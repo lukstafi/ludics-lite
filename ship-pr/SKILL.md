@@ -129,8 +129,9 @@ comment bodies and ids inline; take them as they come and stop polling for what 
 Never end a turn with a PR in flight and nothing watching it: arm the watch as a background command
 before yielding, so the next round wakes you instead of waiting for the user to notice it. `watch`
 *is* the polling loop — don't hand-roll a sleep loop around `poll`, which is what a long review
-otherwise turns into. It returns the moment a round lands (printing exactly what `poll` would) or
-the reaction reaches approval, exits 1 having stayed quiet, and ends on a watermark either way:
+otherwise turns into. It returns the moment a round lands (printing exactly what `poll` would), the
+approval arrives, or it can tell that no review is coming; exits 1 having stayed quiet; and ends on a
+watermark either way:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/pr-review.sh watch <owner>/<repo>#<pr> [watermark]  # background it
@@ -149,15 +150,23 @@ re-arm rather than concluding the reviewer is silent. A window whose *last* poll
 too, even after healthy rounds earlier: the round you are waiting for could be sitting in the part
 of the window that was never read.
 
-Hand-rolling that query has produced six false readings, all of which the script handles: app
+An exit 0 is not always a round: `watch` also returns when it can tell that **nothing is coming** —
+the 👀 went spent without a review of the head, or never landed, or a push has been sitting
+unreviewed past the grace (20 min, `SHIP_PR_REVIEW_GRACE`). Its line says so and names the remedy:
+post a plain `@codex review` comment on the PR, which starts a round within one window. Do that
+rather than re-arming a fourth identical wait — see the state table below for why waiting cannot
+distinguish itself.
+
+Hand-rolling that query has produced seven false readings, all of which the script handles: app
 reviewers' logins carry a `[bot]` suffix so an exact-match filter never fires; your own replies
 bump both counts — and are themselves recorded as `COMMENTED` reviews — so "new" must mean an id
 above a watermark, not a delta; the three feeds number their items in SEPARATE id spaces, so one
 shared watermark takes the max from the reviews feed and then hides every inline finding — the
 dangerous one, because it looks exactly like the reviewer going quiet; the comment APIs paginate
-at 30; `[ "$n" -gt 0 ]` on empty output aborts the watcher mid-run; and a failed request renders
+at 30; `[ "$n" -gt 0 ]` on empty output aborts the watcher mid-run; a failed request renders
 as the same empty list as a quiet feed, so an outage reads as "no findings, no approval" unless
-the two are kept apart.
+the two are kept apart; and a 👀 reaction is a LEVEL that the app does not always take back, so
+reading it as "a review is running" waits on a round that already finished.
 
 ## Address a round
 
@@ -209,9 +218,8 @@ review invalidated, say so in the artifact instead of quietly dropping it.
 ## Converge and merge
 
 The merge gate is the reviewer's approval — for the Codex integration, a 👍 reaction on the PR,
-not a review state. An 👀 reaction means a review is running; wait it out. The two channels are
-disjoint: a round WITH findings posts `COMMENTED` reviews — one
-carrying each inline comment, plus one summary — and no reaction, while a clean round posts no
+not a review state. The two channels are disjoint: a round WITH findings posts `COMMENTED` reviews
+— one carrying each inline comment, plus one summary — and no reaction, while a clean round posts no
 review at all and only the reaction. So a string of `COMMENTED` reviews is neither rejection nor
 sign-off, and their absence after a push is the approval, not silence.
 
@@ -219,12 +227,32 @@ sign-off, and their absence after a push is the approval, not silence.
 ~/.claude/skills/ship-pr/scripts/pr-review.sh status <owner>/<repo>#<pr>
 ```
 
-It answers with a fourth state besides approved/reviewing/none: **UNKNOWN** (exit 3) means the
-reactions API did not answer, and it is not a synonym for "not approved yet" — retry it. The whole
-polling and merge-gate path is REST for this reason: GitHub's GraphQL endpoint 503s independently
-of REST, and a GraphQL-borne silence is indistinguishable from a reviewer's. Thread resolution is
-the one GraphQL-only operation left, and it reports a transport failure as a retry rather than as a
-missing thread.
+The 👀 reaction is the one signal you cannot read on its own. It is a level, not an event, and the
+app does not reliably take it back: on #364 a 👀 outlived the review it announced by an hour, and
+three consecutive 15-minute windows reported "reviewing — wait it out" over a PR nothing was
+reading. So `status` crosses the reactions with what the reviewer has actually posted and with the
+head SHA, and answers with one of six:
+
+| state | means | what to do |
+| --- | --- | --- |
+| `approved` | 👍 is on the PR | merge |
+| `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
+| `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
+| `expected` | no live 👀, and no review of the head SHA: a round is due and has not started | wait out the grace, then `@codex review` |
+| `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push |
+| `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
+
+Two comparisons carry that, and both are easy to get wrong by hand. Whether the reviewer has *seen*
+the head is a SHA equality (each review records the `commit_id` it was submitted against), never a
+time comparison — a commit's date can long predate the push that delivered it. Whether a 👀 is live
+is judged against the reviewer's own last word, never against the head commit: a 👀 raised just
+before your next push is a round that is genuinely running, and #358 had exactly that shape (👀 at
+20:34:13Z, head committed 20:35:01Z) twenty minutes after #364 had the stale one.
+
+The whole polling and merge-gate path is REST: GitHub's GraphQL endpoint 503s independently of REST,
+and a GraphQL-borne silence is indistinguishable from a reviewer's. Thread resolution is the one
+GraphQL-only operation left, and it reports a transport failure as a retry rather than as a missing
+thread.
 
 Merge preserving the commit series (the repo convention for topical commits), and confirm the state
 rather than the exit code — `gh pr merge` returns having only enabled auto-merge when the base has

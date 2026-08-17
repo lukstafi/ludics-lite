@@ -27,7 +27,25 @@
 #     printed during that outage for three threads that all existed, because the paginated GraphQL
 #     lookup 503'd — it reads as a finding ("someone resolved it", "the id is wrong") and sends the
 #     caller hunting. So every claim (no new activity, no such thread, not approved, wrong repo) is
-#     printed ONLY on a call that succeeded; otherwise the message and the exit code say transport.
+#     printed ONLY on a call that succeeded; otherwise the message and the exit code say transport;
+#   - a reaction is a LEVEL, not an event, and the app does not always take its 👀 back: on
+#     2026-08-17 (#364) a 👀 added at 18:13:51Z outlived the review it announced (18:26:06Z), and
+#     three consecutive 15-minute `watch` windows then reported "reviewing — wait it out" over a PR
+#     nothing was reading. 45 minutes went to a signal carrying no information, and the loop only
+#     moved after a hand-posted "@codex review". So a 👀 counts as in flight only while it is NEWER
+#     than the reviewer's last word (a review OR its summary comment); once the reviewer has spoken,
+#     the 👀 describes a round that has already landed and is spent;
+#   - the reviewer's own utterances are that clock, NOT the head commit: a 👀 raised just before
+#     your next push is a round that is genuinely running (seen live on #358 the same evening — 👀
+#     at 20:34:13Z, head committed 20:35:01Z), so "older than the head commit" would declare an
+#     in-flight round spent and nudge on top of it;
+#   - whether the reviewer has SEEN the head is a SHA equality, not a time comparison: every review
+#     records the commit_id it was submitted against, so comparing that to .head.sha answers the
+#     question exactly — no guessing at a push time, and immune to a commit whose author date long
+#     predates the push that delivered it;
+#   - and patience is bounded on BOTH sides, because a stall reads the same from either: a review
+#     that never starts and a 👀 that never lands both end with a verdict to nudge rather than with
+#     another silent hold. "Wait it out" is only honest while something is actually running.
 #
 # REST vs GraphQL: everything on the polling and merge-gate path is REST, deliberately — GitHub's
 # GraphQL endpoint 503s independently of REST, so a GraphQL-borne "no reaction yet" is a lie the
@@ -39,7 +57,8 @@
 #   pr-review.sh [--repo owner/name] poll <pr> [watermark]
 #                                          # new comments/reviews above the watermark; prints next
 #   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands; 0 = act, 1 = quiet
-#   pr-review.sh status <pr>               # reaction gate: approved / reviewing / none / unknown
+#   pr-review.sh status <pr>               # merge gate + who owes what: approved / reviewing /
+#                                          # stalled / expected / idle / unknown
 #   pr-review.sh reply <pr> <comment-id> <body>
 #   pr-review.sh resolve <pr> <comment-id>
 #   pr-review.sh retry [--read] <gh args...>
@@ -55,7 +74,11 @@
 #      REVIEWER=login-prefix (default: codex app), WATCH_INTERVAL=seconds between polls (default
 #      90), WATCH_TIMEOUT=seconds to watch (900), SHIP_PR_STATE_DIR=where the cache lives,
 #      SHIP_PR_API_ATTEMPTS=tries per gh call (4), SHIP_PR_API_BACKOFF=first pause in seconds (5,
-#      doubling to a 20s cap: ~35s of retrying before a call is declared dead).
+#      doubling to a 20s cap: ~35s of retrying before a call is declared dead),
+#      SHIP_PR_REVIEW_GRACE=seconds a due-but-unstarted review is waited for before `watch` returns
+#      saying so (1200), SHIP_PR_REVIEW_STALL=seconds a live 👀 may run before it gets the same
+#      verdict (2×GRACE). Both are measured from the PR's own timestamps, not from when the watch
+#      started, so they are reached ACROSS windows — a 900s window cannot outrun a 1200s grace.
 
 set -uo pipefail
 
@@ -342,65 +365,226 @@ cmd_poll() {
     jq -s --argjson m "$m_review" '[.[][].id // 0, $m] | max' <<<"$reviews")"
 }
 
-# "unknown" is a fourth state, not a flavour of "none": the merge gate reads this, and a dropped
-# request must never present as the reviewer withholding approval.
-status_token() {
-  local raw reactions
-  raw=$(api_list "issues/$1/reactions?per_page=100") || {
-    echo unknown
+# --- reviewer state ---------------------------------------------------------------------------
+# The 👀/👍 reactions alone cannot say whether a round is RUNNING, only that one was announced at
+# some point, so the state is derived from the reactions crossed with what the reviewer has actually
+# posted and with the head SHA. See the 👀 notes in the header for why each comparison is the one it
+# is; the short version is that a spent 👀 is indistinguishable from a live one until you look at
+# what the reviewer said after it.
+
+GRACE="${SHIP_PR_REVIEW_GRACE:-1200}"
+case "$GRACE" in
+'' | *[!0-9]*) die "SHIP_PR_REVIEW_GRACE must be a number of seconds, got '$GRACE'" ;;
+esac
+STALL="${SHIP_PR_REVIEW_STALL:-$((GRACE * 2))}"
+case "$STALL" in
+'' | *[!0-9]*) die "SHIP_PR_REVIEW_STALL must be a number of seconds, got '$STALL'" ;;
+esac
+
+# ISO 8601 UTC timestamps sort correctly as plain strings, which is why every comparison below is a
+# string comparison: no date(1) is involved, whose parsing flags differ between BSD and GNU.
+newest() {
+  local ts best=""
+  for ts in "$@"; do
+    [ -n "$ts" ] || continue
+    [ -z "$best" ] || [[ "$ts" > "$best" ]] || continue
+    best="$ts"
+  done
+  printf '%s' "$best"
+}
+
+# Seconds since an ISO timestamp, or "-" when there is nothing to measure from. jq does the
+# arithmetic for the same portability reason, and "-" is deliberately not 0: a missing age must not
+# read as "just happened" and must never reach an integer comparison.
+age_of() {
+  local out
+  [ -n "${1:-}" ] || {
+    echo -
     return 0
   }
-  reactions=$(jq -r --arg rev "$REVIEWER" '
-      map(select((.user.login // "") | startswith($rev)) | .content) | unique | join(",")' \
-    <<<"$raw" 2>/dev/null) || {
-    echo unknown
-    return 0
-  }
-  case "$reactions" in
-  *"+1"*) echo approved ;;
-  *eyes*) echo reviewing ;;
-  *) echo none ;;
+  out=$(jq -rn --arg t "$1" \
+    'try ((now - ($t | fromdateiso8601)) | floor | tostring) catch "-"' 2>/dev/null)
+  case "$out" in '' | *[!0-9]*) echo - ;; *) echo "$out" ;; esac
+}
+
+# "20m" reads better than "1203s" in a line a human skims; the raw seconds stay in the state line.
+fmt_age() {
+  case "${1:-}" in
+  '' | *[!0-9]*) printf 'an unknown time' ;;
+  *) if [ "$1" -ge 60 ]; then printf '%dm' "$(($1 / 60))"; else printf '%ds' "$1"; fi ;;
   esac
 }
 
+# Prints ONE line, "<token>|<seconds>|<detail>", and always exits 0 — the token carries the failure:
+#   approved  👍 is on the PR: the merge gate is open.
+#   reviewing 👀 is newer than the reviewer's last word, so a round really is in flight.
+#   stalled   ... and it has been in flight longer than any round takes; nothing is coming.
+#   expected  no live 👀 and no review of the head SHA: a round is due and has not started.
+#   idle      the reviewer has reviewed this exact head and left no 👍, so the next move is yours.
+#   unknown   a read failed. NOT a state of the PR — hold the previous one and retry.
+# <seconds> is how long the state has held: since the 👀 for reviewing/stalled, and for expected
+# since the LATEST of head commit / reviewer's last word / spent 👀 — i.e. since the moment a review
+# became due. "-" when nothing datable was read.
+status_state() {
+  local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
+
+  raw=$(api_list "issues/$pr/reactions?per_page=100") || {
+    echo "unknown|-|the reactions API did not answer ($(gh_err_line))"
+    return 0
+  }
+  line=$(jq -r --arg rev "$REVIEWER" '
+      [.[] | select((.user.login // "") | startswith($rev))]
+      | "\(any(.[]; .content == "+1"))"
+        + "|" + ((map(select(.content == "eyes") | .created_at) | max) // "")' \
+    <<<"$raw" 2>/dev/null) || {
+    echo "unknown|-|the reactions feed did not parse"
+    return 0
+  }
+  plus="${line%%|*}"
+  eyes_at="${line#*|}"
+
+  # 👍 is the merge gate and the reactions feed alone answers it, so it is answered before any feed
+  # that could fail: an outage on the reviews feed must not hide an approval behind "unknown".
+  [ "$plus" = true ] && {
+    echo "approved|-|👍 from $REVIEWER"
+    return 0
+  }
+
+  raw=$(api_list "pulls/$pr/reviews?per_page=100") || {
+    echo "unknown|-|the reviews API did not answer ($(gh_err_line))"
+    return 0
+  }
+  # Your own replies land in this feed as COMMENTED reviews, hence the login filter; PENDING reviews
+  # have no submitted_at and are not yet the reviewer speaking.
+  line=$(jq -r --arg rev "$REVIEWER" '
+      [.[] | select((.user.login // "") | startswith($rev)) | select(.submitted_at != null)]
+      | sort_by(.submitted_at) | last
+      | if . == null then "|" else "\(.submitted_at)|\(.commit_id // "")" end' \
+    <<<"$raw" 2>/dev/null) || {
+    echo "unknown|-|the reviews feed did not parse"
+    return 0
+  }
+  rev_at="${line%%|*}"
+  rev_sha="${line#*|}"
+
+  # The summary comment counts as the reviewer speaking too: a round delivered only as an issue
+  # comment would otherwise leave its 👀 looking live forever, which is this same bug in a hat.
+  raw=$(api_list "issues/$pr/comments?per_page=100") || {
+    echo "unknown|-|the comments API did not answer ($(gh_err_line))"
+    return 0
+  }
+  com_at=$(jq -r --arg rev "$REVIEWER" '
+      [.[] | select((.user.login // "") | startswith($rev)) | .created_at] | max // ""' \
+    <<<"$raw" 2>/dev/null) || {
+    echo "unknown|-|the comments feed did not parse"
+    return 0
+  }
+  last_spoke=$(newest "$rev_at" "$com_at")
+
+  # In flight only while the 👀 is newer than everything the reviewer has said. An empty last_spoke
+  # (nothing posted yet) makes any 👀 live, which is right: that is a first round running.
+  if [ -n "$eyes_at" ] && [[ "$eyes_at" > "$last_spoke" ]]; then
+    age=$(age_of "$eyes_at")
+    case "$age" in
+    '' | *[!0-9]*) ;;
+    *) [ "$age" -ge "$STALL" ] && {
+      echo "stalled|$age|👀 from $REVIEWER at $eyes_at with nothing posted since"
+      return 0
+    } ;;
+    esac
+    echo "reviewing|$age|👀 from $REVIEWER at $eyes_at, newer than its last" \
+      "word${last_spoke:+ ($last_spoke)}"
+    return 0
+  fi
+
+  head_sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha)
+  [ "$?" -eq 0 ] && [ -n "$head_sha" ] || {
+    echo "unknown|-|the pulls API did not answer for the head SHA ($(gh_err_line))"
+    return 0
+  }
+
+  # SHA equality, not a timestamp: the review records the commit it was submitted against, so this
+  # is exactly "has the reviewer seen THIS head" with no push time to estimate.
+  if [ "$rev_sha" = "$head_sha" ]; then
+    echo "idle|$(age_of "$last_spoke")|$REVIEWER reviewed head ${head_sha:0:7} at $rev_at"
+    return 0
+  fi
+
+  # The clock on a review that has not started runs from whichever came last: the push (approximated
+  # by the head commit's committer date, which a rebase, amend or cherry-pick all refresh), the
+  # reviewer's last word, or the spent 👀. A failed commit read costs precision, not the state.
+  head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
+    head_at=""
+  echo "expected|$(age_of "$(newest "$head_at" "$last_spoke" "$eyes_at")")|no 👀 in flight and no" \
+    "review of head ${head_sha:0:7}${rev_sha:+; $REVIEWER last reviewed ${rev_sha:0:7} at $rev_at}"
+}
+
+state_tok() { printf '%s' "${1%%|*}"; }
+state_age() {
+  local rest="${1#*|}"
+  printf '%s' "${rest%%|*}"
+}
+state_detail() {
+  local rest="${1#*|}"
+  printf '%s' "${rest#*|}"
+}
+
+# Takes a whole state line, not a token: the age and the detail are what make the difference between
+# "wait it out" and "nothing is coming" legible to whoever reads the log.
 status_line() {
-  case "$1" in
-  approved) echo "approved (👍 from $REVIEWER)" ;;
-  reviewing) echo "reviewing (👀 from $REVIEWER) — wait it out" ;;
-  unknown) echo "UNKNOWN — the reactions API did not answer; this is NOT 'not approved', retry" ;;
-  *) echo "no reaction from $REVIEWER yet" ;;
+  local tok age detail
+  tok=$(state_tok "$1")
+  age=$(state_age "$1")
+  detail=$(state_detail "$1")
+  case "$tok" in
+  approved) echo "approved ($detail)" ;;
+  reviewing) echo "reviewing — $detail, running $(fmt_age "$age") — wait it out" ;;
+  stalled) echo "STALLED — $detail for $(fmt_age "$age"), longer than a round takes; nothing is" \
+    "coming, so nudge with a '@codex review' comment rather than waiting further" ;;
+  expected) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")" ;;
+  idle) echo "nothing in flight — $detail, and no 👍; the next move is yours" ;;
+  unknown) echo "UNKNOWN — $detail; this is NOT 'not approved', retry" ;;
+  *) echo "unrecognised state '$tok' — treat as unknown and retry" ;;
   esac
 }
 
 cmd_status() {
   pr_arg "${1:?usage: status <pr>}"
-  local tok
-  tok=$(status_token "$PR_NUM")
-  status_line "$tok"
+  local state
+  state=$(status_state "$PR_NUM")
+  status_line "$state"
   # Exit 3 on unknown so a caller gating a merge on `status` cannot read a failed read as a quiet
   # "not approved yet" — the same collapse api_list refuses to make. 3 rather than 2, because a
   # usage error (2) is the caller's to fix and this one is the API's to recover from.
-  [ "$tok" = unknown ] && return 3
+  [ "$(state_tok "$state")" = unknown ] && return 3
   return 0
 }
 
 # Poll on a timer so a round's arrival wakes the caller instead of the caller re-deriving this loop.
-# Exits 0 with something to act on (a round's findings, or the reaction reaching/leaving approval),
-# 1 having stayed quiet for the whole window — in both cases the last line is a watermark to resume
-# from, with poll's semantics. It exits 3 instead when it never managed to read the PR at all, so
-# that "the reviewer stayed quiet" and "I was blind for the whole window" stay distinguishable —
-# only the first is a reason to stop watching. Run it in the Bash tool's background mode: the
-# default window is longer than that tool's foreground ceiling. Background shells do not start in
-# the checkout, so give this the repo: `watch owner/name#<pr>`.
+# Exits 0 with something to act on — a round's findings, the approval landing, or the verdict that no
+# review is coming (a spent or stalled 👀, or one that never started within the grace) — and 1 having
+# stayed quiet for the whole window; in both cases the last line is a watermark to resume from, with
+# poll's semantics. It exits 3 instead when it never managed to read the PR at all, so that "the
+# reviewer stayed quiet" and "I was blind for the whole window" stay distinguishable — only the first
+# is a reason to stop watching. Run it in the Bash tool's background mode: the default window is
+# longer than that tool's foreground ceiling. Background shells do not start in the checkout, so give
+# this the repo: `watch owner/name#<pr>`.
+#
+# "Keep waiting" is a claim, and this loop is only allowed to make it while something is running.
+# Every other state gets a bounded wait and then a verdict, because a window that reports nothing is
+# indistinguishable — to the caller and to the user watching the clock — from a window that reported
+# a stale 👀 three times in a row.
 cmd_watch() {
   local pr="${1:?usage: watch <pr> [watermark]}" mark="${2:-}"
   pr_arg "$pr"
   pr="$PR_NUM"
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"
-  local start=$SECONDS was now out rc next quiet=0 saw=0 blind=0
+  local start=$SECONDS was state tok age out rc next quiet=0 saw=0 blind=0
 
-  was=$(status_token "$pr")
-  echo "watching PR $REPO#$pr from status '$was', every ${interval}s for up to ${timeout}s" >&2
+  state=$(status_state "$pr")
+  was=$(state_tok "$state")
+  echo "watching PR $REPO#$pr, every ${interval}s for up to ${timeout}s;" \
+    "from: $(status_line "$state")" >&2
 
   while :; do
     out=$(cmd_poll "$pr" "$mark")
@@ -416,36 +600,76 @@ cmd_watch() {
       blind=$((blind + 1))
     fi
 
+    state=$(status_state "$pr")
+    tok=$(state_tok "$state")
+    age=$(state_age "$state")
+
     # A round's stdout is byte-identical to poll's, watermark last, so a caller can consume watch
-    # and poll the same way; the reaction is context, not the finding, so it goes to stderr.
+    # and poll the same way; the state is context, not the finding, so it goes to stderr.
     if [ "$rc" -eq 0 ] && grep -q '^--- ' <<<"$out"; then
-      echo "status: $(status_line "$(status_token "$pr")")" >&2
+      echo "status: $(status_line "$state")" >&2
       echo "$out"
       return 0
     fi
+    # One line per round, so a backgrounded watch leaves a log that says WHICH kind of quiet this
+    # was — the stall this loop used to hide was a status line repeating itself unremarked.
+    warn "PR $REPO#$pr: $(status_line "$state")"
 
-    now=$(status_token "$pr")
-    if [ "$now" = unknown ]; then
-      # Neither approval nor retraction can be concluded from a read that did not happen; hold the
-      # previous status and keep polling.
-      warn "reactions unreadable this round on PR $REPO#$pr; holding status '$was'"
-    elif [ "$now" = approved ]; then
-      status_line "$now"
+    case "$tok" in
+    unknown)
+      # Neither approval nor its absence can be concluded from a read that did not happen; hold the
+      # previous state and keep polling.
+      warn "state unreadable this round on PR $REPO#$pr; holding '$was'"
+      ;;
+    approved)
+      status_line "$state"
       echo "watermark: $mark"
       return 0
-    # A reaction that vanishes is either a retracted 👀 or a dropped API call; make it prove itself
-    # over two rounds before reporting it, since a single round's read can be a false negative.
-    elif [ "$was" = reviewing ] && [ "$now" = none ]; then
-      quiet=$((quiet + 1))
-      if [ "$quiet" -ge 2 ]; then
-        echo "reaction from $REVIEWER was retracted (was 👀, now none)"
-        echo "watermark: $mark"
-        return 0
+      ;;
+    stalled)
+      # Bounded patience on a LIVE 👀 as well: a round that never lands stalls the loop exactly as a
+      # spent 👀 does, and the answer is the same — say so and let the caller nudge.
+      status_line "$state"
+      echo "watermark: $mark"
+      return 0
+      ;;
+    *)
+      # A 👀 that stops being in flight without a review of the head is a round that ended with
+      # nothing. Make it prove itself over two rounds, since one read can be a false negative — and
+      # this is the fast path to the same verdict the grace below reaches on the clock alone.
+      if [ "$was" = reviewing ] && [ "$tok" != reviewing ]; then
+        quiet=$((quiet + 1))
+        if [ "$quiet" -ge 2 ]; then
+          echo "the 👀 round on PR $REPO#$pr ended without a review of the head commit — consider" \
+            "nudging with a '@codex review' comment"
+          status_line "$state"
+          echo "watermark: $mark"
+          return 0
+        fi
+      else
+        quiet=0
+        was="$tok"
       fi
-    else
-      quiet=0
-      was="$now"
-    fi
+      # The state this loop used to mistake for "reviewing". It is worth a bounded wait — the app
+      # takes minutes to pick a push up — and then it is worth SAYING, because there is nothing on
+      # the other end to wait for. The grace runs from the PR's clock, not the window's, so it is
+      # reached in the second window rather than never.
+      if [ "$tok" = expected ]; then
+        case "$age" in
+        '' | *[!0-9]*) ;;
+        *)
+          if [ "$age" -ge "$GRACE" ]; then
+            echo "no review materialized on PR $REPO#$pr in the $(fmt_age "$age") since it became" \
+              "due — consider nudging with a '@codex review' comment"
+            status_line "$state"
+            echo "watermark: $mark"
+            return 0
+          fi
+          ;;
+        esac
+      fi
+      ;;
+    esac
 
     [ $((SECONDS - start + interval)) -le "$timeout" ] || break
     sleep "$interval"
@@ -467,7 +691,9 @@ cmd_watch() {
     echo "watermark: $mark"
     return 3
   fi
-  echo "no new activity in ${timeout}s; status: $(status_line "$(status_token "$pr")")"
+  # The state is the last round's, not a fresh read: it is what the window actually observed, and a
+  # re-read here would report a change this window never saw and never acted on.
+  echo "no new activity in ${timeout}s; status: $(status_line "$state")"
   echo "watermark: $mark"
   return 1
 }
