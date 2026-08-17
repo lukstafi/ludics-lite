@@ -60,6 +60,15 @@ that a PR running to many rounds walks into — so prefer it to hand-rolled API 
 The commands below spell that path out in full because they are run from a repo checkout, not from
 the skill directory.
 
+**Always name the repo in the PR argument: `owner/name#<pr>`, not a bare number.** The script can
+infer the repo from the cwd, but a *background* shell does not reliably start in the checkout — and
+`watch`, the one invocation this skill tells you to background, is exactly where that bites. The
+failure is loud (exit 2, nothing watching) but easy to leave un-noticed once the command is
+backgrounded and the turn has yielded. It also bites unevenly inside a batch: three `reply` calls
+in one message, the first two landing and the third dying, is a partial success that reads as
+success. A resolved repo is cached per PR number, so later bare-number calls usually still work —
+but that is a safety net, not something to rely on for the first call of a session.
+
 ## Open
 
 Look at the working tree first: commit what belongs to this goal, and say explicitly what you did
@@ -109,21 +118,29 @@ otherwise turns into. It returns the moment a round lands (printing exactly what
 the reaction reaches approval, exits 1 having stayed quiet, and ends on a watermark either way:
 
 ```bash
-~/.claude/skills/ship-pr/scripts/pr-review.sh watch <pr> [watermark]  # background it; exit 0 = act
-~/.claude/skills/ship-pr/scripts/pr-review.sh poll <pr> [watermark]   # one shot; prints next mark
+~/.claude/skills/ship-pr/scripts/pr-review.sh watch <owner>/<repo>#<pr> [watermark]  # background it
+~/.claude/skills/ship-pr/scripts/pr-review.sh poll <owner>/<repo>#<pr> [watermark]   # one shot
 ```
 
 Run `watch` through the Bash tool's **background** mode and act on its completion notification: its
 default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it) outlasts the foreground timeout
-ceiling. On exit 1, hand the watermark it printed to the next `watch` and keep working meanwhile.
+ceiling. Spell the repo out, as above — this is the backgrounded call that cwd inference cannot
+serve.
 
-Hand-rolling that query has produced five false readings, all of which the script handles: app
+Read its exit code, which is three-valued: **0** = act on what it printed; **1** = the window
+passed quietly, so hand the watermark it printed to the next `watch` and keep working meanwhile;
+**3** = it never managed to read the PR (API trouble), which is *not* quiet — nothing was observed,
+so re-arm rather than concluding the reviewer is silent.
+
+Hand-rolling that query has produced six false readings, all of which the script handles: app
 reviewers' logins carry a `[bot]` suffix so an exact-match filter never fires; your own replies
 bump both counts — and are themselves recorded as `COMMENTED` reviews — so "new" must mean an id
 above a watermark, not a delta; the three feeds number their items in SEPARATE id spaces, so one
 shared watermark takes the max from the reviews feed and then hides every inline finding — the
 dangerous one, because it looks exactly like the reviewer going quiet; the comment APIs paginate
-at 30; and `[ "$n" -gt 0 ]` on empty output aborts the watcher mid-run.
+at 30; `[ "$n" -gt 0 ]` on empty output aborts the watcher mid-run; and a failed request renders
+as the same empty list as a quiet feed, so an outage reads as "no findings, no approval" unless
+the two are kept apart.
 
 ## Address a round
 
@@ -158,9 +175,12 @@ The history then reads as a dialogue, which is what a reviewer (or a future arch
 Push, then close out each thread — silent fixes leave the reviewer re-deriving what you did:
 
 ```bash
-~/.claude/skills/ship-pr/scripts/pr-review.sh reply <pr> <comment-id> "Fixed in <sha>: <substance>"
-~/.claude/skills/ship-pr/scripts/pr-review.sh resolve <pr> <comment-id>
+~/.claude/skills/ship-pr/scripts/pr-review.sh reply <owner>/<repo>#<pr> <comment-id> "Fixed in <sha>: <substance>"
+~/.claude/skills/ship-pr/scripts/pr-review.sh resolve <owner>/<repo>#<pr> <comment-id>
 ```
+
+Check every call in such a batch, not just the last: these are independent invocations, and one
+failing while its neighbours succeed leaves a thread silently unanswered.
 
 If a finding changes what a measurement *means* (not just how it is run), redo the affected
 measurement rather than editing the prose around it; and if a result rests on a premise the
@@ -176,8 +196,15 @@ review at all and only the reaction. So a string of `COMMENTED` reviews is neith
 sign-off, and their absence after a push is the approval, not silence.
 
 ```bash
-~/.claude/skills/ship-pr/scripts/pr-review.sh status <pr>
+~/.claude/skills/ship-pr/scripts/pr-review.sh status <owner>/<repo>#<pr>
 ```
+
+It answers with a fourth state besides approved/reviewing/none: **UNKNOWN** (exit 2) means the
+reactions API did not answer, and it is not a synonym for "not approved yet" — retry it. The whole
+polling and merge-gate path is REST for this reason: GitHub's GraphQL endpoint 503s independently
+of REST, and a GraphQL-borne silence is indistinguishable from a reviewer's. Thread resolution is
+the one GraphQL-only operation left, and it reports a transport failure as a retry rather than as a
+missing thread.
 
 Merge preserving the commit series (the repo convention for topical commits), and confirm the state
 rather than the exit code — `gh pr merge` returns having only enabled auto-merge when the base has
@@ -185,8 +212,12 @@ required checks or a merge queue:
 
 ```bash
 gh pr merge <n> --repo <owner>/<repo> --merge
-gh pr view <n> --json state --jq .state       # MERGED before any cleanup
+gh api repos/<owner>/<repo>/pulls/<n> --jq '"merged=\(.merged) state=\(.state)"'   # before cleanup
 ```
+
+Confirm over REST, not `gh pr view --json` / `gh pr checks`: those ride GraphQL, which degrades
+independently of REST, and a nonzero `gh pr merge` whose state query then 503s is exactly the shape
+of a merge that DID land.
 
 Then clean up, but not with `gh pr merge --delete-branch`: from a worktree its cleanup fails *after*
 the merge has landed ("fatal: 'master' is already used by worktree"), leaving the branch behind and
