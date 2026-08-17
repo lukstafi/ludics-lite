@@ -55,10 +55,25 @@ The trade is explicit: a direct commit gets no review at all. Anything carrying 
 goes through the full loop below.
 
 The `gh` recipes below are packaged as `~/.claude/skills/ship-pr/scripts/pr-review.sh` (`poll`,
-`watch`, `status`, `reply`, `resolve`), which encodes the traps in code — including the pagination
-that a PR running to many rounds walks into — so prefer it to hand-rolled API calls.
+`watch`, `status`, `reply`, `resolve`, `retry`), which encodes the traps in code — including the
+pagination that a PR running to many rounds walks into — so prefer it to hand-rolled API calls.
 The commands below spell that path out in full because they are run from a repo checkout, not from
 the skill directory.
+
+**GitHub fails half the time, not none of the time.** During an incident (2026-08-17: an hour of
+roughly every other call returning `503 No server is currently available`) a single attempt is a
+coin flip, so the script retries every call — 4 tries, 5s doubling to 20s, on 5xx and that body,
+never on a 4xx. Two rules follow, and they are worth holding even when you step outside the script.
+Read its **exit codes**: `0` did it, `1` the fact does not hold, `2` your invocation is wrong, `3`
+the API never answered. And never restate a `3` as a finding — "no such thread", "no new activity",
+"not approved" are claims about the PR, and an unanswered call supports none of them. That
+conflation is not hypothetical: the pre-retry script reported `no review thread starts at comment
+N` for three threads that existed, because its paginated GraphQL lookup had 503'd.
+
+For the `gh` calls this skill makes outside the script — `gh pr comment`, `gh pr merge`, the REST
+merge confirmation — use `pr-review.sh retry [--read] <gh args…>` rather than hand-rolling a
+`for i in 1 2 3; do … && break; sleep; done` loop (which one outage session wrote five times).
+Writes are retried only on gateway refusals, so a merge or a comment cannot be sent twice.
 
 **Always name the repo in the PR argument: `owner/name#<pr>`, not a bare number.** The script can
 infer the repo from the cwd, but a *background* shell does not reliably start in the checkout — and
@@ -129,8 +144,10 @@ serve.
 
 Read its exit code, which is three-valued: **0** = act on what it printed; **1** = the window
 passed quietly, so hand the watermark it printed to the next `watch` and keep working meanwhile;
-**3** = it never managed to read the PR (API trouble), which is *not* quiet — nothing was observed,
-so re-arm rather than concluding the reviewer is silent.
+**3** = it did not read the PR (API trouble), which is *not* quiet — nothing was observed, so
+re-arm rather than concluding the reviewer is silent. A window whose *last* polls failed exits 3
+too, even after healthy rounds earlier: the round you are waiting for could be sitting in the part
+of the window that was never read.
 
 Hand-rolling that query has produced six false readings, all of which the script handles: app
 reviewers' logins carry a `[bot]` suffix so an exact-match filter never fires; your own replies
@@ -180,7 +197,10 @@ Push, then close out each thread — silent fixes leave the reviewer re-deriving
 ```
 
 Check every call in such a batch, not just the last: these are independent invocations, and one
-failing while its neighbours succeed leaves a thread silently unanswered.
+failing while its neighbours succeed leaves a thread silently unanswered. A `reply` that exits 3
+posted nothing (the gateway refused it) — repeat it; a `resolve` that exits 3 found the thread and
+failed to close it, so repeating that is safe too. Only exit 1 from `resolve` means the thread is
+really not there.
 
 If a finding changes what a measurement *means* (not just how it is run), redo the affected
 measurement rather than editing the prose around it; and if a result rests on a premise the
@@ -199,7 +219,7 @@ sign-off, and their absence after a push is the approval, not silence.
 ~/.claude/skills/ship-pr/scripts/pr-review.sh status <owner>/<repo>#<pr>
 ```
 
-It answers with a fourth state besides approved/reviewing/none: **UNKNOWN** (exit 2) means the
+It answers with a fourth state besides approved/reviewing/none: **UNKNOWN** (exit 3) means the
 reactions API did not answer, and it is not a synonym for "not approved yet" — retry it. The whole
 polling and merge-gate path is REST for this reason: GitHub's GraphQL endpoint 503s independently
 of REST, and a GraphQL-borne silence is indistinguishable from a reviewer's. Thread resolution is
@@ -211,8 +231,9 @@ rather than the exit code — `gh pr merge` returns having only enabled auto-mer
 required checks or a merge queue:
 
 ```bash
-gh pr merge <n> --repo <owner>/<repo> --merge
-gh api repos/<owner>/<repo>/pulls/<n> --jq '"merged=\(.merged) state=\(.state)"'   # before cleanup
+~/.claude/skills/ship-pr/scripts/pr-review.sh retry gh pr merge <n> --repo <owner>/<repo> --merge
+~/.claude/skills/ship-pr/scripts/pr-review.sh retry --read \
+  api repos/<owner>/<repo>/pulls/<n> --jq '"merged=\(.merged) state=\(.state)"'   # before cleanup
 ```
 
 Confirm over REST, not `gh pr view --json` / `gh pr checks`: those ride GraphQL, which degrades
