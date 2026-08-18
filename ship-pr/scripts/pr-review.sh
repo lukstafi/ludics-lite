@@ -47,6 +47,15 @@
 #     that never starts and a 👀 that never lands both end with a verdict to nudge rather than with
 #     another silent hold. "Wait it out" is only honest while something is actually running.
 #
+# For a future `merge` helper (none exists yet; today the SKILL.md merge section carries this):
+# GitHub recomputes a PR's mergeability asynchronously after every push, and until that finishes
+# `gh pr merge` fails with "Pull request is not mergeable: the merge commit cannot be cleanly
+# created" — byte-identical to a genuine conflict. On ocannl-staging#373 (2026-08-18) the failure
+# fired seconds after pushing the conflict-RESOLUTION merge commit; re-reading
+# `api repos/<o>/<r>/pulls/<n> --jq .mergeable` moments later gave mergeable=true and the retried
+# merge landed. A merge helper must poll .mergeable over REST until it is non-null before treating
+# that failure as base drift (null = still computing; only a false that persists is a conflict).
+#
 # REST vs GraphQL: everything on the polling and merge-gate path is REST, deliberately — GitHub's
 # GraphQL endpoint 503s independently of REST, so a GraphQL-borne "no reaction yet" is a lie the
 # merge gate would act on. `gh repo view` rides GraphQL, hence the local git-remote fallback.

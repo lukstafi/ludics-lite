@@ -268,6 +268,24 @@ Confirm over REST, not `gh pr view --json` / `gh pr checks`: those ride GraphQL,
 independently of REST, and a nonzero `gh pr merge` whose state query then 503s is exactly the shape
 of a merge that DID land.
 
+A merge that instead fails with "Pull request is not mergeable: the merge commit cannot be cleanly
+created" is ambiguous, and the two readings demand opposite moves. GitHub recomputes a PR's
+mergeability asynchronously after every push; until that finishes, the API serves the cached
+verdict, so for some seconds after a push — including the very push that just resolved a real
+conflict — the merge fails with a message byte-identical to a genuine conflict. Seen back-to-back
+on ocannl-staging#373 (2026-08-18): the first failure was real base drift, the second was the stale
+cache over the freshly pushed conflict-resolution merge. So after any push, do not react to that
+failure until you have re-read the PR's `mergeable` field over REST:
+
+```bash
+~/.claude/skills/ship-pr/scripts/pr-review.sh retry --read \
+  api repos/<owner>/<repo>/pulls/<n> --jq '"mergeable=\(.mergeable) state=\(.mergeable_state)"'
+```
+
+`mergeable=null` means the recomputation is still running — wait a few seconds and re-read rather
+than concluding anything. Only a `mergeable=false` that persists across a re-read means base drift
+needing a merge/rebase; `mergeable=true` means retry the merge, it will land.
+
 Then clean up, but not with `gh pr merge --delete-branch`: from a worktree its cleanup fails *after*
 the merge has landed ("fatal: 'master' is already used by worktree"), leaving the branch behind and
 the failure looking like a failed merge. Two rules carry the rest — anchor every command with `git
