@@ -76,7 +76,13 @@ not see this conversation) and include:
 - Verification expectations: scoped test runs, negative controls where the work is a checker,
   the project's known environmental traps (on this Mac: Gatekeeper/XProtect stalls fresh
   executables for minutes - sample the pid before assuming a hang; never start a second dune
-  against a running _build).
+  against a running _build). **On the Mac, the brief must say: targeted test aliases only
+  (`dune build @<dir>/runtest-<name>` for the tests the change reaches, plus the scanners),
+  never a full directory suite, and leave full suites to CI** - the XProtect scanner is one
+  single-threaded service for the machine and each worktree links its own copies of every
+  test exe, so N parallel full suites queue N x ~200 fresh binaries behind it and every
+  agent's run freezes (observed 2026-08-22: 34 exes parked in dlopen, logs frozen, load 2.5).
+  Also ask for `dune -j 4` when more than ~4 agents share the box.
 - Landing: the ship-pr skill through review to merge, then close the upstream issue with a
   summary comment, then remove the worktree.
 - Process discipline, stated explicitly because agents re-derive it badly under load:
@@ -102,7 +108,9 @@ The coordinator's job between launch and last merge:
   launch a fresh finisher agent per stranded branch - it re-verifies from scratch and signs
   for the inherited commits.
 - **Verify externally, not by agent self-report.** `gh pr list/view`, issue states, worktree
-  list. An agent saying "waiting on the watch" while the PR feed already has the next review
+  list. Include the machine: `uptime` low while many `dune` processes sit at 0% CPU means
+  the test exes are parked in XProtect's dlopen queue, not working -
+  `ps -o pid,etime,pcpu,comm -p $(pgrep -P <dune pid>)` then `sample <exe pid> 1`. An agent saying "waiting on the watch" while the PR feed already has the next review
   round is the known strand - point it at the feed. An agent that yields twice in a row with
   no state change gets a concrete, imperative unstick message (do X now, in this turn, do
   not yield); if that fails too, take over the mechanical remainder or spawn a finisher.
