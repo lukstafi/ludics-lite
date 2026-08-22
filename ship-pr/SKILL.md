@@ -179,6 +179,12 @@ re-arm rather than concluding the reviewer is silent. A window whose *last* poll
 too, even after healthy rounds earlier: the round you are waiting for could be sitting in the part
 of the window that was never read.
 
+**The watch's printout is not the record of the round.** A long round's output is cut by the Bash
+tool's display (the head goes, the tail stays), and on 2026-08-22 two agents answered half a round
+that way, both times dropping real findings. After any exit 0, enumerate the round's findings
+yourself from the feeds, by id above the watermark (`status`, or the comment APIs), and address
+THAT list; cross-check the count against what the watch claimed before replying/resolving.
+
 An exit 0 is not always a round: `watch` also returns when it can tell that **nothing is coming** —
 the 👀 went spent without a review of the head, or never landed, or a push has been sitting
 unreviewed past the grace (20 min, `SHIP_PR_REVIEW_GRACE`). Its line says so and names the remedy:
