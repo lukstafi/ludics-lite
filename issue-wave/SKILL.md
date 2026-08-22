@@ -114,6 +114,15 @@ The coordinator's job between launch and last merge:
   round is the known strand - point it at the feed. An agent that yields twice in a row with
   no state change gets a concrete, imperative unstick message (do X now, in this turn, do
   not yield); if that fails too, take over the mechanical remainder or spawn a finisher.
+- **Converge long reviews.** An automated reviewer keeps finding members of any open-ended
+  artifact (a scanner, a property table) indefinitely; two agents went 9 and 13 rounds on
+  2026-08-22. After ~5 rounds send the policy: fix only findings that show a claim CANNOT fail
+  (vacuous guard, untracked config key, host-dependent expectation); reply in-thread and defer
+  everything else to ONE follow-up issue; merge on approval. Both converged within two rounds.
+  Pair it with **one push per CI cycle** in late rounds — every push supersedes the ubuntu leg
+  (~28 min), so a fix that only x86 can confirm stays unconfirmed for as long as pushes keep
+  coming — and with "rebase before opening and before merging": CI builds the MERGE commit, so a
+  repo-wide scan green on the branch can be red against what landed on master meanwhile.
 - **Gate later waves** on the merges and out-of-scope closures they wait for, and rebrief
   each next-wave agent with what its predecessors landed (new helpers, reshaped goldens,
   fresh conventions) so it builds on them instead of colliding.
