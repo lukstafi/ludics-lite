@@ -55,10 +55,10 @@ The trade is explicit: a direct commit gets no review at all. Anything carrying 
 goes through the full loop below.
 
 The `gh` recipes below are packaged as `~/.claude/skills/ship-pr/scripts/pr-review.sh` (`poll`,
-`watch`, `status`, `reply`, `resolve`, `retry`), which encodes the traps in code — including the
-pagination that a PR running to many rounds walks into — so prefer it to hand-rolled API calls.
-The commands below spell that path out in full because they are run from a repo checkout, not from
-the skill directory.
+`watch`, `status`, `checks`, `merge`, `base`, `reply`, `resolve`, `retry`), which encodes the traps
+in code — including the pagination that a PR running to many rounds walks into — so prefer it to
+hand-rolled API calls. The commands below spell that path out in full because they are run from a
+repo checkout, not from the skill directory.
 
 **GitHub fails half the time, not none of the time.** During an incident (2026-08-17: an hour of
 roughly every other call returning `503 No server is currently available`) a single attempt is a
@@ -70,8 +70,8 @@ the API never answered. And never restate a `3` as a finding — "no such thread
 conflation is not hypothetical: the pre-retry script reported `no review thread starts at comment
 N` for three threads that existed, because its paginated GraphQL lookup had 503'd.
 
-For the `gh` calls this skill makes outside the script — `gh pr comment`, `gh pr merge`, the REST
-merge confirmation — use `pr-review.sh retry [--read] <gh args…>` rather than hand-rolling a
+For the `gh` calls this skill makes outside the script — `gh pr comment`, an ad-hoc `api` read —
+use `pr-review.sh retry [--read] <gh args…>` rather than hand-rolling a
 `for i in 1 2 3; do … && break; sleep; done` loop (which one outage session wrote five times).
 Writes are retried only on gateway refusals, so a merge or a comment cannot be sent twice.
 
@@ -83,6 +83,35 @@ backgrounded and the turn has yielded. It also bites unevenly inside a batch: th
 in one message, the first two landing and the third dying, is a partial success that reads as
 success. A resolved repo is cached per PR number, so later bare-number calls usually still work —
 but that is a safety net, not something to rely on for the first call of a session.
+
+## Read the base before you branch
+
+A branch inherits its base's breakage. When a `master` does not build, every later "is this my
+change?" question gets expensive, and the answer is usually no — that is where the cost of a red
+base actually lands, not in the ten hours it stays red. So read it before taking a branch off it:
+
+```bash
+~/.claude/skills/ship-pr/scripts/pr-review.sh base <owner>/<repo> [branch]   # default branch if omitted
+```
+
+Exit **0** green, **1** RED (it says so in three shouted lines and names the run), **3** the API did
+not answer — which is not "green" — and **4** no build workflow has ever completed on that branch.
+
+On a **1**, do not start by branching and hoping. Open the run it names and decide which you are in:
+the break is someone else's and already known (say so before you start, so the session's first
+confusing build failure is not re-diagnosed from scratch), the break is *yours* from a previous
+landing (fix that first — it is one commit and it unblocks everyone), or nobody has looked yet (this
+is the case that costs the most, and reporting it is worth more than the task you were about to
+start). What you must not do is spend the session bisecting a break you inherited.
+
+If this skill fires at the *end* of a task, as it usually does, this section is the one part of it
+to have run at the beginning. A session that did not is still better off running `base` before it
+branches for the follow-up work.
+
+The verdict is about the last **completed** run, and `base` prints which commit that run tested. On
+ocannl-staging `ci` carries `paths-ignore: docs/**`, so a docs-only push produces no run at all and
+the newest verdict legitimately trails the tip by a commit or several — that is a gap in coverage,
+not a stale reading, and the printed SHA is what lets you tell them apart.
 
 ## Open
 
@@ -217,7 +246,10 @@ review invalidated, say so in the artifact instead of quietly dropping it.
 
 ## Converge and merge
 
-The merge gate is the reviewer's approval — for the Codex integration, a 👍 reaction on the PR,
+Two gates stand between a finished round and `master`: the reviewer's approval and the build
+signal. This section is the first; the build gate is below, and neither substitutes for the other.
+
+The review gate is the reviewer's approval — for the Codex integration, a 👍 reaction on the PR,
 not a review state. The two channels are disjoint: a round WITH findings posts `COMMENTED` reviews
 — one carrying each inline comment, plus one summary — and no reaction, while a clean round posts no
 review at all and only the reaction. So a string of `COMMENTED` reviews is neither rejection nor
@@ -254,37 +286,106 @@ and a GraphQL-borne silence is indistinguishable from a reviewer's. Thread resol
 GraphQL-only operation left, and it reports a transport failure as a retry rather than as a missing
 thread.
 
-Merge preserving the commit series (the repo convention for topical commits), and confirm the state
-rather than the exit code — `gh pr merge` returns having only enabled auto-merge when the base has
-required checks or a merge queue:
+### The approval is one gate; the build is the other
+
+Approval says a human-or-bot read the diff. It says nothing about whether the tree compiles, and
+those two gates fail independently. On ocannl-staging they failed independently for ten hours: seven
+consecutive merges landed on a `master` that did not build on the only compiler CI builds, and every
+one of those PRs was carrying its own red `ci` run at the moment it merged — the same error, both
+platforms, named file and line. Six of them were reviewed and approved on top of it
+(ahrefs/ocannl#694). Nothing was undetected; nothing read the result.
+
+So merge through the script, which reads the head commit's checks and then merges:
 
 ```bash
-~/.claude/skills/ship-pr/scripts/pr-review.sh retry gh pr merge <n> --repo <owner>/<repo> --merge
-~/.claude/skills/ship-pr/scripts/pr-review.sh retry --read \
-  api repos/<owner>/<repo>/pulls/<n> --jq '"merged=\(.merged) state=\(.state)"'   # before cleanup
+~/.claude/skills/ship-pr/scripts/pr-review.sh merge <owner>/<repo>#<pr>
 ```
 
-Confirm over REST, not `gh pr view --json` / `gh pr checks`: those ride GraphQL, which degrades
-independently of REST, and a nonzero `gh pr merge` whose state query then 503s is exactly the shape
-of a merge that DID land.
+It merges with `--merge`, preserving the commit series (the repo convention for topical commits);
+other `gh pr merge` flags go after a `--` — `--auto` included, and the gate still runs ahead of it.
+That matters on a base with no required checks, where `--auto` is not a queue at all: it merges on
+the spot, which is exactly how six red builds got past a merge step that read nothing.
 
-A merge that instead fails with "Pull request is not mergeable: the merge commit cannot be cleanly
-created" is ambiguous, and the two readings demand opposite moves. GitHub recomputes a PR's
-mergeability asynchronously after every push; until that finishes, the API serves the cached
-verdict, so for some seconds after a push — including the very push that just resolved a real
-conflict — the merge fails with a message byte-identical to a genuine conflict. Seen back-to-back
-on ocannl-staging#373 (2026-08-18): the first failure was real base drift, the second was the stale
-cache over the freshly pushed conflict-resolution merge. So after any push, do not react to that
-failure until you have re-read the PR's `mergeable` field over REST:
+**It refuses when a build check on the head commit concluded `failure`**, printing which ones with
+their run URLs, and exits 1 without calling the merge API at all. That refusal is the whole point:
+open the run, fix the build, push, merge.
+
+It refuses on an unreadable signal too (exit 3). An unread check list is not a green one — that
+distinction is why these reads are REST while `gh pr checks` is GraphQL, which 503s independently
+and answers an outage with an empty list indistinguishable from a PR whose CI never ran.
+
+The other verdicts are not refusals, and none of them is a green light either:
+
+| exit | verdict | what it is |
+| --- | --- | --- |
+| 0 | green | every build check on the head passed |
+| 0 | absent | no build check ran on this commit — path filters (ocannl's `ci` ignores `docs/**`), or CI never started |
+| 1 | RED | a build check concluded `failure` — refused |
+| 3 | unknown | the checks could not be read — refused |
+| 4 | no verdict | still running, or every finished job was `cancelled` |
+
+Exit 4 does not stop the merge: nothing has failed. But nothing has passed, `merge` says so on
+stderr, and `--wait` holds for the verdict instead (30 min, `SHIP_PR_CHECKS_WAIT`). Wait when the
+change is something a compiler sees; don't when it is a doc or a golden re-promote. `cancelled` is
+deliberately neither red nor green — a cancel is a job that was stopped, not one that found
+something, and ocannl's `ci` sets `fail-fast: false` precisely so a red matrix leg does not cancel
+its siblings and destroy the information. A cancel here comes from a superseding push or a manual
+stop, and re-running is what turns it into an answer.
+
+Run `checks` on its own — same verdicts, same exit codes, no merge — whenever you want the build
+signal without acting on it, such as before asking the reviewer for another round.
+
+### The override
 
 ```bash
-~/.claude/skills/ship-pr/scripts/pr-review.sh retry --read \
-  api repos/<owner>/<repo>/pulls/<n> --jq '"mergeable=\(.mergeable) state=\(.mergeable_state)"'
+~/.claude/skills/ship-pr/scripts/pr-review.sh merge <owner>/<repo>#<pr> \
+  --override "the red is the pages Deps step, failing on master since before this branch existed"
 ```
 
-`mergeable=null` means the recomputation is still running — wait a few seconds and re-read rather
-than concluding anything. Only a `mergeable=false` that persists across a re-read means base drift
-needing a merge/rebase; `mergeable=true` means retry the merge, it will land.
+`--override` takes a reason in **words** — a bare token like `yes` is rejected — because what makes
+an override legitimate is being able to say why *this* red is unrelated to *this* PR, and that
+sentence is what the next reader finds in the log. It prints on both stdout and stderr, loudly, and
+then merges.
+
+It is legitimate when you have **established** that the failure is neither about your change nor
+about the tree you are merging into: the identical red is on `master` from before your branch
+existed; the failing step is infrastructure no source change can reach (an opam solve, a runner
+image, a registry timeout, a rate limit); or you can point at another PR whose build fails the same
+way. In each of those you have opened the run and read it.
+
+It is not legitimate for "the error looks unrelated", for a red you have not opened, or for a flake
+you are assuming rather than confirming — re-run the job instead. A re-run costs minutes; an
+override costs whoever branches next their afternoon. And an override is never the way to handle a
+red you caused: an unrelated red is a fact about the world, and a related one is your commit.
+
+Which checks the gate reads is a deny-list, not an allow-list: every check on the commit counts
+unless it is named advisory (`SHIP_PR_ADVISORY_CHECKS`), so a renamed job or a new matrix leg keeps
+gating instead of silently falling out of it. Advisory by default: the review app's own
+permanently-skipped check, and the two github-pages deploy workflows, whose opam step has been red
+on ocannl-staging's master for days over something that has nothing to do with whether the tree
+compiles. That exclusion is deliberate rather than lax — a signal that is always red is one everyone
+stops reading, which is the failure mode #694 is about. If one of those ever becomes load-bearing,
+narrow the variable rather than leaving it to be ignored.
+
+### What `merge` absorbs, and what a nonzero exit therefore means
+
+`gh pr merge` exits 0 having only *enabled* auto-merge when the base carries required checks or a
+merge queue, so the exit code is not the answer; `merge` confirms `merged` over REST and reports
+`merged=false` as a failure to land. REST, not `gh pr view --json` — those ride GraphQL, and a
+nonzero merge whose state query then 503s is exactly the shape of a merge that DID land.
+
+A merge failing with "Pull request is not mergeable: the merge commit cannot be cleanly created" is
+ambiguous, and the two readings demand opposite moves. GitHub recomputes a PR's mergeability
+asynchronously after every push; until that finishes the API serves the cached verdict, so for some
+seconds after a push — including the very push that just resolved a real conflict — the merge fails
+with a message byte-identical to a genuine conflict. Seen back to back on ocannl-staging#373
+(2026-08-18): first real base drift, then the stale cache over the freshly pushed
+conflict-resolution merge. `merge` re-reads `.mergeable` over REST until it is non-null and retries
+on `true`, so a nonzero exit from it already means the recompute settled: `mergeable=false` is base
+drift needing a merge or rebase of the base branch, and only a repeated failure after that is a
+conflict you must resolve.
+
+### After it lands
 
 Then clean up, but not with `gh pr merge --delete-branch`: from a worktree its cleanup fails *after*
 the merge has landed ("fatal: 'master' is already used by worktree"), leaving the branch behind and
@@ -299,8 +400,10 @@ If the harness blocks the merge itself, that is a permission gate, not a failure
 were doing, give the command, and let the user decide. Never work around it.
 
 After merging: refresh the base for the next branch (`git fetch origin`, then branch off
-`origin/master` again), tear down any scratch worktrees the work created on remote machines, and
-run the `after-merge` brainstorm while the session's friction is still in context.
+`origin/master` again) — and since your merge is what that base now carries, `base` is worth one
+more call here, before the next branch inherits it. Then tear down any scratch worktrees the work
+created on remote machines, and run the `after-merge` brainstorm while the session's friction is
+still in context.
 
 ## Multi-PR arcs
 
