@@ -47,14 +47,18 @@
 #     that never starts and a 👀 that never lands both end with a verdict to nudge rather than with
 #     another silent hold. "Wait it out" is only honest while something is actually running.
 #
-# For a future `merge` helper (none exists yet; today the SKILL.md merge section carries this):
-# GitHub recomputes a PR's mergeability asynchronously after every push, and until that finishes
-# `gh pr merge` fails with "Pull request is not mergeable: the merge commit cannot be cleanly
-# created" — byte-identical to a genuine conflict. On ocannl-staging#373 (2026-08-18) the failure
-# fired seconds after pushing the conflict-RESOLUTION merge commit; re-reading
-# `api repos/<o>/<r>/pulls/<n> --jq .mergeable` moments later gave mergeable=true and the retried
-# merge landed. A merge helper must poll .mergeable over REST until it is non-null before treating
-# that failure as base drift (null = still computing; only a false that persists is a conflict).
+# The `merge` command exists for the same reason as the rest of this file: what the merge step has
+# to READ before it acts does not survive as prose. It reads the head commit's check-runs and
+# REFUSES on a build check that concluded failure (ahrefs/ocannl#694 — seven merges onto a master
+# that did not compile, each PR carrying its own red run), and it absorbs the merge traps: GitHub
+# recomputes a PR's mergeability asynchronously after every push, and until that finishes `gh pr
+# merge` fails with "Pull request is not mergeable: the merge commit cannot be cleanly created" —
+# byte-identical to a genuine conflict. On ocannl-staging#373 (2026-08-18) that fired seconds after
+# pushing the conflict-RESOLUTION merge commit; re-reading .mergeable moments later gave true and
+# the retried merge landed. So it polls .mergeable over REST until it is non-null before calling
+# that failure base drift (null = still computing; only a persisting false is a conflict), and it
+# confirms `merged` over REST afterwards, because `gh pr merge` exits 0 having merely ENABLED
+# auto-merge when the base carries required checks.
 #
 # REST vs GraphQL: everything on the polling and merge-gate path is REST, deliberately — GitHub's
 # GraphQL endpoint 503s independently of REST, so a GraphQL-borne "no reaction yet" is a lie the
@@ -68,6 +72,12 @@
 #   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands; 0 = act, 1 = quiet
 #   pr-review.sh status <pr>               # merge gate + who owes what: approved / reviewing /
 #                                          # stalled / expected / idle / unknown
+#   pr-review.sh checks <pr> [--wait]      # the BUILD signal on the head commit: green / red /
+#                                          # no verdict yet / absent
+#   pr-review.sh merge <pr> [--override "<why this red is unrelated>"] [--wait]
+#                                          # checks, then merge; refuses on red without --override
+#   pr-review.sh base [owner/name] [branch]
+#                                          # is the branch you are about to work off CI-green?
 #   pr-review.sh reply <pr> <comment-id> <body>
 #   pr-review.sh resolve <pr> <comment-id>
 #   pr-review.sh retry [--read] <gh args...>
@@ -76,8 +86,12 @@
 #
 # Exit codes: 0 the command did what it says (and any fact it printed came from a call that
 #             answered); 1 the fact does not hold (the window stayed quiet, no such thread, the API
-#             rejected the request); 2 usage/configuration error; 3 TRANSPORT failure — nothing was
-#             learned, so retry rather than concluding anything. 1 and 3 are kept apart everywhere.
+#             rejected the request, a build check is RED, the merge was refused); 2
+#             usage/configuration error; 3 TRANSPORT failure — nothing was learned, so retry rather
+#             than concluding anything. 1 and 3 are kept apart everywhere. `checks` and `base` add
+#             4: no verdict yet — the build has not finished, or every finished job was cancelled.
+#             4 is not a pass and not a failure, and it is kept apart from 0 for the same reason
+#             3 is: "nothing has failed" and "everything passed" are different facts.
 #
 # Env: REPO=owner/name (else the <pr> argument, else the cwd's checkout, else the per-PR cache),
 #      REVIEWER=login-prefix (default: codex app), WATCH_INTERVAL=seconds between polls (default
@@ -88,6 +102,9 @@
 #      saying so (1200), SHIP_PR_REVIEW_STALL=seconds a live 👀 may run before it gets the same
 #      verdict (2×GRACE). Both are measured from the PR's own timestamps, not from when the watch
 #      started, so they are reached ACROSS windows — a 900s window cannot outrun a 1200s grace.
+#      SHIP_PR_ADVISORY_CHECKS=ERE of check/workflow names the build gate ignores (default: the
+#      review app's check and the github-pages deploys), SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
+#      out for a build verdict (1800), SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60).
 
 set -uo pipefail
 
@@ -843,6 +860,394 @@ cmd_retry() {
   esac
 }
 
+# --- the build signal -------------------------------------------------------------------------
+# ahrefs/ocannl#694: a master that did not compile on OCaml 5.5 survived seven consecutive merges.
+# Detection was never missing — every one of those PRs had its own red `ci` run, byte-identical
+# error, both platforms, before it merged. The signal was produced six times and consumed zero
+# times, because no step between "run finished red" and "merge" read the result. So the read lives
+# here, in the merge command itself, rather than as a line of prose asking the next session to
+# remember it.
+#
+# The reads are REST, like the rest of the merge path: `gh pr checks` rides GraphQL, which 503s
+# independently of REST, and a GraphQL-borne empty check list is indistinguishable from a PR whose
+# CI genuinely never ran. On a merge gate that difference is the whole point — a failed read
+# reports UNKNOWN (exit 3) and never "nothing is red".
+#
+# Which checks count is a DENY-list, not an allow-list. Everything a commit's check-runs report is
+# build-relevant unless it is named advisory. An allow-list keyed on today's job names ("Build
+# (ubuntu-latest, 5.5.x)") stops gating silently the day a job is renamed or a matrix entry is
+# added — it fails OPEN, which is the exact failure this exists to prevent. What is advisory by
+# default: the review app's check (permanently SKIPPED on the PR path) and the github-pages deploy
+# workflows, whose opam `Deps` step has been failing on ocannl-staging's master for days over
+# something that has nothing to do with whether the tree compiles. A signal that is always red
+# teaches everyone to stop reading it, which is the pathology #694 is about — so a chronically red
+# deploy is excluded by name rather than allowed to drown the build verdict.
+#
+# Which CONCLUSIONS count as red is deliberately narrow, because the merge path must not cry wolf:
+#   failure, timed_out, startup_failure   a verdict, and the verdict is no
+#   success, skipped, neutral             green; a path-filtered job that did not run has not failed
+#   cancelled, stale, action_required     NO VERDICT — reported, never counted as red and never
+#                                         counted as a pass
+# `cancelled` is the one worth spelling out: a cancel means the job was stopped, not that it found
+# anything. ocannl's ci sets `fail-fast: false` precisely so a red matrix leg does not cancel its
+# siblings, but that has not always been true and is not true of every workflow, and a superseding
+# push cancels too. Treating a cancel as red would make every force-push a refusal; treating it as
+# green would let a matrix leg that never finished pass for one that passed. It is neither.
+BUILD_ADVISORY="${SHIP_PR_ADVISORY_CHECKS:-^(claude|Claude Code|github pages( .*)?)$}"
+CHECKS_INTERVAL="${SHIP_PR_CHECKS_INTERVAL:-60}"
+CHECKS_WAIT="${SHIP_PR_CHECKS_WAIT:-1800}"
+
+is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }
+
+conclusion_class() {
+  case "$1" in
+  failure | timed_out | startup_failure) echo red ;;
+  success | skipped | neutral) echo green ;;
+  '' | null | pending) echo pending ;;
+  *) echo nogo ;; # cancelled, stale, action_required: stopped, not judged
+  esac
+}
+
+# Prints "class<TAB>name<TAB>conclusion<TAB>url" per non-advisory check-run of <sha>. Returns 3
+# printing NOTHING when the read failed, so the caller can tell an outage from a commit with no
+# checks — collapsing those two is how a merge gate says "nothing is red" about a PR it never read.
+# filter=latest is explicit: a re-run adds a second check-run under the same name, and the older
+# one's conclusion is not the current answer.
+#
+# No field is ever emitted EMPTY, and that is not cosmetic: tab is an IFS *whitespace* character,
+# so `IFS=$'\t' read` collapses a run of tabs into one delimiter. An unfinished check-run has a
+# null conclusion, so an empty middle field would silently shift its URL into the conclusion
+# column and every pending job would be classified by the text of its own link. The placeholder
+# keeps the columns aligned.
+build_checks() {
+  local sha="$1" raw rc name concl url
+  raw=$(gh_retry read api --paginate \
+    "repos/$REPO/commits/$sha/check-runs?filter=latest&per_page=100" \
+    --jq '.check_runs[] | [.name, (.conclusion // "pending"), (.html_url // "-")] | @tsv')
+  rc=$?
+  [ "$rc" -eq 0 ] || return 3
+  while IFS=$'\t' read -r name concl url; do
+    [ -n "$name" ] || continue
+    is_advisory "$name" && continue
+    printf '%s\t%s\t%s\t%s\n' "$(conclusion_class "$concl")" "$name" "$concl" "$url"
+  done <<<"$raw"
+}
+
+# Folds the per-check classes into VERDICT (red|pending|mixed|absent|green) and the report lines.
+# Runs in the current shell — a pipeline would put the loop in a subshell and lose both.
+summarize_checks() {
+  local class name concl url red=0 pending=0 nogo=0 green=0
+  VERDICT=""
+  CHECK_LINES=""
+  CHECK_RED=0
+  while IFS=$'\t' read -r class name concl url; do
+    [ -n "$class" ] || continue
+    case "$class" in
+    red)
+      red=$((red + 1))
+      CHECK_LINES="${CHECK_LINES}  RED      $name ($concl)  $url"$'\n'
+      ;;
+    pending)
+      pending=$((pending + 1))
+      CHECK_LINES="${CHECK_LINES}  running  $name (no verdict yet)  $url"$'\n'
+      ;;
+    nogo)
+      nogo=$((nogo + 1))
+      CHECK_LINES="${CHECK_LINES}  no verdict  $name ($concl — stopped, not judged)  $url"$'\n'
+      ;;
+    *) green=$((green + 1)) ;;
+    esac
+  done <<<"$1"
+  CHECK_RED="$red"
+  CHECK_TOTAL=$((red + pending + nogo + green))
+  if [ "$red" -gt 0 ]; then
+    VERDICT=red
+  elif [ "$pending" -gt 0 ]; then
+    VERDICT=pending
+  elif [ "$nogo" -gt 0 ]; then
+    VERDICT=mixed
+  elif [ "$green" -eq 0 ]; then
+    VERDICT=absent
+  else
+    VERDICT=green
+  fi
+  CHECK_GREEN="$green"
+}
+
+# Reads the PR's head SHA and judges its build signal. Sets VERDICT and prints the report.
+# 0 = green or absent (nothing is red), 1 = RED, 3 = the API did not answer, 4 = no verdict yet
+# (still running, or every finished job was cancelled).
+gate_checks() {
+  local pr="$1" wait_for="${2:-0}" sha lines rc deadline
+  sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha)
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$sha" ]; then
+    VERDICT=unknown
+    warn "could not read $REPO#$pr's head SHA ($(gh_err_line)); the build signal is UNKNOWN," \
+      "which is NOT 'nothing is red'."
+    return 3
+  fi
+  deadline=$(($(date +%s) + wait_for))
+  while :; do
+    lines=$(build_checks "$sha")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      VERDICT=unknown
+      warn "could not read the checks of $REPO#$pr @${sha:0:8} ($(gh_err_line));" \
+        "the build signal is UNKNOWN, which is NOT 'nothing is red'."
+      return 3
+    fi
+    summarize_checks "$lines"
+    [ "$VERDICT" = pending ] && [ "$(date +%s)" -lt "$deadline" ] || break
+    warn "build still running on $REPO#$pr; re-reading in ${CHECKS_INTERVAL}s"
+    sleep "$CHECKS_INTERVAL"
+  done
+  case "$VERDICT" in
+  red) echo "build signal $REPO#$pr @${sha:0:8}: RED — $CHECK_RED of $CHECK_TOTAL build checks failed" ;;
+  pending) echo "build signal $REPO#$pr @${sha:0:8}: NO VERDICT YET — still running" ;;
+  mixed) echo "build signal $REPO#$pr @${sha:0:8}: INCOMPLETE — $CHECK_GREEN passed, the rest were stopped without a verdict" ;;
+  absent) echo "build signal $REPO#$pr @${sha:0:8}: ABSENT — no build check ran on this commit (path filters, or CI never started)" ;;
+  green) echo "build signal $REPO#$pr @${sha:0:8}: green — $CHECK_GREEN build checks passed" ;;
+  esac
+  [ -n "$CHECK_LINES" ] && printf '%s' "$CHECK_LINES"
+  case "$VERDICT" in
+  red) return 1 ;;
+  pending | mixed) return 4 ;;
+  *) return 0 ;;
+  esac
+}
+
+cmd_checks() {
+  local pr="${1:?usage: checks <pr> [--wait[=seconds]]}" wait_for=0
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --wait) wait_for="$CHECKS_WAIT" ;;
+    --wait=*) wait_for="${1#--wait=}" ;;
+    *) die "checks: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  pr_arg "$pr"
+  gate_checks "$PR_NUM" "$wait_for"
+}
+
+# GitHub recomputes a PR's mergeability asynchronously after every push, and until that finishes
+# `gh pr merge` fails with a message byte-identical to a genuine conflict. Seen back to back on
+# ocannl-staging#373: real base drift, then the stale cache over the freshly pushed
+# conflict-RESOLUTION merge. null = still computing, so it is not an answer to anything.
+await_mergeable() {
+  local i m rc
+  for i in 1 2 3 4 5 6 7 8; do
+    m=$(gh_retry read api "repos/$REPO/pulls/$PR_NUM" --jq '.mergeable | tostring')
+    rc=$?
+    [ "$rc" -eq 0 ] || {
+      echo unknown
+      return 3
+    }
+    case "$m" in
+    true | false)
+      echo "$m"
+      return 0
+      ;;
+    esac
+    sleep 5
+  done
+  echo null
+  return 4
+}
+
+# merge = read the build signal, then merge. The two are one command on purpose: a gate you have
+# to remember to run separately is the gate that was missing for seven merges.
+cmd_merge() {
+  local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [-- <gh pr merge args...>]}"
+  shift
+  local override="" wait_for=0 gate out rc attempt=1 mergeable state
+  local -a gh_args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --override)
+      override="${2:?--override needs a reason}"
+      shift 2
+      ;;
+    --override=*)
+      override="${1#--override=}"
+      shift
+      ;;
+    --wait)
+      wait_for="$CHECKS_WAIT"
+      shift
+      ;;
+    --wait=*)
+      wait_for="${1#--wait=}"
+      shift
+      ;;
+    --)
+      shift
+      gh_args=("$@")
+      break
+      ;;
+    *) die "merge: unknown option '$1' (extra \`gh pr merge\` flags go after --)" ;;
+    esac
+  done
+  [ ${#gh_args[@]} -gt 0 ] || gh_args=(--merge) # the repo convention: preserve the commit series
+  # A reason, not a token. "--override yes" would make the gate a formality one keystroke wide;
+  # what makes an override legitimate is being able to say why THIS red is unrelated to THIS PR,
+  # and that sentence is what lands in the log the next reader sees.
+  if [ -n "$override" ] &&
+    ! printf '%s' "$override" | grep -Eq '[^[:space:]]+[[:space:]]+[^[:space:]]+'; then
+    die "merge: --override takes a REASON in words, not '$override'. Say why this red is" \
+      "known-unrelated to this PR — e.g. --override 'ci Deps step fails on an opam solve," \
+      "same red on master before this branch existed'."
+  fi
+  pr_arg "$pr"
+  gate_checks "$PR_NUM" "$wait_for"
+  gate=$?
+  case "$gate" in
+  1)
+    if [ -n "$override" ]; then
+      echo "OVERRIDE: merging $REPO#$PR_NUM over a RED build signal — $override"
+      warn "OVERRIDE: merging $REPO#$PR_NUM over $CHECK_RED red build check(s) — $override"
+    else
+      fail 1 "REFUSING to merge $REPO#$PR_NUM: $CHECK_RED build check(s) concluded failure on the" \
+        "head commit (listed above). Fix it, or — only if that red is genuinely not about this" \
+        "change — re-run with --override '<why this red is unrelated>'."
+    fi
+    ;;
+  3) fail 3 "NOT merging $REPO#$PR_NUM: the build signal could not be READ. Nothing is known," \
+    "so this is not 'nothing is red' — retry rather than merging past it." ;;
+  4)
+    warn "merging $REPO#$PR_NUM with NO build verdict on the head commit (see above)." \
+      "Nothing has failed; nothing has passed either. Use --wait to hold for the verdict."
+    ;;
+  esac
+  while :; do
+    out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" "${gh_args[@]}")
+    rc=$?
+    [ -n "$out" ] && printf '%s\n' "$out"
+    [ "$rc" -eq 0 ] && break
+    case "$(gh_err_line)" in
+    *"not mergeable"* | *"cannot be cleanly created"*)
+      [ "$attempt" -ge 3 ] && fail 1 "merge of $REPO#$PR_NUM keeps failing as not mergeable" \
+        "after $attempt attempts: this is base drift, merge or rebase origin/<base> in."
+      mergeable=$(await_mergeable)
+      case "$mergeable" in
+      true)
+        warn "'not mergeable' was the stale pre-recompute verdict (mergeable=true now); retrying"
+        attempt=$((attempt + 1))
+        continue
+        ;;
+      false) fail 1 "$REPO#$PR_NUM really does not merge cleanly (mergeable=false after the" \
+        "recompute): merge or rebase the base branch in, push, then merge again." ;;
+      *) fail 3 "$REPO#$PR_NUM failed to merge as 'not mergeable' and its mergeable field is" \
+        "$mergeable — GitHub is still computing, or did not answer. Re-read before concluding." ;;
+      esac
+      ;;
+    esac
+    api_rejection "$(gh_err_line)" && fail 1 "gh pr merge was rejected: $(gh_err_line)"
+    fail 3 "gh pr merge failed AMBIGUOUSLY: $(gh_err_line). It may have LANDED — confirm over" \
+      "REST (api repos/$REPO/pulls/$PR_NUM --jq .merged) before retrying."
+  done
+  # `gh pr merge` returns 0 having only ENABLED auto-merge when the base carries required checks or
+  # a merge queue, so the exit code is not the answer. REST is, and it is REST because a GraphQL
+  # 503 on the confirmation looks exactly like a merge that did not land.
+  state=$(gh_retry read api "repos/$REPO/pulls/$PR_NUM" --jq '"merged=\(.merged) state=\(.state)"')
+  rc=$?
+  [ "$rc" -eq 0 ] || fail 3 "merge command returned but the state could not be confirmed" \
+    "($(gh_err_line)) — do NOT re-merge; re-read repos/$REPO/pulls/$PR_NUM first."
+  echo "$REPO#$PR_NUM $state"
+  case "$state" in
+  *"merged=true"*) return 0 ;;
+  esac
+  fail 1 "$REPO#$PR_NUM is not merged ($state) — \`gh pr merge\` returned having only enabled" \
+    "auto-merge. It will land when the base's required checks pass; do not treat it as landed."
+}
+
+# The other half of #694: the confusion actually lands on whoever branches off a broken master.
+# Read the base's own CI before starting work, not only before merging.
+cmd_base() {
+  local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    */*) REPO="$1" ;;
+    -*) die "base: unknown option '$1'" ;;
+    *) branch="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$REPO" ] || REPO=$(repo_from_cwd) || true
+  [ -n "$REPO" ] || die "base: name the repo — \`base owner/name [branch]\`, --repo, or REPO=." \
+    "cwd inference only works from a checkout, and not from a background shell."
+  if [ -z "$branch" ]; then
+    branch=$(gh_retry read api "repos/$REPO" --jq .default_branch)
+    [ $? -eq 0 ] && [ -n "$branch" ] || fail 3 "could not read $REPO's default branch" \
+      "($(gh_err_line)) — the base's health is UNKNOWN, which is not 'fine'."
+  fi
+  tip=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || tip=""
+  raw=$(gh_retry read api \
+    "repos/$REPO/actions/runs?branch=$branch&event=push&per_page=50" \
+    --jq '.workflow_runs[] | [.name, .status, (.conclusion // "pending"), .head_sha, .created_at,
+          (.html_url // "-")] | @tsv')
+  rc=$?
+  [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's runs on $branch ($(gh_err_line));" \
+    "the base's health is UNKNOWN, which is NOT 'green'."
+  # Newest first, so per workflow: the newest run at all (is one in flight?) and the newest
+  # COMPLETED one (what is the last actual verdict?). The two differ routinely and the second is
+  # the one that answers "is this base broken".
+  # Same empty-field rule as build_checks: a workflow with no completed run yet leaves four of
+  # these columns unset, and unset prints as empty, which `IFS=$'\t' read` would collapse.
+  raw=$(awk -F'\t' '
+    { nm=$1
+      if (!(nm in seen)) { seen[nm]=1; order[++n]=nm; lstatus[nm]=$2; lsha[nm]=$4 }
+      if ($2 == "completed" && !(nm in done)) { done[nm]=1; c[nm]=$3; csha[nm]=$4; cw[nm]=$5; cu[nm]=$6 }
+    }
+    END { for (i=1;i<=n;i++) { nm=order[i]
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", nm, lstatus[nm], lsha[nm],
+          (nm in done ? c[nm] : "pending"), (nm in done ? csha[nm] : "-"),
+          (nm in done ? cw[nm] : "-"), (nm in done ? cu[nm] : "-") } }
+  ' <<<"$raw")
+  while IFS=$'\t' read -r name status sha concl csha cwhen curl; do
+    [ -n "$name" ] || continue
+    is_advisory "$name" && continue
+    case "$(conclusion_class "$concl")" in
+    red)
+      red=$((red + 1))
+      out="${out}  RED      $name — $concl at ${csha:0:8} ($cwhen)  $curl"$'\n'
+      ;;
+    green) out="${out}  green    $name — $concl at ${csha:0:8}"$'\n' ;;
+    pending)
+      pend=$((pend + 1))
+      out="${out}  no verdict  $name — has never completed on $branch"$'\n'
+      ;;
+    *) out="${out}  no verdict  $name — $concl at ${csha:0:8} (stopped, not judged)  $curl"$'\n' ;;
+    esac
+    # A run whose head is behind the tip is normal here (ci carries paths-ignore: docs/**), but it
+    # means the verdict is about an older tree than the one you are about to branch from.
+    [ "$csha" = "-" ] && csha=""
+    if [ "$status" != completed ]; then
+      out="${out}           ($name is running now at ${sha:0:8})"$'\n'
+    elif [ -n "$tip" ] && [ -n "$csha" ] && [ "$csha" != "$tip" ]; then
+      out="${out}           (that verdict is about ${csha:0:8}, not the tip ${tip:0:8})"$'\n'
+    fi
+  done <<<"$raw"
+  if [ "$red" -gt 0 ]; then
+    echo "!!! $REPO $branch is RED — $red workflow(s) failed on the tip you are about to branch from"
+    printf '%s' "$out"
+    echo "!!! Branching off a red base makes every later 'is this my change?' question expensive."
+    echo "!!! Read the run above first: if it is already broken, say so before starting, and do not"
+    echo "!!! spend the session bisecting someone else's break."
+    return 1
+  fi
+  if [ -z "$out" ]; then
+    echo "$REPO $branch: no build workflow has run on it (nothing to read, not a green light)"
+    return 4
+  fi
+  echo "$REPO $branch: green${tip:+ (tip ${tip:0:8})}"
+  printf '%s' "$out"
+  [ "$pend" -gt 0 ] && return 4
+  return 0
+}
+
 # --repo mirrors gh's own flag, so reaching for it out of gh habit works instead of hitting usage.
 case "${1:-}" in
 --repo) REPO="${2:?--repo owner/name}" && shift 2 ;;
@@ -853,10 +1258,14 @@ case "${1:-}" in
 poll) shift && cmd_poll "$@" ;;
 watch) shift && cmd_watch "$@" ;;
 status) shift && cmd_status "$@" ;;
+checks) shift && cmd_checks "$@" ;;
+merge) shift && cmd_merge "$@" ;;
+base) shift && cmd_base "$@" ;;
 reply) shift && cmd_reply "$@" ;;
 resolve) shift && cmd_resolve "$@" ;;
 retry) shift && cmd_retry "$@" ;;
-*) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|reply|resolve} <pr> ...
+*) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|checks|merge|reply|resolve} <pr> ...
+  pr-review.sh base [owner/name] [branch]    # is the base branch's CI green? (start of work)
   pr-review.sh retry [--read] <gh args...>   # any other gh call, same retry policy
   <pr> is a number or owner/name#number; prefer owner/name#number for background invocations." ;;
 esac
