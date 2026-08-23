@@ -140,7 +140,8 @@ The coordinator's job between launch and last merge:
   on 2026-08-23 (#452 → red for two hours). `merge --wait` now refuses without a verdict (see
   ship-pr): brief agents to background it and let it hold, raising `SHIP_PR_CHECKS_WAIT` past
   the observed backlog rather than reaching for `--allow-no-verdict` — merging on the one leg
-  that ran is that flag too, with the same bar. A red the next agent inherits is diagnosed by
+  that ran is that flag too, with the same bar — and whoever does merge unread owns re-checking
+  the master run it produces. A red the next agent inherits is diagnosed by
   `git log` on master between the last green and first red run, not by re-bisecting locally;
   one agent owns the fix-forward and every other open PR is told the red is established.
 - **Stacked launches.** When a gated item depends on a sibling PR that is approved but waiting
