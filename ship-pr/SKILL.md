@@ -328,20 +328,48 @@ The other verdicts are not refusals, and none of them is a green light either:
 | 0 | absent | no build check ran on this commit — path filters (ocannl's `ci` ignores `docs/**`), or CI never started |
 | 1 | RED | a build check concluded `failure` — refused |
 | 3 | unknown | the checks could not be read — refused |
-| 4 | no verdict | still running, or every finished job was `cancelled` |
+| 4 | no verdict | still running, or every finished job was `cancelled` — refused without `--allow-no-verdict` |
 
-Exit 4 does not stop the merge: nothing has failed. But nothing has passed, `merge` says so on
-stderr, and `--wait` holds for the verdict instead (30 min, `SHIP_PR_CHECKS_WAIT`). Wait when the
-change is something a compiler sees; don't when it is a doc or a golden re-promote. `cancelled` is
-deliberately neither red nor green — a cancel is a job that was stopped, not one that found
-something, and ocannl's `ci` sets `fail-fast: false` precisely so a red matrix leg does not cancel
-its siblings and destroy the information. A cancel here comes from a superseding push or a manual
-stop, and re-running is what turns it into an answer.
+**Exit 4 refuses too, by default.** Nothing has failed, but nothing has passed, and a merge that
+waits for neither is a merge that read nothing. It used to be a warning: on 2026-08-23 the runner
+queue ran ~2 h deep all day, `--wait`'s 30 minutes ran out with the checks still queued, and two
+PRs merged on the warning — one carrying a stale test claim (ahrefs/ocannl#745, fixed forward in
+lukstafi/ocannl-staging#456), `master` red for two hours, and the next several agents inheriting
+the red. So now:
+
+```bash
+~/.claude/skills/ship-pr/scripts/pr-review.sh merge <owner>/<repo>#<pr> --wait
+```
+
+`--wait` holds for the verdict — up to 120 min by default (`SHIP_PR_CHECKS_WAIT`, seconds; or
+`--wait=<seconds>`), printing a one-line heartbeat every 10 min (`SHIP_PR_CHECKS_HEARTBEAT`) so a
+background Bash child shows it is alive rather than hung. Run it in the background and let it
+hold; the queue is what it is. If the ceiling runs out it exits 4 with "no verdict after N min —
+re-run with --allow-no-verdict to merge unread, or wait", and waiting again is the right answer
+for anything a compiler sees.
+
+`--allow-no-verdict` restores the old behaviour explicitly: it merges unread, saying so loudly on
+both stdout and stderr. It is acceptable only when the verdict could not tell you anything you
+have not already established yourself — a doc-only diff, or a shell-only one whose script you ran
+locally on the **exact rebased tree** you are merging (not the branch as it was before the rebase:
+a rebase is a new tree, and "I tested it earlier" is the stale test claim of #745). For anything
+that compiles, wait. The flag is not for "CI is slow today" — that is exactly the day it exists to
+refuse.
+
+`cancelled` is deliberately neither red nor green — a cancel is a job that was stopped, not one
+that found something, and ocannl's `ci` sets `fail-fast: false` precisely so a red matrix leg does
+not cancel its siblings and destroy the information. A cancel here comes from a superseding push or
+a manual stop, and re-running is what turns it into an answer; it is exit 4 like a running job, and
+`--allow-no-verdict` is no more acceptable for it.
 
 Run `checks` on its own — same verdicts, same exit codes, no merge — whenever you want the build
 signal without acting on it, such as before asking the reviewer for another round.
 
 ### The override
+
+The gate has two escape hatches, for two different facts. `--allow-no-verdict` (above) is for a
+verdict that has not arrived; `--override` is for one that has arrived and is red. They do not
+substitute for each other: a red is never "no verdict", and a queue is never "an unrelated red".
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/pr-review.sh merge <owner>/<repo>#<pr> \

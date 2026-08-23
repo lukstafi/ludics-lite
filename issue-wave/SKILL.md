@@ -124,14 +124,17 @@ The coordinator's job between launch and last merge:
   coming — and with "rebase before opening and before merging": CI builds the MERGE commit, so a
   repo-wide scan green on the branch can be red against what landed on master meanwhile.
 - **Merge gates under a saturated runner queue.** GitHub's macOS runners serialize; a
-  20-PR day queues master runs ~2 h deep, and `pr-review.sh merge --wait`'s default window
-  (30 min) lapses into a "no verdict" merge — which is how a stale test claim reached master
-  unread on 2026-08-23 (#452 → red for two hours until a fix-forward). Brief agents to raise
-  `SHIP_PR_CHECKS_WAIT` past the observed backlog, to merge on the leg that actually runs the
-  affected test when the other leg is only queued, and to re-check the master run after a
-  no-verdict merge. A red the next agent inherits is diagnosed by `git log` on master between
-  the last green and first red run, not by re-bisecting locally; one agent owns the fix-forward
-  and every other open PR is told the red is established.
+  20-PR day queues master runs ~2 h deep. `pr-review.sh merge --wait` used to lapse into a
+  "no verdict" merge after 30 min — which is how a stale test claim reached master unread on
+  2026-08-23 (#452 → red for two hours until a fix-forward). It now waits 120 min by default
+  (`SHIP_PR_CHECKS_WAIT`) with a 10-min heartbeat and REFUSES (exit 4) when no verdict arrives;
+  merging unread takes `--allow-no-verdict`, acceptable only for doc-only or shell-only diffs
+  verified locally on the exact rebased tree (see ship-pr). Brief agents to run the merge in the
+  background and let it hold, to raise `SHIP_PR_CHECKS_WAIT` past the observed backlog rather
+  than reach for the flag, and to re-check the master run after any merge that did go unread. A
+  red the next agent inherits is diagnosed by `git log` on master between the last green and
+  first red run, not by re-bisecting locally; one agent owns the fix-forward and every other open
+  PR is told the red is established.
 - **Stacked launches.** When a gated item depends on a sibling PR that is approved but waiting
   on CI, launch it off the sibling's branch (`git worktree add ... origin/claude/<sibling>`),
   have it implement there, and open its PR only after the sibling merges and it has rebased —

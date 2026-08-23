@@ -81,7 +81,9 @@
 #   pr-review.sh checks <pr> [--wait]      # the BUILD signal on the head commit: green / red /
 #                                          # no verdict yet / absent
 #   pr-review.sh merge <pr> [--override "<why this red is unrelated>"] [--wait]
-#                                          # checks, then merge; refuses on red without --override
+#                           [--allow-no-verdict]
+#                                          # checks, then merge; refuses on red without --override,
+#                                          # and on NO verdict without --allow-no-verdict
 #   pr-review.sh base [owner/name] [branch]
 #                                          # is the branch you are about to work off CI-green?
 #   pr-review.sh reply <pr> <comment-id> <body>
@@ -94,10 +96,12 @@
 #             answered); 1 the fact does not hold (the window stayed quiet, no such thread, the API
 #             rejected the request, a build check is RED, the merge was refused); 2
 #             usage/configuration error; 3 TRANSPORT failure — nothing was learned, so retry rather
-#             than concluding anything. 1 and 3 are kept apart everywhere. `checks` and `base` add
-#             4: no verdict yet — the build has not finished, or every finished job was cancelled.
-#             4 is not a pass and not a failure, and it is kept apart from 0 for the same reason
-#             3 is: "nothing has failed" and "everything passed" are different facts.
+#             than concluding anything. 1 and 3 are kept apart everywhere. `checks`, `base` and
+#             `merge` add 4: no verdict yet — the build has not finished, or every finished job was
+#             cancelled. 4 is not a pass and not a failure, and it is kept apart from 0 for the
+#             same reason 3 is: "nothing has failed" and "everything passed" are different facts.
+#             From `merge`, 4 means the merge was REFUSED for want of a verdict (see
+#             --allow-no-verdict).
 #
 # Env: REPO=owner/name (else the <pr> argument, else the cwd's checkout, else the per-PR cache),
 #      REVIEWER=login-prefix (default: codex app), WATCH_INTERVAL=seconds between polls (default
@@ -110,7 +114,9 @@
 #      started, so they are reached ACROSS windows — a 900s window cannot outrun a 1200s grace.
 #      SHIP_PR_ADVISORY_CHECKS=ERE of check/workflow names the build gate ignores (default: the
 #      review app's check and the github-pages deploys), SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
-#      out for a build verdict (1800), SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60).
+#      out for a build verdict (7200 — the runner queue alone ran ~2h deep on 2026-08-23),
+#      SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60), SHIP_PR_CHECKS_HEARTBEAT=seconds
+#      between the one-line "still waiting" progress notes a `--wait` prints (600).
 
 set -uo pipefail
 
@@ -927,7 +933,8 @@ cmd_retry() {
 # green would let a matrix leg that never finished pass for one that passed. It is neither.
 BUILD_ADVISORY="${SHIP_PR_ADVISORY_CHECKS:-^(claude|Claude Code|github pages docs)$}"
 CHECKS_INTERVAL="${SHIP_PR_CHECKS_INTERVAL:-60}"
-CHECKS_WAIT="${SHIP_PR_CHECKS_WAIT:-1800}"
+CHECKS_WAIT="${SHIP_PR_CHECKS_WAIT:-7200}"
+CHECKS_HEARTBEAT="${SHIP_PR_CHECKS_HEARTBEAT:-600}"
 
 is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }
 
@@ -991,6 +998,7 @@ summarize_checks() {
     esac
   done <<<"$1"
   CHECK_RED="$red"
+  CHECK_PENDING="$pending"
   CHECK_TOTAL=$((red + pending + nogo + green))
   if [ "$red" -gt 0 ]; then
     VERDICT=red
@@ -1010,7 +1018,7 @@ summarize_checks() {
 # 0 = green or absent (nothing is red), 1 = RED, 3 = the API did not answer, 4 = no verdict yet
 # (still running, or every finished job was cancelled).
 gate_checks() {
-  local pr="$1" wait_for="${2:-0}" sha lines rc deadline
+  local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now
   sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha)
   rc=$?
   if [ "$rc" -ne 0 ] || [ -z "$sha" ]; then
@@ -1019,7 +1027,9 @@ gate_checks() {
       "which is NOT 'nothing is red'."
     return 3
   fi
-  deadline=$(($(date +%s) + wait_for))
+  started=$(date +%s)
+  deadline=$((started + wait_for))
+  beat=$started
   while :; do
     lines=$(build_checks "$sha")
     rc=$?
@@ -1030,8 +1040,15 @@ gate_checks() {
       return 3
     fi
     summarize_checks "$lines"
-    [ "$VERDICT" = pending ] && [ "$(date +%s)" -lt "$deadline" ] || break
-    warn "build still running on $REPO#$pr; re-reading in ${CHECKS_INTERVAL}s"
+    now=$(date +%s)
+    [ "$VERDICT" = pending ] && [ "$now" -lt "$deadline" ] || break
+    # One line per heartbeat, not per re-read: a two-hour wait is 120 re-reads, and a background
+    # child that prints that much is as unreadable as one that prints nothing.
+    if [ $((now - beat)) -ge "$CHECKS_HEARTBEAT" ]; then
+      warn "still waiting on $REPO#$pr @${sha:0:8}: no verdict after $(((now - started) / 60)) of" \
+        "$((wait_for / 60)) min ($CHECK_PENDING check(s) running)"
+      beat=$now
+    fi
     sleep "$CHECKS_INTERVAL"
   done
   case "$VERDICT" in
@@ -1092,9 +1109,9 @@ await_mergeable() {
 # merge = read the build signal, then merge. The two are one command on purpose: a gate you have
 # to remember to run separately is the gate that was missing for seven merges.
 cmd_merge() {
-  local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [-- <gh pr merge args...>]}"
+  local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
-  local override="" wait_for=0 gate out rc attempt=1 mergeable state
+  local override="" wait_for=0 allow_no_verdict="" gate out rc attempt=1 mergeable state
   local -a gh_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1112,6 +1129,10 @@ cmd_merge() {
       ;;
     --wait=*)
       wait_for="${1#--wait=}"
+      shift
+      ;;
+    --allow-no-verdict)
+      allow_no_verdict=1
       shift
       ;;
     --)
@@ -1149,8 +1170,19 @@ cmd_merge() {
   3) fail 3 "NOT merging $REPO#$PR_NUM: the build signal could not be READ. Nothing is known," \
     "so this is not 'nothing is red' — retry rather than merging past it." ;;
   4)
-    warn "merging $REPO#$PR_NUM with NO build verdict on the head commit (see above)." \
-      "Nothing has failed; nothing has passed either. Use --wait to hold for the verdict."
+    # No verdict is not "nothing is red" either. On 2026-08-23 a day-long ~2h runner queue outran
+    # the 30-minute wait, two PRs merged unread on the warning below, and master was red for two
+    # hours (ahrefs/ocannl#745, fixed forward in lukstafi/ocannl-staging#456) — so the default
+    # is now to refuse, and merging unread takes a flag, like merging over red takes a reason.
+    if [ -n "$allow_no_verdict" ]; then
+      echo "ALLOW-NO-VERDICT: merging $REPO#$PR_NUM with NO build verdict on the head commit"
+      warn "ALLOW-NO-VERDICT: merging $REPO#$PR_NUM unread — nothing has failed, nothing has" \
+        "passed either (see above)."
+    else
+      fail 4 "REFUSING to merge $REPO#$PR_NUM: no verdict after $((wait_for / 60)) min —" \
+        "re-run with --allow-no-verdict to merge unread, or wait (--wait holds up to" \
+        "$((CHECKS_WAIT / 60)) min, SHIP_PR_CHECKS_WAIT)."
+    fi
     ;;
   esac
   while :; do
