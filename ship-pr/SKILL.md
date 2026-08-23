@@ -182,7 +182,8 @@ of the window that was never read.
 **The watch's printout is not the record of the round.** A long round's output is cut by the Bash
 tool's display (the head goes, the tail stays), and on 2026-08-22 two agents answered half a round
 that way, both times dropping real findings. After any exit 0, enumerate the round's findings
-yourself from the feeds, by id above the watermark (`status`, or the comment APIs), and address
+yourself from the feeds, by id above the watermark you PASSED IN — `watch` prints the advanced one
+back, and ids above that are the next round's (`status`, or the comment APIs) — and address
 THAT list; cross-check the count against what the watch claimed before replying/resolving.
 
 An exit 0 is not always a round: `watch` also returns when it can tell that **nothing is coming** —
@@ -331,30 +332,24 @@ The other verdicts are not refusals, and none of them is a green light either:
 | 4 | no verdict | still running, or every finished job was `cancelled` — refused without `--allow-no-verdict` |
 
 **Exit 4 refuses too, by default.** Nothing has failed, but nothing has passed, and a merge that
-waits for neither is a merge that read nothing. It used to be a warning: on 2026-08-23 the runner
-queue ran ~2 h deep all day, `--wait`'s 30 minutes ran out with the checks still queued, and two
-PRs merged on the warning — one carrying a stale test claim (ahrefs/ocannl#745, fixed forward in
-lukstafi/ocannl-staging#456), `master` red for two hours, and the next several agents inheriting
-the red. So now:
+waits for neither read nothing — it was a warning until 2026-08-23, when a day-long runner queue
+outran the 30-minute wait and a PR merged unread with a stale test claim (ahrefs/ocannl#745),
+leaving `master` red for two hours. So:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/pr-review.sh merge <owner>/<repo>#<pr> --wait
 ```
 
-`--wait` holds for the verdict — up to 120 min by default (`SHIP_PR_CHECKS_WAIT`, seconds; or
-`--wait=<seconds>`), printing a one-line heartbeat every 10 min (`SHIP_PR_CHECKS_HEARTBEAT`) so a
-background Bash child shows it is alive rather than hung. Run it in the background and let it
-hold; the queue is what it is. If the ceiling runs out it exits 4 with "no verdict after N min —
-re-run with --allow-no-verdict to merge unread, or wait", and waiting again is the right answer
-for anything a compiler sees.
+`--wait` holds for the verdict up to 120 min (`SHIP_PR_CHECKS_WAIT` seconds, or `--wait=<seconds>`)
+with a one-line heartbeat every 10 min (`SHIP_PR_CHECKS_HEARTBEAT`), so background it and let it
+hold. If the ceiling runs out it exits 4 naming `--allow-no-verdict`; for anything a compiler sees,
+wait again instead.
 
-`--allow-no-verdict` restores the old behaviour explicitly: it merges unread, saying so loudly on
-both stdout and stderr. It is acceptable only when the verdict could not tell you anything you
-have not already established yourself — a doc-only diff, or a shell-only one whose script you ran
-locally on the **exact rebased tree** you are merging (not the branch as it was before the rebase:
-a rebase is a new tree, and "I tested it earlier" is the stale test claim of #745). For anything
-that compiles, wait. The flag is not for "CI is slow today" — that is exactly the day it exists to
-refuse.
+`--allow-no-verdict` merges unread, loudly on stdout and stderr. It is acceptable only when the
+verdict could tell you nothing you have not established yourself: a doc-only diff, or a shell-only
+one whose script you ran locally on the **exact rebased tree** you are merging — a rebase is a new
+tree, and "I tested it earlier" is the stale test claim of #745. It is not for "CI is slow today";
+that is the day it exists to refuse.
 
 `cancelled` is deliberately neither red nor green — a cancel is a job that was stopped, not one
 that found something, and ocannl's `ci` sets `fail-fast: false` precisely so a red matrix leg does
