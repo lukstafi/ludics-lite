@@ -123,6 +123,32 @@ The coordinator's job between launch and last merge:
   (~28 min), so a fix that only x86 can confirm stays unconfirmed for as long as pushes keep
   coming — and with "rebase before opening and before merging": CI builds the MERGE commit, so a
   repo-wide scan green on the branch can be red against what landed on master meanwhile.
+- **Merge gates under a saturated runner queue.** GitHub's macOS runners serialize; a
+  20-PR day queues master runs ~2 h deep, and `pr-review.sh merge --wait`'s default window
+  (30 min) lapses into a "no verdict" merge — which is how a stale test claim reached master
+  unread on 2026-08-23 (#452 → red for two hours until a fix-forward). Brief agents to raise
+  `SHIP_PR_CHECKS_WAIT` past the observed backlog, to merge on the leg that actually runs the
+  affected test when the other leg is only queued, and to re-check the master run after a
+  no-verdict merge. A red the next agent inherits is diagnosed by `git log` on master between
+  the last green and first red run, not by re-bisecting locally; one agent owns the fix-forward
+  and every other open PR is told the red is established.
+- **Stacked launches.** When a gated item depends on a sibling PR that is approved but waiting
+  on CI, launch it off the sibling's branch (`git worktree add ... origin/claude/<sibling>`),
+  have it implement there, and open its PR only after the sibling merges and it has rebased —
+  the implementation overlaps the CI wait instead of idling behind it (#708 on #457).
+- **GPU boxes from the Mac.** Agents drive rog/minix over ssh for executed legs (worktree
+  off their pushed branch, `opam exec --`, unpiped ssh with an exit sentinel) — this wave ran
+  CUDA+HIP parity for #730/#710/#709 and the whole #728 experiment that way. Two rules: an
+  agent never WoL/power-cycles a box (the user's own sessions may be on it), and a timing
+  harness flushes stdout per line and uses a wall bound — a 0%-CPU process in
+  `IOSurfaceSharedEvent waitUntilSignaledValue` was a legitimate 2 s unscheduled kernel behind
+  dune's buffered stdout, not a hang.
+- **Experiment-only items** (the user says "measurement only, don't recommend"): the brief
+  forbids implementing or recommending a fix direction, the deliverable is an issue comment
+  that a later session can act on, and the issue stays open. Expect the review of the
+  harness PR to find real instrument defects (#444: a device readback inside the timed region,
+  worth up to 1.7x) — that review is worth its rounds; cap it with the convergence policy
+  after, not before.
 - **Gate later waves** on the merges and out-of-scope closures they wait for, and rebrief
   each next-wave agent with what its predecessors landed (new helpers, reshaped goldens,
   fresh conventions) so it builds on them instead of colliding.
