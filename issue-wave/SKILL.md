@@ -118,9 +118,10 @@ The coordinator's job between launch and last merge:
   belief about its own background children is UNRELIABLE in both directions: it claims a
   watch or suite "armed and alive" that no longer exists, and once reported a child as
   launched that never started. Before trusting an "armed" claim, find the process by its own
-  arguments — `pgrep -af 'pr-review.sh watch .*#<pr>'` — not by cwd: a backgrounded child need
-  not keep the worktree as its cwd, and a bare `pgrep -f pr-review` matches its own wrapper
-  shell. When resuming an interrupted agent, lead
+  arguments — `pgrep -fl '[p]r-review.sh watch .*#<pr>'` (the bracket keeps the pattern from
+  matching the shell that runs it; `-l`, not procps-only `-a`, lists the line on both macOS
+  and Linux) — not by cwd, which a backgrounded child need not keep. When resuming an
+  interrupted agent, lead
   with a disk-first brief: inventory `git status`/log in its worktree, trust the disk over its
   memory, re-run anything whose result is not in a file (observed 3x on 2026-08-23; commits
   proved durable every time, so "commit early" is the cheap insurance to insist on in briefs).
