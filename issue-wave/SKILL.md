@@ -117,9 +117,10 @@ The coordinator's job between launch and last merge:
   After a harness restart (power loss, dropped remote-control connection), a resumed agent's
   belief about its own background children is UNRELIABLE in both directions: it claims a
   watch or suite "armed and alive" that no longer exists, and once reported a child as
-  launched that never started. Before trusting an "armed" claim, find the process and check
-  its cwd is the agent's worktree (`pgrep -f pr-review` then `lsof -p <pid> -d cwd` on the
-  Mac, `readlink /proc/<pid>/cwd` on the WSL boxes). When resuming an interrupted agent, lead
+  launched that never started. Before trusting an "armed" claim, find the process by its own
+  arguments — `pgrep -af 'pr-review.sh watch .*#<pr>'` — not by cwd: a backgrounded child need
+  not keep the worktree as its cwd, and a bare `pgrep -f pr-review` matches its own wrapper
+  shell. When resuming an interrupted agent, lead
   with a disk-first brief: inventory `git status`/log in its worktree, trust the disk over its
   memory, re-run anything whose result is not in a file (observed 3x on 2026-08-23; commits
   proved durable every time, so "commit early" is the cheap insurance to insist on in briefs).
