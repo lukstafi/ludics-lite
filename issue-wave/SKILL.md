@@ -114,6 +114,15 @@ The coordinator's job between launch and last merge:
   round is the known strand - point it at the feed. An agent that yields twice in a row with
   no state change gets a concrete, imperative unstick message (do X now, in this turn, do
   not yield); if that fails too, take over the mechanical remainder or spawn a finisher.
+  After a harness restart (power loss, dropped remote-control connection), a resumed agent's
+  belief about its own background children is UNRELIABLE in both directions: it claims a
+  watch or suite "armed and alive" that no longer exists, and once reported a child as
+  launched that never started. Before trusting an "armed" claim, find the process and check
+  its cwd is the agent's worktree (`pgrep -f pr-review` then `lsof -p <pid> -d cwd` on the
+  Mac, `readlink /proc/<pid>/cwd` on the WSL boxes). When resuming an interrupted agent, lead
+  with a disk-first brief: inventory `git status`/log in its worktree, trust the disk over its
+  memory, re-run anything whose result is not in a file (observed 3x on 2026-08-23; commits
+  proved durable every time, so "commit early" is the cheap insurance to insist on in briefs).
 - **Converge long reviews.** An automated reviewer keeps finding members of any open-ended
   artifact (a scanner, a property table) indefinitely; two agents went 9 and 13 rounds on
   2026-08-22. After ~5 rounds send the policy: fix only findings that show a claim CANNOT fail
