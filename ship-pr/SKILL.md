@@ -367,11 +367,15 @@ red you caused: an unrelated red is a fact about the world, and a related one is
 Which checks the gate reads is a deny-list, not an allow-list: every check on the commit counts
 unless it is named advisory (`SHIP_PR_ADVISORY_CHECKS`), so a renamed job or a new matrix leg keeps
 gating instead of silently falling out of it. Advisory by default: the review app's own
-permanently-skipped check, and the two github-pages deploy workflows, whose opam step has been red
-on ocannl-staging's master for days over something that has nothing to do with whether the tree
-compiles. That exclusion is deliberate rather than lax — a signal that is always red is one everyone
-stops reading, which is the failure mode #694 is about. If one of those ever becomes load-bearing,
-narrow the variable rather than leaving it to be ignored.
+permanently-skipped check, and a publishing workflow that compiles none of the tree (ocannl's
+`github pages docs` runs slipshow, pandoc and latexmk over `docs/**`, so its red is about a font
+package, never about the code).
+
+Exclude by name only what **cannot carry a build verdict** — not merely what is red today. ocannl's
+`github pages api` was excluded on the latter reasoning, being red on every master push, and the
+exclusion promptly hid a real `dune build @doc` compile break behind the apt failure that was
+masking it (ahrefs/ocannl#698). A workflow that is always red wants fixing, not deny-listing; once
+it is fixed, take it back off the list.
 
 ### What `merge` absorbs, and what a nonzero exit therefore means
 

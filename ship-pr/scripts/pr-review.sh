@@ -903,11 +903,17 @@ cmd_retry() {
 # build-relevant unless it is named advisory. An allow-list keyed on today's job names ("Build
 # (ubuntu-latest, 5.5.x)") stops gating silently the day a job is renamed or a matrix entry is
 # added — it fails OPEN, which is the exact failure this exists to prevent. What is advisory by
-# default: the review app's check (permanently SKIPPED on the PR path) and the github-pages deploy
-# workflows, whose opam `Deps` step has been failing on ocannl-staging's master for days over
-# something that has nothing to do with whether the tree compiles. A signal that is always red
-# teaches everyone to stop reading it, which is the pathology #694 is about — so a chronically red
-# deploy is excluded by name rather than allowed to drown the build verdict.
+# default: the review app's check (permanently SKIPPED on the PR path), and a publishing workflow
+# that builds none of the tree — ocannl's `github pages docs` runs slipshow, pandoc and latexmk over
+# `docs/**` and compiles no OCaml, so its red is about a font package, never about the code.
+#
+# `github pages api` is NOT on that list, and the distinction is the point. It runs `dune build
+# @doc` over the whole tree, so its red can be the tree's. It was excluded for a while, on the
+# argument that a chronically red signal is one everyone stops reading (the pathology #694 is
+# about) — and that exclusion promptly hid a genuine `@doc` compile break behind the infrastructure
+# failure that was masking it (ahrefs/ocannl#698). The lesson is the opposite of the exclusion: a
+# workflow whose red can mean "the tree does not build" belongs in the gate, and a workflow that is
+# always red belongs fixed. Exclude by name only what CANNOT carry a build verdict.
 #
 # Which CONCLUSIONS count as red is deliberately narrow, because the merge path must not cry wolf:
 #   failure, timed_out, startup_failure   a verdict, and the verdict is no
@@ -919,7 +925,7 @@ cmd_retry() {
 # siblings, but that has not always been true and is not true of every workflow, and a superseding
 # push cancels too. Treating a cancel as red would make every force-push a refusal; treating it as
 # green would let a matrix leg that never finished pass for one that passed. It is neither.
-BUILD_ADVISORY="${SHIP_PR_ADVISORY_CHECKS:-^(claude|Claude Code|github pages( .*)?)$}"
+BUILD_ADVISORY="${SHIP_PR_ADVISORY_CHECKS:-^(claude|Claude Code|github pages docs)$}"
 CHECKS_INTERVAL="${SHIP_PR_CHECKS_INTERVAL:-60}"
 CHECKS_WAIT="${SHIP_PR_CHECKS_WAIT:-1800}"
 
