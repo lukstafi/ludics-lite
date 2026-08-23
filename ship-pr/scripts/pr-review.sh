@@ -6,6 +6,12 @@
 #   - app reviewers appear as "<name>[bot]", so the login is matched by PREFIX, never equality;
 #   - your own replies bump review and comment counts, so "new" means id > watermark, not a delta;
 #   - the comment APIs paginate at 30, so every list call paginates with per_page=100;
+#   - a just-submitted review shows up in pulls/<n>/reviews BEFORE its inline comments reach the
+#     flat pulls/<n>/comments listing (2026-08-20, #396 review 4985620117: three findings readable
+#     under the review's own comments endpoint while the flat list still omitted them, and the
+#     round printed "(no new inline comments)" beside the review it had just detected) — so a
+#     round that sees a new review re-reads pulls/<n>/reviews/<id>/comments and merges by comment
+#     id, and a failure of THAT read fails the whole round rather than dropping the findings;
 #   - empty/non-numeric API output makes [ "$n" -gt 0 ] abort, so no count is compared as an int;
 #   - the three feeds number their items in SEPARATE id spaces (a review id is ~4.9e9 while an
 #     inline-comment id is ~3.8e9), so one shared watermark takes the max from reviews and then
@@ -369,6 +375,26 @@ cmd_poll() {
       "($(gh_err_line)) — this round is UNKNOWN, not quiet"
     return 3
   fi
+
+  # A new review's inline comments can lag the flat listing read above (see the header), so every
+  # review this round is about to report gets its own comments endpoint read too, merged by
+  # comment id — the flat feed's copy wins when both exist, since only it carries current line
+  # numbers. A failed per-review read fails the ROUND (unknown, watermark unwritten): the
+  # alternative is printing the review while silently dropping its findings.
+  local rid extra='[]' more
+  for rid in $(jq -r --arg rev "$REVIEWER" --argjson since "$m_review" '
+    map(select((.user.login // "") | startswith($rev)) | select(.id > $since))
+    | .[].id' <<<"$reviews"); do
+    more=$(api_list "pulls/$pr/reviews/$rid/comments?per_page=100") || {
+      warn "API error reading review $rid's comments on PR $pr after $API_ATTEMPTS attempts" \
+        "($(gh_err_line)) — this round is UNKNOWN, not quiet"
+      return 3
+    }
+    extra=$(printf '%s\n%s\n' "$extra" "$more" | jq -s '.[0] + .[1]') || return 4
+  done
+  inline=$(printf '%s\n%s\n' "$inline" "$extra" | jq -s '
+    (.[0] | map(.id)) as $have
+    | .[0] + (.[1] | map(select(.id as $i | ($have | index($i)) | not)))') || return 4
 
   jq -r --arg rev "$REVIEWER" --argjson since "$m_inline" '
     map(select((.user.login // "") | startswith($rev)) | select(.id > $since))
