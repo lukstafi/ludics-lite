@@ -129,7 +129,7 @@ The coordinator's job between launch and last merge:
   (vacuous guard, untracked config key, host-dependent expectation); reply in-thread and defer
   everything else to ONE follow-up issue; merge on approval. Both converged within two rounds.
   Pair it with **one push per CI cycle** in late rounds — every push supersedes the ubuntu leg
-  (~28 min), so a fix that only x86 can confirm stays unconfirmed for as long as pushes keep
+  (~28 min when the runners are free; the 2026-08-23 wave saw 1h20m with six PRs queued), so a fix that only x86 can confirm stays unconfirmed for as long as pushes keep
   coming — and with "rebase before opening and before merging": CI builds the MERGE commit, so a
   repo-wide scan green on the branch can be red against what landed on master meanwhile.
 - **Merge gates under a saturated runner queue.** GitHub's macOS runners serialize; a
