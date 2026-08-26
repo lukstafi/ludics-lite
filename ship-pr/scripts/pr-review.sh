@@ -88,9 +88,11 @@
 #                                          # is the branch you are about to work off CI-green?
 #   pr-review.sh reply <pr> <comment-id> <body>
 #   pr-review.sh resolve <pr> <comment-id>
+#   pr-review.sh comment <pr> <body>       # a plain PR comment, for what has no thread to reply in:
+#                                          # a review SUMMARY's findings, or a '@codex review' nudge
 #   pr-review.sh retry [--read] <gh args...>
-#                                          # any other gh call (pr comment, pr merge, api) with the
-#                                          # same retry policy, instead of a hand-rolled loop
+#                                          # any other gh call (pr merge, api) with the same retry
+#                                          # policy, instead of a hand-rolled loop
 #
 # Exit codes: 0 the command did what it says (and any fact it printed came from a call that
 #             answered); 1 the fact does not hold (the window stayed quiet, no such thread, the API
@@ -781,6 +783,46 @@ _🤖 Addressed by [Claude Code](https://claude.com/claude-code)_" --jq .html_ur
   esac
 }
 
+# Not every finding has a thread to answer in. A review's SUMMARY body carries no comment ids, so
+# the only surface for answering it is a plain PR comment — and so is the '@codex review' nudge the
+# watch verdicts recommend. `gh pr comment` is the obvious tool and it does NOT take the
+# owner/name#number form the rest of this script standardizes on (it wants a bare number plus
+# --repo, or a full URL), so `retry gh pr comment lukstafi/ocannl-staging#475 --body ...` fails on
+# the argument, not on the network: during the 1.0.1 release prep on that PR (2026-08-25) the
+# workaround was hand-building the PR's URL. The REST issues endpoint takes the same pieces this
+# script already resolved, so the argument shape, the retry policy and the write semantics all stay
+# what every other command here has. Same marker as `reply`, for the same reason.
+cmd_comment() {
+  # Exactly two, and checked rather than left to ${1:?...} — which exits 1, the code that means "the
+  # fact does not hold". A body is a sentence, so an unquoted one arrives as several arguments and
+  # would otherwise post its first word and drop the rest; that reads as a posted comment.
+  [ $# -eq 2 ] || die "usage: comment <pr> <body> — got $# argument(s)." \
+    "The body is ONE argument: quote it, including a multi-line one."
+  local pr="$1" body="$2"
+  [ -n "${body//[[:space:]]/}" ] || die "comment: the body is empty; there is nothing to post"
+  pr_arg "$pr"
+  pr="$PR_NUM"
+  # issues/<n>/comments, not pulls/<n>/comments: on GitHub a PR *is* an issue, and the pulls
+  # endpoint posts INLINE review comments, which need a commit and a path.
+  gh_retry write api -X POST "repos/$REPO/issues/$pr/comments" \
+    -f body="$body
+
+_🤖 Addressed by [Claude Code](https://claude.com/claude-code)_" --jq .html_url
+  case "$?" in
+  0) return 0 ;;
+  3) fail 3 "comment on PR $REPO#$pr did not go through — the API refused it at the gateway on" \
+    "all $API_ATTEMPTS attempts ($(gh_err_line)). Nothing was posted, so retry." ;;
+  *)
+    api_rejection "$(gh_err_line)" &&
+      fail 1 "comment on PR $REPO#$pr was REJECTED, not dropped: $(gh_err_line)." \
+        "Retrying prints the same thing — check the PR number and the repo."
+    fail 3 "comment on PR $REPO#$pr failed AMBIGUOUSLY: $(gh_err_line)." \
+      "That is not a gateway refusal, so the comment may or may not have landed and this script" \
+      "will not post it twice — read the PR, then retry only if it is not there."
+    ;;
+  esac
+}
+
 # Threads are addressed by node id, which is only reachable by matching a thread's FIRST comment.
 # Prints "<node-id> <isResolved>" for the thread starting at comment $2. Exits 1 when the PR
 # genuinely has no such thread, 2 when GraphQL never answered, and 4 when GraphQL rejected the
@@ -1327,8 +1369,10 @@ merge) shift && cmd_merge "$@" ;;
 base) shift && cmd_base "$@" ;;
 reply) shift && cmd_reply "$@" ;;
 resolve) shift && cmd_resolve "$@" ;;
+comment) shift && cmd_comment "$@" ;;
 retry) shift && cmd_retry "$@" ;;
 *) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|checks|merge|reply|resolve} <pr> ...
+  pr-review.sh comment <pr> <body>           # a plain PR comment (a summary round, a review nudge)
   pr-review.sh base [owner/name] [branch]    # is the base branch's CI green? (start of work)
   pr-review.sh retry [--read] <gh args...>   # any other gh call, same retry policy
   <pr> is a number or owner/name#number; prefer owner/name#number for background invocations." ;;

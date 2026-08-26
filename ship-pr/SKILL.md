@@ -55,10 +55,10 @@ The trade is explicit: a direct commit gets no review at all. Anything carrying 
 goes through the full loop below.
 
 The `gh` recipes below are packaged as `~/.claude/skills/ship-pr/scripts/pr-review.sh` (`poll`,
-`watch`, `status`, `checks`, `merge`, `base`, `reply`, `resolve`, `retry`), which encodes the traps
-in code — including the pagination that a PR running to many rounds walks into — so prefer it to
-hand-rolled API calls. The commands below spell that path out in full because they are run from a
-repo checkout, not from the skill directory.
+`watch`, `status`, `checks`, `merge`, `base`, `reply`, `resolve`, `comment`, `retry`), which
+encodes the traps in code — including the pagination that a PR running to many rounds walks into —
+so prefer it to hand-rolled API calls. The commands below spell that path out in full because they
+are run from a repo checkout, not from the skill directory.
 
 **GitHub fails half the time, not none of the time.** During an incident (2026-08-17: an hour of
 roughly every other call returning `503 No server is currently available`) a single attempt is a
@@ -70,10 +70,13 @@ the API never answered. And never restate a `3` as a finding — "no such thread
 conflation is not hypothetical: the pre-retry script reported `no review thread starts at comment
 N` for three threads that existed, because its paginated GraphQL lookup had 503'd.
 
-For the `gh` calls this skill makes outside the script — `gh pr comment`, an ad-hoc `api` read —
-use `pr-review.sh retry [--read] <gh args…>` rather than hand-rolling a
+For the `gh` calls this skill makes outside the script — an ad-hoc `api` read, say — use
+`pr-review.sh retry [--read] <gh args…>` rather than hand-rolling a
 `for i in 1 2 3; do … && break; sleep; done` loop (which one outage session wrote five times).
-Writes are retried only on gateway refusals, so a merge or a comment cannot be sent twice.
+Writes are retried only on gateway refusals, so a merge or a comment cannot be sent twice. Do not
+route `gh pr comment` through `retry`, though: it is the one call that cannot take the
+`owner/name#<pr>` argument this skill standardizes on (it wants a bare number plus `--repo`, or a
+full URL), so it fails on the argument and invites hand-building a PR URL. Use `comment` below.
 
 **Always name the repo in the PR argument: `owner/name#<pr>`, not a bare number.** The script can
 infer the repo from the cwd, but a *background* shell does not reliably start in the checkout — and
@@ -189,9 +192,9 @@ THAT list; cross-check the count against what the watch claimed before replying/
 An exit 0 is not always a round: `watch` also returns when it can tell that **nothing is coming** —
 the 👀 went spent without a review of the head, or never landed, or a push has been sitting
 unreviewed past the grace (20 min, `SHIP_PR_REVIEW_GRACE`). Its line says so and names the remedy:
-post a plain `@codex review` comment on the PR, which starts a round within one window. Do that
-rather than re-arming a fourth identical wait — see the state table below for why waiting cannot
-distinguish itself.
+post a plain `@codex review` comment on the PR — `pr-review.sh comment <owner>/<repo>#<pr>
+'@codex review'` — which starts a round within one window. Do that rather than re-arming a fourth
+identical wait; see the state table below for why waiting cannot distinguish itself.
 
 Hand-rolling that query has produced seven false readings, all of which the script handles: app
 reviewers' logins carry a `[bot]` suffix so an exact-match filter never fires; your own replies
@@ -246,6 +249,24 @@ failing while its neighbours succeed leaves a thread silently unanswered. A `rep
 posted nothing (the gateway refused it) — repeat it; a `resolve` that exits 3 found the thread and
 failed to close it, so repeating that is safe too. Only exit 1 from `resolve` means the thread is
 really not there.
+
+**A finding without a comment id has no thread to reply in — answer it with `comment`.** A review's
+summary body (the `--- review id=… state=…` block a round prints, and the `--- summary id=…` one)
+carries findings that were never attached to a line, so there is nothing to `reply` to and nothing
+to `resolve`; the same is true of the `@codex review` nudge the watch verdicts recommend. Both are
+plain PR comments:
+
+```bash
+~/.claude/skills/ship-pr/scripts/pr-review.sh comment <owner>/<repo>#<pr> "Round 3, on the summary: <substance>"
+```
+
+Do not reach for `gh pr comment` here, with or without `retry` — it rejects the `owner/repo#<pr>`
+form, and the workaround it invites (hand-building the PR's URL) is how a release-prep session on
+`lukstafi/ocannl-staging#475` spent its retries on argument parsing. `comment` takes the same
+argument as every other subcommand and posts through the same write policy: exit 0 posted (it
+prints the comment's URL), 1 the API rejected it, 2 your invocation is wrong — note the body is
+**one** argument, so quote it — and 3 nothing was posted, or nothing is known, so re-read the PR
+before repeating it.
 
 If a finding changes what a measurement *means* (not just how it is run), redo the affected
 measurement rather than editing the prose around it; and if a result rests on a premise the
