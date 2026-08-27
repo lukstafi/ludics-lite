@@ -102,7 +102,8 @@ conversation), transfers between worker kinds verbatim, and includes:
 ### Codex workers
 
 Launch as a harness-tracked background Bash task, one per worktree:
-`codex exec --json -s workspace-write -C <worktree> -o <report-file> "<brief>"`. Capture the
+`codex exec --json -s workspace-write -c 'sandbox_permissions=["network-full-access"]'
+-C <worktree> -o <report-file> "<brief>"`. Capture the
 session UUID from the JSONL stream at launch - it is the address for every later
 intervention. Mechanics that differ from Opus workers:
 
@@ -110,12 +111,12 @@ intervention. Mechanics that differ from Opus workers:
   `~/.codex/skills` (from this repo's working tree - merged skill edits propagate with no
   deploy step). Codex has no `spawn_task`, which hand-back mode makes moot: wave workers of
   either kind propose rather than file.
-- **Network**: the `workspace-write` sandbox blocks network by default. Either enable it in
-  the sandbox config so the worker can push and drive `gh`, or brief the worker to stop at
-  commit and hand the branch to a Claude finisher that lands via ship-pr. Prefer the
-  finisher split while calibrating - it keeps the review-round machinery where the learned
-  failure modes live, and the finisher re-verifies from scratch, a cross-model check for
-  free.
+- **Network**: the `workspace-write` sandbox blocks network by default; the
+  `network-full-access` permission in the launch line lifts that (verified on CLI 0.150.1:
+  sandboxed `curl` fails exit-6 without it, succeeds with it) so the worker can push, drive
+  `gh`, and own its full lifecycle through ship-pr. Deliberate choice: review rounds are
+  addressed by the continuous session that wrote the code, never handed to a fresh-context
+  finisher - the finisher is the escalation path for stalls (Supervise), not a landing path.
 - **Structured close-out**: `--output-schema` can force the final report shape (PR number,
   test status, residuals, chip candidates) when parsing prose reports gets old.
 - **Attribution**: Codex commits carry no Claude trailer; the project's CLAUDE.md

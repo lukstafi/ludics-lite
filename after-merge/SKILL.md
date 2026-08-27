@@ -61,7 +61,7 @@ no single worker can see. In this mode:
 - File nothing, comment nothing, spawn nothing. Drops are still stated with their reason, so
   the coordinator does not re-raise what the worker already binned.
 
-The default — no coordinator, working directly with the user — is **complete mode**: execute
+The default — no coordinator, working directly with the user — is **completion mode**: execute
 the dispositions as written above.
 
 ## Deduplicate first
