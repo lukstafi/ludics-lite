@@ -180,13 +180,16 @@ The coordinator's job between launch and last merge:
 - **Codex workers have no yield signal.** A `codex exec` run is silent between JSONL events,
   so the "yields twice with no state change" play does not exist for it. The stall test is
   external: the JSONL stream quiet AND `git log`/`git status` in its worktree unmoved over a
-  wall-clock window sized to the task. To unstick, send one imperative message via
-  `cd <worktree> && codex exec resume <session-id> "<do X now>"` - the `cd` is mandatory:
-  resume has no `-C` and adopts the invoking shell's cwd, so a resume fired from the
-  coordinator's own checkout resumes the worker inside the WRONG repo. Full session context
-  is retained (a running
+  wall-clock window sized to the task. To unstick, write the imperative message to a file
+  and `cd <worktree> && codex exec resume <session-id> <sandbox flags> - < <message-file>`.
+  That closes the same class as the launch brief: ANY prose substituted into a codex command
+  line is shell-expanded before Codex sees it, so every prompt rides stdin (`-`) or a file -
+  the post-merge brainstorm prompt below included. The `cd` is mandatory: resume has no `-C`
+  and adopts the invoking shell's cwd, so a resume fired from the coordinator's own checkout
+  resumes the worker inside the WRONG repo. Full session context is retained (a running
   session takes `codex queue --thread <id> --message` instead - present on CLI 0.150.1,
-  absent on 0.144: there, wait out or kill the exec, then resume). A resume is a fresh CLI
+  absent on 0.144: there, wait out or kill the exec, then resume. `--message` has no stdin
+  form, so it carries only literal text you typed yourself, never substituted content). A resume is a fresh CLI
   invocation: it retains the conversation, not the launch flags, so every resume repeats the
   launch line's three `-c` sandbox overrides. `-c` only: `exec resume` has no `-s` flag
   (0.150.1 rejects it, "unexpected argument"), which is why the launch line expresses the
