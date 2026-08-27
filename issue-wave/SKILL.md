@@ -87,9 +87,13 @@ conversation), transfers between worker kinds verbatim, and includes:
   agent's run freezes (observed 2026-08-22: 34 exes parked in dlopen, logs frozen, load 2.5).
   Also ask for `dune -j 4` when more than ~4 agents share the box.
 - Landing: the ship-pr skill through review to merge, then close the upstream issue with a
-  summary comment, then remove the worktree. The after-merge brainstorm ship-pr ends with
-  runs in **hand-back mode**: propose issues and chip candidates in the close-out report,
-  file and spawn nothing — the coordinator combines across workers and does the filing.
+  summary comment, then the after-merge brainstorm ship-pr ends with, in **hand-back mode**:
+  propose issues and chip candidates in the close-out report, file and spawn nothing — the
+  coordinator combines across workers and does the filing. Worktree removal comes LAST, after
+  the hand-back is in the close-out — the brainstorm's diff and tracker reads run in that
+  worktree — and a worker whose shell sits inside it (Codex, launched `-C <worktree>`) leaves
+  removal to the coordinator: removing your own cwd is the "Unable to read current working
+  directory" failure ship-pr warns about.
 - Process discipline, stated explicitly because agents re-derive it badly under load:
   never end a turn with only a detached process outstanding - attach waits as
   harness-tracked background children; if a review watch goes quiet suspiciously long, read
@@ -101,10 +105,18 @@ conversation), transfers between worker kinds verbatim, and includes:
 
 ### Codex workers
 
-Launch as a harness-tracked background Bash task, one per worktree:
-`codex exec --json -s workspace-write -c 'sandbox_permissions=["network-full-access"]'
--C <worktree> -o <report-file> "<brief>"`. Capture the
-session UUID from the JSONL stream at launch - it is the address for every later
+Launch as a harness-tracked background Bash task, one per worktree. Write the brief to a
+file first and feed it through stdin - never interpolate it into the command line, where the
+backticks, `$()`, and quotes that issue-derived prose routinely contains would be executed
+or mangled by the coordinator's own shell:
+
+```
+codex exec --json --strict-config -c 'sandbox_mode="workspace-write"' \
+  -c 'sandbox_workspace_write.network_access=true' \
+  -C <worktree> -o <report-file> - < <brief-file>
+```
+
+Capture the session UUID from the JSONL stream at launch - it is the address for every later
 intervention. Mechanics that differ from Opus workers:
 
 - **Skills**: `ship-pr`, `wait-and-proceed`, and `after-merge` are symlinked into
@@ -112,11 +124,15 @@ intervention. Mechanics that differ from Opus workers:
   deploy step). Codex has no `spawn_task`, which hand-back mode makes moot: wave workers of
   either kind propose rather than file.
 - **Network**: the `workspace-write` sandbox blocks network by default; the
-  `network-full-access` permission in the launch line lifts that (verified on CLI 0.150.1:
-  sandboxed `curl` fails exit-6 without it, succeeds with it) so the worker can push, drive
-  `gh`, and own its full lifecycle through ship-pr. Deliberate choice: review rounds are
-  addressed by the continuous session that wrote the code, never handed to a fresh-context
-  finisher - the finisher is the escalation path for stalls (Supervise), not a landing path.
+  `sandbox_workspace_write.network_access=true` override in the launch line lifts that
+  (verified end to end on CLI 0.150.1: an exec-launched agent's `curl` gets HTTP/2 200 with
+  it, exit 6 without) so the worker can push, drive `gh`, and own its full lifecycle through
+  ship-pr. Keep `--strict-config`: it is what rejects a mistyped or unsupported override -
+  0.150.1 rejects `sandbox_permissions` there, a key its own help text still suggests -
+  instead of silently launching a network-blocked worker. Deliberate choice: review rounds
+  are addressed by the continuous session that wrote the code, never handed to a
+  fresh-context finisher - the finisher is the escalation path for stalls (Supervise), not a
+  landing path.
 - **Structured close-out**: `--output-schema` can force the final report shape (PR number,
   test status, residuals, chip candidates) when parsing prose reports gets old.
 - **Attribution**: Codex commits carry no Claude trailer; the project's CLAUDE.md
@@ -159,11 +175,13 @@ The coordinator's job between launch and last merge:
   external: the JSONL stream quiet AND `git log`/`git status` in its worktree unmoved over a
   wall-clock window sized to the task. To unstick, send one imperative message via
   `codex exec resume <session-id> "<do X now>"` - full session context is retained (a running
-  session takes `codex queue --thread <id> --message` instead). A resume is a fresh CLI
+  session takes `codex queue --thread <id> --message` instead - present on CLI 0.150.1,
+  absent on 0.144: there, wait out or kill the exec, then resume). A resume is a fresh CLI
   invocation: it retains the conversation, not the launch flags, so every resume repeats the
-  launch line's `-s workspace-write -c 'sandbox_permissions=["network-full-access"]'` - a
-  resume without them is back in the network-blocked default and the unstick message lands in
-  a worker that cannot push. Escalation is the same as for
+  launch line's two `-c` sandbox overrides. `-c` only: `exec resume` has no `-s` flag
+  (0.150.1 rejects it, "unexpected argument"), which is why the launch line expresses the
+  sandbox mode as config too. A resume without the overrides is back in the network-blocked
+  default and the unstick message lands in a worker that cannot push. Escalation is the same as for
   a Claude agent: two failed interventions and the coordinator takes over the mechanical
   remainder or spawns a Claude finisher on the worktree's branch. A finisher landing a stalled
   worker's branch does not inherit its transcript, so the friction that grounds `after-merge`
