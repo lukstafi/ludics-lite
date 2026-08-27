@@ -20,6 +20,16 @@ Rerun the loop after adding a skill. Replace any pre-existing real directory in
 `~/.claude/skills/` by hand first — diff it against this copy, since a divergent local edit may be
 a fix worth keeping.
 
+On a machine that runs Codex workers (see issue-wave's Codex workers section), also link the
+skills Codex uses into `~/.codex/skills` — same tree, same no-sync-step property:
+
+```sh
+mkdir -p "$HOME/.codex/skills"
+for s in ship-pr wait-and-proceed after-merge; do
+  ln -sfn "$HOME/self-improve/ClaudeDesktop/skills/$s" "$HOME/.codex/skills/$s"
+done
+```
+
 ## Why not copies
 
 Copies drift silently, and did: the `ship-pr` watcher was independently repaired on a second

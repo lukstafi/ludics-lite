@@ -159,9 +159,18 @@ The coordinator's job between launch and last merge:
   external: the JSONL stream quiet AND `git log`/`git status` in its worktree unmoved over a
   wall-clock window sized to the task. To unstick, send one imperative message via
   `codex exec resume <session-id> "<do X now>"` - full session context is retained (a running
-  session takes `codex queue --thread <id> --message` instead). Escalation is the same as for
+  session takes `codex queue --thread <id> --message` instead). A resume is a fresh CLI
+  invocation: it retains the conversation, not the launch flags, so every resume repeats the
+  launch line's `-s workspace-write -c 'sandbox_permissions=["network-full-access"]'` - a
+  resume without them is back in the network-blocked default and the unstick message lands in
+  a worker that cannot push. Escalation is the same as for
   a Claude agent: two failed interventions and the coordinator takes over the mechanical
-  remainder or spawns a Claude finisher on the worktree's branch.
+  remainder or spawns a Claude finisher on the worktree's branch. A finisher landing a stalled
+  worker's branch does not inherit its transcript, so the friction that grounds `after-merge`
+  is still in the Codex session: after the merge, `codex exec resume <session-id>` it (same
+  sandbox flags - hand-back mode still reads the tracker for dedup) for the hand-back
+  brainstorm rather than brainstorming its work from the outside; only if the session is
+  unresumable does the coordinator brainstorm from the diff and say so.
 - **Converge long reviews.** An automated reviewer keeps finding members of any open-ended
   artifact (a scanner, a property table) indefinitely; two agents went 9 and 13 rounds on
   2026-08-22. After ~5 rounds send the policy: fix only findings that show a claim CANNOT fail
