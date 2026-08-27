@@ -113,6 +113,7 @@ or mangled by the coordinator's own shell:
 ```
 codex exec --json --strict-config -c 'sandbox_mode="workspace-write"' \
   -c 'sandbox_workspace_write.network_access=true' \
+  -c 'sandbox_workspace_write.writable_roots=["<main-checkout>/.git"]' \
   -C <worktree> -o <report-file> - < <brief-file>
 ```
 
@@ -133,6 +134,12 @@ intervention. Mechanics that differ from Opus workers:
   are addressed by the continuous session that wrote the code, never handed to a
   fresh-context finisher - the finisher is the escalation path for stalls (Supervise), not a
   landing path.
+- **Linked-worktree git metadata**: a linked worktree's index and refs live under the MAIN
+  checkout's `.git/worktrees/<name>`, outside the `-C` workspace, so without the
+  `writable_roots` override every `git add`/`commit`/rebase dies on `index.lock: Operation
+  not permitted` (verified end to end on 0.150.1: an exec-launched agent's commit in a linked
+  worktree fails without it, lands with it). Express it as config, not `--add-dir`: exec has
+  the flag but `exec resume` does not, and resume must repeat the sandbox settings.
 - **Structured close-out**: `--output-schema` can force the final report shape (PR number,
   test status, residuals, chip candidates) when parsing prose reports gets old.
 - **Attribution**: Codex commits carry no Claude trailer; the project's CLAUDE.md
@@ -178,7 +185,7 @@ The coordinator's job between launch and last merge:
   session takes `codex queue --thread <id> --message` instead - present on CLI 0.150.1,
   absent on 0.144: there, wait out or kill the exec, then resume). A resume is a fresh CLI
   invocation: it retains the conversation, not the launch flags, so every resume repeats the
-  launch line's two `-c` sandbox overrides. `-c` only: `exec resume` has no `-s` flag
+  launch line's three `-c` sandbox overrides. `-c` only: `exec resume` has no `-s` flag
   (0.150.1 rejects it, "unexpected argument"), which is why the launch line expresses the
   sandbox mode as config too. A resume without the overrides is back in the network-blocked
   default and the unstick message lands in a worker that cannot push. Escalation is the same as for
