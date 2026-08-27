@@ -85,5 +85,8 @@ Example pairing: PRs in `lukstafi/ocannl-staging`, issues in `ahrefs/ocannl`.
 ## Report
 
 A short list: item, the friction that grounds it, the disposition. Then the issue URLs created or
-commented on, and the chips spawned or handed up as candidates. Optionally post the brainstorm itself as a comment on the
-merged PR first, so each filed issue can cite it and the idea keeps its provenance.
+commented on, and the chips spawned or handed up as candidates. Optionally — in completion mode
+only — post the brainstorm itself as a comment on the merged PR first, so each filed issue can
+cite it and the idea keeps its provenance. In hand-back mode that comment too is the
+coordinator's to post after its editorial pass: an uncombined draft published early defeats the
+pass.

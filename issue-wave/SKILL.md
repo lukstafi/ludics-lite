@@ -181,7 +181,10 @@ The coordinator's job between launch and last merge:
   so the "yields twice with no state change" play does not exist for it. The stall test is
   external: the JSONL stream quiet AND `git log`/`git status` in its worktree unmoved over a
   wall-clock window sized to the task. To unstick, send one imperative message via
-  `codex exec resume <session-id> "<do X now>"` - full session context is retained (a running
+  `cd <worktree> && codex exec resume <session-id> "<do X now>"` - the `cd` is mandatory:
+  resume has no `-C` and adopts the invoking shell's cwd, so a resume fired from the
+  coordinator's own checkout resumes the worker inside the WRONG repo. Full session context
+  is retained (a running
   session takes `codex queue --thread <id> --message` instead - present on CLI 0.150.1,
   absent on 0.144: there, wait out or kill the exec, then resume). A resume is a fresh CLI
   invocation: it retains the conversation, not the launch flags, so every resume repeats the
@@ -190,10 +193,14 @@ The coordinator's job between launch and last merge:
   sandbox mode as config too. A resume without the overrides is back in the network-blocked
   default and the unstick message lands in a worker that cannot push. Escalation is the same as for
   a Claude agent: two failed interventions and the coordinator takes over the mechanical
-  remainder or spawns a Claude finisher on the worktree's branch. A finisher landing a stalled
+  remainder or spawns a Claude finisher on the worktree's branch - after confirming the
+  stalled exec is DEAD (kill its pid and wait for the exit), because a quiet stream does not
+  prove it cannot still act: a queued message processed late would give the branch two
+  concurrent writers, one of them a finisher mid-rebase. A finisher landing a stalled
   worker's branch does not inherit its transcript, so the friction that grounds `after-merge`
-  is still in the Codex session: after the merge, `codex exec resume <session-id>` it (same
-  sandbox flags - hand-back mode still reads the tracker for dedup) for the hand-back
+  is still in the Codex session: after the merge, `codex exec resume <session-id>` it (from
+  inside the worktree, which removal-comes-last has kept alive; same sandbox flags -
+  hand-back mode still reads the tracker for dedup) for the hand-back
   brainstorm rather than brainstorming its work from the outside; only if the session is
   unresumable does the coordinator brainstorm from the diff and say so.
 - **Converge long reviews.** An automated reviewer keeps finding members of any open-ended
