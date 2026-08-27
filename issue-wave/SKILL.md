@@ -87,7 +87,9 @@ conversation), transfers between worker kinds verbatim, and includes:
   agent's run freezes (observed 2026-08-22: 34 exes parked in dlopen, logs frozen, load 2.5).
   Also ask for `dune -j 4` when more than ~4 agents share the box.
 - Landing: the ship-pr skill through review to merge, then close the upstream issue with a
-  summary comment, then remove the worktree.
+  summary comment, then remove the worktree. The after-merge brainstorm ship-pr ends with
+  runs in **hand-back mode**: propose issues and chip candidates in the close-out report,
+  file and spawn nothing — the coordinator combines across workers and does the filing.
 - Process discipline, stated explicitly because agents re-derive it badly under load:
   never end a turn with only a detached process outstanding - attach waits as
   harness-tracked background children; if a review watch goes quiet suspiciously long, read
@@ -106,8 +108,8 @@ intervention. Mechanics that differ from Opus workers:
 
 - **Skills**: `ship-pr`, `wait-and-proceed`, and `after-merge` are symlinked into
   `~/.codex/skills` (from this repo's working tree - merged skill edits propagate with no
-  deploy step). Codex has no `spawn_task`: per after-merge's chip fallback, its close-out
-  reports chip candidates and the coordinator spawns them.
+  deploy step). Codex has no `spawn_task`, which hand-back mode makes moot: wave workers of
+  either kind propose rather than file.
 - **Network**: the `workspace-write` sandbox blocks network by default. Either enable it in
   the sandbox config so the worker can push and drive `gh`, or brief the worker to stop at
   commit and hand the branch to a Claude finisher that lands via ship-pr. Prefer the
@@ -203,10 +205,13 @@ The coordinator's job between launch and last merge:
 ## Close out
 
 When the last gate clears: a final board (issue -> PR -> merge state), residuals and
-follow-up issues the agents filed, and any gates left for the next invocation. Hand notable
-merges to the `after-merge` skill while the context is fresh — but a merge whose worker already
-ran its own brainstorm (ship-pr instructs it) is done: spawn the chip candidates its close-out
-handed up rather than brainstorming the same merge twice, which the worker's transcript grounds
-better than the coordinator's anyway. Notify any sessions the user
+follow-up issues, and any gates left for the next invocation. Workers ran `after-merge` in
+hand-back mode, so each close-out arrives carrying proposed issues, chip candidates, and
+reasoned drops; the coordinator's role here is editorial, not generative. Combine overlapping
+proposals across workers into single issues — cross-worker recurrence is the strongest
+priority signal a wave produces — revise drafts against the tracker's style, then do the
+filing, evidence comments, and chip-spawning yourself. Do not re-brainstorm a worker's merge
+from the supervision view (its transcript grounds it better); run `after-merge` directly only
+for work the coordinator itself shepherded. Notify any sessions the user
 asked to be told. If the wave surfaced a new coordination trap, add it to the project's
 agent-notes or this skill - whichever the trap belongs to.

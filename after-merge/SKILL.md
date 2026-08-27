@@ -40,11 +40,29 @@ Sort each idea into exactly one, and say which:
   why it is worth fixing, and what a fix would touch.
 - **Chip it** — small, immediately actionable, no open design question. Spawn a background task
   with a self-contained prompt (file paths and enough context to act without this conversation).
-  If your harness has no task-chip tool (`spawn_task` — delegated workers, Codex agents), do not
-  improvise a substitute: list the item in your close-out report as a **chip candidate**, prompt
-  included, for the coordinating session to spawn.
+  If your harness has no task-chip tool (`spawn_task`), do not improvise a substitute: surface
+  the item in your report as a **chip candidate**, prompt included.
 - **Drop it, with the reason** — state the reason in the report so the same idea is not re-raised
   next cycle. Dropping is the common case.
+
+## Hand-back mode (delegated workers)
+
+A worker running under a coordinator — a wave agent, a Codex worker — runs the brainstorm but
+hands the dispositions back instead of executing them. Tracker mutations (issues, comments,
+chips) belong to the coordinator, which sees every worker's hand-back at once and can revise
+drafts, combine overlapping proposals into one issue, and spot recurrence across workers that
+no single worker can see. In this mode:
+
+- The grounding rule and the dedup read below still apply in full — the brainstorm itself is
+  the part only the worker can do, since the friction lives in its transcript.
+- Per item, the close-out carries: the grounding, the *proposed* disposition, and the draft
+  artifact — issue title+body in the tracker's style, chip prompt, or the existing issue
+  number new evidence should be commented on.
+- File nothing, comment nothing, spawn nothing. Drops are still stated with their reason, so
+  the coordinator does not re-raise what the worker already binned.
+
+The default — no coordinator, working directly with the user — is **complete mode**: execute
+the dispositions as written above.
 
 ## Deduplicate first
 
