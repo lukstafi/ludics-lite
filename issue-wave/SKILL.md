@@ -66,9 +66,12 @@ triage is wrong, not the backlog.
 
 ## Launch
 
-One Opus subagent per issue, worktrees outside the repo per project convention, parallel
-groups launched together in a single message. The brief must be self-contained (agents do
-not see this conversation) and include:
+One worker per issue, worktrees outside the repo per project convention, parallel groups
+launched together in a single message. The default worker is an encouraged Opus subagent;
+when the user asks for Codex workers, route D1 issues to Codex (see Codex workers below)
+and keep D2 and anything carrying a tier-2/3 decision on Opus until Codex's failure modes
+on this backlog are calibrated. The brief must be self-contained (agents do not see this
+conversation), transfers between worker kinds verbatim, and includes:
 
 - Setup: worktree creation off current origin/master, environment script, which docs to read.
 - The task: issue number and repo, a summary, and the instruction to read the issue and its
@@ -93,6 +96,28 @@ not see this conversation) and include:
 - Encouragement. It is cheap and the user asked for it: name why the issue matters and
   express confidence. Agents visibly do their best work when the brief treats them as
   trusted colleagues.
+
+### Codex workers
+
+Launch as a harness-tracked background Bash task, one per worktree:
+`codex exec --json -s workspace-write -C <worktree> -o <report-file> "<brief>"`. Capture the
+session UUID from the JSONL stream at launch - it is the address for every later
+intervention. Mechanics that differ from Opus workers:
+
+- **Skills**: `ship-pr`, `wait-and-proceed`, and `after-merge` are symlinked into
+  `~/.codex/skills` (from this repo's working tree - merged skill edits propagate with no
+  deploy step). Codex has no `spawn_task`: per after-merge's chip fallback, its close-out
+  reports chip candidates and the coordinator spawns them.
+- **Network**: the `workspace-write` sandbox blocks network by default. Either enable it in
+  the sandbox config so the worker can push and drive `gh`, or brief the worker to stop at
+  commit and hand the branch to a Claude finisher that lands via ship-pr. Prefer the
+  finisher split while calibrating - it keeps the review-round machinery where the learned
+  failure modes live, and the finisher re-verifies from scratch, a cross-model check for
+  free.
+- **Structured close-out**: `--output-schema` can force the final report shape (PR number,
+  test status, residuals, chip candidates) when parsing prose reports gets old.
+- **Attribution**: Codex commits carry no Claude trailer; the project's CLAUDE.md
+  conventions reach it only through the brief or a mirrored `AGENTS.md`.
 
 ## Supervise
 
@@ -126,6 +151,14 @@ The coordinator's job between launch and last merge:
   with a disk-first brief: inventory `git status`/log in its worktree, trust the disk over its
   memory, re-run anything whose result is not in a file (observed 3x on 2026-08-23; commits
   proved durable every time, so "commit early" is the cheap insurance to insist on in briefs).
+- **Codex workers have no yield signal.** A `codex exec` run is silent between JSONL events,
+  so the "yields twice with no state change" play does not exist for it. The stall test is
+  external: the JSONL stream quiet AND `git log`/`git status` in its worktree unmoved over a
+  wall-clock window sized to the task. To unstick, send one imperative message via
+  `codex exec resume <session-id> "<do X now>"` - full session context is retained (a running
+  session takes `codex queue --thread <id> --message` instead). Escalation is the same as for
+  a Claude agent: two failed interventions and the coordinator takes over the mechanical
+  remainder or spawns a Claude finisher on the worktree's branch.
 - **Converge long reviews.** An automated reviewer keeps finding members of any open-ended
   artifact (a scanner, a property table) indefinitely; two agents went 9 and 13 rounds on
   2026-08-22. After ~5 rounds send the policy: fix only findings that show a claim CANNOT fail
