@@ -171,6 +171,9 @@ The coordinator's job between launch and last merge:
 
 When the last gate clears: a final board (issue -> PR -> merge state), residuals and
 follow-up issues the agents filed, and any gates left for the next invocation. Hand notable
-merges to the `after-merge` skill while the context is fresh. Notify any sessions the user
+merges to the `after-merge` skill while the context is fresh — but a merge whose worker already
+ran its own brainstorm (ship-pr instructs it) is done: spawn the chip candidates its close-out
+handed up rather than brainstorming the same merge twice, which the worker's transcript grounds
+better than the coordinator's anyway. Notify any sessions the user
 asked to be told. If the wave surfaced a new coordination trap, add it to the project's
 agent-notes or this skill - whichever the trap belongs to.

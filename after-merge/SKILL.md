@@ -40,6 +40,9 @@ Sort each idea into exactly one, and say which:
   why it is worth fixing, and what a fix would touch.
 - **Chip it** — small, immediately actionable, no open design question. Spawn a background task
   with a self-contained prompt (file paths and enough context to act without this conversation).
+  If your harness has no task-chip tool (`spawn_task` — delegated workers, Codex agents), do not
+  improvise a substitute: list the item in your close-out report as a **chip candidate**, prompt
+  included, for the coordinating session to spawn.
 - **Drop it, with the reason** — state the reason in the report so the same idea is not re-raised
   next cycle. Dropping is the common case.
 
@@ -64,5 +67,5 @@ Example pairing: PRs in `lukstafi/ocannl-staging`, issues in `ahrefs/ocannl`.
 ## Report
 
 A short list: item, the friction that grounds it, the disposition. Then the issue URLs created or
-commented on, and the chips spawned. Optionally post the brainstorm itself as a comment on the
+commented on, and the chips spawned or handed up as candidates. Optionally post the brainstorm itself as a comment on the
 merged PR first, so each filed issue can cite it and the idea keeps its provenance.
