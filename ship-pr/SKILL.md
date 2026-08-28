@@ -391,6 +391,25 @@ a manual stop, and re-running is what turns it into an answer; it is exit 4 like
 Run `checks` on its own — same verdicts, same exit codes, no merge — whenever you want the build
 signal without acting on it, such as before asking the reviewer for another round.
 
+### How stale the base has grown
+
+Both gates above read the *head commit*, and both are satisfied by a branch whose base has moved on
+without it. `merge` therefore also prints how many commits behind its base the branch is, and says
+so loudly — `!!! … COMMITS BEHIND`, on stdout and stderr — past 20 (`SHIP_PR_STALE_BASE`, or `off`).
+
+It warns and merges anyway: rebasing before merging is already the convention, so this is the
+backstop for the pass where that was forgotten, not a second gate. **Read the line before letting
+the merge stand.** On staging#488 (2026-08-28) sixteen review rounds ran against a base that had
+gone 136 commits stale, `master` had meanwhile edited the very file the PR changed, and every
+signal on the merge path was clean: green checks (on the stale head), an approval (of the stale
+diff), `mergeable=true` (semantic drift produces no textual conflict). What caught it was a hand-run
+`git diff origin/master..HEAD --stat` whose 258 files were visibly not the two-file branch — note
+the two dots, which is what makes the base's own changes show up; `...` would have looked innocent.
+
+When it fires, rebase (or merge the base in, where the branch is shared), push, and let the checks
+re-run — a stale-base merge lands a combination nobody reviewed and no CI run built. A count the
+compare API could not answer prints `UNKNOWN`, which is not "not behind": check it by hand.
+
 ### The override
 
 The gate has two escape hatches, for two different facts. `--allow-no-verdict` (above) is for a

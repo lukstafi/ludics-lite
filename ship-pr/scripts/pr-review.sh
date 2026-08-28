@@ -66,6 +66,18 @@
 # confirms `merged` over REST afterwards, because `gh pr merge` exits 0 having merely ENABLED
 # auto-merge when the base carries required checks.
 #
+# The last thing `merge` reads before acting is how far the branch has fallen BEHIND its base,
+# because a review is only ever about the code it was run against. On 2026-08-28
+# (ocannl-staging#488) a merge was one keystroke away over a base 136 commits stale after SIXTEEN
+# review rounds; master had meanwhile edited the very file the PR changed, and what caught it was a
+# hand-run `git diff origin/master..HEAD --stat` whose 258 files and 14k deletions were visibly not
+# the two-file branch. Nothing on the merge path had a reason to notice: the checks were green (on
+# the stale head), the reviewer had approved (the stale diff), and `mergeable` was true (no textual
+# conflict — semantic drift does not produce one). So the count is read from the compare API and
+# WARNED about. It does not refuse: rebasing before merging is already the repo convention, so this
+# is the backstop for the pass where that was forgotten, and refusing on a number GitHub computes
+# would strand merges whose drift is genuinely irrelevant.
+#
 # REST vs GraphQL: everything on the polling and merge-gate path is REST, deliberately — GitHub's
 # GraphQL endpoint 503s independently of REST, so a GraphQL-borne "no reaction yet" is a lie the
 # merge gate would act on. `gh repo view` rides GraphQL, hence the local git-remote fallback.
@@ -83,7 +95,8 @@
 #   pr-review.sh merge <pr> [--override "<why this red is unrelated>"] [--wait]
 #                           [--allow-no-verdict]
 #                                          # checks, then merge; refuses on red without --override,
-#                                          # and on NO verdict without --allow-no-verdict
+#                                          # on NO verdict without --allow-no-verdict, and WARNS
+#                                          # loudly when the branch is far behind its base
 #   pr-review.sh base [owner/name] [branch]
 #                                          # is the branch you are about to work off CI-green?
 #   pr-review.sh reply <pr> <comment-id> <body>
@@ -118,7 +131,9 @@
 #      review app's check and the github-pages deploys), SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
 #      out for a build verdict (7200 — the runner queue alone ran ~2h deep on 2026-08-23),
 #      SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60), SHIP_PR_CHECKS_HEARTBEAT=seconds
-#      between the one-line "still waiting" progress notes a `--wait` prints (600).
+#      between the one-line "still waiting" progress notes a `--wait` prints (600),
+#      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
+#      silences it — the warning never blocks the merge either way).
 
 set -uo pipefail
 
@@ -1148,6 +1163,80 @@ await_mergeable() {
   return 4
 }
 
+# --- staleness of the base --------------------------------------------------------------------
+# How far behind its base the branch is, i.e. how much of the base the review and the checks never
+# saw. Nothing else on the merge path can answer this: green checks are green on the STALE head, an
+# approval approves the STALE diff, and `mergeable` is true whenever the drift produced no textual
+# conflict — which is exactly the case where the damage is silent. See the header for #488.
+STALE_BASE="${SHIP_PR_STALE_BASE:-20}"
+case "$STALE_BASE" in
+off) ;;
+'' | *[!0-9]*) die "SHIP_PR_STALE_BASE must be a number of commits or 'off', got '$STALE_BASE'" ;;
+esac
+
+# Prints the count, loudly when it is at or over the threshold. Returns 0 fresh enough, 1 warned,
+# 3 unread. The caller merges regardless — this is a warning, not a gate — but the DIFFERENCE
+# between "not behind" and "could not be read" is preserved here like everywhere else in this file:
+# a compare call that never answered must not print a reassuring number it does not have.
+warn_base_drift() {
+  local pr="$1" fields cmp base head sha behind ahead rc
+  [ "$STALE_BASE" = off ] && return 0
+  # Placeholders, never empty fields: tab is IFS whitespace, so an empty middle column would shift
+  # the sha into $head (the same trap build_checks documents).
+  fields=$(gh_retry read api "repos/$REPO/pulls/$pr" \
+    --jq '[(.base.ref // "-"), (.head.label // "-"), (.head.sha // "-")] | @tsv')
+  rc=$?
+  IFS=$'\t' read -r base head sha <<<"$fields"
+  if [ "$rc" -ne 0 ] || [ -z "$base" ] || [ "$base" = - ]; then
+    warn "how far $REPO#$pr is behind its base: UNKNOWN — the PR could not be read" \
+      "($(gh_err_line)). This is not 'not behind': check it by hand before merging" \
+      "(git fetch, then git diff <remote>/<base>..HEAD --stat)."
+    return 3
+  fi
+  # owner:branch, so a fork PR compares against the branch it actually has; the head SHA is the
+  # fallback for a head whose repo is gone or whose label the API left unset.
+  case "$head" in *:*) ;; *) head="$sha" ;; esac
+  # per_page=1 trims the commit list the compare would otherwise carry — 136 commits and 258 files
+  # of payload to read two integers. behind_by/ahead_by are totals and are unaffected by it.
+  cmp=$(gh_retry read api "repos/$REPO/compare/$base...$head?per_page=1" \
+    --jq '[(.behind_by // "-"), (.ahead_by // "-")] | @tsv')
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ "$head" != "$sha" ] && [ "$sha" != - ]; then
+    cmp=$(gh_retry read api "repos/$REPO/compare/$base...$sha?per_page=1" \
+      --jq '[(.behind_by // "-"), (.ahead_by // "-")] | @tsv')
+    rc=$?
+  fi
+  IFS=$'\t' read -r behind ahead <<<"$cmp"
+  [ "$rc" -eq 0 ] || behind=-
+  case "$behind" in
+  '' | *[!0-9]*)
+    warn "how far $REPO#$pr is behind $base: UNKNOWN — the compare call did not answer" \
+      "($(gh_err_line)). This is not 'not behind': check it by hand before merging" \
+      "(git fetch, then git diff <remote>/$base..HEAD --stat)."
+    return 3
+    ;;
+  esac
+  case "$ahead" in '' | *[!0-9]*) ahead="?" ;; esac
+  if [ "$behind" -lt "$STALE_BASE" ]; then
+    echo "base freshness $REPO#$pr: $behind commit(s) behind $base, $ahead ahead" \
+      "(warns at $STALE_BASE)"
+    return 0
+  fi
+  echo "!!! $REPO#$pr is $behind COMMITS BEHIND its base ($base)."
+  echo "!!! The review that approved this branch, and the checks that went green on it, both judged"
+  echo "!!! it against a base that has since moved $behind commits. $base may have edited the very"
+  echo "!!! files this PR changes: merging now lands a combination nobody reviewed and no CI run"
+  echo "!!! built. A clean 'mergeable' says only that the two texts do not collide."
+  echo "!!! Rebase onto the base (or merge it in, where the branch is shared and rewriting is not"
+  echo "!!! yours to do), push, and let the checks re-run before merging:"
+  echo "!!!   git fetch <the remote pointing at $REPO> && git rebase <that remote>/$base"
+  echo "!!!   git diff <that remote>/$base..HEAD --stat   # two dots: on a stale branch this shows"
+  echo "!!!                                               # the BASE's files too, not just yours"
+  warn "MERGING A STALE BRANCH: $REPO#$pr is $behind commits behind $base (warns at $STALE_BASE," \
+    "SHIP_PR_STALE_BASE) — rebase and re-check unless you know the drift is irrelevant."
+  return 1
+}
+
 # merge = read the build signal, then merge. The two are one command on purpose: a gate you have
 # to remember to run separately is the gate that was missing for seven merges.
 cmd_merge() {
@@ -1227,6 +1316,9 @@ cmd_merge() {
     fi
     ;;
   esac
+  # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that the
+  # warning is the final thing on screen before the merge itself. It never stops the merge.
+  warn_base_drift "$PR_NUM" || :
   while :; do
     out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" "${gh_args[@]}")
     rc=$?
