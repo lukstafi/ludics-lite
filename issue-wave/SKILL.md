@@ -177,6 +177,15 @@ The coordinator's job between launch and last merge:
   with a disk-first brief: inventory `git status`/log in its worktree, trust the disk over its
   memory, re-run anything whose result is not in a file (observed 3x on 2026-08-23; commits
   proved durable every time, so "commit early" is the cheap insurance to insist on in briefs).
+- **Babysit through `pr-review.sh`, not hand-rolled `gh`.** When the coordinator ends up
+  shepherding a PR itself — a takeover after failed unsticks, a finisher's branch, a stranded
+  PR inherited from a dead session — drive the review loop with the ship-pr skill's
+  `~/.claude/skills/ship-pr/scripts/pr-review.sh` (`poll`, `watch`, `status`, `checks`,
+  `merge`, `reply`, `resolve`, `comment`, `retry`). It encodes the traps ship-pr documents —
+  retry on GitHub's coin-flip 5xxs, the pagination long review rounds walk into, exit codes
+  that distinguish "the fact does not hold" (1) from "the API never answered" (3) — that
+  hand-rolled `gh` calls rediscover the hard way. The same applies to one-off supervision
+  reads: `pr-review.sh retry --read <gh args…>` beats an ad-hoc retry loop.
 - **Codex workers have no yield signal.** A `codex exec` run is silent between JSONL events,
   so the "yields twice with no state change" play does not exist for it. The stall test is
   external: the JSONL stream quiet AND `git log`/`git status` in its worktree unmoved over a
