@@ -366,6 +366,16 @@ with a one-line heartbeat every 10 min (`SHIP_PR_CHECKS_HEARTBEAT`), so backgrou
 hold. If the ceiling runs out it exits 4 naming `--allow-no-verdict`; for anything a compiler sees,
 wait again instead.
 
+Two traps around that hold, both observed 2026-08-28. **`ABSENT` seconds after a force-push is not
+a verdict** — the mandated rebase-before-merge pushes a new head whose checks may not EXIST yet,
+and a wait that starts in that window sees nothing to wait for and can pass the gate having read
+nothing (ocannl staging#491 merged that way). After any force-push, confirm a run exists on the
+new head (`gh pr checks` / the run list) before trusting a quick `ABSENT`-shaped answer, and if
+none exists yet, wait for it to appear. And **the harness can kill a backgrounded `merge --wait`
+well before its ceiling** (observed twice at ~40 min): the correct response is to re-read merge
+state over REST (`gh pr view --json state,mergedAt,headRefOid`) and re-arm the wait — never to
+conclude the merge failed, and never to reach for `--allow-no-verdict` because the waiter died.
+
 `--allow-no-verdict` merges unread, loudly on stdout and stderr. It is acceptable only when the
 verdict could tell you nothing you have not established yourself: a doc-only diff, or a shell-only
 one whose script you ran locally on the **exact rebased tree** you are merging — a rebase is a new

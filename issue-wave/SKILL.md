@@ -211,10 +211,28 @@ The coordinator's job between launch and last merge:
   2026-08-22. After ~5 rounds send the policy: fix only findings that show a claim CANNOT fail
   (vacuous guard, untracked config key, host-dependent expectation); reply in-thread and defer
   everything else to ONE follow-up issue; merge on approval. Both converged within two rounds.
+  The 2026-08-27 wave (three reviews at 11–18 rounds) refined the policy into the form to send:
+  the axis is **silent vs loud** — a silent defect (a claim that cannot fail, a sweep that deletes
+  what it shouldn't, an oracle a scheduler accident satisfies) is must-fix at ANY round count,
+  while a loud one (a false refusal or error on valid-but-absent shapes) defers; a silent finding
+  only reachable by code nobody has written defers too (reachability qualifier); and defects in
+  machinery the review itself introduced are the worker's to fix, not to defer ("filing bugs
+  against myself"). When a reviewer approves only by finding nothing and the last rounds are
+  confined to review-requested machinery, pre-authorize merge-on-substance: CI green on the final
+  head, every thread answered with its classification, and a review-record paragraph in the PR
+  body. Expect good workers to push back on your framing with verified evidence — the wave's best
+  worker corrected the coordinator's premise three times, correctly each time; endorse that, don't
+  override it.
   Pair it with **one push per CI cycle** in late rounds — every push supersedes the ubuntu leg
   (~28 min when the runners are free; the 2026-08-23 wave saw 1h20m with six PRs queued), so a fix that only x86 can confirm stays unconfirmed for as long as pushes keep
   coming — and with "rebase before opening and before merging": CI builds the MERGE commit, so a
   repo-wide scan green on the branch can be red against what landed on master meanwhile.
+  Where the ci workflow has NO concurrency group, pushes do not supersede — they queue serially
+  behind runs for commits nobody will merge (13 queued runs starved one PR's head for an hour on
+  2026-08-28). The play: freeze pushes, cancel exactly the runs for superseded intermediate
+  commits, let the head's run through, then one batched push carrying the held fixes. A worker
+  told to freeze should hold locally-verified commits unpushed with their threads deliberately
+  unresolved (resolving would claim work not visible on the PR).
 - **Merge gates under a saturated runner queue.** GitHub's macOS runners serialize; a
   20-PR day queues master runs ~2 h deep, which is how a stale test claim reached master unread
   on 2026-08-23 (#452 → red for two hours). `merge --wait` now refuses without a verdict (see
