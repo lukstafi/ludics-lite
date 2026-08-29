@@ -1365,9 +1365,13 @@ cmd_merge() {
 # Read the base's own CI before starting work, not only before merging.
 cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
+  local vconcl vsha vwhen vurl stopped_note
   while [ $# -gt 0 ]; do
     case "$1" in
-    */*) REPO="$1" ;;
+    # First slashed arg is the repo UNLESS one is already named (--repo, REPO=, or an earlier
+    # positional): branches carry slashes too (claude/...), and reading one as the repo turns
+    # `base --repo owner/name claude/topic` into a 404 on repo "claude/topic".
+    */*) if [ -z "$REPO" ]; then REPO="$1"; else branch="$1"; fi ;;
     -*) die "base: unknown option '$1'" ;;
     *) branch="$1" ;;
     esac
@@ -1389,24 +1393,47 @@ cmd_base() {
   rc=$?
   [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's runs on $branch ($(gh_err_line));" \
     "the base's health is UNKNOWN, which is NOT 'green'."
-  # Newest first, so per workflow: the newest run at all (is one in flight?) and the newest
-  # COMPLETED one (what is the last actual verdict?). The two differ routinely and the second is
-  # the one that answers "is this base broken".
-  # Same empty-field rule as build_checks: a workflow with no completed run yet leaves four of
-  # these columns unset, and unset prints as empty, which `IFS=$'\t' read` would collapse.
+  # Empty result must short-circuit: one empty line through tab-IFS `read` collapses into
+  # shifted fields (tab is IFS whitespace), which used to render as a phantom workflow — and
+  # a branch with no push-event runs would headline green with exit 0.
+  if [ -z "$raw" ]; then
+    echo "$REPO $branch: no build workflow has run on it (nothing to read, not a green light)"
+    return 4
+  fi
+  # Newest first, so per workflow: the newest run at all (is one in flight?), the newest
+  # COMPLETED one, and the newest run with an actual VERDICT (red/green). The last one is what
+  # answers "is this base broken": under cancel-in-progress concurrency the newest completed run
+  # on a busy default branch is routinely `cancelled` — stopped, not judged — and reading that as
+  # either green or "no verdict" would be wrong (an older run usually did judge an earlier tip).
+  # Same empty-field rule as build_checks: a workflow with no completed run yet leaves these
+  # columns unset, and unset prints as empty, which `IFS=$'\t' read` would collapse.
   raw=$(awk -F'\t' '
     { nm=$1
       if (!(nm in seen)) { seen[nm]=1; order[++n]=nm; lstatus[nm]=$2; lsha[nm]=$4 }
       if ($2 == "completed" && !(nm in done)) { done[nm]=1; c[nm]=$3; csha[nm]=$4; cw[nm]=$5; cu[nm]=$6 }
+      if ($2 == "completed" && !(nm in vdone) && \
+          ($3 == "failure" || $3 == "timed_out" || $3 == "startup_failure" || \
+           $3 == "success" || $3 == "skipped" || $3 == "neutral")) {
+        vdone[nm]=1; v[nm]=$3; vs[nm]=$4; vw[nm]=$5; vu[nm]=$6 }
     }
     END { for (i=1;i<=n;i++) { nm=order[i]
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", nm, lstatus[nm], lsha[nm],
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", nm, lstatus[nm], lsha[nm],
           (nm in done ? c[nm] : "pending"), (nm in done ? csha[nm] : "-"),
-          (nm in done ? cw[nm] : "-"), (nm in done ? cu[nm] : "-") } }
+          (nm in done ? cw[nm] : "-"), (nm in done ? cu[nm] : "-"),
+          (nm in vdone ? v[nm] : "-"), (nm in vdone ? vs[nm] : "-"),
+          (nm in vdone ? vw[nm] : "-"), (nm in vdone ? vu[nm] : "-") } }
   ' <<<"$raw")
-  while IFS=$'\t' read -r name status sha concl csha cwhen curl; do
+  while IFS=$'\t' read -r name status sha concl csha cwhen curl vconcl vsha vwhen vurl; do
     [ -n "$name" ] || continue
     is_advisory "$name" && continue
+    # Newest completed run stopped-not-judged (cancelled/stale/action_required): the newest
+    # JUDGED run carries the verdict — a red under a cancelled run is not an all-clear — and the
+    # stopped run becomes context. Only when NO run ever judged this branch is there no verdict.
+    stopped_note=""
+    if [ "$(conclusion_class "$concl")" = nogo ] && [ "$vsha" != "-" ]; then
+      stopped_note="           (newest completed run: $concl at ${csha:0:8}, stopped not judged — verdict above is the newest judged run)"$'\n'
+      concl=$vconcl csha=$vsha cwhen=$vwhen curl=$vurl
+    fi
     case "$(conclusion_class "$concl")" in
     red)
       red=$((red + 1))
@@ -1417,8 +1444,12 @@ cmd_base() {
       pend=$((pend + 1))
       out="${out}  no verdict  $name — has never completed on $branch"$'\n'
       ;;
-    *) out="${out}  no verdict  $name — $concl at ${csha:0:8} (stopped, not judged)  $curl"$'\n' ;;
+    *)
+      pend=$((pend + 1))
+      out="${out}  no verdict  $name — $concl at ${csha:0:8} (stopped, not judged; no earlier judged run in the window)  $curl"$'\n'
+      ;;
     esac
+    out="${out}${stopped_note}"
     # A run whose head is behind the tip is normal here (ci carries paths-ignore: docs/**), but it
     # means the verdict is about an older tree than the one you are about to branch from.
     [ "$csha" = "-" ] && csha=""
@@ -1440,9 +1471,13 @@ cmd_base() {
     echo "$REPO $branch: no build workflow has run on it (nothing to read, not a green light)"
     return 4
   fi
+  if [ "$pend" -gt 0 ]; then
+    echo "$REPO $branch: NO VERDICT${tip:+ (tip ${tip:0:8})} — some workflow was never judged here; not green, not red"
+    printf '%s' "$out"
+    return 4
+  fi
   echo "$REPO $branch: green${tip:+ (tip ${tip:0:8})}"
   printf '%s' "$out"
-  [ "$pend" -gt 0 ] && return 4
   return 0
 }
 
