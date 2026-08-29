@@ -98,6 +98,13 @@ and includes:
   harness-tracked background children; if a review watch goes quiet suspiciously long, read
   the PR feed directly (`gh pr view --comments`) rather than re-arming the watch (reactions
   persist across rounds and strand it).
+- **Never re-request review as stall recovery** (2026-08-29): the Codex GitHub reviewer's
+  no-findings verdict can arrive as a PR COMMENT ("Didn't find any major issues... Reviewed
+  commit: <sha>") rather than only the 👍 reaction, and an `@codex review` re-request CLEARS
+  the existing 👍 — a worker that re-requests before reading the feed destroys the approval
+  it failed to see. `pr-review.sh status` recognizes the comment-shaped verdict since
+  self-improve 0e28fd285; the brief still says: read the full feed first, re-request only
+  when it truly holds nothing for the current head.
 - Encouragement. It is cheap and the user asked for it: name why the issue matters and
   express confidence. Agents visibly do their best work when the brief treats them as
   trusted colleagues.
@@ -112,9 +119,17 @@ or mangled by the coordinator's own shell:
 ```
 codex exec --json --strict-config -c 'sandbox_mode="workspace-write"' \
   -c 'sandbox_workspace_write.network_access=true' \
-  -c 'sandbox_workspace_write.writable_roots=["<main-checkout>/.git"]' \
+  -c 'sandbox_workspace_write.writable_roots=["<main-checkout>/.git","<home>/.local/state","<home>/.ocannl-test-runs"]' \
   -C <worktree> -o <report-file> - < <brief-file>
 ```
+
+The two state roots come from the first wave's friction reports (2026-08-29): without them
+every `pr-review.sh` call warns about its `~/.local/state/ship-pr` cache and
+`tools/test-run.sh` cannot write its default runs directory (workers found env-var
+workarounds, but granting the roots is smoother). Two sandbox limits to plan around, not
+patch: `gh`'s cache under `~/.cache` stays blocked (workers set `XDG_CACHE_HOME=/tmp/...`
+when needed — fine), and the sandbox hides GPU devices (a worker probing Metal saw no
+device), so GPU-measurement issues need `--yolo`, a Claude worker, or the GPU-box ssh path.
 
 Capture the session UUID from the JSONL stream at launch - it is the address for every later
 intervention. Mechanics that differ from Opus workers:
