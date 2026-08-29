@@ -42,14 +42,17 @@ git fetch origin && git rebase origin/master   # a direct push has to fast-forwa
 git push origin HEAD:master
 ```
 
-From a linked worktree push `HEAD:master` rather than checking master out — the main checkout
+From a linked worktree push `HEAD:master` rather than checking master out — some checkout
 holds that branch ("already used by worktree"). That is checked-out-branch protection, not `git
 worktree lock`, and it does not reach the remote ref: `push HEAD:master` goes through. It does
-leave the local `master` behind, and only the main checkout can advance it (`git -C <main> merge
---ff-only origin/master`; `fetch origin master:master` and `branch -f master` are refused from the
-worktree). Either do that, or give every later branch an explicit start point (`git checkout -b
-next origin/master`, `git worktree add -b next <path> origin/master`) — an omitted start point
-takes the current HEAD, which from a stale main checkout drops the commits just landed.
+leave the local `master` behind, and which command advances it depends on who has it checked out,
+so look first (`git -C <main> worktree list --porcelain`, grep `branch refs/heads/master`). If NO
+worktree has it out, the primary form is `git -C <main> fetch origin master:master`. If one does,
+that fetch is refused, and the exact complement is `git -C <master-owner> merge --ff-only
+origin/master` run in whichever worktree owns it — the main checkout only when the main checkout
+is the owner. Either update it, or give every later branch an explicit start point (`git checkout
+-b next origin/master`, `git worktree add -b next <path> origin/master`) — an omitted start point
+takes the current HEAD, which from a stale checkout drops the commits just landed.
 
 The trade is explicit: a direct commit gets no review at all. Anything carrying a design decision
 goes through the full loop below.
@@ -128,8 +131,9 @@ a new one, take it from a *freshly fetched* base:
 git fetch origin && git checkout -b claude/<topic> origin/master
 ```
 
-In a worktree setup `git checkout master` fails outright ("already used by worktree"), and a stale
-local base silently reopens problems the base already fixed. The `-b … origin/<base>` form
+In a worktree setup `git checkout master` fails whenever another worktree owns that branch
+("already used by worktree"), and a stale local base silently reopens problems the base already
+fixed. The `-b … origin/<base>` form
 sidesteps both.
 
 If the branch already has a PR, push to it and reuse it — never open a second one for the same
@@ -472,12 +476,29 @@ conflict you must resolve.
 
 Then clean up, but not with `gh pr merge --delete-branch`: from a worktree its cleanup fails *after*
 the merge has landed ("fatal: 'master' is already used by worktree"), leaving the branch behind and
-the failure looking like a failed merge. Two rules carry the rest — anchor every command with `git
--C <main>`, since `worktree remove` deletes the current directory when run from inside it and
-everything after it dies with "Unable to read current working directory"; and fast-forward `master`
-before `git branch -d`, which tests the branch's upstream first and falls back to the stale local
-`master` once the remote branch is gone. `docs/agent-notes.md` (Conventions) carries the full
-ordered sequence, verified end to end — follow it there rather than reconstructing it.
+the failure looking like a failed merge. Three rules carry the rest.
+
+Delete the REMOTE branch first, then fast-forward the local `master`, and only then `git branch
+-d`: `-d` tests the branch's UPSTREAM and falls back to HEAD only when there is none, so with
+`origin/<branch>` still present it checks a tautology and drops an unmerged topic with a warning.
+
+Advancing that local `master` depends on who has it checked out, so inspect `git -C <main> worktree
+list --porcelain` for `branch refs/heads/master`. If NO worktree has it out, use `git -C <main>
+fetch origin master:master`; if one does, that fetch is refused and the exact complement is `git -C
+<master-owner> merge --ff-only origin/master` in the owning worktree.
+
+With the upstream gone, `-d` is a real "merged into master" check only when the checkout's HEAD IS
+`master`. Off `master` it is not, so require `git -C <main> merge-base --is-ancestor <branch>
+master` to pass and then use `-D`, which only performs the deletion (`-D` after an explicit
+ancestry check is also what follows an independently confirmed squash or rebase merge, whose
+commits are not ancestors of `master`). `git -C <main>` anchors the working directory only — it
+says nothing about which branch is checked out there, which is the volatile part during a wave, so
+it is never itself the safety check. Anchor anyway, because `worktree remove` deletes the current
+directory when run from inside it and any later unanchored command dies with "Unable to read
+current working directory".
+
+`docs/agent-notes.md` (Conventions) carries the full ordered sequence, verified end to end —
+follow it there rather than reconstructing it.
 
 If the harness blocks the merge itself, that is a permission gate, not a failure: explain what you
 were doing, give the command, and let the user decide. Never work around it.
