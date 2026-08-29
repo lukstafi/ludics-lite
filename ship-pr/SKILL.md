@@ -495,7 +495,11 @@ commits are not ancestors of `master`). `git -C <main>` anchors the working dire
 says nothing about which branch is checked out there, which is the volatile part during a wave, so
 it is never itself the safety check. Anchor anyway, because `worktree remove` deletes the current
 directory when run from inside it and any later unanchored command dies with "Unable to read
-current working directory".
+current working directory". One more refusal survives all of the above: git will not delete a
+branch any worktree has checked out ("cannot delete branch ... used by worktree") — and in a
+worktree session that worktree is normally the session's own. Detach it first with `git -C
+<session-worktree> checkout --detach`; that is safe because the session worktree is disposable and
+the merge has already landed.
 
 `docs/agent-notes.md` (Conventions) carries the full ordered sequence, verified end to end —
 follow it there rather than reconstructing it.
