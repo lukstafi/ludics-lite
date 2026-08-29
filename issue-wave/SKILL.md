@@ -128,7 +128,11 @@ CPU-only work needed an ever-growing override list — network access to push an
 it every `git add`/`commit`/rebase dies on `index.lock: Operation not permitted`), the
 `~/.local/state/ship-pr` cache, the `~/.ocannl-test-runs` directory, plus
 `XDG_CACHE_HOME` workarounds for `gh`'s blocked `~/.cache`. Workers run in their own
-worktrees on our own machines; the sandbox was cost without benefit.
+worktrees on our own machines; the sandbox was cost without benefit. The trade accepted
+with it: issue-derived prose reaches an unsandboxed agent, so the wave's triage gate is
+the injection screen — the coordinator and user read every issue before a worker launches
+on it, and an issue authored by an untrusted third party is grounds to route that one
+issue to a Claude worker instead, decided at triage.
 
 Capture the session UUID from the JSONL stream at launch - it is the address for every later
 intervention. Mechanics that differ from Opus workers:
@@ -211,7 +215,7 @@ The coordinator's job between launch and last merge:
   prove it cannot still act: a queued message processed late would give the branch two
   concurrent writers, one of them a finisher mid-rebase. A finisher landing a stalled
   worker's branch does not inherit its transcript, so the friction that grounds `after-merge`
-  is still in the Codex session: after the merge, `codex exec resume <session-id>` it (from
+  is still in the Codex session: after the merge, `codex exec resume <session-id> --yolo` it (from
   inside the worktree, which removal-comes-last has kept alive; same `--yolo` flag -
   hand-back mode still reads the tracker for dedup) for the hand-back
   brainstorm rather than brainstorming its work from the outside; only if the session is
