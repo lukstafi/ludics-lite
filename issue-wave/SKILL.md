@@ -117,19 +117,18 @@ backticks, `$()`, and quotes that issue-derived prose routinely contains would b
 or mangled by the coordinator's own shell:
 
 ```
-codex exec --json --strict-config -c 'sandbox_mode="workspace-write"' \
-  -c 'sandbox_workspace_write.network_access=true' \
-  -c 'sandbox_workspace_write.writable_roots=["<main-checkout>/.git","<home>/.local/state","<home>/.ocannl-test-runs"]' \
-  -C <worktree> -o <report-file> - < <brief-file>
+codex exec --json --yolo -C <worktree> -o <report-file> - < <brief-file>
 ```
 
-The two state roots come from the first wave's friction reports (2026-08-29): without them
-every `pr-review.sh` call warns about its `~/.local/state/ship-pr` cache and
-`tools/test-run.sh` cannot write its default runs directory (workers found env-var
-workarounds, but granting the roots is smoother). Two sandbox limits to plan around, not
-patch: `gh`'s cache under `~/.cache` stays blocked (workers set `XDG_CACHE_HOME=/tmp/...`
-when needed — fine), and the sandbox hides GPU devices (a worker probing Metal saw no
-device), so GPU-measurement issues need `--yolo`, a Claude worker, or the GPU-box ssh path.
+`--yolo` (no sandbox) is deliberate, learned on the first wave (2026-08-29). The
+disqualifier: the `workspace-write` sandbox hides GPU devices (a worker probing Metal saw
+no device), so any issue touching GPU measurement silently loses its hardware. And even
+CPU-only work needed an ever-growing override list — network access to push and drive
+`gh`, `writable_roots` for the linked worktree's `.git/worktrees/<name>` metadata (without
+it every `git add`/`commit`/rebase dies on `index.lock: Operation not permitted`), the
+`~/.local/state/ship-pr` cache, the `~/.ocannl-test-runs` directory, plus
+`XDG_CACHE_HOME` workarounds for `gh`'s blocked `~/.cache`. Workers run in their own
+worktrees on our own machines; the sandbox was cost without benefit.
 
 Capture the session UUID from the JSONL stream at launch - it is the address for every later
 intervention. Mechanics that differ from Opus workers:
@@ -138,22 +137,10 @@ intervention. Mechanics that differ from Opus workers:
   `~/.codex/skills` (from this repo's working tree - merged skill edits propagate with no
   deploy step). Codex has no `spawn_task`, which hand-back mode makes moot: wave workers of
   either kind propose rather than file.
-- **Network**: the `workspace-write` sandbox blocks network by default; the
-  `sandbox_workspace_write.network_access=true` override in the launch line lifts that
-  (verified end to end on CLI 0.150.1: an exec-launched agent's `curl` gets HTTP/2 200 with
-  it, exit 6 without) so the worker can push, drive `gh`, and own its full lifecycle through
-  ship-pr. Keep `--strict-config`: it is what rejects a mistyped or unsupported override -
-  0.150.1 rejects `sandbox_permissions` there, a key its own help text still suggests -
-  instead of silently launching a network-blocked worker. Deliberate choice: review rounds
-  are addressed by the continuous session that wrote the code, never handed to a
-  fresh-context finisher - the finisher is the escalation path for stalls (Supervise), not a
-  landing path.
-- **Linked-worktree git metadata**: a linked worktree's index and refs live under the MAIN
-  checkout's `.git/worktrees/<name>`, outside the `-C` workspace, so without the
-  `writable_roots` override every `git add`/`commit`/rebase dies on `index.lock: Operation
-  not permitted` (verified end to end on 0.150.1: an exec-launched agent's commit in a linked
-  worktree fails without it, lands with it). Express it as config, not `--add-dir`: exec has
-  the flag but `exec resume` does not, and resume must repeat the sandbox settings.
+- **Full lifecycle**: with the sandbox gone the worker pushes, drives `gh`, and owns its
+  lifecycle through ship-pr. Deliberate choice: review rounds are addressed by the
+  continuous session that wrote the code, never handed to a fresh-context finisher - the
+  finisher is the escalation path for stalls (Supervise), not a landing path.
 - **Structured close-out**: `--output-schema` can force the final report shape (PR number,
   test status, residuals, chip candidates) when parsing prose reports gets old.
 - **Attribution**: Codex commits carry no Claude trailer; the project's CLAUDE.md
@@ -204,7 +191,7 @@ The coordinator's job between launch and last merge:
   so the "yields twice with no state change" play does not exist for it. The stall test is
   external: the JSONL stream quiet AND `git log`/`git status` in its worktree unmoved over a
   wall-clock window sized to the task. To unstick, write the imperative message to a file
-  and `cd <worktree> && codex exec resume <session-id> <sandbox flags> - < <message-file>`.
+  and `cd <worktree> && codex exec resume <session-id> --yolo - < <message-file>`.
   That closes the same class as the launch brief: ANY prose substituted into a codex command
   line is shell-expanded before Codex sees it, so every prompt rides stdin (`-`) or a file -
   the post-merge brainstorm prompt below included. The `cd` is mandatory: resume has no `-C`
@@ -213,11 +200,11 @@ The coordinator's job between launch and last merge:
   session takes `codex queue --thread <id> --message` instead - present on CLI 0.150.1,
   absent on 0.144: there, wait out or kill the exec, then resume. `--message` has no stdin
   form, so it carries only literal text you typed yourself, never substituted content). A resume is a fresh CLI
-  invocation: it retains the conversation, not the launch flags, so every resume repeats the
-  launch line's three `-c` sandbox overrides. `-c` only: `exec resume` has no `-s` flag
-  (0.150.1 rejects it, "unexpected argument"), which is why the launch line expresses the
-  sandbox mode as config too. A resume without the overrides is back in the network-blocked
-  default and the unstick message lands in a worker that cannot push. Escalation is the same as for
+  invocation: it retains the conversation, not the launch flags, so every resume repeats
+  `--yolo` (accepted by `exec resume` on CLI 0.151.0; `-s` is not - use the flag, not a
+  mode). A resume without it is back in the default sandbox - network-blocked, unable to
+  commit in a linked worktree - and the unstick message lands in a worker that cannot
+  push. Escalation is the same as for
   a Claude agent: two failed interventions and the coordinator takes over the mechanical
   remainder or spawns a Claude finisher on the worktree's branch - after confirming the
   stalled exec is DEAD (kill its pid and wait for the exit), because a quiet stream does not
@@ -225,7 +212,7 @@ The coordinator's job between launch and last merge:
   concurrent writers, one of them a finisher mid-rebase. A finisher landing a stalled
   worker's branch does not inherit its transcript, so the friction that grounds `after-merge`
   is still in the Codex session: after the merge, `codex exec resume <session-id>` it (from
-  inside the worktree, which removal-comes-last has kept alive; same sandbox flags -
+  inside the worktree, which removal-comes-last has kept alive; same `--yolo` flag -
   hand-back mode still reads the tracker for dedup) for the hand-back
   brainstorm rather than brainstorming its work from the outside; only if the session is
   unresumable does the coordinator brainstorm from the diff and say so.
