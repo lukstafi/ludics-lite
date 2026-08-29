@@ -276,8 +276,11 @@ The coordinator's job between launch and last merge:
   the implementation overlaps the CI wait instead of idling behind it (#708 on #457).
 - **GPU boxes from the Mac.** Agents drive rog/minix over ssh for executed legs (worktree
   off their pushed branch, `opam exec --`, unpiped ssh with an exit sentinel) — this wave ran
-  CUDA+HIP parity for #730/#710/#709 and the whole #728 experiment that way. Two rules: an
-  agent never WoL/power-cycles a box (the user's own sessions may be on it), and a timing
+  CUDA+HIP parity for #730/#710/#709 and the whole #728 experiment that way. Prefer leaving
+  out of scope issues that need iterating on a different machine, especially when they are not
+  a major dependency unlock: we run the issue wave skill on ROG and Minix to handle
+  backend-specific iterative work. An agent can wake (WoL) a sleeping/hybernating box but with
+  care to not interrupt sessions/work that run there (especially if re-hibernating). A timing
   harness flushes stdout per line and uses a wall bound — a 0%-CPU process in
   `IOSurfaceSharedEvent waitUntilSignaledValue` was a legitimate 2 s unscheduled kernel behind
   dune's buffered stdout, not a hang.
