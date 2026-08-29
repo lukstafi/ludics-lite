@@ -502,6 +502,7 @@ fmt_age() {
 # became due. "-" when nothing datable was read.
 status_state() {
   local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
+  local vline verd_at verd_sha
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|the reactions API did not answer ($(gh_err_line))"
@@ -554,6 +555,23 @@ status_state() {
     echo "unknown|-|the comments feed did not parse"
     return 0
   }
+  # The connector can deliver its no-findings verdict as an issue comment ("Codex Review:
+  # Didn't find any major issues. ... **Reviewed commit:** `<sha>`") instead of — or as well
+  # as — the 👍 reaction, and a re-requested review CLEARS the reaction while the comment
+  # persists (ocannl-staging#531, 2026-08-29). Capture the newest such verdict and the commit
+  # it names; whether it approves the CURRENT head is decided below, once the head is known.
+  vline=$(jq -r --arg rev "$REVIEWER" '
+      [.[] | select((.user.login // "") | startswith($rev))
+           | select((.body // "") | test("[Dd]idn.t find any major issues"))
+           | {at: .created_at,
+              sha: (try ((.body // "")
+                    | capture("Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})").s)
+                    catch "")}]
+      | sort_by(.at) | last
+      | if . == null then "|" else "\(.at)|\(.sha)" end' \
+    <<<"$raw" 2>/dev/null) || vline="|"
+  verd_at="${vline%%|*}"
+  verd_sha="${vline#*|}"
   last_spoke=$(newest "$rev_at" "$com_at")
 
   # In flight only while the 👀 is newer than everything the reviewer has said. An empty last_spoke
@@ -577,6 +595,18 @@ status_state() {
     echo "unknown|-|the pulls API did not answer for the head SHA ($(gh_err_line))"
     return 0
   }
+
+  # A verdict comment naming the current head is an approval — without this arm it reads as
+  # "no review of this head", which is what invited the '@codex review' re-request that
+  # destroyed the 👍 on #531. Prefix match: the comment quotes a truncated sha.
+  if [ -n "$verd_sha" ]; then
+    case "$head_sha" in
+    "$verd_sha"*)
+      echo "approved|-|$REVIEWER posted a no-findings verdict for head ${head_sha:0:7} at $verd_at"
+      return 0
+      ;;
+    esac
+  fi
 
   # SHA equality, not a timestamp: the review records the commit it was submitted against, so this
   # is exactly "has the reviewer seen THIS head" with no push time to estimate.
@@ -614,8 +644,11 @@ status_line() {
   case "$tok" in
   approved) echo "approved ($detail)" ;;
   reviewing) echo "reviewing — $detail, running $(fmt_age "$age") — wait it out" ;;
-  stalled) echo "STALLED — $detail for $(fmt_age "$age"), longer than a round takes; nothing is" \
-    "coming, so nudge with a '@codex review' comment rather than waiting further" ;;
+  stalled) echo "STALLED — $detail for $(fmt_age "$age"), longer than a round takes. FIRST read" \
+    "the PR feed yourself (retry --read pr view <pr> --comments): a verdict may have landed as" \
+    "a comment or a 👍 this state machine missed. Only if the feed truly has nothing for the" \
+    "current head, nudge with a '@codex review' comment — knowing a re-request CLEARS the" \
+    "reviewer's existing 👍" ;;
   expected) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")" ;;
   idle) echo "nothing in flight — $detail, and no 👍; the next move is yours" ;;
   unknown) echo "UNKNOWN — $detail; this is NOT 'not approved', retry" ;;
@@ -1174,10 +1207,13 @@ off) ;;
 '' | *[!0-9]*) die "SHIP_PR_STALE_BASE must be a number of commits or 'off', got '$STALE_BASE'" ;;
 esac
 
-# Prints the count, loudly when it is at or over the threshold. Returns 0 fresh enough, 1 warned,
-# 3 unread. The caller merges regardless — this is a warning, not a gate — but the DIFFERENCE
-# between "not behind" and "could not be read" is preserved here like everywhere else in this file:
-# a compare call that never answered must not print a reassuring number it does not have.
+# Prints the count, loudly when it is at or over the threshold. Returns 0 fresh enough, 1 at/over
+# the threshold, 3 unread. Since 2026-08-29 the merge path treats 1 as a GATE (four wave workers
+# independently flagged merge-past-drift as the residual hole; #488's 136-commit near-miss is the
+# canonical case) — below the threshold it stays informational, because on a busy repo a few
+# commits of drift accrue during every CI wait and refusing them would livelock the merge queue.
+# The DIFFERENCE between "not behind" and "could not be read" is preserved here like everywhere
+# else in this file: a compare call that never answered must not print a reassuring number.
 warn_base_drift() {
   local pr="$1" fields cmp base head sha behind ahead rc
   [ "$STALE_BASE" = off ] && return 0
@@ -1316,9 +1352,24 @@ cmd_merge() {
     fi
     ;;
   esac
-  # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that the
-  # warning is the final thing on screen before the merge itself. It never stops the merge.
-  warn_base_drift "$PR_NUM" || :
+  # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
+  # verdict is the final thing on screen before the merge itself. At/over the stale threshold it
+  # REFUSES (an approval and a green build both judged a tree $STALE_BASE+ commits stale — the
+  # combination about to land was never reviewed or built); --override carries it, with a reason.
+  warn_base_drift "$PR_NUM"
+  case "$?" in
+  1)
+    if [ -n "$override" ]; then
+      echo "OVERRIDE: merging $REPO#$PR_NUM over a stale base (see above) — $override"
+      warn "OVERRIDE: merging $REPO#$PR_NUM at/over the stale-base threshold — $override"
+    else
+      fail 1 "REFUSING to merge $REPO#$PR_NUM: at/over the stale-base threshold" \
+        "(SHIP_PR_STALE_BASE=$STALE_BASE, see above). Rebase onto the base (or merge it in)," \
+        "push, let review+checks re-run, then merge — or, only when the drift is genuinely" \
+        "irrelevant to this change, re-run with --override '<why>'."
+    fi
+    ;;
+  esac
   while :; do
     out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" "${gh_args[@]}")
     rc=$?
