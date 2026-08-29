@@ -1,6 +1,6 @@
 ---
 name: issue-wave
-description: Run a delegation wave over the issue backlog - read the daily sequencing plan, propose a machine-appropriate scope of D1/D2 issues, launch one encouraged Opus subagent per issue in its own worktree, each shipping via ship-pr, and supervise the wave to full merge. Use when asked to burn down issues, run a wave, or work the backlog; on ROG/Minix, scope flips to issues that specifically benefit from that box.
+description: Run a delegation wave over the issue backlog - read the daily sequencing plan, propose a machine-appropriate scope of D1/D2 issues, launch one subagent per issue in its own worktree, each shipping via ship-pr, and supervise the wave to full merge. Use when asked to burn down issues, run a wave, or work the backlog; on ROG/Minix, scope flips to issues that specifically benefit from that box. User decides subagent type (Opus or Codex).
 ---
 
 # Issue wave
@@ -67,11 +67,10 @@ triage is wrong, not the backlog.
 ## Launch
 
 One worker per issue, worktrees outside the repo per project convention, parallel groups
-launched together in a single message. The default worker is an encouraged Opus subagent;
-when the user asks for Codex workers, route D1 issues to Codex (see Codex workers below)
-and keep D2 and anything carrying a tier-2/3 decision on Opus until Codex's failure modes
-on this backlog are calibrated. The brief must be self-contained (agents do not see this
-conversation), transfers between worker kinds verbatim, and includes:
+launched together in a single message. User decides the workers: either Opus subagents,
+or Codex subagents; for Codex, GPT-5.6-Sol or higher, effort high. The brief must be
+self-contained (agents do not see this conversation), transfers between worker kinds verbatim,
+and includes:
 
 - Setup: worktree creation off current origin/master, environment script, which docs to read.
 - The task: issue number and repo, a summary, and the instruction to read the issue and its
