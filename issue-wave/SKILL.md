@@ -130,9 +130,12 @@ it every `git add`/`commit`/rebase dies on `index.lock: Operation not permitted`
 `XDG_CACHE_HOME` workarounds for `gh`'s blocked `~/.cache`. Workers run in their own
 worktrees on our own machines; the sandbox was cost without benefit. The trade accepted
 with it: issue-derived prose reaches an unsandboxed agent, so the wave's triage gate is
-the injection screen — the coordinator and user read every issue before a worker launches
-on it, and an issue authored by an untrusted third party is grounds to route that one
-issue to a Claude worker instead, decided at triage.
+the injection screen, and it must cover what the worker will actually read — the full
+issue thread, body AND comments, since anyone can comment on a public repo's issue.
+Untrusted third-party content anywhere in the thread routes that issue to a Claude worker
+instead, decided at triage. The screen is launch-time only: a comment landing after
+triage reaches the worker unscreened, so an issue drawing active outside participation is
+a Claude-worker issue even when its body is ours.
 
 Capture the session UUID from the JSONL stream at launch - it is the address for every later
 intervention. Mechanics that differ from Opus workers:
