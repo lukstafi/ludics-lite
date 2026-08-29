@@ -251,6 +251,17 @@ The coordinator's job between launch and last merge:
   the master run it produces. A red the next agent inherits is diagnosed by
   `git log` on master between the last green and first red run, not by re-bisecting locally;
   one agent owns the fix-forward and every other open PR is told the red is established.
+- **When on non-default machine (ROG, Minix), re-check for a rival PR before each queued launch.**
+  Waves on ROG and Minix often run in parallel, and a queued issue may have grown a PR from
+  another box's wave since scoping — the pre-wave `gh pr list` goes stale within hours.
+  Before launching each queued worker, search open PRs for the issue number/topic; on a hit,
+  rebrief the worker to *adopt* the existing PR
+  (take over the branch, answer its review, coordinate in PR comments if the original session
+  resumes — merge ownership goes to whichever session is actively driving, settled explicitly
+  in the PR thread, never raced) instead of opening a competitor. A cross-wave adoption also splits
+  the hand-back: whichever coordinator files first checks the other wave's filings for overlap,
+  and a follow-up the other session claimed ("I will file X") is theirs — record it as a close-out
+  gate, don't duplicate it.
 - **Stacked launches.** When a gated item depends on a sibling PR that is approved but waiting
   on CI, launch it off the sibling's branch (`git worktree add ... origin/claude/<sibling>`),
   have it implement there, and open its PR only after the sibling merges and it has rebased —
