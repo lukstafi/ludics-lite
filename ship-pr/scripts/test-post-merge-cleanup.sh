@@ -62,6 +62,7 @@ git_config() {
 setup_case() {
   local name="$1" merge_mode="$2" owner_mode="$3"
   local root="$TEST_ROOT/$name"
+  CASE_ROOT="$root"
   CASE_REMOTE="$root/remote.git"
   CASE_MAIN="$root/main"
   CASE_SESSION="$root/session"
@@ -227,6 +228,41 @@ test_invalid_path_refusal() {
   echo "PASS: invalid checkout path refusal"
 }
 
+test_unrelated_upstream_deletion() {
+  setup_case unrelated-upstream merge main
+  git -C "$CASE_MAIN" branch unrelated refs/heads/master
+  git -C "$CASE_SESSION" branch --set-upstream-to=unrelated topic >/dev/null
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  echo "PASS: ancestry-verified deletion ignores unrelated upstream"
+}
+
+test_distinct_push_endpoint() {
+  local push_remote fetch_tip fetch_after
+  setup_case distinct-push-endpoint merge main-off
+  push_remote="$CASE_ROOT/push.git"
+  git clone --bare "$CASE_REMOTE" "$push_remote" >/dev/null 2>&1
+  git -C "$CASE_MAIN" remote set-url --push origin "$push_remote"
+
+  git -C "$CASE_INTEGRATOR" checkout -b topic origin/topic >/dev/null
+  echo fetch-only >"$CASE_INTEGRATOR/fetch-only"
+  git -C "$CASE_INTEGRATOR" add fetch-only
+  git -C "$CASE_INTEGRATOR" commit -m "advance only the fetch endpoint" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin topic >/dev/null
+  fetch_tip=$(git -C "$CASE_INTEGRATOR" rev-parse HEAD)
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_absent "$CASE_SESSION"
+  assert_ref_absent refs/heads/topic
+  ! git -C "$CASE_MAIN" ls-remote --exit-code --heads "$push_remote" refs/heads/topic >/dev/null 2>&1 ||
+    fail "topic remained on the push endpoint"
+  fetch_after=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
+  assert_eq "$fetch_after" "$fetch_tip" "cleanup must not confuse the fetch endpoint with the push endpoint"
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" \
+    "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)" "local master must still advance from fetch origin"
+  echo "PASS: distinct fetch and push endpoints"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
@@ -235,4 +271,6 @@ test_squash_rebase_override
 test_newer_remote_tip_refusal
 test_ls_remote_failure_refusal
 test_invalid_path_refusal
+test_unrelated_upstream_deletion
+test_distinct_push_endpoint
 echo "PASS: all post-merge cleanup states"

@@ -522,10 +522,11 @@ the failure looking like a failed merge. Run the executable sequence instead:
 
 It fetches and proves the ordinary topic is an ancestor of `origin/master` before deleting
 anything, deletes the remote branch, advances local `master` according to which worktree owns it,
-detaches and removes the session worktree, and deletes the local branch with the check appropriate
-to the primary checkout's current branch. Its scratch-repository test covers unchecked-out
-`master`, `master` owned by the primary checkout, `master` owned by another worktree, safe deletion
-while the primary checkout is off `master`, and refusal of an unmerged topic:
+detaches and removes the session worktree, rechecks ancestry against updated local `master`, and
+deletes the local branch independently of its configured upstream. Its scratch-repository test
+covers unchecked-out `master`, `master` owned by the primary checkout, `master` owned by another
+worktree, safe deletion while the primary checkout is off `master`, and refusal of an unmerged
+topic:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/test-post-merge-cleanup.sh
@@ -539,11 +540,12 @@ make the exception explicit and leave its reason in the transcript:
   --force-integrated "GitHub reports the PR squash-merged at <sha>"
 ```
 
-The helper anchors every operation before it removes the session directory. It treats an already
-absent remote branch as a safe retry state, but refuses an unreadable ref or a remote tip newer than
-the local branch; the deletion itself carries an exact-OID lease. Do not reconstruct its state
-machine in prose or replace the ancestry guard with `git branch -d`: `-d` tests the branch's
-upstream while it exists, which makes `origin/<branch>` a tautological and unsafe deletion check.
+The helper anchors every operation before it removes the session directory. It resolves the
+actual push endpoint once, treats an already absent branch there as a safe retry state, and refuses
+an unreadable ref or a remote tip newer than the local branch; the deletion itself carries an
+exact-OID lease. Do not reconstruct its state machine in prose or replace the ancestry guard with
+`git branch -d`: `-d` may test a configured upstream unrelated to `master`, making deletion either
+tautological or a false refusal after the worktree is already gone.
 
 If the harness blocks the merge itself, that is a permission gate, not a failure: explain what you
 were doing, give the command, and let the user decide. Never work around it.

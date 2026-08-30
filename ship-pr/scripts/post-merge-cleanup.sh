@@ -95,10 +95,17 @@ else
   echo "post-merge-cleanup.sh: FORCE-INTEGRATED override: $FORCE_REASON" >&2
 fi
 
-# Delete the remote branch before using `git branch -d`: once its upstream is gone, -d checks
-# master/HEAD rather than the tautological origin/<branch>. A missing remote branch is a safe retry
-# state after an interrupted cleanup.
-REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads origin "refs/heads/$BRANCH")
+# Read and delete the branch through the same push endpoint, leasing the mutation against the OID
+# just observed. A missing remote branch is a safe retry state after an interrupted cleanup.
+ORIGIN_PUSH_URLS=$(git -C "$MAIN" remote get-url --push --all origin) ||
+  fail "could not resolve origin's push endpoint"
+[ -n "$ORIGIN_PUSH_URLS" ] || fail "origin has no push endpoint"
+case "$ORIGIN_PUSH_URLS" in
+*$'\n'*) fail "origin has multiple push endpoints; refusing ambiguous branch deletion" ;;
+esac
+ORIGIN_PUSH_URL="$ORIGIN_PUSH_URLS"
+
+REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
 REMOTE_BRANCH_STATUS=$?
 case "$REMOTE_BRANCH_STATUS" in
 0)
@@ -106,7 +113,7 @@ case "$REMOTE_BRANCH_STATUS" in
   LOCAL_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot read local $BRANCH"
   [ "$REMOTE_BRANCH_OID" = "$LOCAL_BRANCH_OID" ] ||
     fail "origin/$BRANCH moved from local $LOCAL_BRANCH_OID to $REMOTE_BRANCH_OID; refusing to delete its newer tip"
-  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" origin --delete "$BRANCH" ||
+  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" "$ORIGIN_PUSH_URL" --delete "$BRANCH" ||
     fail "could not lease-delete origin/$BRANCH at $REMOTE_BRANCH_OID"
   ;;
 2)
@@ -144,7 +151,6 @@ LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot read 
 REMOTE_MASTER=$(git -C "$MAIN" rev-parse refs/remotes/origin/master) || fail "cannot read origin/master"
 [ "$LOCAL_MASTER" = "$REMOTE_MASTER" ] || fail "local master did not reach origin/master"
 
-MAIN_REF=$(git -C "$MAIN" symbolic-ref -q HEAD 2>/dev/null || true)
 if [ -n "$SESSION_REF" ]; then
   git -C "$SESSION" checkout --detach >/dev/null || fail "could not detach the session worktree"
 fi
@@ -156,8 +162,6 @@ git -C "$MAIN" worktree remove "$SESSION" || fail "could not remove session work
 
 if [ -n "$FORCE_REASON" ]; then
   git -C "$MAIN" branch -D "$BRANCH" || fail "could not delete integrated branch: $BRANCH"
-elif [ "$MAIN_REF" = refs/heads/master ]; then
-  git -C "$MAIN" branch -d "$BRANCH" || fail "git did not consider $BRANCH merged into master"
 else
   git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" refs/heads/master ||
     fail "$BRANCH is not an ancestor of the updated local master"
