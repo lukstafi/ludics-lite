@@ -66,6 +66,17 @@ triage is wrong, not the backlog.
 
 ## Launch
 
+**Skill-freshness preflight first (self-improve#11).** Before the wave's first launch — and
+before any launch that runs on another box — fast-forward that box's skills checkout:
+`git -C ~/self-improve pull --ff-only` locally, `ssh <box> 'git -C ~/self-improve pull
+--ff-only'` remotely. The deployed skills are symlinks into that checkout (`~/.claude/skills`,
+plus `~/.codex/skills` on Codex boxes), so a stale checkout runs stale skill text silently — the
+ludics gh-609 failure class — and push-side propagation structurally misses boxes that sleep
+through the merge, which is the normal case (two consecutive merge cycles stranded three boxes).
+A failed fast-forward — dirty or diverged checkout, no network — REFUSES the launch on that box:
+surface it to the user rather than launching stale. With this preflight load-bearing, the
+after-merge "fast-forward each box" convention is best-effort tidying, not propagation.
+
 One worker per issue, worktrees outside the repo per project convention, parallel groups
 launched together in a single message. User decides the workers: either Opus subagents,
 or Codex subagents; for Codex, GPT-5.6-Sol or higher, effort high. The brief must be
