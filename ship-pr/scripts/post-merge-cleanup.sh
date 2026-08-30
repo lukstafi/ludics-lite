@@ -53,6 +53,15 @@ refuse_initialized_submodules() {
   done <<<"$status"
 }
 
+refuse_private_worktree_refs() {
+  local worktree="$1" private_ref
+  private_ref=$(git -C "$worktree" for-each-ref --format='%(refname)' \
+    refs/worktree refs/bisect | sed -n '1p') ||
+    fail "could not inspect session-local refs: $worktree"
+  [ -z "$private_ref" ] ||
+    fail "session worktree has a private ref; remove or retain it before cleanup: $private_ref"
+}
+
 scan_branch_owner() {
   local target_ref="$1" worktree_list field current_worktree=""
   BRANCH_OWNER=""
@@ -169,7 +178,8 @@ SESSION_COMMON=$(git_path "$SESSION" "$(git -C "$SESSION" rev-parse --git-common
 [ "$MAIN_GIT" = "$MAIN_COMMON" ] || fail "main-checkout is a linked worktree, not the primary checkout: $MAIN"
 [ "$MAIN" != "$SESSION" ] || fail "main checkout and session worktree must be different paths"
 [ "$SESSION_COMMON" = "$MAIN_COMMON" ] || fail "main checkout and session worktree belong to different repositories"
-[ ! -e "$MAIN_COMMON/config.lock" ] || fail "repository config is locked; retry after the lock clears"
+{ [ ! -e "$MAIN_COMMON/config.lock" ] && [ ! -L "$MAIN_COMMON/config.lock" ]; } ||
+  fail "repository config is locked; retry after the lock clears"
 command -v perl >/dev/null 2>&1 || fail "Perl is required for atomic session archiving"
 
 git -C "$MAIN" show-ref --verify --quiet "refs/heads/$BRANCH" ||
@@ -204,6 +214,7 @@ SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal -
   fail "could not inspect session worktree cleanliness"
 [ -z "$SESSION_STATUS" ] || fail "session worktree is dirty; commit, stash, or remove its changes before cleanup"
 refuse_initialized_submodules "$SESSION" "session worktree"
+refuse_private_worktree_refs "$SESSION"
 
 SESSION_HEAD_PATH=$(git -C "$SESSION" rev-parse --git-path HEAD) || fail "cannot locate session HEAD"
 case "$SESSION_HEAD_PATH" in
@@ -401,6 +412,31 @@ else
     fail "could not retain the topic recovery ref: $RECOVERY_REF"
 fi
 
+# A stale tracking ref can retain commits absent from both the local topic and the live remote.
+# Preserve any differing tip before its conditional pruning so cleanup cannot erase its last ref.
+TRACKING_RECOVERY_REF=""
+TRACKING_BRANCH_PRESENT=0
+if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+  TRACKING_BRANCH_PRESENT=1
+  TRACKING_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/remotes/origin/$BRANCH") ||
+    fail "cannot read origin/$BRANCH tracking ref"
+  if [ "$TRACKING_BRANCH_OID" != "$LOCAL_BRANCH_OID" ]; then
+    TRACKING_RECOVERY_REF="refs/ship-pr/tracking-recovery/$BRANCH/$TRACKING_BRANCH_OID"
+    if git -C "$MAIN" symbolic-ref -q "$TRACKING_RECOVERY_REF" >/dev/null 2>&1; then
+      fail "tracking recovery ref is symbolic rather than direct: $TRACKING_RECOVERY_REF"
+    fi
+    if git -C "$MAIN" show-ref --verify --quiet "$TRACKING_RECOVERY_REF"; then
+      TRACKING_RECOVERY_OID=$(git -C "$MAIN" rev-parse "$TRACKING_RECOVERY_REF") ||
+        fail "cannot read $TRACKING_RECOVERY_REF"
+      [ "$TRACKING_RECOVERY_OID" = "$TRACKING_BRANCH_OID" ] ||
+        fail "tracking recovery ref points at an unexpected object: $TRACKING_RECOVERY_REF"
+    else
+      git -C "$MAIN" update-ref --no-deref "$TRACKING_RECOVERY_REF" \
+        "$TRACKING_BRANCH_OID" "" || fail "could not retain $TRACKING_RECOVERY_REF"
+    fi
+  fi
+fi
+
 REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
 REMOTE_BRANCH_STATUS=$?
 case "$REMOTE_BRANCH_STATUS" in
@@ -443,8 +479,12 @@ if [ "$CURRENT_TOPIC_OID" != "$LOCAL_BRANCH_OID" ]; then
 fi
 
 if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
-  TRACKING_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/remotes/origin/$BRANCH") ||
+  CURRENT_TRACKING_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/remotes/origin/$BRANCH") ||
     fail "cannot read origin/$BRANCH tracking ref"
+  [ "$TRACKING_BRANCH_PRESENT" -eq 1 ] ||
+    fail "origin/$BRANCH tracking ref appeared during cleanup; its new tip was preserved"
+  [ "$CURRENT_TRACKING_BRANCH_OID" = "$TRACKING_BRANCH_OID" ] ||
+    fail "origin/$BRANCH tracking ref moved during cleanup; its new tip was preserved"
   git -C "$MAIN" update-ref --no-deref -d "refs/remotes/origin/$BRANCH" "$TRACKING_BRANCH_OID" ||
     fail "origin/$BRANCH tracking ref changed while pruning it"
 fi

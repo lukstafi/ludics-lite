@@ -928,6 +928,27 @@ test_locked_session_refusal() {
   echo "PASS: locked session is refused before cleanup"
 }
 
+test_private_worktree_ref_refusal() {
+  local local_master private_oid
+  setup_case private-worktree-ref merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  private_oid=$(printf 'private worktree commit\n' | git -C "$CASE_SESSION" commit-tree \
+    "$(git -C "$CASE_SESSION" rev-parse HEAD^{tree})" -p "$CASE_TOPIC_OID")
+  git -C "$CASE_SESSION" update-ref refs/worktree/private "$private_oid"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "session-local worktree ref was accepted for cleanup"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "private worktree ref refusal must precede master advancement"
+  assert_eq "$(git -C "$CASE_SESSION" rev-parse refs/worktree/private)" "$private_oid" \
+    "session-local worktree ref must remain intact"
+  git -C "$CASE_SESSION" cat-file -e "$private_oid^{commit}" ||
+    fail "commit unique to session-local worktree ref was lost"
+  assert_topic_preserved
+  echo "PASS: session-local worktree ref is refused before unregistering"
+}
+
 test_symbolic_ref_refusal() {
   local tracked_master
   setup_case symbolic-local-topic merge main-off
@@ -1370,6 +1391,77 @@ test_session_recovery_namespace_preflight() {
   echo "PASS: session recovery ref namespace is reserved before mutation"
 }
 
+test_dangling_config_lock_preflight() {
+  local local_master lock_path
+  setup_case dangling-config-lock-preflight merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  lock_path="$CASE_MAIN/.git/config.lock"
+  ln -s missing-config-writer "$lock_path"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "dangling config lock symlink was discovered only after mutation"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "dangling config lock refusal must precede master advancement"
+  [ -L "$lock_path" ] || fail "dangling config lock symlink was removed"
+  assert_eq "$(readlink "$lock_path")" missing-config-writer \
+    "dangling config lock target must be preserved"
+  assert_topic_preserved
+  echo "PASS: dangling repository config lock is preflighted before mutation"
+}
+
+test_divergent_tracking_tip_recovery() {
+  local tracking_oid
+  setup_case divergent-tracking-tip merge main-off
+  tracking_oid=$(printf 'tracking-only commit\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
+  git -C "$CASE_MAIN" update-ref refs/remotes/origin/topic "$tracking_oid"
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse \
+    "refs/ship-pr/tracking-recovery/topic/$tracking_oid")" "$tracking_oid" \
+    "divergent remote-tracking tip must remain directly reachable"
+  echo "PASS: divergent remote-tracking tip receives a recovery ref before pruning"
+}
+
+test_tracking_tip_move_refusal() {
+  local fake_bin race_oid real_git
+  setup_case tracking-tip-move merge main-off
+  race_oid=$(printf 'late tracking commit\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
+  fake_bin="$TEST_ROOT/tracking-tip-move-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = show-ref ] && [ "$6" = refs/remotes/origin/topic ]; then' \
+    '  count=0' \
+    '  [ ! -e "$COUNT_MARKER" ] || count=$(cat "$COUNT_MARKER")' \
+    '  count=$((count + 1))' \
+    '  echo "$count" >"$COUNT_MARKER"' \
+    '  if [ "$count" -eq 2 ]; then' \
+    '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/remotes/origin/topic "$RACE_OID"' \
+    '  fi' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    RACE_OID="$race_oid" COUNT_MARKER="$TEST_ROOT/tracking-tip-move.count" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "cleanup deleted a remote-tracking ref that moved after its recovery snapshot"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/topic)" "$race_oid" \
+    "late remote-tracking tip must be preserved"
+  git -C "$CASE_MAIN" cat-file -e "$race_oid^{commit}" ||
+    fail "commit unique to late remote-tracking tip was lost"
+  git -C "$CASE_MAIN" show-ref --verify --quiet refs/heads/topic ||
+    fail "local topic was lost after remote-tracking move refusal"
+  [ -d "$CASE_SESSION" ] || fail "session was lost after remote-tracking move refusal"
+  echo "PASS: remote-tracking ref movement is refused without deleting its new tip"
+}
+
 test_symref_capability_preflight() {
   local fake_bin local_master real_git
   setup_case symref-capability-preflight merge main-off
@@ -1568,6 +1660,7 @@ test_initialized_session_submodule_refusal
 test_initialized_master_submodule_refusal
 test_diverged_master_refusal
 test_locked_session_refusal
+test_private_worktree_ref_refusal
 test_symbolic_ref_refusal
 test_remote_master_lease
 test_stale_master_response_retains_recovery
@@ -1583,6 +1676,9 @@ test_precreated_archive_target_refusal
 test_session_head_lock_preflight
 test_dangling_session_head_lock_preflight
 test_session_recovery_namespace_preflight
+test_dangling_config_lock_preflight
+test_divergent_tracking_tip_recovery
+test_tracking_tip_move_refusal
 test_symref_capability_preflight
 test_option_like_branch_name
 test_relative_tmpdir

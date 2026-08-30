@@ -555,7 +555,8 @@ helper creates a temporary owner for that same critical section. Remote topic de
 on the observed topic OID and followed by fresh `master` and local-topic reads; if either changed
 or `master` became unreadable, the current topic recovery ref is restored before refusal. The
 validated tip also remains reachable under a direct `refs/ship-pr/recovery/` ref because no finite
-remote read can rule out a later base rollback. The master-owner refresh uses a non-destructive porcelain
+remote read can rule out a later base rollback; a divergent remote-tracking tip is retained
+separately under `refs/ship-pr/tracking-recovery/` before pruning. The master-owner refresh uses a non-destructive porcelain
 fast-forward through a helper-only reservation and a conditional named-ref update. A checked-out
 master owner must contain no local data, including ignored files; after the update it is prepared
 at the new tree and reattached with a detached-HEAD compare-and-swap before the reservation is
@@ -566,7 +567,7 @@ topic ownership to a temporary reservation through local ref deletion, and remov
 remote-tracking and only the standard keys from repository-local upstream configuration. Included, global,
 per-worktree, and custom branch configuration is inherited policy and is deliberately not edited.
 Rather than recursively deleting a directory that can receive a last-moment ignored write, it
-refuses initialized submodules before mutation, preallocates sibling archives before ref mutation,
+refuses initialized submodules and session-local worktree refs before mutation, preallocates sibling archives before ref mutation,
 reserves the session-recovery ref namespace, atomically renames the session into one without
 directory-nesting semantics,
 retains the archived session's final HEAD under `refs/ship-pr/session-recovery/`, and unregisters
