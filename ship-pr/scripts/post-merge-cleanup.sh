@@ -34,6 +34,25 @@ git_path() {
   esac
 }
 
+atomic_rename() {
+  # Shell mv treats an existing directory as a container. The rename(2) syscall instead replaces
+  # an empty target directory or refuses a nonempty one, so a same-user target race cannot nest the
+  # worktree below an attacker-created path while reporting success.
+  perl -e 'rename $ARGV[0], $ARGV[1] or die "$ARGV[0] -> $ARGV[1]: $!\n"' -- "$1" "$2"
+}
+
+refuse_initialized_submodules() {
+  local worktree="$1" description="$2" line status
+  status=$(git -C "$worktree" submodule status --recursive) ||
+    fail "could not inspect $description submodules: $worktree"
+  while IFS= read -r line; do
+    case "$line" in
+    "" | -*) ;;
+    *) fail "$description has an initialized submodule; deinitialize it before cleanup: ${line#?}" ;;
+    esac
+  done <<<"$status"
+}
+
 scan_branch_owner() {
   local target_ref="$1" worktree_list field current_worktree=""
   BRANCH_OWNER=""
@@ -144,6 +163,7 @@ SESSION_COMMON=$(git_path "$SESSION" "$(git -C "$SESSION" rev-parse --git-common
 [ "$MAIN" != "$SESSION" ] || fail "main checkout and session worktree must be different paths"
 [ "$SESSION_COMMON" = "$MAIN_COMMON" ] || fail "main checkout and session worktree belong to different repositories"
 [ ! -e "$MAIN_COMMON/config.lock" ] || fail "repository config is locked; retry after the lock clears"
+command -v perl >/dev/null 2>&1 || fail "Perl is required for atomic session archiving"
 
 git -C "$MAIN" show-ref --verify --quiet "refs/heads/$BRANCH" ||
   fail "local branch does not exist: $BRANCH"
@@ -176,6 +196,7 @@ fi
 SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal --ignored=matching) ||
   fail "could not inspect session worktree cleanliness"
 [ -z "$SESSION_STATUS" ] || fail "session worktree is dirty; commit, stash, or remove its changes before cleanup"
+refuse_initialized_submodules "$SESSION" "session worktree"
 
 SESSION_HEAD_PATH=$(git -C "$SESSION" rev-parse --git-path HEAD) || fail "cannot locate session HEAD"
 case "$SESSION_HEAD_PATH" in
@@ -283,6 +304,7 @@ MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status \
   --porcelain --untracked-files=normal --ignored=matching) ||
   fail "could not inspect master owner cleanliness"
 [ -z "$MASTER_OWNER_STATUS" ] || fail "master owner is dirty; clean it before cleanup: $MASTER_OWNER"
+refuse_initialized_submodules "$MASTER_OWNER" "master owner"
 IGNORED_COLLISION=""
 while IFS= read -r -d '' CHANGED_PATH; do
   if { [ -e "$MASTER_OWNER/$CHANGED_PATH" ] || [ -L "$MASTER_OWNER/$CHANGED_PATH" ]; } &&
@@ -440,8 +462,12 @@ git -C "$MAIN" worktree add --detach "$TOPIC_RESERVATION" "$LOCAL_BRANCH_OID" >/
   fail "could not prepare a temporary topic reservation"
 TOPIC_RESERVATION=$(canonical_dir "$TOPIC_RESERVATION") || exit $?
 if [ -n "$SESSION_REF" ]; then
-  git -C "$SESSION" checkout --detach "$LOCAL_BRANCH_OID" >/dev/null ||
-    fail "could not detach the session worktree at the validated topic tip"
+  if ! git -C "$SESSION" checkout --detach --no-overwrite-ignore "$LOCAL_BRANCH_OID" >/dev/null; then
+    CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH" 2>/dev/null || true)
+    [ -n "$CURRENT_TOPIC_OID" ] && restore_remote_topic "$CURRENT_TOPIC_OID" ||
+      fail "session detach failed, and its current topic tip could not be restored remotely"
+    fail "could not detach the session worktree without overwriting local data; its remote ref was restored"
+  fi
 fi
 if ! git -C "$TOPIC_RESERVATION" switch -- "$BRANCH" >/dev/null 2>&1; then
   git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
@@ -477,7 +503,8 @@ fi
 # missing registered path drops only Git metadata; every former worktree file remains recoverable.
 cd "$TEMP_ROOT" || fail "cannot move out of the session worktree before archiving it"
 SESSION_ARCHIVED_WORKTREE="$SESSION_ARCHIVE/worktree"
-mv "$SESSION" "$SESSION_ARCHIVED_WORKTREE" || fail "could not archive session worktree: $SESSION"
+atomic_rename "$SESSION" "$SESSION_ARCHIVED_WORKTREE" ||
+  fail "could not archive session worktree atomically: $SESSION"
 # Prevent a detached commit from advancing the archived session after the final read. Removing a
 # missing worktree unregisters its metadata without consulting this ref lock, so the exact HEAD can
 # be retained before that metadata (including the lock) disappears.
@@ -510,7 +537,7 @@ fi
 if ! git -C "$MAIN" worktree remove "$SESSION"; then
   { [ -e "$SESSION" ] || [ -L "$SESSION" ]; } ||
     fail "session was archived at $SESSION_ARCHIVE but its worktree registration could not be removed"
-  mv "$SESSION" "$LATE_SESSION_ARCHIVE/data" ||
+  atomic_rename "$SESSION" "$LATE_SESSION_ARCHIVE/data" ||
     fail "late data appeared at $SESSION and could not be moved aside safely"
   git -C "$MAIN" worktree remove "$SESSION" ||
     fail "session and late data were archived, but the worktree registration could not be removed"

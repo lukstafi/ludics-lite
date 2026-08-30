@@ -541,8 +541,9 @@ make the exception explicit and leave its reason in the transcript:
   --force-integrated "GitHub reports the PR squash-merged at <sha>"
 ```
 
-The helper requires Git's transactional `update-ref` symbolic-ref commands, the exact
-session-worktree root, a clean and unlocked session with no ignored local data, and one shared
+The helper requires Git's transactional `update-ref` symbolic-ref commands, Perl for an atomic
+filesystem rename, the exact session-worktree root, a clean and unlocked session with no ignored
+local data, and one shared
 fetch/push endpoint for `origin`. It treats an already absent topic as a safe retry state and
 refuses an unreadable ref, a symbolic local/tracking ref, or a remote tip newer than the local
 branch; an absent remote topic sends no deletion, while present remote and local deletions carry
@@ -565,7 +566,8 @@ topic ownership to a temporary reservation through local ref deletion, and remov
 remote-tracking and only the standard keys from repository-local upstream configuration. Included, global,
 per-worktree, and custom branch configuration is inherited policy and is deliberately not edited.
 Rather than recursively deleting a directory that can receive a last-moment ignored write, it
-preallocates sibling archives before ref mutation, atomically renames the session into one,
+refuses initialized submodules before mutation, preallocates sibling archives before ref mutation,
+atomically renames the session into one without directory-nesting semantics,
 retains the archived session's final HEAD under `refs/ship-pr/session-recovery/`, and unregisters
 the now-missing worktree while holding the linked-worktree HEAD lock. Late files or links at the vacated path are moved to the second archive
 before unregistering is retried. Do not reconstruct its state

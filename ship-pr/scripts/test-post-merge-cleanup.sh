@@ -768,6 +768,137 @@ test_ignored_data_during_master_detach() {
   echo "PASS: initial master detach refuses ignored data"
 }
 
+test_ignored_data_during_topic_detach() {
+  local fake_bin log new_topic_oid real_git remote_topic_oid
+  setup_case ignored-data-during-topic-detach merge main-off
+  echo /value >"$CASE_SESSION/.gitignore"
+  git -C "$CASE_SESSION" add .gitignore
+  git -C "$CASE_SESSION" commit -m "ignore the tracked topic path" >/dev/null
+  git -C "$CASE_SESSION" push origin topic >/dev/null
+  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
+  git -C "$CASE_INTEGRATOR" fetch origin topic >/dev/null
+  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge topic ignore rule" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  fake_bin="$TEST_ROOT/ignored-data-during-topic-detach-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/ignored-data-during-topic-detach.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = --no-overwrite-ignore ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '  : >"$RACE_MARKER"' \
+    '  "$REAL_GIT" -C "$RACE_SESSION" rm value >/dev/null' \
+    '  "$REAL_GIT" -C "$RACE_SESSION" commit -m "remove tracked topic path" >/dev/null' \
+    '  echo irreplaceable >"$RACE_SESSION/value"' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_SESSION="$CASE_SESSION" \
+    RACE_MARKER="$TEST_ROOT/ignored-data-during-topic-detach.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "topic detach overwrote ignored data"
+  fi
+  [ -e "$TEST_ROOT/ignored-data-during-topic-detach.injected" ] ||
+    fail "topic detach race was not injected"
+  assert_eq "$(sed -n '1p' "$CASE_SESSION/value")" irreplaceable \
+    "ignored data created during topic detach must survive"
+  new_topic_oid=$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)
+  remote_topic_oid=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
+  assert_eq "$remote_topic_oid" "$new_topic_oid" \
+    "topic detach refusal must restore the concurrently advanced tip remotely"
+  assert_topic_preserved
+  echo "PASS: topic detach refuses ignored data and restores the current remote tip"
+}
+
+test_initialized_session_submodule_refusal() {
+  local local_master sub_remote sub_seed unique_submodule_oid
+  setup_case initialized-session-submodule merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  sub_remote="$CASE_ROOT/submodule.git"
+  sub_seed="$CASE_ROOT/submodule-seed"
+  git init --bare "$sub_remote" >/dev/null
+  git init -b main "$sub_seed" >/dev/null
+  git_config "$sub_seed"
+  echo submodule-base >"$sub_seed/payload"
+  git -C "$sub_seed" add payload
+  git -C "$sub_seed" commit -m "submodule base" >/dev/null
+  git -C "$sub_seed" remote add origin "$sub_remote"
+  git -C "$sub_seed" push -u origin main >/dev/null
+  git -c protocol.file.allow=always -C "$CASE_SESSION" submodule add \
+    "$sub_remote" nested >/dev/null
+  git -C "$CASE_SESSION" commit -m "add initialized submodule" >/dev/null
+  git -C "$CASE_SESSION" push origin topic >/dev/null
+  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
+  git -C "$CASE_INTEGRATOR" fetch origin topic >/dev/null
+  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge initialized submodule" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  git_config "$CASE_SESSION/nested"
+  git -C "$CASE_SESSION" config submodule.nested.ignore all
+  echo unique >>"$CASE_SESSION/nested/payload"
+  git -C "$CASE_SESSION/nested" add payload
+  git -C "$CASE_SESSION/nested" commit -m "unique linked-worktree submodule commit" >/dev/null
+  unique_submodule_oid=$(git -C "$CASE_SESSION/nested" rev-parse HEAD)
+  [ -z "$(git -C "$CASE_SESSION" status --porcelain --untracked-files=normal --ignored=matching)" ] ||
+    fail "submodule ignore=all did not produce the intended clean superproject"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "initialized session submodule was accepted for cleanup"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "initialized submodule refusal must precede master advancement"
+  git -C "$CASE_SESSION/nested" cat-file -e "$unique_submodule_oid^{commit}" ||
+    fail "unique linked-worktree submodule commit was lost"
+  assert_topic_preserved
+  echo "PASS: initialized session submodule is refused before mutation"
+}
+
+test_initialized_master_submodule_refusal() {
+  local local_master next_submodule_oid sub_remote sub_seed
+  setup_case initialized-master-submodule merge other
+  git -C "$CASE_MASTER_OWNER" fetch origin \
+    refs/heads/master:refs/remotes/origin/master >/dev/null
+  git -C "$CASE_MASTER_OWNER" merge --ff-only refs/remotes/origin/master >/dev/null
+  sub_remote="$CASE_ROOT/master-submodule.git"
+  sub_seed="$CASE_ROOT/master-submodule-seed"
+  git init --bare "$sub_remote" >/dev/null
+  git init -b main "$sub_seed" >/dev/null
+  git_config "$sub_seed"
+  echo submodule-base >"$sub_seed/payload"
+  git -C "$sub_seed" add payload
+  git -C "$sub_seed" commit -m "master submodule base" >/dev/null
+  git -C "$sub_seed" remote add origin "$sub_remote"
+  git -C "$sub_seed" push -u origin main >/dev/null
+  git -c protocol.file.allow=always -C "$CASE_MASTER_OWNER" submodule add \
+    "$sub_remote" nested >/dev/null
+  git -C "$CASE_MASTER_OWNER" commit -m "add initialized master submodule" >/dev/null
+  git -C "$CASE_MASTER_OWNER" push origin master >/dev/null
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_INTEGRATOR" pull --ff-only origin master >/dev/null
+  echo next >>"$sub_seed/payload"
+  git -C "$sub_seed" add payload
+  git -C "$sub_seed" commit -m "advance master submodule" >/dev/null
+  git -C "$sub_seed" push origin main >/dev/null
+  next_submodule_oid=$(git -C "$sub_seed" rev-parse HEAD)
+  git -c protocol.file.allow=always -C "$CASE_INTEGRATOR" submodule update --init nested >/dev/null
+  git -C "$CASE_INTEGRATOR/nested" fetch origin >/dev/null
+  git -C "$CASE_INTEGRATOR/nested" checkout "$next_submodule_oid" >/dev/null
+  git -C "$CASE_INTEGRATOR" add nested
+  git -C "$CASE_INTEGRATOR" commit -m "update master submodule gitlink" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "initialized master-owner submodule was accepted for refresh"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "initialized master-owner submodule refusal must precede master advancement"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER/nested" rev-parse HEAD)" \
+    "$(git -C "$CASE_MASTER_OWNER" rev-parse HEAD:nested)" \
+    "master-owner submodule checkout must remain aligned with its old gitlink"
+  assert_topic_preserved
+  echo "PASS: initialized master-owner submodule is refused before gitlink advancement"
+}
+
 test_diverged_master_refusal() {
   local master_owner="$TEST_ROOT/diverged-master-owner"
   setup_case diverged-master merge none
@@ -1141,6 +1272,47 @@ test_archive_preflight_refusal() {
   echo "PASS: session archive availability is preflighted before mutation"
 }
 
+test_precreated_archive_target_refusal() {
+  local attacked_target fake_bin real_perl
+  setup_case precreated-archive-target merge main-off
+  fake_bin="$TEST_ROOT/precreated-archive-target-bin"
+  real_perl=$(command -v perl)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'target=""' \
+    'for arg in "$@"; do target=$arg; done' \
+    'case "$target" in' \
+    '*.session.ship-pr-recovery.*/worktree)' \
+    '  if [ ! -e "$TARGET_MARKER" ]; then' \
+    '    mkdir -p "$target"' \
+    '    echo attacker >"$target/blocker"' \
+    '    printf "%s\n" "$target" >"$TARGET_MARKER"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_PERL" "$@"' >"$fake_bin/perl"
+  chmod +x "$fake_bin/perl"
+
+  if PATH="$fake_bin:$PATH" REAL_PERL="$real_perl" \
+    TARGET_MARKER="$TEST_ROOT/precreated-archive-target.path" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "session archive nested into a precreated target"
+  fi
+  attacked_target=$(cat "$TEST_ROOT/precreated-archive-target.path")
+  [ -f "$attacked_target/blocker" ] || fail "precreated archive target was overwritten"
+  [ -d "$CASE_SESSION" ] || fail "failed atomic archive moved the original session"
+  [ ! -e "$attacked_target/session" ] || fail "session was nested below the precreated target"
+  git -C "$CASE_MAIN" show-ref --verify --quiet refs/heads/topic ||
+    fail "local topic was lost after atomic archive refusal"
+
+  rm -rf "$attacked_target"
+  rmdir "$(dirname "$attacked_target")"
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  echo "PASS: atomic archive refuses a precreated nonempty target without nesting"
+}
+
 test_session_head_lock_preflight() {
   local head_path local_master lock_contents
   setup_case session-head-lock-preflight merge main-off
@@ -1353,6 +1525,9 @@ test_master_update_failure_reattaches_owner
 test_master_handoff_stays_reserved
 test_master_reattach_compare_and_swap
 test_ignored_data_during_master_detach
+test_ignored_data_during_topic_detach
+test_initialized_session_submodule_refusal
+test_initialized_master_submodule_refusal
 test_diverged_master_refusal
 test_locked_session_refusal
 test_symbolic_ref_refusal
@@ -1366,6 +1541,7 @@ test_dangling_link_at_session_removal
 test_detached_session_head_recovery
 test_session_head_locked_through_unregister
 test_archive_preflight_refusal
+test_precreated_archive_target_refusal
 test_session_head_lock_preflight
 test_symref_capability_preflight
 test_option_like_branch_name
