@@ -87,10 +87,54 @@ preflight_session_metadata_locks() {
     *) path="$SESSION/$path" ;;
     esac
     path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+    path="$path_dir/$(basename "$path")"
+    [ ! -L "$path" ] || fail "session metadata is symbolic; replace it before cleanup: $name"
     lock="$path_dir/$(basename "$path").lock"
     { [ ! -e "$lock" ] && [ ! -L "$lock" ]; } ||
       fail "session metadata is locked; retry after its Git operation finishes: $name"
   done
+}
+
+refuse_active_session_operations() {
+  local name path path_dir
+  for name in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
+    sequencer rebase-merge rebase-apply; do
+    path=$(git -C "$SESSION" rev-parse --git-path "$name") ||
+      fail "could not locate session operation state: $name"
+    case "$path" in
+    /*) ;;
+    *) path="$SESSION/$path" ;;
+    esac
+    path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+    path="$path_dir/$(basename "$path")"
+    { [ ! -e "$path" ] && [ ! -L "$path" ]; } ||
+      fail "session has an active or retained Git operation; finish or abort it before cleanup: $name"
+  done
+}
+
+refuse_index_resolve_undo() {
+  local worktree="$1" description="$2" first
+  first=$(git -C "$worktree" ls-files --resolve-undo | sed -n '1p') ||
+    fail "could not inspect $description resolve-undo state: $worktree"
+  [ -z "$first" ] ||
+    fail "$description index has resolve-undo data; resolve or remove it before cleanup: $worktree"
+}
+
+lock_session_head_for_archive() {
+  local raw
+  (set -o noclobber; printf '%s\n' "$$" >"$SESSION_HEAD_LOCK") 2>/dev/null || return 1
+  SESSION_HEAD_LOCK_OWNED=1
+  raw=$(sed -n '1p' "$SESSION_HEAD_PATH") || return 1
+  if [ -n "$SESSION_REF" ]; then
+    [ "$raw" = "ref: refs/heads/$BRANCH" ] || return 1
+    printf '%s\n' "$SESSION_HEAD" >"$SESSION_HEAD_LOCK" || return 1
+    atomic_rename "$SESSION_HEAD_LOCK" "$SESSION_HEAD_PATH" || return 1
+    SESSION_HEAD_LOCK_OWNED=0
+    (set -o noclobber; printf '%s\n' "$$" >"$SESSION_HEAD_LOCK") 2>/dev/null || return 1
+    SESSION_HEAD_LOCK_OWNED=1
+    raw=$(sed -n '1p' "$SESSION_HEAD_PATH") || return 1
+  fi
+  [ "$raw" = "$SESSION_HEAD" ]
 }
 
 retain_session_object() {
@@ -469,6 +513,7 @@ SESSION_REF=$(git -C "$SESSION" symbolic-ref -q HEAD 2>/dev/null || true)
 if [ -n "$SESSION_REF" ]; then
   [ "$SESSION_REF" = "refs/heads/$BRANCH" ] ||
     fail "session worktree owns ${SESSION_REF#refs/heads/}, not $BRANCH"
+  SESSION_HEAD="$LOCAL_BRANCH_OID"
 else
   SESSION_HEAD=$(git -C "$SESSION" rev-parse HEAD) || fail "cannot read detached session HEAD"
   BRANCH_HEAD=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot read $BRANCH"
@@ -492,6 +537,7 @@ SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal -
 refuse_initialized_submodules "$SESSION" "session worktree"
 refuse_session_module_gitdirs "$SESSION"
 refuse_private_worktree_refs "$SESSION"
+refuse_active_session_operations
 preflight_session_metadata_locks
 
 SESSION_HEAD_PATH=$(git -C "$SESSION" rev-parse --git-path HEAD) || fail "cannot locate session HEAD"
@@ -615,6 +661,7 @@ MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status \
   fail "could not inspect master owner cleanliness"
 [ -z "$MASTER_OWNER_STATUS" ] || fail "master owner is dirty; clean it before cleanup: $MASTER_OWNER"
 refuse_initialized_submodules "$MASTER_OWNER" "master owner"
+refuse_index_resolve_undo "$MASTER_OWNER" "master owner"
 IGNORED_COLLISION=""
 while IFS= read -r -d '' CHANGED_PATH; do
   if { [ -e "$MASTER_OWNER/$CHANGED_PATH" ] || [ -L "$MASTER_OWNER/$CHANGED_PATH" ]; } &&
@@ -803,13 +850,11 @@ rmdir "$TOPIC_RESERVATION" || fail "could not prepare the temporary topic reserv
 git -C "$MAIN" worktree add --detach "$TOPIC_RESERVATION" "$LOCAL_BRANCH_OID" >/dev/null ||
   fail "could not prepare a temporary topic reservation"
 TOPIC_RESERVATION=$(canonical_dir "$TOPIC_RESERVATION") || exit $?
-if [ -n "$SESSION_REF" ]; then
-  if ! git -C "$SESSION" checkout --detach --no-overwrite-ignore "$LOCAL_BRANCH_OID" >/dev/null; then
-    CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH" 2>/dev/null || true)
-    [ -n "$CURRENT_TOPIC_OID" ] && restore_remote_topic "$CURRENT_TOPIC_OID" ||
-      fail "session detach failed, and its current topic tip could not be restored remotely"
-    fail "could not detach the session worktree without overwriting local data; its remote ref was restored"
-  fi
+if ! lock_session_head_for_archive; then
+  CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH" 2>/dev/null || true)
+  [ -n "$CURRENT_TOPIC_OID" ] && restore_remote_topic "$CURRENT_TOPIC_OID" ||
+    fail "session HEAD changed, and its current topic tip could not be restored remotely"
+  fail "session HEAD changed after preflight; its remote ref was restored"
 fi
 if ! git -C "$TOPIC_RESERVATION" switch -- "$BRANCH" >/dev/null 2>&1; then
   git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
@@ -817,8 +862,6 @@ if ! git -C "$TOPIC_RESERVATION" switch -- "$BRANCH" >/dev/null 2>&1; then
   CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH" 2>/dev/null || true)
   [ -n "$CURRENT_TOPIC_OID" ] && restore_remote_topic "$CURRENT_TOPIC_OID" ||
     fail "topic reservation failed, and its remote recovery ref could not be restored"
-  [ -z "$SESSION_REF" ] ||
-    git -C "$SESSION" switch --no-overwrite-ignore -- "$BRANCH" >/dev/null 2>&1 || true
   fail "could not reserve local $BRANCH for deletion; its remote ref was restored"
 fi
 CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
@@ -826,8 +869,6 @@ if [ "$CURRENT_TOPIC_OID" != "$LOCAL_BRANCH_OID" ]; then
   git -C "$TOPIC_RESERVATION" checkout --detach "$LOCAL_BRANCH_OID" >/dev/null 2>&1 || true
   git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
   TOPIC_RESERVATION=""
-  [ -z "$SESSION_REF" ] ||
-    git -C "$SESSION" switch --no-overwrite-ignore -- "$BRANCH" >/dev/null 2>&1 || true
   restore_remote_topic "$CURRENT_TOPIC_OID" ||
     fail "local $BRANCH moved during ownership handoff, and its new tip could not be restored remotely"
   fail "local $BRANCH moved during ownership handoff; its session and remote tip were preserved"
@@ -849,20 +890,8 @@ cd "$TEMP_ROOT" || fail "cannot move out of the session worktree before archivin
 SESSION_ARCHIVED_WORKTREE="$SESSION_ARCHIVE/worktree"
 atomic_rename "$SESSION" "$SESSION_ARCHIVED_WORKTREE" ||
   fail "could not archive session worktree atomically: $SESSION"
-# Prevent a detached commit from advancing the archived session after the final read. Removing a
-# missing worktree unregisters its metadata without consulting this ref lock, so the exact HEAD can
-# be retained before that metadata (including the lock) disappears.
-SESSION_HEAD_PATH=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path HEAD) ||
-  fail "could not locate the archived session HEAD"
-case "$SESSION_HEAD_PATH" in
-/*) ;;
-*) SESSION_HEAD_PATH="$SESSION_ARCHIVED_WORKTREE/$SESSION_HEAD_PATH" ;;
-esac
-SESSION_HEAD_DIR=$(canonical_dir "$(dirname "$SESSION_HEAD_PATH")") || exit $?
-SESSION_HEAD_LOCK="$SESSION_HEAD_DIR/$(basename "$SESSION_HEAD_PATH").lock"
-(set -o noclobber; printf '%s\n' "$$" >"$SESSION_HEAD_LOCK") 2>/dev/null ||
-  fail "archived session HEAD is busy; its worktree metadata was preserved"
-SESSION_HEAD_LOCK_OWNED=1
+# The session HEAD lock acquired during the ownership handoff stays held across this rename and
+# unregister, so neither an attached nor an initially detached session can change after validation.
 lock_and_retain_session_metadata
 SESSION_FINAL_HEAD=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse HEAD) ||
   fail "could not read the archived session's final HEAD"

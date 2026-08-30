@@ -875,12 +875,18 @@ test_ignored_data_during_topic_detach() {
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = --no-overwrite-ignore ] && [ ! -e "$RACE_MARKER" ]; then' \
-    '  : >"$RACE_MARKER"' \
-    '  "$REAL_GIT" -C "$RACE_SESSION" rm value >/dev/null' \
-    '  "$REAL_GIT" -C "$RACE_SESSION" commit -m "remove tracked topic path" >/dev/null' \
-    '  echo irreplaceable >"$RACE_SESSION/value"' \
-    'fi' \
+    'case "$6" in' \
+    '*ship-pr-topic-reserve*)' \
+    '  if [ "$3" = worktree ] && [ "$4" = add ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '    "$REAL_GIT" "$@" || exit $?' \
+    '    : >"$RACE_MARKER"' \
+    '    "$REAL_GIT" -C "$RACE_SESSION" rm value >/dev/null' \
+    '    "$REAL_GIT" -C "$RACE_SESSION" commit -m "remove tracked topic path" >/dev/null' \
+    '    echo irreplaceable >"$RACE_SESSION/value"' \
+    '    exit 0' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
 
@@ -947,6 +953,78 @@ test_ignored_data_during_topic_reattach() {
     "topic reattachment refusal must restore the concurrently advanced tip remotely"
   assert_topic_preserved
   echo "PASS: topic reattachment refuses to overwrite ignored session data"
+}
+
+test_attached_session_head_compare_and_swap() {
+  local fake_bin real_git
+  setup_case attached-session-head-cas merge main-off
+  git -C "$CASE_MAIN" branch alternate "$CASE_TOPIC_OID"
+  fake_bin="$TEST_ROOT/attached-session-head-cas-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$6" in' \
+    '*ship-pr-topic-reserve*)' \
+    '  if [ "$3" = worktree ] && [ "$4" = add ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '    "$REAL_GIT" "$@" || exit $?' \
+    '    : >"$RACE_MARKER"' \
+    '    "$REAL_GIT" -C "$RACE_SESSION" switch alternate >/dev/null' \
+    '    exit 0' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_SESSION="$CASE_SESSION" \
+    RACE_MARKER="$TEST_ROOT/attached-session-head-cas.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "cleanup accepted an attached session that changed branches after preflight"
+  fi
+  [ -e "$TEST_ROOT/attached-session-head-cas.injected" ] ||
+    fail "attached session HEAD race was not injected"
+  assert_eq "$(git -C "$CASE_SESSION" symbolic-ref --short HEAD)" alternate \
+    "session HEAD compare-and-swap must preserve the competing branch"
+  assert_topic_preserved
+  echo "PASS: attached session HEAD is compare-and-swapped before ownership transfer"
+}
+
+test_detached_session_head_compare_and_swap() {
+  local fake_bin race_oid real_git
+  setup_case detached-session-head-cas merge main-off
+  git -C "$CASE_SESSION" checkout --detach >/dev/null
+  race_oid=$(printf 'competing detached session commit\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
+  fake_bin="$TEST_ROOT/detached-session-head-cas-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$6" in' \
+    '*ship-pr-topic-reserve*)' \
+    '  if [ "$3" = worktree ] && [ "$4" = add ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '    "$REAL_GIT" "$@" || exit $?' \
+    '    : >"$RACE_MARKER"' \
+    '    "$REAL_GIT" -C "$RACE_SESSION" checkout --detach "$RACE_OID" >/dev/null' \
+    '    exit 0' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_SESSION="$CASE_SESSION" \
+    RACE_OID="$race_oid" RACE_MARKER="$TEST_ROOT/detached-session-head-cas.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "cleanup accepted a detached session HEAD that changed after preflight"
+  fi
+  [ -e "$TEST_ROOT/detached-session-head-cas.injected" ] ||
+    fail "detached session HEAD race was not injected"
+  assert_eq "$(git -C "$CASE_SESSION" rev-parse HEAD)" "$race_oid" \
+    "detached session HEAD compare-and-swap must preserve the competing commit"
+  assert_topic_preserved
+  echo "PASS: detached session HEAD is compare-and-swapped before archival"
 }
 
 test_initialized_session_submodule_refusal() {
@@ -1095,6 +1173,40 @@ test_initialized_master_submodule_refusal() {
   echo "PASS: initialized master-owner submodule is refused before gitlink advancement"
 }
 
+test_master_resolve_undo_refusal() {
+  local first_blob head_blob index_info local_master second_blob
+  setup_case master-resolve-undo merge other
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  head_blob=$(git -C "$CASE_MASTER_OWNER" rev-parse HEAD:value)
+  first_blob=$(printf 'master resolve-undo first\n' |
+    git -C "$CASE_MAIN" hash-object -w --stdin)
+  second_blob=$(printf 'master resolve-undo second\n' |
+    git -C "$CASE_MAIN" hash-object -w --stdin)
+  index_info="$TEST_ROOT/master-resolve-undo.index-info"
+  printf '0 0000000000000000000000000000000000000000\tvalue\0' >"$index_info"
+  printf '100644 %s 1\tvalue\0' "$head_blob" >>"$index_info"
+  printf '100644 %s 2\tvalue\0' "$first_blob" >>"$index_info"
+  printf '100644 %s 3\tvalue\0' "$second_blob" >>"$index_info"
+  git -C "$CASE_MASTER_OWNER" update-index -z --index-info <"$index_info"
+  git -C "$CASE_MASTER_OWNER" update-index --add --cacheinfo 100644 "$head_blob" value
+  [ -z "$(git -C "$CASE_MASTER_OWNER" status --porcelain --untracked-files=all)" ] ||
+    fail "master resolve-undo test did not leave a clean worktree"
+  [ -n "$(git -C "$CASE_MASTER_OWNER" ls-files --resolve-undo)" ] ||
+    fail "master resolve-undo test created no REUC entries"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "master-owner resolve-undo metadata was accepted for cleanup"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "master resolve-undo refusal must precede master advancement"
+  [ -n "$(git -C "$CASE_MASTER_OWNER" ls-files --resolve-undo)" ] ||
+    fail "master resolve-undo entries were lost"
+  git -C "$CASE_MAIN" cat-file -e "$first_blob^{blob}" || fail "first REUC blob was lost"
+  git -C "$CASE_MAIN" cat-file -e "$second_blob^{blob}" || fail "second REUC blob was lost"
+  assert_topic_preserved
+  echo "PASS: master-owner resolve-undo state is refused before ownership handoff"
+}
+
 test_diverged_master_refusal() {
   local master_owner="$TEST_ROOT/diverged-master-owner"
   setup_case diverged-master merge none
@@ -1120,6 +1232,27 @@ test_locked_session_refusal() {
   fi
   assert_topic_preserved
   echo "PASS: locked session is refused before cleanup"
+}
+
+test_active_session_operation_refusal() {
+  local local_master sequencer session_git_dir
+  setup_case active-session-operation merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  session_git_dir=$(git -C "$CASE_SESSION" rev-parse --absolute-git-dir)
+  sequencer="$session_git_dir/sequencer"
+  mkdir -p "$sequencer"
+  printf 'pick %s pending cleanup test\n' "$CASE_TOPIC_OID" >"$sequencer/todo"
+  [ -z "$(git -C "$CASE_SESSION" status --porcelain --untracked-files=all)" ] ||
+    fail "active-operation test did not leave a clean worktree"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "active session sequencer state was accepted for cleanup"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "active-operation refusal must precede master advancement"
+  [ -f "$sequencer/todo" ] || fail "active session sequencer state was lost"
+  assert_topic_preserved
+  echo "PASS: active session operation state is refused before mutation"
 }
 
 test_private_worktree_ref_refusal() {
@@ -1649,33 +1782,14 @@ test_dangling_link_at_session_removal() {
 }
 
 test_detached_session_head_recovery() {
-  local fake_bin final_head real_git
   setup_case detached-session-head-recovery merge main-off
-  fake_bin="$TEST_ROOT/detached-session-head-recovery-bin"
-  real_git=$(command -v git)
-  mkdir -p "$fake_bin"
-  printf '%s\n' \
-    '#!/usr/bin/env bash' \
-    'case "$2" in' \
-    '*.ship-pr-recovery.*/worktree)' \
-    '  if [ "$3" = rev-parse ] && [ "$4" = --git-path ] && [ "$5" = HEAD ] && [ ! -e "$HEAD_MARKER" ]; then' \
-    '    "$REAL_GIT" -C "$2" commit --allow-empty -m "late detached session commit" >/dev/null' \
-    '    "$REAL_GIT" -C "$2" rev-parse HEAD >"$HEAD_MARKER"' \
-    '  fi' \
-    '  ;;' \
-    'esac' \
-    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
-  chmod +x "$fake_bin/git"
-
-  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
-    HEAD_MARKER="$TEST_ROOT/detached-session-head-recovery.oid" \
-    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
-  final_head=$(cat "$TEST_ROOT/detached-session-head-recovery.oid")
+  git -C "$CASE_SESSION" checkout --detach >/dev/null
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
   assert_eq "$(git -C "$CASE_MAIN" rev-parse \
-    "refs/ship-pr/session-recovery/topic/$final_head")" "$final_head" \
-    "late detached session HEAD must remain reachable after unregistering"
+    "refs/ship-pr/session-recovery/topic/$CASE_TOPIC_OID")" "$CASE_TOPIC_OID" \
+    "validated detached session HEAD must remain reachable after unregistering"
   assert_cleaned
-  echo "PASS: final detached session HEAD receives a direct recovery ref"
+  echo "PASS: detached session HEAD receives a direct recovery ref"
 }
 
 test_session_head_locked_through_unregister() {
@@ -2102,6 +2216,31 @@ test_config_lock_refusal() {
   echo "PASS: config lock is refused before cleanup"
 }
 
+test_symbolic_worktree_config_preflight() {
+  local config_path local_master target
+  setup_case symbolic-worktree-config merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" config extensions.worktreeConfig true
+  config_path=$(git -C "$CASE_SESSION" rev-parse --git-path config.worktree)
+  case "$config_path" in
+  /*) ;;
+  *) config_path="$CASE_SESSION/$config_path" ;;
+  esac
+  target="$TEST_ROOT/symbolic-worktree-config.target"
+  : >"$target"
+  { [ ! -e "$config_path" ] && [ ! -L "$config_path" ]; } || unlink "$config_path"
+  ln -s "$target" "$config_path"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "symbolic per-worktree configuration was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "symbolic worktree config refusal must precede master advancement"
+  [ -L "$config_path" ] || fail "symbolic per-worktree configuration was changed"
+  assert_topic_preserved
+  echo "PASS: symbolic per-worktree configuration is refused during preflight"
+}
+
 test_ignored_master_collision_refusal() {
   local collision
   setup_case ignored-master-collision merge other
@@ -2236,11 +2375,15 @@ test_master_reattach_verifies_named_branch
 test_ignored_data_during_master_detach
 test_ignored_data_during_topic_detach
 test_ignored_data_during_topic_reattach
+test_attached_session_head_compare_and_swap
+test_detached_session_head_compare_and_swap
 test_initialized_session_submodule_refusal
 test_deinitialized_session_submodule_refusal
 test_initialized_master_submodule_refusal
+test_master_resolve_undo_refusal
 test_diverged_master_refusal
 test_locked_session_refusal
+test_active_session_operation_refusal
 test_private_worktree_ref_refusal
 test_rewritten_worktree_ref_refusal
 test_session_pseudoref_recovery
@@ -2278,6 +2421,7 @@ test_dangling_capability_ref_refusal
 test_option_like_branch_name
 test_relative_tmpdir
 test_config_lock_refusal
+test_symbolic_worktree_config_preflight
 test_ignored_master_collision_refusal
 test_ignored_master_descendant_refusal
 test_missing_branch_config
