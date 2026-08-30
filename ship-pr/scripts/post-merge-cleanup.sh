@@ -92,7 +92,8 @@ refuse_private_worktree_refs() {
 preflight_session_metadata_locks() {
   local name path path_dir lock symbolic_status
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
-    BISECT_HEAD AUTO_MERGE FETCH_HEAD COMMIT_EDITMSG SQUASH_MSG index config.worktree; do
+    BISECT_HEAD AUTO_MERGE FETCH_HEAD COMMIT_EDITMSG SQUASH_MSG TAG_EDITMSG NOTES_EDITMSG \
+    index config.worktree; do
     path=$(git -C "$SESSION" rev-parse --git-path "$name") ||
       fail "could not locate session metadata: $name"
     case "$path" in
@@ -103,7 +104,7 @@ preflight_session_metadata_locks() {
     path="$path_dir/$(basename "$path")"
     [ ! -L "$path" ] || fail "session metadata is symbolic; replace it before cleanup: $name"
     case "$name" in
-    COMMIT_EDITMSG | SQUASH_MSG | index | config.worktree) ;;
+    COMMIT_EDITMSG | SQUASH_MSG | TAG_EDITMSG | NOTES_EDITMSG | index | config.worktree) ;;
     *)
       git -C "$SESSION" symbolic-ref -q "$name" >/dev/null 2>&1
       symbolic_status=$?
@@ -209,8 +210,8 @@ refuse_hidden_index_changes() {
   MASTER_INDEX_PROBE=""
 }
 
-detach_master_owner_with_lease() {
-  local head_path head_dir raw
+reserve_master_owner_handoff() {
+  local head_path head_dir index_path index_dir raw
   head_path=$(git -C "$ORIGINAL_MASTER_OWNER" rev-parse --git-path HEAD) ||
     fail "could not locate the master owner's HEAD"
   case "$head_path" in
@@ -225,10 +226,42 @@ detach_master_owner_with_lease() {
   MASTER_HEAD_LOCK_OWNED=1
   raw=$(sed -n '1p' "$head_path") || return 1
   [ "$raw" = "ref: refs/heads/master" ] || return 1
-  printf '%s\n' "$LOCAL_MASTER" >"$MASTER_HEAD_LOCK" || return 1
-  atomic_rename "$MASTER_HEAD_LOCK" "$head_path" || return 1
+
+  index_path=$(git -C "$ORIGINAL_MASTER_OWNER" rev-parse --git-path index) || return 1
+  case "$index_path" in
+  /*) ;;
+  *) index_path="$ORIGINAL_MASTER_OWNER/$index_path" ;;
+  esac
+  index_dir=$(canonical_dir "$(dirname "$index_path")") || exit $?
+  MASTER_OWNER_INDEX_PATH="$index_dir/$(basename "$index_path")"
+  [ ! -L "$MASTER_OWNER_INDEX_PATH" ] || return 1
+  [ -f "$MASTER_OWNER_INDEX_PATH" ] || return 1
+  MASTER_OWNER_INDEX_LOCK="$MASTER_OWNER_INDEX_PATH.lock"
+  (set -o noclobber; : >"$MASTER_OWNER_INDEX_LOCK") 2>/dev/null || return 1
+  MASTER_OWNER_INDEX_LOCK_OWNED=1
+  cp -p "$MASTER_OWNER_INDEX_PATH" "$MASTER_OWNER_INDEX_LOCK" || return 1
+  unlink "$MASTER_HEAD_LOCK" || return 1
   MASTER_HEAD_LOCK_OWNED=0
-  ORIGINAL_MASTER_DETACHED=1
+}
+
+prepare_master_owner_refresh() {
+  MASTER_REFRESH_GIT_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-master-refresh.XXXXXX") || return 1
+  printf '%s\n' "$LOCAL_MASTER" >"$MASTER_REFRESH_GIT_DIR/HEAD" || return 1
+}
+
+refresh_master_owner_to() {
+  local target=$1
+  GIT_DIR="$MASTER_REFRESH_GIT_DIR" GIT_COMMON_DIR="$MAIN_COMMON" \
+    GIT_WORK_TREE="$ORIGINAL_MASTER_OWNER" GIT_INDEX_FILE="$MASTER_OWNER_INDEX_LOCK" \
+    git -C "$ORIGINAL_MASTER_OWNER" checkout --detach --no-overwrite-ignore "$target" >/dev/null
+}
+
+relock_master_owner_head() {
+  local raw
+  (set -o noclobber; printf '%s\n' "$$" >"$MASTER_HEAD_LOCK") 2>/dev/null || return 1
+  MASTER_HEAD_LOCK_OWNED=1
+  raw=$(sed -n '1p' "${MASTER_HEAD_LOCK%.lock}") || return 1
+  [ "$raw" = "ref: refs/heads/master" ]
 }
 
 lock_session_head_for_archive() {
@@ -495,7 +528,7 @@ delete_ref_with_locked_reflog() {
 
 lock_and_retain_session_metadata() {
   local name path path_dir lock line metadata oid config_snapshot message_snapshot squash_snapshot index_snapshot index_tree
-  local shared_index shared_snapshot shared_temp sparse_snapshot worktree_git_dir
+  local edit_snapshot shared_index shared_snapshot shared_temp sparse_snapshot worktree_git_dir
   local reuc_snapshot mode stage old_oid new_oid rest
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
     BISECT_HEAD AUTO_MERGE FETCH_HEAD; do
@@ -566,6 +599,28 @@ lock_and_retain_session_metadata() {
     unlink "$squash_snapshot" || fail "could not prepare the squash-message snapshot"
     ln "$path" "$squash_snapshot" || fail "could not link the archived squash message"
   fi
+
+  for name in TAG_EDITMSG NOTES_EDITMSG; do
+    path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "$name") ||
+      fail "could not locate archived edit message: $name"
+    case "$path" in
+    /*) ;;
+    *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
+    esac
+    path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+    path="$path_dir/$(basename "$path")"
+    lock="$path.lock"
+    (set -o noclobber; printf '%s\n' "$$" >"$lock") 2>/dev/null ||
+      fail "archived edit message is busy: $name"
+    SESSION_PSEUDOREF_LOCKS+=("$lock")
+    [ ! -L "$path" ] || fail "archived edit message is symbolic: $name"
+    if [ -f "$path" ]; then
+      edit_snapshot=$(mktemp "$SESSION_ARCHIVE/$name.XXXXXX") ||
+        fail "could not allocate an edit-message snapshot: $name"
+      unlink "$edit_snapshot" || fail "could not prepare the edit-message snapshot: $name"
+      ln "$path" "$edit_snapshot" || fail "could not link the archived edit message: $name"
+    fi
+  done
 
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path config.worktree) ||
@@ -775,37 +830,35 @@ cleanup_reservations() {
   if [ "${SESSION_WORKTREE_LOCK_OWNED:-0}" -eq 1 ] && [ -n "${SESSION:-}" ]; then
     git -C "$MAIN" worktree unlock "$SESSION" >/dev/null 2>&1 || true
   fi
+  if [ "${MASTER_OWNER_INDEX_LOCK_OWNED:-0}" -eq 1 ] &&
+    [ -n "${MASTER_OWNER_INDEX_LOCK:-}" ] && [ -f "$MASTER_OWNER_INDEX_LOCK" ]; then
+    unlink "$MASTER_OWNER_INDEX_LOCK" >/dev/null 2>&1 || true
+  fi
   if [ "${MASTER_HEAD_LOCK_OWNED:-0}" -eq 1 ] && [ -n "${MASTER_HEAD_LOCK:-}" ] &&
     [ -f "$MASTER_HEAD_LOCK" ]; then
     unlink "$MASTER_HEAD_LOCK" >/dev/null 2>&1 || true
   fi
-  if [ "${ORIGINAL_MASTER_DETACHED:-0}" -eq 1 ] &&
-    [ -n "${ORIGINAL_MASTER_OWNER:-}" ] && [ -d "$ORIGINAL_MASTER_OWNER" ]; then
-    RECOVERY_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master 2>/dev/null || true)
-    if [ -n "$RECOVERY_MASTER" ] &&
-      git -C "$ORIGINAL_MASTER_OWNER" switch --detach --no-overwrite-ignore \
-        "$RECOVERY_MASTER" >/dev/null 2>&1 &&
-      printf 'option no-deref\nverify refs/heads/master %s\nsymref-update HEAD refs/heads/master oid %s\n' \
-        "$RECOVERY_MASTER" "$RECOVERY_MASTER" |
-        git -C "$ORIGINAL_MASTER_OWNER" update-ref --stdin >/dev/null 2>&1; then
-      ORIGINAL_MASTER_DETACHED=0
-    fi
+  if [ -n "${MASTER_REFRESH_GIT_DIR:-}" ]; then
+    unlink "$MASTER_REFRESH_GIT_DIR/HEAD.lock" >/dev/null 2>&1 || true
+    unlink "$MASTER_REFRESH_GIT_DIR/logs/HEAD" >/dev/null 2>&1 || true
+    rmdir "$MASTER_REFRESH_GIT_DIR/logs" >/dev/null 2>&1 || true
+    unlink "$MASTER_REFRESH_GIT_DIR/HEAD" >/dev/null 2>&1 || true
+    rmdir "$MASTER_REFRESH_GIT_DIR" >/dev/null 2>&1 || true
   fi
   if [ -n "${MASTER_RESERVATION:-}" ] && [ -d "$MASTER_RESERVATION" ]; then
     git -C "$MAIN" worktree remove --force "$MASTER_RESERVATION" >/dev/null 2>&1 || true
-  fi
-  if [ "${ORIGINAL_MASTER_DETACHED:-0}" -eq 1 ] &&
-    [ -n "${ORIGINAL_MASTER_OWNER:-}" ] && [ -d "$ORIGINAL_MASTER_OWNER" ]; then
-    git -C "$ORIGINAL_MASTER_OWNER" switch --no-overwrite-ignore -- master >/dev/null 2>&1 || true
   fi
   [ -z "${SESSION_ARCHIVE:-}" ] || rmdir "$SESSION_ARCHIVE" >/dev/null 2>&1 || true
   [ -z "${LATE_SESSION_ARCHIVE:-}" ] || rmdir "$LATE_SESSION_ARCHIVE" >/dev/null 2>&1 || true
 }
 
 MASTER_RESERVATION=""
-ORIGINAL_MASTER_DETACHED=0
 MASTER_HEAD_LOCK=""
 MASTER_HEAD_LOCK_OWNED=0
+MASTER_OWNER_INDEX_PATH=""
+MASTER_OWNER_INDEX_LOCK=""
+MASTER_OWNER_INDEX_LOCK_OWNED=0
+MASTER_REFRESH_GIT_DIR=""
 SESSION_HEAD_LOCK=""
 SESSION_HEAD_LOCK_OWNED=0
 CAPABILITY_REF=""
@@ -1073,42 +1126,54 @@ CHANGED_PATHS_FILE=""
 [ -z "$IGNORED_COLLISION" ] ||
   fail "master fast-forward would overwrite ignored local data: $MASTER_OWNER/$IGNORED_COLLISION"
 
-# Move branch ownership to a helper-only worktree before the named ref update. Detach the original
-# owner with a raw HEAD compare-and-swap, then use an option-safe switch when refreshing its tree so
-# tracked or ignored data that appeared concurrently is refused.
+# Keep an existing owner's symbolic HEAD and real index locked across the complete named-ref and
+# worktree refresh. An initially unowned master instead remains reserved by its helper worktree.
 if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
-  MASTER_RESERVATION=$(mktemp -d "$TEMP_ROOT/ship-pr-master-reserve.XXXXXX") ||
-    fail "could not allocate a temporary master reservation"
-  rmdir "$MASTER_RESERVATION" || fail "could not prepare the temporary master reservation path"
-  git -C "$MAIN" worktree add --detach "$MASTER_RESERVATION" "$LOCAL_MASTER" >/dev/null ||
-    fail "could not prepare a temporary master reservation"
-  MASTER_RESERVATION=$(canonical_dir "$MASTER_RESERVATION") || exit $?
-  detach_master_owner_with_lease ||
-    fail "master owner changed HEAD before its ownership handoff: $ORIGINAL_MASTER_OWNER"
-  git -C "$MASTER_RESERVATION" switch -- master >/dev/null ||
-    fail "could not transfer master ownership to its temporary reservation"
+  reserve_master_owner_handoff ||
+    fail "master owner HEAD or index changed before its locked refresh: $ORIGINAL_MASTER_OWNER"
+  prepare_master_owner_refresh || fail "could not prepare the locked master-owner refresh"
 fi
 git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER" ||
   fail "local master moved after its owner preflight"
-git -C "$MASTER_RESERVATION" read-tree --reset -u "$REMOTE_MASTER" >/dev/null ||
-  fail "master advanced but its helper-only reservation could not be refreshed"
 if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
-  git -C "$ORIGINAL_MASTER_OWNER" switch --detach --no-overwrite-ignore "$REMOTE_MASTER" >/dev/null ||
-    fail "master advanced, but its original owner gained local data: $ORIGINAL_MASTER_OWNER"
-  MASTER_OWNER_STATUS=$(git -C "$ORIGINAL_MASTER_OWNER" status \
+  if ! relock_master_owner_head; then
+    git -C "$MAIN" update-ref --no-deref refs/heads/master "$LOCAL_MASTER" "$REMOTE_MASTER" || true
+    fail "master owner changed HEAD during its locked ownership handoff"
+  fi
+  if ! refresh_master_owner_to "$REMOTE_MASTER"; then
+    git -C "$MAIN" update-ref --no-deref refs/heads/master "$LOCAL_MASTER" "$REMOTE_MASTER" || true
+    fail "master owner could not be refreshed while its HEAD and index were locked"
+  fi
+  MASTER_DURING_REFRESH=$(git -C "$MAIN" rev-parse refs/heads/master) ||
+    fail "could not recheck master during its locked refresh"
+  if [ "$MASTER_DURING_REFRESH" != "$REMOTE_MASTER" ]; then
+    refresh_master_owner_to "$MASTER_DURING_REFRESH" ||
+      fail "master moved during refresh and its owner could not follow the concurrent tip"
+  fi
+  MASTER_OWNER_STATUS=$(GIT_INDEX_FILE="$MASTER_OWNER_INDEX_LOCK" git -C "$ORIGINAL_MASTER_OWNER" status \
     --porcelain --untracked-files=normal --ignored=matching) ||
-    fail "could not recheck the detached original master owner"
+    fail "could not recheck the locked master owner"
+  atomic_rename "$MASTER_OWNER_INDEX_LOCK" "$MASTER_OWNER_INDEX_PATH" ||
+    fail "could not install the refreshed master-owner index"
+  MASTER_OWNER_INDEX_LOCK_OWNED=0
+  unlink "$MASTER_REFRESH_GIT_DIR/logs/HEAD" || fail "could not remove the master refresh reflog"
+  rmdir "$MASTER_REFRESH_GIT_DIR/logs" || fail "could not remove the master refresh logs"
+  unlink "$MASTER_REFRESH_GIT_DIR/HEAD" || fail "could not remove the master refresh HEAD"
+  rmdir "$MASTER_REFRESH_GIT_DIR" || fail "could not remove the master refresh administration"
+  MASTER_REFRESH_GIT_DIR=""
+  unlink "$MASTER_HEAD_LOCK" || fail "could not release the master-owner HEAD lock"
+  MASTER_HEAD_LOCK_OWNED=0
   [ -z "$MASTER_OWNER_STATUS" ] ||
-    fail "master owner gained local data during its update; the data was preserved: $ORIGINAL_MASTER_OWNER"
-  printf 'option no-deref\nverify refs/heads/master %s\nsymref-update HEAD refs/heads/master oid %s\n' \
-    "$REMOTE_MASTER" "$REMOTE_MASTER" |
-    git -C "$ORIGINAL_MASTER_OWNER" update-ref --stdin ||
-    fail "original master owner changed after preparation; its HEAD was not rewritten"
-  ORIGINAL_MASTER_DETACHED=0
+    fail "master owner gained local data during its locked update; the data was preserved"
+  [ "$MASTER_DURING_REFRESH" = "$REMOTE_MASTER" ] ||
+    fail "master moved during its locked refresh; its owner followed the concurrent tip"
+else
+  git -C "$MASTER_RESERVATION" read-tree --reset -u "$REMOTE_MASTER" >/dev/null ||
+    fail "master advanced but its helper-only reservation could not be refreshed"
+  git -C "$MAIN" worktree remove --force "$MASTER_RESERVATION" ||
+    fail "master advanced but its temporary reservation could not be removed"
+  MASTER_RESERVATION=""
 fi
-git -C "$MAIN" worktree remove --force "$MASTER_RESERVATION" ||
-  fail "master advanced but its temporary reservation could not be removed"
-MASTER_RESERVATION=""
 
 LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot reread local master"
 [ "$LOCAL_MASTER" = "$REMOTE_MASTER" ] || fail "local master did not reach origin/master"

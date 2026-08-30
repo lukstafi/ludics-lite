@@ -598,7 +598,7 @@ test_concurrent_master_edit_refusal() {
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "$3" = switch ] && [ "$4" = --detach ] && [ "$6" = "$RACE_TARGET" ]; then' \
+    'if [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = --no-overwrite-ignore ] && [ "$6" = "$RACE_TARGET" ]; then' \
     '  echo concurrent-edit >"$MASTER_OWNER/value"' \
     'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
@@ -631,7 +631,7 @@ test_concurrent_ignored_master_collision() {
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "$3" = switch ] && [ "$4" = --detach ] && [ "$6" = "$RACE_TARGET" ]; then' \
+    'if [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = --no-overwrite-ignore ] && [ "$6" = "$RACE_TARGET" ]; then' \
     '  echo local-data >"$MASTER_COLLISION"' \
     'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
@@ -689,11 +689,13 @@ test_master_owner_switch_refusal() {
     SWITCH_MARKER="$TEST_ROOT/master-owner-branch-switch.status" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1
   checkout_status=$(cat "$TEST_ROOT/master-owner-branch-switch.status")
-  [ "$checkout_status" -eq 0 ] || fail "test did not switch the detached original master owner"
+  [ "$checkout_status" -ne 0 ] || fail "master-owner branch switch bypassed the held index lock"
   assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$remote_master" \
     "master must reach the remote tip while its checkout is locked"
   assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/alternate)" "$local_master" \
     "unrelated branch must not be advanced by the master update"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
+    "locked master owner must remain attached throughout its refresh"
   assert_cleaned
   echo "PASS: master ownership handoff prevents update redirection"
 }
@@ -751,14 +753,8 @@ test_master_update_failure_reattaches_owner() {
     '#!/usr/bin/env bash' \
     'if [ "$3" = update-ref ] && [ "$5" = refs/heads/master ]; then' \
     '  "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/master "$RACE_REMOTE" "$RACE_LOCAL"' \
-    'fi' \
-    'if [ "$3" = worktree ] && [ "$4" = remove ]; then' \
-    '  case "$*" in' \
-    '  *ship-pr-master-reserve*)' \
-    '    "$REAL_GIT" -C "$MASTER_CANDIDATE" checkout master >/dev/null 2>&1' \
-    '    echo "$?" >"$CHECKOUT_MARKER"' \
-    '    ;;' \
-    '  esac' \
+    '  "$REAL_GIT" -C "$MASTER_CANDIDATE" checkout master >/dev/null 2>&1' \
+    '  echo "$?" >"$CHECKOUT_MARKER"' \
     'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
@@ -770,13 +766,13 @@ test_master_update_failure_reattaches_owner() {
     fail "conditional master update unexpectedly succeeded after a competing update"
   fi
   assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
-    "original master owner must be reattached after update-ref failure"
+    "original master owner must remain attached after update-ref failure"
   assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse HEAD)" "$remote_master" \
-    "reattached master owner must follow the concurrently updated ref"
+    "attached master owner must follow the concurrently updated ref"
   checkout_status=$(cat "$TEST_ROOT/master-update-failure-checkout.status")
   [ "$checkout_status" -ne 0 ] || fail "competitor acquired master during failure recovery"
   assert_topic_preserved
-  echo "PASS: master update failure reattaches the original owner"
+  echo "PASS: master update failure keeps the original owner attached"
 }
 
 test_master_handoff_stays_reserved() {
@@ -789,13 +785,9 @@ test_master_handoff_stays_reserved() {
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "$3" = worktree ] && [ "$4" = remove ]; then' \
-    '  case "$*" in' \
-    '  *ship-pr-master-reserve*)' \
+    'if [ "$3" = update-ref ] && [ "$5" = refs/heads/master ]; then' \
     '    "$REAL_GIT" -C "$MASTER_CANDIDATE" checkout master >/dev/null 2>&1' \
     '    echo "$?" >"$CHECKOUT_MARKER"' \
-    '    ;;' \
-    '  esac' \
     'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
@@ -804,11 +796,11 @@ test_master_handoff_stays_reserved() {
     CHECKOUT_MARKER="$TEST_ROOT/master-handoff-reserved.status" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
   checkout_status=$(cat "$TEST_ROOT/master-handoff-reserved.status")
-  [ "$checkout_status" -ne 0 ] || fail "competitor acquired master during reservation removal"
+  [ "$checkout_status" -ne 0 ] || fail "competitor acquired master during the locked handoff"
   assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
-    "original master owner must already be attached before reservation removal"
+    "original master owner must stay attached throughout the handoff"
   assert_cleaned
-  echo "PASS: master remains owned across reservation removal"
+  echo "PASS: master remains owned throughout the locked handoff"
 }
 
 test_master_refresh_preserves_concurrent_ref() {
@@ -843,7 +835,7 @@ test_master_refresh_preserves_concurrent_ref() {
 }
 
 test_master_reattach_compare_and_swap() {
-  local alternate_oid fake_bin local_master real_git log
+  local alternate_oid checkout_status fake_bin local_master real_git log
   setup_case master-reattach-cas merge other
   local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
   git -C "$CASE_MAIN" branch alternate "$local_master"
@@ -854,24 +846,24 @@ test_master_reattach_compare_and_swap() {
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "$3" = update-ref ] && [ "$4" = --stdin ]; then' \
-    '  case "$2" in' \
-    '  */master-owner) "$REAL_GIT" -C "$MASTER_OWNER" checkout alternate >/dev/null 2>&1 ;;' \
-    '  esac' \
+    'if [ "$3" = update-ref ] && [ "$5" = refs/heads/master ]; then' \
+    '  "$REAL_GIT" -C "$MASTER_OWNER" checkout alternate >/dev/null 2>&1' \
+    '  echo "$?" >"$CHECKOUT_MARKER"' \
     'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
 
-  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_OWNER="$CASE_MASTER_OWNER" \
-    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
-    fail "master reattachment overwrote a concurrently switched HEAD"
-  fi
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_OWNER="$CASE_MASTER_OWNER" \
+    CHECKOUT_MARKER="$TEST_ROOT/master-reattach-cas.status" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1
+  checkout_status=$(cat "$TEST_ROOT/master-reattach-cas.status")
+  [ "$checkout_status" -ne 0 ] || fail "master-owner switch bypassed the refresh locks"
   assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/alternate)" "$alternate_oid" \
-    "compare-and-swap refusal must not advance the competing branch"
+    "locked refresh must not advance the competing branch"
   assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
-    "failure recovery must safely reattach the original owner"
-  assert_topic_preserved
-  echo "PASS: master reattachment uses a detached-HEAD compare-and-swap"
+    "original owner must remain attached during its locked refresh"
+  assert_cleaned
+  echo "PASS: master refresh locks out a concurrent branch switch"
 }
 
 test_master_reattach_verifies_named_branch() {
@@ -889,9 +881,10 @@ test_master_reattach_verifies_named_branch() {
     '#!/usr/bin/env bash' \
     'case "$2" in' \
     '*/master-owner)' \
-    '  if [ "$3" = update-ref ] && [ "$4" = --stdin ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '  if [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = --no-overwrite-ignore ] && [ ! -e "$RACE_MARKER" ]; then' \
     '    : >"$RACE_MARKER"' \
-    '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/master "$RACE_OID" "$REMOTE_MASTER"' \
+    '    env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+          "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/master "$RACE_OID" "$REMOTE_MASTER"' \
     '  fi' \
     '  ;;' \
     'esac' \
@@ -905,15 +898,15 @@ test_master_reattach_verifies_named_branch() {
     fail "master reattachment ignored a concurrent named-branch update"
   fi
   assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$competitor_oid" \
-    "master reattachment must preserve a concurrently advanced named branch"
+    "master refresh must preserve a concurrently advanced named branch"
   assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
-    "failure recovery must reattach the original owner to the current master"
+    "failure recovery must leave the original owner attached to current master"
   assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse HEAD)" "$competitor_oid" \
     "failure recovery must use the concurrent master tip"
   [ -z "$(git -C "$CASE_MASTER_OWNER" status --porcelain --untracked-files=all)" ] ||
     fail "failure recovery left the original master owner dirty"
   assert_topic_preserved
-  echo "PASS: master reattachment verifies the named branch in its HEAD transaction"
+  echo "PASS: master refresh verifies the named branch while holding its locks"
 }
 
 test_ignored_data_during_master_detach() {
@@ -932,9 +925,10 @@ test_ignored_data_during_master_detach() {
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "$3" = switch ] && [ "$4" = --detach ] && [ ! -e "$RACE_MARKER" ]; then' \
+    'if [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = --no-overwrite-ignore ] && [ ! -e "$RACE_MARKER" ]; then' \
     '  : >"$RACE_MARKER"' \
-    '  "$REAL_GIT" -C "$MASTER_OWNER" checkout alternate >/dev/null 2>&1' \
+    '  env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+        "$REAL_GIT" -C "$MASTER_OWNER" checkout alternate >/dev/null 2>&1' \
     '  echo local-data >"$MASTER_OWNER/value"' \
     'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
@@ -1851,6 +1845,44 @@ test_squash_message_archive() {
   assert_eq "$(cat "$message_snapshot")" "$squash_message" \
     "pending squash message must survive unregistering"
   echo "PASS: pending squash messages are copied into the recovery archive"
+}
+
+test_tag_and_notes_messages_archive() {
+  local editor file name snapshot snapshot_count text
+  setup_case tag-notes-messages-archive merge main-off
+  editor="$TEST_ROOT/rejecting-message-editor"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$EDIT_TEXT" >"$1"\nexit 1\n' >"$editor"
+  chmod +x "$editor"
+
+  if GIT_EDITOR="$editor" EDIT_TEXT="retain failed tag proposal" \
+    git -C "$CASE_SESSION" tag -a pending-tag >/dev/null 2>&1; then
+    fail "tag editor unexpectedly accepted the scratch message"
+  fi
+  if GIT_EDITOR="$editor" EDIT_TEXT="retain failed notes proposal" \
+    git -C "$CASE_SESSION" notes add HEAD >/dev/null 2>&1; then
+    fail "notes editor unexpectedly accepted the scratch message"
+  fi
+  [ -z "$(git -C "$CASE_SESSION" status --porcelain)" ] ||
+    fail "failed tag or notes edit dirtied the session"
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  for name in TAG_EDITMSG NOTES_EDITMSG; do
+    case "$name" in
+    TAG_EDITMSG) text="retain failed tag proposal" ;;
+    NOTES_EDITMSG) text="retain failed notes proposal" ;;
+    esac
+    snapshot_count=0
+    snapshot=""
+    for file in "$CASE_ARCHIVE/$name".*; do
+      [ -f "$file" ] || continue
+      snapshot_count=$((snapshot_count + 1))
+      snapshot="$file"
+    done
+    assert_eq "$snapshot_count" 1 "cleanup must archive one $name snapshot"
+    assert_eq "$(sed -n '1p' "$snapshot")" "$text" "$name proposal must survive unregistering"
+  done
+  echo "PASS: failed tag and notes edit messages are copied into the recovery archive"
 }
 
 test_sparse_checkout_archive() {
@@ -3126,6 +3158,7 @@ test_worktree_config_archive
 test_commit_message_archive
 test_concurrent_commit_message_archive
 test_squash_message_archive
+test_tag_and_notes_messages_archive
 test_sparse_checkout_archive
 test_session_metadata_lock_preflight
 test_late_private_worktree_ref_recovery
