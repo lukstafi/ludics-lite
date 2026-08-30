@@ -225,6 +225,13 @@ test_invalid_path_refusal() {
     fail "missing session path did not stop cleanup"
   fi
   assert_topic_preserved
+
+  setup_case session-subdirectory merge main
+  mkdir "$CASE_SESSION/inside"
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION/inside" topic >/dev/null 2>&1; then
+    fail "session subdirectory was accepted as the worktree root"
+  fi
+  assert_topic_preserved
   echo "PASS: invalid checkout path refusal"
 }
 
@@ -263,6 +270,28 @@ test_distinct_push_endpoint() {
   echo "PASS: distinct fetch and push endpoints"
 }
 
+test_topic_tag_collision() {
+  setup_case topic-tag-collision merge main-off
+  git -C "$CASE_MAIN" tag topic refs/heads/master
+  git -C "$CASE_MAIN" push origin refs/tags/topic >/dev/null
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  git -C "$CASE_MAIN" ls-remote --exit-code --tags origin refs/tags/topic >/dev/null 2>&1 ||
+    fail "same-named topic tag was removed"
+  echo "PASS: fully qualified topic branch deletion"
+}
+
+test_master_tag_collision() {
+  setup_case master-tag-collision merge none
+  git -C "$CASE_MAIN" tag master refs/heads/master
+  git -C "$CASE_MAIN" push origin refs/tags/master >/dev/null
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  git -C "$CASE_MAIN" ls-remote --exit-code --tags origin refs/tags/master >/dev/null 2>&1 ||
+    fail "same-named master tag was removed"
+  echo "PASS: fully qualified master branch fetch"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
@@ -273,4 +302,6 @@ test_ls_remote_failure_refusal
 test_invalid_path_refusal
 test_unrelated_upstream_deletion
 test_distinct_push_endpoint
+test_topic_tag_collision
+test_master_tag_collision
 echo "PASS: all post-merge cleanup states"

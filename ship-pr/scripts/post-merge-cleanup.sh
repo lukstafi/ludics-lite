@@ -59,6 +59,9 @@ git -C "$MAIN" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   fail "main checkout is not a git worktree: $MAIN"
 git -C "$SESSION" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   fail "session path is not a git worktree: $SESSION"
+SESSION_TOPLEVEL=$(canonical_dir "$(git -C "$SESSION" rev-parse --show-toplevel)") || exit $?
+[ "$SESSION" = "$SESSION_TOPLEVEL" ] ||
+  fail "session-worktree must be the worktree root ($SESSION_TOPLEVEL), not a directory inside it"
 
 MAIN_COMMON=$(git_path "$MAIN" "$(git -C "$MAIN" rev-parse --git-common-dir)") || exit $?
 MAIN_GIT=$(git_path "$MAIN" "$(git -C "$MAIN" rev-parse --git-dir)") || exit $?
@@ -113,7 +116,8 @@ case "$REMOTE_BRANCH_STATUS" in
   LOCAL_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot read local $BRANCH"
   [ "$REMOTE_BRANCH_OID" = "$LOCAL_BRANCH_OID" ] ||
     fail "origin/$BRANCH moved from local $LOCAL_BRANCH_OID to $REMOTE_BRANCH_OID; refusing to delete its newer tip"
-  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" "$ORIGIN_PUSH_URL" --delete "$BRANCH" ||
+  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" \
+    "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH" ||
     fail "could not lease-delete origin/$BRANCH at $REMOTE_BRANCH_OID"
   ;;
 2)
@@ -141,7 +145,8 @@ done < <(git -C "$MAIN" worktree list --porcelain -z)
 
 [ "$MASTER_OWNER_COUNT" -le 1 ] || fail "more than one worktree reports owning master"
 if [ "$MASTER_OWNER_COUNT" -eq 0 ]; then
-  git -C "$MAIN" fetch origin master:master || fail "could not fast-forward unchecked-out master"
+  git -C "$MAIN" fetch origin refs/heads/master:refs/heads/master ||
+    fail "could not fast-forward unchecked-out master"
 else
   git -C "$MASTER_OWNER" merge --ff-only refs/remotes/origin/master ||
     fail "could not fast-forward master in its owning worktree: $MASTER_OWNER"
