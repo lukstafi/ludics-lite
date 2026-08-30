@@ -53,7 +53,7 @@ assert_cleaned() {
   assert_ref_absent "refs/heads/$CASE_BRANCH"
   assert_ref_absent "refs/remotes/origin/$CASE_BRANCH"
   assert_remote_topic_absent
-  for branch_key in remote merge pushRemote rebase description; do
+  for branch_key in remote merge mergeOptions pushRemote rebase description; do
     ! git -C "$CASE_MAIN" config --local --no-includes \
       --get "branch.$CASE_BRANCH.$branch_key" >/dev/null 2>&1 ||
       fail "repository-local topic branch configuration remained: $branch_key"
@@ -1262,6 +1262,26 @@ test_master_resolve_undo_refusal() {
   echo "PASS: master-owner resolve-undo state is refused before ownership handoff"
 }
 
+test_assume_unchanged_master_refusal() {
+  local local_master
+  setup_case assume-unchanged-master merge main
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" update-index --assume-unchanged value
+  printf 'hidden local master edit\n' >"$CASE_MAIN/value"
+  [ -z "$(git -C "$CASE_MAIN" status --porcelain)" ] ||
+    fail "assume-unchanged setup did not hide the master-owner edit"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "assume-unchanged master-owner edit was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "hidden master-owner edit refusal must precede master advancement"
+  assert_eq "$(sed -n '1p' "$CASE_MAIN/value")" "hidden local master edit" \
+    "hidden master-owner data must survive refusal"
+  assert_topic_preserved
+  echo "PASS: assume-unchanged master-owner edits are refused before ownership handoff"
+}
+
 test_master_changed_path_failure_refusal() {
   local fake_bin local_master real_git
   setup_case master-changed-path-failure merge other
@@ -1391,6 +1411,10 @@ test_session_pseudoref_recovery() {
     '    : >"$PSEUDOREF_MARKER"' \
     '    "$REAL_GIT" -C "$2" update-ref --create-reflog ORIG_HEAD "$REFLOG_OID"' \
     '    "$REAL_GIT" -C "$2" update-ref ORIG_HEAD "$UNIQUE_OID" "$REFLOG_OID"' \
+    '    git_dir=$("$REAL_GIT" -C "$2" rev-parse --absolute-git-dir)' \
+    '    reflog="$git_dir/logs/ORIG_HEAD"' \
+    '    tail -n 1 "$reflog" >"$reflog.last"' \
+    '    mv "$reflog.last" "$reflog"' \
     '  fi' \
     '  ;;' \
     'esac' \
@@ -2493,6 +2517,19 @@ test_relative_tmpdir() {
   echo "PASS: relative TMPDIR is canonicalized before temporary worktree use"
 }
 
+test_session_tmpdir_refusal() {
+  local local_master
+  setup_case session-tmpdir merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  if TMPDIR="$CASE_SESSION" "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "session worktree was accepted as the temporary root"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "session TMPDIR refusal must precede master advancement"
+  assert_topic_preserved
+  echo "PASS: temporary roots inside the session are refused before mutation"
+}
+
 test_config_lock_refusal() {
   setup_case config-lock merge main-off
   : >"$CASE_MAIN/.git/config.lock"
@@ -2501,6 +2538,25 @@ test_config_lock_refusal() {
   fi
   assert_topic_preserved
   echo "PASS: config lock is refused before cleanup"
+}
+
+test_symbolic_repository_config_refusal() {
+  local config_path local_master target
+  setup_case symbolic-repository-config merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  config_path="$CASE_MAIN/.git/config"
+  target="$TEST_ROOT/symbolic-repository-config.target"
+  mv "$config_path" "$target"
+  ln -s "$target" "$config_path"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "symbolic repository configuration was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "symbolic repository config refusal must precede master advancement"
+  [ -L "$config_path" ] || fail "symbolic repository configuration was replaced"
+  assert_topic_preserved
+  echo "PASS: symbolic repository configuration is refused before mutation"
 }
 
 test_symbolic_worktree_config_preflight() {
@@ -2629,6 +2685,15 @@ test_custom_branch_config() {
   echo "PASS: custom branch configuration is preserved"
 }
 
+test_merge_options_cleanup() {
+  setup_case merge-options-cleanup merge main-off
+  git -C "$CASE_MAIN" config branch.topic.mergeOptions --no-edit
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  echo "PASS: standard branch mergeOptions configuration is removed"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
@@ -2671,6 +2736,7 @@ test_initialized_session_submodule_refusal
 test_deinitialized_session_submodule_refusal
 test_initialized_master_submodule_refusal
 test_master_resolve_undo_refusal
+test_assume_unchanged_master_refusal
 test_master_changed_path_failure_refusal
 test_diverged_master_refusal
 test_locked_session_refusal
@@ -2716,7 +2782,9 @@ test_symref_capability_preflight
 test_dangling_capability_ref_refusal
 test_option_like_branch_name
 test_relative_tmpdir
+test_session_tmpdir_refusal
 test_config_lock_refusal
+test_symbolic_repository_config_refusal
 test_symbolic_worktree_config_preflight
 test_ignored_master_collision_refusal
 test_ignored_master_descendant_refusal
@@ -2724,4 +2792,5 @@ test_missing_branch_config
 test_inherited_branch_config
 test_dotted_branch_config
 test_custom_branch_config
+test_merge_options_cleanup
 echo "PASS: all post-merge cleanup states"

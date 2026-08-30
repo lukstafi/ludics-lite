@@ -155,6 +155,30 @@ refuse_index_resolve_undo() {
     fail "$description index has resolve-undo data; resolve or remove it before cleanup: $worktree"
 }
 
+refuse_hidden_index_changes() {
+  local worktree="$1" description="$2" index_path index_dir
+  index_path=$(git -C "$worktree" rev-parse --git-path index) ||
+    fail "could not locate $description index: $worktree"
+  case "$index_path" in
+  /*) ;;
+  *) index_path="$worktree/$index_path" ;;
+  esac
+  index_dir=$(canonical_dir "$(dirname "$index_path")") || exit $?
+  index_path="$index_dir/$(basename "$index_path")"
+  [ ! -L "$index_path" ] || fail "$description index is symbolic: $worktree"
+  [ -f "$index_path" ] || fail "$description index is missing: $worktree"
+  MASTER_INDEX_PROBE=$(mktemp "$index_dir/.ship-pr-index-probe.XXXXXX") ||
+    fail "could not allocate the $description index probe"
+  cp -p "$index_path" "$MASTER_INDEX_PROBE" || fail "could not snapshot the $description index"
+  GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" update-index -q --really-refresh ||
+    fail "could not refresh the $description index snapshot"
+  GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" diff-files \
+    --quiet --ignore-submodules=none -- ||
+    fail "$description has a tracked change hidden by index flags; clean it before cleanup: $worktree"
+  unlink "$MASTER_INDEX_PROBE" || fail "could not remove the $description index probe"
+  MASTER_INDEX_PROBE=""
+}
+
 lock_session_head_for_archive() {
   local raw
   (set -o noclobber; printf '%s\n' "$$" >"$SESSION_HEAD_LOCK") 2>/dev/null || return 1
@@ -236,13 +260,15 @@ retain_topic_reflog_sides() {
 }
 
 retain_session_reflog_sides() {
-  local ref="$1" kind="${2:-private-reflog}" path path_dir line old_oid new_oid rest oid
-  path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "logs/$ref") ||
-    fail "could not locate session-private reflog: $ref"
-  case "$path" in
-  /*) ;;
-  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
-  esac
+  local ref="$1" kind="${2:-private-reflog}" path="${3:-}" path_dir line old_oid new_oid rest oid
+  if [ -z "$path" ]; then
+    path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "logs/$ref") ||
+      fail "could not locate session-private reflog: $ref"
+    case "$path" in
+    /*) ;;
+    *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
+    esac
+  fi
   path_dir=$(dirname "$path")
   if [ ! -d "$path_dir" ]; then
     { [ ! -e "$path" ] && [ ! -L "$path" ]; } || fail "session-private reflog has an invalid parent: $ref"
@@ -260,16 +286,6 @@ retain_session_reflog_sides() {
       esac
     done
   done <"$path"
-}
-
-retain_session_reflog_entries() {
-  local ref="$1" kind="$2" oid oids
-  oids=$(git -C "$SESSION_ARCHIVED_WORKTREE" reflog show --format='%H' "$ref") ||
-    fail "could not enumerate session reflog through Git: $ref"
-  while IFS= read -r oid; do
-    [ -n "$oid" ] || continue
-    retain_session_object "$kind" "$oid"
-  done <<<"$oids"
 }
 
 retain_private_session_refs() {
@@ -401,7 +417,7 @@ delete_ref_with_locked_reflog() {
 
 lock_and_retain_session_metadata() {
   local name path path_dir lock line metadata oid config_snapshot index_snapshot index_tree
-  local shared_index shared_snapshot shared_temp sparse_snapshot
+  local shared_index shared_snapshot shared_temp sparse_snapshot worktree_git_dir
   local reuc_snapshot mode stage old_oid new_oid rest
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
     BISECT_HEAD AUTO_MERGE FETCH_HEAD; do
@@ -418,13 +434,18 @@ lock_and_retain_session_metadata() {
       fail "archived session pseudoref is busy: $name"
     SESSION_PSEUDOREF_LOCKS+=("$lock")
     [ ! -L "$path" ] || fail "archived session pseudoref is symbolic: $name"
-    [ -f "$path" ] || continue
-    while IFS= read -r line || [ -n "$line" ]; do
-      oid=${line%%[[:space:]]*}
-      [ -n "$oid" ] || continue
-      retain_session_object "pseudoref-$name" "$oid"
-    done <"$path"
-    retain_session_reflog_entries "$name" "pseudoref-reflog-$name"
+    if [ -f "$path" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        oid=${line%%[[:space:]]*}
+        [ -n "$oid" ] || continue
+        retain_session_object "pseudoref-$name" "$oid"
+      done <"$path"
+    fi
+    worktree_git_dir=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --absolute-git-dir) ||
+      fail "could not locate archived session Git metadata"
+    worktree_git_dir=$(canonical_dir "$worktree_git_dir") || exit $?
+    retain_session_reflog_sides "$name" "pseudoref-reflog-$name" \
+      "$worktree_git_dir/logs/$name"
   done
 
 
@@ -435,20 +456,22 @@ lock_and_retain_session_metadata() {
   *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
   esac
   path_dir=$(dirname "$path")
-  if [ ! -d "$path_dir" ]; then
-    { [ ! -e "$path" ] && [ ! -L "$path" ]; } || fail "archived session HEAD reflog has an invalid parent"
-    return 0
-  fi
-  path_dir=$(canonical_dir "$path_dir") || exit $?
-  lock="$path_dir/$(basename "$path").lock"
-  (set -o noclobber; printf '%s\n' "$$" >"$lock") 2>/dev/null ||
-    fail "archived per-worktree configuration is busy"
-  SESSION_PSEUDOREF_LOCKS+=("$lock")
-  [ ! -L "$path" ] || fail "archived per-worktree configuration is symbolic"
-  if [ -f "$path" ]; then
-    config_snapshot=$(mktemp "$SESSION_ARCHIVE/config.worktree.XXXXXX") ||
-      fail "could not allocate a per-worktree configuration snapshot"
-    cp "$path" "$config_snapshot" || fail "could not archive per-worktree configuration"
+  if [ -d "$path_dir" ]; then
+    path_dir=$(canonical_dir "$path_dir") || exit $?
+    path="$path_dir/$(basename "$path")"
+    lock="$path.lock"
+    (set -o noclobber; printf '%s\n' "$$" >"$lock") 2>/dev/null ||
+      fail "archived per-worktree configuration is busy"
+    SESSION_PSEUDOREF_LOCKS+=("$lock")
+    [ ! -L "$path" ] || fail "archived per-worktree configuration is symbolic"
+    if [ -f "$path" ]; then
+      config_snapshot=$(mktemp "$SESSION_ARCHIVE/config.worktree.XXXXXX") ||
+        fail "could not allocate a per-worktree configuration snapshot"
+      cp "$path" "$config_snapshot" || fail "could not archive per-worktree configuration"
+    fi
+  else
+    { [ ! -e "$path" ] && [ ! -L "$path" ]; } ||
+      fail "archived per-worktree configuration has an invalid parent"
   fi
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path info/sparse-checkout) ||
@@ -530,18 +553,24 @@ lock_and_retain_session_metadata() {
   /*) ;;
   *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
   esac
-  path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
-  path="$path_dir/$(basename "$path")"
-  [ ! -L "$path" ] || fail "archived session HEAD reflog is symbolic"
-  if [ -f "$path" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do
-      read -r old_oid new_oid rest <<<"$line"
-      for oid in "$old_oid" "$new_oid"; do
-        case "$oid" in
-        *[!0]*) retain_session_object reflog-HEAD "$oid" ;;
-        esac
-      done
-    done <"$path"
+  path_dir=$(dirname "$path")
+  if [ -d "$path_dir" ]; then
+    path_dir=$(canonical_dir "$path_dir") || exit $?
+    path="$path_dir/$(basename "$path")"
+    [ ! -L "$path" ] || fail "archived session HEAD reflog is symbolic"
+    if [ -f "$path" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        read -r old_oid new_oid rest <<<"$line"
+        for oid in "$old_oid" "$new_oid"; do
+          case "$oid" in
+          *[!0]*) retain_session_object reflog-HEAD "$oid" ;;
+          esac
+        done
+      done <"$path"
+    fi
+  else
+    { [ ! -e "$path" ] && [ ! -L "$path" ]; } ||
+      fail "archived session HEAD reflog has an invalid parent"
   fi
 }
 
@@ -596,6 +625,10 @@ cleanup_reservations() {
   fi
   if [ -n "${CHANGED_PATHS_FILE:-}" ] && [ -f "$CHANGED_PATHS_FILE" ]; then
     unlink "$CHANGED_PATHS_FILE" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${MASTER_INDEX_PROBE:-}" ]; then
+    unlink "$MASTER_INDEX_PROBE.lock" >/dev/null 2>&1 || true
+    unlink "$MASTER_INDEX_PROBE" >/dev/null 2>&1 || true
   fi
   if [ "${#SESSION_PSEUDOREF_LOCKS[@]}" -gt 0 ]; then
     for lock in "${SESSION_PSEUDOREF_LOCKS[@]}"; do
@@ -658,6 +691,7 @@ PRIVATE_NAMESPACE_BLOCKERS=()
 CONFIG_LOCK=""
 CONFIG_LOCK_OWNED=0
 CHANGED_PATHS_FILE=""
+MASTER_INDEX_PROBE=""
 trap cleanup_reservations EXIT
 
 [ "$#" -ge 3 ] || usage
@@ -690,6 +724,9 @@ git -C "$SESSION" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
 SESSION_TOPLEVEL=$(canonical_dir "$(git -C "$SESSION" rev-parse --show-toplevel)") || exit $?
 [ "$SESSION" = "$SESSION_TOPLEVEL" ] ||
   fail "session-worktree must be the worktree root ($SESSION_TOPLEVEL), not a directory inside it"
+case "$TEMP_ROOT" in
+"$SESSION" | "$SESSION"/*) fail "temporary root must be outside the session worktree: $TEMP_ROOT" ;;
+esac
 
 MAIN_COMMON=$(git_path "$MAIN" "$(git -C "$MAIN" rev-parse --git-common-dir)") || exit $?
 MAIN_GIT=$(git_path "$MAIN" "$(git -C "$MAIN" rev-parse --git-dir)") || exit $?
@@ -699,6 +736,8 @@ SESSION_COMMON=$(git_path "$SESSION" "$(git -C "$SESSION" rev-parse --git-common
 [ "$SESSION_COMMON" = "$MAIN_COMMON" ] || fail "main checkout and session worktree belong to different repositories"
 REF_FORMAT=$(git -C "$MAIN" rev-parse --show-ref-format) || fail "could not determine repository ref storage"
 [ "$REF_FORMAT" = files ] || fail "cleanup currently requires files ref storage, found: $REF_FORMAT"
+[ ! -L "$MAIN_COMMON/config" ] || fail "repository config is symbolic; replace it before cleanup"
+[ -f "$MAIN_COMMON/config" ] || fail "repository config is missing or not a regular file"
 { [ ! -e "$MAIN_COMMON/config.lock" ] && [ ! -L "$MAIN_COMMON/config.lock" ]; } ||
   fail "repository config is locked; retry after the lock clears"
 command -v perl >/dev/null 2>&1 || fail "Perl is required for atomic session archiving"
@@ -862,6 +901,7 @@ MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status \
   --porcelain --untracked-files=normal --ignored=matching) ||
   fail "could not inspect master owner cleanliness"
 [ -z "$MASTER_OWNER_STATUS" ] || fail "master owner is dirty; clean it before cleanup: $MASTER_OWNER"
+refuse_hidden_index_changes "$MASTER_OWNER" "master owner"
 refuse_initialized_submodules "$MASTER_OWNER" "master owner"
 refuse_index_resolve_undo "$MASTER_OWNER" "master owner"
 IGNORED_COLLISION=""
@@ -1039,7 +1079,7 @@ CONFIG_LOCK="$MAIN_COMMON/config.lock"
   fail "repository config became locked during cleanup; local $BRANCH was preserved"
 CONFIG_LOCK_OWNED=1
 cp -p "$MAIN_COMMON/config" "$CONFIG_LOCK" || fail "could not snapshot repository configuration"
-for BRANCH_CONFIG_KEY in remote merge pushRemote rebase description; do
+for BRANCH_CONFIG_KEY in remote merge mergeOptions pushRemote rebase description; do
   git config --file "$CONFIG_LOCK" --no-includes --get \
     "branch.$BRANCH.$BRANCH_CONFIG_KEY" >/dev/null 2>&1
   CONFIG_GET_STATUS=$?
