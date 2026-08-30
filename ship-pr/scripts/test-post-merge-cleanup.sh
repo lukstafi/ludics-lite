@@ -949,6 +949,25 @@ test_private_worktree_ref_refusal() {
   echo "PASS: session-local worktree ref is refused before unregistering"
 }
 
+test_rewritten_worktree_ref_refusal() {
+  local local_master private_oid
+  setup_case rewritten-worktree-ref merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  private_oid=$(printf 'rewritten worktree commit\n' | git -C "$CASE_SESSION" commit-tree \
+    "$(git -C "$CASE_SESSION" rev-parse HEAD^{tree})" -p "$CASE_TOPIC_OID")
+  git -C "$CASE_SESSION" update-ref refs/rewritten/private "$private_oid"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "session-local rewritten ref was accepted for cleanup"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "rewritten worktree ref refusal must precede master advancement"
+  assert_eq "$(git -C "$CASE_SESSION" rev-parse refs/rewritten/private)" "$private_oid" \
+    "session-local rewritten ref must remain intact"
+  assert_topic_preserved
+  echo "PASS: session-local rewritten ref is refused before unregistering"
+}
+
 test_session_pseudoref_recovery() {
   local unique_oid
   setup_case session-pseudoref-recovery merge main-off
@@ -959,9 +978,80 @@ test_session_pseudoref_recovery() {
   "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
   assert_cleaned
   assert_eq "$(git -C "$CASE_MAIN" rev-parse \
-    "refs/ship-pr/session-pseudoref-recovery/topic/ORIG_HEAD/$unique_oid")" \
+    "refs/ship-pr/session-recovery/topic/pseudoref-ORIG_HEAD-$unique_oid")" \
     "$unique_oid" "session ORIG_HEAD object must remain directly reachable"
   echo "PASS: session pseudoref objects receive recovery refs before unregistering"
+}
+
+test_session_reflog_recovery() {
+  local orig_head unique_oid
+  setup_case session-reflog-recovery merge main-off
+  git -C "$CASE_SESSION" checkout --detach >/dev/null
+  git -C "$CASE_SESSION" commit --allow-empty -m "unique detached reflog commit" >/dev/null
+  unique_oid=$(git -C "$CASE_SESSION" rev-parse HEAD)
+  git -C "$CASE_SESSION" reset --hard "$CASE_TOPIC_OID" >/dev/null
+  git -C "$CASE_SESSION" reset --hard "$CASE_TOPIC_OID" >/dev/null
+  orig_head=$(git -C "$CASE_SESSION" rev-parse ORIG_HEAD)
+  [ "$orig_head" != "$unique_oid" ] || fail "test did not evict the unique commit from ORIG_HEAD"
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse \
+    "refs/ship-pr/session-recovery/topic/reflog-HEAD-$unique_oid")" \
+    "$unique_oid" "session HEAD reflog object must remain directly reachable"
+  echo "PASS: session HEAD reflog objects receive recovery refs before unregistering"
+}
+
+test_session_index_recovery() {
+  local blob_oid fake_bin index_ref index_tree real_git retained_blob
+  setup_case session-index-recovery merge main-off
+  fake_bin="$TEST_ROOT/session-index-recovery-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*.ship-pr-recovery.*/worktree)' \
+    '  if [ "$3" = rev-parse ] && [ "$4" = --git-path ] && [ "$5" = ORIG_HEAD ] && [ ! -e "$INDEX_MARKER" ]; then' \
+    '    blob=$(printf "staged-only bytes\n" | "$REAL_GIT" -C "$RACE_MAIN" hash-object -w --stdin)' \
+    '    "$REAL_GIT" -C "$2" update-index --add --cacheinfo 100644 "$blob" staged-only' \
+    '    printf "%s\n" "$blob" >"$INDEX_MARKER"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    INDEX_MARKER="$TEST_ROOT/session-index-recovery.blob" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  blob_oid=$(cat "$TEST_ROOT/session-index-recovery.blob")
+  index_ref=$(git -C "$CASE_MAIN" for-each-ref --format='%(refname)' \
+    refs/ship-pr/session-recovery/topic | sed -n '/\/index-tree-/ {p;q;}')
+  [ -n "$index_ref" ] || fail "archived session index tree received no recovery ref"
+  index_tree=$(git -C "$CASE_MAIN" rev-parse "$index_ref")
+  retained_blob=$(git -C "$CASE_MAIN" ls-tree "$index_tree" -- staged-only | awk '{print $3}')
+  assert_eq "$retained_blob" "$blob_oid" "staged-only blob must remain reachable from index tree"
+  assert_cleaned
+  echo "PASS: final session index tree receives a recovery ref before unregistering"
+}
+
+test_session_metadata_lock_preflight() {
+  local local_master lock_path
+  setup_case session-metadata-lock-preflight merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  lock_path="$(git -C "$CASE_SESSION" rev-parse --git-path ORIG_HEAD).lock"
+  printf 'another Git operation\n' >"$lock_path"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "pre-existing session pseudoref lock was discovered only after mutation"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "session pseudoref lock refusal must precede master advancement"
+  assert_eq "$(sed -n '1p' "$lock_path")" "another Git operation" \
+    "session pseudoref lock must be preserved"
+  assert_topic_preserved
+  echo "PASS: session pseudoref locks are preflighted before mutation"
 }
 
 test_symbolic_ref_refusal() {
@@ -1706,7 +1796,11 @@ test_initialized_master_submodule_refusal
 test_diverged_master_refusal
 test_locked_session_refusal
 test_private_worktree_ref_refusal
+test_rewritten_worktree_ref_refusal
 test_session_pseudoref_recovery
+test_session_reflog_recovery
+test_session_index_recovery
+test_session_metadata_lock_preflight
 test_symbolic_ref_refusal
 test_remote_master_lease
 test_stale_master_response_retains_recovery

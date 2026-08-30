@@ -56,14 +56,49 @@ refuse_initialized_submodules() {
 refuse_private_worktree_refs() {
   local worktree="$1" private_ref
   private_ref=$(git -C "$worktree" for-each-ref --format='%(refname)' \
-    refs/worktree refs/bisect | sed -n '1p') ||
+    refs/worktree refs/bisect refs/rewritten | sed -n '1p') ||
     fail "could not inspect session-local refs: $worktree"
   [ -z "$private_ref" ] ||
     fail "session worktree has a private ref; remove or retain it before cleanup: $private_ref"
 }
 
-lock_and_retain_session_pseudorefs() {
-  local name path path_dir lock line oid recovery_ref recovery_oid
+preflight_session_metadata_locks() {
+  local name path path_dir lock
+  for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
+    BISECT_HEAD AUTO_MERGE FETCH_HEAD index; do
+    path=$(git -C "$SESSION" rev-parse --git-path "$name") ||
+      fail "could not locate session metadata: $name"
+    case "$path" in
+    /*) ;;
+    *) path="$SESSION/$path" ;;
+    esac
+    path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+    lock="$path_dir/$(basename "$path").lock"
+    { [ ! -e "$lock" ] && [ ! -L "$lock" ]; } ||
+      fail "session metadata is locked; retry after its Git operation finishes: $name"
+  done
+}
+
+retain_session_object() {
+  local kind="$1" oid="$2" recovery_ref recovery_oid
+  git -C "$MAIN" cat-file -e "$oid^{object}" 2>/dev/null ||
+    fail "archived session metadata contains an unreadable object: $kind"
+  recovery_ref="refs/ship-pr/session-recovery/$BRANCH/$kind-$oid"
+  if git -C "$MAIN" symbolic-ref -q "$recovery_ref" >/dev/null 2>&1; then
+    fail "session metadata recovery ref is symbolic rather than direct: $recovery_ref"
+  fi
+  if git -C "$MAIN" show-ref --verify --quiet "$recovery_ref"; then
+    recovery_oid=$(git -C "$MAIN" rev-parse "$recovery_ref") || fail "cannot read $recovery_ref"
+    [ "$recovery_oid" = "$oid" ] ||
+      fail "session metadata recovery points at an unexpected object: $recovery_ref"
+  else
+    git -C "$MAIN" update-ref --no-deref "$recovery_ref" "$oid" "" ||
+      fail "could not retain archived session metadata object: $recovery_ref"
+  fi
+}
+
+lock_and_retain_session_metadata() {
+  local name path path_dir lock line oid index_snapshot index_tree reflog_oids
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
     BISECT_HEAD AUTO_MERGE FETCH_HEAD; do
     path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "$name") ||
@@ -83,23 +118,34 @@ lock_and_retain_session_pseudorefs() {
     while IFS= read -r line || [ -n "$line" ]; do
       oid=${line%%[[:space:]]*}
       [ -n "$oid" ] || continue
-      git -C "$MAIN" cat-file -e "$oid^{object}" 2>/dev/null ||
-        fail "archived session pseudoref contains an unreadable object: $name"
-      recovery_ref="refs/ship-pr/session-pseudoref-recovery/$BRANCH/$name/$oid"
-      if git -C "$MAIN" symbolic-ref -q "$recovery_ref" >/dev/null 2>&1; then
-        fail "session pseudoref recovery ref is symbolic rather than direct: $recovery_ref"
-      fi
-      if git -C "$MAIN" show-ref --verify --quiet "$recovery_ref"; then
-        recovery_oid=$(git -C "$MAIN" rev-parse "$recovery_ref") ||
-          fail "cannot read $recovery_ref"
-        [ "$recovery_oid" = "$oid" ] ||
-          fail "session pseudoref recovery points at an unexpected object: $recovery_ref"
-      else
-        git -C "$MAIN" update-ref --no-deref "$recovery_ref" "$oid" "" ||
-          fail "could not retain archived session pseudoref object: $recovery_ref"
-      fi
+      retain_session_object "pseudoref-$name" "$oid"
     done <"$path"
   done
+
+  path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path index) ||
+    fail "could not locate archived session index"
+  case "$path" in
+  /*) ;;
+  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
+  esac
+  path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+  lock="$path_dir/$(basename "$path").lock"
+  (set -o noclobber; printf '%s\n' "$$" >"$lock") 2>/dev/null ||
+    fail "archived session index is busy"
+  SESSION_PSEUDOREF_LOCKS+=("$lock")
+  index_snapshot=$(mktemp "$SESSION_ARCHIVE/index.snapshot.XXXXXX") ||
+    fail "could not allocate an archived session index snapshot"
+  cp "$path" "$index_snapshot" || fail "could not copy the locked archived session index"
+  index_tree=$(GIT_INDEX_FILE="$index_snapshot" git -C "$SESSION_ARCHIVED_WORKTREE" write-tree) ||
+    fail "could not retain the archived session index"
+  retain_session_object index-tree "$index_tree"
+
+  reflog_oids=$(git -C "$SESSION_ARCHIVED_WORKTREE" reflog show --format='%H' HEAD) ||
+    fail "could not inspect the archived session HEAD reflog"
+  while IFS= read -r oid; do
+    [ -n "$oid" ] || continue
+    retain_session_object reflog-HEAD "$oid"
+  done <<<"$reflog_oids"
 }
 
 scan_branch_owner() {
@@ -262,6 +308,7 @@ SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal -
 [ -z "$SESSION_STATUS" ] || fail "session worktree is dirty; commit, stash, or remove its changes before cleanup"
 refuse_initialized_submodules "$SESSION" "session worktree"
 refuse_private_worktree_refs "$SESSION"
+preflight_session_metadata_locks
 
 SESSION_HEAD_PATH=$(git -C "$SESSION" rev-parse --git-path HEAD) || fail "cannot locate session HEAD"
 case "$SESSION_HEAD_PATH" in
@@ -627,7 +674,7 @@ SESSION_HEAD_LOCK="$SESSION_HEAD_DIR/$(basename "$SESSION_HEAD_PATH").lock"
 (set -o noclobber; printf '%s\n' "$$" >"$SESSION_HEAD_LOCK") 2>/dev/null ||
   fail "archived session HEAD is busy; its worktree metadata was preserved"
 SESSION_HEAD_LOCK_OWNED=1
-lock_and_retain_session_pseudorefs
+lock_and_retain_session_metadata
 SESSION_FINAL_HEAD=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse HEAD) ||
   fail "could not read the archived session's final HEAD"
 SESSION_RECOVERY_REF="refs/ship-pr/session-recovery/$BRANCH/$SESSION_FINAL_HEAD"
