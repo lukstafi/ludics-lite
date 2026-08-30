@@ -53,6 +53,20 @@ refuse_initialized_submodules() {
   done <<<"$status"
 }
 
+refuse_session_module_gitdirs() {
+  local worktree="$1" git_dir modules first
+  git_dir=$(git -C "$worktree" rev-parse --absolute-git-dir) ||
+    fail "could not locate session worktree metadata: $worktree"
+  modules="$git_dir/modules"
+  { [ ! -e "$modules" ] && [ ! -L "$modules" ]; } && return 0
+  [ ! -L "$modules" ] || fail "session submodule repository root is symbolic: $modules"
+  [ -d "$modules" ] || fail "session submodule repository root is not a directory: $modules"
+  first=$(find "$modules" -mindepth 1 -print -quit) ||
+    fail "could not inspect residual session submodule repositories: $modules"
+  [ -z "$first" ] ||
+    fail "session has a residual submodule repository; retain or remove it before cleanup: $first"
+}
+
 refuse_private_worktree_refs() {
   local worktree="$1" private_ref
   private_ref=$(git -C "$worktree" for-each-ref --format='%(refname)' \
@@ -151,41 +165,41 @@ retain_private_session_refs() {
   done <<<"$private_refs"
 }
 
-delete_topic_with_locked_reflog() {
-  local response
-  TOPIC_TRANSACTION_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-topic-transaction.XXXXXX") ||
-    fail "could not allocate the topic deletion transaction"
-  TOPIC_TRANSACTION_IN="$TOPIC_TRANSACTION_DIR/input"
-  TOPIC_TRANSACTION_OUT="$TOPIC_TRANSACTION_DIR/output"
-  mkfifo "$TOPIC_TRANSACTION_IN" "$TOPIC_TRANSACTION_OUT" ||
-    fail "could not create the topic deletion transaction channels"
-  git -C "$MAIN" update-ref --stdin <"$TOPIC_TRANSACTION_IN" >"$TOPIC_TRANSACTION_OUT" &
-  TOPIC_TRANSACTION_PID=$!
-  exec 7>"$TOPIC_TRANSACTION_IN" || fail "could not open the topic transaction input"
-  exec 8<"$TOPIC_TRANSACTION_OUT" || fail "could not open the topic transaction output"
+delete_ref_with_locked_reflog() {
+  local ref="$1" expected_oid="$2" kind="$3" response
+  REF_TRANSACTION_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-ref-transaction.XXXXXX") ||
+    fail "could not allocate the ref deletion transaction: $ref"
+  REF_TRANSACTION_IN="$REF_TRANSACTION_DIR/input"
+  REF_TRANSACTION_OUT="$REF_TRANSACTION_DIR/output"
+  mkfifo "$REF_TRANSACTION_IN" "$REF_TRANSACTION_OUT" ||
+    fail "could not create the ref deletion transaction channels: $ref"
+  git -C "$MAIN" update-ref --stdin <"$REF_TRANSACTION_IN" >"$REF_TRANSACTION_OUT" &
+  REF_TRANSACTION_PID=$!
+  exec 7>"$REF_TRANSACTION_IN" || fail "could not open the ref transaction input: $ref"
+  exec 8<"$REF_TRANSACTION_OUT" || fail "could not open the ref transaction output: $ref"
 
-  printf 'start\noption no-deref\ndelete refs/heads/%s %s\nprepare\n' \
-    "$BRANCH" "$LOCAL_BRANCH_OID" >&7 || fail "could not prepare the topic deletion"
-  IFS= read -r response <&8 || fail "topic deletion transaction stopped before start"
-  [ "$response" = "start: ok" ] || fail "topic deletion transaction did not start: $response"
-  IFS= read -r response <&8 || fail "topic deletion transaction stopped before preparation"
-  [ "$response" = "prepare: ok" ] || fail "topic deletion transaction was not prepared: $response"
+  printf 'start\noption no-deref\ndelete %s %s\nprepare\n' "$ref" "$expected_oid" >&7 ||
+    fail "could not prepare the ref deletion: $ref"
+  IFS= read -r response <&8 || fail "ref deletion transaction stopped before start: $ref"
+  [ "$response" = "start: ok" ] || fail "ref deletion transaction did not start: $ref: $response"
+  IFS= read -r response <&8 || fail "ref deletion transaction stopped before preparation: $ref"
+  [ "$response" = "prepare: ok" ] || fail "ref deletion transaction was not prepared: $ref: $response"
 
-  # prepare holds the topic ref and reflog locks. Retain every reflog endpoint while neither can
+  # prepare holds the ref and reflog locks. Retain every reflog endpoint while neither can
   # change, then commit the already-validated deletion without an ABA window between those steps.
-  retain_topic_reflog_sides "refs/heads/$BRANCH" topic-reflog
-  printf 'commit\n' >&7 || fail "could not commit the topic deletion"
-  IFS= read -r response <&8 || fail "topic deletion transaction stopped before commit"
-  [ "$response" = "commit: ok" ] || fail "topic deletion transaction did not commit: $response"
+  retain_topic_reflog_sides "$ref" "$kind"
+  printf 'commit\n' >&7 || fail "could not commit the ref deletion: $ref"
+  IFS= read -r response <&8 || fail "ref deletion transaction stopped before commit: $ref"
+  [ "$response" = "commit: ok" ] || fail "ref deletion transaction did not commit: $ref: $response"
   exec 7>&- 8<&-
-  wait "$TOPIC_TRANSACTION_PID" || fail "topic deletion transaction failed"
-  TOPIC_TRANSACTION_PID=""
-  unlink "$TOPIC_TRANSACTION_IN" || fail "could not remove the topic transaction input"
-  unlink "$TOPIC_TRANSACTION_OUT" || fail "could not remove the topic transaction output"
-  TOPIC_TRANSACTION_IN=""
-  TOPIC_TRANSACTION_OUT=""
-  rmdir "$TOPIC_TRANSACTION_DIR" || fail "could not remove the topic transaction directory"
-  TOPIC_TRANSACTION_DIR=""
+  wait "$REF_TRANSACTION_PID" || fail "ref deletion transaction failed: $ref"
+  REF_TRANSACTION_PID=""
+  unlink "$REF_TRANSACTION_IN" || fail "could not remove the ref transaction input: $ref"
+  unlink "$REF_TRANSACTION_OUT" || fail "could not remove the ref transaction output: $ref"
+  REF_TRANSACTION_IN=""
+  REF_TRANSACTION_OUT=""
+  rmdir "$REF_TRANSACTION_DIR" || fail "could not remove the ref transaction directory: $ref"
+  REF_TRANSACTION_DIR=""
 }
 
 lock_and_retain_session_metadata() {
@@ -335,15 +349,15 @@ restore_remote_topic() {
 
 cleanup_reservations() {
   local lock
-  if [ -n "${TOPIC_TRANSACTION_PID:-}" ]; then
-    kill "$TOPIC_TRANSACTION_PID" >/dev/null 2>&1 || true
+  if [ -n "${REF_TRANSACTION_PID:-}" ]; then
+    kill "$REF_TRANSACTION_PID" >/dev/null 2>&1 || true
     exec 7>&- 8<&-
-    wait "$TOPIC_TRANSACTION_PID" >/dev/null 2>&1 || true
-    TOPIC_TRANSACTION_PID=""
+    wait "$REF_TRANSACTION_PID" >/dev/null 2>&1 || true
+    REF_TRANSACTION_PID=""
   fi
-  [ -z "${TOPIC_TRANSACTION_IN:-}" ] || unlink "$TOPIC_TRANSACTION_IN" >/dev/null 2>&1 || true
-  [ -z "${TOPIC_TRANSACTION_OUT:-}" ] || unlink "$TOPIC_TRANSACTION_OUT" >/dev/null 2>&1 || true
-  [ -z "${TOPIC_TRANSACTION_DIR:-}" ] || rmdir "$TOPIC_TRANSACTION_DIR" >/dev/null 2>&1 || true
+  [ -z "${REF_TRANSACTION_IN:-}" ] || unlink "$REF_TRANSACTION_IN" >/dev/null 2>&1 || true
+  [ -z "${REF_TRANSACTION_OUT:-}" ] || unlink "$REF_TRANSACTION_OUT" >/dev/null 2>&1 || true
+  [ -z "${REF_TRANSACTION_DIR:-}" ] || rmdir "$REF_TRANSACTION_DIR" >/dev/null 2>&1 || true
   if [ "${#SESSION_PSEUDOREF_LOCKS[@]}" -gt 0 ]; then
     for lock in "${SESSION_PSEUDOREF_LOCKS[@]}"; do
       [ ! -f "$lock" ] || unlink "$lock" >/dev/null 2>&1 || true
@@ -397,10 +411,10 @@ SESSION_NAMESPACE_RESERVATION=""
 SESSION_NAMESPACE_RESERVATION_OWNED=0
 SESSION_PSEUDOREF_LOCKS=()
 TOPIC_RESERVATION=""
-TOPIC_TRANSACTION_DIR=""
-TOPIC_TRANSACTION_IN=""
-TOPIC_TRANSACTION_OUT=""
-TOPIC_TRANSACTION_PID=""
+REF_TRANSACTION_DIR=""
+REF_TRANSACTION_IN=""
+REF_TRANSACTION_OUT=""
+REF_TRANSACTION_PID=""
 trap cleanup_reservations EXIT
 
 [ "$#" -ge 3 ] || usage
@@ -476,6 +490,7 @@ SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal -
   fail "could not inspect session worktree cleanliness"
 [ -z "$SESSION_STATUS" ] || fail "session worktree is dirty; commit, stash, or remove its changes before cleanup"
 refuse_initialized_submodules "$SESSION" "session worktree"
+refuse_session_module_gitdirs "$SESSION"
 refuse_private_worktree_refs "$SESSION"
 preflight_session_metadata_locks
 
@@ -756,8 +771,8 @@ if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
     fail "origin/$BRANCH tracking ref appeared during cleanup; its new tip was preserved"
   [ "$CURRENT_TRACKING_BRANCH_OID" = "$TRACKING_BRANCH_OID" ] ||
     fail "origin/$BRANCH tracking ref moved during cleanup; its new tip was preserved"
-  git -C "$MAIN" update-ref --no-deref -d "refs/remotes/origin/$BRANCH" "$TRACKING_BRANCH_OID" ||
-    fail "origin/$BRANCH tracking ref changed while pruning it"
+  delete_ref_with_locked_reflog "refs/remotes/origin/$BRANCH" \
+    "$TRACKING_BRANCH_OID" tracking-reflog
 fi
 
 # Inspect only the repository-local file that removal edits. Git flattens dotted subsection names,
@@ -802,7 +817,8 @@ if ! git -C "$TOPIC_RESERVATION" switch -- "$BRANCH" >/dev/null 2>&1; then
   CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH" 2>/dev/null || true)
   [ -n "$CURRENT_TOPIC_OID" ] && restore_remote_topic "$CURRENT_TOPIC_OID" ||
     fail "topic reservation failed, and its remote recovery ref could not be restored"
-  [ -z "$SESSION_REF" ] || git -C "$SESSION" switch -- "$BRANCH" >/dev/null 2>&1 || true
+  [ -z "$SESSION_REF" ] ||
+    git -C "$SESSION" switch --no-overwrite-ignore -- "$BRANCH" >/dev/null 2>&1 || true
   fail "could not reserve local $BRANCH for deletion; its remote ref was restored"
 fi
 CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
@@ -810,7 +826,8 @@ if [ "$CURRENT_TOPIC_OID" != "$LOCAL_BRANCH_OID" ]; then
   git -C "$TOPIC_RESERVATION" checkout --detach "$LOCAL_BRANCH_OID" >/dev/null 2>&1 || true
   git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
   TOPIC_RESERVATION=""
-  [ -z "$SESSION_REF" ] || git -C "$SESSION" switch -- "$BRANCH" >/dev/null 2>&1 || true
+  [ -z "$SESSION_REF" ] ||
+    git -C "$SESSION" switch --no-overwrite-ignore -- "$BRANCH" >/dev/null 2>&1 || true
   restore_remote_topic "$CURRENT_TOPIC_OID" ||
     fail "local $BRANCH moved during ownership handoff, and its new tip could not be restored remotely"
   fail "local $BRANCH moved during ownership handoff; its session and remote tip were preserved"
@@ -882,7 +899,7 @@ SESSION_HEAD_LOCK=""
 SESSION_PSEUDOREF_LOCKS=()
 [ -d "$SESSION_ARCHIVED_WORKTREE" ] || fail "session recovery archive disappeared: $SESSION_ARCHIVED_WORKTREE"
 
-delete_topic_with_locked_reflog
+delete_ref_with_locked_reflog "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" topic-reflog
 git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" ||
   fail "local $BRANCH was deleted but its temporary reservation could not be removed"
 TOPIC_RESERVATION=""

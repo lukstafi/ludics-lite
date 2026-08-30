@@ -901,6 +901,54 @@ test_ignored_data_during_topic_detach() {
   echo "PASS: topic detach refuses ignored data and restores the current remote tip"
 }
 
+test_ignored_data_during_topic_reattach() {
+  local blob fake_bin index_file log new_topic_oid real_git remote_topic_oid tree
+  setup_case ignored-data-during-topic-reattach merge main-off
+  echo /ignored-collision >>"$CASE_MAIN/.git/info/exclude"
+  blob=$(printf 'branch bytes\n' | git -C "$CASE_MAIN" hash-object -w --stdin)
+  index_file=$(mktemp "$TEST_ROOT/topic-reattach-index.XXXXXX")
+  GIT_INDEX_FILE="$index_file" git -C "$CASE_MAIN" read-tree "$CASE_TOPIC_OID"
+  GIT_INDEX_FILE="$index_file" git -C "$CASE_MAIN" update-index \
+    --add --cacheinfo 100644 "$blob" ignored-collision
+  tree=$(GIT_INDEX_FILE="$index_file" git -C "$CASE_MAIN" write-tree)
+  unlink "$index_file"
+  new_topic_oid=$(printf 'advance topic during ownership handoff\n' |
+    git -C "$CASE_MAIN" commit-tree "$tree" -p "$CASE_TOPIC_OID")
+  fake_bin="$TEST_ROOT/ignored-data-during-topic-reattach-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/ignored-data-during-topic-reattach.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*ship-pr-topic-reserve*)' \
+    '  if [ "$3" = switch ] && [ "$5" = topic ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '    : >"$RACE_MARKER"' \
+    '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/topic "$RACE_OID" "$TOPIC_OID"' \
+    '    printf "irreplaceable local bytes\n" >"$RACE_SESSION/ignored-collision"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    RACE_SESSION="$CASE_SESSION" RACE_OID="$new_topic_oid" TOPIC_OID="$CASE_TOPIC_OID" \
+    RACE_MARKER="$TEST_ROOT/ignored-data-during-topic-reattach.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "topic ownership race unexpectedly completed cleanup"
+  fi
+  [ -e "$TEST_ROOT/ignored-data-during-topic-reattach.injected" ] ||
+    fail "topic reattachment race was not injected"
+  assert_eq "$(sed -n '1p' "$CASE_SESSION/ignored-collision")" "irreplaceable local bytes" \
+    "topic reattachment must not overwrite ignored session data"
+  remote_topic_oid=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
+  assert_eq "$remote_topic_oid" "$new_topic_oid" \
+    "topic reattachment refusal must restore the concurrently advanced tip remotely"
+  assert_topic_preserved
+  echo "PASS: topic reattachment refuses to overwrite ignored session data"
+}
+
 test_initialized_session_submodule_refusal() {
   local local_master sub_remote sub_seed unique_submodule_oid
   setup_case initialized-session-submodule merge main-off
@@ -942,6 +990,62 @@ test_initialized_session_submodule_refusal() {
     fail "unique linked-worktree submodule commit was lost"
   assert_topic_preserved
   echo "PASS: initialized session submodule is refused before mutation"
+}
+
+test_deinitialized_session_submodule_refusal() {
+  local local_master log session_git_dir status sub_remote sub_seed unique_submodule_oid
+  setup_case deinitialized-session-submodule merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  sub_remote="$CASE_ROOT/submodule.git"
+  sub_seed="$CASE_ROOT/submodule-seed"
+  git init --bare "$sub_remote" >/dev/null
+  git -C "$sub_remote" symbolic-ref HEAD refs/heads/main
+  git init -b main "$sub_seed" >/dev/null
+  git_config "$sub_seed"
+  echo submodule-base >"$sub_seed/payload"
+  git -C "$sub_seed" add payload
+  git -C "$sub_seed" commit -m "submodule base" >/dev/null
+  git -C "$sub_seed" remote add origin "$sub_remote"
+  git -C "$sub_seed" push -u origin main >/dev/null
+  git -c protocol.file.allow=always -C "$CASE_SESSION" submodule add \
+    "$sub_remote" nested >/dev/null
+  git -C "$CASE_SESSION" commit -m "add deinitialized submodule" >/dev/null
+  git -C "$CASE_SESSION" push origin topic >/dev/null
+  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
+  git -C "$CASE_INTEGRATOR" fetch origin topic >/dev/null
+  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge deinitialized submodule" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  git_config "$CASE_SESSION/nested"
+  echo unique >>"$CASE_SESSION/nested/payload"
+  git -C "$CASE_SESSION/nested" add payload
+  git -C "$CASE_SESSION/nested" commit -m "unique deinitialized submodule commit" >/dev/null
+  unique_submodule_oid=$(git -C "$CASE_SESSION/nested" rev-parse HEAD)
+  session_git_dir=$(git -C "$CASE_SESSION" rev-parse --absolute-git-dir)
+  git -C "$CASE_SESSION" submodule deinit --force nested >/dev/null
+  status=$(git -C "$CASE_SESSION" submodule status nested)
+  case "$status" in
+  -*) ;;
+  *) fail "test did not deinitialize the submodule checkout" ;;
+  esac
+  [ -z "$(git -C "$CASE_SESSION" status --porcelain --untracked-files=normal --ignored=matching)" ] ||
+    fail "deinitialized submodule did not leave the intended clean superproject"
+  git --git-dir="$session_git_dir/modules/nested" cat-file -e "$unique_submodule_oid^{commit}" ||
+    fail "test residual submodule repository lost its unique commit before cleanup"
+  log="$TEST_ROOT/deinitialized-session-submodule.log"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "deinitialized session submodule repository was accepted for cleanup"
+  fi
+  case "$(cat "$log")" in
+  *"session has a residual submodule repository"*) ;;
+  *) fail "deinitialized submodule test did not reach the residual-repository refusal" ;;
+  esac
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "residual submodule refusal must precede master advancement"
+  git --git-dir="$session_git_dir/modules/nested" cat-file -e "$unique_submodule_oid^{commit}" ||
+    fail "unique deinitialized submodule commit was lost"
+  assert_topic_preserved
+  echo "PASS: residual deinitialized submodule repository is refused before mutation"
 }
 
 test_initialized_master_submodule_refusal() {
@@ -1816,6 +1920,42 @@ test_tracking_reflog_recovery() {
   echo "PASS: remote-tracking reflog objects receive recovery refs before pruning"
 }
 
+test_tracking_reflog_locked_through_deletion() {
+  local attempted_oid fake_bin real_git status
+  setup_case tracking-reflog-delete-lock merge main-off
+  attempted_oid=$(printf 'competing tracking ABA update\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
+  fake_bin="$TEST_ROOT/tracking-reflog-delete-lock-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = rev-parse ] && [ "$4" = --git-path ] && [ "$5" = logs/refs/remotes/origin/topic ]; then' \
+    '  count=0' \
+    '  [ ! -f "$COUNT_MARKER" ] || count=$(cat "$COUNT_MARKER")' \
+    '  count=$((count + 1))' \
+    '  printf "%s\n" "$count" >"$COUNT_MARKER"' \
+    '  if [ "$count" -eq 2 ]; then' \
+    '    if "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/remotes/origin/topic "$RACE_OID" "$TOPIC_OID" >/dev/null 2>&1; then status=0; else status=$?; fi' \
+    '    printf "%s\n" "$status" >"$STATUS_MARKER"' \
+    '  fi' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    RACE_OID="$attempted_oid" TOPIC_OID="$CASE_TOPIC_OID" \
+    COUNT_MARKER="$TEST_ROOT/tracking-reflog-delete-lock.count" \
+    STATUS_MARKER="$TEST_ROOT/tracking-reflog-delete-lock.status" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  [ -f "$TEST_ROOT/tracking-reflog-delete-lock.status" ] ||
+    fail "test never attempted a tracking update during the locked reflog read"
+  status=$(cat "$TEST_ROOT/tracking-reflog-delete-lock.status")
+  [ "$status" -ne 0 ] || fail "competing tracking update succeeded during reflog retention"
+  assert_cleaned
+  echo "PASS: tracking ref and reflog stay locked together through deletion"
+}
+
 test_topic_reflog_recovery() {
   local reflog_oid
   setup_case topic-reflog-recovery merge main-off
@@ -2095,7 +2235,9 @@ test_master_reattach_compare_and_swap
 test_master_reattach_verifies_named_branch
 test_ignored_data_during_master_detach
 test_ignored_data_during_topic_detach
+test_ignored_data_during_topic_reattach
 test_initialized_session_submodule_refusal
+test_deinitialized_session_submodule_refusal
 test_initialized_master_submodule_refusal
 test_diverged_master_refusal
 test_locked_session_refusal
@@ -2128,6 +2270,7 @@ test_dangling_config_lock_preflight
 test_divergent_tracking_tip_recovery
 test_tracking_tip_move_refusal
 test_tracking_reflog_recovery
+test_tracking_reflog_locked_through_deletion
 test_topic_reflog_recovery
 test_topic_reflog_locked_through_deletion
 test_symref_capability_preflight
