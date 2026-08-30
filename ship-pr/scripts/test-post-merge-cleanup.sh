@@ -688,6 +688,38 @@ test_master_handoff_stays_reserved() {
   echo "PASS: master remains owned across reservation removal"
 }
 
+test_master_reattach_compare_and_swap() {
+  local alternate_oid fake_bin local_master real_git log
+  setup_case master-reattach-cas merge other
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" branch alternate "$local_master"
+  alternate_oid=$(git -C "$CASE_MAIN" rev-parse refs/heads/alternate)
+  fake_bin="$TEST_ROOT/master-reattach-cas-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/master-reattach-cas.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = update-ref ] && [ "$4" = --stdin ]; then' \
+    '  case "$2" in' \
+    '  */master-owner) "$REAL_GIT" -C "$MASTER_OWNER" checkout alternate >/dev/null 2>&1 ;;' \
+    '  esac' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_OWNER="$CASE_MASTER_OWNER" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "master reattachment overwrote a concurrently switched HEAD"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/alternate)" "$alternate_oid" \
+    "compare-and-swap refusal must not advance the competing branch"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
+    "failure recovery must safely reattach the original owner"
+  assert_topic_preserved
+  echo "PASS: master reattachment uses a detached-HEAD compare-and-swap"
+}
+
 test_ignored_data_during_master_detach() {
   local fake_bin local_master log real_git
   setup_case ignored-data-during-master-detach merge other
@@ -986,7 +1018,7 @@ test_detached_session_head_recovery() {
     '#!/usr/bin/env bash' \
     'case "$2" in' \
     '*.ship-pr-recovery.*/worktree)' \
-    '  if [ "$3" = rev-parse ] && [ "$4" = HEAD ] && [ ! -e "$HEAD_MARKER" ]; then' \
+    '  if [ "$3" = rev-parse ] && [ "$4" = --git-path ] && [ "$5" = HEAD ] && [ ! -e "$HEAD_MARKER" ]; then' \
     '    "$REAL_GIT" -C "$2" commit --allow-empty -m "late detached session commit" >/dev/null' \
     '    "$REAL_GIT" -C "$2" rev-parse HEAD >"$HEAD_MARKER"' \
     '  fi' \
@@ -1004,6 +1036,39 @@ test_detached_session_head_recovery() {
     "late detached session HEAD must remain reachable after unregistering"
   assert_cleaned
   echo "PASS: final detached session HEAD receives a direct recovery ref"
+}
+
+test_session_head_locked_through_unregister() {
+  local archive commit_status fake_bin real_git
+  setup_case session-head-lock merge main-off
+  fake_bin="$TEST_ROOT/session-head-lock-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = worktree ] && [ "$4" = remove ]; then' \
+    '  case "$*" in' \
+    '  */session*)' \
+    '    for archive in "$RACE_ROOT"/.session.ship-pr-recovery.*/worktree; do' \
+    '      [ -d "$archive" ] || continue' \
+    '      "$REAL_GIT" -C "$archive" commit --allow-empty -m "too-late detached commit" >/dev/null 2>&1' \
+    '      echo "$?" >"$COMMIT_MARKER"' \
+    '    done' \
+    '    ;;' \
+    '  esac' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_ROOT="$CASE_ROOT" \
+    COMMIT_MARKER="$TEST_ROOT/session-head-lock.status" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  commit_status=$(cat "$TEST_ROOT/session-head-lock.status")
+  [ "$commit_status" -ne 0 ] || fail "archived session HEAD advanced after its final recovery read"
+  assert_cleaned
+  archive="$CASE_ARCHIVE/worktree"
+  [ -f "$archive/value" ] || fail "locked session archive lost its worktree files"
+  echo "PASS: archived session HEAD is locked through unregistering"
 }
 
 test_archive_preflight_refusal() {
@@ -1195,6 +1260,7 @@ test_preexisting_ignored_master_data
 test_master_owner_switch_refusal
 test_master_update_failure_reattaches_owner
 test_master_handoff_stays_reserved
+test_master_reattach_compare_and_swap
 test_ignored_data_during_master_detach
 test_diverged_master_refusal
 test_locked_session_refusal
@@ -1206,6 +1272,7 @@ test_topic_reservation
 test_ignored_write_at_session_removal
 test_dangling_link_at_session_removal
 test_detached_session_head_recovery
+test_session_head_locked_through_unregister
 test_archive_preflight_refusal
 test_option_like_branch_name
 test_relative_tmpdir

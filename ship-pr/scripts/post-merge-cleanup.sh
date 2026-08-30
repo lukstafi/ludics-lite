@@ -65,6 +65,9 @@ restore_remote_topic() {
 }
 
 cleanup_reservations() {
+  if [ -n "${SESSION_HEAD_LOCK:-}" ] && [ -f "$SESSION_HEAD_LOCK" ]; then
+    unlink "$SESSION_HEAD_LOCK" >/dev/null 2>&1 || true
+  fi
   if [ -n "${TOPIC_RESERVATION:-}" ] && [ -d "$TOPIC_RESERVATION" ]; then
     git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
   fi
@@ -81,6 +84,7 @@ cleanup_reservations() {
 
 MASTER_RESERVATION=""
 ORIGINAL_MASTER_DETACHED=0
+SESSION_HEAD_LOCK=""
 TOPIC_RESERVATION=""
 trap cleanup_reservations EXIT
 
@@ -283,8 +287,9 @@ if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
     fail "could not recheck the detached original master owner"
   [ -z "$MASTER_OWNER_STATUS" ] ||
     fail "master owner gained local data during its update; the data was preserved: $ORIGINAL_MASTER_OWNER"
-  git -C "$ORIGINAL_MASTER_OWNER" symbolic-ref HEAD refs/heads/master ||
-    fail "could not reattach the prepared original master owner"
+  printf 'symref-update HEAD refs/heads/master oid %s\n' "$REMOTE_MASTER" |
+    git -C "$ORIGINAL_MASTER_OWNER" update-ref --stdin ||
+    fail "original master owner changed after preparation; its HEAD was not rewritten"
   ORIGINAL_MASTER_DETACHED=0
 fi
 git -C "$MAIN" worktree remove --force "$MASTER_RESERVATION" ||
@@ -424,6 +429,19 @@ fi
 cd "$TEMP_ROOT" || fail "cannot move out of the session worktree before archiving it"
 SESSION_ARCHIVED_WORKTREE="$SESSION_ARCHIVE/worktree"
 mv "$SESSION" "$SESSION_ARCHIVED_WORKTREE" || fail "could not archive session worktree: $SESSION"
+# Prevent a detached commit from advancing the archived session after the final read. Removing a
+# missing worktree unregisters its metadata without consulting this ref lock, so the exact HEAD can
+# be retained before that metadata (including the lock) disappears.
+SESSION_HEAD_PATH=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path HEAD) ||
+  fail "could not locate the archived session HEAD"
+case "$SESSION_HEAD_PATH" in
+/*) ;;
+*) SESSION_HEAD_PATH="$SESSION_ARCHIVED_WORKTREE/$SESSION_HEAD_PATH" ;;
+esac
+SESSION_HEAD_DIR=$(canonical_dir "$(dirname "$SESSION_HEAD_PATH")") || exit $?
+SESSION_HEAD_LOCK="$SESSION_HEAD_DIR/$(basename "$SESSION_HEAD_PATH").lock"
+(set -o noclobber; printf '%s\n' "$$" >"$SESSION_HEAD_LOCK") 2>/dev/null ||
+  fail "archived session HEAD is busy; its worktree metadata was preserved"
 SESSION_FINAL_HEAD=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse HEAD) ||
   fail "could not read the archived session's final HEAD"
 SESSION_RECOVERY_REF="refs/ship-pr/session-recovery/$BRANCH/$SESSION_FINAL_HEAD"
@@ -450,6 +468,7 @@ else
   rmdir "$LATE_SESSION_ARCHIVE" || fail "unused late-data archive could not be removed"
   LATE_SESSION_ARCHIVE=""
 fi
+SESSION_HEAD_LOCK=""
 [ -d "$SESSION_ARCHIVED_WORKTREE" ] || fail "session recovery archive disappeared: $SESSION_ARCHIVED_WORKTREE"
 
 git -C "$MAIN" update-ref --no-deref -d "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" ||
