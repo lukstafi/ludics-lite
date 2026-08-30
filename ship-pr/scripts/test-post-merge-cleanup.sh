@@ -781,6 +781,48 @@ test_master_reattach_compare_and_swap() {
   echo "PASS: master reattachment uses a detached-HEAD compare-and-swap"
 }
 
+test_master_reattach_verifies_named_branch() {
+  local competitor_oid fake_bin real_git remote_master
+  setup_case master-reattach-named-ref-cas merge other
+  remote_master=$(git -C "$CASE_INTEGRATOR" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" fetch origin refs/heads/master:refs/remotes/origin/master >/dev/null
+  competitor_oid=$(printf 'competing master update before reattachment\n' |
+    git -C "$CASE_MAIN" commit-tree "$(git -C "$CASE_MAIN" rev-parse "$remote_master^{tree}")" \
+      -p "$remote_master")
+  fake_bin="$TEST_ROOT/master-reattach-named-ref-cas-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*/master-owner)' \
+    '  if [ "$3" = update-ref ] && [ "$4" = --stdin ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '    : >"$RACE_MARKER"' \
+    '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/master "$RACE_OID" "$REMOTE_MASTER"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+    RACE_MAIN="$CASE_MAIN" RACE_OID="$competitor_oid" REMOTE_MASTER="$remote_master" \
+    RACE_MARKER="$TEST_ROOT/master-reattach-named-ref-cas.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "master reattachment ignored a concurrent named-branch update"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$competitor_oid" \
+    "master reattachment must preserve a concurrently advanced named branch"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
+    "failure recovery must reattach the original owner to the current master"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse HEAD)" "$competitor_oid" \
+    "failure recovery must use the concurrent master tip"
+  [ -z "$(git -C "$CASE_MASTER_OWNER" status --porcelain --untracked-files=all)" ] ||
+    fail "failure recovery left the original master owner dirty"
+  assert_topic_preserved
+  echo "PASS: master reattachment verifies the named branch in its HEAD transaction"
+}
+
 test_ignored_data_during_master_detach() {
   local fake_bin local_master log real_git
   setup_case ignored-data-during-master-detach merge other
@@ -1087,6 +1129,41 @@ test_session_index_recovery() {
   echo "PASS: final session index tree receives a recovery ref before unregistering"
 }
 
+test_session_split_index_recovery() {
+  local file index_snapshot shared_basename shared_count shared_index
+  setup_case session-split-index-recovery merge main-off
+  git -C "$CASE_SESSION" update-index --split-index
+  shared_index=$(git -C "$CASE_SESSION" rev-parse --shared-index-path)
+  [ -n "$shared_index" ] || fail "test did not create a shared index"
+  case "$shared_index" in
+  /*) ;;
+  *) shared_index="$CASE_SESSION/$shared_index" ;;
+  esac
+  [ -f "$shared_index" ] || fail "test shared index is missing"
+  shared_basename=$(basename "$shared_index")
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  [ -f "$CASE_ARCHIVE/$shared_basename" ] ||
+    fail "session archive did not retain the split-index base"
+  shared_count=0
+  for file in "$CASE_ARCHIVE"/sharedindex.*; do
+    [ -f "$file" ] || continue
+    shared_count=$((shared_count + 1))
+  done
+  assert_eq "$shared_count" 1 "session archive must retain exactly one split-index base"
+  index_snapshot=""
+  for file in "$CASE_ARCHIVE"/index.snapshot.*; do
+    [ -f "$file" ] || continue
+    [ -z "$index_snapshot" ] || fail "session archive retained multiple index snapshots"
+    index_snapshot="$file"
+  done
+  [ -n "$index_snapshot" ] || fail "session archive retained no index snapshot"
+  GIT_INDEX_FILE="$index_snapshot" git -C "$CASE_MAIN" ls-files --error-unmatch value >/dev/null ||
+    fail "archived split index cannot be read with its retained base"
+  echo "PASS: split-index snapshots retain their shared base beside the archived index"
+}
+
 test_session_resolve_undo_recovery() {
   local fake_bin first_blob real_git second_blob
   setup_case session-resolve-undo-recovery merge main-off
@@ -1321,16 +1398,25 @@ test_topic_reservation() {
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "$3" = update-ref ] && [ "$5" = -d ] && [ "$6" = refs/heads/topic ]; then' \
-    '  "$REAL_GIT" -C "$TOPIC_CANDIDATE" checkout topic >/dev/null 2>&1' \
-    '  echo "$?" >"$CHECKOUT_MARKER"' \
+    'if [ "$3" = rev-parse ] && [ "$4" = --git-path ] && [ "$5" = logs/refs/heads/topic ]; then' \
+    '  count=0' \
+    '  [ ! -f "$COUNT_MARKER" ] || count=$(cat "$COUNT_MARKER")' \
+    '  count=$((count + 1))' \
+    '  printf "%s\n" "$count" >"$COUNT_MARKER"' \
+    '  if [ "$count" -eq 2 ]; then' \
+    '    if "$REAL_GIT" -C "$TOPIC_CANDIDATE" checkout topic >/dev/null 2>&1; then status=0; else status=$?; fi' \
+    '    printf "%s\n" "$status" >"$CHECKOUT_MARKER"' \
+    '  fi' \
     'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
 
   PATH="$fake_bin:$PATH" REAL_GIT="$real_git" TOPIC_CANDIDATE="$candidate" \
+    COUNT_MARKER="$TEST_ROOT/topic-reservation.count" \
     CHECKOUT_MARKER="$TEST_ROOT/topic-reservation.status" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  [ -f "$TEST_ROOT/topic-reservation.status" ] ||
+    fail "topic reservation injection did not run (reflog reads: $(cat "$TEST_ROOT/topic-reservation.count" 2>/dev/null || echo none))"
   checkout_status=$(cat "$TEST_ROOT/topic-reservation.status")
   [ "$checkout_status" -ne 0 ] || fail "another worktree acquired topic during local deletion"
   assert_cleaned
@@ -1747,6 +1833,42 @@ test_topic_reflog_recovery() {
   echo "PASS: local topic reflog objects receive recovery refs before branch deletion"
 }
 
+test_topic_reflog_locked_through_deletion() {
+  local attempted_oid fake_bin real_git status
+  setup_case topic-reflog-delete-lock merge main-off
+  attempted_oid=$(printf 'competing topic ABA update\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
+  fake_bin="$TEST_ROOT/topic-reflog-delete-lock-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = rev-parse ] && [ "$4" = --git-path ] && [ "$5" = logs/refs/heads/topic ]; then' \
+    '  count=0' \
+    '  [ ! -f "$COUNT_MARKER" ] || count=$(cat "$COUNT_MARKER")' \
+    '  count=$((count + 1))' \
+    '  printf "%s\n" "$count" >"$COUNT_MARKER"' \
+    '  if [ "$count" -eq 2 ]; then' \
+    '    if "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/topic "$RACE_OID" "$TOPIC_OID" >/dev/null 2>&1; then status=0; else status=$?; fi' \
+    '    printf "%s\n" "$status" >"$STATUS_MARKER"' \
+    '  fi' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    RACE_OID="$attempted_oid" TOPIC_OID="$CASE_TOPIC_OID" \
+    COUNT_MARKER="$TEST_ROOT/topic-reflog-delete-lock.count" \
+    STATUS_MARKER="$TEST_ROOT/topic-reflog-delete-lock.status" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  [ -f "$TEST_ROOT/topic-reflog-delete-lock.status" ] ||
+    fail "test never attempted a topic update during the locked reflog read"
+  status=$(cat "$TEST_ROOT/topic-reflog-delete-lock.status")
+  [ "$status" -ne 0 ] || fail "competing topic update succeeded during the reflog retention window"
+  assert_cleaned
+  echo "PASS: topic ref and reflog stay locked together through final deletion"
+}
+
 test_symref_capability_preflight() {
   local fake_bin local_master real_git
   setup_case symref-capability-preflight merge main-off
@@ -1970,6 +2092,7 @@ test_master_update_failure_reattaches_owner
 test_master_handoff_stays_reserved
 test_master_refresh_preserves_concurrent_ref
 test_master_reattach_compare_and_swap
+test_master_reattach_verifies_named_branch
 test_ignored_data_during_master_detach
 test_ignored_data_during_topic_detach
 test_initialized_session_submodule_refusal
@@ -1981,6 +2104,7 @@ test_rewritten_worktree_ref_refusal
 test_session_pseudoref_recovery
 test_session_reflog_recovery
 test_session_index_recovery
+test_session_split_index_recovery
 test_session_resolve_undo_recovery
 test_worktree_config_archive
 test_session_metadata_lock_preflight
@@ -2005,6 +2129,7 @@ test_divergent_tracking_tip_recovery
 test_tracking_tip_move_refusal
 test_tracking_reflog_recovery
 test_topic_reflog_recovery
+test_topic_reflog_locked_through_deletion
 test_symref_capability_preflight
 test_dangling_capability_ref_refusal
 test_option_like_branch_name

@@ -151,8 +151,46 @@ retain_private_session_refs() {
   done <<<"$private_refs"
 }
 
+delete_topic_with_locked_reflog() {
+  local response
+  TOPIC_TRANSACTION_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-topic-transaction.XXXXXX") ||
+    fail "could not allocate the topic deletion transaction"
+  TOPIC_TRANSACTION_IN="$TOPIC_TRANSACTION_DIR/input"
+  TOPIC_TRANSACTION_OUT="$TOPIC_TRANSACTION_DIR/output"
+  mkfifo "$TOPIC_TRANSACTION_IN" "$TOPIC_TRANSACTION_OUT" ||
+    fail "could not create the topic deletion transaction channels"
+  git -C "$MAIN" update-ref --stdin <"$TOPIC_TRANSACTION_IN" >"$TOPIC_TRANSACTION_OUT" &
+  TOPIC_TRANSACTION_PID=$!
+  exec 7>"$TOPIC_TRANSACTION_IN" || fail "could not open the topic transaction input"
+  exec 8<"$TOPIC_TRANSACTION_OUT" || fail "could not open the topic transaction output"
+
+  printf 'start\noption no-deref\ndelete refs/heads/%s %s\nprepare\n' \
+    "$BRANCH" "$LOCAL_BRANCH_OID" >&7 || fail "could not prepare the topic deletion"
+  IFS= read -r response <&8 || fail "topic deletion transaction stopped before start"
+  [ "$response" = "start: ok" ] || fail "topic deletion transaction did not start: $response"
+  IFS= read -r response <&8 || fail "topic deletion transaction stopped before preparation"
+  [ "$response" = "prepare: ok" ] || fail "topic deletion transaction was not prepared: $response"
+
+  # prepare holds the topic ref and reflog locks. Retain every reflog endpoint while neither can
+  # change, then commit the already-validated deletion without an ABA window between those steps.
+  retain_topic_reflog_sides "refs/heads/$BRANCH" topic-reflog
+  printf 'commit\n' >&7 || fail "could not commit the topic deletion"
+  IFS= read -r response <&8 || fail "topic deletion transaction stopped before commit"
+  [ "$response" = "commit: ok" ] || fail "topic deletion transaction did not commit: $response"
+  exec 7>&- 8<&-
+  wait "$TOPIC_TRANSACTION_PID" || fail "topic deletion transaction failed"
+  TOPIC_TRANSACTION_PID=""
+  unlink "$TOPIC_TRANSACTION_IN" || fail "could not remove the topic transaction input"
+  unlink "$TOPIC_TRANSACTION_OUT" || fail "could not remove the topic transaction output"
+  TOPIC_TRANSACTION_IN=""
+  TOPIC_TRANSACTION_OUT=""
+  rmdir "$TOPIC_TRANSACTION_DIR" || fail "could not remove the topic transaction directory"
+  TOPIC_TRANSACTION_DIR=""
+}
+
 lock_and_retain_session_metadata() {
   local name path path_dir lock line metadata oid config_snapshot index_snapshot index_tree
+  local shared_index shared_snapshot shared_temp
   local reuc_snapshot mode stage old_oid new_oid rest
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
     BISECT_HEAD AUTO_MERGE FETCH_HEAD; do
@@ -210,6 +248,25 @@ lock_and_retain_session_metadata() {
   index_snapshot=$(mktemp "$SESSION_ARCHIVE/index.snapshot.XXXXXX") ||
     fail "could not allocate an archived session index snapshot"
   cp "$path" "$index_snapshot" || fail "could not copy the locked archived session index"
+  shared_index=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --shared-index-path) ||
+    fail "could not locate the archived session shared index"
+  if [ -n "$shared_index" ]; then
+    case "$shared_index" in
+    /*) ;;
+    *) shared_index="$SESSION_ARCHIVED_WORKTREE/$shared_index" ;;
+    esac
+    path_dir=$(canonical_dir "$(dirname "$shared_index")") || exit $?
+    shared_index="$path_dir/$(basename "$shared_index")"
+    [ ! -L "$shared_index" ] || fail "archived session shared index is symbolic"
+    [ -f "$shared_index" ] || fail "archived session shared index is missing"
+    shared_temp=$(mktemp "$SESSION_ARCHIVE/sharedindex.snapshot.XXXXXX") ||
+      fail "could not allocate an archived shared-index snapshot"
+    cp "$shared_index" "$shared_temp" || fail "could not copy the archived session shared index"
+    shared_snapshot="$SESSION_ARCHIVE/$(basename "$shared_index")"
+    ln "$shared_temp" "$shared_snapshot" ||
+      fail "could not reserve the archived session shared-index name"
+    unlink "$shared_temp" || fail "could not finalize the archived session shared-index snapshot"
+  fi
   index_tree=$(GIT_INDEX_FILE="$index_snapshot" git -C "$SESSION_ARCHIVED_WORKTREE" write-tree) ||
     fail "could not retain the archived session index"
   retain_session_object index-tree "$index_tree"
@@ -278,6 +335,15 @@ restore_remote_topic() {
 
 cleanup_reservations() {
   local lock
+  if [ -n "${TOPIC_TRANSACTION_PID:-}" ]; then
+    kill "$TOPIC_TRANSACTION_PID" >/dev/null 2>&1 || true
+    exec 7>&- 8<&-
+    wait "$TOPIC_TRANSACTION_PID" >/dev/null 2>&1 || true
+    TOPIC_TRANSACTION_PID=""
+  fi
+  [ -z "${TOPIC_TRANSACTION_IN:-}" ] || unlink "$TOPIC_TRANSACTION_IN" >/dev/null 2>&1 || true
+  [ -z "${TOPIC_TRANSACTION_OUT:-}" ] || unlink "$TOPIC_TRANSACTION_OUT" >/dev/null 2>&1 || true
+  [ -z "${TOPIC_TRANSACTION_DIR:-}" ] || rmdir "$TOPIC_TRANSACTION_DIR" >/dev/null 2>&1 || true
   if [ "${#SESSION_PSEUDOREF_LOCKS[@]}" -gt 0 ]; then
     for lock in "${SESSION_PSEUDOREF_LOCKS[@]}"; do
       [ ! -f "$lock" ] || unlink "$lock" >/dev/null 2>&1 || true
@@ -304,7 +370,8 @@ cleanup_reservations() {
     if [ -n "$RECOVERY_MASTER" ] &&
       git -C "$ORIGINAL_MASTER_OWNER" switch --detach --no-overwrite-ignore \
         "$RECOVERY_MASTER" >/dev/null 2>&1 &&
-      printf 'option no-deref\nsymref-update HEAD refs/heads/master oid %s\n' "$RECOVERY_MASTER" |
+      printf 'option no-deref\nverify refs/heads/master %s\nsymref-update HEAD refs/heads/master oid %s\n' \
+        "$RECOVERY_MASTER" "$RECOVERY_MASTER" |
         git -C "$ORIGINAL_MASTER_OWNER" update-ref --stdin >/dev/null 2>&1; then
       ORIGINAL_MASTER_DETACHED=0
     fi
@@ -330,6 +397,10 @@ SESSION_NAMESPACE_RESERVATION=""
 SESSION_NAMESPACE_RESERVATION_OWNED=0
 SESSION_PSEUDOREF_LOCKS=()
 TOPIC_RESERVATION=""
+TOPIC_TRANSACTION_DIR=""
+TOPIC_TRANSACTION_IN=""
+TOPIC_TRANSACTION_OUT=""
+TOPIC_TRANSACTION_PID=""
 trap cleanup_reservations EXIT
 
 [ "$#" -ge 3 ] || usage
@@ -579,7 +650,8 @@ if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
     fail "could not recheck the detached original master owner"
   [ -z "$MASTER_OWNER_STATUS" ] ||
     fail "master owner gained local data during its update; the data was preserved: $ORIGINAL_MASTER_OWNER"
-  printf 'option no-deref\nsymref-update HEAD refs/heads/master oid %s\n' "$REMOTE_MASTER" |
+  printf 'option no-deref\nverify refs/heads/master %s\nsymref-update HEAD refs/heads/master oid %s\n' \
+    "$REMOTE_MASTER" "$REMOTE_MASTER" |
     git -C "$ORIGINAL_MASTER_OWNER" update-ref --stdin ||
     fail "original master owner changed after preparation; its HEAD was not rewritten"
   ORIGINAL_MASTER_DETACHED=0
@@ -810,9 +882,7 @@ SESSION_HEAD_LOCK=""
 SESSION_PSEUDOREF_LOCKS=()
 [ -d "$SESSION_ARCHIVED_WORKTREE" ] || fail "session recovery archive disappeared: $SESSION_ARCHIVED_WORKTREE"
 
-retain_topic_reflog_sides "refs/heads/$BRANCH" topic-reflog
-git -C "$MAIN" update-ref --no-deref -d "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" ||
-  fail "local $BRANCH moved from validated tip $LOCAL_BRANCH_OID; its newer ref was preserved"
+delete_topic_with_locked_reflog
 git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" ||
   fail "local $BRANCH was deleted but its temporary reservation could not be removed"
 TOPIC_RESERVATION=""
