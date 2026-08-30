@@ -698,6 +698,44 @@ test_master_owner_switch_refusal() {
   echo "PASS: master ownership handoff prevents update redirection"
 }
 
+test_master_initial_detach_compare_and_swap() {
+  local checkout_status fake_bin local_master real_git
+  setup_case master-initial-detach-cas merge other
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" branch alternate "$local_master"
+  fake_bin="$TEST_ROOT/master-initial-detach-cas-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*/master-owner)' \
+    '  if [ "$3" = rev-parse ] && [ "$4" = --git-path ] && [ "$5" = HEAD ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '    : >"$RACE_MARKER"' \
+    '    if "$REAL_GIT" -C "$2" checkout alternate >/dev/null 2>&1; then status=0; else status=$?; fi' \
+    '    printf "%s\n" "$status" >"$STATUS_MARKER"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+    RACE_MARKER="$TEST_ROOT/master-initial-detach-cas.injected" \
+    STATUS_MARKER="$TEST_ROOT/master-initial-detach-cas.status" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "initial master-owner detach overwrote a concurrent branch switch"
+  fi
+  checkout_status=$(cat "$TEST_ROOT/master-initial-detach-cas.status")
+  [ "$checkout_status" -eq 0 ] || fail "test did not switch the master owner before its HEAD lease"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" alternate \
+    "leased initial detach must preserve the concurrently selected branch"
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "initial HEAD lease refusal must precede master advancement"
+  assert_topic_preserved
+  echo "PASS: initial master-owner detach uses a symbolic-HEAD compare-and-swap"
+}
+
 test_master_update_failure_reattaches_owner() {
   local candidate checkout_status fake_bin local_master real_git remote_master log
   setup_case master-update-failure merge other
@@ -1653,6 +1691,76 @@ test_commit_message_archive() {
   assert_eq "$(sed -n '1p' "$message_snapshot")" "$message" \
     "rejected commit message must survive unregistering"
   echo "PASS: rejected commit messages are copied into the recovery archive"
+}
+
+test_concurrent_commit_message_archive() {
+  local attempts commit_pid done fake_bin file late_message message_count message_snapshot
+  local pre_commit ready real_git release
+  setup_case concurrent-commit-message-archive merge main-off
+  ready="$TEST_ROOT/concurrent-commit-message.ready"
+  release="$TEST_ROOT/concurrent-commit-message.release"
+  done="$TEST_ROOT/concurrent-commit-message.done"
+  pre_commit="$CASE_MAIN/.git/hooks/pre-commit"
+  printf '#!/bin/sh\ntouch "%s"\nwhile [ ! -e "%s" ]; do sleep 1; done\n' \
+    "$ready" "$release" >"$pre_commit"
+  chmod +x "$pre_commit"
+  printf '#!/bin/sh\ntouch "%s"\nexit 1\n' "$done" >"$CASE_MAIN/.git/hooks/commit-msg"
+  chmod +x "$CASE_MAIN/.git/hooks/commit-msg"
+  late_message="late rejected commit proposal"
+  git -C "$CASE_SESSION" commit --allow-empty -m "$late_message" >/dev/null 2>&1 &
+  commit_pid=$!
+  attempts=0
+  while [ ! -e "$ready" ] && [ "$attempts" -lt 50 ]; do
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  if [ ! -e "$ready" ]; then
+    touch "$release"
+    wait "$commit_pid" >/dev/null 2>&1 || true
+    fail "concurrent commit did not pause in its pre-commit hook"
+  fi
+
+  fake_bin="$TEST_ROOT/concurrent-commit-message-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = worktree ] && [ "$4" = remove ] && [ ! -e "$RELEASE_MARKER" ]; then' \
+    '  case "$*" in' \
+    '  */session*)' \
+    '    : >"$RELEASE_MARKER"' \
+    '    touch "$COMMIT_RELEASE"' \
+    '    attempts=0' \
+    '    while [ ! -e "$COMMIT_DONE" ] && [ "$attempts" -lt 50 ]; do sleep 0.1; attempts=$((attempts + 1)); done' \
+    '    [ -e "$COMMIT_DONE" ] || exit 91' \
+    '    ;;' \
+    '  esac' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if ! PATH="$fake_bin:$PATH" REAL_GIT="$real_git" COMMIT_RELEASE="$release" \
+    COMMIT_DONE="$done" RELEASE_MARKER="$TEST_ROOT/concurrent-commit-message.released" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null; then
+    touch "$release"
+    wait "$commit_pid" >/dev/null 2>&1 || true
+    fail "cleanup failed while retaining a concurrent rejected commit message"
+  fi
+  if wait "$commit_pid"; then
+    fail "commit-msg hook unexpectedly accepted the concurrent commit"
+  fi
+  assert_cleaned
+  message_count=0
+  message_snapshot=""
+  for file in "$CASE_ARCHIVE"/COMMIT_EDITMSG.*; do
+    [ -f "$file" ] || continue
+    message_count=$((message_count + 1))
+    message_snapshot="$file"
+  done
+  assert_eq "$message_count" 1 "concurrent cleanup must retain one commit-message snapshot"
+  assert_eq "$(sed -n '1p' "$message_snapshot")" "$late_message" \
+    "commit message written after retention began must survive unregistering"
+  echo "PASS: concurrent rejected commit messages remain linked into the recovery archive"
 }
 
 test_sparse_checkout_archive() {
@@ -2892,6 +3000,7 @@ test_concurrent_master_edit_refusal
 test_concurrent_ignored_master_collision
 test_preexisting_ignored_master_data
 test_master_owner_switch_refusal
+test_master_initial_detach_compare_and_swap
 test_master_update_failure_reattaches_owner
 test_master_handoff_stays_reserved
 test_master_refresh_preserves_concurrent_ref
@@ -2922,6 +3031,7 @@ test_session_split_index_recovery
 test_session_resolve_undo_recovery
 test_worktree_config_archive
 test_commit_message_archive
+test_concurrent_commit_message_archive
 test_sparse_checkout_archive
 test_session_metadata_lock_preflight
 test_late_private_worktree_ref_recovery

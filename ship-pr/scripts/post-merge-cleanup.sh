@@ -206,6 +206,28 @@ refuse_hidden_index_changes() {
   MASTER_INDEX_PROBE=""
 }
 
+detach_master_owner_with_lease() {
+  local head_path head_dir raw
+  head_path=$(git -C "$ORIGINAL_MASTER_OWNER" rev-parse --git-path HEAD) ||
+    fail "could not locate the master owner's HEAD"
+  case "$head_path" in
+  /*) ;;
+  *) head_path="$ORIGINAL_MASTER_OWNER/$head_path" ;;
+  esac
+  head_dir=$(canonical_dir "$(dirname "$head_path")") || exit $?
+  head_path="$head_dir/$(basename "$head_path")"
+  [ ! -L "$head_path" ] || fail "master owner's HEAD is symbolic on disk"
+  MASTER_HEAD_LOCK="$head_path.lock"
+  (set -o noclobber; printf '%s\n' "$$" >"$MASTER_HEAD_LOCK") 2>/dev/null || return 1
+  MASTER_HEAD_LOCK_OWNED=1
+  raw=$(sed -n '1p' "$head_path") || return 1
+  [ "$raw" = "ref: refs/heads/master" ] || return 1
+  printf '%s\n' "$LOCAL_MASTER" >"$MASTER_HEAD_LOCK" || return 1
+  atomic_rename "$MASTER_HEAD_LOCK" "$head_path" || return 1
+  MASTER_HEAD_LOCK_OWNED=0
+  ORIGINAL_MASTER_DETACHED=1
+}
+
 lock_session_head_for_archive() {
   local raw
   (set -o noclobber; printf '%s\n' "$$" >"$SESSION_HEAD_LOCK") 2>/dev/null || return 1
@@ -514,11 +536,13 @@ lock_and_retain_session_metadata() {
     fail "archived commit message is busy"
   SESSION_PSEUDOREF_LOCKS+=("$lock")
   [ ! -L "$path" ] || fail "archived commit message is symbolic"
-  if [ -f "$path" ]; then
-    message_snapshot=$(mktemp "$SESSION_ARCHIVE/COMMIT_EDITMSG.XXXXXX") ||
-      fail "could not allocate a commit-message snapshot"
-    cp "$path" "$message_snapshot" || fail "could not archive the commit message"
+  if [ ! -f "$path" ]; then
+    : >"$path" || fail "could not reserve the archived commit-message path"
   fi
+  message_snapshot=$(mktemp "$SESSION_ARCHIVE/COMMIT_EDITMSG.XXXXXX") ||
+    fail "could not allocate a commit-message snapshot"
+  unlink "$message_snapshot" || fail "could not prepare the commit-message snapshot"
+  ln "$path" "$message_snapshot" || fail "could not link the archived commit message"
 
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path config.worktree) ||
@@ -728,6 +752,10 @@ cleanup_reservations() {
   if [ "${SESSION_WORKTREE_LOCK_OWNED:-0}" -eq 1 ] && [ -n "${SESSION:-}" ]; then
     git -C "$MAIN" worktree unlock "$SESSION" >/dev/null 2>&1 || true
   fi
+  if [ "${MASTER_HEAD_LOCK_OWNED:-0}" -eq 1 ] && [ -n "${MASTER_HEAD_LOCK:-}" ] &&
+    [ -f "$MASTER_HEAD_LOCK" ]; then
+    unlink "$MASTER_HEAD_LOCK" >/dev/null 2>&1 || true
+  fi
   if [ "${ORIGINAL_MASTER_DETACHED:-0}" -eq 1 ] &&
     [ -n "${ORIGINAL_MASTER_OWNER:-}" ] && [ -d "$ORIGINAL_MASTER_OWNER" ]; then
     RECOVERY_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master 2>/dev/null || true)
@@ -753,6 +781,8 @@ cleanup_reservations() {
 
 MASTER_RESERVATION=""
 ORIGINAL_MASTER_DETACHED=0
+MASTER_HEAD_LOCK=""
+MASTER_HEAD_LOCK_OWNED=0
 SESSION_HEAD_LOCK=""
 SESSION_HEAD_LOCK_OWNED=0
 CAPABILITY_REF=""
@@ -887,6 +917,10 @@ SESSION_ARCHIVE=$(mktemp -d "$SESSION_PARENT/.${SESSION_BASENAME}.ship-pr-recove
   fail "could not allocate a session recovery archive beside $SESSION"
 LATE_SESSION_ARCHIVE=$(mktemp -d "$SESSION_PARENT/.${SESSION_BASENAME}.ship-pr-late-data.XXXXXX") ||
   fail "could not allocate a late-data recovery archive beside $SESSION"
+COMMIT_LINK_PROBE="$SESSION_ARCHIVE/.commit-message-link-probe"
+ln "$MAIN_COMMON/config" "$COMMIT_LINK_PROBE" ||
+  fail "session recovery archive cannot hard-link repository metadata"
+unlink "$COMMIT_LINK_PROBE" || fail "could not remove the commit-message link probe"
 git -C "$MAIN" worktree lock --reason "ship-pr cleanup in progress" "$SESSION" ||
   fail "could not lock the session worktree registration against pruning"
 SESSION_WORKTREE_LOCK_OWNED=1
@@ -1015,9 +1049,9 @@ CHANGED_PATHS_FILE=""
 [ -z "$IGNORED_COLLISION" ] ||
   fail "master fast-forward would overwrite ignored local data: $MASTER_OWNER/$IGNORED_COLLISION"
 
-# Move branch ownership to a helper-only worktree before the named ref update. The original owner
-# is never reset: after the reservation is refreshed, an option-safe switch back to master refuses
-# any tracked or ignored data that appeared concurrently.
+# Move branch ownership to a helper-only worktree before the named ref update. Detach the original
+# owner with a raw HEAD compare-and-swap, then use an option-safe switch when refreshing its tree so
+# tracked or ignored data that appeared concurrently is refused.
 if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
   MASTER_RESERVATION=$(mktemp -d "$TEMP_ROOT/ship-pr-master-reserve.XXXXXX") ||
     fail "could not allocate a temporary master reservation"
@@ -1025,9 +1059,8 @@ if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
   git -C "$MAIN" worktree add --detach "$MASTER_RESERVATION" "$LOCAL_MASTER" >/dev/null ||
     fail "could not prepare a temporary master reservation"
   MASTER_RESERVATION=$(canonical_dir "$MASTER_RESERVATION") || exit $?
-  git -C "$ORIGINAL_MASTER_OWNER" switch --detach --no-overwrite-ignore "$LOCAL_MASTER" >/dev/null ||
-    fail "could not detach the clean master owner for its named update: $ORIGINAL_MASTER_OWNER"
-  ORIGINAL_MASTER_DETACHED=1
+  detach_master_owner_with_lease ||
+    fail "master owner changed HEAD before its ownership handoff: $ORIGINAL_MASTER_OWNER"
   git -C "$MASTER_RESERVATION" switch -- master >/dev/null ||
     fail "could not transfer master ownership to its temporary reservation"
 fi
