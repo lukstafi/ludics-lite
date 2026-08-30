@@ -573,7 +573,9 @@ directory-nesting semantics,
 retains the archived session's final HEAD under `refs/ship-pr/session-recovery/`, and unregisters
 the now-missing worktree while holding the linked-worktree HEAD and pseudoref locks. Objects named
 by session pseudorefs or its HEAD reflog, plus the final index tree, are retained beneath the
-reserved `refs/ship-pr/session-recovery/` namespace. Late files or links at the vacated path are moved to the second archive
+reserved `refs/ship-pr/session-recovery/` namespace; resolve-undo blobs receive direct recovery
+refs, and per-worktree configuration is copied into the archive. Remote-tracking reflog objects are
+retained under the topic recovery namespace before pruning. Late files or links at the vacated path are moved to the second archive
 before unregistering is retried. Do not reconstruct its state
 machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to

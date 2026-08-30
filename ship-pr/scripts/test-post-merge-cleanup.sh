@@ -1036,6 +1036,70 @@ test_session_index_recovery() {
   echo "PASS: final session index tree receives a recovery ref before unregistering"
 }
 
+test_session_resolve_undo_recovery() {
+  local fake_bin first_blob real_git second_blob
+  setup_case session-resolve-undo-recovery merge main-off
+  fake_bin="$TEST_ROOT/session-resolve-undo-recovery-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*.ship-pr-recovery.*/worktree)' \
+    '  if [ "$3" = rev-parse ] && [ "$4" = --git-path ] && [ "$5" = ORIG_HEAD ] && [ ! -e "$REUC_MARKER" ]; then' \
+    '    head_blob=$("$REAL_GIT" -C "$2" rev-parse HEAD:value)' \
+    '    first=$(printf "resolve-undo first\n" | "$REAL_GIT" -C "$RACE_MAIN" hash-object -w --stdin)' \
+    '    second=$(printf "resolve-undo second\n" | "$REAL_GIT" -C "$RACE_MAIN" hash-object -w --stdin)' \
+    '    printf "0 0000000000000000000000000000000000000000\tvalue\0" >"$INDEX_INFO"' \
+    '    printf "100644 %s 1\tvalue\0" "$head_blob" >>"$INDEX_INFO"' \
+    '    printf "100644 %s 2\tvalue\0" "$first" >>"$INDEX_INFO"' \
+    '    printf "100644 %s 3\tvalue\0" "$second" >>"$INDEX_INFO"' \
+    '    "$REAL_GIT" -C "$2" update-index -z --index-info <"$INDEX_INFO"' \
+    '    "$REAL_GIT" -C "$2" update-index --add --cacheinfo 100644 "$head_blob" value' \
+    '    printf "%s\n%s\n" "$first" "$second" >"$REUC_MARKER"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    REUC_MARKER="$TEST_ROOT/session-resolve-undo-recovery.oids" \
+    INDEX_INFO="$TEST_ROOT/session-resolve-undo-recovery.index-info" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  first_blob=$(sed -n '1p' "$TEST_ROOT/session-resolve-undo-recovery.oids")
+  second_blob=$(sed -n '2p' "$TEST_ROOT/session-resolve-undo-recovery.oids")
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse \
+    "refs/ship-pr/session-recovery/topic/index-reuc-$first_blob")" "$first_blob" \
+    "first resolve-undo blob must remain directly reachable"
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse \
+    "refs/ship-pr/session-recovery/topic/index-reuc-$second_blob")" "$second_blob" \
+    "second resolve-undo blob must remain directly reachable"
+  assert_cleaned
+  echo "PASS: session resolve-undo blobs receive recovery refs before unregistering"
+}
+
+test_worktree_config_archive() {
+  local config_count config_snapshot file
+  setup_case worktree-config-archive merge main-off
+  git -C "$CASE_MAIN" config extensions.worktreeConfig true
+  git -C "$CASE_SESSION" config --worktree cleanup.secret retain-me
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  config_count=0
+  config_snapshot=""
+  for file in "$CASE_ARCHIVE"/config.worktree.*; do
+    [ -f "$file" ] || continue
+    config_count=$((config_count + 1))
+    config_snapshot="$file"
+  done
+  assert_eq "$config_count" 1 "cleanup must archive exactly one per-worktree config snapshot"
+  assert_eq "$(git config --file "$config_snapshot" --get cleanup.secret)" retain-me \
+    "per-worktree configuration must survive unregistering"
+  echo "PASS: per-worktree configuration is copied into the recovery archive"
+}
+
 test_session_metadata_lock_preflight() {
   local local_master lock_path
   setup_case session-metadata-lock-preflight merge main-off
@@ -1567,6 +1631,24 @@ test_tracking_tip_move_refusal() {
   echo "PASS: remote-tracking ref movement is refused without deleting its new tip"
 }
 
+test_tracking_reflog_recovery() {
+  local reflog_oid
+  setup_case tracking-reflog-recovery merge main-off
+  reflog_oid=$(printf 'tracking reflog only\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
+  git -C "$CASE_MAIN" update-ref refs/remotes/origin/topic "$reflog_oid"
+  git -C "$CASE_MAIN" update-ref refs/remotes/origin/topic "$CASE_TOPIC_OID"
+  git -C "$CASE_MAIN" reflog show --format='%H' refs/remotes/origin/topic | \
+    grep -Fx "$reflog_oid" >/dev/null || fail "test did not create a tracking-only reflog object"
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse \
+    "refs/ship-pr/recovery/topic/tracking-reflog-$reflog_oid")" "$reflog_oid" \
+    "remote-tracking reflog object must remain directly reachable"
+  echo "PASS: remote-tracking reflog objects receive recovery refs before pruning"
+}
+
 test_symref_capability_preflight() {
   local fake_bin local_master real_git
   setup_case symref-capability-preflight merge main-off
@@ -1800,6 +1882,8 @@ test_rewritten_worktree_ref_refusal
 test_session_pseudoref_recovery
 test_session_reflog_recovery
 test_session_index_recovery
+test_session_resolve_undo_recovery
+test_worktree_config_archive
 test_session_metadata_lock_preflight
 test_symbolic_ref_refusal
 test_remote_master_lease
@@ -1819,6 +1903,7 @@ test_session_recovery_namespace_preflight
 test_dangling_config_lock_preflight
 test_divergent_tracking_tip_recovery
 test_tracking_tip_move_refusal
+test_tracking_reflog_recovery
 test_symref_capability_preflight
 test_dangling_capability_ref_refusal
 test_option_like_branch_name

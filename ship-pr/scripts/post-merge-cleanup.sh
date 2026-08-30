@@ -65,7 +65,7 @@ refuse_private_worktree_refs() {
 preflight_session_metadata_locks() {
   local name path path_dir lock
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
-    BISECT_HEAD AUTO_MERGE FETCH_HEAD index; do
+    BISECT_HEAD AUTO_MERGE FETCH_HEAD index config.worktree; do
     path=$(git -C "$SESSION" rev-parse --git-path "$name") ||
       fail "could not locate session metadata: $name"
     case "$path" in
@@ -97,8 +97,27 @@ retain_session_object() {
   fi
 }
 
+retain_topic_recovery_object() {
+  local kind="$1" oid="$2" recovery_ref recovery_oid
+  git -C "$MAIN" cat-file -e "$oid^{object}" 2>/dev/null ||
+    fail "topic recovery metadata contains an unreadable object: $kind"
+  recovery_ref="refs/ship-pr/recovery/$BRANCH/$kind-$oid"
+  if git -C "$MAIN" symbolic-ref -q "$recovery_ref" >/dev/null 2>&1; then
+    fail "topic metadata recovery ref is symbolic rather than direct: $recovery_ref"
+  fi
+  if git -C "$MAIN" show-ref --verify --quiet "$recovery_ref"; then
+    recovery_oid=$(git -C "$MAIN" rev-parse "$recovery_ref") || fail "cannot read $recovery_ref"
+    [ "$recovery_oid" = "$oid" ] ||
+      fail "topic metadata recovery points at an unexpected object: $recovery_ref"
+  else
+    git -C "$MAIN" update-ref --no-deref "$recovery_ref" "$oid" "" ||
+      fail "could not retain topic metadata object: $recovery_ref"
+  fi
+}
+
 lock_and_retain_session_metadata() {
-  local name path path_dir lock line oid index_snapshot index_tree reflog_oids
+  local name path path_dir lock line metadata oid config_snapshot index_snapshot index_tree
+  local reuc_snapshot mode stage reflog_oids
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
     BISECT_HEAD AUTO_MERGE FETCH_HEAD; do
     path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "$name") ||
@@ -122,6 +141,25 @@ lock_and_retain_session_metadata() {
     done <"$path"
   done
 
+
+  path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path config.worktree) ||
+    fail "could not locate archived per-worktree configuration"
+  case "$path" in
+  /*) ;;
+  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
+  esac
+  path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+  lock="$path_dir/$(basename "$path").lock"
+  (set -o noclobber; printf '%s\n' "$$" >"$lock") 2>/dev/null ||
+    fail "archived per-worktree configuration is busy"
+  SESSION_PSEUDOREF_LOCKS+=("$lock")
+  [ ! -L "$path" ] || fail "archived per-worktree configuration is symbolic"
+  if [ -f "$path" ]; then
+    config_snapshot=$(mktemp "$SESSION_ARCHIVE/config.worktree.XXXXXX") ||
+      fail "could not allocate a per-worktree configuration snapshot"
+    cp "$path" "$config_snapshot" || fail "could not archive per-worktree configuration"
+  fi
+
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path index) ||
     fail "could not locate archived session index"
   case "$path" in
@@ -139,6 +177,17 @@ lock_and_retain_session_metadata() {
   index_tree=$(GIT_INDEX_FILE="$index_snapshot" git -C "$SESSION_ARCHIVED_WORKTREE" write-tree) ||
     fail "could not retain the archived session index"
   retain_session_object index-tree "$index_tree"
+  reuc_snapshot=$(mktemp "$SESSION_ARCHIVE/index.resolve-undo.XXXXXX") ||
+    fail "could not allocate a resolve-undo snapshot"
+  GIT_INDEX_FILE="$index_snapshot" git -C "$SESSION_ARCHIVED_WORKTREE" \
+    ls-files --resolve-undo -z >"$reuc_snapshot" ||
+    fail "could not inspect archived session resolve-undo data"
+  while IFS= read -r -d '' line; do
+    metadata=${line%%$'\t'*}
+    read -r mode oid stage <<<"$metadata"
+    [ -n "$oid" ] || continue
+    retain_session_object index-reuc "$oid"
+  done <"$reuc_snapshot"
 
   reflog_oids=$(git -C "$SESSION_ARCHIVED_WORKTREE" reflog show --format='%H' HEAD) ||
     fail "could not inspect the archived session HEAD reflog"
@@ -534,6 +583,12 @@ if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
         "$TRACKING_BRANCH_OID" "" || fail "could not retain $TRACKING_RECOVERY_REF"
     fi
   fi
+  TRACKING_REFLOG_OIDS=$(git -C "$MAIN" reflog show --format='%H' \
+    "refs/remotes/origin/$BRANCH") || fail "cannot inspect origin/$BRANCH tracking reflog"
+  while IFS= read -r TRACKING_REFLOG_OID; do
+    [ -n "$TRACKING_REFLOG_OID" ] || continue
+    retain_topic_recovery_object tracking-reflog "$TRACKING_REFLOG_OID"
+  done <<<"$TRACKING_REFLOG_OIDS"
 fi
 
 REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
