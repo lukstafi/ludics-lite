@@ -3,6 +3,18 @@
 
 set -uo pipefail
 
+# Repository-local environment overrides take precedence over -C and can redirect both reads and
+# mutations away from the explicit checkout arguments. Ask Git for its complete local set, then
+# clear it before interpreting either path.
+GIT_LOCAL_ENV_VARS=$(git rev-parse --local-env-vars 2>/dev/null) || {
+  echo "post-merge-cleanup.sh: could not enumerate Git repository-selection environment" >&2
+  exit 1
+}
+for GIT_LOCAL_ENV_VAR in $GIT_LOCAL_ENV_VARS; do
+  unset "$GIT_LOCAL_ENV_VAR"
+done
+unset GIT_LOCAL_ENV_VAR GIT_LOCAL_ENV_VARS
+
 fail() {
   echo "post-merge-cleanup.sh: $*" >&2
   exit 1
@@ -118,14 +130,14 @@ preflight_sparse_checkout_metadata() {
 }
 
 refuse_active_session_operations() {
-  local name path path_dir
+  local worktree="${1:-$SESSION}" name path path_dir
   for name in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
     sequencer rebase-merge rebase-apply; do
-    path=$(git -C "$SESSION" rev-parse --git-path "$name") ||
+    path=$(git -C "$worktree" rev-parse --git-path "$name") ||
       fail "could not locate session operation state: $name"
     case "$path" in
     /*) ;;
-    *) path="$SESSION/$path" ;;
+    *) path="$worktree/$path" ;;
     esac
     path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
     path="$path_dir/$(basename "$path")"
@@ -218,7 +230,7 @@ retain_topic_reflog_sides() {
 }
 
 retain_session_reflog_sides() {
-  local ref="$1" path path_dir line old_oid new_oid rest oid
+  local ref="$1" kind="${2:-private-reflog}" path path_dir line old_oid new_oid rest oid
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "logs/$ref") ||
     fail "could not locate session-private reflog: $ref"
   case "$path" in
@@ -233,55 +245,104 @@ retain_session_reflog_sides() {
     read -r old_oid new_oid rest <<<"$line"
     for oid in "$old_oid" "$new_oid"; do
       case "$oid" in
-      *[!0]*) retain_session_object private-reflog "$oid" ;;
+      *[!0]*) retain_session_object "$kind" "$oid" ;;
       esac
     done
   done <"$path"
 }
 
+retain_session_reflog_entries() {
+  local ref="$1" kind="$2" oid oids
+  oids=$(git -C "$SESSION_ARCHIVED_WORKTREE" reflog show --format='%H' "$ref") ||
+    fail "could not enumerate session reflog through Git: $ref"
+  while IFS= read -r oid; do
+    [ -n "$oid" ] || continue
+    retain_session_object "$kind" "$oid"
+  done <<<"$oids"
+}
+
 retain_private_session_refs() {
-  local private_refs line ref oid response
+  local private_refs line ref oid response namespace probe blocker blocker_parent blocker_temp
   private_refs=$(git -C "$SESSION_ARCHIVED_WORKTREE" for-each-ref \
     --format='%(refname) %(objectname)' refs/worktree refs/bisect refs/rewritten) ||
     fail "could not recheck session-private refs before unregistering"
+  REF_TRANSACTION_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-ref-transaction.XXXXXX") ||
+    fail "could not allocate the session-private namespace transaction"
+  REF_TRANSACTION_IN="$REF_TRANSACTION_DIR/input"
+  REF_TRANSACTION_OUT="$REF_TRANSACTION_DIR/output"
+  mkfifo "$REF_TRANSACTION_IN" "$REF_TRANSACTION_OUT" ||
+    fail "could not create the session-private namespace transaction channels"
+  git -C "$SESSION_ARCHIVED_WORKTREE" update-ref --stdin \
+    <"$REF_TRANSACTION_IN" >"$REF_TRANSACTION_OUT" &
+  REF_TRANSACTION_PID=$!
+  exec 7>"$REF_TRANSACTION_IN" || fail "could not open the private namespace transaction input"
+  exec 8<"$REF_TRANSACTION_OUT" || fail "could not open the private namespace transaction output"
+  printf 'start\noption no-deref\n' >&7 || fail "could not start the private namespace transaction"
   while IFS= read -r line; do
     ref=${line%% *}
     oid=${line#* }
     [ -n "$ref" ] || continue
     [ -n "$oid" ] || fail "session-private ref has no object: $ref"
-
-    REF_TRANSACTION_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-ref-transaction.XXXXXX") ||
-      fail "could not allocate the session-private ref transaction: $ref"
-    REF_TRANSACTION_IN="$REF_TRANSACTION_DIR/input"
-    REF_TRANSACTION_OUT="$REF_TRANSACTION_DIR/output"
-    mkfifo "$REF_TRANSACTION_IN" "$REF_TRANSACTION_OUT" ||
-      fail "could not create the session-private ref transaction channels: $ref"
-    git -C "$SESSION_ARCHIVED_WORKTREE" update-ref --stdin \
-      <"$REF_TRANSACTION_IN" >"$REF_TRANSACTION_OUT" &
-    REF_TRANSACTION_PID=$!
-    exec 7>"$REF_TRANSACTION_IN" || fail "could not open the private ref transaction input: $ref"
-    exec 8<"$REF_TRANSACTION_OUT" || fail "could not open the private ref transaction output: $ref"
-    printf 'start\noption no-deref\nverify %s %s\nprepare\n' "$ref" "$oid" >&7 ||
-      fail "could not prepare the session-private ref transaction: $ref"
-    IFS= read -r response <&8 || fail "session-private ref transaction stopped before start: $ref"
-    [ "$response" = "start: ok" ] || fail "session-private ref transaction did not start: $ref"
-    IFS= read -r response <&8 || fail "session-private ref transaction stopped before preparation: $ref"
-    [ "$response" = "prepare: ok" ] || fail "session-private ref changed before retention: $ref"
+    printf 'delete %s %s\n' "$ref" "$oid" >&7 ||
+      fail "could not queue session-private ref retention: $ref"
+  done <<<"$private_refs"
+  printf 'prepare\n' >&7 || fail "could not prepare session-private namespace retention"
+  IFS= read -r response <&8 || fail "session-private namespace transaction stopped before start"
+  [ "$response" = "start: ok" ] || fail "session-private namespace transaction did not start"
+  IFS= read -r response <&8 || fail "session-private namespace transaction stopped before preparation"
+  [ "$response" = "prepare: ok" ] || fail "session-private refs changed before retention"
+  while IFS= read -r line; do
+    ref=${line%% *}
+    oid=${line#* }
+    [ -n "$ref" ] || continue
     retain_session_object private-ref "$oid"
     retain_session_reflog_sides "$ref"
-    printf 'commit\n' >&7 || fail "could not commit the session-private ref transaction: $ref"
-    IFS= read -r response <&8 || fail "session-private ref transaction stopped before commit: $ref"
-    [ "$response" = "commit: ok" ] || fail "session-private ref transaction did not commit: $ref"
-    exec 7>&- 8<&-
-    wait "$REF_TRANSACTION_PID" || fail "session-private ref transaction failed: $ref"
-    REF_TRANSACTION_PID=""
-    unlink "$REF_TRANSACTION_IN" || fail "could not remove the private ref transaction input: $ref"
-    unlink "$REF_TRANSACTION_OUT" || fail "could not remove the private ref transaction output: $ref"
-    REF_TRANSACTION_IN=""
-    REF_TRANSACTION_OUT=""
-    rmdir "$REF_TRANSACTION_DIR" || fail "could not remove the private ref transaction directory: $ref"
-    REF_TRANSACTION_DIR=""
   done <<<"$private_refs"
+  printf 'commit\n' >&7 || fail "could not commit session-private namespace retention"
+  IFS= read -r response <&8 || fail "session-private namespace transaction stopped before commit"
+  [ "$response" = "commit: ok" ] || fail "session-private namespace transaction did not commit"
+  exec 7>&- 8<&-
+  wait "$REF_TRANSACTION_PID" || fail "session-private namespace transaction failed"
+  REF_TRANSACTION_PID=""
+  unlink "$REF_TRANSACTION_IN" || fail "could not remove the private namespace transaction input"
+  unlink "$REF_TRANSACTION_OUT" || fail "could not remove the private namespace transaction output"
+  REF_TRANSACTION_IN=""
+  REF_TRANSACTION_OUT=""
+  rmdir "$REF_TRANSACTION_DIR" || fail "could not remove the private namespace transaction directory"
+  REF_TRANSACTION_DIR=""
+
+  # These namespace roots are special: the root ref itself is shared, while every child is private
+  # to the worktree. Reserve the actual per-worktree filesystem directory with a regular blocker
+  # after atomically emptying it. If a writer recreates a child in the handoff, rmdir refuses and
+  # preserves that new state; once installed, the blocker makes every Git child creation fail.
+  for namespace in refs/worktree refs/bisect refs/rewritten; do
+    probe=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "$namespace/ship-pr-probe") ||
+      fail "could not locate private namespace: $namespace"
+    case "$probe" in
+    /*) ;;
+    *) probe="$SESSION_ARCHIVED_WORKTREE/$probe" ;;
+    esac
+    blocker=$(dirname "$probe")
+    blocker_parent=$(canonical_dir "$(dirname "$blocker")") || exit $?
+    blocker="$blocker_parent/$(basename "$blocker")"
+    blocker_temp=$(mktemp "$blocker_parent/.ship-pr-namespace-blocker.XXXXXX") ||
+      fail "could not allocate private namespace blocker: $namespace"
+    printf '%s\n' "$LOCAL_BRANCH_OID" >"$blocker_temp" ||
+      fail "could not write private namespace blocker: $namespace"
+    if [ -d "$blocker" ]; then
+      rmdir "$blocker" || fail "private namespace gained a ref during retention: $namespace"
+    else
+      { [ ! -e "$blocker" ] && [ ! -L "$blocker" ]; } ||
+        fail "private namespace gained an unexpected entry during retention: $namespace"
+    fi
+    atomic_rename "$blocker_temp" "$blocker" ||
+      fail "could not install private namespace blocker: $namespace"
+    PRIVATE_NAMESPACE_BLOCKERS+=("$blocker")
+  done
+}
+
+release_private_namespace_locks() {
+  PRIVATE_NAMESPACE_BLOCKERS=()
 }
 
 delete_ref_with_locked_reflog() {
@@ -346,6 +407,7 @@ lock_and_retain_session_metadata() {
       [ -n "$oid" ] || continue
       retain_session_object "pseudoref-$name" "$oid"
     done <"$path"
+    retain_session_reflog_entries "$name" "pseudoref-reflog-$name"
   done
 
 
@@ -502,6 +564,11 @@ cleanup_reservations() {
   [ -z "${REF_TRANSACTION_IN:-}" ] || unlink "$REF_TRANSACTION_IN" >/dev/null 2>&1 || true
   [ -z "${REF_TRANSACTION_OUT:-}" ] || unlink "$REF_TRANSACTION_OUT" >/dev/null 2>&1 || true
   [ -z "${REF_TRANSACTION_DIR:-}" ] || rmdir "$REF_TRANSACTION_DIR" >/dev/null 2>&1 || true
+  if [ "${#PRIVATE_NAMESPACE_BLOCKERS[@]}" -gt 0 ]; then
+    for lock in "${PRIVATE_NAMESPACE_BLOCKERS[@]}"; do
+      [ ! -f "$lock" ] || unlink "$lock" >/dev/null 2>&1 || true
+    done
+  fi
   if [ "${#SESSION_PSEUDOREF_LOCKS[@]}" -gt 0 ]; then
     for lock in "${SESSION_PSEUDOREF_LOCKS[@]}"; do
       [ ! -f "$lock" ] || unlink "$lock" >/dev/null 2>&1 || true
@@ -559,6 +626,7 @@ REF_TRANSACTION_DIR=""
 REF_TRANSACTION_IN=""
 REF_TRANSACTION_OUT=""
 REF_TRANSACTION_PID=""
+PRIVATE_NAMESPACE_BLOCKERS=()
 trap cleanup_reservations EXIT
 
 [ "$#" -ge 3 ] || usage
@@ -598,6 +666,8 @@ SESSION_COMMON=$(git_path "$SESSION" "$(git -C "$SESSION" rev-parse --git-common
 [ "$MAIN_GIT" = "$MAIN_COMMON" ] || fail "main-checkout is a linked worktree, not the primary checkout: $MAIN"
 [ "$MAIN" != "$SESSION" ] || fail "main checkout and session worktree must be different paths"
 [ "$SESSION_COMMON" = "$MAIN_COMMON" ] || fail "main checkout and session worktree belong to different repositories"
+REF_FORMAT=$(git -C "$MAIN" rev-parse --show-ref-format) || fail "could not determine repository ref storage"
+[ "$REF_FORMAT" = files ] || fail "cleanup currently requires files ref storage, found: $REF_FORMAT"
 { [ ! -e "$MAIN_COMMON/config.lock" ] && [ ! -L "$MAIN_COMMON/config.lock" ]; } ||
   fail "repository config is locked; retry after the lock clears"
 command -v perl >/dev/null 2>&1 || fail "Perl is required for atomic session archiving"
@@ -1010,6 +1080,8 @@ else
     fail "could not retain the archived session HEAD: $SESSION_RECOVERY_REF"
 fi
 retain_private_session_refs
+refuse_session_module_gitdirs "$SESSION_ARCHIVED_WORKTREE"
+refuse_active_session_operations "$SESSION_ARCHIVED_WORKTREE"
 git -C "$MAIN" update-ref --no-deref -d "$SESSION_NAMESPACE_RESERVATION" \
   "$LOCAL_BRANCH_OID" || fail "could not release the session recovery namespace reservation"
 SESSION_NAMESPACE_RESERVATION_OWNED=0
@@ -1024,6 +1096,7 @@ else
   rmdir "$LATE_SESSION_ARCHIVE" || fail "unused late-data archive could not be removed"
   LATE_SESSION_ARCHIVE=""
 fi
+release_private_namespace_locks
 SESSION_HEAD_LOCK_OWNED=0
 SESSION_HEAD_LOCK=""
 SESSION_PSEUDOREF_LOCKS=()

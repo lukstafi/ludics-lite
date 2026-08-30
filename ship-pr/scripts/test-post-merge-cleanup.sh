@@ -271,6 +271,45 @@ test_invalid_path_refusal() {
   echo "PASS: invalid checkout path refusal"
 }
 
+test_git_local_environment_is_cleared() {
+  local foreign_index
+  setup_case git-local-environment merge main-off
+  foreign_index="$TEST_ROOT/foreign-index"
+  cp "$(git -C "$CASE_MAIN" rev-parse --absolute-git-dir)/index" "$foreign_index"
+
+  GIT_DIR="$TEST_ROOT/not-a-repository" GIT_INDEX_FILE="$foreign_index" \
+    GIT_WORK_TREE="$TEST_ROOT/not-a-worktree" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  echo "PASS: repository-selection environment is cleared before path validation"
+}
+
+test_non_files_ref_backend_refusal() {
+  local fake_bin local_master real_git
+  setup_case non-files-ref-backend merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  fake_bin="$TEST_ROOT/non-files-ref-backend-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = rev-parse ] && [ "$4" = --show-ref-format ]; then' \
+    '  printf "reftable\n"' \
+    '  exit 0' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "non-files ref storage was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "ref-backend refusal must precede master advancement"
+  assert_topic_preserved
+  echo "PASS: non-files ref storage is refused before mutation"
+}
+
 test_unrelated_upstream_deletion() {
   setup_case unrelated-upstream merge main
   git -C "$CASE_MAIN" branch unrelated refs/heads/master
@@ -1296,18 +1335,40 @@ test_rewritten_worktree_ref_refusal() {
 }
 
 test_session_pseudoref_recovery() {
-  local unique_oid
+  local fake_bin real_git reflog_oid unique_oid
   setup_case session-pseudoref-recovery merge main-off
+  reflog_oid=$(printf 'unique ORIG_HEAD reflog commit\n' | git -C "$CASE_SESSION" commit-tree \
+    "$(git -C "$CASE_SESSION" rev-parse HEAD^{tree})" -p "$CASE_TOPIC_OID")
   unique_oid=$(printf 'unique ORIG_HEAD commit\n' | git -C "$CASE_SESSION" commit-tree \
     "$(git -C "$CASE_SESSION" rev-parse HEAD^{tree})" -p "$CASE_TOPIC_OID")
-  git -C "$CASE_SESSION" update-ref ORIG_HEAD "$unique_oid"
+  fake_bin="$TEST_ROOT/session-pseudoref-recovery-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*.ship-pr-recovery.*/worktree)' \
+    '  if [ "$3" = rev-parse ] && [ "$4" = --git-path ] && [ "$5" = ORIG_HEAD ] && [ ! -e "$PSEUDOREF_MARKER" ]; then' \
+    '    : >"$PSEUDOREF_MARKER"' \
+    '    "$REAL_GIT" -C "$2" update-ref --create-reflog ORIG_HEAD "$REFLOG_OID"' \
+    '    "$REAL_GIT" -C "$2" update-ref ORIG_HEAD "$UNIQUE_OID" "$REFLOG_OID"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
 
-  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" REFLOG_OID="$reflog_oid" UNIQUE_OID="$unique_oid" \
+    PSEUDOREF_MARKER="$TEST_ROOT/session-pseudoref-recovery.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
   assert_cleaned
   assert_eq "$(git -C "$CASE_MAIN" rev-parse \
     "refs/ship-pr/session-recovery/topic/pseudoref-ORIG_HEAD-$unique_oid")" \
     "$unique_oid" "session ORIG_HEAD object must remain directly reachable"
-  echo "PASS: session pseudoref objects receive recovery refs before unregistering"
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse \
+    "refs/ship-pr/session-recovery/topic/pseudoref-reflog-ORIG_HEAD-$reflog_oid")" \
+    "$reflog_oid" "session ORIG_HEAD reflog object must remain directly reachable"
+  echo "PASS: session pseudoref tips and reflogs receive recovery refs before unregistering"
 }
 
 test_session_reflog_recovery() {
@@ -1547,6 +1608,125 @@ test_late_private_worktree_ref_recovery() {
     "$private_reflog_oid" "late session-private reflog object must remain directly reachable"
   assert_cleaned
   echo "PASS: late session-private ref tips and reflogs receive recovery refs"
+}
+
+test_private_namespace_locked_through_unregister() {
+  local fake_bin race_oid real_git status
+  setup_case private-namespace-lock merge main-off
+  race_oid=$(printf 'too-late private ref commit\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
+  fake_bin="$TEST_ROOT/private-namespace-lock-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = worktree ] && [ "$4" = remove ]; then' \
+    '  case "$5" in' \
+    '  */session)' \
+    '    for archive in "$RACE_ROOT"/.session.ship-pr-recovery.*/worktree; do' \
+    '      [ -d "$archive" ] || continue' \
+    '      if "$REAL_GIT" -C "$archive" update-ref refs/worktree/too-late "$RACE_OID" >/dev/null 2>&1; then status=0; else status=$?; fi' \
+    '      printf "%s\n" "$status" >"$STATUS_MARKER"' \
+    '    done' \
+    '    ;;' \
+    '  esac' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_ROOT="$CASE_ROOT" RACE_OID="$race_oid" \
+    STATUS_MARKER="$TEST_ROOT/private-namespace-lock.status" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  [ -f "$TEST_ROOT/private-namespace-lock.status" ] ||
+    fail "private namespace race was not attempted during unregister"
+  status=$(cat "$TEST_ROOT/private-namespace-lock.status")
+  [ "$status" -ne 0 ] || fail "a private ref was created during unregister"
+  assert_cleaned
+  echo "PASS: private ref namespaces stay reserved and locked through unregistering"
+}
+
+test_late_active_session_operation_refusal() {
+  local archive fake_bin real_git sequencer
+  setup_case late-active-session-operation merge main-off
+  fake_bin="$TEST_ROOT/late-active-session-operation-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*.ship-pr-recovery.*/worktree)' \
+    '  if [ "$3" = for-each-ref ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '    : >"$RACE_MARKER"' \
+    '    git_dir=$("$REAL_GIT" -C "$2" rev-parse --absolute-git-dir)' \
+    '    mkdir -p "$git_dir/sequencer"' \
+    '    printf "pick %s pending\n" "$TOPIC_OID" >"$git_dir/sequencer/todo"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" TOPIC_OID="$CASE_TOPIC_OID" \
+    RACE_MARKER="$TEST_ROOT/late-active-session-operation.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "late active session operation was accepted before unregistering"
+  fi
+  archive=""
+  for archive in "$CASE_ROOT"/.session.ship-pr-recovery.*/worktree; do
+    [ -d "$archive" ] && break
+  done
+  [ -d "$archive" ] || fail "late active-operation refusal lost the session archive"
+  sequencer="$(git -C "$archive" rev-parse --absolute-git-dir)/sequencer/todo"
+  [ -f "$sequencer" ] || fail "late active session operation state was lost"
+  git -C "$CASE_MAIN" show-ref --verify --quiet refs/heads/topic || fail "local topic was lost"
+  echo "PASS: late active session operation state is refused before unregistering"
+}
+
+test_late_session_module_refusal() {
+  local archive fake_bin late_module module_seed real_git session_git_dir unique_oid
+  setup_case late-session-module merge main-off
+  module_seed="$TEST_ROOT/late-module-seed"
+  late_module="$TEST_ROOT/late-module.git"
+  git init -b main "$module_seed" >/dev/null
+  git_config "$module_seed"
+  echo unique >"$module_seed/payload"
+  git -C "$module_seed" add payload
+  git -C "$module_seed" commit -m "unique late module commit" >/dev/null
+  unique_oid=$(git -C "$module_seed" rev-parse HEAD)
+  git clone --bare "$module_seed" "$late_module" >/dev/null 2>&1
+  fake_bin="$TEST_ROOT/late-session-module-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*.ship-pr-recovery.*/worktree)' \
+    '  if [ "$3" = for-each-ref ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '    : >"$RACE_MARKER"' \
+    '    git_dir=$("$REAL_GIT" -C "$2" rev-parse --absolute-git-dir)' \
+    '    mkdir -p "$git_dir/modules"' \
+    '    mv "$LATE_MODULE" "$git_dir/modules/late"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" LATE_MODULE="$late_module" \
+    RACE_MARKER="$TEST_ROOT/late-session-module.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "late session module repository was accepted before unregistering"
+  fi
+  archive=""
+  for archive in "$CASE_ROOT"/.session.ship-pr-recovery.*/worktree; do
+    [ -d "$archive" ] && break
+  done
+  [ -d "$archive" ] || fail "late module refusal lost the session archive"
+  session_git_dir=$(git -C "$archive" rev-parse --absolute-git-dir)
+  git --git-dir="$session_git_dir/modules/late" cat-file -e "$unique_oid^{commit}" ||
+    fail "late session module unique commit was lost"
+  git -C "$CASE_MAIN" show-ref --verify --quiet refs/heads/topic || fail "local topic was lost"
+  echo "PASS: late session module repository is refused before unregistering"
 }
 
 test_symbolic_ref_refusal() {
@@ -2385,6 +2565,8 @@ test_squash_rebase_override
 test_newer_remote_tip_refusal
 test_ls_remote_failure_refusal
 test_invalid_path_refusal
+test_git_local_environment_is_cleared
+test_non_files_ref_backend_refusal
 test_unrelated_upstream_deletion
 test_distinct_push_endpoint
 test_topic_tag_collision
@@ -2430,6 +2612,9 @@ test_worktree_config_archive
 test_sparse_checkout_archive
 test_session_metadata_lock_preflight
 test_late_private_worktree_ref_recovery
+test_private_namespace_locked_through_unregister
+test_late_active_session_operation_refusal
+test_late_session_module_refusal
 test_symbolic_ref_refusal
 test_remote_master_lease
 test_stale_master_response_retains_recovery
