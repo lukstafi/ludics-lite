@@ -242,14 +242,36 @@ The coordinator's job between launch and last merge:
   override it.
   Pair it with **one push per CI cycle** in late rounds — every push supersedes the ubuntu leg
   (~28 min when the runners are free; the 2026-08-23 wave saw 1h20m with six PRs queued), so a fix that only x86 can confirm stays unconfirmed for as long as pushes keep
-  coming — and with "rebase before opening and before merging": CI builds the MERGE commit, so a
+  coming — and with "rebase before opening": CI builds the MERGE commit, so a
   repo-wide scan green on the branch can be red against what landed on master meanwhile.
+  Rebasing before MERGING is no longer mandated: under the roll-forward policy (next bullet) a
+  clean merge proceeds on the head's green run, and re-verifying per sibling merge is exactly
+  the cost the policy removes.
   Where the ci workflow has NO concurrency group, pushes do not supersede — they queue serially
   behind runs for commits nobody will merge (13 queued runs starved one PR's head for an hour on
   2026-08-28). The play: freeze pushes, cancel exactly the runs for superseded intermediate
   commits, let the head's run through, then one batched push carrying the held fixes. A worker
   told to freeze should hold locally-verified commits unpushed with their threads deliberately
   unresolved (resolving would claim work not visible on the PR).
+- **Roll-forward merges and the integration loop (ahrefs/ocannl#861, decided 2026-08-30).** The
+  merge gate is one green full-matrix run for the PR's *last commit*. A clean merge does not
+  restart verification — before the policy, every sibling merge invalidated every open PR's
+  exact-base verification (staging#533: three clean rebases and three full CI cycles over an
+  unchanged topic diff) — and only a merge that needed a conflict-RESOLVING commit waits for
+  green CI on that commit (the checks gate reads it naturally, it being the new head).
+  `pr-review.sh merge` warns loudly on a stale base but no longer refuses. The complement is
+  coordinator-owned: an **integration loop** that, as each merge lands, pulls merged master onto
+  whichever fleet machine currently has the least work (read `http://mac-studio:7799/api/fleet`
+  — the flotilla dashboard covers mac-studio, rog, minix) and runs the `@runtest @train` aliases
+  (the remote CI's coverage) there to completion. Pick up each merge as it lands; one run
+  covering several merges is incidental batching — they landed while a suite was in flight —
+  never deliberate accumulation, which would just rebuild the serialization the policy removed.
+  **On a regression, stop the world**: launch nothing new, notify running workers that a known
+  regression unrelated to their work exists (so nobody bisects it independently), and dispatch a
+  triage worker — fix directly when the fix is straightforward, file an issue when it involves a
+  trade-off with no clearly better option. Diagnose from `git log` on master between the last
+  green and first red integration run, not by local re-bisecting; one owner for the fix-forward.
+  The wave resumes with its remaining tasks once master is verified again.
 - **Merge gates under a saturated runner queue.** GitHub's macOS runners serialize; a
   20-PR day queues master runs ~2 h deep, which is how a stale test claim reached master unread
   on 2026-08-23 (#452 → red for two hours). `merge --wait` now refuses without a verdict (see

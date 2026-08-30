@@ -74,9 +74,12 @@
 # the two-file branch. Nothing on the merge path had a reason to notice: the checks were green (on
 # the stale head), the reviewer had approved (the stale diff), and `mergeable` was true (no textual
 # conflict — semantic drift does not produce one). So the count is read from the compare API and
-# WARNED about. It does not refuse: rebasing before merging is already the repo convention, so this
-# is the backstop for the pass where that was forgotten, and refusing on a number GitHub computes
-# would strand merges whose drift is genuinely irrelevant.
+# WARNED about. It does not refuse — for one day (2026-08-29) it did, and the ahrefs/ocannl#861
+# decision (2026-08-30) reverted that to the roll-forward policy: a clean merge proceeds on the
+# head's green run, verification does not restart per sibling merge (the gate's cost was
+# structural — #533 ran three full CI cycles over an unchanged diff), and what owns semantic
+# drift after the fact is the wave coordinator's integration loop (issue-wave skill), which runs
+# the full suites on merged master and stops the world on a regression.
 #
 # REST vs GraphQL: everything on the polling and merge-gate path is REST, deliberately — GitHub's
 # GraphQL endpoint 503s independently of REST, so a GraphQL-borne "no reaction yet" is a lie the
@@ -1317,12 +1320,17 @@ off) ;;
 esac
 
 # Prints the count, loudly when it is at or over the threshold. Returns 0 fresh enough, 1 at/over
-# the threshold, 3 unread. Since 2026-08-29 the merge path treats 1 as a GATE (four wave workers
-# independently flagged merge-past-drift as the residual hole; #488's 136-commit near-miss is the
-# canonical case) — below the threshold it stays informational, because on a busy repo a few
-# commits of drift accrue during every CI wait and refusing them would livelock the merge queue.
-# The DIFFERENCE between "not behind" and "could not be read" is preserved here like everywhere
-# else in this file: a compare call that never answered must not print a reassuring number.
+# the threshold, 3 unread. For one day (2026-08-29) the merge path treated 1 as a GATE; the
+# ahrefs/ocannl#861 decision (2026-08-30) reverted it to a WARNING under the roll-forward policy:
+# a PR merges on one green full-matrix run for its LAST commit, a clean merge does not restart
+# verification, and only a conflict-RESOLVING commit needs green CI after it — which the checks
+# gate reads naturally, that commit being the new head. The gate's cost was structural (every
+# sibling merge invalidated every open PR's verification; #533 ran three complete rebase+CI
+# cycles over an unchanged topic diff), and #488's semantic-drift risk is owned after the fact by
+# the wave's integration loop (issue-wave skill: full suites on merged master, stop-the-world on
+# regression). The DIFFERENCE between "not behind" and "could not be read" is preserved here like
+# everywhere else in this file: a compare call that never answered must not print a reassuring
+# number.
 warn_base_drift() {
   local pr="$1" fields cmp base head sha behind ahead rc
   [ "$STALE_BASE" = off ] && return 0
@@ -1369,16 +1377,18 @@ warn_base_drift() {
   fi
   echo "!!! $REPO#$pr is $behind COMMITS BEHIND its base ($base)."
   echo "!!! The review that approved this branch, and the checks that went green on it, both judged"
-  echo "!!! it against a base that has since moved $behind commits. $base may have edited the very"
-  echo "!!! files this PR changes: merging now lands a combination nobody reviewed and no CI run"
-  echo "!!! built. A clean 'mergeable' says only that the two texts do not collide."
-  echo "!!! Rebase onto the base (or merge it in, where the branch is shared and rewriting is not"
-  echo "!!! yours to do), push, and let the checks re-run before merging:"
-  echo "!!!   git fetch <the remote pointing at $REPO> && git rebase <that remote>/$base"
+  echo "!!! it against a base that has since moved $behind commits. Under the roll-forward policy"
+  echo "!!! (ahrefs/ocannl#861) this does NOT block a clean merge — the post-merge integration loop"
+  echo "!!! re-runs the full suites on merged master — but a clean 'mergeable' says only that the"
+  echo "!!! two texts do not collide. Read the drift before letting the merge stand:"
+  echo "!!!   git fetch <the remote pointing at $REPO>"
   echo "!!!   git diff <that remote>/$base..HEAD --stat   # two dots: on a stale branch this shows"
   echo "!!!                                               # the BASE's files too, not just yours"
+  echo "!!! Only when $base has visibly edited the files this PR changes, rebase (or merge it in,"
+  echo "!!! where the branch is shared), push, and let the checks re-run first."
   warn "MERGING A STALE BRANCH: $REPO#$pr is $behind commits behind $base (warns at $STALE_BASE," \
-    "SHIP_PR_STALE_BASE) — rebase and re-check unless you know the drift is irrelevant."
+    "SHIP_PR_STALE_BASE) — a clean merge is the policy (roll-forward, ahrefs/ocannl#861); rebase" \
+    "first only when the drift plausibly touches this PR's files."
   return 1
 }
 
@@ -1462,23 +1472,11 @@ cmd_merge() {
     ;;
   esac
   # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
-  # verdict is the final thing on screen before the merge itself. At/over the stale threshold it
-  # REFUSES (an approval and a green build both judged a tree $STALE_BASE+ commits stale — the
-  # combination about to land was never reviewed or built); --override carries it, with a reason.
-  warn_base_drift "$PR_NUM"
-  case "$?" in
-  1)
-    if [ -n "$override" ]; then
-      echo "OVERRIDE: merging $REPO#$PR_NUM over a stale base (see above) — $override"
-      warn "OVERRIDE: merging $REPO#$PR_NUM at/over the stale-base threshold — $override"
-    else
-      fail 1 "REFUSING to merge $REPO#$PR_NUM: at/over the stale-base threshold" \
-        "(SHIP_PR_STALE_BASE=$STALE_BASE, see above). Rebase onto the base (or merge it in)," \
-        "push, let review+checks re-run, then merge — or, only when the drift is genuinely" \
-        "irrelevant to this change, re-run with --override '<why>'."
-    fi
-    ;;
-  esac
+  # verdict is the final thing on screen before the merge itself. A loud WARNING, not a gate: the
+  # roll-forward policy (ahrefs/ocannl#861, see warn_base_drift) lets a clean merge proceed on the
+  # head's green run, and hands semantic drift to the post-merge integration loop. A 3 (unread)
+  # has already said UNKNOWN loudly; neither outcome blocks the merge.
+  warn_base_drift "$PR_NUM" || true
   while :; do
     out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" "${gh_args[@]}")
     rc=$?

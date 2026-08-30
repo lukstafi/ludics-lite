@@ -371,7 +371,7 @@ hold. If the ceiling runs out it exits 4 naming `--allow-no-verdict`; for anythi
 wait again instead.
 
 Two traps around that hold, both observed 2026-08-28. **`ABSENT` seconds after a force-push is not
-a verdict** — the mandated rebase-before-merge pushes a new head whose checks may not EXIST yet,
+a verdict** — a rebase before merging pushes a new head whose checks may not EXIST yet,
 and a wait that starts in that window sees nothing to wait for and can pass the gate having read
 nothing (ocannl staging#491 merged that way). After any force-push, confirm a run exists on the
 new head (`gh pr checks` / the run list) before trusting a quick `ABSENT`-shaped answer, and if
@@ -410,18 +410,28 @@ Both gates above read the *head commit*, and both are satisfied by a branch whos
 without it. `merge` therefore also prints how many commits behind its base the branch is, and says
 so loudly — `!!! … COMMITS BEHIND`, on stdout and stderr — past 20 (`SHIP_PR_STALE_BASE`, or `off`).
 
-It warns and merges anyway: rebasing before merging is already the convention, so this is the
-backstop for the pass where that was forgotten, not a second gate. **Read the line before letting
-the merge stand.** On staging#488 (2026-08-28) sixteen review rounds ran against a base that had
-gone 136 commits stale, `master` had meanwhile edited the very file the PR changed, and every
-signal on the merge path was clean: green checks (on the stale head), an approval (of the stale
-diff), `mergeable=true` (semantic drift produces no textual conflict). What caught it was a hand-run
-`git diff origin/master..HEAD --stat` whose 258 files were visibly not the two-file branch — note
-the two dots, which is what makes the base's own changes show up; `...` would have looked innocent.
+It warns and merges anyway. That is the **roll-forward policy** (ahrefs/ocannl#861, decided
+2026-08-30 after a wave where every sibling merge invalidated every open PR's verification —
+staging#533 ran three clean rebases and three full CI cycles over an unchanged topic diff): a PR
+merges on one green full-matrix run for its *last commit*; a clean merge does not restart
+verification; only a merge that needed a conflict-RESOLVING commit waits for green CI on that
+commit, which the checks gate reads naturally as the new head. What owns semantic drift instead is
+the wave coordinator's post-merge **integration loop** (issue-wave skill): the full `@runtest
+@train` suites on merged master, on whichever fleet machine has the least work, with
+stop-the-world triage on a regression.
 
-When it fires, rebase (or merge the base in, where the branch is shared), push, and let the checks
-re-run — a stale-base merge lands a combination nobody reviewed and no CI run built. A count the
-compare API could not answer prints `UNKNOWN`, which is not "not behind": check it by hand.
+**Still read the line before letting the merge stand.** On staging#488 (2026-08-28) sixteen review
+rounds ran against a base that had gone 136 commits stale, `master` had meanwhile edited the very
+file the PR changed, and every signal on the merge path was clean: green checks (on the stale
+head), an approval (of the stale diff), `mergeable=true` (semantic drift produces no textual
+conflict). What caught it was a hand-run `git diff origin/master..HEAD --stat` whose 258 files were
+visibly not the two-file branch — note the two dots, which is what makes the base's own changes
+show up; `...` would have looked innocent.
+
+When the drift visibly touches the files this PR changes, rebase (or merge the base in, where the
+branch is shared), push, and let the checks re-run first; otherwise a clean merge on a green head
+is the policy, not a corner cut. A count the compare API could not answer prints `UNKNOWN`, which
+is not "not behind": check it by hand.
 
 ### The override
 
