@@ -412,42 +412,39 @@ test_dirty_session_refusal() {
   echo "PASS: dirty session is refused before cleanup"
 }
 
-test_master_owner_switch_refusal() {
-  local fake_bin real_git coordinator_before remote_master
+test_master_reservation() {
+  local fake_bin real_git candidate remote_master checkout_status
   setup_case master-owner-switch merge other
-  git -C "$CASE_MASTER_OWNER" branch coordinator
-  coordinator_before=$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/coordinator)
   remote_master=$(git -C "$CASE_INTEGRATOR" rev-parse refs/heads/master)
+  candidate="$CASE_ROOT/master-candidate"
+  git -C "$CASE_MAIN" worktree add --detach "$candidate" refs/heads/master >/dev/null
   fake_bin="$TEST_ROOT/master-owner-switch-bin"
   real_git=$(command -v git)
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'joined=" $* "' \
-    'case "$joined" in' \
-    '  *" checkout --detach "*)' \
-    '    if [ ! -e "$SWITCH_MARKER" ]; then' \
-    '      : >"$SWITCH_MARKER"' \
-    '      "$REAL_GIT" -C "$MASTER_OWNER" checkout coordinator >/dev/null' \
-    '    fi' \
-    '    ;;' \
-    'esac' \
+    'if [ "$3" = update-ref ] && [ "$5" = refs/heads/master ]; then' \
+    '  "$REAL_GIT" -C "$MASTER_CANDIDATE" checkout master >/dev/null 2>&1' \
+    '  echo "$?" >"$SWITCH_MARKER"' \
+    'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
 
-  if ! PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_OWNER="$CASE_MASTER_OWNER" \
+  if ! PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_CANDIDATE="$candidate" \
     SWITCH_MARKER="$TEST_ROOT/master-owner-switch.count" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
-    fail "named master update failed after an injected owner switch"
+    fail "continuously owned master update failed"
   fi
+  checkout_status=$(cat "$TEST_ROOT/master-owner-switch.count")
+  [ "$checkout_status" -ne 0 ] || fail "another worktree acquired master during its named update"
   assert_cleaned
   assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/master)" "$remote_master" \
     "named master ref must reach the remote tip"
-  assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/coordinator)" "$coordinator_before" \
-    "coordinator must not receive the master fast-forward"
   assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
-    "master owner must be reattached"
-  echo "PASS: master owner switch cannot redirect the named ref update"
+    "master must remain continuously owned"
+  ! git -C "$candidate" symbolic-ref -q HEAD >/dev/null 2>&1 ||
+    fail "candidate worktree stopped being detached"
+  echo "PASS: continuous master ownership blocks another checkout"
 }
 
 test_diverged_master_refusal() {
@@ -503,6 +500,45 @@ test_symbolic_ref_refusal() {
   echo "PASS: symbolic local and tracking refs are refused"
 }
 
+test_remote_master_lease() {
+  local fake_bin real_git remote_base log
+  setup_case remote-master-lease merge main-off
+  remote_base=$(git -C "$CASE_INTEGRATOR" rev-list --max-parents=0 HEAD)
+  fake_bin="$TEST_ROOT/remote-master-lease-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/remote-master-lease.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for arg in "$@"; do' \
+    '  if [ "$arg" = push ]; then' \
+    '    "$REAL_GIT" -C "$RACE_INTEGRATOR" push --force origin "$RACE_BASE:refs/heads/master" >/dev/null' \
+    '    break' \
+    '  fi' \
+    'done' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_INTEGRATOR="$CASE_INTEGRATOR" \
+    RACE_BASE="$remote_base" "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "topic deletion ignored a concurrent remote master rewrite"
+  fi
+  assert_topic_preserved
+  assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/master | awk '{print $1}')" \
+    "$remote_base" "remote master rewrite must remain visible after atomic refusal"
+  echo "PASS: remote master lease protects topic deletion"
+}
+
+test_config_lock_refusal() {
+  setup_case config-lock merge main-off
+  : >"$CASE_MAIN/.git/config.lock"
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "repository config lock was accepted"
+  fi
+  assert_topic_preserved
+  echo "PASS: config lock is refused before cleanup"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
@@ -521,8 +557,10 @@ test_already_absent_remote_retry
 test_absent_remote_recreation_race
 test_other_topic_owner_refusal
 test_dirty_session_refusal
-test_master_owner_switch_refusal
+test_master_reservation
 test_diverged_master_refusal
 test_locked_session_refusal
 test_symbolic_ref_refusal
+test_remote_master_lease
+test_config_lock_refusal
 echo "PASS: all post-merge cleanup states"

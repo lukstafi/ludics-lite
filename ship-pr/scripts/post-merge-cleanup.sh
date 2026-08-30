@@ -87,6 +87,7 @@ SESSION_COMMON=$(git_path "$SESSION" "$(git -C "$SESSION" rev-parse --git-common
 [ "$MAIN_GIT" = "$MAIN_COMMON" ] || fail "main-checkout is a linked worktree, not the primary checkout: $MAIN"
 [ "$MAIN" != "$SESSION" ] || fail "main checkout and session worktree must be different paths"
 [ "$SESSION_COMMON" = "$MAIN_COMMON" ] || fail "main checkout and session worktree belong to different repositories"
+[ ! -e "$MAIN_COMMON/config.lock" ] || fail "repository config is locked; retry after the lock clears"
 
 git -C "$MAIN" show-ref --verify --quiet "refs/heads/$BRANCH" ||
   fail "local branch does not exist: $BRANCH"
@@ -151,9 +152,9 @@ if git -C "$MAIN" symbolic-ref -q "refs/remotes/origin/$BRANCH" >/dev/null 2>&1;
   fail "remote-tracking branch is symbolic rather than direct: refs/remotes/origin/$BRANCH"
 fi
 
-# Prove and perform the local master fast-forward before deleting the remote recovery ref. When
-# master is checked out, detach its clean owner, update the named ref conditionally, then reattach;
-# no command may infer its destination from whichever branch happens to be current.
+# Prove and perform the local master fast-forward before deleting the remote recovery ref. Keep a
+# checked-out master continuously owned so Git refuses another worktree's checkout, conditionally
+# update the named ref, then refresh that same clean owner from the new tip.
 if git -C "$MAIN" symbolic-ref -q refs/heads/master >/dev/null 2>&1; then
   fail "local master ref is symbolic rather than direct"
 fi
@@ -177,16 +178,13 @@ else
   MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status --porcelain --untracked-files=normal) ||
     fail "could not inspect master owner cleanliness"
   [ -z "$MASTER_OWNER_STATUS" ] || fail "master owner is dirty; clean it before cleanup: $MASTER_OWNER"
-  git -C "$MASTER_OWNER" checkout --detach "$LOCAL_MASTER" >/dev/null ||
-    fail "could not detach the master owner before updating the named ref"
-  scan_branch_owner refs/heads/master
-  [ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "master became owned by another worktree before its update"
-  if ! git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER"; then
-    git -C "$MASTER_OWNER" checkout master >/dev/null 2>&1 || true
-    fail "local master moved after its owner was detached"
-  fi
-  git -C "$MASTER_OWNER" checkout master >/dev/null ||
-    fail "master advanced but its owner could not be reattached: $MASTER_OWNER"
+  git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER" ||
+    fail "local master moved after its owner preflight"
+  MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
+  [ "$MASTER_OWNER_REF" = refs/heads/master ] ||
+    fail "master advanced, but its owner switched branches before worktree refresh: $MASTER_OWNER"
+  git -C "$MASTER_OWNER" reset --hard "$REMOTE_MASTER" >/dev/null ||
+    fail "master advanced but its owner's worktree could not be refreshed: $MASTER_OWNER"
 fi
 
 LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot reread local master"
@@ -199,14 +197,18 @@ case "$REMOTE_BRANCH_STATUS" in
   REMOTE_BRANCH_OID=${REMOTE_BRANCH_LINE%%[[:space:]]*}
   [ "$REMOTE_BRANCH_OID" = "$LOCAL_BRANCH_OID" ] ||
     fail "origin/$BRANCH moved from local $LOCAL_BRANCH_OID to $REMOTE_BRANCH_OID; refusing to delete its newer tip"
-  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" \
-    "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH" ||
-    fail "could not lease-delete origin/$BRANCH at $REMOTE_BRANCH_OID"
+  git -C "$MAIN" push --atomic \
+    --force-with-lease="refs/heads/master:$REMOTE_MASTER" \
+    --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" \
+    "$ORIGIN_PUSH_URL" "$REMOTE_MASTER:refs/heads/master" ":refs/heads/$BRANCH" ||
+    fail "could not atomically lease master and delete origin/$BRANCH at $REMOTE_BRANCH_OID"
   ;;
 2)
-  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:" \
-    "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH" ||
-    fail "origin/$BRANCH changed after it was observed absent"
+  git -C "$MAIN" push --atomic \
+    --force-with-lease="refs/heads/master:$REMOTE_MASTER" \
+    --force-with-lease="refs/heads/$BRANCH:" \
+    "$ORIGIN_PUSH_URL" "$REMOTE_MASTER:refs/heads/master" ":refs/heads/$BRANCH" ||
+    fail "master or origin/$BRANCH changed after the topic was observed absent"
   echo "post-merge-cleanup.sh: origin/$BRANCH was already absent (absence lease confirmed)" >&2
   ;;
 *) fail "could not determine whether origin/$BRANCH exists (ls-remote exit $REMOTE_BRANCH_STATUS)" ;;
@@ -218,6 +220,15 @@ if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
   git -C "$MAIN" update-ref --no-deref -d "refs/remotes/origin/$BRANCH" "$TRACKING_BRANCH_OID" ||
     fail "origin/$BRANCH tracking ref changed while pruning it"
 fi
+
+# Remove configuration while the conditionally deletable local branch and session still exist, so
+# a concurrent config lock leaves a retryable cleanup rather than an unconfigurable missing branch.
+git -C "$MAIN" config --remove-section "branch.$BRANCH" 2>/dev/null
+CONFIG_REMOVE_STATUS=$?
+case "$CONFIG_REMOVE_STATUS" in
+0 | 5) ;;
+*) fail "branch configuration could not be removed; local $BRANCH and its session were preserved" ;;
+esac
 
 if [ -n "$SESSION_REF" ]; then
   git -C "$SESSION" checkout --detach >/dev/null || fail "could not detach the session worktree"
@@ -236,11 +247,5 @@ scan_branch_owner "refs/heads/$BRANCH"
 [ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "$BRANCH became owned by another worktree: $BRANCH_OWNER"
 git -C "$MAIN" update-ref --no-deref -d "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" ||
   fail "local $BRANCH moved from validated tip $LOCAL_BRANCH_OID; its newer ref was preserved"
-git -C "$MAIN" config --remove-section "branch.$BRANCH" 2>/dev/null
-CONFIG_REMOVE_STATUS=$?
-case "$CONFIG_REMOVE_STATUS" in
-0 | 5) ;;
-*) fail "local $BRANCH was deleted but its branch configuration could not be removed" ;;
-esac
 
 echo "post-merge-cleanup.sh: cleaned $BRANCH and removed $SESSION"
