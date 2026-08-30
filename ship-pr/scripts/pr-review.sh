@@ -620,10 +620,15 @@ status_state() {
   # as — the 👍 reaction, and a re-requested review CLEARS the reaction while the comment
   # persists (ocannl-staging#531, 2026-08-29). Capture the newest such verdict and the commit
   # it names; whether it approves the CURRENT head is decided below, once the head is known.
+  # The timestamp is updated_at, not created_at, and that carries a distinction: a verdict
+  # delivered by EDITING the running placeholder in place bears the edit time (newer than the
+  # round's 👀, as it must be to count), while a verdict comment left over from an earlier
+  # round keeps its old time and loses to a fresh 👀 — the re-request-without-a-push case,
+  # where the SHA still matches but a new round is running that may yet find something.
   vline=$(jq -r --arg rev "$REVIEWER" '
       [.[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | test("[Dd]idn.t find any major issues"))
-           | {at: .created_at,
+           | {at: (.updated_at // .created_at),
               sha: (try ((.body // "")
                     | capture("Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})").s)
                     catch "")}]
@@ -638,10 +643,14 @@ status_state() {
   # BEFORE the in-flight return below: with the placeholder off the comment clock, a verdict
   # delivered by editing that placeholder in place leaves the 👀 newer than the reviewer's last
   # dated word, and the round would read as `reviewing` forever (the app does not always take the
-  # 👀 back). The head is read here only when a verdict text exists at all, so the common
-  # reviewing path stays one call cheaper; a failed read falls through to the normal state logic
-  # rather than failing the whole status.
-  if [ -n "$verd_sha" ]; then
+  # 👀 back). Only a verdict NEWER than the 👀 qualifies — a re-requested review without a push
+  # raises a fresh 👀 over a verdict whose SHA still matches, and approving on that would reopen
+  # the merge gate under a round that is still running (see the updated_at note above for why an
+  # edited placeholder passes this bar and a leftover comment does not). The head is read here
+  # only when a qualifying verdict exists at all, so the common reviewing path stays one call
+  # cheaper; a failed read falls through to the normal state logic rather than failing the
+  # whole status.
+  if [ -n "$verd_sha" ] && { [ -z "$eyes_at" ] || [[ "$verd_at" > "$eyes_at" ]]; }; then
     head_sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha) || head_sha=""
     if [ -n "$head_sha" ]; then
       case "$head_sha" in
@@ -1048,7 +1057,7 @@ cmd_resolve() {
 # not retry the watch, read the run; 3 the API did not answer, so the run's state is UNKNOWN;
 # 4 no verdict — still running at the deadline, or stopped without being judged (cancelled).
 cmd_run_watch() {
-  local run_id="" repo="" interval="$CHECKS_INTERVAL" line rc status concl
+  local run_id="" repo="" interval="$CHECKS_INTERVAL" line rc status concl sleep_for remaining
   while [ $# -gt 0 ]; do
     case "$1" in
     -R | --repo)
@@ -1110,7 +1119,13 @@ cmd_run_watch() {
         "$(((now - started) / 60)) min"
       beat=$now
     fi
-    sleep "$interval"
+    # Capped at the remaining deadline: -i is a documented pass-through, and an interval longer
+    # than what is left would sleep the process hours past the advertised ceiling before the
+    # clock is checked again.
+    remaining=$((deadline - now))
+    sleep_for="$interval"
+    [ "$sleep_for" -le "$remaining" ] || sleep_for="$remaining"
+    sleep "$sleep_for"
   done
   case "$(conclusion_class "$concl")" in
   green)
@@ -1607,7 +1622,7 @@ cmd_merge() {
 cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
   local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
-  local nogo_at_tip=0 last_tip="" grace_from
+  local nogo_at_tip=0 last_tip="" grace_from confirm wf wid wname part sleep_for remaining
   local started now beat waited_note="" no_tip_verdict=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1631,6 +1646,16 @@ cmd_base() {
     [ $? -eq 0 ] && [ -n "$branch" ] || fail 3 "could not read $REPO's default branch" \
       "($(gh_err_line)) — the base's health is UNKNOWN, which is not 'fine'."
   fi
+  # Runs are fetched PER WORKFLOW below, not as one flat page: on an active branch, a page of
+  # mixed runs can entirely postdate an infrequent workflow's newest run, and a workflow the fold
+  # never sees is neither uncovered nor red — its standing verdict simply vanishes from the
+  # report (review of self-improve#13, round 5). The workflow list itself is one page of 100: a
+  # repo with more real workflows than that has bigger problems than this report.
+  wf=$(gh_retry read api "repos/$REPO/actions/workflows?per_page=100" \
+    --jq '.workflows[] | [(.id | tostring), .name] | @tsv')
+  rc=$?
+  [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's workflow list ($(gh_err_line));" \
+    "the base's health is UNKNOWN, which is NOT 'green'."
   started=$(date +%s)
   beat=$started
   grace_from=$started
@@ -1646,13 +1671,19 @@ cmd_base() {
     [ -n "$tip" ] || [ "$wait_for" -eq 0 ] ||
       fail 3 "could not read $REPO $branch's tip ($(gh_err_line)) — base --wait cannot know" \
         "which commit needs the verdict. This is UNKNOWN, not green: retry."
-    raw=$(gh_retry read api \
-      "repos/$REPO/actions/runs?branch=$branch&event=push&per_page=50" \
-      --jq '.workflow_runs[] | [.name, .status, (.conclusion // "pending"), .head_sha, .created_at,
-            (.html_url // "-")] | @tsv')
-    rc=$?
-    [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's runs on $branch ($(gh_err_line));" \
-      "the base's health is UNKNOWN, which is NOT 'green'."
+    raw=""
+    while IFS=$'\t' read -r wid wname; do
+      [ -n "$wid" ] || continue
+      is_advisory "$wname" && continue
+      part=$(gh_retry read api \
+        "repos/$REPO/actions/workflows/$wid/runs?branch=$branch&event=push&per_page=10" \
+        --jq '.workflow_runs[] | [.name, .status, (.conclusion // "pending"), .head_sha,
+              .created_at, (.html_url // "-")] | @tsv')
+      rc=$?
+      [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's '$wname' runs on $branch" \
+        "($(gh_err_line)); the base's health is UNKNOWN, which is NOT 'green'."
+      [ -n "$part" ] && raw="${raw}${part}"$'\n'
+    done <<<"$wf"
     # Empty result must short-circuit the fold: one empty line through tab-IFS `read` collapses
     # into shifted fields (tab is IFS whitespace), which used to render as a phantom workflow —
     # and a branch with no push-event runs would headline green with exit 0. Under --wait it is
@@ -1669,6 +1700,9 @@ cmd_base() {
       # leaves these columns unset, and unset prints as empty, which `IFS=$'\t' read` would
       # collapse.
       raw=$(awk -F'\t' '
+        $1 == "" { next } # the per-workflow assembly ends with a newline, and an empty record
+                          # here becomes a phantom workflow whose empty name shifts every later
+                          # field left through tab-IFS (seen live: a workflow named "pending")
         { nm=$1
           if (!(nm in seen)) { seen[nm]=1; order[++n]=nm; lstatus[nm]=$2; lsha[nm]=$4 }
           if ($2 == "completed" && !(nm in done)) { done[nm]=1; c[nm]=$3; csha[nm]=$4; cw[nm]=$5; cu[nm]=$6 }
@@ -1747,14 +1781,21 @@ cmd_base() {
       grace_from=$now
     fi
     if [ "$inflight" -eq 0 ]; then
-      [ "$uncovered" -eq 0 ] && break
+      if [ "$uncovered" -eq 0 ]; then
+        # Covered — against the tip read BEFORE the runs. A sibling merge landing between those
+        # two reads is the integration loop's normal traffic, and would make this a false green
+        # for a branch already pointing elsewhere: accept coverage only when the tip has not
+        # moved meanwhile; otherwise fall through to the sleep and let the next round re-read
+        # everything (the tip-change branch above restarts the grace).
+        confirm=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || confirm=""
+        [ "$confirm" = "$tip" ] && break
       # Nothing running and the tip unjudged. A tip run that completed STOPPED (cancelled/stale)
       # is not absence — it existed and was not judged, so no amount of paths-ignore explains it;
       # the grace only allows for a superseding replacement to be created, and then the verdict
       # is "none". A tip with NO run is either the not-created-yet window or paths-ignore, and
       # only time tells those apart: after the grace, settle for what is there — the
       # per-workflow lines name which commit each verdict is actually about.
-      if [ $((now - grace_from)) -ge "$BASE_ABSENT_GRACE" ]; then
+      elif [ $((now - grace_from)) -ge "$BASE_ABSENT_GRACE" ]; then
         if [ "$nogo_at_tip" -gt 0 ]; then
           waited_note="(the tip's newest run completed stopped-not-judged and no replacement appeared within the grace — NOT absence and NOT a verdict: re-run the workflow)"
           no_tip_verdict=1
@@ -1774,7 +1815,12 @@ cmd_base() {
         "not yet judged at the tip, after $(((now - started) / 60)) min"
       beat=$now
     fi
-    sleep "$CHECKS_INTERVAL"
+    # Capped at the remaining ceiling: an interval longer than what is left would carry the
+    # process past the advertised deadline before the clock is checked again.
+    remaining=$((started + wait_for - now))
+    sleep_for="$CHECKS_INTERVAL"
+    [ "$sleep_for" -le "$remaining" ] || sleep_for="$remaining"
+    sleep "$sleep_for"
   done
   [ -n "$waited_note" ] && echo "$waited_note"
   # A wait that ended WITHOUT the tip's verdict says exactly that, BEFORE the red branch below: at
