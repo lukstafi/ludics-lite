@@ -95,6 +95,28 @@ preflight_session_metadata_locks() {
   done
 }
 
+preflight_sparse_checkout_metadata() {
+  local path path_dir lock
+  path=$(git -C "$SESSION" rev-parse --git-path info/sparse-checkout) ||
+    fail "could not locate session sparse-checkout metadata"
+  case "$path" in
+  /*) ;;
+  *) path="$SESSION/$path" ;;
+  esac
+  path_dir=$(dirname "$path")
+  if [ ! -d "$path_dir" ]; then
+    { [ ! -e "$path" ] && [ ! -L "$path" ]; } ||
+      fail "session sparse-checkout metadata has an invalid parent"
+    return 0
+  fi
+  path_dir=$(canonical_dir "$path_dir") || exit $?
+  path="$path_dir/$(basename "$path")"
+  [ ! -L "$path" ] || fail "session sparse-checkout metadata is symbolic"
+  lock="$path.lock"
+  { [ ! -e "$lock" ] && [ ! -L "$lock" ]; } ||
+    fail "session sparse-checkout metadata is locked; retry after its Git operation finishes"
+}
+
 refuse_active_session_operations() {
   local name path path_dir
   for name in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
@@ -195,8 +217,30 @@ retain_topic_reflog_sides() {
   done <"$path"
 }
 
+retain_session_reflog_sides() {
+  local ref="$1" path path_dir line old_oid new_oid rest oid
+  path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "logs/$ref") ||
+    fail "could not locate session-private reflog: $ref"
+  case "$path" in
+  /*) ;;
+  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
+  esac
+  path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+  path="$path_dir/$(basename "$path")"
+  [ ! -L "$path" ] || fail "session-private reflog is symbolic: $ref"
+  [ -f "$path" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    read -r old_oid new_oid rest <<<"$line"
+    for oid in "$old_oid" "$new_oid"; do
+      case "$oid" in
+      *[!0]*) retain_session_object private-reflog "$oid" ;;
+      esac
+    done
+  done <"$path"
+}
+
 retain_private_session_refs() {
-  local private_refs line ref oid
+  local private_refs line ref oid response
   private_refs=$(git -C "$SESSION_ARCHIVED_WORKTREE" for-each-ref \
     --format='%(refname) %(objectname)' refs/worktree refs/bisect refs/rewritten) ||
     fail "could not recheck session-private refs before unregistering"
@@ -205,7 +249,38 @@ retain_private_session_refs() {
     oid=${line#* }
     [ -n "$ref" ] || continue
     [ -n "$oid" ] || fail "session-private ref has no object: $ref"
+
+    REF_TRANSACTION_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-ref-transaction.XXXXXX") ||
+      fail "could not allocate the session-private ref transaction: $ref"
+    REF_TRANSACTION_IN="$REF_TRANSACTION_DIR/input"
+    REF_TRANSACTION_OUT="$REF_TRANSACTION_DIR/output"
+    mkfifo "$REF_TRANSACTION_IN" "$REF_TRANSACTION_OUT" ||
+      fail "could not create the session-private ref transaction channels: $ref"
+    git -C "$SESSION_ARCHIVED_WORKTREE" update-ref --stdin \
+      <"$REF_TRANSACTION_IN" >"$REF_TRANSACTION_OUT" &
+    REF_TRANSACTION_PID=$!
+    exec 7>"$REF_TRANSACTION_IN" || fail "could not open the private ref transaction input: $ref"
+    exec 8<"$REF_TRANSACTION_OUT" || fail "could not open the private ref transaction output: $ref"
+    printf 'start\noption no-deref\nverify %s %s\nprepare\n' "$ref" "$oid" >&7 ||
+      fail "could not prepare the session-private ref transaction: $ref"
+    IFS= read -r response <&8 || fail "session-private ref transaction stopped before start: $ref"
+    [ "$response" = "start: ok" ] || fail "session-private ref transaction did not start: $ref"
+    IFS= read -r response <&8 || fail "session-private ref transaction stopped before preparation: $ref"
+    [ "$response" = "prepare: ok" ] || fail "session-private ref changed before retention: $ref"
     retain_session_object private-ref "$oid"
+    retain_session_reflog_sides "$ref"
+    printf 'commit\n' >&7 || fail "could not commit the session-private ref transaction: $ref"
+    IFS= read -r response <&8 || fail "session-private ref transaction stopped before commit: $ref"
+    [ "$response" = "commit: ok" ] || fail "session-private ref transaction did not commit: $ref"
+    exec 7>&- 8<&-
+    wait "$REF_TRANSACTION_PID" || fail "session-private ref transaction failed: $ref"
+    REF_TRANSACTION_PID=""
+    unlink "$REF_TRANSACTION_IN" || fail "could not remove the private ref transaction input: $ref"
+    unlink "$REF_TRANSACTION_OUT" || fail "could not remove the private ref transaction output: $ref"
+    REF_TRANSACTION_IN=""
+    REF_TRANSACTION_OUT=""
+    rmdir "$REF_TRANSACTION_DIR" || fail "could not remove the private ref transaction directory: $ref"
+    REF_TRANSACTION_DIR=""
   done <<<"$private_refs"
 }
 
@@ -248,7 +323,7 @@ delete_ref_with_locked_reflog() {
 
 lock_and_retain_session_metadata() {
   local name path path_dir lock line metadata oid config_snapshot index_snapshot index_tree
-  local shared_index shared_snapshot shared_temp
+  local shared_index shared_snapshot shared_temp sparse_snapshot
   local reuc_snapshot mode stage old_oid new_oid rest
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
     BISECT_HEAD AUTO_MERGE FETCH_HEAD; do
@@ -290,6 +365,31 @@ lock_and_retain_session_metadata() {
     config_snapshot=$(mktemp "$SESSION_ARCHIVE/config.worktree.XXXXXX") ||
       fail "could not allocate a per-worktree configuration snapshot"
     cp "$path" "$config_snapshot" || fail "could not archive per-worktree configuration"
+  fi
+
+  path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path info/sparse-checkout) ||
+    fail "could not locate archived sparse-checkout metadata"
+  case "$path" in
+  /*) ;;
+  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
+  esac
+  path_dir=$(dirname "$path")
+  if [ -d "$path_dir" ]; then
+    path_dir=$(canonical_dir "$path_dir") || exit $?
+    path="$path_dir/$(basename "$path")"
+    lock="$path.lock"
+    (set -o noclobber; printf '%s\n' "$$" >"$lock") 2>/dev/null ||
+      fail "archived sparse-checkout metadata is busy"
+    SESSION_PSEUDOREF_LOCKS+=("$lock")
+    [ ! -L "$path" ] || fail "archived sparse-checkout metadata is symbolic"
+    if [ -f "$path" ]; then
+      sparse_snapshot=$(mktemp "$SESSION_ARCHIVE/sparse-checkout.XXXXXX") ||
+        fail "could not allocate a sparse-checkout snapshot"
+      cp "$path" "$sparse_snapshot" || fail "could not archive sparse-checkout metadata"
+    fi
+  else
+    { [ ! -e "$path" ] && [ ! -L "$path" ]; } ||
+      fail "archived sparse-checkout metadata has an invalid parent"
   fi
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path index) ||
@@ -539,6 +639,7 @@ refuse_session_module_gitdirs "$SESSION"
 refuse_private_worktree_refs "$SESSION"
 refuse_active_session_operations
 preflight_session_metadata_locks
+preflight_sparse_checkout_metadata
 
 SESSION_HEAD_PATH=$(git -C "$SESSION" rev-parse --git-path HEAD) || fail "cannot locate session HEAD"
 case "$SESSION_HEAD_PATH" in

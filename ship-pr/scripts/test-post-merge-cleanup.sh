@@ -1465,6 +1465,34 @@ test_worktree_config_archive() {
   echo "PASS: per-worktree configuration is copied into the recovery archive"
 }
 
+test_sparse_checkout_archive() {
+  local file pattern_count pattern_snapshot patterns sparse_path
+  setup_case sparse-checkout-archive merge main-off
+  git -C "$CASE_SESSION" sparse-checkout init --no-cone
+  git -C "$CASE_SESSION" sparse-checkout set --no-cone value
+  sparse_path=$(git -C "$CASE_SESSION" rev-parse --git-path info/sparse-checkout)
+  case "$sparse_path" in
+  /*) ;;
+  *) sparse_path="$CASE_SESSION/$sparse_path" ;;
+  esac
+  [ -f "$sparse_path" ] || fail "test created no sparse-checkout pattern file"
+  patterns=$(cat "$sparse_path")
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  pattern_count=0
+  pattern_snapshot=""
+  for file in "$CASE_ARCHIVE"/sparse-checkout.*; do
+    [ -f "$file" ] || continue
+    pattern_count=$((pattern_count + 1))
+    pattern_snapshot="$file"
+  done
+  assert_eq "$pattern_count" 1 "cleanup must archive exactly one sparse-checkout pattern file"
+  assert_eq "$(cat "$pattern_snapshot")" "$patterns" \
+    "sparse-checkout patterns must survive unregistering"
+  echo "PASS: sparse-checkout patterns are copied into the recovery archive"
+}
+
 test_session_metadata_lock_preflight() {
   local local_master lock_path
   setup_case session-metadata-lock-preflight merge main-off
@@ -1484,9 +1512,11 @@ test_session_metadata_lock_preflight() {
 }
 
 test_late_private_worktree_ref_recovery() {
-  local fake_bin private_oid real_git
+  local fake_bin private_oid private_reflog_oid real_git
   setup_case late-private-worktree-ref merge main-off
   private_oid=$(printf 'late private worktree commit\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
+  private_reflog_oid=$(printf 'late private reflog commit\n' | git -C "$CASE_MAIN" commit-tree \
     "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
   fake_bin="$TEST_ROOT/late-private-worktree-ref-bin"
   real_git=$(command -v git)
@@ -1497,7 +1527,8 @@ test_late_private_worktree_ref_recovery() {
     '*.ship-pr-recovery.*/worktree)' \
     '  if [ "$3" = for-each-ref ] && [ ! -e "$PRIVATE_MARKER" ]; then' \
     '    : >"$PRIVATE_MARKER"' \
-    '    "$REAL_GIT" -C "$2" update-ref refs/worktree/late "$PRIVATE_OID"' \
+    '    "$REAL_GIT" -C "$2" update-ref --create-reflog refs/worktree/late "$PRIVATE_REFLOG_OID"' \
+    '    "$REAL_GIT" -C "$2" update-ref refs/worktree/late "$PRIVATE_OID" "$PRIVATE_REFLOG_OID"' \
     '  fi' \
     '  ;;' \
     'esac' \
@@ -1505,13 +1536,17 @@ test_late_private_worktree_ref_recovery() {
   chmod +x "$fake_bin/git"
 
   PATH="$fake_bin:$PATH" REAL_GIT="$real_git" PRIVATE_OID="$private_oid" \
+    PRIVATE_REFLOG_OID="$private_reflog_oid" \
     PRIVATE_MARKER="$TEST_ROOT/late-private-worktree-ref.injected" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
   assert_eq "$(git -C "$CASE_MAIN" rev-parse \
     "refs/ship-pr/session-recovery/topic/private-ref-$private_oid")" "$private_oid" \
     "late session-private ref object must remain directly reachable"
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse \
+    "refs/ship-pr/session-recovery/topic/private-reflog-$private_reflog_oid")" \
+    "$private_reflog_oid" "late session-private reflog object must remain directly reachable"
   assert_cleaned
-  echo "PASS: late session-private refs receive recovery refs before unregistering"
+  echo "PASS: late session-private ref tips and reflogs receive recovery refs"
 }
 
 test_symbolic_ref_refusal() {
@@ -2392,6 +2427,7 @@ test_session_index_recovery
 test_session_split_index_recovery
 test_session_resolve_undo_recovery
 test_worktree_config_archive
+test_sparse_checkout_archive
 test_session_metadata_lock_preflight
 test_late_private_worktree_ref_recovery
 test_symbolic_ref_refusal
