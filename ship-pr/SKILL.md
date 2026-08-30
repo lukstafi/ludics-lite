@@ -434,10 +434,22 @@ is the policy, not a corner cut. A count the compare API could not answer prints
 is not "not behind": check it by hand.
 
 **Standalone use has no coordinator running that loop**, so the after-the-fact check falls to
-this skill's own tail: the "After it lands" step below already re-reads `base` on the merged
-master, and after a stale-warned merge that call is not optional — it *is* the integration check
-(the base's CI runs the full matrix on what you just landed), and a red it turns up is yours to
-fix forward now, not the next session's to discover. The warning line says so when it fires.
+this skill's own tail, and after a stale-warned merge it is not optional — nor is it a plain
+`base` call, which seconds after a merge answers with the *previous* tip's green while the
+merge's own run is still queued or not yet created (the same window as the force-push `ABSENT`
+trap above). The integration check is:
+
+```bash
+~/.claude/skills/ship-pr/scripts/pr-review.sh base <owner>/<repo> [branch] --wait
+```
+
+which holds until the current tip has its own verdict — every non-advisory workflow judged at
+the tip, nothing mid-flight — settling for an older verdict only when no run for the tip appears
+within a grace and none is running (`SHIP_PR_BASE_ABSENT_GRACE`, 5 min: a docs-only merge under
+`paths-ignore` legitimately never gets one, and the settling is said out loud). If the wait
+ceiling runs out with the tip still unjudged it exits 4 — no verdict, not green, whatever older
+greens the report lists. A red it turns up is yours to fix forward now, not the next session's
+to discover. The warning line names the exact call when it fires.
 
 ### The override
 

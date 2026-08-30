@@ -105,8 +105,10 @@
 #                                          # checks, then merge; refuses on red without --override,
 #                                          # on NO verdict without --allow-no-verdict, and WARNS
 #                                          # loudly when the branch is far behind its base
-#   pr-review.sh base [owner/name] [branch]
+#   pr-review.sh base [owner/name] [branch] [--wait[=seconds]]
 #                                          # is the branch you are about to work off CI-green?
+#                                          # --wait holds until the CURRENT tip has its verdict —
+#                                          # the post-merge integration read (see cmd_base)
 #   pr-review.sh reply <pr> <comment-id> <body>
 #   pr-review.sh resolve <pr> <comment-id>
 #   pr-review.sh comment <pr> <body>       # a plain PR comment, for what has no thread to reply in:
@@ -146,6 +148,8 @@
 #      out for a build verdict (7200 — the runner queue alone ran ~2h deep on 2026-08-23),
 #      SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60), SHIP_PR_CHECKS_HEARTBEAT=seconds
 #      between the one-line "still waiting" progress notes a `--wait` prints (600),
+#      SHIP_PR_BASE_ABSENT_GRACE=seconds `base --wait` allows for a run on the tip to APPEAR
+#      before settling for an older verdict (300; paths-ignore pushes never get one),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences it — the warning never blocks the merge either way).
 
@@ -589,12 +593,20 @@ status_state() {
 
   # The summary comment counts as the reviewer speaking too: a round delivered only as an issue
   # comment would otherwise leave its 👀 looking live forever, which is this same bug in a hat.
+  # EXCEPT the machine-tagged round-started placeholder (codex-pull-request-review-summary,
+  # "🔄 Running"), which lands moments after the 👀 goes up: counting it as the last word makes a
+  # LIVE 👀 look spent — a watch that saw `reviewing` then returns "ended without a review" after
+  # two polls, and one that never did times out at the shorter grace while the round is still
+  # running (review of self-improve#13). It is an announcement, not the reviewer speaking; the
+  # verdict scan below still reads it, in case a verdict is ever delivered by editing it in place.
   raw=$(api_list "issues/$pr/comments?per_page=100") || {
     echo "unknown|-|the comments API did not answer ($(gh_err_line))"
     return 0
   }
   com_at=$(jq -r --arg rev "$REVIEWER" '
-      [.[] | select((.user.login // "") | startswith($rev)) | .created_at] | max // ""' \
+      [.[] | select((.user.login // "") | startswith($rev))
+           | select((.body // "") | test("codex-pull-request-review-summary") | not)
+           | .created_at] | max // ""' \
     <<<"$raw" 2>/dev/null) || {
     echo "unknown|-|the comments feed did not parse"
     return 0
@@ -1165,6 +1177,10 @@ BUILD_ADVISORY="${SHIP_PR_ADVISORY_CHECKS:-^(claude|Claude Code|github pages doc
 CHECKS_INTERVAL="${SHIP_PR_CHECKS_INTERVAL:-60}"
 CHECKS_WAIT="${SHIP_PR_CHECKS_WAIT:-7200}"
 CHECKS_HEARTBEAT="${SHIP_PR_CHECKS_HEARTBEAT:-600}"
+BASE_ABSENT_GRACE="${SHIP_PR_BASE_ABSENT_GRACE:-300}"
+case "$BASE_ABSENT_GRACE" in
+'' | *[!0-9]*) die "SHIP_PR_BASE_ABSENT_GRACE must be a number of seconds, got '$BASE_ABSENT_GRACE'" ;;
+esac
 
 is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }
 
@@ -1415,7 +1431,9 @@ warn_base_drift() {
   echo "!!! Only when $base has visibly edited the files this PR changes, rebase (or merge it in,"
   echo "!!! where the branch is shared), push, and let the checks re-run first."
   echo "!!! Merging OUTSIDE a coordinated wave? Then no integration loop is watching: after the"
-  echo "!!! merge, re-read the base's own CI (pr-review.sh base $REPO $base) and own any red."
+  echo "!!! merge, await the base's OWN verdict on what you landed — pr-review.sh base $REPO $base"
+  echo "!!!   --wait (a plain base call seconds after a merge answers with the PREVIOUS tip's"
+  echo "!!! green) — and own any red it turns up."
   warn "MERGING A STALE BRANCH: $REPO#$pr is $behind commits behind $base (warns at $STALE_BASE," \
     "SHIP_PR_STALE_BASE) — a clean merge is the policy (roll-forward, ahrefs/ocannl#861); rebase" \
     "first only when the drift plausibly touches this PR's files."
@@ -1551,20 +1569,36 @@ cmd_merge() {
 
 # The other half of #694: the confusion actually lands on whoever branches off a broken master.
 # Read the base's own CI before starting work, not only before merging.
+#
+# --wait exists for the OTHER end of a branch's life: the roll-forward policy's standalone
+# complement (ahrefs/ocannl#861, review of self-improve#13) is "after a stale-warned merge, read
+# the base's CI on what you just landed" — and a plain `base` seconds after a merge answers with
+# the PREVIOUS tip's green, because the merge's own run is still queued or does not exist yet
+# (the same not-created-yet window as the force-push ABSENT trap on the merge path). Declaring
+# integration green off that is the stale reading this command exists to prevent. So --wait
+# re-reads until nothing non-advisory is mid-flight AND every non-advisory workflow's newest
+# judged run is about the CURRENT tip — or, when no run for the tip has appeared and none is
+# running, until a grace expires (SHIP_PR_BASE_ABSENT_GRACE; paths-ignore means a docs-only push
+# legitimately never gets one, and only the grace separates "never coming" from "not yet"). A
+# red breaks the wait immediately: it is a verdict.
 cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
-  local vconcl vsha vwhen vurl stopped_note
+  local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0
+  local started now beat waited_note="" ceiling_hit=""
   while [ $# -gt 0 ]; do
     case "$1" in
     # First slashed arg is the repo UNLESS one is already named (--repo, REPO=, or an earlier
     # positional): branches carry slashes too (claude/...), and reading one as the repo turns
     # `base --repo owner/name claude/topic` into a 404 on repo "claude/topic".
     */*) if [ -z "$REPO" ]; then REPO="$1"; else branch="$1"; fi ;;
+    --wait) wait_for="$CHECKS_WAIT" ;;
+    --wait=*) wait_for="${1#--wait=}" ;;
     -*) die "base: unknown option '$1'" ;;
     *) branch="$1" ;;
     esac
     shift
   done
+  case "$wait_for" in '' | *[!0-9]*) die "base: --wait takes seconds, got '$wait_for'" ;; esac
   [ -n "$REPO" ] || REPO=$(repo_from_cwd) || true
   [ -n "$REPO" ] || die "base: name the repo — \`base owner/name [branch]\`, --repo, or REPO=." \
     "cwd inference only works from a checkout, and not from a background shell."
@@ -1573,80 +1607,119 @@ cmd_base() {
     [ $? -eq 0 ] && [ -n "$branch" ] || fail 3 "could not read $REPO's default branch" \
       "($(gh_err_line)) — the base's health is UNKNOWN, which is not 'fine'."
   fi
-  tip=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || tip=""
-  raw=$(gh_retry read api \
-    "repos/$REPO/actions/runs?branch=$branch&event=push&per_page=50" \
-    --jq '.workflow_runs[] | [.name, .status, (.conclusion // "pending"), .head_sha, .created_at,
-          (.html_url // "-")] | @tsv')
-  rc=$?
-  [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's runs on $branch ($(gh_err_line));" \
-    "the base's health is UNKNOWN, which is NOT 'green'."
-  # Empty result must short-circuit: one empty line through tab-IFS `read` collapses into
-  # shifted fields (tab is IFS whitespace), which used to render as a phantom workflow — and
-  # a branch with no push-event runs would headline green with exit 0.
-  if [ -z "$raw" ]; then
-    echo "$REPO $branch: no build workflow has run on it (nothing to read, not a green light)"
-    return 4
-  fi
-  # Newest first, so per workflow: the newest run at all (is one in flight?), the newest
-  # COMPLETED one, and the newest run with an actual VERDICT (red/green). The last one is what
-  # answers "is this base broken": under cancel-in-progress concurrency the newest completed run
-  # on a busy default branch is routinely `cancelled` — stopped, not judged — and reading that as
-  # either green or "no verdict" would be wrong (an older run usually did judge an earlier tip).
-  # Same empty-field rule as build_checks: a workflow with no completed run yet leaves these
-  # columns unset, and unset prints as empty, which `IFS=$'\t' read` would collapse.
-  raw=$(awk -F'\t' '
-    { nm=$1
-      if (!(nm in seen)) { seen[nm]=1; order[++n]=nm; lstatus[nm]=$2; lsha[nm]=$4 }
-      if ($2 == "completed" && !(nm in done)) { done[nm]=1; c[nm]=$3; csha[nm]=$4; cw[nm]=$5; cu[nm]=$6 }
-      if ($2 == "completed" && !(nm in vdone) && \
-          ($3 == "failure" || $3 == "timed_out" || $3 == "startup_failure" || \
-           $3 == "success" || $3 == "skipped" || $3 == "neutral")) {
-        vdone[nm]=1; v[nm]=$3; vs[nm]=$4; vw[nm]=$5; vu[nm]=$6 }
+  started=$(date +%s)
+  beat=$started
+  while :; do
+    red=0 pend=0 out="" inflight=0 uncovered=0
+    # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
+    # a further push during the wait moves the goal with it (its run includes the older merges).
+    tip=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || tip=""
+    raw=$(gh_retry read api \
+      "repos/$REPO/actions/runs?branch=$branch&event=push&per_page=50" \
+      --jq '.workflow_runs[] | [.name, .status, (.conclusion // "pending"), .head_sha, .created_at,
+            (.html_url // "-")] | @tsv')
+    rc=$?
+    [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's runs on $branch ($(gh_err_line));" \
+      "the base's health is UNKNOWN, which is NOT 'green'."
+    # Empty result must short-circuit the fold: one empty line through tab-IFS `read` collapses
+    # into shifted fields (tab is IFS whitespace), which used to render as a phantom workflow —
+    # and a branch with no push-event runs would headline green with exit 0. Under --wait it is
+    # the not-created-yet window instead, until the grace says otherwise.
+    if [ -z "$raw" ]; then
+      uncovered=1
+    else
+      # Newest first, so per workflow: the newest run at all (is one in flight?), the newest
+      # COMPLETED one, and the newest run with an actual VERDICT (red/green). The last one is what
+      # answers "is this base broken": under cancel-in-progress concurrency the newest completed
+      # run on a busy default branch is routinely `cancelled` — stopped, not judged — and reading
+      # that as either green or "no verdict" would be wrong (an older run usually did judge an
+      # earlier tip). Same empty-field rule as build_checks: a workflow with no completed run yet
+      # leaves these columns unset, and unset prints as empty, which `IFS=$'\t' read` would
+      # collapse.
+      raw=$(awk -F'\t' '
+        { nm=$1
+          if (!(nm in seen)) { seen[nm]=1; order[++n]=nm; lstatus[nm]=$2; lsha[nm]=$4 }
+          if ($2 == "completed" && !(nm in done)) { done[nm]=1; c[nm]=$3; csha[nm]=$4; cw[nm]=$5; cu[nm]=$6 }
+          if ($2 == "completed" && !(nm in vdone) && \
+              ($3 == "failure" || $3 == "timed_out" || $3 == "startup_failure" || \
+               $3 == "success" || $3 == "skipped" || $3 == "neutral")) {
+            vdone[nm]=1; v[nm]=$3; vs[nm]=$4; vw[nm]=$5; vu[nm]=$6 }
+        }
+        END { for (i=1;i<=n;i++) { nm=order[i]
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", nm, lstatus[nm], lsha[nm],
+              (nm in done ? c[nm] : "pending"), (nm in done ? csha[nm] : "-"),
+              (nm in done ? cw[nm] : "-"), (nm in done ? cu[nm] : "-"),
+              (nm in vdone ? v[nm] : "-"), (nm in vdone ? vs[nm] : "-"),
+              (nm in vdone ? vw[nm] : "-"), (nm in vdone ? vu[nm] : "-") } }
+      ' <<<"$raw")
+      while IFS=$'\t' read -r name status sha concl csha cwhen curl vconcl vsha vwhen vurl; do
+        [ -n "$name" ] || continue
+        is_advisory "$name" && continue
+        [ "$status" = completed ] || inflight=$((inflight + 1))
+        [ -n "$tip" ] && [ "$vsha" = "$tip" ] || uncovered=$((uncovered + 1))
+        # Newest completed run stopped-not-judged (cancelled/stale/action_required): the newest
+        # JUDGED run carries the verdict — a red under a cancelled run is not an all-clear — and
+        # the stopped run becomes context. Only when NO run ever judged this branch is there no
+        # verdict.
+        stopped_note=""
+        if [ "$(conclusion_class "$concl")" = nogo ] && [ "$vsha" != "-" ]; then
+          stopped_note="           (newest completed run: $concl at ${csha:0:8}, stopped not judged — verdict above is the newest judged run)"$'\n'
+          concl=$vconcl csha=$vsha cwhen=$vwhen curl=$vurl
+        fi
+        case "$(conclusion_class "$concl")" in
+        red)
+          red=$((red + 1))
+          out="${out}  RED      $name — $concl at ${csha:0:8} ($cwhen)  $curl"$'\n'
+          ;;
+        green) out="${out}  green    $name — $concl at ${csha:0:8}"$'\n' ;;
+        pending)
+          pend=$((pend + 1))
+          out="${out}  no verdict  $name — has never completed on $branch"$'\n'
+          ;;
+        *)
+          pend=$((pend + 1))
+          out="${out}  no verdict  $name — $concl at ${csha:0:8} (stopped, not judged; no earlier judged run in the window)  $curl"$'\n'
+          ;;
+        esac
+        out="${out}${stopped_note}"
+        # A run whose head is behind the tip is normal here (ci carries paths-ignore: docs/**),
+        # but it means the verdict is about an older tree than the one you are about to branch
+        # from.
+        [ "$csha" = "-" ] && csha=""
+        if [ "$status" != completed ]; then
+          out="${out}           ($name is running now at ${sha:0:8})"$'\n'
+        elif [ -n "$tip" ] && [ -n "$csha" ] && [ "$csha" != "$tip" ]; then
+          out="${out}           (that verdict is about ${csha:0:8}, not the tip ${tip:0:8})"$'\n'
+        fi
+      done <<<"$raw"
+    fi
+    [ "$wait_for" -gt 0 ] || break
+    [ "$red" -gt 0 ] && break # a red IS the verdict; waiting past it reports it late
+    now=$(date +%s)
+    if [ "$inflight" -eq 0 ]; then
+      [ "$uncovered" -eq 0 ] && break
+      # Nothing running and the tip unjudged: either the run has not been CREATED yet (the
+      # seconds-after-a-push window) or it is never coming (paths-ignore). Only time tells them
+      # apart, so give it the grace and then settle for what is there — the per-workflow lines
+      # name which commit each verdict is actually about.
+      if [ $((now - started)) -ge "$BASE_ABSENT_GRACE" ]; then
+        waited_note="(waited $(((now - started) / 60)) min: no run for the tip appeared and none is in flight — the verdicts above may trail it)"
+        break
+      fi
+    fi
+    [ $((now - started)) -lt "$wait_for" ] || {
+      waited_note="(--wait ceiling of $((wait_for / 60)) min reached with a run still unfinished or the tip unjudged — NOT a verdict for the tip)"
+      ceiling_hit=1
+      break
     }
-    END { for (i=1;i<=n;i++) { nm=order[i]
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", nm, lstatus[nm], lsha[nm],
-          (nm in done ? c[nm] : "pending"), (nm in done ? csha[nm] : "-"),
-          (nm in done ? cw[nm] : "-"), (nm in done ? cu[nm] : "-"),
-          (nm in vdone ? v[nm] : "-"), (nm in vdone ? vs[nm] : "-"),
-          (nm in vdone ? vw[nm] : "-"), (nm in vdone ? vu[nm] : "-") } }
-  ' <<<"$raw")
-  while IFS=$'\t' read -r name status sha concl csha cwhen curl vconcl vsha vwhen vurl; do
-    [ -n "$name" ] || continue
-    is_advisory "$name" && continue
-    # Newest completed run stopped-not-judged (cancelled/stale/action_required): the newest
-    # JUDGED run carries the verdict — a red under a cancelled run is not an all-clear — and the
-    # stopped run becomes context. Only when NO run ever judged this branch is there no verdict.
-    stopped_note=""
-    if [ "$(conclusion_class "$concl")" = nogo ] && [ "$vsha" != "-" ]; then
-      stopped_note="           (newest completed run: $concl at ${csha:0:8}, stopped not judged — verdict above is the newest judged run)"$'\n'
-      concl=$vconcl csha=$vsha cwhen=$vwhen curl=$vurl
+    if [ $((now - beat)) -ge "$CHECKS_HEARTBEAT" ]; then
+      warn "still waiting on $REPO $branch: $inflight run(s) in flight, $uncovered workflow(s)" \
+        "not yet judged at the tip, after $(((now - started) / 60)) min"
+      beat=$now
     fi
-    case "$(conclusion_class "$concl")" in
-    red)
-      red=$((red + 1))
-      out="${out}  RED      $name — $concl at ${csha:0:8} ($cwhen)  $curl"$'\n'
-      ;;
-    green) out="${out}  green    $name — $concl at ${csha:0:8}"$'\n' ;;
-    pending)
-      pend=$((pend + 1))
-      out="${out}  no verdict  $name — has never completed on $branch"$'\n'
-      ;;
-    *)
-      pend=$((pend + 1))
-      out="${out}  no verdict  $name — $concl at ${csha:0:8} (stopped, not judged; no earlier judged run in the window)  $curl"$'\n'
-      ;;
-    esac
-    out="${out}${stopped_note}"
-    # A run whose head is behind the tip is normal here (ci carries paths-ignore: docs/**), but it
-    # means the verdict is about an older tree than the one you are about to branch from.
-    [ "$csha" = "-" ] && csha=""
-    if [ "$status" != completed ]; then
-      out="${out}           ($name is running now at ${sha:0:8})"$'\n'
-    elif [ -n "$tip" ] && [ -n "$csha" ] && [ "$csha" != "$tip" ]; then
-      out="${out}           (that verdict is about ${csha:0:8}, not the tip ${tip:0:8})"$'\n'
-    fi
-  done <<<"$raw"
+    sleep "$CHECKS_INTERVAL"
+  done
+  [ -n "$waited_note" ] && echo "$waited_note"
   if [ "$red" -gt 0 ]; then
     echo "!!! $REPO $branch is RED — $red workflow(s) failed on the tip you are about to branch from"
     printf '%s' "$out"
@@ -1666,6 +1739,9 @@ cmd_base() {
   fi
   echo "$REPO $branch: green${tip:+ (tip ${tip:0:8})}"
   printf '%s' "$out"
+  # A ceiling-hit wait has NO verdict for the tip, whatever older greens the lines above carry —
+  # exit 0 here would let a script-driven caller read a timed-out wait as integration-green.
+  [ -n "$ceiling_hit" ] && return 4
   return 0
 }
 
@@ -1688,7 +1764,8 @@ comment) shift && cmd_comment "$@" ;;
 retry) shift && cmd_retry "$@" ;;
 *) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|checks|merge|reply|resolve} <pr> ...
   pr-review.sh comment <pr> <body>           # a plain PR comment (a summary round, a review nudge)
-  pr-review.sh base [owner/name] [branch]    # is the base branch's CI green? (start of work)
+  pr-review.sh base [owner/name] [branch] [--wait]  # is the base branch's CI green? (start of
+                                             # work; --wait = post-merge integration read)
   pr-review.sh retry [--read] <gh args...>   # any other gh call, same retry policy
   pr-review.sh retry run watch <run-id> [-R owner/name]  # quiet await of ONE run (never forwarded
                                              # to gh); for a PR prefer: checks <pr> --wait
