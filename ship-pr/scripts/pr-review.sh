@@ -164,16 +164,20 @@ CACHE="$STATE_DIR/repo-by-pr"
 # what draws the harness's warning — on every call, when the state dir is unwritable and unreadable
 # (self-improve#8: workers given explicit owner/name#number arguments, which never need the cache,
 # still warned on each invocation). So it can be switched off outright (SHIP_PR_STATE_DIR=off),
-# and a failed write latches it off. The latch is a file, not a variable, because cache_put runs
-# inside command substitutions (every `watch` round's poll is one), where a variable set there
-# would not survive to the next round — and it must outlive the PROCESS too, since every
+# and a failed write latches WRITES off. The latch is a file, not a variable, because cache_put
+# runs inside command substitutions (every `watch` round's poll is one), where a variable set
+# there would not survive to the next round — and it must outlive the PROCESS too, since every
 # documented pr-review.sh command is its own invocation and a per-process latch would re-attempt
 # the prohibited write once per command (review of self-improve#13). Hence: keyed by the state
 # dir (overriding SHIP_PR_STATE_DIR to a writable place re-enables caching instead of inheriting
-# a stale latch), and deliberately NOT removed by the exit trap.
+# a stale latch), and deliberately NOT removed by the exit trap. Reads are gated only by the
+# explicit off switch: a readable-but-unwritable cache keeps serving the mappings it already
+# holds — reading costs no prohibited write, and disabling it would turn every later bare-number
+# call into a usage failure over one unrelated write refusal (same review, round 4).
 CACHE_OFF_FILE="${TMPDIR:-/tmp}/pr-review-nocache.$(printf '%s' "$STATE_DIR" | cksum | cut -d' ' -f1)"
 case "$STATE_DIR" in off | none) CACHE_OFF=1 ;; *) CACHE_OFF="" ;; esac
-cache_off() { [ -n "$CACHE_OFF" ] || [ -e "$CACHE_OFF_FILE" ]; }
+cache_disabled() { [ -n "$CACHE_OFF" ]; }
+cache_write_off() { cache_disabled || [ -e "$CACHE_OFF_FILE" ]; }
 
 API_ATTEMPTS="${SHIP_PR_API_ATTEMPTS:-4}"
 API_BACKOFF="${SHIP_PR_API_BACKOFF:-5}"
@@ -294,7 +298,7 @@ gh_err_line() {
 # a cache hit is VERIFIED against the API before it is trusted — a wrong repo would post a reply
 # onto an unrelated PR, which is worse than the error it is standing in for.
 cache_get() {
-  cache_off && return 1
+  cache_disabled && return 1
   [ -f "$CACHE" ] || return 1
   local hit
   hit=$(awk -v n="$1" '$1 == n { r = $2 } END { if (r != "") print r }' "$CACHE" 2>/dev/null)
@@ -307,7 +311,7 @@ cache_get() {
 # makes losing an entry harmless. Skipping the no-op rewrite keeps most of that window shut, since
 # a running `watch` re-resolves every round.
 cache_put() {
-  cache_off && return 0
+  cache_write_off && return 0
   [ "$(cache_get "$1" 2>/dev/null)" = "$2" ] && return 0
   mkdir -p "$STATE_DIR" 2>/dev/null || {
     : >"$CACHE_OFF_FILE" 2>/dev/null
@@ -629,6 +633,25 @@ status_state() {
   verd_at="${vline%%|*}"
   verd_sha="${vline#*|}"
   last_spoke=$(newest "$rev_at" "$com_at")
+
+  # A no-findings verdict naming the CURRENT head outranks a live-looking 👀, and must be checked
+  # BEFORE the in-flight return below: with the placeholder off the comment clock, a verdict
+  # delivered by editing that placeholder in place leaves the 👀 newer than the reviewer's last
+  # dated word, and the round would read as `reviewing` forever (the app does not always take the
+  # 👀 back). The head is read here only when a verdict text exists at all, so the common
+  # reviewing path stays one call cheaper; a failed read falls through to the normal state logic
+  # rather than failing the whole status.
+  if [ -n "$verd_sha" ]; then
+    head_sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha) || head_sha=""
+    if [ -n "$head_sha" ]; then
+      case "$head_sha" in
+      "$verd_sha"*)
+        echo "approved|-|$REVIEWER posted a no-findings verdict for head ${head_sha:0:7} at $verd_at"
+        return 0
+        ;;
+      esac
+    fi
+  fi
 
   # In flight only while the 👀 is newer than everything the reviewer has said. An empty last_spoke
   # (nothing posted yet) makes any 👀 live, which is right: that is a first round running.
@@ -1584,7 +1607,8 @@ cmd_merge() {
 cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
   local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
-  local started now beat waited_note="" ceiling_hit=""
+  local nogo_at_tip=0 last_tip="" grace_from
+  local started now beat waited_note="" no_tip_verdict=""
   while [ $# -gt 0 ]; do
     case "$1" in
     # First slashed arg is the repo UNLESS one is already named (--repo, REPO=, or an earlier
@@ -1609,8 +1633,9 @@ cmd_base() {
   fi
   started=$(date +%s)
   beat=$started
+  grace_from=$started
   while :; do
-    red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0
+    red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
     tip=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || tip=""
@@ -1664,6 +1689,11 @@ cmd_base() {
         is_advisory "$name" && continue
         [ "$status" = completed ] || inflight=$((inflight + 1))
         [ -n "$tip" ] && [ "$vsha" = "$tip" ] || uncovered=$((uncovered + 1))
+        # A tip run that completed stopped-not-judged (cancelled/stale/action_required) is NOT
+        # the same absence as a run that never existed: one wants a re-run, the other may be
+        # paths-ignore. Recorded here, before the nogo-swap below overwrites concl/csha.
+        [ "$(conclusion_class "$concl")" = nogo ] && [ -n "$tip" ] && [ "$csha" = "$tip" ] &&
+          nogo_at_tip=$((nogo_at_tip + 1))
         # Newest completed run stopped-not-judged (cancelled/stale/action_required): the newest
         # JUDGED run carries the verdict — a red under a cancelled run is not an all-clear — and
         # the stopped run becomes context. Only when NO run ever judged this branch is there no
@@ -1709,20 +1739,34 @@ cmd_base() {
     # tip's run completes, the newest-judged fold replaces it either way.
     [ "$red_at_tip" -gt 0 ] && break
     now=$(date +%s)
+    # The absence grace runs from the last time the TIP MOVED, not from when the wait started: a
+    # further merge landing after the grace had already elapsed would otherwise be declared
+    # integration-green on the spot, its run not yet created and the timer long spent.
+    if [ "$tip" != "$last_tip" ]; then
+      last_tip="$tip"
+      grace_from=$now
+    fi
     if [ "$inflight" -eq 0 ]; then
       [ "$uncovered" -eq 0 ] && break
-      # Nothing running and the tip unjudged: either the run has not been CREATED yet (the
-      # seconds-after-a-push window) or it is never coming (paths-ignore). Only time tells them
-      # apart, so give it the grace and then settle for what is there — the per-workflow lines
-      # name which commit each verdict is actually about.
-      if [ $((now - started)) -ge "$BASE_ABSENT_GRACE" ]; then
-        waited_note="(waited $(((now - started) / 60)) min: no run for the tip appeared and none is in flight — the verdicts above may trail it)"
+      # Nothing running and the tip unjudged. A tip run that completed STOPPED (cancelled/stale)
+      # is not absence — it existed and was not judged, so no amount of paths-ignore explains it;
+      # the grace only allows for a superseding replacement to be created, and then the verdict
+      # is "none". A tip with NO run is either the not-created-yet window or paths-ignore, and
+      # only time tells those apart: after the grace, settle for what is there — the
+      # per-workflow lines name which commit each verdict is actually about.
+      if [ $((now - grace_from)) -ge "$BASE_ABSENT_GRACE" ]; then
+        if [ "$nogo_at_tip" -gt 0 ]; then
+          waited_note="(the tip's newest run completed stopped-not-judged and no replacement appeared within the grace — NOT absence and NOT a verdict: re-run the workflow)"
+          no_tip_verdict=1
+        else
+          waited_note="(waited $(((now - started) / 60)) min: no run for the tip appeared and none is in flight — the verdicts above may trail it)"
+        fi
         break
       fi
     fi
     [ $((now - started)) -lt "$wait_for" ] || {
       waited_note="(--wait ceiling of $((wait_for / 60)) min reached with a run still unfinished or the tip unjudged — NOT a verdict for the tip)"
-      ceiling_hit=1
+      no_tip_verdict=1
       break
     }
     if [ $((now - beat)) -ge "$CHECKS_HEARTBEAT" ]; then
@@ -1733,6 +1777,16 @@ cmd_base() {
     sleep "$CHECKS_INTERVAL"
   done
   [ -n "$waited_note" ] && echo "$waited_note"
+  # A wait that ended WITHOUT the tip's verdict says exactly that, BEFORE the red branch below: at
+  # the ceiling with an older tip's red standing, that branch would headline "failed on the tip
+  # you are about to branch from" with exit 1 — a claim about a commit that has no verdict yet. A
+  # red AT the tip broke the wait before this flag could be set, so it still reports as red; the
+  # older red stays visible in the per-workflow lines under the honest headline.
+  if [ -n "$no_tip_verdict" ]; then
+    echo "$REPO $branch: NO VERDICT for the tip${tip:+ ${tip:0:8}} — not green, not red (see above)"
+    printf '%s' "$out"
+    return 4
+  fi
   if [ "$red" -gt 0 ]; then
     echo "!!! $REPO $branch is RED — $red workflow(s) failed on the tip you are about to branch from"
     printf '%s' "$out"
@@ -1752,9 +1806,6 @@ cmd_base() {
   fi
   echo "$REPO $branch: green${tip:+ (tip ${tip:0:8})}"
   printf '%s' "$out"
-  # A ceiling-hit wait has NO verdict for the tip, whatever older greens the lines above carry —
-  # exit 0 here would let a script-driven caller read a timed-out wait as integration-green.
-  [ -n "$ceiling_hit" ] && return 4
   return 0
 }
 

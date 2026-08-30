@@ -546,9 +546,12 @@ were doing, give the command, and let the user decide. Never work around it.
 
 After merging: refresh the base for the next branch (`git fetch origin`, then branch off
 `origin/master` again) — and since your merge is what that base now carries, `base` is worth one
-more call here, before the next branch inherits it. Then tear down any scratch worktrees the work
-created on remote machines, and run the `after-merge` brainstorm while the session's friction is
-still in context.
+more call here, before the next branch inherits it. After a **stale-warned** merge that call is
+`base <owner>/<repo> --wait`, not the plain read — the stale-base section above owns the why: a
+plain call seconds after a merge answers with the previous tip's green, and the wait is the
+standalone integration check the roll-forward policy leans on. Then tear down any scratch
+worktrees the work created on remote machines, and run the `after-merge` brainstorm while the
+session's friction is still in context.
 
 ## Multi-PR arcs
 

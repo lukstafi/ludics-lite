@@ -290,8 +290,12 @@ The coordinator's job between launch and last merge:
   `pr-review.sh merge` warns loudly on a stale base but no longer refuses. The complement is
   coordinator-owned: an **integration loop** that, as each merge lands, pulls merged master onto
   whichever fleet machine currently has the least work (read `http://mac-studio:7799/api/fleet`
-  — the flotilla dashboard covers mac-studio, rog, minix) and runs the `@runtest @train` aliases
-  (the remote CI's coverage) there to completion. Pick up each merge as it lands; one run
+  — the flotilla dashboard covers mac-studio, rog, minix) and runs the MERGED repository's own
+  full integration suite there to completion — for OCANNL the `@runtest @train` aliases (the
+  remote CI's coverage); for a repo whose CI already is its fullest suite (ludics, flotilla,
+  this one), the merged tip's CI run is the verdict, awaited with `pr-review.sh base owner/repo
+  --wait` rather than re-run locally. The gate was relaxed for every repo, so every repo's waves
+  owe the complement in the suite that repo actually has. Pick up each merge as it lands; one run
   covering several merges is incidental batching — they landed while a suite was in flight —
   never deliberate accumulation, which would just rebuild the serialization the policy removed.
   **On a regression, stop the world**: launch nothing new, notify running workers that a known
