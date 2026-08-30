@@ -547,10 +547,12 @@ branch; both the remote and local deletions carry exact-OID leases. It also fetc
 explicitly, independent of the remote's configured fetch map, and proves the local ref can
 fast-forward before any remote deletion. A clean worktree keeps `master` continuously reserved
 while the named ref is conditionally updated and its tree refreshed, so another worktree cannot
-acquire the branch during that update. Remote topic deletion is an atomic transaction leased on
-both the observed topic and `master` OIDs. The helper refuses a topic owned by any other worktree
-and removes matching remote-tracking and branch-configuration residue while the local topic remains
-retryable. Do not reconstruct its state machine in prose or
+acquire the branch during that update. Remote topic deletion is leased on the observed topic OID
+and followed by a fresh `master` read; if `master` changed or became unreadable,
+the topic recovery ref is restored before refusal. The master-owner refresh also refuses ignored
+local data at paths changed by the fast-forward. The helper refuses a topic owned by any other
+worktree and removes matching remote-tracking and branch-configuration residue while the local
+topic remains retryable. Do not reconstruct its state machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to
 `master`, making deletion either tautological or a false refusal after the worktree is already gone.
 

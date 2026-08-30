@@ -52,6 +52,17 @@ scan_branch_owner() {
   done <<<"$worktree_list"
 }
 
+restore_remote_topic() {
+  if git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:" \
+    "$ORIGIN_PUSH_URL" "$LOCAL_BRANCH_OID:refs/heads/$BRANCH"; then
+    return 0
+  fi
+  # A competing writer may have restored another recovery tip first. That is still safer than an
+  # absent ref; distinguish it from a transport failure that left no recovery branch at all.
+  git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" \
+    "refs/heads/$BRANCH" >/dev/null 2>&1
+}
+
 [ "$#" -ge 3 ] || usage
 
 MAIN=$(canonical_dir "$1") || exit $?
@@ -178,6 +189,16 @@ else
   MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status --porcelain --untracked-files=normal) ||
     fail "could not inspect master owner cleanliness"
   [ -z "$MASTER_OWNER_STATUS" ] || fail "master owner is dirty; clean it before cleanup: $MASTER_OWNER"
+  IGNORED_COLLISION=""
+  while IFS= read -r -d '' CHANGED_PATH; do
+    if { [ -e "$MASTER_OWNER/$CHANGED_PATH" ] || [ -L "$MASTER_OWNER/$CHANGED_PATH" ]; } &&
+      git -C "$MASTER_OWNER" check-ignore -q -- "$CHANGED_PATH"; then
+      IGNORED_COLLISION="$CHANGED_PATH"
+      break
+    fi
+  done < <(git -C "$MAIN" diff --name-only -z "$LOCAL_MASTER" "$REMOTE_MASTER")
+  [ -z "$IGNORED_COLLISION" ] ||
+    fail "master fast-forward would overwrite ignored local data: $MASTER_OWNER/$IGNORED_COLLISION"
   git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER" ||
     fail "local master moved after its owner preflight"
   MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
@@ -197,22 +218,33 @@ case "$REMOTE_BRANCH_STATUS" in
   REMOTE_BRANCH_OID=${REMOTE_BRANCH_LINE%%[[:space:]]*}
   [ "$REMOTE_BRANCH_OID" = "$LOCAL_BRANCH_OID" ] ||
     fail "origin/$BRANCH moved from local $LOCAL_BRANCH_OID to $REMOTE_BRANCH_OID; refusing to delete its newer tip"
-  git -C "$MAIN" push --atomic \
-    --force-with-lease="refs/heads/master:$REMOTE_MASTER" \
-    --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" \
-    "$ORIGIN_PUSH_URL" "$REMOTE_MASTER:refs/heads/master" ":refs/heads/$BRANCH" ||
-    fail "could not atomically lease master and delete origin/$BRANCH at $REMOTE_BRANCH_OID"
+  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" \
+    "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH" ||
+    fail "could not lease-delete origin/$BRANCH at $REMOTE_BRANCH_OID"
   ;;
 2)
-  git -C "$MAIN" push --atomic \
-    --force-with-lease="refs/heads/master:$REMOTE_MASTER" \
-    --force-with-lease="refs/heads/$BRANCH:" \
-    "$ORIGIN_PUSH_URL" "$REMOTE_MASTER:refs/heads/master" ":refs/heads/$BRANCH" ||
-    fail "master or origin/$BRANCH changed after the topic was observed absent"
+  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:" \
+    "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH" ||
+    fail "origin/$BRANCH changed after the topic was observed absent"
   echo "post-merge-cleanup.sh: origin/$BRANCH was already absent (absence lease confirmed)" >&2
   ;;
 *) fail "could not determine whether origin/$BRANCH exists (ls-remote exit $REMOTE_BRANCH_STATUS)" ;;
 esac
+
+MASTER_AFTER_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads \
+  "$ORIGIN_PUSH_URL" refs/heads/master)
+MASTER_AFTER_STATUS=$?
+if [ "$MASTER_AFTER_STATUS" -ne 0 ]; then
+  restore_remote_topic ||
+    fail "remote master became unreadable after topic deletion, and the topic could not be restored"
+  fail "remote master became unreadable after topic deletion; origin/$BRANCH was restored"
+fi
+MASTER_AFTER_OID=${MASTER_AFTER_LINE%%[[:space:]]*}
+if [ "$MASTER_AFTER_OID" != "$REMOTE_MASTER" ]; then
+  restore_remote_topic ||
+    fail "remote master changed to $MASTER_AFTER_OID, and the topic could not be restored"
+  fail "remote master changed from $REMOTE_MASTER to $MASTER_AFTER_OID; origin/$BRANCH was restored"
+fi
 
 if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
   TRACKING_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/remotes/origin/$BRANCH") ||

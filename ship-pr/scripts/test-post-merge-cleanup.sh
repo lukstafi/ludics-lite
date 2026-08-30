@@ -501,32 +501,26 @@ test_symbolic_ref_refusal() {
 }
 
 test_remote_master_lease() {
-  local fake_bin real_git remote_base log
+  local real_git remote_base hook log
   setup_case remote-master-lease merge main-off
   remote_base=$(git -C "$CASE_INTEGRATOR" rev-list --max-parents=0 HEAD)
-  fake_bin="$TEST_ROOT/remote-master-lease-bin"
   real_git=$(command -v git)
+  hook="$CASE_MAIN/.git/hooks/pre-push"
   log="$TEST_ROOT/remote-master-lease.log"
-  mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'for arg in "$@"; do' \
-    '  if [ "$arg" = push ]; then' \
-    '    "$REAL_GIT" -C "$RACE_INTEGRATOR" push --force origin "$RACE_BASE:refs/heads/master" >/dev/null' \
-    '    break' \
-    '  fi' \
-    'done' \
-    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
-  chmod +x "$fake_bin/git"
+    '"$REAL_GIT" -C "$RACE_INTEGRATOR" push --force origin "$RACE_BASE:refs/heads/master" >/dev/null' \
+    'exit 0' >"$hook"
+  chmod +x "$hook"
 
-  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_INTEGRATOR="$CASE_INTEGRATOR" \
+  if REAL_GIT="$real_git" RACE_INTEGRATOR="$CASE_INTEGRATOR" \
     RACE_BASE="$remote_base" "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
     fail "topic deletion ignored a concurrent remote master rewrite"
   fi
   assert_topic_preserved
   assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/master | awk '{print $1}')" \
     "$remote_base" "remote master rewrite must remain visible after atomic refusal"
-  echo "PASS: remote master lease protects topic deletion"
+  echo "PASS: post-advertisement master rewrite restores the topic"
 }
 
 test_config_lock_refusal() {
@@ -537,6 +531,25 @@ test_config_lock_refusal() {
   fi
   assert_topic_preserved
   echo "PASS: config lock is refused before cleanup"
+}
+
+test_ignored_master_collision_refusal() {
+  local collision
+  setup_case ignored-master-collision merge other
+  collision="$CASE_MASTER_OWNER/collision"
+  echo collision >>"$CASE_MAIN/.git/info/exclude"
+  echo local-data >"$collision"
+  echo remote-data >"$CASE_INTEGRATOR/collision"
+  git -C "$CASE_INTEGRATOR" add collision
+  git -C "$CASE_INTEGRATOR" commit -m "track an ignored master-owner path" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "master refresh overwrote an ignored path collision"
+  fi
+  assert_eq "$(sed -n '1p' "$collision")" local-data "ignored master-owner data must survive"
+  assert_topic_preserved
+  echo "PASS: ignored master-owner collision is refused"
 }
 
 test_unchecked_out_master
@@ -563,4 +576,5 @@ test_locked_session_refusal
 test_symbolic_ref_refusal
 test_remote_master_lease
 test_config_lock_refusal
+test_ignored_master_collision_refusal
 echo "PASS: all post-merge cleanup states"
