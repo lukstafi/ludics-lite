@@ -12,6 +12,11 @@
 #     round printed "(no new inline comments)" beside the review it had just detected) — so a
 #     round that sees a new review re-reads pulls/<n>/reviews/<id>/comments and merges by comment
 #     id, and a failure of THAT read fails the whole round rather than dropping the findings;
+#   - the reviewer ANNOUNCES a round by posting a placeholder comment the moment it starts (the
+#     machine-tagged codex-pull-request-review-summary table, "🔄 Running"), so a new id above the
+#     watermark is not yet something to act on — it is dropped from the rendering while the
+#     watermark still advances past it, or every PR's watch wakes once for a round that has not
+#     finished (one wasted wake + re-arm per PR, observed landing self-improve#10 and #13);
 #   - empty/non-numeric API output makes [ "$n" -gt 0 ] abort, so no count is compared as an int;
 #   - the three feeds number their items in SEPARATE id spaces (a review id is ~4.9e9 while an
 #     inline-comment id is ~3.8e9), so one shared watermark takes the max from reviews and then
@@ -451,8 +456,18 @@ cmd_poll() {
       else .[] | "--- inline id=\(.id) \(.path // "?"):\(.line // .original_line // 0) by \(.user.login)\n\(.body)"
       end' <<<"$inline"
 
+  # The connector's "Review Summary" placeholder is machine-tagged with an HTML comment and posted
+  # the moment a round STARTS ("🔄 Running"); it carries no findings, but its id is above the
+  # watermark, so rendering it made `watch` return 0 with nothing to act on — one wasted wake and
+  # re-arm per PR (observed landing self-improve#10, 2026-08-29, and again on #13 the day the fix
+  # landed). It is dropped from the RENDERING only: the watermark below reads the unfiltered feed,
+  # so its id is advanced past and never replayed. Nothing is lost by hiding it — the comment is
+  # thereafter EDITED in place (same id, invisible to a watermark feed by construction), findings
+  # arrive as reviews and inline comments, and a no-findings verdict arrives as the 👍 or as its
+  # own "Didn't find any major issues" comment, both of which status_state reads live.
   jq -r --arg rev "$REVIEWER" --argjson since "$m_issue" '
-    map(select((.user.login // "") | startswith($rev)) | select(.id > $since))
+    map(select((.user.login // "") | startswith($rev)) | select(.id > $since)
+        | select((.body // "") | test("codex-pull-request-review-summary") | not))
     | .[] | "--- summary id=\(.id) by \(.user.login)\n\(.body)"' <<<"$issue"
 
   jq -r --arg rev "$REVIEWER" --argjson since "$m_review" '
