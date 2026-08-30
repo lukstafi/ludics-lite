@@ -401,6 +401,55 @@ test_other_topic_owner_refusal() {
   echo "PASS: topic owned by another worktree is refused"
 }
 
+test_dirty_session_refusal() {
+  setup_case dirty-session merge main-off
+  echo dirty >"$CASE_SESSION/untracked"
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "dirty session was accepted for destructive cleanup"
+  fi
+  assert_topic_preserved
+  assert_eq "$(git -C "$CASE_SESSION" symbolic-ref --short HEAD)" topic \
+    "dirty session must remain attached"
+  echo "PASS: dirty session is refused before cleanup"
+}
+
+test_master_owner_switch_refusal() {
+  local fake_bin real_git owner_before coordinator_before
+  setup_case master-owner-switch merge other
+  git -C "$CASE_MASTER_OWNER" branch coordinator
+  owner_before=$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/master)
+  coordinator_before=$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/coordinator)
+  fake_bin="$TEST_ROOT/master-owner-switch-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for arg in "$@"; do' \
+    '  if [ "$arg" = symbolic-ref ]; then' \
+    '    count=0' \
+    '    [ ! -f "$SWITCH_MARKER" ] || count=$(cat "$SWITCH_MARKER")' \
+    '    count=$((count + 1))' \
+    '    echo "$count" >"$SWITCH_MARKER"' \
+    '    [ "$count" -ne 2 ] || "$REAL_GIT" -C "$MASTER_OWNER" checkout coordinator >/dev/null' \
+    '    break' \
+    '  fi' \
+    'done' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_OWNER="$CASE_MASTER_OWNER" \
+    SWITCH_MARKER="$TEST_ROOT/master-owner-switch.count" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "cleanup merged origin/master into a branch selected after the owner scan"
+  fi
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/master)" "$owner_before" \
+    "master must remain unchanged after its owner switches away"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/coordinator)" "$coordinator_before" \
+    "coordinator must not receive the master fast-forward"
+  [ -d "$CASE_SESSION" ] || fail "session worktree was removed after master-owner refusal"
+  echo "PASS: master owner branch switch is revalidated"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
@@ -418,4 +467,6 @@ test_conditional_local_ref_deletion
 test_already_absent_remote_retry
 test_absent_remote_recreation_race
 test_other_topic_owner_refusal
+test_dirty_session_refusal
+test_master_owner_switch_refusal
 echo "PASS: all post-merge cleanup states"

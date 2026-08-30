@@ -110,6 +110,9 @@ if [ -n "$SESSION_REF" ]; then
 else
   [ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "detached session cannot clean $BRANCH while another worktree owns it: $BRANCH_OWNER"
 fi
+SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal) ||
+  fail "could not inspect session worktree cleanliness"
+[ -z "$SESSION_STATUS" ] || fail "session worktree is dirty; commit, stash, or remove its changes before cleanup"
 
 # Fetch before the safety decision: local master may be stale, while origin/master is the state
 # whose PR merge was independently confirmed. This also makes the later owner-specific update a
@@ -174,6 +177,9 @@ if [ "$BRANCH_OWNER_COUNT" -eq 0 ]; then
   git -C "$MAIN" fetch origin refs/heads/master:refs/heads/master ||
     fail "could not fast-forward unchecked-out master"
 else
+  MASTER_OWNER_REF=$(git -C "$BRANCH_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
+  [ "$MASTER_OWNER_REF" = refs/heads/master ] ||
+    fail "master owner changed branches before its fast-forward: $BRANCH_OWNER"
   git -C "$BRANCH_OWNER" merge --ff-only refs/remotes/origin/master ||
     fail "could not fast-forward master in its owning worktree: $BRANCH_OWNER"
 fi
