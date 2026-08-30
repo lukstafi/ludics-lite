@@ -64,14 +64,18 @@ restore_remote_topic() {
     "refs/heads/$BRANCH" >/dev/null 2>&1
 }
 
-cleanup_master_reservation() {
+cleanup_reservations() {
+  if [ -n "${TOPIC_RESERVATION:-}" ] && [ -d "$TOPIC_RESERVATION" ]; then
+    git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
+  fi
   if [ -n "${MASTER_RESERVATION:-}" ] && [ -d "$MASTER_RESERVATION" ]; then
     git -C "$MAIN" worktree remove --force "$MASTER_RESERVATION" >/dev/null 2>&1 || true
   fi
 }
 
 MASTER_RESERVATION=""
-trap cleanup_master_reservation EXIT
+TOPIC_RESERVATION=""
+trap cleanup_reservations EXIT
 
 [ "$#" -ge 3 ] || usage
 
@@ -229,13 +233,14 @@ while IFS= read -r -d '' CHANGED_PATH; do
 done < <(git -C "$MAIN" diff --name-only -z "$LOCAL_MASTER" "$REMOTE_MASTER")
 [ -z "$IGNORED_COLLISION" ] ||
   fail "master fast-forward would overwrite ignored local data: $MASTER_OWNER/$IGNORED_COLLISION"
-git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER" ||
-  fail "local master moved after its owner preflight"
+# Porcelain fast-forwarding holds Git's normal ref/index locks and refuses tracked edits that appear
+# after the cleanliness preflight. A separate update-ref followed by reset --hard would silently
+# destroy such a concurrent edit.
+git -C "$MASTER_OWNER" merge --ff-only "$REMOTE_MASTER" >/dev/null ||
+  fail "master owner changed or became dirty during its fast-forward: $MASTER_OWNER"
 MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
 [ "$MASTER_OWNER_REF" = refs/heads/master ] ||
-  fail "master advanced, but its owner switched branches before worktree refresh: $MASTER_OWNER"
-git -C "$MASTER_OWNER" reset --hard "$REMOTE_MASTER" >/dev/null ||
-  fail "master advanced but its owner's worktree could not be refreshed: $MASTER_OWNER"
+  fail "master owner switched branches during its fast-forward: $MASTER_OWNER"
 if [ -n "$MASTER_RESERVATION" ]; then
   git -C "$MAIN" worktree remove "$MASTER_RESERVATION" ||
     fail "master advanced but its temporary reservation could not be removed"
@@ -247,6 +252,18 @@ LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot rerea
 CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
 [ "$CURRENT_TOPIC_OID" = "$LOCAL_BRANCH_OID" ] ||
   fail "local $BRANCH moved before remote deletion; all topic artifacts were preserved"
+
+# A remote master can change immediately after any finite observation. Keep the validated topic
+# reachable locally even after its public branch is deleted, so a later rollback can always be
+# recovered rather than turning this cleanup into data loss.
+RECOVERY_REF="refs/ship-pr/recovery/$BRANCH/$LOCAL_BRANCH_OID"
+if git -C "$MAIN" show-ref --verify --quiet "$RECOVERY_REF"; then
+  RECOVERY_OID=$(git -C "$MAIN" rev-parse "$RECOVERY_REF") || fail "cannot read $RECOVERY_REF"
+  [ "$RECOVERY_OID" = "$LOCAL_BRANCH_OID" ] || fail "recovery ref points at an unexpected object: $RECOVERY_REF"
+else
+  git -C "$MAIN" update-ref --no-deref "$RECOVERY_REF" "$LOCAL_BRANCH_OID" "" ||
+    fail "could not retain the topic recovery ref: $RECOVERY_REF"
+fi
 
 REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
 REMOTE_BRANCH_STATUS=$?
@@ -297,10 +314,11 @@ if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
     fail "origin/$BRANCH tracking ref changed while pruning it"
 fi
 
-# Detect section absence explicitly: Git's no-section exit status varies by version. Removal still
-# happens while the local branch and session exist, so a config-lock race remains retryable.
+# Inspect only the repository-local file that removal edits. Included, global, and per-worktree
+# settings are inherited policy rather than branch-owned residue and are deliberately left alone.
 BRANCH_CONFIG_PRESENT=0
-BRANCH_CONFIG_NAMES=$(git -C "$MAIN" config --name-only --get-regexp '^branch\.' 2>/dev/null)
+BRANCH_CONFIG_NAMES=$(git -C "$MAIN" config --local --no-includes --name-only \
+  --get-regexp '^branch\.' 2>/dev/null)
 CONFIG_LIST_STATUS=$?
 case "$CONFIG_LIST_STATUS" in
 0)
@@ -312,23 +330,47 @@ case "$CONFIG_LIST_STATUS" in
 *) fail "branch configuration could not be inspected; local $BRANCH and its session were preserved" ;;
 esac
 if [ "$BRANCH_CONFIG_PRESENT" -eq 1 ] &&
-  ! git -C "$MAIN" config --remove-section "branch.$BRANCH" 2>/dev/null; then
+  ! git -C "$MAIN" config --local --no-includes --remove-section "branch.$BRANCH" 2>/dev/null; then
   fail "branch configuration could not be removed; local $BRANCH and its session were preserved"
 fi
 
-# Keep an attached session attached through every fallible metadata cleanup. Detach at the
-# validated OID only immediately before removal, then re-read the branch so a concurrent commit
-# preserves the worktree and regains a remote recovery ref.
+# Transfer topic ownership from the session to a temporary worktree, revalidating across the
+# handoff. Keeping that reservation attached through update-ref prevents another worktree from
+# acquiring the branch between the final owner scan and local deletion.
+TOPIC_RESERVATION=$(mktemp -d "${TMPDIR:-/tmp}/ship-pr-topic-reserve.XXXXXX") ||
+  fail "could not allocate a temporary topic reservation"
+rmdir "$TOPIC_RESERVATION" || fail "could not prepare the temporary topic reservation path"
+git -C "$MAIN" worktree add --detach "$TOPIC_RESERVATION" "$LOCAL_BRANCH_OID" >/dev/null ||
+  fail "could not prepare a temporary topic reservation"
+TOPIC_RESERVATION=$(canonical_dir "$TOPIC_RESERVATION") || exit $?
 if [ -n "$SESSION_REF" ]; then
   git -C "$SESSION" checkout --detach "$LOCAL_BRANCH_OID" >/dev/null ||
     fail "could not detach the session worktree at the validated topic tip"
-  CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
-  if [ "$CURRENT_TOPIC_OID" != "$LOCAL_BRANCH_OID" ]; then
-    git -C "$SESSION" checkout "$BRANCH" >/dev/null 2>&1 || true
-    restore_remote_topic "$CURRENT_TOPIC_OID" ||
-      fail "local $BRANCH moved during detachment, and its new tip could not be restored remotely"
-    fail "local $BRANCH moved during detachment; its worktree was reattached and remote tip restored"
-  fi
+fi
+if ! git -C "$TOPIC_RESERVATION" checkout "$BRANCH" >/dev/null 2>&1; then
+  git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
+  TOPIC_RESERVATION=""
+  [ -z "$SESSION_REF" ] || git -C "$SESSION" checkout "$BRANCH" >/dev/null 2>&1 || true
+  fail "could not reserve local $BRANCH for deletion; another worktree may have acquired it"
+fi
+CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
+if [ "$CURRENT_TOPIC_OID" != "$LOCAL_BRANCH_OID" ]; then
+  git -C "$TOPIC_RESERVATION" checkout --detach "$LOCAL_BRANCH_OID" >/dev/null 2>&1 || true
+  git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
+  TOPIC_RESERVATION=""
+  [ -z "$SESSION_REF" ] || git -C "$SESSION" checkout "$BRANCH" >/dev/null 2>&1 || true
+  restore_remote_topic "$CURRENT_TOPIC_OID" ||
+    fail "local $BRANCH moved during ownership handoff, and its new tip could not be restored remotely"
+  fail "local $BRANCH moved during ownership handoff; its session and remote tip were preserved"
+fi
+
+scan_branch_owner "refs/heads/$BRANCH"
+[ "$BRANCH_OWNER_COUNT" -eq 1 ] || fail "$BRANCH reservation was lost before deletion"
+BRANCH_OWNER=$(canonical_dir "$BRANCH_OWNER") || exit $?
+[ "$BRANCH_OWNER" = "$TOPIC_RESERVATION" ] || fail "$BRANCH was acquired by another worktree: $BRANCH_OWNER"
+if [ -z "$FORCE_REASON" ]; then
+  git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" refs/heads/master ||
+    fail "$BRANCH is not an ancestor of the updated local master"
 fi
 
 # Do not inherit a cwd that the next command removes. This also lets the helper finish when invoked
@@ -336,13 +378,10 @@ fi
 cd "${TMPDIR:-/tmp}" || fail "cannot move out of the session worktree before removing it"
 git -C "$MAIN" worktree remove "$SESSION" || fail "could not remove session worktree: $SESSION"
 
-if [ -z "$FORCE_REASON" ]; then
-  git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" refs/heads/master ||
-    fail "$BRANCH is not an ancestor of the updated local master"
-fi
-scan_branch_owner "refs/heads/$BRANCH"
-[ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "$BRANCH became owned by another worktree: $BRANCH_OWNER"
 git -C "$MAIN" update-ref --no-deref -d "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" ||
   fail "local $BRANCH moved from validated tip $LOCAL_BRANCH_OID; its newer ref was preserved"
+git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" ||
+  fail "local $BRANCH was deleted but its temporary reservation could not be removed"
+TOPIC_RESERVATION=""
 
-echo "post-merge-cleanup.sh: cleaned $BRANCH and removed $SESSION"
+echo "post-merge-cleanup.sh: cleaned $BRANCH and removed $SESSION; recovery retained at $RECOVERY_REF"

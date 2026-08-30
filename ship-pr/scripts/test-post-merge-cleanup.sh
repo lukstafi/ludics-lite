@@ -53,8 +53,11 @@ assert_cleaned() {
   assert_ref_absent refs/heads/topic
   assert_ref_absent refs/remotes/origin/topic
   assert_remote_topic_absent
-  ! git -C "$CASE_MAIN" config --get-regexp '^branch\.topic\.' >/dev/null 2>&1 ||
-    fail "deleted topic branch configuration remained"
+  ! git -C "$CASE_MAIN" config --local --no-includes \
+    --get-regexp '^branch\.topic\.' >/dev/null 2>&1 ||
+    fail "repository-local topic branch configuration remained"
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse "refs/ship-pr/recovery/topic/$CASE_TOPIC_OID")" \
+    "$CASE_TOPIC_OID" "topic recovery ref must retain the cleaned tip"
 }
 
 git_config() {
@@ -89,6 +92,7 @@ setup_case() {
   git -C "$CASE_SESSION" add value
   git -C "$CASE_SESSION" commit -m topic >/dev/null
   git -C "$CASE_SESSION" push -u origin topic >/dev/null
+  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
 
   git clone --branch master "$CASE_REMOTE" "$CASE_INTEGRATOR" >/dev/null 2>&1
   git_config "$CASE_INTEGRATOR"
@@ -327,7 +331,7 @@ test_conditional_local_ref_deletion() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'for arg in "$@"; do' \
-    '  if [ "$arg" = update-ref ]; then' \
+    '  if [ "$arg" = merge ]; then' \
     '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/topic "$RACE_NEW_OID" "$RACE_OLD_OID"' \
     '    break' \
     '  fi' \
@@ -427,7 +431,7 @@ test_master_reservation() {
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "$3" = update-ref ] && [ "$5" = refs/heads/master ]; then' \
+    'if [ "$3" = merge ]; then' \
     '  "$REAL_GIT" -C "$MASTER_CANDIDATE" checkout master >/dev/null 2>&1' \
     '  echo "$?" >"$SWITCH_MARKER"' \
     'fi' \
@@ -461,7 +465,7 @@ test_unowned_master_reservation() {
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "$3" = update-ref ] && [ "$5" = refs/heads/master ]; then' \
+    'if [ "$3" = merge ]; then' \
     '  "$REAL_GIT" -C "$MASTER_CANDIDATE" checkout master >/dev/null 2>&1' \
     '  echo "$?" >"$SWITCH_MARKER"' \
     'fi' \
@@ -479,6 +483,31 @@ test_unowned_master_reservation() {
   ! git -C "$candidate" symbolic-ref -q HEAD >/dev/null 2>&1 ||
     fail "candidate worktree stopped being detached"
   echo "PASS: unchecked-out master is reserved during its update"
+}
+
+test_concurrent_master_edit_refusal() {
+  local fake_bin real_git log
+  setup_case concurrent-master-edit merge other
+  fake_bin="$TEST_ROOT/concurrent-master-edit-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/concurrent-master-edit.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = merge ]; then' \
+    '  echo concurrent-edit >"$MASTER_OWNER/value"' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_OWNER="$CASE_MASTER_OWNER" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "master fast-forward discarded a concurrent tracked edit"
+  fi
+  assert_eq "$(sed -n '1p' "$CASE_MASTER_OWNER/value")" concurrent-edit \
+    "concurrent master edit must survive a refused fast-forward"
+  assert_topic_preserved
+  echo "PASS: concurrent master edit is refused without data loss"
 }
 
 test_diverged_master_refusal() {
@@ -570,6 +599,68 @@ test_remote_master_lease() {
   echo "PASS: post-advertisement master rewrite restores the topic"
 }
 
+test_stale_master_response_retains_recovery() {
+  local fake_bin real_git remote_base log
+  setup_case stale-master-response merge main-off
+  fake_bin="$TEST_ROOT/stale-master-response-bin"
+  real_git=$(command -v git)
+  remote_base=$(git -C "$CASE_INTEGRATOR" rev-list --max-parents=0 HEAD)
+  log="$TEST_ROOT/stale-master-response.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'is_ls_remote=0' \
+    'is_master=0' \
+    'for arg in "$@"; do' \
+    '  [ "$arg" = ls-remote ] && is_ls_remote=1' \
+    '  [ "$arg" = refs/heads/master ] && is_master=1' \
+    'done' \
+    'if [ "$is_ls_remote" -eq 1 ] && [ "$is_master" -eq 1 ]; then' \
+    '  output=$("$REAL_GIT" "$@")' \
+    '  status=$?' \
+    '  "$REAL_GIT" -C "$RACE_INTEGRATOR" push --force origin "$RACE_BASE:refs/heads/master" >/dev/null' \
+    '  printf "%s\\n" "$output"' \
+    '  exit "$status"' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_INTEGRATOR="$CASE_INTEGRATOR" \
+    RACE_BASE="$remote_base" "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/master | awk '{print $1}')" \
+    "$remote_base" "test must roll remote master back after returning its stale integrated OID"
+  echo "PASS: retained recovery survives stale final master evidence"
+}
+
+test_topic_reservation() {
+  local fake_bin real_git candidate checkout_status
+  setup_case topic-reservation merge main-off
+  candidate="$CASE_ROOT/topic-candidate"
+  git -C "$CASE_MAIN" worktree add --detach "$candidate" refs/heads/topic >/dev/null
+  fake_bin="$TEST_ROOT/topic-reservation-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = update-ref ] && [ "$5" = -d ] && [ "$6" = refs/heads/topic ]; then' \
+    '  "$REAL_GIT" -C "$TOPIC_CANDIDATE" checkout topic >/dev/null 2>&1' \
+    '  echo "$?" >"$CHECKOUT_MARKER"' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" TOPIC_CANDIDATE="$candidate" \
+    CHECKOUT_MARKER="$TEST_ROOT/topic-reservation.status" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  checkout_status=$(cat "$TEST_ROOT/topic-reservation.status")
+  [ "$checkout_status" -ne 0 ] || fail "another worktree acquired topic during local deletion"
+  assert_cleaned
+  ! git -C "$candidate" symbolic-ref -q HEAD >/dev/null 2>&1 ||
+    fail "topic candidate worktree stopped being detached"
+  echo "PASS: topic reservation blocks checkout through local deletion"
+}
+
 test_config_lock_refusal() {
   setup_case config-lock merge main-off
   : >"$CASE_MAIN/.git/config.lock"
@@ -637,6 +728,24 @@ test_missing_branch_config() {
   echo "PASS: absent branch configuration is a normal cleanup state"
 }
 
+test_inherited_branch_config() {
+  local included_config
+  setup_case inherited-branch-config merge main-off
+  included_config="$CASE_ROOT/included-branch-config"
+  git -C "$CASE_MAIN" config --remove-section branch.topic
+  printf '%s\n' \
+    '[branch "topic"]' \
+    '  remote = inherited-origin' \
+    '  merge = refs/heads/topic' >"$included_config"
+  git -C "$CASE_MAIN" config --local include.path "$included_config"
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MAIN" config --get branch.topic.remote)" inherited-origin \
+    "inherited branch policy must be ignored rather than treated as editable local residue"
+  echo "PASS: inherited branch configuration is deliberately left alone"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
@@ -657,12 +766,16 @@ test_other_topic_owner_refusal
 test_dirty_session_refusal
 test_master_reservation
 test_unowned_master_reservation
+test_concurrent_master_edit_refusal
 test_diverged_master_refusal
 test_locked_session_refusal
 test_symbolic_ref_refusal
 test_remote_master_lease
+test_stale_master_response_retains_recovery
+test_topic_reservation
 test_config_lock_refusal
 test_ignored_master_collision_refusal
 test_ignored_master_descendant_refusal
 test_missing_branch_config
+test_inherited_branch_config
 echo "PASS: all post-merge cleanup states"

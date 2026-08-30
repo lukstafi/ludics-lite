@@ -550,10 +550,14 @@ while the named ref is conditionally updated and its tree refreshed; when no wor
 helper creates a temporary owner for that same critical section. Remote topic deletion is leased
 on the observed topic OID and followed by fresh `master` and local-topic reads; if either changed
 or `master` became unreadable, the current topic recovery ref is restored before refusal. The
-master-owner refresh also refuses ignored local data at paths changed by the fast-forward,
-including ignored descendants when a directory is replaced. The helper refuses a topic owned by
-any other worktree and removes matching remote-tracking and branch-configuration residue while the
-local topic and its session remain retryable. Do not reconstruct its state machine in prose or
+validated tip also remains reachable under `refs/ship-pr/recovery/` because no finite remote read
+can rule out a later base rollback. The master-owner refresh uses a non-destructive porcelain
+fast-forward and refuses ignored local data at paths changed by it, including ignored descendants
+when a directory is replaced. The helper refuses a topic owned by any other worktree, transfers
+topic ownership to a temporary reservation through local ref deletion, and removes matching
+remote-tracking and repository-local branch configuration. Included, global, and per-worktree
+configuration is inherited policy and is deliberately not edited. Do not reconstruct its state
+machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to
 `master`, making deletion either tautological or a false refusal after the worktree is already gone.
 
