@@ -1282,6 +1282,26 @@ test_assume_unchanged_master_refusal() {
   echo "PASS: assume-unchanged master-owner edits are refused before ownership handoff"
 }
 
+test_skip_worktree_master_refusal() {
+  local local_master
+  setup_case skip-worktree-master merge main
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" update-index --skip-worktree value
+  printf 'hidden skip-worktree edit\n' >"$CASE_MAIN/value"
+  [ -z "$(git -C "$CASE_MAIN" status --porcelain)" ] ||
+    fail "skip-worktree setup did not hide the master-owner edit"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "skip-worktree master-owner edit was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "skip-worktree edit refusal must precede master advancement"
+  assert_eq "$(sed -n '1p' "$CASE_MAIN/value")" "hidden skip-worktree edit" \
+    "skip-worktree master-owner data must survive refusal"
+  assert_topic_preserved
+  echo "PASS: skip-worktree master-owner edits are refused before ownership handoff"
+}
+
 test_master_changed_path_failure_refusal() {
   local fake_bin local_master real_git
   setup_case master-changed-path-failure merge other
@@ -1351,6 +1371,23 @@ test_active_session_operation_refusal() {
   [ -f "$sequencer/todo" ] || fail "active session sequencer state was lost"
   assert_topic_preserved
   echo "PASS: active session operation state is refused before mutation"
+}
+
+test_symbolic_session_pseudoref_refusal() {
+  local local_master
+  setup_case symbolic-session-pseudoref merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_SESSION" symbolic-ref ORIG_HEAD refs/heads/master
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "symbolic session pseudoref was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "symbolic pseudoref refusal must precede master advancement"
+  assert_eq "$(git -C "$CASE_SESSION" symbolic-ref ORIG_HEAD)" refs/heads/master \
+    "symbolic session pseudoref must survive refusal"
+  assert_topic_preserved
+  echo "PASS: symbolic session pseudorefs are refused before mutation"
 }
 
 test_private_worktree_ref_refusal() {
@@ -2401,6 +2438,46 @@ test_topic_reflog_locked_through_deletion() {
   echo "PASS: topic ref and reflog stay locked together through final deletion"
 }
 
+test_final_topic_lease_restores_remote() {
+  local archive archive_count fake_bin new_oid old_oid race_main real_git remote_oid
+  setup_case final-topic-lease merge main-off
+  race_main=$(cd "$CASE_MAIN" && pwd -P)
+  old_oid=$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)
+  new_oid=$(printf 'late local topic advance\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$old_oid^{tree}")" -p "$old_oid")
+  fake_bin="$TEST_ROOT/final-topic-lease-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$2" = "$RACE_MAIN" ] && [ "$3" = update-ref ] && [ "$4" = --stdin ] && [ ! -d "$RACE_SESSION" ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '  : >"$RACE_MARKER"' \
+    '  "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/topic "$RACE_NEW_OID" "$RACE_OLD_OID"' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$race_main" \
+    RACE_SESSION="$CASE_SESSION" RACE_MARKER="$TEST_ROOT/final-topic-lease.injected" \
+    RACE_NEW_OID="$new_oid" RACE_OLD_OID="$old_oid" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "final topic lease accepted a concurrent local advance"
+  fi
+  [ -e "$TEST_ROOT/final-topic-lease.injected" ] || fail "final topic lease race was not injected"
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)" "$new_oid" \
+    "late local topic advance must remain local"
+  remote_oid=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
+  assert_eq "$remote_oid" "$new_oid" "late local topic advance must be restored remotely"
+  [ ! -d "$CASE_SESSION" ] || fail "session should already be archived at the final lease"
+  archive_count=0
+  for archive in "$CASE_ROOT"/.session.ship-pr-recovery.*; do
+    [ -d "$archive" ] || continue
+    archive_count=$((archive_count + 1))
+  done
+  assert_eq "$archive_count" 1 "final lease refusal must retain one session archive"
+  echo "PASS: final topic lease races restore the current local tip remotely"
+}
+
 test_branch_config_locked_through_deletion() {
   local fake_bin real_git status
   setup_case branch-config-lock merge main-off
@@ -2737,10 +2814,12 @@ test_deinitialized_session_submodule_refusal
 test_initialized_master_submodule_refusal
 test_master_resolve_undo_refusal
 test_assume_unchanged_master_refusal
+test_skip_worktree_master_refusal
 test_master_changed_path_failure_refusal
 test_diverged_master_refusal
 test_locked_session_refusal
 test_active_session_operation_refusal
+test_symbolic_session_pseudoref_refusal
 test_private_worktree_ref_refusal
 test_rewritten_worktree_ref_refusal
 test_session_pseudoref_recovery
@@ -2777,6 +2856,7 @@ test_tracking_reflog_recovery
 test_tracking_reflog_locked_through_deletion
 test_topic_reflog_recovery
 test_topic_reflog_locked_through_deletion
+test_final_topic_lease_restores_remote
 test_branch_config_locked_through_deletion
 test_symref_capability_preflight
 test_dangling_capability_ref_refusal

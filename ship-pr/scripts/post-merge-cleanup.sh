@@ -90,7 +90,7 @@ refuse_private_worktree_refs() {
 }
 
 preflight_session_metadata_locks() {
-  local name path path_dir lock
+  local name path path_dir lock symbolic_status
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
     BISECT_HEAD AUTO_MERGE FETCH_HEAD index config.worktree; do
     path=$(git -C "$SESSION" rev-parse --git-path "$name") ||
@@ -102,6 +102,18 @@ preflight_session_metadata_locks() {
     path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
     path="$path_dir/$(basename "$path")"
     [ ! -L "$path" ] || fail "session metadata is symbolic; replace it before cleanup: $name"
+    case "$name" in
+    index | config.worktree) ;;
+    *)
+      git -C "$SESSION" symbolic-ref -q "$name" >/dev/null 2>&1
+      symbolic_status=$?
+      case "$symbolic_status" in
+      0) fail "session pseudoref is symbolic; replace it before cleanup: $name" ;;
+      1) ;;
+      *) fail "could not inspect whether the session pseudoref is symbolic: $name" ;;
+      esac
+      ;;
+    esac
     lock="$path_dir/$(basename "$path").lock"
     { [ ! -e "$lock" ] && [ ! -L "$lock" ]; } ||
       fail "session metadata is locked; retry after its Git operation finishes: $name"
@@ -156,7 +168,7 @@ refuse_index_resolve_undo() {
 }
 
 refuse_hidden_index_changes() {
-  local worktree="$1" description="$2" index_path index_dir
+  local worktree="$1" description="$2" index_path index_dir entry path
   index_path=$(git -C "$worktree" rev-parse --git-path index) ||
     fail "could not locate $description index: $worktree"
   case "$index_path" in
@@ -170,6 +182,21 @@ refuse_hidden_index_changes() {
   MASTER_INDEX_PROBE=$(mktemp "$index_dir/.ship-pr-index-probe.XXXXXX") ||
     fail "could not allocate the $description index probe"
   cp -p "$index_path" "$MASTER_INDEX_PROBE" || fail "could not snapshot the $description index"
+  MASTER_SKIP_PATHS_FILE=$(mktemp "$index_dir/.ship-pr-skip-paths.XXXXXX") ||
+    fail "could not allocate the $description skip-worktree snapshot"
+  GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" ls-files -t -z \
+    >"$MASTER_SKIP_PATHS_FILE" || fail "could not enumerate $description index flags"
+  while IFS= read -r -d '' entry; do
+    case "$entry" in
+    S\ *)
+      path=${entry#S }
+      GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" update-index \
+        --no-skip-worktree -- "$path" || fail "could not clear a copied skip-worktree flag"
+      ;;
+    esac
+  done <"$MASTER_SKIP_PATHS_FILE"
+  unlink "$MASTER_SKIP_PATHS_FILE" || fail "could not remove the skip-worktree snapshot"
+  MASTER_SKIP_PATHS_FILE=""
   GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" update-index -q --really-refresh ||
     fail "could not refresh the $description index snapshot"
   GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" diff-files \
@@ -378,8 +405,22 @@ release_private_namespace_locks() {
   PRIVATE_NAMESPACE_BLOCKERS=()
 }
 
+discard_ref_transaction() {
+  exec 7>&- 8<&-
+  if [ -n "${REF_TRANSACTION_PID:-}" ]; then
+    wait "$REF_TRANSACTION_PID" >/dev/null 2>&1 || true
+  fi
+  REF_TRANSACTION_PID=""
+  [ -z "${REF_TRANSACTION_IN:-}" ] || unlink "$REF_TRANSACTION_IN" >/dev/null 2>&1 || true
+  [ -z "${REF_TRANSACTION_OUT:-}" ] || unlink "$REF_TRANSACTION_OUT" >/dev/null 2>&1 || true
+  REF_TRANSACTION_IN=""
+  REF_TRANSACTION_OUT=""
+  [ -z "${REF_TRANSACTION_DIR:-}" ] || rmdir "$REF_TRANSACTION_DIR" >/dev/null 2>&1 || true
+  REF_TRANSACTION_DIR=""
+}
+
 delete_ref_with_locked_reflog() {
-  local ref="$1" expected_oid="$2" kind="$3" response
+  local ref="$1" expected_oid="$2" kind="$3" response=""
   REF_TRANSACTION_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-ref-transaction.XXXXXX") ||
     fail "could not allocate the ref deletion transaction: $ref"
   REF_TRANSACTION_IN="$REF_TRANSACTION_DIR/input"
@@ -393,10 +434,16 @@ delete_ref_with_locked_reflog() {
 
   printf 'start\noption no-deref\ndelete %s %s\nprepare\n' "$ref" "$expected_oid" >&7 ||
     fail "could not prepare the ref deletion: $ref"
-  IFS= read -r response <&8 || fail "ref deletion transaction stopped before start: $ref"
-  [ "$response" = "start: ok" ] || fail "ref deletion transaction did not start: $ref: $response"
-  IFS= read -r response <&8 || fail "ref deletion transaction stopped before preparation: $ref"
-  [ "$response" = "prepare: ok" ] || fail "ref deletion transaction was not prepared: $ref: $response"
+  if ! IFS= read -r response <&8 || [ "$response" != "start: ok" ]; then
+    echo "post-merge-cleanup.sh: ref deletion transaction did not start: $ref: $response" >&2
+    discard_ref_transaction
+    return 1
+  fi
+  if ! IFS= read -r response <&8 || [ "$response" != "prepare: ok" ]; then
+    echo "post-merge-cleanup.sh: ref deletion transaction was not prepared: $ref: $response" >&2
+    discard_ref_transaction
+    return 1
+  fi
 
   # prepare holds the ref and reflog locks. Retain every reflog endpoint while neither can
   # change, then commit the already-validated deletion without an ABA window between those steps.
@@ -630,6 +677,9 @@ cleanup_reservations() {
     unlink "$MASTER_INDEX_PROBE.lock" >/dev/null 2>&1 || true
     unlink "$MASTER_INDEX_PROBE" >/dev/null 2>&1 || true
   fi
+  if [ -n "${MASTER_SKIP_PATHS_FILE:-}" ]; then
+    unlink "$MASTER_SKIP_PATHS_FILE" >/dev/null 2>&1 || true
+  fi
   if [ "${#SESSION_PSEUDOREF_LOCKS[@]}" -gt 0 ]; then
     for lock in "${SESSION_PSEUDOREF_LOCKS[@]}"; do
       [ ! -f "$lock" ] || unlink "$lock" >/dev/null 2>&1 || true
@@ -692,6 +742,7 @@ CONFIG_LOCK=""
 CONFIG_LOCK_OWNED=0
 CHANGED_PATHS_FILE=""
 MASTER_INDEX_PROBE=""
+MASTER_SKIP_PATHS_FILE=""
 trap cleanup_reservations EXIT
 
 [ "$#" -ge 3 ] || usage
@@ -1067,7 +1118,8 @@ if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
   [ "$CURRENT_TRACKING_BRANCH_OID" = "$TRACKING_BRANCH_OID" ] ||
     fail "origin/$BRANCH tracking ref moved during cleanup; its new tip was preserved"
   delete_ref_with_locked_reflog "refs/remotes/origin/$BRANCH" \
-    "$TRACKING_BRANCH_OID" tracking-reflog
+    "$TRACKING_BRANCH_OID" tracking-reflog ||
+    fail "origin/$BRANCH tracking ref changed before its leased deletion"
 fi
 
 # Inspect only the repository-local file that removal edits. Git flattens dotted subsection names,
@@ -1184,7 +1236,13 @@ SESSION_HEAD_LOCK=""
 SESSION_PSEUDOREF_LOCKS=()
 [ -d "$SESSION_ARCHIVED_WORKTREE" ] || fail "session recovery archive disappeared: $SESSION_ARCHIVED_WORKTREE"
 
-delete_ref_with_locked_reflog "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" topic-reflog
+if ! delete_ref_with_locked_reflog "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" topic-reflog; then
+  CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH" 2>/dev/null || true)
+  [ -n "$CURRENT_TOPIC_OID" ] || CURRENT_TOPIC_OID="$LOCAL_BRANCH_OID"
+  restore_remote_topic "$CURRENT_TOPIC_OID" ||
+    fail "local $BRANCH changed before final deletion, and its current tip could not be restored remotely"
+  fail "local $BRANCH changed before final deletion; its current tip was restored remotely"
+fi
 atomic_rename "$CONFIG_LOCK" "$MAIN_COMMON/config" ||
   fail "local $BRANCH was deleted but its cleaned repository configuration could not be installed"
 CONFIG_LOCK_OWNED=0
