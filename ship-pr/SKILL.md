@@ -434,7 +434,8 @@ is the policy, not a corner cut. A count the compare API could not answer prints
 is not "not behind": check it by hand.
 
 **Standalone use has no coordinator running that loop**, so the after-the-fact check falls to
-this skill's own tail, and after a stale-warned merge it is not optional — nor is it a plain
+this skill's own tail, and after any merge whose base had moved — stale-warned or merely a few
+commits behind — it is not optional; nor is it a plain
 `base` call, which seconds after a merge answers with the *previous* tip's green while the
 merge's own run is still queued or not yet created (the same window as the force-push `ABSENT`
 trap above). The integration check is:
@@ -546,12 +547,14 @@ were doing, give the command, and let the user decide. Never work around it.
 
 After merging: refresh the base for the next branch (`git fetch origin`, then branch off
 `origin/master` again) — and since your merge is what that base now carries, `base` is worth one
-more call here, before the next branch inherits it. After a **stale-warned** merge that call is
-`base <owner>/<repo> --wait`, not the plain read — the stale-base section above owns the why: a
-plain call seconds after a merge answers with the previous tip's green, and the wait is the
-standalone integration check the roll-forward policy leans on. Then tear down any scratch
-worktrees the work created on remote machines, and run the `after-merge` brainstorm while the
-session's friction is still in context.
+more call here, before the next branch inherits it. After a merge onto a base that had moved at
+all — stale-warned or merely a few commits behind — that call is `base <owner>/<repo> --wait`,
+not the plain read: a plain call seconds after a merge answers with the previous tip's green
+whatever the drift size, and the wait is the standalone integration check the roll-forward
+policy leans on (the stale-base section owns the why). Background it and keep working — it
+returns in seconds when the tip is already judged, and holds only while a run is genuinely in
+flight. Then tear down any scratch worktrees the work created on remote machines, and run the
+`after-merge` brainstorm while the session's friction is still in context.
 
 ## Multi-PR arcs
 

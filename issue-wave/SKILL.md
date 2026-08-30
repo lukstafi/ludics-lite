@@ -290,7 +290,10 @@ The coordinator's job between launch and last merge:
   `pr-review.sh merge` warns loudly on a stale base but no longer refuses. The complement is
   coordinator-owned: an **integration loop** that, as each merge lands, pulls merged master onto
   whichever fleet machine currently has the least work (read `http://mac-studio:7799/api/fleet`
-  — the flotilla dashboard covers mac-studio, rog, minix) and runs the MERGED repository's own
+  — the flotilla dashboard covers mac-studio, rog, minix; the checkout it runs in owes the same
+  proof as the launch preflight — clean porcelain, expected branch, HEAD equal to the remote
+  master just merged — because a suite run atop local edits or the wrong branch verifies
+  nothing) and runs the MERGED repository's own
   full integration suite there to completion — for OCANNL the `@runtest @train` aliases (the
   remote CI's coverage); for a repo whose CI already is its fullest suite (ludics, flotilla,
   this one), the merged tip's CI run is the verdict, awaited with `pr-review.sh base owner/repo

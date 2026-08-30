@@ -1622,7 +1622,7 @@ cmd_merge() {
 cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
   local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
-  local nogo_at_tip=0 last_tip="" grace_from confirm wf wid wname part sleep_for remaining
+  local nogo_at_tip=0 last_tip="" grace_from confirm wf="" wid wname part sleep_for remaining
   local started now beat waited_note="" no_tip_verdict=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1646,16 +1646,6 @@ cmd_base() {
     [ $? -eq 0 ] && [ -n "$branch" ] || fail 3 "could not read $REPO's default branch" \
       "($(gh_err_line)) — the base's health is UNKNOWN, which is not 'fine'."
   fi
-  # Runs are fetched PER WORKFLOW below, not as one flat page: on an active branch, a page of
-  # mixed runs can entirely postdate an infrequent workflow's newest run, and a workflow the fold
-  # never sees is neither uncovered nor red — its standing verdict simply vanishes from the
-  # report (review of self-improve#13, round 5). The workflow list itself is one page of 100: a
-  # repo with more real workflows than that has bigger problems than this report.
-  wf=$(gh_retry read api "repos/$REPO/actions/workflows?per_page=100" \
-    --jq '.workflows[] | [(.id | tostring), .name] | @tsv')
-  rc=$?
-  [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's workflow list ($(gh_err_line));" \
-    "the base's health is UNKNOWN, which is NOT 'green'."
   started=$(date +%s)
   beat=$started
   grace_from=$started
@@ -1671,6 +1661,21 @@ cmd_base() {
     [ -n "$tip" ] || [ "$wait_for" -eq 0 ] ||
       fail 3 "could not read $REPO $branch's tip ($(gh_err_line)) — base --wait cannot know" \
         "which commit needs the verdict. This is UNKNOWN, not green: retry."
+    # The workflow list is (re-)read whenever the observed tip moves — a sibling merge landing
+    # mid-wait can ADD a workflow, and a stale snapshot would never query it: the old set going
+    # fully covered would then read as green over a new workflow still pending or red. Runs are
+    # then fetched PER WORKFLOW, not as one flat page: on an active branch, a page of mixed runs
+    # can entirely postdate an infrequent workflow's newest run, and a workflow the fold never
+    # sees is neither uncovered nor red — its standing verdict simply vanishes from the report
+    # (review of self-improve#13, rounds 5-6). The list itself is one page of 100: a repo with
+    # more real workflows than that has bigger problems than this report.
+    if [ "$tip" != "$last_tip" ] || [ -z "$wf" ]; then
+      wf=$(gh_retry read api "repos/$REPO/actions/workflows?per_page=100" \
+        --jq '.workflows[] | [(.id | tostring), .name] | @tsv')
+      rc=$?
+      [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's workflow list ($(gh_err_line));" \
+        "the base's health is UNKNOWN, which is NOT 'green'."
+    fi
     raw=""
     while IFS=$'\t' read -r wid wname; do
       [ -n "$wid" ] || continue
