@@ -433,6 +433,12 @@ branch is shared), push, and let the checks re-run first; otherwise a clean merg
 is the policy, not a corner cut. A count the compare API could not answer prints `UNKNOWN`, which
 is not "not behind": check it by hand.
 
+**Standalone use has no coordinator running that loop**, so the after-the-fact check falls to
+this skill's own tail: the "After it lands" step below already re-reads `base` on the merged
+master, and after a stale-warned merge that call is not optional — it *is* the integration check
+(the base's CI runs the full matrix on what you just landed), and a red it turns up is yours to
+fix forward now, not the next session's to discover. The warning line says so when it fires.
+
 ### The override
 
 The gate has two escape hatches, for two different facts. `--allow-no-verdict` (above) is for a

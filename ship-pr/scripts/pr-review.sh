@@ -160,11 +160,14 @@ CACHE="$STATE_DIR/repo-by-pr"
 # what draws the harness's warning — on every call, when the state dir is unwritable and unreadable
 # (self-improve#8: workers given explicit owner/name#number arguments, which never need the cache,
 # still warned on each invocation). So it can be switched off outright (SHIP_PR_STATE_DIR=off),
-# and a failed write latches it off for the rest of the process. The latch is a file, not a
-# variable, because cache_put runs inside command substitutions (every `watch` round's poll is
-# one), where a variable set there would not survive to the next round; $$ is the parent's pid in
-# those subshells, so the file is shared across them and cleaned by the same trap as GH_ERR_FILE.
-CACHE_OFF_FILE="${TMPDIR:-/tmp}/pr-review-nocache.$$"
+# and a failed write latches it off. The latch is a file, not a variable, because cache_put runs
+# inside command substitutions (every `watch` round's poll is one), where a variable set there
+# would not survive to the next round — and it must outlive the PROCESS too, since every
+# documented pr-review.sh command is its own invocation and a per-process latch would re-attempt
+# the prohibited write once per command (review of self-improve#13). Hence: keyed by the state
+# dir (overriding SHIP_PR_STATE_DIR to a writable place re-enables caching instead of inheriting
+# a stale latch), and deliberately NOT removed by the exit trap.
+CACHE_OFF_FILE="${TMPDIR:-/tmp}/pr-review-nocache.$(printf '%s' "$STATE_DIR" | cksum | cut -d' ' -f1)"
 case "$STATE_DIR" in off | none) CACHE_OFF=1 ;; *) CACHE_OFF="" ;; esac
 cache_off() { [ -n "$CACHE_OFF" ] || [ -e "$CACHE_OFF_FILE" ]; }
 
@@ -201,7 +204,7 @@ warn() { echo "pr-review.sh: $*" >&2; }
 # blank.
 GH_ERR=""
 GH_ERR_FILE="${TMPDIR:-/tmp}/pr-review-err.$$"
-trap 'rm -f "$GH_ERR_FILE" "$CACHE_OFF_FILE"' EXIT
+trap 'rm -f "$GH_ERR_FILE"' EXIT # NOT the cache latch — it must persist across invocations
 
 gateway_failure() {
   case "$1" in
@@ -1023,8 +1026,18 @@ cmd_run_watch() {
       shift
       ;;
     -i=* | --interval=*) interval="${1#*=}" ;;
-    [0-9]*) run_id="$1" ;;
-    *) ;; # --exit-status is implied; the display flags shape output this await never prints
+    [0-9]*)
+      [ -z "$run_id" ] || die "run watch: got two run ids ('$run_id' and '$1') — name exactly one"
+      run_id="$1"
+      ;;
+    # The two native flags whose meaning this await subsumes are accepted as no-ops so a pasted
+    # `gh run watch` line keeps working; everything ELSE dies loudly. A catch-all that discards
+    # an argument turns a mistyped repo flag into a watch against whatever REPO or the cwd
+    # resolves to — the wrong-target failure the strict pr_arg parse exists to prevent.
+    --exit-status | --compact) ;;
+    -*) die "run watch: unsupported flag '$1' — the quiet await takes <run-id>, -R/--repo," \
+      "-i/--interval, --exit-status, --compact" ;;
+    *) die "run watch: unexpected argument '$1' — the run id is a bare number" ;;
     esac
     shift
   done
@@ -1401,6 +1414,8 @@ warn_base_drift() {
   echo "!!!                                               # the BASE's files too, not just yours"
   echo "!!! Only when $base has visibly edited the files this PR changes, rebase (or merge it in,"
   echo "!!! where the branch is shared), push, and let the checks re-run first."
+  echo "!!! Merging OUTSIDE a coordinated wave? Then no integration loop is watching: after the"
+  echo "!!! merge, re-read the base's own CI (pr-review.sh base $REPO $base) and own any red."
   warn "MERGING A STALE BRANCH: $REPO#$pr is $behind commits behind $base (warns at $STALE_BASE," \
     "SHIP_PR_STALE_BASE) — a clean merge is the policy (roll-forward, ahrefs/ocannl#861); rebase" \
     "first only when the drift plausibly touches this PR's files."
