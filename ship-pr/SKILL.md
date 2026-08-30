@@ -575,7 +575,8 @@ the now-missing worktree while holding the linked-worktree HEAD and pseudoref lo
 by session pseudorefs or its HEAD reflog, plus the final index tree, are retained beneath the
 reserved `refs/ship-pr/session-recovery/` namespace; resolve-undo blobs receive direct recovery
 refs, and per-worktree configuration is copied into the archive. Remote-tracking reflog objects are
-retained under the topic recovery namespace before pruning. Late files or links at the vacated path are moved to the second archive
+retained under the topic recovery namespace before pruning, as are local-topic reflog objects before
+branch deletion; both sides of every retained reflog entry are covered. Late files or links at the vacated path are moved to the second archive
 before unregistering is retried. Do not reconstruct its state
 machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to

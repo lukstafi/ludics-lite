@@ -76,6 +76,23 @@ git_config() {
   git -C "$1" config user.email cleanup-test@example.invalid
 }
 
+git_log_path() {
+  local checkout="$1" ref="$2" path
+  path=$(git -C "$checkout" rev-parse --git-path "logs/$ref") || return 1
+  case "$path" in
+  /*) printf '%s\n' "$path" ;;
+  *) printf '%s\n' "$checkout/$path" ;;
+  esac
+}
+
+keep_last_reflog_entry() {
+  local checkout="$1" ref="$2" path snapshot
+  path=$(git_log_path "$checkout" "$ref") || fail "could not locate $ref reflog"
+  snapshot="$path.ship-pr-test-last"
+  tail -n 1 "$path" >"$snapshot"
+  mv "$snapshot" "$path"
+}
+
 setup_case() {
   local name="$1" merge_mode="$2" owner_mode="$3"
   local root="$TEST_ROOT/$name"
@@ -701,6 +718,37 @@ test_master_handoff_stays_reserved() {
   echo "PASS: master remains owned across reservation removal"
 }
 
+test_master_refresh_preserves_concurrent_ref() {
+  local competitor_oid fake_bin real_git remote_master
+  setup_case master-refresh-race merge none
+  remote_master=$(git -C "$CASE_INTEGRATOR" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" fetch origin refs/heads/master:refs/remotes/origin/master >/dev/null
+  competitor_oid=$(printf 'competing master update\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$remote_master^{tree}")" -p "$remote_master")
+  fake_bin="$TEST_ROOT/master-refresh-race-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = read-tree ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '  : >"$RACE_MARKER"' \
+    '  "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/master "$RACE_OID" "$REMOTE_MASTER"' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    RACE_OID="$competitor_oid" REMOTE_MASTER="$remote_master" \
+    RACE_MARKER="$TEST_ROOT/master-refresh-race.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "reservation refresh overwrote a concurrent master ref update"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$competitor_oid" \
+    "reservation refresh must not move a concurrently advanced master"
+  assert_topic_preserved
+  echo "PASS: master reservation refresh never resets the named ref"
+}
+
 test_master_reattach_compare_and_swap() {
   local alternate_oid fake_bin local_master real_git log
   setup_case master-reattach-cas merge other
@@ -984,7 +1032,7 @@ test_session_pseudoref_recovery() {
 }
 
 test_session_reflog_recovery() {
-  local orig_head unique_oid
+  local orig_head reflog_path unique_oid
   setup_case session-reflog-recovery merge main-off
   git -C "$CASE_SESSION" checkout --detach >/dev/null
   git -C "$CASE_SESSION" commit --allow-empty -m "unique detached reflog commit" >/dev/null
@@ -993,6 +1041,9 @@ test_session_reflog_recovery() {
   git -C "$CASE_SESSION" reset --hard "$CASE_TOPIC_OID" >/dev/null
   orig_head=$(git -C "$CASE_SESSION" rev-parse ORIG_HEAD)
   [ "$orig_head" != "$unique_oid" ] || fail "test did not evict the unique commit from ORIG_HEAD"
+  reflog_path=$(git_log_path "$CASE_SESSION" HEAD)
+  printf '%s %s Cleanup\ Test cleanup-test@example.invalid 0 +0000\told-side-only\n' \
+    "$unique_oid" "$CASE_TOPIC_OID" >"$reflog_path"
 
   "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
   assert_cleaned
@@ -1116,6 +1167,37 @@ test_session_metadata_lock_preflight() {
     "session pseudoref lock must be preserved"
   assert_topic_preserved
   echo "PASS: session pseudoref locks are preflighted before mutation"
+}
+
+test_late_private_worktree_ref_recovery() {
+  local fake_bin private_oid real_git
+  setup_case late-private-worktree-ref merge main-off
+  private_oid=$(printf 'late private worktree commit\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
+  fake_bin="$TEST_ROOT/late-private-worktree-ref-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*.ship-pr-recovery.*/worktree)' \
+    '  if [ "$3" = for-each-ref ] && [ ! -e "$PRIVATE_MARKER" ]; then' \
+    '    : >"$PRIVATE_MARKER"' \
+    '    "$REAL_GIT" -C "$2" update-ref refs/worktree/late "$PRIVATE_OID"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" PRIVATE_OID="$private_oid" \
+    PRIVATE_MARKER="$TEST_ROOT/late-private-worktree-ref.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse \
+    "refs/ship-pr/session-recovery/topic/private-ref-$private_oid")" "$private_oid" \
+    "late session-private ref object must remain directly reachable"
+  assert_cleaned
+  echo "PASS: late session-private refs receive recovery refs before unregistering"
 }
 
 test_symbolic_ref_refusal() {
@@ -1638,8 +1720,7 @@ test_tracking_reflog_recovery() {
     "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
   git -C "$CASE_MAIN" update-ref refs/remotes/origin/topic "$reflog_oid"
   git -C "$CASE_MAIN" update-ref refs/remotes/origin/topic "$CASE_TOPIC_OID"
-  git -C "$CASE_MAIN" reflog show --format='%H' refs/remotes/origin/topic | \
-    grep -Fx "$reflog_oid" >/dev/null || fail "test did not create a tracking-only reflog object"
+  keep_last_reflog_entry "$CASE_MAIN" refs/remotes/origin/topic
 
   "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
   assert_cleaned
@@ -1647,6 +1728,23 @@ test_tracking_reflog_recovery() {
     "refs/ship-pr/recovery/topic/tracking-reflog-$reflog_oid")" "$reflog_oid" \
     "remote-tracking reflog object must remain directly reachable"
   echo "PASS: remote-tracking reflog objects receive recovery refs before pruning"
+}
+
+test_topic_reflog_recovery() {
+  local reflog_oid
+  setup_case topic-reflog-recovery merge main-off
+  reflog_oid=$(printf 'topic reflog only\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
+  git -C "$CASE_MAIN" update-ref refs/heads/topic "$reflog_oid" "$CASE_TOPIC_OID"
+  git -C "$CASE_MAIN" update-ref refs/heads/topic "$CASE_TOPIC_OID" "$reflog_oid"
+  keep_last_reflog_entry "$CASE_MAIN" refs/heads/topic
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse \
+    "refs/ship-pr/recovery/topic/topic-reflog-$reflog_oid")" "$reflog_oid" \
+    "local topic reflog object must remain directly reachable"
+  echo "PASS: local topic reflog objects receive recovery refs before branch deletion"
 }
 
 test_symref_capability_preflight() {
@@ -1870,6 +1968,7 @@ test_preexisting_ignored_master_data
 test_master_owner_switch_refusal
 test_master_update_failure_reattaches_owner
 test_master_handoff_stays_reserved
+test_master_refresh_preserves_concurrent_ref
 test_master_reattach_compare_and_swap
 test_ignored_data_during_master_detach
 test_ignored_data_during_topic_detach
@@ -1885,6 +1984,7 @@ test_session_index_recovery
 test_session_resolve_undo_recovery
 test_worktree_config_archive
 test_session_metadata_lock_preflight
+test_late_private_worktree_ref_recovery
 test_symbolic_ref_refusal
 test_remote_master_lease
 test_stale_master_response_retains_recovery
@@ -1904,6 +2004,7 @@ test_dangling_config_lock_preflight
 test_divergent_tracking_tip_recovery
 test_tracking_tip_move_refusal
 test_tracking_reflog_recovery
+test_topic_reflog_recovery
 test_symref_capability_preflight
 test_dangling_capability_ref_refusal
 test_option_like_branch_name

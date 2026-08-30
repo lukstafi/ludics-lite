@@ -115,9 +115,45 @@ retain_topic_recovery_object() {
   fi
 }
 
+retain_topic_reflog_sides() {
+  local ref="$1" kind="$2" path path_dir line old_oid new_oid rest oid
+  path=$(git -C "$MAIN" rev-parse --git-path "logs/$ref") ||
+    fail "could not locate $ref reflog"
+  case "$path" in
+  /*) ;;
+  *) path="$MAIN/$path" ;;
+  esac
+  path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+  path="$path_dir/$(basename "$path")"
+  [ ! -L "$path" ] || fail "$ref reflog is symbolic"
+  [ -f "$path" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    read -r old_oid new_oid rest <<<"$line"
+    for oid in "$old_oid" "$new_oid"; do
+      case "$oid" in
+      *[!0]*) retain_topic_recovery_object "$kind" "$oid" ;;
+      esac
+    done
+  done <"$path"
+}
+
+retain_private_session_refs() {
+  local private_refs line ref oid
+  private_refs=$(git -C "$SESSION_ARCHIVED_WORKTREE" for-each-ref \
+    --format='%(refname) %(objectname)' refs/worktree refs/bisect refs/rewritten) ||
+    fail "could not recheck session-private refs before unregistering"
+  while IFS= read -r line; do
+    ref=${line%% *}
+    oid=${line#* }
+    [ -n "$ref" ] || continue
+    [ -n "$oid" ] || fail "session-private ref has no object: $ref"
+    retain_session_object private-ref "$oid"
+  done <<<"$private_refs"
+}
+
 lock_and_retain_session_metadata() {
   local name path path_dir lock line metadata oid config_snapshot index_snapshot index_tree
-  local reuc_snapshot mode stage reflog_oids
+  local reuc_snapshot mode stage old_oid new_oid rest
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
     BISECT_HEAD AUTO_MERGE FETCH_HEAD; do
     path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "$name") ||
@@ -189,12 +225,25 @@ lock_and_retain_session_metadata() {
     retain_session_object index-reuc "$oid"
   done <"$reuc_snapshot"
 
-  reflog_oids=$(git -C "$SESSION_ARCHIVED_WORKTREE" reflog show --format='%H' HEAD) ||
-    fail "could not inspect the archived session HEAD reflog"
-  while IFS= read -r oid; do
-    [ -n "$oid" ] || continue
-    retain_session_object reflog-HEAD "$oid"
-  done <<<"$reflog_oids"
+  path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path logs/HEAD) ||
+    fail "could not locate the archived session HEAD reflog"
+  case "$path" in
+  /*) ;;
+  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
+  esac
+  path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+  path="$path_dir/$(basename "$path")"
+  [ ! -L "$path" ] || fail "archived session HEAD reflog is symbolic"
+  if [ -f "$path" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      read -r old_oid new_oid rest <<<"$line"
+      for oid in "$old_oid" "$new_oid"; do
+        case "$oid" in
+        *[!0]*) retain_session_object reflog-HEAD "$oid" ;;
+        esac
+      done
+    done <"$path"
+  fi
 }
 
 scan_branch_owner() {
@@ -520,7 +569,7 @@ if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
 fi
 git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER" ||
   fail "local master moved after its owner preflight"
-git -C "$MASTER_RESERVATION" reset --hard "$REMOTE_MASTER" >/dev/null ||
+git -C "$MASTER_RESERVATION" read-tree --reset -u "$REMOTE_MASTER" >/dev/null ||
   fail "master advanced but its helper-only reservation could not be refreshed"
 if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
   git -C "$ORIGINAL_MASTER_OWNER" switch --detach --no-overwrite-ignore "$REMOTE_MASTER" >/dev/null ||
@@ -559,6 +608,7 @@ else
   git -C "$MAIN" update-ref --no-deref "$RECOVERY_REF" "$LOCAL_BRANCH_OID" "" ||
     fail "could not retain the topic recovery ref: $RECOVERY_REF"
 fi
+retain_topic_reflog_sides "refs/heads/$BRANCH" topic-reflog
 
 # A stale tracking ref can retain commits absent from both the local topic and the live remote.
 # Preserve any differing tip before its conditional pruning so cleanup cannot erase its last ref.
@@ -583,12 +633,7 @@ if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
         "$TRACKING_BRANCH_OID" "" || fail "could not retain $TRACKING_RECOVERY_REF"
     fi
   fi
-  TRACKING_REFLOG_OIDS=$(git -C "$MAIN" reflog show --format='%H' \
-    "refs/remotes/origin/$BRANCH") || fail "cannot inspect origin/$BRANCH tracking reflog"
-  while IFS= read -r TRACKING_REFLOG_OID; do
-    [ -n "$TRACKING_REFLOG_OID" ] || continue
-    retain_topic_recovery_object tracking-reflog "$TRACKING_REFLOG_OID"
-  done <<<"$TRACKING_REFLOG_OIDS"
+  retain_topic_reflog_sides "refs/remotes/origin/$BRANCH" tracking-reflog
 fi
 
 REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
@@ -745,6 +790,7 @@ else
   git -C "$MAIN" update-ref --no-deref "$SESSION_RECOVERY_REF" "$SESSION_FINAL_HEAD" "" ||
     fail "could not retain the archived session HEAD: $SESSION_RECOVERY_REF"
 fi
+retain_private_session_refs
 git -C "$MAIN" update-ref --no-deref -d "$SESSION_NAMESPACE_RESERVATION" \
   "$LOCAL_BRANCH_OID" || fail "could not release the session recovery namespace reservation"
 SESSION_NAMESPACE_RESERVATION_OWNED=0
@@ -764,6 +810,7 @@ SESSION_HEAD_LOCK=""
 SESSION_PSEUDOREF_LOCKS=()
 [ -d "$SESSION_ARCHIVED_WORKTREE" ] || fail "session recovery archive disappeared: $SESSION_ARCHIVED_WORKTREE"
 
+retain_topic_reflog_sides "refs/heads/$BRANCH" topic-reflog
 git -C "$MAIN" update-ref --no-deref -d "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" ||
   fail "local $BRANCH moved from validated tip $LOCAL_BRANCH_OID; its newer ref was preserved"
 git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" ||
