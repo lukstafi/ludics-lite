@@ -541,8 +541,8 @@ make the exception explicit and leave its reason in the transcript:
   --force-integrated "GitHub reports the PR squash-merged at <sha>"
 ```
 
-The helper requires the exact session-worktree root, a clean and unlocked session with no ignored
-local data, and one shared
+The helper requires Git's transactional `update-ref` symbolic-ref commands, the exact
+session-worktree root, a clean and unlocked session with no ignored local data, and one shared
 fetch/push endpoint for `origin`. It treats an already absent topic as a safe retry state and
 refuses an unreadable ref, a symbolic local/tracking ref, or a remote tip newer than the local
 branch; an absent remote topic sends no deletion, while present remote and local deletions carry
@@ -558,7 +558,8 @@ remote read can rule out a later base rollback. The master-owner refresh uses a 
 fast-forward through a helper-only reservation and a conditional named-ref update. A checked-out
 master owner must contain no local data, including ignored files; after the update it is prepared
 at the new tree and reattached with a detached-HEAD compare-and-swap before the reservation is
-removed. The helper also checks ignored descendants when a directory is
+removed. The helper probes that compare-and-swap capability before any branch mutation and refuses
+older Git versions cleanly. The helper also checks ignored descendants when a directory is
 replaced, refuses a topic owned by any other worktree, and transfers
 topic ownership to a temporary reservation through local ref deletion, and removes matching
 remote-tracking and only the standard keys from repository-local upstream configuration. Included, global,

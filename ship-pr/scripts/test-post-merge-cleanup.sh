@@ -627,10 +627,12 @@ test_master_owner_switch_refusal() {
 }
 
 test_master_update_failure_reattaches_owner() {
-  local fake_bin local_master real_git remote_master log
+  local candidate checkout_status fake_bin local_master real_git remote_master log
   setup_case master-update-failure merge other
   local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
   remote_master=$(git -C "$CASE_INTEGRATOR" rev-parse refs/heads/master)
+  candidate="$CASE_ROOT/master-recovery-candidate"
+  git -C "$CASE_MAIN" worktree add --detach "$candidate" "$local_master" >/dev/null
   fake_bin="$TEST_ROOT/master-update-failure-bin"
   real_git=$(command -v git)
   log="$TEST_ROOT/master-update-failure.log"
@@ -640,11 +642,20 @@ test_master_update_failure_reattaches_owner() {
     'if [ "$3" = update-ref ] && [ "$5" = refs/heads/master ]; then' \
     '  "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/master "$RACE_REMOTE" "$RACE_LOCAL"' \
     'fi' \
+    'if [ "$3" = worktree ] && [ "$4" = remove ]; then' \
+    '  case "$*" in' \
+    '  *ship-pr-master-reserve*)' \
+    '    "$REAL_GIT" -C "$MASTER_CANDIDATE" checkout master >/dev/null 2>&1' \
+    '    echo "$?" >"$CHECKOUT_MARKER"' \
+    '    ;;' \
+    '  esac' \
+    'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
 
   if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
-    RACE_LOCAL="$local_master" RACE_REMOTE="$remote_master" \
+    RACE_LOCAL="$local_master" RACE_REMOTE="$remote_master" MASTER_CANDIDATE="$candidate" \
+    CHECKOUT_MARKER="$TEST_ROOT/master-update-failure-checkout.status" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
     fail "conditional master update unexpectedly succeeded after a competing update"
   fi
@@ -652,6 +663,8 @@ test_master_update_failure_reattaches_owner() {
     "original master owner must be reattached after update-ref failure"
   assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse HEAD)" "$remote_master" \
     "reattached master owner must follow the concurrently updated ref"
+  checkout_status=$(cat "$TEST_ROOT/master-update-failure-checkout.status")
+  [ "$checkout_status" -ne 0 ] || fail "competitor acquired master during failure recovery"
   assert_topic_preserved
   echo "PASS: master update failure reattaches the original owner"
 }
@@ -921,6 +934,38 @@ test_topic_reservation() {
   echo "PASS: topic reservation blocks checkout through local deletion"
 }
 
+test_topic_reservation_failure_restores_remote() {
+  local candidate fake_bin real_git log
+  setup_case topic-reservation-failure merge main-off
+  candidate="$CASE_ROOT/topic-acquisition-candidate"
+  git -C "$CASE_MAIN" worktree add --detach "$candidate" refs/heads/topic >/dev/null
+  fake_bin="$TEST_ROOT/topic-reservation-failure-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/topic-reservation-failure.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*ship-pr-topic-reserve*)' \
+    '  if [ "$3" = switch ] && [ "$5" = topic ]; then' \
+    '    "$REAL_GIT" -C "$TOPIC_CANDIDATE" checkout topic >/dev/null 2>&1' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" TOPIC_CANDIDATE="$candidate" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "topic reservation unexpectedly succeeded after competing acquisition"
+  fi
+  git -C "$CASE_MAIN" show-ref --verify --quiet refs/heads/topic || fail "local topic was lost"
+  git -C "$CASE_MAIN" ls-remote --exit-code --heads origin refs/heads/topic >/dev/null 2>&1 ||
+    fail "remote topic was not restored after reservation failure"
+  [ -d "$CASE_SESSION" ] || fail "original session path was removed after reservation failure"
+  echo "PASS: topic reservation failure restores the remote recovery branch"
+}
+
 test_ignored_write_at_session_removal() {
   local archive fake_bin late_archive real_git log
   setup_case ignored-write-at-removal merge main-off
@@ -1096,6 +1141,52 @@ test_archive_preflight_refusal() {
   echo "PASS: session archive availability is preflighted before mutation"
 }
 
+test_session_head_lock_preflight() {
+  local head_path local_master lock_contents
+  setup_case session-head-lock-preflight merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  head_path=$(git -C "$CASE_SESSION" rev-parse --git-path HEAD)
+  lock_contents="owned by another Git process"
+  printf '%s\n' "$lock_contents" >"$head_path.lock"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "pre-existing session HEAD lock was discovered only after mutation"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "session HEAD lock refusal must precede master advancement"
+  assert_eq "$(cat "$head_path.lock")" "$lock_contents" \
+    "session HEAD lock refusal must preserve the caller's lock"
+  assert_topic_preserved
+  echo "PASS: session HEAD lock is preflighted before mutation"
+}
+
+test_symref_capability_preflight() {
+  local fake_bin local_master real_git
+  setup_case symref-capability-preflight merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  fake_bin="$TEST_ROOT/symref-capability-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = update-ref ] && [ "$4" = --stdin ]; then' \
+    '  exit 1' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "missing symref transaction capability was discovered only after mutation"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "symref capability refusal must precede master advancement"
+  [ -z "$(git -C "$CASE_MAIN" for-each-ref --format='%(refname)' \
+    refs/ship-pr/capability-probe-)" ] || fail "failed capability probe ref was left behind"
+  assert_topic_preserved
+  echo "PASS: symref transaction support is preflighted before mutation"
+}
+
 test_option_like_branch_name() {
   setup_case option-like-branch merge main-off
   git -C "$CASE_MAIN" update-ref refs/heads/-topic "$CASE_TOPIC_OID" ""
@@ -1269,11 +1360,14 @@ test_remote_master_lease
 test_stale_master_response_retains_recovery
 test_symbolic_recovery_ref_refusal
 test_topic_reservation
+test_topic_reservation_failure_restores_remote
 test_ignored_write_at_session_removal
 test_dangling_link_at_session_removal
 test_detached_session_head_recovery
 test_session_head_locked_through_unregister
 test_archive_preflight_refusal
+test_session_head_lock_preflight
+test_symref_capability_preflight
 test_option_like_branch_name
 test_relative_tmpdir
 test_config_lock_refusal

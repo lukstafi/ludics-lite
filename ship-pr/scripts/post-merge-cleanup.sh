@@ -65,11 +65,26 @@ restore_remote_topic() {
 }
 
 cleanup_reservations() {
-  if [ -n "${SESSION_HEAD_LOCK:-}" ] && [ -f "$SESSION_HEAD_LOCK" ]; then
+  if [ "${SESSION_HEAD_LOCK_OWNED:-0}" -eq 1 ] && [ -n "${SESSION_HEAD_LOCK:-}" ] &&
+    [ -f "$SESSION_HEAD_LOCK" ]; then
     unlink "$SESSION_HEAD_LOCK" >/dev/null 2>&1 || true
+  fi
+  if [ "${CAPABILITY_REF_OWNED:-0}" -eq 1 ] && [ -n "${CAPABILITY_REF:-}" ]; then
+    git -C "$MAIN" symbolic-ref --delete "$CAPABILITY_REF" >/dev/null 2>&1 || true
   fi
   if [ -n "${TOPIC_RESERVATION:-}" ] && [ -d "$TOPIC_RESERVATION" ]; then
     git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
+  fi
+  if [ "${ORIGINAL_MASTER_DETACHED:-0}" -eq 1 ] &&
+    [ -n "${ORIGINAL_MASTER_OWNER:-}" ] && [ -d "$ORIGINAL_MASTER_OWNER" ]; then
+    RECOVERY_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master 2>/dev/null || true)
+    if [ -n "$RECOVERY_MASTER" ] &&
+      git -C "$ORIGINAL_MASTER_OWNER" switch --detach --no-overwrite-ignore \
+        "$RECOVERY_MASTER" >/dev/null 2>&1 &&
+      printf 'option no-deref\nsymref-update HEAD refs/heads/master oid %s\n' "$RECOVERY_MASTER" |
+        git -C "$ORIGINAL_MASTER_OWNER" update-ref --stdin >/dev/null 2>&1; then
+      ORIGINAL_MASTER_DETACHED=0
+    fi
   fi
   if [ -n "${MASTER_RESERVATION:-}" ] && [ -d "$MASTER_RESERVATION" ]; then
     git -C "$MAIN" worktree remove --force "$MASTER_RESERVATION" >/dev/null 2>&1 || true
@@ -85,6 +100,9 @@ cleanup_reservations() {
 MASTER_RESERVATION=""
 ORIGINAL_MASTER_DETACHED=0
 SESSION_HEAD_LOCK=""
+SESSION_HEAD_LOCK_OWNED=0
+CAPABILITY_REF=""
+CAPABILITY_REF_OWNED=0
 TOPIC_RESERVATION=""
 trap cleanup_reservations EXIT
 
@@ -159,6 +177,15 @@ SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal -
   fail "could not inspect session worktree cleanliness"
 [ -z "$SESSION_STATUS" ] || fail "session worktree is dirty; commit, stash, or remove its changes before cleanup"
 
+SESSION_HEAD_PATH=$(git -C "$SESSION" rev-parse --git-path HEAD) || fail "cannot locate session HEAD"
+case "$SESSION_HEAD_PATH" in
+/*) ;;
+*) SESSION_HEAD_PATH="$SESSION/$SESSION_HEAD_PATH" ;;
+esac
+SESSION_HEAD_DIR=$(canonical_dir "$(dirname "$SESSION_HEAD_PATH")") || exit $?
+SESSION_HEAD_LOCK="$SESSION_HEAD_DIR/$(basename "$SESSION_HEAD_PATH").lock"
+[ ! -e "$SESSION_HEAD_LOCK" ] || fail "session HEAD is locked; retry after its Git operation finishes"
+
 # Allocate both sibling archives before any ref mutation. Keeping the empty directories reserved
 # proves the parent is writable and prevents a later name race; teardown moves data beneath them.
 SESSION_PARENT=$(dirname "$SESSION")
@@ -167,6 +194,25 @@ SESSION_ARCHIVE=$(mktemp -d "$SESSION_PARENT/.${SESSION_BASENAME}.ship-pr-recove
   fail "could not allocate a session recovery archive beside $SESSION"
 LATE_SESSION_ARCHIVE=$(mktemp -d "$SESSION_PARENT/.${SESSION_BASENAME}.ship-pr-late-data.XXXXXX") ||
   fail "could not allocate a late-data recovery archive beside $SESSION"
+
+# symref-update provides the compare-and-swap used by the master ownership handoff. Probe it before
+# master or topic mutation so older Git versions refuse cleanly rather than failing mid-cleanup.
+CAPABILITY_REF="refs/ship-pr/capability-probe-$$"
+git -C "$MAIN" show-ref --verify --quiet "$CAPABILITY_REF" &&
+  fail "temporary capability ref already exists: $CAPABILITY_REF"
+git -C "$MAIN" symbolic-ref "$CAPABILITY_REF" refs/heads/master ||
+  fail "could not create the symref capability probe"
+CAPABILITY_REF_OWNED=1
+if ! printf 'option no-deref\nsymref-update %s refs/heads/master ref refs/heads/master\n' "$CAPABILITY_REF" |
+  git -C "$MAIN" update-ref --stdin >/dev/null 2>&1; then
+  if git -C "$MAIN" symbolic-ref --delete "$CAPABILITY_REF" >/dev/null 2>&1; then
+    CAPABILITY_REF_OWNED=0
+  fi
+  fail "Git lacks update-ref symref transactions required for safe cleanup"
+fi
+git -C "$MAIN" symbolic-ref --delete "$CAPABILITY_REF" ||
+  fail "could not remove the symref capability probe"
+CAPABILITY_REF_OWNED=0
 
 # Fetch before the safety decision: local master may be stale, while origin/master is the state
 # whose PR merge was independently confirmed. This also makes the later owner-specific update a
@@ -287,7 +333,7 @@ if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
     fail "could not recheck the detached original master owner"
   [ -z "$MASTER_OWNER_STATUS" ] ||
     fail "master owner gained local data during its update; the data was preserved: $ORIGINAL_MASTER_OWNER"
-  printf 'symref-update HEAD refs/heads/master oid %s\n' "$REMOTE_MASTER" |
+  printf 'option no-deref\nsymref-update HEAD refs/heads/master oid %s\n' "$REMOTE_MASTER" |
     git -C "$ORIGINAL_MASTER_OWNER" update-ref --stdin ||
     fail "original master owner changed after preparation; its HEAD was not rewritten"
   ORIGINAL_MASTER_DETACHED=0
@@ -400,8 +446,11 @@ fi
 if ! git -C "$TOPIC_RESERVATION" switch -- "$BRANCH" >/dev/null 2>&1; then
   git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
   TOPIC_RESERVATION=""
+  CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH" 2>/dev/null || true)
+  [ -n "$CURRENT_TOPIC_OID" ] && restore_remote_topic "$CURRENT_TOPIC_OID" ||
+    fail "topic reservation failed, and its remote recovery ref could not be restored"
   [ -z "$SESSION_REF" ] || git -C "$SESSION" switch -- "$BRANCH" >/dev/null 2>&1 || true
-  fail "could not reserve local $BRANCH for deletion; another worktree may have acquired it"
+  fail "could not reserve local $BRANCH for deletion; its remote ref was restored"
 fi
 CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
 if [ "$CURRENT_TOPIC_OID" != "$LOCAL_BRANCH_OID" ]; then
@@ -442,6 +491,7 @@ SESSION_HEAD_DIR=$(canonical_dir "$(dirname "$SESSION_HEAD_PATH")") || exit $?
 SESSION_HEAD_LOCK="$SESSION_HEAD_DIR/$(basename "$SESSION_HEAD_PATH").lock"
 (set -o noclobber; printf '%s\n' "$$" >"$SESSION_HEAD_LOCK") 2>/dev/null ||
   fail "archived session HEAD is busy; its worktree metadata was preserved"
+SESSION_HEAD_LOCK_OWNED=1
 SESSION_FINAL_HEAD=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse HEAD) ||
   fail "could not read the archived session's final HEAD"
 SESSION_RECOVERY_REF="refs/ship-pr/session-recovery/$BRANCH/$SESSION_FINAL_HEAD"
@@ -468,6 +518,7 @@ else
   rmdir "$LATE_SESSION_ARCHIVE" || fail "unused late-data archive could not be removed"
   LATE_SESSION_ARCHIVE=""
 fi
+SESSION_HEAD_LOCK_OWNED=0
 SESSION_HEAD_LOCK=""
 [ -d "$SESSION_ARCHIVED_WORKTREE" ] || fail "session recovery archive disappeared: $SESSION_ARCHIVED_WORKTREE"
 
