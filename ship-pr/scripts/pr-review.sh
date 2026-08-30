@@ -1583,7 +1583,7 @@ cmd_merge() {
 # red breaks the wait immediately: it is a verdict.
 cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
-  local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0
+  local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
   local started now beat waited_note="" ceiling_hit=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1610,10 +1610,17 @@ cmd_base() {
   started=$(date +%s)
   beat=$started
   while :; do
-    red=0 pend=0 out="" inflight=0 uncovered=0
+    red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
     tip=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || tip=""
+    # Without --wait the tip only decorates the report, so a failed read costs the "not the tip"
+    # notes. Under --wait it is the QUESTION — which commit needs the verdict — and an unknown
+    # tip would idle to the absent-run grace and then settle for an older green, exit 0, having
+    # never known what it was waiting for. UNKNOWN is the only honest answer there.
+    [ -n "$tip" ] || [ "$wait_for" -eq 0 ] ||
+      fail 3 "could not read $REPO $branch's tip ($(gh_err_line)) — base --wait cannot know" \
+        "which commit needs the verdict. This is UNKNOWN, not green: retry."
     raw=$(gh_retry read api \
       "repos/$REPO/actions/runs?branch=$branch&event=push&per_page=50" \
       --jq '.workflow_runs[] | [.name, .status, (.conclusion // "pending"), .head_sha, .created_at,
@@ -1669,6 +1676,7 @@ cmd_base() {
         case "$(conclusion_class "$concl")" in
         red)
           red=$((red + 1))
+          [ -n "$tip" ] && [ "$csha" = "$tip" ] && red_at_tip=$((red_at_tip + 1))
           out="${out}  RED      $name — $concl at ${csha:0:8} ($cwhen)  $curl"$'\n'
           ;;
         green) out="${out}  green    $name — $concl at ${csha:0:8}"$'\n' ;;
@@ -1694,7 +1702,12 @@ cmd_base() {
       done <<<"$raw"
     fi
     [ "$wait_for" -gt 0 ] || break
-    [ "$red" -gt 0 ] && break # a red IS the verdict; waiting past it reports it late
+    # Only a red AT THE TIP ends the wait early — it is the tip's own verdict. An older tip's red
+    # while the current tip's run is still in flight is precisely the fix-in-progress shape:
+    # breaking on it would report RED for a commit that has no verdict yet and trigger the
+    # fix-forward response against a fix already running. The older red keeps the wait; when the
+    # tip's run completes, the newest-judged fold replaces it either way.
+    [ "$red_at_tip" -gt 0 ] && break
     now=$(date +%s)
     if [ "$inflight" -eq 0 ]; then
       [ "$uncovered" -eq 0 ] && break

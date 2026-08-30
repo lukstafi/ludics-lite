@@ -77,12 +77,17 @@ The preflight is the compound (wrapped in `ssh <box> '…'` for a remote box):
 cd ~/self-improve && git fetch origin \
   && [ -z "$(git status --porcelain)" ] \
   && [ "$(git rev-parse --abbrev-ref HEAD)" = main ] \
-  && git merge --ff-only origin/main
+  && git merge --ff-only origin/main \
+  && [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]
 ```
 
-Any failing leg REFUSES the launch on that box: surface it to the user rather than launching
-stale — and never reset a dirty checkout silently, since a divergent local edit may be a fix
-worth keeping (the skills README says exactly this). The deployed skills are symlinks into that
+The final equality is not decoration: `merge --ff-only` answers "Already up to date" (exit 0) on
+a checkout that is AHEAD of origin — unpushed local commits, which are divergence to surface
+(skill edits land via PR), not upstream text to deploy — so only the HEAD-equals-origin/main
+check asserts what the preflight actually promises. Any failing leg REFUSES the launch on that
+box: surface it to the user rather than launching stale — and never reset a dirty checkout
+silently, since a divergent local edit may be a fix worth keeping (the skills README says
+exactly this). The deployed skills are symlinks into that
 checkout (`~/.claude/skills`, plus `~/.codex/skills` on Codex boxes), so a stale checkout runs
 stale skill text silently — the ludics gh-609 failure class — and push-side propagation
 structurally misses boxes that sleep through the merge, which is the normal case (two
