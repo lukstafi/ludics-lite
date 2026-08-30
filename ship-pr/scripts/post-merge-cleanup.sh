@@ -142,7 +142,7 @@ if [ -n "$SESSION_REF" ]; then
 else
   [ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "detached session cannot clean $BRANCH while another worktree owns it: $BRANCH_OWNER"
 fi
-SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal) ||
+SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal --ignored=matching) ||
   fail "could not inspect session worktree cleanliness"
 [ -z "$SESSION_STATUS" ] || fail "session worktree is dirty; commit, stash, or remove its changes before cleanup"
 
@@ -236,7 +236,7 @@ done < <(git -C "$MAIN" diff --name-only -z "$LOCAL_MASTER" "$REMOTE_MASTER")
 # Porcelain fast-forwarding holds Git's normal ref/index locks and refuses tracked edits that appear
 # after the cleanliness preflight. A separate update-ref followed by reset --hard would silently
 # destroy such a concurrent edit.
-git -C "$MASTER_OWNER" merge --ff-only "$REMOTE_MASTER" >/dev/null ||
+git -C "$MASTER_OWNER" merge --ff-only --no-overwrite-ignore "$REMOTE_MASTER" >/dev/null ||
   fail "master owner changed or became dirty during its fast-forward: $MASTER_OWNER"
 MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
 [ "$MASTER_OWNER_REF" = refs/heads/master ] ||
@@ -314,21 +314,21 @@ if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
     fail "origin/$BRANCH tracking ref changed while pruning it"
 fi
 
-# Inspect only the repository-local file that removal edits. Included, global, and per-worktree
-# settings are inherited policy rather than branch-owned residue and are deliberately left alone.
+# Inspect only the repository-local file that removal edits. Git flattens dotted subsection names,
+# so test the standard branch keys exactly instead of treating branch.topic.* as unambiguous when
+# topic.child is also a valid branch. Included, global, per-worktree, and custom keys are inherited
+# policy rather than branch-owned upstream residue and are deliberately left alone.
 BRANCH_CONFIG_PRESENT=0
-BRANCH_CONFIG_NAMES=$(git -C "$MAIN" config --local --no-includes --name-only \
-  --get-regexp '^branch\.' 2>/dev/null)
-CONFIG_LIST_STATUS=$?
-case "$CONFIG_LIST_STATUS" in
-0)
-  while IFS= read -r CONFIG_NAME; do
-    case "$CONFIG_NAME" in "branch.$BRANCH."*) BRANCH_CONFIG_PRESENT=1 ;; esac
-  done <<<"$BRANCH_CONFIG_NAMES"
-  ;;
-1) ;;
-*) fail "branch configuration could not be inspected; local $BRANCH and its session were preserved" ;;
-esac
+for BRANCH_CONFIG_KEY in remote merge pushRemote rebase description; do
+  git -C "$MAIN" config --local --no-includes --get \
+    "branch.$BRANCH.$BRANCH_CONFIG_KEY" >/dev/null 2>&1
+  CONFIG_GET_STATUS=$?
+  case "$CONFIG_GET_STATUS" in
+  0) BRANCH_CONFIG_PRESENT=1 ;;
+  1) ;;
+  *) fail "branch configuration could not be inspected; local $BRANCH and its session were preserved" ;;
+  esac
+done
 if [ "$BRANCH_CONFIG_PRESENT" -eq 1 ] &&
   ! git -C "$MAIN" config --local --no-includes --remove-section "branch.$BRANCH" 2>/dev/null; then
   fail "branch configuration could not be removed; local $BRANCH and its session were preserved"

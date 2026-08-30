@@ -53,9 +53,12 @@ assert_cleaned() {
   assert_ref_absent refs/heads/topic
   assert_ref_absent refs/remotes/origin/topic
   assert_remote_topic_absent
-  ! git -C "$CASE_MAIN" config --local --no-includes \
-    --get-regexp '^branch\.topic\.' >/dev/null 2>&1 ||
-    fail "repository-local topic branch configuration remained"
+  local branch_key
+  for branch_key in remote merge pushRemote rebase description; do
+    ! git -C "$CASE_MAIN" config --local --no-includes \
+      --get "branch.topic.$branch_key" >/dev/null 2>&1 ||
+      fail "repository-local topic branch configuration remained: $branch_key"
+  done
   assert_eq "$(git -C "$CASE_MAIN" rev-parse "refs/ship-pr/recovery/topic/$CASE_TOPIC_OID")" \
     "$CASE_TOPIC_OID" "topic recovery ref must retain the cleaned tip"
 }
@@ -420,6 +423,19 @@ test_dirty_session_refusal() {
   echo "PASS: dirty session is refused before cleanup"
 }
 
+test_ignored_session_refusal() {
+  setup_case ignored-session merge main-off
+  echo local.log >>"$CASE_MAIN/.git/info/exclude"
+  echo irreplaceable >"$CASE_SESSION/local.log"
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "session containing ignored data was accepted for destructive cleanup"
+  fi
+  assert_eq "$(sed -n '1p' "$CASE_SESSION/local.log")" irreplaceable \
+    "ignored session data must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: ignored session data is refused before cleanup"
+}
+
 test_master_reservation() {
   local fake_bin real_git candidate remote_master checkout_status
   setup_case master-owner-switch merge other
@@ -508,6 +524,37 @@ test_concurrent_master_edit_refusal() {
     "concurrent master edit must survive a refused fast-forward"
   assert_topic_preserved
   echo "PASS: concurrent master edit is refused without data loss"
+}
+
+test_concurrent_ignored_master_collision() {
+  local fake_bin real_git log collision
+  setup_case concurrent-ignored-master-collision merge other
+  collision="$CASE_MASTER_OWNER/collision"
+  echo remote-data >"$CASE_INTEGRATOR/collision"
+  git -C "$CASE_INTEGRATOR" add collision
+  git -C "$CASE_INTEGRATOR" commit -m "add incoming master path" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  echo collision >>"$CASE_MAIN/.git/info/exclude"
+  fake_bin="$TEST_ROOT/concurrent-ignored-master-collision-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/concurrent-ignored-master-collision.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = merge ]; then' \
+    '  echo local-data >"$MASTER_COLLISION"' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_COLLISION="$collision" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "master fast-forward overwrote an ignored file created after collision preflight"
+  fi
+  assert_eq "$(sed -n '1p' "$collision")" local-data \
+    "concurrently created ignored master data must survive"
+  assert_topic_preserved
+  echo "PASS: concurrent ignored master collision is refused"
 }
 
 test_diverged_master_refusal() {
@@ -746,6 +793,20 @@ test_inherited_branch_config() {
   echo "PASS: inherited branch configuration is deliberately left alone"
 }
 
+test_dotted_branch_config() {
+  setup_case dotted-branch-config merge main-off
+  git -C "$CASE_MAIN" config --remove-section branch.topic
+  git -C "$CASE_MAIN" config branch.topic.child.remote child-origin
+  git -C "$CASE_MAIN" config branch.topic.child.merge refs/heads/topic.child
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MAIN" config --local --no-includes \
+    --get branch.topic.child.remote)" child-origin \
+    "dotted child branch configuration must not be mistaken for topic configuration"
+  echo "PASS: dotted child branch configuration remains distinct"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
@@ -764,9 +825,11 @@ test_already_absent_remote_retry
 test_absent_remote_recreation_race
 test_other_topic_owner_refusal
 test_dirty_session_refusal
+test_ignored_session_refusal
 test_master_reservation
 test_unowned_master_reservation
 test_concurrent_master_edit_refusal
+test_concurrent_ignored_master_collision
 test_diverged_master_refusal
 test_locked_session_refusal
 test_symbolic_ref_refusal
@@ -778,4 +841,5 @@ test_ignored_master_collision_refusal
 test_ignored_master_descendant_refusal
 test_missing_branch_config
 test_inherited_branch_config
+test_dotted_branch_config
 echo "PASS: all post-merge cleanup states"

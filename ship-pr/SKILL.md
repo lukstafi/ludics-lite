@@ -540,7 +540,8 @@ make the exception explicit and leave its reason in the transcript:
   --force-integrated "GitHub reports the PR squash-merged at <sha>"
 ```
 
-The helper requires the exact session-worktree root, a clean and unlocked session, and one shared
+The helper requires the exact session-worktree root, a clean and unlocked session with no ignored
+local data, and one shared
 fetch/push endpoint for `origin`. It treats an already absent topic as a safe retry state and
 refuses an unreadable ref, a symbolic local/tracking ref, or a remote tip newer than the local
 branch; both the remote and local deletions carry exact-OID leases. It also fetches `master`
@@ -552,11 +553,13 @@ on the observed topic OID and followed by fresh `master` and local-topic reads; 
 or `master` became unreadable, the current topic recovery ref is restored before refusal. The
 validated tip also remains reachable under `refs/ship-pr/recovery/` because no finite remote read
 can rule out a later base rollback. The master-owner refresh uses a non-destructive porcelain
-fast-forward and refuses ignored local data at paths changed by it, including ignored descendants
-when a directory is replaced. The helper refuses a topic owned by any other worktree, transfers
+fast-forward with ignored overwrites disabled, and refuses ignored local data at paths changed by
+it, including ignored descendants when a directory is replaced. The helper refuses a topic owned
+by any other worktree, transfers
 topic ownership to a temporary reservation through local ref deletion, and removes matching
-remote-tracking and repository-local branch configuration. Included, global, and per-worktree
-configuration is inherited policy and is deliberately not edited. Do not reconstruct its state
+remote-tracking and standard repository-local upstream configuration. Included, global,
+per-worktree, and custom branch configuration is inherited policy and is deliberately not edited.
+Do not reconstruct its state
 machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to
 `master`, making deletion either tautological or a false refusal after the worktree is already gone.
