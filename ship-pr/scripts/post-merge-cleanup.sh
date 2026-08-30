@@ -92,7 +92,7 @@ refuse_private_worktree_refs() {
 preflight_session_metadata_locks() {
   local name path path_dir lock symbolic_status
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
-    BISECT_HEAD AUTO_MERGE FETCH_HEAD COMMIT_EDITMSG index config.worktree; do
+    BISECT_HEAD AUTO_MERGE FETCH_HEAD COMMIT_EDITMSG SQUASH_MSG index config.worktree; do
     path=$(git -C "$SESSION" rev-parse --git-path "$name") ||
       fail "could not locate session metadata: $name"
     case "$path" in
@@ -103,7 +103,7 @@ preflight_session_metadata_locks() {
     path="$path_dir/$(basename "$path")"
     [ ! -L "$path" ] || fail "session metadata is symbolic; replace it before cleanup: $name"
     case "$name" in
-    COMMIT_EDITMSG | index | config.worktree) ;;
+    COMMIT_EDITMSG | SQUASH_MSG | index | config.worktree) ;;
     *)
       git -C "$SESSION" symbolic-ref -q "$name" >/dev/null 2>&1
       symbolic_status=$?
@@ -143,9 +143,10 @@ preflight_sparse_checkout_metadata() {
 }
 
 refuse_active_session_operations() {
-  local worktree="${1:-$SESSION}" name path path_dir
+  local worktree="${1:-$SESSION}" description="${2:-session}" name path path_dir
   for name in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
-    sequencer rebase-merge rebase-apply; do
+    BISECT_START BISECT_LOG BISECT_NAMES BISECT_TERMS BISECT_RUN \
+    BISECT_ANCESTORS_OK BISECT_EXPECTED_REV sequencer rebase-merge rebase-apply; do
     path=$(git -C "$worktree" rev-parse --git-path "$name") ||
       fail "could not locate session operation state: $name"
     case "$path" in
@@ -155,7 +156,7 @@ refuse_active_session_operations() {
     path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
     path="$path_dir/$(basename "$path")"
     { [ ! -e "$path" ] && [ ! -L "$path" ]; } ||
-      fail "session has an active or retained Git operation; finish or abort it before cleanup: $name"
+      fail "$description has an active or retained Git operation; finish or abort it before cleanup: $name"
   done
 }
 
@@ -179,6 +180,8 @@ refuse_hidden_index_changes() {
   index_path="$index_dir/$(basename "$index_path")"
   [ ! -L "$index_path" ] || fail "$description index is symbolic: $worktree"
   [ -f "$index_path" ] || fail "$description index is missing: $worktree"
+  { [ ! -e "$index_path.lock" ] && [ ! -L "$index_path.lock" ]; } ||
+    fail "$description index is locked; retry after its Git operation finishes: $worktree"
   MASTER_INDEX_PROBE=$(mktemp "$index_dir/.ship-pr-index-probe.XXXXXX") ||
     fail "could not allocate the $description index probe"
   cp -p "$index_path" "$MASTER_INDEX_PROBE" || fail "could not snapshot the $description index"
@@ -491,7 +494,7 @@ delete_ref_with_locked_reflog() {
 }
 
 lock_and_retain_session_metadata() {
-  local name path path_dir lock line metadata oid config_snapshot message_snapshot index_snapshot index_tree
+  local name path path_dir lock line metadata oid config_snapshot message_snapshot squash_snapshot index_snapshot index_tree
   local shared_index shared_snapshot shared_temp sparse_snapshot worktree_git_dir
   local reuc_snapshot mode stage old_oid new_oid rest
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
@@ -543,6 +546,26 @@ lock_and_retain_session_metadata() {
     fail "could not allocate a commit-message snapshot"
   unlink "$message_snapshot" || fail "could not prepare the commit-message snapshot"
   ln "$path" "$message_snapshot" || fail "could not link the archived commit message"
+
+  path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path SQUASH_MSG) ||
+    fail "could not locate archived squash message"
+  case "$path" in
+  /*) ;;
+  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
+  esac
+  path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+  path="$path_dir/$(basename "$path")"
+  lock="$path.lock"
+  (set -o noclobber; printf '%s\n' "$$" >"$lock") 2>/dev/null ||
+    fail "archived squash message is busy"
+  SESSION_PSEUDOREF_LOCKS+=("$lock")
+  [ ! -L "$path" ] || fail "archived squash message is symbolic"
+  if [ -f "$path" ]; then
+    squash_snapshot=$(mktemp "$SESSION_ARCHIVE/SQUASH_MSG.XXXXXX") ||
+      fail "could not allocate a squash-message snapshot"
+    unlink "$squash_snapshot" || fail "could not prepare the squash-message snapshot"
+    ln "$path" "$squash_snapshot" || fail "could not link the archived squash message"
+  fi
 
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path config.worktree) ||
@@ -1021,6 +1044,7 @@ MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status \
 refuse_hidden_index_changes "$MASTER_OWNER" "master owner"
 refuse_initialized_submodules "$MASTER_OWNER" "master owner"
 refuse_index_resolve_undo "$MASTER_OWNER" "master owner"
+refuse_active_session_operations "$MASTER_OWNER" "master owner"
 IGNORED_COLLISION=""
 CHANGED_PATHS_FILE=$(mktemp "$TEMP_ROOT/ship-pr-master-paths.XXXXXX") ||
   fail "could not allocate the master changed-path snapshot"

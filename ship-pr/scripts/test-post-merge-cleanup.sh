@@ -1340,6 +1340,50 @@ test_skip_worktree_master_refusal() {
   echo "PASS: skip-worktree master-owner edits are refused before ownership handoff"
 }
 
+test_master_active_operation_refusal() {
+  local local_master merge_head side_oid
+  setup_case master-active-operation merge other
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  side_oid=$(printf 'clean pending merge\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$local_master^{tree}")" -p "$local_master")
+  git -C "$CASE_MAIN" update-ref refs/heads/pending-merge "$side_oid"
+  git -C "$CASE_MASTER_OWNER" merge --no-commit --no-ff pending-merge >/dev/null
+  [ -z "$(git -C "$CASE_MASTER_OWNER" status --porcelain)" ] ||
+    fail "pending clean merge unexpectedly changed master-owner files"
+  merge_head=$(git -C "$CASE_MASTER_OWNER" rev-parse --git-path MERGE_HEAD)
+  [ -f "$merge_head" ] || fail "pending clean merge created no MERGE_HEAD"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "clean active operation in the master owner was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "master active-operation refusal must precede master advancement"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
+    "active-operation refusal must leave the master owner attached"
+  [ -f "$merge_head" ] || fail "master-owner merge state was removed"
+  assert_topic_preserved
+  echo "PASS: clean active operations in the master owner are refused before handoff"
+}
+
+test_master_index_lock_refusal() {
+  local index_path local_master
+  setup_case master-index-lock merge other
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  index_path=$(git -C "$CASE_MASTER_OWNER" rev-parse --git-path index)
+  : >"$index_path.lock"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "locked master-owner index was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "master index-lock refusal must precede master advancement"
+  [ -f "$index_path.lock" ] || fail "master-owner index lock was removed"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
+    "index-lock refusal must leave the master owner attached"
+  assert_topic_preserved
+  echo "PASS: locked master-owner indexes are refused before ownership handoff"
+}
+
 test_master_changed_path_failure_refusal() {
   local fake_bin local_master real_git
   setup_case master-changed-path-failure merge other
@@ -1409,6 +1453,24 @@ test_active_session_operation_refusal() {
   [ -f "$sequencer/todo" ] || fail "active session sequencer state was lost"
   assert_topic_preserved
   echo "PASS: active session operation state is refused before mutation"
+}
+
+test_active_session_bisect_refusal() {
+  local bisect_start local_master
+  setup_case active-session-bisect merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_SESSION" bisect start >/dev/null
+  bisect_start=$(git -C "$CASE_SESSION" rev-parse --git-path BISECT_START)
+  [ -f "$bisect_start" ] || fail "bisect start created no retained state"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "active session bisect without BISECT_HEAD was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "active bisect refusal must precede master advancement"
+  [ -f "$bisect_start" ] || fail "active bisect state was removed"
+  assert_topic_preserved
+  echo "PASS: active session bisect metadata is refused before mutation"
 }
 
 test_symbolic_session_pseudoref_refusal() {
@@ -1761,6 +1823,34 @@ test_concurrent_commit_message_archive() {
   assert_eq "$(sed -n '1p' "$message_snapshot")" "$late_message" \
     "commit message written after retention began must survive unregistering"
   echo "PASS: concurrent rejected commit messages remain linked into the recovery archive"
+}
+
+test_squash_message_archive() {
+  local file message_count message_snapshot side_oid squash_message squash_path
+  setup_case squash-message-archive merge main-off
+  side_oid=$(printf 'pending squash source\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_SESSION" rev-parse "HEAD^{tree}")" -p "$CASE_TOPIC_OID")
+  git -C "$CASE_MAIN" update-ref refs/heads/pending-squash "$side_oid"
+  git -C "$CASE_SESSION" merge --squash pending-squash >/dev/null
+  [ -z "$(git -C "$CASE_SESSION" status --porcelain)" ] ||
+    fail "identical-tree squash unexpectedly dirtied the session"
+  squash_path=$(git -C "$CASE_SESSION" rev-parse --git-path SQUASH_MSG)
+  [ -f "$squash_path" ] || fail "squash merge created no pending message"
+  squash_message=$(cat "$squash_path")
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  message_count=0
+  message_snapshot=""
+  for file in "$CASE_ARCHIVE"/SQUASH_MSG.*; do
+    [ -f "$file" ] || continue
+    message_count=$((message_count + 1))
+    message_snapshot="$file"
+  done
+  assert_eq "$message_count" 1 "cleanup must archive exactly one squash-message snapshot"
+  assert_eq "$(cat "$message_snapshot")" "$squash_message" \
+    "pending squash message must survive unregistering"
+  echo "PASS: pending squash messages are copied into the recovery archive"
 }
 
 test_sparse_checkout_archive() {
@@ -3017,10 +3107,13 @@ test_initialized_master_submodule_refusal
 test_master_resolve_undo_refusal
 test_assume_unchanged_master_refusal
 test_skip_worktree_master_refusal
+test_master_active_operation_refusal
+test_master_index_lock_refusal
 test_master_changed_path_failure_refusal
 test_diverged_master_refusal
 test_locked_session_refusal
 test_active_session_operation_refusal
+test_active_session_bisect_refusal
 test_symbolic_session_pseudoref_refusal
 test_private_worktree_ref_refusal
 test_rewritten_worktree_ref_refusal
@@ -3032,6 +3125,7 @@ test_session_resolve_undo_recovery
 test_worktree_config_archive
 test_commit_message_archive
 test_concurrent_commit_message_archive
+test_squash_message_archive
 test_sparse_checkout_archive
 test_session_metadata_lock_preflight
 test_late_private_worktree_ref_recovery
