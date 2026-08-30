@@ -514,33 +514,35 @@ conflict you must resolve.
 
 Then clean up, but not with `gh pr merge --delete-branch`: from a worktree its cleanup fails *after*
 the merge has landed ("fatal: 'master' is already used by worktree"), leaving the branch behind and
-the failure looking like a failed merge. Three rules carry the rest.
+the failure looking like a failed merge. Run the executable sequence instead:
 
-Delete the REMOTE branch first, then fast-forward the local `master`, and only then `git branch
--d`: `-d` tests the branch's UPSTREAM and falls back to HEAD only when there is none, so with
-`origin/<branch>` still present it checks a tautology and drops an unmerged topic with a warning.
+```bash
+~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh <main-checkout> <session-worktree> <branch>
+```
 
-Advancing that local `master` depends on who has it checked out, so inspect `git -C <main> worktree
-list --porcelain` for `branch refs/heads/master`. If NO worktree has it out, use `git -C <main>
-fetch origin master:master`; if one does, that fetch is refused and the exact complement is `git -C
-<master-owner> merge --ff-only origin/master` in the owning worktree.
+It fetches and proves the ordinary topic is an ancestor of `origin/master` before deleting
+anything, deletes the remote branch, advances local `master` according to which worktree owns it,
+detaches and removes the session worktree, and deletes the local branch with the check appropriate
+to the primary checkout's current branch. Its scratch-repository test covers unchecked-out
+`master`, `master` owned by the primary checkout, `master` owned by another worktree, safe deletion
+while the primary checkout is off `master`, and refusal of an unmerged topic:
 
-With the upstream gone, `-d` is a real "merged into master" check only when the checkout's HEAD IS
-`master`. Off `master` it is not, so require `git -C <main> merge-base --is-ancestor <branch>
-master` to pass and then use `-D`, which only performs the deletion (`-D` after an explicit
-ancestry check is also what follows an independently confirmed squash or rebase merge, whose
-commits are not ancestors of `master`). `git -C <main>` anchors the working directory only — it
-says nothing about which branch is checked out there, which is the volatile part during a wave, so
-it is never itself the safety check. Anchor anyway, because `worktree remove` deletes the current
-directory when run from inside it and any later unanchored command dies with "Unable to read
-current working directory". One more refusal survives all of the above: git will not delete a
-branch any worktree has checked out ("cannot delete branch ... used by worktree") — and in a
-worktree session that worktree is normally the session's own. Detach it first with `git -C
-<session-worktree> checkout --detach`; that is safe because the session worktree is disposable and
-the merge has already landed.
+```bash
+~/.claude/skills/ship-pr/scripts/test-post-merge-cleanup.sh
+```
 
-`docs/agent-notes.md` (Conventions) carries the full ordered sequence, verified end to end —
-follow it there rather than reconstructing it.
+A squash or rebase merge does not preserve ancestry. After independently confirming that merge,
+make the exception explicit and leave its reason in the transcript:
+
+```bash
+~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> \
+  --force-integrated "GitHub reports the PR squash-merged at <sha>"
+```
+
+The helper anchors every operation before it removes the session directory and treats an already
+absent remote branch as a safe retry state. Do not reconstruct its state machine in prose or
+replace the ancestry guard with `git branch -d`: `-d` tests the branch's upstream while it exists,
+which makes `origin/<branch>` a tautological and unsafe deletion check.
 
 If the harness blocks the merge itself, that is a permission gate, not a failure: explain what you
 were doing, give the command, and let the user decide. Never work around it.
