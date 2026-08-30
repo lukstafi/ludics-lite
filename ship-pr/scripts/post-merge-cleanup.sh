@@ -38,10 +38,12 @@ scan_branch_owner() {
   local target_ref="$1" worktree_list field current_worktree=""
   BRANCH_OWNER=""
   BRANCH_OWNER_COUNT=0
+  SESSION_LOCKED=0
   worktree_list=$(git -C "$MAIN" worktree list --porcelain) || fail "could not inspect registered worktrees"
   while IFS= read -r field; do
     case "$field" in
     worktree\ *) current_worktree=${field#worktree } ;;
+    locked*) [ "$current_worktree" != "$SESSION" ] || SESSION_LOCKED=1 ;;
     esac
     if [ "$field" = "branch $target_ref" ]; then
       BRANCH_OWNER="$current_worktree"
@@ -88,6 +90,9 @@ SESSION_COMMON=$(git_path "$SESSION" "$(git -C "$SESSION" rev-parse --git-common
 
 git -C "$MAIN" show-ref --verify --quiet "refs/heads/$BRANCH" ||
   fail "local branch does not exist: $BRANCH"
+if git -C "$MAIN" symbolic-ref -q "refs/heads/$BRANCH" >/dev/null 2>&1; then
+  fail "local branch ref is symbolic rather than direct: refs/heads/$BRANCH"
+fi
 LOCAL_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot read local $BRANCH"
 
 SESSION_REF=$(git -C "$SESSION" symbolic-ref -q HEAD 2>/dev/null || true)
@@ -102,6 +107,7 @@ else
 fi
 
 scan_branch_owner "refs/heads/$BRANCH"
+[ "$SESSION_LOCKED" -eq 0 ] || fail "session worktree is locked; unlock it before cleanup"
 if [ -n "$SESSION_REF" ]; then
   [ "$BRANCH_OWNER_COUNT" -eq 1 ] ||
     fail "$BRANCH must be owned only by the attached session worktree"
@@ -139,6 +145,52 @@ case "$ORIGIN_PUSH_URLS" in
 esac
 ORIGIN_PUSH_URL="$ORIGIN_PUSH_URLS"
 ORIGIN_FETCH_URL=$(git -C "$MAIN" remote get-url origin) || fail "could not resolve origin's fetch endpoint"
+[ "$ORIGIN_FETCH_URL" = "$ORIGIN_PUSH_URL" ] ||
+  fail "origin has distinct fetch and push endpoints; cleanup requires one repository for master and topic"
+if git -C "$MAIN" symbolic-ref -q "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
+  fail "remote-tracking branch is symbolic rather than direct: refs/remotes/origin/$BRANCH"
+fi
+
+# Prove and perform the local master fast-forward before deleting the remote recovery ref. When
+# master is checked out, detach its clean owner, update the named ref conditionally, then reattach;
+# no command may infer its destination from whichever branch happens to be current.
+if git -C "$MAIN" symbolic-ref -q refs/heads/master >/dev/null 2>&1; then
+  fail "local master ref is symbolic rather than direct"
+fi
+LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot read local master"
+REMOTE_MASTER=$(git -C "$MAIN" rev-parse refs/remotes/origin/master) || fail "cannot read origin/master"
+git -C "$MAIN" merge-base --is-ancestor "$LOCAL_MASTER" "$REMOTE_MASTER" ||
+  fail "local master cannot fast-forward to origin/master"
+
+scan_branch_owner refs/heads/master
+[ "$BRANCH_OWNER_COUNT" -le 1 ] || fail "more than one worktree reports owning master"
+if [ "$BRANCH_OWNER_COUNT" -eq 0 ]; then
+  git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER" ||
+    fail "local master moved after its fast-forward preflight"
+else
+  MASTER_OWNER="$BRANCH_OWNER"
+  MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
+  [ "$MASTER_OWNER_REF" = refs/heads/master ] ||
+    fail "master owner changed branches before its fast-forward: $MASTER_OWNER"
+  MASTER_OWNER_HEAD=$(git -C "$MASTER_OWNER" rev-parse HEAD) || fail "cannot read master owner HEAD"
+  [ "$MASTER_OWNER_HEAD" = "$LOCAL_MASTER" ] || fail "master owner's HEAD disagrees with local master"
+  MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status --porcelain --untracked-files=normal) ||
+    fail "could not inspect master owner cleanliness"
+  [ -z "$MASTER_OWNER_STATUS" ] || fail "master owner is dirty; clean it before cleanup: $MASTER_OWNER"
+  git -C "$MASTER_OWNER" checkout --detach "$LOCAL_MASTER" >/dev/null ||
+    fail "could not detach the master owner before updating the named ref"
+  scan_branch_owner refs/heads/master
+  [ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "master became owned by another worktree before its update"
+  if ! git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER"; then
+    git -C "$MASTER_OWNER" checkout master >/dev/null 2>&1 || true
+    fail "local master moved after its owner was detached"
+  fi
+  git -C "$MASTER_OWNER" checkout master >/dev/null ||
+    fail "master advanced but its owner could not be reattached: $MASTER_OWNER"
+fi
+
+LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot reread local master"
+[ "$LOCAL_MASTER" = "$REMOTE_MASTER" ] || fail "local master did not reach origin/master"
 
 REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
 REMOTE_BRANCH_STATUS=$?
@@ -160,33 +212,12 @@ case "$REMOTE_BRANCH_STATUS" in
 *) fail "could not determine whether origin/$BRANCH exists (ls-remote exit $REMOTE_BRANCH_STATUS)" ;;
 esac
 
-if [ "$ORIGIN_FETCH_URL" = "$ORIGIN_PUSH_URL" ] &&
-  git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
   TRACKING_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/remotes/origin/$BRANCH") ||
     fail "cannot read origin/$BRANCH tracking ref"
-  git -C "$MAIN" update-ref -d "refs/remotes/origin/$BRANCH" "$TRACKING_BRANCH_OID" ||
+  git -C "$MAIN" update-ref --no-deref -d "refs/remotes/origin/$BRANCH" "$TRACKING_BRANCH_OID" ||
     fail "origin/$BRANCH tracking ref changed while pruning it"
 fi
-
-# Git permits at most one worktree to own master, but the three possible states need different
-# commands: update the branch ref directly when nobody owns it, or fast-forward the owning
-# worktree (which may or may not be the primary checkout).
-scan_branch_owner refs/heads/master
-[ "$BRANCH_OWNER_COUNT" -le 1 ] || fail "more than one worktree reports owning master"
-if [ "$BRANCH_OWNER_COUNT" -eq 0 ]; then
-  git -C "$MAIN" fetch origin refs/heads/master:refs/heads/master ||
-    fail "could not fast-forward unchecked-out master"
-else
-  MASTER_OWNER_REF=$(git -C "$BRANCH_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
-  [ "$MASTER_OWNER_REF" = refs/heads/master ] ||
-    fail "master owner changed branches before its fast-forward: $BRANCH_OWNER"
-  git -C "$BRANCH_OWNER" merge --ff-only refs/remotes/origin/master ||
-    fail "could not fast-forward master in its owning worktree: $BRANCH_OWNER"
-fi
-
-LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot read local master"
-REMOTE_MASTER=$(git -C "$MAIN" rev-parse refs/remotes/origin/master) || fail "cannot read origin/master"
-[ "$LOCAL_MASTER" = "$REMOTE_MASTER" ] || fail "local master did not reach origin/master"
 
 if [ -n "$SESSION_REF" ]; then
   git -C "$SESSION" checkout --detach >/dev/null || fail "could not detach the session worktree"
@@ -203,7 +234,7 @@ if [ -z "$FORCE_REASON" ]; then
 fi
 scan_branch_owner "refs/heads/$BRANCH"
 [ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "$BRANCH became owned by another worktree: $BRANCH_OWNER"
-git -C "$MAIN" update-ref -d "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" ||
+git -C "$MAIN" update-ref --no-deref -d "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" ||
   fail "local $BRANCH moved from validated tip $LOCAL_BRANCH_OID; its newer ref was preserved"
 git -C "$MAIN" config --remove-section "branch.$BRANCH" 2>/dev/null
 CONFIG_REMOVE_STATUS=$?

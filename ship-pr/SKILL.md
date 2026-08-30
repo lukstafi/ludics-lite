@@ -540,12 +540,14 @@ make the exception explicit and leave its reason in the transcript:
   --force-integrated "GitHub reports the PR squash-merged at <sha>"
 ```
 
-The helper requires the exact session-worktree root and anchors every operation before it removes
-that directory. It resolves the actual push endpoint once, treats an already absent branch there
-as a safe retry state, and refuses an unreadable ref or a remote tip newer than the local branch;
-both the remote and local deletions carry exact-OID leases. It also fetches `master` explicitly,
-independent of the remote's configured fetch map, refuses a dirty session or a topic owned by any
-other worktree, revalidates the selected `master` owner before merging, and removes matching
+The helper requires the exact session-worktree root, a clean and unlocked session, and one shared
+fetch/push endpoint for `origin`. It treats an already absent topic as a safe retry state and
+refuses an unreadable ref, a symbolic local/tracking ref, or a remote tip newer than the local
+branch; both the remote and local deletions carry exact-OID leases. It also fetches `master`
+explicitly, independent of the remote's configured fetch map, and proves the local ref can
+fast-forward before any remote deletion. A clean worktree owning `master` is detached while the
+named ref is conditionally updated, then reattached, so no update can be redirected by a branch
+switch. The helper refuses a topic owned by any other worktree and removes matching
 remote-tracking and branch-configuration residue. Do not reconstruct its state machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to
 `master`, making deletion either tautological or a false refusal after the worktree is already gone.

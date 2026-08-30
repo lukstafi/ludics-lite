@@ -261,16 +261,15 @@ test_distinct_push_endpoint() {
   git -C "$CASE_INTEGRATOR" push origin topic >/dev/null
   fetch_tip=$(git -C "$CASE_INTEGRATOR" rev-parse HEAD)
 
-  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
-  assert_absent "$CASE_SESSION"
-  assert_ref_absent refs/heads/topic
-  ! git -C "$CASE_MAIN" ls-remote --exit-code --heads "$push_remote" refs/heads/topic >/dev/null 2>&1 ||
-    fail "topic remained on the push endpoint"
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "cleanup accepted distinct fetch and push repositories"
+  fi
+  assert_topic_preserved
+  git -C "$CASE_MAIN" ls-remote --exit-code --heads "$push_remote" refs/heads/topic >/dev/null 2>&1 ||
+    fail "topic disappeared from the refused push endpoint"
   fetch_after=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
-  assert_eq "$fetch_after" "$fetch_tip" "cleanup must not confuse the fetch endpoint with the push endpoint"
-  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" \
-    "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)" "local master must still advance from fetch origin"
-  echo "PASS: distinct fetch and push endpoints"
+  assert_eq "$fetch_after" "$fetch_tip" "refused cleanup must preserve the fetch endpoint"
+  echo "PASS: distinct fetch and push endpoints are refused"
 }
 
 test_topic_tag_collision() {
@@ -414,40 +413,94 @@ test_dirty_session_refusal() {
 }
 
 test_master_owner_switch_refusal() {
-  local fake_bin real_git owner_before coordinator_before
+  local fake_bin real_git coordinator_before remote_master
   setup_case master-owner-switch merge other
   git -C "$CASE_MASTER_OWNER" branch coordinator
-  owner_before=$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/master)
   coordinator_before=$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/coordinator)
+  remote_master=$(git -C "$CASE_INTEGRATOR" rev-parse refs/heads/master)
   fake_bin="$TEST_ROOT/master-owner-switch-bin"
   real_git=$(command -v git)
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'for arg in "$@"; do' \
-    '  if [ "$arg" = symbolic-ref ]; then' \
-    '    count=0' \
-    '    [ ! -f "$SWITCH_MARKER" ] || count=$(cat "$SWITCH_MARKER")' \
-    '    count=$((count + 1))' \
-    '    echo "$count" >"$SWITCH_MARKER"' \
-    '    [ "$count" -ne 2 ] || "$REAL_GIT" -C "$MASTER_OWNER" checkout coordinator >/dev/null' \
-    '    break' \
-    '  fi' \
-    'done' \
+    'joined=" $* "' \
+    'case "$joined" in' \
+    '  *" checkout --detach "*)' \
+    '    if [ ! -e "$SWITCH_MARKER" ]; then' \
+    '      : >"$SWITCH_MARKER"' \
+    '      "$REAL_GIT" -C "$MASTER_OWNER" checkout coordinator >/dev/null' \
+    '    fi' \
+    '    ;;' \
+    'esac' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
 
-  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_OWNER="$CASE_MASTER_OWNER" \
+  if ! PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_OWNER="$CASE_MASTER_OWNER" \
     SWITCH_MARKER="$TEST_ROOT/master-owner-switch.count" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
-    fail "cleanup merged origin/master into a branch selected after the owner scan"
+    fail "named master update failed after an injected owner switch"
   fi
-  assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/master)" "$owner_before" \
-    "master must remain unchanged after its owner switches away"
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/master)" "$remote_master" \
+    "named master ref must reach the remote tip"
   assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse refs/heads/coordinator)" "$coordinator_before" \
     "coordinator must not receive the master fast-forward"
-  [ -d "$CASE_SESSION" ] || fail "session worktree was removed after master-owner refusal"
-  echo "PASS: master owner branch switch is revalidated"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
+    "master owner must be reattached"
+  echo "PASS: master owner switch cannot redirect the named ref update"
+}
+
+test_diverged_master_refusal() {
+  local master_owner="$TEST_ROOT/diverged-master-owner"
+  setup_case diverged-master merge none
+  git -C "$CASE_MAIN" worktree add "$master_owner" master >/dev/null
+  git_config "$master_owner"
+  echo divergent >"$master_owner/divergent"
+  git -C "$master_owner" add divergent
+  git -C "$master_owner" commit -m "diverge local master" >/dev/null
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "non-fast-forward local master was accepted"
+  fi
+  assert_topic_preserved
+  assert_eq "$(git -C "$master_owner" symbolic-ref --short HEAD)" master \
+    "diverged master owner must remain attached"
+  echo "PASS: divergent local master is refused before remote deletion"
+}
+
+test_locked_session_refusal() {
+  setup_case locked-session merge main-off
+  git -C "$CASE_MAIN" worktree lock --reason "scratch lock" "$CASE_SESSION"
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "locked session was accepted for cleanup"
+  fi
+  assert_topic_preserved
+  echo "PASS: locked session is refused before cleanup"
+}
+
+test_symbolic_ref_refusal() {
+  local tracked_master
+  setup_case symbolic-local-topic merge main-off
+  git -C "$CASE_MAIN" branch topic-target refs/heads/topic
+  git -C "$CASE_MAIN" symbolic-ref refs/heads/topic refs/heads/topic-target
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "symbolic local topic ref was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" symbolic-ref refs/heads/topic)" refs/heads/topic-target \
+    "symbolic local topic must remain intact"
+  git -C "$CASE_MAIN" ls-remote --exit-code --heads origin refs/heads/topic >/dev/null 2>&1 ||
+    fail "remote topic was deleted after symbolic local ref refusal"
+
+  setup_case symbolic-tracking-topic merge main-off
+  git -C "$CASE_MAIN" fetch origin refs/heads/master:refs/remotes/origin/master >/dev/null
+  tracked_master=$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)
+  git -C "$CASE_MAIN" symbolic-ref refs/remotes/origin/topic refs/remotes/origin/master
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "symbolic remote-tracking topic ref was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)" "$tracked_master" \
+    "symbolic tracking refusal must preserve origin/master"
+  assert_topic_preserved
+  echo "PASS: symbolic local and tracking refs are refused"
 }
 
 test_unchecked_out_master
@@ -469,4 +522,7 @@ test_absent_remote_recreation_race
 test_other_topic_owner_refusal
 test_dirty_session_refusal
 test_master_owner_switch_refusal
+test_diverged_master_refusal
+test_locked_session_refusal
+test_symbolic_ref_refusal
 echo "PASS: all post-merge cleanup states"
