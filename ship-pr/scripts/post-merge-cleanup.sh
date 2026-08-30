@@ -14,6 +14,7 @@ for GIT_LOCAL_ENV_VAR in $GIT_LOCAL_ENV_VARS; do
   unset "$GIT_LOCAL_ENV_VAR"
 done
 unset GIT_LOCAL_ENV_VAR GIT_LOCAL_ENV_VARS
+export GIT_NO_REPLACE_OBJECTS=1
 
 fail() {
   echo "post-merge-cleanup.sh: $*" >&2
@@ -215,7 +216,12 @@ retain_topic_reflog_sides() {
   /*) ;;
   *) path="$MAIN/$path" ;;
   esac
-  path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+  path_dir=$(dirname "$path")
+  if [ ! -d "$path_dir" ]; then
+    { [ ! -e "$path" ] && [ ! -L "$path" ]; } || fail "$ref reflog has an invalid parent"
+    return 0
+  fi
+  path_dir=$(canonical_dir "$path_dir") || exit $?
   path="$path_dir/$(basename "$path")"
   [ ! -L "$path" ] || fail "$ref reflog is symbolic"
   [ -f "$path" ] || return 0
@@ -237,7 +243,12 @@ retain_session_reflog_sides() {
   /*) ;;
   *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
   esac
-  path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+  path_dir=$(dirname "$path")
+  if [ ! -d "$path_dir" ]; then
+    { [ ! -e "$path" ] && [ ! -L "$path" ]; } || fail "session-private reflog has an invalid parent: $ref"
+    return 0
+  fi
+  path_dir=$(canonical_dir "$path_dir") || exit $?
   path="$path_dir/$(basename "$path")"
   [ ! -L "$path" ] || fail "session-private reflog is symbolic: $ref"
   [ -f "$path" ] || return 0
@@ -323,7 +334,13 @@ retain_private_session_refs() {
     *) probe="$SESSION_ARCHIVED_WORKTREE/$probe" ;;
     esac
     blocker=$(dirname "$probe")
-    blocker_parent=$(canonical_dir "$(dirname "$blocker")") || exit $?
+    blocker_parent=$(dirname "$blocker")
+    if [ ! -d "$blocker_parent" ]; then
+      { [ ! -e "$blocker_parent" ] && [ ! -L "$blocker_parent" ]; } ||
+        fail "private namespace parent is invalid: $namespace"
+      mkdir "$blocker_parent" || fail "could not create private namespace parent: $namespace"
+    fi
+    blocker_parent=$(canonical_dir "$blocker_parent") || exit $?
     blocker="$blocker_parent/$(basename "$blocker")"
     blocker_temp=$(mktemp "$blocker_parent/.ship-pr-namespace-blocker.XXXXXX") ||
       fail "could not allocate private namespace blocker: $namespace"
@@ -417,7 +434,12 @@ lock_and_retain_session_metadata() {
   /*) ;;
   *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
   esac
-  path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+  path_dir=$(dirname "$path")
+  if [ ! -d "$path_dir" ]; then
+    { [ ! -e "$path" ] && [ ! -L "$path" ]; } || fail "archived session HEAD reflog has an invalid parent"
+    return 0
+  fi
+  path_dir=$(canonical_dir "$path_dir") || exit $?
   lock="$path_dir/$(basename "$path").lock"
   (set -o noclobber; printf '%s\n' "$$" >"$lock") 2>/dev/null ||
     fail "archived per-worktree configuration is busy"
@@ -569,6 +591,12 @@ cleanup_reservations() {
       [ ! -f "$lock" ] || unlink "$lock" >/dev/null 2>&1 || true
     done
   fi
+  if [ "${CONFIG_LOCK_OWNED:-0}" -eq 1 ] && [ -n "${CONFIG_LOCK:-}" ] && [ -f "$CONFIG_LOCK" ]; then
+    unlink "$CONFIG_LOCK" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${CHANGED_PATHS_FILE:-}" ] && [ -f "$CHANGED_PATHS_FILE" ]; then
+    unlink "$CHANGED_PATHS_FILE" >/dev/null 2>&1 || true
+  fi
   if [ "${#SESSION_PSEUDOREF_LOCKS[@]}" -gt 0 ]; then
     for lock in "${SESSION_PSEUDOREF_LOCKS[@]}"; do
       [ ! -f "$lock" ] || unlink "$lock" >/dev/null 2>&1 || true
@@ -627,6 +655,9 @@ REF_TRANSACTION_IN=""
 REF_TRANSACTION_OUT=""
 REF_TRANSACTION_PID=""
 PRIVATE_NAMESPACE_BLOCKERS=()
+CONFIG_LOCK=""
+CONFIG_LOCK_OWNED=0
+CHANGED_PATHS_FILE=""
 trap cleanup_reservations EXIT
 
 [ "$#" -ge 3 ] || usage
@@ -834,6 +865,10 @@ MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status \
 refuse_initialized_submodules "$MASTER_OWNER" "master owner"
 refuse_index_resolve_undo "$MASTER_OWNER" "master owner"
 IGNORED_COLLISION=""
+CHANGED_PATHS_FILE=$(mktemp "$TEMP_ROOT/ship-pr-master-paths.XXXXXX") ||
+  fail "could not allocate the master changed-path snapshot"
+git -C "$MAIN" diff --name-only -z "$LOCAL_MASTER" "$REMOTE_MASTER" >"$CHANGED_PATHS_FILE" ||
+  fail "could not enumerate paths changed by the master fast-forward"
 while IFS= read -r -d '' CHANGED_PATH; do
   if { [ -e "$MASTER_OWNER/$CHANGED_PATH" ] || [ -L "$MASTER_OWNER/$CHANGED_PATH" ]; } &&
     git -C "$MASTER_OWNER" check-ignore -q -- "$CHANGED_PATH"; then
@@ -851,7 +886,9 @@ while IFS= read -r -d '' CHANGED_PATH; do
       fi
     fi
   fi
-done < <(git -C "$MAIN" diff --name-only -z "$LOCAL_MASTER" "$REMOTE_MASTER")
+done <"$CHANGED_PATHS_FILE"
+unlink "$CHANGED_PATHS_FILE" || fail "could not remove the master changed-path snapshot"
+CHANGED_PATHS_FILE=""
 [ -z "$IGNORED_COLLISION" ] ||
   fail "master fast-forward would overwrite ignored local data: $MASTER_OWNER/$IGNORED_COLLISION"
 
@@ -997,13 +1034,18 @@ fi
 # so test the standard branch keys exactly instead of treating branch.topic.* as unambiguous when
 # topic.child is also a valid branch. Included, global, per-worktree, and custom keys are inherited
 # policy rather than branch-owned upstream residue and are deliberately left alone.
+CONFIG_LOCK="$MAIN_COMMON/config.lock"
+(set -o noclobber; : >"$CONFIG_LOCK") 2>/dev/null ||
+  fail "repository config became locked during cleanup; local $BRANCH was preserved"
+CONFIG_LOCK_OWNED=1
+cp -p "$MAIN_COMMON/config" "$CONFIG_LOCK" || fail "could not snapshot repository configuration"
 for BRANCH_CONFIG_KEY in remote merge pushRemote rebase description; do
-  git -C "$MAIN" config --local --no-includes --get \
+  git config --file "$CONFIG_LOCK" --no-includes --get \
     "branch.$BRANCH.$BRANCH_CONFIG_KEY" >/dev/null 2>&1
   CONFIG_GET_STATUS=$?
   case "$CONFIG_GET_STATUS" in
   0)
-    git -C "$MAIN" config --local --no-includes --unset-all \
+    git config --file "$CONFIG_LOCK" --no-includes --unset-all \
       "branch.$BRANCH.$BRANCH_CONFIG_KEY" 2>/dev/null ||
       fail "branch configuration could not be removed; local $BRANCH and its session were preserved"
     ;;
@@ -1103,6 +1145,10 @@ SESSION_PSEUDOREF_LOCKS=()
 [ -d "$SESSION_ARCHIVED_WORKTREE" ] || fail "session recovery archive disappeared: $SESSION_ARCHIVED_WORKTREE"
 
 delete_ref_with_locked_reflog "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" topic-reflog
+atomic_rename "$CONFIG_LOCK" "$MAIN_COMMON/config" ||
+  fail "local $BRANCH was deleted but its cleaned repository configuration could not be installed"
+CONFIG_LOCK_OWNED=0
+CONFIG_LOCK=""
 git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" ||
   fail "local $BRANCH was deleted but its temporary reservation could not be removed"
 TOPIC_RESERVATION=""

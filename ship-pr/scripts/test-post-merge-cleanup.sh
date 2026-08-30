@@ -310,6 +310,22 @@ test_non_files_ref_backend_refusal() {
   echo "PASS: non-files ref storage is refused before mutation"
 }
 
+test_replacement_refs_disabled() {
+  local fake_master remote_master
+  setup_case replacement-ref-history unmerged main-off
+  remote_master=$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)
+  fake_master=$(printf 'replacement master makes topic appear integrated\n' |
+    git -C "$CASE_MAIN" commit-tree "$(git -C "$CASE_MAIN" rev-parse "$remote_master^{tree}")" \
+      -p "$CASE_TOPIC_OID")
+  git -C "$CASE_MAIN" replace "$remote_master" "$fake_master"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "replacement ref made an unmerged topic eligible for cleanup"
+  fi
+  assert_topic_preserved
+  echo "PASS: replacement refs cannot affect integration proofs"
+}
+
 test_unrelated_upstream_deletion() {
   setup_case unrelated-upstream merge main
   git -C "$CASE_MAIN" branch unrelated refs/heads/master
@@ -1244,6 +1260,29 @@ test_master_resolve_undo_refusal() {
   git -C "$CASE_MAIN" cat-file -e "$second_blob^{blob}" || fail "second REUC blob was lost"
   assert_topic_preserved
   echo "PASS: master-owner resolve-undo state is refused before ownership handoff"
+}
+
+test_master_changed_path_failure_refusal() {
+  local fake_bin local_master real_git
+  setup_case master-changed-path-failure merge other
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  fake_bin="$TEST_ROOT/master-changed-path-failure-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = diff ] && [ "$4" = --name-only ]; then exit 1; fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "failed master changed-path enumeration was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "changed-path failure must precede master advancement"
+  assert_topic_preserved
+  echo "PASS: master changed-path enumeration failures propagate before mutation"
 }
 
 test_diverged_master_refusal() {
@@ -2338,6 +2377,39 @@ test_topic_reflog_locked_through_deletion() {
   echo "PASS: topic ref and reflog stay locked together through final deletion"
 }
 
+test_branch_config_locked_through_deletion() {
+  local fake_bin real_git status
+  setup_case branch-config-lock merge main-off
+  fake_bin="$TEST_ROOT/branch-config-lock-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = rev-parse ] && [ "$4" = --git-path ] && [ "$5" = logs/refs/heads/topic ]; then' \
+    '  count=0' \
+    '  [ ! -f "$COUNT_MARKER" ] || count=$(cat "$COUNT_MARKER")' \
+    '  count=$((count + 1))' \
+    '  printf "%s\n" "$count" >"$COUNT_MARKER"' \
+    '  if [ "$count" -eq 2 ]; then' \
+    '    if "$REAL_GIT" -C "$RACE_MAIN" config branch.topic.remote raced >/dev/null 2>&1; then status=0; else status=$?; fi' \
+    '    printf "%s\n" "$status" >"$STATUS_MARKER"' \
+    '  fi' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    COUNT_MARKER="$TEST_ROOT/branch-config-lock.count" \
+    STATUS_MARKER="$TEST_ROOT/branch-config-lock.status" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  [ -f "$TEST_ROOT/branch-config-lock.status" ] ||
+    fail "branch config race was not attempted during deletion"
+  status=$(cat "$TEST_ROOT/branch-config-lock.status")
+  [ "$status" -ne 0 ] || fail "standard branch configuration was written during cleanup"
+  assert_cleaned
+  echo "PASS: repository configuration stays locked through topic deletion"
+}
+
 test_symref_capability_preflight() {
   local fake_bin local_master real_git
   setup_case symref-capability-preflight merge main-off
@@ -2567,6 +2639,7 @@ test_ls_remote_failure_refusal
 test_invalid_path_refusal
 test_git_local_environment_is_cleared
 test_non_files_ref_backend_refusal
+test_replacement_refs_disabled
 test_unrelated_upstream_deletion
 test_distinct_push_endpoint
 test_topic_tag_collision
@@ -2598,6 +2671,7 @@ test_initialized_session_submodule_refusal
 test_deinitialized_session_submodule_refusal
 test_initialized_master_submodule_refusal
 test_master_resolve_undo_refusal
+test_master_changed_path_failure_refusal
 test_diverged_master_refusal
 test_locked_session_refusal
 test_active_session_operation_refusal
@@ -2637,6 +2711,7 @@ test_tracking_reflog_recovery
 test_tracking_reflog_locked_through_deletion
 test_topic_reflog_recovery
 test_topic_reflog_locked_through_deletion
+test_branch_config_locked_through_deletion
 test_symref_capability_preflight
 test_dangling_capability_ref_refusal
 test_option_like_branch_name
