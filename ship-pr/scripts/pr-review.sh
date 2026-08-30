@@ -1628,7 +1628,7 @@ cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
   local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
   local nogo_at_tip=0 last_tip="" grace_from confirm wf="" wid wname part sleep_for remaining
-  local norun=0 tip_at="" tip_age hold
+  local norun=0 tip_seen_at tip_age hold
   local started now beat waited_note="" no_tip_verdict=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1659,9 +1659,7 @@ cmd_base() {
     red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0 norun=0
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
-    line=$(gh_retry read api "repos/$REPO/commits/$branch" \
-      --jq '[.sha, (.commit.committer.date // "-")] | @tsv') || line=""
-    IFS=$'\t' read -r tip tip_at <<<"$line"
+    tip=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || tip=""
     # Without --wait the tip only decorates the report, so a failed read costs the "not the tip"
     # notes. Under --wait it is the QUESTION — which commit needs the verdict — and an unknown
     # tip would idle to the absent-run grace and then settle for an older green, exit 0, having
@@ -1791,8 +1789,14 @@ cmd_base() {
     # while the current tip's run is still in flight is precisely the fix-in-progress shape:
     # breaking on it would report RED for a commit that has no verdict yet and trigger the
     # fix-forward response against a fix already running. The older red keeps the wait; when the
-    # tip's run completes, the newest-judged fold replaces it either way.
-    [ "$red_at_tip" -gt 0 ] && break
+    # tip's run completes, the newest-judged fold replaces it either way. The break reconfirms
+    # the tip first, the same TOCTOU as the green break: a fix-forward push landing between the
+    # tip read and this check turns this red into an older tip's red — exactly the shape this
+    # gate exists to keep waiting on — so on a moved (or unconfirmable) tip, poll again instead.
+    if [ "$red_at_tip" -gt 0 ]; then
+      confirm=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || confirm=""
+      [ "$confirm" = "$tip" ] && break
+    fi
     now=$(date +%s)
     # The absence grace runs from the last time the TIP MOVED, not from when the wait started: a
     # further merge landing after the grace had already elapsed would otherwise be declared
@@ -1806,13 +1810,18 @@ cmd_base() {
         # A listed workflow with NO push runs on the branch (norun) is ambiguous: dispatch- or
         # schedule-only (never coming — staging carries two such smoke workflows, and counting
         # them as uncovered would park EVERY wait on the full grace), or a push workflow the tip
-        # itself just added, whose first run is not created yet. The tip's own AGE separates
-        # them: a tip older than the creation grace has had its window, so anything still
-        # runless is not coming; a younger tip holds the break until the newcomer's run can
-        # appear (at which point it counts as inflight/uncovered properly).
+        # itself just added, whose first run is not created yet. What separates them is whether
+        # the newcomer has had its creation window SINCE THE PUSH — and the push time is the
+        # sibling runs' own creation time at this tip (every workflow here is judged at the tip,
+        # so sibling rows exist to read: folded col 5 is the newest completed run's sha, col 6
+        # its created_at). Not the commit's committer date (an hours-old commit pushed directly
+        # would erase the window) and not the wait's observation clock (which would hold every
+        # late-started wait on a repo carrying dispatch-only workflows for the full grace).
         hold=""
         if [ "$norun" -gt 0 ]; then
-          tip_age=$(age_of "$tip_at")
+          tip_seen_at=$(awk -F'\t' -v t="$tip" \
+            '$5 == t && $6 > best { best=$6 } END { print best }' <<<"$raw")
+          tip_age=$(age_of "$tip_seen_at")
           case "$tip_age" in
           '' | *[!0-9]*) ;; # unreadable age is not evidence to hold on
           *) [ "$tip_age" -ge "$BASE_ABSENT_GRACE" ] || hold=1 ;;
