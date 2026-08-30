@@ -45,7 +45,7 @@ assert_topic_preserved() {
 }
 
 assert_cleaned() {
-  local archive_count branch_key local_master remote_master
+  local archive archive_count branch_key local_master remote_master
   local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
   remote_master=$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)
   assert_eq "$local_master" "$remote_master" "local master must match origin/master"
@@ -60,10 +60,14 @@ assert_cleaned() {
   done
   assert_eq "$(git -C "$CASE_MAIN" rev-parse "refs/ship-pr/recovery/$CASE_BRANCH/$CASE_TOPIC_OID")" \
     "$CASE_TOPIC_OID" "topic recovery ref must retain the cleaned tip"
-  archive_count=$(find "$CASE_ROOT" -maxdepth 1 -type d \
-    -name '.session.ship-pr-recovery.*' | wc -l | tr -d ' ')
+  archive_count=0
+  CASE_ARCHIVE=""
+  for archive in "$CASE_ROOT"/.session.ship-pr-recovery.*; do
+    [ -d "$archive" ] || continue
+    archive_count=$((archive_count + 1))
+    CASE_ARCHIVE="$archive"
+  done
   assert_eq "$archive_count" 1 "cleanup must retain exactly one session archive"
-  CASE_ARCHIVE=$(find "$CASE_ROOT" -maxdepth 1 -type d -name '.session.ship-pr-recovery.*')
   [ -f "$CASE_ARCHIVE/value" ] || fail "session archive did not retain tracked worktree files"
 }
 
@@ -559,6 +563,24 @@ test_concurrent_ignored_master_collision() {
   echo "PASS: concurrent ignored master collision is refused"
 }
 
+test_preexisting_ignored_master_data() {
+  local local_master
+  setup_case preexisting-ignored-master-data merge other
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  echo unrelated.log >>"$CASE_MAIN/.git/info/exclude"
+  echo local-data >"$CASE_MASTER_OWNER/unrelated.log"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "master with pre-existing ignored data was advanced into an unretryable state"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "pre-existing ignored master data must be refused before the master ref changes"
+  assert_eq "$(sed -n '1p' "$CASE_MASTER_OWNER/unrelated.log")" local-data \
+    "pre-existing ignored master data must survive"
+  assert_topic_preserved
+  echo "PASS: pre-existing ignored master data is refused before mutation"
+}
+
 test_master_owner_switch_refusal() {
   local checkout_status fake_bin real_git local_master log remote_master
   setup_case master-owner-branch-switch merge other
@@ -743,7 +765,7 @@ test_topic_reservation() {
 }
 
 test_ignored_write_at_session_removal() {
-  local fake_bin late_archive real_git log
+  local archive fake_bin late_archive real_git log
   setup_case ignored-write-at-removal merge main-off
   echo local.log >>"$CASE_MAIN/.git/info/exclude"
   fake_bin="$TEST_ROOT/ignored-write-at-removal-bin"
@@ -772,7 +794,12 @@ test_ignored_write_at_session_removal() {
     sed -n '1,120p' "$log" >&2
     fail "cleanup could not archive a late write at the former session path"
   fi
-  late_archive=$(find "$CASE_ROOT" -maxdepth 1 -type d -name '.session.ship-pr-late-data.*')
+  late_archive=""
+  for archive in "$CASE_ROOT"/.session.ship-pr-late-data.*; do
+    [ -d "$archive" ] || continue
+    [ -z "$late_archive" ] || fail "more than one late-data archive was created"
+    late_archive="$archive"
+  done
   [ -n "$late_archive" ] || fail "late ignored data did not receive a recovery archive"
   assert_eq "$(sed -n '1p' "$late_archive/local.log")" irreplaceable \
     "ignored data created at worktree removal must never be deleted"
@@ -934,6 +961,7 @@ test_master_reservation
 test_unowned_master_reservation
 test_concurrent_master_edit_refusal
 test_concurrent_ignored_master_collision
+test_preexisting_ignored_master_data
 test_master_owner_switch_refusal
 test_diverged_master_refusal
 test_locked_session_refusal

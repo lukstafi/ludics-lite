@@ -213,7 +213,8 @@ MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || tr
   fail "master owner changed branches before its fast-forward: $MASTER_OWNER"
 MASTER_OWNER_HEAD=$(git -C "$MASTER_OWNER" rev-parse HEAD) || fail "cannot read master owner HEAD"
 [ "$MASTER_OWNER_HEAD" = "$LOCAL_MASTER" ] || fail "master owner's HEAD disagrees with local master"
-MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status --porcelain --untracked-files=normal) ||
+MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status \
+  --porcelain --untracked-files=normal --ignored=matching) ||
   fail "could not inspect master owner cleanliness"
 [ -z "$MASTER_OWNER_STATUS" ] || fail "master owner is dirty; clean it before cleanup: $MASTER_OWNER"
 IGNORED_COLLISION=""

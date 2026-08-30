@@ -554,9 +554,10 @@ on the observed topic OID and followed by fresh `master` and local-topic reads; 
 or `master` became unreadable, the current topic recovery ref is restored before refusal. The
 validated tip also remains reachable under `refs/ship-pr/recovery/` because no finite remote read
 can rule out a later base rollback. The master-owner refresh uses a non-destructive porcelain
-fast-forward through a helper-only reservation and a conditional named-ref update, then safely
-reattaches the original owner while refusing both tracked edits and ignored local data, including
-ignored descendants when a directory is replaced. The helper refuses a topic owned by any other worktree, transfers
+fast-forward through a helper-only reservation and a conditional named-ref update. A checked-out
+master owner must contain no local data, including ignored files; after the update it is safely
+reattached with the same invariant. The helper also checks ignored descendants when a directory is
+replaced, refuses a topic owned by any other worktree, and transfers
 topic ownership to a temporary reservation through local ref deletion, and removes matching
 remote-tracking and standard repository-local upstream configuration. Included, global,
 per-worktree, and custom branch configuration is inherited policy and is deliberately not edited.
