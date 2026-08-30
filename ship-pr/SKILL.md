@@ -522,7 +522,8 @@ the failure looking like a failed merge. Run the executable sequence instead:
 
 It fetches and proves the ordinary topic is an ancestor of `origin/master` before deleting
 anything, deletes the remote branch, advances local `master` according to which worktree owns it,
-detaches and removes the session worktree, rechecks ancestry against updated local `master`, and
+detaches and unregisters the session worktree into a sibling recovery archive, rechecks ancestry
+against updated local `master`, and
 deletes the local branch independently of its configured upstream. Its scratch-repository test
 covers unchecked-out `master`, `master` owned by the primary checkout, `master` owned by another
 worktree, safe deletion while the primary checkout is off `master`, and refusal of an unmerged
@@ -553,13 +554,15 @@ on the observed topic OID and followed by fresh `master` and local-topic reads; 
 or `master` became unreadable, the current topic recovery ref is restored before refusal. The
 validated tip also remains reachable under `refs/ship-pr/recovery/` because no finite remote read
 can rule out a later base rollback. The master-owner refresh uses a non-destructive porcelain
-fast-forward with ignored overwrites disabled, and refuses ignored local data at paths changed by
-it, including ignored descendants when a directory is replaced. The helper refuses a topic owned
-by any other worktree, transfers
+fast-forward through a helper-only reservation and a conditional named-ref update, then safely
+reattaches the original owner while refusing both tracked edits and ignored local data, including
+ignored descendants when a directory is replaced. The helper refuses a topic owned by any other worktree, transfers
 topic ownership to a temporary reservation through local ref deletion, and removes matching
 remote-tracking and standard repository-local upstream configuration. Included, global,
 per-worktree, and custom branch configuration is inherited policy and is deliberately not edited.
-Do not reconstruct its state
+Rather than recursively deleting a directory that can receive a last-moment ignored write, it
+atomically renames the session beside its original path, unregisters the now-missing worktree, and
+reports the retained archive for later inspection. Do not reconstruct its state
 machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to
 `master`, making deletion either tautological or a false refusal after the worktree is already gone.

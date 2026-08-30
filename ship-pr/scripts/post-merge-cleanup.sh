@@ -81,6 +81,8 @@ trap cleanup_reservations EXIT
 
 MAIN=$(canonical_dir "$1") || exit $?
 SESSION=$(canonical_dir "$2") || exit $?
+SESSION_ORIGINAL="$SESSION"
+TEMP_ROOT=$(canonical_dir "${TMPDIR:-/tmp}") || exit $?
 BRANCH="$3"
 shift 3
 
@@ -194,14 +196,16 @@ git -C "$MAIN" merge-base --is-ancestor "$LOCAL_MASTER" "$REMOTE_MASTER" ||
 scan_branch_owner refs/heads/master
 [ "$BRANCH_OWNER_COUNT" -le 1 ] || fail "more than one worktree reports owning master"
 if [ "$BRANCH_OWNER_COUNT" -eq 0 ]; then
-  MASTER_RESERVATION=$(mktemp -d "${TMPDIR:-/tmp}/ship-pr-master-reserve.XXXXXX") ||
+  MASTER_RESERVATION=$(mktemp -d "$TEMP_ROOT/ship-pr-master-reserve.XXXXXX") ||
     fail "could not allocate a temporary master reservation"
   rmdir "$MASTER_RESERVATION" || fail "could not prepare the temporary master reservation path"
   git -C "$MAIN" worktree add "$MASTER_RESERVATION" master >/dev/null ||
     fail "could not reserve unchecked-out master in a temporary worktree"
   MASTER_OWNER="$MASTER_RESERVATION"
+  ORIGINAL_MASTER_OWNER=""
 else
   MASTER_OWNER="$BRANCH_OWNER"
+  ORIGINAL_MASTER_OWNER="$BRANCH_OWNER"
 fi
 
 MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
@@ -233,18 +237,37 @@ while IFS= read -r -d '' CHANGED_PATH; do
 done < <(git -C "$MAIN" diff --name-only -z "$LOCAL_MASTER" "$REMOTE_MASTER")
 [ -z "$IGNORED_COLLISION" ] ||
   fail "master fast-forward would overwrite ignored local data: $MASTER_OWNER/$IGNORED_COLLISION"
-# Porcelain fast-forwarding holds Git's normal ref/index locks and refuses tracked edits that appear
-# after the cleanliness preflight. A separate update-ref followed by reset --hard would silently
-# destroy such a concurrent edit.
-git -C "$MASTER_OWNER" merge --ff-only --no-overwrite-ignore "$REMOTE_MASTER" >/dev/null ||
-  fail "master owner changed or became dirty during its fast-forward: $MASTER_OWNER"
-MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
-[ "$MASTER_OWNER_REF" = refs/heads/master ] ||
-  fail "master owner switched branches during its fast-forward: $MASTER_OWNER"
-if [ -n "$MASTER_RESERVATION" ]; then
-  git -C "$MAIN" worktree remove "$MASTER_RESERVATION" ||
-    fail "master advanced but its temporary reservation could not be removed"
-  MASTER_RESERVATION=""
+
+# Move branch ownership to a helper-only worktree before the named ref update. The original owner
+# is never reset: after the reservation is refreshed, an option-safe switch back to master refuses
+# any tracked or ignored data that appeared concurrently.
+if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
+  MASTER_RESERVATION=$(mktemp -d "$TEMP_ROOT/ship-pr-master-reserve.XXXXXX") ||
+    fail "could not allocate a temporary master reservation"
+  rmdir "$MASTER_RESERVATION" || fail "could not prepare the temporary master reservation path"
+  git -C "$MAIN" worktree add --detach "$MASTER_RESERVATION" "$LOCAL_MASTER" >/dev/null ||
+    fail "could not prepare a temporary master reservation"
+  MASTER_RESERVATION=$(canonical_dir "$MASTER_RESERVATION") || exit $?
+  git -C "$ORIGINAL_MASTER_OWNER" switch --detach "$LOCAL_MASTER" >/dev/null ||
+    fail "could not detach the clean master owner for its named update: $ORIGINAL_MASTER_OWNER"
+  git -C "$MASTER_RESERVATION" switch -- master >/dev/null ||
+    fail "could not transfer master ownership to its temporary reservation"
+fi
+git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER" ||
+  fail "local master moved after its owner preflight"
+git -C "$MASTER_RESERVATION" reset --hard "$REMOTE_MASTER" >/dev/null ||
+  fail "master advanced but its helper-only reservation could not be refreshed"
+git -C "$MAIN" worktree remove --force "$MASTER_RESERVATION" ||
+  fail "master advanced but its temporary reservation could not be removed"
+MASTER_RESERVATION=""
+if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
+  git -C "$ORIGINAL_MASTER_OWNER" switch --no-overwrite-ignore -- master >/dev/null ||
+    fail "master advanced, but its original owner gained local data or another worktree acquired it: $ORIGINAL_MASTER_OWNER"
+  MASTER_OWNER_STATUS=$(git -C "$ORIGINAL_MASTER_OWNER" status \
+    --porcelain --untracked-files=normal --ignored=matching) ||
+    fail "could not recheck the restored master owner"
+  [ -z "$MASTER_OWNER_STATUS" ] ||
+    fail "master owner gained local data during its update; the data was preserved: $ORIGINAL_MASTER_OWNER"
 fi
 
 LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot reread local master"
@@ -337,7 +360,7 @@ fi
 # Transfer topic ownership from the session to a temporary worktree, revalidating across the
 # handoff. Keeping that reservation attached through update-ref prevents another worktree from
 # acquiring the branch between the final owner scan and local deletion.
-TOPIC_RESERVATION=$(mktemp -d "${TMPDIR:-/tmp}/ship-pr-topic-reserve.XXXXXX") ||
+TOPIC_RESERVATION=$(mktemp -d "$TEMP_ROOT/ship-pr-topic-reserve.XXXXXX") ||
   fail "could not allocate a temporary topic reservation"
 rmdir "$TOPIC_RESERVATION" || fail "could not prepare the temporary topic reservation path"
 git -C "$MAIN" worktree add --detach "$TOPIC_RESERVATION" "$LOCAL_BRANCH_OID" >/dev/null ||
@@ -347,10 +370,10 @@ if [ -n "$SESSION_REF" ]; then
   git -C "$SESSION" checkout --detach "$LOCAL_BRANCH_OID" >/dev/null ||
     fail "could not detach the session worktree at the validated topic tip"
 fi
-if ! git -C "$TOPIC_RESERVATION" checkout "$BRANCH" >/dev/null 2>&1; then
+if ! git -C "$TOPIC_RESERVATION" switch -- "$BRANCH" >/dev/null 2>&1; then
   git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
   TOPIC_RESERVATION=""
-  [ -z "$SESSION_REF" ] || git -C "$SESSION" checkout "$BRANCH" >/dev/null 2>&1 || true
+  [ -z "$SESSION_REF" ] || git -C "$SESSION" switch -- "$BRANCH" >/dev/null 2>&1 || true
   fail "could not reserve local $BRANCH for deletion; another worktree may have acquired it"
 fi
 CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
@@ -358,7 +381,7 @@ if [ "$CURRENT_TOPIC_OID" != "$LOCAL_BRANCH_OID" ]; then
   git -C "$TOPIC_RESERVATION" checkout --detach "$LOCAL_BRANCH_OID" >/dev/null 2>&1 || true
   git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
   TOPIC_RESERVATION=""
-  [ -z "$SESSION_REF" ] || git -C "$SESSION" checkout "$BRANCH" >/dev/null 2>&1 || true
+  [ -z "$SESSION_REF" ] || git -C "$SESSION" switch -- "$BRANCH" >/dev/null 2>&1 || true
   restore_remote_topic "$CURRENT_TOPIC_OID" ||
     fail "local $BRANCH moved during ownership handoff, and its new tip could not be restored remotely"
   fail "local $BRANCH moved during ownership handoff; its session and remote tip were preserved"
@@ -373,10 +396,29 @@ if [ -z "$FORCE_REASON" ]; then
     fail "$BRANCH is not an ancestor of the updated local master"
 fi
 
-# Do not inherit a cwd that the next command removes. This also lets the helper finish when invoked
-# from inside the session worktree itself.
-cd "${TMPDIR:-/tmp}" || fail "cannot move out of the session worktree before removing it"
-git -C "$MAIN" worktree remove "$SESSION" || fail "could not remove session worktree: $SESSION"
+# Atomically move the session aside before unregistering it. `git worktree remove` recursively
+# deletes ignored files, so ordinary removal cannot close the final write race. Removing the now-
+# missing registered path drops only Git metadata; every former worktree file remains recoverable.
+SESSION_PARENT=$(dirname "$SESSION")
+SESSION_BASENAME=$(basename "$SESSION")
+SESSION_ARCHIVE=$(mktemp -d "$SESSION_PARENT/.${SESSION_BASENAME}.ship-pr-recovery.XXXXXX") ||
+  fail "could not allocate a session recovery archive"
+rmdir "$SESSION_ARCHIVE" || fail "could not prepare the session recovery archive path"
+cd "$TEMP_ROOT" || fail "cannot move out of the session worktree before archiving it"
+mv "$SESSION" "$SESSION_ARCHIVE" || fail "could not archive session worktree: $SESSION"
+LATE_SESSION_ARCHIVE=""
+if ! git -C "$MAIN" worktree remove "$SESSION"; then
+  [ -e "$SESSION" ] ||
+    fail "session was archived at $SESSION_ARCHIVE but its worktree registration could not be removed"
+  LATE_SESSION_ARCHIVE=$(mktemp -d "$SESSION_PARENT/.${SESSION_BASENAME}.ship-pr-late-data.XXXXXX") ||
+    fail "late data appeared at $SESSION, and its recovery archive could not be allocated"
+  rmdir "$LATE_SESSION_ARCHIVE" || fail "could not prepare the late-data recovery path"
+  mv "$SESSION" "$LATE_SESSION_ARCHIVE" ||
+    fail "late data appeared at $SESSION and could not be moved aside safely"
+  git -C "$MAIN" worktree remove "$SESSION" ||
+    fail "session and late data were archived, but the worktree registration could not be removed"
+fi
+[ -d "$SESSION_ARCHIVE" ] || fail "session recovery archive disappeared: $SESSION_ARCHIVE"
 
 git -C "$MAIN" update-ref --no-deref -d "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" ||
   fail "local $BRANCH moved from validated tip $LOCAL_BRANCH_OID; its newer ref was preserved"
@@ -384,4 +426,7 @@ git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" ||
   fail "local $BRANCH was deleted but its temporary reservation could not be removed"
 TOPIC_RESERVATION=""
 
-echo "post-merge-cleanup.sh: cleaned $BRANCH and removed $SESSION; recovery retained at $RECOVERY_REF"
+if [ -n "$LATE_SESSION_ARCHIVE" ]; then
+  echo "post-merge-cleanup.sh: data appearing at the former session path was archived at $LATE_SESSION_ARCHIVE" >&2
+fi
+echo "post-merge-cleanup.sh: cleaned $BRANCH and unregistered $SESSION_ORIGINAL; session archived at $SESSION_ARCHIVE; recovery retained at $RECOVERY_REF"
