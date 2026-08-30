@@ -92,7 +92,7 @@ refuse_private_worktree_refs() {
 preflight_session_metadata_locks() {
   local name path path_dir lock symbolic_status
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
-    BISECT_HEAD AUTO_MERGE FETCH_HEAD index config.worktree; do
+    BISECT_HEAD AUTO_MERGE FETCH_HEAD COMMIT_EDITMSG index config.worktree; do
     path=$(git -C "$SESSION" rev-parse --git-path "$name") ||
       fail "could not locate session metadata: $name"
     case "$path" in
@@ -103,7 +103,7 @@ preflight_session_metadata_locks() {
     path="$path_dir/$(basename "$path")"
     [ ! -L "$path" ] || fail "session metadata is symbolic; replace it before cleanup: $name"
     case "$name" in
-    index | config.worktree) ;;
+    COMMIT_EDITMSG | index | config.worktree) ;;
     *)
       git -C "$SESSION" symbolic-ref -q "$name" >/dev/null 2>&1
       symbolic_status=$?
@@ -336,6 +336,9 @@ retain_private_session_refs() {
     ref=${line%% *}
     oid=${line#* }
     [ -n "$ref" ] || continue
+    case "$ref" in
+    refs/worktree | refs/bisect | refs/rewritten) continue ;;
+    esac
     [ -n "$oid" ] || fail "session-private ref has no object: $ref"
     printf 'delete %s %s\n' "$ref" "$oid" >&7 ||
       fail "could not queue session-private ref retention: $ref"
@@ -349,6 +352,9 @@ retain_private_session_refs() {
     ref=${line%% *}
     oid=${line#* }
     [ -n "$ref" ] || continue
+    case "$ref" in
+    refs/worktree | refs/bisect | refs/rewritten) continue ;;
+    esac
     retain_session_object private-ref "$oid"
     retain_session_reflog_sides "$ref"
   done <<<"$private_refs"
@@ -463,7 +469,7 @@ delete_ref_with_locked_reflog() {
 }
 
 lock_and_retain_session_metadata() {
-  local name path path_dir lock line metadata oid config_snapshot index_snapshot index_tree
+  local name path path_dir lock line metadata oid config_snapshot message_snapshot index_snapshot index_tree
   local shared_index shared_snapshot shared_temp sparse_snapshot worktree_git_dir
   local reuc_snapshot mode stage old_oid new_oid rest
   for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
@@ -494,6 +500,25 @@ lock_and_retain_session_metadata() {
     retain_session_reflog_sides "$name" "pseudoref-reflog-$name" \
       "$worktree_git_dir/logs/$name"
   done
+
+  path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path COMMIT_EDITMSG) ||
+    fail "could not locate archived commit message"
+  case "$path" in
+  /*) ;;
+  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
+  esac
+  path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+  path="$path_dir/$(basename "$path")"
+  lock="$path.lock"
+  (set -o noclobber; printf '%s\n' "$$" >"$lock") 2>/dev/null ||
+    fail "archived commit message is busy"
+  SESSION_PSEUDOREF_LOCKS+=("$lock")
+  [ ! -L "$path" ] || fail "archived commit message is symbolic"
+  if [ -f "$path" ]; then
+    message_snapshot=$(mktemp "$SESSION_ARCHIVE/COMMIT_EDITMSG.XXXXXX") ||
+      fail "could not allocate a commit-message snapshot"
+    cp "$path" "$message_snapshot" || fail "could not archive the commit message"
+  fi
 
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path config.worktree) ||
@@ -700,6 +725,9 @@ cleanup_reservations() {
   if [ -n "${TOPIC_RESERVATION:-}" ] && [ -d "$TOPIC_RESERVATION" ]; then
     git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
   fi
+  if [ "${SESSION_WORKTREE_LOCK_OWNED:-0}" -eq 1 ] && [ -n "${SESSION:-}" ]; then
+    git -C "$MAIN" worktree unlock "$SESSION" >/dev/null 2>&1 || true
+  fi
   if [ "${ORIGINAL_MASTER_DETACHED:-0}" -eq 1 ] &&
     [ -n "${ORIGINAL_MASTER_OWNER:-}" ] && [ -d "$ORIGINAL_MASTER_OWNER" ]; then
     RECOVERY_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master 2>/dev/null || true)
@@ -732,6 +760,7 @@ CAPABILITY_REF_OWNED=0
 SESSION_NAMESPACE_RESERVATION=""
 SESSION_NAMESPACE_RESERVATION_OWNED=0
 SESSION_PSEUDOREF_LOCKS=()
+SESSION_WORKTREE_LOCK_OWNED=0
 TOPIC_RESERVATION=""
 REF_TRANSACTION_DIR=""
 REF_TRANSACTION_IN=""
@@ -858,6 +887,9 @@ SESSION_ARCHIVE=$(mktemp -d "$SESSION_PARENT/.${SESSION_BASENAME}.ship-pr-recove
   fail "could not allocate a session recovery archive beside $SESSION"
 LATE_SESSION_ARCHIVE=$(mktemp -d "$SESSION_PARENT/.${SESSION_BASENAME}.ship-pr-late-data.XXXXXX") ||
   fail "could not allocate a late-data recovery archive beside $SESSION"
+git -C "$MAIN" worktree lock --reason "ship-pr cleanup in progress" "$SESSION" ||
+  fail "could not lock the session worktree registration against pruning"
+SESSION_WORKTREE_LOCK_OWNED=1
 
 # symref-update provides the compare-and-swap used by the master ownership handoff. Probe it before
 # master or topic mutation so older Git versions refuse cleanly rather than failing mid-cleanup.
@@ -1219,14 +1251,20 @@ refuse_active_session_operations "$SESSION_ARCHIVED_WORKTREE"
 git -C "$MAIN" update-ref --no-deref -d "$SESSION_NAMESPACE_RESERVATION" \
   "$LOCAL_BRANCH_OID" || fail "could not release the session recovery namespace reservation"
 SESSION_NAMESPACE_RESERVATION_OWNED=0
-if ! git -C "$MAIN" worktree remove "$SESSION"; then
-  { [ -e "$SESSION" ] || [ -L "$SESSION" ]; } ||
-    fail "session was archived at $SESSION_ARCHIVE but its worktree registration could not be removed"
+if [ -e "$SESSION" ] || [ -L "$SESSION" ]; then
   atomic_rename "$SESSION" "$LATE_SESSION_ARCHIVE/data" ||
     fail "late data appeared at $SESSION and could not be moved aside safely"
-  git -C "$MAIN" worktree remove "$SESSION" ||
-    fail "session and late data were archived, but the worktree registration could not be removed"
-else
+fi
+if ! git -C "$MAIN" worktree remove --force --force "$SESSION"; then
+  { [ -e "$SESSION" ] || [ -L "$SESSION" ]; } ||
+    fail "session data was archived, but its locked worktree registration could not be removed"
+  atomic_rename "$SESSION" "$LATE_SESSION_ARCHIVE/data" ||
+    fail "late data appeared during unregistering and could not be moved aside safely"
+  git -C "$MAIN" worktree remove --force --force "$SESSION" ||
+    fail "session and late data were archived, but the locked registration could not be removed"
+fi
+SESSION_WORKTREE_LOCK_OWNED=0
+if [ ! -e "$LATE_SESSION_ARCHIVE/data" ] && [ ! -L "$LATE_SESSION_ARCHIVE/data" ]; then
   rmdir "$LATE_SESSION_ARCHIVE" || fail "unused late-data archive could not be removed"
   LATE_SESSION_ARCHIVE=""
 fi

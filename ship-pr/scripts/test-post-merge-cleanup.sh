@@ -1626,6 +1626,35 @@ test_worktree_config_archive() {
   echo "PASS: per-worktree configuration is copied into the recovery archive"
 }
 
+test_commit_message_archive() {
+  local file hook message message_count message_snapshot
+  setup_case commit-message-archive merge main-off
+  hook="$CASE_MAIN/.git/hooks/commit-msg"
+  printf '#!/bin/sh\nexit 1\n' >"$hook"
+  chmod +x "$hook"
+  message="retain rejected commit proposal"
+  if git -C "$CASE_SESSION" commit --allow-empty -m "$message" >/dev/null 2>&1; then
+    fail "commit-msg hook did not reject the scratch commit"
+  fi
+  unlink "$hook"
+  [ -z "$(git -C "$CASE_SESSION" status --porcelain)" ] ||
+    fail "rejected commit left the session worktree dirty"
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  message_count=0
+  message_snapshot=""
+  for file in "$CASE_ARCHIVE"/COMMIT_EDITMSG.*; do
+    [ -f "$file" ] || continue
+    message_count=$((message_count + 1))
+    message_snapshot="$file"
+  done
+  assert_eq "$message_count" 1 "cleanup must archive exactly one commit-message snapshot"
+  assert_eq "$(sed -n '1p' "$message_snapshot")" "$message" \
+    "rejected commit message must survive unregistering"
+  echo "PASS: rejected commit messages are copied into the recovery archive"
+}
+
 test_sparse_checkout_archive() {
   local file pattern_count pattern_snapshot patterns sparse_path
   setup_case sparse-checkout-archive merge main-off
@@ -1710,6 +1739,41 @@ test_late_private_worktree_ref_recovery() {
   echo "PASS: late session-private ref tips and reflogs receive recovery refs"
 }
 
+test_shared_private_namespace_roots_preserved() {
+  local fake_bin real_git shared_oid
+  setup_case shared-private-namespace-roots merge main-off
+  shared_oid=$(printf 'shared namespace root commit\n' | git -C "$CASE_MAIN" commit-tree \
+    "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
+  fake_bin="$TEST_ROOT/shared-private-namespace-roots-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*.ship-pr-recovery.*/worktree)' \
+    '  if [ "$3" = for-each-ref ] && [ ! -e "$SHARED_MARKER" ]; then' \
+    '    : >"$SHARED_MARKER"' \
+    '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/worktree "$SHARED_OID"' \
+    '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/bisect "$SHARED_OID"' \
+    '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/rewritten "$SHARED_OID"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    SHARED_OID="$shared_oid" SHARED_MARKER="$TEST_ROOT/shared-private-roots.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  [ -e "$TEST_ROOT/shared-private-roots.injected" ] || fail "shared roots were not injected"
+  for ref in refs/worktree refs/bisect refs/rewritten; do
+    assert_eq "$(git -C "$CASE_MAIN" rev-parse "$ref")" "$shared_oid" \
+      "shared namespace root must survive session-private cleanup: $ref"
+  done
+  assert_cleaned
+  echo "PASS: exact shared namespace roots are excluded from private-ref deletion"
+}
+
 test_private_namespace_locked_through_unregister() {
   local fake_bin race_oid real_git status
   setup_case private-namespace-lock merge main-off
@@ -1721,8 +1785,8 @@ test_private_namespace_locked_through_unregister() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [ "$3" = worktree ] && [ "$4" = remove ]; then' \
-    '  case "$5" in' \
-    '  */session)' \
+    '  case "$*" in' \
+    '  */session*)' \
     '    for archive in "$RACE_ROOT"/.session.ship-pr-recovery.*/worktree; do' \
     '      [ -d "$archive" ] || continue' \
     '      if "$REAL_GIT" -C "$archive" update-ref refs/worktree/too-late "$RACE_OID" >/dev/null 2>&1; then status=0; else status=$?; fi' \
@@ -2020,8 +2084,8 @@ test_ignored_write_at_session_removal() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [ "$3" = worktree ] && [ "$4" = remove ]; then' \
-    '  case "$5" in' \
-    '  */session)' \
+    '  case "$*" in' \
+    '  */session*)' \
     '    if [ ! -e "$RACE_MARKER" ]; then' \
     '      : >"$RACE_MARKER"' \
     '      mkdir -p "$RACE_SESSION"' \
@@ -2068,8 +2132,8 @@ test_dangling_link_at_session_removal() {
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [ "$3" = worktree ] && [ "$4" = remove ]; then' \
-    '  case "$5" in' \
-    '  */session)' \
+    '  case "$*" in' \
+    '  */session*)' \
     '    if [ ! -e "$RACE_MARKER" ]; then' \
     '      : >"$RACE_MARKER"' \
     '      ln -s missing-target "$RACE_SESSION"' \
@@ -2138,6 +2202,35 @@ test_session_head_locked_through_unregister() {
   archive="$CASE_ARCHIVE/worktree"
   [ -f "$archive/value" ] || fail "locked session archive lost its worktree files"
   echo "PASS: archived session HEAD is locked through unregistering"
+}
+
+test_session_registration_locked_against_prune() {
+  local fake_bin real_git
+  setup_case session-registration-prune-lock merge main-off
+  fake_bin="$TEST_ROOT/session-registration-prune-lock-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*.ship-pr-recovery.*/worktree)' \
+    '  if [ "$3" = rev-parse ] && [ "$4" = --git-path ] && [ "$5" = ORIG_HEAD ] && [ ! -e "$PRUNE_MARKER" ]; then' \
+    '    : >"$PRUNE_MARKER"' \
+    '    "$REAL_GIT" -C "$RACE_MAIN" worktree prune --expire now' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    PRUNE_MARKER="$TEST_ROOT/session-registration-prune-lock.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  [ -e "$TEST_ROOT/session-registration-prune-lock.injected" ] ||
+    fail "concurrent worktree prune was not injected"
+  assert_cleaned
+  [ -f "$CASE_ARCHIVE/worktree/value" ] || fail "prune race damaged the session archive"
+  echo "PASS: session registration stays locked against pruning through unregistering"
 }
 
 test_archive_preflight_refusal() {
@@ -2828,9 +2921,11 @@ test_session_index_recovery
 test_session_split_index_recovery
 test_session_resolve_undo_recovery
 test_worktree_config_archive
+test_commit_message_archive
 test_sparse_checkout_archive
 test_session_metadata_lock_preflight
 test_late_private_worktree_ref_recovery
+test_shared_private_namespace_roots_preserved
 test_private_namespace_locked_through_unregister
 test_late_active_session_operation_refusal
 test_late_session_module_refusal
@@ -2844,6 +2939,7 @@ test_ignored_write_at_session_removal
 test_dangling_link_at_session_removal
 test_detached_session_head_recovery
 test_session_head_locked_through_unregister
+test_session_registration_locked_against_prune
 test_archive_preflight_refusal
 test_precreated_archive_target_refusal
 test_session_head_lock_preflight
