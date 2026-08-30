@@ -545,15 +545,16 @@ The helper requires the exact session-worktree root, a clean and unlocked sessio
 local data, and one shared
 fetch/push endpoint for `origin`. It treats an already absent topic as a safe retry state and
 refuses an unreadable ref, a symbolic local/tracking ref, or a remote tip newer than the local
-branch; both the remote and local deletions carry exact-OID leases. It also fetches `master`
+branch; an absent remote topic sends no deletion, while present remote and local deletions carry
+exact-OID leases. It also fetches `master`
 explicitly, independent of the remote's configured fetch map, and proves the local ref can
 fast-forward before any remote deletion. A clean worktree keeps `master` continuously reserved
 while the named ref is conditionally updated and its tree refreshed; when no worktree owns it, the
 helper creates a temporary owner for that same critical section. Remote topic deletion is leased
 on the observed topic OID and followed by fresh `master` and local-topic reads; if either changed
 or `master` became unreadable, the current topic recovery ref is restored before refusal. The
-validated tip also remains reachable under `refs/ship-pr/recovery/` because no finite remote read
-can rule out a later base rollback. The master-owner refresh uses a non-destructive porcelain
+validated tip also remains reachable under a direct `refs/ship-pr/recovery/` ref because no finite
+remote read can rule out a later base rollback. The master-owner refresh uses a non-destructive porcelain
 fast-forward through a helper-only reservation and a conditional named-ref update. A checked-out
 master owner must contain no local data, including ignored files; after the update it is safely
 reattached with the same invariant. The helper also checks ignored descendants when a directory is
@@ -563,7 +564,8 @@ remote-tracking and standard repository-local upstream configuration. Included, 
 per-worktree, and custom branch configuration is inherited policy and is deliberately not edited.
 Rather than recursively deleting a directory that can receive a last-moment ignored write, it
 atomically renames the session beside its original path, unregisters the now-missing worktree, and
-reports the retained archive for later inspection. Do not reconstruct its state
+reports the retained archive for later inspection; late files or links at the vacated path are
+moved to a second archive before unregistering is retried. Do not reconstruct its state
 machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to
 `master`, making deletion either tautological or a false refusal after the worktree is already gone.

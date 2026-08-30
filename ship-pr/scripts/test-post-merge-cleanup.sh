@@ -374,9 +374,12 @@ test_already_absent_remote_retry() {
 }
 
 test_absent_remote_recreation_race() {
-  local fake_bin real_git local_oid log
+  local fake_bin local_oid new_oid real_git log tree
   setup_case absent-remote-race merge main-off
   local_oid=$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)
+  tree=$(git -C "$CASE_MAIN" rev-parse "refs/heads/topic^{tree}")
+  new_oid=$(printf '%s\n' "concurrent remote recreation" | \
+    git -C "$CASE_MAIN" commit-tree "$tree" -p "$local_oid")
   git -C "$CASE_MAIN" push origin :refs/heads/topic >/dev/null
   fake_bin="$TEST_ROOT/absent-race-bin"
   real_git=$(command -v git)
@@ -384,22 +387,28 @@ test_absent_remote_recreation_race() {
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
+    'is_topic_query=0' \
     'for arg in "$@"; do' \
-    '  if [ "$arg" = push ]; then' \
-    '    "$REAL_GIT" -C "$RACE_MAIN" push "$RACE_REMOTE" "$RACE_OID:refs/heads/topic" >/dev/null' \
-    '    break' \
-    '  fi' \
+    '  [ "$arg" = refs/heads/topic ] && is_topic_query=1' \
     'done' \
+    'if [ "$3" = ls-remote ] && [ "$is_topic_query" -eq 1 ]; then' \
+    '  output=$("$REAL_GIT" "$@")' \
+    '  status=$?' \
+    '  "$REAL_GIT" -C "$RACE_MAIN" push "$RACE_REMOTE" "$RACE_OID:refs/heads/topic" >/dev/null' \
+    '  printf "%s\\n" "$output"' \
+    '  exit "$status"' \
+    'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
 
-  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
-    RACE_REMOTE="$CASE_REMOTE" RACE_OID="$local_oid" \
-    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
-    fail "remote branch recreation outran the observed-absence cleanup"
-  fi
-  assert_topic_preserved
-  echo "PASS: absent remote branch recreation is lease-refused"
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    RACE_REMOTE="$CASE_REMOTE" RACE_OID="$new_oid" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1
+  assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')" \
+    "$new_oid" "branch created after an absent observation must never be deleted"
+  git -C "$CASE_MAIN" push origin :refs/heads/topic >/dev/null
+  assert_cleaned
+  echo "PASS: branch created after absent advertisement is preserved"
 }
 
 test_other_topic_owner_refusal() {
@@ -613,6 +622,36 @@ test_master_owner_switch_refusal() {
   echo "PASS: master ownership handoff prevents update redirection"
 }
 
+test_master_update_failure_reattaches_owner() {
+  local fake_bin local_master real_git remote_master log
+  setup_case master-update-failure merge other
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  remote_master=$(git -C "$CASE_INTEGRATOR" rev-parse refs/heads/master)
+  fake_bin="$TEST_ROOT/master-update-failure-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/master-update-failure.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = update-ref ] && [ "$5" = refs/heads/master ]; then' \
+    '  "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/master "$RACE_REMOTE" "$RACE_LOCAL"' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    RACE_LOCAL="$local_master" RACE_REMOTE="$remote_master" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "conditional master update unexpectedly succeeded after a competing update"
+  fi
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
+    "original master owner must be reattached after update-ref failure"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse HEAD)" "$remote_master" \
+    "reattached master owner must follow the concurrently updated ref"
+  assert_topic_preserved
+  echo "PASS: master update failure reattaches the original owner"
+}
+
 test_diverged_master_refusal() {
   local master_owner="$TEST_ROOT/diverged-master-owner"
   setup_case diverged-master merge none
@@ -736,6 +775,21 @@ test_stale_master_response_retains_recovery() {
   echo "PASS: retained recovery survives stale final master evidence"
 }
 
+test_symbolic_recovery_ref_refusal() {
+  local recovery_ref
+  setup_case symbolic-recovery-ref merge main-off
+  recovery_ref="refs/ship-pr/recovery/topic/$CASE_TOPIC_OID"
+  git -C "$CASE_MAIN" symbolic-ref "$recovery_ref" refs/heads/topic
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "symbolic recovery ref was accepted as durable topic retention"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" symbolic-ref "$recovery_ref")" refs/heads/topic \
+    "refused symbolic recovery ref must remain intact"
+  assert_topic_preserved
+  echo "PASS: symbolic recovery ref is refused before topic deletion"
+}
+
 test_topic_reservation() {
   local fake_bin real_git candidate checkout_status
   setup_case topic-reservation merge main-off
@@ -811,6 +865,44 @@ test_ignored_write_at_session_removal() {
   grep -F "data appearing at the former session path was archived" "$log" >/dev/null ||
     fail "late data at the former session path was not reported"
   echo "PASS: atomic session archival cannot erase a late ignored write"
+}
+
+test_dangling_link_at_session_removal() {
+  local archive fake_bin late_archive real_git log
+  setup_case dangling-link-at-removal merge main-off
+  fake_bin="$TEST_ROOT/dangling-link-at-removal-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/dangling-link-at-removal.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = worktree ] && [ "$4" = remove ]; then' \
+    '  case "$5" in' \
+    '  */session)' \
+    '    if [ ! -e "$RACE_MARKER" ]; then' \
+    '      : >"$RACE_MARKER"' \
+    '      ln -s missing-target "$RACE_SESSION"' \
+    '    fi' \
+    '    ;;' \
+    '  esac' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_SESSION="$CASE_SESSION" \
+    RACE_MARKER="$TEST_ROOT/dangling-link-at-removal.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1
+  late_archive=""
+  for archive in "$CASE_ROOT"/.session.ship-pr-late-data.*; do
+    [ -L "$archive" ] || continue
+    [ -z "$late_archive" ] || fail "more than one dangling-link archive was created"
+    late_archive="$archive"
+  done
+  [ -n "$late_archive" ] || fail "dangling link did not receive a recovery archive"
+  assert_eq "$(readlink "$late_archive")" missing-target \
+    "archived dangling link must retain its target text"
+  assert_cleaned
+  echo "PASS: dangling link at vacated session path is archived"
 }
 
 test_option_like_branch_name() {
@@ -963,13 +1055,16 @@ test_concurrent_master_edit_refusal
 test_concurrent_ignored_master_collision
 test_preexisting_ignored_master_data
 test_master_owner_switch_refusal
+test_master_update_failure_reattaches_owner
 test_diverged_master_refusal
 test_locked_session_refusal
 test_symbolic_ref_refusal
 test_remote_master_lease
 test_stale_master_response_retains_recovery
+test_symbolic_recovery_ref_refusal
 test_topic_reservation
 test_ignored_write_at_session_removal
+test_dangling_link_at_session_removal
 test_option_like_branch_name
 test_relative_tmpdir
 test_config_lock_refusal

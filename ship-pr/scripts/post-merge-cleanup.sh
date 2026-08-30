@@ -71,9 +71,14 @@ cleanup_reservations() {
   if [ -n "${MASTER_RESERVATION:-}" ] && [ -d "$MASTER_RESERVATION" ]; then
     git -C "$MAIN" worktree remove --force "$MASTER_RESERVATION" >/dev/null 2>&1 || true
   fi
+  if [ "${ORIGINAL_MASTER_DETACHED:-0}" -eq 1 ] &&
+    [ -n "${ORIGINAL_MASTER_OWNER:-}" ] && [ -d "$ORIGINAL_MASTER_OWNER" ]; then
+    git -C "$ORIGINAL_MASTER_OWNER" switch --no-overwrite-ignore -- master >/dev/null 2>&1 || true
+  fi
 }
 
 MASTER_RESERVATION=""
+ORIGINAL_MASTER_DETACHED=0
 TOPIC_RESERVATION=""
 trap cleanup_reservations EXIT
 
@@ -251,6 +256,7 @@ if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
   MASTER_RESERVATION=$(canonical_dir "$MASTER_RESERVATION") || exit $?
   git -C "$ORIGINAL_MASTER_OWNER" switch --detach "$LOCAL_MASTER" >/dev/null ||
     fail "could not detach the clean master owner for its named update: $ORIGINAL_MASTER_OWNER"
+  ORIGINAL_MASTER_DETACHED=1
   git -C "$MASTER_RESERVATION" switch -- master >/dev/null ||
     fail "could not transfer master ownership to its temporary reservation"
 fi
@@ -264,6 +270,7 @@ MASTER_RESERVATION=""
 if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
   git -C "$ORIGINAL_MASTER_OWNER" switch --no-overwrite-ignore -- master >/dev/null ||
     fail "master advanced, but its original owner gained local data or another worktree acquired it: $ORIGINAL_MASTER_OWNER"
+  ORIGINAL_MASTER_DETACHED=0
   MASTER_OWNER_STATUS=$(git -C "$ORIGINAL_MASTER_OWNER" status \
     --porcelain --untracked-files=normal --ignored=matching) ||
     fail "could not recheck the restored master owner"
@@ -281,6 +288,9 @@ CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cann
 # reachable locally even after its public branch is deleted, so a later rollback can always be
 # recovered rather than turning this cleanup into data loss.
 RECOVERY_REF="refs/ship-pr/recovery/$BRANCH/$LOCAL_BRANCH_OID"
+if git -C "$MAIN" symbolic-ref -q "$RECOVERY_REF" >/dev/null 2>&1; then
+  fail "recovery ref is symbolic rather than a direct ref: $RECOVERY_REF"
+fi
 if git -C "$MAIN" show-ref --verify --quiet "$RECOVERY_REF"; then
   RECOVERY_OID=$(git -C "$MAIN" rev-parse "$RECOVERY_REF") || fail "cannot read $RECOVERY_REF"
   [ "$RECOVERY_OID" = "$LOCAL_BRANCH_OID" ] || fail "recovery ref points at an unexpected object: $RECOVERY_REF"
@@ -301,10 +311,9 @@ case "$REMOTE_BRANCH_STATUS" in
     fail "could not lease-delete origin/$BRANCH at $REMOTE_BRANCH_OID"
   ;;
 2)
-  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:" \
-    "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH" ||
-    fail "origin/$BRANCH changed after the topic was observed absent"
-  echo "post-merge-cleanup.sh: origin/$BRANCH was already absent (absence lease confirmed)" >&2
+  # An empty force-with-lease can still delete a ref created after push advertisement. Absence is
+  # already the desired state, so do not send a deletion at all; a concurrent creation survives.
+  echo "post-merge-cleanup.sh: origin/$BRANCH was already absent (no deletion sent)" >&2
   ;;
 *) fail "could not determine whether origin/$BRANCH exists (ls-remote exit $REMOTE_BRANCH_STATUS)" ;;
 esac
@@ -409,7 +418,7 @@ cd "$TEMP_ROOT" || fail "cannot move out of the session worktree before archivin
 mv "$SESSION" "$SESSION_ARCHIVE" || fail "could not archive session worktree: $SESSION"
 LATE_SESSION_ARCHIVE=""
 if ! git -C "$MAIN" worktree remove "$SESSION"; then
-  [ -e "$SESSION" ] ||
+  { [ -e "$SESSION" ] || [ -L "$SESSION" ]; } ||
     fail "session was archived at $SESSION_ARCHIVE but its worktree registration could not be removed"
   LATE_SESSION_ARCHIVE=$(mktemp -d "$SESSION_PARENT/.${SESSION_BASENAME}.ship-pr-late-data.XXXXXX") ||
     fail "late data appeared at $SESSION, and its recovery archive could not be allocated"
