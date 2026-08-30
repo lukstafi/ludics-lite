@@ -91,6 +91,11 @@ cleanup_reservations() {
   if [ "${CAPABILITY_REF_OWNED:-0}" -eq 1 ] && [ -n "${CAPABILITY_REF:-}" ]; then
     git -C "$MAIN" symbolic-ref --delete "$CAPABILITY_REF" >/dev/null 2>&1 || true
   fi
+  if [ "${SESSION_NAMESPACE_RESERVATION_OWNED:-0}" -eq 1 ] &&
+    [ -n "${SESSION_NAMESPACE_RESERVATION:-}" ]; then
+    git -C "$MAIN" update-ref --no-deref -d "$SESSION_NAMESPACE_RESERVATION" \
+      "$LOCAL_BRANCH_OID" >/dev/null 2>&1 || true
+  fi
   if [ -n "${TOPIC_RESERVATION:-}" ] && [ -d "$TOPIC_RESERVATION" ]; then
     git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
   fi
@@ -122,6 +127,8 @@ SESSION_HEAD_LOCK=""
 SESSION_HEAD_LOCK_OWNED=0
 CAPABILITY_REF=""
 CAPABILITY_REF_OWNED=0
+SESSION_NAMESPACE_RESERVATION=""
+SESSION_NAMESPACE_RESERVATION_OWNED=0
 TOPIC_RESERVATION=""
 trap cleanup_reservations EXIT
 
@@ -205,7 +212,16 @@ case "$SESSION_HEAD_PATH" in
 esac
 SESSION_HEAD_DIR=$(canonical_dir "$(dirname "$SESSION_HEAD_PATH")") || exit $?
 SESSION_HEAD_LOCK="$SESSION_HEAD_DIR/$(basename "$SESSION_HEAD_PATH").lock"
-[ ! -e "$SESSION_HEAD_LOCK" ] || fail "session HEAD is locked; retry after its Git operation finishes"
+{ [ ! -e "$SESSION_HEAD_LOCK" ] && [ ! -L "$SESSION_HEAD_LOCK" ]; } ||
+  fail "session HEAD is locked; retry after its Git operation finishes"
+
+# Keep a child ref present until the final session recovery ref exists. With the files ref backend,
+# this reserves every prefix directory against a conflicting direct ref; an existing conflict makes
+# this expected-absent update fail before master or topic mutation.
+SESSION_NAMESPACE_RESERVATION="refs/ship-pr/session-recovery/$BRANCH/reservation-$$"
+git -C "$MAIN" update-ref --no-deref "$SESSION_NAMESPACE_RESERVATION" \
+  "$LOCAL_BRANCH_OID" "" || fail "session recovery ref namespace is unavailable"
+SESSION_NAMESPACE_RESERVATION_OWNED=1
 
 # Allocate both sibling archives before any ref mutation. Keeping the empty directories reserved
 # proves the parent is writable and prevents a later name race; teardown moves data beneath them.
@@ -534,6 +550,9 @@ else
   git -C "$MAIN" update-ref --no-deref "$SESSION_RECOVERY_REF" "$SESSION_FINAL_HEAD" "" ||
     fail "could not retain the archived session HEAD: $SESSION_RECOVERY_REF"
 fi
+git -C "$MAIN" update-ref --no-deref -d "$SESSION_NAMESPACE_RESERVATION" \
+  "$LOCAL_BRANCH_OID" || fail "could not release the session recovery namespace reservation"
+SESSION_NAMESPACE_RESERVATION_OWNED=0
 if ! git -C "$MAIN" worktree remove "$SESSION"; then
   { [ -e "$SESSION" ] || [ -L "$SESSION" ]; } ||
     fail "session was archived at $SESSION_ARCHIVE but its worktree registration could not be removed"

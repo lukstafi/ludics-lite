@@ -567,7 +567,8 @@ remote-tracking and only the standard keys from repository-local upstream config
 per-worktree, and custom branch configuration is inherited policy and is deliberately not edited.
 Rather than recursively deleting a directory that can receive a last-moment ignored write, it
 refuses initialized submodules before mutation, preallocates sibling archives before ref mutation,
-atomically renames the session into one without directory-nesting semantics,
+reserves the session-recovery ref namespace, atomically renames the session into one without
+directory-nesting semantics,
 retains the archived session's final HEAD under `refs/ship-pr/session-recovery/`, and unregisters
 the now-missing worktree while holding the linked-worktree HEAD lock. Late files or links at the vacated path are moved to the second archive
 before unregistering is retried. Do not reconstruct its state

@@ -818,6 +818,7 @@ test_initialized_session_submodule_refusal() {
   sub_remote="$CASE_ROOT/submodule.git"
   sub_seed="$CASE_ROOT/submodule-seed"
   git init --bare "$sub_remote" >/dev/null
+  git -C "$sub_remote" symbolic-ref HEAD refs/heads/main
   git init -b main "$sub_seed" >/dev/null
   git_config "$sub_seed"
   echo submodule-base >"$sub_seed/payload"
@@ -862,6 +863,7 @@ test_initialized_master_submodule_refusal() {
   sub_remote="$CASE_ROOT/master-submodule.git"
   sub_seed="$CASE_ROOT/master-submodule-seed"
   git init --bare "$sub_remote" >/dev/null
+  git -C "$sub_remote" symbolic-ref HEAD refs/heads/main
   git init -b main "$sub_seed" >/dev/null
   git_config "$sub_seed"
   echo submodule-base >"$sub_seed/payload"
@@ -1332,6 +1334,42 @@ test_session_head_lock_preflight() {
   echo "PASS: session HEAD lock is preflighted before mutation"
 }
 
+test_dangling_session_head_lock_preflight() {
+  local head_path local_master
+  setup_case dangling-session-head-lock-preflight merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  head_path=$(git -C "$CASE_SESSION" rev-parse --git-path HEAD)
+  ln -s missing-lock-owner "$head_path.lock"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "dangling session HEAD lock symlink was discovered only after mutation"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "dangling session HEAD lock refusal must precede master advancement"
+  [ -L "$head_path.lock" ] || fail "dangling session HEAD lock symlink was removed"
+  assert_eq "$(readlink "$head_path.lock")" missing-lock-owner \
+    "dangling session HEAD lock target must be preserved"
+  assert_topic_preserved
+  echo "PASS: dangling session HEAD lock is preflighted before mutation"
+}
+
+test_session_recovery_namespace_preflight() {
+  local local_master
+  setup_case session-recovery-namespace-preflight merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" update-ref refs/ship-pr/session-recovery/topic "$CASE_TOPIC_OID"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "conflicting session recovery namespace was discovered only after mutation"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "session recovery namespace refusal must precede master advancement"
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/ship-pr/session-recovery/topic)" \
+    "$CASE_TOPIC_OID" "conflicting session recovery prefix ref must be preserved"
+  assert_topic_preserved
+  echo "PASS: session recovery ref namespace is reserved before mutation"
+}
+
 test_symref_capability_preflight() {
   local fake_bin local_master real_git
   setup_case symref-capability-preflight merge main-off
@@ -1543,6 +1581,8 @@ test_session_head_locked_through_unregister
 test_archive_preflight_refusal
 test_precreated_archive_target_refusal
 test_session_head_lock_preflight
+test_dangling_session_head_lock_preflight
+test_session_recovery_namespace_preflight
 test_symref_capability_preflight
 test_option_like_branch_name
 test_relative_tmpdir
