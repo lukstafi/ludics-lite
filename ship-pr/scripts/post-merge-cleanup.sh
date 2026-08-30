@@ -36,8 +36,8 @@ git_path() {
 
 [ "$#" -ge 3 ] || usage
 
-MAIN=$(canonical_dir "$1")
-SESSION=$(canonical_dir "$2")
+MAIN=$(canonical_dir "$1") || exit $?
+SESSION=$(canonical_dir "$2") || exit $?
 BRANCH="$3"
 shift 3
 
@@ -60,9 +60,9 @@ git -C "$MAIN" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
 git -C "$SESSION" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   fail "session path is not a git worktree: $SESSION"
 
-MAIN_COMMON=$(git_path "$MAIN" "$(git -C "$MAIN" rev-parse --git-common-dir)")
-MAIN_GIT=$(git_path "$MAIN" "$(git -C "$MAIN" rev-parse --git-dir)")
-SESSION_COMMON=$(git_path "$SESSION" "$(git -C "$SESSION" rev-parse --git-common-dir)")
+MAIN_COMMON=$(git_path "$MAIN" "$(git -C "$MAIN" rev-parse --git-common-dir)") || exit $?
+MAIN_GIT=$(git_path "$MAIN" "$(git -C "$MAIN" rev-parse --git-dir)") || exit $?
+SESSION_COMMON=$(git_path "$SESSION" "$(git -C "$SESSION" rev-parse --git-common-dir)") || exit $?
 [ "$MAIN_GIT" = "$MAIN_COMMON" ] || fail "main-checkout is a linked worktree, not the primary checkout: $MAIN"
 [ "$MAIN" != "$SESSION" ] || fail "main checkout and session worktree must be different paths"
 [ "$SESSION_COMMON" = "$MAIN_COMMON" ] || fail "main checkout and session worktree belong to different repositories"
@@ -98,11 +98,22 @@ fi
 # Delete the remote branch before using `git branch -d`: once its upstream is gone, -d checks
 # master/HEAD rather than the tautological origin/<branch>. A missing remote branch is a safe retry
 # state after an interrupted cleanup.
-if git -C "$MAIN" ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
-  git -C "$MAIN" push origin --delete "$BRANCH" || fail "could not delete origin/$BRANCH"
-else
+REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads origin "refs/heads/$BRANCH")
+REMOTE_BRANCH_STATUS=$?
+case "$REMOTE_BRANCH_STATUS" in
+0)
+  REMOTE_BRANCH_OID=${REMOTE_BRANCH_LINE%%[[:space:]]*}
+  LOCAL_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot read local $BRANCH"
+  [ "$REMOTE_BRANCH_OID" = "$LOCAL_BRANCH_OID" ] ||
+    fail "origin/$BRANCH moved from local $LOCAL_BRANCH_OID to $REMOTE_BRANCH_OID; refusing to delete its newer tip"
+  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" origin --delete "$BRANCH" ||
+    fail "could not lease-delete origin/$BRANCH at $REMOTE_BRANCH_OID"
+  ;;
+2)
   echo "post-merge-cleanup.sh: origin/$BRANCH is already absent" >&2
-fi
+  ;;
+*) fail "could not determine whether origin/$BRANCH exists (ls-remote exit $REMOTE_BRANCH_STATUS)" ;;
+esac
 git -C "$MAIN" fetch --prune origin || fail "could not refresh origin after branch deletion"
 
 # Git permits at most one worktree to own master, but the three possible states need different

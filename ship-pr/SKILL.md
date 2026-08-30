@@ -539,10 +539,11 @@ make the exception explicit and leave its reason in the transcript:
   --force-integrated "GitHub reports the PR squash-merged at <sha>"
 ```
 
-The helper anchors every operation before it removes the session directory and treats an already
-absent remote branch as a safe retry state. Do not reconstruct its state machine in prose or
-replace the ancestry guard with `git branch -d`: `-d` tests the branch's upstream while it exists,
-which makes `origin/<branch>` a tautological and unsafe deletion check.
+The helper anchors every operation before it removes the session directory. It treats an already
+absent remote branch as a safe retry state, but refuses an unreadable ref or a remote tip newer than
+the local branch; the deletion itself carries an exact-OID lease. Do not reconstruct its state
+machine in prose or replace the ancestry guard with `git branch -d`: `-d` tests the branch's
+upstream while it exists, which makes `origin/<branch>` a tautological and unsafe deletion check.
 
 If the harness blocks the merge itself, that is a permission gate, not a failure: explain what you
 were doing, give the command, and let the user decide. Never work around it.

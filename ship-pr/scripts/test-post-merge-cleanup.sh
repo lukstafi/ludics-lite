@@ -37,6 +37,13 @@ assert_remote_topic_absent() {
     fail "expected origin/topic to be absent"
 }
 
+assert_topic_preserved() {
+  git -C "$CASE_MAIN" show-ref --verify --quiet refs/heads/topic || fail "local topic was deleted"
+  git -C "$CASE_MAIN" ls-remote --exit-code --heads origin refs/heads/topic >/dev/null 2>&1 ||
+    fail "remote topic was deleted"
+  [ -d "$CASE_SESSION" ] || fail "topic worktree was removed"
+}
+
 assert_cleaned() {
   local local_master remote_master
   local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
@@ -145,10 +152,7 @@ test_safe_topic_deletion() {
   if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
     fail "unmerged topic cleanup unexpectedly succeeded"
   fi
-  git -C "$CASE_MAIN" show-ref --verify --quiet refs/heads/topic || fail "unmerged local topic was deleted"
-  git -C "$CASE_MAIN" ls-remote --exit-code --heads origin refs/heads/topic >/dev/null 2>&1 ||
-    fail "unmerged remote topic was deleted"
-  [ -d "$CASE_SESSION" ] || fail "unmerged topic worktree was removed"
+  assert_topic_preserved
   echo "PASS: safe topic deletion and unmerged refusal"
 }
 
@@ -164,9 +168,71 @@ test_squash_rebase_override() {
   echo "PASS: explicit squash/rebase override"
 }
 
+test_newer_remote_tip_refusal() {
+  local remote_tip after_tip
+  setup_case newer-remote-tip merge main-off
+  git -C "$CASE_INTEGRATOR" checkout -b topic origin/topic >/dev/null
+  echo newer >"$CASE_INTEGRATOR/newer"
+  git -C "$CASE_INTEGRATOR" add newer
+  git -C "$CASE_INTEGRATOR" commit -m "newer remote topic work" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin topic >/dev/null
+  remote_tip=$(git -C "$CASE_INTEGRATOR" rev-parse HEAD)
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "cleanup deleted a newer remote topic tip"
+  fi
+  after_tip=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
+  assert_eq "$after_tip" "$remote_tip" "newer remote topic tip must be preserved"
+  assert_topic_preserved
+  echo "PASS: newer remote topic tip refusal"
+}
+
+test_ls_remote_failure_refusal() {
+  local fake_bin real_git log
+  setup_case ls-remote-failure merge main-off
+  fake_bin="$TEST_ROOT/fake-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/ls-remote-failure.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for arg in "$@"; do' \
+    '  [ "$arg" = ls-remote ] && exit 1' \
+    'done' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "ls-remote transport failure was treated as branch absence"
+  fi
+  grep -F "could not determine whether origin/topic exists (ls-remote exit 1)" "$log" >/dev/null ||
+    fail "ls-remote failure was not diagnosed distinctly"
+  assert_topic_preserved
+  echo "PASS: ls-remote failure refusal"
+}
+
+test_invalid_path_refusal() {
+  setup_case missing-main-path merge main
+  if (cd "$CASE_SESSION" && "$HELPER" "$TEST_ROOT/missing-main" "$CASE_SESSION" topic >/dev/null 2>&1); then
+    fail "missing main path did not stop cleanup"
+  fi
+  assert_topic_preserved
+
+  setup_case missing-session-path merge main
+  if "$HELPER" "$CASE_MAIN" "$TEST_ROOT/missing-session" topic >/dev/null 2>&1; then
+    fail "missing session path did not stop cleanup"
+  fi
+  assert_topic_preserved
+  echo "PASS: invalid checkout path refusal"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
 test_safe_topic_deletion
 test_squash_rebase_override
+test_newer_remote_tip_refusal
+test_ls_remote_failure_refusal
+test_invalid_path_refusal
 echo "PASS: all post-merge cleanup states"
