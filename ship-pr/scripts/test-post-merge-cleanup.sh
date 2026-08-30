@@ -769,10 +769,21 @@ test_master_update_failure_reattaches_owner() {
     "original master owner must remain attached after update-ref failure"
   assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse HEAD)" "$remote_master" \
     "attached master owner must follow the concurrently updated ref"
+  [ -z "$(git -C "$CASE_MASTER_OWNER" status --porcelain --untracked-files=all)" ] ||
+    fail "conditional master update failure left its attached owner dirty"
   checkout_status=$(cat "$TEST_ROOT/master-update-failure-checkout.status")
   [ "$checkout_status" -ne 0 ] || fail "competitor acquired master during failure recovery"
   assert_topic_preserved
   echo "PASS: master update failure keeps the original owner attached"
+}
+
+test_master_owner_without_head_reflog() {
+  setup_case master-owner-without-head-reflog merge other
+  git -C "$CASE_MAIN" config core.logAllRefUpdates false
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  echo "PASS: master owner refresh tolerates a disabled synthetic HEAD reflog"
 }
 
 test_master_handoff_stays_reserved() {
@@ -3124,6 +3135,7 @@ test_preexisting_ignored_master_data
 test_master_owner_switch_refusal
 test_master_initial_detach_compare_and_swap
 test_master_update_failure_reattaches_owner
+test_master_owner_without_head_reflog
 test_master_handoff_stays_reserved
 test_master_refresh_preserves_concurrent_ref
 test_master_reattach_compare_and_swap

@@ -256,6 +256,29 @@ refresh_master_owner_to() {
     git -C "$ORIGINAL_MASTER_OWNER" checkout --detach --no-overwrite-ignore "$target" >/dev/null
 }
 
+discard_master_refresh_admin() {
+  [ ! -f "$MASTER_REFRESH_GIT_DIR/logs/HEAD" ] ||
+    unlink "$MASTER_REFRESH_GIT_DIR/logs/HEAD" >/dev/null 2>&1 || true
+  [ ! -d "$MASTER_REFRESH_GIT_DIR/logs" ] ||
+    rmdir "$MASTER_REFRESH_GIT_DIR/logs" >/dev/null 2>&1 || true
+  [ ! -f "$MASTER_REFRESH_GIT_DIR/HEAD" ] ||
+    unlink "$MASTER_REFRESH_GIT_DIR/HEAD" >/dev/null 2>&1 || true
+  if rmdir "$MASTER_REFRESH_GIT_DIR" >/dev/null 2>&1; then
+    MASTER_REFRESH_GIT_DIR=""
+  else
+    echo "post-merge-cleanup.sh: retained temporary master refresh metadata at $MASTER_REFRESH_GIT_DIR" >&2
+  fi
+}
+
+install_master_owner_refresh() {
+  atomic_rename "$MASTER_OWNER_INDEX_LOCK" "$MASTER_OWNER_INDEX_PATH" ||
+    fail "could not install the refreshed master-owner index"
+  MASTER_OWNER_INDEX_LOCK_OWNED=0
+  unlink "$MASTER_HEAD_LOCK" || fail "could not release the master-owner HEAD lock"
+  MASTER_HEAD_LOCK_OWNED=0
+  discard_master_refresh_admin
+}
+
 relock_master_owner_head() {
   local raw
   (set -o noclobber; printf '%s\n' "$$" >"$MASTER_HEAD_LOCK") 2>/dev/null || return 1
@@ -1133,8 +1156,24 @@ if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
     fail "master owner HEAD or index changed before its locked refresh: $ORIGINAL_MASTER_OWNER"
   prepare_master_owner_refresh || fail "could not prepare the locked master-owner refresh"
 fi
-git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER" ||
+if ! git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER"; then
+  if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
+    relock_master_owner_head ||
+      fail "local master and its owner's HEAD both moved after preflight"
+    MASTER_DURING_REFRESH=$(git -C "$MAIN" rev-parse refs/heads/master) ||
+      fail "could not read master after its conditional update failed"
+    refresh_master_owner_to "$MASTER_DURING_REFRESH" ||
+      fail "local master moved and its locked owner could not follow the concurrent tip"
+    MASTER_OWNER_STATUS=$(GIT_INDEX_FILE="$MASTER_OWNER_INDEX_LOCK" \
+      git -C "$ORIGINAL_MASTER_OWNER" status \
+        --porcelain --untracked-files=normal --ignored=matching) ||
+      fail "could not recheck the master owner after its ref moved"
+    install_master_owner_refresh
+    [ -z "$MASTER_OWNER_STATUS" ] ||
+      fail "local master moved and its owner gained data; the data was preserved"
+  fi
   fail "local master moved after its owner preflight"
+fi
 if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
   if ! relock_master_owner_head; then
     git -C "$MAIN" update-ref --no-deref refs/heads/master "$LOCAL_MASTER" "$REMOTE_MASTER" || true
@@ -1153,16 +1192,7 @@ if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
   MASTER_OWNER_STATUS=$(GIT_INDEX_FILE="$MASTER_OWNER_INDEX_LOCK" git -C "$ORIGINAL_MASTER_OWNER" status \
     --porcelain --untracked-files=normal --ignored=matching) ||
     fail "could not recheck the locked master owner"
-  atomic_rename "$MASTER_OWNER_INDEX_LOCK" "$MASTER_OWNER_INDEX_PATH" ||
-    fail "could not install the refreshed master-owner index"
-  MASTER_OWNER_INDEX_LOCK_OWNED=0
-  unlink "$MASTER_REFRESH_GIT_DIR/logs/HEAD" || fail "could not remove the master refresh reflog"
-  rmdir "$MASTER_REFRESH_GIT_DIR/logs" || fail "could not remove the master refresh logs"
-  unlink "$MASTER_REFRESH_GIT_DIR/HEAD" || fail "could not remove the master refresh HEAD"
-  rmdir "$MASTER_REFRESH_GIT_DIR" || fail "could not remove the master refresh administration"
-  MASTER_REFRESH_GIT_DIR=""
-  unlink "$MASTER_HEAD_LOCK" || fail "could not release the master-owner HEAD lock"
-  MASTER_HEAD_LOCK_OWNED=0
+  install_master_owner_refresh
   [ -z "$MASTER_OWNER_STATUS" ] ||
     fail "master owner gained local data during its locked update; the data was preserved"
   [ "$MASTER_DURING_REFRESH" = "$REMOTE_MASTER" ] ||
