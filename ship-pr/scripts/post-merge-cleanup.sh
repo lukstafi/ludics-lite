@@ -34,6 +34,22 @@ git_path() {
   esac
 }
 
+scan_branch_owner() {
+  local target_ref="$1" worktree_list field current_worktree=""
+  BRANCH_OWNER=""
+  BRANCH_OWNER_COUNT=0
+  worktree_list=$(git -C "$MAIN" worktree list --porcelain) || fail "could not inspect registered worktrees"
+  while IFS= read -r field; do
+    case "$field" in
+    worktree\ *) current_worktree=${field#worktree } ;;
+    esac
+    if [ "$field" = "branch $target_ref" ]; then
+      BRANCH_OWNER="$current_worktree"
+      BRANCH_OWNER_COUNT=$((BRANCH_OWNER_COUNT + 1))
+    fi
+  done <<<"$worktree_list"
+}
+
 [ "$#" -ge 3 ] || usage
 
 MAIN=$(canonical_dir "$1") || exit $?
@@ -85,6 +101,16 @@ else
     fail "detached session HEAD is not the tip of $BRANCH"
 fi
 
+scan_branch_owner "refs/heads/$BRANCH"
+if [ -n "$SESSION_REF" ]; then
+  [ "$BRANCH_OWNER_COUNT" -eq 1 ] ||
+    fail "$BRANCH must be owned only by the attached session worktree"
+  BRANCH_OWNER=$(canonical_dir "$BRANCH_OWNER") || exit $?
+  [ "$BRANCH_OWNER" = "$SESSION" ] || fail "$BRANCH is owned by another worktree: $BRANCH_OWNER"
+else
+  [ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "detached session cannot clean $BRANCH while another worktree owns it: $BRANCH_OWNER"
+fi
+
 # Fetch before the safety decision: local master may be stale, while origin/master is the state
 # whose PR merge was independently confirmed. This also makes the later owner-specific update a
 # local fast-forward rather than a second network-dependent decision point.
@@ -109,6 +135,7 @@ case "$ORIGIN_PUSH_URLS" in
 *$'\n'*) fail "origin has multiple push endpoints; refusing ambiguous branch deletion" ;;
 esac
 ORIGIN_PUSH_URL="$ORIGIN_PUSH_URLS"
+ORIGIN_FETCH_URL=$(git -C "$MAIN" remote get-url origin) || fail "could not resolve origin's fetch endpoint"
 
 REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
 REMOTE_BRANCH_STATUS=$?
@@ -122,34 +149,33 @@ case "$REMOTE_BRANCH_STATUS" in
     fail "could not lease-delete origin/$BRANCH at $REMOTE_BRANCH_OID"
   ;;
 2)
-  echo "post-merge-cleanup.sh: origin/$BRANCH is already absent" >&2
+  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:" \
+    "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH" ||
+    fail "origin/$BRANCH changed after it was observed absent"
+  echo "post-merge-cleanup.sh: origin/$BRANCH was already absent (absence lease confirmed)" >&2
   ;;
 *) fail "could not determine whether origin/$BRANCH exists (ls-remote exit $REMOTE_BRANCH_STATUS)" ;;
 esac
 
+if [ "$ORIGIN_FETCH_URL" = "$ORIGIN_PUSH_URL" ] &&
+  git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+  TRACKING_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/remotes/origin/$BRANCH") ||
+    fail "cannot read origin/$BRANCH tracking ref"
+  git -C "$MAIN" update-ref -d "refs/remotes/origin/$BRANCH" "$TRACKING_BRANCH_OID" ||
+    fail "origin/$BRANCH tracking ref changed while pruning it"
+fi
+
 # Git permits at most one worktree to own master, but the three possible states need different
 # commands: update the branch ref directly when nobody owns it, or fast-forward the owning
 # worktree (which may or may not be the primary checkout).
-MASTER_OWNER=""
-MASTER_OWNER_COUNT=0
-CURRENT_WORKTREE=""
-while IFS= read -r -d '' FIELD; do
-  case "$FIELD" in
-  worktree\ *) CURRENT_WORKTREE=${FIELD#worktree } ;;
-  "branch refs/heads/master")
-    MASTER_OWNER="$CURRENT_WORKTREE"
-    MASTER_OWNER_COUNT=$((MASTER_OWNER_COUNT + 1))
-    ;;
-  esac
-done < <(git -C "$MAIN" worktree list --porcelain -z)
-
-[ "$MASTER_OWNER_COUNT" -le 1 ] || fail "more than one worktree reports owning master"
-if [ "$MASTER_OWNER_COUNT" -eq 0 ]; then
+scan_branch_owner refs/heads/master
+[ "$BRANCH_OWNER_COUNT" -le 1 ] || fail "more than one worktree reports owning master"
+if [ "$BRANCH_OWNER_COUNT" -eq 0 ]; then
   git -C "$MAIN" fetch origin refs/heads/master:refs/heads/master ||
     fail "could not fast-forward unchecked-out master"
 else
-  git -C "$MASTER_OWNER" merge --ff-only refs/remotes/origin/master ||
-    fail "could not fast-forward master in its owning worktree: $MASTER_OWNER"
+  git -C "$BRANCH_OWNER" merge --ff-only refs/remotes/origin/master ||
+    fail "could not fast-forward master in its owning worktree: $BRANCH_OWNER"
 fi
 
 LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot read local master"
@@ -169,7 +195,15 @@ if [ -z "$FORCE_REASON" ]; then
   git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" refs/heads/master ||
     fail "$BRANCH is not an ancestor of the updated local master"
 fi
+scan_branch_owner "refs/heads/$BRANCH"
+[ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "$BRANCH became owned by another worktree: $BRANCH_OWNER"
 git -C "$MAIN" update-ref -d "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" ||
   fail "local $BRANCH moved from validated tip $LOCAL_BRANCH_OID; its newer ref was preserved"
+git -C "$MAIN" config --remove-section "branch.$BRANCH" 2>/dev/null
+CONFIG_REMOVE_STATUS=$?
+case "$CONFIG_REMOVE_STATUS" in
+0 | 5) ;;
+*) fail "local $BRANCH was deleted but its branch configuration could not be removed" ;;
+esac
 
 echo "post-merge-cleanup.sh: cleaned $BRANCH and removed $SESSION"

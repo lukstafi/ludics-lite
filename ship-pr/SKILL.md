@@ -544,9 +544,11 @@ The helper requires the exact session-worktree root and anchors every operation 
 that directory. It resolves the actual push endpoint once, treats an already absent branch there
 as a safe retry state, and refuses an unreadable ref or a remote tip newer than the local branch;
 both the remote and local deletions carry exact-OID leases. It also fetches `master` explicitly,
-independent of the remote's configured fetch map. Do not reconstruct its state machine in prose or
-replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to
-`master`, making deletion either tautological or a false refusal after the worktree is already gone.
+independent of the remote's configured fetch map, refuses a topic owned by any other worktree, and
+removes matching remote-tracking and branch-configuration residue. Do not reconstruct its state
+machine in prose or replace the ancestry guard with `git branch -d`: `-d` may test a configured
+upstream unrelated to `master`, making deletion either tautological or a false refusal after the
+worktree is already gone.
 
 If the harness blocks the merge itself, that is a permission gate, not a failure: explain what you
 were doing, give the command, and let the user decide. Never work around it.

@@ -51,7 +51,10 @@ assert_cleaned() {
   assert_eq "$local_master" "$remote_master" "local master must match origin/master"
   assert_absent "$CASE_SESSION"
   assert_ref_absent refs/heads/topic
+  assert_ref_absent refs/remotes/origin/topic
   assert_remote_topic_absent
+  ! git -C "$CASE_MAIN" config --get-regexp '^branch\.topic\.' >/dev/null 2>&1 ||
+    fail "deleted topic branch configuration remained"
 }
 
 git_config() {
@@ -346,6 +349,58 @@ test_conditional_local_ref_deletion() {
   echo "PASS: conditional local ref deletion preserves a concurrent tip"
 }
 
+test_already_absent_remote_retry() {
+  setup_case already-absent-remote merge main-off
+  git -C "$CASE_MAIN" push origin :refs/heads/topic >/dev/null
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  echo "PASS: already-absent remote branch retry"
+}
+
+test_absent_remote_recreation_race() {
+  local fake_bin real_git local_oid log
+  setup_case absent-remote-race merge main-off
+  local_oid=$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)
+  git -C "$CASE_MAIN" push origin :refs/heads/topic >/dev/null
+  fake_bin="$TEST_ROOT/absent-race-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/absent-race.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for arg in "$@"; do' \
+    '  if [ "$arg" = push ]; then' \
+    '    "$REAL_GIT" -C "$RACE_MAIN" push "$RACE_REMOTE" "$RACE_OID:refs/heads/topic" >/dev/null' \
+    '    break' \
+    '  fi' \
+    'done' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    RACE_REMOTE="$CASE_REMOTE" RACE_OID="$local_oid" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "remote branch recreation outran the observed-absence cleanup"
+  fi
+  assert_topic_preserved
+  echo "PASS: absent remote branch recreation is lease-refused"
+}
+
+test_other_topic_owner_refusal() {
+  local other_topic
+  setup_case other-topic-owner merge none
+  other_topic="$CASE_ROOT/other-topic-worktree"
+  git -C "$CASE_SESSION" checkout --detach >/dev/null
+  git -C "$CASE_MAIN" worktree add "$other_topic" topic >/dev/null
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "detached session deleted a topic owned by another worktree"
+  fi
+  assert_topic_preserved
+  assert_eq "$(git -C "$other_topic" symbolic-ref --short HEAD)" topic \
+    "other topic worktree must remain attached"
+  echo "PASS: topic owned by another worktree is refused"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
@@ -360,4 +415,7 @@ test_topic_tag_collision
 test_master_tag_collision
 test_excluded_master_fetch_refusal
 test_conditional_local_ref_deletion
+test_already_absent_remote_retry
+test_absent_remote_recreation_race
+test_other_topic_owner_refusal
 echo "PASS: all post-merge cleanup states"
