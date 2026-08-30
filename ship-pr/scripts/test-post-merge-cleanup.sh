@@ -292,6 +292,60 @@ test_master_tag_collision() {
   echo "PASS: fully qualified master branch fetch"
 }
 
+test_excluded_master_fetch_refusal() {
+  local remote_base tracked_master
+  setup_case excluded-master-fetch merge main-off
+  git -C "$CASE_MAIN" fetch origin refs/heads/master:refs/remotes/origin/master >/dev/null
+  git -C "$CASE_MAIN" config --unset-all remote.origin.fetch
+  git -C "$CASE_MAIN" config --add remote.origin.fetch \
+    "+refs/heads/topic:refs/remotes/origin/topic"
+  remote_base=$(git -C "$CASE_INTEGRATOR" rev-list --max-parents=0 HEAD)
+  git -C "$CASE_INTEGRATOR" push --force origin "$remote_base:refs/heads/master" >/dev/null
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "stale origin/master passed ancestry after master was excluded from the fetch map"
+  fi
+  tracked_master=$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)
+  assert_eq "$tracked_master" "$remote_base" "explicit master fetch must replace stale tracking state"
+  assert_topic_preserved
+  echo "PASS: explicit master fetch defeats an excluding fetch map"
+}
+
+test_conditional_local_ref_deletion() {
+  local fake_bin real_git old_oid new_oid tree log
+  setup_case conditional-local-delete squash main-off
+  fake_bin="$TEST_ROOT/update-ref-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/conditional-local-delete.log"
+  old_oid=$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)
+  tree=$(git -C "$CASE_MAIN" rev-parse "refs/heads/topic^{tree}")
+  new_oid=$(printf '%s\n' "concurrent local topic commit" | \
+    git -C "$CASE_MAIN" commit-tree "$tree" -p "$old_oid")
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'for arg in "$@"; do' \
+    '  if [ "$arg" = update-ref ]; then' \
+    '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/topic "$RACE_NEW_OID" "$RACE_OLD_OID"' \
+    '    break' \
+    '  fi' \
+    'done' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    RACE_NEW_OID="$new_oid" RACE_OLD_OID="$old_oid" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic \
+      --force-integrated "scratch repository confirms the squash merge" >"$log" 2>&1; then
+    fail "conditional deletion removed a concurrently advanced local topic"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)" "$new_oid" \
+    "concurrently advanced local topic must survive"
+  git -C "$CASE_MAIN" cat-file -e "$new_oid^{commit}" || fail "concurrent local commit became unreachable"
+  assert_absent "$CASE_SESSION"
+  echo "PASS: conditional local ref deletion preserves a concurrent tip"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
@@ -304,4 +358,6 @@ test_unrelated_upstream_deletion
 test_distinct_push_endpoint
 test_topic_tag_collision
 test_master_tag_collision
+test_excluded_master_fetch_refusal
+test_conditional_local_ref_deletion
 echo "PASS: all post-merge cleanup states"

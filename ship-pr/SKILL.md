@@ -543,7 +543,8 @@ make the exception explicit and leave its reason in the transcript:
 The helper requires the exact session-worktree root and anchors every operation before it removes
 that directory. It resolves the actual push endpoint once, treats an already absent branch there
 as a safe retry state, and refuses an unreadable ref or a remote tip newer than the local branch;
-the deletion itself carries an exact-OID lease. Do not reconstruct its state machine in prose or
+both the remote and local deletions carry exact-OID leases. It also fetches `master` explicitly,
+independent of the remote's configured fetch map. Do not reconstruct its state machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to
 `master`, making deletion either tautological or a false refusal after the worktree is already gone.
 

@@ -72,6 +72,7 @@ SESSION_COMMON=$(git_path "$SESSION" "$(git -C "$SESSION" rev-parse --git-common
 
 git -C "$MAIN" show-ref --verify --quiet "refs/heads/$BRANCH" ||
   fail "local branch does not exist: $BRANCH"
+LOCAL_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot read local $BRANCH"
 
 SESSION_REF=$(git -C "$SESSION" symbolic-ref -q HEAD 2>/dev/null || true)
 if [ -n "$SESSION_REF" ]; then
@@ -87,7 +88,8 @@ fi
 # Fetch before the safety decision: local master may be stale, while origin/master is the state
 # whose PR merge was independently confirmed. This also makes the later owner-specific update a
 # local fast-forward rather than a second network-dependent decision point.
-git -C "$MAIN" fetch --prune origin || fail "could not fetch origin"
+git -C "$MAIN" fetch --no-tags origin \
+  "+refs/heads/master:refs/remotes/origin/master" || fail "could not fetch origin/master explicitly"
 git -C "$MAIN" show-ref --verify --quiet refs/remotes/origin/master ||
   fail "origin/master does not exist"
 
@@ -113,7 +115,6 @@ REMOTE_BRANCH_STATUS=$?
 case "$REMOTE_BRANCH_STATUS" in
 0)
   REMOTE_BRANCH_OID=${REMOTE_BRANCH_LINE%%[[:space:]]*}
-  LOCAL_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot read local $BRANCH"
   [ "$REMOTE_BRANCH_OID" = "$LOCAL_BRANCH_OID" ] ||
     fail "origin/$BRANCH moved from local $LOCAL_BRANCH_OID to $REMOTE_BRANCH_OID; refusing to delete its newer tip"
   git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" \
@@ -125,7 +126,6 @@ case "$REMOTE_BRANCH_STATUS" in
   ;;
 *) fail "could not determine whether origin/$BRANCH exists (ls-remote exit $REMOTE_BRANCH_STATUS)" ;;
 esac
-git -C "$MAIN" fetch --prune origin || fail "could not refresh origin after branch deletion"
 
 # Git permits at most one worktree to own master, but the three possible states need different
 # commands: update the branch ref directly when nobody owns it, or fast-forward the owning
@@ -165,12 +165,11 @@ fi
 cd "${TMPDIR:-/tmp}" || fail "cannot move out of the session worktree before removing it"
 git -C "$MAIN" worktree remove "$SESSION" || fail "could not remove session worktree: $SESSION"
 
-if [ -n "$FORCE_REASON" ]; then
-  git -C "$MAIN" branch -D "$BRANCH" || fail "could not delete integrated branch: $BRANCH"
-else
+if [ -z "$FORCE_REASON" ]; then
   git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" refs/heads/master ||
     fail "$BRANCH is not an ancestor of the updated local master"
-  git -C "$MAIN" branch -D "$BRANCH" || fail "could not delete ancestry-verified branch: $BRANCH"
 fi
+git -C "$MAIN" update-ref -d "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" ||
+  fail "local $BRANCH moved from validated tip $LOCAL_BRANCH_OID; its newer ref was preserved"
 
 echo "post-merge-cleanup.sh: cleaned $BRANCH and removed $SESSION"
