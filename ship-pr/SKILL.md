@@ -556,16 +556,17 @@ or `master` became unreadable, the current topic recovery ref is restored before
 validated tip also remains reachable under a direct `refs/ship-pr/recovery/` ref because no finite
 remote read can rule out a later base rollback. The master-owner refresh uses a non-destructive porcelain
 fast-forward through a helper-only reservation and a conditional named-ref update. A checked-out
-master owner must contain no local data, including ignored files; after the update it is safely
-reattached with the same invariant. The helper also checks ignored descendants when a directory is
+master owner must contain no local data, including ignored files; after the update it is prepared
+at the new tree and reattached before the reservation is removed. The helper also checks ignored descendants when a directory is
 replaced, refuses a topic owned by any other worktree, and transfers
 topic ownership to a temporary reservation through local ref deletion, and removes matching
-remote-tracking and standard repository-local upstream configuration. Included, global,
+remote-tracking and only the standard keys from repository-local upstream configuration. Included, global,
 per-worktree, and custom branch configuration is inherited policy and is deliberately not edited.
 Rather than recursively deleting a directory that can receive a last-moment ignored write, it
-atomically renames the session beside its original path, unregisters the now-missing worktree, and
-reports the retained archive for later inspection; late files or links at the vacated path are
-moved to a second archive before unregistering is retried. Do not reconstruct its state
+preallocates sibling archives before ref mutation, atomically renames the session into one,
+retains the archived session's final HEAD under `refs/ship-pr/session-recovery/`, and unregisters
+the now-missing worktree. Late files or links at the vacated path are moved to the second archive
+before unregistering is retried. Do not reconstruct its state
 machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to
 `master`, making deletion either tautological or a false refusal after the worktree is already gone.

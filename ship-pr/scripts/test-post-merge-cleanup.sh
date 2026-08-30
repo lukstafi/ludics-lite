@@ -68,7 +68,7 @@ assert_cleaned() {
     CASE_ARCHIVE="$archive"
   done
   assert_eq "$archive_count" 1 "cleanup must retain exactly one session archive"
-  [ -f "$CASE_ARCHIVE/value" ] || fail "session archive did not retain tracked worktree files"
+  [ -f "$CASE_ARCHIVE/worktree/value" ] || fail "session archive did not retain tracked worktree files"
 }
 
 git_config() {
@@ -517,21 +517,23 @@ test_unowned_master_reservation() {
 }
 
 test_concurrent_master_edit_refusal() {
-  local fake_bin real_git log
+  local fake_bin real_git log remote_master
   setup_case concurrent-master-edit merge other
+  remote_master=$(git -C "$CASE_INTEGRATOR" rev-parse refs/heads/master)
   fake_bin="$TEST_ROOT/concurrent-master-edit-bin"
   real_git=$(command -v git)
   log="$TEST_ROOT/concurrent-master-edit.log"
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "$3" = switch ] && [ "$4" = --no-overwrite-ignore ]; then' \
+    'if [ "$3" = switch ] && [ "$4" = --detach ] && [ "$6" = "$RACE_TARGET" ]; then' \
     '  echo concurrent-edit >"$MASTER_OWNER/value"' \
     'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
 
   if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_OWNER="$CASE_MASTER_OWNER" \
+    RACE_TARGET="$remote_master" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
     fail "master fast-forward discarded a concurrent tracked edit"
   fi
@@ -542,13 +544,14 @@ test_concurrent_master_edit_refusal() {
 }
 
 test_concurrent_ignored_master_collision() {
-  local fake_bin real_git log collision
+  local fake_bin real_git log collision remote_master
   setup_case concurrent-ignored-master-collision merge other
   collision="$CASE_MASTER_OWNER/collision"
   echo remote-data >"$CASE_INTEGRATOR/collision"
   git -C "$CASE_INTEGRATOR" add collision
   git -C "$CASE_INTEGRATOR" commit -m "add incoming master path" >/dev/null
   git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  remote_master=$(git -C "$CASE_INTEGRATOR" rev-parse refs/heads/master)
   echo collision >>"$CASE_MAIN/.git/info/exclude"
   fake_bin="$TEST_ROOT/concurrent-ignored-master-collision-bin"
   real_git=$(command -v git)
@@ -556,13 +559,14 @@ test_concurrent_ignored_master_collision() {
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [ "$3" = switch ] && [ "$4" = --no-overwrite-ignore ]; then' \
+    'if [ "$3" = switch ] && [ "$4" = --detach ] && [ "$6" = "$RACE_TARGET" ]; then' \
     '  echo local-data >"$MASTER_COLLISION"' \
     'fi' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
 
   if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_COLLISION="$collision" \
+    RACE_TARGET="$remote_master" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
     fail "master fast-forward overwrote an ignored file created after collision preflight"
   fi
@@ -650,6 +654,73 @@ test_master_update_failure_reattaches_owner() {
     "reattached master owner must follow the concurrently updated ref"
   assert_topic_preserved
   echo "PASS: master update failure reattaches the original owner"
+}
+
+test_master_handoff_stays_reserved() {
+  local candidate checkout_status fake_bin real_git
+  setup_case master-handoff-reserved merge other
+  candidate="$CASE_ROOT/master-handoff-candidate"
+  git -C "$CASE_MAIN" worktree add --detach "$candidate" refs/heads/master >/dev/null
+  fake_bin="$TEST_ROOT/master-handoff-reserved-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = worktree ] && [ "$4" = remove ]; then' \
+    '  case "$*" in' \
+    '  *ship-pr-master-reserve*)' \
+    '    "$REAL_GIT" -C "$MASTER_CANDIDATE" checkout master >/dev/null 2>&1' \
+    '    echo "$?" >"$CHECKOUT_MARKER"' \
+    '    ;;' \
+    '  esac' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_CANDIDATE="$candidate" \
+    CHECKOUT_MARKER="$TEST_ROOT/master-handoff-reserved.status" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  checkout_status=$(cat "$TEST_ROOT/master-handoff-reserved.status")
+  [ "$checkout_status" -ne 0 ] || fail "competitor acquired master during reservation removal"
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" symbolic-ref --short HEAD)" master \
+    "original master owner must already be attached before reservation removal"
+  assert_cleaned
+  echo "PASS: master remains owned across reservation removal"
+}
+
+test_ignored_data_during_master_detach() {
+  local fake_bin local_master log real_git
+  setup_case ignored-data-during-master-detach merge other
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" branch alternate "$local_master"
+  git -C "$CASE_MASTER_OWNER" checkout alternate >/dev/null
+  git -C "$CASE_MASTER_OWNER" rm value >/dev/null
+  git -C "$CASE_MASTER_OWNER" commit -m "alternate omits old-master path" >/dev/null
+  git -C "$CASE_MASTER_OWNER" checkout master >/dev/null
+  echo value >>"$CASE_MAIN/.git/info/exclude"
+  fake_bin="$TEST_ROOT/ignored-data-during-master-detach-bin"
+  real_git=$(command -v git)
+  log="$TEST_ROOT/ignored-data-during-master-detach.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = switch ] && [ "$4" = --detach ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '  : >"$RACE_MARKER"' \
+    '  "$REAL_GIT" -C "$MASTER_OWNER" checkout alternate >/dev/null 2>&1' \
+    '  echo local-data >"$MASTER_OWNER/value"' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_OWNER="$CASE_MASTER_OWNER" \
+    RACE_MARKER="$TEST_ROOT/ignored-data-during-master-detach.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "initial master detach overwrote ignored data"
+  fi
+  assert_eq "$(sed -n '1p' "$CASE_MASTER_OWNER/value")" local-data \
+    "ignored data created during initial master detach must survive"
+  assert_topic_preserved
+  echo "PASS: initial master detach refuses ignored data"
 }
 
 test_diverged_master_refusal() {
@@ -855,7 +926,7 @@ test_ignored_write_at_session_removal() {
     late_archive="$archive"
   done
   [ -n "$late_archive" ] || fail "late ignored data did not receive a recovery archive"
-  assert_eq "$(sed -n '1p' "$late_archive/local.log")" irreplaceable \
+  assert_eq "$(sed -n '1p' "$late_archive/data/local.log")" irreplaceable \
     "ignored data created at worktree removal must never be deleted"
   assert_absent "$CASE_SESSION"
   assert_ref_absent refs/heads/topic
@@ -894,15 +965,70 @@ test_dangling_link_at_session_removal() {
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1
   late_archive=""
   for archive in "$CASE_ROOT"/.session.ship-pr-late-data.*; do
-    [ -L "$archive" ] || continue
+    [ -L "$archive/data" ] || continue
     [ -z "$late_archive" ] || fail "more than one dangling-link archive was created"
     late_archive="$archive"
   done
   [ -n "$late_archive" ] || fail "dangling link did not receive a recovery archive"
-  assert_eq "$(readlink "$late_archive")" missing-target \
+  assert_eq "$(readlink "$late_archive/data")" missing-target \
     "archived dangling link must retain its target text"
   assert_cleaned
   echo "PASS: dangling link at vacated session path is archived"
+}
+
+test_detached_session_head_recovery() {
+  local fake_bin final_head real_git
+  setup_case detached-session-head-recovery merge main-off
+  fake_bin="$TEST_ROOT/detached-session-head-recovery-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$2" in' \
+    '*.ship-pr-recovery.*/worktree)' \
+    '  if [ "$3" = rev-parse ] && [ "$4" = HEAD ] && [ ! -e "$HEAD_MARKER" ]; then' \
+    '    "$REAL_GIT" -C "$2" commit --allow-empty -m "late detached session commit" >/dev/null' \
+    '    "$REAL_GIT" -C "$2" rev-parse HEAD >"$HEAD_MARKER"' \
+    '  fi' \
+    '  ;;' \
+    'esac' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+    HEAD_MARKER="$TEST_ROOT/detached-session-head-recovery.oid" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  final_head=$(cat "$TEST_ROOT/detached-session-head-recovery.oid")
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse \
+    "refs/ship-pr/session-recovery/topic/$final_head")" "$final_head" \
+    "late detached session HEAD must remain reachable after unregistering"
+  assert_cleaned
+  echo "PASS: final detached session HEAD receives a direct recovery ref"
+}
+
+test_archive_preflight_refusal() {
+  local fake_bin local_master real_mktemp
+  setup_case archive-preflight-refusal merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  fake_bin="$TEST_ROOT/archive-preflight-bin"
+  real_mktemp=$(command -v mktemp)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$*" in' \
+    '*.session.ship-pr-recovery.*) exit 1 ;;' \
+    'esac' \
+    'exec "$REAL_MKTEMP" "$@"' >"$fake_bin/mktemp"
+  chmod +x "$fake_bin/mktemp"
+
+  if PATH="$fake_bin:$PATH" REAL_MKTEMP="$real_mktemp" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "unavailable session archive was discovered only after destructive cleanup"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "archive preflight failure must precede the local master update"
+  assert_topic_preserved
+  echo "PASS: session archive availability is preflighted before mutation"
 }
 
 test_option_like_branch_name() {
@@ -1030,6 +1156,18 @@ test_dotted_branch_config() {
   echo "PASS: dotted child branch configuration remains distinct"
 }
 
+test_custom_branch_config() {
+  setup_case custom-branch-config merge main-off
+  git -C "$CASE_MAIN" config branch.topic.cleanupNote retain-me
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MAIN" config --local --no-includes \
+    --get branch.topic.cleanupNote)" retain-me \
+    "custom repository-local branch configuration must survive upstream cleanup"
+  echo "PASS: custom branch configuration is preserved"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
@@ -1056,6 +1194,8 @@ test_concurrent_ignored_master_collision
 test_preexisting_ignored_master_data
 test_master_owner_switch_refusal
 test_master_update_failure_reattaches_owner
+test_master_handoff_stays_reserved
+test_ignored_data_during_master_detach
 test_diverged_master_refusal
 test_locked_session_refusal
 test_symbolic_ref_refusal
@@ -1065,6 +1205,8 @@ test_symbolic_recovery_ref_refusal
 test_topic_reservation
 test_ignored_write_at_session_removal
 test_dangling_link_at_session_removal
+test_detached_session_head_recovery
+test_archive_preflight_refusal
 test_option_like_branch_name
 test_relative_tmpdir
 test_config_lock_refusal
@@ -1073,4 +1215,5 @@ test_ignored_master_descendant_refusal
 test_missing_branch_config
 test_inherited_branch_config
 test_dotted_branch_config
+test_custom_branch_config
 echo "PASS: all post-merge cleanup states"
