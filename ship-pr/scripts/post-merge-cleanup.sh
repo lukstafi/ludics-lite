@@ -53,8 +53,9 @@ scan_branch_owner() {
 }
 
 restore_remote_topic() {
+  local recovery_oid="$1"
   if git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:" \
-    "$ORIGIN_PUSH_URL" "$LOCAL_BRANCH_OID:refs/heads/$BRANCH"; then
+    "$ORIGIN_PUSH_URL" "$recovery_oid:refs/heads/$BRANCH"; then
     return 0
   fi
   # A competing writer may have restored another recovery tip first. That is still safer than an
@@ -62,6 +63,15 @@ restore_remote_topic() {
   git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" \
     "refs/heads/$BRANCH" >/dev/null 2>&1
 }
+
+cleanup_master_reservation() {
+  if [ -n "${MASTER_RESERVATION:-}" ] && [ -d "$MASTER_RESERVATION" ]; then
+    git -C "$MAIN" worktree remove --force "$MASTER_RESERVATION" >/dev/null 2>&1 || true
+  fi
+}
+
+MASTER_RESERVATION=""
+trap cleanup_master_reservation EXIT
 
 [ "$#" -ge 3 ] || usage
 
@@ -135,6 +145,9 @@ SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal) 
 # Fetch before the safety decision: local master may be stale, while origin/master is the state
 # whose PR merge was independently confirmed. This also makes the later owner-specific update a
 # local fast-forward rather than a second network-dependent decision point.
+if git -C "$MAIN" symbolic-ref -q refs/remotes/origin/master >/dev/null 2>&1; then
+  fail "origin/master is symbolic rather than a direct remote-tracking ref"
+fi
 git -C "$MAIN" fetch --no-tags origin \
   "+refs/heads/master:refs/remotes/origin/master" || fail "could not fetch origin/master explicitly"
 git -C "$MAIN" show-ref --verify --quiet refs/remotes/origin/master ||
@@ -177,39 +190,63 @@ git -C "$MAIN" merge-base --is-ancestor "$LOCAL_MASTER" "$REMOTE_MASTER" ||
 scan_branch_owner refs/heads/master
 [ "$BRANCH_OWNER_COUNT" -le 1 ] || fail "more than one worktree reports owning master"
 if [ "$BRANCH_OWNER_COUNT" -eq 0 ]; then
-  git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER" ||
-    fail "local master moved after its fast-forward preflight"
+  MASTER_RESERVATION=$(mktemp -d "${TMPDIR:-/tmp}/ship-pr-master-reserve.XXXXXX") ||
+    fail "could not allocate a temporary master reservation"
+  rmdir "$MASTER_RESERVATION" || fail "could not prepare the temporary master reservation path"
+  git -C "$MAIN" worktree add "$MASTER_RESERVATION" master >/dev/null ||
+    fail "could not reserve unchecked-out master in a temporary worktree"
+  MASTER_OWNER="$MASTER_RESERVATION"
 else
   MASTER_OWNER="$BRANCH_OWNER"
-  MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
-  [ "$MASTER_OWNER_REF" = refs/heads/master ] ||
-    fail "master owner changed branches before its fast-forward: $MASTER_OWNER"
-  MASTER_OWNER_HEAD=$(git -C "$MASTER_OWNER" rev-parse HEAD) || fail "cannot read master owner HEAD"
-  [ "$MASTER_OWNER_HEAD" = "$LOCAL_MASTER" ] || fail "master owner's HEAD disagrees with local master"
-  MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status --porcelain --untracked-files=normal) ||
-    fail "could not inspect master owner cleanliness"
-  [ -z "$MASTER_OWNER_STATUS" ] || fail "master owner is dirty; clean it before cleanup: $MASTER_OWNER"
-  IGNORED_COLLISION=""
-  while IFS= read -r -d '' CHANGED_PATH; do
-    if { [ -e "$MASTER_OWNER/$CHANGED_PATH" ] || [ -L "$MASTER_OWNER/$CHANGED_PATH" ]; } &&
-      git -C "$MASTER_OWNER" check-ignore -q -- "$CHANGED_PATH"; then
-      IGNORED_COLLISION="$CHANGED_PATH"
-      break
+fi
+
+MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
+[ "$MASTER_OWNER_REF" = refs/heads/master ] ||
+  fail "master owner changed branches before its fast-forward: $MASTER_OWNER"
+MASTER_OWNER_HEAD=$(git -C "$MASTER_OWNER" rev-parse HEAD) || fail "cannot read master owner HEAD"
+[ "$MASTER_OWNER_HEAD" = "$LOCAL_MASTER" ] || fail "master owner's HEAD disagrees with local master"
+MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status --porcelain --untracked-files=normal) ||
+  fail "could not inspect master owner cleanliness"
+[ -z "$MASTER_OWNER_STATUS" ] || fail "master owner is dirty; clean it before cleanup: $MASTER_OWNER"
+IGNORED_COLLISION=""
+while IFS= read -r -d '' CHANGED_PATH; do
+  if { [ -e "$MASTER_OWNER/$CHANGED_PATH" ] || [ -L "$MASTER_OWNER/$CHANGED_PATH" ]; } &&
+    git -C "$MASTER_OWNER" check-ignore -q -- "$CHANGED_PATH"; then
+    IGNORED_COLLISION="$CHANGED_PATH"
+    break
+  fi
+  if [ -d "$MASTER_OWNER/$CHANGED_PATH" ]; then
+    REMOTE_PATH_TYPE=$(git -C "$MAIN" cat-file -t "$REMOTE_MASTER:$CHANGED_PATH" 2>/dev/null || true)
+    if [ "$REMOTE_PATH_TYPE" != tree ]; then
+      IGNORED_DESCENDANT=$(git -C "$MASTER_OWNER" ls-files --others --ignored \
+        --exclude-standard -- "$CHANGED_PATH" | sed -n '1p')
+      if [ -n "$IGNORED_DESCENDANT" ]; then
+        IGNORED_COLLISION="$IGNORED_DESCENDANT"
+        break
+      fi
     fi
-  done < <(git -C "$MAIN" diff --name-only -z "$LOCAL_MASTER" "$REMOTE_MASTER")
-  [ -z "$IGNORED_COLLISION" ] ||
-    fail "master fast-forward would overwrite ignored local data: $MASTER_OWNER/$IGNORED_COLLISION"
-  git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER" ||
-    fail "local master moved after its owner preflight"
-  MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
-  [ "$MASTER_OWNER_REF" = refs/heads/master ] ||
-    fail "master advanced, but its owner switched branches before worktree refresh: $MASTER_OWNER"
-  git -C "$MASTER_OWNER" reset --hard "$REMOTE_MASTER" >/dev/null ||
-    fail "master advanced but its owner's worktree could not be refreshed: $MASTER_OWNER"
+  fi
+done < <(git -C "$MAIN" diff --name-only -z "$LOCAL_MASTER" "$REMOTE_MASTER")
+[ -z "$IGNORED_COLLISION" ] ||
+  fail "master fast-forward would overwrite ignored local data: $MASTER_OWNER/$IGNORED_COLLISION"
+git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER" ||
+  fail "local master moved after its owner preflight"
+MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
+[ "$MASTER_OWNER_REF" = refs/heads/master ] ||
+  fail "master advanced, but its owner switched branches before worktree refresh: $MASTER_OWNER"
+git -C "$MASTER_OWNER" reset --hard "$REMOTE_MASTER" >/dev/null ||
+  fail "master advanced but its owner's worktree could not be refreshed: $MASTER_OWNER"
+if [ -n "$MASTER_RESERVATION" ]; then
+  git -C "$MAIN" worktree remove "$MASTER_RESERVATION" ||
+    fail "master advanced but its temporary reservation could not be removed"
+  MASTER_RESERVATION=""
 fi
 
 LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot reread local master"
 [ "$LOCAL_MASTER" = "$REMOTE_MASTER" ] || fail "local master did not reach origin/master"
+CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
+[ "$CURRENT_TOPIC_OID" = "$LOCAL_BRANCH_OID" ] ||
+  fail "local $BRANCH moved before remote deletion; all topic artifacts were preserved"
 
 REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
 REMOTE_BRANCH_STATUS=$?
@@ -235,15 +272,22 @@ MASTER_AFTER_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads \
   "$ORIGIN_PUSH_URL" refs/heads/master)
 MASTER_AFTER_STATUS=$?
 if [ "$MASTER_AFTER_STATUS" -ne 0 ]; then
-  restore_remote_topic ||
+  restore_remote_topic "$LOCAL_BRANCH_OID" ||
     fail "remote master became unreadable after topic deletion, and the topic could not be restored"
   fail "remote master became unreadable after topic deletion; origin/$BRANCH was restored"
 fi
 MASTER_AFTER_OID=${MASTER_AFTER_LINE%%[[:space:]]*}
 if [ "$MASTER_AFTER_OID" != "$REMOTE_MASTER" ]; then
-  restore_remote_topic ||
+  restore_remote_topic "$LOCAL_BRANCH_OID" ||
     fail "remote master changed to $MASTER_AFTER_OID, and the topic could not be restored"
   fail "remote master changed from $REMOTE_MASTER to $MASTER_AFTER_OID; origin/$BRANCH was restored"
+fi
+
+CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
+if [ "$CURRENT_TOPIC_OID" != "$LOCAL_BRANCH_OID" ]; then
+  restore_remote_topic "$CURRENT_TOPIC_OID" ||
+    fail "local $BRANCH moved after remote deletion, and its new tip could not be restored remotely"
+  fail "local $BRANCH moved after remote deletion; its new tip was restored remotely"
 fi
 
 if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
@@ -253,17 +297,38 @@ if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
     fail "origin/$BRANCH tracking ref changed while pruning it"
 fi
 
-# Remove configuration while the conditionally deletable local branch and session still exist, so
-# a concurrent config lock leaves a retryable cleanup rather than an unconfigurable missing branch.
-git -C "$MAIN" config --remove-section "branch.$BRANCH" 2>/dev/null
-CONFIG_REMOVE_STATUS=$?
-case "$CONFIG_REMOVE_STATUS" in
-0 | 5) ;;
-*) fail "branch configuration could not be removed; local $BRANCH and its session were preserved" ;;
+# Detect section absence explicitly: Git's no-section exit status varies by version. Removal still
+# happens while the local branch and session exist, so a config-lock race remains retryable.
+BRANCH_CONFIG_PRESENT=0
+BRANCH_CONFIG_NAMES=$(git -C "$MAIN" config --name-only --get-regexp '^branch\.' 2>/dev/null)
+CONFIG_LIST_STATUS=$?
+case "$CONFIG_LIST_STATUS" in
+0)
+  while IFS= read -r CONFIG_NAME; do
+    case "$CONFIG_NAME" in "branch.$BRANCH."*) BRANCH_CONFIG_PRESENT=1 ;; esac
+  done <<<"$BRANCH_CONFIG_NAMES"
+  ;;
+1) ;;
+*) fail "branch configuration could not be inspected; local $BRANCH and its session were preserved" ;;
 esac
+if [ "$BRANCH_CONFIG_PRESENT" -eq 1 ] &&
+  ! git -C "$MAIN" config --remove-section "branch.$BRANCH" 2>/dev/null; then
+  fail "branch configuration could not be removed; local $BRANCH and its session were preserved"
+fi
 
+# Keep an attached session attached through every fallible metadata cleanup. Detach at the
+# validated OID only immediately before removal, then re-read the branch so a concurrent commit
+# preserves the worktree and regains a remote recovery ref.
 if [ -n "$SESSION_REF" ]; then
-  git -C "$SESSION" checkout --detach >/dev/null || fail "could not detach the session worktree"
+  git -C "$SESSION" checkout --detach "$LOCAL_BRANCH_OID" >/dev/null ||
+    fail "could not detach the session worktree at the validated topic tip"
+  CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
+  if [ "$CURRENT_TOPIC_OID" != "$LOCAL_BRANCH_OID" ]; then
+    git -C "$SESSION" checkout "$BRANCH" >/dev/null 2>&1 || true
+    restore_remote_topic "$CURRENT_TOPIC_OID" ||
+      fail "local $BRANCH moved during detachment, and its new tip could not be restored remotely"
+    fail "local $BRANCH moved during detachment; its worktree was reattached and remote tip restored"
+  fi
 fi
 
 # Do not inherit a cwd that the next command removes. This also lets the helper finish when invoked

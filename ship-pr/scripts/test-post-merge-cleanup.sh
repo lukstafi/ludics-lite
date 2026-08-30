@@ -344,8 +344,12 @@ test_conditional_local_ref_deletion() {
   assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)" "$new_oid" \
     "concurrently advanced local topic must survive"
   git -C "$CASE_MAIN" cat-file -e "$new_oid^{commit}" || fail "concurrent local commit became unreachable"
-  assert_absent "$CASE_SESSION"
-  echo "PASS: conditional local ref deletion preserves a concurrent tip"
+  [ -d "$CASE_SESSION" ] || fail "topic worktree was removed after its branch advanced"
+  assert_eq "$(git -C "$CASE_SESSION" symbolic-ref --short HEAD)" topic \
+    "advanced topic worktree must remain attached"
+  assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')" "$old_oid" \
+    "remote topic must remain at the validated tip when the local branch advances early"
+  echo "PASS: topic advancement preserves its branch and worktree"
 }
 
 test_already_absent_remote_retry() {
@@ -447,6 +451,36 @@ test_master_reservation() {
   echo "PASS: continuous master ownership blocks another checkout"
 }
 
+test_unowned_master_reservation() {
+  local fake_bin real_git candidate checkout_status
+  setup_case unowned-master-reservation merge none
+  candidate="$CASE_ROOT/master-candidate"
+  git -C "$CASE_MAIN" worktree add --detach "$candidate" refs/heads/master >/dev/null
+  fake_bin="$TEST_ROOT/unowned-master-reservation-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = update-ref ] && [ "$5" = refs/heads/master ]; then' \
+    '  "$REAL_GIT" -C "$MASTER_CANDIDATE" checkout master >/dev/null 2>&1' \
+    '  echo "$?" >"$SWITCH_MARKER"' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if ! PATH="$fake_bin:$PATH" REAL_GIT="$real_git" MASTER_CANDIDATE="$candidate" \
+    SWITCH_MARKER="$TEST_ROOT/unowned-master-reservation.status" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "temporary reservation of unchecked-out master failed"
+  fi
+  checkout_status=$(cat "$TEST_ROOT/unowned-master-reservation.status")
+  [ "$checkout_status" -ne 0 ] || fail "another worktree acquired initially unowned master"
+  assert_cleaned
+  ! git -C "$candidate" symbolic-ref -q HEAD >/dev/null 2>&1 ||
+    fail "candidate worktree stopped being detached"
+  echo "PASS: unchecked-out master is reserved during its update"
+}
+
 test_diverged_master_refusal() {
   local master_owner="$TEST_ROOT/diverged-master-owner"
   setup_case diverged-master merge none
@@ -496,6 +530,19 @@ test_symbolic_ref_refusal() {
   fi
   assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)" "$tracked_master" \
     "symbolic tracking refusal must preserve origin/master"
+  assert_topic_preserved
+
+  setup_case symbolic-tracking-master merge main-off
+  git -C "$CASE_MAIN" fetch origin refs/heads/master:refs/remotes/origin/master >/dev/null
+  tracked_master=$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)
+  git -C "$CASE_MAIN" update-ref refs/remotes/origin/master-target "$tracked_master"
+  git -C "$CASE_MAIN" update-ref -d refs/remotes/origin/master
+  git -C "$CASE_MAIN" symbolic-ref refs/remotes/origin/master refs/remotes/origin/master-target
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "symbolic origin/master was accepted before explicit fetch"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" symbolic-ref refs/remotes/origin/master)" \
+    refs/remotes/origin/master-target "symbolic origin/master must remain intact"
   assert_topic_preserved
   echo "PASS: symbolic local and tracking refs are refused"
 }
@@ -552,6 +599,44 @@ test_ignored_master_collision_refusal() {
   echo "PASS: ignored master-owner collision is refused"
 }
 
+test_ignored_master_descendant_refusal() {
+  local collision tracked_tip
+  setup_case ignored-master-descendant merge other
+  collision="$CASE_MASTER_OWNER/collision"
+  mkdir "$CASE_INTEGRATOR/collision"
+  echo tracked >"$CASE_INTEGRATOR/collision/tracked"
+  git -C "$CASE_INTEGRATOR" add collision/tracked
+  git -C "$CASE_INTEGRATOR" commit -m "add tracked master directory" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  tracked_tip=$(git -C "$CASE_INTEGRATOR" rev-parse HEAD)
+  git -C "$CASE_MAIN" fetch origin refs/heads/master:refs/remotes/origin/master >/dev/null
+  git -C "$CASE_MASTER_OWNER" reset --hard "$tracked_tip" >/dev/null
+
+  git -C "$CASE_INTEGRATOR" rm collision/tracked >/dev/null
+  echo remote-file >"$CASE_INTEGRATOR/collision"
+  git -C "$CASE_INTEGRATOR" add collision
+  git -C "$CASE_INTEGRATOR" commit -m "replace tracked directory with a file" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  echo collision/local >>"$CASE_MAIN/.git/info/exclude"
+  echo local-data >"$collision/local"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "master refresh replaced a directory containing ignored local data"
+  fi
+  assert_eq "$(sed -n '1p' "$collision/local")" local-data \
+    "ignored descendant under a replaced directory must survive"
+  assert_topic_preserved
+  echo "PASS: ignored descendant under replaced master directory is refused"
+}
+
+test_missing_branch_config() {
+  setup_case missing-branch-config merge main-off
+  git -C "$CASE_MAIN" config --remove-section branch.topic
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  echo "PASS: absent branch configuration is a normal cleanup state"
+}
+
 test_unchecked_out_master
 test_master_owned_by_main
 test_master_owned_by_other_worktree
@@ -571,10 +656,13 @@ test_absent_remote_recreation_race
 test_other_topic_owner_refusal
 test_dirty_session_refusal
 test_master_reservation
+test_unowned_master_reservation
 test_diverged_master_refusal
 test_locked_session_refusal
 test_symbolic_ref_refusal
 test_remote_master_lease
 test_config_lock_refusal
 test_ignored_master_collision_refusal
+test_ignored_master_descendant_refusal
+test_missing_branch_config
 echo "PASS: all post-merge cleanup states"
