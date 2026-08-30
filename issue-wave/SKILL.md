@@ -66,9 +66,12 @@ triage is wrong, not the backlog.
 
 ## Launch
 
-**Skill-freshness preflight first (self-improve#11).** Before the wave's first launch — and
-before any launch that runs on another box — bring that box's skills checkout to the upstream
-main, refusing on anything short of it. A bare `pull --ff-only` is NOT the check: it succeeds
+**Skill-freshness preflight first (self-improve#11).** Before EVERY worker launch — the wave's
+first, each later one on this box, and any on another box — bring the launching box's skills
+checkout to the upstream main, refusing on anything short of it. Every launch, not just the
+first: upstream main advancing mid-wave is normal (skill merges land during waves), the
+after-merge push-side ff is explicitly best-effort, and the compound below is one cheap local
+command. A bare `pull --ff-only` is NOT the check: it succeeds
 over a dirty worktree (the deployed symlinks then serve upstream *plus* local edits), and it
 fast-forwards whichever branch happens to be checked out, against that branch's own upstream.
 The preflight is the compound (wrapped in `ssh <box> '…'` for a remote box):

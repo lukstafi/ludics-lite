@@ -686,8 +686,13 @@ status_state() {
 
   # A verdict comment naming the current head is an approval — without this arm it reads as
   # "no review of this head", which is what invited the '@codex review' re-request that
-  # destroyed the 👍 on #531. Prefix match: the comment quotes a truncated sha.
-  if [ -n "$verd_sha" ]; then
+  # destroyed the 👍 on #531. Prefix match: the comment quotes a truncated sha. The verdict must
+  # also be no OLDER than the reviewer's last word: a re-requested round on the same head that
+  # ended WITH findings spends the 👀 through its own review, and a SHA-only check here would
+  # then approve on the previous round's verdict over those findings. Not-older (rather than
+  # strictly newer) because the legitimate verdict usually IS the last word — the same comment
+  # timestamps both sides of the comparison.
+  if [ -n "$verd_sha" ] && ! [[ "$verd_at" < "$last_spoke" ]]; then
     case "$head_sha" in
     "$verd_sha"*)
       echo "approved|-|$REVIEWER posted a no-findings verdict for head ${head_sha:0:7} at $verd_at"
@@ -1623,6 +1628,7 @@ cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
   local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
   local nogo_at_tip=0 last_tip="" grace_from confirm wf="" wid wname part sleep_for remaining
+  local norun=0 tip_at="" tip_age hold
   local started now beat waited_note="" no_tip_verdict=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1650,10 +1656,12 @@ cmd_base() {
   beat=$started
   grace_from=$started
   while :; do
-    red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0
+    red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0 norun=0
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
-    tip=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || tip=""
+    line=$(gh_retry read api "repos/$REPO/commits/$branch" \
+      --jq '[.sha, (.commit.committer.date // "-")] | @tsv') || line=""
+    IFS=$'\t' read -r tip tip_at <<<"$line"
     # Without --wait the tip only decorates the report, so a failed read costs the "not the tip"
     # notes. Under --wait it is the QUESTION — which commit needs the verdict — and an unknown
     # tip would idle to the absent-run grace and then settle for an older green, exit 0, having
@@ -1687,7 +1695,15 @@ cmd_base() {
       rc=$?
       [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's '$wname' runs on $branch" \
         "($(gh_err_line)); the base's health is UNKNOWN, which is NOT 'green'."
-      [ -n "$part" ] && raw="${raw}${part}"$'\n'
+      if [ -n "$part" ]; then
+        raw="${raw}${part}"$'\n'
+      else
+        # A listed non-advisory workflow with NO push runs on this branch yet — just added, or
+        # its first run not created — is still unjudged at the tip. Dropping it here let the
+        # OTHER workflows' coverage read as immediately green, with no creation grace for the
+        # newcomer that may then fail (round 7).
+        norun=$((norun + 1))
+      fi
     done <<<"$wf"
     # Empty result must short-circuit the fold: one empty line through tab-IFS `read` collapses
     # into shifted fields (tab is IFS whitespace), which used to render as a phantom workflow —
@@ -1787,13 +1803,30 @@ cmd_base() {
     fi
     if [ "$inflight" -eq 0 ]; then
       if [ "$uncovered" -eq 0 ]; then
+        # A listed workflow with NO push runs on the branch (norun) is ambiguous: dispatch- or
+        # schedule-only (never coming — staging carries two such smoke workflows, and counting
+        # them as uncovered would park EVERY wait on the full grace), or a push workflow the tip
+        # itself just added, whose first run is not created yet. The tip's own AGE separates
+        # them: a tip older than the creation grace has had its window, so anything still
+        # runless is not coming; a younger tip holds the break until the newcomer's run can
+        # appear (at which point it counts as inflight/uncovered properly).
+        hold=""
+        if [ "$norun" -gt 0 ]; then
+          tip_age=$(age_of "$tip_at")
+          case "$tip_age" in
+          '' | *[!0-9]*) ;; # unreadable age is not evidence to hold on
+          *) [ "$tip_age" -ge "$BASE_ABSENT_GRACE" ] || hold=1 ;;
+          esac
+        fi
         # Covered — against the tip read BEFORE the runs. A sibling merge landing between those
         # two reads is the integration loop's normal traffic, and would make this a false green
         # for a branch already pointing elsewhere: accept coverage only when the tip has not
         # moved meanwhile; otherwise fall through to the sleep and let the next round re-read
         # everything (the tip-change branch above restarts the grace).
-        confirm=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || confirm=""
-        [ "$confirm" = "$tip" ] && break
+        if [ -z "$hold" ]; then
+          confirm=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || confirm=""
+          [ "$confirm" = "$tip" ] && break
+        fi
       # Nothing running and the tip unjudged. A tip run that completed STOPPED (cancelled/stale)
       # is not absence — it existed and was not judged, so no amount of paths-ignore explains it;
       # the grace only allows for a superseding replacement to be created, and then the verdict
