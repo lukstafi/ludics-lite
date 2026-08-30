@@ -420,6 +420,14 @@ the wave coordinator's post-merge **integration loop** (issue-wave skill): the f
 @train` suites on merged master, on whichever fleet machine has the least work, with
 stop-the-world triage on a regression.
 
+The division is strict on the landing side too: **after `merge` confirms `merged`, your
+verification is over.** Do not watch master's subsequent workflows — under concurrent merges
+"the latest tip's run" is a moving target and the wait never terminates (on 2026-08-30 seven
+wave workers each chased it for 100–120 minutes; every one ended unjudged or had to be killed).
+If you check anything post-merge, it is the single run for your OWN merge commit, read once —
+a run superseded or cancelled by a later sibling merge is the integration loop's business, not
+yours.
+
 **Still read the line before letting the merge stand.** On staging#488 (2026-08-28) sixteen review
 rounds ran against a base that had gone 136 commits stale, `master` had meanwhile edited the very
 file the PR changed, and every signal on the merge path was clean: green checks (on the stale

@@ -124,6 +124,13 @@ and includes:
   worktree — and a worker whose shell sits inside it (Codex, launched `-C <worktree>`) leaves
   removal to the coordinator: removing your own cwd is the "Unable to read current working
   directory" failure ship-pr warns about.
+- **The worker's verification ends at its own merge** (2026-08-30, seven workers, ~10 h):
+  the brief must say that after `merge` confirms `merged`, the worker does NOT watch master's
+  subsequent CI — "the latest tip's workflows" is a moving target under concurrent sibling
+  merges and that wait never terminates (workers chased it 100–120 minutes each; one hit a
+  120-minute ceiling unjudged). Post-merge master verification is the coordinator's
+  integration loop, full stop. If a worker checks anything after merging, it is the run for
+  its OWN merge commit, once, without waiting out reruns triggered by later merges.
 - Process discipline, stated explicitly because agents re-derive it badly under load:
   never end a turn with only a detached process outstanding - attach waits as
   harness-tracked background children; if a review watch goes quiet suspiciously long, read
@@ -234,10 +241,15 @@ The coordinator's job between launch and last merge:
   line is shell-expanded before Codex sees it, so every prompt rides stdin (`-`) or a file -
   the post-merge brainstorm prompt below included. The `cd` is mandatory: resume has no `-C`
   and adopts the invoking shell's cwd, so a resume fired from the coordinator's own checkout
-  resumes the worker inside the WRONG repo. Full session context is retained (a running
-  session takes `codex queue --thread <id> --message` instead - present on CLI 0.150.1,
-  absent on 0.144: there, wait out or kill the exec, then resume. `--message` has no stdin
-  form, so it carries only literal text you typed yourself, never substituted content). A resume is a fresh CLI
+  resumes the worker inside the WRONG repo. Full session context is retained. Do NOT reach
+  for `codex queue --thread <id> --message` to unstick an exec worker: an entire `codex exec`
+  run is ONE turn, and queued messages deliver only at a turn boundary — the message sits
+  undelivered while the worker keeps doing the thing you queued it to stop (observed
+  2026-08-30: a tip-chasing worker ran 50 more minutes past its queued stop). For exec
+  workers the unstick is always kill-the-exec (confirm the pid is dead) then resume with the
+  message on stdin; queue is only for genuinely interactive multi-turn sessions, and even
+  there `--message` has no stdin form, so it carries only literal text you typed yourself,
+  never substituted content. A resume is a fresh CLI
   invocation: it retains the conversation, not the launch flags, so every resume repeats
   `--yolo` (accepted by `exec resume` on CLI 0.151.0; `-s` is not - use the flag, not a
   mode). A resume without it is back in the default sandbox - network-blocked, unable to
@@ -254,6 +266,21 @@ The coordinator's job between launch and last merge:
   hand-back mode still reads the tracker for dedup) for the hand-back
   brainstorm rather than brainstorming its work from the outside; only if the session is
   unresumable does the coordinator brainstorm from the diff and say so.
+- **Model-capacity errors kill execs; resume just works.** A `codex exec` dies with exit 1
+  and `turn.failed: "Selected model is at capacity"` when the provider is saturated — it is
+  terminal for that invocation, not for the session. The work is durable (briefs mandate
+  early commits): `codex exec resume <thread-id> --yolo` from inside the worktree with a
+  disk-first note (trust `git log`/`git status` and the PR state over the session's memory;
+  re-run anything whose result is not in a file) recovered 2/2 cleanly on 2026-08-30, one
+  mid-review, one mid-measurement. Expect kills to cluster (capacity is global); resume
+  victims as their exit notifications arrive.
+- **Before a coordinator fix-forward, check for a rival fix in flight.** On 2026-08-30's
+  first integration red the coordinator pushed a doc reword to master while PR #562 was
+  independently landing an exemption for the same red; the two fixes then conflicted at the
+  next integration run (a stale count-pinned exemption). Before fixing a red directly, scan
+  the open PRs (and recent pushes to open branches) for one already addressing it; if found,
+  either let it land or coordinate in its thread — two uncoordinated fixes for one red are a
+  third red.
 - **Converge long reviews.** An automated reviewer keeps finding members of any open-ended
   artifact (a scanner, a property table) indefinitely; two agents went 9 and 13 rounds on
   2026-08-22. After ~5 rounds send the policy: fix only findings that show a claim CANNOT fail
