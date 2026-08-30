@@ -395,6 +395,15 @@ a manual stop, and re-running is what turns it into an answer; it is exit 4 like
 Run `checks` on its own — same verdicts, same exit codes, no merge — whenever you want the build
 signal without acting on it, such as before asking the reviewer for another round.
 
+**Awaiting CI is `checks --wait`'s job, never `gh run watch`'s.** Raw `gh run watch` streamed
+~168k tokens of progress redraws into one session, and its nonzero exit on a run that concluded
+FAILURE carries no HTTP status, so a retry loop reads a workflow verdict as transport — the
+2026-08-29 wave re-watched a completed FAILED run four times and then reported "the API never
+answered". Use `checks <pr> --wait` for a PR's build signal (it reads every check on the head,
+with a heartbeat instead of redraws). For a single run addressed by id, `retry run watch
+<run-id>` is safe: the script does not forward it to gh but executes a quiet await — one verdict
+line; run FAILED is exit 1, transport exit 3, no verdict exit 4.
+
 ### How stale the base has grown
 
 Both gates above read the *head commit*, and both are satisfied by a branch whose base has moved on

@@ -106,6 +106,11 @@
 #   pr-review.sh retry [--read] <gh args...>
 #                                          # any other gh call (pr merge, api) with the same retry
 #                                          # policy, instead of a hand-rolled loop
+#   pr-review.sh retry [--read] run watch <run-id> [-R owner/name]
+#                                          # NOT forwarded to gh: executed as a QUIET await of that
+#                                          # run — one verdict line instead of a stream of redraws,
+#                                          # and a FAILED run is a verdict (exit 1), never retried
+#                                          # as transport. For a PR, prefer `checks <pr> --wait`.
 #
 # Exit codes: 0 the command did what it says (and any fact it printed came from a call that
 #             answered); 1 the fact does not hold (the window stayed quiet, no such thread, the API
@@ -120,7 +125,8 @@
 #
 # Env: REPO=owner/name (else the <pr> argument, else the cwd's checkout, else the per-PR cache),
 #      REVIEWER=login-prefix (default: codex app), WATCH_INTERVAL=seconds between polls (default
-#      90), WATCH_TIMEOUT=seconds to watch (900), SHIP_PR_STATE_DIR=where the cache lives,
+#      90), WATCH_TIMEOUT=seconds to watch (900), SHIP_PR_STATE_DIR=where the cache lives
+#      (`off` disables the cache entirely — for sandboxes where even the attempted write warns),
 #      SHIP_PR_API_ATTEMPTS=tries per gh call (4), SHIP_PR_API_BACKOFF=first pause in seconds (5,
 #      doubling to a 20s cap: ~35s of retrying before a call is declared dead),
 #      SHIP_PR_REVIEW_GRACE=seconds a due-but-unstarted review is waited for before `watch` returns
@@ -141,6 +147,18 @@ REPO="${REPO:-}"
 REVIEWER="${REVIEWER:-chatgpt-codex-connector}"
 STATE_DIR="${SHIP_PR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ship-pr}"
 CACHE="$STATE_DIR/repo-by-pr"
+
+# The cache is a convenience, never a requirement, and in a sandboxed worker the write ATTEMPT is
+# what draws the harness's warning — on every call, when the state dir is unwritable and unreadable
+# (self-improve#8: workers given explicit owner/name#number arguments, which never need the cache,
+# still warned on each invocation). So it can be switched off outright (SHIP_PR_STATE_DIR=off),
+# and a failed write latches it off for the rest of the process. The latch is a file, not a
+# variable, because cache_put runs inside command substitutions (every `watch` round's poll is
+# one), where a variable set there would not survive to the next round; $$ is the parent's pid in
+# those subshells, so the file is shared across them and cleaned by the same trap as GH_ERR_FILE.
+CACHE_OFF_FILE="${TMPDIR:-/tmp}/pr-review-nocache.$$"
+case "$STATE_DIR" in off | none) CACHE_OFF=1 ;; *) CACHE_OFF="" ;; esac
+cache_off() { [ -n "$CACHE_OFF" ] || [ -e "$CACHE_OFF_FILE" ]; }
 
 API_ATTEMPTS="${SHIP_PR_API_ATTEMPTS:-4}"
 API_BACKOFF="${SHIP_PR_API_BACKOFF:-5}"
@@ -175,7 +193,7 @@ warn() { echo "pr-review.sh: $*" >&2; }
 # blank.
 GH_ERR=""
 GH_ERR_FILE="${TMPDIR:-/tmp}/pr-review-err.$$"
-trap 'rm -f "$GH_ERR_FILE"' EXIT
+trap 'rm -f "$GH_ERR_FILE" "$CACHE_OFF_FILE"' EXIT
 
 gateway_failure() {
   case "$1" in
@@ -261,6 +279,7 @@ gh_err_line() {
 # a cache hit is VERIFIED against the API before it is trusted — a wrong repo would post a reply
 # onto an unrelated PR, which is worse than the error it is standing in for.
 cache_get() {
+  cache_off && return 1
   [ -f "$CACHE" ] || return 1
   local hit
   hit=$(awk -v n="$1" '$1 == n { r = $2 } END { if (r != "") print r }' "$CACHE" 2>/dev/null)
@@ -273,13 +292,17 @@ cache_get() {
 # makes losing an entry harmless. Skipping the no-op rewrite keeps most of that window shut, since
 # a running `watch` re-resolves every round.
 cache_put() {
+  cache_off && return 0
   [ "$(cache_get "$1" 2>/dev/null)" = "$2" ] && return 0
-  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || {
+    : >"$CACHE_OFF_FILE" 2>/dev/null
+    return 0
+  }
   local tmp="$CACHE.$$"
   {
     [ -f "$CACHE" ] && awk -v n="$1" '$1 != n' "$CACHE"
     echo "$1 $2"
-  } >"$tmp" 2>/dev/null && mv -f "$tmp" "$CACHE" 2>/dev/null
+  } >"$tmp" 2>/dev/null && mv -f "$tmp" "$CACHE" 2>/dev/null || : >"$CACHE_OFF_FILE" 2>/dev/null
   rm -f "$tmp" 2>/dev/null
   return 0
 }
@@ -955,6 +978,87 @@ cmd_resolve() {
   esac
 }
 
+# `gh run watch` is the wrong tool on both of its ends, and workers keep reaching for it (the
+# 2026-08-29 wave, self-improve#8). Its nonzero exit on a run that concluded FAILURE is a workflow
+# VERDICT, but it arrives with no HTTP status on stderr, so the retry policy read it as transport:
+# four attempts re-watching a run that had already completed, then "the API never answered" — a
+# lie, it answered every time. And in a non-TTY shell its progress redraws accumulate; one session
+# captured ~168k tokens of them. So `retry` does not forward `run watch` to gh at all: the await
+# below polls `gh run view` on the checks cadence, prints a heartbeat line instead of redraws, and
+# ends with ONE verdict line. Each poll keeps the usual transport retries. For a PR's build
+# signal, prefer `checks <pr> --wait`, which reads EVERY check on the head commit, not one run.
+#
+# Exit codes, matching `checks`: 0 the run succeeded; 1 it concluded failure — a VERDICT, so do
+# not retry the watch, read the run; 3 the API did not answer, so the run's state is UNKNOWN;
+# 4 no verdict — still running at the deadline, or stopped without being judged (cancelled).
+cmd_run_watch() {
+  local run_id="" repo="" interval="$CHECKS_INTERVAL" line rc status concl
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    -R | --repo)
+      repo="${2:?$1 needs owner/name}"
+      shift
+      ;;
+    -R=* | --repo=*) repo="${1#*=}" ;;
+    -i | --interval)
+      interval="${2:?$1 needs seconds}"
+      shift
+      ;;
+    -i=* | --interval=*) interval="${1#*=}" ;;
+    [0-9]*) run_id="$1" ;;
+    *) ;; # --exit-status is implied; the display flags shape output this await never prints
+    esac
+    shift
+  done
+  case "$run_id" in
+  '' | *[!0-9]*) die "retry run watch: name the run id (a number) — the quiet await polls" \
+    "\`gh run view <id>\`. For a PR's checks, prefer \`checks <pr> --wait\`." ;;
+  esac
+  case "$interval" in '' | *[!0-9]*) die "run watch: the interval must be seconds, got '$interval'" ;; esac
+  [ -n "$repo" ] || repo="$REPO"
+  [ -n "$repo" ] || repo=$(repo_from_cwd) || true
+  [ -n "$repo" ] || die "run watch: name the repo (-R owner/name, --repo, or REPO=) —" \
+    "cwd inference only works from a checkout, and not from a background shell."
+  local started deadline beat now
+  started=$(date +%s)
+  deadline=$((started + CHECKS_WAIT))
+  beat=$started
+  while :; do
+    line=$(gh_retry read run view "$run_id" --repo "$repo" --json status,conclusion \
+      --jq '[.status, (.conclusion // "pending")] | @tsv')
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      api_rejection "$(gh_err_line)" &&
+        fail 1 "run $run_id was not readable in $repo: $(gh_err_line) — check the id and the repo"
+      fail 3 "could not read run $run_id in $repo after $API_ATTEMPTS attempts ($(gh_err_line));" \
+        "the run's state is UNKNOWN — not failed, not passed. Retry rather than concluding."
+    fi
+    IFS=$'\t' read -r status concl <<<"$line"
+    [ "$status" = completed ] && break
+    now=$(date +%s)
+    [ "$now" -lt "$deadline" ] || fail 4 "run $run_id in $repo has NO VERDICT after" \
+      "$((CHECKS_WAIT / 60)) min (status: ${status:-unknown}) — that is still not a failure;" \
+      "re-arm the await, or read it with: gh run view $run_id --repo $repo"
+    if [ $((now - beat)) -ge "$CHECKS_HEARTBEAT" ]; then
+      warn "still waiting on run $run_id in $repo: ${status:-unknown} after" \
+        "$(((now - started) / 60)) min"
+      beat=$now
+    fi
+    sleep "$interval"
+  done
+  case "$(conclusion_class "$concl")" in
+  green)
+    echo "run $run_id in $repo: $concl"
+    return 0
+    ;;
+  red) fail 1 "run $run_id in $repo concluded $concl — the run FAILED. That is the workflow's" \
+    "verdict, not transport: do not retry the watch; read the failure with:" \
+    "gh run view $run_id --repo $repo --log-failed" ;;
+  *) fail 4 "run $run_id in $repo concluded $concl — stopped, not judged (a superseding push or" \
+    "a manual cancel); re-run the workflow to turn it into an answer" ;;
+  esac
+}
+
 # Every gh call this skill makes wants the same policy, not just the ones wrapped above: the
 # 2026-08-17 outage had a session hand-rolling `for i in 1 2 3; do … && break; sleep; done` around
 # `gh pr comment` and `gh pr merge` five separate times. Run them through here instead. Default is
@@ -968,6 +1072,11 @@ cmd_retry() {
   esac
   [ "${1:-}" = gh ] && shift # tolerate the leading `gh` a caller pastes in
   [ $# -gt 0 ] || die "usage: retry [--read] <gh args...>"
+  if [ "${1:-}" = run ] && [ "${2:-}" = watch ]; then
+    shift 2
+    cmd_run_watch "$@"
+    return
+  fi
   gh_retry "$mode" "$@"
   case "$?" in
   0) return 0 ;;
@@ -1553,5 +1662,7 @@ retry) shift && cmd_retry "$@" ;;
   pr-review.sh comment <pr> <body>           # a plain PR comment (a summary round, a review nudge)
   pr-review.sh base [owner/name] [branch]    # is the base branch's CI green? (start of work)
   pr-review.sh retry [--read] <gh args...>   # any other gh call, same retry policy
+  pr-review.sh retry run watch <run-id> [-R owner/name]  # quiet await of ONE run (never forwarded
+                                             # to gh); for a PR prefer: checks <pr> --wait
   <pr> is a number or owner/name#number; prefer owner/name#number for background invocations." ;;
 esac
