@@ -62,6 +62,46 @@ refuse_private_worktree_refs() {
     fail "session worktree has a private ref; remove or retain it before cleanup: $private_ref"
 }
 
+lock_and_retain_session_pseudorefs() {
+  local name path path_dir lock line oid recovery_ref recovery_oid
+  for name in ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD \
+    BISECT_HEAD AUTO_MERGE FETCH_HEAD; do
+    path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "$name") ||
+      fail "could not locate archived session pseudoref: $name"
+    case "$path" in
+    /*) ;;
+    *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
+    esac
+    path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
+    path="$path_dir/$(basename "$path")"
+    lock="$path.lock"
+    (set -o noclobber; printf '%s\n' "$$" >"$lock") 2>/dev/null ||
+      fail "archived session pseudoref is busy: $name"
+    SESSION_PSEUDOREF_LOCKS+=("$lock")
+    [ ! -L "$path" ] || fail "archived session pseudoref is symbolic: $name"
+    [ -f "$path" ] || continue
+    while IFS= read -r line || [ -n "$line" ]; do
+      oid=${line%%[[:space:]]*}
+      [ -n "$oid" ] || continue
+      git -C "$MAIN" cat-file -e "$oid^{object}" 2>/dev/null ||
+        fail "archived session pseudoref contains an unreadable object: $name"
+      recovery_ref="refs/ship-pr/session-pseudoref-recovery/$BRANCH/$name/$oid"
+      if git -C "$MAIN" symbolic-ref -q "$recovery_ref" >/dev/null 2>&1; then
+        fail "session pseudoref recovery ref is symbolic rather than direct: $recovery_ref"
+      fi
+      if git -C "$MAIN" show-ref --verify --quiet "$recovery_ref"; then
+        recovery_oid=$(git -C "$MAIN" rev-parse "$recovery_ref") ||
+          fail "cannot read $recovery_ref"
+        [ "$recovery_oid" = "$oid" ] ||
+          fail "session pseudoref recovery points at an unexpected object: $recovery_ref"
+      else
+        git -C "$MAIN" update-ref --no-deref "$recovery_ref" "$oid" "" ||
+          fail "could not retain archived session pseudoref object: $recovery_ref"
+      fi
+    done <"$path"
+  done
+}
+
 scan_branch_owner() {
   local target_ref="$1" worktree_list field current_worktree=""
   BRANCH_OWNER=""
@@ -93,6 +133,12 @@ restore_remote_topic() {
 }
 
 cleanup_reservations() {
+  local lock
+  if [ "${#SESSION_PSEUDOREF_LOCKS[@]}" -gt 0 ]; then
+    for lock in "${SESSION_PSEUDOREF_LOCKS[@]}"; do
+      [ ! -f "$lock" ] || unlink "$lock" >/dev/null 2>&1 || true
+    done
+  fi
   if [ "${SESSION_HEAD_LOCK_OWNED:-0}" -eq 1 ] && [ -n "${SESSION_HEAD_LOCK:-}" ] &&
     [ -f "$SESSION_HEAD_LOCK" ]; then
     unlink "$SESSION_HEAD_LOCK" >/dev/null 2>&1 || true
@@ -138,6 +184,7 @@ CAPABILITY_REF=""
 CAPABILITY_REF_OWNED=0
 SESSION_NAMESPACE_RESERVATION=""
 SESSION_NAMESPACE_RESERVATION_OWNED=0
+SESSION_PSEUDOREF_LOCKS=()
 TOPIC_RESERVATION=""
 trap cleanup_reservations EXIT
 
@@ -246,8 +293,13 @@ LATE_SESSION_ARCHIVE=$(mktemp -d "$SESSION_PARENT/.${SESSION_BASENAME}.ship-pr-l
 # symref-update provides the compare-and-swap used by the master ownership handoff. Probe it before
 # master or topic mutation so older Git versions refuse cleanly rather than failing mid-cleanup.
 CAPABILITY_REF="refs/ship-pr/capability-probe-$$"
-git -C "$MAIN" show-ref --verify --quiet "$CAPABILITY_REF" &&
-  fail "temporary capability ref already exists: $CAPABILITY_REF"
+git -C "$MAIN" show-ref --exists "$CAPABILITY_REF" >/dev/null 2>&1
+CAPABILITY_REF_STATUS=$?
+case "$CAPABILITY_REF_STATUS" in
+0) fail "temporary capability ref already exists: $CAPABILITY_REF" ;;
+2) ;;
+*) fail "could not inspect the temporary capability ref: $CAPABILITY_REF" ;;
+esac
 git -C "$MAIN" symbolic-ref "$CAPABILITY_REF" refs/heads/master ||
   fail "could not create the symref capability probe"
 CAPABILITY_REF_OWNED=1
@@ -575,6 +627,7 @@ SESSION_HEAD_LOCK="$SESSION_HEAD_DIR/$(basename "$SESSION_HEAD_PATH").lock"
 (set -o noclobber; printf '%s\n' "$$" >"$SESSION_HEAD_LOCK") 2>/dev/null ||
   fail "archived session HEAD is busy; its worktree metadata was preserved"
 SESSION_HEAD_LOCK_OWNED=1
+lock_and_retain_session_pseudorefs
 SESSION_FINAL_HEAD=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse HEAD) ||
   fail "could not read the archived session's final HEAD"
 SESSION_RECOVERY_REF="refs/ship-pr/session-recovery/$BRANCH/$SESSION_FINAL_HEAD"
@@ -606,6 +659,7 @@ else
 fi
 SESSION_HEAD_LOCK_OWNED=0
 SESSION_HEAD_LOCK=""
+SESSION_PSEUDOREF_LOCKS=()
 [ -d "$SESSION_ARCHIVED_WORKTREE" ] || fail "session recovery archive disappeared: $SESSION_ARCHIVED_WORKTREE"
 
 git -C "$MAIN" update-ref --no-deref -d "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" ||

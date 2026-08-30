@@ -571,7 +571,8 @@ refuses initialized submodules and session-local worktree refs before mutation, 
 reserves the session-recovery ref namespace, atomically renames the session into one without
 directory-nesting semantics,
 retains the archived session's final HEAD under `refs/ship-pr/session-recovery/`, and unregisters
-the now-missing worktree while holding the linked-worktree HEAD lock. Late files or links at the vacated path are moved to the second archive
+the now-missing worktree while holding the linked-worktree HEAD and pseudoref locks. Objects named
+only by a session pseudoref are retained under `refs/ship-pr/session-pseudoref-recovery/`. Late files or links at the vacated path are moved to the second archive
 before unregistering is retried. Do not reconstruct its state
 machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to

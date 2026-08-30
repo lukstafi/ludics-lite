@@ -949,6 +949,21 @@ test_private_worktree_ref_refusal() {
   echo "PASS: session-local worktree ref is refused before unregistering"
 }
 
+test_session_pseudoref_recovery() {
+  local unique_oid
+  setup_case session-pseudoref-recovery merge main-off
+  unique_oid=$(printf 'unique ORIG_HEAD commit\n' | git -C "$CASE_SESSION" commit-tree \
+    "$(git -C "$CASE_SESSION" rev-parse HEAD^{tree})" -p "$CASE_TOPIC_OID")
+  git -C "$CASE_SESSION" update-ref ORIG_HEAD "$unique_oid"
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse \
+    "refs/ship-pr/session-pseudoref-recovery/topic/ORIG_HEAD/$unique_oid")" \
+    "$unique_oid" "session ORIG_HEAD object must remain directly reachable"
+  echo "PASS: session pseudoref objects receive recovery refs before unregistering"
+}
+
 test_symbolic_ref_refusal() {
   local tracked_master
   setup_case symbolic-local-topic merge main-off
@@ -1489,6 +1504,36 @@ test_symref_capability_preflight() {
   echo "PASS: symref transaction support is preflighted before mutation"
 }
 
+test_dangling_capability_ref_refusal() {
+  local capability_ref fake_bin local_master real_git
+  setup_case dangling-capability-ref merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  fake_bin="$TEST_ROOT/dangling-capability-ref-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = show-ref ] && [ "$4" = --exists ]; then' \
+    '  "$REAL_GIT" -C "$RACE_MAIN" symbolic-ref "$5" refs/heads/missing-capability-target' \
+    '  printf "%s\n" "$5" >"$CAPABILITY_MARKER"' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+    CAPABILITY_MARKER="$TEST_ROOT/dangling-capability-ref.path" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "pre-existing dangling capability ref was overwritten"
+  fi
+  capability_ref=$(cat "$TEST_ROOT/dangling-capability-ref.path")
+  assert_eq "$(git -C "$CASE_MAIN" symbolic-ref "$capability_ref")" \
+    refs/heads/missing-capability-target "dangling capability ref must be preserved"
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "dangling capability ref refusal must precede master advancement"
+  assert_topic_preserved
+  echo "PASS: dangling capability probe ref is detected without dereferencing"
+}
+
 test_option_like_branch_name() {
   setup_case option-like-branch merge main-off
   git -C "$CASE_MAIN" update-ref refs/heads/-topic "$CASE_TOPIC_OID" ""
@@ -1661,6 +1706,7 @@ test_initialized_master_submodule_refusal
 test_diverged_master_refusal
 test_locked_session_refusal
 test_private_worktree_ref_refusal
+test_session_pseudoref_recovery
 test_symbolic_ref_refusal
 test_remote_master_lease
 test_stale_master_response_retains_recovery
@@ -1680,6 +1726,7 @@ test_dangling_config_lock_preflight
 test_divergent_tracking_tip_recovery
 test_tracking_tip_move_refusal
 test_symref_capability_preflight
+test_dangling_capability_ref_refusal
 test_option_like_branch_name
 test_relative_tmpdir
 test_config_lock_refusal
