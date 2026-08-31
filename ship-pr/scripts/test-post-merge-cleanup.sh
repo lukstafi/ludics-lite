@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end tests for post-merge-cleanup.sh. Every repository lives under one disposable /tmp tree.
+# Runs every case by default; name cases exactly to run only those, or --list to see the names.
 
 set -euo pipefail
 
@@ -3105,117 +3106,172 @@ test_merge_options_cleanup() {
   echo "PASS: standard branch mergeOptions configuration is removed"
 }
 
-test_unchecked_out_master
-test_master_owned_by_main
-test_master_owned_by_other_worktree
-test_safe_topic_deletion
-test_squash_rebase_override
-test_newer_remote_tip_refusal
-test_ls_remote_failure_refusal
-test_invalid_path_refusal
-test_git_local_environment_is_cleared
-test_non_files_ref_backend_refusal
-test_replacement_refs_disabled
-test_unrelated_upstream_deletion
-test_distinct_push_endpoint
-test_topic_tag_collision
-test_master_tag_collision
-test_excluded_master_fetch_refusal
-test_conditional_local_ref_deletion
-test_already_absent_remote_retry
-test_absent_remote_recreation_race
-test_other_topic_owner_refusal
-test_dirty_session_refusal
-test_ignored_session_refusal
-test_master_reservation
-test_unowned_master_reservation
-test_concurrent_master_edit_refusal
-test_concurrent_ignored_master_collision
-test_preexisting_ignored_master_data
-test_master_owner_switch_refusal
-test_master_initial_detach_compare_and_swap
-test_master_update_failure_reattaches_owner
-test_master_owner_without_head_reflog
-test_master_handoff_stays_reserved
-test_master_refresh_preserves_concurrent_ref
-test_master_reattach_compare_and_swap
-test_master_reattach_verifies_named_branch
-test_ignored_data_during_master_detach
-test_ignored_data_during_topic_detach
-test_ignored_data_during_topic_reattach
-test_attached_session_head_compare_and_swap
-test_detached_session_head_compare_and_swap
-test_initialized_session_submodule_refusal
-test_deinitialized_session_submodule_refusal
-test_initialized_master_submodule_refusal
-test_master_resolve_undo_refusal
-test_assume_unchanged_master_refusal
-test_skip_worktree_master_refusal
-test_master_active_operation_refusal
-test_master_index_lock_refusal
-test_master_changed_path_failure_refusal
-test_diverged_master_refusal
-test_locked_session_refusal
-test_active_session_operation_refusal
-test_active_session_bisect_refusal
-test_symbolic_session_pseudoref_refusal
-test_private_worktree_ref_refusal
-test_rewritten_worktree_ref_refusal
-test_session_pseudoref_recovery
-test_session_reflog_recovery
-test_session_index_recovery
-test_session_split_index_recovery
-test_session_resolve_undo_recovery
-test_worktree_config_archive
-test_commit_message_archive
-test_concurrent_commit_message_archive
-test_squash_message_archive
-test_tag_and_notes_messages_archive
-test_sparse_checkout_archive
-test_session_metadata_lock_preflight
-test_late_private_worktree_ref_recovery
-test_shared_private_namespace_roots_preserved
-test_private_namespace_locked_through_unregister
-test_late_active_session_operation_refusal
-test_late_session_module_refusal
-test_symbolic_ref_refusal
-test_remote_master_lease
-test_stale_master_response_retains_recovery
-test_symbolic_recovery_ref_refusal
-test_topic_reservation
-test_topic_reservation_failure_restores_remote
-test_ignored_write_at_session_removal
-test_dangling_link_at_session_removal
-test_detached_session_head_recovery
-test_session_head_locked_through_unregister
-test_session_registration_locked_against_prune
-test_archive_preflight_refusal
-test_precreated_archive_target_refusal
-test_session_head_lock_preflight
-test_dangling_session_head_lock_preflight
-test_session_recovery_namespace_preflight
-test_dangling_config_lock_preflight
-test_divergent_tracking_tip_recovery
-test_tracking_tip_move_refusal
-test_tracking_reflog_recovery
-test_tracking_reflog_locked_through_deletion
-test_topic_reflog_recovery
-test_topic_reflog_locked_through_deletion
-test_final_topic_lease_restores_remote
-test_branch_config_locked_through_deletion
-test_symref_capability_preflight
-test_dangling_capability_ref_refusal
-test_option_like_branch_name
-test_relative_tmpdir
-test_session_tmpdir_refusal
-test_config_lock_refusal
-test_symbolic_repository_config_refusal
-test_symbolic_worktree_config_preflight
-test_ignored_master_collision_refusal
-test_ignored_master_descendant_refusal
-test_missing_branch_config
-test_inherited_branch_config
-test_dotted_branch_config
-test_custom_branch_config
-test_merge_options_cleanup
-echo "PASS: all post-merge cleanup states"
+TESTS=(
+  test_unchecked_out_master
+  test_master_owned_by_main
+  test_master_owned_by_other_worktree
+  test_safe_topic_deletion
+  test_squash_rebase_override
+  test_newer_remote_tip_refusal
+  test_ls_remote_failure_refusal
+  test_invalid_path_refusal
+  test_git_local_environment_is_cleared
+  test_non_files_ref_backend_refusal
+  test_replacement_refs_disabled
+  test_unrelated_upstream_deletion
+  test_distinct_push_endpoint
+  test_topic_tag_collision
+  test_master_tag_collision
+  test_excluded_master_fetch_refusal
+  test_conditional_local_ref_deletion
+  test_already_absent_remote_retry
+  test_absent_remote_recreation_race
+  test_other_topic_owner_refusal
+  test_dirty_session_refusal
+  test_ignored_session_refusal
+  test_master_reservation
+  test_unowned_master_reservation
+  test_concurrent_master_edit_refusal
+  test_concurrent_ignored_master_collision
+  test_preexisting_ignored_master_data
+  test_master_owner_switch_refusal
+  test_master_initial_detach_compare_and_swap
+  test_master_update_failure_reattaches_owner
+  test_master_owner_without_head_reflog
+  test_master_handoff_stays_reserved
+  test_master_refresh_preserves_concurrent_ref
+  test_master_reattach_compare_and_swap
+  test_master_reattach_verifies_named_branch
+  test_ignored_data_during_master_detach
+  test_ignored_data_during_topic_detach
+  test_ignored_data_during_topic_reattach
+  test_attached_session_head_compare_and_swap
+  test_detached_session_head_compare_and_swap
+  test_initialized_session_submodule_refusal
+  test_deinitialized_session_submodule_refusal
+  test_initialized_master_submodule_refusal
+  test_master_resolve_undo_refusal
+  test_assume_unchanged_master_refusal
+  test_skip_worktree_master_refusal
+  test_master_active_operation_refusal
+  test_master_index_lock_refusal
+  test_master_changed_path_failure_refusal
+  test_diverged_master_refusal
+  test_locked_session_refusal
+  test_active_session_operation_refusal
+  test_active_session_bisect_refusal
+  test_symbolic_session_pseudoref_refusal
+  test_private_worktree_ref_refusal
+  test_rewritten_worktree_ref_refusal
+  test_session_pseudoref_recovery
+  test_session_reflog_recovery
+  test_session_index_recovery
+  test_session_split_index_recovery
+  test_session_resolve_undo_recovery
+  test_worktree_config_archive
+  test_commit_message_archive
+  test_concurrent_commit_message_archive
+  test_squash_message_archive
+  test_tag_and_notes_messages_archive
+  test_sparse_checkout_archive
+  test_session_metadata_lock_preflight
+  test_late_private_worktree_ref_recovery
+  test_shared_private_namespace_roots_preserved
+  test_private_namespace_locked_through_unregister
+  test_late_active_session_operation_refusal
+  test_late_session_module_refusal
+  test_symbolic_ref_refusal
+  test_remote_master_lease
+  test_stale_master_response_retains_recovery
+  test_symbolic_recovery_ref_refusal
+  test_topic_reservation
+  test_topic_reservation_failure_restores_remote
+  test_ignored_write_at_session_removal
+  test_dangling_link_at_session_removal
+  test_detached_session_head_recovery
+  test_session_head_locked_through_unregister
+  test_session_registration_locked_against_prune
+  test_archive_preflight_refusal
+  test_precreated_archive_target_refusal
+  test_session_head_lock_preflight
+  test_dangling_session_head_lock_preflight
+  test_session_recovery_namespace_preflight
+  test_dangling_config_lock_preflight
+  test_divergent_tracking_tip_recovery
+  test_tracking_tip_move_refusal
+  test_tracking_reflog_recovery
+  test_tracking_reflog_locked_through_deletion
+  test_topic_reflog_recovery
+  test_topic_reflog_locked_through_deletion
+  test_final_topic_lease_restores_remote
+  test_branch_config_locked_through_deletion
+  test_symref_capability_preflight
+  test_dangling_capability_ref_refusal
+  test_option_like_branch_name
+  test_relative_tmpdir
+  test_session_tmpdir_refusal
+  test_config_lock_refusal
+  test_symbolic_repository_config_refusal
+  test_symbolic_worktree_config_preflight
+  test_ignored_master_collision_refusal
+  test_ignored_master_descendant_refusal
+  test_missing_branch_config
+  test_inherited_branch_config
+  test_dotted_branch_config
+  test_custom_branch_config
+  test_merge_options_cleanup
+)
+
+usage() {
+  cat <<'USAGE'
+usage: test-post-merge-cleanup.sh [test_name ...]
+
+With no arguments every case runs. Each argument names one case exactly, as the
+test function is spelled in this file; --list prints the available names.
+USAGE
+}
+
+known_test() {
+  local name="$1" candidate
+  for candidate in "${TESTS[@]}"; do
+    [ "$candidate" = "$name" ] && return 0
+  done
+  return 1
+}
+
+SELECTED_COUNT=0
+SELECTED=()
+for requested in "$@"; do
+  case "$requested" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  --list)
+    printf '%s\n' "${TESTS[@]}"
+    exit 0
+    ;;
+  esac
+  known_test "$requested" || {
+    echo "FAIL: unknown test name: $requested" >&2
+    echo "run with --list to see the ${#TESTS[@]} available names" >&2
+    exit 1
+  }
+  SELECTED+=("$requested")
+  SELECTED_COUNT=$((SELECTED_COUNT + 1))
+done
+
+if [ "$SELECTED_COUNT" -eq 0 ]; then
+  SELECTED=("${TESTS[@]}")
+  SELECTED_COUNT=${#TESTS[@]}
+fi
+
+for selected_test in "${SELECTED[@]}"; do
+  "$selected_test"
+done
+
+if [ "$#" -eq 0 ]; then
+  echo "PASS: all post-merge cleanup states"
+else
+  echo "PASS: $SELECTED_COUNT selected post-merge cleanup states"
+fi

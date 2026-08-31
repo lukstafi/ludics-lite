@@ -544,6 +544,13 @@ topic:
 ~/.claude/skills/ship-pr/scripts/test-post-merge-cleanup.sh
 ```
 
+Naming one or more cases exactly — as `--list` spells them — runs only those, which is how to
+iterate on a single failure; an unrecognized name is refused before any case runs.
+
+```bash
+~/.claude/skills/ship-pr/scripts/test-post-merge-cleanup.sh test_safe_topic_deletion
+```
+
 A squash or rebase merge does not preserve ancestry. After independently confirming that merge,
 make the exception explicit and leave its reason in the transcript:
 
