@@ -427,9 +427,9 @@ concurrent sibling merges "the current tip" is a moving target and the wait neve
 (on 2026-08-30 seven wave workers each chased it for 100–120 minutes; every one ended unjudged
 or had to be killed). If a wave worker checks anything post-merge, it is the single run for its
 OWN merge commit, read once — a run superseded or cancelled by a later sibling merge is the
-integration loop's business. In standalone use — no coordinator, no loop — this paragraph does
-NOT apply: the `base --wait` integration check below remains mandatory after any merge whose
-base had moved, and it terminates there because nothing else is moving the tip.
+integration loop's business. In standalone use — no coordinator, no loop — an after-the-fact
+check still exists, but it is SINGULAR there too: one watcher per machine, not one wait per
+merger (below).
 
 **Still read the line before letting the merge stand.** On staging#488 (2026-08-28) sixteen review
 rounds ran against a base that had gone 136 commits stale, `master` had meanwhile edited the very
@@ -445,23 +445,34 @@ is the policy, not a corner cut. A count the compare API could not answer prints
 is not "not behind": check it by hand.
 
 **Standalone use has no coordinator running that loop**, so the after-the-fact check falls to
-this skill's own tail, and after any merge whose base had moved — stale-warned or merely a few
-commits behind — it is not optional; nor is it a plain
-`base` call, which seconds after a merge answers with the *previous* tip's green while the
-merge's own run is still queued or not yet created (the same window as the force-push `ABSENT`
-trap above). The integration check is:
+this skill's own tail — but to exactly ONE session per machine, never to every merger. (For a
+few hours on 2026-08-31 the rule read "every merge onto a moved base blocks on its own
+`base --wait`"; since a base has always moved a little, every standalone session sat foreground
+on the same remote CI cycle, and a red would have drawn N parallel fixes.) A plain `base` call
+is still not the check — seconds after a merge it answers with the *previous* tip's green while
+the merge's own run is queued or not yet created (the same window as the force-push `ABSENT`
+trap above). The handoff is:
 
 ```bash
-~/.claude/skills/ship-pr/scripts/pr-review.sh base <owner>/<repo> [branch] --wait
+~/.claude/skills/ship-pr/scripts/master-watch.sh <owner>/<repo> [branch]
 ```
 
-which holds until the current tip has its own verdict — every non-advisory workflow judged at
-the tip, nothing mid-flight — settling for an older verdict only when no run for the tip appears
+If another watcher already holds the repo on this machine, it says so and exits 0 at once — the
+running wait re-reads the tip every round, so it covers your merge too, and your session is
+done. If you acquired the lock, you are the watcher: the underlying `pr-review.sh base --wait`
+holds until the current tip has its own verdict — every non-advisory workflow judged at the
+tip, nothing mid-flight — settling for an older verdict only when no run for the tip appears
 within a grace and none is running (`SHIP_PR_BASE_ABSENT_GRACE`, 5 min: a docs-only merge under
-`paths-ignore` legitimately never gets one, and the settling is said out loud). If the wait
-ceiling runs out with the tip still unjudged it exits 4 — no verdict, not green, whatever older
-greens the report lists. A red it turns up is yours to fix forward now, not the next session's
-to discover. The warning line names the exact call when it fires.
+`paths-ignore` legitimately never gets one, and the settling is said out loud). Background the
+call and keep working; read its verdict before ending the session. If the wait ceiling runs out
+with the tip still unjudged it exits 4 — no verdict, not green, whatever older greens the report
+lists.
+
+A red the watch turns up is the watcher's to fix forward — but the lock is machine-local, so
+**claim it before touching anything**: check whether a fix is already in flight (an open PR or
+issue naming the failing workflow and master commit), and if not, file a brief claiming issue —
+failing workflow, `master@<sha>`, "being fixed here" — before starting. Finding an existing
+claim means someone else owns it; leave it to them.
 
 ### The override
 
@@ -603,16 +614,14 @@ replace the ancestry guard with `git branch -d`: `-d` may test a configured upst
 If the harness blocks the merge itself, that is a permission gate, not a failure: explain what you
 were doing, give the command, and let the user decide. Never work around it.
 
-After merging: refresh the base for the next branch (`git fetch origin`, then branch off
-`origin/master` again) — and since your merge is what that base now carries, `base` is worth one
-more call here, before the next branch inherits it. After a merge onto a base that had moved at
-all — stale-warned or merely a few commits behind — that call is `base <owner>/<repo> --wait`,
-not the plain read: a plain call seconds after a merge answers with the previous tip's green
-whatever the drift size, and the wait is the standalone integration check the roll-forward
-policy leans on (the stale-base section owns the why). Background it and keep working — it
-returns in seconds when the tip is already judged, and holds only while a run is genuinely in
-flight. Then tear down any scratch worktrees the work created on remote machines, and run the
-`after-merge` brainstorm while the session's friction is still in context.
+After merging: run the `after-merge` brainstorm FIRST, while the session's friction is still in
+context — CI watching never delays or displaces it. Then refresh the base for the next branch
+(`git fetch origin`, then branch off `origin/master` again), tear down any scratch worktrees the
+work created on remote machines, and hand trailing-CI duty to the singleton watcher —
+`master-watch.sh <owner>/<repo>`, backgrounded (the stale-base section owns the why, the claim
+protocol for a red, and why a plain `base` read right after a merge would answer with the
+previous tip's green). If it reports another session already watching, that is the good outcome:
+nothing further is owed here.
 
 ## Multi-PR arcs
 
