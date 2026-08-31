@@ -427,9 +427,8 @@ concurrent sibling merges "the current tip" is a moving target and the wait neve
 (on 2026-08-30 seven wave workers each chased it for 100–120 minutes; every one ended unjudged
 or had to be killed). If a wave worker checks anything post-merge, it is the single run for its
 OWN merge commit, read once — a run superseded or cancelled by a later sibling merge is the
-integration loop's business. In standalone use — no coordinator, no loop — an after-the-fact
-check still exists, but it is SINGULAR there too: one watcher per machine, not one wait per
-merger (below).
+integration loop's business. In standalone use — no coordinator, no loop — trailing CI is
+likewise not the merger's to watch: it belongs to the CI-red triage routine (below).
 
 **Still read the line before letting the merge stand.** On staging#488 (2026-08-28) sixteen review
 rounds ran against a base that had gone 136 commits stale, `master` had meanwhile edited the very
@@ -444,35 +443,22 @@ branch is shared), push, and let the checks re-run first; otherwise a clean merg
 is the policy, not a corner cut. A count the compare API could not answer prints `UNKNOWN`, which
 is not "not behind": check it by hand.
 
-**Standalone use has no coordinator running that loop**, so the after-the-fact check falls to
-this skill's own tail — but to exactly ONE session per machine, never to every merger. (For a
-few hours on 2026-08-31 the rule read "every merge onto a moved base blocks on its own
-`base --wait`"; since a base has always moved a little, every standalone session sat foreground
-on the same remote CI cycle, and a red would have drawn N parallel fixes.) A plain `base` call
-is still not the check — seconds after a merge it answers with the *previous* tip's green while
-the merge's own run is queued or not yet created (the same window as the force-push `ABSENT`
-trap above). The handoff is:
+**Standalone use does not watch CI at all** (since 2026-08-31): trailing failures on merged
+master belong to the **"ocannl-staging CI-red triage" cloud routine** — fired by a GitHub
+webhook on the repo's completed workflow runs, with a daily backstop sweep. On a master red it
+checks for an existing claim, claims the failure via an issue on the staging repo (`CI red on
+master@<short-sha>: <workflow>`), and either opens a `ci-fix/*` PR (it never merges its own
+PRs) or posts its diagnosis to the claiming issue. So after `merge` confirms `merged`, this
+session's verification is over: do not run `base --wait`, do not watch master's subsequent
+workflows. (Briefly that day the rule was the opposite — every merger blocked on its own
+`base --wait` — which stacked N sessions on the same remote CI cycle; the routine is the
+single owner that replaced it.)
 
-```bash
-~/.claude/skills/ship-pr/scripts/master-watch.sh <owner>/<repo> [branch]
-```
-
-If another watcher already holds the repo on this machine, it says so and exits 0 at once — the
-running wait re-reads the tip every round, so it covers your merge too, and your session is
-done. If you acquired the lock, you are the watcher: the underlying `pr-review.sh base --wait`
-holds until the current tip has its own verdict — every non-advisory workflow judged at the
-tip, nothing mid-flight — settling for an older verdict only when no run for the tip appears
-within a grace and none is running (`SHIP_PR_BASE_ABSENT_GRACE`, 5 min: a docs-only merge under
-`paths-ignore` legitimately never gets one, and the settling is said out loud). Background the
-call and keep working; read its verdict before ending the session. If the wait ceiling runs out
-with the tip still unjudged it exits 4 — no verdict, not green, whatever older greens the report
-lists.
-
-A red the watch turns up is the watcher's to fix forward — but the lock is machine-local, so
-**claim it before touching anything**: check whether a fix is already in flight (an open PR or
-issue naming the failing workflow and master commit), and if not, file a brief claiming issue —
-failing workflow, `master@<sha>`, "being fixed here" — before starting. Finding an existing
-claim means someone else owns it; leave it to them.
+Two local touchpoints remain. A red you happen to see — in the pre-branch `base` read, or
+anywhere else — is presumptively CLAIMED work: find the routine's claiming issue and any
+linked PR before touching anything, and take over only when the issue shows triage stopped
+short and nobody else picked it up (say so there first). And a `ci-fix/*` PR the routine
+opened is finished work like any other: land it through this skill.
 
 ### The override
 
@@ -615,13 +601,12 @@ If the harness blocks the merge itself, that is a permission gate, not a failure
 were doing, give the command, and let the user decide. Never work around it.
 
 After merging: run the `after-merge` brainstorm FIRST, while the session's friction is still in
-context — CI watching never delays or displaces it. Then refresh the base for the next branch
-(`git fetch origin`, then branch off `origin/master` again), tear down any scratch worktrees the
-work created on remote machines, and hand trailing-CI duty to the singleton watcher —
-`master-watch.sh <owner>/<repo>`, backgrounded (the stale-base section owns the why, the claim
-protocol for a red, and why a plain `base` read right after a merge would answer with the
-previous tip's green). If it reports another session already watching, that is the good outcome:
-nothing further is owed here.
+context. Then refresh the base for the next branch (`git fetch origin`, then branch off
+`origin/master` again) and tear down any scratch worktrees the work created on remote machines.
+Nothing further is owed: trailing CI on the new tip is the CI-red triage routine's business
+(the stale-base section owns the division of responsibilities and the takeover protocol) — and
+a plain `base` read seconds after a merge would only report the previous tip's green anyway,
+so do not treat one as a post-merge verdict.
 
 ## Multi-PR arcs
 
