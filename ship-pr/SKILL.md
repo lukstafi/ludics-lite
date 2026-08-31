@@ -525,33 +525,73 @@ conflict you must resolve.
 
 Then clean up, but not with `gh pr merge --delete-branch`: from a worktree its cleanup fails *after*
 the merge has landed ("fatal: 'master' is already used by worktree"), leaving the branch behind and
-the failure looking like a failed merge. Three rules carry the rest.
+the failure looking like a failed merge. Run the executable sequence instead:
 
-Delete the REMOTE branch first, then fast-forward the local `master`, and only then `git branch
--d`: `-d` tests the branch's UPSTREAM and falls back to HEAD only when there is none, so with
-`origin/<branch>` still present it checks a tautology and drops an unmerged topic with a warning.
+```bash
+~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh <main-checkout> <session-worktree> <branch>
+```
 
-Advancing that local `master` depends on who has it checked out, so inspect `git -C <main> worktree
-list --porcelain` for `branch refs/heads/master`. If NO worktree has it out, use `git -C <main>
-fetch origin master:master`; if one does, that fetch is refused and the exact complement is `git -C
-<master-owner> merge --ff-only origin/master` in the owning worktree.
+It fetches and proves the ordinary topic is an ancestor of `origin/master` before deleting
+anything, deletes the remote branch, advances local `master` according to which worktree owns it,
+detaches and unregisters the session worktree into a sibling recovery archive, rechecks ancestry
+against updated local `master`, and
+deletes the local branch independently of its configured upstream. Its scratch-repository test
+covers unchecked-out `master`, `master` owned by the primary checkout, `master` owned by another
+worktree, safe deletion while the primary checkout is off `master`, and refusal of an unmerged
+topic:
 
-With the upstream gone, `-d` is a real "merged into master" check only when the checkout's HEAD IS
-`master`. Off `master` it is not, so require `git -C <main> merge-base --is-ancestor <branch>
-master` to pass and then use `-D`, which only performs the deletion (`-D` after an explicit
-ancestry check is also what follows an independently confirmed squash or rebase merge, whose
-commits are not ancestors of `master`). `git -C <main>` anchors the working directory only — it
-says nothing about which branch is checked out there, which is the volatile part during a wave, so
-it is never itself the safety check. Anchor anyway, because `worktree remove` deletes the current
-directory when run from inside it and any later unanchored command dies with "Unable to read
-current working directory". One more refusal survives all of the above: git will not delete a
-branch any worktree has checked out ("cannot delete branch ... used by worktree") — and in a
-worktree session that worktree is normally the session's own. Detach it first with `git -C
-<session-worktree> checkout --detach`; that is safe because the session worktree is disposable and
-the merge has already landed.
+```bash
+~/.claude/skills/ship-pr/scripts/test-post-merge-cleanup.sh
+```
 
-`docs/agent-notes.md` (Conventions) carries the full ordered sequence, verified end to end —
-follow it there rather than reconstructing it.
+A squash or rebase merge does not preserve ancestry. After independently confirming that merge,
+make the exception explicit and leave its reason in the transcript:
+
+```bash
+~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> \
+  --force-integrated "GitHub reports the PR squash-merged at <sha>"
+```
+
+The helper requires Git's transactional `update-ref` symbolic-ref commands, Perl for an atomic
+filesystem rename, the exact session-worktree root, a clean and unlocked session with no ignored
+local data, and one shared
+fetch/push endpoint for `origin`. It treats an already absent topic as a safe retry state and
+refuses an unreadable ref, a symbolic local/tracking ref, or a remote tip newer than the local
+branch; an absent remote topic sends no deletion, while present remote and local deletions carry
+exact-OID leases. It also fetches `master`
+explicitly, independent of the remote's configured fetch map, and proves the local ref can
+fast-forward before any remote deletion. A clean worktree keeps `master` continuously reserved
+while the named ref is conditionally updated and its tree refreshed; when no worktree owns it, the
+helper creates a temporary owner for that same critical section. Remote topic deletion is leased
+on the observed topic OID and followed by fresh `master` and local-topic reads; if either changed
+or `master` became unreadable, the current topic recovery ref is restored before refusal. The
+validated tip also remains reachable under a direct `refs/ship-pr/recovery/` ref because no finite
+remote read can rule out a later base rollback; a divergent remote-tracking tip is retained
+separately under `refs/ship-pr/tracking-recovery/` before pruning. The master-owner refresh uses a non-destructive porcelain
+fast-forward through a helper-only reservation and a conditional named-ref update. A checked-out
+master owner must contain no local data, including ignored files; after the update it is prepared
+at the new tree and reattached with a detached-HEAD compare-and-swap before the reservation is
+removed. The helper probes that compare-and-swap capability before any branch mutation and refuses
+older Git versions cleanly. The helper also checks ignored descendants when a directory is
+replaced, refuses a topic owned by any other worktree, and transfers
+topic ownership to a temporary reservation through local ref deletion, and removes matching
+remote-tracking and only the standard keys from repository-local upstream configuration. Included, global,
+per-worktree, and custom branch configuration is inherited policy and is deliberately not edited.
+Rather than recursively deleting a directory that can receive a last-moment ignored write, it
+refuses initialized submodules and session-local worktree refs before mutation, preallocates sibling archives before ref mutation,
+reserves the session-recovery ref namespace, atomically renames the session into one without
+directory-nesting semantics,
+retains the archived session's final HEAD under `refs/ship-pr/session-recovery/`, and unregisters
+the now-missing worktree while holding the linked-worktree HEAD and pseudoref locks. Objects named
+by session pseudorefs or its HEAD reflog, plus the final index tree, are retained beneath the
+reserved `refs/ship-pr/session-recovery/` namespace; resolve-undo blobs receive direct recovery
+refs, and per-worktree configuration is copied into the archive. Remote-tracking reflog objects are
+retained under the topic recovery namespace before pruning, as are local-topic reflog objects before
+branch deletion; both sides of every retained reflog entry are covered. Late files or links at the vacated path are moved to the second archive
+before unregistering is retried. Do not reconstruct its state
+machine in prose or
+replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to
+`master`, making deletion either tautological or a false refusal after the worktree is already gone.
 
 If the harness blocks the merge itself, that is a permission gate, not a failure: explain what you
 were doing, give the command, and let the user decide. Never work around it.
