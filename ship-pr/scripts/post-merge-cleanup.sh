@@ -190,10 +190,15 @@ refuse_hidden_index_changes() {
     fail "could not allocate the $description skip-worktree snapshot"
   GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" ls-files -t -z \
     >"$MASTER_SKIP_PATHS_FILE" || fail "could not enumerate $description index flags"
+  # Clear the copied flag only for materialized paths: a skip-worktree entry with no file on disk
+  # is a sparse checkout's intentional absence, and clearing it would make the probe read a clean
+  # sparse owner as "tracked file deleted". A materialized skip-worktree file still has its flag
+  # cleared, so an edit hidden behind the flag is still detected.
   while IFS= read -r -d '' entry; do
     case "$entry" in
     S\ *)
       path=${entry#S }
+      { [ -e "$worktree/$path" ] || [ -L "$worktree/$path" ]; } || continue
       GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" update-index \
         --no-skip-worktree -- "$path" || fail "could not clear a copied skip-worktree flag"
       ;;
@@ -772,12 +777,18 @@ lock_and_retain_session_metadata() {
 }
 
 scan_branch_owner() {
-  local target_ref="$1" worktree_list field current_worktree=""
+  # NUL-delimited fields: a valid worktree path (or lock reason) can contain a newline, and the
+  # line-based porcelain would truncate it — misreading which worktree owns the branch. Command
+  # substitution strips NUL bytes, so the listing goes through a snapshot file instead.
+  local target_ref="$1" field current_worktree=""
   BRANCH_OWNER=""
   BRANCH_OWNER_COUNT=0
   SESSION_LOCKED=0
-  worktree_list=$(git -C "$MAIN" worktree list --porcelain) || fail "could not inspect registered worktrees"
-  while IFS= read -r field; do
+  WORKTREE_LIST_FILE=$(mktemp "$TEMP_ROOT/ship-pr-worktree-list.XXXXXX") ||
+    fail "could not allocate the worktree list snapshot"
+  git -C "$MAIN" worktree list --porcelain -z >"$WORKTREE_LIST_FILE" ||
+    fail "could not inspect registered worktrees"
+  while IFS= read -r -d '' field; do
     case "$field" in
     worktree\ *) current_worktree=${field#worktree } ;;
     locked*) [ "$current_worktree" != "$SESSION" ] || SESSION_LOCKED=1 ;;
@@ -786,7 +797,9 @@ scan_branch_owner() {
       BRANCH_OWNER="$current_worktree"
       BRANCH_OWNER_COUNT=$((BRANCH_OWNER_COUNT + 1))
     fi
-  done <<<"$worktree_list"
+  done <"$WORKTREE_LIST_FILE"
+  unlink "$WORKTREE_LIST_FILE" || fail "could not remove the worktree list snapshot"
+  WORKTREE_LIST_FILE=""
 }
 
 restore_remote_topic() {
@@ -822,6 +835,9 @@ cleanup_reservations() {
   fi
   if [ -n "${CHANGED_PATHS_FILE:-}" ] && [ -f "$CHANGED_PATHS_FILE" ]; then
     unlink "$CHANGED_PATHS_FILE" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${WORKTREE_LIST_FILE:-}" ] && [ -f "$WORKTREE_LIST_FILE" ]; then
+    unlink "$WORKTREE_LIST_FILE" >/dev/null 2>&1 || true
   fi
   if [ -n "${MASTER_INDEX_PROBE:-}" ]; then
     unlink "$MASTER_INDEX_PROBE.lock" >/dev/null 2>&1 || true
@@ -899,6 +915,7 @@ PRIVATE_NAMESPACE_BLOCKERS=()
 CONFIG_LOCK=""
 CONFIG_LOCK_OWNED=0
 CHANGED_PATHS_FILE=""
+WORKTREE_LIST_FILE=""
 MASTER_INDEX_PROBE=""
 MASTER_SKIP_PATHS_FILE=""
 trap cleanup_reservations EXIT
@@ -1113,8 +1130,14 @@ MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || tr
   fail "master owner changed branches before its fast-forward: $MASTER_OWNER"
 MASTER_OWNER_HEAD=$(git -C "$MASTER_OWNER" rev-parse HEAD) || fail "cannot read master owner HEAD"
 [ "$MASTER_OWNER_HEAD" = "$LOCAL_MASTER" ] || fail "master owner's HEAD disagrees with local master"
+# Ignored files are deliberately NOT part of this cleanliness gate: on the standard layout the
+# primary checkout owns master and always carries build caches and ignored config, so requiring
+# "no ignored data anywhere" makes the helper unusable there. Ignored data is only at risk on
+# paths the fast-forward actually touches, and those are refused by the changed-path collision
+# scan below; the locked refresh itself runs checkout --no-overwrite-ignore, which refuses loudly
+# if ignored data appears on a touched path after that scan.
 MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status \
-  --porcelain --untracked-files=normal --ignored=matching) ||
+  --porcelain --untracked-files=normal) ||
   fail "could not inspect master owner cleanliness"
 [ -z "$MASTER_OWNER_STATUS" ] || fail "master owner is dirty; clean it before cleanup: $MASTER_OWNER"
 refuse_hidden_index_changes "$MASTER_OWNER" "master owner"
@@ -1166,7 +1189,7 @@ if ! git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$L
       fail "local master moved and its locked owner could not follow the concurrent tip"
     MASTER_OWNER_STATUS=$(GIT_INDEX_FILE="$MASTER_OWNER_INDEX_LOCK" \
       git -C "$ORIGINAL_MASTER_OWNER" status \
-        --porcelain --untracked-files=normal --ignored=matching) ||
+        --porcelain --untracked-files=normal) ||
       fail "could not recheck the master owner after its ref moved"
     install_master_owner_refresh
     [ -z "$MASTER_OWNER_STATUS" ] ||
@@ -1189,8 +1212,11 @@ if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
     refresh_master_owner_to "$MASTER_DURING_REFRESH" ||
       fail "master moved during refresh and its owner could not follow the concurrent tip"
   fi
+  # Ignored files pass here for the same reason as the preflight gate: pre-existing ignored data
+  # on untouched paths is expected on the standard layout, and touched paths were either refused
+  # by the collision scan or protected by the refresh's --no-overwrite-ignore.
   MASTER_OWNER_STATUS=$(GIT_INDEX_FILE="$MASTER_OWNER_INDEX_LOCK" git -C "$ORIGINAL_MASTER_OWNER" status \
-    --porcelain --untracked-files=normal --ignored=matching) ||
+    --porcelain --untracked-files=normal) ||
     fail "could not recheck the locked master owner"
   install_master_owner_refresh
   [ -z "$MASTER_OWNER_STATUS" ] ||

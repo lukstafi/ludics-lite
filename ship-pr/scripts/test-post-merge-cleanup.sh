@@ -649,22 +649,23 @@ test_concurrent_ignored_master_collision() {
   echo "PASS: concurrent ignored master collision is refused"
 }
 
+# On the standard single-main-checkout layout the master owner ALWAYS carries ignored data (build
+# caches, local config). Ignored files on paths the fast-forward does not touch are not at risk,
+# so they must pass; ignored data on touched paths keeps its refusal
+# (test_ignored_master_collision_refusal, test_ignored_master_descendant_refusal).
 test_preexisting_ignored_master_data() {
-  local local_master
   setup_case preexisting-ignored-master-data merge other
-  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
   echo unrelated.log >>"$CASE_MAIN/.git/info/exclude"
   echo local-data >"$CASE_MASTER_OWNER/unrelated.log"
 
-  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
-    fail "master with pre-existing ignored data was advanced into an unretryable state"
-  fi
-  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
-    "pre-existing ignored master data must be refused before the master ref changes"
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse HEAD)" \
+    "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)" \
+    "master owner with untouched ignored data must be fast-forwarded"
   assert_eq "$(sed -n '1p' "$CASE_MASTER_OWNER/unrelated.log")" local-data \
-    "pre-existing ignored master data must survive"
-  assert_topic_preserved
-  echo "PASS: pre-existing ignored master data is refused before mutation"
+    "ignored master data on untouched paths must survive the fast-forward"
+  echo "PASS: ignored master data on untouched paths passes cleanup intact"
 }
 
 test_master_owner_switch_refusal() {
@@ -1344,6 +1345,111 @@ test_skip_worktree_master_refusal() {
     "skip-worktree master-owner data must survive refusal"
   assert_topic_preserved
   echo "PASS: skip-worktree master-owner edits are refused before ownership handoff"
+}
+
+# A clean sparse-checkout master owner: its skip-worktree entries with no file on disk are
+# intentional absence, not hidden deletions, so the hidden-change probe must pass it — while
+# test_skip_worktree_master_refusal above keeps proving an EDITED materialized skip-worktree
+# file is still refused. The locked refresh must advance the owner without materializing the
+# sparse-absent paths or dropping their flags.
+test_sparse_master_owner() {
+  local root remote main session owner integrator
+  root="$TEST_ROOT/sparse-master-owner"
+  remote="$root/remote.git"
+  main="$root/main"
+  session="$root/session"
+  owner="$root/master-owner"
+  integrator="$root/integrator"
+  mkdir -p "$root"
+  git init --bare "$remote" >/dev/null
+  git init -b master "$main" >/dev/null
+  git_config "$main"
+  echo base >"$main/value"
+  mkdir "$main/docs"
+  echo manual >"$main/docs/manual"
+  git -C "$main" add value docs/manual
+  git -C "$main" commit -m base >/dev/null
+  git -C "$main" remote add origin "$remote"
+  git -C "$main" push -u origin master >/dev/null
+  git -C "$main" branch topic
+  git -C "$main" worktree add "$session" topic >/dev/null
+  git_config "$session"
+  echo topic >>"$session/value"
+  git -C "$session" add value
+  git -C "$session" commit -m topic >/dev/null
+  git -C "$session" push -u origin topic >/dev/null
+  git clone --branch master "$remote" "$integrator" >/dev/null 2>&1
+  git_config "$integrator"
+  git -C "$integrator" merge --no-ff origin/topic -m "merge topic" >/dev/null
+  git -C "$integrator" push origin master >/dev/null
+  git -C "$main" checkout --detach >/dev/null
+  git -C "$main" worktree add "$owner" master >/dev/null
+  git -C "$owner" sparse-checkout set >/dev/null 2>&1
+  [ ! -e "$owner/docs/manual" ] || fail "sparse setup did not de-materialize docs/manual"
+  assert_eq "$(git -C "$owner" ls-files -t -- docs/manual)" "S docs/manual" \
+    "sparse setup must mark docs/manual skip-worktree"
+
+  "$HELPER" "$main" "$session" topic >/dev/null
+  assert_eq "$(git -C "$owner" rev-parse HEAD)" "$(git -C "$main" rev-parse refs/remotes/origin/master)" \
+    "sparse master owner must be fast-forwarded"
+  assert_eq "$(sed -n '2p' "$owner/value")" topic \
+    "materialized files must follow the fast-forward in a sparse owner"
+  [ ! -e "$owner/docs/manual" ] || fail "sparse-absent path must not be materialized by the refresh"
+  assert_eq "$(git -C "$owner" ls-files -t -- docs/manual)" "S docs/manual" \
+    "sparse-absent path must keep its skip-worktree flag through the refresh"
+  ! git -C "$main" show-ref --verify --quiet refs/heads/topic || fail "local topic must be deleted"
+  echo "PASS: clean sparse-checkout master owner is advanced without losing sparseness"
+}
+
+# Worktree pathnames can contain a newline; the line-based `worktree list --porcelain` truncates
+# them, so ownership validation must read the NUL-delimited listing. Both the session worktree
+# and the checked-out master owner live at newline-bearing paths here.
+test_newline_worktree_paths() {
+  local root remote main session owner integrator archive archive_count
+  root="$TEST_ROOT/newline-worktree-paths"
+  remote="$root/remote.git"
+  main="$root/main"
+  session="$root/session"$'\n'"wt"
+  owner="$root/master"$'\n'"owner"
+  integrator="$root/integrator"
+  mkdir -p "$root"
+  git init --bare "$remote" >/dev/null
+  git init -b master "$main" >/dev/null
+  git_config "$main"
+  echo base >"$main/value"
+  git -C "$main" add value
+  git -C "$main" commit -m base >/dev/null
+  git -C "$main" remote add origin "$remote"
+  git -C "$main" push -u origin master >/dev/null
+  git -C "$main" branch topic
+  git -C "$main" worktree add "$session" topic >/dev/null
+  git_config "$session"
+  echo topic >>"$session/value"
+  git -C "$session" add value
+  git -C "$session" commit -m topic >/dev/null
+  git -C "$session" push -u origin topic >/dev/null
+  git clone --branch master "$remote" "$integrator" >/dev/null 2>&1
+  git_config "$integrator"
+  git -C "$integrator" merge --no-ff origin/topic -m "merge topic" >/dev/null
+  git -C "$integrator" push origin master >/dev/null
+  git -C "$main" checkout --detach >/dev/null
+  git -C "$main" worktree add "$owner" master >/dev/null
+
+  "$HELPER" "$main" "$session" topic >/dev/null
+  [ ! -e "$session" ] || fail "newline session worktree was not removed"
+  assert_eq "$(git -C "$owner" rev-parse HEAD)" "$(git -C "$main" rev-parse refs/remotes/origin/master)" \
+    "newline-path master owner must be fast-forwarded"
+  assert_eq "$(git -C "$owner" symbolic-ref --short HEAD)" master \
+    "newline-path master owner must still own master"
+  ! git -C "$main" show-ref --verify --quiet refs/heads/topic || fail "local topic must be deleted"
+  archive_count=0
+  for archive in "$root"/.session*.ship-pr-recovery.*; do
+    [ -d "$archive" ] || continue
+    archive_count=$((archive_count + 1))
+    [ -f "$archive/worktree/value" ] || fail "newline session archive must retain tracked files"
+  done
+  assert_eq "$archive_count" 1 "cleanup must retain exactly one newline session archive"
+  echo "PASS: newline-bearing worktree paths are scanned and cleaned correctly"
 }
 
 test_master_active_operation_refusal() {
@@ -3153,6 +3259,8 @@ TESTS=(
   test_master_resolve_undo_refusal
   test_assume_unchanged_master_refusal
   test_skip_worktree_master_refusal
+  test_sparse_master_owner
+  test_newline_worktree_paths
   test_master_active_operation_refusal
   test_master_index_lock_refusal
   test_master_changed_path_failure_refusal

@@ -1095,6 +1095,9 @@ cmd_run_watch() {
     "\`gh run view <id>\`. For a PR's checks, prefer \`checks <pr> --wait\`." ;;
   esac
   case "$interval" in '' | *[!0-9]*) die "run watch: the interval must be seconds, got '$interval'" ;; esac
+  # `gh run watch` documents -i as seconds and defaults to 3; 0 would turn the quiet await into a
+  # rate-limit-burning busy loop of API reads for up to the full two-hour ceiling.
+  [ "$interval" -gt 0 ] || die "run watch: the interval must be at least 1 second, got '$interval'"
   [ -n "$repo" ] || repo="$REPO"
   [ -n "$repo" ] || repo=$(repo_from_cwd) || true
   [ -n "$repo" ] || die "run watch: name the repo (-R owner/name, --repo, or REPO=) —" \
@@ -1307,7 +1310,7 @@ summarize_checks() {
 # 0 = green or absent (nothing is red), 1 = RED, 3 = the API did not answer, 4 = no verdict yet
 # (still running, or every finished job was cancelled).
 gate_checks() {
-  local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now
+  local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining
   sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha)
   rc=$?
   if [ "$rc" -ne 0 ] || [ -z "$sha" ]; then
@@ -1338,7 +1341,13 @@ gate_checks() {
         "$((wait_for / 60)) min ($CHECK_PENDING check(s) running)"
       beat=$now
     fi
-    sleep "$CHECKS_INTERVAL"
+    # Capped at the remaining deadline, same as cmd_base and cmd_run_watch: an interval longer
+    # than what is left would sleep the process past the advertised ceiling before the clock is
+    # checked again.
+    remaining=$((deadline - now))
+    sleep_for="$CHECKS_INTERVAL"
+    [ "$sleep_for" -le "$remaining" ] || sleep_for="$remaining"
+    sleep "$sleep_for"
   done
   case "$VERDICT" in
   red) echo "build signal $REPO#$pr @${sha:0:8}: RED — $CHECK_RED of $CHECK_TOTAL build checks failed" ;;
@@ -1610,6 +1619,30 @@ cmd_merge() {
     "auto-merge. It will land when the base's required checks pass; do not treat it as landed."
 }
 
+# A branch name is data, not URL structure: `release#1` and `release&one` are valid refs, but
+# interpolated raw into a REST path or query the `#` truncates the request at the fragment and the
+# `&` splits it into another parameter — so `base` would read some OTHER branch's tip and runs.
+# Percent-encode every byte outside the unreserved set, keeping `/` literal (slashed branch names
+# are the common case, and a literal `/` is valid in both a path segment sequence and a query
+# value, while `+` is not — in a query it decodes as a space).
+encode_ref() {
+  # LC_ALL=C so the loop walks BYTES; the ordinal of a high byte sign-extends on some shells, so
+  # mask it back to one byte before formatting (UTF-8 branch names encode per byte).
+  local LC_ALL=C s="$1" out="" c i o
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    case "$c" in
+    [a-zA-Z0-9._~/-]) out+="$c" ;;
+    *)
+      printf -v o '%d' "'$c"
+      printf -v c '%%%02X' "$((o & 255))"
+      out+="$c"
+      ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 # The other half of #694: the confusion actually lands on whoever branches off a broken master.
 # Read the base's own CI before starting work, not only before merging.
 #
@@ -1628,7 +1661,7 @@ cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
   local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
   local nogo_at_tip=0 last_tip="" grace_from confirm wf="" wid wname part sleep_for remaining
-  local norun=0 tip_seen_at tip_age hold
+  local norun=0 tip_seen_at tip_age hold ebranch
   local started now beat waited_note="" no_tip_verdict=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1652,6 +1685,7 @@ cmd_base() {
     [ $? -eq 0 ] && [ -n "$branch" ] || fail 3 "could not read $REPO's default branch" \
       "($(gh_err_line)) — the base's health is UNKNOWN, which is not 'fine'."
   fi
+  ebranch=$(encode_ref "$branch")
   started=$(date +%s)
   beat=$started
   grace_from=$started
@@ -1659,7 +1693,7 @@ cmd_base() {
     red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0 norun=0
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
-    tip=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || tip=""
+    tip=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || tip=""
     # Without --wait the tip only decorates the report, so a failed read costs the "not the tip"
     # notes. Under --wait it is the QUESTION — which commit needs the verdict — and an unknown
     # tip would idle to the absent-run grace and then settle for an older green, exit 0, having
@@ -1686,10 +1720,13 @@ cmd_base() {
     while IFS=$'\t' read -r wid wname; do
       [ -n "$wid" ] || continue
       is_advisory "$wname" && continue
+      # The workflow ID leads each row so the fold can group by it: two workflow FILES can share
+      # one display name, and a name-keyed fold would collapse them into a single row — the
+      # first-listed one's green masking the other still running or red (round 9).
       part=$(gh_retry read api \
-        "repos/$REPO/actions/workflows/$wid/runs?branch=$branch&event=push&per_page=10" \
-        --jq '.workflow_runs[] | [.name, .status, (.conclusion // "pending"), .head_sha,
-              .created_at, (.html_url // "-")] | @tsv')
+        "repos/$REPO/actions/workflows/$wid/runs?branch=$ebranch&event=push&per_page=10" \
+        --jq '.workflow_runs[] | [(.workflow_id | tostring), .name, .status,
+              (.conclusion // "pending"), .head_sha, .created_at, (.html_url // "-")] | @tsv')
       rc=$?
       [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's '$wname' runs on $branch" \
         "($(gh_err_line)); the base's health is UNKNOWN, which is NOT 'green'."
@@ -1718,24 +1755,25 @@ cmd_base() {
       # earlier tip). Same empty-field rule as build_checks: a workflow with no completed run yet
       # leaves these columns unset, and unset prints as empty, which `IFS=$'\t' read` would
       # collapse.
+      # Grouped by the leading workflow ID — the name is display only (two files can share it).
       raw=$(awk -F'\t' '
         $1 == "" { next } # the per-workflow assembly ends with a newline, and an empty record
-                          # here becomes a phantom workflow whose empty name shifts every later
+                          # here becomes a phantom workflow whose empty id shifts every later
                           # field left through tab-IFS (seen live: a workflow named "pending")
-        { nm=$1
-          if (!(nm in seen)) { seen[nm]=1; order[++n]=nm; lstatus[nm]=$2; lsha[nm]=$4 }
-          if ($2 == "completed" && !(nm in done)) { done[nm]=1; c[nm]=$3; csha[nm]=$4; cw[nm]=$5; cu[nm]=$6 }
-          if ($2 == "completed" && !(nm in vdone) && \
-              ($3 == "failure" || $3 == "timed_out" || $3 == "startup_failure" || \
-               $3 == "success" || $3 == "skipped" || $3 == "neutral")) {
-            vdone[nm]=1; v[nm]=$3; vs[nm]=$4; vw[nm]=$5; vu[nm]=$6 }
+        { k=$1
+          if (!(k in seen)) { seen[k]=1; order[++n]=k; nm[k]=$2; lstatus[k]=$3; lsha[k]=$5 }
+          if ($3 == "completed" && !(k in done)) { done[k]=1; c[k]=$4; csha[k]=$5; cw[k]=$6; cu[k]=$7 }
+          if ($3 == "completed" && !(k in vdone) && \
+              ($4 == "failure" || $4 == "timed_out" || $4 == "startup_failure" || \
+               $4 == "success" || $4 == "skipped" || $4 == "neutral")) {
+            vdone[k]=1; v[k]=$4; vs[k]=$5; vw[k]=$6; vu[k]=$7 }
         }
-        END { for (i=1;i<=n;i++) { nm=order[i]
-            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", nm, lstatus[nm], lsha[nm],
-              (nm in done ? c[nm] : "pending"), (nm in done ? csha[nm] : "-"),
-              (nm in done ? cw[nm] : "-"), (nm in done ? cu[nm] : "-"),
-              (nm in vdone ? v[nm] : "-"), (nm in vdone ? vs[nm] : "-"),
-              (nm in vdone ? vw[nm] : "-"), (nm in vdone ? vu[nm] : "-") } }
+        END { for (i=1;i<=n;i++) { k=order[i]
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", nm[k], lstatus[k], lsha[k],
+              (k in done ? c[k] : "pending"), (k in done ? csha[k] : "-"),
+              (k in done ? cw[k] : "-"), (k in done ? cu[k] : "-"),
+              (k in vdone ? v[k] : "-"), (k in vdone ? vs[k] : "-"),
+              (k in vdone ? vw[k] : "-"), (k in vdone ? vu[k] : "-") } }
       ' <<<"$raw")
       while IFS=$'\t' read -r name status sha concl csha cwhen curl vconcl vsha vwhen vurl; do
         [ -n "$name" ] || continue
@@ -1794,7 +1832,7 @@ cmd_base() {
     # tip read and this check turns this red into an older tip's red — exactly the shape this
     # gate exists to keep waiting on — so on a moved (or unconfirmable) tip, poll again instead.
     if [ "$red_at_tip" -gt 0 ]; then
-      confirm=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || confirm=""
+      confirm=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || confirm=""
       [ "$confirm" = "$tip" ] && break
     fi
     now=$(date +%s)
@@ -1833,7 +1871,7 @@ cmd_base() {
         # moved meanwhile; otherwise fall through to the sleep and let the next round re-read
         # everything (the tip-change branch above restarts the grace).
         if [ -z "$hold" ]; then
-          confirm=$(gh_retry read api "repos/$REPO/commits/$branch" --jq .sha) || confirm=""
+          confirm=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || confirm=""
           [ "$confirm" = "$tip" ] && break
         fi
       # Nothing running and the tip unjudged. A tip run that completed STOPPED (cancelled/stale)
