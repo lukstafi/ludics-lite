@@ -179,6 +179,14 @@ default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it) outlasts the
 ceiling. Spell the repo out, as above — this is the backgrounded call that cwd inference cannot
 serve.
 
+**Never pipe a gate command** — `watch`, `poll`, `checks`, `base`, `merge` — through `tail`, `head`
+or anything else: the pipeline reports the LAST command's status, so the script's exit code (2 for
+a usage error, 1 for red, 3 transport, 4 no verdict) is replaced by the pager's 0, and the harness
+then reports a clean exit for a call that never ran. On 2026-09-01 a `checks 587 --repo …` — wrong
+option, `checks` takes the repo through `REPO=` — died on stderr and the run was recorded as
+exit 0, which reads exactly like a passing build gate. Let these commands write straight to the
+output file, where the message is anyway.
+
 Read its exit code, which is three-valued: **0** = act on what it printed; **1** = the window
 passed quietly, so hand the watermark it printed to the next `watch` and keep working meanwhile;
 **3** = it did not read the PR (API trouble), which is *not* quiet — nothing was observed, so
