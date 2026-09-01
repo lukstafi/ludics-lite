@@ -170,7 +170,7 @@ refuse_index_resolve_undo() {
 }
 
 refuse_hidden_index_changes() {
-  local worktree="$1" description="$2" index_path index_dir entry path
+  local worktree="$1" description="$2" index_path index_dir entry path sparse_enabled
   index_path=$(git -C "$worktree" rev-parse --git-path index) ||
     fail "could not locate $description index: $worktree"
   case "$index_path" in
@@ -190,20 +190,49 @@ refuse_hidden_index_changes() {
     fail "could not allocate the $description skip-worktree snapshot"
   GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" ls-files -t -z \
     >"$MASTER_SKIP_PATHS_FILE" || fail "could not enumerate $description index flags"
-  # Clear the copied flag only for materialized paths: a skip-worktree entry with no file on disk
-  # is a sparse checkout's intentional absence, and clearing it would make the probe read a clean
-  # sparse owner as "tracked file deleted". A materialized skip-worktree file still has its flag
-  # cleared, so an edit hidden behind the flag is still detected.
+  # Clear the copied flag for every MATERIALIZED skip-worktree path, so an edit hidden behind the
+  # flag is detected. An ABSENT skip-worktree path is ambiguous: a sparse checkout's intentional
+  # absence, or a deletion hidden behind `update-index --skip-worktree`. What separates them is
+  # the active sparse-checkout rules — an absent entry the rules would materialize, or any absent
+  # entry when sparse checkout is not enabled at all, is a hidden deletion, and clearing its flag
+  # lets diff-files report it. When the rules cannot be read (older Git, unreadable patterns),
+  # every absent flag is cleared: the conservative refusal, never the silent pass.
+  MASTER_SPARSE_ABSENT_FILE=$(mktemp "$index_dir/.ship-pr-sparse-absent.XXXXXX") ||
+    fail "could not allocate the $description sparse-absence snapshot"
   while IFS= read -r -d '' entry; do
     case "$entry" in
     S\ *)
       path=${entry#S }
-      { [ -e "$worktree/$path" ] || [ -L "$worktree/$path" ]; } || continue
-      GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" update-index \
-        --no-skip-worktree -- "$path" || fail "could not clear a copied skip-worktree flag"
+      if [ -e "$worktree/$path" ] || [ -L "$worktree/$path" ]; then
+        GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" update-index \
+          --no-skip-worktree -- "$path" || fail "could not clear a copied skip-worktree flag"
+      else
+        printf '%s\0' "$path" >>"$MASTER_SPARSE_ABSENT_FILE" ||
+          fail "could not record an absent $description skip-worktree path"
+      fi
       ;;
     esac
   done <"$MASTER_SKIP_PATHS_FILE"
+  if [ -s "$MASTER_SPARSE_ABSENT_FILE" ]; then
+    sparse_enabled=$(git -C "$worktree" config --get --type=bool core.sparseCheckout 2>/dev/null) ||
+      sparse_enabled=false
+    MASTER_SPARSE_SUSPECT_FILE=$(mktemp "$index_dir/.ship-pr-sparse-suspect.XXXXXX") ||
+      fail "could not allocate the $description sparse-match snapshot"
+    if [ "$sparse_enabled" != true ] ||
+      ! git -C "$worktree" sparse-checkout check-rules -z \
+        <"$MASTER_SPARSE_ABSENT_FILE" >"$MASTER_SPARSE_SUSPECT_FILE" 2>/dev/null; then
+      cp "$MASTER_SPARSE_ABSENT_FILE" "$MASTER_SPARSE_SUSPECT_FILE" ||
+        fail "could not snapshot the $description absent skip-worktree paths"
+    fi
+    while IFS= read -r -d '' path; do
+      GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" update-index \
+        --no-skip-worktree -- "$path" || fail "could not clear a copied skip-worktree flag"
+    done <"$MASTER_SPARSE_SUSPECT_FILE"
+    unlink "$MASTER_SPARSE_SUSPECT_FILE" || fail "could not remove the sparse-match snapshot"
+    MASTER_SPARSE_SUSPECT_FILE=""
+  fi
+  unlink "$MASTER_SPARSE_ABSENT_FILE" || fail "could not remove the sparse-absence snapshot"
+  MASTER_SPARSE_ABSENT_FILE=""
   unlink "$MASTER_SKIP_PATHS_FILE" || fail "could not remove the skip-worktree snapshot"
   MASTER_SKIP_PATHS_FILE=""
   GIT_INDEX_FILE="$MASTER_INDEX_PROBE" git -C "$worktree" update-index -q --really-refresh ||
@@ -250,8 +279,26 @@ reserve_master_owner_handoff() {
 }
 
 prepare_master_owner_refresh() {
+  local owner_git_dir source
   MASTER_REFRESH_GIT_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-master-refresh.XXXXXX") || return 1
   printf '%s\n' "$LOCAL_MASTER" >"$MASTER_REFRESH_GIT_DIR/HEAD" || return 1
+  # The refresh checkout resolves per-worktree configuration and sparse-checkout patterns against
+  # ITS GIT_DIR, so the owner's copies ride along: without them a sparse owner's checkout runs
+  # with core.sparseCheckout unset and materializes (and un-flags) any sparse-absent path the
+  # fast-forward changes. A symbolic source refuses the whole preparation rather than following
+  # the link.
+  owner_git_dir=$(git -C "$ORIGINAL_MASTER_OWNER" rev-parse --absolute-git-dir) || return 1
+  source="$owner_git_dir/config.worktree"
+  [ ! -L "$source" ] || return 1
+  if [ -f "$source" ]; then
+    cp "$source" "$MASTER_REFRESH_GIT_DIR/config.worktree" || return 1
+  fi
+  source="$owner_git_dir/info/sparse-checkout"
+  [ ! -L "$source" ] || return 1
+  if [ -f "$source" ]; then
+    mkdir "$MASTER_REFRESH_GIT_DIR/info" || return 1
+    cp "$source" "$MASTER_REFRESH_GIT_DIR/info/sparse-checkout" || return 1
+  fi
 }
 
 refresh_master_owner_to() {
@@ -266,6 +313,12 @@ discard_master_refresh_admin() {
     unlink "$MASTER_REFRESH_GIT_DIR/logs/HEAD" >/dev/null 2>&1 || true
   [ ! -d "$MASTER_REFRESH_GIT_DIR/logs" ] ||
     rmdir "$MASTER_REFRESH_GIT_DIR/logs" >/dev/null 2>&1 || true
+  [ ! -f "$MASTER_REFRESH_GIT_DIR/config.worktree" ] ||
+    unlink "$MASTER_REFRESH_GIT_DIR/config.worktree" >/dev/null 2>&1 || true
+  [ ! -f "$MASTER_REFRESH_GIT_DIR/info/sparse-checkout" ] ||
+    unlink "$MASTER_REFRESH_GIT_DIR/info/sparse-checkout" >/dev/null 2>&1 || true
+  [ ! -d "$MASTER_REFRESH_GIT_DIR/info" ] ||
+    rmdir "$MASTER_REFRESH_GIT_DIR/info" >/dev/null 2>&1 || true
   [ ! -f "$MASTER_REFRESH_GIT_DIR/HEAD" ] ||
     unlink "$MASTER_REFRESH_GIT_DIR/HEAD" >/dev/null 2>&1 || true
   if rmdir "$MASTER_REFRESH_GIT_DIR" >/dev/null 2>&1; then
@@ -846,6 +899,12 @@ cleanup_reservations() {
   if [ -n "${MASTER_SKIP_PATHS_FILE:-}" ]; then
     unlink "$MASTER_SKIP_PATHS_FILE" >/dev/null 2>&1 || true
   fi
+  if [ -n "${MASTER_SPARSE_ABSENT_FILE:-}" ]; then
+    unlink "$MASTER_SPARSE_ABSENT_FILE" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${MASTER_SPARSE_SUSPECT_FILE:-}" ]; then
+    unlink "$MASTER_SPARSE_SUSPECT_FILE" >/dev/null 2>&1 || true
+  fi
   if [ "${#SESSION_PSEUDOREF_LOCKS[@]}" -gt 0 ]; then
     for lock in "${SESSION_PSEUDOREF_LOCKS[@]}"; do
       [ ! -f "$lock" ] || unlink "$lock" >/dev/null 2>&1 || true
@@ -881,6 +940,9 @@ cleanup_reservations() {
     unlink "$MASTER_REFRESH_GIT_DIR/HEAD.lock" >/dev/null 2>&1 || true
     unlink "$MASTER_REFRESH_GIT_DIR/logs/HEAD" >/dev/null 2>&1 || true
     rmdir "$MASTER_REFRESH_GIT_DIR/logs" >/dev/null 2>&1 || true
+    unlink "$MASTER_REFRESH_GIT_DIR/config.worktree" >/dev/null 2>&1 || true
+    unlink "$MASTER_REFRESH_GIT_DIR/info/sparse-checkout" >/dev/null 2>&1 || true
+    rmdir "$MASTER_REFRESH_GIT_DIR/info" >/dev/null 2>&1 || true
     unlink "$MASTER_REFRESH_GIT_DIR/HEAD" >/dev/null 2>&1 || true
     rmdir "$MASTER_REFRESH_GIT_DIR" >/dev/null 2>&1 || true
   fi
@@ -918,6 +980,8 @@ CHANGED_PATHS_FILE=""
 WORKTREE_LIST_FILE=""
 MASTER_INDEX_PROBE=""
 MASTER_SKIP_PATHS_FILE=""
+MASTER_SPARSE_ABSENT_FILE=""
+MASTER_SPARSE_SUSPECT_FILE=""
 trap cleanup_reservations EXIT
 
 [ "$#" -ge 3 ] || usage

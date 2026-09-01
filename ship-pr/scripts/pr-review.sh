@@ -1224,8 +1224,22 @@ CHECKS_INTERVAL="${SHIP_PR_CHECKS_INTERVAL:-60}"
 CHECKS_WAIT="${SHIP_PR_CHECKS_WAIT:-7200}"
 CHECKS_HEARTBEAT="${SHIP_PR_CHECKS_HEARTBEAT:-600}"
 BASE_ABSENT_GRACE="${SHIP_PR_BASE_ABSENT_GRACE:-300}"
+# Whole seconds, validated up front: these feed shell arithmetic (deadlines, heartbeats, and the
+# sleep caps against the remaining deadline), where a fractional value does not degrade gracefully
+# — `[ 0.5 -le N ]` errors and takes the fallback arm, which for the interval means one read and
+# then a sleep to the full ceiling. A zero interval would busy-loop the API instead of pacing it.
 case "$BASE_ABSENT_GRACE" in
 '' | *[!0-9]*) die "SHIP_PR_BASE_ABSENT_GRACE must be a number of seconds, got '$BASE_ABSENT_GRACE'" ;;
+esac
+case "$CHECKS_INTERVAL" in
+'' | *[!0-9]*) die "SHIP_PR_CHECKS_INTERVAL must be whole seconds, got '$CHECKS_INTERVAL'" ;;
+esac
+[ "$CHECKS_INTERVAL" -gt 0 ] || die "SHIP_PR_CHECKS_INTERVAL must be at least 1 second, got '$CHECKS_INTERVAL'"
+case "$CHECKS_WAIT" in
+'' | *[!0-9]*) die "SHIP_PR_CHECKS_WAIT must be whole seconds, got '$CHECKS_WAIT'" ;;
+esac
+case "$CHECKS_HEARTBEAT" in
+'' | *[!0-9]*) die "SHIP_PR_CHECKS_HEARTBEAT must be whole seconds, got '$CHECKS_HEARTBEAT'" ;;
 esac
 
 is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }

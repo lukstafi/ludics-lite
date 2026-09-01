@@ -1347,58 +1347,114 @@ test_skip_worktree_master_refusal() {
   echo "PASS: skip-worktree master-owner edits are refused before ownership handoff"
 }
 
-# A clean sparse-checkout master owner: its skip-worktree entries with no file on disk are
-# intentional absence, not hidden deletions, so the hidden-change probe must pass it — while
-# test_skip_worktree_master_refusal above keeps proving an EDITED materialized skip-worktree
-# file is still refused. The locked refresh must advance the owner without materializing the
-# sparse-absent paths or dropping their flags.
-test_sparse_master_owner() {
-  local root remote main session owner integrator
-  root="$TEST_ROOT/sparse-master-owner"
+# Shared topology for the sparse-checkout master-owner cases: a base with a materialized file and
+# a docs/ directory, a topic editing both, and a cone-sparse (root-only) master-owner worktree in
+# which docs/manual is intentionally absent. Exposes SPARSE_MAIN, SPARSE_SESSION, SPARSE_OWNER.
+setup_sparse_case() {
+  local name="$1" root remote integrator
+  root="$TEST_ROOT/$name"
   remote="$root/remote.git"
-  main="$root/main"
-  session="$root/session"
-  owner="$root/master-owner"
+  SPARSE_MAIN="$root/main"
+  SPARSE_SESSION="$root/session"
+  SPARSE_OWNER="$root/master-owner"
   integrator="$root/integrator"
   mkdir -p "$root"
   git init --bare "$remote" >/dev/null
-  git init -b master "$main" >/dev/null
-  git_config "$main"
-  echo base >"$main/value"
-  mkdir "$main/docs"
-  echo manual >"$main/docs/manual"
-  git -C "$main" add value docs/manual
-  git -C "$main" commit -m base >/dev/null
-  git -C "$main" remote add origin "$remote"
-  git -C "$main" push -u origin master >/dev/null
-  git -C "$main" branch topic
-  git -C "$main" worktree add "$session" topic >/dev/null
-  git_config "$session"
-  echo topic >>"$session/value"
-  git -C "$session" add value
-  git -C "$session" commit -m topic >/dev/null
-  git -C "$session" push -u origin topic >/dev/null
+  git init -b master "$SPARSE_MAIN" >/dev/null
+  git_config "$SPARSE_MAIN"
+  echo base >"$SPARSE_MAIN/value"
+  mkdir "$SPARSE_MAIN/docs"
+  echo manual >"$SPARSE_MAIN/docs/manual"
+  git -C "$SPARSE_MAIN" add value docs/manual
+  git -C "$SPARSE_MAIN" commit -m base >/dev/null
+  git -C "$SPARSE_MAIN" remote add origin "$remote"
+  git -C "$SPARSE_MAIN" push -u origin master >/dev/null
+  git -C "$SPARSE_MAIN" branch topic
+  git -C "$SPARSE_MAIN" worktree add "$SPARSE_SESSION" topic >/dev/null
+  git_config "$SPARSE_SESSION"
+  echo topic >>"$SPARSE_SESSION/value"
+  echo updated >>"$SPARSE_SESSION/docs/manual"
+  git -C "$SPARSE_SESSION" add value docs/manual
+  git -C "$SPARSE_SESSION" commit -m topic >/dev/null
+  git -C "$SPARSE_SESSION" push -u origin topic >/dev/null
   git clone --branch master "$remote" "$integrator" >/dev/null 2>&1
   git_config "$integrator"
   git -C "$integrator" merge --no-ff origin/topic -m "merge topic" >/dev/null
   git -C "$integrator" push origin master >/dev/null
-  git -C "$main" checkout --detach >/dev/null
-  git -C "$main" worktree add "$owner" master >/dev/null
-  git -C "$owner" sparse-checkout set >/dev/null 2>&1
-  [ ! -e "$owner/docs/manual" ] || fail "sparse setup did not de-materialize docs/manual"
-  assert_eq "$(git -C "$owner" ls-files -t -- docs/manual)" "S docs/manual" \
+  git -C "$SPARSE_MAIN" checkout --detach >/dev/null
+  git -C "$SPARSE_MAIN" worktree add "$SPARSE_OWNER" master >/dev/null
+  git -C "$SPARSE_OWNER" sparse-checkout set >/dev/null 2>&1
+  [ ! -e "$SPARSE_OWNER/docs/manual" ] || fail "sparse setup did not de-materialize docs/manual"
+  assert_eq "$(git -C "$SPARSE_OWNER" ls-files -t -- docs/manual)" "S docs/manual" \
     "sparse setup must mark docs/manual skip-worktree"
+}
 
-  "$HELPER" "$main" "$session" topic >/dev/null
-  assert_eq "$(git -C "$owner" rev-parse HEAD)" "$(git -C "$main" rev-parse refs/remotes/origin/master)" \
+# A clean sparse-checkout master owner: its skip-worktree entries with no file on disk are
+# intentional absence, not hidden deletions, so the hidden-change probe must pass it — while
+# test_skip_worktree_master_refusal above keeps proving an EDITED materialized skip-worktree
+# file is still refused. The fast-forward changes BOTH the materialized file and the
+# sparse-absent one, so the locked refresh must advance the owner — index entry included —
+# without materializing the absent path or dropping its flag (its sparse metadata rides into
+# the refresh's temporary GIT_DIR for exactly this case).
+test_sparse_master_owner() {
+  setup_sparse_case sparse-master-owner
+
+  "$HELPER" "$SPARSE_MAIN" "$SPARSE_SESSION" topic >/dev/null
+  assert_eq "$(git -C "$SPARSE_OWNER" rev-parse HEAD)" \
+    "$(git -C "$SPARSE_MAIN" rev-parse refs/remotes/origin/master)" \
     "sparse master owner must be fast-forwarded"
-  assert_eq "$(sed -n '2p' "$owner/value")" topic \
+  assert_eq "$(sed -n '2p' "$SPARSE_OWNER/value")" topic \
     "materialized files must follow the fast-forward in a sparse owner"
-  [ ! -e "$owner/docs/manual" ] || fail "sparse-absent path must not be materialized by the refresh"
-  assert_eq "$(git -C "$owner" ls-files -t -- docs/manual)" "S docs/manual" \
+  [ ! -e "$SPARSE_OWNER/docs/manual" ] || fail "sparse-absent path must not be materialized by the refresh"
+  assert_eq "$(git -C "$SPARSE_OWNER" ls-files -t -- docs/manual)" "S docs/manual" \
     "sparse-absent path must keep its skip-worktree flag through the refresh"
-  ! git -C "$main" show-ref --verify --quiet refs/heads/topic || fail "local topic must be deleted"
+  assert_eq "$(git -C "$SPARSE_OWNER" ls-files --format='%(objectname)' -- docs/manual)" \
+    "$(git -C "$SPARSE_MAIN" rev-parse "refs/remotes/origin/master:docs/manual")" \
+    "the changed sparse-absent path's index entry must reach the new tip's blob"
+  ! git -C "$SPARSE_MAIN" show-ref --verify --quiet refs/heads/topic || fail "local topic must be deleted"
   echo "PASS: clean sparse-checkout master owner is advanced without losing sparseness"
+}
+
+# The other side of the sparse exemption: an absent skip-worktree entry that the active sparse
+# rules WOULD materialize is a deletion hidden behind the flag, not sparse absence, and must
+# still be refused before any branch mutation.
+test_sparse_hidden_deletion_refusal() {
+  local local_master
+  setup_sparse_case sparse-hidden-deletion
+  local_master=$(git -C "$SPARSE_MAIN" rev-parse refs/heads/master)
+  git -C "$SPARSE_OWNER" update-index --skip-worktree value
+  rm "$SPARSE_OWNER/value"
+  [ -z "$(git -C "$SPARSE_OWNER" status --porcelain)" ] ||
+    fail "skip-worktree setup did not hide the sparse-owner deletion"
+
+  if "$HELPER" "$SPARSE_MAIN" "$SPARSE_SESSION" topic >/dev/null 2>&1; then
+    fail "deletion hidden behind skip-worktree in a sparse owner was accepted"
+  fi
+  assert_eq "$(git -C "$SPARSE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "sparse hidden-deletion refusal must precede master advancement"
+  git -C "$SPARSE_MAIN" show-ref --verify --quiet refs/heads/topic || fail "local topic was deleted"
+  [ -d "$SPARSE_SESSION" ] || fail "topic worktree was removed"
+  echo "PASS: in-cone deletion hidden behind skip-worktree is refused in a sparse owner"
+}
+
+# And with no sparse checkout at all, EVERY absent skip-worktree entry is a hidden deletion —
+# the exemption must not blanket-trust absence.
+test_skip_worktree_deleted_master_refusal() {
+  local local_master
+  setup_case skip-worktree-deleted-master merge main
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" update-index --skip-worktree value
+  rm "$CASE_MAIN/value"
+  [ -z "$(git -C "$CASE_MAIN" status --porcelain)" ] ||
+    fail "skip-worktree setup did not hide the master-owner deletion"
+
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "deletion hidden behind skip-worktree was accepted"
+  fi
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "hidden-deletion refusal must precede master advancement"
+  assert_topic_preserved
+  echo "PASS: deletion hidden behind skip-worktree is refused in a non-sparse owner"
 }
 
 # Worktree pathnames can contain a newline; the line-based `worktree list --porcelain` truncates
@@ -3260,6 +3316,8 @@ TESTS=(
   test_assume_unchanged_master_refusal
   test_skip_worktree_master_refusal
   test_sparse_master_owner
+  test_sparse_hidden_deletion_refusal
+  test_skip_worktree_deleted_master_refusal
   test_newline_worktree_paths
   test_master_active_operation_refusal
   test_master_index_lock_refusal
