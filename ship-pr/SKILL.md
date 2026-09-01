@@ -444,11 +444,12 @@ is the policy, not a corner cut. A count the compare API could not answer prints
 is not "not behind": check it by hand.
 
 **Standalone use does not watch CI at all** (since 2026-08-31): trailing failures on merged
-master belong to the **"ocannl-staging CI-red triage" cloud routine** — fired by a GitHub
-webhook on the repo's completed workflow runs, with a daily backstop sweep. On a master red it
-checks for an existing claim, claims the failure via an issue on the staging repo (`CI red on
-master@<short-sha>: <workflow>`), and either opens a `ci-fix/*` PR (it never merges its own
-PRs) or posts its diagnosis to the claiming issue. So after `merge` confirms `merged`, this
+master belong to the **"ocannl-staging CI-red triage" cloud routine** — fired by `ci.yml`'s own
+`notify-triage-routine` job through the routine fire API on any non-PR master red, with a daily
+backstop sweep behind it. On a master red it checks for an existing claim, claims the failure
+with an issue on **ahrefs/ocannl** (`CI red on master@<short-sha>: <workflow>` — issues are
+disabled on the staging repo), and either opens a `ci-fix/*` PR on staging (it never merges its
+own PRs) or posts its diagnosis to the claiming issue. So after `merge` confirms `merged`, this
 session's verification is over: do not run `base --wait`, do not watch master's subsequent
 workflows. (Briefly that day the rule was the opposite — every merger blocked on its own
 `base --wait` — which stacked N sessions on the same remote CI cycle; the routine is the
