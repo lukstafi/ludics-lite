@@ -63,7 +63,8 @@
 # (the whole fleet, "mac-studio rog-nv-wsl minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/self-improve), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
 # FLEET_TMUX_SOCKET (tmux -L name; tests isolate with it), FLEET_FLOTILLA (http://mac-studio:7799),
 # FLEET_LOCK_WAIT (seconds a lease mutation waits for a concurrent one to finish; 10),
-# FLEET_PROBE_TIMEOUT (wall-clock bound on the preflight's live headless turn; 120).
+# FLEET_PROBE_TIMEOUT (wall-clock bound on the preflight's live headless turn; 120),
+# FLEET_FETCH_TIMEOUT (bound on the project fetch before a worktree is created; 300).
 
 set -uo pipefail
 
@@ -127,7 +128,9 @@ session_of() {
 }
 # A literal string as an ERE, for pgrep/pkill -f.
 re_lit() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g'; }
-alive() { tm has-session -t "iw-$1" 2>/dev/null; }
+# `=` forces an exact session name: without it tmux falls back to prefix matching, and with
+# iw-repo-1 gone, -t iw-repo-1 would resolve to iw-repo-12 - reading, or killing, a sibling.
+alive() { tm has-session -t "=iw-$1" 2>/dev/null; }
 WORKERS="$STATE/workers"
 # take_lock <dir> <wait-seconds> <label>: a mkdir lock that records its holder's pid, so a lock
 # left by a killed shell or a rebooted box is reclaimed instead of wedging the name forever.
@@ -157,6 +160,26 @@ take_lock() {
   proc_start $$ > "$lock/start"; echo $$ > "$lock/pid"
 }
 release_lock() { rm -f "$1/pid" "$1/start"; rmdir "$1" 2>/dev/null; }
+# bounded <secs> <cmd...>: run with stdin from the caller, kill the whole group at the deadline
+# (no `timeout` on stock macOS). Output on stdout; exit 124 on expiry.
+bounded() {
+  local secs="$1"; shift
+  local out rcf pid waited=0 rc c
+  out=$(mktemp "${TMPDIR:-/tmp}/fw-probe.XXXXXX"); rcf=$(mktemp "${TMPDIR:-/tmp}/fw-probe-rc.XXXXXX")
+  # Everything under the probe writes to files or /dev/null: nothing it spawns may inherit the
+  # caller's stdout, or a lingering child would hold a command substitution open.
+  ( "$@" > "$out" 2>&1; echo $? > "$rcf" ) >/dev/null 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$secs" ]; do sleep 1; waited=$((waited + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    for c in $(pgrep -P "$pid" 2>/dev/null); do pkill -P "$c" 2>/dev/null; kill "$c" 2>/dev/null; done
+    kill "$pid" 2>/dev/null; rc=124
+  else
+    rc=$(cat "$rcf" 2>/dev/null); rc=${rc:-1}
+  fi
+  wait "$pid" 2>/dev/null
+  cat "$out"; rm -f "$out" "$rcf"; return "$rc"
+}
 # The pattern that finds a worker's CLI by its own command line: a claude or codex command
 # word, then the session id (claude, and codex after a resume) or this worker's state dir
 # (codex's -o). The command-word anchor keeps a `tail -f .../stream.jsonl` or an editor on a
@@ -220,7 +243,8 @@ gen_uuid() {
 # box never answered and the caller may retry rather than conclude anything.
 unreachable() { [ "$1" -eq 255 ]; }
 
-valid_name() { case "$1" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
+# No leading dot: a `*` glob (fleet inventory) would not see such a record.
+valid_name() { case "$1" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 
 # The coordinator's identity is per SESSION, not per box: FLEET_COORDINATOR if set, else the
 # Claude Code session id the shell inherits. Nothing is guessed from the process tree - a
@@ -277,26 +301,6 @@ preflight_script() {
 codex="$1" probe="$2" probe_timeout="$3"
 refuse=""
 note() { refuse="$refuse; $*"; }
-# bounded <secs> <cmd...>: run with stdin from the caller, kill the whole group at the deadline
-# (no `timeout` on stock macOS). Output on stdout; exit 124 on expiry.
-bounded() {
-  local secs="$1"; shift
-  local out rcf pid waited=0 rc c
-  out=$(mktemp "${TMPDIR:-/tmp}/fw-probe.XXXXXX"); rcf=$(mktemp "${TMPDIR:-/tmp}/fw-probe-rc.XXXXXX")
-  # Everything under the probe writes to files or /dev/null: nothing it spawns may inherit the
-  # caller's stdout, or a lingering child would hold a command substitution open.
-  ( "$@" > "$out" 2>&1; echo $? > "$rcf" ) >/dev/null 2>&1 &
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$secs" ]; do sleep 1; waited=$((waited + 1)); done
-  if kill -0 "$pid" 2>/dev/null; then
-    for c in $(pgrep -P "$pid" 2>/dev/null); do pkill -P "$c" 2>/dev/null; kill "$c" 2>/dev/null; done
-    kill "$pid" 2>/dev/null; rc=124
-  else
-    rc=$(cat "$rcf" 2>/dev/null); rc=${rc:-1}
-  fi
-  wait "$pid" 2>/dev/null
-  cat "$out"; rm -f "$out" "$rcf"; return "$rc"
-}
 # One preflight per box at a time: a parallel group launched together would otherwise race
 # `git fetch`/`merge` in the same checkout and refuse on git's own lock files. Idempotent, so
 # waiting for the other preflight is the right thing; the bound covers a hung live probe.
@@ -397,7 +401,7 @@ cmd_preflight() {
 cmd_launch() {
   local box="${1:-}" name="${2:-}"
   [ -n "$box" ] && [ -n "$name" ] || die "launch: <box> <name> required"
-  valid_name "$name" || die "launch: name must be [A-Za-z0-9._-]+"
+  valid_name "$name" || die "launch: name must be [A-Za-z0-9._-]+ and not start with a dot"
   shift 2
   local kind="" brief="" cwd="" repo="" branch="" base="origin/master" force=0 replace=0
   while [ $# -gt 0 ]; do
@@ -441,14 +445,20 @@ cmd_launch() {
   if unreachable "$prc2"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc2" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: cannot stage the brief under the worker state dir on $box (unwritable, or a file in the way)"; exit 1; }
   { prelude "$box"; cat <<'EOF'
-name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8" replace="$9" stamp="${10}"; shift 10
+name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8" replace="$9" stamp="${10}" fetch_timeout="${11}"; shift 11
 d="$WORKERS/$name"; incoming="$d/incoming-$stamp.md"
-refuse() { rm -f "$incoming"; echo "LAUNCH REFUSED $BOX/$name: $*"; exit 1; }
+refuse() { rm -f "$incoming"; [ -f "$d/meta" ] || rmdir "$d" 2>/dev/null; echo "LAUNCH REFUSED $BOX/$name: $*"; exit 1; }
 # One launch of a name at a time: the guards below and the record writes after them are one
 # critical section, held until the tmux session exists (or this launch has refused).
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
 msg=$(take_lock "$wlock" 0 "lock") || refuse "another launch or unstick of this name is in progress ($msg)"
-trap 'release_lock "$wlock"' EXIT
+archive=""
+on_exit() {
+  # Killed between archiving the old record and writing the new meta: put the old record back.
+  if [ -n "$archive" ] && [ -d "$archive" ] && [ ! -f "$d/meta" ]; then rm -rf "$d"; mv "$archive" "$d" 2>/dev/null; fi
+  release_lock "$wlock"
+}
+trap on_exit EXIT; trap 'exit 143' TERM HUP INT
 if alive "$name"; then refuse "already running"; fi
 if [ -f "$d/meta" ]; then
   # tmux gone is not the CLI gone: a reparented orphan can still write and commit, and
@@ -464,23 +474,15 @@ if [ -f "$d/meta" ] && [ "$replace" != 1 ]; then
   fi
   refuse "a previous launch left no exit record (killed?); unstick it, or --replace"
 fi
-archive=""
-if [ -f "$d/meta" ]; then
-  # --replace keeps the previous record whole under $STATE/replaced/ (evidence), and a refusal
-  # below puts it back; nothing of it is truncated in place.
-  mkdir -p "$STATE/replaced" 2>/dev/null; archive="$STATE/replaced/$name-$stamp"
-  if ! mv "$d" "$archive" 2>/dev/null || [ ! -d "$archive" ]; then
-    archive=""; refuse "cannot archive the previous record to $STATE/replaced/ (unwritable, or a file in the way); nothing was changed"
-  fi
-  # From here the old record lives in $archive; any refusal puts it back whole.
-  refuse() { rm -f "$incoming"; rm -rf "$d"; mv "$archive" "$d" 2>/dev/null; echo "LAUNCH REFUSED $BOX/$name: $* (previous record restored)"; exit 1; }
-  mkdir -p "$d" && mv "$archive/incoming-$stamp.md" "$incoming" 2>/dev/null || refuse "cannot start a fresh record at $d"
-fi
 if [ -z "$cwd" ]; then
   repo=$(expand_tilde "$repo")
   cwd="$repo-worktrees/$name"
   if [ ! -d "$cwd" ]; then
-    git -C "$repo" fetch -q origin || refuse "fetch failed in $repo"
+    # Bounded: a stalling origin must not hold the worker lock (or, below, an archived record)
+    # indefinitely.
+    bounded "$fetch_timeout" git -C "$repo" fetch -q origin >/dev/null; frc=$?
+    [ "$frc" -ne 124 ] || refuse "git fetch in $repo timed out after ${fetch_timeout}s"
+    [ "$frc" -eq 0 ] || refuse "fetch failed in $repo"
     git -C "$repo" worktree add -q "$cwd" -b "$branch" "$base" 2>&1 || refuse "worktree add failed"
   else
     # An existing directory is reused only when it is the worktree the caller described.
@@ -495,6 +497,17 @@ else
   cwd=$(expand_tilde "$cwd")
 fi
 [ -d "$cwd" ] || refuse "no such directory $cwd"
+if [ -f "$d/meta" ]; then
+  # --replace keeps the previous record whole under $STATE/replaced/ (evidence), and a refusal
+  # below puts it back; nothing of it is truncated in place.
+  mkdir -p "$STATE/replaced" 2>/dev/null; archive="$STATE/replaced/$name-$stamp"
+  if ! mv "$d" "$archive" 2>/dev/null || [ ! -d "$archive" ]; then
+    archive=""; refuse "cannot archive the previous record to $STATE/replaced/ (unwritable, or a file in the way); nothing was changed"
+  fi
+  # From here the old record lives in $archive; any refusal puts it back whole.
+  refuse() { rm -f "$incoming"; rm -rf "$d"; mv "$archive" "$d" 2>/dev/null; echo "LAUNCH REFUSED $BOX/$name: $* (previous record restored)"; exit 1; }
+  mkdir -p "$d" && mv "$archive/incoming-$stamp.md" "$incoming" 2>/dev/null || refuse "cannot start a fresh record at $d"
+fi
 # Every record mutation is checked, and the brief is in place before any evidence is truncated.
 [ ! -d "$d/brief.md" ] || refuse "cannot install the brief: $d/brief.md is a directory"
 mv -f "$incoming" "$d/brief.md" 2>/dev/null && [ -f "$d/brief.md" ] || refuse "cannot install the brief at $d/brief.md"
@@ -531,7 +544,7 @@ if [ "$kind" = codex ]; then
 fi
 echo "LAUNCHED $BOX/$name kind=$kind session=${sid:-unknown} cwd=$cwd stream=$d/stream.jsonl${archive:+ replaced=$archive}"
 EOF
-  } | run_on "$box" "$name" "$kind" "$cwd" "$repo" "$branch" "$base" "$sid" "$(hostname -s)" "$replace" "$stamp" "$@"
+  } | run_on "$box" "$name" "$kind" "$cwd" "$repo" "$branch" "$base" "$sid" "$(hostname -s)" "$replace" "$stamp" "${FLEET_FETCH_TIMEOUT:-300}" "$@"
   local rc=$?
   if unreachable "$rc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   exit "$rc"
@@ -702,7 +715,7 @@ if alive "$name"; then
   if [ "$kill" != 1 ]; then
     echo "UNSTICK REFUSED $BOX/$name: still running -- a resume beside a live exec gives the branch two writers; pass --kill to stop it first"; exit 1
   fi
-  tm kill-session -t "iw-$name"
+  tm kill-session -t "=iw-$name"
   for i in $(seq 1 30); do alive "$name" || break; sleep 1; done
 fi
 # The tmux session is gone; make sure the CLI it ran is too (it could have been reparented).

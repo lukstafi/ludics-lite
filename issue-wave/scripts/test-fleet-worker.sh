@@ -100,6 +100,13 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\n{
 [ -n "$out" ] && printf '%s\n' "$text" > "$out"
 exit 0
 EOF
+REAL_GIT=$(command -v git)
+cat > "$TMP/bin/git" <<EOF
+#!/usr/bin/env bash
+if [ -n "\${SHIM_GIT_HANG_FETCH:-}" ]; then for a in "\$@"; do [ "\$a" = fetch ] && sleep 60; done; fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$TMP/bin/git"
 REAL_TMUX=$(command -v tmux)
 cat > "$TMP/bin/tmux" <<EOF
 #!/usr/bin/env bash
@@ -389,6 +396,18 @@ expect "a diagnostic process on a record file is not the worker" 0 "EXITED(0) te
 expect "a brief that cannot be staged is a refusal, not an unreachable box" 1 "LAUNCH REFUSED testbox/blocked: cannot stage the brief" -- "$FW" launch testbox blocked --kind claude --brief "$brief" --cwd "$proj"
 rm -f "$ISSUE_WAVE_STATE/workers/blocked"
 
+printf 'SLEEP 20\n' > "$TMP/slow20.md"
+"$FW" launch testbox p-1 --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox p-1 --interval 1 >/dev/null
+"$FW" launch testbox p-12 --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
+expect "a finished worker is not read as running through a prefix-matching sibling session" 0 "EXITED(0) testbox/p-1 " -- "$FW" status testbox p-1
+expect "unstick --kill of the finished worker leaves the sibling session alone" 0 "RESUMED testbox/p-1" -- "$FW" unstick testbox p-1 --message "$TMP/msg.md" --kill
+expect "...the sibling is still running" 0 "RUNNING testbox/p-12" -- "$FW" status testbox p-12
+"$FW" attach testbox p-1 --interval 1 >/dev/null
+"$FW" unstick testbox p-12 --message "$TMP/msg.md" --kill >/dev/null; "$FW" attach testbox p-12 --interval 1 >/dev/null
+expect "a stalling project fetch is bounded and refused before any record is touched" 1 "git fetch in .* timed out after 2s" -- \
+  env SHIM_GIT_HANG_FETCH=1 FLEET_FETCH_TIMEOUT=2 "$FW" launch testbox fh --kind claude --brief "$brief" --repo "$proj" --branch claude/fh
+[ -d "$ISSUE_WAVE_STATE/workers/fh" ] && ko "a refused fetch left a record" || ok "no record left by the refused fetch"
+
 echo "--- codex workers"
 expect "codex launch captures the thread id from the stream" 0 "LAUNCHED testbox/c1 kind=codex session=0199-shim-" -- \
   "$FW" launch testbox c1 --kind codex --brief "$brief" --cwd "$proj"
@@ -430,6 +449,7 @@ echo "--- usage"
 expect "no command prints usage, exit 2" 2 "Usage:" -- "$FW"
 expect "bad worker name refuses" 2 "name must be" -- "$FW" launch testbox "bad name" --kind claude --brief "$brief" --cwd "$proj"
 expect "dot names refuse" 2 "name must be" -- "$FW" launch testbox .. --kind claude --brief "$brief" --cwd "$proj"
+expect "a dot-prefixed name refuses (ls could not see it)" 2 "not start with a dot" -- "$FW" launch testbox .triage --kind claude --brief "$brief" --cwd "$proj"
 expect "unstick validates the name before writing anything" 2 "unstick: name must be" -- "$FW" unstick testbox ../escape --message "$TMP/msg.md"
 expect "status validates the name" 2 "status: name must be" -- "$FW" status testbox "a b"
 expect "without FLEET_LOCAL_BOX an unrecognized host is local only to 'local'" 0 "EXITED(0) local/w1" -- env -u FLEET_LOCAL_BOX "$FW" status local w1
