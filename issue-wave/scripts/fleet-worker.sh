@@ -64,7 +64,7 @@
 # FLEET_TMUX_SOCKET (tmux -L name; tests isolate with it), FLEET_FLOTILLA (http://mac-studio:7799),
 # FLEET_LOCK_WAIT (seconds a lease mutation waits for a concurrent one to finish; 10),
 # FLEET_PROBE_TIMEOUT (wall-clock bound on the preflight's live headless turn; 120),
-# FLEET_FETCH_TIMEOUT (bound on the project fetch before a worktree is created; 300).
+# FLEET_FETCH_TIMEOUT (bound on the skills-checkout and project fetches; 300).
 
 set -uo pipefail
 
@@ -298,7 +298,7 @@ anchor_gate() {
 # the per-launch refusal the skill promises is enforced here rather than remembered.
 preflight_script() {
   cat <<'EOF'
-codex="$1" probe="$2" probe_timeout="$3"
+codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4"
 refuse=""
 note() { refuse="$refuse; $*"; }
 # One preflight per box at a time: a parallel group launched together would otherwise race
@@ -311,7 +311,8 @@ repo=$(expand_tilde "$SKILLS_REPO")
 if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
   echo "PREFLIGHT REFUSED $BOX: no skills checkout at $repo"; exit 1
 fi
-git -C "$repo" fetch -q origin 2>/dev/null || note "fetch failed (offline?)"
+bounded "$fetch_timeout" git -C "$repo" fetch -q origin >/dev/null; frc=$?
+if [ "$frc" -eq 124 ]; then note "git fetch in $repo timed out after ${fetch_timeout}s"; elif [ "$frc" -ne 0 ]; then note "fetch failed (offline?)"; fi
 # Any change under the served tree - tracked or untracked - is divergence to surface: the
 # deployed symlinks would serve it. Changes elsewhere are not skill text and are only reported
 # (mac-studio's checkout carries git-synced memory checkpoints under harness/ most of the time;
@@ -391,7 +392,7 @@ cmd_preflight() {
     esac
     shift
   done
-  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}"
+  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}"
   local rc=$?
   if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; exit 4; fi
   exit "$rc"
@@ -426,7 +427,7 @@ cmd_launch() {
   fi
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
   local codex=0 pf; [ "$kind" = codex ] && codex=1
-  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" )
+  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" )
   local prc=$?
   if unreachable "$prc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: $pf"; exit 1; }
@@ -447,15 +448,20 @@ cmd_launch() {
   { prelude "$box"; cat <<'EOF'
 name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8" replace="$9" stamp="${10}" fetch_timeout="${11}"; shift 11
 d="$WORKERS/$name"; incoming="$d/incoming-$stamp.md"
-refuse() { rm -f "$incoming"; [ -f "$d/meta" ] || rmdir "$d" 2>/dev/null; echo "LAUNCH REFUSED $BOX/$name: $*"; exit 1; }
+fresh=0; [ -f "$d/meta" ] || fresh=1   # this launch creates the record: a refusal removes it whole
+refuse() { rm -f "$incoming"; if [ "$fresh" = 1 ]; then rm -rf "$d"; fi; echo "LAUNCH REFUSED $BOX/$name: $*"; exit 1; }
 # One launch of a name at a time: the guards below and the record writes after them are one
 # critical section, held until the tmux session exists (or this launch has refused).
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
 msg=$(take_lock "$wlock" 0 "lock") || refuse "another launch or unstick of this name is in progress ($msg)"
-archive=""
+archive=""; started=0
 on_exit() {
-  # Killed between archiving the old record and writing the new meta: put the old record back.
-  if [ -n "$archive" ] && [ -d "$archive" ] && [ ! -f "$d/meta" ]; then rm -rf "$d"; mv "$archive" "$d" 2>/dev/null; fi
+  # Killed anywhere after archiving the old record and before tmux started: put it back; a
+  # fresh record that never reached a session is removed, so the name stays launchable.
+  if [ "$started" != 1 ]; then
+    if [ -n "$archive" ] && [ -d "$archive" ]; then rm -rf "$d"; mv "$archive" "$d" 2>/dev/null
+    elif [ "$fresh" = 1 ]; then rm -rf "$d"; fi
+  fi
   release_lock "$wlock"
 }
 trap on_exit EXIT; trap 'exit 143' TERM HUP INT
@@ -531,6 +537,7 @@ mv -f "$incoming" "$d/brief.md" 2>/dev/null && [ -f "$d/brief.md" ] || refuse "c
   if [ -n "$sid" ]; then echo "session=$sid"; fi
 } > "$d/meta" || refuse "cannot write $d/meta"
 tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || refuse "tmux failed"
+started=1
 if [ "$kind" = codex ]; then
   # The thread id is the resume address; it is the first event, but the exec takes a moment. If
   # this connection drops before it is recorded, session_of recovers it from the stream later.
@@ -886,17 +893,23 @@ lock="$lease.lock"
 msg=$(take_lock "$lock" "$lockwait" "CLAIM FAILED: lease lock on $BOX") || { echo "$msg"; exit 1; }
 trap 'release_lock "$lock"' EXIT
 verified() { [ "$(sed -n 's/^token=//p' "$lease" 2>/dev/null)" = "$token" ]; }
+# The record is written and verified in a temp file first, then published atomically (link for
+# a first claim, rename for a takeover), so a failed write never truncates a valid lease.
+tmp="$lease.tmp.$$"; trap 'rm -f "$tmp"; release_lock "$lock"' EXIT
+# ln/mv onto a DIRECTORY would publish the record inside it; refuse that shape outright.
+[ ! -d "$lease" ] || { echo "CLAIM FAILED: could not write the lease at $lease on $BOX (a directory in its place)"; exit 1; }
+staged() { record > "$tmp" 2>/dev/null && [ "$(sed -n 's/^token=//p' "$tmp" 2>/dev/null)" = "$token" ]; }
 if [ ! -f "$lease" ]; then
-  if ( set -o noclobber; record > "$lease" ) 2>/dev/null && verified; then echo "CLAIMED coordinator lease on $BOX for $host"; exit 0; fi
+  if staged && ln "$tmp" "$lease" 2>/dev/null && verified; then echo "CLAIMED coordinator lease on $BOX for $host"; exit 0; fi
   echo "CLAIM FAILED: could not write the lease at $lease on $BOX (a directory in its place, or unwritable)"; exit 1
 fi
 held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease"); since=$(sed -n 's/^since=//p' "$lease")
 if [ "$held" = "$token" ]; then echo "CLAIMED already held by $host since $since"; exit 0; fi
 if [ "$take" = 1 ]; then
-  if record > "$lease" 2>/dev/null && verified; then
+  if staged && mv -f "$tmp" "$lease" 2>/dev/null && verified; then
     echo "CLAIMED (adopted) coordinator lease on $BOX for $host -- was ${hhost:-nobody} since ${since:-never}"; exit 0
   fi
-  echo "CLAIM FAILED: could not write the lease at $lease on $BOX (a directory in its place, or unwritable) -- not adopted"; exit 1
+  echo "CLAIM FAILED: could not write the lease at $lease on $BOX (a directory in its place, or unwritable) -- not adopted; the previous lease is intact"; exit 1
 fi
 echo "CLAIM REFUSED: coordinator lease held by $hhost since $since -- a wave is in flight; adopt with --take only if that coordinator is gone"
 exit 1

@@ -188,6 +188,8 @@ rmdir "$ISSUE_WAVE_STATE/COORDINATOR"
 echo "--- preflight"
 expect "clean main on origin passes (claude, live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox
 expect "clean main passes for codex (live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --codex
+expect "a stalling skills fetch is bounded and refused" 1 "git fetch in .* timed out after 2s" -- env SHIM_GIT_HANG_FETCH=1 FLEET_FETCH_TIMEOUT=2 "$FW" preflight testbox --no-probe
+[ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
 expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
 expect "codex that cannot run headless refuses despite login status" 1 "codex cannot run headless: \"message\":\"401 Unauthorized\"" -- env SHIM_CODEX_DOWN=1 "$FW" preflight testbox --codex
 echo x >> "$repo/ClaudeDesktop/skills/ship-pr/SKILL.md"
@@ -404,6 +406,12 @@ expect "unstick --kill of the finished worker leaves the sibling session alone" 
 expect "...the sibling is still running" 0 "RUNNING testbox/p-12" -- "$FW" status testbox p-12
 "$FW" attach testbox p-1 --interval 1 >/dev/null
 "$FW" unstick testbox p-12 --message "$TMP/msg.md" --kill >/dev/null; "$FW" attach testbox p-12 --interval 1 >/dev/null
+expect "a first launch whose tmux fails leaves no record behind" 1 "LAUNCH REFUSED testbox/tf: tmux failed" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" launch testbox tf --kind claude --brief "$brief" --cwd "$proj"
+[ -d "$ISSUE_WAVE_STATE/workers/tf" ] && ko "failed first launch left a record" || ok "no record left by the failed first launch"
+expect "...so the name launches normally afterwards" 0 "LAUNCHED testbox/tf" -- "$FW" launch testbox tf --kind claude --brief "$brief" --cwd "$proj"
+"$FW" attach testbox tf --interval 1 >/dev/null
+expect "a --replace whose tmux fails restores the previous record" 1 "tmux failed (previous record restored)" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" launch testbox tf --kind claude --brief "$brief" --cwd "$proj" --replace
+expect "...and the previous worker still reads as done" 0 "EXITED(0) testbox/tf" -- "$FW" status testbox tf
 expect "a stalling project fetch is bounded and refused before any record is touched" 1 "git fetch in .* timed out after 2s" -- \
   env SHIM_GIT_HANG_FETCH=1 FLEET_FETCH_TIMEOUT=2 "$FW" launch testbox fh --kind claude --brief "$brief" --repo "$proj" --branch claude/fh
 [ -d "$ISSUE_WAVE_STATE/workers/fh" ] && ko "a refused fetch left a record" || ok "no record left by the refused fetch"
