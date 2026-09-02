@@ -64,6 +64,7 @@ while [ $# -gt 0 ]; do
 done
 brief=$(cat)
 sleep_s=$(printf '%s\n' "$brief" | sed -n 's/^SLEEP \([0-9]*\).*/\1/p' | head -n1)
+[ -n "${SHIM_CLAUDE_HANG:-}" ] && sleep 30
 if [ "$fmt" = json ]; then
   printf '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"%s"}\n' "${sid:-none}"; exit 0
 fi
@@ -85,10 +86,13 @@ cat > "$TMP/bin/codex" <<'EOF'
 case " $* " in *" -C / "*) case " $* " in *" --skip-git-repo-check "*) ;; *) echo "Not inside a trusted directory and --skip-git-repo-check was not specified." >&2; exit 1 ;; esac ;; esac
 if [ -n "${SHIM_CODEX_DOWN:-}" ]; then printf '{"type":"thread.started","thread_id":"x"}\n{"type":"turn.failed","error":{"message":"401 Unauthorized"}}\n'; exit 1; fi
 tid=""; out=""
-if [ "${1:-}" = resume ]; then shift; tid="$1"; shift; fi
+resumed=""
+if [ "${1:-}" = resume ]; then shift; tid="$1"; shift; resumed=1; fi
 while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; esac; shift; done
 [ -n "$tid" ] || tid="0199-shim-$(date +%s)-$$"
 brief=$(cat)
+if [ -n "${SHIM_CODEX_SILENT_RESUME:-}" ] && [ "$1" != "" ] 2>/dev/null; then :; fi
+if [ -n "${SHIM_CODEX_SILENT_RESUME:-}" ] && [ -n "$resumed" ]; then exit 0; fi
 printf '{"type":"thread.started","thread_id":"%s"}\n{"type":"turn.started"}\n' "$tid"
 sleep 1
 text="codex did: $(printf '%s' "$brief" | head -c 40 | tr '\n' ' ')"
@@ -159,7 +163,7 @@ expect "two first claims of one new identity leave that identity holding" 0 "COO
 env FLEET_COORDINATOR=fresh "$FW" release >/dev/null; "$FW" claim >/dev/null
 expect "an identity outside the safe set is refused, not folded" 2 "coordinator identity 'team/a' must be" -- env FLEET_COORDINATOR=team/a "$FW" claim
 chmod 555 "$ISSUE_WAVE_STATE"
-expect "release on an unwritable anchor fails at once, not after the lock wait" 1 "RELEASE FAILED: cannot create the lease lock" -- "$FW" release
+expect "release on an unwritable anchor fails at once, not after the lock wait" 1 "RELEASE FAILED: lease lock on testbox: cannot create lock" -- "$FW" release
 chmod 755 "$ISSUE_WAVE_STATE"
 expect "release drops it" 0 "RELEASED coordinator lease" -- "$FW" release
 expect "coordinator after release: nobody" 3 "nobody holds" -- "$FW" coordinator
@@ -171,6 +175,7 @@ rmdir "$ISSUE_WAVE_STATE/COORDINATOR"
 echo "--- preflight"
 expect "clean main on origin passes (claude, live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox
 expect "clean main passes for codex (live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --codex
+expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
 expect "codex that cannot run headless refuses despite login status" 1 "codex cannot run headless: \"message\":\"401 Unauthorized\"" -- env SHIM_CODEX_DOWN=1 "$FW" preflight testbox --codex
 echo x >> "$repo/ClaudeDesktop/skills/ship-pr/SKILL.md"
 expect "tracked change refuses" 1 "tracked change" -- "$FW" preflight testbox --no-probe
@@ -252,6 +257,11 @@ bash -c 'sleep 30; :' claude "$ISSUE_WAVE_STATE/workers/w1/" >/dev/null 2>&1 & o
 expect "--replace refuses while a process still carries the old worker's path" 1 "a CLI from the previous launch is still running" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
 kill "$orphan" 2>/dev/null; wait "$orphan" 2>/dev/null
+rm -rf "$ISSUE_WAVE_STATE/replaced"; : > "$ISSUE_WAVE_STATE/replaced"
+expect "--replace with an unusable archive namespace refuses and changes nothing" 1 "cannot archive the previous record .* nothing was changed" -- \
+  "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
+[ -s "$ISSUE_WAVE_STATE/workers/w1/stream.jsonl" ] && [ -f "$ISSUE_WAVE_STATE/workers/w1/exit" ] && ok "the old record is intact" || ko "old record damaged by a failed archive"
+rm -f "$ISSUE_WAVE_STATE/replaced"
 oldstream=$(cat "$ISSUE_WAVE_STATE/workers/w1/stream.jsonl")
 expect "--replace archives the previous record and starts a fresh one" 0 "LAUNCHED testbox/w1 .* replaced=.*/replaced/w1-" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
@@ -332,8 +342,14 @@ launched=$(cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -c '^LAUNCHED testbox/du
 [ "$launched" -eq 1 ] && ok "two overlapping launches of one name: exactly one LAUNCHED" || ko "overlapping launches: $launched LAUNCHED -- $(cat "$TMP/dup-a.out" "$TMP/dup-b.out")"
 cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -q 'another launch of this name is in progress\|already running' && ok "the other was refused by the lock or the liveness guard" || ko "no refusal for the overlapping launch"
 [ -d "$ISSUE_WAVE_STATE/locks/dup" ] && ko "launch lock left behind" || ok "launch lock released"
+mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo 999999 > "$ISSUE_WAVE_STATE/locks/q/pid"
+expect "a lock left by a dead holder is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj"
+"$FW" attach testbox q --interval 1 >/dev/null
+mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo $$ > "$ISSUE_WAVE_STATE/locks/q/pid"
+expect "a lock held by a live process still refuses" 1 "another launch or unstick of this name is in progress" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace
+rm -rf "$ISSUE_WAVE_STATE/locks/q"
 "$FW" launch testbox q.mutating --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox q.mutating --interval 1 >/dev/null
-expect "a worker named like a lock suffix does not block its sibling" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj"
+expect "a worker named like a lock suffix does not block its sibling" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace
 "$FW" attach testbox q --interval 1 >/dev/null
 "$FW" attach testbox dup --interval 1 >/dev/null
 "$FW" unstick testbox dup --message "$TMP/msg.md" >"$TMP/un-a.out" 2>&1 & ua=$!
@@ -359,6 +375,10 @@ expect "status recovers the thread id from the stream when meta lacks it" 0 "ses
 expect "codex unstick resumes by thread id (from the stream) with --yolo" 0 "RESUMED testbox/c1 kind=codex session=0199-shim-" -- "$FW" unstick testbox c1 --message "$TMP/msg.md"
 tid=$(sed -n 's/^session=//p' "$ISSUE_WAVE_STATE/workers/c1/meta" | head -n1)
 grep -q -- "codex exec resume $tid --yolo --json -" "$ISSUE_WAVE_STATE/workers/c1/run.sh" && ok "codex resume command shape" || ko "codex resume: $(cat "$ISSUE_WAVE_STATE/workers/c1/run.sh")"
+"$FW" attach testbox c1 --interval 1 >/dev/null
+expect "a resumed turn that emits nothing is FAILED even though the first turn succeeded" 1 "FAILED testbox/c1 exit=0 no terminal event" -- \
+  env SHIM_CODEX_SILENT_RESUME=1 bash -c '"$0" unstick testbox c1 --message "$1" && "$0" attach testbox c1 --interval 1' "$FW" "$TMP/msg.md"
+"$FW" unstick testbox c1 --message "$TMP/msg.md" >/dev/null
 expect "the resumed codex turn's verdict carries the NEW message, from the stream" 0 "DONE testbox/c1 exit=0 turn.completed .*| codex did: Stop and answer now" -- "$FW" attach testbox c1 --interval 1
 
 echo "--- halt"

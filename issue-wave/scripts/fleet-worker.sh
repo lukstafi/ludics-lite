@@ -62,7 +62,8 @@
 # FLEET_ANCHOR_STATE (the anchor's state dir, default the same as ISSUE_WAVE_STATE), FLEET_BOXES
 # (the whole fleet, "mac-studio rog-nv-wsl minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/self-improve), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
 # FLEET_TMUX_SOCKET (tmux -L name; tests isolate with it), FLEET_FLOTILLA (http://mac-studio:7799),
-# FLEET_LOCK_WAIT (seconds a `claim --take` waits for a concurrent takeover to finish; 10).
+# FLEET_LOCK_WAIT (seconds a lease mutation waits for a concurrent one to finish; 10),
+# FLEET_PROBE_TIMEOUT (wall-clock bound on the preflight's live headless turn; 120).
 
 set -uo pipefail
 
@@ -128,6 +129,23 @@ session_of() {
 re_lit() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g'; }
 alive() { tm has-session -t "iw-$1" 2>/dev/null; }
 WORKERS="$STATE/workers"
+# take_lock <dir> <wait-seconds> <label>: a mkdir lock that records its holder's pid, so a lock
+# left by a killed shell or a rebooted box is reclaimed instead of wedging the name forever.
+# Prints nothing on success; on failure prints one line and returns 1. Release with rmdir.
+take_lock() {
+  local lock="$1" wait="$2" label="$3" waited=0 holder
+  until mkdir "$lock" 2>/dev/null; do
+    [ -d "$lock" ] || { echo "$label: cannot create lock $lock (unwritable?)"; return 1; }
+    holder=$(cat "$lock/pid" 2>/dev/null)
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null; continue   # dead holder: reclaim
+    fi
+    [ "$waited" -lt "$wait" ] || { echo "$label: lock $lock held ${holder:+by pid $holder }for ${wait}s -- another operation in progress"; return 1; }
+    sleep 1; waited=$((waited + 1))
+  done
+  echo $$ > "$lock/pid"
+}
+release_lock() { rm -f "$1/pid"; rmdir "$1" 2>/dev/null; }
 # The pattern that finds a worker's CLI by its own command line: a claude or codex command
 # word, then the session id (claude, and codex after a resume) or this worker's state dir
 # (codex's -o). The command-word anchor keeps a `tail -f .../stream.jsonl` or an editor on a
@@ -245,19 +263,35 @@ anchor_gate() {
 # the per-launch refusal the skill promises is enforced here rather than remembered.
 preflight_script() {
   cat <<'EOF'
-codex="$1" probe="$2"
+codex="$1" probe="$2" probe_timeout="$3"
 refuse=""
 note() { refuse="$refuse; $*"; }
+# bounded <secs> <cmd...>: run with stdin from the caller, kill the whole group at the deadline
+# (no `timeout` on stock macOS). Output on stdout; exit 124 on expiry.
+bounded() {
+  local secs="$1"; shift
+  local out rcf pid waited=0 rc c
+  out=$(mktemp "${TMPDIR:-/tmp}/fw-probe.XXXXXX"); rcf=$(mktemp "${TMPDIR:-/tmp}/fw-probe-rc.XXXXXX")
+  # Everything under the probe writes to files or /dev/null: nothing it spawns may inherit the
+  # caller's stdout, or a lingering child would hold a command substitution open.
+  ( "$@" > "$out" 2>&1; echo $? > "$rcf" ) >/dev/null 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$secs" ]; do sleep 1; waited=$((waited + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    for c in $(pgrep -P "$pid" 2>/dev/null); do pkill -P "$c" 2>/dev/null; kill "$c" 2>/dev/null; done
+    kill "$pid" 2>/dev/null; rc=124
+  else
+    rc=$(cat "$rcf" 2>/dev/null); rc=${rc:-1}
+  fi
+  wait "$pid" 2>/dev/null
+  cat "$out"; rm -f "$out" "$rcf"; return "$rc"
+}
 # One preflight per box at a time: a parallel group launched together would otherwise race
 # `git fetch`/`merge` in the same checkout and refuse on git's own lock files. Idempotent, so
 # waiting for the other preflight is the right thing; the bound covers a hung live probe.
-mkdir -p "$STATE" 2>/dev/null; plock="$STATE/preflight.lock"; waited=0
-until mkdir "$plock" 2>/dev/null; do
-  [ -d "$plock" ] || { echo "PREFLIGHT REFUSED $BOX: cannot create $plock (state dir unwritable?)"; exit 1; }
-  [ "$waited" -lt 180 ] || { echo "PREFLIGHT REFUSED $BOX: another preflight has held $plock for 180s -- hung probe, or a stale lock to remove by hand"; exit 1; }
-  sleep 1; waited=$((waited + 1))
-done
-trap 'rmdir "$plock" 2>/dev/null' EXIT
+mkdir -p "$STATE" 2>/dev/null; plock="$STATE/preflight.lock"
+msg=$(take_lock "$plock" 180 "PREFLIGHT REFUSED $BOX") || { echo "$msg"; exit 1; }
+trap 'release_lock "$plock"' EXIT
 repo=$(expand_tilde "$SKILLS_REPO")
 if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
   echo "PREFLIGHT REFUSED $BOX: no skills checkout at $repo"; exit 1
@@ -305,8 +339,9 @@ if [ "$codex" = 1 ]; then
   codex login status >/dev/null 2>&1 || note "codex not logged in"
   # A status read is not a proof either way; only a live headless turn is.
   if [ "$probe" = 1 ] && command -v codex >/dev/null 2>&1; then
-    out=$(cd / && printf 'Reply with the single word ok.' | codex exec --json --ephemeral --skip-git-repo-check -C / - 2>&1)
-    if ! printf '%s' "$out" | grep -q '"type":"turn.completed"'; then
+    out=$(cd / && printf 'Reply with the single word ok.' | bounded "$probe_timeout" codex exec --json --ephemeral --skip-git-repo-check -C / -); prc=$?
+    if [ "$prc" -eq 124 ]; then note "codex headless probe timed out after ${probe_timeout}s"
+    elif ! printf '%s' "$out" | grep -q '"type":"turn.completed"'; then
       note "codex cannot run headless: $(printf '%s' "$out" | grep -o '"message":"[^"]*"' | head -n1 | cut -c1-120)"
     fi
   fi
@@ -315,8 +350,9 @@ else
   # `claude auth status` reports loggedIn:true over an expired, unrefreshable OAuth session
   # (observed 2026-09-02 on minix); only a live turn proves the CLI can run headless here.
   if [ "$probe" = 1 ] && command -v claude >/dev/null 2>&1; then
-    out=$(cd / && printf 'Reply with the single word ok.' | claude -p --model haiku --output-format json --no-session-persistence 2>&1)
-    if ! printf '%s' "$out" | grep -q '"is_error":false'; then
+    out=$(cd / && printf 'Reply with the single word ok.' | bounded "$probe_timeout" claude -p --model haiku --output-format json --no-session-persistence); prc=$?
+    if [ "$prc" -eq 124 ]; then note "claude headless probe timed out after ${probe_timeout}s"
+    elif ! printf '%s' "$out" | grep -q '"is_error":false'; then
       note "claude cannot run headless: $(printf '%s' "$out" | grep -o '"result":"[^"]*"' | head -n1 | cut -c1-120)"
     fi
   fi
@@ -342,7 +378,7 @@ cmd_preflight() {
     esac
     shift
   done
-  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe"
+  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}"
   local rc=$?
   if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; exit 4; fi
   exit "$rc"
@@ -377,7 +413,7 @@ cmd_launch() {
   fi
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
   local codex=0 pf; [ "$kind" = codex ] && codex=1
-  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 )
+  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" )
   local prc=$?
   if unreachable "$prc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: $pf"; exit 1; }
@@ -402,8 +438,8 @@ refuse() { rm -f "$incoming"; echo "LAUNCH REFUSED $BOX/$name: $*"; exit 1; }
 # One launch of a name at a time: the guards below and the record writes after them are one
 # critical section, held until the tmux session exists (or this launch has refused).
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
-if ! mkdir "$wlock" 2>/dev/null; then refuse "another launch or unstick of this name is in progress (lock $wlock)"; fi
-trap 'rmdir "$wlock" 2>/dev/null' EXIT
+msg=$(take_lock "$wlock" 0 "lock") || refuse "another launch or unstick of this name is in progress ($msg)"
+trap 'release_lock "$wlock"' EXIT
 if alive "$name"; then refuse "already running"; fi
 if [ -f "$d/meta" ]; then
   # tmux gone is not the CLI gone: a reparented orphan can still write and commit, and
@@ -423,10 +459,13 @@ archive=""
 if [ -f "$d/meta" ]; then
   # --replace keeps the previous record whole under $STATE/replaced/ (evidence), and a refusal
   # below puts it back; nothing of it is truncated in place.
-  mkdir -p "$STATE/replaced"; archive="$STATE/replaced/$name-$stamp"
-  mv "$d" "$archive" 2>/dev/null && mkdir -p "$d" && mv "$archive/incoming-$stamp.md" "$incoming" 2>/dev/null ||
-    { rm -rf "$d"; [ -d "$archive" ] && mv "$archive" "$d"; echo "LAUNCH REFUSED $BOX/$name: cannot archive the previous record to $archive"; exit 1; }
+  mkdir -p "$STATE/replaced" 2>/dev/null; archive="$STATE/replaced/$name-$stamp"
+  if ! mv "$d" "$archive" 2>/dev/null || [ ! -d "$archive" ]; then
+    archive=""; refuse "cannot archive the previous record to $STATE/replaced/ (unwritable, or a file in the way); nothing was changed"
+  fi
+  # From here the old record lives in $archive; any refusal puts it back whole.
   refuse() { rm -f "$incoming"; rm -rf "$d"; mv "$archive" "$d" 2>/dev/null; echo "LAUNCH REFUSED $BOX/$name: $* (previous record restored)"; exit 1; }
+  mkdir -p "$d" && mv "$archive/incoming-$stamp.md" "$incoming" 2>/dev/null || refuse "cannot start a fresh record at $d"
 fi
 if [ -z "$cwd" ]; then
   repo=$(expand_tilde "$repo")
@@ -451,7 +490,7 @@ fi
 [ ! -d "$d/brief.md" ] || refuse "cannot install the brief: $d/brief.md is a directory"
 mv -f "$incoming" "$d/brief.md" 2>/dev/null && [ -f "$d/brief.md" ] || refuse "cannot install the brief at $d/brief.md"
 { : > "$d/stream.jsonl" && : > "$d/stderr.log" && rm -f "$d/exit" && [ ! -e "$d/exit" ]; } 2>/dev/null ||
-  { echo "LAUNCH REFUSED $BOX/$name: cannot initialize the worker record under $d"; exit 1; }
+  refuse "cannot initialize the worker record under $d"
 # The CLI line itself, written to a file tmux runs: nothing from the brief is ever a shell word.
 {
   printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
@@ -463,13 +502,13 @@ mv -f "$incoming" "$d/brief.md" 2>/dev/null && [ -f "$d/brief.md" ] || refuse "c
   [ "$kind" = codex ] && printf ' -'
   printf ' < %q >> %q 2>> %q\n' "$d/brief.md" "$d/stream.jsonl" "$d/stderr.log"
   printf 'echo $? > %q\n' "$d/exit"
-} > "$d/run.sh" || { echo "LAUNCH REFUSED $BOX/$name: cannot write $d/run.sh"; exit 1; }
+} > "$d/run.sh" || refuse "cannot write $d/run.sh"
 {
   echo "kind=$kind"; echo "cwd=$cwd"; echo "box=$(hostname -s)"; echo "coordinator=$coord"
-  echo "launched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "resumes=0"
+  echo "launched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "resumes=0"; echo "turn_offset=0"
   if [ -n "$sid" ]; then echo "session=$sid"; fi
-} > "$d/meta" || { echo "LAUNCH REFUSED $BOX/$name: cannot write $d/meta"; exit 1; }
-tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || { echo "LAUNCH REFUSED $BOX/$name: tmux failed"; exit 1; }
+} > "$d/meta" || refuse "cannot write $d/meta"
+tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || refuse "tmux failed"
 if [ "$kind" = codex ]; then
   # The thread id is the resume address; it is the first event, but the exec takes a moment. If
   # this connection drops before it is recorded, session_of recovers it from the stream later.
@@ -501,14 +540,17 @@ verdict() {
     echo "VANISHED $BOX/$name: no exit record (killed, or the CLI never started; an orphaned CLI ran on past tmux if the stream moved -- see $d/stderr.log)"; return 3
   fi
   rc=$(cat "$d/exit")
-  # The LAST terminal event decides (a resumed turn appends after the first one's); a stream
-  # with no terminal event is not a success whatever the exit code said.
+  # Only THIS turn's events count: the stream is append-only across resumes, so the verdict
+  # reads past the turn_offset the launch/unstick recorded; a turn with no terminal event of
+  # its own is not a success whatever the exit code said.
+  local off; off=$(meta_get "$d" turn_offset); off=${off:-0}
+  turn() { tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null; }
   case "$kind" in
-    claude) summary=$(jq -r 'select(.type=="result") | "\(.subtype) is_error=\(.is_error) turns=\(.num_turns) " + ((.result // "")|tostring|.[0:200]|gsub("\n";" "))' "$d/stream.jsonl" 2>/dev/null | tail -n1)
+    claude) summary=$(turn | jq -r 'select(.type=="result") | "\(.subtype) is_error=\(.is_error) turns=\(.num_turns) " + ((.result // "")|tostring|.[0:200]|gsub("\n";" "))' 2>/dev/null | tail -n1)
             ok_event=$(printf '%s' "$summary" | grep -c 'is_error=false') ;;
-    codex)  summary=$(jq -r 'select(.type=="turn.completed" or .type=="turn.failed") | .type + " " + ((.error.message // "")|tostring|.[0:200])' "$d/stream.jsonl" 2>/dev/null | tail -n1)
+    codex)  summary=$(turn | jq -r 'select(.type=="turn.completed" or .type=="turn.failed") | .type + " " + ((.error.message // "")|tostring|.[0:200])' 2>/dev/null | tail -n1)
             ok_event=$(printf '%s' "$summary" | grep -c '^turn.completed')
-            last=$(jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text' "$d/stream.jsonl" 2>/dev/null | tail -n1 | cut -c1-200)
+            last=$(turn | jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text' 2>/dev/null | tail -n1 | cut -c1-200)
             [ -n "$last" ] && summary="$summary | $last" ;;
   esac
   [ -n "$summary" ] || summary="no terminal event in the stream"
@@ -641,8 +683,8 @@ d="$WORKERS/$name"
 [ -f "$d/meta" ] || { echo "UNSTICK REFUSED $BOX/$name: never launched here"; exit 1; }
 # Same critical section as launch: liveness checks through tmux creation, one at a time.
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
-if ! mkdir "$wlock" 2>/dev/null; then echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress (lock $wlock)"; exit 1; fi
-trap 'rmdir "$wlock" 2>/dev/null' EXIT
+msg=$(take_lock "$wlock" 0 "lock") || { echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress ($msg)"; exit 1; }
+trap 'release_lock "$wlock"' EXIT
 kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd); sid=$(session_of "$d")
 [ -n "$sid" ] || { echo "UNSTICK REFUSED $BOX/$name: no session id in meta or stream"; exit 1; }
 [ -d "$cwd" ] || { echo "UNSTICK REFUSED $BOX/$name: recorded working directory $cwd is gone (worktree removed or renamed); nothing was changed"; exit 1; }
@@ -682,7 +724,11 @@ fi
   printf 'echo $? > %q\n' "$d/exit"
 } > "$d/run.sh" 2>/dev/null && [ -s "$d/run.sh" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot write $d/run.sh (a directory in its place, or unwritable)"; exit 1; }
 n=$(meta_get "$d" resumes); n=$(( ${n:-0} + 1 ))
-sed -i.bak "s/^resumes=.*/resumes=$n/" "$d/meta" 2>/dev/null && rm -f "$d/meta.bak" && grep -q "^resumes=$n\$" "$d/meta" ||
+# The verdict of THIS turn must come from events appended after this point, never from the
+# previous turn's terminal event: record where the new turn's output starts.
+off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
+grep -q '^turn_offset=' "$d/meta" || echo "turn_offset=0" >> "$d/meta"
+sed -i.bak "s/^resumes=.*/resumes=$n/; s/^turn_offset=.*/turn_offset=$off/" "$d/meta" 2>/dev/null && rm -f "$d/meta.bak" && grep -q "^resumes=$n\$" "$d/meta" && grep -q "^turn_offset=$off\$" "$d/meta" ||
   { echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
 # The previous terminal state is evidence until the resume has really started: set it aside,
 # and put it back if tmux refuses.
@@ -746,13 +792,9 @@ cmd_load() {
 lease_mutation_prelude() {
   cat <<'EOF'
 verb="$1" token="$2" lockwait="$3"; shift 3
-mkdir -p "$ANCHOR_STATE" 2>/dev/null; lease="$ANCHOR_STATE/COORDINATOR"; lock="$lease.lock"; waited=0
-until mkdir "$lock" 2>/dev/null; do
-  [ -d "$lock" ] || { echo "$verb FAILED: cannot create the lease lock $lock on $BOX (anchor state unwritable?)"; exit 1; }
-  [ "$waited" -lt "$lockwait" ] || { echo "$verb FAILED: lease lock $lock held for ${lockwait}s on $BOX -- an adoption in progress, or a stale lock to remove by hand"; exit 1; }
-  sleep 1; waited=$((waited + 1))
-done
-trap 'rmdir "$lock" 2>/dev/null' EXIT
+mkdir -p "$ANCHOR_STATE" 2>/dev/null; lease="$ANCHOR_STATE/COORDINATOR"; lock="$lease.lock"
+msg=$(take_lock "$lock" "$lockwait" "$verb FAILED: lease lock on $BOX") || { echo "$msg"; exit 1; }
+trap 'release_lock "$lock"' EXIT
 held=$(sed -n 's/^token=//p' "$lease" 2>/dev/null); hhost=$(sed -n 's/^host=//p' "$lease" 2>/dev/null)
 [ -n "$token" ] && [ "$held" = "$token" ] || { echo "$verb REFUSED fleet: coordinator lease held by ${hhost:-nobody} -- not you (adopted since your gate?)"; exit 1; }
 EOF
@@ -815,13 +857,9 @@ mkdir -p "$ANCHOR_STATE"; lease="$ANCHOR_STATE/COORDINATOR"
 record() { printf 'host=%s\ntoken=%s\nsince=%s\n' "$host" "$token" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
 # Every lease mutation - first claim, idempotent re-claim, takeover - runs under one lock, so
 # a claim cannot slip between a release and a queued takeover and leave two believers.
-lock="$lease.lock"; waited=0
-until mkdir "$lock" 2>/dev/null; do
-  [ -d "$lock" ] || { echo "CLAIM FAILED: cannot create the lease lock $lock on $BOX (anchor state unwritable?)"; exit 1; }
-  [ "$waited" -lt "$lockwait" ] || { echo "CLAIM FAILED: lease lock $lock held for ${lockwait}s on $BOX -- another claim or adoption in progress, or a stale lock to remove by hand"; exit 1; }
-  sleep 1; waited=$((waited + 1))
-done
-trap 'rmdir "$lock" 2>/dev/null' EXIT
+lock="$lease.lock"
+msg=$(take_lock "$lock" "$lockwait" "CLAIM FAILED: lease lock on $BOX") || { echo "$msg"; exit 1; }
+trap 'release_lock "$lock"' EXIT
 verified() { [ "$(sed -n 's/^token=//p' "$lease" 2>/dev/null)" = "$token" ]; }
 if [ ! -f "$lease" ]; then
   if ( set -o noclobber; record > "$lease" ) 2>/dev/null && verified; then echo "CLAIMED coordinator lease on $BOX for $host"; exit 0; fi
@@ -848,13 +886,9 @@ cmd_release() {
 token="$1" lockwait="$2"; lease="$ANCHOR_STATE/COORDINATOR"
 # The token check and the removal happen under the same lock takeovers use, so a release
 # racing an adoption cannot delete the successor's freshly written lease.
-lock="$lease.lock"; waited=0
-until mkdir "$lock" 2>/dev/null; do
-  [ -d "$lock" ] || { echo "RELEASE FAILED: cannot create the lease lock $lock on $BOX (anchor state unwritable?) -- the lease is still held"; exit 1; }
-  [ "$waited" -lt "$lockwait" ] || { echo "RELEASE FAILED: lease lock $lock held for ${lockwait}s on $BOX -- an adoption in progress, or a stale lock to remove by hand"; exit 1; }
-  sleep 1; waited=$((waited + 1))
-done
-trap 'rmdir "$lock" 2>/dev/null' EXIT
+lock="$lease.lock"
+msg=$(take_lock "$lock" "$lockwait" "RELEASE FAILED: lease lock on $BOX") || { echo "$msg -- the lease is still held"; exit 1; }
+trap 'release_lock "$lock"' EXIT
 [ -f "$lease" ] || { echo "RELEASE: no lease held"; exit 0; }
 held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease")
 [ "$held" = "$token" ] || { echo "RELEASE REFUSED: lease held by $hhost, not you"; exit 1; }
