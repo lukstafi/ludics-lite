@@ -82,6 +82,7 @@ cat > "$TMP/bin/codex" <<'EOF'
 #!/usr/bin/env bash
 [ "$1" = login ] && exit 0
 [ "$1" = exec ] && shift
+if [ -n "${SHIM_CODEX_DOWN:-}" ]; then printf '{"type":"thread.started","thread_id":"x"}\n{"type":"turn.failed","error":{"message":"401 Unauthorized"}}\n'; exit 1; fi
 tid=""; out=""
 if [ "${1:-}" = resume ]; then shift; tid="$1"; shift; fi
 while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; esac; shift; done
@@ -125,6 +126,22 @@ expect "the previous holder now sees the lease as not theirs" 1 "(not you)" -- "
 expect "...and takes it back with --take" 0 "CLAIMED (adopted)" -- "$FW" claim --take
 expect "another session on the same box (same state dir) is not the holder" 1 "CLAIM REFUSED" -- env FLEET_COORDINATOR=other-session "$FW" claim
 expect "...and cannot launch through the holder's token" 1 "coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" launch testbox nope --kind claude --brief /dev/null --cwd "$TMP"
+# Two adopters at once: the takeover lock serializes them, exactly one holds afterwards.
+env FLEET_COORDINATOR=race-a "$FW" claim --take >"$TMP/race-a.out" 2>&1 & ra=$!
+env FLEET_COORDINATOR=race-b "$FW" claim --take >"$TMP/race-b.out" 2>&1 & rb=$!
+wait "$ra" "$rb"
+holders=0
+env FLEET_COORDINATOR=race-a "$FW" coordinator 2>&1 | grep -q "COORDINATOR: you" && holders=$((holders + 1))
+env FLEET_COORDINATOR=race-b "$FW" coordinator 2>&1 | grep -q "COORDINATOR: you" && holders=$((holders + 1))
+[ "$holders" -eq 1 ] && ok "concurrent takeovers leave exactly one holder" || ko "concurrent takeovers: $holders holders -- $(cat "$TMP/race-a.out" "$TMP/race-b.out")"
+[ -d "$ISSUE_WAVE_STATE/COORDINATOR.lock" ] && ko "takeover lock left behind" || ok "takeover lock released"
+mkdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
+expect "a held takeover lock makes --take fail after the bounded wait" 1 "CLAIM FAILED: takeover lock" -- env FLEET_LOCK_WAIT=1 "$FW" claim --take
+rmdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
+"$FW" claim --take >/dev/null
+mkdir -p "$TMP/state-c"; : > "$TMP/state-c/tokens"
+expect "a token that cannot be persisted refuses the claim" 1 "CLAIM REFUSED: cannot persist" -- env ISSUE_WAVE_STATE="$TMP/state-c" FLEET_ANCHOR_STATE="$ISSUE_WAVE_STATE" FLEET_COORDINATOR=c "$FW" claim --take
+grep -q '^token=$' "$ISSUE_WAVE_STATE/COORDINATOR" && ko "an empty token reached the lease" || ok "no empty-token lease was written"
 expect "an identity outside the safe set is refused, not folded" 2 "coordinator identity 'team/a' must be" -- env FLEET_COORDINATOR=team/a "$FW" claim
 chmod 555 "$ISSUE_WAVE_STATE"
 expect "release that cannot remove the lease says so, exit 1" 1 "RELEASE FAILED: could not remove" -- "$FW" release
@@ -137,7 +154,8 @@ rmdir "$ISSUE_WAVE_STATE/COORDINATOR"
 
 echo "--- preflight"
 expect "clean main on origin passes (claude, live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox
-expect "clean main passes for codex" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --codex
+expect "clean main passes for codex (live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --codex
+expect "codex that cannot run headless refuses despite login status" 1 "codex cannot run headless: \"message\":\"401 Unauthorized\"" -- env SHIM_CODEX_DOWN=1 "$FW" preflight testbox --codex
 echo x >> "$repo/ClaudeDesktop/skills/ship-pr/SKILL.md"
 expect "tracked change refuses" 1 "tracked change" -- "$FW" preflight testbox --no-probe
 git -C "$repo" checkout -q -- .
@@ -275,6 +293,9 @@ kill -0 "$orphan" 2>/dev/null && ok "the orphan was not killed by the refused un
 expect "unstick --kill terminates the orphan and resumes" 0 "RESUMED testbox/wo" -- "$FW" unstick testbox wo --message "$TMP/msg.md" --kill
 kill -0 "$orphan" 2>/dev/null && ko "orphan survived --kill" || ok "--kill terminated the orphan"
 "$FW" attach testbox wo --interval 1 >/dev/null
+mv "$ISSUE_WAVE_STATE/workers/wo/run.sh" "$TMP/run.saved"; mkdir "$ISSUE_WAVE_STATE/workers/wo/run.sh"
+expect "unstick refuses when the resume script cannot be written" 1 "UNSTICK REFUSED testbox/wo: cannot write .*run.sh" -- "$FW" unstick testbox wo --message "$TMP/msg.md"
+rmdir "$ISSUE_WAVE_STATE/workers/wo/run.sh"; mv "$TMP/run.saved" "$ISSUE_WAVE_STATE/workers/wo/run.sh"
 expect "a non-holder cannot unstick" 1 "UNSTICK REFUSED testbox/wo: coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" unstick testbox wo --message "$TMP/msg.md"
 
 echo "--- codex workers"
@@ -316,6 +337,8 @@ expect "bad worker name refuses" 2 "name must be" -- "$FW" launch testbox "bad n
 expect "dot names refuse" 2 "name must be" -- "$FW" launch testbox .. --kind claude --brief "$brief" --cwd "$proj"
 expect "unstick validates the name before writing anything" 2 "unstick: name must be" -- "$FW" unstick testbox ../escape --message "$TMP/msg.md"
 expect "status validates the name" 2 "status: name must be" -- "$FW" status testbox "a b"
+expect "attach rejects a zero interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval 0
+expect "attach rejects a non-numeric interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval fast
 expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --kind claude --brief "$TMP/none.md" --cwd "$proj"
 
 echo

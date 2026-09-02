@@ -60,7 +60,8 @@
 # (mac-studio; where lease and halt live),
 # FLEET_ANCHOR_STATE (the anchor's state dir, default the same as ISSUE_WAVE_STATE), FLEET_BOXES
 # (the whole fleet, "mac-studio rog-nv-wsl minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/self-improve), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
-# FLEET_TMUX_SOCKET (tmux -L name; tests isolate with it), FLEET_FLOTILLA (http://mac-studio:7799).
+# FLEET_TMUX_SOCKET (tmux -L name; tests isolate with it), FLEET_FLOTILLA (http://mac-studio:7799),
+# FLEET_LOCK_WAIT (seconds a `claim --take` waits for a concurrent takeover to finish; 10).
 
 set -uo pipefail
 
@@ -272,6 +273,13 @@ if [ "$codex" = 1 ]; then
   done
   command -v codex >/dev/null 2>&1 || note "no codex on PATH"
   codex login status >/dev/null 2>&1 || note "codex not logged in"
+  # A status read is not a proof either way; only a live headless turn is.
+  if [ "$probe" = 1 ] && command -v codex >/dev/null 2>&1; then
+    out=$(cd / && printf 'Reply with the single word ok.' | codex exec --json --ephemeral -C / - 2>&1)
+    if ! printf '%s' "$out" | grep -q '"type":"turn.completed"'; then
+      note "codex cannot run headless: $(printf '%s' "$out" | grep -o '"message":"[^"]*"' | head -n1 | cut -c1-120)"
+    fi
+  fi
 else
   command -v claude >/dev/null 2>&1 || note "no claude on PATH"
   # `claude auth status` reports loggedIn:true over an expired, unrefreshable OAuth session
@@ -470,6 +478,7 @@ cmd_attach() {
   while [ $# -gt 0 ]; do
     case "$1" in --interval) interval="${2:-30}"; shift ;; *) die "attach: unknown option $1" ;; esac; shift
   done
+  case "$interval" in ''|*[!0-9]*|0) die "attach: --interval must be a positive number of seconds" ;; esac
   # The far side waits; a dropped connection (box asleep, tailnet blip) is retried here, from the
   # coordinator, because the worker is still running on its box regardless.
   local tries=0 rc
@@ -611,9 +620,10 @@ rm -f "$d/exit"
   [ "$kind" = codex ] && printf ' -'
   printf ' < %q >> %q 2>> %q\n' "$d/messages/$stamp.md" "$d/stream.jsonl" "$d/stderr.log"
   printf 'echo $? > %q\n' "$d/exit"
-} > "$d/run.sh"
+} > "$d/run.sh" 2>/dev/null && [ -s "$d/run.sh" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot write $d/run.sh (a directory in its place, or unwritable)"; exit 1; }
 n=$(meta_get "$d" resumes); n=$(( ${n:-0} + 1 ))
-sed -i.bak "s/^resumes=.*/resumes=$n/" "$d/meta" && rm -f "$d/meta.bak"
+sed -i.bak "s/^resumes=.*/resumes=$n/" "$d/meta" 2>/dev/null && rm -f "$d/meta.bak" && grep -q "^resumes=$n\$" "$d/meta" ||
+  { echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
 tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || { echo "UNSTICK REFUSED $BOX/$name: tmux failed"; exit 1; }
 echo "RESUMED $BOX/$name kind=$kind session=$sid resume=$n message=$d/messages/$stamp.md"
 EOF
@@ -645,7 +655,8 @@ done
 EOF
     } | run_on "$box"
     rc=$?
-    if unreachable "$rc"; then echo "$box: unreachable"; worst=4; fi
+    if unreachable "$rc"; then echo "$box: unreachable"; worst=4
+    elif [ "$rc" -ne 0 ]; then echo "$box: inventory failed (exit $rc)"; [ "$worst" -eq 4 ] || worst=1; fi
   done
   exit "$worst"
 }
@@ -705,11 +716,12 @@ cmd_claim() {
   while [ $# -gt 0 ]; do case "$1" in --take) take=1 ;; *) die "claim: unknown option $1" ;; esac; shift; done
   local tf; tf=$(token_file)
   if [ ! -s "$tf" ]; then
-    mkdir -p "$(dirname "$tf")"
-    gen_uuid > "$tf" || printf '%s-%s-%s' "$(hostname -s)" "$(date +%s)" "$$" > "$tf"
+    mkdir -p "$(dirname "$tf")" 2>/dev/null
+    { gen_uuid || printf '%s-%s-%s' "$(hostname -s)" "$(date +%s)" "$$"; } > "$tf" 2>/dev/null
   fi
+  [ -s "$tf" ] || { echo "CLAIM REFUSED: cannot persist this coordinator's token at $tf"; exit 1; }
   { prelude "$ANCHOR"; cat <<'EOF'
-host="$1" token="$2" take="$3"
+host="$1" token="$2" take="$3" lockwait="$4"
 mkdir -p "$ANCHOR_STATE"; lease="$ANCHOR_STATE/COORDINATOR"
 record() { printf 'host=%s\ntoken=%s\nsince=%s\n' "$host" "$token" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
 if ( set -o noclobber; record > "$lease" ) 2>/dev/null; then
@@ -718,15 +730,24 @@ fi
 held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease"); since=$(sed -n 's/^since=//p' "$lease")
 if [ "$held" = "$token" ]; then echo "CLAIMED already held by $host since $since"; exit 0; fi
 if [ "$take" = 1 ]; then
+  # Takeovers serialize under a mkdir lock (atomic on every filesystem here), so two adopters
+  # cannot both write and each verify its own token before the other's write lands.
+  lock="$lease.lock"; waited=0
+  until mkdir "$lock" 2>/dev/null; do
+    [ "$waited" -lt "$lockwait" ] || { echo "CLAIM FAILED: takeover lock $lock held for ${lockwait}s on $BOX -- another adoption in progress, or a stale lock to remove by hand"; exit 1; }
+    sleep 1; waited=$((waited + 1))
+  done
+  held=$(sed -n 's/^token=//p' "$lease" 2>/dev/null); hhost=$(sed -n 's/^host=//p' "$lease" 2>/dev/null); since=$(sed -n 's/^since=//p' "$lease" 2>/dev/null)
   if record > "$lease" 2>/dev/null && [ "$(sed -n 's/^token=//p' "$lease" 2>/dev/null)" = "$token" ]; then
-    echo "CLAIMED (adopted) coordinator lease on $BOX for $host -- was $hhost since $since"; exit 0
+    rmdir "$lock"; echo "CLAIMED (adopted) coordinator lease on $BOX for $host -- was ${hhost:-nobody} since ${since:-never}"; exit 0
   fi
+  rmdir "$lock"
   echo "CLAIM FAILED: could not write the lease at $lease on $BOX (a directory in its place, or unwritable) -- not adopted"; exit 1
 fi
 echo "CLAIM REFUSED: coordinator lease held by $hhost since $since -- a wave is in flight; adopt with --take only if that coordinator is gone"
 exit 1
 EOF
-  } | run_on "$ANCHOR" "$(hostname -s)/$(coordinator_id)" "$(cat "$tf")" "$take"
+  } | run_on "$ANCHOR" "$(hostname -s)/$(coordinator_id)" "$(cat "$tf")" "$take" "${FLEET_LOCK_WAIT:-10}"
   local rc=$?; if unreachable "$rc"; then echo "CLAIM UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
 }
 
