@@ -36,12 +36,15 @@ the other boxes.
 - **Project conventions**: the repo's CLAUDE.md and agent-notes govern how workers work
   (worktree location, test discipline, commit style). The plan governs what and in which order.
 
-**One coordinator is checked, not assumed.** Before scoping, run `fleet-worker.sh ls`. A
-`RUNNING` worker launched by another coordinator means a wave is still in flight: read its
-board (the PRs its workers opened), adopt what it left, or defer - never start a second wave
-over the same scope. Two coordinators recreate every race this design removed, and the halt
-state below lives on the coordinator's own box, so a second coordinator would not even see a
-stop-the-world.
+**One coordinator is a lease, not an assumption.** Before scoping, `fleet-worker.sh claim`
+takes the fleet's coordinator lease - one file on the anchor box (mac-studio, wherever the
+coordinator itself runs), created atomically, naming the holder. A refusal means a wave is in
+flight: read its board (`fleet-worker.sh ls` for its workers, the PRs they opened), and either
+wait, or - only when that coordinator is demonstrably gone (its session dead, its workers all
+finished or stranded) - `claim --take` to adopt the wave with its halt state and its worker
+records intact. Every `launch`, `halt` and `resume-launches` proves the lease, so two
+coordinators cannot both drive; a point-in-time `ls` alone could not promise that, since two
+coordinators starting on an idle fleet would both see it empty. `release` at close-out.
 
 ## Scope and sequencing
 
@@ -356,7 +359,9 @@ The coordinator's job between launch and last merge:
   accumulation.
 - **On a regression, stop the world - as a mechanism.** `fleet-worker.sh halt "<what
   regressed, who owns the fix>"` makes every subsequent `launch` refuse until
-  `resume-launches`; that is the "launch nothing new" half, enforced rather than remembered.
+  `resume-launches`; that is the "launch nothing new" half, enforced rather than remembered,
+  and it lives on the anchor box with the lease, so a coordinator that adopts the wave from
+  another box inherits the halt rather than launching into a known red.
   Then tell the running workers through the channel they already read - a `pr-review.sh
   comment` on every open wave PR stating that master's red is established and owned, so nobody
   bisects it independently - and dispatch one triage worker with `launch --force` (the only
@@ -409,7 +414,8 @@ The coordinator's job between launch and last merge:
 
 ## Close out
 
-When the last gate clears: `fleet-worker.sh ls` must show no `RUNNING` worker on any box;
+When the last gate clears: `fleet-worker.sh ls` must show no `RUNNING` worker on any box, and
+the lease is released last (`fleet-worker.sh release`), after the report below is written;
 then a final board (issue -> box -> PR -> merge state), residuals and follow-up issues, and any
 gates left for the next invocation. Workers ran `after-merge` in hand-back mode, so each
 close-out (`fleet-worker.sh log <box> <name>` for the final report; the stream file is the full

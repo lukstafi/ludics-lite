@@ -23,10 +23,15 @@
 #   - `unstick` refuses to resume a session whose exec is still alive: a resume beside a live exec
 #     gives the branch two writers, and the quiet stream that prompted the unstick does not prove
 #     the exec cannot still act;
-#   - `halt` is the stop-the-world mechanism: a file the launcher checks, so "launch nothing new"
-#     after an integration regression is enforced rather than remembered.
+#   - fleet-wide state -- the coordinator LEASE and the stop-the-world HALT -- lives on one anchor
+#     box (mac-studio, the always-on controller), never on whichever box the coordinator happens
+#     to run on: `claim` takes the lease atomically, every `launch` proves it holds it, and `halt`
+#     is a file on the anchor the launcher checks, so "one coordinator" and "launch nothing new
+#     after an integration regression" are enforced rather than remembered.
 #
 # Usage:
+#   fleet-worker.sh claim [--take]         # take the fleet's coordinator lease (--take adopts)
+#   fleet-worker.sh coordinator | release  # who holds it (exit 0 me, 1 other, 3 nobody) / give it up
 #   fleet-worker.sh preflight <box> [--codex] [--no-probe]
 #   fleet-worker.sh launch <box> <name> --kind claude|codex --brief <file>
 #                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
@@ -39,22 +44,28 @@
 #   fleet-worker.sh load
 #   fleet-worker.sh halt <reason> | resume-launches | halted
 #
+# `launch`, `halt` and `resume-launches` require the lease; `launch` also refuses while halted
+# (`--force` admits the one triage worker). Lease and halt live on FLEET_ANCHOR.
+#
 # <box> is an ssh destination (rog-nv-wsl, minix-amd-wsl), or `local` / the value of
 # FLEET_LOCAL_BOX (default mac-studio) for the coordinator's own machine.
 #
 # Exit: 0 ok | 1 the fact does not hold (refused, worker failed, stale) | 2 usage |
 #       3 worker vanished without an exit record | 4 the box never answered.
 #
-# Env: FLEET_LOCAL_BOX (mac-studio), FLEET_BOXES (the whole fleet, "mac-studio rog-nv-wsl
-# minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/self-improve), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
+# Env: FLEET_LOCAL_BOX (mac-studio), FLEET_ANCHOR (mac-studio; where lease and halt live),
+# FLEET_ANCHOR_STATE (the anchor's state dir, default the same as ISSUE_WAVE_STATE), FLEET_BOXES
+# (the whole fleet, "mac-studio rog-nv-wsl minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/self-improve), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
 # FLEET_TMUX_SOCKET (tmux -L name; tests isolate with it), FLEET_FLOTILLA (http://mac-studio:7799).
 
 set -uo pipefail
 
 LOCAL_BOX="${FLEET_LOCAL_BOX:-mac-studio}"
+ANCHOR="${FLEET_ANCHOR:-mac-studio}"
 BOXES="${FLEET_BOXES:-mac-studio rog-nv-wsl minix-amd-wsl}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/self-improve}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
+ANCHOR_STATE="${FLEET_ANCHOR_STATE:-$STATE}"
 TMUX_SOCKET="${FLEET_TMUX_SOCKET:-}"
 FLOTILLA="${FLEET_FLOTILLA:-http://mac-studio:7799}"
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
@@ -63,14 +74,28 @@ die() { echo "fleet-worker.sh: $*" >&2; exit 2; }
 
 is_local() { [ "$1" = local ] || [ "$1" = "$LOCAL_BOX" ]; }
 
+# A configured path, expanded on THIS box (a default keeps a literal $HOME so the same value can
+# also be shipped to another box and expanded there).
+local_path() { case "$1" in '$HOME'/*) printf '%s' "$HOME/${1#\$HOME/}" ;; *) printf '%s' "$1" ;; esac; }
+# The same value as a far-side assignment: $HOME stays expandable, the rest is shell-quoted, so
+# a checkout under "/Volumes/Work Trees" is an assignment and not a command.
+emit_var() {
+  case "$2" in
+    '$HOME'/*) printf '%s="$HOME"/%q\n' "$1" "${2#\$HOME/}" ;;
+    *) printf '%s=%q\n' "$1" "$2" ;;
+  esac
+}
+
 # Every far-side script starts with this: the same paths, the same tmux invocation, the same
 # portable helpers, on macOS and Linux alike, and BOX = the name the coordinator addressed the
 # box by, so every line it prints is greppable by that name rather than by a hostname the
 # coordinator never typed. Single-quoted heredoc: nothing expands locally.
 prelude() {
-  printf 'STATE=%s\nSKILLS_REPO=%s\nTMUX_SOCKET=%q\nBOX=%q\n' "$STATE" "$SKILLS_REPO" "$TMUX_SOCKET" "$1"
+  emit_var STATE "$STATE"; emit_var SKILLS_REPO "$SKILLS_REPO"; emit_var ANCHOR_STATE "$ANCHOR_STATE"
+  printf 'TMUX_SOCKET=%q\nBOX=%q\n' "$TMUX_SOCKET" "$1"
   cat <<'EOF'
 set -uo pipefail
+expand_tilde() { case "$1" in '~/'*) printf '%s' "$HOME/${1#\~/}" ;; '~') printf '%s' "$HOME" ;; *) printf '%s' "$1" ;; esac; }
 tm() { if [ -n "$TMUX_SOCKET" ]; then tmux -L "$TMUX_SOCKET" "$@"; else tmux "$@"; fi; }
 mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 now() { date +%s; }
@@ -110,7 +135,7 @@ run_on() {
 put_file() {
   local box="$1" src="$2" dst="$3"
   if is_local "$box"; then
-    bash -c 'mkdir -p "$(dirname "$1")" && cat > "$1"' -- "$(eval echo "$dst")" < "$src"
+    bash -c 'mkdir -p "$(dirname "$1")" && cat > "$1"' -- "$(local_path "$dst")" < "$src"
   else
     # shellcheck disable=SC2086
     ssh $SSH_OPTS "$box" "mkdir -p \"\$(dirname \"$dst\")\" && cat > \"$dst\"" < "$src"
@@ -137,7 +162,33 @@ unreachable() { [ "$1" -eq 255 ]; }
 
 valid_name() { case "$1" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 
-halt_file() { eval echo "$STATE/HALT"; }
+# The coordinator's identity is a token in its own state dir; the lease on the anchor names it.
+token_file() { printf '%s/coordinator.token' "$(local_path "$STATE")"; }
+my_token() { cat "$(token_file)" 2>/dev/null; }
+
+# Far-side script for the anchor: lease + halt checks. Args: verb label force token.
+# Prints nothing when the coordinator may proceed; otherwise one refusal line, exit 1.
+anchor_gate_script() {
+  cat <<'EOF'
+verb="$1" label="$2" force="$3" token="$4"
+lease="$ANCHOR_STATE/COORDINATOR"
+if [ ! -f "$lease" ]; then echo "$verb REFUSED $label: no coordinator lease on the anchor -- run \`fleet-worker.sh claim\` first"; exit 1; fi
+held=$(sed -n 's/^token=//p' "$lease"); host=$(sed -n 's/^host=//p' "$lease"); since=$(sed -n 's/^since=//p' "$lease")
+if [ -z "$token" ] || [ "$held" != "$token" ]; then
+  echo "$verb REFUSED $label: coordinator lease held by $host since $since -- adopt it with \`fleet-worker.sh claim --take\` only if that coordinator is gone"; exit 1
+fi
+if [ "$force" != 1 ] && [ -f "$ANCHOR_STATE/HALT" ]; then
+  echo "$verb REFUSED $label: launches halted -- $(cat "$ANCHOR_STATE/HALT")"; exit 1
+fi
+EOF
+}
+# anchor_gate <verb> <label> <force>: exit 0 proceed, 1 refused (line printed), 4 anchor unreachable.
+anchor_gate() {
+  { prelude "$ANCHOR"; anchor_gate_script; } | run_on "$ANCHOR" "$1" "$2" "$3" "$(my_token)"
+  local rc=$?
+  if unreachable "$rc"; then echo "$1 REFUSED $2: anchor $ANCHOR unreachable (lease and halt live there)"; return 4; fi
+  return "$rc"
+}
 
 # ---------------------------------------------------------------------------------------------
 cmd_preflight() {
@@ -155,7 +206,7 @@ cmd_preflight() {
 codex="$1" probe="$2"
 refuse=""
 note() { refuse="$refuse; $*"; }
-repo=$(eval echo "$SKILLS_REPO")
+repo=$(expand_tilde "$SKILLS_REPO")
 if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
   echo "PREFLIGHT REFUSED $BOX: no skills checkout at $repo"; exit 1
 fi
@@ -163,10 +214,18 @@ git -C "$repo" fetch -q origin 2>/dev/null || note "fetch failed (offline?)"
 # Tracked modifications, and untracked files under the served tree, are divergence to surface.
 # Untracked files elsewhere (a stray .claude/ from running claude inside the checkout) are not
 # skill text and are only reported.
-dirty=$(git -C "$repo" status --porcelain 2>/dev/null)
-tracked=$(printf '%s\n' "$dirty" | grep -v '^??' | grep -c . || true)
-served=$(printf '%s\n' "$dirty" | grep '^?? ClaudeDesktop/' | grep -c . || true)
-other=$(printf '%s\n' "$dirty" | grep '^??' | grep -v '^?? ClaudeDesktop/' | sed 's/^?? //' | tr '\n' ' ')
+# NUL-delimited, so a path git would otherwise quote (a space, a quote, a non-ASCII byte) is
+# still classified by its directory rather than falling through as "outside the served tree".
+tracked=0; served=0; other=""
+while IFS= read -r -d '' entry; do
+  st=${entry:0:2}; path=${entry:3}
+  case "$st" in R*|C*) IFS= read -r -d '' _from ;; esac   # a rename's second record is the source
+  if [ "$st" = "??" ]; then
+    case "$path" in ClaudeDesktop/*) served=$((served + 1)) ;; *) other="$other$path " ;; esac
+  else
+    tracked=$((tracked + 1))
+  fi
+done < <(git -C "$repo" status --porcelain -z 2>/dev/null)
 [ "$tracked" -eq 0 ] || note "$tracked tracked change(s) in $repo"
 [ "$served" -eq 0 ] || note "$served untracked file(s) under ClaudeDesktop/"
 branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -176,18 +235,19 @@ if [ -z "$refuse" ]; then
 fi
 head=$(git -C "$repo" rev-parse HEAD 2>/dev/null); up=$(git -C "$repo" rev-parse origin/main 2>/dev/null)
 [ "$head" = "$up" ] || note "HEAD $(echo "$head" | cut -c1-9) != origin/main $(echo "$up" | cut -c1-9) (ahead, or offline)"
-# The deployed skills must be the symlinks the README installs, into THIS checkout - compared
-# as resolved paths, so a link through `..` cannot pass a lexical prefix test.
+# The deployed skills must be the symlinks the README installs, each into ITS OWN directory of
+# THIS checkout - compared as resolved paths, so neither a link through `..` nor two links
+# swapped within the checkout can pass.
 canon=$(cd "$repo" && pwd -P)
 resolved() { [ -L "$1" ] && (cd -P "$1" 2>/dev/null && pwd -P); }
 for s in issue-wave ship-pr wait-and-proceed after-merge; do
   t=$(resolved "$HOME/.claude/skills/$s")
-  case "$t" in "$canon"/ClaudeDesktop/skills/*) ;; *) note "~/.claude/skills/$s -> ${t:-missing/not a link} (not into $repo)" ;; esac
+  [ "$t" = "$canon/ClaudeDesktop/skills/$s" ] || note "~/.claude/skills/$s -> ${t:-missing/not a link} (not $repo/ClaudeDesktop/skills/$s)"
 done
 if [ "$codex" = 1 ]; then
   for s in ship-pr wait-and-proceed after-merge; do
     t=$(resolved "$HOME/.codex/skills/$s")
-    case "$t" in "$canon"/ClaudeDesktop/skills/*) ;; *) note "~/.codex/skills/$s -> ${t:-missing/not a link} (README's Codex loop not run)" ;; esac
+    [ "$t" = "$canon/ClaudeDesktop/skills/$s" ] || note "~/.codex/skills/$s -> ${t:-missing/not a link} (README's Codex loop not run)"
   done
   command -v codex >/dev/null 2>&1 || note "no codex on PATH"
   codex login status >/dev/null 2>&1 || note "codex not logged in"
@@ -243,10 +303,7 @@ cmd_launch() {
   if [ -z "$cwd" ]; then
     [ -n "$repo" ] && [ -n "$branch" ] || die "launch: --cwd <dir>, or --repo <dir> --branch <branch>"
   fi
-  if [ "$force" = 0 ] && [ -f "$(halt_file)" ]; then
-    echo "LAUNCH REFUSED $box/$name: launches halted -- $(cat "$(halt_file)")"
-    exit 1
-  fi
+  anchor_gate LAUNCH "$box/$name" "$force" || exit $?
   local sid=""
   if [ "$kind" = claude ]; then
     sid=$(gen_uuid) || { echo "LAUNCH REFUSED $box/$name: cannot generate a session id here (no uuidgen, /proc uuid, or python3)"; exit 1; }
@@ -260,6 +317,14 @@ name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8"
 d="$WORKERS/$name"; incoming="$d/incoming-$stamp.md"
 refuse() { rm -f "$incoming"; echo "LAUNCH REFUSED $BOX/$name: $*"; exit 1; }
 if alive "$name"; then refuse "already running"; fi
+if [ -f "$d/meta" ]; then
+  # tmux gone is not the CLI gone: a reparented orphan can still write and commit, and
+  # --replace must not put a second CLI beside it.
+  opat=$(re_lit "$d/"); osid=$(session_of "$d"); [ -n "$osid" ] && opat="$(re_lit "$osid")|$opat"
+  if pgrep -f -- "$opat" >/dev/null 2>&1; then
+    refuse "a CLI from the previous launch is still running ($(pgrep -fl -- "$opat" | head -n 2 | tr '\n' ';')); unstick --kill it, or wait"
+  fi
+fi
 if [ -f "$d/meta" ] && [ "$replace" != 1 ]; then
   if [ -f "$d/exit" ]; then
     refuse "a finished worker's record is here (its stream is close-out evidence); pick a new name, or --replace to overwrite"
@@ -267,7 +332,7 @@ if [ -f "$d/meta" ] && [ "$replace" != 1 ]; then
   refuse "a previous launch left no exit record (killed?); unstick it, or --replace"
 fi
 if [ -z "$cwd" ]; then
-  repo=$(eval echo "$repo")
+  repo=$(expand_tilde "$repo")
   cwd="$repo-worktrees/$name"
   if [ ! -d "$cwd" ]; then
     git -C "$repo" fetch -q origin || refuse "fetch failed in $repo"
@@ -279,7 +344,7 @@ if [ -z "$cwd" ]; then
     echo "notice: reusing existing worktree $cwd (on $branch)"
   fi
 else
-  cwd=$(eval echo "$cwd")
+  cwd=$(expand_tilde "$cwd")
 fi
 [ -d "$cwd" ] || refuse "no such directory $cwd"
 mv -f "$incoming" "$d/brief.md"
@@ -300,7 +365,7 @@ mv -f "$incoming" "$d/brief.md"
   echo "kind=$kind"; echo "cwd=$cwd"; echo "box=$(hostname -s)"; echo "coordinator=$coord"
   echo "launched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "resumes=0"; [ -n "$sid" ] && echo "session=$sid"
 } > "$d/meta"
-tm new-session -d -s "iw-$name" "bash $d/run.sh" || { echo "LAUNCH REFUSED $BOX/$name: tmux failed"; exit 1; }
+tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || { echo "LAUNCH REFUSED $BOX/$name: tmux failed"; exit 1; }
 if [ "$kind" = codex ]; then
   # The thread id is the resume address; it is the first event, but the exec takes a moment. If
   # this connection drops before it is recorded, session_of recovers it from the stream later.
@@ -488,7 +553,7 @@ rm -f "$d/exit"
 } > "$d/run.sh"
 n=$(meta_get "$d" resumes); n=$(( ${n:-0} + 1 ))
 sed -i.bak "s/^resumes=.*/resumes=$n/" "$d/meta" && rm -f "$d/meta.bak"
-tm new-session -d -s "iw-$name" "bash $d/run.sh" || { echo "UNSTICK REFUSED $BOX/$name: tmux failed"; exit 1; }
+tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || { echo "UNSTICK REFUSED $BOX/$name: tmux failed"; exit 1; }
 echo "RESUMED $BOX/$name kind=$kind session=$sid resume=$n message=$d/messages/$stamp.md"
 EOF
   } | run_on "$box" "$name" "$kill" "$stamp" "$@"
@@ -539,20 +604,87 @@ cmd_load() {
 # ---------------------------------------------------------------------------------------------
 cmd_halt() {
   local reason="$*"; [ -n "$reason" ] || die "halt: give the reason (what regressed, who owns the fix)"
-  local f; f=$(halt_file)
-  mkdir -p "$(dirname "$f")"
-  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" > "$f"
-  echo "HALTED: launches refused until resume-launches -- $reason"
+  anchor_gate HALT fleet 1 || exit $?
+  { prelude "$ANCHOR"; cat <<'EOF'
+mkdir -p "$ANCHOR_STATE"
+printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" > "$ANCHOR_STATE/HALT"
+echo "HALTED: launches refused until resume-launches -- $1"
+EOF
+  } | run_on "$ANCHOR" "$reason"
+  local rc=$?; if unreachable "$rc"; then echo "HALT UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
 }
 
 cmd_resume_launches() {
-  local f; f=$(halt_file)
-  if [ -f "$f" ]; then echo "RESUMED launches (was: $(cat "$f"))"; rm -f "$f"; else echo "launches were not halted"; fi
+  anchor_gate RESUME-LAUNCHES fleet 1 || exit $?
+  { prelude "$ANCHOR"; cat <<'EOF'
+f="$ANCHOR_STATE/HALT"
+if [ -f "$f" ]; then echo "RESUMED launches (was: $(cat "$f"))"; rm -f "$f"; else echo "launches were not halted"; fi
+EOF
+  } | run_on "$ANCHOR"
+  local rc=$?; if unreachable "$rc"; then echo "RESUME-LAUNCHES UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
 }
 
 cmd_halted() {
-  local f; f=$(halt_file)
-  if [ -f "$f" ]; then echo "HALTED $(cat "$f")"; exit 1; else echo "launches open"; exit 0; fi
+  { prelude "$ANCHOR"; cat <<'EOF'
+f="$ANCHOR_STATE/HALT"
+if [ -f "$f" ]; then echo "HALTED $(cat "$f")"; exit 1; else echo "launches open"; exit 0; fi
+EOF
+  } | run_on "$ANCHOR"
+  local rc=$?; if unreachable "$rc"; then echo "HALTED? UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
+}
+
+# ---------------------------------------------------------------------------------------------
+# The coordinator lease: one file on the anchor, created with O_EXCL (noclobber) so two
+# coordinators starting at once cannot both win, naming the holder's host and token.
+cmd_claim() {
+  local take=0
+  while [ $# -gt 0 ]; do case "$1" in --take) take=1 ;; *) die "claim: unknown option $1" ;; esac; shift; done
+  local tf; tf=$(token_file)
+  if [ ! -s "$tf" ]; then
+    mkdir -p "$(dirname "$tf")"
+    gen_uuid > "$tf" || printf '%s-%s-%s' "$(hostname -s)" "$(date +%s)" "$$" > "$tf"
+  fi
+  { prelude "$ANCHOR"; cat <<'EOF'
+host="$1" token="$2" take="$3"
+mkdir -p "$ANCHOR_STATE"; lease="$ANCHOR_STATE/COORDINATOR"
+record() { printf 'host=%s\ntoken=%s\nsince=%s\n' "$host" "$token" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
+if ( set -o noclobber; record > "$lease" ) 2>/dev/null; then
+  echo "CLAIMED coordinator lease on $BOX for $host"; exit 0
+fi
+held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease"); since=$(sed -n 's/^since=//p' "$lease")
+if [ "$held" = "$token" ]; then echo "CLAIMED already held by $host since $since"; exit 0; fi
+if [ "$take" = 1 ]; then
+  record > "$lease"; echo "CLAIMED (adopted) coordinator lease on $BOX for $host -- was $hhost since $since"; exit 0
+fi
+echo "CLAIM REFUSED: coordinator lease held by $hhost since $since -- a wave is in flight; adopt with --take only if that coordinator is gone"
+exit 1
+EOF
+  } | run_on "$ANCHOR" "$(hostname -s)" "$(cat "$tf")" "$take"
+  local rc=$?; if unreachable "$rc"; then echo "CLAIM UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
+}
+
+cmd_release() {
+  { prelude "$ANCHOR"; cat <<'EOF'
+token="$1"; lease="$ANCHOR_STATE/COORDINATOR"
+[ -f "$lease" ] || { echo "RELEASE: no lease held"; exit 0; }
+held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease")
+[ "$held" = "$token" ] || { echo "RELEASE REFUSED: lease held by $hhost, not you"; exit 1; }
+rm -f "$lease"; echo "RELEASED coordinator lease on $BOX"
+EOF
+  } | run_on "$ANCHOR" "$(my_token)"
+  local rc=$?; if unreachable "$rc"; then echo "RELEASE UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
+}
+
+cmd_coordinator() {
+  { prelude "$ANCHOR"; cat <<'EOF'
+token="$1"; lease="$ANCHOR_STATE/COORDINATOR"
+[ -f "$lease" ] || { echo "COORDINATOR: nobody holds the lease on $BOX"; exit 3; }
+held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease"); since=$(sed -n 's/^since=//p' "$lease")
+if [ -n "$token" ] && [ "$held" = "$token" ]; then echo "COORDINATOR: you ($hhost) since $since"; exit 0; fi
+echo "COORDINATOR: $hhost since $since (not you)"; exit 1
+EOF
+  } | run_on "$ANCHOR" "$(my_token)"
+  local rc=$?; if unreachable "$rc"; then echo "COORDINATOR UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -569,5 +701,8 @@ case "$cmd" in
   halt) cmd_halt "$@" ;;
   resume-launches) cmd_resume_launches "$@" ;;
   halted) cmd_halted "$@" ;;
+  claim) cmd_claim "$@" ;;
+  release) cmd_release "$@" ;;
+  coordinator) cmd_coordinator "$@" ;;
   *) sed -n '/^# Usage:/,/^# Exit:/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

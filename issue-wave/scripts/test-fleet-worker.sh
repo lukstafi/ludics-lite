@@ -20,9 +20,11 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/fleet-worker-test.XXXXXX")
 TMP=$(cd "$TMP" && pwd -P)   # canonical: macOS mktemp answers under /var, which resolves to /private/var
 export HOME="$TMP/home"
 mkdir -p "$HOME/.claude/skills" "$HOME/.codex/skills" "$TMP/bin"
-export ISSUE_WAVE_STATE="$TMP/state"
+# Paths with spaces on purpose: every far-side line that forgets to quote shows up here.
+export ISSUE_WAVE_STATE="$TMP/st ate"
 export FLEET_TMUX_SOCKET="fwtest-$$"
 export FLEET_LOCAL_BOX="testbox"
+export FLEET_ANCHOR="testbox"
 export PATH="$TMP/bin:$PATH"
 # A scratch git identity, so worktree/commit steps work on a bare runner.
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
@@ -89,7 +91,7 @@ EOF
 chmod +x "$TMP/bin/claude" "$TMP/bin/codex"
 
 # --- a scratch skills checkout with an origin, deployed the way the README deploys it --------
-origin="$TMP/origin.git"; repo="$TMP/self-improve"
+origin="$TMP/origin.git"; repo="$TMP/self improve"
 git init -q --bare "$origin"
 git init -q -b main "$repo"
 mkdir -p "$repo/ClaudeDesktop/skills"
@@ -102,6 +104,22 @@ git -C "$repo" add -A && git -C "$repo" commit -q -m init
 git -C "$repo" remote add origin "$origin" && git -C "$repo" push -q -u origin main
 export FLEET_SKILLS_REPO="$repo"
 
+echo "--- coordinator lease"
+expect "coordinator: nobody yet, exit 3" 3 "nobody holds the lease" -- "$FW" coordinator
+expect "claim takes the lease" 0 "CLAIMED coordinator lease on testbox" -- "$FW" claim
+expect "claim again is idempotent for the holder" 0 "CLAIMED already held" -- "$FW" claim
+expect "coordinator: me" 0 "COORDINATOR: you" -- "$FW" coordinator
+# A second coordinator: its own state dir (own token), the same anchor state.
+B=(env ISSUE_WAVE_STATE="$TMP/state-b" FLEET_ANCHOR_STATE="$ISSUE_WAVE_STATE" "$FW")
+expect "a second coordinator's claim is refused while held" 1 "CLAIM REFUSED: coordinator lease held by" -- "${B[@]}" claim
+expect "a second coordinator cannot halt" 1 "HALT REFUSED fleet: coordinator lease held by" -- "${B[@]}" halt "not mine"
+expect "release by a non-holder is refused" 1 "RELEASE REFUSED" -- "${B[@]}" release
+expect "--take adopts the lease" 0 "CLAIMED (adopted) coordinator lease" -- "${B[@]}" claim --take
+expect "the previous holder now sees the lease as not theirs" 1 "(not you)" -- "$FW" coordinator
+expect "...and takes it back with --take" 0 "CLAIMED (adopted)" -- "$FW" claim --take
+expect "release drops it" 0 "RELEASED coordinator lease" -- "$FW" release
+expect "coordinator after release: nobody" 3 "nobody holds" -- "$FW" coordinator
+
 echo "--- preflight"
 expect "clean main on origin passes (claude, live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox
 expect "clean main passes for codex" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --codex
@@ -111,6 +129,9 @@ git -C "$repo" checkout -q -- .
 touch "$repo/ClaudeDesktop/skills/ship-pr/scripts.sh"
 expect "untracked file under the served tree refuses" 1 "untracked file(s) under ClaudeDesktop" -- "$FW" preflight testbox --no-probe
 rm "$repo/ClaudeDesktop/skills/ship-pr/scripts.sh"
+touch "$repo/ClaudeDesktop/skills/ship-pr/a b.sh"
+expect "an untracked served file whose path git would quote still refuses" 1 "1 untracked file(s) under ClaudeDesktop" -- "$FW" preflight testbox --no-probe
+rm "$repo/ClaudeDesktop/skills/ship-pr/a b.sh"
 mkdir -p "$repo/.claude"; echo '{}' > "$repo/.claude/settings.local.json"
 expect "untracked file outside the served tree passes with a notice" 0 "PREFLIGHT OK.*ignored: .claude/" -- "$FW" preflight testbox --no-probe
 rm -rf "$repo/.claude"
@@ -137,12 +158,17 @@ mkdir -p "$TMP/outside-skill"; ln -sfn "$repo/ClaudeDesktop/../../outside-skill"
 expect "skill link that escapes the checkout through .. refuses" 1 "skills/ship-pr -> $TMP/outside-skill" -- "$FW" preflight testbox --no-probe
 rm "$HOME/.claude/skills/ship-pr"; cp -R "$repo/ClaudeDesktop/skills/ship-pr" "$HOME/.claude/skills/ship-pr"
 expect "a real directory in place of the link refuses" 1 "skills/ship-pr -> missing/not a link" -- "$FW" preflight testbox --no-probe
-rm -rf "$HOME/.claude/skills/ship-pr"; ln -sfn "$repo/ClaudeDesktop/skills/ship-pr" "$HOME/.claude/skills/ship-pr"
+rm -rf "$HOME/.claude/skills/ship-pr"; ln -sfn "$repo/ClaudeDesktop/skills/wait-and-proceed" "$HOME/.claude/skills/ship-pr"
+expect "a link swapped to a sibling skill refuses" 1 "skills/ship-pr -> .*/skills/wait-and-proceed (not " -- "$FW" preflight testbox --no-probe
+ln -sfn "$repo/ClaudeDesktop/skills/ship-pr" "$HOME/.claude/skills/ship-pr"
 
 echo "--- launch / attach / status / log with a project repo and --repo/--branch"
-proj="$TMP/proj"; git init -q -b master "$proj" && echo a > "$proj/a" && git -C "$proj" add a && git -C "$proj" commit -q -m a
+proj="$TMP/pro j"; git init -q -b master "$proj" && echo a > "$proj/a" && git -C "$proj" add a && git -C "$proj" commit -q -m a
 git init -q --bare "$TMP/proj.git" && git -C "$proj" remote add origin "$TMP/proj.git" && git -C "$proj" push -q -u origin master
 brief="$TMP/brief.md"; printf 'Fix issue #1: handle `$(rm -rf /)` and `backticks` in prose\n' > "$brief"
+expect "launch without a lease refuses" 1 "LAUNCH REFUSED testbox/w1: no coordinator lease" -- \
+  "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
+"$FW" claim >/dev/null
 expect "launch creates the worktree and reports the session" 0 "LAUNCHED testbox/w1 kind=claude session=[0-9a-f-]\{36\} cwd=$proj-worktrees/w1" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 -- --model opus
 [ -d "$proj-worktrees/w1" ] && [ "$(git -C "$proj-worktrees/w1" rev-parse --abbrev-ref HEAD)" = claude/w1 ] && ok "worktree on the requested branch" || ko "worktree missing or wrong branch"
@@ -165,6 +191,10 @@ git -C "$proj-worktrees/w1" checkout -q claude/w1 && git -C "$proj-worktrees/w1"
 expect "a reused worktree on the requested branch is accepted" 0 "reusing existing worktree .* (on claude/w1)" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
 "$FW" attach testbox w1 --interval 1 >/dev/null
+bash -c 'sleep 30; :' orphan-shim "$ISSUE_WAVE_STATE/workers/w1/" >/dev/null 2>&1 & orphan=$!
+expect "--replace refuses while a process still carries the old worker's path" 1 "a CLI from the previous launch is still running" -- \
+  "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
+kill "$orphan" 2>/dev/null; wait "$orphan" 2>/dev/null
 expect "--replace overwrites deliberately" 0 "LAUNCHED testbox/w1" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
 "$FW" attach testbox w1 --interval 1 >/dev/null
@@ -206,7 +236,7 @@ expect "no uuidgen: a fallback still yields a session id" 0 "LAUNCHED testbox/nu
 echo "--- codex workers"
 expect "codex launch captures the thread id from the stream" 0 "LAUNCHED testbox/c1 kind=codex session=0199-shim-" -- \
   "$FW" launch testbox c1 --kind codex --brief "$brief" --cwd "$proj"
-grep -q -- "codex exec --json --yolo -C $proj -o .*last-message.md - < " "$ISSUE_WAVE_STATE/workers/c1/run.sh" && ok "codex command shape (brief on stdin, -o last message)" || ko "codex command: $(cat "$ISSUE_WAVE_STATE/workers/c1/run.sh")"
+grep -qF -- "codex exec --json --yolo -C $(printf '%q' "$proj") -o " "$ISSUE_WAVE_STATE/workers/c1/run.sh" && grep -qF -- "last-message.md - < " "$ISSUE_WAVE_STATE/workers/c1/run.sh" && ok "codex command shape (brief on stdin, -o last message)" || ko "codex command: $(cat "$ISSUE_WAVE_STATE/workers/c1/run.sh")"
 expect "codex attach reads turn.completed and the last message" 0 "DONE testbox/c1 exit=0 turn.completed .*codex did: Fix issue" -- "$FW" attach testbox c1 --interval 1
 expect "codex log prints agent messages" 0 "codex did: Fix issue" -- "$FW" log testbox c1
 sed -i.bak '/^session=/d' "$ISSUE_WAVE_STATE/workers/c1/meta" && rm -f "$ISSUE_WAVE_STATE/workers/c1/meta.bak"
@@ -226,6 +256,12 @@ expect "--force launches anyway (the triage worker)" 0 "LAUNCHED testbox/h1" -- 
 expect "resume-launches clears it" 0 "RESUMED launches" -- "$FW" resume-launches
 expect "launch works again" 0 "LAUNCHED testbox/h2" -- "$FW" launch testbox h2 --kind claude --brief "$brief" --cwd "$proj"
 "$FW" attach testbox h2 --interval 1 >/dev/null
+"$FW" halt "adopted mid-halt" >/dev/null
+"${B[@]}" claim --take >/dev/null
+expect "a coordinator adopting the lease inherits the halt" 1 "LAUNCH REFUSED testbox/h3: launches halted -- .*adopted mid-halt" -- \
+  "${B[@]}" launch testbox h3 --kind claude --brief "$brief" --cwd "$proj"
+expect "...and reads it with halted" 1 "HALTED .*adopted mid-halt" -- "${B[@]}" halted
+"$FW" claim --take >/dev/null; "$FW" resume-launches >/dev/null
 
 echo "--- usage"
 expect "no command prints usage, exit 2" 2 "Usage:" -- "$FW"
