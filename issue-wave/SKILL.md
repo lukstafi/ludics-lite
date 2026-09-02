@@ -44,7 +44,10 @@ wait, or - only when that coordinator is demonstrably gone (its session dead, it
 finished or stranded) - `claim --take` to adopt the wave with its halt state and its worker
 records intact. Every `launch`, `halt` and `resume-launches` proves the lease, so two
 coordinators cannot both drive; a point-in-time `ls` alone could not promise that, since two
-coordinators starting on an idle fleet would both see it empty. `release` at close-out.
+coordinators starting on an idle fleet would both see it empty. The lease is per coordinator
+SESSION (the shell's Claude Code session id), so a restarted coordinator adopts with `--take`
+rather than inheriting silently, and `unstick` is fenced by it too - only the holder intervenes
+in a wave's workers. `release` at close-out.
 
 ## Scope and sequencing
 
@@ -107,7 +110,8 @@ session id on disk under that box's `~/.local/state/issue-wave/workers/<name>/`.
 named `local` (or `mac-studio`) runs without ssh; the same script, the same files.
 
 **Skill-freshness preflight first, per launch, on the launching box (self-improve#11):**
-`fleet-worker.sh preflight <box>` (`--codex` for a Codex worker). It brings that box's
+`launch` runs it itself before every worker, and `fleet-worker.sh preflight <box>` (`--codex`
+for a Codex worker) runs it alone for diagnosis. It brings that box's
 `~/self-improve` to upstream main and refuses on anything short of it: a tracked change or an
 untracked file under `ClaudeDesktop/` (the served tree), a branch other than main, a HEAD that
 is not origin/main after the fast-forward (an unpushed local commit is divergence to surface,

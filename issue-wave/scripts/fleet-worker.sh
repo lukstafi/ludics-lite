@@ -32,7 +32,7 @@
 # Usage:
 #   fleet-worker.sh claim [--take]         # take the fleet's coordinator lease (--take adopts)
 #   fleet-worker.sh coordinator | release  # who holds it (exit 0 me, 1 other, 3 nobody) / give it up
-#   fleet-worker.sh preflight <box> [--codex] [--no-probe]
+#   fleet-worker.sh preflight <box> [--codex] [--no-probe]   # launch runs this itself, too
 #   fleet-worker.sh launch <box> <name> --kind claude|codex --brief <file>
 #                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
 #                          [--force] [--replace] [-- <extra CLI args>]
@@ -44,8 +44,9 @@
 #   fleet-worker.sh load
 #   fleet-worker.sh halt <reason> | resume-launches | halted
 #
-# `launch`, `halt` and `resume-launches` require the lease; `launch` also refuses while halted
-# (`--force` admits the one triage worker). Lease and halt live on FLEET_ANCHOR.
+# `launch`, `unstick`, `halt` and `resume-launches` require the lease; `launch` also refuses
+# while halted (`--force` admits the one triage worker) and runs the preflight on the box first.
+# Lease and halt live on FLEET_ANCHOR.
 #
 # <box> is an ssh destination (rog-nv-wsl, minix-amd-wsl), or `local` / the value of
 # FLEET_LOCAL_BOX (default mac-studio) for the coordinator's own machine.
@@ -162,8 +163,18 @@ unreachable() { [ "$1" -eq 255 ]; }
 
 valid_name() { case "$1" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 
-# The coordinator's identity is a token in its own state dir; the lease on the anchor names it.
-token_file() { printf '%s/coordinator.token' "$(local_path "$STATE")"; }
+# The coordinator's identity is per SESSION, not per box: FLEET_COORDINATOR if set, else the
+# Claude Code session id the shell inherits, else the owning process. Its token lives under that
+# identity, so a second coordinator session on the same box has no token and cannot pass the
+# gate, and a restarted coordinator (new session id) must adopt explicitly with claim --take.
+coordinator_id() {
+  if [ -n "${FLEET_COORDINATOR:-}" ]; then printf '%s' "$FLEET_COORDINATOR"
+  elif [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then printf 'session-%s' "$CLAUDE_CODE_SESSION_ID"
+  elif [ -n "${CLAUDE_PID:-}" ]; then printf '%s-pid-%s' "$(hostname -s)" "$CLAUDE_PID"
+  else printf '%s-pid-%s' "$(hostname -s)" "$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')"
+  fi
+}
+token_file() { printf '%s/tokens/%s' "$(local_path "$STATE")" "$(coordinator_id | tr -c 'A-Za-z0-9._-\n' '_')"; }
 my_token() { cat "$(token_file)" 2>/dev/null; }
 
 # Far-side script for the anchor: lease + halt checks. Args: verb label force token.
@@ -191,18 +202,11 @@ anchor_gate() {
 }
 
 # ---------------------------------------------------------------------------------------------
-cmd_preflight() {
-  local box="${1:-}"; [ -n "$box" ] || die "preflight: which box?"; shift
-  local codex=0 probe=1
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --codex) codex=1 ;;
-      --no-probe) probe=0 ;;
-      *) die "preflight: unknown option $1" ;;
-    esac
-    shift
-  done
-  { prelude "$box"; cat <<'EOF'
+# Far-side skill-freshness preflight (self-improve#11). Args: codex probe. Exit 0 with a
+# PREFLIGHT OK line, 1 with the refusal. `launch` runs it on the box before every worker, so
+# the per-launch refusal the skill promises is enforced here rather than remembered.
+preflight_script() {
+  cat <<'EOF'
 codex="$1" probe="$2"
 refuse=""
 note() { refuse="$refuse; $*"; }
@@ -270,7 +274,20 @@ if [ -n "$refuse" ]; then
 fi
 echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (untracked outside the served tree, ignored: $other)}"
 EOF
-  } | run_on "$box" "$codex" "$probe"
+}
+
+cmd_preflight() {
+  local box="${1:-}"; [ -n "$box" ] || die "preflight: which box?"; shift
+  local codex=0 probe=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --codex) codex=1 ;;
+      --no-probe) probe=0 ;;
+      *) die "preflight: unknown option $1" ;;
+    esac
+    shift
+  done
+  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe"
   local rc=$?
   if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; exit 4; fi
   exit "$rc"
@@ -304,6 +321,11 @@ cmd_launch() {
     [ -n "$repo" ] && [ -n "$branch" ] || die "launch: --cwd <dir>, or --repo <dir> --branch <branch>"
   fi
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
+  local codex=0 pf; [ "$kind" = codex ] && codex=1
+  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 )
+  local prc=$?
+  if unreachable "$prc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
+  [ "$prc" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: $pf"; exit 1; }
   local sid=""
   if [ "$kind" = claude ]; then
     sid=$(gen_uuid) || { echo "LAUNCH REFUSED $box/$name: cannot generate a session id here (no uuidgen, /proc uuid, or python3)"; exit 1; }
@@ -397,12 +419,18 @@ verdict() {
     echo "VANISHED $BOX/$name: no exit record (killed, or the CLI never started -- see $d/stderr.log)"; return 3
   fi
   rc=$(cat "$d/exit")
+  # The LAST terminal event decides (a resumed turn appends after the first one's); a stream
+  # with no terminal event is not a success whatever the exit code said.
   case "$kind" in
-    claude) summary=$(jq -r 'select(.type=="result") | "\(.subtype) is_error=\(.is_error) turns=\(.num_turns) " + ((.result // "")|tostring|.[0:200]|gsub("\n";" "))' "$d/stream.jsonl" 2>/dev/null | tail -n1) ;;
+    claude) summary=$(jq -r 'select(.type=="result") | "\(.subtype) is_error=\(.is_error) turns=\(.num_turns) " + ((.result // "")|tostring|.[0:200]|gsub("\n";" "))' "$d/stream.jsonl" 2>/dev/null | tail -n1)
+            ok_event=$(printf '%s' "$summary" | grep -c 'is_error=false') ;;
     codex)  summary=$(jq -r 'select(.type=="turn.completed" or .type=="turn.failed") | .type + " " + ((.error.message // "")|tostring|.[0:200])' "$d/stream.jsonl" 2>/dev/null | tail -n1)
-            [ -s "$d/last-message.md" ] && summary="$summary | $(head -c 200 "$d/last-message.md" | tr '\n' ' ')" ;;
+            ok_event=$(printf '%s' "$summary" | grep -c '^turn.completed')
+            last=$(jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text' "$d/stream.jsonl" 2>/dev/null | tail -n1 | cut -c1-200)
+            [ -n "$last" ] && summary="$summary | $last" ;;
   esac
-  if [ "$rc" = 0 ] && ! printf '%s' "$summary" | grep -q 'is_error=true\|turn.failed'; then
+  [ -n "$summary" ] || summary="no terminal event in the stream"
+  if [ "$rc" = 0 ] && [ "${ok_event:-0}" -gt 0 ]; then
     echo "DONE $BOX/$name exit=0 $summary"; return 0
   fi
   echo "FAILED $BOX/$name exit=$rc $summary $(tail -n 2 "$d/stderr.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"; return 1
@@ -511,6 +539,7 @@ cmd_unstick() {
     shift
   done
   [ -n "$msg" ] && [ -r "$msg" ] || die "unstick: --message <readable file>"
+  anchor_gate UNSTICK "$box/$name" 1 || exit $?
   local stamp; stamp=$(date -u +%Y%m%dT%H%M%SZ)
   put_file "$box" "$msg" "$STATE/workers/$name/messages/$stamp.md" || { echo "UNSTICK UNREACHABLE $box"; exit 4; }
   { prelude "$box"; cat <<'EOF'
@@ -529,8 +558,12 @@ if alive "$name"; then
 fi
 # The tmux session is gone; make sure the CLI it ran is too (it could have been reparented).
 # A claude worker carries its session id on its command line; a codex worker's first exec
-# carries only this worker's state dir (-o), so match either.
+# carries only this worker's state dir (-o), so match either. An orphan is still a live
+# writer: it is refused without --kill exactly like a live tmux session.
 pat="$(re_lit "$sid")|$(re_lit "$d/")"
+if [ "$kill" != 1 ] && pgrep -f -- "$pat" >/dev/null 2>&1; then
+  echo "UNSTICK REFUSED $BOX/$name: tmux is gone but a CLI still runs ($(pgrep -fl -- "$pat" | head -n 2 | tr '\n' ';')); pass --kill to stop it first"; exit 1
+fi
 for i in $(seq 1 30); do
   pgrep -f -- "$pat" >/dev/null 2>&1 || break
   [ "$i" -eq 1 ] && pkill -TERM -f -- "$pat" 2>/dev/null
@@ -607,7 +640,9 @@ cmd_halt() {
   anchor_gate HALT fleet 1 || exit $?
   { prelude "$ANCHOR"; cat <<'EOF'
 mkdir -p "$ANCHOR_STATE"
-printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" > "$ANCHOR_STATE/HALT"
+if ! printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" > "$ANCHOR_STATE/HALT" 2>/dev/null || [ ! -f "$ANCHOR_STATE/HALT" ]; then
+  echo "HALT FAILED: cannot write $ANCHOR_STATE/HALT on $BOX -- the fleet is NOT halted"; exit 1
+fi
 echo "HALTED: launches refused until resume-launches -- $1"
 EOF
   } | run_on "$ANCHOR" "$reason"
@@ -659,7 +694,7 @@ fi
 echo "CLAIM REFUSED: coordinator lease held by $hhost since $since -- a wave is in flight; adopt with --take only if that coordinator is gone"
 exit 1
 EOF
-  } | run_on "$ANCHOR" "$(hostname -s)" "$(cat "$tf")" "$take"
+  } | run_on "$ANCHOR" "$(hostname -s)/$(coordinator_id)" "$(cat "$tf")" "$take"
   local rc=$?; if unreachable "$rc"; then echo "CLAIM UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
 }
 

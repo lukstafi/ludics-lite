@@ -62,6 +62,7 @@ sleep_s=$(printf '%s\n' "$brief" | sed -n 's/^SLEEP \([0-9]*\).*/\1/p' | head -n
 if [ "$fmt" = json ]; then
   printf '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"%s"}\n' "${sid:-none}"; exit 0
 fi
+if printf '%s' "$brief" | grep -q '^SILENT'; then exit 0; fi
 printf '{"type":"system","subtype":"init","session_id":"%s","resumed":%s}\n' "$sid" "$([ -n "$resume" ] && echo true || echo false)"
 [ -n "$sleep_s" ] && sleep "$sleep_s"
 text="did: $(printf '%s' "$brief" | head -c 40 | tr '\n' ' ')"
@@ -117,6 +118,8 @@ expect "release by a non-holder is refused" 1 "RELEASE REFUSED" -- "${B[@]}" rel
 expect "--take adopts the lease" 0 "CLAIMED (adopted) coordinator lease" -- "${B[@]}" claim --take
 expect "the previous holder now sees the lease as not theirs" 1 "(not you)" -- "$FW" coordinator
 expect "...and takes it back with --take" 0 "CLAIMED (adopted)" -- "$FW" claim --take
+expect "another session on the same box (same state dir) is not the holder" 1 "CLAIM REFUSED" -- env FLEET_COORDINATOR=other-session "$FW" claim
+expect "...and cannot launch through the holder's token" 1 "coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" launch testbox nope --kind claude --brief /dev/null --cwd "$TMP"
 expect "release drops it" 0 "RELEASED coordinator lease" -- "$FW" release
 expect "coordinator after release: nobody" 3 "nobody holds" -- "$FW" coordinator
 
@@ -169,6 +172,10 @@ brief="$TMP/brief.md"; printf 'Fix issue #1: handle `$(rm -rf /)` and `backticks
 expect "launch without a lease refuses" 1 "LAUNCH REFUSED testbox/w1: no coordinator lease" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 "$FW" claim >/dev/null
+echo x >> "$repo/ClaudeDesktop/skills/ship-pr/SKILL.md"
+expect "launch runs the preflight on the box and refuses a dirty checkout" 1 "LAUNCH REFUSED testbox/w1: PREFLIGHT REFUSED testbox: 1 tracked change" -- \
+  "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
+git -C "$repo" checkout -q -- .
 expect "launch creates the worktree and reports the session" 0 "LAUNCHED testbox/w1 kind=claude session=[0-9a-f-]\{36\} cwd=$proj-worktrees/w1" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 -- --model opus
 [ -d "$proj-worktrees/w1" ] && [ "$(git -C "$proj-worktrees/w1" rev-parse --abbrev-ref HEAD)" = claude/w1 ] && ok "worktree on the requested branch" || ko "worktree missing or wrong branch"
@@ -206,6 +213,9 @@ echo "--- failure verdicts"
 printf 'FAIL on purpose\n' > "$TMP/fail.md"
 "$FW" launch testbox wf --kind claude --brief "$TMP/fail.md" --cwd "$proj" >/dev/null
 expect "an erroring worker attaches as FAILED, exit 1" 1 "FAILED testbox/wf exit=1 error_during_execution is_error=true" -- "$FW" attach testbox wf --interval 1
+printf 'SILENT\n' > "$TMP/silent.md"
+"$FW" launch testbox wsil --kind claude --brief "$TMP/silent.md" --cwd "$proj" >/dev/null
+expect "exit 0 with no terminal event is FAILED, not DONE" 1 "FAILED testbox/wsil exit=0 no terminal event" -- "$FW" attach testbox wsil --interval 1
 printf 'SLEEP 30\n' > "$TMP/slow.md"
 "$FW" launch testbox wv --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null
 sleep 1; tmux -L "$FLEET_TMUX_SOCKET" kill-session -t iw-wv
@@ -233,6 +243,15 @@ expect "no uuidgen: a fallback still yields a session id" 0 "LAUNCHED testbox/nu
   env PATH="$TMP/nouuid:$PATH" "$FW" launch testbox nu --kind claude --brief "$brief" --cwd "$proj"
 "$FW" attach testbox nu --interval 1 >/dev/null
 
+"$FW" launch testbox wo --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox wo --interval 1 >/dev/null
+bash -c 'sleep 30; :' orphan-shim "$ISSUE_WAVE_STATE/workers/wo/" >/dev/null 2>&1 & orphan=$!; disown; sleep 0.5
+expect "an orphaned CLI (tmux gone) refuses a plain unstick" 1 "tmux is gone but a CLI still runs" -- "$FW" unstick testbox wo --message "$TMP/msg.md"
+kill -0 "$orphan" 2>/dev/null && ok "the orphan was not killed by the refused unstick" || ko "plain unstick killed the orphan"
+expect "unstick --kill terminates the orphan and resumes" 0 "RESUMED testbox/wo" -- "$FW" unstick testbox wo --message "$TMP/msg.md" --kill
+kill -0 "$orphan" 2>/dev/null && ko "orphan survived --kill" || ok "--kill terminated the orphan"
+"$FW" attach testbox wo --interval 1 >/dev/null
+expect "a non-holder cannot unstick" 1 "UNSTICK REFUSED testbox/wo: coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" unstick testbox wo --message "$TMP/msg.md"
+
 echo "--- codex workers"
 expect "codex launch captures the thread id from the stream" 0 "LAUNCHED testbox/c1 kind=codex session=0199-shim-" -- \
   "$FW" launch testbox c1 --kind codex --brief "$brief" --cwd "$proj"
@@ -244,9 +263,12 @@ expect "status recovers the thread id from the stream when meta lacks it" 0 "ses
 expect "codex unstick resumes by thread id (from the stream) with --yolo" 0 "RESUMED testbox/c1 kind=codex session=0199-shim-" -- "$FW" unstick testbox c1 --message "$TMP/msg.md"
 tid=$(sed -n 's/^session=//p' "$ISSUE_WAVE_STATE/workers/c1/meta" | head -n1)
 grep -q -- "codex exec resume $tid --yolo --json -" "$ISSUE_WAVE_STATE/workers/c1/run.sh" && ok "codex resume command shape" || ko "codex resume: $(cat "$ISSUE_WAVE_STATE/workers/c1/run.sh")"
-"$FW" attach testbox c1 --interval 1 >/dev/null
+expect "the resumed codex turn's verdict carries the NEW message, from the stream" 0 "DONE testbox/c1 exit=0 turn.completed .*| codex did: Stop and answer now" -- "$FW" attach testbox c1 --interval 1
 
 echo "--- halt"
+mkdir -p "$ISSUE_WAVE_STATE/HALT"
+expect "halt that cannot write its marker fails loudly" 1 "HALT FAILED: cannot write" -- "$FW" halt "unwritable"
+rmdir "$ISSUE_WAVE_STATE/HALT"
 expect "halted reports open" 0 "launches open" -- "$FW" halted
 expect "halt records the reason" 0 "HALTED: launches refused" -- "$FW" halt "master red at abc123, owner: coordinator"
 expect "halted reports the reason, exit 1" 1 "HALTED .*master red at abc123" -- "$FW" halted
