@@ -161,12 +161,15 @@ run_on() {
 # Copy a local file to a path on the box (parent created). The file's bytes cross as stdin, so
 # nothing in it is ever a shell word anywhere.
 put_file() {
-  local box="$1" src="$2" dst="$3"
+  local box="$1" src="$2" dst="$3" q
   if is_local "$box"; then
     bash -c 'mkdir -p "$(dirname "$1")" && cat > "$1"' -- "$(local_path "$dst")" < "$src"
   else
+    # The destination travels as ONE quoted word ($HOME kept expandable, the rest %q), never
+    # interpolated into the command text where a quote or $() in a configured path would run.
+    case "$dst" in '$HOME'/*) q="\"\$HOME\"/$(printf '%q' "${dst#\$HOME/}")" ;; *) q=$(printf '%q' "$dst") ;; esac
     # shellcheck disable=SC2086
-    ssh $SSH_OPTS "$box" "mkdir -p \"\$(dirname \"$dst\")\" && cat > \"$dst\"" < "$src"
+    ssh $SSH_OPTS "$box" "bash -c 'mkdir -p \"\$(dirname \"\$1\")\" && cat > \"\$1\"' -- $q" < "$src"
   fi
 }
 
@@ -412,9 +415,18 @@ if [ -f "$d/meta" ]; then
 fi
 if [ -f "$d/meta" ] && [ "$replace" != 1 ]; then
   if [ -f "$d/exit" ]; then
-    refuse "a finished worker's record is here (its stream is close-out evidence); pick a new name, or --replace to overwrite"
+    refuse "a finished worker's record is here (its stream is close-out evidence); pick a new name, or --replace to archive it"
   fi
   refuse "a previous launch left no exit record (killed?); unstick it, or --replace"
+fi
+archive=""
+if [ -f "$d/meta" ]; then
+  # --replace keeps the previous record whole under $STATE/replaced/ (evidence), and a refusal
+  # below puts it back; nothing of it is truncated in place.
+  mkdir -p "$STATE/replaced"; archive="$STATE/replaced/$name-$stamp"
+  mv "$d" "$archive" 2>/dev/null && mkdir -p "$d" && mv "$archive/incoming-$stamp.md" "$incoming" 2>/dev/null ||
+    { rm -rf "$d"; [ -d "$archive" ] && mv "$archive" "$d"; echo "LAUNCH REFUSED $BOX/$name: cannot archive the previous record to $archive"; exit 1; }
+  refuse() { rm -f "$incoming"; rm -rf "$d"; mv "$archive" "$d" 2>/dev/null; echo "LAUNCH REFUSED $BOX/$name: $* (previous record restored)"; exit 1; }
 fi
 if [ -z "$cwd" ]; then
   repo=$(expand_tilde "$repo")
@@ -469,7 +481,7 @@ if [ "$kind" = codex ]; then
   done
   [ -n "$sid" ] && echo "session=$sid" >> "$d/meta"
 fi
-echo "LAUNCHED $BOX/$name kind=$kind session=${sid:-unknown} cwd=$cwd stream=$d/stream.jsonl"
+echo "LAUNCHED $BOX/$name kind=$kind session=${sid:-unknown} cwd=$cwd stream=$d/stream.jsonl${archive:+ replaced=$archive}"
 EOF
   } | run_on "$box" "$name" "$kind" "$cwd" "$repo" "$branch" "$base" "$sid" "$(hostname -s)" "$replace" "$stamp" "$@"
   local rc=$?

@@ -252,14 +252,12 @@ bash -c 'sleep 30; :' claude "$ISSUE_WAVE_STATE/workers/w1/" >/dev/null 2>&1 & o
 expect "--replace refuses while a process still carries the old worker's path" 1 "a CLI from the previous launch is still running" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
 kill "$orphan" 2>/dev/null; wait "$orphan" 2>/dev/null
-mv "$ISSUE_WAVE_STATE/workers/w1/brief.md" "$TMP/brief.saved"; mkdir "$ISSUE_WAVE_STATE/workers/w1/brief.md"
-expect "--replace over a record whose brief.md is a directory refuses before truncating" 1 "cannot install the brief" -- \
+oldstream=$(cat "$ISSUE_WAVE_STATE/workers/w1/stream.jsonl")
+expect "--replace archives the previous record and starts a fresh one" 0 "LAUNCHED testbox/w1 .* replaced=.*/replaced/w1-" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
-[ -s "$ISSUE_WAVE_STATE/workers/w1/stream.jsonl" ] && ok "the refused --replace did not truncate the stream" || ko "stream truncated by a refused --replace"
-[ -z "$(ls -A "$ISSUE_WAVE_STATE/workers/w1/brief.md")" ] && ok "nothing was moved into the directory" || ko "the incoming brief landed inside brief.md/"
-rm -rf "$ISSUE_WAVE_STATE/workers/w1/brief.md"; mv "$TMP/brief.saved" "$ISSUE_WAVE_STATE/workers/w1/brief.md"
-expect "--replace overwrites deliberately" 0 "LAUNCHED testbox/w1" -- \
-  "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
+arch=$(printf '%s' "$out" | sed -n 's/.* replaced=//p')
+[ -n "$arch" ] && [ "$(cat "$arch/stream.jsonl")" = "$oldstream" ] && [ -f "$arch/exit" ] && ok "the archived record keeps the old stream and exit" || ko "archive missing or incomplete: $arch"
+[ "$(cat "$ISSUE_WAVE_STATE/workers/w1/brief.md")" = "$(cat "$brief")" ] && ok "the fresh record has the new brief" || ko "fresh record brief wrong"
 "$FW" attach testbox w1 --interval 1 >/dev/null
 expect "ls lists local workers with state" 0 "testbox/w1 EXITED(0) kind=claude" -- "$FW" ls testbox
 out=$(FLEET_BOXES="testbox" "$FW" ls 2>&1)
