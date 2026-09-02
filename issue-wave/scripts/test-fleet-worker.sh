@@ -17,6 +17,7 @@ command -v tmux >/dev/null 2>&1 || { echo "SKIP: tmux not installed"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not installed"; exit 0; }
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/fleet-worker-test.XXXXXX")
+TMP=$(cd "$TMP" && pwd -P)   # canonical: macOS mktemp answers under /var, which resolves to /private/var
 export HOME="$TMP/home"
 mkdir -p "$HOME/.claude/skills" "$HOME/.codex/skills" "$TMP/bin"
 export ISSUE_WAVE_STATE="$TMP/state"
@@ -130,9 +131,13 @@ rm "$HOME/.codex/skills/after-merge"
 expect "missing codex skill link refuses only for codex" 1 "codex/skills/after-merge -> missing" -- "$FW" preflight testbox --codex --no-probe
 expect "...and claude preflight still passes" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --no-probe
 ln -sfn "$repo/ClaudeDesktop/skills/after-merge" "$HOME/.codex/skills/after-merge"
-ln -sfn "$TMP/elsewhere" "$HOME/.claude/skills/ship-pr"
+mkdir -p "$TMP/elsewhere"; ln -sfn "$TMP/elsewhere" "$HOME/.claude/skills/ship-pr"
 expect "skill link pointing outside the checkout refuses" 1 "skills/ship-pr -> $TMP/elsewhere" -- "$FW" preflight testbox --no-probe
-ln -sfn "$repo/ClaudeDesktop/skills/ship-pr" "$HOME/.claude/skills/ship-pr"
+mkdir -p "$TMP/outside-skill"; ln -sfn "$repo/ClaudeDesktop/../../outside-skill" "$HOME/.claude/skills/ship-pr"
+expect "skill link that escapes the checkout through .. refuses" 1 "skills/ship-pr -> $TMP/outside-skill" -- "$FW" preflight testbox --no-probe
+rm "$HOME/.claude/skills/ship-pr"; cp -R "$repo/ClaudeDesktop/skills/ship-pr" "$HOME/.claude/skills/ship-pr"
+expect "a real directory in place of the link refuses" 1 "skills/ship-pr -> missing/not a link" -- "$FW" preflight testbox --no-probe
+rm -rf "$HOME/.claude/skills/ship-pr"; ln -sfn "$repo/ClaudeDesktop/skills/ship-pr" "$HOME/.claude/skills/ship-pr"
 
 echo "--- launch / attach / status / log with a project repo and --repo/--branch"
 proj="$TMP/proj"; git init -q -b master "$proj" && echo a > "$proj/a" && git -C "$proj" add a && git -C "$proj" commit -q -m a
@@ -148,12 +153,24 @@ expect "status after exit names head and branch" 0 "EXITED(0) testbox/w1 kind=cl
 expect "log prints the assistant text" 0 "did: Fix issue #1" -- "$FW" log testbox w1
 expect "unknown worker is UNKNOWN, exit 3" 3 "UNKNOWN testbox/nope" -- "$FW" status testbox nope
 expect "the literal box name local is the same box, labelled as typed" 0 "EXITED(0) local/w1 kind=claude" -- "$FW" status local w1
+printf 'a different brief\n' > "$TMP/brief2.md"
 expect "a finished worker's name is not reused silently" 1 "finished worker's record is here" -- \
-  "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1"
+  "$FW" launch testbox w1 --kind claude --brief "$TMP/brief2.md" --cwd "$proj-worktrees/w1"
+[ "$(cat "$ISSUE_WAVE_STATE/workers/w1/brief.md")" = "$(cat "$brief")" ] && ok "a refused launch leaves the recorded brief untouched" || ko "refused launch overwrote brief.md"
+ls "$ISSUE_WAVE_STATE/workers/w1/" | grep -q '^incoming-' && ko "refused launch left its incoming brief behind" || ok "refused launch cleans up its incoming brief"
+git -C "$proj-worktrees/w1" checkout -q -b other
+expect "a reused worktree on another branch refuses" 1 "exists but is on 'other', not claude/w1" -- \
+  "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
+git -C "$proj-worktrees/w1" checkout -q claude/w1 && git -C "$proj-worktrees/w1" branch -q -D other
+expect "a reused worktree on the requested branch is accepted" 0 "reusing existing worktree .* (on claude/w1)" -- \
+  "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
+"$FW" attach testbox w1 --interval 1 >/dev/null
 expect "--replace overwrites deliberately" 0 "LAUNCHED testbox/w1" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
 "$FW" attach testbox w1 --interval 1 >/dev/null
 expect "ls lists local workers with state" 0 "testbox/w1 EXITED(0) kind=claude" -- "$FW" ls testbox
+out=$(FLEET_BOXES="testbox" "$FW" ls 2>&1)
+[ "$(printf '%s\n' "$out" | grep -c '/w1 ')" -eq 1 ] && printf '%s' "$out" | grep -q '^local/w1 ' && ok "default ls sweeps the fleet minus the local box, once" || ko "default ls: $out"
 
 echo "--- failure verdicts"
 printf 'FAIL on purpose\n' > "$TMP/fail.md"
@@ -177,13 +194,24 @@ expect "the resumed turn completes with the message's result" 0 "DONE testbox/ws
 grep -q '"resumed":true' "$ISSUE_WAVE_STATE/workers/ws/stream.jsonl" && ok "stream appended, not truncated, across the resume" || ko "stream lost the resume"
 grep -q '^resumes=1$' "$ISSUE_WAVE_STATE/workers/ws/meta" && ok "meta counts the resume" || ko "meta resumes not bumped"
 
+printf 'SLEEP 60\n' > "$TMP/slow.md"
+"$FW" launch testbox a.b --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1
+expect "a dotted name is killed by a literal match, not a regex" 0 "RESUMED testbox/a.b" -- "$FW" unstick testbox a.b --message "$TMP/msg.md" --kill
+"$FW" attach testbox a.b --interval 1 >/dev/null
+mkdir -p "$TMP/nouuid"; printf '#!/bin/sh\nexit 1\n' > "$TMP/nouuid/uuidgen"; chmod +x "$TMP/nouuid/uuidgen"
+expect "no uuidgen: a fallback still yields a session id" 0 "LAUNCHED testbox/nu kind=claude session=[0-9a-f-]\{36\}" -- \
+  env PATH="$TMP/nouuid:$PATH" "$FW" launch testbox nu --kind claude --brief "$brief" --cwd "$proj"
+"$FW" attach testbox nu --interval 1 >/dev/null
+
 echo "--- codex workers"
 expect "codex launch captures the thread id from the stream" 0 "LAUNCHED testbox/c1 kind=codex session=0199-shim-" -- \
   "$FW" launch testbox c1 --kind codex --brief "$brief" --cwd "$proj"
 grep -q -- "codex exec --json --yolo -C $proj -o .*last-message.md - < " "$ISSUE_WAVE_STATE/workers/c1/run.sh" && ok "codex command shape (brief on stdin, -o last message)" || ko "codex command: $(cat "$ISSUE_WAVE_STATE/workers/c1/run.sh")"
 expect "codex attach reads turn.completed and the last message" 0 "DONE testbox/c1 exit=0 turn.completed .*codex did: Fix issue" -- "$FW" attach testbox c1 --interval 1
 expect "codex log prints agent messages" 0 "codex did: Fix issue" -- "$FW" log testbox c1
-expect "codex unstick resumes by thread id with --yolo" 0 "RESUMED testbox/c1 kind=codex session=0199-shim-" -- "$FW" unstick testbox c1 --message "$TMP/msg.md"
+sed -i.bak '/^session=/d' "$ISSUE_WAVE_STATE/workers/c1/meta" && rm -f "$ISSUE_WAVE_STATE/workers/c1/meta.bak"
+expect "status recovers the thread id from the stream when meta lacks it" 0 "session=0199-shim-" -- "$FW" status testbox c1
+expect "codex unstick resumes by thread id (from the stream) with --yolo" 0 "RESUMED testbox/c1 kind=codex session=0199-shim-" -- "$FW" unstick testbox c1 --message "$TMP/msg.md"
 tid=$(sed -n 's/^session=//p' "$ISSUE_WAVE_STATE/workers/c1/meta" | head -n1)
 grep -q -- "codex exec resume $tid --yolo --json -" "$ISSUE_WAVE_STATE/workers/c1/run.sh" && ok "codex resume command shape" || ko "codex resume: $(cat "$ISSUE_WAVE_STATE/workers/c1/run.sh")"
 "$FW" attach testbox c1 --interval 1 >/dev/null
@@ -202,6 +230,7 @@ expect "launch works again" 0 "LAUNCHED testbox/h2" -- "$FW" launch testbox h2 -
 echo "--- usage"
 expect "no command prints usage, exit 2" 2 "Usage:" -- "$FW"
 expect "bad worker name refuses" 2 "name must be" -- "$FW" launch testbox "bad name" --kind claude --brief "$brief" --cwd "$proj"
+expect "dot names refuse" 2 "name must be" -- "$FW" launch testbox .. --kind claude --brief "$brief" --cwd "$proj"
 expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --kind claude --brief "$TMP/none.md" --cwd "$proj"
 
 echo

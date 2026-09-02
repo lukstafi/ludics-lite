@@ -45,14 +45,14 @@
 # Exit: 0 ok | 1 the fact does not hold (refused, worker failed, stale) | 2 usage |
 #       3 worker vanished without an exit record | 4 the box never answered.
 #
-# Env: FLEET_LOCAL_BOX (mac-studio), FLEET_BOXES ("rog-nv-wsl minix-amd-wsl", the remote boxes
-# `ls` sweeps), FLEET_SKILLS_REPO (~/self-improve), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
+# Env: FLEET_LOCAL_BOX (mac-studio), FLEET_BOXES (the whole fleet, "mac-studio rog-nv-wsl
+# minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/self-improve), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
 # FLEET_TMUX_SOCKET (tmux -L name; tests isolate with it), FLEET_FLOTILLA (http://mac-studio:7799).
 
 set -uo pipefail
 
 LOCAL_BOX="${FLEET_LOCAL_BOX:-mac-studio}"
-BOXES="${FLEET_BOXES:-rog-nv-wsl minix-amd-wsl}"
+BOXES="${FLEET_BOXES:-mac-studio rog-nv-wsl minix-amd-wsl}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/self-improve}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 TMUX_SOCKET="${FLEET_TMUX_SOCKET:-}"
@@ -75,6 +75,16 @@ tm() { if [ -n "$TMUX_SOCKET" ]; then tmux -L "$TMUX_SOCKET" "$@"; else tmux "$@
 mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 now() { date +%s; }
 meta_get() { sed -n "s/^$2=//p" "$1/meta" 2>/dev/null | head -n1; }
+# The session id addresses every intervention: from meta when the launch recorded it, else from
+# the stream itself (a Codex thread id lands there first; a launch connection can drop between).
+session_of() {
+  local s; s=$(meta_get "$1" session)
+  [ -n "$s" ] || s=$(jq -r 'select(.type=="thread.started") | .thread_id' "$1/stream.jsonl" 2>/dev/null | head -n1)
+  [ -n "$s" ] || s=$(jq -r 'select(.type=="system" and .subtype=="init") | .session_id' "$1/stream.jsonl" 2>/dev/null | head -n1)
+  printf '%s' "$s"
+}
+# A literal string as an ERE, for pgrep/pkill -f.
+re_lit() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g'; }
 alive() { tm has-session -t "iw-$1" 2>/dev/null; }
 WORKERS="$STATE/workers"
 EOF
@@ -107,11 +117,25 @@ put_file() {
   fi
 }
 
+# A session id for a Claude worker, from whatever the coordinator's box has; empty means none of
+# the sources worked and the launch must refuse rather than start an unaddressable session.
+gen_uuid() {
+  local u
+  u=$(uuidgen 2>/dev/null) || u=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) ||
+    u=$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null) ||
+    u=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | sed 's/^\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)$/\1-\2-\3-\4-\5/')
+  u=$(printf '%s' "$u" | tr 'A-Z' 'a-z')
+  case "$u" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*-*-*-[0-9a-f]*) printf '%s' "$u" ;;
+    *) return 1 ;;
+  esac
+}
+
 # ssh's own transport failure is 255; a local child cannot produce it, so 255 always means the
 # box never answered and the caller may retry rather than conclude anything.
 unreachable() { [ "$1" -eq 255 ]; }
 
-valid_name() { case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
+valid_name() { case "$1" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 
 halt_file() { eval echo "$STATE/HALT"; }
 
@@ -152,15 +176,18 @@ if [ -z "$refuse" ]; then
 fi
 head=$(git -C "$repo" rev-parse HEAD 2>/dev/null); up=$(git -C "$repo" rev-parse origin/main 2>/dev/null)
 [ "$head" = "$up" ] || note "HEAD $(echo "$head" | cut -c1-9) != origin/main $(echo "$up" | cut -c1-9) (ahead, or offline)"
-# The deployed skills must be the symlinks the README installs, into THIS checkout.
+# The deployed skills must be the symlinks the README installs, into THIS checkout - compared
+# as resolved paths, so a link through `..` cannot pass a lexical prefix test.
+canon=$(cd "$repo" && pwd -P)
+resolved() { [ -L "$1" ] && (cd -P "$1" 2>/dev/null && pwd -P); }
 for s in issue-wave ship-pr wait-and-proceed after-merge; do
-  t=$(readlink "$HOME/.claude/skills/$s" 2>/dev/null)
-  case "$t" in "$repo"/*) ;; *) note "~/.claude/skills/$s -> ${t:-missing} (not into $repo)" ;; esac
+  t=$(resolved "$HOME/.claude/skills/$s")
+  case "$t" in "$canon"/ClaudeDesktop/skills/*) ;; *) note "~/.claude/skills/$s -> ${t:-missing/not a link} (not into $repo)" ;; esac
 done
 if [ "$codex" = 1 ]; then
   for s in ship-pr wait-and-proceed after-merge; do
-    t=$(readlink "$HOME/.codex/skills/$s" 2>/dev/null)
-    case "$t" in "$repo"/*) ;; *) note "~/.codex/skills/$s -> ${t:-missing} (README's Codex loop not run)" ;; esac
+    t=$(resolved "$HOME/.codex/skills/$s")
+    case "$t" in "$canon"/ClaudeDesktop/skills/*) ;; *) note "~/.codex/skills/$s -> ${t:-missing/not a link} (README's Codex loop not run)" ;; esac
   done
   command -v codex >/dev/null 2>&1 || note "no codex on PATH"
   codex login status >/dev/null 2>&1 || note "codex not logged in"
@@ -221,32 +248,41 @@ cmd_launch() {
     exit 1
   fi
   local sid=""
-  [ "$kind" = claude ] && sid=$(uuidgen | tr 'A-Z' 'a-z')
-  put_file "$box" "$brief" "$STATE/workers/$name/brief.md" || { echo "LAUNCH UNREACHABLE $box"; exit 4; }
+  if [ "$kind" = claude ]; then
+    sid=$(gen_uuid) || { echo "LAUNCH REFUSED $box/$name: cannot generate a session id here (no uuidgen, /proc uuid, or python3)"; exit 1; }
+  fi
+  # The brief lands beside the record, not on it: the far side moves it into place only after
+  # the guards pass, so a refused launch leaves a finished worker's brief untouched.
+  local stamp; stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  put_file "$box" "$brief" "$STATE/workers/$name/incoming-$stamp.md" || { echo "LAUNCH UNREACHABLE $box"; exit 4; }
   { prelude "$box"; cat <<'EOF'
-name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8" replace="$9"; shift 9
-d="$WORKERS/$name"
-if alive "$name"; then echo "LAUNCH REFUSED $BOX/$name: already running"; exit 1; fi
+name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8" replace="$9" stamp="${10}"; shift 10
+d="$WORKERS/$name"; incoming="$d/incoming-$stamp.md"
+refuse() { rm -f "$incoming"; echo "LAUNCH REFUSED $BOX/$name: $*"; exit 1; }
+if alive "$name"; then refuse "already running"; fi
 if [ -f "$d/meta" ] && [ "$replace" != 1 ]; then
   if [ -f "$d/exit" ]; then
-    echo "LAUNCH REFUSED $BOX/$name: a finished worker's record is here (its stream is close-out evidence); pick a new name, or --replace to overwrite"; exit 1
+    refuse "a finished worker's record is here (its stream is close-out evidence); pick a new name, or --replace to overwrite"
   fi
-  echo "LAUNCH REFUSED $BOX/$name: a previous launch left no exit record (killed?); unstick it, or --replace"; exit 1
+  refuse "a previous launch left no exit record (killed?); unstick it, or --replace"
 fi
 if [ -z "$cwd" ]; then
   repo=$(eval echo "$repo")
   cwd="$repo-worktrees/$name"
   if [ ! -d "$cwd" ]; then
-    git -C "$repo" fetch -q origin || { echo "LAUNCH REFUSED $BOX/$name: fetch failed in $repo"; exit 1; }
-    git -C "$repo" worktree add -q "$cwd" -b "$branch" "$base" 2>&1 ||
-      { echo "LAUNCH REFUSED $BOX/$name: worktree add failed"; exit 1; }
+    git -C "$repo" fetch -q origin || refuse "fetch failed in $repo"
+    git -C "$repo" worktree add -q "$cwd" -b "$branch" "$base" 2>&1 || refuse "worktree add failed"
   else
-    echo "notice: reusing existing worktree $cwd"
+    # An existing directory is reused only when it is the worktree the caller described.
+    have=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    [ "$have" = "$branch" ] || refuse "$cwd exists but is on '${have:-no branch}', not $branch; remove it, or pass it explicitly with --cwd"
+    echo "notice: reusing existing worktree $cwd (on $branch)"
   fi
 else
   cwd=$(eval echo "$cwd")
 fi
-[ -d "$cwd" ] || { echo "LAUNCH REFUSED $BOX/$name: no such directory $cwd"; exit 1; }
+[ -d "$cwd" ] || refuse "no such directory $cwd"
+mv -f "$incoming" "$d/brief.md"
 : > "$d/stream.jsonl"; : > "$d/stderr.log"; rm -f "$d/exit"
 # The CLI line itself, written to a file tmux runs: nothing from the brief is ever a shell word.
 {
@@ -266,7 +302,8 @@ fi
 } > "$d/meta"
 tm new-session -d -s "iw-$name" "bash $d/run.sh" || { echo "LAUNCH REFUSED $BOX/$name: tmux failed"; exit 1; }
 if [ "$kind" = codex ]; then
-  # The thread id is the resume address; it is the first event, but the exec takes a moment.
+  # The thread id is the resume address; it is the first event, but the exec takes a moment. If
+  # this connection drops before it is recorded, session_of recovers it from the stream later.
   for i in $(seq 1 60); do
     sid=$(jq -r 'select(.type=="thread.started") | .thread_id' "$d/stream.jsonl" 2>/dev/null | head -n1)
     [ -n "$sid" ] && break
@@ -277,7 +314,7 @@ if [ "$kind" = codex ]; then
 fi
 echo "LAUNCHED $BOX/$name kind=$kind session=${sid:-unknown} cwd=$cwd stream=$d/stream.jsonl"
 EOF
-  } | run_on "$box" "$name" "$kind" "$cwd" "$repo" "$branch" "$base" "$sid" "$(hostname -s)" "$replace" "$@"
+  } | run_on "$box" "$name" "$kind" "$cwd" "$repo" "$branch" "$base" "$sid" "$(hostname -s)" "$replace" "$stamp" "$@"
   local rc=$?
   if unreachable "$rc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   exit "$rc"
@@ -365,7 +402,7 @@ if git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
 else
   wt="cwd not a git repo (or gone)"
 fi
-echo "$state $BOX/$name kind=$kind session=$(meta_get "$d" session) stream: ${events} events, ${quiet}s quiet, last=${last:-none} | $wt | resumes=$(meta_get "$d" resumes) stderr=$(wc -c < "$d/stderr.log" 2>/dev/null | tr -d ' ')B"
+echo "$state $BOX/$name kind=$kind session=$(session_of "$d") stream: ${events} events, ${quiet}s quiet, last=${last:-none} | $wt | resumes=$(meta_get "$d" resumes) stderr=$(wc -c < "$d/stderr.log" 2>/dev/null | tr -d ' ')B"
 EOF
   } | run_on "$box" "$name"
   local rc=$?
@@ -415,8 +452,9 @@ cmd_unstick() {
 name="$1" kill="$2" stamp="$3"; shift 3
 d="$WORKERS/$name"
 [ -f "$d/meta" ] || { echo "UNSTICK REFUSED $BOX/$name: never launched here"; exit 1; }
-kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd); sid=$(meta_get "$d" session)
-[ -n "$sid" ] || { echo "UNSTICK REFUSED $BOX/$name: no session id recorded"; exit 1; }
+kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd); sid=$(session_of "$d")
+[ -n "$sid" ] || { echo "UNSTICK REFUSED $BOX/$name: no session id in meta or stream"; exit 1; }
+grep -q '^session=' "$d/meta" || echo "session=$sid" >> "$d/meta"
 if alive "$name"; then
   if [ "$kill" != 1 ]; then
     echo "UNSTICK REFUSED $BOX/$name: still running -- a resume beside a live exec gives the branch two writers; pass --kill to stop it first"; exit 1
@@ -427,7 +465,7 @@ fi
 # The tmux session is gone; make sure the CLI it ran is too (it could have been reparented).
 # A claude worker carries its session id on its command line; a codex worker's first exec
 # carries only this worker's state dir (-o), so match either.
-pat="$sid|$d/"
+pat="$(re_lit "$sid")|$(re_lit "$d/")"
 for i in $(seq 1 30); do
   pgrep -f -- "$pat" >/dev/null 2>&1 || break
   [ "$i" -eq 1 ] && pkill -TERM -f -- "$pat" 2>/dev/null
@@ -461,8 +499,11 @@ EOF
 
 # ---------------------------------------------------------------------------------------------
 cmd_ls() {
-  local boxes="$*" box rc worst=0
-  [ -n "$boxes" ] || boxes="local $BOXES"
+  local boxes="$*" box rc worst=0 b
+  if [ -z "$boxes" ]; then
+    boxes=local
+    for b in $BOXES; do is_local "$b" || boxes="$boxes $b"; done
+  fi
   for box in $boxes; do
     { prelude "$box"; cat <<'EOF'
 [ -d "$WORKERS" ] || { echo "$BOX: no workers"; exit 0; }
