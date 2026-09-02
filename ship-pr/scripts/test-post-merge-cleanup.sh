@@ -8,6 +8,12 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 HELPER="$SCRIPT_DIR/post-merge-cleanup.sh"
 TEST_ROOT=$(mktemp -d "/tmp/post-merge-cleanup-test.XXXXXX") || exit 1
+# The in-flight cases' subshell pids and names, kept by the runner at the bottom. Declared before
+# the EXIT trap is installed: an exit ahead of the runner (--help, --list, a refused argument)
+# must not find an inherited variable of the same name and signal whatever it lists.
+RUNNING_PIDS=()
+RUNNING_NAMES=()
+RUNNING=0
 
 cleanup() {
   # Every exit path — a signal, a failed assertion in the runner, a closed output pipe — first
@@ -3522,9 +3528,6 @@ JOBS="$JOBS_VALUE"
 set -m
 LOG_DIR="$TEST_ROOT/.logs"
 mkdir -p "$LOG_DIR"
-RUNNING_PIDS=()
-RUNNING_NAMES=()
-RUNNING=0
 PASSED_COUNT=0
 FAILED_COUNT=0
 FAILED=()
@@ -3555,6 +3558,7 @@ report_case() {
   pid="${RUNNING_PIDS[$i]}"
   log="$LOG_DIR/$name.log"
   if wait "$pid" >/dev/null 2>&1; then wait_status=0; else wait_status=$?; fi
+  stop_if_interrupted # a trapped signal returns from wait early; the case is still registered
   kill -TERM -- "-$pid" >/dev/null 2>&1 || true # anything the case left behind in its group
   note=""
   if [ -f "$LOG_DIR/$name.status" ]; then
@@ -3592,6 +3596,7 @@ report_case() {
 reap_one() {
   local i state
   while :; do
+    stop_if_interrupted
     for i in ${RUNNING_PIDS[@]+"${!RUNNING_PIDS[@]}"}; do
       if [ -f "$LOG_DIR/${RUNNING_NAMES[$i]}.status" ]; then
         report_case "$i"
@@ -3611,11 +3616,19 @@ reap_one() {
   done
 }
 
+# A signal only sets a flag. Exiting from inside the trap could fall between a case's spawn and
+# its registration, and the EXIT cleanup would then know nothing of that case; instead the
+# scheduler stops at its next step, once every spawned case is on record, and the EXIT trap
+# terminates and reaps the in-flight process groups before removing the root.
+INTERRUPTED=0
 on_signal() {
-  trap - INT TERM
-  # The EXIT trap terminates and reaps the in-flight process groups before removing the root.
-  echo "FAIL: interrupted with $RUNNING post-merge cleanup states still running" >&2
-  exit 130
+  INTERRUPTED=1
+}
+stop_if_interrupted() {
+  [ "$INTERRUPTED" -eq 0 ] || {
+    echo "FAIL: interrupted with $RUNNING post-merge cleanup states still running" >&2
+    exit 130
+  }
 }
 trap on_signal INT TERM
 
@@ -3624,11 +3637,13 @@ for selected_test in "${SELECTED[@]}"; do
   while [ "$RUNNING" -ge "$JOBS" ]; do
     reap_one
   done
+  stop_if_interrupted
   start_case "$selected_test"
 done
 while [ "$RUNNING" -gt 0 ]; do
   reap_one
 done
+stop_if_interrupted
 
 if [ "$FAILED_COUNT" -gt 0 ]; then
   echo "FAIL: $FAILED_COUNT of $SELECTED_COUNT post-merge cleanup states failed in ${SECONDS}s (-j $JOBS): ${FAILED[*]}" >&2
