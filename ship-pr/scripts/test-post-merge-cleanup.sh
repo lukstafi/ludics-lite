@@ -3426,7 +3426,8 @@ known_test() {
   return 1
 }
 
-JOBS="${SHIP_PR_TEST_JOBS:-}"
+JOBS="${SHIP_PR_TEST_JOBS:-}" # an empty variable is unset, as for the other SHIP_PR_* knobs
+JOBS_EXPLICIT=0               # an explicit -j / --jobs value, empty included, is validated as given
 VERBOSE=0
 NAMED=0
 SELECTED_COUNT=0
@@ -3448,10 +3449,17 @@ while [ "$#" -gt 0 ]; do
       exit 1
     }
     JOBS="$2"
+    JOBS_EXPLICIT=1
     shift
     ;;
-  -j?*) JOBS="${1#-j}" ;;
-  --jobs=*) JOBS="${1#--jobs=}" ;;
+  -j?*)
+    JOBS="${1#-j}"
+    JOBS_EXPLICIT=1
+    ;;
+  --jobs=*)
+    JOBS="${1#--jobs=}"
+    JOBS_EXPLICIT=1
+    ;;
   -*)
     echo "FAIL: unknown option: $1" >&2
     usage >&2
@@ -3484,7 +3492,7 @@ if [ "$SELECTED_COUNT" -eq 0 ]; then
   SELECTED_COUNT=${#TESTS[@]}
 fi
 
-if [ -z "$JOBS" ]; then
+if [ "$JOBS_EXPLICIT" -eq 0 ] && [ -z "$JOBS" ]; then
   JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || JOBS=""
   case "$JOBS" in
   '' | *[!0-9]* | 0) JOBS=4 ;; # no readable processor count: a CI-runner-sized default
