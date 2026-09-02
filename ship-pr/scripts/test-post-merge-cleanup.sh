@@ -10,6 +10,19 @@ HELPER="$SCRIPT_DIR/post-merge-cleanup.sh"
 TEST_ROOT=$(mktemp -d "/tmp/post-merge-cleanup-test.XXXXXX") || exit 1
 
 cleanup() {
+  # Every exit path — a signal, a failed assertion in the runner, a closed output pipe — first
+  # terminates and reaps the in-flight cases' process groups (see the runner below), so nothing
+  # is left waiting on markers under the root this removes.
+  local pid
+  for pid in ${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}; do
+    # The group, and the leader by pid as well: a case forked in the same instant as this exit
+    # may not have joined its group yet, and then only the direct signal reaches it.
+    kill -TERM -- "-$pid" >/dev/null 2>&1 || true
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+  done
+  for pid in ${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}; do
+    wait "$pid" >/dev/null 2>&1 || true
+  done
   case "$TEST_ROOT" in
   /tmp/post-merge-cleanup-test.*) rm -rf "$TEST_ROOT" ;;
   *) echo "refusing to remove unexpected test root: $TEST_ROOT" >&2 ;;
@@ -3510,7 +3523,11 @@ FAILED=()
 
 run_case() {
   local name="$1"
-  trap 'echo "$?" >"$LOG_DIR/$name.status"' EXIT
+  # The trap body is evaluated when the subshell exits, under whatever scope is live then. Every
+  # case's setup_case has its own local `name`, so a failure inside it would resolve `$name` to
+  # the scratch slug and write a status file the parent never looks for. Resolve the path now.
+  CASE_STATUS_FILE="$LOG_DIR/$name.status"
+  trap 'echo "$?" >"$CASE_STATUS_FILE"' EXIT
   TEST_ROOT="$TEST_ROOT/$name"
   mkdir -p "$TEST_ROOT" || exit 1
   "$name"
@@ -3525,13 +3542,21 @@ start_case() {
 }
 
 report_case() {
-  local i="$1" name pid status log
+  local i="$1" name pid status log note wait_status
   name="${RUNNING_NAMES[$i]}"
   pid="${RUNNING_PIDS[$i]}"
   log="$LOG_DIR/$name.log"
-  wait "$pid" >/dev/null 2>&1 || true
+  if wait "$pid" >/dev/null 2>&1; then wait_status=0; else wait_status=$?; fi
   kill -TERM -- "-$pid" >/dev/null 2>&1 || true # anything the case left behind in its group
-  status=$(cat "$LOG_DIR/$name.status" 2>/dev/null) || status=""
+  note=""
+  if [ -f "$LOG_DIR/$name.status" ]; then
+    status=$(cat "$LOG_DIR/$name.status" 2>/dev/null) || status=""
+  else
+    # The subshell died without its status trap running (a signal, or a broken trap): that is
+    # never a pass, whatever the exit status says.
+    status=""
+    note=" — the case exited $wait_status without reporting a status"
+  fi
   case "$status" in
   '' | *[!0-9]*) status=1 ;;
   esac
@@ -3549,7 +3574,7 @@ report_case() {
     FAILED_COUNT=$((FAILED_COUNT + 1))
     FAILED+=("$name")
     {
-      echo "===== FAIL: $name (exit $status) ====="
+      echo "===== FAIL: $name (exit $status$note) ====="
       cat "$log"
       echo "===== end of $name ====="
     } >&2
@@ -3557,28 +3582,30 @@ report_case() {
 }
 
 reap_one() {
-  local i
+  local i state
   while :; do
     for i in ${RUNNING_PIDS[@]+"${!RUNNING_PIDS[@]}"}; do
       if [ -f "$LOG_DIR/${RUNNING_NAMES[$i]}.status" ]; then
         report_case "$i"
         return 0
       fi
+      # A subshell that exited without its status file must still be reaped, or the suite would
+      # wait on it forever: a zombie (or a pid already gone) is finished, whatever it reported.
+      state=$(ps -o stat= -p "${RUNNING_PIDS[$i]}" 2>/dev/null) || state=""
+      case "$state" in
+      '' | Z*)
+        report_case "$i"
+        return 0
+        ;;
+      esac
     done
     sleep 0.2
   done
 }
 
 on_signal() {
-  local pid
   trap - INT TERM
-  for pid in ${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}; do
-    kill -TERM -- "-$pid" >/dev/null 2>&1 || true # the case's whole process group
-  done
-  # Reap them here so bash does not narrate each termination while the EXIT trap removes the root.
-  for pid in ${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}; do
-    wait "$pid" >/dev/null 2>&1 || true
-  done
+  # The EXIT trap terminates and reaps the in-flight process groups before removing the root.
   echo "FAIL: interrupted with $RUNNING post-merge cleanup states still running" >&2
   exit 130
 }
