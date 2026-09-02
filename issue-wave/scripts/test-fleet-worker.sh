@@ -137,6 +137,7 @@ env FLEET_COORDINATOR=race-b "$FW" coordinator 2>&1 | grep -q "COORDINATOR: you"
 [ -d "$ISSUE_WAVE_STATE/COORDINATOR.lock" ] && ko "takeover lock left behind" || ok "takeover lock released"
 mkdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
 expect "a held takeover lock makes --take fail after the bounded wait" 1 "CLAIM FAILED: takeover lock" -- env FLEET_LOCK_WAIT=1 "$FW" claim --take
+expect "release under a held lease lock fails after the bounded wait, not silently" 1 "RELEASE FAILED: lease lock" -- env FLEET_LOCK_WAIT=1 "$FW" release
 rmdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
 "$FW" claim --take >/dev/null
 mkdir -p "$TMP/state-c"; : > "$TMP/state-c/tokens"
@@ -144,7 +145,7 @@ expect "a token that cannot be persisted refuses the claim" 1 "CLAIM REFUSED: ca
 grep -q '^token=$' "$ISSUE_WAVE_STATE/COORDINATOR" && ko "an empty token reached the lease" || ok "no empty-token lease was written"
 expect "an identity outside the safe set is refused, not folded" 2 "coordinator identity 'team/a' must be" -- env FLEET_COORDINATOR=team/a "$FW" claim
 chmod 555 "$ISSUE_WAVE_STATE"
-expect "release that cannot remove the lease says so, exit 1" 1 "RELEASE FAILED: could not remove" -- "$FW" release
+expect "release on an unwritable anchor fails at once, not after the lock wait" 1 "RELEASE FAILED: cannot create the lease lock" -- "$FW" release
 chmod 755 "$ISSUE_WAVE_STATE"
 expect "release drops it" 0 "RELEASED coordinator lease" -- "$FW" release
 expect "coordinator after release: nobody" 3 "nobody holds" -- "$FW" coordinator
@@ -225,6 +226,10 @@ git -C "$proj-worktrees/w1" checkout -q -b other
 expect "a reused worktree on another branch refuses" 1 "exists but is on 'other', not claude/w1" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
 git -C "$proj-worktrees/w1" checkout -q claude/w1 && git -C "$proj-worktrees/w1" branch -q -D other
+foreign="$proj-worktrees/wx"; git init -q -b claude/wx "$foreign" && echo z > "$foreign/z" && git -C "$foreign" add z && git -C "$foreign" commit -q -m z
+expect "a foreign repository at the derived path is refused even on the right branch" 1 "exists but is not a worktree of" -- \
+  "$FW" launch testbox wx --kind claude --brief "$brief" --repo "$proj" --branch claude/wx
+rm -rf "$foreign"
 expect "a reused worktree on the requested branch is accepted" 0 "reusing existing worktree .* (on claude/w1)" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
 "$FW" attach testbox w1 --interval 1 >/dev/null
@@ -295,8 +300,19 @@ kill -0 "$orphan" 2>/dev/null && ko "orphan survived --kill" || ok "--kill termi
 "$FW" attach testbox wo --interval 1 >/dev/null
 mv "$ISSUE_WAVE_STATE/workers/wo/run.sh" "$TMP/run.saved"; mkdir "$ISSUE_WAVE_STATE/workers/wo/run.sh"
 expect "unstick refuses when the resume script cannot be written" 1 "UNSTICK REFUSED testbox/wo: cannot write .*run.sh" -- "$FW" unstick testbox wo --message "$TMP/msg.md"
+[ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "a refused unstick keeps the previous exit record" || ko "refused unstick destroyed the exit record"
 rmdir "$ISSUE_WAVE_STATE/workers/wo/run.sh"; mv "$TMP/run.saved" "$ISSUE_WAVE_STATE/workers/wo/run.sh"
 expect "a non-holder cannot unstick" 1 "UNSTICK REFUSED testbox/wo: coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" unstick testbox wo --message "$TMP/msg.md"
+
+printf 'SLEEP 5\n' > "$TMP/slow5.md"
+"$FW" launch testbox dup --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/dup-a.out" 2>&1 & da=$!
+"$FW" launch testbox dup --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/dup-b.out" 2>&1 & db=$!
+wait "$da" "$db"
+launched=$(cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -c '^LAUNCHED testbox/dup')
+[ "$launched" -eq 1 ] && ok "two overlapping launches of one name: exactly one LAUNCHED" || ko "overlapping launches: $launched LAUNCHED -- $(cat "$TMP/dup-a.out" "$TMP/dup-b.out")"
+cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -q 'another launch of this name is in progress\|already running' && ok "the other was refused by the lock or the liveness guard" || ko "no refusal for the overlapping launch"
+[ -d "$ISSUE_WAVE_STATE/workers/dup.launching" ] && ko "launch lock left behind" || ok "launch lock released"
+"$FW" attach testbox dup --interval 1 >/dev/null
 
 echo "--- codex workers"
 expect "codex launch captures the thread id from the stream" 0 "LAUNCHED testbox/c1 kind=codex session=0199-shim-" -- \

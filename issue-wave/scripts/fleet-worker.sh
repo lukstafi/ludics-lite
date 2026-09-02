@@ -228,6 +228,16 @@ preflight_script() {
 codex="$1" probe="$2"
 refuse=""
 note() { refuse="$refuse; $*"; }
+# One preflight per box at a time: a parallel group launched together would otherwise race
+# `git fetch`/`merge` in the same checkout and refuse on git's own lock files. Idempotent, so
+# waiting for the other preflight is the right thing; the bound covers a hung live probe.
+mkdir -p "$STATE" 2>/dev/null; plock="$STATE/preflight.lock"; waited=0
+until mkdir "$plock" 2>/dev/null; do
+  [ -d "$plock" ] || { echo "PREFLIGHT REFUSED $BOX: cannot create $plock (state dir unwritable?)"; exit 1; }
+  [ "$waited" -lt 180 ] || { echo "PREFLIGHT REFUSED $BOX: another preflight has held $plock for 180s -- hung probe, or a stale lock to remove by hand"; exit 1; }
+  sleep 1; waited=$((waited + 1))
+done
+trap 'rmdir "$plock" 2>/dev/null' EXIT
 repo=$(expand_tilde "$SKILLS_REPO")
 if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
   echo "PREFLIGHT REFUSED $BOX: no skills checkout at $repo"; exit 1
@@ -360,12 +370,16 @@ cmd_launch() {
   fi
   # The brief lands beside the record, not on it: the far side moves it into place only after
   # the guards pass, so a refused launch leaves a finished worker's brief untouched.
-  local stamp; stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  local stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   put_file "$box" "$brief" "$STATE/workers/$name/incoming-$stamp.md" || { echo "LAUNCH UNREACHABLE $box"; exit 4; }
   { prelude "$box"; cat <<'EOF'
 name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8" replace="$9" stamp="${10}"; shift 10
 d="$WORKERS/$name"; incoming="$d/incoming-$stamp.md"
 refuse() { rm -f "$incoming"; echo "LAUNCH REFUSED $BOX/$name: $*"; exit 1; }
+# One launch of a name at a time: the guards below and the record writes after them are one
+# critical section, held until the tmux session exists (or this launch has refused).
+if ! mkdir "$d.launching" 2>/dev/null; then refuse "another launch of this name is in progress (lock $d.launching)"; fi
+trap 'rmdir "$d.launching" 2>/dev/null' EXIT
 if alive "$name"; then refuse "already running"; fi
 if [ -f "$d/meta" ]; then
   # tmux gone is not the CLI gone: a reparented orphan can still write and commit, and
@@ -391,6 +405,9 @@ if [ -z "$cwd" ]; then
     # An existing directory is reused only when it is the worktree the caller described.
     have=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)
     [ "$have" = "$branch" ] || refuse "$cwd exists but is on '${have:-no branch}', not $branch; remove it, or pass it explicitly with --cwd"
+    common=$(cd "$cwd" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)
+    want=$(cd "$repo" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)
+    [ -n "$common" ] && [ "$common" = "$want" ] || refuse "$cwd exists but is not a worktree of $repo (common dir ${common:-unknown}); remove it, or pass it explicitly with --cwd"
     echo "notice: reusing existing worktree $cwd (on $branch)"
   fi
 else
@@ -577,7 +594,7 @@ cmd_unstick() {
   done
   [ -n "$msg" ] && [ -r "$msg" ] || die "unstick: --message <readable file>"
   anchor_gate UNSTICK "$box/$name" 1 || exit $?
-  local stamp; stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  local stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   put_file "$box" "$msg" "$STATE/workers/$name/messages/$stamp.md" || { echo "UNSTICK UNREACHABLE $box"; exit 4; }
   { prelude "$box"; cat <<'EOF'
 name="$1" kill="$2" stamp="$3"; shift 3
@@ -609,7 +626,6 @@ done
 if pgrep -f -- "$pat" >/dev/null 2>&1; then
   echo "UNSTICK REFUSED $BOX/$name: a process still carries session $sid after TERM: $(pgrep -fl -- "$pat" | head -n 3 | tr '\n' ';')"; exit 1
 fi
-rm -f "$d/exit"
 {
   printf 'cd %q || exit 97\n' "$cwd"
   case "$kind" in
@@ -624,6 +640,8 @@ rm -f "$d/exit"
 n=$(meta_get "$d" resumes); n=$(( ${n:-0} + 1 ))
 sed -i.bak "s/^resumes=.*/resumes=$n/" "$d/meta" 2>/dev/null && rm -f "$d/meta.bak" && grep -q "^resumes=$n\$" "$d/meta" ||
   { echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
+# The previous terminal state is evidence until the resume is really starting.
+rm -f "$d/exit" 2>/dev/null; [ ! -e "$d/exit" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot clear $d/exit"; exit 1; }
 tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || { echo "UNSTICK REFUSED $BOX/$name: tmux failed"; exit 1; }
 echo "RESUMED $BOX/$name kind=$kind session=$sid resume=$n message=$d/messages/$stamp.md"
 EOF
@@ -734,6 +752,7 @@ if [ "$take" = 1 ]; then
   # cannot both write and each verify its own token before the other's write lands.
   lock="$lease.lock"; waited=0
   until mkdir "$lock" 2>/dev/null; do
+    [ -d "$lock" ] || { echo "CLAIM FAILED: cannot create the lease lock $lock on $BOX (anchor state unwritable?) -- not adopted"; exit 1; }
     [ "$waited" -lt "$lockwait" ] || { echo "CLAIM FAILED: takeover lock $lock held for ${lockwait}s on $BOX -- another adoption in progress, or a stale lock to remove by hand"; exit 1; }
     sleep 1; waited=$((waited + 1))
   done
@@ -754,13 +773,22 @@ EOF
 cmd_release() {
   check_identity
   { prelude "$ANCHOR"; cat <<'EOF'
-token="$1"; lease="$ANCHOR_STATE/COORDINATOR"
+token="$1" lockwait="$2"; lease="$ANCHOR_STATE/COORDINATOR"
+# The token check and the removal happen under the same lock takeovers use, so a release
+# racing an adoption cannot delete the successor's freshly written lease.
+lock="$lease.lock"; waited=0
+until mkdir "$lock" 2>/dev/null; do
+  [ -d "$lock" ] || { echo "RELEASE FAILED: cannot create the lease lock $lock on $BOX (anchor state unwritable?) -- the lease is still held"; exit 1; }
+  [ "$waited" -lt "$lockwait" ] || { echo "RELEASE FAILED: lease lock $lock held for ${lockwait}s on $BOX -- an adoption in progress, or a stale lock to remove by hand"; exit 1; }
+  sleep 1; waited=$((waited + 1))
+done
+trap 'rmdir "$lock" 2>/dev/null' EXIT
 [ -f "$lease" ] || { echo "RELEASE: no lease held"; exit 0; }
 held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease")
 [ "$held" = "$token" ] || { echo "RELEASE REFUSED: lease held by $hhost, not you"; exit 1; }
 if rm -f "$lease" 2>/dev/null && [ ! -e "$lease" ]; then echo "RELEASED coordinator lease on $BOX"; else echo "RELEASE FAILED: could not remove $lease on $BOX -- the lease is still held"; exit 1; fi
 EOF
-  } | run_on "$ANCHOR" "$(my_token)"
+  } | run_on "$ANCHOR" "$(my_token)" "${FLEET_LOCK_WAIT:-10}"
   local rc=$?; if unreachable "$rc"; then echo "RELEASE UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
 }
 
