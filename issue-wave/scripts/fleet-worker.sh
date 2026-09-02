@@ -122,8 +122,8 @@ meta_get() { sed -n "s/^$2=//p" "$1/meta" 2>/dev/null | head -n1; }
 # the stream itself (a Codex thread id lands there first; a launch connection can drop between).
 session_of() {
   local s; s=$(meta_get "$1" session)
-  [ -n "$s" ] || s=$(jq -r 'select(.type=="thread.started") | .thread_id' "$1/stream.jsonl" 2>/dev/null | head -n1)
-  [ -n "$s" ] || s=$(jq -r 'select(.type=="system" and .subtype=="init") | .session_id' "$1/stream.jsonl" 2>/dev/null | head -n1)
+  [ -n "$s" ] || s=$(jq -Rr 'fromjson? | select(.type=="thread.started") | .thread_id' "$1/stream.jsonl" 2>/dev/null | head -n1)
+  [ -n "$s" ] || s=$(jq -Rr 'fromjson? | select(.type=="system" and .subtype=="init") | .session_id' "$1/stream.jsonl" 2>/dev/null | head -n1)
   printf '%s' "$s"
 }
 # A literal string as an ERE, for pgrep/pkill -f.
@@ -321,12 +321,21 @@ if [ "$frc" -eq 124 ]; then note "git fetch in $repo timed out after ${fetch_tim
 # NUL-delimited, so a path git would otherwise quote (a space, a quote, a non-ASCII byte) is
 # still classified by its directory rather than falling through as "outside the served tree".
 served=0; other=""
+statusz=$(mktemp "${TMPDIR:-/tmp}/fw-status.XXXXXX")
+if ! git -C "$repo" status --porcelain -z --untracked-files=all --ignored=matching > "$statusz" 2>/dev/null; then
+  rm -f "$statusz"; note "git status failed in $repo (cannot scan the served tree)"; statusz=/dev/null
+fi
+# Index-hidden entries (skip-worktree / assume-unchanged) never show in status: refuse them
+# under the served tree outright, since the symlinks serve the working-tree bytes.
+hidden=$(git -C "$repo" ls-files -v -- ClaudeDesktop 2>/dev/null | grep -c '^[Sh]' || true)
+[ "${hidden:-0}" -eq 0 ] || note "$hidden index-hidden (skip-worktree/assume-unchanged) file(s) under ClaudeDesktop/"
 while IFS= read -r -d '' entry; do
   st=${entry:0:2}; path=${entry:3}; from=""
   case "$st" in R*|C*) IFS= read -r -d '' from ;; esac   # a rename's second record is the source
   # Both sides of a rename count: a file moved OUT of the served tree is a served file gone.
   case "$path" in ClaudeDesktop/*) served=$((served + 1)) ;; *) case "$from" in ClaudeDesktop/*) served=$((served + 1)) ;; *) other="$other$path " ;; esac ;; esac
-done < <(git -C "$repo" status --porcelain -z --untracked-files=all --ignored=matching 2>/dev/null)
+done < "$statusz"
+[ "$statusz" = /dev/null ] || rm -f "$statusz"
 [ "$served" -eq 0 ] || note "$served local change(s) under ClaudeDesktop/ (the served tree)"
 branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
 [ "$branch" = main ] || note "checked out $branch, not main"
@@ -460,8 +469,9 @@ msg=$(take_lock "$wlock" 0 "lock") || refuse "another launch or unstick of this 
 archive=""; started=0
 on_exit() {
   # Killed anywhere after archiving the old record and before tmux started: put it back; a
-  # fresh record that never reached a session is removed, so the name stays launchable.
-  if [ "$started" != 1 ]; then
+  # fresh record that never reached a session is removed, so the name stays launchable. The
+  # session itself is the truth: if it exists, nothing is rolled back whatever the flag says.
+  if [ "$started" != 1 ] && ! alive "$name"; then
     if [ -n "$archive" ] && [ -d "$archive" ]; then rm -rf "$d"; mv "$archive" "$d" 2>/dev/null
     elif [ "$fresh" = 1 ]; then rm -rf "$d"; fi
   fi
@@ -512,9 +522,9 @@ fi
 # condition unstick refuses, under different names. Compared by resolved path, and under a
 # box-wide launch lock held from this scan until this record's meta (its ownership claim)
 # is written, so two launches under different names cannot both pass the scan.
-blaunch="$STATE/launch.lock"
-msg=$(take_lock "$blaunch" 120 "launch lock") || refuse "another launch on this box is publishing its record ($msg)"
-canon_cwd=$(cd "$cwd" 2>/dev/null && pwd -P)
+msg=$(take_lock "$STATE/launch.lock" 120 "launch lock") || refuse "another launch on this box is publishing its record ($msg)"
+blaunch="$STATE/launch.lock"   # set only once acquired: on_exit must never release another holder's lock
+canon_cwd=$(cd "$cwd" 2>/dev/null && pwd -P); cwd="$canon_cwd"   # the record holds the resolved absolute path
 for om in "$WORKERS"/*/meta; do
   [ -f "$om" ] || continue
   oname=$(basename "$(dirname "$om")"); [ "$oname" = "$name" ] && continue
@@ -556,14 +566,15 @@ mv -f "$incoming" "$d/brief.md" 2>/dev/null && [ -f "$d/brief.md" ] || refuse "c
   echo "launched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "resumes=0"; echo "turn_offset=0"
   if [ -n "$sid" ]; then echo "session=$sid"; fi
 } > "$d/meta" || refuse "cannot write $d/meta"
-release_lock "$blaunch"; blaunch=""   # ownership is published; the box-wide lock is no longer needed
 tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || refuse "tmux failed"
 started=1
+# Ownership is now visible as a live session; the box-wide lock can go.
+release_lock "$blaunch"; blaunch=""
 if [ "$kind" = codex ]; then
   # The thread id is the resume address; it is the first event, but the exec takes a moment. If
   # this connection drops before it is recorded, session_of recovers it from the stream later.
   for i in $(seq 1 60); do
-    sid=$(jq -r 'select(.type=="thread.started") | .thread_id' "$d/stream.jsonl" 2>/dev/null | head -n1)
+    sid=$(jq -Rr 'fromjson? | select(.type=="thread.started") | .thread_id' "$d/stream.jsonl" 2>/dev/null | head -n1)
     [ -n "$sid" ] && break
     [ -f "$d/exit" ] && break
     sleep 1
@@ -596,11 +607,11 @@ verdict() {
   local off; off=$(meta_get "$d" turn_offset); off=${off:-0}
   turn() { tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null; }
   case "$kind" in
-    claude) summary=$(turn | jq -r 'select(.type=="result") | "\(.subtype) is_error=\(.is_error) turns=\(.num_turns) " + ((.result // "")|tostring|.[0:200]|gsub("\n";" "))' 2>/dev/null | tail -n1)
+    claude) summary=$(turn | jq -Rr 'fromjson? | select(.type=="result") | "\(.subtype) is_error=\(.is_error) turns=\(.num_turns) " + ((.result // "")|tostring|.[0:200]|gsub("\n";" "))' 2>/dev/null | tail -n1)
             ok_event=$(printf '%s' "$summary" | grep -c 'is_error=false') ;;
-    codex)  summary=$(turn | jq -r 'select(.type=="turn.completed" or .type=="turn.failed") | .type + " " + ((.error.message // "")|tostring|.[0:200])' 2>/dev/null | tail -n1)
+    codex)  summary=$(turn | jq -Rr 'fromjson? | select(.type=="turn.completed" or .type=="turn.failed") | .type + " " + ((.error.message // "")|tostring|.[0:200])' 2>/dev/null | tail -n1)
             ok_event=$(printf '%s' "$summary" | grep -c '^turn.completed')
-            last=$(turn | jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text' 2>/dev/null | tail -n1 | cut -c1-200)
+            last=$(turn | jq -Rr 'fromjson? | select(.type=="item.completed" and .item.type=="agent_message") | .item.text' 2>/dev/null | tail -n1 | cut -c1-200)
             [ -n "$last" ] && summary="$summary | $last" ;;
   esac
   [ -n "$summary" ] || summary="no terminal event in the stream"
@@ -663,8 +674,8 @@ kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd)
 state=$(state_of "$name")
 quiet=$(( $(now) - $(mtime "$d/stream.jsonl") ))
 case "$kind" in
-  claude) last=$(tail -n 1 "$d/stream.jsonl" 2>/dev/null | jq -r '.type + (if .type=="assistant" then ":" + ([.message.content[]? | .type] | join(",")) else "" end)' 2>/dev/null) ;;
-  codex)  last=$(tail -n 1 "$d/stream.jsonl" 2>/dev/null | jq -r '.type + (if .item then ":" + .item.type else "" end)' 2>/dev/null) ;;
+  claude) last=$(tail -n 1 "$d/stream.jsonl" 2>/dev/null | jq -Rr 'fromjson? | .type + (if .type=="assistant" then ":" + ([.message.content[]? | .type] | join(",")) else "" end)' 2>/dev/null) ;;
+  codex)  last=$(tail -n 1 "$d/stream.jsonl" 2>/dev/null | jq -Rr 'fromjson? | .type + (if .item then ":" + .item.type else "" end)' 2>/dev/null) ;;
 esac
 events=$(grep -c . "$d/stream.jsonl" 2>/dev/null); events=${events:-0}
 if git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
@@ -691,8 +702,8 @@ cmd_log() {
 name="$1" n="$2"; d="$WORKERS/$name"
 [ -f "$d/meta" ] || { echo "UNKNOWN $BOX/$name: never launched here"; exit 3; }
 case "$(meta_get "$d" kind)" in
-  claude) jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$d/stream.jsonl" 2>/dev/null | tail -n "$n" ;;
-  codex)  jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text' "$d/stream.jsonl" 2>/dev/null | tail -n "$n" ;;
+  claude) jq -Rr 'fromjson? | select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$d/stream.jsonl" 2>/dev/null | tail -n "$n" ;;
+  codex)  jq -Rr 'fromjson? | select(.type=="item.completed" and .item.type=="agent_message") | .item.text' "$d/stream.jsonl" 2>/dev/null | tail -n "$n" ;;
 esac
 if [ -s "$d/stderr.log" ]; then echo "--- stderr (tail):"; tail -n 5 "$d/stderr.log"; fi
 EOF
@@ -734,15 +745,16 @@ d="$WORKERS/$name"; staged="$STATE/incoming/$name-$stamp.md"
 # Same critical section as launch: liveness checks through tmux creation, one at a time.
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
 msg=$(take_lock "$wlock" 0 "lock") || { rm -f "$staged"; echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress ($msg)"; exit 1; }
-started=0
+started=0; blaunch=""
 on_exit() {
-  # Interrupted after the record was changed but before tmux started: put exit and meta back.
-  if [ "$started" != 1 ]; then
+  # Interrupted after the record was changed but before tmux started: put exit and meta back
+  # (unless the session exists after all - the session is the truth).
+  if [ "$started" != 1 ] && ! alive "$name"; then
     [ -e "$d/exit.prev" ] && mv -f "$d/exit.prev" "$d/exit" 2>/dev/null
     [ -e "$d/meta.prev" ] && mv -f "$d/meta.prev" "$d/meta" 2>/dev/null
     rm -f "$staged"
   fi
-  release_lock "$wlock"
+  release_lock "$wlock"; [ -n "$blaunch" ] && release_lock "$blaunch"
 }
 trap on_exit EXIT; trap 'exit 143' TERM HUP INT
 # The message moves into the record only now, under the lock: a --replace that archived the
@@ -752,6 +764,18 @@ mkdir -p "$d/messages" && mv -f "$staged" "$d/messages/$stamp.md" 2>/dev/null &&
 kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd); sid=$(session_of "$d")
 [ -n "$sid" ] || { echo "UNSTICK REFUSED $BOX/$name: no session id in meta or stream"; exit 1; }
 [ -d "$cwd" ] || { echo "UNSTICK REFUSED $BOX/$name: recorded working directory $cwd is gone (worktree removed or renamed); nothing was changed"; exit 1; }
+# The same one-live-worker-per-worktree rule as launch, under the same box-wide lock: a
+# resume must not start beside another worker that took this worktree meanwhile.
+msg=$(take_lock "$STATE/launch.lock" 120 "launch lock") || { echo "UNSTICK REFUSED $BOX/$name: another launch on this box is publishing its record ($msg)"; exit 1; }
+blaunch="$STATE/launch.lock"
+canon_cwd=$(cd "$cwd" 2>/dev/null && pwd -P)
+for om in "$WORKERS"/*/meta; do
+  [ -f "$om" ] || continue
+  oname=$(basename "$(dirname "$om")"); [ "$oname" = "$name" ] && continue
+  ocwd=$(sed -n 's/^cwd=//p' "$om" | head -n1); [ -n "$ocwd" ] || continue
+  [ "$(cd "$ocwd" 2>/dev/null && pwd -P)" = "$canon_cwd" ] || continue
+  running "$oname" && { echo "UNSTICK REFUSED $BOX/$name: worktree $cwd is now owned by live worker $oname on this box"; exit 1; }
+done
 grep -q '^session=' "$d/meta" || echo "session=$sid" >> "$d/meta"
 if alive "$name"; then
   if [ "$kill" != 1 ]; then
@@ -805,6 +829,7 @@ if ! tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")"; then
   echo "UNSTICK REFUSED $BOX/$name: tmux failed (previous exit record and meta kept)"; exit 1
 fi
 started=1
+release_lock "$blaunch"; blaunch=""
 rm -f "$d/exit.prev" "$d/meta.prev"
 echo "RESUMED $BOX/$name kind=$kind session=$sid resume=$n message=$d/messages/$stamp.md"
 EOF

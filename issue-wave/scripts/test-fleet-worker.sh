@@ -204,6 +204,12 @@ expect "untracked file under the served tree refuses" 1 "1 local change(s) under
 git -C "$repo" config status.showUntrackedFiles no
 expect "...even when the box's git config hides untracked files" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
 git -C "$repo" config --unset status.showUntrackedFiles
+git -C "$repo" update-index --skip-worktree ClaudeDesktop/skills/ship-pr/SKILL.md; echo hidden >> "$repo/ClaudeDesktop/skills/ship-pr/SKILL.md"
+expect "a skip-worktree edit under the served tree refuses" 1 "index-hidden (skip-worktree/assume-unchanged) file(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
+git -C "$repo" update-index --no-skip-worktree ClaudeDesktop/skills/ship-pr/SKILL.md; git -C "$repo" checkout -q -- .
+git -C "$repo" config status.relativePaths bogus
+expect "a git status that cannot run refuses instead of passing an empty scan" 1 "git status failed in" -- "$FW" preflight testbox --no-probe
+git -C "$repo" config --unset status.relativePaths
 printf '*.tmp\n' > "$TMP/excludes"; git -C "$repo" config core.excludesFile "$TMP/excludes"; touch "$repo/ClaudeDesktop/skills/ship-pr/x.tmp"
 expect "an ignored file under the served tree still refuses" 1 "local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
 rm "$repo/ClaudeDesktop/skills/ship-pr/x.tmp"; git -C "$repo" config --unset core.excludesFile
@@ -422,8 +428,11 @@ n=$(cat "$TMP/rx.out" "$TMP/ry.out" | grep -c '^LAUNCHED ')
 cat "$TMP/rx.out" "$TMP/ry.out" | grep -q 'already owned by live worker' && ok "the other was refused by ownership" || ko "no ownership refusal: $(cat "$TMP/rx.out" "$TMP/ry.out")"
 [ -d "$ISSUE_WAVE_STATE/launch.lock" ] && ko "box-wide launch lock left behind" || ok "box-wide launch lock released"
 for w in race-x race-y; do "$FW" unstick testbox $w --message "$TMP/msg.md" --kill >/dev/null 2>&1; "$FW" attach testbox $w --interval 1 >/dev/null 2>&1; done
+"$FW" launch testbox hold --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
+expect "unstick refuses to resume into a worktree another live worker now owns" 1 "UNSTICK REFUSED testbox/own-b: worktree .* is now owned by live worker hold" -- "$FW" unstick testbox own-b --message "$TMP/msg.md"
+"$FW" unstick testbox hold --message "$TMP/msg.md" --kill >/dev/null; "$FW" attach testbox hold --interval 1 >/dev/null
 "$FW" launch testbox p-1 --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox p-1 --interval 1 >/dev/null
-"$FW" launch testbox p-12 --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
+"$FW" launch testbox p-12 --kind claude --brief "$TMP/slow20.md" --cwd "$proj-worktrees/w1" >/dev/null; sleep 1   # its own worktree: ownership is not what this case tests
 expect "a finished worker is not read as running through a prefix-matching sibling session" 0 "EXITED(0) testbox/p-1 " -- "$FW" status testbox p-1
 expect "unstick --kill of the finished worker leaves the sibling session alone" 0 "RESUMED testbox/p-1" -- "$FW" unstick testbox p-1 --message "$TMP/msg.md" --kill
 expect "...the sibling is still running" 0 "RUNNING testbox/p-12" -- "$FW" status testbox p-12
@@ -446,6 +455,8 @@ expect "codex launch captures the thread id from the stream" 0 "LAUNCHED testbox
 grep -qF -- "codex exec --json --yolo -C $(printf '%q' "$proj") -o " "$ISSUE_WAVE_STATE/workers/c1/run.sh" && grep -qF -- "last-message.md - < " "$ISSUE_WAVE_STATE/workers/c1/run.sh" && ok "codex command shape (brief on stdin, -o last message)" || ko "codex command: $(cat "$ISSUE_WAVE_STATE/workers/c1/run.sh")"
 expect "codex attach reads turn.completed and the last message" 0 "DONE testbox/c1 exit=0 turn.completed .*codex did: Fix issue" -- "$FW" attach testbox c1 --interval 1
 expect "codex log prints agent messages" 0 "codex did: Fix issue" -- "$FW" log testbox c1
+printf '{"type":"item.completed","item":{"type":"agent_mes' >> "$ISSUE_WAVE_STATE/workers/c1/stream.jsonl"; printf '\n{"type":"item.completed","item":{"type":"agent_message","text":"after the damage"}}\n' >> "$ISSUE_WAVE_STATE/workers/c1/stream.jsonl"
+expect "a truncated JSONL line does not hide the events after it" 0 "after the damage" -- "$FW" log testbox c1
 sed -i.bak '/^session=/d' "$ISSUE_WAVE_STATE/workers/c1/meta" && rm -f "$ISSUE_WAVE_STATE/workers/c1/meta.bak"
 expect "status recovers the thread id from the stream when meta lacks it" 0 "session=0199-shim-" -- "$FW" status testbox c1
 expect "codex unstick resumes by thread id (from the stream) with --yolo" 0 "RESUMED testbox/c1 kind=codex session=0199-shim-" -- "$FW" unstick testbox c1 --message "$TMP/msg.md"
@@ -490,6 +501,8 @@ out=$(env -u FLEET_LOCAL_BOX "$FW" status testbox w1 2>&1); rc=$?
 expect "attach rejects a zero interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval 0
 expect "attach rejects a non-numeric interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval fast
 expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --kind claude --brief "$TMP/none.md" --cwd "$proj"
+( cd "$TMP" && "$FW" launch testbox rel --kind claude --brief "$brief" --cwd "pro j" >/dev/null ) && "$FW" attach testbox rel --interval 1 >/dev/null
+grep -q "^cwd=$proj\$" "$ISSUE_WAVE_STATE/workers/rel/meta" && ok "a relative --cwd is recorded as its absolute path" || ko "relative cwd recorded: $(grep '^cwd=' "$ISSUE_WAVE_STATE/workers/rel/meta")"
 expect "a path with a newline refuses" 2 "must not contain newlines" -- "$FW" launch testbox nl --kind claude --brief "$brief" --cwd "$(printf '%s\nx' "$proj")"
 
 echo
