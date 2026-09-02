@@ -313,8 +313,8 @@ if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
 fi
 bounded "$fetch_timeout" git -C "$repo" fetch -q origin >/dev/null; frc=$?
 if [ "$frc" -eq 124 ]; then note "git fetch in $repo timed out after ${fetch_timeout}s"; elif [ "$frc" -ne 0 ]; then note "fetch failed (offline?)"; fi
-# Any change under the served tree - tracked or untracked - is divergence to surface: the
-# deployed symlinks would serve it. Changes elsewhere are not skill text and are only reported
+# Any change under the served tree - tracked, untracked, even ignored - is divergence to
+# surface: the deployed symlinks would serve it. Changes elsewhere are not skill text and are only reported
 # (mac-studio's checkout carries git-synced memory checkpoints under harness/ most of the time;
 # a stray .claude/ appears wherever claude was run inside the checkout). The fast-forward below
 # still fails, and refuses, if such a local change collides with what upstream brings.
@@ -326,7 +326,7 @@ while IFS= read -r -d '' entry; do
   case "$st" in R*|C*) IFS= read -r -d '' from ;; esac   # a rename's second record is the source
   # Both sides of a rename count: a file moved OUT of the served tree is a served file gone.
   case "$path" in ClaudeDesktop/*) served=$((served + 1)) ;; *) case "$from" in ClaudeDesktop/*) served=$((served + 1)) ;; *) other="$other$path " ;; esac ;; esac
-done < <(git -C "$repo" status --porcelain -z --untracked-files=all 2>/dev/null)
+done < <(git -C "$repo" status --porcelain -z --untracked-files=all --ignored=matching 2>/dev/null)
 [ "$served" -eq 0 ] || note "$served local change(s) under ClaudeDesktop/ (the served tree)"
 branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
 [ "$branch" = main ] || note "checked out $branch, not main"
@@ -506,6 +506,16 @@ else
   cwd=$(expand_tilde "$cwd")
 fi
 [ -d "$cwd" ] || refuse "no such directory $cwd"
+# One live worker per worktree on this box: two CLIs in one checkout are the two-writer
+# condition unstick refuses, under different names. Compared by resolved path.
+canon_cwd=$(cd "$cwd" 2>/dev/null && pwd -P)
+for om in "$WORKERS"/*/meta; do
+  [ -f "$om" ] || continue
+  oname=$(basename "$(dirname "$om")"); [ "$oname" = "$name" ] && continue
+  ocwd=$(sed -n 's/^cwd=//p' "$om" | head -n1); [ -n "$ocwd" ] || continue
+  [ "$(cd "$ocwd" 2>/dev/null && pwd -P)" = "$canon_cwd" ] || continue
+  running "$oname" && refuse "worktree $cwd is already owned by live worker $oname on this box; wait for it, unstick --kill it, or use another worktree"
+done
 mkdir -p "$d" 2>/dev/null || refuse "cannot create the worker record at $d (a file in the way, or unwritable)"
 if [ -f "$d/meta" ]; then
   # --replace keeps the previous record whole under $STATE/replaced/ (evidence), and a refusal

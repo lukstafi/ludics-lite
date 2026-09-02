@@ -204,6 +204,9 @@ expect "untracked file under the served tree refuses" 1 "1 local change(s) under
 git -C "$repo" config status.showUntrackedFiles no
 expect "...even when the box's git config hides untracked files" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
 git -C "$repo" config --unset status.showUntrackedFiles
+printf '*.tmp\n' > "$TMP/excludes"; git -C "$repo" config core.excludesFile "$TMP/excludes"; touch "$repo/ClaudeDesktop/skills/ship-pr/x.tmp"
+expect "an ignored file under the served tree still refuses" 1 "local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
+rm "$repo/ClaudeDesktop/skills/ship-pr/x.tmp"; git -C "$repo" config --unset core.excludesFile
 rm "$repo/ClaudeDesktop/skills/ship-pr/scripts.sh"
 touch "$repo/ClaudeDesktop/skills/ship-pr/a b.sh"
 expect "an untracked served file whose path git would quote still refuses" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
@@ -405,6 +408,11 @@ expect "a record directory that cannot be created is a refusal naming it" 1 "LAU
 rm -f "$ISSUE_WAVE_STATE/workers/blocked"
 
 printf 'SLEEP 20\n' > "$TMP/slow20.md"
+"$FW" launch testbox own-a --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
+expect "a second worker on a worktree a live worker owns is refused" 1 "already owned by live worker own-a" -- "$FW" launch testbox own-b --kind claude --brief "$brief" --cwd "$proj/"
+"$FW" unstick testbox own-a --message "$TMP/msg.md" --kill >/dev/null; "$FW" attach testbox own-a --interval 1 >/dev/null
+expect "...and allowed once that worker has finished" 0 "LAUNCHED testbox/own-b" -- "$FW" launch testbox own-b --kind claude --brief "$brief" --cwd "$proj"
+"$FW" attach testbox own-b --interval 1 >/dev/null
 "$FW" launch testbox p-1 --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox p-1 --interval 1 >/dev/null
 "$FW" launch testbox p-12 --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
 expect "a finished worker is not read as running through a prefix-matching sibling session" 0 "EXITED(0) testbox/p-1 " -- "$FW" status testbox p-1

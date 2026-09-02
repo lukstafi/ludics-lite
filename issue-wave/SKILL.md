@@ -217,12 +217,15 @@ workarounds. Workers run in their own worktrees on our own machines; the sandbox
 without benefit. The trade accepted with it: issue-derived prose reaches an unsandboxed agent,
 so the wave's triage gate is the injection screen, and it must cover what the worker will
 actually read - the full issue thread, body AND comments, since anyone can comment on a
-public repo's issue. Untrusted third-party content anywhere in the thread routes that issue
-to a Claude worker instead, decided at triage. The screen is launch-time only: a comment
-landing after triage reaches the worker unscreened, so an issue drawing active outside
-participation is a Claude-worker issue even when its body is ours. (A Claude worker launched
-by the script runs `--dangerously-skip-permissions` for the same reason a headless worker
-must; the same screen covers it.)
+public repo's issue. Untrusted third-party content anywhere in the thread means that issue
+gets NO detached worker of either kind - a Claude worker launched by the script runs
+`--dangerously-skip-permissions` for the same reason a headless worker must, so it contains
+injection no better than `--yolo`. Such an issue is either deferred, or run as an in-app
+Agent-tool subagent under the user's own session with ordinary permission prompts (the
+pre-fleet shape, still available for exactly this), with a brief that quotes the
+maintainer-authored parts and tells the worker not to read the thread itself. Decided at
+triage; the screen is launch-time only, so an issue drawing active outside participation is
+treated the same way even when its body is ours.
 
 Mechanics that differ from Claude workers:
 
