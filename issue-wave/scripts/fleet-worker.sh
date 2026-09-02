@@ -117,9 +117,14 @@ session_of() {
 re_lit() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g'; }
 alive() { tm has-session -t "iw-$1" 2>/dev/null; }
 WORKERS="$STATE/workers"
-# The pattern that finds a worker's CLI by its own arguments: the session id (claude, and codex
-# after a resume) or this worker's state dir (codex's -o). Same pattern everywhere.
-live_pat() { local d="$WORKERS/$1" p sid; p=$(re_lit "$WORKERS/$1/"); sid=$(session_of "$d"); [ -n "$sid" ] && p="$(re_lit "$sid")|$p"; printf '%s' "$p"; }
+# The pattern that finds a worker's CLI by its own command line: a claude or codex command
+# word, then the session id (claude, and codex after a resume) or this worker's state dir
+# (codex's -o). The command-word anchor keeps a `tail -f .../stream.jsonl` or an editor on a
+# record file from reading as the worker - or from being killed as one. Same pattern everywhere.
+live_pat() {
+  local d="$WORKERS/$1" p sid; p=$(re_lit "$WORKERS/$1/"); sid=$(session_of "$d"); [ -n "$sid" ] && p="$(re_lit "$sid")|$p"
+  printf '(^|/| )(claude|codex)( |$).*(%s)' "$p"
+}
 # tmux gone but the CLI reparented and still running: a live writer, not a finished worker.
 orphaned() { ! alive "$1" && pgrep -f -- "$(live_pat "$1")" >/dev/null 2>&1; }
 running() { alive "$1" || orphaned "$1"; }
@@ -382,8 +387,9 @@ d="$WORKERS/$name"; incoming="$d/incoming-$stamp.md"
 refuse() { rm -f "$incoming"; echo "LAUNCH REFUSED $BOX/$name: $*"; exit 1; }
 # One launch of a name at a time: the guards below and the record writes after them are one
 # critical section, held until the tmux session exists (or this launch has refused).
-if ! mkdir "$d.mutating" 2>/dev/null; then refuse "another launch or unstick of this name is in progress (lock $d.mutating)"; fi
-trap 'rmdir "$d.mutating" 2>/dev/null' EXIT
+mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
+if ! mkdir "$wlock" 2>/dev/null; then refuse "another launch or unstick of this name is in progress (lock $wlock)"; fi
+trap 'rmdir "$wlock" 2>/dev/null' EXIT
 if alive "$name"; then refuse "already running"; fi
 if [ -f "$d/meta" ]; then
   # tmux gone is not the CLI gone: a reparented orphan can still write and commit, and
@@ -603,13 +609,17 @@ cmd_unstick() {
   local prc2=$?
   if unreachable "$prc2"; then echo "UNSTICK UNREACHABLE $box"; exit 4; fi
   [ "$prc2" -eq 0 ] || { echo "UNSTICK REFUSED $box/$name: cannot stage the message under the worker state dir on $box (unwritable, or a file in the way)"; exit 1; }
+  # Re-read the lease after the upload, right before the worker is touched: an adoption that
+  # completed meanwhile fences this intervention (residual window: one ssh round trip).
+  anchor_gate UNSTICK "$box/$name" 1 || exit $?
   { prelude "$box"; cat <<'EOF'
 name="$1" kill="$2" stamp="$3"; shift 3
 d="$WORKERS/$name"
 [ -f "$d/meta" ] || { echo "UNSTICK REFUSED $BOX/$name: never launched here"; exit 1; }
 # Same critical section as launch: liveness checks through tmux creation, one at a time.
-if ! mkdir "$d.mutating" 2>/dev/null; then echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress (lock $d.mutating)"; exit 1; fi
-trap 'rmdir "$d.mutating" 2>/dev/null' EXIT
+mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
+if ! mkdir "$wlock" 2>/dev/null; then echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress (lock $wlock)"; exit 1; fi
+trap 'rmdir "$wlock" 2>/dev/null' EXIT
 kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd); sid=$(session_of "$d")
 [ -n "$sid" ] || { echo "UNSTICK REFUSED $BOX/$name: no session id in meta or stream"; exit 1; }
 grep -q '^session=' "$d/meta" || echo "session=$sid" >> "$d/meta"
@@ -765,7 +775,9 @@ cmd_claim() {
   local tf; tf=$(token_file)
   if [ ! -s "$tf" ]; then
     mkdir -p "$(dirname "$tf")" 2>/dev/null
-    { gen_uuid || printf '%s-%s-%s' "$(hostname -s)" "$(date +%s)" "$$"; } > "$tf" 2>/dev/null
+    # noclobber: two first claims of one identity race to create it; the loser reads the winner's.
+    local tok; tok=$(gen_uuid) || tok="$(hostname -s)-$(date +%s)-$$"
+    ( set -o noclobber; printf '%s\n' "$tok" > "$tf" ) 2>/dev/null || true
   fi
   [ -s "$tf" ] || { echo "CLAIM REFUSED: cannot persist this coordinator's token at $tf"; exit 1; }
   { prelude "$ANCHOR"; cat <<'EOF'

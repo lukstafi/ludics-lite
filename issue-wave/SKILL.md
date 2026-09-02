@@ -418,8 +418,10 @@ The coordinator's job between launch and last merge:
 
 ## Close out
 
-When the last gate clears: `fleet-worker.sh ls` must show no `RUNNING` worker on any box, and
-the lease is released last (`fleet-worker.sh release`), after the report below is written;
+When the last gate clears: `fleet-worker.sh ls` must show no `RUNNING` and no `ORPHANED` worker
+on any box (an orphan is a CLI still writing after its tmux session died - wait for it, or
+`unstick --kill` it, never close out over it), and the lease is released last
+(`fleet-worker.sh release`), after the report below is written;
 then a final board (issue -> box -> PR -> merge state), residuals and follow-up issues, and any
 gates left for the next invocation. Workers ran `after-merge` in hand-back mode, so each
 close-out (`fleet-worker.sh log <box> <name>` for the final report; the stream file is the full

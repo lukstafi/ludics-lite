@@ -151,6 +151,12 @@ rmdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
 mkdir -p "$TMP/state-c"; : > "$TMP/state-c/tokens"
 expect "a token that cannot be persisted refuses the claim" 1 "CLAIM REFUSED: cannot persist" -- env ISSUE_WAVE_STATE="$TMP/state-c" FLEET_ANCHOR_STATE="$ISSUE_WAVE_STATE" FLEET_COORDINATOR=c "$FW" claim --take
 grep -q '^token=$' "$ISSUE_WAVE_STATE/COORDINATOR" && ko "an empty token reached the lease" || ok "no empty-token lease was written"
+"$FW" release >/dev/null 2>&1
+env FLEET_COORDINATOR=fresh "$FW" claim >"$TMP/fresh-a.out" 2>&1 & fa=$!
+env FLEET_COORDINATOR=fresh "$FW" claim >"$TMP/fresh-b.out" 2>&1 & fb=$!
+wait "$fa" "$fb"
+expect "two first claims of one new identity leave that identity holding" 0 "COORDINATOR: you" -- env FLEET_COORDINATOR=fresh "$FW" coordinator
+env FLEET_COORDINATOR=fresh "$FW" release >/dev/null; "$FW" claim >/dev/null
 expect "an identity outside the safe set is refused, not folded" 2 "coordinator identity 'team/a' must be" -- env FLEET_COORDINATOR=team/a "$FW" claim
 chmod 555 "$ISSUE_WAVE_STATE"
 expect "release on an unwritable anchor fails at once, not after the lock wait" 1 "RELEASE FAILED: cannot create the lease lock" -- "$FW" release
@@ -242,7 +248,7 @@ rm -rf "$foreign"
 expect "a reused worktree on the requested branch is accepted" 0 "reusing existing worktree .* (on claude/w1)" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
 "$FW" attach testbox w1 --interval 1 >/dev/null
-bash -c 'sleep 30; :' orphan-shim "$ISSUE_WAVE_STATE/workers/w1/" >/dev/null 2>&1 & orphan=$!
+bash -c 'sleep 30; :' claude "$ISSUE_WAVE_STATE/workers/w1/" >/dev/null 2>&1 & orphan=$!
 expect "--replace refuses while a process still carries the old worker's path" 1 "a CLI from the previous launch is still running" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
 kill "$orphan" 2>/dev/null; wait "$orphan" 2>/dev/null
@@ -272,7 +278,7 @@ sleep 1; tmux -L "$FLEET_TMUX_SOCKET" kill-session -t iw-wv
 expect "a killed session with no exit record is VANISHED, exit 3" 3 "VANISHED testbox/wv" -- "$FW" attach testbox wv --interval 1
 expect "relaunching a vanished name refuses without --replace" 1 "left no exit record" -- "$FW" launch testbox wv --kind claude --brief "$brief" --cwd "$proj"
 # An orphan: tmux gone, a process still carrying the worker's state dir. Supervision must see it.
-bash -c 'sleep 4; :' orphan-shim "$ISSUE_WAVE_STATE/workers/wv/" >/dev/null 2>&1 & disown; sleep 0.5
+bash -c 'sleep 4; :' claude "$ISSUE_WAVE_STATE/workers/wv/" >/dev/null 2>&1 & disown; sleep 0.5
 expect "status reports an orphaned CLI as ORPHANED" 0 "ORPHANED testbox/wv" -- "$FW" status testbox wv
 expect "ls reports it as ORPHANED too" 0 "testbox/wv ORPHANED" -- "$FW" ls testbox
 t0=$(date +%s)
@@ -301,7 +307,7 @@ expect "no uuidgen: a fallback still yields a session id" 0 "LAUNCHED testbox/nu
 "$FW" attach testbox nu --interval 1 >/dev/null
 
 "$FW" launch testbox wo --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox wo --interval 1 >/dev/null
-bash -c 'sleep 30; :' orphan-shim "$ISSUE_WAVE_STATE/workers/wo/" >/dev/null 2>&1 & orphan=$!; disown; sleep 0.5
+bash -c 'sleep 30; :' claude "$ISSUE_WAVE_STATE/workers/wo/" >/dev/null 2>&1 & orphan=$!; disown; sleep 0.5
 expect "an orphaned CLI (tmux gone) refuses a plain unstick" 1 "tmux is gone but a CLI still runs" -- "$FW" unstick testbox wo --message "$TMP/msg.md"
 kill -0 "$orphan" 2>/dev/null && ok "the orphan was not killed by the refused unstick" || ko "plain unstick killed the orphan"
 expect "unstick --kill terminates the orphan and resumes" 0 "RESUMED testbox/wo" -- "$FW" unstick testbox wo --message "$TMP/msg.md" --kill
@@ -320,7 +326,10 @@ wait "$da" "$db"
 launched=$(cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -c '^LAUNCHED testbox/dup')
 [ "$launched" -eq 1 ] && ok "two overlapping launches of one name: exactly one LAUNCHED" || ko "overlapping launches: $launched LAUNCHED -- $(cat "$TMP/dup-a.out" "$TMP/dup-b.out")"
 cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -q 'another launch of this name is in progress\|already running' && ok "the other was refused by the lock or the liveness guard" || ko "no refusal for the overlapping launch"
-[ -d "$ISSUE_WAVE_STATE/workers/dup.mutating" ] && ko "launch lock left behind" || ok "launch lock released"
+[ -d "$ISSUE_WAVE_STATE/locks/dup" ] && ko "launch lock left behind" || ok "launch lock released"
+"$FW" launch testbox q.mutating --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox q.mutating --interval 1 >/dev/null
+expect "a worker named like a lock suffix does not block its sibling" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj"
+"$FW" attach testbox q --interval 1 >/dev/null
 "$FW" attach testbox dup --interval 1 >/dev/null
 "$FW" unstick testbox dup --message "$TMP/msg.md" >"$TMP/un-a.out" 2>&1 & ua=$!
 "$FW" unstick testbox dup --message "$TMP/msg.md" >"$TMP/un-b.out" 2>&1 & ub=$!
@@ -328,6 +337,8 @@ wait "$ua" "$ub"
 resumed=$(cat "$TMP/un-a.out" "$TMP/un-b.out" | grep -c '^RESUMED testbox/dup')
 [ "$resumed" -eq 1 ] && ok "two overlapping unsticks of one worker: exactly one RESUMED" || ko "overlapping unsticks: $resumed RESUMED -- $(cat "$TMP/un-a.out" "$TMP/un-b.out")"
 "$FW" attach testbox dup --interval 1 >/dev/null
+bash -c 'sleep 3; :' tail -f "$ISSUE_WAVE_STATE/workers/dup/stream.jsonl" >/dev/null 2>&1 & disown; sleep 0.5
+expect "a diagnostic process on a record file is not the worker" 0 "EXITED(0) testbox/dup" -- "$FW" status testbox dup
 : > "$ISSUE_WAVE_STATE/workers/blocked"
 expect "a brief that cannot be staged is a refusal, not an unreachable box" 1 "LAUNCH REFUSED testbox/blocked: cannot stage the brief" -- "$FW" launch testbox blocked --kind claude --brief "$brief" --cwd "$proj"
 rm -f "$ISSUE_WAVE_STATE/workers/blocked"
