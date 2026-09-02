@@ -448,12 +448,14 @@ includes the PR's own edits, so every nonempty PR looks drifted by it. The quest
 base's advance touch this PR's files — is answered by anchoring at the branch point:
 
 ```bash
-git diff --stat $(git merge-base origin/master HEAD) origin/master -- $(git diff --name-only --no-renames origin/master...HEAD)
+git diff --name-only --no-renames $(git merge-base origin/master HEAD) origin/master | grep -Fxf <(git diff --name-only --no-renames origin/master...HEAD)
 ```
 
-Empty output means the base never touched those paths (substitute the remote that actually points
-at the base repo; its name is local). `--no-renames` lists both names of a file the PR renamed, so
-an edit the base made to the old name still shows.
+It prints exactly the PR's files that the base's advance also touched — nothing means none
+(substitute the remote that actually points at the base repo; its name is local). `--no-renames`
+lists both names of a file the PR renamed, so an edit the base made to the old name still shows;
+`grep -Fx` compares whole lines, so a path with spaces is one path rather than word-split
+pathspec fragments.
 
 When the base's advance touches the files this PR changes, rebase (or merge the base in, where the
 branch is shared), push, and let the checks re-run first — any commit that moves the head waits
