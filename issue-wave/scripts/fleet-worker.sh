@@ -116,6 +116,13 @@ session_of() {
 re_lit() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g'; }
 alive() { tm has-session -t "iw-$1" 2>/dev/null; }
 WORKERS="$STATE/workers"
+# The pattern that finds a worker's CLI by its own arguments: the session id (claude, and codex
+# after a resume) or this worker's state dir (codex's -o). Same pattern everywhere.
+live_pat() { local d="$WORKERS/$1" p sid; p=$(re_lit "$WORKERS/$1/"); sid=$(session_of "$d"); [ -n "$sid" ] && p="$(re_lit "$sid")|$p"; printf '%s' "$p"; }
+# tmux gone but the CLI reparented and still running: a live writer, not a finished worker.
+orphaned() { ! alive "$1" && pgrep -f -- "$(live_pat "$1")" >/dev/null 2>&1; }
+running() { alive "$1" || orphaned "$1"; }
+state_of() { if alive "$1"; then echo RUNNING; elif orphaned "$1"; then echo ORPHANED; elif [ -f "$WORKERS/$1/exit" ]; then echo "EXITED($(cat "$WORKERS/$1/exit"))"; else echo VANISHED; fi; }
 EOF
 }
 
@@ -177,7 +184,13 @@ coordinator_id() {
   else printf '%s-pid-%s' "$(hostname -s)" "$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')"
   fi
 }
-token_file() { printf '%s/tokens/%s' "$(local_path "$STATE")" "$(coordinator_id | tr -c -- '-A-Za-z0-9._' '_')"; }
+# Validated at top level (a die inside $(...) would only end the substitution): the identity
+# is used verbatim as the token file name, so it must be injective - no folding of characters.
+check_identity() {
+  local id; id=$(coordinator_id)
+  case "$id" in ''|.|..|*[!A-Za-z0-9._-]*) die "coordinator identity '$id' must be [A-Za-z0-9._-]+ (set FLEET_COORDINATOR)" ;; esac
+}
+token_file() { printf '%s/tokens/%s' "$(local_path "$STATE")" "$(coordinator_id)"; }
 my_token() { cat "$(token_file)" 2>/dev/null; }
 
 # Far-side script for the anchor: lease + halt checks. Args: verb label force token.
@@ -198,6 +211,7 @@ EOF
 }
 # anchor_gate <verb> <label> <force>: exit 0 proceed, 1 refused (line printed), 4 anchor unreachable.
 anchor_gate() {
+  check_identity
   { prelude "$ANCHOR"; anchor_gate_script; } | run_on "$ANCHOR" "$1" "$2" "$3" "$(my_token)"
   local rc=$?
   if unreachable "$rc"; then echo "$1 REFUSED $2: anchor $ANCHOR unreachable (lease and halt live there)"; return 4; fi
@@ -329,6 +343,9 @@ cmd_launch() {
   local prc=$?
   if unreachable "$prc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: $pf"; exit 1; }
+  # The preflight fetches and runs a live probe; a halt or an adoption during that window
+  # must still fence this launch, so the gate is read again right before anything is written.
+  anchor_gate LAUNCH "$box/$name" "$force" || exit $?
   local sid=""
   if [ "$kind" = claude ]; then
     sid=$(gen_uuid) || { echo "LAUNCH REFUSED $box/$name: cannot generate a session id here (no uuidgen, /proc uuid, or python3)"; exit 1; }
@@ -345,7 +362,7 @@ if alive "$name"; then refuse "already running"; fi
 if [ -f "$d/meta" ]; then
   # tmux gone is not the CLI gone: a reparented orphan can still write and commit, and
   # --replace must not put a second CLI beside it.
-  opat=$(re_lit "$d/"); osid=$(session_of "$d"); [ -n "$osid" ] && opat="$(re_lit "$osid")|$opat"
+  opat=$(live_pat "$name")
   if pgrep -f -- "$opat" >/dev/null 2>&1; then
     refuse "a CLI from the previous launch is still running ($(pgrep -fl -- "$opat" | head -n 2 | tr '\n' ';')); unstick --kill it, or wait"
   fi
@@ -372,8 +389,11 @@ else
   cwd=$(expand_tilde "$cwd")
 fi
 [ -d "$cwd" ] || refuse "no such directory $cwd"
-mv -f "$incoming" "$d/brief.md"
-: > "$d/stream.jsonl"; : > "$d/stderr.log"; rm -f "$d/exit"
+# Every record mutation is checked, and the brief is in place before any evidence is truncated.
+[ ! -d "$d/brief.md" ] || refuse "cannot install the brief: $d/brief.md is a directory"
+mv -f "$incoming" "$d/brief.md" 2>/dev/null && [ -f "$d/brief.md" ] || refuse "cannot install the brief at $d/brief.md"
+{ : > "$d/stream.jsonl" && : > "$d/stderr.log" && rm -f "$d/exit" && [ ! -e "$d/exit" ]; } 2>/dev/null ||
+  { echo "LAUNCH REFUSED $BOX/$name: cannot initialize the worker record under $d"; exit 1; }
 # The CLI line itself, written to a file tmux runs: nothing from the brief is ever a shell word.
 {
   printf 'cd %q || exit 97\n' "$cwd"
@@ -385,11 +405,12 @@ mv -f "$incoming" "$d/brief.md"
   [ "$kind" = codex ] && printf ' -'
   printf ' < %q >> %q 2>> %q\n' "$d/brief.md" "$d/stream.jsonl" "$d/stderr.log"
   printf 'echo $? > %q\n' "$d/exit"
-} > "$d/run.sh"
+} > "$d/run.sh" || { echo "LAUNCH REFUSED $BOX/$name: cannot write $d/run.sh"; exit 1; }
 {
   echo "kind=$kind"; echo "cwd=$cwd"; echo "box=$(hostname -s)"; echo "coordinator=$coord"
-  echo "launched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "resumes=0"; [ -n "$sid" ] && echo "session=$sid"
-} > "$d/meta"
+  echo "launched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "resumes=0"
+  if [ -n "$sid" ]; then echo "session=$sid"; fi
+} > "$d/meta" || { echo "LAUNCH REFUSED $BOX/$name: cannot write $d/meta"; exit 1; }
 tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || { echo "LAUNCH REFUSED $BOX/$name: tmux failed"; exit 1; }
 if [ "$kind" = codex ]; then
   # The thread id is the resume address; it is the first event, but the exec takes a moment. If
@@ -419,7 +440,7 @@ verdict() {
   local name="$1" d="$WORKERS/$1" kind rc summary
   kind=$(meta_get "$d" kind)
   if [ ! -f "$d/exit" ]; then
-    echo "VANISHED $BOX/$name: no exit record (killed, or the CLI never started -- see $d/stderr.log)"; return 3
+    echo "VANISHED $BOX/$name: no exit record (killed, or the CLI never started; an orphaned CLI ran on past tmux if the stream moved -- see $d/stderr.log)"; return 3
   fi
   rc=$(cat "$d/exit")
   # The LAST terminal event decides (a resumed turn appends after the first one's); a stream
@@ -443,6 +464,7 @@ EOF
 
 cmd_attach() {
   local box="${1:-}" name="${2:-}"; [ -n "$box" ] && [ -n "$name" ] || die "attach: <box> <name> required"
+  valid_name "$name" || die "attach: name must be [A-Za-z0-9._-]+"
   shift 2
   local interval=30
   while [ $# -gt 0 ]; do
@@ -456,7 +478,7 @@ cmd_attach() {
 name="$1" interval="$2"; d="$WORKERS/$name"
 [ -f "$d/meta" ] || { echo "UNKNOWN $BOX/$name: never launched here"; exit 3; }
 started=$(now); last=$started
-while alive "$name"; do
+while running "$name"; do
   sleep "$interval"
   t=$(now)
   if [ $((t - last)) -ge 900 ]; then
@@ -482,11 +504,12 @@ EOF
 # ---------------------------------------------------------------------------------------------
 cmd_status() {
   local box="${1:-}" name="${2:-}"; [ -n "$box" ] && [ -n "$name" ] || die "status: <box> <name> required"
+  valid_name "$name" || die "status: name must be [A-Za-z0-9._-]+"
   { prelude "$box"; cat <<'EOF'
 name="$1"; d="$WORKERS/$name"
 [ -f "$d/meta" ] || { echo "UNKNOWN $BOX/$name: never launched here"; exit 3; }
 kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd)
-if alive "$name"; then state=RUNNING; elif [ -f "$d/exit" ]; then state="EXITED($(cat "$d/exit"))"; else state=VANISHED; fi
+state=$(state_of "$name")
 quiet=$(( $(now) - $(mtime "$d/stream.jsonl") ))
 case "$kind" in
   claude) last=$(tail -n 1 "$d/stream.jsonl" 2>/dev/null | jq -r '.type + (if .type=="assistant" then ":" + ([.message.content[]? | .type] | join(",")) else "" end)' 2>/dev/null) ;;
@@ -509,6 +532,7 @@ EOF
 # ---------------------------------------------------------------------------------------------
 cmd_log() {
   local box="${1:-}" name="${2:-}"; [ -n "$box" ] && [ -n "$name" ] || die "log: <box> <name> required"
+  valid_name "$name" || die "log: name must be [A-Za-z0-9._-]+"
   shift 2
   local n=40
   while [ $# -gt 0 ]; do case "$1" in -n) n="${2:-40}"; shift ;; *) die "log: unknown option $1" ;; esac; shift; done
@@ -530,6 +554,7 @@ EOF
 # ---------------------------------------------------------------------------------------------
 cmd_unstick() {
   local box="${1:-}" name="${2:-}"; [ -n "$box" ] && [ -n "$name" ] || die "unstick: <box> <name> required"
+  valid_name "$name" || die "unstick: name must be [A-Za-z0-9._-]+"
   shift 2
   local msg="" kill=0
   while [ $# -gt 0 ]; do
@@ -613,7 +638,7 @@ for d in "$WORKERS"/*/; do
   [ -f "$d/meta" ] || continue
   found=1
   name=$(basename "$d")
-  if alive "$name"; then state=RUNNING; elif [ -f "$d/exit" ]; then state="EXITED($(cat "$d/exit"))"; else state=VANISHED; fi
+  state=$(state_of "$name")
   echo "$BOX/$name $state kind=$(meta_get "$d" kind) launched=$(meta_get "$d" launched_at) by=$(meta_get "$d" coordinator) quiet=$(( $(now) - $(mtime "$d/stream.jsonl") ))s cwd=$(meta_get "$d" cwd)"
 done
 [ "$found" = 1 ] || echo "$BOX: no workers"
@@ -675,6 +700,7 @@ EOF
 # The coordinator lease: one file on the anchor, created with O_EXCL (noclobber) so two
 # coordinators starting at once cannot both win, naming the holder's host and token.
 cmd_claim() {
+  check_identity
   local take=0
   while [ $# -gt 0 ]; do case "$1" in --take) take=1 ;; *) die "claim: unknown option $1" ;; esac; shift; done
   local tf; tf=$(token_file)
@@ -692,7 +718,10 @@ fi
 held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease"); since=$(sed -n 's/^since=//p' "$lease")
 if [ "$held" = "$token" ]; then echo "CLAIMED already held by $host since $since"; exit 0; fi
 if [ "$take" = 1 ]; then
-  record > "$lease"; echo "CLAIMED (adopted) coordinator lease on $BOX for $host -- was $hhost since $since"; exit 0
+  if record > "$lease" 2>/dev/null && [ "$(sed -n 's/^token=//p' "$lease" 2>/dev/null)" = "$token" ]; then
+    echo "CLAIMED (adopted) coordinator lease on $BOX for $host -- was $hhost since $since"; exit 0
+  fi
+  echo "CLAIM FAILED: could not write the lease at $lease on $BOX (a directory in its place, or unwritable) -- not adopted"; exit 1
 fi
 echo "CLAIM REFUSED: coordinator lease held by $hhost since $since -- a wave is in flight; adopt with --take only if that coordinator is gone"
 exit 1
@@ -702,18 +731,20 @@ EOF
 }
 
 cmd_release() {
+  check_identity
   { prelude "$ANCHOR"; cat <<'EOF'
 token="$1"; lease="$ANCHOR_STATE/COORDINATOR"
 [ -f "$lease" ] || { echo "RELEASE: no lease held"; exit 0; }
 held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease")
 [ "$held" = "$token" ] || { echo "RELEASE REFUSED: lease held by $hhost, not you"; exit 1; }
-rm -f "$lease"; echo "RELEASED coordinator lease on $BOX"
+if rm -f "$lease" 2>/dev/null && [ ! -e "$lease" ]; then echo "RELEASED coordinator lease on $BOX"; else echo "RELEASE FAILED: could not remove $lease on $BOX -- the lease is still held"; exit 1; fi
 EOF
   } | run_on "$ANCHOR" "$(my_token)"
   local rc=$?; if unreachable "$rc"; then echo "RELEASE UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
 }
 
 cmd_coordinator() {
+  check_identity
   { prelude "$ANCHOR"; cat <<'EOF'
 token="$1"; lease="$ANCHOR_STATE/COORDINATOR"
 [ -f "$lease" ] || { echo "COORDINATOR: nobody holds the lease on $BOX"; exit 3; }

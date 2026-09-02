@@ -125,8 +125,15 @@ expect "the previous holder now sees the lease as not theirs" 1 "(not you)" -- "
 expect "...and takes it back with --take" 0 "CLAIMED (adopted)" -- "$FW" claim --take
 expect "another session on the same box (same state dir) is not the holder" 1 "CLAIM REFUSED" -- env FLEET_COORDINATOR=other-session "$FW" claim
 expect "...and cannot launch through the holder's token" 1 "coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" launch testbox nope --kind claude --brief /dev/null --cwd "$TMP"
+expect "an identity outside the safe set is refused, not folded" 2 "coordinator identity 'team/a' must be" -- env FLEET_COORDINATOR=team/a "$FW" claim
+chmod 555 "$ISSUE_WAVE_STATE"
+expect "release that cannot remove the lease says so, exit 1" 1 "RELEASE FAILED: could not remove" -- "$FW" release
+chmod 755 "$ISSUE_WAVE_STATE"
 expect "release drops it" 0 "RELEASED coordinator lease" -- "$FW" release
 expect "coordinator after release: nobody" 3 "nobody holds" -- "$FW" coordinator
+mkdir -p "$ISSUE_WAVE_STATE/COORDINATOR"
+expect "claim --take that cannot write the lease fails, not CLAIMED" 1 "CLAIM FAILED: could not write" -- "$FW" claim --take
+rmdir "$ISSUE_WAVE_STATE/COORDINATOR"
 
 echo "--- preflight"
 expect "clean main on origin passes (claude, live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox
@@ -207,6 +214,12 @@ bash -c 'sleep 30; :' orphan-shim "$ISSUE_WAVE_STATE/workers/w1/" >/dev/null 2>&
 expect "--replace refuses while a process still carries the old worker's path" 1 "a CLI from the previous launch is still running" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
 kill "$orphan" 2>/dev/null; wait "$orphan" 2>/dev/null
+mv "$ISSUE_WAVE_STATE/workers/w1/brief.md" "$TMP/brief.saved"; mkdir "$ISSUE_WAVE_STATE/workers/w1/brief.md"
+expect "--replace over a record whose brief.md is a directory refuses before truncating" 1 "cannot install the brief" -- \
+  "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
+[ -s "$ISSUE_WAVE_STATE/workers/w1/stream.jsonl" ] && ok "the refused --replace did not truncate the stream" || ko "stream truncated by a refused --replace"
+[ -z "$(ls -A "$ISSUE_WAVE_STATE/workers/w1/brief.md")" ] && ok "nothing was moved into the directory" || ko "the incoming brief landed inside brief.md/"
+rm -rf "$ISSUE_WAVE_STATE/workers/w1/brief.md"; mv "$TMP/brief.saved" "$ISSUE_WAVE_STATE/workers/w1/brief.md"
 expect "--replace overwrites deliberately" 0 "LAUNCHED testbox/w1" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
 "$FW" attach testbox w1 --interval 1 >/dev/null
@@ -226,6 +239,13 @@ printf 'SLEEP 30\n' > "$TMP/slow.md"
 sleep 1; tmux -L "$FLEET_TMUX_SOCKET" kill-session -t iw-wv
 expect "a killed session with no exit record is VANISHED, exit 3" 3 "VANISHED testbox/wv" -- "$FW" attach testbox wv --interval 1
 expect "relaunching a vanished name refuses without --replace" 1 "left no exit record" -- "$FW" launch testbox wv --kind claude --brief "$brief" --cwd "$proj"
+# An orphan: tmux gone, a process still carrying the worker's state dir. Supervision must see it.
+bash -c 'sleep 4; :' orphan-shim "$ISSUE_WAVE_STATE/workers/wv/" >/dev/null 2>&1 & disown; sleep 0.5
+expect "status reports an orphaned CLI as ORPHANED" 0 "ORPHANED testbox/wv" -- "$FW" status testbox wv
+expect "ls reports it as ORPHANED too" 0 "testbox/wv ORPHANED" -- "$FW" ls testbox
+t0=$(date +%s)
+expect "attach waits for the orphan to exit and then reports VANISHED" 3 "VANISHED testbox/wv" -- "$FW" attach testbox wv --interval 1
+[ $(( $(date +%s) - t0 )) -ge 2 ] && ok "attach held while the orphan lived" || ko "attach returned before the orphan exited"
 
 echo "--- unstick"
 printf 'SLEEP 60 then report\n' > "$TMP/slow.md"; printf 'Stop and answer now.\n' > "$TMP/msg.md"
@@ -294,6 +314,8 @@ echo "--- usage"
 expect "no command prints usage, exit 2" 2 "Usage:" -- "$FW"
 expect "bad worker name refuses" 2 "name must be" -- "$FW" launch testbox "bad name" --kind claude --brief "$brief" --cwd "$proj"
 expect "dot names refuse" 2 "name must be" -- "$FW" launch testbox .. --kind claude --brief "$brief" --cwd "$proj"
+expect "unstick validates the name before writing anything" 2 "unstick: name must be" -- "$FW" unstick testbox ../escape --message "$TMP/msg.md"
+expect "status validates the name" 2 "status: name must be" -- "$FW" status testbox "a b"
 expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --kind claude --brief "$TMP/none.md" --cwd "$proj"
 
 echo
