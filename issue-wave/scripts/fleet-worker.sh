@@ -371,15 +371,18 @@ cmd_launch() {
   # The brief lands beside the record, not on it: the far side moves it into place only after
   # the guards pass, so a refused launch leaves a finished worker's brief untouched.
   local stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  put_file "$box" "$brief" "$STATE/workers/$name/incoming-$stamp.md" || { echo "LAUNCH UNREACHABLE $box"; exit 4; }
+  put_file "$box" "$brief" "$STATE/workers/$name/incoming-$stamp.md"
+  local prc2=$?
+  if unreachable "$prc2"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
+  [ "$prc2" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: cannot stage the brief under the worker state dir on $box (unwritable, or a file in the way)"; exit 1; }
   { prelude "$box"; cat <<'EOF'
 name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8" replace="$9" stamp="${10}"; shift 10
 d="$WORKERS/$name"; incoming="$d/incoming-$stamp.md"
 refuse() { rm -f "$incoming"; echo "LAUNCH REFUSED $BOX/$name: $*"; exit 1; }
 # One launch of a name at a time: the guards below and the record writes after them are one
 # critical section, held until the tmux session exists (or this launch has refused).
-if ! mkdir "$d.launching" 2>/dev/null; then refuse "another launch of this name is in progress (lock $d.launching)"; fi
-trap 'rmdir "$d.launching" 2>/dev/null' EXIT
+if ! mkdir "$d.mutating" 2>/dev/null; then refuse "another launch or unstick of this name is in progress (lock $d.mutating)"; fi
+trap 'rmdir "$d.mutating" 2>/dev/null' EXIT
 if alive "$name"; then refuse "already running"; fi
 if [ -f "$d/meta" ]; then
   # tmux gone is not the CLI gone: a reparented orphan can still write and commit, and
@@ -595,11 +598,17 @@ cmd_unstick() {
   [ -n "$msg" ] && [ -r "$msg" ] || die "unstick: --message <readable file>"
   anchor_gate UNSTICK "$box/$name" 1 || exit $?
   local stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  put_file "$box" "$msg" "$STATE/workers/$name/messages/$stamp.md" || { echo "UNSTICK UNREACHABLE $box"; exit 4; }
+  put_file "$box" "$msg" "$STATE/workers/$name/messages/$stamp.md"
+  local prc2=$?
+  if unreachable "$prc2"; then echo "UNSTICK UNREACHABLE $box"; exit 4; fi
+  [ "$prc2" -eq 0 ] || { echo "UNSTICK REFUSED $box/$name: cannot stage the message under the worker state dir on $box (unwritable, or a file in the way)"; exit 1; }
   { prelude "$box"; cat <<'EOF'
 name="$1" kill="$2" stamp="$3"; shift 3
 d="$WORKERS/$name"
 [ -f "$d/meta" ] || { echo "UNSTICK REFUSED $BOX/$name: never launched here"; exit 1; }
+# Same critical section as launch: liveness checks through tmux creation, one at a time.
+if ! mkdir "$d.mutating" 2>/dev/null; then echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress (lock $d.mutating)"; exit 1; fi
+trap 'rmdir "$d.mutating" 2>/dev/null' EXIT
 kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd); sid=$(session_of "$d")
 [ -n "$sid" ] || { echo "UNSTICK REFUSED $BOX/$name: no session id in meta or stream"; exit 1; }
 grep -q '^session=' "$d/meta" || echo "session=$sid" >> "$d/meta"
@@ -692,27 +701,47 @@ cmd_load() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Far-side: take the lease lock (shared with claim --take and release), verify the caller
+# still holds the lease, then run the mutation. Args: verb token lockwait, then the action's.
+lease_mutation_prelude() {
+  cat <<'EOF'
+verb="$1" token="$2" lockwait="$3"; shift 3
+mkdir -p "$ANCHOR_STATE" 2>/dev/null; lease="$ANCHOR_STATE/COORDINATOR"; lock="$lease.lock"; waited=0
+until mkdir "$lock" 2>/dev/null; do
+  [ -d "$lock" ] || { echo "$verb FAILED: cannot create the lease lock $lock on $BOX (anchor state unwritable?)"; exit 1; }
+  [ "$waited" -lt "$lockwait" ] || { echo "$verb FAILED: lease lock $lock held for ${lockwait}s on $BOX -- an adoption in progress, or a stale lock to remove by hand"; exit 1; }
+  sleep 1; waited=$((waited + 1))
+done
+trap 'rmdir "$lock" 2>/dev/null' EXIT
+held=$(sed -n 's/^token=//p' "$lease" 2>/dev/null); hhost=$(sed -n 's/^host=//p' "$lease" 2>/dev/null)
+[ -n "$token" ] && [ "$held" = "$token" ] || { echo "$verb REFUSED fleet: coordinator lease held by ${hhost:-nobody} -- not you (adopted since your gate?)"; exit 1; }
+EOF
+}
+
 cmd_halt() {
   local reason="$*"; [ -n "$reason" ] || die "halt: give the reason (what regressed, who owns the fix)"
-  anchor_gate HALT fleet 1 || exit $?
-  { prelude "$ANCHOR"; cat <<'EOF'
-mkdir -p "$ANCHOR_STATE"
+  check_identity
+  { prelude "$ANCHOR"; lease_mutation_prelude; cat <<'EOF'
 if ! printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" > "$ANCHOR_STATE/HALT" 2>/dev/null || [ ! -f "$ANCHOR_STATE/HALT" ]; then
   echo "HALT FAILED: cannot write $ANCHOR_STATE/HALT on $BOX -- the fleet is NOT halted"; exit 1
 fi
 echo "HALTED: launches refused until resume-launches -- $1"
 EOF
-  } | run_on "$ANCHOR" "$reason"
+  } | run_on "$ANCHOR" HALT "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$reason"
   local rc=$?; if unreachable "$rc"; then echo "HALT UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
 }
 
 cmd_resume_launches() {
-  anchor_gate RESUME-LAUNCHES fleet 1 || exit $?
-  { prelude "$ANCHOR"; cat <<'EOF'
+  check_identity
+  { prelude "$ANCHOR"; lease_mutation_prelude; cat <<'EOF'
 f="$ANCHOR_STATE/HALT"
-if [ -f "$f" ]; then echo "RESUMED launches (was: $(cat "$f"))"; rm -f "$f"; else echo "launches were not halted"; fi
+if [ -f "$f" ]; then
+  was=$(cat "$f"); rm -f "$f" 2>/dev/null
+  [ ! -e "$f" ] || { echo "RESUME-LAUNCHES FAILED: cannot remove $f on $BOX -- still halted"; exit 1; }
+  echo "RESUMED launches (was: $was)"
+else echo "launches were not halted"; fi
 EOF
-  } | run_on "$ANCHOR"
+  } | run_on "$ANCHOR" RESUME-LAUNCHES "$(my_token)" "${FLEET_LOCK_WAIT:-10}"
   local rc=$?; if unreachable "$rc"; then echo "RESUME-LAUNCHES UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
 }
 

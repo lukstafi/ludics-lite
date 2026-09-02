@@ -120,6 +120,9 @@ expect "coordinator: me" 0 "COORDINATOR: you" -- "$FW" coordinator
 B=(env ISSUE_WAVE_STATE="$TMP/state-b" FLEET_ANCHOR_STATE="$ISSUE_WAVE_STATE" "$FW")
 expect "a second coordinator's claim is refused while held" 1 "CLAIM REFUSED: coordinator lease held by" -- "${B[@]}" claim
 expect "a second coordinator cannot halt" 1 "HALT REFUSED fleet: coordinator lease held by" -- "${B[@]}" halt "not mine"
+mkdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
+expect "resume-launches waits for the lease lock and fails after the bound" 1 "RESUME-LAUNCHES FAILED: lease lock" -- env FLEET_LOCK_WAIT=1 "$FW" resume-launches
+rmdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
 expect "release by a non-holder is refused" 1 "RELEASE REFUSED" -- "${B[@]}" release
 expect "--take adopts the lease" 0 "CLAIMED (adopted) coordinator lease" -- "${B[@]}" claim --take
 expect "the previous holder now sees the lease as not theirs" 1 "(not you)" -- "$FW" coordinator
@@ -311,8 +314,17 @@ wait "$da" "$db"
 launched=$(cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -c '^LAUNCHED testbox/dup')
 [ "$launched" -eq 1 ] && ok "two overlapping launches of one name: exactly one LAUNCHED" || ko "overlapping launches: $launched LAUNCHED -- $(cat "$TMP/dup-a.out" "$TMP/dup-b.out")"
 cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -q 'another launch of this name is in progress\|already running' && ok "the other was refused by the lock or the liveness guard" || ko "no refusal for the overlapping launch"
-[ -d "$ISSUE_WAVE_STATE/workers/dup.launching" ] && ko "launch lock left behind" || ok "launch lock released"
+[ -d "$ISSUE_WAVE_STATE/workers/dup.mutating" ] && ko "launch lock left behind" || ok "launch lock released"
 "$FW" attach testbox dup --interval 1 >/dev/null
+"$FW" unstick testbox dup --message "$TMP/msg.md" >"$TMP/un-a.out" 2>&1 & ua=$!
+"$FW" unstick testbox dup --message "$TMP/msg.md" >"$TMP/un-b.out" 2>&1 & ub=$!
+wait "$ua" "$ub"
+resumed=$(cat "$TMP/un-a.out" "$TMP/un-b.out" | grep -c '^RESUMED testbox/dup')
+[ "$resumed" -eq 1 ] && ok "two overlapping unsticks of one worker: exactly one RESUMED" || ko "overlapping unsticks: $resumed RESUMED -- $(cat "$TMP/un-a.out" "$TMP/un-b.out")"
+"$FW" attach testbox dup --interval 1 >/dev/null
+: > "$ISSUE_WAVE_STATE/workers/blocked"
+expect "a brief that cannot be staged is a refusal, not an unreachable box" 1 "LAUNCH REFUSED testbox/blocked: cannot stage the brief" -- "$FW" launch testbox blocked --kind claude --brief "$brief" --cwd "$proj"
+rm -f "$ISSUE_WAVE_STATE/workers/blocked"
 
 echo "--- codex workers"
 expect "codex launch captures the thread id from the stream" 0 "LAUNCHED testbox/c1 kind=codex session=0199-shim-" -- \
