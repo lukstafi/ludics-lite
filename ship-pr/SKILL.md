@@ -557,6 +557,14 @@ iterate on a single failure; an unrecognized name is refused before any case run
 ~/.claude/skills/ship-pr/scripts/test-post-merge-cleanup.sh test_safe_topic_deletion
 ```
 
+The cases are independent, so they run concurrently, one per processor by default (`-j N` or
+`SHIP_PR_TEST_JOBS` changes that; `-j 1` is serial): the full suite finishes in about a minute and
+a half on a 4-core CI runner, where the serial run took eight, and in well under a minute on a
+desktop. Each case's output is buffered and printed whole when it completes, so a failure report
+never interleaves with another case; passing cases print only their `PASS:` line unless `-v` asks
+for everything. Failures do not stop the other cases — the closing `FAIL:` line names every case
+that failed.
+
 A squash or rebase merge does not preserve ancestry. After independently confirming that merge,
 make the exception explicit and leave its reason in the transcript:
 

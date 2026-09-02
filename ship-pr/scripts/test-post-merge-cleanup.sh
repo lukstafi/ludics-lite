@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# End-to-end tests for post-merge-cleanup.sh. Every repository lives under one disposable /tmp tree.
-# Runs every case by default; name cases exactly to run only those, or --list to see the names.
+# End-to-end tests for post-merge-cleanup.sh. Every repository lives under one disposable /tmp tree,
+# each case in its own subtree, and the cases run concurrently (-j N; see usage). Runs every case by
+# default; name cases exactly to run only those, or --list to see the names.
 
 set -euo pipefail
 
@@ -3390,10 +3391,16 @@ TESTS=(
 
 usage() {
   cat <<'USAGE'
-usage: test-post-merge-cleanup.sh [test_name ...]
+usage: test-post-merge-cleanup.sh [-j N] [-v] [test_name ...]
 
 With no arguments every case runs. Each argument names one case exactly, as the
 test function is spelled in this file; --list prints the available names.
+
+Cases are independent, so they run concurrently, N at a time (-j N, --jobs=N,
+or SHIP_PR_TEST_JOBS; default: the number of online processors). Each case's
+output is buffered and printed whole when it completes, so a failure report is
+never interleaved with another case; passing cases print only their PASS lines
+unless -v/--verbose asks for their full output. -j 1 runs the cases serially.
 USAGE
 }
 
@@ -3405,10 +3412,13 @@ known_test() {
   return 1
 }
 
+JOBS="${SHIP_PR_TEST_JOBS:-}"
+VERBOSE=0
+NAMED=0
 SELECTED_COUNT=0
 SELECTED=()
-for requested in "$@"; do
-  case "$requested" in
+while [ "$#" -gt 0 ]; do
+  case "$1" in
   -h | --help)
     usage
     exit 0
@@ -3417,14 +3427,34 @@ for requested in "$@"; do
     printf '%s\n' "${TESTS[@]}"
     exit 0
     ;;
-  esac
-  known_test "$requested" || {
-    echo "FAIL: unknown test name: $requested" >&2
-    echo "run with --list to see the ${#TESTS[@]} available names" >&2
+  -v | --verbose) VERBOSE=1 ;;
+  -j | --jobs)
+    [ "$#" -ge 2 ] || {
+      echo "FAIL: $1 needs a job count" >&2
+      exit 1
+    }
+    JOBS="$2"
+    shift
+    ;;
+  -j?*) JOBS="${1#-j}" ;;
+  --jobs=*) JOBS="${1#--jobs=}" ;;
+  -*)
+    echo "FAIL: unknown option: $1" >&2
+    usage >&2
     exit 1
-  }
-  SELECTED+=("$requested")
-  SELECTED_COUNT=$((SELECTED_COUNT + 1))
+    ;;
+  *)
+    known_test "$1" || {
+      echo "FAIL: unknown test name: $1" >&2
+      echo "run with --list to see the ${#TESTS[@]} available names" >&2
+      exit 1
+    }
+    NAMED=1
+    SELECTED+=("$1")
+    SELECTED_COUNT=$((SELECTED_COUNT + 1))
+    ;;
+  esac
+  shift
 done
 
 if [ "$SELECTED_COUNT" -eq 0 ]; then
@@ -3432,12 +3462,126 @@ if [ "$SELECTED_COUNT" -eq 0 ]; then
   SELECTED_COUNT=${#TESTS[@]}
 fi
 
+if [ -z "$JOBS" ]; then
+  JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || JOBS=""
+  case "$JOBS" in
+  '' | *[!0-9]* | 0) JOBS=4 ;; # no readable processor count: a CI-runner-sized default
+  esac
+fi
+case "$JOBS" in
+'' | *[!0-9]* | 0)
+  echo "FAIL: the job count (-j / SHIP_PR_TEST_JOBS) must be a positive integer, got '$JOBS'" >&2
+  exit 1
+  ;;
+esac
+[ "$JOBS" -le "$SELECTED_COUNT" ] || JOBS="$SELECTED_COUNT"
+
+# Every case builds its scratch repositories under $TEST_ROOT and reads nothing outside them, so
+# each one runs in a background subshell with a private root named after the case. The subshell
+# reports its exit status through a file: a zombie still answers `kill -0`, and bash 3.2 has no
+# `wait -n`, so the status file is what the parent polls for. Nothing here relies on the parent's
+# EXIT trap (which background subshells do not inherit); the root is removed once, at the end.
+LOG_DIR="$TEST_ROOT/.logs"
+mkdir -p "$LOG_DIR"
+RUNNING_PIDS=()
+RUNNING_NAMES=()
+RUNNING=0
+PASSED_COUNT=0
+FAILED_COUNT=0
+FAILED=()
+
+run_case() {
+  local name="$1"
+  trap 'echo "$?" >"$LOG_DIR/$name.status"' EXIT
+  TEST_ROOT="$TEST_ROOT/$name"
+  mkdir -p "$TEST_ROOT" || exit 1
+  "$name"
+}
+
+start_case() {
+  local name="$1"
+  (run_case "$name") >"$LOG_DIR/$name.log" 2>&1 </dev/null &
+  RUNNING_PIDS+=("$!")
+  RUNNING_NAMES+=("$name")
+  RUNNING=$((RUNNING + 1))
+}
+
+report_case() {
+  local i="$1" name pid status log
+  name="${RUNNING_NAMES[$i]}"
+  pid="${RUNNING_PIDS[$i]}"
+  log="$LOG_DIR/$name.log"
+  wait "$pid" >/dev/null 2>&1 || true
+  status=$(cat "$LOG_DIR/$name.status" 2>/dev/null) || status=""
+  case "$status" in
+  '' | *[!0-9]*) status=1 ;;
+  esac
+  unset "RUNNING_PIDS[$i]" "RUNNING_NAMES[$i]"
+  RUNNING=$((RUNNING - 1))
+  if [ "$status" -eq 0 ]; then
+    PASSED_COUNT=$((PASSED_COUNT + 1))
+    if [ "$VERBOSE" -eq 1 ]; then
+      cat "$log"
+    else
+      grep '^PASS:' "$log" || echo "PASS: $name (printed no PASS line)"
+    fi
+    rm -rf "$TEST_ROOT/$name"
+  else
+    FAILED_COUNT=$((FAILED_COUNT + 1))
+    FAILED+=("$name")
+    {
+      echo "===== FAIL: $name (exit $status) ====="
+      cat "$log"
+      echo "===== end of $name ====="
+    } >&2
+  fi
+}
+
+reap_one() {
+  local i
+  while :; do
+    for i in ${RUNNING_PIDS[@]+"${!RUNNING_PIDS[@]}"}; do
+      if [ -f "$LOG_DIR/${RUNNING_NAMES[$i]}.status" ]; then
+        report_case "$i"
+        return 0
+      fi
+    done
+    sleep 0.2
+  done
+}
+
+on_signal() {
+  local pid
+  trap - INT TERM
+  for pid in ${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}; do
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+  done
+  # Reap them here so bash does not narrate each termination while the EXIT trap removes the root.
+  for pid in ${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}; do
+    wait "$pid" >/dev/null 2>&1 || true
+  done
+  echo "FAIL: interrupted with $RUNNING post-merge cleanup states still running" >&2
+  exit 130
+}
+trap on_signal INT TERM
+
+SECONDS=0
 for selected_test in "${SELECTED[@]}"; do
-  "$selected_test"
+  while [ "$RUNNING" -ge "$JOBS" ]; do
+    reap_one
+  done
+  start_case "$selected_test"
+done
+while [ "$RUNNING" -gt 0 ]; do
+  reap_one
 done
 
-if [ "$#" -eq 0 ]; then
-  echo "PASS: all post-merge cleanup states"
+if [ "$FAILED_COUNT" -gt 0 ]; then
+  echo "FAIL: $FAILED_COUNT of $SELECTED_COUNT post-merge cleanup states failed in ${SECONDS}s (-j $JOBS): ${FAILED[*]}" >&2
+  exit 1
+fi
+if [ "$NAMED" -eq 0 ]; then
+  echo "PASS: all post-merge cleanup states ($SELECTED_COUNT cases in ${SECONDS}s, -j $JOBS)"
 else
-  echo "PASS: $SELECTED_COUNT selected post-merge cleanup states"
+  echo "PASS: $SELECTED_COUNT selected post-merge cleanup states (${SECONDS}s, -j $JOBS)"
 fi
