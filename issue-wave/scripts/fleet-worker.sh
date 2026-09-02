@@ -54,7 +54,10 @@
 # Exit: 0 ok | 1 the fact does not hold (refused, worker failed, stale) | 2 usage |
 #       3 worker vanished without an exit record | 4 the box never answered.
 #
-# Env: FLEET_LOCAL_BOX (mac-studio), FLEET_ANCHOR (mac-studio; where lease and halt live),
+# Env: FLEET_COORDINATOR (this coordinator's identity for the lease; defaults to the Claude Code
+# session id the shell inherits - set it explicitly when not running under Claude Code, since the
+# last-resort fallback is the owning process id), FLEET_LOCAL_BOX (mac-studio), FLEET_ANCHOR
+# (mac-studio; where lease and halt live),
 # FLEET_ANCHOR_STATE (the anchor's state dir, default the same as ISSUE_WAVE_STATE), FLEET_BOXES
 # (the whole fleet, "mac-studio rog-nv-wsl minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/self-improve), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
 # FLEET_TMUX_SOCKET (tmux -L name; tests isolate with it), FLEET_FLOTILLA (http://mac-studio:7799).
