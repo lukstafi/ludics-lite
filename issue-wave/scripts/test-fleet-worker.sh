@@ -184,13 +184,17 @@ expect "clean main passes for codex (live probe via shim)" 0 "PREFLIGHT OK" -- "
 expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
 expect "codex that cannot run headless refuses despite login status" 1 "codex cannot run headless: \"message\":\"401 Unauthorized\"" -- env SHIM_CODEX_DOWN=1 "$FW" preflight testbox --codex
 echo x >> "$repo/ClaudeDesktop/skills/ship-pr/SKILL.md"
-expect "tracked change refuses" 1 "tracked change" -- "$FW" preflight testbox --no-probe
+expect "a tracked change under the served tree refuses" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
+git -C "$repo" checkout -q -- .
+mkdir -p "$repo/harness/claude-memory"; echo "# note" > "$repo/harness/claude-memory/MEMORY.md"; git -C "$repo" add -A; git -C "$repo" commit -q -m memory; git -C "$repo" push -q origin main
+echo "- edit" >> "$repo/harness/claude-memory/MEMORY.md"
+expect "a tracked change outside the served tree (a memory checkpoint) passes with a notice" 0 "PREFLIGHT OK.*ignored: harness/claude-memory/MEMORY.md" -- "$FW" preflight testbox --no-probe
 git -C "$repo" checkout -q -- .
 touch "$repo/ClaudeDesktop/skills/ship-pr/scripts.sh"
-expect "untracked file under the served tree refuses" 1 "untracked file(s) under ClaudeDesktop" -- "$FW" preflight testbox --no-probe
+expect "untracked file under the served tree refuses" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
 rm "$repo/ClaudeDesktop/skills/ship-pr/scripts.sh"
 touch "$repo/ClaudeDesktop/skills/ship-pr/a b.sh"
-expect "an untracked served file whose path git would quote still refuses" 1 "1 untracked file(s) under ClaudeDesktop" -- "$FW" preflight testbox --no-probe
+expect "an untracked served file whose path git would quote still refuses" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
 rm "$repo/ClaudeDesktop/skills/ship-pr/a b.sh"
 mkdir -p "$repo/.claude"; echo '{}' > "$repo/.claude/settings.local.json"
 expect "untracked file outside the served tree passes with a notice" 0 "PREFLIGHT OK.*ignored: .claude/" -- "$FW" preflight testbox --no-probe
@@ -230,7 +234,7 @@ expect "launch without a lease refuses" 1 "LAUNCH REFUSED testbox/w1: no coordin
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 "$FW" claim >/dev/null
 echo x >> "$repo/ClaudeDesktop/skills/ship-pr/SKILL.md"
-expect "launch runs the preflight on the box and refuses a dirty checkout" 1 "LAUNCH REFUSED testbox/w1: PREFLIGHT REFUSED testbox: 1 tracked change" -- \
+expect "launch runs the preflight on the box and refuses a dirty served tree" 1 "LAUNCH REFUSED testbox/w1: PREFLIGHT REFUSED testbox: 1 local change(s) under ClaudeDesktop/" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 git -C "$repo" checkout -q -- .
 expect "launch creates the worktree and reports the session" 0 "LAUNCHED testbox/w1 kind=claude session=[0-9a-f-]\{36\} cwd=$proj-worktrees/w1" -- \

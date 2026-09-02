@@ -112,8 +112,10 @@ named `local` (or `mac-studio`) runs without ssh; the same script, the same file
 **Skill-freshness preflight first, per launch, on the launching box (self-improve#11):**
 `launch` runs it itself before every worker, and `fleet-worker.sh preflight <box>` (`--codex`
 for a Codex worker) runs it alone for diagnosis. It brings that box's
-`~/self-improve` to upstream main and refuses on anything short of it: a tracked change or an
-untracked file under `ClaudeDesktop/` (the served tree), a branch other than main, a HEAD that
+`~/self-improve` to upstream main and refuses on anything short of it: any local change,
+tracked or untracked, under `ClaudeDesktop/` (the served tree; changes elsewhere - mac-studio's
+git-synced memory checkpoints under `harness/`, a stray `.claude/` - are reported, not refused,
+and still refuse if they block the fast-forward), a branch other than main, a HEAD that
 is not origin/main after the fast-forward (an unpushed local commit is divergence to surface,
 not text to deploy), a deployed skill symlink that does not point into the checkout (and, for
 Codex, the three `~/.codex/skills` links the README's Codex loop installs), and - the leg that

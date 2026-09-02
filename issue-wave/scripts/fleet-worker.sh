@@ -303,23 +303,20 @@ if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
   echo "PREFLIGHT REFUSED $BOX: no skills checkout at $repo"; exit 1
 fi
 git -C "$repo" fetch -q origin 2>/dev/null || note "fetch failed (offline?)"
-# Tracked modifications, and untracked files under the served tree, are divergence to surface.
-# Untracked files elsewhere (a stray .claude/ from running claude inside the checkout) are not
-# skill text and are only reported.
+# Any change under the served tree - tracked or untracked - is divergence to surface: the
+# deployed symlinks would serve it. Changes elsewhere are not skill text and are only reported
+# (mac-studio's checkout carries git-synced memory checkpoints under harness/ most of the time;
+# a stray .claude/ appears wherever claude was run inside the checkout). The fast-forward below
+# still fails, and refuses, if such a local change collides with what upstream brings.
 # NUL-delimited, so a path git would otherwise quote (a space, a quote, a non-ASCII byte) is
 # still classified by its directory rather than falling through as "outside the served tree".
-tracked=0; served=0; other=""
+served=0; other=""
 while IFS= read -r -d '' entry; do
   st=${entry:0:2}; path=${entry:3}
   case "$st" in R*|C*) IFS= read -r -d '' _from ;; esac   # a rename's second record is the source
-  if [ "$st" = "??" ]; then
-    case "$path" in ClaudeDesktop/*) served=$((served + 1)) ;; *) other="$other$path " ;; esac
-  else
-    tracked=$((tracked + 1))
-  fi
+  case "$path" in ClaudeDesktop/*) served=$((served + 1)) ;; *) other="$other$path " ;; esac
 done < <(git -C "$repo" status --porcelain -z 2>/dev/null)
-[ "$tracked" -eq 0 ] || note "$tracked tracked change(s) in $repo"
-[ "$served" -eq 0 ] || note "$served untracked file(s) under ClaudeDesktop/"
+[ "$served" -eq 0 ] || note "$served local change(s) under ClaudeDesktop/ (the served tree)"
 branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
 [ "$branch" = main ] || note "checked out $branch, not main"
 if [ -z "$refuse" ]; then
@@ -366,10 +363,10 @@ fi
 command -v tmux >/dev/null 2>&1 || note "no tmux"
 command -v jq >/dev/null 2>&1 || note "no jq"
 if [ -n "$refuse" ]; then
-  echo "PREFLIGHT REFUSED $BOX: ${refuse#; }${other:+ (untracked outside the served tree, ignored: $other)}"
+  echo "PREFLIGHT REFUSED $BOX: ${refuse#; }${other:+ (changes outside the served tree, ignored: $other)}"
   exit 1
 fi
-echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (untracked outside the served tree, ignored: $other)}"
+echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (changes outside the served tree, ignored: $other)}"
 EOF
 }
 
