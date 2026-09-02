@@ -201,6 +201,9 @@ expect "a tracked change outside the served tree (a memory checkpoint) passes wi
 git -C "$repo" checkout -q -- .
 touch "$repo/ClaudeDesktop/skills/ship-pr/scripts.sh"
 expect "untracked file under the served tree refuses" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
+git -C "$repo" config status.showUntrackedFiles no
+expect "...even when the box's git config hides untracked files" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
+git -C "$repo" config --unset status.showUntrackedFiles
 rm "$repo/ClaudeDesktop/skills/ship-pr/scripts.sh"
 touch "$repo/ClaudeDesktop/skills/ship-pr/a b.sh"
 expect "an untracked served file whose path git would quote still refuses" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
@@ -263,7 +266,7 @@ printf 'a different brief\n' > "$TMP/brief2.md"
 expect "a finished worker's name is not reused silently" 1 "finished worker's record is here" -- \
   "$FW" launch testbox w1 --kind claude --brief "$TMP/brief2.md" --cwd "$proj-worktrees/w1"
 [ "$(cat "$ISSUE_WAVE_STATE/workers/w1/brief.md")" = "$(cat "$brief")" ] && ok "a refused launch leaves the recorded brief untouched" || ko "refused launch overwrote brief.md"
-ls "$ISSUE_WAVE_STATE/workers/w1/" | grep -q '^incoming-' && ko "refused launch left its incoming brief behind" || ok "refused launch cleans up its incoming brief"
+ls "$ISSUE_WAVE_STATE/incoming/" 2>/dev/null | grep -q '^w1-' && ko "refused launch left its staged brief behind" || ok "refused launch cleans up its staged brief"
 git -C "$proj-worktrees/w1" checkout -q -b other
 expect "a reused worktree on another branch refuses" 1 "exists but is on 'other', not claude/w1" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
@@ -394,8 +397,11 @@ resumed=$(cat "$TMP/un-a.out" "$TMP/un-b.out" | grep -c '^RESUMED testbox/dup')
 "$FW" attach testbox dup --interval 1 >/dev/null
 bash -c 'sleep 3; :' tail -f "$ISSUE_WAVE_STATE/workers/dup/stream.jsonl" >/dev/null 2>&1 & disown; sleep 0.5
 expect "a diagnostic process on a record file is not the worker" 0 "EXITED(0) testbox/dup" -- "$FW" status testbox dup
-: > "$ISSUE_WAVE_STATE/workers/blocked"
+rm -rf "$ISSUE_WAVE_STATE/incoming"; : > "$ISSUE_WAVE_STATE/incoming"
 expect "a brief that cannot be staged is a refusal, not an unreachable box" 1 "LAUNCH REFUSED testbox/blocked: cannot stage the brief" -- "$FW" launch testbox blocked --kind claude --brief "$brief" --cwd "$proj"
+rm -f "$ISSUE_WAVE_STATE/incoming"
+: > "$ISSUE_WAVE_STATE/workers/blocked"
+expect "a record directory that cannot be created is a refusal naming it" 1 "LAUNCH REFUSED testbox/blocked: cannot create the worker record" -- "$FW" launch testbox blocked --kind claude --brief "$brief" --cwd "$proj"
 rm -f "$ISSUE_WAVE_STATE/workers/blocked"
 
 printf 'SLEEP 20\n' > "$TMP/slow20.md"
@@ -415,6 +421,7 @@ expect "...and the previous worker still reads as done" 0 "EXITED(0) testbox/tf"
 expect "a stalling project fetch is bounded and refused before any record is touched" 1 "git fetch in .* timed out after 2s" -- \
   env SHIM_GIT_HANG_FETCH=1 FLEET_FETCH_TIMEOUT=2 "$FW" launch testbox fh --kind claude --brief "$brief" --repo "$proj" --branch claude/fh
 [ -d "$ISSUE_WAVE_STATE/workers/fh" ] && ko "a refused fetch left a record" || ok "no record left by the refused fetch"
+ls "$ISSUE_WAVE_STATE/incoming/" 2>/dev/null | grep -q '^fh-' && ko "a refused fetch left a staged brief" || ok "no staged brief left by the refused fetch"
 
 echo "--- codex workers"
 expect "codex launch captures the thread id from the stream" 0 "LAUNCHED testbox/c1 kind=codex session=0199-shim-" -- \

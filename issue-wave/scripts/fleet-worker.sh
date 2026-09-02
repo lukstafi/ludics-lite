@@ -305,7 +305,7 @@ note() { refuse="$refuse; $*"; }
 # `git fetch`/`merge` in the same checkout and refuse on git's own lock files. Idempotent, so
 # waiting for the other preflight is the right thing; the bound covers a hung live probe.
 mkdir -p "$STATE" 2>/dev/null; plock="$STATE/preflight.lock"
-msg=$(take_lock "$plock" 180 "PREFLIGHT REFUSED $BOX") || { echo "$msg"; exit 1; }
+msg=$(take_lock "$plock" $((fetch_timeout + probe_timeout + 60)) "PREFLIGHT REFUSED $BOX") || { echo "$msg"; exit 1; }
 trap 'release_lock "$plock"' EXIT
 repo=$(expand_tilde "$SKILLS_REPO")
 if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
@@ -326,7 +326,7 @@ while IFS= read -r -d '' entry; do
   case "$st" in R*|C*) IFS= read -r -d '' from ;; esac   # a rename's second record is the source
   # Both sides of a rename count: a file moved OUT of the served tree is a served file gone.
   case "$path" in ClaudeDesktop/*) served=$((served + 1)) ;; *) case "$from" in ClaudeDesktop/*) served=$((served + 1)) ;; *) other="$other$path " ;; esac ;; esac
-done < <(git -C "$repo" status --porcelain -z 2>/dev/null)
+done < <(git -C "$repo" status --porcelain -z --untracked-files=all 2>/dev/null)
 [ "$served" -eq 0 ] || note "$served local change(s) under ClaudeDesktop/ (the served tree)"
 branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
 [ "$branch" = main ] || note "checked out $branch, not main"
@@ -441,14 +441,16 @@ cmd_launch() {
   # The brief lands beside the record, not on it: the far side moves it into place only after
   # the guards pass, so a refused launch leaves a finished worker's brief untouched.
   local stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  put_file "$box" "$brief" "$STATE/workers/$name/incoming-$stamp.md"
+  put_file "$box" "$brief" "$STATE/incoming/$name-$stamp.md"
   local prc2=$?
   if unreachable "$prc2"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc2" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: cannot stage the brief under the worker state dir on $box (unwritable, or a file in the way)"; exit 1; }
   { prelude "$box"; cat <<'EOF'
 name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8" replace="$9" stamp="${10}" fetch_timeout="${11}"; shift 11
-d="$WORKERS/$name"; incoming="$d/incoming-$stamp.md"
-fresh=0; [ -f "$d/meta" ] || fresh=1   # this launch creates the record: a refusal removes it whole
+d="$WORKERS/$name"; incoming="$STATE/incoming/$name-$stamp.md"
+# Until the lock is held nothing here is ours but the staged brief; `fresh` (this launch
+# creates the record, so a refusal removes it whole) is decided under the lock.
+fresh=0
 refuse() { rm -f "$incoming"; if [ "$fresh" = 1 ]; then rm -rf "$d"; fi; echo "LAUNCH REFUSED $BOX/$name: $*"; exit 1; }
 # One launch of a name at a time: the guards below and the record writes after them are one
 # critical section, held until the tmux session exists (or this launch has refused).
@@ -465,6 +467,7 @@ on_exit() {
   release_lock "$wlock"
 }
 trap on_exit EXIT; trap 'exit 143' TERM HUP INT
+[ -f "$d/meta" ] || fresh=1
 if alive "$name"; then refuse "already running"; fi
 if [ -f "$d/meta" ]; then
   # tmux gone is not the CLI gone: a reparented orphan can still write and commit, and
@@ -503,6 +506,7 @@ else
   cwd=$(expand_tilde "$cwd")
 fi
 [ -d "$cwd" ] || refuse "no such directory $cwd"
+mkdir -p "$d" 2>/dev/null || refuse "cannot create the worker record at $d (a file in the way, or unwritable)"
 if [ -f "$d/meta" ]; then
   # --replace keeps the previous record whole under $STATE/replaced/ (evidence), and a refusal
   # below puts it back; nothing of it is truncated in place.
@@ -512,7 +516,7 @@ if [ -f "$d/meta" ]; then
   fi
   # From here the old record lives in $archive; any refusal puts it back whole.
   refuse() { rm -f "$incoming"; rm -rf "$d"; mv "$archive" "$d" 2>/dev/null; echo "LAUNCH REFUSED $BOX/$name: $* (previous record restored)"; exit 1; }
-  mkdir -p "$d" && mv "$archive/incoming-$stamp.md" "$incoming" 2>/dev/null || refuse "cannot start a fresh record at $d"
+  mkdir -p "$d" || refuse "cannot start a fresh record at $d"
 fi
 # Every record mutation is checked, and the brief is in place before any evidence is truncated.
 [ ! -d "$d/brief.md" ] || refuse "cannot install the brief: $d/brief.md is a directory"
@@ -699,7 +703,7 @@ cmd_unstick() {
   [ -n "$msg" ] && [ -r "$msg" ] || die "unstick: --message <readable file>"
   anchor_gate UNSTICK "$box/$name" 1 || exit $?
   local stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  put_file "$box" "$msg" "$STATE/workers/$name/messages/$stamp.md"
+  put_file "$box" "$msg" "$STATE/incoming/$name-$stamp.md"
   local prc2=$?
   if unreachable "$prc2"; then echo "UNSTICK UNREACHABLE $box"; exit 4; fi
   [ "$prc2" -eq 0 ] || { echo "UNSTICK REFUSED $box/$name: cannot stage the message under the worker state dir on $box (unwritable, or a file in the way)"; exit 1; }
@@ -708,12 +712,26 @@ cmd_unstick() {
   anchor_gate UNSTICK "$box/$name" 1 || exit $?
   { prelude "$box"; cat <<'EOF'
 name="$1" kill="$2" stamp="$3"; shift 3
-d="$WORKERS/$name"
-[ -f "$d/meta" ] || { echo "UNSTICK REFUSED $BOX/$name: never launched here"; exit 1; }
+d="$WORKERS/$name"; staged="$STATE/incoming/$name-$stamp.md"
+[ -f "$d/meta" ] || { rm -f "$staged"; echo "UNSTICK REFUSED $BOX/$name: never launched here"; exit 1; }
 # Same critical section as launch: liveness checks through tmux creation, one at a time.
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
-msg=$(take_lock "$wlock" 0 "lock") || { echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress ($msg)"; exit 1; }
-trap 'release_lock "$wlock"' EXIT
+msg=$(take_lock "$wlock" 0 "lock") || { rm -f "$staged"; echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress ($msg)"; exit 1; }
+started=0
+on_exit() {
+  # Interrupted after the record was changed but before tmux started: put exit and meta back.
+  if [ "$started" != 1 ]; then
+    [ -e "$d/exit.prev" ] && mv -f "$d/exit.prev" "$d/exit" 2>/dev/null
+    [ -e "$d/meta.prev" ] && mv -f "$d/meta.prev" "$d/meta" 2>/dev/null
+    rm -f "$staged"
+  fi
+  release_lock "$wlock"
+}
+trap on_exit EXIT; trap 'exit 143' TERM HUP INT
+# The message moves into the record only now, under the lock: a --replace that archived the
+# record before we held it cannot have taken it along.
+mkdir -p "$d/messages" && mv -f "$staged" "$d/messages/$stamp.md" 2>/dev/null && [ -f "$d/messages/$stamp.md" ] ||
+  { echo "UNSTICK REFUSED $BOX/$name: cannot place the message under $d/messages"; exit 1; }
 kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd); sid=$(session_of "$d")
 [ -n "$sid" ] || { echo "UNSTICK REFUSED $BOX/$name: no session id in meta or stream"; exit 1; }
 [ -d "$cwd" ] || { echo "UNSTICK REFUSED $BOX/$name: recorded working directory $cwd is gone (worktree removed or renamed); nothing was changed"; exit 1; }
@@ -769,6 +787,7 @@ if ! tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")"; then
   mv -f "$d/meta.prev" "$d/meta"
   echo "UNSTICK REFUSED $BOX/$name: tmux failed (previous exit record and meta kept)"; exit 1
 fi
+started=1
 rm -f "$d/exit.prev" "$d/meta.prev"
 echo "RESUMED $BOX/$name kind=$kind session=$sid resume=$n message=$d/messages/$stamp.md"
 EOF
