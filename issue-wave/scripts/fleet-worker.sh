@@ -431,7 +431,7 @@ mv -f "$incoming" "$d/brief.md" 2>/dev/null && [ -f "$d/brief.md" ] || refuse "c
   { echo "LAUNCH REFUSED $BOX/$name: cannot initialize the worker record under $d"; exit 1; }
 # The CLI line itself, written to a file tmux runs: nothing from the brief is ever a shell word.
 {
-  printf 'cd %q || exit 97\n' "$cwd"
+  printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
   case "$kind" in
     claude) printf 'claude -p --output-format stream-json --verbose --dangerously-skip-permissions --session-id %q' "$sid" ;;
     codex)  printf 'codex exec --json --yolo -C %q -o %q' "$cwd" "$d/last-message.md" ;;
@@ -622,6 +622,7 @@ if ! mkdir "$wlock" 2>/dev/null; then echo "UNSTICK REFUSED $BOX/$name: another 
 trap 'rmdir "$wlock" 2>/dev/null' EXIT
 kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd); sid=$(session_of "$d")
 [ -n "$sid" ] || { echo "UNSTICK REFUSED $BOX/$name: no session id in meta or stream"; exit 1; }
+[ -d "$cwd" ] || { echo "UNSTICK REFUSED $BOX/$name: recorded working directory $cwd is gone (worktree removed or renamed); nothing was changed"; exit 1; }
 grep -q '^session=' "$d/meta" || echo "session=$sid" >> "$d/meta"
 if alive "$name"; then
   if [ "$kill" != 1 ]; then
@@ -647,7 +648,7 @@ if pgrep -f -- "$pat" >/dev/null 2>&1; then
   echo "UNSTICK REFUSED $BOX/$name: a process still carries session $sid after TERM: $(pgrep -fl -- "$pat" | head -n 3 | tr '\n' ';')"; exit 1
 fi
 {
-  printf 'cd %q || exit 97\n' "$cwd"
+  printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
   case "$kind" in
     claude) printf 'claude -p --output-format stream-json --verbose --dangerously-skip-permissions --resume %q' "$sid" ;;
     codex)  printf 'codex exec resume %q --yolo --json' "$sid" ;;
