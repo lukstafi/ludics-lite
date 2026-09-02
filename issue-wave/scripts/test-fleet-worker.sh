@@ -113,9 +113,11 @@ rm "$repo/ClaudeDesktop/skills/ship-pr/scripts.sh"
 mkdir -p "$repo/.claude"; echo '{}' > "$repo/.claude/settings.local.json"
 expect "untracked file outside the served tree passes with a notice" 0 "PREFLIGHT OK.*ignored: .claude/" -- "$FW" preflight testbox --no-probe
 rm -rf "$repo/.claude"
-# Behind origin: a second clone pushes; the preflight must fast-forward and pass.
-git clone -q "$origin" "$TMP/other" && echo more >> "$TMP/other/ClaudeDesktop/skills/ship-pr/SKILL.md" \
-  && git -C "$TMP/other" commit -q -am upstream && git -C "$TMP/other" push -q origin main
+# Behind origin: a second clone pushes; the preflight must fast-forward and pass. The bare origin
+# has no HEAD for `main` (the runner's git may default to master), so name the branch to clone.
+git clone -q -b main "$origin" "$TMP/other" && echo more >> "$TMP/other/ClaudeDesktop/skills/ship-pr/SKILL.md" \
+  && git -C "$TMP/other" commit -q -am upstream && git -C "$TMP/other" push -q origin main \
+  || ko "could not advance the scratch origin (setup, not the launcher)"
 expect "behind origin fast-forwards and passes" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --no-probe
 [ "$(git -C "$repo" rev-parse HEAD)" = "$(git -C "$TMP/other" rev-parse HEAD)" ] && ok "checkout was fast-forwarded" || ko "checkout not fast-forwarded"
 echo local >> "$repo/ClaudeDesktop/skills/after-merge/SKILL.md" && git -C "$repo" commit -q -am "unpushed"
