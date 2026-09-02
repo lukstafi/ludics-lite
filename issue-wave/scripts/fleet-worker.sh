@@ -48,15 +48,16 @@
 # while halted (`--force` admits the one triage worker) and runs the preflight on the box first.
 # Lease and halt live on FLEET_ANCHOR.
 #
-# <box> is an ssh destination (rog-nv-wsl, minix-amd-wsl), or `local` / the value of
-# FLEET_LOCAL_BOX (default mac-studio) for the coordinator's own machine.
+# <box> is an ssh destination (rog-nv-wsl, minix-amd-wsl), or `local` / this machine's own fleet
+# name (detected from the hostname; FLEET_LOCAL_BOX overrides) for the coordinator's own machine.
 #
 # Exit: 0 ok | 1 the fact does not hold (refused, worker failed, stale) | 2 usage |
 #       3 worker vanished without an exit record | 4 the box never answered.
 #
 # Env: FLEET_COORDINATOR (this coordinator's identity for the lease; defaults to the Claude Code
 # session id the shell inherits, and is REQUIRED when not running under Claude Code - nothing is
-# guessed from the process tree), FLEET_LOCAL_BOX (mac-studio), FLEET_ANCHOR
+# guessed from the process tree), FLEET_LOCAL_BOX (this box's fleet name; detected from the
+# hostname), FLEET_ANCHOR
 # (mac-studio; where lease and halt live),
 # FLEET_ANCHOR_STATE (the anchor's state dir, default the same as ISSUE_WAVE_STATE), FLEET_BOXES
 # (the whole fleet, "mac-studio rog-nv-wsl minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/self-improve), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
@@ -65,7 +66,17 @@
 
 set -uo pipefail
 
-LOCAL_BOX="${FLEET_LOCAL_BOX:-mac-studio}"
+# Which fleet box this is, from the hostname unless FLEET_LOCAL_BOX says so; an unrecognized
+# host is local to nothing but the literal `local`, so every named box is reached over ssh.
+detect_local_box() {
+  case "$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')" in
+    *mac-studio*) echo mac-studio ;;
+    rog-nv*|rog) echo rog-nv-wsl ;;
+    minix*) echo minix-amd-wsl ;;
+    *) echo "" ;;
+  esac
+}
+LOCAL_BOX="${FLEET_LOCAL_BOX-$(detect_local_box)}"
 ANCHOR="${FLEET_ANCHOR:-mac-studio}"
 BOXES="${FLEET_BOXES:-mac-studio rog-nv-wsl minix-amd-wsl}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/self-improve}"
@@ -77,7 +88,7 @@ SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o Ser
 
 die() { echo "fleet-worker.sh: $*" >&2; exit 2; }
 
-is_local() { [ "$1" = local ] || [ "$1" = "$LOCAL_BOX" ]; }
+is_local() { [ "$1" = local ] || { [ -n "$LOCAL_BOX" ] && [ "$1" = "$LOCAL_BOX" ]; }; }
 
 # A configured path, expanded on THIS box (a default keeps a literal $HOME so the same value can
 # also be shipped to another box and expanded there).
@@ -635,7 +646,7 @@ fi
 # A claude worker carries its session id on its command line; a codex worker's first exec
 # carries only this worker's state dir (-o), so match either. An orphan is still a live
 # writer: it is refused without --kill exactly like a live tmux session.
-pat="$(re_lit "$sid")|$(re_lit "$d/")"
+pat=$(live_pat "$name")
 if [ "$kill" != 1 ] && pgrep -f -- "$pat" >/dev/null 2>&1; then
   echo "UNSTICK REFUSED $BOX/$name: tmux is gone but a CLI still runs ($(pgrep -fl -- "$pat" | head -n 2 | tr '\n' ';')); pass --kill to stop it first"; exit 1
 fi
@@ -661,9 +672,14 @@ fi
 n=$(meta_get "$d" resumes); n=$(( ${n:-0} + 1 ))
 sed -i.bak "s/^resumes=.*/resumes=$n/" "$d/meta" 2>/dev/null && rm -f "$d/meta.bak" && grep -q "^resumes=$n\$" "$d/meta" ||
   { echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
-# The previous terminal state is evidence until the resume is really starting.
-rm -f "$d/exit" 2>/dev/null; [ ! -e "$d/exit" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot clear $d/exit"; exit 1; }
-tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || { echo "UNSTICK REFUSED $BOX/$name: tmux failed"; exit 1; }
+# The previous terminal state is evidence until the resume has really started: set it aside,
+# and put it back if tmux refuses.
+if [ -e "$d/exit" ]; then mv -f "$d/exit" "$d/exit.prev" 2>/dev/null && [ ! -e "$d/exit" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot set aside $d/exit"; exit 1; }; fi
+if ! tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")"; then
+  [ -e "$d/exit.prev" ] && mv -f "$d/exit.prev" "$d/exit"
+  echo "UNSTICK REFUSED $BOX/$name: tmux failed (previous exit record kept)"; exit 1
+fi
+rm -f "$d/exit.prev"
 echo "RESUMED $BOX/$name kind=$kind session=$sid resume=$n message=$d/messages/$stamp.md"
 EOF
   } | run_on "$box" "$name" "$kill" "$stamp" "$@"
