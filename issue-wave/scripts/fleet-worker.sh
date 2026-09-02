@@ -147,7 +147,9 @@ take_lock() {
     [ "$waited" -lt "$wait" ] || { echo "$label: lock $lock held ${holder:+by pid $holder }for ${wait}s -- another operation in progress"; return 1; }
     sleep 1; waited=$((waited + 1))
   done
-  echo $$ > "$lock/pid"; proc_start $$ > "$lock/start"
+  # start before pid: a contender that sees a pid without its start time would otherwise read
+  # the mismatch as a reused pid and reclaim a lock that is being taken right now.
+  proc_start $$ > "$lock/start"; echo $$ > "$lock/pid"
 }
 release_lock() { rm -f "$1/pid" "$1/start"; rmdir "$1" 2>/dev/null; }
 # The pattern that finds a worker's CLI by its own command line: a claude or codex command
