@@ -421,6 +421,7 @@ cmd_launch() {
     shift
   done
   case "$kind" in claude|codex) ;; *) die "launch: --kind claude|codex" ;; esac
+  case "$cwd$repo$branch$base" in *$'\n'*) die "launch: paths and refs must not contain newlines (the record is line-oriented)" ;; esac
   [ -n "$brief" ] && [ -r "$brief" ] || die "launch: --brief <readable file>"
   if [ -z "$cwd" ]; then
     [ -n "$repo" ] && [ -n "$branch" ] || die "launch: --cwd <dir>, or --repo <dir> --branch <branch>"
@@ -464,9 +465,10 @@ on_exit() {
     if [ -n "$archive" ] && [ -d "$archive" ]; then rm -rf "$d"; mv "$archive" "$d" 2>/dev/null
     elif [ "$fresh" = 1 ]; then rm -rf "$d"; fi
   fi
-  release_lock "$wlock"
+  release_lock "$wlock"; [ -n "${blaunch:-}" ] && release_lock "$blaunch"
 }
 trap on_exit EXIT; trap 'exit 143' TERM HUP INT
+blaunch=""
 [ -f "$d/meta" ] || fresh=1
 if alive "$name"; then refuse "already running"; fi
 if [ -f "$d/meta" ]; then
@@ -507,7 +509,11 @@ else
 fi
 [ -d "$cwd" ] || refuse "no such directory $cwd"
 # One live worker per worktree on this box: two CLIs in one checkout are the two-writer
-# condition unstick refuses, under different names. Compared by resolved path.
+# condition unstick refuses, under different names. Compared by resolved path, and under a
+# box-wide launch lock held from this scan until this record's meta (its ownership claim)
+# is written, so two launches under different names cannot both pass the scan.
+blaunch="$STATE/launch.lock"
+msg=$(take_lock "$blaunch" 120 "launch lock") || refuse "another launch on this box is publishing its record ($msg)"
 canon_cwd=$(cd "$cwd" 2>/dev/null && pwd -P)
 for om in "$WORKERS"/*/meta; do
   [ -f "$om" ] || continue
@@ -550,6 +556,7 @@ mv -f "$incoming" "$d/brief.md" 2>/dev/null && [ -f "$d/brief.md" ] || refuse "c
   echo "launched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "resumes=0"; echo "turn_offset=0"
   if [ -n "$sid" ]; then echo "session=$sid"; fi
 } > "$d/meta" || refuse "cannot write $d/meta"
+release_lock "$blaunch"; blaunch=""   # ownership is published; the box-wide lock is no longer needed
 tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || refuse "tmux failed"
 started=1
 if [ "$kind" = codex ]; then

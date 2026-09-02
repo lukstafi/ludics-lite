@@ -414,6 +414,14 @@ expect "a second worker on a worktree a live worker owns is refused" 1 "already 
 "$FW" unstick testbox own-a --message "$TMP/msg.md" --kill >/dev/null; "$FW" attach testbox own-a --interval 1 >/dev/null
 expect "...and allowed once that worker has finished" 0 "LAUNCHED testbox/own-b" -- "$FW" launch testbox own-b --kind claude --brief "$brief" --cwd "$proj"
 "$FW" attach testbox own-b --interval 1 >/dev/null
+"$FW" launch testbox race-x --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/rx.out" 2>&1 & rx=$!
+"$FW" launch testbox race-y --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/ry.out" 2>&1 & ry=$!
+wait "$rx" "$ry"
+n=$(cat "$TMP/rx.out" "$TMP/ry.out" | grep -c '^LAUNCHED ')
+[ "$n" -eq 1 ] && ok "two concurrent launches under different names on one worktree: exactly one LAUNCHED" || ko "worktree race: $n LAUNCHED -- $(cat "$TMP/rx.out" "$TMP/ry.out")"
+cat "$TMP/rx.out" "$TMP/ry.out" | grep -q 'already owned by live worker' && ok "the other was refused by ownership" || ko "no ownership refusal: $(cat "$TMP/rx.out" "$TMP/ry.out")"
+[ -d "$ISSUE_WAVE_STATE/launch.lock" ] && ko "box-wide launch lock left behind" || ok "box-wide launch lock released"
+for w in race-x race-y; do "$FW" unstick testbox $w --message "$TMP/msg.md" --kill >/dev/null 2>&1; "$FW" attach testbox $w --interval 1 >/dev/null 2>&1; done
 "$FW" launch testbox p-1 --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox p-1 --interval 1 >/dev/null
 "$FW" launch testbox p-12 --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
 expect "a finished worker is not read as running through a prefix-matching sibling session" 0 "EXITED(0) testbox/p-1 " -- "$FW" status testbox p-1
@@ -482,6 +490,7 @@ out=$(env -u FLEET_LOCAL_BOX "$FW" status testbox w1 2>&1); rc=$?
 expect "attach rejects a zero interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval 0
 expect "attach rejects a non-numeric interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval fast
 expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --kind claude --brief "$TMP/none.md" --cwd "$proj"
+expect "a path with a newline refuses" 2 "must not contain newlines" -- "$FW" launch testbox nl --kind claude --brief "$brief" --cwd "$(printf '%s\nx' "$proj")"
 
 echo
 echo "$pass passed, $fail failed"
