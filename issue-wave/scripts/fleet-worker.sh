@@ -174,7 +174,7 @@ coordinator_id() {
   else printf '%s-pid-%s' "$(hostname -s)" "$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')"
   fi
 }
-token_file() { printf '%s/tokens/%s' "$(local_path "$STATE")" "$(coordinator_id | tr -c 'A-Za-z0-9._-\n' '_')"; }
+token_file() { printf '%s/tokens/%s' "$(local_path "$STATE")" "$(coordinator_id | tr -c -- '-A-Za-z0-9._' '_')"; }
 my_token() { cat "$(token_file)" 2>/dev/null; }
 
 # Far-side script for the anchor: lease + halt checks. Args: verb label force token.
