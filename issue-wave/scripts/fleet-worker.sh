@@ -132,20 +132,24 @@ WORKERS="$STATE/workers"
 # take_lock <dir> <wait-seconds> <label>: a mkdir lock that records its holder's pid, so a lock
 # left by a killed shell or a rebooted box is reclaimed instead of wedging the name forever.
 # Prints nothing on success; on failure prints one line and returns 1. Release with rmdir.
+# The holder is identified by pid AND process start time: after a reboot (or plain pid reuse)
+# the recorded pid may belong to an unrelated live process, which a bare kill -0 would treat
+# as the holder forever.
+proc_start() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' '; }
 take_lock() {
-  local lock="$1" wait="$2" label="$3" waited=0 holder
+  local lock="$1" wait="$2" label="$3" waited=0 holder hstart
   until mkdir "$lock" 2>/dev/null; do
     [ -d "$lock" ] || { echo "$label: cannot create lock $lock (unwritable?)"; return 1; }
-    holder=$(cat "$lock/pid" 2>/dev/null)
-    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-      rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null; continue   # dead holder: reclaim
+    holder=$(cat "$lock/pid" 2>/dev/null); hstart=$(cat "$lock/start" 2>/dev/null)
+    if [ -n "$holder" ] && { ! kill -0 "$holder" 2>/dev/null || [ "$(proc_start "$holder")" != "$hstart" ]; }; then
+      rm -f "$lock/pid" "$lock/start"; rmdir "$lock" 2>/dev/null; continue   # dead or reused pid: reclaim
     fi
     [ "$waited" -lt "$wait" ] || { echo "$label: lock $lock held ${holder:+by pid $holder }for ${wait}s -- another operation in progress"; return 1; }
     sleep 1; waited=$((waited + 1))
   done
-  echo $$ > "$lock/pid"
+  echo $$ > "$lock/pid"; proc_start $$ > "$lock/start"
 }
-release_lock() { rm -f "$1/pid"; rmdir "$1" 2>/dev/null; }
+release_lock() { rm -f "$1/pid" "$1/start"; rmdir "$1" 2>/dev/null; }
 # The pattern that finds a worker's CLI by its own command line: a claude or codex command
 # word, then the session id (claude, and codex after a resume) or this worker's state dir
 # (codex's -o). The command-word anchor keeps a `tail -f .../stream.jsonl` or an editor on a
@@ -724,20 +728,23 @@ fi
   printf 'echo $? > %q\n' "$d/exit"
 } > "$d/run.sh" 2>/dev/null && [ -s "$d/run.sh" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot write $d/run.sh (a directory in its place, or unwritable)"; exit 1; }
 n=$(meta_get "$d" resumes); n=$(( ${n:-0} + 1 ))
+# meta is set aside with exit below and restored together with it if tmux refuses.
+cp -p "$d/meta" "$d/meta.prev" 2>/dev/null || { echo "UNSTICK REFUSED $BOX/$name: cannot back up $d/meta"; exit 1; }
 # The verdict of THIS turn must come from events appended after this point, never from the
 # previous turn's terminal event: record where the new turn's output starts.
 off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
 grep -q '^turn_offset=' "$d/meta" || echo "turn_offset=0" >> "$d/meta"
 sed -i.bak "s/^resumes=.*/resumes=$n/; s/^turn_offset=.*/turn_offset=$off/" "$d/meta" 2>/dev/null && rm -f "$d/meta.bak" && grep -q "^resumes=$n\$" "$d/meta" && grep -q "^turn_offset=$off\$" "$d/meta" ||
-  { echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
+  { mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
 # The previous terminal state is evidence until the resume has really started: set it aside,
-# and put it back if tmux refuses.
-if [ -e "$d/exit" ]; then mv -f "$d/exit" "$d/exit.prev" 2>/dev/null && [ ! -e "$d/exit" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot set aside $d/exit"; exit 1; }; fi
+# and put it back (with the previous meta) if tmux refuses.
+if [ -e "$d/exit" ]; then mv -f "$d/exit" "$d/exit.prev" 2>/dev/null && [ ! -e "$d/exit" ] || { mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot set aside $d/exit"; exit 1; }; fi
 if ! tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")"; then
   [ -e "$d/exit.prev" ] && mv -f "$d/exit.prev" "$d/exit"
-  echo "UNSTICK REFUSED $BOX/$name: tmux failed (previous exit record kept)"; exit 1
+  mv -f "$d/meta.prev" "$d/meta"
+  echo "UNSTICK REFUSED $BOX/$name: tmux failed (previous exit record and meta kept)"; exit 1
 fi
-rm -f "$d/exit.prev"
+rm -f "$d/exit.prev" "$d/meta.prev"
 echo "RESUMED $BOX/$name kind=$kind session=$sid resume=$n message=$d/messages/$stamp.md"
 EOF
   } | run_on "$box" "$name" "$kill" "$stamp" "$@"

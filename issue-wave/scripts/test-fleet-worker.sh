@@ -100,7 +100,13 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\n{
 [ -n "$out" ] && printf '%s\n' "$text" > "$out"
 exit 0
 EOF
-chmod +x "$TMP/bin/claude" "$TMP/bin/codex"
+REAL_TMUX=$(command -v tmux)
+cat > "$TMP/bin/tmux" <<EOF
+#!/usr/bin/env bash
+if [ -n "\${SHIM_TMUX_FAIL_NEW:-}" ]; then case " \$* " in *" new-session "*) echo "shim: tmux refuses new-session" >&2; exit 1 ;; esac; fi
+exec "$REAL_TMUX" "\$@"
+EOF
+chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux"
 
 # --- a scratch skills checkout with an origin, deployed the way the README deploys it --------
 origin="$TMP/origin.git"; repo="$TMP/self improve"
@@ -328,6 +334,10 @@ rmdir "$ISSUE_WAVE_STATE/workers/wo/run.sh"; mv "$TMP/run.saved" "$ISSUE_WAVE_ST
 bash -c 'sleep 3; :' tail -f "$ISSUE_WAVE_STATE/workers/wo/stream.jsonl" >/dev/null 2>&1 & disown; sleep 0.5
 expect "a diagnostic process on the record does not block a plain unstick" 0 "RESUMED testbox/wo" -- "$FW" unstick testbox wo --message "$TMP/msg.md"
 "$FW" attach testbox wo --interval 1 >/dev/null
+cp "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before"
+expect "a tmux failure during unstick restores exit and meta" 1 "tmux failed (previous exit record and meta kept)" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" unstick testbox wo --message "$TMP/msg.md"
+cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "meta and exit are as before the failed resume" || ko "meta or exit changed by a failed resume"
+expect "...and the worker still reads as its previous successful turn" 0 "DONE testbox/wo exit=0" -- "$FW" attach testbox wo --interval 1
 mv "$proj" "$proj.moved"
 expect "unstick refuses when the recorded worktree is gone, before touching the record" 1 "recorded working directory .* is gone" -- "$FW" unstick testbox wo --message "$TMP/msg.md"
 [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "the exit record survived the refused unstick" || ko "exit record lost"
@@ -345,7 +355,10 @@ cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -q 'another launch of this name is 
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo 999999 > "$ISSUE_WAVE_STATE/locks/q/pid"
 expect "a lock left by a dead holder is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj"
 "$FW" attach testbox q --interval 1 >/dev/null
-mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo $$ > "$ISSUE_WAVE_STATE/locks/q/pid"
+mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo $$ > "$ISSUE_WAVE_STATE/locks/q/pid"; echo "bogus start" > "$ISSUE_WAVE_STATE/locks/q/start"
+expect "a lock whose pid is live but whose start time differs (pid reuse) is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace
+"$FW" attach testbox q --interval 1 >/dev/null
+mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo $$ > "$ISSUE_WAVE_STATE/locks/q/pid"; ps -o lstart= -p $$ | tr -s ' ' > "$ISSUE_WAVE_STATE/locks/q/start"
 expect "a lock held by a live process still refuses" 1 "another launch or unstick of this name is in progress" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace
 rm -rf "$ISSUE_WAVE_STATE/locks/q"
 "$FW" launch testbox q.mutating --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox q.mutating --interval 1 >/dev/null
