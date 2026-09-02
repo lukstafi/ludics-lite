@@ -953,6 +953,12 @@ cleanup_reservations() {
   [ -z "${LATE_SESSION_ARCHIVE:-}" ] || rmdir "$LATE_SESSION_ARCHIVE" >/dev/null 2>&1 || true
 }
 
+# Bash reads a script file by offset while it runs, so rewriting this file mid-run resumes the
+# shell at a shifted offset, in the middle of whatever command now sits there. The test suite runs
+# this helper once per case while a review round can be editing it. Everything below is one brace
+# group: it is parsed whole before its first command runs, and the closing exit means nothing past
+# it is ever read. The body keeps its original indentation, so the guard is a two-line change.
+{
 MASTER_RESERVATION=""
 MASTER_HEAD_LOCK=""
 MASTER_HEAD_LOCK_OWNED=0
@@ -1535,3 +1541,5 @@ if [ -n "$LATE_SESSION_ARCHIVE" ]; then
   echo "post-merge-cleanup.sh: data appearing at the former session path was archived at $LATE_SESSION_ARCHIVE" >&2
 fi
 echo "post-merge-cleanup.sh: cleaned $BRANCH and unregistered $SESSION_ORIGINAL; session archived at $SESSION_ARCHIVED_WORKTREE; recovery retained at $RECOVERY_REF and $SESSION_RECOVERY_REF"
+exit "$?"
+}

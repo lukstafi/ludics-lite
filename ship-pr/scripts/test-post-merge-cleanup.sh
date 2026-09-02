@@ -3424,6 +3424,13 @@ unless -v/--verbose asks for their full output. -j 1 runs the cases serially.
 USAGE
 }
 
+# Bash reads a script file by offset while it runs, so rewriting this file mid-run resumes the
+# shell at a shifted offset, in the middle of whatever command now sits there — that is how two
+# runs of this suite skipped their final wait loop and removed the scratch root under cases still
+# running. The runner below is one brace group: it is parsed whole before its first command runs,
+# and the closing exit means nothing past it is ever read. The body keeps its original
+# indentation, so the guard is a two-line change.
+{
 known_test() {
   local name="$1" candidate
   for candidate in "${TESTS[@]}"; do
@@ -3654,3 +3661,5 @@ if [ "$NAMED" -eq 0 ]; then
 else
   echo "PASS: $SELECTED_COUNT selected post-merge cleanup states (${SECONDS}s, -j $JOBS)"
 fi
+exit "$?"
+}
