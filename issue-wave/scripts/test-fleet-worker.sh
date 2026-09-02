@@ -196,6 +196,9 @@ rm "$repo/ClaudeDesktop/skills/ship-pr/scripts.sh"
 touch "$repo/ClaudeDesktop/skills/ship-pr/a b.sh"
 expect "an untracked served file whose path git would quote still refuses" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
 rm "$repo/ClaudeDesktop/skills/ship-pr/a b.sh"
+mkdir -p "$repo/outside"; git -C "$repo" mv ClaudeDesktop/skills/after-merge/SKILL.md outside/gone.md
+expect "a file renamed out of the served tree refuses (the source side counts)" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
+git -C "$repo" mv outside/gone.md ClaudeDesktop/skills/after-merge/SKILL.md; rmdir "$repo/outside"
 mkdir -p "$repo/.claude"; echo '{}' > "$repo/.claude/settings.local.json"
 expect "untracked file outside the served tree passes with a notice" 0 "PREFLIGHT OK.*ignored: .claude/" -- "$FW" preflight testbox --no-probe
 rm -rf "$repo/.claude"
@@ -358,6 +361,11 @@ cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -q 'another launch of this name is 
 [ -d "$ISSUE_WAVE_STATE/locks/dup" ] && ko "launch lock left behind" || ok "launch lock released"
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo 999999 > "$ISSUE_WAVE_STATE/locks/q/pid"
 expect "a lock left by a dead holder is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj"
+"$FW" attach testbox q --interval 1 >/dev/null
+mkdir -p "$ISSUE_WAVE_STATE/locks/q"
+expect "a fresh ownerless lock (registration in progress) still refuses" 1 "another launch or unstick of this name is in progress" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace
+touch -t 202001010000 "$ISSUE_WAVE_STATE/locks/q"
+expect "an old ownerless lock (shell died before the pid write) is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace
 "$FW" attach testbox q --interval 1 >/dev/null
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo $$ > "$ISSUE_WAVE_STATE/locks/q/pid"; echo "bogus start" > "$ISSUE_WAVE_STATE/locks/q/start"
 expect "a lock whose pid is live but whose start time differs (pid reuse) is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace

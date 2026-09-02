@@ -144,6 +144,11 @@ take_lock() {
     if [ -n "$holder" ] && { ! kill -0 "$holder" 2>/dev/null || [ "$(proc_start "$holder")" != "$hstart" ]; }; then
       rm -f "$lock/pid" "$lock/start"; rmdir "$lock" 2>/dev/null; continue   # dead or reused pid: reclaim
     fi
+    # No owner recorded: registration takes milliseconds, so an ownerless lock older than 30 s
+    # was left by a shell that died between mkdir and the pid write. Reclaim it.
+    if [ -z "$holder" ] && [ $(( $(now) - $(mtime "$lock") )) -gt 30 ]; then
+      rm -f "$lock/pid" "$lock/start"; rmdir "$lock" 2>/dev/null; continue
+    fi
     [ "$waited" -lt "$wait" ] || { echo "$label: lock $lock held ${holder:+by pid $holder }for ${wait}s -- another operation in progress"; return 1; }
     sleep 1; waited=$((waited + 1))
   done
@@ -312,9 +317,10 @@ git -C "$repo" fetch -q origin 2>/dev/null || note "fetch failed (offline?)"
 # still classified by its directory rather than falling through as "outside the served tree".
 served=0; other=""
 while IFS= read -r -d '' entry; do
-  st=${entry:0:2}; path=${entry:3}
-  case "$st" in R*|C*) IFS= read -r -d '' _from ;; esac   # a rename's second record is the source
-  case "$path" in ClaudeDesktop/*) served=$((served + 1)) ;; *) other="$other$path " ;; esac
+  st=${entry:0:2}; path=${entry:3}; from=""
+  case "$st" in R*|C*) IFS= read -r -d '' from ;; esac   # a rename's second record is the source
+  # Both sides of a rename count: a file moved OUT of the served tree is a served file gone.
+  case "$path" in ClaudeDesktop/*) served=$((served + 1)) ;; *) case "$from" in ClaudeDesktop/*) served=$((served + 1)) ;; *) other="$other$path " ;; esac ;; esac
 done < <(git -C "$repo" status --porcelain -z 2>/dev/null)
 [ "$served" -eq 0 ] || note "$served local change(s) under ClaudeDesktop/ (the served tree)"
 branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
