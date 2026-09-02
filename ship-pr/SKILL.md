@@ -443,13 +443,22 @@ rounds ran against a base that had gone 136 commits stale, `master` had meanwhil
 file the PR changed, and every signal on the merge path was clean: green checks (on the stale
 head), an approval (of the stale diff), `mergeable=true` (semantic drift produces no textual
 conflict). What caught it was a hand-run `git diff origin/master..HEAD --stat` whose 258 files were
-visibly not the two-file branch — note the two dots, which is what makes the base's own changes
-show up; `...` would have looked innocent.
+visibly not the two-file branch. That two-dot endpoint diff is an eyeball tool, not a test: it
+includes the PR's own edits, so every nonempty PR looks drifted by it. The question — did the
+base's advance touch this PR's files — is answered by anchoring at the branch point:
 
-When the drift visibly touches the files this PR changes, rebase (or merge the base in, where the
-branch is shared), push, and let the checks re-run first; otherwise a clean merge on a green head
-is the policy, not a corner cut. A count the compare API could not answer prints `UNKNOWN`, which
-is not "not behind": check it by hand.
+```bash
+git diff --stat $(git merge-base origin/master HEAD) origin/master -- $(git diff --name-only origin/master...HEAD)
+```
+
+Empty output means the base never touched those paths (substitute the remote that actually points
+at the base repo; its name is local).
+
+When the base's advance touches the files this PR changes, rebase (or merge the base in, where the
+branch is shared), push, and let the checks re-run first — any commit that moves the head waits
+for its own green run, conflicts or not; otherwise a clean merge on a green head is the policy,
+not a corner cut. A count the compare API could not answer prints `UNKNOWN`, which is not "not
+behind": check it by hand.
 
 **Standalone use does not watch CI at all** (since 2026-08-31): trailing failures on merged
 master belong to the **"ocannl-staging CI-red triage" cloud routine** — fired by `ci.yml`'s own
