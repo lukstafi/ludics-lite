@@ -82,6 +82,7 @@ cat > "$TMP/bin/codex" <<'EOF'
 #!/usr/bin/env bash
 [ "$1" = login ] && exit 0
 [ "$1" = exec ] && shift
+case " $* " in *" -C / "*) case " $* " in *" --skip-git-repo-check "*) ;; *) echo "Not inside a trusted directory and --skip-git-repo-check was not specified." >&2; exit 1 ;; esac ;; esac
 if [ -n "${SHIM_CODEX_DOWN:-}" ]; then printf '{"type":"thread.started","thread_id":"x"}\n{"type":"turn.failed","error":{"message":"401 Unauthorized"}}\n'; exit 1; fi
 tid=""; out=""
 if [ "${1:-}" = resume ]; then shift; tid="$1"; shift; fi
@@ -112,6 +113,10 @@ git -C "$repo" remote add origin "$origin" && git -C "$repo" push -q -u origin m
 export FLEET_SKILLS_REPO="$repo"
 
 echo "--- coordinator lease"
+expect "no identity at all is refused, not guessed" 2 "no coordinator identity" -- env -u FLEET_COORDINATOR "$FW" claim
+mkdir "$ISSUE_WAVE_STATE/COORDINATOR.lock" 2>/dev/null || { mkdir -p "$ISSUE_WAVE_STATE"; mkdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"; }
+expect "a first claim also waits on the lease lock and fails after the bound" 1 "CLAIM FAILED: lease lock" -- env FLEET_LOCK_WAIT=1 "$FW" claim
+rmdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
 expect "coordinator: nobody yet, exit 3" 3 "nobody holds the lease" -- "$FW" coordinator
 expect "claim takes the lease" 0 "CLAIMED coordinator lease on testbox" -- "$FW" claim
 expect "claim again is idempotent for the holder" 0 "CLAIMED already held" -- "$FW" claim
@@ -139,7 +144,7 @@ env FLEET_COORDINATOR=race-b "$FW" coordinator 2>&1 | grep -q "COORDINATOR: you"
 [ "$holders" -eq 1 ] && ok "concurrent takeovers leave exactly one holder" || ko "concurrent takeovers: $holders holders -- $(cat "$TMP/race-a.out" "$TMP/race-b.out")"
 [ -d "$ISSUE_WAVE_STATE/COORDINATOR.lock" ] && ko "takeover lock left behind" || ok "takeover lock released"
 mkdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
-expect "a held takeover lock makes --take fail after the bounded wait" 1 "CLAIM FAILED: takeover lock" -- env FLEET_LOCK_WAIT=1 "$FW" claim --take
+expect "a held lease lock makes --take fail after the bounded wait" 1 "CLAIM FAILED: lease lock" -- env FLEET_LOCK_WAIT=1 "$FW" claim --take
 expect "release under a held lease lock fails after the bounded wait, not silently" 1 "RELEASE FAILED: lease lock" -- env FLEET_LOCK_WAIT=1 "$FW" release
 rmdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
 "$FW" claim --take >/dev/null
@@ -154,6 +159,7 @@ expect "release drops it" 0 "RELEASED coordinator lease" -- "$FW" release
 expect "coordinator after release: nobody" 3 "nobody holds" -- "$FW" coordinator
 mkdir -p "$ISSUE_WAVE_STATE/COORDINATOR"
 expect "claim --take that cannot write the lease fails, not CLAIMED" 1 "CLAIM FAILED: could not write" -- "$FW" claim --take
+expect "a plain claim over an unwritable lease path fails too" 1 "CLAIM FAILED: could not write" -- "$FW" claim
 rmdir "$ISSUE_WAVE_STATE/COORDINATOR"
 
 echo "--- preflight"

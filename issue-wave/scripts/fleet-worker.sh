@@ -55,8 +55,8 @@
 #       3 worker vanished without an exit record | 4 the box never answered.
 #
 # Env: FLEET_COORDINATOR (this coordinator's identity for the lease; defaults to the Claude Code
-# session id the shell inherits - set it explicitly when not running under Claude Code, since the
-# last-resort fallback is the owning process id), FLEET_LOCAL_BOX (mac-studio), FLEET_ANCHOR
+# session id the shell inherits, and is REQUIRED when not running under Claude Code - nothing is
+# guessed from the process tree), FLEET_LOCAL_BOX (mac-studio), FLEET_ANCHOR
 # (mac-studio; where lease and halt live),
 # FLEET_ANCHOR_STATE (the anchor's state dir, default the same as ISSUE_WAVE_STATE), FLEET_BOXES
 # (the whole fleet, "mac-studio rog-nv-wsl minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/self-improve), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
@@ -175,21 +175,22 @@ unreachable() { [ "$1" -eq 255 ]; }
 valid_name() { case "$1" in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 
 # The coordinator's identity is per SESSION, not per box: FLEET_COORDINATOR if set, else the
-# Claude Code session id the shell inherits, else the owning process. Its token lives under that
-# identity, so a second coordinator session on the same box has no token and cannot pass the
-# gate, and a restarted coordinator (new session id) must adopt explicitly with claim --take.
+# Claude Code session id the shell inherits. Nothing is guessed from the process tree - a
+# parent pid is shared by sibling tabs and changes under command substitution, so a guessed
+# identity is either not unique or not stable. Its token lives under that identity, so a second
+# coordinator session on the same box has no token and cannot pass the gate, and a restarted
+# coordinator (new session id) must adopt explicitly with claim --take.
 coordinator_id() {
   if [ -n "${FLEET_COORDINATOR:-}" ]; then printf '%s' "$FLEET_COORDINATOR"
   elif [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then printf 'session-%s' "$CLAUDE_CODE_SESSION_ID"
-  elif [ -n "${CLAUDE_PID:-}" ]; then printf '%s-pid-%s' "$(hostname -s)" "$CLAUDE_PID"
-  else printf '%s-pid-%s' "$(hostname -s)" "$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')"
   fi
 }
 # Validated at top level (a die inside $(...) would only end the substitution): the identity
 # is used verbatim as the token file name, so it must be injective - no folding of characters.
 check_identity() {
   local id; id=$(coordinator_id)
-  case "$id" in ''|.|..|*[!A-Za-z0-9._-]*) die "coordinator identity '$id' must be [A-Za-z0-9._-]+ (set FLEET_COORDINATOR)" ;; esac
+  [ -n "$id" ] || die "no coordinator identity: not under Claude Code (no CLAUDE_CODE_SESSION_ID) -- set FLEET_COORDINATOR=<name> for this coordinator session"
+  case "$id" in .|..|*[!A-Za-z0-9._-]*) die "coordinator identity '$id' must be [A-Za-z0-9._-]+ (set FLEET_COORDINATOR)" ;; esac
 }
 token_file() { printf '%s/tokens/%s' "$(local_path "$STATE")" "$(coordinator_id)"; }
 my_token() { cat "$(token_file)" 2>/dev/null; }
@@ -285,7 +286,7 @@ if [ "$codex" = 1 ]; then
   codex login status >/dev/null 2>&1 || note "codex not logged in"
   # A status read is not a proof either way; only a live headless turn is.
   if [ "$probe" = 1 ] && command -v codex >/dev/null 2>&1; then
-    out=$(cd / && printf 'Reply with the single word ok.' | codex exec --json --ephemeral -C / - 2>&1)
+    out=$(cd / && printf 'Reply with the single word ok.' | codex exec --json --ephemeral --skip-git-repo-check -C / - 2>&1)
     if ! printf '%s' "$out" | grep -q '"type":"turn.completed"'; then
       note "codex cannot run headless: $(printf '%s' "$out" | grep -o '"message":"[^"]*"' | head -n1 | cut -c1-120)"
     fi
@@ -771,25 +772,26 @@ cmd_claim() {
 host="$1" token="$2" take="$3" lockwait="$4"
 mkdir -p "$ANCHOR_STATE"; lease="$ANCHOR_STATE/COORDINATOR"
 record() { printf 'host=%s\ntoken=%s\nsince=%s\n' "$host" "$token" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
-if ( set -o noclobber; record > "$lease" ) 2>/dev/null; then
-  echo "CLAIMED coordinator lease on $BOX for $host"; exit 0
+# Every lease mutation - first claim, idempotent re-claim, takeover - runs under one lock, so
+# a claim cannot slip between a release and a queued takeover and leave two believers.
+lock="$lease.lock"; waited=0
+until mkdir "$lock" 2>/dev/null; do
+  [ -d "$lock" ] || { echo "CLAIM FAILED: cannot create the lease lock $lock on $BOX (anchor state unwritable?)"; exit 1; }
+  [ "$waited" -lt "$lockwait" ] || { echo "CLAIM FAILED: lease lock $lock held for ${lockwait}s on $BOX -- another claim or adoption in progress, or a stale lock to remove by hand"; exit 1; }
+  sleep 1; waited=$((waited + 1))
+done
+trap 'rmdir "$lock" 2>/dev/null' EXIT
+verified() { [ "$(sed -n 's/^token=//p' "$lease" 2>/dev/null)" = "$token" ]; }
+if [ ! -f "$lease" ]; then
+  if ( set -o noclobber; record > "$lease" ) 2>/dev/null && verified; then echo "CLAIMED coordinator lease on $BOX for $host"; exit 0; fi
+  echo "CLAIM FAILED: could not write the lease at $lease on $BOX (a directory in its place, or unwritable)"; exit 1
 fi
 held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease"); since=$(sed -n 's/^since=//p' "$lease")
 if [ "$held" = "$token" ]; then echo "CLAIMED already held by $host since $since"; exit 0; fi
 if [ "$take" = 1 ]; then
-  # Takeovers serialize under a mkdir lock (atomic on every filesystem here), so two adopters
-  # cannot both write and each verify its own token before the other's write lands.
-  lock="$lease.lock"; waited=0
-  until mkdir "$lock" 2>/dev/null; do
-    [ -d "$lock" ] || { echo "CLAIM FAILED: cannot create the lease lock $lock on $BOX (anchor state unwritable?) -- not adopted"; exit 1; }
-    [ "$waited" -lt "$lockwait" ] || { echo "CLAIM FAILED: takeover lock $lock held for ${lockwait}s on $BOX -- another adoption in progress, or a stale lock to remove by hand"; exit 1; }
-    sleep 1; waited=$((waited + 1))
-  done
-  held=$(sed -n 's/^token=//p' "$lease" 2>/dev/null); hhost=$(sed -n 's/^host=//p' "$lease" 2>/dev/null); since=$(sed -n 's/^since=//p' "$lease" 2>/dev/null)
-  if record > "$lease" 2>/dev/null && [ "$(sed -n 's/^token=//p' "$lease" 2>/dev/null)" = "$token" ]; then
-    rmdir "$lock"; echo "CLAIMED (adopted) coordinator lease on $BOX for $host -- was ${hhost:-nobody} since ${since:-never}"; exit 0
+  if record > "$lease" 2>/dev/null && verified; then
+    echo "CLAIMED (adopted) coordinator lease on $BOX for $host -- was ${hhost:-nobody} since ${since:-never}"; exit 0
   fi
-  rmdir "$lock"
   echo "CLAIM FAILED: could not write the lease at $lease on $BOX (a directory in its place, or unwritable) -- not adopted"; exit 1
 fi
 echo "CLAIM REFUSED: coordinator lease held by $hhost since $since -- a wave is in flight; adopt with --take only if that coordinator is gone"
