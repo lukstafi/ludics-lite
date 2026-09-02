@@ -3394,7 +3394,8 @@ usage() {
 usage: test-post-merge-cleanup.sh [-j N] [-v] [test_name ...]
 
 With no arguments every case runs. Each argument names one case exactly, as the
-test function is spelled in this file; --list prints the available names.
+test function is spelled in this file; --list prints the available names. An
+unknown name, or one given twice, is refused before any case runs.
 
 Cases are independent, so they run concurrently, N at a time (-j N, --jobs=N,
 or SHIP_PR_TEST_JOBS; default: the number of online processors). Each case's
@@ -3449,6 +3450,14 @@ while [ "$#" -gt 0 ]; do
       echo "run with --list to see the ${#TESTS[@]} available names" >&2
       exit 1
     }
+    # Each case owns the scratch subtree, log, and status file named after it, so a name
+    # selected twice would run two copies of the case on one tree.
+    for selected_test in ${SELECTED[@]+"${SELECTED[@]}"}; do
+      [ "$selected_test" != "$1" ] || {
+        echo "FAIL: test name given more than once: $1" >&2
+        exit 1
+      }
+    done
     NAMED=1
     SELECTED+=("$1")
     SELECTED_COUNT=$((SELECTED_COUNT + 1))
@@ -3469,11 +3478,14 @@ if [ -z "$JOBS" ]; then
   esac
 fi
 case "$JOBS" in
-'' | *[!0-9]* | 0)
+'' | *[!0-9]*) JOBS_VALUE=-1 ;;
+*) JOBS_VALUE=$((10#$JOBS)) ;; # decimal, so 00 is zero and 08 is eight
+esac
+[ "$JOBS_VALUE" -ge 1 ] || {
   echo "FAIL: the job count (-j / SHIP_PR_TEST_JOBS) must be a positive integer, got '$JOBS'" >&2
   exit 1
-  ;;
-esac
+}
+JOBS="$JOBS_VALUE"
 [ "$JOBS" -le "$SELECTED_COUNT" ] || JOBS="$SELECTED_COUNT"
 
 # Every case builds its scratch repositories under $TEST_ROOT and reads nothing outside them, so
@@ -3481,6 +3493,12 @@ esac
 # reports its exit status through a file: a zombie still answers `kill -0`, and bash 3.2 has no
 # `wait -n`, so the status file is what the parent polls for. Nothing here relies on the parent's
 # EXIT trap (which background subshells do not inherit); the root is removed once, at the end.
+#
+# Job control puts each case in its own process group, so the whole tree a case spawned — the
+# helper, its git children, a hook paused in a sleep loop — can be terminated as a unit: on an
+# interrupt, and after every case, before its scratch tree is removed from under it. Without it
+# a killed case leaves descendants waiting on markers in a directory that no longer exists.
+set -m
 LOG_DIR="$TEST_ROOT/.logs"
 mkdir -p "$LOG_DIR"
 RUNNING_PIDS=()
@@ -3512,6 +3530,7 @@ report_case() {
   pid="${RUNNING_PIDS[$i]}"
   log="$LOG_DIR/$name.log"
   wait "$pid" >/dev/null 2>&1 || true
+  kill -TERM -- "-$pid" >/dev/null 2>&1 || true # anything the case left behind in its group
   status=$(cat "$LOG_DIR/$name.status" 2>/dev/null) || status=""
   case "$status" in
   '' | *[!0-9]*) status=1 ;;
@@ -3554,7 +3573,7 @@ on_signal() {
   local pid
   trap - INT TERM
   for pid in ${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}; do
-    kill -TERM "$pid" >/dev/null 2>&1 || true
+    kill -TERM -- "-$pid" >/dev/null 2>&1 || true # the case's whole process group
   done
   # Reap them here so bash does not narrate each termination while the EXIT trap removes the root.
   for pid in ${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}; do
