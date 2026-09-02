@@ -745,14 +745,19 @@ d="$WORKERS/$name"; staged="$STATE/incoming/$name-$stamp.md"
 # Same critical section as launch: liveness checks through tmux creation, one at a time.
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
 msg=$(take_lock "$wlock" 0 "lock") || { rm -f "$staged"; echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress ($msg)"; exit 1; }
-started=0; blaunch=""
+started=0; blaunch=""; backed=0
 on_exit() {
-  # Interrupted after the record was changed but before tmux started: put exit and meta back
-  # (unless the session exists after all - the session is the truth).
-  if [ "$started" != 1 ] && ! alive "$name"; then
-    [ -e "$d/exit.prev" ] && mv -f "$d/exit.prev" "$d/exit" 2>/dev/null
-    [ -e "$d/meta.prev" ] && mv -f "$d/meta.prev" "$d/meta" 2>/dev/null
-    rm -f "$staged"
+  # Only backups THIS invocation made are ever restored, and only when the session does not
+  # exist (the session is the truth); when it does, the backups are stale and are removed
+  # so no later refusal can restore them over a completed turn.
+  if [ "$backed" = 1 ]; then
+    if [ "$started" != 1 ] && ! alive "$name"; then
+      [ -e "$d/exit.prev" ] && mv -f "$d/exit.prev" "$d/exit" 2>/dev/null
+      [ -e "$d/meta.prev" ] && mv -f "$d/meta.prev" "$d/meta" 2>/dev/null
+      rm -f "$staged"
+    else
+      rm -f "$d/exit.prev" "$d/meta.prev"
+    fi
   fi
   release_lock "$wlock"; [ -n "$blaunch" ] && release_lock "$blaunch"
 }
@@ -813,7 +818,9 @@ fi
 } > "$d/run.sh" 2>/dev/null && [ -s "$d/run.sh" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot write $d/run.sh (a directory in its place, or unwritable)"; exit 1; }
 n=$(meta_get "$d" resumes); n=$(( ${n:-0} + 1 ))
 # meta is set aside with exit below and restored together with it if tmux refuses.
+rm -f "$d/exit.prev" "$d/meta.prev"   # leftovers from an interrupted earlier run are not ours to restore
 cp -p "$d/meta" "$d/meta.prev" 2>/dev/null || { echo "UNSTICK REFUSED $BOX/$name: cannot back up $d/meta"; exit 1; }
+backed=1
 # The verdict of THIS turn must come from events appended after this point, never from the
 # previous turn's terminal event: record where the new turn's output starts.
 off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
