@@ -1,53 +1,92 @@
-# Claude Code skills
+# ludics-lite
 
-The authoritative copy of my personal (user-level) Claude Code skills. Each machine symlinks
-`~/.claude/skills/<name>` here, so a skill edited mid-session lands in this working tree and shows
-up as a normal `git status` — there is no separate sync step to forget.
+A small collection of Claude Code skills for landing work through review and running
+delegation waves over an issue backlog across a fleet of machines. They are the lightweight,
+skill-only companion to [ludics](https://github.com/lukstafi/ludics): no binary, no daemon,
+just Markdown and shell that Claude Code loads from `~/.claude/skills`.
 
-Only the skills live here. The rest of `~/.claude` (sessions, cache, credentials, `settings.json`)
-stays out of version control: it is machine-local and partly sensitive.
+| Skill | What it does |
+| --- | --- |
+| `ship-pr` | Land finished work: decide between a direct push and a PR, then carry the PR through automated review to merge, with a watcher that survives reviewer delays. |
+| `wait-and-proceed` | Block a task behind another branch or PR until it lands, then continue. |
+| `after-merge` | Right after a merge, brainstorm what the experience suggests about the codebase and route each idea to an issue, a task chip, or the bin. |
+| `issue-wave` | Run one coordinator over the whole fleet: pick issues from a sequencing plan, launch one worker per issue in its own worktree on a chosen box, and supervise the wave to full merge. |
 
-## Setting up a machine
+The skills were extracted from a private repository with their full history, so commit
+messages and comments reference that repository's issue numbers (`self-improve#N`). Those
+issues are not public; the references are kept as provenance.
+
+## Installing
+
+Clone the repository and symlink each skill into `~/.claude/skills`. Symlinks rather than copies
+mean a skill edited mid-session lands in this working tree and shows up as a normal `git status`,
+so there is no separate sync step to forget.
 
 ```sh
-git clone git@github.com:lukstafi/self-improve.git ~/self-improve   # if not already cloned
-for s in "$HOME"/self-improve/ClaudeDesktop/skills/*/; do
+git clone https://github.com/lukstafi/ludics-lite.git ~/ludics-lite
+for s in "$HOME"/ludics-lite/*/; do
+  case "$s" in */.git/) continue ;; esac
   ln -sfn "${s%/}" "$HOME/.claude/skills/$(basename "$s")"
 done
 ```
 
 Rerun the loop after adding a skill. Replace any pre-existing real directory in
-`~/.claude/skills/` by hand first — diff it against this copy, since a divergent local edit may be
-a fix worth keeping.
+`~/.claude/skills/` by hand first, and diff it against this copy, since a divergent local edit
+may be a fix worth keeping.
 
-On a machine that runs Codex workers (see issue-wave's Codex workers section), also link the
-skills Codex uses into `~/.codex/skills` — same tree, same no-sync-step property. The issue-wave
-coordinator's per-launch preflight (`issue-wave/scripts/fleet-worker.sh preflight <box> --codex`)
-refuses to launch a Codex worker on a box where these links are missing, so run the loop once per
-box before its first Codex wave:
+On a machine that runs Codex workers (see the Codex workers section of `issue-wave/SKILL.md`),
+also link the skills Codex uses into `~/.codex/skills`. The issue-wave coordinator's per-launch
+preflight (`issue-wave/scripts/fleet-worker.sh preflight <box> --codex`) refuses to launch a
+Codex worker on a box where these links are missing:
 
 ```sh
 mkdir -p "$HOME/.codex/skills"
 for s in ship-pr wait-and-proceed after-merge; do
-  ln -sfn "$HOME/self-improve/ClaudeDesktop/skills/$s" "$HOME/.codex/skills/$s"
+  ln -sfn "$HOME/ludics-lite/$s" "$HOME/.codex/skills/$s"
 done
 ```
 
-## Fleet boxes
+## Fleet configuration
 
-Waves run with one coordinator for the whole fleet (issue-wave skill, self-improve#12): workers
-are launched onto rog-nv-wsl / minix-amd-wsl over ssh by `issue-wave/scripts/fleet-worker.sh`,
-whose `preflight` fast-forwards that box's `~/self-improve` to upstream main before every launch
-and refuses on a dirty or diverged checkout. That pull-side step is what propagates merged skill
-edits to boxes that slept through the merge; the push-side fast-forward after a merge is
-best-effort tidying. A headless worker also needs the box's CLI logged in — `claude auth login`
-there for Claude workers (an expired OAuth session cannot refresh headless, and `claude auth
-status` does not notice), `codex login` for Codex ones; the preflight proves both with a live
-call, not a status read.
+`issue-wave` assumes a fleet of boxes reachable over ssh, with one anchor box that holds the
+lease and halt files. Every site-specific value is an environment variable read by
+`issue-wave/scripts/fleet-worker.sh`; the header comment of that script is the authoritative
+list. The ones you will need to set for your own fleet:
 
-## Why not copies
+| Variable | Meaning |
+| --- | --- |
+| `FLEET_BOXES` | Space-separated fleet box names. |
+| `FLEET_ANCHOR` | The box where the lease and halt files live. |
+| `FLEET_LOCAL_BOX` | This box's fleet name, if hostname detection does not recognise it. |
+| `FLEET_SKILLS_REPO` | Path of this checkout on each box (the preflight fast-forwards it). |
+| `FLEET_FLOTILLA` | URL of the flotilla status service, if you run one. |
+| `ISSUE_WAVE_STATE` | Local state directory for waves. |
+
+The defaults encode the author's fleet and will not work anywhere else. `issue-wave/SKILL.md`
+also names a daily sequencing plan file; point the coordinator at your own.
+
+Before every launch the preflight fast-forwards the target box's checkout of this repository to
+upstream main and refuses on a dirty or diverged checkout. That pull-side step is what
+propagates merged skill edits to boxes that slept through the merge. A headless worker also
+needs the box's CLI logged in: `claude auth login` for Claude workers (an expired OAuth session
+cannot refresh headless, and `claude auth status` does not notice) and `codex login` for Codex
+ones. The preflight proves both with a live call, not a status read.
+
+## Tests
+
+The shell scripts carry their own test suites:
+
+```sh
+issue-wave/scripts/test-fleet-worker.sh
+ship-pr/scripts/test-post-merge-cleanup.sh
+```
+
+## Why symlinks, not copies
 
 Copies drift silently, and did: the `ship-pr` watcher was independently repaired on a second
-machine against a base that had already grown a better fix, so the repair both duplicated work and
-sat on top of a copy missing later improvements (`resolve` pagination, watermark preservation
-across a failed API round). Symlinks make one tree the only tree.
+machine against a base that had already grown a better fix, so the repair both duplicated work
+and sat on top of a copy missing later improvements. Symlinks make one tree the only tree.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
