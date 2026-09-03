@@ -264,6 +264,11 @@ expect "launch creates the worktree and reports the session" 0 "LAUNCHED testbox
 [ -d "$proj-worktrees/w1" ] && [ "$(git -C "$proj-worktrees/w1" rev-parse --abbrev-ref HEAD)" = claude/w1 ] && ok "worktree on the requested branch" || ko "worktree missing or wrong branch"
 grep -q -- "--model opus" "$ISSUE_WAVE_STATE/workers/w1/run.sh" && ok "extra CLI args reach the command line" || ko "extra args lost"
 expect "attach returns the verdict" 0 "DONE testbox/w1 exit=0 success is_error=false" -- "$FW" attach testbox w1 --interval 1
+git -C "$proj" branch -q -f alt-base master && echo b > "$proj/b" && git -C "$proj" add b && git -C "$proj" commit -q -m b && git -C "$proj" push -q origin master alt-base
+expect "FLEET_BASE_REF sets the worktree's start point when --base is not given" 0 "LAUNCHED testbox/wb " -- \
+  env FLEET_BASE_REF=origin/alt-base "$FW" launch testbox wb --kind claude --brief "$brief" --repo "$proj" --branch claude/wb
+[ "$(git -C "$proj-worktrees/wb" rev-parse HEAD)" = "$(git -C "$proj" rev-parse origin/alt-base)" ] && ok "worktree started from FLEET_BASE_REF" || ko "worktree did not start from FLEET_BASE_REF"
+"$FW" attach testbox wb --interval 1 >/dev/null
 [ "$(cat "$ISSUE_WAVE_STATE/workers/w1/brief.md")" = "$(cat "$brief")" ] && ok "brief crossed byte-for-byte" || ko "brief mangled"
 expect "status after exit names head and branch" 0 "EXITED(0) testbox/w1 kind=claude .*branch=claude/w1" -- "$FW" status testbox w1
 expect "log prints the assistant text" 0 "did: Fix issue #1" -- "$FW" log testbox w1
@@ -498,6 +503,9 @@ expect "status validates the name" 2 "status: name must be" -- "$FW" status test
 expect "without FLEET_LOCAL_BOX an unrecognized host is local only to 'local'" 0 "EXITED(0) local/w1" -- env -u FLEET_LOCAL_BOX "$FW" status local w1
 out=$(env -u FLEET_LOCAL_BOX "$FW" status testbox w1 2>&1); rc=$?
 [ "$rc" -eq 4 ] && printf '%s' "$out" | grep -q "UNREACHABLE testbox" && ok "...and a named box that is not this host goes over ssh (unreachable here)" || ko "named box without local mapping: rc=$rc $out"
+me=$(hostname -s | tr 'A-Z' 'a-z')
+expect "FLEET_HOSTNAME_MAP maps this host to a fleet name (glob, first match wins)" 0 "EXITED(0) testbox/w1" -- env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=other ${me%?}*=testbox *=wrong" "$FW" status testbox w1
+expect "...and a map that does not match leaves the host unnamed" 4 "UNREACHABLE testbox" -- env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=testbox" "$FW" status testbox w1
 expect "attach rejects a zero interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval 0
 expect "attach rejects a non-numeric interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval fast
 expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --kind claude --brief "$TMP/none.md" --cwd "$proj"

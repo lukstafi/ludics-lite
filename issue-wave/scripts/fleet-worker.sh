@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The fleet half of the issue-wave skill: one coordinator launches workers onto any box in the
 # fleet and supervises them there, with the same commands whether the box is the coordinator's
-# own machine or a remote one reached over ssh (self-improve#12).
+# own machine or a remote one reached over ssh (ludics-lite#4).
 #
 # A worker is a detached tmux session on its box running one headless CLI turn --
 # `claude -p --output-format stream-json` or `codex exec --json` -- with its brief on stdin and
@@ -18,7 +18,7 @@
 #   - supervision reads are the same commands on every box, so "the JSONL stream is quiet AND the
 #     worktree is unmoved" (the stall test for workers with no yield signal) does not assume the
 #     coordinator can read the worker's disk directly;
-#   - the skill-freshness preflight (self-improve#11) runs on the box that will run the worker,
+#   - the skill-freshness preflight (ludics-lite#3) runs on the box that will run the worker,
 #     because that box's ~/.claude/skills symlinks serve whatever its checkout holds;
 #   - `unstick` refuses to resume a session whose exec is still alive: a resume beside a live exec
 #     gives the branch two writers, and the quiet stream that prompted the unstick does not prove
@@ -49,7 +49,8 @@
 # Lease and halt live on FLEET_ANCHOR.
 #
 # <box> is an ssh destination (rog-nv-wsl, minix-amd-wsl), or `local` / this machine's own fleet
-# name (detected from the hostname; FLEET_LOCAL_BOX overrides) for the coordinator's own machine.
+# name (detected from the hostname through FLEET_HOSTNAME_MAP; FLEET_LOCAL_BOX overrides) for the
+# coordinator's own machine.
 #
 # Exit: 0 ok | 1 the fact does not hold (refused, worker failed, stale) | 2 usage |
 #       3 worker vanished without an exit record | 4 the box never answered.
@@ -57,7 +58,10 @@
 # Env: FLEET_COORDINATOR (this coordinator's identity for the lease; defaults to the Claude Code
 # session id the shell inherits, and is REQUIRED when not running under Claude Code - nothing is
 # guessed from the process tree), FLEET_LOCAL_BOX (this box's fleet name; detected from the
-# hostname), FLEET_ANCHOR
+# hostname), FLEET_HOSTNAME_MAP (how that detection reads: space-separated `<glob>=<box>` pairs
+# matched against the lowercased short hostname, first match wins; the default is the author's
+# fleet), FLEET_BASE_REF (the ref `launch` starts a worktree from when --base is not given;
+# origin/master), FLEET_ANCHOR
 # (mac-studio; where lease and halt live),
 # FLEET_ANCHOR_STATE (the anchor's state dir, default the same as ISSUE_WAVE_STATE), FLEET_BOXES
 # (the whole fleet, "mac-studio rog-nv-wsl minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/ludics-lite), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
@@ -70,15 +74,21 @@ set -uo pipefail
 
 # Which fleet box this is, from the hostname unless FLEET_LOCAL_BOX says so; an unrecognized
 # host is local to nothing but the literal `local`, so every named box is reached over ssh.
+# FLEET_HOSTNAME_MAP is the lookup: `<glob>=<box>` pairs, first match wins, patterns are shell
+# globs against the lowercased short hostname (so `*mac-studio*` and `rog-nv*` read as expected).
+HOSTNAME_MAP="${FLEET_HOSTNAME_MAP:-*mac-studio*=mac-studio rog-nv*=rog-nv-wsl rog=rog-nv-wsl minix*=minix-amd-wsl}"
 detect_local_box() {
-  case "$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')" in
-    *mac-studio*) echo mac-studio ;;
-    rog-nv*|rog) echo rog-nv-wsl ;;
-    minix*) echo minix-amd-wsl ;;
-    *) echo "" ;;
-  esac
+  local host pair
+  host=$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')
+  for pair in $HOSTNAME_MAP; do
+    case "$pair" in *=*) ;; *) continue ;; esac
+    # shellcheck disable=SC2254  # the glob is the point
+    case "$host" in ${pair%%=*}) echo "${pair#*=}"; return ;; esac
+  done
+  echo ""
 }
 LOCAL_BOX="${FLEET_LOCAL_BOX-$(detect_local_box)}"
+BASE_REF="${FLEET_BASE_REF:-origin/master}"
 ANCHOR="${FLEET_ANCHOR:-mac-studio}"
 BOXES="${FLEET_BOXES:-mac-studio rog-nv-wsl minix-amd-wsl}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"
@@ -293,7 +303,7 @@ anchor_gate() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Far-side skill-freshness preflight (self-improve#11). Args: codex probe. Exit 0 with a
+# Far-side skill-freshness preflight (ludics-lite#3). Args: codex probe. Exit 0 with a
 # PREFLIGHT OK line, 1 with the refusal. `launch` runs it on the box before every worker, so
 # the per-launch refusal the skill promises is enforced here rather than remembered.
 preflight_script() {
@@ -413,7 +423,7 @@ cmd_launch() {
   [ -n "$box" ] && [ -n "$name" ] || die "launch: <box> <name> required"
   valid_name "$name" || die "launch: name must be [A-Za-z0-9._-]+ and not start with a dot"
   shift 2
-  local kind="" brief="" cwd="" repo="" branch="" base="origin/master" force=0 replace=0
+  local kind="" brief="" cwd="" repo="" branch="" base="$BASE_REF" force=0 replace=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --kind) kind="${2:-}"; shift ;;
