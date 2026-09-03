@@ -166,22 +166,28 @@ was told about. Other harnesses may expose a different PR surface or no event fe
 review events do start mid-loop and carry the comment bodies and ids inline, take them as they
 come and stop polling for what they delivered.
 
-Never end a turn with a PR in flight and nothing watching it: arm the watch as a background command
-before yielding, so the next round wakes you instead of waiting for the user to notice it. `watch`
-*is* the polling loop — don't hand-roll a sleep loop around `poll`, which is what a long review
-otherwise turns into. It returns the moment a round lands (printing exactly what `poll` would), the
-approval arrives, or it can tell that no review is coming; exits 1 having stayed quiet; and ends on a
-watermark either way:
+Never end a turn with a PR in flight and no wake-capable observer. A running background command and
+a mechanism that resumes the agent when it finishes are separate capabilities: use both, and let
+the harness determine how. If background completion wakes the task, arm the watch and yield. In
+Codex, keep the turn active and poll the returned command session until it exits; for a wait too
+long to hold open, use a thread heartbeat or automation that rechecks the PR instead of relying on
+terminal completion. Do not send a final response while an otherwise unobserved shell session is
+the only thing watching the PR.
+
+`watch` *is* the polling loop — don't hand-roll a sleep loop around `poll`, which is what a long
+review otherwise turns into. It returns the moment a round lands (printing exactly what `poll`
+would), the approval arrives, or it can tell that no review is coming; exits 1 having stayed quiet;
+and ends on a watermark either way:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/pr-review.sh watch <owner>/<repo>#<pr> [watermark]  # background it
 ~/.claude/skills/ship-pr/scripts/pr-review.sh poll <owner>/<repo>#<pr> [watermark]   # one shot
 ```
 
-Run `watch` through the Bash tool's **background** mode and act on its completion notification: its
-default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it) outlasts the foreground timeout
-ceiling. Spell the repo out, as above — this is the backgrounded call that cwd inference cannot
-serve.
+Run `watch` through the harness's long-running command surface and consume its exit status and
+output through that surface. Its default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune
+it) outlasts many foreground timeout ceilings. Spell the repo out, as above — a deferred call may
+not retain the checkout from which repo inference would otherwise work.
 
 **Never pipe a gate command** — `watch`, `poll`, `checks`, `base`, `merge` — through `tail`, `head`
 or anything else: the pipeline reports the LAST command's status, so the script's exit code (2 for
