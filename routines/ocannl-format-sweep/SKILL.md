@@ -11,11 +11,17 @@ Working directory: /Users/lukstafi/ocannl-staging (the main checkout — not a w
 2. Interpret the outcome from the script's output:
    - A gate stopped the sweep before it touched anything, and the next scheduled run can simply try again: "not a quiet
      period" (open PRs or active worktrees), "not on master", "working tree not clean", "local commits not on origin/master",
-     "not the main checkout", "a tools/test-run.sh run is active in this checkout", "a tools/test-run.sh run held its lock past
-     the bound", or "another format-sweep is running". This is the designed no-op. End with a one-line report. One caveat:
-     "another format-sweep is running" also covers a stale lock left by a hard kill, which is not self-healing — if the
-     previous scheduled run reported that same message, say so and name the $LOCKDIR path the output carries as something a
-     person has to clear.
+     "a tools/test-run.sh run is active in this checkout", "a tools/test-run.sh run held its lock past the bound", or "another
+     format-sweep is running". This is the designed no-op. End with a one-line report. But a no-op only stays benign while it
+     CLEARS: each of these describes someone else holding the checkout, and if the previous scheduled run reported the same
+     message, nobody is letting go and the sweep is silently disabled rather than politely waiting. Say so in the report when
+     that happens — a repeat is worth a person's attention even though a single occurrence is not.
+     Two of these have a specific remedy to name on a repeat. "another format-sweep is running" also covers a stale lock left
+     by a hard kill; the $LOCKDIR path in the output is what a person clears, but only after confirming no live sweep still
+     owns it (a hung sweep and a stale lock produce the same message, and removing the directory under a live one lets a
+     second invocation rewrite the same checkout underneath it — so the check is for the process first, the directory second).
+     "a tools/test-run.sh run is active" / "held its lock past the bound" is an flock the kernel drops when its holder dies, so
+     a repeat means a genuinely long-running or hung test run to look at, never a lock file to delete.
    - "repository already formatted; nothing to do": end with a one-line report.
    - "pushed <sha>": the sweep landed. Report the SHA in one line.
    - "origin/master moved during the sweep; dropped the sweep" or "quiet period ended during the sweep; dropped the sweep": a
@@ -27,9 +33,13 @@ Working directory: /Users/lukstafi/ocannl-staging (the main checkout — not a w
      WITH the git error the output carries, and say whether the previous scheduled run reported the same step failing; a
      repeat is an operational break to raise, not a race to wait out.
    - "master diverged from origin/master; resolve that first", "working tree changed during the entry gates; resolve that
-     first", "working tree changed while waiting for the test-run lock; resolve that first", "ocamlformat is not installed" or
-     "ocamlformat <version> does not match the .ocamlformat pin": these need a person, and until someone acts every future
-     sweep dies at the same gate. Do NOT clear them yourself — do not reset, clean or stash the main checkout (the
+     first", "working tree changed while waiting for the test-run lock; resolve that first", "not the main checkout (master is
+     checked out in a linked worktree)", "ocamlformat is not installed" or "ocamlformat <version> does not match the
+     .ocamlformat pin": these need a person, and until someone acts every future sweep dies at the same gate — not even on the
+     first occurrence is waiting the right move. "not the main checkout" is the least obvious of them: the gate compares the
+     checkout's git-dir against its git-common-dir, so it fires on the directory the task is REGISTERED to run in, which is
+     fixed configuration the next run reuses unchanged; report it as the task pointing at a linked worktree instead of
+     /Users/lukstafi/ocannl-staging. Do NOT clear them yourself — do not reset, clean or stash the main checkout (the
      changed-tree messages exist precisely to preserve someone's unrelated in-progress work), do not resolve the divergence,
      and do not run the opam install the ocamlformat messages name. Report in one line which gate stopped it and what the fix
      is, and raise it as an operational break rather than waiting for it to clear on its own.
