@@ -23,13 +23,15 @@ fail() {
 
 usage() {
   cat >&2 <<'EOF'
-usage: post-merge-cleanup.sh <main-checkout> <session-worktree> <branch>
-       post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> \
-         --force-integrated "why this squash/rebase merge is confirmed"
+usage: post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> [options]
 
-The ordinary path requires the topic branch to be an ancestor of origin/master. Use
---force-integrated only after independently confirming a squash or rebase merge; its non-empty
-reason is printed in the cleanup record.
+Options:
+  --base <branch>       Base branch to refresh and verify (default: master)
+  --force-integrated    Followed by why this squash/rebase merge is confirmed
+
+The ordinary path requires the topic branch to be an ancestor of origin/<base>. Use
+--force-integrated only after independently confirming a squash or rebase merge; its
+non-empty reason is printed in the cleanup record.
 EOF
   exit 2
 }
@@ -247,19 +249,19 @@ refuse_hidden_index_changes() {
 reserve_master_owner_handoff() {
   local head_path head_dir index_path index_dir raw
   head_path=$(git -C "$ORIGINAL_MASTER_OWNER" rev-parse --git-path HEAD) ||
-    fail "could not locate the master owner's HEAD"
+    fail "could not locate the $BASE_BRANCH owner's HEAD"
   case "$head_path" in
   /*) ;;
   *) head_path="$ORIGINAL_MASTER_OWNER/$head_path" ;;
   esac
   head_dir=$(canonical_dir "$(dirname "$head_path")") || exit $?
   head_path="$head_dir/$(basename "$head_path")"
-  [ ! -L "$head_path" ] || fail "master owner's HEAD is symbolic on disk"
+  [ ! -L "$head_path" ] || fail "$BASE_BRANCH owner's HEAD is symbolic on disk"
   MASTER_HEAD_LOCK="$head_path.lock"
   (set -o noclobber; printf '%s\n' "$$" >"$MASTER_HEAD_LOCK") 2>/dev/null || return 1
   MASTER_HEAD_LOCK_OWNED=1
   raw=$(sed -n '1p' "$head_path") || return 1
-  [ "$raw" = "ref: refs/heads/master" ] || return 1
+  [ "$raw" = "ref: $BASE_LOCAL_REF" ] || return 1
 
   index_path=$(git -C "$ORIGINAL_MASTER_OWNER" rev-parse --git-path index) || return 1
   case "$index_path" in
@@ -324,15 +326,15 @@ discard_master_refresh_admin() {
   if rmdir "$MASTER_REFRESH_GIT_DIR" >/dev/null 2>&1; then
     MASTER_REFRESH_GIT_DIR=""
   else
-    echo "post-merge-cleanup.sh: retained temporary master refresh metadata at $MASTER_REFRESH_GIT_DIR" >&2
+    echo "post-merge-cleanup.sh: retained temporary $BASE_BRANCH refresh metadata at $MASTER_REFRESH_GIT_DIR" >&2
   fi
 }
 
 install_master_owner_refresh() {
   atomic_rename "$MASTER_OWNER_INDEX_LOCK" "$MASTER_OWNER_INDEX_PATH" ||
-    fail "could not install the refreshed master-owner index"
+    fail "could not install the refreshed $BASE_BRANCH-owner index"
   MASTER_OWNER_INDEX_LOCK_OWNED=0
-  unlink "$MASTER_HEAD_LOCK" || fail "could not release the master-owner HEAD lock"
+  unlink "$MASTER_HEAD_LOCK" || fail "could not release the $BASE_BRANCH-owner HEAD lock"
   MASTER_HEAD_LOCK_OWNED=0
   discard_master_refresh_admin
 }
@@ -342,7 +344,7 @@ relock_master_owner_head() {
   (set -o noclobber; printf '%s\n' "$$" >"$MASTER_HEAD_LOCK") 2>/dev/null || return 1
   MASTER_HEAD_LOCK_OWNED=1
   raw=$(sed -n '1p' "${MASTER_HEAD_LOCK%.lock}") || return 1
-  [ "$raw" = "ref: refs/heads/master" ]
+  [ "$raw" = "ref: $BASE_LOCAL_REF" ]
 }
 
 lock_session_head_for_archive() {
@@ -999,19 +1001,32 @@ TEMP_ROOT=$(canonical_dir "${TMPDIR:-/tmp}") || exit $?
 BRANCH="$3"
 shift 3
 
+BASE_BRANCH="master"
 FORCE_REASON=""
-case "$#" in
-0) ;;
-2)
-  [ "$1" = "--force-integrated" ] || usage
-  FORCE_REASON="$2"
-  [ -n "$FORCE_REASON" ] || usage
-  ;;
-*) usage ;;
-esac
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  --base)
+    [ "$#" -ge 2 ] || usage
+    BASE_BRANCH="$2"
+    [ -n "$BASE_BRANCH" ] || usage
+    shift 2
+    ;;
+  --force-integrated)
+    [ "$#" -ge 2 ] || usage
+    FORCE_REASON="$2"
+    [ -n "$FORCE_REASON" ] || usage
+    shift 2
+    ;;
+  *) usage ;;
+  esac
+done
 
-[ "$BRANCH" != master ] || fail "refusing to clean up the base branch master"
+git check-ref-format "refs/heads/$BASE_BRANCH" >/dev/null 2>&1 ||
+  fail "invalid base branch name: $BASE_BRANCH"
+[ "$BRANCH" != "$BASE_BRANCH" ] || fail "refusing to clean up the base branch $BASE_BRANCH"
 git check-ref-format "refs/heads/$BRANCH" >/dev/null 2>&1 || fail "invalid branch name: $BRANCH"
+BASE_LOCAL_REF="refs/heads/$BASE_BRANCH"
+BASE_REMOTE_REF="refs/remotes/origin/$BASE_BRANCH"
 
 git -C "$MAIN" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   fail "main checkout is not a git worktree: $MAIN"
@@ -1089,7 +1104,7 @@ SESSION_HEAD_LOCK="$SESSION_HEAD_DIR/$(basename "$SESSION_HEAD_PATH").lock"
 
 # Keep a child ref present until the final session recovery ref exists. With the files ref backend,
 # this reserves every prefix directory against a conflicting direct ref; an existing conflict makes
-# this expected-absent update fail before master or topic mutation.
+# this expected-absent update fail before base or topic mutation.
 SESSION_NAMESPACE_RESERVATION="refs/ship-pr/session-recovery/$BRANCH/reservation-$$"
 git -C "$MAIN" update-ref --no-deref "$SESSION_NAMESPACE_RESERVATION" \
   "$LOCAL_BRANCH_OID" "" || fail "session recovery ref namespace is unavailable"
@@ -1111,8 +1126,8 @@ git -C "$MAIN" worktree lock --reason "ship-pr cleanup in progress" "$SESSION" |
   fail "could not lock the session worktree registration against pruning"
 SESSION_WORKTREE_LOCK_OWNED=1
 
-# symref-update provides the compare-and-swap used by the master ownership handoff. Probe it before
-# master or topic mutation so older Git versions refuse cleanly rather than failing mid-cleanup.
+# symref-update provides the compare-and-swap used by the base ownership handoff. Probe it before
+# base or topic mutation so older Git versions refuse cleanly rather than failing mid-cleanup.
 CAPABILITY_REF="refs/ship-pr/capability-probe-$$"
 git -C "$MAIN" show-ref --exists "$CAPABILITY_REF" >/dev/null 2>&1
 CAPABILITY_REF_STATUS=$?
@@ -1121,10 +1136,11 @@ case "$CAPABILITY_REF_STATUS" in
 2) ;;
 *) fail "could not inspect the temporary capability ref: $CAPABILITY_REF" ;;
 esac
-git -C "$MAIN" symbolic-ref "$CAPABILITY_REF" refs/heads/master ||
+git -C "$MAIN" symbolic-ref "$CAPABILITY_REF" "$BASE_LOCAL_REF" ||
   fail "could not create the symref capability probe"
 CAPABILITY_REF_OWNED=1
-if ! printf 'option no-deref\nsymref-update %s refs/heads/master ref refs/heads/master\n' "$CAPABILITY_REF" |
+if ! printf 'option no-deref\nsymref-update %s %s ref %s\n' \
+  "$CAPABILITY_REF" "$BASE_LOCAL_REF" "$BASE_LOCAL_REF" |
   git -C "$MAIN" update-ref --stdin >/dev/null 2>&1; then
   if git -C "$MAIN" symbolic-ref --delete "$CAPABILITY_REF" >/dev/null 2>&1; then
     CAPABILITY_REF_OWNED=0
@@ -1135,20 +1151,20 @@ git -C "$MAIN" symbolic-ref --delete "$CAPABILITY_REF" ||
   fail "could not remove the symref capability probe"
 CAPABILITY_REF_OWNED=0
 
-# Fetch before the safety decision: local master may be stale, while origin/master is the state
+# Fetch before the safety decision: the local base may be stale, while origin/<base> is the state
 # whose PR merge was independently confirmed. This also makes the later owner-specific update a
 # local fast-forward rather than a second network-dependent decision point.
-if git -C "$MAIN" symbolic-ref -q refs/remotes/origin/master >/dev/null 2>&1; then
-  fail "origin/master is symbolic rather than a direct remote-tracking ref"
+if git -C "$MAIN" symbolic-ref -q "$BASE_REMOTE_REF" >/dev/null 2>&1; then
+  fail "origin/$BASE_BRANCH is symbolic rather than a direct remote-tracking ref"
 fi
 git -C "$MAIN" fetch --no-tags origin \
-  "+refs/heads/master:refs/remotes/origin/master" || fail "could not fetch origin/master explicitly"
-git -C "$MAIN" show-ref --verify --quiet refs/remotes/origin/master ||
-  fail "origin/master does not exist"
+  "+$BASE_LOCAL_REF:$BASE_REMOTE_REF" || fail "could not fetch origin/$BASE_BRANCH explicitly"
+git -C "$MAIN" show-ref --verify --quiet "$BASE_REMOTE_REF" ||
+  fail "origin/$BASE_BRANCH does not exist"
 
 if [ -z "$FORCE_REASON" ]; then
-  git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" refs/remotes/origin/master ||
-    fail "$BRANCH is not an ancestor of origin/master; independently confirm a squash/rebase merge and use --force-integrated with a reason"
+  git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" "$BASE_REMOTE_REF" ||
+    fail "$BRANCH is not an ancestor of origin/$BASE_BRANCH; independently confirm a squash/rebase merge and use --force-integrated with a reason"
 else
   echo "post-merge-cleanup.sh: FORCE-INTEGRATED override: $FORCE_REASON" >&2
 fi
@@ -1164,30 +1180,30 @@ esac
 ORIGIN_PUSH_URL="$ORIGIN_PUSH_URLS"
 ORIGIN_FETCH_URL=$(git -C "$MAIN" remote get-url origin) || fail "could not resolve origin's fetch endpoint"
 [ "$ORIGIN_FETCH_URL" = "$ORIGIN_PUSH_URL" ] ||
-  fail "origin has distinct fetch and push endpoints; cleanup requires one repository for master and topic"
+  fail "origin has distinct fetch and push endpoints; cleanup requires one repository for $BASE_BRANCH and topic"
 if git -C "$MAIN" symbolic-ref -q "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
   fail "remote-tracking branch is symbolic rather than direct: refs/remotes/origin/$BRANCH"
 fi
 
-# Prove and perform the local master fast-forward before deleting the remote recovery ref. Keep a
-# checked-out master continuously owned so Git refuses another worktree's checkout, conditionally
+# Prove and perform the local base fast-forward before deleting the remote recovery ref. Keep the
+# checked-out base continuously owned so Git refuses another worktree's checkout, conditionally
 # update the named ref, then refresh that same clean owner from the new tip.
-if git -C "$MAIN" symbolic-ref -q refs/heads/master >/dev/null 2>&1; then
-  fail "local master ref is symbolic rather than direct"
+if git -C "$MAIN" symbolic-ref -q "$BASE_LOCAL_REF" >/dev/null 2>&1; then
+  fail "local $BASE_BRANCH ref is symbolic rather than direct"
 fi
-LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot read local master"
-REMOTE_MASTER=$(git -C "$MAIN" rev-parse refs/remotes/origin/master) || fail "cannot read origin/master"
+LOCAL_MASTER=$(git -C "$MAIN" rev-parse "$BASE_LOCAL_REF") || fail "cannot read local $BASE_BRANCH"
+REMOTE_MASTER=$(git -C "$MAIN" rev-parse "$BASE_REMOTE_REF") || fail "cannot read origin/$BASE_BRANCH"
 git -C "$MAIN" merge-base --is-ancestor "$LOCAL_MASTER" "$REMOTE_MASTER" ||
-  fail "local master cannot fast-forward to origin/master"
+  fail "local $BASE_BRANCH cannot fast-forward to origin/$BASE_BRANCH"
 
-scan_branch_owner refs/heads/master
-[ "$BRANCH_OWNER_COUNT" -le 1 ] || fail "more than one worktree reports owning master"
+scan_branch_owner "$BASE_LOCAL_REF"
+[ "$BRANCH_OWNER_COUNT" -le 1 ] || fail "more than one worktree reports owning $BASE_BRANCH"
 if [ "$BRANCH_OWNER_COUNT" -eq 0 ]; then
   MASTER_RESERVATION=$(mktemp -d "$TEMP_ROOT/ship-pr-master-reserve.XXXXXX") ||
-    fail "could not allocate a temporary master reservation"
-  rmdir "$MASTER_RESERVATION" || fail "could not prepare the temporary master reservation path"
-  git -C "$MAIN" worktree add "$MASTER_RESERVATION" master >/dev/null ||
-    fail "could not reserve unchecked-out master in a temporary worktree"
+    fail "could not allocate a temporary $BASE_BRANCH reservation"
+  rmdir "$MASTER_RESERVATION" || fail "could not prepare the temporary $BASE_BRANCH reservation path"
+  git -C "$MAIN" worktree add -- "$MASTER_RESERVATION" "$BASE_BRANCH" >/dev/null ||
+    fail "could not reserve unchecked-out $BASE_BRANCH in a temporary worktree"
   MASTER_OWNER="$MASTER_RESERVATION"
   ORIGINAL_MASTER_OWNER=""
 else
@@ -1196,29 +1212,30 @@ else
 fi
 
 MASTER_OWNER_REF=$(git -C "$MASTER_OWNER" symbolic-ref -q HEAD 2>/dev/null || true)
-[ "$MASTER_OWNER_REF" = refs/heads/master ] ||
-  fail "master owner changed branches before its fast-forward: $MASTER_OWNER"
-MASTER_OWNER_HEAD=$(git -C "$MASTER_OWNER" rev-parse HEAD) || fail "cannot read master owner HEAD"
-[ "$MASTER_OWNER_HEAD" = "$LOCAL_MASTER" ] || fail "master owner's HEAD disagrees with local master"
+[ "$MASTER_OWNER_REF" = "$BASE_LOCAL_REF" ] ||
+  fail "$BASE_BRANCH owner changed branches before its fast-forward: $MASTER_OWNER"
+MASTER_OWNER_HEAD=$(git -C "$MASTER_OWNER" rev-parse HEAD) || fail "cannot read $BASE_BRANCH owner HEAD"
+[ "$MASTER_OWNER_HEAD" = "$LOCAL_MASTER" ] ||
+  fail "$BASE_BRANCH owner's HEAD disagrees with local $BASE_BRANCH"
 # Ignored files are deliberately NOT part of this cleanliness gate: on the standard layout the
-# primary checkout owns master and always carries build caches and ignored config, so requiring
+# primary checkout owns the base and always carries build caches and ignored config, so requiring
 # "no ignored data anywhere" makes the helper unusable there. Ignored data is only at risk on
 # paths the fast-forward actually touches, and those are refused by the changed-path collision
 # scan below; the locked refresh itself runs checkout --no-overwrite-ignore, which refuses loudly
 # if ignored data appears on a touched path after that scan.
 MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status \
   --porcelain --untracked-files=normal) ||
-  fail "could not inspect master owner cleanliness"
-[ -z "$MASTER_OWNER_STATUS" ] || fail "master owner is dirty; clean it before cleanup: $MASTER_OWNER"
-refuse_hidden_index_changes "$MASTER_OWNER" "master owner"
-refuse_initialized_submodules "$MASTER_OWNER" "master owner"
-refuse_index_resolve_undo "$MASTER_OWNER" "master owner"
-refuse_active_session_operations "$MASTER_OWNER" "master owner"
+  fail "could not inspect $BASE_BRANCH owner cleanliness"
+[ -z "$MASTER_OWNER_STATUS" ] || fail "$BASE_BRANCH owner is dirty; clean it before cleanup: $MASTER_OWNER"
+refuse_hidden_index_changes "$MASTER_OWNER" "$BASE_BRANCH owner"
+refuse_initialized_submodules "$MASTER_OWNER" "$BASE_BRANCH owner"
+refuse_index_resolve_undo "$MASTER_OWNER" "$BASE_BRANCH owner"
+refuse_active_session_operations "$MASTER_OWNER" "$BASE_BRANCH owner"
 IGNORED_COLLISION=""
 CHANGED_PATHS_FILE=$(mktemp "$TEMP_ROOT/ship-pr-master-paths.XXXXXX") ||
-  fail "could not allocate the master changed-path snapshot"
+  fail "could not allocate the $BASE_BRANCH changed-path snapshot"
 git -C "$MAIN" diff --name-only -z "$LOCAL_MASTER" "$REMOTE_MASTER" >"$CHANGED_PATHS_FILE" ||
-  fail "could not enumerate paths changed by the master fast-forward"
+  fail "could not enumerate paths changed by the $BASE_BRANCH fast-forward"
 while IFS= read -r -d '' CHANGED_PATH; do
   if { [ -e "$MASTER_OWNER/$CHANGED_PATH" ] || [ -L "$MASTER_OWNER/$CHANGED_PATH" ]; } &&
     git -C "$MASTER_OWNER" check-ignore -q -- "$CHANGED_PATH"; then
@@ -1237,77 +1254,78 @@ while IFS= read -r -d '' CHANGED_PATH; do
     fi
   fi
 done <"$CHANGED_PATHS_FILE"
-unlink "$CHANGED_PATHS_FILE" || fail "could not remove the master changed-path snapshot"
+unlink "$CHANGED_PATHS_FILE" || fail "could not remove the $BASE_BRANCH changed-path snapshot"
 CHANGED_PATHS_FILE=""
 [ -z "$IGNORED_COLLISION" ] ||
-  fail "master fast-forward would overwrite ignored local data: $MASTER_OWNER/$IGNORED_COLLISION"
+  fail "$BASE_BRANCH fast-forward would overwrite ignored local data: $MASTER_OWNER/$IGNORED_COLLISION"
 
 # Keep an existing owner's symbolic HEAD and real index locked across the complete named-ref and
-# worktree refresh. An initially unowned master instead remains reserved by its helper worktree.
+# worktree refresh. An initially unowned base instead remains reserved by its helper worktree.
 if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
   reserve_master_owner_handoff ||
-    fail "master owner HEAD or index changed before its locked refresh: $ORIGINAL_MASTER_OWNER"
-  prepare_master_owner_refresh || fail "could not prepare the locked master-owner refresh"
+    fail "$BASE_BRANCH owner HEAD or index changed before its locked refresh: $ORIGINAL_MASTER_OWNER"
+  prepare_master_owner_refresh || fail "could not prepare the locked $BASE_BRANCH-owner refresh"
 fi
-if ! git -C "$MAIN" update-ref --no-deref refs/heads/master "$REMOTE_MASTER" "$LOCAL_MASTER"; then
+if ! git -C "$MAIN" update-ref --no-deref "$BASE_LOCAL_REF" "$REMOTE_MASTER" "$LOCAL_MASTER"; then
   if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
     relock_master_owner_head ||
-      fail "local master and its owner's HEAD both moved after preflight"
-    MASTER_DURING_REFRESH=$(git -C "$MAIN" rev-parse refs/heads/master) ||
-      fail "could not read master after its conditional update failed"
+      fail "local $BASE_BRANCH and its owner's HEAD both moved after preflight"
+    MASTER_DURING_REFRESH=$(git -C "$MAIN" rev-parse "$BASE_LOCAL_REF") ||
+      fail "could not read $BASE_BRANCH after its conditional update failed"
     refresh_master_owner_to "$MASTER_DURING_REFRESH" ||
-      fail "local master moved and its locked owner could not follow the concurrent tip"
+      fail "local $BASE_BRANCH moved and its locked owner could not follow the concurrent tip"
     MASTER_OWNER_STATUS=$(GIT_INDEX_FILE="$MASTER_OWNER_INDEX_LOCK" \
       git -C "$ORIGINAL_MASTER_OWNER" status \
         --porcelain --untracked-files=normal) ||
-      fail "could not recheck the master owner after its ref moved"
+      fail "could not recheck the $BASE_BRANCH owner after its ref moved"
     install_master_owner_refresh
     [ -z "$MASTER_OWNER_STATUS" ] ||
-      fail "local master moved and its owner gained data; the data was preserved"
+      fail "local $BASE_BRANCH moved and its owner gained data; the data was preserved"
   fi
-  fail "local master moved after its owner preflight"
+  fail "local $BASE_BRANCH moved after its owner preflight"
 fi
 if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
   if ! relock_master_owner_head; then
-    git -C "$MAIN" update-ref --no-deref refs/heads/master "$LOCAL_MASTER" "$REMOTE_MASTER" || true
-    fail "master owner changed HEAD during its locked ownership handoff"
+    git -C "$MAIN" update-ref --no-deref "$BASE_LOCAL_REF" "$LOCAL_MASTER" "$REMOTE_MASTER" || true
+    fail "$BASE_BRANCH owner changed HEAD during its locked ownership handoff"
   fi
   if ! refresh_master_owner_to "$REMOTE_MASTER"; then
-    git -C "$MAIN" update-ref --no-deref refs/heads/master "$LOCAL_MASTER" "$REMOTE_MASTER" || true
-    fail "master owner could not be refreshed while its HEAD and index were locked"
+    git -C "$MAIN" update-ref --no-deref "$BASE_LOCAL_REF" "$LOCAL_MASTER" "$REMOTE_MASTER" || true
+    fail "$BASE_BRANCH owner could not be refreshed while its HEAD and index were locked"
   fi
-  MASTER_DURING_REFRESH=$(git -C "$MAIN" rev-parse refs/heads/master) ||
-    fail "could not recheck master during its locked refresh"
+  MASTER_DURING_REFRESH=$(git -C "$MAIN" rev-parse "$BASE_LOCAL_REF") ||
+    fail "could not recheck $BASE_BRANCH during its locked refresh"
   if [ "$MASTER_DURING_REFRESH" != "$REMOTE_MASTER" ]; then
     refresh_master_owner_to "$MASTER_DURING_REFRESH" ||
-      fail "master moved during refresh and its owner could not follow the concurrent tip"
+      fail "$BASE_BRANCH moved during refresh and its owner could not follow the concurrent tip"
   fi
   # Ignored files pass here for the same reason as the preflight gate: pre-existing ignored data
   # on untouched paths is expected on the standard layout, and touched paths were either refused
   # by the collision scan or protected by the refresh's --no-overwrite-ignore.
   MASTER_OWNER_STATUS=$(GIT_INDEX_FILE="$MASTER_OWNER_INDEX_LOCK" git -C "$ORIGINAL_MASTER_OWNER" status \
     --porcelain --untracked-files=normal) ||
-    fail "could not recheck the locked master owner"
+    fail "could not recheck the locked $BASE_BRANCH owner"
   install_master_owner_refresh
   [ -z "$MASTER_OWNER_STATUS" ] ||
-    fail "master owner gained local data during its locked update; the data was preserved"
+    fail "$BASE_BRANCH owner gained local data during its locked update; the data was preserved"
   [ "$MASTER_DURING_REFRESH" = "$REMOTE_MASTER" ] ||
-    fail "master moved during its locked refresh; its owner followed the concurrent tip"
+    fail "$BASE_BRANCH moved during its locked refresh; its owner followed the concurrent tip"
 else
   git -C "$MASTER_RESERVATION" read-tree --reset -u "$REMOTE_MASTER" >/dev/null ||
-    fail "master advanced but its helper-only reservation could not be refreshed"
+    fail "$BASE_BRANCH advanced but its helper-only reservation could not be refreshed"
   git -C "$MAIN" worktree remove --force "$MASTER_RESERVATION" ||
-    fail "master advanced but its temporary reservation could not be removed"
+    fail "$BASE_BRANCH advanced but its temporary reservation could not be removed"
   MASTER_RESERVATION=""
 fi
 
-LOCAL_MASTER=$(git -C "$MAIN" rev-parse refs/heads/master) || fail "cannot reread local master"
-[ "$LOCAL_MASTER" = "$REMOTE_MASTER" ] || fail "local master did not reach origin/master"
+LOCAL_MASTER=$(git -C "$MAIN" rev-parse "$BASE_LOCAL_REF") || fail "cannot reread local $BASE_BRANCH"
+[ "$LOCAL_MASTER" = "$REMOTE_MASTER" ] ||
+  fail "local $BASE_BRANCH did not reach origin/$BASE_BRANCH"
 CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
 [ "$CURRENT_TOPIC_OID" = "$LOCAL_BRANCH_OID" ] ||
   fail "local $BRANCH moved before remote deletion; all topic artifacts were preserved"
 
-# A remote master can change immediately after any finite observation. Keep the validated topic
+# A remote base can change immediately after any finite observation. Keep the validated topic
 # reachable locally even after its public branch is deleted, so a later rollback can always be
 # recovered rather than turning this cleanup into data loss.
 RECOVERY_REF="refs/ship-pr/recovery/$BRANCH/$LOCAL_BRANCH_OID"
@@ -1369,18 +1387,18 @@ case "$REMOTE_BRANCH_STATUS" in
 esac
 
 MASTER_AFTER_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads \
-  "$ORIGIN_PUSH_URL" refs/heads/master)
+  "$ORIGIN_PUSH_URL" "$BASE_LOCAL_REF")
 MASTER_AFTER_STATUS=$?
 if [ "$MASTER_AFTER_STATUS" -ne 0 ]; then
   restore_remote_topic "$LOCAL_BRANCH_OID" ||
-    fail "remote master became unreadable after topic deletion, and the topic could not be restored"
-  fail "remote master became unreadable after topic deletion; origin/$BRANCH was restored"
+    fail "remote $BASE_BRANCH became unreadable after topic deletion, and the topic could not be restored"
+  fail "remote $BASE_BRANCH became unreadable after topic deletion; origin/$BRANCH was restored"
 fi
 MASTER_AFTER_OID=${MASTER_AFTER_LINE%%[[:space:]]*}
 if [ "$MASTER_AFTER_OID" != "$REMOTE_MASTER" ]; then
   restore_remote_topic "$LOCAL_BRANCH_OID" ||
-    fail "remote master changed to $MASTER_AFTER_OID, and the topic could not be restored"
-  fail "remote master changed from $REMOTE_MASTER to $MASTER_AFTER_OID; origin/$BRANCH was restored"
+    fail "remote $BASE_BRANCH changed to $MASTER_AFTER_OID, and the topic could not be restored"
+  fail "remote $BASE_BRANCH changed from $REMOTE_MASTER to $MASTER_AFTER_OID; origin/$BRANCH was restored"
 fi
 
 CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
@@ -1464,8 +1482,8 @@ scan_branch_owner "refs/heads/$BRANCH"
 BRANCH_OWNER=$(canonical_dir "$BRANCH_OWNER") || exit $?
 [ "$BRANCH_OWNER" = "$TOPIC_RESERVATION" ] || fail "$BRANCH was acquired by another worktree: $BRANCH_OWNER"
 if [ -z "$FORCE_REASON" ]; then
-  git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" refs/heads/master ||
-    fail "$BRANCH is not an ancestor of the updated local master"
+  git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" "$BASE_LOCAL_REF" ||
+    fail "$BRANCH is not an ancestor of the updated local $BASE_BRANCH"
 fi
 
 # Atomically move the session aside before unregistering it. `git worktree remove` recursively

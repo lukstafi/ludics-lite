@@ -549,14 +549,22 @@ the failure looking like a failed merge. Run the executable sequence instead:
 ~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh <main-checkout> <session-worktree> <branch>
 ```
 
-It fetches and proves the ordinary topic is an ancestor of `origin/master` before deleting
-anything, deletes the remote branch, advances local `master` according to which worktree owns it,
+The helper defaults to a `master` base for compatibility. Pass `--base main` (or another branch)
+when the repository uses a different base:
+
+```bash
+~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> \
+  --base main
+```
+
+It fetches and proves the ordinary topic is an ancestor of `origin/<base>` before deleting
+anything, deletes the remote branch, advances the local base according to which worktree owns it,
 detaches and unregisters the session worktree into a sibling recovery archive, rechecks ancestry
-against updated local `master`, and
+against the updated local base, and
 deletes the local branch independently of its configured upstream. Its scratch-repository test
-covers unchecked-out `master`, `master` owned by the primary checkout, `master` owned by another
-worktree, safe deletion while the primary checkout is off `master`, and refusal of an unmerged
-topic:
+covers an unchecked-out base, a base owned by the primary checkout, a base owned by another
+worktree, safe deletion while the primary checkout is off the base, an explicit `main` base, and
+refusal of an unmerged topic:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/test-post-merge-cleanup.sh
@@ -582,7 +590,7 @@ make the exception explicit and leave its reason in the transcript:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> \
-  --force-integrated "GitHub reports the PR squash-merged at <sha>"
+  --base main --force-integrated "GitHub reports the PR squash-merged at <sha>"
 ```
 
 The helper requires Git's transactional `update-ref` symbolic-ref commands, Perl for an atomic
@@ -591,18 +599,18 @@ local data, and one shared
 fetch/push endpoint for `origin`. It treats an already absent topic as a safe retry state and
 refuses an unreadable ref, a symbolic local/tracking ref, or a remote tip newer than the local
 branch; an absent remote topic sends no deletion, while present remote and local deletions carry
-exact-OID leases. It also fetches `master`
+exact-OID leases. It also fetches the selected base
 explicitly, independent of the remote's configured fetch map, and proves the local ref can
-fast-forward before any remote deletion. A clean worktree keeps `master` continuously reserved
+fast-forward before any remote deletion. A clean worktree keeps the base continuously reserved
 while the named ref is conditionally updated and its tree refreshed; when no worktree owns it, the
 helper creates a temporary owner for that same critical section. Remote topic deletion is leased
-on the observed topic OID and followed by fresh `master` and local-topic reads; if either changed
-or `master` became unreadable, the current topic recovery ref is restored before refusal. The
+on the observed topic OID and followed by fresh base and local-topic reads; if either changed
+or the base became unreadable, the current topic recovery ref is restored before refusal. The
 validated tip also remains reachable under a direct `refs/ship-pr/recovery/` ref because no finite
 remote read can rule out a later base rollback; a divergent remote-tracking tip is retained
-separately under `refs/ship-pr/tracking-recovery/` before pruning. The master-owner refresh uses a non-destructive porcelain
+separately under `refs/ship-pr/tracking-recovery/` before pruning. The base-owner refresh uses a non-destructive porcelain
 fast-forward through a helper-only reservation and a conditional named-ref update. A checked-out
-master owner must contain no local data, including ignored files; after the update it is prepared
+base owner must contain no local data, including ignored files; after the update it is prepared
 at the new tree and reattached with a detached-HEAD compare-and-swap before the reservation is
 removed. The helper probes that compare-and-swap capability before any branch mutation and refuses
 older Git versions cleanly. The helper also checks ignored descendants when a directory is
@@ -624,7 +632,7 @@ branch deletion; both sides of every retained reflog entry are covered. Late fil
 before unregistering is retried. Do not reconstruct its state
 machine in prose or
 replace the ancestry guard with `git branch -d`: `-d` may test a configured upstream unrelated to
-`master`, making deletion either tautological or a false refusal after the worktree is already gone.
+the base, making deletion either tautological or a false refusal after the worktree is already gone.
 
 If the harness blocks the merge itself, that is a permission gate, not a failure: explain what you
 were doing, give the command, and let the user decide. Never work around it.
