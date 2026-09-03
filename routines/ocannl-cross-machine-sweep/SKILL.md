@@ -144,8 +144,10 @@ For each of the FIVE backends (cc, multidev_cc, metal, cuda, hip) find the most 
 liveness row. Flag backends with no pass in more than 2 days. For cuda or hip, say which of the three step-1 outcomes applied: woken
   and swept; woken but `-wsl` never appeared or was gone again by the time the unit probed it
   (machine up, backend untestable — the cold-boot kicked-VM trap in step 1; a re-kick plus an
-  incremental rerun usually recovers it); or the wake itself failed. A failed wake with `link=1` points at BIOS
-  WoL having been lost or the box being unplugged from power; with `link=0`, at the cable.
+  incremental rerun usually recovers it); or the wake itself failed. A failed wake with `link=1` means the NIC was
+  powered and listening, so the magic packet was ignored: the WoL option itself (BIOS, or the
+  Windows NIC driver's wake settings) has been lost. With `link=0` the NIC is not powered while the
+  box is off: the cable, the box's power, or the BIOS setting that keeps the NIC powered in S5.
 
 ## 5. Report
 
@@ -165,8 +167,10 @@ though the run had completed.
 
 ## 6. Notify
 
-Send a PushNotification ONLY if there is (a) a new failure or timeout, (b) a staleness flag, or
-(c) a skip-coverage `FAIL`, or a FAIL/POTENTIAL claim set that differs from the previous report's.
+Send a PushNotification ONLY if there is (a) a new failure or timeout, (b) a staleness flag,
+(c) a skip-coverage `FAIL`, or a FAIL/POTENTIAL claim set that differs from the previous report's,
+or (d) an `error` outcome or a script exit of 2: nothing was tested there, which step 5 already
+calls notify-worthy, and it must not go silent for being neither a failure nor yet stale.
 A `FAIL` notifies even when unchanged — it fires at most weekly (forced runs only) and means some
 claim has zero execution coverage on every backend, which must keep reaching a human until fixed;
 an unchanged POTENTIAL set stays silent like an unchanged fingerprint.
