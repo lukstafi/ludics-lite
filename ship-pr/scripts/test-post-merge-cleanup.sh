@@ -3419,18 +3419,37 @@ unguard() {
   printf '%s\n' "$stripped" >"$file"
 }
 
-# run_copy_rewritten <copy-dir> <out-file> <rewrite-helper-too>: run the copy on SELF_CASE and
-# rewrite its script(s) in place while that case runs. Prints the copy's exit status.
+# gate_helper <copy-dir> <started-file> <go-file>: make the copy's helper announce that it has
+# started and hold, inside its brace group, until told to go. While it holds, the case that ran
+# it and the copy's runner are all mid-run, so the rewrite below lands on three live readers of
+# the two files whatever the box's speed (on a fast runner an ungated case finished in a second,
+# before a fixed delay's rewrite, and the negative control had nothing to catch; gating the case
+# instead left the helper to start fresh from the rewritten file and exit on the marker).
+gate_helper() {
+  local copy="$1" started="$2" go="$3" gated
+  gated=$(awk -v hold="touch '$started'; while [ ! -e '$go' ]; do sleep 0.1; done" \
+    'BEGIN { opened = 0 } { print; if (!opened && $0 == "{") { opened = 1; print hold } }' "$copy/post-merge-cleanup.sh")
+  printf '%s\n' "$gated" >"$copy/post-merge-cleanup.sh"
+  grep -q "^touch '$started'; while" "$copy/post-merge-cleanup.sh" || fail "could not gate the copy's helper"
+}
+
+# run_copy_rewritten <copy-dir> <out-file> <rewrite-helper-too>: run the copy on SELF_CASE,
+# rewrite its script(s) in place once the case has the gated helper running, then let the helper
+# finish. Prints the copy's exit status.
 run_copy_rewritten() {
-  local copy="$1" out="$2" helper_too="$3" pid rc
+  local copy="$1" out="$2" helper_too="$3" started="$copy.started" go="$copy.go" pid rc tries=0
+  rm -f "$started" "$go"
+  gate_helper "$copy" "$started" "$go"
   run_copy "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null &
   pid=$!
-  # The case takes several seconds, so the copy is inside its wait loop by now. An earlier
-  # rewrite would not matter: any re-read from an offset ahead of the marker lands in the padding
-  # and slides into it.
-  sleep 1.5
+  while [ ! -e "$started" ]; do
+    [ "$tries" -lt 600 ] || { kill_case_group "$pid" 2>/dev/null; fail "the copy's helper did not start within 60s: $(cat "$out")"; }
+    sleep 0.1
+    tries=$((tries + 1))
+  done
   rewrite_in_place "$copy/test-post-merge-cleanup.sh"
   [ "$helper_too" -eq 0 ] || rewrite_in_place "$copy/post-merge-cleanup.sh"
+  touch "$go"
   if wait "$pid"; then rc=0; else rc=$?; fi
   echo "$rc"
 }
@@ -3440,10 +3459,10 @@ test_runner_survives_midrun_rewrite() {
   # while it runs, so an in-place rewrite of the runner or the helper mid-run resumed the shell at
   # a shifted offset (once: skipping the final wait loop and removing the root under live cases).
   # Both scripts are one brace group parsed whole before its first command. The guarded copies
-  # are rewritten while a case runs and must still end with the ordinary summary; the negative
-  # control — the same rewrite of a copy with the group stripped — must not, which is what makes
-  # this a regression test rather than a tautology. A command appended past the guarded copy's
-  # closing brace must never run either.
+  # are rewritten while a case has the helper mid-run and must still end with the ordinary
+  # summary; the negative control — the same rewrite of a runner copy with the group stripped —
+  # must not, which is what makes this a regression test rather than a tautology. A command
+  # appended past the guarded copy's closing brace must never run either.
   local tag="rw$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" rc
   copy_runner "$copy" "$tag-guarded"
   echo 'echo SHOULD_NOT_RUN' >>"$copy/test-post-merge-cleanup.sh"
