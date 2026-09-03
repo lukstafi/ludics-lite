@@ -24,53 +24,35 @@ already-running box are a no-op, and so is the WSL kick:
 
     ~/bin/wake-lab.sh --wait --wsl rog minix
 
-It sends a FRITZ!Box TR-064 WoL plus a direct magic packet to both MACs of each box, polls for up
-to 4 minutes, then starts WSL on whichever boxes came up and waits up to 3 minutes for `tailscaled`
-inside the VM to register. Do not hand-roll the probe-then-branch logic it replaces; a partial wake
-(one box up, one dead) is handled — the live box still gets its WSL kick.
+It sends the wake-on-LAN packets (router-side and direct), polls for up to 4 minutes, then starts
+WSL on whichever boxes came up — WSL never autostarts at boot, so `--wsl` is not optional — and
+waits up to 3 minutes for `tailscaled` inside the VM to register. Do not hand-roll the
+probe-then-branch logic it replaces; a partial wake (one box up, one dead) is handled — the live
+box still gets its WSL kick.
 
-Read its last lines. `did NOT wake: <box>` is the only failure that matters here, and it is **not**
-an error: that backend simply goes uncovered today, surfacing through the staleness thresholds in
-step 4. Do not retry in a loop. `wsl still down after 3 min` on a box that woke means the machine
-is up but the backend is untestable — say so explicitly in the report, since it is a different
-finding from a box that never woke.
+Read its last lines:
+
+- `did NOT wake: <box>` is **not** an error: that backend simply goes uncovered today, surfacing
+  through the staleness thresholds in step 4. Do not send the wake command again.
+- `wsl still down after 3 min` on a box that woke means the machine is up but the backend is
+  untestable — say so explicitly in the report, since it is a different finding from a box that
+  never woke.
+- `all up` and `wsl up`: start the sweep promptly. A VM kicked on a cold-booted box does not
+  always stay up on its own; once a unit's ssh session is running inside it, it does.
 
 `~/bin/wake-lab.sh status` prints the per-box picture (link, `-lan`, `-win`, `-wsl`) if you need to
 say precisely what happened.
 
-Constraints below are all verified; do not spend the run rediscovering them:
+The retry budget is exactly one re-kick and one rerun. If the sweep records cuda or hip as
+`skip (unreachable)` while `status` shows that box `win=UP`, the VM was up and vanished: run
+`~/bin/wake-lab.sh kick-wsl rog minix` once, then rerun the sweep once — reruns are incremental
+and cheap. If the unit still skips, report it as "woken but `-wsl` gone" (step 4 names this
+outcome) and do not kick or rerun again.
 
-- **WoL works over Ethernet only, never over Wi-Fi** — a magic packet cannot reach the Wi-Fi NIC of
-  a powered-off machine. rog and minix are both cabled (rog Ethernet `.30`, minix Ethernet `.31`;
-  minix's old `.27` Wi-Fi lease is inactive). asus is Wi-Fi only and cannot be woken at all.
-- **Both boxes wake from a full shutdown (S5), not just from sleep** — verified 2026-08-15 on both,
-  after enabling a `Wake Up` item on minix's BIOS second setup screen. So "powered off" is a normal
-  starting state for this routine, not a reason to expect failure.
-- A box holding Ethernet link while powered off (`status` → `link=1`) is the WoL-armed state, and
-  is what makes the wake possible. `link=0` on a box that will not wake points at that BIOS setting
-  having been lost.
-- WSL **never** autostarts at boot, so a box coming up from power-down always needs the kick —
-  which is why `--wsl` is not optional above. (A box resuming from sleep/hibernate with the user's
-  GUI WSL shell still open — his normal cycle — keeps its VM across the resume, verified on minix
-  2026-09-01: same boot id, `-wsl` answering seconds after the wake with no kick; the kick is then
-  a harmless no-op.)
-- **A kicked VM on a cold-booted box does not necessarily STAY up**: on 2026-09-01, twice in a
-  row, `--wait --wsl` reported both `-wsl` UP yet both VMs were gone ~4 minutes later (`status`:
-  `win=UP`, `wsl=--`) and the sweep recorded cuda/hip `skip (unreachable)`. So run the sweep
-  promptly after the wake, and if it still records those skips while `status` shows `win=UP`,
-  re-kick (`wake-lab.sh kick-wsl rog minix`) and immediately re-run the sweep — reruns are
-  incremental and cheap, and once a unit's ssh session is running inside the VM it stays up.
-- WSL needs no interactive Windows login: the ssh network logon is session enough (verified with
-  the console logged off). A `console` entry in `query session` after a cold boot comes from
-  Windows' Automatic Restart Sign-On, not from a human having logged in.
-- Both boxes run Tailscale in unattended mode (`ForceDaemon`), so they authenticate after a cold
-  wake with nobody logged in. If a box comes up without its Tailscale node appearing, reach it over
-  the LAN aliases `rog-lan` / `minix-lan` — these depend on nothing but the box being booted, and
-  answer within seconds of a wake while Tailscale lags a minute or more. They need the box's
-  Windows Firewall profile to be Private, currently true of both.
-- When probing over ssh by hand, the command must be `exit 0`, **not** `true`: the `-win` and
-  `-lan` aliases land in cmd.exe, which has no `true`, so every Windows box would read as down.
-  (`true` is fine on the `-wsl` aliases, which are Linux.)
+Everything else about these boxes — WoL over Ethernet only, waking from a full shutdown, what
+`link=1` means, the cold-boot kicked-VM trap, Tailscale unattended mode, the `exit 0` vs `true`
+probe trap — is verified and recorded in the header comment of `~/bin/wake-lab.sh`; do not spend
+the run rediscovering it.
 
 Do not power the boxes back down afterwards — the user may want them for the day's work, and the
 next sweep can always wake them again.
