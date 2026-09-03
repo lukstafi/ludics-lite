@@ -12,6 +12,10 @@ just Markdown and shell loaded by compatible agent harnesses from their skill di
 | `after-merge` | Right after a merge, brainstorm what the experience suggests about the codebase and route each idea to an issue, a task chip, or the bin. |
 | `issue-wave` | Run one coordinator over the whole fleet: pick issues from a sequencing plan, launch one worker per issue in its own worktree on a chosen box, and supervise the wave to full merge. |
 
+The `routines/` directory holds the prompts of the scheduled runs that feed these skills: the
+daily sequencing plan `issue-wave` reads, the OCANNL test and formatting sweeps, and the CI-red
+triage cloud routine. See [routines/README.md](routines/README.md).
+
 The skills were extracted from a private repository with their full history. Its issues were
 cloned here and the references in the skills renumbered to `ludics-lite#N`; the few remaining
 `self-improve#N` references, and the ones in older commit messages, are that repository's pull
@@ -27,14 +31,15 @@ so there is no separate sync step to forget.
 git clone https://github.com/lukstafi/ludics-lite.git ~/ludics-lite
 mkdir -p "$HOME/.claude/skills"
 for s in "$HOME"/ludics-lite/*/; do
-  case "$s" in */.git/) continue ;; esac
+  case "$s" in */.git/|*/routines/) continue ;; esac
   ln -sfn "${s%/}" "$HOME/.claude/skills/$(basename "$s")"
 done
 ```
 
-Rerun the loop after adding a skill. Replace any pre-existing real directory in
-`~/.claude/skills/` by hand first, and diff it against this copy, since a divergent local edit
-may be a fix worth keeping.
+The loop skips `routines/`, whose contents are scheduled-task prompts rather than skills; they
+are linked separately, see the Routines section. Rerun the loop after adding a skill. Replace
+any pre-existing real directory in `~/.claude/skills/` by hand first, and diff it against this
+copy, since a divergent local edit may be a fix worth keeping.
 
 These loops are executed, not just quoted: the fleet launcher's test suite extracts them from
 this README, runs them against a scratch clone of the checkout, and preflights the result, so a
@@ -96,6 +101,16 @@ propagates merged skill edits to boxes that slept through the merge. A headless 
 needs the box's CLI logged in: `claude auth login` for Claude workers (an expired OAuth session
 cannot refresh headless, and `claude auth status` does not notice) and `codex login` for Codex
 ones. The preflight proves both with a live call, not a status read.
+
+## Routines
+
+`routines/` carries the scheduled-task prompts the same way the skill directories carry skills,
+and three of the four install the same way: each task directory under `~/.claude/scheduled-tasks`
+replaced by a symlink into this checkout, so an edit made during a run lands here. The desktop
+app's registry (cron, working directory, model) is not in the repository and is recorded in
+[routines/README.md](routines/README.md), which also carries the install loop with its guard
+against linking into a real directory. The fourth, the CI-red triage routine `ship-pr` defers
+master's trailing failures to, runs in the cloud and is synced by hand.
 
 ## Tests
 
