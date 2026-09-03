@@ -590,7 +590,7 @@ make the exception explicit and leave its reason in the transcript:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> \
-  --base main --force-integrated "GitHub reports the PR squash-merged at <sha>"
+  --force-integrated "GitHub reports the PR squash-merged at <sha>"
 ```
 
 The helper requires Git's transactional `update-ref` symbolic-ref commands, Perl for an atomic
