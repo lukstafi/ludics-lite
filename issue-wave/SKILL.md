@@ -34,7 +34,8 @@ author's fleet (the header of `scripts/fleet-worker.sh` is the authoritative lis
 | Where this skills checkout lives on each box | `FLEET_SKILLS_REPO` |
 | The ref a worker's worktree starts from (`origin/master` here; `origin/main` elsewhere) | `FLEET_BASE_REF`, or `--base` per launch |
 | The flotilla status and wake service, if any | `FLEET_FLOTILLA` |
-| Local state directory | `ISSUE_WAVE_STATE` |
+| Local state directory for each coordinator | `ISSUE_WAVE_STATE` |
+| State directory on the anchor for the lease and fleet-wide halt | `FLEET_ANCHOR_STATE`; every coordinator must resolve it to the same directory on the anchor |
 
 The rest is prose in this file and is edited in place: the **sequencing plan** path and the
 task that maintains it (Inputs, just below), the **fleet roster** with its hardware and the

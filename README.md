@@ -63,7 +63,8 @@ list. The ones you will need to set for your own fleet:
 | `FLEET_BASE_REF` | The ref a worker's worktree starts from when a launch names no `--base` (`origin/master` by default). |
 | `FLEET_SKILLS_REPO` | Path of this checkout on each box, `~/ludics-lite` by default (the preflight fast-forwards it). |
 | `FLEET_FLOTILLA` | URL of the flotilla status service, if you run one. |
-| `ISSUE_WAVE_STATE` | Local state directory for waves. |
+| `ISSUE_WAVE_STATE` | Local state directory for each coordinator. |
+| `FLEET_ANCHOR_STATE` | State directory on the anchor for the lease and fleet-wide halt; every coordinator must resolve it to the same directory there. |
 
 The defaults encode the author's fleet and will not work anywhere else. The prose of
 `issue-wave/SKILL.md` names that fleet too, along with a daily sequencing plan file and the

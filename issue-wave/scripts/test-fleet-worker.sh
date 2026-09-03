@@ -506,6 +506,9 @@ out=$(env -u FLEET_LOCAL_BOX "$FW" status testbox w1 2>&1); rc=$?
 me=$(hostname -s | tr 'A-Z' 'a-z')
 expect "FLEET_HOSTNAME_MAP maps this host to a fleet name (glob, first match wins)" 0 "EXITED(0) testbox/w1" -- env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=other ${me%?}*=testbox *=wrong" "$FW" status testbox w1
 expect "...and a map that does not match leaves the host unnamed" 4 "UNREACHABLE testbox" -- env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=testbox" "$FW" status testbox w1
+mkdir "$TMP/glob-cwd"; touch "$TMP/glob-cwd/cache=testbox"
+expect "hostname-map tokens do not expand as filenames in the launcher's cwd" 0 "EXITED(0) testbox/w1" -- \
+  bash -c 'cd "$1" && exec env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="*=testbox" "$2" status testbox w1' _ "$TMP/glob-cwd" "$FW"
 expect "attach rejects a zero interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval 0
 expect "attach rejects a non-numeric interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval fast
 expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --kind claude --brief "$TMP/none.md" --cwd "$proj"

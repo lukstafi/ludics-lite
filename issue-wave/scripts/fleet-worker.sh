@@ -79,8 +79,10 @@ set -uo pipefail
 HOSTNAME_MAP="${FLEET_HOSTNAME_MAP:-*mac-studio*=mac-studio rog-nv*=rog-nv-wsl rog=rog-nv-wsl minix*=minix-amd-wsl}"
 detect_local_box() {
   local host pair
+  local -a hostname_pairs=()
   host=$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')
-  for pair in $HOSTNAME_MAP; do
+  read -r -a hostname_pairs <<< "$HOSTNAME_MAP"
+  for pair in "${hostname_pairs[@]}"; do
     case "$pair" in *=*) ;; *) continue ;; esac
     # shellcheck disable=SC2254  # the glob is the point
     case "$host" in ${pair%%=*}) echo "${pair#*=}"; return ;; esac
