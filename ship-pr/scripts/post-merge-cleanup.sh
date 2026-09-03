@@ -1021,17 +1021,19 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-git check-ref-format --branch "$BASE_BRANCH" >/dev/null 2>&1 ||
-  fail "invalid base branch name: $BASE_BRANCH"
-[ "$BRANCH" != "$BASE_BRANCH" ] || fail "refusing to clean up the base branch $BASE_BRANCH"
 git check-ref-format "refs/heads/$BRANCH" >/dev/null 2>&1 || fail "invalid branch name: $BRANCH"
-BASE_LOCAL_REF="refs/heads/$BASE_BRANCH"
-BASE_REMOTE_REF="refs/remotes/origin/$BASE_BRANCH"
 
 git -C "$MAIN" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   fail "main checkout is not a git worktree: $MAIN"
 git -C "$SESSION" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   fail "session path is not a git worktree: $SESSION"
+VALIDATED_BASE_BRANCH=$(git -C "$MAIN" check-ref-format --branch "$BASE_BRANCH" 2>/dev/null) ||
+  fail "invalid base branch name: $BASE_BRANCH"
+[ "$VALIDATED_BASE_BRANCH" = "$BASE_BRANCH" ] ||
+  fail "expanded base branch shorthand is not allowed: $BASE_BRANCH (use $VALIDATED_BASE_BRANCH)"
+[ "$BRANCH" != "$BASE_BRANCH" ] || fail "refusing to clean up the base branch $BASE_BRANCH"
+BASE_LOCAL_REF="refs/heads/$BASE_BRANCH"
+BASE_REMOTE_REF="refs/remotes/origin/$BASE_BRANCH"
 SESSION_TOPLEVEL=$(canonical_dir "$(git -C "$SESSION" rev-parse --show-toplevel)") || exit $?
 [ "$SESSION" = "$SESSION_TOPLEVEL" ] ||
   fail "session-worktree must be the worktree root ($SESSION_TOPLEVEL), not a directory inside it"

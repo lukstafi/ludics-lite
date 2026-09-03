@@ -228,6 +228,13 @@ test_main_base_support() {
     *) fail "invalid base shorthand was not diagnosed: $refusal" ;;
     esac
   done
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --base '@{-1}' 2>&1); then
+    fail "expanded base shorthand unexpectedly passed"
+  fi
+  case "$refusal" in
+  *"expanded base branch shorthand is not allowed: @{-1} (use main)"*) ;;
+  *) fail "expanded base shorthand was not diagnosed against the main checkout: $refusal" ;;
+  esac
   assert_topic_preserved
   echo "PASS: main base cleanup and unmerged refusal"
 }
