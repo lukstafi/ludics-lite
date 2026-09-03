@@ -1,9 +1,9 @@
 # ludics-lite
 
-A small collection of Claude Code skills for landing work through review and running
+A small collection of agent skills for landing work through review and running
 delegation waves over an issue backlog across a fleet of machines. They are the lightweight,
 skill-only companion to [ludics](https://github.com/lukstafi/ludics): no binary, no daemon,
-just Markdown and shell that Claude Code loads from `~/.claude/skills`.
+just Markdown and shell loaded by compatible agent harnesses from their skill directories.
 
 | Skill | What it does |
 | --- | --- |
@@ -25,6 +25,7 @@ so there is no separate sync step to forget.
 
 ```sh
 git clone https://github.com/lukstafi/ludics-lite.git ~/ludics-lite
+mkdir -p "$HOME/.claude/skills"
 for s in "$HOME"/ludics-lite/*/; do
   case "$s" in */.git/) continue ;; esac
   ln -sfn "${s%/}" "$HOME/.claude/skills/$(basename "$s")"
@@ -34,6 +35,10 @@ done
 Rerun the loop after adding a skill. Replace any pre-existing real directory in
 `~/.claude/skills/` by hand first, and diff it against this copy, since a divergent local edit
 may be a fix worth keeping.
+
+Keep these `~/.claude/skills` links even on a Codex-only box: command examples use them as the
+canonical script paths. The `~/.codex/skills` links below are additionally required for Codex to
+discover the skills.
 
 On a machine that runs Codex workers (see the Codex workers section of `issue-wave/SKILL.md`),
 also link the skills Codex uses into `~/.codex/skills`. The issue-wave coordinator's per-launch
@@ -45,6 +50,13 @@ mkdir -p "$HOME/.codex/skills"
 for s in ship-pr wait-and-proceed after-merge; do
   ln -sfn "$HOME/ludics-lite/$s" "$HOME/.codex/skills/$s"
 done
+```
+
+A box that runs the `issue-wave` coordinator itself under Codex needs that skill discoverable too:
+
+```sh
+mkdir -p "$HOME/.codex/skills"
+ln -sfn "$HOME/ludics-lite/issue-wave" "$HOME/.codex/skills/issue-wave"
 ```
 
 ## Fleet configuration

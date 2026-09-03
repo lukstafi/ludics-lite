@@ -69,9 +69,9 @@ finished or stranded) - `claim --take` to adopt the wave with its halt state and
 records intact. Every `launch`, `halt` and `resume-launches` proves the lease, so two
 coordinators cannot both drive; a point-in-time `ls` alone could not promise that, since two
 coordinators starting on an idle fleet would both see it empty. The lease is per coordinator
-SESSION (the shell's Claude Code session id), so a restarted coordinator adopts with `--take`
-rather than inheriting silently, and `unstick` is fenced by it too - only the holder intervenes
-in a wave's workers. `release` at close-out.
+SESSION (the session identity inherited from the harness), so a restarted coordinator adopts
+with `--take` rather than inheriting silently, and `unstick` is fenced by it too - only the holder
+intervenes in a wave's workers. `release` at close-out.
 
 ## Scope and sequencing
 
@@ -254,9 +254,9 @@ treated the same way even when its body is ours.
 Mechanics that differ from Claude workers:
 
 - **Skills**: `ship-pr`, `wait-and-proceed`, and `after-merge` are symlinked into
-  `~/.codex/skills` (from the box's `~/ludics-lite` - the preflight checks the links). Codex
-  has no `spawn_task`, which hand-back mode makes moot: wave workers of either kind propose
-  rather than file.
+  `~/.codex/skills` (from the box's `~/ludics-lite` - the preflight checks the links). Whether
+  Codex has a chip tool (`create_thread` in place of `spawn_task`) is moot under hand-back mode:
+  wave workers of either kind propose rather than file.
 - **Full lifecycle**: with the sandbox gone the worker pushes, drives `gh`, and owns its
   lifecycle through ship-pr. Deliberate choice: review rounds are addressed by the
   continuous session that wrote the code, never handed to a fresh-context finisher - the

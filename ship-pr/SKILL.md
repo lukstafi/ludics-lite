@@ -143,8 +143,8 @@ Write the body as the reviewer's map, not a changelog: what is now true that was
 tests pin, what changes for existing users, and where the risky corner is. Reviewers — human and
 automated — spend their attention where the body sends it.
 
-Report the URL on its own line, wrapped so the Desktop client renders a live status card (the tag
-is inert everywhere else):
+Report the URL on its own line, wrapped as below. The Claude Desktop client renders a live status
+card from the tag; other harnesses ignore it:
 
 ```
 <pr-created>https://github.com/owner/repo/pull/123</pr-created>
@@ -156,28 +156,33 @@ multi-PR arc that comment is what makes the phases legible later.
 
 ## Monitor
 
-Poll for the review yourself: nothing arms on its own. The `<pr-created>` tag gets the Desktop
-client to render a PR card, but the review-event feed behind that card starts only when the user
-clicks its "Auto-fix CI & address comments" — verified on a PR opened with the tag and no other
-setup, which drew a review nobody was told about. If those events do start mid-loop they carry the
-comment bodies and ids inline; take them as they come and stop polling for what they delivered.
+Poll for the review yourself: nothing arms on its own. In the Claude Desktop client, the
+`<pr-created>` tag renders a PR card, but the review-event feed behind that card starts only when
+the user clicks its "Auto-fix CI & address comments" — verified on a PR opened with the tag and no
+other setup, which drew a review nobody was told about. If review events do start mid-loop and
+carry the comment bodies and ids inline, take them as they come and stop polling for what they
+delivered.
 
-Never end a turn with a PR in flight and nothing watching it: arm the watch as a background command
-before yielding, so the next round wakes you instead of waiting for the user to notice it. `watch`
-*is* the polling loop — don't hand-roll a sleep loop around `poll`, which is what a long review
-otherwise turns into. It returns the moment a round lands (printing exactly what `poll` would), the
-approval arrives, or it can tell that no review is coming; exits 1 having stayed quiet; and ends on a
-watermark either way:
+Never end a turn with a PR in flight and nothing that will wake you. Under Claude Code, run `watch`
+with Bash `run_in_background: true` and yield; the completion notification is the wake. Under Codex
+a finished background command does not resume the agent: keep the turn open and poll the command
+session until `watch` exits, or, for a wait too long to hold open, schedule a heartbeat that
+re-runs both `status` and watermark-aware `poll` (or a bounded `watch`). A backgrounded shell
+nobody is polling is not an observer.
+
+`watch` *is* the polling loop — don't hand-roll a sleep loop around `poll`, which is what a long
+review otherwise turns into. It returns the moment a round lands (printing exactly what `poll`
+would), the approval arrives, or it can tell that no review is coming; exits 1 having stayed quiet;
+and ends on a watermark either way:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/pr-review.sh watch <owner>/<repo>#<pr> [watermark]  # background it
 ~/.claude/skills/ship-pr/scripts/pr-review.sh poll <owner>/<repo>#<pr> [watermark]   # one shot
 ```
 
-Run `watch` through the Bash tool's **background** mode and act on its completion notification: its
-default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it) outlasts the foreground timeout
-ceiling. Spell the repo out, as above — this is the backgrounded call that cwd inference cannot
-serve.
+Its default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it) outlasts a foreground
+tool's timeout, which is why it is backgrounded. Spell the repo out, as above: a background shell
+does not reliably start in the checkout.
 
 **Never pipe a gate command** — `watch`, `poll`, `checks`, `base`, `merge` — through `tail`, `head`
 or anything else: the pipeline reports the LAST command's status, so the script's exit code (2 for

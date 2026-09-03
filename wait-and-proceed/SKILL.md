@@ -32,9 +32,11 @@ depend on code your dependency is about to change.
 ~/.claude/skills/wait-and-proceed/scripts/wait-for.sh branch <branch> --label "<what this unblocks>"
 ```
 
-**Run it with Bash `run_in_background: true`.** Its completion notification is your wake signal —
-one notification, no polling, no turns burned while it waits. Run in the foreground and it will
-hit the 600s tool cap long before the merge happens.
+Under Claude Code, run it with Bash `run_in_background: true` and yield; the completion
+notification is the wake. Under Codex a finished background command does not resume the agent:
+keep the turn open and poll the command session until the waiter exits, or, for a wait too long to
+hold open, schedule a heartbeat that re-runs the same waiter with `--timeout 0`, making each tick a
+one-shot branch or predicate check.
 
 A branch is the right thing to name whether or not a PR exists yet: the script watches the PR when
 there is one and git when there is not, so you can arm it before the other session has opened

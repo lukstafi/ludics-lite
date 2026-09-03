@@ -39,9 +39,11 @@ Sort each idea into exactly one, and say which:
   silently wrong for overlapping windows" beats "gradient issues"). Body: what the work ran into,
   why it is worth fixing, and what a fix would touch.
 - **Chip it** — small, immediately actionable, no open design question. Spawn a background task
-  with a self-contained prompt (file paths and enough context to act without this conversation).
-  If your harness has no task-chip tool (`spawn_task`), do not improvise a substitute: surface
-  the item in your report as a **chip candidate**, prompt included.
+  with a self-contained prompt (file paths and enough context to act without this conversation)
+  through the harness's task tool, such as `spawn_task` under Claude Code or `create_thread` in
+  Codex Desktop, not an in-session subagent, which is neither persistent nor user-visible. If the
+  harness has no such tool, do not improvise a substitute: surface the item in your report as a
+  **chip candidate**, prompt included.
 - **Drop it, with the reason** — state the reason in the report so the same idea is not re-raised
   next cycle. Dropping is the common case.
 

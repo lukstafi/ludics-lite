@@ -55,20 +55,24 @@
 # Exit: 0 ok | 1 the fact does not hold (refused, worker failed, stale) | 2 usage |
 #       3 worker vanished without an exit record | 4 the box never answered.
 #
-# Env: FLEET_COORDINATOR (this coordinator's identity for the lease; defaults to the Claude Code
-# session id the shell inherits, and is REQUIRED when not running under Claude Code - nothing is
-# guessed from the process tree), FLEET_LOCAL_BOX (this box's fleet name; detected from the
-# hostname), FLEET_HOSTNAME_MAP (how that detection reads: space-separated `<glob>=<box>` pairs
-# matched against the lowercased short hostname, first match wins; the default is the author's
-# fleet), FLEET_BASE_REF (the ref `launch` starts a worktree from when --base is not given;
-# origin/master), FLEET_ANCHOR
-# (mac-studio; where lease and halt live),
-# FLEET_ANCHOR_STATE (the anchor's state dir, default the same as ISSUE_WAVE_STATE), FLEET_BOXES
-# (the whole fleet, "mac-studio rog-nv-wsl minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/ludics-lite), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
-# FLEET_TMUX_SOCKET (tmux -L name; tests isolate with it), FLEET_FLOTILLA (http://mac-studio:7799),
-# FLEET_LOCK_WAIT (seconds a lease mutation waits for a concurrent one to finish; 10),
-# FLEET_PROBE_TIMEOUT (wall-clock bound on the preflight's live headless turn; 120),
-# FLEET_FETCH_TIMEOUT (bound on the skills-checkout and project fetches; 300).
+# Env:
+#   FLEET_COORDINATOR: lease identity; defaults to inherited CLAUDE_CODE_SESSION_ID or
+#     CODEX_THREAD_ID. Required when the harness supplies neither, because nothing is guessed from
+#     the process tree.
+#   FLEET_LOCAL_BOX: this box's fleet name; otherwise detected from the hostname.
+#   FLEET_HOSTNAME_MAP: space-separated `<glob>=<box>` hostname mappings, first match wins; the
+#     default is the author's fleet.
+#   FLEET_BASE_REF: ref from which `launch` starts a worktree when --base is absent; origin/master.
+#   FLEET_ANCHOR: box where lease and halt live; mac-studio.
+#   FLEET_ANCHOR_STATE: anchor state dir; defaults to ISSUE_WAVE_STATE.
+#   FLEET_BOXES: whole fleet; "mac-studio rog-nv-wsl minix-amd-wsl". `ls` sweeps it minus local.
+#   FLEET_SKILLS_REPO: skills checkout on each box; ~/ludics-lite.
+#   ISSUE_WAVE_STATE: local worker-state directory; ~/.local/state/issue-wave.
+#   FLEET_TMUX_SOCKET: tmux -L name; tests isolate with it.
+#   FLEET_FLOTILLA: status service; http://mac-studio:7799.
+#   FLEET_LOCK_WAIT: seconds a lease mutation waits for a concurrent one; 10.
+#   FLEET_PROBE_TIMEOUT: wall-clock bound on the live headless preflight turn; 120.
+#   FLEET_FETCH_TIMEOUT: wall-clock bound on skills-checkout and project fetches; 300.
 
 set -uo pipefail
 
@@ -259,21 +263,23 @@ unreachable() { [ "$1" -eq 255 ]; }
 valid_name() { case "$1" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 
 # The coordinator's identity is per SESSION, not per box: FLEET_COORDINATOR if set, else the
-# Claude Code session id the shell inherits. Nothing is guessed from the process tree - a
-# parent pid is shared by sibling tabs and changes under command substitution, so a guessed
-# identity is either not unique or not stable. Its token lives under that identity, so a second
-# coordinator session on the same box has no token and cannot pass the gate, and a restarted
-# coordinator (new session id) must adopt explicitly with claim --take.
+# harness identity inherited as CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID. Nothing is guessed from
+# the process tree - a parent pid is shared by sibling tabs and changes under command substitution,
+# so a guessed identity is either not unique or not stable. Its token lives under that identity, so
+# a second coordinator session on the same box has no token and cannot pass the gate, and a
+# restarted coordinator (new session id) must adopt explicitly with claim --take.
 coordinator_id() {
   if [ -n "${FLEET_COORDINATOR:-}" ]; then printf '%s' "$FLEET_COORDINATOR"
   elif [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then printf 'session-%s' "$CLAUDE_CODE_SESSION_ID"
+  elif [ -n "${CODEX_THREAD_ID:-}" ]; then printf 'codex-%s' "$CODEX_THREAD_ID"
   fi
 }
 # Validated at top level (a die inside $(...) would only end the substitution): the identity
 # is used verbatim as the token file name, so it must be injective - no folding of characters.
 check_identity() {
   local id; id=$(coordinator_id)
-  [ -n "$id" ] || die "no coordinator identity: not under Claude Code (no CLAUDE_CODE_SESSION_ID) -- set FLEET_COORDINATOR=<name> for this coordinator session"
+  [ -n "$id" ] || die "no coordinator identity: harness supplied neither CLAUDE_CODE_SESSION_ID" \
+    "nor CODEX_THREAD_ID -- set FLEET_COORDINATOR=<name> for this coordinator session"
   case "$id" in .|..|*[!A-Za-z0-9._-]*) die "coordinator identity '$id' must be [A-Za-z0-9._-]+ (set FLEET_COORDINATOR)" ;; esac
 }
 token_file() { printf '%s/tokens/%s' "$(local_path "$STATE")" "$(coordinator_id)"; }
