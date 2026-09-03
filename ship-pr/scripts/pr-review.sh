@@ -71,8 +71,9 @@
 # confirms `merged` over REST afterwards, because `gh pr merge` exits 0 having merely ENABLED
 # auto-merge when the base carries required checks.
 #
-# The last thing `merge` reads before acting is how far the branch has fallen BEHIND its base,
-# because a review is only ever about the code it was run against. On 2026-08-28
+# The last thing `merge` reads before acting is how far the branch has fallen BEHIND its base and
+# whether the base's advance touched any path changed by the PR, because a review is only ever
+# about the code it was run against. On 2026-08-28
 # (ocannl-staging#488) a merge was one keystroke away over a base 136 commits stale after SIXTEEN
 # review rounds; master had meanwhile edited the very file the PR changed, and what caught it was a
 # hand-run `git diff origin/master..HEAD --stat` whose 258 files and 14k deletions were visibly not
@@ -84,7 +85,10 @@
 # head's green run, verification does not restart per sibling merge (the gate's cost was
 # structural — #533 ran three full CI cycles over an unchanged diff), and what owns semantic
 # drift after the fact is the wave coordinator's integration loop (issue-wave skill), which runs
-# the full suites on merged master and stops the world on a regression.
+# the full suites on merged master and stops the world on a regression. The overlap is exact or
+# UNKNOWN: compare responses cap their file list at 300, so a capped list is never reported as
+# "none". Both compare directions use the base and head SHAs from one PR read, and rename entries
+# contribute both their current and previous filenames.
 #
 # REST vs GraphQL: everything on the polling and merge-gate path is REST, deliberately — GitHub's
 # GraphQL endpoint 503s independently of REST, so a GraphQL-borne "no reaction yet" is a lie the
@@ -151,7 +155,8 @@
 #      SHIP_PR_BASE_ABSENT_GRACE=seconds `base --wait` allows for a run on the tip to APPEAR
 #      before settling for an older verdict (300; paths-ignore pushes never get one),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
-#      silences it — the warning never blocks the merge either way).
+#      silences the commit-count warning). A nonempty file overlap still warns at any count; no
+#      base-drift warning blocks the merge.
 
 set -uo pipefail
 
@@ -1429,8 +1434,9 @@ off) ;;
 '' | *[!0-9]*) die "SHIP_PR_STALE_BASE must be a number of commits or 'off', got '$STALE_BASE'" ;;
 esac
 
-# Prints the count, loudly when it is at or over the threshold. Returns 0 fresh enough, 1 at/over
-# the threshold, 3 unread. For one day (2026-08-29) the merge path treated 1 as a GATE; the
+# Prints the count and exact path overlap, loudly when the count is at or over the threshold or any
+# path overlaps. Returns 0 fresh enough with no overlap, 1 for either warning, 3 when the count or
+# overlap is unknown. For one day (2026-08-29) the merge path treated 1 as a GATE; the
 # ahrefs/ocannl#861 decision (2026-08-30) reverted it to a WARNING under the roll-forward policy:
 # a PR merges on one green full-matrix run for its LAST commit, a clean merge does not restart
 # verification, and only a conflict-RESOLVING commit needs green CI after it — which the checks
@@ -1442,68 +1448,131 @@ esac
 # everywhere else in this file: a compare call that never answered must not print a reassuring
 # number.
 warn_base_drift() {
-  local pr="$1" fields cmp base head sha behind ahead rc
-  [ "$STALE_BASE" = off ] && return 0
+  local pr="$1" fields base base_sha head_sha rc
+  local forward reverse behind ahead forward_base reverse_base
+  local pr_files base_files pr_file_count base_file_count overlap overlap_count
+  local count_unknown="" overlap_unknown="" overlap_reason="" count_warn=""
   # Placeholders, never empty fields: tab is IFS whitespace, so an empty middle column would shift
-  # the sha into $head (the same trap build_checks documents).
+  # a SHA into the wrong field (the same trap build_checks documents). Capture both endpoint SHAs
+  # in this one read: labels can move, and the base can advance between the two compare calls.
   fields=$(gh_retry read api "repos/$REPO/pulls/$pr" \
-    --jq '[(.base.ref // "-"), (.head.label // "-"), (.head.sha // "-")] | @tsv')
+    --jq '[(.base.ref // "-"), (.base.sha // "-"), (.head.sha // "-")] | @tsv')
   rc=$?
-  IFS=$'\t' read -r base head sha <<<"$fields"
-  if [ "$rc" -ne 0 ] || [ -z "$base" ] || [ "$base" = - ]; then
+  IFS=$'\t' read -r base base_sha head_sha <<<"$fields"
+  if [ "$rc" -ne 0 ] || [ -z "$base" ] || [ "$base" = - ] ||
+    [ -z "$base_sha" ] || [ "$base_sha" = - ] || [ -z "$head_sha" ] || [ "$head_sha" = - ]; then
     warn "how far $REPO#$pr is behind its base: UNKNOWN — the PR could not be read" \
       "($(gh_err_line)). This is not 'not behind': check it by hand before merging" \
-      "(git fetch, then git diff <remote>/<base>..HEAD --stat)."
+      "and do not assume the base-drift file overlap is empty."
+    echo "base-drift file overlap $REPO#$pr: UNKNOWN — the PR snapshot could not be read"
     return 3
   fi
-  # owner:branch, so a fork PR compares against the branch it actually has; the head SHA is the
-  # fallback for a head whose repo is gone or whose label the API left unset.
-  case "$head" in *:*) ;; *) head="$sha" ;; esac
-  # per_page=1 trims the commit list the compare would otherwise carry — 136 commits and 258 files
-  # of payload to read two integers. behind_by/ahead_by are totals and are unaffected by it.
-  cmp=$(gh_retry read api "repos/$REPO/compare/$base...$head?per_page=1" \
-    --jq '[(.behind_by // "-"), (.ahead_by // "-")] | @tsv')
+
+  # Compare the captured endpoints in both directions. Each direction's files are changes from
+  # their common merge base to that direction's head: base...head is the PR, head...base is the
+  # base advance. Exact SHAs also make fork labels irrelevant once GitHub has admitted the PR.
+  # per_page=1 trims only the commit list. GitHub still returns the first (and only) file list, but
+  # caps it at 300 entries for the whole comparison; length 300 is therefore potentially truncated.
+  forward=$(gh_retry read api "repos/$REPO/compare/$base_sha...$head_sha?per_page=1")
   rc=$?
-  if [ "$rc" -ne 0 ] && [ "$head" != "$sha" ] && [ "$sha" != - ]; then
-    cmp=$(gh_retry read api "repos/$REPO/compare/$base...$sha?per_page=1" \
-      --jq '[(.behind_by // "-"), (.ahead_by // "-")] | @tsv')
-    rc=$?
-  fi
-  IFS=$'\t' read -r behind ahead <<<"$cmp"
-  [ "$rc" -eq 0 ] || behind=-
-  case "$behind" in
-  '' | *[!0-9]*)
+  if [ "$rc" -ne 0 ]; then
     warn "how far $REPO#$pr is behind $base: UNKNOWN — the compare call did not answer" \
-      "($(gh_err_line)). This is not 'not behind': check it by hand before merging" \
-      "(git fetch, then git diff <remote>/$base..HEAD --stat)."
+      "($(gh_err_line)). The base-drift file overlap is UNKNOWN too, not none; retry before" \
+      "merging."
+    echo "base-drift file overlap $REPO#$pr: UNKNOWN — the forward compare call did not answer"
     return 3
-    ;;
-  esac
-  case "$ahead" in '' | *[!0-9]*) ahead="?" ;; esac
-  if [ "$behind" -lt "$STALE_BASE" ]; then
+  fi
+
+  behind=$(jq -er '.behind_by | numbers | select(. >= 0 and floor == .) | tostring' \
+    <<<"$forward" 2>/dev/null) || count_unknown=1
+  ahead=$(jq -er '.ahead_by | numbers | select(. >= 0 and floor == .) | tostring' \
+    <<<"$forward" 2>/dev/null) || ahead="?"
+  forward_base=$(jq -er '.merge_base_commit.sha | strings | select(length > 0)' \
+    <<<"$forward" 2>/dev/null) || overlap_unknown=1
+  pr_files=$(jq -ce '
+    if (.files | type) == "array" then
+      [.files[] | .filename, .previous_filename?]
+      | map(select(type == "string")) | unique
+    else error("missing files") end' <<<"$forward" 2>/dev/null) || overlap_unknown=1
+  pr_file_count=$(jq -er 'if (.files | type) == "array" then .files | length
+    else error("missing files") end' <<<"$forward" 2>/dev/null) || overlap_unknown=1
+
+  reverse=$(gh_retry read api "repos/$REPO/compare/$head_sha...$base_sha?per_page=1")
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    overlap_unknown=1
+    overlap_reason="the reverse compare call did not answer ($(gh_err_line))"
+  else
+    reverse_base=$(jq -er '.merge_base_commit.sha | strings | select(length > 0)' \
+      <<<"$reverse" 2>/dev/null) || overlap_unknown=1
+    base_files=$(jq -ce '
+      if (.files | type) == "array" then
+        [.files[] | .filename, .previous_filename?]
+        | map(select(type == "string")) | unique
+      else error("missing files") end' <<<"$reverse" 2>/dev/null) || overlap_unknown=1
+    base_file_count=$(jq -er 'if (.files | type) == "array" then .files | length
+      else error("missing files") end' <<<"$reverse" 2>/dev/null) || overlap_unknown=1
+  fi
+
+  if [ -z "$overlap_unknown" ] && [ "$forward_base" != "$reverse_base" ]; then
+    overlap_unknown=1
+    overlap_reason="the two compare calls reported different merge bases"
+  fi
+  if [ -z "$overlap_unknown" ] &&
+    { [ "$pr_file_count" -ge 300 ] || [ "$base_file_count" -ge 300 ]; }; then
+    overlap_unknown=1
+    overlap_reason="a compare file list reached GitHub's 300-file cap and may be truncated"
+  fi
+  if [ -z "$overlap_unknown" ]; then
+    overlap=$(jq -cn --argjson pr "$pr_files" --argjson base "$base_files" '
+      [$pr[] | select(. as $path | $base | index($path))] | unique') || overlap_unknown=1
+    overlap_count=$(jq -er 'length' <<<"$overlap" 2>/dev/null) || overlap_unknown=1
+  fi
+
+  if [ -n "$count_unknown" ]; then
+    warn "how far $REPO#$pr is behind $base: UNKNOWN — the compare response did not contain a" \
+      "valid behind_by count. This is not 'not behind'."
+  elif [ "$STALE_BASE" = off ]; then
+    : # only the count warning is disabled; the path-overlap warning below remains active
+  elif [ "$behind" -lt "$STALE_BASE" ]; then
     echo "base freshness $REPO#$pr: $behind commit(s) behind $base, $ahead ahead" \
       "(warns at $STALE_BASE)"
-    return 0
+  else
+    count_warn=1
+    echo "!!! $REPO#$pr is $behind COMMITS BEHIND its base ($base)."
+    echo "!!! The review that approved this branch, and the checks that went green on it, both judged"
+    echo "!!! it against a base that has since moved $behind commits. Under the roll-forward policy"
+    echo "!!! (ahrefs/ocannl#861) this does NOT block a clean merge — the post-merge integration loop"
+    echo "!!! re-runs the full suites on merged master — but a clean 'mergeable' says only that the"
+    echo "!!! two texts do not collide. Read the base-drift file intersection printed below."
   fi
-  echo "!!! $REPO#$pr is $behind COMMITS BEHIND its base ($base)."
-  echo "!!! The review that approved this branch, and the checks that went green on it, both judged"
-  echo "!!! it against a base that has since moved $behind commits. Under the roll-forward policy"
-  echo "!!! (ahrefs/ocannl#861) this does NOT block a clean merge — the post-merge integration loop"
-  echo "!!! re-runs the full suites on merged master — but a clean 'mergeable' says only that the"
-  echo "!!! two texts do not collide. Read the drift before letting the merge stand:"
-  echo "!!!   git fetch <the remote pointing at $REPO>"
-  echo "!!!   git diff <that remote>/$base..HEAD --stat   # two dots: on a stale branch this shows"
-  echo "!!!                                               # the BASE's files too, not just yours"
-  echo "!!! Only when $base has visibly edited the files this PR changes, rebase (or merge it in,"
-  echo "!!! where the branch is shared), push, and let the checks re-run first."
-  echo "!!! Merging OUTSIDE a coordinated wave? Then no integration loop is watching: after the"
-  echo "!!! merge, await the base's OWN verdict on what you landed — pr-review.sh base $REPO $base"
-  echo "!!!   --wait (a plain base call seconds after a merge answers with the PREVIOUS tip's"
-  echo "!!! green) — and own any red it turns up."
-  warn "MERGING A STALE BRANCH: $REPO#$pr is $behind commits behind $base (warns at $STALE_BASE," \
-    "SHIP_PR_STALE_BASE) — a clean merge is the policy (roll-forward, ahrefs/ocannl#861); rebase" \
-    "first only when the drift plausibly touches this PR's files."
-  return 1
+
+  if [ -n "$overlap_unknown" ]; then
+    [ -n "$overlap_reason" ] || overlap_reason="a compare response was incomplete or invalid"
+    echo "base-drift file overlap $REPO#$pr: UNKNOWN — $overlap_reason"
+    warn "BASE-DRIFT FILE OVERLAP UNKNOWN for $REPO#$pr — this is not 'none'; retry the merge" \
+      "read before deciding whether the branch needs a rebase."
+  elif [ "$overlap_count" -eq 0 ]; then
+    echo "base-drift file overlap $REPO#$pr: none"
+  else
+    echo "!!! BASE-DRIFT FILE OVERLAP: the base's advance touched $overlap_count path(s) changed by"
+    echo "!!! $REPO#$pr: $overlap"
+    echo "!!! Rebase (or merge $base in where the branch is shared), push, and let checks re-run."
+    warn "BASE-DRIFT FILE OVERLAP for $REPO#$pr: $overlap — this warning applies even below" \
+      "SHIP_PR_STALE_BASE, but does not block the merge under the roll-forward policy."
+  fi
+
+  if [ -n "$count_warn" ]; then
+    warn "MERGING A STALE BRANCH: $REPO#$pr is $behind commits behind $base (warns at $STALE_BASE," \
+      "SHIP_PR_STALE_BASE) — a clean merge is the policy (roll-forward, ahrefs/ocannl#861)."
+  fi
+  if [ -n "$count_unknown" ] || [ -n "$overlap_unknown" ]; then
+    return 3
+  fi
+  if [ -n "$count_warn" ] || [ "${overlap_count:-0}" -gt 0 ]; then
+    return 1
+  fi
+  return 0
 }
 
 # merge = read the build signal, then merge. The two are one command on purpose: a gate you have
@@ -1955,23 +2024,24 @@ cmd_base() {
 }
 
 # --repo mirrors gh's own flag, so reaching for it out of gh habit works instead of hitting usage.
-case "${1:-}" in
---repo) REPO="${2:?--repo owner/name}" && shift 2 ;;
---repo=*) REPO="${1#--repo=}" && shift ;;
-esac
+main() {
+  case "${1:-}" in
+  --repo) REPO="${2:?--repo owner/name}" && shift 2 ;;
+  --repo=*) REPO="${1#--repo=}" && shift ;;
+  esac
 
-case "${1:-}" in
-poll) shift && cmd_poll "$@" ;;
-watch) shift && cmd_watch "$@" ;;
-status) shift && cmd_status "$@" ;;
-checks) shift && cmd_checks "$@" ;;
-merge) shift && cmd_merge "$@" ;;
-base) shift && cmd_base "$@" ;;
-reply) shift && cmd_reply "$@" ;;
-resolve) shift && cmd_resolve "$@" ;;
-comment) shift && cmd_comment "$@" ;;
-retry) shift && cmd_retry "$@" ;;
-*) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|checks|merge|reply|resolve} <pr> ...
+  case "${1:-}" in
+  poll) shift && cmd_poll "$@" ;;
+  watch) shift && cmd_watch "$@" ;;
+  status) shift && cmd_status "$@" ;;
+  checks) shift && cmd_checks "$@" ;;
+  merge) shift && cmd_merge "$@" ;;
+  base) shift && cmd_base "$@" ;;
+  reply) shift && cmd_reply "$@" ;;
+  resolve) shift && cmd_resolve "$@" ;;
+  comment) shift && cmd_comment "$@" ;;
+  retry) shift && cmd_retry "$@" ;;
+  *) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|checks|merge|reply|resolve} <pr> ...
   pr-review.sh comment <pr> <body>           # a plain PR comment (a summary round, a review nudge)
   pr-review.sh base [owner/name] [branch] [--wait]  # is the base branch's CI green? (start of
                                              # work; --wait = post-merge integration read)
@@ -1979,4 +2049,9 @@ retry) shift && cmd_retry "$@" ;;
   pr-review.sh retry run watch <run-id> [-R owner/name]  # quiet await of ONE run (never forwarded
                                              # to gh); for a PR prefer: checks <pr> --wait
   <pr> is a number or owner/name#number; prefer owner/name#number for background invocations." ;;
-esac
+  esac
+}
+
+# Focused tests source the functions and replace gh with a fixture transport; do not expose a
+# user-facing testing subcommand or make them pass through the unrelated build and merge gates.
+[ "${SHIP_PR_TEST_SOURCE_ONLY:-}" = 1 ] || main "$@"

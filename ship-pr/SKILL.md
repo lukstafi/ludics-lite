@@ -415,8 +415,10 @@ line; run FAILED is exit 1, transport exit 3, no verdict exit 4.
 ### How stale the base has grown
 
 Both gates above read the *head commit*, and both are satisfied by a branch whose base has moved on
-without it. `merge` therefore also prints how many commits behind its base the branch is, and says
-so loudly — `!!! … COMMITS BEHIND`, on stdout and stderr — past 20 (`SHIP_PR_STALE_BASE`, or `off`).
+without it. `merge` therefore also prints how many commits behind its base the branch is and the
+exact intersection between paths changed by the PR and paths changed by the base since their merge
+base. It says so loudly — `!!! … COMMITS BEHIND`, on stdout and stderr — past 20
+(`SHIP_PR_STALE_BASE`, or `off`), and warns at any count when that intersection is nonempty.
 
 It warns and merges anyway. That is the **roll-forward policy** (ahrefs/ocannl#861, decided
 2026-08-30 after a wave where every sibling merge invalidated every open PR's verification —
@@ -438,24 +440,18 @@ OWN merge commit, read once — a run superseded or cancelled by a later sibling
 integration loop's business. In standalone use — no coordinator, no loop — trailing CI is
 likewise not the merger's to watch: it belongs to the CI-red triage routine (below).
 
-**Still read the line before letting the merge stand.** On staging#488 (2026-08-28) sixteen review
+**Still read the intersection before letting the merge stand.** On staging#488 (2026-08-28) sixteen review
 rounds ran against a base that had gone 136 commits stale, `master` had meanwhile edited the very
 file the PR changed, and every signal on the merge path was clean: green checks (on the stale
 head), an approval (of the stale diff), `mergeable=true` (semantic drift produces no textual
-conflict). What caught it was a hand-run `git diff origin/master..HEAD --stat` whose 258 files were
-visibly not the two-file branch. That two-dot endpoint diff is an eyeball tool, not a test: it
-includes the PR's own edits, so every nonempty PR looks drifted by it. The question — did the
-base's advance touch this PR's files — is answered by anchoring at the branch point:
-
-```bash
-git diff --name-only --no-renames $(git merge-base origin/master HEAD) origin/master | grep -Fxf <(git diff --name-only --no-renames origin/master...HEAD)
-```
-
-It prints exactly the PR's files that the base's advance also touched — nothing means none
-(substitute the remote that actually points at the base repo; its name is local). `--no-renames`
-lists both names of a file the PR renamed, so an edit the base made to the old name still shows;
-`grep -Fx` compares whole lines, so a path with spaces is one path rather than word-split
-pathspec fragments.
+conflict). What caught it was a hand-run endpoint diff whose 258 files were visibly not the
+two-file branch. Endpoint diffs are eyeball tools, not the answer: they include the PR's own edits,
+so every nonempty PR looks drifted by them. Read `merge`'s `base-drift file overlap` line instead.
+It derives the PR's actual base and compares the exact base/head SHA snapshot in both directions;
+renames contribute both the old and new path, and paths remain JSON strings so spaces and unusual
+characters are not split. `none` is an exact empty intersection. `UNKNOWN` means an API call failed
+or GitHub's 300-file compare cap made a list potentially incomplete; it never means none, so retry
+the read before deciding whether to rebase.
 
 When the base's advance touches the files this PR changes, rebase (or merge the base in, where the
 branch is shared), push, and let the checks re-run first — any commit that moves the head waits
