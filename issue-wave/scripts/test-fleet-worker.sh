@@ -4,14 +4,92 @@
 # state dir, so it is safe beside real workers. The far-side script is the same for local and
 # remote boxes, so what passes here is what runs over ssh; only the transport is untested.
 #
-# Usage: test-fleet-worker.sh            (exit 0 all pass, 1 otherwise; skips with a notice when
-#                                          tmux is not installed, which is the CI runner's state
-#                                          unless the workflow installs it)
+# Usage: test-fleet-worker.sh [section ...] (exit 0 all pass, 1 otherwise; skips with a notice
+#                                          when tmux is not installed, which is the CI runner's
+#                                          state unless the workflow installs it)
+#        test-fleet-worker.sh --list       (the section names)
+#
+# With no arguments every section runs; each argument selects every section whose name contains
+# it, so a prefix or any distinctive substring will do. An argument matching no section is refused
+# before anything runs. The setup the sections share -- the shim CLIs, the scratch skills checkout,
+# the scratch project repo -- runs whatever is selected, and a section that needs more than that
+# (the coordinator lease, a finished worker) takes it explicitly, so any section runs on its own.
 
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 FW="$HERE/fleet-worker.sh"
+
+# --- section selection ------------------------------------------------------------------------
+# The `--- name` headers below, in the order they run. Arguments are matched against these, and a
+# selected run still runs the sections in file order: each reads what the ones above it left.
+SECTIONS=(
+  "the real checkout under the README's install loops"
+  "coordinator lease"
+  "preflight"
+  "launch / attach / status / log with a project repo and --repo/--branch"
+  "failure verdicts"
+  "unstick"
+  "codex workers"
+  "halt"
+  "usage"
+)
+
+usage() {
+  cat <<'USAGE'
+usage: test-fleet-worker.sh [--list] [section ...]
+
+With no arguments every section runs. Each argument selects every section whose
+name contains it, so a prefix or any distinctive substring ("coord", "unstick",
+"status") will do; --list prints the names. An argument matching no section is
+refused before anything runs.
+
+Selected sections run in file order, after the setup they all share: the shim
+CLIs, the scratch skills checkout and the scratch project repo. A section that
+needs more than that -- the coordinator lease, a finished worker to read -- takes
+it itself, so any section stands on its own.
+USAGE
+}
+
+NAMED=0
+SELECTED=()
+# select_section <name>: add it once. Two arguments can match the same section (`coord lease` both
+# name the lease section), and a section running twice would assert against its own leftovers.
+select_section() {
+  local s
+  for s in ${SELECTED[@]+"${SELECTED[@]}"}; do [ "$s" = "$1" ] && return 0; done
+  SELECTED+=("$1")
+}
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h | --help) usage; exit 0 ;;
+    --list) printf '%s\n' "${SECTIONS[@]}"; exit 0 ;;
+    -*) echo "FAIL: unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *)
+      matched=0
+      for s in "${SECTIONS[@]}"; do
+        case "$s" in *"$1"*) select_section "$s"; matched=1 ;; esac
+      done
+      [ "$matched" -eq 1 ] || {
+        echo "FAIL: no section matches: $1" >&2
+        echo "run with --list to see the ${#SECTIONS[@]} section names" >&2
+        exit 1
+      }
+      NAMED=1
+      ;;
+  esac
+  shift
+done
+
+# section <name>: print the header, and say whether this run includes the section. Every section
+# below is `section "..." && { ... }`, so an unselected one is skipped whole.
+section() {
+  local s found=0
+  [ "$NAMED" -eq 1 ] || found=1
+  for s in ${SELECTED[@]+"${SELECTED[@]}"}; do [ "$s" = "$1" ] && found=1; done
+  [ "$found" -eq 1 ] || return 1
+  echo "--- $1"
+}
 
 command -v tmux >/dev/null 2>&1 || { echo "SKIP: tmux not installed"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not installed"; exit 0; }
@@ -124,7 +202,7 @@ chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux"
 # scratch HOME, installed with the install loops extracted from README.md (minus their git
 # clone), and preflighted for both worker kinds, so the README's loop and the preflight's
 # expected link target are read from where they live rather than restated here.
-echo "--- the real checkout under the README's install loops"
+section "the real checkout under the README's install loops" && {
 real_top=$(git -C "$HERE" rev-parse --show-toplevel)
 readme_block() { # <text>: the first fenced code block of README.md containing the text
   awk -v want="$1" '
@@ -149,6 +227,7 @@ expect "the real checkout, installed the README's way, passes the claude preflig
   env -u FLEET_SKILLS_REPO HOME="$real_home" "$FW" preflight testbox --no-probe
 expect "...and the codex preflight" 0 "PREFLIGHT OK" -- \
   env -u FLEET_SKILLS_REPO HOME="$real_home" "$FW" preflight testbox --codex --no-probe
+}
 
 # --- a scratch skills checkout with an origin, deployed the way the README deploys it --------
 origin="$TMP/origin.git"; repo="$TMP/ludics lite"
@@ -163,7 +242,31 @@ git -C "$repo" add -A && git -C "$repo" commit -q -m init
 git -C "$repo" remote add origin "$origin" && git -C "$repo" push -q -u origin main
 export FLEET_SKILLS_REPO="$repo"
 
-echo "--- coordinator lease"
+# --- setup every section shares ---------------------------------------------------------------
+# The project repo and the brief live here, not in the launch section, so a later section selected
+# on its own still finds them; the two helpers below take what only some sections need.
+proj="$TMP/pro j"; git init -q -b master "$proj" && echo a > "$proj/a" && git -C "$proj" add a && git -C "$proj" commit -q -m a
+git init -q --bare "$TMP/proj.git" && git -C "$proj" remote add origin "$TMP/proj.git" && git -C "$proj" push -q -u origin master
+brief="$TMP/brief.md"; printf 'Fix issue #1: handle `$(rm -rf /)` and `backticks` in prose\n' > "$brief"
+# The unstick message: the unstick, codex and usage sections all pass it to `unstick --message`.
+printf 'Stop and answer now.\n' > "$TMP/msg.md"
+# A second coordinator: its own state dir (own token), the same anchor state.
+B=(env ISSUE_WAVE_STATE="$TMP/state-b" FLEET_ANCHOR_STATE="$ISSUE_WAVE_STATE" "$FW")
+# need_lease: the coordinator lease, held by us -- what every section from the launches on assumes.
+# The lease section leaves it unheld and the launch section claims it, and a claim by the holder is
+# idempotent, so this is a no-op in a full run.
+need_lease() { "$FW" claim >/dev/null || ko "could not claim the coordinator lease (setup, not the launcher)"; }
+# need_worker <name>: a finished worker and its worktree, as the launch section leaves behind for
+# the sections that read one. A no-op once that section has run.
+need_worker() {
+  [ -d "$ISSUE_WAVE_STATE/workers/$1" ] && return 0
+  need_lease
+  "$FW" launch testbox "$1" --kind claude --brief "$brief" --repo "$proj" --branch "claude/$1" >/dev/null &&
+    "$FW" attach testbox "$1" --interval 1 >/dev/null ||
+    ko "could not prepare worker $1 (setup, not the launcher)"
+}
+
+section "coordinator lease" && {
 expect "no identity at all is refused, not guessed" 2 "no coordinator identity" -- env -u FLEET_COORDINATOR "$FW" claim
 expect "a Codex thread id supplies the coordinator identity" 3 "nobody holds the lease" -- \
   env -u FLEET_COORDINATOR CODEX_THREAD_ID=test-thread "$FW" coordinator
@@ -174,8 +277,6 @@ expect "coordinator: nobody yet, exit 3" 3 "nobody holds the lease" -- "$FW" coo
 expect "claim takes the lease" 0 "CLAIMED coordinator lease on testbox" -- "$FW" claim
 expect "claim again is idempotent for the holder" 0 "CLAIMED already held" -- "$FW" claim
 expect "coordinator: me" 0 "COORDINATOR: you" -- "$FW" coordinator
-# A second coordinator: its own state dir (own token), the same anchor state.
-B=(env ISSUE_WAVE_STATE="$TMP/state-b" FLEET_ANCHOR_STATE="$ISSUE_WAVE_STATE" "$FW")
 expect "a second coordinator's claim is refused while held" 1 "CLAIM REFUSED: coordinator lease held by" -- "${B[@]}" claim
 expect "a second coordinator cannot halt" 1 "HALT REFUSED fleet: coordinator lease held by" -- "${B[@]}" halt "not mine"
 mkdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
@@ -220,8 +321,9 @@ mkdir -p "$ISSUE_WAVE_STATE/COORDINATOR"
 expect "claim --take that cannot write the lease fails, not CLAIMED" 1 "CLAIM FAILED: could not write" -- "$FW" claim --take
 expect "a plain claim over an unwritable lease path fails too" 1 "CLAIM FAILED: could not write" -- "$FW" claim
 rmdir "$ISSUE_WAVE_STATE/COORDINATOR"
+}
 
-echo "--- preflight"
+section "preflight" && {
 expect "clean main on origin passes (claude, live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox
 expect "clean main passes for codex (live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --codex
 expect "a stalling skills fetch is bounded and refused" 1 "git fetch in .* timed out after 2s" -- env SHIM_GIT_HANG_FETCH=1 FLEET_FETCH_TIMEOUT=2 "$FW" preflight testbox --no-probe
@@ -284,11 +386,9 @@ expect "a real directory in place of the link refuses" 1 "skills/ship-pr -> miss
 rm -rf "$HOME/.claude/skills/ship-pr"; ln -sfn "$repo/wait-and-proceed" "$HOME/.claude/skills/ship-pr"
 expect "a link swapped to a sibling skill refuses" 1 "skills/ship-pr -> .*/wait-and-proceed (not " -- "$FW" preflight testbox --no-probe
 ln -sfn "$repo/ship-pr" "$HOME/.claude/skills/ship-pr"
+}
 
-echo "--- launch / attach / status / log with a project repo and --repo/--branch"
-proj="$TMP/pro j"; git init -q -b master "$proj" && echo a > "$proj/a" && git -C "$proj" add a && git -C "$proj" commit -q -m a
-git init -q --bare "$TMP/proj.git" && git -C "$proj" remote add origin "$TMP/proj.git" && git -C "$proj" push -q -u origin master
-brief="$TMP/brief.md"; printf 'Fix issue #1: handle `$(rm -rf /)` and `backticks` in prose\n' > "$brief"
+section "launch / attach / status / log with a project repo and --repo/--branch" && {
 expect "launch without a lease refuses" 1 "LAUNCH REFUSED testbox/w1: no coordinator lease" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 "$FW" claim >/dev/null
@@ -346,8 +446,10 @@ arch=$(printf '%s' "$out" | sed -n 's/.* replaced=//p')
 expect "ls lists local workers with state" 0 "testbox/w1 EXITED(0) kind=claude" -- "$FW" ls testbox
 out=$(FLEET_BOXES="testbox" "$FW" ls 2>&1)
 [ "$(printf '%s\n' "$out" | grep -c '/w1 ')" -eq 1 ] && printf '%s' "$out" | grep -q '^local/w1 ' && ok "default ls sweeps the fleet minus the local box, once" || ko "default ls: $out"
+}
 
-echo "--- failure verdicts"
+section "failure verdicts" && {
+need_lease   # this section and every one below launch workers; see the shared setup above
 printf 'FAIL on purpose\n' > "$TMP/fail.md"
 "$FW" launch testbox wf --kind claude --brief "$TMP/fail.md" --cwd "$proj" >/dev/null
 expect "an erroring worker attaches as FAILED, exit 1" 1 "FAILED testbox/wf exit=1 error_during_execution is_error=true" -- "$FW" attach testbox wf --interval 1
@@ -366,9 +468,12 @@ expect "ls reports it as ORPHANED too" 0 "testbox/wv ORPHANED" -- "$FW" ls testb
 t0=$(date +%s)
 expect "attach waits for the orphan to exit and then reports VANISHED" 3 "VANISHED testbox/wv" -- "$FW" attach testbox wv --interval 1
 [ $(( $(date +%s) - t0 )) -ge 2 ] && ok "attach held while the orphan lived" || ko "attach returned before the orphan exited"
+}
 
-echo "--- unstick"
-printf 'SLEEP 60 then report\n' > "$TMP/slow.md"; printf 'Stop and answer now.\n' > "$TMP/msg.md"
+section "unstick" && {
+need_lease
+need_worker w1   # its own worktree, for the sibling-session case below
+printf 'SLEEP 60 then report\n' > "$TMP/slow.md"
 "$FW" launch testbox ws --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1
 expect "unstick refuses while the exec is alive" 1 "still running.*pass --kill" -- "$FW" unstick testbox ws --message "$TMP/msg.md"
 expect "unstick --kill stops it and resumes the same session" 0 "RESUMED testbox/ws kind=claude session=[0-9a-f-]\{36\} resume=1" -- \
@@ -490,8 +595,10 @@ expect "a stalling project fetch is bounded and refused before any record is tou
   env SHIM_GIT_HANG_FETCH=1 FLEET_FETCH_TIMEOUT=2 "$FW" launch testbox fh --kind claude --brief "$brief" --repo "$proj" --branch claude/fh
 [ -d "$ISSUE_WAVE_STATE/workers/fh" ] && ko "a refused fetch left a record" || ok "no record left by the refused fetch"
 ls "$ISSUE_WAVE_STATE/incoming/" 2>/dev/null | grep -q '^fh-' && ko "a refused fetch left a staged brief" || ok "no staged brief left by the refused fetch"
+}
 
-echo "--- codex workers"
+section "codex workers" && {
+need_lease
 expect "codex launch captures the thread id from the stream" 0 "LAUNCHED testbox/c1 kind=codex session=0199-shim-" -- \
   "$FW" launch testbox c1 --kind codex --brief "$brief" --cwd "$proj"
 grep -qF -- "codex exec --json --yolo -C $(printf '%q' "$proj") -o " "$ISSUE_WAVE_STATE/workers/c1/run.sh" && grep -qF -- "last-message.md - < " "$ISSUE_WAVE_STATE/workers/c1/run.sh" && ok "codex command shape (brief on stdin, -o last message)" || ko "codex command: $(cat "$ISSUE_WAVE_STATE/workers/c1/run.sh")"
@@ -509,8 +616,10 @@ expect "a resumed turn that emits nothing is FAILED even though the first turn s
   env SHIM_CODEX_SILENT_RESUME=1 bash -c '"$0" unstick testbox c1 --message "$1" && "$0" attach testbox c1 --interval 1' "$FW" "$TMP/msg.md"
 "$FW" unstick testbox c1 --message "$TMP/msg.md" >/dev/null
 expect "the resumed codex turn's verdict carries the NEW message, from the stream" 0 "DONE testbox/c1 exit=0 turn.completed .*| codex did: Stop and answer now" -- "$FW" attach testbox c1 --interval 1
+}
 
-echo "--- halt"
+section "halt" && {
+need_lease
 mkdir -p "$ISSUE_WAVE_STATE/HALT"
 expect "halt that cannot write its marker fails loudly" 1 "HALT FAILED: cannot write" -- "$FW" halt "unwritable"
 rmdir "$ISSUE_WAVE_STATE/HALT"
@@ -529,8 +638,11 @@ expect "a coordinator adopting the lease inherits the halt" 1 "LAUNCH REFUSED te
   "${B[@]}" launch testbox h3 --kind claude --brief "$brief" --cwd "$proj"
 expect "...and reads it with halted" 1 "HALTED .*adopted mid-halt" -- "${B[@]}" halted
 "$FW" claim --take >/dev/null; "$FW" resume-launches >/dev/null
+}
 
-echo "--- usage"
+section "usage" && {
+need_lease
+need_worker w1
 expect "no command prints usage, exit 2" 2 "Usage:" -- "$FW"
 expect "bad worker name refuses" 2 "name must be" -- "$FW" launch testbox "bad name" --kind claude --brief "$brief" --cwd "$proj"
 expect "dot names refuse" 2 "name must be" -- "$FW" launch testbox .. --kind claude --brief "$brief" --cwd "$proj"
@@ -552,7 +664,12 @@ expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --ki
 ( cd "$TMP" && "$FW" launch testbox rel --kind claude --brief "$brief" --cwd "pro j" >/dev/null ) && "$FW" attach testbox rel --interval 1 >/dev/null
 grep -q "^cwd=$proj\$" "$ISSUE_WAVE_STATE/workers/rel/meta" && ok "a relative --cwd is recorded as its absolute path" || ko "relative cwd recorded: $(grep '^cwd=' "$ISSUE_WAVE_STATE/workers/rel/meta")"
 expect "a path with a newline refuses" 2 "must not contain newlines" -- "$FW" launch testbox nl --kind claude --brief "$brief" --cwd "$(printf '%s\nx' "$proj")"
+}
 
 echo
-echo "$pass passed, $fail failed"
+if [ "$NAMED" -eq 1 ]; then
+  echo "$pass passed, $fail failed (${#SELECTED[@]} of ${#SECTIONS[@]} sections)"
+else
+  echo "$pass passed, $fail failed"
+fi
 [ "$fail" -eq 0 ]

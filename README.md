@@ -112,6 +112,14 @@ macOS (the fleet's bash is 3.2) for every push and pull request, along with `bas
 at error severity, and a check that the two cleanup scripts still carry their parse guard. It runs
 without path filters, so every PR's merge gate reads a verdict rather than `ABSENT`.
 
+`test-fleet-worker.sh` runs its ~180 assertions top to bottom in one shell, which takes about three
+and a half minutes. Arguments narrow that: each one selects every section whose name contains it
+(`test-fleet-worker.sh unstick`, `test-fleet-worker.sh 'real checkout'`), `--list` prints the
+section names, and an argument matching none of them is refused before anything runs. The setup the
+sections share (the shim CLIs, the scratch skills checkout, the scratch project repo) runs whatever
+is selected, and a section that needs more than that, such as the coordinator lease or a finished
+worker to read, takes it itself, so every section also passes when it is the only one selected.
+
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and
 reported instead of holding the job until CI's own timeout. `SHIP_PR_TEST_LOG_DIR` keeps the
