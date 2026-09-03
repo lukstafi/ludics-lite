@@ -25,6 +25,7 @@ so there is no separate sync step to forget.
 
 ```sh
 git clone https://github.com/lukstafi/ludics-lite.git ~/ludics-lite
+mkdir -p "$HOME/.claude/skills"
 for s in "$HOME"/ludics-lite/*/; do
   case "$s" in */.git/) continue ;; esac
   ln -sfn "${s%/}" "$HOME/.claude/skills/$(basename "$s")"

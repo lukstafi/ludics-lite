@@ -56,8 +56,9 @@
 #       3 worker vanished without an exit record | 4 the box never answered.
 #
 # Env:
-#   FLEET_COORDINATOR: lease identity; defaults to the inherited CLAUDE_CODE_SESSION_ID. Required
-#     when the harness supplies none, because nothing is guessed from the process tree.
+#   FLEET_COORDINATOR: lease identity; defaults to inherited CLAUDE_CODE_SESSION_ID or
+#     CODEX_THREAD_ID. Required when the harness supplies neither, because nothing is guessed from
+#     the process tree.
 #   FLEET_LOCAL_BOX: this box's fleet name; otherwise detected from the hostname.
 #   FLEET_HOSTNAME_MAP: space-separated `<glob>=<box>` hostname mappings, first match wins; the
 #     default is the author's fleet.
@@ -262,22 +263,23 @@ unreachable() { [ "$1" -eq 255 ]; }
 valid_name() { case "$1" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 
 # The coordinator's identity is per SESSION, not per box: FLEET_COORDINATOR if set, else the
-# harness session id the shell inherits as CLAUDE_CODE_SESSION_ID. Nothing is guessed from the
-# process tree - a parent pid is shared by sibling tabs and changes under command substitution, so
-# a guessed identity is either not unique or not stable. Its token lives under that identity, so a
-# second coordinator session on the same box has no token and cannot pass the gate, and a restarted
-# coordinator (new session id) must adopt explicitly with claim --take.
+# harness identity inherited as CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID. Nothing is guessed from
+# the process tree - a parent pid is shared by sibling tabs and changes under command substitution,
+# so a guessed identity is either not unique or not stable. Its token lives under that identity, so
+# a second coordinator session on the same box has no token and cannot pass the gate, and a
+# restarted coordinator (new session id) must adopt explicitly with claim --take.
 coordinator_id() {
   if [ -n "${FLEET_COORDINATOR:-}" ]; then printf '%s' "$FLEET_COORDINATOR"
   elif [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then printf 'session-%s' "$CLAUDE_CODE_SESSION_ID"
+  elif [ -n "${CODEX_THREAD_ID:-}" ]; then printf 'codex-%s' "$CODEX_THREAD_ID"
   fi
 }
 # Validated at top level (a die inside $(...) would only end the substitution): the identity
 # is used verbatim as the token file name, so it must be injective - no folding of characters.
 check_identity() {
   local id; id=$(coordinator_id)
-  [ -n "$id" ] || die "no coordinator identity: harness supplied no CLAUDE_CODE_SESSION_ID --" \
-    "set FLEET_COORDINATOR=<name> for this coordinator session"
+  [ -n "$id" ] || die "no coordinator identity: harness supplied neither CLAUDE_CODE_SESSION_ID" \
+    "nor CODEX_THREAD_ID -- set FLEET_COORDINATOR=<name> for this coordinator session"
   case "$id" in .|..|*[!A-Za-z0-9._-]*) die "coordinator identity '$id' must be [A-Za-z0-9._-]+ (set FLEET_COORDINATOR)" ;; esac
 }
 token_file() { printf '%s/tokens/%s' "$(local_path "$STATE")" "$(coordinator_id)"; }

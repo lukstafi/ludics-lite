@@ -167,7 +167,8 @@ Never end a turn with a PR in flight and nothing that will wake you. Under Claud
 with Bash `run_in_background: true` and yield; the completion notification is the wake. Under Codex
 a finished background command does not resume the agent: keep the turn open and poll the command
 session until `watch` exits, or, for a wait too long to hold open, schedule a heartbeat that
-re-runs `poll`. A backgrounded shell nobody is polling is not an observer.
+re-runs both `status` and watermark-aware `poll` (or a bounded `watch`). A backgrounded shell
+nobody is polling is not an observer.
 
 `watch` *is* the polling loop — don't hand-roll a sleep loop around `poll`, which is what a long
 review otherwise turns into. It returns the moment a round lands (printing exactly what `poll`

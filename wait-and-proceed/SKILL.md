@@ -35,7 +35,8 @@ depend on code your dependency is about to change.
 Under Claude Code, run it with Bash `run_in_background: true` and yield; the completion
 notification is the wake. Under Codex a finished background command does not resume the agent:
 keep the turn open and poll the command session until the waiter exits, or, for a wait too long to
-hold open, schedule a heartbeat that re-runs the branch or predicate check.
+hold open, schedule a heartbeat that re-runs the same waiter with `--timeout 0`, making each tick a
+one-shot branch or predicate check.
 
 A branch is the right thing to name whether or not a PR exists yet: the script watches the PR when
 there is one and git when there is not, so you can arm it before the other session has opened

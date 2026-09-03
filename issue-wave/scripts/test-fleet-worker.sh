@@ -25,11 +25,11 @@ export ISSUE_WAVE_STATE="$TMP/st ate"
 export FLEET_TMUX_SOCKET="fwtest-$$"
 export FLEET_LOCAL_BOX="testbox"
 export FLEET_ANCHOR="testbox"
-# The coordinator identity, pinned: without CLAUDE_CODE_SESSION_ID the script refuses to guess
-# (line 132 tests exactly that), so a test must name it, as would any coordinator whose harness
-# supplies no session identity.
+# The coordinator identity, pinned: without either harness session variable the script refuses to
+# guess (tested below), so a test must name it, as would any coordinator whose harness supplies no
+# session identity.
 export FLEET_COORDINATOR="test-coordinator"
-unset CLAUDE_CODE_SESSION_ID
+unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
 export PATH="$TMP/bin:$PATH"
 # A scratch git identity, so worktree/commit steps work on a bare runner.
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
@@ -130,6 +130,8 @@ export FLEET_SKILLS_REPO="$repo"
 
 echo "--- coordinator lease"
 expect "no identity at all is refused, not guessed" 2 "no coordinator identity" -- env -u FLEET_COORDINATOR "$FW" claim
+expect "a Codex thread id supplies the coordinator identity" 3 "nobody holds the lease" -- \
+  env -u FLEET_COORDINATOR CODEX_THREAD_ID=test-thread "$FW" coordinator
 mkdir "$ISSUE_WAVE_STATE/COORDINATOR.lock" 2>/dev/null || { mkdir -p "$ISSUE_WAVE_STATE"; mkdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"; }
 expect "a first claim also waits on the lease lock and fails after the bound" 1 "CLAIM FAILED: lease lock" -- env FLEET_LOCK_WAIT=1 "$FW" claim
 rmdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
