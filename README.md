@@ -1,9 +1,9 @@
 # ludics-lite
 
-A small collection of Claude Code skills for landing work through review and running
+A small collection of agent skills for landing work through review and running
 delegation waves over an issue backlog across a fleet of machines. They are the lightweight,
 skill-only companion to [ludics](https://github.com/lukstafi/ludics): no binary, no daemon,
-just Markdown and shell that Claude Code loads from `~/.claude/skills`.
+just Markdown and shell loaded by compatible agent harnesses from their skill directories.
 
 | Skill | What it does |
 | --- | --- |

@@ -912,7 +912,7 @@ cmd_reply() {
   gh_retry write api -X POST "repos/$REPO/pulls/$pr/comments/$id/replies" \
     -f body="$body
 
-_🤖 Addressed by [Claude Code](https://claude.com/claude-code)_" --jq .html_url
+_🤖 Addressed by an automated coding agent_" --jq .html_url
   case "$?" in
   0) return 0 ;;
   3) fail 3 "reply to comment $id on PR $REPO#$pr did not go through — the API refused it at the" \
@@ -953,7 +953,7 @@ cmd_comment() {
   gh_retry write api -X POST "repos/$REPO/issues/$pr/comments" \
     -f body="$body
 
-_🤖 Addressed by [Claude Code](https://claude.com/claude-code)_" --jq .html_url
+_🤖 Addressed by an automated coding agent_" --jq .html_url
   case "$?" in
   0) return 0 ;;
   3) fail 3 "comment on PR $REPO#$pr did not go through — the API refused it at the gateway on" \
@@ -1224,7 +1224,7 @@ cmd_retry() {
 # siblings, but that has not always been true and is not true of every workflow, and a superseding
 # push cancels too. Treating a cancel as red would make every force-push a refusal; treating it as
 # green would let a matrix leg that never finished pass for one that passed. It is neither.
-BUILD_ADVISORY="${SHIP_PR_ADVISORY_CHECKS:-^(claude|Claude Code|github pages docs)$}"
+BUILD_ADVISORY="${SHIP_PR_ADVISORY_CHECKS:-^([Cc]laude([[:space:]][Cc]ode)?|github pages docs)$}"
 CHECKS_INTERVAL="${SHIP_PR_CHECKS_INTERVAL:-60}"
 CHECKS_WAIT="${SHIP_PR_CHECKS_WAIT:-7200}"
 CHECKS_HEARTBEAT="${SHIP_PR_CHECKS_HEARTBEAT:-600}"

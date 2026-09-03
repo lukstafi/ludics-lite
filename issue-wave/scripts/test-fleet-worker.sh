@@ -25,9 +25,9 @@ export ISSUE_WAVE_STATE="$TMP/st ate"
 export FLEET_TMUX_SOCKET="fwtest-$$"
 export FLEET_LOCAL_BOX="testbox"
 export FLEET_ANCHOR="testbox"
-# The coordinator identity, pinned: outside Claude Code the fallback is the owning process, which
-# differs between a direct call and one captured in $(...), so a test must name it (as would any
-# coordinator not running under Claude Code).
+# The coordinator identity, pinned: without an inherited harness session id the fallback would be
+# the owning process, which differs between a direct call and one captured in $(...), so a test
+# must name it (as would any coordinator whose harness supplies no session identity).
 export FLEET_COORDINATOR="test-coordinator"
 unset CLAUDE_CODE_SESSION_ID CLAUDE_PID
 export PATH="$TMP/bin:$PATH"

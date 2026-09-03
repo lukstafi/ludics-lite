@@ -143,8 +143,10 @@ Write the body as the reviewer's map, not a changelog: what is now true that was
 tests pin, what changes for existing users, and where the risky corner is. Reviewers — human and
 automated — spend their attention where the body sends it.
 
-Report the URL on its own line, wrapped so the Desktop client renders a live status card (the tag
-is inert everywhere else):
+Report the URL on its own line. Use the harness's native way to surface a newly created PR when it
+has one — the intent is to give the user the richest available PR link or live status card, and
+the agent chooses the mechanism. The Claude harness's Desktop client recognizes this wrapper (it
+is inert elsewhere):
 
 ```
 <pr-created>https://github.com/owner/repo/pull/123</pr-created>
@@ -156,11 +158,13 @@ multi-PR arc that comment is what makes the phases legible later.
 
 ## Monitor
 
-Poll for the review yourself: nothing arms on its own. The `<pr-created>` tag gets the Desktop
-client to render a PR card, but the review-event feed behind that card starts only when the user
-clicks its "Auto-fix CI & address comments" — verified on a PR opened with the tag and no other
-setup, which drew a review nobody was told about. If those events do start mid-loop they carry the
-comment bodies and ids inline; take them as they come and stop polling for what they delivered.
+Poll for the review yourself: merely surfacing the PR through the harness does not arm monitoring.
+In the Claude harness's Desktop client, the `<pr-created>` tag renders a PR card, but the
+review-event feed behind that card starts only when the user clicks its "Auto-fix CI & address
+comments" — verified on a PR opened with the tag and no other setup, which drew a review nobody
+was told about. Other harnesses may expose a different PR surface or no event feed at all. If
+review events do start mid-loop and carry the comment bodies and ids inline, take them as they
+come and stop polling for what they delivered.
 
 Never end a turn with a PR in flight and nothing watching it: arm the watch as a background command
 before yielding, so the next round wakes you instead of waiting for the user to notice it. `watch`

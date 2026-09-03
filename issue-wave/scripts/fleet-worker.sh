@@ -55,10 +55,11 @@
 # Exit: 0 ok | 1 the fact does not hold (refused, worker failed, stale) | 2 usage |
 #       3 worker vanished without an exit record | 4 the box never answered.
 #
-# Env: FLEET_COORDINATOR (this coordinator's identity for the lease; defaults to the Claude Code
-# session id the shell inherits, and is REQUIRED when not running under Claude Code - nothing is
-# guessed from the process tree), FLEET_LOCAL_BOX (this box's fleet name; detected from the
-# hostname), FLEET_HOSTNAME_MAP (how that detection reads: space-separated `<glob>=<box>` pairs
+# Env: FLEET_COORDINATOR (this coordinator's identity for the lease; defaults to the harness
+# session id the shell inherits as CLAUDE_CODE_SESSION_ID, and is REQUIRED when the harness does
+# not provide one - nothing is guessed from the process tree), FLEET_LOCAL_BOX (this box's fleet
+# name; detected from the hostname), FLEET_HOSTNAME_MAP (how that detection reads: space-separated
+# `<glob>=<box>` pairs
 # matched against the lowercased short hostname, first match wins; the default is the author's
 # fleet), FLEET_BASE_REF (the ref `launch` starts a worktree from when --base is not given;
 # origin/master), FLEET_ANCHOR
@@ -259,7 +260,7 @@ unreachable() { [ "$1" -eq 255 ]; }
 valid_name() { case "$1" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
 
 # The coordinator's identity is per SESSION, not per box: FLEET_COORDINATOR if set, else the
-# Claude Code session id the shell inherits. Nothing is guessed from the process tree - a
+# harness session id the shell inherits as CLAUDE_CODE_SESSION_ID. Nothing is guessed from the
 # parent pid is shared by sibling tabs and changes under command substitution, so a guessed
 # identity is either not unique or not stable. Its token lives under that identity, so a second
 # coordinator session on the same box has no token and cannot pass the gate, and a restarted
@@ -273,7 +274,8 @@ coordinator_id() {
 # is used verbatim as the token file name, so it must be injective - no folding of characters.
 check_identity() {
   local id; id=$(coordinator_id)
-  [ -n "$id" ] || die "no coordinator identity: not under Claude Code (no CLAUDE_CODE_SESSION_ID) -- set FLEET_COORDINATOR=<name> for this coordinator session"
+  [ -n "$id" ] || die "no coordinator identity: harness supplied no CLAUDE_CODE_SESSION_ID --" \
+    "set FLEET_COORDINATOR=<name> for this coordinator session"
   case "$id" in .|..|*[!A-Za-z0-9._-]*) die "coordinator identity '$id' must be [A-Za-z0-9._-]+ (set FLEET_COORDINATOR)" ;; esac
 }
 token_file() { printf '%s/tokens/%s' "$(local_path "$STATE")" "$(coordinator_id)"; }
