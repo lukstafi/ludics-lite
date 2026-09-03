@@ -55,6 +55,7 @@ done
 A box that runs the `issue-wave` coordinator itself under Codex needs that skill discoverable too:
 
 ```sh
+mkdir -p "$HOME/.codex/skills"
 ln -sfn "$HOME/ludics-lite/issue-wave" "$HOME/.codex/skills/issue-wave"
 ```
 
