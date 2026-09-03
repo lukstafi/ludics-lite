@@ -3,6 +3,16 @@
 
 set -uo pipefail
 
+# Bash reads a script file by offset while it runs, so rewriting this file mid-run resumes the
+# shell at a shifted offset, in the middle of whatever command now sits there. The test suite runs
+# this helper once per case while a review round can be editing it. Everything below is one brace
+# group: it is parsed whole before its first command runs, and the closing exit means nothing past
+# it is ever read. The group opens right here, above the first fork, so no line of this file is
+# read after any of it has executed; `set` is a builtin and cannot be interrupted by a rewrite.
+# The body keeps its original indentation, so the guard is a two-line change. CI checks that the
+# file still ends in `exit "$?"` and `}`: a command appended past the group is never read, and
+# the failure would otherwise be silent ("my change did nothing").
+{
 # Repository-local environment overrides take precedence over -C and can redirect both reads and
 # mutations away from the explicit checkout arguments. Ask Git for its complete local set, then
 # clear it before interpreting either path.
@@ -955,12 +965,6 @@ cleanup_reservations() {
   [ -z "${LATE_SESSION_ARCHIVE:-}" ] || rmdir "$LATE_SESSION_ARCHIVE" >/dev/null 2>&1 || true
 }
 
-# Bash reads a script file by offset while it runs, so rewriting this file mid-run resumes the
-# shell at a shifted offset, in the middle of whatever command now sits there. The test suite runs
-# this helper once per case while a review round can be editing it. Everything below is one brace
-# group: it is parsed whole before its first command runs, and the closing exit means nothing past
-# it is ever read. The body keeps its original indentation, so the guard is a two-line change.
-{
 MASTER_RESERVATION=""
 MASTER_HEAD_LOCK=""
 MASTER_HEAD_LOCK_OWNED=0

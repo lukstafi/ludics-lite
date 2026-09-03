@@ -115,6 +115,41 @@ exec "$REAL_TMUX" "\$@"
 EOF
 chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux"
 
+# --- the real checkout, installed by the README's own loops, must pass the preflight ---------
+# The scratch checkout further down is built to the layout the preflight expects, so the two
+# can agree with each other while both disagree with the repository: after the extraction into
+# this repo the preflight went on scanning a ClaudeDesktop/ tree that no longer existed, and the
+# suite passed (ludics-lite#16). This pins the served-tree assumption to the actual tree. The
+# commit this test lives in is pushed to a scratch origin, cloned to ~/ludics-lite under a
+# scratch HOME, installed with the install loops extracted from README.md (minus their git
+# clone), and preflighted for both worker kinds, so the README's loop and the preflight's
+# expected link target are read from where they live rather than restated here.
+echo "--- the real checkout under the README's install loops"
+real_top=$(git -C "$HERE" rev-parse --show-toplevel)
+readme_block() { # <text>: the first fenced code block of README.md containing the text
+  awk -v want="$1" '
+    /^```/ { if (inblock) { if (index(block, want)) { printf "%s", block; exit } block = "" }; inblock = !inblock; next }
+    inblock { block = block $0 "\n" }
+  ' "$real_top/README.md"
+}
+real_home="$TMP/real-home"; real_origin="$TMP/real-origin.git"
+mkdir -p "$real_home"
+git init -q --bare "$real_origin"
+git -C "$real_top" push -q "$real_origin" HEAD:refs/heads/main || ko "could not push the real checkout's HEAD to the scratch origin (setup, not the launcher)"
+git clone -q -b main "$real_origin" "$real_home/ludics-lite" || ko "could not clone the scratch origin (setup, not the launcher)"
+claude_loop=$(readme_block 'ludics-lite/*/' | grep -v '^git clone ')
+codex_loop=$(readme_block 'for s in ship-pr wait-and-proceed after-merge' | grep -v '^git clone ')
+[ -n "$claude_loop" ] && [ -n "$codex_loop" ] && ok "README.md carries both install loops" || ko "could not find the README's install loops"
+( export HOME="$real_home"; eval "$claude_loop" && eval "$codex_loop" ) || ko "the README's install loops failed: $claude_loop $codex_loop"
+[ -L "$real_home/.claude/skills/ship-pr" ] && ok "the README's loop links ship-pr" || ko "the README's loop did not link ship-pr into ~/.claude/skills"
+# FLEET_SKILLS_REPO is at its default here on purpose: ~/ludics-lite is where the README clones
+# to, and the default must agree with it. Unset explicitly, since a configured fleet environment
+# exports it, and an absolute value would send this preflight to the box's real checkout.
+expect "the real checkout, installed the README's way, passes the claude preflight" 0 "PREFLIGHT OK" -- \
+  env -u FLEET_SKILLS_REPO HOME="$real_home" "$FW" preflight testbox --no-probe
+expect "...and the codex preflight" 0 "PREFLIGHT OK" -- \
+  env -u FLEET_SKILLS_REPO HOME="$real_home" "$FW" preflight testbox --codex --no-probe
+
 # --- a scratch skills checkout with an origin, deployed the way the README deploys it --------
 origin="$TMP/origin.git"; repo="$TMP/ludics lite"
 git init -q --bare "$origin"

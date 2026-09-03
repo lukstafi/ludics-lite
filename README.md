@@ -36,6 +36,10 @@ Rerun the loop after adding a skill. Replace any pre-existing real directory in
 `~/.claude/skills/` by hand first, and diff it against this copy, since a divergent local edit
 may be a fix worth keeping.
 
+These loops are executed, not just quoted: the fleet launcher's test suite extracts them from
+this README, runs them against a scratch clone of the checkout, and preflights the result, so a
+loop that stops matching the layout the preflight expects fails the suite.
+
 Keep these `~/.claude/skills` links even on a Codex-only box: command examples use them as the
 canonical script paths. The `~/.codex/skills` links below are additionally required for Codex to
 discover the skills.
@@ -100,7 +104,20 @@ The shell scripts carry their own test suites:
 ```sh
 issue-wave/scripts/test-fleet-worker.sh
 ship-pr/scripts/test-post-merge-cleanup.sh
+ship-pr/scripts/test-pr-review-base-drift.sh
 ```
+
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all three on Ubuntu and
+macOS (the fleet's bash is 3.2) for every push and pull request, along with `bash -n`, shellcheck
+at error severity, and a check that the two cleanup scripts still carry their parse guard. It runs
+without path filters, so every PR's merge gate reads a verdict rather than `ABSENT`.
+
+`test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
+deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and
+reported instead of holding the job until CI's own timeout. `SHIP_PR_TEST_LOG_DIR` keeps the
+per-case logs where CI can collect them. The runner also tests itself, from patched scratch copies:
+refused arguments, `--help` with an inherited pid list, the deadline, and an in-place rewrite of
+both scripts mid-run (with a negative control that strips the parse guard).
 
 ## Why symlinks, not copies
 

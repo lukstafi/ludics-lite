@@ -52,9 +52,15 @@ script; they are what the coordinator tells its workers.
   a parallelism analysis, machine placement, and a ready-now first wave. If it has a design
   questions section (see Decision gate), that too.
 - **The fleet**: `mac-studio` (Metal + cc, the reference dev box), `rog-nv-wsl` (CUDA, 24
-  cores), `minix-amd-wsl` (HIP, 32 cores). The plan's Machine-placement section is the
-  **dispatch table**: an issue it assigns to ROG or Minix runs there; everything else runs on
-  mac-studio. It makes placement a lookup - do not re-derive hardware needs from issue bodies.
+  cores), `minix-amd-wsl` (HIP, 32 cores). Placement is a lookup, never a re-derivation of
+  hardware needs from issue bodies: where the plan's first-wave list carries a box per item,
+  that column is the **dispatch table**. Where it still places by prose - the Machine-placement
+  paragraphs, one per box, listing *legs* of issues rather than issues (ludics-lite#13) - derive
+  one box per issue from them before proposing the wave: an issue's home is the box where its
+  iteration happens, an issue with legs on two boxes goes to its home box with the other leg
+  driven over ssh (GPU work, in Supervise), and everything the paragraphs do not name runs on
+  mac-studio. Put the derived table in the wave summary so the user corrects a misread before
+  a CUDA-iterating issue lands on the wrong box.
   `fleet-worker.sh load` (flotilla, `http://mac-studio:7799/api/fleet`) gives reachability and
   current load per box; `fleet-worker.sh ls` lists live and finished workers on every box.
 - **Project conventions**: the repo's CLAUDE.md and agent-notes govern how workers work

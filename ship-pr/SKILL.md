@@ -12,6 +12,9 @@ ending at the merge.
 Scoping (one goal per PR, one design move per commit) is the project's own convention — check
 CLAUDE.md/AGENTS.md before splitting work differently.
 
+`master` below stands for the repository's base branch. Where that is `main` (this repository,
+for one), substitute it in the commands, and pass `--base main` to the cleanup helper at the end.
+
 ## Fire when the work is done, not when a PR is asked for
 
 Reaching a finished goal with unlanded changes is itself the trigger; landing does not wait for
@@ -584,7 +587,13 @@ a half on a 4-core CI runner, where the serial run took eight, and in well under
 desktop. Each case's output is buffered and printed whole when it completes, so a failure report
 never interleaves with another case; passing cases print only their `PASS:` line unless `-v` asks
 for everything. Failures do not stop the other cases — the closing `FAIL:` line names every case
-that failed.
+that failed. Each case runs in its own process group under a deadline
+(`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a case still running at its deadline is
+killed as a group and reported with its log, so one stalled case cannot hold a CI job to the
+job's own timeout, which one did for six hours. The runner tests itself as well, from patched
+scratch copies — refused arguments, `--help` with an inherited pid list, the deadline, and an
+in-place rewrite of both scripts while a case runs, which the brace group each script is wrapped
+in makes harmless (the negative control strips it and must resume at the rewritten offset).
 
 A squash or rebase merge does not preserve ancestry. After independently confirming that merge,
 make the exception explicit and leave its reason in the transcript:

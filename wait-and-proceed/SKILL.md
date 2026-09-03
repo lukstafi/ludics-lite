@@ -50,7 +50,8 @@ check passing:
 ```
 
 Options: `--base` (default `origin/master`), `--timeout` (default 4h), `--interval` (default 60s),
-`--repo`, `--label`.
+`--repo`, `--label`. The script does not detect the base branch: on a repository whose base is
+`main`, pass `--base origin/main`, or a branch merged there reads as unlanded until the timeout.
 
 ## Read the outcome, do not assume it
 
@@ -58,7 +59,7 @@ Every exit prints one line. Four of the five are not "go":
 
 | Exit | Line | What to do |
 |---|---|---|
-| 0 | `CLEAR:` | Proceed — step 5. |
+| 0 | `CLEAR:` | Proceed — "On wake" below. |
 | 3 | `TIMEOUT:` | Nothing landed in the window. Report to the user; do not start on a guess. |
 | 4 | `ERROR:` | Predicate unevaluable (wrong repo path). Fix and re-arm. |
 | 5 | `ABANDONED:` | The PR was closed unmerged — this will never clear. Tell the user; the plan needs rethinking, not a longer wait. |

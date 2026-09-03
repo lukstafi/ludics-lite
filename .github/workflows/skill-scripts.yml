@@ -1,0 +1,115 @@
+name: skill scripts
+
+# The shell behind the skills: syntax, shellcheck, the parse guard the cleanup scripts carry,
+# and the three test suites, on the two platforms the fleet runs (bash 3.2 on macOS is the
+# reason macOS is not optional). Every push and pull request runs it, without path filters, so
+# `pr-review.sh merge` always finds a verdict on the head commit rather than ABSENT
+# (ludics-lite#21).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One run per ref: a new push supersedes the previous run instead of stacking behind it.
+concurrency:
+  group: skill-scripts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: syntax, shellcheck, parse guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: |
+          set -e
+          for f in */scripts/*.sh; do bash -n "$f"; done
+      - name: Shellcheck
+        # Errors only: the warning tier is style and a few false positives on deliberately
+        # unquoted globs; the error tier is what breaks a script.
+        run: shellcheck --severity=error --external-sources */scripts/*.sh
+      - name: Parse guard
+        # post-merge-cleanup.sh and test-post-merge-cleanup.sh are each one brace group ending
+        # in `exit "$?"` and `}` (ludics-lite#10), so a mid-run rewrite cannot resume the shell
+        # at a shifted offset. The cost is that a command appended past the closing brace is
+        # never read, and that failure is silent; this is the guard on the guard.
+        run: |
+          set -e
+          for f in ship-pr/scripts/post-merge-cleanup.sh ship-pr/scripts/test-post-merge-cleanup.sh; do
+            if [ "$(tail -n 2 "$f")" != "$(printf 'exit "$?"\n}')" ]; then
+              echo "::error file=$f::$f must end in 'exit \"\$?\"' and '}' (the parse guard); anything past them is never read"
+              exit 1
+            fi
+            if ! awk '/^set -[a-z]*o pipefail$/ { s = NR; next } s && !/^#/ && !/^$/ { seen = 1; exit ($0 == "{") ? 0 : 1 } END { if (!seen) exit 1 }' "$f"; then
+              echo "::error file=$f::$f must open its brace group as the first command after 'set -o pipefail', above the first fork"
+              exit 1
+            fi
+          done
+
+  pr-review:
+    name: pr-review fixtures (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise the merge-time base-drift intersection
+        run: ship-pr/scripts/test-pr-review-base-drift.sh
+
+  cleanup:
+    name: post-merge cleanup (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # One stalled case once held a macOS job for the six-hour default (ludics-lite#14). The
+    # suite now kills a case at SHIP_PR_TEST_CASE_TIMEOUT and reports it; this is the backstop.
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      SHIP_PR_TEST_LOG_DIR: ${{ github.workspace }}/cleanup-logs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise post-merge branch states
+        run: ship-pr/scripts/test-post-merge-cleanup.sh
+      - name: Keep the per-case logs
+        # The log of a failed or timed-out case is already in the job output; the artifact is
+        # for the run that hangs anyway, when the in-flight cases' partial logs are the evidence.
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-logs-${{ matrix.os }}
+          path: ${{ github.workspace }}/cleanup-logs
+          if-no-files-found: ignore
+
+  fleet-worker:
+    name: fleet launcher (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The suite installs the real checkout the way the README does and preflights it, so
+          # it needs the whole tree, not a shallow view of it.
+          fetch-depth: 0
+      - name: Install tmux
+        run: |
+          set -e
+          if command -v apt-get >/dev/null; then sudo apt-get update -q && sudo apt-get install -y -q tmux; fi
+          if command -v brew >/dev/null; then brew list tmux >/dev/null 2>&1 || brew install tmux; fi
+          command -v tmux && command -v jq
+      - name: Exercise the fleet launcher against the local box
+        run: issue-wave/scripts/test-fleet-worker.sh
