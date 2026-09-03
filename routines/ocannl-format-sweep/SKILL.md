@@ -12,7 +12,9 @@ Working directory: /Users/lukstafi/ocannl-staging (the main checkout — not a w
    - "not a quiet period" (open PRs or active worktrees), "not on master", "working tree not clean", or "local commits not on origin/master": this is the designed no-op. End with a one-line report.
    - "repository already formatted; nothing to do": end with a one-line report.
    - "pushed <sha>": the sweep landed. Report the SHA in one line.
-   - "origin/master moved during the sweep; dropped the sweep": a benign race; it retries on the next scheduled run. One-line report.
+   - "origin/master moved during the sweep; dropped the sweep", "quiet period ended during the sweep; dropped the sweep",
+     "git fetch failed; dropped the sweep", or "push failed; dropped the sweep": the post-commit gates and network steps
+     rechecked and the script reverted the tree itself. All benign; each retries on the next scheduled run. One-line report.
    - A test-gate failure ("@check failed", "test suite failed...") or "no fixed point after N rounds": the script has already reverted the tree. Do NOT re-run it, do NOT use --force, do NOT hand-edit goldens, do NOT push anything. Read the test-run log the output names (a path under ~/.ocannl-test-runs/) and report a short diagnosis. The most likely cause of non-convergence is an ocamlformat-hostile golden (for example a new test/ppx/*_expected.ml) missing from .ocamlformat-ignore.
    - "gh failed": report that the quiet-period check could not reach GitHub; do not override it.
 3. If formatting failed for a formatting-specific, well-scoped, low effort and impact, unambiguous reason, act: attach a floating docu-comment, separate an ambiguously attached docu-comment from the code it doesn't describe, update a broken code link if the intended target can be confidently traced etc. --  fix the problem, commit directly on master, push it (a direct-to-master landing under the ship-pr rules; the entry gate refuses a checkout with local commits not on origin/master, so an unpushed repair only produces that no-op and blocks every later scheduled sweep), and try again from (1). Otherwise report the problem and stop.

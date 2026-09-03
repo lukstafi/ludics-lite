@@ -11,7 +11,9 @@ matrix fast (gh-ocannl-756; the decision is recorded at the runtest step in `.gi
 have no automated coverage except this sweep, so this routine is the ONLY gate for all five of
 those backends. The CUDA box (rog-nv-wsl) and HIP box
 (minix-amd-wsl) are often hibernated, and sometimes powered off; step 1 tries to wake them, but if that fails,
-"skip (unreachable)" is a normal outcome, not an error. CI does not cover a Windows OS target to maintain developer momentum.
+"skip (unreachable)" is a normal outcome, not an error. CI's Windows OS target is likewise off the per-PR path: it runs only on the
+twice-weekly scheduled CI sweep, and on demand via `workflow_dispatch`, because at 62-74min it
+set the latency of the whole per-PR matrix.
 
 ## 1. Wake the GPU boxes
 
@@ -136,9 +138,7 @@ are different claims:
   and is the backend green" age, thresholded below.
 - **Execution coverage**: the most recent full-scope `pass` row with `execution=forced`. Flag any
   backend whose last forced pass is more than 14 days old (the Sunday `--force` cadence plus one
-  missed week) — incremental greens in between may be cache hits and cannot stand in for it. Until
-  the first Sunday forced run after 2026-08-26 there are no such rows at all; say that plainly
-  once rather than flagging all five backends.
+  missed week) — incremental greens in between may be cache hits and cannot stand in for it.
 
 For each of the FIVE backends (cc, multidev_cc, metal, cuda, hip) find the most recent qualifying
 liveness row. Flag backends with no pass in more than 2 days. For cuda or hip, say which of the three step-1 outcomes applied: woken
