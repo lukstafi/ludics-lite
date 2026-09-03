@@ -202,7 +202,7 @@ test_master_owned_by_other_worktree() {
 }
 
 test_main_base_support() {
-  local refusal
+  local invalid refusal
   setup_case main-base merge main main
   "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --base main >/dev/null
   assert_cleaned
@@ -217,6 +217,17 @@ test_main_base_support() {
   *"topic is not an ancestor of origin/main"*) ;;
   *) fail "main-base refusal did not name origin/main: $refusal" ;;
   esac
+  assert_topic_preserved
+
+  for invalid in HEAD -release; do
+    if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --base "$invalid" 2>&1); then
+      fail "invalid base shorthand unexpectedly passed: $invalid"
+    fi
+    case "$refusal" in
+    *"invalid base branch name: $invalid"*) ;;
+    *) fail "invalid base shorthand was not diagnosed: $refusal" ;;
+    esac
+  done
   assert_topic_preserved
   echo "PASS: main base cleanup and unmerged refusal"
 }

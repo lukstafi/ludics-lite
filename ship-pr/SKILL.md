@@ -639,7 +639,8 @@ were doing, give the command, and let the user decide. Never work around it.
 
 After merging: run the `after-merge` brainstorm FIRST, while the session's friction is still in
 context. Then refresh the base for the next branch (`git fetch origin`, then branch off
-`origin/master` again) and tear down any scratch worktrees the work created on remote machines.
+the selected `origin/<base>` again) and tear down any scratch worktrees the work created on remote
+machines.
 Nothing further is owed: trailing CI on the new tip is the CI-red triage routine's business
 (the stale-base section owns the division of responsibilities and the takeover protocol) — and
 a plain `base` read seconds after a merge would only report the previous tip's green anyway,

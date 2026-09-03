@@ -1021,7 +1021,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-git check-ref-format "refs/heads/$BASE_BRANCH" >/dev/null 2>&1 ||
+git check-ref-format --branch "$BASE_BRANCH" >/dev/null 2>&1 ||
   fail "invalid base branch name: $BASE_BRANCH"
 [ "$BRANCH" != "$BASE_BRANCH" ] || fail "refusing to clean up the base branch $BASE_BRANCH"
 git check-ref-format "refs/heads/$BRANCH" >/dev/null 2>&1 || fail "invalid branch name: $BRANCH"
