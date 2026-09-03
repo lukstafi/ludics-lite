@@ -220,6 +220,7 @@ codex_loop=$(readme_block 'for s in ship-pr wait-and-proceed after-merge' | grep
 [ -n "$claude_loop" ] && [ -n "$codex_loop" ] && ok "README.md carries both install loops" || ko "could not find the README's install loops"
 ( export HOME="$real_home"; eval "$claude_loop" && eval "$codex_loop" ) || ko "the README's install loops failed: $claude_loop $codex_loop"
 [ -L "$real_home/.claude/skills/ship-pr" ] && ok "the README's loop links ship-pr" || ko "the README's loop did not link ship-pr into ~/.claude/skills"
+[ ! -e "$real_home/.claude/skills/routines" ] && ok "the README's loop keeps routines/ out of ~/.claude/skills" || ko "the README's loop linked routines/ into ~/.claude/skills"
 # FLEET_SKILLS_REPO is at its default here on purpose: ~/ludics-lite is where the README clones
 # to, and the default must agree with it. Unset explicitly, since a configured fleet environment
 # exports it, and an absolute value would send this preflight to the box's real checkout.
