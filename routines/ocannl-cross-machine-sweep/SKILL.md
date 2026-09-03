@@ -39,6 +39,10 @@ Read its last lines:
 - `wsl still down after 3 min` on a box that woke means the machine is up but the backend is
   untestable — say so explicitly in the report, since it is a different finding from a box that
   never woke.
+- `no host table at ~/.config/wake-lab/hosts.sh`: nothing was woken and nothing will be. That
+  file is this box's untracked site configuration for the script (the top-level README of
+  ludics-lite says how to install it); report the missing setup as the finding rather than the
+  boxes as unreachable.
 - `all up` and `wsl up`: start the sweep promptly. A VM kicked on a cold-booted box does not
   always stay up on its own; once a unit's ssh session is running inside it, it does.
 
@@ -53,8 +57,9 @@ outcome) and do not kick or rerun again.
 
 Everything else about these boxes — WoL over Ethernet only, waking from a full shutdown, what
 `link=1` means, the cold-boot kicked-VM trap, Tailscale unattended mode, the `exit 0` vs `true`
-probe trap — is verified and recorded in the header comment of `~/bin/wake-lab.sh`; do not spend
-the run rediscovering it.
+probe trap — is verified and recorded in the header comment of `scripts/wake-lab.sh` in
+ludics-lite, which is what `~/bin/wake-lab.sh` links to and what `~/bin/wake-lab.sh --help`
+prints; do not spend the run rediscovering it.
 
 Do not power the boxes back down afterwards — the user may want them for the day's work, and the
 next sweep can always wake them again.
