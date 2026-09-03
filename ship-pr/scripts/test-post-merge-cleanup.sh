@@ -5,6 +5,16 @@
 
 set -euo pipefail
 
+# Bash reads a script file by offset while it runs, so rewriting this file mid-run resumes the
+# shell at a shifted offset, in the middle of whatever command now sits there — that is how two
+# runs of this suite skipped their final wait loop and removed the scratch root under cases still
+# running. Everything below is one brace group: it is parsed whole before its first command runs,
+# and the closing exit means nothing past it is ever read. The group opens right here, above the
+# first fork, so no line of this file is read after any of it has executed (ludics-lite#10). The
+# body keeps its original indentation, so the guard is a two-line change. CI checks that the file
+# still ends in `exit "$?"` and `}`, and test_runner_survives_midrun_rewrite exercises the
+# property against a scratch copy: a command appended past the group is never read.
+{
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 HELPER="$SCRIPT_DIR/post-merge-cleanup.sh"
 TEST_ROOT=$(mktemp -d "/tmp/post-merge-cleanup-test.XXXXXX") || exit 1
@@ -13,6 +23,7 @@ TEST_ROOT=$(mktemp -d "/tmp/post-merge-cleanup-test.XXXXXX") || exit 1
 # must not find an inherited variable of the same name and signal whatever it lists.
 RUNNING_PIDS=()
 RUNNING_NAMES=()
+RUNNING_STARTS=()
 RUNNING=0
 
 cleanup() {
@@ -3328,6 +3339,208 @@ test_merge_options_cleanup() {
   echo "PASS: standard branch mergeOptions configuration is removed"
 }
 
+# --- runner self-cases (ludics-lite#9) -------------------------------------------------------
+# The runner's own behaviors used to be verified by hand from patched scratch copies, repeated by
+# nothing in CI. These point the runner at itself: a scratch COPY of this script and the helper,
+# patched with sed the way the hand checks were, run with -j 1 inside so the nested runner's job
+# control never overlaps this one's. Each asserts on the copy's exit status, its summary line, and
+# the absence of the copy's own scratch root — never on this runner's state.
+
+RUNNER="$SCRIPT_DIR/test-post-merge-cleanup.sh"
+SELF_CASE=test_missing_branch_config # an ordinary quick case: one repository, one helper call
+
+# copy_runner <dir> <root-tag>: a scratch copy of the runner and the helper, its scratch root
+# template renamed so the copy's tree can be told from this run's and asserted gone afterwards.
+copy_runner() {
+  local dir="$1" tag="$2"
+  mkdir -p "$dir"
+  sed "s|/tmp/post-merge-cleanup-test\.XXXXXX|/tmp/post-merge-cleanup-test.$tag.XXXXXX|" "$RUNNER" \
+    >"$dir/test-post-merge-cleanup.sh"
+  grep -q "post-merge-cleanup-test\.$tag\.XXXXXX" "$dir/test-post-merge-cleanup.sh" ||
+    fail "could not retarget the copy's scratch root"
+  cp "$HELPER" "$dir/post-merge-cleanup.sh"
+  chmod +x "$dir/test-post-merge-cleanup.sh" "$dir/post-merge-cleanup.sh"
+}
+
+# run_copy <command...>: run a scratch copy without this run's knobs. SHIP_PR_TEST_LOG_DIR in
+# particular must not reach it: the copy would write its status files beside this runner's, and
+# reap_one would read a copy's verdict as one of ours.
+run_copy() {
+  env -u SHIP_PR_TEST_LOG_DIR -u SHIP_PR_TEST_CASE_TIMEOUT -u SHIP_PR_TEST_JOBS "$@"
+}
+
+# assert_copy_root_gone <root-tag>: the copy removed its scratch root on every exit path.
+assert_copy_root_gone() {
+  local root
+  for root in /tmp/post-merge-cleanup-test."$1".*; do
+    [ ! -e "$root" ] || fail "the copy left its scratch root behind: $root"
+  done
+}
+
+# rewrite_in_place <file>: rewrite the file through its existing inode — truncate, then write —
+# as an editor or tool that saves in place does to a running script. The new text is the old
+# with padding inserted after the shebang, sized so that the byte offset where the runner will
+# next read the file (right after the `done` of its final wait loop: bash discards its read
+# buffer at every fork and resumes from the file offset) now holds three lines that print a
+# marker and exit 99. A shell that re-reads the file lands on them; one that parsed the whole
+# group before running never looks. Unguarded, the same rewrite with plain comment padding once
+# resumed at a harmless spot and reprinted a case's PASS line, so the landing is aimed, not left
+# to where the shift happens to fall.
+rewrite_in_place() {
+  local file="$1" first_line resume_at pad i=0 rewritten
+  first_line=$(head -n 1 "$file")
+  resume_at=$(grep -b '^done$' "$file" | tail -n 1 | cut -d: -f1) || resume_at=""
+  [ -n "$resume_at" ] || fail "no wait loop to aim the rewrite at in $file"
+  resume_at=$((resume_at + 5))
+  pad=$((resume_at - ${#first_line} - 1))
+  [ "$pad" -ge 0 ] || fail "the resume point precedes the shebang in $file"
+  rewritten=$(
+    printf '%s\n' "$first_line"
+    awk -v n="$pad" 'BEGIN {
+      while (n >= 80) { printf "%-79s\n", "#"; n -= 80 }
+      if (n == 1) printf "\n"
+      else if (n > 1) { printf "#"; for (i = 2; i < n; i++) printf "#"; printf "\n" }
+    }'
+    while [ "$i" -lt 3 ]; do
+      echo 'echo "REWRITE_RESUMED: the shell re-read this file at line $LINENO" >&2; exit 99'
+      i=$((i + 1))
+    done
+    tail -n +2 "$file"
+  )
+  printf '%s\n' "$rewritten" >"$file"
+}
+
+# unguard <file>: strip the brace group (ludics-lite#10) from a copy — the first line that is
+# exactly `{`, and the closing `exit "$?"` and `}` — leaving a plain top-level script.
+unguard() {
+  local file="$1" stripped
+  [ "$(tail -n 2 "$file")" = "$(printf 'exit "$?"\n}')" ] || fail "the copy does not end in the guard's exit and brace"
+  stripped=$(awk 'BEGIN { opened = 0 } { if (!opened && $0 == "{") { opened = 1; next } print }' "$file" | sed '$d' | sed '$d')
+  printf '%s\n' "$stripped" >"$file"
+}
+
+# run_copy_rewritten <copy-dir> <out-file> <rewrite-helper-too>: run the copy on SELF_CASE and
+# rewrite its script(s) in place while that case runs. Prints the copy's exit status.
+run_copy_rewritten() {
+  local copy="$1" out="$2" helper_too="$3" pid rc
+  run_copy "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null &
+  pid=$!
+  # The case takes several seconds, so the copy is inside its wait loop by now. An earlier
+  # rewrite would not matter: any re-read from an offset ahead of the marker lands in the padding
+  # and slides into it.
+  sleep 1.5
+  rewrite_in_place "$copy/test-post-merge-cleanup.sh"
+  [ "$helper_too" -eq 0 ] || rewrite_in_place "$copy/post-merge-cleanup.sh"
+  if wait "$pid"; then rc=0; else rc=$?; fi
+  echo "$rc"
+}
+
+test_runner_survives_midrun_rewrite() {
+  # Candidate (7) of ludics-lite#9, grounded in ludics-lite#10: bash reads a script by offset
+  # while it runs, so an in-place rewrite of the runner or the helper mid-run resumed the shell at
+  # a shifted offset (once: skipping the final wait loop and removing the root under live cases).
+  # Both scripts are one brace group parsed whole before its first command. The guarded copies
+  # are rewritten while a case runs and must still end with the ordinary summary; the negative
+  # control — the same rewrite of a copy with the group stripped — must not, which is what makes
+  # this a regression test rather than a tautology. A command appended past the guarded copy's
+  # closing brace must never run either.
+  local tag="rw$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" rc
+  copy_runner "$copy" "$tag-guarded"
+  echo 'echo SHOULD_NOT_RUN' >>"$copy/test-post-merge-cleanup.sh"
+  rc=$(run_copy_rewritten "$copy" "$out" 1)
+  [ "$rc" -eq 0 ] || fail "the guarded copy exited $rc after a mid-run rewrite: $(cat "$out")"
+  grep -q '^PASS: 1 selected post-merge cleanup states' "$out" ||
+    fail "the guarded copy printed no summary after a mid-run rewrite: $(cat "$out")"
+  ! grep -q SHOULD_NOT_RUN "$out" || fail "a command appended past the closing brace ran: $(cat "$out")"
+  ! grep -q '^REWRITE_RESUMED' "$out" || fail "the guarded copy re-read its file after the rewrite: $(cat "$out")"
+  assert_copy_root_gone "$tag-guarded"
+
+  rm -rf "$copy"
+  copy_runner "$copy" "$tag-unguarded"
+  unguard "$copy/test-post-merge-cleanup.sh"
+  rc=$(run_copy_rewritten "$copy" "$out" 0)
+  [ "$rc" -eq 99 ] && grep -q '^REWRITE_RESUMED' "$out" ||
+    fail "negative control: a copy without the brace group did not resume at the rewritten offset (exit $rc), so the guard is not what this case tests: $(cat "$out")"
+  # The resumed shell exits through its EXIT trap, which removes the copy's root; nothing of the
+  # run may outlive this case either way.
+  sleep 1
+  rm -rf /tmp/post-merge-cleanup-test."$tag-unguarded".*
+  echo "PASS: an in-place rewrite of the runner and the helper mid-run does not corrupt the run; without the guard it resumes at the rewritten offset"
+}
+
+test_runner_kills_a_case_past_its_deadline() {
+  # ludics-lite#14: a case that stalls (one sat silent for six hours of macOS CI) is killed with
+  # its whole process group at SHIP_PR_TEST_CASE_TIMEOUT, reported as a failure naming the
+  # deadline together with its log, and the run still ends with its root removed.
+  local tag="dl$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" rc marker patched
+  marker="sleep 3571.$$" # a duration no other process on the box is sleeping for
+  copy_runner "$copy" "$tag"
+  patched=$(sed "s/^$SELF_CASE() {\$/$SELF_CASE() { $marker;/" "$copy/test-post-merge-cleanup.sh")
+  printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
+  grep -q "^$SELF_CASE() { $marker;" "$copy/test-post-merge-cleanup.sh" || fail "could not plant the stall in the copy"
+  if run_copy env SHIP_PR_TEST_CASE_TIMEOUT=2 "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 1 ] || fail "the copy exited $rc with a stalled case, expected 1: $(cat "$out")"
+  grep -q "timed out after 2s (SHIP_PR_TEST_CASE_TIMEOUT); its process group was killed" "$out" ||
+    fail "the stalled case was not reported against its deadline: $(cat "$out")"
+  grep -q "^FAIL: 1 of 1 post-merge cleanup states failed" "$out" || fail "no failing summary: $(cat "$out")"
+  sleep 0.5
+  ! pgrep -f "sleep 3571\\.$$" >/dev/null 2>&1 || fail "the stalled case's process group survived the deadline"
+  assert_copy_root_gone "$tag"
+  echo "PASS: a case past its deadline is killed with its process group and reported"
+}
+
+test_runner_refuses_bad_arguments() {
+  # Candidate (5) of ludics-lite#9: every refused invocation exits 1 before any case starts and
+  # names the problem, and --list spells the names the refusals are checked against.
+  local out rc
+  refused() { # <label> <expected message> <args...>
+    local label="$1" want="$2"
+    shift 2
+    if out=$("$RUNNER" "$@" 2>&1 </dev/null); then rc=0; else rc=$?; fi
+    [ "$rc" -eq 1 ] || fail "$label: exit $rc, expected 1: $out"
+    case "$out" in *"$want"*) ;; *) fail "$label: expected '$want' in: $out" ;; esac
+    case "$out" in *"PASS:"* | *"===== FAIL"*) fail "$label: a case ran before the refusal: $out" ;; esac
+  }
+  refused "an empty --jobs=" "must be a positive integer, got ''" --jobs= "$SELF_CASE"
+  refused "-j 00" "must be a positive integer, got '00'" -j 00 "$SELF_CASE"
+  refused "-j abc" "must be a positive integer, got 'abc'" -j abc "$SELF_CASE"
+  refused "-j without a count" "needs a job count" "$SELF_CASE" -j
+  refused "a duplicated name" "test name given more than once: $SELF_CASE" "$SELF_CASE" "$SELF_CASE"
+  refused "an unknown name" "unknown test name: test_no_such_case" test_no_such_case
+  refused "an unknown option" "unknown option: --bogus" --bogus
+  if out=$(SHIP_PR_TEST_CASE_TIMEOUT=soon "$RUNNER" "$SELF_CASE" 2>&1 </dev/null); then rc=0; else rc=$?; fi
+  [ "$rc" -eq 1 ] || fail "a bad deadline: exit $rc, expected 1: $out"
+  case "$out" in
+  *"SHIP_PR_TEST_CASE_TIMEOUT must be a number of seconds, 0, or off, got 'soon'"*) ;;
+  *) fail "a bad deadline was not refused by name: $out" ;;
+  esac
+  out=$("$RUNNER" --list) || fail "--list exited nonzero"
+  printf '%s\n' "$out" | grep -qx "$SELF_CASE" || fail "--list does not spell $SELF_CASE"
+  printf '%s\n' "$out" | grep -qx test_runner_refuses_bad_arguments || fail "--list does not spell this case"
+  echo "PASS: refused arguments exit 1 before any case starts"
+}
+
+test_runner_help_ignores_inherited_pids() {
+  # Candidate (6) of ludics-lite#9: RUNNING_PIDS is declared before the EXIT trap is installed, so
+  # an exit ahead of the runner (--help here) cannot signal whatever an inherited variable of that
+  # name happens to list.
+  local bystander out
+  sleep 3573 &
+  bystander=$!
+  out=$(RUNNING_PIDS="$bystander" "$RUNNER" --help 2>&1) ||
+    fail "--help exited nonzero with an inherited RUNNING_PIDS: $out"
+  case "$out" in *"usage: test-post-merge-cleanup.sh"*) ;; *) fail "--help printed no usage: $out" ;; esac
+  sleep 0.2
+  kill -0 "$bystander" 2>/dev/null || fail "--help signalled the process an inherited RUNNING_PIDS named"
+  kill "$bystander" 2>/dev/null || true
+  wait "$bystander" 2>/dev/null || true
+  echo "PASS: --help with an inherited RUNNING_PIDS signals nothing"
+}
+
 TESTS=(
   test_unchecked_out_master
   test_master_owned_by_main
@@ -3447,6 +3660,10 @@ TESTS=(
   test_dotted_branch_config
   test_custom_branch_config
   test_merge_options_cleanup
+  test_runner_survives_midrun_rewrite
+  test_runner_kills_a_case_past_its_deadline
+  test_runner_refuses_bad_arguments
+  test_runner_help_ignores_inherited_pids
 )
 
 usage() {
@@ -3462,16 +3679,16 @@ or SHIP_PR_TEST_JOBS; default: the number of online processors). Each case's
 output is buffered and printed whole when it completes, so a failure report is
 never interleaved with another case; passing cases print only their PASS lines
 unless -v/--verbose asks for their full output. -j 1 runs the cases serially.
+
+Each case has a deadline: SHIP_PR_TEST_CASE_TIMEOUT seconds (default 300; 0 or
+off disables it). A case still running at its deadline has its process group
+killed and is reported as a failure naming the deadline, with its log, so one
+stalled case cannot hold the suite open until the CI job's own timeout.
+SHIP_PR_TEST_LOG_DIR keeps every case's log and status file in that directory
+instead of under the scratch root, where CI can collect them after a failure.
 USAGE
 }
 
-# Bash reads a script file by offset while it runs, so rewriting this file mid-run resumes the
-# shell at a shifted offset, in the middle of whatever command now sits there — that is how two
-# runs of this suite skipped their final wait loop and removed the scratch root under cases still
-# running. The runner below is one brace group: it is parsed whole before its first command runs,
-# and the closing exit means nothing past it is ever read. The body keeps its original
-# indentation, so the guard is a two-line change.
-{
 known_test() {
   local name="$1" candidate
   for candidate in "${TESTS[@]}"; do
@@ -3563,6 +3780,16 @@ esac
 JOBS="$JOBS_VALUE"
 [ "$JOBS" -le "$SELECTED_COUNT" ] || JOBS="$SELECTED_COUNT"
 
+CASE_TIMEOUT="${SHIP_PR_TEST_CASE_TIMEOUT:-300}"
+case "$CASE_TIMEOUT" in
+off) CASE_TIMEOUT=0 ;;
+'' | *[!0-9]*)
+  echo "FAIL: SHIP_PR_TEST_CASE_TIMEOUT must be a number of seconds, 0, or off, got '$CASE_TIMEOUT'" >&2
+  exit 1
+  ;;
+*) CASE_TIMEOUT=$((10#$CASE_TIMEOUT)) ;;
+esac
+
 # Every case builds its scratch repositories under $TEST_ROOT and reads nothing outside them, so
 # each one runs in a background subshell with a private root named after the case. The subshell
 # reports its exit status through a file: a zombie still answers `kill -0`, and bash 3.2 has no
@@ -3574,8 +3801,15 @@ JOBS="$JOBS_VALUE"
 # interrupt, and after every case, before its scratch tree is removed from under it. Without it
 # a killed case leaves descendants waiting on markers in a directory that no longer exists.
 set -m
-LOG_DIR="$TEST_ROOT/.logs"
-mkdir -p "$LOG_DIR"
+if [ -n "${SHIP_PR_TEST_LOG_DIR:-}" ]; then
+  LOG_DIR="$SHIP_PR_TEST_LOG_DIR" # kept after the run: CI collects it as an artifact on failure
+else
+  LOG_DIR="$TEST_ROOT/.logs"
+fi
+mkdir -p "$LOG_DIR" || {
+  echo "FAIL: cannot create the log directory $LOG_DIR" >&2
+  exit 1
+}
 PASSED_COUNT=0
 FAILED_COUNT=0
 FAILED=()
@@ -3593,15 +3827,55 @@ run_case() {
 }
 
 start_case() {
-  local name="$1"
+  local name="$1" pid pgid
+  # A kept log directory may hold a status file from a previous run; reap_one would take it for
+  # this case's verdict before the case had run.
+  rm -f "$LOG_DIR/$name.status"
   (run_case "$name") >"$LOG_DIR/$name.log" 2>&1 </dev/null &
-  RUNNING_PIDS+=("$!")
+  pid=$!
+  RUNNING_PIDS+=("$pid")
   RUNNING_NAMES+=("$name")
+  RUNNING_STARTS+=("$SECONDS")
   RUNNING=$((RUNNING + 1))
+  # Prove the case is in its own process group rather than trusting job control's handoff. Both
+  # sides of the fork call setpgid; on macOS the child's call intermittently fails with "child
+  # setpgid (N to N): Operation not permitted" (bash prints that line itself, before the case's
+  # redirections apply, so it cannot be silenced here). On every such occasion observed the
+  # parent's identical call had already succeeded — 354 spawns, 13 complaints, 0 wrong groups —
+  # so the line is noise; this check is what makes that a fact rather than a hope. A case that
+  # is nevertheless not a group leader is moved by the runner (allowed: a subshell has not
+  # exec'd) and, failing that, named, since only its leader can then be signalled.
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || pgid=""
+  if [ -n "$pgid" ] && [ "$pgid" != "$pid" ]; then
+    perl -e 'setpgrp($ARGV[0], $ARGV[0]) or exit 1' "$pid" 2>/dev/null || true
+    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || pgid=""
+    [ -z "$pgid" ] || [ "$pgid" = "$pid" ] ||
+      echo "WARN: $name (pid $pid) runs in process group $pgid, not its own; its descendants cannot be terminated as a unit" >&2
+  fi
 }
 
+# kill_case_group <pid>: terminate a case's process group and its leader, escalating to KILL
+# after a grace period, so a case wedged in something that ignores TERM still ends.
+kill_case_group() {
+  local pid="$1" tries=0 state
+  kill -TERM -- "-$pid" >/dev/null 2>&1 || true
+  kill -TERM "$pid" >/dev/null 2>&1 || true
+  while [ "$tries" -lt 25 ]; do
+    state=$(ps -o stat= -p "$pid" 2>/dev/null) || state=""
+    case "$state" in
+    '' | Z*) return 0 ;;
+    esac
+    sleep 0.2
+    tries=$((tries + 1))
+  done
+  kill -KILL -- "-$pid" >/dev/null 2>&1 || true
+  kill -KILL "$pid" >/dev/null 2>&1 || true
+}
+
+# report_case <index> [deadline-note]: reap the case and print its verdict. A deadline note
+# means the runner killed it: that is a failure whatever its status trap managed to write.
 report_case() {
-  local i="$1" name pid status log note wait_status
+  local i="$1" deadline_note="${2:-}" name pid status log note wait_status
   name="${RUNNING_NAMES[$i]}"
   pid="${RUNNING_PIDS[$i]}"
   log="$LOG_DIR/$name.log"
@@ -3609,7 +3883,10 @@ report_case() {
   stop_if_interrupted # a trapped signal returns from wait early; the case is still registered
   kill -TERM -- "-$pid" >/dev/null 2>&1 || true # anything the case left behind in its group
   note=""
-  if [ -f "$LOG_DIR/$name.status" ]; then
+  if [ -n "$deadline_note" ]; then
+    status=1
+    note="$deadline_note"
+  elif [ -f "$LOG_DIR/$name.status" ]; then
     status=$(cat "$LOG_DIR/$name.status" 2>/dev/null) || status=""
   else
     # The subshell died without its status trap running (a signal, or a broken trap): that is
@@ -3620,7 +3897,7 @@ report_case() {
   case "$status" in
   '' | *[!0-9]*) status=1 ;;
   esac
-  unset "RUNNING_PIDS[$i]" "RUNNING_NAMES[$i]"
+  unset "RUNNING_PIDS[$i]" "RUNNING_NAMES[$i]" "RUNNING_STARTS[$i]"
   RUNNING=$((RUNNING - 1))
   if [ "$status" -eq 0 ]; then
     PASSED_COUNT=$((PASSED_COUNT + 1))
@@ -3659,6 +3936,14 @@ reap_one() {
         return 0
         ;;
       esac
+      # The deadline (ludics-lite#14): a case that stalls — one sat silent for the six hours of a
+      # CI job's default timeout — is killed as a group and reported, naming the deadline, rather
+      # than polled for as long as the job lasts.
+      if [ "$CASE_TIMEOUT" -gt 0 ] && [ $((SECONDS - ${RUNNING_STARTS[$i]})) -ge "$CASE_TIMEOUT" ]; then
+        kill_case_group "${RUNNING_PIDS[$i]}"
+        report_case "$i" " — timed out after ${CASE_TIMEOUT}s (SHIP_PR_TEST_CASE_TIMEOUT); its process group was killed"
+        return 0
+      fi
     done
     sleep 0.2
   done
