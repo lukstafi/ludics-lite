@@ -198,7 +198,7 @@ fail() {
 
 die() { fail 2 "$@"; }
 
-warn() { echo "pr-review.sh: $*" >&2; }
+warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 
 # --- transport retries ----------------------------------------------------------------------
 # Only TRANSPORT failures are retried. A 4xx is the API ANSWERING — no such comment, no such PR,
@@ -1447,10 +1447,23 @@ esac
 # regression). The DIFFERENCE between "not behind" and "could not be read" is preserved here like
 # everywhere else in this file: a compare call that never answered must not print a reassuring
 # number.
+compare_file_set() {
+  jq -ce '
+    def valid_file:
+      (.filename | type) == "string" and (.filename | length) > 0
+      and ((has("previous_filename") | not) or .previous_filename == null
+        or ((.previous_filename | type) == "string" and (.previous_filename | length) > 0));
+    if (.files | type) == "array" and all(.files[]; valid_file) then
+      {count: (.files | length),
+       paths: ([.files[] | .filename, .previous_filename?]
+         | map(select(type == "string")) | unique)}
+    else error("missing or invalid files") end' <<<"$1" 2>/dev/null
+}
+
 warn_base_drift() {
   local pr="$1" fields base base_sha head_sha rc
   local forward reverse behind ahead forward_base reverse_base
-  local pr_files base_files pr_file_count base_file_count overlap overlap_count
+  local forward_set reverse_set pr_files base_files pr_file_count base_file_count overlap overlap_count
   local count_unknown="" overlap_unknown="" overlap_reason="" count_warn=""
   # Placeholders, never empty fields: tab is IFS whitespace, so an empty middle column would shift
   # a SHA into the wrong field (the same trap build_checks documents). Capture both endpoint SHAs
@@ -1489,13 +1502,9 @@ warn_base_drift() {
     <<<"$forward" 2>/dev/null) || ahead="?"
   forward_base=$(jq -er '.merge_base_commit.sha | strings | select(length > 0)' \
     <<<"$forward" 2>/dev/null) || overlap_unknown=1
-  pr_files=$(jq -ce '
-    if (.files | type) == "array" then
-      [.files[] | .filename, .previous_filename?]
-      | map(select(type == "string")) | unique
-    else error("missing files") end' <<<"$forward" 2>/dev/null) || overlap_unknown=1
-  pr_file_count=$(jq -er 'if (.files | type) == "array" then .files | length
-    else error("missing files") end' <<<"$forward" 2>/dev/null) || overlap_unknown=1
+  forward_set=$(compare_file_set "$forward") || overlap_unknown=1
+  pr_files=$(jq -ce '.paths' <<<"$forward_set" 2>/dev/null) || overlap_unknown=1
+  pr_file_count=$(jq -er '.count' <<<"$forward_set" 2>/dev/null) || overlap_unknown=1
 
   reverse=$(gh_retry read api "repos/$REPO/compare/$head_sha...$base_sha?per_page=1")
   rc=$?
@@ -1505,13 +1514,9 @@ warn_base_drift() {
   else
     reverse_base=$(jq -er '.merge_base_commit.sha | strings | select(length > 0)' \
       <<<"$reverse" 2>/dev/null) || overlap_unknown=1
-    base_files=$(jq -ce '
-      if (.files | type) == "array" then
-        [.files[] | .filename, .previous_filename?]
-        | map(select(type == "string")) | unique
-      else error("missing files") end' <<<"$reverse" 2>/dev/null) || overlap_unknown=1
-    base_file_count=$(jq -er 'if (.files | type) == "array" then .files | length
-      else error("missing files") end' <<<"$reverse" 2>/dev/null) || overlap_unknown=1
+    reverse_set=$(compare_file_set "$reverse") || overlap_unknown=1
+    base_files=$(jq -ce '.paths' <<<"$reverse_set" 2>/dev/null) || overlap_unknown=1
+    base_file_count=$(jq -er '.count' <<<"$reverse_set" 2>/dev/null) || overlap_unknown=1
   fi
 
   if [ -z "$overlap_unknown" ] && [ "$forward_base" != "$reverse_base" ]; then
@@ -1556,10 +1561,11 @@ warn_base_drift() {
     echo "base-drift file overlap $REPO#$pr: none"
   else
     echo "!!! BASE-DRIFT FILE OVERLAP: the base's advance touched $overlap_count path(s) changed by"
-    echo "!!! $REPO#$pr: $overlap"
+    printf '!!! %s#%s: %s\n' "$REPO" "$pr" "$overlap"
     echo "!!! Rebase (or merge $base in where the branch is shared), push, and let checks re-run."
-    warn "BASE-DRIFT FILE OVERLAP for $REPO#$pr: $overlap — this warning applies even below" \
-      "SHIP_PR_STALE_BASE, but does not block the merge under the roll-forward policy."
+    printf 'pr-review.sh: BASE-DRIFT FILE OVERLAP for %s#%s: %s — this warning applies even below %s\n' \
+      "$REPO" "$pr" "$overlap" \
+      "SHIP_PR_STALE_BASE, but does not block the merge under the roll-forward policy." >&2
   fi
 
   if [ -n "$count_warn" ]; then

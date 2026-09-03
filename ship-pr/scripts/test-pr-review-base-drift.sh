@@ -177,6 +177,33 @@ test_truncated_data_is_unknown() {
   done
 }
 
+test_malformed_file_entry_is_unknown() {
+  local direction
+  for direction in forward reverse; do
+    if [ "$direction" = forward ]; then
+      set_compares 2 1 '[{}]' '[{"filename":"base.txt"}]'
+    else
+      set_compares 2 1 '[{"filename":"pr.txt"}]' '[{"filename":null}]'
+    fi
+    run_drift
+    assert_eq "$DRIFT_RC" 3 "a malformed $direction file entry should be unknown"
+    assert_contains "$DRIFT_OUTPUT" "base-drift file overlap $REPO#7: UNKNOWN" \
+      "malformed $direction data should print UNKNOWN"
+    assert_not_contains "$DRIFT_OUTPUT" "overlap $REPO#7: none" \
+      "malformed $direction data must not print none"
+  done
+}
+
+test_json_escapes_survive_xpg_echo() {
+  set_compares 2 1 '[{"filename":"dir/a\tb.txt"}]' '[{"filename":"dir/a\tb.txt"}]'
+  shopt -s xpg_echo
+  run_drift
+  shopt -u xpg_echo
+  assert_eq "$DRIFT_RC" 1 "a tab-bearing overlap should warn"
+  assert_contains "$DRIFT_OUTPUT" '["dir/a\tb.txt"]' \
+    "JSON escapes should remain printable under xpg_echo"
+}
+
 test_fork_head_uses_snapshot_shas() {
   set_compares 2 1 '[{"filename":"pr.txt"}]' '[{"filename":"base.txt"}]'
   run_drift
@@ -209,6 +236,8 @@ tests=(
   test_rename_previous_filename
   test_api_failure_is_unknown
   test_truncated_data_is_unknown
+  test_malformed_file_entry_is_unknown
+  test_json_escapes_survive_xpg_echo
   test_fork_head_uses_snapshot_shas
   test_overlap_below_stale_threshold_is_loud
 )
