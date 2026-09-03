@@ -60,7 +60,7 @@
 # hostname), FLEET_ANCHOR
 # (mac-studio; where lease and halt live),
 # FLEET_ANCHOR_STATE (the anchor's state dir, default the same as ISSUE_WAVE_STATE), FLEET_BOXES
-# (the whole fleet, "mac-studio rog-nv-wsl minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/self-improve), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
+# (the whole fleet, "mac-studio rog-nv-wsl minix-amd-wsl"; `ls` sweeps it minus the local box), FLEET_SKILLS_REPO (~/ludics-lite), ISSUE_WAVE_STATE (~/.local/state/issue-wave),
 # FLEET_TMUX_SOCKET (tmux -L name; tests isolate with it), FLEET_FLOTILLA (http://mac-studio:7799),
 # FLEET_LOCK_WAIT (seconds a lease mutation waits for a concurrent one to finish; 10),
 # FLEET_PROBE_TIMEOUT (wall-clock bound on the preflight's live headless turn; 120),
@@ -81,7 +81,7 @@ detect_local_box() {
 LOCAL_BOX="${FLEET_LOCAL_BOX-$(detect_local_box)}"
 ANCHOR="${FLEET_ANCHOR:-mac-studio}"
 BOXES="${FLEET_BOXES:-mac-studio rog-nv-wsl minix-amd-wsl}"
-SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/self-improve}"
+SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 ANCHOR_STATE="${FLEET_ANCHOR_STATE:-$STATE}"
 TMUX_SOCKET="${FLEET_TMUX_SOCKET:-}"
@@ -313,11 +313,11 @@ if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
 fi
 bounded "$fetch_timeout" git -C "$repo" fetch -q origin >/dev/null; frc=$?
 if [ "$frc" -eq 124 ]; then note "git fetch in $repo timed out after ${fetch_timeout}s"; elif [ "$frc" -ne 0 ]; then note "fetch failed (offline?)"; fi
-# Any change under the served tree - tracked, untracked, even ignored - is divergence to
-# surface: the deployed symlinks would serve it. Changes elsewhere are not skill text and are only reported
-# (mac-studio's checkout carries git-synced memory checkpoints under harness/ most of the time;
-# a stray .claude/ appears wherever claude was run inside the checkout). The fast-forward below
-# still fails, and refuses, if such a local change collides with what upstream brings.
+# The whole checkout is the served tree: every skill directory sits at its root, so any local
+# change - tracked, untracked, even ignored - is divergence to surface, since the deployed
+# symlinks would serve it. The one exception is a stray .claude/ (settings.local.json appears
+# wherever claude was run inside the checkout): not skill text, so reported rather than refused.
+# The fast-forward below still fails, and refuses, if such a change collides with what upstream brings.
 # NUL-delimited, so a path git would otherwise quote (a space, a quote, a non-ASCII byte) is
 # still classified by its directory rather than falling through as "outside the served tree".
 served=0; other=""
@@ -327,16 +327,16 @@ if ! git -C "$repo" status --porcelain -z --untracked-files=all --ignored=matchi
 fi
 # Index-hidden entries (skip-worktree / assume-unchanged) never show in status: refuse them
 # under the served tree outright, since the symlinks serve the working-tree bytes.
-hidden=$(git -C "$repo" ls-files -v -- ClaudeDesktop 2>/dev/null | grep -c '^[Sh]' || true)
-[ "${hidden:-0}" -eq 0 ] || note "$hidden index-hidden (skip-worktree/assume-unchanged) file(s) under ClaudeDesktop/"
+hidden=$(git -C "$repo" ls-files -v 2>/dev/null | grep -c '^[Sh]' || true)
+[ "${hidden:-0}" -eq 0 ] || note "$hidden index-hidden (skip-worktree/assume-unchanged) file(s) in the served tree"
 while IFS= read -r -d '' entry; do
   st=${entry:0:2}; path=${entry:3}; from=""
   case "$st" in R*|C*) IFS= read -r -d '' from ;; esac   # a rename's second record is the source
   # Both sides of a rename count: a file moved OUT of the served tree is a served file gone.
-  case "$path" in ClaudeDesktop/*) served=$((served + 1)) ;; *) case "$from" in ClaudeDesktop/*) served=$((served + 1)) ;; *) other="$other$path " ;; esac ;; esac
+  case "$path" in .claude/*) case "$from" in ""|.claude/*) other="$other$path " ;; *) served=$((served + 1)) ;; esac ;; *) served=$((served + 1)) ;; esac
 done < "$statusz"
 [ "$statusz" = /dev/null ] || rm -f "$statusz"
-[ "$served" -eq 0 ] || note "$served local change(s) under ClaudeDesktop/ (the served tree)"
+[ "$served" -eq 0 ] || note "$served local change(s) in the served tree"
 branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
 [ "$branch" = main ] || note "checked out $branch, not main"
 if [ -z "$refuse" ]; then
@@ -351,12 +351,12 @@ canon=$(cd "$repo" && pwd -P)
 resolved() { [ -L "$1" ] && (cd -P "$1" 2>/dev/null && pwd -P); }
 for s in issue-wave ship-pr wait-and-proceed after-merge; do
   t=$(resolved "$HOME/.claude/skills/$s")
-  [ "$t" = "$canon/ClaudeDesktop/skills/$s" ] || note "~/.claude/skills/$s -> ${t:-missing/not a link} (not $repo/ClaudeDesktop/skills/$s)"
+  [ "$t" = "$canon/$s" ] || note "~/.claude/skills/$s -> ${t:-missing/not a link} (not $repo/$s)"
 done
 if [ "$codex" = 1 ]; then
   for s in ship-pr wait-and-proceed after-merge; do
     t=$(resolved "$HOME/.codex/skills/$s")
-    [ "$t" = "$canon/ClaudeDesktop/skills/$s" ] || note "~/.codex/skills/$s -> ${t:-missing/not a link} (README's Codex loop not run)"
+    [ "$t" = "$canon/$s" ] || note "~/.codex/skills/$s -> ${t:-missing/not a link} (README's Codex loop not run)"
   done
   command -v codex >/dev/null 2>&1 || note "no codex on PATH"
   codex login status >/dev/null 2>&1 || note "codex not logged in"

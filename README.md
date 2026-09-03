@@ -58,7 +58,7 @@ list. The ones you will need to set for your own fleet:
 | `FLEET_BOXES` | Space-separated fleet box names. |
 | `FLEET_ANCHOR` | The box where the lease and halt files live. |
 | `FLEET_LOCAL_BOX` | This box's fleet name, if hostname detection does not recognise it. |
-| `FLEET_SKILLS_REPO` | Path of this checkout on each box (the preflight fast-forwards it). |
+| `FLEET_SKILLS_REPO` | Path of this checkout on each box, `~/ludics-lite` by default (the preflight fast-forwards it). |
 | `FLEET_FLOTILLA` | URL of the flotilla status service, if you run one. |
 | `ISSUE_WAVE_STATE` | Local state directory for waves. |
 

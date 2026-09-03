@@ -112,10 +112,10 @@ named `local` (or `mac-studio`) runs without ssh; the same script, the same file
 **Skill-freshness preflight first, per launch, on the launching box (self-improve#11):**
 `launch` runs it itself before every worker, and `fleet-worker.sh preflight <box>` (`--codex`
 for a Codex worker) runs it alone for diagnosis. It brings that box's
-`~/self-improve` to upstream main and refuses on anything short of it: any local change,
-tracked or untracked, under `ClaudeDesktop/` (the served tree; changes elsewhere - mac-studio's
-git-synced memory checkpoints under `harness/`, a stray `.claude/` - are reported, not refused,
-and still refuse if they block the fast-forward), a branch other than main, a HEAD that
+`~/ludics-lite` to upstream main and refuses on anything short of it: any local change,
+tracked or untracked, anywhere in the checkout (the whole tree is served; the one exception,
+a stray `.claude/` left by running claude inside it, is reported, not refused, and still
+refuses if it blocks the fast-forward), a branch other than main, a HEAD that
 is not origin/main after the fast-forward (an unpushed local commit is divergence to surface,
 not text to deploy), a deployed skill symlink that does not point into the checkout (and, for
 Codex, the three `~/.codex/skills` links the README's Codex loop installs), and - the leg that
@@ -197,7 +197,7 @@ worker kinds verbatim, and includes:
   commit: <sha>") rather than only the 👍 reaction, and an `@codex review` re-request CLEARS
   the existing 👍 - a worker that re-requests before reading the feed destroys the approval
   it failed to see. `pr-review.sh status` recognizes the comment-shaped verdict since
-  self-improve 0e28fd285; the brief still says: read the full feed first, re-request only
+  ludics-lite 254facf; the brief still says: read the full feed first, re-request only
   when it truly holds nothing for the current head.
 - Encouragement. It is cheap and the user asked for it: name why the issue matters and
   express confidence. Workers visibly do their best work when the brief treats them as
@@ -230,7 +230,7 @@ treated the same way even when its body is ours.
 Mechanics that differ from Claude workers:
 
 - **Skills**: `ship-pr`, `wait-and-proceed`, and `after-merge` are symlinked into
-  `~/.codex/skills` (from the box's `~/self-improve` - the preflight checks the links). Codex
+  `~/.codex/skills` (from the box's `~/ludics-lite` - the preflight checks the links). Codex
   has no `spawn_task`, which hand-back mode makes moot: wave workers of either kind propose
   rather than file.
 - **Full lifecycle**: with the sandbox gone the worker pushes, drives `gh`, and owns its

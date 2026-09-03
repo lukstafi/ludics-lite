@@ -116,15 +116,14 @@ EOF
 chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux"
 
 # --- a scratch skills checkout with an origin, deployed the way the README deploys it --------
-origin="$TMP/origin.git"; repo="$TMP/self improve"
+origin="$TMP/origin.git"; repo="$TMP/ludics lite"
 git init -q --bare "$origin"
 git init -q -b main "$repo"
-mkdir -p "$repo/ClaudeDesktop/skills"
 for s in issue-wave ship-pr wait-and-proceed after-merge; do
-  mkdir -p "$repo/ClaudeDesktop/skills/$s"; echo "# $s" > "$repo/ClaudeDesktop/skills/$s/SKILL.md"
-  ln -sfn "$repo/ClaudeDesktop/skills/$s" "$HOME/.claude/skills/$s"
+  mkdir -p "$repo/$s"; echo "# $s" > "$repo/$s/SKILL.md"
+  ln -sfn "$repo/$s" "$HOME/.claude/skills/$s"
 done
-for s in ship-pr wait-and-proceed after-merge; do ln -sfn "$repo/ClaudeDesktop/skills/$s" "$HOME/.codex/skills/$s"; done
+for s in ship-pr wait-and-proceed after-merge; do ln -sfn "$repo/$s" "$HOME/.codex/skills/$s"; done
 git -C "$repo" add -A && git -C "$repo" commit -q -m init
 git -C "$repo" remote add origin "$origin" && git -C "$repo" push -q -u origin main
 export FLEET_SKILLS_REPO="$repo"
@@ -192,45 +191,44 @@ expect "a stalling skills fetch is bounded and refused" 1 "git fetch in .* timed
 [ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
 expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
 expect "codex that cannot run headless refuses despite login status" 1 "codex cannot run headless: \"message\":\"401 Unauthorized\"" -- env SHIM_CODEX_DOWN=1 "$FW" preflight testbox --codex
-echo x >> "$repo/ClaudeDesktop/skills/ship-pr/SKILL.md"
-expect "a tracked change under the served tree refuses" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
+echo x >> "$repo/ship-pr/SKILL.md"
+expect "a tracked change under the served tree refuses" 1 "1 local change(s) in the served tree" -- "$FW" preflight testbox --no-probe
 git -C "$repo" checkout -q -- .
-mkdir -p "$repo/harness/claude-memory"; echo "# note" > "$repo/harness/claude-memory/MEMORY.md"; git -C "$repo" add -A; git -C "$repo" commit -q -m memory; git -C "$repo" push -q origin main
-echo "- edit" >> "$repo/harness/claude-memory/MEMORY.md"
-expect "a tracked change outside the served tree (a memory checkpoint) passes with a notice" 0 "PREFLIGHT OK.*ignored: harness/claude-memory/MEMORY.md" -- "$FW" preflight testbox --no-probe
-git -C "$repo" checkout -q -- .
-touch "$repo/ClaudeDesktop/skills/ship-pr/scripts.sh"
-expect "untracked file under the served tree refuses" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
+touch "$repo/ship-pr/scripts.sh"
+expect "untracked file under the served tree refuses" 1 "1 local change(s) in the served tree" -- "$FW" preflight testbox --no-probe
 git -C "$repo" config status.showUntrackedFiles no
-expect "...even when the box's git config hides untracked files" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
+expect "...even when the box's git config hides untracked files" 1 "1 local change(s) in the served tree" -- "$FW" preflight testbox --no-probe
 git -C "$repo" config --unset status.showUntrackedFiles
-git -C "$repo" update-index --skip-worktree ClaudeDesktop/skills/ship-pr/SKILL.md; echo hidden >> "$repo/ClaudeDesktop/skills/ship-pr/SKILL.md"
-expect "a skip-worktree edit under the served tree refuses" 1 "index-hidden (skip-worktree/assume-unchanged) file(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
-git -C "$repo" update-index --no-skip-worktree ClaudeDesktop/skills/ship-pr/SKILL.md; git -C "$repo" checkout -q -- .
+git -C "$repo" update-index --skip-worktree ship-pr/SKILL.md; echo hidden >> "$repo/ship-pr/SKILL.md"
+expect "a skip-worktree edit under the served tree refuses" 1 "index-hidden (skip-worktree/assume-unchanged) file(s) in the served tree" -- "$FW" preflight testbox --no-probe
+git -C "$repo" update-index --no-skip-worktree ship-pr/SKILL.md; git -C "$repo" checkout -q -- .
 git -C "$repo" config status.relativePaths bogus
 expect "a git status that cannot run refuses instead of passing an empty scan" 1 "git status failed in" -- "$FW" preflight testbox --no-probe
 git -C "$repo" config --unset status.relativePaths
-printf '*.tmp\n' > "$TMP/excludes"; git -C "$repo" config core.excludesFile "$TMP/excludes"; touch "$repo/ClaudeDesktop/skills/ship-pr/x.tmp"
-expect "an ignored file under the served tree still refuses" 1 "local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
-rm "$repo/ClaudeDesktop/skills/ship-pr/x.tmp"; git -C "$repo" config --unset core.excludesFile
-rm "$repo/ClaudeDesktop/skills/ship-pr/scripts.sh"
-touch "$repo/ClaudeDesktop/skills/ship-pr/a b.sh"
-expect "an untracked served file whose path git would quote still refuses" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
-rm "$repo/ClaudeDesktop/skills/ship-pr/a b.sh"
-mkdir -p "$repo/outside"; git -C "$repo" mv ClaudeDesktop/skills/after-merge/SKILL.md outside/gone.md
-expect "a file renamed out of the served tree refuses (the source side counts)" 1 "1 local change(s) under ClaudeDesktop/" -- "$FW" preflight testbox --no-probe
-git -C "$repo" mv outside/gone.md ClaudeDesktop/skills/after-merge/SKILL.md; rmdir "$repo/outside"
+printf '*.tmp\n' > "$TMP/excludes"; git -C "$repo" config core.excludesFile "$TMP/excludes"; touch "$repo/ship-pr/x.tmp"
+expect "an ignored file under the served tree still refuses" 1 "local change(s) in the served tree" -- "$FW" preflight testbox --no-probe
+rm "$repo/ship-pr/x.tmp"; git -C "$repo" config --unset core.excludesFile
+rm "$repo/ship-pr/scripts.sh"
+touch "$repo/ship-pr/a b.sh"
+expect "an untracked served file whose path git would quote still refuses" 1 "1 local change(s) in the served tree" -- "$FW" preflight testbox --no-probe
+rm "$repo/ship-pr/a b.sh"
+mkdir -p "$repo/outside"; git -C "$repo" mv after-merge/SKILL.md outside/gone.md
+expect "a file renamed out of the served tree refuses (the source side counts)" 1 "1 local change(s) in the served tree" -- "$FW" preflight testbox --no-probe
+git -C "$repo" mv outside/gone.md after-merge/SKILL.md; rmdir "$repo/outside"
 mkdir -p "$repo/.claude"; echo '{}' > "$repo/.claude/settings.local.json"
-expect "untracked file outside the served tree passes with a notice" 0 "PREFLIGHT OK.*ignored: .claude/" -- "$FW" preflight testbox --no-probe
+expect "a stray .claude/ (the one path outside the served tree) passes with a notice" 0 "PREFLIGHT OK.*ignored: .claude/" -- "$FW" preflight testbox --no-probe
+git -C "$repo" mv ship-pr/SKILL.md .claude/moved.md
+expect "a served file renamed into .claude/ refuses (the source side counts)" 1 "1 local change(s) in the served tree" -- "$FW" preflight testbox --no-probe
+git -C "$repo" mv .claude/moved.md ship-pr/SKILL.md
 rm -rf "$repo/.claude"
 # Behind origin: a second clone pushes; the preflight must fast-forward and pass. The bare origin
 # has no HEAD for `main` (the runner's git may default to master), so name the branch to clone.
-git clone -q -b main "$origin" "$TMP/other" && echo more >> "$TMP/other/ClaudeDesktop/skills/ship-pr/SKILL.md" \
+git clone -q -b main "$origin" "$TMP/other" && echo more >> "$TMP/other/ship-pr/SKILL.md" \
   && git -C "$TMP/other" commit -q -am upstream && git -C "$TMP/other" push -q origin main \
   || ko "could not advance the scratch origin (setup, not the launcher)"
 expect "behind origin fast-forwards and passes" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --no-probe
 [ "$(git -C "$repo" rev-parse HEAD)" = "$(git -C "$TMP/other" rev-parse HEAD)" ] && ok "checkout was fast-forwarded" || ko "checkout not fast-forwarded"
-echo local >> "$repo/ClaudeDesktop/skills/after-merge/SKILL.md" && git -C "$repo" commit -q -am "unpushed"
+echo local >> "$repo/after-merge/SKILL.md" && git -C "$repo" commit -q -am "unpushed"
 expect "ahead of origin (unpushed local commit) refuses" 1 "!= origin/main" -- "$FW" preflight testbox --no-probe
 git -C "$repo" reset -q --hard origin/main
 git -C "$repo" checkout -q -b topic
@@ -239,16 +237,16 @@ git -C "$repo" checkout -q main && git -C "$repo" branch -q -D topic
 rm "$HOME/.codex/skills/after-merge"
 expect "missing codex skill link refuses only for codex" 1 "codex/skills/after-merge -> missing" -- "$FW" preflight testbox --codex --no-probe
 expect "...and claude preflight still passes" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --no-probe
-ln -sfn "$repo/ClaudeDesktop/skills/after-merge" "$HOME/.codex/skills/after-merge"
+ln -sfn "$repo/after-merge" "$HOME/.codex/skills/after-merge"
 mkdir -p "$TMP/elsewhere"; ln -sfn "$TMP/elsewhere" "$HOME/.claude/skills/ship-pr"
 expect "skill link pointing outside the checkout refuses" 1 "skills/ship-pr -> $TMP/elsewhere" -- "$FW" preflight testbox --no-probe
-mkdir -p "$TMP/outside-skill"; ln -sfn "$repo/ClaudeDesktop/../../outside-skill" "$HOME/.claude/skills/ship-pr"
+mkdir -p "$TMP/outside-skill"; ln -sfn "$repo/../outside-skill" "$HOME/.claude/skills/ship-pr"
 expect "skill link that escapes the checkout through .. refuses" 1 "skills/ship-pr -> $TMP/outside-skill" -- "$FW" preflight testbox --no-probe
-rm "$HOME/.claude/skills/ship-pr"; cp -R "$repo/ClaudeDesktop/skills/ship-pr" "$HOME/.claude/skills/ship-pr"
+rm "$HOME/.claude/skills/ship-pr"; cp -R "$repo/ship-pr" "$HOME/.claude/skills/ship-pr"
 expect "a real directory in place of the link refuses" 1 "skills/ship-pr -> missing/not a link" -- "$FW" preflight testbox --no-probe
-rm -rf "$HOME/.claude/skills/ship-pr"; ln -sfn "$repo/ClaudeDesktop/skills/wait-and-proceed" "$HOME/.claude/skills/ship-pr"
-expect "a link swapped to a sibling skill refuses" 1 "skills/ship-pr -> .*/skills/wait-and-proceed (not " -- "$FW" preflight testbox --no-probe
-ln -sfn "$repo/ClaudeDesktop/skills/ship-pr" "$HOME/.claude/skills/ship-pr"
+rm -rf "$HOME/.claude/skills/ship-pr"; ln -sfn "$repo/wait-and-proceed" "$HOME/.claude/skills/ship-pr"
+expect "a link swapped to a sibling skill refuses" 1 "skills/ship-pr -> .*/wait-and-proceed (not " -- "$FW" preflight testbox --no-probe
+ln -sfn "$repo/ship-pr" "$HOME/.claude/skills/ship-pr"
 
 echo "--- launch / attach / status / log with a project repo and --repo/--branch"
 proj="$TMP/pro j"; git init -q -b master "$proj" && echo a > "$proj/a" && git -C "$proj" add a && git -C "$proj" commit -q -m a
@@ -257,8 +255,8 @@ brief="$TMP/brief.md"; printf 'Fix issue #1: handle `$(rm -rf /)` and `backticks
 expect "launch without a lease refuses" 1 "LAUNCH REFUSED testbox/w1: no coordinator lease" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 "$FW" claim >/dev/null
-echo x >> "$repo/ClaudeDesktop/skills/ship-pr/SKILL.md"
-expect "launch runs the preflight on the box and refuses a dirty served tree" 1 "LAUNCH REFUSED testbox/w1: PREFLIGHT REFUSED testbox: 1 local change(s) under ClaudeDesktop/" -- \
+echo x >> "$repo/ship-pr/SKILL.md"
+expect "launch runs the preflight on the box and refuses a dirty served tree" 1 "LAUNCH REFUSED testbox/w1: PREFLIGHT REFUSED testbox: 1 local change(s) in the served tree" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 git -C "$repo" checkout -q -- .
 expect "launch creates the worktree and reports the session" 0 "LAUNCHED testbox/w1 kind=claude session=[0-9a-f-]\{36\} cwd=$proj-worktrees/w1" -- \
