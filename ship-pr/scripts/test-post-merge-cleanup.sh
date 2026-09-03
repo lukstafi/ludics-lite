@@ -3491,12 +3491,15 @@ test_runner_kills_a_case_past_its_deadline() {
   # ludics-lite#14: a case that stalls (one sat silent for six hours of macOS CI) is killed with
   # its whole process group at SHIP_PR_TEST_CASE_TIMEOUT, reported as a failure naming the
   # deadline together with its log, and the run still ends with its root removed.
+  # The stall is a descendant that ignores TERM under a case shell that dies on it: the leader
+  # vanishes at the first signal, and only a runner that watches the whole group escalates to
+  # KILL for what is left (a duration no other process on the box is sleeping for).
   local tag="dl$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" rc marker patched
-  marker="sleep 3571.$$" # a duration no other process on the box is sleeping for
+  marker="sh -c 'trap \"\" TERM; exec sleep 3571.$$'"
   copy_runner "$copy" "$tag"
-  patched=$(sed "s/^$SELF_CASE() {\$/$SELF_CASE() { $marker;/" "$copy/test-post-merge-cleanup.sh")
+  patched=$(sed "s|^$SELF_CASE() {\$|$SELF_CASE() { $marker;|" "$copy/test-post-merge-cleanup.sh")
   printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
-  grep -q "^$SELF_CASE() { $marker;" "$copy/test-post-merge-cleanup.sh" || fail "could not plant the stall in the copy"
+  grep -qF -- "$SELF_CASE() { $marker;" "$copy/test-post-merge-cleanup.sh" || fail "could not plant the stall in the copy"
   if run_copy env SHIP_PR_TEST_CASE_TIMEOUT=2 "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null; then
     rc=0
   else
@@ -3507,7 +3510,7 @@ test_runner_kills_a_case_past_its_deadline() {
     fail "the stalled case was not reported against its deadline: $(cat "$out")"
   grep -q "^FAIL: 1 of 1 post-merge cleanup states failed" "$out" || fail "no failing summary: $(cat "$out")"
   sleep 0.5
-  ! pgrep -f "sleep 3571\\.$$" >/dev/null 2>&1 || fail "the stalled case's process group survived the deadline"
+  ! pgrep -f "sleep 3571\\.$$" >/dev/null 2>&1 || fail "the TERM-ignoring descendant survived the deadline: the runner stopped escalating at the leader"
   assert_copy_root_gone "$tag"
   echo "PASS: a case past its deadline is killed with its process group and reported"
 }
@@ -3845,16 +3848,20 @@ run_case() {
   "$name"
 }
 
+SPAWNED=0 # the next case's index in the RUNNING_* arrays, which unset leaves sparse
+
 start_case() {
-  local name="$1" pid pgid
+  local name="$1" i pid pgid
   # A kept log directory may hold a status file from a previous run; reap_one would take it for
   # this case's verdict before the case had run.
   rm -f "$LOG_DIR/$name.status"
   (run_case "$name") >"$LOG_DIR/$name.log" 2>&1 </dev/null &
   pid=$!
-  RUNNING_PIDS+=("$pid")
-  RUNNING_NAMES+=("$name")
-  RUNNING_STARTS+=("$SECONDS")
+  i=$SPAWNED
+  SPAWNED=$((SPAWNED + 1))
+  RUNNING_PIDS[$i]="$pid"
+  RUNNING_NAMES[$i]="$name"
+  RUNNING_STARTS[$i]="$SECONDS"
   RUNNING=$((RUNNING + 1))
   # Prove the case is in its own process group rather than trusting job control's handoff. Both
   # sides of the fork call setpgid; on macOS the child's call intermittently fails with "child
@@ -3862,28 +3869,33 @@ start_case() {
   # redirections apply, so it cannot be silenced here). On every such occasion observed the
   # parent's identical call had already succeeded — 354 spawns, 13 complaints, 0 wrong groups —
   # so the line is noise; this check is what makes that a fact rather than a hope. A case that
-  # is nevertheless not a group leader is moved by the runner (allowed: a subshell has not
-  # exec'd) and, failing that, named, since only its leader can then be signalled.
+  # is nevertheless not a group leader cannot be repaired from here (setpgid reaches only the
+  # caller or its children, and any helper process this runner starts is the case's sibling),
+  # and the deadline and cleanup guarantees rest on the group: the case is ended now and
+  # reported as a runner failure, rather than run with descendants nothing can terminate.
   pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || pgid=""
   if [ -n "$pgid" ] && [ "$pgid" != "$pid" ]; then
-    perl -e 'setpgrp($ARGV[0], $ARGV[0]) or exit 1' "$pid" 2>/dev/null || true
-    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || pgid=""
-    [ -z "$pgid" ] || [ "$pgid" = "$pid" ] ||
-      echo "WARN: $name (pid $pid) runs in process group $pgid, not its own; its descendants cannot be terminated as a unit" >&2
+    kill_case_group "$pid"
+    report_case "$i" " — the runner could not place it in its own process group (it ran in $pgid), so its descendants could not have been terminated as a unit; the case was ended, not run"
   fi
 }
 
+# group_live_count <pgid>: processes still running in the group, zombies excluded. A killed
+# leader is a zombie until reaped and would otherwise keep the group looking alive.
+group_live_count() {
+  ps -A -o pgid=,stat= 2>/dev/null | awk -v g="$1" '$1 == g && $2 !~ /^Z/ { n++ } END { print n + 0 }'
+}
+
 # kill_case_group <pid>: terminate a case's process group and its leader, escalating to KILL
-# after a grace period, so a case wedged in something that ignores TERM still ends.
+# once a grace period passes with anything in the group still alive — the leader may well die
+# on TERM while a descendant that ignores it lives on, and it is the whole group that has to be
+# gone before the case's tree can be removed.
 kill_case_group() {
-  local pid="$1" tries=0 state
+  local pid="$1" tries=0
   kill -TERM -- "-$pid" >/dev/null 2>&1 || true
   kill -TERM "$pid" >/dev/null 2>&1 || true
   while [ "$tries" -lt 25 ]; do
-    state=$(ps -o stat= -p "$pid" 2>/dev/null) || state=""
-    case "$state" in
-    '' | Z*) return 0 ;;
-    esac
+    [ "$(group_live_count "$pid")" -gt 0 ] || return 0
     sleep 0.2
     tries=$((tries + 1))
   done

@@ -142,11 +142,13 @@ codex_loop=$(readme_block 'for s in ship-pr wait-and-proceed after-merge' | grep
 [ -n "$claude_loop" ] && [ -n "$codex_loop" ] && ok "README.md carries both install loops" || ko "could not find the README's install loops"
 ( export HOME="$real_home"; eval "$claude_loop" && eval "$codex_loop" ) || ko "the README's install loops failed: $claude_loop $codex_loop"
 [ -L "$real_home/.claude/skills/ship-pr" ] && ok "the README's loop links ship-pr" || ko "the README's loop did not link ship-pr into ~/.claude/skills"
-# FLEET_SKILLS_REPO is left at its default here on purpose: ~/ludics-lite is where the README
-# clones to, and the default must agree with it.
+# FLEET_SKILLS_REPO is at its default here on purpose: ~/ludics-lite is where the README clones
+# to, and the default must agree with it. Unset explicitly, since a configured fleet environment
+# exports it, and an absolute value would send this preflight to the box's real checkout.
 expect "the real checkout, installed the README's way, passes the claude preflight" 0 "PREFLIGHT OK" -- \
-  env HOME="$real_home" "$FW" preflight testbox --no-probe
-expect "...and the codex preflight" 0 "PREFLIGHT OK" -- env HOME="$real_home" "$FW" preflight testbox --codex --no-probe
+  env -u FLEET_SKILLS_REPO HOME="$real_home" "$FW" preflight testbox --no-probe
+expect "...and the codex preflight" 0 "PREFLIGHT OK" -- \
+  env -u FLEET_SKILLS_REPO HOME="$real_home" "$FW" preflight testbox --codex --no-probe
 
 # --- a scratch skills checkout with an origin, deployed the way the README deploys it --------
 origin="$TMP/origin.git"; repo="$TMP/ludics lite"
