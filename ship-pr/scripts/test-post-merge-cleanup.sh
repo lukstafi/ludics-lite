@@ -67,9 +67,10 @@ assert_topic_preserved() {
 
 assert_cleaned() {
   local archive archive_count branch_key local_master remote_master
-  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
-  remote_master=$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)
-  assert_eq "$local_master" "$remote_master" "local master must match origin/master"
+  local_master=$(git -C "$CASE_MAIN" rev-parse "refs/heads/$CASE_BASE_BRANCH")
+  remote_master=$(git -C "$CASE_MAIN" rev-parse "refs/remotes/origin/$CASE_BASE_BRANCH")
+  assert_eq "$local_master" "$remote_master" \
+    "local $CASE_BASE_BRANCH must match origin/$CASE_BASE_BRANCH"
   assert_absent "$CASE_SESSION"
   assert_ref_absent "refs/heads/$CASE_BRANCH"
   assert_ref_absent "refs/remotes/origin/$CASE_BRANCH"
@@ -115,7 +116,7 @@ keep_last_reflog_entry() {
 }
 
 setup_case() {
-  local name="$1" merge_mode="$2" owner_mode="$3"
+  local name="$1" merge_mode="$2" owner_mode="$3" base_branch="${4:-master}"
   local root="$TEST_ROOT/$name"
   CASE_ROOT="$root"
   CASE_REMOTE="$root/remote.git"
@@ -124,16 +125,17 @@ setup_case() {
   CASE_INTEGRATOR="$root/integrator"
   CASE_MASTER_OWNER="$root/master-owner"
   CASE_BRANCH=topic
+  CASE_BASE_BRANCH="$base_branch"
 
   mkdir -p "$root"
   git init --bare "$CASE_REMOTE" >/dev/null
-  git init -b master "$CASE_MAIN" >/dev/null
+  git init -b "$CASE_BASE_BRANCH" "$CASE_MAIN" >/dev/null
   git_config "$CASE_MAIN"
   echo base >"$CASE_MAIN/value"
   git -C "$CASE_MAIN" add value
   git -C "$CASE_MAIN" commit -m base >/dev/null
   git -C "$CASE_MAIN" remote add origin "$CASE_REMOTE"
-  git -C "$CASE_MAIN" push -u origin master >/dev/null
+  git -C "$CASE_MAIN" push -u origin "$CASE_BASE_BRANCH" >/dev/null
 
   git -C "$CASE_MAIN" branch topic
   git -C "$CASE_MAIN" worktree add "$CASE_SESSION" topic >/dev/null
@@ -144,17 +146,17 @@ setup_case() {
   git -C "$CASE_SESSION" push -u origin topic >/dev/null
   CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
 
-  git clone --branch master "$CASE_REMOTE" "$CASE_INTEGRATOR" >/dev/null 2>&1
+  git clone --branch "$CASE_BASE_BRANCH" "$CASE_REMOTE" "$CASE_INTEGRATOR" >/dev/null 2>&1
   git_config "$CASE_INTEGRATOR"
   case "$merge_mode" in
   merge)
     git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge topic" >/dev/null
-    git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+    git -C "$CASE_INTEGRATOR" push origin "$CASE_BASE_BRANCH" >/dev/null
     ;;
   squash)
     git -C "$CASE_INTEGRATOR" merge --squash origin/topic >/dev/null
     git -C "$CASE_INTEGRATOR" commit -m "squash topic" >/dev/null
-    git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+    git -C "$CASE_INTEGRATOR" push origin "$CASE_BASE_BRANCH" >/dev/null
     ;;
   unmerged) ;;
   *) fail "unknown merge mode: $merge_mode" ;;
@@ -165,7 +167,7 @@ setup_case() {
   main) ;;
   other)
     git -C "$CASE_MAIN" checkout --detach >/dev/null
-    git -C "$CASE_MAIN" worktree add "$CASE_MASTER_OWNER" master >/dev/null
+    git -C "$CASE_MAIN" worktree add "$CASE_MASTER_OWNER" "$CASE_BASE_BRANCH" >/dev/null
     ;;
   main-off)
     git -C "$CASE_MAIN" checkout -b coordinator >/dev/null
@@ -197,6 +199,44 @@ test_master_owned_by_other_worktree() {
   assert_eq "$(git -C "$CASE_MASTER_OWNER" rev-parse HEAD)" "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)" \
     "other worktree must be fast-forwarded"
   echo "PASS: master owned by another worktree"
+}
+
+test_main_base_support() {
+  local invalid refusal
+  setup_case main-base merge main main
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --base main >/dev/null
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MAIN" symbolic-ref --short HEAD)" main \
+    "main checkout must still own main"
+
+  setup_case main-base-unmerged unmerged main-off main
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --base main 2>&1); then
+    fail "unmerged topic cleanup unexpectedly succeeded with a main base"
+  fi
+  case "$refusal" in
+  *"topic is not an ancestor of origin/main"*) ;;
+  *) fail "main-base refusal did not name origin/main: $refusal" ;;
+  esac
+  assert_topic_preserved
+
+  for invalid in HEAD -release; do
+    if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --base "$invalid" 2>&1); then
+      fail "invalid base shorthand unexpectedly passed: $invalid"
+    fi
+    case "$refusal" in
+    *"invalid base branch name: $invalid"*) ;;
+    *) fail "invalid base shorthand was not diagnosed: $refusal" ;;
+    esac
+  done
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --base '@{-1}' 2>&1); then
+    fail "expanded base shorthand unexpectedly passed"
+  fi
+  case "$refusal" in
+  *"expanded base branch shorthand is not allowed: @{-1} (use main)"*) ;;
+  *) fail "expanded base shorthand was not diagnosed against the main checkout: $refusal" ;;
+  esac
+  assert_topic_preserved
+  echo "PASS: main base cleanup and unmerged refusal"
 }
 
 test_safe_topic_deletion() {
@@ -3292,6 +3332,7 @@ TESTS=(
   test_unchecked_out_master
   test_master_owned_by_main
   test_master_owned_by_other_worktree
+  test_main_base_support
   test_safe_topic_deletion
   test_squash_rebase_override
   test_newer_remote_tip_refusal
