@@ -3,6 +3,8 @@ name: daily-issue-planning
 description: Sequence open issues for execution with focus on what and where to do today.
 ---
 
+Before editing anything, run `git -C ~/self-improve pull --rebase` so you work on the latest copy of the plan — it is edited from other boxes too.
+
 Update ~/self-improve/ClaudeDesktop/sequencing_plan.md with the account of all currently open issues across my active GitHub repositories: ahrefs/ocannl (PRs at lukstafi/ocannl-staging), lukstafi/flotilla, lukstafi/ocaml-cudajit, lukstafi/ocaml-metal, lukstafi/ocaml-hipjit, lukstafi/ocaml-dataprep, lukstafi/lukstafi.github.io, lukstafi/ludics-lite.
 
 Arrange the material without unhelpful redundancy, the following are needs, not steps.
@@ -16,6 +18,6 @@ Arrange the material without unhelpful redundancy, the following are needs, not 
   - Among them, show which ones prefer to run on ROG (NVIDIA GPU) and which prefer to run on Minix (AMD GPU).
 - End with a "## Design questions" section surfacing the open design decisions you noticed while reading the issues. This section feeds the issue-wave skill's decision gate, so make each entry directly consumable: one line per question with the issue number, the X-vs-Y in a clause, **your own recommendation with a one-clause reason**, and a suggested tier: "veto" (default: the wave posts the recommendation to the issue and proceeds; user silence is consent) or "ask" (reserved for genuinely user-owned calls: lasting API/workflow taste, or impacting longer term design direction). Lean heavily toward "veto" — the point is to spare the user decision fatigue, not to route every judgment through them. Drop entries from previous runs once their issue closes or a decision lands.
 
-Updating the doc means removing issues that are closed and adding issues that are missing. For OCANNL, also assign issues that miss a milestone to the appropriate milestone.  After done, do a sync commit of all changes on ~/self-improve and push.
+Updating the doc means removing issues that are closed and adding issues that are missing. For OCANNL, also assign issues that miss a milestone to the appropriate milestone.  After done, do a sync commit of all changes on ~/self-improve and push. If the push is rejected, run `git -C ~/self-improve pull --rebase` once and push again. If that still fails, do not leave it silent: end your report with an explicit final line saying the plan was updated locally but not pushed, and why (the error, and any rebase conflict you left behind) — other boxes read this file live and would otherwise keep working off a stale plan.
 
 This routine is started inside the ocannl-staging repository, as this one has the richest related memory and context.
