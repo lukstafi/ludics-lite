@@ -3,7 +3,7 @@ name: daily-issue-planning
 description: Sequence open issues for execution with focus on what and where to do today.
 ---
 
-Before editing anything, run `git -C ~/self-improve pull --rebase` so you work on the latest copy of the plan — it is edited from other boxes too. If that pull does not succeed, do not edit anything on top of it: a previous run may have left a conflicted rebase behind, so finish it (`git -C ~/self-improve rebase --continue`, or `--abort` to get back to a clean tree and pull again), and if you cannot, stop and report that the plan was not updated at all and why.
+Do not start editing until `git -C ~/self-improve pull --rebase` has actually succeeded — the plan is edited from other boxes too, and every recovery below ends by running it again, since nothing else fetches what they pushed. If it does not succeed, a previous run may have left a conflicted rebase behind: finish it (`git -C ~/self-improve rebase --continue`, or `--abort` for a clean tree), pull again, and if you still cannot get a clean pull, stop and report that the plan was not updated at all and why.
 
 Update ~/self-improve/ClaudeDesktop/sequencing_plan.md with the account of all currently open issues across my active GitHub repositories: ahrefs/ocannl (PRs at lukstafi/ocannl-staging), lukstafi/flotilla, lukstafi/ocaml-cudajit, lukstafi/ocaml-metal, lukstafi/ocaml-hipjit, lukstafi/ocaml-dataprep, lukstafi/lukstafi.github.io, lukstafi/ludics-lite.
 
