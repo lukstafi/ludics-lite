@@ -52,6 +52,12 @@ for s in ship-pr wait-and-proceed after-merge; do
 done
 ```
 
+A box that runs the `issue-wave` coordinator itself under Codex needs that skill discoverable too:
+
+```sh
+ln -sfn "$HOME/ludics-lite/issue-wave" "$HOME/.codex/skills/issue-wave"
+```
+
 ## Fleet configuration
 
 `issue-wave` assumes a fleet of boxes reachable over ssh, with one anchor box that holds the
