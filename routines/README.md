@@ -10,12 +10,17 @@ Two kinds live here, and they are kept in sync differently.
 | Routine | Kind | Fires | Runs in | Model | Feeds |
 | --- | --- | --- | --- | --- | --- |
 | `ocannl-format-sweep` | local scheduled task | daily 06:43 local (`43 6 * * *`) | `~/ocannl-staging` | Opus | `tools/format-sweep.sh` in OCANNL |
-| `ocannl-cross-machine-sweep` | local scheduled task | daily 06:47 local (`47 6 * * *`) | `~/ocannl-staging` | Opus | `tools/sweep.sh` in OCANNL, `~/bin/wake-lab.sh` |
+| `ocannl-cross-machine-sweep` | local scheduled task | daily 07:20 local (`20 7 * * *`) | `~/ocannl-staging` | Opus | `tools/sweep.sh` in OCANNL, `~/bin/wake-lab.sh` |
 | `daily-issue-planning` | local scheduled task | daily 07:05 local (`5 7 * * *`) | `~/ocannl-staging` | Fable | the sequencing plan `issue-wave` reads |
 | `ocannl-ci-red-triage` | cloud routine | on any non-PR master red, fired by `ci.yml`; backstop daily 05:17 UTC (`17 5 * * *`) | Anthropic cloud, sources `lukstafi/ocannl-staging` and `ahrefs/ocannl` | Sonnet | the claiming issues `ship-pr` defers to |
 
 The local scheduler adds a per-task jitter of a few minutes to the times above. Cron in the
 local registry is the box's local time; the cloud routine's cron is UTC.
+
+The two sweeps share `~/ocannl-staging`, which is fine because the cross-machine sweep never
+modifies the tree, but the format sweep runs the full test suite for about 30 minutes when it
+proceeds, and the cross-machine sweep's local units would contend with it. Hence the gap:
+the cross-machine sweep starts last, after the planning run, which is light.
 
 ## Local scheduled tasks: symlinks, like the skills
 
