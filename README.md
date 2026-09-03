@@ -169,11 +169,15 @@ worker to read, takes it itself, so every section also passes when it is the onl
 
 `test-wake-lab.sh` runs the lab script against shim `curl`, `python3` and `ssh` on PATH, so it
 touches neither the router nor the network. It pins the split above from both sides: that every
-MAC the script sends comes from the sourced host table and that a missing or incomplete one is
-refused before any router traffic, and that no MAC-shaped literal is tracked anywhere in the
-repository (with a negative control, since a scan that cannot fail would prove nothing). It also
-pins `--help` to the whole header comment, which was a hard-coded line range that truncated
-silently whenever the header grew.
+MAC the script sends comes from the sourced host table and that a missing, incomplete or
+short-a-target one is refused before any router traffic, and that no MAC-shaped literal is tracked
+anywhere in the repository, in either separator the script accepts (with a negative control, since
+a scan that cannot fail would prove nothing). It also pins `--help` to the whole header comment,
+which was a hard-coded line range that truncated silently whenever the header grew; that the WSL
+kick reaches the Windows side through whichever of the two aliases answers, since after a cold boot
+that is the LAN one; and that the polling loops honour a wall-clock deadline against slow probes,
+which an iteration budget did not (`WAKE_LAB_WAIT_SECONDS`, `WAKE_LAB_WSL_WAIT_SECONDS` and
+`WAKE_LAB_DOWN_WAIT_SECONDS` are what let the suite ask for a one-second one).
 
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and

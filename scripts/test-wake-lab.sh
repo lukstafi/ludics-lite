@@ -47,12 +47,31 @@ cat > "$TMP/bin/python3" <<'EOF'
 cat >/dev/null            # the inline program, read from stdin as `python3 - <mac> <bcast>`
 printf 'magic %s\n' "${2:-}" >> "$CURL_LOG"
 EOF
-# ssh: every box is down, instantly. `status` probes three aliases per box.
-printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/bin/ssh"
+# ssh: logs `<destination> :: <command>` and answers according to $SSH_UP, a space-separated list
+# of destinations that are reachable -- unset, every box is down, which is what most of the cases
+# below want. $SSH_DELAY makes each probe slow, the way a real ConnectTimeout against a dark box
+# is, which is what the polling deadlines have to survive.
+cat > "$TMP/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+dest=""; cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift ;;
+    -*) ;;
+    *) if [ -z "$dest" ]; then dest="$1"; else cmd="$cmd $1"; fi ;;
+  esac
+  shift
+done
+printf '%s ::%s\n' "$dest" "$cmd" >> "$SSH_LOG"
+[ -n "${SSH_DELAY:-}" ] && sleep "$SSH_DELAY"
+for u in ${SSH_UP:-}; do [ "$u" = "$dest" ] && exit 0; done
+exit 1
+EOF
 chmod +x "$TMP/bin/curl" "$TMP/bin/python3" "$TMP/bin/ssh"
 PATH="$TMP/bin:$PATH"; export PATH
 CURL_LOG="$TMP/curl.log"; export CURL_LOG
-: > "$CURL_LOG"
+SSH_LOG="$TMP/ssh.log"; export SSH_LOG
+: > "$CURL_LOG"; : > "$SSH_LOG"
 
 # A host table with obviously fake addresses, in the shape the example file documents.
 cat > "$TMP/hosts.sh" <<'EOF'
@@ -101,11 +120,54 @@ expect "status asks the router about the site file's Ethernet MAC alone" 0 "rog 
 grep -q 'aa:bb:cc:00:00:02' "$CURL_LOG" && ! grep -q 'aa:bb:cc:00:00:01' "$CURL_LOG" \
   && ok "...not about the Wi-Fi one" || ko "link_active used the wrong MAC: $(cat "$CURL_LOG")"
 
-# The exit code is the dispatch loop's and is 0 either way, here as before the split; what the
-# site file decides is that the name is unknown at all.
-out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" "$WL" nosuch 2>&1)
-printf '%s' "$out" | grep -q 'unknown machine: nosuch' \
-  && ok "a box the site file does not know is refused by name" || ko "no refusal for an unknown box -- $out"
+# A target the table does not answer for refuses the whole run, before any packet: the boxes it
+# DOES know must not be woken while a later target turns out to be missing, and the dispatch loop's
+# exit status would have reported that partial operation as a success.
+: > "$CURL_LOG"
+expect "a box the site file does not know refuses the run" 1 "not in the host table" -- \
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" "$WL" nosuch
+expect "...naming every missing target, with a known one alongside" 1 "nosuch alsomissing" -- \
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" "$WL" rog nosuch alsomissing
+[ ! -s "$CURL_LOG" ] && ok "...before waking the box it does know" \
+  || ko "a partial wake went out before the refusal: $(cat "$CURL_LOG")"
+
+# --- the WSL kick reaches the Windows side by whichever alias answers ---------------------------
+# After a cold boot the LAN alias answers within seconds and tailscaled lags a minute or more, so a
+# kick that knew only the Tailscale alias failed on exactly the wake wait_for had just declared
+# finished -- and the WSL poll behind it could then only time out, losing the box's backend for the
+# day. `kick-wsl` also polls, so the budget is cut to a second here.
+kick() { env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="$1" "$WL" kick-wsl rog; }
+: > "$SSH_LOG"
+out=$(kick "rog-lan rog-nv-wsl" 2>&1)
+printf '%s' "$out" | grep -q 'wsl started on rog (via rog-lan)' \
+  && ok "the WSL kick goes through the LAN alias when Tailscale has not caught up" \
+  || ko "the kick did not use the LAN alias -- $out"
+grep -q '^rog-lan :: wsl.exe' "$SSH_LOG" \
+  && ok "...carrying the wsl.exe start command" || ko "no wsl.exe over rog-lan: $(cat "$SSH_LOG")"
+out=$(kick "rog-nv-win rog-nv-wsl" 2>&1)
+printf '%s' "$out" | grep -q 'wsl started on rog (via rog-nv-win)' \
+  && ok "...and falls back to the Tailscale alias when the LAN one is silent" \
+  || ko "no fallback to the Tailscale alias -- $out"
+out=$(kick "" 2>&1)
+printf '%s' "$out" | grep -q 'wsl kick FAILED on rog' \
+  && ok "...and reports a box no endpoint answers for" || ko "a kick with nothing up did not fail -- $out"
+
+# --- the polling loops are bounded by elapsed time, not by iteration count -----------------------
+# Every probe of a dark box burns its ConnectTimeout, so an iteration budget was a wall-clock lie:
+# 36 rounds of a "3 minute" WSL wait ran for nine when the probes were slow. Three-second probes
+# against a one-second budget: a loop counting iterations would run for minutes here.
+started=$SECONDS
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_DELAY=3 "$WL" kick-wsl rog >/dev/null 2>&1
+elapsed=$((SECONDS - started))
+[ "$elapsed" -lt 30 ] && ok "a WSL wait with slow probes honours its deadline (${elapsed}s)" \
+  || ko "the WSL wait ran ${elapsed}s against a 1s budget: it is still counting iterations"
+started=$SECONDS
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 SSH_DELAY=3 "$WL" --wait rog 2>&1)
+elapsed=$((SECONDS - started))
+[ "$elapsed" -lt 30 ] && ok "...and so does the wake wait (${elapsed}s)" \
+  || ko "the wake wait ran ${elapsed}s against a 1s budget: it is still counting iterations"
+printf '%s' "$out" | grep -q 'did NOT wake: rog' \
+  && ok "...reporting the box that never came up" || ko "no 'did NOT wake' after the budget -- $out"
 
 # --- the two commands that need no site data --------------------------------------------------
 # --help and --list are what you reach for on a box where the table has yet to be installed, so
@@ -136,20 +198,30 @@ expect "the example host table satisfies the contract" 0 "eth-link=1" -- \
 # --- no hardware addresses in the repository ----------------------------------------------------
 # The point of the split. Anything MAC-shaped in a tracked file is a leak, except the example
 # file's 00:00:00 placeholders (and this script's own aa:bb:cc fixtures, which name no hardware).
-# Each hit is printed as `file:line:<address>`, so the placeholder filter can anchor on the
-# address itself: a line carrying both a placeholder and a real MAC still reports the real one.
+# Both separators, because magic_packet() strips `:` and `-` alike: a MAC pasted in with hyphens,
+# the spelling Windows prints, is every bit as much a leak as the colon-separated one, and a guard
+# that reads only half of what the script accepts promises more than it checks. Each hit is printed as `file:line:<address>`,
+# so the placeholder filter can anchor on the address itself: a line carrying both a placeholder
+# and a real MAC still reports the real one.
 mac_hits() { # mac_hits <file...> -- the MAC-shaped literals in those files, placeholders aside
-  grep -oHInEi -- '([0-9a-f]{2}:){5}[0-9a-f]{2}' "$@" 2>/dev/null \
-    | grep -vEi '(00:00:00|aa:bb:cc):([0-9a-f]{2}:){2}[0-9a-f]{2}$'
+  grep -oHInEi -- '([0-9a-f]{2}[:-]){5}[0-9a-f]{2}' "$@" 2>/dev/null \
+    | grep -vEi '(00[:-]00[:-]00|aa[:-]bb[:-]cc)([:-][0-9a-f]{2}){3}$'
 }
 # The negative control: a scan that cannot fail proves nothing, and this one is two greps deep.
 # Assembled at runtime, because a real-shaped address written out here would be a hit itself.
-leak_mac=$(printf 'de:ad:be:ef:%02d:%02d' 12 34)
-printf 'eth_mac_of() { echo %s; }\n' "$leak_mac" > "$TMP/leaky.sh"
-[ -n "$(mac_hits "$TMP/leaky.sh")" ] && ok "the MAC scan catches a real-shaped address" \
-  || ko "the MAC scan does not catch $leak_mac, so its verdict below means nothing"
+for sep in : -; do
+  leak_mac=$(printf 'de%sad%sbe%sef%s12%s34' "$sep" "$sep" "$sep" "$sep" "$sep")
+  printf 'eth_mac_of() { echo %s; }\n' "$leak_mac" > "$TMP/leaky.sh"
+  [ -n "$(mac_hits "$TMP/leaky.sh")" ] && ok "the MAC scan catches a real-shaped address ($sep)" \
+    || ko "the MAC scan does not catch $leak_mac, so its verdict below means nothing"
+done
 [ -z "$(mac_hits "$EXAMPLE")" ] && ok "...and passes the example file's placeholders" \
   || ko "the example file carries a non-placeholder MAC: $(mac_hits "$EXAMPLE")"
+# The template's IPs are site data too if they are the author's leases. RFC 5737's 192.0.2.0/24 is
+# the documentation range; anything in a private range here is a real address someone copied in.
+ex_ips=$(grep -oE '\b(10|127|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]+\.[0-9]+\b' "$EXAMPLE")
+[ -z "$ex_ips" ] && ok "...and the example's IPs are documentation addresses, not a real LAN" \
+  || ko "the example file carries private-range addresses: $ex_ips"
 
 # Tracked files, so a leak is judged by what the repository would publish. Before the first
 # commit of a new script `git ls-files` does not list it yet; scan scripts/ as well, always.

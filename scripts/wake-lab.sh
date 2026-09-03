@@ -91,6 +91,19 @@ load_hosts() {
   done
 }
 
+# The table's box list is mac_of's, and every target must be in it BEFORE anything is sent. A table
+# that knows rog but not minix would otherwise wake rog, then report minix as a typo halfway
+# through the operation -- and the dispatch loop's exit status hides that, so the run reads as a
+# success. Refusing the whole run is what "refuse rather than run half-configured" means here.
+check_targets() {
+  local t bad=""
+  for t in "$@"; do mac_of "$t" >/dev/null 2>&1 || bad="$bad $t"; done
+  [ -z "$bad" ] && return 0
+  echo "wake-lab.sh: not in the host table ($HOSTS_FILE):$bad" >&2
+  echo "  the known boxes are the ones mac_of answers for; nothing was sent." >&2
+  exit 1
+}
+
 # Direct-to-LAN-IP ssh aliases. These depend on nothing but the box being booted, which makes them
 # the FASTEST and most trustworthy liveness signal — see is_up(). asus has none.
 lan_of() { case "$1" in
@@ -210,6 +223,15 @@ do_status() {
 }
 
 # ---------------------------------------------------------------- power control
+# Poll budgets, in seconds, and they are wall-clock budgets: the loops below run to a deadline
+# rather than to an iteration count. Counting iterations quietly lied whenever the boxes stayed
+# dark -- each is_up() burns two ssh ConnectTimeouts, so 48 rounds over two unreachable boxes ran
+# for about twenty minutes under the name of a four-minute wait, delaying the sweep that is the
+# only coverage those backends get. The env overrides exist for the test suite.
+WAIT_SECONDS=${WAKE_LAB_WAIT_SECONDS:-240}
+WSL_WAIT_SECONDS=${WAKE_LAB_WSL_WAIT_SECONDS:-180}
+DOWN_WAIT_SECONDS=${WAKE_LAB_DOWN_WAIT_SECONDS:-120}
+
 wake() { # wake <box>
   local name=$1 macs mac err ok=1
   macs=$(mac_of "$name") || { echo "unknown machine: $name" >&2; return 1; }
@@ -234,10 +256,22 @@ wake() { # wake <box>
 }
 
 kick_wsl() { # kick_wsl <box> — WSL never autostarts at boot, and hibernate terminates the VM.
-  local ts; ts=$(ts_of "$1") || return 1
-  # An ssh network logon is session enough: this works with nobody logged in at the console.
-  ssh -o BatchMode=yes -o ConnectTimeout=15 "$ts" 'wsl.exe -d Ubuntu -e true' >/dev/null 2>&1 \
-    && echo "  wsl started on $1" || echo "  wsl kick FAILED on $1 (is $ts up?)"
+  # The -lan and -win aliases land in the same Windows sshd, and after a cold boot the LAN one
+  # answers within seconds while tailscaled takes a minute or more (the same asymmetry is_up() is
+  # built on). A kick that knew only the Tailscale alias therefore failed on exactly the wake
+  # wait_for had just declared finished, and the WSL poll behind it could only time out. Try the
+  # fast path first, fall back to Tailscale, and say which one carried it.
+  local name=$1 dest
+  for dest in $(lan_of "$name") $(ts_of "$name"); do
+    [ -n "$dest" ] || continue
+    # An ssh network logon is session enough: this works with nobody logged in at the console.
+    if ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" 'wsl.exe -d Ubuntu -e true' >/dev/null 2>&1; then
+      echo "  wsl started on $name (via $dest)"
+      return 0
+    fi
+  done
+  echo "  wsl kick FAILED on $name (no Windows endpoint answered)"
+  return 1
 }
 
 # `SetSuspendState` drops the connection mid-command; without ServerAlive* the ssh client can hang
@@ -258,24 +292,25 @@ power_action() { # power_action <verb> <box>
   echo "  (a dropped/timed-out connection here is the expected success signature)"
 }
 
-confirm_down() { # confirm_down <box...> — poll until ssh stops answering
-  local names=("$@") i n any
-  for ((i = 0; i < 24; i++)); do
+confirm_down() { # confirm_down <box...> — poll until ssh stops answering, to a deadline
+  local names=("$@") n any deadline=$((SECONDS + DOWN_WAIT_SECONDS))
+  while :; do
     any=0
     for n in "${names[@]}"; do
       if is_up "$n"; then printf '%s=up ' "$n"; any=1; else printf '%s=DOWN ' "$n"; fi
     done
     printf '(%s)\n' "$(date +%H:%M:%S)"
     [ "$any" = 0 ] && return 0
+    [ "$SECONDS" -ge "$deadline" ] && break
     sleep 5
   done
-  echo "still reachable after 2 min — the suspend may not have taken"
+  echo "still reachable after $((DOWN_WAIT_SECONDS / 60)) min — the suspend may not have taken"
   return 1
 }
 
-wait_for() { # wait_for <box...> — poll for up to 4 minutes
-  local names=("$@") i n up all
-  for ((i = 0; i < 48; i++)); do
+wait_for() { # wait_for <box...> — poll until every box answers, for up to WAIT_SECONDS
+  local names=("$@") n up all deadline=$((SECONDS + WAIT_SECONDS))
+  while :; do
     all=1
     for n in "${names[@]}"; do
       if is_up "$n"; then up=UP; else up=down; all=0; fi
@@ -283,14 +318,14 @@ wait_for() { # wait_for <box...> — poll for up to 4 minutes
     done
     printf '(%s)\n' "$(date +%H:%M:%S)"
     [ "$all" = 1 ] && return 0
+    [ "$SECONDS" -ge "$deadline" ] && return 1
     sleep 5
   done
-  return 1
 }
 
 wait_for_wsl() { # wait_for_wsl <box...> — tailscaled inside WSL can take >2 min after a resume
-  local names=("$@") i n w all
-  for ((i = 0; i < 36; i++)); do
+  local names=("$@") n w all deadline=$((SECONDS + WSL_WAIT_SECONDS))
+  while :; do
     all=1
     for n in "${names[@]}"; do
       w=$(wsl_of "$n")
@@ -299,9 +334,9 @@ wait_for_wsl() { # wait_for_wsl <box...> — tailscaled inside WSL can take >2 m
     done
     printf '(%s)\n' "$(date +%H:%M:%S)"
     [ "$all" = 1 ] && return 0
+    [ "$SECONDS" -ge "$deadline" ] && return 1
     sleep 5
   done
-  return 1
 }
 
 # ---------------------------------------------------------------- dispatch
@@ -329,6 +364,7 @@ done
 # After the argument loop on purpose: --help and --list need no site data, and both are what you
 # reach for on a box where the host table has yet to be installed.
 load_hosts
+check_targets "${TARGETS[@]}"
 
 case "$VERB" in
   status)
@@ -336,7 +372,8 @@ case "$VERB" in
     ;;
   kick-wsl)
     for t in "${TARGETS[@]}"; do kick_wsl "$t"; done
-    wait_for_wsl "${TARGETS[@]}" && echo "wsl up" || echo "wsl still down after 3 min"
+    wait_for_wsl "${TARGETS[@]}" && echo "wsl up" \
+      || echo "wsl still down after $((WSL_WAIT_SECONDS / 60)) min"
     ;;
   sleep|hibernate|down)
     for t in "${TARGETS[@]}"; do power_action "$VERB" "$t"; done
@@ -356,7 +393,8 @@ case "$VERB" in
         for t in "${TARGETS[@]}"; do is_up "$t" && UP+=("$t"); done
         if [ ${#UP[@]} -gt 0 ]; then
           for t in "${UP[@]}"; do kick_wsl "$t"; done
-          wait_for_wsl "${UP[@]}" && echo "wsl up" || echo "wsl still down after 3 min"
+          wait_for_wsl "${UP[@]}" && echo "wsl up" \
+            || echo "wsl still down after $((WSL_WAIT_SECONDS / 60)) min"
         fi
       fi
       if [ "$rc" = 0 ]; then

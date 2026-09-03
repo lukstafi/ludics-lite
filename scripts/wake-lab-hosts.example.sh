@@ -10,7 +10,9 @@
 # fleet's MAC addresses and LAN IPs. Everything else — the lore, the router endpoints, the ssh
 # aliases, the logic — is tracked in ludics-lite, so an in-place edit shows up in `git status`
 # (ludics-lite#31). The MACs below are 00:00:00 placeholders on purpose; a real one in this file
-# is a leak, and scripts/test-wake-lab.sh fails the repository if one appears.
+# is a leak, and scripts/test-wake-lab.sh fails the repository if one appears. The IPs are
+# likewise fictitious, from RFC 5737's documentation range (192.0.2.0/24) rather than from any
+# real LAN: a template carrying the author's leases would be site data by another name.
 #
 # The box names must be the ones the script knows: rog, minix, asus (lan_of/ts_of/wsl_of in
 # wake-lab.sh are the tracked half of the same table). Each function echoes the value(s) for a
@@ -38,7 +40,7 @@ eth_mac_of() { case "$1" in
 # aliases resolve these through ~/.ssh/config — but it is the record of which lease is the live
 # one, which is exactly the question a stale Wi-Fi lease makes hard to answer.
 ip_of() { case "$1" in
-  rog)   echo 192.168.178.30 ;;  # Ethernet; its Wi-Fi lease is a different address
-  minix) echo 192.168.178.31 ;;  # Ethernet
-  asus)  echo 192.168.178.29 ;;  # Wi-Fi
+  rog)   echo 192.0.2.30 ;;  # Ethernet; its Wi-Fi lease is a different address
+  minix) echo 192.0.2.31 ;;  # Ethernet
+  asus)  echo 192.0.2.29 ;;  # Wi-Fi
   *) return 1 ;; esac; }
