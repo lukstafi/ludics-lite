@@ -162,7 +162,7 @@ CACHE="$STATE_DIR/repo-by-pr"
 
 # The cache is a convenience, never a requirement, and in a sandboxed worker the write ATTEMPT is
 # what draws the harness's warning — on every call, when the state dir is unwritable and unreadable
-# (self-improve#8: workers given explicit owner/name#number arguments, which never need the cache,
+# (ludics-lite#2: workers given explicit owner/name#number arguments, which never need the cache,
 # still warned on each invocation). So it can be switched off outright (SHIP_PR_STATE_DIR=off),
 # and a failed write latches WRITES off. The latch is a file, not a variable, because cache_put
 # runs inside command substitutions (every `watch` round's poll is one), where a variable set
@@ -1049,7 +1049,7 @@ cmd_resolve() {
 }
 
 # `gh run watch` is the wrong tool on both of its ends, and workers keep reaching for it (the
-# 2026-08-29 wave, self-improve#8). Its nonzero exit on a run that concluded FAILURE is a workflow
+# 2026-08-29 wave, ludics-lite#2). Its nonzero exit on a run that concluded FAILURE is a workflow
 # VERDICT, but it arrives with no HTTP status on stderr, so the retry policy read it as transport:
 # four attempts re-watching a run that had already completed, then "the API never answered" — a
 # lie, it answered every time. And in a non-TTY shell its progress redraws accumulate; one session

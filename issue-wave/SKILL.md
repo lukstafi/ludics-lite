@@ -1,6 +1,6 @@
 ---
 name: issue-wave
-description: Run a delegation wave over the issue backlog with ONE coordinator for the whole fleet - read the daily sequencing plan, propose a scope of D1/D2 issues with a box per issue from the plan's placement table, launch one worker per issue in its own worktree on that box (mac-studio, ROG, Minix) via scripts/fleet-worker.sh, each shipping via ship-pr, and supervise the wave to full merge. Use when asked to burn down issues, run a wave, or work the backlog. User decides worker type (Opus or Codex).
+description: Run a delegation wave over the issue backlog with ONE coordinator for the whole fleet - read the daily sequencing plan, propose a scope of D1/D2 issues with a box per issue from the plan's placement table, launch one worker per issue in its own worktree on that box via scripts/fleet-worker.sh, each shipping via ship-pr, and supervise the wave to full merge. Use when asked to burn down issues, run a wave, or work the backlog. User decides worker type (Opus or Codex).
 ---
 
 # Issue wave
@@ -9,7 +9,7 @@ Runs: plan -> scope -> decision gate -> launch -> supervise -> close out. Each w
 lifecycle is implement -> ship-pr -> issue close; the wave coordinator never implements, only
 sequences, briefs, places, unsticks, and reports.
 
-**One coordinator per fleet, not per box** (self-improve#12, since 2026-09-02). The coordinator
+**One coordinator per fleet, not per box** (ludics-lite#4, since 2026-09-02). The coordinator
 owns scoping, the decision gate, placement, the integration loop, stop-the-world, and close-out
 for every machine, and launches workers onto whichever box the plan places them on - the same
 brief, the same ship-pr lifecycle, the same supervision commands whether the box is its own or
@@ -19,6 +19,30 @@ longer sets the scope. Waves racing each other to an issue, per-box preflights, 
 stop-the-world as a courtesy protocol were all symptoms of several coordinators owning
 overlapping scope; a single owner is the fix, and `scripts/fleet-worker.sh` is how it reaches
 the other boxes.
+
+## Site configuration
+
+This skill is written against one particular fleet, and the prose below names it throughout:
+boxes, hardware, URLs, a project. Everything a copy for another site has to change is in one
+of two places. The script reads its values from environment variables, each defaulting to the
+author's fleet (the header of `scripts/fleet-worker.sh` is the authoritative list):
+
+| Value | Where it is set |
+| --- | --- |
+| Fleet box names, and which one holds the lease and halt files | `FLEET_BOXES`, `FLEET_ANCHOR` |
+| How a box recognises itself from its hostname | `FLEET_HOSTNAME_MAP` (`<glob>=<box>` pairs), or `FLEET_LOCAL_BOX` outright |
+| Where this skills checkout lives on each box | `FLEET_SKILLS_REPO` |
+| The ref a worker's worktree starts from (`origin/master` here; `origin/main` elsewhere) | `FLEET_BASE_REF`, or `--base` per launch |
+| The flotilla status and wake service, if any | `FLEET_FLOTILLA` |
+| Local state directory for each coordinator | `ISSUE_WAVE_STATE` |
+| State directory on the anchor for the lease and fleet-wide halt | `FLEET_ANCHOR_STATE`; every coordinator must resolve it to the same directory on the anchor |
+
+The rest is prose in this file and is edited in place: the **sequencing plan** path and the
+task that maintains it (Inputs, just below), the **fleet roster** with its hardware and the
+placement rule (Inputs), the **project** whose conventions, test suites and tracker the
+Supervise and Brief sections cite (OCANNL, with PRs on a staging fork and issues upstream), and
+the per-box **environmental traps** in the brief template. None of those are read by the
+script; they are what the coordinator tells its workers.
 
 ## Inputs
 
@@ -109,7 +133,7 @@ session on its box running one headless CLI turn (`claude -p --output-format str
 session id on disk under that box's `~/.local/state/issue-wave/workers/<name>/`. The box
 named `local` (or `mac-studio`) runs without ssh; the same script, the same files.
 
-**Skill-freshness preflight first, per launch, on the launching box (self-improve#11):**
+**Skill-freshness preflight first, per launch, on the launching box (ludics-lite#3):**
 `launch` runs it itself before every worker, and `fleet-worker.sh preflight <box>` (`--codex`
 for a Codex worker) runs it alone for diagnosis. It brings that box's
 `~/ludics-lite` to upstream main and refuses on anything short of it: any local change,
@@ -142,9 +166,9 @@ fleet-worker.sh launch <box> <repo>-<issue> --kind claude|codex --brief <brief-f
 fleet-worker.sh attach <box> <repo>-<issue>     # Bash run_in_background: the wake signal
 ```
 
-`launch` creates `<checkout>-worktrees/<name>` off `origin/master` on the box (`--base` for
-another base, `--cwd` for a worktree that already exists) and prints the session id that
-addresses every later intervention. `attach` blocks until the worker's session exits and prints
+`launch` creates `<checkout>-worktrees/<name>` off `origin/master` on the box (`FLEET_BASE_REF`
+for another default, `--base` for one launch, `--cwd` for a worktree that already exists) and
+prints the session id that addresses every later intervention. `attach` blocks until the worker's session exits and prints
 one verdict line (`DONE` / `FAILED` / `VANISHED`), riding out ssh drops and box naps by
 retrying from the coordinator's side; run it as a harness-tracked background task, one per
 worker, and its completion notification is the wake signal - exactly the wait-and-proceed

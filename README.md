@@ -12,9 +12,10 @@ just Markdown and shell that Claude Code loads from `~/.claude/skills`.
 | `after-merge` | Right after a merge, brainstorm what the experience suggests about the codebase and route each idea to an issue, a task chip, or the bin. |
 | `issue-wave` | Run one coordinator over the whole fleet: pick issues from a sequencing plan, launch one worker per issue in its own worktree on a chosen box, and supervise the wave to full merge. |
 
-The skills were extracted from a private repository with their full history, so commit
-messages and comments reference that repository's issue numbers (`self-improve#N`). Those
-issues are not public; the references are kept as provenance.
+The skills were extracted from a private repository with their full history. Its issues were
+cloned here and the references in the skills renumbered to `ludics-lite#N`; the few remaining
+`self-improve#N` references, and the ones in older commit messages, are that repository's pull
+requests, which were not cloned. They are kept as provenance.
 
 ## Installing
 
@@ -58,12 +59,20 @@ list. The ones you will need to set for your own fleet:
 | `FLEET_BOXES` | Space-separated fleet box names. |
 | `FLEET_ANCHOR` | The box where the lease and halt files live. |
 | `FLEET_LOCAL_BOX` | This box's fleet name, if hostname detection does not recognise it. |
+| `FLEET_HOSTNAME_MAP` | How hostname detection reads: space-separated `<glob>=<box>` pairs, first match wins. |
+| `FLEET_BASE_REF` | The ref a worker's worktree starts from when a launch names no `--base` (`origin/master` by default). |
 | `FLEET_SKILLS_REPO` | Path of this checkout on each box, `~/ludics-lite` by default (the preflight fast-forwards it). |
 | `FLEET_FLOTILLA` | URL of the flotilla status service, if you run one. |
-| `ISSUE_WAVE_STATE` | Local state directory for waves. |
+| `ISSUE_WAVE_STATE` | Local state directory for each coordinator. |
+| `FLEET_ANCHOR_STATE` | State directory on the anchor for the lease and fleet-wide halt; every coordinator must resolve it to the same directory there. |
 
-The defaults encode the author's fleet and will not work anywhere else. `issue-wave/SKILL.md`
-also names a daily sequencing plan file; point the coordinator at your own.
+The defaults encode the author's fleet and will not work anywhere else. The prose of
+`issue-wave/SKILL.md` names that fleet too, along with a daily sequencing plan file and the
+project the waves run over; its opening "Site configuration" section lists what to edit.
+
+`ship-pr` assumes the [Codex](https://github.com/openai/codex) GitHub app reviews every PR: its
+watch waits for that reviewer's rounds and its 👍 reaction is the approval gate. Without it, the
+watch reports that no review is coming and the merge gate has only the build signal to read.
 
 Before every launch the preflight fast-forwards the target box's checkout of this repository to
 upstream main and refuses on a dirty or diverged checkout. That pull-side step is what
