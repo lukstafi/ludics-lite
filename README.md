@@ -31,15 +31,16 @@ so there is no separate sync step to forget.
 git clone https://github.com/lukstafi/ludics-lite.git ~/ludics-lite
 mkdir -p "$HOME/.claude/skills"
 for s in "$HOME"/ludics-lite/*/; do
-  case "$s" in */.git/|*/routines/) continue ;; esac
+  case "$s" in */.git/|*/routines/|*/scripts/) continue ;; esac
   ln -sfn "${s%/}" "$HOME/.claude/skills/$(basename "$s")"
 done
 ```
 
-The loop skips `routines/`, whose contents are scheduled-task prompts rather than skills; they
-are linked separately, see the Routines section. Rerun the loop after adding a skill. Replace
-any pre-existing real directory in `~/.claude/skills/` by hand first, and diff it against this
-copy, since a divergent local edit may be a fix worth keeping.
+The loop skips `routines/`, whose contents are scheduled-task prompts rather than skills, and
+`scripts/`, which holds the lab script; both are linked separately, see the Routines and Lab
+script sections. Rerun the loop after adding a skill. Replace any pre-existing real directory in
+`~/.claude/skills/` by hand first, and diff it against this copy, since a divergent local edit
+may be a fix worth keeping.
 
 These loops are executed, not just quoted: the fleet launcher's test suite extracts them from
 this README, runs them against a scratch clone of the checkout, and preflights the result, so a
@@ -112,6 +113,36 @@ app's registry (cron, working directory, model) is not in the repository and is 
 against linking into a real directory. The fourth, the CI-red triage routine `ship-pr` defers
 master's trailing failures to, runs in the cloud and is synced by hand.
 
+## The lab script
+
+`scripts/wake-lab.sh` drives the home-lab boxes' power state: wake-on-LAN over the router's TR-064
+interface and as a direct magic packet, sleep/hibernate/shutdown, a WSL kick, and a per-box
+reachability table. The cross-machine sweep routine calls it to wake the GPU boxes before testing
+them. It installs the way the skills do, as a symlink, so an edit made mid-run lands in this
+checkout as a normal `git status` (ludics-lite#31):
+
+```sh
+mkdir -p "$HOME/bin"
+ln -sfn "$HOME/ludics-lite/scripts/wake-lab.sh" "$HOME/bin/wake-lab.sh"
+```
+
+The fleet's MAC and LAN IP addresses are the one part that is not tracked. They live in a file the
+script sources at startup and refuses to run without, so a box that has not been configured says
+so instead of reporting every machine as unknown:
+
+```sh
+mkdir -p "$HOME/.config/wake-lab"
+cp "$HOME/ludics-lite/scripts/wake-lab-hosts.example.sh" "$HOME/.config/wake-lab/hosts.sh"
+chmod 600 "$HOME/.config/wake-lab/hosts.sh"   # then fill in mac_of, eth_mac_of and ip_of
+```
+
+`WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the verified lab
+lore in the header comment (wake-on-LAN over Ethernet only, waking from a full shutdown, what
+`link=1` means, the cold-boot kicked-VM trap, the `exit 0` vs `true` probe trap), the router
+endpoints, the ssh aliases and all of the logic. `wake-lab.sh --help` prints that header, and
+`--help` and `--list` are the two commands that work before the host table exists. The box names
+(`rog`, `minix`, `asus`) and the ssh aliases are the author's and are edited in place.
+
 ## Tests
 
 The shell scripts carry their own test suites:
@@ -120,9 +151,10 @@ The shell scripts carry their own test suites:
 issue-wave/scripts/test-fleet-worker.sh
 ship-pr/scripts/test-post-merge-cleanup.sh
 ship-pr/scripts/test-pr-review-base-drift.sh
+scripts/test-wake-lab.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all three on Ubuntu and
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all four on Ubuntu and
 macOS (the fleet's bash is 3.2) for every push and pull request, along with `bash -n`, shellcheck
 at error severity, and a check that the two cleanup scripts still carry their parse guard. It runs
 without path filters, so every PR's merge gate reads a verdict rather than `ABSENT`.
@@ -134,6 +166,18 @@ section names, and an argument matching none of them is refused before anything 
 sections share (the shim CLIs, the scratch skills checkout, the scratch project repo) runs whatever
 is selected, and a section that needs more than that, such as the coordinator lease or a finished
 worker to read, takes it itself, so every section also passes when it is the only one selected.
+
+`test-wake-lab.sh` runs the lab script against shim `curl`, `python3` and `ssh` on PATH, so it
+touches neither the router nor the network. It pins the split above from both sides: that every
+MAC the script sends comes from the sourced host table and that a missing, incomplete or
+short-a-target one is refused before any router traffic, and that no MAC-shaped literal is tracked
+anywhere in the repository, in either separator the script accepts (with a negative control, since
+a scan that cannot fail would prove nothing). It also pins `--help` to the whole header comment,
+which was a hard-coded line range that truncated silently whenever the header grew; that the WSL
+kick reaches the Windows side through whichever of the two aliases answers, since after a cold boot
+that is the LAN one; and that the polling loops honour a wall-clock deadline against slow probes,
+which an iteration budget did not (`WAKE_LAB_WAIT_SECONDS`, `WAKE_LAB_WSL_WAIT_SECONDS` and
+`WAKE_LAB_DOWN_WAIT_SECONDS` are what let the suite ask for a one-second one).
 
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and

@@ -10,7 +10,7 @@ Two kinds live here, and they are kept in sync differently.
 | Routine | Kind | Fires | Runs in | Model | Feeds |
 | --- | --- | --- | --- | --- | --- |
 | `ocannl-format-sweep` | local scheduled task | daily 06:43 local (`43 6 * * *`) | `~/ocannl-staging` | Opus | `tools/format-sweep.sh` in OCANNL |
-| `ocannl-cross-machine-sweep` | local scheduled task | daily 07:20 local (`20 7 * * *`) | `~/ocannl-staging` | Opus | `tools/sweep.sh` in OCANNL, `~/bin/wake-lab.sh` |
+| `ocannl-cross-machine-sweep` | local scheduled task | daily 07:20 local (`20 7 * * *`) | `~/ocannl-staging` | Opus | `tools/sweep.sh` in OCANNL, `scripts/wake-lab.sh` |
 | `daily-issue-planning` | local scheduled task | daily 07:05 local (`5 7 * * *`) | `~/ocannl-staging` | Fable | the sequencing plan `issue-wave` reads |
 | `ocannl-ci-red-triage` | cloud routine | on any non-PR master red, fired by `ci.yml`; backstop daily 05:17 UTC (`17 5 * * *`) | Anthropic cloud, sources `lukstafi/ocannl-staging` and `ahrefs/ocannl` | Sonnet | the claiming issues `ship-pr` defers to |
 
@@ -83,7 +83,13 @@ Like the skills, these prompts name the author's setup in prose and are edited i
 `~/self-improve/ClaudeDesktop/sequencing_plan.md` and the repository list in
 `daily-issue-planning`; `~/ocannl-staging`, `~/.ocannl-sweep`, `~/bin/wake-lab.sh` and the box
 names `rog`/`minix` (`rog-nv-wsl`, `minix-amd-wsl`) in the two sweeps; the two OCANNL
-repositories in the triage routine. The OCANNL scripts they drive (`tools/format-sweep.sh`,
+repositories in the triage routine. `~/bin/wake-lab.sh` is a symlink to `scripts/wake-lab.sh` in
+this checkout, so the cross-machine sweep's lab lore is reviewable here rather than living only on
+`mac-studio` (ludics-lite#31); the fleet's MAC and IP addresses are the one part that stays out of
+the repository, in the untracked `~/.config/wake-lab/hosts.sh` the script refuses to run without.
+Both are installed by the "The lab script" section of the top-level README.
+
+The OCANNL scripts they drive (`tools/format-sweep.sh`,
 `tools/sweep.sh`, `tools/aggregate-skips.sh`) live in that repository, and the outcome strings
 the prompts teach the agent to read are those scripts' messages, so a change to a script's
 wording is a change to its routine.

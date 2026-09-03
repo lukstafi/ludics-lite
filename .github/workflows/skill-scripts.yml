@@ -1,7 +1,7 @@
 name: skill scripts
 
 # The shell behind the skills: syntax, shellcheck, the parse guard the cleanup scripts carry,
-# and the three test suites, on the two platforms the fleet runs (bash 3.2 on macOS is the
+# and the four test suites, on the two platforms the fleet runs (bash 3.2 on macOS is the
 # reason macOS is not optional). Every push and pull request runs it, without path filters, so
 # `pr-review.sh merge` always finds a verdict on the head commit rather than ABSENT
 # (ludics-lite#21).
@@ -29,11 +29,11 @@ jobs:
       - name: Check shell syntax
         run: |
           set -e
-          for f in */scripts/*.sh; do bash -n "$f"; done
+          for f in */scripts/*.sh scripts/*.sh; do bash -n "$f"; done
       - name: Shellcheck
         # Errors only: the warning tier is style and a few false positives on deliberately
         # unquoted globs; the error tier is what breaks a script.
-        run: shellcheck --severity=error --external-sources */scripts/*.sh
+        run: shellcheck --severity=error --external-sources */scripts/*.sh scripts/*.sh
       - name: Parse guard
         # post-merge-cleanup.sh and test-post-merge-cleanup.sh are each one brace group ending
         # in `exit "$?"` and `}` (ludics-lite#10), so a mid-run rewrite cannot resume the shell
@@ -90,6 +90,19 @@ jobs:
           name: cleanup-logs-${{ matrix.os }}
           path: ${{ github.workspace }}/cleanup-logs
           if-no-files-found: ignore
+
+  wake-lab:
+    name: wake-lab (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise the host-table split and the --help range
+        run: scripts/test-wake-lab.sh
 
   fleet-worker:
     name: fleet launcher (${{ matrix.os }})
