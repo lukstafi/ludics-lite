@@ -143,10 +143,8 @@ Write the body as the reviewer's map, not a changelog: what is now true that was
 tests pin, what changes for existing users, and where the risky corner is. Reviewers — human and
 automated — spend their attention where the body sends it.
 
-Report the URL on its own line. Use the harness's native way to surface a newly created PR when it
-has one — the intent is to give the user the richest available PR link or live status card, and
-the agent chooses the mechanism. The Claude harness's Desktop client recognizes this wrapper (it
-is inert elsewhere):
+Report the URL on its own line, wrapped as below. The Claude Desktop client renders a live status
+card from the tag; other harnesses ignore it:
 
 ```
 <pr-created>https://github.com/owner/repo/pull/123</pr-created>
@@ -158,21 +156,18 @@ multi-PR arc that comment is what makes the phases legible later.
 
 ## Monitor
 
-Poll for the review yourself: merely surfacing the PR through the harness does not arm monitoring.
-In the Claude harness's Desktop client, the `<pr-created>` tag renders a PR card, but the
-review-event feed behind that card starts only when the user clicks its "Auto-fix CI & address
-comments" — verified on a PR opened with the tag and no other setup, which drew a review nobody
-was told about. Other harnesses may expose a different PR surface or no event feed at all. If
-review events do start mid-loop and carry the comment bodies and ids inline, take them as they
-come and stop polling for what they delivered.
+Poll for the review yourself: nothing arms on its own. In the Claude Desktop client, the
+`<pr-created>` tag renders a PR card, but the review-event feed behind that card starts only when
+the user clicks its "Auto-fix CI & address comments" — verified on a PR opened with the tag and no
+other setup, which drew a review nobody was told about. If review events do start mid-loop and
+carry the comment bodies and ids inline, take them as they come and stop polling for what they
+delivered.
 
-Never end a turn with a PR in flight and no wake-capable observer. A running background command and
-a mechanism that resumes the agent when it finishes are separate capabilities: use both, and let
-the harness determine how. If background completion wakes the task, arm the watch and yield. In
-Codex, keep the turn active and poll the returned command session until it exits; for a wait too
-long to hold open, use a thread heartbeat or automation that rechecks the PR instead of relying on
-terminal completion. Do not send a final response while an otherwise unobserved shell session is
-the only thing watching the PR.
+Never end a turn with a PR in flight and nothing that will wake you. Under Claude Code, run `watch`
+with Bash `run_in_background: true` and yield; the completion notification is the wake. Under Codex
+a finished background command does not resume the agent: keep the turn open and poll the command
+session until `watch` exits, or, for a wait too long to hold open, schedule a heartbeat that
+re-runs `poll`. A backgrounded shell nobody is polling is not an observer.
 
 `watch` *is* the polling loop — don't hand-roll a sleep loop around `poll`, which is what a long
 review otherwise turns into. It returns the moment a round lands (printing exactly what `poll`
@@ -184,10 +179,9 @@ and ends on a watermark either way:
 ~/.claude/skills/ship-pr/scripts/pr-review.sh poll <owner>/<repo>#<pr> [watermark]   # one shot
 ```
 
-Run `watch` through the harness's long-running command surface and consume its exit status and
-output through that surface. Its default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune
-it) outlasts many foreground timeout ceilings. Spell the repo out, as above — a deferred call may
-not retain the checkout from which repo inference would otherwise work.
+Its default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it) outlasts a foreground
+tool's timeout, which is why it is backgrounded. Spell the repo out, as above: a background shell
+does not reliably start in the checkout.
 
 **Never pipe a gate command** — `watch`, `poll`, `checks`, `base`, `merge` — through `tail`, `head`
 or anything else: the pipeline reports the LAST command's status, so the script's exit code (2 for

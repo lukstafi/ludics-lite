@@ -254,10 +254,9 @@ treated the same way even when its body is ours.
 Mechanics that differ from Claude workers:
 
 - **Skills**: `ship-pr`, `wait-and-proceed`, and `after-merge` are symlinked into
-  `~/.codex/skills` (from the box's `~/ludics-lite` - the preflight checks the links). Codex
-  may expose persistent task creation as `create_thread` rather than `spawn_task`. Hand-back mode
-  makes the agent's choice of harness mechanism moot here: wave workers of either kind propose
-  rather than create the follow-up task themselves.
+  `~/.codex/skills` (from the box's `~/ludics-lite` - the preflight checks the links). Whether
+  Codex has a chip tool (`create_thread` in place of `spawn_task`) is moot under hand-back mode:
+  wave workers of either kind propose rather than file.
 - **Full lifecycle**: with the sandbox gone the worker pushes, drives `gh`, and owns its
   lifecycle through ship-pr. Deliberate choice: review rounds are addressed by the
   continuous session that wrote the code, never handed to a fresh-context finisher - the

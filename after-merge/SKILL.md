@@ -38,13 +38,11 @@ Sort each idea into exactly one, and say which:
   Match the tracker's existing title style; prefer a specific claim over a topic ("gradients are
   silently wrong for overlapping windows" beats "gradient issues"). Body: what the work ran into,
   why it is worth fixing, and what a fix would touch.
-- **Chip it** — small, immediately actionable, no open design question. Create a persistent,
-  user-visible follow-up task with a self-contained prompt (file paths and enough context to act
-  without this conversation), rather than delegating an ephemeral subagent inside this session.
-  Use the task-creation surface native to the harness — for example `spawn_task` or Codex's
-  `create_thread`. The agent chooses the supported mechanism appropriate to its harness; that
-  surface may create immediately or ask the user to confirm. If the harness offers no such
-  surface, do not improvise a substitute: surface the item in your report as a **chip candidate**,
+- **Chip it** — small, immediately actionable, no open design question. Spawn a background task
+  with a self-contained prompt (file paths and enough context to act without this conversation)
+  through the harness's task tool, `spawn_task` under Claude Code or `create_thread` under Codex,
+  not an in-session subagent, which is neither persistent nor user-visible. If the harness has no
+  such tool, do not improvise a substitute: surface the item in your report as a **chip candidate**,
   prompt included.
 - **Drop it, with the reason** — state the reason in the report so the same idea is not re-raised
   next cycle. Dropping is the common case.

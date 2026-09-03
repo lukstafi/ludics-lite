@@ -35,6 +35,10 @@ Rerun the loop after adding a skill. Replace any pre-existing real directory in
 `~/.claude/skills/` by hand first, and diff it against this copy, since a divergent local edit
 may be a fix worth keeping.
 
+Keep these `~/.claude/skills` links even on a Codex-only box: command examples use them as the
+canonical script paths. The `~/.codex/skills` links below are additionally required for Codex to
+discover the skills.
+
 On a machine that runs Codex workers (see the Codex workers section of `issue-wave/SKILL.md`),
 also link the skills Codex uses into `~/.codex/skills`. The issue-wave coordinator's per-launch
 preflight (`issue-wave/scripts/fleet-worker.sh preflight <box> --codex`) refuses to launch a
