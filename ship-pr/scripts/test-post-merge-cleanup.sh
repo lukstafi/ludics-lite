@@ -3602,7 +3602,7 @@ test_runner_cleans_up_after_a_closed_pipe() {
   # only state this outer case inspects. Bash 3.2 reports the closed external writer as SIGPIPE
   # (141), while Bash 5 can surface the failed builtin write as 1; both are nonzero closed-pipe
   # exits, and the cleanup contract is the same.
-  local tag="pipe$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" patched
+  local tag="pipe$$" copy="$TEST_ROOT/copy" err="$TEST_ROOT/copy.err" out="$TEST_ROOT/copy.out" patched
   local copy_rc head_rc pipeline_statuses
   copy_runner "$copy" "$tag"
   patched=$(awk -v target="$SELF_CASE() {" '{
@@ -3617,7 +3617,10 @@ test_runner_cleans_up_after_a_closed_pipe() {
     fail "could not give the copy enough verbose output to close its pipe"
 
   set +e
-  run_copy "$copy/test-post-merge-cleanup.sh" -j 1 -v "$SELF_CASE" 2>&1 | head -n 1 >"$out"
+  # A plain `runner -v | head -1` pipes stdout only. Keep stderr separate too: macOS Bash's known
+  # job-control diagnostic is written before the case redirections exist, but it is not output
+  # whose reader closed and must not race the deterministic stdout payload for head's one line.
+  run_copy "$copy/test-post-merge-cleanup.sh" -j 1 -v "$SELF_CASE" 2>"$err" | head -n 1 >"$out"
   pipeline_statuses=("${PIPESTATUS[@]}")
   set -e
   copy_rc="${pipeline_statuses[0]}"
