@@ -195,6 +195,22 @@ test_comment_only_rounds_count() {
     "the inline round (with its summary comment) plus one comment-only round"
 }
 
+# The feeds travel on stdin, not the argument list: one 300 KB comment is over Linux's per-argument
+# limit, and a long PR has many.
+test_large_comment_feed_still_counts() {
+  set_reviews "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)"
+  local big
+  big=$(head -c 300000 /dev/zero | tr '\0' x)
+  set_comments \
+    "$(comment "$REVIEWER" 2026-09-01T10:45:00Z "Codex Review: $big")" \
+    "$(comment "$REVIEWER" 2026-09-01T11:30:00Z "Codex Review: $big")"
+  ROUND_THRESHOLD=12
+  run_rounds
+  assert_eq "$ROUNDS_RC" 0 "a large comment feed still reads"
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 3 of 12" \
+    "the inline round plus two comment-only rounds"
+}
+
 test_no_rounds_yet() {
   set_reviews "$(review "$REVIEWER" APPROVED cccc 2026-09-01T12:00:00Z)"
   ROUND_THRESHOLD=12
@@ -251,6 +267,7 @@ tests=(
   test_malformed_threshold_is_refused
   test_malformed_gap_is_refused
   test_comment_only_rounds_count
+  test_large_comment_feed_still_counts
   test_no_rounds_yet
   test_threshold
   test_threshold_off

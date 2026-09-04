@@ -817,8 +817,12 @@ review_rounds() {
     echo "unknown|the comments API did not answer ($(gh_err_line))"
     return 0
   }
-  line=$(jq -r --arg rev "$REVIEWER" --argjson gap "$ROUND_GAP" --argjson comments "$comments" '
-      ([.[] | select((.user.login // "") | startswith($rev))
+  # Both feeds go in on stdin (slurped: reviews first, comments second), never as arguments —
+  # a long PR's comment history outgrows the argument list (128 KB per argument on Linux).
+  line=$(printf '%s\n%s\n' "$raw" "$comments" | jq -r -s --arg rev "$REVIEWER" \
+    --argjson gap "$ROUND_GAP" '
+      .[1] as $comments | .[0]
+      | ([.[] | select((.user.login // "") | startswith($rev))
            | select(.submitted_at != null)
            | select(.state == "COMMENTED" or .state == "CHANGES_REQUESTED")
            | {sha: (.commit_id // ""), t: (.submitted_at | fromdateiso8601)}]
@@ -839,8 +843,7 @@ review_rounds() {
           if (same($r.sha; .sha) | not) or ($r.t - .t) > $gap
           then {n: (.n + 1), sha: $r.sha, t: $r.t}
           else {n: .n, sha: .sha, t: $r.t} end)
-      | "\(.n)|" + ([.] | length | tostring)' \
-    <<<"$raw" 2>/dev/null) || {
+      | "\(.n)|" + ([.] | length | tostring)' 2>/dev/null) || {
     echo "unknown|the reviews feed did not parse"
     return 0
   }
@@ -1836,6 +1839,14 @@ cmd_merge() {
     esac
   done
   [ ${#gh_args[@]} -gt 0 ] || gh_args=(--merge) # the repo convention: preserve the commit series
+  # The head binding is the script's, not the caller's: a forwarded --match-head-commit would
+  # follow the script's on the command line and could name a head the gate never read.
+  for arg in "${gh_args[@]}"; do
+    case "$arg" in
+    --match-head-commit | --match-head-commit=*) die "merge: --match-head-commit is set by the" \
+      "script to the head the build signal was read for, and cannot be forwarded." ;;
+    esac
+  done
   # A close-out merge is a merge NOW of the head the gate read, or nothing: deferred auto-merge
   # would land whatever head the PR has when the base's checks pass, gate unread.
   if [ -n "$require_green" ]; then

@@ -186,6 +186,16 @@ test_require_green_refuses_green_by_skips_only() {
   assert_eq "$MERGE_CALLS" "" "no merge call should have been made"
 }
 
+test_forwarded_head_binding_is_refused() {
+  use_merge_fixture
+  run_merge -- --match-head-commit other --merge
+  assert_eq "$MERGE_RC" 2 "a forwarded --match-head-commit is a usage error"
+  assert_contains "$MERGE_OUTPUT" "cannot be forwarded" "should say the flag is the script's"
+  assert_eq "$MERGE_CALLS" "" "no merge call should have been made"
+  run_merge -- --match-head-commit=other --merge
+  assert_eq "$MERGE_RC" 2 "the = form is refused too"
+}
+
 test_require_green_refuses_auto() {
   use_merge_fixture
   run_merge --require-green -- --auto --merge
@@ -243,6 +253,7 @@ tests=(
   test_heartbeat_is_once_per_period
   test_merge_binds_to_the_gated_head
   test_require_green_refuses_green_by_skips_only
+  test_forwarded_head_binding_is_refused
   test_require_green_refuses_auto
   test_require_green_disables_a_deferred_auto_merge
   test_require_green_waits_for_a_young_green_to_settle
