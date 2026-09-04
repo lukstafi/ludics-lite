@@ -3599,7 +3599,9 @@ test_runner_cleans_up_after_a_closed_pipe() {
   # log larger than a pipe buffer, read one line, and close the pipe. The copy must take SIGPIPE,
   # run its EXIT cleanup, and remove its scratch root. The inner runner stays at -j 1, matching
   # every runner self-case; its exit status, the one retained output line, and its root are the
-  # only state this outer case inspects.
+  # only state this outer case inspects. Bash 3.2 reports the closed external writer as SIGPIPE
+  # (141), while Bash 5 can surface the failed builtin write as 1; both are nonzero closed-pipe
+  # exits, and the cleanup contract is the same.
   local tag="pipe$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" patched
   local copy_rc head_rc pipeline_statuses
   copy_runner "$copy" "$tag"
@@ -3620,7 +3622,10 @@ test_runner_cleans_up_after_a_closed_pipe() {
   set -e
   copy_rc="${pipeline_statuses[0]}"
   head_rc="${pipeline_statuses[1]}"
-  [ "$copy_rc" -eq 141 ] || fail "the copy exited $copy_rc after its pipe closed, expected 141"
+  case "$copy_rc" in
+  1 | 141) ;;
+  *) fail "the copy exited $copy_rc after its pipe closed, expected 1 or 141" ;;
+  esac
   [ "$head_rc" -eq 0 ] || fail "head exited $head_rc while closing the copy's pipe"
   grep -Fqx RUNNER_CLOSED_PIPE_HEAD "$out" ||
     fail "the closed-pipe run did not yield its deterministic first line: $(cat "$out")"
