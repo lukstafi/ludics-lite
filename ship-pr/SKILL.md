@@ -400,7 +400,8 @@ checks leave nothing to wait for (green as well as absent), the gate reads
 - a queued or running non-advisory run is exit 4, **including under a green check** — one
   workflow's green says nothing about a sibling that has not judged the head;
 - a run that completed `cancelled`/`stale`/`action_required` with nothing behind it is exit 4,
-  stopped-not-judged like everywhere else;
+  stopped-not-judged like everywhere else, as is one reported `completed` with no conclusion
+  recorded yet;
 - a head with no Actions run to back its checks holds too: `build_checks` accepts every provider's
   check runs, so an early Codecov green is not evidence that Actions has created its rows;
 - a **checkless** head holds while it is inside `SHIP_PR_BASE_ABSENT_GRACE` (300s, measured from
@@ -408,10 +409,13 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   so a long-local commit pushed just now counts as fresh and a future commit date does not blind
   the gate), and only past that is `ABSENT` the verdict — with the evidence on the line.
 
-Only the newest run of each workflow is judged, the same `filter=latest` semantics the check
-lookup asks for: a queued invocation that was cancelled and then re-triggered must not park the
-gate on the superseded row. A run list that cannot be read is exit 3 even under a pending check —
-an unread run list cannot rule out a red that no check run will ever carry.
+Only the newest run of each workflow **and event** is judged, the same `filter=latest` semantics
+the check lookup asks for: a re-triggered invocation supersedes its own cancelled predecessor, but
+one file triggered on both `push` and `pull_request` produces two independent runs that must both
+be. The advisory list is a deny-list of check, job and workflow names in all directions — a run
+whose red is explained entirely by advisory jobs is not a red build signal, since `build_checks`
+already dropped those checks on purpose. A run list that cannot be read is exit 3 even under a
+pending check: an unread run list cannot rule out a red that no check run will ever carry.
 
 No hand re-check, and no `--wait` needed for any of it: without one the same window is exit 4, not
 0. The knob is there for a repo whose runs take longer than five minutes to appear.

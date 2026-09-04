@@ -150,8 +150,9 @@
 #      saying so (1200), SHIP_PR_REVIEW_STALL=seconds a live 👀 may run before it gets the same
 #      verdict (2×GRACE). Both are measured from the PR's own timestamps, not from when the watch
 #      started, so they are reached ACROSS windows — a 900s window cannot outrun a 1200s grace.
-#      SHIP_PR_ADVISORY_CHECKS=ERE of check/workflow names the build gate ignores (default: the
-#      review app's check and the github-pages deploys), SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
+#      SHIP_PR_ADVISORY_CHECKS=ERE of check, job and workflow names the build gate ignores
+#      (default: the review app's check and the github-pages deploys) — a run whose red is
+#      explained entirely by advisory JOBS is not a red build signal either, SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
 #      out for a build verdict (7200 — the runner queue alone ran ~2h deep on 2026-08-23),
 #      SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60), SHIP_PR_CHECKS_HEARTBEAT=seconds
 #      between the one-line "still waiting" progress notes a `--wait` prints (600),
@@ -1391,45 +1392,86 @@ run_reason() {
   printf '%s' "$@"
 }
 
+# A workflow run's aggregate conclusion is not always a build verdict. The advisory list is a
+# deny-list of CHECK names (SHIP_PR_ADVISORY_CHECKS), and build_checks applies it per check run —
+# so a non-advisory workflow carrying one advisory JOB reports `failure` at the run level when
+# only that job failed, and reading the run's red would restore a failure the gate was configured
+# to ignore (ludics-lite#38, round 4). The run's own jobs settle it: true when the run has jobs
+# and none of the non-advisory ones is red, i.e. its red is entirely explained by jobs the gate
+# ignores. A run with NO jobs (the `startup_failure` case this red branch exists for) is not
+# explained, and neither is a jobs read that failed — a red this cannot disprove stands.
+run_red_is_advisory_only() {
+  local id="$1" raw rc jname jconcl jobs=0 hard=0
+  raw=$(gh_retry read api --paginate "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
+    --jq '.jobs[] | [(.name // "-"), (.conclusion // "pending")] | @tsv')
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  while IFS=$'\t' read -r jname jconcl; do
+    [ -n "$jname" ] || continue
+    jobs=$((jobs + 1))
+    is_advisory "$jname" && continue
+    [ "$(conclusion_class "$jconcl")" = red ] && hard=$((hard + 1))
+  done <<<"$raw"
+  [ "$jobs" -gt 0 ] && [ "$hard" -eq 0 ]
+}
+
 run_signal() {
-  local sha="$1" pr_at="${2:-}" checks="${3:-0}" raw rc wid name status concl seen_ids=" "
+  local sha="$1" pr_at="${2:-}" checks="${3:-0}" raw rc rid wid event name status concl
+  local seen_ids=" " red_rows="" rname rconcl
   local runs=0 inflight=0 nogo=0 red=0 red_note="" pushed_at age pr_age t seen
   raw=$(gh_retry read api --paginate \
     "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
-    --jq '.workflow_runs[] | [((.workflow_id // 0) | tostring), (.name // "-"),
-          (.status // "unknown"), (.conclusion // "pending")] | @tsv')
+    --jq '.workflow_runs[] | [((.id // 0) | tostring), ((.workflow_id // 0) | tostring),
+          (.event // "-"), (.name // "-"), (.status // "unknown"), (.conclusion // "pending")]
+          | @tsv')
   rc=$?
   [ "$rc" -eq 0 ] || {
     run_reason 0 "the workflow runs for this head could not be read ($(gh_err_line))"
     return 3
   }
-  # One row per WORKFLOW, the newest — the same `filter=latest` semantics build_checks asks the
+  # One row per INVOCATION, the newest — the same `filter=latest` semantics build_checks asks the
   # check API for, and for the same reason: a head can carry several runs of one workflow (a
   # queued invocation cancelled, then a fresh one that passed), and the superseded row's
   # conclusion is not the current answer. Without this an old cancelled row parks the gate at 4
   # forever and an old checkless failure holds it RED over a workflow that has since gone green
   # (ludics-lite#38, round 3). The feed is newest-first, which is what cmd_base's fold relies on
-  # too, so the first row seen for a workflow id is the one that counts. The id leads the row
-  # because two workflow FILES can share a display name, and a name-keyed fold would collapse
-  # them into one.
-  while IFS=$'\t' read -r wid name status concl; do
-    [ -n "$wid" ] || continue
+  # too, so the first row seen for a key is the one that counts.
+  #
+  # The key is workflow id AND event, not the workflow id alone. The id is there because two
+  # workflow FILES can share a display name and a name-keyed fold would collapse them; the event
+  # is there because ONE file triggered on both `push` and `pull_request` produces two INDEPENDENT
+  # runs at the same head that share a workflow id — collapsing those hides a queued invocation
+  # behind a newer one that finished (round 4). cmd_base does not need this because it queries a
+  # single event; this feed is every event at a head.
+  while IFS=$'\t' read -r rid wid event name status concl; do
+    [ -n "$rid" ] || continue
     is_advisory "$name" && continue
-    case "$seen_ids" in *" $wid "*) continue ;; esac
-    seen_ids="$seen_ids$wid "
+    case "$seen_ids" in *" $wid/$event "*) continue ;; esac
+    seen_ids="$seen_ids$wid/$event "
     runs=$((runs + 1))
-    if [ "$status" != completed ]; then
+    # A run reported `completed` before its conclusion is populated is not judged either: the
+    # projection renders that null as `pending`, which is neither red nor stopped, and counting it
+    # as finished-and-judged would let a green check — or, on a checkless head, the eventual
+    # ABSENT — carry a workflow that has concluded nothing (round 4).
+    if [ "$status" != completed ] || [ "$(conclusion_class "$concl")" = pending ]; then
       inflight=$((inflight + 1))
       continue
     fi
     case "$(conclusion_class "$concl")" in
-    red)
-      red=$((red + 1))
-      [ -n "$red_note" ] || red_note="$name ($concl)"
-      ;;
+    red) red_rows="${red_rows}${rid}"$'\t'"${name}"$'\t'"${concl}"$'\n' ;;
     nogo) nogo=$((nogo + 1)) ;;
     esac
   done <<<"$raw"
+  # Each red run gets the advisory-job read before it counts — one call, only ever for a run that
+  # is already red, and only when no check run reported that failure.
+  if [ -n "$red_rows" ]; then
+    while IFS=$'\t' read -r rid rname rconcl; do
+      [ -n "$rid" ] || continue
+      run_red_is_advisory_only "$rid" && continue
+      red=$((red + 1))
+      [ -n "$red_note" ] || red_note="$rname ($rconcl)"
+    done <<<"$red_rows"
+  fi
   # Red first: it is a verdict, and a verdict ends the wait. Reaching here at all means the check
   # fold found no red, so this run's failure is one no check run reported — the whole reason to
   # look at the run list rather than trusting the check list to carry every failure.
@@ -1440,8 +1482,8 @@ run_signal() {
     return 1
   fi
   if [ "$inflight" -gt 0 ]; then
-    run_reason 0 "$inflight workflow run(s) for this head have not finished — their check runs" \
-      " do not exist yet"
+    run_reason 0 "$inflight workflow run(s) for this head have no conclusion yet (queued," \
+      " running, or completed with none recorded) — their check runs may not exist yet"
     return 4
   fi
   if [ "$nogo" -gt 0 ]; then
@@ -1571,7 +1613,10 @@ gate_checks() {
           "alone are not the build signal, so this is UNKNOWN, which is NOT 'nothing is red'."
         return 3
         ;;
-      4) case "$VERDICT" in green | absent) VERDICT=unjudged ;; esac ;;
+      # Every fold the run list leaves unjudged becomes waitable, MIXED included: a stopped check
+      # under a queued run used to break the loop at once, so `--wait` returned without waiting
+      # for the run that was still coming (round 4). The stopped checks stay in the report below.
+      4) case "$VERDICT" in pending) ;; *) VERDICT=unjudged ;; esac ;;
       esac
     fi
     now=$(date +%s)

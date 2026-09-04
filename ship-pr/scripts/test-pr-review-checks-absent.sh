@@ -51,6 +51,7 @@ CHECK_RUNS_SEQ=()
 RUNS_SEQ=()
 COMMIT_AGE=""
 PR_UPDATED_AGE=""
+JOBS_JSON=""
 FAIL_ENDPOINT=""
 
 check_runs_json() { jq -cn --argjson runs "$1" '{check_runs:$runs}'; }
@@ -59,8 +60,12 @@ check_runs_json() { jq -cn --argjson runs "$1" '{check_runs:$runs}'; }
 # superseded-run cases below say deliberately. Rows are newest-first, as the API returns them.
 runs_json() {
   jq -cn --argjson runs "$1" \
-    '{workflow_runs: [$runs | to_entries[] | .value + {workflow_id: (.value.workflow_id // (.key + 1))}]}'
+    '{workflow_runs: [$runs | to_entries[] | .value + {
+        id: (.value.id // (.key + 101)),
+        workflow_id: (.value.workflow_id // (.key + 1)),
+        event: (.value.event // "push")}]}'
 }
+jobs_json() { jq -cn --argjson jobs "$1" '{jobs:$jobs}'; }
 iso_ago() { jq -rn --argjson n "$1" '(now - $n) | todateiso8601'; }
 
 # Pops the next canned answer, and repeats the last one forever after: the round count is the
@@ -82,6 +87,7 @@ reset_fixture() {
   RUNS_SEQ=("$(runs_json '[]')")
   COMMIT_AGE=3600
   PR_UPDATED_AGE=3600
+  JOBS_JSON=$(jobs_json '[]')
   FAIL_ENDPOINT=""
   rm -f "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls"
   ABSENT_GRACE=300
@@ -137,6 +143,7 @@ gh() {
   "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&per_page=100")
     response=$(next_of RUNS_SEQ)
     ;;
+  "repos/$REPO/actions/runs/"*"/jobs?per_page=100") response="$JOBS_JSON" ;;
   "repos/$REPO/commits/$HEAD_SHA")
     response=$(jq -cn --arg at "$(iso_ago "$COMMIT_AGE")" '{commit:{committer:{date:$at}}}')
     ;;
@@ -170,7 +177,7 @@ test_inflight_run_is_not_absent() {
   run_gate
   assert_eq "$GATE_RC" 4 "an in-flight run with no checks yet is no verdict, not absence"
   assert_contains "$GATE_OUTPUT" "NO VERDICT YET" "the in-flight run should headline no verdict"
-  assert_contains "$GATE_OUTPUT" "1 workflow run(s) for this head have not finished" \
+  assert_contains "$GATE_OUTPUT" "1 workflow run(s) for this head have no conclusion yet" \
     "the reason should name the unfinished run"
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "an unfinished run must not print ABSENT"
 }
@@ -547,6 +554,83 @@ test_unreadable_commit_still_decides_on_the_pr_clock() {
   assert_contains "$GATE_OUTPUT" "run-creation grace" "the hold should name the grace"
 }
 
+# Round 4 of the review, P1: one workflow file triggered on both `push` and `pull_request`
+# produces two INDEPENDENT runs at the same head, sharing a workflow id. Folding them together
+# hides a queued invocation behind a newer one that finished.
+test_two_events_of_one_workflow_are_two_runs() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ci","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"workflow_id":7,"event":"pull_request","name":"ci",
+                            "status":"completed","conclusion":"success"},
+                           {"workflow_id":7,"event":"push","name":"ci",
+                            "status":"queued","conclusion":null}]')")
+  run_gate
+  assert_eq "$GATE_RC" 4 "the queued push run is not superseded by the pull_request run"
+  assert_contains "$GATE_OUTPUT" "NO VERDICT YET" "the queued invocation should hold the gate"
+}
+
+# Round 4, P2: a stopped check under a queued run used to break the wait loop at once.
+test_stopped_checks_with_a_queued_run_keep_waiting() {
+  reset_fixture
+  CHECKS_HEARTBEAT=0
+  CHECK_RUNS_SEQ=(
+    "$(check_runs_json '[{"name":"a","conclusion":"cancelled","html_url":"u"}]')"
+    "$(check_runs_json '[{"name":"a","conclusion":"cancelled","html_url":"u"},
+                         {"name":"b","conclusion":"failure","html_url":"u"}]')"
+  )
+  RUNS_SEQ=("$(runs_json '[{"name":"a","status":"completed","conclusion":"cancelled"},
+                           {"name":"b","status":"queued","conclusion":null}]')")
+  run_gate 30
+  assert_eq "$GATE_RC" 1 "the wait should have stayed for the queued run's verdict"
+  assert_contains "$GATE_OUTPUT" "still waiting" "a mixed fold over a queued run should wait"
+}
+
+# Round 4, P2: `completed` with no conclusion recorded yet is not judged.
+test_completed_run_without_a_conclusion_is_unjudged() {
+  reset_fixture
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":null}]')")
+  run_gate
+  assert_eq "$GATE_RC" 4 "a completed run with no conclusion has judged nothing"
+  assert_contains "$GATE_OUTPUT" "no conclusion yet" "the reason should say so"
+  assert_not_contains "$GATE_OUTPUT" ": ABSENT" "it must not settle as absence"
+}
+
+# Round 4, P1: the advisory list is a deny-list of CHECK names, and build_checks applies it per
+# check run. A non-advisory workflow whose only failing job is advisory must not come back as red
+# through the run-level conclusion.
+test_advisory_job_failure_is_not_a_red_run() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"build","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"failure"}]')")
+  JOBS_JSON=$(jobs_json '[{"name":"build","conclusion":"success"},
+                          {"name":"claude","conclusion":"failure"}]')
+  run_gate
+  assert_eq "$GATE_RC" 0 "a red explained entirely by an advisory job is not a build red"
+  assert_contains "$GATE_OUTPUT" "green — 1 build checks passed" "the check fold's verdict stands"
+}
+
+test_non_advisory_job_failure_is_a_red_run() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"lint","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"failure"}]')")
+  JOBS_JSON=$(jobs_json '[{"name":"lint","conclusion":"success"},
+                          {"name":"build","conclusion":"failure"}]')
+  run_gate
+  assert_eq "$GATE_RC" 1 "a red job the gate does not ignore is still red"
+  assert_contains "$GATE_OUTPUT" "ci (failure)" "the red run should be named"
+}
+
+# A red this cannot disprove stands: no jobs at all is the startup_failure shape, and an
+# unreadable job list is not evidence of innocence.
+test_unreadable_jobs_keep_the_red() {
+  reset_fixture
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"failure"}]')")
+  FAIL_ENDPOINT="*/jobs?per_page=100"
+  run_gate
+  assert_eq "$GATE_RC" 1 "an unreadable job list leaves the red standing"
+  assert_contains "$GATE_OUTPUT" ": RED" "the red should still headline"
+}
+
 tests=(
   test_inflight_run_is_not_absent
   test_queued_run_is_not_absent
@@ -578,6 +662,12 @@ tests=(
   test_newest_run_of_a_workflow_still_counts
   test_future_commit_date_falls_back_to_the_pr_clock
   test_future_commit_date_still_holds_a_fresh_pr
+  test_two_events_of_one_workflow_are_two_runs
+  test_stopped_checks_with_a_queued_run_keep_waiting
+  test_completed_run_without_a_conclusion_is_unjudged
+  test_advisory_job_failure_is_not_a_red_run
+  test_non_advisory_job_failure_is_a_red_run
+  test_unreadable_jobs_keep_the_red
   test_wait_holds_until_the_checks_appear
   test_wait_ceiling_with_a_queued_run_is_no_verdict
 )
