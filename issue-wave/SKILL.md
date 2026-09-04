@@ -273,7 +273,8 @@ triage, list the issues whose subject is a crash, a trap, an out-of-range access
 else that reads as exploit analysis in the wave summary as candidates for Claude workers and
 let the user choose; mid-wave, after ONE such kill, the escalation path Supervise already names
 applies - hand the worktree to a Claude finisher under a NEW worker name
-(`launch <box> <name>-fin --kind claude --cwd <worktree>`; the dead worker's record keeps
+(`launch <box> <name>-fin --kind claude --brief <finisher-brief> --cwd <worktree>`; the dead
+worker's record keeps
 `<name>`, which `launch` refuses to overwrite without `--replace`), brief = the original plus a
 finisher note naming the inherited commits, and tell the user - rather than resuming. Both
 finishers that day landed their PRs (the user confirmed keeping the first), and the `#870` one
@@ -286,7 +287,9 @@ and the turn's end kills the watch - the finisher brief says to WAIT on `pr-revi
 over ssh for a one-off leg; on 2026-09-04 minix had no credential for rog and the CUDA arm of
 ahrefs/ocannl#892 went unmeasured (lukstafi/ludics-lite#57). Until the preflight probes it,
 check the path the WORKER will use, from its home box, not from the coordinator's:
-`ssh <home-box> 'ssh -o BatchMode=yes <other-box> exit 0'` before briefing such a leg.
+`ssh <home-box> 'ssh -o BatchMode=yes <other-box> exit 0'`, or plain
+`ssh -o BatchMode=yes <other-box> exit 0` when the home box is the coordinator's own machine
+(the same local/remote split `run_on` makes) - before briefing such a leg.
 
 Mechanics that differ from Claude workers:
 
