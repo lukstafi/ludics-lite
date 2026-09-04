@@ -101,6 +101,52 @@ test_counts_distinct_heads_with_findings() {
   assert_not_contains "$ROUNDS_OUTPUT" "PAST" "two of twelve is not past the threshold"
 }
 
+# A re-requested round on the same head ('@codex review' without a push) is a separate burst of
+# reviews minutes later; it must count, or twelve rounds on one head would read as one.
+test_rerequested_round_on_same_head_counts() {
+  set_reviews \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)" \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:03Z)" \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:40:00Z)" \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:40:02Z)" \
+    "$(review "$REVIEWER" COMMENTED bbbb 2026-09-01T11:00:00Z)"
+  ROUND_THRESHOLD=12
+  run_rounds
+  assert_eq "$ROUNDS_RC" 0 "three rounds under the threshold should exit 0"
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 3 of 12" \
+    "two bursts on one head plus one on another are three rounds"
+  assert_contains "$ROUNDS_OUTPUT" "over 2 head(s)" "should still report the heads"
+}
+
+# Order in the feed is not submission order, and a burst straddling the gap by one review is one
+# round: the gap is measured review to review, not from the round's first review.
+test_rounds_are_ordered_by_submission_and_chained() {
+  set_reviews \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:20:00Z)" \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)" \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:10:00Z)"
+  ROUND_THRESHOLD=12
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "reviews 10 minutes apart in a chain are one round"
+}
+
+test_malformed_threshold_is_refused() {
+  local out rc
+  set +e
+  out=$(SHIP_PR_ROUND_THRESHOLD=12x bash "$HELPER" rounds "$REPO#7" 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 2 "a malformed threshold is a usage error, not 'off'"
+  assert_contains "$out" "SHIP_PR_ROUND_THRESHOLD must be a number of rounds or 'off', got '12x'" \
+    "should name the bad value"
+  set +e
+  out=$(SHIP_PR_ROUND_THRESHOLD=off SHIP_PR_TEST_SOURCE_ONLY=1 bash "$HELPER" 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 0 "off is accepted"
+}
+
 test_no_rounds_yet() {
   set_reviews "$(review "$REVIEWER" APPROVED cccc 2026-09-01T12:00:00Z)"
   ROUND_THRESHOLD=12
@@ -152,6 +198,9 @@ test_api_failure_is_unknown() {
 
 tests=(
   test_counts_distinct_heads_with_findings
+  test_rerequested_round_on_same_head_counts
+  test_rounds_are_ordered_by_submission_and_chained
+  test_malformed_threshold_is_refused
   test_no_rounds_yet
   test_threshold
   test_threshold_off

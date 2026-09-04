@@ -360,7 +360,9 @@ The coordinator's job between launch and last merge:
   loud one (a false refusal or error on valid-but-absent shapes) defers to ONE follow-up
   issue; a silent finding only reachable by code nobody has written defers too (reachability
   qualifier); and defects in machinery the review itself introduced are the worker's to fix,
-  not to defer ("filing bugs against myself"). When a reviewer approves only by finding
+  not to defer ("filing bugs against myself") — through the twelfth round; past it ship-pr's
+  threshold applies and they defer like anything else that does not make the PR wrong. When a
+  reviewer approves only by finding
   nothing and the last rounds are confined to review-requested machinery, pre-authorize
   merge-on-substance: CI green on the final head, every thread answered with its
   classification, and a review-record paragraph in the PR body. Ship-pr carries the exits a

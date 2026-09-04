@@ -297,6 +297,9 @@ review invalidated, say so in the artifact instead of quietly dropping it.
 
 Two gates stand between a finished round and `master`: the reviewer's approval and the build
 signal. This section is the first; the build gate is below, and neither substitutes for the other.
+The review gate has one narrowly scoped alternative to the approval itself — the close-out record
+of *When the loop ends* (below), at one of the loop's two exits — and nothing stands in for the
+build gate.
 
 The review gate is the reviewer's approval — for the Codex integration, a 👍 reaction on the PR,
 not a review state. The two channels are disjoint: a round WITH findings posts `COMMENTED` reviews
@@ -398,8 +401,9 @@ the reviewer never 👍'd defensible:
 - every thread is answered with its disposition — fixed / removed / deferred / rebutted — and
   resolved;
 - the PR body carries a review-record paragraph: how many rounds, each rebuttal in one line, and
-  the follow-up issue's number;
-- the residuals are filed, as one issue, before the merge rather than after it.
+  — when anything was deferred — the follow-up issue's number;
+- the residuals, when there are any, are filed as one issue before the merge rather than after
+  it. A round rebutted in full leaves none, and no empty issue is filed to say so.
 
 Then merge — `merge` (below) reads the build signal, not the 👍. The maintainer reads in the
 record what was not done and why, instead of finding it in the next PR's review.

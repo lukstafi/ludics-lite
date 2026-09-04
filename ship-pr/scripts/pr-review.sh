@@ -163,13 +163,18 @@
 #      base-drift warning blocks the merge. SHIP_PR_ROUND_THRESHOLD=review rounds with findings
 #      after which only BLOCKING findings are fixed and the rest go to one follow-up issue (12;
 #      ship-pr's "When the loop ends" — `rounds` and `status` report the count against it,
-#      nothing here enforces it; `off` reports the count alone).
+#      nothing here enforces it; `off` reports the count alone; anything else is refused).
+#      SHIP_PR_ROUND_GAP=seconds between two of the reviewer's reviews on the same head beyond
+#      which they are separate rounds (900; a round's reviews land within seconds).
 
 set -uo pipefail
 
 REPO="${REPO:-}"
 REVIEWER="${REVIEWER:-chatgpt-codex-connector}"
 ROUND_THRESHOLD="${SHIP_PR_ROUND_THRESHOLD:-12}"
+# Reviews of one round land within seconds of each other; a re-requested round on the SAME head
+# lands minutes or hours later. This gap is what tells them apart (seconds).
+ROUND_GAP="${SHIP_PR_ROUND_GAP:-900}"
 STATE_DIR="${SHIP_PR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ship-pr}"
 CACHE="$STATE_DIR/repo-by-pr"
 
@@ -205,6 +210,14 @@ fail() {
 }
 
 die() { fail 2 "$@"; }
+
+# A typo in the threshold ("12x") must not read as `off`: that would turn a bounded triage into
+# an unbounded one silently, so anything but a number or the literal `off` is a usage error.
+case "$ROUND_THRESHOLD" in
+off | 0 | [1-9]*) case "$ROUND_THRESHOLD" in *[!0-9]*) [ "$ROUND_THRESHOLD" = off ] ||
+  die "SHIP_PR_ROUND_THRESHOLD must be a number of rounds or 'off', got '$ROUND_THRESHOLD'" ;; esac ;;
+*) die "SHIP_PR_ROUND_THRESHOLD must be a number of rounds or 'off', got '$ROUND_THRESHOLD'" ;;
+esac
 
 warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 
@@ -764,32 +777,51 @@ status_line() {
 
 # How many review rounds have carried findings, read off the PR rather than remembered: a session
 # that has been compacted twice cannot say what round it is in, and the convergence policy (the
-# skill's "When the loop ends") needs the number. A round with findings is a set of COMMENTED
-# reviews the reviewer submitted against one head, so the count is the number of DISTINCT heads
-# that carry such reviews. A re-requested round on the same head that found more collapses into
-# the first — the count errs low, which is the safe direction for a threshold. Your own replies
+# skill's "When the loop ends") needs the number. A round with findings is a burst of COMMENTED
+# reviews the reviewer submitted against one head — one per inline comment plus a summary, all
+# within seconds — so the count is the number of such bursts: in submission order, a review
+# starts a new round when it is on a different head than the previous one OR lands more than
+# ROUND_GAP after it. The gap is what keeps a re-requested round on the same head (the
+# `@codex review` nudge the status verdicts recommend needs no push) from collapsing into the
+# round before it, which a distinct-heads count did (review of ludics-lite#39). Your own replies
 # land in the same feed as COMMENTED reviews, hence the login filter; PENDING reviews have no
 # submitted_at and are not a round. Prints ONE line, "<count>|<detail>", and always exits 0:
 # a count of "unknown" carries the failure, and is NOT "no rounds yet".
 review_rounds() {
-  local pr="$1" raw line
+  local pr="$1" raw line count heads
   raw=$(api_list "pulls/$pr/reviews?per_page=100") || {
     echo "unknown|the reviews API did not answer ($(gh_err_line))"
     return 0
   }
-  line=$(jq -r --arg rev "$REVIEWER" '
+  line=$(jq -r --arg rev "$REVIEWER" --argjson gap "$ROUND_GAP" '
       [.[] | select((.user.login // "") | startswith($rev))
            | select(.submitted_at != null)
            | select(.state == "COMMENTED" or .state == "CHANGES_REQUESTED")
-           | (.commit_id // "")] | unique | map(select(. != "")) | length' \
+           | {sha: (.commit_id // ""), t: (.submitted_at | fromdateiso8601)}]
+      | sort_by(.t)
+      | reduce .[] as $r ({n: 0, sha: null, t: 0};
+          if $r.sha != .sha or ($r.t - .t) > $gap
+          then {n: (.n + 1), sha: $r.sha, t: $r.t}
+          else {n: .n, sha: .sha, t: $r.t} end)
+      | "\(.n)|" + ([.] | length | tostring)' \
     <<<"$raw" 2>/dev/null) || {
     echo "unknown|the reviews feed did not parse"
     return 0
   }
-  case "$line" in
-  '' | *[!0-9]*) echo "unknown|the reviews feed did not parse" ;;
-  *) echo "$line|$line head(s) carry $REVIEWER findings" ;;
+  count="${line%%|*}"
+  case "$count" in
+  '' | *[!0-9]*)
+    echo "unknown|the reviews feed did not parse"
+    return 0
+    ;;
   esac
+  heads=$(jq -r --arg rev "$REVIEWER" '
+      [.[] | select((.user.login // "") | startswith($rev))
+           | select(.submitted_at != null)
+           | select(.state == "COMMENTED" or .state == "CHANGES_REQUESTED")
+           | (.commit_id // "")] | unique | map(select(. != "")) | length' \
+    <<<"$raw" 2>/dev/null) || heads="?"
+  echo "$count|$count round(s) of $REVIEWER findings over $heads head(s)"
 }
 
 # The count against the threshold, on one line; exit 0 at or under it, 1 past it, 3 unread. The
