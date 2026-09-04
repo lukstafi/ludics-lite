@@ -51,6 +51,7 @@ READS_FILE=$(mktemp "${TMPDIR:-/tmp}/pr-review-checks-reads.XXXXXX") || exit 1
 reads() { wc -l <"$READS_FILE" | tr -d ' '; }
 PENDING_FOREVER=""
 SKIPS_ONLY=""
+STARTED_AT=""   # epoch the green check-run was created; empty = undated
 build_checks() {
   echo read >>"$READS_FILE"
   if [ -n "$PENDING_FOREVER" ]; then
@@ -58,7 +59,7 @@ build_checks() {
   elif [ -n "$SKIPS_ONLY" ]; then
     printf 'green\tci\tskipped\thttps://example/run\ngreen\tdocs\tneutral\thttps://example/run2\n'
   elif [ -n "$GREEN_AFTER" ] && [ "$(reads)" -gt "$GREEN_AFTER" ]; then
-    printf 'green\tci\tsuccess\thttps://example/run\n'
+    printf 'green\tci\tsuccess\thttps://example/run\t%s\n' "${STARTED_AT:-0}"
   fi
   return 0
 }
@@ -133,6 +134,7 @@ use_merge_fixture() {
   : >"$MERGE_ARGS_FILE"
   GREEN_AFTER=0
   SKIPS_ONLY=""
+  STARTED_AT=""
   warn_base_drift() { return 0; }
   gh() {
     case "${1:-} ${2:-}" in
@@ -207,6 +209,33 @@ test_require_green_disables_a_deferred_auto_merge() {
   assert_contains "$MERGE_OUTPUT" "auto-merge DISABLED again" "should say it took it back"
 }
 
+# A green whose newest check-run is seconds old may be a partial set — a sibling workflow not
+# yet registered. The ordinary gate takes it; --require-green refuses without --wait and holds
+# with it until the set has aged past the grace.
+test_require_green_waits_for_a_young_green_to_settle() {
+  use_merge_fixture
+  STARTED_AT=$(date +%s)
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the ordinary gate takes a young green"
+  STARTED_AT=$(date +%s)
+  run_merge --require-green
+  assert_eq "$MERGE_RC" 4 "--require-green refuses a young green without --wait"
+  assert_contains "$MERGE_OUTPUT" "younger than 3 s" "should say the set is young"
+  assert_eq "$MERGE_CALLS" "" "no merge call should have been made"
+  STARTED_AT=$(date +%s)
+  local before after
+  before=$(date +%s)
+  run_merge --require-green --wait=20
+  after=$(date +%s)
+  assert_eq "$MERGE_RC" 0 "--require-green --wait merges once the set has settled ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "holding until the set is 3 s old" "should say it is holding"
+  [ $((after - before)) -ge 3 ] || bail "should have held through the grace"
+  [ $((after - before)) -lt 15 ] || bail "should not have waited to the deadline"
+  STARTED_AT=$(( $(date +%s) - 60 ))
+  run_merge --require-green
+  assert_eq "$MERGE_RC" 0 "an old green needs no settling ($MERGE_OUTPUT)"
+}
+
 tests=(
   test_no_wait_takes_absent_at_once
   test_wait_holds_for_a_run_to_appear
@@ -216,6 +245,7 @@ tests=(
   test_require_green_refuses_green_by_skips_only
   test_require_green_refuses_auto
   test_require_green_disables_a_deferred_auto_merge
+  test_require_green_waits_for_a_young_green_to_settle
 )
 
 for test_name in "${tests[@]}"; do

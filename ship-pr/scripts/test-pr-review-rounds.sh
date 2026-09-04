@@ -16,6 +16,7 @@ source "$HELPER"
 
 REPO=example/repo
 REVIEWS_JSON='[]'
+COMMENTS_JSON='[]'
 FAIL_READ=""
 
 fail() {
@@ -59,6 +60,7 @@ gh() {
     fi
     printf '%s\n' "$REVIEWS_JSON"
     ;;
+  "repos/$REPO/issues/7/comments?per_page=100") printf '%s\n' "$COMMENTS_JSON" ;;
   *) fail "unexpected fixture endpoint: $endpoint" ;;
   esac
 }
@@ -71,7 +73,16 @@ review() { # <login> <state> <commit> <submitted_at|null>
 
 set_reviews() {
   REVIEWS_JSON=$(printf '%s\n' "$@" | jq -cs .)
+  COMMENTS_JSON='[]'
   FAIL_READ=""
+}
+
+comment() { # <login> <created_at> <body>
+  jq -cn --arg u "$1" --arg t "$2" --arg b "$3" '{user:{login:$u}, created_at:$t, body:$b}'
+}
+
+set_comments() {
+  COMMENTS_JSON=$(printf '%s\n' "$@" | jq -cs .)
 }
 
 run_rounds() {
@@ -165,6 +176,25 @@ test_malformed_gap_is_refused() {
   assert_eq "$rc" 0 "a zero gap is accepted"
 }
 
+# A round delivered only as an issue comment is a round; the running placeholder and the clean
+# verdict are not; a comment quoting the head it reviewed joins that head's burst.
+test_comment_only_rounds_count() {
+  set_reviews \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)" \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:02Z)"
+  set_comments \
+    "$(comment "$REVIEWER" 2026-09-01T09:59:00Z '<!-- codex-pull-request-review-summary --> 🔄 Running')" \
+    "$(comment "$REVIEWER" 2026-09-01T10:00:05Z 'Summary for **Reviewed commit:** `aaaa111` with one finding')" \
+    "$(comment "$REVIEWER" 2026-09-01T10:45:00Z 'Codex Review: one more thing about the lock, no lines')" \
+    "$(comment lukstafi 2026-09-01T10:50:00Z 'Round 2, on the summary: fixed')" \
+    "$(comment "$REVIEWER" 2026-09-01T11:30:00Z "Codex Review: Didn't find any major issues. **Reviewed commit:** \`bbbb\`")"
+  ROUND_THRESHOLD=12
+  run_rounds
+  assert_eq "$ROUNDS_RC" 0 "two rounds under the threshold"
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
+    "the inline round (with its summary comment) plus one comment-only round"
+}
+
 test_no_rounds_yet() {
   set_reviews "$(review "$REVIEWER" APPROVED cccc 2026-09-01T12:00:00Z)"
   ROUND_THRESHOLD=12
@@ -220,6 +250,7 @@ tests=(
   test_rounds_are_ordered_by_submission_and_chained
   test_malformed_threshold_is_refused
   test_malformed_gap_is_refused
+  test_comment_only_rounds_count
   test_no_rounds_yet
   test_threshold
   test_threshold_off

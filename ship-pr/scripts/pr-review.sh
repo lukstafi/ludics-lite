@@ -803,19 +803,40 @@ status_line() {
 # submitted_at and are not a round. Prints ONE line, "<count>|<detail>", and always exits 0:
 # a count of "unknown" carries the failure, and is NOT "no rounds yet".
 review_rounds() {
-  local pr="$1" raw line count heads
+  local pr="$1" raw comments line count heads
   raw=$(api_list "pulls/$pr/reviews?per_page=100") || {
     echo "unknown|the reviews API did not answer ($(gh_err_line))"
     return 0
   }
-  line=$(jq -r --arg rev "$REVIEWER" --argjson gap "$ROUND_GAP" '
-      [.[] | select((.user.login // "") | startswith($rev))
+  # A round can also arrive as an issue comment alone — the same shape status_state treats as
+  # the reviewer speaking — so those count too, minus the round-started placeholder and the
+  # no-findings verdict. A comment quoting "Reviewed commit: <sha>" joins that head's burst;
+  # one that names none is its own head, so a summary-only round is never folded into an
+  # inline round it did not belong to.
+  comments=$(api_list "issues/$pr/comments?per_page=100") || {
+    echo "unknown|the comments API did not answer ($(gh_err_line))"
+    return 0
+  }
+  line=$(jq -r --arg rev "$REVIEWER" --argjson gap "$ROUND_GAP" --argjson comments "$comments" '
+      ([.[] | select((.user.login // "") | startswith($rev))
            | select(.submitted_at != null)
            | select(.state == "COMMENTED" or .state == "CHANGES_REQUESTED")
            | {sha: (.commit_id // ""), t: (.submitted_at | fromdateiso8601)}]
+       + [$comments[] | select((.user.login // "") | startswith($rev))
+           | select((.body // "") | test("codex-pull-request-review-summary") | not)
+           | select((.body // "") | test("[Dd]idn.t find any major issues") | not)
+           | {sha: ((((.body // "")
+                     | capture("Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})")).s)
+                    // "comment"),
+              t: (.created_at | fromdateiso8601)}])
       | sort_by(.t)
-      | reduce .[] as $r ({n: 0, sha: null, t: 0};
-          if $r.sha != .sha or ($r.t - .t) > $gap
+      # Same head when equal, or when one is a prefix of the other: a comment quotes a
+      # truncated sha, a review records the full one.
+      | def same($a; $b): $a == $b
+          or ($a != null and $b != null and $a != "" and $b != ""
+              and (($a | startswith($b)) or ($b | startswith($a))));
+        reduce .[] as $r ({n: 0, sha: null, t: 0};
+          if (same($r.sha; .sha) | not) or ($r.t - .t) > $gap
           then {n: (.n + 1), sha: $r.sha, t: $r.t}
           else {n: .n, sha: .sha, t: $r.t} end)
       | "\(.n)|" + ([.] | length | tostring)' \
@@ -1393,7 +1414,9 @@ conclusion_class() {
   esac
 }
 
-# Prints "class<TAB>name<TAB>conclusion<TAB>url" per non-advisory check-run of <sha>. Returns 3
+# Prints "class<TAB>name<TAB>conclusion<TAB>url<TAB>started" per non-advisory check-run of <sha>
+# (started = epoch seconds the run was created, 0 when unknown; it dates the SET, see
+# CHECK_NEWEST). Returns 3
 # printing NOTHING when the read failed, so the caller can tell an outage from a commit with no
 # checks — collapsing those two is how a merge gate says "nothing is red" about a PR it never read.
 # filter=latest is explicit: a re-run adds a second check-run under the same name, and the older
@@ -1408,25 +1431,33 @@ build_checks() {
   local sha="$1" raw rc name concl url
   raw=$(gh_retry read api --paginate \
     "repos/$REPO/commits/$sha/check-runs?filter=latest&per_page=100" \
-    --jq '.check_runs[] | [.name, (.conclusion // "pending"), (.html_url // "-")] | @tsv')
+    --jq '.check_runs[] | [.name, (.conclusion // "pending"), (.html_url // "-"),
+          ((.started_at // "") | if . == "" then 0 else fromdateiso8601 end)] | @tsv')
   rc=$?
   [ "$rc" -eq 0 ] || return 3
-  while IFS=$'\t' read -r name concl url; do
+  while IFS=$'\t' read -r name concl url started; do
     [ -n "$name" ] || continue
     is_advisory "$name" && continue
-    printf '%s\t%s\t%s\t%s\n' "$(conclusion_class "$concl")" "$name" "$concl" "$url"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(conclusion_class "$concl")" "$name" "$concl" "$url" \
+      "${started:-0}"
   done <<<"$raw"
 }
 
 # Folds the per-check classes into VERDICT (red|pending|mixed|absent|green) and the report lines.
 # Runs in the current shell — a pipeline would put the loop in a subshell and lose both.
 summarize_checks() {
-  local class name concl url red=0 pending=0 nogo=0 green=0 passed=0
+  local class name concl url started red=0 pending=0 nogo=0 green=0 passed=0 newest=0
   VERDICT=""
   CHECK_LINES=""
   CHECK_RED=0
-  while IFS=$'\t' read -r class name concl url; do
+  while IFS=$'\t' read -r class name concl url started; do
     [ -n "$class" ] || continue
+    # When the newest check-run on the head was created: a set whose newest member is seconds
+    # old may still be growing (a sibling workflow registers its runs on its own clock).
+    case "$started" in
+    '' | *[!0-9]*) ;;
+    *) [ "$started" -le "$newest" ] || newest="$started" ;;
+    esac
     case "$class" in
     red)
       red=$((red + 1))
@@ -1450,6 +1481,7 @@ summarize_checks() {
   done <<<"$1"
   CHECK_RED="$red"
   CHECK_PASSED="$passed"
+  CHECK_NEWEST="$newest"
   CHECK_PENDING="$pending"
   CHECK_TOTAL=$((red + pending + nogo + green))
   if [ "$red" -gt 0 ]; then
@@ -1466,11 +1498,23 @@ summarize_checks() {
   CHECK_GREEN="$green"
 }
 
+# Is the newest check-run on the head younger than the creation grace? An unknown creation time
+# (0) counts as settled: the API did not date it, and there is nothing to wait for.
+check_set_is_young() {
+  [ "${CHECK_NEWEST:-0}" -gt 0 ] && [ $(($1 - CHECK_NEWEST)) -lt "$CHECKS_ABSENT_GRACE" ]
+}
+
 # Reads the PR's head SHA and judges its build signal. Sets VERDICT and prints the report.
 # 0 = green or absent (nothing is red), 1 = RED, 3 = the API did not answer, 4 = no verdict yet
 # (still running, or every finished job was cancelled).
+# A third argument `settle` (used by merge --require-green) refuses to take a GREEN whose newest
+# check-run is younger than the creation grace: one fast workflow can be green while a slower
+# sibling has not registered its run yet, and a partial green is not a green (review of
+# ludics-lite#39, round 7). Under --wait it keeps polling until the set has aged past the grace;
+# without one it reports the verdict with CHECK_SETTLED empty, and the caller refuses.
 gate_checks() {
-  local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining held=""
+  local pr="$1" wait_for="${2:-0}" settle="${3:-}" sha lines rc deadline started beat now
+  local sleep_for remaining held="" young=""
   sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha)
   rc=$?
   if [ "$rc" -ne 0 ] || [ -z "$sha" ]; then
@@ -1504,6 +1548,15 @@ gate_checks() {
     case "$VERDICT" in
     pending) ;;
     absent) [ $((now - started)) -lt "$CHECKS_ABSENT_GRACE" ] || break ;;
+    green)
+      [ -n "$settle" ] && check_set_is_young "$now" || break
+      if [ -z "$young" ]; then
+        warn "green on $REPO#$pr @${sha:0:8}, but its newest check-run is $((now - CHECK_NEWEST)) s" \
+          "old — holding until the set is $CHECKS_ABSENT_GRACE s old, in case a sibling workflow" \
+          "has not registered its run yet (SHIP_PR_CHECKS_ABSENT_GRACE)"
+        young=1
+      fi
+      ;;
     *) break ;;
     esac
     # One line per heartbeat, not per re-read: a two-hour wait is 120 re-reads, and a background
@@ -1526,6 +1579,8 @@ gate_checks() {
     [ "$sleep_for" -le "$remaining" ] || sleep_for="$remaining"
     sleep "$sleep_for"
   done
+  CHECK_SETTLED=1
+  [ "$VERDICT" = green ] && [ -n "$settle" ] && check_set_is_young "$(date +%s)" && CHECK_SETTLED=""
   case "$VERDICT" in
   red) echo "build signal $REPO#$pr @${sha:0:8}: RED — $CHECK_RED of $CHECK_TOTAL build checks failed" ;;
   pending) echo "build signal $REPO#$pr @${sha:0:8}: NO VERDICT YET — still running" ;;
@@ -1801,7 +1856,7 @@ cmd_merge() {
       "same red on master before this branch existed'."
   fi
   pr_arg "$pr"
-  gate_checks "$PR_NUM" "$wait_for"
+  gate_checks "$PR_NUM" "$wait_for" "$require_green"
   gate=$?
   case "$gate" in
   1)
@@ -1846,6 +1901,12 @@ cmd_merge() {
   # Green by skips alone is the path-filter case wearing a verdict: every check concluded, none
   # of them ran a build. The ordinary gate lets that through (nothing failed); a close-out merge
   # needs a build that RAN and passed.
+  if [ -n "$require_green" ] && [ -z "${CHECK_SETTLED:-}" ]; then
+    fail 4 "REFUSING to merge $REPO#$PR_NUM: --require-green and the head's newest check-run is" \
+      "younger than $CHECKS_ABSENT_GRACE s — a sibling workflow may not have registered its run" \
+      "yet, and a partial green is not a green. Re-run with --wait, which holds until the set" \
+      "has settled."
+  fi
   if [ -n "$require_green" ] && [ "${CHECK_PASSED:-0}" -eq 0 ]; then
     fail 4 "REFUSING to merge $REPO#$PR_NUM: --require-green and every build check on the head" \
       "was skipped or neutral — green, but no build RAN. A close-out merge needs at least one" \
