@@ -109,9 +109,10 @@
 #   pr-review.sh checks <pr> [--wait]      # the BUILD signal on the head commit: green / red /
 #                                          # no verdict yet / absent
 #   pr-review.sh merge <pr> [--override "<why this red is unrelated>"] [--wait]
-#                           [--allow-no-verdict]
+#                           [--allow-no-verdict] [--require-green]
 #                                          # checks, then merge; refuses on red without --override,
-#                                          # on NO verdict without --allow-no-verdict, and WARNS
+#                                          # on NO verdict without --allow-no-verdict, on ABSENT
+#                                          # with --require-green (a close-out merge), and WARNS
 #                                          # loudly when the branch is far behind its base
 #   pr-review.sh base [owner/name] [branch] [--wait[=seconds]]
 #                                          # is the branch you are about to work off CI-green?
@@ -217,6 +218,14 @@ case "$ROUND_THRESHOLD" in
 off | 0 | [1-9]*) case "$ROUND_THRESHOLD" in *[!0-9]*) [ "$ROUND_THRESHOLD" = off ] ||
   die "SHIP_PR_ROUND_THRESHOLD must be a number of rounds or 'off', got '$ROUND_THRESHOLD'" ;; esac ;;
 *) die "SHIP_PR_ROUND_THRESHOLD must be a number of rounds or 'off', got '$ROUND_THRESHOLD'" ;;
+esac
+# The gap reaches jq as a number (--argjson), where a quoted "900" or a `true` would not be
+# rejected but compared cross-type — every same-head re-request collapsing, or every review
+# becoming its own round — so only a plain nonnegative integer passes.
+case "$ROUND_GAP" in
+0 | [1-9]*) case "$ROUND_GAP" in *[!0-9]*)
+  die "SHIP_PR_ROUND_GAP must be a nonnegative number of seconds, got '$ROUND_GAP'" ;; esac ;;
+*) die "SHIP_PR_ROUND_GAP must be a nonnegative number of seconds, got '$ROUND_GAP'" ;;
 esac
 
 warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
@@ -1702,7 +1711,7 @@ warn_base_drift() {
 cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
-  local override="" wait_for=0 allow_no_verdict="" gate out rc attempt=1 mergeable state
+  local override="" wait_for=0 allow_no_verdict="" require_green="" gate out rc attempt=1 mergeable state
   local -a gh_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1724,6 +1733,10 @@ cmd_merge() {
       ;;
     --allow-no-verdict)
       allow_no_verdict=1
+      shift
+      ;;
+    --require-green)
+      require_green=1
       shift
       ;;
     --)
@@ -1776,6 +1789,16 @@ cmd_merge() {
     fi
     ;;
   esac
+  # ABSENT passes the ordinary gate (nothing is red, and path filters make it routine), but a
+  # close-out merge — one the reviewer never 👍'd, resting on the record instead — is required to
+  # have READ a green, and "no run on this head" is not one: seconds after a push the run may
+  # simply not exist yet (the force-push trap). --require-green turns that into a refusal.
+  if [ -n "$require_green" ] && [ "$VERDICT" != green ]; then
+    fail 4 "REFUSING to merge $REPO#$PR_NUM: --require-green and the build signal is $VERDICT," \
+      "not green. A close-out merge needs a green verdict READ on the final head: wait for a run" \
+      "to appear and finish (checks --wait), or confirm why none will (path filters) and" \
+      "merge without --require-green, saying so."
+  fi
   # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
   # verdict is the final thing on screen before the merge itself. A loud WARNING, not a gate: the
   # roll-forward policy (ahrefs/ocannl#861, see warn_base_drift) lets a clean merge proceed on the

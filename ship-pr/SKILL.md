@@ -372,9 +372,11 @@ round it is in:
 ~/.claude/skills/ship-pr/scripts/pr-review.sh rounds <owner>/<repo>#<pr>   # status prints it too
 ```
 
-It counts the heads the reviewer left findings on, exits 1 past the threshold
-(`SHIP_PR_ROUND_THRESHOLD`, 12), and enforces nothing: the threshold is a policy, and the merge is
-still the build gate's to allow.
+It counts bursts of the reviewer's reviews — a round's reviews land within seconds of each other,
+and a new round starts on a different head or after a gap (`SHIP_PR_ROUND_GAP`, 15 min) since the
+previous review, so a re-requested round on the same head counts on its own. It exits 1 past the
+threshold (`SHIP_PR_ROUND_THRESHOLD`, 12) and enforces nothing: the threshold is a policy, and the
+merge is still the build gate's to allow.
 
 *Blocking* is read narrowly, and informally: there is no checklist, and a bug does not qualify by
 being a bug. A finding blocks when merging over it would make the PR wrong — the change does not
@@ -397,7 +399,9 @@ long review — stop and raise it with the user.
 **Closing out** at either exit is the same act, and the record it leaves is what makes a merge
 the reviewer never 👍'd defensible:
 
-- the build gate is green on the final head (below — nothing here lifts it);
+- the build gate has READ a green on the final head: merge with `--require-green`, which refuses
+  `absent` as well as red and no-verdict — a run that does not exist yet is not a green, and a
+  merge the reviewer never 👍'd does not get the path-filter allowance the ordinary gate gives;
 - every thread is answered with its disposition — fixed / removed / deferred / rebutted — and
   resolved;
 - the PR body carries a review-record paragraph: how many rounds, each rebuttal in one line, and
@@ -405,8 +409,14 @@ the reviewer never 👍'd defensible:
 - the residuals, when there are any, are filed as one issue before the merge rather than after
   it. A round rebutted in full leaves none, and no empty issue is filed to say so.
 
-Then merge — `merge` (below) reads the build signal, not the 👍. The maintainer reads in the
-record what was not done and why, instead of finding it in the next PR's review.
+Then merge:
+
+```bash
+~/.claude/skills/ship-pr/scripts/pr-review.sh merge <owner>/<repo>#<pr> --require-green --wait
+```
+
+`merge` (below) reads the build signal, not the 👍. The maintainer reads in the record what was
+not done and why, instead of finding it in the next PR's review.
 
 Both exits have an incentive problem: past the threshold, deferring is cheaper than fixing, and
 rebutting is cheaper than either at any round. The threads and the record paragraph are the only
@@ -488,6 +498,11 @@ that found something, and ocannl's `ci` sets `fail-fast: false` precisely so a r
 not cancel its siblings and destroy the information. A cancel here comes from a superseding push or
 a manual stop, and re-running is what turns it into an answer; it is exit 4 like a running job, and
 `--allow-no-verdict` is no more acceptable for it.
+
+`--require-green` is the opposite hatch: it makes `absent` a refusal too (exit 4), for the
+close-out merges of *When the loop ends*, which rest on the record rather than on a 👍 and so must
+have READ a green verdict rather than found nothing red. Its refusal names the two ways out —
+wait for the run, or establish that none will come and merge without the flag, saying so.
 
 Run `checks` on its own — same verdicts, same exit codes, no merge — whenever you want the build
 signal without acting on it, such as before asking the reviewer for another round.

@@ -147,6 +147,24 @@ test_malformed_threshold_is_refused() {
   assert_eq "$rc" 0 "off is accepted"
 }
 
+test_malformed_gap_is_refused() {
+  local out rc v
+  for v in '"900"' true -1 900.5 x; do
+    set +e
+    out=$(SHIP_PR_ROUND_GAP="$v" bash "$HELPER" rounds "$REPO#7" 2>&1)
+    rc=$?
+    set -e
+    assert_eq "$rc" 2 "a gap of '$v' is a usage error"
+    assert_contains "$out" "SHIP_PR_ROUND_GAP must be a nonnegative number of seconds" \
+      "should name the setting for '$v'"
+  done
+  set +e
+  out=$(SHIP_PR_ROUND_GAP=0 SHIP_PR_TEST_SOURCE_ONLY=1 bash "$HELPER" 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 0 "a zero gap is accepted"
+}
+
 test_no_rounds_yet() {
   set_reviews "$(review "$REVIEWER" APPROVED cccc 2026-09-01T12:00:00Z)"
   ROUND_THRESHOLD=12
@@ -201,6 +219,7 @@ tests=(
   test_rerequested_round_on_same_head_counts
   test_rounds_are_ordered_by_submission_and_chained
   test_malformed_threshold_is_refused
+  test_malformed_gap_is_refused
   test_no_rounds_yet
   test_threshold
   test_threshold_off
