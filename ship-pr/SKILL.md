@@ -236,8 +236,8 @@ finding as if it were isolated is what makes review loops long.
 Judge each finding on the merits. Most are right; some are not, and a wrong one deserves a
 reasoned reply rather than a compliance edit — a design boundary you hold deliberately (what a
 component is *not* responsible for) is worth defending in the thread, in the terms of the design. A
-round you answer entirely with reasoning needs no push: reply, then merge — that is the first of
-the loop's exits (*When the loop ends*, below).
+round you answer entirely with reasoning needs no push: reply, then merge — that is one of the
+loop's two exits (*When the loop ends*, below).
 
 **When findings arrive in a family, fix the genre, not the instance.** This is the single biggest
 lever on how long the loop runs. If round N says "pin knob X" and round N+1 says "pin knob Y", a
@@ -345,10 +345,10 @@ and halt moving onto the anchor, orphan detection, the live auth probe — and f
 rollback windows, backup ordering, lock-holder identity. Each was a real silent-class defect, each
 was cheap, and each spawned one or two successors in the next round. The reviewer approved at
 round 23, four hours in, most of them spent hardening concurrency paths a single coordinator per
-fleet never exercises. Nothing in the loop was wrong; the loop had no exit. These are its exits,
-in the order to look for them:
+fleet never exercises. A long review is welcome when it makes the code better, and the loop has
+no round limit. What it has is two exits, and a round past which most findings stop being work.
 
-**1. Every finding in a round is rebutted.** Judging on the merits (above) already means some
+**A round rebutted in full ends the loop.** Judging on the merits (above) already means some
 findings are wrong, and a wrong one is answered with reasoning, not a compliance edit. A finding
 rebutted with evidence — the code path that makes it unreachable, the invariant that makes it
 harmless, the design boundary that puts it out of scope — is *closed*, not deferred. When every
@@ -358,58 +358,58 @@ audit trail. So a rebuttal is about the code and never about the budget — "thi
 not a reason a finding is wrong — and it cites what it rests on, so the maintainer can check it
 after the merge.
 
-**2. The rounds have converged on machinery the review introduced.** Findings whose subject exists
-only because an earlier round asked for it — the lock added in round 3, the rollback added in round
-5 — are the signature. After **two consecutive rounds** whose findings are all of that kind, stop
-fixing successors and close out: for each open finding, pick one of three.
-
-- *Fix it*, if it sits on the merge path. A silent defect — the issue-wave policy's axis: a claim
-  that cannot fail, a sweep that deletes what it shouldn't, an oracle a scheduler accident
-  satisfies — in the PR's own substance is must-fix at any round count, and nothing here changes
-  that.
-- *Remove the machinery that spawned it.* This is where "fix the genre, not the instance" points
-  when the genre is review-introduced, and it is the option a loop never takes on its own. A lock
-  with three rounds of races is often better answered by no lock and a documented single-writer
-  assumption; a rollback with a window, by no rollback and an idempotent retry. Simpler and
-  correct beats elaborate and nearly correct, and a reviewer accepts the removal when the reply
-  names the invariant that now carries the load.
-- *Defer it*, into ONE follow-up issue for the whole residual set — never one issue per finding,
-  and never a finding whose silent failure the PR's substance can reach.
-
-**3. The ceiling: twelve rounds with findings.** Whatever the shape, at round 12 close out as
-above. Read the number off the PR; do not remember it — a session that has been compacted twice
-does not know what round it is in:
+**From the thirteenth round with findings on, only blocking findings are fixed.** Every other
+finding is handed to ONE follow-up issue for the whole residual set — never one issue per finding
+— and its thread answered with the deferral. The loop then ends the first time a round yields
+nothing to push: every finding rebutted or deferred, reply in each thread, and merge. Read the
+round off the PR; do not remember it — a session that has been compacted twice does not know what
+round it is in:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/pr-review.sh rounds <owner>/<repo>#<pr>   # status prints it too
 ```
 
-It counts the heads the reviewer left findings on (`SHIP_PR_ROUND_CAP` moves the ceiling), exits 1
-at or past it, and enforces nothing: the ceiling is a policy, and the merge is still the build
-gate's to allow. One thing survives the ceiling. A silent defect in the PR's own substance — not
-in review-introduced machinery — still open at round 12 means the PR is wrong, not the review. Do
-not merge over it and do not fix on; stop and raise it with the user.
+It counts the heads the reviewer left findings on, exits 1 past the threshold
+(`SHIP_PR_ROUND_THRESHOLD`, 12), and enforces nothing: the threshold is a policy, and the merge is
+still the build gate's to allow.
 
-**Closing out** is the same act at any of the three exits, and it is what makes a merge on
-substance rather than on a 👍 defensible:
+*Blocking* is read strictly, and informally: there is no checklist, and a bug does not qualify by
+being a bug. A finding blocks when merging over it would make the PR wrong — the change does not
+do what its description claims, it loses or corrupts data on a path the PR's own use takes, it
+leaves `master` red, or it invalidates a result the PR reports. A real defect that is none of
+those is deferred: a silent one included, and one on machinery an earlier round asked for
+included. That narrows the silent-vs-loud policy (issue-wave), whose "silent is must-fix at any
+round count" governs the first twelve rounds; past them the axis is whether the PR is wrong, not
+whether the defect is quiet. The findings that arrive past the threshold have a recognisable
+shape: their subject exists only because an earlier round asked for it — the lock added in round
+3, the rollback added in round 5 — and each spawns a successor. When one of those does block,
+removing the machinery is as good an answer as fixing it, and the one a loop never takes on its
+own: a lock with three rounds of races is often better answered by no lock and a documented
+single-writer assumption; a rollback with a window, by no rollback and an idempotent retry.
+Simpler and correct beats elaborate and nearly correct, and a reviewer accepts the removal when
+the reply names the invariant that now carries the load. Blocking findings in the PR's own
+substance that keep arriving past the threshold are a different signal: that is a wrong PR, not a
+long review — stop and raise it with the user.
+
+**Closing out** at either exit is the same act, and the record it leaves is what makes a merge
+the reviewer never 👍'd defensible:
 
 - the build gate is green on the final head (below — nothing here lifts it);
-- every thread is answered with its classification and its disposition — silent or loud, and
-  fixed / removed / deferred / rebutted — and resolved;
-- the PR body carries a review-record paragraph: how many rounds, where the substance ended and
-  the machinery began, each rebuttal in one line, and the follow-up issue's number;
+- every thread is answered with its disposition — fixed / removed / deferred / rebutted — and
+  resolved;
+- the PR body carries a review-record paragraph: how many rounds, each rebuttal in one line, and
+  the follow-up issue's number;
 - the residuals are filed, as one issue, before the merge rather than after it.
 
-Then merge — `merge` (below) reads the build signal, not the 👍. The record paragraph is what a
-merge without the reviewer's 👍 rests on: the maintainer reads there what was not done and why,
-instead of finding it in the next PR's review.
+Then merge — `merge` (below) reads the build signal, not the 👍. The maintainer reads in the
+record what was not done and why, instead of finding it in the next PR's review.
 
-Rebutting is the exit with an incentive problem: near the ceiling, rebutting is cheaper than
-fixing. The threads and the record paragraph are the only check on that in a standalone session,
-which is why a rebuttal cites its evidence and the record lists rebuttals beside deferrals — a
-reviewer who was right and got argued with is visible there. Under a wave coordinator none of
-this changes; the coordinator's pre-authorization (issue-wave's convergence policy) can only move
-close-out earlier than these exits, never later.
+Both exits have an incentive problem: past the threshold, deferring is cheaper than fixing, and
+rebutting is cheaper than either at any round. The threads and the record paragraph are the only
+check on that in a standalone session, which is why a rebuttal cites its evidence and a deferral
+names why the PR is not wrong without the fix — a reviewer who was right and got argued with is
+visible there. Under a wave coordinator none of this changes; the coordinator's pre-authorization
+(issue-wave's convergence policy) can only move close-out earlier, never later.
 
 ### The approval is one gate; the build is the other
 

@@ -102,10 +102,10 @@
 #   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands; 0 = act, 1 = quiet
 #   pr-review.sh status <pr>               # merge gate + who owes what: approved / reviewing /
 #                                          # stalled / expected / idle / unknown — and the round
-#                                          # count against the ceiling (see `rounds`)
+#                                          # count against the threshold (see `rounds`)
 #   pr-review.sh rounds <pr>               # how many review rounds carried findings, read off the
 #                                          # PR (heads the reviewer left comments on), against
-#                                          # SHIP_PR_ROUND_CAP; exit 1 at or past the ceiling
+#                                          # SHIP_PR_ROUND_THRESHOLD; exit 1 past it
 #   pr-review.sh checks <pr> [--wait]      # the BUILD signal on the head commit: green / red /
 #                                          # no verdict yet / absent
 #   pr-review.sh merge <pr> [--override "<why this red is unrelated>"] [--wait]
@@ -160,15 +160,16 @@
 #      before settling for an older verdict (300; paths-ignore pushes never get one),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences the commit-count warning). A nonempty file overlap still warns at any count; no
-#      base-drift warning blocks the merge. SHIP_PR_ROUND_CAP=review rounds with findings at
-#      which the loop closes out instead of fixing on (12; the ceiling of ship-pr's "When the
-#      loop ends" — `rounds` and `status` report the count against it, nothing here enforces it).
+#      base-drift warning blocks the merge. SHIP_PR_ROUND_THRESHOLD=review rounds with findings
+#      after which only BLOCKING findings are fixed and the rest go to one follow-up issue (12;
+#      ship-pr's "When the loop ends" — `rounds` and `status` report the count against it,
+#      nothing here enforces it; `off` reports the count alone).
 
 set -uo pipefail
 
 REPO="${REPO:-}"
 REVIEWER="${REVIEWER:-chatgpt-codex-connector}"
-ROUND_CAP="${SHIP_PR_ROUND_CAP:-12}"
+ROUND_THRESHOLD="${SHIP_PR_ROUND_THRESHOLD:-12}"
 STATE_DIR="${SHIP_PR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ship-pr}"
 CACHE="$STATE_DIR/repo-by-pr"
 
@@ -766,7 +767,7 @@ status_line() {
 # skill's "When the loop ends") needs the number. A round with findings is a set of COMMENTED
 # reviews the reviewer submitted against one head, so the count is the number of DISTINCT heads
 # that carry such reviews. A re-requested round on the same head that found more collapses into
-# the first — the count errs low, which is the safe direction for a ceiling. Your own replies
+# the first — the count errs low, which is the safe direction for a threshold. Your own replies
 # land in the same feed as COMMENTED reviews, hence the login filter; PENDING reviews have no
 # submitted_at and are not a round. Prints ONE line, "<count>|<detail>", and always exits 0:
 # a count of "unknown" carries the failure, and is NOT "no rounds yet".
@@ -791,9 +792,11 @@ review_rounds() {
   esac
 }
 
-# The count against the ceiling, on one line; exit 0 under it, 1 at or past it, 3 unread. The
-# ceiling is the skill's, not this script's: nothing here refuses a merge over it. It exists so
-# the session reads "round 12 of 12" off the PR instead of believing it is at round 6.
+# The count against the threshold, on one line; exit 0 at or under it, 1 past it, 3 unread. The
+# threshold is the skill's, not this script's: nothing here refuses a merge over it. It exists so
+# the session reads "round 13" off the PR instead of believing it is at round 6. Past it the skill
+# fixes only BLOCKING findings — strictly: what would make the PR wrong, not a bug as such — and
+# defers the rest to one follow-up issue, so the loop ends on the first round with nothing to push.
 rounds_line() {
   local count detail
   count="${1%%|*}"
@@ -804,19 +807,25 @@ rounds_line() {
     return 3
     ;;
   esac
-  case "$ROUND_CAP" in
+  case "$ROUND_THRESHOLD" in
   '' | off | *[!0-9]*)
-    echo "review rounds with findings: $count ($detail); no ceiling set"
+    echo "review rounds with findings: $count ($detail); no threshold set"
     return 0
     ;;
   esac
-  if [ "$count" -ge "$ROUND_CAP" ]; then
-    echo "review rounds with findings: $count of $ROUND_CAP — AT THE CEILING: close out (fix," \
-      "remove, or defer every open finding; merge on substance or raise it with the user), do" \
-      "not fix on ($detail)"
+  if [ "$count" -gt "$ROUND_THRESHOLD" ]; then
+    echo "review rounds with findings: $count, PAST the $ROUND_THRESHOLD-round threshold —" \
+      "blocking-only from here: fix what would make the PR wrong (a bug as such does not" \
+      "qualify), defer the rest to ONE follow-up issue, and merge on the first round with" \
+      "nothing to push ($detail)"
     return 1
   fi
-  echo "review rounds with findings: $count of $ROUND_CAP ($detail)"
+  if [ "$count" -eq "$ROUND_THRESHOLD" ]; then
+    echo "review rounds with findings: $count of $ROUND_THRESHOLD — the last round addressed in" \
+      "full; from the next, only blocking findings are fixed ($detail)"
+    return 0
+  fi
+  echo "review rounds with findings: $count of $ROUND_THRESHOLD ($detail)"
   return 0
 }
 

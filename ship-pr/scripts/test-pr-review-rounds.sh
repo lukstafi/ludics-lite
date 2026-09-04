@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Focused fixture tests for pr-review.sh's review-round count — the number the convergence policy's
-# ceiling is read against (ludics-lite#12).
+# threshold is read against (ludics-lite#12).
 
 set -euo pipefail
 
@@ -94,42 +94,46 @@ test_counts_distinct_heads_with_findings() {
     "$(review "$REVIEWER" APPROVED cccc 2026-09-01T12:00:00Z)" \
     "$(review lukstafi COMMENTED bbbb 2026-09-01T11:30:00Z)" \
     "$(review "$REVIEWER" COMMENTED dddd null)"
-  ROUND_CAP=12
+  ROUND_THRESHOLD=12
   run_rounds
-  assert_eq "$ROUNDS_RC" 0 "two rounds under a ceiling of 12 should exit 0"
+  assert_eq "$ROUNDS_RC" 0 "two rounds under a threshold of 12 should exit 0"
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" "should count two heads"
-  assert_not_contains "$ROUNDS_OUTPUT" "CEILING" "two of twelve is not at the ceiling"
+  assert_not_contains "$ROUNDS_OUTPUT" "PAST" "two of twelve is not past the threshold"
 }
 
 test_no_rounds_yet() {
   set_reviews "$(review "$REVIEWER" APPROVED cccc 2026-09-01T12:00:00Z)"
-  ROUND_CAP=12
+  ROUND_THRESHOLD=12
   run_rounds
   assert_eq "$ROUNDS_RC" 0 "an approval alone is zero rounds with findings"
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 0 of 12" "should count zero"
 }
 
-test_ceiling_is_loud_and_exit_1() {
+test_threshold() {
   set_reviews \
     "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)" \
     "$(review "$REVIEWER" COMMENTED bbbb 2026-09-01T11:00:00Z)" \
     "$(review "$REVIEWER" COMMENTED cccc 2026-09-01T12:00:00Z)"
-  ROUND_CAP=3
+  ROUND_THRESHOLD=3
   run_rounds
-  assert_eq "$ROUNDS_RC" 1 "at the ceiling should exit 1"
-  assert_contains "$ROUNDS_OUTPUT" "3 of 3 — AT THE CEILING" "should say it is at the ceiling"
-  assert_contains "$ROUNDS_OUTPUT" "do not fix on" "should carry the close-out instruction"
-  ROUND_CAP=2
+  assert_eq "$ROUNDS_RC" 0 "the threshold round itself is still addressed in full"
+  assert_contains "$ROUNDS_OUTPUT" "3 of 3 — the last round addressed in full" \
+    "should say the threshold round is the last full one"
+  ROUND_THRESHOLD=2
   run_rounds
-  assert_eq "$ROUNDS_RC" 1 "past the ceiling should exit 1 too"
+  assert_eq "$ROUNDS_RC" 1 "past the threshold should exit 1"
+  assert_contains "$ROUNDS_OUTPUT" "3, PAST the 2-round threshold" "should say it is past"
+  assert_contains "$ROUNDS_OUTPUT" "blocking-only from here" "should carry the triage rule"
+  assert_contains "$ROUNDS_OUTPUT" "a bug as such does not" "should say a bug is not blocking"
+  assert_not_contains "$ROUNDS_OUTPUT" "of 2" "past the threshold is not 'N of M'"
 }
 
-test_ceiling_off() {
+test_threshold_off() {
   set_reviews "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)"
-  ROUND_CAP=off
+  ROUND_THRESHOLD=off
   run_rounds
-  assert_eq "$ROUNDS_RC" 0 "no ceiling should exit 0"
-  assert_contains "$ROUNDS_OUTPUT" "no ceiling set" "should say there is no ceiling"
+  assert_eq "$ROUNDS_RC" 0 "no threshold should exit 0"
+  assert_contains "$ROUNDS_OUTPUT" "no threshold set" "should say there is no threshold"
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 " "should still count"
 }
 
@@ -138,7 +142,7 @@ test_ceiling_off() {
 test_api_failure_is_unknown() {
   set_reviews "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)"
   FAIL_READ=1
-  ROUND_CAP=12
+  ROUND_THRESHOLD=12
   run_rounds
   assert_eq "$ROUNDS_RC" 3 "an unread feed should exit 3"
   assert_contains "$ROUNDS_OUTPUT" "UNKNOWN" "an unread feed should say UNKNOWN"
@@ -149,8 +153,8 @@ test_api_failure_is_unknown() {
 tests=(
   test_counts_distinct_heads_with_findings
   test_no_rounds_yet
-  test_ceiling_is_loud_and_exit_1
-  test_ceiling_off
+  test_threshold
+  test_threshold_off
   test_api_failure_is_unknown
 )
 
