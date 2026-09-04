@@ -20,6 +20,7 @@ foreach ($nic in Get-NetAdapter -Physical | Where-Object { $_.MediaType -eq '802
   Enable-NetAdapterPowerManagement -Name $nic.Name -WakeOnMagicPacket -ErrorAction SilentlyContinue
   $pm = Get-NetAdapterPowerManagement -Name $nic.Name
   $pm.WakeOnMagicPacket = 'Enabled'
+  $pm.WakeOnPattern = 'Disabled'
   $pm.DeviceSleepOnDisconnect = 'Disabled'
   Set-NetAdapterPowerManagement -InputObject $pm
   Get-NetAdapterPowerManagement -Name $nic.Name |

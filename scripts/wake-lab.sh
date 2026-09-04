@@ -43,11 +43,13 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 # * Both boxes wake from a full shutdown (S5), not just from sleep — verified 2026-08-15 on both,
 #   after enabling the `Wake Up` item on minix's BIOS SECOND setup screen (not under Advanced).
 #   "Powered off" is a normal starting state for a wake, not a reason to expect failure.
-# * A box holding Ethernet link while powered off (`status` -> link=1) is the WoL-armed state and
-#   is what makes the wake possible. A failed wake with link=1 means the NIC was powered and
-#   listening, so the magic packet was ignored: the WoL option itself (BIOS, or the Windows NIC
-#   driver's wake settings) has been lost. With link=0 the NIC is not powered while the box is
-#   off: the cable, the box's power, or the BIOS setting that keeps the NIC powered in S5.
+# * `status` -> link is the router's NewActive bit, not direct NIC telemetry. For several minutes
+#   after shutdown or hibernate, link=1 can be a stale DHCP lease rather than physical link; wait
+#   for it to settle before diagnosing the wake path. After a full shutdown and once settled, a
+#   box holding Ethernet link (link=1) is in the WoL-armed state that makes the wake possible. A
+#   failed wake then means the magic packet was ignored: the WoL option itself (BIOS, or the
+#   Windows NIC driver's wake settings) has been lost. With settled link=0 after full shutdown,
+#   check the cable, the box's power, and the BIOS setting that keeps the NIC powered in S5.
 # * WSL never autostarts at boot, so a box coming up from power-down always needs kick_wsl. A box
 #   resuming from sleep/hibernate with the user's GUI WSL shell still open (the usual cycle) keeps
 #   its VM across the resume — verified on minix 2026-09-01: same boot id, -wsl answering seconds
