@@ -338,7 +338,8 @@ Every one of those lines also says **`CONFLICTS with the base (mergeable_state=d
 GitHub cannot build the PR's merge commit, and on `idle` that replaces "the next move is yours".
 It is not a seventh state — the reviewer keeps reviewing a conflicted PR — but it changes what a
 round is worth: GitHub creates no `pull_request` workflow run for a head whose merge commit it
-cannot build, so every round on that head is a round whose fixes CI is not testing. On
+cannot build, so every push made after the conflict is one CI does not test against the base (a
+run that completed before the base moved still stands, but it tested an older merge). On
 ludics-lite#39 (2026-09-04) a sibling landed on `main` during round 6, and rounds 6–12 each got
 findings, "the next move is yours", and no CI at all, over eight pushes and 80 minutes; one of
 them landed a broken test suite, and two of them built machinery the sibling had already
@@ -587,8 +588,10 @@ exact intersection between paths changed by the PR and paths changed by the base
 base (and `watch` prints the same read, on stderr, whenever a round lands). It says so loudly —
 `!!! … COMMITS BEHIND`, on stdout and stderr — past 20 (`SHIP_PR_STALE_BASE`, or `off`), warns at
 any count when that intersection is nonempty, and says `!!! … CONFLICTS` when GitHub reports the
-PR's `mergeable_state` as `dirty`: no `pull_request` workflow has run on that head, and the merge
-call would fail on it.
+PR's `mergeable_state` as `dirty`: nothing has tested that head merged with the *current* base — a
+`pull_request` run from before the base moved tested it against an older base, a branch-push run
+tested it alone, and a push made after the conflict gets no `pull_request` run at all — and the
+merge call would fail on it.
 
 It warns and merges anyway. That is the **roll-forward policy** (ahrefs/ocannl#861, decided
 2026-08-30 after a wave where every sibling merge invalidated every open PR's verification —

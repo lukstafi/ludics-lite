@@ -115,7 +115,8 @@
 #                                          # stalled / expected / idle / unknown — and the round
 #                                          # count against the threshold (see `rounds`); says
 #                                          # CONFLICTS when GitHub cannot build the merge commit
-#                                          # (no CI will run on the head until the base is in)
+#                                          # (nothing tests the head merged with the base, and
+#                                          # a push gets no run at all, until the base is in)
 #   pr-review.sh rounds <pr>               # how many review rounds carried findings, read off the
 #                                          # PR (heads the reviewer left comments on), against
 #                                          # SHIP_PR_ROUND_THRESHOLD; exit 1 past it
@@ -617,7 +618,8 @@ fmt_age() {
 # along with EVERY token, because it is not a state of the review but a fact about what the
 # review is worth: `dirty` means the merge commit cannot be built, and GitHub creates no
 # pull_request workflow run for a head whose merge commit it cannot build — so a round in flight,
-# a round landed and a push awaiting review are all rounds whose fixes NO CI is testing. On
+# a round landed and a push awaiting review are all rounds whose fixes no CI tests against the
+# base (a run from before the base moved still stands; it tested an older merge). On
 # ludics-lite#39 (2026-09-04) main gained a sibling at 10:15 while the loop was on round 6, and
 # rounds 6 through 12 each got a reviewer round, a "the next move is yours", and no CI at all,
 # over eight pushes and 80 minutes; the first thing that noticed was `merge` (ludics-lite#44).
