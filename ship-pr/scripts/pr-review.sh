@@ -54,9 +54,17 @@
 #     records the commit_id it was submitted against, so comparing that to .head.sha answers the
 #     question exactly — no guessing at a push time, and immune to a commit whose author date long
 #     predates the push that delivered it;
-#   - and patience is bounded on BOTH sides, because a stall reads the same from either: a review
+#   - patience is bounded on BOTH sides, because a stall reads the same from either: a review
 #     that never starts and a 👀 that never lands both end with a verdict to nudge rather than with
-#     another silent hold. "Wait it out" is only honest while something is actually running.
+#     another silent hold. "Wait it out" is only honest while something is actually running;
+#   - and a round is only worth its cost on a head CI can test: GitHub creates no pull_request
+#     workflow run for a PR whose merge commit it cannot build (mergeable_state `dirty`), while
+#     the reviewer reviews it regardless. On ludics-lite#39 (2026-09-04) a sibling landed on main
+#     during round 6 and rounds 6 through 12 each got findings, a "the next move is yours" from
+#     `status`, and NO CI, over eight pushes and 80 minutes, until `merge` failed on it — one of
+#     those pushes landed a broken test suite CI would have caught (ludics-lite#44). So `status`
+#     reads mergeable_state off the same PR read as the head and says CONFLICTS on every state,
+#     and `watch` prints the base-drift read the moment a round lands, not only at merge time.
 #
 # The `merge` command exists for the same reason as the rest of this file: what the merge step has
 # to READ before it acts does not survive as prose. It reads the head commit's check-runs and
@@ -87,8 +95,11 @@
 # drift after the fact is the wave coordinator's integration loop (issue-wave skill), which runs
 # the full suites on merged master and stops the world on a regression. The overlap is exact or
 # UNKNOWN: compare responses cap their file list at 300, so a capped list is never reported as
-# "none". Both compare directions use the base and head SHAs from one PR read, and rename entries
-# contribute both their current and previous filenames.
+# "none". Both compare directions use the head SHA from one PR read and the base branch's tip
+# from one read of the branch — NOT the PR's `.base.sha`, which is the base as of the last time
+# GitHub could build the merge commit and so stands still on exactly the conflicted PR that is
+# furthest behind (#39 read "0 behind" off it, 7 commits and 4 overlapping files behind) — and
+# rename entries contribute both their current and previous filenames.
 #
 # REST vs GraphQL: everything on the polling and merge-gate path is REST, deliberately — GitHub's
 # GraphQL endpoint 503s independently of REST, so a GraphQL-borne "no reaction yet" is a lie the
@@ -102,7 +113,10 @@
 #   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands; 0 = act, 1 = quiet
 #   pr-review.sh status <pr>               # merge gate + who owes what: approved / reviewing /
 #                                          # stalled / expected / idle / unknown — and the round
-#                                          # count against the threshold (see `rounds`)
+#                                          # count against the threshold (see `rounds`); says
+#                                          # CONFLICTS when GitHub cannot build the merge commit
+#                                          # (nothing tests the head merged with the base, and
+#                                          # a push gets no run at all, until the base is in)
 #   pr-review.sh rounds <pr>               # how many review rounds carried findings, read off the
 #                                          # PR (heads the reviewer left comments on), against
 #                                          # SHIP_PR_ROUND_THRESHOLD; exit 1 past it
@@ -586,7 +600,8 @@ fmt_age() {
   esac
 }
 
-# Prints ONE line, "<token>|<seconds>|<detail>", and always exits 0 — the token carries the failure:
+# Prints ONE line, "<token>|<seconds>|<mergeability>|<detail>", and always exits 0 — the token
+# carries the failure:
 #   approved  👍 is on the PR: the merge gate is open.
 #   reviewing 👀 is newer than the reviewer's last word, so a round really is in flight.
 #   stalled   ... and it has been in flight longer than any round takes; nothing is coming.
@@ -596,12 +611,50 @@ fmt_age() {
 # <seconds> is how long the state has held: since the 👀 for reviewing/stalled, and for expected
 # since the LATEST of head commit / reviewer's last word / spent 👀 — i.e. since the moment a review
 # became due. "-" when nothing datable was read.
+# <mergeability> is the PR's mergeable_state as GitHub reports it (clean, dirty, unstable, blocked,
+# behind, draft, unknown while it is recomputing), "unread" when the PR read failed, or "-" when
+# no PR read was attempted (a feed failed before it). "unread" is rendered as such: a line that
+# cannot say whether the PR conflicts must not look like one that says it does not. It rides
+# along with EVERY token, because it is not a state of the review but a fact about what the
+# review is worth: `dirty` means the merge commit cannot be built, and GitHub creates no
+# pull_request workflow run for a head whose merge commit it cannot build — so a round in flight,
+# a round landed and a push awaiting review are all rounds whose fixes no CI tests against the
+# base (a run from before the base moved still stands; it tested an older merge). On
+# ludics-lite#39 (2026-09-04) main gained a sibling at 10:15 while the loop was on round 6, and
+# rounds 6 through 12 each got a reviewer round, a "the next move is yours", and no CI at all,
+# over eight pushes and 80 minutes; the first thing that noticed was `merge` (ludics-lite#44).
+# The reviewer keeps reviewing a conflicted PR, so the tokens above still apply; the field is
+# what turns "the next move is yours" into "merge the base in first". The detail is the LAST
+# field, so it may contain anything, `|` included (an error line quotes gh).
+# Sets head_sha, mstate and head_err in the CALLER's scope (status_state's locals, by bash's
+# dynamic scoping) from one read of the PR. Best-effort: a failed read leaves head_sha empty and
+# mstate "unread", and remembers the error line, because it is the caller's state that decides
+# whether the missing head is fatal — an approval is the reactions feed's alone to answer, and a
+# failed PR read must not hide a 👍 behind "unknown". Placeholders, never empty fields: tab is
+# IFS whitespace, and an empty first column would shift the mergeability into the SHA
+# (warn_base_drift's trap).
+pr_head_read() {
+  local hline
+  head_sha=""
+  mstate=unread
+  head_err=""
+  hline=$(gh_retry read api "repos/$REPO/pulls/$1" \
+    --jq '[(.head.sha // "-"), (.mergeable_state // "-")] | @tsv') || {
+    head_err=$(gh_err_line)
+    return 0
+  }
+  IFS=$'\t' read -r head_sha mstate <<<"$hline"
+  [ "$head_sha" = - ] && head_sha=""
+  [ -n "$mstate" ] || mstate="-"
+  return 0
+}
+
 status_state() {
   local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
-  local vline verd_at verd_sha
+  local vline verd_at verd_sha mstate="-" head_err=""
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
-    echo "unknown|-|the reactions API did not answer ($(gh_err_line))"
+    echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
     return 0
   }
   line=$(jq -r --arg rev "$REVIEWER" '
@@ -609,7 +662,7 @@ status_state() {
       | "\(any(.[]; .content == "+1"))"
         + "|" + ((map(select(.content == "eyes") | .created_at) | max) // "")' \
     <<<"$raw" 2>/dev/null) || {
-    echo "unknown|-|the reactions feed did not parse"
+    echo "unknown|-|-|the reactions feed did not parse"
     return 0
   }
   plus="${line%%|*}"
@@ -617,13 +670,15 @@ status_state() {
 
   # 👍 is the merge gate and the reactions feed alone answers it, so it is answered before any feed
   # that could fail: an outage on the reviews feed must not hide an approval behind "unknown".
+  # The PR read here is for the mergeability alone, and cannot change the verdict.
   [ "$plus" = true ] && {
-    echo "approved|-|👍 from $REVIEWER"
+    pr_head_read "$pr"
+    echo "approved|-|$mstate|👍 from $REVIEWER"
     return 0
   }
 
   raw=$(api_list "pulls/$pr/reviews?per_page=100") || {
-    echo "unknown|-|the reviews API did not answer ($(gh_err_line))"
+    echo "unknown|-|$mstate|the reviews API did not answer ($(gh_err_line))"
     return 0
   }
   # Your own replies land in this feed as COMMENTED reviews, hence the login filter; PENDING reviews
@@ -633,7 +688,7 @@ status_state() {
       | sort_by(.submitted_at) | last
       | if . == null then "|" else "\(.submitted_at)|\(.commit_id // "")" end' \
     <<<"$raw" 2>/dev/null) || {
-    echo "unknown|-|the reviews feed did not parse"
+    echo "unknown|-|$mstate|the reviews feed did not parse"
     return 0
   }
   rev_at="${line%%|*}"
@@ -648,7 +703,7 @@ status_state() {
   # running (review of self-improve#13). It is an announcement, not the reviewer speaking; the
   # verdict scan below still reads it, in case a verdict is ever delivered by editing it in place.
   raw=$(api_list "issues/$pr/comments?per_page=100") || {
-    echo "unknown|-|the comments API did not answer ($(gh_err_line))"
+    echo "unknown|-|$mstate|the comments API did not answer ($(gh_err_line))"
     return 0
   }
   com_at=$(jq -r --arg rev "$REVIEWER" '
@@ -656,7 +711,7 @@ status_state() {
            | select((.body // "") | test("codex-pull-request-review-summary") | not)
            | .created_at] | max // ""' \
     <<<"$raw" 2>/dev/null) || {
-    echo "unknown|-|the comments feed did not parse"
+    echo "unknown|-|$mstate|the comments feed did not parse"
     return 0
   }
   # The connector can deliver its no-findings verdict as an issue comment ("Codex Review:
@@ -683,6 +738,15 @@ status_state() {
   verd_sha="${vline#*|}"
   last_spoke=$(newest "$rev_at" "$com_at")
 
+  # The head SHA and the mergeability, in ONE read of the PR, made AFTER the feeds: every review
+  # in those feeds is then about a head no newer than the one read, so "the review's commit_id
+  # equals the head" means the CURRENT head was reviewed. Read before the feeds, a push landing
+  # between the two reads would match the previous head's review to the previous head and report
+  # `idle` (or a verdict comment as `approved`) while the new head sits unreviewed — the false
+  # reading this state machine exists to prevent (review of ludics-lite#47). One read serves the
+  # verdict check and the post-round states, which used to read it separately.
+  pr_head_read "$pr"
+
   # A no-findings verdict naming the CURRENT head outranks a live-looking 👀, and must be checked
   # BEFORE the in-flight return below: with the placeholder off the comment clock, a verdict
   # delivered by editing that placeholder in place leaves the 👀 newer than the reviewer's last
@@ -690,20 +754,16 @@ status_state() {
   # 👀 back). Only a verdict NEWER than the 👀 qualifies — a re-requested review without a push
   # raises a fresh 👀 over a verdict whose SHA still matches, and approving on that would reopen
   # the merge gate under a round that is still running (see the updated_at note above for why an
-  # edited placeholder passes this bar and a leftover comment does not). The head is read here
-  # only when a qualifying verdict exists at all, so the common reviewing path stays one call
-  # cheaper; a failed read falls through to the normal state logic rather than failing the
-  # whole status.
-  if [ -n "$verd_sha" ] && { [ -z "$eyes_at" ] || [[ "$verd_at" > "$eyes_at" ]]; }; then
-    head_sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha) || head_sha=""
-    if [ -n "$head_sha" ]; then
-      case "$head_sha" in
-      "$verd_sha"*)
-        echo "approved|-|$REVIEWER posted a no-findings verdict for head ${head_sha:0:7} at $verd_at"
-        return 0
-        ;;
-      esac
-    fi
+  # edited placeholder passes this bar and a leftover comment does not). A head the PR read did
+  # not deliver falls through to the normal state logic rather than failing the whole status.
+  if [ -n "$verd_sha" ] && [ -n "$head_sha" ] &&
+    { [ -z "$eyes_at" ] || [[ "$verd_at" > "$eyes_at" ]]; }; then
+    case "$head_sha" in
+    "$verd_sha"*)
+      echo "approved|-|$mstate|$REVIEWER posted a no-findings verdict for head ${head_sha:0:7} at $verd_at"
+      return 0
+      ;;
+    esac
   fi
 
   # In flight only while the 👀 is newer than everything the reviewer has said. An empty last_spoke
@@ -713,18 +773,17 @@ status_state() {
     case "$age" in
     '' | *[!0-9]*) ;;
     *) [ "$age" -ge "$STALL" ] && {
-      echo "stalled|$age|👀 from $REVIEWER at $eyes_at with nothing posted since"
+      echo "stalled|$age|$mstate|👀 from $REVIEWER at $eyes_at with nothing posted since"
       return 0
     } ;;
     esac
-    echo "reviewing|$age|👀 from $REVIEWER at $eyes_at, newer than its last" \
+    echo "reviewing|$age|$mstate|👀 from $REVIEWER at $eyes_at, newer than its last" \
       "word${last_spoke:+ ($last_spoke)}"
     return 0
   fi
 
-  head_sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha)
-  [ "$?" -eq 0 ] && [ -n "$head_sha" ] || {
-    echo "unknown|-|the pulls API did not answer for the head SHA ($(gh_err_line))"
+  [ -n "$head_sha" ] || {
+    echo "unknown|-|unread|the pulls API did not answer for the head SHA ($head_err)"
     return 0
   }
 
@@ -739,7 +798,7 @@ status_state() {
   if [ -n "$verd_sha" ] && ! [[ "$verd_at" < "$last_spoke" ]]; then
     case "$head_sha" in
     "$verd_sha"*)
-      echo "approved|-|$REVIEWER posted a no-findings verdict for head ${head_sha:0:7} at $verd_at"
+      echo "approved|-|$mstate|$REVIEWER posted a no-findings verdict for head ${head_sha:0:7} at $verd_at"
       return 0
       ;;
     esac
@@ -748,7 +807,7 @@ status_state() {
   # SHA equality, not a timestamp: the review records the commit it was submitted against, so this
   # is exactly "has the reviewer seen THIS head" with no push time to estimate.
   if [ "$rev_sha" = "$head_sha" ]; then
-    echo "idle|$(age_of "$last_spoke")|$REVIEWER reviewed head ${head_sha:0:7} at $rev_at"
+    echo "idle|$(age_of "$last_spoke")|$mstate|$REVIEWER reviewed head ${head_sha:0:7} at $rev_at"
     return 0
   fi
 
@@ -757,8 +816,8 @@ status_state() {
   # reviewer's last word, or the spent 👀. A failed commit read costs precision, not the state.
   head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
     head_at=""
-  echo "expected|$(age_of "$(newest "$head_at" "$last_spoke" "$eyes_at")")|no 👀 in flight and no" \
-    "review of head ${head_sha:0:7}${rev_sha:+; $REVIEWER last reviewed ${rev_sha:0:7} at $rev_at}"
+  echo "expected|$(age_of "$(newest "$head_at" "$last_spoke" "$eyes_at")")|$mstate|no 👀 in flight" \
+    "and no review of head ${head_sha:0:7}${rev_sha:+; $REVIEWER last reviewed ${rev_sha:0:7} at $rev_at}"
 }
 
 state_tok() { printf '%s' "${1%%|*}"; }
@@ -766,29 +825,63 @@ state_age() {
   local rest="${1#*|}"
   printf '%s' "${rest%%|*}"
 }
+state_merge() {
+  local rest="${1#*|}"
+  rest="${rest#*|}"
+  printf '%s' "${rest%%|*}"
+}
 state_detail() {
   local rest="${1#*|}"
+  rest="${rest#*|}"
   printf '%s' "${rest#*|}"
+}
+
+# The one word of the mergeability that changes what a round is worth. `dirty` is GitHub's term
+# for "the merge commit cannot be created", and it is the only value on which no pull_request
+# run will test the head merged with the current base (a run that completed before the base
+# moved, or a branch-push run, may well exist — they tested the head against an older base, or
+# alone, which is why the note says what is NOT tested rather than that nothing ran); `unknown`
+# is GitHub still computing (moments after a push) and `behind`/`blocked`/`unstable` are
+# branch-protection verdicts the checks gate reads for itself. `unread` is a PR read that failed
+# under a state the reactions feed decided on its own, and is said as such: "cannot tell" must
+# not render like "does not conflict". Empty when there is nothing to say, so a caller can splice
+# it in with ${x:+; $x}.
+conflict_note() {
+  case "$1" in
+  dirty)
+    printf '%s' "CONFLICTS with the base (mergeable_state=dirty): GitHub cannot build this head" \
+      " merged with the current base, so no pull_request run tests that merge and the rounds'" \
+      " fixes go untested against it — merge the base in, resolve, and push before the next round"
+    ;;
+  unread)
+    printf '%s' "mergeability UNREAD (the PR read did not answer): whether this PR conflicts with" \
+      " its base is unknown, which is not 'no' — retry status before acting on this line"
+    ;;
+  esac
+  return 0
 }
 
 # Takes a whole state line, not a token: the age and the detail are what make the difference between
 # "wait it out" and "nothing is coming" legible to whoever reads the log.
 status_line() {
-  local tok age detail
+  local tok age detail conflict
   tok=$(state_tok "$1")
   age=$(state_age "$1")
   detail=$(state_detail "$1")
+  conflict=$(conflict_note "$(state_merge "$1")")
   case "$tok" in
-  approved) echo "approved ($detail)" ;;
-  reviewing) echo "reviewing — $detail, running $(fmt_age "$age") — wait it out" ;;
+  approved) echo "approved ($detail)${conflict:+; $conflict}" ;;
+  reviewing) echo "reviewing — $detail, running $(fmt_age "$age") — wait it out${conflict:+; $conflict}" ;;
   stalled) echo "STALLED — $detail for $(fmt_age "$age"), longer than a round takes. FIRST read" \
     "the PR feed yourself (retry --read pr view <pr> --comments): a verdict may have landed as" \
     "a comment or a 👍 this state machine missed. Only if the feed truly has nothing for the" \
     "current head, nudge with a '@codex review' comment — knowing a re-request CLEARS the" \
-    "reviewer's existing 👍" ;;
-  expected) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")" ;;
-  idle) echo "nothing in flight — $detail, and no 👍; the next move is yours" ;;
-  unknown) echo "UNKNOWN — $detail; this is NOT 'not approved', retry" ;;
+    "reviewer's existing 👍${conflict:+; $conflict}" ;;
+  expected) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")${conflict:+; $conflict}" ;;
+  # "The next move is yours" is exactly the line that sent #39 into seven untested rounds: on a
+  # conflicted PR the move is the base merge, and saying anything else invites another push.
+  idle) echo "nothing in flight — $detail, and no 👍; ${conflict:-the next move is yours}" ;;
+  unknown) echo "UNKNOWN — $detail; this is NOT 'not approved', retry${conflict:+; $conflict}" ;;
   *) echo "unrecognised state '$tok' — treat as unknown and retry" ;;
   esac
 }
@@ -924,6 +1017,18 @@ cmd_status() {
   return 0
 }
 
+# What `merge` reads last — how far behind its base the branch is, whether the base's advance
+# touched the PR's files, whether the PR conflicts — read at the moment a round lands instead,
+# because that is when it is cheap to act on: the round's fixes are about to be written, and
+# "the base touched these files" or "CONFLICTS" is the instruction to merge the base in FIRST,
+# so the next push is one CI can test. Read only at merge time, it arrives after every round has
+# been paid for (ludics-lite#44: seven rounds on a conflicted #39, 80 minutes, no CI). On stderr
+# with the rest of the context, so a round's stdout stays byte-identical to poll's; not on the
+# `approved` exit, whose next step is `merge`, which prints the same read on stdout.
+watch_drift_note() {
+  warn_base_drift "$1" >&2 || true
+}
+
 # Poll on a timer so a round's arrival wakes the caller instead of the caller re-deriving this loop.
 # Exits 0 with something to act on — a round's findings, the approval landing, or the verdict that no
 # review is coming (a spent or stalled 👀, or one that never started within the grace) — and 1 having
@@ -972,6 +1077,7 @@ cmd_watch() {
     # and poll the same way; the state is context, not the finding, so it goes to stderr.
     if [ "$rc" -eq 0 ] && grep -q '^--- ' <<<"$out"; then
       echo "status: $(status_line "$state")" >&2
+      watch_drift_note "$pr"
       echo "$out"
       return 0
     fi
@@ -993,6 +1099,7 @@ cmd_watch() {
     stalled)
       # Bounded patience on a LIVE 👀 as well: a round that never lands stalls the loop exactly as a
       # spent 👀 does, and the answer is the same — say so and let the caller nudge.
+      watch_drift_note "$pr"
       status_line "$state"
       echo "watermark: $mark"
       return 0
@@ -1004,6 +1111,7 @@ cmd_watch() {
       if [ "$was" = reviewing ] && [ "$tok" != reviewing ]; then
         quiet=$((quiet + 1))
         if [ "$quiet" -ge 2 ]; then
+          watch_drift_note "$pr"
           echo "the 👀 round on PR $REPO#$pr ended without a review of the head commit — consider" \
             "nudging with a '@codex review' comment"
           status_line "$state"
@@ -1023,6 +1131,7 @@ cmd_watch() {
         '' | *[!0-9]*) ;;
         *)
           if [ "$age" -ge "$GRACE" ]; then
+            watch_drift_note "$pr"
             echo "no review materialized on PR $REPO#$pr in the $(fmt_age "$age") since it became" \
               "due — consider nudging with a '@codex review' comment"
             status_line "$state"
@@ -1909,27 +2018,57 @@ compare_file_set() {
 }
 
 warn_base_drift() {
-  local pr="$1" fields base base_sha head_sha rc
+  local pr="$1" fields base base_sha head_sha mstate rc
   local forward reverse behind ahead forward_base reverse_base
   local forward_set reverse_set pr_files base_files pr_file_count base_file_count overlap overlap_count
-  local count_unknown="" overlap_unknown="" overlap_reason="" count_warn=""
+  local count_unknown="" overlap_unknown="" overlap_reason="" count_warn="" dirty_warn=""
   # Placeholders, never empty fields: tab is IFS whitespace, so an empty middle column would shift
-  # a SHA into the wrong field (the same trap build_checks documents). Capture both endpoint SHAs
-  # in this one read: labels can move, and the base can advance between the two compare calls.
+  # a SHA into the wrong field (the same trap build_checks documents). The head SHA is captured
+  # in this one read: labels can move. The base's SHA deliberately is NOT: the PR's `.base.sha`
+  # is the base as it stood when GitHub last built the PR's merge commit, and on a PR whose merge
+  # commit CANNOT be built (mergeable_state dirty) it stops moving — ludics-lite#39 read "0
+  # behind, 15 ahead" off it while main was 7 commits and 4 overlapping files ahead, so the one
+  # PR that needed the warning was the one that could not get it (ludics-lite#44). The base's
+  # tip is read from the branch itself instead, once, below.
   fields=$(gh_retry read api "repos/$REPO/pulls/$pr" \
-    --jq '[(.base.ref // "-"), (.base.sha // "-"), (.head.sha // "-")] | @tsv')
+    --jq '[(.base.ref // "-"), (.head.sha // "-"), (.mergeable_state // "-")] | @tsv')
   rc=$?
-  IFS=$'\t' read -r base base_sha head_sha <<<"$fields"
+  IFS=$'\t' read -r base head_sha mstate <<<"$fields"
   if [ "$rc" -ne 0 ] || [ -z "$base" ] || [ "$base" = - ] ||
-    [ -z "$base_sha" ] || [ "$base_sha" = - ] || [ -z "$head_sha" ] || [ "$head_sha" = - ]; then
+    [ -z "$head_sha" ] || [ "$head_sha" = - ]; then
     warn "how far $REPO#$pr is behind its base: UNKNOWN — the PR could not be read" \
       "($(gh_err_line)). This is not 'not behind': check it by hand before merging" \
       "and do not assume the base-drift file overlap is empty."
     echo "base-drift file overlap $REPO#$pr: UNKNOWN — the PR snapshot could not be read"
     return 3
   fi
+  # One read of the tip, and both compares below use that SHA: the base advancing between the
+  # two calls then still shows up as disagreeing merge bases (checked below) rather than as two
+  # silently different questions. Encoded like `base` encodes it — a `#` or `&` in a branch name
+  # would otherwise read some other branch's tip.
+  base_sha=$(gh_retry read api "repos/$REPO/commits/$(encode_ref "$base")" --jq .sha)
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$base_sha" ]; then
+    warn "how far $REPO#$pr is behind $base: UNKNOWN — the tip of $base could not be read" \
+      "($(gh_err_line)). This is not 'not behind': check it by hand before merging" \
+      "and do not assume the base-drift file overlap is empty."
+    echo "base-drift file overlap $REPO#$pr: UNKNOWN — the tip of $base could not be read"
+    return 3
+  fi
 
-  # Compare the captured endpoints in both directions. Each direction's files are changes from
+  # Said before the counts, because it is what the counts mean: whatever the checks gate read
+  # for this head tested it merged with an OLDER base (a pull_request run from before the base
+  # moved) or alone (a branch-push run), never with the base as it stands, and the merge call
+  # below this will fail on it anyway.
+  if [ "$mstate" = dirty ]; then
+    dirty_warn=1
+    echo "!!! $REPO#$pr CONFLICTS with $base (mergeable_state=dirty): GitHub cannot build head"
+    echo "!!! ${head_sha:0:7} merged with the current $base, so no pull_request run tests that merge"
+    echo "!!! and the merge will be refused. Merge $base in, resolve, push, and let the checks run"
+    echo "!!! on the resolution."
+  fi
+
+  # Compare the tip and the head in both directions. Each direction's files are changes from
   # their common merge base to that direction's head: base...head is the PR, head...base is the
   # base advance. Exact SHAs also make fork labels irrelevant once GitHub has admitted the PR.
   # per_page=1 trims only the commit list. GitHub still returns the first (and only) file list, but
@@ -2020,10 +2159,14 @@ warn_base_drift() {
     warn "MERGING A STALE BRANCH: $REPO#$pr is $behind commits behind $base (warns at $STALE_BASE," \
       "SHIP_PR_STALE_BASE) — a clean merge is the policy (roll-forward, ahrefs/ocannl#861)."
   fi
+  if [ -n "$dirty_warn" ]; then
+    warn "$REPO#$pr CONFLICTS with $base (mergeable_state=dirty): nothing tests this head merged" \
+      "with the current $base while GitHub cannot build that merge — merge $base in first."
+  fi
   if [ -n "$count_unknown" ] || [ -n "$overlap_unknown" ]; then
     return 3
   fi
-  if [ -n "$count_warn" ] || [ "${overlap_count:-0}" -gt 0 ]; then
+  if [ -n "$count_warn" ] || [ -n "$dirty_warn" ] || [ "${overlap_count:-0}" -gt 0 ]; then
     return 1
   fi
   return 0

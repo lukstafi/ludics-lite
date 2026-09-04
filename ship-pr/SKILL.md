@@ -209,6 +209,14 @@ yourself from the feeds, by id above the watermark you PASSED IN — `watch` pri
 back, and ids above that are the next round's (`status`, or the comment APIs) — and address
 THAT list; cross-check the count against what the watch claimed before replying/resolving.
 
+On every exit 0 but an approval, `watch` also prints (on stderr, so a round's stdout stays
+poll's) the base-drift read that `merge` otherwise makes last: how many commits behind its base
+the branch is, the exact file overlap with the base's advance, and whether the PR CONFLICTS.
+That is the moment it is cheap to act on — the round's fixes are about to be written — and
+"the base touched these files" or "CONFLICTS" means merge the base in *first*, so the next push
+is one CI can test. Read only at merge time, the same information arrives after every round has
+been paid for.
+
 An exit 0 is not always a round: `watch` also returns when it can tell that **nothing is coming** —
 the 👀 went spent without a review of the head, or never landed, or a push has been sitting
 unreviewed past the grace (20 min, `SHIP_PR_REVIEW_GRACE`). Its line says so and names the remedy:
@@ -325,6 +333,18 @@ head SHA, and answers with one of six:
 | `expected` | no live 👀, and no review of the head SHA: a round is due and has not started | wait out the grace, then `@codex review` |
 | `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push — or, at one of the loop's exits (below), close out and merge |
 | `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
+
+Every one of those lines also says **`CONFLICTS with the base (mergeable_state=dirty)`** when
+GitHub cannot build the PR's merge commit, and on `idle` that replaces "the next move is yours".
+It is not a seventh state — the reviewer keeps reviewing a conflicted PR — but it changes what a
+round is worth: GitHub creates no `pull_request` workflow run for a head whose merge commit it
+cannot build, so every push made after the conflict is one CI does not test against the base (a
+run that completed before the base moved still stands, but it tested an older merge). On
+ludics-lite#39 (2026-09-04) a sibling landed on `main` during round 6, and rounds 6–12 each got
+findings, "the next move is yours", and no CI at all, over eight pushes and 80 minutes; one of
+them landed a broken test suite, and two of them built machinery the sibling had already
+superseded. The first thing that noticed was `merge`. When the line says CONFLICTS, the next
+move is `git merge origin/<base>`, resolve, push — before addressing anything else.
 
 Two comparisons carry that, and both are easy to get wrong by hand. Whether the reviewer has *seen*
 the head is a SHA equality (each review records the `commit_id` it was submitted against), never a
@@ -565,8 +585,13 @@ line; run FAILED is exit 1, transport exit 3, no verdict exit 4.
 Both gates above read the *head commit*, and both are satisfied by a branch whose base has moved on
 without it. `merge` therefore also prints how many commits behind its base the branch is and the
 exact intersection between paths changed by the PR and paths changed by the base since their merge
-base. It says so loudly — `!!! … COMMITS BEHIND`, on stdout and stderr — past 20
-(`SHIP_PR_STALE_BASE`, or `off`), and warns at any count when that intersection is nonempty.
+base (and `watch` prints the same read, on stderr, whenever a round lands). It says so loudly —
+`!!! … COMMITS BEHIND`, on stdout and stderr — past 20 (`SHIP_PR_STALE_BASE`, or `off`), warns at
+any count when that intersection is nonempty, and says `!!! … CONFLICTS` when GitHub reports the
+PR's `mergeable_state` as `dirty`: nothing has tested that head merged with the *current* base — a
+`pull_request` run from before the base moved tested it against an older base, a branch-push run
+tested it alone, and a push made after the conflict gets no `pull_request` run at all — and the
+merge call would fail on it.
 
 It warns and merges anyway. That is the **roll-forward policy** (ahrefs/ocannl#861, decided
 2026-08-30 after a wave where every sibling merge invalidated every open PR's verification —
@@ -595,8 +620,11 @@ head), an approval (of the stale diff), `mergeable=true` (semantic drift produce
 conflict). What caught it was a hand-run endpoint diff whose 258 files were visibly not the
 two-file branch. Endpoint diffs are eyeball tools, not the answer: they include the PR's own edits,
 so every nonempty PR looks drifted by them. Read `merge`'s `base-drift file overlap` line instead.
-It derives the PR's actual base and compares the exact base/head SHA snapshot in both directions;
-renames contribute both the old and new path, and paths remain JSON strings so spaces and unusual
+It reads the PR's head SHA and the base *branch's* current tip and compares those two exact SHAs in
+both directions — not the PR's own `base.sha`, which is the base as of the last merge commit
+GitHub could build and so stands still on precisely the conflicted PR that is furthest behind
+(#39 read "0 behind" off it while `main` was 7 commits and 4 overlapping files ahead); renames
+contribute both the old and new path, and paths remain JSON strings so spaces and unusual
 characters are not split. `none` is an exact empty intersection. `UNKNOWN` means an API call failed
 or GitHub's 300-file compare cap made a list potentially incomplete; it never means none, so retry
 the read before deciding whether to rebase.

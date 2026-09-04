@@ -21,10 +21,20 @@ trap 'rm -f "$GH_ERR_FILE"; case "$TEST_ROOT" in /tmp/pr-review-base-drift-test.
 
 REPO=example/repo
 REQUEST_LOG="$TEST_ROOT/requests"
-PR_JSON='{"base":{"ref":"main","sha":"base-sha"},"head":{"label":"fork-owner:topic","sha":"head-sha"}}'
+# The PR's base.sha is a STALE snapshot on purpose (ludics-lite#44): it is the base as of the last
+# merge commit GitHub could build, and the drift read must not compare against it. The base's
+# real tip is what the branch read below answers.
+BASE_REF=main
+MERGEABLE_STATE=clean
 FORWARD_JSON=""
 REVERSE_JSON=""
 FAIL_DIRECTION=""
+FAIL_TIP=""
+
+pr_json() {
+  jq -cn --arg ref "$BASE_REF" --arg m "$MERGEABLE_STATE" \
+    '{base:{ref:$ref,sha:"stale-base-sha"},head:{label:"fork-owner:topic",sha:"head-sha"},mergeable_state:$m}'
+}
 
 # Not `fail`: pr-review.sh is sourced above and its refusals call ITS fail, whose exit code these
 # tests read; a same-named helper here would turn every refusal into this reporter's 1.
@@ -54,6 +64,9 @@ set_compares() {
   FORWARD_JSON=$(compare_json "$1" "$2" "$3")
   REVERSE_JSON=$(compare_json "$2" "$1" "$4")
   FAIL_DIRECTION=""
+  FAIL_TIP=""
+  BASE_REF=main
+  MERGEABLE_STATE=clean
   : >"$REQUEST_LOG"
   STALE_BASE=20
 }
@@ -78,7 +91,16 @@ gh() {
   done
   printf '%s\n' "$endpoint" >>"$REQUEST_LOG"
   case "$endpoint" in
-  "repos/$REPO/pulls/7") response="$PR_JSON" ;;
+  "repos/$REPO/pulls/7") response=$(pr_json) ;;
+  # The base branch's tip: what the compares must be anchored on. A compare against the PR's
+  # stale-base-sha snapshot has no fixture and bails below, which is the point.
+  "repos/$REPO/commits/main" | "repos/$REPO/commits/wip%20x")
+    if [ -n "$FAIL_TIP" ]; then
+      echo "gh: commit unavailable (HTTP 500)" >&2
+      return 1
+    fi
+    response='{"sha":"base-sha"}'
+    ;;
   "repos/$REPO/compare/base-sha...head-sha?per_page=1")
     if [ "$FAIL_DIRECTION" = forward ]; then
       echo "gh: compare unavailable (HTTP 500)" >&2
@@ -212,12 +234,69 @@ test_fork_head_uses_snapshot_shas() {
   assert_eq "$DRIFT_RC" 0 "fork-labelled PR with no overlap should be fresh"
   assert_contains "$(cat "$REQUEST_LOG")" \
     "repos/$REPO/compare/base-sha...head-sha?per_page=1" \
-    "forward compare should use captured SHAs"
+    "forward compare should use the head SHA and the base's tip SHA"
   assert_contains "$(cat "$REQUEST_LOG")" \
     "repos/$REPO/compare/head-sha...base-sha?per_page=1" \
-    "reverse compare should use captured SHAs"
+    "reverse compare should use the head SHA and the base's tip SHA"
   assert_not_contains "$(cat "$REQUEST_LOG")" "fork-owner:topic" \
     "a fork's mutable head label should not enter compare URLs"
+}
+
+test_base_tip_not_the_pr_snapshot() {
+  set_compares 7 15 '[{"filename":"pr.txt"}]' '[{"filename":"base.txt"}]'
+  run_drift
+  assert_eq "$DRIFT_RC" 0 "a branch behind a tip the snapshot does not know should read cleanly"
+  assert_contains "$DRIFT_OUTPUT" "7 commit(s) behind main, 15 ahead" \
+    "the count should be against the base's tip, which the PR's base.sha snapshot is not"
+  assert_contains "$(cat "$REQUEST_LOG")" "repos/$REPO/commits/main" \
+    "the base's tip should be read from the branch"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "stale-base-sha" \
+    "the PR's base.sha snapshot must not anchor a compare"
+}
+
+test_tip_read_failure_is_unknown() {
+  set_compares 2 1 '[{"filename":"pr.txt"}]' '[{"filename":"base.txt"}]'
+  FAIL_TIP=1
+  run_drift
+  assert_eq "$DRIFT_RC" 3 "an unreadable base tip should be unknown"
+  assert_contains "$DRIFT_OUTPUT" "base-drift file overlap $REPO#7: UNKNOWN" \
+    "an unreadable tip should print UNKNOWN"
+  assert_not_contains "$DRIFT_OUTPUT" "overlap $REPO#7: none" \
+    "an unreadable tip must not print a reassuring none"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "compare/" \
+    "no compare should be attempted without a tip to anchor it"
+}
+
+test_dirty_pr_is_loud() {
+  set_compares 7 15 '[{"filename":"pr.txt"}]' '[{"filename":"base.txt"}]'
+  MERGEABLE_STATE=dirty
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "a conflicted PR should warn even with no file overlap"
+  assert_contains "$DRIFT_OUTPUT" "!!! $REPO#7 CONFLICTS with main (mergeable_state=dirty)" \
+    "a dirty mergeable_state should be said loudly"
+  assert_contains "$DRIFT_OUTPUT" "head-sh merged with the current main" \
+    "the conflict warning should say what it costs: nothing tests the head merged with the base"
+  assert_not_contains "$DRIFT_OUTPUT" "no pull_request workflow has run" \
+    "a run that completed before the base moved may exist: do not claim nothing ran"
+  assert_contains "$DRIFT_OUTPUT" "7 commit(s) behind main" \
+    "the count should still be read on a conflicted PR"
+}
+
+test_computing_mergeability_is_not_a_conflict() {
+  set_compares 2 1 '[{"filename":"pr.txt"}]' '[{"filename":"base.txt"}]'
+  MERGEABLE_STATE=unknown
+  run_drift
+  assert_eq "$DRIFT_RC" 0 "GitHub still computing mergeability is not a conflict"
+  assert_not_contains "$DRIFT_OUTPUT" "CONFLICTS" "an unknown mergeable_state must not claim a conflict"
+}
+
+test_base_ref_is_encoded() {
+  set_compares 2 1 '[{"filename":"pr.txt"}]' '[{"filename":"base.txt"}]'
+  BASE_REF='wip x'
+  run_drift
+  assert_eq "$DRIFT_RC" 0 "a base ref needing encoding should still read"
+  assert_contains "$(cat "$REQUEST_LOG")" "repos/$REPO/commits/wip%20x" \
+    "the base ref should be percent-encoded in the tip read"
 }
 
 test_overlap_below_stale_threshold_is_loud() {
@@ -242,6 +321,11 @@ tests=(
   test_json_escapes_survive_xpg_echo
   test_fork_head_uses_snapshot_shas
   test_overlap_below_stale_threshold_is_loud
+  test_base_tip_not_the_pr_snapshot
+  test_tip_read_failure_is_unknown
+  test_dirty_pr_is_loud
+  test_computing_mergeability_is_not_a_conflict
+  test_base_ref_is_encoded
 )
 
 for test_name in "${tests[@]}"; do
