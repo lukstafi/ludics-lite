@@ -131,9 +131,11 @@
 #             rejected the request, a build check is RED, the merge was refused); 2
 #             usage/configuration error; 3 TRANSPORT failure — nothing was learned, so retry rather
 #             than concluding anything. 1 and 3 are kept apart everywhere. `checks`, `base` and
-#             `merge` add 4: no verdict yet — the build has not finished, or every finished job was
-#             cancelled. 4 is not a pass and not a failure, and it is kept apart from 0 for the
-#             same reason 3 is: "nothing has failed" and "everything passed" are different facts.
+#             `merge` add 4: no verdict yet — the build has not finished, every finished job was
+#             cancelled, or the head has no check runs and its workflow run is queued, running or
+#             still to be created. 4 is not a pass and not a failure, and it is kept apart from 0
+#             for the same reason 3 is: "nothing has failed" and "everything passed" are different
+#             facts.
 #             From `merge`, 4 means the merge was REFUSED for want of a verdict (see
 #             --allow-no-verdict).
 #
@@ -152,8 +154,10 @@
 #      out for a build verdict (7200 — the runner queue alone ran ~2h deep on 2026-08-23),
 #      SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60), SHIP_PR_CHECKS_HEARTBEAT=seconds
 #      between the one-line "still waiting" progress notes a `--wait` prints (600),
-#      SHIP_PR_BASE_ABSENT_GRACE=seconds `base --wait` allows for a run on the tip to APPEAR
-#      before settling for an older verdict (300; paths-ignore pushes never get one),
+#      SHIP_PR_BASE_ABSENT_GRACE=seconds a commit with no workflow run yet is allowed before its
+#      absence is read as a fact (300; paths-ignore pushes never get one). `base --wait` applies
+#      it to the tip before settling for an older verdict, and `checks`/`merge` apply it to the
+#      head before calling a build signal ABSENT rather than not-created-yet (ludics-lite#24),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences the commit-count warning). A nonempty file overlap still warns at any count; no
 #      base-drift warning blocks the merge.
@@ -1228,13 +1232,17 @@ BUILD_ADVISORY="${SHIP_PR_ADVISORY_CHECKS:-^(claude|Claude Code|github pages doc
 CHECKS_INTERVAL="${SHIP_PR_CHECKS_INTERVAL:-60}"
 CHECKS_WAIT="${SHIP_PR_CHECKS_WAIT:-7200}"
 CHECKS_HEARTBEAT="${SHIP_PR_CHECKS_HEARTBEAT:-600}"
-BASE_ABSENT_GRACE="${SHIP_PR_BASE_ABSENT_GRACE:-300}"
+# Named for `base --wait`, which asked the question first, but the question is not the base's: how
+# long a push may go without a run before absence becomes a fact. The checks gate asks it too
+# (see absent_signal), so the shell variable drops the prefix and the ENV name keeps it — nobody's
+# scripts should have to be edited for a widened meaning.
+ABSENT_GRACE="${SHIP_PR_BASE_ABSENT_GRACE:-300}"
 # Whole seconds, validated up front: these feed shell arithmetic (deadlines, heartbeats, and the
 # sleep caps against the remaining deadline), where a fractional value does not degrade gracefully
 # — `[ 0.5 -le N ]` errors and takes the fallback arm, which for the interval means one read and
 # then a sleep to the full ceiling. A zero interval would busy-loop the API instead of pacing it.
-case "$BASE_ABSENT_GRACE" in
-'' | *[!0-9]*) die "SHIP_PR_BASE_ABSENT_GRACE must be a number of seconds, got '$BASE_ABSENT_GRACE'" ;;
+case "$ABSENT_GRACE" in
+'' | *[!0-9]*) die "SHIP_PR_BASE_ABSENT_GRACE must be a number of seconds, got '$ABSENT_GRACE'" ;;
 esac
 case "$CHECKS_INTERVAL" in
 '' | *[!0-9]*) die "SHIP_PR_CHECKS_INTERVAL must be whole seconds, got '$CHECKS_INTERVAL'" ;;
@@ -1325,11 +1333,90 @@ summarize_checks() {
   CHECK_GREEN="$green"
 }
 
+# ABSENT is two facts wearing one word, and only one of them is a verdict: "no workflow covers this
+# commit" (path filters — ocannl's `ci` ignores `docs/**`) and "the checks of the run for this
+# commit DO NOT EXIST YET", seconds after a push. Both read as zero check-runs, so the fold above
+# cannot tell them apart, and the second one used to leave the gate as exit 0 ABSENT while
+# `actions/runs` for that same head already said `in_progress` (ludics-lite#24). That is the shape
+# a merge can be armed on and read nothing: ocannl-staging#491 merged exactly that way. The skill's
+# prose asked every caller to re-derive the distinction by hand after a push, which is the class of
+# defect this file exists to encode instead of describing.
+#
+# So an absence gets a second read, of the two things that separate the cases: the workflow RUNS
+# for the head SHA (`actions/runs?head_sha=`, which exists from the moment the run is queued —
+# before any of its check-runs do), and, when there is no run at all, how long ago the head was
+# pushed. Prints the reason phrase for the report; returns
+#   0  the absence IS the verdict — a run for this head finished and left no build check behind,
+#      or no run was created within the grace (a paths-ignore push never gets one, and only time
+#      separates that from "not yet")
+#   4  no verdict YET — a run for the head is queued or in flight, or the head is younger than the
+#      grace and its run may still be created. Under --wait, keep waiting.
+#   3  neither could be read. `base --wait` settles on an unreadable age because the sibling runs
+#      judged at the tip are evidence in their own right; here there is nothing else to go on, and
+#      an absence that could not be read is UNKNOWN, which is not "nothing is red".
+#
+# Advisory names are filtered here as everywhere else, and for the same reason in both directions:
+# the review app's own check must not hold a wait open, and a repo whose only in-flight run is
+# advisory has no build signal coming. A run's `.name` is the workflow's name unless the workflow
+# sets `run-name:`, in which case a custom name can miss the advisory ERE — that only costs a hold
+# for a run whose verdict would have been ignored, which is the safe direction to be wrong in.
+absent_signal() {
+  local sha="$1" raw rc name status runs=0 inflight=0 pushed_at age
+  raw=$(gh_retry read api "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
+    --jq '.workflow_runs[] | [(.name // "-"), (.status // "unknown")] | @tsv')
+  rc=$?
+  [ "$rc" -eq 0 ] || {
+    printf '%s' "the workflow runs for this head could not be read ($(gh_err_line))"
+    return 3
+  }
+  while IFS=$'\t' read -r name status; do
+    [ -n "$name" ] || continue
+    is_advisory "$name" && continue
+    runs=$((runs + 1))
+    [ "$status" = completed ] || inflight=$((inflight + 1))
+  done <<<"$raw"
+  if [ "$inflight" -gt 0 ]; then
+    printf '%s' "$inflight workflow run(s) for this head have not finished — their check runs" \
+      " do not exist yet"
+    return 4
+  fi
+  if [ "$runs" -gt 0 ]; then
+    printf '%s' "$runs workflow run(s) for this head finished and left no build check behind" \
+      " — path filters, or every job in them was skipped"
+    return 0
+  fi
+  # No run at all, so the only question left is how long there has been to create one. The head's
+  # own committer date is the push clock the rest of this file uses (pr_state's review clock): a
+  # rebase, an amend and a cherry-pick all refresh it, which covers every way a PR head moves. It
+  # can still overstate the age of a branch that sat locally for hours before its first push —
+  # SHIP_PR_BASE_ABSENT_GRACE is the knob for a repo whose runs are slower to appear than that.
+  pushed_at=$(gh_retry read api "repos/$REPO/commits/$sha" --jq .commit.committer.date) ||
+    pushed_at=""
+  age=$(age_of "$pushed_at")
+  case "$age" in
+  '' | *[!0-9]*)
+    printf '%s' "no workflow run exists for this head and its push time could not be read" \
+      " ($(gh_err_line))"
+    return 3
+    ;;
+  esac
+  if [ "$age" -lt "$ABSENT_GRACE" ]; then
+    printf '%s' "no workflow run exists for this head yet, pushed $(fmt_age "$age") ago — inside" \
+      " the $(fmt_age "$ABSENT_GRACE") creation grace (SHIP_PR_BASE_ABSENT_GRACE)"
+    return 4
+  fi
+  printf '%s' "no workflow run was created for this head in the $(fmt_age "$age") since it was" \
+    " pushed"
+  return 0
+}
+
 # Reads the PR's head SHA and judges its build signal. Sets VERDICT and prints the report.
-# 0 = green or absent (nothing is red), 1 = RED, 3 = the API did not answer, 4 = no verdict yet
-# (still running, or every finished job was cancelled).
+# 0 = green, or an absence that absent_signal confirmed is the verdict (nothing is red), 1 = RED,
+# 3 = the API did not answer, 4 = no verdict yet (still running, every finished job was cancelled,
+# or the run for this head exists and has not produced its checks yet).
 gate_checks() {
   local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining
+  local absent_why="" note
   sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha)
   rc=$?
   if [ "$rc" -ne 0 ] || [ -z "$sha" ]; then
@@ -1351,13 +1438,33 @@ gate_checks() {
       return 3
     fi
     summarize_checks "$lines"
+    # An absence is not read as a verdict until the second read says it is one — including with no
+    # --wait at all, where the honest answer to "is there a signal here" is 4, not a 0 the merge
+    # gate would take for "nothing is red".
+    if [ "$VERDICT" = absent ]; then
+      absent_why=$(absent_signal "$sha")
+      case $? in
+      3)
+        VERDICT=unknown
+        warn "could not tell whether $REPO#$pr @${sha:0:8} has no build signal or has one that" \
+          "does not exist YET ($absent_why); that is UNKNOWN, which is NOT 'nothing is red'."
+        return 3
+        ;;
+      4) VERDICT=unstarted ;;
+      esac
+    fi
     now=$(date +%s)
-    [ "$VERDICT" = pending ] && [ "$now" -lt "$deadline" ] || break
+    case "$VERDICT" in pending | unstarted) ;; *) break ;; esac
+    [ "$now" -lt "$deadline" ] || break
     # One line per heartbeat, not per re-read: a two-hour wait is 120 re-reads, and a background
     # child that prints that much is as unreadable as one that prints nothing.
     if [ $((now - beat)) -ge "$CHECKS_HEARTBEAT" ]; then
+      case "$VERDICT" in
+      unstarted) note="$absent_why" ;;
+      *) note="$CHECK_PENDING check(s) running" ;;
+      esac
       warn "still waiting on $REPO#$pr @${sha:0:8}: no verdict after $(((now - started) / 60)) of" \
-        "$((wait_for / 60)) min ($CHECK_PENDING check(s) running)"
+        "$((wait_for / 60)) min ($note)"
       beat=$now
     fi
     # Capped at the remaining deadline, same as cmd_base and cmd_run_watch: an interval longer
@@ -1372,13 +1479,14 @@ gate_checks() {
   red) echo "build signal $REPO#$pr @${sha:0:8}: RED — $CHECK_RED of $CHECK_TOTAL build checks failed" ;;
   pending) echo "build signal $REPO#$pr @${sha:0:8}: NO VERDICT YET — still running" ;;
   mixed) echo "build signal $REPO#$pr @${sha:0:8}: INCOMPLETE — $CHECK_GREEN passed, the rest were stopped without a verdict" ;;
-  absent) echo "build signal $REPO#$pr @${sha:0:8}: ABSENT — no build check ran on this commit (path filters, or CI never started)" ;;
+  unstarted) echo "build signal $REPO#$pr @${sha:0:8}: NO VERDICT YET — no build check on this commit yet: $absent_why" ;;
+  absent) echo "build signal $REPO#$pr @${sha:0:8}: ABSENT — no build check ran on this commit: $absent_why" ;;
   green) echo "build signal $REPO#$pr @${sha:0:8}: green — $CHECK_GREEN build checks passed" ;;
   esac
   [ -n "$CHECK_LINES" ] && printf '%s' "$CHECK_LINES"
   case "$VERDICT" in
   red) return 1 ;;
-  pending | mixed) return 4 ;;
+  pending | mixed | unstarted) return 4 ;;
   *) return 0 ;;
   esac
 }
@@ -1951,7 +2059,7 @@ cmd_base() {
           tip_age=$(age_of "$tip_seen_at")
           case "$tip_age" in
           '' | *[!0-9]*) ;; # unreadable age is not evidence to hold on
-          *) [ "$tip_age" -ge "$BASE_ABSENT_GRACE" ] || hold=1 ;;
+          *) [ "$tip_age" -ge "$ABSENT_GRACE" ] || hold=1 ;;
           esac
         fi
         # Covered — against the tip read BEFORE the runs. A sibling merge landing between those
@@ -1969,7 +2077,7 @@ cmd_base() {
       # is "none". A tip with NO run is either the not-created-yet window or paths-ignore, and
       # only time tells those apart: after the grace, settle for what is there — the
       # per-workflow lines name which commit each verdict is actually about.
-      elif [ $((now - grace_from)) -ge "$BASE_ABSENT_GRACE" ]; then
+      elif [ $((now - grace_from)) -ge "$ABSENT_GRACE" ]; then
         if [ "$nogo_at_tip" -gt 0 ]; then
           waited_note="(the tip's newest run completed stopped-not-judged and no replacement appeared within the grace — NOT absence and NOT a verdict: re-run the workflow)"
           no_tip_verdict=1

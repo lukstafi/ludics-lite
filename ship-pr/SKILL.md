@@ -367,10 +367,10 @@ The other verdicts are not refusals, and none of them is a green light either:
 | exit | verdict | what it is |
 | --- | --- | --- |
 | 0 | green | every build check on the head passed |
-| 0 | absent | no build check ran on this commit — path filters (ocannl's `ci` ignores `docs/**`), or CI never started |
+| 0 | absent | no build check ran on this commit, and the run list confirms none is coming — path filters (ocannl's `ci` ignores `docs/**`), or CI never started |
 | 1 | RED | a build check concluded `failure` — refused |
 | 3 | unknown | the checks could not be read — refused |
-| 4 | no verdict | still running, or every finished job was `cancelled` — refused without `--allow-no-verdict` |
+| 4 | no verdict | still running, every finished job was `cancelled`, or the head's run has not created its checks yet — refused without `--allow-no-verdict` |
 
 **Exit 4 refuses too, by default.** Nothing has failed, but nothing has passed, and a merge that
 waits for neither read nothing — it was a warning until 2026-08-23, when a day-long runner queue
@@ -386,15 +386,21 @@ with a one-line heartbeat every 10 min (`SHIP_PR_CHECKS_HEARTBEAT`), so backgrou
 hold. If the ceiling runs out it exits 4 naming `--allow-no-verdict`; for anything a compiler sees,
 wait again instead.
 
-Two traps around that hold, both observed 2026-08-28. **`ABSENT` seconds after a force-push is not
-a verdict** — a rebase before merging pushes a new head whose checks may not EXIST yet,
-and a wait that starts in that window sees nothing to wait for and can pass the gate having read
-nothing (ocannl staging#491 merged that way). After any force-push, confirm a run exists on the
-new head (`gh pr checks` / the run list) before trusting a quick `ABSENT`-shaped answer, and if
-none exists yet, wait for it to appear. And **the harness can kill a backgrounded `merge --wait`
-well before its ceiling** (observed twice at ~40 min): the correct response is to re-read merge
-state over REST (`gh pr view --json state,mergedAt,headRefOid`) and re-arm the wait — never to
-conclude the merge failed, and never to reach for `--allow-no-verdict` because the waiter died.
+**`ABSENT` seconds after a push used to be the trap here** — a push (a rebase before merging, or
+any other) creates a head whose checks do not EXIST yet, and a wait armed in that window saw
+nothing to wait for and passed the gate having read nothing (ocannl staging#491 merged that way).
+The gate now reads that distinction itself (ludics-lite#24): an absence is confirmed against
+`actions/runs?head_sha=`, so a queued or running workflow for the head is exit 4 like any other
+unfinished build, a head with no run yet holds until `SHIP_PR_BASE_ABSENT_GRACE` (300s) has passed
+since it was pushed, and `ABSENT` is reported only past that — with the evidence on the line. No
+hand re-check, and no `--wait` needed for it: without one the same window is exit 4, not 0. The
+knob is there for a repo whose runs take longer than five minutes to appear.
+
+The trap that remains is at the other end of the hold: **the harness can kill a backgrounded
+`merge --wait` well before its ceiling** (observed twice at ~40 min). The correct response is to
+re-read merge state over REST (`gh pr view --json state,mergedAt,headRefOid`) and re-arm the wait
+— never to conclude the merge failed, and never to reach for `--allow-no-verdict` because the
+waiter died.
 
 `--allow-no-verdict` merges unread, loudly on stdout and stderr. It is acceptable only when the
 verdict could tell you nothing you have not established yourself: a doc-only diff, or a shell-only

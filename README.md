@@ -151,10 +151,11 @@ The shell scripts carry their own test suites:
 issue-wave/scripts/test-fleet-worker.sh
 ship-pr/scripts/test-post-merge-cleanup.sh
 ship-pr/scripts/test-pr-review-base-drift.sh
+ship-pr/scripts/test-pr-review-checks-absent.sh
 scripts/test-wake-lab.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all four on Ubuntu and
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all five on Ubuntu and
 macOS (the fleet's bash is 3.2) for every push and pull request, along with `bash -n`, shellcheck
 at error severity, and a check that the two cleanup scripts still carry their parse guard. It runs
 without path filters, so every PR's merge gate reads a verdict rather than `ABSENT`.
@@ -178,6 +179,12 @@ kick reaches the Windows side through whichever of the two aliases answers, sinc
 that is the LAN one; and that the polling loops honour a wall-clock deadline against slow probes,
 which an iteration budget did not (`WAKE_LAB_WAIT_SECONDS`, `WAKE_LAB_WSL_WAIT_SECONDS` and
 `WAKE_LAB_DOWN_WAIT_SECONDS` are what let the suite ask for a one-second one).
+
+`test-pr-review-checks-absent.sh` drives the build gate against a canned Actions API, one answer
+per polling round, and pins the split the word ABSENT used to hide: a queued or running workflow
+for the head, and a head too freshly pushed to have one yet, are exit 4 (no verdict), while a
+finished run that left no build check and a head past `SHIP_PR_BASE_ABSENT_GRACE` with no run are
+exit 0 (the absence itself). A second read that fails is exit 3, never a reassuring 0.
 
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and
