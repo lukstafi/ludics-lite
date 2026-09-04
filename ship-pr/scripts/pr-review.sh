@@ -111,8 +111,10 @@
 #   pr-review.sh merge <pr> [--override "<why this red is unrelated>"] [--wait]
 #                           [--allow-no-verdict] [--require-green]
 #                                          # checks, then merge; refuses on red without --override,
-#                                          # on NO verdict without --allow-no-verdict, on ABSENT
-#                                          # with --require-green (a close-out merge), and WARNS
+#                                          # on NO verdict without --allow-no-verdict, and — with
+#                                          # --require-green (a close-out merge) — on ABSENT, on
+#                                          # green-by-skips-only, on --auto, and on a deferred
+#                                          # auto-merge (which it disables again); and WARNS
 #                                          # loudly when the branch is far behind its base
 #   pr-review.sh base [owner/name] [branch] [--wait[=seconds]]
 #                                          # is the branch you are about to work off CI-green?
@@ -1419,7 +1421,7 @@ build_checks() {
 # Folds the per-check classes into VERDICT (red|pending|mixed|absent|green) and the report lines.
 # Runs in the current shell — a pipeline would put the loop in a subshell and lose both.
 summarize_checks() {
-  local class name concl url red=0 pending=0 nogo=0 green=0
+  local class name concl url red=0 pending=0 nogo=0 green=0 passed=0
   VERDICT=""
   CHECK_LINES=""
   CHECK_RED=0
@@ -1438,10 +1440,16 @@ summarize_checks() {
       nogo=$((nogo + 1))
       CHECK_LINES="${CHECK_LINES}  no verdict  $name ($concl — stopped, not judged)  $url"$'\n'
       ;;
-    *) green=$((green + 1)) ;;
+    *)
+      green=$((green + 1))
+      # `skipped` and `neutral` are green for the ordinary gate (nothing failed) but they are not
+      # a build that RAN; --require-green wants at least one of these.
+      [ "$concl" = success ] && passed=$((passed + 1))
+      ;;
     esac
   done <<<"$1"
   CHECK_RED="$red"
+  CHECK_PASSED="$passed"
   CHECK_PENDING="$pending"
   CHECK_TOTAL=$((red + pending + nogo + green))
   if [ "$red" -gt 0 ]; then
@@ -1736,7 +1744,7 @@ warn_base_drift() {
 cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
-  local override="" wait_for=0 allow_no_verdict="" require_green="" gate out rc attempt=1 mergeable state
+  local override="" wait_for=0 allow_no_verdict="" require_green="" gate out rc attempt=1 mergeable state arg
   local -a gh_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1773,6 +1781,16 @@ cmd_merge() {
     esac
   done
   [ ${#gh_args[@]} -gt 0 ] || gh_args=(--merge) # the repo convention: preserve the commit series
+  # A close-out merge is a merge NOW of the head the gate read, or nothing: deferred auto-merge
+  # would land whatever head the PR has when the base's checks pass, gate unread.
+  if [ -n "$require_green" ]; then
+    for arg in "${gh_args[@]}"; do
+      case "$arg" in
+      --auto | --auto=*) die "merge: --require-green cannot be combined with --auto — a close-out" \
+        "merge lands the gated head now or refuses; it is never deferred to auto-merge." ;;
+      esac
+    done
+  fi
   # A reason, not a token. "--override yes" would make the gate a formality one keystroke wide;
   # what makes an override legitimate is being able to say why THIS red is unrelated to THIS PR,
   # and that sentence is what lands in the log the next reader sees.
@@ -1824,6 +1842,15 @@ cmd_merge() {
       "to appear and finish (--wait holds $CHECKS_ABSENT_GRACE s for one to appear, then for its" \
       "verdict), or confirm why none will (path filters) and merge without --require-green," \
       "saying so."
+  fi
+  # Green by skips alone is the path-filter case wearing a verdict: every check concluded, none
+  # of them ran a build. The ordinary gate lets that through (nothing failed); a close-out merge
+  # needs a build that RAN and passed.
+  if [ -n "$require_green" ] && [ "${CHECK_PASSED:-0}" -eq 0 ]; then
+    fail 4 "REFUSING to merge $REPO#$PR_NUM: --require-green and every build check on the head" \
+      "was skipped or neutral — green, but no build RAN. A close-out merge needs at least one" \
+      "check that concluded success; if the head genuinely runs no build (job-level path" \
+      "filters), merge without --require-green, saying so."
   fi
   # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
   # verdict is the final thing on screen before the merge itself. A loud WARNING, not a gate: the
@@ -1880,6 +1907,20 @@ cmd_merge() {
   case "$state" in
   *"merged=true"*) return 0 ;;
   esac
+  if [ -n "$require_green" ]; then
+    # A merge queue or required checks turned the call into a deferred auto-merge, which
+    # --match-head-commit guarded only at enable time: a later push would land ungated. Take
+    # it back and refuse, loudly; the caller decides what to do about the base's requirements.
+    if gh_retry write pr merge "$PR_NUM" --repo "$REPO" --disable-auto >/dev/null; then
+      fail 1 "NOT merged, and auto-merge DISABLED again: $REPO#$PR_NUM ($state) — the base defers" \
+        "merges to its required checks or a merge queue, and a close-out merge is never" \
+        "deferred. Merge it when the base allows a direct merge, or without --require-green" \
+        "with the reason on record."
+    fi
+    fail 3 "NOT merged, and auto-merge could NOT be disabled ($(gh_err_line)): $REPO#$PR_NUM" \
+      "($state) is armed to land a LATER head ungated. Disable it by hand (gh pr merge" \
+      "--disable-auto) before anything else."
+  fi
   fail 1 "$REPO#$PR_NUM is not merged ($state) — \`gh pr merge\` returned having only enabled" \
     "auto-merge. It will land when the base's required checks pass; do not treat it as landed."
 }

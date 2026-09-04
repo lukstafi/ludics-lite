@@ -501,9 +501,12 @@ not cancel its siblings and destroy the information. A cancel here comes from a 
 a manual stop, and re-running is what turns it into an answer; it is exit 4 like a running job, and
 `--allow-no-verdict` is no more acceptable for it.
 
-`--require-green` is the opposite hatch: it makes `absent` a refusal too (exit 4), for the
+`--require-green` is the opposite hatch: it makes `absent` a refusal too (exit 4), and so is a
+green made only of `skipped` and `neutral` checks — nothing failed, but no build ran — for the
 close-out merges of *When the loop ends*, which rest on the record rather than on a 👍 and so must
-have READ a green verdict rather than found nothing red. With `--wait` it holds through the
+have READ a passing build rather than found nothing red. It also refuses `--auto`, and when the
+base turns the call into a deferred auto-merge anyway (required checks, a merge queue) it
+disables that again and exits 1: a close-out merge lands the gated head now or not at all. With `--wait` it holds through the
 creation grace for a run to appear and then for its verdict; its refusal names the two ways out —
 wait longer, or establish that no run will come and merge without the flag, saying so.
 
