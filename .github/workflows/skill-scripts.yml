@@ -34,6 +34,23 @@ jobs:
         # Errors only: the warning tier is style and a few false positives on deliberately
         # unquoted globs; the error tier is what breaks a script.
         run: shellcheck --severity=error --external-sources */scripts/*.sh scripts/*.sh
+      - name: Check PowerShell syntax
+        # pwsh is preinstalled on the hosted Ubuntu and macOS images. Parse the Windows repair
+        # script without executing its Windows-only networking and registry commands.
+        run: |
+          pwsh -NoProfile -Command '
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path "scripts/enable-wol-windows.ps1"),
+              [ref] $tokens,
+              [ref] $errors
+            ) > $null
+            if ($errors.Count -ne 0) {
+              $errors | ForEach-Object { Write-Error $_ }
+              exit 1
+            }
+          '
       - name: Parse guard
         # post-merge-cleanup.sh and test-post-merge-cleanup.sh are each one brace group ending
         # in `exit "$?"` and `}` (ludics-lite#10), so a mid-run rewrite cannot resume the shell

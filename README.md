@@ -143,6 +143,10 @@ endpoints, the ssh aliases and all of the logic. `wake-lab.sh --help` prints tha
 `--help` and `--list` are the two commands that work before the host table exists. The box names
 (`rog`, `minix`, `asus`) and the ssh aliases are the author's and are edited in place.
 
+To repair the Windows-side NIC settings, copy `scripts/enable-wol-windows.ps1` to the Windows box
+and run it from an elevated PowerShell (`powershell -ExecutionPolicy Bypass -File
+.\enable-wol-windows.ps1`); BIOS/UEFI Wake-on-LAN still has to be enabled separately.
+
 ## Tests
 
 The shell scripts carry their own test suites:

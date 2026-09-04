@@ -218,7 +218,8 @@ do_status() {
   echo "box    link  lan(direct IP)  win(tailscale)  wsl(tailscale)"
   for n in "$@"; do status_one "$n"; done
   echo
-  echo "link=1 only means the NIC holds link — a WoL-armed box reads 1 while powered OFF."
+  echo "link=1 can mean a WoL-armed NIC holds link while powered OFF; minutes after shutdown or"
+  echo "hibernate it can instead be a stale router lease, not physical link state."
   echo "lan/win/wsl are real ssh probes; wsl=-- right after a wake is usually just tailscaled lag."
 }
 
@@ -401,9 +402,10 @@ case "$VERB" in
         echo "all up"
       else
         for t in "${TARGETS[@]}"; do is_up "$t" || echo "did NOT wake: $t"; done
-        echo "Check, in order: BIOS Wake-on-LAN / 'Power Up' (minix needed this, and it is on the"
-        echo "SECOND setup screen, not under Advanced); Fast Startup off; the NIC holding link"
-        echo "while powered off ('$0 status' -> link=1). asus is Wi-Fi only and cannot be woken."
+        echo "Check BIOS Wake-on-LAN / 'Power Up' (minix needed the SECOND setup screen, not"
+        echo "Advanced), then run scripts/enable-wol-windows.ps1 from an elevated Windows"
+        echo "PowerShell to disable Fast Startup and re-arm the NIC. Check '$0 status' after the"
+        echo "router lease settles; asus is Wi-Fi only and cannot be woken."
       fi
     fi
     ;;

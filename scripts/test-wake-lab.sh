@@ -119,6 +119,9 @@ expect "status asks the router about the site file's Ethernet MAC alone" 0 "rog 
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" "$WL" status rog
 grep -q 'aa:bb:cc:00:00:02' "$CURL_LOG" && ! grep -q 'aa:bb:cc:00:00:01' "$CURL_LOG" \
   && ok "...not about the Wi-Fi one" || ko "link_active used the wrong MAC: $(cat "$CURL_LOG")"
+printf '%s' "$out" | grep -q 'stale router lease, not physical link state' \
+  && ok "...and warns that a recent shutdown can leave a stale lease reading" \
+  || ko "status does not carry the stale-lease caveat -- $out"
 
 # A target the table does not answer for refuses the whole run, before any packet: the boxes it
 # DOES know must not be woken while a later target turns out to be missing, and the dispatch loop's
@@ -168,6 +171,9 @@ elapsed=$((SECONDS - started))
   || ko "the wake wait ran ${elapsed}s against a 1s budget: it is still counting iterations"
 printf '%s' "$out" | grep -q 'did NOT wake: rog' \
   && ok "...reporting the box that never came up" || ko "no 'did NOT wake' after the budget -- $out"
+printf '%s' "$out" | grep -q 'scripts/enable-wol-windows.ps1' \
+  && ok "...and points failure advice at the tracked Windows repair script" \
+  || ko "wake failure advice does not name scripts/enable-wol-windows.ps1 -- $out"
 
 # --- the two commands that need no site data --------------------------------------------------
 # --help and --list are what you reach for on a box where the table has yet to be installed, so
