@@ -19,28 +19,30 @@ REVIEWS_JSON='[]'
 COMMENTS_JSON='[]'
 FAIL_READ=""
 
-fail() {
+# Not `fail`: pr-review.sh is sourced above and its refusals call ITS fail, whose exit code these
+# tests read; a same-named helper here would turn every refusal into this reporter's 1.
+bail() {
   echo "FAIL: $*" >&2
   exit 1
 }
 
 assert_eq() {
-  [ "$1" = "$2" ] || fail "$3 (got '$1', expected '$2')"
+  [ "$1" = "$2" ] || bail "$3 (got '$1', expected '$2')"
 }
 
 assert_contains() {
-  case "$1" in *"$2"*) ;; *) fail "$3 (missing '$2' in: $1)" ;; esac
+  case "$1" in *"$2"*) ;; *) bail "$3 (missing '$2' in: $1)" ;; esac
 }
 
 assert_not_contains() {
-  case "$1" in *"$2"*) fail "$3 (unexpected '$2' in: $1)" ;; *) ;; esac
+  case "$1" in *"$2"*) bail "$3 (unexpected '$2' in: $1)" ;; *) ;; esac
 }
 
 # Minimal gh fixture transport: the reviews feed is the only endpoint the counter reads. It is
 # fetched with --paginate, which the fixture accepts and ignores (one page is the whole feed).
 gh() {
   local endpoint="" arg
-  [ "${1:-}" = api ] || fail "fixture received non-api gh call: $*"
+  [ "${1:-}" = api ] || bail "fixture received non-api gh call: $*"
   shift
   while [ $# -gt 0 ]; do
     arg="$1"
@@ -61,7 +63,7 @@ gh() {
     printf '%s\n' "$REVIEWS_JSON"
     ;;
   "repos/$REPO/issues/7/comments?per_page=100") printf '%s\n' "$COMMENTS_JSON" ;;
-  *) fail "unexpected fixture endpoint: $endpoint" ;;
+  *) bail "unexpected fixture endpoint: $endpoint" ;;
   esac
 }
 
