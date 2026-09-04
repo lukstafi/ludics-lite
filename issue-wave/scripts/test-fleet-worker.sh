@@ -223,6 +223,71 @@ claude_loop=$(readme_block 'ludics-lite/*/' | grep -v '^git clone ')
 codex_loop=$(readme_block 'for s in ship-pr wait-and-proceed after-merge' | grep -v '^git clone ')
 [ -n "$claude_loop" ] && [ -n "$codex_loop" ] && ok "README.md carries both install loops" || ko "could not find the README's install loops"
 ( export HOME="$real_home"; eval "$claude_loop" && eval "$codex_loop" ) || ko "the README's install loops failed: $claude_loop $codex_loop"
+
+# Read the layout rather than naming today's skills. A new top-level directory has to declare
+# itself as infrastructure here, or carry SKILL.md and therefore become part of the install set.
+non_skill_dirs=".git .github routines scripts"
+top_dirs=$(find "$real_top" -mindepth 1 -maxdepth 1 -type d -print | sort)
+tree_skills=$(printf '%s\n' "$top_dirs" | while IFS= read -r d; do
+  [ -f "$d/SKILL.md" ] && basename "$d"
+done)
+unknown_dirs=$(printf '%s\n' "$top_dirs" | while IFS= read -r d; do
+  [ -f "$d/SKILL.md" ] && continue
+  name=${d##*/}; declared=0
+  for non_skill in $non_skill_dirs; do [ "$name" = "$non_skill" ] && declared=1; done
+  [ "$declared" -eq 1 ] || printf ' %s' "$name"
+done)
+[ -n "$tree_skills" ] && [ -z "$unknown_dirs" ] \
+  && ok "every top-level directory is a skill or a declared non-skill ($non_skill_dirs)" \
+  || ko "top-level directories without SKILL.md outside the declared non-skill set:$unknown_dirs"
+
+linked_skills=$(find "$real_home/.claude/skills" -mindepth 1 -maxdepth 1 -type l -exec basename {} \; | sort)
+[ "$linked_skills" = "$tree_skills" ] \
+  && ok "the README's Claude loop links exactly the skills the tree declares" \
+  || ko "the README's Claude loop and tree disagree (tree: $tree_skills; links: $linked_skills)"
+
+# Extract each lint step's patterns from the workflow: restating them here would let the test and
+# workflow drift together. Every shell file must be covered by BOTH the syntax and shellcheck step.
+workflow_globs() { # workflow_globs <step name>
+  awk -v want="$1" '
+    /^[[:space:]]*- name: / {
+      if (in_step) exit
+      if (index($0, "- name: " want) != 0) in_step = 1
+      next
+    }
+    in_step && /[.]sh/ {
+      line = $0
+      gsub(/[;|]/, " ", line)
+      n = split(line, field, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) if (field[i] ~ /[*].*[.]sh$/) print field[i]
+    }
+  ' "$real_top/.github/workflows/skill-scripts.yml"
+}
+glob_matches() { # glob_matches <relative path> <newline-separated patterns>
+  local rel="$1" patterns="$2" pattern
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    case "$rel" in $pattern) return 0 ;; esac
+  done <<EOF
+$patterns
+EOF
+  return 1
+}
+syntax_globs=$(workflow_globs 'Check shell syntax')
+shellcheck_globs=$(workflow_globs 'Shellcheck')
+shell_files=$(cd "$real_top" && find . -type f -name '*.sh' -print | sed 's|^\./||' | sort)
+uncovered=""
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  glob_matches "$f" "$syntax_globs" || uncovered="$uncovered bash-n:$f"
+  glob_matches "$f" "$shellcheck_globs" || uncovered="$uncovered shellcheck:$f"
+done <<EOF
+$shell_files
+EOF
+[ -n "$syntax_globs" ] && [ -n "$shellcheck_globs" ] && [ -z "$uncovered" ] \
+  && ok "the workflow's own syntax and shellcheck globs cover every shell script in the tree" \
+  || ko "workflow shell globs are missing or leave files uncovered:$uncovered (bash -n: $syntax_globs; shellcheck: $shellcheck_globs)"
+
 [ -L "$real_home/.claude/skills/ship-pr" ] && ok "the README's loop links ship-pr" || ko "the README's loop did not link ship-pr into ~/.claude/skills"
 [ ! -e "$real_home/.claude/skills/routines" ] && ok "the README's loop keeps routines/ out of ~/.claude/skills" || ko "the README's loop linked routines/ into ~/.claude/skills"
 [ ! -e "$real_home/.claude/skills/scripts" ] && ok "...and scripts/ too" || ko "the README's loop linked scripts/ into ~/.claude/skills"
