@@ -1462,7 +1462,7 @@ summarize_checks() {
 # 0 = green or absent (nothing is red), 1 = RED, 3 = the API did not answer, 4 = no verdict yet
 # (still running, or every finished job was cancelled).
 gate_checks() {
-  local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining
+  local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining held=""
   sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha)
   rc=$?
   if [ "$rc" -ne 0 ] || [ -z "$sha" ]; then
@@ -1471,6 +1471,7 @@ gate_checks() {
       "which is NOT 'nothing is red'."
     return 3
   fi
+  CHECK_SHA="$sha" # what the verdict is ABOUT; merge binds to it
   started=$(date +%s)
   deadline=$((started + wait_for))
   beat=$started
@@ -1502,12 +1503,12 @@ gate_checks() {
     if [ $((now - beat)) -ge "$CHECKS_HEARTBEAT" ]; then
       warn "still waiting on $REPO#$pr @${sha:0:8}: no verdict after $(((now - started) / 60)) of" \
         "$((wait_for / 60)) min ($CHECK_PENDING check(s) running)"
+      beat=$now
     fi
-    if [ "$VERDICT" = absent ] && [ "$beat" = "$started" ]; then
+    if [ "$VERDICT" = absent ] && [ -z "$held" ]; then
       warn "no build check on $REPO#$pr @${sha:0:8} yet — holding up to $CHECKS_ABSENT_GRACE s" \
         "for one to appear (SHIP_PR_CHECKS_ABSENT_GRACE)"
-      beat=$((started + 1)) # once; the heartbeat above takes over if a run appears
-      beat=$now
+      held=1 # said once; the heartbeat above is on its own clock
     fi
     # Capped at the remaining deadline, same as cmd_base and cmd_run_watch: an interval longer
     # than what is left would sleep the process past the advertised ceiling before the clock is
@@ -1830,12 +1831,23 @@ cmd_merge() {
   # head's green run, and hands semantic drift to the post-merge integration loop. A 3 (unread)
   # has already said UNKNOWN loudly; neither outcome blocks the merge.
   warn_base_drift "$PR_NUM" || true
+  # The verdict above is about ONE head, the one gate_checks read — and a --wait is minutes to
+  # hours long, during which a push can move the PR. `gh pr merge` merges whatever the head is at
+  # the moment of the call; --match-head-commit makes it refuse unless that is still the gated
+  # SHA, so a close-out merge cannot land a head with neither a read green nor a 👍 (review of
+  # ludics-lite#39). The refusal is final, not retried: re-run merge, which re-reads the gate.
   while :; do
-    out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" "${gh_args[@]}")
+    out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" --match-head-commit "$CHECK_SHA" \
+      "${gh_args[@]}")
     rc=$?
     [ -n "$out" ] && printf '%s\n' "$out"
     [ "$rc" -eq 0 ] && break
     case "$(gh_err_line)" in
+    *"was modified"* | *"does not match"* | *"head commit"* | *"expected head"*)
+      fail 1 "NOT merged: $REPO#$PR_NUM's head is no longer ${CHECK_SHA:0:8}, the commit the build" \
+        "signal was read for ($(gh_err_line)). A push moved it; re-run merge so the gate reads" \
+        "the new head."
+      ;;
     *"not mergeable"* | *"cannot be cleanly created"*)
       [ "$attempt" -ge 3 ] && fail 1 "merge of $REPO#$PR_NUM keeps failing as not mergeable" \
         "after $attempt attempts: this is base drift, merge or rebase origin/<base> in."

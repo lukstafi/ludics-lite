@@ -47,9 +47,12 @@ gh() {
 # variable: a subshell's increment would never reach the test.
 READS_FILE=$(mktemp "${TMPDIR:-/tmp}/pr-review-checks-reads.XXXXXX") || exit 1
 reads() { wc -l <"$READS_FILE" | tr -d ' '; }
+PENDING_FOREVER=""
 build_checks() {
   echo read >>"$READS_FILE"
-  if [ -n "$GREEN_AFTER" ] && [ "$(reads)" -gt "$GREEN_AFTER" ]; then
+  if [ -n "$PENDING_FOREVER" ]; then
+    printf 'pending\tci\t\thttps://example/run\n'
+  elif [ -n "$GREEN_AFTER" ] && [ "$(reads)" -gt "$GREEN_AFTER" ]; then
     printf 'green\tci\tsuccess\thttps://example/run\n'
   fi
   return 0
@@ -102,10 +105,58 @@ test_absent_past_the_grace_is_the_answer() {
   [ $((after - before)) -ge 3 ] || fail "should have held through the grace"
 }
 
+# The heartbeat is one line per SHIP_PR_CHECKS_HEARTBEAT, not one per re-read: round 4's edit
+# dropped the clock advance and a two-hour wait would have printed every minute.
+test_heartbeat_is_once_per_period() {
+  PENDING_FOREVER=1
+  CHECKS_HEARTBEAT=2
+  run_gate 5
+  PENDING_FOREVER=""
+  assert_eq "$GATE_RC" 4 "pending to the deadline is exit 4"
+  local beats
+  beats=$(grep -c 'still waiting' "$OUT_FILE" || true)
+  [ "$beats" -ge 1 ] || fail "expected at least one heartbeat in a 5 s wait (got $beats)"
+  [ "$beats" -le 3 ] || fail "expected at most one heartbeat per 2 s, got $beats in 5 s"
+  [ "$(reads)" -ge 4 ] || fail "should have re-read more often than it beat (reads: $(reads))"
+}
+
+# The merge is bound to the head the gate read: a push during a long --wait must not land a head
+# with neither a read green nor a 👍.
+MERGE_ARGS_FILE=$(mktemp "${TMPDIR:-/tmp}/pr-review-merge-args.XXXXXX") || exit 1
+trap 'rm -f "$GH_ERR_FILE" "$OUT_FILE" "$READS_FILE" "$MERGE_ARGS_FILE"' EXIT
+test_merge_binds_to_the_gated_head() {
+  GREEN_AFTER=0
+  warn_base_drift() { return 0; }
+  gh() {
+    case "${1:-} ${2:-}" in
+    "api repos/$REPO/pulls/7")
+      case "$*" in
+      *'.head.sha'*) echo head-sha ;;
+      *merged=*) echo "merged=true state=MERGED" ;;
+      *) fail "unexpected pulls read: $*" ;;
+      esac
+      ;;
+    "pr merge") printf '%s\n' "$@" >"$MERGE_ARGS_FILE" ;;
+    *) fail "unexpected fixture gh call: $*" ;;
+    esac
+  }
+  local rc
+  set +e
+  cmd_merge "$REPO#7" >"$OUT_FILE" 2>&1
+  rc=$?
+  set -e
+  assert_eq "$rc" 0 "a green head merges ($(cat "$OUT_FILE"))"
+  assert_contains "$(tr '\n' ' ' <"$MERGE_ARGS_FILE")" "--match-head-commit head-sha " \
+    "merge should be bound to the gated head"
+  assert_contains "$(tr '\n' ' ' <"$MERGE_ARGS_FILE")" " --merge" "the repo convention stays"
+}
+
 tests=(
   test_no_wait_takes_absent_at_once
   test_wait_holds_for_a_run_to_appear
   test_absent_past_the_grace_is_the_answer
+  test_heartbeat_is_once_per_period
+  test_merge_binds_to_the_gated_head
 )
 
 for test_name in "${tests[@]}"; do

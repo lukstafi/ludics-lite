@@ -507,6 +507,11 @@ have READ a green verdict rather than found nothing red. With `--wait` it holds 
 creation grace for a run to appear and then for its verdict; its refusal names the two ways out —
 wait longer, or establish that no run will come and merge without the flag, saying so.
 
+Whatever the verdict, the merge is bound to the head it was read for: `merge` passes
+`--match-head-commit` with that SHA, so a push that moves the PR during a long `--wait` makes the
+merge refuse (exit 1, naming the SHA it read) instead of landing a head nothing has read. Re-run
+`merge`; it reads the gate again.
+
 Run `checks` on its own — same verdicts, same exit codes, no merge — whenever you want the build
 signal without acting on it, such as before asking the reviewer for another round.
 
