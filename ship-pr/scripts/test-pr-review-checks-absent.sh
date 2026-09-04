@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Focused fixture tests for pr-review.sh's build gate, and specifically for the two facts ABSENT
-# used to wear at once: "no workflow covers this commit" and "the run for this commit has not
-# created its checks yet" (ludics-lite#24). The second one must never leave the gate as exit 0.
+# Focused fixture tests for pr-review.sh's build gate, and specifically for everything the CHECK
+# list alone cannot say about a head: "no workflow covers this commit" versus "the run for this
+# commit has not created its checks yet" (ludics-lite#24), a run that failed or was stopped before
+# any check existed, and a green check standing over a sibling run that has not judged the head
+# (ludics-lite#38, round 2). None of those may leave the gate as exit 0.
 
 set -euo pipefail
 
@@ -23,6 +25,7 @@ trap 'rm -f "$GH_ERR_FILE"; case "$TEST_ROOT" in /tmp/pr-review-checks-absent-te
 REPO=example/repo
 HEAD_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 REQUEST_LOG="$TEST_ROOT/requests"
+PAGINATE_LOG="$TEST_ROOT/paginated"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -79,10 +82,11 @@ reset_fixture() {
   CHECKS_INTERVAL=1
   CHECKS_HEARTBEAT=600
   : >"$REQUEST_LOG"
+  : >"$PAGINATE_LOG"
 }
 
 gh() {
-  local endpoint="" filter="" response="" arg
+  local endpoint="" filter="" response="" arg paginate=""
   [ "${1:-}" = api ] || fail "fixture received non-api gh call: $*"
   shift
   while [ $# -gt 0 ]; do
@@ -93,11 +97,13 @@ gh() {
       filter="${1:-}"
       shift || true
       ;;
+    --paginate) paginate=1 ;;
     -*) ;;
     *) [ -n "$endpoint" ] || endpoint="$arg" ;;
     esac
   done
   printf '%s\n' "$endpoint" >>"$REQUEST_LOG"
+  [ -z "$paginate" ] || printf '%s\n' "$endpoint" >>"$PAGINATE_LOG"
   # A GLOB, deliberately unquoted: "repos/o/n/commits/<sha>" is a prefix of the check-runs
   # endpoint, so a substring match could not fail the commit read alone — and a case that failed
   # both reads would pass for the wrong reason.
@@ -247,25 +253,80 @@ test_unreadable_push_time_is_unknown() {
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "an undecidable absence must not print ABSENT"
 }
 
-# The second read is only for absences: a commit that HAS checks is judged by them alone.
-test_green_never_consults_the_run_list() {
+# Green checks over a finished, judged run list are green — and the head's age is nobody's
+# business then: run rows for one event are created together, so a head showing a check has had
+# its rows created, and holding every fresh green head for the grace would buy nothing.
+test_green_over_finished_runs_is_green() {
   reset_fixture
+  COMMIT_AGE=5
+  PR_UPDATED_AGE=5
   CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ci","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
   run_gate
-  assert_eq "$GATE_RC" 0 "green checks are green"
+  assert_eq "$GATE_RC" 0 "green checks over a finished run list are green"
   assert_contains "$GATE_OUTPUT" "green — 1 build checks passed" "green should headline green"
-  assert_not_contains "$(cat "$REQUEST_LOG")" "actions/runs" \
-    "a commit with checks should not need the run list"
 }
 
-test_red_never_consults_the_run_list() {
+# Round 2 of the review of ludics-lite#38, P1: one workflow's green check says nothing about a
+# SIBLING workflow whose run is queued and has yet to create its own.
+test_green_over_a_queued_sibling_is_not_green() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"a","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"a","status":"completed","conclusion":"success"},
+                           {"name":"b","status":"queued","conclusion":null}]')")
+  run_gate
+  assert_eq "$GATE_RC" 4 "a queued sibling run leaves the head unjudged"
+  assert_contains "$GATE_OUTPUT" "NO VERDICT YET" "the sibling should headline no verdict"
+  assert_contains "$GATE_OUTPUT" "1 build check(s) have passed so far" \
+    "the line should still say what passed"
+  assert_not_contains "$GATE_OUTPUT" "green — " "a queued sibling must not read as green"
+}
+
+# Round 2, P1: a workflow that fails before its jobs start leaves no check run to be red. The check
+# list cannot show it, so the run list has to.
+test_checkless_red_run_is_red() {
+  local concl
+  for concl in startup_failure failure timed_out; do
+    reset_fixture
+    RUNS_SEQ=("$(runs_json "$(jq -cn --arg c "$concl" \
+      '[{name:"ci", status:"completed", conclusion:$c}]')")")
+    run_gate
+    assert_eq "$GATE_RC" 1 "a checkless $concl run is a red build signal"
+    assert_contains "$GATE_OUTPUT" ": RED" "a checkless $concl run should headline RED"
+    assert_contains "$GATE_OUTPUT" "ci ($concl)" "the red run should be named"
+    assert_not_contains "$GATE_OUTPUT" ": ABSENT" "a red run must not print ABSENT"
+  done
+}
+
+# ... and it outranks a green check on the same head, for the same reason: nothing in the check
+# list can carry that run's failure.
+test_checkless_red_run_outranks_a_green_check() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"a","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"a","status":"completed","conclusion":"success"},
+                           {"name":"b","status":"completed","conclusion":"startup_failure"}]')")
+  run_gate
+  assert_eq "$GATE_RC" 1 "a checkless red sibling is red, not green"
+  assert_contains "$GATE_OUTPUT" "b (startup_failure)" "the red sibling should be named"
+}
+
+# A red in the check list is a verdict the fold already has; the run list adds nothing to it.
+test_red_checks_never_consult_the_run_list() {
   reset_fixture
   CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ci","conclusion":"failure","html_url":"u"}]')")
   run_gate
   assert_eq "$GATE_RC" 1 "a failed check is red"
   assert_contains "$GATE_OUTPUT" "RED" "red should headline RED"
   assert_not_contains "$(cat "$REQUEST_LOG")" "actions/runs" \
-    "a red commit should not need the run list"
+    "a red check list should not need the run list"
+}
+
+# Round 2, P2: a head with a long re-run history can push a queued run off the first page.
+test_run_lookup_is_paginated() {
+  reset_fixture
+  run_gate
+  assert_contains "$(cat "$PAGINATE_LOG")" "actions/runs" \
+    "the run lookup should ask for every page"
 }
 
 # --wait must hold through the not-created-yet window and then read the verdict that appears,
@@ -346,7 +407,10 @@ test_old_commit_freshly_pushed_waits() {
   PR_UPDATED_AGE=20
   run_gate
   assert_eq "$GATE_RC" 4 "a day-old commit pushed 20s ago is inside the creation window"
-  assert_contains "$GATE_OUTPUT" "at most 20s" "the fresher clock should be the one reported"
+  assert_contains "$GATE_OUTPUT" "in place at most 2" \
+    "the fresher clock (~20s) should be the one reported, not the day-old commit date"
+  assert_not_contains "$GATE_OUTPUT" "in place at most 1440m" \
+    "the committer date must not be the clock here"
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" \
     "a freshly pushed old commit must not print ABSENT"
 }
@@ -386,8 +450,12 @@ tests=(
   test_old_commit_freshly_pushed_waits
   test_old_commit_and_quiet_pr_is_absent
   test_unreadable_commit_still_decides_on_the_pr_clock
-  test_green_never_consults_the_run_list
-  test_red_never_consults_the_run_list
+  test_green_over_finished_runs_is_green
+  test_green_over_a_queued_sibling_is_not_green
+  test_checkless_red_run_is_red
+  test_checkless_red_run_outranks_a_green_check
+  test_red_checks_never_consult_the_run_list
+  test_run_lookup_is_paginated
   test_wait_holds_until_the_checks_appear
   test_wait_ceiling_with_a_queued_run_is_no_verdict
 )

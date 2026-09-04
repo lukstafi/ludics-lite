@@ -368,9 +368,9 @@ The other verdicts are not refusals, and none of them is a green light either:
 | --- | --- | --- |
 | 0 | green | every build check on the head passed |
 | 0 | absent | no build check ran on this commit, and the run list confirms none is coming — path filters (ocannl's `ci` ignores `docs/**`), or CI never started |
-| 1 | RED | a build check concluded `failure` — refused |
-| 3 | unknown | the checks could not be read — refused |
-| 4 | no verdict | still running, every finished job was `cancelled`, or the head's run has not created its checks yet — refused without `--allow-no-verdict` |
+| 1 | RED | a build check concluded `failure`, or a workflow run for the head concluded red without producing one — refused |
+| 3 | unknown | the checks or the head's runs could not be read — refused |
+| 4 | no verdict | still running, every finished job was `cancelled`, or a run for the head is queued, stopped without a verdict, or has yet to create its checks — refused without `--allow-no-verdict` |
 
 **Exit 4 refuses too, by default.** Nothing has failed, but nothing has passed, and a merge that
 waits for neither read nothing — it was a warning until 2026-08-23, when a day-long runner queue
@@ -389,15 +389,24 @@ wait again instead.
 **`ABSENT` seconds after a push used to be the trap here** — a push (a rebase before merging, or
 any other) creates a head whose checks do not EXIST yet, and a wait armed in that window saw
 nothing to wait for and passed the gate having read nothing (ocannl staging#491 merged that way).
-The gate now reads that distinction itself (ludics-lite#24): an absence is confirmed against
-`actions/runs?head_sha=`, so a queued or running workflow for the head is exit 4 like any other
-unfinished build, a run that completed `cancelled`/`stale`/`action_required` with nothing behind it
-is exit 4 like every other stopped-not-judged run, and any absence at all holds while the head is
-inside `SHIP_PR_BASE_ABSENT_GRACE` (300s, measured from the fresher of the head's commit date and
-the PR's own `updated_at`, so a long-local commit pushed just now still counts as fresh). `ABSENT`
-is reported only past that, with the evidence on the line. No hand re-check, and no `--wait` needed
-for it: without one the same window is exit 4, not 0. The knob is there for a repo whose runs take
-longer than five minutes to appear.
+The gate now reads that window itself (ludics-lite#24). The check list is only half the signal —
+a run row exists from the moment a run is queued, before any of its check runs — so whenever the
+checks leave nothing to wait for (green as well as absent), the gate reads
+`actions/runs?head_sha=` and lets it overrule them:
+
+- a queued or running non-advisory run is exit 4, **including under a green check** — one
+  workflow's green says nothing about a sibling that has not judged the head;
+- a run that concluded red without producing a check (a broken workflow file `startup_failure`,
+  say) is exit 1 — nothing in the check list can carry that failure;
+- a run that completed `cancelled`/`stale`/`action_required` with nothing behind it is exit 4,
+  stopped-not-judged like everywhere else;
+- a **checkless** head holds while it is inside `SHIP_PR_BASE_ABSENT_GRACE` (300s, measured from
+  the fresher of the head's commit date and the PR's own `updated_at`, so a long-local commit
+  pushed just now still counts as fresh), and only past that is `ABSENT` the verdict — with the
+  evidence on the line.
+
+No hand re-check, and no `--wait` needed for any of it: without one the same window is exit 4, not
+0. The knob is there for a repo whose runs take longer than five minutes to appear.
 
 The trap that remains is at the other end of the hold: **the harness can kill a backgrounded
 `merge --wait` well before its ceiling** (observed twice at ~40 min). The correct response is to

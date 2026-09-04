@@ -181,13 +181,13 @@ which an iteration budget did not (`WAKE_LAB_WAIT_SECONDS`, `WAKE_LAB_WSL_WAIT_S
 `WAKE_LAB_DOWN_WAIT_SECONDS` are what let the suite ask for a one-second one).
 
 `test-pr-review-checks-absent.sh` drives the build gate against a canned Actions API, one answer
-per polling round, and pins the split the word ABSENT used to hide. Exit 4 (no verdict): a queued
-or running workflow for the head, a run that completed stopped-not-judged with nothing behind it,
-and any absence while the head is still inside `SHIP_PR_BASE_ABSENT_GRACE` — measured from the
-fresher of the commit date and the PR's `updated_at`, so a long-local commit pushed a moment ago
-counts as fresh, and one finished workflow does not settle the question for a sibling whose run
-row has yet to appear. Exit 0 (the absence itself) only past that grace. A second read that fails
-is exit 3, never a reassuring 0.
+per polling round, and pins everything the check list alone cannot say about a head. Exit 4 (no
+verdict): a queued or running workflow — including under a green check from a sibling workflow — a
+run that completed stopped-not-judged with nothing behind it, and a checkless head still inside
+`SHIP_PR_BASE_ABSENT_GRACE`, measured from the fresher of the commit date and the PR's
+`updated_at` so a long-local commit pushed a moment ago counts as fresh. Exit 1: a run that
+concluded red without producing a check to be red. Exit 0: green over a finished, judged run list,
+and the absence itself once the grace is spent. A read that fails is exit 3, never a reassuring 0.
 
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and
