@@ -363,7 +363,14 @@ The coordinator's job between launch and last merge:
   not to defer ("filing bugs against myself"). When a reviewer approves only by finding
   nothing and the last rounds are confined to review-requested machinery, pre-authorize
   merge-on-substance: CI green on the final head, every thread answered with its
-  classification, and a review-record paragraph in the PR body. Expect good workers to push
+  classification, and a review-record paragraph in the PR body. Ship-pr carries the exits a
+  worker reaches WITHOUT you (its *When the loop ends*, from ludics-lite#12: a round rebutted
+  in full, two consecutive rounds confined to review-introduced machinery, and a ceiling of 12
+  rounds with findings that `pr-review.sh rounds` reads off the PR), so a standalone worker
+  no longer runs unbounded; your pre-authorization moves close-out earlier than those exits,
+  never later. The option to name explicitly is *removal* — delete the lock or rollback a
+  round introduced rather than harden it a fourth time — because a worker fixing "bugs
+  against itself" does not take it on its own. Expect good workers to push
   back on your framing with verified evidence - the wave's best worker corrected the
   coordinator's premise three times, correctly each time; endorse that, don't override it.
   Pair it with **one push per CI cycle** in late rounds - every push supersedes the ubuntu leg

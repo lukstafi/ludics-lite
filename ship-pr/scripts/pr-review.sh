@@ -101,7 +101,11 @@
 #                                          # new comments/reviews above the watermark; prints next
 #   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands; 0 = act, 1 = quiet
 #   pr-review.sh status <pr>               # merge gate + who owes what: approved / reviewing /
-#                                          # stalled / expected / idle / unknown
+#                                          # stalled / expected / idle / unknown — and the round
+#                                          # count against the ceiling (see `rounds`)
+#   pr-review.sh rounds <pr>               # how many review rounds carried findings, read off the
+#                                          # PR (heads the reviewer left comments on), against
+#                                          # SHIP_PR_ROUND_CAP; exit 1 at or past the ceiling
 #   pr-review.sh checks <pr> [--wait]      # the BUILD signal on the head commit: green / red /
 #                                          # no verdict yet / absent
 #   pr-review.sh merge <pr> [--override "<why this red is unrelated>"] [--wait]
@@ -156,12 +160,15 @@
 #      before settling for an older verdict (300; paths-ignore pushes never get one),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences the commit-count warning). A nonempty file overlap still warns at any count; no
-#      base-drift warning blocks the merge.
+#      base-drift warning blocks the merge. SHIP_PR_ROUND_CAP=review rounds with findings at
+#      which the loop closes out instead of fixing on (12; the ceiling of ship-pr's "When the
+#      loop ends" — `rounds` and `status` report the count against it, nothing here enforces it).
 
 set -uo pipefail
 
 REPO="${REPO:-}"
 REVIEWER="${REVIEWER:-chatgpt-codex-connector}"
+ROUND_CAP="${SHIP_PR_ROUND_CAP:-12}"
 STATE_DIR="${SHIP_PR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ship-pr}"
 CACHE="$STATE_DIR/repo-by-pr"
 
@@ -754,11 +761,79 @@ status_line() {
   esac
 }
 
+# How many review rounds have carried findings, read off the PR rather than remembered: a session
+# that has been compacted twice cannot say what round it is in, and the convergence policy (the
+# skill's "When the loop ends") needs the number. A round with findings is a set of COMMENTED
+# reviews the reviewer submitted against one head, so the count is the number of DISTINCT heads
+# that carry such reviews. A re-requested round on the same head that found more collapses into
+# the first — the count errs low, which is the safe direction for a ceiling. Your own replies
+# land in the same feed as COMMENTED reviews, hence the login filter; PENDING reviews have no
+# submitted_at and are not a round. Prints ONE line, "<count>|<detail>", and always exits 0:
+# a count of "unknown" carries the failure, and is NOT "no rounds yet".
+review_rounds() {
+  local pr="$1" raw line
+  raw=$(api_list "pulls/$pr/reviews?per_page=100") || {
+    echo "unknown|the reviews API did not answer ($(gh_err_line))"
+    return 0
+  }
+  line=$(jq -r --arg rev "$REVIEWER" '
+      [.[] | select((.user.login // "") | startswith($rev))
+           | select(.submitted_at != null)
+           | select(.state == "COMMENTED" or .state == "CHANGES_REQUESTED")
+           | (.commit_id // "")] | unique | map(select(. != "")) | length' \
+    <<<"$raw" 2>/dev/null) || {
+    echo "unknown|the reviews feed did not parse"
+    return 0
+  }
+  case "$line" in
+  '' | *[!0-9]*) echo "unknown|the reviews feed did not parse" ;;
+  *) echo "$line|$line head(s) carry $REVIEWER findings" ;;
+  esac
+}
+
+# The count against the ceiling, on one line; exit 0 under it, 1 at or past it, 3 unread. The
+# ceiling is the skill's, not this script's: nothing here refuses a merge over it. It exists so
+# the session reads "round 12 of 12" off the PR instead of believing it is at round 6.
+rounds_line() {
+  local count detail
+  count="${1%%|*}"
+  detail="${1#*|}"
+  case "$count" in
+  unknown)
+    echo "review rounds: UNKNOWN — $detail; this is NOT 'no rounds yet', retry"
+    return 3
+    ;;
+  esac
+  case "$ROUND_CAP" in
+  '' | off | *[!0-9]*)
+    echo "review rounds with findings: $count ($detail); no ceiling set"
+    return 0
+    ;;
+  esac
+  if [ "$count" -ge "$ROUND_CAP" ]; then
+    echo "review rounds with findings: $count of $ROUND_CAP — AT THE CEILING: close out (fix," \
+      "remove, or defer every open finding; merge on substance or raise it with the user), do" \
+      "not fix on ($detail)"
+    return 1
+  fi
+  echo "review rounds with findings: $count of $ROUND_CAP ($detail)"
+  return 0
+}
+
+cmd_rounds() {
+  pr_arg "${1:?usage: rounds <pr>}"
+  rounds_line "$(review_rounds "$PR_NUM")"
+}
+
 cmd_status() {
   pr_arg "${1:?usage: status <pr>}"
   local state
   state=$(status_state "$PR_NUM")
   status_line "$state"
+  # The round count rides along so the convergence policy is always in view; it never changes
+  # this command's exit code — the merge gate is the state, and an unread count is reported as
+  # such on its own line rather than turning an approval into an "unknown".
+  rounds_line "$(review_rounds "$PR_NUM")" || true
   # Exit 3 on unknown so a caller gating a merge on `status` cannot read a failed read as a quiet
   # "not approved yet" — the same collapse api_list refuses to make. 3 rather than 2, because a
   # usage error (2) is the caller's to fix and this one is the API's to recover from.
@@ -2040,6 +2115,7 @@ main() {
   poll) shift && cmd_poll "$@" ;;
   watch) shift && cmd_watch "$@" ;;
   status) shift && cmd_status "$@" ;;
+  rounds) shift && cmd_rounds "$@" ;;
   checks) shift && cmd_checks "$@" ;;
   merge) shift && cmd_merge "$@" ;;
   base) shift && cmd_base "$@" ;;
@@ -2047,7 +2123,7 @@ main() {
   resolve) shift && cmd_resolve "$@" ;;
   comment) shift && cmd_comment "$@" ;;
   retry) shift && cmd_retry "$@" ;;
-  *) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|checks|merge|reply|resolve} <pr> ...
+  *) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|rounds|checks|merge|reply|resolve} <pr> ...
   pr-review.sh comment <pr> <body>           # a plain PR comment (a summary round, a review nudge)
   pr-review.sh base [owner/name] [branch] [--wait]  # is the base branch's CI green? (start of
                                              # work; --wait = post-merge integration read)

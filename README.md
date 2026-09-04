@@ -151,10 +151,11 @@ The shell scripts carry their own test suites:
 issue-wave/scripts/test-fleet-worker.sh
 ship-pr/scripts/test-post-merge-cleanup.sh
 ship-pr/scripts/test-pr-review-base-drift.sh
+ship-pr/scripts/test-pr-review-rounds.sh
 scripts/test-wake-lab.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all four on Ubuntu and
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all five on Ubuntu and
 macOS (the fleet's bash is 3.2) for every push and pull request, along with `bash -n`, shellcheck
 at error severity, and a check that the two cleanup scripts still carry their parse guard. It runs
 without path filters, so every PR's merge gate reads a verdict rather than `ABSENT`.
