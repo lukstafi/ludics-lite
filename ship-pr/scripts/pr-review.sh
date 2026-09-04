@@ -857,6 +857,14 @@ conflict_note() {
     printf '%s' "mergeability UNREAD (the PR read did not answer): whether this PR conflicts with" \
       " its base is unknown, which is not 'no' — retry status before acting on this line"
     ;;
+  # GitHub recomputes the mergeability after every push and reports `unknown` for the seconds it
+  # takes, so the first status after the push that CAUSED a conflict reads exactly like a clean
+  # one. Not a conflict, and not a clean bill of health either.
+  unknown)
+    printf '%s' "mergeability NOT YET COMPUTED (mergeable_state=unknown, GitHub recomputes it" \
+      " after every push): a conflict this push caused would not show yet — re-read status in a" \
+      " minute"
+    ;;
   esac
   return 0
 }
@@ -864,11 +872,12 @@ conflict_note() {
 # Takes a whole state line, not a token: the age and the detail are what make the difference between
 # "wait it out" and "nothing is coming" legible to whoever reads the log.
 status_line() {
-  local tok age detail conflict
+  local tok age detail merge conflict
   tok=$(state_tok "$1")
   age=$(state_age "$1")
   detail=$(state_detail "$1")
-  conflict=$(conflict_note "$(state_merge "$1")")
+  merge=$(state_merge "$1")
+  conflict=$(conflict_note "$merge")
   case "$tok" in
   approved) echo "approved ($detail)${conflict:+; $conflict}" ;;
   reviewing) echo "reviewing — $detail, running $(fmt_age "$age") — wait it out${conflict:+; $conflict}" ;;
@@ -879,8 +888,15 @@ status_line() {
     "reviewer's existing 👍${conflict:+; $conflict}" ;;
   expected) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")${conflict:+; $conflict}" ;;
   # "The next move is yours" is exactly the line that sent #39 into seven untested rounds: on a
-  # conflicted PR the move is the base merge, and saying anything else invites another push.
-  idle) echo "nothing in flight — $detail, and no 👍; ${conflict:-the next move is yours}" ;;
+  # conflicted PR the move is the base merge, and saying anything else invites another push. Only
+  # a KNOWN conflict takes the move away, though: a mergeability still being computed leaves the
+  # move where it was and rides along as a caveat.
+  idle)
+    case "$merge" in
+    dirty) echo "nothing in flight — $detail, and no 👍; $conflict" ;;
+    *) echo "nothing in flight — $detail, and no 👍; the next move is yours${conflict:+; $conflict}" ;;
+    esac
+    ;;
   unknown) echo "UNKNOWN — $detail; this is NOT 'not approved', retry${conflict:+; $conflict}" ;;
   *) echo "unrecognised state '$tok' — treat as unknown and retry" ;;
   esac
