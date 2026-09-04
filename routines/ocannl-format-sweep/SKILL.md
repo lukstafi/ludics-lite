@@ -8,8 +8,8 @@ Run OCANNL's automated formatting sweep.
 Working directory: /Users/lukstafi/ocannl-staging (the main checkout — not a worktree under .claude/worktrees/).
 
 Use `~/.ocannl-test-runs/format-sweep-scheduled.tsv` as the scheduled run's cross-run ledger. Before
-invoking the sweep, create its parent directory if needed and read the ledger's last line (no line means
-there is no previous run). After the run's final outcome is known — including after any repair and retry
+invoking the sweep, create its parent directory and an empty ledger file if either is absent, then read
+the ledger's last line (an empty file means there is no previous run). After the run's final outcome is known — including after any repair and retry
 in step 3 — append exactly one tab-separated line before reporting:
 `<UTC timestamp>\t<outcome key>\t<one-line report>`. Keep the fields themselves on one line and free of
 tabs. The outcome key is the stable quoted outcome category from step 2; for "not a quiet period", add
