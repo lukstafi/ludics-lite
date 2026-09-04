@@ -26,21 +26,23 @@ FORWARD_JSON=""
 REVERSE_JSON=""
 FAIL_DIRECTION=""
 
-fail() {
+# Not `fail`: pr-review.sh is sourced above and its refusals call ITS fail, whose exit code these
+# tests read; a same-named helper here would turn every refusal into this reporter's 1.
+bail() {
   echo "FAIL: $*" >&2
   exit 1
 }
 
 assert_eq() {
-  [ "$1" = "$2" ] || fail "$3 (got '$1', expected '$2')"
+  [ "$1" = "$2" ] || bail "$3 (got '$1', expected '$2')"
 }
 
 assert_contains() {
-  case "$1" in *"$2"*) ;; *) fail "$3 (missing '$2' in: $1)" ;; esac
+  case "$1" in *"$2"*) ;; *) bail "$3 (missing '$2' in: $1)" ;; esac
 }
 
 assert_not_contains() {
-  case "$1" in *"$2"*) fail "$3 (unexpected '$2' in: $1)" ;; *) ;; esac
+  case "$1" in *"$2"*) bail "$3 (unexpected '$2' in: $1)" ;; *) ;; esac
 }
 
 compare_json() {
@@ -60,7 +62,7 @@ set_compares() {
 # stable base/head snapshot, while compare responses are deliberately parsed by local jq.
 gh() {
   local endpoint="" filter="" response="" arg
-  [ "${1:-}" = api ] || fail "fixture received non-api gh call: $*"
+  [ "${1:-}" = api ] || bail "fixture received non-api gh call: $*"
   shift
   endpoint="${1:-}"
   shift || true
@@ -91,7 +93,7 @@ gh() {
     fi
     response="$REVERSE_JSON"
     ;;
-  *) fail "unexpected fixture endpoint: $endpoint" ;;
+  *) bail "unexpected fixture endpoint: $endpoint" ;;
   esac
   if [ -n "$filter" ]; then
     jq -r "$filter" <<<"$response"
