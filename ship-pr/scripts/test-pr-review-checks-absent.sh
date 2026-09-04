@@ -54,7 +54,13 @@ PR_UPDATED_AGE=""
 FAIL_ENDPOINT=""
 
 check_runs_json() { jq -cn --argjson runs "$1" '{check_runs:$runs}'; }
-runs_json() { jq -cn --argjson runs "$1" '{workflow_runs:$runs}'; }
+# Each row gets a distinct workflow_id unless the case names one, because the gate folds the run
+# list per workflow and a shared id means "these are the same workflow's runs" — which is what the
+# superseded-run cases below say deliberately. Rows are newest-first, as the API returns them.
+runs_json() {
+  jq -cn --argjson runs "$1" \
+    '{workflow_runs: [$runs | to_entries[] | .value + {workflow_id: (.value.workflow_id // (.key + 1))}]}'
+}
 iso_ago() { jq -rn --argjson n "$1" '(now - $n) | todateiso8601'; }
 
 # Pops the next canned answer, and repeats the last one forever after: the round count is the
@@ -321,6 +327,112 @@ test_red_checks_never_consult_the_run_list() {
     "a red check list should not need the run list"
 }
 
+# Round 3 of the review, P1: a pending or cancelled check on one workflow while a sibling has
+# already concluded red without producing a check. Reporting 4 there would let --allow-no-verdict
+# merge a failed head without facing the red-build --override.
+test_checkless_red_run_outranks_a_pending_check() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"a","conclusion":null,"html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"a","status":"in_progress","conclusion":null},
+                           {"name":"b","status":"completed","conclusion":"startup_failure"}]')")
+  run_gate
+  assert_eq "$GATE_RC" 1 "a checkless red sibling outranks a still-running check"
+  assert_contains "$GATE_OUTPUT" ": RED" "the pending fold should still headline RED"
+  assert_contains "$GATE_OUTPUT" "b (startup_failure)" "the red sibling should be named"
+}
+
+test_checkless_red_run_outranks_a_stopped_check() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"a","conclusion":"cancelled","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"a","status":"completed","conclusion":"cancelled"},
+                           {"name":"b","status":"completed","conclusion":"failure"}]')")
+  run_gate
+  assert_eq "$GATE_RC" 1 "a checkless red sibling outranks a stopped-not-judged fold"
+  assert_contains "$GATE_OUTPUT" "b (failure)" "the red sibling should be named"
+}
+
+# An unread run list cannot rule out such a red, so even a plainly pending fold is UNKNOWN rather
+# than the milder 4 it could have claimed on its own.
+test_pending_with_an_unreadable_run_list_is_unknown() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"a","conclusion":null,"html_url":"u"}]')")
+  FAIL_ENDPOINT="*actions/runs*"
+  run_gate
+  assert_eq "$GATE_RC" 3 "an unread run list under a pending fold is unknown"
+  assert_contains "$GATE_OUTPUT" "UNKNOWN" "it should say UNKNOWN"
+}
+
+# Round 3, P1: build_checks accepts every provider's check runs, so an early non-Actions green
+# proves nothing about whether Actions has created its rows.
+test_non_actions_check_without_runs_keeps_the_grace() {
+  reset_fixture
+  COMMIT_AGE=20
+  PR_UPDATED_AGE=20
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"codecov","conclusion":"success","html_url":"u"}]')")
+  run_gate
+  assert_eq "$GATE_RC" 4 "a green app check with no Actions run yet is not a build verdict"
+  assert_contains "$GATE_OUTPUT" "run-creation grace" "the hold should name the grace"
+  assert_not_contains "$GATE_OUTPUT" "green — " "an unbacked green must not read as green"
+}
+
+test_non_actions_check_past_the_grace_is_green() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"codecov","conclusion":"success","html_url":"u"}]')")
+  run_gate
+  assert_eq "$GATE_RC" 0 "past the grace the check fold's own verdict stands"
+  assert_contains "$GATE_OUTPUT" "green — 1 build checks passed" "green should headline green"
+}
+
+# Round 3, P2: several runs of ONE workflow at one head — a queued invocation cancelled, then a
+# fresh one. Only the newest counts, as `filter=latest` does for the check list.
+test_superseded_stopped_run_does_not_hold() {
+  reset_fixture
+  RUNS_SEQ=("$(runs_json '[{"workflow_id":7,"name":"ci","status":"completed","conclusion":"success"},
+                           {"workflow_id":7,"name":"ci","status":"completed","conclusion":"cancelled"}]')")
+  run_gate
+  assert_eq "$GATE_RC" 0 "a superseded cancelled run must not park the gate at no-verdict"
+  assert_not_contains "$GATE_OUTPUT" "stopped-not-judged" \
+    "the superseded row should not be the one classified"
+}
+
+test_superseded_red_run_does_not_stay_red() {
+  reset_fixture
+  RUNS_SEQ=("$(runs_json '[{"workflow_id":7,"name":"ci","status":"completed","conclusion":"success"},
+                           {"workflow_id":7,"name":"ci","status":"completed","conclusion":"failure"}]')")
+  run_gate
+  assert_eq "$GATE_RC" 0 "a superseded failure must not hold the gate red"
+  assert_not_contains "$GATE_OUTPUT" ": RED" "the superseded row should not be the one classified"
+}
+
+test_newest_run_of_a_workflow_still_counts() {
+  reset_fixture
+  RUNS_SEQ=("$(runs_json '[{"workflow_id":7,"name":"ci","status":"completed","conclusion":"failure"},
+                           {"workflow_id":7,"name":"ci","status":"completed","conclusion":"success"}]')")
+  run_gate
+  assert_eq "$GATE_RC" 1 "the newest run of a workflow is the one that counts"
+  assert_contains "$GATE_OUTPUT" "ci (failure)" "the newest row should be the one classified"
+}
+
+# Round 3, P2: a committer date in the future (clock skew, an explicit GIT_COMMITTER_DATE) is the
+# newest timestamp there is, and its age is unreadable. The PR clock must still decide.
+test_future_commit_date_falls_back_to_the_pr_clock() {
+  reset_fixture
+  COMMIT_AGE=-86400
+  PR_UPDATED_AGE=7200
+  run_gate
+  assert_eq "$GATE_RC" 0 "a future commit date must not block the absence verdict"
+  assert_contains "$GATE_OUTPUT" ": ABSENT" "the PR clock should carry it past the grace"
+}
+
+test_future_commit_date_still_holds_a_fresh_pr() {
+  reset_fixture
+  COMMIT_AGE=-86400
+  PR_UPDATED_AGE=20
+  run_gate
+  assert_eq "$GATE_RC" 4 "a fresh PR clock still holds under a future commit date"
+  assert_contains "$GATE_OUTPUT" "run-creation grace" "the hold should name the grace"
+}
+
 # Round 2, P2: a head with a long re-run history can push a queued run off the first page.
 test_run_lookup_is_paginated() {
   reset_fixture
@@ -456,6 +568,16 @@ tests=(
   test_checkless_red_run_outranks_a_green_check
   test_red_checks_never_consult_the_run_list
   test_run_lookup_is_paginated
+  test_checkless_red_run_outranks_a_pending_check
+  test_checkless_red_run_outranks_a_stopped_check
+  test_pending_with_an_unreadable_run_list_is_unknown
+  test_non_actions_check_without_runs_keeps_the_grace
+  test_non_actions_check_past_the_grace_is_green
+  test_superseded_stopped_run_does_not_hold
+  test_superseded_red_run_does_not_stay_red
+  test_newest_run_of_a_workflow_still_counts
+  test_future_commit_date_falls_back_to_the_pr_clock
+  test_future_commit_date_still_holds_a_fresh_pr
   test_wait_holds_until_the_checks_appear
   test_wait_ceiling_with_a_queued_run_is_no_verdict
 )

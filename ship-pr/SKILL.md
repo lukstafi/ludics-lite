@@ -394,16 +394,24 @@ a run row exists from the moment a run is queued, before any of its check runs �
 checks leave nothing to wait for (green as well as absent), the gate reads
 `actions/runs?head_sha=` and lets it overrule them:
 
+- a run that concluded red without producing a check (a broken workflow file's `startup_failure`,
+  say) is exit 1 — nothing in the check list can carry that failure, and it outranks a green,
+  pending or stopped check on the same head;
 - a queued or running non-advisory run is exit 4, **including under a green check** — one
   workflow's green says nothing about a sibling that has not judged the head;
-- a run that concluded red without producing a check (a broken workflow file `startup_failure`,
-  say) is exit 1 — nothing in the check list can carry that failure;
 - a run that completed `cancelled`/`stale`/`action_required` with nothing behind it is exit 4,
   stopped-not-judged like everywhere else;
+- a head with no Actions run to back its checks holds too: `build_checks` accepts every provider's
+  check runs, so an early Codecov green is not evidence that Actions has created its rows;
 - a **checkless** head holds while it is inside `SHIP_PR_BASE_ABSENT_GRACE` (300s, measured from
-  the fresher of the head's commit date and the PR's own `updated_at`, so a long-local commit
-  pushed just now still counts as fresh), and only past that is `ABSENT` the verdict — with the
-  evidence on the line.
+  the fresher of the head's commit date and the PR's own `updated_at` — each validated on its own,
+  so a long-local commit pushed just now counts as fresh and a future commit date does not blind
+  the gate), and only past that is `ABSENT` the verdict — with the evidence on the line.
+
+Only the newest run of each workflow is judged, the same `filter=latest` semantics the check
+lookup asks for: a queued invocation that was cancelled and then re-triggered must not park the
+gate on the superseded row. A run list that cannot be read is exit 3 even under a pending check —
+an unread run list cannot rule out a red that no check run will ever carry.
 
 No hand re-check, and no `--wait` needed for any of it: without one the same window is exit 4, not
 0. The knob is there for a repo whose runs take longer than five minutes to appear.

@@ -128,7 +128,8 @@
 #
 # Exit codes: 0 the command did what it says (and any fact it printed came from a call that
 #             answered); 1 the fact does not hold (the window stayed quiet, no such thread, the API
-#             rejected the request, a build check is RED, the merge was refused); 2
+#             rejected the request, a build check or a checkless workflow run is RED, the merge was
+#             refused); 2
 #             usage/configuration error; 3 TRANSPORT failure — nothing was learned, so retry rather
 #             than concluding anything. 1 and 3 are kept apart everywhere. `checks`, `base` and
 #             `merge` add 4: no verdict yet — the build has not finished, every finished job was
@@ -1391,20 +1392,31 @@ run_reason() {
 }
 
 run_signal() {
-  local sha="$1" pr_at="${2:-}" checks="${3:-0}" raw rc name status concl
-  local runs=0 inflight=0 nogo=0 red=0 red_note="" pushed_at age seen
+  local sha="$1" pr_at="${2:-}" checks="${3:-0}" raw rc wid name status concl seen_ids=" "
+  local runs=0 inflight=0 nogo=0 red=0 red_note="" pushed_at age pr_age t seen
   raw=$(gh_retry read api --paginate \
     "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
-    --jq '.workflow_runs[] | [(.name // "-"), (.status // "unknown"), (.conclusion // "pending")]
-          | @tsv')
+    --jq '.workflow_runs[] | [((.workflow_id // 0) | tostring), (.name // "-"),
+          (.status // "unknown"), (.conclusion // "pending")] | @tsv')
   rc=$?
   [ "$rc" -eq 0 ] || {
     run_reason 0 "the workflow runs for this head could not be read ($(gh_err_line))"
     return 3
   }
-  while IFS=$'\t' read -r name status concl; do
-    [ -n "$name" ] || continue
+  # One row per WORKFLOW, the newest — the same `filter=latest` semantics build_checks asks the
+  # check API for, and for the same reason: a head can carry several runs of one workflow (a
+  # queued invocation cancelled, then a fresh one that passed), and the superseded row's
+  # conclusion is not the current answer. Without this an old cancelled row parks the gate at 4
+  # forever and an old checkless failure holds it RED over a workflow that has since gone green
+  # (ludics-lite#38, round 3). The feed is newest-first, which is what cmd_base's fold relies on
+  # too, so the first row seen for a workflow id is the one that counts. The id leads the row
+  # because two workflow FILES can share a display name, and a name-keyed fold would collapse
+  # them into one.
+  while IFS=$'\t' read -r wid name status concl; do
+    [ -n "$wid" ] || continue
     is_advisory "$name" && continue
+    case "$seen_ids" in *" $wid "*) continue ;; esac
+    seen_ids="$seen_ids$wid "
     runs=$((runs + 1))
     if [ "$status" != completed ]; then
       inflight=$((inflight + 1))
@@ -1438,10 +1450,15 @@ run_signal() {
       " not a verdict: re-run the workflow"
     return 4
   fi
-  # Every run for this head is finished and judged. With checks in hand, the fold above has read
-  # them and its verdict stands.
+  # Every run for this head is finished and judged. With checks in hand AND at least one Actions
+  # run behind them, the fold above has read the signal and its verdict stands — run rows for one
+  # event are created together, so a head showing a run has had its rows created, and holding
+  # every fresh green head for the grace would buy nothing. Checks from a NON-Actions provider
+  # prove nothing about that (build_checks deliberately accepts every provider's check runs), so
+  # an early Codecov green over an empty run list falls through to the grace like any other
+  # checkless head (ludics-lite#38, round 3).
   case "$checks" in '' | *[!0-9]*) checks=0 ;; esac
-  if [ "$checks" -gt 0 ]; then
+  if [ "$checks" -gt 0 ] && [ "$runs" -gt 0 ]; then
     run_reason 0 "$runs workflow run(s) for this head are finished and judged"
     return 0
   fi
@@ -1457,14 +1474,23 @@ run_signal() {
   # grace of holding after unrelated PR activity, the safe direction for a merge gate.
   pushed_at=$(gh_retry read api "repos/$REPO/commits/$sha" --jq .commit.committer.date) ||
     pushed_at=""
-  age=$(age_of "$(newest "$pushed_at" "$pr_at")")
-  case "$age" in
-  '' | *[!0-9]*)
-    run_reason 0 "no build check is on this head and neither its commit date nor the PR's" \
-      " updated_at could be read ($(gh_err_line)), so the run-creation window is unknown"
+  # Each clock validated on its OWN, then the freshest of what survives — not `newest` over the
+  # raw timestamps. A committer date in the FUTURE (clock skew, or an explicit GIT_COMMITTER_DATE)
+  # is the newest string there is, and age_of answers a negative age with "-", so picking it would
+  # throw away a perfectly good PR clock and leave the gate UNKNOWN until wall time caught up —
+  # for hours, on a path-filtered PR that has no other way past this branch (round 3).
+  age=""
+  pr_age=$(age_of "$pr_at")
+  for t in "$(age_of "$pushed_at")" "$pr_age"; do
+    case "$t" in '' | *[!0-9]*) continue ;; esac
+    [ -n "$age" ] && [ "$age" -le "$t" ] || age="$t"
+  done
+  if [ -z "$age" ]; then
+    run_reason 0 "no usable clock for this head: neither its commit date nor the PR's updated_at" \
+      " could be read ($(gh_err_line)), or both are in the future, so the run-creation window" \
+      " is unknown"
     return 3
-    ;;
-  esac
+  fi
   if [ "$runs" -gt 0 ]; then
     seen="$runs workflow run(s) for this head finished and left no build check behind"
   else
@@ -1518,12 +1544,16 @@ gate_checks() {
       return 3
     fi
     summarize_checks "$lines"
-    # Whenever the checks leave nothing to wait for, the run list gets the deciding read: green can
-    # be green over a sibling run that has not judged the head, and an absence can be a run whose
-    # checks do not exist yet. This happens with no --wait too, where the honest answer to "is
-    # there a signal here" is 4, not a 0 the merge gate would take for "nothing is red".
-    case "$VERDICT" in
-    green | absent)
+    # Every fold but a red one gets the run list's deciding read. Green can be green over a
+    # sibling that has not judged the head; an absence can be a run whose checks do not exist yet;
+    # and a PENDING or MIXED fold can be sitting on a sibling that already concluded red without
+    # producing a check — where reporting 4 lets `--allow-no-verdict` merge a failed head without
+    # ever facing the red-build --override, and makes --wait sit out the other check before
+    # finding out (ludics-lite#38, round 3). Only a red fold is skipped: it is already the
+    # strongest verdict, and a second read cannot add to it. This happens with no --wait too,
+    # where the honest answer to "is there a signal here" is 4, not a 0 the merge gate would take
+    # for "nothing is red".
+    if [ "$VERDICT" != red ]; then
       run_info=$(run_signal "$sha" "$pr_at" "$CHECK_TOTAL")
       rc=$?
       run_why="${run_info#*$'\t'}"
@@ -1533,15 +1563,17 @@ gate_checks() {
         CHECK_RED="${run_info%%$'\t'*}"
         ;;
       3)
+        # UNKNOWN even over a pending fold, which would otherwise be an honest 4 on its own: an
+        # unread run list cannot rule out a red that no check run will ever carry, and this file
+        # does not report a signal it failed to read as a milder one.
         VERDICT=unknown
         warn "could not read the workflow runs of $REPO#$pr @${sha:0:8} ($run_why); the checks" \
           "alone are not the build signal, so this is UNKNOWN, which is NOT 'nothing is red'."
         return 3
         ;;
-      4) VERDICT=unjudged ;;
+      4) case "$VERDICT" in green | absent) VERDICT=unjudged ;; esac ;;
       esac
-      ;;
-    esac
+    fi
     now=$(date +%s)
     case "$VERDICT" in pending | unjudged) ;; *) break ;; esac
     [ "$now" -lt "$deadline" ] || break
