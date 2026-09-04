@@ -154,10 +154,11 @@ ship-pr/scripts/test-pr-review-base-drift.sh
 ship-pr/scripts/test-pr-review-checks-absent.sh
 ship-pr/scripts/test-pr-review-rounds.sh
 ship-pr/scripts/test-pr-review-merge.sh
+ship-pr/scripts/test-pr-review-status.sh
 scripts/test-wake-lab.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all seven on Ubuntu and
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all eight on Ubuntu and
 macOS (the fleet's bash is 3.2) for every push and pull request, along with `bash -n`, shellcheck
 at error severity, and a check that the two cleanup scripts still carry their parse guard. It runs
 without path filters, so every PR's merge gate reads a verdict rather than `ABSENT`.
@@ -197,6 +198,16 @@ gate on its cancelled predecessor while one file's `push` and `pull_request` run
 separately and a queued invocation is never hidden behind a finished twin; and a run whose red is
 explained entirely by advisory jobs is not a red build signal, since those checks were dropped on
 purpose.
+
+`test-pr-review-status.sh` drives `status` and `watch` against canned reactions, reviews,
+comments and PR reads, and pins the mergeability that rides on every state line: a PR whose merge
+commit GitHub cannot build says `CONFLICTS` on every state and never "the next move is yours",
+GitHub still computing is not a conflict, a failed PR read cannot hide a 👍 and is `unknown`
+(exit 3) only where the head SHA decides the state, one PR read serves a whole `status`, and a
+`watch` that returns on a round prints the base-drift read on stderr, against the base branch's
+tip, leaving stdout byte-identical to `poll`'s. `test-pr-review-base-drift.sh` pins the other
+half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
+which stands still on a conflicted PR.
 
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and
