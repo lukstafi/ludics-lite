@@ -274,8 +274,10 @@ test_dirty_pr_is_loud() {
   assert_eq "$DRIFT_RC" 1 "a conflicted PR should warn even with no file overlap"
   assert_contains "$DRIFT_OUTPUT" "!!! $REPO#7 CONFLICTS with main (mergeable_state=dirty)" \
     "a dirty mergeable_state should be said loudly"
-  assert_contains "$DRIFT_OUTPUT" "no pull_request workflow has run on head head-sh" \
-    "the conflict warning should say what it costs: no CI on the head"
+  assert_contains "$DRIFT_OUTPUT" "head-sh merged with the current main" \
+    "the conflict warning should say what it costs: nothing tests the head merged with the base"
+  assert_not_contains "$DRIFT_OUTPUT" "no pull_request workflow has run" \
+    "a run that completed before the base moved may exist: do not claim nothing ran"
   assert_contains "$DRIFT_OUTPUT" "7 commit(s) behind main" \
     "the count should still be read on a conflicted PR"
 }

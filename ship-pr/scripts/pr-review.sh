@@ -611,7 +611,9 @@ fmt_age() {
 # since the LATEST of head commit / reviewer's last word / spent 👀 — i.e. since the moment a review
 # became due. "-" when nothing datable was read.
 # <mergeability> is the PR's mergeable_state as GitHub reports it (clean, dirty, unstable, blocked,
-# behind, draft, unknown while it is recomputing), or "-" when the PR could not be read. It rides
+# behind, draft, unknown while it is recomputing), "unread" when the PR read failed, or "-" when
+# no PR read was attempted (a feed failed before it). "unread" is rendered as such: a line that
+# cannot say whether the PR conflicts must not look like one that says it does not. It rides
 # along with EVERY token, because it is not a state of the review but a fact about what the
 # review is worth: `dirty` means the merge commit cannot be built, and GitHub creates no
 # pull_request workflow run for a head whose merge commit it cannot build — so a round in flight,
@@ -622,9 +624,32 @@ fmt_age() {
 # The reviewer keeps reviewing a conflicted PR, so the tokens above still apply; the field is
 # what turns "the next move is yours" into "merge the base in first". The detail is the LAST
 # field, so it may contain anything, `|` included (an error line quotes gh).
+# Sets head_sha, mstate and head_err in the CALLER's scope (status_state's locals, by bash's
+# dynamic scoping) from one read of the PR. Best-effort: a failed read leaves head_sha empty and
+# mstate "unread", and remembers the error line, because it is the caller's state that decides
+# whether the missing head is fatal — an approval is the reactions feed's alone to answer, and a
+# failed PR read must not hide a 👍 behind "unknown". Placeholders, never empty fields: tab is
+# IFS whitespace, and an empty first column would shift the mergeability into the SHA
+# (warn_base_drift's trap).
+pr_head_read() {
+  local hline
+  head_sha=""
+  mstate=unread
+  head_err=""
+  hline=$(gh_retry read api "repos/$REPO/pulls/$1" \
+    --jq '[(.head.sha // "-"), (.mergeable_state // "-")] | @tsv') || {
+    head_err=$(gh_err_line)
+    return 0
+  }
+  IFS=$'\t' read -r head_sha mstate <<<"$hline"
+  [ "$head_sha" = - ] && head_sha=""
+  [ -n "$mstate" ] || mstate="-"
+  return 0
+}
+
 status_state() {
   local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
-  local vline verd_at verd_sha hline mstate="-" head_err=""
+  local vline verd_at verd_sha mstate="-" head_err=""
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -641,25 +666,11 @@ status_state() {
   plus="${line%%|*}"
   eyes_at="${line#*|}"
 
-  # The head SHA and the mergeability come from ONE read of the PR, made here rather than at each
-  # of the places below that need the head (the verdict check and the post-round states used to
-  # read it separately, so a verdict naming another head cost two calls). It is best-effort at
-  # this point: a failed read must not hide a 👍 behind "unknown" — the approval is the reactions
-  # feed's alone to answer — so the failure is remembered and reported only by the states that
-  # cannot be named without the head. Placeholders, never empty fields: tab is IFS whitespace, and
-  # an empty first column would shift the mergeability into the SHA (warn_base_drift's trap).
-  hline=$(gh_retry read api "repos/$REPO/pulls/$pr" \
-    --jq '[(.head.sha // "-"), (.mergeable_state // "-")] | @tsv') || {
-    hline=""
-    head_err=$(gh_err_line)
-  }
-  IFS=$'\t' read -r head_sha mstate <<<"$hline"
-  [ "$head_sha" = - ] && head_sha=""
-  [ -n "$mstate" ] || mstate="-"
-
   # 👍 is the merge gate and the reactions feed alone answers it, so it is answered before any feed
   # that could fail: an outage on the reviews feed must not hide an approval behind "unknown".
+  # The PR read here is for the mergeability alone, and cannot change the verdict.
   [ "$plus" = true ] && {
+    pr_head_read "$pr"
     echo "approved|-|$mstate|👍 from $REVIEWER"
     return 0
   }
@@ -725,6 +736,15 @@ status_state() {
   verd_sha="${vline#*|}"
   last_spoke=$(newest "$rev_at" "$com_at")
 
+  # The head SHA and the mergeability, in ONE read of the PR, made AFTER the feeds: every review
+  # in those feeds is then about a head no newer than the one read, so "the review's commit_id
+  # equals the head" means the CURRENT head was reviewed. Read before the feeds, a push landing
+  # between the two reads would match the previous head's review to the previous head and report
+  # `idle` (or a verdict comment as `approved`) while the new head sits unreviewed — the false
+  # reading this state machine exists to prevent (review of ludics-lite#47). One read serves the
+  # verdict check and the post-round states, which used to read it separately.
+  pr_head_read "$pr"
+
   # A no-findings verdict naming the CURRENT head outranks a live-looking 👀, and must be checked
   # BEFORE the in-flight return below: with the placeholder off the comment clock, a verdict
   # delivered by editing that placeholder in place leaves the 👀 newer than the reviewer's last
@@ -761,7 +781,7 @@ status_state() {
   fi
 
   [ -n "$head_sha" ] || {
-    echo "unknown|-|-|the pulls API did not answer for the head SHA ($head_err)"
+    echo "unknown|-|unread|the pulls API did not answer for the head SHA ($head_err)"
     return 0
   }
 
@@ -816,14 +836,27 @@ state_detail() {
 
 # The one word of the mergeability that changes what a round is worth. `dirty` is GitHub's term
 # for "the merge commit cannot be created", and it is the only value on which no pull_request
-# workflow will ever run for the head; `unknown` is GitHub still computing (moments after a push)
-# and `behind`/`blocked`/`unstable` are branch-protection verdicts the checks gate reads for
-# itself. Empty when there is nothing to say, so a caller can splice it in with ${x:+; $x}.
+# run will test the head merged with the current base (a run that completed before the base
+# moved, or a branch-push run, may well exist — they tested the head against an older base, or
+# alone, which is why the note says what is NOT tested rather than that nothing ran); `unknown`
+# is GitHub still computing (moments after a push) and `behind`/`blocked`/`unstable` are
+# branch-protection verdicts the checks gate reads for itself. `unread` is a PR read that failed
+# under a state the reactions feed decided on its own, and is said as such: "cannot tell" must
+# not render like "does not conflict". Empty when there is nothing to say, so a caller can splice
+# it in with ${x:+; $x}.
 conflict_note() {
-  [ "$1" = dirty ] || return 0
-  printf '%s' "CONFLICTS with the base (mergeable_state=dirty): GitHub cannot build this PR's" \
-    " merge commit, so no workflow runs on this head and nothing the rounds fix is being" \
-    " tested — merge the base in, resolve, and push before the next round"
+  case "$1" in
+  dirty)
+    printf '%s' "CONFLICTS with the base (mergeable_state=dirty): GitHub cannot build this head" \
+      " merged with the current base, so no pull_request run tests that merge and the rounds'" \
+      " fixes go untested against it — merge the base in, resolve, and push before the next round"
+    ;;
+  unread)
+    printf '%s' "mergeability UNREAD (the PR read did not answer): whether this PR conflicts with" \
+      " its base is unknown, which is not 'no' — retry status before acting on this line"
+    ;;
+  esac
+  return 0
 }
 
 # Takes a whole state line, not a token: the age and the detail are what make the difference between
@@ -2021,14 +2054,16 @@ warn_base_drift() {
     return 3
   fi
 
-  # Said before the counts, because it is what the counts mean: no pull_request workflow has run
-  # on this head, whatever the checks gate read for it was for an older head or a `push` event,
-  # and the merge call below this will fail on it anyway.
+  # Said before the counts, because it is what the counts mean: whatever the checks gate read
+  # for this head tested it merged with an OLDER base (a pull_request run from before the base
+  # moved) or alone (a branch-push run), never with the base as it stands, and the merge call
+  # below this will fail on it anyway.
   if [ "$mstate" = dirty ]; then
     dirty_warn=1
-    echo "!!! $REPO#$pr CONFLICTS with $base (mergeable_state=dirty): GitHub cannot build its merge"
-    echo "!!! commit, so no pull_request workflow has run on head ${head_sha:0:7} and the merge will"
-    echo "!!! be refused. Merge $base in, resolve, push, and let the checks run on the resolution."
+    echo "!!! $REPO#$pr CONFLICTS with $base (mergeable_state=dirty): GitHub cannot build head"
+    echo "!!! ${head_sha:0:7} merged with the current $base, so no pull_request run tests that merge"
+    echo "!!! and the merge will be refused. Merge $base in, resolve, push, and let the checks run"
+    echo "!!! on the resolution."
   fi
 
   # Compare the tip and the head in both directions. Each direction's files are changes from
@@ -2123,8 +2158,8 @@ warn_base_drift() {
       "SHIP_PR_STALE_BASE) — a clean merge is the policy (roll-forward, ahrefs/ocannl#861)."
   fi
   if [ -n "$dirty_warn" ]; then
-    warn "$REPO#$pr CONFLICTS with $base (mergeable_state=dirty): no pull_request workflow runs" \
-      "on a head whose merge commit GitHub cannot build — merge $base in before anything else."
+    warn "$REPO#$pr CONFLICTS with $base (mergeable_state=dirty): nothing tests this head merged" \
+      "with the current $base while GitHub cannot build that merge — merge $base in first."
   fi
   if [ -n "$count_unknown" ] || [ -n "$overlap_unknown" ]; then
     return 3

@@ -28,6 +28,7 @@ COMMENTS_JSON='[]'
 HEAD_SHA=head-sha
 MERGEABLE_STATE=clean
 FAIL_PULLS=""
+PUSH_ON_REVIEWS_READ=""
 PAST=2026-09-01T00:00:00Z
 
 # Not `fail`: pr-review.sh is sourced above and its refusals call ITS fail, whose exit code these
@@ -56,6 +57,8 @@ reset_fixture() {
   HEAD_SHA=head-sha
   MERGEABLE_STATE=clean
   FAIL_PULLS=""
+  PUSH_ON_REVIEWS_READ=""
+  rm -f "$TEST_ROOT/pushed"
   : >"$REQUEST_LOG"
 }
 
@@ -105,7 +108,12 @@ gh() {
   printf '%s\n' "$endpoint" >>"$REQUEST_LOG"
   case "$endpoint" in
   "repos/$REPO/issues/7/reactions?per_page=100") response="$REACTIONS_JSON" ;;
-  "repos/$REPO/pulls/7/reviews?per_page=100") response="$REVIEWS_JSON" ;;
+  "repos/$REPO/pulls/7/reviews?per_page=100")
+    # The simulated push: gh runs in a subshell, so the "new head" travels through a file that
+    # the PR read below consults.
+    [ -z "$PUSH_ON_REVIEWS_READ" ] || : >"$TEST_ROOT/pushed"
+    response="$REVIEWS_JSON"
+    ;;
   "repos/$REPO/issues/7/comments?per_page=100") response="$COMMENTS_JSON" ;;
   "repos/$REPO/pulls/7/comments?per_page=100") response='[]' ;;
   "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100") response='[]' ;;
@@ -115,10 +123,11 @@ gh() {
       return 1
     fi
     # base.sha is a stale snapshot on purpose, as on a conflicted PR (see the base-drift suite).
+    [ ! -e "$TEST_ROOT/pushed" ] || HEAD_SHA=new-head-sha
     response=$(jq -cn --arg h "$HEAD_SHA" --arg m "$MERGEABLE_STATE" \
       '{base:{ref:"main",sha:"stale-base-sha"}, head:{sha:$h}, mergeable_state:$m}')
     ;;
-  "repos/$REPO/commits/head-sha")
+  "repos/$REPO/commits/head-sha" | "repos/$REPO/commits/new-head-sha")
     response='{"sha":"head-sha","commit":{"committer":{"date":"2026-09-01T00:00:00Z"}}}' ;;
   "repos/$REPO/commits/main") response='{"sha":"base-sha"}' ;;
   "repos/$REPO/compare/base-sha...head-sha?per_page=1") response=$(compare_json 7 15 pr.txt) ;;
@@ -188,7 +197,10 @@ test_idle_dirty_says_conflicts_not_next_move() {
   assert_eq "$(state_tok "$STATE")" idle "a conflict is not a review state: the head is still reviewed"
   assert_eq "$(state_merge "$STATE")" dirty "the dirty mergeability should ride on the state line"
   assert_contains "$LINE" "$CONFLICT" "a conflicted idle PR should say CONFLICTS"
-  assert_contains "$LINE" "no workflow runs on this head" "the line should say what the conflict costs"
+  assert_contains "$LINE" "no pull_request run tests that merge" \
+    "the line should say what the conflict costs: the head merged with the base goes untested"
+  assert_not_contains "$LINE" "no workflow runs on this head" \
+    "a run that completed before the base moved may exist: do not claim nothing ran"
   assert_contains "$LINE" "merge the base in" "the line should name the remedy"
   assert_not_contains "$LINE" "the next move is yours" \
     "a conflicted PR must not invite another push as the next move"
@@ -228,8 +240,41 @@ test_approved_dirty_says_conflicts_and_survives_a_failed_pr_read() {
   run_status
   assert_eq "$(state_tok "$STATE")" approved \
     "a failed PR read must not hide a 👍 behind unknown: the reactions feed alone answers it"
-  assert_eq "$(state_merge "$STATE")" - "an unread mergeability is '-', not a value"
+  assert_eq "$(state_merge "$STATE")" unread "a failed PR read is 'unread', not a value"
   assert_not_contains "$LINE" "CONFLICTS" "an unread mergeability must not claim a conflict"
+  assert_contains "$LINE" "mergeability UNREAD" \
+    "an approved line that could not read the mergeability must say so, not look clean"
+}
+
+test_reviewing_with_a_failed_pr_read_says_unread() {
+  reset_fixture
+  FAIL_PULLS=1
+  REACTIONS_JSON="[$(reaction eyes "$(jq -rn '(now - 60) | todate')")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" reviewing "a live 👀 is a round in flight whatever the PR read did"
+  assert_contains "$LINE" "wait it out" "the round is still waited out"
+  assert_contains "$LINE" "mergeability UNREAD" \
+    "a reviewing line that could not read the mergeability must say so"
+  assert_contains "$LINE" "not 'no'" "unread must not read as 'does not conflict'"
+}
+
+test_head_is_read_after_the_feeds() {
+  # A push lands between the feed reads and the PR read: the review on file is of the PREVIOUS
+  # head. Read after the feeds, the PR read sees the new head and the state is expected; read
+  # before them, the old head would have matched its own review and reported idle.
+  idle_fixture
+  PUSH_ON_REVIEWS_READ=1
+  run_status
+  PUSH_ON_REVIEWS_READ=""
+  assert_eq "$(state_tok "$STATE")" expected \
+    "a head pushed while the feeds were read is unreviewed, not idle"
+  assert_contains "$(state_detail "$STATE")" "no review of head new-hea" \
+    "the state should be about the head as read after the feeds"
+  local order
+  order=$(awk -v feed="repos/$REPO/pulls/7/reviews?per_page=100" -v pr="repos/$REPO/pulls/7" '
+    $0 == feed { f = NR } $0 == pr { p = NR }
+    END { if (f && p && p > f) print "after"; else print "feed=" f " pr=" p }' "$REQUEST_LOG")
+  assert_eq "$order" after "the PR read should come after the reviews feed"
 }
 
 test_computing_mergeability_is_not_a_conflict() {
@@ -305,6 +350,8 @@ tests=(
   test_reviewing_dirty_still_says_conflicts
   test_expected_dirty_says_conflicts
   test_approved_dirty_says_conflicts_and_survives_a_failed_pr_read
+  test_reviewing_with_a_failed_pr_read_says_unread
+  test_head_is_read_after_the_feeds
   test_computing_mergeability_is_not_a_conflict
   test_failed_pr_read_is_unknown_where_the_head_decides
   test_one_pr_read_per_status
