@@ -151,12 +151,13 @@ The shell scripts carry their own test suites:
 issue-wave/scripts/test-fleet-worker.sh
 ship-pr/scripts/test-post-merge-cleanup.sh
 ship-pr/scripts/test-pr-review-base-drift.sh
+ship-pr/scripts/test-pr-review-checks-absent.sh
 ship-pr/scripts/test-pr-review-rounds.sh
-ship-pr/scripts/test-pr-review-checks-wait.sh
+ship-pr/scripts/test-pr-review-merge.sh
 scripts/test-wake-lab.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all six on Ubuntu and
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all seven on Ubuntu and
 macOS (the fleet's bash is 3.2) for every push and pull request, along with `bash -n`, shellcheck
 at error severity, and a check that the two cleanup scripts still carry their parse guard. It runs
 without path filters, so every PR's merge gate reads a verdict rather than `ABSENT`.
@@ -180,6 +181,22 @@ kick reaches the Windows side through whichever of the two aliases answers, sinc
 that is the LAN one; and that the polling loops honour a wall-clock deadline against slow probes,
 which an iteration budget did not (`WAKE_LAB_WAIT_SECONDS`, `WAKE_LAB_WSL_WAIT_SECONDS` and
 `WAKE_LAB_DOWN_WAIT_SECONDS` are what let the suite ask for a one-second one).
+
+`test-pr-review-checks-absent.sh` drives the build gate against a canned Actions API, one answer
+per polling round, and pins everything the check list alone cannot say about a head. Exit 4 (no
+verdict): a queued or running workflow — including under a green check from a sibling workflow — a
+run that completed stopped-not-judged with nothing behind it, a green check with no Actions run
+behind it at all, and a checkless head still inside `SHIP_PR_BASE_ABSENT_GRACE`, measured from the
+fresher of the commit date and the PR's `updated_at` (each validated on its own, so a long-local
+commit pushed a moment ago counts as fresh and a future commit date does not blind the gate).
+Exit 1: a run that concluded red without producing a check to be red, over a green, pending or
+stopped check alike. Exit 0: green over a finished, judged run list, and the absence itself once
+the grace is spent. A read that fails is exit 3, never a reassuring 0. Only finished runs are
+folded away as superseded, per workflow and event, so a re-triggered invocation does not park the
+gate on its cancelled predecessor while one file's `push` and `pull_request` runs still count
+separately and a queued invocation is never hidden behind a finished twin; and a run whose red is
+explained entirely by advisory jobs is not a red build signal, since those checks were dropped on
+purpose.
 
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and
