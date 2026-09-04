@@ -2215,29 +2215,47 @@ test_late_private_worktree_ref_recovery() {
 }
 
 test_shared_private_namespace_roots_preserved() {
-  local fake_bin real_git shared_oid
+  local fake_bin real_git real_git_version shared_oid
   setup_case shared-private-namespace-roots merge main-off
   shared_oid=$(printf 'shared namespace root commit\n' | git -C "$CASE_MAIN" commit-tree \
     "$(git -C "$CASE_MAIN" rev-parse "$CASE_TOPIC_OID^{tree}")" -p "$CASE_TOPIC_OID")
   fake_bin="$TEST_ROOT/shared-private-namespace-roots-bin"
   real_git=$(command -v git)
+  real_git_version=$("$real_git" --version) || fail "could not read the git version used by the private-root race"
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
+    'trace() {' \
+    '  phase="$1"' \
+    '  shift' \
+    '  printf "TRACE shared-private pid=%s git=%s phase=%s" "$$" "$REAL_GIT_VERSION" "$phase" >&2' \
+    '  for arg in "$@"; do printf " <%s>" "$arg" >&2; done' \
+    '  printf "\n" >&2' \
+    '}' \
+    'trace invoke "$@"' \
     'case "$2" in' \
     '*.ship-pr-recovery.*/worktree)' \
     '  if [ "$3" = for-each-ref ] && [ ! -e "$SHARED_MARKER" ]; then' \
+    '    trace injection-begin "$@"' \
     '    : >"$SHARED_MARKER"' \
+    '    trace update-ref-begin refs/worktree' \
     '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/worktree "$SHARED_OID"' \
+    '    trace update-ref-end refs/worktree' \
+    '    trace update-ref-begin refs/bisect' \
     '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/bisect "$SHARED_OID"' \
+    '    trace update-ref-end refs/bisect' \
+    '    trace update-ref-begin refs/rewritten' \
     '    "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/rewritten "$SHARED_OID"' \
+    '    trace update-ref-end refs/rewritten' \
+    '    trace injection-end "$@"' \
     '  fi' \
     '  ;;' \
     'esac' \
+    'trace exec-real "$@"' \
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
 
-  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" REAL_GIT_VERSION="$real_git_version" RACE_MAIN="$CASE_MAIN" \
     SHARED_OID="$shared_oid" SHARED_MARKER="$TEST_ROOT/shared-private-roots.injected" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
   [ -e "$TEST_ROOT/shared-private-roots.injected" ] || fail "shared roots were not injected"
@@ -3515,6 +3533,132 @@ test_runner_kills_a_case_past_its_deadline() {
   echo "PASS: a case past its deadline is killed with its process group and reported"
 }
 
+test_runner_names_a_setup_case_failure() {
+  # Candidate (1) of ludics-lite#9: setup_case has its own local `name`, so the status trap must
+  # have captured its destination before that scope exists. Force setup_case to fail after the
+  # local is declared; the copy must promptly report the selected function's name and ordinary
+  # exit status, not wait on a status file named after setup_case's scratch slug.
+  local tag="setup$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" patched rc
+  copy_runner "$copy" "$tag"
+  patched=$(awk '{
+    print
+    if ($0 == "  local name=\"$1\" merge_mode=\"$2\" owner_mode=\"$3\" base_branch=\"${4:-master}\"")
+      print "  false # runner self-case: fail inside setup_case after its local name is live"
+  }' "$copy/test-post-merge-cleanup.sh")
+  printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
+  grep -q '^  false # runner self-case: fail inside setup_case' "$copy/test-post-merge-cleanup.sh" ||
+    fail "could not plant a failure inside the copy's setup_case"
+
+  if run_copy env SHIP_PR_TEST_CASE_TIMEOUT=5 "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 1 ] || fail "the copy exited $rc after setup_case failed, expected 1: $(cat "$out")"
+  grep -Fqx "===== FAIL: $SELF_CASE (exit 1) =====" "$out" ||
+    fail "the setup_case failure was not reported under the selected case name: $(cat "$out")"
+  grep -q "^FAIL: 1 of 1 post-merge cleanup states failed.*: $SELF_CASE$" "$out" ||
+    fail "the setup_case failure printed no right-named summary: $(cat "$out")"
+  assert_copy_root_gone "$tag"
+  echo "PASS: a failure inside setup_case fails the right-named case without hanging"
+}
+
+test_runner_reaps_a_statusless_case() {
+  # Candidate (2) of ludics-lite#9: a case shell may exit without running its status trap. Remove
+  # the trap from a copy; the scheduler must notice the gone or zombie child, reap it, and report
+  # the missing status instead of polling forever or accepting the child's zero exit.
+  local tag="statusless$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" patched rc
+  copy_runner "$copy" "$tag"
+  patched=$(awk '{
+    if ($0 ~ /^  trap .*CASE_STATUS_FILE.* EXIT$/) {
+      print "  : # runner self-case: deliberately omit the case status trap"
+      next
+    }
+    print
+  }' "$copy/test-post-merge-cleanup.sh")
+  printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
+  grep -q '^  : # runner self-case: deliberately omit' "$copy/test-post-merge-cleanup.sh" ||
+    fail "could not remove the copy's case status trap"
+
+  if run_copy env SHIP_PR_TEST_CASE_TIMEOUT=5 "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 1 ] || fail "the copy exited $rc without a case status, expected 1: $(cat "$out")"
+  grep -q "^===== FAIL: $SELF_CASE .*the case exited 0 without reporting a status.*=====$" "$out" ||
+    fail "the status-less case was not reported under its selected name: $(cat "$out")"
+  grep -q "^FAIL: 1 of 1 post-merge cleanup states failed.*: $SELF_CASE$" "$out" ||
+    fail "the status-less case printed no right-named summary: $(cat "$out")"
+  assert_copy_root_gone "$tag"
+  echo "PASS: a status-less case is reaped and reported instead of hanging"
+}
+
+test_runner_cleans_up_after_a_closed_pipe() {
+  # Candidate (3) of ludics-lite#9: verbose output can lose its reader. Give the selected case a
+  # log larger than a pipe buffer, read one line, and close the pipe. The copy must take SIGPIPE,
+  # run its EXIT cleanup, and remove its scratch root. The inner runner stays at -j 1, matching
+  # every runner self-case; its exit status, the one retained output line, and its root are the
+  # only state this outer case inspects.
+  local tag="pipe$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" patched
+  local copy_rc head_rc pipeline_statuses
+  copy_runner "$copy" "$tag"
+  patched=$(awk -v target="$SELF_CASE() {" '{
+    print
+    if ($0 == target) {
+      print "  echo RUNNER_CLOSED_PIPE_HEAD"
+      print "  i=0; while [ \"$i\" -lt 20000 ]; do printf \"runner closed pipe payload %s\\n\" \"$i\"; i=$((i + 1)); done"
+    }
+  }' "$copy/test-post-merge-cleanup.sh")
+  printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
+  grep -q '^  echo RUNNER_CLOSED_PIPE_HEAD$' "$copy/test-post-merge-cleanup.sh" ||
+    fail "could not give the copy enough verbose output to close its pipe"
+
+  set +e
+  run_copy "$copy/test-post-merge-cleanup.sh" -j 1 -v "$SELF_CASE" 2>&1 | head -n 1 >"$out"
+  pipeline_statuses=("${PIPESTATUS[@]}")
+  set -e
+  copy_rc="${pipeline_statuses[0]}"
+  head_rc="${pipeline_statuses[1]}"
+  [ "$copy_rc" -eq 141 ] || fail "the copy exited $copy_rc after its pipe closed, expected 141"
+  [ "$head_rc" -eq 0 ] || fail "head exited $head_rc while closing the copy's pipe"
+  grep -Fqx RUNNER_CLOSED_PIPE_HEAD "$out" ||
+    fail "the closed-pipe run did not yield its deterministic first line: $(cat "$out")"
+  assert_copy_root_gone "$tag"
+  echo "PASS: -v piped to head -1 exits on the closed pipe and removes the scratch root"
+}
+
+test_runner_term_midrun_exits_130() {
+  # Candidate (4) of ludics-lite#9: wait until the copied helper is running inside its brace group
+  # (a fixed delay raced on fast CI), then TERM the runner. Its scheduler trap must leave the case
+  # registered for EXIT cleanup, which terminates and reaps the group before removing the root.
+  local tag="term$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out"
+  local started go pid rc tries=0
+  copy_runner "$copy" "$tag"
+  started="$copy.started"
+  go="$copy.go"
+  gate_helper "$copy" "$started" "$go"
+  # Start the external env directly: backgrounding run_copy would expose the PID of bash's
+  # function subshell, so TERM would kill that wrapper with 143 instead of reaching the copied
+  # runner and exercising its 130 trap path.
+  env -u SHIP_PR_TEST_LOG_DIR -u SHIP_PR_TEST_CASE_TIMEOUT -u SHIP_PR_TEST_JOBS \
+    "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null &
+  pid=$!
+  while [ ! -e "$started" ]; do
+    kill -0 "$pid" 2>/dev/null || fail "the copy exited before its helper announced itself: $(cat "$out")"
+    [ "$tries" -lt 600 ] || { kill_case_group "$pid" 2>/dev/null; fail "the copy's helper did not start within 60s: $(cat "$out")"; }
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  kill -TERM "$pid" || fail "could not send TERM to the copied runner"
+  if wait "$pid"; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 130 ] || fail "the copied runner exited $rc on TERM, expected 130: $(cat "$out")"
+  grep -q '^FAIL: interrupted with 1 post-merge cleanup states still running$' "$out" ||
+    fail "the TERM run printed no interrupted summary: $(cat "$out")"
+  assert_copy_root_gone "$tag"
+  echo "PASS: TERM mid-run exits 130 after reaping the case and removing the scratch root"
+}
+
 test_runner_refuses_bad_arguments() {
   # Candidate (5) of ludics-lite#9: every refused invocation exits 1 before any case starts and
   # names the problem, and --list spells the names the refusals are checked against.
@@ -3682,6 +3826,10 @@ TESTS=(
   test_dotted_branch_config
   test_custom_branch_config
   test_merge_options_cleanup
+  test_runner_names_a_setup_case_failure
+  test_runner_reaps_a_statusless_case
+  test_runner_cleans_up_after_a_closed_pipe
+  test_runner_term_midrun_exits_130
   test_runner_survives_midrun_rewrite
   test_runner_kills_a_case_past_its_deadline
   test_runner_refuses_bad_arguments
