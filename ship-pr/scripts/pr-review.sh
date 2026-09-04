@@ -890,7 +890,9 @@ status_line() {
   # "The next move is yours" is exactly the line that sent #39 into seven untested rounds: on a
   # conflicted PR the move is the base merge, and saying anything else invites another push. Only
   # a KNOWN conflict takes the move away, though: a mergeability still being computed leaves the
-  # move where it was and rides along as a caveat.
+  # move where it was and rides along as a caveat. `unread` needs no arm of its own here: with no
+  # head SHA the idle branch of status_state cannot fire at all, so a failed PR read lands in
+  # `unknown` — test_failed_pr_read_is_unknown_where_the_head_decides pins that.
   idle)
     case "$merge" in
     dirty) echo "nothing in flight — $detail, and no 👍; $conflict" ;;
