@@ -1386,8 +1386,11 @@ CHECKS_WAIT="${SHIP_PR_CHECKS_WAIT:-7200}"
 CHECKS_HEARTBEAT="${SHIP_PR_CHECKS_HEARTBEAT:-600}"
 BASE_ABSENT_GRACE="${SHIP_PR_BASE_ABSENT_GRACE:-300}"
 CHECKS_ABSENT_GRACE="${SHIP_PR_CHECKS_ABSENT_GRACE:-300}"
+# No leading zero: "08" passes a digits-only test and then trips $((...)) as an octal literal.
 case "$CHECKS_ABSENT_GRACE" in
-'' | *[!0-9]*) die "SHIP_PR_CHECKS_ABSENT_GRACE must be a number of seconds, got '$CHECKS_ABSENT_GRACE'" ;;
+0 | [1-9]*) case "$CHECKS_ABSENT_GRACE" in *[!0-9]*)
+  die "SHIP_PR_CHECKS_ABSENT_GRACE must be a number of seconds, got '$CHECKS_ABSENT_GRACE'" ;; esac ;;
+*) die "SHIP_PR_CHECKS_ABSENT_GRACE must be a number of seconds, got '$CHECKS_ABSENT_GRACE'" ;;
 esac
 # Whole seconds, validated up front: these feed shell arithmetic (deadlines, heartbeats, and the
 # sleep caps against the remaining deadline), where a fractional value does not degrade gracefully

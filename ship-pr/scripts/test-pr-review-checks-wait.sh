@@ -282,6 +282,24 @@ test_require_green_refuses_a_merge_queue() {
   assert_eq "$calls" "CALL api graph,CALL api graph,CALL pr merge ," "both reads precede the merge call"
 }
 
+test_malformed_absent_grace_is_refused() {
+  local out rc v
+  for v in 08 09 x -1 5s; do
+    set +e
+    out=$(SHIP_PR_CHECKS_ABSENT_GRACE="$v" bash "$HELPER" checks "$REPO#7" 2>&1)
+    rc=$?
+    set -e
+    assert_eq "$rc" 2 "an absent grace of '$v' is a usage error"
+    assert_contains "$out" "SHIP_PR_CHECKS_ABSENT_GRACE must be a number of seconds" \
+      "should name the setting for '$v'"
+  done
+  set +e
+  out=$(SHIP_PR_CHECKS_ABSENT_GRACE=0 SHIP_PR_TEST_SOURCE_ONLY=1 bash "$HELPER" 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 0 "a zero grace is accepted"
+}
+
 tests=(
   test_no_wait_takes_absent_at_once
   test_wait_holds_for_a_run_to_appear
@@ -293,6 +311,7 @@ tests=(
   test_require_green_refuses_auto
   test_require_green_disables_a_deferred_auto_merge
   test_require_green_refuses_a_merge_queue
+  test_malformed_absent_grace_is_refused
   test_require_green_waits_for_a_young_green_to_settle
 )
 
