@@ -391,10 +391,13 @@ any other) creates a head whose checks do not EXIST yet, and a wait armed in tha
 nothing to wait for and passed the gate having read nothing (ocannl staging#491 merged that way).
 The gate now reads that distinction itself (ludics-lite#24): an absence is confirmed against
 `actions/runs?head_sha=`, so a queued or running workflow for the head is exit 4 like any other
-unfinished build, a head with no run yet holds until `SHIP_PR_BASE_ABSENT_GRACE` (300s) has passed
-since it was pushed, and `ABSENT` is reported only past that — with the evidence on the line. No
-hand re-check, and no `--wait` needed for it: without one the same window is exit 4, not 0. The
-knob is there for a repo whose runs take longer than five minutes to appear.
+unfinished build, a run that completed `cancelled`/`stale`/`action_required` with nothing behind it
+is exit 4 like every other stopped-not-judged run, and any absence at all holds while the head is
+inside `SHIP_PR_BASE_ABSENT_GRACE` (300s, measured from the fresher of the head's commit date and
+the PR's own `updated_at`, so a long-local commit pushed just now still counts as fresh). `ABSENT`
+is reported only past that, with the evidence on the line. No hand re-check, and no `--wait` needed
+for it: without one the same window is exit 4, not 0. The knob is there for a repo whose runs take
+longer than five minutes to appear.
 
 The trap that remains is at the other end of the hold: **the harness can kill a backgrounded
 `merge --wait` well before its ceiling** (observed twice at ~40 min). The correct response is to

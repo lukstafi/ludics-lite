@@ -1342,18 +1342,32 @@ summarize_checks() {
 # prose asked every caller to re-derive the distinction by hand after a push, which is the class of
 # defect this file exists to encode instead of describing.
 #
-# So an absence gets a second read, of the two things that separate the cases: the workflow RUNS
-# for the head SHA (`actions/runs?head_sha=`, which exists from the moment the run is queued —
-# before any of its check-runs do), and, when there is no run at all, how long ago the head was
-# pushed. Prints the reason phrase for the report; returns
-#   0  the absence IS the verdict — a run for this head finished and left no build check behind,
-#      or no run was created within the grace (a paths-ignore push never gets one, and only time
-#      separates that from "not yet")
-#   4  no verdict YET — a run for the head is queued or in flight, or the head is younger than the
-#      grace and its run may still be created. Under --wait, keep waiting.
-#   3  neither could be read. `base --wait` settles on an unreadable age because the sibling runs
-#      judged at the tip are evidence in their own right; here there is nothing else to go on, and
-#      an absence that could not be read is UNKNOWN, which is not "nothing is red".
+# So an absence gets a second read, of the workflow RUNS for the head SHA
+# (`actions/runs?head_sha=`, which exists from the moment a run is queued — before any of its
+# check-runs do) and of how long the head has been around. Prints the reason phrase for the
+# report; returns
+#   0  the absence IS the verdict — nothing is in flight for this head, nothing was stopped
+#      without judging it, and the run-creation grace is spent
+#   4  no verdict YET — a run for the head is queued or in flight, a run completed stopped-not-
+#      judged, or the head is inside the grace and a run may still be created. Under --wait, keep
+#      waiting; without one, 4 is still the honest answer, and it is what makes `merge` refuse.
+#   3  the runs or the clock could not be read. `base --wait` settles on an unreadable age because
+#      the sibling runs judged at the tip are evidence in their own right; here there is nothing
+#      else to go on, and an absence that could not be read is UNKNOWN, not "nothing is red".
+#
+# The grace applies to EVERY absence, not only to a head with no run at all. One finished run is
+# evidence about ONE workflow: a repo where workflow A completes with every job skipped while
+# workflow B's run row has not been created yet would otherwise read as settled absence in the
+# middle of the very creation race this exists to close (review of ludics-lite#38, round 1). The
+# alternative — diffing the run list against `actions/workflows` — buys precision this gate cannot
+# use, since a dispatch- or schedule-only workflow is permanently "missing" and would park every
+# absence on the full grace anyway.
+#
+# A completed run whose conclusion is cancelled, stale or action_required is NOT evidence of
+# absence either: a run cancelled while still queued reports `completed` with no check-runs behind
+# it, and this file classifies stopped-not-judged as no verdict everywhere else (see
+# conclusion_class, and cmd_base's nogo_at_tip). Reading one as "nothing covers this commit" would
+# let a superseded run pass for a path filter.
 #
 # Advisory names are filtered here as everywhere else, and for the same reason in both directions:
 # the review app's own check must not hold a wait open, and a repo whose only in-flight run is
@@ -1361,52 +1375,69 @@ summarize_checks() {
 # sets `run-name:`, in which case a custom name can miss the advisory ERE — that only costs a hold
 # for a run whose verdict would have been ignored, which is the safe direction to be wrong in.
 absent_signal() {
-  local sha="$1" raw rc name status runs=0 inflight=0 pushed_at age
+  local sha="$1" pr_at="${2:-}" raw rc name status concl runs=0 inflight=0 nogo=0
+  local pushed_at age seen
   raw=$(gh_retry read api "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
-    --jq '.workflow_runs[] | [(.name // "-"), (.status // "unknown")] | @tsv')
+    --jq '.workflow_runs[] | [(.name // "-"), (.status // "unknown"), (.conclusion // "pending")]
+          | @tsv')
   rc=$?
   [ "$rc" -eq 0 ] || {
     printf '%s' "the workflow runs for this head could not be read ($(gh_err_line))"
     return 3
   }
-  while IFS=$'\t' read -r name status; do
+  while IFS=$'\t' read -r name status concl; do
     [ -n "$name" ] || continue
     is_advisory "$name" && continue
     runs=$((runs + 1))
-    [ "$status" = completed ] || inflight=$((inflight + 1))
+    if [ "$status" != completed ]; then
+      inflight=$((inflight + 1))
+    elif [ "$(conclusion_class "$concl")" = nogo ]; then
+      nogo=$((nogo + 1))
+    fi
   done <<<"$raw"
   if [ "$inflight" -gt 0 ]; then
     printf '%s' "$inflight workflow run(s) for this head have not finished — their check runs" \
       " do not exist yet"
     return 4
   fi
-  if [ "$runs" -gt 0 ]; then
-    printf '%s' "$runs workflow run(s) for this head finished and left no build check behind" \
-      " — path filters, or every job in them was skipped"
-    return 0
+  if [ "$nogo" -gt 0 ]; then
+    printf '%s' "$nogo workflow run(s) for this head completed stopped-not-judged (cancelled," \
+      " stale or action_required) with no build check behind them — stopped is not absence and" \
+      " not a verdict: re-run the workflow"
+    return 4
   fi
-  # No run at all, so the only question left is how long there has been to create one. The head's
-  # own committer date is the push clock the rest of this file uses (pr_state's review clock): a
-  # rebase, an amend and a cherry-pick all refresh it, which covers every way a PR head moves. It
-  # can still overstate the age of a branch that sat locally for hours before its first push —
-  # SHIP_PR_BASE_ABSENT_GRACE is the knob for a repo whose runs are slower to appear than that.
+  # How long there has been to create a run. Two clocks, and the FRESHER wins, because each covers
+  # the other's blind spot. The head's committer date is the push clock the rest of this file uses
+  # (pr_state's review clock): a rebase, an amend and a cherry-pick all refresh it, which covers
+  # every way a PR head moves — but not a commit that sat locally for hours before its first push,
+  # where it is already older than any grace and would settle the absence on the spot (review of
+  # ludics-lite#38, round 1). The PR's own `updated_at` covers exactly that: a push to the head
+  # branch updates the PR, so it is never OLDER than the push, whatever the commit's date says. It
+  # can be fresher than the push — a comment moves it too — and that costs at most one grace of
+  # holding after unrelated PR activity, which is the safe direction for a merge gate.
   pushed_at=$(gh_retry read api "repos/$REPO/commits/$sha" --jq .commit.committer.date) ||
     pushed_at=""
-  age=$(age_of "$pushed_at")
+  age=$(age_of "$(newest "$pushed_at" "$pr_at")")
   case "$age" in
   '' | *[!0-9]*)
-    printf '%s' "no workflow run exists for this head and its push time could not be read" \
-      " ($(gh_err_line))"
+    printf '%s' "no build check is on this head and neither its commit date nor the PR's" \
+      " updated_at could be read ($(gh_err_line)), so the run-creation window is unknown"
     return 3
     ;;
   esac
+  if [ "$runs" -gt 0 ]; then
+    seen="$runs workflow run(s) for this head finished and left no build check behind"
+  else
+    seen="no workflow run exists for this head"
+  fi
   if [ "$age" -lt "$ABSENT_GRACE" ]; then
-    printf '%s' "no workflow run exists for this head yet, pushed $(fmt_age "$age") ago — inside" \
-      " the $(fmt_age "$ABSENT_GRACE") creation grace (SHIP_PR_BASE_ABSENT_GRACE)"
+    printf '%s' "$seen, and the head has been in place at most $(fmt_age "$age") — inside the" \
+      " $(fmt_age "$ABSENT_GRACE") run-creation grace (SHIP_PR_BASE_ABSENT_GRACE), so a run" \
+      " may still appear"
     return 4
   fi
-  printf '%s' "no workflow run was created for this head in the $(fmt_age "$age") since it was" \
-    " pushed"
+  printf '%s' "$seen in the $(fmt_age "$age") since it appeared — past the" \
+    " $(fmt_age "$ABSENT_GRACE") run-creation grace"
   return 0
 }
 
@@ -1416,9 +1447,17 @@ absent_signal() {
 # or the run for this head exists and has not produced its checks yet).
 gate_checks() {
   local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining
-  local absent_why="" note
-  sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha)
+  local absent_why="" note pr_at=""
+  # One read for both: the head to judge, and the PR's own last-updated stamp, which absent_signal
+  # uses as the push clock a stale committer date cannot provide. Tab-separated with a placeholder
+  # for the same reason build_checks uses one — an empty field would collapse under tab-IFS.
+  # Captured first, then split: a process substitution would hand `read` the exit status and lose
+  # gh_retry's, and a failed read that reports 0 is the one thing this gate must never do.
+  lines=$(gh_retry read api "repos/$REPO/pulls/$pr" \
+    --jq '[.head.sha, (.updated_at // "-")] | @tsv')
   rc=$?
+  IFS=$'\t' read -r sha pr_at <<<"$lines"
+  [ "${pr_at:--}" != - ] || pr_at=""
   if [ "$rc" -ne 0 ] || [ -z "$sha" ]; then
     VERDICT=unknown
     warn "could not read $REPO#$pr's head SHA ($(gh_err_line)); the build signal is UNKNOWN," \
@@ -1442,7 +1481,7 @@ gate_checks() {
     # --wait at all, where the honest answer to "is there a signal here" is 4, not a 0 the merge
     # gate would take for "nothing is red".
     if [ "$VERDICT" = absent ]; then
-      absent_why=$(absent_signal "$sha")
+      absent_why=$(absent_signal "$sha" "$pr_at")
       case $? in
       3)
         VERDICT=unknown

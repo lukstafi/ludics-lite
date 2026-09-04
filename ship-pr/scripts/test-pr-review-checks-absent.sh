@@ -47,6 +47,7 @@ assert_not_contains() {
 CHECK_RUNS_SEQ=()
 RUNS_SEQ=()
 COMMIT_AGE=""
+PR_UPDATED_AGE=""
 FAIL_ENDPOINT=""
 
 check_runs_json() { jq -cn --argjson runs "$1" '{check_runs:$runs}'; }
@@ -71,6 +72,7 @@ reset_fixture() {
   CHECK_RUNS_SEQ=("$(check_runs_json '[]')")
   RUNS_SEQ=("$(runs_json '[]')")
   COMMIT_AGE=3600
+  PR_UPDATED_AGE=3600
   FAIL_ENDPOINT=""
   rm -f "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls"
   ABSENT_GRACE=300
@@ -96,16 +98,27 @@ gh() {
     esac
   done
   printf '%s\n' "$endpoint" >>"$REQUEST_LOG"
+  # A GLOB, deliberately unquoted: "repos/o/n/commits/<sha>" is a prefix of the check-runs
+  # endpoint, so a substring match could not fail the commit read alone — and a case that failed
+  # both reads would pass for the wrong reason.
   if [ -n "$FAIL_ENDPOINT" ]; then
+    # shellcheck disable=SC2254
     case "$endpoint" in
-    *"$FAIL_ENDPOINT"*)
+    $FAIL_ENDPOINT)
       echo "gh: $endpoint unavailable (HTTP 500)" >&2
       return 1
       ;;
     esac
   fi
   case "$endpoint" in
-  "repos/$REPO/pulls/7") response=$(jq -cn --arg sha "$HEAD_SHA" '{head:{sha:$sha}}') ;;
+  "repos/$REPO/pulls/7")
+    if [ -n "$PR_UPDATED_AGE" ]; then
+      response=$(jq -cn --arg sha "$HEAD_SHA" --arg at "$(iso_ago "$PR_UPDATED_AGE")" \
+        '{head:{sha:$sha}, updated_at:$at}')
+    else
+      response=$(jq -cn --arg sha "$HEAD_SHA" '{head:{sha:$sha}}')
+    fi
+    ;;
   "repos/$REPO/commits/$HEAD_SHA/check-runs?filter=latest&per_page=100")
     response=$(next_of CHECK_RUNS_SEQ)
     ;;
@@ -177,8 +190,8 @@ test_stale_push_without_a_run_is_absent() {
   run_gate
   assert_eq "$GATE_RC" 0 "no run 30 min after the push is the absence verdict"
   assert_contains "$GATE_OUTPUT" ": ABSENT" "past the grace should print ABSENT"
-  assert_contains "$GATE_OUTPUT" "no workflow run was created for this head" \
-    "the absence should say what was read"
+  assert_contains "$GATE_OUTPUT" "no workflow run exists for this head in the 30m" \
+    "the absence should say what was read and how long it waited"
 }
 
 test_grace_of_zero_settles_at_once() {
@@ -193,8 +206,7 @@ test_grace_of_zero_settles_at_once() {
 # A finished run that left no build check is the path-filter case, and it needs no grace at all.
 test_finished_run_without_checks_is_absent() {
   reset_fixture
-  COMMIT_AGE=5
-  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
   run_gate
   assert_eq "$GATE_RC" 0 "a finished run that produced no build check is absence"
   assert_contains "$GATE_OUTPUT" ": ABSENT" "a finished run with no checks should print ABSENT"
@@ -207,7 +219,7 @@ test_finished_run_without_checks_is_absent() {
 test_advisory_run_does_not_hold_the_gate() {
   reset_fixture
   COMMIT_AGE=1800
-  RUNS_SEQ=("$(runs_json '[{"name":"claude","status":"in_progress"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"claude","status":"in_progress","conclusion":null}]')")
   run_gate
   assert_eq "$GATE_RC" 0 "an in-flight advisory run is not a build signal on the way"
   assert_contains "$GATE_OUTPUT" ": ABSENT" "an advisory-only run should still read as absence"
@@ -218,7 +230,7 @@ test_advisory_run_does_not_hold_the_gate() {
 test_unreadable_run_list_is_unknown() {
   reset_fixture
   COMMIT_AGE=1800
-  FAIL_ENDPOINT="actions/runs"
+  FAIL_ENDPOINT="*actions/runs*"
   run_gate
   assert_eq "$GATE_RC" 3 "an unreadable run list is unknown"
   assert_contains "$GATE_OUTPUT" "UNKNOWN" "an unreadable run list should say UNKNOWN"
@@ -227,9 +239,10 @@ test_unreadable_run_list_is_unknown() {
 
 test_unreadable_push_time_is_unknown() {
   reset_fixture
+  PR_UPDATED_AGE=""
   FAIL_ENDPOINT="repos/$REPO/commits/$HEAD_SHA"
   run_gate
-  assert_eq "$GATE_RC" 3 "an unreadable push time leaves the absence undecidable"
+  assert_eq "$GATE_RC" 3 "with both clocks gone the absence is undecidable"
   assert_contains "$GATE_OUTPUT" "UNKNOWN" "an unreadable push time should say UNKNOWN"
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "an undecidable absence must not print ABSENT"
 }
@@ -292,6 +305,72 @@ test_wait_ceiling_with_a_queued_run_is_no_verdict() {
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "the ceiling must not turn a queued run into absence"
 }
 
+# Round 1 of the review of ludics-lite#38, P1: a run cancelled while still QUEUED reports
+# `completed` with no check runs behind it. Stopped is not judged anywhere else in this file, and
+# it is not absence here.
+test_cancelled_run_is_not_absent() {
+  local concl
+  for concl in cancelled stale action_required; do
+    reset_fixture
+    RUNS_SEQ=("$(runs_json "$(jq -cn --arg c "$concl" \
+      '[{name:"ci", status:"completed", conclusion:$c}]')")")
+    run_gate
+    assert_eq "$GATE_RC" 4 "a $concl run left no verdict, and no absence either"
+    assert_contains "$GATE_OUTPUT" "stopped-not-judged" "the reason should name what happened"
+    assert_contains "$GATE_OUTPUT" "re-run the workflow" "the remedy should be named"
+    assert_not_contains "$GATE_OUTPUT" ": ABSENT" "a $concl run must not print ABSENT"
+  done
+}
+
+# Round 1 of the same review, P1: one finished workflow is evidence about one workflow. A repo
+# where A finishes with every job skipped while B's run row is not created yet must still hold.
+test_one_finished_run_does_not_bypass_the_grace() {
+  reset_fixture
+  COMMIT_AGE=30
+  PR_UPDATED_AGE=30
+  RUNS_SEQ=("$(runs_json '[{"name":"a","status":"completed","conclusion":"skipped"}]')")
+  run_gate
+  assert_eq "$GATE_RC" 4 "a finished run inside the grace does not settle the whole head"
+  assert_contains "$GATE_OUTPUT" "run-creation grace" "the hold should name the grace"
+  assert_contains "$GATE_OUTPUT" "1 workflow run(s) for this head finished" \
+    "the hold should still report what was seen"
+  assert_not_contains "$GATE_OUTPUT" ": ABSENT" \
+    "a finished run inside the grace must not print ABSENT"
+}
+
+# Round 1 of the same review, P1: an old commit pushed just now has a committer date older than any
+# grace. The PR's updated_at moves with the push, so the fresher of the two clocks wins.
+test_old_commit_freshly_pushed_waits() {
+  reset_fixture
+  COMMIT_AGE=86400
+  PR_UPDATED_AGE=20
+  run_gate
+  assert_eq "$GATE_RC" 4 "a day-old commit pushed 20s ago is inside the creation window"
+  assert_contains "$GATE_OUTPUT" "at most 20s" "the fresher clock should be the one reported"
+  assert_not_contains "$GATE_OUTPUT" ": ABSENT" \
+    "a freshly pushed old commit must not print ABSENT"
+}
+
+# ... and the converse: a stale PR whose head really has no CI still reaches its verdict.
+test_old_commit_and_quiet_pr_is_absent() {
+  reset_fixture
+  COMMIT_AGE=86400
+  PR_UPDATED_AGE=7200
+  run_gate
+  assert_eq "$GATE_RC" 0 "an old head on a quiet PR is the absence verdict"
+  assert_contains "$GATE_OUTPUT" ": ABSENT" "a quiet old head should print ABSENT"
+}
+
+# The push clock has two sources, and only losing BOTH is unknown.
+test_unreadable_commit_still_decides_on_the_pr_clock() {
+  reset_fixture
+  PR_UPDATED_AGE=20
+  FAIL_ENDPOINT="repos/$REPO/commits/$HEAD_SHA"
+  run_gate
+  assert_eq "$GATE_RC" 4 "the PR's own clock is enough to hold"
+  assert_contains "$GATE_OUTPUT" "run-creation grace" "the hold should name the grace"
+}
+
 tests=(
   test_inflight_run_is_not_absent
   test_queued_run_is_not_absent
@@ -302,6 +381,11 @@ tests=(
   test_advisory_run_does_not_hold_the_gate
   test_unreadable_run_list_is_unknown
   test_unreadable_push_time_is_unknown
+  test_cancelled_run_is_not_absent
+  test_one_finished_run_does_not_bypass_the_grace
+  test_old_commit_freshly_pushed_waits
+  test_old_commit_and_quiet_pr_is_absent
+  test_unreadable_commit_still_decides_on_the_pr_clock
   test_green_never_consults_the_run_list
   test_red_never_consults_the_run_list
   test_wait_holds_until_the_checks_appear
