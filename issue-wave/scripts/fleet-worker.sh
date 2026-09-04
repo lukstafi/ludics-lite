@@ -80,7 +80,11 @@ set -uo pipefail
 # host is local to nothing but the literal `local`, so every named box is reached over ssh.
 # FLEET_HOSTNAME_MAP is the lookup: `<glob>=<box>` pairs, first match wins, patterns are shell
 # globs against the lowercased short hostname (so `*mac-studio*` and `rog-nv*` read as expected).
-HOSTNAME_MAP="${FLEET_HOSTNAME_MAP:-*mac-studio*=mac-studio rog-nv*=rog-nv-wsl rog=rog-nv-wsl minix*=minix-amd-wsl}"
+# The Mac Studio's short hostname is `LukaszsacStudio` (Apple names the host after the owner and
+# model, not after the ssh alias), so it is listed beside the alias-shaped spelling: without it
+# the coordinator on the anchor box itself ssh'd to `mac-studio` and read its own lease and
+# halt files as unreachable (2026-09-04, the first fleet-wide wave).
+HOSTNAME_MAP="${FLEET_HOSTNAME_MAP:-*mac-studio*=mac-studio lukaszsacstudio*=mac-studio rog-nv*=rog-nv-wsl rog=rog-nv-wsl minix*=minix-amd-wsl}"
 detect_local_box() {
   local host pair
   local -a hostname_pairs=()
@@ -176,15 +180,24 @@ take_lock() {
   proc_start $$ > "$lock/start"; echo $$ > "$lock/pid"
 }
 release_lock() { rm -f "$1/pid" "$1/start"; rmdir "$1" 2>/dev/null; }
-# bounded <secs> <cmd...>: run with stdin from the caller, kill the whole group at the deadline
-# (no `timeout` on stock macOS). Output on stdout; exit 124 on expiry.
+# bounded [--stdin <file>] <secs> <cmd...>: run detached from the caller's stdin, kill the whole
+# group at the deadline (no `timeout` on stock macOS). Output on stdout; exit 124 on expiry.
+# The child's stdin is /dev/null unless --stdin names a file. A pipe into `bounded` is NOT
+# forwarded: a `&` command with job control off gets /dev/null for stdin, and macOS's bash 3.2
+# (what the local run_on's `bash -s` is) applies that even inside a pipeline, while bash 5 on the
+# Linux boxes kept the pipe -- so the live probe's prompt reached codex on rog and minix and
+# vanished on mac-studio ("No prompt provided via stdin.", reported as an empty refusal). And the
+# far-side scripts run under `bash -s`, whose stdin IS the script: a child inheriting it would
+# eat the rest of the preflight. Hence a file, never the inherited descriptor.
 bounded() {
+  local stdin=/dev/null
+  if [ "$1" = --stdin ]; then stdin="$2"; shift 2; fi
   local secs="$1"; shift
   local out rcf pid waited=0 rc c
   out=$(mktemp "${TMPDIR:-/tmp}/fw-probe.XXXXXX"); rcf=$(mktemp "${TMPDIR:-/tmp}/fw-probe-rc.XXXXXX")
   # Everything under the probe writes to files or /dev/null: nothing it spawns may inherit the
   # caller's stdout, or a lingering child would hold a command substitution open.
-  ( "$@" > "$out" 2>&1; echo $? > "$rcf" ) >/dev/null 2>&1 &
+  ( "$@" < "$stdin" > "$out" 2>&1; echo $? > "$rcf" ) >/dev/null 2>&1 &
   pid=$!
   while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$secs" ]; do sleep 1; waited=$((waited + 1)); done
   if kill -0 "$pid" 2>/dev/null; then
@@ -380,7 +393,9 @@ if [ "$codex" = 1 ]; then
   codex login status >/dev/null 2>&1 || note "codex not logged in"
   # A status read is not a proof either way; only a live headless turn is.
   if [ "$probe" = 1 ] && command -v codex >/dev/null 2>&1; then
-    out=$(cd / && printf 'Reply with the single word ok.' | bounded "$probe_timeout" codex exec --json --ephemeral --skip-git-repo-check -C / -); prc=$?
+    prompt=$(mktemp "${TMPDIR:-/tmp}/fw-prompt.XXXXXX"); printf 'Reply with the single word ok.' > "$prompt"
+    out=$(cd / && bounded --stdin "$prompt" "$probe_timeout" codex exec --json --ephemeral --skip-git-repo-check -C / -); prc=$?
+    rm -f "$prompt"
     if [ "$prc" -eq 124 ]; then note "codex headless probe timed out after ${probe_timeout}s"
     elif ! printf '%s' "$out" | grep -q '"type":"turn.completed"'; then
       note "codex cannot run headless: $(printf '%s' "$out" | grep -o '"message":"[^"]*"' | head -n1 | cut -c1-120)"
@@ -391,7 +406,9 @@ else
   # `claude auth status` reports loggedIn:true over an expired, unrefreshable OAuth session
   # (observed 2026-09-02 on minix); only a live turn proves the CLI can run headless here.
   if [ "$probe" = 1 ] && command -v claude >/dev/null 2>&1; then
-    out=$(cd / && printf 'Reply with the single word ok.' | bounded "$probe_timeout" claude -p --model haiku --output-format json --no-session-persistence); prc=$?
+    prompt=$(mktemp "${TMPDIR:-/tmp}/fw-prompt.XXXXXX"); printf 'Reply with the single word ok.' > "$prompt"
+    out=$(cd / && bounded --stdin "$prompt" "$probe_timeout" claude -p --model haiku --output-format json --no-session-persistence); prc=$?
+    rm -f "$prompt"
     if [ "$prc" -eq 124 ]; then note "claude headless probe timed out after ${probe_timeout}s"
     elif ! printf '%s' "$out" | grep -q '"is_error":false'; then
       note "claude cannot run headless: $(printf '%s' "$out" | grep -o '"result":"[^"]*"' | head -n1 | cut -c1-120)"

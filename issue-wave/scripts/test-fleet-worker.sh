@@ -141,6 +141,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 brief=$(cat)
+# The real CLI refuses an empty stdin prompt; the shim must too, or a probe whose prompt was lost
+# on the way (bash 3.2 backgrounding, the mac-studio preflight failure) passes here and fails live.
+[ -n "$brief" ] || { echo "Error: Input must be provided either through stdin or as a prompt argument when using --print" >&2; exit 1; }
 sleep_s=$(printf '%s\n' "$brief" | sed -n 's/^SLEEP \([0-9]*\).*/\1/p' | head -n1)
 [ -n "${SHIM_CLAUDE_HANG:-}" ] && sleep 30
 if [ "$fmt" = json ]; then
@@ -169,6 +172,7 @@ if [ "${1:-}" = resume ]; then shift; tid="$1"; shift; resumed=1; fi
 while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; esac; shift; done
 [ -n "$tid" ] || tid="0199-shim-$(date +%s)-$$"
 brief=$(cat)
+[ -n "$brief" ] || { echo "No prompt provided via stdin." >&2; exit 1; }
 if [ -n "${SHIM_CODEX_SILENT_RESUME:-}" ] && [ "$1" != "" ] 2>/dev/null; then :; fi
 if [ -n "${SHIM_CODEX_SILENT_RESUME:-}" ] && [ -n "$resumed" ]; then exit 0; fi
 printf '{"type":"thread.started","thread_id":"%s"}\n{"type":"turn.started"}\n' "$tid"
