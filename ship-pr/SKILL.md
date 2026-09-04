@@ -504,12 +504,20 @@ a manual stop, and re-running is what turns it into an answer; it is exit 4 like
 `--require-green` is the opposite hatch: it makes `absent` a refusal too (exit 4), and so is a
 green made only of `skipped` and `neutral` checks — nothing failed, but no build ran — for the
 close-out merges of *When the loop ends*, which rest on the record rather than on a 👍 and so must
+`--require-green` is the opposite hatch: it makes `absent` a refusal too (exit 4), and so is a
+green made only of `skipped` and `neutral` checks — nothing failed, but no build ran — for the
+close-out merges of *When the loop ends*, which rest on the record rather than on a 👍 and so must
 have READ a passing build rather than found nothing red. It also refuses `--auto` and a base
 with a merge queue (where `gh pr merge` is an enqueue, landing later on whatever head the PR has
-then), and when required checks turn the call into a deferred auto-merge anyway it disables that
-again and exits 1: a close-out merge lands the gated head now or not at all. With `--wait` it holds through the
-creation grace for a run to appear and then for its verdict; its refusal names the two ways out —
-wait longer, or establish that no run will come and merge without the flag, saying so.
+then; read before the wait and again right before the merge call), and when required checks turn
+the call into a deferred auto-merge anyway it disables that again and exits 1: a close-out merge
+lands the gated head now or not at all. With `--wait` it holds through the creation grace for a
+run to appear and then for its verdict. Its refusals have no "drop the flag" way out: a head that
+genuinely runs no build (path filters) gets one dispatched onto it (`gh workflow run <workflow>
+--ref <branch>`), or the merge goes to the maintainer with the record on the PR — the path-filter
+allowance the ordinary gate gives is exactly what a merge without a 👍 does not get.
+
+
 
 Whatever the verdict, the merge is bound to the head it was read for: `merge` passes
 `--match-head-commit` with that SHA, so a push that moves the PR during a long `--wait` makes the

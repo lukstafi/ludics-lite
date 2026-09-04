@@ -1800,11 +1800,30 @@ warn_base_drift() {
 
 # merge = read the build signal, then merge. The two are one command on purpose: a gate you have
 # to remember to run separately is the gate that was missing for seven merges.
+# Refuses (exit 1) when the PR's base has a merge queue, exit 3 when that could not be read —
+# the queue is GraphQL-only, and an unread answer is not "no queue". Called by merge under
+# --require-green, twice: before the wait and again right before the merge call.
+refuse_merge_queue() {
+  local pr="$1" base_ref queue
+  base_ref=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .base.ref)
+  [ "$?" -eq 0 ] && [ -n "$base_ref" ] || fail 3 "NOT merging $REPO#$pr: the base branch" \
+    "could not be read ($(gh_err_line)), so whether it has a merge queue is unknown."
+  queue=$(gh_retry read api graphql \
+    -f query='query($o:String!,$r:String!,$b:String!){repository(owner:$o,name:$r){mergeQueue(branch:$b){id}}}' \
+    -f o="${REPO%%/*}" -f r="${REPO#*/}" -f b="$base_ref" \
+    --jq '.data.repository.mergeQueue.id // ""')
+  [ "$?" -eq 0 ] || fail 3 "NOT merging $REPO#$pr: could not read whether $base_ref has a" \
+    "merge queue ($(gh_err_line)); a close-out merge does not guess. Retry."
+  [ -z "$queue" ] || fail 1 "REFUSING to merge $REPO#$pr: $base_ref has a merge queue, so" \
+    "\`gh pr merge\` would ENQUEUE the PR to land later on whatever head it has then, and a" \
+    "close-out merge lands the gated head now or not at all. Hand the merge to the maintainer" \
+    "with the record on the PR."
+}
+
 cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
   local override="" wait_for=0 allow_no_verdict="" require_green="" gate out rc attempt=1 mergeable state arg
-  local base_ref queue
   local -a gh_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1871,23 +1890,10 @@ cmd_merge() {
   pr_arg "$pr"
   # A merge queue turns `gh pr merge` into an ENQUEUE — the PR lands later, on whatever head it
   # has then, and --disable-auto does not take an entry out of a queue. A close-out merge lands
-  # the gated head now or refuses, so on a queued base it refuses before calling merge at all.
-  # The queue is GraphQL-only; an unread answer is exit 3, not "no queue".
-  if [ -n "$require_green" ]; then
-    base_ref=$(gh_retry read api "repos/$REPO/pulls/$PR_NUM" --jq .base.ref)
-    [ "$?" -eq 0 ] && [ -n "$base_ref" ] || fail 3 "NOT merging $REPO#$PR_NUM: the base branch" \
-      "could not be read ($(gh_err_line)), so whether it has a merge queue is unknown."
-    queue=$(gh_retry read api graphql \
-      -f query='query($o:String!,$r:String!,$b:String!){repository(owner:$o,name:$r){mergeQueue(branch:$b){id}}}' \
-      -f o="${REPO%%/*}" -f r="${REPO#*/}" -f b="$base_ref" \
-      --jq '.data.repository.mergeQueue.id // ""')
-    [ "$?" -eq 0 ] || fail 3 "NOT merging $REPO#$PR_NUM: could not read whether $base_ref has a" \
-      "merge queue ($(gh_err_line)); a close-out merge does not guess. Retry."
-    [ -z "$queue" ] || fail 1 "REFUSING to merge $REPO#$PR_NUM: $base_ref has a merge queue," \
-      "so \`gh pr merge\` would ENQUEUE the PR to land later on whatever head it has then, and" \
-      "a close-out merge lands the gated head now or not at all. Merge it by hand through the" \
-      "queue with the record on the PR, or merge without --require-green, saying so."
-  fi
+  # the gated head now or refuses, so on a queued base it refuses before calling merge at all:
+  # once here, before a wait that can run two hours, and once more right before the call, since
+  # the base can be retargeted or a queue enabled during the wait.
+  [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
   gate_checks "$PR_NUM" "$wait_for" "$require_green"
   gate=$?
   case "$gate" in
@@ -1927,8 +1933,9 @@ cmd_merge() {
     fail 4 "REFUSING to merge $REPO#$PR_NUM: --require-green and the build signal is $VERDICT," \
       "not green. A close-out merge needs a green verdict READ on the final head: wait for a run" \
       "to appear and finish (--wait holds $CHECKS_ABSENT_GRACE s for one to appear, then for its" \
-      "verdict), or confirm why none will (path filters) and merge without --require-green," \
-      "saying so."
+      "verdict). If the head genuinely runs no build (path filters), get one onto it — dispatch" \
+      "the workflow on the branch (gh workflow run) — or hand the merge to the maintainer with" \
+      "the record; a close-out merge is never made by dropping --require-green."
   fi
   # Green by skips alone is the path-filter case wearing a verdict: every check concluded, none
   # of them ran a build. The ordinary gate lets that through (nothing failed); a close-out merge
@@ -1942,8 +1949,9 @@ cmd_merge() {
   if [ -n "$require_green" ] && [ "${CHECK_PASSED:-0}" -eq 0 ]; then
     fail 4 "REFUSING to merge $REPO#$PR_NUM: --require-green and every build check on the head" \
       "was skipped or neutral — green, but no build RAN. A close-out merge needs at least one" \
-      "check that concluded success; if the head genuinely runs no build (job-level path" \
-      "filters), merge without --require-green, saying so."
+      "check that concluded success. If the head genuinely runs no build (job-level path" \
+      "filters), get one onto it (gh workflow run) or hand the merge to the maintainer with" \
+      "the record; a close-out merge is never made by dropping --require-green."
   fi
   # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
   # verdict is the final thing on screen before the merge itself. A loud WARNING, not a gate: the
@@ -1951,6 +1959,7 @@ cmd_merge() {
   # head's green run, and hands semantic drift to the post-merge integration loop. A 3 (unread)
   # has already said UNKNOWN loudly; neither outcome blocks the merge.
   warn_base_drift "$PR_NUM" || true
+  [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
   # The verdict above is about ONE head, the one gate_checks read — and a --wait is minutes to
   # hours long, during which a push can move the PR. `gh pr merge` merges whatever the head is at
   # the moment of the call; --match-head-commit makes it refuse unless that is still the gated
@@ -2008,8 +2017,8 @@ cmd_merge() {
     if gh_retry write pr merge "$PR_NUM" --repo "$REPO" --disable-auto >/dev/null; then
       fail 1 "NOT merged, and auto-merge DISABLED again: $REPO#$PR_NUM ($state) — the base defers" \
         "merges to its required checks or a merge queue, and a close-out merge is never" \
-        "deferred. Merge it when the base allows a direct merge, or without --require-green" \
-        "with the reason on record."
+        "deferred. Merge it when the base allows a direct merge, or hand it to the maintainer" \
+        "with the record on the PR."
     fi
     fail 3 "NOT merged, and auto-merge could NOT be disabled ($(gh_err_line)): $REPO#$PR_NUM" \
       "($state) is armed to land a LATER head ungated. Disable it by hand (gh pr merge" \

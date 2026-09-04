@@ -274,6 +274,12 @@ test_require_green_refuses_a_merge_queue() {
   assert_no_merge_call
   run_merge --require-green
   assert_eq "$MERGE_RC" 0 "no queue: --require-green merges ($MERGE_OUTPUT)"
+  # Read twice: before the wait, and again right before the merge call — a queue can be
+  # enabled or the PR retargeted during a two-hour wait.
+  assert_eq "$(grep -c 'mergeQueue(branch:' "$MERGE_ARGS_FILE")" 2 "the queue is read before and after the gate"
+  local calls
+  calls=$(grep -n 'mergeQueue\|pr merge' "$MERGE_ARGS_FILE" | cut -d: -f2- | cut -c1-14 | tr '\n' ',')
+  assert_eq "$calls" "CALL api graph,CALL api graph,CALL pr merge ," "both reads precede the merge call"
 }
 
 tests=(
