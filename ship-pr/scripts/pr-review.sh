@@ -113,8 +113,9 @@
 #                                          # checks, then merge; refuses on red without --override,
 #                                          # on NO verdict without --allow-no-verdict, and — with
 #                                          # --require-green (a close-out merge) — on ABSENT, on
-#                                          # green-by-skips-only, on --auto, and on a deferred
-#                                          # auto-merge (which it disables again); and WARNS
+#                                          # green-by-skips-only, on --auto, on a base with a
+#                                          # merge queue, and on a deferred auto-merge (which it
+#                                          # disables again); and WARNS
 #                                          # loudly when the branch is far behind its base
 #   pr-review.sh base [owner/name] [branch] [--wait[=seconds]]
 #                                          # is the branch you are about to work off CI-green?
@@ -1803,6 +1804,7 @@ cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
   local override="" wait_for=0 allow_no_verdict="" require_green="" gate out rc attempt=1 mergeable state arg
+  local base_ref queue
   local -a gh_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1867,6 +1869,25 @@ cmd_merge() {
       "same red on master before this branch existed'."
   fi
   pr_arg "$pr"
+  # A merge queue turns `gh pr merge` into an ENQUEUE — the PR lands later, on whatever head it
+  # has then, and --disable-auto does not take an entry out of a queue. A close-out merge lands
+  # the gated head now or refuses, so on a queued base it refuses before calling merge at all.
+  # The queue is GraphQL-only; an unread answer is exit 3, not "no queue".
+  if [ -n "$require_green" ]; then
+    base_ref=$(gh_retry read api "repos/$REPO/pulls/$PR_NUM" --jq .base.ref)
+    [ "$?" -eq 0 ] && [ -n "$base_ref" ] || fail 3 "NOT merging $REPO#$PR_NUM: the base branch" \
+      "could not be read ($(gh_err_line)), so whether it has a merge queue is unknown."
+    queue=$(gh_retry read api graphql \
+      -f query='query($o:String!,$r:String!,$b:String!){repository(owner:$o,name:$r){mergeQueue(branch:$b){id}}}' \
+      -f o="${REPO%%/*}" -f r="${REPO#*/}" -f b="$base_ref" \
+      --jq '.data.repository.mergeQueue.id // ""')
+    [ "$?" -eq 0 ] || fail 3 "NOT merging $REPO#$PR_NUM: could not read whether $base_ref has a" \
+      "merge queue ($(gh_err_line)); a close-out merge does not guess. Retry."
+    [ -z "$queue" ] || fail 1 "REFUSING to merge $REPO#$PR_NUM: $base_ref has a merge queue," \
+      "so \`gh pr merge\` would ENQUEUE the PR to land later on whatever head it has then, and" \
+      "a close-out merge lands the gated head now or not at all. Merge it by hand through the" \
+      "queue with the record on the PR, or merge without --require-green, saying so."
+  fi
   gate_checks "$PR_NUM" "$wait_for" "$require_green"
   gate=$?
   case "$gate" in
@@ -1980,9 +2001,10 @@ cmd_merge() {
   *"merged=true"*) return 0 ;;
   esac
   if [ -n "$require_green" ]; then
-    # A merge queue or required checks turned the call into a deferred auto-merge, which
-    # --match-head-commit guarded only at enable time: a later push would land ungated. Take
-    # it back and refuse, loudly; the caller decides what to do about the base's requirements.
+    # Required checks turned the call into a deferred auto-merge (a merge queue was refused
+    # above, before the call), which --match-head-commit guarded only at enable time: a later
+    # push would land ungated. Take it back and refuse, loudly; the caller decides what to do
+    # about the base's requirements.
     if gh_retry write pr merge "$PR_NUM" --repo "$REPO" --disable-auto >/dev/null; then
       fail 1 "NOT merged, and auto-merge DISABLED again: $REPO#$PR_NUM ($state) — the base defers" \
         "merges to its required checks or a merge queue, and a close-out merge is never" \
