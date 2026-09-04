@@ -569,6 +569,21 @@ test_two_events_of_one_workflow_are_two_runs() {
   assert_contains "$GATE_OUTPUT" "NO VERDICT YET" "the queued invocation should hold the gate"
 }
 
+# Round 5 of the review, P2: two independent invocations of one workflow at one head share a
+# workflow id AND an event, so no key tells them apart — but a queued row has not been superseded
+# by anything, and only finished rows compete to be the answer.
+test_queued_invocation_survives_a_finished_twin() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ci","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"id":201,"workflow_id":7,"event":"workflow_dispatch","name":"ci",
+                            "status":"completed","conclusion":"success"},
+                           {"id":202,"workflow_id":7,"event":"workflow_dispatch","name":"ci",
+                            "status":"queued","conclusion":null}]')")
+  run_gate
+  assert_eq "$GATE_RC" 4 "a queued invocation is not superseded by a finished twin"
+  assert_contains "$GATE_OUTPUT" "NO VERDICT YET" "the queued invocation should hold the gate"
+}
+
 # Round 4, P2: a stopped check under a queued run used to break the wait loop at once.
 test_stopped_checks_with_a_queued_run_keep_waiting() {
   reset_fixture
@@ -663,6 +678,7 @@ tests=(
   test_future_commit_date_falls_back_to_the_pr_clock
   test_future_commit_date_still_holds_a_fresh_pr
   test_two_events_of_one_workflow_are_two_runs
+  test_queued_invocation_survives_a_finished_twin
   test_stopped_checks_with_a_queued_run_keep_waiting
   test_completed_run_without_a_conclusion_is_unjudged
   test_advisory_job_failure_is_not_a_red_run

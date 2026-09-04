@@ -409,10 +409,11 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   so a long-local commit pushed just now counts as fresh and a future commit date does not blind
   the gate), and only past that is `ABSENT` the verdict — with the evidence on the line.
 
-Only the newest run of each workflow **and event** is judged, the same `filter=latest` semantics
-the check lookup asks for: a re-triggered invocation supersedes its own cancelled predecessor, but
-one file triggered on both `push` and `pull_request` produces two independent runs that must both
-be. The advisory list is a deny-list of check, job and workflow names in all directions — a run
+Only the newest **completed** run of each workflow and event is judged, the same `filter=latest`
+semantics the check lookup asks for: a re-triggered invocation supersedes its own cancelled
+predecessor, while one file triggered on both `push` and `pull_request` produces two independent
+runs that are both judged — and a queued run is never folded away at all, since supersession is
+something that happens to a run that stopped. The advisory list is a deny-list of check, job and workflow names in all directions — a run
 whose red is explained entirely by advisory jobs is not a red build signal, since `build_checks`
 already dropped those checks on purpose. A run list that cannot be read is exit 3 even under a
 pending check: an unread run list cannot rule out a red that no check run will ever carry.

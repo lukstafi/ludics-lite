@@ -1443,20 +1443,29 @@ run_signal() {
   # runs at the same head that share a workflow id — collapsing those hides a queued invocation
   # behind a newer one that finished (round 4). cmd_base does not need this because it queries a
   # single event; this feed is every event at a head.
+  #
+  # And the fold only ever collapses COMPLETED rows. No key identifies an invocation — two manual
+  # dispatches of one workflow at one head share workflow id and event and are independent work
+  # (round 5) — but supersession is something that happens to a run that STOPPED: a queued or
+  # running row has not been superseded by anything, so it is counted, never folded away. That is
+  # what reconciles round 3's ask (a cancelled predecessor must not park the gate) with round 5's
+  # (a queued sibling must not hide behind a finished one) without an identity the API does not
+  # give: unfinished work is always work, and only finished rows compete to be the answer.
   while IFS=$'\t' read -r rid wid event name status concl; do
     [ -n "$rid" ] || continue
     is_advisory "$name" && continue
-    case "$seen_ids" in *" $wid/$event "*) continue ;; esac
-    seen_ids="$seen_ids$wid/$event "
-    runs=$((runs + 1))
     # A run reported `completed` before its conclusion is populated is not judged either: the
     # projection renders that null as `pending`, which is neither red nor stopped, and counting it
     # as finished-and-judged would let a green check — or, on a checkless head, the eventual
     # ABSENT — carry a workflow that has concluded nothing (round 4).
     if [ "$status" != completed ] || [ "$(conclusion_class "$concl")" = pending ]; then
+      runs=$((runs + 1))
       inflight=$((inflight + 1))
       continue
     fi
+    case "$seen_ids" in *" $wid/$event "*) continue ;; esac
+    seen_ids="$seen_ids$wid/$event "
+    runs=$((runs + 1))
     case "$(conclusion_class "$concl")" in
     red) red_rows="${red_rows}${rid}"$'\t'"${name}"$'\t'"${concl}"$'\n' ;;
     nogo) nogo=$((nogo + 1)) ;;

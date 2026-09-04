@@ -189,11 +189,12 @@ fresher of the commit date and the PR's `updated_at` (each validated on its own,
 commit pushed a moment ago counts as fresh and a future commit date does not blind the gate).
 Exit 1: a run that concluded red without producing a check to be red, over a green, pending or
 stopped check alike. Exit 0: green over a finished, judged run list, and the absence itself once
-the grace is spent. A read that fails is exit 3, never a reassuring 0. Superseded runs are folded
-away per workflow AND event, so a re-triggered invocation does not park the gate on its cancelled
-predecessor while one file's `push` and `pull_request` runs still count separately; and a run
-whose red is explained entirely by advisory jobs is not a red build signal, since those checks
-were dropped on purpose.
+the grace is spent. A read that fails is exit 3, never a reassuring 0. Only finished runs are
+folded away as superseded, per workflow and event, so a re-triggered invocation does not park the
+gate on its cancelled predecessor while one file's `push` and `pull_request` runs still count
+separately and a queued invocation is never hidden behind a finished twin; and a run whose red is
+explained entirely by advisory jobs is not a red build signal, since those checks were dropped on
+purpose.
 
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and
