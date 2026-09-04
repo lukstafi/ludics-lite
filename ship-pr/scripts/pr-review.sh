@@ -128,12 +128,15 @@
 #
 # Exit codes: 0 the command did what it says (and any fact it printed came from a call that
 #             answered); 1 the fact does not hold (the window stayed quiet, no such thread, the API
-#             rejected the request, a build check is RED, the merge was refused); 2
+#             rejected the request, a build check or a checkless workflow run is RED, the merge was
+#             refused); 2
 #             usage/configuration error; 3 TRANSPORT failure — nothing was learned, so retry rather
 #             than concluding anything. 1 and 3 are kept apart everywhere. `checks`, `base` and
-#             `merge` add 4: no verdict yet — the build has not finished, or every finished job was
-#             cancelled. 4 is not a pass and not a failure, and it is kept apart from 0 for the
-#             same reason 3 is: "nothing has failed" and "everything passed" are different facts.
+#             `merge` add 4: no verdict yet — the build has not finished, every finished job was
+#             cancelled, or a workflow run for the head is queued, running, stopped without a
+#             verdict, or still to be created. 4 is not a pass and not a failure, and it is kept
+#             apart from 0 for the same reason 3 is: "nothing has failed" and "everything passed"
+#             are different facts.
 #             From `merge`, 4 means the merge was REFUSED for want of a verdict (see
 #             --allow-no-verdict).
 #
@@ -147,13 +150,16 @@
 #      saying so (1200), SHIP_PR_REVIEW_STALL=seconds a live 👀 may run before it gets the same
 #      verdict (2×GRACE). Both are measured from the PR's own timestamps, not from when the watch
 #      started, so they are reached ACROSS windows — a 900s window cannot outrun a 1200s grace.
-#      SHIP_PR_ADVISORY_CHECKS=ERE of check/workflow names the build gate ignores (default: the
-#      review app's check and the github-pages deploys), SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
+#      SHIP_PR_ADVISORY_CHECKS=ERE of check, job and workflow names the build gate ignores
+#      (default: the review app's check and the github-pages deploys) — a run whose red is
+#      explained entirely by advisory JOBS is not a red build signal either, SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
 #      out for a build verdict (7200 — the runner queue alone ran ~2h deep on 2026-08-23),
 #      SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60), SHIP_PR_CHECKS_HEARTBEAT=seconds
 #      between the one-line "still waiting" progress notes a `--wait` prints (600),
-#      SHIP_PR_BASE_ABSENT_GRACE=seconds `base --wait` allows for a run on the tip to APPEAR
-#      before settling for an older verdict (300; paths-ignore pushes never get one),
+#      SHIP_PR_BASE_ABSENT_GRACE=seconds a commit with no workflow run yet is allowed before its
+#      absence is read as a fact (300; paths-ignore pushes never get one). `base --wait` applies
+#      it to the tip before settling for an older verdict, and `checks`/`merge` apply it to the
+#      head before calling a build signal ABSENT rather than not-created-yet (ludics-lite#24),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences the commit-count warning). A nonempty file overlap still warns at any count; no
 #      base-drift warning blocks the merge.
@@ -1228,13 +1234,17 @@ BUILD_ADVISORY="${SHIP_PR_ADVISORY_CHECKS:-^(claude|Claude Code|github pages doc
 CHECKS_INTERVAL="${SHIP_PR_CHECKS_INTERVAL:-60}"
 CHECKS_WAIT="${SHIP_PR_CHECKS_WAIT:-7200}"
 CHECKS_HEARTBEAT="${SHIP_PR_CHECKS_HEARTBEAT:-600}"
-BASE_ABSENT_GRACE="${SHIP_PR_BASE_ABSENT_GRACE:-300}"
+# Named for `base --wait`, which asked the question first, but the question is not the base's: how
+# long a push may go without a run before absence becomes a fact. The checks gate asks it too
+# (see absent_signal), so the shell variable drops the prefix and the ENV name keeps it — nobody's
+# scripts should have to be edited for a widened meaning.
+ABSENT_GRACE="${SHIP_PR_BASE_ABSENT_GRACE:-300}"
 # Whole seconds, validated up front: these feed shell arithmetic (deadlines, heartbeats, and the
 # sleep caps against the remaining deadline), where a fractional value does not degrade gracefully
 # — `[ 0.5 -le N ]` errors and takes the fallback arm, which for the interval means one read and
 # then a sleep to the full ceiling. A zero interval would busy-loop the API instead of pacing it.
-case "$BASE_ABSENT_GRACE" in
-'' | *[!0-9]*) die "SHIP_PR_BASE_ABSENT_GRACE must be a number of seconds, got '$BASE_ABSENT_GRACE'" ;;
+case "$ABSENT_GRACE" in
+'' | *[!0-9]*) die "SHIP_PR_BASE_ABSENT_GRACE must be a number of seconds, got '$ABSENT_GRACE'" ;;
 esac
 case "$CHECKS_INTERVAL" in
 '' | *[!0-9]*) die "SHIP_PR_CHECKS_INTERVAL must be whole seconds, got '$CHECKS_INTERVAL'" ;;
@@ -1325,13 +1335,247 @@ summarize_checks() {
   CHECK_GREEN="$green"
 }
 
-# Reads the PR's head SHA and judges its build signal. Sets VERDICT and prints the report.
-# 0 = green or absent (nothing is red), 1 = RED, 3 = the API did not answer, 4 = no verdict yet
-# (still running, or every finished job was cancelled).
+# The check-run list is not the whole build signal, and after a push it is not even a complete
+# view of itself. ABSENT was two facts wearing one word — "no workflow covers this commit" (path
+# filters: ocannl's `ci` ignores `docs/**`) and "the checks of the run for this commit DO NOT EXIST
+# YET" — and the second one used to leave the gate as exit 0 while `actions/runs` for that same
+# head already said `in_progress` (ludics-lite#24). That is the shape a merge is armed on and
+# reads nothing: ocannl-staging#491 merged exactly that way.
+#
+# The same gap has three more mouths, all found reviewing the fix (ludics-lite#38, round 2), and
+# they are one defect: the check list can be EMPTY, PARTIAL, or SILENT about a run that never got
+# as far as a job.
+#   - a workflow that fails before its jobs start (a broken workflow file — `startup_failure` —
+#     or a `failure`/`timed_out` at the run level) leaves NO check run to be red;
+#   - a run cancelled while still queued reports `completed` with nothing behind it, and stopped
+#     is not judged anywhere else in this file (see conclusion_class, cmd_base's nogo_at_tip);
+#   - one workflow's green check says nothing about a SIBLING workflow whose run is still queued
+#     and has yet to create its own — a green verdict over an unjudged build.
+# So the head's RUN list is read whenever the check fold says there is nothing left to wait for
+# (green or absent), and it can overrule that reading. `actions/runs?head_sha=` is the right feed
+# for it: a run row exists from the moment the run is queued, before any of its check-runs, and it
+# carries the run-level conclusion the check list cannot. Paginated, because a head with a long
+# re-run history can push a queued run off the first page.
+#
+# Prints "<red count><TAB><reason>" — a count, because gate_checks reports through CHECK_RED and a
+# command substitution cannot hand it back a variable — and returns
+#   1  RED at the run level: a non-advisory run for this head concluded red with no check behind
+#      it. A red is a verdict, so it ends a --wait like any other.
+#   4  no verdict YET — a run is queued or in flight, a run completed stopped-not-judged, or the
+#      head has no checks at all and is inside the run-creation grace. Under --wait, keep waiting;
+#      without one, 4 is still the honest answer, and it is what makes `merge` refuse.
+#   0  the check fold's own reading stands: every run for the head finished and was judged.
+#   3  the runs or the clock could not be read — UNKNOWN, which is not "nothing is red".
+#
+# The run-creation grace applies to every CHECKLESS head, not only to one with no run row at all:
+# one finished run is evidence about one workflow, and a repo where A completes with every job
+# skipped while B's row has not appeared would otherwise read as settled absence in the middle of
+# the creation race. It is deliberately NOT applied when the head has checks: run rows for one
+# event are created together, so a head showing any check has had its rows created, and holding
+# every fresh green head for five minutes would buy nothing. The alternative — diffing the run
+# list against `actions/workflows` — buys precision this gate cannot use, since a dispatch- or
+# schedule-only workflow is permanently "missing" and would park every absence on the full grace.
+#
+# Advisory names are filtered here as everywhere else, and for the same reason in both directions:
+# the review app's own check must not hold a wait open, and a repo whose only in-flight run is
+# advisory has no build signal coming. A run's `.name` is the workflow's name unless the workflow
+# sets `run-name:`, in which case a custom name can miss the advisory ERE — that only costs a hold
+# for a run whose verdict would have been ignored, which is the safe direction to be wrong in.
+# printf reuses its format string for every argument, so "%s" over a fragmented message is the
+# concatenation the reason lines want — but the leading red count must be emitted ONCE, or every
+# fragment carries a copy of it (caught by the fixture suite the moment the messages grew a second
+# fragment). One printf for the count, one for the message.
+run_reason() {
+  local n="$1"
+  shift
+  printf '%s\t' "$n"
+  printf '%s' "$@"
+}
+
+# A workflow run's aggregate conclusion is not always a build verdict. The advisory list is a
+# deny-list of CHECK names (SHIP_PR_ADVISORY_CHECKS), and build_checks applies it per check run —
+# so a non-advisory workflow carrying one advisory JOB reports `failure` at the run level when
+# only that job failed, and reading the run's red would restore a failure the gate was configured
+# to ignore (ludics-lite#38, round 4). The run's own jobs settle it: true when the run has jobs
+# and none of the non-advisory ones is red, i.e. its red is entirely explained by jobs the gate
+# ignores. A run with NO jobs (the `startup_failure` case this red branch exists for) is not
+# explained, and neither is a jobs read that failed — a red this cannot disprove stands.
+run_red_is_advisory_only() {
+  local id="$1" raw rc jname jconcl jobs=0 hard=0
+  raw=$(gh_retry read api --paginate "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
+    --jq '.jobs[] | [(.name // "-"), (.conclusion // "pending")] | @tsv')
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  while IFS=$'\t' read -r jname jconcl; do
+    [ -n "$jname" ] || continue
+    jobs=$((jobs + 1))
+    is_advisory "$jname" && continue
+    [ "$(conclusion_class "$jconcl")" = red ] && hard=$((hard + 1))
+  done <<<"$raw"
+  [ "$jobs" -gt 0 ] && [ "$hard" -eq 0 ]
+}
+
+run_signal() {
+  local sha="$1" pr_at="${2:-}" checks="${3:-0}" raw rc rid wid event name status concl
+  local seen_ids=" " red_rows="" rname rconcl
+  local runs=0 inflight=0 nogo=0 red=0 red_note="" pushed_at age pr_age t seen
+  raw=$(gh_retry read api --paginate \
+    "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
+    --jq '.workflow_runs[] | [((.id // 0) | tostring), ((.workflow_id // 0) | tostring),
+          (.event // "-"), (.name // "-"), (.status // "unknown"), (.conclusion // "pending")]
+          | @tsv')
+  rc=$?
+  [ "$rc" -eq 0 ] || {
+    run_reason 0 "the workflow runs for this head could not be read ($(gh_err_line))"
+    return 3
+  }
+  # One row per INVOCATION, the newest — the same `filter=latest` semantics build_checks asks the
+  # check API for, and for the same reason: a head can carry several runs of one workflow (a
+  # queued invocation cancelled, then a fresh one that passed), and the superseded row's
+  # conclusion is not the current answer. Without this an old cancelled row parks the gate at 4
+  # forever and an old checkless failure holds it RED over a workflow that has since gone green
+  # (ludics-lite#38, round 3). The feed is newest-first, which is what cmd_base's fold relies on
+  # too, so the first row seen for a key is the one that counts.
+  #
+  # The key is workflow id AND event, not the workflow id alone. The id is there because two
+  # workflow FILES can share a display name and a name-keyed fold would collapse them; the event
+  # is there because ONE file triggered on both `push` and `pull_request` produces two INDEPENDENT
+  # runs at the same head that share a workflow id — collapsing those hides a queued invocation
+  # behind a newer one that finished (round 4). cmd_base does not need this because it queries a
+  # single event; this feed is every event at a head.
+  #
+  # And the fold only ever collapses COMPLETED rows. No key identifies an invocation — two manual
+  # dispatches of one workflow at one head share workflow id and event and are independent work
+  # (round 5) — but supersession is something that happens to a run that STOPPED: a queued or
+  # running row has not been superseded by anything, so it is counted, never folded away. That is
+  # what reconciles round 3's ask (a cancelled predecessor must not park the gate) with round 5's
+  # (a queued sibling must not hide behind a finished one) without an identity the API does not
+  # give: unfinished work is always work, and only finished rows compete to be the answer.
+  while IFS=$'\t' read -r rid wid event name status concl; do
+    [ -n "$rid" ] || continue
+    is_advisory "$name" && continue
+    # A run reported `completed` before its conclusion is populated is not judged either: the
+    # projection renders that null as `pending`, which is neither red nor stopped, and counting it
+    # as finished-and-judged would let a green check — or, on a checkless head, the eventual
+    # ABSENT — carry a workflow that has concluded nothing (round 4).
+    if [ "$status" != completed ] || [ "$(conclusion_class "$concl")" = pending ]; then
+      runs=$((runs + 1))
+      inflight=$((inflight + 1))
+      continue
+    fi
+    case "$seen_ids" in *" $wid/$event "*) continue ;; esac
+    seen_ids="$seen_ids$wid/$event "
+    runs=$((runs + 1))
+    case "$(conclusion_class "$concl")" in
+    red) red_rows="${red_rows}${rid}"$'\t'"${name}"$'\t'"${concl}"$'\n' ;;
+    nogo) nogo=$((nogo + 1)) ;;
+    esac
+  done <<<"$raw"
+  # Each red run gets the advisory-job read before it counts — one call, only ever for a run that
+  # is already red, and only when no check run reported that failure.
+  if [ -n "$red_rows" ]; then
+    while IFS=$'\t' read -r rid rname rconcl; do
+      [ -n "$rid" ] || continue
+      run_red_is_advisory_only "$rid" && continue
+      red=$((red + 1))
+      [ -n "$red_note" ] || red_note="$rname ($rconcl)"
+    done <<<"$red_rows"
+  fi
+  # Red first: it is a verdict, and a verdict ends the wait. Reaching here at all means the check
+  # fold found no red, so this run's failure is one no check run reported — the whole reason to
+  # look at the run list rather than trusting the check list to carry every failure.
+  if [ "$red" -gt 0 ]; then
+    run_reason "$red" "$red workflow run(s) for this head concluded red with no build check" \
+      " to show for it — $red_note; a run that fails before its jobs start leaves nothing in the" \
+      " check list"
+    return 1
+  fi
+  if [ "$inflight" -gt 0 ]; then
+    run_reason 0 "$inflight workflow run(s) for this head have no conclusion yet (queued," \
+      " running, or completed with none recorded) — their check runs may not exist yet"
+    return 4
+  fi
+  if [ "$nogo" -gt 0 ]; then
+    run_reason 0 "$nogo workflow run(s) for this head completed stopped-not-judged (cancelled," \
+      " stale or action_required) with no build check behind them — stopped is not absence and" \
+      " not a verdict: re-run the workflow"
+    return 4
+  fi
+  # Every run for this head is finished and judged. With checks in hand AND at least one Actions
+  # run behind them, the fold above has read the signal and its verdict stands — run rows for one
+  # event are created together, so a head showing a run has had its rows created, and holding
+  # every fresh green head for the grace would buy nothing. Checks from a NON-Actions provider
+  # prove nothing about that (build_checks deliberately accepts every provider's check runs), so
+  # an early Codecov green over an empty run list falls through to the grace like any other
+  # checkless head (ludics-lite#38, round 3).
+  case "$checks" in '' | *[!0-9]*) checks=0 ;; esac
+  if [ "$checks" -gt 0 ] && [ "$runs" -gt 0 ]; then
+    run_reason 0 "$runs workflow run(s) for this head are finished and judged"
+    return 0
+  fi
+  # Checkless: how long there has been to create a run. Two clocks, and the FRESHER wins, because
+  # each covers the other's blind spot. The head's committer date is the push clock the rest of
+  # this file uses (pr_state's review clock): a rebase, an amend and a cherry-pick all refresh it,
+  # which covers every way a PR head moves — but not a commit that sat locally for hours before
+  # its first push, where it is already older than any grace and would settle the absence on the
+  # spot. The PR's own `updated_at` covers exactly that: a push to the head branch updates the PR,
+  # so it is never OLDER than the push, whatever the commit's date says (measured live on
+  # ludics-lite#38: 09:12:31Z before a push of an older commit series, 09:17:29Z five seconds
+  # after). It can be fresher than the push — a comment moves it too — and that costs at most one
+  # grace of holding after unrelated PR activity, the safe direction for a merge gate.
+  pushed_at=$(gh_retry read api "repos/$REPO/commits/$sha" --jq .commit.committer.date) ||
+    pushed_at=""
+  # Each clock validated on its OWN, then the freshest of what survives — not `newest` over the
+  # raw timestamps. A committer date in the FUTURE (clock skew, or an explicit GIT_COMMITTER_DATE)
+  # is the newest string there is, and age_of answers a negative age with "-", so picking it would
+  # throw away a perfectly good PR clock and leave the gate UNKNOWN until wall time caught up —
+  # for hours, on a path-filtered PR that has no other way past this branch (round 3).
+  age=""
+  pr_age=$(age_of "$pr_at")
+  for t in "$(age_of "$pushed_at")" "$pr_age"; do
+    case "$t" in '' | *[!0-9]*) continue ;; esac
+    [ -n "$age" ] && [ "$age" -le "$t" ] || age="$t"
+  done
+  if [ -z "$age" ]; then
+    run_reason 0 "no usable clock for this head: neither its commit date nor the PR's updated_at" \
+      " could be read ($(gh_err_line)), or both are in the future, so the run-creation window" \
+      " is unknown"
+    return 3
+  fi
+  if [ "$runs" -gt 0 ]; then
+    seen="$runs workflow run(s) for this head finished and left no build check behind"
+  else
+    seen="no workflow run exists for this head"
+  fi
+  if [ "$age" -lt "$ABSENT_GRACE" ]; then
+    run_reason 0 "$seen, and the head has been in place at most $(fmt_age "$age") — inside the" \
+      " $(fmt_age "$ABSENT_GRACE") run-creation grace (SHIP_PR_BASE_ABSENT_GRACE), so a run" \
+      " may still appear"
+    return 4
+  fi
+  run_reason 0 "$seen in the $(fmt_age "$age") since it appeared — past the" \
+    " $(fmt_age "$ABSENT_GRACE") run-creation grace"
+  return 0
+}
+
+# Reads the PR's head SHA and judges its build signal, from the check runs AND — whenever those
+# leave nothing to wait for — the head's workflow runs. Sets VERDICT and prints the report.
+# 0 = green, or an absence run_signal confirmed is the verdict (nothing is red), 1 = RED (a check
+# or a checkless run), 3 = the API did not answer, 4 = no verdict yet (still running, stopped
+# without a verdict, or a run for this head has yet to produce its checks).
 gate_checks() {
   local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining
-  sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .head.sha)
+  local run_why="" run_info note pr_at=""
+  # One read for both: the head to judge, and the PR's own last-updated stamp, which run_signal
+  # uses as the push clock a stale committer date cannot provide. Tab-separated with a placeholder
+  # for the same reason build_checks uses one — an empty field would collapse under tab-IFS.
+  # Captured first, then split: a process substitution would hand `read` the exit status and lose
+  # gh_retry's, and a failed read that reports 0 is the one thing this gate must never do.
+  lines=$(gh_retry read api "repos/$REPO/pulls/$pr" \
+    --jq '[.head.sha, (.updated_at // "-")] | @tsv')
   rc=$?
+  IFS=$'\t' read -r sha pr_at <<<"$lines"
+  [ "${pr_at:--}" != - ] || pr_at=""
   if [ "$rc" -ne 0 ] || [ -z "$sha" ]; then
     VERDICT=unknown
     warn "could not read $REPO#$pr's head SHA ($(gh_err_line)); the build signal is UNKNOWN," \
@@ -1351,13 +1595,51 @@ gate_checks() {
       return 3
     fi
     summarize_checks "$lines"
+    # Every fold but a red one gets the run list's deciding read. Green can be green over a
+    # sibling that has not judged the head; an absence can be a run whose checks do not exist yet;
+    # and a PENDING or MIXED fold can be sitting on a sibling that already concluded red without
+    # producing a check — where reporting 4 lets `--allow-no-verdict` merge a failed head without
+    # ever facing the red-build --override, and makes --wait sit out the other check before
+    # finding out (ludics-lite#38, round 3). Only a red fold is skipped: it is already the
+    # strongest verdict, and a second read cannot add to it. This happens with no --wait too,
+    # where the honest answer to "is there a signal here" is 4, not a 0 the merge gate would take
+    # for "nothing is red".
+    if [ "$VERDICT" != red ]; then
+      run_info=$(run_signal "$sha" "$pr_at" "$CHECK_TOTAL")
+      rc=$?
+      run_why="${run_info#*$'\t'}"
+      case "$rc" in
+      1)
+        VERDICT=runred
+        CHECK_RED="${run_info%%$'\t'*}"
+        ;;
+      3)
+        # UNKNOWN even over a pending fold, which would otherwise be an honest 4 on its own: an
+        # unread run list cannot rule out a red that no check run will ever carry, and this file
+        # does not report a signal it failed to read as a milder one.
+        VERDICT=unknown
+        warn "could not read the workflow runs of $REPO#$pr @${sha:0:8} ($run_why); the checks" \
+          "alone are not the build signal, so this is UNKNOWN, which is NOT 'nothing is red'."
+        return 3
+        ;;
+      # Every fold the run list leaves unjudged becomes waitable, MIXED included: a stopped check
+      # under a queued run used to break the loop at once, so `--wait` returned without waiting
+      # for the run that was still coming (round 4). The stopped checks stay in the report below.
+      4) case "$VERDICT" in pending) ;; *) VERDICT=unjudged ;; esac ;;
+      esac
+    fi
     now=$(date +%s)
-    [ "$VERDICT" = pending ] && [ "$now" -lt "$deadline" ] || break
+    case "$VERDICT" in pending | unjudged) ;; *) break ;; esac
+    [ "$now" -lt "$deadline" ] || break
     # One line per heartbeat, not per re-read: a two-hour wait is 120 re-reads, and a background
     # child that prints that much is as unreadable as one that prints nothing.
     if [ $((now - beat)) -ge "$CHECKS_HEARTBEAT" ]; then
+      case "$VERDICT" in
+      unjudged) note="$run_why" ;;
+      *) note="$CHECK_PENDING check(s) running" ;;
+      esac
       warn "still waiting on $REPO#$pr @${sha:0:8}: no verdict after $(((now - started) / 60)) of" \
-        "$((wait_for / 60)) min ($CHECK_PENDING check(s) running)"
+        "$((wait_for / 60)) min ($note)"
       beat=$now
     fi
     # Capped at the remaining deadline, same as cmd_base and cmd_run_watch: an interval longer
@@ -1368,17 +1650,23 @@ gate_checks() {
     [ "$sleep_for" -le "$remaining" ] || sleep_for="$remaining"
     sleep "$sleep_for"
   done
+  # A head whose checks were green but whose run list is not done is still reported as no verdict
+  # — with what DID pass, so the line is not read as "nothing has run".
+  note=""
+  [ "${CHECK_GREEN:-0}" -gt 0 ] && note=" ($CHECK_GREEN build check(s) have passed so far)"
   case "$VERDICT" in
   red) echo "build signal $REPO#$pr @${sha:0:8}: RED — $CHECK_RED of $CHECK_TOTAL build checks failed" ;;
   pending) echo "build signal $REPO#$pr @${sha:0:8}: NO VERDICT YET — still running" ;;
   mixed) echo "build signal $REPO#$pr @${sha:0:8}: INCOMPLETE — $CHECK_GREEN passed, the rest were stopped without a verdict" ;;
-  absent) echo "build signal $REPO#$pr @${sha:0:8}: ABSENT — no build check ran on this commit (path filters, or CI never started)" ;;
+  runred) echo "build signal $REPO#$pr @${sha:0:8}: RED — $run_why" ;;
+  unjudged) echo "build signal $REPO#$pr @${sha:0:8}: NO VERDICT YET — $run_why$note" ;;
+  absent) echo "build signal $REPO#$pr @${sha:0:8}: ABSENT — no build check ran on this commit: $run_why" ;;
   green) echo "build signal $REPO#$pr @${sha:0:8}: green — $CHECK_GREEN build checks passed" ;;
   esac
   [ -n "$CHECK_LINES" ] && printf '%s' "$CHECK_LINES"
   case "$VERDICT" in
-  red) return 1 ;;
-  pending | mixed) return 4 ;;
+  red | runred) return 1 ;;
+  pending | mixed | unjudged) return 4 ;;
   *) return 0 ;;
   esac
 }
@@ -1951,7 +2239,7 @@ cmd_base() {
           tip_age=$(age_of "$tip_seen_at")
           case "$tip_age" in
           '' | *[!0-9]*) ;; # unreadable age is not evidence to hold on
-          *) [ "$tip_age" -ge "$BASE_ABSENT_GRACE" ] || hold=1 ;;
+          *) [ "$tip_age" -ge "$ABSENT_GRACE" ] || hold=1 ;;
           esac
         fi
         # Covered — against the tip read BEFORE the runs. A sibling merge landing between those
@@ -1969,7 +2257,7 @@ cmd_base() {
       # is "none". A tip with NO run is either the not-created-yet window or paths-ignore, and
       # only time tells those apart: after the grace, settle for what is there — the
       # per-workflow lines name which commit each verdict is actually about.
-      elif [ $((now - grace_from)) -ge "$BASE_ABSENT_GRACE" ]; then
+      elif [ $((now - grace_from)) -ge "$ABSENT_GRACE" ]; then
         if [ "$nogo_at_tip" -gt 0 ]; then
           waited_note="(the tip's newest run completed stopped-not-judged and no replacement appeared within the grace — NOT absence and NOT a verdict: re-run the workflow)"
           no_tip_verdict=1

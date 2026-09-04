@@ -367,10 +367,10 @@ The other verdicts are not refusals, and none of them is a green light either:
 | exit | verdict | what it is |
 | --- | --- | --- |
 | 0 | green | every build check on the head passed |
-| 0 | absent | no build check ran on this commit — path filters (ocannl's `ci` ignores `docs/**`), or CI never started |
-| 1 | RED | a build check concluded `failure` — refused |
-| 3 | unknown | the checks could not be read — refused |
-| 4 | no verdict | still running, or every finished job was `cancelled` — refused without `--allow-no-verdict` |
+| 0 | absent | no build check ran on this commit, and the run list confirms none is coming — path filters (ocannl's `ci` ignores `docs/**`), or CI never started |
+| 1 | RED | a build check concluded `failure`, or a workflow run for the head concluded red without producing one — refused |
+| 3 | unknown | the checks or the head's runs could not be read — refused |
+| 4 | no verdict | still running, every finished job was `cancelled`, or a run for the head is queued, stopped without a verdict, or has yet to create its checks — refused without `--allow-no-verdict` |
 
 **Exit 4 refuses too, by default.** Nothing has failed, but nothing has passed, and a merge that
 waits for neither read nothing — it was a warning until 2026-08-23, when a day-long runner queue
@@ -386,15 +386,46 @@ with a one-line heartbeat every 10 min (`SHIP_PR_CHECKS_HEARTBEAT`), so backgrou
 hold. If the ceiling runs out it exits 4 naming `--allow-no-verdict`; for anything a compiler sees,
 wait again instead.
 
-Two traps around that hold, both observed 2026-08-28. **`ABSENT` seconds after a force-push is not
-a verdict** — a rebase before merging pushes a new head whose checks may not EXIST yet,
-and a wait that starts in that window sees nothing to wait for and can pass the gate having read
-nothing (ocannl staging#491 merged that way). After any force-push, confirm a run exists on the
-new head (`gh pr checks` / the run list) before trusting a quick `ABSENT`-shaped answer, and if
-none exists yet, wait for it to appear. And **the harness can kill a backgrounded `merge --wait`
-well before its ceiling** (observed twice at ~40 min): the correct response is to re-read merge
-state over REST (`gh pr view --json state,mergedAt,headRefOid`) and re-arm the wait — never to
-conclude the merge failed, and never to reach for `--allow-no-verdict` because the waiter died.
+**`ABSENT` seconds after a push used to be the trap here** — a push (a rebase before merging, or
+any other) creates a head whose checks do not EXIST yet, and a wait armed in that window saw
+nothing to wait for and passed the gate having read nothing (ocannl staging#491 merged that way).
+The gate now reads that window itself (ludics-lite#24). The check list is only half the signal —
+a run row exists from the moment a run is queued, before any of its check runs — so whenever the
+checks leave nothing to wait for (green as well as absent), the gate reads
+`actions/runs?head_sha=` and lets it overrule them:
+
+- a run that concluded red without producing a check (a broken workflow file's `startup_failure`,
+  say) is exit 1 — nothing in the check list can carry that failure, and it outranks a green,
+  pending or stopped check on the same head;
+- a queued or running non-advisory run is exit 4, **including under a green check** — one
+  workflow's green says nothing about a sibling that has not judged the head;
+- a run that completed `cancelled`/`stale`/`action_required` with nothing behind it is exit 4,
+  stopped-not-judged like everywhere else, as is one reported `completed` with no conclusion
+  recorded yet;
+- a head with no Actions run to back its checks holds too: `build_checks` accepts every provider's
+  check runs, so an early Codecov green is not evidence that Actions has created its rows;
+- a **checkless** head holds while it is inside `SHIP_PR_BASE_ABSENT_GRACE` (300s, measured from
+  the fresher of the head's commit date and the PR's own `updated_at` — each validated on its own,
+  so a long-local commit pushed just now counts as fresh and a future commit date does not blind
+  the gate), and only past that is `ABSENT` the verdict — with the evidence on the line.
+
+Only the newest **completed** run of each workflow and event is judged, the same `filter=latest`
+semantics the check lookup asks for: a re-triggered invocation supersedes its own cancelled
+predecessor, while one file triggered on both `push` and `pull_request` produces two independent
+runs that are both judged — and a queued run is never folded away at all, since supersession is
+something that happens to a run that stopped. The advisory list is a deny-list of check, job and workflow names in all directions — a run
+whose red is explained entirely by advisory jobs is not a red build signal, since `build_checks`
+already dropped those checks on purpose. A run list that cannot be read is exit 3 even under a
+pending check: an unread run list cannot rule out a red that no check run will ever carry.
+
+No hand re-check, and no `--wait` needed for any of it: without one the same window is exit 4, not
+0. The knob is there for a repo whose runs take longer than five minutes to appear.
+
+The trap that remains is at the other end of the hold: **the harness can kill a backgrounded
+`merge --wait` well before its ceiling** (observed twice at ~40 min). The correct response is to
+re-read merge state over REST (`gh pr view --json state,mergedAt,headRefOid`) and re-arm the wait
+— never to conclude the merge failed, and never to reach for `--allow-no-verdict` because the
+waiter died.
 
 `--allow-no-verdict` merges unread, loudly on stdout and stderr. It is acceptable only when the
 verdict could tell you nothing you have not established yourself: a doc-only diff, or a shell-only
