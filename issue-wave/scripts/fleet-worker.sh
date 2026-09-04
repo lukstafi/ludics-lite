@@ -375,12 +375,15 @@ if [ -z "$refuse" ]; then
 fi
 head=$(git -C "$repo" rev-parse HEAD 2>/dev/null); up=$(git -C "$repo" rev-parse origin/main 2>/dev/null)
 [ "$head" = "$up" ] || note "HEAD $(echo "$head" | cut -c1-9) != origin/main $(echo "$up" | cut -c1-9) (ahead, or offline)"
-# The deployed skills must be the symlinks the README installs, each into ITS OWN directory of
-# THIS checkout - compared as resolved paths, so neither a link through `..` nor two links
-# swapped within the checkout can pass.
+# Every skill the checkout declares must be one of the symlinks the README installs, into ITS OWN
+# directory of THIS checkout - compared as resolved paths, so neither a link through `..` nor two
+# links swapped within the checkout can pass. Deriving this set from SKILL.md keeps a new skill
+# from falling outside preflight while the README's top-level install glob starts serving it.
 canon=$(cd "$repo" && pwd -P)
 resolved() { [ -L "$1" ] && (cd -P "$1" 2>/dev/null && pwd -P); }
-for s in issue-wave ship-pr wait-and-proceed after-merge; do
+for skill_dir in "$repo"/*; do
+  [ -f "$skill_dir/SKILL.md" ] || continue
+  s=${skill_dir##*/}
   t=$(resolved "$HOME/.claude/skills/$s")
   [ "$t" = "$canon/$s" ] || note "~/.claude/skills/$s -> ${t:-missing/not a link} (not $repo/$s)"
 done

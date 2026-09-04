@@ -43,11 +43,13 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 # * Both boxes wake from a full shutdown (S5), not just from sleep — verified 2026-08-15 on both,
 #   after enabling the `Wake Up` item on minix's BIOS SECOND setup screen (not under Advanced).
 #   "Powered off" is a normal starting state for a wake, not a reason to expect failure.
-# * A box holding Ethernet link while powered off (`status` -> link=1) is the WoL-armed state and
-#   is what makes the wake possible. A failed wake with link=1 means the NIC was powered and
-#   listening, so the magic packet was ignored: the WoL option itself (BIOS, or the Windows NIC
-#   driver's wake settings) has been lost. With link=0 the NIC is not powered while the box is
-#   off: the cable, the box's power, or the BIOS setting that keeps the NIC powered in S5.
+# * `status` -> link is the router's NewActive bit, not direct NIC telemetry. For several minutes
+#   after shutdown or hibernate, link=1 can be a stale DHCP lease rather than physical link; wait
+#   for it to settle before diagnosing the wake path. After a full shutdown and once settled, a
+#   box holding Ethernet link (link=1) is in the WoL-armed state that makes the wake possible. A
+#   failed wake then means the magic packet was ignored: the WoL option itself (BIOS, or the
+#   Windows NIC driver's wake settings) has been lost. With settled link=0 after full shutdown,
+#   check the cable, the box's power, and the BIOS setting that keeps the NIC powered in S5.
 # * WSL never autostarts at boot, so a box coming up from power-down always needs kick_wsl. A box
 #   resuming from sleep/hibernate with the user's GUI WSL shell still open (the usual cycle) keeps
 #   its VM across the resume — verified on minix 2026-09-01: same boot id, -wsl answering seconds
@@ -218,7 +220,8 @@ do_status() {
   echo "box    link  lan(direct IP)  win(tailscale)  wsl(tailscale)"
   for n in "$@"; do status_one "$n"; done
   echo
-  echo "link=1 only means the NIC holds link — a WoL-armed box reads 1 while powered OFF."
+  echo "link=1 can mean a WoL-armed NIC holds link while powered OFF; minutes after shutdown or"
+  echo "hibernate it can instead be a stale router lease, not physical link state."
   echo "lan/win/wsl are real ssh probes; wsl=-- right after a wake is usually just tailscaled lag."
 }
 
@@ -401,9 +404,10 @@ case "$VERB" in
         echo "all up"
       else
         for t in "${TARGETS[@]}"; do is_up "$t" || echo "did NOT wake: $t"; done
-        echo "Check, in order: BIOS Wake-on-LAN / 'Power Up' (minix needed this, and it is on the"
-        echo "SECOND setup screen, not under Advanced); Fast Startup off; the NIC holding link"
-        echo "while powered off ('$0 status' -> link=1). asus is Wi-Fi only and cannot be woken."
+        echo "Check BIOS Wake-on-LAN / 'Power Up' (minix needed the SECOND setup screen, not"
+        echo "Advanced), then run scripts/enable-wol-windows.ps1 from an elevated Windows"
+        echo "PowerShell to disable Fast Startup and re-arm the NIC. Check '$0 status' after the"
+        echo "router lease settles; asus is Wi-Fi only and cannot be woken."
       fi
     fi
     ;;
