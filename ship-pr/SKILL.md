@@ -480,9 +480,11 @@ wait again instead.
 Two traps around that hold, both observed 2026-08-28. **`ABSENT` seconds after a force-push is not
 a verdict** — a rebase before merging pushes a new head whose checks may not EXIST yet,
 and a wait that starts in that window sees nothing to wait for and can pass the gate having read
-nothing (ocannl staging#491 merged that way). After any force-push, confirm a run exists on the
-new head (`gh pr checks` / the run list) before trusting a quick `ABSENT`-shaped answer, and if
-none exists yet, wait for it to appear. And **the harness can kill a backgrounded `merge --wait`
+nothing (ocannl staging#491 merged that way). `--wait` therefore holds through a creation grace
+on `absent` (`SHIP_PR_CHECKS_ABSENT_GRACE`, 5 min) before taking it as the answer, so a wait
+started seconds after a push finds the run once it exists; a quick `ABSENT` from a call WITHOUT
+`--wait` is still not a verdict after a force-push — confirm a run exists on the new head (`gh pr
+checks` / the run list) or wait. And **the harness can kill a backgrounded `merge --wait`
 well before its ceiling** (observed twice at ~40 min): the correct response is to re-read merge
 state over REST (`gh pr view --json state,mergedAt,headRefOid`) and re-arm the wait — never to
 conclude the merge failed, and never to reach for `--allow-no-verdict` because the waiter died.
@@ -501,8 +503,9 @@ a manual stop, and re-running is what turns it into an answer; it is exit 4 like
 
 `--require-green` is the opposite hatch: it makes `absent` a refusal too (exit 4), for the
 close-out merges of *When the loop ends*, which rest on the record rather than on a 👍 and so must
-have READ a green verdict rather than found nothing red. Its refusal names the two ways out —
-wait for the run, or establish that none will come and merge without the flag, saying so.
+have READ a green verdict rather than found nothing red. With `--wait` it holds through the
+creation grace for a run to appear and then for its verdict; its refusal names the two ways out —
+wait longer, or establish that no run will come and merge without the flag, saying so.
 
 Run `checks` on its own — same verdicts, same exit codes, no merge — whenever you want the build
 signal without acting on it, such as before asking the reviewer for another round.

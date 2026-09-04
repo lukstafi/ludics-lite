@@ -157,6 +157,10 @@
 #      out for a build verdict (7200 — the runner queue alone ran ~2h deep on 2026-08-23),
 #      SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60), SHIP_PR_CHECKS_HEARTBEAT=seconds
 #      between the one-line "still waiting" progress notes a `--wait` prints (600),
+#      SHIP_PR_CHECKS_ABSENT_GRACE=seconds a `checks --wait` / `merge --wait` holds on an ABSENT
+#      signal for a run on the head to APPEAR before taking absent as the answer (300; check
+#      runs are created some seconds after a push, and a wait that starts before that would
+#      otherwise return having read nothing),
 #      SHIP_PR_BASE_ABSENT_GRACE=seconds `base --wait` allows for a run on the tip to APPEAR
 #      before settling for an older verdict (300; paths-ignore pushes never get one),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
@@ -1354,6 +1358,10 @@ CHECKS_INTERVAL="${SHIP_PR_CHECKS_INTERVAL:-60}"
 CHECKS_WAIT="${SHIP_PR_CHECKS_WAIT:-7200}"
 CHECKS_HEARTBEAT="${SHIP_PR_CHECKS_HEARTBEAT:-600}"
 BASE_ABSENT_GRACE="${SHIP_PR_BASE_ABSENT_GRACE:-300}"
+CHECKS_ABSENT_GRACE="${SHIP_PR_CHECKS_ABSENT_GRACE:-300}"
+case "$CHECKS_ABSENT_GRACE" in
+'' | *[!0-9]*) die "SHIP_PR_CHECKS_ABSENT_GRACE must be a number of seconds, got '$CHECKS_ABSENT_GRACE'" ;;
+esac
 # Whole seconds, validated up front: these feed shell arithmetic (deadlines, heartbeats, and the
 # sleep caps against the remaining deadline), where a fractional value does not degrade gracefully
 # — `[ 0.5 -le N ]` errors and takes the fallback arm, which for the interval means one read and
@@ -1477,12 +1485,28 @@ gate_checks() {
     fi
     summarize_checks "$lines"
     now=$(date +%s)
-    [ "$VERDICT" = pending ] && [ "$now" -lt "$deadline" ] || break
+    [ "$now" -lt "$deadline" ] || break
+    # ABSENT in the first minutes of a wait is usually a run that does not EXIST yet — GitHub
+    # creates the check runs some seconds after a push, and a wait that starts in that window
+    # otherwise finds nothing to wait for and returns having read nothing (staging#491 merged
+    # that way; the --require-green close-out merge refused that way, review of ludics-lite#39).
+    # So a wait holds through a creation grace on absent, and only an absent that OUTLIVES the
+    # grace is the path-filter kind. The grace runs from the wait's start, not from the push.
+    case "$VERDICT" in
+    pending) ;;
+    absent) [ $((now - started)) -lt "$CHECKS_ABSENT_GRACE" ] || break ;;
+    *) break ;;
+    esac
     # One line per heartbeat, not per re-read: a two-hour wait is 120 re-reads, and a background
     # child that prints that much is as unreadable as one that prints nothing.
     if [ $((now - beat)) -ge "$CHECKS_HEARTBEAT" ]; then
       warn "still waiting on $REPO#$pr @${sha:0:8}: no verdict after $(((now - started) / 60)) of" \
         "$((wait_for / 60)) min ($CHECK_PENDING check(s) running)"
+    fi
+    if [ "$VERDICT" = absent ] && [ "$beat" = "$started" ]; then
+      warn "no build check on $REPO#$pr @${sha:0:8} yet — holding up to $CHECKS_ABSENT_GRACE s" \
+        "for one to appear (SHIP_PR_CHECKS_ABSENT_GRACE)"
+      beat=$((started + 1)) # once; the heartbeat above takes over if a run appears
       beat=$now
     fi
     # Capped at the remaining deadline, same as cmd_base and cmd_run_watch: an interval longer
@@ -1796,8 +1820,9 @@ cmd_merge() {
   if [ -n "$require_green" ] && [ "$VERDICT" != green ]; then
     fail 4 "REFUSING to merge $REPO#$PR_NUM: --require-green and the build signal is $VERDICT," \
       "not green. A close-out merge needs a green verdict READ on the final head: wait for a run" \
-      "to appear and finish (checks --wait), or confirm why none will (path filters) and" \
-      "merge without --require-green, saying so."
+      "to appear and finish (--wait holds $CHECKS_ABSENT_GRACE s for one to appear, then for its" \
+      "verdict), or confirm why none will (path filters) and merge without --require-green," \
+      "saying so."
   fi
   # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
   # verdict is the final thing on screen before the merge itself. A loud WARNING, not a gate: the
