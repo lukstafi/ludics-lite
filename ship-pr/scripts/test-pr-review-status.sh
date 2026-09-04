@@ -282,8 +282,13 @@ test_computing_mergeability_is_not_a_conflict() {
   MERGEABLE_STATE=unknown
   run_status
   assert_eq "$(state_merge "$STATE")" unknown "GitHub still computing is carried as is"
-  assert_contains "$LINE" "the next move is yours" "unknown mergeability leaves the idle line alone"
+  assert_contains "$LINE" "the next move is yours" \
+    "a mergeability still being computed does not take the move away: only a known conflict does"
   assert_not_contains "$LINE" "CONFLICTS" "unknown mergeability is not a conflict"
+  assert_contains "$LINE" "mergeability NOT YET COMPUTED" \
+    "the first status after a push that caused a conflict must not read as a clean bill of health"
+  assert_contains "$LINE" "re-read status in a minute" \
+    "the caveat should name the remedy: look again once GitHub has computed it"
 }
 
 test_failed_pr_read_is_unknown_where_the_head_decides() {
