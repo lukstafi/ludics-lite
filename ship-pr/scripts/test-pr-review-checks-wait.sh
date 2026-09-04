@@ -130,19 +130,28 @@ test_heartbeat_is_once_per_period() {
 MERGE_ARGS_FILE=$(mktemp "${TMPDIR:-/tmp}/pr-review-merge-args.XXXXXX") || exit 1
 trap 'rm -f "$GH_ERR_FILE" "$OUT_FILE" "$READS_FILE" "$MERGE_ARGS_FILE"' EXIT
 MERGE_STATE="merged=true state=MERGED"
+MERGE_QUEUE=""   # nonempty = the base has a merge queue
 use_merge_fixture() {
   : >"$MERGE_ARGS_FILE"
   GREEN_AFTER=0
   SKIPS_ONLY=""
   STARTED_AT=""
+  MERGE_QUEUE=""
   warn_base_drift() { return 0; }
   gh() {
     case "${1:-} ${2:-}" in
     "api repos/$REPO/pulls/7")
       case "$*" in
       *'.head.sha'*) echo head-sha ;;
+      *'.base.ref'*) echo main ;;
       *merged=*) echo "$MERGE_STATE" ;;
       *) bail "unexpected pulls read: $*" ;;
+      esac
+      ;;
+    "api graphql")
+      case "$*" in
+      *mergeQueue*) printf 'CALL %s\n' "$*" >>"$MERGE_ARGS_FILE"; echo "$MERGE_QUEUE" ;;
+      *) bail "unexpected graphql call: $*" ;;
       esac
       ;;
     "pr merge") printf 'CALL %s\n' "$*" >>"$MERGE_ARGS_FILE" ;;
@@ -152,6 +161,9 @@ use_merge_fixture() {
 }
 # In a subshell: cmd_merge's refusals are `fail`, which exits the shell it runs in. The calls
 # and output travel through files, so the subshell costs nothing the assertions need.
+assert_no_merge_call() {
+  case "$MERGE_CALLS" in *"pr merge"*) bail "no merge call should have been made ($MERGE_CALLS)" ;; esac
+}
 run_merge() {
   local rc
   : >"$MERGE_ARGS_FILE"
@@ -183,7 +195,7 @@ test_require_green_refuses_green_by_skips_only() {
   run_merge --require-green
   assert_eq "$MERGE_RC" 4 "--require-green refuses skips-only"
   assert_contains "$MERGE_OUTPUT" "skipped or neutral — green, but no build RAN" "should say why"
-  assert_eq "$MERGE_CALLS" "" "no merge call should have been made"
+  assert_no_merge_call
 }
 
 test_forwarded_head_binding_is_refused() {
@@ -191,7 +203,7 @@ test_forwarded_head_binding_is_refused() {
   run_merge -- --match-head-commit other --merge
   assert_eq "$MERGE_RC" 2 "a forwarded --match-head-commit is a usage error"
   assert_contains "$MERGE_OUTPUT" "cannot be forwarded" "should say the flag is the script's"
-  assert_eq "$MERGE_CALLS" "" "no merge call should have been made"
+  assert_no_merge_call
   run_merge -- --match-head-commit=other --merge
   assert_eq "$MERGE_RC" 2 "the = form is refused too"
 }
@@ -201,7 +213,7 @@ test_require_green_refuses_auto() {
   run_merge --require-green -- --auto --merge
   assert_eq "$MERGE_RC" 2 "--auto with --require-green is a usage error"
   assert_contains "$MERGE_OUTPUT" "cannot be combined with --auto" "should name the conflict"
-  assert_eq "$MERGE_CALLS" "" "no merge call should have been made"
+  assert_no_merge_call
 }
 
 # On a base that defers merges, gh returns 0 having only ENABLED auto-merge; a close-out merge
@@ -231,7 +243,7 @@ test_require_green_waits_for_a_young_green_to_settle() {
   run_merge --require-green
   assert_eq "$MERGE_RC" 4 "--require-green refuses a young green without --wait"
   assert_contains "$MERGE_OUTPUT" "younger than 3 s" "should say the set is young"
-  assert_eq "$MERGE_CALLS" "" "no merge call should have been made"
+  assert_no_merge_call
   STARTED_AT=$(date +%s)
   local before after
   before=$(date +%s)
@@ -246,6 +258,24 @@ test_require_green_waits_for_a_young_green_to_settle() {
   assert_eq "$MERGE_RC" 0 "an old green needs no settling ($MERGE_OUTPUT)"
 }
 
+# A merge queue makes `gh pr merge` an enqueue, which --disable-auto cannot undo: a close-out
+# merge refuses before calling merge. The ordinary gate never asks.
+test_require_green_refuses_a_merge_queue() {
+  use_merge_fixture
+  MERGE_QUEUE=MQ_1
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the ordinary gate merges on a queued base as before"
+  case "$MERGE_CALLS" in *mergeQueue*) bail "the ordinary path must not read the queue" ;; esac
+  run_merge --require-green
+  MERGE_QUEUE=""
+  assert_eq "$MERGE_RC" 1 "--require-green refuses a base with a merge queue"
+  assert_contains "$MERGE_OUTPUT" "has a merge queue" "should say why"
+  assert_contains "$MERGE_CALLS" "mergeQueue(branch:" "should have read the queue"
+  assert_no_merge_call
+  run_merge --require-green
+  assert_eq "$MERGE_RC" 0 "no queue: --require-green merges ($MERGE_OUTPUT)"
+}
+
 tests=(
   test_no_wait_takes_absent_at_once
   test_wait_holds_for_a_run_to_appear
@@ -256,6 +286,7 @@ tests=(
   test_forwarded_head_binding_is_refused
   test_require_green_refuses_auto
   test_require_green_disables_a_deferred_auto_merge
+  test_require_green_refuses_a_merge_queue
   test_require_green_waits_for_a_young_green_to_settle
 )
 

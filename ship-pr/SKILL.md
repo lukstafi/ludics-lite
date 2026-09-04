@@ -504,9 +504,10 @@ a manual stop, and re-running is what turns it into an answer; it is exit 4 like
 `--require-green` is the opposite hatch: it makes `absent` a refusal too (exit 4), and so is a
 green made only of `skipped` and `neutral` checks — nothing failed, but no build ran — for the
 close-out merges of *When the loop ends*, which rest on the record rather than on a 👍 and so must
-have READ a passing build rather than found nothing red. It also refuses `--auto`, and when the
-base turns the call into a deferred auto-merge anyway (required checks, a merge queue) it
-disables that again and exits 1: a close-out merge lands the gated head now or not at all. With `--wait` it holds through the
+have READ a passing build rather than found nothing red. It also refuses `--auto` and a base
+with a merge queue (where `gh pr merge` is an enqueue, landing later on whatever head the PR has
+then), and when required checks turn the call into a deferred auto-merge anyway it disables that
+again and exits 1: a close-out merge lands the gated head now or not at all. With `--wait` it holds through the
 creation grace for a run to appear and then for its verdict; its refusal names the two ways out —
 wait longer, or establish that no run will come and merge without the flag, saying so.
 
