@@ -795,7 +795,7 @@ review_rounds() {
 # The count against the threshold, on one line; exit 0 at or under it, 1 past it, 3 unread. The
 # threshold is the skill's, not this script's: nothing here refuses a merge over it. It exists so
 # the session reads "round 13" off the PR instead of believing it is at round 6. Past it the skill
-# fixes only BLOCKING findings — strictly: what would make the PR wrong, not a bug as such — and
+# fixes only BLOCKING findings — narrowly: what would make the PR wrong, not a bug as such — and
 # defers the rest to one follow-up issue, so the loop ends on the first round with nothing to push.
 rounds_line() {
   local count detail

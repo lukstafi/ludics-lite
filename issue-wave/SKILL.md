@@ -366,7 +366,7 @@ The coordinator's job between launch and last merge:
   classification, and a review-record paragraph in the PR body. Ship-pr carries the exits a
   worker reaches WITHOUT you (its *When the loop ends*, from ludics-lite#12): a round rebutted
   in full ends the loop, and from the thirteenth round with findings (`pr-review.sh rounds`
-  reads the count off the PR) only BLOCKING findings are fixed — blocking read strictly, a
+  reads the count off the PR) only BLOCKING findings are fixed — blocking read narrowly, a
   finding that would make the PR wrong, not a bug as such — with the rest deferred to one
   follow-up issue, so the loop ends on the first round with nothing to push. Your
   pre-authorization moves that earlier, never later. The option to name explicitly is

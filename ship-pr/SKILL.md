@@ -373,7 +373,7 @@ It counts the heads the reviewer left findings on, exits 1 past the threshold
 (`SHIP_PR_ROUND_THRESHOLD`, 12), and enforces nothing: the threshold is a policy, and the merge is
 still the build gate's to allow.
 
-*Blocking* is read strictly, and informally: there is no checklist, and a bug does not qualify by
+*Blocking* is read narrowly, and informally: there is no checklist, and a bug does not qualify by
 being a bug. A finding blocks when merging over it would make the PR wrong — the change does not
 do what its description claims, it loses or corrupts data on a path the PR's own use takes, it
 leaves `master` red, or it invalidates a result the PR reports. A real defect that is none of
