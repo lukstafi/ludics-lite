@@ -236,7 +236,8 @@ finding as if it were isolated is what makes review loops long.
 Judge each finding on the merits. Most are right; some are not, and a wrong one deserves a
 reasoned reply rather than a compliance edit — a design boundary you hold deliberately (what a
 component is *not* responsible for) is worth defending in the thread, in the terms of the design. A
-round you answer entirely with reasoning needs no push: reply, then merge.
+round you answer entirely with reasoning needs no push: reply, then merge — that is one of the
+loop's two exits (*When the loop ends*, below).
 
 **When findings arrive in a family, fix the genre, not the instance.** This is the single biggest
 lever on how long the loop runs. If round N says "pin knob X" and round N+1 says "pin knob Y", a
@@ -296,6 +297,9 @@ review invalidated, say so in the artifact instead of quietly dropping it.
 
 Two gates stand between a finished round and `master`: the reviewer's approval and the build
 signal. This section is the first; the build gate is below, and neither substitutes for the other.
+The review gate has one narrowly scoped alternative to the approval itself — the close-out record
+of *When the loop ends* (below), at one of the loop's two exits — and nothing stands in for the
+build gate.
 
 The review gate is the reviewer's approval — for the Codex integration, a 👍 reaction on the PR,
 not a review state. The two channels are disjoint: a round WITH findings posts `COMMENTED` reviews
@@ -319,7 +323,7 @@ head SHA, and answers with one of six:
 | `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
 | `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
 | `expected` | no live 👀, and no review of the head SHA: a round is due and has not started | wait out the grace, then `@codex review` |
-| `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push |
+| `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push — or, at one of the loop's exits (below), close out and merge |
 | `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
 
 Two comparisons carry that, and both are easy to get wrong by hand. Whether the reviewer has *seen*
@@ -333,6 +337,93 @@ The whole polling and merge-gate path is REST: GitHub's GraphQL endpoint 503s in
 and a GraphQL-borne silence is indistinguishable from a reviewer's. Thread resolution is the one
 GraphQL-only operation left, and it reports a transport failure as a retry rather than as a missing
 thread.
+
+### When the loop ends
+
+An automated reviewer does not stop on its own. It keeps finding members of any open-ended
+surface, and the surface it finds the most in is the one the review itself built. On
+lukstafi/self-improve#27 (2026-09-02) rounds 1–4 were substantive — input validation, the lease
+and halt moving onto the anchor, orphan detection, the live auth probe — and from round 5 to round
+22 every finding but two was a member of machinery those rounds had introduced: lock races,
+rollback windows, backup ordering, lock-holder identity. Each was a real silent-class defect, each
+was cheap, and each spawned one or two successors in the next round. The reviewer approved at
+round 23, four hours in, most of them spent hardening concurrency paths a single coordinator per
+fleet never exercises. A long review is welcome when it makes the code better, and the loop has
+no round limit. What it has is two exits, and a round past which most findings stop being work.
+
+**A round rebutted in full ends the loop.** Judging on the merits (above) already means some
+findings are wrong, and a wrong one is answered with reasoning, not a compliance edit. A finding
+rebutted with evidence — the code path that makes it unreachable, the invariant that makes it
+harmless, the design boundary that puts it out of scope — is *closed*, not deferred. When every
+finding in a round is closed that way, the loop is over: reply in each thread, and merge. There is
+no push, so the reviewer gets no further turn; the judgement is yours, and the threads are its
+audit trail. So a rebuttal is about the code and never about the budget — "this is round 11" is
+not a reason a finding is wrong — and it cites what it rests on, so the maintainer can check it
+after the merge.
+
+**From the thirteenth round with findings on, only blocking findings are fixed.** Every other
+finding is handed to ONE follow-up issue for the whole residual set — never one issue per finding
+— and its thread answered with the deferral. The loop then ends the first time a round yields
+nothing to push: every finding rebutted or deferred, reply in each thread, and merge. Read the
+round off the PR; do not remember it — a session that has been compacted twice does not know what
+round it is in:
+
+```bash
+~/.claude/skills/ship-pr/scripts/pr-review.sh rounds <owner>/<repo>#<pr>   # status prints it too
+```
+
+It counts bursts of the reviewer's reviews — a round's reviews land within seconds of each other,
+and a new round starts on a different head or after a gap (`SHIP_PR_ROUND_GAP`, 15 min) since the
+previous review, so a re-requested round on the same head counts on its own. It exits 1 past the
+threshold (`SHIP_PR_ROUND_THRESHOLD`, 12) and enforces nothing: the threshold is a policy, and the
+merge is still the build gate's to allow.
+
+*Blocking* is read narrowly, and informally: there is no checklist, and a bug does not qualify by
+being a bug. A finding blocks when merging over it would make the PR wrong — the change does not
+do what its description claims, it loses or corrupts data on a path the PR's own use takes, it
+leaves `master` red, or it invalidates a result the PR reports. A real defect that is none of
+those is deferred: a silent one included, and one on machinery an earlier round asked for
+included. That narrows the silent-vs-loud policy (issue-wave), whose "silent is must-fix at any
+round count" governs the first twelve rounds; past them the axis is whether the PR is wrong, not
+whether the defect is quiet. The findings that arrive past the threshold have a recognisable
+shape: their subject exists only because an earlier round asked for it — the lock added in round
+3, the rollback added in round 5 — and each spawns a successor. When one of those does block,
+removing the machinery is as good an answer as fixing it, and the one a loop never takes on its
+own: a lock with three rounds of races is often better answered by no lock and a documented
+single-writer assumption; a rollback with a window, by no rollback and an idempotent retry.
+Simpler and correct beats elaborate and nearly correct, and a reviewer accepts the removal when
+the reply names the invariant that now carries the load. Blocking findings in the PR's own
+substance that keep arriving past the threshold are a different signal: that is a wrong PR, not a
+long review — stop and raise it with the user.
+
+**Closing out** at either exit is the same act, and the record it leaves is what makes a merge
+the reviewer never 👍'd defensible:
+
+- the build gate has READ a green on the final head: merge with `--require-green`, which refuses
+  `absent` as well as red and no-verdict — a run that does not exist yet is not a green, and a
+  merge the reviewer never 👍'd does not get the path-filter allowance the ordinary gate gives;
+- every thread is answered with its disposition — fixed / removed / deferred / rebutted — and
+  resolved;
+- the PR body carries a review-record paragraph: how many rounds, each rebuttal in one line, and
+  — when anything was deferred — the follow-up issue's number;
+- the residuals, when there are any, are filed as one issue before the merge rather than after
+  it. A round rebutted in full leaves none, and no empty issue is filed to say so.
+
+Then merge:
+
+```bash
+~/.claude/skills/ship-pr/scripts/pr-review.sh merge <owner>/<repo>#<pr> --require-green --wait
+```
+
+`merge` (below) reads the build signal, not the 👍. The maintainer reads in the record what was
+not done and why, instead of finding it in the next PR's review.
+
+Both exits have an incentive problem: past the threshold, deferring is cheaper than fixing, and
+rebutting is cheaper than either at any round. The threads and the record paragraph are the only
+check on that in a standalone session, which is why a rebuttal cites its evidence and a deferral
+names why the PR is not wrong without the fix — a reviewer who was right and got argued with is
+visible there. Under a wave coordinator none of this changes; the coordinator's pre-authorization
+(issue-wave's convergence policy) can only move close-out earlier, never later.
 
 ### The approval is one gate; the build is the other
 
@@ -438,6 +529,24 @@ that found something, and ocannl's `ci` sets `fail-fast: false` precisely so a r
 not cancel its siblings and destroy the information. A cancel here comes from a superseding push or
 a manual stop, and re-running is what turns it into an answer; it is exit 4 like a running job, and
 `--allow-no-verdict` is no more acceptable for it.
+
+`--require-green` is the opposite hatch: it makes `absent` a refusal too (exit 4), and so is a
+green made only of `skipped` and `neutral` checks — nothing failed, but no build ran — for the
+close-out merges of *When the loop ends*, which rest on the record rather than on a 👍 and so must
+have READ a passing build rather than found nothing red. It also refuses `--auto` and a base
+with a merge queue (where `gh pr merge` is an enqueue, landing later on whatever head the PR has
+then; read before the wait and again right before the merge call), and when required checks turn
+the call into a deferred auto-merge anyway it disables that again and exits 1: a close-out merge
+lands the gated head now or not at all. With `--wait` it holds, like the ordinary gate, through
+the run-creation grace and then for the verdict. Its refusals have no "drop the flag" way out: a
+head that genuinely runs no build (path filters) gets one dispatched onto it (`gh workflow run
+<workflow> --ref <branch>`), or the merge goes to the maintainer with the record on the PR — the
+path-filter allowance the ordinary gate gives is exactly what a merge without a 👍 does not get.
+
+Whatever the verdict, the merge is bound to the head it was read for: `merge` passes
+`--match-head-commit` with that SHA, so a push that moves the PR during a long `--wait` makes the
+merge refuse (exit 1, naming the SHA it read) instead of landing a head nothing has read. Re-run
+`merge`; it reads the gate again.
 
 Run `checks` on its own — same verdicts, same exit codes, no merge — whenever you want the build
 signal without acting on it, such as before asking the reviewer for another round.

@@ -101,13 +101,21 @@
 #                                          # new comments/reviews above the watermark; prints next
 #   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands; 0 = act, 1 = quiet
 #   pr-review.sh status <pr>               # merge gate + who owes what: approved / reviewing /
-#                                          # stalled / expected / idle / unknown
+#                                          # stalled / expected / idle / unknown — and the round
+#                                          # count against the threshold (see `rounds`)
+#   pr-review.sh rounds <pr>               # how many review rounds carried findings, read off the
+#                                          # PR (heads the reviewer left comments on), against
+#                                          # SHIP_PR_ROUND_THRESHOLD; exit 1 past it
 #   pr-review.sh checks <pr> [--wait]      # the BUILD signal on the head commit: green / red /
 #                                          # no verdict yet / absent
 #   pr-review.sh merge <pr> [--override "<why this red is unrelated>"] [--wait]
-#                           [--allow-no-verdict]
+#                           [--allow-no-verdict] [--require-green]
 #                                          # checks, then merge; refuses on red without --override,
-#                                          # on NO verdict without --allow-no-verdict, and WARNS
+#                                          # on NO verdict without --allow-no-verdict, and — with
+#                                          # --require-green (a close-out merge) — on ABSENT, on
+#                                          # green-by-skips-only, on --auto, on a base with a
+#                                          # merge queue, and on a deferred auto-merge (which it
+#                                          # disables again); and WARNS
 #                                          # loudly when the branch is far behind its base
 #   pr-review.sh base [owner/name] [branch] [--wait[=seconds]]
 #                                          # is the branch you are about to work off CI-green?
@@ -162,12 +170,21 @@
 #      head before calling a build signal ABSENT rather than not-created-yet (ludics-lite#24),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences the commit-count warning). A nonempty file overlap still warns at any count; no
-#      base-drift warning blocks the merge.
+#      base-drift warning blocks the merge. SHIP_PR_ROUND_THRESHOLD=review rounds with findings
+#      after which only BLOCKING findings are fixed and the rest go to one follow-up issue (12;
+#      ship-pr's "When the loop ends" — `rounds` and `status` report the count against it,
+#      nothing here enforces it; `off` reports the count alone; anything else is refused).
+#      SHIP_PR_ROUND_GAP=seconds between two of the reviewer's reviews on the same head beyond
+#      which they are separate rounds (900; a round's reviews land within seconds).
 
 set -uo pipefail
 
 REPO="${REPO:-}"
 REVIEWER="${REVIEWER:-chatgpt-codex-connector}"
+ROUND_THRESHOLD="${SHIP_PR_ROUND_THRESHOLD:-12}"
+# Reviews of one round land within seconds of each other; a re-requested round on the SAME head
+# lands minutes or hours later. This gap is what tells them apart (seconds).
+ROUND_GAP="${SHIP_PR_ROUND_GAP:-900}"
 STATE_DIR="${SHIP_PR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ship-pr}"
 CACHE="$STATE_DIR/repo-by-pr"
 
@@ -203,6 +220,22 @@ fail() {
 }
 
 die() { fail 2 "$@"; }
+
+# A typo in the threshold ("12x") must not read as `off`: that would turn a bounded triage into
+# an unbounded one silently, so anything but a number or the literal `off` is a usage error.
+case "$ROUND_THRESHOLD" in
+off | 0 | [1-9]*) case "$ROUND_THRESHOLD" in *[!0-9]*) [ "$ROUND_THRESHOLD" = off ] ||
+  die "SHIP_PR_ROUND_THRESHOLD must be a number of rounds or 'off', got '$ROUND_THRESHOLD'" ;; esac ;;
+*) die "SHIP_PR_ROUND_THRESHOLD must be a number of rounds or 'off', got '$ROUND_THRESHOLD'" ;;
+esac
+# The gap reaches jq as a number (--argjson), where a quoted "900" or a `true` would not be
+# rejected but compared cross-type — every same-head re-request collapsing, or every review
+# becoming its own round — so only a plain nonnegative integer passes.
+case "$ROUND_GAP" in
+0 | [1-9]*) case "$ROUND_GAP" in *[!0-9]*)
+  die "SHIP_PR_ROUND_GAP must be a nonnegative number of seconds, got '$ROUND_GAP'" ;; esac ;;
+*) die "SHIP_PR_ROUND_GAP must be a nonnegative number of seconds, got '$ROUND_GAP'" ;;
+esac
 
 warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 
@@ -760,11 +793,130 @@ status_line() {
   esac
 }
 
+# How many review rounds have carried findings, read off the PR rather than remembered: a session
+# that has been compacted twice cannot say what round it is in, and the convergence policy (the
+# skill's "When the loop ends") needs the number. A round with findings is a burst of COMMENTED
+# reviews the reviewer submitted against one head — one per inline comment plus a summary, all
+# within seconds — so the count is the number of such bursts: in submission order, a review
+# starts a new round when it is on a different head than the previous one OR lands more than
+# ROUND_GAP after it. The gap is what keeps a re-requested round on the same head (the
+# `@codex review` nudge the status verdicts recommend needs no push) from collapsing into the
+# round before it, which a distinct-heads count did (review of ludics-lite#39). Your own replies
+# land in the same feed as COMMENTED reviews, hence the login filter; PENDING reviews have no
+# submitted_at and are not a round. Prints ONE line, "<count>|<detail>", and always exits 0:
+# a count of "unknown" carries the failure, and is NOT "no rounds yet".
+review_rounds() {
+  local pr="$1" raw comments line count heads
+  raw=$(api_list "pulls/$pr/reviews?per_page=100") || {
+    echo "unknown|the reviews API did not answer ($(gh_err_line))"
+    return 0
+  }
+  # A round can also arrive as an issue comment alone — the same shape status_state treats as
+  # the reviewer speaking — so those count too, minus the round-started placeholder and the
+  # no-findings verdict. A comment quoting "Reviewed commit: <sha>" joins that head's burst;
+  # one that names none is its own head, so a summary-only round is never folded into an
+  # inline round it did not belong to.
+  comments=$(api_list "issues/$pr/comments?per_page=100") || {
+    echo "unknown|the comments API did not answer ($(gh_err_line))"
+    return 0
+  }
+  # Both feeds go in on stdin (slurped: reviews first, comments second), never as arguments —
+  # a long PR's comment history outgrows the argument list (128 KB per argument on Linux).
+  line=$(printf '%s\n%s\n' "$raw" "$comments" | jq -r -s --arg rev "$REVIEWER" \
+    --argjson gap "$ROUND_GAP" '
+      .[1] as $comments | .[0]
+      | ([.[] | select((.user.login // "") | startswith($rev))
+           | select(.submitted_at != null)
+           | select(.state == "COMMENTED" or .state == "CHANGES_REQUESTED")
+           | {sha: (.commit_id // ""), t: (.submitted_at | fromdateiso8601)}]
+       + [$comments[] | select((.user.login // "") | startswith($rev))
+           | select((.body // "") | test("codex-pull-request-review-summary") | not)
+           | select((.body // "") | test("[Dd]idn.t find any major issues") | not)
+           | {sha: ((((.body // "")
+                     | capture("Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})")).s)
+                    // "comment"),
+              t: (.created_at | fromdateiso8601)}])
+      | sort_by(.t)
+      # Same head when equal, or when one is a prefix of the other: a comment quotes a
+      # truncated sha, a review records the full one.
+      | def same($a; $b): $a == $b
+          or ($a != null and $b != null and $a != "" and $b != ""
+              and (($a | startswith($b)) or ($b | startswith($a))));
+        reduce .[] as $r ({n: 0, sha: null, t: 0};
+          if (same($r.sha; .sha) | not) or ($r.t - .t) > $gap
+          then {n: (.n + 1), sha: $r.sha, t: $r.t}
+          else {n: .n, sha: .sha, t: $r.t} end)
+      | "\(.n)|" + ([.] | length | tostring)' 2>/dev/null) || {
+    echo "unknown|the reviews feed did not parse"
+    return 0
+  }
+  count="${line%%|*}"
+  case "$count" in
+  '' | *[!0-9]*)
+    echo "unknown|the reviews feed did not parse"
+    return 0
+    ;;
+  esac
+  heads=$(jq -r --arg rev "$REVIEWER" '
+      [.[] | select((.user.login // "") | startswith($rev))
+           | select(.submitted_at != null)
+           | select(.state == "COMMENTED" or .state == "CHANGES_REQUESTED")
+           | (.commit_id // "")] | unique | map(select(. != "")) | length' \
+    <<<"$raw" 2>/dev/null) || heads="?"
+  echo "$count|$count round(s) of $REVIEWER findings over $heads head(s)"
+}
+
+# The count against the threshold, on one line; exit 0 at or under it, 1 past it, 3 unread. The
+# threshold is the skill's, not this script's: nothing here refuses a merge over it. It exists so
+# the session reads "round 13" off the PR instead of believing it is at round 6. Past it the skill
+# fixes only BLOCKING findings — narrowly: what would make the PR wrong, not a bug as such — and
+# defers the rest to one follow-up issue, so the loop ends on the first round with nothing to push.
+rounds_line() {
+  local count detail
+  count="${1%%|*}"
+  detail="${1#*|}"
+  case "$count" in
+  unknown)
+    echo "review rounds: UNKNOWN — $detail; this is NOT 'no rounds yet', retry"
+    return 3
+    ;;
+  esac
+  case "$ROUND_THRESHOLD" in
+  '' | off | *[!0-9]*)
+    echo "review rounds with findings: $count ($detail); no threshold set"
+    return 0
+    ;;
+  esac
+  if [ "$count" -gt "$ROUND_THRESHOLD" ]; then
+    echo "review rounds with findings: $count, PAST the $ROUND_THRESHOLD-round threshold —" \
+      "blocking-only from here: fix what would make the PR wrong (a bug as such does not" \
+      "qualify), defer the rest to ONE follow-up issue, and merge on the first round with" \
+      "nothing to push ($detail)"
+    return 1
+  fi
+  if [ "$count" -eq "$ROUND_THRESHOLD" ]; then
+    echo "review rounds with findings: $count of $ROUND_THRESHOLD — the last round addressed in" \
+      "full; from the next, only blocking findings are fixed ($detail)"
+    return 0
+  fi
+  echo "review rounds with findings: $count of $ROUND_THRESHOLD ($detail)"
+  return 0
+}
+
+cmd_rounds() {
+  pr_arg "${1:?usage: rounds <pr>}"
+  rounds_line "$(review_rounds "$PR_NUM")"
+}
+
 cmd_status() {
   pr_arg "${1:?usage: status <pr>}"
   local state
   state=$(status_state "$PR_NUM")
   status_line "$state"
+  # The round count rides along so the convergence policy is always in view; it never changes
+  # this command's exit code — the merge gate is the state, and an unread count is reported as
+  # such on its own line rather than turning an approval into an "unknown".
+  rounds_line "$(review_rounds "$PR_NUM")" || true
   # Exit 3 on unknown so a caller gating a merge on `status` cannot read a failed read as a quiet
   # "not approved yet" — the same collapse api_list refuses to make. 3 rather than 2, because a
   # usage error (2) is the caller's to fix and this one is the API's to recover from.
@@ -1296,7 +1448,7 @@ build_checks() {
 # Folds the per-check classes into VERDICT (red|pending|mixed|absent|green) and the report lines.
 # Runs in the current shell — a pipeline would put the loop in a subshell and lose both.
 summarize_checks() {
-  local class name concl url red=0 pending=0 nogo=0 green=0
+  local class name concl url red=0 pending=0 nogo=0 green=0 passed=0
   VERDICT=""
   CHECK_LINES=""
   CHECK_RED=0
@@ -1315,10 +1467,16 @@ summarize_checks() {
       nogo=$((nogo + 1))
       CHECK_LINES="${CHECK_LINES}  no verdict  $name ($concl — stopped, not judged)  $url"$'\n'
       ;;
-    *) green=$((green + 1)) ;;
+    *)
+      green=$((green + 1))
+      # `skipped` and `neutral` are green for the ordinary gate (nothing failed) but they are not
+      # a build that RAN; --require-green wants at least one of these.
+      [ "$concl" = success ] && passed=$((passed + 1))
+      ;;
     esac
   done <<<"$1"
   CHECK_RED="$red"
+  CHECK_PASSED="$passed"
   CHECK_PENDING="$pending"
   CHECK_TOTAL=$((red + pending + nogo + green))
   if [ "$red" -gt 0 ]; then
@@ -1582,6 +1740,8 @@ gate_checks() {
       "which is NOT 'nothing is red'."
     return 3
   fi
+  CHECK_SHA="$sha" # what the verdict is ABOUT; merge binds to it
+  CHECK_SHA="$sha" # what the verdict is ABOUT; merge binds to it
   started=$(date +%s)
   deadline=$((started + wait_for))
   beat=$started
@@ -1871,10 +2031,30 @@ warn_base_drift() {
 
 # merge = read the build signal, then merge. The two are one command on purpose: a gate you have
 # to remember to run separately is the gate that was missing for seven merges.
+# Refuses (exit 1) when the PR's base has a merge queue, exit 3 when that could not be read —
+# the queue is GraphQL-only, and an unread answer is not "no queue". Called by merge under
+# --require-green, twice: before the wait and again right before the merge call.
+refuse_merge_queue() {
+  local pr="$1" base_ref queue
+  base_ref=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq .base.ref)
+  [ "$?" -eq 0 ] && [ -n "$base_ref" ] || fail 3 "NOT merging $REPO#$pr: the base branch" \
+    "could not be read ($(gh_err_line)), so whether it has a merge queue is unknown."
+  queue=$(gh_retry read api graphql \
+    -f query='query($o:String!,$r:String!,$b:String!){repository(owner:$o,name:$r){mergeQueue(branch:$b){id}}}' \
+    -f o="${REPO%%/*}" -f r="${REPO#*/}" -f b="$base_ref" \
+    --jq '.data.repository.mergeQueue.id // ""')
+  [ "$?" -eq 0 ] || fail 3 "NOT merging $REPO#$pr: could not read whether $base_ref has a" \
+    "merge queue ($(gh_err_line)); a close-out merge does not guess. Retry."
+  [ -z "$queue" ] || fail 1 "REFUSING to merge $REPO#$pr: $base_ref has a merge queue, so" \
+    "\`gh pr merge\` would ENQUEUE the PR to land later on whatever head it has then, and a" \
+    "close-out merge lands the gated head now or not at all. Hand the merge to the maintainer" \
+    "with the record on the PR."
+}
+
 cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
-  local override="" wait_for=0 allow_no_verdict="" gate out rc attempt=1 mergeable state
+  local override="" wait_for=0 allow_no_verdict="" require_green="" gate out rc attempt=1 mergeable state arg
   local -a gh_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1898,6 +2078,10 @@ cmd_merge() {
       allow_no_verdict=1
       shift
       ;;
+    --require-green)
+      require_green=1
+      shift
+      ;;
     --)
       shift
       gh_args=("$@")
@@ -1907,6 +2091,24 @@ cmd_merge() {
     esac
   done
   [ ${#gh_args[@]} -gt 0 ] || gh_args=(--merge) # the repo convention: preserve the commit series
+  # The head binding is the script's, not the caller's: a forwarded --match-head-commit would
+  # follow the script's on the command line and could name a head the gate never read.
+  for arg in "${gh_args[@]}"; do
+    case "$arg" in
+    --match-head-commit | --match-head-commit=*) die "merge: --match-head-commit is set by the" \
+      "script to the head the build signal was read for, and cannot be forwarded." ;;
+    esac
+  done
+  # A close-out merge is a merge NOW of the head the gate read, or nothing: deferred auto-merge
+  # would land whatever head the PR has when the base's checks pass, gate unread.
+  if [ -n "$require_green" ]; then
+    for arg in "${gh_args[@]}"; do
+      case "$arg" in
+      --auto | --auto=*) die "merge: --require-green cannot be combined with --auto — a close-out" \
+        "merge lands the gated head now or refuses; it is never deferred to auto-merge." ;;
+      esac
+    done
+  fi
   # A reason, not a token. "--override yes" would make the gate a formality one keystroke wide;
   # what makes an override legitimate is being able to say why THIS red is unrelated to THIS PR,
   # and that sentence is what lands in the log the next reader sees.
@@ -1917,6 +2119,12 @@ cmd_merge() {
       "same red on master before this branch existed'."
   fi
   pr_arg "$pr"
+  # A merge queue turns `gh pr merge` into an ENQUEUE — the PR lands later, on whatever head it
+  # has then, and --disable-auto does not take an entry out of a queue. A close-out merge lands
+  # the gated head now or refuses, so on a queued base it refuses before calling merge at all:
+  # once here, before a wait that can run two hours, and once more right before the call, since
+  # the base can be retargeted or a queue enabled during the wait.
+  [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
   gate_checks "$PR_NUM" "$wait_for"
   gate=$?
   case "$gate" in
@@ -1948,18 +2156,50 @@ cmd_merge() {
     fi
     ;;
   esac
+  # ABSENT passes the ordinary gate (nothing is red, and the run list has confirmed nothing is
+  # coming), but a close-out merge — one the reviewer never 👍'd, resting on the record instead
+  # — is required to have READ a green. --require-green turns absent into a refusal.
+  if [ -n "$require_green" ] && [ "$VERDICT" != green ]; then
+    fail 4 "REFUSING to merge $REPO#$PR_NUM: --require-green and the build signal is $VERDICT," \
+      "not green. A close-out merge needs a green verdict READ on the final head. If the head" \
+      "genuinely runs no build (path filters), get one onto it — dispatch the workflow on the" \
+      "branch (gh workflow run) — or hand the merge to the maintainer with the record; a" \
+      "close-out merge is never made by dropping --require-green."
+  fi
+  # Green by skips alone is the path-filter case wearing a verdict: every check concluded, none
+  # of them ran a build. The ordinary gate lets that through (nothing failed); a close-out merge
+  # needs a build that RAN and passed.
+  if [ -n "$require_green" ] && [ "${CHECK_PASSED:-0}" -eq 0 ]; then
+    fail 4 "REFUSING to merge $REPO#$PR_NUM: --require-green and every build check on the head" \
+      "was skipped or neutral — green, but no build RAN. A close-out merge needs at least one" \
+      "check that concluded success. If the head genuinely runs no build (job-level path" \
+      "filters), get one onto it (gh workflow run) or hand the merge to the maintainer with" \
+      "the record; a close-out merge is never made by dropping --require-green."
+  fi
   # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
   # verdict is the final thing on screen before the merge itself. A loud WARNING, not a gate: the
   # roll-forward policy (ahrefs/ocannl#861, see warn_base_drift) lets a clean merge proceed on the
   # head's green run, and hands semantic drift to the post-merge integration loop. A 3 (unread)
   # has already said UNKNOWN loudly; neither outcome blocks the merge.
   warn_base_drift "$PR_NUM" || true
+  [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
+  # The verdict above is about ONE head, the one gate_checks read — and a --wait is minutes to
+  # hours long, during which a push can move the PR. `gh pr merge` merges whatever the head is at
+  # the moment of the call; --match-head-commit makes it refuse unless that is still the gated
+  # SHA, so a close-out merge cannot land a head with neither a read green nor a 👍 (review of
+  # ludics-lite#39). The refusal is final, not retried: re-run merge, which re-reads the gate.
   while :; do
-    out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" "${gh_args[@]}")
+    out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" --match-head-commit "$CHECK_SHA" \
+      "${gh_args[@]}")
     rc=$?
     [ -n "$out" ] && printf '%s\n' "$out"
     [ "$rc" -eq 0 ] && break
     case "$(gh_err_line)" in
+    *"was modified"* | *"does not match"* | *"head commit"* | *"expected head"*)
+      fail 1 "NOT merged: $REPO#$PR_NUM's head is no longer ${CHECK_SHA:0:8}, the commit the build" \
+        "signal was read for ($(gh_err_line)). A push moved it; re-run merge so the gate reads" \
+        "the new head."
+      ;;
     *"not mergeable"* | *"cannot be cleanly created"*)
       [ "$attempt" -ge 3 ] && fail 1 "merge of $REPO#$PR_NUM keeps failing as not mergeable" \
         "after $attempt attempts: this is base drift, merge or rebase origin/<base> in."
@@ -1992,6 +2232,21 @@ cmd_merge() {
   case "$state" in
   *"merged=true"*) return 0 ;;
   esac
+  if [ -n "$require_green" ]; then
+    # Required checks turned the call into a deferred auto-merge (a merge queue was refused
+    # above, before the call), which --match-head-commit guarded only at enable time: a later
+    # push would land ungated. Take it back and refuse, loudly; the caller decides what to do
+    # about the base's requirements.
+    if gh_retry write pr merge "$PR_NUM" --repo "$REPO" --disable-auto >/dev/null; then
+      fail 1 "NOT merged, and auto-merge DISABLED again: $REPO#$PR_NUM ($state) — the base defers" \
+        "merges to its required checks or a merge queue, and a close-out merge is never" \
+        "deferred. Merge it when the base allows a direct merge, or hand it to the maintainer" \
+        "with the record on the PR."
+    fi
+    fail 3 "NOT merged, and auto-merge could NOT be disabled ($(gh_err_line)): $REPO#$PR_NUM" \
+      "($state) is armed to land a LATER head ungated. Disable it by hand (gh pr merge" \
+      "--disable-auto) before anything else."
+  fi
   fail 1 "$REPO#$PR_NUM is not merged ($state) — \`gh pr merge\` returned having only enabled" \
     "auto-merge. It will land when the base's required checks pass; do not treat it as landed."
 }
@@ -2328,6 +2583,7 @@ main() {
   poll) shift && cmd_poll "$@" ;;
   watch) shift && cmd_watch "$@" ;;
   status) shift && cmd_status "$@" ;;
+  rounds) shift && cmd_rounds "$@" ;;
   checks) shift && cmd_checks "$@" ;;
   merge) shift && cmd_merge "$@" ;;
   base) shift && cmd_base "$@" ;;
@@ -2335,7 +2591,7 @@ main() {
   resolve) shift && cmd_resolve "$@" ;;
   comment) shift && cmd_comment "$@" ;;
   retry) shift && cmd_retry "$@" ;;
-  *) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|checks|merge|reply|resolve} <pr> ...
+  *) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|rounds|checks|merge|reply|resolve} <pr> ...
   pr-review.sh comment <pr> <body>           # a plain PR comment (a summary round, a review nudge)
   pr-review.sh base [owner/name] [branch] [--wait]  # is the base branch's CI green? (start of
                                              # work; --wait = post-merge integration read)

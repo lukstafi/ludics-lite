@@ -360,10 +360,20 @@ The coordinator's job between launch and last merge:
   loud one (a false refusal or error on valid-but-absent shapes) defers to ONE follow-up
   issue; a silent finding only reachable by code nobody has written defers too (reachability
   qualifier); and defects in machinery the review itself introduced are the worker's to fix,
-  not to defer ("filing bugs against myself"). When a reviewer approves only by finding
+  not to defer ("filing bugs against myself") — through the twelfth round; past it ship-pr's
+  threshold applies and they defer like anything else that does not make the PR wrong. When a
+  reviewer approves only by finding
   nothing and the last rounds are confined to review-requested machinery, pre-authorize
   merge-on-substance: CI green on the final head, every thread answered with its
-  classification, and a review-record paragraph in the PR body. Expect good workers to push
+  classification, and a review-record paragraph in the PR body. Ship-pr carries the exits a
+  worker reaches WITHOUT you (its *When the loop ends*, from ludics-lite#12): a round rebutted
+  in full ends the loop, and from the thirteenth round with findings (`pr-review.sh rounds`
+  reads the count off the PR) only BLOCKING findings are fixed — blocking read narrowly, a
+  finding that would make the PR wrong, not a bug as such — with the rest deferred to one
+  follow-up issue, so the loop ends on the first round with nothing to push. Your
+  pre-authorization moves that earlier, never later. The option to name explicitly is
+  *removal* — delete the lock or rollback a round introduced rather than harden it a fourth
+  time — because a worker fixing "bugs against itself" does not take it on its own. Expect good workers to push
   back on your framing with verified evidence - the wave's best worker corrected the
   coordinator's premise three times, correctly each time; endorse that, don't override it.
   Pair it with **one push per CI cycle** in late rounds - every push supersedes the ubuntu leg
