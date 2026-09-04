@@ -14,6 +14,12 @@ Arrange the material without unhelpful redundancy, the following are needs, not 
 - Show dependencies.
 - Categorize into three classes: (D1) straightforward ones; (D2) requiring logical problem solving, but limited code impact (e.g. debugging); (D3) requiring design taste and tricky conceptual thinking.
 - Pick the issues that can be implemented or solved first.
+  - Present them as the first-wave list, with an explicit home-box field on every item: exactly one of
+    `mac-studio`, `rog-nv-wsl`, or `minix-amd-wsl`. This is the issue-wave coordinator's dispatch
+    lookup, so never leave it to inference from the machine-placement prose. When an issue has useful
+    legs on other boxes, name the box where its primary iteration happens as home and list the other
+    boxes separately as legs. If one list item groups issues with different homes, label each issue's
+    home rather than giving the group an ambiguous shared field.
   - Among them, show which ones are good to run in parallel to one-another.
   - Among them, show which ones prefer to run on ROG (NVIDIA GPU) and which prefer to run on Minix (AMD GPU).
 - End with a "## Design questions" section surfacing the open design decisions you noticed while reading the issues. This section feeds the issue-wave skill's decision gate, so make each entry directly consumable: one line per question with the issue number, the X-vs-Y in a clause, **your own recommendation with a one-clause reason**, and a suggested tier: "veto" (default: the wave posts the recommendation to the issue and proceeds; user silence is consent) or "ask" (reserved for genuinely user-owned calls: lasting API/workflow taste, or impacting longer term design direction). Lean heavily toward "veto" — the point is to spare the user decision fatigue, not to route every judgment through them. Drop entries from previous runs once their issue closes or a decision lands.
