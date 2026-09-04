@@ -77,8 +77,11 @@ set_reviews() {
   FAIL_READ=""
 }
 
+# The body goes to jq on stdin: a shell function's arguments are not exec arguments, but a
+# `--arg` is, and the large-feed fixture below is over Linux's per-argument limit by design.
 comment() { # <login> <created_at> <body>
-  jq -cn --arg u "$1" --arg t "$2" --arg b "$3" '{user:{login:$u}, created_at:$t, body:$b}'
+  printf '%s' "$3" | jq -c -R -s --arg u "$1" --arg t "$2" \
+    '{user:{login:$u}, created_at:$t, body:.}'
 }
 
 set_comments() {
