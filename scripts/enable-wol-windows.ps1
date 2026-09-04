@@ -2,6 +2,8 @@
 #   powershell -ExecutionPolicy Bypass -File enable-wol-windows.ps1
 # BIOS/UEFI still has the final say: enable "Wake on LAN" / "Power On by PCI-E" there too.
 
+$ErrorActionPreference = 'Stop'
+
 Write-Host "== Ethernet adapters =="
 Get-NetAdapter -Physical | Where-Object { $_.MediaType -eq '802.3' } | Format-Table Name, Status, MacAddress
 
@@ -23,17 +25,24 @@ foreach ($nic in Get-NetAdapter -Physical | Where-Object { $_.MediaType -eq '802
   Get-NetAdapterPowerManagement -Name $nic.Name |
     Format-List WakeOnMagicPacket, WakeOnPattern, DeviceSleepOnDisconnect
 
-  # 3. Vendor advanced properties — names vary by driver; set whichever exist.
-  foreach ($kw in 'Wake on Magic Packet', 'Wake on pattern match', 'WakeOnLink',
-                  'Energy Efficient Ethernet', 'Green Ethernet', 'Ultra Low Power Mode') {
+  # 3. Vendor advanced properties — names vary by driver; set whichever exist. Only a magic
+  # packet may wake the machine; pattern and link triggers are disabled with the power savers.
+  $advancedSettings = [ordered]@{
+    'Wake on Magic Packet'      = 'Enabled'
+    'Wake on pattern match'     = 'Disabled'
+    'WakeOnLink'                = 'Disabled'
+    'Energy Efficient Ethernet' = 'Disabled'
+    'Green Ethernet'            = 'Disabled'
+    'Ultra Low Power Mode'      = 'Disabled'
+  }
+  foreach ($kw in $advancedSettings.Keys) {
     $p = Get-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $kw -ErrorAction SilentlyContinue
     if ($p) {
-      # Wake settings on; power-saving settings off (they kill the link at shutdown).
-      $val = if ($kw -like 'Wake*') { 'Enabled' } else { 'Disabled' }
+      $val = $advancedSettings[$kw]
       try {
         Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $kw -DisplayValue $val
         Write-Host "  $kw -> $val"
-      } catch { Write-Host "  $kw : could not set ($val)" }
+      } catch { Write-Warning "  $kw : could not set ($val): $($_.Exception.Message)" }
     }
   }
 
@@ -44,7 +53,7 @@ foreach ($nic in Get-NetAdapter -Physical | Where-Object { $_.MediaType -eq '802
       try {
         Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $kw -DisplayValue 'Enabled'
         Write-Host "  $kw -> Enabled"
-      } catch { Write-Host "  $kw : could not set" }
+      } catch { Write-Warning "  $kw : could not enable: $($_.Exception.Message)" }
     }
   }
 }
@@ -53,4 +62,4 @@ Write-Host "`n== Devices currently armed to wake the system =="
 powercfg /devicequery wake_armed
 
 Write-Host "`nDone. Shut down fully (shutdown /s /t 0), then test from the Mac:"
-Write-Host "  ~/bin/wake-lab.sh --wait rog"
+Write-Host "  ~/bin/wake-lab.sh --wait <rog-or-minix>"

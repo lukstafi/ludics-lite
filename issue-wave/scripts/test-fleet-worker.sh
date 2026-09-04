@@ -263,24 +263,31 @@ workflow_globs() { # workflow_globs <step name>
     }
   ' "$real_top/.github/workflows/skill-scripts.yml"
 }
-glob_matches() { # glob_matches <relative path> <newline-separated patterns>
-  local rel="$1" patterns="$2" pattern
-  while IFS= read -r pattern; do
-    [ -n "$pattern" ] || continue
-    case "$rel" in $pattern) return 0 ;; esac
-  done <<EOF
+workflow_matches() { # workflow_matches <newline-separated patterns>: expand from the checkout root
+  local patterns="$1"
+  (
+    cd "$real_top" || exit 1
+    while IFS= read -r pattern; do
+      [ -n "$pattern" ] || continue
+      # Unquoted on purpose: the workflow's shell expands the same pathname glob. Unlike `case`,
+      # pathname expansion does not let * cross a slash.
+      # shellcheck disable=SC2086
+      for matched in $pattern; do [ -f "$matched" ] && printf '%s\n' "$matched"; done
+    done <<EOF
 $patterns
 EOF
-  return 1
+  ) | sort -u
 }
 syntax_globs=$(workflow_globs 'Check shell syntax')
 shellcheck_globs=$(workflow_globs 'Shellcheck')
 shell_files=$(cd "$real_top" && find . -type f -name '*.sh' -print | sed 's|^\./||' | sort)
+syntax_files=$(workflow_matches "$syntax_globs")
+shellcheck_files=$(workflow_matches "$shellcheck_globs")
 uncovered=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  glob_matches "$f" "$syntax_globs" || uncovered="$uncovered bash-n:$f"
-  glob_matches "$f" "$shellcheck_globs" || uncovered="$uncovered shellcheck:$f"
+  printf '%s\n' "$syntax_files" | grep -Fqx -- "$f" || uncovered="$uncovered bash-n:$f"
+  printf '%s\n' "$shellcheck_files" | grep -Fqx -- "$f" || uncovered="$uncovered shellcheck:$f"
 done <<EOF
 $shell_files
 EOF
@@ -298,6 +305,21 @@ expect "the real checkout, installed the README's way, passes the claude preflig
   env -u FLEET_SKILLS_REPO HOME="$real_home" "$FW" preflight testbox --no-probe
 expect "...and the codex preflight" 0 "PREFLIGHT OK" -- \
   env -u FLEET_SKILLS_REPO HOME="$real_home" "$FW" preflight testbox --codex --no-probe
+unverified_skills=""
+while IFS= read -r s; do
+  [ -n "$s" ] || continue
+  rm "$real_home/.claude/skills/$s"
+  missing_out=$(env -u FLEET_SKILLS_REPO HOME="$real_home" "$FW" preflight testbox --no-probe 2>&1); missing_rc=$?
+  if [ "$missing_rc" -ne 1 ] || ! printf '%s' "$missing_out" | grep -Fq ".claude/skills/$s -> missing"; then
+    unverified_skills="$unverified_skills $s"
+  fi
+  ln -sfn "$real_home/ludics-lite/$s" "$real_home/.claude/skills/$s"
+done <<EOF
+$tree_skills
+EOF
+[ -z "$unverified_skills" ] \
+  && ok "production preflight refuses every skill link derived from the tree when it is missing" \
+  || ko "production preflight did not refuse these missing derived skill links:$unverified_skills"
 }
 
 # --- a scratch skills checkout with an origin, deployed the way the README deploys it --------
