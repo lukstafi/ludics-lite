@@ -187,7 +187,11 @@ worker kinds verbatim, and includes:
 
 - Setup: the worktree it is already in (branch, base), environment script, which docs to read.
 - The task: issue number and repo, a summary, and the instruction to read the issue and its
-  comments first - including any decision comment the gate just posted.
+  comments first - including the decision comment, where the gate POSTED one: only tier-2
+  (recommendation-with-veto) and tier-3 (user-owned) questions get a comment, a tier-1 call is
+  the worker's own and gets none, so the brief names the comment only for the issues that
+  received one (three workers of the 2026-09-04 wave reported a "promised but absent" comment,
+  and one filed it as a residual, because the shared brief promised one on every issue).
 - Verification expectations: scoped test runs, negative controls where the work is a checker,
   and the box's known environmental traps. **On mac-studio**: Gatekeeper/XProtect stalls
   fresh executables for minutes - sample the pid before assuming a hang; never start a second
@@ -256,6 +260,36 @@ pre-fleet shape, still available for exactly this), with a brief that quotes the
 maintainer-authored parts and tells the worker not to read the thread itself. Decided at
 triage; the screen is launch-time only, so an issue drawing active outside participation is
 treated the same way even when its body is ours.
+
+**Some issues kill Codex sessions by their subject (2026-09-04, first fleet wave).** OpenAI's
+cyber-risk classifier terminates a `codex exec` turn (`turn.failed ... flagged for possible
+cybersecurity risk`) when the model's own reasoning takes the shape of a memory-safety or crash
+analysis - a write through index 0 when an extent is zero (ahrefs/ocannl#878), reading a SIGTRAP
+crash report and the `.ll` around it (ahrefs/ocannl#870) - regardless of how the brief or the
+inputs are worded: the outputs fed back before each kill carried no trigger vocabulary, a
+rephrasing instruction did not help, and the same session died three times at 16/39/46 events.
+The work was durable each time (WIP commits). The worker type stays the user's decision: at
+triage, list the issues whose subject is a crash, a trap, an out-of-range access or anything
+else that reads as exploit analysis in the wave summary as candidates for Claude workers and
+let the user choose; mid-wave, after ONE such kill, the escalation path Supervise already names
+applies - hand the worktree to a Claude finisher under a NEW worker name
+(`launch <box> <name>-fin --kind claude --brief <finisher-brief> --cwd <worktree>`; the dead
+worker's record keeps
+`<name>`, which `launch` refuses to overwrite without `--replace`), brief = the original plus a
+finisher note naming the inherited commits, and tell the user - rather than resuming. Both
+finishers that day landed their PRs (the user confirmed keeping the first), and the `#870` one
+found the root cause the Codex session was reading toward.
+A Claude finisher has its own stall shape: `claude -p` ends its turn on "watch is armed, waiting",
+and the turn's end kills the watch - the finisher brief says to WAIT on `pr-review.sh watch` and
+`merge --wait` inside the turn, and an `unstick` with that sentence recovered it once.
+
+**Cross-box legs need cross-box ssh.** The brief tells a GPU-box worker to drive the other GPU box
+over ssh for a one-off leg; on 2026-09-04 minix had no credential for rog and the CUDA arm of
+ahrefs/ocannl#892 went unmeasured (lukstafi/ludics-lite#57). Until the preflight probes it,
+check the path the WORKER will use, from its home box, not from the coordinator's:
+`ssh <home-box> 'ssh -o BatchMode=yes <other-box> exit 0'`, or plain
+`ssh -o BatchMode=yes <other-box> exit 0` when the home box is the coordinator's own machine
+(the same local/remote split `run_on` makes) - before briefing such a leg.
 
 Mechanics that differ from Claude workers:
 
