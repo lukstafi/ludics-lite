@@ -20,7 +20,7 @@ ko() { fail=$((fail + 1)); echo "FAIL: $*"; }
 expect() {
   local label="$1" want_rc="$2" want="$3"; shift 3; [ "$1" = -- ] && shift
   out=$("$@" 2>&1); rc=$?
-  if [ "$rc" -eq "$want_rc" ] && printf '%s' "$out" | grep -q -- "$want"; then ok "$label"
+  if [ "$rc" -eq "$want_rc" ] && printf '%s' "$out" | grep -qF -- "$want"; then ok "$label"
   else ko "$label (rc=$rc want $want_rc; want /$want/) -- $out"; fi
 }
 
@@ -95,6 +95,42 @@ fresh "$R"; skill "$R" alpha "name: 'alpha'" 'description: "Quoted, with a # ins
 expect "quoted and commented values resolve to their text" 0 '6 passed, 0 failed' -- "$CP" "$R"
 fresh "$R"; skill "$R" alpha 'name: "beta"' 'description: quoted mismatch'
 expect "...so a quoted name is still compared to the directory" 1 "name 'beta' does not match its directory 'alpha'" -- "$CP" "$R"
+
+# The value grammar is a subset of YAML: whatever it accepts a loader reads as the same string,
+# and whatever a loader might read otherwise -- or reject -- is refused, with the reason. One
+# probe per refusal reason, then the plain-text shapes that must stay accepted.
+while IFS='|' read -r value reason; do
+  fresh "$R"; skill "$R" alpha 'name: alpha' "description: $value"
+  expect "'description: $value' is refused ($reason)" 1 "outside the grammar this check accepts: '$value' ($reason" -- "$CP" "$R"
+done <<'CASES'
+"unterminated|a double-quoted value must close
+"closed" then more|a double-quoted value must close
+'unterminated|a single-quoted value must close
+'closed' then more|a single-quoted value must close
+[]|starts with the YAML indicator '['
+{}|starts with the YAML indicator '{'
+[a, b]|starts with the YAML indicator '['
+&anchor text|starts with the YAML indicator '&'
+*alias|starts with the YAML indicator '*'
+!!str text|starts with the YAML indicator '!'
+`backticked`|starts with the YAML indicator '`'
+- a list item|starts with '- '
+? a key|starts with '? '
+: a value|starts with ': '
+Runs checks: quickly|contains ': ' or ends with ':'
+Ends with a colon:|contains ': ' or ends with ':'
+42|'42' is a number, boolean or null
+1e3|'1e3' is a number, boolean or null
+.inf|'.inf' is a number, boolean or null
+true|'true' is a number, boolean or null
+Yes|'Yes' is a number, boolean or null
+CASES
+for value in 'Runs checks:quickly, no space after the colon' 'v1.2 of 3 things, 100% plain' \
+  '-x is plain when no space follows the dash' 'Text - with - dashes and a trailing note # here' \
+  '"Runs checks: quickly, quoted"' "'It''s quoted, with: a colon'" 'Yes it is text, not a boolean'; do
+  fresh "$R"; skill "$R" alpha 'name: alpha' "description: $value"
+  expect "'description: $value' is accepted" 0 '6 passed, 0 failed' -- "$CP" "$R"
+done
 
 fresh "$R"; skill "$R" alpha 'name: alpah' 'description: misspelt'
 expect "name must match the directory" 1 "name 'alpah' does not match its directory 'alpha'" -- "$CP" "$R"

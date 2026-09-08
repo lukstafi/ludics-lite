@@ -10,9 +10,11 @@
 #     is a top-level `key: value` (or blank, or a comment) -- a flat map of one-line scalars,
 #     which is the only shape the loaders read; a continued, nested, listed or block-scalar
 #     value is refused rather than half-read;
-#   - exactly one `name:` and one `description:` declaration, each resolving to a non-empty
-#     value the way YAML resolves a one-line scalar (so `""`, `~`, `null` and a bare comment
-#     are empty);
+#   - exactly one `name:` and one `description:` declaration, each a value inside the grammar
+#     YAML reads unambiguously as a non-empty string -- a fully quoted string, or a plain
+#     scalar free of indicators, of `: `, and of the number/boolean/null spellings; anything
+#     else is refused, whether or not a loader would accept it, so the checker never has to
+#     guess what a loader would make of it;
 #   - `name` equals the directory's name, which is what the install loops link by and what the
 #     scheduler registers.
 # And per index table -- `| Skill |` in README.md, `| Routine |` in routines/README.md -- that
@@ -53,9 +55,10 @@ frontmatter() {
 # is what makes the reading exact rather than an approximation of YAML -- every line is blank, a
 # comment, or a top-level `key: value`, so a value cannot continue on a next line, a block scalar
 # has no body to hold, and a list or nested map is refused outright. Within that shape, a value is
-# resolved the way YAML resolves a one-line scalar (`scalar` below), so `description: ""`,
-# `description: ~` and `description: # note` are the empty they are to a loader, not the
-# non-empty text they are to a byte count.
+# accepted only inside a grammar YAML reads unambiguously as a string (`value_of` below), so
+# `description: ""`, `description: ~` and `description: # note` are the empty they are to a
+# loader, `description: []` and `description: Runs: checks` are refused rather than half-read,
+# and the checker owes no opinion on anything it does not accept.
 KEY_LINE='^[A-Za-z_][A-Za-z0-9_-]*:([[:space:]]|$)'
 BLANK_OR_COMMENT='^[[:space:]]*(#|$)'
 
@@ -63,20 +66,56 @@ BLANK_OR_COMMENT='^[[:space:]]*(#|$)'
 # an empty value included -- the count of declarations is a fact about the keys, not the values.
 field() { printf '%s\n' "$2" | sed -n "s/^$1:[[:space:]]*//p"; }
 
-# scalar <raw>: the string a one-line YAML scalar resolves to -- surrounding quotes removed (a
-# quoted value ends at its closing quote), an unquoted trailing comment dropped, and the null
-# spellings (`null`, `~`, nothing at all) made empty. Block scalars never reach this.
-scalar() {
-  local v
+# value_of <raw>: the text a value resolves to, on stdout with exit 0, when the value lies inside
+# the grammar this checker accepts; otherwise exit 1 with the REASON on stdout. The grammar is a
+# deliberate SUBSET of YAML -- the values a loader reads unambiguously as a string -- and
+# everything outside it is refused whether YAML would accept it or not. That is what closes, for
+# good, the class of "the checker reads this value differently from a YAML loader": the checker
+# never models what a loader does with a value it does not accept, it refuses it.
+#   - a double-quoted string, `"..."` with backslash escapes, closed on the same line and
+#     followed by nothing but an optional comment;
+#   - a single-quoted string, `'...'` with `''` for a quote, closed the same way;
+#   - a plain scalar: no leading YAML indicator (`[]{}&*!|>%@,` and the backtick; `-`, `?`
+#     and `:` only where YAML gives them meaning, before a space or at the end), no `: ` and no
+#     trailing `:` (a mapping to YAML), and not a spelling YAML resolves to a number, boolean or
+#     null; an unquoted trailing ` #comment` is dropped first.
+# The empty string, from any of these, is "no value" (`null`, `~` and a bare comment included).
+value_of() {
+  local v inner first
   v=$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
   case "$v" in
-  \"*) v=${v#\"}; v=${v%%\"*} ;;
-  \'*) v=${v#\'}; v=${v%%\'*} ;;
-  \#*) v="" ;;
-  *) v=$(printf '%s' "$v" | sed -e 's/[[:space:]]#.*$//' -e 's/[[:space:]]*$//') ;;
+  \"*)
+    if ! printf '%s\n' "$v" | grep -qE '^"([^"\\]|\\.)*"([[:space:]]+#.*)?$'; then
+      echo "a double-quoted value must close on the same line, with nothing but a comment after the closing quote"; return 1
+    fi
+    inner=$(printf '%s\n' "$v" | sed -E 's/^"(([^"\\]|\\.)*)".*$/\1/')
+    ;;
+  \'*)
+    if ! printf '%s\n' "$v" | grep -qE "^'([^']|'')*'([[:space:]]+#.*)?\$"; then
+      echo "a single-quoted value must close on the same line, with nothing but a comment after the closing quote"; return 1
+    fi
+    inner=$(printf '%s\n' "$v" | sed -E "s/^'(([^']|'')*)'.*\$/\1/" | sed "s/''/'/g")
+    ;;
+  *)
+    v=$(printf '%s' "$v" | sed -e 's/[[:space:]]#.*$//' -e 's/[[:space:]]*$//')
+    first=${v%"${v#?}"}
+    case "$v" in
+    '' | \#*) inner="" ;;
+    [\[\]{}\&\*\!\|\>%@\`,]*)
+      echo "starts with the YAML indicator '$first', which a loader reads as a collection, anchor, tag or block scalar, not text; quote the value"; return 1 ;;
+    -\ * | - | \?\ * | \? | :\ * | :)
+      echo "starts with '$first ', which YAML reads as a list item or mapping key, not text; quote the value"; return 1 ;;
+    *:\ * | *:)
+      echo "contains ': ' or ends with ':', which YAML reads as a nested mapping, not text; quote the value or rephrase"; return 1 ;;
+    *) inner="$v" ;;
+    esac
+    case "$inner" in null | Null | NULL | '~') inner="" ;; esac
+    if printf '%s\n' "$inner" | grep -qiE '^(true|false|yes|no|on|off|y|n|[-+]?(\.[0-9]+|[0-9][0-9_]*(\.[0-9_]*)?)([eE][-+]?[0-9]+)?|0x[0-9a-fA-F_]+|0o?[0-7_]+|[-+]?\.(inf|nan))$'; then
+      echo "'$inner' is a number, boolean or null to YAML, not text; quote the value"; return 1
+    fi
+    ;;
   esac
-  case "$v" in null | Null | NULL | '~') v="" ;; esac
-  printf '%s' "$v"
+  printf '%s' "$inner"
 }
 
 check_skill_file() {
@@ -103,7 +142,9 @@ check_skill_file() {
     '|'* | '>'*)
       ko "$rel" "$key is a block scalar ('$raw'); the loaders read it as one line"; continue ;;
     esac
-    value=$(scalar "$raw")
+    if ! value=$(value_of "$raw"); then
+      ko "$rel" "frontmatter '$key:' value is outside the grammar this check accepts: '$raw' ($value)"; continue
+    fi
     if [ -z "$value" ]; then
       ko "$rel" "frontmatter '$key:' has no value ('$raw' resolves to empty)"; continue
     fi
