@@ -154,6 +154,7 @@ The shell scripts carry their own test suites:
 ```sh
 issue-wave/scripts/test-fleet-worker.sh
 ship-pr/scripts/test-post-merge-cleanup.sh
+ship-pr/scripts/test-pr-review-lib.sh
 ship-pr/scripts/test-pr-review-base-drift.sh
 ship-pr/scripts/test-pr-review-checks-absent.sh
 ship-pr/scripts/test-pr-review-rounds.sh
@@ -162,7 +163,7 @@ ship-pr/scripts/test-pr-review-status.sh
 scripts/test-wake-lab.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all eight on Ubuntu and
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all nine on Ubuntu and
 macOS (the fleet's bash is 3.2) for every push and pull request, along with `bash -n`, shellcheck
 at error severity, and a check that the two cleanup scripts still carry their parse guard. It runs
 without path filters, so every PR's merge gate reads a verdict rather than `ABSENT`.
@@ -212,6 +213,18 @@ GitHub still computing is not a conflict, a failed PR read cannot hide a 👍 an
 tip, leaving stdout byte-identical to `poll`'s. `test-pr-review-base-drift.sh` pins the other
 half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
 which stands still on a conflicted PR.
+
+The five `test-pr-review-*` suites share a preamble, `test-pr-review-lib.sh`, which sources
+`pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and
+the fixture `gh`'s argument parsing. It also closes the trap that bit twice (ludics-lite#39, #45,
+#46): `pr-review.sh` puts some sixty unqualified functions in scope, and a suite helper sharing a
+name — a reporter called `fail` — silently replaces the library's, turning every refusal's exit
+code into the reporter's. So the preamble snapshots the function table when it is sourced, and
+`run_tests` refuses, naming the function and where the suite redefined it, any library function
+redefined without a `stub <fn>` declaration (the merge suite declares `build_checks`, `run_signal`
+and `warn_base_drift`), and any declaration the suite never honoured. Run directly,
+`test-pr-review-lib.sh` is its own suite: throwaway suites that source it prove the guard refuses
+what it must and passes what it must.
 
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and

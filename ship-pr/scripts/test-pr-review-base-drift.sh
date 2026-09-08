@@ -4,20 +4,10 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
-HELPER="$SCRIPT_DIR/pr-review.sh"
-TEST_ROOT=$(mktemp -d "/tmp/pr-review-base-drift-test.XXXXXX") || exit 1
-trap 'case "$TEST_ROOT" in /tmp/pr-review-base-drift-test.*) rm -rf "$TEST_ROOT" ;; esac' EXIT
-
-export SHIP_PR_TEST_SOURCE_ONLY=1
-export SHIP_PR_STATE_DIR=off
-export SHIP_PR_API_ATTEMPTS=1
-export SHIP_PR_API_BACKOFF=0
-export SHIP_PR_STALE_BASE=20
-# shellcheck source=pr-review.sh
-source "$HELPER"
-# pr-review.sh installs its own EXIT trap. Preserve that cleanup and restore this test's temporary
-# root cleanup after sourcing it.
-trap 'rm -f "$GH_ERR_FILE"; case "$TEST_ROOT" in /tmp/pr-review-base-drift-test.*) rm -rf "$TEST_ROOT" ;; esac' EXIT
+export SHIP_PR_STALE_BASE=20 # read when pr-review.sh is sourced, so before the preamble
+# shellcheck source=test-pr-review-lib.sh
+source "$SCRIPT_DIR/test-pr-review-lib.sh"
+test_tmpdir TEST_ROOT base-drift-test
 
 REPO=example/repo
 REQUEST_LOG="$TEST_ROOT/requests"
@@ -36,25 +26,6 @@ pr_json() {
     '{base:{ref:$ref,sha:"stale-base-sha"},head:{label:"fork-owner:topic",sha:"head-sha"},mergeable_state:$m}'
 }
 
-# Not `fail`: pr-review.sh is sourced above and its refusals call ITS fail, whose exit code these
-# tests read; a same-named helper here would turn every refusal into this reporter's 1.
-bail() {
-  echo "FAIL: $*" >&2
-  exit 1
-}
-
-assert_eq() {
-  [ "$1" = "$2" ] || bail "$3 (got '$1', expected '$2')"
-}
-
-assert_contains() {
-  case "$1" in *"$2"*) ;; *) bail "$3 (missing '$2' in: $1)" ;; esac
-}
-
-assert_not_contains() {
-  case "$1" in *"$2"*) bail "$3 (unexpected '$2' in: $1)" ;; *) ;; esac
-}
-
 compare_json() {
   jq -cn --argjson behind "$1" --argjson ahead "$2" --argjson files "$3" \
     '{behind_by:$behind, ahead_by:$ahead, merge_base_commit:{sha:"merge-base-sha"}, files:$files}'
@@ -71,26 +42,13 @@ set_compares() {
   STALE_BASE=20
 }
 
-# Minimal gh fixture transport. It honours --jq because the PR metadata read asks gh to format its
-# stable base/head snapshot, while compare responses are deliberately parsed by local jq.
+# Minimal gh fixture transport. The --jq filter matters here: the PR metadata read asks gh to
+# format its stable base/head snapshot, while compare responses are deliberately parsed by local
+# jq.
 gh() {
-  local endpoint="" filter="" response="" arg
-  [ "${1:-}" = api ] || bail "fixture received non-api gh call: $*"
-  shift
-  endpoint="${1:-}"
-  shift || true
-  while [ $# -gt 0 ]; do
-    arg="$1"
-    shift
-    case "$arg" in
-    --jq)
-      filter="${1:-}"
-      shift || true
-      ;;
-    esac
-  done
-  printf '%s\n' "$endpoint" >>"$REQUEST_LOG"
-  case "$endpoint" in
+  local response=""
+  gh_fixture_parse "$@"
+  case "$FIXTURE_ENDPOINT" in
   "repos/$REPO/pulls/7") response=$(pr_json) ;;
   # The base branch's tip: what the compares must be anchored on. A compare against the PR's
   # stale-base-sha snapshot has no fixture and bails below, which is the point.
@@ -115,13 +73,9 @@ gh() {
     fi
     response="$REVERSE_JSON"
     ;;
-  *) bail "unexpected fixture endpoint: $endpoint" ;;
+  *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
-  if [ -n "$filter" ]; then
-    jq -r "$filter" <<<"$response"
-  else
-    printf '%s\n' "$response"
-  fi
+  gh_fixture_answer "$response"
 }
 
 run_drift() {
@@ -328,7 +282,4 @@ tests=(
   test_base_ref_is_encoded
 )
 
-for test_name in "${tests[@]}"; do
-  "$test_name"
-  echo "PASS: $test_name"
-done
+run_tests "${tests[@]}"
