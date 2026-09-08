@@ -72,19 +72,48 @@ fresh "$R"; printf -- '---\nname: beta\ndescription: unclosed\n\n# beta\n' > "$R
 expect "no closing fence" 1 'beta/SKILL.md: no YAML frontmatter' -- "$CP" "$R"
 
 fresh "$R"; skill "$R" alpha 'description: nameless'
-expect "missing name" 1 "alpha/SKILL.md: frontmatter has no 'name:'" -- "$CP" "$R"
+expect "missing name" 1 "alpha/SKILL.md: frontmatter has no 'name:' line" -- "$CP" "$R"
 
 fresh "$R"; skill "$R/routines" weekly 'name: weekly' 'description:'
-expect "empty description" 1 "weekly/SKILL.md: frontmatter has no 'description:'" -- "$CP" "$R"
+expect "empty description" 1 "weekly/SKILL.md: frontmatter 'description:' has no value" -- "$CP" "$R"
 
 fresh "$R"; skill "$R" beta 'name: beta' 'name: beta' 'description: twice named'
 expect "duplicate name" 1 "beta/SKILL.md: frontmatter has 2 'name:' lines" -- "$CP" "$R"
 
+# Declarations are counted as keys, not as non-empty values: a blank `name:` beside a populated
+# one is two declarations, and neither the blank one nor the mismatch it could hide gets through.
+fresh "$R"; skill "$R" beta 'name:' 'name: alpha' 'description: blank beside populated'
+expect "a blank duplicate key still counts" 1 "beta/SKILL.md: frontmatter has 2 'name:' lines" -- "$CP" "$R"
+
+# Values resolve the way YAML resolves a one-line scalar: the quoted, null and comment-only
+# spellings of empty are empty, and quotes and a trailing comment around real text are not text.
+for empty in 'description: ""' "description: ''" 'description: null' 'description: ~' 'description: # only a comment' 'description:    '; do
+  fresh "$R"; skill "$R" alpha 'name: alpha' "$empty"
+  expect "'$empty' is empty" 1 "alpha/SKILL.md: frontmatter 'description:' has no value" -- "$CP" "$R"
+done
+fresh "$R"; skill "$R" alpha "name: 'alpha'" 'description: "Quoted, with a # inside." # and a trailing note'
+expect "quoted and commented values resolve to their text" 0 '6 passed, 0 failed' -- "$CP" "$R"
+fresh "$R"; skill "$R" alpha 'name: "beta"' 'description: quoted mismatch'
+expect "...so a quoted name is still compared to the directory" 1 "name 'beta' does not match its directory 'alpha'" -- "$CP" "$R"
+
 fresh "$R"; skill "$R" alpha 'name: alpah' 'description: misspelt'
 expect "name must match the directory" 1 "name 'alpah' does not match its directory 'alpha'" -- "$CP" "$R"
 
-fresh "$R"; skill "$R" alpha 'name: alpha' 'description: |' '  A block scalar.'
-expect "block-scalar description" 1 'description is a block scalar' -- "$CP" "$R"
+# A block scalar is refused by its header, whatever indicators or comment follow the `|`/`>`;
+# and its body, like any continued, nested or listed value, is refused as a non-key line, so a
+# value cannot span lines whichever way it is spelled.
+for header in 'description: |' 'description: |2-' 'description: >+' 'description: > # folded'; do
+  fresh "$R"; skill "$R" alpha 'name: alpha' "$header"
+  expect "block scalar header '$header'" 1 'description is a block scalar' -- "$CP" "$R"
+done
+fresh "$R"; skill "$R" alpha 'name: alpha' 'description: |' '  A block scalar body.'
+expect "a block scalar body is a non-key line" 1 "not a top-level 'key: value'" -- "$CP" "$R"
+fresh "$R"; skill "$R" alpha 'name: alpha' 'description: The first line' '  continued on a second.'
+expect "a plain scalar continued on the next line" 1 "not a top-level 'key: value'" -- "$CP" "$R"
+fresh "$R"; skill "$R" alpha 'name: alpha' 'description: listed' 'allowed-tools:' '  - Bash'
+expect "a nested list" 1 "not a top-level 'key: value'" -- "$CP" "$R"
+fresh "$R"; skill "$R" alpha 'name: alpha' 'description: commented' '# a comment line' '' 'model: sonnet'
+expect "blank and comment lines between keys are fine" 0 '6 passed, 0 failed' -- "$CP" "$R"
 
 # --- index table defects ---------------------------------------------------------------------
 fresh "$R"; skill "$R" gamma 'name: gamma' 'description: Unindexed.'
@@ -99,6 +128,24 @@ expect "a routine missing from routines/README.md" 1 'routine directories missin
 fresh "$R"; rm -r "$R/routines/nightly"
 expect "a routines row without a directory" 1 "table row 'nightly' has no routines/nightly/SKILL.md" -- "$CP" "$R"
 
+# A table ends at its first non-row line, blank or not: rows of a later table that follows a
+# heading with no blank line between are not the index, in either direction.
+fresh "$R"; cat > "$R/README.md" <<'EOF'
+# scratch
+
+| Skill | What it does |
+| --- | --- |
+| `alpha` | The first. |
+## A heading with no blank line before it
+| Variable | Meaning |
+| --- | --- |
+| `beta` | Indexed in the wrong table. |
+| `NOT_A_SKILL` | Not a skill either. |
+EOF
+expect "a heading ends the table: a skill listed only in a later table is missing" 1 'skill directories missing from its table: beta' -- "$CP" "$R"
+printf '%s' "$out" | grep -q "table row 'NOT_A_SKILL'" && ko "the later table's rows were read as the index" \
+  || ok "...and the later table's rows are not read as index rows"
+
 fresh "$R"; sed -i.bak 's/^| Routine |/| Routines |/' "$R/routines/README.md"
 expect "a renamed table header is a failure, not an empty pass" 1 "no '| Routine |' table" -- "$CP" "$R"
 
@@ -108,8 +155,8 @@ expect "a missing index file" 1 'routines/README.md: missing' -- "$CP" "$R"
 # Two defects in one run are both reported: the per-file loop does not stop at the first.
 fresh "$R"; skill "$R" alpha 'description: nameless'; skill "$R/routines" weekly 'name: weekly'
 out=$("$CP" "$R" 2>&1)
-if printf '%s' "$out" | grep -q "alpha/SKILL.md: frontmatter has no 'name:'" \
-  && printf '%s' "$out" | grep -q "weekly/SKILL.md: frontmatter has no 'description:'"; then
+if printf '%s' "$out" | grep -q "alpha/SKILL.md: frontmatter has no 'name:' line" \
+  && printf '%s' "$out" | grep -q "weekly/SKILL.md: frontmatter has no 'description:' line"; then
   ok "every defective file is reported, not only the first"
 else ko "a second defective file went unreported -- $out"; fi
 

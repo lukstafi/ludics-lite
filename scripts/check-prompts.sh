@@ -6,10 +6,13 @@
 # all, which `pr-review.sh merge` refuses as ABSENT. This is what keeps such a head judged.
 #
 # What it pins, per <root>/*/SKILL.md and <root>/routines/*/SKILL.md:
-#   - YAML frontmatter: line 1 is `---`, closed by a later `---`, and nothing but frontmatter
-#     before the closing fence;
-#   - exactly one `name:` and one `description:`, each with a non-empty single-line value
-#     (a block scalar, `|` or `>`, is refused: the loaders read the description as one line);
+#   - YAML frontmatter: line 1 is `---`, closed by a later `---`, and every line between them
+#     is a top-level `key: value` (or blank, or a comment) -- a flat map of one-line scalars,
+#     which is the only shape the loaders read; a continued, nested, listed or block-scalar
+#     value is refused rather than half-read;
+#   - exactly one `name:` and one `description:` declaration, each resolving to a non-empty
+#     value the way YAML resolves a one-line scalar (so `""`, `~`, `null` and a bare comment
+#     are empty);
 #   - `name` equals the directory's name, which is what the install loops link by and what the
 #     scheduler registers.
 # And per index table -- `| Skill |` in README.md, `| Routine |` in routines/README.md -- that
@@ -46,30 +49,66 @@ frontmatter() {
   awk 'NR == 1 { next } /^---$/ { found = 1; exit } { print } END { exit found ? 0 : 1 }' "$f"
 }
 
-# field <key> <frontmatter>: the values of `key: value` lines, one per line.
+# The frontmatter is read as what the loaders need it to be: a FLAT map of one-line scalars. That
+# is what makes the reading exact rather than an approximation of YAML -- every line is blank, a
+# comment, or a top-level `key: value`, so a value cannot continue on a next line, a block scalar
+# has no body to hold, and a list or nested map is refused outright. Within that shape, a value is
+# resolved the way YAML resolves a one-line scalar (`scalar` below), so `description: ""`,
+# `description: ~` and `description: # note` are the empty they are to a loader, not the
+# non-empty text they are to a byte count.
+KEY_LINE='^[A-Za-z_][A-Za-z0-9_-]*:([[:space:]]|$)'
+BLANK_OR_COMMENT='^[[:space:]]*(#|$)'
+
+# field <key> <frontmatter>: the raw right-hand side of EVERY `key:` line, one per output line,
+# an empty value included -- the count of declarations is a fact about the keys, not the values.
 field() { printf '%s\n' "$2" | sed -n "s/^$1:[[:space:]]*//p"; }
 
+# scalar <raw>: the string a one-line YAML scalar resolves to -- surrounding quotes removed (a
+# quoted value ends at its closing quote), an unquoted trailing comment dropped, and the null
+# spellings (`null`, `~`, nothing at all) made empty. Block scalars never reach this.
+scalar() {
+  local v
+  v=$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  case "$v" in
+  \"*) v=${v#\"}; v=${v%%\"*} ;;
+  \'*) v=${v#\'}; v=${v%%\'*} ;;
+  \#*) v="" ;;
+  *) v=$(printf '%s' "$v" | sed -e 's/[[:space:]]#.*$//' -e 's/[[:space:]]*$//') ;;
+  esac
+  case "$v" in null | Null | NULL | '~') v="" ;; esac
+  printf '%s' "$v"
+}
+
 check_skill_file() {
-  local rel="$1" dir fm name desc count
+  local rel="$1" dir fm bad key count raw name="" value
   dir=$(basename "$(dirname "$ROOT/$rel")")
   if ! fm=$(frontmatter "$ROOT/$rel"); then
     ko "$rel" "no YAML frontmatter: line 1 must be '---' and a closing '---' must follow"
     return
   fi
+  bad=$(printf '%s\n' "$fm" | grep -v -E "$BLANK_OR_COMMENT" | grep -v -E "$KEY_LINE" | head -n 1)
+  if [ -n "$bad" ]; then
+    ko "$rel" "frontmatter line is not a top-level 'key: value' (a continued, nested or listed value cannot be read as one line): '$bad'"
+    return
+  fi
   for key in name description; do
-    count=$(field "$key" "$fm" | grep -c .)
+    count=$(field "$key" "$fm" | wc -l | tr -d ' ')
     case "$count" in
-    0) ko "$rel" "frontmatter has no '$key:' with a value" ;;
+    0) ko "$rel" "frontmatter has no '$key:' line"; continue ;;
     1) ;;
-    *) ko "$rel" "frontmatter has $count '$key:' lines, expected one" ;;
+    *) ko "$rel" "frontmatter has $count '$key:' lines, expected one"; continue ;;
     esac
+    raw=$(field "$key" "$fm")
+    case "$raw" in
+    '|'* | '>'*)
+      ko "$rel" "$key is a block scalar ('$raw'); the loaders read it as one line"; continue ;;
+    esac
+    value=$(scalar "$raw")
+    if [ -z "$value" ]; then
+      ko "$rel" "frontmatter '$key:' has no value ('$raw' resolves to empty)"; continue
+    fi
+    [ "$key" = name ] && name="$value"
   done
-  name=$(field name "$fm" | head -n 1)
-  desc=$(field description "$fm" | head -n 1)
-  case "$desc" in
-  '|' | '>' | '|-' | '>-' | '|+' | '>+')
-    ko "$rel" "description is a block scalar ('$desc'); the loaders read it as one line" ;;
-  esac
   if [ -n "$name" ] && [ "$name" != "$dir" ]; then
     ko "$rel" "frontmatter name '$name' does not match its directory '$dir'"
   fi
@@ -79,11 +118,13 @@ check_skill_file() {
 
 # --- index tables -----------------------------------------------------------------------------
 # table_names <readme> <first-column-header>: the backticked first column of the table whose
-# header row starts `| <header> |`, up to the first blank line after it.
+# header row starts `| <header> |`. A Markdown table ends at the first line that is not a row,
+# blank or not -- a heading or paragraph ends it just the same, and the rows of a later table
+# are that table's, whatever its header.
 table_names() {
   awk -v hdr="| $2 |" '
     index($0, hdr) == 1 { in_table = 1; next }
-    in_table && /^$/ { exit }
+    in_table && !/^\|/ { exit }
     in_table && /^\| `[^`]*` \|/ { sub(/^\| `/, ""); sub(/`.*$/, ""); print }
   ' "$ROOT/$1"
 }
