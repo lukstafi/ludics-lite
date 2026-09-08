@@ -196,7 +196,9 @@ echo "      base $BASE tip $HEAD"
 
 # --- actions/runs?head_sha= -------------------------------------------------------------------
 section "actions/runs?head_sha=<tip> — run_signal's feed"
-runs=$(api --paginate "repos/$REPO/actions/runs?head_sha=$HEAD&per_page=100" | pages workflow_runs)
+# The newest 100 rows, not the whole history: these are shape claims, a sample carries them, and
+# a tip that accumulates a scheduled run a day would otherwise grow every read without bound.
+runs=$(api "repos/$REPO/actions/runs?head_sha=$HEAD&per_page=100" | pages workflow_runs)
 pin "the feed is workflow_runs[]" 'type == "array"' "$runs"
 # An empty list is a valid signal the gate handles (a paths-ignored push, a repository without
 # push workflows), not a moved shape: the row-level claims need a sample, and say so without one.
@@ -242,7 +244,7 @@ else
 fi
 
 if is_num "${GITHUB_RUN_ID:-}" && is_sha "${CONTRACT_OWN_HEAD:-}"; then
-  own=$(api --paginate "repos/$REPO/actions/runs?head_sha=$CONTRACT_OWN_HEAD&per_page=100" | pages workflow_runs)
+  own=$(api "repos/$REPO/actions/runs?head_sha=$CONTRACT_OWN_HEAD&per_page=100" | pages workflow_runs) # the own run is among the newest on its head
   is_list "$own" || own='[]' # the wrapper claim above has recorded the MOVED; these then move too, on an empty list
   pin "this job's own run (id $GITHUB_RUN_ID) is a row on its head, unfinished, with no conclusion" \
     'any(.[]; .id == $run and .status != "completed" and .conclusion == null)' "$own" --argjson run "$GITHUB_RUN_ID"
@@ -299,7 +301,7 @@ fi
 
 # --- commits/<sha>/check-runs ---------------------------------------------------------------------
 section "commits/<tip>/check-runs?filter=latest — build_checks's feed"
-checks=$(api --paginate "repos/$REPO/commits/$HEAD/check-runs?filter=latest&per_page=100" | pages check_runs)
+checks=$(api "repos/$REPO/commits/$HEAD/check-runs?filter=latest&per_page=100" | pages check_runs) # the first 100: a sample, like the runs
 pin "the feed is check_runs[]" 'type == "array"' "$checks"
 if ! is_list "$checks"; then
   skip "the row-level claims on the tip's check runs" "$UNUSABLE"
@@ -315,29 +317,45 @@ pin "every check run carries a check_suite.id (build_checks reads by name across
   'all(.[]; .check_suite.id | type == "number")' "$checks"
 pin "filter=latest yields one check run per name WITHIN a check suite (a re-run does not add a stale twin; two workflows may share a job name)" \
   '[.[] | "\(.check_suite.id)/\(.name)"] | length == (unique | length)' "$checks"
-# Every run on the tip, whatever its status: a check run exists only once its job does, and a
-# tip whose run is still queued (a fresh merge behind a runner queue) has no completed run yet.
-# The runs this correlation is made against are read AFTER the checks: a run exists before any
-# of its checks, so a snapshot taken after the check read cannot lack the run behind a check —
-# while the earlier snapshot could, for a workflow started on the tip in between.
-runs_after=$(api --paginate "repos/$REPO/actions/runs?head_sha=$HEAD&per_page=100" | pages workflow_runs)
-is_list "$runs_after" || runs_after='null'
-# The names accumulate in a file, one page's list per line, and reach the claim deduplicated
-# through --slurpfile: a head re-run many times has more names than fit on the argument vector.
-: >"$SCRATCH/job_names"
-jobs_unusable=""
-for rid in $(jq -r '.[]?.id // "-"' <<<"$runs_after"); do
-  is_num "$rid" || { jobs_unusable=1; continue; }
-  api --paginate "repos/$REPO/actions/runs/$rid/jobs?per_page=100" | jq -c '[.jobs[]?.name]' >>"$SCRATCH/job_names"
-done
-jq -s 'add // [] | unique' "$SCRATCH/job_names" >"$SCRATCH/job_names.json"
-if [ "$runs_after" = null ]; then
-  skip "every github-actions check run on the tip is named after a job of one of its runs" "$UNUSABLE"
-elif [ -z "$jobs_unusable" ]; then
-  pin "every github-actions check run on the tip is named after a job of one of the tip's runs (the advisory deny-list matches JOB names)" \
-    '[.[] | select(.app.slug == "github-actions") | .name] | all(.[]; . as $n | $jobs[0] | index($n))' "$checks" --slurpfile jobs "$SCRATCH/job_names.json"
+# A check run's suite is its run's — check_suite.id on the check joins check_suite_id on the run
+# — so the correlation is exact (a check is named after a job of ITS run, not of some run on the
+# tip) and bounded: the newest CORRELATE runs, whatever their status, since a check run exists
+# only once its job does and a tip whose run is still queued has no completed run yet. One jobs
+# read per run in the sample, never per run in the history: a tip accumulating a scheduled run
+# a day would otherwise grow the loop without bound. Read AFTER the checks: a run exists before
+# any of its checks, so a snapshot taken after the check read cannot lack the run behind a check
+# — while the earlier snapshot could, for a workflow started on the tip in between. The names
+# accumulate in a file and reach the claim through --slurpfile, off the argument vector.
+CORRELATE=10
+runs_after=$(api "repos/$REPO/actions/runs?head_sha=$HEAD&per_page=$CORRELATE" | pages workflow_runs)
+correlation="every github-actions check run of the tip's newest $CORRELATE runs is named after a job of ITS run (the advisory deny-list matches JOB names)"
+if ! is_list "$runs_after"; then
+  skip "$correlation" "$UNUSABLE"
 else
-  skip "every github-actions check run on the tip is named after a job of one of its runs" "a run row has no usable id — see the MOVED above"
+  pin "every run row carries a numeric check_suite_id (the join to a check run's check_suite.id)" \
+    'all(.[]; .check_suite_id | type == "number")' "$runs_after"
+  : >"$SCRATCH/suite_jobs"
+  jobs_unusable=""
+  for pair in $(jq -r '.[] | "\(.id // "-"):\(.check_suite_id // "-")"' <<<"$runs_after"); do
+    rid=${pair%%:*}
+    sid=${pair#*:}
+    if ! is_num "$rid" || ! is_num "$sid"; then
+      jobs_unusable=1
+      continue
+    fi
+    api --paginate "repos/$REPO/actions/runs/$rid/jobs?per_page=100" | jq -c --argjson sid "$sid" '{suite: ($sid | tostring), jobs: [.jobs[]?.name]}' >>"$SCRATCH/suite_jobs"
+  done
+  jq -s 'group_by(.suite) | map({key: .[0].suite, value: (map(.jobs) | add | unique)}) | from_entries' "$SCRATCH/suite_jobs" >"$SCRATCH/suite_jobs.json"
+  in_sample=$(jq --slurpfile m "$SCRATCH/suite_jobs.json" '[.[] | select(.app.slug == "github-actions") | select((.check_suite.id | tostring) as $s | $m[0] | has($s))] | length' <<<"$checks")
+  if [ -n "$jobs_unusable" ]; then
+    skip "$correlation" "a run row has no usable id or check_suite_id — see the MOVED above"
+  elif [ "$in_sample" -eq 0 ]; then
+    skip "$correlation" "none of the tip's check runs belongs to its newest $CORRELATE runs' suites (their jobs have not started yet)"
+  else
+    pin "$correlation, on $in_sample check runs" \
+      '[.[] | select(.app.slug == "github-actions") | select((.check_suite.id | tostring) as $s | $m[0] | has($s))]
+       | all(.[]; (.check_suite.id | tostring) as $s | .name as $n | $m[0][$s] | index($n))' "$checks" --slurpfile m "$SCRATCH/suite_jobs.json"
+  fi
 fi
 fi
 
