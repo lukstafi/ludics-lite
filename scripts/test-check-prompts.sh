@@ -269,6 +269,11 @@ expect "...and one indented three does" 0 '6 passed, 0 failed' -- "$CP" "$R"
 # renders as a table on GitHub, and so it is one here.
 fresh "$R"; sed -i.bak 's/^| --- | --- |$/| - | - |/' "$R/README.md"
 expect "a single-hyphen delimiter row is a table, as on GitHub" 0 '6 passed, 0 failed' -- "$CP" "$R"
+# ...but only with as many cells as the header: GFM recognises no table otherwise.
+fresh "$R"; sed -i.bak 's/^| --- | --- |$/| - |/' "$R/README.md"
+expect "a delimiter row with fewer cells than the header is not a table" 1 "no '| Skill |' table" -- "$CP" "$R"
+fresh "$R"; sed -i.bak 's/^| --- | --- |$/| --- | --- | --- |/' "$R/README.md"
+expect "...nor one with more" 1 "no '| Skill |' table" -- "$CP" "$R"
 
 # Every data row is judged: a row the reader sees with a first cell that is not one backticked
 # name fails, instead of being skipped as not-a-row.

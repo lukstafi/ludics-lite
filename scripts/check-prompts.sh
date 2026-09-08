@@ -237,8 +237,16 @@ table_rows() {
     fence { next }
     !comment && index($0, "<!--") { comment = 1 }
     comment { if (index($0, "-->")) comment = 0; next }
-    index($0, hdr) == 1 { want_delim = 1; next }
-    want_delim { want_delim = 0; if ($0 ~ /^\|([[:space:]]*:?-+:?[[:space:]]*\|)+[[:space:]]*$/) in_table = 1; else exit; next }
+    index($0, hdr) == 1 { want_delim = 1; hdr_line = $0; next }
+    want_delim {
+      # A delimiter row: hyphen cells, as many of them as the header has (GFM: "The header row
+      # must match the delimiter row in the number of cells. If not, a table will not be
+      # recognized"); the cell count is the pipe count, both rows being pipe-edged.
+      want_delim = 0
+      if ($0 ~ /^\|([[:space:]]*:?-+:?[[:space:]]*\|)+[[:space:]]*$/ && gsub(/\|/, "|") == gsub(/\|/, "|", hdr_line)) in_table = 1
+      else exit
+      next
+    }
     in_table && !/^\|/ { exit }
     in_table { print }
   ' "$ROOT/$1"
