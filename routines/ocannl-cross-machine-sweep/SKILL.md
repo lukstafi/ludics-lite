@@ -46,7 +46,7 @@ Read its last lines:
 - `all up` and `wsl up`: start the sweep promptly. A VM kicked on a cold-booted box does not
   always stay up on its own; once a unit's ssh session is running inside it, it does.
 
-`~/bin/wake-lab.sh status` prints the per-box picture (link, `-lan`, `-win`, `-wsl`) if you need to
+`~/bin/wake-lab.sh status` prints the per-box picture (router-active, `-lan`, `-win`, `-wsl`) if you need to
 say precisely what happened.
 
 The retry budget is exactly one re-kick and one rerun. If the sweep records cuda or hip as
@@ -56,7 +56,7 @@ and cheap. If the unit still skips, report it as "woken but `-wsl` gone" (step 4
 outcome) and do not kick or rerun again.
 
 Everything else about these boxes — WoL over Ethernet only, waking from a full shutdown, what
-`link=1` means, the cold-boot kicked-VM trap, Tailscale unattended mode, the `exit 0` vs `true`
+`router-active=1` means, the cold-boot kicked-VM trap, Tailscale unattended mode, the `exit 0` vs `true`
 probe trap — is verified and recorded in the header comment of `scripts/wake-lab.sh` in
 ludics-lite, which is what `~/bin/wake-lab.sh` links to and what `~/bin/wake-lab.sh --help`
 prints; do not spend the run rediscovering it.
@@ -131,9 +131,9 @@ For each of the FIVE backends (cc, multidev_cc, metal, cuda, hip) find the most 
 liveness row. Flag backends with no pass in more than 2 days. For cuda or hip, say which of the three step-1 outcomes applied: woken
   and swept; woken but `-wsl` never appeared or was gone again by the time the unit probed it
   (machine up, backend untestable — the cold-boot kicked-VM trap in step 1; a re-kick plus an
-  incremental rerun usually recovers it); or the wake itself failed. A failed wake with `link=1` means the NIC was
+  incremental rerun usually recovers it); or the wake itself failed. A failed wake with settled `router-active=1` means the NIC was
   powered and listening, so the magic packet was ignored: the WoL option itself (BIOS, or the
-  Windows NIC driver's wake settings) has been lost. With `link=0` the NIC is not powered while the
+  Windows NIC driver's wake settings) has been lost. With settled `router-active=0` the NIC is not powered while the
   box is off: the cable, the box's power, or the BIOS setting that keeps the NIC powered in S5.
 
 ## 5. Report
