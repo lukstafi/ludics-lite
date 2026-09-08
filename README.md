@@ -160,12 +160,25 @@ ship-pr/scripts/test-pr-review-rounds.sh
 ship-pr/scripts/test-pr-review-merge.sh
 ship-pr/scripts/test-pr-review-status.sh
 scripts/test-wake-lab.sh
+scripts/test-check-prompts.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all eight on Ubuntu and
-macOS (the fleet's bash is 3.2) for every push and pull request, along with `bash -n`, shellcheck
-at error severity, and a check that the two cleanup scripts still carry their parse guard. It runs
-without path filters, so every PR's merge gate reads a verdict rather than `ABSENT`.
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all nine on Ubuntu, one
+job per suite, and on macOS (the fleet's bash is 3.2) as one job with a step per suite: the hosted
+macOS runners are scarce enough that four separate macOS jobs queued a green PR for one to two
+hours behind nine minutes of work (ludics-lite#55). Alongside them run `bash -n`, shellcheck at
+error severity, and a check that the two cleanup scripts still carry their parse guard. The suites
+run on every push to main and on a pull request that touches anything but Markdown (the top-level
+README counts as script input, since the fleet suite executes its install loops); two jobs run on
+every head regardless, the prompt hygiene check (`scripts/check-prompts.sh`) and the lint, so every
+PR's merge gate reads a verdict rather than `ABSENT`, a prompt-only PR included.
+
+`check-prompts.sh` is the prompt hygiene check itself: every skill and routine `SKILL.md` opens
+with YAML frontmatter carrying one `name`, equal to its directory, and one single-line
+`description`, and the skill table above and the routine table in `routines/README.md` each index
+exactly the directories that carry a `SKILL.md`, in both directions. `test-check-prompts.sh` runs
+it against scratch trees, one per defect, with the well-formed tree as the control, and ends by
+running it on this checkout.
 
 `test-fleet-worker.sh` runs its ~180 assertions top to bottom in one shell, which takes about three
 and a half minutes. Arguments narrow that: each one selects every section whose name contains it
