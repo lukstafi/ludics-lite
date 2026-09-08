@@ -36,8 +36,9 @@ jobs:
       pull-requests: read
     outputs:
       # The script's exit code, for the reporter: 1 is a moved belief, 4 an addressed endpoint
-      # or anchor answering 4xx, 3 the API not answering, anything else the contract stopping
-      # early — everything but 0 and 3 is reported.
+      # or anchor answering 4xx, 5 the read refused (the token or these permissions), 3 the API
+      # not answering or throttling, anything else the contract stopping early — everything but
+      # 0 and 3 is reported, each named as what it is.
       rc: ${{ steps.contract.outputs.rc }}
     steps:
       - uses: actions/checkout@v4
@@ -61,10 +62,11 @@ jobs:
     # exists to catch. One open issue per drift, not one per day: a second scheduled failure
     # finds the first's issue and adds a comment instead. No checkout: this job's token can
     # write, so it runs nothing a pull request could have changed. Every exit but 3 is
-    # reported — a moved belief (1), a 4xx from an endpoint the contract addresses (4), or the
-    # contract stopping early on a shape it did not expect — because each of those is the
-    # silent class this workflow exists to catch; the API not answering (3) is an outage, not
-    # drift, and is left to the next day's run.
+    # reported — a moved belief (1), a 4xx from an endpoint the contract addresses (4), a read
+    # the token was refused (5), or the contract stopping early on a shape it did not expect —
+    # because each of those is the silent class this workflow exists to catch, and the issue
+    # says which it was rather than calling every one a moved belief; the API not answering or
+    # throttling (3) is an outage, not drift, and is left to the next day's run.
     needs: contract
     if: failure() && github.event_name == 'schedule' && needs.contract.outputs.rc != '3'
     runs-on: ubuntu-latest
@@ -78,11 +80,12 @@ jobs:
           RC: ${{ needs.contract.outputs.rc }}
         run: |
           set -e
-          title="pr-review.sh fixtures: a belief about the GitHub API moved (api contract)"
+          title="api contract: the scheduled live-API check of the pr-review.sh fixtures' beliefs failed"
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           case "$RC" in
           1) what="found a belief the pr-review.sh fixtures encode that no longer holds on this repository's API; the run names the field" ;;
           4) what="got a 4xx from an endpoint it addresses with a validated input — a retired or renamed endpoint, or a wrong anchor; the run names the call" ;;
+          5) what="was refused a read (401/403, not a rate limit) — the token or the workflow's permissions, not a moved belief; the run names the call" ;;
           *) what="stopped early (exit $RC) on a shape it did not expect; the run's last lines say where" ;;
           esac
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
