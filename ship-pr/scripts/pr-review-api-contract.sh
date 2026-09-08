@@ -430,7 +430,10 @@ if [ -n "$REVIEWED_PR" ]; then
     'any(.[]; .user.login == $bot and (.body | test("codex-pull-request-review-summary")))' "$comments" --arg bot "$BOT"
   inline_all=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/comments?per_page=100" | jq -s 'add')
   inline_page=$(api "repos/$REPO/pulls/$REVIEWED_PR/comments")
-  pin "the inline-comments feed is a list, paginated or not" 'type == "array"' "$(jq -cn --argjson a "$inline_all" --argjson b "$inline_page" '[$a, $b] | if all(.[]; type == "array") then [] else null end')"
+  # Two claims, each fed on stdin: the paginated feed of a long-reviewed PR is over Linux's
+  # per-argument limit (the rounds suite's known trap), so it never travels as an argument.
+  pin "the paginated inline-comments feed is a list" 'type == "array"' "$inline_all"
+  pin "the unpaginated inline-comments read is a list" 'type == "array"' "$inline_page"
   is_list "$inline_all" || inline_all='[]'
   is_list "$inline_page" || inline_page='[]'
   pin "inline comments carry numeric id, pull_request_review_id, commit_id, user.login, path, body, and the line/original_line pair poll renders" \
