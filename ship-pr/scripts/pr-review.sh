@@ -865,6 +865,21 @@ conflict_note() {
       " after every push): a conflict this push caused would not show yet — re-read status in a" \
       " minute"
     ;;
+  # A draft is not a mergeability in the sense the other arms carry — nothing about the base
+  # merge — but GitHub reports it through the same field, and it is the one remaining value that
+  # changes the answer (ludics-lite#49): no sequence of reviewer actions lands a draft, so every
+  # "next move" the tokens name is wrong over it until someone marks it ready. Read from
+  # mergeable_state rather than the PR's own `.draft` boolean because `pr_head_read` already
+  # carries this field on every state line and nothing outside status_line parses the format
+  # (#47 dropped an extra-field proposal on exactly that ground); should `.draft` ever be needed
+  # on its own, the arm stays and the field is what changes.
+  # The command names the repository: `status` is invoked as owner/repo#pr from shells whose
+  # working directory is unreliable, where a bare `gh pr ready <n>` cannot resolve the repo.
+  draft)
+    printf '%s' "DRAFT (mergeable_state=draft): a draft cannot be merged and no reviewer action" \
+      " lands it — mark it ready (gh pr ready ${PR_NUM:-<pr>} --repo $REPO) when it is; the" \
+      " review rounds still count"
+    ;;
   esac
   return 0
 }
@@ -888,14 +903,16 @@ status_line() {
     "reviewer's existing 👍${conflict:+; $conflict}" ;;
   expected) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")${conflict:+; $conflict}" ;;
   # "The next move is yours" is exactly the line that sent #39 into seven untested rounds: on a
-  # conflicted PR the move is the base merge, and saying anything else invites another push. Only
-  # a KNOWN conflict takes the move away, though: a mergeability still being computed leaves the
-  # move where it was and rides along as a caveat. `unread` needs no arm of its own here: with no
+  # conflicted PR the move is the base merge, and saying anything else invites another push. A
+  # draft takes it away for the same reason (#49): its move is `gh pr ready`, and "yours" would
+  # read as "address the round and push" over a PR no push can land. Only a KNOWN conflict or
+  # draft takes the move away, though: a mergeability still being computed leaves the move where
+  # it was and rides along as a caveat. `unread` needs no arm of its own here: with no
   # head SHA the idle branch of status_state cannot fire at all, so a failed PR read lands in
   # `unknown` — test_failed_pr_read_is_unknown_where_the_head_decides pins that.
   idle)
     case "$merge" in
-    dirty) echo "nothing in flight — $detail, and no 👍; $conflict" ;;
+    dirty | draft) echo "nothing in flight — $detail, and no 👍; $conflict" ;;
     *) echo "nothing in flight — $detail, and no 👍; the next move is yours${conflict:+; $conflict}" ;;
     esac
     ;;
@@ -2010,8 +2027,9 @@ off) ;;
 esac
 
 # Prints the count and exact path overlap, loudly when the count is at or over the threshold or any
-# path overlaps. Returns 0 fresh enough with no overlap, 1 for either warning, 3 when the count or
-# overlap is unknown. For one day (2026-08-29) the merge path treated 1 as a GATE; the
+# path overlaps in the same region (a path both sides changed in disjoint hunks is listed quietly).
+# Returns 0 fresh enough with no such overlap, 1 for either warning, 3 when the count or overlap is
+# unknown. For one day (2026-08-29) the merge path treated 1 as a GATE; the
 # ahrefs/ocannl#861 decision (2026-08-30) reverted it to a WARNING under the roll-forward policy:
 # a PR merges on one green full-matrix run for its LAST commit, a clean merge does not restart
 # verification, and only a conflict-RESOLVING commit needs green CI after it — which the checks
@@ -2022,6 +2040,51 @@ esac
 # regression). The DIFFERENCE between "not behind" and "could not be read" is preserved here like
 # everywhere else in this file: a compare call that never answered must not print a reassuring
 # number.
+# The old-side hunk ranges of each file's patch, keyed by path, from one compare response. Both
+# compares below share their merge base, so a forward hunk's `-start,len` and a reverse hunk's
+# `-start,len` are ranges of the SAME text (the merge base), and two paths both sides changed can
+# be told apart by whether those ranges meet: an appended stanza against an appended stanza forty
+# lines up is a different fact from two edits of one paragraph (ludics-lite#54: the wave PRs each
+# append a test stanza to `test/operations/dune`, so the path overlapped for nearly every one of
+# them while none touched a sibling's lines). A pure insertion (`-N,0`) sits between lines N and
+# N+1 and is taken as touching both; adjacent ranges count as meeting, since git merges them
+# cleanly and a reader still wants to look. A file without a `patch` (GitHub omits it for binary
+# files and past a size cap) yields null, which the caller reads as "hunks unread" — never as
+# disjoint.
+# A patch is read hunk by hunk against its own headers: every `@@ -s,n +t,m @@` must be followed
+# by exactly n old-side and m new-side lines before the next header or the end, and the patch's
+# added and removed line totals must equal the entry's own `additions` and `deletions` counts,
+# which GitHub computes from the whole diff. The first catches a patch cut inside a hunk; the
+# second catches one cut between hunks, where every retained hunk is complete and only the count
+# says a later one is missing. Either shortfall yields null like a missing patch — unread, never
+# disjoint (Codex P2s on #63).
+compare_hunks() {
+  jq -c '
+    def ranges:
+      if (.patch | type) != "string" or (.additions | type) != "number"
+        or (.deletions | type) != "number" then null
+      elif ([.patch | split("\n")[] | select(startswith("+"))] | length) != .additions
+        or ([.patch | split("\n")[] | select(startswith("-"))] | length) != .deletions then null
+      else
+        reduce (.patch | split("\n"))[] as $l ({ranges: [], cur: null, ok: true};
+          if ($l | test("^@@ -[0-9]+(,[0-9]+)? \\+[0-9]+(,[0-9]+)? @@")) then
+            (if .cur != null and (.cur.o != 0 or .cur.n != 0) then .ok = false else . end)
+            | ($l | capture("^@@ -(?<s>[0-9]+)(,(?<n>[0-9]+))? \\+[0-9]+(,(?<m>[0-9]+))? @@")) as $h
+            | ($h.s | tonumber) as $s
+            | (if $h.n == null then 1 else ($h.n | tonumber) end) as $n
+            | (if $h.m == null then 1 else ($h.m | tonumber) end) as $m
+            | .ranges += [if $n == 0 then {lo: $s, hi: ($s + 1)} else {lo: $s, hi: ($s + $n - 1)} end]
+            | .cur = {o: $n, n: $m}
+          elif .cur == null then .
+          elif ($l | startswith("-")) then .cur.o -= 1
+          elif ($l | startswith("+")) then .cur.n -= 1
+          elif ($l | startswith(" ")) then .cur.o -= 1 | .cur.n -= 1
+          else . end)
+        | if .ok and (.cur == null or (.cur.o == 0 and .cur.n == 0)) then .ranges else null end
+      end;
+    [.files[] | {key: .filename, value: ranges}] | from_entries' <<<"$1" 2>/dev/null
+}
+
 compare_file_set() {
   jq -ce '
     def valid_file:
@@ -2039,6 +2102,8 @@ warn_base_drift() {
   local pr="$1" fields base base_sha head_sha mstate rc
   local forward reverse behind ahead forward_base reverse_base
   local forward_set reverse_set pr_files base_files pr_file_count base_file_count overlap overlap_count
+  local pr_hunks base_hunks split overlap_meet overlap_meet_count overlap_unread overlap_unread_count
+  local overlap_disjoint overlap_disjoint_count
   local count_unknown="" overlap_unknown="" overlap_reason="" count_warn="" dirty_warn=""
   # Placeholders, never empty fields: tab is IFS whitespace, so an empty middle column would shift
   # a SHA into the wrong field (the same trap build_checks documents). The head SHA is captured
@@ -2138,6 +2203,34 @@ warn_base_drift() {
       [$pr[] | select(. as $path | $base | index($path))] | unique') || overlap_unknown=1
     overlap_count=$(jq -er 'length' <<<"$overlap" 2>/dev/null) || overlap_unknown=1
   fi
+  # Split the overlapping paths by whether the two sides' hunks meet. A path whose hunks could
+  # not be read on either side stays with the meeting ones: unread is not disjoint.
+  if [ -z "$overlap_unknown" ] && [ "$overlap_count" -gt 0 ]; then
+    pr_hunks=$(compare_hunks "$forward") || pr_hunks='{}'
+    base_hunks=$(compare_hunks "$reverse") || base_hunks='{}'
+    split=$(jq -cn --argjson paths "$overlap" --argjson pr "$pr_hunks" --argjson base "$base_hunks" '
+      def meets($a; $b):
+        any($a[]; . as $x | any($b[]; .lo <= $x.hi + 1 and $x.lo <= .hi + 1));
+      reduce $paths[] as $p ({meet: [], disjoint: [], unread: []};
+        if ($pr[$p] | type) != "array" or ($base[$p] | type) != "array" then .unread += [$p]
+        elif meets($pr[$p]; $base[$p]) then .meet += [$p]
+        else .disjoint += [$p] end)') || split=""
+    if [ -n "$split" ]; then
+      overlap_meet=$(jq -c '.meet + .unread' <<<"$split")
+      overlap_meet_count=$(jq -r '(.meet + .unread) | length' <<<"$split")
+      overlap_unread=$(jq -c '.unread' <<<"$split")
+      overlap_unread_count=$(jq -r '.unread | length' <<<"$split")
+      overlap_disjoint=$(jq -c '.disjoint' <<<"$split")
+      overlap_disjoint_count=$(jq -r '.disjoint | length' <<<"$split")
+    else
+      overlap_meet="$overlap"
+      overlap_meet_count="$overlap_count"
+      overlap_unread="$overlap"
+      overlap_unread_count="$overlap_count"
+      overlap_disjoint='[]'
+      overlap_disjoint_count=0
+    fi
+  fi
 
   if [ -n "$count_unknown" ]; then
     warn "how far $REPO#$pr is behind $base: UNKNOWN — the compare response did not contain a" \
@@ -2164,13 +2257,36 @@ warn_base_drift() {
       "read before deciding whether the branch needs a rebase."
   elif [ "$overlap_count" -eq 0 ]; then
     echo "base-drift file overlap $REPO#$pr: none"
+  elif [ "$overlap_meet_count" -eq 0 ]; then
+    # Same paths, different lines: what a sibling's appended stanza looks like. Said without the
+    # `!!!`, which is reserved for the two facts that change the next move (a conflict, and a
+    # same-region overlap), and with rc 0, since there is nothing to act on (ludics-lite#54).
+    echo "base-drift file overlap $REPO#$pr: $overlap_count path(s) changed on both sides, all in" \
+      "DISJOINT hunks (the base's lines and this PR's do not meet, which git merges by" \
+      "construction): $overlap_disjoint"
   else
-    echo "!!! BASE-DRIFT FILE OVERLAP: the base's advance touched $overlap_count path(s) changed by"
-    printf '!!! %s#%s: %s\n' "$REPO" "$pr" "$overlap"
-    echo "!!! Rebase (or merge $base in where the branch is shared), push, and let checks re-run."
-    printf 'pr-review.sh: BASE-DRIFT FILE OVERLAP for %s#%s: %s — this warning applies even below %s\n' \
-      "$REPO" "$pr" "$overlap" \
-      "SHIP_PR_STALE_BASE, but does not block the merge under the roll-forward policy." >&2
+    # The wording is the policy: six workers of the 2026-09-04 wave read the old "rebase, push,
+    # and let checks re-run" as an instruction they had just failed to follow, then watched the
+    # merge proceed anyway (ludics-lite#54). Under roll-forward a clean merge lands on the run
+    # that went green; the rebase is an option for a head one wants CI to test against the
+    # current base, not a requirement.
+    echo "!!! BASE-DRIFT FILE OVERLAP: the base's advance touched the SAME REGIONS of" \
+      "$overlap_meet_count path(s) changed by"
+    printf '!!! %s#%s: %s\n' "$REPO" "$pr" "$overlap_meet"
+    if [ "$overlap_unread_count" -gt 0 ]; then
+      echo "!!! (hunks unread for $overlap_unread_count of them — no patch in the compare response," \
+        "so counted as meeting: $overlap_unread)"
+    fi
+    if [ "$overlap_disjoint_count" -gt 0 ]; then
+      echo "!!! and $overlap_disjoint_count more path(s) in disjoint hunks only: $overlap_disjoint"
+    fi
+    echo "!!! Merging under the roll-forward policy (ahrefs/ocannl#861): a clean merge proceeds on"
+    echo "!!! the run that went green, and the post-merge integration loop verifies merged $base."
+    echo "!!! Read those files for semantic drift; rebase (or merge $base in where the branch is"
+    echo "!!! shared) only if you want CI to test this head against the current $base first."
+    printf 'pr-review.sh: BASE-DRIFT FILE OVERLAP for %s#%s in the same regions: %s — noted even below %s\n' \
+      "$REPO" "$pr" "$overlap_meet" \
+      "SHIP_PR_STALE_BASE; it does not block the merge under the roll-forward policy." >&2
   fi
 
   if [ -n "$count_warn" ]; then
@@ -2184,7 +2300,9 @@ warn_base_drift() {
   if [ -n "$count_unknown" ] || [ -n "$overlap_unknown" ]; then
     return 3
   fi
-  if [ -n "$count_warn" ] || [ -n "$dirty_warn" ] || [ "${overlap_count:-0}" -gt 0 ]; then
+  # A shared path whose hunks stay apart is reported, not warned (ludics-lite#54): rc 1 is for
+  # the two overlap facts a reader acts on, meeting hunks and hunks that could not be read.
+  if [ -n "$count_warn" ] || [ -n "$dirty_warn" ] || [ "${overlap_meet_count:-0}" -gt 0 ]; then
     return 1
   fi
   return 0
