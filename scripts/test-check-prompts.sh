@@ -280,6 +280,11 @@ expect "a backtick fence with a backtick in its info string is not a fence" 0 '6
 # Cells are counted on unescaped pipes: an escaped one in a header cell is content.
 fresh "$R"; sed -i.bak 's/^| Skill | What it does |$/| Skill | What \\| why |/' "$R/README.md"
 expect "an escaped pipe in a header cell is not a cell boundary" 0 '6 passed, 0 failed' -- "$CP" "$R"
+fresh "$R"; sed -i.bak 's/^| Skill | What it does |$/| Skill | What \\\\| why |/' "$R/README.md"
+expect "...but behind an escaped backslash the pipe is real, and the header has three cells" 1 "no '| Skill |' table" -- "$CP" "$R"
+# The delimiter must be the line right after the header: a fence there is no table.
+fresh "$R"; sed -i.bak $'/^| Skill | What it does |$/a\\\n```\\\ncode\\\n```' "$R/README.md"
+expect "a fence between the header and the delimiter is no table" 1 "no '| Skill |' table" -- "$CP" "$R"
 # A table cannot interrupt a paragraph: a header straight under prose is prose; under a
 # heading, a blank line or a closed fence it is a header.
 fresh "$R"; sed -i.bak 's/^# scratch$/Some paragraph text, with the blank line below it gone./' "$R/README.md" && sed -i.bak '/^Some paragraph text/{n;d;}' "$R/README.md"

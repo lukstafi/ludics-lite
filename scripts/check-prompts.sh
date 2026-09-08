@@ -248,6 +248,20 @@ table_rows() {
   awk -v hdr="| $2 |" '
     # Inside a comment region, only its close matters; the rest of that line is then read.
     comment { k = index($0, "-->"); if (!k) next; comment = 0; $0 = substr($0, k + 3) }
+    # The delimiter row, judged on the line RIGHT AFTER the header whatever that line is (a
+    # fence there ends the table before it began), and as written: hyphen cells (a comment
+    # inside one is content, not a delimiter, to GFM), as many as the header has -- GFM: "The
+    # header row must match the delimiter row in the number of cells. If not, a table will not
+    # be recognized". Cells are counted on unescaped pipes, both rows being pipe-edged: a pipe
+    # is escaped behind an odd run of backslashes, so `\\` pairs go first, then `\|`.
+    want_delim {
+      want_delim = 0
+      h = hdr_line; gsub(/\\\\/, "", h); gsub(/\\\|/, "", h)
+      d = $0; gsub(/\\\\/, "", d); gsub(/\\\|/, "", d)
+      if ($0 ~ /^\|([[:space:]]*:?-+:?[[:space:]]*\|)+[[:space:]]*$/ && gsub(/\|/, "|", d) == gsub(/\|/, "|", h)) in_table = 1
+      else exit
+      boundary = 0; next
+    }
     # Inside a fence, only a closing fence matters: same marker, at least as long, nothing
     # but whitespace after it. A closed fence is a block boundary for what follows.
     fence {
@@ -265,10 +279,8 @@ table_rows() {
       len = 0; while (substr(line, len + 1, 1) == m) len++
       if (!(m == "`" && index(substr(line, len + 1), "`"))) { fence = 1; fence_m = m; fence_len = len; next }
     }
-    # A comment that closes on its own line is cut out; an unclosed one opens a region. The
-    # line as written is kept, for the delimiter row, which GFM judges with its comment in.
+    # A comment that closes on its own line is cut out; an unclosed one opens a region.
     {
-      raw = $0
       while ((i = index($0, "<!--")) > 0) {
         j = index(substr($0, i + 4), "-->")
         if (!j) { comment = 1; $0 = substr($0, 1, i - 1); break }
@@ -279,21 +291,6 @@ table_rows() {
     # or a closed fence -- a table cannot interrupt a paragraph, so a header straight under
     # prose is prose.
     index($0, hdr) == 1 { if (NR == 1 || boundary) { want_delim = 1; hdr_line = $0 }; boundary = 0; next }
-    # The delimiter row as written: hyphen cells (a comment inside one is content, not a
-    # delimiter, to GFM), as many as the header has -- GFM: "The header row must match the
-    # delimiter row in the number of cells. If not, a table will not be recognized". Cells are
-    # counted on unescaped pipes, both rows being pipe-edged.
-    want_delim {
-      want_delim = 0
-      h = hdr_line; gsub(/\\\|/, "", h); d = raw; gsub(/\\\|/, "", d)
-      if (raw ~ /^\|([[:space:]]*:?-+:?[[:space:]]*\|)+[[:space:]]*$/ && gsub(/\|/, "|", d) == gsub(/\|/, "|", h)) in_table = 1
-      else exit
-      boundary = 0; next
-    }
-    # GFM breaks the table "at the first empty line, or beginning of another block-level
-    # structure"; until then every line is a row it renders, with or without a leading pipe,
-    # so every line is judged. A block start not listed here is read as a row, which fails
-    # loud on its first cell rather than hiding a row.
     in_table && (/^[[:space:]]*$/ || /^ ? ? ?##?#?#?#?#?([ \t]|$)/ || /^ ? ? ?(```|~~~)/ || /^ ? ? ?>/) { exit }
     in_table { print; next }
     # Where the next line may begin a block: after a blank line, or an ATX heading -- one to
