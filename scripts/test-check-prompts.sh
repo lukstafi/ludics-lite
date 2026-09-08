@@ -24,6 +24,10 @@ expect() {
   else ko "$label (rc=$rc want $want_rc; want /$want/) -- $out"; fi
 }
 
+# row_after_beta <row>: inserts a row into the scratch README's skill table, after `beta`.
+row_after_beta() { sed -i.bak "/^| \`beta\` |/a\\
+$1" "$R/README.md"; }
+
 # --- the scratch tree: two skills, two routines, both index tables ---------------------------
 skill() {  # skill <root> <name> [frontmatter lines...]: writes <root>/<name>/SKILL.md
   local root="$1" name="$2"; shift 2
@@ -191,6 +195,8 @@ fresh "$R"; printf -- '---\nname: alpha\ndescription: a\357\277\276 non-characte
 expect "U+FFFE" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
 fresh "$R"; printf -- '---\nname: alpha\ndescription: a\342\200\250b, split by a line separator\n---\n' > "$R/alpha/SKILL.md"
 expect "U+2028, a line break to YAML 1.1" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
+fresh "$R"; printf -- '---\nname: alpha\ndescription: fine\n---\n\nA body line\342\200\250split by a separator, which is not YAML.\n' > "$R/alpha/SKILL.md"
+expect "...but only in the frontmatter: the Markdown body is not YAML" 0 '6 passed, 0 failed' -- "$CP" "$R"
 fresh "$R"; printf -- '---\nname: alpha\ndescription: fine \303\274ber text \342\200\224 with a dash\n---\n' > "$R/alpha/SKILL.md"
 expect "...while valid UTF-8 content passes" 0 '6 passed, 0 failed' -- "$CP" "$R"
 # A Unicode space is content, not whitespace, to YAML and to this check (LC_ALL=C): appended
@@ -247,6 +253,12 @@ fresh "$R"; { printf '%s\n' '```' '| Skill | What it does |' '| --- | --- |' '| 
   '<!-- | Skill | What it does |' '| --- | --- |' '| `NOT_A_SKILL` | commented | -->'; cat "$R/README.md"; } > "$R/README.pre" \
   && mv "$R/README.pre" "$R/README.md"
 expect "...and look-alikes inside them do not hide the real table after them" 0 '6 passed, 0 failed' -- "$CP" "$R"
+# A comment that closes on its own line is cut out and the rest of the line still read: a
+# row with an inline note is a row (and a stale one is caught); a header with one is a header.
+fresh "$R"; row_after_beta '| `stale` | Visible text <!-- note --> |'
+expect "a row with an inline comment is still judged" 1 "table row 'stale' has no stale/SKILL.md" -- "$CP" "$R"
+fresh "$R"; sed -i.bak 's/^| Skill | What it does |$/| Skill | What it does | <!-- two cells, one note -->/' "$R/README.md"
+expect "a header with a trailing inline comment is still the header" 0 '6 passed, 0 failed' -- "$CP" "$R"
 
 # A fence closes only on its own marker, at least as long as the opener: a `~~~` inside a
 # backtick fence, or a shorter fence, leaves the block open, as it does for the renderer.
@@ -277,8 +289,6 @@ expect "...nor one with more" 1 "no '| Skill |' table" -- "$CP" "$R"
 
 # Every data row is judged: a row the reader sees with a first cell that is not one backticked
 # name fails, instead of being skipped as not-a-row.
-row_after_beta() { sed -i.bak "/^| \`beta\` |/a\\
-$1" "$R/README.md"; }
 fresh "$R"; row_after_beta '| stale-skill | Stale rendered row. |'
 expect "an unbackticked first cell is a failing row" 1 "skill table row's first cell is not a backticked name: 'stale-skill'" -- "$CP" "$R"
 fresh "$R"; row_after_beta '| `two` `names` | Two names. |'

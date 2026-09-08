@@ -146,18 +146,22 @@ value_of() {
 # remains -- and the line breaks YAML 1.1 (libyaml, Psych) knows beyond LF, CR and NEL, the
 # separators U+2028 and U+2029 (`\xE2\x80\xA8`, `\xE2\x80\xA9`), which would split a value the
 # frontmatter reads as one line. Refusing by the spec's own definitions is what closes the class.
+# The NUL and UTF-8 checks are the whole file's (every reader takes it as UTF-8 text); the
+# YAML character rules are the frontmatter's alone, read as raw bytes off the file, since the
+# Markdown body after the closing fence is never YAML and may carry a line separator.
 well_formed_bytes() {
   local f="$1"
   [ "$(tr -d '\000' < "$f" | wc -c)" -eq "$(wc -c < "$f")" ] || return 1
   iconv -f UTF-8 -t UTF-8 < "$f" > /dev/null 2>&1 || return 1
-  ! grep -qE "$(printf '\302[\200-\237]|\357\277[\276\277]|\342\200[\250\251]')" "$f"
+  ! awk 'NR > 1 && /^---$/ { exit } NR > 1 { print }' "$f" \
+    | grep -qE "$(printf '\302[\200-\237]|\357\277[\276\277]|\342\200[\250\251]')"
 }
 
 check_skill_file() {
   local rel="$1" dir fm bad key count raw name="" value
   dir=$(basename "$(dirname "$ROOT/$rel")")
   if ! well_formed_bytes "$ROOT/$rel"; then
-    ko "$rel" "carries a byte sequence no loader accepts: a NUL, invalid UTF-8, a character outside YAML's printable set (a C1 control, U+FFFE, U+FFFF), or a line separator (U+2028, U+2029)"
+    ko "$rel" "carries a byte sequence no loader accepts: a NUL or invalid UTF-8 anywhere, or in the frontmatter a character outside YAML's printable set (a C1 control, U+FFFE, U+FFFF) or a line separator (U+2028, U+2029)"
     return
   fi
   if ! fm=$(frontmatter "$ROOT/$rel"); then
@@ -216,7 +220,9 @@ check_skill_file() {
 # two Markdown contexts that hide a table from the renderer by accident, a fenced code block
 # (opened and closed by a fence line indented at most three spaces, since four make it code,
 # closed only by a fence of the same marker at least as long as the one that opened it with
-# nothing but whitespace after it, as CommonMark closes it) and an HTML comment, hide it from
+# nothing but whitespace after it, as CommonMark closes it) and an HTML comment (a region from
+# an unclosed `<!--` to its `-->`; a comment that closes on its own line is cut out of the
+# line, and the rest of the line -- a row, say -- is still read), hide it from
 # this scan too. That is the scan's scope, and a deliberate line: a table is read at column 0
 # outside those two, and a table an author wraps in a raw HTML block (`<pre>`, `<div>`, any of
 # CommonMark's seven HTML-block kinds) is a choice made on purpose, which a hygiene check for
@@ -235,8 +241,14 @@ table_rows() {
       next
     }
     fence { next }
-    !comment && index($0, "<!--") { comment = 1 }
-    comment { if (index($0, "-->")) comment = 0; next }
+    comment { k = index($0, "-->"); if (!k) next; comment = 0; $0 = substr($0, k + 3) }
+    {
+      while ((i = index($0, "<!--")) > 0) {
+        j = index(substr($0, i + 4), "-->")
+        if (!j) { comment = 1; $0 = substr($0, 1, i - 1); break }
+        $0 = substr($0, 1, i - 1) substr($0, i + j + 6)
+      }
+    }
     index($0, hdr) == 1 { want_delim = 1; hdr_line = $0; next }
     want_delim {
       # A delimiter row: hyphen cells, as many of them as the header has (GFM: "The header row
