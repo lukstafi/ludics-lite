@@ -369,7 +369,9 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 # liveness: a `wsl --shutdown` that failed on both Windows aliases leaves the STALE guest answering,
 # and polling it would print `wsl up` over exactly the degraded VM the restart exists to replace —
 # and the sweep reads that line as permission to proceed. So a failed box is reported last, by
-# name, `wsl up` is never printed alongside a failure, and the status is 1.
+# name, `wsl up` is never printed alongside a failure, and the status is 1 — carried on into the
+# wake path's final verdict through WSL_FAILED, so that `all up` cannot paper over it either.
+WSL_FAILED=""
 start_wsl() {
   local n what=kick started=() failed=()
   [ "$FRESH_WSL" = fresh ] && what=restart
@@ -385,7 +387,8 @@ start_wsl() {
     fi
   fi
   [ ${#failed[@]} -eq 0 ] && return 0
-  echo "wsl $what FAILED on: ${failed[*]} (a -wsl guest that still answers there is the old VM)"
+  WSL_FAILED="wsl $what FAILED on: ${failed[*]}"
+  echo "$WSL_FAILED (a -wsl guest that still answers there is the old VM)"
   return 1
 }
 
@@ -455,19 +458,28 @@ case "$VERB" in
       # Partial success still deserves the WSL kick: one box failing to wake must not suppress
       # starting WSL on the box that did come up, or an unrelated dead machine silently costs a
       # backend's coverage.
+      wsl_rc=0
       if [ "$WANT_WSL" = 1 ]; then
         UP=()
         for t in "${TARGETS[@]}"; do is_up "$t" && UP+=("$t"); done
-        [ ${#UP[@]} -gt 0 ] && start_wsl "${UP[@]}"
+        [ ${#UP[@]} -gt 0 ] && { start_wsl "${UP[@]}" || wsl_rc=1; }
       fi
-      if [ "$rc" = 0 ]; then
+      # The final verdict is the wake's AND the WSL step's: `all up` over a failed restart would
+      # hand the sweep the degraded VM the restart exists to replace, so the WSL failure is
+      # restated as the LAST line, where the sweep routine reads its verdict, and the exit
+      # status says so too.
+      if [ "$rc" = 0 ] && [ "$wsl_rc" = 0 ]; then
         echo "all up"
       else
-        for t in "${TARGETS[@]}"; do is_up "$t" || echo "did NOT wake: $t"; done
-        echo "Check BIOS Wake-on-LAN / 'Power Up' (minix needed the SECOND setup screen, not"
-        echo "Advanced), then run scripts/enable-wol-windows.ps1 from an elevated Windows"
-        echo "PowerShell to disable Fast Startup and re-arm the NIC. Check '$0 status' after the"
-        echo "router lease settles; asus is Wi-Fi only and cannot be woken."
+        if [ "$rc" != 0 ]; then
+          for t in "${TARGETS[@]}"; do is_up "$t" || echo "did NOT wake: $t"; done
+          echo "Check BIOS Wake-on-LAN / 'Power Up' (minix needed the SECOND setup screen, not"
+          echo "Advanced), then run scripts/enable-wol-windows.ps1 from an elevated Windows"
+          echo "PowerShell to disable Fast Startup and re-arm the NIC. Check '$0 status' after the"
+          echo "router lease settles; asus is Wi-Fi only and cannot be woken."
+        fi
+        [ "$wsl_rc" != 0 ] && echo "NOT all up: $WSL_FAILED (see above)"
+        exit 1
       fi
     fi
     ;;

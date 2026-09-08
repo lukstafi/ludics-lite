@@ -217,15 +217,21 @@ wake_wsl() { env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB
 : > "$SSH_LOG"; out=$(wake_wsl --wsl 2>&1)
 printf '%s' "$out" | grep -q 'wsl up' && ! grep -q -- '--shutdown' "$SSH_LOG" \
   && ok "...and neither does --wait --wsl" || ko "--wait --wsl shut a VM down, or never started one -- $out; $(cat "$SSH_LOG")"
-: > "$SSH_LOG"; out=$(wake_wsl --restart-wsl 2>&1)
-printf '%s' "$out" | grep -q 'wsl shut down on rog (via rog-lan)' && printf '%s' "$out" | grep -q 'wsl up' \
-  && grep -q '^rog-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
-  && ok "--wait --restart-wsl shuts the VM down after the wake and starts a fresh one" \
-  || ko "--wait --restart-wsl did not restart the VM -- $out; $(cat "$SSH_LOG")"
-: > "$SSH_LOG"; out=$(env SSH_REFUSE=--shutdown WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-wsl" "$WL" --wait --restart-wsl rog 2>&1)
+: > "$SSH_LOG"; out=$(wake_wsl --restart-wsl 2>&1); rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'wsl shut down on rog (via rog-lan)' && printf '%s' "$out" | grep -q 'wsl up' \
+  && printf '%s\n' "$out" | tail -1 | grep -q '^all up$' && grep -q '^rog-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ok "--wait --restart-wsl shuts the VM down after the wake and starts a fresh one, ending in all up (rc=$rc)" \
+  || ko "--wait --restart-wsl did not restart the VM, or did not end in all up (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+# The wake path's final verdict is the wake's AND the WSL step's: with the boxes up and the
+# restart failed, `all up` with exit 0 would hand the sweep the old VM, so the WSL failure is the
+# last line and the exit status is nonzero.
+: > "$SSH_LOG"; out=$(env SSH_REFUSE=--shutdown WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-wsl" "$WL" --wait --restart-wsl rog 2>&1); rc=$?
 printf '%s' "$out" | grep -q 'wsl restart FAILED on: rog' && ! printf '%s' "$out" | grep -q 'wsl up' \
   && ok "...and in the wake path too, a failed shutdown over a live old guest is never 'wsl up'" \
   || ko "the wake path reported wsl up over a VM it failed to shut down -- $out"
+[ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q '^all up$' && printf '%s\n' "$out" | tail -1 | grep -q 'wsl restart FAILED on: rog' \
+  && ok "...nor 'all up': the restart failure is the wake's last line and its exit status (rc=$rc)" \
+  || ko "the wake path said all up, or exited 0, over a failed restart (rc=$rc) -- $out"
 # The kick path holds the same line: a kick no Windows endpoint carried is a failed kick, whatever
 # the guest answers, so `wsl up` there is the kick's own success and not the poll's.
 out=$(kick "rog-nv-wsl" 2>&1); rc=$?
@@ -243,7 +249,7 @@ elapsed=$((SECONDS - started))
 [ "$elapsed" -lt 30 ] && ok "a WSL wait with slow probes honours its deadline (${elapsed}s)" \
   || ko "the WSL wait ran ${elapsed}s against a 1s budget: it is still counting iterations"
 started=$SECONDS
-out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 SSH_DELAY=3 "$WL" --wait rog 2>&1)
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 SSH_DELAY=3 "$WL" --wait rog 2>&1); wake_rc=$?
 elapsed=$((SECONDS - started))
 [ "$elapsed" -lt 30 ] && ok "...and so does the wake wait (${elapsed}s)" \
   || ko "the wake wait ran ${elapsed}s against a 1s budget: it is still counting iterations"
@@ -252,6 +258,7 @@ printf '%s' "$out" | grep -q 'did NOT wake: rog' \
 printf '%s' "$out" | grep -q 'scripts/enable-wol-windows.ps1' \
   && ok "...and points failure advice at the tracked Windows repair script" \
   || ko "wake failure advice does not name scripts/enable-wol-windows.ps1 -- $out"
+[ "$wake_rc" -ne 0 ] && ok "...and exits nonzero (rc=$wake_rc)" || ko "a wake that timed out exited 0"
 
 # --- the two commands that need no site data --------------------------------------------------
 # --help and --list are what you reach for on a box where the table has yet to be installed, so
