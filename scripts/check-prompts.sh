@@ -75,10 +75,11 @@ field() { printf '%s\n' "$2" | sed -n "s/^$1:[[:space:]]*//p"; }
 #   - a double-quoted string, `"..."` with backslash escapes, closed on the same line and
 #     followed by nothing but an optional comment;
 #   - a single-quoted string, `'...'` with `''` for a quote, closed the same way;
-#   - a plain scalar: no leading YAML indicator (`[]{}&*!|>%@,` and the backtick; `-`, `?`
-#     and `:` only where YAML gives them meaning, before a space or at the end), no `: ` and no
-#     trailing `:` (a mapping to YAML), and not a spelling YAML resolves to a number, boolean or
-#     null; an unquoted trailing ` #comment` is dropped first.
+#   - a plain scalar: starts with an ASCII letter (no implicitly typed YAML scalar -- number,
+#     date, time, sexagesimal, binary, merge key -- does, so none needs modelling), is not a
+#     boolean or null keyword, carries no leading YAML indicator (`[]{}&*!|>%@,` and the
+#     backtick; `-`, `?` and `:` before a space or at the end), no `: ` and no trailing `:`
+#     (a mapping to YAML); an unquoted trailing ` #comment` is dropped first.
 # The empty string, from any of these, is "no value" (`null`, `~` and a bare comment included).
 value_of() {
   local v inner first
@@ -113,8 +114,16 @@ value_of() {
     *) inner="$v" ;;
     esac
     case "$inner" in null | Null | NULL | '~') inner="" ;; esac
-    if printf '%s\n' "$inner" | grep -qiE '^(true|false|yes|no|on|off|y|n|[-+]?(\.[0-9]+|[0-9][0-9_]*(\.[0-9_]*)?)([eE][-+]?[0-9]+)?|0x[0-9a-fA-F_]+|0o?[0-7_]+|[-+]?\.(inf|nan))$'; then
-      echo "'$inner' is a number, boolean or null to YAML, not text; quote the value"; return 1
+    # Implicit typing is closed by shape, not by enumerating the loaders' type grammars: no
+    # number, float, date, time, sexagesimal, binary, merge key or other implicitly typed
+    # scalar begins with an ASCII letter, so a plain value must, and the keyword spellings
+    # of booleans and null are the one lettered exception, refused by name.
+    case "$inner" in
+    '' | [A-Za-z]*) ;;
+    *) echo "'$inner' does not start with a letter, so a loader may read it as a number, date, time or other typed value, not text; quote the value"; return 1 ;;
+    esac
+    if printf '%s\n' "$inner" | grep -qiE '^(true|false|yes|no|on|off|y|n|null)$'; then
+      echo "'$inner' is a boolean or null to YAML, not text; quote the value"; return 1
     fi
     ;;
   esac
@@ -176,9 +185,15 @@ check_skill_file() {
 # header row starts `| <header> |`. It is a table only with its delimiter row (`| --- | ... |`)
 # right under the header -- without one Markdown renders the rows as prose, and so does this.
 # A table ends at the first line that is not a row, blank or not: a heading or paragraph ends
-# it just the same, and the rows of a later table are that table's, whatever its header.
+# it just the same, and the rows of a later table are that table's, whatever its header. The
+# two Markdown contexts that hide a table from the renderer, a fenced code block and an HTML
+# comment, hide it from this scan too; nothing else can, since a row is read only at column 0.
 table_names() {
   awk -v hdr="| $2 |" '
+    /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
+    fence { next }
+    !comment && index($0, "<!--") { comment = 1 }
+    comment { if (index($0, "-->")) comment = 0; next }
     index($0, hdr) == 1 { want_delim = 1; next }
     want_delim { want_delim = 0; if ($0 ~ /^\|([[:space:]]*:?-+:?[[:space:]]*\|)+[[:space:]]*$/) in_table = 1; else exit; next }
     in_table && !/^\|/ { exit }

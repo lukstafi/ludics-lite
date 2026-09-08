@@ -119,16 +119,16 @@ jobs:
           # "Script-related" is defined by its complement: a PR is prompt-only when every file it
           # touches is Markdown other than the top-level README. The README counts as script
           # input because the fleet launcher's suite extracts and executes its install loops.
-          # Patterns are OR-ed (dorny's default `some` quantifier), so the lines read: any
-          # non-Markdown file, plus README.md, plus any file that was RENAMED -- the filter sees
-          # a rename under its new path only, so a script renamed to a Markdown path would
-          # otherwise read as prompt-only; a rename is rare enough that running everything is
-          # the cheap side of that error.
+          # Patterns are OR-ed (dorny's default `some` quantifier), so the two lines read: any
+          # non-Markdown file, plus README.md. A rename needs no line of its own: on a pull
+          # request the action expands one into a delete of the previous path and an add of
+          # the new (src/main.ts, "Rename is replaced by delete of original filename and add
+          # of new filename"), so a script renamed to a Markdown path is classified by the
+          # script path it left.
           filters: |
             scripts:
               - '!**/*.md'
               - 'README.md'
-              - renamed: '**'
 
   # ---- the script suites on Ubuntu, one job each ------------------------------------------
   # Each carries the same `needs`/`if` pair: run on any event but a pull request, and on a pull

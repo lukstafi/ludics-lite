@@ -119,15 +119,23 @@ done <<'CASES'
 : a value|starts with ': '
 Runs checks: quickly|contains ': ' or ends with ':'
 Ends with a colon:|contains ': ' or ends with ':'
-42|'42' is a number, boolean or null
-1e3|'1e3' is a number, boolean or null
-.inf|'.inf' is a number, boolean or null
-true|'true' is a number, boolean or null
-Yes|'Yes' is a number, boolean or null
+42|'42' does not start with a letter
+1e3|'1e3' does not start with a letter
+.inf|'.inf' does not start with a letter
+2001-12-15|'2001-12-15' does not start with a letter
+0b1010|'0b1010' does not start with a letter
+12:34|'12:34' does not start with a letter
++1_000|'+1_000' does not start with a letter
+<< merge|'<< merge' does not start with a letter
+-x is plain to YAML but outside the grammar|'-x is plain to YAML but outside the grammar' does not start with a letter
+true|'true' is a boolean or null
+Yes|'Yes' is a boolean or null
+n|'n' is a boolean or null
 CASES
 for value in 'Runs checks:quickly, no space after the colon' 'v1.2 of 3 things, 100% plain' \
-  '-x is plain when no space follows the dash' 'Text - with - dashes and a trailing note # here' \
-  '"Runs checks: quickly, quoted"' "'It''s quoted, with: a colon'" 'Yes it is text, not a boolean'; do
+  'Text - with - dashes and a trailing note # here' 'Nothing is 2001-12-15 once a letter leads' \
+  '"Runs checks: quickly, quoted"' "'It''s quoted, with: a colon'" 'Yes it is text, not a boolean' \
+  '"2001-12-15, quoted, is text"'; do
   fresh "$R"; skill "$R" alpha 'name: alpha' "description: $value"
   expect "'description: $value' is accepted" 0 '6 passed, 0 failed' -- "$CP" "$R"
 done
@@ -207,6 +215,17 @@ EOF
 expect "a heading ends the table: a skill listed only in a later table is missing" 1 'skill directories missing from its table: beta' -- "$CP" "$R"
 printf '%s' "$out" | grep -q "table row 'NOT_A_SKILL'" && ko "the later table's rows were read as the index" \
   || ok "...and the later table's rows are not read as index rows"
+
+# A table inside a fenced code block or an HTML comment is not rendered, and is not read; one
+# outside them is, whatever fenced or commented look-alikes precede it.
+fresh "$R"; { echo '```'; cat "$R/README.md"; echo '```'; } > "$R/README.fenced" && mv "$R/README.fenced" "$R/README.md"
+expect "a table inside a code fence is not a table" 1 "no '| Skill |' table" -- "$CP" "$R"
+fresh "$R"; { echo '<!--'; cat "$R/README.md"; echo '-->'; } > "$R/README.commented" && mv "$R/README.commented" "$R/README.md"
+expect "a table inside an HTML comment is not a table" 1 "no '| Skill |' table" -- "$CP" "$R"
+fresh "$R"; { printf '%s\n' '```' '| Skill | What it does |' '| --- | --- |' '| `NOT_A_SKILL` | fenced |' '```' \
+  '<!-- | Skill | What it does |' '| --- | --- |' '| `NOT_A_SKILL` | commented | -->'; cat "$R/README.md"; } > "$R/README.pre" \
+  && mv "$R/README.pre" "$R/README.md"
+expect "...and look-alikes inside them do not hide the real table after them" 0 '6 passed, 0 failed' -- "$CP" "$R"
 
 # Without its delimiter row a header and its rows are prose to Markdown, and to this.
 fresh "$R"; sed -i.bak '/^| Skill |/{n;d;}' "$R/README.md"
