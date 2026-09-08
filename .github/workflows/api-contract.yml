@@ -35,8 +35,9 @@ jobs:
       checks: read
       pull-requests: read
     outputs:
-      # The script's exit code, for the reporter: 1 is a moved belief, 3 is the API not
-      # answering, and only the first is drift.
+      # The script's exit code, for the reporter: 1 is a moved belief, 4 an addressed endpoint
+      # or anchor answering 4xx, 3 the API not answering, anything else the contract stopping
+      # early — everything but 0 and 3 is reported.
       rc: ${{ steps.contract.outputs.rc }}
     steps:
       - uses: actions/checkout@v4
@@ -59,11 +60,13 @@ jobs:
     # A scheduled run nobody watches fails silently, which is the drift class this workflow
     # exists to catch. One open issue per drift, not one per day: a second scheduled failure
     # finds the first's issue and adds a comment instead. No checkout: this job's token can
-    # write, so it runs nothing a pull request could have changed. Only a moved belief (exit 1)
-    # is reported: the API not answering (exit 3) is an outage, not drift, and is left to the
-    # next day's run.
+    # write, so it runs nothing a pull request could have changed. Every exit but 3 is
+    # reported — a moved belief (1), a 4xx from an endpoint the contract addresses (4), or the
+    # contract stopping early on a shape it did not expect — because each of those is the
+    # silent class this workflow exists to catch; the API not answering (3) is an outage, not
+    # drift, and is left to the next day's run.
     needs: contract
-    if: failure() && github.event_name == 'schedule' && needs.contract.outputs.rc == '1'
+    if: failure() && github.event_name == 'schedule' && needs.contract.outputs.rc != '3'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -72,16 +75,22 @@ jobs:
       - name: Open or extend the drift issue
         env:
           GH_TOKEN: ${{ github.token }}
+          RC: ${{ needs.contract.outputs.rc }}
         run: |
           set -e
           title="pr-review.sh fixtures: a belief about the GitHub API moved (api contract)"
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          case "$RC" in
+          1) what="found a belief the pr-review.sh fixtures encode that no longer holds on this repository's API; the run names the field" ;;
+          4) what="got a 4xx from an endpoint it addresses with a validated input — a retired or renamed endpoint, or a wrong anchor; the run names the call" ;;
+          *) what="stopped early (exit $RC) on a shape it did not expect; the run's last lines say where" ;;
+          esac
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Still moved on $(date -u +%Y-%m-%d): $run_url"
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Still failing on $(date -u +%Y-%m-%d) (exit $RC): $run_url"
           else
             body=$(printf '%s\n\n%s' \
-              "The scheduled live-API contract (\`ship-pr/scripts/pr-review-api-contract.sh\`) found a belief the pr-review.sh fixtures encode that no longer holds on this repository's API. The run names the field: $run_url" \
+              "The scheduled live-API contract (\`ship-pr/scripts/pr-review-api-contract.sh\`) $what: $run_url" \
               "Each MOVED line is one projection input; the fixture suites stay green through this by construction (they feed canned shapes), so the gate may be reading a head wrong until the projection and its fixtures are updated together (ludics-lite#41).")
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
           fi

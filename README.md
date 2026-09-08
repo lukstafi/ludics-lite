@@ -232,7 +232,8 @@ conclusion string leaves every fixture green and the gate reading a head wrong (
 `ship-pr/scripts/pr-review-api-contract.sh` asks this repository's own live API the same questions,
 one jq read per belief, and reports each on its own line (`ok`, `MOVED` with the filter and the
 read, or `skip` with the reason it cannot be checked here), so a failure localizes to the field
-that moved: the fields `run_signal`, `build_checks`, `run_red_is_advisory_only`, `pr_head_read`,
+that moved; its exit code separates a moved belief (1) and an addressed endpoint answering 4xx (4)
+from the API not answering (3), and the reporter files everything but the last: the fields `run_signal`, `build_checks`, `run_red_is_advisory_only`, `pr_head_read`,
 `warn_base_drift` and `status_state` index; the newest-first order of `actions/runs`; the status,
 conclusion, mergeable-state and review-state vocabularies; that a merged PR's `.base.sha` is a
 snapshot standing behind the merge's first parent (anchored on #53); and the reviewer feeds' shapes

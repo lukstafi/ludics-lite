@@ -26,11 +26,14 @@
 #   REVIEWER                 the review app's login without its [bot] suffix (pr-review.sh's)
 #
 # Exit 0: every checkable belief holds. 1: at least one MOVED (listed, all of them — the script
-# does not stop at the first). 3: the API did not answer, which is not a moved belief and ends
-# the run at once: every read is an assignment under errexit, so a failed read cannot feed empty
-# data into the claims after it and be reported as drift. A belief this repository cannot check
-# prints as `skip`, with the reason, so the unpinned set is visible in every run rather than
-# assumed away.
+# does not stop at the first). 3: the API did not answer (a transport failure after retries),
+# which is not a moved belief and ends the run at once — every read is an assignment under
+# errexit, so a failed read cannot feed empty data into the claims after it. 4: an endpoint or
+# anchor the contract addresses answered 4xx — the input was validated, so this is a retired or
+# renamed endpoint (drift), or a wrong anchor; it ends the run the same way. Any other exit is
+# the contract stopping early, and the EXIT trap says so; the workflow reports every exit but
+# 0 and 3. A belief this repository cannot check prints as `skip`, with the reason, so the
+# unpinned set is visible in every run rather than assumed away.
 
 set -euo pipefail
 
@@ -67,10 +70,11 @@ CLAIMS=0
 MOVED=0
 SKIPPED=0
 
-# api <gh api args...>: one read, three attempts on a transport failure and none on a 4xx (the
-# API answering, if with "no such thing"). A read that fails ends the run with 3, from inside a
-# command substitution too — the caller's assignment fails, and the script runs under errexit —
-# because an unanswered call supports no claim about the API, moved or not.
+# api <gh api args...>: one read. A 4xx is the API answering "no such thing" about an input this
+# script validated before asking: a retired or renamed endpoint, or a wrong anchor — exit 4,
+# reported as drift, no retry. Anything else that fails is retried three times and is then a
+# transport failure — exit 3, not drift. Both end the run from inside a command substitution
+# too: the caller's assignment fails, and the script runs under errexit.
 api() {
   local attempt out
   for attempt in 1 2 3; do
@@ -78,12 +82,30 @@ api() {
       printf '%s\n' "$out"
       return 0
     fi
-    case "$out" in *"HTTP 4"[0-9][0-9]*) break ;; esac
+    case "$out" in
+    *"HTTP 4"[0-9][0-9]*)
+      echo "pr-review-api-contract.sh: an endpoint the contract addresses answered 4xx (retired, renamed, or a wrong anchor): gh api $* -> ${out%%$'\n'*}" >&2
+      exit 4
+      ;;
+    esac
     [ "$attempt" -eq 3 ] || sleep $((attempt * 5))
   done
   echo "pr-review-api-contract.sh: the API did not answer: gh api $* -> ${out%%$'\n'*}" >&2
   exit 3
 }
+
+# Any exit this script did not choose — a jq that cannot iterate a wrapper that moved, say — is
+# named here, so the log says what stopped and the workflow's reporter (every exit but 0 and 3)
+# has something to point at. pr-review.sh's own trap is folded in.
+on_exit() {
+  local rc=$?
+  rm -f "$GH_ERR_FILE"
+  case "$rc" in
+  0 | 1 | 3 | 4) ;;
+  *) echo "pr-review-api-contract.sh: the contract stopped early with exit $rc after $CLAIMS beliefs ($MOVED moved): a shape it did not expect, most likely — read the log as drift until shown otherwise" >&2 ;;
+  esac
+}
+trap on_exit EXIT
 
 # pin <belief> <jq filter> <json> [jq args...]: the filter must yield true on the json. A value
 # the filter compares against travels as a jq argument (--arg / --argjson), never interpolated
@@ -106,6 +128,9 @@ pin() {
 # into a 404 — exit 3, transport — and hide every MOVED line after it.
 is_sha() { case "$1" in *[!0-9a-f]* | '') return 1 ;; esac; [ "${#1}" -eq 40 ]; }
 is_num() { case "$1" in '' | *[!0-9]*) return 1 ;; esac; }
+# A list whose wrapper moved arrives as null; row-level claims on it would crash a jq under
+# errexit instead of standing behind the MOVED the wrapper claim recorded.
+is_list() { jq -e 'type == "array"' <<<"$1" >/dev/null 2>&1; }
 UNUSABLE="its input is not usable — see the MOVED above"
 
 skip() { # <belief> <why>
@@ -130,8 +155,15 @@ echo "      base $BASE tip $HEAD"
 # --- actions/runs?head_sha= -------------------------------------------------------------------
 section "actions/runs?head_sha=<tip> — run_signal's feed"
 runs=$(api --paginate "repos/$REPO/actions/runs?head_sha=$HEAD&per_page=100" --jq '.workflow_runs' | jq -s 'add')
-pin "the feed is workflow_runs[], and the base tip has at least one run" \
-  'type == "array" and length >= 1' "$runs"
+pin "the feed is workflow_runs[]" 'type == "array"' "$runs"
+# An empty list is a valid signal the gate handles (a paths-ignored push, a repository without
+# push workflows), not a moved shape: the row-level claims need a sample, and say so without one.
+if ! is_list "$runs"; then
+  skip "the row-level claims on the tip's runs" "$UNUSABLE"
+  runs='[]'
+elif [ "$(jq length <<<"$runs")" -eq 0 ]; then
+  skip "the row-level claims on the tip's runs" "the tip has no Actions run (a paths-ignored push, or a repository without push workflows)"
+else
 pin "every row carries the fields the fold indexes: numeric id and workflow_id, string event, name and status, created_at" \
   'all(.[]; (.id | type == "number") and (.workflow_id | type == "number") and (.event | type == "string" and length > 0)
              and (.name | type == "string") and (.status | type == "string") and (.created_at | test("'"$ISO"'")))' "$runs"
@@ -145,6 +177,7 @@ pin "a row that is not completed has no conclusion yet" \
   'all(.[]; .status == "completed" or .conclusion == null)' "$runs"
 echo "      events seen on the tip: $(jq -r '[.[].event] | unique | join(" ")' <<<"$runs")"
 echo "      status/conclusion seen: $(jq -r '[.[] | "\(.status)/\(.conclusion)"] | unique | join(" ")' <<<"$runs")"
+fi
 
 # Newest-first is what the supersession fold rests on: the first row seen per key is the one
 # that counts. One row proves nothing about order, so the claim is made on the tip when it has
@@ -154,12 +187,18 @@ if [ "$(jq length <<<"$runs")" -ge 2 ]; then
     '[.[].created_at] | . == (sort | reverse)' "$runs"
 else
   all_runs=$(api "repos/$REPO/actions/runs?per_page=100" --jq '.workflow_runs')
-  pin "actions/runs comes back newest-first (created_at non-increasing, over the latest $(jq length <<<"$all_runs") runs)" \
-    '[.[].created_at] | . == (sort | reverse)' "$all_runs"
+  pin "actions/runs is workflow_runs[] here too" 'type == "array"' "$all_runs"
+  if is_list "$all_runs" && [ "$(jq length <<<"$all_runs")" -ge 2 ]; then
+    pin "actions/runs comes back newest-first (created_at non-increasing, over the latest $(jq length <<<"$all_runs") runs)" \
+      '[.[].created_at] | . == (sort | reverse)' "$all_runs"
+  else
+    skip "actions/runs comes back newest-first" "fewer than two runs to order, or the list is not usable"
+  fi
 fi
 
 if is_num "${GITHUB_RUN_ID:-}" && is_sha "${CONTRACT_OWN_HEAD:-}"; then
   own=$(api --paginate "repos/$REPO/actions/runs?head_sha=$CONTRACT_OWN_HEAD&per_page=100" --jq '.workflow_runs' | jq -s 'add')
+  is_list "$own" || own='[]' # the wrapper claim above has recorded the MOVED; these then move too, on an empty list
   pin "this job's own run (id $GITHUB_RUN_ID) is a row on its head, unfinished, with no conclusion" \
     'any(.[]; .id == $run and .status != "completed" and .conclusion == null)' "$own" --argjson run "$GITHUB_RUN_ID"
   # On a scheduled or dispatched run the head is the base tip, whose push run came long before
@@ -192,24 +231,36 @@ section "actions/runs/<id>/jobs — run_red_is_advisory_only's feed"
 all_runs="${all_runs:-$(api "repos/$REPO/actions/runs?per_page=100" --jq '.workflow_runs')}"
 # The sample is the latest run of ANY conclusion conclusion_class calls red, since the advisory
 # read runs for each of them, not only for `failure`.
-red_run=$(jq -r '[.[] | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure"))][0].id // empty' <<<"$all_runs")
+red_run=""
+if is_list "$all_runs"; then
+  red_run=$(jq -r '[.[] | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure"))][0].id // empty' <<<"$all_runs")
+fi
 if is_num "$red_run"; then
   red_concl=$(jq -r --argjson id "$red_run" '.[] | select(.id == $id) | .conclusion' <<<"$all_runs")
   jobs=$(api --paginate "repos/$REPO/actions/runs/$red_run/jobs?per_page=100" --jq '.jobs' | jq -s 'add')
-  pin "jobs[] rows carry name, status and conclusion (run $red_run, the latest red run: $red_concl)" \
-    'type == "array" and all(.[]; (.name | type == "string") and (.status | type == "string") and (.conclusion == null or (.conclusion | type == "string")))' "$jobs"
+  pin "the feed is jobs[] (run $red_run, the latest red run: $red_concl)" 'type == "array"' "$jobs"
+  is_list "$jobs" || jobs='[]'
+  pin "jobs[] rows carry name, status and conclusion" \
+    'all(.[]; (.name | type == "string") and (.status | type == "string") and (.conclusion == null or (.conclusion | type == "string")))' "$jobs"
   pin "job conclusions are in the same vocabulary as run conclusions" \
     "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$jobs"
   pin "a red run's jobs show which job was red: at least one non-green job, or no jobs at all (the startup_failure shape)" \
     'length == 0 or any(.[]; .conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")' "$jobs"
-else
+elif is_list "$all_runs"; then
   skip "a red run's jobs name the red job" "no failure, timed_out or startup_failure run among the latest $(jq length <<<"$all_runs")"
+else
+  skip "a red run's jobs name the red job" "$UNUSABLE"
 fi
 
 # --- commits/<sha>/check-runs ---------------------------------------------------------------------
 section "commits/<tip>/check-runs?filter=latest — build_checks's feed"
 checks=$(api --paginate "repos/$REPO/commits/$HEAD/check-runs?filter=latest&per_page=100" --jq '.check_runs' | jq -s 'add')
-pin "the feed is check_runs[], non-empty on the base tip" 'type == "array" and length >= 1' "$checks"
+pin "the feed is check_runs[]" 'type == "array"' "$checks"
+if ! is_list "$checks"; then
+  skip "the row-level claims on the tip's check runs" "$UNUSABLE"
+elif [ "$(jq length <<<"$checks")" -eq 0 ]; then
+  skip "the row-level claims on the tip's check runs" "the tip has no check run (nothing ran on it, or nothing has created its checks yet)"
+else
 pin "every check run carries name, status, conclusion (null while unfinished), html_url and app.slug" \
   'all(.[]; (.name | type == "string") and (.status | type == "string") and (.conclusion == null or (.conclusion | type == "string"))
              and (.html_url | type == "string") and (.app.slug | type == "string"))' "$checks"
@@ -225,17 +276,21 @@ pin "filter=latest yields one check run per name WITHIN a check suite (a re-run 
 # of its checks, so a snapshot taken after the check read cannot lack the run behind a check —
 # while the earlier snapshot could, for a workflow started on the tip in between.
 runs_after=$(api --paginate "repos/$REPO/actions/runs?head_sha=$HEAD&per_page=100" --jq '.workflow_runs' | jq -s 'add')
+is_list "$runs_after" || runs_after='null'
 job_names='[]'
 jobs_unusable=""
-for rid in $(jq -r '.[].id // "-"' <<<"$runs_after"); do
+for rid in $(jq -r '.[]?.id // "-"' <<<"$runs_after"); do
   is_num "$rid" || { jobs_unusable=1; continue; }
-  job_names=$(api --paginate "repos/$REPO/actions/runs/$rid/jobs?per_page=100" --jq '[.jobs[].name]' | jq -s --argjson acc "$job_names" 'add + $acc')
+  job_names=$(api --paginate "repos/$REPO/actions/runs/$rid/jobs?per_page=100" --jq '[.jobs[]?.name]' | jq -s --argjson acc "$job_names" 'add + $acc')
 done
-if [ -z "$jobs_unusable" ]; then
+if [ "$runs_after" = null ]; then
+  skip "every github-actions check run on the tip is named after a job of one of its runs" "$UNUSABLE"
+elif [ -z "$jobs_unusable" ]; then
   pin "every github-actions check run on the tip is named after a job of one of the tip's runs (the advisory deny-list matches JOB names)" \
     '[.[] | select(.app.slug == "github-actions") | .name] | all(.[]; . as $n | $jobs | index($n))' "$checks" --argjson jobs "$job_names"
 else
   skip "every github-actions check run on the tip is named after a job of one of its runs" "a run row has no usable id — see the MOVED above"
+fi
 fi
 
 # --- pulls/<n> -----------------------------------------------------------------------------------
@@ -280,7 +335,7 @@ else
 fi
 
 # Merged first, then the cut: closed-unmerged PRs would otherwise eat the sample, silently.
-recent=$(api "repos/$REPO/pulls?state=closed&sort=updated&direction=desc&per_page=100" --jq '[.[] | select(.merged_at != null)] | .[0:10]')
+recent=$(api "repos/$REPO/pulls?state=closed&sort=updated&direction=desc&per_page=100" --jq '[.[]? | select(.merged_at != null)] | .[0:10]')
 n_recent=$(jq length <<<"$recent")
 if [ "$n_recent" -ge 1 ]; then
   ok_all=true
@@ -315,6 +370,8 @@ fi
 # Mergeability is on the single-PR read only — the list endpoint omits mergeable and
 # mergeable_state — which is why pr_head_read reads pulls/<n> per PR. So does this.
 open_list=$(api "repos/$REPO/pulls?state=open&per_page=10")
+pin "pulls?state=open is a list" 'type == "array"' "$open_list"
+is_list "$open_list" || open_list='[]'
 if [ "$(jq length <<<"$open_list")" -ge 1 ]; then
   pin "every row of the open-PR list carries a numeric number" 'all(.[]; .number | type == "number")' "$open_list"
   open_prs='[]'
@@ -346,6 +403,8 @@ skip "a push moves the PR's updated_at (the push clock)" "push time is not an AP
 section "reactions, reviews and comments on a reviewed PR — status_state's and review_rounds's feeds"
 if [ -n "$REVIEWED_PR" ]; then
   reactions=$(api --paginate "repos/$REPO/issues/$REVIEWED_PR/reactions?per_page=100" | jq -s 'add')
+  pin "the reactions feed is a list" 'type == "array"' "$reactions"
+  is_list "$reactions" || reactions='[]'
   pin "reactions carry content, user.login and created_at" \
     "all(.[]; (.content | type == \"string\") and (.user.login | type == \"string\") and (.created_at | test(\"$ISO\")))" "$reactions"
   pin "the app's login carries the [bot] suffix: '$BOT' reacted, and nothing is logged in as bare '$REVIEWER'" \
@@ -353,6 +412,8 @@ if [ -n "$REVIEWED_PR" ]; then
   pin "the approval is a '+1' reaction from the app (the merge gate's 👍)" \
     'any(.[]; .content == "+1" and .user.login == $bot)' "$reactions" --arg bot "$BOT"
   reviews=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/reviews?per_page=100" | jq -s 'add')
+  pin "the reviews feed is a list" 'type == "array"' "$reviews"
+  is_list "$reviews" || reviews='[]'
   pin "reviews carry numeric id, state, commit_id, submitted_at, user.login and a body (poll renders it)" \
     "all(.[]; (.id | type == \"number\") and (.state | type == \"string\") and (.commit_id | test(\"$HEX40\")) and (.submitted_at == null or (.submitted_at | test(\"$ISO\"))) and (.user.login | type == \"string\") and has(\"body\"))" "$reviews"
   pin "review states are in the vocabulary" "all(.[]; .state as \$s | $REVIEW_STATE_VOCAB | index(\$s))" "$reviews"
@@ -361,12 +422,17 @@ if [ -n "$REVIEWED_PR" ]; then
   pin "the author's own replies appear in the same feed as COMMENTED reviews (so 'new' must be id > watermark, not a count)" \
     'any(.[]; .user.login != $bot and .state == "COMMENTED")' "$reviews" --arg bot "$BOT"
   comments=$(api --paginate "repos/$REPO/issues/$REVIEWED_PR/comments?per_page=100" | jq -s 'add')
+  pin "the issue-comments feed is a list" 'type == "array"' "$comments"
+  is_list "$comments" || comments='[]'
   pin "issue comments carry numeric id, created_at, updated_at, body and user.login" \
     "all(.[]; (.id | type == \"number\") and (.created_at | test(\"$ISO\")) and (.updated_at | test(\"$ISO\")) and (.body | type == \"string\") and (.user.login | type == \"string\"))" "$comments"
   pin "the app's summary comment carries the codex-pull-request-review-summary machine tag" \
     'any(.[]; .user.login == $bot and (.body | test("codex-pull-request-review-summary")))' "$comments" --arg bot "$BOT"
   inline_all=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/comments?per_page=100" | jq -s 'add')
   inline_page=$(api "repos/$REPO/pulls/$REVIEWED_PR/comments")
+  pin "the inline-comments feed is a list, paginated or not" 'type == "array"' "$(jq -cn --argjson a "$inline_all" --argjson b "$inline_page" '[$a, $b] | if all(.[]; type == "array") then [] else null end')"
+  is_list "$inline_all" || inline_all='[]'
+  is_list "$inline_page" || inline_page='[]'
   pin "inline comments carry numeric id, pull_request_review_id, commit_id, user.login, path, body, and the line/original_line pair poll renders" \
     "all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\") and (.body | type == \"string\") and has(\"line\") and has(\"original_line\"))" "$inline_all"
   pin "the flat listing paginates at 30 by default: an unpaginated read of #$REVIEWED_PR's $(jq length <<<"$inline_all") inline comments returns 30" \
@@ -374,8 +440,8 @@ if [ -n "$REVIEWED_PR" ]; then
   first_review=$(jq -r --arg bot "$BOT" '[.[] | select(.user.login == $bot and .state == "COMMENTED")][0].id // empty' <<<"$reviews")
   if is_num "$first_review"; then
     per_review=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/reviews/$first_review/comments?per_page=100" | jq -s 'add')
-    pin "a review's own comments endpoint answers, and its ids are a subset of the flat listing's (the merge-by-id read)" \
-      'length >= 1 and all(.[].id; . as $i | $ids | index($i))' "$per_review" --argjson ids "$(jq -c '[.[].id]' <<<"$inline_all")"
+    pin "a review's own comments endpoint answers with a list whose ids are a subset of the flat listing's (the merge-by-id read)" \
+      'type == "array" and length >= 1 and all(.[].id; . as $i | $ids | index($i))' "$per_review" --argjson ids "$(jq -c '[.[]?.id]' <<<"$inline_all")"
   else
     skip "a review's own comments endpoint" "$UNUSABLE"
   fi
