@@ -211,11 +211,15 @@ THAT list; cross-check the count against what the watch claimed before replying/
 
 On every exit 0 but an approval, `watch` also prints (on stderr, so a round's stdout stays
 poll's) the base-drift read that `merge` otherwise makes last: how many commits behind its base
-the branch is, the exact file overlap with the base's advance, and whether the PR CONFLICTS.
-That is the moment it is cheap to act on — the round's fixes are about to be written — and
-"the base touched these files" or "CONFLICTS" means merge the base in *first*, so the next push
-is one CI can test. Read only at merge time, the same information arrives after every round has
-been paid for.
+the branch is, the file overlap with the base's advance — split into paths whose hunks MEET
+(the same regions edited on both sides) and paths changed in DISJOINT hunks only (a sibling's
+appended stanza; nothing to act on) — and whether the PR CONFLICTS. That is the moment it is
+cheap to act on — the round's fixes are about to be written. "CONFLICTS" means merge the base in
+*first*, so the next push is one CI can test. A same-region overlap is information under the
+roll-forward policy (*How stale the base has grown*, below): read those files for semantic drift,
+and merge the base in only if you want CI to test the next push against the current base — the
+merge proceeds either way. Read only at merge time, the same information arrives after every
+round has been paid for.
 
 An exit 0 is not always a round: `watch` also returns when it can tell that **nothing is coming** —
 the 👀 went spent without a review of the head, or never landed, or a push has been sitting
@@ -269,9 +273,19 @@ The history then reads as a dialogue, which is what a reviewer (or a future arch
 Push, then close out each thread — silent fixes leave the reviewer re-deriving what you did:
 
 ```bash
-~/.claude/skills/ship-pr/scripts/pr-review.sh reply <owner>/<repo>#<pr> <comment-id> "Fixed in <sha>: <substance>"
+~/.claude/skills/ship-pr/scripts/pr-review.sh reply <owner>/<repo>#<pr> <comment-id> "Fixed in round N (<sha>, \"<commit subject>\"): <substance>"
 ~/.claude/skills/ship-pr/scripts/pr-review.sh resolve <owner>/<repo>#<pr> <comment-id>
 ```
+
+Cite the round and the commit's subject, not the sha alone. A branch rebased before it merges —
+onto a base that moved, or to resolve a conflict — rewrites every commit, and a reply that says
+only `Fixed in d2bacbc7c` then resolves nowhere in the merged history (staging#633: 27 rounds of
+replies, every sha dead after the rebase, and the next session mapped them back by subject with
+`git log --grep='Review fixes round N:'`). The `Review fixes round N: <subject>` convention
+survives the rebase, so the round and the subject are the durable citation and the sha is the
+convenience. If you do rebase after replies were posted, one PR comment mapping the old ids to
+the merged ones (`comment`, below) keeps the threads readable as the audit trail the record
+paragraph points the maintainer at.
 
 Check every call in such a batch, not just the last: these are independent invocations, and one
 failing while its neighbours succeed leaves a thread silently unanswered. A `reply` that exits 3

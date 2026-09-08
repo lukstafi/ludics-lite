@@ -264,9 +264,109 @@ test_overlap_below_stale_threshold_is_loud() {
     "below-threshold count should not trigger the count warning"
 }
 
+# Hunks: the compare response carries each file's patch, and the read splits an overlapping path by
+# whether the two sides' old-side ranges meet (ludics-lite#54). Both compares share a merge base,
+# so a forward hunk and a reverse hunk are ranges of the same text.
+# [patched name patch [additions deletions]]: the counts default to what the patch shows, as a
+# complete patch from the API has them; given explicitly, they model GitHub's whole-diff counts
+# disagreeing with a patch cut between hunks.
+patched() {
+  jq -cn --arg name "$1" --arg patch "$2" --arg add "${3:-}" --arg del "${4:-}" '
+    ($patch | split("\n")) as $lines
+    | {filename: $name, patch: $patch,
+       additions: (if $add == "" then ([$lines[] | select(startswith("+"))] | length) else ($add | tonumber) end),
+       deletions: (if $del == "" then ([$lines[] | select(startswith("-"))] | length) else ($del | tonumber) end)}'
+}
+
+test_disjoint_hunks_are_not_loud() {
+  set_compares 2 1 "[$(patched dune $'@@ -400,0 +401,2 @@\n+(test\n+ (name mine))')]" \
+    "[$(patched dune $'@@ -120,0 +121,2 @@\n+(test\n+ (name theirs))')]"
+  run_drift
+  assert_eq "$DRIFT_RC" 0 "a shared path edited in disjoint hunks is nothing to act on"
+  assert_contains "$DRIFT_OUTPUT" "all in DISJOINT hunks" "the line should say the hunks are disjoint"
+  assert_contains "$DRIFT_OUTPUT" "[\"dune\"]" "the disjoint path should still be named"
+  assert_not_contains "$DRIFT_OUTPUT" "!!!" "disjoint hunks earn no alarm"
+  assert_not_contains "$DRIFT_OUTPUT" "Rebase" "a disjoint overlap suggests no rebase"
+}
+
+test_meeting_hunks_state_the_policy() {
+  set_compares 2 1 "[$(patched README.md $'@@ -10,2 +10,3 @@\n context\n-old\n+new\n+newer')]" \
+    "[$(patched README.md $'@@ -12,1 +12,1 @@\n-was\n+is')]"
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "the same region edited on both sides should warn"
+  assert_contains "$DRIFT_OUTPUT" "!!! BASE-DRIFT FILE OVERLAP: the base's advance touched the SAME REGIONS" \
+    "meeting hunks should be loud and say what they are"
+  assert_contains "$DRIFT_OUTPUT" "roll-forward policy" \
+    "the guidance is the policy the merge follows, not an instruction the merge then ignores"
+  assert_contains "$DRIFT_OUTPUT" "only if you want CI to test this head" \
+    "the rebase is offered as an option, never as a prerequisite"
+  assert_not_contains "$DRIFT_OUTPUT" "let checks re-run" \
+    "the wording six wave workers read as an unmet instruction is gone"
+}
+
+test_adjacent_hunks_meet() {
+  # Line 5 edited on one side, line 6 on the other: git merges it, a reader still wants to look.
+  set_compares 2 1 "[$(patched a.txt $'@@ -5,1 +5,1 @@\n-x\n+y')]" \
+    "[$(patched a.txt $'@@ -6,1 +6,1 @@\n-p\n+q')]"
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "adjacent hunks count as meeting"
+  assert_contains "$DRIFT_OUTPUT" "SAME REGIONS" "adjacent hunks should be reported as meeting"
+}
+
+test_mixed_paths_split_by_hunks() {
+  set_compares 2 1 \
+    "[$(patched dune $'@@ -400,0 +401,2 @@\n+a\n+b'),$(patched shared.ml $'@@ -3,1 +3,1 @@\n-a\n+b')]" \
+    "[$(patched dune $'@@ -120,0 +121,2 @@\n+c\n+d'),$(patched shared.ml $'@@ -4,1 +4,1 @@\n-a\n+b')]"
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "one meeting path is enough to warn"
+  assert_contains "$DRIFT_OUTPUT" "SAME REGIONS of 1 path(s)" "only the meeting path counts as such"
+  assert_contains "$DRIFT_OUTPUT" "[\"shared.ml\"]" "the meeting path is named"
+  assert_contains "$DRIFT_OUTPUT" "1 more path(s) in disjoint hunks only: [\"dune\"]" \
+    "the disjoint path is listed apart"
+}
+
+test_truncated_patch_is_unread() {
+  # The header promises three old-side lines and the patch stops after one: GitHub cut it short,
+  # and whatever hunk followed is unknown — unread, not disjoint.
+  set_compares 2 1 "[$(patched big.ml $'@@ -10,3 +10,4 @@\n context')]" \
+    "[$(patched big.ml $'@@ -400,1 +400,1 @@\n-a\n+b')]"
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "a truncated patch stays loud"
+  assert_contains "$DRIFT_OUTPUT" "hunks unread for 1 of them" "a truncated patch is reported unread"
+  assert_not_contains "$DRIFT_OUTPUT" "DISJOINT hunks (" "a truncated patch must never read as disjoint"
+}
+
+test_boundary_truncated_patch_is_unread() {
+  # One complete hunk retained, but the entry counts three additions: a later hunk was cut off.
+  set_compares 2 1 "[$(patched big.ml $'@@ -10,1 +10,1 @@\n-a\n+b' 3 1)]" \
+    "[$(patched big.ml $'@@ -400,1 +400,1 @@\n-a\n+b')]"
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "a patch whose totals fall short of the entry counts stays loud"
+  assert_contains "$DRIFT_OUTPUT" "hunks unread for 1 of them" \
+    "a patch cut between hunks is reported unread"
+  assert_not_contains "$DRIFT_OUTPUT" "DISJOINT hunks (" \
+    "a patch cut between hunks must never read as disjoint"
+}
+
+test_unread_hunks_count_as_meeting() {
+  # No patch on the base side (binary, or past GitHub's size cap): unread is not disjoint.
+  set_compares 2 1 "[$(patched img.bin $'@@ -1,1 +1,1 @@\n-a\n+b')]" '[{"filename":"img.bin"}]'
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "a path whose hunks could not be read stays loud"
+  assert_contains "$DRIFT_OUTPUT" "hunks unread for 1 of them" "the line should say the hunks were not read"
+  assert_not_contains "$DRIFT_OUTPUT" "DISJOINT hunks (" "unread hunks must never read as disjoint"
+}
+
 tests=(
   test_no_overlap
   test_exact_overlap
+  test_disjoint_hunks_are_not_loud
+  test_meeting_hunks_state_the_policy
+  test_adjacent_hunks_meet
+  test_mixed_paths_split_by_hunks
+  test_truncated_patch_is_unread
+  test_boundary_truncated_patch_is_unread
+  test_unread_hunks_count_as_meeting
   test_spaces
   test_rename_previous_filename
   test_api_failure_is_unknown

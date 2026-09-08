@@ -22,12 +22,12 @@ the Windows sides. A box can be fully awake on `-win` while `-wsl` is still abse
 is up" and "the backend is testable" are different claims.
 
 One command does the whole thing, and is safe to run unconditionally — packets to an
-already-running box are a no-op, and so is the WSL kick:
+already-running box are a no-op, and the WSL restart is wanted either way (below):
 
-    ~/bin/wake-lab.sh --wait --wsl rog minix
+    ~/bin/wake-lab.sh --wait --restart-wsl rog minix
 
-It sends the wake-on-LAN packets (router-side and direct), polls for up to 4 minutes, then starts
-WSL on whichever boxes came up — WSL never autostarts at boot, so `--wsl` is not optional — and
+It sends the wake-on-LAN packets (router-side and direct), polls for up to 4 minutes, then restarts
+WSL on whichever boxes came up — WSL never autostarts at boot, so starting it is not optional — and
 waits up to 3 minutes for `tailscaled` inside the VM to register. Do not hand-roll the
 probe-then-branch logic it replaces; a partial wake (one box up, one dead) is handled — the live
 box still gets its WSL kick.
@@ -45,6 +45,15 @@ Read its last lines:
   boxes as unreachable.
 - `all up` and `wsl up`: start the sweep promptly. A VM kicked on a cold-booted box does not
   always stay up on its own; once a unit's ssh session is running inside it, it does.
+- `--restart-wsl` rather than `--wsl`, so the GPU units run on a fresh VM every day: a VM that
+  survived a host sleep/resume can carry a degraded dxg bridge that fails HIP (and CUDA) under the
+  sweep's parallel width while every single-process probe passes (ludics-lite#60), and on a
+  cold-booted box the shutdown is a no-op. The restarted VM is a freshly kicked one, so the
+  previous bullet applies to it twice over: the sweep's ssh sessions have to follow promptly.
+  `wsl restart FAILED on: <box>` in the last lines means no fresh VM there — the line says
+  whether the shutdown was refused (a `-wsl` that still answers is the old VM) or the start
+  failed after it (no VM at all) — so that backend is untestable today: report it as such rather
+  than sweeping it. Each such line names only the boxes it applies to.
 
 `~/bin/wake-lab.sh status` prints the per-box picture (router-active, `-lan`, `-win`, `-wsl`) if you need to
 say precisely what happened.
