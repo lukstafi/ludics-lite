@@ -2052,13 +2052,19 @@ esac
 # files and past a size cap) yields null, which the caller reads as "hunks unread" — never as
 # disjoint.
 # A patch is read hunk by hunk against its own headers: every `@@ -s,n +t,m @@` must be followed
-# by exactly n old-side and m new-side lines before the next header or the end. A patch GitHub
-# cut short (a large text diff) fails that count and yields null like a missing one — unread, never
-# disjoint (Codex P2 on #63).
+# by exactly n old-side and m new-side lines before the next header or the end, and the patch's
+# added and removed line totals must equal the entry's own `additions` and `deletions` counts,
+# which GitHub computes from the whole diff. The first catches a patch cut inside a hunk; the
+# second catches one cut between hunks, where every retained hunk is complete and only the count
+# says a later one is missing. Either shortfall yields null like a missing patch — unread, never
+# disjoint (Codex P2s on #63).
 compare_hunks() {
   jq -c '
     def ranges:
-      if (.patch | type) != "string" then null
+      if (.patch | type) != "string" or (.additions | type) != "number"
+        or (.deletions | type) != "number" then null
+      elif ([.patch | split("\n")[] | select(startswith("+"))] | length) != .additions
+        or ([.patch | split("\n")[] | select(startswith("-"))] | length) != .deletions then null
       else
         reduce (.patch | split("\n"))[] as $l ({ranges: [], cur: null, ok: true};
           if ($l | test("^@@ -[0-9]+(,[0-9]+)? \\+[0-9]+(,[0-9]+)? @@")) then

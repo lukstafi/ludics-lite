@@ -313,8 +313,15 @@ test_overlap_below_stale_threshold_is_loud() {
 # Hunks: the compare response carries each file's patch, and the read splits an overlapping path by
 # whether the two sides' old-side ranges meet (ludics-lite#54). Both compares share a merge base,
 # so a forward hunk and a reverse hunk are ranges of the same text.
+# [patched name patch [additions deletions]]: the counts default to what the patch shows, as a
+# complete patch from the API has them; given explicitly, they model GitHub's whole-diff counts
+# disagreeing with a patch cut between hunks.
 patched() {
-  jq -cn --arg name "$1" --arg patch "$2" '{filename:$name, patch:$patch}'
+  jq -cn --arg name "$1" --arg patch "$2" --arg add "${3:-}" --arg del "${4:-}" '
+    ($patch | split("\n")) as $lines
+    | {filename: $name, patch: $patch,
+       additions: (if $add == "" then ([$lines[] | select(startswith("+"))] | length) else ($add | tonumber) end),
+       deletions: (if $del == "" then ([$lines[] | select(startswith("-"))] | length) else ($del | tonumber) end)}'
 }
 
 test_disjoint_hunks_are_not_loud() {
@@ -375,6 +382,18 @@ test_truncated_patch_is_unread() {
   assert_not_contains "$DRIFT_OUTPUT" "DISJOINT hunks (" "a truncated patch must never read as disjoint"
 }
 
+test_boundary_truncated_patch_is_unread() {
+  # One complete hunk retained, but the entry counts three additions: a later hunk was cut off.
+  set_compares 2 1 "[$(patched big.ml $'@@ -10,1 +10,1 @@\n-a\n+b' 3 1)]" \
+    "[$(patched big.ml $'@@ -400,1 +400,1 @@\n-a\n+b')]"
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "a patch whose totals fall short of the entry counts stays loud"
+  assert_contains "$DRIFT_OUTPUT" "hunks unread for 1 of them" \
+    "a patch cut between hunks is reported unread"
+  assert_not_contains "$DRIFT_OUTPUT" "DISJOINT hunks (" \
+    "a patch cut between hunks must never read as disjoint"
+}
+
 test_unread_hunks_count_as_meeting() {
   # No patch on the base side (binary, or past GitHub's size cap): unread is not disjoint.
   set_compares 2 1 "[$(patched img.bin $'@@ -1,1 +1,1 @@\n-a\n+b')]" '[{"filename":"img.bin"}]'
@@ -392,6 +411,7 @@ tests=(
   test_adjacent_hunks_meet
   test_mixed_paths_split_by_hunks
   test_truncated_patch_is_unread
+  test_boundary_truncated_patch_is_unread
   test_unread_hunks_count_as_meeting
   test_spaces
   test_rename_previous_filename
