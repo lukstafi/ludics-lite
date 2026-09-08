@@ -236,6 +236,11 @@ fi
 if [ "$(jq length <<<"$runs")" -ge 2 ]; then
   pin "runs?head_sha= comes back newest-first (created_at non-increasing, on the tip's $(jq length <<<"$runs") rows)" \
     '[.[].created_at] | . == (sort | reverse)' "$runs"
+  # Ties (two rows created in the same second) are ordered by nothing the fixtures encode or
+  # GitHub documents, so their order is observed, not asserted: run_signal keeps the first row
+  # per workflow-and-event key, and two invocations of one key inside a second is two dispatches
+  # on one sha (a re-run keeps its row, run_attempt bumped).
+  echo "      created_at ties on the tip: $(jq '[group_by(.created_at)[] | select(length > 1)] | length' <<<"$runs") group(s); same workflow-and-event inside one tie: $(jq '[group_by(.created_at)[] | select(length > 1) | group_by([.workflow_id, .event])[] | select(length > 1)] | length' <<<"$runs")"
 else
   all_runs=$(api "repos/$REPO/actions/runs?per_page=100" | pages workflow_runs)
   pin "actions/runs is workflow_runs[] here too" 'type == "array"' "$all_runs"
@@ -440,9 +445,13 @@ if [ -n "$STALE_BASE_PR" ]; then
     pin "compare files[] rows carry string filename and status, numeric additions, deletions and changes, and previous_filename absent, null or non-empty (valid_file's shape)" \
       'all(.files[]; (.filename | type == "string" and length > 0) and (.status | type == "string") and (.additions | type == "number") and (.deletions | type == "number") and (.changes | type == "number")
                      and ((has("previous_filename") | not) or .previous_filename == null or ((.previous_filename | type) == "string" and (.previous_filename | length) > 0)))' "$cmp"
-    pin "at least one compare file carries a patch, and on every file that does its +/- line counts equal additions/deletions (compare_hunks's consistency test)" \
-      'any(.files[]; .patch | type == "string") and all(.files[] | select(.patch | type == "string");
-         ([.patch | split("\n")[] | select(startswith("+"))] | length) == .additions and ([.patch | split("\n")[] | select(startswith("-"))] | length) == .deletions)' "$cmp"
+    if jq -e 'any(.files[]; .patch | type == "string")' <<<"$cmp" >/dev/null; then
+      pin "on every compare file that carries a patch, its +/- line counts equal additions/deletions (compare_hunks's consistency test)" \
+        'all(.files[] | select(.patch | type == "string");
+           ([.patch | split("\n")[] | select(startswith("+"))] | length) == .additions and ([.patch | split("\n")[] | select(startswith("-"))] | length) == .deletions)' "$cmp"
+    else
+      skip "a compare file's patch agrees with its additions/deletions" "no file of the anchor compare carries a patch (binary or oversized diffs); an anchor with a text change shows it"
+    fi
     pin "... and merge_base_commit is the older side when it is an ancestor" '.merge_base_commit.sha == $base' "$cmp" --arg base "$base_sha"
     if jq -e 'any(.files[]; .status == "renamed")' <<<"$cmp" >/dev/null; then
       pin "a renamed entry carries previous_filename" 'all(.files[] | select(.status == "renamed"); .previous_filename | type == "string")' "$cmp"
@@ -547,7 +556,8 @@ if [ -n "$REVIEWED_PR" ]; then
   is_list "$reviews" || reviews='[]'
   pin "reviews carry numeric id, state, commit_id, submitted_at (present, null while pending), user.login and a body (poll renders it)" \
     "all(.[]; (.id | type == \"number\") and (.state | type == \"string\") and (.commit_id | test(\"$HEX40\")) and has(\"submitted_at\") and (.submitted_at == null or (.submitted_at | test(\"$ISO\"))) and (.user.login | type == \"string\") and has(\"body\"))" "$reviews"
-  pin "review states are in the vocabulary" "all(.[]; .state as \$s | $REVIEW_STATE_VOCAB | index(\$s))" "$reviews"
+  pin "the app's review states are in the vocabulary (the projections filter to the app before classifying; other participants' states are not read)" \
+    "all(.[] | select(.user.login == \$bot); .state as \$s | $REVIEW_STATE_VOCAB | index(\$s))" "$reviews" --arg bot "$BOT"
   pin "a round with findings is COMMENTED reviews from the app, and the approval is NOT an APPROVED review (it is the reaction above)" \
     'any(.[]; .user.login == $bot and .state == "COMMENTED") and all(.[] | select(.user.login == $bot); .state != "APPROVED")' "$reviews" --arg bot "$BOT"
   comments=$(api --paginate "repos/$REPO/issues/$REVIEWED_PR/comments?per_page=100" | jq -s 'add')
@@ -570,9 +580,7 @@ if [ -n "$REVIEWED_PR" ]; then
   INLINE_ROW="all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\" and length > 0) and (.body | type == \"string\") and has(\"line\") and has(\"original_line\"))"
   pin "inline comments carry numeric id, pull_request_review_id, commit_id, user.login, a non-empty path, body, and the line/original_line pair poll renders" \
     "$INLINE_ROW" "$inline_all"
-  n_inline=$(jq length <<<"$inline_all")
-  if [ "$n_inline" -gt 30 ]; then
-    # The belief behind id-based watermarks: a reply to an inline comment creates a COMMENTED
+  # The belief behind id-based watermarks: a reply to an inline comment creates a COMMENTED
   # review by the replier, in the same feed as the app's rounds. Detected from a reply (a
   # non-bot comment with in_reply_to_id) rather than required of the anchor, which need not
   # carry one; skips when it does not.
@@ -588,7 +596,9 @@ if [ -n "$REVIEWED_PR" ]; then
   else
     skip "a reply to an inline comment is a COMMENTED review by the replier" "#$REVIEWED_PR carries no non-app reply to an inline comment; an anchor with one shows it"
   fi
-  pin "the flat listing paginates at 30 by default: an unpaginated read of #$REVIEWED_PR's $n_inline inline comments returns 30" \
+  n_inline=$(jq length <<<"$inline_all")
+  if [ "$n_inline" -gt 30 ]; then
+    pin "the flat listing paginates at 30 by default: an unpaginated read of #$REVIEWED_PR's $n_inline inline comments returns 30" \
       'length == 30' "$inline_page"
   else
     skip "the flat listing paginates at 30 by default" "#$REVIEWED_PR has $n_inline inline comments, not more than a page; a larger anchor shows it"
@@ -610,8 +620,8 @@ if [ -n "$REVIEWED_PR" ]; then
     # `.line // .original_line // 0` for a row it has from this feed alone. So the claim is the
     # fields poll reads from this feed; the line-number gap is printed, not asserted, since the
     # fallback renders either way.
-    pin "the per-review rows carry what poll renders from this feed alone while the flat listing lags: numeric id and pull_request_review_id, commit_id, user.login, a non-empty path, body, and position/original_position" \
-      "all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\" and length > 0) and (.body | type == \"string\") and has(\"position\") and has(\"original_position\"))" "$per_review"
+    pin "the per-review rows carry what poll renders from this feed alone while the flat listing lags: numeric id and pull_request_review_id, commit_id, user.login, a non-empty path, body" \
+      "all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\" and length > 0) and (.body | type == \"string\"))" "$per_review"
     echo "      per-review rows carrying line/original_line: $(jq '[.[] | select(has("line") and has("original_line"))] | length' <<<"$per_review") of $(jq length <<<"$per_review") (the flat listing's copy wins on a merge because it carries them)"
   else
     skip "a review's own comments endpoint" "the flat listing names no review — $UNUSABLE"
