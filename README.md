@@ -116,7 +116,7 @@ master's trailing failures to, runs in the cloud and is synced by hand.
 ## The lab script
 
 `scripts/wake-lab.sh` drives the home-lab boxes' power state: wake-on-LAN over the router's TR-064
-interface and as a direct magic packet, sleep/hibernate/shutdown, a WSL kick, and a per-box
+interface and as a direct magic packet, sleep/hibernate/shutdown, a WSL kick or restart, and a per-box
 reachability table. The cross-machine sweep routine calls it to wake the GPU boxes before testing
 them. It installs the way the skills do, as a symlink, so an edit made mid-run lands in this
 checkout as a normal `git status` (ludics-lite#31):

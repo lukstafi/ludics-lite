@@ -50,7 +50,9 @@ EOF
 # ssh: logs `<destination> :: <command>` and answers according to $SSH_UP, a space-separated list
 # of destinations that are reachable -- unset, every box is down, which is what most of the cases
 # below want. $SSH_DELAY makes each probe slow, the way a real ConnectTimeout against a dark box
-# is, which is what the polling deadlines have to survive.
+# is, which is what the polling deadlines have to survive. $SSH_REFUSE names a command substring
+# that fails even on a reachable destination: a Windows host that answers ssh but whose
+# `wsl.exe --shutdown` fails, say.
 cat > "$TMP/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 dest=""; cmd=""
@@ -64,6 +66,7 @@ while [ $# -gt 0 ]; do
 done
 printf '%s ::%s\n' "$dest" "$cmd" >> "$SSH_LOG"
 [ -n "${SSH_DELAY:-}" ] && sleep "$SSH_DELAY"
+case "$cmd" in *"${SSH_REFUSE:-}"*) [ -n "${SSH_REFUSE:-}" ] && exit 1 ;; esac
 for u in ${SSH_UP:-}; do [ "$u" = "$dest" ] && exit 0; done
 exit 1
 EOF
@@ -77,12 +80,15 @@ SSH_LOG="$TMP/ssh.log"; export SSH_LOG
 cat > "$TMP/hosts.sh" <<'EOF'
 mac_of() { case "$1" in
   rog)   echo aa:bb:cc:00:00:01 aa:bb:cc:00:00:02 ;;
+  minix) echo aa:bb:cc:00:00:03 aa:bb:cc:00:00:04 ;;
   *) return 1 ;; esac; }
 eth_mac_of() { case "$1" in
   rog)   echo aa:bb:cc:00:00:02 ;;
+  minix) echo aa:bb:cc:00:00:04 ;;
   *) return 1 ;; esac; }
 ip_of() { case "$1" in
   rog)   echo 10.0.0.1 ;;
+  minix) echo 10.0.0.2 ;;
   *) return 1 ;; esac; }
 EOF
 
@@ -165,6 +171,105 @@ out=$(kick "" 2>&1)
 printf '%s' "$out" | grep -q 'wsl kick FAILED on rog' \
   && ok "...and reports a box no endpoint answers for" || ko "a kick with nothing up did not fail -- $out"
 
+# --- restart-wsl shuts the VM down on the Windows host before starting it ---------------------
+# A VM kept alive across a host sleep/resume can carry a degraded dxg bridge that fails under the
+# sweep's parallel width while every single-process probe passes (ludics-lite#60). The cure is a
+# new VM, and `wsl --shutdown` belongs on the Windows side: issued inside the VM it kills the
+# session issuing it. So the restart rides the same -lan/-win aliases as the kick, never -wsl.
+restart() { env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="$1" "$WL" restart-wsl rog; }
+: > "$SSH_LOG"
+out=$(restart "rog-lan rog-nv-wsl" 2>&1)
+printf '%s' "$out" | grep -q 'wsl shut down on rog (via rog-lan)' \
+  && printf '%s' "$out" | grep -q 'wsl started on rog (via rog-lan)' \
+  && ok "restart-wsl shuts the VM down and starts it again, over the LAN alias" \
+  || ko "restart-wsl did not report a shutdown and a start -- $out"
+awk '/^rog-lan :: wsl.exe --shutdown$/ { s = NR } /^rog-lan :: wsl.exe -d Ubuntu/ { t = NR } END { exit !(s && t && s < t) }' "$SSH_LOG" \
+  && ok "...issuing wsl.exe --shutdown on the Windows host before the start" \
+  || ko "no shutdown ahead of the start over rog-lan: $(cat "$SSH_LOG")"
+grep -q '^rog-nv-wsl :: wsl.exe' "$SSH_LOG" \
+  && ko "a wsl.exe command reached the -wsl guest, where a shutdown kills its own session: $(cat "$SSH_LOG")" \
+  || ok "...and never through the -wsl guest"
+out=$(restart "" 2>&1)
+printf '%s' "$out" | grep -q 'wsl restart FAILED on rog' \
+  && ok "...and reports a box no endpoint answers for as a failed restart" || ko "a restart with nothing up did not fail -- $out"
+# A restart's success is the restart's own status, never the guest's liveness: when the shutdown
+# fails, the -wsl guest that still answers is the OLD VM, and `wsl up` over it would send the sweep
+# onto exactly the degraded bridge the restart exists to replace. Two shapes of that: no Windows
+# endpoint answers while the guest does, and the endpoints answer but the shutdown itself fails.
+out=$(restart "rog-nv-wsl" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'wsl restart FAILED on: rog' && ! printf '%s' "$out" | grep -q 'wsl up' \
+  && ok "a restart no Windows endpoint carried is not 'wsl up' just because the old guest answers (rc=$rc)" \
+  || ko "a failed restart over a live old guest read as success (rc=$rc) -- $out"
+: > "$SSH_LOG"
+out=$(env SSH_REFUSE=--shutdown WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-win rog-nv-wsl" "$WL" restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'wsl restart FAILED on: rog (shutdown refused' && ! printf '%s' "$out" | grep -q 'wsl up' \
+  && ok "...nor is one whose wsl.exe --shutdown failed on every alias that answered, and it says which phase (rc=$rc)" \
+  || ko "a refused shutdown over a live old guest read as success, or did not name the phase (rc=$rc) -- $out"
+grep -q 'wsl.exe -d Ubuntu' "$SSH_LOG" \
+  && ko "a start was issued after the shutdown failed, onto the old VM: $(cat "$SSH_LOG")" \
+  || ok "...and no start is issued onto the VM the shutdown left standing"
+printf '%s\n' "$out" | tail -1 | grep -q 'wsl restart FAILED on: rog' \
+  && ok "...with the failure as the last line, where the sweep routine reads its verdict" \
+  || ko "the failure is not the last line -- $out"
+# The kick keeps its meaning -- start if not running -- so a `--wait --wsl` on a box the user is
+# working on never kills a live VM; `--restart-wsl` is the spelling that does.
+: > "$SSH_LOG"; kick "rog-lan rog-nv-wsl" >/dev/null 2>&1
+grep -q -- '--shutdown' "$SSH_LOG" && ko "kick-wsl issued a shutdown: $(cat "$SSH_LOG")" \
+  || ok "kick-wsl never shuts a VM down"
+wake_wsl() { env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-wsl" "$WL" --wait "$1" rog; }
+: > "$SSH_LOG"; out=$(wake_wsl --wsl 2>&1)
+printf '%s' "$out" | grep -q 'wsl up' && ! grep -q -- '--shutdown' "$SSH_LOG" \
+  && ok "...and neither does --wait --wsl" || ko "--wait --wsl shut a VM down, or never started one -- $out; $(cat "$SSH_LOG")"
+: > "$SSH_LOG"; out=$(wake_wsl --restart-wsl 2>&1); rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'wsl shut down on rog (via rog-lan)' && printf '%s' "$out" | grep -q 'wsl up' \
+  && printf '%s\n' "$out" | tail -1 | grep -q '^all up$' && grep -q '^rog-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ok "--wait --restart-wsl shuts the VM down after the wake and starts a fresh one, ending in all up (rc=$rc)" \
+  || ko "--wait --restart-wsl did not restart the VM, or did not end in all up (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+# The wake path's final verdict is the wake's AND the WSL step's: with the boxes up and the
+# restart failed, `all up` with exit 0 would hand the sweep the old VM, so the WSL failure is the
+# last line and the exit status is nonzero.
+: > "$SSH_LOG"; out=$(env SSH_REFUSE=--shutdown WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-wsl" "$WL" --wait --restart-wsl rog 2>&1); rc=$?
+printf '%s' "$out" | grep -q 'wsl restart FAILED on: rog' && ! printf '%s' "$out" | grep -q 'wsl up' \
+  && ok "...and in the wake path too, a failed shutdown over a live old guest is never 'wsl up'" \
+  || ko "the wake path reported wsl up over a VM it failed to shut down -- $out"
+[ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q '^all up$' && printf '%s\n' "$out" | tail -1 | grep -q 'wsl restart FAILED on: rog' \
+  && ok "...nor 'all up': the restart failure is the wake's last line and its exit status (rc=$rc)" \
+  || ko "the wake path said all up, or exited 0, over a failed restart (rc=$rc) -- $out"
+# A start that fails AFTER the shutdown went through is the opposite diagnosis: there is no VM at
+# all, old or new, and telling the operator the old one still answers would be wrong twice over.
+: > "$SSH_LOG"
+out=$(env SSH_REFUSE='-d Ubuntu' WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-win rog-nv-wsl" "$WL" restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'wsl shut down on rog (via rog-lan)' \
+  && printf '%s\n' "$out" | tail -1 | grep -q 'wsl restart FAILED on: rog (shut down, then the start failed' \
+  && ! printf '%s' "$out" | grep -q 'old VM' \
+  && ok "a start that fails after the shutdown is reported as a start failure, never as the old VM answering (rc=$rc)" \
+  || ko "a failed start after a shutdown was misreported (rc=$rc) -- $out"
+# The step's third failing shape: every wsl.exe command succeeded, and the fresh guest never
+# answered within the poll budget. `wsl still down` is a backend the sweep cannot test, so it is a
+# failure of the step, from the verb's exit status and from the wake path's final verdict alike.
+: > "$SSH_LOG"; out=$(restart "rog-lan rog-nv-win" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q 'wsl up' && printf '%s\n' "$out" | tail -1 | grep -q 'wsl still down after 0 min on: rog' \
+  && ok "a restarted guest that never answers is a failed restart-wsl, its last line saying so (rc=$rc)" \
+  || ko "a guest that never answered read as a successful restart (rc=$rc) -- $out"
+grep -q '^rog-lan :: wsl.exe -d Ubuntu' "$SSH_LOG" && ok "...after the start really was issued" \
+  || ko "the start was never issued, so the case pins nothing: $(cat "$SSH_LOG")"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-win" "$WL" --wait --restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q '^all up$' && printf '%s\n' "$out" | tail -1 | grep -q 'NOT all up: wsl still down after 0 min on: rog' \
+  && ok "...and the wake path over it is NOT all up, exit nonzero, with the poll timeout as its last line (rc=$rc)" \
+  || ko "the wake path said all up, or exited 0, over a guest that never answered (rc=$rc) -- $out"
+# The poll's verdict is aggregate; the report is per box. With two boxes started and one guest
+# late, only that one is still down -- the other is up and its backend is testable today.
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan minix-lan rog-nv-wsl" "$WL" restart-wsl rog minix 2>&1); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '^wsl up on: rog$' && printf '%s\n' "$out" | tail -1 | grep -q 'wsl still down after 0 min on: minix$' \
+  && ok "one late guest is reported alone, and its neighbour as up (rc=$rc)" \
+  || ko "the poll's aggregate failure was pinned on every started box (rc=$rc) -- $out"
+# The kick path holds the same line: a kick no Windows endpoint carried is a failed kick, whatever
+# the guest answers, so `wsl up` there is the kick's own success and not the poll's.
+out=$(kick "rog-nv-wsl" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'wsl kick FAILED on: rog' && ! printf '%s' "$out" | grep -q 'wsl up' \
+  && ok "kick-wsl reports its own failure over a live guest as well (rc=$rc)" \
+  || ko "a failed kick over a live guest read as success (rc=$rc) -- $out"
+
 # --- the polling loops are bounded by elapsed time, not by iteration count -----------------------
 # Every probe of a dark box burns its ConnectTimeout, so an iteration budget was a wall-clock lie:
 # 36 rounds of a "3 minute" WSL wait ran for nine when the probes were slow. Three-second probes
@@ -175,7 +280,7 @@ elapsed=$((SECONDS - started))
 [ "$elapsed" -lt 30 ] && ok "a WSL wait with slow probes honours its deadline (${elapsed}s)" \
   || ko "the WSL wait ran ${elapsed}s against a 1s budget: it is still counting iterations"
 started=$SECONDS
-out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 SSH_DELAY=3 "$WL" --wait rog 2>&1)
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 SSH_DELAY=3 "$WL" --wait rog 2>&1); wake_rc=$?
 elapsed=$((SECONDS - started))
 [ "$elapsed" -lt 30 ] && ok "...and so does the wake wait (${elapsed}s)" \
   || ko "the wake wait ran ${elapsed}s against a 1s budget: it is still counting iterations"
@@ -184,6 +289,7 @@ printf '%s' "$out" | grep -q 'did NOT wake: rog' \
 printf '%s' "$out" | grep -q 'scripts/enable-wol-windows.ps1' \
   && ok "...and points failure advice at the tracked Windows repair script" \
   || ko "wake failure advice does not name scripts/enable-wol-windows.ps1 -- $out"
+[ "$wake_rc" -ne 0 ] && ok "...and exits nonzero (rc=$wake_rc)" || ko "a wake that timed out exited 0"
 
 # --- the two commands that need no site data --------------------------------------------------
 # --help and --list are what you reach for on a box where the table has yet to be installed, so
