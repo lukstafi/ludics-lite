@@ -32,7 +32,7 @@
 # Usage:
 #   fleet-worker.sh claim [--take]         # take the fleet's coordinator lease (--take adopts)
 #   fleet-worker.sh coordinator | release  # who holds it (exit 0 me, 1 other, 3 nobody) / give it up
-#   fleet-worker.sh preflight <box> [--codex] [--no-probe]   # launch runs this itself, too
+#   fleet-worker.sh preflight <box> [--codex] [--no-probe] [--no-cross]   # launch runs this itself, too
 #   fleet-worker.sh launch <box> <name> --kind claude|codex --brief <file>
 #                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
 #                          [--force] [--replace] [-- <extra CLI args>]
@@ -72,6 +72,7 @@
 #   FLEET_FLOTILLA: status service; http://mac-studio:7799.
 #   FLEET_LOCK_WAIT: seconds a lease mutation waits for a concurrent one; 10.
 #   FLEET_PROBE_TIMEOUT: wall-clock bound on the live headless preflight turn; 120.
+#   FLEET_CROSS_TIMEOUT: wall-clock bound on each cross-box ssh reach probe of the preflight; 20.
 #   FLEET_FETCH_TIMEOUT: wall-clock bound on skills-checkout and project fetches; 300.
 
 set -uo pipefail
@@ -199,7 +200,10 @@ bounded() {
   # caller's stdout, or a lingering child would hold a command substitution open.
   ( "$@" < "$stdin" > "$out" 2>&1; echo $? > "$rcf" ) >/dev/null 2>&1 &
   pid=$!
-  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$secs" ]; do sleep 1; waited=$((waited + 1)); done
+  # Tenth-second polls: a probe that returns at once (a reachable ssh sibling, a fast CLI) must
+  # not cost a whole second each, since the preflight runs them serially under the per-box lock
+  # and every launch pays it; [waited] counts tenths against [secs].
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt $((secs * 10)) ]; do sleep 0.1; waited=$((waited + 1)); done
   if kill -0 "$pid" 2>/dev/null; then
     for c in $(pgrep -P "$pid" 2>/dev/null); do pkill -P "$c" 2>/dev/null; kill "$c" 2>/dev/null; done
     kill "$pid" 2>/dev/null; rc=124
@@ -329,14 +333,17 @@ anchor_gate() {
 # the per-launch refusal the skill promises is enforced here rather than remembered.
 preflight_script() {
   cat <<'EOF'
-codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4"
+codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4" cross="$5" cross_timeout="$6"
 refuse=""
 note() { refuse="$refuse; $*"; }
 # One preflight per box at a time: a parallel group launched together would otherwise race
 # `git fetch`/`merge` in the same checkout and refuse on git's own lock files. Idempotent, so
 # waiting for the other preflight is the right thing; the bound covers a hung live probe.
 mkdir -p "$STATE" 2>/dev/null; plock="$STATE/preflight.lock"
-msg=$(take_lock "$plock" $((fetch_timeout + probe_timeout + 60)) "PREFLIGHT REFUSED $BOX") || { echo "$msg"; exit 1; }
+# The wait covers everything a holder may legitimately spend: the fetch, the live probe, and one
+# cross-box timeout per sibling, since the reach probes run serially under this lock.
+nsib=0; for _s in $cross; do nsib=$((nsib + 1)); done
+msg=$(take_lock "$plock" $((fetch_timeout + probe_timeout + 60 + cross_timeout * nsib)) "PREFLIGHT REFUSED $BOX") || { echo "$msg"; exit 1; }
 trap 'release_lock "$plock"' EXIT
 repo=$(expand_tilde "$SKILLS_REPO")
 if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
@@ -420,26 +427,64 @@ else
 fi
 command -v tmux >/dev/null 2>&1 || note "no tmux"
 command -v jq >/dev/null 2>&1 || note "no jq"
+# Cross-box reach (ludics-lite#57): a worker's brief may drive a fleet sibling over ssh for a
+# one-off leg, and on 2026-09-04 the first such leg found no credential mid-task. A refused
+# credential (permission denied, an unverifiable host key) refuses here; a sibling that does not
+# answer at all is asleep or off the network, which the wake path owns, so it is noted on the OK
+# line rather than refused - a worker whose task has no leg there must still launch.
+cross_down=""
+if [ -n "$cross" ] && ! command -v ssh >/dev/null 2>&1; then
+  note "no ssh client on $BOX for the cross-box legs (ludics-lite#57)"; cross=""
+fi
+for sibling in $cross; do
+  # Under `bounded`, which gives the probe /dev/null as stdin (the far-side program arrives on
+  # stdin through `bash -s`, and an ssh that inherited it would read the rest of this script as
+  # its own input, ending it early with status 0 - Codex P1 on #67; `-n` says the same thing to
+  # ssh itself) and a whole-process deadline: ConnectTimeout bounds the handshake only, not a
+  # login shell that never returns, and this loop holds the preflight lock.
+  err=$(bounded "$cross_timeout" ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$sibling" exit 0); crc=$?
+  [ "$crc" -eq 0 ] && continue
+  if [ "$crc" -eq 124 ]; then cross_down="$cross_down $sibling(no answer in ${cross_timeout}s)"; continue; fi
+  case "$err" in
+    *"Permission denied"*|*"Host key verification failed"*)
+      note "no non-interactive ssh to $sibling from $BOX: $(printf '%s' "$err" | tail -n1 | cut -c1-100) (provision the key, ludics-lite#57)" ;;
+    *) cross_down="$cross_down $sibling" ;;
+  esac
+done
 if [ -n "$refuse" ]; then
   echo "PREFLIGHT REFUSED $BOX: ${refuse#; }${other:+ (changes outside the served tree, ignored: $other)}"
   exit 1
 fi
-echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (changes outside the served tree, ignored: $other)}"
+echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (changes outside the served tree, ignored: $other)}${cross_down:+ (cross-box unreachable, asleep or off the network:$cross_down)}"
 EOF
+}
+
+# The fleet minus one box: what that box's preflight probes ssh to. `local` and the coordinator's
+# own name both stand for the box running this script, so neither is a sibling of itself.
+siblings_of() {
+  local box="$1" b out=""
+  for b in $BOXES; do
+    [ "$b" = "$box" ] && continue
+    is_local "$box" && is_local "$b" && continue
+    out="$out $b"
+  done
+  printf '%s' "${out# }"
 }
 
 cmd_preflight() {
   local box="${1:-}"; [ -n "$box" ] || die "preflight: which box?"; shift
-  local codex=0 probe=1
+  local codex=0 probe=1 cross=""
+  cross=$(siblings_of "$box")
   while [ $# -gt 0 ]; do
     case "$1" in
       --codex) codex=1 ;;
       --no-probe) probe=0 ;;
+      --no-cross) cross="" ;;
       *) die "preflight: unknown option $1" ;;
     esac
     shift
   done
-  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}"
+  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$cross" "${FLEET_CROSS_TIMEOUT:-20}"
   local rc=$?
   if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; exit 4; fi
   exit "$rc"
@@ -475,10 +520,14 @@ cmd_launch() {
   fi
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
   local codex=0 pf; [ "$kind" = codex ] && codex=1
-  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" )
+  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$(siblings_of "$box")" "${FLEET_CROSS_TIMEOUT:-20}" )
   local prc=$?
   if unreachable "$prc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: $pf"; exit 1; }
+  # A passing preflight can still carry a note the coordinator must see before briefing a
+  # cross-box leg: a sibling that did not answer. Said on stderr, so the LAUNCHED line stays
+  # the one thing on stdout.
+  case "$pf" in *"cross-box unreachable"*) echo "preflight note for $box/$name: ${pf#*skills=* }" >&2 ;; esac
   # The preflight fetches and runs a live probe; a halt or an adoption during that window
   # must still fence this launch, so the gate is read again right before anything is written.
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
