@@ -179,8 +179,10 @@ pin "check-run conclusions are in the vocabulary conclusion_class classifies" \
   "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$checks"
 pin "filter=latest yields one check run per name (a re-run does not add a stale twin)" \
   '[.[].name] | length == (unique | length)' "$checks"
+# Every run on the tip, whatever its status: a check run exists only once its job does, and a
+# tip whose run is still queued (a fresh merge behind a runner queue) has no completed run yet.
 job_names='[]'
-for rid in $(jq -r '.[] | select(.status == "completed") | .id' <<<"$runs"); do
+for rid in $(jq -r '.[].id' <<<"$runs"); do
   job_names=$(api --paginate "repos/$REPO/actions/runs/$rid/jobs?per_page=100" --jq '[.jobs[].name]' | jq -s --argjson acc "$job_names" 'add + $acc')
 done
 pin "every github-actions check run on the tip is named after a job of one of the tip's runs (the advisory deny-list matches JOB names)" \
