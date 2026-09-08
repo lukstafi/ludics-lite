@@ -16,6 +16,7 @@ on:
   pull_request:
     paths:
       - ship-pr/scripts/pr-review-api-contract.sh
+      - ship-pr/scripts/pr-review.sh # sourced by the contract: a change to the library it derives from is a change to the contract
       - .github/workflows/api-contract.yml
 
 # Two jobs, because a pull request that changes the script runs the PR's version of it: the job

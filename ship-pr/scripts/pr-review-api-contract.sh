@@ -339,13 +339,21 @@ else
   printf '%s\n' "$checks" >"$SCRATCH/latest.json"
   pin "filter=latest is a subset of filter=all by id (it filters; it does not invent rows)" \
     '[.[].id] as $all | $latest[0] | all(.[]; . as $i | $all | index($i))' "$checks_all" --slurpfile latest "$SCRATCH/latest_ids.json"
-  if [ "$(jq length <<<"$checks_all")" -gt "$(jq length <<<"$checks")" ]; then
-    pin "every check run filter=all has that filter=latest lacks is a superseded attempt: a newer row of the same suite and name is in filter=latest (no stale twin, and no uniqueness asked of same-named jobs)" \
-      '[.[] | select(.id as $i | $latest[0] | index($i) | not)]
+  # Two snapshots, read latest-then-all: a row in the later `all` that the earlier `latest`
+  # lacks is either a superseded attempt or one CREATED BETWEEN the reads (a workflow starting on
+  # the tip meanwhile). Check-run ids increase globally, so a row created after the first read
+  # has an id above every id that read returned, while a superseded attempt never does — its
+  # newer twin sits in `latest` with the higher id. The rows above that watermark are excluded
+  # exactly, rather than by a re-read that only narrows the window; the claim counts them.
+  n_dropped=$(jq --slurpfile latest "$SCRATCH/latest_ids.json" '($latest[0] | max) as $mark | [.[] | select((.id as $i | $latest[0] | index($i) | not) and .id < $mark)] | length' <<<"$checks_all")
+  n_after=$(jq --slurpfile latest "$SCRATCH/latest_ids.json" '($latest[0] | max) as $mark | [.[] | select(.id > $mark)] | length' <<<"$checks_all")
+  if [ "$n_dropped" -ge 1 ]; then
+    pin "every check run filter=all has that filter=latest lacks ($n_dropped, with $n_after created between the two reads set aside) is a superseded attempt: a newer row of the same suite and name is in filter=latest (no stale twin, and no uniqueness asked of same-named jobs)" \
+      '($latest[0] | max) as $mark | [.[] | select((.id as $i | $latest[0] | index($i) | not) and .id < $mark)]
        | all(.[]; .check_suite.id as $s | .name as $n | .id as $i | $lat[0] | any(.[]; .check_suite.id == $s and .name == $n and .id > $i))' \
       "$checks_all" --slurpfile latest "$SCRATCH/latest_ids.json" --slurpfile lat "$SCRATCH/latest.json"
   else
-    skip "filter=latest drops a re-run's superseded attempt" "no re-run on the tip: filter=all and filter=latest have the same $(jq length <<<"$checks") rows"
+    skip "filter=latest drops a re-run's superseded attempt" "no re-run on the tip: filter=all has no row below filter=latest's newest that filter=latest lacks ($(jq length <<<"$checks") rows, $n_after created between the reads)"
   fi
 fi
 # A check run's suite is its run's — check_suite.id on the check joins check_suite_id on the run
@@ -418,6 +426,18 @@ if [ -n "$STALE_BASE_PR" ]; then
     pin "compare/<a>...<b>?per_page=1 carries behind_by, ahead_by, merge_base_commit.sha and files[].filename (the drift fixture's shape)" \
       '(.behind_by | type == "number") and (.ahead_by | type == "number") and (.merge_base_commit.sha | test($hex))
        and (.files | type == "array" and length >= 1 and all(.[]; .filename | type == "string"))' "$cmp" --arg hex "$HEX40"
+    # What compare_hunks and warn_base_drift's valid_file read per file: the counts and status,
+    # previous_filename absent, null or non-empty, and a patch whose +/- line counts equal
+    # additions/deletions — compare_hunks's own consistency test, failing which a file's hunks
+    # read as unknown and every shared path becomes a possible same-region overlap. GitHub omits
+    # patch on binary and oversized diffs, so the consistency claim is on the files that carry
+    # one, of which the anchor compare must have at least one.
+    pin "compare files[] rows carry string filename and status, numeric additions, deletions and changes, and previous_filename absent, null or non-empty (valid_file's shape)" \
+      'all(.files[]; (.filename | type == "string") and (.status | type == "string") and (.additions | type == "number") and (.deletions | type == "number") and (.changes | type == "number")
+                     and ((has("previous_filename") | not) or .previous_filename == null or ((.previous_filename | type) == "string" and (.previous_filename | length) > 0)))' "$cmp"
+    pin "at least one compare file carries a patch, and on every file that does its +/- line counts equal additions/deletions (compare_hunks's consistency test)" \
+      'any(.files[]; .patch | type == "string") and all(.files[] | select(.patch | type == "string");
+         ([.patch | split("\n")[] | select(startswith("+"))] | length) == .additions and ([.patch | split("\n")[] | select(startswith("-"))] | length) == .deletions)' "$cmp"
     pin "... and merge_base_commit is the older side when it is an ancestor" '.merge_base_commit.sha == $base' "$cmp" --arg base "$base_sha"
     if jq -e 'any(.files[]; .status == "renamed")' <<<"$cmp" >/dev/null; then
       pin "a renamed entry carries previous_filename" 'all(.files[] | select(.status == "renamed"); .previous_filename | type == "string")' "$cmp"
