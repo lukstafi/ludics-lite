@@ -226,6 +226,27 @@ and `warn_base_drift`), and any declaration the suite never honoured. Run direct
 `test-pr-review-lib.sh` is its own suite: throwaway suites that source it prove the guard refuses
 what it must and passes what it must.
 
+The fixture suites pin the gate's logic against canned answers, so the shapes those answers imitate
+are a belief the suites cannot check — a renamed field, a changed default ordering or a new
+conclusion string leaves every fixture green and the gate reading a head wrong (ludics-lite#41).
+`ship-pr/scripts/pr-review-api-contract.sh` asks this repository's own live API the same questions,
+one jq read per belief, and reports each on its own line (`ok`, `MOVED` with the filter and the
+read, or `skip` with the reason it cannot be checked here), so a failure localizes to the field
+that moved; its exit code separates a moved belief (1), an addressed endpoint answering 4xx (4) and
+a read the token was refused (5) from the API not answering or throttling (3), and the reporter
+files everything but the last, naming which: the fields `run_signal`, `build_checks`, `run_red_is_advisory_only`, `pr_head_read`,
+`warn_base_drift` and `status_state` index; the newest-first order of `actions/runs`; the status,
+conclusion, mergeable-state and review-state vocabularies; that a merged PR's `.base.sha` is a
+snapshot standing behind the merge's first parent (anchored on #53); and the reviewer feeds' shapes
+(the `[bot]` suffix, the `+1` approval, `COMMENTED` rounds, the summary tag, 30-per-page
+pagination) anchored on #39. `.github/workflows/api-contract.yml` runs it daily, on demand, and on a pull request that
+changes the contract itself; a scheduled failure opens (or comments on) one issue rather than
+failing silently, from a second job that checks nothing out, so the job that runs a pull request's
+version of the script holds a read-only token. A belief that needs a state this repository does not
+have, or a fact the API does not carry — a dirty PR pushed to under observation, a 300-file
+compare, the push time behind `updated_at` — prints as `skip`, so the unpinned set is visible in
+every run. Run it locally with `gh` auth: `ship-pr/scripts/pr-review-api-contract.sh lukstafi/ludics-lite`.
+
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and
 reported instead of holding the job until CI's own timeout. `SHIP_PR_TEST_LOG_DIR` keeps the
