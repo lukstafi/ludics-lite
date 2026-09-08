@@ -873,9 +873,12 @@ conflict_note() {
   # carries this field on every state line and nothing outside status_line parses the format
   # (#47 dropped an extra-field proposal on exactly that ground); should `.draft` ever be needed
   # on its own, the arm stays and the field is what changes.
+  # The command names the repository: `status` is invoked as owner/repo#pr from shells whose
+  # working directory is unreliable, where a bare `gh pr ready <n>` cannot resolve the repo.
   draft)
     printf '%s' "DRAFT (mergeable_state=draft): a draft cannot be merged and no reviewer action" \
-      " lands it — mark it ready (gh pr ready <pr>) when it is; the review rounds still count"
+      " lands it — mark it ready (gh pr ready ${PR_NUM:-<pr>} --repo $REPO) when it is; the" \
+      " review rounds still count"
     ;;
   esac
   return 0
@@ -2048,14 +2051,31 @@ esac
 # cleanly and a reader still wants to look. A file without a `patch` (GitHub omits it for binary
 # files and past a size cap) yields null, which the caller reads as "hunks unread" — never as
 # disjoint.
+# A patch is read hunk by hunk against its own headers: every `@@ -s,n +t,m @@` must be followed
+# by exactly n old-side and m new-side lines before the next header or the end. A patch GitHub
+# cut short (a large text diff) fails that count and yields null like a missing one — unread, never
+# disjoint (Codex P2 on #63).
 compare_hunks() {
   jq -c '
     def ranges:
-      if (.patch | type) == "string" then
-        [.patch | scan("(?m)^@@ -([0-9]+)(?:,([0-9]+))? ")
-          | {s: (.[0] | tonumber), n: (if .[1] == null then 1 else (.[1] | tonumber) end)}
-          | if .n == 0 then {lo: .s, hi: (.s + 1)} else {lo: .s, hi: (.s + .n - 1)} end]
-      else null end;
+      if (.patch | type) != "string" then null
+      else
+        reduce (.patch | split("\n"))[] as $l ({ranges: [], cur: null, ok: true};
+          if ($l | test("^@@ -[0-9]+(,[0-9]+)? \\+[0-9]+(,[0-9]+)? @@")) then
+            (if .cur != null and (.cur.o != 0 or .cur.n != 0) then .ok = false else . end)
+            | ($l | capture("^@@ -(?<s>[0-9]+)(,(?<n>[0-9]+))? \\+[0-9]+(,(?<m>[0-9]+))? @@")) as $h
+            | ($h.s | tonumber) as $s
+            | (if $h.n == null then 1 else ($h.n | tonumber) end) as $n
+            | (if $h.m == null then 1 else ($h.m | tonumber) end) as $m
+            | .ranges += [if $n == 0 then {lo: $s, hi: ($s + 1)} else {lo: $s, hi: ($s + $n - 1)} end]
+            | .cur = {o: $n, n: $m}
+          elif .cur == null then .
+          elif ($l | startswith("-")) then .cur.o -= 1
+          elif ($l | startswith("+")) then .cur.n -= 1
+          elif ($l | startswith(" ")) then .cur.o -= 1 | .cur.n -= 1
+          else . end)
+        | if .ok and (.cur == null or (.cur.o == 0 and .cur.n == 0)) then .ranges else null end
+      end;
     [.files[] | {key: .filename, value: ranges}] | from_entries' <<<"$1" 2>/dev/null
 }
 

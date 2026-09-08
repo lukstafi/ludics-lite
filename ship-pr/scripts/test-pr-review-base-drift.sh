@@ -318,8 +318,8 @@ patched() {
 }
 
 test_disjoint_hunks_are_not_loud() {
-  set_compares 2 1 "[$(patched dune $'@@ -400,0 +401,12 @@\n+(test\n+ (name mine))')]" \
-    "[$(patched dune $'@@ -120,0 +121,9 @@\n+(test\n+ (name theirs))')]"
+  set_compares 2 1 "[$(patched dune $'@@ -400,0 +401,2 @@\n+(test\n+ (name mine))')]" \
+    "[$(patched dune $'@@ -120,0 +121,2 @@\n+(test\n+ (name theirs))')]"
   run_drift
   assert_eq "$DRIFT_RC" 0 "a shared path edited in disjoint hunks is nothing to act on"
   assert_contains "$DRIFT_OUTPUT" "all in DISJOINT hunks" "the line should say the hunks are disjoint"
@@ -329,8 +329,8 @@ test_disjoint_hunks_are_not_loud() {
 }
 
 test_meeting_hunks_state_the_policy() {
-  set_compares 2 1 "[$(patched README.md $'@@ -10,3 +10,4 @@\n context\n-old\n+new\n+newer')]" \
-    "[$(patched README.md $'@@ -12,2 +12,2 @@\n-was\n+is')]"
+  set_compares 2 1 "[$(patched README.md $'@@ -10,2 +10,3 @@\n context\n-old\n+new\n+newer')]" \
+    "[$(patched README.md $'@@ -12,1 +12,1 @@\n-was\n+is')]"
   run_drift
   assert_eq "$DRIFT_RC" 1 "the same region edited on both sides should warn"
   assert_contains "$DRIFT_OUTPUT" "!!! BASE-DRIFT FILE OVERLAP: the base's advance touched the SAME REGIONS" \
@@ -354,7 +354,7 @@ test_adjacent_hunks_meet() {
 
 test_mixed_paths_split_by_hunks() {
   set_compares 2 1 \
-    "[$(patched dune $'@@ -400,0 +401,2 @@\n+a\n+b'),$(patched shared.ml $'@@ -3,2 +3,2 @@\n-a\n+b')]" \
+    "[$(patched dune $'@@ -400,0 +401,2 @@\n+a\n+b'),$(patched shared.ml $'@@ -3,1 +3,1 @@\n-a\n+b')]" \
     "[$(patched dune $'@@ -120,0 +121,2 @@\n+c\n+d'),$(patched shared.ml $'@@ -4,1 +4,1 @@\n-a\n+b')]"
   run_drift
   assert_eq "$DRIFT_RC" 1 "one meeting path is enough to warn"
@@ -362,6 +362,17 @@ test_mixed_paths_split_by_hunks() {
   assert_contains "$DRIFT_OUTPUT" "[\"shared.ml\"]" "the meeting path is named"
   assert_contains "$DRIFT_OUTPUT" "1 more path(s) in disjoint hunks only: [\"dune\"]" \
     "the disjoint path is listed apart"
+}
+
+test_truncated_patch_is_unread() {
+  # The header promises three old-side lines and the patch stops after one: GitHub cut it short,
+  # and whatever hunk followed is unknown — unread, not disjoint.
+  set_compares 2 1 "[$(patched big.ml $'@@ -10,3 +10,4 @@\n context')]" \
+    "[$(patched big.ml $'@@ -400,1 +400,1 @@\n-a\n+b')]"
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "a truncated patch stays loud"
+  assert_contains "$DRIFT_OUTPUT" "hunks unread for 1 of them" "a truncated patch is reported unread"
+  assert_not_contains "$DRIFT_OUTPUT" "DISJOINT hunks (" "a truncated patch must never read as disjoint"
 }
 
 test_unread_hunks_count_as_meeting() {
@@ -380,6 +391,7 @@ tests=(
   test_meeting_hunks_state_the_policy
   test_adjacent_hunks_meet
   test_mixed_paths_split_by_hunks
+  test_truncated_patch_is_unread
   test_unread_hunks_count_as_meeting
   test_spaces
   test_rename_previous_filename

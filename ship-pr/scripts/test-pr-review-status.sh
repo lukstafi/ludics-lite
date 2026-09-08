@@ -217,6 +217,8 @@ test_idle_draft_names_gh_pr_ready() {
   assert_eq "$(state_merge "$STATE")" draft "the draft mergeability should ride on the state line"
   assert_contains "$LINE" "DRAFT (mergeable_state=draft)" "an idle draft should say DRAFT"
   assert_contains "$LINE" "gh pr ready" "the line should name the move that lands a draft"
+  assert_contains "$LINE" "--repo $REPO" \
+    "the command names the repository: a bare number cannot resolve it from a background shell"
   assert_not_contains "$LINE" "the next move is yours" \
     "a draft must not invite another push as the move that lands it"
   assert_not_contains "$LINE" "CONFLICTS" "a draft is not a conflict"
