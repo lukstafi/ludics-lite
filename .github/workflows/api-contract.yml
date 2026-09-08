@@ -1,0 +1,60 @@
+name: api contract
+
+# The live-API contract behind pr-review.sh's fixtures (ludics-lite#41): the test-pr-review-*
+# suites pin the gate's LOGIC against canned answers, and this job pins the SHAPES those answers
+# imitate against this repository's own API — the fields the projections read, the newest-first
+# order of the runs feed, the status and conclusion vocabulary, what a PR read says about its
+# base and mergeability, and the reviewer feeds. It runs daily, because a field that moves does so
+# on GitHub's clock, not on a push; on demand; and on a pull request that changes the contract
+# itself. Reads only, with the default token. It is its own workflow file rather than a job in
+# skill-scripts.yml so that the schedule does not also run the whole macOS matrix every day.
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ship-pr/scripts/pr-review-api-contract.sh
+      - .github/workflows/api-contract.yml
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  pull-requests: read
+  issues: write # only the `Report a moved belief` step writes, and only on a scheduled failure
+
+jobs:
+  contract:
+    name: live API contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert the fixtures' beliefs against this repository's live API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This run's own row in actions/runs?head_sha= is the live newest-first check: on a
+          # pull_request run the head is the PR's, not the merge commit's.
+          CONTRACT_OWN_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: ship-pr/scripts/pr-review-api-contract.sh "$GITHUB_REPOSITORY"
+      - name: Report a moved belief
+        # A scheduled run nobody watches fails silently, which is the drift class this workflow
+        # exists to catch. One open issue per drift, not one per day: a second scheduled failure
+        # finds the first's issue and adds a comment instead.
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          title="pr-review.sh fixtures: a belief about the GitHub API moved (api contract)"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Still moved on $(date -u +%Y-%m-%d): $run_url"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "The scheduled live-API contract (\`ship-pr/scripts/pr-review-api-contract.sh\`) found a belief the pr-review.sh fixtures encode that no longer holds on this repository's API. The run names the field: $run_url
+
+Each MOVED line is one projection input; the fixture suites stay green through this by construction (they feed canned shapes), so the gate may be reading a head wrong until the projection and its fixtures are updated together (ludics-lite#41)."
+          fi
