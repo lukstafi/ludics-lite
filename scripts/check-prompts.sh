@@ -143,19 +143,21 @@ value_of() {
 # character outside YAML's `c-printable` production -- of which, in valid UTF-8 with the ASCII
 # controls refused on the frontmatter below, the C1 controls U+0080-U+009F (`\xC2\x80`-
 # `\xC2\x9F`) and the non-characters U+FFFE, U+FFFF (`\xEF\xBF\xBE`, `\xEF\xBF\xBF`) are what
-# remains. Refusing by the spec's own definition is what closes the class.
+# remains -- and the line breaks YAML 1.1 (libyaml, Psych) knows beyond LF, CR and NEL, the
+# separators U+2028 and U+2029 (`\xE2\x80\xA8`, `\xE2\x80\xA9`), which would split a value the
+# frontmatter reads as one line. Refusing by the spec's own definitions is what closes the class.
 well_formed_bytes() {
   local f="$1"
   [ "$(tr -d '\000' < "$f" | wc -c)" -eq "$(wc -c < "$f")" ] || return 1
   iconv -f UTF-8 -t UTF-8 < "$f" > /dev/null 2>&1 || return 1
-  ! grep -qE "$(printf '\302[\200-\237]|\357\277[\276\277]')" "$f"
+  ! grep -qE "$(printf '\302[\200-\237]|\357\277[\276\277]|\342\200[\250\251]')" "$f"
 }
 
 check_skill_file() {
   local rel="$1" dir fm bad key count raw name="" value
   dir=$(basename "$(dirname "$ROOT/$rel")")
   if ! well_formed_bytes "$ROOT/$rel"; then
-    ko "$rel" "carries a byte sequence no loader accepts: a NUL, invalid UTF-8, or a character outside YAML's printable set (a C1 control, U+FFFE, U+FFFF)"
+    ko "$rel" "carries a byte sequence no loader accepts: a NUL, invalid UTF-8, a character outside YAML's printable set (a C1 control, U+FFFE, U+FFFF), or a line separator (U+2028, U+2029)"
     return
   fi
   if ! fm=$(frontmatter "$ROOT/$rel"); then
@@ -212,7 +214,8 @@ check_skill_file() {
 # A table ends at the first line that is not a row, blank or not: a heading or paragraph ends
 # it just the same, and the rows of a later table are that table's, whatever its header. The
 # two Markdown contexts that hide a table from the renderer by accident, a fenced code block
-# (closed only by a fence of the same marker at least as long as the one that opened it, with
+# (opened and closed by a fence line indented at most three spaces, since four make it code,
+# closed only by a fence of the same marker at least as long as the one that opened it with
 # nothing but whitespace after it, as CommonMark closes it) and an HTML comment, hide it from
 # this scan too. That is the scan's scope, and a deliberate line: a table is read at column 0
 # outside those two, and a table an author wraps in a raw HTML block (`<pre>`, `<div>`, any of
@@ -224,8 +227,8 @@ check_skill_file() {
 # empty last line of a command substitution does.
 table_rows() {
   awk -v hdr="| $2 |" '
-    /^[[:space:]]*(```+|~~~+)/ {
-      line = $0; sub(/^[[:space:]]*/, "", line); m = substr(line, 1, 1)
+    /^ ? ? ?(```+|~~~+)/ {
+      line = $0; sub(/^ ? ? ?/, "", line); m = substr(line, 1, 1)
       len = 0; while (substr(line, len + 1, 1) == m) len++
       if (!fence) { fence = 1; fence_m = m; fence_len = len }
       else if (m == fence_m && len >= fence_len && substr(line, len + 1) ~ /^[[:space:]]*$/) fence = 0

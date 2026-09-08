@@ -189,6 +189,8 @@ fresh "$R"; printf -- '---\nname: alpha\ndescription: a C1 control \302\205 insi
 expect "a C1 control (U+0085)" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
 fresh "$R"; printf -- '---\nname: alpha\ndescription: a\357\277\276 non-character\n---\n' > "$R/alpha/SKILL.md"
 expect "U+FFFE" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
+fresh "$R"; printf -- '---\nname: alpha\ndescription: a\342\200\250b, split by a line separator\n---\n' > "$R/alpha/SKILL.md"
+expect "U+2028, a line break to YAML 1.1" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
 fresh "$R"; printf -- '---\nname: alpha\ndescription: fine \303\274ber text \342\200\224 with a dash\n---\n' > "$R/alpha/SKILL.md"
 expect "...while valid UTF-8 content passes" 0 '6 passed, 0 failed' -- "$CP" "$R"
 # A Unicode space is content, not whitespace, to YAML and to this check (LC_ALL=C): appended
@@ -258,6 +260,15 @@ fresh "$R"; { echo '```text'; echo '```not-a-close'; cat "$R/README.md"; echo '`
 expect "a fence line with text after the marker does not close" 1 "no '| Skill |' table" -- "$CP" "$R"
 fresh "$R"; { echo '```text'; echo 'code'; echo '```   '; cat "$R/README.md"; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
 expect "...and one with only whitespace after it does" 0 '6 passed, 0 failed' -- "$CP" "$R"
+# A fence line may be indented at most three spaces; four make it code inside the open block.
+fresh "$R"; { echo '```'; echo '    ```'; cat "$R/README.md"; echo '```'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
+expect "a fence indented four spaces does not close" 1 "no '| Skill |' table" -- "$CP" "$R"
+fresh "$R"; { echo '```'; echo 'code'; echo '   ```'; cat "$R/README.md"; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
+expect "...and one indented three does" 0 '6 passed, 0 failed' -- "$CP" "$R"
+# GFM's delimiter row: cells "whose only content are hyphens", no minimum count -- `| - | - |`
+# renders as a table on GitHub, and so it is one here.
+fresh "$R"; sed -i.bak 's/^| --- | --- |$/| - | - |/' "$R/README.md"
+expect "a single-hyphen delimiter row is a table, as on GitHub" 0 '6 passed, 0 failed' -- "$CP" "$R"
 
 # Every data row is judged: a row the reader sees with a first cell that is not one backticked
 # name fails, instead of being skipped as not-a-row.
