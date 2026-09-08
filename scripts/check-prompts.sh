@@ -85,10 +85,13 @@ value_of() {
   v=$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
   case "$v" in
   \"*)
-    if ! printf '%s\n' "$v" | grep -qE '^"([^"\\]|\\.)*"([[:space:]]+#.*)?$'; then
-      echo "a double-quoted value must close on the same line, with nothing but a comment after the closing quote"; return 1
+    # Only the two escapes whose reading is one character and one line, `\"` and `\\`; every
+    # other backslash (`\n`, `\t`, `\q`) is refused rather than decoded, so a value never
+    # resolves past one line, and never to something a loader would reject.
+    if ! printf '%s\n' "$v" | grep -qE '^"([^"\\]|\\["\\])*"([[:space:]]+#.*)?$'; then
+      echo "a double-quoted value must close on the same line with nothing but a comment after it, and may escape only \\\" and \\\\ (single-quote the value, or drop the backslash)"; return 1
     fi
-    inner=$(printf '%s\n' "$v" | sed -E 's/^"(([^"\\]|\\.)*)".*$/\1/')
+    inner=$(printf '%s\n' "$v" | sed -E 's/^"(([^"\\]|\\["\\])*)".*$/\1/' | sed -E 's/\\(["\\])/\1/g')
     ;;
   \'*)
     if ! printf '%s\n' "$v" | grep -qE "^'([^']|'')*'([[:space:]]+#.*)?\$"; then
@@ -125,18 +128,26 @@ check_skill_file() {
     ko "$rel" "no YAML frontmatter: line 1 must be '---' and a closing '---' must follow"
     return
   fi
+  # A control character anywhere in the frontmatter -- a tab YAML reads as a separator, a
+  # carriage return a loader folds into the value -- is refused whole, rather than modelled
+  # wherever it could change a reading.
+  if printf '%s\n' "$fm" | grep -q '[[:cntrl:]]'; then
+    ko "$rel" "frontmatter carries a control character (a tab or a carriage return, say); use plain spaces and LF line ends"
+    return
+  fi
   bad=$(printf '%s\n' "$fm" | grep -v -E "$BLANK_OR_COMMENT" | grep -v -E "$KEY_LINE" | head -n 1)
   if [ -n "$bad" ]; then
     ko "$rel" "frontmatter line is not a top-level 'key: value' (a continued, nested or listed value cannot be read as one line): '$bad'"
     return
   fi
-  for key in name description; do
+  # Every declared key, the optional ones included, is declared once and carries a value inside
+  # the grammar: a loader rejects the whole file on a malformed `allowed-tools:` just as on a
+  # malformed `name:`, so the verdict cannot be limited to the two required keys.
+  for key in $(printf '%s\n' "$fm" | grep -E "$KEY_LINE" | sed 's/:.*$//' | sort -u); do
     count=$(field "$key" "$fm" | wc -l | tr -d ' ')
-    case "$count" in
-    0) ko "$rel" "frontmatter has no '$key:' line"; continue ;;
-    1) ;;
-    *) ko "$rel" "frontmatter has $count '$key:' lines, expected one"; continue ;;
-    esac
+    if [ "$count" -ne 1 ]; then
+      ko "$rel" "frontmatter has $count '$key:' lines, expected one"; continue
+    fi
     raw=$(field "$key" "$fm")
     case "$raw" in
     '|'* | '>'*)
@@ -150,6 +161,9 @@ check_skill_file() {
     fi
     [ "$key" = name ] && name="$value"
   done
+  for key in name description; do
+    printf '%s\n' "$fm" | grep -qE "^$key:" || ko "$rel" "frontmatter has no '$key:' line"
+  done
   if [ -n "$name" ] && [ "$name" != "$dir" ]; then
     ko "$rel" "frontmatter name '$name' does not match its directory '$dir'"
   fi
@@ -159,12 +173,14 @@ check_skill_file() {
 
 # --- index tables -----------------------------------------------------------------------------
 # table_names <readme> <first-column-header>: the backticked first column of the table whose
-# header row starts `| <header> |`. A Markdown table ends at the first line that is not a row,
-# blank or not -- a heading or paragraph ends it just the same, and the rows of a later table
-# are that table's, whatever its header.
+# header row starts `| <header> |`. It is a table only with its delimiter row (`| --- | ... |`)
+# right under the header -- without one Markdown renders the rows as prose, and so does this.
+# A table ends at the first line that is not a row, blank or not: a heading or paragraph ends
+# it just the same, and the rows of a later table are that table's, whatever its header.
 table_names() {
   awk -v hdr="| $2 |" '
-    index($0, hdr) == 1 { in_table = 1; next }
+    index($0, hdr) == 1 { want_delim = 1; next }
+    want_delim { want_delim = 0; if ($0 ~ /^\|([[:space:]]*:?-+:?[[:space:]]*\|)+[[:space:]]*$/) in_table = 1; else exit; next }
     in_table && !/^\|/ { exit }
     in_table && /^\| `[^`]*` \|/ { sub(/^\| `/, ""); sub(/`.*$/, ""); print }
   ' "$ROOT/$1"
@@ -179,7 +195,7 @@ check_index() {
     | sed "s|^$prefix||" | sort)
   rows=$(table_names "$readme" "$header" | sort)
   if [ -z "$rows" ]; then
-    ko "$readme" "no '| $header |' table with backticked names in its first column"
+    ko "$readme" "no '| $header |' table (a header row, its '| --- |' delimiter row, then rows with backticked names in the first column)"
     return
   fi
   missing=$(comm -23 <(printf '%s\n' "$dirs") <(printf '%s\n' "$rows") | tr '\n' ' ')

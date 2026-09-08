@@ -151,6 +151,32 @@ expect "a nested list" 1 "not a top-level 'key: value'" -- "$CP" "$R"
 fresh "$R"; skill "$R" alpha 'name: alpha' 'description: commented' '# a comment line' '' 'model: sonnet'
 expect "blank and comment lines between keys are fine" 0 '6 passed, 0 failed' -- "$CP" "$R"
 
+# Double-quoted values admit only `\"` and `\\`: a backslash a loader would reject (`\q`) and one
+# it would turn into a second line (`\n`) are refused alike, and the two admitted ones decode.
+fresh "$R"; skill "$R" alpha 'name: alpha' 'description: "bad \q escape"'
+expect "an escape YAML rejects" 1 'may escape only \" and \\' -- "$CP" "$R"
+fresh "$R"; skill "$R" alpha 'name: alpha' 'description: "first\nsecond"'
+expect "an escape that would make a second line" 1 'may escape only \" and \\' -- "$CP" "$R"
+fresh "$R"; skill "$R" alpha 'name: "al\"pha"' 'description: "a \"quoted\" word and a \\ backslash"'
+expect "the admitted escapes decode before the directory comparison" 1 "name 'al\"pha' does not match its directory 'alpha'" -- "$CP" "$R"
+fresh "$R"; skill "$R" alpha 'name: alpha' 'description: "a \"quoted\" word and a \\ backslash"'
+expect "...and pass where the text is fine" 0 '6 passed, 0 failed' -- "$CP" "$R"
+
+# A control character anywhere in the frontmatter is refused whole: the tab YAML reads as a
+# separator after `:`, and the carriage return a loader would fold into the value.
+fresh "$R"; skill "$R" alpha 'name: alpha' "description: Runs:$(printf '\t')quickly"
+expect "a tab in a value" 1 'frontmatter carries a control character' -- "$CP" "$R"
+fresh "$R"; skill "$R" alpha 'name: alpha' "description: CRLF line$(printf '\r')"
+expect "a carriage return" 1 'frontmatter carries a control character' -- "$CP" "$R"
+
+# Optional keys are held to the same grammar: a loader rejects the whole file on any of them.
+fresh "$R"; skill "$R" alpha 'name: alpha' 'description: fine' 'allowed-tools: ['
+expect "a malformed optional key" 1 "frontmatter 'allowed-tools:' value is outside the grammar" -- "$CP" "$R"
+fresh "$R"; skill "$R" alpha 'name: alpha' 'description: fine' 'model:'
+expect "an empty optional key" 1 "frontmatter 'model:' has no value" -- "$CP" "$R"
+fresh "$R"; skill "$R" alpha 'name: alpha' 'description: fine' 'model: sonnet' 'model: opus'
+expect "a duplicated optional key" 1 "frontmatter has 2 'model:' lines" -- "$CP" "$R"
+
 # --- index table defects ---------------------------------------------------------------------
 fresh "$R"; skill "$R" gamma 'name: gamma' 'description: Unindexed.'
 expect "a skill missing from the README table" 1 'skill directories missing from its table: gamma' -- "$CP" "$R"
@@ -181,6 +207,10 @@ EOF
 expect "a heading ends the table: a skill listed only in a later table is missing" 1 'skill directories missing from its table: beta' -- "$CP" "$R"
 printf '%s' "$out" | grep -q "table row 'NOT_A_SKILL'" && ko "the later table's rows were read as the index" \
   || ok "...and the later table's rows are not read as index rows"
+
+# Without its delimiter row a header and its rows are prose to Markdown, and to this.
+fresh "$R"; sed -i.bak '/^| Skill |/{n;d;}' "$R/README.md"
+expect "a table without its delimiter row is not a table" 1 "no '| Skill |' table" -- "$CP" "$R"
 
 fresh "$R"; sed -i.bak 's/^| Routine |/| Routines |/' "$R/routines/README.md"
 expect "a renamed table header is a failure, not an empty pass" 1 "no '| Routine |' table" -- "$CP" "$R"
