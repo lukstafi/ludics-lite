@@ -16,6 +16,10 @@
 # (the coordinator lease, a finished worker) takes it explicitly, so any section runs on its own.
 
 set -uo pipefail
+# No `... | grep -q` under that pipefail: grep exits on its first match and the writer takes
+# SIGPIPE, so the pipeline reads 141 -- a refusal message long enough for two writes turned the
+# ownership-race assertion into a flake (the gh-ocannl-949 mechanism). Matches read from files or
+# here-strings, which bash backs with a file.
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 FW="$HERE/fleet-worker.sh"
@@ -122,7 +126,7 @@ ko() { fail=$((fail + 1)); echo "FAIL: $*"; }
 expect() {
   local label="$1" want_rc="$2" want="$3"; shift 3; [ "$1" = -- ] && shift
   out=$("$@" 2>&1); rc=$?
-  if [ "$rc" -eq "$want_rc" ] && printf '%s' "$out" | grep -q -- "$want"; then ok "$label"
+  if [ "$rc" -eq "$want_rc" ] && grep -q -- "$want" <<<"$out"; then ok "$label"
   else ko "$label (rc=$rc want $want_rc; want /$want/) -- $out"; fi
 }
 
@@ -195,7 +199,24 @@ cat > "$TMP/bin/tmux" <<EOF
 if [ -n "\${SHIM_TMUX_FAIL_NEW:-}" ]; then case " \$* " in *" new-session "*) echo "shim: tmux refuses new-session" >&2; exit 1 ;; esac; fi
 exec "$REAL_TMUX" "\$@"
 EOF
-chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux"
+# ssh: the preflight's cross-box reach probe (ludics-lite#57) -- the one ssh shape these tests
+# answer, `ssh <opts> <host> exit 0`. `SHIM_SSH_DENY=<host>` answers a missing credential,
+# `SHIM_SSH_DOWN=<host>` a box that does not answer; every other probed host is reachable. Any
+# other invocation (run_on's `bash -s` to a box the tests never map as local) is unresolvable, as
+# it would be for real: nothing in these tests reaches a real box.
+cat > "$TMP/bin/ssh" <<'SHIMEOF'
+#!/usr/bin/env bash
+host=""
+while [ $# -gt 0 ]; do case "$1" in -o) shift ;; -*) ;; *) host="$1"; break ;; esac; shift; done
+shift
+[ "$*" = "exit 0" ] || { echo "ssh: Could not resolve hostname $host: nodename nor servname provided" >&2; exit 255; }
+[ "$host" = "${SHIM_SSH_HANG:-}" ] && sleep 30
+[ "$host" = "${SHIM_SSH_SLURP:-}" ] && cat > /dev/null
+[ "$host" = "${SHIM_SSH_DENY:-}" ] && { echo "$host: Permission denied (publickey)." >&2; exit 255; }
+[ "$host" = "${SHIM_SSH_DOWN:-}" ] && { echo "ssh: connect to host $host port 22: Connection timed out" >&2; exit 255; }
+exit 0
+SHIMEOF
+chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux" "$TMP/bin/ssh"
 
 # --- the real checkout, installed by the README's own loops, must pass the preflight ---------
 # The scratch checkout further down is built to the layout the preflight expects, so the two
@@ -386,8 +407,8 @@ env FLEET_COORDINATOR=race-a "$FW" claim --take >"$TMP/race-a.out" 2>&1 & ra=$!
 env FLEET_COORDINATOR=race-b "$FW" claim --take >"$TMP/race-b.out" 2>&1 & rb=$!
 wait "$ra" "$rb"
 holders=0
-env FLEET_COORDINATOR=race-a "$FW" coordinator 2>&1 | grep -q "COORDINATOR: you" && holders=$((holders + 1))
-env FLEET_COORDINATOR=race-b "$FW" coordinator 2>&1 | grep -q "COORDINATOR: you" && holders=$((holders + 1))
+ra=$(env FLEET_COORDINATOR=race-a "$FW" coordinator 2>&1); grep -q "COORDINATOR: you" <<<"$ra" && holders=$((holders + 1))
+rb=$(env FLEET_COORDINATOR=race-b "$FW" coordinator 2>&1); grep -q "COORDINATOR: you" <<<"$rb" && holders=$((holders + 1))
 [ "$holders" -eq 1 ] && ok "concurrent takeovers leave exactly one holder" || ko "concurrent takeovers: $holders holders -- $(cat "$TMP/race-a.out" "$TMP/race-b.out")"
 [ -d "$ISSUE_WAVE_STATE/COORDINATOR.lock" ] && ko "takeover lock left behind" || ok "takeover lock released"
 mkdir "$ISSUE_WAVE_STATE/COORDINATOR.lock"
@@ -420,6 +441,18 @@ section "preflight" && {
 expect "clean main on origin passes (claude, live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox
 expect "clean main passes for codex (live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --codex
 expect "a stalling skills fetch is bounded and refused" 1 "git fetch in .* timed out after 2s" -- env SHIM_GIT_HANG_FETCH=1 FLEET_FETCH_TIMEOUT=2 "$FW" preflight testbox --no-probe
+# Cross-box reach (ludics-lite#57): a missing credential refuses, a box that is down is noted.
+expect "a sibling refusing the key refuses the preflight" 1 "no non-interactive ssh to otherbox from testbox: .*Permission denied" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_DENY=otherbox "$FW" preflight testbox --no-probe
+expect "a sibling that does not answer is noted on the OK line" 0 "PREFLIGHT OK.*cross-box unreachable, asleep or off the network: otherbox" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_DOWN=otherbox "$FW" preflight testbox --no-probe
+expect "a reachable sibling adds nothing to the OK line" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- env FLEET_BOXES="testbox otherbox" "$FW" preflight testbox --no-probe
+expect "--no-cross skips the reach probe" 0 "PREFLIGHT OK" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_DENY=otherbox "$FW" preflight testbox --no-probe --no-cross
+expect "a sibling whose login never returns is bounded and noted, not hung" 0 "PREFLIGHT OK.*otherbox(no answer in 2s)" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_HANG=otherbox FLEET_CROSS_TIMEOUT=2 "$FW" preflight testbox --no-probe
+[ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded reach probe" || ok "preflight lock released after the bounded reach probe"
+# The probe must not read the far-side program off stdin: a sibling that swallows its stdin would
+# otherwise end the preflight early with status 0 over an earlier refusal (Codex P1 on #67).
+echo x >> "$repo/ship-pr/SKILL.md"
+expect "a reachable sibling does not swallow the refusal that follows the probe" 1 "1 local change(s) in the served tree" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_SLURP=otherbox "$FW" preflight testbox --no-probe
+git -C "$repo" checkout -q -- ship-pr/SKILL.md
 [ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
 expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
 expect "codex that cannot run headless refuses despite login status" 1 "codex cannot run headless: \"message\":\"401 Unauthorized\"" -- env SHIM_CODEX_DOWN=1 "$FW" preflight testbox --codex
@@ -485,6 +518,9 @@ section "launch / attach / status / log with a project repo and --repo/--branch"
 expect "launch without a lease refuses" 1 "LAUNCH REFUSED testbox/w1: no coordinator lease" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 "$FW" claim >/dev/null
+expect "launch says on stderr which sibling did not answer, and still launches" 0 "preflight note for testbox/w-cross: (cross-box unreachable, asleep or off the network: otherbox)" -- \
+  env FLEET_BOXES="testbox otherbox" SHIM_SSH_DOWN=otherbox "$FW" launch testbox w-cross --kind claude --brief "$brief" --cwd "$proj"
+"$FW" attach testbox w-cross --interval 1 >/dev/null
 echo x >> "$repo/ship-pr/SKILL.md"
 expect "launch runs the preflight on the box and refuses a dirty served tree" 1 "LAUNCH REFUSED testbox/w1: PREFLIGHT REFUSED testbox: 1 local change(s) in the served tree" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
@@ -508,7 +544,7 @@ printf 'a different brief\n' > "$TMP/brief2.md"
 expect "a finished worker's name is not reused silently" 1 "finished worker's record is here" -- \
   "$FW" launch testbox w1 --kind claude --brief "$TMP/brief2.md" --cwd "$proj-worktrees/w1"
 [ "$(cat "$ISSUE_WAVE_STATE/workers/w1/brief.md")" = "$(cat "$brief")" ] && ok "a refused launch leaves the recorded brief untouched" || ko "refused launch overwrote brief.md"
-ls "$ISSUE_WAVE_STATE/incoming/" 2>/dev/null | grep -q '^w1-' && ko "refused launch left its staged brief behind" || ok "refused launch cleans up its staged brief"
+grep -q '^w1-' <<<"$(ls "$ISSUE_WAVE_STATE/incoming/" 2>/dev/null)" && ko "refused launch left its staged brief behind" || ok "refused launch cleans up its staged brief"
 git -C "$proj-worktrees/w1" checkout -q -b other
 expect "a reused worktree on another branch refuses" 1 "exists but is on 'other', not claude/w1" -- \
   "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
@@ -538,7 +574,7 @@ arch=$(printf '%s' "$out" | sed -n 's/.* replaced=//p')
 "$FW" attach testbox w1 --interval 1 >/dev/null
 expect "ls lists local workers with state" 0 "testbox/w1 EXITED(0) kind=claude" -- "$FW" ls testbox
 out=$(FLEET_BOXES="testbox" "$FW" ls 2>&1)
-[ "$(printf '%s\n' "$out" | grep -c '/w1 ')" -eq 1 ] && printf '%s' "$out" | grep -q '^local/w1 ' && ok "default ls sweeps the fleet minus the local box, once" || ko "default ls: $out"
+[ "$(printf '%s\n' "$out" | grep -c '/w1 ')" -eq 1 ] && grep -q '^local/w1 ' <<<"$out" && ok "default ls sweeps the fleet minus the local box, once" || ko "default ls: $out"
 }
 
 section "failure verdicts" && {
@@ -618,7 +654,10 @@ printf 'SLEEP 5\n' > "$TMP/slow5.md"
 wait "$da" "$db"
 launched=$(cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -c '^LAUNCHED testbox/dup')
 [ "$launched" -eq 1 ] && ok "two overlapping launches of one name: exactly one LAUNCHED" || ko "overlapping launches: $launched LAUNCHED -- $(cat "$TMP/dup-a.out" "$TMP/dup-b.out")"
-cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -q 'another launch of this name is in progress\|already running' && ok "the other was refused by the lock or the liveness guard" || ko "no refusal for the overlapping launch"
+# Three guards can refuse the loser, depending on where the winner is when the loser arrives: the
+# name lock, the liveness guard, or -- once the winner has published its record and its CLI is up --
+# the worktree ownership check. Each is a refusal; which one fires is timing.
+grep -q 'another launch of this name is in progress\|already running\|already owned by live worker' "$TMP/dup-a.out" "$TMP/dup-b.out" && ok "the other was refused by the lock, the liveness guard or ownership" || ko "no refusal for the overlapping launch -- $(cat "$TMP/dup-a.out" "$TMP/dup-b.out")"
 [ -d "$ISSUE_WAVE_STATE/locks/dup" ] && ko "launch lock left behind" || ok "launch lock released"
 "$FW" attach testbox dup --interval 1 >/dev/null   # dup shares $proj; a live owner would refuse q
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo 999999 > "$ISSUE_WAVE_STATE/locks/q/pid"
@@ -665,7 +704,7 @@ expect "...and allowed once that worker has finished" 0 "LAUNCHED testbox/own-b"
 wait "$rx" "$ry"
 n=$(cat "$TMP/rx.out" "$TMP/ry.out" | grep -c '^LAUNCHED ')
 [ "$n" -eq 1 ] && ok "two concurrent launches under different names on one worktree: exactly one LAUNCHED" || ko "worktree race: $n LAUNCHED -- $(cat "$TMP/rx.out" "$TMP/ry.out")"
-cat "$TMP/rx.out" "$TMP/ry.out" | grep -q 'already owned by live worker' && ok "the other was refused by ownership" || ko "no ownership refusal: $(cat "$TMP/rx.out" "$TMP/ry.out")"
+grep -q 'already owned by live worker' "$TMP/rx.out" "$TMP/ry.out" && ok "the other was refused by ownership" || ko "no ownership refusal: $(cat "$TMP/rx.out" "$TMP/ry.out")"
 [ -d "$ISSUE_WAVE_STATE/launch.lock" ] && ko "box-wide launch lock left behind" || ok "box-wide launch lock released"
 for w in race-x race-y; do "$FW" unstick testbox $w --message "$TMP/msg.md" --kill >/dev/null 2>&1; "$FW" attach testbox $w --interval 1 >/dev/null 2>&1; done
 "$FW" launch testbox hold --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
@@ -687,7 +726,7 @@ expect "...and the previous worker still reads as done" 0 "EXITED(0) testbox/tf"
 expect "a stalling project fetch is bounded and refused before any record is touched" 1 "git fetch in .* timed out after 2s" -- \
   env SHIM_GIT_HANG_FETCH=1 FLEET_FETCH_TIMEOUT=2 "$FW" launch testbox fh --kind claude --brief "$brief" --repo "$proj" --branch claude/fh
 [ -d "$ISSUE_WAVE_STATE/workers/fh" ] && ko "a refused fetch left a record" || ok "no record left by the refused fetch"
-ls "$ISSUE_WAVE_STATE/incoming/" 2>/dev/null | grep -q '^fh-' && ko "a refused fetch left a staged brief" || ok "no staged brief left by the refused fetch"
+grep -q '^fh-' <<<"$(ls "$ISSUE_WAVE_STATE/incoming/" 2>/dev/null)" && ko "a refused fetch left a staged brief" || ok "no staged brief left by the refused fetch"
 }
 
 section "codex workers" && {
@@ -744,7 +783,7 @@ expect "unstick validates the name before writing anything" 2 "unstick: name mus
 expect "status validates the name" 2 "status: name must be" -- "$FW" status testbox "a b"
 expect "without FLEET_LOCAL_BOX an unrecognized host is local only to 'local'" 0 "EXITED(0) local/w1" -- env -u FLEET_LOCAL_BOX "$FW" status local w1
 out=$(env -u FLEET_LOCAL_BOX "$FW" status testbox w1 2>&1); rc=$?
-[ "$rc" -eq 4 ] && printf '%s' "$out" | grep -q "UNREACHABLE testbox" && ok "...and a named box that is not this host goes over ssh (unreachable here)" || ko "named box without local mapping: rc=$rc $out"
+[ "$rc" -eq 4 ] && grep -q "UNREACHABLE testbox" <<<"$out" && ok "...and a named box that is not this host goes over ssh (unreachable here)" || ko "named box without local mapping: rc=$rc $out"
 me=$(hostname -s | tr 'A-Z' 'a-z')
 expect "FLEET_HOSTNAME_MAP maps this host to a fleet name (glob, first match wins)" 0 "EXITED(0) testbox/w1" -- env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=other ${me%?}*=testbox *=wrong" "$FW" status testbox w1
 expect "...and a map that does not match leaves the host unnamed" 4 "UNREACHABLE testbox" -- env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=testbox" "$FW" status testbox w1

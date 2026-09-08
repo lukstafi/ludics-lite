@@ -283,13 +283,24 @@ A Claude finisher has its own stall shape: `claude -p` ends its turn on "watch i
 and the turn's end kills the watch - the finisher brief says to WAIT on `pr-review.sh watch` and
 `merge --wait` inside the turn, and an `unstick` with that sentence recovered it once.
 
-**Cross-box legs need cross-box ssh.** The brief tells a GPU-box worker to drive the other GPU box
-over ssh for a one-off leg; on 2026-09-04 minix had no credential for rog and the CUDA arm of
-ahrefs/ocannl#892 went unmeasured (lukstafi/ludics-lite#57). Until the preflight probes it,
-check the path the WORKER will use, from its home box, not from the coordinator's:
-`ssh <home-box> 'ssh -o BatchMode=yes <other-box> exit 0'`, or plain
-`ssh -o BatchMode=yes <other-box> exit 0` when the home box is the coordinator's own machine
-(the same local/remote split `run_on` makes) - before briefing such a leg.
+**Cross-box legs need cross-box ssh, and the fleet has it.** The brief tells a GPU-box worker
+to drive the other GPU box over ssh for a one-off leg; on 2026-09-04 minix had no credential for
+rog and the CUDA arm of ahrefs/ocannl#892 went unmeasured (lukstafi/ludics-lite#57). Since
+2026-09-08 every box reaches the other two non-interactively: each has its own `~/.ssh/id_ed25519`
+(rog's existing one, minix's minted for this), its public key sits in the other boxes'
+`authorized_keys` (the Mac's included, Remote Login being on), and `~/.ssh/config` on the boxes
+carries `rog-nv-wsl` / `minix-amd-wsl` / `mac-studio` aliases over Tailscale MagicDNS with that
+key, so the same names work from every box. `fleet-worker.sh preflight` probes it on every
+launch: `ssh -o BatchMode=yes <sibling> exit 0` from the box to each fleet sibling (the
+`FLEET_BOXES` roster minus the box itself), refusing on a missing credential (`Permission
+denied`, an unverifiable host key) and only noting a sibling that does not answer - that one is
+asleep or off the network, which `wake-lab.sh` owns, and a worker whose task has no leg there
+still launches; `--no-cross` skips the probe, and `FLEET_CROSS_TIMEOUT` (20 s) bounds each one.
+A new box joins in both directions: mint its key and append the public key to every existing
+box's `authorized_keys`; append every existing box's public key to ITS `authorized_keys`; add
+the aliases for the others on it AND its own alias on each existing box; then run the preflight
+on the new box and on each existing one, since a box's preflight checks only its outbound
+reach.
 
 Mechanics that differ from Claude workers:
 
