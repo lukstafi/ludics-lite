@@ -9,9 +9,11 @@
 # Usage:
 #   wake-lab.sh [rog|minix|asus|all]      wake (default targets: rog minix)
 #   wake-lab.sh --wait [--wsl] rog        wake, then poll until ssh answers (--wsl: also start WSL)
+#   wake-lab.sh --wait --restart-wsl rog  ...and start WSL from a FRESH VM (wsl --shutdown first)
 #   wake-lab.sh status [box...]           per-box power/reachability table
 #   wake-lab.sh sleep|hibernate|down box  suspend / hibernate / full shutdown
 #   wake-lab.sh kick-wsl box              start the WSL VM (it never autostarts at boot)
+#   wake-lab.sh restart-wsl box           shut the WSL VM down and start it again (see the lore)
 #   wake-lab.sh --list                    dump the router's host table
 #
 # Tracked in the ludics-lite repository as scripts/wake-lab.sh and meant to be reached through a
@@ -57,11 +59,29 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 # * WSL never autostarts at boot, so a box coming up from power-down always needs kick_wsl. A box
 #   resuming from sleep/hibernate with the user's GUI WSL shell still open (the usual cycle) keeps
 #   its VM across the resume — verified on minix 2026-09-01: same boot id, -wsl answering seconds
-#   after the wake with no kick; the kick is then a harmless no-op.
+#   after the wake with no kick; the kick is then a harmless no-op. But a VM kept alive across a
+#   host resume can carry a DEGRADED dxg bridge (the WSL2 GPU paravirtualization both CUDA and HIP
+#   ride on): on 2026-09-05 minix's VM had survived two resumes, and its bridge then refused under
+#   load — `misc dxg: dxgvmb_send_sync_msg: vmbus_sendpacket failed: fffffff5` (-EAGAIN) whenever
+#   more than about two processes held the GPU — while every standalone probe passed, so the
+#   sweep's hip unit went red twice on a "working" device (ludics-lite#60). `restart-wsl` (and
+#   `--wait --restart-wsl`) issues `wsl --shutdown` on the Windows host before the start, which is
+#   a fresh VM for ~a minute's cost; on a cold-booted box the shutdown is a no-op. The sweep uses
+#   it before its GPU units. Nothing inside the VM can issue that restart without killing its own
+#   session, which is why it lives here, on the -win side.
+# * Under WSL2, /dev/kfd and /dev/dri are never present and `rocm-smi` always says "driver not
+#   initialized (amdgpu not found in modules)"; none of that is evidence of a lost passthrough,
+#   and a "check the device nodes" step in the WSL path would report the box broken every time.
+#   `hipGetDeviceCount` (or `rocminfo` listing the gfx agent) is the evidence. And a stale-but-
+#   alive VM is NOT detectable by a single-process probe: hipGetDeviceCount, hiprtc and a kernel
+#   launch all pass on it. The only signals are the guest's `dmesg | grep -c 'misc dxg'` growing
+#   under a few concurrent GPU processes, or the `hv_utils: TimeSync IC version` renegotiation
+#   lines since boot, one per host resume. That is why the fix is a restart, not a probe.
 # * A kicked VM on a cold-booted box does not necessarily STAY up: on 2026-09-01, twice in a row,
 #   `--wait --wsl` reported both -wsl UP yet both VMs were gone ~4 minutes later (`status`:
-#   win=UP, wsl=--). Use the VM promptly after the kick; once an ssh session is running inside it,
-#   it stays up. `kick-wsl` re-kicks a box whose Windows side is up.
+#   win=UP, wsl=--). Use the VM promptly after the kick — and after a restart, whose VM is that
+#   same freshly kicked one; once an ssh session is running inside it, it stays up. `kick-wsl`
+#   re-kicks a box whose Windows side is up.
 # * WSL needs no interactive Windows login: the ssh network logon is session enough (verified
 #   with the console logged off). A `console` entry in `query session` after a cold boot comes
 #   from Windows' Automatic Restart Sign-On, not from a human having logged in.
@@ -265,24 +285,45 @@ wake() { # wake <box>
   [ "$ok" = 1 ]
 }
 
-kick_wsl() { # kick_wsl <box> — WSL never autostarts at boot, and hibernate terminates the VM.
+kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibernate terminates the VM.
   # The -lan and -win aliases land in the same Windows sshd, and after a cold boot the LAN one
   # answers within seconds while tailscaled takes a minute or more (the same asymmetry is_up() is
   # built on). A kick that knew only the Tailscale alias therefore failed on exactly the wake
   # wait_for had just declared finished, and the WSL poll behind it could only time out. Try the
   # fast path first, fall back to Tailscale, and say which one carried it.
-  local name=$1 dest
+  #
+  # With `fresh`, `wsl --shutdown` goes first over the same alias: a VM that survived a host
+  # resume can carry a degraded dxg bridge (see the lore), and the only cure is a new VM. The
+  # shutdown lands on the Windows host, never inside the VM, so it cannot kill the session issuing
+  # it. A start that then fails falls through to the next alias, shutdown included, which is a
+  # natural retry of the whole restart rather than a start on a VM only half torn down.
+  #
+  # On failure KICK_PHASE says which phase failed, because the two mean opposite things to the
+  # operator: `shutdown` — no alias carried the shutdown, so a -wsl guest that still answers is
+  # the OLD VM; `start` — the shutdown went through and the start then failed everywhere, so
+  # there is no VM at all until a kick succeeds; `kick` — the plain kick's start failed.
+  local name=$1 fresh=${2:-} dest what=kick shut=0
+  [ "$fresh" = fresh ] && what=restart
   for dest in $(lan_of "$name") $(ts_of "$name"); do
     [ -n "$dest" ] || continue
     # An ssh network logon is session enough: this works with nobody logged in at the console.
+    if [ "$fresh" = fresh ]; then
+      ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" 'wsl.exe --shutdown' >/dev/null 2>&1 || continue
+      echo "  wsl shut down on $name (via $dest)"
+      shut=1
+    fi
     if ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" 'wsl.exe -d Ubuntu -e true' >/dev/null 2>&1; then
       echo "  wsl started on $name (via $dest)"
       return 0
     fi
   done
-  echo "  wsl kick FAILED on $name (no Windows endpoint answered)"
+  if [ "$fresh" = fresh ] && [ "$shut" = 0 ]; then KICK_PHASE=shutdown
+  elif [ "$fresh" = fresh ]; then KICK_PHASE=start
+  else KICK_PHASE=kick; fi
+  echo "  wsl $what FAILED on $name (no Windows endpoint answered the $KICK_PHASE)"
   return 1
 }
+KICK_PHASE=""
 
 # `SetSuspendState` drops the connection mid-command; without ServerAlive* the ssh client can hang
 # for minutes instead of returning. The drop IS the success signature — do not treat it as an error,
@@ -333,6 +374,54 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
   done
 }
 
+# start_wsl <box...> — kick (or, with FRESH_WSL, restart) WSL on each box, then poll only the boxes
+# whose kick_wsl succeeded. Its status is the whole step's: 0 only when every box's command
+# succeeded AND every started guest answered within the poll budget. The restart's success is
+# never the guest's liveness: a `wsl --shutdown` that failed on both Windows aliases leaves the
+# STALE guest answering, and polling it would print `wsl up` over exactly the degraded VM the
+# restart exists to replace — and the sweep reads that line as permission to proceed. Nor is a
+# guest that never answered a success: `wsl still down` is a backend the sweep cannot test. So
+# `wsl up` is never printed alongside a failure, every failure names its boxes and its phase —
+# the poll's aggregate verdict is re-probed per box, so one late guest does not label its
+# neighbour untestable, and a refused shutdown (the old VM still answers) is told apart from a
+# start that failed after the shutdown went through (no VM at all) — and every one of them
+# reaches the wake path's final verdict through WSL_FAILED, so `all up` cannot paper over it.
+WSL_FAILED=""
+start_wsl() {
+  local n what=kick started=() unshut=() unstarted=() up=() down=() rc=0 line
+  [ "$FRESH_WSL" = fresh ] && what=restart
+  for n in "$@"; do
+    if kick_wsl "$n" "$FRESH_WSL"; then started+=("$n")
+    elif [ "$KICK_PHASE" = shutdown ]; then unshut+=("$n")
+    else unstarted+=("$n"); fi
+  done
+  # bash 3.2 under set -u: an empty array cannot be expanded, hence the count guards.
+  if [ ${#started[@]} -gt 0 ]; then
+    if wait_for_wsl "${started[@]}"; then up=("${started[@]}")
+    else for n in "${started[@]}"; do
+      if ssh_probe "$(wsl_of "$n")"; then up+=("$n"); else down+=("$n"); fi
+    done; fi
+  fi
+  WSL_FAILED=""
+  if [ ${#up[@]} -gt 0 ]; then
+    if [ ${#up[@]} -eq $# ]; then echo "wsl up"; else echo "wsl up on: ${up[*]}"; fi
+  fi
+  if [ ${#down[@]} -gt 0 ]; then
+    line="wsl still down after $((WSL_WAIT_SECONDS / 60)) min on: ${down[*]}"
+    echo "$line"; WSL_FAILED="$line"; rc=1
+  fi
+  if [ ${#unshut[@]} -gt 0 ]; then
+    line="wsl $what FAILED on: ${unshut[*]} (shutdown refused on every alias: a -wsl guest that still answers there is the old VM)"
+    echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
+  fi
+  if [ ${#unstarted[@]} -gt 0 ]; then
+    if [ "$what" = restart ]; then line="wsl $what FAILED on: ${unstarted[*]} (shut down, then the start failed on every alias: no VM there until a kick succeeds)"
+    else line="wsl $what FAILED on: ${unstarted[*]} (the start failed on every alias)"; fi
+    echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
+  fi
+  return $rc
+}
+
 wait_for_wsl() { # wait_for_wsl <box...> — tailscaled inside WSL can take >2 min after a resume
   local names=("$@") n w all deadline=$((SECONDS + WSL_WAIT_SECONDS))
   while :; do
@@ -352,11 +441,13 @@ wait_for_wsl() { # wait_for_wsl <box...> — tailscaled inside WSL can take >2 m
 # ---------------------------------------------------------------- dispatch
 WAIT=0
 WANT_WSL=0
+FRESH_WSL=""   # "fresh" makes kick_wsl shut the VM down first; --wsl alone never kills a live VM
 VERB=wake
 TARGETS=()
 
 case "${1:-}" in
   status|sleep|hibernate|down|kick-wsl) VERB=$1; shift ;;
+  restart-wsl) VERB=kick-wsl; FRESH_WSL=fresh; shift ;;
 esac
 
 for arg in "$@"; do
@@ -364,6 +455,7 @@ for arg in "$@"; do
     --list) list_hosts; exit 0 ;;
     --wait) WAIT=1 ;;
     --wsl)  WANT_WSL=1 ;;
+    --restart-wsl) WANT_WSL=1; FRESH_WSL=fresh ;;
     -h|--help) usage; exit 0 ;;
     all) TARGETS+=(rog minix asus) ;;
     *) TARGETS+=("$arg") ;;
@@ -381,9 +473,7 @@ case "$VERB" in
     do_status "${TARGETS[@]}"
     ;;
   kick-wsl)
-    for t in "${TARGETS[@]}"; do kick_wsl "$t"; done
-    wait_for_wsl "${TARGETS[@]}" && echo "wsl up" \
-      || echo "wsl still down after $((WSL_WAIT_SECONDS / 60)) min"
+    start_wsl "${TARGETS[@]}"; exit $?
     ;;
   sleep|hibernate|down)
     for t in "${TARGETS[@]}"; do power_action "$VERB" "$t"; done
@@ -398,23 +488,28 @@ case "$VERB" in
       # Partial success still deserves the WSL kick: one box failing to wake must not suppress
       # starting WSL on the box that did come up, or an unrelated dead machine silently costs a
       # backend's coverage.
+      wsl_rc=0
       if [ "$WANT_WSL" = 1 ]; then
         UP=()
         for t in "${TARGETS[@]}"; do is_up "$t" && UP+=("$t"); done
-        if [ ${#UP[@]} -gt 0 ]; then
-          for t in "${UP[@]}"; do kick_wsl "$t"; done
-          wait_for_wsl "${UP[@]}" && echo "wsl up" \
-            || echo "wsl still down after $((WSL_WAIT_SECONDS / 60)) min"
-        fi
+        [ ${#UP[@]} -gt 0 ] && { start_wsl "${UP[@]}" || wsl_rc=1; }
       fi
-      if [ "$rc" = 0 ]; then
+      # The final verdict is the wake's AND the WSL step's: `all up` over a failed restart would
+      # hand the sweep the degraded VM the restart exists to replace, so the WSL failure is
+      # restated as the LAST line, where the sweep routine reads its verdict, and the exit
+      # status says so too.
+      if [ "$rc" = 0 ] && [ "$wsl_rc" = 0 ]; then
         echo "all up"
       else
-        for t in "${TARGETS[@]}"; do is_up "$t" || echo "did NOT wake: $t"; done
-        echo "Check BIOS Wake-on-LAN / 'Power Up' (minix needed the SECOND setup screen, not"
-        echo "Advanced), then run scripts/enable-wol-windows.ps1 from an elevated Windows"
-        echo "PowerShell to disable Fast Startup and re-arm the NIC. Check '$0 status' after the"
-        echo "router lease settles; asus is Wi-Fi only and cannot be woken."
+        if [ "$rc" != 0 ]; then
+          for t in "${TARGETS[@]}"; do is_up "$t" || echo "did NOT wake: $t"; done
+          echo "Check BIOS Wake-on-LAN / 'Power Up' (minix needed the SECOND setup screen, not"
+          echo "Advanced), then run scripts/enable-wol-windows.ps1 from an elevated Windows"
+          echo "PowerShell to disable Fast Startup and re-arm the NIC. Check '$0 status' after the"
+          echo "router lease settles; asus is Wi-Fi only and cannot be woken."
+        fi
+        [ "$wsl_rc" != 0 ] && echo "NOT all up: $WSL_FAILED (see above)"
+        exit 1
       fi
     fi
     ;;

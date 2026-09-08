@@ -161,6 +161,21 @@ test_idle_dirty_says_conflicts_not_next_move() {
   assert_contains "$CMD_OUT" "$CONFLICT" "cmd_status should print the conflict"
 }
 
+test_idle_draft_names_gh_pr_ready() {
+  idle_fixture
+  MERGEABLE_STATE=draft
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "a draft is not a review state: the head is still reviewed"
+  assert_eq "$(state_merge "$STATE")" draft "the draft mergeability should ride on the state line"
+  assert_contains "$LINE" "DRAFT (mergeable_state=draft)" "an idle draft should say DRAFT"
+  assert_contains "$LINE" "gh pr ready" "the line should name the move that lands a draft"
+  assert_contains "$LINE" "--repo $REPO" \
+    "the command names the repository: a bare number cannot resolve it from a background shell"
+  assert_not_contains "$LINE" "the next move is yours" \
+    "a draft must not invite another push as the move that lands it"
+  assert_not_contains "$LINE" "CONFLICTS" "a draft is not a conflict"
+}
+
 test_reviewing_dirty_still_says_conflicts() {
   reset_fixture
   MERGEABLE_STATE=dirty
@@ -304,6 +319,7 @@ test_watch_approved_leaves_the_drift_to_merge() {
 tests=(
   test_idle_clean_says_next_move_is_yours
   test_idle_dirty_says_conflicts_not_next_move
+  test_idle_draft_names_gh_pr_ready
   test_reviewing_dirty_still_says_conflicts
   test_expected_dirty_says_conflicts
   test_approved_dirty_says_conflicts_and_survives_a_failed_pr_read
