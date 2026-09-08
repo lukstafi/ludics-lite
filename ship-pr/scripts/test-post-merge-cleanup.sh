@@ -3366,6 +3366,13 @@ test_merge_options_cleanup() {
 
 RUNNER="$SCRIPT_DIR/test-post-merge-cleanup.sh"
 SELF_CASE=test_missing_branch_config # an ordinary quick case: one repository, one helper call
+# The deadline a runner self-case gives its inner run of SELF_CASE when the case under test is
+# NOT the deadline itself: generous, because the inner case does real git work and the shared
+# macOS runner runs three of these copies beside the rest of the suite. At 5 s the inner case
+# timed out under load and the self-case then read the timeout's wording instead of the report it
+# was checking for -- red on main and on unrelated PRs (ludics-lite#68). Only the case that pins
+# the deadline firing keeps a short one.
+SELF_CASE_TIMEOUT=60
 
 # copy_runner <dir> <root-tag>: a scratch copy of the runner and the helper, its scratch root
 # template renamed so the copy's tree can be told from this run's and asserted gone afterwards.
@@ -3549,7 +3556,7 @@ test_runner_names_a_setup_case_failure() {
   grep -q '^  false # runner self-case: fail inside setup_case' "$copy/test-post-merge-cleanup.sh" ||
     fail "could not plant a failure inside the copy's setup_case"
 
-  if run_copy env SHIP_PR_TEST_CASE_TIMEOUT=5 "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null; then
+  if run_copy env SHIP_PR_TEST_CASE_TIMEOUT="$SELF_CASE_TIMEOUT" "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null; then
     rc=0
   else
     rc=$?
@@ -3580,7 +3587,7 @@ test_runner_reaps_a_statusless_case() {
   grep -q '^  : # runner self-case: deliberately omit' "$copy/test-post-merge-cleanup.sh" ||
     fail "could not remove the copy's case status trap"
 
-  if run_copy env SHIP_PR_TEST_CASE_TIMEOUT=5 "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null; then
+  if run_copy env SHIP_PR_TEST_CASE_TIMEOUT="$SELF_CASE_TIMEOUT" "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null; then
     rc=0
   else
     rc=$?
