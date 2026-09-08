@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# The preamble the pr-review.sh fixture suites (test-pr-review-*.sh) share. A suite sources it
+# right after `set -euo pipefail`, before defining anything of its own:
+#
+#   SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
+#   # shellcheck source=test-pr-review-lib.sh
+#   source "$SCRIPT_DIR/test-pr-review-lib.sh"
+#
+# Sourced, it exports the test environment and sources pr-review.sh in SHIP_PR_TEST_SOURCE_ONLY
+# mode, and then provides what every suite used to copy (ludics-lite#46):
+#
+#   bail <msg>                          the reporter: FAIL: <msg> on stderr, exit 1
+#   assert_eq <got> <want> <msg>        the assertion trio
+#   assert_contains <hay> <needle> <msg>
+#   assert_not_contains <hay> <needle> <msg>
+#   test_tmpdir <var> <label>           a throwaway directory in <var>, removed at exit — this
+#                                       file owns the EXIT trap (pr-review.sh installs one of its
+#                                       own when sourced, which the suites used to re-install by
+#                                       hand), so a suite never touches `trap`
+#   gh_fixture_parse "$@"               inside a fixture `gh`: refuses anything but `gh api`,
+#   gh_fixture_answer <response>        sets FIXTURE_ENDPOINT / FIXTURE_FILTER / FIXTURE_PAGINATE,
+#                                       logs the endpoint to $REQUEST_LOG (and, when paginated,
+#                                       $PAGINATE_LOG) if the suite set them; the answer goes
+#                                       through the --jq filter the call carried, if any
+#   stub <fn>...                        declares the library functions this suite redefines on
+#                                       purpose (the merge suite's build_checks, run_signal and
+#                                       warn_base_drift)
+#   run_tests <case>...                 the guard below, then each case with a PASS line
+#
+# The guard is why the file exists. pr-review.sh defines some sixty top-level functions, every
+# one in scope in every suite the moment it is sourced, and a suite helper that happens to share
+# a name silently replaces the library's: a reporter named `fail` turned every refusal of the
+# script under test into the reporter's exit 1 (ludics-lite#39, then #45 in three more suites),
+# and a collision on `newest` or `age_of` would produce wrong test RESULTS instead, with nothing
+# shouting. Shellcheck is silent about it at every severity. So the function table is snapshotted
+# here — name, line and defining file for everything pr-review.sh and this file define — and
+# `run_tests` reads it again before the first case: a protected function that is no longer the
+# one its file defined is REFUSED (exit 2, naming the function, its owner and where the suite
+# redefined it) unless the suite declared it with `stub`; and a `stub` that names a function the
+# suite never redefined is refused too, so the declarations stay honest. A suite's fixture `gh`
+# is outside the guard's scope on purpose: it shadows a command, not a function of the library.
+#
+# Executed rather than sourced, this file runs its own controls: throwaway suites that source it
+# and, respectively, redefine an undeclared library function (the ludics-lite#46 shape itself,
+# a reporter named `fail`), declare a stub and honour it, declare one and do not, stub a name the
+# library lacks, redefine one of this file's own helpers, and define a function before sourcing.
+# The negative controls are what prove the guard can fail; CI runs it beside the five suites.
+
+TEST_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+TEST_LIB_FILE="$TEST_LIB_DIR/$(basename "${BASH_SOURCE[0]}")"
+HELPER="$TEST_LIB_DIR/pr-review.sh"
+
+# Everything a suite defines must come AFTER this file: a function defined before pr-review.sh
+# is sourced is replaced by the library's same-named one (the shadow in the other direction),
+# and the snapshot below could not tell.
+lib_predefined=$(declare -F | sed 's/^declare -f //' | tr '\n' ' ')
+if [ -n "$lib_predefined" ]; then
+  echo "test-pr-review-lib.sh: REFUSING to run: the suite defined functions before sourcing this file (${lib_predefined% }); source it first, so the shadow guard sees every definition" >&2
+  exit 2
+fi
+unset lib_predefined
+
+export SHIP_PR_TEST_SOURCE_ONLY=1
+export SHIP_PR_STATE_DIR=off
+export SHIP_PR_API_ATTEMPTS=1
+export SHIP_PR_API_BACKOFF=0
+# shellcheck source=pr-review.sh
+source "$HELPER"
+
+# --- the reporter and the assertions ----------------------------------------------------------
+# Not `fail`: that is pr-review.sh's, and its refusals' exit codes are what the suites read.
+bail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+assert_eq() {
+  [ "$1" = "$2" ] || bail "$3 (got '$1', expected '$2')"
+}
+
+assert_contains() {
+  case "$1" in *"$2"*) ;; *) bail "$3 (missing '$2' in: $1)" ;; esac
+}
+
+assert_not_contains() {
+  case "$1" in *"$2"*) bail "$3 (unexpected '$2' in: $1)" ;; *) ;; esac
+}
+
+# --- temporary paths and the one EXIT trap ----------------------------------------------------
+# pr-review.sh's trap removes GH_ERR_FILE; sourcing it replaced whatever trap the suite had. This
+# one does both jobs, and the suite registers its scratch space through test_tmpdir instead of
+# installing a trap of its own. Only paths mktemp created are ever removed.
+TEST_CLEANUP=()
+test_cleanup() {
+  rm -f "$GH_ERR_FILE"
+  local p
+  # bash 3.2 under `set -u` rejects "${TEST_CLEANUP[@]}" while it is empty.
+  [ "${#TEST_CLEANUP[@]}" -eq 0 ] || for p in "${TEST_CLEANUP[@]}"; do rm -rf "$p"; done
+}
+trap test_cleanup EXIT
+
+# test_tmpdir <var> <label>: a fresh directory under TMPDIR, its path in <var>. A function, not a
+# `$(...)`, because the registration must reach this shell, and a command substitution's does not.
+test_tmpdir() {
+  local dir
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/pr-review-$2.XXXXXX") || bail "mktemp -d failed for $2"
+  TEST_CLEANUP+=("$dir")
+  printf -v "$1" '%s' "$dir"
+}
+
+# --- the fixture gh's argument parsing --------------------------------------------------------
+FIXTURE_ENDPOINT=""
+FIXTURE_FILTER=""
+FIXTURE_PAGINATE=""
+
+gh_fixture_parse() {
+  local arg
+  FIXTURE_ENDPOINT=""
+  FIXTURE_FILTER=""
+  FIXTURE_PAGINATE=""
+  [ "${1:-}" = api ] || bail "fixture received non-api gh call: $*"
+  shift
+  while [ $# -gt 0 ]; do
+    arg="$1"
+    shift
+    case "$arg" in
+    --jq)
+      FIXTURE_FILTER="${1:-}"
+      shift || true
+      ;;
+    --paginate) FIXTURE_PAGINATE=1 ;;
+    -*) ;;
+    *) [ -n "$FIXTURE_ENDPOINT" ] || FIXTURE_ENDPOINT="$arg" ;;
+    esac
+  done
+  [ -z "${REQUEST_LOG:-}" ] || printf '%s\n' "$FIXTURE_ENDPOINT" >>"$REQUEST_LOG"
+  [ -z "$FIXTURE_PAGINATE" ] || [ -z "${PAGINATE_LOG:-}" ] ||
+    printf '%s\n' "$FIXTURE_ENDPOINT" >>"$PAGINATE_LOG"
+}
+
+gh_fixture_answer() {
+  if [ -n "$FIXTURE_FILTER" ]; then
+    jq -r "$FIXTURE_FILTER" <<<"$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# --- the stub declarations and the shadow guard -----------------------------------------------
+# `declare -F <names>` under extdebug prints "<name> <line> <file>" per function; the option is
+# set in a subshell so its debugger side effects (function and error tracing) touch nothing else.
+lib_function_table() {
+  local names
+  names=$(declare -F | sed 's/^declare -f //')
+  # shellcheck disable=SC2086 # the names are one word each, and the point is to split them
+  (shopt -s extdebug && declare -F $names) || true
+}
+
+# lib_owner_of <name> <table>: the "<line> <file>" the table records for <name>, empty if none.
+lib_owner_of() {
+  printf '%s\n' "$2" | awk -v n="$1" '$1 == n { sub(/^[^ ]+ /, ""); print; exit }'
+}
+
+# The names below this point are not protected: the snapshot is taken once everything this file
+# defines exists, at the end of the sourced part.
+STUBS=""
+
+# stub <fn>...: the suite redefines these on purpose. A name the library lacks is a typo, and a
+# declaration never honoured is refused by the guard.
+stub() {
+  local fn
+  [ $# -gt 0 ] || bail "stub: no function named"
+  for fn in "$@"; do
+    [ -n "$(lib_owner_of "$fn" "$LIB_SNAPSHOT")" ] ||
+      bail "stub $fn: neither pr-review.sh nor test-pr-review-lib.sh defines $fn — nothing to stub"
+    STUBS="$STUBS $fn "
+  done
+}
+
+lib_declared_stub() { case "$STUBS" in *" $1 "*) ;; *) return 1 ;; esac; }
+
+# A path as the suite's reader would write it: the library files by basename, the suite as it was
+# invoked (which is what `declare -F` records).
+lib_show_file() {
+  case "$1" in
+  "$HELPER" | "$TEST_LIB_FILE") basename "$1" ;;
+  *) printf '%s' "$1" ;;
+  esac
+}
+
+check_shadows() {
+  local table name owner now file line owner_file owner_line problems=""
+  table=$(lib_function_table)
+  while read -r name owner_line owner_file; do
+    [ -n "$name" ] || continue
+    now=$(lib_owner_of "$name" "$table")
+    if [ "$now" = "$owner_line $owner_file" ]; then
+      ! lib_declared_stub "$name" ||
+        problems="$problems
+  - stub $name is declared, but $name is still $(lib_show_file "$owner_file")'s: drop the declaration or define the stub"
+      continue
+    fi
+    lib_declared_stub "$name" && continue
+    line=${now%% *}
+    file=${now#* }
+    problems="$problems
+  - $(lib_show_file "$owner_file")'s $name ($(lib_show_file "$owner_file"):$owner_line) is redefined at $(lib_show_file "$file"):$line without \`stub $name\`"
+  done <<<"$LIB_SNAPSHOT"
+  [ -z "$problems" ] || {
+    echo "test-pr-review-lib.sh: REFUSING to run the cases: a suite function replaces a library function it did not declare (ludics-lite#46) — a same-named helper silently takes over every call the library makes (a reporter named \`fail\` turns each refusal's exit code into 1); declare a deliberate override with \`stub <fn>\`, else rename the suite's function:$problems" >&2
+    exit 2
+  }
+}
+
+# run_tests <case>...: the guard, then the cases in order, each announced on stdout.
+run_tests() {
+  local test_name
+  check_shadows
+  [ $# -gt 0 ] || bail "run_tests: no cases named"
+  for test_name in "$@"; do
+    "$test_name"
+    echo "PASS: $test_name"
+  done
+}
+
+LIB_SNAPSHOT=$(lib_function_table)
+
+# --- executed: this file's own controls -------------------------------------------------------
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+set -euo pipefail
+
+test_tmpdir CONTROL_ROOT lib-test
+CONTROL_N=0
+
+# control <body...>: a throwaway suite that sources this file and runs a passing case, with the
+# given lines in between. Its exit code, stdout and stderr land in CONTROL_RC / _OUT / _ERR.
+control() {
+  local file rc
+  CONTROL_N=$((CONTROL_N + 1))
+  file="$CONTROL_ROOT/control-$CONTROL_N.sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    printf 'source %s\n' "\"$TEST_LIB_FILE\""
+    printf '%s\n' "$@"
+    echo 'test_a_case() { assert_eq 1 1 "one is one"; }'
+    echo 'run_tests test_a_case'
+  } >"$file"
+  set +e
+  bash "$file" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
+  rc=$?
+  set -e
+  CONTROL_RC="$rc"
+  CONTROL_OUT=$(cat "$CONTROL_ROOT/out")
+  CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
+  CONTROL_FILE="$file"
+}
+
+assert_refused() { # <msg>: the guard's refusal, with no case run
+  assert_eq "$CONTROL_RC" 2 "$1: a refusal is exit 2 ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "REFUSING" "$1: the refusal should say so"
+  assert_not_contains "$CONTROL_OUT" "PASS:" "$1: no case may run under a refusal"
+}
+
+# The ludics-lite#46 shape itself: a reporter named `fail`, which is pr-review.sh's refusal path.
+test_undeclared_shadow_is_refused() {
+  control 'fail() { echo "FAIL: $*" >&2; exit 1; }'
+  assert_refused "a suite-defined fail"
+  assert_contains "$CONTROL_ERR" "pr-review.sh's fail (pr-review.sh:" "the owner and its line should be named"
+  assert_contains "$CONTROL_ERR" "redefined at $CONTROL_FILE:4 without \`stub fail\`" \
+    "the suite's definition should be located and the remedy named"
+  assert_contains "$CONTROL_ERR" "ludics-lite#46" "the refusal should cite the trap"
+}
+
+# Every library function is protected, not a hand-picked list: a name that would corrupt results
+# rather than exit codes is caught the same way, and so are two at once.
+test_every_library_function_is_protected() {
+  control 'newest() { echo 0; }' 'age_of() { echo 0; }'
+  assert_refused "shadowed newest and age_of"
+  assert_contains "$CONTROL_ERR" "pr-review.sh's newest (" "newest should be named"
+  assert_contains "$CONTROL_ERR" "pr-review.sh's age_of (" "age_of should be named"
+  assert_eq "$(grep -c 'redefined at' <<<"$CONTROL_ERR")" 2 "both shadows in one refusal"
+}
+
+# A suite may not quietly replace this file's helpers either.
+test_lib_helpers_are_protected() {
+  control 'assert_eq() { :; }'
+  assert_refused "a redefined assert_eq"
+  assert_contains "$CONTROL_ERR" "test-pr-review-lib.sh's assert_eq (test-pr-review-lib.sh:" \
+    "the owner should be this file"
+}
+
+test_declared_stub_is_allowed() {
+  control 'stub newest' 'newest() { echo 0; }'
+  assert_eq "$CONTROL_RC" 0 "a declared stub runs ($CONTROL_ERR)"
+  assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
+  # The declaration may come after the definition too: the guard reads the table at run_tests.
+  control 'build_checks() { :; }' 'run_signal() { :; }' 'stub build_checks run_signal'
+  assert_eq "$CONTROL_RC" 0 "stubs declared after their definitions run ($CONTROL_ERR)"
+}
+
+test_stub_without_a_redefinition_is_refused() {
+  control 'stub newest'
+  assert_refused "a stub never honoured"
+  assert_contains "$CONTROL_ERR" "stub newest is declared, but newest is still pr-review.sh's" \
+    "the stale declaration should be named"
+}
+
+test_stub_of_an_unknown_name_is_refused() {
+  control 'stub no_such_function'
+  assert_eq "$CONTROL_RC" 1 "an unknown stub is the reporter's exit 1 ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "stub no_such_function: neither pr-review.sh nor test-pr-review-lib.sh defines no_such_function" \
+    "the unknown name should be named"
+  assert_not_contains "$CONTROL_OUT" "PASS:" "no case may run"
+}
+
+# The suite's own functions are its business: a fixture gh and helpers of any other name pass.
+test_own_functions_pass() {
+  control 'gh() { gh_fixture_parse "$@"; gh_fixture_answer "{}"; }' 'helper_of_my_own() { :; }'
+  assert_eq "$CONTROL_RC" 0 "a suite with only its own functions runs ($CONTROL_ERR)"
+  assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
+}
+
+test_definitions_before_sourcing_are_refused() {
+  local file
+  file="$CONTROL_ROOT/early.sh"
+  {
+    echo 'set -euo pipefail'
+    echo 'early() { :; }'
+    printf 'source %s\n' "\"$TEST_LIB_FILE\""
+    echo 'run_tests early'
+  } >"$file"
+  set +e
+  bash "$file" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
+  CONTROL_RC=$?
+  set -e
+  CONTROL_OUT=$(cat "$CONTROL_ROOT/out")
+  CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
+  assert_refused "a function defined before the source"
+  assert_contains "$CONTROL_ERR" "defined functions before sourcing this file (early)" \
+    "the early definition should be named"
+}
+
+# The parser the api-only suites share, pinned once: the endpoint, the filter, the pagination
+# flag, and the two logs.
+test_gh_fixture_parse() {
+  local log="$CONTROL_ROOT/req" plog="$CONTROL_ROOT/pag" out
+  REQUEST_LOG="$log"
+  PAGINATE_LOG="$plog"
+  : >"$log"
+  : >"$plog"
+  gh_fixture_parse api --paginate repos/o/n/thing --jq '.a' -X GET
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "the first non-option argument is the endpoint"
+  assert_eq "$FIXTURE_FILTER" .a "the --jq filter is kept"
+  assert_eq "$FIXTURE_PAGINATE" 1 "--paginate is noted"
+  assert_eq "$(cat "$log")" repos/o/n/thing "the endpoint is logged"
+  assert_eq "$(cat "$plog")" repos/o/n/thing "a paginated read is logged as such"
+  out=$(gh_fixture_answer '{"a":"x"}')
+  assert_eq "$out" x "the answer goes through the filter"
+  gh_fixture_parse api repos/o/n/other
+  assert_eq "$FIXTURE_FILTER" "" "no filter without --jq"
+  assert_eq "$FIXTURE_PAGINATE" "" "not paginated without the flag"
+  assert_eq "$(cat "$plog")" repos/o/n/thing "an unpaginated read is not logged as paginated"
+  out=$(gh_fixture_answer '{"a":"x"}')
+  assert_eq "$out" '{"a":"x"}' "the raw answer without a filter"
+  set +e
+  out=$(gh_fixture_parse pr merge 2>&1)
+  assert_eq "$?" 1 "a non-api call is refused"
+  set -e
+  assert_contains "$out" "fixture received non-api gh call: pr merge" "the call should be quoted"
+  REQUEST_LOG=""
+  PAGINATE_LOG=""
+}
+
+tests=(
+  test_undeclared_shadow_is_refused
+  test_every_library_function_is_protected
+  test_lib_helpers_are_protected
+  test_declared_stub_is_allowed
+  test_stub_without_a_redefinition_is_refused
+  test_stub_of_an_unknown_name_is_refused
+  test_own_functions_pass
+  test_definitions_before_sourcing_are_refused
+  test_gh_fixture_parse
+)
+
+run_tests "${tests[@]}"

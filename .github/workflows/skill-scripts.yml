@@ -1,7 +1,7 @@
 name: skill scripts
 
 # The shell behind the skills: syntax, shellcheck, the parse guard the cleanup scripts carry,
-# and the eight test suites, on the two platforms the fleet runs (bash 3.2 on macOS is the
+# and the nine test suites, on the two platforms the fleet runs (bash 3.2 on macOS is the
 # reason macOS is not optional). Every push and pull request runs it, without path filters, so
 # `pr-review.sh merge` always finds a verdict on the head commit rather than ABSENT
 # (ludics-lite#21).
@@ -79,6 +79,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+      - name: Exercise the suites' shared preamble and its shadow guard
+        # The negative controls first: a suite that redefines a pr-review.sh function without
+        # declaring it must be refused, or the five suites below prove less than they print.
+        run: ship-pr/scripts/test-pr-review-lib.sh
       - name: Exercise the merge-time base-drift intersection
         run: ship-pr/scripts/test-pr-review-base-drift.sh
       - name: Exercise the build gate's absent-vs-not-yet split

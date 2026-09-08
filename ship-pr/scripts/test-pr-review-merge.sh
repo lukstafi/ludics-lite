@@ -6,42 +6,22 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
-HELPER="$SCRIPT_DIR/pr-review.sh"
-
-export SHIP_PR_TEST_SOURCE_ONLY=1
-export SHIP_PR_STATE_DIR=off
-export SHIP_PR_API_ATTEMPTS=1
-export SHIP_PR_API_BACKOFF=0
-# shellcheck source=pr-review.sh
-source "$HELPER"
+# shellcheck source=test-pr-review-lib.sh
+source "$SCRIPT_DIR/test-pr-review-lib.sh"
 
 REPO=example/repo
-
-# Not `fail`: pr-review.sh is sourced above and its refusals call ITS fail, whose exit code the
-# merge tests read; a same-named helper here would turn every refusal into this reporter's 1.
-bail() {
-  echo "FAIL: $*" >&2
-  exit 1
-}
-
-assert_eq() {
-  [ "$1" = "$2" ] || bail "$3 (got '$1', expected '$2')"
-}
-
-assert_contains() {
-  case "$1" in *"$2"*) ;; *) bail "$3 (missing '$2' in: $1)" ;; esac
-}
-
-OUT_FILE=$(mktemp "${TMPDIR:-/tmp}/pr-review-merge-out.XXXXXX") || exit 1
-CALLS_FILE=$(mktemp "${TMPDIR:-/tmp}/pr-review-merge-calls.XXXXXX") || exit 1
-# pr-review.sh installed its own EXIT trap when sourced; keep its cleanup and add these files'.
-trap 'rm -f "$GH_ERR_FILE" "$OUT_FILE" "$CALLS_FILE"' EXIT
+test_tmpdir TEST_ROOT merge-test
+OUT_FILE="$TEST_ROOT/out"
+CALLS_FILE="$TEST_ROOT/calls"
 
 SKIPS_ONLY=""                          # the head's checks all skipped/neutral
 MERGE_STATE="merged=true state=MERGED" # what REST says after the merge call
 MERGE_QUEUE=""                         # nonempty = the base has a merge queue
 
-# gate_checks calls these inside command substitutions; they print, they do not set variables.
+# The three library functions this suite replaces, declared so the shadow guard lets them through:
+# the build signal is not under test here. gate_checks calls them inside command substitutions;
+# they print, they do not set variables.
+stub build_checks run_signal warn_base_drift
 build_checks() {
   if [ -n "$SKIPS_ONLY" ]; then
     printf 'green\tci\tskipped\thttps://example/run\ngreen\tdocs\tneutral\thttps://example/run2\n'
@@ -184,7 +164,4 @@ tests=(
   test_require_green_refuses_a_merge_queue
 )
 
-for test_name in "${tests[@]}"; do
-  "$test_name"
-  echo "PASS: $test_name"
-done
+run_tests "${tests[@]}"

@@ -5,66 +5,31 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
-HELPER="$SCRIPT_DIR/pr-review.sh"
-
-export SHIP_PR_TEST_SOURCE_ONLY=1
-export SHIP_PR_STATE_DIR=off
-export SHIP_PR_API_ATTEMPTS=1
-export SHIP_PR_API_BACKOFF=0
-# shellcheck source=pr-review.sh
-source "$HELPER"
+# shellcheck source=test-pr-review-lib.sh
+source "$SCRIPT_DIR/test-pr-review-lib.sh"
 
 REPO=example/repo
 REVIEWS_JSON='[]'
 COMMENTS_JSON='[]'
 FAIL_READ=""
 
-# Not `fail`: pr-review.sh is sourced above and its refusals call ITS fail, whose exit code these
-# tests read; a same-named helper here would turn every refusal into this reporter's 1.
-bail() {
-  echo "FAIL: $*" >&2
-  exit 1
-}
-
-assert_eq() {
-  [ "$1" = "$2" ] || bail "$3 (got '$1', expected '$2')"
-}
-
-assert_contains() {
-  case "$1" in *"$2"*) ;; *) bail "$3 (missing '$2' in: $1)" ;; esac
-}
-
-assert_not_contains() {
-  case "$1" in *"$2"*) bail "$3 (unexpected '$2' in: $1)" ;; *) ;; esac
-}
-
 # Minimal gh fixture transport: the reviews feed is the only endpoint the counter reads. It is
 # fetched with --paginate, which the fixture accepts and ignores (one page is the whole feed).
 gh() {
-  local endpoint="" arg
-  [ "${1:-}" = api ] || bail "fixture received non-api gh call: $*"
-  shift
-  while [ $# -gt 0 ]; do
-    arg="$1"
-    shift
-    case "$arg" in
-    --paginate) ;;
-    --jq) shift || true ;;
-    -*) ;;
-    *) [ -n "$endpoint" ] || endpoint="$arg" ;;
-    esac
-  done
-  case "$endpoint" in
+  local response=""
+  gh_fixture_parse "$@"
+  case "$FIXTURE_ENDPOINT" in
   "repos/$REPO/pulls/7/reviews?per_page=100")
     if [ -n "$FAIL_READ" ]; then
       echo "gh: reviews unavailable (HTTP 500)" >&2
       return 1
     fi
-    printf '%s\n' "$REVIEWS_JSON"
+    response="$REVIEWS_JSON"
     ;;
-  "repos/$REPO/issues/7/comments?per_page=100") printf '%s\n' "$COMMENTS_JSON" ;;
-  *) bail "unexpected fixture endpoint: $endpoint" ;;
+  "repos/$REPO/issues/7/comments?per_page=100") response="$COMMENTS_JSON" ;;
+  *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
+  gh_fixture_answer "$response"
 }
 
 review() { # <login> <state> <commit> <submitted_at|null>
@@ -279,7 +244,4 @@ tests=(
   test_api_failure_is_unknown
 )
 
-for test_name in "${tests[@]}"; do
-  "$test_name"
-  echo "PASS: $test_name"
-done
+run_tests "${tests[@]}"
