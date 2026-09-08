@@ -115,13 +115,23 @@ grep -q '^magic aa:bb:cc:00:00:02$' "$CURL_LOG" \
   && ok "...and as a direct magic packet" || ko "no direct packet for the Ethernet MAC: $(cat "$CURL_LOG")"
 
 : > "$CURL_LOG"
-expect "status asks the router about the site file's Ethernet MAC alone" 0 "rog    eth-link=1" -- \
+expect "status asks the router about the site file's Ethernet MAC alone" 0 "rog    router-active=1" -- \
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" "$WL" status rog
 grep -q 'aa:bb:cc:00:00:02' "$CURL_LOG" && ! grep -q 'aa:bb:cc:00:00:01' "$CURL_LOG" \
-  && ok "...not about the Wi-Fi one" || ko "link_active used the wrong MAC: $(cat "$CURL_LOG")"
-printf '%s' "$out" | grep -q 'stale router lease, not physical link state' \
-  && ok "...and warns that a recent shutdown can leave a stale lease reading" \
-  || ko "status does not carry the stale-lease caveat -- $out"
+  && ok "...not about the Wi-Fi one" || ko "router_active used the wrong MAC: $(cat "$CURL_LOG")"
+# The column is named for what it reads, the router's NewActive bit, and never for the NIC's link
+# state: `eth-link=1` minutes after a shutdown was read as physical link when it was a stale DHCP
+# lease (ludics-lite#56). The footer is where a reader of the table learns the difference between
+# that stale reading and the settled, powered-off, WoL-armed one.
+printf '%s' "$out" | grep -q "NewActive bit for the Ethernet MAC, not the NIC's link state" \
+  && ok "...and says the column is the router's NewActive bit, not link state" \
+  || ko "status does not say what router-active reads -- $out"
+printf '%s' "$out" | grep -q 'stale DHCP lease' && printf '%s' "$out" | grep -q 'once settled' \
+  && ok "...telling a stale lease from the settled powered-off state" \
+  || ko "status does not carry the stale-lease-vs-settled caveat -- $out"
+printf '%s' "$out" | grep -qE 'eth-link|(^|[^-])link=' \
+  && ko "the old link column name resurfaced in status -- $out" \
+  || ok "...and nothing in the table is still called link"
 
 # A target the table does not answer for refuses the whole run, before any packet: the boxes it
 # DOES know must not be woken while a later target turns out to be missing, and the dispatch loop's
@@ -198,7 +208,7 @@ printf '%s\n' "$help_out" | grep -q 'set -u' \
   || ko "the header is short enough that the old truncating range would still pass; the guard above proves nothing"
 
 # --- the example table is a working one ---------------------------------------------------------
-expect "the example host table satisfies the contract" 0 "eth-link=1" -- \
+expect "the example host table satisfies the contract" 0 "router-active=1" -- \
   env WAKE_LAB_HOSTS="$EXAMPLE" "$WL" status rog
 
 # --- no hardware addresses in the repository ----------------------------------------------------

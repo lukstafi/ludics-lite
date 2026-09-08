@@ -28,9 +28,10 @@ mac_of() { case "$1" in
   asus)  echo 00:00:00:00:00:05 ;;                    # Wi-Fi only
   *) return 1 ;; esac; }
 
-# The Ethernet MAC alone — the one whose link state actually means something. link_active() asks
-# the router about this MAC, and `status` prints the answer as eth-link. A box with no cabled NIC
-# belongs in neither branch: returning 1 is what makes its link read `?`.
+# The Ethernet MAC alone — the one whose lease says anything about the wake path. router_active()
+# asks the router about this MAC, and `status` prints the router's NewActive bit for it as
+# router-active. A box with no cabled NIC belongs in neither branch: returning 1 is what makes its
+# router-active read `?`.
 eth_mac_of() { case "$1" in
   rog)   echo 00:00:00:00:00:02 ;;
   minix) echo 00:00:00:00:00:04 ;;

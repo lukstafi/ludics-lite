@@ -138,7 +138,7 @@ chmod 600 "$HOME/.config/wake-lab/hosts.sh"   # then fill in mac_of, eth_mac_of 
 
 `WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the verified lab
 lore in the header comment (wake-on-LAN over Ethernet only, waking from a full shutdown, what
-`link=1` means, the cold-boot kicked-VM trap, the `exit 0` vs `true` probe trap), the router
+`router-active=1` means, the cold-boot kicked-VM trap, the `exit 0` vs `true` probe trap), the router
 endpoints, the ssh aliases and all of the logic. `wake-lab.sh --help` prints that header, and
 `--help` and `--list` are the two commands that work before the host table exists. The box names
 (`rog`, `minix`, `asus`) and the ssh aliases are the author's and are edited in place.

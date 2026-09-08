@@ -43,13 +43,17 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 # * Both boxes wake from a full shutdown (S5), not just from sleep — verified 2026-08-15 on both,
 #   after enabling the `Wake Up` item on minix's BIOS SECOND setup screen (not under Advanced).
 #   "Powered off" is a normal starting state for a wake, not a reason to expect failure.
-# * `status` -> link is the router's NewActive bit, not direct NIC telemetry. For several minutes
-#   after shutdown or hibernate, link=1 can be a stale DHCP lease rather than physical link; wait
-#   for it to settle before diagnosing the wake path. After a full shutdown and once settled, a
-#   box holding Ethernet link (link=1) is in the WoL-armed state that makes the wake possible. A
-#   failed wake then means the magic packet was ignored: the WoL option itself (BIOS, or the
-#   Windows NIC driver's wake settings) has been lost. With settled link=0 after full shutdown,
-#   check the cable, the box's power, and the BIOS setting that keeps the NIC powered in S5.
+# * `status` -> router-active is the router's NewActive bit for the box's Ethernet MAC, read over
+#   TR-064 -- the router's opinion of the lease, not NIC telemetry, and the column is named for
+#   what it reads so that it is not mistaken for link state. It is a fast UP signal and a SLOW
+#   DOWN signal: for several minutes after a shutdown or hibernate, router-active=1 is a stale
+#   DHCP lease aging out, and diagnosing the wake path from it is a misdiagnosis (2026-09-01);
+#   wait for it to settle first. Once settled after a full shutdown, router-active=1 means the
+#   NIC still holds Ethernet link while powered off: the WoL-armed state that makes the wake
+#   possible. A failed wake then means the magic packet was ignored: the WoL option itself (BIOS,
+#   or the Windows NIC driver's wake settings) has been lost. With settled router-active=0 after
+#   a full shutdown, check the cable, the box's power, and the BIOS setting that keeps the NIC
+#   powered in S5.
 # * WSL never autostarts at boot, so a box coming up from power-down always needs kick_wsl. A box
 #   resuming from sleep/hibernate with the user's GUI WSL shell still open (the usual cycle) keeps
 #   its VM across the resume — verified on minix 2026-09-01: same boot id, -wsl answering seconds
@@ -69,9 +73,10 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 # * Probing the -win / -lan aliases by hand: the command must be `exit 0`, NOT `true` — they land
 #   in cmd.exe, which has no `true`; see ssh_probe().
 #
-# mac_of (every MAC of a box), eth_mac_of (the Ethernet one alone, whose link state is what
-# link_active reads) and ip_of are NOT here: they are the fleet's hardware addresses, the one part
-# of this script that is site data rather than reviewable logic, and they come from HOSTS_FILE.
+# mac_of (every MAC of a box), eth_mac_of (the Ethernet one alone, whose lease is what
+# router_active asks the router about) and ip_of are NOT here: they are the fleet's hardware
+# addresses, the one part of this script that is site data rather than reviewable logic, and they
+# come from HOSTS_FILE.
 HOSTS_FILE=${WAKE_LAB_HOSTS:-$HOME/.config/wake-lab/hosts.sh}
 
 # Refuse rather than run half-configured: without the table every box is "unknown machine", which
@@ -187,7 +192,8 @@ list_hosts() {
   echo "link (active=1) indefinitely while powered off. Use 'status' to ask what is really running."
 }
 
-link_active() { # link_active <box> — echo 1/0/? for the Ethernet MAC's router-side link state
+router_active() { # router_active <box> — echo 1/0/? for the router's NewActive bit on the Ethernet MAC
+  # NewActive is the router's view of the lease, not the NIC's link state; see the lore above.
   local mac out
   mac=$(eth_mac_of "$1") || { echo '?'; return; }
   out=$(soap_checked $HOSTS_CTL $HOSTS_SVC GetSpecificHostEntry "<NewMACAddress>$mac</NewMACAddress>" 2>/dev/null) \
@@ -208,8 +214,8 @@ is_up() { # is_up <box>
 status_one() { # status_one <box>
   local lan ts wsl l
   lan=$(lan_of "$1"); ts=$(ts_of "$1"); wsl=$(wsl_of "$1")
-  l=$(link_active "$1")
-  printf '%-6s eth-link=%-1s' "$1" "$l"
+  l=$(router_active "$1")
+  printf '%-6s router-active=%-1s' "$1" "$l"
   if [ -n "$lan" ]; then ssh_probe "$lan" && printf '  lan=UP  ' || printf '  lan=--  '; else printf '  lan=n/a '; fi
   if [ -n "$ts" ];  then ssh_probe "$ts"  && printf '  win=UP  ' || printf '  win=--  '; else printf '  win=n/a '; fi
   if [ -n "$wsl" ]; then ssh_probe "$wsl" && printf '  wsl=UP'   || printf '  wsl=--'  ; else printf '  wsl=n/a'; fi
@@ -217,11 +223,12 @@ status_one() { # status_one <box>
 }
 
 do_status() {
-  echo "box    link  lan(direct IP)  win(tailscale)  wsl(tailscale)"
+  echo "box    router-active   lan(direct IP)  win(tailscale)  wsl(tailscale)"
   for n in "$@"; do status_one "$n"; done
   echo
-  echo "link=1 can mean a WoL-armed NIC holds link while powered OFF; minutes after shutdown or"
-  echo "hibernate it can instead be a stale router lease, not physical link state."
+  echo "router-active is the router's NewActive bit for the Ethernet MAC, not the NIC's link state:"
+  echo "minutes after a shutdown or hibernate, 1 is a stale DHCP lease still aging out; once settled,"
+  echo "1 on a powered-off box means the NIC holds link and is WoL-armed."
   echo "lan/win/wsl are real ssh probes; wsl=-- right after a wake is usually just tailscaled lag."
 }
 
