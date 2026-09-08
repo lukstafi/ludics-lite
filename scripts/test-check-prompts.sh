@@ -195,6 +195,10 @@ fresh "$R"; printf -- '---\nname: alpha\ndescription: a\357\277\276 non-characte
 expect "U+FFFE" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
 fresh "$R"; printf -- '---\nname: alpha\ndescription: a\342\200\250b, split by a line separator\n---\n' > "$R/alpha/SKILL.md"
 expect "U+2028, a line break to YAML 1.1" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
+# ...and read to the end: an early forbidden character in a large frontmatter is not lost to
+# grep stopping at its first match and awk dying of SIGPIPE under pipefail.
+fresh "$R"; { printf -- '---\nname: alpha\ndescription: a\357\277\276 early non-character\n'; yes '# filler' | head -n 5000; printf -- '---\n'; } > "$R/alpha/SKILL.md"
+expect "U+FFFE early in a large frontmatter" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
 fresh "$R"; printf -- '---\nname: alpha\ndescription: fine\n---\n\nA body line\342\200\250split by a separator, which is not YAML.\n' > "$R/alpha/SKILL.md"
 expect "...but only in the frontmatter: the Markdown body is not YAML" 0 '6 passed, 0 failed' -- "$CP" "$R"
 fresh "$R"; printf -- '---\nname: alpha\ndescription: fine \303\274ber text \342\200\224 with a dash\n---\n' > "$R/alpha/SKILL.md"
@@ -259,6 +263,27 @@ fresh "$R"; row_after_beta '| `stale` | Visible text <!-- note --> |'
 expect "a row with an inline comment is still judged" 1 "table row 'stale' has no stale/SKILL.md" -- "$CP" "$R"
 fresh "$R"; sed -i.bak 's/^| Skill | What it does |$/| Skill | What it does | <!-- two cells, one note -->/' "$R/README.md"
 expect "a header with a trailing inline comment is still the header" 0 '6 passed, 0 failed' -- "$CP" "$R"
+# A comment region is read before any fence inside it, so a fence line in a comment neither
+# opens a fence nor keeps the comment from closing.
+fresh "$R"; { echo '<!--'; echo '```'; echo '-->'; cat "$R/README.md"; } > "$R/README.c" && mv "$R/README.c" "$R/README.md"
+expect "a fence line inside a comment is comment" 0 '6 passed, 0 failed' -- "$CP" "$R"
+# The delimiter row is judged as written: a comment inside a cell makes it not a delimiter.
+fresh "$R"; sed -i.bak 's/^| --- | --- |$/| --- | --- <!-- note --> |/' "$R/README.md"
+expect "a comment inside a delimiter cell is not a delimiter" 1 "no '| Skill |' table" -- "$CP" "$R"
+# A backtick opener takes no backtick in its info string: such a line is text, not a fence.
+fresh "$R"; { echo '```foo`bar'; cat "$R/README.md"; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
+expect "a backtick fence with a backtick in its info string is not a fence" 0 '6 passed, 0 failed' -- "$CP" "$R"
+# Cells are counted on unescaped pipes: an escaped one in a header cell is content.
+fresh "$R"; sed -i.bak 's/^| Skill | What it does |$/| Skill | What \\| why |/' "$R/README.md"
+expect "an escaped pipe in a header cell is not a cell boundary" 0 '6 passed, 0 failed' -- "$CP" "$R"
+# A table cannot interrupt a paragraph: a header straight under prose is prose; under a
+# heading, a blank line or a closed fence it is a header.
+fresh "$R"; sed -i.bak 's/^# scratch$/Some paragraph text, with the blank line below it gone./' "$R/README.md" && sed -i.bak '/^Some paragraph text/{n;d;}' "$R/README.md"
+expect "a header straight under paragraph text is not a table" 1 "no '| Skill |' table" -- "$CP" "$R"
+fresh "$R"; sed -i.bak '/^# scratch$/{n;d;}' "$R/README.md"
+expect "...straight under a heading it is" 0 '6 passed, 0 failed' -- "$CP" "$R"
+fresh "$R"; { echo '```'; echo 'code'; echo '```'; cat "$R/README.md" | sed '1,2d'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
+expect "...and straight under a closed fence it is" 0 '6 passed, 0 failed' -- "$CP" "$R"
 
 # A fence closes only on its own marker, at least as long as the opener: a `~~~` inside a
 # backtick fence, or a shorter fence, leaves the block open, as it does for the renderer.

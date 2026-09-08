@@ -153,8 +153,11 @@ well_formed_bytes() {
   local f="$1"
   [ "$(tr -d '\000' < "$f" | wc -c)" -eq "$(wc -c < "$f")" ] || return 1
   iconv -f UTF-8 -t UTF-8 < "$f" > /dev/null 2>&1 || return 1
-  ! awk 'NR > 1 && /^---$/ { exit } NR > 1 { print }' "$f" \
-    | grep -qE "$(printf '\302[\200-\237]|\357\277[\276\277]|\342\200[\250\251]')"
+  # Judged on grep's OUTPUT, not the pipeline's status: `grep -q` stops at the first match,
+  # awk then dies of SIGPIPE, and under pipefail the negated pipeline would read a large
+  # frontmatter with an early forbidden character as well formed. Without -q, grep reads it all.
+  [ -z "$(awk 'NR > 1 && /^---$/ { exit } NR > 1 { print }' "$f" \
+    | grep -E "$(printf '\302[\200-\237]|\357\277[\276\277]|\342\200[\250\251]')")" ]
 }
 
 check_skill_file() {
@@ -220,47 +223,69 @@ check_skill_file() {
 # two Markdown contexts that hide a table from the renderer by accident, a fenced code block
 # (opened and closed by a fence line indented at most three spaces, since four make it code,
 # closed only by a fence of the same marker at least as long as the one that opened it with
-# nothing but whitespace after it, as CommonMark closes it) and an HTML comment (a region from
-# an unclosed `<!--` to its `-->`; a comment that closes on its own line is cut out of the
-# line, and the rest of the line -- a row, say -- is still read), hide it from
+# nothing but whitespace after it, as CommonMark closes it, and a backtick opener taking no
+# backtick in its info string) and an HTML comment (a region from an unclosed `<!--` to its
+# `-->`, read before any fence inside it; a comment that closes on its own line is cut out of
+# the line, and the rest of the line -- a row, say -- is still read), hide it from
 # this scan too. That is the scan's scope, and a deliberate line: a table is read at column 0
 # outside those two, and a table an author wraps in a raw HTML block (`<pre>`, `<div>`, any of
 # CommonMark's seven HTML-block kinds) is a choice made on purpose, which a hygiene check for
 # accidental drift does not police -- following the HTML-block grammar clause by clause would
-# not end, and would guard nothing anyone does by mistake. Every data row is printed whole for
-# check_index to judge its first
+# not end, and would guard nothing anyone does by mistake. A header is read only where GFM
+# lets a table begin (at the top, after a blank line, a heading or a closed fence: a table
+# cannot interrupt a paragraph), its delimiter row as written with as many cells as the header
+# counted on unescaped pipes. Every data row is printed whole for check_index to judge its first
 # cell: a row is never skipped for being malformed, and an empty cell cannot vanish the way an
 # empty last line of a command substitution does.
 table_rows() {
   awk -v hdr="| $2 |" '
+    # Inside a comment region, only its close matters; the rest of that line is then read.
+    comment { k = index($0, "-->"); if (!k) next; comment = 0; $0 = substr($0, k + 3) }
+    # Inside a fence, only a closing fence matters: same marker, at least as long, nothing
+    # but whitespace after it. A closed fence is a block boundary for what follows.
+    fence {
+      if ($0 ~ /^ ? ? ?(```+|~~~+)[[:space:]]*$/) {
+        line = $0; sub(/^ ? ? ?/, "", line); m = substr(line, 1, 1)
+        len = 0; while (substr(line, len + 1, 1) == m) len++
+        if (m == fence_m && len >= fence_len) { fence = 0; boundary = 1 }
+      }
+      next
+    }
+    # An opening fence: a marker run indented at most three spaces; a backtick fence takes no
+    # backtick in its info string, so a line that has one is ordinary text.
     /^ ? ? ?(```+|~~~+)/ {
       line = $0; sub(/^ ? ? ?/, "", line); m = substr(line, 1, 1)
       len = 0; while (substr(line, len + 1, 1) == m) len++
-      if (!fence) { fence = 1; fence_m = m; fence_len = len }
-      else if (m == fence_m && len >= fence_len && substr(line, len + 1) ~ /^[[:space:]]*$/) fence = 0
-      next
+      if (!(m == "`" && index(substr(line, len + 1), "`"))) { fence = 1; fence_m = m; fence_len = len; next }
     }
-    fence { next }
-    comment { k = index($0, "-->"); if (!k) next; comment = 0; $0 = substr($0, k + 3) }
+    # A comment that closes on its own line is cut out; an unclosed one opens a region. The
+    # line as written is kept, for the delimiter row, which GFM judges with its comment in.
     {
+      raw = $0
       while ((i = index($0, "<!--")) > 0) {
         j = index(substr($0, i + 4), "-->")
         if (!j) { comment = 1; $0 = substr($0, 1, i - 1); break }
         $0 = substr($0, 1, i - 1) substr($0, i + j + 6)
       }
     }
-    index($0, hdr) == 1 { want_delim = 1; hdr_line = $0; next }
+    # The header, only where a block may begin: at the top, or after a blank line, a heading
+    # or a closed fence -- a table cannot interrupt a paragraph, so a header straight under
+    # prose is prose.
+    index($0, hdr) == 1 { if (NR == 1 || boundary) { want_delim = 1; hdr_line = $0 }; boundary = 0; next }
+    # The delimiter row as written: hyphen cells (a comment inside one is content, not a
+    # delimiter, to GFM), as many as the header has -- GFM: "The header row must match the
+    # delimiter row in the number of cells. If not, a table will not be recognized". Cells are
+    # counted on unescaped pipes, both rows being pipe-edged.
     want_delim {
-      # A delimiter row: hyphen cells, as many of them as the header has (GFM: "The header row
-      # must match the delimiter row in the number of cells. If not, a table will not be
-      # recognized"); the cell count is the pipe count, both rows being pipe-edged.
       want_delim = 0
-      if ($0 ~ /^\|([[:space:]]*:?-+:?[[:space:]]*\|)+[[:space:]]*$/ && gsub(/\|/, "|") == gsub(/\|/, "|", hdr_line)) in_table = 1
+      h = hdr_line; gsub(/\\\|/, "", h); d = raw; gsub(/\\\|/, "", d)
+      if (raw ~ /^\|([[:space:]]*:?-+:?[[:space:]]*\|)+[[:space:]]*$/ && gsub(/\|/, "|", d) == gsub(/\|/, "|", h)) in_table = 1
       else exit
-      next
+      boundary = 0; next
     }
     in_table && !/^\|/ { exit }
-    in_table { print }
+    in_table { print; next }
+    { boundary = ($0 ~ /^[[:space:]]*$/ || $0 ~ /^#/) }
   ' "$ROOT/$1"
 }
 
