@@ -8,43 +8,14 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
-HELPER="$SCRIPT_DIR/pr-review.sh"
-TEST_ROOT=$(mktemp -d "/tmp/pr-review-checks-absent-test.XXXXXX") || exit 1
-trap 'case "$TEST_ROOT" in /tmp/pr-review-checks-absent-test.*) rm -rf "$TEST_ROOT" ;; esac' EXIT
-
-export SHIP_PR_TEST_SOURCE_ONLY=1
-export SHIP_PR_STATE_DIR=off
-export SHIP_PR_API_ATTEMPTS=1
-export SHIP_PR_API_BACKOFF=0
-# shellcheck source=pr-review.sh
-source "$HELPER"
-# pr-review.sh installs its own EXIT trap. Preserve that cleanup and restore this test's temporary
-# root cleanup after sourcing it.
-trap 'rm -f "$GH_ERR_FILE"; case "$TEST_ROOT" in /tmp/pr-review-checks-absent-test.*) rm -rf "$TEST_ROOT" ;; esac' EXIT
+# shellcheck source=test-pr-review-lib.sh
+source "$SCRIPT_DIR/test-pr-review-lib.sh"
+test_tmpdir TEST_ROOT checks-absent-test
 
 REPO=example/repo
 HEAD_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 REQUEST_LOG="$TEST_ROOT/requests"
 PAGINATE_LOG="$TEST_ROOT/paginated"
-
-# Not `fail`: pr-review.sh is sourced above and its refusals call ITS fail, whose exit code these
-# tests read; a same-named helper here would turn every refusal into this reporter's 1.
-bail() {
-  echo "FAIL: $*" >&2
-  exit 1
-}
-
-assert_eq() {
-  [ "$1" = "$2" ] || bail "$3 (got '$1', expected '$2')"
-}
-
-assert_contains() {
-  case "$1" in *"$2"*) ;; *) bail "$3 (missing '$2' in: $1)" ;; esac
-}
-
-assert_not_contains() {
-  case "$1" in *"$2"*) bail "$3 (unexpected '$2' in: $1)" ;; *) ;; esac
-}
 
 # --- the fixture transport --------------------------------------------------------------------
 # One canned answer per endpoint, each a list so a round can differ from the next: the wait loop
@@ -100,37 +71,21 @@ reset_fixture() {
 }
 
 gh() {
-  local endpoint="" filter="" response="" arg paginate=""
-  [ "${1:-}" = api ] || bail "fixture received non-api gh call: $*"
-  shift
-  while [ $# -gt 0 ]; do
-    arg="$1"
-    shift
-    case "$arg" in
-    --jq)
-      filter="${1:-}"
-      shift || true
-      ;;
-    --paginate) paginate=1 ;;
-    -*) ;;
-    *) [ -n "$endpoint" ] || endpoint="$arg" ;;
-    esac
-  done
-  printf '%s\n' "$endpoint" >>"$REQUEST_LOG"
-  [ -z "$paginate" ] || printf '%s\n' "$endpoint" >>"$PAGINATE_LOG"
+  local response=""
+  gh_fixture_parse "$@"
   # A GLOB, deliberately unquoted: "repos/o/n/commits/<sha>" is a prefix of the check-runs
   # endpoint, so a substring match could not fail the commit read alone — and a case that failed
   # both reads would pass for the wrong reason.
   if [ -n "$FAIL_ENDPOINT" ]; then
     # shellcheck disable=SC2254
-    case "$endpoint" in
+    case "$FIXTURE_ENDPOINT" in
     $FAIL_ENDPOINT)
-      echo "gh: $endpoint unavailable (HTTP 500)" >&2
+      echo "gh: $FIXTURE_ENDPOINT unavailable (HTTP 500)" >&2
       return 1
       ;;
     esac
   fi
-  case "$endpoint" in
+  case "$FIXTURE_ENDPOINT" in
   "repos/$REPO/pulls/7")
     if [ -n "$PR_UPDATED_AGE" ]; then
       response=$(jq -cn --arg sha "$HEAD_SHA" --arg at "$(iso_ago "$PR_UPDATED_AGE")" \
@@ -149,13 +104,9 @@ gh() {
   "repos/$REPO/commits/$HEAD_SHA")
     response=$(jq -cn --arg at "$(iso_ago "$COMMIT_AGE")" '{commit:{committer:{date:$at}}}')
     ;;
-  *) bail "unexpected fixture endpoint: $endpoint" ;;
+  *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
-  if [ -n "$filter" ]; then
-    jq -r "$filter" <<<"$response"
-  else
-    printf '%s\n' "$response"
-  fi
+  gh_fixture_answer "$response"
 }
 
 run_gate() {
@@ -690,7 +641,4 @@ tests=(
   test_wait_ceiling_with_a_queued_run_is_no_verdict
 )
 
-for test_name in "${tests[@]}"; do
-  "$test_name"
-  echo "PASS: $test_name"
-done
+run_tests "${tests[@]}"
