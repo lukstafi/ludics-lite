@@ -258,8 +258,13 @@ if is_num "${GITHUB_RUN_ID:-}" && is_sha "${CONTRACT_OWN_HEAD:-}"; then
   # this run was created may rightly sit above it.
   case "${GITHUB_EVENT_NAME:-}" in
   schedule | workflow_dispatch)
-    pin "on a $GITHUB_EVENT_NAME run, runs?head_sha= for this job's own head ($(jq length <<<"$own") rows) is newest-first by created_at, live" \
-      'length >= 2 and ([.[].created_at] | . == (sort | reverse))' "$own"
+    # One row cannot show an order: a dispatch on a sha with no earlier run is valid and skips.
+    if [ "$(jq length <<<"$own")" -ge 2 ]; then
+      pin "on a $GITHUB_EVENT_NAME run, runs?head_sha= for this job's own head ($(jq length <<<"$own") rows) is newest-first by created_at, live" \
+        '[.[].created_at] | . == (sort | reverse)' "$own"
+    else
+      skip "newest-first on this job's own head, live" "a $GITHUB_EVENT_NAME run on a sha with no earlier run: one row shows no order"
+    fi
     ;;
   *) skip "newest-first on a multi-row head, live" "on a ${GITHUB_EVENT_NAME:-?} run the head's rows are created in the same second" ;;
   esac
@@ -291,8 +296,8 @@ if is_num "$red_run"; then
   jobs=$(api --paginate "repos/$REPO/actions/runs/$red_run/jobs?per_page=100" | pages jobs)
   pin "the feed is jobs[] (run $red_run, the latest red run: $red_concl)" 'type == "array"' "$jobs"
   is_list "$jobs" || jobs='[]'
-  pin "jobs[] rows carry name, status and conclusion (present, null while unfinished)" \
-    'all(.[]; (.name | type == "string") and (.status | type == "string") and has("conclusion") and (.conclusion == null or (.conclusion | type == "string")))' "$jobs"
+  pin "jobs[] rows carry a non-empty name (run_red_is_advisory_only skips a row with none), status and conclusion (present, null while unfinished)" \
+    'all(.[]; (.name | type == "string" and length > 0) and (.status | type == "string") and has("conclusion") and (.conclusion == null or (.conclusion | type == "string")))' "$jobs"
   pin "job conclusions are in the same vocabulary as run conclusions" \
     "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$jobs"
   # The belief run_red_is_advisory_only rests on: it discards a run's red when no non-advisory
@@ -316,8 +321,8 @@ if ! is_list "$checks"; then
 elif [ "$(jq length <<<"$checks")" -eq 0 ]; then
   skip "the row-level claims on the tip's check runs" "the tip has no check run (nothing ran on it, or nothing has created its checks yet)"
 else
-pin "every check run carries name, status, conclusion (present, null while unfinished), html_url and app.slug" \
-  'all(.[]; (.name | type == "string") and (.status | type == "string") and has("conclusion") and (.conclusion == null or (.conclusion | type == "string"))
+pin "every check run carries a non-empty name (build_checks skips a row with none), status, conclusion (present, null while unfinished), html_url and app.slug" \
+  'all(.[]; (.name | type == "string" and length > 0) and (.status | type == "string") and has("conclusion") and (.conclusion == null or (.conclusion | type == "string"))
              and (.html_url | type == "string") and (.app.slug | type == "string"))' "$checks"
 pin "check-run conclusions are in the vocabulary conclusion_class classifies" \
   "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$checks"
@@ -403,7 +408,7 @@ section "pulls/<n> — pr_head_read, gate_checks's clock, warn_base_drift and aw
 if [ -n "$STALE_BASE_PR" ]; then
   pr=$(api "repos/$REPO/pulls/$STALE_BASE_PR")
   pin "the anchor PR #$STALE_BASE_PR is merged, with a merge_commit_sha, a base.sha, a head.sha and a base.ref" \
-    "(.merged == true) and (.merge_commit_sha | test(\"$HEX40\")) and (.base.sha | test(\"$HEX40\")) and (.head.sha | test(\"$HEX40\")) and (.base.ref | type == \"string\")" "$pr"
+    "(.merged == true) and (.merge_commit_sha | test(\"$HEX40\")) and (.base.sha | test(\"$HEX40\")) and (.head.sha | test(\"$HEX40\")) and (.base.ref | type == \"string\" and length > 0)" "$pr"
   pin "a merged PR's mergeability is not computed: mergeable present and null, mergeable_state 'unknown'" \
     'has("mergeable") and .mergeable == null and .mergeable_state == "unknown"' "$pr"
   base_sha=$(jq -r '.base.sha // empty' <<<"$pr")
@@ -433,7 +438,7 @@ if [ -n "$STALE_BASE_PR" ]; then
     # patch on binary and oversized diffs, so the consistency claim is on the files that carry
     # one, of which the anchor compare must have at least one.
     pin "compare files[] rows carry string filename and status, numeric additions, deletions and changes, and previous_filename absent, null or non-empty (valid_file's shape)" \
-      'all(.files[]; (.filename | type == "string") and (.status | type == "string") and (.additions | type == "number") and (.deletions | type == "number") and (.changes | type == "number")
+      'all(.files[]; (.filename | type == "string" and length > 0) and (.status | type == "string") and (.additions | type == "number") and (.deletions | type == "number") and (.changes | type == "number")
                      and ((has("previous_filename") | not) or .previous_filename == null or ((.previous_filename | type) == "string" and (.previous_filename | length) > 0)))' "$cmp"
     pin "at least one compare file carries a patch, and on every file that does its +/- line counts equal additions/deletions (compare_hunks's consistency test)" \
       'any(.files[]; .patch | type == "string") and all(.files[] | select(.patch | type == "string");
@@ -507,7 +512,7 @@ if [ "$(jq length <<<"$open_list")" -ge 1 ]; then
   done
   open_prs=$(jq -s . "$SCRATCH/open_prs")
   pin "an open PR's pulls/<n> read carries head.sha, base.ref, updated_at, and mergeable (present) in {true,false,null}" \
-    "all(.[]; (.head_sha | test(\"$HEX40\")) and (.base_ref | type == \"string\") and (.updated_at | test(\"$ISO\")) and (.mergeable == true or .mergeable == false or .mergeable == null))" "$open_prs"
+    "all(.[]; (.head_sha | test(\"$HEX40\")) and (.base_ref | type == \"string\" and length > 0) and (.updated_at | test(\"$ISO\")) and (.mergeable == true or .mergeable == false or .mergeable == null))" "$open_prs"
   pin "... and a mergeable_state in the vocabulary status_state renders (dirty is CONFLICTS, unknown is not yet computed)" \
     "all(.[]; .mergeable_state as \$m | $MERGEABLE_STATE_VOCAB | index(\$m))" "$open_prs"
   echo "      open PRs: $(jq -r '[.[] | "#\(.number) \(.mergeable_state)"] | join(", ")' <<<"$open_prs")"
@@ -545,8 +550,6 @@ if [ -n "$REVIEWED_PR" ]; then
   pin "review states are in the vocabulary" "all(.[]; .state as \$s | $REVIEW_STATE_VOCAB | index(\$s))" "$reviews"
   pin "a round with findings is COMMENTED reviews from the app, and the approval is NOT an APPROVED review (it is the reaction above)" \
     'any(.[]; .user.login == $bot and .state == "COMMENTED") and all(.[] | select(.user.login == $bot); .state != "APPROVED")' "$reviews" --arg bot "$BOT"
-  pin "the author's own replies appear in the same feed as COMMENTED reviews (so 'new' must be id > watermark, not a count)" \
-    'any(.[]; .user.login != $bot and .state == "COMMENTED")' "$reviews" --arg bot "$BOT"
   comments=$(api --paginate "repos/$REPO/issues/$REVIEWED_PR/comments?per_page=100" | jq -s 'add')
   pin "the issue-comments feed is a list" 'type == "array"' "$comments"
   is_list "$comments" || comments='[]'
@@ -562,11 +565,30 @@ if [ -n "$REVIEWED_PR" ]; then
   pin "the unpaginated inline-comments read is a list" 'type == "array"' "$inline_page"
   is_list "$inline_all" || inline_all='[]'
   is_list "$inline_page" || inline_page='[]'
-  pin "inline comments carry numeric id, pull_request_review_id, commit_id, user.login, path, body, and the line/original_line pair poll renders" \
-    "all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\") and (.body | type == \"string\") and has(\"line\") and has(\"original_line\"))" "$inline_all"
+  # The row shape poll renders, asserted on BOTH feeds: while the flat listing lags a fresh
+  # round, the per-review feed is the only source of these fields.
+  INLINE_ROW="all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\" and length > 0) and (.body | type == \"string\") and has(\"line\") and has(\"original_line\"))"
+  pin "inline comments carry numeric id, pull_request_review_id, commit_id, user.login, a non-empty path, body, and the line/original_line pair poll renders" \
+    "$INLINE_ROW" "$inline_all"
   n_inline=$(jq length <<<"$inline_all")
   if [ "$n_inline" -gt 30 ]; then
-    pin "the flat listing paginates at 30 by default: an unpaginated read of #$REVIEWED_PR's $n_inline inline comments returns 30" \
+    # The belief behind id-based watermarks: a reply to an inline comment creates a COMMENTED
+  # review by the replier, in the same feed as the app's rounds. Detected from a reply (a
+  # non-bot comment with in_reply_to_id) rather than required of the anchor, which need not
+  # carry one; skips when it does not.
+  reply_review=$(jq -r --arg bot "$BOT" '[.[]? | select(.user.login != $bot and (.in_reply_to_id | type == "number"))][0] | if . == null then empty else "\(.pull_request_review_id // "-")\t\(.user.login)" end' <<<"$inline_all")
+  if [ -n "$reply_review" ]; then
+    IFS=$'\t' read -r rr_id rr_user <<<"$reply_review"
+    if is_num "$rr_id"; then
+      pin "a reply to an inline comment is a COMMENTED review by the replier in the same feed as the app's rounds (so 'new' must be id > watermark, not a count; review $rr_id by $rr_user)" \
+        'any(.[]; .id == $r and .state == "COMMENTED" and .user.login == $u)' "$reviews" --argjson r "$rr_id" --arg u "$rr_user"
+    else
+      skip "a reply to an inline comment is a COMMENTED review by the replier" "the reply's pull_request_review_id is not a number — see the MOVED above"
+    fi
+  else
+    skip "a reply to an inline comment is a COMMENTED review by the replier" "#$REVIEWED_PR carries no non-app reply to an inline comment; an anchor with one shows it"
+  fi
+  pin "the flat listing paginates at 30 by default: an unpaginated read of #$REVIEWED_PR's $n_inline inline comments returns 30" \
       'length == 30' "$inline_page"
   else
     skip "the flat listing paginates at 30 by default" "#$REVIEWED_PR has $n_inline inline comments, not more than a page; a larger anchor shows it"
@@ -581,6 +603,16 @@ if [ -n "$REVIEWED_PR" ]; then
     jq -c --argjson r "$named_review" '[.[]? | select(.pull_request_review_id == $r) | .id] | sort' <<<"$inline_all" >"$SCRATCH/named_ids.json"
     pin "a review's own comments endpoint answers with exactly the flat listing's rows for that review, by id (the merge-by-id read; review $named_review)" \
       'type == "array" and ([.[].id] | sort) == $ids[0]' "$per_review" --slurpfile ids "$SCRATCH/named_ids.json"
+    is_list "$per_review" || per_review='[]'
+    # The per-review feed is NOT the flat listing's shape: live, it carries position and
+    # original_position but no line/original_line (nor side, start_line, subject_type) — which
+    # is why the merge-by-id read lets the flat feed's copy win, and why poll renders
+    # `.line // .original_line // 0` for a row it has from this feed alone. So the claim is the
+    # fields poll reads from this feed; the line-number gap is printed, not asserted, since the
+    # fallback renders either way.
+    pin "the per-review rows carry what poll renders from this feed alone while the flat listing lags: numeric id and pull_request_review_id, commit_id, user.login, a non-empty path, body, and position/original_position" \
+      "all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\" and length > 0) and (.body | type == \"string\") and has(\"position\") and has(\"original_position\"))" "$per_review"
+    echo "      per-review rows carrying line/original_line: $(jq '[.[] | select(has("line") and has("original_line"))] | length' <<<"$per_review") of $(jq length <<<"$per_review") (the flat listing's copy wins on a merge because it carries them)"
   else
     skip "a review's own comments endpoint" "the flat listing names no review — $UNUSABLE"
   fi
