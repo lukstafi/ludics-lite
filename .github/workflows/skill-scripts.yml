@@ -1,10 +1,26 @@
 name: skill scripts
 
-# The shell behind the skills: syntax, shellcheck, the parse guard the cleanup scripts carry,
-# and the nine test suites, on the two platforms the fleet runs (bash 3.2 on macOS is the
-# reason macOS is not optional). Every push and pull request runs it, without path filters, so
-# `pr-review.sh merge` always finds a verdict on the head commit rather than ABSENT
-# (ludics-lite#21).
+# The prompts and the shell behind the skills, on the two platforms the fleet runs. Every push to
+# main and every pull request runs it. One job per concern, so a new one (a scheduled contract
+# check, say) is one more entry below and no edit to the others.
+#
+# THE VERDICT GUARANTEE. `pr-review.sh merge` reads the head commit's check-runs and refuses a
+# head that has none (ABSENT, ludics-lite#21). Two jobs therefore run on every head, whatever it
+# changed: `prompts` (the prompt hygiene checks) and `lint`. Everything expensive is conditioned
+# on the diff instead -- as job-level `if:` conditions on a `changes` job, NEVER as
+# `on.<event>.paths`: a workflow-level path filter means no run at all for a prompt-only PR, so
+# no verdict; a job that its `if:` skips still reports a `skipped` check-run, which the gate
+# reads as green (nothing failed) next to the hygiene job's `success` (something ran and
+# passed, which `--require-green` asks for). Adding a job that must always judge: leave its
+# `if:` out. Adding a job that is expensive: give it the `needs: changes` / `if:` pair below.
+#
+# THE MACOS QUEUE. macOS coverage is required (the fleet's bash is 3.2), but the hosted macOS
+# runners are scarce: with one macOS job per suite, each waited for its own runner assignment
+# and a green PR sat one to two hours behind ~9 minutes of actual work (ludics-lite#55). So every
+# macOS suite is one step of ONE macOS job, which installs the shared dependencies once; each
+# step still runs after an earlier one fails (`if: !cancelled()`), still names its suite when it
+# fails (the `::error` annotation), and the job is red if any step is. The Ubuntu suites stay
+# one job each: Ubuntu runners are plentiful and the split keeps their failures apart.
 
 on:
   pull_request:
@@ -20,6 +36,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ---- always run: the verdict every head carries -----------------------------------------
+
+  prompts:
+    name: prompt hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check every SKILL.md's frontmatter and the README index tables
+        # No `if:` on this job, ever: it is the check-run a prompt-only head is judged by.
+        run: scripts/check-prompts.sh
+
   lint:
     name: syntax, shellcheck, parse guard
     runs-on: ubuntu-latest
@@ -69,14 +97,52 @@ jobs:
             fi
           done
 
-  pr-review:
-    name: pr-review fixtures (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  # ---- the diff classification the suites are conditioned on ------------------------------
+
+  changes:
+    name: classify the diff
+    # Pull requests only: a push to main runs every suite regardless (the consumers' `if:`
+    # below treats any other event as "scripts changed"), so main's verdict is always the full
+    # one and the runtimes measured there are the whole workflow's.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
     timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    permissions:
+      contents: read
+      pull-requests: read # the PR's file list comes from the API; no checkout needed
+    outputs:
+      scripts: ${{ steps.filter.outputs.scripts }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # "Script-related" is defined by its complement: a PR is prompt-only when every file it
+          # touches is Markdown other than the top-level README. The README counts as script
+          # input because the fleet launcher's suite extracts and executes its install loops.
+          # Patterns are OR-ed (dorny's default `some` quantifier), so the two lines read: any
+          # non-Markdown file, plus README.md. A rename needs no line of its own: on a pull
+          # request the action expands one into a delete of the previous path and an add of
+          # the new (src/main.ts, "Rename is replaced by delete of original filename and add
+          # of new filename"), so a script renamed to a Markdown path is classified by the
+          # script path it left.
+          filters: |
+            scripts:
+              - '!**/*.md'
+              - 'README.md'
+
+  # ---- the script suites on Ubuntu, one job each ------------------------------------------
+  # Each carries the same `needs`/`if` pair: run on any event but a pull request, and on a pull
+  # request only when the diff classification says the scripts are involved. `!cancelled()` is
+  # what lets the job evaluate its condition at all when `changes` was skipped (a push), while a
+  # `changes` job that FAILED leaves the output empty, so the suites are skipped and the red
+  # `changes` check is the head's verdict: fail closed.
+
+  pr-review:
+    name: pr-review fixtures (ubuntu)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: Exercise the suites' shared preamble and its shadow guard
@@ -95,20 +161,18 @@ jobs:
         run: ship-pr/scripts/test-pr-review-status.sh
 
   cleanup:
-    name: post-merge cleanup (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    # One stalled case once held a macOS job for the six-hour default (ludics-lite#14). The
-    # suite now kills a case at SHIP_PR_TEST_CASE_TIMEOUT and reports it; this is the backstop.
+    name: post-merge cleanup (ubuntu)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: ubuntu-latest
+    # One stalled case once held a job for the six-hour default (ludics-lite#14). The suite now
+    # kills a case at SHIP_PR_TEST_CASE_TIMEOUT and reports it; this is the backstop.
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    env:
-      SHIP_PR_TEST_LOG_DIR: ${{ github.workspace }}/cleanup-logs
     steps:
       - uses: actions/checkout@v4
       - name: Exercise post-merge branch states
+        env:
+          SHIP_PR_TEST_LOG_DIR: ${{ runner.temp }}/cleanup-logs
         run: ship-pr/scripts/test-post-merge-cleanup.sh
       - name: Keep the per-case logs
         # The log of a failed or timed-out case is already in the job output; the artifact is
@@ -116,31 +180,38 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: cleanup-logs-${{ matrix.os }}
-          path: ${{ github.workspace }}/cleanup-logs
+          name: cleanup-logs-ubuntu
+          path: ${{ runner.temp }}/cleanup-logs
           if-no-files-found: ignore
 
   wake-lab:
-    name: wake-lab (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: wake-lab (ubuntu)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Exercise the host-table split and the --help range
         run: scripts/test-wake-lab.sh
 
+  prompt-checker:
+    name: prompt checker fixtures (ubuntu)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise the hygiene checks against defective scratch trees
+        run: scripts/test-check-prompts.sh
+
   fleet-worker:
-    name: fleet launcher (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: fleet launcher (ubuntu)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -150,8 +221,73 @@ jobs:
       - name: Install tmux
         run: |
           set -e
-          if command -v apt-get >/dev/null; then sudo apt-get update -q && sudo apt-get install -y -q tmux; fi
-          if command -v brew >/dev/null; then brew list tmux >/dev/null 2>&1 || brew install tmux; fi
+          sudo apt-get update -q && sudo apt-get install -y -q tmux
           command -v tmux && command -v jq
       - name: Exercise the fleet launcher against the local box
         run: issue-wave/scripts/test-fleet-worker.sh
+
+  # ---- every script suite on macOS, one job, one runner assignment ------------------------
+
+  macos:
+    name: bash 3.2 suites (macos)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: macos-latest
+    # The suites take about nine minutes together (the cleanup and fleet suites are ~4 each).
+    # The cleanup suite kills a stalled case at SHIP_PR_TEST_CASE_TIMEOUT (ludics-lite#14), so
+    # this is the backstop behind that, sized for the whole sequence rather than one suite.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the fleet launcher suite installs and preflights the real checkout
+      - name: Install tmux
+        run: |
+          set -e
+          brew list tmux >/dev/null 2>&1 || brew install tmux
+          command -v tmux && command -v jq
+      # Every suite step below runs whether or not an earlier one failed, and a failure names
+      # its suite in the run's annotations; the job's conclusion is red if any step's is.
+      - name: pr-review fixtures, shared preamble and shadow guard
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-lib.sh || { echo '::error title=macOS suite failed::test-pr-review-lib.sh'; exit 1; }
+      - name: pr-review fixtures, base drift
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-base-drift.sh || { echo '::error title=macOS suite failed::test-pr-review-base-drift.sh'; exit 1; }
+      - name: pr-review fixtures, absent vs not yet
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-checks-absent.sh || { echo '::error title=macOS suite failed::test-pr-review-checks-absent.sh'; exit 1; }
+      - name: pr-review fixtures, review rounds
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-rounds.sh || { echo '::error title=macOS suite failed::test-pr-review-rounds.sh'; exit 1; }
+      - name: pr-review fixtures, merge
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-merge.sh || { echo '::error title=macOS suite failed::test-pr-review-merge.sh'; exit 1; }
+      - name: pr-review fixtures, status and watch
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-status.sh || { echo '::error title=macOS suite failed::test-pr-review-status.sh'; exit 1; }
+      - name: post-merge cleanup
+        if: ${{ !cancelled() }}
+        # The per-case logs go OUTSIDE the checkout: the fleet launcher suite later in this job
+        # enumerates the checkout's top-level directories and refuses one it does not know,
+        # which a `cleanup-logs/` in the workspace would be (a step interaction the separate
+        # jobs never had).
+        env:
+          SHIP_PR_TEST_LOG_DIR: ${{ runner.temp }}/cleanup-logs
+        run: ship-pr/scripts/test-post-merge-cleanup.sh || { echo '::error title=macOS suite failed::test-post-merge-cleanup.sh'; exit 1; }
+      - name: wake-lab
+        if: ${{ !cancelled() }}
+        run: scripts/test-wake-lab.sh || { echo '::error title=macOS suite failed::test-wake-lab.sh'; exit 1; }
+      - name: prompt checker fixtures
+        if: ${{ !cancelled() }}
+        run: scripts/test-check-prompts.sh || { echo '::error title=macOS suite failed::test-check-prompts.sh'; exit 1; }
+      - name: fleet launcher
+        if: ${{ !cancelled() }}
+        run: issue-wave/scripts/test-fleet-worker.sh || { echo '::error title=macOS suite failed::test-fleet-worker.sh'; exit 1; }
+      - name: Keep the cleanup suite's per-case logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-logs-macos
+          path: ${{ runner.temp }}/cleanup-logs
+          if-no-files-found: ignore
