@@ -54,7 +54,8 @@ jobs:
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Still moved on $(date -u +%Y-%m-%d): $run_url"
           else
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "The scheduled live-API contract (\`ship-pr/scripts/pr-review-api-contract.sh\`) found a belief the pr-review.sh fixtures encode that no longer holds on this repository's API. The run names the field: $run_url
-
-Each MOVED line is one projection input; the fixture suites stay green through this by construction (they feed canned shapes), so the gate may be reading a head wrong until the projection and its fixtures are updated together (ludics-lite#41)."
+            body=$(printf '%s\n\n%s' \
+              "The scheduled live-API contract (\`ship-pr/scripts/pr-review-api-contract.sh\`) found a belief the pr-review.sh fixtures encode that no longer holds on this repository's API. The run names the field: $run_url" \
+              "Each MOVED line is one projection input; the fixture suites stay green through this by construction (they feed canned shapes), so the gate may be reading a head wrong until the projection and its fixtures are updated together (ludics-lite#41).")
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
           fi
