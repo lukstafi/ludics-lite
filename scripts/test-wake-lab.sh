@@ -165,6 +165,42 @@ out=$(kick "" 2>&1)
 printf '%s' "$out" | grep -q 'wsl kick FAILED on rog' \
   && ok "...and reports a box no endpoint answers for" || ko "a kick with nothing up did not fail -- $out"
 
+# --- restart-wsl shuts the VM down on the Windows host before starting it ---------------------
+# A VM kept alive across a host sleep/resume can carry a degraded dxg bridge that fails under the
+# sweep's parallel width while every single-process probe passes (ludics-lite#60). The cure is a
+# new VM, and `wsl --shutdown` belongs on the Windows side: issued inside the VM it kills the
+# session issuing it. So the restart rides the same -lan/-win aliases as the kick, never -wsl.
+restart() { env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="$1" "$WL" restart-wsl rog; }
+: > "$SSH_LOG"
+out=$(restart "rog-lan rog-nv-wsl" 2>&1)
+printf '%s' "$out" | grep -q 'wsl shut down on rog (via rog-lan)' \
+  && printf '%s' "$out" | grep -q 'wsl started on rog (via rog-lan)' \
+  && ok "restart-wsl shuts the VM down and starts it again, over the LAN alias" \
+  || ko "restart-wsl did not report a shutdown and a start -- $out"
+awk '/^rog-lan :: wsl.exe --shutdown$/ { s = NR } /^rog-lan :: wsl.exe -d Ubuntu/ { t = NR } END { exit !(s && t && s < t) }' "$SSH_LOG" \
+  && ok "...issuing wsl.exe --shutdown on the Windows host before the start" \
+  || ko "no shutdown ahead of the start over rog-lan: $(cat "$SSH_LOG")"
+grep -q '^rog-nv-wsl :: wsl.exe' "$SSH_LOG" \
+  && ko "a wsl.exe command reached the -wsl guest, where a shutdown kills its own session: $(cat "$SSH_LOG")" \
+  || ok "...and never through the -wsl guest"
+out=$(restart "" 2>&1)
+printf '%s' "$out" | grep -q 'wsl restart FAILED on rog' \
+  && ok "...and reports a box no endpoint answers for as a failed restart" || ko "a restart with nothing up did not fail -- $out"
+# The kick keeps its meaning -- start if not running -- so a `--wait --wsl` on a box the user is
+# working on never kills a live VM; `--restart-wsl` is the spelling that does.
+: > "$SSH_LOG"; kick "rog-lan rog-nv-wsl" >/dev/null 2>&1
+grep -q -- '--shutdown' "$SSH_LOG" && ko "kick-wsl issued a shutdown: $(cat "$SSH_LOG")" \
+  || ok "kick-wsl never shuts a VM down"
+wake_wsl() { env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-wsl" "$WL" --wait "$1" rog; }
+: > "$SSH_LOG"; out=$(wake_wsl --wsl 2>&1)
+printf '%s' "$out" | grep -q 'wsl up' && ! grep -q -- '--shutdown' "$SSH_LOG" \
+  && ok "...and neither does --wait --wsl" || ko "--wait --wsl shut a VM down, or never started one -- $out; $(cat "$SSH_LOG")"
+: > "$SSH_LOG"; out=$(wake_wsl --restart-wsl 2>&1)
+printf '%s' "$out" | grep -q 'wsl shut down on rog (via rog-lan)' && printf '%s' "$out" | grep -q 'wsl up' \
+  && grep -q '^rog-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ok "--wait --restart-wsl shuts the VM down after the wake and starts a fresh one" \
+  || ko "--wait --restart-wsl did not restart the VM -- $out; $(cat "$SSH_LOG")"
+
 # --- the polling loops are bounded by elapsed time, not by iteration count -----------------------
 # Every probe of a dark box burns its ConnectTimeout, so an iteration budget was a wall-clock lie:
 # 36 rounds of a "3 minute" WSL wait ran for nine when the probes were slow. Three-second probes
