@@ -40,6 +40,12 @@ ROOT=${1:-$(cd "$HERE/.." && pwd)}
 
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok: $*"; }
+
+# matches <ERE> <text>: whether a line of the text matches the expression. Judged on grep's
+# OUTPUT, never on a `grep -q` pipeline's status: -q stops at the first match, the producer
+# then dies of SIGPIPE, and under pipefail a match early in text longer than the pipe buffer
+# would read as no match. Every regex test in this file goes through here for that reason.
+matches() { [ -n "$(printf '%s\n' "$2" | grep -E "$1")" ]; }
 # ko <file> <message>: <file> is relative to the root, for the annotation.
 ko() {
   fail=$((fail + 1))
@@ -96,13 +102,13 @@ value_of() {
     # Only the two escapes whose reading is one character and one line, `\"` and `\\`; every
     # other backslash (`\n`, `\t`, `\q`) is refused rather than decoded, so a value never
     # resolves past one line, and never to something a loader would reject.
-    if ! printf '%s\n' "$v" | grep -qE '^"([^"\\]|\\["\\])*"([[:space:]]+#.*)?$'; then
+    if ! matches '^"([^"\\]|\\["\\])*"([[:space:]]+#.*)?$' "$v"; then
       echo "a double-quoted value must close on the same line with nothing but a comment after it, and may escape only \\\" and \\\\ (single-quote the value, or drop the backslash)"; return 1
     fi
     inner=$(printf '%s\n' "$v" | sed -E 's/^"(([^"\\]|\\["\\])*)".*$/\1/' | sed -E 's/\\(["\\])/\1/g')
     ;;
   \'*)
-    if ! printf '%s\n' "$v" | grep -qE "^'([^']|'')*'([[:space:]]+#.*)?\$"; then
+    if ! matches "^'([^']|'')*'([[:space:]]+#.*)?\$" "$v"; then
       echo "a single-quoted value must close on the same line, with nothing but a comment after the closing quote"; return 1
     fi
     inner=$(printf '%s\n' "$v" | sed -E "s/^'(([^']|'')*)'.*\$/\1/" | sed "s/''/'/g")
@@ -129,7 +135,7 @@ value_of() {
     '' | [A-Za-z]*) ;;
     *) echo "'$inner' does not start with a letter, so a loader may read it as a number, date, time or other typed value, not text; quote the value"; return 1 ;;
     esac
-    if printf '%s\n' "$inner" | grep -qiE '^(true|false|yes|no|on|off|y|n|null)$'; then
+    if matches '^(true|false|yes|no|on|off|y|n|null)$' "$(printf '%s' "$inner" | tr '[:upper:]' '[:lower:]')"; then
       echo "'$inner' is a boolean or null to YAML, not text; quote the value"; return 1
     fi
     ;;
@@ -174,7 +180,7 @@ check_skill_file() {
   # A control character anywhere in the frontmatter -- a tab YAML reads as a separator, a
   # carriage return a loader folds into the value -- is refused whole, rather than modelled
   # wherever it could change a reading.
-  if printf '%s\n' "$fm" | grep -q '[[:cntrl:]]'; then
+  if matches '[[:cntrl:]]' "$fm"; then
     ko "$rel" "frontmatter carries a control character (a tab or a carriage return, say); use plain spaces and LF line ends"
     return
   fi
@@ -205,7 +211,7 @@ check_skill_file() {
     [ "$key" = name ] && name="$value"
   done
   for key in name description; do
-    printf '%s\n' "$fm" | grep -qE "^$key:" || ko "$rel" "frontmatter has no '$key:' line"
+    matches "^$key:" "$fm" || ko "$rel" "frontmatter has no '$key:' line"
   done
   if [ -n "$name" ] && [ "$name" != "$dir" ]; then
     ko "$rel" "frontmatter name '$name' does not match its directory '$dir'"
@@ -234,9 +240,10 @@ check_skill_file() {
 # not end, and would guard nothing anyone does by mistake. A header is read only where GFM
 # lets a table begin (at the top, after a blank line, a heading or a closed fence: a table
 # cannot interrupt a paragraph), its delimiter row as written with as many cells as the header
-# counted on unescaped pipes. Every data row is printed whole for check_index to judge its first
-# cell: a row is never skipped for being malformed, and an empty cell cannot vanish the way an
-# empty last line of a command substitution does.
+# counted on unescaped pipes. Every line until the table's end -- a blank line or a block start
+# -- is printed whole for check_index to judge its first cell, a leading pipe or not (GFM
+# renders a pipeless body row): a row is never skipped for being malformed, and an empty cell
+# cannot vanish the way an empty last line of a command substitution does.
 table_rows() {
   awk -v hdr="| $2 |" '
     # Inside a comment region, only its close matters; the rest of that line is then read.
@@ -283,9 +290,15 @@ table_rows() {
       else exit
       boundary = 0; next
     }
-    in_table && !/^\|/ { exit }
+    # GFM breaks the table "at the first empty line, or beginning of another block-level
+    # structure"; until then every line is a row it renders, with or without a leading pipe,
+    # so every line is judged. A block start not listed here is read as a row, which fails
+    # loud on its first cell rather than hiding a row.
+    in_table && (/^[[:space:]]*$/ || /^ ? ? ?##?#?#?#?#?([ \t]|$)/ || /^ ? ? ?(```|~~~)/ || /^ ? ? ?>/) { exit }
     in_table { print; next }
-    { boundary = ($0 ~ /^[[:space:]]*$/ || $0 ~ /^#/) }
+    # Where the next line may begin a block: after a blank line, or an ATX heading -- one to
+    # six `#` followed by a space or the end of the line; `#not-a-heading` is paragraph text.
+    { boundary = ($0 ~ /^[[:space:]]*$/ || $0 ~ /^ ? ? ?##?#?#?#?#?([ \t]|$)/) }
   ' "$ROOT/$1"
 }
 

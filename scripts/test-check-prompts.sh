@@ -180,6 +180,10 @@ fresh "$R"; skill "$R" alpha 'name: alpha' "description: Runs:$(printf '\t')quic
 expect "a tab in a value" 1 'frontmatter carries a control character' -- "$CP" "$R"
 fresh "$R"; skill "$R" alpha 'name: alpha' "description: CRLF line$(printf '\r')"
 expect "a carriage return" 1 'frontmatter carries a control character' -- "$CP" "$R"
+# ...found however large the frontmatter: the test is judged on grep's output, so a tab early
+# in 20000 lines is not lost to grep stopping and printf dying of SIGPIPE under pipefail.
+fresh "$R"; { printf -- '---\nname: alpha\n# an early tab\there\n'; yes '# filler' | head -n 20000; printf -- 'description: late\n---\n'; } > "$R/alpha/SKILL.md"
+expect "a tab early in a large frontmatter" 1 'frontmatter carries a control character' -- "$CP" "$R"
 
 # A NUL byte never reaches a shell variable (bash drops it, warning on stderr where no verdict
 # reads), and invalid UTF-8 is a loader error: both are refused on the raw file, first.
@@ -282,6 +286,8 @@ fresh "$R"; sed -i.bak 's/^# scratch$/Some paragraph text, with the blank line b
 expect "a header straight under paragraph text is not a table" 1 "no '| Skill |' table" -- "$CP" "$R"
 fresh "$R"; sed -i.bak '/^# scratch$/{n;d;}' "$R/README.md"
 expect "...straight under a heading it is" 0 '6 passed, 0 failed' -- "$CP" "$R"
+fresh "$R"; sed -i.bak 's/^# scratch$/#not-a-heading/' "$R/README.md" && sed -i.bak '/^#not-a-heading/{n;d;}' "$R/README.md"
+expect "...but '#not-a-heading' is paragraph text, so a header under it is prose" 1 "no '| Skill |' table" -- "$CP" "$R"
 fresh "$R"; { echo '```'; echo 'code'; echo '```'; cat "$R/README.md" | sed '1,2d'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
 expect "...and straight under a closed fence it is" 0 '6 passed, 0 failed' -- "$CP" "$R"
 
@@ -320,6 +326,12 @@ fresh "$R"; row_after_beta '| `two` `names` | Two names. |'
 expect "two backticked names in one cell is a failing row" 1 "is not one backticked name" -- "$CP" "$R"
 fresh "$R"; row_after_beta '|   | Empty first cell. |'
 expect "an empty first cell is a failing row" 1 "first cell is not a backticked name: ''" -- "$CP" "$R"
+# GFM renders a body row without a leading pipe, so it is judged too: as a stale row when its
+# first cell is not a name, and as the skill's row when it is.
+fresh "$R"; row_after_beta 'stale | A pipeless row GitHub renders.'
+expect "a pipeless row with a stale first cell fails" 1 "first cell is not a backticked name: 'stale'" -- "$CP" "$R"
+fresh "$R"; sed -i.bak 's/^| `beta` | The second. |$/`beta` | The second, pipeless./' "$R/README.md"
+expect "...and a pipeless row with the skill's name is its row" 0 '6 passed, 0 failed' -- "$CP" "$R"
 
 # Without its delimiter row a header and its rows are prose to Markdown, and to this.
 fresh "$R"; sed -i.bak '/^| Skill |/{n;d;}' "$R/README.md"
