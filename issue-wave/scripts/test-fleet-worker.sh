@@ -195,13 +195,19 @@ cat > "$TMP/bin/tmux" <<EOF
 if [ -n "\${SHIM_TMUX_FAIL_NEW:-}" ]; then case " \$* " in *" new-session "*) echo "shim: tmux refuses new-session" >&2; exit 1 ;; esac; fi
 exec "$REAL_TMUX" "\$@"
 EOF
-# ssh: the preflight's cross-box reach probe (ludics-lite#57). `SHIM_SSH_DENY=<host>` answers a
-# missing credential, `SHIM_SSH_DOWN=<host>` a box that does not answer; every other host is
-# reachable. Nothing in these tests reaches a real box.
+# ssh: the preflight's cross-box reach probe (ludics-lite#57) -- the one ssh shape these tests
+# answer, `ssh <opts> <host> exit 0`. `SHIM_SSH_DENY=<host>` answers a missing credential,
+# `SHIM_SSH_DOWN=<host>` a box that does not answer; every other probed host is reachable. Any
+# other invocation (run_on's `bash -s` to a box the tests never map as local) is unresolvable, as
+# it would be for real: nothing in these tests reaches a real box.
 cat > "$TMP/bin/ssh" <<'SHIMEOF'
 #!/usr/bin/env bash
 host=""
 while [ $# -gt 0 ]; do case "$1" in -o) shift ;; -*) ;; *) host="$1"; break ;; esac; shift; done
+shift
+[ "$*" = "exit 0" ] || { echo "ssh: Could not resolve hostname $host: nodename nor servname provided" >&2; exit 255; }
+[ "$host" = "${SHIM_SSH_HANG:-}" ] && sleep 30
+[ "$host" = "${SHIM_SSH_SLURP:-}" ] && cat > /dev/null
 [ "$host" = "${SHIM_SSH_DENY:-}" ] && { echo "$host: Permission denied (publickey)." >&2; exit 255; }
 [ "$host" = "${SHIM_SSH_DOWN:-}" ] && { echo "ssh: connect to host $host port 22: Connection timed out" >&2; exit 255; }
 exit 0
@@ -436,6 +442,13 @@ expect "a sibling refusing the key refuses the preflight" 1 "no non-interactive 
 expect "a sibling that does not answer is noted on the OK line" 0 "PREFLIGHT OK.*cross-box unreachable, asleep or off the network: otherbox" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_DOWN=otherbox "$FW" preflight testbox --no-probe
 expect "a reachable sibling adds nothing to the OK line" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- env FLEET_BOXES="testbox otherbox" "$FW" preflight testbox --no-probe
 expect "--no-cross skips the reach probe" 0 "PREFLIGHT OK" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_DENY=otherbox "$FW" preflight testbox --no-probe --no-cross
+expect "a sibling whose login never returns is bounded and noted, not hung" 0 "PREFLIGHT OK.*otherbox(no answer in 2s)" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_HANG=otherbox FLEET_CROSS_TIMEOUT=2 "$FW" preflight testbox --no-probe
+[ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded reach probe" || ok "preflight lock released after the bounded reach probe"
+# The probe must not read the far-side program off stdin: a sibling that swallows its stdin would
+# otherwise end the preflight early with status 0 over an earlier refusal (Codex P1 on #67).
+echo x >> "$repo/ship-pr/SKILL.md"
+expect "a reachable sibling does not swallow the refusal that follows the probe" 1 "1 local change(s) in the served tree" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_SLURP=otherbox "$FW" preflight testbox --no-probe
+git -C "$repo" checkout -q -- ship-pr/SKILL.md
 [ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
 expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
 expect "codex that cannot run headless refuses despite login status" 1 "codex cannot run headless: \"message\":\"401 Unauthorized\"" -- env SHIM_CODEX_DOWN=1 "$FW" preflight testbox --codex

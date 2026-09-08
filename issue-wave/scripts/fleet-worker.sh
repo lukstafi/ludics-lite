@@ -72,6 +72,7 @@
 #   FLEET_FLOTILLA: status service; http://mac-studio:7799.
 #   FLEET_LOCK_WAIT: seconds a lease mutation waits for a concurrent one; 10.
 #   FLEET_PROBE_TIMEOUT: wall-clock bound on the live headless preflight turn; 120.
+#   FLEET_CROSS_TIMEOUT: wall-clock bound on each cross-box ssh reach probe of the preflight; 20.
 #   FLEET_FETCH_TIMEOUT: wall-clock bound on skills-checkout and project fetches; 300.
 
 set -uo pipefail
@@ -199,7 +200,10 @@ bounded() {
   # caller's stdout, or a lingering child would hold a command substitution open.
   ( "$@" < "$stdin" > "$out" 2>&1; echo $? > "$rcf" ) >/dev/null 2>&1 &
   pid=$!
-  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$secs" ]; do sleep 1; waited=$((waited + 1)); done
+  # Tenth-second polls: a probe that returns at once (a reachable ssh sibling, a fast CLI) must
+  # not cost a whole second each, since the preflight runs them serially under the per-box lock
+  # and every launch pays it; [waited] counts tenths against [secs].
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt $((secs * 10)) ]; do sleep 0.1; waited=$((waited + 1)); done
   if kill -0 "$pid" 2>/dev/null; then
     for c in $(pgrep -P "$pid" 2>/dev/null); do pkill -P "$c" 2>/dev/null; kill "$c" 2>/dev/null; done
     kill "$pid" 2>/dev/null; rc=124
@@ -329,7 +333,7 @@ anchor_gate() {
 # the per-launch refusal the skill promises is enforced here rather than remembered.
 preflight_script() {
   cat <<'EOF'
-codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4" cross="$5"
+codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4" cross="$5" cross_timeout="$6"
 refuse=""
 note() { refuse="$refuse; $*"; }
 # One preflight per box at a time: a parallel group launched together would otherwise race
@@ -426,9 +430,18 @@ command -v jq >/dev/null 2>&1 || note "no jq"
 # answer at all is asleep or off the network, which the wake path owns, so it is noted on the OK
 # line rather than refused - a worker whose task has no leg there must still launch.
 cross_down=""
+if [ -n "$cross" ] && ! command -v ssh >/dev/null 2>&1; then
+  note "no ssh client on $BOX for the cross-box legs (ludics-lite#57)"; cross=""
+fi
 for sibling in $cross; do
-  err=$(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$sibling" exit 0 2>&1); crc=$?
+  # Under `bounded`, which gives the probe /dev/null as stdin (the far-side program arrives on
+  # stdin through `bash -s`, and an ssh that inherited it would read the rest of this script as
+  # its own input, ending it early with status 0 - Codex P1 on #67; `-n` says the same thing to
+  # ssh itself) and a whole-process deadline: ConnectTimeout bounds the handshake only, not a
+  # login shell that never returns, and this loop holds the preflight lock.
+  err=$(bounded "$cross_timeout" ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$sibling" exit 0); crc=$?
   [ "$crc" -eq 0 ] && continue
+  if [ "$crc" -eq 124 ]; then cross_down="$cross_down $sibling(no answer in ${cross_timeout}s)"; continue; fi
   case "$err" in
     *"Permission denied"*|*"Host key verification failed"*)
       note "no non-interactive ssh to $sibling from $BOX: $(printf '%s' "$err" | tail -n1 | cut -c1-100) (provision the key, ludics-lite#57)" ;;
@@ -468,7 +481,7 @@ cmd_preflight() {
     esac
     shift
   done
-  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$cross"
+  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$cross" "${FLEET_CROSS_TIMEOUT:-20}"
   local rc=$?
   if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; exit 4; fi
   exit "$rc"
@@ -504,7 +517,7 @@ cmd_launch() {
   fi
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
   local codex=0 pf; [ "$kind" = codex ] && codex=1
-  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$(siblings_of "$box")" )
+  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$(siblings_of "$box")" "${FLEET_CROSS_TIMEOUT:-20}" )
   local prc=$?
   if unreachable "$prc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: $pf"; exit 1; }

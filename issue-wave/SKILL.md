@@ -295,9 +295,12 @@ launch: `ssh -o BatchMode=yes <sibling> exit 0` from the box to each fleet sibli
 `FLEET_BOXES` roster minus the box itself), refusing on a missing credential (`Permission
 denied`, an unverifiable host key) and only noting a sibling that does not answer - that one is
 asleep or off the network, which `wake-lab.sh` owns, and a worker whose task has no leg there
-still launches; `--no-cross` skips the probe. A new box joins by minting a key, appending its
-public key to the others' `authorized_keys`, adding the three aliases, and running the
-preflight, which is the whole bootstrap.
+still launches; `--no-cross` skips the probe, and `FLEET_CROSS_TIMEOUT` (20 s) bounds each one.
+A new box joins in both directions: mint its key and append the public key to every existing
+box's `authorized_keys`; append every existing box's public key to ITS `authorized_keys`; add
+the aliases for the others on it AND its own alias on each existing box; then run the preflight
+on the new box and on each existing one, since a box's preflight checks only its outbound
+reach.
 
 Mechanics that differ from Claude workers:
 
