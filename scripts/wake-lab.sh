@@ -365,15 +365,17 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 }
 
 # start_wsl <box...> — kick (or, with FRESH_WSL, restart) WSL on each box, then poll only the boxes
-# whose kick_wsl succeeded. The restart's success is the restart's own status, never the guest's
-# liveness: a `wsl --shutdown` that failed on both Windows aliases leaves the STALE guest answering,
-# and polling it would print `wsl up` over exactly the degraded VM the restart exists to replace —
-# and the sweep reads that line as permission to proceed. So a failed box is reported last, by
-# name, `wsl up` is never printed alongside a failure, and the status is 1 — carried on into the
-# wake path's final verdict through WSL_FAILED, so that `all up` cannot paper over it either.
+# whose kick_wsl succeeded. Its status is the whole step's: 0 only when every box's command
+# succeeded AND every started guest answered within the poll budget. The restart's success is
+# never the guest's liveness: a `wsl --shutdown` that failed on both Windows aliases leaves the
+# STALE guest answering, and polling it would print `wsl up` over exactly the degraded VM the
+# restart exists to replace — and the sweep reads that line as permission to proceed. Nor is a
+# guest that never answered a success: `wsl still down` is a backend the sweep cannot test. So
+# `wsl up` is never printed alongside either failure, both are named, and both reach the wake
+# path's final verdict through WSL_FAILED, so that `all up` cannot paper over them either.
 WSL_FAILED=""
 start_wsl() {
-  local n what=kick started=() failed=()
+  local n what=kick started=() failed=() rc=0
   [ "$FRESH_WSL" = fresh ] && what=restart
   for n in "$@"; do
     if kick_wsl "$n" "$FRESH_WSL"; then started+=("$n"); else failed+=("$n"); fi
@@ -383,13 +385,17 @@ start_wsl() {
     if wait_for_wsl "${started[@]}"; then
       [ ${#failed[@]} -eq 0 ] && echo "wsl up" || echo "wsl up on: ${started[*]}"
     else
-      echo "wsl still down after $((WSL_WAIT_SECONDS / 60)) min"
+      WSL_FAILED="wsl still down after $((WSL_WAIT_SECONDS / 60)) min on: ${started[*]}"
+      echo "$WSL_FAILED"
+      rc=1
     fi
   fi
-  [ ${#failed[@]} -eq 0 ] && return 0
-  WSL_FAILED="wsl $what FAILED on: ${failed[*]}"
-  echo "$WSL_FAILED (a -wsl guest that still answers there is the old VM)"
-  return 1
+  if [ ${#failed[@]} -gt 0 ]; then
+    WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }wsl $what FAILED on: ${failed[*]}"
+    echo "wsl $what FAILED on: ${failed[*]} (a -wsl guest that still answers there is the old VM)"
+    rc=1
+  fi
+  return $rc
 }
 
 wait_for_wsl() { # wait_for_wsl <box...> — tailscaled inside WSL can take >2 min after a resume

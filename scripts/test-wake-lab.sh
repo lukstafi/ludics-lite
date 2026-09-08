@@ -232,6 +232,19 @@ printf '%s' "$out" | grep -q 'wsl restart FAILED on: rog' && ! printf '%s' "$out
 [ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q '^all up$' && printf '%s\n' "$out" | tail -1 | grep -q 'wsl restart FAILED on: rog' \
   && ok "...nor 'all up': the restart failure is the wake's last line and its exit status (rc=$rc)" \
   || ko "the wake path said all up, or exited 0, over a failed restart (rc=$rc) -- $out"
+# The step's third failing shape: every wsl.exe command succeeded, and the fresh guest never
+# answered within the poll budget. `wsl still down` is a backend the sweep cannot test, so it is a
+# failure of the step, from the verb's exit status and from the wake path's final verdict alike.
+: > "$SSH_LOG"; out=$(restart "rog-lan rog-nv-win" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q 'wsl up' && printf '%s\n' "$out" | tail -1 | grep -q 'wsl still down after 0 min on: rog' \
+  && ok "a restarted guest that never answers is a failed restart-wsl, its last line saying so (rc=$rc)" \
+  || ko "a guest that never answered read as a successful restart (rc=$rc) -- $out"
+grep -q '^rog-lan :: wsl.exe -d Ubuntu' "$SSH_LOG" && ok "...after the start really was issued" \
+  || ko "the start was never issued, so the case pins nothing: $(cat "$SSH_LOG")"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-win" "$WL" --wait --restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q '^all up$' && printf '%s\n' "$out" | tail -1 | grep -q 'NOT all up: wsl still down after 0 min on: rog' \
+  && ok "...and the wake path over it is NOT all up, exit nonzero, with the poll timeout as its last line (rc=$rc)" \
+  || ko "the wake path said all up, or exited 0, over a guest that never answered (rc=$rc) -- $out"
 # The kick path holds the same line: a kick no Windows endpoint carried is a failed kick, whatever
 # the guest answers, so `wsl up` there is the kick's own success and not the poll's.
 out=$(kick "rog-nv-wsl" 2>&1); rc=$?
