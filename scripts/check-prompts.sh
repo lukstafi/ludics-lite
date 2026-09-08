@@ -130,9 +130,22 @@ value_of() {
   printf '%s' "$inner"
 }
 
+# The bytes a shell variable cannot hold are checked on the raw file, before anything is read
+# into one: bash drops a NUL from a command substitution (with a warning on stderr that no
+# verdict reads), and a loader rejects the file for it; invalid UTF-8 goes the same way.
+well_formed_bytes() {
+  local f="$1"
+  [ "$(tr -d '\000' < "$f" | wc -c)" -eq "$(wc -c < "$f")" ] || return 1
+  iconv -f UTF-8 -t UTF-8 < "$f" > /dev/null 2>&1
+}
+
 check_skill_file() {
   local rel="$1" dir fm bad key count raw name="" value
   dir=$(basename "$(dirname "$ROOT/$rel")")
+  if ! well_formed_bytes "$ROOT/$rel"; then
+    ko "$rel" "carries a NUL byte or invalid UTF-8; a loader rejects the file, and a shell variable could not even hold it to check"
+    return
+  fi
   if ! fm=$(frontmatter "$ROOT/$rel"); then
     ko "$rel" "no YAML frontmatter: line 1 must be '---' and a closing '---' must follow"
     return
@@ -186,33 +199,57 @@ check_skill_file() {
 # right under the header -- without one Markdown renders the rows as prose, and so does this.
 # A table ends at the first line that is not a row, blank or not: a heading or paragraph ends
 # it just the same, and the rows of a later table are that table's, whatever its header. The
-# two Markdown contexts that hide a table from the renderer, a fenced code block and an HTML
-# comment, hide it from this scan too; nothing else can, since a row is read only at column 0.
-table_names() {
+# two Markdown contexts that hide a table from the renderer, a fenced code block (closed only
+# by a fence of the same marker at least as long as the one that opened it, as CommonMark
+# closes it) and an HTML comment, hide it from this scan too; nothing else can, since a row is
+# read only at column 0. Every data row is printed whole for check_index to judge its first
+# cell: a row is never skipped for being malformed, and an empty cell cannot vanish the way an
+# empty last line of a command substitution does.
+table_rows() {
   awk -v hdr="| $2 |" '
-    /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
+    /^[[:space:]]*(```+|~~~+)/ {
+      line = $0; sub(/^[[:space:]]*/, "", line); m = substr(line, 1, 1)
+      len = 0; while (substr(line, len + 1, 1) == m) len++
+      if (!fence) { fence = 1; fence_m = m; fence_len = len }
+      else if (m == fence_m && len >= fence_len) fence = 0
+      next
+    }
     fence { next }
     !comment && index($0, "<!--") { comment = 1 }
     comment { if (index($0, "-->")) comment = 0; next }
     index($0, hdr) == 1 { want_delim = 1; next }
     want_delim { want_delim = 0; if ($0 ~ /^\|([[:space:]]*:?-+:?[[:space:]]*\|)+[[:space:]]*$/) in_table = 1; else exit; next }
     in_table && !/^\|/ { exit }
-    in_table && /^\| `[^`]*` \|/ { sub(/^\| `/, ""); sub(/`.*$/, ""); print }
+    in_table { print }
   ' "$ROOT/$1"
 }
 
 # check_index <readme> <header> <dir prefix> <what>: the table's names and the directories
 # carrying a SKILL.md under the prefix must be the same set.
 check_index() {
-  local readme="$1" header="$2" prefix="$3" what="$4" dirs rows missing extra
+  local readme="$1" header="$2" prefix="$3" what="$4" dirs cells cell rows missing extra
   [ -f "$ROOT/$readme" ] || { ko "$readme" "missing: it carries the $what table"; return; }
   dirs=$(cd "$ROOT" && for f in ${prefix}*/SKILL.md; do [ -f "$f" ] && dirname "$f"; done \
     | sed "s|^$prefix||" | sort)
-  rows=$(table_names "$readme" "$header" | sort)
-  if [ -z "$rows" ]; then
+  cells=$(table_rows "$readme" "$header")
+  if [ -z "$cells" ]; then
     ko "$readme" "no '| $header |' table (a header row, its '| --- |' delimiter row, then rows with backticked names in the first column)"
     return
   fi
+  # Every row is judged: a first cell that is not exactly one backticked name is a row the
+  # reader sees and this check would otherwise not, so it fails rather than being skipped.
+  rows=""
+  while IFS= read -r cell; do
+    cell=${cell#|}; cell=${cell%%|*}
+    cell=$(printf '%s' "$cell" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    case "$cell" in
+    \`?*\`) cell=${cell#\`}; cell=${cell%\`}
+      case "$cell" in *\`*) ko "$readme" "$what table row's first cell is not one backticked name: '\`$cell\`'"; continue ;; esac
+      rows="$rows$cell"$'\n' ;;
+    *) ko "$readme" "$what table row's first cell is not a backticked name: '$cell'" ;;
+    esac
+  done <<<"$cells"
+  rows=$(printf '%s' "$rows" | sort)
   missing=$(comm -23 <(printf '%s\n' "$dirs") <(printf '%s\n' "$rows") | tr '\n' ' ')
   extra=$(comm -13 <(printf '%s\n' "$dirs") <(printf '%s\n' "$rows") | tr '\n' ' ')
   [ -z "$missing" ] || ko "$readme" "$what directories missing from its table: ${missing% }"

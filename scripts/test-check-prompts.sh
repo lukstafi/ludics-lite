@@ -177,6 +177,15 @@ expect "a tab in a value" 1 'frontmatter carries a control character' -- "$CP" "
 fresh "$R"; skill "$R" alpha 'name: alpha' "description: CRLF line$(printf '\r')"
 expect "a carriage return" 1 'frontmatter carries a control character' -- "$CP" "$R"
 
+# A NUL byte never reaches a shell variable (bash drops it, warning on stderr where no verdict
+# reads), and invalid UTF-8 is a loader error: both are refused on the raw file, first.
+fresh "$R"; printf -- '---\nname: alpha\ndescription: a NUL \000 inside\n---\n' > "$R/alpha/SKILL.md"
+expect "a NUL byte" 1 'carries a NUL byte or invalid UTF-8' -- "$CP" "$R"
+fresh "$R"; printf -- '---\nname: alpha\ndescription: bad \377 byte\n---\n' > "$R/alpha/SKILL.md"
+expect "invalid UTF-8" 1 'carries a NUL byte or invalid UTF-8' -- "$CP" "$R"
+fresh "$R"; printf -- '---\nname: alpha\ndescription: fine \303\274ber text\n---\n' > "$R/alpha/SKILL.md"
+expect "...while valid UTF-8 passes" 0 '6 passed, 0 failed' -- "$CP" "$R"
+
 # Optional keys are held to the same grammar: a loader rejects the whole file on any of them.
 fresh "$R"; skill "$R" alpha 'name: alpha' 'description: fine' 'allowed-tools: ['
 expect "a malformed optional key" 1 "frontmatter 'allowed-tools:' value is outside the grammar" -- "$CP" "$R"
@@ -226,6 +235,26 @@ fresh "$R"; { printf '%s\n' '```' '| Skill | What it does |' '| --- | --- |' '| 
   '<!-- | Skill | What it does |' '| --- | --- |' '| `NOT_A_SKILL` | commented | -->'; cat "$R/README.md"; } > "$R/README.pre" \
   && mv "$R/README.pre" "$R/README.md"
 expect "...and look-alikes inside them do not hide the real table after them" 0 '6 passed, 0 failed' -- "$CP" "$R"
+
+# A fence closes only on its own marker, at least as long as the opener: a `~~~` inside a
+# backtick fence, or a shorter fence, leaves the block open, as it does for the renderer.
+fresh "$R"; { echo '```'; echo '~~~'; cat "$R/README.md"; echo '```'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
+expect "a ~~~ inside a backtick fence does not close it" 1 "no '| Skill |' table" -- "$CP" "$R"
+fresh "$R"; { echo '````'; echo '```'; cat "$R/README.md"; echo '````'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
+expect "a shorter fence does not close a longer one" 1 "no '| Skill |' table" -- "$CP" "$R"
+fresh "$R"; { echo '```'; echo 'code'; echo '`````'; cat "$R/README.md"; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
+expect "...and a longer fence of the same marker does" 0 '6 passed, 0 failed' -- "$CP" "$R"
+
+# Every data row is judged: a row the reader sees with a first cell that is not one backticked
+# name fails, instead of being skipped as not-a-row.
+row_after_beta() { sed -i.bak "/^| \`beta\` |/a\\
+$1" "$R/README.md"; }
+fresh "$R"; row_after_beta '| stale-skill | Stale rendered row. |'
+expect "an unbackticked first cell is a failing row" 1 "skill table row's first cell is not a backticked name: 'stale-skill'" -- "$CP" "$R"
+fresh "$R"; row_after_beta '| `two` `names` | Two names. |'
+expect "two backticked names in one cell is a failing row" 1 "is not one backticked name" -- "$CP" "$R"
+fresh "$R"; row_after_beta '|   | Empty first cell. |'
+expect "an empty first cell is a failing row" 1 "first cell is not a backticked name: ''" -- "$CP" "$R"
 
 # Without its delimiter row a header and its rows are prose to Markdown, and to this.
 fresh "$R"; sed -i.bak '/^| Skill |/{n;d;}' "$R/README.md"
