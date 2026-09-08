@@ -32,7 +32,7 @@
 # Usage:
 #   fleet-worker.sh claim [--take]         # take the fleet's coordinator lease (--take adopts)
 #   fleet-worker.sh coordinator | release  # who holds it (exit 0 me, 1 other, 3 nobody) / give it up
-#   fleet-worker.sh preflight <box> [--codex] [--no-probe]   # launch runs this itself, too
+#   fleet-worker.sh preflight <box> [--codex] [--no-probe] [--no-cross]   # launch runs this itself, too
 #   fleet-worker.sh launch <box> <name> --kind claude|codex --brief <file>
 #                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
 #                          [--force] [--replace] [-- <extra CLI args>]
@@ -329,7 +329,7 @@ anchor_gate() {
 # the per-launch refusal the skill promises is enforced here rather than remembered.
 preflight_script() {
   cat <<'EOF'
-codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4"
+codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4" cross="$5"
 refuse=""
 note() { refuse="$refuse; $*"; }
 # One preflight per box at a time: a parallel group launched together would otherwise race
@@ -420,26 +420,55 @@ else
 fi
 command -v tmux >/dev/null 2>&1 || note "no tmux"
 command -v jq >/dev/null 2>&1 || note "no jq"
+# Cross-box reach (ludics-lite#57): a worker's brief may drive a fleet sibling over ssh for a
+# one-off leg, and on 2026-09-04 the first such leg found no credential mid-task. A refused
+# credential (permission denied, an unverifiable host key) refuses here; a sibling that does not
+# answer at all is asleep or off the network, which the wake path owns, so it is noted on the OK
+# line rather than refused - a worker whose task has no leg there must still launch.
+cross_down=""
+for sibling in $cross; do
+  err=$(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$sibling" exit 0 2>&1); crc=$?
+  [ "$crc" -eq 0 ] && continue
+  case "$err" in
+    *"Permission denied"*|*"Host key verification failed"*)
+      note "no non-interactive ssh to $sibling from $BOX: $(printf '%s' "$err" | tail -n1 | cut -c1-100) (provision the key, ludics-lite#57)" ;;
+    *) cross_down="$cross_down $sibling" ;;
+  esac
+done
 if [ -n "$refuse" ]; then
   echo "PREFLIGHT REFUSED $BOX: ${refuse#; }${other:+ (changes outside the served tree, ignored: $other)}"
   exit 1
 fi
-echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (changes outside the served tree, ignored: $other)}"
+echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (changes outside the served tree, ignored: $other)}${cross_down:+ (cross-box unreachable, asleep or off the network:$cross_down)}"
 EOF
+}
+
+# The fleet minus one box: what that box's preflight probes ssh to. `local` and the coordinator's
+# own name both stand for the box running this script, so neither is a sibling of itself.
+siblings_of() {
+  local box="$1" b out=""
+  for b in $BOXES; do
+    [ "$b" = "$box" ] && continue
+    is_local "$box" && is_local "$b" && continue
+    out="$out $b"
+  done
+  printf '%s' "${out# }"
 }
 
 cmd_preflight() {
   local box="${1:-}"; [ -n "$box" ] || die "preflight: which box?"; shift
-  local codex=0 probe=1
+  local codex=0 probe=1 cross=""
+  cross=$(siblings_of "$box")
   while [ $# -gt 0 ]; do
     case "$1" in
       --codex) codex=1 ;;
       --no-probe) probe=0 ;;
+      --no-cross) cross="" ;;
       *) die "preflight: unknown option $1" ;;
     esac
     shift
   done
-  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}"
+  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$cross"
   local rc=$?
   if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; exit 4; fi
   exit "$rc"
@@ -475,7 +504,7 @@ cmd_launch() {
   fi
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
   local codex=0 pf; [ "$kind" = codex ] && codex=1
-  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" )
+  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$(siblings_of "$box")" )
   local prc=$?
   if unreachable "$prc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: $pf"; exit 1; }

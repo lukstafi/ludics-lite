@@ -195,7 +195,18 @@ cat > "$TMP/bin/tmux" <<EOF
 if [ -n "\${SHIM_TMUX_FAIL_NEW:-}" ]; then case " \$* " in *" new-session "*) echo "shim: tmux refuses new-session" >&2; exit 1 ;; esac; fi
 exec "$REAL_TMUX" "\$@"
 EOF
-chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux"
+# ssh: the preflight's cross-box reach probe (ludics-lite#57). `SHIM_SSH_DENY=<host>` answers a
+# missing credential, `SHIM_SSH_DOWN=<host>` a box that does not answer; every other host is
+# reachable. Nothing in these tests reaches a real box.
+cat > "$TMP/bin/ssh" <<'SHIMEOF'
+#!/usr/bin/env bash
+host=""
+while [ $# -gt 0 ]; do case "$1" in -o) shift ;; -*) ;; *) host="$1"; break ;; esac; shift; done
+[ "$host" = "${SHIM_SSH_DENY:-}" ] && { echo "$host: Permission denied (publickey)." >&2; exit 255; }
+[ "$host" = "${SHIM_SSH_DOWN:-}" ] && { echo "ssh: connect to host $host port 22: Connection timed out" >&2; exit 255; }
+exit 0
+SHIMEOF
+chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux" "$TMP/bin/ssh"
 
 # --- the real checkout, installed by the README's own loops, must pass the preflight ---------
 # The scratch checkout further down is built to the layout the preflight expects, so the two
@@ -420,6 +431,11 @@ section "preflight" && {
 expect "clean main on origin passes (claude, live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox
 expect "clean main passes for codex (live probe via shim)" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --codex
 expect "a stalling skills fetch is bounded and refused" 1 "git fetch in .* timed out after 2s" -- env SHIM_GIT_HANG_FETCH=1 FLEET_FETCH_TIMEOUT=2 "$FW" preflight testbox --no-probe
+# Cross-box reach (ludics-lite#57): a missing credential refuses, a box that is down is noted.
+expect "a sibling refusing the key refuses the preflight" 1 "no non-interactive ssh to otherbox from testbox: .*Permission denied" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_DENY=otherbox "$FW" preflight testbox --no-probe
+expect "a sibling that does not answer is noted on the OK line" 0 "PREFLIGHT OK.*cross-box unreachable, asleep or off the network: otherbox" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_DOWN=otherbox "$FW" preflight testbox --no-probe
+expect "a reachable sibling adds nothing to the OK line" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- env FLEET_BOXES="testbox otherbox" "$FW" preflight testbox --no-probe
+expect "--no-cross skips the reach probe" 0 "PREFLIGHT OK" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_DENY=otherbox "$FW" preflight testbox --no-probe --no-cross
 [ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
 expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
 expect "codex that cannot run headless refuses despite login status" 1 "codex cannot run headless: \"message\":\"401 Unauthorized\"" -- env SHIM_CODEX_DOWN=1 "$FW" preflight testbox --codex
