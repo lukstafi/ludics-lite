@@ -235,14 +235,15 @@ read, or `skip` with the reason it cannot be checked here), so a failure localiz
 that moved: the fields `run_signal`, `build_checks`, `run_red_is_advisory_only`, `pr_head_read`,
 `warn_base_drift` and `status_state` index; the newest-first order of `actions/runs`; the status,
 conclusion, mergeable-state and review-state vocabularies; that a merged PR's `.base.sha` is a
-snapshot standing behind the merge's first parent (anchored on #53); that an open PR's
-`updated_at` is never older than its head's push; and the reviewer feeds' shapes (the `[bot]`
-suffix, the `+1` approval, `COMMENTED` rounds, the summary tag, 30-per-page pagination) anchored
-on #39. `.github/workflows/api-contract.yml` runs it daily, on demand, and on a pull request that
+snapshot standing behind the merge's first parent (anchored on #53); and the reviewer feeds' shapes
+(the `[bot]` suffix, the `+1` approval, `COMMENTED` rounds, the summary tag, 30-per-page
+pagination) anchored on #39. `.github/workflows/api-contract.yml` runs it daily, on demand, and on a pull request that
 changes the contract itself; a scheduled failure opens (or comments on) one issue rather than
-failing silently. A belief that needs a state this repository does not have — a dirty PR pushed to
-under observation, a 300-file compare — prints as `skip`, so the unpinned set is visible in every
-run. Run it locally with `gh` auth: `ship-pr/scripts/pr-review-api-contract.sh lukstafi/ludics-lite`.
+failing silently, from a second job that checks nothing out, so the job that runs a pull request's
+version of the script holds a read-only token. A belief that needs a state this repository does not
+have, or a fact the API does not carry — a dirty PR pushed to under observation, a 300-file
+compare, the push time behind `updated_at` — prints as `skip`, so the unpinned set is visible in
+every run. Run it locally with `gh` auth: `ship-pr/scripts/pr-review-api-contract.sh lukstafi/ludics-lite`.
 
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and

@@ -140,15 +140,19 @@ if [ -n "${GITHUB_RUN_ID:-}" ] && [ -n "${CONTRACT_OWN_HEAD:-}" ]; then
   own=$(api --paginate "repos/$REPO/actions/runs?head_sha=$CONTRACT_OWN_HEAD&per_page=100" --jq '.workflow_runs' | jq -s 'add')
   pin "this job's own run (id $GITHUB_RUN_ID) is a row on its head, unfinished, with no conclusion" \
     "any(.[]; .id == $GITHUB_RUN_ID and .status != \"completed\" and .conclusion == null)" "$own"
+  # On a scheduled or dispatched run the head is the base tip, whose push run came long before
+  # this one, so the list has at least two rows created apart — a live newest-first check on a
+  # filtered head. Not "this run is row 0": another workflow dispatched on the same SHA after
+  # this run was created may rightly sit above it.
   case "${GITHUB_EVENT_NAME:-}" in
   schedule | workflow_dispatch)
-    pin "on a $GITHUB_EVENT_NAME run, this job's own row is the FIRST on its head (newest-first, live)" \
-      ".[0].id == $GITHUB_RUN_ID" "$own"
+    pin "on a $GITHUB_EVENT_NAME run, runs?head_sha= for this job's own head ($(jq length <<<"$own") rows) is newest-first by created_at, live" \
+      'length >= 2 and ([.[].created_at] | . == (sort | reverse))' "$own"
     ;;
-  *) skip "the own run is the first row on its head" "on a ${GITHUB_EVENT_NAME:-?} run its siblings are created in the same second" ;;
+  *) skip "newest-first on a multi-row head, live" "on a ${GITHUB_EVENT_NAME:-?} run the head's rows are created in the same second" ;;
   esac
 else
-  skip "this job's own run is the newest row on its head" "not running under Actions (GITHUB_RUN_ID and CONTRACT_OWN_HEAD unset)"
+  skip "this job's own run is a row on its head, and that head is newest-first" "not running under Actions (GITHUB_RUN_ID and CONTRACT_OWN_HEAD unset)"
 fi
 
 if [ "$(jq length <<<"$runs")" -ge 1 ]; then
@@ -257,15 +261,12 @@ if [ "$(jq length <<<"$open_nums")" -ge 1 ]; then
   open_prs='[]'
   for n in $(jq -r '.[]' <<<"$open_nums"); do
     p=$(api "repos/$REPO/pulls/$n" --jq '{number, head_sha: .head.sha, base_ref: .base.ref, updated_at, mergeable, mergeable_state}')
-    cd=$(api "repos/$REPO/commits/$(jq -r .head_sha <<<"$p")" --jq .commit.committer.date)
-    open_prs=$(jq -c --argjson p "$p" --arg cd "$cd" '. + [$p + {committed: $cd}]' <<<"$open_prs")
+    open_prs=$(jq -c --argjson p "$p" '. + [$p]' <<<"$open_prs")
   done
   pin "an open PR's pulls/<n> read carries head.sha, base.ref, updated_at, and mergeable in {true,false,null}" \
     "all(.[]; (.head_sha | test(\"$HEX40\")) and (.base_ref | type == \"string\") and (.updated_at | test(\"$ISO\")) and (.mergeable == true or .mergeable == false or .mergeable == null))" "$open_prs"
   pin "... and a mergeable_state in the vocabulary status_state renders (dirty is CONFLICTS, unknown is not yet computed)" \
     "all(.[]; .mergeable_state as \$m | $MERGEABLE_STATE_VOCAB | index(\$m))" "$open_prs"
-  pin "the PR clock is never older than the push: updated_at >= the head's committer date on every open PR (a future-dated commit excepted)" \
-    'all(.[]; .updated_at >= .committed or .committed > (now | todate))' "$open_prs"
   echo "      open PRs: $(jq -r '[.[] | "#\(.number) \(.mergeable_state)"] | join(", ")' <<<"$open_prs")"
   if jq -e 'any(.[]; .mergeable_state == "dirty")' <<<"$open_prs" >/dev/null; then
     echo "      a dirty PR is open: that no pull_request run is created for a push made while dirty can be checked on it by hand"
@@ -274,6 +275,12 @@ else
   skip "open PRs' mergeability and clock fields" "no open PR right now"
 fi
 skip "a push made while mergeable_state=dirty gets no pull_request run" "needs a dirty PR pushed to under observation; not manufactured here"
+# The push clock: gate_checks reads updated_at because a push to the head branch moves it. The
+# push time itself is not an API field, and a committer date is not one either (a skewed or
+# assigned date can be later than the real push), so the belief was measured live on
+# ludics-lite#38 (09:12:31Z before a push, 09:17:29Z five seconds after) and is not re-checkable
+# without pushing; the field's shape on the single-PR read is pinned above.
+skip "a push moves the PR's updated_at (the push clock)" "push time is not an API field; measured live on ludics-lite#38, not re-checkable without a push"
 
 # --- the reviewer's feeds ----------------------------------------------------------------------------
 section "reactions, reviews and comments on a reviewed PR — status_state's and review_rounds's feeds"

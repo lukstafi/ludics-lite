@@ -18,18 +18,22 @@ on:
       - ship-pr/scripts/pr-review-api-contract.sh
       - .github/workflows/api-contract.yml
 
+# Two jobs, because a pull request that changes the script runs the PR's version of it: the job
+# that executes the script reads only, and the one job that may write (the drift issue, on a
+# scheduled failure) checks nothing out and runs no repository code.
 permissions:
   contents: read
-  actions: read
-  checks: read
-  pull-requests: read
-  issues: write # only the `Report a moved belief` step writes, and only on a scheduled failure
 
 jobs:
   contract:
     name: live API contract
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
       - name: Assert the fixtures' beliefs against this repository's live API
@@ -39,11 +43,21 @@ jobs:
           # pull_request run the head is the PR's, not the merge commit's.
           CONTRACT_OWN_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: ship-pr/scripts/pr-review-api-contract.sh "$GITHUB_REPOSITORY"
-      - name: Report a moved belief
-        # A scheduled run nobody watches fails silently, which is the drift class this workflow
-        # exists to catch. One open issue per drift, not one per day: a second scheduled failure
-        # finds the first's issue and adds a comment instead.
-        if: failure() && github.event_name == 'schedule'
+
+  report:
+    name: report a moved belief
+    # A scheduled run nobody watches fails silently, which is the drift class this workflow
+    # exists to catch. One open issue per drift, not one per day: a second scheduled failure
+    # finds the first's issue and adds a comment instead. No checkout: this job's token can
+    # write, so it runs nothing a pull request could have changed.
+    needs: contract
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or extend the drift issue
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
