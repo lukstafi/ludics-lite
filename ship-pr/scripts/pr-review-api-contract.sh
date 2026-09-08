@@ -34,6 +34,14 @@
 
 set -euo pipefail
 
+# pr-review.sh itself, sourced without running: the contract encodes a branch name with the
+# library's own encode_ref, so the anchor read below exercises the encoder warn_base_drift uses,
+# rather than a restatement of it. Every function this file defines comes after this line and
+# shares no name with the library's (the trap test-pr-review-lib.sh guards the suites against).
+export SHIP_PR_TEST_SOURCE_ONLY=1
+# shellcheck source=pr-review.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/pr-review.sh"
+
 REPO="${1:-${GITHUB_REPOSITORY:-lukstafi/ludics-lite}}"
 REVIEWER="${REVIEWER:-chatgpt-codex-connector}"
 BOT="${REVIEWER}[bot]" # how an app's login reads in every feed: matched by prefix in pr-review.sh
@@ -110,8 +118,10 @@ section() { printf '\n== %s\n' "$*"; }
 # --- the anchors ------------------------------------------------------------------------------
 section "anchors on $REPO"
 BASE="${CONTRACT_BASE:-$(api "repos/$REPO" --jq .default_branch)}"
-tip=$(api "repos/$REPO/commits/$BASE")
-pin "commits/<branch> answers the branch tip's sha and committer date (the drift anchor and the push clock)" \
+# The ref goes through the library's encoder, as warn_base_drift's tip read sends it: a legal
+# name such as release#1 would otherwise become a URL fragment.
+tip=$(api "repos/$REPO/commits/$(encode_ref "$BASE")")
+pin "commits/<encode_ref branch> answers the branch tip's sha and committer date (the drift anchor and the push clock)" \
   "(.sha | test(\"$HEX40\")) and (.commit.committer.date | test(\"$ISO\"))" "$tip"
 HEAD=$(jq -r '.sha // empty' <<<"$tip")
 is_sha "$HEAD" || { echo "pr-review-api-contract.sh: the tip read carries no usable sha; nothing below can be anchored (1 moved)" >&2; exit 1; }
@@ -211,9 +221,13 @@ pin "filter=latest yields one check run per name WITHIN a check suite (a re-run 
   '[.[] | "\(.check_suite.id)/\(.name)"] | length == (unique | length)' "$checks"
 # Every run on the tip, whatever its status: a check run exists only once its job does, and a
 # tip whose run is still queued (a fresh merge behind a runner queue) has no completed run yet.
+# The runs this correlation is made against are read AFTER the checks: a run exists before any
+# of its checks, so a snapshot taken after the check read cannot lack the run behind a check —
+# while the earlier snapshot could, for a workflow started on the tip in between.
+runs_after=$(api --paginate "repos/$REPO/actions/runs?head_sha=$HEAD&per_page=100" --jq '.workflow_runs' | jq -s 'add')
 job_names='[]'
 jobs_unusable=""
-for rid in $(jq -r '.[].id // "-"' <<<"$runs"); do
+for rid in $(jq -r '.[].id // "-"' <<<"$runs_after"); do
   is_num "$rid" || { jobs_unusable=1; continue; }
   job_names=$(api --paginate "repos/$REPO/actions/runs/$rid/jobs?per_page=100" --jq '[.jobs[].name]' | jq -s --argjson acc "$job_names" 'add + $acc')
 done
@@ -270,7 +284,12 @@ recent=$(api "repos/$REPO/pulls?state=closed&sort=updated&direction=desc&per_pag
 n_recent=$(jq length <<<"$recent")
 if [ "$n_recent" -ge 1 ]; then
   ok_all=true
-  for n in $(jq -r '.[].number' <<<"$recent"); do
+  for n in $(jq -r '.[].number // "-"' <<<"$recent"); do
+    if ! is_num "$n"; then
+      ok_all=false
+      echo "      a merged row of the closed-PR list has no numeric number ($n)"
+      continue
+    fi
     p=$(api "repos/$REPO/pulls/$n" --jq '[(.base.sha // "-"), (.merge_commit_sha // "-")] | @tsv')
     IFS=$'\t' read -r bs ms <<<"$p"
     if ! is_sha "$bs" || ! is_sha "$ms"; then
@@ -295,10 +314,12 @@ fi
 
 # Mergeability is on the single-PR read only — the list endpoint omits mergeable and
 # mergeable_state — which is why pr_head_read reads pulls/<n> per PR. So does this.
-open_nums=$(api "repos/$REPO/pulls?state=open&per_page=10" --jq '[.[].number]')
-if [ "$(jq length <<<"$open_nums")" -ge 1 ]; then
+open_list=$(api "repos/$REPO/pulls?state=open&per_page=10")
+if [ "$(jq length <<<"$open_list")" -ge 1 ]; then
+  pin "every row of the open-PR list carries a numeric number" 'all(.[]; .number | type == "number")' "$open_list"
   open_prs='[]'
-  for n in $(jq -r '.[]' <<<"$open_nums"); do
+  for n in $(jq -r '.[].number // "-"' <<<"$open_list"); do
+    is_num "$n" || continue # recorded MOVED just above; no request is built from it
     p=$(api "repos/$REPO/pulls/$n" --jq '{number, head_sha: .head.sha, base_ref: .base.ref, updated_at, mergeable, mergeable_state}')
     open_prs=$(jq -c --argjson p "$p" '. + [$p]' <<<"$open_prs")
   done
@@ -332,8 +353,8 @@ if [ -n "$REVIEWED_PR" ]; then
   pin "the approval is a '+1' reaction from the app (the merge gate's 👍)" \
     'any(.[]; .content == "+1" and .user.login == $bot)' "$reactions" --arg bot "$BOT"
   reviews=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/reviews?per_page=100" | jq -s 'add')
-  pin "reviews carry numeric id, state, commit_id, submitted_at and user.login" \
-    "all(.[]; (.id | type == \"number\") and (.state | type == \"string\") and (.commit_id | test(\"$HEX40\")) and (.submitted_at == null or (.submitted_at | test(\"$ISO\"))) and (.user.login | type == \"string\"))" "$reviews"
+  pin "reviews carry numeric id, state, commit_id, submitted_at, user.login and a body (poll renders it)" \
+    "all(.[]; (.id | type == \"number\") and (.state | type == \"string\") and (.commit_id | test(\"$HEX40\")) and (.submitted_at == null or (.submitted_at | test(\"$ISO\"))) and (.user.login | type == \"string\") and has(\"body\"))" "$reviews"
   pin "review states are in the vocabulary" "all(.[]; .state as \$s | $REVIEW_STATE_VOCAB | index(\$s))" "$reviews"
   pin "a round with findings is COMMENTED reviews from the app, and the approval is NOT an APPROVED review (it is the reaction above)" \
     'any(.[]; .user.login == $bot and .state == "COMMENTED") and all(.[] | select(.user.login == $bot); .state != "APPROVED")' "$reviews" --arg bot "$BOT"
@@ -346,8 +367,8 @@ if [ -n "$REVIEWED_PR" ]; then
     'any(.[]; .user.login == $bot and (.body | test("codex-pull-request-review-summary")))' "$comments" --arg bot "$BOT"
   inline_all=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/comments?per_page=100" | jq -s 'add')
   inline_page=$(api "repos/$REPO/pulls/$REVIEWED_PR/comments")
-  pin "inline comments carry numeric id, pull_request_review_id, commit_id and user.login" \
-    "all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\"))" "$inline_all"
+  pin "inline comments carry numeric id, pull_request_review_id, commit_id, user.login, path, body, and the line/original_line pair poll renders" \
+    "all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\") and (.body | type == \"string\") and has(\"line\") and has(\"original_line\"))" "$inline_all"
   pin "the flat listing paginates at 30 by default: an unpaginated read of #$REVIEWED_PR's $(jq length <<<"$inline_all") inline comments returns 30" \
     "length == 30 and $(jq length <<<"$inline_all") > 30" "$inline_page"
   first_review=$(jq -r --arg bot "$BOT" '[.[] | select(.user.login == $bot and .state == "COMMENTED")][0].id // empty' <<<"$reviews")
