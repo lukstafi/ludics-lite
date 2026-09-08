@@ -340,7 +340,10 @@ note() { refuse="$refuse; $*"; }
 # `git fetch`/`merge` in the same checkout and refuse on git's own lock files. Idempotent, so
 # waiting for the other preflight is the right thing; the bound covers a hung live probe.
 mkdir -p "$STATE" 2>/dev/null; plock="$STATE/preflight.lock"
-msg=$(take_lock "$plock" $((fetch_timeout + probe_timeout + 60)) "PREFLIGHT REFUSED $BOX") || { echo "$msg"; exit 1; }
+# The wait covers everything a holder may legitimately spend: the fetch, the live probe, and one
+# cross-box timeout per sibling, since the reach probes run serially under this lock.
+nsib=0; for _s in $cross; do nsib=$((nsib + 1)); done
+msg=$(take_lock "$plock" $((fetch_timeout + probe_timeout + 60 + cross_timeout * nsib)) "PREFLIGHT REFUSED $BOX") || { echo "$msg"; exit 1; }
 trap 'release_lock "$plock"' EXIT
 repo=$(expand_tilde "$SKILLS_REPO")
 if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
@@ -521,6 +524,10 @@ cmd_launch() {
   local prc=$?
   if unreachable "$prc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: $pf"; exit 1; }
+  # A passing preflight can still carry a note the coordinator must see before briefing a
+  # cross-box leg: a sibling that did not answer. Said on stderr, so the LAUNCHED line stays
+  # the one thing on stdout.
+  case "$pf" in *"cross-box unreachable"*) echo "preflight note for $box/$name: ${pf#*skills=* }" >&2 ;; esac
   # The preflight fetches and runs a live probe; a halt or an adoption during that window
   # must still fence this launch, so the gate is read again right before anything is written.
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
