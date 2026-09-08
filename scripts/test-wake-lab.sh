@@ -80,12 +80,15 @@ SSH_LOG="$TMP/ssh.log"; export SSH_LOG
 cat > "$TMP/hosts.sh" <<'EOF'
 mac_of() { case "$1" in
   rog)   echo aa:bb:cc:00:00:01 aa:bb:cc:00:00:02 ;;
+  minix) echo aa:bb:cc:00:00:03 aa:bb:cc:00:00:04 ;;
   *) return 1 ;; esac; }
 eth_mac_of() { case "$1" in
   rog)   echo aa:bb:cc:00:00:02 ;;
+  minix) echo aa:bb:cc:00:00:04 ;;
   *) return 1 ;; esac; }
 ip_of() { case "$1" in
   rog)   echo 10.0.0.1 ;;
+  minix) echo 10.0.0.2 ;;
   *) return 1 ;; esac; }
 EOF
 
@@ -199,9 +202,9 @@ out=$(restart "rog-nv-wsl" 2>&1); rc=$?
   || ko "a failed restart over a live old guest read as success (rc=$rc) -- $out"
 : > "$SSH_LOG"
 out=$(env SSH_REFUSE=--shutdown WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-win rog-nv-wsl" "$WL" restart-wsl rog 2>&1); rc=$?
-[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'wsl restart FAILED on: rog' && ! printf '%s' "$out" | grep -q 'wsl up' \
-  && ok "...nor is one whose wsl.exe --shutdown failed on every alias that answered (rc=$rc)" \
-  || ko "a refused shutdown over a live old guest read as success (rc=$rc) -- $out"
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'wsl restart FAILED on: rog (shutdown refused' && ! printf '%s' "$out" | grep -q 'wsl up' \
+  && ok "...nor is one whose wsl.exe --shutdown failed on every alias that answered, and it says which phase (rc=$rc)" \
+  || ko "a refused shutdown over a live old guest read as success, or did not name the phase (rc=$rc) -- $out"
 grep -q 'wsl.exe -d Ubuntu' "$SSH_LOG" \
   && ko "a start was issued after the shutdown failed, onto the old VM: $(cat "$SSH_LOG")" \
   || ok "...and no start is issued onto the VM the shutdown left standing"
@@ -232,6 +235,15 @@ printf '%s' "$out" | grep -q 'wsl restart FAILED on: rog' && ! printf '%s' "$out
 [ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q '^all up$' && printf '%s\n' "$out" | tail -1 | grep -q 'wsl restart FAILED on: rog' \
   && ok "...nor 'all up': the restart failure is the wake's last line and its exit status (rc=$rc)" \
   || ko "the wake path said all up, or exited 0, over a failed restart (rc=$rc) -- $out"
+# A start that fails AFTER the shutdown went through is the opposite diagnosis: there is no VM at
+# all, old or new, and telling the operator the old one still answers would be wrong twice over.
+: > "$SSH_LOG"
+out=$(env SSH_REFUSE='-d Ubuntu' WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-win rog-nv-wsl" "$WL" restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'wsl shut down on rog (via rog-lan)' \
+  && printf '%s\n' "$out" | tail -1 | grep -q 'wsl restart FAILED on: rog (shut down, then the start failed' \
+  && ! printf '%s' "$out" | grep -q 'old VM' \
+  && ok "a start that fails after the shutdown is reported as a start failure, never as the old VM answering (rc=$rc)" \
+  || ko "a failed start after a shutdown was misreported (rc=$rc) -- $out"
 # The step's third failing shape: every wsl.exe command succeeded, and the fresh guest never
 # answered within the poll budget. `wsl still down` is a backend the sweep cannot test, so it is a
 # failure of the step, from the verb's exit status and from the wake path's final verdict alike.
@@ -245,6 +257,12 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WA
 [ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q '^all up$' && printf '%s\n' "$out" | tail -1 | grep -q 'NOT all up: wsl still down after 0 min on: rog' \
   && ok "...and the wake path over it is NOT all up, exit nonzero, with the poll timeout as its last line (rc=$rc)" \
   || ko "the wake path said all up, or exited 0, over a guest that never answered (rc=$rc) -- $out"
+# The poll's verdict is aggregate; the report is per box. With two boxes started and one guest
+# late, only that one is still down -- the other is up and its backend is testable today.
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan minix-lan rog-nv-wsl" "$WL" restart-wsl rog minix 2>&1); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '^wsl up on: rog$' && printf '%s\n' "$out" | tail -1 | grep -q 'wsl still down after 0 min on: minix$' \
+  && ok "one late guest is reported alone, and its neighbour as up (rc=$rc)" \
+  || ko "the poll's aggregate failure was pinned on every started box (rc=$rc) -- $out"
 # The kick path holds the same line: a kick no Windows endpoint carried is a failed kick, whatever
 # the guest answers, so `wsl up` there is the kick's own success and not the poll's.
 out=$(kick "rog-nv-wsl" 2>&1); rc=$?

@@ -297,7 +297,12 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
   # shutdown lands on the Windows host, never inside the VM, so it cannot kill the session issuing
   # it. A start that then fails falls through to the next alias, shutdown included, which is a
   # natural retry of the whole restart rather than a start on a VM only half torn down.
-  local name=$1 fresh=${2:-} dest what=kick
+  #
+  # On failure KICK_PHASE says which phase failed, because the two mean opposite things to the
+  # operator: `shutdown` — no alias carried the shutdown, so a -wsl guest that still answers is
+  # the OLD VM; `start` — the shutdown went through and the start then failed everywhere, so
+  # there is no VM at all until a kick succeeds; `kick` — the plain kick's start failed.
+  local name=$1 fresh=${2:-} dest what=kick shut=0
   [ "$fresh" = fresh ] && what=restart
   for dest in $(lan_of "$name") $(ts_of "$name"); do
     [ -n "$dest" ] || continue
@@ -305,15 +310,20 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
     if [ "$fresh" = fresh ]; then
       ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" 'wsl.exe --shutdown' >/dev/null 2>&1 || continue
       echo "  wsl shut down on $name (via $dest)"
+      shut=1
     fi
     if ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" 'wsl.exe -d Ubuntu -e true' >/dev/null 2>&1; then
       echo "  wsl started on $name (via $dest)"
       return 0
     fi
   done
-  echo "  wsl $what FAILED on $name (no Windows endpoint answered)"
+  if [ "$fresh" = fresh ] && [ "$shut" = 0 ]; then KICK_PHASE=shutdown
+  elif [ "$fresh" = fresh ]; then KICK_PHASE=start
+  else KICK_PHASE=kick; fi
+  echo "  wsl $what FAILED on $name (no Windows endpoint answered the $KICK_PHASE)"
   return 1
 }
+KICK_PHASE=""
 
 # `SetSuspendState` drops the connection mid-command; without ServerAlive* the ssh client can hang
 # for minutes instead of returning. The drop IS the success signature — do not treat it as an error,
@@ -371,29 +381,43 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 # STALE guest answering, and polling it would print `wsl up` over exactly the degraded VM the
 # restart exists to replace — and the sweep reads that line as permission to proceed. Nor is a
 # guest that never answered a success: `wsl still down` is a backend the sweep cannot test. So
-# `wsl up` is never printed alongside either failure, both are named, and both reach the wake
-# path's final verdict through WSL_FAILED, so that `all up` cannot paper over them either.
+# `wsl up` is never printed alongside a failure, every failure names its boxes and its phase —
+# the poll's aggregate verdict is re-probed per box, so one late guest does not label its
+# neighbour untestable, and a refused shutdown (the old VM still answers) is told apart from a
+# start that failed after the shutdown went through (no VM at all) — and every one of them
+# reaches the wake path's final verdict through WSL_FAILED, so `all up` cannot paper over it.
 WSL_FAILED=""
 start_wsl() {
-  local n what=kick started=() failed=() rc=0
+  local n what=kick started=() unshut=() unstarted=() up=() down=() rc=0 line
   [ "$FRESH_WSL" = fresh ] && what=restart
   for n in "$@"; do
-    if kick_wsl "$n" "$FRESH_WSL"; then started+=("$n"); else failed+=("$n"); fi
+    if kick_wsl "$n" "$FRESH_WSL"; then started+=("$n")
+    elif [ "$KICK_PHASE" = shutdown ]; then unshut+=("$n")
+    else unstarted+=("$n"); fi
   done
   # bash 3.2 under set -u: an empty array cannot be expanded, hence the count guards.
   if [ ${#started[@]} -gt 0 ]; then
-    if wait_for_wsl "${started[@]}"; then
-      [ ${#failed[@]} -eq 0 ] && echo "wsl up" || echo "wsl up on: ${started[*]}"
-    else
-      WSL_FAILED="wsl still down after $((WSL_WAIT_SECONDS / 60)) min on: ${started[*]}"
-      echo "$WSL_FAILED"
-      rc=1
-    fi
+    if wait_for_wsl "${started[@]}"; then up=("${started[@]}")
+    else for n in "${started[@]}"; do
+      if ssh_probe "$(wsl_of "$n")"; then up+=("$n"); else down+=("$n"); fi
+    done; fi
   fi
-  if [ ${#failed[@]} -gt 0 ]; then
-    WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }wsl $what FAILED on: ${failed[*]}"
-    echo "wsl $what FAILED on: ${failed[*]} (a -wsl guest that still answers there is the old VM)"
-    rc=1
+  WSL_FAILED=""
+  if [ ${#up[@]} -gt 0 ]; then
+    if [ ${#up[@]} -eq $# ]; then echo "wsl up"; else echo "wsl up on: ${up[*]}"; fi
+  fi
+  if [ ${#down[@]} -gt 0 ]; then
+    line="wsl still down after $((WSL_WAIT_SECONDS / 60)) min on: ${down[*]}"
+    echo "$line"; WSL_FAILED="$line"; rc=1
+  fi
+  if [ ${#unshut[@]} -gt 0 ]; then
+    line="wsl $what FAILED on: ${unshut[*]} (shutdown refused on every alias: a -wsl guest that still answers there is the old VM)"
+    echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
+  fi
+  if [ ${#unstarted[@]} -gt 0 ]; then
+    if [ "$what" = restart ]; then line="wsl $what FAILED on: ${unstarted[*]} (shut down, then the start failed on every alias: no VM there until a kick succeeds)"
+    else line="wsl $what FAILED on: ${unstarted[*]} (the start failed on every alias)"; fi
+    echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
   fi
   return $rc
 }
