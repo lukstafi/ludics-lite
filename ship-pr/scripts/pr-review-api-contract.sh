@@ -18,16 +18,19 @@
 #   CONTRACT_STALE_BASE_PR   a MERGED PR whose `.base.sha` is NOT its merge commit's first parent
 #                            (ludics-lite#53: merged behind a sibling, so the snapshot stood
 #                            still) — the pulls-API belief from ludics-lite#44/#47
-#   CONTRACT_REVIEWED_PR     a PR the review app reviewed AND approved (ludics-lite#39) — the
-#                            reactions, reviews and comments beliefs of the status/rounds suites
+#   CONTRACT_REVIEWED_PR     a PR the review app reviewed with at least one round of inline
+#                            findings AND approved (ludics-lite#39) — the reactions, reviews and
+#                            comments beliefs of the status/rounds suites; the pagination belief
+#                            needs more than 30 inline comments and skips on a smaller anchor
 #   CONTRACT_OWN_HEAD        under Actions: the head this job's own run is attached to
 #                            (github.event.pull_request.head.sha, else github.sha); with
 #                            GITHUB_RUN_ID it pins the job's own row as the newest for that head
 #   REVIEWER                 the review app's login without its [bot] suffix (pr-review.sh's)
 #
 # Exit 0: every checkable belief holds. 1: at least one MOVED (listed, all of them — the script
-# does not stop at the first). 3: the API did not answer (no answer, a 5xx, or throttling — 429
-# or a 403 naming a rate limit — after retries), which is not a moved belief and ends the run
+# does not stop at the first). 3: the API did not answer (no answer, a 5xx, a request timeout —
+# 408, 425 — or throttling — 429 or a 403 naming a rate limit — after retries), which is not a
+# moved belief and ends the run
 # at once — every read is an assignment under errexit, so a failed read cannot feed empty data
 # into the claims after it. 4: an endpoint or anchor the contract addresses answered a 4xx other
 # than those — the input was validated, so this is a retired or renamed endpoint (drift), or a
@@ -98,7 +101,8 @@ api() {
       return 0
     fi
     case "$out" in
-    *"HTTP 429"* | *"rate limit"* | *"Rate limit"*) ;; # throttled: retried, transport if it persists
+    # The 4xx about the connection rather than the request: throttling, and a request timeout.
+    *"HTTP 429"* | *"HTTP 408"* | *"HTTP 425"* | *"rate limit"* | *"Rate limit"*) ;; # retried, transport if it persists
     *"HTTP 401"* | *"HTTP 403"*)
       echo "pr-review-api-contract.sh: the API refused the read (the token or the workflow's permissions, not a moved belief): gh api $* -> ${out##*$'\n'}" >&2
       exit 5
@@ -291,8 +295,12 @@ if is_num "$red_run"; then
     'all(.[]; (.name | type == "string") and (.status | type == "string") and has("conclusion") and (.conclusion == null or (.conclusion | type == "string")))' "$jobs"
   pin "job conclusions are in the same vocabulary as run conclusions" \
     "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$jobs"
-  pin "a red run's jobs show which job was red: at least one non-green job, or no jobs at all (the startup_failure shape)" \
-    'length == 0 or any(.[]; .conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")' "$jobs"
+  # The belief run_red_is_advisory_only rests on: it discards a run's red when no non-advisory
+  # job is HARD red (failure, timed_out, startup_failure — conclusion_class's red), so a red run
+  # whose jobs were all cancelled or stale would lose its red silently. A MOVED here is a gap in
+  # that projection, which is the direction the contract exists to show.
+  pin "a red run's jobs carry the red: at least one job concluded failure, timed_out or startup_failure, or no jobs at all (the startup_failure shape)" \
+    'length == 0 or any(.[]; .conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure")' "$jobs"
 elif is_list "$all_runs"; then
   skip "a red run's jobs name the red job" "no failure, timed_out or startup_failure run among the latest $(jq length <<<"$all_runs")"
 else
@@ -315,8 +323,31 @@ pin "check-run conclusions are in the vocabulary conclusion_class classifies" \
   "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$checks"
 pin "every check run carries a check_suite.id (build_checks reads by name across every suite and provider)" \
   'all(.[]; .check_suite.id | type == "number")' "$checks"
-pin "filter=latest yields one check run per name WITHIN a check suite (a re-run does not add a stale twin; two workflows may share a job name)" \
-  '[.[] | "\(.check_suite.id)/\(.name)"] | length == (unique | length)' "$checks"
+# What build_checks asks of filter=latest is not uniqueness — two jobs may legally share a name,
+# and it emits one row per check run — but that a re-run's superseded attempt is DROPPED, since
+# a stale red twin would otherwise redden the head. So the belief is stated against filter=all:
+# latest is a subset of all by id, and every row all has that latest lacks is superseded by a
+# newer (higher-id) row of the same suite and name. The second half needs a re-run on the tip
+# to be non-vacuous, and says so when there is none.
+checks_all=$(api "repos/$REPO/commits/$HEAD/check-runs?filter=all&per_page=100" | pages check_runs)
+if ! is_list "$checks_all"; then
+  skip "filter=latest drops a re-run's superseded attempt" "the filter=all read is not a list — $UNUSABLE"
+elif [ "$(jq length <<<"$checks_all")" -ge 100 ]; then
+  skip "filter=latest drops a re-run's superseded attempt" "the tip has a page or more of check runs under filter=all; the sample cannot be compared whole"
+else
+  jq -c '[.[].id]' <<<"$checks" >"$SCRATCH/latest_ids.json"
+  printf '%s\n' "$checks" >"$SCRATCH/latest.json"
+  pin "filter=latest is a subset of filter=all by id (it filters; it does not invent rows)" \
+    '[.[].id] as $all | $latest[0] | all(.[]; . as $i | $all | index($i))' "$checks_all" --slurpfile latest "$SCRATCH/latest_ids.json"
+  if [ "$(jq length <<<"$checks_all")" -gt "$(jq length <<<"$checks")" ]; then
+    pin "every check run filter=all has that filter=latest lacks is a superseded attempt: a newer row of the same suite and name is in filter=latest (no stale twin, and no uniqueness asked of same-named jobs)" \
+      '[.[] | select(.id as $i | $latest[0] | index($i) | not)]
+       | all(.[]; .check_suite.id as $s | .name as $n | .id as $i | $lat[0] | any(.[]; .check_suite.id == $s and .name == $n and .id > $i))' \
+      "$checks_all" --slurpfile latest "$SCRATCH/latest_ids.json" --slurpfile lat "$SCRATCH/latest.json"
+  else
+    skip "filter=latest drops a re-run's superseded attempt" "no re-run on the tip: filter=all and filter=latest have the same $(jq length <<<"$checks") rows"
+  fi
+fi
 # A check run's suite is its run's — check_suite.id on the check joins check_suite_id on the run
 # — so the correlation is exact (a check is named after a job of ITS run, not of some run on the
 # tip) and bounded: the newest CORRELATE runs, whatever their status, since a check run exists
@@ -513,16 +544,25 @@ if [ -n "$REVIEWED_PR" ]; then
   is_list "$inline_page" || inline_page='[]'
   pin "inline comments carry numeric id, pull_request_review_id, commit_id, user.login, path, body, and the line/original_line pair poll renders" \
     "all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\") and (.body | type == \"string\") and has(\"line\") and has(\"original_line\"))" "$inline_all"
-  pin "the flat listing paginates at 30 by default: an unpaginated read of #$REVIEWED_PR's $(jq length <<<"$inline_all") inline comments returns 30" \
-    "length == 30 and $(jq length <<<"$inline_all") > 30" "$inline_page"
-  first_review=$(jq -r --arg bot "$BOT" '[.[] | select(.user.login == $bot and .state == "COMMENTED")][0].id // empty' <<<"$reviews")
-  if is_num "$first_review"; then
-    per_review=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/reviews/$first_review/comments?per_page=100" | jq -s 'add')
-    jq -c '[.[]?.id]' <<<"$inline_all" >"$SCRATCH/inline_ids.json"
-    pin "a review's own comments endpoint answers with a list whose ids are a subset of the flat listing's (the merge-by-id read)" \
-      'type == "array" and length >= 1 and all(.[].id; . as $i | $ids[0] | index($i))' "$per_review" --slurpfile ids "$SCRATCH/inline_ids.json"
+  n_inline=$(jq length <<<"$inline_all")
+  if [ "$n_inline" -gt 30 ]; then
+    pin "the flat listing paginates at 30 by default: an unpaginated read of #$REVIEWED_PR's $n_inline inline comments returns 30" \
+      'length == 30' "$inline_page"
   else
-    skip "a review's own comments endpoint" "$UNUSABLE"
+    skip "the flat listing paginates at 30 by default" "#$REVIEWED_PR has $n_inline inline comments, not more than a page; a larger anchor shows it"
+  fi
+  # The review whose comments are read is one the flat listing NAMES (a pull_request_review_id
+  # it carries), the way the merge-by-id read is made — not the app's first COMMENTED review,
+  # which may be a summary with no inline comment — so the claim is exact: the per-review feed
+  # is the flat listing's rows for that review, as a set of ids.
+  named_review=$(jq -r '[.[]?.pull_request_review_id | select(type == "number")][0] // empty' <<<"$inline_all")
+  if is_num "$named_review"; then
+    per_review=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/reviews/$named_review/comments?per_page=100" | jq -s 'add')
+    jq -c --argjson r "$named_review" '[.[]? | select(.pull_request_review_id == $r) | .id] | sort' <<<"$inline_all" >"$SCRATCH/named_ids.json"
+    pin "a review's own comments endpoint answers with exactly the flat listing's rows for that review, by id (the merge-by-id read; review $named_review)" \
+      'type == "array" and ([.[].id] | sort) == $ids[0]' "$per_review" --slurpfile ids "$SCRATCH/named_ids.json"
+  else
+    skip "a review's own comments endpoint" "the flat listing names no review — $UNUSABLE"
   fi
 else
   skip "the reviewer feeds' shapes" "set CONTRACT_REVIEWED_PR to a PR the review app reviewed and approved"
