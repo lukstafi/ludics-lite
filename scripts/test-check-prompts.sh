@@ -180,11 +180,21 @@ expect "a carriage return" 1 'frontmatter carries a control character' -- "$CP" 
 # A NUL byte never reaches a shell variable (bash drops it, warning on stderr where no verdict
 # reads), and invalid UTF-8 is a loader error: both are refused on the raw file, first.
 fresh "$R"; printf -- '---\nname: alpha\ndescription: a NUL \000 inside\n---\n' > "$R/alpha/SKILL.md"
-expect "a NUL byte" 1 'carries a NUL byte or invalid UTF-8' -- "$CP" "$R"
+expect "a NUL byte" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
 fresh "$R"; printf -- '---\nname: alpha\ndescription: bad \377 byte\n---\n' > "$R/alpha/SKILL.md"
-expect "invalid UTF-8" 1 'carries a NUL byte or invalid UTF-8' -- "$CP" "$R"
-fresh "$R"; printf -- '---\nname: alpha\ndescription: fine \303\274ber text\n---\n' > "$R/alpha/SKILL.md"
-expect "...while valid UTF-8 passes" 0 '6 passed, 0 failed' -- "$CP" "$R"
+expect "invalid UTF-8" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
+# ...and the characters YAML's printable set excludes, by the spec's definition: the C1
+# controls and the two non-characters. Everything else valid UTF-8 encodes is content.
+fresh "$R"; printf -- '---\nname: alpha\ndescription: a C1 control \302\205 inside\n---\n' > "$R/alpha/SKILL.md"
+expect "a C1 control (U+0085)" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
+fresh "$R"; printf -- '---\nname: alpha\ndescription: a\357\277\276 non-character\n---\n' > "$R/alpha/SKILL.md"
+expect "U+FFFE" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
+fresh "$R"; printf -- '---\nname: alpha\ndescription: fine \303\274ber text \342\200\224 with a dash\n---\n' > "$R/alpha/SKILL.md"
+expect "...while valid UTF-8 content passes" 0 '6 passed, 0 failed' -- "$CP" "$R"
+# A Unicode space is content, not whitespace, to YAML and to this check (LC_ALL=C): appended
+# to a name it stays in the name, which then does not match its directory.
+fresh "$R"; printf -- '---\nname: alpha\342\200\202\ndescription: en space after the name\n---\n' > "$R/alpha/SKILL.md"
+expect "a Unicode space is kept in the name" 1 "does not match its directory 'alpha'" -- "$CP" "$R"
 
 # Optional keys are held to the same grammar: a loader rejects the whole file on any of them.
 fresh "$R"; skill "$R" alpha 'name: alpha' 'description: fine' 'allowed-tools: ['
@@ -244,6 +254,10 @@ fresh "$R"; { echo '````'; echo '```'; cat "$R/README.md"; echo '````'; } > "$R/
 expect "a shorter fence does not close a longer one" 1 "no '| Skill |' table" -- "$CP" "$R"
 fresh "$R"; { echo '```'; echo 'code'; echo '`````'; cat "$R/README.md"; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
 expect "...and a longer fence of the same marker does" 0 '6 passed, 0 failed' -- "$CP" "$R"
+fresh "$R"; { echo '```text'; echo '```not-a-close'; cat "$R/README.md"; echo '```'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
+expect "a fence line with text after the marker does not close" 1 "no '| Skill |' table" -- "$CP" "$R"
+fresh "$R"; { echo '```text'; echo 'code'; echo '```   '; cat "$R/README.md"; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
+expect "...and one with only whitespace after it does" 0 '6 passed, 0 failed' -- "$CP" "$R"
 
 # Every data row is judged: a row the reader sees with a first cell that is not one backticked
 # name fails, instead of being skipped as not-a-row.

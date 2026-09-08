@@ -27,6 +27,13 @@
 
 set -uo pipefail
 
+# Every character class below is ASCII, by locale: under C, `[[:space:]]` is the blanks YAML
+# calls whitespace, `[[:cntrl:]]` the ASCII controls, `[A-Za-z]` the letters, and any other
+# byte is content -- a Unicode space in a name stays in the name and is compared with the
+# directory, never trimmed away as a UTF-8 locale's `[[:space:]]` would. The same reading on
+# every box, whatever its locale.
+export LC_ALL=C
+
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=${1:-$(cd "$HERE/.." && pwd)}
 [ -d "$ROOT" ] || { echo "check-prompts: no such directory: $ROOT" >&2; exit 2; }
@@ -130,20 +137,25 @@ value_of() {
   printf '%s' "$inner"
 }
 
-# The bytes a shell variable cannot hold are checked on the raw file, before anything is read
-# into one: bash drops a NUL from a command substitution (with a warning on stderr that no
-# verdict reads), and a loader rejects the file for it; invalid UTF-8 goes the same way.
+# The bytes a shell variable cannot hold, or a loader will not, are checked on the raw file
+# before anything is read into a variable: bash drops a NUL from a command substitution (with a
+# warning on stderr that no verdict reads); invalid UTF-8 is a loader error; and so is any
+# character outside YAML's `c-printable` production -- of which, in valid UTF-8 with the ASCII
+# controls refused on the frontmatter below, the C1 controls U+0080-U+009F (`\xC2\x80`-
+# `\xC2\x9F`) and the non-characters U+FFFE, U+FFFF (`\xEF\xBF\xBE`, `\xEF\xBF\xBF`) are what
+# remains. Refusing by the spec's own definition is what closes the class.
 well_formed_bytes() {
   local f="$1"
   [ "$(tr -d '\000' < "$f" | wc -c)" -eq "$(wc -c < "$f")" ] || return 1
-  iconv -f UTF-8 -t UTF-8 < "$f" > /dev/null 2>&1
+  iconv -f UTF-8 -t UTF-8 < "$f" > /dev/null 2>&1 || return 1
+  ! grep -qE "$(printf '\302[\200-\237]|\357\277[\276\277]')" "$f"
 }
 
 check_skill_file() {
   local rel="$1" dir fm bad key count raw name="" value
   dir=$(basename "$(dirname "$ROOT/$rel")")
   if ! well_formed_bytes "$ROOT/$rel"; then
-    ko "$rel" "carries a NUL byte or invalid UTF-8; a loader rejects the file, and a shell variable could not even hold it to check"
+    ko "$rel" "carries a byte sequence no loader accepts: a NUL, invalid UTF-8, or a character outside YAML's printable set (a C1 control, U+FFFE, U+FFFF)"
     return
   fi
   if ! fm=$(frontmatter "$ROOT/$rel"); then
@@ -199,10 +211,15 @@ check_skill_file() {
 # right under the header -- without one Markdown renders the rows as prose, and so does this.
 # A table ends at the first line that is not a row, blank or not: a heading or paragraph ends
 # it just the same, and the rows of a later table are that table's, whatever its header. The
-# two Markdown contexts that hide a table from the renderer, a fenced code block (closed only
-# by a fence of the same marker at least as long as the one that opened it, as CommonMark
-# closes it) and an HTML comment, hide it from this scan too; nothing else can, since a row is
-# read only at column 0. Every data row is printed whole for check_index to judge its first
+# two Markdown contexts that hide a table from the renderer by accident, a fenced code block
+# (closed only by a fence of the same marker at least as long as the one that opened it, with
+# nothing but whitespace after it, as CommonMark closes it) and an HTML comment, hide it from
+# this scan too. That is the scan's scope, and a deliberate line: a table is read at column 0
+# outside those two, and a table an author wraps in a raw HTML block (`<pre>`, `<div>`, any of
+# CommonMark's seven HTML-block kinds) is a choice made on purpose, which a hygiene check for
+# accidental drift does not police -- following the HTML-block grammar clause by clause would
+# not end, and would guard nothing anyone does by mistake. Every data row is printed whole for
+# check_index to judge its first
 # cell: a row is never skipped for being malformed, and an empty cell cannot vanish the way an
 # empty last line of a command substitution does.
 table_rows() {
@@ -211,7 +228,7 @@ table_rows() {
       line = $0; sub(/^[[:space:]]*/, "", line); m = substr(line, 1, 1)
       len = 0; while (substr(line, len + 1, 1) == m) len++
       if (!fence) { fence = 1; fence_m = m; fence_len = len }
-      else if (m == fence_m && len >= fence_len) fence = 0
+      else if (m == fence_m && len >= fence_len && substr(line, len + 1) ~ /^[[:space:]]*$/) fence = 0
       next
     }
     fence { next }
