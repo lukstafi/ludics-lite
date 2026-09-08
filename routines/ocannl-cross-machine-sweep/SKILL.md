@@ -50,6 +50,9 @@ Read its last lines:
   sweep's parallel width while every single-process probe passes (ludics-lite#60), and on a
   cold-booted box the shutdown is a no-op. The restarted VM is a freshly kicked one, so the
   previous bullet applies to it twice over: the sweep's ssh sessions have to follow promptly.
+  `wsl restart FAILED on: <box>` as the last line means the shutdown never happened there: a
+  `-wsl` that still answers is the old VM, so that backend is untestable today — report it as
+  such rather than sweeping it.
 
 `~/bin/wake-lab.sh status` prints the per-box picture (router-active, `-lan`, `-win`, `-wsl`) if you need to
 say precisely what happened.

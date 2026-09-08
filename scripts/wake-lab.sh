@@ -364,6 +364,31 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
   done
 }
 
+# start_wsl <box...> — kick (or, with FRESH_WSL, restart) WSL on each box, then poll only the boxes
+# whose kick_wsl succeeded. The restart's success is the restart's own status, never the guest's
+# liveness: a `wsl --shutdown` that failed on both Windows aliases leaves the STALE guest answering,
+# and polling it would print `wsl up` over exactly the degraded VM the restart exists to replace —
+# and the sweep reads that line as permission to proceed. So a failed box is reported last, by
+# name, `wsl up` is never printed alongside a failure, and the status is 1.
+start_wsl() {
+  local n what=kick started=() failed=()
+  [ "$FRESH_WSL" = fresh ] && what=restart
+  for n in "$@"; do
+    if kick_wsl "$n" "$FRESH_WSL"; then started+=("$n"); else failed+=("$n"); fi
+  done
+  # bash 3.2 under set -u: an empty array cannot be expanded, hence the count guards.
+  if [ ${#started[@]} -gt 0 ]; then
+    if wait_for_wsl "${started[@]}"; then
+      [ ${#failed[@]} -eq 0 ] && echo "wsl up" || echo "wsl up on: ${started[*]}"
+    else
+      echo "wsl still down after $((WSL_WAIT_SECONDS / 60)) min"
+    fi
+  fi
+  [ ${#failed[@]} -eq 0 ] && return 0
+  echo "wsl $what FAILED on: ${failed[*]} (a -wsl guest that still answers there is the old VM)"
+  return 1
+}
+
 wait_for_wsl() { # wait_for_wsl <box...> — tailscaled inside WSL can take >2 min after a resume
   local names=("$@") n w all deadline=$((SECONDS + WSL_WAIT_SECONDS))
   while :; do
@@ -415,9 +440,7 @@ case "$VERB" in
     do_status "${TARGETS[@]}"
     ;;
   kick-wsl)
-    for t in "${TARGETS[@]}"; do kick_wsl "$t" "$FRESH_WSL"; done
-    wait_for_wsl "${TARGETS[@]}" && echo "wsl up" \
-      || echo "wsl still down after $((WSL_WAIT_SECONDS / 60)) min"
+    start_wsl "${TARGETS[@]}"; exit $?
     ;;
   sleep|hibernate|down)
     for t in "${TARGETS[@]}"; do power_action "$VERB" "$t"; done
@@ -435,11 +458,7 @@ case "$VERB" in
       if [ "$WANT_WSL" = 1 ]; then
         UP=()
         for t in "${TARGETS[@]}"; do is_up "$t" && UP+=("$t"); done
-        if [ ${#UP[@]} -gt 0 ]; then
-          for t in "${UP[@]}"; do kick_wsl "$t" "$FRESH_WSL"; done
-          wait_for_wsl "${UP[@]}" && echo "wsl up" \
-            || echo "wsl still down after $((WSL_WAIT_SECONDS / 60)) min"
-        fi
+        [ ${#UP[@]} -gt 0 ] && start_wsl "${UP[@]}"
       fi
       if [ "$rc" = 0 ]; then
         echo "all up"
