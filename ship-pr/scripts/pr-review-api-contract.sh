@@ -26,11 +26,13 @@
 #   REVIEWER                 the review app's login without its [bot] suffix (pr-review.sh's)
 #
 # Exit 0: every checkable belief holds. 1: at least one MOVED (listed, all of them — the script
-# does not stop at the first). 3: the API did not answer, which is not a moved belief. A belief
-# this repository cannot check prints as `skip`, with the reason, so the unpinned set is visible
-# in every run rather than assumed away.
+# does not stop at the first). 3: the API did not answer, which is not a moved belief and ends
+# the run at once: every read is an assignment under errexit, so a failed read cannot feed empty
+# data into the claims after it and be reported as drift. A belief this repository cannot check
+# prints as `skip`, with the reason, so the unpinned set is visible in every run rather than
+# assumed away.
 
-set -uo pipefail
+set -euo pipefail
 
 REPO="${1:-${GITHUB_REPOSITORY:-lukstafi/ludics-lite}}"
 REVIEWER="${REVIEWER:-chatgpt-codex-connector}"
@@ -57,8 +59,10 @@ CLAIMS=0
 MOVED=0
 SKIPPED=0
 
-# api <gh api args...>: one read, three attempts. A read that never answers ends the run with 3:
-# an unanswered call supports no claim about the API, moved or not.
+# api <gh api args...>: one read, three attempts on a transport failure and none on a 4xx (the
+# API answering, if with "no such thing"). A read that fails ends the run with 3, from inside a
+# command substitution too — the caller's assignment fails, and the script runs under errexit —
+# because an unanswered call supports no claim about the API, moved or not.
 api() {
   local attempt out
   for attempt in 1 2 3; do
@@ -66,9 +70,10 @@ api() {
       printf '%s\n' "$out"
       return 0
     fi
+    case "$out" in *"HTTP 4"[0-9][0-9]*) break ;; esac
     [ "$attempt" -eq 3 ] || sleep $((attempt * 5))
   done
-  echo "pr-review-api-contract.sh: the API did not answer: gh api $* -> $out" >&2
+  echo "pr-review-api-contract.sh: the API did not answer: gh api $* -> ${out%%$'\n'*}" >&2
   exit 3
 }
 
@@ -146,26 +151,31 @@ else
   skip "this job's own run is the newest row on its head" "not running under Actions (GITHUB_RUN_ID and CONTRACT_OWN_HEAD unset)"
 fi
 
-wid=$(jq -r '.[0].workflow_id' <<<"$runs")
-wname=$(jq -r '.[0].name' <<<"$runs")
-wf=$(api "repos/$REPO/actions/workflows/$wid")
-pin "workflow_id resolves to a workflow FILE whose name is the run's name (the fold keys on the file, not the display name)" \
-  "(.path | startswith(\".github/workflows/\")) and .name == \"$wname\"" "$wf"
+if [ "$(jq length <<<"$runs")" -ge 1 ]; then
+  wid=$(jq -r '.[0].workflow_id' <<<"$runs")
+  wname=$(jq -r '.[0].name' <<<"$runs")
+  wf=$(api "repos/$REPO/actions/workflows/$wid")
+  pin "workflow_id resolves to a workflow FILE whose name is the run's name (the fold keys on the file, not the display name)" \
+    "(.path | startswith(\".github/workflows/\")) and .name == \"$wname\"" "$wf"
+fi
 
 # --- actions/runs/<id>/jobs ---------------------------------------------------------------------
 section "actions/runs/<id>/jobs — run_red_is_advisory_only's feed"
 all_runs="${all_runs:-$(api "repos/$REPO/actions/runs?per_page=100" --jq '.workflow_runs')}"
-red_run=$(jq -r '[.[] | select(.status == "completed" and .conclusion == "failure")][0].id // empty' <<<"$all_runs")
+# The sample is the latest run of ANY conclusion conclusion_class calls red, since the advisory
+# read runs for each of them, not only for `failure`.
+red_run=$(jq -r '[.[] | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure"))][0].id // empty' <<<"$all_runs")
 if [ -n "$red_run" ]; then
+  red_concl=$(jq -r --argjson id "$red_run" '.[] | select(.id == $id) | .conclusion' <<<"$all_runs")
   jobs=$(api --paginate "repos/$REPO/actions/runs/$red_run/jobs?per_page=100" --jq '.jobs' | jq -s 'add')
-  pin "jobs[] rows carry name, status and conclusion (run $red_run, the latest red run)" \
+  pin "jobs[] rows carry name, status and conclusion (run $red_run, the latest red run: $red_concl)" \
     'type == "array" and all(.[]; (.name | type == "string") and (.status | type == "string") and (.conclusion == null or (.conclusion | type == "string")))' "$jobs"
   pin "job conclusions are in the same vocabulary as run conclusions" \
     "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$jobs"
   pin "a red run's jobs show which job was red: at least one non-green job, or no jobs at all (the startup_failure shape)" \
     'length == 0 or any(.[]; .conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")' "$jobs"
 else
-  skip "a red run's jobs name the red job" "no failed run among the latest $(jq length <<<"$all_runs")"
+  skip "a red run's jobs name the red job" "no failure, timed_out or startup_failure run among the latest $(jq length <<<"$all_runs")"
 fi
 
 # --- commits/<sha>/check-runs ---------------------------------------------------------------------
@@ -177,8 +187,10 @@ pin "every check run carries name, status, conclusion (null while unfinished), h
              and (.html_url | type == "string") and (.app.slug | type == "string"))' "$checks"
 pin "check-run conclusions are in the vocabulary conclusion_class classifies" \
   "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$checks"
-pin "filter=latest yields one check run per name (a re-run does not add a stale twin)" \
-  '[.[].name] | length == (unique | length)' "$checks"
+pin "every check run carries a check_suite.id (build_checks reads by name across every suite and provider)" \
+  'all(.[]; .check_suite.id | type == "number")' "$checks"
+pin "filter=latest yields one check run per name WITHIN a check suite (a re-run does not add a stale twin; two workflows may share a job name)" \
+  '[.[] | "\(.check_suite.id)/\(.name)"] | length == (unique | length)' "$checks"
 # Every run on the tip, whatever its status: a check run exists only once its job does, and a
 # tip whose run is still queued (a fresh merge behind a runner queue) has no completed run yet.
 job_names='[]'
@@ -220,18 +232,22 @@ else
   skip "base.sha is a stale snapshot on a merged PR" "set CONTRACT_STALE_BASE_PR to a merged PR whose base moved before it merged"
 fi
 
-recent=$(api "repos/$REPO/pulls?state=closed&sort=updated&direction=desc&per_page=10" --jq '[.[] | select(.merged_at != null)]')
+# Merged first, then the cut: closed-unmerged PRs would otherwise eat the sample, silently.
+recent=$(api "repos/$REPO/pulls?state=closed&sort=updated&direction=desc&per_page=100" --jq '[.[] | select(.merged_at != null)] | .[0:10]')
 n_recent=$(jq length <<<"$recent")
 if [ "$n_recent" -ge 1 ]; then
   ok_all=true
   for n in $(jq -r '.[].number' <<<"$recent"); do
-    IFS=$'\t' read -r bs ms <<<"$(api "repos/$REPO/pulls/$n" --jq '[.base.sha, .merge_commit_sha] | @tsv')"
+    p=$(api "repos/$REPO/pulls/$n" --jq '[.base.sha, .merge_commit_sha] | @tsv')
+    IFS=$'\t' read -r bs ms <<<"$p"
     p1=$(api "repos/$REPO/commits/$ms" --jq '.parents[0].sha')
     st=$(api "repos/$REPO/compare/$bs...$p1?per_page=1" --jq .status)
     case "$st" in identical | ahead) ;; *) ok_all=false; echo "      #$n: base.sha $bs vs first parent $p1: compare status $st" ;; esac
   done
-  pin "on the $n_recent most recently merged PRs, base.sha is the merge's first parent or an ancestor of it — never off the base line" \
+  pin "on the $n_recent most recently merged PRs (of the latest 100 closed), base.sha is the merge's first parent or an ancestor of it — never off the base line" \
     ". == true" "$ok_all"
+else
+  skip "base.sha stays on the base line across recently merged PRs" "no merged PR among the latest 100 closed"
 fi
 
 # Mergeability is on the single-PR read only — the list endpoint omits mergeable and
@@ -288,10 +304,12 @@ if [ -n "$REVIEWED_PR" ]; then
     "all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\"))" "$inline_all"
   pin "the flat listing paginates at 30 by default: an unpaginated read of #$REVIEWED_PR's $(jq length <<<"$inline_all") inline comments returns 30" \
     "length == 30 and $(jq length <<<"$inline_all") > 30" "$inline_page"
-  first_review=$(jq -r "[.[] | select(.user.login == \"$BOT\" and .state == \"COMMENTED\")][0].id" <<<"$reviews")
-  per_review=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/reviews/$first_review/comments?per_page=100" | jq -s 'add')
-  pin "a review's own comments endpoint answers, and its ids are a subset of the flat listing's (the merge-by-id read)" \
-    "length >= 1 and all(.[].id; . as \$i | $(jq -c '[.[].id]' <<<"$inline_all") | index(\$i))" "$per_review"
+  first_review=$(jq -r "[.[] | select(.user.login == \"$BOT\" and .state == \"COMMENTED\")][0].id // empty" <<<"$reviews")
+  if [ -n "$first_review" ]; then
+    per_review=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/reviews/$first_review/comments?per_page=100" | jq -s 'add')
+    pin "a review's own comments endpoint answers, and its ids are a subset of the flat listing's (the merge-by-id read)" \
+      "length >= 1 and all(.[].id; . as \$i | $(jq -c '[.[].id]' <<<"$inline_all") | index(\$i))" "$per_review"
+  fi
 else
   skip "the reviewer feeds' shapes" "set CONTRACT_REVIEWED_PR to a PR the review app reviewed and approved"
 fi
