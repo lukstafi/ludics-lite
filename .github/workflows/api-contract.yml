@@ -34,24 +34,36 @@ jobs:
       actions: read
       checks: read
       pull-requests: read
+    outputs:
+      # The script's exit code, for the reporter: 1 is a moved belief, 3 is the API not
+      # answering, and only the first is drift.
+      rc: ${{ steps.contract.outputs.rc }}
     steps:
       - uses: actions/checkout@v4
       - name: Assert the fixtures' beliefs against this repository's live API
+        id: contract
         env:
           GH_TOKEN: ${{ github.token }}
           # This run's own row in actions/runs?head_sha= is the live newest-first check: on a
           # pull_request run the head is the PR's, not the merge commit's.
           CONTRACT_OWN_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: ship-pr/scripts/pr-review-api-contract.sh "$GITHUB_REPOSITORY"
+        run: |
+          set +e
+          ship-pr/scripts/pr-review-api-contract.sh "$GITHUB_REPOSITORY"
+          rc=$?
+          echo "rc=$rc" >>"$GITHUB_OUTPUT"
+          exit "$rc"
 
   report:
     name: report a moved belief
     # A scheduled run nobody watches fails silently, which is the drift class this workflow
     # exists to catch. One open issue per drift, not one per day: a second scheduled failure
     # finds the first's issue and adds a comment instead. No checkout: this job's token can
-    # write, so it runs nothing a pull request could have changed.
+    # write, so it runs nothing a pull request could have changed. Only a moved belief (exit 1)
+    # is reported: the API not answering (exit 3) is an outage, not drift, and is left to the
+    # next day's run.
     needs: contract
-    if: failure() && github.event_name == 'schedule'
+    if: failure() && github.event_name == 'schedule' && needs.contract.outputs.rc == '1'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
