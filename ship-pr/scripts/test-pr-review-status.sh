@@ -23,6 +23,10 @@ HEAD_SHA=head-sha
 MERGEABLE_STATE=clean
 FAIL_PULLS=""
 PUSH_ON_REVIEWS_READ=""
+# The base's tip, and the head PUSH_ON_REVIEWS_READ swaps in. With HEAD_SHA these are the only
+# SHAs the transport below spells out, so a case that needs a new head just sets HEAD_SHA.
+BASE_SHA=base-sha
+PUSHED_HEAD=new-head-sha
 PAST=2026-09-01T00:00:00Z
 # The head commit's own date, which is what a failure naming no ref is dated against.
 HEAD_AT=2026-09-01T00:00:00Z
@@ -90,11 +94,19 @@ compare_json() { # <behind> <ahead> <file>
       files:[{filename:$f}]}'
 }
 
+# Is this SHA a head the fixture is standing behind? The commit read and both compare directions
+# ask, so the three of them agree on one answer and a case that needs a new head costs the one
+# HEAD_SHA assignment it already makes — spelling a head into an endpoint pattern is what used to
+# cost three edits or a `bail`.
+fixture_head() { # <sha>
+  [ "$1" = "$HEAD_SHA" ] || [ "$1" = "$PUSHED_HEAD" ]
+}
+
 # Minimal gh fixture transport for every feed `status` and `watch` read. The --jq filter matters
 # here: the PR read asks gh to format its head/mergeability snapshot. --paginate is ignored (one
 # page is the whole feed).
 gh() {
-  local response=""
+  local response="" spec left right
   gh_fixture_parse "$@"
   case "$FIXTURE_ENDPOINT" in
   "repos/$REPO/issues/7/reactions?per_page=100") response="$REACTIONS_JSON" ;;
@@ -113,18 +125,33 @@ gh() {
       return 1
     fi
     # base.sha is a stale snapshot on purpose, as on a conflicted PR (see the base-drift suite).
-    [ ! -e "$TEST_ROOT/pushed" ] || HEAD_SHA=new-head-sha
+    [ ! -e "$TEST_ROOT/pushed" ] || HEAD_SHA="$PUSHED_HEAD"
     response=$(jq -cn --arg h "$HEAD_SHA" --arg m "$MERGEABLE_STATE" \
       '{base:{ref:"main",sha:"stale-base-sha"}, head:{sha:$h}, mergeable_state:$m}')
     ;;
-  "repos/$REPO/commits/head-sha" | "repos/$REPO/commits/new-head-sha" | \
-    "repos/$REPO/commits/$FAILED_HEAD")
+  # Before the head arm: `main` is a ref this fixture resolves, not a head it serves.
+  "repos/$REPO/commits/main") response="{\"sha\":\"$BASE_SHA\"}" ;;
+  "repos/$REPO/commits/"*)
+    fixture_head "${FIXTURE_ENDPOINT#"repos/$REPO/commits/"}" ||
+      bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT"
+    # The date is the whole answer here — this read is `--jq .commit.committer.date` — so the
+    # `sha` stays the placeholder it has always been rather than echoing the head back.
     response=$(jq -cn --arg d "$HEAD_AT" '{sha:"head-sha", commit:{committer:{date:$d}}}') ;;
-  "repos/$REPO/commits/main") response='{"sha":"base-sha"}' ;;
-  "repos/$REPO/compare/base-sha...head-sha?per_page=1" | \
-    "repos/$REPO/compare/base-sha...$FAILED_HEAD?per_page=1") response=$(compare_json 7 15 pr.txt) ;;
-  "repos/$REPO/compare/head-sha...base-sha?per_page=1" | \
-    "repos/$REPO/compare/$FAILED_HEAD...base-sha?per_page=1") response=$(compare_json 15 7 base.txt) ;;
+  # The query suffix is part of the endpoint, not decoration: matching it here is what keeps the
+  # generalization to the head SHA alone, so a compare that lost its `?per_page=1` still bails.
+  "repos/$REPO/compare/"*"?per_page=1")
+    spec=${FIXTURE_ENDPOINT#"repos/$REPO/compare/"}
+    spec=${spec%"?per_page=1"}
+    left=${spec%%...*}
+    right=${spec#*...}
+    if [ "$left" = "$BASE_SHA" ] && fixture_head "$right"; then
+      response=$(compare_json 7 15 pr.txt) # base...head, the forward read: 7 behind, 15 ahead
+    elif [ "$right" = "$BASE_SHA" ] && fixture_head "$left"; then
+      response=$(compare_json 15 7 base.txt) # head...base, the reverse read: the counts swap
+    else
+      bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT"
+    fi
+    ;;
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
   gh_fixture_answer "$response"
