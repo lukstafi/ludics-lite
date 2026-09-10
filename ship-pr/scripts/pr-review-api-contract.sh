@@ -677,8 +677,16 @@ if [ -n "$REVIEWED_PR" ]; then
     # `.line // .original_line // 0` for a row it has from this feed alone. So the claim is the
     # fields poll reads from this feed; the line-number gap is printed, not asserted, since the
     # fallback renders either way.
-    pin "the per-review rows carry what poll renders from this feed alone while the flat listing lags: numeric id and pull_request_review_id, commit_id, user.login, a non-empty path, body" \
-      "all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\" and length > 0) and (.body | type == \"string\"))" "$per_review"
+    #
+    # `original_commit_id` is asserted on THIS feed as well as on the flat one, and the row above
+    # is not evidence for it: these are the rows poll has while the flat listing lags, so if the
+    # field were dropped here alone, the flat-feed belief would stay green while every supplemented
+    # finding fell back to the MIGRATING `commit_id` — stamping a previous round's finding with the
+    # current head, which is the one thing the head-bound watch must never do (#86 round 3).
+    # position/original_position are asserted for the same reason: with no line to fall back to,
+    # they are the whole anchor these rows fold on.
+    pin "the per-review rows carry what poll renders and folds from this feed alone while the flat listing lags: numeric id and pull_request_review_id, commit_id, the original_commit_id the head stamp needs, the position pair the fold keys on, user.login, a non-empty path, body" \
+      "all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.original_commit_id | test(\"$HEX40\")) and has(\"position\") and has(\"original_position\") and (.user.login | type == \"string\") and (.path | type == \"string\" and length > 0) and (.body | type == \"string\"))" "$per_review"
     echo "      per-review rows carrying line/original_line: $(jq '[.[] | select(has("line") and has("original_line"))] | length' <<<"$per_review") of $(jq length <<<"$per_review") (the flat listing's copy wins on a merge because it carries them)"
   else
     skip "a review's own comments endpoint" "the flat listing names no review — $UNUSABLE"

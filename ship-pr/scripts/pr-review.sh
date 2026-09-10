@@ -191,6 +191,10 @@
 #                                          # several: the body goes to the first thread and each
 #                                          # duplicate gets a one-line pointer to that reply, from
 #                                          # this one invocation
+#   pr-review.sh reply <pr> <comment-id>[+...] --anchor <comment-id>
+#                                          # no body: the answer already stands in <comment-id>'s
+#                                          # thread, and every id in the token is pointed at it.
+#                                          # What a batch that failed part-way is retried with
 #   pr-review.sh resolve <pr> <comment-id>[+<comment-id>...]
 #                                          # the same token; every thread it names is closed
 #   pr-review.sh comment <pr> <body>       # a plain PR comment, for what has no thread to reply in:
@@ -1926,6 +1930,24 @@ ids_from() {
   printf '%s' "$out"
 }
 
+# ids_token <space-joined ids>: the same list as the TOKEN this command takes. A retry set is
+# printed through this and never as the internal space-joined form, which is not something the
+# caller can paste back (round 3 of ludics-lite#86).
+ids_token() {
+  local id out=""
+  for id in $1; do
+    if [ -z "$out" ]; then out="$id"; else out="$out+$id"; fi
+  done
+  printf '%s' "$out"
+}
+
+# Where a thread lives, from its first comment id alone — the anchor URL a `--anchor` retry points
+# at, which no read is spent on because this is the html_url shape GitHub serves for a review
+# comment (verified on this repository's own PRs).
+thread_url() { # <pr> <comment-id>
+  printf 'https://github.com/%s/pull/%s#discussion_r%s' "$REPO" "$1" "$2"
+}
+
 # One reply into one thread. Prints the reply's html_url and returns gh_retry's code; the CALLER
 # composes the failure, because what a failure means depends on how far the batch got.
 post_reply() { # <pr> <comment-id> <body>
@@ -1946,25 +1968,33 @@ _🤖 Addressed by an automated coding agent_" --jq .html_url
 # saying the reply may have landed (round 2 of #86). The retry set is stated instead of the
 # instruction, because only for an ambiguous failure is it a question — and there it is stated as
 # the question it is, with both answers.
-reply_failed() { # <pr> <comment-id> <rc> <ids answered> <ids not answered, this one first>
-  local pr="$1" id="$2" rc="$3" answered="$4" rest="$5" landed="" after
+reply_failed() { # <pr> <comment-id> <rc> <ids answered> <ids not answered, first> <anchor, or empty>
+  local pr="$1" id="$2" rc="$3" answered="$4" rest="$5" anchor="$6" landed="" after retry keep
   after="${rest#" $id"}"
+  # The retry set as something the caller can paste. Once the ANSWER is standing in a thread, the
+  # retry must keep pointing at THAT thread: handing the suffix back plain would promote its first
+  # id to anchor, post the composed body there a second time and point the rest at the copy
+  # (round 3 of ludics-lite#86). `--anchor` is what says "the answer is already in that thread".
+  keep=""
+  [ -z "$anchor" ] || keep=" --anchor $anchor"
+  retry="$(ids_token "$rest")$keep"
   [ -z "$answered" ] || landed="The replies to$answered DID land, so do not repeat those. "
   case "$rc" in
   # A gateway refusal is a request no backend ran (gh_retry's write policy is narrower than a
   # read's for exactly this reason), so comment $id got nothing and the retry set is exact.
   3) fail 3 "reply to comment $id on PR $REPO#$pr did not go through — the API refused it at the" \
     "gateway on all $API_ATTEMPTS attempts ($(gh_err_line)). ${landed}Nothing was posted for" \
-    "comment $id, so retry with:$rest" ;;
+    "comment $id, so retry with: $retry" ;;
   esac
   api_rejection "$(gh_err_line)" &&
     fail 1 "reply to comment $id on PR $REPO#$pr was REJECTED, not dropped: $(gh_err_line)." \
       "Retrying prints the same thing — check the comment id and the PR. ${landed}Comment $id got" \
-      "nothing, so once the id is right, retry with:$rest"
+      "nothing, so once the id is right, retry with: $retry"
   fail 3 "reply to comment $id on PR $REPO#$pr failed AMBIGUOUSLY: $(gh_err_line)." \
     "That is not a gateway refusal, so the reply MAY have landed and this script will not post it" \
-    "twice. ${landed}Read comment $id's thread: retry with:$rest if the reply is not there;" \
-    "${after:+retry with:$after if it is}${after:-there is nothing else outstanding if it is}"
+    "twice. ${landed}Read comment $id's thread: retry with: $retry if the reply is not there;" \
+    "${after:+retry with: $(ids_token "$after") --anchor ${anchor:-$id} if it is}" \
+    "${after:-there is nothing else outstanding if it is}"
 }
 
 # One invocation answers a whole folded entry: the body goes to the ANCHOR (the first id), and
@@ -1979,18 +2009,53 @@ reply_failed() { # <pr> <comment-id> <rc> <ids answered> <ids not answered, this
 # Every reply's html_url is printed, one per line, in the order they were posted, so the caller
 # can see which threads it actually reached.
 cmd_reply() {
+  local anchor="" args=() arg
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --anchor)
+      anchor="${2:-}"
+      shift 2 || die "reply: --anchor takes the comment id of the thread the answer is already in"
+      ;;
+    --anchor=*)
+      anchor="${1#--anchor=}"
+      shift
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
   # Exactly three, checked rather than left to ${3:?...} — which exits 1, the code that means "the
   # fact does not hold", for what is an invocation error. And a body is a sentence: an unquoted one
   # arrives as several arguments, and the ${3:?} form would post its first word and drop the rest,
-  # which reads as a posted reply (cmd_comment's trap, same remedy).
-  [ $# -eq 3 ] || die "usage: reply <pr> <comment-id>[+<comment-id>...] <body> — got $# argument(s)." \
-    "The body is ONE argument: quote it, including a multi-line one."
-  local pr="$1" ids="$2" body="$3"
-  [ -n "${body//[[:space:]]/}" ] || die "reply: the body is empty; there is nothing to post"
+  # which reads as a posted reply (cmd_comment's trap, same remedy). With --anchor there is no
+  # body at all: the answer is already written, and these threads are being pointed at it.
+  local body=""
+  if [ -n "$anchor" ]; then
+    [ $# -eq 2 ] || die "usage: reply <pr> <comment-id>[+<comment-id>...] --anchor <comment-id> —" \
+      "got $# positional argument(s). With --anchor the answer already stands in that thread," \
+      "so no body is taken: every id in the token is pointed at it."
+    case "$anchor" in '' | *[!0-9]*) die "reply: --anchor takes one comment id, got '$anchor'" ;; esac
+  else
+    [ $# -eq 3 ] || die "usage: reply <pr> <comment-id>[+<comment-id>...] <body> — got $# argument(s)." \
+      "The body is ONE argument: quote it, including a multi-line one."
+    body="$3"
+    [ -n "${body//[[:space:]]/}" ] || die "reply: the body is empty; there is nothing to post"
+  fi
+  local pr="$1" ids="$2"
   pr_arg "$pr"
   pr="$PR_NUM"
   split_ids "$ids" reply
-  local id anchor="" anchor_url="" answered="" url rc
+  local id anchor_url="" answered="" url rc
+  if [ -n "$anchor" ]; then
+    case " $FOLD_IDS " in *" $anchor "*)
+      die "reply: --anchor $anchor is also in the token '$ids' — a thread cannot be pointed at" \
+        "itself; name the threads that still need the pointer" ;;
+    esac
+    anchor_url=$(thread_url "$pr" "$anchor")
+  fi
   for id in $FOLD_IDS; do
     if [ -z "$anchor" ]; then
       url=$(post_reply "$pr" "$id" "$body")
@@ -2000,7 +2065,7 @@ cmd_reply() {
     fi
     rc=$?
     [ "$rc" -eq 0 ] ||
-      reply_failed "$pr" "$id" "$rc" "$answered" "$(ids_from "$FOLD_IDS" "$id")"
+      reply_failed "$pr" "$id" "$rc" "$answered" "$(ids_from "$FOLD_IDS" "$id")" "$anchor"
     [ -z "$url" ] || printf '%s\n' "$url"
     if [ -z "$anchor" ]; then
       anchor="$id"

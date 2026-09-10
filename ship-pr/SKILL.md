@@ -339,9 +339,14 @@ Push, then close out each thread — silent fixes leave the reviewer re-deriving
 ```
 
 The comment id is the token `poll` rendered. Where that was a folded entry — `id=900+901+902`,
-the same finding posted as several threads — paste it back whole: one `reply` posts your answer to
-the first thread and a one-line pointer to it into each duplicate, and one `resolve` closes them
-all. Compose the answer once; the duplicates are a quirk of the reviewer, not more findings.
+one location the reviewer posted several threads at — paste it back whole: one `reply` posts your
+answer to the first thread and a one-line pointer to it into each duplicate, and one `resolve`
+closes them all. Compose the answer once, covering every body the entry printed.
+
+If such a `reply` fails part-way, the refusal names the retry, and it is not the plain remainder:
+`reply <pr> 901+902 --anchor 900` posts no body at all and points those threads at the answer
+already standing in 900. Handing back the bare suffix would promote 901 to anchor, post your
+answer there a second time and point 902 at the copy.
 
 Cite the round and the commit's subject, not the sha alone. A branch rebased before it merges —
 onto a base that moved, or to resolve a conflict — rewrites every commit, and a reply that says

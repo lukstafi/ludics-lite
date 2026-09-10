@@ -265,8 +265,8 @@ test_a_failure_after_the_anchor_says_what_landed() {
   run_cmd cmd_reply 900+901+902 "Fixed in round 3 (abc1234)."
   assert_eq "$RC" 3 "a gateway refusal is transport"
   assert_contains "$ERR" "The replies to 900 DID land, so do not repeat those" "what landed is named"
-  assert_contains "$ERR" "retry with: 901 902" \
-    "and so is the retry, which must not include the anchor"
+  assert_contains "$ERR" "retry with: 901+902 --anchor 900" \
+    "and so is the retry — as a token that can be pasted, and keeping the anchor that answered"
   assert_eq "$(writes_to 902)" 0 "and the batch stops rather than skipping past the failure"
   # The negative control: the SAME failure on the first id really does say nothing landed, so the
   # progress note above is a report and not a fixed string.
@@ -275,8 +275,9 @@ test_a_failure_after_the_anchor_says_what_landed() {
   FAIL_MSG="503 No server is currently available to service your request"
   run_cmd cmd_reply 900+901+902 "Fixed in round 3 (abc1234)."
   assert_eq "$RC" 3 "the same transport failure, at the anchor"
-  assert_contains "$ERR" "Nothing was posted for comment 900, so retry with: 900 901 902" \
+  assert_contains "$ERR" "Nothing was posted for comment 900, so retry with: 900+901+902" \
     "with nothing up, the whole invocation is the retry"
+  assert_not_contains "$ERR" "--anchor" "and there is no answered thread to anchor to"
   assert_not_contains "$ERR" "DID land" "and nothing is claimed to have landed"
 }
 
@@ -296,8 +297,9 @@ test_an_ambiguous_write_never_claims_nothing_was_posted() {
     "which is a claim a 500 does not support, and the one that invites a double post"
   assert_not_contains "$ERR" "repeat it whole" "nor may the instruction contradict the sentence"
   assert_contains "$ERR" "Read comment 900's thread" "the caller is sent to look"
-  assert_contains "$ERR" "retry with: 900 901 if the reply is not there" "with both answers named"
-  assert_contains "$ERR" "retry with: 901 if it is" "the second of them being the rest of the batch"
+  assert_contains "$ERR" "retry with: 900+901 if the reply is not there" "with both answers named"
+  assert_contains "$ERR" "retry with: 901 --anchor 900 if it is" \
+    "the second keeping the thread that may already hold the answer as the anchor"
   # The control on the pair: the gateway refusal at the same id DOES say nothing was posted, so
   # the two classifications are reported differently rather than by one hedged string.
   reset_fixture
@@ -319,7 +321,7 @@ test_the_write_exits_stay_apart_inside_a_batch() {
   assert_eq "$RC" 1 "a 404 is the API answering about that comment"
   assert_contains "$ERR" "was REJECTED, not dropped" "and the message says so"
   assert_contains "$ERR" "The replies to 900 DID land" "with the batch's progress either way"
-  assert_contains "$ERR" "Comment 901 got nothing, so once the id is right, retry with: 901" \
+  assert_contains "$ERR" "Comment 901 got nothing, so once the id is right, retry with: 901 --anchor 900" \
     "a rejected write posted nothing, so its retry set is exact"
   reset_fixture
   FAIL_ID=901
@@ -327,6 +329,37 @@ test_the_write_exits_stay_apart_inside_a_batch() {
   run_cmd cmd_reply 900+901 "Fixed in round 3 (abc1234)."
   assert_eq "$RC" 3 "a 500 may or may not have posted"
   assert_contains "$ERR" "failed AMBIGUOUSLY" "and is reported as ambiguous, never as rejected"
+}
+
+# The retry a failed batch recommends has to be one that can be RUN: `--anchor` posts no body at
+# all and points every id in the token at the thread that already holds the answer. Without it the
+# suffix promotes its own first id to anchor, posting the composed body a second time and pointing
+# the rest at the copy (round 3 of #86).
+test_an_anchored_retry_points_at_the_thread_that_answered() {
+  reset_fixture
+  run_cmd cmd_reply 901+902 --anchor 900
+  assert_eq "$RC" 0 "an anchored reply needs no body"
+  assert_eq "$(writes_to 900)" 0 "the thread that answered is not written to again"
+  assert_contains "$(posted_to 901)" \
+    "Duplicate of the thread answered at https://github.com/example/repo/pull/7#discussion_r900" \
+    "and every id in the token is pointed at it, by the url its comment id gives"
+  assert_contains "$(posted_to 902)" "#discussion_r900" "every one of them"
+  assert_not_contains "$(posted_to 902)" "#discussion_r901" \
+    "never at each other: the answer is in 900, and a chain of pointers is not an answer"
+  # The refusals around it: a body with --anchor is an invocation error (there is nothing to post
+  # it as), and so is anchoring a thread to itself.
+  reset_fixture
+  run_cmd cmd_reply 901 --anchor 900 "a body nobody asked for"
+  assert_eq "$RC" 2 "with --anchor the answer is already written"
+  assert_contains "$ERR" "no body is taken" "and the refusal says so"
+  reset_fixture
+  run_cmd cmd_reply 900+901 --anchor 900
+  assert_eq "$RC" 2 "a thread cannot be pointed at itself"
+  assert_contains "$ERR" "is also in the token" "and the refusal names the collision"
+  assert_eq "$(wc -l <"$REQUEST_LOG" | tr -d " ")" 0 "with nothing posted"
+  reset_fixture
+  run_cmd cmd_reply 901 --anchor 90x
+  assert_eq "$RC" 2 "the anchor is one comment id"
 }
 
 # --- resolve --------------------------------------------------------------------------------------
@@ -381,6 +414,7 @@ tests=(
   test_the_invocation_shape_is_a_usage_error
   test_a_failure_after_the_anchor_says_what_landed
   test_an_ambiguous_write_never_claims_nothing_was_posted
+  test_an_anchored_retry_points_at_the_thread_that_answered
   test_the_write_exits_stay_apart_inside_a_batch
   test_resolve_closes_every_thread_the_token_names
   test_an_already_resolved_thread_costs_no_write
