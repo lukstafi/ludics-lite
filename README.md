@@ -233,7 +233,12 @@ guard it must catch an unusable destination, without the pruning pass it must ca
 that is not the source, and each has the control that the same copy publishes cleanly when
 nothing is in its way. It pins that `pull` is the repair in the other direction, restoring a
 checkout routine that was deleted or linked away, and that it does not take the empty-diff
-shortcut over a linked `SKILL.md` whose bytes already match; that a push never
+shortcut over a linked `SKILL.md` whose bytes already match; that a RETIRED routine still
+installed on a box is reported in every mode and removed by nobody, since deleting a prompt
+directory here retires nothing where the registry entry still names it and the install loop reads
+this repository's list rather than the destination; and that `--help` states the one asymmetry a
+caller could otherwise read wrong, `pull` proceeding behind a symlinked destination root where
+`push` refuses; that a push never
 leaves the installed prompt absent or half-written, sampled by a reader running flat out across
 twelve of them, with a control that the reader can report an absence; and that two modes in one
 invocation are a usage error, since `push` and `pull` write in opposite directions and the last
@@ -248,7 +253,10 @@ and four negative controls show it can fail; `check-prompts.sh` keeps its per-di
 gains no table model. Two last cases pin what the comparison is worth: that the workflow job
 running this suite carries no `if:`/`needs:`, since an all-Markdown PR is both what the diff
 classification calls prompt-only and the one shape that can break the pin, and that the tracked
-mode of `sync-routines.sh` is 755, which a `> tmp && mv` rewrite drops silently.
+mode of `sync-routines.sh` is 755, which a `> tmp && mv` rewrite drops silently. Its assertions read
+strings rather than piping them into `grep -q`, which exits at the first match and can SIGPIPE the
+writer under `pipefail`: a pin that fails one run in many is worse than no pin, and the one it
+carries decides whether an unconditional CI job is worth having.
 
 `test-pr-review-checks-absent.sh` drives the build gate against a canned Actions API, one answer
 per polling round, and pins everything the check list alone cannot say about a head. Exit 4 (no

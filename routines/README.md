@@ -53,12 +53,14 @@ an edit lands in the installed copy instead -- a routine's own run editing its p
 `pull` it back and commit, rather than letting the two drift. `status` exits 1 on any drift, which
 is what makes it worth running after a merge that touched a prompt.
 
-The script is unforgiving about symlinks in three places, because the scheduler is: it refuses,
-in any mode, when `~/.claude/scheduled-tasks` is itself reached through a link at any component
-(the task directories under it would each be real while nothing could read one of them); it
-refuses an installed directory holding a link anywhere inside it, a linked `SKILL.md` included,
-which a plain `diff -r` would follow and call in sync; and `push` replaces a link rather than
-writing through it. It also refuses to `pull` from an installed directory with no `SKILL.md` —
+The script is unforgiving about symlinks in three places, because the scheduler is. When
+`~/.claude/scheduled-tasks` is itself reached through a link at any component, the task
+directories under it are each real while nothing can read one of them: `status` reports it and
+`push` refuses, since installing there installs something that will not run — `pull` warns and
+takes the files anyway, because they are real and taking them is the recovery. It refuses an
+installed directory holding a link anywhere inside it, a linked `SKILL.md` included, which a plain
+`diff -r` would follow and call in sync. And `push` replaces a link rather than writing through
+it. It also refuses to `pull` from an installed directory with no `SKILL.md` —
 that is a leftover, not a routine, and taking it would delete the tracked prompt here. In the
 other direction `pull` is the repair, and reads on past a checkout prompt that is broken in any of
 those ways, a deleted routine directory and one linked out of the tree included: it restores them
@@ -87,8 +89,15 @@ Only the box running the desktop app's scheduler fires these. On the author's fl
 
 Retiring a routine is three steps, and the registry is the one the repository cannot do: delete
 its directory here and its row above, then deregister the task in the desktop app, then remove
-`~/.claude/scheduled-tasks/<id>`. A prompt directory left installed with no row here is invisible
-to `sync-routines.sh`, which iterates the list rather than the destination.
+`~/.claude/scheduled-tasks/<id>`. The first step alone retires nothing on a box that already has
+the task — the installed prompt stays, and so does the registry entry naming it by path, which
+keeps firing. Because the script iterates the list above rather than the destination, a leftover
+like that would be invisible, so a retired name goes into `RETIRED_ROUTINES` in
+`scripts/sync-routines.sh` as a tombstone: the script then looks for it by name and says, in every
+mode, that it is still installed and what the two remaining steps are. It removes nothing itself —
+a prompt deleted while its registry entry stands makes the task fire and fail rather than stop.
+Drop the tombstone once the fleet is known to be clean. `ocannl-format-sweep` is the one carried
+today.
 
 ## The cloud routine: synced by hand
 

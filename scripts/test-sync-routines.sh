@@ -26,6 +26,9 @@
 #     not-installed and symlinked-installation branches included;
 #   - that two modes in one invocation are a usage error, since push and pull write in opposite
 #     directions and the last token used to win;
+#   - that a RETIRED routine still installed on a box is reported rather than passed over -- the
+#     loop iterates this repository's list, so without a tombstone the leftover is invisible --
+#     and that the script removes nothing itself, the registry being the desktop app's;
 #   - that --dry-run copies nothing, in every mode, and still says what it would do;
 #   - the usage exits: an unknown argument is 2, --help prints the header;
 #   - that LOCAL_ROUTINES lists exactly the routines/README.md rows whose Kind is
@@ -52,13 +55,25 @@ trap 'rm -rf "$TMP"' EXIT
 TMP=$(cd "$TMP" && pwd -P) || exit 1
 
 pass=0; fail=0
-ok() { pass=$((pass + 1)); echo "PASS: $*"; }
-ko() { fail=$((fail + 1)); echo "FAIL: $*"; }
+# Both report and then RETURN 0 explicitly. These are used as `<test> && ok ... || ko ...`, the
+# house style, in which anything that makes `ok` itself fail fires `ko` on an assertion that
+# held -- a FAIL nobody can reproduce.
+ok() { pass=$((pass + 1)); echo "PASS: $*"; return 0; }
+ko() { fail=$((fail + 1)); echo "FAIL: $*"; return 0; }
+# contains <haystack> <literal needle>, has/hasi <haystack> <extended regex>: the assertions read
+# a STRING, never a pipeline into `grep -q`. `grep -q` exits at the first match and closes the
+# pipe, so under `set -o pipefail` the writer can take a SIGPIPE and turn a condition that held
+# into a false one -- a fixture that fails nondeterministically, which on the routines-table pin
+# would be worse than no pin (round 6 of this PR). `case` forks nothing; the here-strings below
+# give grep a file, which cannot be SIGPIPEd.
+contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+has() { grep -qE -- "$2" <<<"$1"; }
+hasi() { grep -qiE -- "$2" <<<"$1"; }
 # expect <label> <want-rc> <want-substring> -- <cmd...>; leaves the output in $out, rc in $rc.
 expect() {
   local label="$1" want_rc="$2" want="$3"; shift 3; [ "$1" = -- ] && shift
   out=$("$@" 2>&1); rc=$?
-  if [ "$rc" -eq "$want_rc" ] && printf '%s' "$out" | grep -q -- "$want"; then ok "$label"
+  if [ "$rc" -eq "$want_rc" ] && contains "$out" "$want"; then ok "$label"
   else ko "$label (rc=$rc want $want_rc; want /$want/) -- $out"; fi
 }
 
@@ -67,7 +82,9 @@ expect() {
 # top level, so it is not sourceable, and the shape the comment promises is a one-line
 # LOCAL_ROUTINES="...".
 routines_list_of() { sed -n 's/^LOCAL_ROUTINES="\([^"]*\)"[[:space:]]*$/\1/p' "$1"; }
+retired_list_of() { sed -n 's/^RETIRED_ROUTINES="\([^"]*\)"[[:space:]]*$/\1/p' "$1"; }
 LOCAL_ROUTINES=$(routines_list_of "$SYNC")
+RETIRED_ROUTINES=$(retired_list_of "$SYNC")
 if [ -n "$LOCAL_ROUTINES" ]; then
   ok "sync-routines.sh declares LOCAL_ROUTINES ($LOCAL_ROUTINES)"
 else
@@ -111,29 +128,29 @@ run_sync() { env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/installed" "$SR" "$@"; }
 reset_trees; install_all
 expect "an unknown argument is refused with exit 2" 2 "unknown argument: --frobnicate" -- \
   run_sync --frobnicate
-printf '%s' "$out" | grep -q -- '--help' \
+contains "$out" '--help' \
   && ok "...and points at --help" || ko "the refusal does not mention --help -- $out"
 
 expect "--help prints the header's usage" 0 "sync-routines.sh push" -- run_sync --help
-printf '%s' "$out" | grep -q 'symlink' \
+contains "$out" 'symlink' \
   && ok "...including why copies rather than symlinks" || ko "--help drops the symlink lore -- $out"
-printf '%s' "$out" | grep -q '^#' \
+has "$out" '^#' \
   && ko "--help leaks the comment markers -- $out" || ok "...with the comment markers stripped"
 expect "-h is the same" 0 "Exit codes:" -- run_sync -h
 
 # --- status: the four states --------------------------------------------------------------------
 reset_trees; install_all
 expect "status on a matching pair exits 0" 0 "all local routines in sync" -- run_sync
-printf '%s' "$out" | grep -q "$R1: in sync" \
+contains "$out" "$R1: in sync" \
   && ok "...naming each routine" || ko "status does not name $R1 -- $out"
 expect "status is also the default with no argument at all" 0 "in sync" -- run_sync status
 
 reset_trees; install_all
 printf 'body v2 -- edited in the installed copy\n' >> "$TMP/installed/$R1/SKILL.md"
 expect "status reports drift with exit 1" 1 "$R1: DRIFT" -- run_sync
-printf '%s' "$out" | grep -q 'body v2' \
+contains "$out" 'body v2' \
   && ok "...and shows the differing lines" || ko "the drift report carries no diff -- $out"
-printf '%s' "$out" | grep -q 'push' \
+contains "$out" 'push' \
   && ok "...and names the way out" || ko "the drift report suggests nothing -- $out"
 
 reset_trees
@@ -143,14 +160,14 @@ install_all_rest() { for r in $LOCAL_ROUTINES; do [ "$r" = "$R1" ] && continue
   rm -rf "${TMP:?}/installed/$r"; cp -R "$REPO/routines/$r" "$TMP/installed/$r"; done; }
 install_all_rest
 expect "status calls out a symlinked installation with exit 1" 1 "installed as a SYMLINK" -- run_sync
-printf '%s' "$out" | grep -q 'the scheduler cannot read it' \
+contains "$out" 'the scheduler cannot read it' \
   && ok "...and says the scheduler cannot read it" || ko "no consequence given -- $out"
 
 reset_trees
 expect "status reports a missing prompt directory with exit 1" 1 "no prompt directory at" -- run_sync
 # The registry is the desktop app's and unreadable from here, so nothing may be asserted about it
 # from the absence of a directory: the line reports the directory, not a registration state.
-printf '%s' "$out" | grep -qi 'unregister\|not registered\|no cron' \
+hasi "$out" 'unregister|not registered|no cron' \
   && ko "the missing-directory line claims something about the registry it cannot read -- $out" \
   || ok "...without inferring anything about the registry from it"
 
@@ -184,11 +201,11 @@ reset_trees
 expect "push installs a routine that is not there at all" 0 "prompt installed at" -- run_sync push
 [ -f "$TMP/installed/$R1/SKILL.md" ] \
   && ok "...writing a real file" || ko "nothing was installed at $TMP/installed/$R1"
-printf '%s' "$out" | grep -q 'never fires' \
+contains "$out" 'never fires' \
   && ok "...while saying a prompt no registry entry names never fires" \
   || ko "push installed silently, saying nothing about registration -- $out"
 # ...but conditionally: the directory was missing, which is no evidence the task is unregistered.
-printf '%s' "$out" | grep -qi 'is still unregistered\|is unregistered\|no cron will fire' \
+hasi "$out" 'is still unregistered|is unregistered|no cron will fire' \
   && ko "push asserts the task is unregistered, which it cannot know from a missing directory -- $out" \
   || ok "...as a thing to check, not as a claim about the registry"
 
@@ -203,7 +220,7 @@ reset_trees; install_all
 rm -rf "$REPO/routines/$R1"
 expect "push over a missing source routine exits 1 rather than reporting success" 1 \
   "is not a directory" -- run_sync push
-printf '%s' "$out" | grep -q 'were not synced' \
+contains "$out" 'were not synced' \
   && ok "...and says so in the summary" || ko "the summary claims a clean push -- $out"
 
 # --- pull ---------------------------------------------------------------------------------------
@@ -212,7 +229,7 @@ printf 'body v2 -- written by the routine mid-run\n' >> "$TMP/installed/$R1/SKIL
 expect "pull takes an edit made in the installed copy" 0 "$R1: pulled into" -- run_sync pull
 grep -q 'mid-run' "$REPO/routines/$R1/SKILL.md" \
   && ok "...into the checkout" || ko "the checkout was not updated: $(cat "$REPO/routines/$R1/SKILL.md")"
-printf '%s' "$out" | grep -q 'Nothing is committed' \
+contains "$out" 'Nothing is committed' \
   && ok "...and says the commit is still the caller's" || ko "pull does not mention committing -- $out"
 
 reset_trees; install_all
@@ -232,7 +249,7 @@ before=$(cat "$TMP/installed/$R1/SKILL.md")
 expect "push --dry-run says what it would do" 0 "would push" -- run_sync push --dry-run
 [ "$(cat "$TMP/installed/$R1/SKILL.md")" = "$before" ] \
   && ok "...and copies nothing" || ko "push --dry-run wrote to the installed copy"
-printf '%s' "$out" | grep -q 'dry run: nothing was copied' \
+contains "$out" 'dry run: nothing was copied' \
   && ok "...and does not report routines updated" || ko "the dry run's summary claims work -- $out"
 expect "-n is the same flag" 0 "would push" -- run_sync push -n
 [ "$(cat "$TMP/installed/$R1/SKILL.md")" = "$before" ] \
@@ -271,7 +288,7 @@ linked_sync() { env CLAUDE_SCHEDULED_TASKS_DIR="$LINKED" "$SR" "$@"; }
 
 expect "status refuses a destination root that is itself a symlink" 1 "reached through a SYMLINK" -- \
   linked_sync
-printf '%s' "$out" | grep -q 'at any component' \
+contains "$out" 'at any component' \
   && ok "...saying the scheduler refuses any component" || ko "no reason given -- $out"
 # The negative control on that verdict: the SAME trees reached by their real path are in sync, so
 # the exit 1 above is about the link and not about the fixture.
@@ -297,7 +314,7 @@ mkdir -p "$TMP/deep/real/tasks"
 for r in $LOCAL_ROUTINES; do cp -R "$REPO/routines/$r" "$TMP/deep/real/tasks/$r"; done
 expect "status refuses when a component ABOVE the destination is the link" 1 \
   "reached through a SYMLINK" -- env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/deep/link/tasks" "$SR"
-printf '%s' "$out" | grep -q "$TMP/deep/link" \
+contains "$out" "$TMP/deep/link" \
   && ok "...naming the component that is the link" || ko "the refusal does not name the link -- $out"
 # The control: the same tree by its real path is in sync, so the refusal is the link's doing.
 expect "...while the real path of that same tree is in sync" 0 "all local routines in sync" -- \
@@ -310,6 +327,13 @@ expect "pull behind a symlinked root warns but proceeds" 0 "pulling anyway" -- l
 grep -q 'mid-run' "$REPO/routines/$R1/SKILL.md" \
   && ok "...taking the edit, since the content behind the link is real" \
   || ko "pull behind the link took nothing"
+# That asymmetry -- push refuses, status reports, pull proceeds -- is a contract callers read out
+# of `--help`, so the help text has to state it. A behaviour change fails the cases above; a help
+# text that promises a refusal pull does not perform fails this one.
+out=$(run_sync --help 2>&1)
+contains "$out" "pull WARNS AND PROCEEDS" \
+  && ok "...and --help says so, rather than promising a refusal in every mode" \
+  || ko "--help does not state pull's behaviour behind a symlinked ancestor -- callers would read the wrong exit contract"
 
 # --- an installed directory that exists and is not a usable prompt -------------------------------
 # `-L "$dst"` sees only the routine's own directory and `diff -r` FOLLOWS a link, so an installed
@@ -320,7 +344,7 @@ reset_trees; install_all
 rm -f "$TMP/installed/$R1/SKILL.md"
 ln -s "$REPO/routines/$R1/SKILL.md" "$TMP/installed/$R1/SKILL.md"
 expect "status refuses an installed SKILL.md that is a symlink" 1 "holds a symlink" -- run_sync
-printf '%s' "$out" | grep -q "^$R1: in sync" \
+has "$out" "^$R1: in sync" \
   && ko "it still called $R1 in sync while following the link -- $out" \
   || ok "...rather than following it into an in-sync verdict"
 # The control: the same trees with a real, byte-identical SKILL.md ARE in sync, so the refusal is
@@ -567,7 +591,7 @@ expect "...and a following push does not refuse it" 0 "routine(s) updated" -- ru
 # above is the link's doing.
 reset_trees; install_all
 out=$(run_sync pull 2>&1); rc=$?
-[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '0 routine(s) updated' \
+[ "$rc" -eq 0 ] && contains "$out" '0 routine(s) updated' \
   && ok "...while identical real files leave pull with nothing to do" \
   || ko "pull copied over trees that already match (rc=$rc) -- $out"
 
@@ -583,10 +607,10 @@ chmod +x "$TMP/failbin/cp"
 out=$(env PATH="$TMP/failbin:$PATH" CLAUDE_SCHEDULED_TASKS_DIR="$TMP/installed" "$SR" push 2>&1); rc=$?
 [ "$rc" -eq 1 ] \
   && ok "a push whose cp fails exits 1" || ko "push with a failing cp exited $rc -- $out"
-printf '%s' "$out" | grep -q "$R1: pushed to" \
+contains "$out" "$R1: pushed to" \
   && ko "...but it still reported the routine pushed -- $out" \
   || ok "...and does not report the routine pushed"
-printf '%s' "$out" | grep -q 'failed part-way\|still differs from' \
+has "$out" 'failed part-way|still differs from' \
   && ok "...saying the destination is not what the checkout holds" \
   || ko "no diagnosis of the failed publish -- $out"
 grep -q 'must not be reported as published' "$TMP/installed/$R1/SKILL.md" \
@@ -640,12 +664,12 @@ for r in $LOCAL_ROUTINES; do cp -R "$BROKEN/routines/$r" "$TMP/broken-installed/
 rm -f "$TMP/broken-installed/$R1/SKILL.md"
 mkdir -p "$TMP/broken-installed/$R1/SKILL.md"
 out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/broken-installed" "$BROKEN/scripts/sync-routines.sh" push 2>&1); rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'after publishing'; then
+if [ "$rc" -eq 1 ] && contains "$out" 'after publishing'; then
   ok "the post-condition catches a publish that left the destination unusable"
 else
   ko "the guard-less copy reported rc=$rc without the post-condition firing -- $out"
 fi
-printf '%s' "$out" | grep -q "$R1: republished to" \
+contains "$out" "$R1: republished to" \
   && ko "it still printed 'republished' for a routine it did not republish -- $out" \
   || ok "...and does not call it republished"
 # The second clause, and the one the round-5 review asked for by name: presence is not enough,
@@ -663,12 +687,12 @@ mkdir -p "$TMP/noprune-installed"
 for r in $LOCAL_ROUTINES; do cp -R "$NOPRUNE/routines/$r" "$TMP/noprune-installed/$r"; done
 printf 'a file the checkout no longer has\n' > "$TMP/noprune-installed/$R1/leftover.md"
 out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/noprune-installed" "$NOPRUNE/scripts/sync-routines.sh" push 2>&1); rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'still differs from'; then
+if [ "$rc" -eq 1 ] && contains "$out" 'still differs from'; then
   ok "the post-condition catches a destination that has a SKILL.md but is not the source"
 else
   ko "the prune-less copy reported rc=$rc without the tree comparison firing -- $out"
 fi
-printf '%s' "$out" | grep -q "$R1: pushed to" \
+contains "$out" "$R1: pushed to" \
   && ko "...but it still reported the routine pushed -- $out" \
   || ok "...and does not report it pushed"
 # The control on that one: with nothing extra installed, the same prune-less copy succeeds.
@@ -677,7 +701,7 @@ mkdir -p "$TMP/noprune-installed"
 for r in $LOCAL_ROUTINES; do cp -R "$NOPRUNE/routines/$r" "$TMP/noprune-installed/$r"; done
 printf 'body v2\n' >> "$NOPRUNE/routines/$R1/SKILL.md"
 out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/noprune-installed" "$NOPRUNE/scripts/sync-routines.sh" push 2>&1); rc=$?
-[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'pushed to' \
+[ "$rc" -eq 0 ] && contains "$out" 'pushed to' \
   && ok "...while the same copy publishes cleanly with nothing left over" \
   || ko "the prune-less copy fails even a plain push (rc=$rc): $out"
 
@@ -688,7 +712,7 @@ mkdir -p "$TMP/broken-installed"
 for r in $LOCAL_ROUTINES; do cp -R "$BROKEN/routines/$r" "$TMP/broken-installed/$r"; done
 printf 'body v2\n' >> "$BROKEN/routines/$R1/SKILL.md"
 out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/broken-installed" "$BROKEN/scripts/sync-routines.sh" push 2>&1); rc=$?
-[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'pushed to' \
+[ "$rc" -eq 0 ] && contains "$out" 'pushed to' \
   && ok "...while the same copy publishes cleanly with nothing in the way" \
   || ko "the guard-less copy fails even a plain push (rc=$rc) -- the control above is not about the guard: $out"
 
@@ -710,7 +734,7 @@ expect "push over a MISSING installation validates the checkout first" 1 "refusi
   run_sync push
 [ ! -e "$TMP/installed/$R1" ] \
   && ok "...installing nothing unusable" || ko "an unusable prompt was installed at $TMP/installed/$R1"
-printf '%s' "$out" | grep -q "$R1: prompt installed" \
+contains "$out" "$R1: prompt installed" \
   && ko "it reported the broken routine as installed -- $out" \
   || ok "...and did not report it installed"
 
@@ -734,7 +758,7 @@ expect "two modes in one invocation are refused with exit 2" 2 "only one mode ma
 grep -q 'the edit the caller wants back' "$TMP/installed/$R1/SKILL.md" \
   && ok "...before either direction is written" \
   || ko "the refused invocation still overwrote the installed edit"
-printf '%s' "$out" | grep -q 'opposite directions' \
+contains "$out" 'opposite directions' \
   && ok "...saying why the last token must not win" || ko "no reason given -- $out"
 expect "...in the other order too" 2 "only one mode may be given" -- run_sync push pull
 expect "...and a repeated mode is refused as well" 2 "only one mode may be given" -- run_sync push push
@@ -831,6 +855,57 @@ EOF
   && ok "...while prose and later cells saying \"local scheduled task\" add no rows" \
   || ko "the reader picked up rows outside the Kind cell: $(local_rows_of "$TMP/table-prose.md")"
 
+# --- retired routines are tombstoned, not forgotten ----------------------------------------------
+# Deleting a prompt directory in this repository retires nothing on a box that already has it: the
+# installed copy stays and so does the registry entry naming it, which keeps firing. The install
+# loop cannot see that, because it iterates this repository's list rather than the destination.
+if [ -n "$RETIRED_ROUTINES" ]; then
+  ok "sync-routines.sh carries tombstones for retired routines ($RETIRED_ROUTINES)"
+else
+  ko "no RETIRED_ROUTINES list in $SYNC -- a retired routine's installation is invisible again"
+fi
+RETIRED1=$(set -- $RETIRED_ROUTINES; echo "${1:-}")
+if [ -n "$RETIRED1" ]; then
+  reset_trees; install_all
+  # The control first: with nothing left over, status is clean and says nothing about it.
+  expect "with no retired routine installed, status is clean" 0 "all local routines in sync" -- run_sync
+  contains "$out" "$RETIRED1" \
+    && ko "it named $RETIRED1 with nothing installed for it -- $out" \
+    || ok "...and does not mention $RETIRED1"
+
+  mkdir -p "$TMP/installed/$RETIRED1"
+  printf -- '---\nname: %s\ndescription: the retired one\n---\n\nstill here\n' "$RETIRED1" \
+    > "$TMP/installed/$RETIRED1/SKILL.md"
+  expect "status reports a retired routine that is still installed" 1 "RETIRED, but still installed" -- \
+    run_sync
+  contains "$out" "Deregister '$RETIRED1'" \
+    && ok "...telling the operator to deregister it in the desktop app" \
+    || ko "the report does not say to deregister it -- $out"
+  contains "$out" "$TMP/installed/$RETIRED1" \
+    && ok "...and naming the directory to remove afterwards" || ko "no path given -- $out"
+  # It must NOT delete it: the registry entry is the desktop app's, and a prompt removed under a
+  # live entry fires and fails rather than stopping.
+  [ -f "$TMP/installed/$RETIRED1/SKILL.md" ] \
+    && ok "...while removing nothing itself, since the registry is not this script's to change" \
+    || ko "the script deleted $TMP/installed/$RETIRED1"
+  expect "...and push reports it too rather than passing clean" 1 "RETIRED, but still installed" -- \
+    run_sync push
+  [ -f "$TMP/installed/$RETIRED1/SKILL.md" ] \
+    && ok "...still removing nothing" || ko "push deleted the retired routine's directory"
+  # A retired name must be retired in the repository too, or the tombstone contradicts the table.
+  case " $LOCAL_ROUTINES " in
+    *" $RETIRED1 "*) ko "$RETIRED1 is tombstoned AND in LOCAL_ROUTINES" ;;
+    *) ok "...and $RETIRED1 is not in LOCAL_ROUTINES" ;;
+  esac
+  [ ! -d "$ROOT/routines/$RETIRED1" ] \
+    && ok "...nor does routines/$RETIRED1 exist" || ko "routines/$RETIRED1 is still in the repository"
+  contains " $(local_rows_of "$ROUTINES_README") " " $RETIRED1 " \
+    && ko "$RETIRED1 still has a local scheduled task row in $ROUTINES_README" \
+    || ok "...nor a row in the routines table"
+else
+  ok "no retired routine to check (the tombstone list is empty)"
+fi
+
 # --- the pin has to actually run ----------------------------------------------------------------
 # The comparison above is only worth what CI runs. The diff classification in the workflow calls a
 # PR prompt-only when every file it touches is Markdown other than the top-level README -- and a PR
@@ -852,9 +927,9 @@ if [ -f "$WORKFLOW" ]; then
   block=$(job_block sync-routines "$WORKFLOW")
   if [ -n "$block" ]; then
     ok "the workflow declares a sync-routines job"
-    printf '%s\n' "$block" | grep -q 'test-sync-routines.sh' \
+    contains "$block" 'test-sync-routines.sh' \
       && ok "...that runs this suite" || ko "the sync-routines job does not run this suite"
-    printf '%s\n' "$block" | grep -qE '^    (if|needs):' \
+    has "$block" '^    (if|needs):' \
       && ko "the sync-routines job is conditioned on the diff classification, so the routines-table pin is skipped on an all-Markdown PR -- the one shape that breaks it" \
       || ok "...unconditionally, so an all-Markdown PR is judged by it too"
   else
@@ -877,7 +952,7 @@ jobs:
   macos:
     runs-on: macos-latest
 EOF
-printf '%s\n' "$(job_block sync-routines "$TMP/wf-conditioned.yml")" | grep -qE '^    (if|needs):' \
+has "$(job_block sync-routines "$TMP/wf-conditioned.yml")" '^    (if|needs):' \
   && ok "the job reader sees an if:/needs: line when one is there, so the verdict above can fail" \
   || ko "the job reader misses a conditioned job -- the verdict above means nothing"
 cat > "$TMP/wf-plain.yml" <<'EOF'
@@ -890,7 +965,7 @@ jobs:
     needs: changes
     if: ${{ always() }}
 EOF
-printf '%s\n' "$(job_block sync-routines "$TMP/wf-plain.yml")" | grep -qE '^    (if|needs):' \
+has "$(job_block sync-routines "$TMP/wf-plain.yml")" '^    (if|needs):' \
   && ko "the job reader read past the end of the job into the next one" \
   || ok "...and stops at the next job, so a neighbour's condition is not read as this job's"
 
@@ -922,7 +997,7 @@ scratch_mode=$( cd "$GITREPO" && git ls-files -s -- s.sh 2>/dev/null | awk '{pri
 # and must not touch the real ~/.claude/scheduled-tasks.
 mkdir -p "$TMP/empty-dest"
 out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/empty-dest" "$SYNC" 2>&1); rc=$?
-[ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no prompt directory at' \
+[ "$rc" -eq 1 ] && contains "$out" 'no prompt directory at' \
   && ok "the tracked script itself reports an empty destination with exit 1" \
   || ko "the tracked script on an empty destination: rc=$rc -- $out"
 [ -z "$(ls -A "$TMP/empty-dest")" ] \

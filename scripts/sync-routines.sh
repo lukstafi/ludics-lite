@@ -21,13 +21,19 @@
 #
 # Exit codes:
 #   0  status: everything in sync. push/pull: every routine handled.
-#   1  status: drift (or a routine not installed, or installed as a symlink, or a destination
-#      reached through one). push: the destination is behind a symlink, so nothing was copied, or
+#   1  status: drift -- including a routine not installed, one installed as a symlink, a
+#      destination reached through one, and a retired routine still installed.
+#      push: nothing was copied, or not everything was -- the destination is behind a symlink,
 #      the checkout's own prompt is unusable, or a publish did not end with the destination
-#      holding the source. pull: there was nothing real to take -- no installed prompt, or one
-#      behind a symlink, or one that is not a usable prompt. A push that installs a prompt over a
-#      placeholder is not a failure, and neither is a pull that RESTORES a checkout routine that
-#      was deleted or linked away: repairing this side is what pull is for.
+#      holding the source.
+#      pull: there was nothing real to take -- no installed prompt, or one that IS a symlink, or
+#      one that is not a usable prompt.
+#      Two things are deliberately NOT failures. A push that installs a prompt over a placeholder
+#      is a success, and so is a pull that RESTORES a checkout routine that was deleted or linked
+#      away: repairing this side is what pull is for. A destination reached through a symlinked
+#      ANCESTOR is the asymmetric case: push refuses it (installing there is installing something
+#      the scheduler will not read) and status reports it, but pull WARNS AND PROCEEDS, because
+#      the files behind the link are real and taking them is the recovery.
 #   2  usage: an argument this script does not know.
 #
 # The destination is $CLAUDE_SCHEDULED_TASKS_DIR when set, which is what the fixture suite
@@ -50,6 +56,15 @@ set -euo pipefail
 # disagree, with negative controls that show the comparison can fail (ludics-lite#77). Keep
 # the assignment on one line, `LOCAL_ROUTINES="..."`, which is the shape the suite reads.
 LOCAL_ROUTINES="daily-issue-planning ocannl-cross-machine-sweep"
+
+# Routines that USED to be local scheduled tasks. Deleting a prompt directory here retires
+# nothing on a box that already has it: the installed copy stays, and so does the desktop app's
+# registry entry, which names the file by path and keeps firing it. The loop above cannot see
+# that -- it iterates this repository's list, not the destination -- so retired names are carried
+# as tombstones and looked for by name. The script never deletes one: the registry is the desktop
+# app's, and a prompt removed while its entry stands would fire and fail rather than stop.
+# A tombstone is dropped once the fleet is known to be clean.
+RETIRED_ROUTINES="ocannl-format-sweep"
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 src_root="$repo_root/routines"
@@ -277,6 +292,18 @@ fi
 if [ "$mode" = push ] && ! $dry_run; then
   mkdir -p "$dest_root"
 fi
+
+for r in $RETIRED_ROUTINES; do
+  [ -e "$dest_root/$r" ] || continue
+  warn "$r: RETIRED, but still installed at $dest_root/$r"
+  warn "$r: this repository no longer carries its prompt, and deleting one here does not stop a"
+  warn "$r: registered task. Deregister '$r' in the desktop app's scheduled tasks, THEN remove"
+  warn "$r: $dest_root/$r. Until both are done it keeps firing."
+  case "$mode" in
+    status) drift=1 ;;
+    *) problems=1 ;;
+  esac
+done
 
 for r in $LOCAL_ROUTINES; do
   src="$src_root/$r"
