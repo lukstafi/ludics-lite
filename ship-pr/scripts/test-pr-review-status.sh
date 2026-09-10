@@ -137,9 +137,11 @@ gh() {
     # The date is the whole answer here — this read is `--jq .commit.committer.date` — so the
     # `sha` stays the placeholder it has always been rather than echoing the head back.
     response=$(jq -cn --arg d "$HEAD_AT" '{sha:"head-sha", commit:{committer:{date:$d}}}') ;;
-  "repos/$REPO/compare/"*)
+  # The query suffix is part of the endpoint, not decoration: matching it here is what keeps the
+  # generalization to the head SHA alone, so a compare that lost its `?per_page=1` still bails.
+  "repos/$REPO/compare/"*"?per_page=1")
     spec=${FIXTURE_ENDPOINT#"repos/$REPO/compare/"}
-    spec=${spec%'?per_page=1'}
+    spec=${spec%"?per_page=1"}
     left=${spec%%...*}
     right=${spec#*...}
     if [ "$left" = "$BASE_SHA" ] && fixture_head "$right"; then
