@@ -170,7 +170,7 @@ scripts/test-check-prompts.sh
 scripts/test-sync-routines.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all fourteen on Ubuntu, one
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all fifteen on Ubuntu, one
 job per suite, and on macOS (the fleet's bash is 3.2) as one job with a step per suite: the hosted
 macOS runners are scarce enough that four separate macOS jobs queued a green PR for one to two
 hours behind nine minutes of work (ludics-lite#55). Alongside them run `bash -n`, shellcheck at
