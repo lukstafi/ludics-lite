@@ -21,9 +21,11 @@
 #
 # Exit codes:
 #   0  status: everything in sync. push/pull: every routine handled.
-#   1  status: drift (or a routine not installed, or installed as a symlink). push/pull: a
-#      routine could NOT be synced -- a source directory missing, or a `pull` with nothing
-#      real to read. A push that installs a prompt over a placeholder is not a failure.
+#   1  status: drift (or a routine not installed, or installed as a symlink, or a destination
+#      reached through one). push: the destination is behind a symlink, so nothing was copied,
+#      or a routine could not be synced. pull: a routine could not be read -- a source directory
+#      missing, or an installed path that is a symlink and so holds nothing real. A push that
+#      installs a prompt over a placeholder is not a failure.
 #   2  usage: an argument this script does not know.
 #
 # The destination is $CLAUDE_SCHEDULED_TASKS_DIR when set, which is what the fixture suite
@@ -67,6 +69,30 @@ done
 say() { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
+# first_symlinked_ancestor <dir>: the first component of <dir>'s path that is a symlink, or
+# nothing. The per-routine `[ -L "$dst" ]` check below only sees the routine's own directory, but
+# the scheduler refuses a task file whose path traverses a symlink at ANY component: a symlinked
+# ~/.claude, or a scheduled-tasks directory moved aside and linked back, hides behind a $dst that
+# is a real directory and would otherwise be reported in sync while nothing could read it.
+#
+# The walk is over the LITERAL components, which is what the registry stores and what the reader
+# traverses -- so a component above the destination counts too, even one nobody here chose (on
+# macOS /var is a link to /private/var, so a destination under /var/... genuinely is behind one).
+# `pwd -P` at the caller's end is how a path is made clean; realpath is not on stock macOS.
+first_symlinked_ancestor() {
+  local path=$1 prefix="" comp oldifs
+  case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
+  oldifs=$IFS
+  IFS=/
+  for comp in $path; do
+    [ -n "$comp" ] || continue
+    prefix="$prefix/$comp"
+    if [ -L "$prefix" ]; then IFS=$oldifs; printf '%s\n' "$prefix"; return 0; fi
+  done
+  IFS=$oldifs
+  return 1
+}
+
 # Replace dst with a copy of src, atomically enough that a dispatch mid-copy sees either the
 # old directory or the new one.
 copy_dir() {
@@ -81,6 +107,28 @@ copy_dir() {
 drift=0      # status only: the checkout and the installed copies disagree
 problems=0   # push/pull only: a routine this run could not sync
 copied=0
+
+# Whatever the mode, a destination reached through a symlink is a destination the scheduler will
+# not read. Checked once, above the loop, because it is a fact about the root and not about any
+# one routine.
+if link=$(first_symlinked_ancestor "$dest_root"); then
+  warn "$dest_root is reached through a SYMLINK ($link -> $(readlink "$link")) -- the scheduler"
+  warn "refuses a task file whose path traverses one, at any component. Make the destination a"
+  warn "real directory (or point CLAUDE_SCHEDULED_TASKS_DIR at the resolved path) before syncing."
+  case "$mode" in
+    push)
+      # Copying would succeed and install a prompt nothing can read: the exact quiet failure
+      # this script exists to prevent.
+      warn "sync-routines: refusing to push behind a symlink"
+      exit 1
+      ;;
+    pull)
+      # Reading is unaffected -- the files behind the link are real -- so this is a warning.
+      warn "sync-routines: pulling anyway; the content behind the link is real"
+      ;;
+    *) drift=1 ;;
+  esac
+fi
 
 # A push onto a box whose scheduled-tasks directory does not exist yet has to create it, or
 # copy_dir's `mv` lands nowhere. Status and pull read, so they leave the filesystem alone.

@@ -9,12 +9,17 @@
 #     and the exit code of each;
 #   - that push replaces a symlink with a real directory instead of writing THROUGH it, which
 #     is the whole reason the script exists (desktop app 1.46388.4 refuses a task file reached
-#     through a symlink, quietly);
+#     through a symlink, quietly), and that a destination reached through a link at any component
+#     ABOVE the routine directory is refused too, with the same trees under their real path as
+#     the control;
 #   - that --dry-run copies nothing, in every mode, and still says what it would do;
 #   - the usage exits: an unknown argument is 2, --help prints the header;
 #   - that LOCAL_ROUTINES lists exactly the routines/README.md rows whose Kind is
 #     `local scheduled task` (ludics-lite#77), with negative controls that show the comparison
 #     can fail -- a claim that cannot fail would be worse than no claim;
+#   - that the workflow job running this suite carries no `if:`/`needs:`, since the diff
+#     classification calls an all-Markdown PR prompt-only and that is the one shape the pin
+#     above exists to catch;
 #   - that the tracked mode of sync-routines.sh is 755, which a `> tmp && mv` rewrite drops.
 #
 # Usage: test-sync-routines.sh   (exit 0 all pass, 1 otherwise)
@@ -27,6 +32,10 @@ SYNC="$HERE/sync-routines.sh"
 ROUTINES_README="$ROOT/routines/README.md"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/sync-routines-test.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
+# Physical path: the script refuses a destination reached through a symlink at ANY component,
+# and on macOS $TMPDIR sits under /var, which is a link to /private/var. Every case below wants
+# a clean root, so the symlink cases can put the link where they mean it.
+TMP=$(cd "$TMP" && pwd -P) || exit 1
 
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "PASS: $*"; }
@@ -230,6 +239,58 @@ expect "push --dry-run over a missing installation says it would install" 0 "wou
 [ ! -e "$TMP/installed/$R1" ] \
   && ok "...installing nothing" || ko "push --dry-run installed $R1"
 
+# --- a destination reached through a symlink ----------------------------------------------------
+# The per-routine check only sees the routine's own directory; the scheduler refuses a task file
+# whose path traverses a link at any component, so a symlinked ~/.claude or scheduled-tasks makes
+# every $dst a real directory behind a link. Reported "in sync" before this was checked.
+reset_trees; install_all
+LINKED="$TMP/linked-root"
+rm -f "$LINKED"
+ln -s "$TMP/installed" "$LINKED"
+linked_sync() { env CLAUDE_SCHEDULED_TASKS_DIR="$LINKED" "$SR" "$@"; }
+
+expect "status refuses a destination root that is itself a symlink" 1 "reached through a SYMLINK" -- \
+  linked_sync
+printf '%s' "$out" | grep -q 'at any component' \
+  && ok "...saying the scheduler refuses any component" || ko "no reason given -- $out"
+# The negative control on that verdict: the SAME trees reached by their real path are in sync, so
+# the exit 1 above is about the link and not about the fixture.
+expect "...while the same trees under their real path are in sync" 0 "all local routines in sync" -- \
+  run_sync
+
+expect "push refuses to install behind a symlinked root" 1 "refusing to push behind a symlink" -- \
+  linked_sync push
+# And it refuses before writing: a push that copied first would leave the prompt behind the link.
+printf 'body v2\n' >> "$REPO/routines/$R1/SKILL.md"
+linked_sync push >/dev/null 2>&1
+grep -q 'body v2' "$TMP/installed/$R1/SKILL.md" \
+  && ko "the refused push copied anyway" || ok "...copying nothing"
+expect "push --dry-run refuses the same way" 1 "refusing to push behind a symlink" -- \
+  linked_sync push --dry-run
+
+# A deeper link: the root exists as a real directory, but a component above it is a link.
+reset_trees; install_all
+mkdir -p "$TMP/deep/real"
+rm -f "$TMP/deep/link"
+ln -s "$TMP/deep/real" "$TMP/deep/link"
+mkdir -p "$TMP/deep/real/tasks"
+for r in $LOCAL_ROUTINES; do cp -R "$REPO/routines/$r" "$TMP/deep/real/tasks/$r"; done
+expect "status refuses when a component ABOVE the destination is the link" 1 \
+  "reached through a SYMLINK" -- env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/deep/link/tasks" "$SR"
+printf '%s' "$out" | grep -q "$TMP/deep/link" \
+  && ok "...naming the component that is the link" || ko "the refusal does not name the link -- $out"
+# The control: the same tree by its real path is in sync, so the refusal is the link's doing.
+expect "...while the real path of that same tree is in sync" 0 "all local routines in sync" -- \
+  env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/deep/real/tasks" "$SR"
+
+# pull is a read: the files behind the link are real, so it warns and proceeds rather than refusing.
+reset_trees; install_all
+printf 'body v2 -- written by the routine mid-run\n' >> "$TMP/installed/$R1/SKILL.md"
+expect "pull behind a symlinked root warns but proceeds" 0 "pulling anyway" -- linked_sync pull
+grep -q 'mid-run' "$REPO/routines/$R1/SKILL.md" \
+  && ok "...taking the edit, since the content behind the link is real" \
+  || ko "pull behind the link took nothing"
+
 # --- the pin: LOCAL_ROUTINES vs the routines table ----------------------------------------------
 # ludics-lite#77: nothing said that the install loop lists exactly the rows whose Kind is `local
 # scheduled task`. It is a script list now, so the pin is here. This reads the table narrowly --
@@ -319,6 +380,69 @@ EOF
 [ "$(local_rows_of "$TMP/table-prose.md")" = "$declared" ] \
   && ok "...while prose and later cells saying \"local scheduled task\" add no rows" \
   || ko "the reader picked up rows outside the Kind cell: $(local_rows_of "$TMP/table-prose.md")"
+
+# --- the pin has to actually run ----------------------------------------------------------------
+# The comparison above is only worth what CI runs. The diff classification in the workflow calls a
+# PR prompt-only when every file it touches is Markdown other than the top-level README -- and a PR
+# that adds or relabels a local routine can be exactly that (routines/README.md plus a prompt). So
+# this suite's job must carry no `if:` and no `needs:`, or the one check that compares the table
+# with LOCAL_ROUTINES is skipped on precisely the PRs that can break it.
+WORKFLOW="$ROOT/.github/workflows/skill-scripts.yml"
+# The block of one job: from `  <name>:` to the next line at that indent. A narrow read, like the
+# table read above, and the emptiness guard is the same idea.
+job_block() {
+  JB_NAME="$1" awk '
+    BEGIN { want = "  " ENVIRON["JB_NAME"] ":" }
+    $0 == want { inside = 1; next }
+    inside && /^  [^ #]/ { exit }
+    inside { print }
+  ' "$2"
+}
+if [ -f "$WORKFLOW" ]; then
+  block=$(job_block sync-routines "$WORKFLOW")
+  if [ -n "$block" ]; then
+    ok "the workflow declares a sync-routines job"
+    printf '%s\n' "$block" | grep -q 'test-sync-routines.sh' \
+      && ok "...that runs this suite" || ko "the sync-routines job does not run this suite"
+    printf '%s\n' "$block" | grep -qE '^    (if|needs):' \
+      && ko "the sync-routines job is conditioned on the diff classification, so the routines-table pin is skipped on an all-Markdown PR -- the one shape that breaks it" \
+      || ok "...unconditionally, so an all-Markdown PR is judged by it too"
+  else
+    ko "no sync-routines job in $WORKFLOW -- nothing runs this suite"
+  fi
+else
+  ko "no $WORKFLOW to read"
+fi
+# The negative controls: the same reader over a scratch workflow, conditioned and unconditioned.
+cat > "$TMP/wf-conditioned.yml" <<'EOF'
+jobs:
+  prompts:
+    runs-on: ubuntu-latest
+  sync-routines:
+    name: sync-routines (ubuntu)
+    needs: changes
+    if: ${{ needs.changes.outputs.scripts == 'true' }}
+    steps:
+      - run: scripts/test-sync-routines.sh
+  macos:
+    runs-on: macos-latest
+EOF
+printf '%s\n' "$(job_block sync-routines "$TMP/wf-conditioned.yml")" | grep -qE '^    (if|needs):' \
+  && ok "the job reader sees an if:/needs: line when one is there, so the verdict above can fail" \
+  || ko "the job reader misses a conditioned job -- the verdict above means nothing"
+cat > "$TMP/wf-plain.yml" <<'EOF'
+jobs:
+  sync-routines:
+    name: sync-routines (ubuntu)
+    steps:
+      - run: scripts/test-sync-routines.sh
+  macos:
+    needs: changes
+    if: ${{ always() }}
+EOF
+printf '%s\n' "$(job_block sync-routines "$TMP/wf-plain.yml")" | grep -qE '^    (if|needs):' \
+  && ko "the job reader read past the end of the job into the next one" \
+  || ok "...and stops at the next job, so a neighbour's condition is not read as this job's"
 
 # --- the executable bit -------------------------------------------------------------------------
 # A `> tmp && mv` rewrite of a script drops mode 755, and the failure is a CI run away: the

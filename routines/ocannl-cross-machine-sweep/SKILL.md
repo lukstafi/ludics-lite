@@ -81,9 +81,14 @@ script is NOT standalone: it resolves siblings relative to its own directory
 so a lone copy of `tools/sweep.sh` dies with exit 2 before testing anything. Extract the two
 directories together from master instead of copying one file:
 
+    mkdir -p ~/.ocannl-sweep
     git -C ~/ocannl-staging fetch -q origin master
     rm -rf ~/.ocannl-sweep/tools ~/.ocannl-sweep/benchmarks
     git -C ~/ocannl-staging archive origin/master tools benchmarks | tar -x -C ~/.ocannl-sweep
+
+The `mkdir` is not redundant on a box where the sweep has run before: `tar -C` requires the
+directory to exist, and `~/.ocannl-sweep` is also the script's state directory
+(`OCANNL_TOOL_SWEEP_STATE`), so a fresh host, or one where it was cleared, has none.
 
 If a future master grows a dependency outside those two directories, the failure is an exit 2
 during startup: today the missing sibling is reported by the interpreter's own error above the

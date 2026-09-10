@@ -51,7 +51,10 @@ scripts/sync-routines.sh pull   # ~/.claude/scheduled-tasks -> this checkout, th
 `push` also converts a directory left over from the symlink era. Edit a prompt here and `push`; if
 an edit lands in the installed copy instead -- a routine's own run editing its prompt in place --
 `pull` it back and commit, rather than letting the two drift. `status` exits 1 on any drift, which
-is what makes it worth running after a merge that touched a prompt.
+is what makes it worth running after a merge that touched a prompt. It refuses outright, in any
+mode, when `~/.claude/scheduled-tasks` is itself reached through a symlink at any component: the
+task directories under it would each be real while nothing could read a single one of them, which
+is the same quiet failure by a longer path.
 
 The script only touches the rows above whose Kind is `local scheduled task`, never the cloud
 routine below, and its `LOCAL_ROUTINES` list is exactly those rows -- pinned by

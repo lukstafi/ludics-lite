@@ -170,15 +170,17 @@ scripts/test-check-prompts.sh
 scripts/test-sync-routines.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all thirteen on Ubuntu, one
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all fourteen on Ubuntu, one
 job per suite, and on macOS (the fleet's bash is 3.2) as one job with a step per suite: the hosted
 macOS runners are scarce enough that four separate macOS jobs queued a green PR for one to two
 hours behind nine minutes of work (ludics-lite#55). Alongside them run `bash -n`, shellcheck at
 error severity, and a check that the two cleanup scripts still carry their parse guard. The suites
 run on every push to main and on a pull request that touches anything but Markdown (the top-level
-README counts as script input, since the fleet suite executes its install loops); two jobs run on
-every head regardless, the prompt hygiene check (`scripts/check-prompts.sh`) and the lint, so every
-PR's merge gate reads a verdict rather than `ABSENT`, a prompt-only PR included.
+README counts as script input, since the fleet suite executes its install loops); three jobs run on
+every head regardless, the prompt hygiene check (`scripts/check-prompts.sh`), the lint, and the
+sync-routines suite, so every PR's merge gate reads a verdict rather than `ABSENT`, a prompt-only
+PR included. The third is unconditional for a reason of its own: the routines-table pin it carries
+is broken by exactly the all-Markdown PR the classification calls prompt-only.
 
 `check-prompts.sh` is the prompt hygiene check itself: every skill and routine `SKILL.md` opens
 with YAML frontmatter carrying one `name`, equal to its directory, and one single-line
@@ -216,13 +218,17 @@ which an iteration budget did not (`WAKE_LAB_WAIT_SECONDS`, `WAKE_LAB_WSL_WAIT_S
 scratch checkout, so a `pull` case can never reach the real `routines/`. It pins the four states
 `status` reports and the exit code of each (in sync, drift, installed as a symlink, not
 installed), that `push` replaces a symlinked installation with a real directory instead of writing
-through it, that `--dry-run` copies nothing in any mode, and the usage exits. It also pins what
+through it, that a destination reached through a link at any component *above* the routine
+directory is refused as well — a symlinked `~/.claude` leaves every task directory real and the
+whole tree unreadable — that `--dry-run` copies nothing in any mode, and the usage exits. It also pins what
 ludics-lite#77 found unpinned: that the script's `LOCAL_ROUTINES` lists exactly the rows of
 `routines/README.md` whose Kind is `local scheduled task`. That comparison reads the table
 narrowly and refuses an empty read, so a mangled table cannot pass it vacuously, and four negative
 controls show it can fail; `check-prompts.sh` keeps its per-directory lookup and gains no table
-model. The last case pins the tracked mode of `sync-routines.sh` at 755, which a `> tmp && mv`
-rewrite drops silently.
+model. Two more cases pin what the comparison is worth: that the workflow job running this suite
+carries no `if:`/`needs:`, since an all-Markdown PR is both what the classification calls
+prompt-only and the one shape that can break the pin, and that the tracked mode of
+`sync-routines.sh` is 755, which a `> tmp && mv` rewrite drops silently.
 
 `test-pr-review-checks-absent.sh` drives the build gate against a canned Actions API, one answer
 per polling round, and pins everything the check list alone cannot say about a head. Exit 4 (no

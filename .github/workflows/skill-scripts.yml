@@ -5,8 +5,9 @@ name: skill scripts
 # check, say) is one more entry below and no edit to the others.
 #
 # THE VERDICT GUARANTEE. `pr-review.sh merge` reads the head commit's check-runs and refuses a
-# head that has none (ABSENT, ludics-lite#21). Two jobs therefore run on every head, whatever it
-# changed: `prompts` (the prompt hygiene checks) and `lint`. Everything expensive is conditioned
+# head that has none (ABSENT, ludics-lite#21). Three jobs therefore run on every head, whatever it
+# changed: `prompts` (the prompt hygiene checks), `lint`, and `sync-routines`, which is
+# unconditional for a second reason given at the job itself. Everything expensive is conditioned
 # on the diff instead -- as job-level `if:` conditions on a `changes` job, NEVER as
 # `on.<event>.paths`: a workflow-level path filter means no run at all for a prompt-only PR, so
 # no verdict; a job that its `if:` skips still reports a `skipped` check-run, which the gate
@@ -117,6 +118,24 @@ jobs:
             fi
           done
 
+  sync-routines:
+    name: sync-routines (ubuntu)
+    # No `if:` here either, and the reason is the routines-table pin the suite carries. A PR that
+    # adds or relabels a local scheduled task can be entirely Markdown -- routines/README.md plus a
+    # prompt -- which the classification below calls prompt-only. Conditioned like the other
+    # suites, the one check that compares the table with the script's LOCAL_ROUTINES would be
+    # skipped on exactly the PRs that can break it, and `prompts` does not compare them (its index
+    # claim is a per-directory lookup, ludics-lite#75, and is not to be grown into one). The suite
+    # runs in about a second with no dependencies, so it costs what the hygiene job costs. Its
+    # macOS leg stays in the conditioned macos job below: bash 3.2 coverage is the expensive half,
+    # and the pin itself is platform-independent.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise the routine install states and the routines-table pin
+        run: scripts/test-sync-routines.sh
+
   # ---- the diff classification the suites are conditioned on ------------------------------
 
   changes:
@@ -222,17 +241,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Exercise the host-table split and the --help range
         run: scripts/test-wake-lab.sh
-
-  sync-routines:
-    name: sync-routines (ubuntu)
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Exercise the routine install states and the routines-table pin
-        run: scripts/test-sync-routines.sh
 
   prompt-checker:
     name: prompt checker fixtures (ubuntu)
