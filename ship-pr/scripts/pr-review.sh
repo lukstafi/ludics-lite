@@ -584,10 +584,15 @@ esac
 # The first marker is anchored to the START of the body (\A), not to a line: a review whose own
 # prose or code block QUOTES the failure reads as one otherwise — this repository's fixtures quote
 # it verbatim and its reviewer reads them — and a wrong verdict is the one thing here worse than a
-# missed one. The second marker is line-anchored, because the ref arrives inside that fenced
-# block; the ref it names is then checked against the head before any state fires, so a quoted
-# one cannot match the PR it is quoted on. GitHub serves lowercase hex, as does the message.
-INIT_FAILURE_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong|^[ \t]*Provided git ref [0-9a-f]{7,40} does not exist'
+# missed one. The second marker takes any line, because the ref arrives inside that fenced block,
+# and the ref it names is then checked against the head before any state fires, so a quoted one
+# cannot match the PR it is quoted on. That line start is spelled `(^|\n)`, not `^`: jq's regexes
+# are Oniguruma in Perl mode, where `^` is the start of the STRING and nothing else — a `^`
+# marker here matches only a body that opens with the fenced ref, which is not a body the
+# connector ever posts, so the alternative would be a claim that cannot fire. GitHub serves
+# lowercase hex, as does the message.
+INIT_FAILURE_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong'
+INIT_FAILURE_RE="$INIT_FAILURE_RE"'|(^|\n)[ \t]*Provided git ref [0-9a-f]{7,40} does not exist'
 # The ref the failure names, when it names one: the head the reviewer could not fetch.
 INIT_FAILURE_REF_RE='Provided git ref[^0-9a-f]*(?<s>[0-9a-f]{7,40})'
 
@@ -866,14 +871,17 @@ status_state() {
       if [ -z "$rev_head_at" ] || [[ "$fail_at" > "$rev_head_at" ]]; then
         # How many failures name THIS head: the first is worth a nudge, a second says the nudge
         # will not help and the head itself has to move. Only a failure that names a ref can be
-        # attributed to a head at all, so a newest one that names none counts itself in.
+        # attributed to a head at all, so a newest one that names none counts itself in. The ref
+        # is bound to $ref before the prefix test: inside `startswith(...)` the `.` is that
+        # filter's own input — $sha — so the unbound form compares the head to itself and every
+        # failure on the PR counts (caught by the two-heads control in the status suite).
         nfail=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" \
           --arg refre "$INIT_FAILURE_REF_RE" --arg sha "$head_sha" '
             [.[] | select((.user.login // "") | startswith($rev))
                  | select((.body // "") | test("codex-pull-request-review-summary") | not)
                  | select((.body // "") | test($re))
-                 | ((try ((.body // "") | capture($refre).s) catch "") // "")
-                 | select(. != "" and ($sha | startswith(.)))]
+                 | ((try ((.body // "") | capture($refre).s) catch "") // "") as $ref
+                 | select($ref != "" and ($sha | startswith($ref)))]
             | length' <<<"$comments_raw" 2>/dev/null) || nfail=""
         case "$nfail" in '' | *[!0-9]*) nfail=0 ;; esac
         [ -n "$fail_ref" ] || nfail=$((nfail + 1))

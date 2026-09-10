@@ -2,6 +2,10 @@
 # Focused fixture tests for pr-review.sh's `status` state line — the mergeability that rides on
 # every state and turns "the next move is yours" into "merge the base in first" — and for `watch`
 # reading the base drift the moment a round lands rather than at merge time (ludics-lite#44).
+#
+# Plus the `failed` state (ludics-lite#78): the reviewer answering with an initialization failure
+# instead of a round, which used to read as `expected` and send `watch` into the grace. Its
+# fixtures carry the comment body verbatim from lukstafi/ocannl-staging#677.
 
 set -euo pipefail
 
@@ -20,6 +24,9 @@ MERGEABLE_STATE=clean
 FAIL_PULLS=""
 PUSH_ON_REVIEWS_READ=""
 PAST=2026-09-01T00:00:00Z
+# The two refs ocannl-staging#677's failures named, and its third head, which reviewed normally.
+FAILED_HEAD=0ac6fef8038e95481f82deddc1edfa2ab8ca8827
+OTHER_REF=099131cc90960b2ad144f9f33c374c6be81035c8
 
 reset_fixture() {
   REACTIONS_JSON='[]'
@@ -48,6 +55,30 @@ verdict_comment() { # <id> <sha> <created_at>
   jq -cn --argjson id "$1" --arg sha "$2" --arg at "$3" --arg rev "$REVIEWER" \
     '{id:$id, user:{login:($rev + "[bot]")}, created_at:$at, updated_at:$at,
       body:("Codex Review: Didn'"'"'t find any major issues.\n**Reviewed commit:** `" + $sha + "`")}'
+}
+
+plain_comment() { # <id> <created_at> <body>
+  jq -cn --argjson id "$1" --arg at "$2" --arg b "$3" --arg rev "$REVIEWER" \
+    '{id:$id, user:{login:($rev + "[bot]")}, created_at:$at, updated_at:$at, body:$b}'
+}
+
+# The initialization failure as the connector posts it: the curly quotes, the ref in a fenced
+# block, and the "About Codex in GitHub" details block every one of its comments carries. Nothing
+# machine-tags it, which is why it reads as the reviewer's last word. `-` for a failure that
+# names no ref.
+FAILURE_HEAD_LINE='Codex Review: Something went wrong. Try again later by commenting “@codex review”.'
+FAILURE_TAIL='<details> <summary>ℹ️ About Codex in GitHub</summary>
+Reviews are triggered when you open a pull request or comment "@codex review".
+</details>'
+
+failure_body() { # <ref|->
+  printf '%s\n' "$FAILURE_HEAD_LINE" ""
+  [ "$1" = - ] || printf '```\nProvided git ref %s does not exist\n```\n\n' "$1"
+  printf '%s\n' "$FAILURE_TAIL"
+}
+
+failure_comment() { # <id> <ref|-> <created_at>
+  plain_comment "$1" "$3" "$(failure_body "$2")"
 }
 
 compare_json() { # <behind> <ahead> <file>
@@ -83,11 +114,14 @@ gh() {
     response=$(jq -cn --arg h "$HEAD_SHA" --arg m "$MERGEABLE_STATE" \
       '{base:{ref:"main",sha:"stale-base-sha"}, head:{sha:$h}, mergeable_state:$m}')
     ;;
-  "repos/$REPO/commits/head-sha" | "repos/$REPO/commits/new-head-sha")
+  "repos/$REPO/commits/head-sha" | "repos/$REPO/commits/new-head-sha" | \
+    "repos/$REPO/commits/$FAILED_HEAD")
     response='{"sha":"head-sha","commit":{"committer":{"date":"2026-09-01T00:00:00Z"}}}' ;;
   "repos/$REPO/commits/main") response='{"sha":"base-sha"}' ;;
-  "repos/$REPO/compare/base-sha...head-sha?per_page=1") response=$(compare_json 7 15 pr.txt) ;;
-  "repos/$REPO/compare/head-sha...base-sha?per_page=1") response=$(compare_json 15 7 base.txt) ;;
+  "repos/$REPO/compare/base-sha...head-sha?per_page=1" | \
+    "repos/$REPO/compare/base-sha...$FAILED_HEAD?per_page=1") response=$(compare_json 7 15 pr.txt) ;;
+  "repos/$REPO/compare/head-sha...base-sha?per_page=1" | \
+    "repos/$REPO/compare/$FAILED_HEAD...base-sha?per_page=1") response=$(compare_json 15 7 base.txt) ;;
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
   gh_fixture_answer "$response"
@@ -316,6 +350,175 @@ test_watch_approved_leaves_the_drift_to_merge() {
     "merge prints the drift read next; the watch does not duplicate it"
 }
 
+# --- the reviewer that never started (ludics-lite#78) ------------------------------------------
+# The head is the SHA the first ocannl-staging#677 failure named, so "the ref it could not fetch"
+# and "the PR's head" are the same string, as they were there.
+failed_fixture() { # <the ref the failure names, or - for none>
+  reset_fixture
+  HEAD_SHA="$FAILED_HEAD"
+  COMMENTS_JSON="[$(failure_comment 100 "$1" "$PAST")]"
+}
+
+test_initialization_failure_is_its_own_state() {
+  failed_fixture "$FAILED_HEAD"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed \
+    "the reviewer's newest word saying it could not fetch the head is not a review that is due"
+  assert_eq "$(state_merge "$STATE")" clean "the mergeability rides on this state line too"
+  assert_contains "$LINE" "reviewer FAILED at initialization on head ${FAILED_HEAD:0:7} — " \
+    "the line should name the state and the head it happened on"
+  assert_contains "$LINE" "nudge it once with a '@codex review' comment" \
+    "the first failure on a head is worth one nudge"
+  assert_contains "$LINE" "pr-review.sh comment $REPO#" "the nudge should be a runnable command"
+  assert_contains "$LINE" "clone is behind, not your push" \
+    "the line should say whose side the failure is on, since the push looks guilty"
+  assert_not_contains "$LINE" "review EXPECTED" \
+    "the failure must not read as a round that has yet to start"
+  assert_not_contains "$LINE" "another nudge is not the move" \
+    "a first failure has not exhausted the nudge"
+  run_cmd_status
+  assert_eq "$CMD_RC" 0 "a state that was READ is exit 0, whatever it says"
+  assert_contains "$CMD_OUT" "reviewer FAILED at initialization" "cmd_status should print it"
+  assert_contains "$CMD_OUT" "review rounds with findings: 0 of 12" \
+    "an attempt that never ran is not a round with findings"
+}
+
+# A failure that names no ref at all is still about the head the round was due on: it is the
+# reviewer's newest word and it contradicts nothing.
+test_a_failure_naming_no_ref_still_fires() {
+  failed_fixture -
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "a failure naming no ref cannot be about another head"
+  assert_contains "$LINE" "reviewer FAILED at initialization on head ${FAILED_HEAD:0:7}" \
+    "the head on the line is the PR's, since the comment named none"
+  assert_contains "$LINE" "nudge it once" "one unattributable failure is still the first one"
+}
+
+# The second marker carrying the match on its own: a body that does not OPEN with the connector's
+# sentence is still a failure when the fenced ref line is there. Without a case for it the
+# matcher would rest entirely on one line of prose — and the marker itself would be unfalsifiable
+# (its first spelling, `^…`, matched nothing at all: jq's `^` is the start of the string).
+test_the_ref_line_alone_identifies_the_failure() {
+  reset_fixture
+  HEAD_SHA="$FAILED_HEAD"
+  COMMENTS_JSON="[$(plain_comment 100 "$PAST" "$(printf '%s\n\n```\nProvided git ref %s does not exist\n```\n' \
+    'Codex Review: the review could not be started.' "$FAILED_HEAD")")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed \
+    "the fenced ref line identifies the failure without the opening sentence"
+  assert_contains "$LINE" "for ref ${FAILED_HEAD:0:7}" \
+    "the ref the reviewer could not fetch should be captured and named"
+}
+
+test_a_second_failure_on_the_same_head_says_push_a_new_head() {
+  failed_fixture "$FAILED_HEAD"
+  COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST"),$(
+    failure_comment 101 "$FAILED_HEAD" 2026-09-01T00:03:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "a second failure is still a failure"
+  assert_contains "$LINE" "failed 2 times on THIS head" "the line should count the recurrence"
+  assert_contains "$LINE" "push a new head (an amend suffices" \
+    "a nudge that already failed is not the remedy twice"
+  assert_not_contains "$LINE" "nudge it once" "the exhausted remedy must not be re-offered"
+  # ocannl-staging#677's own shape: two failures, each naming its own head. For the head in hand
+  # that is the FIRST, and a nudge is what worked there.
+  COMMENTS_JSON="[$(failure_comment 100 "$OTHER_REF" "$PAST"),$(
+    failure_comment 101 "$FAILED_HEAD" 2026-09-01T00:03:00Z)]"
+  run_status
+  assert_contains "$LINE" "nudge it once" \
+    "a failure on the previous head is not a failure on this one"
+  assert_not_contains "$LINE" "failed 2 times" "the count is per head, not per PR"
+}
+
+# The head moved on after the failure: a round is due on the NEW head, and that is `expected`.
+test_a_failure_naming_another_head_is_expected() {
+  failed_fixture "$OTHER_REF"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected \
+    "a failure about a head that has since been replaced is a round due on the new one"
+  assert_contains "$LINE" "review EXPECTED but not started" "the ordinary due-round line"
+  assert_not_contains "$LINE" "FAILED at initialization" \
+    "the previous head's failure must not be reported against this one"
+}
+
+test_a_round_of_the_head_after_the_failure_wins() {
+  failed_fixture "$FAILED_HEAD"
+  REVIEWS_JSON="[$(review 5 "$FAILED_HEAD" 2026-09-01T01:00:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle \
+    "a round that landed on this head after the failure is the newer truth"
+  # The negative control on the same comparison: the round landed BEFORE the failed re-request
+  # (a '@codex review' with no push), so it does not answer for it.
+  REVIEWS_JSON="[$(review 5 "$FAILED_HEAD" 2026-08-31T23:00:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed \
+    "a round from before the failure does not make the failed re-request a round"
+  # And a review of some OTHER head is not a review of this one, whenever it landed.
+  REVIEWS_JSON="[$(review 5 old-head-sha 2026-09-01T01:00:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "the comparison is against reviews of THIS head"
+}
+
+test_a_newer_reviewer_word_supersedes_the_failure() {
+  failed_fixture "$FAILED_HEAD"
+  REACTIONS_JSON="[$(reaction eyes "$(jq -rn '(now - 60) | todate')")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" reviewing \
+    "a 👀 raised after the failure is a round that started after it — wait that one out"
+  failed_fixture "$FAILED_HEAD"
+  COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST"),$(
+    verdict_comment 101 "$FAILED_HEAD" 2026-09-01T01:00:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved \
+    "a no-findings verdict after the failure is the reviewer's newest word"
+  failed_fixture "$FAILED_HEAD"
+  REACTIONS_JSON="[$(reaction +1 "$PAST")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "the 👍 is the merge gate whatever followed it"
+}
+
+# The wrong verdict this state could produce, and the two guards against it. A review QUOTING the
+# failure — this repository's own reviewer reads these fixtures — must not be read as one.
+test_a_quoted_failure_is_not_a_failure() {
+  reset_fixture
+  HEAD_SHA="$FAILED_HEAD"
+  COMMENTS_JSON="[$(plain_comment 100 "$PAST" "$(printf '%s\n\n```\n%s\n```\n\n%s\n' \
+    'Round 3, on the summary: the first marker is anchored to the body start, so' \
+    "$FAILURE_HEAD_LINE" 'quoting it in a finding cannot fire the state.')")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected \
+    "a finding that quotes the failure sentence is not the reviewer failing"
+  # Quoted with its fenced ref line as well: that marker is line-anchored and does match, so what
+  # refuses the state here is the ref — the quoted one is not this PR's head.
+  COMMENTS_JSON="[$(plain_comment 101 "$PAST" "$(printf 'Round 4, the fixture body is\n\n%s\n' \
+    "$(failure_body "$OTHER_REF")")")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected \
+    "a quoted failure names the ref it was quoted from, which is not this head"
+}
+
+test_watch_exits_on_the_initialization_failure() {
+  failed_fixture "$FAILED_HEAD"
+  # The watermark is already past the comment: this is the SECOND window, the one that used to
+  # report "review EXPECTED but not started" and wait the grace out.
+  run_watch 0,200,0
+  assert_eq "$WATCH_RC" 0 "the failure is something to act on, as a stall is"
+  assert_contains "$WATCH_OUT" "reviewer FAILED at initialization on head ${FAILED_HEAD:0:7}" \
+    "the verdict is on stdout, where the caller reads it"
+  assert_contains "$WATCH_OUT" "watermark: 0,200,0" "the watch still ends on a watermark"
+  assert_not_contains "$WATCH_OUT" "no review materialized" \
+    "the grace is for a round that has not started, not for one the reviewer said it could not"
+  assert_contains "$WATCH_ERR" "base freshness $REPO#7:" \
+    "the drift read rides along, as it does on the other exits"
+  # The first window, where the comment is itself the new activity: the round prints, and the
+  # status context beside it already says what the comment means.
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "a new comment is a round to return on"
+  assert_contains "$WATCH_OUT" "--- summary id=100" "the failure comment is what poll saw"
+  assert_contains "$WATCH_ERR" "status: reviewer FAILED at initialization" \
+    "the context should name the state, not leave the caller to read the body"
+}
+
 tests=(
   test_idle_clean_says_next_move_is_yours
   test_idle_dirty_says_conflicts_not_next_move
@@ -331,6 +534,15 @@ tests=(
   test_detail_is_the_last_field_and_keeps_pipes
   test_watch_reads_the_drift_when_a_round_lands
   test_watch_approved_leaves_the_drift_to_merge
+  test_initialization_failure_is_its_own_state
+  test_a_failure_naming_no_ref_still_fires
+  test_the_ref_line_alone_identifies_the_failure
+  test_a_second_failure_on_the_same_head_says_push_a_new_head
+  test_a_failure_naming_another_head_is_expected
+  test_a_round_of_the_head_after_the_failure_wins
+  test_a_newer_reviewer_word_supersedes_the_failure
+  test_a_quoted_failure_is_not_a_failure
+  test_watch_exits_on_the_initialization_failure
 )
 
 run_tests "${tests[@]}"

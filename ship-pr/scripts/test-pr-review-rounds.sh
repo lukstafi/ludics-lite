@@ -55,6 +55,13 @@ set_comments() {
   COMMENTS_JSON=$(printf '%s\n' "$@" | jq -cs .)
 }
 
+# The initialization failure, verbatim from lukstafi/ocannl-staging#677 (2026-09-09): a summary
+# comment with no findings under it, because the review never ran (ludics-lite#78).
+failure_body() { # <the ref the reviewer could not fetch>
+  printf '%s\n\n```\nProvided git ref %s does not exist\n```\n' \
+    'Codex Review: Something went wrong. Try again later by commenting “@codex review”.' "$1"
+}
+
 run_rounds() {
   local capture rc
   set +e
@@ -181,6 +188,40 @@ test_large_comment_feed_still_counts() {
     "the inline round plus two comment-only rounds"
 }
 
+# What #677 actually read: two failed fetches, minutes apart, both landing in the comment feed
+# with no "Reviewed commit" to attribute them to a head — counted as one comment-shaped round,
+# reported as "1 round(s) of findings over 0 head(s)", and charged against the threshold.
+test_initialization_failures_are_not_rounds() {
+  set_reviews
+  set_comments \
+    "$(comment "$REVIEWER" 2026-09-09T17:00:54Z \
+      "$(failure_body 0ac6fef8038e95481f82deddc1edfa2ab8ca8827)")" \
+    "$(comment "$REVIEWER" 2026-09-09T17:03:22Z \
+      "$(failure_body 099131cc90960b2ad144f9f33c374c6be81035c8)")"
+  ROUND_THRESHOLD=12
+  run_rounds
+  assert_eq "$ROUNDS_RC" 0 "an unread threshold is not what a failed fetch produces"
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 0 of 12" \
+    "a review that never started carries no findings"
+  # Beside a real round, the failures still add nothing.
+  set_reviews "$(review "$REVIEWER" COMMENTED aaaa 2026-09-09T10:00:00Z)"
+  set_comments \
+    "$(comment "$REVIEWER" 2026-09-09T17:00:54Z \
+      "$(failure_body 0ac6fef8038e95481f82deddc1edfa2ab8ca8827)")" \
+    "$(comment "$REVIEWER" 2026-09-09T17:03:22Z \
+      "$(failure_body 099131cc90960b2ad144f9f33c374c6be81035c8)")"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "the inline round is the only round the two failures sit beside"
+  # The negative control on the matcher: a comment-only round that merely says the words is a
+  # round, and must not be swept up with them.
+  set_comments "$(comment "$REVIEWER" 2026-09-09T17:00:54Z \
+    'Codex Review: drop the lock — something went wrong in round 2 for a different reason')"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
+    "a finding that mentions the wording is still a finding"
+}
+
 test_no_rounds_yet() {
   set_reviews "$(review "$REVIEWER" APPROVED cccc 2026-09-01T12:00:00Z)"
   ROUND_THRESHOLD=12
@@ -238,6 +279,7 @@ tests=(
   test_malformed_gap_is_refused
   test_comment_only_rounds_count
   test_large_comment_feed_still_counts
+  test_initialization_failures_are_not_rounds
   test_no_rounds_yet
   test_threshold
   test_threshold_off
