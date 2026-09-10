@@ -60,23 +60,36 @@ jobs:
           set -e
           for f in */scripts/*.sh scripts/*.sh; do bash -n "$f"; done
       - name: Check the mode bit
-        # The same list as the syntax check above, asserted executable. A `> tmp && mv` rewrite
-        # of a script drops its mode bit and git tracks the mode, so the drop commits; without
-        # this the first symptom is an `exit 126` from a suite in some other job, which reads as
-        # that suite failing rather than as a lost mode bit. The exemption is the sourced
-        # template: an `*.example.sh` is `.`-ed by the script that reads it
-        # (scripts/wake-lab-hosts.example.sh, sourced by wake-lab.sh) and is never executed, so
-        # it is tracked 100644 on purpose. The PowerShell script is outside the glob entirely --
-        # it is `.ps1`, and `Check PowerShell syntax` parses it rather than running it.
+        # The same list as the syntax check above, under a two-way rule: a script must be
+        # executable, and an `*.example.sh` must NOT be. A `> tmp && mv` rewrite of a script drops
+        # its mode bit and git tracks the mode, so the drop commits; without this the first
+        # symptom is an `exit 126` from a suite in some other job, which reads as that suite
+        # failing rather than as a lost mode bit. The suffix names the sourced template: an
+        # `*.example.sh` is `.`-ed by the script that reads it (scripts/wake-lab-hosts.example.sh,
+        # sourced by wake-lab.sh) and is never executed, so it is tracked 100644 on purpose. That
+        # half is asserted rather than merely exempted, because the pass the suffix buys is sound
+        # only while the class really is the sourced one: a future `*.example.sh` written to be
+        # run would otherwise skip the mode check in silence, and a stray `chmod +x` on a template
+        # would void the convention this comment claims. The PowerShell script is outside the glob
+        # entirely -- it is `.ps1`, and `Check PowerShell syntax` parses it rather than running it.
         run: |
           set -e
           rc=0
           for f in */scripts/*.sh scripts/*.sh; do
-            case "$f" in *.example.sh) continue ;; esac
-            if [ ! -x "$f" ]; then
-              echo "::error file=$f::$f is not executable; restore the mode bit with 'chmod +x $f' and commit it"
-              rc=1
-            fi
+            case "$f" in
+              *.example.sh)
+                if [ -x "$f" ]; then
+                  echo "::error file=$f::$f is an .example.sh: it is sourced, never executed, so it must NOT be executable (the mode check gives the suffix a pass on that assertion, and the pass is only sound if the class is really the sourced one); run 'chmod -x $f' and commit it"
+                  rc=1
+                fi
+                ;;
+              *)
+                if [ ! -x "$f" ]; then
+                  echo "::error file=$f::$f is not executable; restore the mode bit with 'chmod +x $f' and commit it"
+                  rc=1
+                fi
+                ;;
+            esac
           done
           exit "$rc"
       - name: Shellcheck
