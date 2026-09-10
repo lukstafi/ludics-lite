@@ -370,7 +370,12 @@ result rather than a failure. `retune GRACE=1` remembers the value as sourced, r
 script does not set, and `run_tests` puts every one of them back when the case ends. Run directly,
 `test-pr-review-lib.sh` is its own suite: throwaway suites that source it prove the guard refuses
 what it must and passes what it must, and a pair of cases proves a retuned constant is restored for
-the case after it.
+the case after it. A control there has to be *shown* to fail, and the way to show it is to copy the
+file and `pr-review.sh` into a scratch directory, revert the fix in the copy, and run the copy —
+the tracked file is never touched, so an interrupted session leaves the repo clean. The copy may be
+named anything (the file derives its own name rather than spelling it) and needs only `pr-review.sh`
+beside it; the last case runs a renamed copy for real, so a name spelled instead of derived breaks
+the suite rather than the next person's mutation (ludics-lite#101).
 
 The fixture suites pin the gate's logic against canned answers, so the shapes those answers imitate
 are a belief the suites cannot check — a renamed field, a changed default ordering or a new
