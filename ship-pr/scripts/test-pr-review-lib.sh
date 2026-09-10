@@ -414,8 +414,19 @@ lib_function_table() {
 }
 
 # lib_owner_of <name> <table>: the "<line> <file>" the table records for <name>, empty if none.
+#
+# A here-string, not `printf … | awk`: awk stops at the first match, and a reader that exits early
+# closes the pipe under the writer. The writer then takes a SIGPIPE, `set -o pipefail` — which
+# every suite runs under — makes that the pipeline's status, and the caller's `$(…)` assignment
+# fails under `set -e`. It is a race on whether the table still fits the pipe buffer when awk
+# leaves, so it fires once in many runs and reproduces nowhere: main went red on 2026-09-10 with
+# `line 418: printf: write error: Broken pipe` out of test_own_functions_pass, a case that touches
+# none of this. A here-string is fed from a temporary file rather than a pipe, so there is no
+# reader to close and nothing to signal. Same output, same status, in all three cases the callers
+# rely on — a match at either end of the table, and no match at all. This is ludics-lite#118's
+# shape (`printf … | grep -q`) in the preamble that issue holds up as the model for the fix.
 lib_owner_of() {
-  printf '%s\n' "$2" | awk -v n="$1" '$1 == n { sub(/^[^ ]+ /, ""); print; exit }'
+  awk -v n="$1" '$1 == n { sub(/^[^ ]+ /, ""); print; exit }' <<<"$2"
 }
 
 # The names below this point are not protected: the snapshot is taken once everything this file
