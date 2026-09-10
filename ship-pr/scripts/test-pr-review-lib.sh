@@ -61,7 +61,14 @@ HELPER="$TEST_LIB_DIR/pr-review.sh"
 # Everything a suite defines must come AFTER this file: a function defined before pr-review.sh
 # is sourced is replaced by the library's same-named one (the shadow in the other direction),
 # and the snapshot below could not tell.
-lib_predefined=$(declare -F | sed 's/^declare -f //' | tr '\n' ' ')
+# `declare -f <name>` for an ordinary function, `declare -fx <name>` for one the ENVIRONMENT
+# exported into this shell (`export -f`). Only the former is the suite's doing, so only the former
+# is matched — printing just the matches, and not every line with a prefix stripped where it
+# happened to occur. An inherited function is not something a suite can be asked to move below the
+# source, and it is harmless besides: a library name among them is replaced when pr-review.sh is
+# sourced a few lines down, and the snapshot then records the library's. Before this, any exported
+# function in the environment refused every suite, naming "declare -fx <name>" as the definition.
+lib_predefined=$(declare -F | sed -n 's/^declare -f \(.*\)/\1/p' | tr '\n' ' ')
 if [ -n "$lib_predefined" ]; then
   echo "test-pr-review-lib.sh: REFUSING to run: the suite defined functions before sourcing this file (${lib_predefined% }); source it first, so the shadow guard sees every definition" >&2
   exit 2
@@ -72,19 +79,32 @@ export SHIP_PR_TEST_SOURCE_ONLY=1
 export SHIP_PR_STATE_DIR=off
 export SHIP_PR_API_ATTEMPTS=1
 export SHIP_PR_API_BACKOFF=0
-# The variable names in scope on either side of the source, so what pr-review.sh sets when it is
-# sourced can be named exactly: that difference is the set `retune` accepts. The seeds are the
-# three names this stanza itself introduces — each is set after the snapshot it would spoil, so
-# without them they would read as the library's.
-lib_vars_before=" $(compgen -v | tr '\n' ' ')lib_vars_before lib_var HELPER_CONSTANTS "
+# The set `retune` accepts: the names pr-review.sh ASSIGNS, read from its text, kept when they are
+# really set once it has been sourced. Two things are deliberate about reading the text.
+#
+# It does not depend on who invoked the suite. Differencing the variable names across the source
+# looked simpler and was wrong in exactly the direction that matters: a name the environment
+# already carries — `env GRACE=777 ./test-pr-review-lib.sh`, or an exported `ABSENT_GRACE` — is in
+# scope on BOTH sides, so it read as the caller's, dropped out of the set, and every migrated
+# `retune GRACE=1` was refused with "sets no GRACE". What pr-review.sh assigns is a fact about
+# pr-review.sh.
+#
+# And it reaches an assignment wherever it sits, not only at column 0: `CACHE_OFF` is set inside a
+# top-level `case`, so a stanza-shaped pattern would have missed it. The pattern is a bare `NAME=`
+# after nothing but whitespace, which is why `local dir=…` contributes no `dir` — the name there is
+# not what follows the indent. Function-local assignments that do match are dropped by the second
+# half: a local of a function that has not run is not set, so it never reaches the set.
+lib_assigned=$(sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$HELPER" | sort -u)
 # shellcheck source=pr-review.sh
 source "$HELPER"
 HELPER_CONSTANTS=""
-for lib_var in $(compgen -v); do
-  case "$lib_vars_before" in *" $lib_var "*) continue ;; esac
+for lib_var in $lib_assigned; do
+  # Really set, so retune has a value to save and restore — `+set` and not `-`, since a constant
+  # legitimately holding the empty string (pr-review.sh has several) must still be retunable.
+  [ -n "${!lib_var+set}" ] || continue
   HELPER_CONSTANTS="$HELPER_CONSTANTS $lib_var "
 done
-unset lib_vars_before lib_var
+unset lib_assigned lib_var
 
 # --- the reporter and the assertions ----------------------------------------------------------
 # Not `fail`: that is pr-review.sh's, and its refusals' exit codes are what the suites read.
@@ -432,6 +452,29 @@ test_definitions_before_sourcing_are_refused() {
   assert_refused "a function defined before the source"
   assert_contains "$CONTROL_ERR" "defined functions before sourcing this file (early)" \
     "the early definition should be named"
+  # A function the ENVIRONMENT exported into the suite's shell is not the suite defining one, and
+  # refusing it made every suite unrunnable from such a shell. The exporting shell is a file of its
+  # own, because `export -f` carries the definition's file and line with it and defining these here
+  # would attribute them to this file. One of the two is `fail` deliberately — the ludics-lite#46
+  # name — to pin that an inherited library name is not a shadow either: pr-review.sh's own
+  # definition replaces it when the preamble sources it, which is what the snapshot then records.
+  local exporter="$CONTROL_ROOT/exporter.sh"
+  control 'helper_of_my_own() { :; }'
+  {
+    echo 'fail() { echo "an inherited fail"; }'
+    echo 'inherited_helper() { :; }'
+    echo 'export -f fail inherited_helper'
+    printf 'exec bash %s\n' "\"$CONTROL_FILE\""
+  } >"$exporter"
+  set +e
+  bash "$exporter" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
+  CONTROL_RC=$?
+  set -e
+  CONTROL_OUT=$(cat "$CONTROL_ROOT/out")
+  CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
+  assert_eq "$CONTROL_RC" 0 "an exported function in the environment must not refuse a suite ($CONTROL_ERR)"
+  assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
+  assert_not_contains "$CONTROL_ERR" "REFUSING" "and nothing should be refused"
 }
 
 # test_tmpdir writes to the CALLER's variable, whatever it is named — including `dir`, the name
@@ -520,8 +563,15 @@ test_retune_moves_a_constant() {
   # A case may put them back mid-case; the next case proves it need not.
   restore_tuning
   assert_eq "$GRACE" "$GRACE_AS_SOURCED" "restore_tuning returns the value as sourced, not the first move"
-  retune GRACE=3
+  assert_eq "$ABSENT_GRACE" "$ABSENT_GRACE_AS_SOURCED" "and every name it held, not only the last moved"
+  # BOTH are left moved, with nothing here restoring them, because the next case is judged on what
+  # run_tests restores by itself. Leaving only GRACE moved — which this case used to do, the second
+  # constant having been put back by the restore_tuning above — made that case's ABSENT_GRACE
+  # assertion green whatever run_tests did with it, so it could not tell a restore of ONE retuned
+  # constant from a restore of all of them.
+  retune GRACE=3 ABSENT_GRACE=9
   assert_eq "$GRACE" 3 "and retuning again after a restore still works"
+  assert_eq "$ABSENT_GRACE" 9 "for every name, so the case after this one has two to check"
 }
 
 # Listed immediately after the case above, and reading what that case left behind: nothing there
