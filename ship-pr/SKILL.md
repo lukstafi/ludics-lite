@@ -346,7 +346,7 @@ head SHA, and answers with one of seven:
 | `approved` | 👍 is on the PR | merge |
 | `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
 | `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
-| `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — about this head: the round never ran | `@codex review` once; on a second failure for the same head, push a new head (an amend is enough) |
+| `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head: the round never ran | `@codex review` once; on a second failure for the same head, push a new head (an amend is enough) |
 | `expected` | no live 👀, and no review of the head SHA: a round is due and has not started | wait out the grace, then `@codex review` |
 | `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push — or, at one of the loop's exits (below), close out and merge |
 | `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
@@ -358,9 +358,9 @@ and the third reviewed normally after one nudge). It ranks below the 👍 and be
 after it — a round that started later is a round to wait out — and above `idle` and `expected`,
 which is what it used to read as: three `watch` windows recommending the grace for a round that
 had already ended. A failure naming a head you have since replaced is not it; that is `expected`
-again, correctly — and so is a failure that named no ref at all but predates the head you are
-looking at. Nudge once, and if the same head fails twice, amend and push — the count is read off
-the PR and the line says which case you are in. The failed attempt is not a round, so
+again, correctly — and so is one that names no ref at all, which is attributed to no head. Nudge
+once, and if the same head fails twice, amend and push — the count is read off the PR and the
+line says which case you are in. The failed attempt is not a round, so
 it does not count against the convergence threshold.
 
 Every one of those lines also says **`CONFLICTS with the base (mergeable_state=dirty)`** when

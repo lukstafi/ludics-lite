@@ -581,18 +581,22 @@ esac
 # placeholder) no machine tag: "Codex Review: Something went wrong. Try again later by commenting
 # “@codex review”." with "Provided git ref <sha> does not exist" in a fenced block beneath it.
 #
-# BOTH markers are anchored to the START of the body (\A), never to a line: a review whose own
-# prose or code block QUOTES the failure reads as one otherwise — this repository's fixtures quote
-# it verbatim and its reviewer reads them — and a wrong verdict is the one thing here worse than a
-# missed one. The second marker takes the opening line, then whitespace and an optional fence,
-# then the ref error, which is the shape the connector posts; a quotation has prose in between.
-# (`^` would not do that job in either direction: jq's regexes are Oniguruma in Perl mode, where
-# `^` is the start of the STRING and nothing else, so a `^`-anchored ref marker matches only a
-# body that OPENS with the fenced ref — a claim that could never fire.) GitHub serves lowercase
-# hex, as does the message.
-INIT_FAILURE_BODY_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong'
-INIT_FAILURE_RE="$INIT_FAILURE_BODY_RE"'|\A[ \t]*Codex Review:[^\n]*\n\s*(```[a-z]*[ \t]*\n)?[ \t]*Provided git ref [0-9a-f]{7,40} does not exist'
-# The ref the failure names, when it names one: the head the reviewer could not fetch.
+# ONE expression, and it is the CANONICAL BODY: anchored to the start of the body (\A), the
+# reviewer's own sentence, nothing looser. Both callers use it, so a comment can never be a round
+# for one and a failure for the other.
+#
+# The looser shapes were tried and withdrawn (review of #82, rounds 1 and 2). A ref marker taken
+# on any line swallowed a comment-only ROUND whose finding quotes "Provided git ref <sha> does
+# not exist" — a round about this very matcher — and anchoring that marker to the opening line
+# plus a fence did not save it, since a round's summary opens with "Codex Review:" too. What is
+# left is a deliberate, LOUD miss: a failure whose opening sentence is ever worded differently
+# reads as `expected` and costs one grace, where the swallowed round would have cost a finding,
+# silently. (`^` is no use here in either direction: jq's regexes are Oniguruma in Perl mode,
+# where `^` is the start of the STRING and nothing else.)
+INIT_FAILURE_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong'
+# The ref the failure names — the head the reviewer could not fetch. GitHub serves lowercase hex,
+# as does the message. A failure that names none is not attributed to any head: see the branch in
+# status_state.
 INIT_FAILURE_REF_RE='Provided git ref[^0-9a-f]*(?<s>[0-9a-f]{7,40})'
 
 # ISO 8601 UTC timestamps sort correctly as plain strings, which is why every comparison below is a
@@ -651,10 +655,10 @@ fmt_age() {
 # for three windows. `stalled` cannot compete: a failure comment is the reviewer speaking, so the
 # 👀 above it is spent by definition. It fires only when the failure comment is the reviewer's
 # newest non-placeholder comment, is newer than any review OF THE CURRENT HEAD (a round that
-# landed after it is the newer truth), and is ABOUT the current head — which the ref it names
-# answers exactly, and which a failure naming no ref answers by its date against the head's
-# commit date. A failure about a head that has since been replaced is `expected`, correctly:
-# the new head's round has not started yet and has its grace to run.
+# landed after it is the newer truth), and NAMES the current head as the ref it could not fetch.
+# A failure about a head that has since been replaced is `expected`, correctly: the new head's
+# round has not started yet and has its grace to run. One that names no ref at all is not
+# attributed to a head — the branch says why.
 #
 # For that token ALONE the detail carries two leading `|`-separated fields — the head's short SHA
 # and how many such failures name this head — because the remedy escalates with the recurrence
@@ -701,7 +705,7 @@ pr_head_read() {
 status_state() {
   local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local vline verd_at verd_sha mstate="-" head_err=""
-  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref fail_mine rev_head_at nfail
+  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nfail
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -859,68 +863,47 @@ status_state() {
 
   # The round that never started. The 👍 and a live 👀 have already returned above, so what is
   # left to rule out is a round that landed ON THIS HEAD after the failure, and a failure about
-  # some other head.
+  # some other head — which the ref it names answers exactly.
   #
-  # WHICH head a failure is about: the ref it names answers that exactly. One that names none is
-  # about whatever head was current when it landed, so it is compared against the head's own
-  # commit date — the clock the `expected` arm below runs on, which an amend, a rebase or a
-  # cherry-pick all refresh. Without that comparison a ref-less failure would follow the branch
-  # onto every head pushed after it and nudge over a round that has not had its grace yet
-  # (review of #82, round 1, P2).
-  if [ -n "$fail_at" ]; then
-    head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
-      head_at=""
-    fail_mine=""
-    nfail=""
-    case "$fail_ref" in
-    '')
-      # An undated head cannot answer "did this head arrive after the failure?". The reviewer's
-      # newest word still stands — a nudge costs one comment, and there is no 👍 in this branch
-      # for one to clear — but the recurrence cannot be counted, so the remedy stays the first.
-      if [ -z "$head_at" ]; then
-        fail_mine=1
-        nfail=1
-      elif [[ "$fail_at" > "$head_at" ]]; then
-        fail_mine=1
-      fi
-      ;;
-    *) case "$head_sha" in "$fail_ref"*) fail_mine=1 ;; esac ;;
-    esac
-    if [ -n "$fail_mine" ]; then
+  # A failure that names NO ref is not attributed to any head, and falls through to the ordinary
+  # due-round states. Two rounds of review went into trying to attribute one (review of #82): the
+  # only clock available is the head commit's committer date, and it is commit metadata, not the
+  # time that SHA became the head — a force-push or a reset to an older commit dates the new head
+  # BEFORE the failure, so the old failure would be reported against it and `watch` would exit on
+  # a round still inside its grace. Every failure the connector has posted names its ref in the
+  # fenced block, so what this gives up is a shape nobody has seen, and what it costs when that
+  # shape appears is one grace — the state before this existed.
+  if [ -n "$fail_at" ] && [ -n "$fail_ref" ]; then
+    case "$head_sha" in
+    "$fail_ref"*)
       rev_head_at=$(jq -r --arg rev "$REVIEWER" --arg sha "$head_sha" '
           [.[] | select((.user.login // "") | startswith($rev))
                | select(.submitted_at != null) | select((.commit_id // "") == $sha)
                | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || rev_head_at=""
       if [ -z "$rev_head_at" ] || [[ "$fail_at" > "$rev_head_at" ]]; then
-        # How many failures are about THIS head, by the same rule: the first is worth a nudge, a
-        # second says the nudge will not help and the head itself has to move. Ref-less failures
-        # are counted by their date, or two of them in a row would each read as the first and the
-        # second remedy would never be reached (same review, P2). The ref is bound to $ref before
-        # the prefix test: inside `startswith(...)` the `.` is that filter's own input — $sha — so
+        # How many failures name THIS head: the first is worth a nudge, a second says the nudge
+        # will not help and the head itself has to move. The ref is bound to $ref before the
+        # prefix test: inside `startswith(...)` the `.` is that filter's own input — $sha — so
         # the unbound form compares the head to itself and every failure on the PR counts (caught
-        # by the two-heads control in the status suite) — and `.ref` inside it is that same `.`,
-        # which is why the pair is bound to $f before either is read.
-        if [ -z "$nfail" ]; then
-          nfail=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" \
-            --arg refre "$INIT_FAILURE_REF_RE" --arg sha "$head_sha" --arg since "$head_at" '
-              [.[] | select((.user.login // "") | startswith($rev))
-                   | select((.body // "") | test("codex-pull-request-review-summary") | not)
-                   | select((.body // "") | test($re))
-                   | {at: (.created_at // ""),
-                      ref: (((try ((.body // "") | capture($refre).s) catch "") // ""))} as $f
-                   | select(if $f.ref != "" then ($sha | startswith($f.ref))
-                            else ($since != "" and $f.at > $since) end)]
-              | length' <<<"$comments_raw" 2>/dev/null) || nfail=""
-          case "$nfail" in '' | *[!0-9]*) nfail=0 ;; esac
-          # A count that came back empty must not read as "never before": the failure in hand is
-          # one by construction, and one is the arm that nudges rather than the one that pushes.
-          [ "$nfail" -ge 1 ] || nfail=1
-        fi
+        # by the two-heads control in the status suite).
+        nfail=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" \
+          --arg refre "$INIT_FAILURE_REF_RE" --arg sha "$head_sha" '
+            [.[] | select((.user.login // "") | startswith($rev))
+                 | select((.body // "") | test("codex-pull-request-review-summary") | not)
+                 | select((.body // "") | test($re))
+                 | ((try ((.body // "") | capture($refre).s) catch "") // "") as $ref
+                 | select($ref != "" and ($sha | startswith($ref)))]
+            | length' <<<"$comments_raw" 2>/dev/null) || nfail=""
+        case "$nfail" in '' | *[!0-9]*) nfail=0 ;; esac
+        # A count that came back empty must not read as "never before": the failure in hand is
+        # one by construction, and one is the arm that nudges rather than the one that pushes.
+        [ "$nfail" -ge 1 ] || nfail=1
         echo "failed|$(age_of "$fail_at")|$mstate|${head_sha:0:7}|$nfail|$REVIEWER reported an" \
-          "initialization failure at $fail_at${fail_ref:+ for ref ${fail_ref:0:7}}"
+          "initialization failure at $fail_at for ref ${fail_ref:0:7}"
         return 0
       fi
-    fi
+      ;;
+    esac
   fi
 
   # A verdict comment naming the current head is an approval — without this arm it reads as
@@ -1108,14 +1091,10 @@ review_rounds() {
   # from the COMMENT feed alone, which is the only feed it has ever arrived in: a review carries
   # the commit it was submitted against, and the reviewer submits none when it cannot fetch it.
   #
-  # The test here is the CANONICAL-BODY one (INIT_FAILURE_BODY_RE), stricter than the shape
-  # status_state uses: this function has no head to cross-check a named ref against, so a
-  # comment-only round whose finding quotes "Provided git ref <sha> does not exist" — a round
-  # about this very matcher, say — would vanish from the convergence count under the shared
-  # expression (review of #82, round 1, P2). Dropped only when the body OPENS with the failure
-  # sentence itself, which a round quoting it does not. The residue is the other way round: a
-  # failure whose opening sentence is worded differently counts as one round too many, which is
-  # loud (the number is on every `status` line) where the lost round would have been silent.
+  # The test is INIT_FAILURE_RE, the canonical body, which is `status_state`'s test too: a
+  # comment is a failure for both or a round for both. A comment-only round whose finding quotes
+  # "Provided git ref <sha> does not exist" — a round about this very matcher — is a round here
+  # and on the state line, and that is what the anchored expression buys (review of #82).
   comments=$(api_list "issues/$pr/comments?per_page=100") || {
     echo "unknown|the comments API did not answer ($(gh_err_line))"
     return 0
@@ -1123,7 +1102,7 @@ review_rounds() {
   # Both feeds go in on stdin (slurped: reviews first, comments second), never as arguments —
   # a long PR's comment history outgrows the argument list (128 KB per argument on Linux).
   line=$(printf '%s\n%s\n' "$raw" "$comments" | jq -r -s --arg rev "$REVIEWER" \
-    --argjson gap "$ROUND_GAP" --arg fail "$INIT_FAILURE_BODY_RE" '
+    --argjson gap "$ROUND_GAP" --arg fail "$INIT_FAILURE_RE" '
       .[1] as $comments | .[0]
       | ([.[] | select((.user.login // "") | startswith($rev))
            | select(.submitted_at != null)

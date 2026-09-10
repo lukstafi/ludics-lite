@@ -388,31 +388,51 @@ test_initialization_failure_is_its_own_state() {
 
 # A failure that names no ref at all is still about the head the round was due on: it is the
 # reviewer's newest word and it contradicts nothing.
-test_a_failure_naming_no_ref_still_fires() {
+# A failure that names no ref is not attributed to any head. Two review rounds went into trying:
+# the only clock is the head commit's committer date, which a force-push or a reset to an older
+# commit dates BEFORE the failure, so the old failure would be reported against a head whose round
+# is still inside its grace. The cost of not attributing it is one grace, on a shape the connector
+# has never posted; the cost of attributing it wrongly is a nudge over a round that is coming.
+test_a_failure_naming_no_ref_is_not_attributed() {
   failed_fixture -
-  # Dated after the head: that is what says which head it is about, the ref not being there.
-  COMMENTS_JSON="[$(failure_comment 100 - 2026-09-01T00:05:00Z)]"
   run_status
-  assert_eq "$(state_tok "$STATE")" failed "a failure naming no ref cannot be about another head"
-  assert_contains "$LINE" "reviewer FAILED at initialization on head ${FAILED_HEAD:0:7}" \
-    "the head on the line is the PR's, since the comment named none"
-  assert_contains "$LINE" "nudge it once" "one unattributable failure is still the first one"
+  assert_eq "$(state_tok "$STATE")" expected \
+    "a failure that names no head is not evidence about this one"
+  assert_contains "$LINE" "review EXPECTED but not started" "the ordinary due-round line"
+  assert_not_contains "$LINE" "FAILED at initialization" "and no verdict is claimed from it"
+  # The same body WITH the ref is the shape that fires: this case is about the ref, nothing else.
+  COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "the ref is what attributes a failure to a head"
 }
 
-# The second marker carrying the match on its own: a body that does not OPEN with the connector's
-# sentence is still a failure when the fenced ref line is there. Without a case for it the
-# matcher would rest entirely on one line of prose — and the marker itself would be unfalsifiable
-# (its first spelling, `^…`, matched nothing at all: jq's `^` is the start of the string).
-test_the_ref_line_alone_identifies_the_failure() {
+# The deliberate, loud miss. The matcher is the reviewer's own opening sentence and nothing
+# looser, so a failure worded differently reads as `expected` and costs one grace. Every looser
+# shape tried in review swallowed a comment-only ROUND whose finding quotes the ref error, which
+# costs a finding and says nothing — the trade is stated in the matcher's comment.
+test_a_differently_worded_failure_is_missed_not_guessed() {
   reset_fixture
   HEAD_SHA="$FAILED_HEAD"
   COMMENTS_JSON="[$(plain_comment 100 "$PAST" "$(printf '%s\n\n```\nProvided git ref %s does not exist\n```\n' \
     'Codex Review: the review could not be started.' "$FAILED_HEAD")")]"
   run_status
-  assert_eq "$(state_tok "$STATE")" failed \
-    "the fenced ref line identifies the failure without the opening sentence"
-  assert_contains "$LINE" "for ref ${FAILED_HEAD:0:7}" \
-    "the ref the reviewer could not fetch should be captured and named"
+  assert_eq "$(state_tok "$STATE")" expected \
+    "the opening sentence is the whole matcher: anything else waits out the grace"
+}
+
+# The finding this state could hide, and the reason the matcher is anchored to that sentence: a
+# comment-only ROUND whose finding quotes the CURRENT head's ref error. Reported as `failed` it
+# would send the caller to nudge while the round's finding sat unread in the same comment.
+test_a_round_quoting_this_head_s_ref_error_is_not_a_failure() {
+  reset_fixture
+  HEAD_SHA="$FAILED_HEAD"
+  COMMENTS_JSON="[$(plain_comment 100 "$PAST" "$(printf '%s\n\n```\nProvided git ref %s does not exist\n```\n\n%s\n' \
+    'Codex Review: P2 — the matcher reads a quoted error as a failure' "$FAILED_HEAD" \
+    'so a round about it disappears.')")]"
+  run_status
+  assert_not_contains "$LINE" "FAILED at initialization" \
+    "a round that quotes this head's ref error is a round, not the reviewer failing"
+  assert_eq "$(state_tok "$STATE")" expected "and it reads as the round it is"
 }
 
 test_a_second_failure_on_the_same_head_says_push_a_new_head() {
@@ -482,19 +502,19 @@ test_a_newer_reviewer_word_supersedes_the_failure() {
   assert_eq "$(state_tok "$STATE")" approved "the 👍 is the merge gate whatever followed it"
 }
 
-# The wrong verdict this state could produce, and the two guards against it. A review QUOTING the
+# The wrong verdict this state could produce, and the anchor that refuses it. A review QUOTING the
 # failure — this repository's own reviewer reads these fixtures — must not be read as one.
 test_a_quoted_failure_is_not_a_failure() {
   reset_fixture
   HEAD_SHA="$FAILED_HEAD"
   COMMENTS_JSON="[$(plain_comment 100 "$PAST" "$(printf '%s\n\n```\n%s\n```\n\n%s\n' \
-    'Round 3, on the summary: the first marker is anchored to the body start, so' \
+    'Round 3, on the summary: the matcher is anchored to the body start, so' \
     "$FAILURE_HEAD_LINE" 'quoting it in a finding cannot fire the state.')")]"
   run_status
   assert_eq "$(state_tok "$STATE")" expected \
     "a finding that quotes the failure sentence is not the reviewer failing"
-  # Quoted whole, ref line and all: the ref marker is anchored to the opening line too, so the
-  # shape refuses this before the ref is ever read. (The ref guard behind it is what
+  # Quoted whole, ref line and all: still a quotation, since the sentence is not where the body
+  # opens. (The ref-vs-head guard behind the anchor is what
   # test_a_failure_naming_another_head_is_expected exercises, on a genuine failure body.)
   COMMENTS_JSON="[$(plain_comment 101 "$PAST" "$(printf 'Round 4, the fixture body is\n\n%s\n' \
     "$(failure_body "$OTHER_REF")")")]"
@@ -523,47 +543,6 @@ test_watch_exits_on_the_initialization_failure() {
   assert_contains "$WATCH_OUT" "--- summary id=100" "the failure comment is what poll saw"
   assert_contains "$WATCH_ERR" "status: reviewer FAILED at initialization" \
     "the context should name the state, not leave the caller to read the body"
-}
-
-# A ref-less failure names no head, so its DATE has to say which head it was about: without that
-# it matches every SHA and follows the branch onto each head pushed after it, nudging over a
-# round that has not had its grace yet (review of #82, round 1).
-test_a_ref_less_failure_does_not_follow_a_new_head() {
-  failed_fixture -
-  COMMENTS_JSON="[$(failure_comment 100 - 2026-08-31T22:00:00Z)]"
-  run_status
-  assert_eq "$(state_tok "$STATE")" expected \
-    "a failure from before this head was committed is about the head it replaced"
-  assert_contains "$LINE" "review EXPECTED but not started" \
-    "the new head's round has not started yet and has its grace to run"
-  # The control on the same clock: the same comment, dated after the head, still fires.
-  COMMENTS_JSON="[$(failure_comment 100 - 2026-09-01T00:05:00Z)]"
-  run_status
-  assert_eq "$(state_tok "$STATE")" failed "a failure after the head's commit is about this head"
-  # An undated head cannot answer the question. The reviewer's newest word stands rather than
-  # being dropped on an API failure, and the remedy stays the cheap one.
-  HEAD_AT=""
-  run_status
-  assert_eq "$(state_tok "$STATE")" failed "an unread head date does not withdraw the failure"
-  assert_contains "$LINE" "nudge it once" "an uncountable recurrence stays at the first remedy"
-}
-
-# Two ref-less failures on an unchanged head are two failures, not one twice: counted by the same
-# date rule, or the second remedy would never be reached (review of #82, round 1).
-test_two_ref_less_failures_reach_the_second_remedy() {
-  failed_fixture -
-  COMMENTS_JSON="[$(failure_comment 100 - 2026-09-01T00:05:00Z),$(
-    failure_comment 101 - 2026-09-01T00:20:00Z)]"
-  run_status
-  assert_eq "$(state_tok "$STATE")" failed "still a failure"
-  assert_contains "$LINE" "failed 2 times on THIS head" \
-    "both failures are about this head, and the line should say so"
-  assert_contains "$LINE" "push a new head" "the second failure is where the head has to move"
-  # A failure from before the head does not join that count.
-  COMMENTS_JSON="[$(failure_comment 100 - 2026-08-31T22:00:00Z),$(
-    failure_comment 101 - 2026-09-01T00:20:00Z)]"
-  run_status
-  assert_contains "$LINE" "nudge it once" "a failure about the previous head is not one about this"
 }
 
 # The merge gate against a failure, both ways round — the deliberate part of the ranking. A round
@@ -602,16 +581,15 @@ tests=(
   test_watch_reads_the_drift_when_a_round_lands
   test_watch_approved_leaves_the_drift_to_merge
   test_initialization_failure_is_its_own_state
-  test_a_failure_naming_no_ref_still_fires
-  test_the_ref_line_alone_identifies_the_failure
+  test_a_failure_naming_no_ref_is_not_attributed
+  test_a_differently_worded_failure_is_missed_not_guessed
+  test_a_round_quoting_this_head_s_ref_error_is_not_a_failure
   test_a_second_failure_on_the_same_head_says_push_a_new_head
   test_a_failure_naming_another_head_is_expected
   test_a_round_of_the_head_after_the_failure_wins
   test_a_newer_reviewer_word_supersedes_the_failure
   test_a_quoted_failure_is_not_a_failure
   test_watch_exits_on_the_initialization_failure
-  test_a_ref_less_failure_does_not_follow_a_new_head
-  test_two_ref_less_failures_reach_the_second_remedy
   test_a_standing_verdict_survives_a_failed_re_request
 )
 
