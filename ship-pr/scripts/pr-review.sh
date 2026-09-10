@@ -893,13 +893,19 @@ status_state() {
         # after that success are evidence that nudging has stopped working. The first is worth a
         # nudge, a second says the nudge will not help and the head itself has to move.
         #
-        # "Got through" is read from BOTH feeds, because a round arrives in either: a review
-        # submitted against this head, or a comment naming it as its Reviewed commit that is not
-        # itself a failure — which covers the comment-only rounds this script counts as rounds
-        # elsewhere, and the no-findings verdict alike. $c and $f are bound before their fields
-        # are read: inside `startswith(...)` the `.` is that filter's own input — $sha — so the
-        # unbound form compares the head to itself and every failure on the PR counts (caught by
-        # the two-heads control in the status suite).
+        # "Got through" is the newest of the three ways the reviewer speaks about a head, each
+        # read by the code above that already knows how — re-deriving one of them here is what
+        # produced three rounds of successors (review of #82, rounds 3, 4 and 5):
+        #   - a review submitted against this head ($rev_head_at, from the reviews feed);
+        #   - the no-findings verdict for it ($verd_at/$verd_sha, from the verdict scan, which
+        #     is the reader that handles a verdict delivered by EDITING the running placeholder
+        #     in place — machine-tagged, and dated by updated_at rather than created_at);
+        #   - a comment-only findings round naming it as its Reviewed commit (below). That scan
+        #     drops the placeholder, deliberately: an announcement is not a round, and the one
+        #     case where the placeholder carries a verdict is the term above it.
+        # $c and $f are bound before their fields are read: inside `startswith(...)` the `.` is
+        # that filter's own input — $sha — so the unbound form compares the head to itself and
+        # every failure on the PR counts (caught by the two-heads control in the status suite).
         success_at=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" \
           --arg rc "$REVIEWED_COMMIT_RE" --arg sha "$head_sha" '
             [.[] | select((.user.login // "") | startswith($rev))
@@ -910,6 +916,9 @@ status_state() {
                  | select($c.sha != "" and ($sha | startswith($c.sha)))
                  | $c.at] | max // ""' <<<"$comments_raw" 2>/dev/null) || success_at=""
         success_at=$(newest "$success_at" "$rev_head_at")
+        if [ -n "$verd_sha" ]; then
+          case "$head_sha" in "$verd_sha"*) success_at=$(newest "$success_at" "$verd_at") ;; esac
+        fi
         nfail=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" \
           --arg refre "$INIT_FAILURE_REF_RE" --arg sha "$head_sha" --arg since "$success_at" '
             [.[] | select((.user.login // "") | startswith($rev))

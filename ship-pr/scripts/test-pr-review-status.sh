@@ -92,6 +92,15 @@ round_comment() { # <id> <sha> <created_at>
 **Reviewed commit:** \`$2\`"
 }
 
+# The no-findings verdict as the connector sometimes delivers it: by EDITING the machine-tagged
+# running placeholder in place, so the body carries the tag and the verdict's time is its edit.
+placeholder_verdict() { # <id> <sha> <created_at> <updated_at>
+  jq -cn --argjson id "$1" --arg sha "$2" --arg at "$3" --arg up "$4" --arg rev "$REVIEWER" \
+    '{id:$id, user:{login:($rev + "[bot]")}, created_at:$at, updated_at:$up,
+      body:("<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\n" +
+            "Codex Review: Didn'"'"'t find any major issues.\n**Reviewed commit:** `" + $sha + "`")}'
+}
+
 compare_json() { # <behind> <ahead> <file>
   jq -cn --argjson behind "$1" --argjson ahead "$2" --arg f "$3" \
     '{behind_by:$behind, ahead_by:$ahead, merge_base_commit:{sha:"merge-base-sha"},
@@ -591,6 +600,19 @@ test_a_successful_review_resets_the_recurrence() {
   assert_contains "$LINE" "nudge it once" \
     "a round that arrived as a comment is a round the nudge got through"
   assert_not_contains "$LINE" "failed 2 times" "so the failures either side of it are not a pair"
+  # And a verdict delivered by EDITING the running placeholder in place: machine-tagged, so the
+  # comment scan drops it, and dated by its edit — which is why this term is the verdict scan's
+  # rather than a second reading of the same feed.
+  REVIEWS_JSON='[]'
+  COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST"),$(
+    placeholder_verdict 104 "$FAILED_HEAD" 2026-08-31T23:00:00Z 2026-09-01T01:00:00Z),$(
+    failure_comment 101 "$FAILED_HEAD" 2026-09-01T02:00:00Z)]"
+  REACTIONS_JSON="[$(reaction eyes 2026-09-01T01:30:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "the failure is newer than the 👀 that announced it"
+  assert_contains "$LINE" "nudge it once" \
+    "an edited placeholder carrying the verdict is the reviewer getting through"
+  REACTIONS_JSON='[]'
   # A no-findings verdict for this head is a success too. The 👀 after it is the re-request that
   # announced itself, which is what leaves the failure as the newest word (see below).
   REVIEWS_JSON='[]'
