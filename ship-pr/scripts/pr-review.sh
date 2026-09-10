@@ -138,7 +138,9 @@
 # Usage (<pr> is a number, or owner/name#number — prefer the latter, see the repo note below):
 #   pr-review.sh [--repo owner/name] poll <pr> [watermark]
 #                                          # new comments/reviews above the watermark, each stamped
-#                                          # with the commit it is about; prints the next watermark
+#                                          # with the commit it is about; ends with one machine
+#                                          # line naming those items (kind:id:commit:author:state)
+#                                          # and the next watermark
 #   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands ON THE HEAD being
 #                                          # watched; 0 = act, 1 = quiet. Reviewer activity about
 #                                          # another commit is printed on stderr for the record and
@@ -194,7 +196,9 @@
 #             rejected the request, a build check or a checkless workflow run is RED, the merge was
 #             refused); 2
 #             usage/configuration error; 3 TRANSPORT failure — nothing was learned, so retry rather
-#             than concluding anything. 1 and 3 are kept apart everywhere. `checks`, `base` and
+#             than concluding anything, which for `watch` includes a verdict WITHHELD because the
+#             final poll or the state re-read behind it did not answer. 1 and 3 are kept apart
+#             everywhere. `checks`, `base` and
 #             `merge` add 4: no verdict yet — the build has not finished, every finished job was
 #             cancelled, or a workflow run for the head is queued, running, stopped without a
 #             verdict, or still to be created. 4 is not a pass and not a failure, and it is kept
@@ -561,6 +565,35 @@ mark_of() {
   case "$field" in '' | *[!0-9]*) echo 0 ;; *) echo "$field" ;; esac
 }
 
+# The commit each kind of item is ABOUT, as one jq prelude shared by the rendering and the index
+# below, so the two can never disagree about an item. Spliced into a jq program, which is why it
+# carries no apostrophe.
+#
+# An inline comment is bound by `original_commit_id`, NOT `commit_id`: GitHub migrates the latter
+# forward as the head advances for a comment whose lines still exist, so a previous round finding
+# would stamp itself with the CURRENT head and pass any head test put to it. original_commit_id is
+# the commit the reviewer wrote it against, and it does not move. Nothing is lost if that ever
+# proves too strict: every inline finding belongs to a review, poll re-reads each NEW review own
+# comments endpoint (above), and the review row carries the head it was submitted against — so a
+# round of the head is caught by its review even if none of its comments were.
+#
+# A comment has no such field; its only head association is the "**Reviewed commit:** `<sha>`"
+# stamp the connector writes on the comments it delivers a round or a verdict in. The LAST match
+# is the one taken: the connector writes that stamp as a FOOTER, and a findings body can quote
+# another commit above it — a review OF this parsing logic does exactly that — where taking the
+# first would stamp the round with a commit it merely mentions and discard it as an old head.
+# `[capture(...; "g")] | last` and never `capture(...) // ""`, because a capture that does not
+# match produces NO output rather than null, and a zero-output sub-expression inside a string
+# interpolation takes the whole string with it: the comment would not be rendered at all, which
+# on the initialization failure (the one summary that never carries the stamp) is a round
+# silently disappearing from the watch that was waiting for it.
+POLL_ITEM_DEFS='
+  def short: if (. // "") == "" then "-" else .[0:7] end;
+  def item_stamp($re): ([(.body // "") | capture($re; "g").s] | last) | short;
+  def inline_commit: (.original_commit_id // .commit_id) | short;
+  def review_commit: .commit_id | short;
+'
+
 # Exits 3, and prints no watermark, when any feed failed to read: an unwritten watermark keeps the
 # caller's old one, so a transient error cannot advance past findings it never saw.
 cmd_poll() {
@@ -615,12 +648,25 @@ cmd_poll() {
   # inline finding belongs to a review, poll re-reads each NEW review's own comments endpoint
   # (see above), and the review row itself carries the head it was submitted against — so a round
   # of the head is caught by its review even if none of its comments were.
-  jq -r --arg rev "$REVIEWER" --argjson since "$m_inline" '
-    def short: if (. // "") == "" then "-" else .[0:7] end;
-    map(select((.user.login // "") | startswith($rev)) | select(.id > $since))
-    | if length == 0 then "(no new inline comments)"
-      else .[] | "--- inline id=\(.id) \(.path // "?"):\(.line // .original_line // 0) commit=\((.original_commit_id // .commit_id) | short) by \(.user.login)\n\(.body)"
-      end' <<<"$inline"
+  # Each feed's new items are filtered ONCE, into an array that is then both rendered and indexed
+  # (the `items:` line below), so the index cannot drift from what was printed — and so the fold
+  # of duplicate threads (ludics-lite#76) has one place to sit.
+  local new_inline new_issue new_reviews
+  new_inline=$(jq --arg rev "$REVIEWER" --argjson since "$m_inline" \
+    'map(select((.user.login // "") | startswith($rev)) | select(.id > $since))' <<<"$inline") ||
+    return 4
+  new_issue=$(jq --arg rev "$REVIEWER" --argjson since "$m_issue" \
+    'map(select((.user.login // "") | startswith($rev)) | select(.id > $since)
+         | select((.body // "") | test("codex-pull-request-review-summary") | not))' <<<"$issue") ||
+    return 4
+  new_reviews=$(jq --arg rev "$REVIEWER" --argjson since "$m_review" \
+    'map(select((.user.login // "") | startswith($rev)) | select(.id > $since))' <<<"$reviews") ||
+    return 4
+
+  jq -r "$POLL_ITEM_DEFS"'
+    if length == 0 then "(no new inline comments)"
+    else .[] | "--- inline id=\(.id) \(.path // "?"):\(.line // .original_line // 0) commit=\(inline_commit) by \(.user.login)\n\(.body)"
+    end' <<<"$new_inline"
 
   # The connector's "Review Summary" placeholder is machine-tagged with an HTML comment and posted
   # the moment a round STARTS ("🔄 Running"); it carries no findings, but its id is above the
@@ -632,26 +678,34 @@ cmd_poll() {
   # arrive as reviews and inline comments, and a no-findings verdict arrives as the 👍 or as its
   # own "Didn't find any major issues" comment, both of which status_state reads live.
   #
-  # A comment's only head association is the "**Reviewed commit:** `<sha>`" stamp the connector
-  # writes on the comments it delivers a round or a verdict in (REVIEWED_COMMIT_RE, shared with
-  # status_state and review_rounds). A comment carrying none stamps `-`.
-  #
-  # `[... capture ...] | first` and not `capture(...) // ""`, because a `capture` that does not
-  # match produces NO output rather than null, and a zero-output sub-expression inside a string
-  # interpolation takes the whole string with it: the comment would not be RENDERED at all, which
-  # on the initialization failure (the one summary that never carries the stamp) is a round
-  # silently disappearing from the watch that was waiting for it. The array collects zero or one.
-  jq -r --arg rev "$REVIEWER" --argjson since "$m_issue" --arg rc "$REVIEWED_COMMIT_RE" '
-    def short: if (. // "") == "" then "-" else .[0:7] end;
-    def stamp($re): [(.body // "") | capture($re).s] | first;
-    map(select((.user.login // "") | startswith($rev)) | select(.id > $since)
-        | select((.body // "") | test("codex-pull-request-review-summary") | not))
-    | .[] | "--- summary id=\(.id) commit=\(stamp($rc) | short) by \(.user.login)\n\(.body)"' <<<"$issue"
+  # A comment's only head association is the stamp POLL_ITEM_DEFS describes; one carrying none
+  # renders `commit=-`, and nothing downstream may read that as "another commit".
+  jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
+    .[] | "--- summary id=\(.id) commit=\(item_stamp($rc)) by \(.user.login)\n\(.body)"' <<<"$new_issue"
 
-  jq -r --arg rev "$REVIEWER" --argjson since "$m_review" '
-    def short: if (. // "") == "" then "-" else .[0:7] end;
-    map(select((.user.login // "") | startswith($rev)) | select(.id > $since))
-    | .[] | "--- review id=\(.id) state=\(.state) commit=\(.commit_id | short) by \(.user.login)\n\(.body // "")"' <<<"$reviews"
+  jq -r "$POLL_ITEM_DEFS"'
+    .[] | "--- review id=\(.id) state=\(.state) commit=\(review_commit) by \(.user.login)\n\(.body // "")"' <<<"$new_reviews"
+
+  # The items above, as one machine-readable line, for a caller that has to decide something about
+  # them — `watch` asks which of them are about the head it is watching. Fields per item:
+  # kind:id:commit:author:state (`-` where there is none), and none of the five can contain a
+  # space or a colon, so the line is safe to split. The rendered headers are NOT that line: a
+  # BODY may contain a line that looks exactly like one — a review of this script quoting poll
+  # output does, and this very PR drew one — and a watch that classified by scanning the rendering
+  # would take a quoted header for an item and end the wait on the round it was there to skip.
+  # Read it as the watermark is read, the LAST match: it is emitted after every body, so a body
+  # that quotes one of these lines cannot displace it.
+  echo "items: $(
+    jq -r "$POLL_ITEM_DEFS"'[.[] | "inline:\(.id):\(inline_commit):\(.user.login):-"] | join(" ")' \
+      <<<"$new_inline"
+  ) $(
+    jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
+      [.[] | "summary:\(.id):\(item_stamp($rc)):\(.user.login):-"] | join(" ")' <<<"$new_issue"
+  ) $(
+    jq -r "$POLL_ITEM_DEFS"'
+      [.[] | "review:\(.id):\(review_commit):\(.user.login):\(.state // "-")"] | join(" ")' \
+      <<<"$new_reviews"
+  )"
 
   # Pass this back verbatim next time: per-feed maxima, so replies you post in this round cannot
   # read back as new findings and a big review id cannot mask a smaller comment id.
@@ -1393,7 +1447,7 @@ item_about_head() { # <stamp> <head sha>
 # makes both answers exact. A round of a watch is 90 seconds apart; the call is affordable and the
 # guarantee is not.
 watch_round() { # <pr> <watermark>
-  local line commit next head_sha mstate head_err pr_created
+  local entry rest kind id commit login state desc next head_sha mstate head_err pr_created
   POLLED_OUT=$(cmd_poll "$1" "$2")
   POLLED_RC=$?
   POLLED_MARK="$2"
@@ -1409,23 +1463,31 @@ watch_round() { # <pr> <watermark>
   [ "$POLLED_RC" -eq 0 ] || return 0
   pr_head_read "$1"
   POLLED_HEAD="$head_sha"
-  while IFS= read -r line; do
-    case "$line" in '--- '*) ;; *) continue ;; esac
-    commit=-
-    case "$line" in
-    *" commit="*)
-      commit="${line#* commit=}"
-      commit="${commit%% *}"
-      ;;
-    esac
+  # From the `items:` line poll emits, never from the rendered headers: a reviewer BODY can carry
+  # a line that looks exactly like a header (see cmd_poll). Splitting on whitespace is the point.
+  # shellcheck disable=SC2013,SC2086
+  for entry in $(sed -n 's/^items: //p' <<<"$POLLED_OUT" | tail -1); do
+    kind="${entry%%:*}"
+    rest="${entry#*:}"
+    id="${rest%%:*}"
+    rest="${rest#*:}"
+    commit="${rest%%:*}"
+    rest="${rest#*:}"
+    login="${rest%%:*}"
+    state="${rest#*:}"
+    # What the exit line names: the id, the review state where there is one, the short commit and
+    # the author — enough to tell "the reviewer answered this head" from "an old review went by".
+    desc="$kind id=$id"
+    [ "$state" = - ] || desc="$desc state=$state"
+    desc="$desc commit=$commit by $login"
     if item_about_head "$commit" "$POLLED_HEAD"; then
       POLLED_ON_N=$((POLLED_ON_N + 1))
-      [ -n "$POLLED_ON" ] || POLLED_ON="${line#--- }"
+      [ -n "$POLLED_ON" ] || POLLED_ON="$desc"
     else
       POLLED_PAST_N=$((POLLED_PAST_N + 1))
-      [ -n "$POLLED_PAST" ] || POLLED_PAST="${line#--- }"
+      [ -n "$POLLED_PAST" ] || POLLED_PAST="$desc"
     fi
-  done <<<"$POLLED_OUT"
+  done
   return 0
 }
 
@@ -1442,7 +1504,7 @@ watch_note_past() { # <pr>
   past_last="$POLLED_PAST"
   warn "PR $REPO#$1: $POLLED_PAST_N item(s) NOT about head ${POLLED_HEAD:0:7} (first: $POLLED_PAST)" \
     "— printed below for the record; the watermark advances past them and the wait continues"
-  sed '/^watermark: /d' <<<"$POLLED_OUT" >&2
+  sed -e '/^watermark: /d' -e '/^items: /d' <<<"$POLLED_OUT" >&2
 }
 
 # What a quiet exit exits ON. The head the wait was bound to, the window it covered when there is
@@ -1488,10 +1550,11 @@ watch_act() { # <pr> <state line>
 #
 # It carries the caller's watermark and blind/saw accounting forward exactly as a loop round does
 # (through cmd_watch's locals, by dynamic scoping): a final poll that answers proves the tail of
-# the window was observed, and one that does not adds to the blind count the window-end report
-# reads — reporting a quiet window whose last read failed is the silent stall this script exists
-# to prevent.
-# 0 = the verdict stands; 1 = a round about the head arrived instead, in the POLLED_* globals.
+# the window was observed, and one that does not is reported as such rather than papered over —
+# reporting a quiet window whose last read failed is the silent stall this script exists to
+# prevent.
+# 0 = nothing new; 1 = a round about the head arrived, in the POLLED_* globals; 3 = the poll did
+# not answer, so nothing about the gap is known.
 watch_settle() { # <pr>
   watch_round "$1" "$mark"
   mark="$POLLED_MARK"
@@ -1500,30 +1563,65 @@ watch_settle() { # <pr>
     blind=0
   else
     blind=$((blind + 1))
+    return 3
   fi
   [ "$POLLED_ON_N" -eq 0 ] || return 1
   watch_note_past "$1"
   return 0
 }
 
-# Every "nothing is coming" verdict, in one place: the final poll, and then — if the verdict still
-# stands — the drift read, the verdict's own line, what it exits on, the state and the watermark.
-# 1 when the final poll turned up a round instead, which the caller acts on rather than print this.
-watch_verdict() { # <pr> <message, empty for none>
-  watch_settle "$1" || return 1
+# The end of the wait, in one place, for every verdict that says nothing is coming. It prints
+# whatever the window turned out to be, and RETURNS WHAT cmd_watch RETURNS:
+#   0  the verdict still stands, or the round the final poll found instead, or the approval;
+#   1  the verdict was dropped because the state moved — a quiet window, re-arm;
+#   3  the verdict is WITHHELD: the final poll or the state re-read did not answer, so nothing
+#      rules out a round in the gap, and a nudge recommended over one re-requests the review and
+#      CLEARS the 👍 it was about to get. An unanswered call is not a fact about the PR.
+#
+# The state is re-read after that poll, and only the state the verdict was ABOUT is still the
+# verdict: cmd_poll reads comments and reviews, and the 👍 is on neither, so an approval landing
+# in this same gap would otherwise be answered with a nudge — the one move that destroys it.
+watch_end() { # <pr> <the state token the verdict is about> <message, empty for none>
+  local rc
+  watch_settle "$1"
+  rc=$?
+  if [ "$rc" -eq 1 ]; then
+    # The state beside a round is re-read too: the verdict's own state ("nothing in flight", "no
+    # review of the head") is exactly the reading that round has just falsified.
+    watch_act "$1" "$(status_state "$1")"
+    return 0
+  fi
+  if [ "$rc" -eq 3 ]; then
+    echo "the final poll before the '$2' verdict on PR $REPO#$1 did not answer" \
+      "($(gh_err_line)), so nothing rules out a round that landed while the state was being" \
+      "read — the verdict is WITHHELD, and this window says nothing about the reviewer; re-arm"
+    echo "watermark: $mark"
+    return 3
+  fi
+  state=$(status_state "$1")
+  tok=$(state_tok "$state")
+  if [ "$tok" = unknown ]; then
+    echo "the state could not be re-read after the final poll on PR $REPO#$1, so the '$2' verdict" \
+      "is WITHHELD — $(state_detail "$state"); this is NOT 'the reviewer stayed quiet', re-arm"
+    echo "watermark: $mark"
+    return 3
+  fi
+  if [ "$tok" = approved ] && [ "$2" != approved ]; then
+    echo "the '$2' verdict on PR $REPO#$1 was dropped: the 👍 landed while it was being read —" \
+      "$(status_line "$state")"
+    echo "watermark: $mark"
+    return 0
+  fi
+  if [ "$tok" != "$2" ]; then
+    echo "the '$2' verdict on PR $REPO#$1 was dropped: the state moved to '$tok' while it was" \
+      "being read — $(status_line "$state"); nothing here says the reviewer is done, re-arm"
+    echo "watermark: $mark"
+    return 1
+  fi
   watch_drift_note "$1"
-  [ -z "$2" ] || echo "$2"
+  [ -z "$3" ] || echo "$3"
   echo "$(watch_quiet_line -); status: $(status_line "$state")"
   echo "watermark: $mark"
-  return 0
-}
-
-# The end of the wait, whichever way it goes: the verdict if it still stands after that final
-# poll, the round if the poll found one. Both are exit 0 — what changed is which of the two the
-# caller reads. The state beside a round is re-read, because the verdict's own state ("nothing in
-# flight", "no review of the head") is exactly the reading the round just falsified.
-watch_end() { # <pr> <message, empty for none>
-  watch_verdict "$1" "$2" || watch_act "$1" "$(status_state "$1")"
   return 0
 }
 
@@ -1603,16 +1701,16 @@ cmd_watch() {
     stalled)
       # Bounded patience on a LIVE 👀 as well: a round that never lands stalls the loop exactly as a
       # spent 👀 does, and the answer is the same — say so and let the caller nudge.
-      watch_end "$pr" ""
-      return 0
+      watch_end "$pr" "$tok" ""
+      return $?
       ;;
     failed)
       # Nothing is running and nothing will start on its own: the reviewer said it could not fetch
       # the head. Exiting here rather than falling into the `expected` arm below is the whole
       # point of the state — that arm would hold the window and then hold the grace out (three
       # times over, on ocannl-staging#677) before recommending the nudge this prints now.
-      watch_end "$pr" ""
-      return 0
+      watch_end "$pr" "$tok" ""
+      return $?
       ;;
     *)
       # A 👀 that stops being in flight without a review of the head is a round that ended with
@@ -1621,9 +1719,9 @@ cmd_watch() {
       if [ "$was" = reviewing ] && [ "$tok" != reviewing ]; then
         quiet=$((quiet + 1))
         if [ "$quiet" -ge 2 ]; then
-          watch_end "$pr" "$(echo "the 👀 round on PR $REPO#$pr ended without a review of the" \
-            "head commit — consider nudging with a '@codex review' comment")"
-          return 0
+          watch_end "$pr" "$tok" "$(echo "the 👀 round on PR $REPO#$pr ended without a review of" \
+            "the head commit — consider nudging with a '@codex review' comment")"
+          return $?
         fi
       else
         quiet=0
@@ -1638,10 +1736,10 @@ cmd_watch() {
         '' | *[!0-9]*) ;;
         *)
           if [ "$age" -ge "$GRACE" ]; then
-            watch_end "$pr" "$(echo "no review materialized on PR $REPO#$pr in the" \
+            watch_end "$pr" "$tok" "$(echo "no review materialized on PR $REPO#$pr in the" \
               "$(fmt_age "$age") since it became due — consider nudging with a '@codex review'" \
               "comment")"
-            return 0
+            return $?
           fi
           ;;
         esac
@@ -1656,7 +1754,10 @@ cmd_watch() {
   # The window is out, and the last thing it does is look once more: the round this watch exists
   # to catch can be seconds old when the loop breaks, and a "quiet window" reported over it costs
   # a whole re-arm (item 3 of ludics-lite#72).
-  if ! watch_settle "$pr"; then
+  # A settle that did not answer falls through to the blind branch below, which already says the
+  # tail of the window was not observed — the same fact, in the report that window is owed.
+  watch_settle "$pr"
+  if [ $? -eq 1 ]; then
     watch_act "$pr" "$(status_state "$pr")"
     return 0
   fi

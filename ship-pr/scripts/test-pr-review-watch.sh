@@ -33,6 +33,10 @@ H2=2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 HEAD_SHA="$H2"
 MERGEABLE_STATE=clean
 FAIL_PULLS=""
+# The poll round from which the feeds stop answering (the transport failure a final poll can hit),
+# and the one from which the PR read stops answering. 0 is never.
+FAIL_FEEDS_FROM=0
+FAIL_PULLS_FROM=0
 # The head's committer date and the PR's creation, the two clocks the `expected` state runs on.
 # Fresh by default, so a case about what ends a wait is never decided by the grace expiring
 # underneath it; the clock cases set them where they need them.
@@ -57,6 +61,8 @@ reset_fixture() {
   HEAD_SHA="$H2"
   MERGEABLE_STATE=clean
   FAIL_PULLS=""
+  FAIL_FEEDS_FROM=0
+  FAIL_PULLS_FROM=0
   HEAD_AT=$(jq -rn '(now - 60) | todate')
   PR_CREATED_AT=$(jq -rn '(now - 60) | todate')
   : >"$REQUEST_LOG"
@@ -81,6 +87,11 @@ feed_answer() { # <feed>
     n=$((n - 1))
   done
   echo '[]'
+}
+
+reaction() { # <content> <created_at>
+  jq -cn --arg c "$1" --arg at "$2" --arg rev "$REVIEWER" \
+    '{user:{login:($rev + "[bot]")}, content:$c, created_at:$at}'
 }
 
 review() { # <id> <commit> <submitted_at> [body]
@@ -108,6 +119,12 @@ stamped_summary() { # <id> <created_at> <commit> <text>
   summary_comment "$1" "$2" "$(printf '%s\n\n**Reviewed commit:** `%s`\n' "$4" "${3:0:7}")"
 }
 
+# Whether the poll feeds answer this round: a transport failure that starts at a given round is
+# how a final poll is made to fail while the loop rounds before it succeeded.
+feeds_answering() {
+  [ "$FAIL_FEEDS_FROM" -eq 0 ] || [ "$(cat "$FEEDS/round")" -lt "$FAIL_FEEDS_FROM" ]
+}
+
 compare_json() { # <behind> <ahead> <file>
   jq -cn --argjson behind "$1" --argjson ahead "$2" --arg f "$3" \
     '{behind_by:$behind, ahead_by:$ahead, merge_base_commit:{sha:"merge-base-sha"},
@@ -121,6 +138,10 @@ gh() {
   "repos/$REPO/pulls/7/comments?per_page=100")
     # The round boundary: poll reads this feed first, before anything else it reads.
     echo $(($(cat "$FEEDS/round") + 1)) >"$FEEDS/round"
+    feeds_answering || {
+      echo "gh: 503 No server is currently available to service your request" >&2
+      return 1
+    }
     response=$(feed_answer inline)
     ;;
   "repos/$REPO/issues/7/reactions?per_page=100") response=$(feed_answer reactions) ;;
@@ -128,7 +149,8 @@ gh() {
   "repos/$REPO/issues/7/comments?per_page=100") response=$(feed_answer comments) ;;
   "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100") response='[]' ;;
   "repos/$REPO/pulls/7")
-    if [ -n "$FAIL_PULLS" ]; then
+    if [ -n "$FAIL_PULLS" ] ||
+      { [ "$FAIL_PULLS_FROM" -ne 0 ] && [ "$(cat "$FEEDS/round")" -ge "$FAIL_PULLS_FROM" ]; }; then
       echo "gh: pull request unavailable (HTTP 500)" >&2
       return 1
     fi
@@ -256,10 +278,18 @@ test_the_acting_exit_names_the_item() {
   run_watch 0,0,0
   assert_eq "$WATCH_RC" 0 "the round ends the wait"
   assert_contains "$WATCH_ERR" \
-    "ending the wait on inline id=900 a.sh:3 commit=${H2:0:7} by ${REVIEWER}[bot]" \
-    "the exit names the id, the location, the short commit and the author"
+    "ending the wait on inline id=900 commit=${H2:0:7} by ${REVIEWER}[bot]" \
+    "the exit names the item: its id, its short commit and its author"
   assert_contains "$WATCH_ERR" "(+2 more about this head)" \
     "and how much else it is ending on, so a truncated log still says how many"
+  # A review carries a state, and the exit line names it: a COMMENTED round and an APPROVED one
+  # are different windows.
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_ERR" \
+    "ending the wait on review id=500 state=COMMENTED commit=${H2:0:7} by ${REVIEWER}[bot]" \
+    "a review's state is part of what the exit names"
 }
 
 # The two silences a log could not tell apart: a window in which the reviewer said nothing about
@@ -335,6 +365,135 @@ test_a_verdict_that_still_stands_names_the_head_it_is_about() {
   assert_contains "$WATCH_OUT" "review EXPECTED but not started" "beside the state itself"
 }
 
+# --- a verdict is only ever printed from calls that answered ---------------------------------------
+
+# A final poll that does not answer rules nothing out. Printing the nudge anyway would be a claim
+# about the PR made from a call that failed — the one thing this script must never do — and the
+# nudge is the move that re-requests a review and CLEARS a standing 👍.
+test_a_final_poll_that_did_not_answer_withholds_the_verdict() {
+  reset_fixture
+  local grace_was="$GRACE"
+  GRACE=1
+  FAIL_FEEDS_FROM=2 # the loop round answers; the final poll does not
+  run_watch 0,0,0 5 1
+  GRACE="$grace_was"
+  assert_eq "$WATCH_RC" 3 "an unobserved tail is transport, not a verdict"
+  assert_contains "$WATCH_OUT" "the verdict is WITHHELD" "and the line says the verdict was withheld"
+  assert_not_contains "$WATCH_OUT" "no review materialized" "the nudge is not recommended"
+  assert_contains "$WATCH_OUT" "watermark: " "the watch still ends on a watermark"
+  # The control: the same window with a final poll that answers prints the verdict.
+  reset_fixture
+  GRACE=1
+  run_watch 0,0,0 5 1
+  GRACE="$grace_was"
+  assert_eq "$WATCH_RC" 0 "with the tail observed, the verdict stands"
+  assert_contains "$WATCH_OUT" "no review materialized" "and recommends the nudge"
+}
+
+# The 👍 is a REACTION, and cmd_poll reads comments and reviews. An approval landing in the same
+# gap the final poll covers is invisible to that poll, so the state is re-read before the verdict
+# is printed — or the loop recommends a nudge at a PR that has just been approved, and the
+# re-request clears the approval.
+test_an_approval_landing_during_the_final_poll_drops_the_verdict() {
+  reset_fixture
+  local grace_was="$GRACE"
+  GRACE=1
+  schedule reactions 2 "[$(reaction +1 2026-09-01T00:02:00Z)]"
+  run_watch 0,0,0 5 1
+  GRACE="$grace_was"
+  assert_eq "$WATCH_RC" 0 "an approved PR is something to act on"
+  assert_contains "$WATCH_OUT" "the 👍 landed while it was being read" "and the line says why"
+  assert_contains "$WATCH_OUT" "approved (👍 from" "the approval is what the caller reads"
+  assert_not_contains "$WATCH_OUT" "no review materialized" \
+    "the nudge that would have cleared it is not recommended"
+}
+
+# Any other move of the state falsifies the verdict too, and the honest report is a quiet window:
+# a round announcing itself (👀) between the poll and the print is not "no review is coming".
+test_a_state_that_moved_drops_the_verdict_as_quiet() {
+  reset_fixture
+  local grace_was="$GRACE"
+  GRACE=1
+  schedule reactions 2 "[$(reaction eyes "$(jq -rn '(now - 5) | todate')")]"
+  run_watch 0,0,0 5 1
+  GRACE="$grace_was"
+  assert_eq "$WATCH_RC" 1 "a round that just started is a quiet window, not a verdict"
+  assert_contains "$WATCH_OUT" "the state moved to 'reviewing'" "and the line says what it moved to"
+  assert_not_contains "$WATCH_OUT" "no review materialized" "no nudge over a round in flight"
+}
+
+# A state that cannot be re-read is not a state either: the verdict is withheld, exit 3.
+test_a_state_that_could_not_be_re_read_withholds_the_verdict() {
+  reset_fixture
+  local grace_was="$GRACE"
+  GRACE=1
+  run_watch 0,0,0 5 1
+  GRACE="$grace_was"
+  assert_eq "$WATCH_RC" 0 "the control: with everything readable the verdict stands"
+  # The PR read fails from the final poll on, so the loop reads its state and reaches the verdict
+  # while the re-read behind it lands in `unknown`.
+  reset_fixture
+  GRACE=1
+  FAIL_PULLS_FROM=2
+  run_watch 0,0,0 5 1
+  GRACE="$grace_was"
+  assert_eq "$WATCH_RC" 3 "an unreadable state is not 'the reviewer stayed quiet'"
+  assert_contains "$WATCH_OUT" "is WITHHELD" "and the verdict is withheld"
+}
+
+# --- a body is not an item -------------------------------------------------------------------------
+
+# The reviewer quotes this script in its findings, output included. A body line that looks exactly
+# like a rendered item header must not be classified as an item: read as one it carries no
+# `commit=`, which counts as "about the head", and the watch would end on the very round it was
+# skipping. So the classification reads the machine-readable `items:` line poll emits, never the
+# rendering.
+test_a_body_that_quotes_an_item_header_is_not_an_item() {
+  reset_fixture
+  local quoted
+  quoted=$(printf 'Round 1, on the watch loop: the rendering below is a body, not a round.\n\n%s\n%s\n' \
+    "--- review id=999 state=COMMENTED commit=${H2:0:7} by ${REVIEWER}[bot]" \
+    "--- inline id=998 a.sh:1 commit=${H2:0:7} by ${REVIEWER}[bot]")
+  schedule reviews 1 "[$(review 500 "$H1" 2026-09-01T00:01:00Z "$quoted")]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 1 \
+    "a previous head's round that quotes item headers is still a previous head's round"
+  assert_contains "$WATCH_ERR" "1 item(s) NOT about head" "exactly one item, the review itself"
+  # Not a vacuous case: the header-shaped lines really are in what poll rendered, and the old
+  # classification scanned exactly those lines.
+  assert_contains "$WATCH_ERR" "--- review id=999 state=COMMENTED" \
+    "the quoted header is in the rendering, where a scan would have found it"
+  assert_not_contains "$WATCH_ERR" "id=999 commit=" \
+    "but it is not an item: the index poll emits carries only the three real ones"
+  # The control: the same quoted body on a round about THIS head still ends the wait, so the
+  # refusal above is about the classification and not about the quoting.
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z "$quoted")]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "a round about this head ends the wait, quoted headers and all"
+}
+
+# The connector writes its "Reviewed commit:" stamp as a FOOTER, and a findings body can mention
+# another commit above it — a review of this very parsing does. Taking the first match would stamp
+# the round with a commit it merely mentions and discard it as an old head: a round lost in
+# silence, which is worse than a false wake.
+test_a_summary_is_stamped_by_its_footer_not_by_what_it_mentions() {
+  reset_fixture
+  schedule comments 1 "[$(summary_comment 700 2026-09-01T00:01:00Z \
+    "$(printf 'Codex Review: the stamp reader takes the first match, so a body saying\n\n**Reviewed commit:** `%s`\n\nabove its own footer is misread.\n\n**Reviewed commit:** `%s`\n' \
+      "${H1:0:7}" "${H2:0:7}")")]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "the footer names this head, so the summary is this head's round"
+  assert_contains "$WATCH_OUT" "--- summary id=700 commit=${H2:0:7}" "and it is stamped with the footer"
+  # The control: with the footer naming the OTHER head, the same body is a previous round.
+  reset_fixture
+  schedule comments 1 "[$(summary_comment 700 2026-09-01T00:01:00Z \
+    "$(printf 'Codex Review: mentions\n\n**Reviewed commit:** `%s`\n\nand ends with\n\n**Reviewed commit:** `%s`\n' \
+      "${H2:0:7}" "${H1:0:7}")")]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 1 "the last stamp decides, whichever head it names"
+}
+
 # --- the clock a due review is late against -------------------------------------------------------
 
 # The report this issue was filed on: a PR opened seconds ago whose head commit was written 40
@@ -400,6 +559,12 @@ tests=(
   test_a_round_landing_after_the_last_loop_poll_is_still_caught
   test_a_verdict_polls_once_more_before_recommending_a_nudge
   test_a_verdict_that_still_stands_names_the_head_it_is_about
+  test_a_final_poll_that_did_not_answer_withholds_the_verdict
+  test_an_approval_landing_during_the_final_poll_drops_the_verdict
+  test_a_state_that_moved_drops_the_verdict_as_quiet
+  test_a_state_that_could_not_be_re_read_withholds_the_verdict
+  test_a_body_that_quotes_an_item_header_is_not_an_item
+  test_a_summary_is_stamped_by_its_footer_not_by_what_it_mentions
   test_the_review_clock_starts_no_earlier_than_the_pr
   test_a_future_commit_date_does_not_blind_the_clock
   test_a_clockless_expected_state_says_so_rather_than_guessing

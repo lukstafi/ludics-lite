@@ -253,7 +253,13 @@ while the watermark advances past it and the window goes on, with the same item 
 each case's control. An inline finding is bound by the commit it was WRITTEN against, since
 GitHub migrates `commit_id` forward to the current head; an item with no commit association at
 all, and every item when the head could not be read, is acted on rather than swallowed. Each exit
-names what it ends on. Every verdict that says nothing came polls once more first — including
+names what it ends on, from the machine-readable `items:` line `poll` ends with rather than from
+the rendered headers — a reviewer body that quotes one of those headers is not an item, and a
+summary is stamped by its footer rather than by a commit it mentions above it. Every verdict that
+says nothing came polls once more first, and re-reads the state behind that poll: a 👍 landing in
+the same gap is reported as the approval it is rather than answered with the nudge that would
+clear it, a state that moved otherwise makes the window quiet, and a read that did not answer
+withholds the verdict for a transport exit instead of claiming the reviewer said nothing — including
 when that changes nothing, so the extra poll is not proved by the hit alone — and the round it
 finds beats the nudge it would have recommended. The `expected` clock is here too: it starts no
 earlier than the PR's own creation, still runs from the head's committer date on an older PR, and
