@@ -217,13 +217,23 @@ a comment's `Reviewed commit:` stamp, taken from the FOOTER a body may quote ano
 — and `watch` compares that to the head it reads after each poll. It compares the machine-readable
 `items:` line `poll` ends with, never the rendered headers: a reviewer body can carry a line that
 looks exactly like one (a review quoting this script's output does), and a watch that scanned the
-rendering would take the quotation for an item. **Inline threads the reviewer posted twice render as one entry.** The connector duplicates
-findings verbatim often enough to matter (round 11 of #66 posted nine threads for four findings),
-so threads identical in everything the entry shows — path, line, body, commit stamp and author —
-fold into a single entry whose id field lists every thread: `--- inline id=900+901+902 a.sh:3 …`.
-That token is what `reply` and `resolve` take, so a duplicate costs one composed answer instead of
-one per thread. A folded entry is still one finding — the round count and the watch's act/quiet
-decision are unchanged — and every duplicate's id is still advanced past by the watermark.
+rendering would take the quotation for an item. **Inline threads at one anchor render as one entry.** The connector posts one finding as several
+threads often enough to matter — round 11 of #66 posted nine threads for four findings — and it
+duplicates by RE-WRITING, so the copies share their location exactly and share no byte of their
+text. So threads at the same anchor (path, commit, author, and every location field the row
+carries) fold into a single entry whose id field lists every thread, with every *distinct* body
+under the id of the thread carrying it:
+
+```
+--- inline id=900+901+902 a.sh:447 commit=252e336 by codex[bot] (3 threads at one location, 3 findings as written; one reply answers all)
+[thread 900]
+…
+```
+
+Read every body — a folded entry can carry more than one finding — and answer once: that id token
+is what `reply` and `resolve` take. A folded entry is still one finding for the loop: the round
+count and the watch's act/quiet decision are unchanged, and every folded id is still advanced past
+by the watermark.
 
 Reviewer activity about some other commit is a *previous* round scrolling past above the
 watermark: it is printed on stderr for the record, the watermark advances past it so it never

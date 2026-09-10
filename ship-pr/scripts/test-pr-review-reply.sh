@@ -264,22 +264,48 @@ test_a_failure_after_the_anchor_says_what_landed() {
   FAIL_MSG="503 No server is currently available to service your request"
   run_cmd cmd_reply 900+901+902 "Fixed in round 3 (abc1234)."
   assert_eq "$RC" 3 "a gateway refusal is transport"
-  assert_contains "$ERR" "The replies to 900 DID land" "what landed is named"
-  assert_contains "$ERR" "retry with the ids that did not: 901 902" \
+  assert_contains "$ERR" "The replies to 900 DID land, so do not repeat those" "what landed is named"
+  assert_contains "$ERR" "retry with: 901 902" \
     "and so is the retry, which must not include the anchor"
-  assert_not_contains "$ERR" "Nothing in this invocation was posted" \
-    "the anchor is up: saying otherwise invites a double post"
   assert_eq "$(writes_to 902)" 0 "and the batch stops rather than skipping past the failure"
-  # The negative control: the SAME failure on the first id really does say nothing was posted, so
-  # the progress note above is a report and not a fixed string.
+  # The negative control: the SAME failure on the first id really does say nothing landed, so the
+  # progress note above is a report and not a fixed string.
   reset_fixture
   FAIL_ID=900
   FAIL_MSG="503 No server is currently available to service your request"
   run_cmd cmd_reply 900+901+902 "Fixed in round 3 (abc1234)."
   assert_eq "$RC" 3 "the same transport failure, at the anchor"
-  assert_contains "$ERR" "Nothing in this invocation was posted, so repeat it whole" \
+  assert_contains "$ERR" "Nothing was posted for comment 900, so retry with: 900 901 902" \
     "with nothing up, the whole invocation is the retry"
   assert_not_contains "$ERR" "DID land" "and nothing is claimed to have landed"
+}
+
+# A gateway refusal is a request no backend ran, and the message may say so. An AMBIGUOUS failure
+# is not: a 500 or a dropped connection may be a reply that landed. The first cut of this said
+# "nothing in this invocation was posted, so repeat it whole" directly under a sentence saying the
+# reply may have landed (round 2 of #86) — a contradiction whose obedient reading posts the
+# composed answer twice.
+test_an_ambiguous_write_never_claims_nothing_was_posted() {
+  reset_fixture
+  FAIL_ID=900
+  FAIL_MSG="Internal Server Error (HTTP 500)"
+  run_cmd cmd_reply 900+901 "Fixed in round 3 (abc1234)."
+  assert_eq "$RC" 3 "an ambiguous write is transport, not a verdict"
+  assert_contains "$ERR" "the reply MAY have landed" "and is reported as the question it is"
+  assert_not_contains "$ERR" "Nothing was posted" \
+    "which is a claim a 500 does not support, and the one that invites a double post"
+  assert_not_contains "$ERR" "repeat it whole" "nor may the instruction contradict the sentence"
+  assert_contains "$ERR" "Read comment 900's thread" "the caller is sent to look"
+  assert_contains "$ERR" "retry with: 900 901 if the reply is not there" "with both answers named"
+  assert_contains "$ERR" "retry with: 901 if it is" "the second of them being the rest of the batch"
+  # The control on the pair: the gateway refusal at the same id DOES say nothing was posted, so
+  # the two classifications are reported differently rather than by one hedged string.
+  reset_fixture
+  FAIL_ID=900
+  FAIL_MSG="503 No server is currently available to service your request"
+  run_cmd cmd_reply 900+901 "Fixed in round 3 (abc1234)."
+  assert_contains "$ERR" "Nothing was posted for comment 900" "a refused request posted nothing"
+  assert_not_contains "$ERR" "MAY have landed" "and that is not in question"
 }
 
 # The three exits a write can take are kept apart on a folded reply exactly as on a single one: a
@@ -293,6 +319,8 @@ test_the_write_exits_stay_apart_inside_a_batch() {
   assert_eq "$RC" 1 "a 404 is the API answering about that comment"
   assert_contains "$ERR" "was REJECTED, not dropped" "and the message says so"
   assert_contains "$ERR" "The replies to 900 DID land" "with the batch's progress either way"
+  assert_contains "$ERR" "Comment 901 got nothing, so once the id is right, retry with: 901" \
+    "a rejected write posted nothing, so its retry set is exact"
   reset_fixture
   FAIL_ID=901
   FAIL_MSG="Internal Server Error (HTTP 500)"
@@ -352,6 +380,7 @@ tests=(
   test_a_glob_token_cannot_take_its_ids_from_the_filesystem
   test_the_invocation_shape_is_a_usage_error
   test_a_failure_after_the_anchor_says_what_landed
+  test_an_ambiguous_write_never_claims_nothing_was_posted
   test_the_write_exits_stay_apart_inside_a_batch
   test_resolve_closes_every_thread_the_token_names
   test_an_already_resolved_thread_costs_no_write

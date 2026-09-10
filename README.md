@@ -256,11 +256,15 @@ GitHub migrates `commit_id` forward to the current head; an item with no commit 
 all, and every item when the head could not be read, is acted on rather than swallowed. Each exit
 names what it ends on, from the machine-readable `items:` line `poll` ends with rather than from
 the rendered headers — a reviewer body that quotes one of those headers is not an item, and a
-summary is stamped by its footer rather than by a commit it mentions above it. Inline threads the reviewer posted twice — identical in path, line, body,
-commit stamp and author — render as ONE entry naming every thread id, with the body printed once
-and one item on that index; threads differing in any one of those fields stay separate, each
-difference with its own case, because a fold that collapsed distinct findings would pass every
-other case here. Every verdict that
+summary is stamped by its footer rather than by a commit it mentions above it. Inline threads at one anchor — same path, commit, author and every location
+field the row carries — render as ONE entry naming every thread id and printing every distinct
+body under its own thread id, with one item on that index; the body is deliberately not part of
+the key, because the reviewer duplicates a finding by re-writing it (on the round the issue was
+filed on, grouping by body finds zero duplicates among 51 findings while grouping by the anchor
+finds the four the issue counted). A different place — line, path, commit, position, a `side` or
+`start_line` nobody enumerated, or a field this script has never heard of — stays a separate
+entry, each difference with its own case, because a fold that collapsed unrelated findings would
+pass every other case here. Every verdict that
 says nothing came polls once more first, and re-reads the state behind that poll: a 👍 landing in
 the same gap is reported as the approval it is rather than answered with the nudge that would
 clear it, a state that moved otherwise makes the window quiet, and a read that did not answer
