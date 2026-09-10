@@ -434,7 +434,7 @@ fi
 fi
 
 # --- pulls/<n> -----------------------------------------------------------------------------------
-section "pulls/<n> — pr_head_read, gate_checks's clock, warn_base_drift and await_mergeable"
+section "pulls/<n> — pr_head_read, the review and build clocks, warn_base_drift and await_mergeable"
 if [ -n "$STALE_BASE_PR" ]; then
   pr=$(api "repos/$REPO/pulls/$STALE_BASE_PR")
   pin "the anchor PR #$STALE_BASE_PR is merged, with a merge_commit_sha, a base.sha, a head.sha and a base.ref" \
@@ -554,11 +554,16 @@ if [ "$(jq length <<<"$open_list")" -ge 1 ]; then
   for n in $(jq -r '.[].number // "-"' <<<"$open_list"); do
     is_num "$n" || continue # recorded MOVED just above; no request is built from it
     api "repos/$REPO/pulls/$n" | jq -c '{number, head_sha: .head.sha, base_ref: .base.ref, updated_at,
-      mergeable: (if has("mergeable") then .mergeable else "absent" end), mergeable_state}' >>"$SCRATCH/open_prs"
+      created_at, mergeable: (if has("mergeable") then .mergeable else "absent" end), mergeable_state}' >>"$SCRATCH/open_prs"
   done
   open_prs=$(jq -s . "$SCRATCH/open_prs")
   pin "an open PR's pulls/<n> read carries head.sha, base.ref, updated_at, and mergeable (present) in {true,false,null}" \
     "all(.[]; (.head_sha | test(\"$HEX40\")) and (.base_ref | type == \"string\" and length > 0) and (.updated_at | test(\"$ISO\")) and (.mergeable == true or .mergeable == false or .mergeable == null))" "$open_prs"
+  # created_at is the floor the review clock starts at (status_state's `expected`), and unlike
+  # updated_at it must not move: a clock that comments could push forward would never let the
+  # grace expire. That it does not move is not checkable in one read; that it is there, is.
+  pin "... and created_at, the review clock's floor, no later than updated_at" \
+    "all(.[]; (.created_at | test(\"$ISO\")) and (.created_at <= .updated_at))" "$open_prs"
   pin "... and a mergeable_state in the vocabulary status_state renders (dirty is CONFLICTS, unknown is not yet computed)" \
     "all(.[]; .mergeable_state as \$m | $MERGEABLE_STATE_VOCAB | index(\$m))" "$open_prs"
   echo "      open PRs: $(jq -r '[.[] | "#\(.number) \(.mergeable_state)"] | join(", ")' <<<"$open_prs")"
@@ -569,7 +574,8 @@ else
   skip "open PRs' mergeability and clock fields" "no open PR right now"
 fi
 skip "a push made while mergeable_state=dirty gets no pull_request run" "needs a dirty PR pushed to under observation; not manufactured here"
-# The push clock: gate_checks reads updated_at because a push to the head branch moves it. The
+# The push clock: gate_checks reads updated_at because a push to the head branch moves it, and
+# status_state's review clock reads created_at instead, as a floor that comments cannot move. The
 # push time itself is not an API field, and a committer date is not one either (a skewed or
 # assigned date can be later than the real push), so the belief was measured live on
 # ludics-lite#38 (09:12:31Z before a push, 09:17:29Z five seconds after) and is not re-checkable

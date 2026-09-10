@@ -54,9 +54,27 @@
 #     records the commit_id it was submitted against, so comparing that to .head.sha answers the
 #     question exactly — no guessing at a push time, and immune to a commit whose author date long
 #     predates the push that delivered it;
+#   - the same equality decides what ENDS a wait, and `watch` used to skip it: a new id above the
+#     watermark is not the round you are waiting for unless it is about the head you are watching.
+#     A round's watch exits on the inline findings and takes its watermark from that poll; the
+#     reviewer's separate summary review lands seconds later with a higher id; and the next
+#     window returns 0 on it immediately, with nothing about the new head to act on (ludics-lite
+#     #72). So every item poll renders carries the commit it is about (a review's commit_id, an
+#     inline comment's original_commit_id — commit_id MIGRATES to the current head as the branch
+#     advances — and a comment's "Reviewed commit:" stamp), and one about another commit is
+#     printed for the record while the watermark advances past it and the wait goes on;
 #   - patience is bounded on BOTH sides, because a stall reads the same from either: a review
 #     that never starts and a 👀 that never lands both end with a verdict to nudge rather than with
-#     another silent hold. "Wait it out" is only honest while something is actually running;
+#     another silent hold. "Wait it out" is only honest while something is actually running — and
+#     the verdict that nothing is coming polls ONE more time before it says so, because a nudge
+#     recommended over a round that landed while the state was being read re-requests a review
+#     and clears the 👍 it was about to get;
+#   - how late a due review is cannot be read off the head commit's date alone: that date is
+#     commit metadata, and a force-push to an older commit or a first push of a morning's work
+#     predates the push it arrived in. The push time is not an API field, so the clock starts at
+#     the newest of that date and the PR's created_at — a floor that cannot be wrong, since
+#     nothing about a PR is due before the PR exists (ludics-lite#72, where a PR opened seconds
+#     earlier reported its review "due for 22m" and recommended a nudge);
 #   - the reviewer can fail at INITIALIZATION and say so in a plain summary comment, which is its
 #     newest word without being a round at all: "Codex Review: Something went wrong. Try again
 #     later by commenting “@codex review”." with "Provided git ref <sha> does not exist" in a
@@ -119,8 +137,12 @@
 #
 # Usage (<pr> is a number, or owner/name#number — prefer the latter, see the repo note below):
 #   pr-review.sh [--repo owner/name] poll <pr> [watermark]
-#                                          # new comments/reviews above the watermark; prints next
-#   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands; 0 = act, 1 = quiet
+#                                          # new comments/reviews above the watermark, each stamped
+#                                          # with the commit it is about; prints the next watermark
+#   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands ON THE HEAD being
+#                                          # watched; 0 = act, 1 = quiet. Reviewer activity about
+#                                          # another commit is printed on stderr for the record and
+#                                          # the wait continues; every exit names what it ends on
 #   pr-review.sh status <pr>               # merge gate + who owes what: approved / reviewing /
 #                                          # stalled / failed / expected / idle / unknown — and
 #                                          # the round count against the threshold (see `rounds`);

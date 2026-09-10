@@ -161,12 +161,13 @@ ship-pr/scripts/test-pr-review-checks-absent.sh
 ship-pr/scripts/test-pr-review-rounds.sh
 ship-pr/scripts/test-pr-review-merge.sh
 ship-pr/scripts/test-pr-review-status.sh
+ship-pr/scripts/test-pr-review-watch.sh
 ship-pr/scripts/test-pr-review-run-watch.sh
 scripts/test-wake-lab.sh
 scripts/test-check-prompts.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all twelve on Ubuntu, one
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all thirteen on Ubuntu, one
 job per suite, and on macOS (the fleet's bash is 3.2) as one job with a step per suite: the hosted
 macOS runners are scarce enough that four separate macOS jobs queued a green PR for one to two
 hours behind nine minutes of work (ludics-lite#55). Alongside them run `bash -n`, shellcheck at
@@ -244,6 +245,20 @@ tip, leaving stdout byte-identical to `poll`'s. `test-pr-review-base-drift.sh` p
 half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
 which stands still on a conflicted PR.
 
+`test-pr-review-watch.sh` drives what ends a `watch` (ludics-lite#72), against a fixture that
+answers the feeds in sequence across polls — the round a final poll catches has to be absent from
+the round before it. The wait ends only on reviewer activity about the head being watched: a
+review, an inline finding or a summary about another commit is printed on stderr for the record
+while the watermark advances past it and the window goes on, with the same item about the head as
+each case's control. An inline finding is bound by the commit it was WRITTEN against, since
+GitHub migrates `commit_id` forward to the current head; an item with no commit association at
+all, and every item when the head could not be read, is acted on rather than swallowed. Each exit
+names what it ends on. Every verdict that says nothing came polls once more first — including
+when that changes nothing, so the extra poll is not proved by the hit alone — and the round it
+finds beats the nudge it would have recommended. The `expected` clock is here too: it starts no
+earlier than the PR's own creation, still runs from the head's committer date on an older PR, and
+survives a committer date in the future.
+
 `test-pr-review-base-red.sh` covers the other `base` — the one that answers "is the branch I am
 about to work off green", and what it says once the answer is no (ludics-lite#73). A red names the
 failing JOB and the commit the red starts at, and the cases pin the claims that could be quietly
@@ -253,7 +268,7 @@ going ends no streak because it judged nothing, two workflow files sharing a dis
 their histories apart, a jobs read that fails prints UNKNOWN and leaves the red standing rather
 than reporting no failing job, and a green base spends no call on any of it.
 
-The seven `test-pr-review-*` suites share a preamble, `test-pr-review-lib.sh`, which sources
+The eight `test-pr-review-*` suites share a preamble, `test-pr-review-lib.sh`, which sources
 `pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and
 the fixture `gh`'s argument parsing. It also closes the trap that bit twice (ludics-lite#39, #45,
 #46): `pr-review.sh` puts some sixty unqualified functions in scope, and a suite helper sharing a
