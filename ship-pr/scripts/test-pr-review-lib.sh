@@ -20,9 +20,11 @@
 #                                       by hand), so a suite never touches `trap`
 #   gh_fixture_parse "$@"               inside a fixture `gh`: refuses anything but `gh api`, and
 #   gh_fixture_answer <response>        anything whose endpoint is neither `graphql` nor a REST
-#                                       path with a `/` (an option's value in the endpoint slot,
-#                                       ludics-lite#86); sets FIXTURE_ENDPOINT / FIXTURE_FILTER
-#                                       / FIXTURE_PAGINATE,
+#                                       path with a `/` — every gh option but a known boolean is
+#                                       consumed with a value, so an option in the endpoint slot
+#                                       is a gh boolean this file has yet to hear of
+#                                       (ludics-lite#86, #102); sets FIXTURE_ENDPOINT /
+#                                       FIXTURE_FILTER / FIXTURE_PAGINATE,
 #                                       logs the endpoint to $REQUEST_LOG (and, when paginated,
 #                                       $PAGINATE_LOG) if the suite set them; the answer goes
 #                                       through the --jq filter the call carried, if any
@@ -143,28 +145,45 @@ gh_fixture_parse() {
     arg="$1"
     shift
     case "$arg" in
-    --jq)
+    # The filter, in both of gh's spellings for it (`-q` is --jq's short form) and both of pflag's
+    # forms. It is the one option's value the fixture itself reads.
+    --jq=*) FIXTURE_FILTER="${arg#*=}" ;;
+    --jq | -q)
       FIXTURE_FILTER="${1:-}"
       shift || true
       ;;
     --paginate) FIXTURE_PAGINATE=1 ;;
-    # The options that carry a VALUE, consumed with it. Without this the `POST` of a `gh api -X
-    # POST repos/...` became the endpoint (it is the first argument that does not start with a
-    # dash), so a suite over the writing commands addressed every call to "POST".
-    -X | --method | -f | --field | -F | --raw-field | -H | --header) shift || true ;;
-    -*) ;;
+    # gh api's BOOLEAN flags — the whole list as of gh 2.99.0, and a DENY-list on purpose. #86
+    # wrote the opposite: it listed the options that carry a VALUE (`-X/--method`, `-f/--field`,
+    # `-F/--raw-field`, `-H/--header`) and let every other `-*` stand alone, because until then
+    # the `POST` of a `gh api -X POST repos/...` became the endpoint — it is the first argument
+    # that does not start with a dash — and a suite over the writing commands addressed every
+    # call to "POST". But that list has to name every value-taking option gh HAS, and the ones it
+    # missed fail the same silent way: `--input fixtures/body.json` is a value that even looks
+    # like a REST path, so it takes the endpoint slot and passes any check of the slot's shape.
+    # Inverted, an option this parser does not know is assumed to carry a value, so the next one
+    # gh grows is parsed correctly with no edit here; and the way the inversion can be wrong — a
+    # new BOOLEAN, whose non-existent value is then read off the endpoint — leaves the endpoint
+    # slot empty for the guard below to shout about. Loud and wrong beats silent and wrong.
+    -i | --include | --silent | --slurp | --verbose | --allow-escape-sequences) ;;
+    # A long option carrying its value inline consumes nothing further.
+    --*=*) ;;
+    # Everything else that looks like an option carries a value: `-X/--method`, `-f/--field`,
+    # `-F/--raw-field`, `-H/--header`, `--cache`, `--hostname`, `--input`, `-p/--preview`,
+    # `-t/--template`, and whatever comes next.
+    -*) shift || true ;;
     *) [ -n "$FIXTURE_ENDPOINT" ] || FIXTURE_ENDPOINT="$arg" ;;
     esac
   done
-  # The endpoint's SHAPE, checked before a fixture dispatches on it. The list above is a list of
-  # options gh has today; the next one it grows is one this parser does not know, and its value
-  # would take the endpoint slot as a bare word again — the #86 shape, one option later, and just
-  # as silent: the fixture answers the wrong branch and the suite passes on it. Every endpoint
-  # pr-review.sh addresses is `graphql` or a REST path, so anything else is this bug and not a
-  # call worth answering.
+  # The endpoint's SHAPE, the backstop under the inversion above. The boolean list is a list of
+  # the flags gh has today, and a new one would be consumed as though it carried a value — taking
+  # the endpoint with it. Every endpoint pr-review.sh addresses is `graphql` or a REST path, so
+  # anything else is that bug (or the #86 one, in whatever form outlives the inversion) and not a
+  # call worth answering: the fixture would dispatch on a word the caller never wrote and answer
+  # the wrong branch, which is the failure that passes.
   case "$FIXTURE_ENDPOINT" in
   graphql | */*) ;;
-  *) bail "fixture parsed '$FIXTURE_ENDPOINT' as the endpoint of: gh $call — an endpoint is 'graphql' or a REST path carrying a '/', so an option's value took the slot: teach gh_fixture_parse the option that carries it" ;;
+  *) bail "fixture parsed '$FIXTURE_ENDPOINT' as the endpoint of: gh $call — an endpoint is 'graphql' or a REST path carrying a '/', so an option this parser does not know either swallowed the endpoint as its value or put its own value in the slot: teach gh_fixture_parse that option" ;;
   esac
   [ -z "${REQUEST_LOG:-}" ] || printf '%s\n' "$FIXTURE_ENDPOINT" >>"$REQUEST_LOG"
   [ -z "$FIXTURE_PAGINATE" ] || [ -z "${PAGINATE_LOG:-}" ] ||
@@ -438,26 +457,66 @@ test_gh_fixture_parse() {
   assert_eq "$?" 1 "a non-api call is refused"
   set -e
   assert_contains "$out" "fixture received non-api gh call: pr merge" "the call should be quoted"
-  # The shape guard, in a subshell because bail exits: an option this parser does not know
-  # carries its value into the endpoint slot, and `5m` is not an endpoint. This is what makes the
-  # next recurrence of #86 loud instead of a wrongly answered branch.
+  REQUEST_LOG=""
+  PAGINATE_LOG=""
+}
+
+# The inversion the option list rests on: an option this parser has never heard of carries a
+# value, so it is consumed WITH that value and the endpoint stays the endpoint. Each case below
+# is a real gh api option #86's allow-list did not name, and each of them silently took the
+# endpoint slot before the list was inverted.
+test_gh_fixture_parse_consumes_an_unknown_option_s_value() {
+  # `--input <file>`: the value even LOOKS like a REST path, so no check of the endpoint's shape
+  # could have caught it (ludics-lite#102, round 1).
+  gh_fixture_parse api --input fixtures/body.json repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "a path-shaped option value is not the endpoint"
+  gh_fixture_parse api --cache 5m --hostname github.com -t '{{.x}}' -p nebula repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "nor is a duration, a host, a template or a preview"
+  # The point of the inversion: an option gh has not grown yet needs no edit here.
+  gh_fixture_parse api --not-an-option-gh-has-yet whatever/value repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "an option this parser cannot know is consumed with its value"
+  # The booleans, which must NOT eat the endpoint that follows them.
+  gh_fixture_parse api -i --silent --slurp --verbose --allow-escape-sequences repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "a boolean flag does not consume the endpoint"
+  # The filter's other spellings: --jq's short form, and pflag's inline value.
+  gh_fixture_parse api repos/o/n/thing -q .a
+  assert_eq "$FIXTURE_FILTER" .a "-q is --jq"
+  gh_fixture_parse api --jq=.b repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "--jq=<filter> consumes nothing further"
+  assert_eq "$FIXTURE_FILTER" .b "--jq=<filter> is still the filter"
+  gh_fixture_parse api --cache=5m repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "nor does any other inline-value long option"
+}
+
+# The shape guard: the backstop under that inversion, and the one refusal that keeps its failure
+# loud. A gh boolean this list does not name is read as carrying a value, and the value it reads
+# is the endpoint — so the endpoint slot ends up empty (or holding a word the caller never wrote
+# as one), and the fixture would otherwise dispatch on it and answer the wrong branch.
+test_gh_fixture_parse_refuses_an_endpoint_that_is_not_one() {
+  local log="$CONTROL_ROOT/guard-req" out
+  REQUEST_LOG="$log"
   : >"$log"
   set +e
-  out=$(gh_fixture_parse api --cache 5m repos/o/n/thing --jq .a 2>&1)
-  assert_eq "$?" 1 "an unknown option's value in the endpoint slot is refused"
+  out=$(gh_fixture_parse api --not-a-boolean-gh-has-yet repos/o/n/thing --jq .a 2>&1)
+  assert_eq "$?" 1 "a swallowed endpoint is refused"
   set -e
-  assert_contains "$out" "fixture parsed '5m' as the endpoint" "the bad endpoint should be named"
-  assert_contains "$out" "gh api --cache 5m repos/o/n/thing --jq .a" "the whole call should be quoted"
-  assert_contains "$out" "teach gh_fixture_parse the option that carries it" "the fix should be named"
+  assert_contains "$out" "fixture parsed '' as the endpoint" "the empty endpoint should be named"
+  assert_contains "$out" "gh api --not-a-boolean-gh-has-yet repos/o/n/thing --jq .a" \
+    "the whole call should be quoted"
+  assert_contains "$out" "teach gh_fixture_parse that option" "the fix should be named"
+  # A bare word that is no endpoint, wherever it came from.
+  set +e
+  out=$(gh_fixture_parse api POST 2>&1)
+  assert_eq "$?" 1 "a word that is not an endpoint is refused"
+  set -e
+  assert_contains "$out" "fixture parsed 'POST' as the endpoint" "the bad endpoint should be named"
   # An api call with no endpoint at all is the same refusal.
   set +e
   out=$(gh_fixture_parse api --paginate 2>&1)
   assert_eq "$?" 1 "an api call with no endpoint is refused"
   set -e
-  assert_contains "$out" "fixture parsed '' as the endpoint" "the empty endpoint should be named"
   assert_eq "$(cat "$log")" "" "a refused call is not logged"
   REQUEST_LOG=""
-  PAGINATE_LOG=""
 }
 
 tests=(
@@ -472,6 +531,8 @@ tests=(
   test_tmpdir_writes_to_a_target_named_dir
   test_tmpdir_refuses_a_name_it_uses
   test_gh_fixture_parse
+  test_gh_fixture_parse_consumes_an_unknown_option_s_value
+  test_gh_fixture_parse_refuses_an_endpoint_that_is_not_one
 )
 
 run_tests "${tests[@]}"
