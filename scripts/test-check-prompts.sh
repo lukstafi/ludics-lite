@@ -27,6 +27,16 @@ expect() {
 # row_after_beta <row>: inserts a row into the scratch README's skill table, after `beta`.
 row_after_beta() { sed -i.bak "/^| \`beta\` |/a\\
 $1" "$R/README.md"; }
+# beta_row <line>: replaces the scratch README's `beta` row with <line>. Matched and rewritten
+# by awk rather than sed, so a replacement full of pipes needs no delimiter gymnastics.
+# A replacement that matched nothing would leave a probe asserting a pass over an unmutated
+# tree, which is a probe that cannot fail: the helper says so instead.
+beta_row() {
+  awk -v repl="$1" '/^\| `beta` \| The second\. \|$/ { print repl; hit = 1; next } { print }
+    END { exit hit ? 0 : 1 }' "$R/README.md" > "$R/README.row" \
+    || { ko "beta_row: the scratch README carries no \`beta\` row to replace"; return 1; }
+  mv "$R/README.row" "$R/README.md"
+}
 
 # --- the scratch tree: two skills, two routines, both index tables ---------------------------
 skill() {  # skill <root> <name> [frontmatter lines...]: writes <root>/<name>/SKILL.md
@@ -220,133 +230,52 @@ expect "an empty optional key" 1 "frontmatter 'model:' has no value" -- "$CP" "$
 fresh "$R"; skill "$R" alpha 'name: alpha' 'description: fine' 'model: sonnet' 'model: opus'
 expect "a duplicated optional key" 1 "frontmatter has 2 'model:' lines" -- "$CP" "$R"
 
-# --- index table defects ---------------------------------------------------------------------
-fresh "$R"; skill "$R" gamma 'name: gamma' 'description: Unindexed.'
-expect "a skill missing from the README table" 1 'skill directories missing from its table: gamma' -- "$CP" "$R"
+# --- index lookup defects ---------------------------------------------------------------------
+# The claim is one lookup per directory: the README that indexes it carries a row whose first
+# cell is that directory's name in backticks. Every probe below is at that granularity -- the
+# table-syntax probes went with the scanner they exercised (ludics-lite#75).
 
-fresh "$R"; rm -r "$R/beta"
-expect "a README row without a directory" 1 "table row 'beta' has no beta/SKILL.md" -- "$CP" "$R"
+fresh "$R"; skill "$R" gamma 'name: gamma' 'description: Unindexed.'
+expect "a skill missing from the README" 1 "skill 'gamma' is not indexed" -- "$CP" "$R"
 
 fresh "$R"; skill "$R/routines" monthly 'name: monthly' 'description: Unindexed.'
-expect "a routine missing from routines/README.md" 1 'routine directories missing from its table: monthly' -- "$CP" "$R"
+expect "a routine missing from routines/README.md" 1 "routine 'monthly' is not indexed" -- "$CP" "$R"
 
-fresh "$R"; rm -r "$R/routines/nightly"
-expect "a routines row without a directory" 1 "table row 'nightly' has no routines/nightly/SKILL.md" -- "$CP" "$R"
-
-# A table ends at its first non-row line, blank or not: rows of a later table that follows a
-# heading with no blank line between are not the index, in either direction.
-fresh "$R"; cat > "$R/README.md" <<'EOF'
-# scratch
-
-| Skill | What it does |
-| --- | --- |
-| `alpha` | The first. |
-## A heading with no blank line before it
-| Variable | Meaning |
-| --- | --- |
-| `beta` | Indexed in the wrong table. |
-| `NOT_A_SKILL` | Not a skill either. |
-EOF
-expect "a heading ends the table: a skill listed only in a later table is missing" 1 'skill directories missing from its table: beta' -- "$CP" "$R"
-printf '%s' "$out" | grep -q "table row 'NOT_A_SKILL'" && ko "the later table's rows were read as the index" \
-  || ok "...and the later table's rows are not read as index rows"
-
-# A table inside a fenced code block or an HTML comment is not rendered, and is not read; one
-# outside them is, whatever fenced or commented look-alikes precede it.
-fresh "$R"; { echo '```'; cat "$R/README.md"; echo '```'; } > "$R/README.fenced" && mv "$R/README.fenced" "$R/README.md"
-expect "a table inside a code fence is not a table" 1 "no '| Skill |' table" -- "$CP" "$R"
-fresh "$R"; { echo '<!--'; cat "$R/README.md"; echo '-->'; } > "$R/README.commented" && mv "$R/README.commented" "$R/README.md"
-expect "a table inside an HTML comment is not a table" 1 "no '| Skill |' table" -- "$CP" "$R"
-fresh "$R"; { printf '%s\n' '```' '| Skill | What it does |' '| --- | --- |' '| `NOT_A_SKILL` | fenced |' '```' \
-  '<!-- | Skill | What it does |' '| --- | --- |' '| `NOT_A_SKILL` | commented | -->'; cat "$R/README.md"; } > "$R/README.pre" \
-  && mv "$R/README.pre" "$R/README.md"
-expect "...and look-alikes inside them do not hide the real table after them" 0 '6 passed, 0 failed' -- "$CP" "$R"
-# A comment that closes on its own line is cut out and the rest of the line still read: a
-# row with an inline note is a row (and a stale one is caught); a header with one is a header.
-fresh "$R"; row_after_beta '| `stale` | Visible text <!-- note --> |'
-expect "a row with an inline comment is still judged" 1 "table row 'stale' has no stale/SKILL.md" -- "$CP" "$R"
-fresh "$R"; sed -i.bak 's/^| Skill | What it does |$/| Skill | What it does | <!-- two cells, one note -->/' "$R/README.md"
-expect "a header with a trailing inline comment is still the header" 0 '6 passed, 0 failed' -- "$CP" "$R"
-# A comment region is read before any fence inside it, so a fence line in a comment neither
-# opens a fence nor keeps the comment from closing.
-fresh "$R"; { echo '<!--'; echo '```'; echo '-->'; cat "$R/README.md"; } > "$R/README.c" && mv "$R/README.c" "$R/README.md"
-expect "a fence line inside a comment is comment" 0 '6 passed, 0 failed' -- "$CP" "$R"
-# The delimiter row is judged as written: a comment inside a cell makes it not a delimiter.
-fresh "$R"; sed -i.bak 's/^| --- | --- |$/| --- | --- <!-- note --> |/' "$R/README.md"
-expect "a comment inside a delimiter cell is not a delimiter" 1 "no '| Skill |' table" -- "$CP" "$R"
-# A backtick opener takes no backtick in its info string: such a line is text, not a fence.
-fresh "$R"; { echo '```foo`bar'; cat "$R/README.md"; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
-expect "a backtick fence with a backtick in its info string is not a fence" 0 '6 passed, 0 failed' -- "$CP" "$R"
-# Cells are counted on unescaped pipes: an escaped one in a header cell is content.
-fresh "$R"; sed -i.bak 's/^| Skill | What it does |$/| Skill | What \\| why |/' "$R/README.md"
-expect "an escaped pipe in a header cell is not a cell boundary" 0 '6 passed, 0 failed' -- "$CP" "$R"
-fresh "$R"; sed -i.bak 's/^| Skill | What it does |$/| Skill | What \\\\| why |/' "$R/README.md"
-expect "...but behind an escaped backslash the pipe is real, and the header has three cells" 1 "no '| Skill |' table" -- "$CP" "$R"
-# The delimiter must be the line right after the header: a fence there is no table.
-fresh "$R"; sed -i.bak $'/^| Skill | What it does |$/a\\\n```\\\ncode\\\n```' "$R/README.md"
-expect "a fence between the header and the delimiter is no table" 1 "no '| Skill |' table" -- "$CP" "$R"
-# A table cannot interrupt a paragraph: a header straight under prose is prose; under a
-# heading, a blank line or a closed fence it is a header.
-fresh "$R"; sed -i.bak 's/^# scratch$/Some paragraph text, with the blank line below it gone./' "$R/README.md" && sed -i.bak '/^Some paragraph text/{n;d;}' "$R/README.md"
-expect "a header straight under paragraph text is not a table" 1 "no '| Skill |' table" -- "$CP" "$R"
-fresh "$R"; sed -i.bak '/^# scratch$/{n;d;}' "$R/README.md"
-expect "...straight under a heading it is" 0 '6 passed, 0 failed' -- "$CP" "$R"
-fresh "$R"; sed -i.bak 's/^# scratch$/#not-a-heading/' "$R/README.md" && sed -i.bak '/^#not-a-heading/{n;d;}' "$R/README.md"
-expect "...but '#not-a-heading' is paragraph text, so a header under it is prose" 1 "no '| Skill |' table" -- "$CP" "$R"
-fresh "$R"; { echo '```'; echo 'code'; echo '```'; cat "$R/README.md" | sed '1,2d'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
-expect "...and straight under a closed fence it is" 0 '6 passed, 0 failed' -- "$CP" "$R"
-
-# A fence closes only on its own marker, at least as long as the opener: a `~~~` inside a
-# backtick fence, or a shorter fence, leaves the block open, as it does for the renderer.
-fresh "$R"; { echo '```'; echo '~~~'; cat "$R/README.md"; echo '```'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
-expect "a ~~~ inside a backtick fence does not close it" 1 "no '| Skill |' table" -- "$CP" "$R"
-fresh "$R"; { echo '````'; echo '```'; cat "$R/README.md"; echo '````'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
-expect "a shorter fence does not close a longer one" 1 "no '| Skill |' table" -- "$CP" "$R"
-fresh "$R"; { echo '```'; echo 'code'; echo '`````'; cat "$R/README.md"; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
-expect "...and a longer fence of the same marker does" 0 '6 passed, 0 failed' -- "$CP" "$R"
-fresh "$R"; { echo '```text'; echo '```not-a-close'; cat "$R/README.md"; echo '```'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
-expect "a fence line with text after the marker does not close" 1 "no '| Skill |' table" -- "$CP" "$R"
-fresh "$R"; { echo '```text'; echo 'code'; echo '```   '; cat "$R/README.md"; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
-expect "...and one with only whitespace after it does" 0 '6 passed, 0 failed' -- "$CP" "$R"
-# A fence line may be indented at most three spaces; four make it code inside the open block.
-fresh "$R"; { echo '```'; echo '    ```'; cat "$R/README.md"; echo '```'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
-expect "a fence indented four spaces does not close" 1 "no '| Skill |' table" -- "$CP" "$R"
-fresh "$R"; { echo '```'; echo 'code'; echo '   ```'; cat "$R/README.md"; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
-expect "...and one indented three does" 0 '6 passed, 0 failed' -- "$CP" "$R"
-# GFM's delimiter row: cells "whose only content are hyphens", no minimum count -- `| - | - |`
-# renders as a table on GitHub, and so it is one here.
-fresh "$R"; sed -i.bak 's/^| --- | --- |$/| - | - |/' "$R/README.md"
-expect "a single-hyphen delimiter row is a table, as on GitHub" 0 '6 passed, 0 failed' -- "$CP" "$R"
-# ...but only with as many cells as the header: GFM recognises no table otherwise.
-fresh "$R"; sed -i.bak 's/^| --- | --- |$/| - |/' "$R/README.md"
-expect "a delimiter row with fewer cells than the header is not a table" 1 "no '| Skill |' table" -- "$CP" "$R"
-fresh "$R"; sed -i.bak 's/^| --- | --- |$/| --- | --- | --- |/' "$R/README.md"
-expect "...nor one with more" 1 "no '| Skill |' table" -- "$CP" "$R"
-
-# Every data row is judged: a row the reader sees with a first cell that is not one backticked
-# name fails, instead of being skipped as not-a-row.
-fresh "$R"; row_after_beta '| stale-skill | Stale rendered row. |'
-expect "an unbackticked first cell is a failing row" 1 "skill table row's first cell is not a backticked name: 'stale-skill'" -- "$CP" "$R"
-fresh "$R"; row_after_beta '| `two` `names` | Two names. |'
-expect "two backticked names in one cell is a failing row" 1 "is not one backticked name" -- "$CP" "$R"
-fresh "$R"; row_after_beta '|   | Empty first cell. |'
-expect "an empty first cell is a failing row" 1 "first cell is not a backticked name: ''" -- "$CP" "$R"
-# GFM renders a body row without a leading pipe, so it is judged too: as a stale row when its
-# first cell is not a name, and as the skill's row when it is.
-fresh "$R"; row_after_beta 'stale | A pipeless row GitHub renders.'
-expect "a pipeless row with a stale first cell fails" 1 "first cell is not a backticked name: 'stale'" -- "$CP" "$R"
-fresh "$R"; sed -i.bak 's/^| `beta` | The second. |$/`beta` | The second, pipeless./' "$R/README.md"
-expect "...and a pipeless row with the skill's name is its row" 0 '6 passed, 0 failed' -- "$CP" "$R"
-
-# Without its delimiter row a header and its rows are prose to Markdown, and to this.
-fresh "$R"; sed -i.bak '/^| Skill |/{n;d;}' "$R/README.md"
-expect "a table without its delimiter row is not a table" 1 "no '| Skill |' table" -- "$CP" "$R"
-
-fresh "$R"; sed -i.bak 's/^| Routine |/| Routines |/' "$R/routines/README.md"
-expect "a renamed table header is a failure, not an empty pass" 1 "no '| Routine |' table" -- "$CP" "$R"
+# A row is a row by its FIRST cell, and the name is backticked there: the three ways a README
+# can name a directory and still not index it each fail.
+fresh "$R"; beta_row '| beta | The second, unbackticked. |'
+expect "a row naming the skill without backticks" 1 "skill 'beta' is not indexed" -- "$CP" "$R"
+fresh "$R"; beta_row '| `other` | Backticked in a later cell: `beta`. |'
+expect "the name backticked in a later cell is not the first cell" 1 "skill 'beta' is not indexed" -- "$CP" "$R"
+fresh "$R"; beta_row 'The `beta` skill, described in prose instead of indexed.'
+expect "a backticked mention that is not a row" 1 "skill 'beta' is not indexed" -- "$CP" "$R"
+# The name is matched as text and in full: a longer name containing it is a different directory,
+# and a regex metacharacter in a name is that character.
+fresh "$R"; beta_row '| `betas` | A longer name that contains this one. |'
+expect "a row naming a longer name does not index the directory" 1 "skill 'beta' is not indexed" -- "$CP" "$R"
+fresh "$R"; skill "$R" v1.2 'name: v1.2' 'description: A dotted name.'; row_after_beta '| `v1x2` | A row the dot must not match. |'
+expect "a '.' in a directory name is not a wildcard" 1 "skill 'v1.2' is not indexed" -- "$CP" "$R"
+fresh "$R"; skill "$R" v1.2 'name: v1.2' 'description: A dotted name.'; row_after_beta '| `v1.2` | A dotted name, indexed exactly. |'
+expect "...while the exact dotted name indexes it" 0 '7 passed, 0 failed' -- "$CP" "$R"
+# GFM renders a body row without its leading pipe, so one counts here too.
+fresh "$R"; beta_row '`beta` | The second, pipeless.'
+expect "a pipeless row is a row" 0 '6 passed, 0 failed' -- "$CP" "$R"
 
 fresh "$R"; rm "$R/routines/README.md"
 expect "a missing index file" 1 'routines/README.md: missing' -- "$CP" "$R"
+
+# With nothing to look up, the README is not thereby judged: the line says so rather than
+# reading as a check that passed.
+fresh "$R"; rm -r "$R/routines/nightly" "$R/routines/weekly"
+expect "no directories to index says so, instead of passing silently" 0 'no routines/ SKILL.md directory to index' -- "$CP" "$R"
+
+# The boundary of the shrunken claim, pinned from the other side so that what the lookup gave up
+# is a decision on record rather than a hole nobody meant (ludics-lite#75). It models no table,
+# so it reads neither a row that outlived its directory nor whether the row renders at all.
+fresh "$R"; rm -r "$R/beta"
+expect "a row that outlives its directory is no longer read" 0 '5 passed, 0 failed' -- "$CP" "$R"
+fresh "$R"; { echo '```'; cat "$R/README.md"; echo '```'; } > "$R/README.f" && mv "$R/README.f" "$R/README.md"
+expect "...and a fenced README still satisfies the lookup" 0 '6 passed, 0 failed' -- "$CP" "$R"
 
 # Two defects in one run are both reported: the per-file loop does not stop at the first.
 fresh "$R"; skill "$R" alpha 'description: nameless'; skill "$R/routines" weekly 'name: weekly'

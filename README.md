@@ -176,10 +176,14 @@ PR's merge gate reads a verdict rather than `ABSENT`, a prompt-only PR included.
 
 `check-prompts.sh` is the prompt hygiene check itself: every skill and routine `SKILL.md` opens
 with YAML frontmatter carrying one `name`, equal to its directory, and one single-line
-`description`, and the skill table above and the routine table in `routines/README.md` each index
-exactly the directories that carry a `SKILL.md`, in both directions. `test-check-prompts.sh` runs
-it against scratch trees, one per defect, with the well-formed tree as the control, and ends by
-running it on this checkout.
+`description`, and every directory carrying a `SKILL.md` is named, in backticks, in the first cell
+of a row of the README that indexes it — the skill table above, the routine table in
+`routines/README.md`. That second half is a lookup, one fixed scan per directory, not a table
+parser: it claims only that the name is written down as a row, not that the row renders, and it no
+longer reads the other direction, a row that outlived its directory. The scanner it replaced drew
+thirteen rounds of table-syntax edge cases in one review and reopened on every new rule
+(ludics-lite#75). `test-check-prompts.sh` runs it against scratch trees, one per defect, with the
+well-formed tree as the control, and ends by running it on this checkout.
 
 `test-fleet-worker.sh` runs its ~180 assertions top to bottom in one shell, which takes about three
 and a half minutes. Arguments narrow that: each one selects every section whose name contains it

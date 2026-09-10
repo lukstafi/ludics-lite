@@ -5,7 +5,8 @@ the sweeps that keep OCANNL's non-CI backends and formatting honest, and the CI-
 `ship-pr` hands master's trailing failures to. Each directory holds one `SKILL.md` in the shape
 Claude Code's scheduled tasks use: a `name` and `description` in the frontmatter, then the prompt.
 CI's prompt hygiene job (`scripts/check-prompts.sh`) checks that shape, that `name` matches the
-directory, and that the table below lists exactly these directories.
+directory, and that each of these directories is named, in backticks, in the first cell of a row
+of the table below.
 
 Two kinds live here, and they are kept in sync differently.
 
