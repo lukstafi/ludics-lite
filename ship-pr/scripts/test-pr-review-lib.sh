@@ -56,10 +56,35 @@
 # The negative controls are what prove the guard can fail; CI runs it beside the nine suites.
 # `retune` is covered in the same run, by a pair of cases: one moves two constants, the next reads
 # them back as pr-review.sh set them, which is the restore no case performs itself.
+#
+# To SHOW a guard can fail — which is how a control earns its place here — copy this file and
+# pr-review.sh into a scratch directory, revert the fix in the COPY, and run the copy:
+#
+#   cp ship-pr/scripts/{test-pr-review-lib.sh,pr-review.sh} "$d"/ && mv "$d"/test-pr-review-lib.sh "$d"/lib-reverted.sh
+#   $EDITOR "$d"/lib-reverted.sh && bash "$d"/lib-reverted.sh   # the control you added must fail
+#
+# The tracked file is never touched, so a session that dies mid-way leaves the repo clean; the
+# alternative — mutating the tracked file in place and restoring it — does not have that property.
+# The copy needs pr-review.sh beside it (TEST_LIB_DIR comes from BASH_SOURCE and HELPER from that)
+# and nothing else: any directory will do, and the name of the copy does not matter, because this
+# file names itself through LIB_BASENAME rather than spelling it. The last control is what keeps
+# that true — it runs a renamed copy for real and holds it to this file's own PASS list, so a name
+# spelled instead of derived fails here rather than under whoever next tries the route
+# (ludics-lite#101). `--inner-copy`, which that control passes, is the only argument this file
+# takes; it stops the copy from copying itself again.
 
 TEST_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 TEST_LIB_FILE="$TEST_LIB_DIR/$(basename "${BASH_SOURCE[0]}")"
 HELPER="$TEST_LIB_DIR/pr-review.sh"
+# How this file names ITSELF, everywhere below: derived, never spelled. A copy is how a guard is
+# shown to fail without touching the tracked file (see the executed section's copy control), and a
+# copy is named something else — so every message and every assertion that spells the canonical
+# name is a false failure waiting for whoever tries that route. One did: run as `lib-reverted.sh`,
+# `test_lib_helpers_are_protected` asserted on a literal "test-pr-review-lib.sh's assert_eq" while
+# the guard correctly reported `lib-reverted.sh's assert_eq`, and the case failed for a reason
+# with nothing to do with the mutation under test. pr-review.sh keeps its literal name, in prose
+# and in HELPER both: a copy has to sit beside a file of exactly that name to run at all.
+LIB_BASENAME=$(basename "$TEST_LIB_FILE")
 
 # Everything a suite defines must come AFTER this file: a function defined before pr-review.sh
 # is sourced is replaced by the library's same-named one (the shadow in the other direction),
@@ -73,7 +98,7 @@ HELPER="$TEST_LIB_DIR/pr-review.sh"
 # function in the environment refused every suite, naming "declare -fx <name>" as the definition.
 lib_predefined=$(declare -F | sed -n 's/^declare -f \(.*\)/\1/p' | tr '\n' ' ')
 if [ -n "$lib_predefined" ]; then
-  echo "test-pr-review-lib.sh: REFUSING to run: the suite defined functions before sourcing this file (${lib_predefined% }); source it first, so the shadow guard sees every definition" >&2
+  echo "$LIB_BASENAME: REFUSING to run: the suite defined functions before sourcing this file (${lib_predefined% }); source it first, so the shadow guard sees every definition" >&2
   exit 2
 fi
 unset lib_predefined
@@ -146,7 +171,7 @@ SRANDOM " in *" $n "*) continue ;; esac
 case "$lib_probe_rc$HELPER_CONSTANTS" in
 0*[![:space:]]*) rm -f "$lib_probe_err" ;;
 *)
-  echo "test-pr-review-lib.sh: REFUSING to run: the probe that reads pr-review.sh's source-time constants exited $lib_probe_rc and named $(printf '%s' "$HELPER_CONSTANTS" | wc -w | tr -d ' ') constant(s), so \`retune\` could accept no name. What the source said:" >&2
+  echo "$LIB_BASENAME: REFUSING to run: the probe that reads pr-review.sh's source-time constants exited $lib_probe_rc and named $(printf '%s' "$HELPER_CONSTANTS" | wc -w | tr -d ' ') constant(s), so \`retune\` could accept no name. What the source said:" >&2
   sed 's/^/  /' "$lib_probe_err" >&2 || :
   rm -f "$lib_probe_err"
   exit 2
@@ -440,7 +465,7 @@ stub() {
   [ $# -gt 0 ] || bail "stub: no function named"
   for fn in "$@"; do
     [ -n "$(lib_owner_of "$fn" "$LIB_SNAPSHOT")" ] ||
-      bail "stub $fn: neither pr-review.sh nor test-pr-review-lib.sh defines $fn — nothing to stub"
+      bail "stub $fn: neither pr-review.sh nor $LIB_BASENAME defines $fn — nothing to stub"
     STUBS="$STUBS $fn "
   done
 }
@@ -475,7 +500,7 @@ check_shadows() {
   - $(lib_show_file "$owner_file")'s $name ($(lib_show_file "$owner_file"):$owner_line) is redefined at $(lib_show_file "$file"):$line without \`stub $name\`"
   done <<<"$LIB_SNAPSHOT"
   [ -z "$problems" ] || {
-    echo "test-pr-review-lib.sh: REFUSING to run the cases: a suite function replaces a library function it did not declare (ludics-lite#46) — a same-named helper silently takes over every call the library makes (a reporter named \`fail\` turns each refusal's exit code into 1); declare a deliberate override with \`stub <fn>\`, else rename the suite's function:$problems" >&2
+    echo "$LIB_BASENAME: REFUSING to run the cases: a suite function replaces a library function it did not declare (ludics-lite#46) — a same-named helper silently takes over every call the library makes (a reporter named \`fail\` turns each refusal's exit code into 1); declare a deliberate override with \`stub <fn>\`, else rename the suite's function:$problems" >&2
     exit 2
   }
 }
@@ -519,7 +544,7 @@ LIB_SNAPSHOT=$(lib_function_table |
 case "$LIB_SNAPSHOT" in
 *[![:space:]]*) ;;
 *)
-  echo "test-pr-review-lib.sh: REFUSING to run: the function-table snapshot named nothing, so the shadow guard would protect no function and every ludics-lite#46 shadow would be accepted silently; pr-review.sh ($HELPER) and this file should between them define some sixty" >&2
+  echo "$LIB_BASENAME: REFUSING to run: the function-table snapshot named nothing, so the shadow guard would protect no function and every ludics-lite#46 shadow would be accepted silently; pr-review.sh ($HELPER) and this file should between them define some sixty" >&2
   exit 2
   ;;
 esac
@@ -527,6 +552,22 @@ esac
 # --- executed: this file's own controls -------------------------------------------------------
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 set -euo pipefail
+
+# The copy control at the end runs this very file again, from a renamed copy. That inner run must
+# not copy itself a third time, and the marker that stops it is an ARGUMENT rather than an
+# exported variable on purpose: an argument cannot arrive from an ambient environment, so no stray
+# `export` in a caller's shell can delete the control from an ordinary run and leave the file
+# reporting a PASS for a case that did nothing. Anything else on the command line is a typo, and
+# a typo that ran the whole suite anyway would look like the flag had been honoured.
+LIB_INNER_RUN=""
+case "${1:-}" in
+"") ;;
+--inner-copy) LIB_INNER_RUN=1 ;;
+*)
+  echo "$LIB_BASENAME: REFUSING to run: unknown argument '$1' (the only one is --inner-copy, which this file passes to a copy of itself)" >&2
+  exit 2
+  ;;
+esac
 
 test_tmpdir CONTROL_ROOT lib-test
 CONTROL_N=0
@@ -585,7 +626,7 @@ test_every_library_function_is_protected() {
 test_lib_helpers_are_protected() {
   control 'assert_eq() { :; }'
   assert_refused "a redefined assert_eq"
-  assert_contains "$CONTROL_ERR" "test-pr-review-lib.sh's assert_eq (test-pr-review-lib.sh:" \
+  assert_contains "$CONTROL_ERR" "$LIB_BASENAME's assert_eq ($LIB_BASENAME:" \
     "the owner should be this file"
 }
 
@@ -608,7 +649,7 @@ test_stub_without_a_redefinition_is_refused() {
 test_stub_of_an_unknown_name_is_refused() {
   control 'stub no_such_function'
   assert_eq "$CONTROL_RC" 1 "an unknown stub is the reporter's exit 1 ($CONTROL_ERR)"
-  assert_contains "$CONTROL_ERR" "stub no_such_function: neither pr-review.sh nor test-pr-review-lib.sh defines no_such_function" \
+  assert_contains "$CONTROL_ERR" "stub no_such_function: neither pr-review.sh nor $LIB_BASENAME defines no_such_function" \
     "the unknown name should be named"
   assert_not_contains "$CONTROL_OUT" "PASS:" "no case may run"
 }
@@ -1002,6 +1043,44 @@ test_the_guard_survives_a_path_with_spaces() {
     "the snapshot should be populated, not empty-and-refused"
 }
 
+# The route the whole file depends on: to SHOW a guard can fail you copy this file and pr-review.sh
+# into a scratch directory, revert the fix in the COPY, and run the copy — the tracked file is
+# never touched, so a session that dies between mutating and restoring leaves the repo clean. The
+# fallback when that route is broken is to mutate the tracked file in place and put it back, which
+# does not have that property.
+#
+# It was broken by a single assertion that spelled this file's name where it meant "this file":
+# run as `lib-reverted.sh`, `test_lib_helpers_are_protected` failed on the owner string rather than
+# on the mutation (ludics-lite#101). Nothing caught it, because nothing here had ever run this file
+# from anywhere but its own path. This case is what stops the spelling from creeping back: it runs
+# the copy for real and holds it to the same PASS list, so a name spelled instead of derived fails
+# HERE, in the file that spelled it.
+#
+# A copy needs pr-review.sh beside it — TEST_LIB_DIR comes from BASH_SOURCE and HELPER from that —
+# and needs nothing else: any directory will do, which is why the copy goes to a test_tmpdir
+# rather than into ship-pr/scripts/.
+#
+# The inner run is given `--inner-copy` so it skips this case instead of copying itself forever.
+# It still reports a PASS line for it, so the two lists match exactly and a case silently lost
+# from the copy is a diff rather than a shorter list nobody counted.
+test_the_self_test_runs_from_a_renamed_copy() {
+  local root copy out err rc want
+  [ -z "$LIB_INNER_RUN" ] || return 0
+  test_tmpdir root renamed-copy
+  copy="$root/lib-reverted.sh"
+  cp "$TEST_LIB_FILE" "$copy"
+  cp "$HELPER" "$root/"
+  set +e
+  out=$(bash "$copy" --inner-copy 2>"$root/err")
+  rc=$?
+  set -e
+  err=$(cat "$root/err")
+  assert_eq "$rc" 0 "a renamed copy beside pr-review.sh must run its own controls ($err)"
+  assert_eq "$err" "" "and say nothing on stderr"
+  want=$(printf 'PASS: %s\n' "${tests[@]}")
+  assert_eq "$out" "$want" "the copy should report every case this file runs, in the same order"
+}
+
 tests=(
   test_undeclared_shadow_is_refused
   test_every_library_function_is_protected
@@ -1021,6 +1100,7 @@ tests=(
   test_retune_of_a_name_the_script_does_not_set_is_refused
   test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason
   test_the_guard_survives_a_path_with_spaces
+  test_the_self_test_runs_from_a_renamed_copy
 )
 
 run_tests "${tests[@]}"
