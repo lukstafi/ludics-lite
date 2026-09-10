@@ -149,6 +149,10 @@ sidesteps both.
 If the branch already has a PR, push to it and reuse it — never open a second one for the same
 branch.
 
+Before the first push, run the formatter check the repository's CI gates on, if it has one —
+its AGENTS.md or CLAUDE.md names it (OCANNL: `dune build @fmt`). A formatting-only fix push
+costs a CI round and, since automated reviews fire on every push, a review round.
+
 Write the body as the reviewer's map, not a changelog: what is now true that was not, what the
 tests pin, what changes for existing users, and where the risky corner is. Reviewers — human and
 automated — spend their attention where the body sends it.

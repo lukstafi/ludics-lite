@@ -13,7 +13,7 @@ just Markdown and shell loaded by compatible agent harnesses from their skill di
 | `issue-wave` | Run one coordinator over the whole fleet: pick issues from a sequencing plan, launch one worker per issue in its own worktree on a chosen box, and supervise the wave to full merge. |
 
 The `routines/` directory holds the prompts of the scheduled runs that feed these skills: the
-daily sequencing plan `issue-wave` reads, the OCANNL test and formatting sweeps, and the CI-red
+daily sequencing plan `issue-wave` reads, the OCANNL test sweep, and the CI-red
 triage cloud routine. See [routines/README.md](routines/README.md).
 
 The skills were extracted from a private repository with their full history. Its issues were
@@ -105,13 +105,13 @@ ones. The preflight proves both with a live call, not a status read.
 
 ## Routines
 
-`routines/` carries the scheduled-task prompts the same way the skill directories carry skills,
-and three of the four install the same way: each task directory under `~/.claude/scheduled-tasks`
-replaced by a symlink into this checkout, so an edit made during a run lands here. The desktop
-app's registry (cron, working directory, model) is not in the repository and is recorded in
-[routines/README.md](routines/README.md), which also carries the install loop with its guard
-against linking into a real directory. The fourth, the CI-red triage routine `ship-pr` defers
-master's trailing failures to, runs in the cloud and is synced by hand.
+`routines/` carries the scheduled-task prompts, but not the way the skill directories carry
+skills: since desktop app 1.46388.4 the scheduler refuses a task file reached through a symlink,
+so three of the four install as copies under `~/.claude/scheduled-tasks`, pushed and pulled by
+`scripts/sync-routines.sh`. The desktop app's registry (cron, working directory, model) is not in
+the repository and is recorded in [routines/README.md](routines/README.md), which also carries the
+install order and the symptoms of an unreadable prompt. The fourth, the CI-red triage routine
+`ship-pr` defers master's trailing failures to, runs in the cloud and is synced by hand.
 
 ## The lab script
 
