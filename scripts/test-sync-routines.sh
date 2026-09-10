@@ -13,8 +13,9 @@
 #     ABOVE the routine directory is refused too, with the same trees under their real path as
 #     the control;
 #   - that a directory which EXISTS and is still not a usable prompt -- a symlink anywhere
-#     inside it, or no SKILL.md -- is refused rather than certified in sync or pulled over the
-#     checkout, in both directions;
+#     inside it, no SKILL.md, or a SKILL.md that is empty or carries no readable frontmatter --
+#     is refused rather than certified in sync or pulled over the checkout, in both directions,
+#     with a legal-but-unusual prompt as the control that the floor is not refusing everything;
 #   - that a push never leaves the installed prompt absent or half-written, sampled by a reader
 #     running flat out across a series of them, with a control that the reader can report an
 #     absence;
@@ -352,7 +353,8 @@ printf 'body v2 -- the installed edit\n' >> "$TMP/installed/$R1/SKILL.md"
 mkdir -p "$TMP/outside-routines"
 for r in $LOCAL_ROUTINES; do
   mkdir -p "$TMP/outside-routines/$r"
-  printf 'external prompt nobody asked to change\n' > "$TMP/outside-routines/$r/SKILL.md"
+  printf -- '---\nname: %s\ndescription: external prompt for %s\n---\n\nexternal prompt nobody asked to change\n' \
+    "$r" "$r" > "$TMP/outside-routines/$r/SKILL.md"
 done
 LINKREPO="$TMP/linkrepo"
 rm -rf "$LINKREPO"
@@ -438,6 +440,47 @@ grep -q 'body v1' "$TMP/installed/$R1/SKILL.md" \
 expect "...while pull onto it is allowed, since that is the repair" 0 "pulled into" -- run_sync pull
 [ -f "$REPO/routines/$R1/SKILL.md" ] \
   && ok "...restoring the checkout's prompt" || ko "pull did not restore $REPO/routines/$R1/SKILL.md"
+
+# --- a regular file is not yet a prompt -----------------------------------------------------------
+# A zero-byte or frontmatter-less SKILL.md installs happily and then compares equal to itself, so
+# push would replace a working prompt with one the loaders can read no name, no description and no
+# body out of -- the same quiet nothing-ran as an unreadable file, by a different route. The floor
+# below is not a second copy of check-prompts.sh's grammar; it is what the loaders need to find.
+for defect in empty no-fence unclosed no-name no-description; do
+  reset_trees; install_all
+  case "$defect" in
+    empty)          : > "$REPO/routines/$R1/SKILL.md" ;;
+    no-fence)       printf 'name: %s\n\nbody\n' "$R1" > "$REPO/routines/$R1/SKILL.md" ;;
+    unclosed)       printf -- '---\nname: %s\ndescription: d\n\nbody\n' "$R1" > "$REPO/routines/$R1/SKILL.md" ;;
+    no-name)        printf -- '---\ndescription: d\n---\n\nbody\n' > "$REPO/routines/$R1/SKILL.md" ;;
+    no-description) printf -- '---\nname: %s\n---\n\nbody\n' "$R1" > "$REPO/routines/$R1/SKILL.md" ;;
+  esac
+  expect "push refuses a checkout SKILL.md that is $defect" 1 "refusing to install it" -- run_sync push
+  grep -q 'body v1' "$TMP/installed/$R1/SKILL.md" \
+    && ok "...leaving the working installed prompt in place" \
+    || ko "the $defect prompt replaced the installed one"
+  expect "...and status calls it out" 1 "$R1: $REPO/routines/$R1" -- run_sync
+done
+# The same floor on the installed side.
+reset_trees; install_all
+: > "$TMP/installed/$R1/SKILL.md"
+expect "status refuses an installed SKILL.md that is empty" 1 "EMPTY SKILL.md" -- run_sync
+expect "...pull refuses to take it" 1 "refusing to pull from it" -- run_sync pull
+[ -s "$REPO/routines/$R1/SKILL.md" ] \
+  && ok "...leaving the checkout's prompt alone" || ko "pull emptied the checkout's prompt"
+expect "...while push republishes over it" 0 "republished to" -- run_sync push
+[ -s "$TMP/installed/$R1/SKILL.md" ] \
+  && ok "...restoring a real prompt" || ko "the installed prompt is still empty"
+
+# The control: a well-formed prompt with unusual but legal content passes, so the floor is not
+# just refusing everything. A CRLF first line counts, since a checkout can carry one.
+reset_trees; install_all
+printf -- '---\r\nname: %s\r\ndescription: a prompt with CRLF line endings\r\n---\r\n\r\nbody\r\n' \
+  "$R1" > "$REPO/routines/$R1/SKILL.md"
+expect "a CRLF prompt is still a prompt" 0 "pushed to" -- run_sync push
+expect "...and reads as in sync afterwards" 0 "all local routines in sync" -- run_sync
+reset_trees; install_all
+expect "...as does the ordinary one, which is the baseline for all of the above" 0 "in sync" -- run_sync
 
 # --- publishing keeps a readable prompt at every instant -----------------------------------------
 # The scheduler opens $dst/SKILL.md by the path the registry stores. The first draft removed the

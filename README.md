@@ -221,9 +221,11 @@ directory — that `push` replaces a symlinked installation with a real director
 through it, and that a destination reached through a link at any component *above* the routine
 directory is refused too: a symlinked `~/.claude` leaves every task directory real and the whole
 tree unreadable. It pins that a directory which exists and is
-still not a usable prompt — a link anywhere inside it, or no `SKILL.md` — is refused rather than
-certified in sync or pulled over the checkout, in both directions and before any branch that
-would publish it; that publishing replaces what stands in its way rather than following or
+still not a usable prompt — a link anywhere inside it, no `SKILL.md`, or a `SKILL.md` that is
+empty or carries no readable frontmatter — is refused rather than certified in sync or pulled over
+the checkout, in both directions and before any branch that would publish it, with a legal but
+unusual prompt (CRLF line endings) as the control that the floor is not simply refusing
+everything; that publishing replaces what stands in its way rather than following or
 entering it (a linked directory at either end, a directory or a link to one where `SKILL.md`
 belongs, a file where a directory belongs), checks every step, and reads its own
 result afterwards — that the destination now HOLDS the source, not merely that a `SKILL.md` is

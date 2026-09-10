@@ -64,8 +64,12 @@ reports the destination one, because the scheduler will not open a task file who
 a link however the sync went. It refuses an
 installed directory holding a link anywhere inside it, a linked `SKILL.md` included, which a plain
 `diff -r` would follow and call in sync. And `push` replaces a link rather than writing through
-it. It also refuses to `pull` from an installed directory with no `SKILL.md` —
-that is a leftover, not a routine, and taking it would delete the tracked prompt here. In the
+it. It also refuses to `pull` from an installed directory with no
+`SKILL.md` — that is a leftover, not a routine, and taking it would delete the tracked prompt
+here — and from one whose `SKILL.md` is empty or carries no readable frontmatter, which installs
+just as happily and leaves the scheduler a task with no description and no body. That last check
+is a floor, not a second copy of `check-prompts.sh`'s grammar: it asks only for what the loaders
+have to find. In the
 other direction `pull` is the repair, and reads on past a checkout prompt that is broken in any of
 those ways, a deleted routine directory and one linked out of the tree included: it restores them
 from a usable installed copy. `push`

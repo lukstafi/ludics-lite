@@ -106,7 +106,13 @@ hardcode a box name in this routine: read the file, and treat its absence exactl
 `~/.config/wake-lab/hosts.sh` in step 1 — the setup is the finding, nothing was swept, and it is
 notify-worthy (step 6):
 
-    box=$(cat ~/.config/ocannl-sweep/local-box) || { echo "no box ID at ~/.config/ocannl-sweep/local-box"; }
+    box=$(cat ~/.config/ocannl-sweep/local-box 2>/dev/null)
+    [ -n "$box" ] || { echo "no box ID at ~/.config/ocannl-sweep/local-box; nothing swept" >&2; exit 1; }
+
+If that fires, DO NOT launch the sweep. An empty `OCANNL_TOOL_SWEEP_LOCAL_BOX` is not "let the
+script decide": it dies with the same exit 2 as any other unusable environment, which reads like
+something the corrected relaunch below could fix and is not. Go straight to step 5 and report the
+missing site configuration as the finding, then notify in step 6.
 
 A typo in the file is caught by the script itself: it checks that every declared box has a sweep
 unit, so a misspelled local ID dies with `declared measurement box 'm4-max' has no sweep unit`.

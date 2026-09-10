@@ -135,7 +135,7 @@ first_symlinked_ancestor() {
 #     is a leftover, not a routine, and pulling from it would replace the checkout's prompt
 #     with nothing.
 prompt_problem() {
-  local dir=$1 link
+  local dir=$1 link first fm key
   # The two ways a prompt directory is not even a directory. Both matter on the SOURCE side,
   # where `pull` is the repair: a deleted routine and one someone linked out of the tree are
   # exactly what a pull should be able to restore from a usable installed copy.
@@ -157,6 +157,49 @@ prompt_problem() {
     printf 'has no SKILL.md, which is the file the registry names by path\n'
     return 0
   fi
+  # A regular file is not yet a prompt. An empty or frontmatter-less SKILL.md installs happily,
+  # compares equal to itself afterwards, and leaves the scheduler with a task whose description
+  # is blank and whose body is nothing -- the same quiet nothing-ran as an unreadable file, by a
+  # different route. This is a FLOOR, not a second copy of the frontmatter grammar:
+  # scripts/check-prompts.sh owns that, and owns it for the repository's prompts. What is
+  # checked here is what the loaders need to find at all.
+  if [ ! -s "$dir/SKILL.md" ]; then
+    printf 'has an EMPTY SKILL.md\n'
+    return 0
+  fi
+  # `read` rather than `head | grep`: no pipeline, so nothing can be SIGPIPEd. A CRLF checkout
+  # would otherwise fail on the invisible carriage return.
+  first=
+  IFS= read -r first < "$dir/SKILL.md" || true
+  first=${first%$'\r'}
+  case "$first" in
+    '---' | '--- ') ;;
+    *)
+      printf 'has a SKILL.md that does not open with a --- frontmatter fence\n'
+      return 0
+      ;;
+  esac
+  fm=$(awk '
+    NR == 1 { next }
+    /^---[[:space:]]*$/ { closed = 1; exit }
+    { print }
+    END { if (!closed) print "@@UNCLOSED@@" }
+  ' "$dir/SKILL.md")
+  case "$fm" in
+    *'@@UNCLOSED@@'*)
+      printf 'has a SKILL.md whose frontmatter is never closed by a second ---\n'
+      return 0
+      ;;
+  esac
+  for key in name description; do
+    case "$fm" in
+      *"$key:"*) ;;
+      *)
+        printf 'has a SKILL.md whose frontmatter carries no %s: line\n' "$key"
+        return 0
+        ;;
+    esac
+  done
   return 1
 }
 
