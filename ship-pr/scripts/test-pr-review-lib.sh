@@ -70,8 +70,11 @@
 # file names itself through LIB_BASENAME rather than spelling it. The last control is what keeps
 # that true — it runs a renamed copy for real and holds it to this file's own PASS list, so a name
 # spelled instead of derived fails here rather than under whoever next tries the route
-# (ludics-lite#101). `--inner-copy`, which that control passes, is the only argument this file
-# takes; it stops the copy from copying itself again.
+# (ludics-lite#101). The PASS list alone would not do it: what a refusal SAYS is checked by the
+# controls that provoke it, so `assert_refused` matches "$LIB_BASENAME: REFUSING" rather than the
+# bare word, and the renamed inner run is where a re-spelled prefix then fails. `--inner-copy`,
+# which that control passes, is the only argument this file takes — exactly, with no trailing
+# word, since a marker that could be typed past would skip that control in silence.
 
 TEST_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 TEST_LIB_FILE="$TEST_LIB_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -559,12 +562,17 @@ set -euo pipefail
 # `export` in a caller's shell can delete the control from an ordinary run and leave the file
 # reporting a PASS for a case that did nothing. Anything else on the command line is a typo, and
 # a typo that ran the whole suite anyway would look like the flag had been honoured.
+#
+# The COUNT is part of the match, not just the first word. Reading `$1` alone accepted
+# `--inner-copy typo`: the trailing word was ignored, the copy control skipped itself, and the run
+# reported all 19 PASS lines — the whole suite green with the one control it was told to refuse
+# silently missing, which is the failure this parser exists to prevent.
 LIB_INNER_RUN=""
-case "${1:-}" in
-"") ;;
---inner-copy) LIB_INNER_RUN=1 ;;
+case "$#:${1:-}" in
+"0:") ;;
+"1:--inner-copy") LIB_INNER_RUN=1 ;;
 *)
-  echo "$LIB_BASENAME: REFUSING to run: unknown argument '$1' (the only one is --inner-copy, which this file passes to a copy of itself)" >&2
+  echo "$LIB_BASENAME: REFUSING to run: expected no arguments, or exactly \`--inner-copy\` (which this file passes to a copy of itself); got $# argument(s): $*" >&2
   exit 2
   ;;
 esac
@@ -629,9 +637,17 @@ control_run() {
   CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
 }
 
+# The refusal is matched WITH the name the file gives itself — "$LIB_BASENAME: REFUSING", not the
+# bare word. Every refusal here opens with that prefix, and under a renamed copy the prefix is the
+# copy's name, so this one line is what pins the LIB_BASENAME rendering in every refusal a control
+# can reach: the early-definition guard, the shadow guard, and whatever refusal is added next.
+# Matching only "REFUSING" left those prefixes free to be spelled again — with the literal restored
+# in the early-definition refusal, the outer run and the renamed inner copy both passed all 19
+# cases, so the copy control's PASS-list equality was asserting less than it claimed.
 assert_refused() { # <msg>: the guard's refusal, with no case run
   assert_eq "$CONTROL_RC" 2 "$1: a refusal is exit 2 ($CONTROL_ERR)"
-  assert_contains "$CONTROL_ERR" "REFUSING" "$1: the refusal should say so"
+  assert_contains "$CONTROL_ERR" "$LIB_BASENAME: REFUSING" \
+    "$1: the refusal should say so, under the name the file goes by"
   assert_not_contains "$CONTROL_OUT" "PASS:" "$1: no case may run under a refusal"
 }
 
@@ -1010,8 +1026,8 @@ test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason() {
     >"$root/pr-review.sh"
   control_in "$root"
   assert_eq "$CONTROL_RC" 2 "a probe that cannot read the constants is a refusal, not a suite failure ($CONTROL_ERR)"
-  assert_contains "$CONTROL_ERR" "REFUSING to run: the probe that reads pr-review.sh's source-time constants" \
-    "the refusal should name what could not be read"
+  assert_contains "$CONTROL_ERR" "$LIB_BASENAME: REFUSING to run: the probe that reads pr-review.sh's source-time constants" \
+    "the refusal should name what could not be read, under the name the file goes by"
   assert_contains "$CONTROL_ERR" "missing dependency: frobnicator not found" \
     "and carry what the source itself said, which is the only thing that localizes it"
   assert_eq "$CONTROL_OUT" "" "nothing may run"
@@ -1061,8 +1077,14 @@ test_the_guard_survives_a_path_with_spaces() {
 # The inner run is given `--inner-copy` so it skips this case instead of copying itself forever.
 # It still reports a PASS line for it, so the two lists match exactly and a case silently lost
 # from the copy is a diff rather than a shorter list nobody counted.
+#
+# What the equality below pins is the PASS list; what pins the diagnostics is the inner run's own
+# controls, each of which asserts on the refusal it provoked. That is why `assert_refused` matches
+# the "$LIB_BASENAME: REFUSING" prefix: the copies of those refusals rendered in the renamed run
+# are the only place a re-spelled prefix shows up, and while it matched the bare word, restoring
+# the literal in the early-definition refusal left both runs green through all 19 cases.
 test_the_self_test_runs_from_a_renamed_copy() {
-  local root copy out err rc want
+  local root copy out err rc want bad
   [ -z "$LIB_INNER_RUN" ] || return 0
   test_tmpdir root renamed-copy
   copy="$root/lib-reverted.sh"
@@ -1077,6 +1099,22 @@ test_the_self_test_runs_from_a_renamed_copy() {
   assert_eq "$err" "" "and say nothing on stderr"
   want=$(printf 'PASS: %s\n' "${tests[@]}")
   assert_eq "$out" "$want" "the copy should report every case this file runs, in the same order"
+  # The marker's own guard, shown to refuse rather than assumed to. Reading `$1` alone accepted
+  # `--inner-copy typo` — the trailing word ignored, this case skipped, and all 19 PASS lines
+  # reported by a run that had silently dropped the one control the typo was meant to refuse.
+  # A run that skips a case must not be reachable by anything but the exact marker.
+  for bad in "--inner-copy typo" "--bogus" "--inner-copy --inner-copy"; do
+    set +e
+    # shellcheck disable=SC2086 # the point is to pass these as separate words
+    out=$(bash "$copy" $bad 2>"$root/err")
+    rc=$?
+    set -e
+    err=$(cat "$root/err")
+    assert_eq "$rc" 2 "\`$bad\` must be refused, not honoured ($err)"
+    assert_contains "$err" "lib-reverted.sh: REFUSING to run: expected no arguments" \
+      "the refusal should carry the COPY's name, which is the prefix a renamed run renders"
+    assert_eq "$out" "" "no case may run under a refused command line"
+  done
 }
 
 tests=(
