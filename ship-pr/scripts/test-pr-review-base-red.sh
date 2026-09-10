@@ -80,8 +80,12 @@ reset_fixture() {
   done
   JOBS_DEFAULT=$(jobs_json '[]')
   FAIL_ENDPOINT=""
-  BASE_JOBS_RUN=""
-  BASE_JOBS_OUT=""
+  BASE_JOBS_CACHE=""
+  BASE_RED_DETAIL=""
+  # The wait loop's clocks, for the one case that takes more than a single round.
+  ABSENT_GRACE=300
+  CHECKS_INTERVAL=1
+  CHECKS_HEARTBEAT=600
   : >"$REQUEST_LOG"
 }
 
@@ -122,7 +126,7 @@ gh() {
 run_base() {
   local capture rc
   set +e
-  capture=$(cmd_base "$BRANCH" 2>&1)
+  capture=$(cmd_base "$BRANCH" "$@" 2>&1)
   rc=$?
   set -e
   BASE_OUTPUT="$capture"
@@ -281,6 +285,32 @@ test_two_workflows_sharing_a_name_keep_their_streaks_apart() {
     "the second workflow's jobs must not be read off the first's run"
 }
 
+# `base --wait` re-reads and re-folds every round, so the jobs read is one call per round per red
+# workflow unless it is remembered. It was not, for one round of review: the caller took the
+# detail through a command substitution, and every cache record the function wrote died with that
+# subshell — a cache that could never hit, which is invisible except in the call count.
+test_a_standing_red_is_read_once_across_wait_rounds() {
+  reset_fixture
+  # The shape that keeps a wait going: the tip is still being judged, and the red standing behind
+  # it belongs to an older commit, so nothing breaks the loop early.
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" --arg a "$SHA_A" \
+    '[{status:"in_progress", conclusion:null, head_sha:$c, id:3041},
+      {conclusion:"failure", head_sha:$b, id:3040},
+      {conclusion:"success", head_sha:$a, id:3039}]')")
+  JOBS_3040=$(jobs_json '[{"name":"fixtures (macos)","conclusion":"failure"}]')
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a wait that ends with the tip unjudged is no verdict"
+  # Two reads of the runs feed prove the loop really went round more than once, which is what
+  # makes the single jobs read below evidence of anything.
+  local rounds
+  rounds=$(grep -c "actions/workflows/1/runs" "$REQUEST_LOG")
+  [ "$rounds" -ge 2 ] || bail "the wait should have polled more than once (got $rounds rounds)"
+  assert_eq "$(grep -c "actions/runs/3040/jobs" "$REQUEST_LOG")" 1 \
+    "the standing red's jobs should be read once, not once per round"
+  assert_contains "$BASE_OUTPUT" "failed job(s): fixtures (macos) (failure)" \
+    "the remembered line should still be printed on the rounds that did not read"
+}
+
 tests=(
   test_red_names_the_failing_job_and_the_first_red_commit
   test_a_window_of_only_reds_does_not_name_a_first_red_commit
@@ -289,6 +319,7 @@ tests=(
   test_a_red_run_with_no_red_job_says_so
   test_a_green_base_asks_for_no_jobs
   test_two_workflows_sharing_a_name_keep_their_streaks_apart
+  test_a_standing_red_is_read_once_across_wait_rounds
 )
 
 run_tests "${tests[@]}"

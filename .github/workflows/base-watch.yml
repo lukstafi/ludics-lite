@@ -59,6 +59,14 @@ jobs:
         run: |
           set -uo pipefail
           out="$RUNNER_TEMP/base.out"
+          # Plain `base`, not `base --wait`: at a scheduled minute a run in flight is ordinary
+          # traffic, not a finding. `--wait` holds for the CURRENT tip's verdict, so a push landing
+          # shortly before this run would either hold the job for a whole CI cycle (nine minutes
+          # here, and the macOS runner queue has run hours deep) or hit its ceiling and file "no
+          # verdict" for a build that was simply still running. What this check is for is a red
+          # nobody looked at, and the newest JUDGED run per workflow — what a worker branching off
+          # main is told at session start — is exactly that reading. When it trails the tip the
+          # report says which commit each verdict is about, and that goes into the issue.
           set +e
           ship-pr/scripts/pr-review.sh base "$GITHUB_REPOSITORY" main >"$out"
           rc=$?
@@ -127,7 +135,7 @@ jobs:
             ;;
           4)
             title="base watch: main's tip has no CI verdict"
-            what="reached no verdict for main's tip: no workflow has judged it, or the run that would have was stopped without judging. That is neither green nor red, and nothing stands behind main until it is one of them"
+            what="reached no verdict for main at all: no workflow has ever completed a push run on it, or the runs that did were stopped without judging and nothing behind them ever judged the branch. That is neither green nor red, and nothing stands behind main until it is one of them"
             again="Still without a verdict on $today"
             ;;
           *)

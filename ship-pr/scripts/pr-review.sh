@@ -2573,14 +2573,15 @@ encode_ref() {
 # running, until a grace expires (SHIP_PR_BASE_ABSENT_GRACE; paths-ignore means a docs-only push
 # legitimately never gets one, and only the grace separates "never coming" from "not yet"). A
 # red breaks the wait immediately: it is a verdict.
-# One red run's jobs, remembered across the polling rounds of `base --wait`: the run id of a
-# standing red does not change while the wait holds, and re-asking every 60 seconds would spend a
-# call per round to print the same line.
-BASE_JOBS_RUN=""
-BASE_JOBS_OUT=""
+# The red runs whose jobs have already been read, one "<run id><TAB><the line>" record per line.
+# `base --wait` re-folds every round, so without this a standing red would spend one jobs call per
+# round — per red workflow — to print the line it printed last time. A LIST rather than one slot
+# because two red workflows alternate run ids, and a single slot would miss on every read.
+BASE_JOBS_CACHE=""
 
 # base_red_detail <workflow-id> <unfolded run rows>: the two facts a CI-red owner asks for first,
-# printed as indented notes under the RED line — WHICH job failed, and WHERE the red started
+# left in BASE_RED_DETAIL as indented notes for the RED line — WHICH job failed, and WHERE the red
+# started
 # (ludics-lite#73: main was red for a day on a job nobody had named, because what reads a base's
 # health reported the workflow and the newest failing run, and an owner still had to open the run
 # and walk the branch back by hand to find the commit that broke it).
@@ -2590,8 +2591,16 @@ BASE_JOBS_OUT=""
 # whose failure prints UNKNOWN and leaves the red standing. Turning a red base into exit 3 because
 # a second call fell over would be the worst trade in this file — the caller would retry a fact
 # that was already established.
+#
+# The result comes back in a variable rather than on stdout because the cache above has to
+# OUTLIVE the call: `detail=$(base_red_detail …)` would run the whole function in a subshell, and
+# every record it added to the cache would die with it — the cache would read empty on every
+# round and the call it exists to save would be made anyway (review round 1).
+BASE_RED_DETAIL=""
 base_red_detail() {
   local wfid="$1" rows="$2" indent='           '
+  local cached line
+  BASE_RED_DETAIL=""
   local c_wf c_name c_status c_concl c_sha c_when c_url c_id
   local jname jconcl jobs jrc run_id="" first_sha="" first_when="" reds=0 bounded=0 failed=""
   # Newest-first, the order the API returns and the fold relies on. A stopped-not-judged run
@@ -2618,22 +2627,26 @@ base_red_detail() {
     esac
   done <<<"$rows"
   # Called only under a red verdict, so this is a contradiction rather than a quiet nothing: say
-  # nothing rather than print a "first red" the rows do not support.
+  # nothing rather than report a "first red" the rows do not support.
   [ "$reds" -gt 0 ] || return 0
   if [ "$bounded" -eq 1 ]; then
-    printf '%sred since %s (run created %s), %d run(s) back; the judged run before it was not red\n' \
+    printf -v BASE_RED_DETAIL \
+      '%sred since %s (run created %s), %d run(s) back; the judged run before it was not red\n' \
       "$indent" "${first_sha:0:8}" "$first_when" "$reds"
   else
     # The window is the newest runs of this workflow on this branch, not its whole history: with
     # no green under the streak the first red commit is NOT known, and saying so is the point —
     # an owner told "red since <the oldest run the page happened to hold>" would start bisecting
     # from the wrong end.
-    printf '%sred for all %d judged run(s) in the window, back to %s (run created %s) — the window holds no\n%sgreen under it, so the red may start further back\n' \
+    printf -v BASE_RED_DETAIL \
+      '%sred for all %d judged run(s) in the window, back to %s (run created %s) — the window holds no\n%sgreen under it, so the red may start further back\n' \
       "$indent" "$reds" "${first_sha:0:8}" "$first_when" "$indent"
   fi
   case "$run_id" in '' | *[!0-9]*) return 0 ;; esac
-  if [ "$run_id" = "$BASE_JOBS_RUN" ]; then
-    printf '%s' "$BASE_JOBS_OUT"
+  cached=$(awk -F'\t' -v r="$run_id" '$1 == r { sub(/^[^\t]*\t/, ""); print; exit }' \
+    <<<"$BASE_JOBS_CACHE")
+  if [ -n "$cached" ]; then
+    BASE_RED_DETAIL="${BASE_RED_DETAIL}${cached}"$'\n'
     return 0
   fi
   jobs=$(gh_retry read api --paginate "repos/$REPO/actions/runs/$run_id/jobs?per_page=100" \
@@ -2641,8 +2654,9 @@ base_red_detail() {
   jrc=$?
   # Not cached: the next round may reach the API.
   [ "$jrc" -eq 0 ] || {
-    printf '%swhich job failed is UNKNOWN (%s) — the red above stands; open the run\n' \
+    printf -v line '%swhich job failed is UNKNOWN (%s) — the red above stands; open the run' \
       "$indent" "$(gh_err_line)"
+    BASE_RED_DETAIL="${BASE_RED_DETAIL}${line}"$'\n'
     return 0
   }
   while IFS=$'\t' read -r jname jconcl; do
@@ -2650,19 +2664,19 @@ base_red_detail() {
     [ "$(conclusion_class "$jconcl")" = red ] && failed="${failed}${failed:+, }$jname ($jconcl)"
   done <<<"$jobs"
   if [ -n "$failed" ]; then
-    BASE_JOBS_OUT="${indent}failed job(s): $failed"$'\n'
+    line="${indent}failed job(s): $failed"
   else
     # A run can conclude red with no red job: startup_failure, or a failure raised outside the
     # jobs (a matrix that could not expand). Naming that is more use than an empty list.
-    BASE_JOBS_OUT="${indent}no job in that run concluded red — a startup or workflow-level failure"$'\n'
+    line="${indent}no job in that run concluded red — a startup or workflow-level failure"
   fi
-  BASE_JOBS_RUN="$run_id"
-  printf '%s' "$BASE_JOBS_OUT"
+  BASE_JOBS_CACHE="${BASE_JOBS_CACHE}${run_id}"$'\t'"${line}"$'\n'
+  BASE_RED_DETAIL="${BASE_RED_DETAIL}${line}"$'\n'
 }
 
 cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
-  local allruns="" wfid detail
+  local allruns="" wfid
   local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
   local nogo_at_tip=0 last_tip="" grace_from confirm wf="" wid wname part sleep_for remaining
   local norun=0 tip_seen_at tip_age hold ebranch
@@ -2813,8 +2827,8 @@ cmd_base() {
           out="${out}  RED      $name — $concl at ${csha:0:8} ($cwhen)  $curl"$'\n'
           # WHICH job, and SINCE WHEN: what an owner of the red needs before anything else, and
           # what the run-level line above cannot say (ludics-lite#73).
-          detail=$(base_red_detail "$wfid" "$allruns")
-          [ -z "$detail" ] || out="${out}${detail}"$'\n'
+          base_red_detail "$wfid" "$allruns"
+          out="${out}${BASE_RED_DETAIL}"
           ;;
         green) out="${out}  green    $name — $concl at ${csha:0:8}"$'\n' ;;
         pending)
