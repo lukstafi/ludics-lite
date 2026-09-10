@@ -51,10 +51,18 @@ scripts/sync-routines.sh pull   # ~/.claude/scheduled-tasks -> this checkout, th
 `push` also converts a directory left over from the symlink era. Edit a prompt here and `push`; if
 an edit lands in the installed copy instead -- a routine's own run editing its prompt in place --
 `pull` it back and commit, rather than letting the two drift. `status` exits 1 on any drift, which
-is what makes it worth running after a merge that touched a prompt. It refuses outright, in any
-mode, when `~/.claude/scheduled-tasks` is itself reached through a symlink at any component: the
-task directories under it would each be real while nothing could read a single one of them, which
-is the same quiet failure by a longer path.
+is what makes it worth running after a merge that touched a prompt.
+
+The script is unforgiving about symlinks in three places, because the scheduler is: it refuses,
+in any mode, when `~/.claude/scheduled-tasks` is itself reached through a link at any component
+(the task directories under it would each be real while nothing could read one of them); it
+refuses an installed directory holding a link anywhere inside it, a linked `SKILL.md` included,
+which a plain `diff -r` would follow and call in sync; and `push` replaces a link rather than
+writing through it. It also refuses to `pull` from an installed directory with no `SKILL.md` —
+that is a leftover, not a routine, and taking it would delete the tracked prompt here. `push`
+publishes file by file, staging each inside the destination and renaming it onto its final name,
+so a dispatch that lands mid-push always finds a whole prompt: never a missing one, never a
+half-written one.
 
 The script only touches the rows above whose Kind is `local scheduled task`, never the cloud
 routine below, and its `LOCAL_ROUTINES` list is exactly those rows -- pinned by

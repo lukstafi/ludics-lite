@@ -12,6 +12,13 @@
 #     through a symlink, quietly), and that a destination reached through a link at any component
 #     ABOVE the routine directory is refused too, with the same trees under their real path as
 #     the control;
+#   - that a directory which EXISTS and is still not a usable prompt -- a symlink anywhere
+#     inside it, or no SKILL.md -- is refused rather than certified in sync or pulled over the
+#     checkout, in both directions;
+#   - that a push never leaves the installed prompt absent or half-written, sampled by a reader
+#     running flat out across one, with a control that the reader can report an absence;
+#   - that two modes in one invocation are a usage error, since push and pull write in opposite
+#     directions and the last token used to win;
 #   - that --dry-run copies nothing, in every mode, and still says what it would do;
 #   - the usage exits: an unknown argument is 2, --help prints the header;
 #   - that LOCAL_ROUTINES lists exactly the routines/README.md rows whose Kind is
@@ -296,6 +303,151 @@ expect "pull behind a symlinked root warns but proceeds" 0 "pulling anyway" -- l
 grep -q 'mid-run' "$REPO/routines/$R1/SKILL.md" \
   && ok "...taking the edit, since the content behind the link is real" \
   || ko "pull behind the link took nothing"
+
+# --- an installed directory that exists and is not a usable prompt -------------------------------
+# `-L "$dst"` sees only the routine's own directory and `diff -r` FOLLOWS a link, so an installed
+# SKILL.md that is a link to the byte-identical checkout file used to read as "in sync" over an
+# installation the scheduler refuses. And a directory whose SKILL.md was deleted used to read as
+# drift and be PULLED, deleting the checkout's tracked prompt.
+reset_trees; install_all
+rm -f "$TMP/installed/$R1/SKILL.md"
+ln -s "$REPO/routines/$R1/SKILL.md" "$TMP/installed/$R1/SKILL.md"
+expect "status refuses an installed SKILL.md that is a symlink" 1 "holds a symlink" -- run_sync
+printf '%s' "$out" | grep -q "^$R1: in sync" \
+  && ko "it still called $R1 in sync while following the link -- $out" \
+  || ok "...rather than following it into an in-sync verdict"
+# The control: the same trees with a real, byte-identical SKILL.md ARE in sync, so the refusal is
+# the link's doing and not the fixture's.
+reset_trees; install_all
+expect "...while the identical bytes as a real file are in sync" 0 "all local routines in sync" -- run_sync
+
+reset_trees; install_all
+rm -f "$TMP/installed/$R1/SKILL.md"
+ln -s "$REPO/routines/$R1/SKILL.md" "$TMP/installed/$R1/SKILL.md"
+expect "push republishes over a symlinked prompt file" 0 "republished to" -- run_sync push
+[ -f "$TMP/installed/$R1/SKILL.md" ] && [ ! -L "$TMP/installed/$R1/SKILL.md" ] \
+  && ok "...leaving a real file the scheduler can open" \
+  || ko "the installed SKILL.md is still a symlink after push"
+expect "...and status is clean afterwards" 0 "all local routines in sync" -- run_sync
+
+reset_trees; install_all
+rm -f "$TMP/installed/$R1/SKILL.md"
+ln -s "$REPO/routines/$R1/SKILL.md" "$TMP/installed/$R1/SKILL.md"
+expect "pull refuses a symlinked installed prompt" 1 "refusing to pull from it" -- run_sync pull
+grep -q 'body v1' "$REPO/routines/$R1/SKILL.md" \
+  && ok "...leaving the checkout's prompt alone" || ko "pull mangled the checkout"
+
+# A nested link, to show the check is about the whole tree and not about SKILL.md alone.
+reset_trees; install_all
+mkdir -p "$TMP/installed/$R1/refs"
+ln -s "$REPO/routines/$R1/SKILL.md" "$TMP/installed/$R1/refs/copy.md"
+expect "status refuses a link nested deeper in the installed directory" 1 "holds a symlink" -- run_sync
+
+# The other way a directory exists and is not a prompt.
+reset_trees; install_all
+rm -f "$TMP/installed/$R1/SKILL.md"
+expect "status refuses an installed directory with no SKILL.md" 1 "has no SKILL.md" -- run_sync
+expect "...and pull refuses to take it" 1 "refusing to pull from it" -- run_sync pull
+[ -f "$REPO/routines/$R1/SKILL.md" ] \
+  && ok "...so the checkout's tracked prompt survives" \
+  || ko "pull deleted $REPO/routines/$R1/SKILL.md"
+expect "...while push republishes into it" 0 "republished to" -- run_sync push
+[ -f "$TMP/installed/$R1/SKILL.md" ] \
+  && ok "...restoring the prompt" || ko "push did not restore the installed SKILL.md"
+
+# The same reader over the checkout side: pushing a broken prompt is refused, pulling onto it is
+# the repair and is allowed.
+reset_trees; install_all
+rm -f "$REPO/routines/$R1/SKILL.md"
+expect "push refuses a checkout directory with no SKILL.md" 1 "refusing to install it" -- run_sync push
+grep -q 'body v1' "$TMP/installed/$R1/SKILL.md" \
+  && ok "...leaving the installed prompt alone" || ko "the refused push wrote to the installed copy"
+expect "...while pull onto it is allowed, since that is the repair" 0 "pulled into" -- run_sync pull
+[ -f "$REPO/routines/$R1/SKILL.md" ] \
+  && ok "...restoring the checkout's prompt" || ko "pull did not restore $REPO/routines/$R1/SKILL.md"
+
+# --- publishing keeps a readable prompt at every instant -----------------------------------------
+# The scheduler opens $dst/SKILL.md by the path the registry stores. The first draft removed the
+# directory and moved a staged one into place, so a dispatch between the two saw no path at all --
+# the same silent stale-dispatch failure the script exists to prevent. Files are staged inside the
+# destination and renamed onto their final names instead, so the prompt is never absent.
+reset_trees; install_all
+# A reader running flat out across a SERIES of pushes: every sample must find the file, and must
+# read it as one whole version or the other, never as a partial write or an absence. One push is
+# over too quickly to sample meaningfully.
+watcher_log="$TMP/reader.log"
+: > "$watcher_log"
+rm -f "$TMP/reader.stop"
+( while [ ! -f "$TMP/reader.stop" ]; do
+    if [ -f "$TMP/installed/$R1/SKILL.md" ]; then
+      if grep -q 'body v[12]$' "$TMP/installed/$R1/SKILL.md" 2>/dev/null; then printf 'whole\n'
+      else printf 'PARTIAL\n'; fi
+    else
+      printf 'MISSING\n'
+    fi
+  done >> "$watcher_log" ) &
+watcher=$!
+i=0
+while [ "$i" -lt 12 ]; do
+  if [ $((i % 2)) -eq 0 ]; then v=2; else v=1; fi
+  printf -- '---\nname: %s\ndescription: scratch prompt for %s\n---\n\nbody v%s\n' \
+    "$R1" "$R1" "$v" > "$REPO/routines/$R1/SKILL.md"
+  run_sync push >/dev/null 2>&1
+  i=$((i + 1))
+done
+: > "$TMP/reader.stop"
+wait "$watcher" 2>/dev/null
+samples=$(grep -c . "$watcher_log" 2>/dev/null || echo 0)
+[ "${samples:-0}" -gt 20 ] \
+  && ok "the reader sampled the installed prompt $samples times across 12 pushes" \
+  || ko "only ${samples:-0} samples taken -- too few for the absence check below to mean anything"
+grep -q 'MISSING' "$watcher_log" \
+  && ko "the prompt was absent during a push: a dispatch in that window reads nothing" \
+  || ok "...and never once found it absent"
+grep -q 'PARTIAL' "$watcher_log" \
+  && ko "the reader saw a half-written prompt during a push" \
+  || ok "...nor half-written: every sample was one whole version"
+rm -f "$TMP/reader.stop"
+# The negative control on the reader itself: with the prompt genuinely removed it must say MISSING,
+# or the verdict above is a check that cannot fail.
+: > "$watcher_log"
+( while [ ! -f "$TMP/reader.stop" ]; do
+    if [ -f "$TMP/installed/$R1/SKILL.md" ]; then printf 'present\n'; else printf 'MISSING\n'; fi
+  done >> "$watcher_log" ) &
+watcher=$!
+rm -rf "$TMP/installed/$R1"
+sleep 1
+: > "$TMP/reader.stop"
+wait "$watcher" 2>/dev/null
+grep -q 'MISSING' "$watcher_log" \
+  && ok "the reader reports MISSING when the prompt really is gone, so the check above can fail" \
+  || ko "the reader never noticed a removed prompt -- the absence verdict above means nothing"
+rm -f "$TMP/reader.stop"
+
+# Publishing also prunes what the source no longer has, or a stale file outlives its prompt.
+reset_trees; install_all
+printf 'stale\n' > "$TMP/installed/$R1/leftover.md"
+expect "push prunes a file the checkout no longer has" 0 "pushed to" -- run_sync push
+[ ! -e "$TMP/installed/$R1/leftover.md" ] \
+  && ok "...removing it" || ko "leftover.md survived the push"
+[ -f "$TMP/installed/$R1/SKILL.md" ] \
+  && ok "...while the prompt itself stays" || ko "the push pruned SKILL.md too"
+
+# --- one mode per invocation ---------------------------------------------------------------------
+# `pull push` used to run a push, overwriting the installed edits the caller asked to recover.
+reset_trees; install_all
+printf 'body v2 -- the edit the caller wants back\n' >> "$TMP/installed/$R1/SKILL.md"
+expect "two modes in one invocation are refused with exit 2" 2 "only one mode may be given" -- \
+  run_sync pull push
+grep -q 'the edit the caller wants back' "$TMP/installed/$R1/SKILL.md" \
+  && ok "...before either direction is written" \
+  || ko "the refused invocation still overwrote the installed edit"
+printf '%s' "$out" | grep -q 'opposite directions' \
+  && ok "...saying why the last token must not win" || ko "no reason given -- $out"
+expect "...in the other order too" 2 "only one mode may be given" -- run_sync push pull
+expect "...and a repeated mode is refused as well" 2 "only one mode may be given" -- run_sync push push
+# The control: one mode with the same flags still works, so the refusal is about the second mode.
+expect "...while one mode with its flags is accepted" 0 "would pull" -- run_sync pull --dry-run
 
 # --- the pin: LOCAL_ROUTINES vs the routines table ----------------------------------------------
 # ludics-lite#77: nothing said that the install loop lists exactly the rows whose Kind is `local

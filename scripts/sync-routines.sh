@@ -54,11 +54,22 @@ src_root="$repo_root/routines"
 dest_root="${CLAUDE_SCHEDULED_TASKS_DIR:-$HOME/.claude/scheduled-tasks}"
 
 mode=status
+mode_given=
 dry_run=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    push|pull|status) mode=$1 ;;
+    push|pull|status)
+      # `pull push` used to run a push, silently discarding the installed edits the caller
+      # asked to recover: the two write in OPPOSITE directions, so the last token winning is
+      # the worst possible tie-break. One mode per invocation.
+      if [ -n "$mode_given" ]; then
+        echo "sync-routines: only one mode may be given, got '$mode_given' then '$1'; push and pull write in opposite directions (try --help)" >&2
+        exit 2
+      fi
+      mode_given=$1
+      mode=$1
+      ;;
     -n|--dry-run) dry_run=true ;;
     -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "sync-routines: unknown argument: $1 (try --help)" >&2; exit 2 ;;
@@ -93,15 +104,71 @@ first_symlinked_ancestor() {
   return 1
 }
 
-# Replace dst with a copy of src, atomically enough that a dispatch mid-copy sees either the
-# old directory or the new one.
-copy_dir() {
-  local src=$1 dst=$2 tmp
-  tmp="$dst.sync-$$"
-  rm -rf "$tmp"
-  cp -R "$src" "$tmp"
-  rm -rf "$dst"
-  mv "$tmp" "$dst"
+# prompt_problem <dir>: says why <dir> is not a usable prompt directory, or exits 1 saying
+# nothing. Two ways a directory that EXISTS still is not one, and neither is visible to the
+# `-L` test on the directory itself or to the `diff -r` comparison below:
+#   - a symlink anywhere inside it. The scheduler's rule is about every component of the path,
+#     so a linked SKILL.md is as unreadable as a linked directory -- and `diff -r` follows the
+#     link and reports the trees identical, which is a green verdict over an installation
+#     nothing can open.
+#   - no regular SKILL.md. That is the file the registry names by path; a directory without one
+#     is a leftover, not a routine, and pulling from it would replace the checkout's prompt
+#     with nothing.
+prompt_problem() {
+  local dir=$1 link
+  link=$(find "$dir" -type l -print 2>/dev/null | head -n 1)
+  if [ -n "$link" ]; then
+    printf 'holds a symlink (%s -> %s), and the scheduler refuses any component of the path\n' \
+      "$link" "$(readlink "$link")"
+    return 0
+  fi
+  if [ ! -f "$dir/SKILL.md" ]; then
+    printf 'has no SKILL.md, which is the file the registry names by path\n'
+    return 0
+  fi
+  return 1
+}
+
+# publish_dir <src> <dst>: make dst's contents match src's, keeping a readable prompt at dst
+# throughout. A directory cannot be swapped atomically on POSIX -- rename(2) replaces a directory
+# only when the target is an empty one -- and the `rm -rf "$dst"; mv tmp "$dst"` pair this started
+# as left a window in which the registry's path did not exist at all. A dispatch landing in that
+# window cannot open SKILL.md, which is precisely the silent stale-dispatch failure this script
+# exists to prevent. So each FILE is staged beside its final name inside dst and renamed onto it,
+# which rename(2) does make atomic, and only then is what src no longer has removed. A file is
+# therefore never absent, only briefly old.
+#
+# Paths are read from `find` a line at a time, so a newline in a routine's filename would split;
+# these trees are a checkout's tracked prompts and a scheduler's copies of them.
+publish_dir() {
+  local src=$1 dst=$2
+  mkdir -p "$dst"
+  # Directories first, so a file's parent exists when the file is staged.
+  find "$src" -type d -print | while IFS= read -r d; do
+    rel=${d#"$src"}; rel=${rel#/}
+    [ -n "$rel" ] || continue
+    mkdir -p "$dst/$rel"
+  done
+  find "$src" -type f -print | while IFS= read -r f; do
+    rel=${f#"$src"}; rel=${rel#/}
+    tmp="$dst/$(dirname "$rel")/.sync-$$-$(basename "$rel")"
+    cp "$f" "$tmp"
+    # Over a symlink too: rename(2) replaces the NAME, so a linked SKILL.md becomes a real file
+    # rather than being written through.
+    mv -f "$tmp" "$dst/$rel"
+  done
+  # Then what src no longer has. Files and links (`! -type d` catches both -- find does not
+  # follow links), then the directories that are left empty, deepest first.
+  find "$dst" ! -type d -print | while IFS= read -r f; do
+    rel=${f#"$dst"}; rel=${rel#/}
+    case "$rel" in .sync-$$-* | */.sync-$$-*) continue ;; esac
+    [ -e "$src/$rel" ] || rm -f "$f"
+  done
+  find "$dst" -type d -print | sort -r | while IFS= read -r d; do
+    rel=${d#"$dst"}; rel=${rel#/}
+    [ -n "$rel" ] || continue
+    [ -d "$src/$rel" ] || rmdir "$d" 2>/dev/null || true
+  done
 }
 
 drift=0      # status only: the checkout and the installed copies disagree
@@ -131,7 +198,8 @@ if link=$(first_symlinked_ancestor "$dest_root"); then
 fi
 
 # A push onto a box whose scheduled-tasks directory does not exist yet has to create it, or
-# copy_dir's `mv` lands nowhere. Status and pull read, so they leave the filesystem alone.
+# publish_dir's `mkdir -p` lands nowhere. Status and pull read, so they leave the filesystem
+# alone.
 if [ "$mode" = push ] && ! $dry_run; then
   mkdir -p "$dest_root"
 fi
@@ -154,7 +222,7 @@ for r in $LOCAL_ROUTINES; do
           say "$r: would replace the symlink with a real directory"
         else
           rm -f "$dst"
-          copy_dir "$src" "$dst"
+          publish_dir "$src" "$dst"
           say "$r: symlink replaced with a real copy"
           copied=$((copied + 1))
         fi
@@ -180,7 +248,7 @@ for r in $LOCAL_ROUTINES; do
         if $dry_run; then
           say "$r: would install $src -> $dst"
         else
-          copy_dir "$src" "$dst"
+          publish_dir "$src" "$dst"
           say "$r: prompt installed at $dst"
           say "$r: if the desktop app does not list this task, register it -- a prompt no registry"
           say "$r: entry names never fires, and this script cannot see the registry either way"
@@ -189,6 +257,45 @@ for r in $LOCAL_ROUTINES; do
         ;;
       pull)
         warn "$r: nothing to pull -- there is no installed prompt to take"
+        problems=1
+        ;;
+      *) drift=1 ;;
+    esac
+    continue
+  fi
+
+  # Both sides exist. Either can still be a directory that is not a usable prompt, and the
+  # comparison below would not notice: `diff -r` follows a symlink, and it says nothing at all
+  # about a SKILL.md that is missing from both sides.
+  if src_problem=$(prompt_problem "$src"); then
+    warn "$r: $src $src_problem"
+    case "$mode" in
+      pull) : ;;  # pulling is what repairs the checkout; let it run
+      push)
+        warn "$r: refusing to install it -- fix the prompt in this checkout first"
+        problems=1
+        continue
+        ;;
+      *) drift=1; continue ;;
+    esac
+  fi
+
+  if dst_problem=$(prompt_problem "$dst"); then
+    warn "$r: the installed prompt at $dst $dst_problem"
+    case "$mode" in
+      push)
+        # Republishing over it IS the repair, and it must happen whatever the comparison below
+        # would have said.
+        if $dry_run; then
+          say "$r: would republish $src -> $dst"
+        else
+          publish_dir "$src" "$dst"
+          say "$r: republished to $dst"
+          copied=$((copied + 1))
+        fi
+        ;;
+      pull)
+        warn "$r: refusing to pull from it -- that would replace the checkout's prompt with an unusable copy"
         problems=1
         ;;
       *) drift=1 ;;
@@ -211,7 +318,7 @@ for r in $LOCAL_ROUTINES; do
       if $dry_run; then
         say "$r: would push $src -> $dst"
       else
-        copy_dir "$src" "$dst"
+        publish_dir "$src" "$dst"
         say "$r: pushed to $dst"
         copied=$((copied + 1))
       fi
@@ -220,7 +327,7 @@ for r in $LOCAL_ROUTINES; do
       if $dry_run; then
         say "$r: would pull $dst -> $src"
       else
-        copy_dir "$dst" "$src"
+        publish_dir "$dst" "$src"
         say "$r: pulled into $src -- review it with git diff"
         copied=$((copied + 1))
       fi
