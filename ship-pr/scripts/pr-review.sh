@@ -587,11 +587,41 @@ mark_of() {
 # interpolation takes the whole string with it: the comment would not be rendered at all, which
 # on the initialization failure (the one summary that never carries the stamp) is a round
 # silently disappearing from the watch that was waiting for it.
+#
+# `fold_inline` is the last of these: the reviewer sometimes posts the SAME finding as several
+# inline threads, identical in path, line and body (round 11 of ludics-lite#66 posted nine threads
+# for four findings, ludics-lite#76), and each duplicate then costs its own composed reply and its
+# own resolve. The fold groups such threads into one entry whose `thread_ids` lists every one of
+# them, anchor first, and the rendering and the index both address it by that list (`id=900+901`)
+# — the token `reply` and `resolve` take, so what poll printed is what the caller pastes back.
+#
+# What may fold is exactly what renders IDENTICALLY: the key is every field the entry's header and
+# body show — path, line, body, commit stamp and author — so a folded entry prints what its members
+# would each have printed, and the fold cannot hide a difference the caller was meant to see. The
+# commit stamp is in the key for a second reason: it is what `watch` classifies an item by, and
+# folding across two stamps would force one head verdict onto two different associations.
+# Grouping is by the key's `tojson` — a STRING — because jq's `index` on an array argument searches
+# for a sub-SEQUENCE rather than an element, so a key kept as an array would match its neighbours'
+# prefixes. Order is the feed's: `group_by` sorts by key, and `pos` (each group's first member's
+# index) puts the entries back in the order they arrived, so folding does not reshuffle a round.
 POLL_ITEM_DEFS='
   def short: if (. // "") == "" then "-" else .[0:7] end;
   def item_stamp($re): ([(.body // "") | capture($re; "g").s] | last) | short;
   def inline_commit: (.original_commit_id // .commit_id) | short;
   def review_commit: .commit_id | short;
+  def item_path: .path // "?";
+  def item_line: .line // .original_line // 0;
+  def fold_key: [item_path, item_line, (.body // ""), inline_commit, (.user.login // "")];
+  def fold_inline:
+    [to_entries[] | {i: .key, k: (.value | fold_key | tojson), v: .value}]
+    | group_by(.k)
+    | map(sort_by(.i) | {pos: .[0].i, ids: [.[].v.id], v: .[0].v})
+    | sort_by(.pos)
+    | map(.v + {thread_ids: .ids});
+  def thread_ids: .thread_ids // [.id];
+  def thread_list: thread_ids | map(tostring) | join("+");
+  def dupe_note: (thread_ids | length) as $n
+    | if $n > 1 then " (\($n) identical threads, one reply answers all)" else "" end;
 '
 
 # Exits 3, and prints no watermark, when any feed failed to read: an unwritten watermark keeps the
@@ -650,11 +680,15 @@ cmd_poll() {
   # of the head is caught by its review even if none of its comments were.
   # Each feed's new items are filtered ONCE, into an array that is then both rendered and indexed
   # (the `items:` line below), so the index cannot drift from what was printed — and so the fold
-  # of duplicate threads (ludics-lite#76) has one place to sit.
+  # of duplicate threads (`fold_inline`, ludics-lite#76) has ONE place to sit: it happens here,
+  # once, and the rendering and the index below read its output. A folded entry is still one
+  # finding for `watch` (it counts entries, not threads) and the watermark is untouched — that is
+  # computed from the UNFILTERED feed below, so every duplicate's id is still advanced past.
+  # `rounds` reads its own feeds and never these, so the round count is untouched too.
   local new_inline new_issue new_reviews
-  new_inline=$(jq --arg rev "$REVIEWER" --argjson since "$m_inline" \
-    'map(select((.user.login // "") | startswith($rev)) | select(.id > $since))' <<<"$inline") ||
-    return 4
+  new_inline=$(jq --arg rev "$REVIEWER" --argjson since "$m_inline" "$POLL_ITEM_DEFS"'
+    map(select((.user.login // "") | startswith($rev)) | select(.id > $since)) | fold_inline' \
+    <<<"$inline") || return 4
   new_issue=$(jq --arg rev "$REVIEWER" --argjson since "$m_issue" \
     'map(select((.user.login // "") | startswith($rev)) | select(.id > $since)
          | select((.body // "") | test("codex-pull-request-review-summary") | not))' <<<"$issue") ||
@@ -665,7 +699,7 @@ cmd_poll() {
 
   jq -r "$POLL_ITEM_DEFS"'
     if length == 0 then "(no new inline comments)"
-    else .[] | "--- inline id=\(.id) \(.path // "?"):\(.line // .original_line // 0) commit=\(inline_commit) by \(.user.login)\n\(.body)"
+    else .[] | "--- inline id=\(thread_list) \(item_path):\(item_line) commit=\(inline_commit) by \(.user.login)\(dupe_note)\n\(.body)"
     end' <<<"$new_inline"
 
   # The connector's "Review Summary" placeholder is machine-tagged with an HTML comment and posted
@@ -696,7 +730,7 @@ cmd_poll() {
   # Read it as the watermark is read, the LAST match: it is emitted after every body, so a body
   # that quotes one of these lines cannot displace it.
   echo "items: $(
-    jq -r "$POLL_ITEM_DEFS"'[.[] | "inline:\(.id):\(inline_commit):\(.user.login):-"] | join(" ")' \
+    jq -r "$POLL_ITEM_DEFS"'[.[] | "inline:\(thread_list):\(inline_commit):\(.user.login):-"] | join(" ")' \
       <<<"$new_inline"
   ) $(
     jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
