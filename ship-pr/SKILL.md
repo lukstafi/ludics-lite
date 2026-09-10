@@ -593,9 +593,14 @@ signal without acting on it, such as before asking the reviewer for another roun
 FAILURE carries no HTTP status, so a retry loop reads a workflow verdict as transport — the
 2026-08-29 wave re-watched a completed FAILED run four times and then reported "the API never
 answered". Use `checks <pr> --wait` for a PR's build signal (it reads every check on the head,
-with a heartbeat instead of redraws). For a single run addressed by id, `retry run watch
-<run-id>` is safe: the script does not forward it to gh but executes a quiet await — one verdict
-line; run FAILED is exit 1, transport exit 3, no verdict exit 4.
+with a heartbeat instead of redraws). For a single run, `retry run watch
+<owner>/<repo>#<run-id>` is safe: the script does not forward it to gh but executes a quiet await
+— one verdict line; run FAILED is exit 1, transport exit 3, no verdict exit 4. Name the repo in
+the argument here for the same reason as everywhere else, and with one more tooth: the await does
+not infer it from the cwd at all (ludics-lite#74 — a background shell that had started in another
+project's worktree awaited a run id from this one, and the 404 came back as a verdict about the
+run). A bare id is accepted only with `-R owner/name` or `REPO=`, and refused with exit 2
+otherwise; a run/repo pair the API rejects is exit 2 too, never the exit 1 that reads as red.
 
 ### How stale the base has grown
 
