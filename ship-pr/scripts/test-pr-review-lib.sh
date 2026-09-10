@@ -44,7 +44,7 @@
 # and, respectively, redefine an undeclared library function (the ludics-lite#46 shape itself,
 # a reporter named `fail`), declare a stub and honour it, declare one and do not, stub a name the
 # library lacks, redefine one of this file's own helpers, and define a function before sourcing.
-# The negative controls are what prove the guard can fail; CI runs it beside the eight suites.
+# The negative controls are what prove the guard can fail; CI runs it beside the nine suites.
 
 TEST_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 TEST_LIB_FILE="$TEST_LIB_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -129,6 +129,10 @@ gh_fixture_parse() {
       shift || true
       ;;
     --paginate) FIXTURE_PAGINATE=1 ;;
+    # The options that carry a VALUE, consumed with it. Without this the `POST` of a `gh api -X
+    # POST repos/...` became the endpoint (it is the first argument that does not start with a
+    # dash), so a suite over the writing commands addressed every call to "POST".
+    -X | --method | -f | --field | -F | --raw-field | -H | --header) shift || true ;;
     -*) ;;
     *) [ -n "$FIXTURE_ENDPOINT" ] || FIXTURE_ENDPOINT="$arg" ;;
     esac
@@ -357,6 +361,12 @@ test_gh_fixture_parse() {
   assert_eq "$(cat "$plog")" repos/o/n/thing "a paginated read is logged as such"
   out=$(gh_fixture_answer '{"a":"x"}')
   assert_eq "$out" x "the answer goes through the filter"
+  # A write: the method's value is not the endpoint, and neither is a field's.
+  gh_fixture_parse api -X POST repos/o/n/thing/replies -f body=hello --jq .html_url
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing/replies "-X POST does not become the endpoint"
+  assert_eq "$FIXTURE_FILTER" .html_url "the filter still parses after an option with a value"
+  gh_fixture_parse api -f query=q graphql
+  assert_eq "$FIXTURE_ENDPOINT" graphql "nor does a field's value, wherever the endpoint sits"
   gh_fixture_parse api repos/o/n/other
   assert_eq "$FIXTURE_FILTER" "" "no filter without --jq"
   assert_eq "$FIXTURE_PAGINATE" "" "not paginated without the flag"

@@ -1922,8 +1922,14 @@ second time; retry with the ids that did not:$rest."
 # Every reply's html_url is printed, one per line, in the order they were posted, so the caller
 # can see which threads it actually reached.
 cmd_reply() {
-  local pr="${1:?usage: reply <pr> <comment-id>[+<comment-id>...] <body>}"
-  local ids="${2:?comment-id}" body="${3:?body}"
+  # Exactly three, checked rather than left to ${3:?...} — which exits 1, the code that means "the
+  # fact does not hold", for what is an invocation error. And a body is a sentence: an unquoted one
+  # arrives as several arguments, and the ${3:?} form would post its first word and drop the rest,
+  # which reads as a posted reply (cmd_comment's trap, same remedy).
+  [ $# -eq 3 ] || die "usage: reply <pr> <comment-id>[+<comment-id>...] <body> — got $# argument(s)." \
+    "The body is ONE argument: quote it, including a multi-line one."
+  local pr="$1" ids="$2" body="$3"
+  [ -n "${body//[[:space:]]/}" ] || die "reply: the body is empty; there is nothing to post"
   pr_arg "$pr"
   pr="$PR_NUM"
   split_ids "$ids" reply
@@ -2086,7 +2092,8 @@ idempotent, so the whole token is safe to repeat."
 # every thread the entry lists, in order, each answered on its own line. Unlike a reply, this is
 # safe to repeat whole — the mutation is idempotent and an already-resolved thread costs no write.
 cmd_resolve() {
-  local pr="${1:?usage: resolve <pr> <comment-id>[+<comment-id>...]}" ids="${2:?comment-id}"
+  [ $# -eq 2 ] || die "usage: resolve <pr> <comment-id>[+<comment-id>...] — got $# argument(s)"
+  local pr="$1" ids="$2"
   pr_arg "$pr"
   pr="$PR_NUM"
   split_ids "$ids" resolve

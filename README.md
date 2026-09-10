@@ -162,6 +162,7 @@ ship-pr/scripts/test-pr-review-rounds.sh
 ship-pr/scripts/test-pr-review-merge.sh
 ship-pr/scripts/test-pr-review-status.sh
 ship-pr/scripts/test-pr-review-watch.sh
+ship-pr/scripts/test-pr-review-reply.sh
 ship-pr/scripts/test-pr-review-run-watch.sh
 scripts/test-wake-lab.sh
 scripts/test-check-prompts.sh
@@ -255,7 +256,11 @@ GitHub migrates `commit_id` forward to the current head; an item with no commit 
 all, and every item when the head could not be read, is acted on rather than swallowed. Each exit
 names what it ends on, from the machine-readable `items:` line `poll` ends with rather than from
 the rendered headers — a reviewer body that quotes one of those headers is not an item, and a
-summary is stamped by its footer rather than by a commit it mentions above it. Every verdict that
+summary is stamped by its footer rather than by a commit it mentions above it. Inline threads the reviewer posted twice — identical in path, line, body,
+commit stamp and author — render as ONE entry naming every thread id, with the body printed once
+and one item on that index; threads differing in any one of those fields stay separate, each
+difference with its own case, because a fold that collapsed distinct findings would pass every
+other case here. Every verdict that
 says nothing came polls once more first, and re-reads the state behind that poll: a 👍 landing in
 the same gap is reported as the approval it is rather than answered with the nudge that would
 clear it, a state that moved otherwise makes the window quiet, and a read that did not answer
@@ -264,6 +269,17 @@ when that changes nothing, so the extra poll is not proved by the hit alone — 
 finds beats the nudge it would have recommended. The `expected` clock is here too: it starts no
 earlier than the PR's own creation, still runs from the head's committer date on an older PR, and
 survives a committer date in the future.
+
+`test-pr-review-reply.sh` covers the two WRITING commands, which had no fixture coverage at all
+until it (ludics-lite#76): every other suite drives a read path, and a double-posted reply is not
+something a test may risk against the live API. One invocation answers a whole folded entry — the
+composed body to the anchor thread, a one-line pointer to that reply into each duplicate — and
+`resolve` closes every thread the same token names, an already-resolved one costing no write. A
+token that is not a comment id or several joined by single `+` is refused before anything is
+posted, and so is an unquoted body (the arity, not `${3:?}`, which would post its first word). A
+failure MID-batch never says "nothing was posted" once the anchor has landed: it names what landed
+and which ids to retry with, with the same failure at the anchor as the control, and the write
+exits stay apart inside a batch — a 4xx rejected (1), anything else ambiguous (3).
 
 `test-pr-review-base-red.sh` covers the other `base` — the one that answers "is the branch I am
 about to work off green", and what it says once the answer is no (ludics-lite#73). A red names the
@@ -274,7 +290,7 @@ going ends no streak because it judged nothing, two workflow files sharing a dis
 their histories apart, a jobs read that fails prints UNKNOWN and leaves the red standing rather
 than reporting no failing job, and a green base spends no call on any of it.
 
-The eight `test-pr-review-*` suites share a preamble, `test-pr-review-lib.sh`, which sources
+The nine `test-pr-review-*` suites share a preamble, `test-pr-review-lib.sh`, which sources
 `pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and
 the fixture `gh`'s argument parsing. It also closes the trap that bit twice (ludics-lite#39, #45,
 #46): `pr-review.sh` puts some sixty unqualified functions in scope, and a suite helper sharing a

@@ -163,6 +163,8 @@ jobs:
         run: ship-pr/scripts/test-pr-review-status.sh
       - name: Exercise what ends a watch and the clock a due review is late against
         run: ship-pr/scripts/test-pr-review-watch.sh
+      - name: Exercise the folded reply and resolve
+        run: ship-pr/scripts/test-pr-review-reply.sh
       - name: Exercise the run await's addressing and its invocation-vs-verdict split
         run: ship-pr/scripts/test-pr-review-run-watch.sh
 
@@ -278,6 +280,9 @@ jobs:
       - name: pr-review fixtures, what ends a watch
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-watch.sh || { echo '::error title=macOS suite failed::test-pr-review-watch.sh'; exit 1; }
+      - name: pr-review fixtures, the folded reply and resolve
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-reply.sh || { echo '::error title=macOS suite failed::test-pr-review-reply.sh'; exit 1; }
       - name: pr-review fixtures, the run await
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-run-watch.sh || { echo '::error title=macOS suite failed::test-pr-review-run-watch.sh'; exit 1; }
