@@ -120,7 +120,8 @@ occurrences() { # <haystack> <needle>
 # A row as the PER-REVIEW comments endpoint serves it, which is not the shape the flat feed has:
 # no `line` and no `original_line` at all — verified against this repository's live API on
 # 2026-09-10 — with the location carried by position/original_position instead. poll renders such
-# a row as `:0`, so two of them at different places in one file look identical.
+# a row by the field it actually has, `:@<position>`, so two of them at different places in one
+# file are told apart by the eye as well as by the fold key.
 positional_comment() { # <id> <original commit> <body> <position>
   jq -cn --argjson id "$1" --arg orig "$2" --arg b "$3" --argjson pos "$4" --arg rev "$REVIEWER" \
     '{id:$id, user:{login:($rev + "[bot]")}, path:"a.sh", body:$b, position:$pos,
@@ -287,11 +288,14 @@ test_an_unread_head_holds_nothing_back() {
 }
 
 # The silent half of the fold, found in round 1 of #86. When the flat comments feed lags a new
-# review, poll supplements it from the per-review endpoint, whose rows carry NO line at all — so
-# every one of them renders `:0` and two findings at different places in one file look identical.
+# review, poll supplements it from the per-review endpoint, whose rows carry NO line at all.
 # Folded, the second is answered by a reply it never got and resolved with the first, and the
 # watermark has advanced past its id, so nothing renders it again. The key therefore carries every
-# location field the row has, and `:0` is never the thing two rows are folded on.
+# location field the row has, and an absent line is never the thing two rows are folded on.
+#
+# The rendering has to show that too. `:0` said "unknown" in the shape of a line number, so the
+# two rows below printed identically and a fold that ate one of them was invisible to the reader
+# checking the round; the position each row does carry is printed instead, as `@12`.
 test_rows_with_no_line_are_folded_only_when_their_positions_agree() {
   reset_fixture
   local same="the same body, at two places in one file"
@@ -299,8 +303,10 @@ test_rows_with_no_line_are_folded_only_when_their_positions_agree() {
   schedule review_comments 1 "[$(positional_comment 900 "$H2" "$same" 12),$(positional_comment 901 "$H2" "$same" 40)]"
   run_watch 0,0,0
   assert_eq "$WATCH_RC" 0 "the round is acted on"
-  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:0" "the first row renders with no line"
-  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:0" "and so does the second: they LOOK alike"
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:@12" \
+    "with no line to print, the first row renders the position it does carry"
+  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:@40" \
+    "and the second renders its own: two places, and they no longer LOOK alike"
   assert_not_contains "$WATCH_OUT" "id=900+901" \
     "but two positions in one file are two findings, and folding them loses the second for good"
   assert_eq "$(occurrences "$WATCH_OUT" "$same")" 2 "each is rendered, so each can be answered"
@@ -310,9 +316,23 @@ test_rows_with_no_line_are_folded_only_when_their_positions_agree() {
   schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
   schedule review_comments 1 "[$(positional_comment 900 "$H2" "$same" 12),$(positional_comment 901 "$H2" "$same" 12)]"
   run_watch 0,0,0
-  assert_contains "$WATCH_OUT" "--- inline id=900+901 a.sh:0" \
+  assert_contains "$WATCH_OUT" "--- inline id=900+901 a.sh:@12" \
     "with nothing to tell them apart, they are one finding and one reply"
   assert_eq "$(occurrences "$WATCH_OUT" "$same")" 1 "and one body"
+}
+
+# The remaining case of an absent line: a row with no `position` either — a file-level comment
+# carries `line: null` and nothing to fall back to. There is no number to print, so the rendering
+# says there is none rather than printing a place the reviewer never named.
+test_a_row_with_no_location_at_all_says_so() {
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
+  schedule inline 1 \
+    "[$(inline_comment 900 "$H2" "$H2" 'a finding about the whole file' a.sh null '{"subject_type":"file"}')]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "the round is acted on"
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:?" "an unknown line renders as unknown"
+  assert_not_contains "$WATCH_OUT" "a.sh:0" "and never as line zero, which reads as a line number"
 }
 
 # --- what each exit says it exits on --------------------------------------------------------------
@@ -735,6 +755,7 @@ tests=(
   test_an_unrecognized_field_keeps_two_threads_apart
   test_the_same_body_against_two_heads_is_not_folded
   test_rows_with_no_line_are_folded_only_when_their_positions_agree
+  test_a_row_with_no_location_at_all_says_so
   test_a_summary_is_bound_by_the_commit_it_names
   test_an_unread_head_holds_nothing_back
   test_the_acting_exit_names_the_item
