@@ -83,9 +83,7 @@ reset_fixture() {
   BASE_JOBS_CACHE=""
   BASE_RED_DETAIL=""
   # The wait loop's clocks, for the one case that takes more than a single round.
-  ABSENT_GRACE=300
-  CHECKS_INTERVAL=1
-  CHECKS_HEARTBEAT=600
+  retune ABSENT_GRACE=300 CHECKS_INTERVAL=1 CHECKS_HEARTBEAT=600
   : >"$REQUEST_LOG"
 }
 

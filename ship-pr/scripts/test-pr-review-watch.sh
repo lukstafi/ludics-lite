@@ -405,14 +405,13 @@ test_a_round_landing_after_the_last_loop_poll_is_still_caught() {
 # review and CLEARS the 👍 it may be about to get.
 test_a_verdict_polls_once_more_before_recommending_a_nudge() {
   reset_fixture
-  # GRACE is read when pr-review.sh is sourced, so SHIP_PR_REVIEW_GRACE cannot reach it here.
-  # The grace is one second, so the head is past due on the first round and the loop reaches the
+  # GRACE is read when pr-review.sh is sourced, so SHIP_PR_REVIEW_GRACE cannot reach it here and
+  # the constant itself is what `retune` moves (run_tests puts it back when the case ends). The
+  # grace is one second, so the head is past due on the first round and the loop reaches the
   # verdict this case is about.
-  local grace_was="$GRACE"
-  GRACE=1
+  retune GRACE=1
   schedule reviews 2 "[$(review 500 "$H2" 2026-09-01T00:01:00Z 'the round the nudge would have talked over')]"
   run_watch 0,0,0 5 1
-  GRACE="$grace_was"
   assert_eq "$WATCH_RC" 0 "the round wins over the verdict that was about to be printed"
   assert_not_contains "$WATCH_OUT" "no review materialized" \
     "and the nudge is not recommended over a round that has landed"
@@ -423,10 +422,8 @@ test_a_verdict_polls_once_more_before_recommending_a_nudge() {
 
 test_a_verdict_that_still_stands_names_the_head_it_is_about() {
   reset_fixture
-  local grace_was="$GRACE"
-  GRACE=1
+  retune GRACE=1
   run_watch 0,0,0 5 1
-  GRACE="$grace_was"
   assert_eq "$WATCH_RC" 0 "a due round that never started is still something to act on"
   assert_contains "$WATCH_OUT" "no review materialized" "the verdict stands"
   assert_contains "$WATCH_OUT" "no reviewer activity about head ${H2:0:7}" \
@@ -441,20 +438,17 @@ test_a_verdict_that_still_stands_names_the_head_it_is_about() {
 # nudge is the move that re-requests a review and CLEARS a standing 👍.
 test_a_final_poll_that_did_not_answer_withholds_the_verdict() {
   reset_fixture
-  local grace_was="$GRACE"
-  GRACE=1
+  retune GRACE=1
   FAIL_FEEDS_FROM=2 # the loop round answers; the final poll does not
   run_watch 0,0,0 5 1
-  GRACE="$grace_was"
   assert_eq "$WATCH_RC" 3 "an unobserved tail is transport, not a verdict"
   assert_contains "$WATCH_OUT" "the verdict is WITHHELD" "and the line says the verdict was withheld"
   assert_not_contains "$WATCH_OUT" "no review materialized" "the nudge is not recommended"
   assert_contains "$WATCH_OUT" "watermark: " "the watch still ends on a watermark"
   # The control: the same window with a final poll that answers prints the verdict.
   reset_fixture
-  GRACE=1
+  retune GRACE=1
   run_watch 0,0,0 5 1
-  GRACE="$grace_was"
   assert_eq "$WATCH_RC" 0 "with the tail observed, the verdict stands"
   assert_contains "$WATCH_OUT" "no review materialized" "and recommends the nudge"
 }
@@ -465,11 +459,9 @@ test_a_final_poll_that_did_not_answer_withholds_the_verdict() {
 # re-request clears the approval.
 test_an_approval_landing_during_the_final_poll_drops_the_verdict() {
   reset_fixture
-  local grace_was="$GRACE"
-  GRACE=1
+  retune GRACE=1
   schedule reactions 2 "[$(reaction +1 2026-09-01T00:02:00Z)]"
   run_watch 0,0,0 5 1
-  GRACE="$grace_was"
   assert_eq "$WATCH_RC" 0 "an approved PR is something to act on"
   assert_contains "$WATCH_OUT" "the 👍 landed while it was being read" "and the line says why"
   assert_contains "$WATCH_OUT" "approved (👍 from" "the approval is what the caller reads"
@@ -481,11 +473,9 @@ test_an_approval_landing_during_the_final_poll_drops_the_verdict() {
 # a round announcing itself (👀) between the poll and the print is not "no review is coming".
 test_a_state_that_moved_drops_the_verdict_as_quiet() {
   reset_fixture
-  local grace_was="$GRACE"
-  GRACE=1
+  retune GRACE=1
   schedule reactions 2 "[$(reaction eyes "$(jq -rn '(now - 5) | todate')")]"
   run_watch 0,0,0 5 1
-  GRACE="$grace_was"
   assert_eq "$WATCH_RC" 1 "a round that just started is a quiet window, not a verdict"
   assert_contains "$WATCH_OUT" "the state moved to 'reviewing'" "and the line says what it moved to"
   assert_not_contains "$WATCH_OUT" "no review materialized" "no nudge over a round in flight"
@@ -494,18 +484,15 @@ test_a_state_that_moved_drops_the_verdict_as_quiet() {
 # A state that cannot be re-read is not a state either: the verdict is withheld, exit 3.
 test_a_state_that_could_not_be_re_read_withholds_the_verdict() {
   reset_fixture
-  local grace_was="$GRACE"
-  GRACE=1
+  retune GRACE=1
   run_watch 0,0,0 5 1
-  GRACE="$grace_was"
   assert_eq "$WATCH_RC" 0 "the control: with everything readable the verdict stands"
   # The PR read fails from the final poll on, so the loop reads its state and reaches the verdict
   # while the re-read behind it lands in `unknown`.
   reset_fixture
-  GRACE=1
+  retune GRACE=1
   FAIL_PULLS_FROM=2
   run_watch 0,0,0 5 1
-  GRACE="$grace_was"
   assert_eq "$WATCH_RC" 3 "an unreadable state is not 'the reviewer stayed quiet'"
   assert_contains "$WATCH_OUT" "is WITHHELD" "and the verdict is withheld"
 }

@@ -26,6 +26,10 @@
 #                                       logs the endpoint to $REQUEST_LOG (and, when paginated,
 #                                       $PAGINATE_LOG) if the suite set them; the answer goes
 #                                       through the --jq filter the call carried, if any
+#   retune <NAME>=<value>...            moves pr-review.sh's source-time constants (GRACE, STALL,
+#                                       ROUND_GAP, ABSENT_GRACE, CHECKS_INTERVAL, …) for the
+#   restore_tuning                      current case; run_tests restores them when it ends, and a
+#                                       case that wants them back sooner calls restore_tuning
 #   stub <fn>...                        declares the library functions this suite redefines on
 #                                       purpose (the merge suite's build_checks, run_signal and
 #                                       warn_base_drift)
@@ -50,6 +54,8 @@
 # library lacks, redefine one of this file's own helpers, and define a function before sourcing;
 # then two over test_tmpdir's target variable (ludics-lite#79) and one over gh_fixture_parse.
 # The negative controls are what prove the guard can fail; CI runs it beside the nine suites.
+# `retune` is covered in the same run, by a pair of cases: one moves two constants, the next reads
+# them back as pr-review.sh set them, which is the restore no case performs itself.
 
 TEST_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 TEST_LIB_FILE="$TEST_LIB_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -58,7 +64,14 @@ HELPER="$TEST_LIB_DIR/pr-review.sh"
 # Everything a suite defines must come AFTER this file: a function defined before pr-review.sh
 # is sourced is replaced by the library's same-named one (the shadow in the other direction),
 # and the snapshot below could not tell.
-lib_predefined=$(declare -F | sed 's/^declare -f //' | tr '\n' ' ')
+# `declare -f <name>` for an ordinary function, `declare -fx <name>` for one the ENVIRONMENT
+# exported into this shell (`export -f`). Only the former is the suite's doing, so only the former
+# is matched — printing just the matches, and not every line with a prefix stripped where it
+# happened to occur. An inherited function is not something a suite can be asked to move below the
+# source, and it is harmless besides: a library name among them is replaced when pr-review.sh is
+# sourced a few lines down, and the snapshot then records the library's. Before this, any exported
+# function in the environment refused every suite, naming "declare -fx <name>" as the definition.
+lib_predefined=$(declare -F | sed -n 's/^declare -f \(.*\)/\1/p' | tr '\n' ' ')
 if [ -n "$lib_predefined" ]; then
   echo "test-pr-review-lib.sh: REFUSING to run: the suite defined functions before sourcing this file (${lib_predefined% }); source it first, so the shadow guard sees every definition" >&2
   exit 2
@@ -69,6 +82,78 @@ export SHIP_PR_TEST_SOURCE_ONLY=1
 export SHIP_PR_STATE_DIR=off
 export SHIP_PR_API_ATTEMPTS=1
 export SHIP_PR_API_BACKOFF=0
+# The set `retune` accepts: the names sourcing pr-review.sh ASSIGNS, asked of a probe that does
+# exactly that in a pristine environment, where the names in scope before and after the source
+# differ by precisely what the source set. Two cheaper answers were both wrong, in opposite ways.
+#
+# Differencing the names across THIS shell's source depends on who invoked the suite: a name the
+# environment already carries — `env GRACE=777 ./test-pr-review-lib.sh`, or an exported
+# `ABSENT_GRACE` — is in scope on both sides, so it read as the caller's, dropped out of the set,
+# and every migrated `retune GRACE=1` was refused with "sets no GRACE".
+#
+# Reading the assignments out of pr-review.sh's TEXT is invoker-independent but cannot tell a
+# source-time assignment from one inside a function body, and "is it set now" cannot separate them
+# either for a name the shell itself always provides: `IFS=… read` appears in several of its
+# functions and every shell has IFS set, so `retune IFS=x` was accepted and would have altered the
+# harness's own word splitting — a typo guard that admits IFS is not a guard.
+#
+# The probe answers the question that was being approximated. `env -i` so nothing is inherited;
+# PATH, HOME and TMPDIR because the source reads them; the same SHIP_PR_* the suites source under.
+# Function bodies do not run, so their locals never appear. It is written inline rather than as a
+# helper because a function defined before the source is the one shape this file refuses from a
+# suite: pr-review.sh would replace a same-named one, and the snapshot could not tell.
+#
+# The shell creates variables of its own as it runs, and those are not the script's constants.
+# `PIPESTATUS` is the one that reached the set: absent from the first snapshot, materialized by
+# bash when the source ran a top-level pipeline, and so indistinguishable by name alone from
+# something pr-review.sh assigned — `retune PIPESTATUS=x` was accepted, and did nothing. Both
+# halves below are against that: the WARM-UP runs the constructs that materialize such variables
+# before the first snapshot, so they are on the "before" side where they belong; the deny-list
+# catches the ones no warm-up here triggers, and the two overlap on purpose, because a new bash
+# maintaining one more name should be caught by the warm-up without anyone editing a list.
+#
+# The status is captured rather than propagated. `set -e` is on in every suite by the time this
+# runs, so a probe that failed took the assignment's exit status with it and killed the suite
+# where it stood — before the refusal below could say what happened, and with the source's own
+# stderr discarded. The `|| lib_probe_rc=$?` is what lets the diagnostic run at all.
+lib_probe_err="${TMPDIR:-/tmp}/pr-review-probe.$$.err"
+lib_probe_rc=0
+HELPER_CONSTANTS=" $(
+  env -i "PATH=$PATH" "HOME=${HOME:-}" "TMPDIR=${TMPDIR:-/tmp}" \
+    SHIP_PR_TEST_SOURCE_ONLY=1 SHIP_PR_STATE_DIR=off \
+    bash -c '
+      # The warm-up: a pipeline for PIPESTATUS, a regex match for BASH_REMATCH, a read for REPLY.
+      : | : >/dev/null
+      [[ x =~ x ]] || :
+      printf "%s\n" x | { read -r _ignored || :; }
+      before=" $(compgen -v | tr "\n" " ")before n "
+      . "$1" >/dev/null || exit 1
+      for n in $(compgen -v); do
+        case "$before" in *" $n "*) continue ;; esac
+        # The names bash maintains, which a script does not assign and retune must not accept.
+        case " BASH_ARGC BASH_ARGV BASH_ARGV0 BASH_COMMAND BASH_LINENO BASH_REMATCH BASH_SOURCE \
+BASH_SUBSHELL COMP_CWORD COMP_KEY COMP_LINE COMP_POINT COMP_TYPE COMP_WORDBREAKS COMP_WORDS \
+EPOCHREALTIME EPOCHSECONDS FUNCNAME GROUPS LINENO OPTARG OPTIND PIPESTATUS RANDOM REPLY SECONDS \
+SRANDOM " in *" $n "*) continue ;; esac
+        printf "%s " "$n"
+      done
+    ' _ "$HELPER" 2>"$lib_probe_err"
+)" || lib_probe_rc=$?
+
+# A probe that failed or answered nothing is a broken setup, not a script with no constants:
+# retune would otherwise refuse every name and each suite would fail somewhere in its middle with
+# "sets no GRACE" rather than here, where the reason is.
+case "$lib_probe_rc$HELPER_CONSTANTS" in
+0*[![:space:]]*) rm -f "$lib_probe_err" ;;
+*)
+  echo "test-pr-review-lib.sh: REFUSING to run: the probe that reads pr-review.sh's source-time constants exited $lib_probe_rc and named $(printf '%s' "$HELPER_CONSTANTS" | wc -w | tr -d ' ') constant(s), so \`retune\` could accept no name. What the source said:" >&2
+  sed 's/^/  /' "$lib_probe_err" >&2 || :
+  rm -f "$lib_probe_err"
+  exit 2
+  ;;
+esac
+unset lib_probe_err lib_probe_rc
+
 # shellcheck source=pr-review.sh
 source "$HELPER"
 
@@ -264,6 +349,60 @@ gh_fixture_answer() {
   fi
 }
 
+# --- retuning pr-review.sh's source-time constants --------------------------------------------
+# GRACE, STALL, ROUND_GAP, ABSENT_GRACE, CHECKS_INTERVAL and the rest are read from the
+# environment ONCE, when pr-review.sh is sourced. So `SHIP_PR_REVIEW_GRACE=1 run_watch ...` reaches
+# nothing in a suite that sourced the script minutes earlier: a case that needs a different clock
+# has to assign the constant itself. Done by hand that is a save, an assignment and a restore per
+# case (the `grace_was` triple the watch suite carried six times over), and the restore is the part
+# that gets forgotten — a constant left retuned leaks into every case after it, which is a wrong
+# RESULT, not a failure. `retune` remembers the value as sourced and `run_tests` puts it back when
+# the case ends, so no case has to.
+TUNED_SAVED=()
+
+# retune <NAME>=<value>...: move constants for the current case. A name pr-review.sh does not set
+# when it is sourced is a typo — assigning it would invent a variable the script never reads, and
+# the case would pass while proving nothing — so it is refused.
+retune() {
+  local assignment name
+  [ $# -gt 0 ] || bail "retune: no constant named"
+  for assignment in "$@"; do
+    case "$assignment" in
+    [A-Za-z_]*=*) ;;
+    *) bail "retune: '$assignment' is not a NAME=value assignment" ;;
+    esac
+    name=${assignment%%=*}
+    case "$HELPER_CONSTANTS" in
+    *" $name "*) ;;
+    *) bail "retune $name: pr-review.sh sets no $name when it is sourced — nothing to retune" ;;
+    esac
+    # Only the FIRST retune of a name is saved, so a case that moves one constant twice is still
+    # restored to the value pr-review.sh gave it, not to the intermediate.
+    case " $(lib_tuned_names) " in
+    *" $name "*) ;;
+    *) TUNED_SAVED+=("$name=${!name-}") ;;
+    esac
+    printf -v "$name" '%s' "${assignment#*=}"
+  done
+}
+
+lib_tuned_names() {
+  local assignment
+  [ "${#TUNED_SAVED[@]}" -eq 0 ] || for assignment in "${TUNED_SAVED[@]}"; do
+    printf '%s ' "${assignment%%=*}"
+  done
+}
+
+# restore_tuning: every retuned constant back to the value it was sourced with. run_tests calls it
+# after each case; a case that wants the constants back before its own assertions may call it too.
+restore_tuning() {
+  local assignment
+  [ "${#TUNED_SAVED[@]}" -eq 0 ] || for assignment in "${TUNED_SAVED[@]}"; do
+    printf -v "${assignment%%=*}" '%s' "${assignment#*=}"
+  done
+  TUNED_SAVED=()
+}
+
 # --- the stub declarations and the shadow guard -----------------------------------------------
 # `declare -F <names>` under extdebug prints "<name> <line> <file>" per function; the option is
 # set in a subshell so its debugger side effects (function and error tracing) touch nothing else.
@@ -330,18 +469,49 @@ check_shadows() {
   }
 }
 
-# run_tests <case>...: the guard, then the cases in order, each announced on stdout.
+# run_tests <case>...: the guard, then the cases in order, each announced on stdout. A case's
+# retuned constants are put back before the next one starts, whether or not it restored them.
 run_tests() {
   local test_name
   check_shadows
   [ $# -gt 0 ] || bail "run_tests: no cases named"
   for test_name in "$@"; do
     "$test_name"
+    restore_tuning
     echo "PASS: $test_name"
   done
 }
 
-LIB_SNAPSHOT=$(lib_function_table)
+# What is PROTECTED is what these two files define, and only that — the table is filtered on the
+# defining file rather than taken whole. A function the environment exported in (`export -f`) is
+# in scope here too, and bash records it with no file at all; recorded as library-owned, it made a
+# suite's own fixture `gh` read as a redefinition of it and refused the suite ("(null)'s gh
+# ((null):0) is redefined at …"). An inherited function is not the library's, and a suite is free
+# to define one of any name — which is the same ground the fixture `gh` has always stood on.
+# Only the snapshot is filtered: `check_shadows` reads the CURRENT table unfiltered, because the
+# file it reports a redefinition from is the suite's own.
+#
+# The path is the INTACT remainder of the record, not a field: `declare -F` prints "<name> <line>
+# <file>", and a checkout under a path with a space in it — `/tmp/ludics review.XXXX`, which is
+# what a scratch clone looks like — splits that file across awk's fields. Comparing `$3` then
+# matched nothing, the snapshot came out EMPTY, and an empty snapshot does not fail: it protects
+# no function at all, so every shadow is accepted and the file's own first control passes a
+# deliberate `fail` through. Hence the check under it, which is the same guard the constants probe
+# carries: this file's whole purpose is a refusal, and a refusal that quietly has nothing to say
+# is the failure mode it was written against.
+LIB_SNAPSHOT=$(lib_function_table |
+  awk -v h="$HELPER" -v t="$TEST_LIB_FILE" '{
+    path = $0
+    sub(/^[^ ]+ [^ ]+ /, "", path)
+    if (path == h || path == t) print
+  }')
+case "$LIB_SNAPSHOT" in
+*[![:space:]]*) ;;
+*)
+  echo "test-pr-review-lib.sh: REFUSING to run: the function-table snapshot named nothing, so the shadow guard would protect no function and every ludics-lite#46 shadow would be accepted silently; pr-review.sh ($HELPER) and this file should between them define some sixty" >&2
+  exit 2
+  ;;
+esac
 
 # --- executed: this file's own controls -------------------------------------------------------
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0
@@ -437,6 +607,26 @@ test_own_functions_pass() {
   control 'gh() { gh_fixture_parse "$@"; gh_fixture_answer "{}"; }' 'helper_of_my_own() { :; }'
   assert_eq "$CONTROL_RC" 0 "a suite with only its own functions runs ($CONTROL_ERR)"
   assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
+  # And still when the ENVIRONMENT exported a function of the same name in. Bash records an
+  # inherited function with no defining file, so a snapshot taken whole protected it and the
+  # suite's own fixture `gh` read as a redefinition of it: every suite refused, from a shell that
+  # merely had `gh` exported, with "(null)'s gh ((null):0) is redefined at …". The exporting shell
+  # is a file of its own because `export -f` carries the definition's file and line with it.
+  local exporter="$CONTROL_ROOT/exporter-gh.sh"
+  {
+    echo 'gh() { echo "an inherited gh"; }'
+    echo 'export -f gh'
+    printf 'exec bash %s\n' "\"$CONTROL_FILE\""
+  } >"$exporter"
+  set +e
+  bash "$exporter" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
+  CONTROL_RC=$?
+  set -e
+  CONTROL_OUT=$(cat "$CONTROL_ROOT/out")
+  CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
+  assert_eq "$CONTROL_RC" 0 "an inherited gh must not make the suite's own fixture a shadow ($CONTROL_ERR)"
+  assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
+  assert_not_contains "$CONTROL_ERR" "REFUSING" "and nothing should be refused"
 }
 
 test_definitions_before_sourcing_are_refused() {
@@ -457,6 +647,29 @@ test_definitions_before_sourcing_are_refused() {
   assert_refused "a function defined before the source"
   assert_contains "$CONTROL_ERR" "defined functions before sourcing this file (early)" \
     "the early definition should be named"
+  # A function the ENVIRONMENT exported into the suite's shell is not the suite defining one, and
+  # refusing it made every suite unrunnable from such a shell. The exporting shell is a file of its
+  # own, because `export -f` carries the definition's file and line with it and defining these here
+  # would attribute them to this file. One of the two is `fail` deliberately — the ludics-lite#46
+  # name — to pin that an inherited library name is not a shadow either: pr-review.sh's own
+  # definition replaces it when the preamble sources it, which is what the snapshot then records.
+  local exporter="$CONTROL_ROOT/exporter.sh"
+  control 'helper_of_my_own() { :; }'
+  {
+    echo 'fail() { echo "an inherited fail"; }'
+    echo 'inherited_helper() { :; }'
+    echo 'export -f fail inherited_helper'
+    printf 'exec bash %s\n' "\"$CONTROL_FILE\""
+  } >"$exporter"
+  set +e
+  bash "$exporter" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
+  CONTROL_RC=$?
+  set -e
+  CONTROL_OUT=$(cat "$CONTROL_ROOT/out")
+  CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
+  assert_eq "$CONTROL_RC" 0 "an exported function in the environment must not refuse a suite ($CONTROL_ERR)"
+  assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
+  assert_not_contains "$CONTROL_ERR" "REFUSING" "and nothing should be refused"
 }
 
 # test_tmpdir writes to the CALLER's variable, whatever it is named — including `dir`, the name
@@ -640,6 +853,144 @@ test_gh_fixture_parse_refuses_what_it_cannot_parse() {
   REQUEST_LOG=""
 }
 
+# --- retune, and the restore no case performs itself -------------------------------------------
+# The values pr-review.sh gave the two constants when this file sourced it, read once so the pair
+# below asserts against the script's own defaults rather than a number copied out of it.
+GRACE_AS_SOURCED="$GRACE"
+ABSENT_GRACE_AS_SOURCED="$ABSENT_GRACE"
+
+test_retune_moves_a_constant() {
+  assert_eq "$GRACE" "$GRACE_AS_SOURCED" "the case starts from the grace pr-review.sh was sourced with"
+  retune GRACE=1 ABSENT_GRACE=0
+  assert_eq "$GRACE" 1 "the grace this case runs under"
+  assert_eq "$ABSENT_GRACE" 0 "and a second constant in the same call"
+  # Twice over, which is what a case with a control in it does: the saved value is still the one
+  # pr-review.sh set, not the 1 above — restoring to that would leak the case's own clock.
+  retune GRACE=2
+  assert_eq "$GRACE" 2 "the second move takes"
+  # A case may put them back mid-case; the next case proves it need not.
+  restore_tuning
+  assert_eq "$GRACE" "$GRACE_AS_SOURCED" "restore_tuning returns the value as sourced, not the first move"
+  assert_eq "$ABSENT_GRACE" "$ABSENT_GRACE_AS_SOURCED" "and every name it held, not only the last moved"
+  # BOTH are left moved, with nothing here restoring them, because the next case is judged on what
+  # run_tests restores by itself. Leaving only GRACE moved — which this case used to do, the second
+  # constant having been put back by the restore_tuning above — made that case's ABSENT_GRACE
+  # assertion green whatever run_tests did with it, so it could not tell a restore of ONE retuned
+  # constant from a restore of all of them.
+  retune GRACE=3 ABSENT_GRACE=9
+  assert_eq "$GRACE" 3 "and retuning again after a restore still works"
+  assert_eq "$ABSENT_GRACE" 9 "for every name, so the case after this one has two to check"
+}
+
+# Listed immediately after the case above, and reading what that case left behind: nothing there
+# restored GRACE=3 or ABSENT_GRACE=0, so anything but the sourced values here is the leak.
+test_retune_is_undone_when_the_case_ends() {
+  assert_eq "$GRACE" "$GRACE_AS_SOURCED" "run_tests restored the grace the case before it moved"
+  assert_eq "$ABSENT_GRACE" "$ABSENT_GRACE_AS_SOURCED" "and every other constant that case moved"
+}
+
+# A typo would otherwise invent a variable pr-review.sh never reads, and the case would pass while
+# running under the untouched constant it meant to move.
+test_retune_of_a_name_the_script_does_not_set_is_refused() {
+  control 'retune GARCE=1'
+  assert_eq "$CONTROL_RC" 1 "an unknown constant is the reporter's exit 1 ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "retune GARCE: pr-review.sh sets no GARCE when it is sourced" \
+    "the unknown name should be named"
+  assert_not_contains "$CONTROL_OUT" "PASS:" "no case may run"
+  # A bare name is the other way to write it wrong: `retune GRACE 1` would silently do nothing.
+  control 'retune GRACE 1'
+  assert_eq "$CONTROL_RC" 1 "a bare name is refused too ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "retune: 'GRACE' is not a NAME=value assignment" \
+    "the malformed argument should be quoted"
+  # A name the SHELL always provides is not a constant of pr-review.sh's, whatever its text says.
+  # IFS is the one that matters: `IFS=… read` sits in several of its function bodies and every
+  # shell has IFS set, so a set derived from the text plus "is it set now" accepted `retune IFS=x`
+  # — which would have altered the word splitting of the harness doing the retuning.
+  control 'retune IFS=x'
+  assert_eq "$CONTROL_RC" 1 "IFS is not a source-time constant ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "retune IFS: pr-review.sh sets no IFS when it is sourced" \
+    "IFS should be refused by name"
+  # PIPESTATUS is the same class arriving by the other door: the shell CREATES it, mid-source,
+  # when the script runs a top-level pipeline. It is absent from a naive first snapshot and
+  # present in the second, so by name alone it is indistinguishable from something the script
+  # assigned — and `retune PIPESTATUS=x` was accepted, and did nothing at all.
+  control 'retune PIPESTATUS=x'
+  assert_eq "$CONTROL_RC" 1 "a variable the shell creates is not a constant ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "retune PIPESTATUS: pr-review.sh sets no PIPESTATUS when it is sourced" \
+    "PIPESTATUS should be refused by name"
+  # The other side of that probe: the constants it must accept, including one assigned inside a
+  # top-level `case` rather than in a stanza of its own.
+  control 'retune GRACE=1 STALL=2 ROUND_GAP=3 ABSENT_GRACE=4 CHECKS_INTERVAL=5 CACHE_OFF=6' \
+    '[ "$GRACE$STALL$ROUND_GAP$ABSENT_GRACE$CHECKS_INTERVAL$CACHE_OFF" = 123456 ] ||
+       bail "the constants did not take: $GRACE$STALL$ROUND_GAP$ABSENT_GRACE$CHECKS_INTERVAL$CACHE_OFF"'
+  assert_eq "$CONTROL_RC" 0 "every documented constant is retunable ($CONTROL_ERR)"
+  assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
+}
+
+# A probe that cannot read pr-review.sh's constants must say so HERE, with the reason. Every
+# suite has `set -e` on by the time the probe runs, so a failure that propagated through the
+# assignment killed the suite where it stood — exit 1, no output, and the source's own stderr
+# discarded — which reads as the suite failing rather than as a setup that never started. The
+# control is a copy of this file beside a pr-review.sh that refuses to source.
+test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason() {
+  local root out err rc
+  test_tmpdir root probe-fail
+  cp "$TEST_LIB_FILE" "$root/"
+  printf '#!/usr/bin/env bash\necho "missing dependency: frobnicator not found" >&2\nreturn 1\n' \
+    >"$root/pr-review.sh"
+  printf '#!/usr/bin/env bash\nset -euo pipefail\nsource "%s"\n' \
+    "$root/$(basename "$TEST_LIB_FILE")" >"$root/suite.sh"
+  set +e
+  out=$(bash "$root/suite.sh" 2>"$root/err")
+  rc=$?
+  set -e
+  err=$(cat "$root/err")
+  assert_eq "$rc" 2 "a probe that cannot read the constants is a refusal, not a suite failure ($err)"
+  assert_contains "$err" "REFUSING to run: the probe that reads pr-review.sh's source-time constants" \
+    "the refusal should name what could not be read"
+  assert_contains "$err" "missing dependency: frobnicator not found" \
+    "and carry what the source itself said, which is the only thing that localizes it"
+  assert_eq "$out" "" "nothing may run"
+}
+
+# The guard has to survive the PATH it is checked out under. `declare -F` prints "<name> <line>
+# <file>", and a directory with a space in it — a scratch clone at `/tmp/ludics review.XXXX` —
+# splits that file across the fields of anything reading it positionally. Comparing a field rather
+# than the intact remainder emptied the snapshot, and an EMPTY snapshot protects nothing and says
+# nothing: this file's own first control passed a deliberate `fail` through.
+#
+# The control cannot be "run this file from a spaced directory" — it would run this case again,
+# forever. It is a throwaway suite there instead, carrying the ludics-lite#46 shadow, which must
+# still be refused.
+test_the_guard_survives_a_path_with_spaces() {
+  local root out err rc lib
+  root=$(mktemp -d "${TMPDIR:-/tmp}/pr-review lib space.XXXXXX") || bail "mktemp -d failed"
+  TEST_CLEANUP+=("$root")
+  case "$root" in *" "*) ;; *) bail "the control needs a path with a space in it: $root" ;; esac
+  lib="$root/$(basename "$TEST_LIB_FILE")"
+  cp "$HELPER" "$TEST_LIB_FILE" "$root/"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    printf 'source %s\n' "\"$lib\""
+    echo 'fail() { echo "FAIL: $*" >&2; exit 1; }'
+    echo 'test_a_case() { assert_eq 1 1 "one is one"; }'
+    echo 'run_tests test_a_case'
+  } >"$root/suite.sh"
+  set +e
+  out=$(bash "$root/suite.sh" 2>"$root/err")
+  rc=$?
+  set -e
+  err=$(cat "$root/err")
+  assert_eq "$rc" 2 "the shadow guard must still refuse from a spaced path ($err)"
+  assert_contains "$err" "without \`stub fail\`" "the refusal should name the shadow, not the snapshot"
+  assert_not_contains "$out" "PASS:" "no case may run"
+  # And the snapshot itself is not empty there — the refusal above would also fire if the file
+  # merely failed to load, and this is the difference between the two.
+  assert_not_contains "$err" "the function-table snapshot named nothing" \
+    "the snapshot should be populated, not empty-and-refused"
+}
+
 tests=(
   test_undeclared_shadow_is_refused
   test_every_library_function_is_protected
@@ -654,6 +1005,11 @@ tests=(
   test_gh_fixture_parse
   test_gh_fixture_parse_knows_gh_s_option_table
   test_gh_fixture_parse_refuses_what_it_cannot_parse
+  test_retune_moves_a_constant
+  test_retune_is_undone_when_the_case_ends # must stay directly after the case above
+  test_retune_of_a_name_the_script_does_not_set_is_refused
+  test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason
+  test_the_guard_survives_a_path_with_spaces
 )
 
 run_tests "${tests[@]}"

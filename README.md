@@ -361,9 +361,16 @@ name — a reporter called `fail` — silently replaces the library's, turning e
 code into the reporter's. So the preamble snapshots the function table when it is sourced, and
 `run_tests` refuses, naming the function and where the suite redefined it, any library function
 redefined without a `stub <fn>` declaration (the merge suite declares `build_checks`, `run_signal`
-and `warn_base_drift`), and any declaration the suite never honoured. Run directly,
+and `warn_base_drift`), and any declaration the suite never honoured. It also carries `retune`, for
+the constants `pr-review.sh` reads from the environment exactly once, when it is sourced (`GRACE`,
+`STALL`, `ROUND_GAP`, `ABSENT_GRACE`, `CHECKS_INTERVAL`, …): a case that needs a different clock
+cannot pass `SHIP_PR_REVIEW_GRACE` to it and has to assign the constant, and the restore is the
+part that gets forgotten — a constant left retuned leaks into every case after it, which is a wrong
+result rather than a failure. `retune GRACE=1` remembers the value as sourced, refuses a name the
+script does not set, and `run_tests` puts every one of them back when the case ends. Run directly,
 `test-pr-review-lib.sh` is its own suite: throwaway suites that source it prove the guard refuses
-what it must and passes what it must.
+what it must and passes what it must, and a pair of cases proves a retuned constant is restored for
+the case after it.
 
 The fixture suites pin the gate's logic against canned answers, so the shapes those answers imitate
 are a belief the suites cannot check — a renamed field, a changed default ordering or a new

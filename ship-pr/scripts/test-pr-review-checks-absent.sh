@@ -71,9 +71,7 @@ reset_fixture() {
   JOBS_JSON=$(jobs_json '[]')
   FAIL_ENDPOINT=""
   rm -f "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls"
-  ABSENT_GRACE=300
-  CHECKS_INTERVAL=1
-  CHECKS_HEARTBEAT=600
+  retune ABSENT_GRACE=300 CHECKS_INTERVAL=1 CHECKS_HEARTBEAT=600
   : >"$REQUEST_LOG"
   : >"$PAGINATE_LOG"
 }
@@ -177,7 +175,7 @@ test_stale_push_without_a_run_is_absent() {
 test_grace_of_zero_settles_at_once() {
   reset_fixture
   COMMIT_AGE=1
-  ABSENT_GRACE=0
+  retune ABSENT_GRACE=0
   run_gate
   assert_eq "$GATE_RC" 0 "a zero grace is the escape hatch and must settle immediately"
   assert_contains "$GATE_OUTPUT" ": ABSENT" "a zero grace should print ABSENT"
@@ -442,7 +440,7 @@ test_run_lookup_is_paginated() {
 test_wait_holds_until_the_checks_appear() {
   reset_fixture
   COMMIT_AGE=10
-  CHECKS_HEARTBEAT=0
+  retune CHECKS_HEARTBEAT=0
   CHECK_RUNS_SEQ=(
     "$(check_runs_json '[]')"
     "$(check_runs_json '[]')"
@@ -576,7 +574,7 @@ test_queued_invocation_survives_a_finished_twin() {
 # Round 4, P2: a stopped check under a queued run used to break the wait loop at once.
 test_stopped_checks_with_a_queued_run_keep_waiting() {
   reset_fixture
-  CHECKS_HEARTBEAT=0
+  retune CHECKS_HEARTBEAT=0
   CHECK_RUNS_SEQ=(
     "$(check_runs_json '[{"name":"a","conclusion":"cancelled","html_url":"u"}]')"
     "$(check_runs_json '[{"name":"a","conclusion":"cancelled","html_url":"u"},
