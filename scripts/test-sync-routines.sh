@@ -583,6 +583,28 @@ rm -f "$TMP/routes-link"
 ln -s "$REPO/routines" "$TMP/routes-link"
 expect "...however the overlap is spelled" 2 "are the same directory" -- \
   env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/routes-link" "$SR" push
+# ...and however it is SPELLED. A `..` after a component that does not exist yet is folded by the
+# filesystem the moment `mkdir -p` creates that component, so it has to be folded here first --
+# otherwise the comparison sees two disjoint paths and the push then writes into the checkout.
+reset_trees; install_all
+before=$(cat "$REPO/routines/$R1/SKILL.md")
+expect "a destination reaching routines/ through a not-yet-existing component and .. is refused" 2 \
+  "are the same directory" -- env CLAUDE_SCHEDULED_TASKS_DIR="$REPO/routines/missing/../../routines" "$SR" push
+[ ! -e "$REPO/routines/missing" ] \
+  && ok "...without creating the component it was spelled through" \
+  || ko "$REPO/routines/missing was created"
+[ "$(cat "$REPO/routines/$R1/SKILL.md")" = "$before" ] \
+  && ok "...and the tracked prompt is untouched" || ko "the refused push modified the checkout"
+expect "...and one that lands BELOW routines/ the same way" 2 "is inside the checkout's routines/" -- \
+  env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/nope/../$(basename "$REPO")/routines/$R1/installed" "$SR" push
+expect "...as does a plain ./ and ../ walk onto it" 2 "are the same directory" -- \
+  env CLAUDE_SCHEDULED_TASKS_DIR="$REPO/./routines/$R1/.." "$SR" push
+# The control: a `..` walk that genuinely lands OUTSIDE the checkout is not refused, so the
+# folding is not simply refusing anything with a dot segment in it. (It walks through components
+# that exist, since a path whose parent has yet to be created does not resolve for a READ either.)
+expect "...while a .. walk that lands outside the checkout is fine" 0 "all local routines in sync" -- \
+  env CLAUDE_SCHEDULED_TASKS_DIR="$REPO/../installed" "$SR"
+
 # The control: a destination outside the checkout is not refused.
 expect "...while a destination outside the checkout is fine" 0 "all local routines in sync" -- run_sync
 

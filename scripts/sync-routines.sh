@@ -100,21 +100,42 @@ done
 say() { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
-# physical_of <path>: <path> with every symlink and `..` resolved as far as it exists, plus the
-# part that does not exist yet, so two roots can be compared as the filesystem sees them rather
-# than as they were spelled. There is no realpath on stock macOS; `cd -P` is the portable one.
+# physical_of <path>: <path> as the filesystem will see it -- every symlink resolved, every `.`
+# and `..` folded -- so two roots can be compared as they will BE and not as they were spelled.
+# There is no realpath on stock macOS; `cd -P` is the portable resolver, and it only works on a
+# directory that exists, so the tail that does not exist yet is folded lexically. That is sound
+# for exactly the reason it is needed: those components do not exist, `mkdir -p` is about to
+# create them as plain directories, and `missing/..` is then the parent -- but only once they
+# have been folded, which is the bug this replaces. Folding can uncover a longer existing prefix
+# (`/a/missing/../link/x`), so resolve and fold until it settles.
 physical_of() {
-  local d=$1 rest=""
-  case "$d" in /*) ;; *) d="$PWD/$d" ;; esac
-  while [ "$d" != "/" ] && [ -n "$d" ] && [ ! -d "$d" ]; do
-    rest="/$(basename "$d")$rest"
-    d=$(dirname "$d")
+  local p=$1 d suffix base comp oldifs rounds=0 previous=
+  case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+  while [ "$p" != "$previous" ] && [ "$rounds" -lt 16 ]; do
+    previous=$p
+    rounds=$((rounds + 1))
+    d=$p
+    suffix=
+    while [ "$d" != "/" ] && [ -n "$d" ] && [ ! -d "$d" ]; do
+      suffix="/$(basename "$d")$suffix"
+      d=$(dirname "$d")
+    done
+    if [ -d "$d" ]; then base=$(cd "$d" && pwd -P); else base=$d; fi
+    [ "$base" = "/" ] && base=
+    oldifs=$IFS
+    IFS=/
+    for comp in $suffix; do
+      case "$comp" in
+        '' | '.') ;;
+        '..') base=${base%/*} ;;
+        *) base="$base/$comp" ;;
+      esac
+    done
+    IFS=$oldifs
+    [ -n "$base" ] || base=/
+    p=$base
   done
-  if [ -d "$d" ]; then
-    printf '%s%s\n' "$(cd "$d" && pwd -P)" "$rest"
-  else
-    printf '%s%s\n' "$d" "$rest"
-  fi
+  printf '%s\n' "$p"
 }
 
 # first_symlinked_ancestor <dir>: the first component of <dir>'s path that is a symlink, or
