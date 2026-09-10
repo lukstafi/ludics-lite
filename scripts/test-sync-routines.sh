@@ -15,7 +15,11 @@
 #   - that a directory which EXISTS and is still not a usable prompt -- a symlink anywhere
 #     inside it, no SKILL.md, or a SKILL.md that is empty or carries no readable frontmatter --
 #     is refused rather than certified in sync or pulled over the checkout, in both directions,
-#     with a legal-but-unusual prompt as the control that the floor is not refusing everything;
+#     with legal-but-unusual prompts as the control that the floor is not refusing everything --
+#     including a description that quotes the parser's own markers, and this repository's own
+#     prompts;
+#   - that the two roots must be disjoint, however the overlap is spelled, since a destination
+#     under routines/ has the publisher walk the tree it is writing;
 #   - that a push never leaves the installed prompt absent or half-written, sampled by a reader
 #     running flat out across a series of them, with a control that the reader can report an
 #     absence;
@@ -481,6 +485,73 @@ expect "a CRLF prompt is still a prompt" 0 "pushed to" -- run_sync push
 expect "...and reads as in sync afterwards" 0 "all local routines in sync" -- run_sync
 reset_trees; install_all
 expect "...as does the ordinary one, which is the baseline for all of the above" 0 "in sync" -- run_sync
+
+# --- the frontmatter floor is a floor, not a substring search -------------------------------------
+# The first draft of it was three ad-hoc tests. Each of these is a shape it got wrong.
+reset_trees; install_all
+printf -- '---\nname:\ndescription: d\n---\n\nbody\n' > "$REPO/routines/$R1/SKILL.md"
+expect "push refuses a name: with no value" 1 "no non-empty name: field" -- run_sync push
+reset_trees; install_all
+printf -- '---\nname: %s\ndescription:   \n---\n\nbody\n' "$R1" > "$REPO/routines/$R1/SKILL.md"
+expect "...and a description: that is only whitespace" 1 "no non-empty description: field" -- run_sync push
+reset_trees; install_all
+printf -- '---\nx-name: %s\nx-description: d\n---\n\nbody\n' "$R1" > "$REPO/routines/$R1/SKILL.md"
+expect "...and keys that merely CONTAIN the field names" 1 "no non-empty name: field" -- run_sync push
+reset_trees; install_all
+printf -- '---\nname: %s\ndescription: d\n---\n' "$R1" > "$REPO/routines/$R1/SKILL.md"
+expect "...and frontmatter with no prompt under it" 1 "no prompt to run" -- run_sync push
+reset_trees; install_all
+printf -- '---\nname: %s\ndescription: d\n---\n   \n\t\n' "$R1" > "$REPO/routines/$R1/SKILL.md"
+expect "...including a body of nothing but whitespace" 1 "no prompt to run" -- run_sync push
+grep -q 'body v1' "$TMP/installed/$R1/SKILL.md" \
+  && ok "...with the working installation left in place throughout" \
+  || ko "one of the refused pushes still replaced the installed prompt"
+
+# The other direction: shapes that are legal must PASS, or the floor is just a wall. A value that
+# contains the parser's own vocabulary is the one that caught an in-band marker.
+reset_trees; install_all
+printf -- '---\nname: %s\ndescription: Reports an @@UNCLOSED@@ parser state, and --- fences\n---\n\nbody v2\n' \
+  "$R1" > "$REPO/routines/$R1/SKILL.md"
+expect "a description that quotes the parser's own markers is a valid prompt" 0 "pushed to" -- run_sync push
+expect "...and reads as in sync afterwards" 0 "all local routines in sync" -- run_sync
+reset_trees; install_all
+printf -- '---\nname: %s\ndescription: d\nallowed-tools: Bash, Read\n---\n\nbody v2\n' \
+  "$R1" > "$REPO/routines/$R1/SKILL.md"
+expect "...as is frontmatter carrying keys this floor does not know" 0 "pushed to" -- run_sync push
+# The repository's own prompts are the last word: whatever this floor is, they must pass it.
+for r in $LOCAL_ROUTINES; do
+  out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/probe-$r" "$SYNC" 2>&1) || true
+  contains "$out" "routines/$r has" \
+    && ko "the floor rejects this repository's own $r prompt: $out" \
+    || ok "this repository's $r prompt passes the floor"
+done
+
+# --- the two roots must be disjoint ---------------------------------------------------------------
+# A destination under the checkout's routines/ makes push create the destination INSIDE the
+# source, after which `find "$src"` walks the tree it is writing and the installation is copied
+# into the canonical prompts.
+reset_trees; install_all
+before=$(cat "$REPO/routines/$R1/SKILL.md")
+inside="$REPO/routines/$R1/installed"
+expect "a destination inside the checkout's routines/ is refused with exit 2" 2 \
+  "is inside the checkout's routines/" -- env CLAUDE_SCHEDULED_TASKS_DIR="$inside" "$SR" push
+[ ! -e "$inside" ] \
+  && ok "...before anything is created under the tracked prompts" || ko "$inside was created"
+[ "$(cat "$REPO/routines/$R1/SKILL.md")" = "$before" ] \
+  && ok "...and the tracked prompt is untouched" || ko "the refused push modified the checkout"
+expect "...and status refuses it too, not just the writing modes" 2 "is inside the checkout" -- \
+  env CLAUDE_SCHEDULED_TASKS_DIR="$inside" "$SR"
+expect "the routines/ directory itself as a destination is refused" 2 "are the same directory" -- \
+  env CLAUDE_SCHEDULED_TASKS_DIR="$REPO/routines" "$SR" push
+expect "...and a destination that CONTAINS it" 2 "contains the checkout's routines/" -- \
+  env CLAUDE_SCHEDULED_TASKS_DIR="$REPO" "$SR" push
+# Spelled through a link, the overlap must still be seen: the comparison is on physical paths.
+rm -f "$TMP/routes-link"
+ln -s "$REPO/routines" "$TMP/routes-link"
+expect "...however the overlap is spelled" 2 "are the same directory" -- \
+  env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/routes-link" "$SR" push
+# The control: a destination outside the checkout is not refused.
+expect "...while a destination outside the checkout is fine" 0 "all local routines in sync" -- run_sync
 
 # --- publishing keeps a readable prompt at every instant -----------------------------------------
 # The scheduler opens $dst/SKILL.md by the path the registry stores. The first draft removed the

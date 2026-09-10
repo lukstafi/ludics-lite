@@ -100,6 +100,23 @@ done
 say() { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
+# physical_of <path>: <path> with every symlink and `..` resolved as far as it exists, plus the
+# part that does not exist yet, so two roots can be compared as the filesystem sees them rather
+# than as they were spelled. There is no realpath on stock macOS; `cd -P` is the portable one.
+physical_of() {
+  local d=$1 rest=""
+  case "$d" in /*) ;; *) d="$PWD/$d" ;; esac
+  while [ "$d" != "/" ] && [ -n "$d" ] && [ ! -d "$d" ]; do
+    rest="/$(basename "$d")$rest"
+    d=$(dirname "$d")
+  done
+  if [ -d "$d" ]; then
+    printf '%s%s\n' "$(cd "$d" && pwd -P)" "$rest"
+  else
+    printf '%s%s\n' "$d" "$rest"
+  fi
+}
+
 # first_symlinked_ancestor <dir>: the first component of <dir>'s path that is a symlink, or
 # nothing. The per-routine `[ -L "$dst" ]` check below only sees the routine's own directory, but
 # the scheduler refuses a task file whose path traverses a symlink at ANY component: a symlinked
@@ -135,7 +152,7 @@ first_symlinked_ancestor() {
 #     is a leftover, not a routine, and pulling from it would replace the checkout's prompt
 #     with nothing.
 prompt_problem() {
-  local dir=$1 link first fm key
+  local dir=$1 link problem
   # The two ways a prompt directory is not even a directory. Both matter on the SOURCE side,
   # where `pull` is the repair: a deleted routine and one someone linked out of the tree are
   # exactly what a pull should be able to restore from a usable installed copy.
@@ -167,39 +184,52 @@ prompt_problem() {
     printf 'has an EMPTY SKILL.md\n'
     return 0
   fi
-  # `read` rather than `head | grep`: no pipeline, so nothing can be SIGPIPEd. A CRLF checkout
-  # would otherwise fail on the invisible carriage return.
-  first=
-  IFS= read -r first < "$dir/SKILL.md" || true
-  first=${first%$'\r'}
-  case "$first" in
-    '---' | '--- ') ;;
-    *)
-      printf 'has a SKILL.md that does not open with a --- frontmatter fence\n'
-      return 0
-      ;;
-  esac
-  fm=$(awk '
-    NR == 1 { next }
-    /^---[[:space:]]*$/ { closed = 1; exit }
-    { print }
-    END { if (!closed) print "@@UNCLOSED@@" }
-  ' "$dir/SKILL.md")
-  case "$fm" in
-    *'@@UNCLOSED@@'*)
-      printf 'has a SKILL.md whose frontmatter is never closed by a second ---\n'
-      return 0
-      ;;
-  esac
-  for key in name description; do
-    case "$fm" in
-      *"$key:"*) ;;
-      *)
-        printf 'has a SKILL.md whose frontmatter carries no %s: line\n' "$key"
-        return 0
-        ;;
-    esac
-  done
+  # ONE pass, which decides and reports in the same place. The first draft of this floor was a
+  # `read` for the fence, an awk that printed the frontmatter, and shell `case` tests over that
+  # text; each of those was wrong in its own way -- an in-band `@@UNCLOSED@@` marker a real
+  # description could contain, a `name:` test that a key called `x-name:` satisfied, and a value
+  # nobody looked at, so `name:` with nothing after it passed. Fields are matched anchored, with
+  # their value read, and closure is the parser's own state rather than something written into
+  # its output. A trailing CR is stripped per line, so a CRLF checkout is judged on its text.
+  if problem=$(awk '
+    NR == 1 {
+      line = $0; sub(/\r$/, "", line)
+      if (line !~ /^---[[:space:]]*$/) {
+        print "has a SKILL.md that does not open with a --- frontmatter fence"
+        bad = 1
+        exit 0
+      }
+      next
+    }
+    !closed {
+      line = $0; sub(/\r$/, "", line)
+      if (line ~ /^---[[:space:]]*$/) { closed = 1; next }
+      if (match(line, /^[A-Za-z0-9_.-]+:/)) {
+        key = substr(line, 1, RLENGTH - 1)
+        val = substr(line, RLENGTH + 1)
+        gsub(/^[[:space:]]+/, "", val)
+        gsub(/[[:space:]]+$/, "", val)
+        if (key == "name" && val != "") have_name = 1
+        if (key == "description" && val != "") have_desc = 1
+      }
+      next
+    }
+    {
+      line = $0; sub(/\r$/, "", line)
+      if (line ~ /[^[:space:]]/) have_body = 1
+    }
+    END {
+      if (bad) exit 0
+      if (!closed) { print "has a SKILL.md whose frontmatter is never closed by a second ---"; exit 0 }
+      if (!have_name) { print "has a SKILL.md whose frontmatter carries no non-empty name: field"; exit 0 }
+      if (!have_desc) { print "has a SKILL.md whose frontmatter carries no non-empty description: field"; exit 0 }
+      if (!have_body) { print "has a SKILL.md with nothing under its frontmatter: no prompt to run"; exit 0 }
+      exit 1
+    }
+  ' "$dir/SKILL.md"); then
+    printf '%s\n' "$problem"
+    return 0
+  fi
   return 1
 }
 
@@ -305,6 +335,31 @@ publish_checked() {
   fi
   return 0
 }
+
+# The two roots must be disjoint. If the destination lands inside the checkout's routines/ --
+# CLAUDE_SCHEDULED_TASKS_DIR set to a path under it -- then push creates the destination INSIDE
+# the source and publish_dir's `find "$src"` then walks the tree it is writing, copying the
+# installation into the canonical prompts and back again. It is checked before anything is
+# written, and on the PHYSICAL paths, so a link cannot spell the overlap away. Exit 2: this is
+# how the command was invoked, not something about the routines.
+src_phys=$(physical_of "$src_root")
+dest_phys=$(physical_of "$dest_root")
+overlap=
+if [ "$src_phys" = "$dest_phys" ]; then
+  overlap="are the same directory"
+else
+  case "$dest_phys/" in "$src_phys"/*) overlap="is inside the checkout's routines/" ;; esac
+  case "$src_phys/" in "$dest_phys"/*) overlap="contains the checkout's routines/" ;; esac
+fi
+if [ -n "$overlap" ]; then
+  warn "sync-routines: the destination $overlap:"
+  warn "  routines:    $src_phys"
+  warn "  destination: $dest_phys"
+  warn "A sync copies between two separate trees; overlapping roots would have it walk the tree"
+  warn "it is writing and copy an installation into the canonical prompts. Point"
+  warn "CLAUDE_SCHEDULED_TASKS_DIR somewhere outside this checkout."
+  exit 2
+fi
 
 drift=0      # status only: the checkout and the installed copies disagree
 problems=0   # push/pull only: a routine this run could not sync

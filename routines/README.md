@@ -66,10 +66,17 @@ installed directory holding a link anywhere inside it, a linked `SKILL.md` inclu
 `diff -r` would follow and call in sync. And `push` replaces a link rather than writing through
 it. It also refuses to `pull` from an installed directory with no
 `SKILL.md` — that is a leftover, not a routine, and taking it would delete the tracked prompt
-here — and from one whose `SKILL.md` is empty or carries no readable frontmatter, which installs
-just as happily and leaves the scheduler a task with no description and no body. That last check
-is a floor, not a second copy of `check-prompts.sh`'s grammar: it asks only for what the loaders
-have to find. In the
+here — and from one whose `SKILL.md` is not a prompt: empty, opening with no
+`---` fence, with frontmatter never closed, with no non-empty `name:` or `description:` field, or
+with nothing under the frontmatter to run. Any of those installs just as happily and leaves the
+scheduler a task it can read no name, no description and no instructions out of. That check is a
+floor, not a second copy of `check-prompts.sh`'s grammar: it asks only for what the loaders have
+to find at all, and it is one parser pass rather than a set of substring tests, so a description
+that quotes `---` is a valid description.
+
+The two roots have to be disjoint, and that is checked on the resolved paths before anything is
+written: a `CLAUDE_SCHEDULED_TASKS_DIR` pointing inside `routines/` would have the publisher walk
+the tree it is writing and copy an installation into the canonical prompts. In the
 other direction `pull` is the repair, and reads on past a checkout prompt that is broken in any of
 those ways, a deleted routine directory and one linked out of the tree included: it restores them
 from a usable installed copy. `push`
