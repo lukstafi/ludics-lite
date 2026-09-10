@@ -50,8 +50,13 @@ scripts/sync-routines.sh pull   # ~/.claude/scheduled-tasks -> this checkout, th
 
 `push` also converts a directory left over from the symlink era. Edit a prompt here and `push`; if
 an edit lands in the installed copy instead -- a routine's own run editing its prompt in place --
-`pull` it back and commit, rather than letting the two drift. The script only touches the two
-local tasks, never the cloud routine below.
+`pull` it back and commit, rather than letting the two drift. `status` exits 1 on any drift, which
+is what makes it worth running after a merge that touched a prompt.
+
+The script only touches the rows above whose Kind is `local scheduled task`, never the cloud
+routine below, and its `LOCAL_ROUTINES` list is exactly those rows -- pinned by
+`scripts/test-sync-routines.sh`, so adding a local scheduled task means editing both the table and
+that list, and CI says so if only one of them changes.
 
 On a fresh box, register the task first (the `schedule` tool in the desktop app, with the cron,
 working directory and model from the table; it writes a placeholder `SKILL.md`), then `push` over
@@ -60,6 +65,11 @@ which is what the script warns about.
 
 Only the box running the desktop app's scheduler fires these. On the author's fleet that is
 `mac-studio`, which is why both run in that box's `~/ocannl-staging`.
+
+Retiring a routine is three steps, and the registry is the one the repository cannot do: delete
+its directory here and its row above, then deregister the task in the desktop app, then remove
+`~/.claude/scheduled-tasks/<id>`. A prompt directory left installed with no row here is invisible
+to `sync-routines.sh`, which iterates the list rather than the destination.
 
 ## The cloud routine: synced by hand
 

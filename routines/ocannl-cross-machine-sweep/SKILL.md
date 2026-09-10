@@ -85,9 +85,11 @@ directories together from master instead of copying one file:
     rm -rf ~/.ocannl-sweep/tools ~/.ocannl-sweep/benchmarks
     git -C ~/ocannl-staging archive origin/master tools benchmarks | tar -x -C ~/.ocannl-sweep
 
-If a future master grows a dependency outside those two directories, the exit-2 line will name
-the missing file; widen the pathspec in the `git archive` line above (that is the whole fix), then
-relaunch once.
+If a future master grows a dependency outside those two directories, the failure is an exit 2
+during startup: today the missing sibling is reported by the interpreter's own error above the
+`sweep:` line (`cannot parse measurement boxes at <sha>` is what the script itself says when
+`benchmarks/fixture_digest.py` is not there), so read both lines, not just the `sweep:` one.
+Widen the pathspec in the `git archive` line above (that is the whole fix), then relaunch once.
 
 The script refuses to run without `OCANNL_TOOL_SWEEP_LOCAL_BOX`, the portable measurement-box ID
 of THIS host — one of the names on the `# measurement-boxes:` line of

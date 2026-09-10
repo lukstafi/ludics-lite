@@ -223,6 +223,17 @@ jobs:
       - name: Exercise the host-table split and the --help range
         run: scripts/test-wake-lab.sh
 
+  sync-routines:
+    name: sync-routines (ubuntu)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise the routine install states and the routines-table pin
+        run: scripts/test-sync-routines.sh
+
   prompt-checker:
     name: prompt checker fixtures (ubuntu)
     needs: changes
@@ -318,6 +329,9 @@ jobs:
       - name: wake-lab
         if: ${{ !cancelled() }}
         run: scripts/test-wake-lab.sh || { echo '::error title=macOS suite failed::test-wake-lab.sh'; exit 1; }
+      - name: sync-routines
+        if: ${{ !cancelled() }}
+        run: scripts/test-sync-routines.sh || { echo '::error title=macOS suite failed::test-sync-routines.sh'; exit 1; }
       - name: prompt checker fixtures
         if: ${{ !cancelled() }}
         run: scripts/test-check-prompts.sh || { echo '::error title=macOS suite failed::test-check-prompts.sh'; exit 1; }

@@ -37,7 +37,7 @@ done
 ```
 
 The loop skips `routines/`, whose contents are scheduled-task prompts rather than skills, and
-`scripts/`, which holds the lab script; both are linked separately, see the Routines and Lab
+`scripts/`, which holds the lab script; both are installed separately, see the Routines and Lab
 script sections. Rerun the loop after adding a skill. Replace any pre-existing real directory in
 `~/.claude/skills/` by hand first, and diff it against this copy, since a divergent local edit
 may be a fix worth keeping.
@@ -107,11 +107,12 @@ ones. The preflight proves both with a live call, not a status read.
 
 `routines/` carries the scheduled-task prompts, but not the way the skill directories carry
 skills: since desktop app 1.46388.4 the scheduler refuses a task file reached through a symlink,
-so three of the four install as copies under `~/.claude/scheduled-tasks`, pushed and pulled by
-`scripts/sync-routines.sh`. The desktop app's registry (cron, working directory, model) is not in
-the repository and is recorded in [routines/README.md](routines/README.md), which also carries the
-install order and the symptoms of an unreadable prompt. The fourth, the CI-red triage routine
-`ship-pr` defers master's trailing failures to, runs in the cloud and is synced by hand.
+so the two local ones install as copies under `~/.claude/scheduled-tasks`, pushed and pulled by
+`scripts/sync-routines.sh` (`status` after a merge that touched a prompt, `push` to install it).
+The desktop app's registry (cron, working directory, model) is not in the repository and is
+recorded in [routines/README.md](routines/README.md), which also carries the install order and the
+symptoms of an unreadable prompt. The third, the CI-red triage routine `ship-pr` defers master's
+trailing failures to, runs in the cloud and is synced by hand.
 
 ## The lab script
 
@@ -166,6 +167,7 @@ ship-pr/scripts/test-pr-review-reply.sh
 ship-pr/scripts/test-pr-review-run-watch.sh
 scripts/test-wake-lab.sh
 scripts/test-check-prompts.sh
+scripts/test-sync-routines.sh
 ```
 
 The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all thirteen on Ubuntu, one
@@ -208,6 +210,19 @@ kick reaches the Windows side through whichever of the two aliases answers, sinc
 that is the LAN one; and that the polling loops honour a wall-clock deadline against slow probes,
 which an iteration budget did not (`WAKE_LAB_WAIT_SECONDS`, `WAKE_LAB_WSL_WAIT_SECONDS` and
 `WAKE_LAB_DOWN_WAIT_SECONDS` are what let the suite ask for a one-second one).
+
+`test-sync-routines.sh` runs `scripts/sync-routines.sh` against scratch trees, with
+`CLAUDE_SCHEDULED_TASKS_DIR` pointed at them and over a byte-identical copy of the script inside a
+scratch checkout, so a `pull` case can never reach the real `routines/`. It pins the four states
+`status` reports and the exit code of each (in sync, drift, installed as a symlink, not
+installed), that `push` replaces a symlinked installation with a real directory instead of writing
+through it, that `--dry-run` copies nothing in any mode, and the usage exits. It also pins what
+ludics-lite#77 found unpinned: that the script's `LOCAL_ROUTINES` lists exactly the rows of
+`routines/README.md` whose Kind is `local scheduled task`. That comparison reads the table
+narrowly and refuses an empty read, so a mangled table cannot pass it vacuously, and four negative
+controls show it can fail; `check-prompts.sh` keeps its per-directory lookup and gains no table
+model. The last case pins the tracked mode of `sync-routines.sh` at 755, which a `> tmp && mv`
+rewrite drops silently.
 
 `test-pr-review-checks-absent.sh` drives the build gate against a canned Actions API, one answer
 per polling round, and pins everything the check list alone cannot say about a head. Exit 4 (no
