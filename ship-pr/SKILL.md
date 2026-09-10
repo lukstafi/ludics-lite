@@ -938,11 +938,28 @@ Nothing further is owed: trailing CI on the new tip is the CI-red triage routine
 a plain `base` read seconds after a merge would only report the previous tip's green anyway,
 so do not treat one as a post-merge verdict.
 
+Close the tracked issue out in two commands, comment first — never as one `gh issue close
+--comment`. A PR body that links the issue (`Closes #N`, the ordinary way to write one) has
+already closed it at merge time, and `gh issue close N --repo O/R --comment "…"` on an
+issue that is already closed prints `! Issue … is already closed`, posts NOTHING, and exits 0:
+the summary is lost silently, with the close-out reading as done (ludics-lite#70 and #76 both,
+2026-09-10). So post the summary unconditionally, then close only if the merge did not:
+
+```bash
+gh issue comment N --repo O/R --body-file <summary-file>
+gh issue view N --repo O/R --json state --jq .state   # CLOSED → done; OPEN → close it
+gh issue close N --repo O/R
+```
+
+`--body-file` rather than `--body "…"`: a summary worth posting is multi-paragraph and carries
+backticks, which a shell argument mangles.
+
 ## Multi-PR arcs
 
 When several PRs implement one tracked issue, comment on the issue as each phase lands — what the
 phase delivered, in the issue's own vocabulary. At the end, close the issue with a waypoint
-summary mapping each waypoint to the PR that landed it, and state the honest outcome including
+summary mapping each waypoint to the PR that landed it (comment-then-close, as *After it lands*
+spells out — the last PR of an arc closes the issue too), and state the honest outcome including
 where the work did *not* pay off; file the follow-ups that the arc's own evidence justifies
 (that is `after-merge`'s job). An arc that closes with only its wins recorded costs the next
 person the same discovery twice.

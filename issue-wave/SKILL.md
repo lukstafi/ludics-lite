@@ -191,7 +191,12 @@ worker kinds verbatim, and includes:
   (recommendation-with-veto) and tier-3 (user-owned) questions get a comment, a tier-1 call is
   the worker's own and gets none, so the brief names the comment only for the issues that
   received one (three workers of the 2026-09-04 wave reported a "promised but absent" comment,
-  and one filed it as a residual, because the shared brief promised one on every issue).
+  and one filed it as a residual, because the shared brief promised one on every issue). Spell
+  that read out as `gh issue view N --repo O/R --json number,title,body,comments` (or a plain
+  `gh issue view N --repo O/R`, then the same with `--comments`), never as `--comments` alone:
+  that form prints ONLY the comments and never the body, so on a comment-less issue it emits
+  zero bytes and exits 0 - the worker then holds nothing of its task and reconstructs it from
+  the brief's summary (ludics-lite#70 and #76, 2026-09-10).
 - Verification expectations: scoped test runs, negative controls where the work is a checker,
   and the box's known environmental traps. **On mac-studio**: Gatekeeper/XProtect stalls
   fresh executables for minutes - sample the pid before assuming a hang; never start a second
@@ -206,7 +211,10 @@ worker kinds verbatim, and includes:
   golden proves nothing - the OCANNL notes on `OCANNL_BACKEND` and self-announcing legs), and
   still one dune per _build.
 - Landing: the ship-pr skill through review to merge, then close the upstream issue with a
-  summary comment, then the after-merge brainstorm ship-pr ends with, in **hand-back mode**:
+  summary comment - `gh issue comment --body-file` first and `gh issue close` only if the merge
+  left it open, per ship-pr's *After it lands*, because `gh issue close --comment` on an issue a
+  PR body's `Closes #N` already closed posts nothing at all - then the after-merge brainstorm
+  ship-pr ends with, in **hand-back mode**:
   propose issues and chip candidates in the close-out report, file and spawn nothing - the
   coordinator combines across workers and does the filing. Worktree removal is NOT the
   worker's: the brainstorm's diff and tracker reads run in that worktree, the worker's shell
