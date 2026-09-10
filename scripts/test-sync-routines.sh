@@ -17,7 +17,8 @@
 #     is refused rather than certified in sync or pulled over the checkout, in both directions,
 #     with legal-but-unusual prompts as the control that the floor is not refusing everything --
 #     including a description that quotes the parser's own markers, and this repository's own
-#     prompts;
+#     prompts -- and that the frontmatter GRAMMAR is check-prompts.sh's job and not this
+#     floor's, a division pinned from both sides on a malformed optional field;
 #   - that the two roots must be disjoint, however the overlap is spelled, since a destination
 #     under routines/ has the publisher walk the tree it is writing;
 #   - that a push never leaves the installed prompt absent or half-written, sampled by a reader
@@ -525,6 +526,38 @@ for r in $LOCAL_ROUTINES; do
     && ko "the floor rejects this repository's own $r prompt: $out" \
     || ok "this repository's $r prompt passes the floor"
 done
+
+# The division of labour, pinned from both sides. This floor asks what the LOADERS must find; the
+# frontmatter GRAMMAR belongs to scripts/check-prompts.sh, which CI runs on every head. A
+# malformed optional field is the case that separates them, and if that ever stops being true --
+# the checker losing its rule, or this floor growing a value grammar -- this is where it shows.
+reset_trees; install_all
+printf -- '---\nname: %s\ndescription: d\nallowed-tools: [\n---\n\nbody v2\n' \
+  "$R1" > "$REPO/routines/$R1/SKILL.md"
+expect "the floor passes a malformed OPTIONAL field, which is not its claim to make" 0 "pushed to" -- \
+  run_sync push
+CPTREE="$TMP/cptree"
+rm -rf "$CPTREE"
+mkdir -p "$CPTREE/routines/$R1"
+cp "$REPO/routines/$R1/SKILL.md" "$CPTREE/routines/$R1/SKILL.md"
+cp "$ROOT/routines/README.md" "$CPTREE/routines/README.md"
+cp "$ROOT/README.md" "$CPTREE/README.md"
+if [ -x "$ROOT/scripts/check-prompts.sh" ]; then
+  cp_out=$("$ROOT/scripts/check-prompts.sh" "$CPTREE" 2>&1) || true
+  contains "$cp_out" "allowed-tools" \
+    && ok "...while check-prompts.sh, which owns the grammar, refuses that same file" \
+    || ko "check-prompts.sh does not catch a malformed optional field either, so nothing does: $cp_out"
+  # The control: with the value made well-formed, the checker passes the same tree, so the
+  # refusal above is the malformed value and not the scratch tree.
+  printf -- '---\nname: %s\ndescription: d\nallowed-tools: Bash\n---\n\nbody v2\n' \
+    "$R1" > "$CPTREE/routines/$R1/SKILL.md"
+  cp_out=$("$ROOT/scripts/check-prompts.sh" "$CPTREE" 2>&1) || true
+  contains "$cp_out" "allowed-tools" \
+    && ko "the checker complains about a well-formed optional field too: $cp_out" \
+    || ok "...and passes it once the value is well-formed"
+else
+  ko "no $ROOT/scripts/check-prompts.sh to compare against -- the division above is unpinned"
+fi
 
 # --- the two roots must be disjoint ---------------------------------------------------------------
 # A destination under the checkout's routines/ makes push create the destination INSIDE the

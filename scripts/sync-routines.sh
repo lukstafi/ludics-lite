@@ -178,8 +178,14 @@ prompt_problem() {
   # compares equal to itself afterwards, and leaves the scheduler with a task whose description
   # is blank and whose body is nothing -- the same quiet nothing-ran as an unreadable file, by a
   # different route. This is a FLOOR, not a second copy of the frontmatter grammar:
-  # scripts/check-prompts.sh owns that, and owns it for the repository's prompts. What is
-  # checked here is what the loaders need to find at all.
+  # scripts/check-prompts.sh owns that, and owns it for the repository's prompts, on every head,
+  # in one of the three CI jobs that run whatever the diff touched. What is checked here is what
+  # the LOADERS need to find at all -- a name, a description, something to run -- which is also
+  # exactly what this script can claim without a YAML value grammar of its own. The division is
+  # deliberate and is pinned from both sides in scripts/test-sync-routines.sh: a malformed
+  # OPTIONAL field (`allowed-tools: [`) passes here and is refused by check-prompts.sh, which
+  # names the indicator character. Two grammars for one file is the defect ludics-lite#75
+  # documents, and the second one is always the one that goes stale.
   if [ ! -s "$dir/SKILL.md" ]; then
     printf 'has an EMPTY SKILL.md\n'
     return 0
