@@ -59,11 +59,16 @@ in any mode, when `~/.claude/scheduled-tasks` is itself reached through a link a
 refuses an installed directory holding a link anywhere inside it, a linked `SKILL.md` included,
 which a plain `diff -r` would follow and call in sync; and `push` replaces a link rather than
 writing through it. It also refuses to `pull` from an installed directory with no `SKILL.md` —
-that is a leftover, not a routine, and taking it would delete the tracked prompt here. `push`
+that is a leftover, not a routine, and taking it would delete the tracked prompt here. In the
+other direction `pull` is the repair, and reads on past a checkout prompt that is broken in any of
+those ways, a deleted routine directory and one linked out of the tree included: it restores them
+from a usable installed copy. `push`
 publishes file by file, staging each inside the destination and renaming it onto its final name,
 so a dispatch that lands mid-push always finds a whole prompt: never a missing one, never a
 half-written one. It replaces whatever stands in a file's way rather than following or entering it,
-and reads the result before reporting a routine published.
+checks every step, and reads the result before reporting a routine published — not that a
+`SKILL.md` is there, which a failed copy leaves standing, but that the destination now holds what
+the source holds.
 
 The script only touches the rows above whose Kind is `local scheduled task`, never the cloud
 routine below, and its `LOCAL_ROUTINES` list is exactly those rows -- pinned by

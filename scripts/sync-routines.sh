@@ -22,10 +22,12 @@
 # Exit codes:
 #   0  status: everything in sync. push/pull: every routine handled.
 #   1  status: drift (or a routine not installed, or installed as a symlink, or a destination
-#      reached through one). push: the destination is behind a symlink, so nothing was copied,
-#      or a routine could not be synced. pull: a routine could not be read -- a source directory
-#      missing, or an installed path that is a symlink and so holds nothing real. A push that
-#      installs a prompt over a placeholder is not a failure.
+#      reached through one). push: the destination is behind a symlink, so nothing was copied, or
+#      the checkout's own prompt is unusable, or a publish did not end with the destination
+#      holding the source. pull: there was nothing real to take -- no installed prompt, or one
+#      behind a symlink, or one that is not a usable prompt. A push that installs a prompt over a
+#      placeholder is not a failure, and neither is a pull that RESTORES a checkout routine that
+#      was deleted or linked away: repairing this side is what pull is for.
 #   2  usage: an argument this script does not know.
 #
 # The destination is $CLAUDE_SCHEDULED_TASKS_DIR when set, which is what the fixture suite
@@ -116,6 +118,17 @@ first_symlinked_ancestor() {
 #     with nothing.
 prompt_problem() {
   local dir=$1 link
+  # The two ways a prompt directory is not even a directory. Both matter on the SOURCE side,
+  # where `pull` is the repair: a deleted routine and one someone linked out of the tree are
+  # exactly what a pull should be able to restore from a usable installed copy.
+  if [ -L "$dir" ]; then
+    printf 'is a symlink (-> %s) where a real directory belongs\n' "$(readlink "$dir")"
+    return 0
+  fi
+  if [ ! -d "$dir" ]; then
+    printf 'is not a directory\n'
+    return 0
+  fi
   link=$(find "$dir" -type l -print 2>/dev/null | head -n 1)
   if [ -n "$link" ]; then
     printf 'holds a symlink (%s -> %s), and the scheduler refuses any component of the path\n' \
@@ -140,18 +153,23 @@ prompt_problem() {
 #
 # Paths are read from `find` a line at a time, so a newline in a routine's filename would split;
 # these trees are a checkout's tracked prompts and a scheduler's copies of them.
+# Every step is checked. publish_dir is called as the condition of an `if`, which suspends
+# `set -e` for the whole dynamic extent of the call, so an unchecked `cp` or `mv` that failed --
+# a full or unwritable destination -- would leave the OLD prompt in place and the caller would
+# report the routine published. The `|| exit 1` inside a `find | while` pipeline exits that
+# subshell, which `|| return 1` on the pipeline then propagates.
 publish_dir() {
   local src=$1 dst=$2
   # The destination root itself may be a symlink -- a task directory left over from the symlink
   # era, or a routine directory in this checkout that someone linked out. Following it would
   # write through into the link's target and leave the link standing, so replace it.
   if [ -L "$dst" ]; then
-    rm -f "$dst"
+    rm -f "$dst" || return 1
   elif [ -e "$dst" ] && [ ! -d "$dst" ]; then
     # ...or a plain file where a directory belongs.
-    rm -f "$dst"
+    rm -f "$dst" || return 1
   fi
-  mkdir -p "$dst"
+  mkdir -p "$dst" || return 1
   # Directories first, so a file's parent exists when the file is staged. Anything of another
   # kind standing in a directory's place goes: mkdir would fail on it, and a link would send the
   # files below it out of the tree.
@@ -159,10 +177,10 @@ publish_dir() {
     rel=${d#"$src"}; rel=${rel#/}
     [ -n "$rel" ] || continue
     if [ -L "$dst/$rel" ] || { [ -e "$dst/$rel" ] && [ ! -d "$dst/$rel" ]; }; then
-      rm -rf "$dst/$rel"
+      rm -rf "$dst/$rel" || exit 1
     fi
-    mkdir -p "$dst/$rel"
-  done
+    mkdir -p "$dst/$rel" || exit 1
+  done || return 1
   find "$src" -type f -print | while IFS= read -r f; do
     rel=${f#"$src"}; rel=${rel#/}
     # A DIRECTORY standing where a file belongs is the one case rename(2) does not resolve:
@@ -176,25 +194,30 @@ publish_dir() {
     # between these two markers deleted, to show that publish_checked's post-condition below can
     # actually fail. Keep the markers if the guard moves.
     if [ -d "$dst/$rel" ]; then
-      rm -rf "$dst/$rel"
+      rm -rf "$dst/$rel" || exit 1
     fi
     # <<< kind-guard
     tmp="$dst/$(dirname "$rel")/.sync-$$-$(basename "$rel")"
-    cp "$f" "$tmp"
-    mv -f "$tmp" "$dst/$rel"
-  done
+    cp "$f" "$tmp" || exit 1
+    mv -f "$tmp" "$dst/$rel" || { rm -f "$tmp"; exit 1; }
+  done || return 1
   # Then what src no longer has. Files and links (`! -type d` catches both -- find does not
   # follow links), then the directories that are left empty, deepest first.
+  # >>> prune-guard: scripts/test-sync-routines.sh builds a copy of this script with the block
+  # between these two markers deleted, to show that publish_checked's tree comparison catches a
+  # destination that merely LOOKS like a prompt. Keep the markers if the pruning moves.
   find "$dst" ! -type d -print | while IFS= read -r f; do
     rel=${f#"$dst"}; rel=${rel#/}
     case "$rel" in .sync-$$-* | */.sync-$$-*) continue ;; esac
-    [ -e "$src/$rel" ] || rm -f "$f"
-  done
+    [ -e "$src/$rel" ] || rm -f "$f" || exit 1
+  done || return 1
   find "$dst" -type d -print | sort -r | while IFS= read -r d; do
     rel=${d#"$dst"}; rel=${rel#/}
     [ -n "$rel" ] || continue
     [ -d "$src/$rel" ] || rmdir "$d" 2>/dev/null || true
-  done
+  done || return 1
+  # <<< prune-guard
+  return 0
 }
 
 # publish_checked <src> <dst>: publish, then READ THE RESULT. A publish that reported success
@@ -202,10 +225,21 @@ publish_dir() {
 # exists to remove from the install step; the post-condition is what makes "republished" mean
 # something rather than "the commands were issued".
 publish_checked() {
-  local src=$1 dst=$2 left
-  publish_dir "$src" "$dst"
+  local src=$1 dst=$2 left report
+  if ! publish_dir "$src" "$dst"; then
+    warn "sync-routines: publishing $src -> $dst failed part-way; $dst is not what $src holds"
+    return 1
+  fi
   if left=$(prompt_problem "$dst"); then
     warn "sync-routines: after publishing, $dst still $left"
+    return 1
+  fi
+  # Presence is not enough: an old prompt that a failed copy left standing satisfies it. The
+  # claim is that the destination now HOLDS THE SOURCE, so read that. Output, not exit code
+  # (see the drift comparison below for why).
+  report=$(diff -r -q "$src" "$dst" 2>&1) || true
+  if [ -n "$report" ]; then
+    warn "sync-routines: after publishing, $dst still differs from $src: $report"
     return 1
   fi
   return 0
@@ -248,27 +282,23 @@ for r in $LOCAL_ROUTINES; do
   src="$src_root/$r"
   dst="$dest_root/$r"
 
-  if [ ! -d "$src" ]; then
-    warn "$r: no such routine in $src_root -- skipping"
-    if [ "$mode" = status ]; then drift=1; else problems=1; fi
-    continue
-  fi
-
   # THE SOURCE COMES FIRST, before any branch that might publish it. A push that installs an
   # unusable prompt -- a half-finished local edit with SKILL.md deleted, say -- and then reports
   # success is the false verdict this script exists to remove, and the destination branches below
   # (symlinked, missing, unusable) all publish. `pull` is the exception in the other direction:
-  # a broken checkout prompt is what a pull REPAIRS, so it reads on.
+  # a broken checkout prompt, up to and including a deleted directory or one linked out of the
+  # tree, is what a pull REPAIRS from a usable installed copy, so it reads on and remembers.
+  src_broken=0
   if src_problem=$(prompt_problem "$src"); then
     warn "$r: $src $src_problem"
     case "$mode" in
-      pull) : ;;
+      pull) src_broken=1 ;;
       push)
         warn "$r: refusing to install it -- fix the prompt in this checkout first"
         problems=1
         continue
         ;;
-      *) drift=1 ;;
+      *) drift=1; continue ;;
     esac
   fi
 
@@ -356,7 +386,11 @@ for r in $LOCAL_ROUTINES; do
   # "in sync" over a destination the scheduler cannot use. Anything diff has to say, including a
   # complaint on stderr, is drift.
   diff_report=$(diff -r -q "$src" "$dst" 2>&1) || true
-  if [ -z "$diff_report" ]; then
+  # `$src_broken` overrides an empty report, and has to: `diff` FOLLOWS a symlinked SKILL.md, so
+  # a checkout prompt that is a link to byte-identical content compares equal while still being
+  # a prompt nothing can read. Taking the shortcut there would leave the link standing and call
+  # the pull done.
+  if [ -z "$diff_report" ] && [ "$src_broken" -eq 0 ]; then
     if [ "$mode" = status ]; then say "$r: in sync"; fi
     continue
   fi
@@ -379,7 +413,11 @@ for r in $LOCAL_ROUTINES; do
       ;;
     pull)
       if $dry_run; then
-        say "$r: would pull $dst -> $src"
+        if [ "$src_broken" -eq 1 ]; then
+          say "$r: would restore $dst -> $src"
+        else
+          say "$r: would pull $dst -> $src"
+        fi
       elif publish_checked "$dst" "$src"; then
         say "$r: pulled into $src -- review it with git diff"
         copied=$((copied + 1))

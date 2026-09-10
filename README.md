@@ -225,9 +225,15 @@ still not a usable prompt — a link anywhere inside it, or no `SKILL.md` — is
 certified in sync or pulled over the checkout, in both directions and before any branch that
 would publish it; that publishing replaces what stands in its way rather than following or
 entering it (a linked directory at either end, a directory or a link to one where `SKILL.md`
-belongs, a file where a directory belongs), and reads its own result afterwards, so "republished"
-is not a claim about the commands issued — a copy of the script with that guard deleted has to
-fail the post-condition, which is what makes the post-condition worth having; that a push never
+belongs, a file where a directory belongs), checks every step, and reads its own
+result afterwards — that the destination now HOLDS the source, not merely that a `SKILL.md` is
+there, which a failed copy leaves standing. Two copies of the script, each with one guard deleted
+between markers in the source, are what keep that post-condition honest: without the file-kind
+guard it must catch an unusable destination, without the pruning pass it must catch a destination
+that is not the source, and each has the control that the same copy publishes cleanly when
+nothing is in its way. It pins that `pull` is the repair in the other direction, restoring a
+checkout routine that was deleted or linked away, and that it does not take the empty-diff
+shortcut over a linked `SKILL.md` whose bytes already match; that a push never
 leaves the installed prompt absent or half-written, sampled by a reader running flat out across
 twelve of them, with a control that the reader can report an absence; and that two modes in one
 invocation are a usage error, since `push` and `pull` write in opposite directions and the last

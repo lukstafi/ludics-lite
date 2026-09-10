@@ -202,7 +202,7 @@ expect "push creates the scheduled-tasks directory on a box that has none" 0 "pr
 reset_trees; install_all
 rm -rf "$REPO/routines/$R1"
 expect "push over a missing source routine exits 1 rather than reporting success" 1 \
-  "no such routine" -- run_sync push
+  "is not a directory" -- run_sync push
 printf '%s' "$out" | grep -q 'were not synced' \
   && ok "...and says so in the summary" || ko "the summary claims a clean push -- $out"
 
@@ -515,29 +515,124 @@ expect "push replaces a link-to-a-directory standing at SKILL.md" 0 "republished
   && ok "...and nothing was written through it into the link's target" \
   || ko "push wrote into $TMP/linktarget: $(ls -A "$TMP/linktarget")"
 
+# --- pull is the repair, up to a checkout routine that is gone -----------------------------------
+# "pull repairs the checkout" has to include the plainest breakages, or the recovery command
+# cannot recover. status and push still refuse: only pull reads on past a broken source.
+reset_trees; install_all
+printf 'body v2 -- the installed edit\n' >> "$TMP/installed/$R1/SKILL.md"
+rm -rf "$REPO/routines/$R1"
+expect "pull restores a checkout routine that was deleted" 0 "pulled into" -- run_sync pull
+[ -f "$REPO/routines/$R1/SKILL.md" ] \
+  && ok "...recreating its directory" || ko "$REPO/routines/$R1/SKILL.md was not restored"
+grep -q 'the installed edit' "$REPO/routines/$R1/SKILL.md" \
+  && ok "...with the installed copy's content" || ko "the restored prompt is not the installed one"
+expect "...leaving status clean" 0 "all local routines in sync" -- run_sync
+
+reset_trees; install_all
+rm -rf "$REPO/routines/$R1"
+expect "status still calls a deleted checkout routine a problem" 1 "is not a directory" -- run_sync
+expect "...and push still refuses to install one" 1 "refusing to install it" -- run_sync push
+
+reset_trees; install_all
+rm -rf "$REPO/routines/$R1"
+expect "pull --dry-run says it would restore it, and does not" 0 "would restore" -- run_sync pull --dry-run
+[ ! -e "$REPO/routines/$R1" ] \
+  && ok "...restoring nothing" || ko "pull --dry-run wrote $REPO/routines/$R1"
+
+# A checkout routine linked out of the tree: the link is replaced, its target untouched.
+reset_trees; install_all
+mkdir -p "$TMP/outside3"
+printf 'external\n' > "$TMP/outside3/SKILL.md"
+rm -rf "$REPO/routines/$R1"
+ln -s "$TMP/outside3" "$REPO/routines/$R1"
+expect "pull replaces a checkout routine that is a symlink" 0 "pulled into" -- run_sync pull
+[ -d "$REPO/routines/$R1" ] && [ ! -L "$REPO/routines/$R1" ] \
+  && ok "...with a real directory" || ko "$REPO/routines/$R1 is still a link"
+grep -q '^external$' "$TMP/outside3/SKILL.md" \
+  && ok "...and the link's target untouched" || ko "pull wrote through the link"
+
+# The one the diff shortcut hid: a checkout SKILL.md that is a LINK to byte-identical content.
+# `diff` follows it and reports no difference, so the pull used to exit 0 having done nothing.
+reset_trees; install_all
+rm -f "$REPO/routines/$R1/SKILL.md"
+ln -s "$TMP/installed/$R1/SKILL.md" "$REPO/routines/$R1/SKILL.md"
+expect "pull repairs a linked checkout SKILL.md whose bytes already match" 0 "pulled into" -- \
+  run_sync pull
+[ -f "$REPO/routines/$R1/SKILL.md" ] && [ ! -L "$REPO/routines/$R1/SKILL.md" ] \
+  && ok "...replacing the link with a real file" \
+  || ko "the checkout SKILL.md is still a link, and the pull claimed to be done"
+expect "...so status no longer calls the checkout unusable" 0 "all local routines in sync" -- run_sync
+expect "...and a following push does not refuse it" 0 "routine(s) updated" -- run_sync push
+# The control: identical bytes as a REAL file are in sync and pull does nothing, so the case
+# above is the link's doing.
+reset_trees; install_all
+out=$(run_sync pull 2>&1); rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '0 routine(s) updated' \
+  && ok "...while identical real files leave pull with nothing to do" \
+  || ko "pull copied over trees that already match (rc=$rc) -- $out"
+
+# --- a failing publish is a failure, not a success over the old contents -------------------------
+# publish_checked is called as an `if` condition, which suspends `set -e` for the whole call, so
+# every step inside publish_dir checks itself. And presence is not enough afterwards: a `cp` that
+# failed leaves the OLD prompt standing, which satisfies "there is a SKILL.md".
+reset_trees; install_all
+printf 'body v2 -- must not be reported as published\n' >> "$REPO/routines/$R1/SKILL.md"
+mkdir -p "$TMP/failbin"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/failbin/cp"
+chmod +x "$TMP/failbin/cp"
+out=$(env PATH="$TMP/failbin:$PATH" CLAUDE_SCHEDULED_TASKS_DIR="$TMP/installed" "$SR" push 2>&1); rc=$?
+[ "$rc" -eq 1 ] \
+  && ok "a push whose cp fails exits 1" || ko "push with a failing cp exited $rc -- $out"
+printf '%s' "$out" | grep -q "$R1: pushed to" \
+  && ko "...but it still reported the routine pushed -- $out" \
+  || ok "...and does not report the routine pushed"
+printf '%s' "$out" | grep -q 'failed part-way\|still differs from' \
+  && ok "...saying the destination is not what the checkout holds" \
+  || ko "no diagnosis of the failed publish -- $out"
+grep -q 'must not be reported as published' "$TMP/installed/$R1/SKILL.md" \
+  && ko "the new content reached the installation despite the failing cp" \
+  || ok "...while the old installed prompt is still there, unclaimed"
+# The control: the same push without the shim on PATH succeeds, so the failure above is the cp's.
+expect "...while the same push with a working cp succeeds" 0 "pushed to" -- run_sync push
+grep -q 'must not be reported as published' "$TMP/installed/$R1/SKILL.md" \
+  && ok "...and does land the new content" || ko "the working push did not land the content"
+
 # --- publish_checked reads its own result, and that reading can fail -----------------------------
 # The post-condition is the guard on the guard: with every case above passing, no publish reaches
 # it, and a claim that cannot fail is worth nothing. So build a copy of the script with the
 # file-kind guard deleted -- the defect the round-4 review found -- and require the post-condition
 # to catch it. Nothing here weakens the real script; it is the control that gives the real
 # script's "republished" line its meaning.
+# strip_marked_block <name> <out>: a copy of the tracked script with the block between
+# `# >>> <name>` and `# <<< <name>` deleted. Every caller checks that the strip removed
+# something, so a marker that moved makes the control fail loudly instead of passing vacuously.
+strip_marked_block() {
+  SMB_NAME="$1" awk '
+    $0 ~ "^ *# >>> " ENVIRON["SMB_NAME"] { skip = 1 }
+    !skip { print }
+    $0 ~ "^ *# <<< " ENVIRON["SMB_NAME"] { skip = 0 }
+  ' "$SYNC" > "$2"
+  chmod +x "$2"
+}
+# strip_check <name> <file> <label>: the markers were both in the tracked script and none is left.
+strip_check() {
+  local marks stripped o_lines s_lines shrank
+  marks=$(grep -c "$1" "$SYNC" 2>/dev/null) || true
+  stripped=$(grep -c "$1" "$2" 2>/dev/null) || true
+  o_lines=$(wc -l < "$SYNC" | tr -d ' ')
+  s_lines=$(wc -l < "$2" | tr -d ' ')
+  shrank=$((o_lines - s_lines))
+  if [ "${marks:-0}" -eq 2 ] && [ "${stripped:-1}" -eq 0 ] && [ "$shrank" -ge 3 ]; then
+    ok "$3 ($shrank lines removed)"
+  else
+    ko "$3: the $1 markers are not both in $SYNC, or the strip removed nothing (marks=${marks:-0} left=${stripped:-?} shrank=$shrank) -- the control below proves nothing"
+  fi
+}
 BROKEN="$TMP/broken"
 mkdir -p "$BROKEN/scripts"
-awk '/^ *# >>> kind-guard/ { skip = 1 } !skip { print } /^ *# <<< kind-guard/ { skip = 0 }' \
-  "$SYNC" > "$BROKEN/scripts/sync-routines.sh"
-chmod +x "$BROKEN/scripts/sync-routines.sh"
-# `grep -c` PRINTS 0 and EXITS 1 when nothing matches, so `|| echo 0` would append a second
-# zero and every arithmetic test below would error out.
-marks=$(grep -c 'kind-guard' "$SYNC" 2>/dev/null) || true
-stripped=$(grep -c 'kind-guard' "$BROKEN/scripts/sync-routines.sh" 2>/dev/null) || true
-orig_lines=$(wc -l < "$SYNC" | tr -d ' ')
-strip_lines=$(wc -l < "$BROKEN/scripts/sync-routines.sh" | tr -d ' ')
-shrank=$((orig_lines - strip_lines))
-if [ "$marks" -eq 2 ] && [ "$stripped" -eq 0 ] && [ "$shrank" -ge 3 ]; then
-  ok "a copy of the script without the file-kind guard was built ($shrank lines removed)"
-else
-  ko "the kind-guard markers are not both in $SYNC, or the strip removed nothing (marks=$marks stripped=$stripped shrank=$shrank) -- the control below proves nothing"
-fi
+strip_marked_block kind-guard "$BROKEN/scripts/sync-routines.sh"
+strip_check kind-guard "$BROKEN/scripts/sync-routines.sh" \
+  "a copy of the script without the file-kind guard was built"
 cp -R "$REPO/routines" "$BROKEN/routines"
 rm -rf "$TMP/broken-installed"
 mkdir -p "$TMP/broken-installed"
@@ -553,6 +648,39 @@ fi
 printf '%s' "$out" | grep -q "$R1: republished to" \
   && ko "it still printed 'republished' for a routine it did not republish -- $out" \
   || ok "...and does not call it republished"
+# The second clause, and the one the round-5 review asked for by name: presence is not enough,
+# the destination must HOLD THE SOURCE. prompt_problem cannot see this -- a stale leftover file
+# sits beside a perfectly good SKILL.md -- so it needs its own guard-less copy, without the
+# pruning pass.
+NOPRUNE="$TMP/noprune"
+mkdir -p "$NOPRUNE/scripts"
+strip_marked_block prune-guard "$NOPRUNE/scripts/sync-routines.sh"
+strip_check prune-guard "$NOPRUNE/scripts/sync-routines.sh" \
+  "a copy of the script that publishes without pruning was built"
+cp -R "$REPO/routines" "$NOPRUNE/routines"
+rm -rf "$TMP/noprune-installed"
+mkdir -p "$TMP/noprune-installed"
+for r in $LOCAL_ROUTINES; do cp -R "$NOPRUNE/routines/$r" "$TMP/noprune-installed/$r"; done
+printf 'a file the checkout no longer has\n' > "$TMP/noprune-installed/$R1/leftover.md"
+out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/noprune-installed" "$NOPRUNE/scripts/sync-routines.sh" push 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'still differs from'; then
+  ok "the post-condition catches a destination that has a SKILL.md but is not the source"
+else
+  ko "the prune-less copy reported rc=$rc without the tree comparison firing -- $out"
+fi
+printf '%s' "$out" | grep -q "$R1: pushed to" \
+  && ko "...but it still reported the routine pushed -- $out" \
+  || ok "...and does not report it pushed"
+# The control on that one: with nothing extra installed, the same prune-less copy succeeds.
+rm -rf "$TMP/noprune-installed"
+mkdir -p "$TMP/noprune-installed"
+for r in $LOCAL_ROUTINES; do cp -R "$NOPRUNE/routines/$r" "$TMP/noprune-installed/$r"; done
+printf 'body v2\n' >> "$NOPRUNE/routines/$R1/SKILL.md"
+out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/noprune-installed" "$NOPRUNE/scripts/sync-routines.sh" push 2>&1); rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'pushed to' \
+  && ok "...while the same copy publishes cleanly with nothing left over" \
+  || ko "the prune-less copy fails even a plain push (rc=$rc): $out"
+
 # The control on the control: the same guard-less copy over a destination with nothing in the way
 # publishes cleanly, so the failure above is the missing guard and not the copy itself.
 rm -rf "$TMP/broken-installed"
