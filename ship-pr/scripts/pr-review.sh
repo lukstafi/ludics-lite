@@ -455,15 +455,40 @@ resolve_repo() {
 # not carry one, so a caller can tell "no repo named" from "this repo" — and REF_NUM, and returns 1
 # on anything that is not a number, leaving the message to the caller: what the number is called
 # ("PR", "run id") is the only part of the refusal that differs.
+#
+# The WHOLE argument is validated, not the tail after the last `#`. Splitting on the last
+# delimiter and checking only what follows it accepts an argument carrying unparsed input in
+# front of a valid one: `owner/repo#111#222` would name run 222, and `junk#123` run 123, each
+# silently — a verdict about a target the caller did not name, which is the failure this parse
+# exists to prevent rather than a shape to be lenient about. So: exactly one `#`, exactly one `/`
+# before it with both halves nonempty, and nothing outside the characters GitHub allows in an
+# owner or a repository name.
 parse_ref() {
+  local repo num
   REF_REPO=""
+  REF_NUM=""
   case "$1" in
-  */*"#"*) REF_REPO="${1%%#*}" ;;
+  *"#"*)
+    repo="${1%%#*}"
+    num="${1#*#}"
+    case "$num" in *"#"*) return 1 ;; esac
+    case "$repo" in
+    */*/* | /* | */) return 1 ;;
+    */*) ;;
+    *) return 1 ;;
+    esac
+    case "$repo" in *[!A-Za-z0-9._/-]*) return 1 ;; esac
+    ;;
+  *)
+    repo=""
+    num="$1"
+    ;;
   esac
-  REF_NUM="${1##*#}"
-  case "$REF_NUM" in
+  case "$num" in
   '' | *[!0-9]*) return 1 ;;
   esac
+  REF_REPO="$repo"
+  REF_NUM="$num"
   return 0
 }
 

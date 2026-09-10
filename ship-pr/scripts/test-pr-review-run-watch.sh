@@ -192,6 +192,30 @@ test_malformed_run_argument_is_refused() {
   assert_eq "$(gh_calls)" "" "a malformed invocation reads nothing"
 }
 
+# An argument that carries unparsed input in FRONT of a valid one is the same wrong-target
+# failure, arriving through the parse instead of through the cwd: taking the tail after the last
+# `#` would name run 222 and run 123 here, and answer about them.
+test_unparsed_prefixes_are_refused() {
+  reset_fixture
+  run_await example/repo#111#222
+  assert_eq "$AWAIT_RC" 2 "a second '#' is refused ($AWAIT_OUT)"
+  assert_eq "$(gh_calls)" "" "run 222 must not be read"
+  reset_fixture
+  run_await -R example/repo junk#123
+  assert_eq "$AWAIT_RC" 2 "a junk prefix before '#' is refused ($AWAIT_OUT)"
+  assert_eq "$(gh_calls)" "" "run 123 must not be read"
+  reset_fixture
+  run_await -R example/repo '#123'
+  assert_eq "$AWAIT_RC" 2 "a bare '#123' is refused ($AWAIT_OUT)"
+  reset_fixture
+  run_await example/repo/extra#4242
+  assert_eq "$AWAIT_RC" 2 "a third path segment is refused ($AWAIT_OUT)"
+  reset_fixture
+  run_await "example repo#4242"
+  assert_eq "$AWAIT_RC" 2 "a repo outside GitHub's name characters is refused ($AWAIT_OUT)"
+  assert_eq "$(gh_calls)" "" "nothing may be read on any of these"
+}
+
 # --- the verdicts the refusals must not swallow -----------------------------------------------
 
 # A 4xx is the API answering about the pair you named, so it is an invocation error too — but it
@@ -250,16 +274,22 @@ test_parse_ref() {
   parse_ref 34 || bail "a bare number should parse"
   assert_eq "$REF_REPO" "" "a bare number carries no repo, and says so as empty"
   assert_eq "$REF_NUM" 34 "the bare number is the number"
-  set +e
-  parse_ref example/repo#x
-  local rc=$?
-  set -e
-  assert_eq "$rc" 1 "a non-numeric tail does not parse"
-  set +e
-  parse_ref ""
-  rc=$?
-  set -e
-  assert_eq "$rc" 1 "an empty argument does not parse"
+  # The names GitHub actually allows on both halves, so the tightening below refuses only what
+  # cannot be a repository.
+  parse_ref my-org_1.x/repo.name-2#7 || bail "dots, dashes and underscores should parse"
+  assert_eq "$REF_REPO" my-org_1.x/repo.name-2 "the repo comes through intact"
+  assert_eq "$REF_NUM" 7 "and the number with it"
+  local rc bad
+  for bad in example/repo#x "" "#123" "junk#123" "example/repo#111#222" "example/repo/extra#1" \
+    "example repo#1" "/repo#1" "example/#1" "example/repo#" "example/repo"; do
+    set +e
+    parse_ref "$bad"
+    rc=$?
+    set -e
+    assert_eq "$rc" 1 "'$bad' must not parse"
+    assert_eq "$REF_REPO" "" "'$bad' must leave no repo behind"
+    assert_eq "$REF_NUM" "" "'$bad' must leave no number behind"
+  done
 }
 
 tests=(
@@ -268,6 +298,7 @@ tests=(
   test_owner_name_hash_run_is_accepted
   test_conflicting_repos_are_refused
   test_malformed_run_argument_is_refused
+  test_unparsed_prefixes_are_refused
   test_a_rejected_pair_is_not_a_failed_run
   test_a_failed_run_is_still_exit_1
   test_transport_failure_is_unknown
