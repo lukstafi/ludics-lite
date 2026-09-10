@@ -22,6 +22,10 @@
 #                                       logs the endpoint to $REQUEST_LOG (and, when paginated,
 #                                       $PAGINATE_LOG) if the suite set them; the answer goes
 #                                       through the --jq filter the call carried, if any
+#   retune <NAME>=<value>...            moves pr-review.sh's source-time constants (GRACE, STALL,
+#                                       ROUND_GAP, ABSENT_GRACE, CHECKS_INTERVAL, …) for the
+#   restore_tuning                      current case; run_tests restores them when it ends, and a
+#                                       case that wants them back sooner calls restore_tuning
 #   stub <fn>...                        declares the library functions this suite redefines on
 #                                       purpose (the merge suite's build_checks, run_signal and
 #                                       warn_base_drift)
@@ -45,6 +49,8 @@
 # a reporter named `fail`), declare a stub and honour it, declare one and do not, stub a name the
 # library lacks, redefine one of this file's own helpers, and define a function before sourcing.
 # The negative controls are what prove the guard can fail; CI runs it beside the nine suites.
+# `retune` is covered in the same run, by a pair of cases: one moves two constants, the next reads
+# them back as pr-review.sh set them, which is the restore no case performs itself.
 
 TEST_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 TEST_LIB_FILE="$TEST_LIB_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -64,8 +70,19 @@ export SHIP_PR_TEST_SOURCE_ONLY=1
 export SHIP_PR_STATE_DIR=off
 export SHIP_PR_API_ATTEMPTS=1
 export SHIP_PR_API_BACKOFF=0
+# The variable names in scope on either side of the source, so what pr-review.sh sets when it is
+# sourced can be named exactly: that difference is the set `retune` accepts. The seeds are the
+# three names this stanza itself introduces — each is set after the snapshot it would spoil, so
+# without them they would read as the library's.
+lib_vars_before=" $(compgen -v | tr '\n' ' ')lib_vars_before lib_var HELPER_CONSTANTS "
 # shellcheck source=pr-review.sh
 source "$HELPER"
+HELPER_CONSTANTS=""
+for lib_var in $(compgen -v); do
+  case "$lib_vars_before" in *" $lib_var "*) continue ;; esac
+  HELPER_CONSTANTS="$HELPER_CONSTANTS $lib_var "
+done
+unset lib_vars_before lib_var
 
 # --- the reporter and the assertions ----------------------------------------------------------
 # Not `fail`: that is pr-review.sh's, and its refusals' exit codes are what the suites read.
@@ -150,6 +167,60 @@ gh_fixture_answer() {
   fi
 }
 
+# --- retuning pr-review.sh's source-time constants --------------------------------------------
+# GRACE, STALL, ROUND_GAP, ABSENT_GRACE, CHECKS_INTERVAL and the rest are read from the
+# environment ONCE, when pr-review.sh is sourced. So `SHIP_PR_REVIEW_GRACE=1 run_watch ...` reaches
+# nothing in a suite that sourced the script minutes earlier: a case that needs a different clock
+# has to assign the constant itself. Done by hand that is a save, an assignment and a restore per
+# case (the `grace_was` triple the watch suite carried six times over), and the restore is the part
+# that gets forgotten — a constant left retuned leaks into every case after it, which is a wrong
+# RESULT, not a failure. `retune` remembers the value as sourced and `run_tests` puts it back when
+# the case ends, so no case has to.
+TUNED_SAVED=()
+
+# retune <NAME>=<value>...: move constants for the current case. A name pr-review.sh does not set
+# when it is sourced is a typo — assigning it would invent a variable the script never reads, and
+# the case would pass while proving nothing — so it is refused.
+retune() {
+  local assignment name
+  [ $# -gt 0 ] || bail "retune: no constant named"
+  for assignment in "$@"; do
+    case "$assignment" in
+    [A-Za-z_]*=*) ;;
+    *) bail "retune: '$assignment' is not a NAME=value assignment" ;;
+    esac
+    name=${assignment%%=*}
+    case "$HELPER_CONSTANTS" in
+    *" $name "*) ;;
+    *) bail "retune $name: pr-review.sh sets no $name when it is sourced — nothing to retune" ;;
+    esac
+    # Only the FIRST retune of a name is saved, so a case that moves one constant twice is still
+    # restored to the value pr-review.sh gave it, not to the intermediate.
+    case " $(lib_tuned_names) " in
+    *" $name "*) ;;
+    *) TUNED_SAVED+=("$name=${!name-}") ;;
+    esac
+    printf -v "$name" '%s' "${assignment#*=}"
+  done
+}
+
+lib_tuned_names() {
+  local assignment
+  [ "${#TUNED_SAVED[@]}" -eq 0 ] || for assignment in "${TUNED_SAVED[@]}"; do
+    printf '%s ' "${assignment%%=*}"
+  done
+}
+
+# restore_tuning: every retuned constant back to the value it was sourced with. run_tests calls it
+# after each case; a case that wants the constants back before its own assertions may call it too.
+restore_tuning() {
+  local assignment
+  [ "${#TUNED_SAVED[@]}" -eq 0 ] || for assignment in "${TUNED_SAVED[@]}"; do
+    printf -v "${assignment%%=*}" '%s' "${assignment#*=}"
+  done
+  TUNED_SAVED=()
+}
+
 # --- the stub declarations and the shadow guard -----------------------------------------------
 # `declare -F <names>` under extdebug prints "<name> <line> <file>" per function; the option is
 # set in a subshell so its debugger side effects (function and error tracing) touch nothing else.
@@ -216,13 +287,15 @@ check_shadows() {
   }
 }
 
-# run_tests <case>...: the guard, then the cases in order, each announced on stdout.
+# run_tests <case>...: the guard, then the cases in order, each announced on stdout. A case's
+# retuned constants are put back before the next one starts, whether or not it restored them.
 run_tests() {
   local test_name
   check_shadows
   [ $# -gt 0 ] || bail "run_tests: no cases named"
   for test_name in "$@"; do
     "$test_name"
+    restore_tuning
     echo "PASS: $test_name"
   done
 }
@@ -382,6 +455,50 @@ test_gh_fixture_parse() {
   PAGINATE_LOG=""
 }
 
+# --- retune, and the restore no case performs itself -------------------------------------------
+# The values pr-review.sh gave the two constants when this file sourced it, read once so the pair
+# below asserts against the script's own defaults rather than a number copied out of it.
+GRACE_AS_SOURCED="$GRACE"
+ABSENT_GRACE_AS_SOURCED="$ABSENT_GRACE"
+
+test_retune_moves_a_constant() {
+  assert_eq "$GRACE" "$GRACE_AS_SOURCED" "the case starts from the grace pr-review.sh was sourced with"
+  retune GRACE=1 ABSENT_GRACE=0
+  assert_eq "$GRACE" 1 "the grace this case runs under"
+  assert_eq "$ABSENT_GRACE" 0 "and a second constant in the same call"
+  # Twice over, which is what a case with a control in it does: the saved value is still the one
+  # pr-review.sh set, not the 1 above — restoring to that would leak the case's own clock.
+  retune GRACE=2
+  assert_eq "$GRACE" 2 "the second move takes"
+  # A case may put them back mid-case; the next case proves it need not.
+  restore_tuning
+  assert_eq "$GRACE" "$GRACE_AS_SOURCED" "restore_tuning returns the value as sourced, not the first move"
+  retune GRACE=3
+  assert_eq "$GRACE" 3 "and retuning again after a restore still works"
+}
+
+# Listed immediately after the case above, and reading what that case left behind: nothing there
+# restored GRACE=3 or ABSENT_GRACE=0, so anything but the sourced values here is the leak.
+test_retune_is_undone_when_the_case_ends() {
+  assert_eq "$GRACE" "$GRACE_AS_SOURCED" "run_tests restored the grace the case before it moved"
+  assert_eq "$ABSENT_GRACE" "$ABSENT_GRACE_AS_SOURCED" "and every other constant that case moved"
+}
+
+# A typo would otherwise invent a variable pr-review.sh never reads, and the case would pass while
+# running under the untouched constant it meant to move.
+test_retune_of_a_name_the_script_does_not_set_is_refused() {
+  control 'retune GARCE=1'
+  assert_eq "$CONTROL_RC" 1 "an unknown constant is the reporter's exit 1 ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "retune GARCE: pr-review.sh sets no GARCE when it is sourced" \
+    "the unknown name should be named"
+  assert_not_contains "$CONTROL_OUT" "PASS:" "no case may run"
+  # A bare name is the other way to write it wrong: `retune GRACE 1` would silently do nothing.
+  control 'retune GRACE 1'
+  assert_eq "$CONTROL_RC" 1 "a bare name is refused too ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "retune: 'GRACE' is not a NAME=value assignment" \
+    "the malformed argument should be quoted"
+}
+
 tests=(
   test_undeclared_shadow_is_refused
   test_every_library_function_is_protected
@@ -392,6 +509,9 @@ tests=(
   test_own_functions_pass
   test_definitions_before_sourcing_are_refused
   test_gh_fixture_parse
+  test_retune_moves_a_constant
+  test_retune_is_undone_when_the_case_ends # must stay directly after the case above
+  test_retune_of_a_name_the_script_does_not_set_is_refused
 )
 
 run_tests "${tests[@]}"
