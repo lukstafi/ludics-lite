@@ -13,7 +13,7 @@ just Markdown and shell loaded by compatible agent harnesses from their skill di
 | `issue-wave` | Run one coordinator over the whole fleet: pick issues from a sequencing plan, launch one worker per issue in its own worktree on a chosen box, and supervise the wave to full merge. |
 
 The `routines/` directory holds the prompts of the scheduled runs that feed these skills: the
-daily sequencing plan `issue-wave` reads, the OCANNL test and formatting sweeps, and the CI-red
+daily sequencing plan `issue-wave` reads, the OCANNL test sweep, and the CI-red
 triage cloud routine. See [routines/README.md](routines/README.md).
 
 The skills were extracted from a private repository with their full history. Its issues were
@@ -37,7 +37,7 @@ done
 ```
 
 The loop skips `routines/`, whose contents are scheduled-task prompts rather than skills, and
-`scripts/`, which holds the lab script; both are linked separately, see the Routines and Lab
+`scripts/`, which holds the lab script; both are installed separately, see the Routines and Lab
 script sections. Rerun the loop after adding a skill. Replace any pre-existing real directory in
 `~/.claude/skills/` by hand first, and diff it against this copy, since a divergent local edit
 may be a fix worth keeping.
@@ -105,13 +105,14 @@ ones. The preflight proves both with a live call, not a status read.
 
 ## Routines
 
-`routines/` carries the scheduled-task prompts the same way the skill directories carry skills,
-and three of the four install the same way: each task directory under `~/.claude/scheduled-tasks`
-replaced by a symlink into this checkout, so an edit made during a run lands here. The desktop
-app's registry (cron, working directory, model) is not in the repository and is recorded in
-[routines/README.md](routines/README.md), which also carries the install loop with its guard
-against linking into a real directory. The fourth, the CI-red triage routine `ship-pr` defers
-master's trailing failures to, runs in the cloud and is synced by hand.
+`routines/` carries the scheduled-task prompts, but not the way the skill directories carry
+skills: since desktop app 1.46388.4 the scheduler refuses a task file reached through a symlink,
+so the two local ones install as copies under `~/.claude/scheduled-tasks`, pushed and pulled by
+`scripts/sync-routines.sh` (`status` after a merge that touched a prompt, `push` to install it).
+The desktop app's registry (cron, working directory, model) is not in the repository and is
+recorded in [routines/README.md](routines/README.md), which also carries the install order and the
+symptoms of an unreadable prompt. The third, the CI-red triage routine `ship-pr` defers master's
+trailing failures to, runs in the cloud and is synced by hand.
 
 ## The lab script
 
@@ -166,17 +167,20 @@ ship-pr/scripts/test-pr-review-reply.sh
 ship-pr/scripts/test-pr-review-run-watch.sh
 scripts/test-wake-lab.sh
 scripts/test-check-prompts.sh
+scripts/test-sync-routines.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all thirteen on Ubuntu, one
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all fifteen on Ubuntu, one
 job per suite, and on macOS (the fleet's bash is 3.2) as one job with a step per suite: the hosted
 macOS runners are scarce enough that four separate macOS jobs queued a green PR for one to two
 hours behind nine minutes of work (ludics-lite#55). Alongside them run `bash -n`, shellcheck at
 error severity, and a check that the two cleanup scripts still carry their parse guard. The suites
 run on every push to main and on a pull request that touches anything but Markdown (the top-level
-README counts as script input, since the fleet suite executes its install loops); two jobs run on
-every head regardless, the prompt hygiene check (`scripts/check-prompts.sh`) and the lint, so every
-PR's merge gate reads a verdict rather than `ABSENT`, a prompt-only PR included.
+README counts as script input, since the fleet suite executes its install loops); three jobs run on
+every head regardless, the prompt hygiene check (`scripts/check-prompts.sh`), the lint, and the
+sync-routines suite, so every PR's merge gate reads a verdict rather than `ABSENT`, a prompt-only
+PR included. The third is unconditional for a reason of its own: the routines-table pin it carries
+is broken by exactly the all-Markdown PR the classification calls prompt-only.
 
 `check-prompts.sh` is the prompt hygiene check itself: every skill and routine `SKILL.md` opens
 with YAML frontmatter carrying one `name`, equal to its directory, and one single-line
@@ -208,6 +212,58 @@ kick reaches the Windows side through whichever of the two aliases answers, sinc
 that is the LAN one; and that the polling loops honour a wall-clock deadline against slow probes,
 which an iteration budget did not (`WAKE_LAB_WAIT_SECONDS`, `WAKE_LAB_WSL_WAIT_SECONDS` and
 `WAKE_LAB_DOWN_WAIT_SECONDS` are what let the suite ask for a one-second one).
+
+`test-sync-routines.sh` runs `scripts/sync-routines.sh` against scratch trees, with
+`CLAUDE_SCHEDULED_TASKS_DIR` pointed at them and over a byte-identical copy of the script inside a
+scratch checkout, so a `pull` case can never reach the real `routines/`. It pins the four states
+`status` reports and the exit code of each — in sync, drift, installed as a symlink, no prompt
+directory — that `push` replaces a symlinked installation with a real directory instead of writing
+through it, and that a destination reached through a link at any component *above* the routine
+directory is refused too: a symlinked `~/.claude` leaves every task directory real and the whole
+tree unreadable. It pins that a directory which exists and is
+still not a usable prompt — a link anywhere inside it, no `SKILL.md`, or a `SKILL.md` that is
+empty or carries no readable frontmatter — is refused rather than certified in sync or pulled over
+the checkout, in both directions and before any branch that would publish it, with legal but unusual prompts as the control that the
+floor is not simply refusing everything — CRLF line endings, unknown frontmatter keys, a
+description quoting the parser's own markers, and this repository's own two prompts; that the two
+roots must be disjoint however the overlap is spelled, since a destination under `routines/` has
+the publisher walk the tree it is writing; that publishing replaces what stands in its way rather than following or
+entering it (a linked directory at either end, a directory or a link to one where `SKILL.md`
+belongs, a file where a directory belongs), checks every step, and reads its own
+result afterwards — that the destination now HOLDS the source, not merely that a `SKILL.md` is
+there, which a failed copy leaves standing. Two copies of the script, each with one guard deleted
+between markers in the source, are what keep that post-condition honest: without the file-kind
+guard it must catch an unusable destination, without the pruning pass it must catch a destination
+that is not the source, and each has the control that the same copy publishes cleanly when
+nothing is in its way. It pins that `pull` is the repair in the other direction, restoring a
+checkout routine that was deleted or linked away, and that it does not take the empty-diff
+shortcut over a linked `SKILL.md` whose bytes already match; that a RETIRED routine still
+installed on a box is reported in every mode and removed by nobody, since deleting a prompt
+directory here retires nothing where the registry entry still names it and the install loop reads
+this repository's list rather than the destination; including the dangling link an
+upgraded box is left with, which a plain existence test calls absent; that publishing through a
+symlinked ancestor is refused at either root while reading through one is only warned about, so a
+linked destination root refuses a `push` and a linked `routines/` refuses a `pull`, each letting
+the other direction through; and that `--help` states both halves of that, since it is the
+contract a caller reads exit codes out of; that a push never
+leaves the installed prompt absent or half-written, sampled by a reader running flat out across
+twelve of them, with a control that the reader can report an absence; and that two modes in one
+invocation are a usage error, since `push` and `pull` write in opposite directions and the last
+token used to win. It pins that
+`--dry-run` copies nothing in any mode, the usage exits, and that nothing infers a registration
+state from a missing prompt directory — the registry is the desktop
+app's and unreadable here, so `push` says to check the task list rather than reporting what is in
+it. It also pins what ludics-lite#77 found unpinned: that the script's `LOCAL_ROUTINES` lists
+exactly the rows of `routines/README.md` whose Kind is `local scheduled task`. That comparison
+reads the table narrowly and refuses an empty read, so a mangled table cannot pass it vacuously,
+and four negative controls show it can fail; `check-prompts.sh` keeps its per-directory lookup and
+gains no table model. Two last cases pin what the comparison is worth: that the workflow job
+running this suite carries no `if:`/`needs:`, since an all-Markdown PR is both what the diff
+classification calls prompt-only and the one shape that can break the pin, and that the tracked
+mode of `sync-routines.sh` is 755, which a `> tmp && mv` rewrite drops silently. Its assertions read
+strings rather than piping them into `grep -q`, which exits at the first match and can SIGPIPE the
+writer under `pipefail`: a pin that fails one run in many is worse than no pin, and the one it
+carries decides whether an unconditional CI job is worth having.
 
 `test-pr-review-checks-absent.sh` drives the build gate against a canned Actions API, one answer
 per polling round, and pins everything the check list alone cannot say about a head. Exit 4 (no

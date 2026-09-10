@@ -75,16 +75,51 @@ next sweep can always wake them again.
 
 ## 2. Run the sweep
 
-Always use origin/master's copy of the script, the checkout is sometimes on a WIP branch:
+Always use origin/master's copy of the script, the checkout is sometimes on a WIP branch. The
+script is NOT standalone: it resolves siblings relative to its own directory
+(`tools/aggregate-skips.sh`, and `benchmarks/fixture_digest.py` for the measurement-box matrix),
+so a lone copy of `tools/sweep.sh` dies with exit 2 before testing anything. Extract the two
+directories together from master instead of copying one file:
 
     mkdir -p ~/.ocannl-sweep
     git -C ~/ocannl-staging fetch -q origin master
-    git -C ~/ocannl-staging show origin/master:tools/sweep.sh > ~/.ocannl-sweep/sweep.sh
-    chmod +x ~/.ocannl-sweep/sweep.sh
+    rm -rf ~/.ocannl-sweep/tools ~/.ocannl-sweep/benchmarks
+    git -C ~/ocannl-staging archive origin/master tools benchmarks | tar -x -C ~/.ocannl-sweep
+
+The `mkdir` is not redundant on a box where the sweep has run before: `tar -C` requires the
+directory to exist, and `~/.ocannl-sweep` is also the script's state directory
+(`OCANNL_TOOL_SWEEP_STATE`), so a fresh host, or one where it was cleared, has none.
+
+If a future master grows a dependency outside those two directories, the failure is an exit 2
+during startup: today the missing sibling is reported by the interpreter's own error above the
+`sweep:` line (`cannot parse measurement boxes at <sha>` is what the script itself says when
+`benchmarks/fixture_digest.py` is not there), so read both lines, not just the `sweep:` one.
+Widen the pathspec in the `git archive` line above (that is the whole fix), then relaunch once.
+
+The script refuses to run without `OCANNL_TOOL_SWEEP_LOCAL_BOX`, the portable measurement-box ID
+of THIS host — one of the names on the `# measurement-boxes:` line of
+`benchmarks/fixtures/DIGESTS.txt` (currently `m4-max minix rog-nv`). It deliberately will not
+infer that identity from the hostname or CPU model (either can name a different machine the same
+way), so the binding is per-host site configuration, one line in
+`~/.config/ocannl-sweep/local-box` (on this Mac, the Apple M4 Max, it says `m4-max`). Do not
+hardcode a box name in this routine: read the file, and treat its absence exactly like the missing
+`~/.config/wake-lab/hosts.sh` in step 1 — the setup is the finding, nothing was swept, and it is
+notify-worthy (step 6):
+
+    box=$(cat ~/.config/ocannl-sweep/local-box 2>/dev/null)
+    [ -n "$box" ] || { echo "no box ID at ~/.config/ocannl-sweep/local-box; nothing swept" >&2; exit 1; }
+
+If that fires, DO NOT launch the sweep. An empty `OCANNL_TOOL_SWEEP_LOCAL_BOX` is not "let the
+script decide": it dies with the same exit 2 as any other unusable environment, which reads like
+something the corrected relaunch below could fix and is not. Go straight to step 5 and report the
+missing site configuration as the finding, then notify in step 6.
+
+A typo in the file is caught by the script itself: it checks that every declared box has a sweep
+unit, so a misspelled local ID dies with `declared measurement box 'm4-max' has no sweep unit`.
 
 Then, if today is Sunday, run the weekly full check
-`OCANNL_TOOL_SWEEP_CAP=10800 ~/.ocannl-sweep/sweep.sh --slow --force`; otherwise
-`~/.ocannl-sweep/sweep.sh`. `--force` is what makes a unit record `pass` with `execution=forced`
+`OCANNL_TOOL_SWEEP_LOCAL_BOX=$box OCANNL_TOOL_SWEEP_CAP=10800 ~/.ocannl-sweep/tools/sweep.sh --slow --force`;
+otherwise `OCANNL_TOOL_SWEEP_LOCAL_BOX=$box ~/.ocannl-sweep/tools/sweep.sh`. `--force` is what makes a unit record `pass` with `execution=forced`
 (a `dune clean` plus alias `--force`, so every test action genuinely re-executes); a weekday run
 is incremental and records `incremental-pass`, which is evidence about the changed cone but does
 not refresh execution coverage. The raised cap is for the forced runs only: a cold rebuild plus
@@ -95,6 +130,15 @@ The script deliberately exits 0 even when tests
 fail; its exit code tells you nothing about test results, so do not read anything into it. Read
 the results from the history file instead.
 
+The ONE exit code that does carry meaning is 2: the script found its launch environment unusable
+(a `sweep: ...` line on stderr says why) and stopped BEFORE testing anything, on any machine. A
+bare exit 2 is therefore a whole day of non-coverage for all five backends, not a test result:
+read the `sweep:` line first, and relaunch only if it names something this routine can correct
+from the instructions above (a missing box ID, a stale or incomplete extraction, "another sweep is
+running"). Do not retry the same command hoping for a different answer — the 2026-09-05 run burned
+a second attempt on that before recognizing the failure. Whatever the outcome of the single
+corrected relaunch, an exit 2 is reported in step 5 as non-coverage and notified in step 6.
+
 ## 3. Diff against the previous sweep
 
 Read `~/.ocannl-sweep/history.tsv` (columns: when, machine, backend, ref, outcome, seconds,
@@ -104,6 +148,11 @@ column existed).
 For every unit in today's run whose outcome is not one of those, compare
 `~/.ocannl-sweep/logs/<stamp>-<machine>-<backend>.fingerprint` against the fingerprint of that
 same unit's most recent PREVIOUS non-pass run. Only a DIFFERENCE is news.
+
+The `machine` column holds the measurement-box ID, so rows and filenames from before 2026-09-05
+spell the same units `local` (now `m4-max`) and `rog` (now `rog-nv`); `minix` is unchanged. When
+looking for a unit's previous non-pass run, match on `backend` and accept the old machine spelling
+of its fingerprint filename.
 
 A unit going from `pass` to `fail`, or a new entry appearing in a fingerprint, IS news.
 
@@ -159,13 +208,16 @@ Outcomes are `pass`, `incremental-pass`, `legacy-pass`, `fail`, `skip`, `timeout
 put that machine's worktree on the commit under test, so NOTHING was tested there — report it as
 non-coverage rather than as a test failure, and treat it as notify-worthy. If the script itself
 exits 2, no sweep happened at all: report that as the finding and do not read the history file as
-though the run had completed.
+though the run had completed. The same applies when this routine never got as far as launching
+it because `~/.config/ocannl-sweep/local-box` is missing: report the missing site configuration,
+not the backends.
 
 ## 6. Notify
 
 Send a PushNotification ONLY if there is (a) a new failure or timeout, (b) a staleness flag,
 (c) a skip-coverage `FAIL`, or a FAIL/POTENTIAL claim set that differs from the previous report's,
-or (d) an `error` outcome or a script exit of 2: nothing was tested there, which step 5 already
+or (d) an `error` outcome, a script exit of 2, or a launch refused for a missing
+`~/.config/ocannl-sweep/local-box`: nothing was tested there, which step 5 already
 calls notify-worthy, and it must not go silent for being neither a failure nor yet stale.
 A `FAIL` notifies even when unchanged — it fires at most weekly (forced runs only) and means some
 claim has zero execution coverage on every backend, which must keep reaching a human until fixed;

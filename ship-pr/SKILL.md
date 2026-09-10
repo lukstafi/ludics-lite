@@ -149,6 +149,12 @@ sidesteps both.
 If the branch already has a PR, push to it and reuse it — never open a second one for the same
 branch.
 
+Before **every** push that touches code, run the formatter check the repository's CI gates on,
+if it has one — its AGENTS.md or CLAUDE.md names it (OCANNL: `dune build @fmt`). A
+formatting-only fix push costs a CI round and, since automated reviews fire on every push, a
+review round; a round's fixes are exactly as able to break formatting as the first commit was,
+so the habit belongs on the push and not on the branch.
+
 Write the body as the reviewer's map, not a changelog: what is now true that was not, what the
 tests pin, what changes for existing users, and where the risky corner is. Reviewers — human and
 automated — spend their attention where the body sends it.
@@ -335,7 +341,8 @@ Review fixes round 3: repro commands pinned, keep-fraction pin, exact provenance
 
 The history then reads as a dialogue, which is what a reviewer (or a future archaeologist) needs.
 
-Push, then close out each thread — silent fixes leave the reviewer re-deriving what you did:
+Run the formatter check (*Open*, above) if this round touched code, push, then close out each
+thread — silent fixes leave the reviewer re-deriving what you did:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/pr-review.sh reply <owner>/<repo>#<pr> <comment-id> "Fixed in round N (<sha>, \"<commit subject>\"): <substance>"
