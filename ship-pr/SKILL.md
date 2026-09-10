@@ -217,7 +217,25 @@ a comment's `Reviewed commit:` stamp, taken from the FOOTER a body may quote ano
 — and `watch` compares that to the head it reads after each poll. It compares the machine-readable
 `items:` line `poll` ends with, never the rendered headers: a reviewer body can carry a line that
 looks exactly like one (a review quoting this script's output does), and a watch that scanned the
-rendering would take the quotation for an item. Reviewer activity about some other commit is a *previous* round scrolling past above the
+rendering would take the quotation for an item. **Inline threads at one anchor render as one entry.** The connector posts one finding as several
+threads often enough to matter — round 11 of #66 posted nine threads for four findings — and it
+duplicates by RE-WRITING, so the copies share their location exactly and share no byte of their
+text. So threads at the same anchor (path, commit, author, and every location field the row
+carries) fold into a single entry whose id field lists every thread, with every *distinct* body
+under the id of the thread carrying it:
+
+```
+--- inline id=900+901+902 a.sh:447 commit=252e336 by codex[bot] (3 threads at one location, 3 findings as written; one reply answers all)
+[thread 900]
+…
+```
+
+Read every body — a folded entry can carry more than one finding — and answer once: that id token
+is what `reply` and `resolve` take. A folded entry is still one finding for the loop: the round
+count and the watch's act/quiet decision are unchanged, and every folded id is still advanced past
+by the watermark.
+
+Reviewer activity about some other commit is a *previous* round scrolling past above the
 watermark: it is printed on stderr for the record, the watermark advances past it so it never
 comes back, and the window keeps waiting. That is the shape this repository hit — one window
 exited on a round's inline findings, the reviewer's separate summary review landed seconds later
@@ -320,6 +338,16 @@ Push, then close out each thread — silent fixes leave the reviewer re-deriving
 ~/.claude/skills/ship-pr/scripts/pr-review.sh resolve <owner>/<repo>#<pr> <comment-id>
 ```
 
+The comment id is the token `poll` rendered. Where that was a folded entry — `id=900+901+902`,
+one location the reviewer posted several threads at — paste it back whole: one `reply` posts your
+answer to the first thread and a one-line pointer to it into each duplicate, and one `resolve`
+closes them all. Compose the answer once, covering every body the entry printed.
+
+If such a `reply` fails part-way, the refusal names the retry, and it is not the plain remainder:
+`reply <pr> 901+902 --anchor 900` posts no body at all and points those threads at the answer
+already standing in 900. Handing back the bare suffix would promote 901 to anchor, post your
+answer there a second time and point 902 at the copy.
+
 Cite the round and the commit's subject, not the sha alone. A branch rebased before it merges —
 onto a base that moved, or to resolve a conflict — rewrites every commit, and a reply that says
 only `Fixed in d2bacbc7c` then resolves nowhere in the merged history (staging#633: 27 rounds of
@@ -334,7 +362,10 @@ Check every call in such a batch, not just the last: these are independent invoc
 failing while its neighbours succeed leaves a thread silently unanswered. A `reply` that exits 3
 posted nothing (the gateway refused it) — repeat it; a `resolve` that exits 3 found the thread and
 failed to close it, so repeating that is safe too. Only exit 1 from `resolve` means the thread is
-really not there.
+really not there. A `reply` over a *folded* token is the one batch the script makes itself, and it
+is the one place that rule needs care: if it fails after the anchor's reply landed, the refusal
+says so and names the ids that did not get one — retry with **those**, not with the whole token,
+or the answer is posted twice.
 
 **A finding without a comment id has no thread to reply in — answer it with `comment`.** A review's
 summary body (the `--- review id=… state=…` block a round prints, and the `--- summary id=…` one)

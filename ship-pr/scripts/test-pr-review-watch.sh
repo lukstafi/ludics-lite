@@ -58,6 +58,7 @@ reset_fixture() {
   schedule reviews 1 '[]'
   schedule comments 1 '[]'
   schedule inline 1 '[]'
+  schedule review_comments 1 '[]'
   HEAD_SHA="$H2"
   MERGEABLE_STATE=clean
   FAIL_PULLS=""
@@ -103,11 +104,27 @@ review() { # <id> <commit> <submitted_at> [body]
 # An inline comment carries BOTH commit fields, because they are what the head test turns on:
 # GitHub migrates `commit_id` forward to the current head for a comment whose lines still exist,
 # while `original_commit_id` stays the commit the reviewer wrote it against.
-inline_comment() { # <id> <original commit> <current commit> [body]
+inline_comment() { # <id> <original commit> <current commit> [body] [path] [line] [extra json]
   jq -cn --argjson id "$1" --arg orig "$2" --arg cur "$3" --arg b "${4:-a finding}" \
-    --arg rev "$REVIEWER" \
-    '{id:$id, user:{login:($rev + "[bot]")}, path:"a.sh", line:3, body:$b,
-      original_commit_id:$orig, commit_id:$cur}'
+    --arg p "${5:-a.sh}" --argjson ln "${6:-3}" --argjson extra "${7:-null}" --arg rev "$REVIEWER" \
+    '{id:$id, user:{login:($rev + "[bot]")}, path:$p, line:$ln, body:$b,
+      original_commit_id:$orig, commit_id:$cur} + ($extra // {})'
+}
+
+# How many times a string occurs in the whole of what a watch printed. A fold is only a fold if
+# the duplicated BODY is printed once, and "contains it" cannot tell one copy from three.
+occurrences() { # <haystack> <needle>
+  grep -c -F -- "$2" <<<"$1" || true
+}
+
+# A row as the PER-REVIEW comments endpoint serves it, which is not the shape the flat feed has:
+# no `line` and no `original_line` at all — verified against this repository's live API on
+# 2026-09-10 — with the location carried by position/original_position instead. poll renders such
+# a row as `:0`, so two of them at different places in one file look identical.
+positional_comment() { # <id> <original commit> <body> <position>
+  jq -cn --argjson id "$1" --arg orig "$2" --arg b "$3" --argjson pos "$4" --arg rev "$REVIEWER" \
+    '{id:$id, user:{login:($rev + "[bot]")}, path:"a.sh", body:$b, position:$pos,
+      original_position:$pos, original_commit_id:$orig, commit_id:$orig}'
 }
 
 summary_comment() { # <id> <created_at> <body>
@@ -147,7 +164,7 @@ gh() {
   "repos/$REPO/issues/7/reactions?per_page=100") response=$(feed_answer reactions) ;;
   "repos/$REPO/pulls/7/reviews?per_page=100") response=$(feed_answer reviews) ;;
   "repos/$REPO/issues/7/comments?per_page=100") response=$(feed_answer comments) ;;
-  "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100") response='[]' ;;
+  "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100") response=$(feed_answer review_comments) ;;
   "repos/$REPO/pulls/7")
     if [ -n "$FAIL_PULLS" ] ||
       { [ "$FAIL_PULLS_FROM" -ne 0 ] && [ "$(cat "$FEEDS/round")" -ge "$FAIL_PULLS_FROM" ]; }; then
@@ -269,12 +286,44 @@ test_an_unread_head_holds_nothing_back() {
     "and the exit line says which case it is in"
 }
 
+# The silent half of the fold, found in round 1 of #86. When the flat comments feed lags a new
+# review, poll supplements it from the per-review endpoint, whose rows carry NO line at all — so
+# every one of them renders `:0` and two findings at different places in one file look identical.
+# Folded, the second is answered by a reply it never got and resolved with the first, and the
+# watermark has advanced past its id, so nothing renders it again. The key therefore carries every
+# location field the row has, and `:0` is never the thing two rows are folded on.
+test_rows_with_no_line_are_folded_only_when_their_positions_agree() {
+  reset_fixture
+  local same="the same body, at two places in one file"
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
+  schedule review_comments 1 "[$(positional_comment 900 "$H2" "$same" 12),$(positional_comment 901 "$H2" "$same" 40)]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "the round is acted on"
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:0" "the first row renders with no line"
+  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:0" "and so does the second: they LOOK alike"
+  assert_not_contains "$WATCH_OUT" "id=900+901" \
+    "but two positions in one file are two findings, and folding them loses the second for good"
+  assert_eq "$(occurrences "$WATCH_OUT" "$same")" 2 "each is rendered, so each can be answered"
+  # The control: rows agreeing on every anchor either of them has really are indistinguishable,
+  # and do fold — or the case above would pass on a fold that had simply stopped working.
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
+  schedule review_comments 1 "[$(positional_comment 900 "$H2" "$same" 12),$(positional_comment 901 "$H2" "$same" 12)]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_OUT" "--- inline id=900+901 a.sh:0" \
+    "with nothing to tell them apart, they are one finding and one reply"
+  assert_eq "$(occurrences "$WATCH_OUT" "$same")" 1 "and one body"
+}
+
 # --- what each exit says it exits on --------------------------------------------------------------
 
 test_the_acting_exit_names_the_item() {
   reset_fixture
   schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
-  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2"),$(inline_comment 901 "$H2" "$H2")]"
+  # Two PLACES: two findings, not one posted twice. Threads at one anchor fold into a single entry
+  # (ludics-lite#76), which is the right count for a duplicate and the wrong fixture for a case
+  # about how much else the exit is ending on.
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'a finding' a.sh 3),$(inline_comment 901 "$H2" "$H2" 'another finding' a.sh 9)]"
   run_watch 0,0,0
   assert_eq "$WATCH_RC" 0 "the round ends the wait"
   assert_contains "$WATCH_ERR" \
@@ -549,9 +598,143 @@ test_a_clockless_expected_state_says_so_rather_than_guessing() {
   assert_contains "$LINE" "due for an unknown time" "and the line says so rather than '0s'"
 }
 
+# --- duplicated inline threads ----------------------------------------------------------------
+
+# Round 11 of ludics-lite#66 posted nine inline threads for four findings: the reviewer had
+# duplicated several verbatim, and each duplicate cost its own composed reply and its own resolve.
+# Identical here means identical in everything the entry shows — path, line, body, commit stamp and
+# author — so the folded entry prints exactly what each of its members would have printed, once,
+# under an id that lists them all.
+test_identical_inline_threads_fold_into_one_entry() {
+  reset_fixture
+  local dup="the same finding, posted three times"
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$dup"),$(inline_comment 901 "$H2" "$H2" "$dup"),$(inline_comment 902 "$H2" "$H2" "$dup")]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "a duplicated finding is still a round to act on"
+  assert_contains "$WATCH_OUT" "--- inline id=900+901+902 a.sh:3 commit=${H2:0:7}" \
+    "the three threads render as one entry naming every id, anchor first"
+  assert_contains "$WATCH_OUT" "(3 identical threads, one reply answers all)" \
+    "and the entry says why it carries three ids"
+  assert_eq "$(occurrences "$WATCH_OUT" "$dup")" 1 \
+    "the body is printed once: a fold that still printed it three times saves the caller nothing"
+  assert_contains "$WATCH_OUT" "items: inline:900+901+902:${H2:0:7}:${REVIEWER}[bot]:-" \
+    "the machine index folds with the rendering, and keeps its five fields"
+  assert_contains "$WATCH_ERR" "ending the wait on inline id=900+901+902 commit=${H2:0:7}" \
+    "the exit names the whole list, so it can be handed straight to reply"
+  assert_not_contains "$WATCH_ERR" "more about this head" \
+    "one finding is one item: the fold must not read as several"
+  assert_contains "$WATCH_OUT" "watermark: 902,0,0" \
+    "every duplicate's id is still advanced past — the watermark reads the unfolded feed"
+}
+
+# What folds is a PLACE, not a text — the measured difference between a fold that fires and one
+# that never does. On the round the issue was filed on (#66 head 252e336), grouping by body finds
+# ZERO groups among 51 findings while grouping by the anchor finds four covering nine threads: the
+# reviewer duplicates a finding by RE-WRITING it, and the three threads at one line there carry
+# bodies of 546, 575 and 570 characters saying the same thing. So two threads at one anchor fold
+# whatever their text, and the entry prints EVERY distinct body under the id of its own thread —
+# which is what keeps that safe: the caller sees every word the reviewer wrote and answers once.
+test_threads_at_one_anchor_fold_with_every_body_shown() {
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'the first finding'),$(inline_comment 901 "$H2" "$H2" 'the second finding')]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "the round is acted on"
+  assert_contains "$WATCH_OUT" "--- inline id=900+901 a.sh:3" \
+    "one place is one entry and one reply, whatever the two texts say"
+  assert_contains "$WATCH_OUT" "(2 threads at one location, 2 findings as written" \
+    "and the note says there are two of them to answer"
+  assert_contains "$WATCH_OUT" "[thread 900]" "each body is filed under its own thread id"
+  assert_contains "$WATCH_OUT" "the first finding" "the first body is printed"
+  assert_contains "$WATCH_OUT" "[thread 901]" "including the second thread's"
+  assert_contains "$WATCH_OUT" "the second finding" "and the second body: nothing is dropped"
+  assert_not_contains "$WATCH_OUT" "identical threads" \
+    "they are not identical, and the note must not say so"
+  # Identical bodies keep the shorter rendering: a repeat is printed once.
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'one finding, twice'),$(inline_comment 901 "$H2" "$H2" 'one finding, twice')]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_OUT" "(2 identical threads, one reply answers all)" \
+    "an exact repeat is reported as one"
+  assert_eq "$(occurrences "$WATCH_OUT" "one finding, twice")" 1 "and printed once"
+  assert_not_contains "$WATCH_OUT" "[thread 900]" "with no per-thread labelling to read past"
+}
+
+# The negative control the fold's whole claim rests on: a different PLACE must stay a different
+# entry. Without this the fold could be collapsing unrelated findings and every other case here
+# would still pass.
+test_threads_at_different_places_are_not_folded() {
+  # Same body, different LINE.
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'a finding' a.sh 3),$(inline_comment 901 "$H2" "$H2" 'a finding' a.sh 9)]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:3" "one line"
+  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:9" "and another are two places to fix"
+  # Same body and line, different PATH.
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'a finding' a.sh 3),$(inline_comment 901 "$H2" "$H2" 'a finding' b.sh 3)]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:3" "one file"
+  assert_contains "$WATCH_OUT" "--- inline id=901 b.sh:3" "and another, likewise"
+}
+
+# The key is a deny-list: the whole row minus the fields that MUST differ between two posts of one
+# finding. So a location field nobody enumerated — `side` on a LEFT-vs-RIGHT anchor, a multi-line
+# `start_line`, or one GitHub has yet to invent — keeps two threads apart on its own, and the
+# failure mode of an unknown field is an extra reply rather than a lost finding.
+test_an_unrecognized_field_keeps_two_threads_apart() {
+  reset_fixture
+  local same="the same text at two anchors"
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"side":"LEFT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"side":"RIGHT"}')]"
+  run_watch 0,0,0
+  assert_not_contains "$WATCH_OUT" "id=900+901" "a side the rendering never shows still separates"
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"start_line":3}')]"
+  run_watch 0,0,0
+  assert_not_contains "$WATCH_OUT" "id=900+901" "and so does a multi-line range"
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"an_anchor_github_has_yet_to_invent":"a"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"an_anchor_github_has_yet_to_invent":"b"}')]"
+  run_watch 0,0,0
+  assert_not_contains "$WATCH_OUT" "id=900+901" \
+    "a field this script has never heard of is identifying by default"
+  # The control the deny-list rests on: two threads differing ONLY in the fields that must differ
+  # between two posts of one finding still fold — or the fold would never fire on a real pair.
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"node_id":"A","url":"u/900","html_url":"h/900","pull_request_url":"p","pull_request_review_id":11,"created_at":"2026-09-01T00:00:01Z","updated_at":"2026-09-01T00:00:01Z","reactions":{"url":"r/900"},"_links":{"self":{"href":"s/900"}}}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"node_id":"B","url":"u/901","html_url":"h/901","pull_request_url":"p","pull_request_review_id":12,"created_at":"2026-09-01T00:00:02Z","updated_at":"2026-09-01T00:00:02Z","reactions":{"url":"r/901"},"_links":{"self":{"href":"s/901"}}}')]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_OUT" "--- inline id=900+901 a.sh:3" \
+    "ids, urls, timestamps, reactions, links and the per-comment review id are not the finding"
+  assert_contains "$WATCH_OUT" "(2 identical threads" "and the pair is one finding"
+}
+
+# The commit stamp is in the fold key because it is what `watch` classifies an item BY: folding a
+# finding written against the previous head into one written against this head would force a
+# single verdict onto two different head associations — and here it would drag a stale finding
+# onto stdout as part of this head's round.
+test_the_same_body_against_two_heads_is_not_folded() {
+  reset_fixture
+  local same="a finding the reviewer repeated after the push"
+  schedule inline 1 "[$(inline_comment 900 "$H1" "$H2" "$same"),$(inline_comment 901 "$H2" "$H2" "$same")]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "the finding about this head ends the wait"
+  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:3 commit=${H2:0:7}" \
+    "this head's copy is what the caller acts on"
+  assert_not_contains "$WATCH_OUT" "id=900+901" \
+    "and the previous head's copy is not folded into it"
+  assert_contains "$WATCH_ERR" "(+1 about another commit, below)" \
+    "it stays a separate item, classified by its own stamp"
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:3 commit=${H1:0:7}" \
+    "and is rendered under the stamp it was written against, not this head's"
+}
+
 tests=(
   test_a_review_of_another_head_does_not_end_the_wait
   test_an_inline_finding_is_bound_by_the_commit_it_was_written_against
+  test_identical_inline_threads_fold_into_one_entry
+  test_threads_at_one_anchor_fold_with_every_body_shown
+  test_threads_at_different_places_are_not_folded
+  test_an_unrecognized_field_keeps_two_threads_apart
+  test_the_same_body_against_two_heads_is_not_folded
+  test_rows_with_no_line_are_folded_only_when_their_positions_agree
   test_a_summary_is_bound_by_the_commit_it_names
   test_an_unread_head_holds_nothing_back
   test_the_acting_exit_names_the_item

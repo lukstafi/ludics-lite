@@ -46,6 +46,13 @@
 #     moved after a hand-posted "@codex review". So a 👀 counts as in flight only while it is NEWER
 #     than the reviewer's last word (a review OR its summary comment); once the reviewer has spoken,
 #     the 👀 describes a round that has already landed and is spent;
+#   - the reviewer posts one finding as several inline threads often enough to matter (round 11 of
+#     ludics-lite#66: nine threads for four findings), and each duplicate then costs its own
+#     composed reply and its own resolve — and it duplicates by RE-WRITING, so the copies share
+#     their anchor exactly and share no byte of their text. So threads at the SAME anchor (path,
+#     commit, author and every location field the row carries) fold into one entry listing every
+#     thread id and printing every distinct body, and `reply`/`resolve` take that list, so a
+#     duplicate costs one answer (ludics-lite#76);
 #   - the reviewer's own utterances are that clock, NOT the head commit: a 👀 raised just before
 #     your next push is a round that is genuinely running (seen live on #358 the same evening — 👀
 #     at 20:34:13Z, head committed 20:35:01Z), so "older than the head commit" would declare an
@@ -140,7 +147,12 @@
 #                                          # new comments/reviews above the watermark, each stamped
 #                                          # with the commit it is about; ends with one machine
 #                                          # line naming those items (kind:id:commit:author:state)
-#                                          # and the next watermark
+#                                          # and the next watermark. Inline threads at the SAME
+#                                          # anchor (path, commit, author and every location field
+#                                          # the row carries) render as ONE entry whose id field
+#                                          # lists them all, anchor first — `id=900+901`, the token
+#                                          # `reply` and `resolve` take — with every distinct body
+#                                          # under the id of the thread carrying it
 #   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands ON THE HEAD being
 #                                          # watched; 0 = act, 1 = quiet. Reviewer activity about
 #                                          # another commit is printed on stderr for the record and
@@ -174,8 +186,17 @@
 #                                          # and not just a workflow name (see base_red_detail);
 #                                          # `.github/workflows/base-watch.yml` runs it daily on
 #                                          # this repository's own main and files what it finds
-#   pr-review.sh reply <pr> <comment-id> <body>
-#   pr-review.sh resolve <pr> <comment-id>
+#   pr-review.sh reply <pr> <comment-id>[+<comment-id>...] <body>
+#                                          # the id token poll rendered. A FOLDED entry names
+#                                          # several: the body goes to the first thread and each
+#                                          # duplicate gets a one-line pointer to that reply, from
+#                                          # this one invocation
+#   pr-review.sh reply <pr> <comment-id>[+...] --anchor <comment-id>
+#                                          # no body: the answer already stands in <comment-id>'s
+#                                          # thread, and every id in the token is pointed at it.
+#                                          # What a batch that failed part-way is retried with
+#   pr-review.sh resolve <pr> <comment-id>[+<comment-id>...]
+#                                          # the same token; every thread it names is closed
 #   pr-review.sh comment <pr> <body>       # a plain PR comment, for what has no thread to reply in:
 #                                          # a review SUMMARY's findings, or a '@codex review' nudge
 #   pr-review.sh retry [--read] <gh args...>
@@ -587,11 +608,82 @@ mark_of() {
 # interpolation takes the whole string with it: the comment would not be rendered at all, which
 # on the initialization failure (the one summary that never carries the stamp) is a round
 # silently disappearing from the watch that was waiting for it.
+#
+# `fold_inline` is the last of these: the reviewer posts one finding as several inline threads
+# often enough to matter (round 11 of ludics-lite#66 posted nine threads for four findings,
+# ludics-lite#76), and each duplicate then costs its own composed reply and its own resolve. The
+# fold groups such threads into one entry whose `thread_ids` lists every one of them, anchor first,
+# and the rendering and the index both address it by that list (`id=900+901`) — the token `reply`
+# and `resolve` take, so what poll printed is what the caller pastes back.
+#
+# What folds is a PLACE, not a text. Two threads fold when they are the same anchor — same path,
+# same commit, same author, and identical in every location field the row carries — and the BODY
+# is deliberately not part of that, which is the whole difference between a fold that fires and
+# one that never does. Measured against the round the issue was filed on (#66 head 252e336):
+# grouping by body finds ZERO groups among that PR's 51 findings, while grouping by the anchor
+# finds exactly four, covering nine threads — the issue's own arithmetic — and not one of them
+# mixes unrelated findings. The reviewer duplicates a finding by RE-WRITING it (the three threads
+# at :447 carry bodies of 546, 575 and 570 characters saying the same thing), so a key that
+# demanded equal text would have been a feature that could not fire.
+#
+# Nothing is lost by that, because the entry prints every DISTINCT body, each under the id of the
+# thread carrying it (`body_block`), and only an exact repeat is printed once. So the caller sees
+# every word the reviewer wrote, under one id token, and answers once.
+#
+# The key is a DENY-LIST — the whole row minus the eleven fields that must differ between two
+# posts of one finding (the ids, the urls, the timestamps, the reactions, the links, the review
+# id) and the body. Every other field is identifying by default, present or future, so a field
+# GitHub adds later can only make the fold fire LESS, never more: unfolded is loud (one extra
+# reply) and over-folded is silent (a finding answered by a reply it never got, its id already
+# behind the watermark). That is also why the location fields are not enumerated: `line`,
+# `original_line`, `side`, `start_line`, `start_side`, `original_start_line`, `position`,
+# `original_position` and `subject_type` are all in the key without being named, and so is the
+# next one. Two of these were found the expensive way, one per round: the per-review comments
+# endpoint (the one poll re-reads when the flat feed lags a new review) serves rows with NO `line`
+# and no `original_line` at all, carrying `position`/`original_position` instead — every such row
+# renders `:0`, so an enumerating key collapsed two findings in one file (#86 round 1) — and
+# `side`/`start_line` do the same for a LEFT-vs-RIGHT or multi-line anchor (#86 round 2).
+#
+# `pull_request_review_id` is in the deny-list for a measured reason, not a tidy one: the reviewer
+# posts a separate COMMENTED review per inline comment (46 comments over 36 reviews on #39), so
+# keeping it would have kept every real duplicate apart.
+#
+# The commit stamp is in the key for a second reason: it is what `watch` classifies an item by, and
+# folding across two stamps would force one head verdict onto two different associations.
+# Grouping is by the key's `tojson` — a STRING — because jq's `index` on an array argument searches
+# for a sub-SEQUENCE rather than an element, so a key kept as an array would match its neighbours
+# prefixes. Order is the feed's: `group_by` sorts by key, and `pos` (each group's first member's
+# index) puts the entries back in the order they arrived, so folding does not reshuffle a round.
 POLL_ITEM_DEFS='
   def short: if (. // "") == "" then "-" else .[0:7] end;
   def item_stamp($re): ([(.body // "") | capture($re; "g").s] | last) | short;
   def inline_commit: (.original_commit_id // .commit_id) | short;
   def review_commit: .commit_id | short;
+  def item_path: .path // "?";
+  def item_line: .line // .original_line // 0;
+  def fold_key: del(.id, .node_id, .url, .html_url, .pull_request_url, .pull_request_review_id,
+                    .created_at, .updated_at, .reactions, ._links, .body);
+  def fold_inline:
+    [to_entries[] | {i: .key, k: (.value | fold_key | tojson), v: .value}]
+    | group_by(.k)
+    | map(sort_by(.i)
+          | {pos: .[0].i, ids: [.[].v.id], v: .[0].v,
+             bodies: (reduce .[] as $x ([];
+                        if (map(.body) | index($x.v.body // "")) then .
+                        else . + [{id: $x.v.id, body: ($x.v.body // "")}] end))})
+    | sort_by(.pos)
+    | map(.v + {thread_ids: .ids, thread_bodies: .bodies});
+  def thread_ids: .thread_ids // [.id];
+  def thread_list: thread_ids | map(tostring) | join("+");
+  def thread_bodies_of: .thread_bodies // [{id: .id, body: (.body // "")}];
+  def body_block: thread_bodies_of as $b
+    | if ($b | length) <= 1 then ($b[0].body)
+      else ([$b[] | "[thread \(.id)]\n\(.body)"] | join("\n")) end;
+  def dupe_note: (thread_ids | length) as $n | (thread_bodies_of | length) as $k
+    | if $n <= 1 then ""
+      elif $k <= 1 then " (\($n) identical threads, one reply answers all)"
+      else " (\($n) threads at one location, \($k) findings as written; one reply answers all)"
+      end;
 '
 
 # Exits 3, and prints no watermark, when any feed failed to read: an unwritten watermark keeps the
@@ -650,11 +742,15 @@ cmd_poll() {
   # of the head is caught by its review even if none of its comments were.
   # Each feed's new items are filtered ONCE, into an array that is then both rendered and indexed
   # (the `items:` line below), so the index cannot drift from what was printed — and so the fold
-  # of duplicate threads (ludics-lite#76) has one place to sit.
+  # of duplicate threads (`fold_inline`, ludics-lite#76) has ONE place to sit: it happens here,
+  # once, and the rendering and the index below read its output. A folded entry is still one
+  # finding for `watch` (it counts entries, not threads) and the watermark is untouched — that is
+  # computed from the UNFILTERED feed below, so every duplicate's id is still advanced past.
+  # `rounds` reads its own feeds and never these, so the round count is untouched too.
   local new_inline new_issue new_reviews
-  new_inline=$(jq --arg rev "$REVIEWER" --argjson since "$m_inline" \
-    'map(select((.user.login // "") | startswith($rev)) | select(.id > $since))' <<<"$inline") ||
-    return 4
+  new_inline=$(jq --arg rev "$REVIEWER" --argjson since "$m_inline" "$POLL_ITEM_DEFS"'
+    map(select((.user.login // "") | startswith($rev)) | select(.id > $since)) | fold_inline' \
+    <<<"$inline") || return 4
   new_issue=$(jq --arg rev "$REVIEWER" --argjson since "$m_issue" \
     'map(select((.user.login // "") | startswith($rev)) | select(.id > $since)
          | select((.body // "") | test("codex-pull-request-review-summary") | not))' <<<"$issue") ||
@@ -665,7 +761,7 @@ cmd_poll() {
 
   jq -r "$POLL_ITEM_DEFS"'
     if length == 0 then "(no new inline comments)"
-    else .[] | "--- inline id=\(.id) \(.path // "?"):\(.line // .original_line // 0) commit=\(inline_commit) by \(.user.login)\n\(.body)"
+    else .[] | "--- inline id=\(thread_list) \(item_path):\(item_line) commit=\(inline_commit) by \(.user.login)\(dupe_note)\n\(body_block)"
     end' <<<"$new_inline"
 
   # The connector's "Review Summary" placeholder is machine-tagged with an HTML comment and posted
@@ -689,14 +785,18 @@ cmd_poll() {
   # The items above, as one machine-readable line, for a caller that has to decide something about
   # them — `watch` asks which of them are about the head it is watching. Fields per item:
   # kind:id:commit:author:state (`-` where there is none), and none of the five can contain a
-  # space or a colon, so the line is safe to split. The rendered headers are NOT that line: a
+  # space or a colon, so the line is safe to split. The id field of a FOLDED inline entry is the
+  # `+`-joined list of its thread ids, anchor first (`inline:900+901:…`) — the same token the
+  # rendering shows and `reply`/`resolve` take; a consumer wanting the anchor alone takes the part
+  # before the first `+`. It stays one field precisely so that this line's arity never depends on
+  # whether the reviewer duplicated a thread. The rendered headers are NOT that line: a
   # BODY may contain a line that looks exactly like one — a review of this script quoting poll
   # output does, and this very PR drew one — and a watch that classified by scanning the rendering
   # would take a quoted header for an item and end the wait on the round it was there to skip.
   # Read it as the watermark is read, the LAST match: it is emitted after every body, so a body
   # that quotes one of these lines cannot displace it.
   echo "items: $(
-    jq -r "$POLL_ITEM_DEFS"'[.[] | "inline:\(.id):\(inline_commit):\(.user.login):-"] | join(" ")' \
+    jq -r "$POLL_ITEM_DEFS"'[.[] | "inline:\(thread_list):\(inline_commit):\(.user.login):-"] | join(" ")' \
       <<<"$new_inline"
   ) $(
     jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
@@ -1465,6 +1565,9 @@ watch_round() { # <pr> <watermark>
   POLLED_HEAD="$head_sha"
   # From the `items:` line poll emits, never from the rendered headers: a reviewer BODY can carry
   # a line that looks exactly like a header (see cmd_poll). Splitting on whitespace is the point.
+  # An inline entry's id may be a `+`-joined list of duplicated threads (ludics-lite#76); it is
+  # one item here, as it is one finding — the act/quiet decision counts entries, not threads, and
+  # the exit line names the whole list so the caller can hand it straight back to `reply`.
   # shellcheck disable=SC2013,SC2086
   for entry in $(sed -n 's/^items: //p' <<<"$POLLED_OUT" | tail -1); do
     kind="${entry%%:*}"
@@ -1786,28 +1889,190 @@ cmd_watch() {
 }
 
 # Replies carry the automated-work marker so a human scanning the thread knows what wrote them.
-cmd_reply() {
-  local pr="${1:?usage: reply <pr> <comment-id> <body>}" id="${2:?comment-id}" body="${3:?body}"
-  pr_arg "$pr"
-  pr="$PR_NUM"
-  gh_retry write api -X POST "repos/$REPO/pulls/$pr/comments/$id/replies" \
-    -f body="$body
+# The comment-id argument of `reply` and `resolve` is the token poll RENDERS — `900` for an
+# ordinary thread, `900+901+902` for a folded entry (see fold_inline) — so the caller pastes back
+# what it read instead of re-deriving a list. Splits it into FOLD_IDS, space-joined, anchor first;
+# refuses anything else, because the split is new and an id that silently stayed "900+901" would
+# address no comment and come back as a 404 the caller would read as a missing thread.
+FOLD_IDS=""
+split_ids() { # <token> <command name, for the message>
+  local id
+  FOLD_IDS=""
+  # The WHOLE token is matched against the grammar BEFORE anything is split off it, and checking
+  # each piece afterwards is not the same thing: the split is an unquoted expansion, so it also
+  # word-splits and GLOBS. A token carrying whitespace ("900 901") would arrive as two pieces a
+  # per-piece numeric check accepts and be written to twice, and one carrying a glob character
+  # ("*") would expand against the caller's working directory, where a numeric filename would
+  # become a comment id this script then replies to and resolves (round 1 of #86). Digits and
+  # single `+`, nothing else, so nothing that reaches the split can split or expand further.
+  case "$1" in
+  '' | *[!0-9+]* | *"++"* | "+"* | *"+")
+    die "$2: '$1' is not a comment id — a comment id is digits, and several are joined by single" \
+      "'+' as poll renders a folded entry (900+901+902)" ;;
+  esac
+  for id in ${1//+/ }; do
+    # Repeats are dropped rather than refused: they cost a duplicate write, and the entry they
+    # came from is one finding either way.
+    case " $FOLD_IDS " in *" $id "*) continue ;; esac
+    FOLD_IDS="$FOLD_IDS $id"
+  done
+}
+
+# ids_from <space-joined ids> <first id to keep>: the tail of the list starting at that id, for a
+# message that has to say which of a batch is still unanswered.
+ids_from() {
+  local id out="" seen=""
+  for id in $1; do
+    if [ -z "$seen" ] && [ "$id" != "$2" ]; then continue; fi
+    seen=1
+    out="$out $id"
+  done
+  printf '%s' "$out"
+}
+
+# ids_token <space-joined ids>: the same list as the TOKEN this command takes. A retry set is
+# printed through this and never as the internal space-joined form, which is not something the
+# caller can paste back (round 3 of ludics-lite#86).
+ids_token() {
+  local id out=""
+  for id in $1; do
+    if [ -z "$out" ]; then out="$id"; else out="$out+$id"; fi
+  done
+  printf '%s' "$out"
+}
+
+# Where a thread lives, from its first comment id alone — the anchor URL a `--anchor` retry points
+# at, which no read is spent on because this is the html_url shape GitHub serves for a review
+# comment (verified on this repository's own PRs).
+thread_url() { # <pr> <comment-id>
+  printf 'https://github.com/%s/pull/%s#discussion_r%s' "$REPO" "$1" "$2"
+}
+
+# One reply into one thread. Prints the reply's html_url and returns gh_retry's code; the CALLER
+# composes the failure, because what a failure means depends on how far the batch got.
+post_reply() { # <pr> <comment-id> <body>
+  gh_retry write api -X POST "repos/$REPO/pulls/$1/comments/$2/replies" \
+    -f body="$3
 
 _🤖 Addressed by an automated coding agent_" --jq .html_url
-  case "$?" in
-  0) return 0 ;;
+}
+
+# What a failed reply says, with the batch's progress in it. A reply is the one write here that
+# cannot be repeated safely, so a refusal that said "nothing was posted" after the anchor had
+# landed would invite a caller to post the same body twice.
+#
+# The progress turns on the CLASSIFICATION as much as on how far the batch got, and conflating
+# the two is how the first cut of this printed a contradiction: an ambiguous first write (a 500,
+# a dropped connection — a request that may well have been served) left `answered` empty, so the
+# note said "nothing in this invocation was posted, so repeat it whole" directly under a sentence
+# saying the reply may have landed (round 2 of #86). The retry set is stated instead of the
+# instruction, because only for an ambiguous failure is it a question — and there it is stated as
+# the question it is, with both answers.
+reply_failed() { # <pr> <comment-id> <rc> <ids answered> <ids not answered, first> <anchor, or empty>
+  local pr="$1" id="$2" rc="$3" answered="$4" rest="$5" anchor="$6" landed="" after retry keep
+  after="${rest#" $id"}"
+  # The retry set as something the caller can paste. Once the ANSWER is standing in a thread, the
+  # retry must keep pointing at THAT thread: handing the suffix back plain would promote its first
+  # id to anchor, post the composed body there a second time and point the rest at the copy
+  # (round 3 of ludics-lite#86). `--anchor` is what says "the answer is already in that thread".
+  keep=""
+  [ -z "$anchor" ] || keep=" --anchor $anchor"
+  retry="$(ids_token "$rest")$keep"
+  [ -z "$answered" ] || landed="The replies to$answered DID land, so do not repeat those. "
+  case "$rc" in
+  # A gateway refusal is a request no backend ran (gh_retry's write policy is narrower than a
+  # read's for exactly this reason), so comment $id got nothing and the retry set is exact.
   3) fail 3 "reply to comment $id on PR $REPO#$pr did not go through — the API refused it at the" \
-    "gateway on all $API_ATTEMPTS attempts ($(gh_err_line)). Nothing was posted, so retry;" \
-    "a batch of replies fails one at a time, so check each one, not just the last." ;;
-  *)
-    api_rejection "$(gh_err_line)" &&
-      fail 1 "reply to comment $id on PR $REPO#$pr was REJECTED, not dropped: $(gh_err_line)." \
-        "Retrying prints the same thing — check the comment id and the PR."
-    fail 3 "reply to comment $id on PR $REPO#$pr failed AMBIGUOUSLY: $(gh_err_line)." \
-      "That is not a gateway refusal, so the reply may or may not have landed and this script" \
-      "will not post it twice — read the thread, then retry only if it is not there."
-    ;;
+    "gateway on all $API_ATTEMPTS attempts ($(gh_err_line)). ${landed}Nothing was posted for" \
+    "comment $id, so retry with: $retry" ;;
   esac
+  api_rejection "$(gh_err_line)" &&
+    fail 1 "reply to comment $id on PR $REPO#$pr was REJECTED, not dropped: $(gh_err_line)." \
+      "Retrying prints the same thing — check the comment id and the PR. ${landed}Comment $id got" \
+      "nothing, so once the id is right, retry with: $retry"
+  fail 3 "reply to comment $id on PR $REPO#$pr failed AMBIGUOUSLY: $(gh_err_line)." \
+    "That is not a gateway refusal, so the reply MAY have landed and this script will not post it" \
+    "twice. ${landed}Read comment $id's thread: retry with: $retry if the reply is not there;" \
+    "${after:+retry with: $(ids_token "$after") --anchor ${anchor:-$id} if it is}" \
+    "${after:-there is nothing else outstanding if it is}"
+}
+
+# One invocation answers a whole folded entry: the body goes to the ANCHOR (the first id), and
+# each duplicate gets a one-line pointer to the anchor's reply. That is what makes a duplicate
+# cheap — one composed answer instead of one per thread (ludics-lite#76).
+#
+# The duplicates get a pointer REPLY rather than a bare resolve because a thread closed with
+# nothing in it reads, to the reviewer and to the next archaeologist, as a finding answered in
+# silence — which is what this loop exists to prevent. It is one line, and it says where the
+# answer is. `resolve` then closes each of them, taking the same token.
+#
+# Every reply's html_url is printed, one per line, in the order they were posted, so the caller
+# can see which threads it actually reached.
+cmd_reply() {
+  local anchor="" args=() arg
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --anchor)
+      anchor="${2:-}"
+      shift 2 || die "reply: --anchor takes the comment id of the thread the answer is already in"
+      ;;
+    --anchor=*)
+      anchor="${1#--anchor=}"
+      shift
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+  # Exactly three, checked rather than left to ${3:?...} — which exits 1, the code that means "the
+  # fact does not hold", for what is an invocation error. And a body is a sentence: an unquoted one
+  # arrives as several arguments, and the ${3:?} form would post its first word and drop the rest,
+  # which reads as a posted reply (cmd_comment's trap, same remedy). With --anchor there is no
+  # body at all: the answer is already written, and these threads are being pointed at it.
+  local body=""
+  if [ -n "$anchor" ]; then
+    [ $# -eq 2 ] || die "usage: reply <pr> <comment-id>[+<comment-id>...] --anchor <comment-id> —" \
+      "got $# positional argument(s). With --anchor the answer already stands in that thread," \
+      "so no body is taken: every id in the token is pointed at it."
+    case "$anchor" in '' | *[!0-9]*) die "reply: --anchor takes one comment id, got '$anchor'" ;; esac
+  else
+    [ $# -eq 3 ] || die "usage: reply <pr> <comment-id>[+<comment-id>...] <body> — got $# argument(s)." \
+      "The body is ONE argument: quote it, including a multi-line one."
+    body="$3"
+    [ -n "${body//[[:space:]]/}" ] || die "reply: the body is empty; there is nothing to post"
+  fi
+  local pr="$1" ids="$2"
+  pr_arg "$pr"
+  pr="$PR_NUM"
+  split_ids "$ids" reply
+  local id anchor_url="" answered="" url rc
+  if [ -n "$anchor" ]; then
+    case " $FOLD_IDS " in *" $anchor "*)
+      die "reply: --anchor $anchor is also in the token '$ids' — a thread cannot be pointed at" \
+        "itself; name the threads that still need the pointer" ;;
+    esac
+    anchor_url=$(thread_url "$pr" "$anchor")
+  fi
+  for id in $FOLD_IDS; do
+    if [ -z "$anchor" ]; then
+      url=$(post_reply "$pr" "$id" "$body")
+    else
+      url=$(post_reply "$pr" "$id" \
+        "Duplicate of the thread answered at ${anchor_url:-comment $anchor} — see there.")
+    fi
+    rc=$?
+    [ "$rc" -eq 0 ] ||
+      reply_failed "$pr" "$id" "$rc" "$answered" "$(ids_from "$FOLD_IDS" "$id")" "$anchor"
+    [ -z "$url" ] || printf '%s\n' "$url"
+    if [ -z "$anchor" ]; then
+      anchor="$id"
+      anchor_url="$url"
+    fi
+    answered="$answered $id"
+  done
 }
 
 # Not every finding has a thread to answer in. A review's SUMMARY body carries no comment ids, so
@@ -1895,11 +2160,16 @@ find_thread() {
   return 1
 }
 
-cmd_resolve() {
-  local pr="${1:?usage: resolve <pr> <comment-id>}" id="${2:?comment-id}" hit rc
-  pr_arg "$pr"
-  pr="$PR_NUM"
-  case "$id" in '' | *[!0-9]*) die "comment-id must be numeric, got '$id'" ;; esac
+# One thread, closed. <label> is nonempty when the invocation carries several ids, and then each
+# answer is prefixed with the id it is about — with one id the output stays what it always was,
+# a bare `true`. <done> is the ids already closed by this invocation, named in every refusal so a
+# caller knows where it stopped; resolving is idempotent, so the whole token can simply be
+# repeated. Refusals exit the process (`fail`), which is why this is called directly and never
+# from a command substitution.
+resolve_one() { # <pr> <comment-id> <label prefix, empty for none> <ids already resolved>
+  local pr="$1" id="$2" label="$3" done_ids="$4" hit rc out progress=""
+  [ -z "$done_ids" ] || progress=" Already resolved in this invocation:$done_ids — resolving is
+idempotent, so the whole token is safe to repeat."
   hit=$(find_thread "$pr" "$id")
   rc=$?
   case "$rc" in
@@ -1907,31 +2177,54 @@ cmd_resolve() {
   2) fail 3 "GraphQL did not answer for PR $REPO#$pr after $API_ATTEMPTS attempts per page" \
     "($(gh_err_line)) — thread resolution has no REST equivalent, so this is a RETRY, not a" \
     "missing thread: the threads are probably all there, and the reply (REST) may well have gone" \
-    "through. Do NOT read this as someone else having resolved it or as a wrong comment id." ;;
+    "through. Do NOT read this as someone else having resolved it or as a wrong comment id.$progress" ;;
   4) fail 2 "GraphQL REJECTED the thread lookup for PR $REPO#$pr: $(gh_err_line)." \
     "The search never ran, so this says nothing about comment $id — check the repo, the PR" \
-    "number and \`gh auth status\` rather than the comment id." ;;
+    "number and \`gh auth status\` rather than the comment id.$progress" ;;
   *) fail 1 "no review thread starts at comment $id — every page of PR $REPO#$pr was read and" \
-    "none of them begins there (this is a real answer, not a dropped request)" ;;
+    "none of them begins there (this is a real answer, not a dropped request)$progress" ;;
   esac
   # Already-resolved is the goal state, not a no-op worth an API write: replying then resolving a
   # thread twice across rounds is normal, and the mutation would just echo it back.
   case "$hit" in
-  *" true") echo "true (already resolved)" && return 0 ;;
+  *" true")
+    printf '%s\n' "${label:+$id }true (already resolved)"
+    return 0
+    ;;
   esac
   # The mutation is idempotent — resolving a resolved thread just answers true — so it is retried
   # like a read, on anything short of the API rejecting it.
-  gh_retry read api graphql -f query="mutation {
+  out=$(gh_retry read api graphql -f query="mutation {
       resolveReviewThread(input:{threadId:\"${hit%% *}\"}) {
-      thread { isResolved } } }" --jq .data.resolveReviewThread.thread.isResolved
+      thread { isResolved } } }" --jq .data.resolveReviewThread.thread.isResolved)
   case "$?" in
-  0) return 0 ;;
+  0)
+    printf '%s\n' "${label:+$id }$out"
+    return 0
+    ;;
   3) fail 3 "resolveReviewThread did not answer for the thread at comment $id on PR $REPO#$pr" \
     "after $API_ATTEMPTS attempts ($(gh_err_line)); the thread was FOUND, so this is transport" \
-    "only — retry when the API recovers, and the mutation is safe to repeat." ;;
+    "only — retry when the API recovers, and the mutation is safe to repeat.$progress" ;;
   *) fail 1 "resolveReviewThread was rejected for the thread at comment $id on PR $REPO#$pr:" \
-    "$(gh_err_line)" ;;
+    "$(gh_err_line)$progress" ;;
   esac
+}
+
+# `resolve` takes the same token `reply` does, so a folded entry is closed by one invocation too:
+# every thread the entry lists, in order, each answered on its own line. Unlike a reply, this is
+# safe to repeat whole — the mutation is idempotent and an already-resolved thread costs no write.
+cmd_resolve() {
+  [ $# -eq 2 ] || die "usage: resolve <pr> <comment-id>[+<comment-id>...] — got $# argument(s)"
+  local pr="$1" ids="$2"
+  pr_arg "$pr"
+  pr="$PR_NUM"
+  split_ids "$ids" resolve
+  local id resolved="" label=""
+  case "$FOLD_IDS" in *" "*" "*) label=1 ;; esac
+  for id in $FOLD_IDS; do
+    resolve_one "$pr" "$id" "$label" "$resolved"
+    resolved="$resolved $id"
+  done
 }
 
 # `gh run watch` is the wrong tool on both of its ends, and workers keep reaching for it (the
