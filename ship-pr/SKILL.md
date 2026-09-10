@@ -209,6 +209,26 @@ re-arm rather than concluding the reviewer is silent. A window whose *last* poll
 too, even after healthy rounds earlier: the round you are waiting for could be sitting in the part
 of the window that was never read.
 
+**What ends the wait is a round about the head you are watching**, and nothing else. Every item
+`poll` renders is stamped with the commit it is about — `commit=<sha7>`, from a review's
+`commit_id`, an inline comment's `original_commit_id` (GitHub migrates `commit_id` forward as the
+branch advances, so it would name your current head for a finding written against the last one) or
+a comment's `Reviewed commit:` stamp, taken from the FOOTER a body may quote another commit above
+— and `watch` compares that to the head it reads after each poll. It compares the machine-readable
+`items:` line `poll` ends with, never the rendered headers: a reviewer body can carry a line that
+looks exactly like one (a review quoting this script's output does), and a watch that scanned the
+rendering would take the quotation for an item. Reviewer activity about some other commit is a *previous* round scrolling past above the
+watermark: it is printed on stderr for the record, the watermark advances past it so it never
+comes back, and the window keeps waiting. That is the shape this repository hit — one window
+exited on a round's inline findings, the reviewer's separate summary review landed seconds later
+with a higher id, and the next window woke on it at once with nothing to do.
+
+So read the line each exit ends on, which now says what it ended *on*: the item's own descriptor
+(`ending the wait on review id=… state=… commit=… by …`) when a round ended it, and the head the
+silence was about plus how much scrolled past (`no reviewer activity about head abc1234 in 900s;
+2 item(s) about another commit scrolled past …`) when nothing did. "The reviewer answered this
+head" and "an old review went by" are different windows and read differently.
+
 **The watch's printout is not the record of the round.** A long round's output is cut by the Bash
 tool's display (the head goes, the tail stays), and on 2026-08-22 two agents answered half a round
 that way, both times dropping real findings. After any exit 0, enumerate the round's findings
@@ -239,6 +259,17 @@ itself. Read the remedy off the line rather than from this paragraph when the tw
 `failed` the nudge is the first move and not the only one — if the SAME head fails to initialize
 again, the next move is a new head (an amend suffices), because the reviewer's clone is what is
 behind.
+
+Every one of those verdicts polls once more before it prints, and re-reads the state behind that
+poll. A round found by the last look wins; a 👍 that landed in the same gap is reported as the
+approval it is (`poll` reads comments and reviews, and the 👍 is on neither); a state that moved
+some other way makes the window a quiet **1**; and a poll or state read that did not answer
+WITHHOLDS the verdict for a **3**. The seconds a state read takes are exactly when a round lands,
+and a nudge posted over one re-requests the review and CLEARS the 👍 it was about to get. The grace itself is measured from
+the newest of the head commit's date and the PR's *creation* — the push time is not an API field,
+and a commit's date can predate by hours the push that delivered it, so on a freshly opened PR the
+committer date alone once reported a review "due for 22m" and recommended a nudge at a reviewer
+that had had no time at all.
 
 Hand-rolling that query has produced seven false readings, all of which the script handles: app
 reviewers' logins carry a `[bot]` suffix so an exact-match filter never fires; your own replies
