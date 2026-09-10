@@ -102,28 +102,57 @@ export SHIP_PR_API_BACKOFF=0
 # Function bodies do not run, so their locals never appear. It is written inline rather than as a
 # helper because a function defined before the source is the one shape this file refuses from a
 # suite: pr-review.sh would replace a same-named one, and the snapshot could not tell.
+#
+# The shell creates variables of its own as it runs, and those are not the script's constants.
+# `PIPESTATUS` is the one that reached the set: absent from the first snapshot, materialized by
+# bash when the source ran a top-level pipeline, and so indistinguishable by name alone from
+# something pr-review.sh assigned — `retune PIPESTATUS=x` was accepted, and did nothing. Both
+# halves below are against that: the WARM-UP runs the constructs that materialize such variables
+# before the first snapshot, so they are on the "before" side where they belong; the deny-list
+# catches the ones no warm-up here triggers, and the two overlap on purpose, because a new bash
+# maintaining one more name should be caught by the warm-up without anyone editing a list.
+#
+# The status is captured rather than propagated. `set -e` is on in every suite by the time this
+# runs, so a probe that failed took the assignment's exit status with it and killed the suite
+# where it stood — before the refusal below could say what happened, and with the source's own
+# stderr discarded. The `|| lib_probe_rc=$?` is what lets the diagnostic run at all.
+lib_probe_err="${TMPDIR:-/tmp}/pr-review-probe.$$.err"
+lib_probe_rc=0
 HELPER_CONSTANTS=" $(
   env -i "PATH=$PATH" "HOME=${HOME:-}" "TMPDIR=${TMPDIR:-/tmp}" \
     SHIP_PR_TEST_SOURCE_ONLY=1 SHIP_PR_STATE_DIR=off \
     bash -c '
-      before=" $(compgen -v | tr "\n" " ")before "
-      . "$1" >/dev/null 2>&1 || exit 1
+      # The warm-up: a pipeline for PIPESTATUS, a regex match for BASH_REMATCH, a read for REPLY.
+      : | : >/dev/null
+      [[ x =~ x ]] || :
+      printf "%s\n" x | { read -r _ignored || :; }
+      before=" $(compgen -v | tr "\n" " ")before n "
+      . "$1" >/dev/null || exit 1
       for n in $(compgen -v); do
         case "$before" in *" $n "*) continue ;; esac
+        # The names bash maintains, which a script does not assign and retune must not accept.
+        case " BASH_ARGC BASH_ARGV BASH_ARGV0 BASH_COMMAND BASH_LINENO BASH_REMATCH BASH_SOURCE \
+BASH_SUBSHELL COMP_CWORD COMP_KEY COMP_LINE COMP_POINT COMP_TYPE COMP_WORDBREAKS COMP_WORDS \
+EPOCHREALTIME EPOCHSECONDS FUNCNAME GROUPS LINENO OPTARG OPTIND PIPESTATUS RANDOM REPLY SECONDS \
+SRANDOM " in *" $n "*) continue ;; esac
         printf "%s " "$n"
       done
-    ' _ "$HELPER"
-)"
-# A probe that answered nothing is a broken setup, not a script with no constants: retune would
-# then refuse every name, and each suite would fail somewhere in its middle with "sets no GRACE"
-# rather than here, where the reason is.
-case "$HELPER_CONSTANTS" in
-*[![:space:]]*) ;;
+    ' _ "$HELPER" 2>"$lib_probe_err"
+)" || lib_probe_rc=$?
+
+# A probe that failed or answered nothing is a broken setup, not a script with no constants:
+# retune would otherwise refuse every name and each suite would fail somewhere in its middle with
+# "sets no GRACE" rather than here, where the reason is.
+case "$lib_probe_rc$HELPER_CONSTANTS" in
+0*[![:space:]]*) rm -f "$lib_probe_err" ;;
 *)
-  echo "test-pr-review-lib.sh: REFUSING to run: the probe that reads pr-review.sh's source-time constants returned nothing, so \`retune\` could accept no name; run \"bash $HELPER\" to see how it fails" >&2
+  echo "test-pr-review-lib.sh: REFUSING to run: the probe that reads pr-review.sh's source-time constants exited $lib_probe_rc and named $(printf '%s' "$HELPER_CONSTANTS" | wc -w | tr -d ' ') constant(s), so \`retune\` could accept no name. What the source said:" >&2
+  sed 's/^/  /' "$lib_probe_err" >&2 || :
+  rm -f "$lib_probe_err"
   exit 2
   ;;
 esac
+unset lib_probe_err lib_probe_rc
 
 # shellcheck source=pr-review.sh
 source "$HELPER"
@@ -860,6 +889,14 @@ test_retune_of_a_name_the_script_does_not_set_is_refused() {
   assert_eq "$CONTROL_RC" 1 "IFS is not a source-time constant ($CONTROL_ERR)"
   assert_contains "$CONTROL_ERR" "retune IFS: pr-review.sh sets no IFS when it is sourced" \
     "IFS should be refused by name"
+  # PIPESTATUS is the same class arriving by the other door: the shell CREATES it, mid-source,
+  # when the script runs a top-level pipeline. It is absent from a naive first snapshot and
+  # present in the second, so by name alone it is indistinguishable from something the script
+  # assigned — and `retune PIPESTATUS=x` was accepted, and did nothing at all.
+  control 'retune PIPESTATUS=x'
+  assert_eq "$CONTROL_RC" 1 "a variable the shell creates is not a constant ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "retune PIPESTATUS: pr-review.sh sets no PIPESTATUS when it is sourced" \
+    "PIPESTATUS should be refused by name"
   # The other side of that probe: the constants it must accept, including one assigned inside a
   # top-level `case` rather than in a stanza of its own.
   control 'retune GRACE=1 STALL=2 ROUND_GAP=3 ABSENT_GRACE=4 CHECKS_INTERVAL=5 CACHE_OFF=6' \
@@ -867,6 +904,32 @@ test_retune_of_a_name_the_script_does_not_set_is_refused() {
        bail "the constants did not take: $GRACE$STALL$ROUND_GAP$ABSENT_GRACE$CHECKS_INTERVAL$CACHE_OFF"'
   assert_eq "$CONTROL_RC" 0 "every documented constant is retunable ($CONTROL_ERR)"
   assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
+}
+
+# A probe that cannot read pr-review.sh's constants must say so HERE, with the reason. Every
+# suite has `set -e` on by the time the probe runs, so a failure that propagated through the
+# assignment killed the suite where it stood — exit 1, no output, and the source's own stderr
+# discarded — which reads as the suite failing rather than as a setup that never started. The
+# control is a copy of this file beside a pr-review.sh that refuses to source.
+test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason() {
+  local root out err rc
+  test_tmpdir root probe-fail
+  cp "$TEST_LIB_FILE" "$root/"
+  printf '#!/usr/bin/env bash\necho "missing dependency: frobnicator not found" >&2\nreturn 1\n' \
+    >"$root/pr-review.sh"
+  printf '#!/usr/bin/env bash\nset -euo pipefail\nsource "%s"\n' \
+    "$root/$(basename "$TEST_LIB_FILE")" >"$root/suite.sh"
+  set +e
+  out=$(bash "$root/suite.sh" 2>"$root/err")
+  rc=$?
+  set -e
+  err=$(cat "$root/err")
+  assert_eq "$rc" 2 "a probe that cannot read the constants is a refusal, not a suite failure ($err)"
+  assert_contains "$err" "REFUSING to run: the probe that reads pr-review.sh's source-time constants" \
+    "the refusal should name what could not be read"
+  assert_contains "$err" "missing dependency: frobnicator not found" \
+    "and carry what the source itself said, which is the only thing that localizes it"
+  assert_eq "$out" "" "nothing may run"
 }
 
 tests=(
@@ -886,6 +949,7 @@ tests=(
   test_retune_moves_a_constant
   test_retune_is_undone_when_the_case_ends # must stay directly after the case above
   test_retune_of_a_name_the_script_does_not_set_is_refused
+  test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason
 )
 
 run_tests "${tests[@]}"
