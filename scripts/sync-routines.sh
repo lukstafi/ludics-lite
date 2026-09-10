@@ -47,6 +47,12 @@
 # a placeholder SKILL.md -- then `sync-routines.sh push` over it.
 
 set -euo pipefail
+# No pathname expansion, anywhere. Paths are split on `/` and routine names on whitespace with
+# unquoted expansions, which do word splitting AND globbing: a path component or a routine name
+# holding a `*`, `?` or `[` would be replaced by whatever it happens to match in the caller's
+# working directory, and the script would then reason about a name nobody passed it. Word
+# splitting still happens, which is what those loops want; `case` patterns are unaffected.
+set -f
 
 # The routines this script syncs: exactly the rows of routines/README.md's table whose Kind is
 # `local scheduled task`. The cloud routine (ocannl-ci-red-triage) is not here -- it is synced
@@ -149,6 +155,7 @@ physical_of() {
 # macOS /var is a link to /private/var, so a destination under /var/... genuinely is behind one).
 # `pwd -P` at the caller's end is how a path is made clean; realpath is not on stock macOS.
 first_symlinked_ancestor() {
+  # `set -f` at the top of the file is what keeps the unquoted `$path` below from globbing.
   local path=$1 prefix="" comp oldifs
   case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
   oldifs=$IFS
@@ -363,6 +370,16 @@ publish_checked() {
   return 0
 }
 
+# is_under <child> <parent>: is <child> strictly inside <parent>? The filesystem root is the case
+# that makes a naive prefix test wrong -- "/" plus "/" is "//", which matches no ordinary path, so
+# a destination of "/" read as disjoint from everything and the guard below let it through.
+is_under() {
+  local child=$1 parent=$2
+  [ "$parent" = "/" ] && parent=
+  case "$child" in "$parent"/?*) return 0 ;; esac
+  return 1
+}
+
 # The two roots must be disjoint. If the destination lands inside the checkout's routines/ --
 # CLAUDE_SCHEDULED_TASKS_DIR set to a path under it -- then push creates the destination INSIDE
 # the source and publish_dir's `find "$src"` then walks the tree it is writing, copying the
@@ -374,9 +391,10 @@ dest_phys=$(physical_of "$dest_root")
 overlap=
 if [ "$src_phys" = "$dest_phys" ]; then
   overlap="are the same directory"
-else
-  case "$dest_phys/" in "$src_phys"/*) overlap="is inside the checkout's routines/" ;; esac
-  case "$src_phys/" in "$dest_phys"/*) overlap="contains the checkout's routines/" ;; esac
+elif is_under "$dest_phys" "$src_phys"; then
+  overlap="is inside the checkout's routines/"
+elif is_under "$src_phys" "$dest_phys"; then
+  overlap="contains the checkout's routines/"
 fi
 if [ -n "$overlap" ]; then
   warn "sync-routines: the destination $overlap:"

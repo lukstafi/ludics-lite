@@ -599,6 +599,58 @@ expect "...and one that lands BELOW routines/ the same way" 2 "is inside the che
   env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/nope/../$(basename "$REPO")/routines/$R1/installed" "$SR" push
 expect "...as does a plain ./ and ../ walk onto it" 2 "are the same directory" -- \
   env CLAUDE_SCHEDULED_TASKS_DIR="$REPO/./routines/$R1/.." "$SR" push
+# The filesystem root contains everything, this checkout included, and is the one parent a naive
+# prefix test gets wrong: "/" plus "/" is "//", which matches no ordinary path.
+expect "the filesystem root as a destination is refused, not treated as disjoint" 2 \
+  "contains the checkout's routines/" -- env CLAUDE_SCHEDULED_TASKS_DIR=/ "$SR" push
+expect "...in dry-run too, which would otherwise print what it would install under /" 2 \
+  "contains the checkout's routines/" -- env CLAUDE_SCHEDULED_TASKS_DIR=/ "$SR" push --dry-run
+contains "$out" "would install /" \
+  && ko "it still proposed installing at the root -- $out" \
+  || ok "...proposing nothing"
+[ ! -e "/$R1" ] && ok "...and creating nothing there" || ko "/$R1 exists"
+
+# A path component that is a glob pattern must be read as the literal name it is. The component
+# loops split on `/` with an unquoted expansion, which globs as well as splits, so a component
+# like `r*` would be replaced by whatever it matches in the CALLER's working directory -- and the
+# script would then judge a path nobody gave it.
+reset_trees; install_all
+mkdir -p "$TMP/globdir/real"
+for r in $LOCAL_ROUTINES; do cp -R "$REPO/routines/$r" "$TMP/globdir/real/$r"; done
+rm -f "$TMP/globdir/r*"
+ln -s "$TMP/globdir/real" "$TMP/globdir/r*"
+( cd "$REPO" && env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/globdir/r*/" "$SR" push --dry-run ) \
+  > "$TMP/glob.out" 2>&1 && glob_rc=0 || glob_rc=$?
+glob_out=$(cat "$TMP/glob.out")
+[ "$glob_rc" -eq 1 ] && contains "$glob_out" "reached through a SYMLINK" \
+  && ok "a destination component that looks like a glob is read as the literal name" \
+  || ko "the glob-named symlinked root was not refused (rc=$glob_rc) -- $glob_out"
+# The control: the same destination by its real name is not refused, so the refusal above is the
+# link and not the metacharacter.
+( cd "$REPO" && env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/globdir/real" "$SR" ) > "$TMP/glob2.out" 2>&1 \
+  && glob_rc=0 || glob_rc=$?
+[ "$glob_rc" -eq 0 ] \
+  && ok "...while the same tree by its real name is in sync" \
+  || ko "the control run failed (rc=$glob_rc) -- $(cat "$TMP/glob2.out")"
+# And a ROUTINE name holding a metacharacter must not expand either: the install loop splits
+# LOCAL_ROUTINES the same way.
+GLOBREPO="$TMP/globrepo"
+rm -rf "$GLOBREPO"
+mkdir -p "$GLOBREPO/scripts" "$GLOBREPO/routines"
+sed 's/^LOCAL_ROUTINES=.*/LOCAL_ROUTINES="ro*tine"/' "$SYNC" > "$GLOBREPO/scripts/sync-routines.sh"
+chmod +x "$GLOBREPO/scripts/sync-routines.sh"
+mkdir -p "$GLOBREPO/routines/routine-that-would-match"
+printf -- '---\nname: x\ndescription: d\n---\n\nbody\n' \
+  > "$GLOBREPO/routines/routine-that-would-match/SKILL.md"
+out=$( cd "$GLOBREPO/routines" && env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/globdest" \
+  "$GLOBREPO/scripts/sync-routines.sh" 2>&1 ) || true
+contains "$out" "ro*tine" \
+  && ok "...and a routine name holding a metacharacter is reported as itself" \
+  || ko "the routine name expanded against the working directory -- $out"
+contains "$out" "routine-that-would-match" \
+  && ko "it reported a directory the name merely matched -- $out" \
+  || ok "...not as the directory it happens to match"
+
 # The control: a `..` walk that genuinely lands OUTSIDE the checkout is not refused, so the
 # folding is not simply refusing anything with a dot segment in it. (It walks through components
 # that exist, since a path whose parent has yet to be created does not resolve for a READ either.)
@@ -984,10 +1036,20 @@ expect "...while one mode with its flags is accepted" 0 "would pull" -- run_sync
 # deliberately has no table model (ludics-lite#75) and this does not give it one.
 local_rows_of() {
   awk -F'|' '
-    /^[[:space:]]*\|/ {
-      name = $2; kind = $3
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", kind)
+    function cell(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+    # A fenced block is an EXAMPLE, never a declaration, and the table ends at the first line
+    # that is not one of its rows. Without both bounds a row-shaped line in a code fence or in
+    # prose below counts, and a row genuinely removed from the table is masked by it -- at which
+    # point this pin passes over exactly the drift it exists to catch.
+    /^[[:space:]]*```/ { fence = !fence; next }
+    fence { next }
+    !in_table {
+      if ($0 ~ /^[[:space:]]*\|/ && cell($2) == "Routine" && cell($3) == "Kind") in_table = 1
+      next
+    }
+    $0 !~ /^[[:space:]]*\|/ { exit }
+    {
+      name = cell($2); kind = cell($3)
       if (kind != "local scheduled task") next
       if (substr(name, 1, 1) != "`" || substr(name, length(name), 1) != "`") next
       print substr(name, 2, length(name) - 2)
@@ -1043,6 +1105,34 @@ EOF
 [ "$(local_rows_of "$TMP/table-kind.md")" != "$declared" ] \
   && ok "...and the cloud routine relabelled as a local task" \
   || ko "the Kind cell is not read: a relabelled cloud row reads as agreement"
+
+# A row-shaped line in a fenced EXAMPLE is not a declaration, and must not mask a row that was
+# genuinely removed -- otherwise the pin passes over exactly the drift it is for.
+{
+  printf '| Routine | Kind | Fires |\n| --- | --- | --- |\n'
+  printf '| `ocannl-cross-machine-sweep` | local scheduled task | daily |\n'
+  printf '| `ocannl-ci-red-triage` | cloud routine | on red |\n\n'
+  printf 'An example of a row:\n\n```md\n'
+  printf '| `daily-issue-planning` | local scheduled task | daily |\n'
+  printf '```\n'
+} > "$TMP/table-fenced.md"
+[ "$(local_rows_of "$TMP/table-fenced.md")" != "$declared" ] \
+  && ok "...and a row that exists only inside a fenced example does not stand in for a real one" \
+  || ko "a fenced example masked a removed row: $(local_rows_of "$TMP/table-fenced.md")"
+# ...nor does one below the table's end.
+{
+  printf '| Routine | Kind | Fires |\n| --- | --- | --- |\n'
+  printf '| `ocannl-cross-machine-sweep` | local scheduled task | daily |\n\n'
+  printf 'Retired routines, kept for the record:\n\n'
+  printf '| `daily-issue-planning` | local scheduled task | daily |\n'
+} > "$TMP/table-after.md"
+[ "$(local_rows_of "$TMP/table-after.md")" != "$declared" ] \
+  && ok "...nor one written below the table it left" \
+  || ko "a row past the table's end counted: $(local_rows_of "$TMP/table-after.md")"
+# The control on those two bounds: the real table, whose rows follow its header, still reads.
+[ -n "$(local_rows_of "$ROUTINES_README")" ] \
+  && ok "...while the real table still reads through both bounds" \
+  || ko "the bounded reader finds nothing in $ROUTINES_README"
 
 cat > "$TMP/table-none.md" <<'EOF'
 | Routine | Kind | Fires |
