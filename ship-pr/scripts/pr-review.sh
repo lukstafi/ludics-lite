@@ -582,8 +582,11 @@ esac
 # “@codex review”." with "Provided git ref <sha> does not exist" in a fenced block beneath it.
 #
 # ONE expression, and it is the CANONICAL BODY: anchored to the start of the body (\A), the
-# reviewer's own sentence, nothing looser. Both callers use it, so a comment can never be a round
-# for one and a failure for the other.
+# reviewer's own sentence WHOLE — through the retry instruction, not just its first words, or a
+# round opening "Codex Review: Something went wrong in the retry path" is read as a failure
+# (review of #82, round 3). It stops before the quoted command, whose typographic quotes the
+# connector renders curly. Both callers use it, so a comment can never be a round for one and a
+# failure for the other.
 #
 # The looser shapes were tried and withdrawn (review of #82, rounds 1 and 2). A ref marker taken
 # on any line swallowed a comment-only ROUND whose finding quotes "Provided git ref <sha> does
@@ -593,7 +596,7 @@ esac
 # reads as `expected` and costs one grace, where the swallowed round would have cost a finding,
 # silently. (`^` is no use here in either direction: jq's regexes are Oniguruma in Perl mode,
 # where `^` is the start of the STRING and nothing else.)
-INIT_FAILURE_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong'
+INIT_FAILURE_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong\.[ \t]*Try again later by commenting'
 # The ref the failure names — the head the reviewer could not fetch. GitHub serves lowercase hex,
 # as does the message. A failure that names none is not attributed to any head: see the branch in
 # status_state.
@@ -705,7 +708,7 @@ pr_head_read() {
 status_state() {
   local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local vline verd_at verd_sha mstate="-" head_err=""
-  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nfail
+  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at success_at nfail
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -881,18 +884,28 @@ status_state() {
                | select(.submitted_at != null) | select((.commit_id // "") == $sha)
                | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || rev_head_at=""
       if [ -z "$rev_head_at" ] || [[ "$fail_at" > "$rev_head_at" ]]; then
-        # How many failures name THIS head: the first is worth a nudge, a second says the nudge
-        # will not help and the head itself has to move. The ref is bound to $ref before the
-        # prefix test: inside `startswith(...)` the `.` is that filter's own input — $sha — so
-        # the unbound form compares the head to itself and every failure on the PR counts (caught
-        # by the two-heads control in the status suite).
+        # How many failures name THIS head SINCE the reviewer last got through on it — a review
+        # of this head, or a no-findings verdict for it. A nudge that demonstrably worked once
+        # must not leave the caller amending over a review that succeeded and the green checks
+        # under it (review of #82, round 3); only failures after that success are evidence that
+        # nudging has stopped working. The first is worth a nudge, a second says the nudge will
+        # not help and the head itself has to move. $f is bound before either field is read:
+        # inside `startswith(...)` the `.` is that filter's own input — $sha — so the unbound
+        # form compares the head to itself and every failure on the PR counts (caught by the
+        # two-heads control in the status suite).
+        success_at="$rev_head_at"
+        if [ -n "$verd_sha" ]; then
+          case "$head_sha" in "$verd_sha"*) success_at=$(newest "$success_at" "$verd_at") ;; esac
+        fi
         nfail=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" \
-          --arg refre "$INIT_FAILURE_REF_RE" --arg sha "$head_sha" '
+          --arg refre "$INIT_FAILURE_REF_RE" --arg sha "$head_sha" --arg since "$success_at" '
             [.[] | select((.user.login // "") | startswith($rev))
                  | select((.body // "") | test("codex-pull-request-review-summary") | not)
                  | select((.body // "") | test($re))
-                 | ((try ((.body // "") | capture($refre).s) catch "") // "") as $ref
-                 | select($ref != "" and ($sha | startswith($ref)))]
+                 | {at: (.created_at // ""),
+                    ref: (((try ((.body // "") | capture($refre).s) catch "") // ""))} as $f
+                 | select($f.ref != "" and ($sha | startswith($f.ref))
+                          and ($since == "" or $f.at > $since))]
             | length' <<<"$comments_raw" 2>/dev/null) || nfail=""
         case "$nfail" in '' | *[!0-9]*) nfail=0 ;; esac
         # A count that came back empty must not read as "never before": the failure in hand is

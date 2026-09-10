@@ -237,6 +237,13 @@ test_a_round_quoting_the_ref_error_still_counts() {
   assert_eq "$ROUNDS_RC" 0 "a round is a round"
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
     "a finding that quotes the ref error must not be swept up with the failures"
+  # Nor one whose own opening words are the connector's: the sentence is matched whole, through
+  # the retry instruction (review of #82, round 3).
+  set_comments "$(comment "$REVIEWER" 2026-09-09T17:00:54Z \
+    'Codex Review: Something went wrong in the retry path — the backoff is not reset')"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "three shared words are not the failure sentence"
 }
 
 test_no_rounds_yet() {

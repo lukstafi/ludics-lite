@@ -433,6 +433,16 @@ test_a_round_quoting_this_head_s_ref_error_is_not_a_failure() {
   assert_not_contains "$LINE" "FAILED at initialization" \
     "a round that quotes this head's ref error is a round, not the reviewer failing"
   assert_eq "$(state_tok "$STATE")" expected "and it reads as the round it is"
+  # The compound of that and the sentence: a finding whose own first words are the connector's,
+  # over the same quoted error. The matcher takes the sentence WHOLE, through the retry
+  # instruction, so "Something went wrong in the retry path" is a finding about a retry path.
+  COMMENTS_JSON="[$(plain_comment 101 "$PAST" "$(printf '%s\n\n```\nProvided git ref %s does not exist\n```\n' \
+    'Codex Review: Something went wrong in the retry path, and the head it names is this one' \
+    "$FAILED_HEAD")")]"
+  run_status
+  assert_not_contains "$LINE" "FAILED at initialization" \
+    "three shared words are not the failure sentence"
+  assert_eq "$(state_tok "$STATE")" expected "the finding stands as a round"
 }
 
 test_a_second_failure_on_the_same_head_says_push_a_new_head() {
@@ -545,6 +555,35 @@ test_watch_exits_on_the_initialization_failure() {
     "the context should name the state, not leave the caller to read the body"
 }
 
+# A nudge that worked once resets the count: the recurrence is only evidence that nudging has
+# STOPPED working, and telling the caller to amend over a review that succeeded would throw away
+# that review and the green checks under it.
+test_a_successful_review_resets_the_recurrence() {
+  failed_fixture "$FAILED_HEAD"
+  COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST"),$(
+    failure_comment 101 "$FAILED_HEAD" 2026-09-01T02:00:00Z)]"
+  REVIEWS_JSON="[$(review 5 "$FAILED_HEAD" 2026-09-01T01:00:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "the newest word is still the failure"
+  assert_contains "$LINE" "nudge it once" \
+    "the failure before the successful review is not evidence about the nudge that worked"
+  assert_not_contains "$LINE" "failed 2 times" "a count across a success is not a recurrence"
+  # Without the review between them, the same two failures are a recurrence.
+  REVIEWS_JSON='[]'
+  run_status
+  assert_contains "$LINE" "failed 2 times on THIS head" "two failures and no success between them"
+  # A no-findings verdict for this head is a success too. The 👀 after it is the re-request that
+  # announced itself, which is what leaves the failure as the newest word (see below).
+  REVIEWS_JSON='[]'
+  COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST"),$(
+    verdict_comment 102 "$FAILED_HEAD" 2026-09-01T01:00:00Z),$(
+    failure_comment 101 "$FAILED_HEAD" 2026-09-01T02:00:00Z)]"
+  REACTIONS_JSON="[$(reaction eyes 2026-09-01T01:30:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "the failure is newer than the 👀 that announced it"
+  assert_contains "$LINE" "nudge it once" "a verdict for this head is the reviewer getting through"
+}
+
 # The merge gate against a failure, both ways round — the deliberate part of the ranking. A round
 # that ANNOUNCED itself and then failed closes the gate; a re-request that never announced itself
 # does not withdraw the verdict this head already has, exactly as a 👍 would not be withdrawn.
@@ -590,6 +629,7 @@ tests=(
   test_a_newer_reviewer_word_supersedes_the_failure
   test_a_quoted_failure_is_not_a_failure
   test_watch_exits_on_the_initialization_failure
+  test_a_successful_review_resets_the_recurrence
   test_a_standing_verdict_survives_a_failed_re_request
 )
 
