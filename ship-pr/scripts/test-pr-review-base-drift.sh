@@ -348,6 +348,34 @@ test_boundary_truncated_patch_is_unread() {
     "a patch cut between hunks must never read as disjoint"
 }
 
+test_count_omitted_headers_are_read() {
+  # git omits the count on a one-line side: `@@ -5 +5,2 @@` and `@@ -5,2 +5 @@` are the shapes
+  # where the header regex's two optional groups carry meaning, and all four combinations of
+  # present and omitted appear across these two patches. compare_hunks matches the header ONCE;
+  # a `test` guarding a second, near-identical `capture` would only have to disagree on a shape
+  # like this for the capture to yield no output, and a zero-output sub-expression collapses the
+  # whole fold to null — a patch that WAS read comes back as unread. A header the read silently
+  # skips instead leaves the file with no ranges at all, which reads as disjoint. Both failures
+  # are excluded here: these two hunks start on the same line, so only ranges actually derived
+  # from these headers can produce the meeting verdict.
+  set_compares 2 1 "[$(patched a.txt $'@@ -5 +5,2 @@\n-x\n+y\n+z')]" \
+    "[$(patched a.txt $'@@ -5,2 +5 @@\n-p\n-q\n+r')]"
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "count-omitted headers must still place the hunks, and these meet"
+  assert_contains "$DRIFT_OUTPUT" "SAME REGIONS" \
+    "a count-omitted header must yield a range like any other"
+  assert_not_contains "$DRIFT_OUTPUT" "hunks unread" \
+    "a header shape the read handles must never come back as unread"
+  # The same shapes, hunks far apart: the range a count-omitted side yields is one line, not the
+  # rest of the file, so this half of the pair must still read as disjoint.
+  set_compares 2 1 "[$(patched a.txt $'@@ -5 +5,2 @@\n-x\n+y\n+z')]" \
+    "[$(patched a.txt $'@@ -40,2 +40 @@\n-p\n-q\n+r')]"
+  run_drift
+  assert_eq "$DRIFT_RC" 0 "count-omitted headers forty lines apart are disjoint"
+  assert_contains "$DRIFT_OUTPUT" "all in DISJOINT hunks" \
+    "an omitted count is one line, not an unbounded range"
+}
+
 test_unread_hunks_count_as_meeting() {
   # No patch on the base side (binary, or past GitHub's size cap): unread is not disjoint.
   set_compares 2 1 "[$(patched img.bin $'@@ -1,1 +1,1 @@\n-a\n+b')]" '[{"filename":"img.bin"}]'
@@ -367,6 +395,7 @@ tests=(
   test_truncated_patch_is_unread
   test_boundary_truncated_patch_is_unread
   test_unread_hunks_count_as_meeting
+  test_count_omitted_headers_are_read
   test_spaces
   test_rename_previous_filename
   test_api_failure_is_unknown
