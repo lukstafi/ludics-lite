@@ -49,7 +49,7 @@ jobs:
         run: scripts/check-prompts.sh
 
   lint:
-    name: syntax, shellcheck, parse guard
+    name: syntax, shellcheck, mode bits, parse guard
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -58,6 +58,26 @@ jobs:
         run: |
           set -e
           for f in */scripts/*.sh scripts/*.sh; do bash -n "$f"; done
+      - name: Check the mode bit
+        # The same list as the syntax check above, asserted executable. A `> tmp && mv` rewrite
+        # of a script drops its mode bit and git tracks the mode, so the drop commits; without
+        # this the first symptom is an `exit 126` from a suite in some other job, which reads as
+        # that suite failing rather than as a lost mode bit. The exemption is the sourced
+        # template: an `*.example.sh` is `.`-ed by the script that reads it
+        # (scripts/wake-lab-hosts.example.sh, sourced by wake-lab.sh) and is never executed, so
+        # it is tracked 100644 on purpose. The PowerShell script is outside the glob entirely --
+        # it is `.ps1`, and `Check PowerShell syntax` parses it rather than running it.
+        run: |
+          set -e
+          rc=0
+          for f in */scripts/*.sh scripts/*.sh; do
+            case "$f" in *.example.sh) continue ;; esac
+            if [ ! -x "$f" ]; then
+              echo "::error file=$f::$f is not executable; restore the mode bit with 'chmod +x $f' and commit it"
+              rc=1
+            fi
+          done
+          exit "$rc"
       - name: Shellcheck
         # Errors only: the warning tier is style and a few false positives on deliberately
         # unquoted globs; the error tier is what breaks a script.
