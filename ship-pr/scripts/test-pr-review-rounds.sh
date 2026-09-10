@@ -244,6 +244,13 @@ test_a_round_quoting_the_ref_error_still_counts() {
   run_rounds
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
     "three shared words are not the failure sentence"
+  # Nor most of the sentence: it is matched through the command it tells you to comment
+  # (review of #82, round 7).
+  set_comments "$(comment "$REVIEWER" 2026-09-09T17:00:54Z \
+    'Codex Review: Something went wrong. Try again later by commenting on the retry logic')"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "a round that diverges before the command is a round"
 }
 
 test_no_rounds_yet() {

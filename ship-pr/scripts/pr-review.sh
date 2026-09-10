@@ -582,11 +582,13 @@ esac
 # “@codex review”." with "Provided git ref <sha> does not exist" in a fenced block beneath it.
 #
 # ONE expression, and it is the CANONICAL BODY: anchored to the start of the body (\A), the
-# reviewer's own sentence WHOLE — through the retry instruction, not just its first words, or a
-# round opening "Codex Review: Something went wrong in the retry path" is read as a failure
-# (review of #82, round 3). It stops before the quoted command, whose typographic quotes the
-# connector renders curly. Both callers use it, so a comment can never be a round for one and a
-# failure for the other.
+# reviewer's own sentence WHOLE — through the command it tells you to comment, not just its first
+# words, or a round opening "Codex Review: Something went wrong in the retry path" (round 3) or
+# "... Try again later by commenting on the retry logic" (round 7) is read as a failure. The
+# quote around that command is matched as "up to a few characters", not as itself: the connector
+# renders it curly (“@codex review”), and pinning typography is a matcher a straight-quote
+# rendering defeats silently. Both callers use it, so a comment can never be a round for one and
+# a failure for the other.
 #
 # The looser shapes were tried and withdrawn (review of #82, rounds 1 and 2). A ref marker taken
 # on any line swallowed a comment-only ROUND whose finding quotes "Provided git ref <sha> does
@@ -596,7 +598,7 @@ esac
 # reads as `expected` and costs one grace, where the swallowed round would have cost a finding,
 # silently. (`^` is no use here in either direction: jq's regexes are Oniguruma in Perl mode,
 # where `^` is the start of the STRING and nothing else.)
-INIT_FAILURE_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong\.[ \t]*Try again later by commenting'
+INIT_FAILURE_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong\.[ \t]*Try again later by commenting[^\n]{0,4}@codex review'
 # The ref the failure names — the head the reviewer could not fetch. GitHub serves lowercase hex,
 # as does the message. A failure that names none is not attributed to any head: see the branch in
 # status_state.

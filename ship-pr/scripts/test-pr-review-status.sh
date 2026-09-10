@@ -415,6 +415,14 @@ test_a_differently_worded_failure_is_missed_not_guessed() {
   run_status
   assert_eq "$(state_tok "$STATE")" expected \
     "the opening sentence is the whole matcher: anything else waits out the grace"
+  # And a finding that gets as far as the retry instruction before diverging: the sentence is
+  # matched through the command it names, not up to the last word they share.
+  COMMENTS_JSON="[$(plain_comment 101 "$PAST" "$(printf '%s\n\n```\nProvided git ref %s does not exist\n```\n' \
+    'Codex Review: Something went wrong. Try again later by commenting on the retry logic' \
+    "$FAILED_HEAD")")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected \
+    "the sentence runs through '@codex review', so a finding that stops short is a finding"
 }
 
 # The finding this state could hide, and the reason the matcher is anchored to that sentence: a
