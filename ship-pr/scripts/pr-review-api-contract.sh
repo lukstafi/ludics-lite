@@ -673,10 +673,10 @@ if [ -n "$REVIEWED_PR" ]; then
     is_list "$per_review" || per_review='[]'
     # The per-review feed is NOT the flat listing's shape: live, it carries position and
     # original_position but no line/original_line (nor side, start_line, subject_type) — which
-    # is why the merge-by-id read lets the flat feed's copy win, and why poll renders
-    # `.line // .original_line // 0` for a row it has from this feed alone. So the claim is the
-    # fields poll reads from this feed; the line-number gap is printed, not asserted, since the
-    # fallback renders either way.
+    # is why the merge-by-id read lets the flat feed's copy win, and why poll renders a row it has
+    # from this feed alone as `:@<position>` — the field it does carry — rather than as a line
+    # number it was never served. So the claim is the fields poll reads from this feed; the
+    # line-number gap is printed, not asserted, since the rendering falls back either way.
     #
     # `original_commit_id` is asserted on THIS feed as well as on the flat one, and the row above
     # is not evidence for it: these are the rows poll has while the flat listing lags, so if the

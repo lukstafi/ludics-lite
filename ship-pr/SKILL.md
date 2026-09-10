@@ -231,7 +231,11 @@ under the id of the thread carrying it:
 ```
 
 Read every body — a folded entry can carry more than one finding — and answer once: that id token
-is what `reply` and `resolve` take. A folded entry is still one finding for the loop: the round
+is what `reply` and `resolve` take. The `path:line` after the id is the anchor as the feed served
+it: a line number when there is one, `@12` when the row carries only a diff *position* (the rows
+poll reads from the per-review endpoint while the flat feed lags carry no line at all), and `?`
+when it names no place in the file. Two entries showing `@12` and `@40` are two places, the same
+as `:12` and `:40` would be. A folded entry is still one finding for the loop: the round
 count and the watch's act/quiet decision are unchanged, and every folded id is still advanced past
 by the watermark.
 
