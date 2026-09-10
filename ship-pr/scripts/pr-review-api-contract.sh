@@ -17,7 +17,10 @@
 #   CONTRACT_BASE            the base branch (default: the repository's default branch)
 #   CONTRACT_STALE_BASE_PR   a MERGED PR whose `.base.sha` is NOT its merge commit's first parent
 #                            (ludics-lite#53: merged behind a sibling, so the snapshot stood
-#                            still) — the pulls-API belief from ludics-lite#44/#47
+#                            still) — the pulls-API belief from ludics-lite#44/#47. The snapshot
+#                            claims hold whatever the merge strategy was; the separate
+#                            second-parent claim needs a MERGE-merged anchor and skips itself,
+#                            saying so, on a squash- or rebase-merged one
 #   CONTRACT_REVIEWED_PR     a PR the review app reviewed with at least one round of inline
 #                            findings AND approved (ludics-lite#39) — the reactions, reviews and
 #                            comments beliefs of the status/rounds suites; the pagination belief
@@ -69,6 +72,14 @@ STATUS_VOCAB='["queued","in_progress","completed","waiting","requested","pending
 CONCLUSION_VOCAB='["success","failure","cancelled","skipped","neutral","timed_out","action_required","stale","startup_failure"]'
 MERGEABLE_STATE_VOCAB='["clean","dirty","unstable","blocked","behind","unknown","draft","has_hooks"]'
 REVIEW_STATE_VOCAB='["APPROVED","CHANGES_REQUESTED","COMMENTED","DISMISSED","PENDING"]'
+# How the projections select the reviewer's rows: by PREFIX — `(.user.login // "") |
+# startswith($rev)` in status_state, review_rounds and cmd_poll alike. Every claim below about
+# the app's rows selects the same way, so the set a claim is made about is the set the gate acts
+# on. Selecting on the exact `$BOT` login was narrower than that: a login carrying some other
+# suffix would be consumed by the projections and covered by no belief here (ludics-lite#70, from
+# #66's round 13). That the suffix IS `[bot]` stays a belief of its own — the one claim that must
+# keep naming the exact login, since exactness is what it is about.
+APP='((.user.login // "") | startswith($rev))'
 ISO='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
 HEX40='^[0-9a-f]{40}$'
 
@@ -212,7 +223,7 @@ if ! is_list "$runs"; then
 elif [ "$(jq length <<<"$runs")" -eq 0 ]; then
   skip "the row-level claims on the tip's runs" "the tip has no Actions run (a paths-ignored push, or a repository without push workflows)"
 else
-pin "every row carries the fields the fold indexes: numeric id and workflow_id, string event, name and status, created_at" \
+pin "every row carries the fields the fold indexes: numeric id and workflow_id, string event, name and status, created_at (created_at and id are the sort key it orders on)" \
   'all(.[]; (.id | type == "number") and (.workflow_id | type == "number") and (.event | type == "string" and length > 0)
              and (.name | type == "string") and (.status | type == "string") and (.created_at | test("'"$ISO"'")))' "$runs"
 pin "every row's head_sha is the sha asked for (the filter filters)" \
@@ -230,16 +241,22 @@ echo "      events seen on the tip: $(jq -r '[.[].event] | unique | join(" ")' <
 echo "      status/conclusion seen: $(jq -r '[.[] | "\(.status)/\(.conclusion)"] | unique | join(" ")' <<<"$runs")"
 fi
 
-# Newest-first is what the supersession fold rests on: the first row seen per key is the one
-# that counts. One row proves nothing about order, so the claim is made on the tip when it has
-# several, else on the repository's whole feed, which the same endpoint serves.
+# Newest-first is what cmd_base's supersession fold rests on: the first row seen per key is the
+# one that counts, and cmd_base takes the feed's order as given. run_signal no longer does — it
+# sorts by (created_at desc, id desc) itself (ludics-lite#70) — so this claim is about cmd_base's
+# reliance, not about a shape that would change the gate's verdict on a head. One row proves
+# nothing about order, so the claim is made on the tip when it has several, else on the
+# repository's whole feed, which the same endpoint serves.
 if [ "$(jq length <<<"$runs")" -ge 2 ]; then
   pin "runs?head_sha= comes back newest-first (created_at non-increasing, on the tip's $(jq length <<<"$runs") rows)" \
     '[.[].created_at] | . == (sort | reverse)' "$runs"
-  # Ties (two rows created in the same second) are ordered by nothing the fixtures encode or
-  # GitHub documents, so their order is observed, not asserted: run_signal keeps the first row
-  # per workflow-and-event key, and two invocations of one key inside a second is two dispatches
-  # on one sha (a re-run keeps its row, run_attempt bumped).
+  # Ties (two rows created in the same second) are ordered by nothing GitHub documents, so their
+  # order is observed here, not asserted — and since ludics-lite#70 nothing rests on it either:
+  # run_signal sorts the feed on (created_at desc, id desc) before folding, so within a
+  # workflow-and-event key a tied pair is settled by the higher run id, the later allocation.
+  # The count still prints, because how often the shape occurs at all is worth seeing (two
+  # invocations of one key inside a second is two dispatches on one sha; a re-run keeps its row,
+  # run_attempt bumped) — but it is an observation now, not a hazard.
   echo "      created_at ties on the tip: $(jq '[group_by(.created_at)[] | select(length > 1)] | length' <<<"$runs") group(s); same workflow-and-event inside one tie: $(jq '[group_by(.created_at)[] | select(length > 1) | group_by([.workflow_id, .event])[] | select(length > 1)] | length' <<<"$runs")"
 else
   all_runs=$(api "repos/$REPO/actions/runs?per_page=100" | pages workflow_runs)
@@ -301,8 +318,12 @@ if is_num "$red_run"; then
   jobs=$(api --paginate "repos/$REPO/actions/runs/$red_run/jobs?per_page=100" | pages jobs)
   pin "the feed is jobs[] (run $red_run, the latest red run: $red_concl)" 'type == "array"' "$jobs"
   is_list "$jobs" || jobs='[]'
-  pin "jobs[] rows carry a non-empty name (run_red_is_advisory_only skips a row with none), status and conclusion (present, null while unfinished)" \
-    'all(.[]; (.name | type == "string" and length > 0) and (.status | type == "string") and has("conclusion") and (.conclusion == null or (.conclusion | type == "string")))' "$jobs"
+  # `.status` is deliberately NOT pinned here: run_red_is_advisory_only projects `.name` and
+  # `.conclusion` and nothing else, and a claim about a field no projection reads would file a
+  # drift issue over a harmless change (ludics-lite#70, from #66's round 13). The field stays
+  # pinned on `workflow_runs[]` above, where run_signal does read it.
+  pin "jobs[] rows carry a non-empty name (run_red_is_advisory_only skips a row with none) and conclusion (present, null while unfinished)" \
+    'all(.[]; (.name | type == "string" and length > 0) and has("conclusion") and (.conclusion == null or (.conclusion | type == "string")))' "$jobs"
   pin "job conclusions are in the same vocabulary as run conclusions" \
     "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$jobs"
   # The belief run_red_is_advisory_only rests on: it discards a run's red when no non-advisory
@@ -326,8 +347,12 @@ if ! is_list "$checks"; then
 elif [ "$(jq length <<<"$checks")" -eq 0 ]; then
   skip "the row-level claims on the tip's check runs" "the tip has no check run (nothing ran on it, or nothing has created its checks yet)"
 else
-pin "every check run carries a non-empty name (build_checks skips a row with none), status, conclusion (present, null while unfinished), html_url and app.slug" \
-  'all(.[]; (.name | type == "string" and length > 0) and (.status | type == "string") and has("conclusion") and (.conclusion == null or (.conclusion | type == "string"))
+# `.status` is not pinned here either, for the same reason as on jobs[]: build_checks projects
+# `.name`, `.conclusion` and `.html_url`, and the pending/finished distinction it needs it reads
+# off the null conclusion, never off the status. `.app.slug` is pinned because the correlation
+# below selects on it.
+pin "every check run carries a non-empty name (build_checks skips a row with none), conclusion (present, null while unfinished), html_url and app.slug" \
+  'all(.[]; (.name | type == "string" and length > 0) and has("conclusion") and (.conclusion == null or (.conclusion | type == "string"))
              and (.html_url | type == "string") and (.app.slug | type == "string"))' "$checks"
 pin "check-run conclusions are in the vocabulary conclusion_class classifies" \
   "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$checks"
@@ -423,7 +448,19 @@ if [ -n "$STALE_BASE_PR" ]; then
   if is_sha "$base_sha" && is_sha "$merge_sha" && is_sha "$head_sha"; then
     merge_commit=$(api "repos/$REPO/commits/$merge_sha")
     parent1=$(jq -r '.parents[0].sha // empty' <<<"$merge_commit")
-    pin "the merge commit's second parent is the PR's head" '.parents[1].sha == $head' "$merge_commit" --arg head "$head_sha"
+    # Only a MERGE-merged anchor has a second parent to claim anything about. Squash and rebase
+    # merges give `merge_commit_sha` a single parent and do not keep the head in the history at
+    # all, so asserting it there reports MOVED about the repository's merge strategy rather than
+    # about a field that moved — the drift signal reading as drift when nothing drifted
+    # (ludics-lite#70, from #66's round 13). The parent COUNT settles which anchor this is, and a
+    # one-parent anchor skips this claim with that reason on the line. The snapshot claims below
+    # do not need the second parent: they are about `.base.sha` against the FIRST parent, which
+    # every merge strategy has.
+    if [ "$(jq '.parents | length' <<<"$merge_commit")" -ge 2 ]; then
+      pin "the merge commit's second parent is the PR's head" '.parents[1].sha == $head' "$merge_commit" --arg head "$head_sha"
+    else
+      skip "the merge commit's second parent is the PR's head" "#$STALE_BASE_PR was squash- or rebase-merged: its merge_commit_sha has one parent and does not carry the head as a parent at all; a merge-commit anchor pins this claim"
+    fi
     pin "\`.base.sha\` is a SNAPSHOT, not the base the merge was built on: on #$STALE_BASE_PR it differs from the merge commit's first parent" \
       '.parents[0].sha != $base' "$merge_commit" --arg base "$base_sha"
   else
@@ -550,23 +587,14 @@ if [ -n "$REVIEWED_PR" ]; then
   pin "the app's login carries the [bot] suffix: '$BOT' reacted, and nothing is logged in as bare '$REVIEWER'" \
     'any(.[]; .user.login == $bot) and all(.[]; .user.login != $rev)' "$reactions" --arg bot "$BOT" --arg rev "$REVIEWER"
   pin "the approval is a '+1' reaction from the app (the merge gate's 👍)" \
-    'any(.[]; .content == "+1" and .user.login == $bot)' "$reactions" --arg bot "$BOT"
-  reviews=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/reviews?per_page=100" | jq -s 'add')
-  pin "the reviews feed is a list" 'type == "array"' "$reviews"
-  is_list "$reviews" || reviews='[]'
-  pin "reviews carry numeric id, state, commit_id, submitted_at (present, null while pending), user.login and a body (poll renders it)" \
-    "all(.[]; (.id | type == \"number\") and (.state | type == \"string\") and (.commit_id | test(\"$HEX40\")) and has(\"submitted_at\") and (.submitted_at == null or (.submitted_at | test(\"$ISO\"))) and (.user.login | type == \"string\") and has(\"body\"))" "$reviews"
-  pin "the app's review states are in the vocabulary (the projections filter to the app before classifying; other participants' states are not read)" \
-    "all(.[] | select(.user.login == \$bot); .state as \$s | $REVIEW_STATE_VOCAB | index(\$s))" "$reviews" --arg bot "$BOT"
-  pin "a round with findings is COMMENTED reviews from the app, and the approval is NOT an APPROVED review (it is the reaction above)" \
-    'any(.[]; .user.login == $bot and .state == "COMMENTED") and all(.[] | select(.user.login == $bot); .state != "APPROVED")' "$reviews" --arg bot "$BOT"
+    "any(.[]; .content == \"+1\" and $APP)" "$reactions" --arg rev "$REVIEWER"
   comments=$(api --paginate "repos/$REPO/issues/$REVIEWED_PR/comments?per_page=100" | jq -s 'add')
   pin "the issue-comments feed is a list" 'type == "array"' "$comments"
   is_list "$comments" || comments='[]'
   pin "issue comments carry numeric id, created_at, updated_at, body and user.login" \
     "all(.[]; (.id | type == \"number\") and (.created_at | test(\"$ISO\")) and (.updated_at | test(\"$ISO\")) and (.body | type == \"string\") and (.user.login | type == \"string\"))" "$comments"
   pin "the app's summary comment carries the codex-pull-request-review-summary machine tag" \
-    'any(.[]; .user.login == $bot and (.body | test("codex-pull-request-review-summary")))' "$comments" --arg bot "$BOT"
+    "any(.[]; $APP and (.body | test(\"codex-pull-request-review-summary\")))" "$comments" --arg rev "$REVIEWER"
   inline_all=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/comments?per_page=100" | jq -s 'add')
   inline_page=$(api "repos/$REPO/pulls/$REVIEWED_PR/comments")
   # Two claims, each fed on stdin: the paginated feed of a long-reviewed PR is over Linux's
@@ -580,11 +608,28 @@ if [ -n "$REVIEWED_PR" ]; then
   INLINE_ROW="all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\" and length > 0) and (.body | type == \"string\") and has(\"line\") and has(\"original_line\"))"
   pin "inline comments carry numeric id, pull_request_review_id, commit_id, user.login, a non-empty path, body, and the line/original_line pair poll renders" \
     "$INLINE_ROW" "$inline_all"
+  # The reviews feed is read AFTER the inline feed, the way the check-run correlation orders its
+  # reads and for the same reason: the reply belief below correlates a reply found in the INLINE
+  # feed with the COMMENTED review that carries it, and a review exists before its comments do.
+  # Read the other way round, a reply posted BETWEEN the two reads is in the inline snapshot with
+  # no review in the earlier reviews snapshot, and the belief reports MOVED over a race
+  # (ludics-lite#70, from #66's round 13). The default anchor #39 is closed and can never show
+  # that; a CONTRACT_REVIEWED_PR still being replied to would.
+  reviews=$(api --paginate "repos/$REPO/pulls/$REVIEWED_PR/reviews?per_page=100" | jq -s 'add')
+  pin "the reviews feed is a list" 'type == "array"' "$reviews"
+  is_list "$reviews" || reviews='[]'
+  pin "reviews carry numeric id, state, commit_id, submitted_at (present, null while pending), user.login and a body (poll renders it)" \
+    "all(.[]; (.id | type == \"number\") and (.state | type == \"string\") and (.commit_id | test(\"$HEX40\")) and has(\"submitted_at\") and (.submitted_at == null or (.submitted_at | test(\"$ISO\"))) and (.user.login | type == \"string\") and has(\"body\"))" "$reviews"
+  pin "the app's review states are in the vocabulary (the projections filter to the app before classifying; other participants' states are not read)" \
+    "all(.[] | select($APP); .state as \$s | $REVIEW_STATE_VOCAB | index(\$s))" "$reviews" --arg rev "$REVIEWER"
+  pin "a round with findings is COMMENTED reviews from the app, and the approval is NOT an APPROVED review (it is the reaction above)" \
+    "any(.[]; $APP and .state == \"COMMENTED\") and all(.[] | select($APP); .state != \"APPROVED\")" "$reviews" --arg rev "$REVIEWER"
   # The belief behind id-based watermarks: a reply to an inline comment creates a COMMENTED
-  # review by the replier, in the same feed as the app's rounds. Detected from a reply (a
-  # non-bot comment with in_reply_to_id) rather than required of the anchor, which need not
-  # carry one; skips when it does not.
-  reply_review=$(jq -r --arg bot "$BOT" '[.[]? | select(.user.login != $bot and (.in_reply_to_id | type == "number"))][0] | if . == null then empty else "\(.pull_request_review_id // "-")\t\(.user.login)" end' <<<"$inline_all")
+  # review by the replier, in the same feed as the app's rounds. Detected from a reply (a comment
+  # the projections would NOT read as the app's — the same prefix predicate, negated — carrying
+  # an in_reply_to_id) rather than required of the anchor, which need not carry one; skips when
+  # it does not.
+  reply_review=$(jq -r --arg rev "$REVIEWER" "[.[]? | select(($APP | not) and (.in_reply_to_id | type == \"number\"))][0] | if . == null then empty else \"\(.pull_request_review_id // \"-\")\t\(.user.login)\" end" <<<"$inline_all")
   if [ -n "$reply_review" ]; then
     IFS=$'\t' read -r rr_id rr_user <<<"$reply_review"
     if is_num "$rr_id"; then
