@@ -490,7 +490,28 @@ run_tests() {
 # to define one of any name — which is the same ground the fixture `gh` has always stood on.
 # Only the snapshot is filtered: `check_shadows` reads the CURRENT table unfiltered, because the
 # file it reports a redefinition from is the suite's own.
-LIB_SNAPSHOT=$(lib_function_table | awk -v h="$HELPER" -v t="$TEST_LIB_FILE" '$3 == h || $3 == t')
+#
+# The path is the INTACT remainder of the record, not a field: `declare -F` prints "<name> <line>
+# <file>", and a checkout under a path with a space in it — `/tmp/ludics review.XXXX`, which is
+# what a scratch clone looks like — splits that file across awk's fields. Comparing `$3` then
+# matched nothing, the snapshot came out EMPTY, and an empty snapshot does not fail: it protects
+# no function at all, so every shadow is accepted and the file's own first control passes a
+# deliberate `fail` through. Hence the check under it, which is the same guard the constants probe
+# carries: this file's whole purpose is a refusal, and a refusal that quietly has nothing to say
+# is the failure mode it was written against.
+LIB_SNAPSHOT=$(lib_function_table |
+  awk -v h="$HELPER" -v t="$TEST_LIB_FILE" '{
+    path = $0
+    sub(/^[^ ]+ [^ ]+ /, "", path)
+    if (path == h || path == t) print
+  }')
+case "$LIB_SNAPSHOT" in
+*[![:space:]]*) ;;
+*)
+  echo "test-pr-review-lib.sh: REFUSING to run: the function-table snapshot named nothing, so the shadow guard would protect no function and every ludics-lite#46 shadow would be accepted silently; pr-review.sh ($HELPER) and this file should between them define some sixty" >&2
+  exit 2
+  ;;
+esac
 
 # --- executed: this file's own controls -------------------------------------------------------
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0
@@ -932,6 +953,44 @@ test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason() {
   assert_eq "$out" "" "nothing may run"
 }
 
+# The guard has to survive the PATH it is checked out under. `declare -F` prints "<name> <line>
+# <file>", and a directory with a space in it — a scratch clone at `/tmp/ludics review.XXXX` —
+# splits that file across the fields of anything reading it positionally. Comparing a field rather
+# than the intact remainder emptied the snapshot, and an EMPTY snapshot protects nothing and says
+# nothing: this file's own first control passed a deliberate `fail` through.
+#
+# The control cannot be "run this file from a spaced directory" — it would run this case again,
+# forever. It is a throwaway suite there instead, carrying the ludics-lite#46 shadow, which must
+# still be refused.
+test_the_guard_survives_a_path_with_spaces() {
+  local root out err rc lib
+  root=$(mktemp -d "${TMPDIR:-/tmp}/pr-review lib space.XXXXXX") || bail "mktemp -d failed"
+  TEST_CLEANUP+=("$root")
+  case "$root" in *" "*) ;; *) bail "the control needs a path with a space in it: $root" ;; esac
+  lib="$root/$(basename "$TEST_LIB_FILE")"
+  cp "$HELPER" "$TEST_LIB_FILE" "$root/"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    printf 'source %s\n' "\"$lib\""
+    echo 'fail() { echo "FAIL: $*" >&2; exit 1; }'
+    echo 'test_a_case() { assert_eq 1 1 "one is one"; }'
+    echo 'run_tests test_a_case'
+  } >"$root/suite.sh"
+  set +e
+  out=$(bash "$root/suite.sh" 2>"$root/err")
+  rc=$?
+  set -e
+  err=$(cat "$root/err")
+  assert_eq "$rc" 2 "the shadow guard must still refuse from a spaced path ($err)"
+  assert_contains "$err" "without \`stub fail\`" "the refusal should name the shadow, not the snapshot"
+  assert_not_contains "$out" "PASS:" "no case may run"
+  # And the snapshot itself is not empty there — the refusal above would also fire if the file
+  # merely failed to load, and this is the difference between the two.
+  assert_not_contains "$err" "the function-table snapshot named nothing" \
+    "the snapshot should be populated, not empty-and-refused"
+}
+
 tests=(
   test_undeclared_shadow_is_refused
   test_every_library_function_is_protected
@@ -950,6 +1009,7 @@ tests=(
   test_retune_is_undone_when_the_case_ends # must stay directly after the case above
   test_retune_of_a_name_the_script_does_not_set_is_refused
   test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason
+  test_the_guard_survives_a_path_with_spaces
 )
 
 run_tests "${tests[@]}"
