@@ -521,27 +521,56 @@ test_tmpdir CONTROL_ROOT lib-test
 CONTROL_N=0
 
 # control <body...>: a throwaway suite that sources this file and runs a passing case, with the
-# given lines in between. Its exit code, stdout and stderr land in CONTROL_RC / _OUT / _ERR.
+# given lines in between. Its exit code, stdout and stderr land in CONTROL_RC / _OUT / _ERR, and
+# the suite it wrote in CONTROL_FILE.
 control() {
-  local file rc
+  control_in "$CONTROL_ROOT" "$@"
+}
+
+# control_in <dir> <body...>: `control`, with the throwaway suite written in <dir> instead of
+# beside the others. It sources the preamble copy in <dir> when the caller has put one there —
+# and so runs against whatever pr-review.sh sits beside THAT copy, which is what a control over
+# the source itself needs — and this file where it lives when <dir> holds no copy, which is the
+# plain `control` above. A control wanting a directory of its own makes one with `test_tmpdir`,
+# whose label is part of the name and so may carry a space, and copies in what it wants read.
+#
+# What is written is always a throwaway SUITE, never this file: a control that ran the preamble
+# itself would re-enter the case that called it, and that one would run it again, forever.
+control_in() {
+  local dir file lib
+  dir="$1"
+  shift
+  [ -d "$dir" ] || bail "control_in: $dir is not a directory"
+  lib="$dir/$(basename "$TEST_LIB_FILE")"
+  [ -f "$lib" ] || lib="$TEST_LIB_FILE"
   CONTROL_N=$((CONTROL_N + 1))
-  file="$CONTROL_ROOT/control-$CONTROL_N.sh"
+  file="$dir/control-$CONTROL_N.sh"
   {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
-    printf 'source %s\n' "\"$TEST_LIB_FILE\""
+    printf 'source %s\n' "\"$lib\""
     printf '%s\n' "$@"
     echo 'test_a_case() { assert_eq 1 1 "one is one"; }'
     echo 'run_tests test_a_case'
   } >"$file"
+  CONTROL_FILE="$file"
+  control_run "$file"
+}
+
+# control_run <script>: run <script> and land its exit code, stdout and stderr in CONTROL_RC /
+# _OUT / _ERR. For the controls that cannot be a plain body — a wrapper that exports a function
+# in before exec'ing a suite, a suite that defines one above the source — which need the capture
+# and nothing else. The two capture files stay in $CONTROL_ROOT wherever <script> is, so a
+# control with a directory of its own has in it only what it was given.
+control_run() {
+  local rc
   set +e
-  bash "$file" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
+  bash "$1" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
   rc=$?
   set -e
   CONTROL_RC="$rc"
   CONTROL_OUT=$(cat "$CONTROL_ROOT/out")
   CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
-  CONTROL_FILE="$file"
 }
 
 assert_refused() { # <msg>: the guard's refusal, with no case run
@@ -618,12 +647,7 @@ test_own_functions_pass() {
     echo 'export -f gh'
     printf 'exec bash %s\n' "\"$CONTROL_FILE\""
   } >"$exporter"
-  set +e
-  bash "$exporter" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
-  CONTROL_RC=$?
-  set -e
-  CONTROL_OUT=$(cat "$CONTROL_ROOT/out")
-  CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
+  control_run "$exporter"
   assert_eq "$CONTROL_RC" 0 "an inherited gh must not make the suite's own fixture a shadow ($CONTROL_ERR)"
   assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
   assert_not_contains "$CONTROL_ERR" "REFUSING" "and nothing should be refused"
@@ -638,12 +662,7 @@ test_definitions_before_sourcing_are_refused() {
     printf 'source %s\n' "\"$TEST_LIB_FILE\""
     echo 'run_tests early'
   } >"$file"
-  set +e
-  bash "$file" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
-  CONTROL_RC=$?
-  set -e
-  CONTROL_OUT=$(cat "$CONTROL_ROOT/out")
-  CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
+  control_run "$file"
   assert_refused "a function defined before the source"
   assert_contains "$CONTROL_ERR" "defined functions before sourcing this file (early)" \
     "the early definition should be named"
@@ -661,12 +680,7 @@ test_definitions_before_sourcing_are_refused() {
     echo 'export -f fail inherited_helper'
     printf 'exec bash %s\n' "\"$CONTROL_FILE\""
   } >"$exporter"
-  set +e
-  bash "$exporter" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
-  CONTROL_RC=$?
-  set -e
-  CONTROL_OUT=$(cat "$CONTROL_ROOT/out")
-  CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
+  control_run "$exporter"
   assert_eq "$CONTROL_RC" 0 "an exported function in the environment must not refuse a suite ($CONTROL_ERR)"
   assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
   assert_not_contains "$CONTROL_ERR" "REFUSING" "and nothing should be refused"
@@ -933,24 +947,18 @@ test_retune_of_a_name_the_script_does_not_set_is_refused() {
 # discarded — which reads as the suite failing rather than as a setup that never started. The
 # control is a copy of this file beside a pr-review.sh that refuses to source.
 test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason() {
-  local root out err rc
+  local root
   test_tmpdir root probe-fail
   cp "$TEST_LIB_FILE" "$root/"
   printf '#!/usr/bin/env bash\necho "missing dependency: frobnicator not found" >&2\nreturn 1\n' \
     >"$root/pr-review.sh"
-  printf '#!/usr/bin/env bash\nset -euo pipefail\nsource "%s"\n' \
-    "$root/$(basename "$TEST_LIB_FILE")" >"$root/suite.sh"
-  set +e
-  out=$(bash "$root/suite.sh" 2>"$root/err")
-  rc=$?
-  set -e
-  err=$(cat "$root/err")
-  assert_eq "$rc" 2 "a probe that cannot read the constants is a refusal, not a suite failure ($err)"
-  assert_contains "$err" "REFUSING to run: the probe that reads pr-review.sh's source-time constants" \
+  control_in "$root"
+  assert_eq "$CONTROL_RC" 2 "a probe that cannot read the constants is a refusal, not a suite failure ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "REFUSING to run: the probe that reads pr-review.sh's source-time constants" \
     "the refusal should name what could not be read"
-  assert_contains "$err" "missing dependency: frobnicator not found" \
+  assert_contains "$CONTROL_ERR" "missing dependency: frobnicator not found" \
     "and carry what the source itself said, which is the only thing that localizes it"
-  assert_eq "$out" "" "nothing may run"
+  assert_eq "$CONTROL_OUT" "" "nothing may run"
 }
 
 # The guard has to survive the PATH it is checked out under. `declare -F` prints "<name> <line>
@@ -963,31 +971,17 @@ test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason() {
 # forever. It is a throwaway suite there instead, carrying the ludics-lite#46 shadow, which must
 # still be refused.
 test_the_guard_survives_a_path_with_spaces() {
-  local root out err rc lib
-  root=$(mktemp -d "${TMPDIR:-/tmp}/pr-review lib space.XXXXXX") || bail "mktemp -d failed"
-  TEST_CLEANUP+=("$root")
+  local root
+  test_tmpdir root "lib space"
   case "$root" in *" "*) ;; *) bail "the control needs a path with a space in it: $root" ;; esac
-  lib="$root/$(basename "$TEST_LIB_FILE")"
   cp "$HELPER" "$TEST_LIB_FILE" "$root/"
-  {
-    echo '#!/usr/bin/env bash'
-    echo 'set -euo pipefail'
-    printf 'source %s\n' "\"$lib\""
-    echo 'fail() { echo "FAIL: $*" >&2; exit 1; }'
-    echo 'test_a_case() { assert_eq 1 1 "one is one"; }'
-    echo 'run_tests test_a_case'
-  } >"$root/suite.sh"
-  set +e
-  out=$(bash "$root/suite.sh" 2>"$root/err")
-  rc=$?
-  set -e
-  err=$(cat "$root/err")
-  assert_eq "$rc" 2 "the shadow guard must still refuse from a spaced path ($err)"
-  assert_contains "$err" "without \`stub fail\`" "the refusal should name the shadow, not the snapshot"
-  assert_not_contains "$out" "PASS:" "no case may run"
+  control_in "$root" 'fail() { echo "FAIL: $*" >&2; exit 1; }'
+  assert_eq "$CONTROL_RC" 2 "the shadow guard must still refuse from a spaced path ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "without \`stub fail\`" "the refusal should name the shadow, not the snapshot"
+  assert_not_contains "$CONTROL_OUT" "PASS:" "no case may run"
   # And the snapshot itself is not empty there — the refusal above would also fire if the file
   # merely failed to load, and this is the difference between the two.
-  assert_not_contains "$err" "the function-table snapshot named nothing" \
+  assert_not_contains "$CONTROL_ERR" "the function-table snapshot named nothing" \
     "the snapshot should be populated, not empty-and-refused"
 }
 
