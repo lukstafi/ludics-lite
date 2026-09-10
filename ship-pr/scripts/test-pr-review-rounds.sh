@@ -222,6 +222,23 @@ test_initialization_failures_are_not_rounds() {
     "a finding that mentions the wording is still a finding"
 }
 
+# The other side of that filter: a comment-only round whose finding QUOTES the ref error is a
+# round. This function has no head to check a quoted ref against, so it drops a comment only when
+# the body OPENS with the failure sentence itself — under the shape `status` uses, a round about
+# this very matcher would vanish from the convergence count (review of #82, round 1).
+test_a_round_quoting_the_ref_error_still_counts() {
+  set_reviews
+  set_comments "$(comment "$REVIEWER" 2026-09-09T17:00:54Z \
+    "$(printf '%s\n\n```\nProvided git ref %s does not exist\n```\n\n%s\n' \
+      'Codex Review: P2 — the matcher drops a round whose body quotes' \
+      0ac6fef8038e95481f82deddc1edfa2ab8ca8827 'from the convergence count.')")"
+  ROUND_THRESHOLD=12
+  run_rounds
+  assert_eq "$ROUNDS_RC" 0 "a round is a round"
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "a finding that quotes the ref error must not be swept up with the failures"
+}
+
 test_no_rounds_yet() {
   set_reviews "$(review "$REVIEWER" APPROVED cccc 2026-09-01T12:00:00Z)"
   ROUND_THRESHOLD=12
@@ -280,6 +297,7 @@ tests=(
   test_comment_only_rounds_count
   test_large_comment_feed_still_counts
   test_initialization_failures_are_not_rounds
+  test_a_round_quoting_the_ref_error_still_counts
   test_no_rounds_yet
   test_threshold
   test_threshold_off

@@ -24,6 +24,8 @@ MERGEABLE_STATE=clean
 FAIL_PULLS=""
 PUSH_ON_REVIEWS_READ=""
 PAST=2026-09-01T00:00:00Z
+# The head commit's own date, which is what a failure naming no ref is dated against.
+HEAD_AT=2026-09-01T00:00:00Z
 # The two refs ocannl-staging#677's failures named, and its third head, which reviewed normally.
 FAILED_HEAD=0ac6fef8038e95481f82deddc1edfa2ab8ca8827
 OTHER_REF=099131cc90960b2ad144f9f33c374c6be81035c8
@@ -34,6 +36,7 @@ reset_fixture() {
   COMMENTS_JSON='[]'
   HEAD_SHA=head-sha
   MERGEABLE_STATE=clean
+  HEAD_AT=2026-09-01T00:00:00Z
   FAIL_PULLS=""
   PUSH_ON_REVIEWS_READ=""
   rm -f "$TEST_ROOT/pushed"
@@ -116,7 +119,7 @@ gh() {
     ;;
   "repos/$REPO/commits/head-sha" | "repos/$REPO/commits/new-head-sha" | \
     "repos/$REPO/commits/$FAILED_HEAD")
-    response='{"sha":"head-sha","commit":{"committer":{"date":"2026-09-01T00:00:00Z"}}}' ;;
+    response=$(jq -cn --arg d "$HEAD_AT" '{sha:"head-sha", commit:{committer:{date:$d}}}') ;;
   "repos/$REPO/commits/main") response='{"sha":"base-sha"}' ;;
   "repos/$REPO/compare/base-sha...head-sha?per_page=1" | \
     "repos/$REPO/compare/base-sha...$FAILED_HEAD?per_page=1") response=$(compare_json 7 15 pr.txt) ;;
@@ -387,6 +390,8 @@ test_initialization_failure_is_its_own_state() {
 # reviewer's newest word and it contradicts nothing.
 test_a_failure_naming_no_ref_still_fires() {
   failed_fixture -
+  # Dated after the head: that is what says which head it is about, the ref not being there.
+  COMMENTS_JSON="[$(failure_comment 100 - 2026-09-01T00:05:00Z)]"
   run_status
   assert_eq "$(state_tok "$STATE")" failed "a failure naming no ref cannot be about another head"
   assert_contains "$LINE" "reviewer FAILED at initialization on head ${FAILED_HEAD:0:7}" \
@@ -488,13 +493,14 @@ test_a_quoted_failure_is_not_a_failure() {
   run_status
   assert_eq "$(state_tok "$STATE")" expected \
     "a finding that quotes the failure sentence is not the reviewer failing"
-  # Quoted with its fenced ref line as well: that marker is line-anchored and does match, so what
-  # refuses the state here is the ref — the quoted one is not this PR's head.
+  # Quoted whole, ref line and all: the ref marker is anchored to the opening line too, so the
+  # shape refuses this before the ref is ever read. (The ref guard behind it is what
+  # test_a_failure_naming_another_head_is_expected exercises, on a genuine failure body.)
   COMMENTS_JSON="[$(plain_comment 101 "$PAST" "$(printf 'Round 4, the fixture body is\n\n%s\n' \
     "$(failure_body "$OTHER_REF")")")]"
   run_status
   assert_eq "$(state_tok "$STATE")" expected \
-    "a quoted failure names the ref it was quoted from, which is not this head"
+    "a failure quoted below the first line is a quotation, not the reviewer failing"
 }
 
 test_watch_exits_on_the_initialization_failure() {
@@ -517,6 +523,67 @@ test_watch_exits_on_the_initialization_failure() {
   assert_contains "$WATCH_OUT" "--- summary id=100" "the failure comment is what poll saw"
   assert_contains "$WATCH_ERR" "status: reviewer FAILED at initialization" \
     "the context should name the state, not leave the caller to read the body"
+}
+
+# A ref-less failure names no head, so its DATE has to say which head it was about: without that
+# it matches every SHA and follows the branch onto each head pushed after it, nudging over a
+# round that has not had its grace yet (review of #82, round 1).
+test_a_ref_less_failure_does_not_follow_a_new_head() {
+  failed_fixture -
+  COMMENTS_JSON="[$(failure_comment 100 - 2026-08-31T22:00:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected \
+    "a failure from before this head was committed is about the head it replaced"
+  assert_contains "$LINE" "review EXPECTED but not started" \
+    "the new head's round has not started yet and has its grace to run"
+  # The control on the same clock: the same comment, dated after the head, still fires.
+  COMMENTS_JSON="[$(failure_comment 100 - 2026-09-01T00:05:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "a failure after the head's commit is about this head"
+  # An undated head cannot answer the question. The reviewer's newest word stands rather than
+  # being dropped on an API failure, and the remedy stays the cheap one.
+  HEAD_AT=""
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "an unread head date does not withdraw the failure"
+  assert_contains "$LINE" "nudge it once" "an uncountable recurrence stays at the first remedy"
+}
+
+# Two ref-less failures on an unchanged head are two failures, not one twice: counted by the same
+# date rule, or the second remedy would never be reached (review of #82, round 1).
+test_two_ref_less_failures_reach_the_second_remedy() {
+  failed_fixture -
+  COMMENTS_JSON="[$(failure_comment 100 - 2026-09-01T00:05:00Z),$(
+    failure_comment 101 - 2026-09-01T00:20:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "still a failure"
+  assert_contains "$LINE" "failed 2 times on THIS head" \
+    "both failures are about this head, and the line should say so"
+  assert_contains "$LINE" "push a new head" "the second failure is where the head has to move"
+  # A failure from before the head does not join that count.
+  COMMENTS_JSON="[$(failure_comment 100 - 2026-08-31T22:00:00Z),$(
+    failure_comment 101 - 2026-09-01T00:20:00Z)]"
+  run_status
+  assert_contains "$LINE" "nudge it once" "a failure about the previous head is not one about this"
+}
+
+# The merge gate against a failure, both ways round — the deliberate part of the ranking. A round
+# that ANNOUNCED itself and then failed closes the gate; a re-request that never announced itself
+# does not withdraw the verdict this head already has, exactly as a 👍 would not be withdrawn.
+test_a_standing_verdict_survives_a_failed_re_request() {
+  failed_fixture "$FAILED_HEAD"
+  COMMENTS_JSON="[$(verdict_comment 99 "$FAILED_HEAD" "$PAST"),$(
+    failure_comment 100 "$FAILED_HEAD" 2026-09-01T01:00:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved \
+    "a round that never ran does not take back the verdict this head already has"
+  assert_contains "$LINE" "no-findings verdict for head" "the approval names the verdict it rests on"
+  # With a 👀 between them — the re-request that did announce a round — the verdict is no longer
+  # the reviewer's newest word about the attempt, and the failure is what the caller must act on.
+  REACTIONS_JSON="[$(reaction eyes 2026-09-01T00:30:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed \
+    "a round that announced itself and then failed leaves the failure as the newest word"
+  assert_contains "$LINE" "reviewer FAILED at initialization" "and the line says so"
 }
 
 tests=(
@@ -543,6 +610,9 @@ tests=(
   test_a_newer_reviewer_word_supersedes_the_failure
   test_a_quoted_failure_is_not_a_failure
   test_watch_exits_on_the_initialization_failure
+  test_a_ref_less_failure_does_not_follow_a_new_head
+  test_two_ref_less_failures_reach_the_second_remedy
+  test_a_standing_verdict_survives_a_failed_re_request
 )
 
 run_tests "${tests[@]}"
