@@ -171,18 +171,26 @@ for r in $LOCAL_ROUTINES; do
   fi
 
   if [ ! -d "$dst" ]; then
-    warn "$r: not installed at $dst -- register the task with the \`schedule\` tool first"
+    # The registry lives in the desktop app and is not readable from here, so a missing prompt
+    # directory says nothing about whether a registry entry names it. Report the fact, not an
+    # inference from it.
+    warn "$r: no prompt directory at $dst"
     case "$mode" in
       push)
         if $dry_run; then
           say "$r: would install $src -> $dst"
         else
           copy_dir "$src" "$dst"
-          say "$r: prompt installed, but the task is still unregistered (no cron will fire it)"
+          say "$r: prompt installed at $dst"
+          say "$r: if the desktop app does not list this task, register it -- a prompt no registry"
+          say "$r: entry names never fires, and this script cannot see the registry either way"
           copied=$((copied + 1))
         fi
         ;;
-      pull) problems=1 ;;
+      pull)
+        warn "$r: nothing to pull -- there is no installed prompt to take"
+        problems=1
+        ;;
       *) drift=1 ;;
     esac
     continue

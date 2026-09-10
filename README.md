@@ -216,19 +216,21 @@ which an iteration budget did not (`WAKE_LAB_WAIT_SECONDS`, `WAKE_LAB_WSL_WAIT_S
 `test-sync-routines.sh` runs `scripts/sync-routines.sh` against scratch trees, with
 `CLAUDE_SCHEDULED_TASKS_DIR` pointed at them and over a byte-identical copy of the script inside a
 scratch checkout, so a `pull` case can never reach the real `routines/`. It pins the four states
-`status` reports and the exit code of each (in sync, drift, installed as a symlink, not
-installed), that `push` replaces a symlinked installation with a real directory instead of writing
-through it, that a destination reached through a link at any component *above* the routine
-directory is refused as well — a symlinked `~/.claude` leaves every task directory real and the
-whole tree unreadable — that `--dry-run` copies nothing in any mode, and the usage exits. It also pins what
-ludics-lite#77 found unpinned: that the script's `LOCAL_ROUTINES` lists exactly the rows of
-`routines/README.md` whose Kind is `local scheduled task`. That comparison reads the table
-narrowly and refuses an empty read, so a mangled table cannot pass it vacuously, and four negative
-controls show it can fail; `check-prompts.sh` keeps its per-directory lookup and gains no table
-model. Two more cases pin what the comparison is worth: that the workflow job running this suite
-carries no `if:`/`needs:`, since an all-Markdown PR is both what the classification calls
-prompt-only and the one shape that can break the pin, and that the tracked mode of
-`sync-routines.sh` is 755, which a `> tmp && mv` rewrite drops silently.
+`status` reports and the exit code of each — in sync, drift, installed as a symlink, no prompt
+directory — that `push` replaces a symlinked installation with a real directory instead of writing
+through it, and that a destination reached through a link at any component *above* the routine
+directory is refused too: a symlinked `~/.claude` leaves every task directory real and the whole
+tree unreadable. It pins that `--dry-run` copies nothing in any mode, the usage exits, and that
+nothing infers a registration state from a missing prompt directory — the registry is the desktop
+app's and unreadable here, so `push` says to check the task list rather than reporting what is in
+it. It also pins what ludics-lite#77 found unpinned: that the script's `LOCAL_ROUTINES` lists
+exactly the rows of `routines/README.md` whose Kind is `local scheduled task`. That comparison
+reads the table narrowly and refuses an empty read, so a mangled table cannot pass it vacuously,
+and four negative controls show it can fail; `check-prompts.sh` keeps its per-directory lookup and
+gains no table model. Two last cases pin what the comparison is worth: that the workflow job
+running this suite carries no `if:`/`needs:`, since an all-Markdown PR is both what the diff
+classification calls prompt-only and the one shape that can break the pin, and that the tracked
+mode of `sync-routines.sh` is 755, which a `> tmp && mv` rewrite drops silently.
 
 `test-pr-review-checks-absent.sh` drives the build gate against a canned Actions API, one answer
 per polling round, and pins everything the check list alone cannot say about a head. Exit 4 (no

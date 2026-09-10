@@ -63,8 +63,10 @@ that list, and CI says so if only one of them changes.
 
 On a fresh box, register the task first (the `schedule` tool in the desktop app, with the cron,
 working directory and model from the table; it writes a placeholder `SKILL.md`), then `push` over
-it. Registration and prompt are independent: a pushed prompt with no registry entry never fires,
-which is what the script warns about.
+it. Registration and prompt are independent in both directions, and the script can see only one of
+them: the registry is the desktop app's, so a missing prompt directory is no evidence the task is
+unregistered (a prompt directory deleted under a live registry entry looks exactly the same), and
+`push` says to check the app's task list rather than telling you what it found there.
 
 Only the box running the desktop app's scheduler fires these. On the author's fleet that is
 `mac-studio`, which is why both run in that box's `~/ocannl-staging`.

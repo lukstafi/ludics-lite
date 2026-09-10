@@ -133,10 +133,12 @@ printf '%s' "$out" | grep -q 'the scheduler cannot read it' \
   && ok "...and says the scheduler cannot read it" || ko "no consequence given -- $out"
 
 reset_trees
-expect "status reports an uninstalled routine with exit 1" 1 "not installed at" -- run_sync
-printf '%s' "$out" | grep -q 'schedule' \
-  && ok "...pointing at the \`schedule\` tool, since registration is separate" \
-  || ko "the not-installed line does not mention registration -- $out"
+expect "status reports a missing prompt directory with exit 1" 1 "no prompt directory at" -- run_sync
+# The registry is the desktop app's and unreadable from here, so nothing may be asserted about it
+# from the absence of a directory: the line reports the directory, not a registration state.
+printf '%s' "$out" | grep -qi 'unregister\|not registered\|no cron' \
+  && ko "the missing-directory line claims something about the registry it cannot read -- $out" \
+  || ok "...without inferring anything about the registry from it"
 
 # --- push ---------------------------------------------------------------------------------------
 reset_trees; install_all
@@ -165,16 +167,20 @@ grep -q 'body v2' "$TMP/installed/$R1/SKILL.md" \
   && ok "...carrying the checkout's current prompt" || ko "the replacement copy is stale"
 
 reset_trees
-expect "push installs a routine that is not there at all" 0 "still unregistered" -- run_sync push
+expect "push installs a routine that is not there at all" 0 "prompt installed at" -- run_sync push
 [ -f "$TMP/installed/$R1/SKILL.md" ] \
   && ok "...writing a real file" || ko "nothing was installed at $TMP/installed/$R1"
-printf '%s' "$out" | grep -q 'no cron will fire it' \
-  && ok "...while warning that a prompt without a registry entry never fires" \
-  || ko "push installed silently over a missing registration -- $out"
+printf '%s' "$out" | grep -q 'never fires' \
+  && ok "...while saying a prompt no registry entry names never fires" \
+  || ko "push installed silently, saying nothing about registration -- $out"
+# ...but conditionally: the directory was missing, which is no evidence the task is unregistered.
+printf '%s' "$out" | grep -qi 'is still unregistered\|is unregistered\|no cron will fire' \
+  && ko "push asserts the task is unregistered, which it cannot know from a missing directory -- $out" \
+  || ok "...as a thing to check, not as a claim about the registry"
 
 reset_trees
 rm -rf "$TMP/installed"
-expect "push creates the scheduled-tasks directory on a box that has none" 0 "still unregistered" -- \
+expect "push creates the scheduled-tasks directory on a box that has none" 0 "prompt installed at" -- \
   run_sync push
 [ -f "$TMP/installed/$R1/SKILL.md" ] \
   && ok "...and installs into it" || ko "push did not create $TMP/installed"
@@ -203,7 +209,7 @@ grep -q 'body v1' "$REPO/routines/$R1/SKILL.md" \
   && ok "...leaving the checkout's prompt alone" || ko "pull mangled the source through the link"
 
 reset_trees
-expect "pull with nothing installed exits 1" 1 "not installed at" -- run_sync pull
+expect "pull with nothing installed exits 1" 1 "nothing to pull" -- run_sync pull
 
 # --- --dry-run copies nothing -------------------------------------------------------------------
 reset_trees; install_all
@@ -472,7 +478,7 @@ scratch_mode=$( cd "$GITREPO" && git ls-files -s -- s.sh 2>/dev/null | awk '{pri
 # and must not touch the real ~/.claude/scheduled-tasks.
 mkdir -p "$TMP/empty-dest"
 out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/empty-dest" "$SYNC" 2>&1); rc=$?
-[ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'not installed at' \
+[ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no prompt directory at' \
   && ok "the tracked script itself reports an empty destination with exit 1" \
   || ko "the tracked script on an empty destination: rc=$rc -- $out"
 [ -z "$(ls -A "$TMP/empty-dest")" ] \
