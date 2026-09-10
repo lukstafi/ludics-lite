@@ -611,8 +611,14 @@ if [ -n "$REVIEWED_PR" ]; then
   is_list "$inline_page" || inline_page='[]'
   # The row shape poll renders, asserted on BOTH feeds: while the flat listing lags a fresh
   # round, the per-review feed is the only source of these fields.
-  INLINE_ROW="all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\" and length > 0) and (.body | type == \"string\") and has(\"line\") and has(\"original_line\"))"
-  pin "inline comments carry numeric id, pull_request_review_id, commit_id, user.login, a non-empty path, body, and the line/original_line pair poll renders" \
+  # `original_commit_id` is in this row because TWO behaviours rest on it and neither would say so
+  # if it vanished: poll stamps an inline finding with it (the head binding of ludics-lite#72 —
+  # `commit_id` MIGRATES forward and would stamp an old finding with the current head), and it is
+  # part of the key that folds duplicate threads (ludics-lite#76). Both fall back to `commit_id`,
+  # silently and wrongly, so its absence has to be a reported MOVED rather than a fallback nobody
+  # notices.
+  INLINE_ROW="all(.[]; (.id | type == \"number\") and (.pull_request_review_id | type == \"number\") and (.commit_id | test(\"$HEX40\")) and (.original_commit_id | test(\"$HEX40\")) and (.user.login | type == \"string\") and (.path | type == \"string\" and length > 0) and (.body | type == \"string\") and has(\"line\") and has(\"original_line\"))"
+  pin "inline comments carry numeric id, pull_request_review_id, commit_id, the original_commit_id poll stamps and folds by, user.login, a non-empty path, body, and the line/original_line pair poll renders" \
     "$INLINE_ROW" "$inline_all"
   # The reviews feed is read AFTER the inline feed, the way the check-run correlation orders its
   # reads and for the same reason: the reply belief below correlates a reply found in the INLINE
