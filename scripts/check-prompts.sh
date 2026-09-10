@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prompt hygiene: the small, deterministic checks on the prompts themselves -- every skill and
-# routine `SKILL.md`, and the two README tables that index them. It is the one CI job that runs on
+# routine `SKILL.md`, and the two READMEs that index them. It is the one CI job that runs on
 # every head regardless of what changed (ludics-lite#55): the script suites are conditioned on
 # script-related paths, so a prompt-only PR would otherwise reach the merge gate with no verdict at
 # all, which `pr-review.sh merge` refuses as ABSENT. This is what keeps such a head judged.
@@ -17,9 +17,10 @@
 #     guess what a loader would make of it;
 #   - `name` equals the directory's name, which is what the install loops link by and what the
 #     scheduler registers.
-# And per index table -- `| Skill |` in README.md, `| Routine |` in routines/README.md -- that
-# the table's first column and the directories carrying a SKILL.md are the same set, in both
-# directions, so a new prompt cannot land unindexed and a row cannot outlive its directory.
+# And per README -- README.md for the skills, routines/README.md for the routines -- that every
+# directory carrying a SKILL.md is named, in backticks, in the first cell of a row there, so a new
+# prompt cannot land unindexed. That is a lookup, not a rendering claim: see `indexed` below for
+# what it stopped asserting when the table scanner went (ludics-lite#75).
 #
 # Usage: check-prompts.sh [root]   (root defaults to the checkout this script lives in;
 #                                   exit 0 all pass, 1 otherwise)
@@ -220,118 +221,65 @@ check_skill_file() {
   ok "$rel: frontmatter names '$name' with a one-line description"
 }
 
-# --- index tables -----------------------------------------------------------------------------
-# table_names <readme> <first-column-header>: the backticked first column of the table whose
-# header row starts `| <header> |`. It is a table only with its delimiter row (`| --- | ... |`)
-# right under the header -- without one Markdown renders the rows as prose, and so does this.
-# A table ends at the first line that is not a row, blank or not: a heading or paragraph ends
-# it just the same, and the rows of a later table are that table's, whatever its header. The
-# two Markdown contexts that hide a table from the renderer by accident, a fenced code block
-# (opened and closed by a fence line indented at most three spaces, since four make it code,
-# closed only by a fence of the same marker at least as long as the one that opened it with
-# nothing but whitespace after it, as CommonMark closes it, and a backtick opener taking no
-# backtick in its info string) and an HTML comment (a region from an unclosed `<!--` to its
-# `-->`, read before any fence inside it; a comment that closes on its own line is cut out of
-# the line, and the rest of the line -- a row, say -- is still read), hide it from
-# this scan too. That is the scan's scope, and a deliberate line: a table is read at column 0
-# outside those two, and a table an author wraps in a raw HTML block (`<pre>`, `<div>`, any of
-# CommonMark's seven HTML-block kinds) is a choice made on purpose, which a hygiene check for
-# accidental drift does not police -- following the HTML-block grammar clause by clause would
-# not end, and would guard nothing anyone does by mistake. A header is read only where GFM
-# lets a table begin (at the top, after a blank line, a heading or a closed fence: a table
-# cannot interrupt a paragraph), its delimiter row as written with as many cells as the header
-# counted on unescaped pipes. Every line until the table's end -- a blank line or a block start
-# -- is printed whole for check_index to judge its first cell, a leading pipe or not (GFM
-# renders a pipeless body row): a row is never skipped for being malformed, and an empty cell
-# cannot vanish the way an empty last line of a command substitution does.
-table_rows() {
-  awk -v hdr="| $2 |" '
-    # Inside a comment region, only its close matters; the rest of that line is then read.
-    comment { k = index($0, "-->"); if (!k) next; comment = 0; $0 = substr($0, k + 3) }
-    # The delimiter row, judged on the line RIGHT AFTER the header whatever that line is (a
-    # fence there ends the table before it began), and as written: hyphen cells (a comment
-    # inside one is content, not a delimiter, to GFM), as many as the header has -- GFM: "The
-    # header row must match the delimiter row in the number of cells. If not, a table will not
-    # be recognized". Cells are counted on unescaped pipes, both rows being pipe-edged: a pipe
-    # is escaped behind an odd run of backslashes, so `\\` pairs go first, then `\|`.
-    want_delim {
-      want_delim = 0
-      h = hdr_line; gsub(/\\\\/, "", h); gsub(/\\\|/, "", h)
-      d = $0; gsub(/\\\\/, "", d); gsub(/\\\|/, "", d)
-      if ($0 ~ /^\|([[:space:]]*:?-+:?[[:space:]]*\|)+[[:space:]]*$/ && gsub(/\|/, "|", d) == gsub(/\|/, "|", h)) in_table = 1
-      else exit
-      boundary = 0; next
-    }
-    # Inside a fence, only a closing fence matters: same marker, at least as long, nothing
-    # but whitespace after it. A closed fence is a block boundary for what follows.
-    fence {
-      if ($0 ~ /^ ? ? ?(```+|~~~+)[[:space:]]*$/) {
-        line = $0; sub(/^ ? ? ?/, "", line); m = substr(line, 1, 1)
-        len = 0; while (substr(line, len + 1, 1) == m) len++
-        if (m == fence_m && len >= fence_len) { fence = 0; boundary = 1 }
-      }
-      next
-    }
-    # An opening fence: a marker run indented at most three spaces; a backtick fence takes no
-    # backtick in its info string, so a line that has one is ordinary text.
-    /^ ? ? ?(```+|~~~+)/ {
-      line = $0; sub(/^ ? ? ?/, "", line); m = substr(line, 1, 1)
-      len = 0; while (substr(line, len + 1, 1) == m) len++
-      if (!(m == "`" && index(substr(line, len + 1), "`"))) { fence = 1; fence_m = m; fence_len = len; next }
-    }
-    # A comment that closes on its own line is cut out; an unclosed one opens a region.
+# --- index lookup -----------------------------------------------------------------------------
+# indexed <readme> <name>: whether <readme> carries a row whose FIRST cell is `<name>` -- the
+# whole claim, and a lookup rather than a parse. One fixed scan per directory: a line is a row
+# here when, after an optional leading pipe, it opens with the backticked name and the next
+# non-blank character is a pipe (GFM renders a body row without its leading pipe, so both
+# spellings count). The name is matched as text, not as a pattern, so a `.` or a `-` in a
+# directory name is that character and `beta` is not found in `` `betas` ``. The name reaches awk
+# through the ENVIRONMENT, never through `-v`: an assignment made with `-v` is escape-processed, so
+# a directory named `a\n` -- a name this checker accepts, spelled `name: "a\\n"` -- would be
+# looked up as `a<LF>` and reported unindexed however exactly the README names it, while the
+# decoded spelling of some OTHER name would answer for it.
+#
+# What this deliberately does NOT claim, after ludics-lite#75: that the row renders. There is no
+# table model here -- no header, no delimiter row, no fenced-code or HTML-comment scope, no
+# end-of-table condition -- so a row-shaped line inside a code fence or a comment satisfies the
+# lookup, and a table whose header or delimiter row was mangled still passes. Each of those was
+# a rule the scanner got to be wrong about, and thirteen review rounds of PR #64 went on their
+# edge cases while the drift anyone actually commits -- a new prompt directory nobody added to
+# the README -- needs none of them. The check that is left is the one worth having, and it is
+# small enough to be obviously right.
+indexed() {
+  CP_WANT="\`$2\`" awk '
+    BEGIN { want = ENVIRON["CP_WANT"] }
     {
-      while ((i = index($0, "<!--")) > 0) {
-        j = index(substr($0, i + 4), "-->")
-        if (!j) { comment = 1; $0 = substr($0, 1, i - 1); break }
-        $0 = substr($0, 1, i - 1) substr($0, i + j + 6)
+      line = $0
+      sub(/^[[:space:]]*\|?[[:space:]]*/, "", line)
+      if (index(line, want) == 1) {
+        rest = substr(line, length(want) + 1)
+        sub(/^[[:space:]]*/, "", rest)
+        if (substr(rest, 1, 1) == "|") { found = 1; exit }
       }
     }
-    # The header, only where a block may begin: at the top, or after a blank line, a heading
-    # or a closed fence -- a table cannot interrupt a paragraph, so a header straight under
-    # prose is prose.
-    index($0, hdr) == 1 { if (NR == 1 || boundary) { want_delim = 1; hdr_line = $0 }; boundary = 0; next }
-    in_table && (/^[[:space:]]*$/ || /^ ? ? ?##?#?#?#?#?([ \t]|$)/ || /^ ? ? ?(```|~~~)/ || /^ ? ? ?>/) { exit }
-    in_table { print; next }
-    # Where the next line may begin a block: after a blank line, or an ATX heading -- one to
-    # six `#` followed by a space or the end of the line; `#not-a-heading` is paragraph text.
-    { boundary = ($0 ~ /^[[:space:]]*$/ || $0 ~ /^ ? ? ?##?#?#?#?#?([ \t]|$)/) }
-  ' "$ROOT/$1"
+    END { exit found ? 0 : 1 }
+  ' "$1"
 }
 
-# check_index <readme> <header> <dir prefix> <what>: the table's names and the directories
-# carrying a SKILL.md under the prefix must be the same set.
+# check_index <readme> <dir prefix> <what>: every directory carrying a SKILL.md under the prefix
+# is named in a backticked row of the readme, so a new prompt cannot land unindexed. The other
+# direction -- a row that outlives its directory -- is not checked: reading it needs the table
+# model this file no longer has, and a stale row misleads a reader where an unindexed prompt
+# hides from one.
 check_index() {
-  local readme="$1" header="$2" prefix="$3" what="$4" dirs cells cell rows missing extra
-  [ -f "$ROOT/$readme" ] || { ko "$readme" "missing: it carries the $what table"; return; }
+  local readme="$1" prefix="$2" what="$3" dirs dir found=0 bad=0
+  [ -f "$ROOT/$readme" ] || { ko "$readme" "missing: it indexes the $what directories"; return; }
   dirs=$(cd "$ROOT" && for f in ${prefix}*/SKILL.md; do [ -f "$f" ] && dirname "$f"; done \
     | sed "s|^$prefix||" | sort)
-  cells=$(table_rows "$readme" "$header")
-  if [ -z "$cells" ]; then
-    ko "$readme" "no '| $header |' table (a header row, its '| --- |' delimiter row, then rows with backticked names in the first column)"
-    return
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    found=$((found + 1))
+    indexed "$ROOT/$readme" "$dir" \
+      || { ko "$readme" "$what '$dir' is not indexed: no row whose first cell is the backticked name '\`$dir\`'"; bad=1; }
+  done <<<"$dirs"
+  if [ "$found" -eq 0 ]; then
+    # Nothing to look up is not a verdict on the index: say that, rather than passing as if the
+    # readme had been checked against something.
+    ok "$readme: no ${prefix:-top-level} SKILL.md directory to index"
+  elif [ "$bad" -eq 0 ]; then
+    ok "$readme: all $found $what directories are named in backticked rows"
   fi
-  # Every row is judged: a first cell that is not exactly one backticked name is a row the
-  # reader sees and this check would otherwise not, so it fails rather than being skipped.
-  rows=""
-  while IFS= read -r cell; do
-    cell=${cell#|}; cell=${cell%%|*}
-    cell=$(printf '%s' "$cell" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-    case "$cell" in
-    \`?*\`) cell=${cell#\`}; cell=${cell%\`}
-      case "$cell" in *\`*) ko "$readme" "$what table row's first cell is not one backticked name: '\`$cell\`'"; continue ;; esac
-      rows="$rows$cell"$'\n' ;;
-    *) ko "$readme" "$what table row's first cell is not a backticked name: '$cell'" ;;
-    esac
-  done <<<"$cells"
-  rows=$(printf '%s' "$rows" | sort)
-  missing=$(comm -23 <(printf '%s\n' "$dirs") <(printf '%s\n' "$rows") | tr '\n' ' ')
-  extra=$(comm -13 <(printf '%s\n' "$dirs") <(printf '%s\n' "$rows") | tr '\n' ' ')
-  [ -z "$missing" ] || ko "$readme" "$what directories missing from its table: ${missing% }"
-  for name in $extra; do
-    ko "$readme" "table row '$name' has no ${prefix}$name/SKILL.md behind it"
-  done
-  [ -n "$missing$extra" ] || ok "$readme: the $what table indexes exactly the ${prefix:-top-level} SKILL.md directories"
 }
 
 # --- run --------------------------------------------------------------------------------------
@@ -344,8 +292,8 @@ for f in $files; do
   fail=$((before + fail))
 done
 
-check_index README.md Skill "" skill
-check_index routines/README.md Routine routines/ routine
+check_index README.md "" skill
+check_index routines/README.md routines/ routine
 
 echo
 echo "check-prompts: $pass passed, $fail failed"
