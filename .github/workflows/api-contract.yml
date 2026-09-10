@@ -68,8 +68,14 @@ jobs:
     # because each of those is the silent class this workflow exists to catch, and the issue
     # says which it was rather than calling every one a moved belief; the API not answering or
     # throttling (3) is an outage, not drift, and is left to the next day's run.
+    #
+    # `!cancelled()` plus explicit rc tests rather than `failure()`, for the reason base-watch.yml
+    # gives: a contract job that died before writing its output leaves rc empty, and `failure()`
+    # would report that as an exit code the issue cannot name. It is reported, because a check
+    # that cannot run is the same silence as a belief that moved — the empty case is named as the
+    # job dying rather than rendered as `exit `.
     needs: contract
-    if: failure() && github.event_name == 'schedule' && needs.contract.outputs.rc != '3'
+    if: ${{ !cancelled() && github.event_name == 'schedule' && needs.contract.outputs.rc != '0' && needs.contract.outputs.rc != '3' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -87,11 +93,11 @@ jobs:
           1) what="found a belief the pr-review.sh fixtures encode that no longer holds on this repository's API; the run names the field" ;;
           4) what="got a 4xx from an endpoint it addresses with a validated input — a retired or renamed endpoint, or a wrong anchor; the run names the call" ;;
           5) what="was refused a read (401/403, not a rate limit) — the token or the workflow's permissions, not a moved belief; the run names the call" ;;
-          *) what="stopped early (exit $RC) on a shape it did not expect; the run's last lines say where" ;;
+          *) what="did not run to a verdict (exit ${RC:-none}) — it stopped early on a shape it did not expect, or the job died before it could report an exit code at all; the run's last lines say where" ;;
           esac
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Still failing on $(date -u +%Y-%m-%d) (exit $RC): $run_url"
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Still failing on $(date -u +%Y-%m-%d) (exit ${RC:-none}): $run_url"
           else
             body=$(printf '%s\n\n%s' \
               "The scheduled live-API contract (\`ship-pr/scripts/pr-review-api-contract.sh\`) $what: $run_url" \
