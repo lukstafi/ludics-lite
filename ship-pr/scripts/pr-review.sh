@@ -147,11 +147,15 @@
 #   pr-review.sh retry [--read] <gh args...>
 #                                          # any other gh call (pr merge, api) with the same retry
 #                                          # policy, instead of a hand-rolled loop
-#   pr-review.sh retry [--read] run watch <run-id> [-R owner/name]
+#   pr-review.sh retry [--read] run watch owner/name#<run-id>
 #                                          # NOT forwarded to gh: executed as a QUIET await of that
 #                                          # run — one verdict line instead of a stream of redraws,
 #                                          # and a FAILED run is a verdict (exit 1), never retried
-#                                          # as transport. For a PR, prefer `checks <pr> --wait`.
+#                                          # as transport. The repo travels in the argument, like
+#                                          # every other subcommand's (a bare id still works with
+#                                          # -R owner/name or REPO=, and is REFUSED without one —
+#                                          # never taken from the cwd). For a PR, prefer
+#                                          # `checks <pr> --wait`.
 #
 # Exit codes: 0 the command did what it says (and any fact it printed came from a call that
 #             answered); 1 the fact does not hold (the window stayed quiet, no such thread, the API
@@ -167,7 +171,8 @@
 #             From `merge`, 4 means the merge was REFUSED for want of a verdict (see
 #             --allow-no-verdict).
 #
-# Env: REPO=owner/name (else the <pr> argument, else the cwd's checkout, else the per-PR cache),
+# Env: REPO=owner/name (else the <pr> argument, else the cwd's checkout, else the per-PR cache —
+#      `retry run watch` takes only the first two, never the cwd and never the cache),
 #      REVIEWER=login-prefix (default: codex app), WATCH_INTERVAL=seconds between polls (default
 #      90), WATCH_TIMEOUT=seconds to watch (900), SHIP_PR_STATE_DIR=where the cache lives
 #      (`off` disables the cache entirely — for sandboxes where even the attempted write warns),
@@ -447,15 +452,56 @@ resolve_repo() {
 # Accept both a bare number and owner/name#number (the form PR URLs and cards use); anything else
 # dies loudly. Without this, a malformed <pr> lands in the API path, api_list eats the error, and
 # every feed reads back empty — the PR looks eternally quiet, which is exactly the false reading
-# this script exists to prevent. Sets PR_NUM, and REPO from the argument or the fallbacks above.
-pr_arg() {
+# this script exists to prevent.
+#
+# Two things are addressed as owner/name#number here: a PR, and the workflow run `retry run watch`
+# awaits (ludics-lite#74). They share this parse rather than each hand-rolling it, so that the one
+# accepted spelling is the one both commands accept. It sets REF_REPO — EMPTY when the argument did
+# not carry one, so a caller can tell "no repo named" from "this repo" — and REF_NUM, and returns 1
+# on anything that is not a number, leaving the message to the caller: what the number is called
+# ("PR", "run id") is the only part of the refusal that differs.
+#
+# The WHOLE argument is validated, not the tail after the last `#`. Splitting on the last
+# delimiter and checking only what follows it accepts an argument carrying unparsed input in
+# front of a valid one: `owner/repo#111#222` would name run 222, and `junk#123` run 123, each
+# silently — a verdict about a target the caller did not name, which is the failure this parse
+# exists to prevent rather than a shape to be lenient about. So: exactly one `#`, exactly one `/`
+# before it with both halves nonempty, and nothing outside the characters GitHub allows in an
+# owner or a repository name.
+parse_ref() {
+  local repo num
+  REF_REPO=""
+  REF_NUM=""
   case "$1" in
-  */*"#"*) REPO="${1%%#*}" ;;
+  *"#"*)
+    repo="${1%%#*}"
+    num="${1#*#}"
+    case "$num" in *"#"*) return 1 ;; esac
+    case "$repo" in
+    */*/* | /* | */) return 1 ;;
+    */*) ;;
+    *) return 1 ;;
+    esac
+    case "$repo" in *[!A-Za-z0-9._/-]*) return 1 ;; esac
+    ;;
+  *)
+    repo=""
+    num="$1"
+    ;;
   esac
-  PR_NUM="${1##*#}"
-  case "$PR_NUM" in
-  '' | *[!0-9]*) die "PR must be a number or owner/name#number, got '$1'" ;;
+  case "$num" in
+  '' | *[!0-9]*) return 1 ;;
   esac
+  REF_REPO="$repo"
+  REF_NUM="$num"
+  return 0
+}
+
+# Sets PR_NUM, and REPO from the argument or the fallbacks above.
+pr_arg() {
+  parse_ref "$1" || die "PR must be a number or owner/name#number, got '$1'"
+  [ -z "$REF_REPO" ] || REPO="$REF_REPO"
+  PR_NUM="$REF_NUM"
   resolve_repo "$PR_NUM"
 }
 
@@ -1370,50 +1416,76 @@ cmd_resolve() {
 # ends with ONE verdict line. Each poll keeps the usual transport retries. For a PR's build
 # signal, prefer `checks <pr> --wait`, which reads EVERY check on the head commit, not one run.
 #
+# The run is addressed the way a PR is — owner/name#<run-id>, through the same parse_ref — and the
+# repo is NEVER inferred from the cwd (ludics-lite#74). It used to be, and the inference is a
+# false-verdict generator on exactly the invocation this await exists for: a worker whose
+# background shell had started in an ocannl-staging worktree awaited a ludics-lite run id, the
+# read 404'd against the repo the cwd named, and the await returned exit 1 over a run that was
+# fine — a red gate manufactured out of a wrong-target invocation. A cwd mismatch has to be an
+# INVOCATION error, so an unnamed repo is refused (exit 2) rather than guessed, and a named pair
+# the API says does not exist is one too (below) rather than a verdict about the run. The per-PR
+# repo cache is not consulted either: it is keyed by PR number, and a run id lives in a different
+# id space, so a hit there would be a coincidence pointing at an unrelated repository.
+#
 # Exit codes, matching `checks`: 0 the run succeeded; 1 it concluded failure — a VERDICT, so do
-# not retry the watch, read the run; 3 the API did not answer, so the run's state is UNKNOWN;
-# 4 no verdict — still running at the deadline, or stopped without being judged (cancelled).
+# not retry the watch, read the run; 2 the invocation is wrong (no repo named, a malformed run
+# argument, or a run/repo pair the API rejects); 3 the API did not answer, so the run's state is
+# UNKNOWN; 4 no verdict — still running at the deadline, or stopped without being judged.
 cmd_run_watch() {
-  local run_id="" repo="" interval="$CHECKS_INTERVAL" line rc status concl sleep_for remaining
+  local run_ref="" run_id="" repo="" flag_repo="" interval="$CHECKS_INTERVAL"
+  local line rc status concl sleep_for remaining
   while [ $# -gt 0 ]; do
     case "$1" in
     -R | --repo)
-      repo="${2:?$1 needs owner/name}"
+      flag_repo="${2:?$1 needs owner/name}"
       shift
       ;;
-    -R=* | --repo=*) repo="${1#*=}" ;;
+    -R=* | --repo=*) flag_repo="${1#*=}" ;;
     -i | --interval)
       interval="${2:?$1 needs seconds}"
       shift
       ;;
     -i=* | --interval=*) interval="${1#*=}" ;;
-    [0-9]*)
-      [ -z "$run_id" ] || die "run watch: got two run ids ('$run_id' and '$1') — name exactly one"
-      run_id="$1"
-      ;;
     # The two native flags whose meaning this await subsumes are accepted as no-ops so a pasted
     # `gh run watch` line keeps working; everything ELSE dies loudly. A catch-all that discards
-    # an argument turns a mistyped repo flag into a watch against whatever REPO or the cwd
-    # resolves to — the wrong-target failure the strict pr_arg parse exists to prevent.
+    # an argument turns a mistyped repo flag into a watch against whatever REPO resolves to —
+    # the wrong-target failure the strict parse_ref parse exists to prevent.
     --exit-status | --compact) ;;
-    -*) die "run watch: unsupported flag '$1' — the quiet await takes <run-id>, -R/--repo," \
-      "-i/--interval, --exit-status, --compact" ;;
-    *) die "run watch: unexpected argument '$1' — the run id is a bare number" ;;
+    -*) die "run watch: unsupported flag '$1' — the quiet await takes owner/name#<run-id>," \
+      "-R/--repo, -i/--interval, --exit-status, --compact" ;;
+    *)
+      [ -z "$run_ref" ] || die "run watch: got two run arguments ('$run_ref' and '$1') —" \
+        "name exactly one"
+      run_ref="$1"
+      ;;
     esac
     shift
   done
-  case "$run_id" in
-  '' | *[!0-9]*) die "retry run watch: name the run id (a number) — the quiet await polls" \
-    "\`gh run view <id>\`. For a PR's checks, prefer \`checks <pr> --wait\`." ;;
-  esac
+  [ -n "$run_ref" ] || die "retry run watch: name the run as owner/name#<run-id> — the quiet" \
+    "await polls \`gh run view <id> --repo <owner/name>\`. For a PR's checks, prefer" \
+    "\`checks <pr> --wait\`."
+  parse_ref "$run_ref" || die "run watch: the run must be owner/name#<run-id> (or a bare run id" \
+    "with -R owner/name), got '$run_ref'"
+  run_id="$REF_NUM"
   case "$interval" in '' | *[!0-9]*) die "run watch: the interval must be seconds, got '$interval'" ;; esac
   # `gh run watch` documents -i as seconds and defaults to 3; 0 would turn the quiet await into a
   # rate-limit-burning busy loop of API reads for up to the full two-hour ceiling.
   [ "$interval" -gt 0 ] || die "run watch: the interval must be at least 1 second, got '$interval'"
+  # Two spellings that BOTH name a target and disagree are an invocation error, not a precedence
+  # puzzle: silently preferring either is how a run gets awaited in the repo the caller did not
+  # mean, which is the whole failure this argument form removes. REPO= is a session default rather
+  # than a second target, so a spelled-out argument overrides it the way it does for a PR.
+  repo="$REF_REPO"
+  [ -z "$repo" ] || [ -z "$flag_repo" ] || [ "$repo" = "$flag_repo" ] ||
+    die "run watch: the run names $repo and -R/--repo names $flag_repo — two explicit targets" \
+      "that disagree; name the repo once."
+  [ -n "$repo" ] || repo="$flag_repo"
   [ -n "$repo" ] || repo="$REPO"
-  [ -n "$repo" ] || repo=$(repo_from_cwd) || true
-  [ -n "$repo" ] || die "run watch: name the repo (-R owner/name, --repo, or REPO=) —" \
-    "cwd inference only works from a checkout, and not from a background shell."
+  [ -n "$repo" ] || die "run watch: name the repo — owner/name#$run_id (preferred), or a bare" \
+    "run id with -R owner/name or REPO=owner/name. A bare id alone is refused and NOT resolved" \
+    "from the cwd: this await is a background call by construction, a background shell does not" \
+    "start in the checkout, and guessing turned a wrong-target read into a FAILED run" \
+    "(ludics-lite#74)."
   local started deadline beat now
   started=$(date +%s)
   deadline=$((started + CHECKS_WAIT))
@@ -1423,8 +1495,15 @@ cmd_run_watch() {
       --jq '[.status, (.conclusion // "pending")] | @tsv')
     rc=$?
     if [ "$rc" -ne 0 ]; then
+      # A 4xx is the API saying THIS PAIR does not exist (or is not visible), which is a fact
+      # about the invocation and not about the run: exit 2, never the 1 that reads as a failed
+      # run. That conflation is the second half of ludics-lite#74 — the 404 the cwd inference
+      # earned came back as a red gate — and it survives the inference's removal, since a
+      # mistyped -R produces the same 404.
       api_rejection "$(gh_err_line)" &&
-        fail 1 "run $run_id was not readable in $repo: $(gh_err_line) — check the id and the repo"
+        die "run watch: $repo has no run $run_id readable here: $(gh_err_line). That is the" \
+          "API answering about the id and the repo you named — nothing about the run's outcome," \
+          "so it is not a failure. Check both, then re-run the await."
       fail 3 "could not read run $run_id in $repo after $API_ATTEMPTS attempts ($(gh_err_line));" \
         "the run's state is UNKNOWN — not failed, not passed. Retry rather than concluding."
     fi
@@ -2994,9 +3073,10 @@ main() {
   pr-review.sh base [owner/name] [branch] [--wait]  # is the base branch's CI green? (start of
                                              # work; --wait = post-merge integration read)
   pr-review.sh retry [--read] <gh args...>   # any other gh call, same retry policy
-  pr-review.sh retry run watch <run-id> [-R owner/name]  # quiet await of ONE run (never forwarded
+  pr-review.sh retry run watch owner/name#<run-id>  # quiet await of ONE run (never forwarded
                                              # to gh); for a PR prefer: checks <pr> --wait
-  <pr> is a number or owner/name#number; prefer owner/name#number for background invocations." ;;
+  <pr> is a number or owner/name#number; prefer owner/name#number for background invocations.
+  The run argument takes the same form, and a bare run id without -R/REPO is refused." ;;
   esac
 }
 

@@ -161,6 +161,8 @@ jobs:
         run: ship-pr/scripts/test-pr-review-merge.sh
       - name: Exercise the status line's conflict flag and the watch-time drift read
         run: ship-pr/scripts/test-pr-review-status.sh
+      - name: Exercise the run await's addressing and its invocation-vs-verdict split
+        run: ship-pr/scripts/test-pr-review-run-watch.sh
 
   cleanup:
     name: post-merge cleanup (ubuntu)
@@ -271,6 +273,9 @@ jobs:
       - name: pr-review fixtures, status and watch
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-status.sh || { echo '::error title=macOS suite failed::test-pr-review-status.sh'; exit 1; }
+      - name: pr-review fixtures, the run await
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-run-watch.sh || { echo '::error title=macOS suite failed::test-pr-review-run-watch.sh'; exit 1; }
       - name: post-merge cleanup
         if: ${{ !cancelled() }}
         # The per-case logs go OUTSIDE the checkout: the fleet launcher suite later in this job
