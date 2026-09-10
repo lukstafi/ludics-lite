@@ -13,10 +13,11 @@
 #   assert_eq <got> <want> <msg>        the assertion trio
 #   assert_contains <hay> <needle> <msg>
 #   assert_not_contains <hay> <needle> <msg>
-#   test_tmpdir <var> <label>           a throwaway directory in <var>, removed at exit — this
-#                                       file owns the EXIT trap (pr-review.sh installs one of its
-#                                       own when sourced, which the suites used to re-install by
-#                                       hand), so a suite never touches `trap`
+#   test_tmpdir <var> <label>           a throwaway directory in <var> (any name but the two the
+#                                       function itself uses, which it refuses), removed at exit —
+#                                       this file owns the EXIT trap (pr-review.sh installs one of
+#                                       its own when sourced, which the suites used to re-install
+#                                       by hand), so a suite never touches `trap`
 #   gh_fixture_parse "$@"               inside a fixture `gh`: refuses anything but `gh api`,
 #   gh_fixture_answer <response>        sets FIXTURE_ENDPOINT / FIXTURE_FILTER / FIXTURE_PAGINATE,
 #                                       logs the endpoint to $REQUEST_LOG (and, when paginated,
@@ -43,7 +44,8 @@
 # Executed rather than sourced, this file runs its own controls: throwaway suites that source it
 # and, respectively, redefine an undeclared library function (the ludics-lite#46 shape itself,
 # a reporter named `fail`), declare a stub and honour it, declare one and do not, stub a name the
-# library lacks, redefine one of this file's own helpers, and define a function before sourcing.
+# library lacks, redefine one of this file's own helpers, and define a function before sourcing;
+# then two over test_tmpdir's target variable (ludics-lite#79) and one over gh_fixture_parse.
 # The negative controls are what prove the guard can fail; CI runs it beside the nine suites.
 
 TEST_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
@@ -101,11 +103,25 @@ trap test_cleanup EXIT
 
 # test_tmpdir <var> <label>: a fresh directory under TMPDIR, its path in <var>. A function, not a
 # `$(...)`, because the registration must reach this shell, and a command substitution's does not.
+#
+# Its own names are namespaced, because <var> is the caller's word and `printf -v` writes to
+# whatever is in scope: a suite that asked for the obvious `dir` used to have the path land on the
+# then-local of that name and never reach the suite, leaving an unbound variable one line later
+# under `set -u`, or — worse, with a prior value — a stale path while the fresh directory sat
+# registered in TEST_CLEANUP (ludics-lite#79). The two names it still cannot get out of the way of
+# are refused instead of written past: its own local, and TEST_CLEANUP, which `printf -v` would
+# overwrite as the array's first element and so drop every path already registered for removal.
+# Refusing, rather than quietly renaming, is the register the preamble's own guards use.
 test_tmpdir() {
-  local dir
-  dir=$(mktemp -d "${TMPDIR:-/tmp}/pr-review-$2.XXXXXX") || bail "mktemp -d failed for $2"
-  TEST_CLEANUP+=("$dir")
-  printf -v "$1" '%s' "$dir"
+  local __test_tmpdir_path
+  case "$1" in
+  __test_tmpdir_path | TEST_CLEANUP)
+    bail "test_tmpdir: refusing to write the path into \$$1 — test_tmpdir uses that name itself; name the variable something else"
+    ;;
+  esac
+  __test_tmpdir_path=$(mktemp -d "${TMPDIR:-/tmp}/pr-review-$2.XXXXXX") || bail "mktemp -d failed for $2"
+  TEST_CLEANUP+=("$__test_tmpdir_path")
+  printf -v "$1" '%s' "$__test_tmpdir_path"
 }
 
 # --- the fixture gh's argument parsing --------------------------------------------------------
@@ -345,6 +361,37 @@ test_definitions_before_sourcing_are_refused() {
     "the early definition should be named"
 }
 
+# test_tmpdir writes to the CALLER's variable, whatever it is named — including `dir`, the name
+# the function itself once held its scratch value in (ludics-lite#79). The target is pre-set, so
+# the silent half of the trap is covered too: the caller's stale value must not survive, and the
+# path that comes back must be the one registered for removal, in the caller's shell.
+test_tmpdir_writes_to_a_target_named_dir() {
+  local path
+  control 'dir=stale' \
+    'test_tmpdir dir tmpdir-target' \
+    'printf "target=%s\n" "$dir"' \
+    '[ -d "$dir" ] || bail "test_tmpdir did not return a directory: $dir"' \
+    '[ "${TEST_CLEANUP[0]}" = "$dir" ] || bail "registered ${TEST_CLEANUP[0]}, returned $dir"'
+  assert_eq "$CONTROL_RC" 0 "a caller's variable named dir is written ($CONTROL_ERR)"
+  path=$(sed -n 's/^target=//p' <<<"$CONTROL_OUT")
+  assert_not_contains "$path" stale "the caller's prior value must not survive the call"
+  assert_contains "$path" "/pr-review-tmpdir-target." "the fresh directory should reach the caller"
+  [ ! -d "$path" ] || bail "the control left $path behind: the registration did not reach its shell"
+}
+
+# The two names it cannot get out of the way of are refused by name rather than written past.
+test_tmpdir_refuses_a_name_it_uses() {
+  control 'test_tmpdir __test_tmpdir_path tmpdir-own-local'
+  assert_eq "$CONTROL_RC" 1 "its own local as the target is the reporter's exit 1 ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" 'refusing to write the path into $__test_tmpdir_path' \
+    "the refusal should name the variable asked for"
+  assert_not_contains "$CONTROL_OUT" "PASS:" "no case may run"
+  control 'test_tmpdir TEST_CLEANUP tmpdir-cleanup-list'
+  assert_eq "$CONTROL_RC" 1 "the cleanup list as the target is refused too ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" 'refusing to write the path into $TEST_CLEANUP' \
+    "the refusal should name the cleanup list"
+}
+
 # The parser the api-only suites share, pinned once: the endpoint, the filter, the pagination
 # flag, and the two logs.
 test_gh_fixture_parse() {
@@ -391,6 +438,8 @@ tests=(
   test_stub_of_an_unknown_name_is_refused
   test_own_functions_pass
   test_definitions_before_sourcing_are_refused
+  test_tmpdir_writes_to_a_target_named_dir
+  test_tmpdir_refuses_a_name_it_uses
   test_gh_fixture_parse
 )
 
