@@ -25,8 +25,14 @@ expect() {
 }
 
 # row_after_beta <row>: inserts a row into the scratch README's skill table, after `beta`.
-row_after_beta() { sed -i.bak "/^| \`beta\` |/a\\
-$1" "$R/README.md"; }
+# An insert that matched nothing would leave a probe asserting a pass over an unmutated tree,
+# which is a probe that cannot fail: the helper says so instead.
+row_after_beta() {
+  grep -q '^| `beta` |' "$R/README.md" \
+    || { ko "row_after_beta: the scratch README carries no \`beta\` row to insert after"; return 1; }
+  sed -i.bak "/^| \`beta\` |/a\\
+$1" "$R/README.md"
+}
 # beta_row <line>: replaces the scratch README's `beta` row with <line>. Matched and rewritten
 # by awk rather than sed, so a replacement full of pipes needs no delimiter gymnastics.
 # A replacement that matched nothing would leave a probe asserting a pass over an unmutated
