@@ -2975,6 +2975,14 @@ esac
 # second catches one cut between hunks, where every retained hunk is complete and only the count
 # says a later one is missing. Either shortfall yields null like a missing patch — unread, never
 # disjoint (Codex P2s on #63).
+# The header is matched ONCE — `[capture(...)] | first`, bound and tested for null — and never as
+# a `test` guarding a second, near-identical `capture`. A capture that does not match yields NO
+# output rather than null, and a zero-output sub-expression inside this reduce takes the whole
+# accumulator with it: the fold's result is null, so every hunk of that file, including the ones
+# already read, vanishes and the path reads as "hunks unread" — the split above would then report
+# what an unread patch reports for a patch it in fact read. Two patterns that must agree on every
+# `@@` shape are a standing invitation to that drift; #84 fixed three sibling sites of the same
+# trap.
 compare_hunks() {
   jq -c '
     def ranges:
@@ -2984,9 +2992,10 @@ compare_hunks() {
         or ([.patch | split("\n")[] | select(startswith("-"))] | length) != .deletions then null
       else
         reduce (.patch | split("\n"))[] as $l ({ranges: [], cur: null, ok: true};
-          if ($l | test("^@@ -[0-9]+(,[0-9]+)? \\+[0-9]+(,[0-9]+)? @@")) then
+          ([$l | capture("^@@ -(?<s>[0-9]+)(,(?<n>[0-9]+))? \\+[0-9]+(,(?<m>[0-9]+))? @@")]
+            | first) as $h
+          | if $h != null then
             (if .cur != null and (.cur.o != 0 or .cur.n != 0) then .ok = false else . end)
-            | ($l | capture("^@@ -(?<s>[0-9]+)(,(?<n>[0-9]+))? \\+[0-9]+(,(?<m>[0-9]+))? @@")) as $h
             | ($h.s | tonumber) as $s
             | (if $h.n == null then 1 else ($h.n | tonumber) end) as $n
             | (if $h.m == null then 1 else ($h.m | tonumber) end) as $m
