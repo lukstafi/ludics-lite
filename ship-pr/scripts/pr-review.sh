@@ -601,6 +601,11 @@ INIT_FAILURE_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong\.[ \t]*Try agai
 # as does the message. A failure that names none is not attributed to any head: see the branch in
 # status_state.
 INIT_FAILURE_REF_RE='Provided git ref[^0-9a-f]*(?<s>[0-9a-f]{7,40})'
+# The head a comment says it is about. The connector stamps "**Reviewed commit:** `<sha>`" on the
+# comments it delivers a round or a verdict in, truncated; it is the only head association a
+# comment has, and three readers want it — the verdict check, the round count, and the success
+# boundary the failure recurrence is measured from — so they share one expression.
+REVIEWED_COMMIT_RE='Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})'
 
 # ISO 8601 UTC timestamps sort correctly as plain strings, which is why every comparison below is a
 # string comparison: no date(1) is involved, whose parsing flags differ between BSD and GNU.
@@ -785,13 +790,11 @@ status_state() {
   # round's 👀, as it must be to count), while a verdict comment left over from an earlier
   # round keeps its old time and loses to a fresh 👀 — the re-request-without-a-push case,
   # where the SHA still matches but a new round is running that may yet find something.
-  vline=$(jq -r --arg rev "$REVIEWER" '
+  vline=$(jq -r --arg rev "$REVIEWER" --arg rc "$REVIEWED_COMMIT_RE" '
       [.[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | test("[Dd]idn.t find any major issues"))
            | {at: (.updated_at // .created_at),
-              sha: (try ((.body // "")
-                    | capture("Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})").s)
-                    catch "")}]
+              sha: (try ((.body // "") | capture($rc).s) catch "")}]
       | sort_by(.at) | last
       | if . == null then "|" else "\(.at)|\(.sha)" end' \
     <<<"$raw" 2>/dev/null) || vline="|"
@@ -884,19 +887,29 @@ status_state() {
                | select(.submitted_at != null) | select((.commit_id // "") == $sha)
                | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || rev_head_at=""
       if [ -z "$rev_head_at" ] || [[ "$fail_at" > "$rev_head_at" ]]; then
-        # How many failures name THIS head SINCE the reviewer last got through on it — a review
-        # of this head, or a no-findings verdict for it. A nudge that demonstrably worked once
-        # must not leave the caller amending over a review that succeeded and the green checks
-        # under it (review of #82, round 3); only failures after that success are evidence that
-        # nudging has stopped working. The first is worth a nudge, a second says the nudge will
-        # not help and the head itself has to move. $f is bound before either field is read:
-        # inside `startswith(...)` the `.` is that filter's own input — $sha — so the unbound
-        # form compares the head to itself and every failure on the PR counts (caught by the
-        # two-heads control in the status suite).
-        success_at="$rev_head_at"
-        if [ -n "$verd_sha" ]; then
-          case "$head_sha" in "$verd_sha"*) success_at=$(newest "$success_at" "$verd_at") ;; esac
-        fi
+        # How many failures name THIS head SINCE the reviewer last GOT THROUGH on it. A nudge
+        # that demonstrably worked once must not leave the caller amending over a round that
+        # succeeded and the green checks under it (review of #82, rounds 3 and 4); only failures
+        # after that success are evidence that nudging has stopped working. The first is worth a
+        # nudge, a second says the nudge will not help and the head itself has to move.
+        #
+        # "Got through" is read from BOTH feeds, because a round arrives in either: a review
+        # submitted against this head, or a comment naming it as its Reviewed commit that is not
+        # itself a failure — which covers the comment-only rounds this script counts as rounds
+        # elsewhere, and the no-findings verdict alike. $c and $f are bound before their fields
+        # are read: inside `startswith(...)` the `.` is that filter's own input — $sha — so the
+        # unbound form compares the head to itself and every failure on the PR counts (caught by
+        # the two-heads control in the status suite).
+        success_at=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" \
+          --arg rc "$REVIEWED_COMMIT_RE" --arg sha "$head_sha" '
+            [.[] | select((.user.login // "") | startswith($rev))
+                 | select((.body // "") | test("codex-pull-request-review-summary") | not)
+                 | select((.body // "") | test($re) | not)
+                 | {at: (.created_at // ""),
+                    sha: (((try ((.body // "") | capture($rc).s) catch "") // ""))} as $c
+                 | select($c.sha != "" and ($sha | startswith($c.sha)))
+                 | $c.at] | max // ""' <<<"$comments_raw" 2>/dev/null) || success_at=""
+        success_at=$(newest "$success_at" "$rev_head_at")
         nfail=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" \
           --arg refre "$INIT_FAILURE_REF_RE" --arg sha "$head_sha" --arg since "$success_at" '
             [.[] | select((.user.login // "") | startswith($rev))
@@ -1115,7 +1128,7 @@ review_rounds() {
   # Both feeds go in on stdin (slurped: reviews first, comments second), never as arguments —
   # a long PR's comment history outgrows the argument list (128 KB per argument on Linux).
   line=$(printf '%s\n%s\n' "$raw" "$comments" | jq -r -s --arg rev "$REVIEWER" \
-    --argjson gap "$ROUND_GAP" --arg fail "$INIT_FAILURE_RE" '
+    --argjson gap "$ROUND_GAP" --arg fail "$INIT_FAILURE_RE" --arg rc "$REVIEWED_COMMIT_RE" '
       .[1] as $comments | .[0]
       | ([.[] | select((.user.login // "") | startswith($rev))
            | select(.submitted_at != null)
@@ -1125,9 +1138,7 @@ review_rounds() {
            | select((.body // "") | test("codex-pull-request-review-summary") | not)
            | select((.body // "") | test("[Dd]idn.t find any major issues") | not)
            | select((.body // "") | test($fail) | not)
-           | {sha: ((((.body // "")
-                     | capture("Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})")).s)
-                    // "comment"),
+           | {sha: ((((.body // "") | capture($rc)).s) // "comment"),
               t: (.created_at | fromdateiso8601)}])
       | sort_by(.t)
       # Same head when equal, or when one is a prefix of the other: a comment quotes a

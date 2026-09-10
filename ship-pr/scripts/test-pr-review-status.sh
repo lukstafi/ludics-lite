@@ -84,6 +84,14 @@ failure_comment() { # <id> <ref|-> <created_at>
   plain_comment "$1" "$3" "$(failure_body "$2")"
 }
 
+# A findings round delivered as a comment alone, naming the head it read — the shape this script
+# counts as a round in `review_rounds`, and one of the ways the reviewer gets through on a head.
+round_comment() { # <id> <sha> <created_at>
+  plain_comment "$1" "$3" "Codex Review: one finding on the lock, no lines attached.
+
+**Reviewed commit:** \`$2\`"
+}
+
 compare_json() { # <behind> <ahead> <file>
   jq -cn --argjson behind "$1" --argjson ahead "$2" --arg f "$3" \
     '{behind_by:$behind, ahead_by:$ahead, merge_base_commit:{sha:"merge-base-sha"},
@@ -572,6 +580,17 @@ test_a_successful_review_resets_the_recurrence() {
   REVIEWS_JSON='[]'
   run_status
   assert_contains "$LINE" "failed 2 times on THIS head" "two failures and no success between them"
+  # A comment-only findings round naming this head is the reviewer getting through as much as a
+  # review is: this script counts one as a round, so it must reset the recurrence like one.
+  REVIEWS_JSON='[]'
+  COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST"),$(
+    round_comment 103 "$FAILED_HEAD" 2026-09-01T01:00:00Z),$(
+    failure_comment 101 "$FAILED_HEAD" 2026-09-01T02:00:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "the failure is still the newest word"
+  assert_contains "$LINE" "nudge it once" \
+    "a round that arrived as a comment is a round the nudge got through"
+  assert_not_contains "$LINE" "failed 2 times" "so the failures either side of it are not a pair"
   # A no-findings verdict for this head is a success too. The 👀 after it is the re-request that
   # announced itself, which is what leaves the failure as the newest word (see below).
   REVIEWS_JSON='[]'
