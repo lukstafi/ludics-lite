@@ -103,7 +103,9 @@ base actually lands, not in the ten hours it stays red. So read it before taking
 ~/.claude/skills/ship-pr/scripts/pr-review.sh base <owner>/<repo> [branch]   # default branch if omitted
 ```
 
-Exit **0** green, **1** RED (it says so in three shouted lines and names the run), **3** the API did
+Exit **0** green, **1** RED (it says so in three shouted lines and names the run, the job that
+failed and how far back the red runs go — the first red commit when a green run stands under the
+streak, and otherwise that the red may start further back than the window shows), **3** the API did
 not answer — which is not "green" — and **4** no build workflow has ever completed on that branch.
 
 On a **1**, do not start by branching and hoping. Open the run it names and decide which you are in:
@@ -112,6 +114,11 @@ confusing build failure is not re-diagnosed from scratch), the break is *yours* 
 landing (fix that first — it is one commit and it unblocks everyone), or nobody has looked yet (this
 is the case that costs the most, and reporting it is worth more than the task you were about to
 start). What you must not do is spend the session bisecting a break you inherited.
+
+On this repository that third case has an owner: `.github/workflows/base-watch.yml` runs this same
+read against `main` daily and opens (or extends) one issue per red episode, so a red found here is
+often already filed — check the open issues before writing it up, and add what you know to the one
+that exists.
 
 If this skill fires at the *end* of a task, as it usually does, this section is the one part of it
 to have run at the beginning. A session that did not is still better off running `base` before it

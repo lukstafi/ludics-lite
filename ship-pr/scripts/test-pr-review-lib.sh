@@ -44,7 +44,7 @@
 # and, respectively, redefine an undeclared library function (the ludics-lite#46 shape itself,
 # a reporter named `fail`), declare a stub and honour it, declare one and do not, stub a name the
 # library lacks, redefine one of this file's own helpers, and define a function before sourcing.
-# The negative controls are what prove the guard can fail; CI runs it beside the five suites.
+# The negative controls are what prove the guard can fail; CI runs it beside the seven suites.
 
 TEST_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 TEST_LIB_FILE="$TEST_LIB_DIR/$(basename "${BASH_SOURCE[0]}")"

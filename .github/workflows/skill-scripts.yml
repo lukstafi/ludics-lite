@@ -151,6 +151,8 @@ jobs:
         run: ship-pr/scripts/test-pr-review-lib.sh
       - name: Exercise the merge-time base-drift intersection
         run: ship-pr/scripts/test-pr-review-base-drift.sh
+      - name: Exercise the base command's red report
+        run: ship-pr/scripts/test-pr-review-base-red.sh
       - name: Exercise the build gate's absent-vs-not-yet split
         run: ship-pr/scripts/test-pr-review-checks-absent.sh
       - name: Exercise the review-round count
@@ -256,6 +258,9 @@ jobs:
       - name: pr-review fixtures, base drift
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-base-drift.sh || { echo '::error title=macOS suite failed::test-pr-review-base-drift.sh'; exit 1; }
+      - name: pr-review fixtures, the base command's red report
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-base-red.sh || { echo '::error title=macOS suite failed::test-pr-review-base-red.sh'; exit 1; }
       - name: pr-review fixtures, absent vs not yet
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-checks-absent.sh || { echo '::error title=macOS suite failed::test-pr-review-checks-absent.sh'; exit 1; }

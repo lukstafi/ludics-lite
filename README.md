@@ -156,6 +156,7 @@ issue-wave/scripts/test-fleet-worker.sh
 ship-pr/scripts/test-post-merge-cleanup.sh
 ship-pr/scripts/test-pr-review-lib.sh
 ship-pr/scripts/test-pr-review-base-drift.sh
+ship-pr/scripts/test-pr-review-base-red.sh
 ship-pr/scripts/test-pr-review-checks-absent.sh
 ship-pr/scripts/test-pr-review-rounds.sh
 ship-pr/scripts/test-pr-review-merge.sh
@@ -165,7 +166,7 @@ scripts/test-wake-lab.sh
 scripts/test-check-prompts.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all eleven on Ubuntu, one
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all twelve on Ubuntu, one
 job per suite, and on macOS (the fleet's bash is 3.2) as one job with a step per suite: the hosted
 macOS runners are scarce enough that four separate macOS jobs queued a green PR for one to two
 hours behind nine minutes of work (ludics-lite#55). Alongside them run `bash -n`, shellcheck at
@@ -243,7 +244,16 @@ tip, leaving stdout byte-identical to `poll`'s. `test-pr-review-base-drift.sh` p
 half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
 which stands still on a conflicted PR.
 
-The six `test-pr-review-*` suites share a preamble, `test-pr-review-lib.sh`, which sources
+`test-pr-review-base-red.sh` covers the other `base` — the one that answers "is the branch I am
+about to work off green", and what it says once the answer is no (ludics-lite#73). A red names the
+failing JOB and the commit the red starts at, and the cases pin the claims that could be quietly
+wrong: a first red commit is named only when a judged run under the streak was not red (a window
+red to its end says the red may start further back instead), a run that was cancelled or is still
+going ends no streak because it judged nothing, two workflow files sharing a display name keep
+their histories apart, a jobs read that fails prints UNKNOWN and leaves the red standing rather
+than reporting no failing job, and a green base spends no call on any of it.
+
+The seven `test-pr-review-*` suites share a preamble, `test-pr-review-lib.sh`, which sources
 `pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and
 the fixture `gh`'s argument parsing. It also closes the trap that bit twice (ludics-lite#39, #45,
 #46): `pr-review.sh` puts some sixty unqualified functions in scope, and a suite helper sharing a
@@ -275,6 +285,18 @@ version of the script holds a read-only token. A belief that needs a state this 
 have, or a fact the API does not carry — a dirty PR pushed to under observation, a 300-file
 compare, the push time behind `updated_at` — prints as `skip`, so the unpinned set is visible in
 every run. Run it locally with `gh` auth: `ship-pr/scripts/pr-review-api-contract.sh lukstafi/ludics-lite`.
+
+`.github/workflows/base-watch.yml` gives main's own CI verdict an owner (ludics-lite#73). Every
+worker's session starts by branching off main, and nothing read main's verdict between waves: main
+was once red for a day, unnamed, until a pull request tripped over it. So the read a worker does at
+session start, `pr-review.sh base lukstafi/ludics-lite main`, runs daily (06:47 UTC, away from the
+contract's slot) and on demand, and a scheduled run that finds a red — or a tip with no verdict at
+all, or a check that broke — opens one issue naming the workflow, the failing job and where the red
+starts, from a second job that checks nothing out and holds the only writing token. One issue per
+red EPISODE, not per day: while it is open the next run comments on it, so closing it once main is
+green is what lets the next red open a fresh one. On a pull request it reads and reports without
+filing, and a red main does not redden the pull request: that verdict is about main, and a PR
+carrying it as a failed check could not merge the fix.
 
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and

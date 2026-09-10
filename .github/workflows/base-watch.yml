@@ -1,0 +1,168 @@
+name: base watch
+
+# Who owns a red main (ludics-lite#73). Nothing here read main's own verdict between waves: main
+# was red from 8fd8778 for a day — a macOS fixture case, `test_runner_reaps_a_statusless_case` —
+# and it stayed nameless until a PR tripped over it and a coordinator filed the red from that PR's
+# evidence, after which the fix had to be merged into two in-flight branches before their gates
+# could read green. Every worker's session starts by branching off main, so the cost of an
+# unowned red is paid by everyone who starts work under it, in "is this my change?" time.
+#
+# So the same read a worker does at session start (`pr-review.sh base`) runs daily against main
+# itself, and what it finds gets an owner: one issue naming the workflow, the job that failed and
+# the commit the red starts at. Daily rather than per push, because this is the backstop behind
+# skill-scripts.yml's own run and not a second copy of it — a push's red is already visible on the
+# push; what this catches is a red nobody looked at. On demand as well, for the same reason the
+# contract check is: to be able to ask.
+#
+# This workflow never appears in its own report: `base` folds `event=push` runs only, and nothing
+# here triggers on push. Giving it a push trigger would make a red base-watch file an issue about
+# base-watch.
+
+on:
+  schedule:
+    # Away from api-contract.yml's 05:23 UTC: both read this repository's Actions API, and two
+    # scheduled runs in the same minute would share a rate-limit window for no reason.
+    - cron: '47 6 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/base-watch.yml
+      - ship-pr/scripts/pr-review.sh # the command this runs: a change to it is a change to this
+
+# Two jobs, for the reason api-contract.yml has two: a pull request runs the PR's version of
+# pr-review.sh, so the job that executes it reads only, and the one job that may write checks
+# nothing out and runs no repository code.
+permissions:
+  contents: read
+
+jobs:
+  read:
+    name: main's CI verdict
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read # the workflow list, each workflow's runs on main, and a red run's jobs
+    outputs:
+      # 0 green, 1 RED, 3 the API did not answer (nothing was learned), 4 no verdict for the tip.
+      # 2 is a usage error and anything else is the command stopping early — the reporter names
+      # each as what it is rather than calling every one a red.
+      rc: ${{ steps.base.outputs.rc }}
+      # The report verbatim, so the issue carries the evidence and the reporter parses nothing.
+      report: ${{ steps.base.outputs.report }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read main's standing CI verdict
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/base.out"
+          # Plain `base`, not `base --wait`: at a scheduled minute a run in flight is ordinary
+          # traffic, not a finding. `--wait` holds for the CURRENT tip's verdict, so a push landing
+          # shortly before this run would either hold the job for a whole CI cycle (nine minutes
+          # here, and the macOS runner queue has run hours deep) or hit its ceiling and file "no
+          # verdict" for a build that was simply still running. What this check is for is a red
+          # nobody looked at, and the newest JUDGED run per workflow — what a worker branching off
+          # main is told at session start — is exactly that reading. When it trails the tip the
+          # report says which commit each verdict is about, and that goes into the issue.
+          set +e
+          ship-pr/scripts/pr-review.sh base "$GITHUB_REPOSITORY" main >"$out"
+          rc=$?
+          set -e
+          cat "$out"
+          echo "rc=$rc" >>"$GITHUB_OUTPUT"
+          # A random delimiter, because the value is the script's own output: a fixed one appearing
+          # in a workflow name would let a report line close the heredoc and write further outputs.
+          # Capped well under the 65536-character issue body, since that body quotes this whole
+          # report.
+          delim="BASE_REPORT_$(openssl rand -hex 16)"
+          {
+            printf 'report<<%s\n' "$delim"
+            head -c 20000 "$out"
+            printf '\n%s\n' "$delim"
+          } >>"$GITHUB_OUTPUT"
+          # A red main is a fact about main, not about the pull request that happens to touch this
+          # workflow: on a pull request every verdict the command REACHED exits 0 here, or a PR
+          # opened while main is red would carry a red check of its own and `pr-review.sh merge`
+          # would refuse to land the very fix. A usage error or a crash (anything but 0, 1, 3, 4)
+          # is the PR's doing and stays red. On the schedule the run's own colour is the verdict.
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            case "$rc" in
+            0 | 1 | 3 | 4) exit 0 ;;
+            esac
+          fi
+          exit "$rc"
+
+  report:
+    name: give the red an owner
+    # A scheduled run nobody watches is exactly the state this workflow exists for, so the finding
+    # has to leave the run. One issue per red EPISODE, not one per day: while the issue is open the
+    # next day's run comments on it instead, and closing it (main is green again) is what lets a
+    # later red open a fresh one. The title is therefore stable and carries no sha — a title
+    # naming the first red commit would file a second issue the moment the commit scrolled out of
+    # the run window.
+    #
+    # `!cancelled()` rather than `failure()`: a read job that died before writing its outputs
+    # leaves rc empty, which is itself a silent failure of this check and is reported as one.
+    # Exit 3 is the API not answering — an outage, not a fact about main — and is left to the
+    # next day's run, as the contract check leaves its own 3.
+    #
+    # Schedule only: a `workflow_dispatch` run is watched by whoever fired it, and an issue filed
+    # under their eyes is noise they then have to close.
+    needs: read
+    if: ${{ !cancelled() && github.event_name == 'schedule' && needs.read.outputs.rc != '0' && needs.read.outputs.rc != '3' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or extend the issue that owns this red
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC: ${{ needs.read.outputs.rc }}
+          REPORT: ${{ needs.read.outputs.report }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          today=$(date -u +%Y-%m-%d)
+          case "$RC" in
+          1)
+            title="base watch: main is RED"
+            what="found main RED. The report names the workflow, the job that failed and how far back the red runs go"
+            again="Still red on $today"
+            ;;
+          4)
+            title="base watch: main's tip has no CI verdict"
+            what="reached no verdict for main at all: no workflow has ever completed a push run on it, or the runs that did were stopped without judging and nothing behind them ever judged the branch. That is neither green nor red, and nothing stands behind main until it is one of them"
+            again="Still without a verdict on $today"
+            ;;
+          *)
+            title="base watch: the daily read of main's CI verdict is broken"
+            what="did not run to a verdict (exit ${RC:-none}) — a usage or configuration error, or the job dying before it could report. The check that owns main's red is itself unowned until this is fixed"
+            again="Still broken on $today"
+            ;;
+          esac
+          # shellcheck disable=SC2016 # the backticks in the format are markdown, not substitution
+          body=$(printf '%s: %s\n\n%s\n\n```\n%s\n```\n\n%s\n' \
+            "The daily base watch (\`ship-pr/scripts/pr-review.sh base $GITHUB_REPOSITORY main\`) $what" \
+            "$run_url" \
+            "What it read, at $(date -u +%Y-%m-%dT%H:%M:%SZ):" \
+            "${REPORT:-(the read produced no report)}" \
+            "Every worker's session starts by branching off main, so this is filed the day it happens rather than when a pull request trips over it (ludics-lite#73). One issue per episode: while this is open the daily run comments here instead of filing again, so close it once main is green.")
+          # The search API matches the phrase in the title; the issue this finds is this
+          # workflow's own, because no other title is this one.
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$title\" in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            # The report goes into the comment too, not just the first body: a red that MOVED (a
+            # second break on top of the first, a different job) is the thing a comment saying
+            # only "still red" would hide.
+            # shellcheck disable=SC2016 # markdown fences again
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+              --body "$(printf '%s (exit %s): %s\n\n```\n%s\n```\n' \
+                "$again" "${RC:-none}" "$run_url" "${REPORT:-(the read produced no report)}")"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
