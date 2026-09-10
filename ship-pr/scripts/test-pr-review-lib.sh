@@ -18,8 +18,11 @@
 #                                       this file owns the EXIT trap (pr-review.sh installs one of
 #                                       its own when sourced, which the suites used to re-install
 #                                       by hand), so a suite never touches `trap`
-#   gh_fixture_parse "$@"               inside a fixture `gh`: refuses anything but `gh api`,
-#   gh_fixture_answer <response>        sets FIXTURE_ENDPOINT / FIXTURE_FILTER / FIXTURE_PAGINATE,
+#   gh_fixture_parse "$@"               inside a fixture `gh`: refuses anything but `gh api`, any
+#   gh_fixture_answer <response>        option outside gh api's own table (below), and any
+#                                       endpoint that is neither `graphql` nor a REST path with a
+#                                       `/` (ludics-lite#86, #102); sets FIXTURE_ENDPOINT /
+#                                       FIXTURE_FILTER / FIXTURE_PAGINATE,
 #                                       logs the endpoint to $REQUEST_LOG (and, when paginated,
 #                                       $PAGINATE_LOG) if the suite set them; the answer goes
 #                                       through the --jq filter the call carried, if any
@@ -79,32 +82,51 @@ export SHIP_PR_TEST_SOURCE_ONLY=1
 export SHIP_PR_STATE_DIR=off
 export SHIP_PR_API_ATTEMPTS=1
 export SHIP_PR_API_BACKOFF=0
-# The set `retune` accepts: the names pr-review.sh ASSIGNS, read from its text, kept when they are
-# really set once it has been sourced. Two things are deliberate about reading the text.
+# The set `retune` accepts: the names sourcing pr-review.sh ASSIGNS, asked of a probe that does
+# exactly that in a pristine environment, where the names in scope before and after the source
+# differ by precisely what the source set. Two cheaper answers were both wrong, in opposite ways.
 #
-# It does not depend on who invoked the suite. Differencing the variable names across the source
-# looked simpler and was wrong in exactly the direction that matters: a name the environment
-# already carries — `env GRACE=777 ./test-pr-review-lib.sh`, or an exported `ABSENT_GRACE` — is in
-# scope on BOTH sides, so it read as the caller's, dropped out of the set, and every migrated
-# `retune GRACE=1` was refused with "sets no GRACE". What pr-review.sh assigns is a fact about
-# pr-review.sh.
+# Differencing the names across THIS shell's source depends on who invoked the suite: a name the
+# environment already carries — `env GRACE=777 ./test-pr-review-lib.sh`, or an exported
+# `ABSENT_GRACE` — is in scope on both sides, so it read as the caller's, dropped out of the set,
+# and every migrated `retune GRACE=1` was refused with "sets no GRACE".
 #
-# And it reaches an assignment wherever it sits, not only at column 0: `CACHE_OFF` is set inside a
-# top-level `case`, so a stanza-shaped pattern would have missed it. The pattern is a bare `NAME=`
-# after nothing but whitespace, which is why `local dir=…` contributes no `dir` — the name there is
-# not what follows the indent. Function-local assignments that do match are dropped by the second
-# half: a local of a function that has not run is not set, so it never reaches the set.
-lib_assigned=$(sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$HELPER" | sort -u)
+# Reading the assignments out of pr-review.sh's TEXT is invoker-independent but cannot tell a
+# source-time assignment from one inside a function body, and "is it set now" cannot separate them
+# either for a name the shell itself always provides: `IFS=… read` appears in several of its
+# functions and every shell has IFS set, so `retune IFS=x` was accepted and would have altered the
+# harness's own word splitting — a typo guard that admits IFS is not a guard.
+#
+# The probe answers the question that was being approximated. `env -i` so nothing is inherited;
+# PATH, HOME and TMPDIR because the source reads them; the same SHIP_PR_* the suites source under.
+# Function bodies do not run, so their locals never appear. It is written inline rather than as a
+# helper because a function defined before the source is the one shape this file refuses from a
+# suite: pr-review.sh would replace a same-named one, and the snapshot could not tell.
+HELPER_CONSTANTS=" $(
+  env -i "PATH=$PATH" "HOME=${HOME:-}" "TMPDIR=${TMPDIR:-/tmp}" \
+    SHIP_PR_TEST_SOURCE_ONLY=1 SHIP_PR_STATE_DIR=off \
+    bash -c '
+      before=" $(compgen -v | tr "\n" " ")before "
+      . "$1" >/dev/null 2>&1 || exit 1
+      for n in $(compgen -v); do
+        case "$before" in *" $n "*) continue ;; esac
+        printf "%s " "$n"
+      done
+    ' _ "$HELPER"
+)"
+# A probe that answered nothing is a broken setup, not a script with no constants: retune would
+# then refuse every name, and each suite would fail somewhere in its middle with "sets no GRACE"
+# rather than here, where the reason is.
+case "$HELPER_CONSTANTS" in
+*[![:space:]]*) ;;
+*)
+  echo "test-pr-review-lib.sh: REFUSING to run: the probe that reads pr-review.sh's source-time constants returned nothing, so \`retune\` could accept no name; run \"bash $HELPER\" to see how it fails" >&2
+  exit 2
+  ;;
+esac
+
 # shellcheck source=pr-review.sh
 source "$HELPER"
-HELPER_CONSTANTS=""
-for lib_var in $lib_assigned; do
-  # Really set, so retune has a value to save and restore — `+set` and not `-`, since a constant
-  # legitimately holding the empty string (pr-review.sh has several) must still be retunable.
-  [ -n "${!lib_var+set}" ] || continue
-  HELPER_CONSTANTS="$HELPER_CONSTANTS $lib_var "
-done
-unset lib_assigned lib_var
 
 # --- the reporter and the assertions ----------------------------------------------------------
 # Not `fail`: that is pr-review.sh's, and its refusals' exit codes are what the suites read.
@@ -166,8 +188,32 @@ FIXTURE_ENDPOINT=""
 FIXTURE_FILTER=""
 FIXTURE_PAGINATE=""
 
+# gh api's OPTION TABLE, as of gh 2.99.0: every option the command accepts AS PART OF A REQUEST,
+# split by whether it carries a value, each spelling its own entry and surrounded by spaces so a
+# lookup is exact. `--help` is deliberately in neither list — it is an action, not an option, and
+# is refused below.
+#
+# Two lists preceded this one and each was a guess about the options NOT named. #86 listed the
+# value-taking options and let anything else stand alone, so a value-taking option it had missed
+# put its value in the endpoint slot: `--input fixtures/body.json` even looks like a REST path,
+# which is why a check of the slot's shape did not catch it (ludics-lite#102, round 1). Inverting
+# it — list the booleans, assume everything else carries a value — moved the silence rather than
+# ending it: an unknown boolean AFTER the endpoint left the endpoint intact and swallowed the
+# NEXT option, so `repos/o/n/thing --future-boolean --jq .a` parsed with no filter and the
+# fixture answered the raw body (round 2). Both guesses fail the same way, quietly, one gh
+# release after they were written.
+#
+# So the fixture is exhaustive instead, and refuses what it has not been told: an option in
+# neither list is a `bail` naming it. That is the right failure for a fixture — the calls it sees
+# are the ones pr-review.sh makes, so an unknown option means the library grew a call this file
+# has yet to learn, and one line here teaches it. A refusal is also the answer to a form the
+# table cannot express (a boolean with an inline value, a bundled short): loud and unparsed beats
+# parsed wrong, which is the whole lesson of the two lists above.
+FIXTURE_GH_BOOLS=" -i --include --paginate --silent --slurp --verbose --allow-escape-sequences "
+FIXTURE_GH_VALUED=" -X --method -f --raw-field -F --field -H --header -q --jq -t --template -p --preview --cache --hostname --input "
+
 gh_fixture_parse() {
-  local arg
+  local arg name value inline positional opts_ended="" positionals=0 call="$*"
   FIXTURE_ENDPOINT=""
   FIXTURE_FILTER=""
   FIXTURE_PAGINATE=""
@@ -176,20 +222,91 @@ gh_fixture_parse() {
   while [ $# -gt 0 ]; do
     arg="$1"
     shift
-    case "$arg" in
-    --jq)
-      FIXTURE_FILTER="${1:-}"
-      shift || true
+    positional=""
+    if [ -n "$opts_ended" ]; then
+      positional=1
+    else
+      # Split the option's NAME from an inline value, in each of pflag's spellings: `--name=v`,
+      # `-x=v`, and the attached short `-xv`. `--` ends option parsing, and everything after it is
+      # positional however much it looks like an option; a lone `-` is the endpoint (gh reads a
+      # body from stdin, not an option).
+      case "$arg" in
+      --) opts_ended=1 && continue ;;
+      --*=*)
+        name="${arg%%=*}"
+        value="${arg#*=}"
+        inline=1
+        ;;
+      --?*)
+        name="$arg"
+        value=""
+        inline=""
+        ;;
+      -?=*)
+        name="${arg%%=*}"
+        value="${arg#*=}"
+        inline=1
+        ;;
+      -?)
+        name="$arg"
+        value=""
+        inline=""
+        ;;
+      -??*)
+        name="${arg:0:2}"
+        value="${arg:2}"
+        inline=1
+        ;;
+      *) positional=1 ;;
+      esac
+    fi
+    if [ -n "$positional" ]; then
+      # `gh api <endpoint> [flags]` takes exactly ONE positional. A second is a call the CLI
+      # would have refused outright, so a fixture that answered it would be answering a request
+      # production cannot send — which a test could then pass against (ludics-lite#102, round 3;
+      # round 2's own control had enshrined `api -- repos/o/n/thing --paginate` as valid).
+      positionals=$((positionals + 1))
+      [ "$positionals" -eq 1 ] ||
+        bail "fixture received $positionals positional arguments in: gh $call — gh api takes exactly one, the endpoint; the real CLI answers 'accepts 1 arg(s), received $positionals' and makes no request"
+      FIXTURE_ENDPOINT="$arg"
+      continue
+    fi
+    # `--help` is a terminal ACTION, not part of a request: gh prints the help, exits 0 and calls
+    # nothing, whichever side of the endpoint it sits on. It is kept out of the boolean list and
+    # refused by name, so a library call that grew one by accident cannot find a fixture willing
+    # to answer it (round 3).
+    [ "$name" != --help ] ||
+      bail "fixture received --help in: gh $call — gh api would have printed its help and made no request, so no answer here could be the right one"
+    case "$FIXTURE_GH_BOOLS" in
+    *" $name "*)
+      # An inline value on a boolean is either pflag's `--bool=false` or a bundle of shorts, and
+      # the table can express neither. Refuse it rather than pick a reading.
+      [ -z "$inline" ] ||
+        bail "fixture cannot parse '$arg' in: gh $call — $name takes no value, so this is either a boolean written as '$name=$value' or short options bundled as one word; write them apart"
+      [ "$name" != --paginate ] || FIXTURE_PAGINATE=1
+      continue
       ;;
-    --paginate) FIXTURE_PAGINATE=1 ;;
-    # The options that carry a VALUE, consumed with it. Without this the `POST` of a `gh api -X
-    # POST repos/...` became the endpoint (it is the first argument that does not start with a
-    # dash), so a suite over the writing commands addressed every call to "POST".
-    -X | --method | -f | --field | -F | --raw-field | -H | --header) shift || true ;;
-    -*) ;;
-    *) [ -n "$FIXTURE_ENDPOINT" ] || FIXTURE_ENDPOINT="$arg" ;;
+    esac
+    case "$FIXTURE_GH_VALUED" in
+    *" $name "*) ;;
+    *) bail "fixture does not know the gh api option $name in: gh $call — add it to FIXTURE_GH_BOOLS or FIXTURE_GH_VALUED, whichever it is; guessing is what put an option's value in the endpoint slot twice (ludics-lite#86, #102)" ;;
+    esac
+    if [ -z "$inline" ]; then
+      value="${1:-}"
+      shift || true
+    fi
+    case "$name" in
+    --jq | -q) FIXTURE_FILTER="$value" ;;
     esac
   done
+  # The endpoint's SHAPE, the last thing between a mis-parse and a fixture dispatching on it.
+  # Every endpoint pr-review.sh addresses is `graphql` or a REST path, so anything else is a word
+  # the caller never wrote as one — a `POST` the table failed to consume, or no endpoint at all —
+  # and answering it would mean answering the wrong branch, which is the failure that PASSES.
+  case "$FIXTURE_ENDPOINT" in
+  graphql | */*) ;;
+  *) bail "fixture parsed '$FIXTURE_ENDPOINT' as the endpoint of: gh $call — an endpoint is 'graphql' or a REST path carrying a '/'" ;;
+  esac
   [ -z "${REQUEST_LOG:-}" ] || printf '%s\n' "$FIXTURE_ENDPOINT" >>"$REQUEST_LOG"
   [ -z "$FIXTURE_PAGINATE" ] || [ -z "${PAGINATE_LOG:-}" ] ||
     printf '%s\n' "$FIXTURE_ENDPOINT" >>"$PAGINATE_LOG"
@@ -336,7 +453,15 @@ run_tests() {
   done
 }
 
-LIB_SNAPSHOT=$(lib_function_table)
+# What is PROTECTED is what these two files define, and only that — the table is filtered on the
+# defining file rather than taken whole. A function the environment exported in (`export -f`) is
+# in scope here too, and bash records it with no file at all; recorded as library-owned, it made a
+# suite's own fixture `gh` read as a redefinition of it and refused the suite ("(null)'s gh
+# ((null):0) is redefined at …"). An inherited function is not the library's, and a suite is free
+# to define one of any name — which is the same ground the fixture `gh` has always stood on.
+# Only the snapshot is filtered: `check_shadows` reads the CURRENT table unfiltered, because the
+# file it reports a redefinition from is the suite's own.
+LIB_SNAPSHOT=$(lib_function_table | awk -v h="$HELPER" -v t="$TEST_LIB_FILE" '$3 == h || $3 == t')
 
 # --- executed: this file's own controls -------------------------------------------------------
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0
@@ -432,6 +557,26 @@ test_own_functions_pass() {
   control 'gh() { gh_fixture_parse "$@"; gh_fixture_answer "{}"; }' 'helper_of_my_own() { :; }'
   assert_eq "$CONTROL_RC" 0 "a suite with only its own functions runs ($CONTROL_ERR)"
   assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
+  # And still when the ENVIRONMENT exported a function of the same name in. Bash records an
+  # inherited function with no defining file, so a snapshot taken whole protected it and the
+  # suite's own fixture `gh` read as a redefinition of it: every suite refused, from a shell that
+  # merely had `gh` exported, with "(null)'s gh ((null):0) is redefined at …". The exporting shell
+  # is a file of its own because `export -f` carries the definition's file and line with it.
+  local exporter="$CONTROL_ROOT/exporter-gh.sh"
+  {
+    echo 'gh() { echo "an inherited gh"; }'
+    echo 'export -f gh'
+    printf 'exec bash %s\n' "\"$CONTROL_FILE\""
+  } >"$exporter"
+  set +e
+  bash "$exporter" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
+  CONTROL_RC=$?
+  set -e
+  CONTROL_OUT=$(cat "$CONTROL_ROOT/out")
+  CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
+  assert_eq "$CONTROL_RC" 0 "an inherited gh must not make the suite's own fixture a shadow ($CONTROL_ERR)"
+  assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
+  assert_not_contains "$CONTROL_ERR" "REFUSING" "and nothing should be refused"
 }
 
 test_definitions_before_sourcing_are_refused() {
@@ -545,6 +690,119 @@ test_gh_fixture_parse() {
   PAGINATE_LOG=""
 }
 
+# The option table, exercised in every spelling pflag accepts. Each case here is a form one of
+# the two guessing lists parsed wrongly and silently.
+test_gh_fixture_parse_knows_gh_s_option_table() {
+  # A value that looks like a REST path (#102 round 1), and the four other value options #86's
+  # list had missed.
+  gh_fixture_parse api --input fixtures/body.json repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "a path-shaped option value is not the endpoint"
+  gh_fixture_parse api --cache 5m --hostname github.com -t '{{.x}}' -p nebula repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "nor a duration, a host, a template or a preview"
+  # The booleans, which must not consume what follows them — in either position.
+  gh_fixture_parse api -i --silent --slurp --verbose --allow-escape-sequences repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "a boolean does not consume the endpoint"
+  gh_fixture_parse api repos/o/n/thing --silent --jq .a
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "nor when it stands after the endpoint"
+  assert_eq "$FIXTURE_FILTER" .a "and it does not swallow the option after it (#102 round 2)"
+  # The filter in every spelling gh accepts: separated long and short, and each attached form.
+  gh_fixture_parse api repos/o/n/thing -q .a
+  assert_eq "$FIXTURE_FILTER" .a "-q is --jq"
+  gh_fixture_parse api --jq=.b repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "--jq=<filter> consumes nothing further"
+  assert_eq "$FIXTURE_FILTER" .b "--jq=<filter> is the filter"
+  gh_fixture_parse api repos/o/n/thing -q.c
+  assert_eq "$FIXTURE_FILTER" .c "an attached short value is the filter (#102 round 2)"
+  gh_fixture_parse api repos/o/n/thing -q=.d
+  assert_eq "$FIXTURE_FILTER" .d "so is one attached with an ="
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "and neither attached form loses the endpoint"
+  gh_fixture_parse api --cache=5m repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "nor does any other inline-value long option"
+  # `--` ends option parsing: what follows is the endpoint, and is not consumed as a value
+  # (#102 round 2).
+  gh_fixture_parse api -- repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "-- is the end of options, not an option"
+  gh_fixture_parse api --jq .a -- repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "options before -- still parse"
+  assert_eq "$FIXTURE_FILTER" .a "and their values are still read"
+}
+
+# What the table refuses. Every one of these was parsed, wrongly and in silence, by one of the
+# two lists that guessed at the options they did not name.
+test_gh_fixture_parse_refuses_what_it_cannot_parse() {
+  local log="$CONTROL_ROOT/guard-req" out
+  REQUEST_LOG="$log"
+  : >"$log"
+  # An option the table lacks, in the position where assuming it carries a value swallows the
+  # endpoint...
+  set +e
+  out=$(gh_fixture_parse api --future-option repos/o/n/thing 2>&1)
+  assert_eq "$?" 1 "an option the table lacks is refused before the endpoint"
+  set -e
+  assert_contains "$out" "does not know the gh api option --future-option" "the option should be named"
+  assert_contains "$out" "gh api --future-option repos/o/n/thing" "the whole call should be quoted"
+  assert_contains "$out" "FIXTURE_GH_BOOLS or FIXTURE_GH_VALUED" "the fix should be named"
+  # ...and in the position where it leaves the endpoint intact and swallows the NEXT option
+  # instead, which is the round-2 shape and the one no guard on the endpoint can see.
+  set +e
+  out=$(gh_fixture_parse api repos/o/n/thing --future-option --jq .a 2>&1)
+  assert_eq "$?" 1 "an option the table lacks is refused after the endpoint too"
+  set -e
+  assert_contains "$out" "does not know the gh api option --future-option" "the option should be named"
+  # A boolean carrying an inline value, and a bundle of shorts, are the same unparseable word.
+  set +e
+  out=$(gh_fixture_parse api --paginate=false repos/o/n/thing 2>&1)
+  assert_eq "$?" 1 "a boolean with an inline value is refused"
+  set -e
+  assert_contains "$out" "cannot parse '--paginate=false'" "the word should be quoted"
+  assert_contains "$out" "write them apart" "the fix should be named"
+  set +e
+  out=$(gh_fixture_parse api -iq .a repos/o/n/thing 2>&1)
+  assert_eq "$?" 1 "bundled short options are refused"
+  set -e
+  assert_contains "$out" "cannot parse '-iq'" "the bundle should be quoted"
+  # `gh api` takes exactly one positional. A second is a call the CLI refuses outright, so
+  # answering it would be answering a request production cannot send — and round 2's own control
+  # had pinned this very invocation as valid (round 3).
+  set +e
+  out=$(gh_fixture_parse api -- repos/o/n/thing --paginate 2>&1)
+  assert_eq "$?" 1 "a second positional is refused, even past --"
+  set -e
+  assert_contains "$out" "received 2 positional arguments" "the count should be named"
+  assert_contains "$out" "accepts 1 arg(s), received 2" "the CLI's own refusal should be quoted"
+  set +e
+  out=$(gh_fixture_parse api repos/o/n/thing repos/o/n/other 2>&1)
+  assert_eq "$?" 1 "two endpoints are refused without a -- in sight"
+  set -e
+  assert_contains "$out" "received 2 positional arguments" "the count should be named"
+  # `--help` is an ACTION: gh prints its help and makes no request, so no answer is the right one
+  # (round 3). Refused from either side of the endpoint.
+  set +e
+  out=$(gh_fixture_parse api --help repos/o/n/thing 2>&1)
+  assert_eq "$?" 1 "--help before the endpoint is refused"
+  set -e
+  assert_contains "$out" "fixture received --help" "the flag should be named"
+  assert_contains "$out" "made no request" "why no answer can be right should be stated"
+  set +e
+  out=$(gh_fixture_parse api repos/o/n/thing --help 2>&1)
+  assert_eq "$?" 1 "--help after the endpoint is refused too"
+  set -e
+  assert_contains "$out" "fixture received --help" "the flag should be named"
+  # The shape guard under it all: a word that is no endpoint, and no endpoint at all.
+  set +e
+  out=$(gh_fixture_parse api POST 2>&1)
+  assert_eq "$?" 1 "a word that is not an endpoint is refused"
+  set -e
+  assert_contains "$out" "fixture parsed 'POST' as the endpoint" "the bad endpoint should be named"
+  set +e
+  out=$(gh_fixture_parse api --paginate 2>&1)
+  assert_eq "$?" 1 "an api call with no endpoint is refused"
+  set -e
+  assert_contains "$out" "fixture parsed '' as the endpoint" "the empty endpoint should be named"
+  assert_eq "$(cat "$log")" "" "a refused call is not logged"
+  REQUEST_LOG=""
+}
+
 # --- retune, and the restore no case performs itself -------------------------------------------
 # The values pr-review.sh gave the two constants when this file sourced it, read once so the pair
 # below asserts against the script's own defaults rather than a number copied out of it.
@@ -594,6 +852,21 @@ test_retune_of_a_name_the_script_does_not_set_is_refused() {
   assert_eq "$CONTROL_RC" 1 "a bare name is refused too ($CONTROL_ERR)"
   assert_contains "$CONTROL_ERR" "retune: 'GRACE' is not a NAME=value assignment" \
     "the malformed argument should be quoted"
+  # A name the SHELL always provides is not a constant of pr-review.sh's, whatever its text says.
+  # IFS is the one that matters: `IFS=… read` sits in several of its function bodies and every
+  # shell has IFS set, so a set derived from the text plus "is it set now" accepted `retune IFS=x`
+  # — which would have altered the word splitting of the harness doing the retuning.
+  control 'retune IFS=x'
+  assert_eq "$CONTROL_RC" 1 "IFS is not a source-time constant ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "retune IFS: pr-review.sh sets no IFS when it is sourced" \
+    "IFS should be refused by name"
+  # The other side of that probe: the constants it must accept, including one assigned inside a
+  # top-level `case` rather than in a stanza of its own.
+  control 'retune GRACE=1 STALL=2 ROUND_GAP=3 ABSENT_GRACE=4 CHECKS_INTERVAL=5 CACHE_OFF=6' \
+    '[ "$GRACE$STALL$ROUND_GAP$ABSENT_GRACE$CHECKS_INTERVAL$CACHE_OFF" = 123456 ] ||
+       bail "the constants did not take: $GRACE$STALL$ROUND_GAP$ABSENT_GRACE$CHECKS_INTERVAL$CACHE_OFF"'
+  assert_eq "$CONTROL_RC" 0 "every documented constant is retunable ($CONTROL_ERR)"
+  assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
 }
 
 tests=(
@@ -608,6 +881,8 @@ tests=(
   test_tmpdir_writes_to_a_target_named_dir
   test_tmpdir_refuses_a_name_it_uses
   test_gh_fixture_parse
+  test_gh_fixture_parse_knows_gh_s_option_table
+  test_gh_fixture_parse_refuses_what_it_cannot_parse
   test_retune_moves_a_constant
   test_retune_is_undone_when_the_case_ends # must stay directly after the case above
   test_retune_of_a_name_the_script_does_not_set_is_refused

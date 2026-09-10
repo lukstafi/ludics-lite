@@ -149,6 +149,12 @@ sidesteps both.
 If the branch already has a PR, push to it and reuse it — never open a second one for the same
 branch.
 
+Before **every** push that touches code, run the formatter check the repository's CI gates on,
+if it has one — its AGENTS.md or CLAUDE.md names it (OCANNL: `dune build @fmt`). A
+formatting-only fix push costs a CI round and, since automated reviews fire on every push, a
+review round; a round's fixes are exactly as able to break formatting as the first commit was,
+so the habit belongs on the push and not on the branch.
+
 Write the body as the reviewer's map, not a changelog: what is now true that was not, what the
 tests pin, what changes for existing users, and where the risky corner is. Reviewers — human and
 automated — spend their attention where the body sends it.
@@ -335,7 +341,8 @@ Review fixes round 3: repro commands pinned, keep-fraction pin, exact provenance
 
 The history then reads as a dialogue, which is what a reviewer (or a future archaeologist) needs.
 
-Push, then close out each thread — silent fixes leave the reviewer re-deriving what you did:
+Run the formatter check (*Open*, above) if this round touched code, push, then close out each
+thread — silent fixes leave the reviewer re-deriving what you did:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/pr-review.sh reply <owner>/<repo>#<pr> <comment-id> "Fixed in round N (<sha>, \"<commit subject>\"): <substance>"
@@ -938,11 +945,28 @@ Nothing further is owed: trailing CI on the new tip is the CI-red triage routine
 a plain `base` read seconds after a merge would only report the previous tip's green anyway,
 so do not treat one as a post-merge verdict.
 
+Close the tracked issue out in two commands, comment first — never as one `gh issue close
+--comment`. A PR body that links the issue (`Closes #N`, the ordinary way to write one) has
+already closed it at merge time, and `gh issue close N --repo O/R --comment "…"` on an
+issue that is already closed prints `! Issue … is already closed`, posts NOTHING, and exits 0:
+the summary is lost silently, with the close-out reading as done (ludics-lite#70 and #76 both,
+2026-09-10). So post the summary unconditionally, then close only if the merge did not:
+
+```bash
+gh issue comment N --repo O/R --body-file <summary-file>
+gh issue view N --repo O/R --json state --jq .state   # CLOSED → done; OPEN → close it
+gh issue close N --repo O/R
+```
+
+`--body-file` rather than `--body "…"`: a summary worth posting is multi-paragraph and carries
+backticks, which a shell argument mangles.
+
 ## Multi-PR arcs
 
 When several PRs implement one tracked issue, comment on the issue as each phase lands — what the
 phase delivered, in the issue's own vocabulary. At the end, close the issue with a waypoint
-summary mapping each waypoint to the PR that landed it, and state the honest outcome including
+summary mapping each waypoint to the PR that landed it (comment-then-close, as *After it lands*
+spells out — the last PR of an arc closes the issue too), and state the honest outcome including
 where the work did *not* pay off; file the follow-ups that the arc's own evidence justifies
 (that is `after-merge`'s job). An arc that closes with only its wins recorded costs the next
 person the same discovery twice.
