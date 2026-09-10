@@ -236,9 +236,12 @@ checkout routine that was deleted or linked away, and that it does not take the 
 shortcut over a linked `SKILL.md` whose bytes already match; that a RETIRED routine still
 installed on a box is reported in every mode and removed by nobody, since deleting a prompt
 directory here retires nothing where the registry entry still names it and the install loop reads
-this repository's list rather than the destination; and that `--help` states the one asymmetry a
-caller could otherwise read wrong, `pull` proceeding behind a symlinked destination root where
-`push` refuses; that a push never
+this repository's list rather than the destination; including the dangling link an
+upgraded box is left with, which a plain existence test calls absent; that publishing through a
+symlinked ancestor is refused at either root while reading through one is only warned about, so a
+linked destination root refuses a `push` and a linked `routines/` refuses a `pull`, each letting
+the other direction through; and that `--help` states both halves of that, since it is the
+contract a caller reads exit codes out of; that a push never
 leaves the installed prompt absent or half-written, sampled by a reader running flat out across
 twelve of them, with a control that the reader can report an absence; and that two modes in one
 invocation are a usage error, since `push` and `pull` write in opposite directions and the last

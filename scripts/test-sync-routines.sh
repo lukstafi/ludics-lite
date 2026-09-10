@@ -28,7 +28,11 @@
 #     directions and the last token used to win;
 #   - that a RETIRED routine still installed on a box is reported rather than passed over -- the
 #     loop iterates this repository's list, so without a tombstone the leftover is invisible --
-#     and that the script removes nothing itself, the registry being the desktop app's;
+#     including the DANGLING link an upgraded box is left with, and that the script removes
+#     nothing itself, the registry being the desktop app's;
+#   - that publishing through a symlinked ANCESTOR is refused at either root and reading through
+#     one only warned about: a linked destination root refuses a push, a linked routines/ refuses
+#     a pull, and each lets the other direction through;
 #   - that --dry-run copies nothing, in every mode, and still says what it would do;
 #   - the usage exits: an unknown argument is 2, --help prints the header;
 #   - that LOCAL_ROUTINES lists exactly the routines/README.md rows whose Kind is
@@ -331,9 +335,47 @@ grep -q 'mid-run' "$REPO/routines/$R1/SKILL.md" \
 # of `--help`, so the help text has to state it. A behaviour change fails the cases above; a help
 # text that promises a refusal pull does not perform fails this one.
 out=$(run_sync --help 2>&1)
-contains "$out" "pull WARNS AND PROCEEDS" \
+contains "$out" "refuses a push and lets a pull through" \
   && ok "...and --help says so, rather than promising a refusal in every mode" \
-  || ko "--help does not state pull's behaviour behind a symlinked ancestor -- callers would read the wrong exit contract"
+  || ko "--help does not state pull's behaviour behind a symlinked destination root -- callers would read the wrong exit contract"
+contains "$out" "refuses a PULL and lets a push through" \
+  && ok "...and states the mirror rule for a symlinked checkout root" \
+  || ko "--help does not state the source-root rule -- $out"
+
+# --- the CHECKOUT root reached through a symlink --------------------------------------------------
+# The mirror of the destination-root case, and the one prompt_problem cannot see: if `routines/`
+# itself is a link, each routine directory under it is perfectly normal. A pull publishes into
+# that side, so it would write into the link's target -- outside the checkout, where `git diff`
+# will not show it -- and leave the link standing while reporting the routines pulled.
+reset_trees; install_all
+printf 'body v2 -- the installed edit\n' >> "$TMP/installed/$R1/SKILL.md"
+mkdir -p "$TMP/outside-routines"
+for r in $LOCAL_ROUTINES; do
+  mkdir -p "$TMP/outside-routines/$r"
+  printf 'external prompt nobody asked to change\n' > "$TMP/outside-routines/$r/SKILL.md"
+done
+LINKREPO="$TMP/linkrepo"
+rm -rf "$LINKREPO"
+mkdir -p "$LINKREPO/scripts"
+cp "$SYNC" "$LINKREPO/scripts/sync-routines.sh"
+chmod +x "$LINKREPO/scripts/sync-routines.sh"
+ln -s "$TMP/outside-routines" "$LINKREPO/routines"
+linked_src() { env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/installed" "$LINKREPO/scripts/sync-routines.sh" "$@"; }
+
+expect "pull refuses a checkout whose routines/ is a symlink" 1 "refusing to pull into a checkout" -- \
+  linked_src pull
+grep -q 'external prompt nobody asked to change' "$TMP/outside-routines/$R1/SKILL.md" \
+  && ok "...writing nothing into the link's target" \
+  || ko "the refused pull wrote into $TMP/outside-routines: $(cat "$TMP/outside-routines/$R1/SKILL.md")"
+[ -L "$LINKREPO/routines" ] \
+  && ok "...and leaving the link alone, since routines/ is not this script's to replace" \
+  || ko "the link was replaced"
+# push and status only READ that side, and the scheduler never opens it, so they go on with a
+# warning. This is the control that the refusal above is about WRITING and not about the link.
+expect "...while push reads through it and says so" 0 "reading it anyway" -- linked_src push
+grep -q 'external prompt' "$TMP/installed/$R1/SKILL.md" \
+  && ok "...having installed what is behind the link" || ko "push through the link installed nothing"
+expect "...and status reads through it too" 0 "all local routines in sync" -- linked_src
 
 # --- an installed directory that exists and is not a usable prompt -------------------------------
 # `-L "$dst"` sees only the routine's own directory and `diff -r` FOLLOWS a link, so an installed
@@ -892,6 +934,21 @@ if [ -n "$RETIRED1" ]; then
     run_sync push
   [ -f "$TMP/installed/$RETIRED1/SKILL.md" ] \
     && ok "...still removing nothing" || ko "push deleted the retired routine's directory"
+  # The state an upgraded box is actually in: the old install loop symlinked the task directory
+  # into this checkout, and this change deletes the target, so what is left is a DANGLING link --
+  # which `-e` calls absent while the registry entry still names it.
+  rm -rf "$TMP/installed/$RETIRED1"
+  ln -s "$TMP/no-such-target-$RETIRED1" "$TMP/installed/$RETIRED1"
+  [ ! -e "$TMP/installed/$RETIRED1" ] && [ -L "$TMP/installed/$RETIRED1" ] \
+    && ok "...the upgraded box's dangling link is invisible to a plain existence test" \
+    || ko "the fixture did not produce a dangling link, so the case below proves nothing"
+  expect "...and a DANGLING retired link is reported all the same" 1 "RETIRED, but still installed" -- \
+    run_sync
+  [ -L "$TMP/installed/$RETIRED1" ] \
+    && ok "...and is still left for the operator to remove after deregistering" \
+    || ko "the script removed the dangling link itself"
+  rm -f "$TMP/installed/$RETIRED1"
+
   # A retired name must be retired in the repository too, or the tombstone contradicts the table.
   case " $LOCAL_ROUTINES " in
     *" $RETIRED1 "*) ko "$RETIRED1 is tombstoned AND in LOCAL_ROUTINES" ;;

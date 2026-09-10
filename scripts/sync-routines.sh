@@ -31,9 +31,12 @@
 #      Two things are deliberately NOT failures. A push that installs a prompt over a placeholder
 #      is a success, and so is a pull that RESTORES a checkout routine that was deleted or linked
 #      away: repairing this side is what pull is for. A destination reached through a symlinked
-#      ANCESTOR is the asymmetric case: push refuses it (installing there is installing something
-#      the scheduler will not read) and status reports it, but pull WARNS AND PROCEEDS, because
-#      the files behind the link are real and taking them is the recovery.
+#      ANCESTOR is the asymmetric case, and it is symmetric between the two roots: publishing
+#      through a symlinked ancestor is refused, reading through one only warned about. So a
+#      symlinked DESTINATION root refuses a push and lets a pull through, while a symlinked
+#      SOURCE root (this checkout's routines/) refuses a PULL and lets a push through. status
+#      reports the destination one as drift, since the scheduler cannot read a task file whose
+#      path traverses a link however the sync went.
 #   2  usage: an argument this script does not know.
 #
 # The destination is $CLAUDE_SCHEDULED_TASKS_DIR when set, which is what the fixture suite
@@ -264,9 +267,13 @@ drift=0      # status only: the checkout and the installed copies disagree
 problems=0   # push/pull only: a routine this run could not sync
 copied=0
 
-# Whatever the mode, a destination reached through a symlink is a destination the scheduler will
-# not read. Checked once, above the loop, because it is a fact about the root and not about any
-# one routine.
+# Both roots are checked once, above the loop, because each is a fact about the root and not
+# about any one routine. The rule is the same at both ends and comes from the filesystem, not
+# from which side we happen to be on: PUBLISHING through a symlinked ancestor is refused, because
+# it writes into the link's target and leaves the link standing, while READING through one is
+# fine, since the files behind it are real. What the destination adds on top is the scheduler:
+# it will not open a task file whose path traverses a link, so a destination behind one is a
+# problem even when nothing is being written.
 if link=$(first_symlinked_ancestor "$dest_root"); then
   warn "$dest_root is reached through a SYMLINK ($link -> $(readlink "$link")) -- the scheduler"
   warn "refuses a task file whose path traverses one, at any component. Make the destination a"
@@ -286,6 +293,25 @@ if link=$(first_symlinked_ancestor "$dest_root"); then
   esac
 fi
 
+if link=$(first_symlinked_ancestor "$src_root"); then
+  warn "$src_root is reached through a SYMLINK ($link -> $(readlink "$link"))."
+  case "$mode" in
+    pull)
+      # This is the write side for a pull. Publishing through the link would overwrite files in
+      # its target -- outside the checkout, where `git diff` cannot show them -- and leave the
+      # link standing while reporting the routines pulled. Replacing the link is not this
+      # script's call either: routines/ is a tracked directory and somebody put it there.
+      warn "sync-routines: refusing to pull into a checkout reached through a symlink; a pull"
+      warn "writes, and it would write into $(readlink "$link") and leave the link in place."
+      exit 1
+      ;;
+    *)
+      # push and status only READ this side, and the scheduler never opens it.
+      warn "sync-routines: reading it anyway; nothing writes to this side in $mode mode"
+      ;;
+  esac
+fi
+
 # A push onto a box whose scheduled-tasks directory does not exist yet has to create it, or
 # publish_dir's `mkdir -p` lands nowhere. Status and pull read, so they leave the filesystem
 # alone.
@@ -294,7 +320,10 @@ if [ "$mode" = push ] && ! $dry_run; then
 fi
 
 for r in $RETIRED_ROUTINES; do
-  [ -e "$dest_root/$r" ] || continue
+  # `-e` alone misses the state an upgraded box is actually IN: the old install loop symlinked
+  # the task directory into this checkout, and this change deletes the target, so what is left is
+  # a DANGLING link -- invisible to -e, and still named by a live registry entry.
+  [ -e "$dest_root/$r" ] || [ -L "$dest_root/$r" ] || continue
   warn "$r: RETIRED, but still installed at $dest_root/$r"
   warn "$r: this repository no longer carries its prompt, and deleting one here does not stop a"
   warn "$r: registered task. Deregister '$r' in the desktop app's scheduled tasks, THEN remove"
