@@ -132,8 +132,10 @@ FIXTURE_ENDPOINT=""
 FIXTURE_FILTER=""
 FIXTURE_PAGINATE=""
 
-# gh api's OPTION TABLE, as of gh 2.99.0: every option the command accepts, split by whether it
-# carries a value, each spelling its own entry and surrounded by spaces so a lookup is exact.
+# gh api's OPTION TABLE, as of gh 2.99.0: every option the command accepts AS PART OF A REQUEST,
+# split by whether it carries a value, each spelling its own entry and surrounded by spaces so a
+# lookup is exact. `--help` is deliberately in neither list — it is an action, not an option, and
+# is refused below.
 #
 # Two lists preceded this one and each was a guess about the options NOT named. #86 listed the
 # value-taking options and let anything else stand alone, so a value-taking option it had missed
@@ -151,11 +153,11 @@ FIXTURE_PAGINATE=""
 # has yet to learn, and one line here teaches it. A refusal is also the answer to a form the
 # table cannot express (a boolean with an inline value, a bundled short): loud and unparsed beats
 # parsed wrong, which is the whole lesson of the two lists above.
-FIXTURE_GH_BOOLS=" -i --include --paginate --silent --slurp --verbose --allow-escape-sequences --help "
+FIXTURE_GH_BOOLS=" -i --include --paginate --silent --slurp --verbose --allow-escape-sequences "
 FIXTURE_GH_VALUED=" -X --method -f --raw-field -F --field -H --header -q --jq -t --template -p --preview --cache --hostname --input "
 
 gh_fixture_parse() {
-  local arg name value inline opts_ended="" call="$*"
+  local arg name value inline positional opts_ended="" positionals=0 call="$*"
   FIXTURE_ENDPOINT=""
   FIXTURE_FILTER=""
   FIXTURE_PAGINATE=""
@@ -164,46 +166,61 @@ gh_fixture_parse() {
   while [ $# -gt 0 ]; do
     arg="$1"
     shift
+    positional=""
     if [ -n "$opts_ended" ]; then
-      [ -n "$FIXTURE_ENDPOINT" ] || FIXTURE_ENDPOINT="$arg"
+      positional=1
+    else
+      # Split the option's NAME from an inline value, in each of pflag's spellings: `--name=v`,
+      # `-x=v`, and the attached short `-xv`. `--` ends option parsing, and everything after it is
+      # positional however much it looks like an option; a lone `-` is the endpoint (gh reads a
+      # body from stdin, not an option).
+      case "$arg" in
+      --) opts_ended=1 && continue ;;
+      --*=*)
+        name="${arg%%=*}"
+        value="${arg#*=}"
+        inline=1
+        ;;
+      --?*)
+        name="$arg"
+        value=""
+        inline=""
+        ;;
+      -?=*)
+        name="${arg%%=*}"
+        value="${arg#*=}"
+        inline=1
+        ;;
+      -?)
+        name="$arg"
+        value=""
+        inline=""
+        ;;
+      -??*)
+        name="${arg:0:2}"
+        value="${arg:2}"
+        inline=1
+        ;;
+      *) positional=1 ;;
+      esac
+    fi
+    if [ -n "$positional" ]; then
+      # `gh api <endpoint> [flags]` takes exactly ONE positional. A second is a call the CLI
+      # would have refused outright, so a fixture that answered it would be answering a request
+      # production cannot send — which a test could then pass against (ludics-lite#102, round 3;
+      # round 2's own control had enshrined `api -- repos/o/n/thing --paginate` as valid).
+      positionals=$((positionals + 1))
+      [ "$positionals" -eq 1 ] ||
+        bail "fixture received $positionals positional arguments in: gh $call — gh api takes exactly one, the endpoint; the real CLI answers 'accepts 1 arg(s), received $positionals' and makes no request"
+      FIXTURE_ENDPOINT="$arg"
       continue
     fi
-    # Split the option's NAME from an inline value, in each of pflag's spellings: `--name=v`,
-    # `-x=v`, and the attached short `-xv`. `--` ends option parsing, and everything after it is
-    # positional however much it looks like an option; a lone `-` is the endpoint (gh reads a
-    # body from stdin, not an option).
-    case "$arg" in
-    --) opts_ended=1 && continue ;;
-    --*=*)
-      name="${arg%%=*}"
-      value="${arg#*=}"
-      inline=1
-      ;;
-    --?*)
-      name="$arg"
-      value=""
-      inline=""
-      ;;
-    -?=*)
-      name="${arg%%=*}"
-      value="${arg#*=}"
-      inline=1
-      ;;
-    -?)
-      name="$arg"
-      value=""
-      inline=""
-      ;;
-    -??*)
-      name="${arg:0:2}"
-      value="${arg:2}"
-      inline=1
-      ;;
-    *)
-      [ -n "$FIXTURE_ENDPOINT" ] || FIXTURE_ENDPOINT="$arg"
-      continue
-      ;;
-    esac
+    # `--help` is a terminal ACTION, not part of a request: gh prints the help, exits 0 and calls
+    # nothing, whichever side of the endpoint it sits on. It is kept out of the boolean list and
+    # refused by name, so a library call that grew one by accident cannot find a fixture willing
+    # to answer it (round 3).
+    [ "$name" != --help ] ||
+      bail "fixture received --help in: gh $call — gh api would have printed its help and made no request, so no answer here could be the right one"
     case "$FIXTURE_GH_BOOLS" in
     *" $name "*)
       # An inline value on a boolean is either pflag's `--bool=false` or a bundle of shorts, and
@@ -545,9 +562,6 @@ test_gh_fixture_parse_knows_gh_s_option_table() {
   gh_fixture_parse api --jq .a -- repos/o/n/thing
   assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "options before -- still parse"
   assert_eq "$FIXTURE_FILTER" .a "and their values are still read"
-  gh_fixture_parse api -- repos/o/n/thing --paginate
-  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "past --, an option word is positional"
-  assert_eq "$FIXTURE_PAGINATE" "" "and is not read as the flag it spells"
 }
 
 # What the table refuses. Every one of these was parsed, wrongly and in silence, by one of the
@@ -584,6 +598,33 @@ test_gh_fixture_parse_refuses_what_it_cannot_parse() {
   assert_eq "$?" 1 "bundled short options are refused"
   set -e
   assert_contains "$out" "cannot parse '-iq'" "the bundle should be quoted"
+  # `gh api` takes exactly one positional. A second is a call the CLI refuses outright, so
+  # answering it would be answering a request production cannot send — and round 2's own control
+  # had pinned this very invocation as valid (round 3).
+  set +e
+  out=$(gh_fixture_parse api -- repos/o/n/thing --paginate 2>&1)
+  assert_eq "$?" 1 "a second positional is refused, even past --"
+  set -e
+  assert_contains "$out" "received 2 positional arguments" "the count should be named"
+  assert_contains "$out" "accepts 1 arg(s), received 2" "the CLI's own refusal should be quoted"
+  set +e
+  out=$(gh_fixture_parse api repos/o/n/thing repos/o/n/other 2>&1)
+  assert_eq "$?" 1 "two endpoints are refused without a -- in sight"
+  set -e
+  assert_contains "$out" "received 2 positional arguments" "the count should be named"
+  # `--help` is an ACTION: gh prints its help and makes no request, so no answer is the right one
+  # (round 3). Refused from either side of the endpoint.
+  set +e
+  out=$(gh_fixture_parse api --help repos/o/n/thing 2>&1)
+  assert_eq "$?" 1 "--help before the endpoint is refused"
+  set -e
+  assert_contains "$out" "fixture received --help" "the flag should be named"
+  assert_contains "$out" "made no request" "why no answer can be right should be stated"
+  set +e
+  out=$(gh_fixture_parse api repos/o/n/thing --help 2>&1)
+  assert_eq "$?" 1 "--help after the endpoint is refused too"
+  set -e
+  assert_contains "$out" "fixture received --help" "the flag should be named"
   # The shape guard under it all: a word that is no endpoint, and no endpoint at all.
   set +e
   out=$(gh_fixture_parse api POST 2>&1)
