@@ -227,7 +227,11 @@ check_skill_file() {
 # here when, after an optional leading pipe, it opens with the backticked name and the next
 # non-blank character is a pipe (GFM renders a body row without its leading pipe, so both
 # spellings count). The name is matched as text, not as a pattern, so a `.` or a `-` in a
-# directory name is that character and `beta` is not found in `` `betas` ``.
+# directory name is that character and `beta` is not found in `` `betas` ``. The name reaches awk
+# through the ENVIRONMENT, never through `-v`: an assignment made with `-v` is escape-processed, so
+# a directory named `a\n` -- a name this checker accepts, spelled `name: "a\\n"` -- would be
+# looked up as `a<LF>` and reported unindexed however exactly the README names it, while the
+# decoded spelling of some OTHER name would answer for it.
 #
 # What this deliberately does NOT claim, after ludics-lite#75: that the row renders. There is no
 # table model here -- no header, no delimiter row, no fenced-code or HTML-comment scope, no
@@ -238,7 +242,8 @@ check_skill_file() {
 # the README -- needs none of them. The check that is left is the one worth having, and it is
 # small enough to be obviously right.
 indexed() {
-  awk -v want="\`$2\`" '
+  CP_WANT="\`$2\`" awk '
+    BEGIN { want = ENVIRON["CP_WANT"] }
     {
       line = $0
       sub(/^[[:space:]]*\|?[[:space:]]*/, "", line)

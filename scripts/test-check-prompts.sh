@@ -257,6 +257,16 @@ fresh "$R"; skill "$R" v1.2 'name: v1.2' 'description: A dotted name.'; row_afte
 expect "a '.' in a directory name is not a wildcard" 1 "skill 'v1.2' is not indexed" -- "$CP" "$R"
 fresh "$R"; skill "$R" v1.2 'name: v1.2' 'description: A dotted name.'; row_after_beta '| `v1.2` | A dotted name, indexed exactly. |'
 expect "...while the exact dotted name indexes it" 0 '7 passed, 0 failed' -- "$CP" "$R"
+# A backslash in a name is a backslash: the name reaches awk through the environment, so it is not
+# escape-processed on the way in. Both directions of that are pinned, since an `-v` assignment
+# would refuse the exactly-indexed name and accept the decoded spelling of a different one. The
+# row is appended rather than inserted, which is all the lookup needs.
+fresh "$R"; skill "$R" 'a\n' 'name: "a\\n"' 'description: A literal backslash in the name.'
+printf '%s\n' '| `a\n` | A name carrying a backslash. |' >> "$R/README.md"
+expect "a backslash in a directory name is matched literally" 0 '7 passed, 0 failed' -- "$CP" "$R"
+fresh "$R"; skill "$R" 'a\tb' 'name: "a\\tb"' 'description: A backslash-t in the name.'
+printf '%s\n' '| `a	b` | The decoded spelling, which names something else. |' >> "$R/README.md"
+expect "...and what that backslash would decode to is a different name" 1 "skill 'a\tb' is not indexed" -- "$CP" "$R"
 # GFM renders a body row without its leading pipe, so one counts here too.
 fresh "$R"; beta_row '`beta` | The second, pipeless.'
 expect "a pipeless row is a row" 0 '6 passed, 0 failed' -- "$CP" "$R"
