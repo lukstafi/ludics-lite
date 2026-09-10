@@ -58,6 +58,7 @@ reset_fixture() {
   schedule reviews 1 '[]'
   schedule comments 1 '[]'
   schedule inline 1 '[]'
+  schedule review_comments 1 '[]'
   HEAD_SHA="$H2"
   MERGEABLE_STATE=clean
   FAIL_PULLS=""
@@ -116,6 +117,16 @@ occurrences() { # <haystack> <needle>
   grep -c -F -- "$2" <<<"$1" || true
 }
 
+# A row as the PER-REVIEW comments endpoint serves it, which is not the shape the flat feed has:
+# no `line` and no `original_line` at all — verified against this repository's live API on
+# 2026-09-10 — with the location carried by position/original_position instead. poll renders such
+# a row as `:0`, so two of them at different places in one file look identical.
+positional_comment() { # <id> <original commit> <body> <position>
+  jq -cn --argjson id "$1" --arg orig "$2" --arg b "$3" --argjson pos "$4" --arg rev "$REVIEWER" \
+    '{id:$id, user:{login:($rev + "[bot]")}, path:"a.sh", body:$b, position:$pos,
+      original_position:$pos, original_commit_id:$orig, commit_id:$orig}'
+}
+
 summary_comment() { # <id> <created_at> <body>
   jq -cn --argjson id "$1" --arg at "$2" --arg b "$3" --arg rev "$REVIEWER" \
     '{id:$id, user:{login:($rev + "[bot]")}, created_at:$at, updated_at:$at, body:$b}'
@@ -153,7 +164,7 @@ gh() {
   "repos/$REPO/issues/7/reactions?per_page=100") response=$(feed_answer reactions) ;;
   "repos/$REPO/pulls/7/reviews?per_page=100") response=$(feed_answer reviews) ;;
   "repos/$REPO/issues/7/comments?per_page=100") response=$(feed_answer comments) ;;
-  "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100") response='[]' ;;
+  "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100") response=$(feed_answer review_comments) ;;
   "repos/$REPO/pulls/7")
     if [ -n "$FAIL_PULLS" ] ||
       { [ "$FAIL_PULLS_FROM" -ne 0 ] && [ "$(cat "$FEEDS/round")" -ge "$FAIL_PULLS_FROM" ]; }; then
@@ -273,6 +284,35 @@ test_an_unread_head_holds_nothing_back() {
   assert_eq "$WATCH_RC" 0 "with no head to compare against, the round is acted on"
   assert_contains "$WATCH_ERR" "the head did not read this round, so nothing was held back" \
     "and the exit line says which case it is in"
+}
+
+# The silent half of the fold, found in round 1 of #86. When the flat comments feed lags a new
+# review, poll supplements it from the per-review endpoint, whose rows carry NO line at all — so
+# every one of them renders `:0` and two findings at different places in one file look identical.
+# Folded, the second is answered by a reply it never got and resolved with the first, and the
+# watermark has advanced past its id, so nothing renders it again. The key therefore carries every
+# location field the row has, and `:0` is never the thing two rows are folded on.
+test_rows_with_no_line_are_folded_only_when_their_positions_agree() {
+  reset_fixture
+  local same="the same body, at two places in one file"
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
+  schedule review_comments 1 "[$(positional_comment 900 "$H2" "$same" 12),$(positional_comment 901 "$H2" "$same" 40)]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "the round is acted on"
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:0" "the first row renders with no line"
+  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:0" "and so does the second: they LOOK alike"
+  assert_not_contains "$WATCH_OUT" "id=900+901" \
+    "but two positions in one file are two findings, and folding them loses the second for good"
+  assert_eq "$(occurrences "$WATCH_OUT" "$same")" 2 "each is rendered, so each can be answered"
+  # The control: rows agreeing on every anchor either of them has really are indistinguishable,
+  # and do fold — or the case above would pass on a fold that had simply stopped working.
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
+  schedule review_comments 1 "[$(positional_comment 900 "$H2" "$same" 12),$(positional_comment 901 "$H2" "$same" 12)]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_OUT" "--- inline id=900+901 a.sh:0" \
+    "with nothing to tell them apart, they are one finding and one reply"
+  assert_eq "$(occurrences "$WATCH_OUT" "$same")" 1 "and one body"
 }
 
 # --- what each exit says it exits on --------------------------------------------------------------
@@ -640,6 +680,7 @@ tests=(
   test_identical_inline_threads_fold_into_one_entry
   test_threads_differing_only_in_body_are_not_folded
   test_the_same_body_against_two_heads_is_not_folded
+  test_rows_with_no_line_are_folded_only_when_their_positions_agree
   test_a_summary_is_bound_by_the_commit_it_names
   test_an_unread_head_holds_nothing_back
   test_the_acting_exit_names_the_item

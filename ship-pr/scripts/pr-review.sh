@@ -609,10 +609,22 @@ mark_of() {
 # them, anchor first, and the rendering and the index both address it by that list (`id=900+901`)
 # — the token `reply` and `resolve` take, so what poll printed is what the caller pastes back.
 #
-# What may fold is exactly what renders IDENTICALLY: the key is every field the entry's header and
-# body show — path, line, body, commit stamp and author — so a folded entry prints what its members
-# would each have printed, and the fold cannot hide a difference the caller was meant to see. The
-# commit stamp is in the key for a second reason: it is what `watch` classifies an item by, and
+# What may fold must render identically — but rendering identically is NOT enough, because the
+# rendering cannot always show where a finding is. The key is every field the entry's header and
+# body show — path, line, body, commit stamp and author — plus every OTHER location field the row
+# carries, and the extra ones are what make the fold safe rather than merely tidy: the per-review
+# comments endpoint (the one poll re-reads when the flat feed lags a new review) serves rows with
+# no `line` and no `original_line` AT ALL, carrying `position`/`original_position` instead
+# (verified against this repository's live API, 2026-09-10). Every such row renders `:0`, so two
+# findings at different places in one file LOOK identical; folded, the second would be answered by
+# a reply it never got and resolved with the first, and the watermark has advanced past its id, so
+# nothing renders it again once the flat feed catches up (round 1 of #86). All four location fields
+# therefore go in the key, each as itself — `line`, `original_line`, `position`, `original_position`
+# — so two rows fold only when every anchor either of them has agrees. The inequality runs in the
+# safe direction: two entries that look alike may stay unfolded (loud, and costs one extra reply),
+# and two that differ can never merge (silent, and costs a finding).
+#
+# The commit stamp is in the key for a second reason: it is what `watch` classifies an item by, and
 # folding across two stamps would force one head verdict onto two different associations.
 # Grouping is by the key's `tojson` — a STRING — because jq's `index` on an array argument searches
 # for a sub-SEQUENCE rather than an element, so a key kept as an array would match its neighbours'
@@ -625,7 +637,8 @@ POLL_ITEM_DEFS='
   def review_commit: .commit_id | short;
   def item_path: .path // "?";
   def item_line: .line // .original_line // 0;
-  def fold_key: [item_path, item_line, (.body // ""), inline_commit, (.user.login // "")];
+  def fold_key: [item_path, .line, .original_line, .position, .original_position,
+                 (.body // ""), inline_commit, (.user.login // "")];
   def fold_inline:
     [to_entries[] | {i: .key, k: (.value | fold_key | tojson), v: .value}]
     | group_by(.k)
@@ -1845,25 +1858,29 @@ cmd_watch() {
 # ordinary thread, `900+901+902` for a folded entry (see fold_inline) — so the caller pastes back
 # what it read instead of re-deriving a list. Splits it into FOLD_IDS, space-joined, anchor first;
 # refuses anything else, because the split is new and an id that silently stayed "900+901" would
-# address no comment and come back as a 404 the caller would read as a missing thread. Repeats are
-# dropped rather than refused: they cost a duplicate write, and the entry they came from is one
-# finding either way.
+# address no comment and come back as a 404 the caller would read as a missing thread.
 FOLD_IDS=""
 split_ids() { # <token> <command name, for the message>
   local id
   FOLD_IDS=""
+  # The WHOLE token is matched against the grammar BEFORE anything is split off it, and checking
+  # each piece afterwards is not the same thing: the split is an unquoted expansion, so it also
+  # word-splits and GLOBS. A token carrying whitespace ("900 901") would arrive as two pieces a
+  # per-piece numeric check accepts and be written to twice, and one carrying a glob character
+  # ("*") would expand against the caller's working directory, where a numeric filename would
+  # become a comment id this script then replies to and resolves (round 1 of #86). Digits and
+  # single `+`, nothing else, so nothing that reaches the split can split or expand further.
   case "$1" in
-  *"++"* | "+"* | *"+") die "$2: '$1' is not a comment id — several are joined by single '+'," \
-    "as poll renders a folded entry (900+901+902)" ;;
+  '' | *[!0-9+]* | *"++"* | "+"* | *"+")
+    die "$2: '$1' is not a comment id — a comment id is digits, and several are joined by single" \
+      "'+' as poll renders a folded entry (900+901+902)" ;;
   esac
   for id in ${1//+/ }; do
-    case "$id" in '' | *[!0-9]*) die "$2: the comment id must be numeric, or several joined by" \
-      "'+' as poll renders a folded entry (900+901+902), got '$1'" ;;
-    esac
+    # Repeats are dropped rather than refused: they cost a duplicate write, and the entry they
+    # came from is one finding either way.
     case " $FOLD_IDS " in *" $id "*) continue ;; esac
     FOLD_IDS="$FOLD_IDS $id"
   done
-  [ -n "$FOLD_IDS" ] || die "$2: no comment id in '$1'"
 }
 
 # ids_from <space-joined ids> <first id to keep>: the tail of the list starting at that id, for a

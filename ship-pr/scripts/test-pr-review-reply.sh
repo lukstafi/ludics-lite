@@ -177,7 +177,7 @@ test_a_repeated_id_costs_one_write() {
 # ids is an invocation error (exit 2), before any write.
 test_a_malformed_token_is_refused_before_anything_is_posted() {
   local token
-  for token in 900+9a1 900++901 +900 900+ "" abc; do
+  for token in 900+9a1 900++901 +900 900+ "" abc "900 901" "900,901"; do
     reset_fixture
     run_cmd cmd_reply "$token" "a body"
     assert_eq "$RC" 2 "'$token' is an invocation error, not a write ($ERR)"
@@ -192,6 +192,39 @@ test_a_malformed_token_is_refused_before_anything_is_posted() {
   reset_fixture
   run_cmd cmd_resolve 900+901
   assert_eq "$RC" 0 "and resolve takes the same token ($ERR)"
+}
+
+# The token is matched WHOLE before it is split, because the split is an unquoted expansion: it
+# word-splits, and it globs. "900 901" above is the first half; this is the second — a token of
+# glob characters expanded against the caller's working directory, where a numeric FILENAME became
+# a comment id the script replied to and resolved (round 1 of #86).
+test_a_glob_token_cannot_take_its_ids_from_the_filesystem() {
+  local dir="$TEST_ROOT/cwd"
+  reset_fixture
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  : >"$dir/900"
+  : >"$dir/901"
+  [ -e "$dir/900" ] || bail "the case needs numeric filenames for the glob to find"
+  set +e
+  (cd "$dir" && cmd_reply 7 "*" "a body") >"$TEST_ROOT/out" 2>"$TEST_ROOT/err"
+  RC=$?
+  set -e
+  OUT=$(cat "$TEST_ROOT/out")
+  ERR=$(cat "$TEST_ROOT/err")
+  assert_eq "$RC" 2 "a glob is not a comment id"
+  assert_contains "$ERR" "is not a comment id" "and is refused as the token it is"
+  assert_eq "$(wc -l <"$REQUEST_LOG" | tr -d " ")" 0 \
+    "with nothing written to the threads the directory listing happens to name"
+  # The control: from that same directory, a real token still works — the refusal is about the
+  # token and not about where the command was run.
+  reset_fixture
+  set +e
+  (cd "$dir" && cmd_reply 7 900 "a body") >"$TEST_ROOT/out" 2>"$TEST_ROOT/err"
+  RC=$?
+  set -e
+  assert_eq "$RC" 0 "a real id from the same directory posts ($(cat "$TEST_ROOT/err"))"
+  assert_eq "$(writes_to 900)" 1 "to the thread it names"
 }
 
 # An unquoted body arrives as several arguments, and the `${3:?body}` form these commands used to
@@ -316,6 +349,7 @@ tests=(
   test_a_single_thread_reply_is_unchanged
   test_a_repeated_id_costs_one_write
   test_a_malformed_token_is_refused_before_anything_is_posted
+  test_a_glob_token_cannot_take_its_ids_from_the_filesystem
   test_the_invocation_shape_is_a_usage_error
   test_a_failure_after_the_anchor_says_what_landed
   test_the_write_exits_stay_apart_inside_a_batch
