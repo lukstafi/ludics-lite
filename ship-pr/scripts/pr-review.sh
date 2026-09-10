@@ -668,10 +668,8 @@ fmt_age() {
 # round has not started yet and has its grace to run. One that names no ref at all is not
 # attributed to a head — the branch says why.
 #
-# For that token ALONE the detail carries two leading `|`-separated fields — the head's short SHA
-# and how many such failures name this head — because the remedy escalates with the recurrence
-# (nudge once; on a second failure for the same head, push a new head) and only this function can
-# count them. status_line splits them off; nothing else parses a detail.
+# For that token ALONE the detail carries one leading `|`-separated field, the head's short SHA,
+# which the rendered line names. status_line splits it off; nothing else parses a detail.
 # <mergeability> is the PR's mergeable_state as GitHub reports it (clean, dirty, unstable, blocked,
 # behind, draft, unknown while it is recomputing), "unread" when the PR read failed, or "-" when
 # no PR read was attempted (a feed failed before it). "unread" is rendered as such: a line that
@@ -713,7 +711,7 @@ pr_head_read() {
 status_state() {
   local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local vline verd_at verd_sha mstate="-" head_err=""
-  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at success_at nfail
+  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -887,53 +885,15 @@ status_state() {
                | select(.submitted_at != null) | select((.commit_id // "") == $sha)
                | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || rev_head_at=""
       if [ -z "$rev_head_at" ] || [[ "$fail_at" > "$rev_head_at" ]]; then
-        # How many failures name THIS head SINCE the reviewer last GOT THROUGH on it. A nudge
-        # that demonstrably worked once must not leave the caller amending over a round that
-        # succeeded and the green checks under it (review of #82, rounds 3 and 4); only failures
-        # after that success are evidence that nudging has stopped working. The first is worth a
-        # nudge, a second says the nudge will not help and the head itself has to move.
-        #
-        # "Got through" is the newest of the three ways the reviewer speaks about a head, each
-        # read by the code above that already knows how — re-deriving one of them here is what
-        # produced three rounds of successors (review of #82, rounds 3, 4 and 5):
-        #   - a review submitted against this head ($rev_head_at, from the reviews feed);
-        #   - the no-findings verdict for it ($verd_at/$verd_sha, from the verdict scan, which
-        #     is the reader that handles a verdict delivered by EDITING the running placeholder
-        #     in place — machine-tagged, and dated by updated_at rather than created_at);
-        #   - a comment-only findings round naming it as its Reviewed commit (below). That scan
-        #     drops the placeholder, deliberately: an announcement is not a round, and the one
-        #     case where the placeholder carries a verdict is the term above it.
-        # $c and $f are bound before their fields are read: inside `startswith(...)` the `.` is
-        # that filter's own input — $sha — so the unbound form compares the head to itself and
-        # every failure on the PR counts (caught by the two-heads control in the status suite).
-        success_at=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" \
-          --arg rc "$REVIEWED_COMMIT_RE" --arg sha "$head_sha" '
-            [.[] | select((.user.login // "") | startswith($rev))
-                 | select((.body // "") | test("codex-pull-request-review-summary") | not)
-                 | select((.body // "") | test($re) | not)
-                 | {at: (.created_at // ""),
-                    sha: (((try ((.body // "") | capture($rc).s) catch "") // ""))} as $c
-                 | select($c.sha != "" and ($sha | startswith($c.sha)))
-                 | $c.at] | max // ""' <<<"$comments_raw" 2>/dev/null) || success_at=""
-        success_at=$(newest "$success_at" "$rev_head_at")
-        if [ -n "$verd_sha" ]; then
-          case "$head_sha" in "$verd_sha"*) success_at=$(newest "$success_at" "$verd_at") ;; esac
-        fi
-        nfail=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" \
-          --arg refre "$INIT_FAILURE_REF_RE" --arg sha "$head_sha" --arg since "$success_at" '
-            [.[] | select((.user.login // "") | startswith($rev))
-                 | select((.body // "") | test("codex-pull-request-review-summary") | not)
-                 | select((.body // "") | test($re))
-                 | {at: (.created_at // ""),
-                    ref: (((try ((.body // "") | capture($refre).s) catch "") // ""))} as $f
-                 | select($f.ref != "" and ($sha | startswith($f.ref))
-                          and ($since == "" or $f.at > $since))]
-            | length' <<<"$comments_raw" 2>/dev/null) || nfail=""
-        case "$nfail" in '' | *[!0-9]*) nfail=0 ;; esac
-        # A count that came back empty must not read as "never before": the failure in hand is
-        # one by construction, and one is the arm that nudges rather than the one that pushes.
-        [ "$nfail" -ge 1 ] || nfail=1
-        echo "failed|$(age_of "$fail_at")|$mstate|${head_sha:0:7}|$nfail|$REVIEWER reported an" \
+        # No recurrence count rides on this line. One was tried and removed (review of #82,
+        # rounds 1, 3, 4, 5 and 6): "has this head failed before?" has to be measured from the
+        # last time the reviewer GOT THROUGH on it, and that success is not always recorded —
+        # a clean round posts no review and only a 👍, and the very re-request that then fails
+        # CLEARS that reaction, leaving nothing behind to measure from. Every fix made the
+        # boundary wider and the next round found the next hole. So the line states both moves
+        # unconditionally, which is what the issue asked for and what a caller can act on
+        # without the script deciding which case it is in.
+        echo "failed|$(age_of "$fail_at")|$mstate|${head_sha:0:7}|$REVIEWER reported an" \
           "initialization failure at $fail_at for ref ${fail_ref:0:7}"
         return 0
       fi
@@ -1041,7 +1001,7 @@ conflict_note() {
 # Takes a whole state line, not a token: the age and the detail are what make the difference between
 # "wait it out" and "nothing is coming" legible to whoever reads the log.
 status_line() {
-  local tok age detail merge conflict fsha fnum frest remedy
+  local tok age detail merge conflict fsha frest
   tok=$(state_tok "$1")
   age=$(state_age "$1")
   detail=$(state_detail "$1")
@@ -1057,28 +1017,19 @@ status_line() {
     "reviewer's existing 👍${conflict:+; $conflict}" ;;
   # The remedy, not the diagnosis, is what this line is for: the reviewer's clone is behind, and
   # nothing the caller waits for changes that. A nudge re-runs the fetch and usually succeeds
-  # (ocannl-staging#677's third head reviewed normally after one), so the first failure on a head
-  # gets a nudge; a second failure on the SAME head says the fetch keeps missing that object, and
-  # only a new head — an amend is enough — gives it one it can resolve. The recurrence count and
-  # the head ride in the detail's two leading fields (see status_state); the rest is the fact.
+  # (ocannl-staging#677's third head reviewed normally after one); if the same head fails again,
+  # only a new head gives the reviewer an object its clone can resolve. Both moves are stated,
+  # in order, rather than the script deciding which one the caller is due — see status_state for
+  # why counting the failures on a head cannot be done honestly.
   failed)
     fsha="${detail%%|*}"
     frest="${detail#*|}"
-    fnum="${frest%%|*}"
-    frest="${frest#*|}"
-    case "$fnum" in '' | *[!0-9]*) fnum=1 ;; esac
-    if [ "$fnum" -ge 2 ]; then
-      remedy="it has now failed $fnum times on THIS head, so another nudge is not the move:"
-      remedy="$remedy push a new head (an amend suffices, git commit --amend --no-edit && git push"
-      remedy="$remedy --force-with-lease) so the reviewer fetches an object its clone can resolve"
-    else
-      remedy="nudge it once with a '@codex review' comment (pr-review.sh comment"
-      remedy="$remedy $REPO#${PR_NUM:-<pr>} '@codex review'); if it fails again on this same head,"
-      remedy="$remedy push a new head instead (an amend suffices)"
-    fi
-    echo "reviewer FAILED at initialization on head $fsha — $remedy. The reviewer's clone is" \
-      "behind, not your push: the ref it could not fetch is one the PR and git ls-remote both" \
-      "serve. This is not a round — $frest, standing for $(fmt_age "$age")${conflict:+; $conflict}"
+    echo "reviewer FAILED at initialization on head $fsha — nudge it once with a '@codex review'" \
+      "comment (pr-review.sh comment $REPO#${PR_NUM:-<pr>} '@codex review'); if the SAME head" \
+      "fails again, push a new head instead (an amend suffices: git commit --amend --no-edit &&" \
+      "git push --force-with-lease), since the reviewer's clone is behind, not your push — the" \
+      "ref it could not fetch is one the PR and git ls-remote both serve. This is not a round —" \
+      "$frest, standing for $(fmt_age "$age")${conflict:+; $conflict}"
     ;;
   expected) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")${conflict:+; $conflict}" ;;
   # "The next move is yours" is exactly the line that sent #39 into seven untested rounds: on a

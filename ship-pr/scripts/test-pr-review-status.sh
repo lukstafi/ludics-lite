@@ -84,23 +84,6 @@ failure_comment() { # <id> <ref|-> <created_at>
   plain_comment "$1" "$3" "$(failure_body "$2")"
 }
 
-# A findings round delivered as a comment alone, naming the head it read — the shape this script
-# counts as a round in `review_rounds`, and one of the ways the reviewer gets through on a head.
-round_comment() { # <id> <sha> <created_at>
-  plain_comment "$1" "$3" "Codex Review: one finding on the lock, no lines attached.
-
-**Reviewed commit:** \`$2\`"
-}
-
-# The no-findings verdict as the connector sometimes delivers it: by EDITING the machine-tagged
-# running placeholder in place, so the body carries the tag and the verdict's time is its edit.
-placeholder_verdict() { # <id> <sha> <created_at> <updated_at>
-  jq -cn --argjson id "$1" --arg sha "$2" --arg at "$3" --arg up "$4" --arg rev "$REVIEWER" \
-    '{id:$id, user:{login:($rev + "[bot]")}, created_at:$at, updated_at:$up,
-      body:("<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\n" +
-            "Codex Review: Didn'"'"'t find any major issues.\n**Reviewed commit:** `" + $sha + "`")}'
-}
-
 compare_json() { # <behind> <ahead> <file>
   jq -cn --argjson behind "$1" --argjson ahead "$2" --arg f "$3" \
     '{behind_by:$behind, ahead_by:$ahead, merge_base_commit:{sha:"merge-base-sha"},
@@ -388,14 +371,11 @@ test_initialization_failure_is_its_own_state() {
   assert_contains "$LINE" "reviewer FAILED at initialization on head ${FAILED_HEAD:0:7} — " \
     "the line should name the state and the head it happened on"
   assert_contains "$LINE" "nudge it once with a '@codex review' comment" \
-    "the first failure on a head is worth one nudge"
-  assert_contains "$LINE" "pr-review.sh comment $REPO#" "the nudge should be a runnable command"
+    "the line should name the move that usually gets the reviewer through"
   assert_contains "$LINE" "clone is behind, not your push" \
     "the line should say whose side the failure is on, since the push looks guilty"
   assert_not_contains "$LINE" "review EXPECTED" \
     "the failure must not read as a round that has yet to start"
-  assert_not_contains "$LINE" "another nudge is not the move" \
-    "a first failure has not exhausted the nudge"
   run_cmd_status
   assert_eq "$CMD_RC" 0 "a state that was READ is exit 0, whatever it says"
   assert_contains "$CMD_OUT" "reviewer FAILED at initialization" "cmd_status should print it"
@@ -462,24 +442,24 @@ test_a_round_quoting_this_head_s_ref_error_is_not_a_failure() {
   assert_eq "$(state_tok "$STATE")" expected "the finding stands as a round"
 }
 
-test_a_second_failure_on_the_same_head_says_push_a_new_head() {
+# Both moves are on the line, in order, whatever the history: the nudge that usually works, and
+# the new head for when it does not. No count decides between them — a reaction-only success
+# leaves nothing to count from, and the re-request that fails clears the 👍 that was its only
+# trace (review of #82, round 6), so a script that claimed to know which case you are in would
+# be claiming more than the feeds can tell it.
+test_the_line_states_both_moves() {
   failed_fixture "$FAILED_HEAD"
+  run_status
+  assert_contains "$LINE" "nudge it once with a '@codex review' comment" "the first move"
+  assert_contains "$LINE" "if the SAME head fails again, push a new head instead" "the second"
+  assert_contains "$LINE" "pr-review.sh comment $REPO#" "the nudge should be runnable"
+  # A second failure on the same head does not change the line: it was already saying this.
   COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST"),$(
     failure_comment 101 "$FAILED_HEAD" 2026-09-01T00:03:00Z)]"
   run_status
-  assert_eq "$(state_tok "$STATE")" failed "a second failure is still a failure"
-  assert_contains "$LINE" "failed 2 times on THIS head" "the line should count the recurrence"
-  assert_contains "$LINE" "push a new head (an amend suffices" \
-    "a nudge that already failed is not the remedy twice"
-  assert_not_contains "$LINE" "nudge it once" "the exhausted remedy must not be re-offered"
-  # ocannl-staging#677's own shape: two failures, each naming its own head. For the head in hand
-  # that is the FIRST, and a nudge is what worked there.
-  COMMENTS_JSON="[$(failure_comment 100 "$OTHER_REF" "$PAST"),$(
-    failure_comment 101 "$FAILED_HEAD" 2026-09-01T00:03:00Z)]"
-  run_status
-  assert_contains "$LINE" "nudge it once" \
-    "a failure on the previous head is not a failure on this one"
-  assert_not_contains "$LINE" "failed 2 times" "the count is per head, not per PR"
+  assert_eq "$(state_tok "$STATE")" failed "still a failure"
+  assert_contains "$LINE" "if the SAME head fails again, push a new head instead" \
+    "the escalation is stated the same way, not counted into"
 }
 
 # The head moved on after the failure: a round is due on the NEW head, and that is `expected`.
@@ -572,59 +552,6 @@ test_watch_exits_on_the_initialization_failure() {
     "the context should name the state, not leave the caller to read the body"
 }
 
-# A nudge that worked once resets the count: the recurrence is only evidence that nudging has
-# STOPPED working, and telling the caller to amend over a review that succeeded would throw away
-# that review and the green checks under it.
-test_a_successful_review_resets_the_recurrence() {
-  failed_fixture "$FAILED_HEAD"
-  COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST"),$(
-    failure_comment 101 "$FAILED_HEAD" 2026-09-01T02:00:00Z)]"
-  REVIEWS_JSON="[$(review 5 "$FAILED_HEAD" 2026-09-01T01:00:00Z)]"
-  run_status
-  assert_eq "$(state_tok "$STATE")" failed "the newest word is still the failure"
-  assert_contains "$LINE" "nudge it once" \
-    "the failure before the successful review is not evidence about the nudge that worked"
-  assert_not_contains "$LINE" "failed 2 times" "a count across a success is not a recurrence"
-  # Without the review between them, the same two failures are a recurrence.
-  REVIEWS_JSON='[]'
-  run_status
-  assert_contains "$LINE" "failed 2 times on THIS head" "two failures and no success between them"
-  # A comment-only findings round naming this head is the reviewer getting through as much as a
-  # review is: this script counts one as a round, so it must reset the recurrence like one.
-  REVIEWS_JSON='[]'
-  COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST"),$(
-    round_comment 103 "$FAILED_HEAD" 2026-09-01T01:00:00Z),$(
-    failure_comment 101 "$FAILED_HEAD" 2026-09-01T02:00:00Z)]"
-  run_status
-  assert_eq "$(state_tok "$STATE")" failed "the failure is still the newest word"
-  assert_contains "$LINE" "nudge it once" \
-    "a round that arrived as a comment is a round the nudge got through"
-  assert_not_contains "$LINE" "failed 2 times" "so the failures either side of it are not a pair"
-  # And a verdict delivered by EDITING the running placeholder in place: machine-tagged, so the
-  # comment scan drops it, and dated by its edit — which is why this term is the verdict scan's
-  # rather than a second reading of the same feed.
-  REVIEWS_JSON='[]'
-  COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST"),$(
-    placeholder_verdict 104 "$FAILED_HEAD" 2026-08-31T23:00:00Z 2026-09-01T01:00:00Z),$(
-    failure_comment 101 "$FAILED_HEAD" 2026-09-01T02:00:00Z)]"
-  REACTIONS_JSON="[$(reaction eyes 2026-09-01T01:30:00Z)]"
-  run_status
-  assert_eq "$(state_tok "$STATE")" failed "the failure is newer than the 👀 that announced it"
-  assert_contains "$LINE" "nudge it once" \
-    "an edited placeholder carrying the verdict is the reviewer getting through"
-  REACTIONS_JSON='[]'
-  # A no-findings verdict for this head is a success too. The 👀 after it is the re-request that
-  # announced itself, which is what leaves the failure as the newest word (see below).
-  REVIEWS_JSON='[]'
-  COMMENTS_JSON="[$(failure_comment 100 "$FAILED_HEAD" "$PAST"),$(
-    verdict_comment 102 "$FAILED_HEAD" 2026-09-01T01:00:00Z),$(
-    failure_comment 101 "$FAILED_HEAD" 2026-09-01T02:00:00Z)]"
-  REACTIONS_JSON="[$(reaction eyes 2026-09-01T01:30:00Z)]"
-  run_status
-  assert_eq "$(state_tok "$STATE")" failed "the failure is newer than the 👀 that announced it"
-  assert_contains "$LINE" "nudge it once" "a verdict for this head is the reviewer getting through"
-}
-
 # The merge gate against a failure, both ways round — the deliberate part of the ranking. A round
 # that ANNOUNCED itself and then failed closes the gate; a re-request that never announced itself
 # does not withdraw the verdict this head already has, exactly as a 👍 would not be withdrawn.
@@ -664,13 +591,12 @@ tests=(
   test_a_failure_naming_no_ref_is_not_attributed
   test_a_differently_worded_failure_is_missed_not_guessed
   test_a_round_quoting_this_head_s_ref_error_is_not_a_failure
-  test_a_second_failure_on_the_same_head_says_push_a_new_head
+  test_the_line_states_both_moves
   test_a_failure_naming_another_head_is_expected
   test_a_round_of_the_head_after_the_failure_wins
   test_a_newer_reviewer_word_supersedes_the_failure
   test_a_quoted_failure_is_not_a_failure
   test_watch_exits_on_the_initialization_failure
-  test_a_successful_review_resets_the_recurrence
   test_a_standing_verdict_survives_a_failed_re_request
 )
 

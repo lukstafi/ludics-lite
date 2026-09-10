@@ -228,7 +228,10 @@ could not start (`failed`, below, which exits at once rather than holding the gr
 so and names the remedy: post a plain `@codex review` comment on the PR — `pr-review.sh comment
 <owner>/<repo>#<pr> '@codex review'` — which starts a round within one window. Do that rather than
 re-arming a fourth identical wait; see the state table below for why waiting cannot distinguish
-itself.
+itself. Read the remedy off the line rather than from this paragraph when the two differ: on
+`failed` the nudge is the first move and not the only one — if the SAME head fails to initialize
+again, the next move is a new head (an amend suffices), because the reviewer's clone is what is
+behind.
 
 Hand-rolling that query has produced seven false readings, all of which the script handles: app
 reviewers' logins carry a `[bot]` suffix so an exact-match filter never fires; your own replies
@@ -346,7 +349,7 @@ head SHA, and answers with one of seven:
 | `approved` | 👍 is on the PR | merge |
 | `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
 | `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
-| `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head: the round never ran | `@codex review` once; on a second failure for the same head, push a new head (an amend is enough) |
+| `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) |
 | `expected` | no live 👀, and no review of the head SHA: a round is due and has not started | wait out the grace, then `@codex review` |
 | `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push — or, at one of the loop's exits (below), close out and merge |
 | `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
@@ -359,9 +362,10 @@ after it — a round that started later is a round to wait out — and above `id
 which is what it used to read as: three `watch` windows recommending the grace for a round that
 had already ended. A failure naming a head you have since replaced is not it; that is `expected`
 again, correctly — and so is one that names no ref at all, which is attributed to no head. Nudge
-once, and if the same head fails twice, amend and push — the count is read off the PR and the
-line says which case you are in. The failed attempt is not a round, so
-it does not count against the convergence threshold.
+once, and if the same head fails again, amend and push; the line states both moves in order,
+because no feed records a reaction-only success reliably enough for the script to say which of
+the two you are due. The failed attempt is not a round, so it does not count against the
+convergence threshold.
 
 Every one of those lines also says **`CONFLICTS with the base (mergeable_state=dirty)`** when
 GitHub cannot build the PR's merge commit, and on `idle` that replaces "the next move is yours".
