@@ -611,7 +611,10 @@ cmd_poll() {
   # `commit_id` forward as the head advances for a comment whose lines still exist, so a previous
   # round's finding would stamp itself with the CURRENT head and pass any head test put to it.
   # `original_commit_id` is the commit the comment was written against — the reviewer's own view
-  # of the code — and it does not move.
+  # of the code — and it does not move. Nothing is lost if that ever proves too strict: every
+  # inline finding belongs to a review, poll re-reads each NEW review's own comments endpoint
+  # (see above), and the review row itself carries the head it was submitted against — so a round
+  # of the head is caught by its review even if none of its comments were.
   jq -r --arg rev "$REVIEWER" --argjson since "$m_inline" '
     def short: if (. // "") == "" then "-" else .[0:7] end;
     map(select((.user.login // "") | startswith($rev)) | select(.id > $since))
@@ -1383,6 +1386,12 @@ item_about_head() { # <stamp> <head sha>
 # the poll rendered is then about a head no newer than the one read, so an item can never be
 # matched to a head that replaced the one it was written against. The read is skipped when the
 # poll failed: there is nothing to classify, and an outage is not the moment to spend a call.
+#
+# It is a read of its own, not status_state's, and that is one extra call per round on top of the
+# eight or so a round already makes. Sharing one would mean sharing the FEED reads too — the two
+# read the same three feeds for different questions — and the ordering each depends on is what
+# makes both answers exact. A round of a watch is 90 seconds apart; the call is affordable and the
+# guarantee is not.
 watch_round() { # <pr> <watermark>
   local line commit next head_sha mstate head_err pr_created
   POLLED_OUT=$(cmd_poll "$1" "$2")
