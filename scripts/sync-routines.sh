@@ -142,19 +142,45 @@ prompt_problem() {
 # these trees are a checkout's tracked prompts and a scheduler's copies of them.
 publish_dir() {
   local src=$1 dst=$2
+  # The destination root itself may be a symlink -- a task directory left over from the symlink
+  # era, or a routine directory in this checkout that someone linked out. Following it would
+  # write through into the link's target and leave the link standing, so replace it.
+  if [ -L "$dst" ]; then
+    rm -f "$dst"
+  elif [ -e "$dst" ] && [ ! -d "$dst" ]; then
+    # ...or a plain file where a directory belongs.
+    rm -f "$dst"
+  fi
   mkdir -p "$dst"
-  # Directories first, so a file's parent exists when the file is staged.
+  # Directories first, so a file's parent exists when the file is staged. Anything of another
+  # kind standing in a directory's place goes: mkdir would fail on it, and a link would send the
+  # files below it out of the tree.
   find "$src" -type d -print | while IFS= read -r d; do
     rel=${d#"$src"}; rel=${rel#/}
     [ -n "$rel" ] || continue
+    if [ -L "$dst/$rel" ] || { [ -e "$dst/$rel" ] && [ ! -d "$dst/$rel" ]; }; then
+      rm -rf "$dst/$rel"
+    fi
     mkdir -p "$dst/$rel"
   done
   find "$src" -type f -print | while IFS= read -r f; do
     rel=${f#"$src"}; rel=${rel#/}
+    # A DIRECTORY standing where a file belongs is the one case rename(2) does not resolve:
+    # `mv -f file dir/` moves the file INTO it and the destination keeps the directory. That is
+    # true of a SYMLINK to a directory as well -- checked on macOS 15, where the link survived
+    # and the staged file landed in its target -- so the test is `-d`, which follows the link,
+    # and `rm -rf` on a link removes the link and not what it points at. A symlink to a FILE
+    # needs no such care: rename replaces the name, which is what turns a linked SKILL.md into a
+    # real one without a moment where the prompt is missing.
+    # >>> kind-guard: scripts/test-sync-routines.sh builds a copy of this script with the block
+    # between these two markers deleted, to show that publish_checked's post-condition below can
+    # actually fail. Keep the markers if the guard moves.
+    if [ -d "$dst/$rel" ]; then
+      rm -rf "$dst/$rel"
+    fi
+    # <<< kind-guard
     tmp="$dst/$(dirname "$rel")/.sync-$$-$(basename "$rel")"
     cp "$f" "$tmp"
-    # Over a symlink too: rename(2) replaces the NAME, so a linked SKILL.md becomes a real file
-    # rather than being written through.
     mv -f "$tmp" "$dst/$rel"
   done
   # Then what src no longer has. Files and links (`! -type d` catches both -- find does not
@@ -169,6 +195,20 @@ publish_dir() {
     [ -n "$rel" ] || continue
     [ -d "$src/$rel" ] || rmdir "$d" 2>/dev/null || true
   done
+}
+
+# publish_checked <src> <dst>: publish, then READ THE RESULT. A publish that reported success
+# over a destination that is still not a usable prompt is the same false verdict this script
+# exists to remove from the install step; the post-condition is what makes "republished" mean
+# something rather than "the commands were issued".
+publish_checked() {
+  local src=$1 dst=$2 left
+  publish_dir "$src" "$dst"
+  if left=$(prompt_problem "$dst"); then
+    warn "sync-routines: after publishing, $dst still $left"
+    return 1
+  fi
+  return 0
 }
 
 drift=0      # status only: the checkout and the installed copies disagree
@@ -214,17 +254,35 @@ for r in $LOCAL_ROUTINES; do
     continue
   fi
 
+  # THE SOURCE COMES FIRST, before any branch that might publish it. A push that installs an
+  # unusable prompt -- a half-finished local edit with SKILL.md deleted, say -- and then reports
+  # success is the false verdict this script exists to remove, and the destination branches below
+  # (symlinked, missing, unusable) all publish. `pull` is the exception in the other direction:
+  # a broken checkout prompt is what a pull REPAIRS, so it reads on.
+  if src_problem=$(prompt_problem "$src"); then
+    warn "$r: $src $src_problem"
+    case "$mode" in
+      pull) : ;;
+      push)
+        warn "$r: refusing to install it -- fix the prompt in this checkout first"
+        problems=1
+        continue
+        ;;
+      *) drift=1 ;;
+    esac
+  fi
+
   if [ -L "$dst" ]; then
     warn "$r: installed as a SYMLINK ($(readlink "$dst")) -- the scheduler cannot read it"
     case "$mode" in
       push)
         if $dry_run; then
           say "$r: would replace the symlink with a real directory"
-        else
-          rm -f "$dst"
-          publish_dir "$src" "$dst"
+        elif publish_checked "$src" "$dst"; then
           say "$r: symlink replaced with a real copy"
           copied=$((copied + 1))
+        else
+          problems=1
         fi
         ;;
       pull)
@@ -247,12 +305,13 @@ for r in $LOCAL_ROUTINES; do
       push)
         if $dry_run; then
           say "$r: would install $src -> $dst"
-        else
-          publish_dir "$src" "$dst"
+        elif publish_checked "$src" "$dst"; then
           say "$r: prompt installed at $dst"
           say "$r: if the desktop app does not list this task, register it -- a prompt no registry"
           say "$r: entry names never fires, and this script cannot see the registry either way"
           copied=$((copied + 1))
+        else
+          problems=1
         fi
         ;;
       pull)
@@ -264,22 +323,9 @@ for r in $LOCAL_ROUTINES; do
     continue
   fi
 
-  # Both sides exist. Either can still be a directory that is not a usable prompt, and the
-  # comparison below would not notice: `diff -r` follows a symlink, and it says nothing at all
-  # about a SKILL.md that is missing from both sides.
-  if src_problem=$(prompt_problem "$src"); then
-    warn "$r: $src $src_problem"
-    case "$mode" in
-      pull) : ;;  # pulling is what repairs the checkout; let it run
-      push)
-        warn "$r: refusing to install it -- fix the prompt in this checkout first"
-        problems=1
-        continue
-        ;;
-      *) drift=1; continue ;;
-    esac
-  fi
-
+  # Both sides exist. The installed one can still be a directory that is not a usable prompt, and
+  # the comparison below would not notice: `diff -r` FOLLOWS a symlink, so a linked SKILL.md
+  # reads as identical, and a missing SKILL.md is not a difference if neither side has one.
   if dst_problem=$(prompt_problem "$dst"); then
     warn "$r: the installed prompt at $dst $dst_problem"
     case "$mode" in
@@ -288,10 +334,11 @@ for r in $LOCAL_ROUTINES; do
         # would have said.
         if $dry_run; then
           say "$r: would republish $src -> $dst"
-        else
-          publish_dir "$src" "$dst"
+        elif publish_checked "$src" "$dst"; then
           say "$r: republished to $dst"
           copied=$((copied + 1))
+        else
+          problems=1
         fi
         ;;
       pull)
@@ -303,7 +350,13 @@ for r in $LOCAL_ROUTINES; do
     continue
   fi
 
-  if diff -r -q "$src" "$dst" >/dev/null 2>&1; then
+  # The comparison is on diff's OUTPUT, not on its exit code. `diff -r -q` reports a path that is
+  # a directory on one side and a regular file on the other by printing the mismatch and exiting
+  # 0 (checked on macOS 15), so an exit-code test calls those trees identical -- a silent
+  # "in sync" over a destination the scheduler cannot use. Anything diff has to say, including a
+  # complaint on stderr, is drift.
+  diff_report=$(diff -r -q "$src" "$dst" 2>&1) || true
+  if [ -z "$diff_report" ]; then
     if [ "$mode" = status ]; then say "$r: in sync"; fi
     continue
   fi
@@ -311,25 +364,27 @@ for r in $LOCAL_ROUTINES; do
   case "$mode" in
     status)
       say "$r: DRIFT"
-      diff -r -u "$src" "$dst" | sed 's/^/    /' || true
+      diff -r -u "$src" "$dst" 2>&1 | sed 's/^/    /' || true
       drift=1
       ;;
     push)
       if $dry_run; then
         say "$r: would push $src -> $dst"
-      else
-        publish_dir "$src" "$dst"
+      elif publish_checked "$src" "$dst"; then
         say "$r: pushed to $dst"
         copied=$((copied + 1))
+      else
+        problems=1
       fi
       ;;
     pull)
       if $dry_run; then
         say "$r: would pull $dst -> $src"
-      else
-        publish_dir "$dst" "$src"
+      elif publish_checked "$dst" "$src"; then
         say "$r: pulled into $src -- review it with git diff"
         copied=$((copied + 1))
+      else
+        problems=1
       fi
       ;;
   esac

@@ -16,7 +16,14 @@
 #     inside it, or no SKILL.md -- is refused rather than certified in sync or pulled over the
 #     checkout, in both directions;
 #   - that a push never leaves the installed prompt absent or half-written, sampled by a reader
-#     running flat out across one, with a control that the reader can report an absence;
+#     running flat out across a series of them, with a control that the reader can report an
+#     absence;
+#   - that publishing REPLACES what stands in its way rather than following or entering it -- a
+#     linked directory at either end, a directory where SKILL.md belongs, a file where a
+#     directory belongs -- and reads its own result, so "republished" is not a claim about the
+#     commands issued;
+#   - that the checkout side is validated BEFORE any branch that would publish it, the
+#     not-installed and symlinked-installation branches included;
 #   - that two modes in one invocation are a usage error, since push and pull write in opposite
 #     directions and the last token used to win;
 #   - that --dry-run copies nothing, in every mode, and still says what it would do;
@@ -397,7 +404,7 @@ while [ "$i" -lt 12 ]; do
 done
 : > "$TMP/reader.stop"
 wait "$watcher" 2>/dev/null
-samples=$(grep -c . "$watcher_log" 2>/dev/null || echo 0)
+samples=$(grep -c . "$watcher_log" 2>/dev/null) || true  # grep -c exits 1 on zero matches
 [ "${samples:-0}" -gt 20 ] \
   && ok "the reader sampled the installed prompt $samples times across 12 pushes" \
   || ko "only ${samples:-0} samples taken -- too few for the absence check below to mean anything"
@@ -432,6 +439,163 @@ expect "push prunes a file the checkout no longer has" 0 "pushed to" -- run_sync
   && ok "...removing it" || ko "leftover.md survived the push"
 [ -f "$TMP/installed/$R1/SKILL.md" ] \
   && ok "...while the prompt itself stays" || ko "the push pruned SKILL.md too"
+
+# --- publishing replaces what stands in its way, and reads its own result ------------------------
+# Every branch that publishes had a way to "succeed" over a destination that was still not a
+# usable prompt. `mkdir -p` follows a link; `mv -f file dir/` moves the file INTO the directory
+# instead of replacing it; and nothing read the result afterwards.
+
+# The P1 shape: pull repairing a checkout whose routine directory is a LINK out of the tree.
+reset_trees; install_all
+printf 'body v2 -- the installed edit to recover\n' >> "$TMP/installed/$R1/SKILL.md"
+mkdir -p "$TMP/outside"
+printf 'external content nobody asked to change\n' > "$TMP/outside/SKILL.md"
+rm -rf "$REPO/routines/$R1"
+ln -s "$TMP/outside" "$REPO/routines/$R1"
+expect "pull replaces a symlinked checkout routine instead of writing through it" 0 "pulled into" -- \
+  run_sync pull
+[ -d "$REPO/routines/$R1" ] && [ ! -L "$REPO/routines/$R1" ] \
+  && ok "...leaving a real directory in the checkout" \
+  || ko "$REPO/routines/$R1 is still a symlink after pull"
+grep -q 'external content nobody asked to change' "$TMP/outside/SKILL.md" \
+  && ok "...and the link's target is untouched" \
+  || ko "pull wrote through the link into $TMP/outside: $(cat "$TMP/outside/SKILL.md")"
+grep -q 'the installed edit to recover' "$REPO/routines/$R1/SKILL.md" \
+  && ok "...while the installed edit did land in the checkout" || ko "the pull took nothing"
+
+# The same for push onto a destination whose routine directory is a link -- covered above by the
+# symlink-installation case, and here through publish_dir's own guard, with the target checked.
+reset_trees; install_all
+mkdir -p "$TMP/outside2"
+printf 'external\n' > "$TMP/outside2/SKILL.md"
+rm -rf "$TMP/installed/$R1"
+ln -s "$TMP/outside2" "$TMP/installed/$R1"
+expect "push replaces a symlinked installation without writing through it" 0 "symlink replaced" -- \
+  run_sync push
+grep -q '^external$' "$TMP/outside2/SKILL.md" \
+  && ok "...leaving the link's target untouched" \
+  || ko "push wrote through the link into $TMP/outside2: $(cat "$TMP/outside2/SKILL.md")"
+
+# A DIRECTORY standing where SKILL.md belongs: `mv -f` would move the staged file inside it.
+reset_trees; install_all
+rm -f "$TMP/installed/$R1/SKILL.md"
+mkdir -p "$TMP/installed/$R1/SKILL.md"
+printf 'junk\n' > "$TMP/installed/$R1/SKILL.md/inner.txt"
+expect "push replaces a directory standing where SKILL.md belongs" 0 "republished to" -- run_sync push
+[ -f "$TMP/installed/$R1/SKILL.md" ] \
+  && ok "...with a regular file" \
+  || ko "$TMP/installed/$R1/SKILL.md is still not a regular file: $(ls -ld "$TMP/installed/$R1/SKILL.md" 2>&1)"
+expect "...so the next status is clean" 0 "all local routines in sync" -- run_sync
+
+# And the other way round: a FILE standing where a directory belongs.
+reset_trees
+mkdir -p "$REPO/routines/$R1/refs"
+printf 'ref\n' > "$REPO/routines/$R1/refs/note.md"
+install_all
+rm -rf "$TMP/installed/$R1/refs"
+printf 'not a directory\n' > "$TMP/installed/$R1/refs"
+# `diff -r -q` PRINTS this mismatch and exits 0, so the drift test reads its output, not its
+# status; an exit-code test called these trees identical.
+expect "status calls a directory-versus-file mismatch drift" 1 "$R1: DRIFT" -- run_sync
+expect "push replaces a file standing where a directory belongs" 0 "pushed to" -- run_sync push
+[ -f "$TMP/installed/$R1/refs/note.md" ] \
+  && ok "...creating the directory below it" || ko "refs/note.md was not published"
+
+# A symlink TO A DIRECTORY at SKILL.md's name: `mv -f` follows it too (checked on macOS 15 --
+# the link survived and the staged file landed in its target), so the guard tests -d, which
+# follows the link, rather than "is not a link".
+reset_trees; install_all
+mkdir -p "$TMP/linktarget"
+rm -f "$TMP/installed/$R1/SKILL.md"
+ln -s "$TMP/linktarget" "$TMP/installed/$R1/SKILL.md"
+expect "push replaces a link-to-a-directory standing at SKILL.md" 0 "republished to" -- run_sync push
+[ -f "$TMP/installed/$R1/SKILL.md" ] && [ ! -L "$TMP/installed/$R1/SKILL.md" ] \
+  && ok "...with a regular file" || ko "SKILL.md is still a link after push"
+[ -z "$(ls -A "$TMP/linktarget")" ] \
+  && ok "...and nothing was written through it into the link's target" \
+  || ko "push wrote into $TMP/linktarget: $(ls -A "$TMP/linktarget")"
+
+# --- publish_checked reads its own result, and that reading can fail -----------------------------
+# The post-condition is the guard on the guard: with every case above passing, no publish reaches
+# it, and a claim that cannot fail is worth nothing. So build a copy of the script with the
+# file-kind guard deleted -- the defect the round-4 review found -- and require the post-condition
+# to catch it. Nothing here weakens the real script; it is the control that gives the real
+# script's "republished" line its meaning.
+BROKEN="$TMP/broken"
+mkdir -p "$BROKEN/scripts"
+awk '/^ *# >>> kind-guard/ { skip = 1 } !skip { print } /^ *# <<< kind-guard/ { skip = 0 }' \
+  "$SYNC" > "$BROKEN/scripts/sync-routines.sh"
+chmod +x "$BROKEN/scripts/sync-routines.sh"
+# `grep -c` PRINTS 0 and EXITS 1 when nothing matches, so `|| echo 0` would append a second
+# zero and every arithmetic test below would error out.
+marks=$(grep -c 'kind-guard' "$SYNC" 2>/dev/null) || true
+stripped=$(grep -c 'kind-guard' "$BROKEN/scripts/sync-routines.sh" 2>/dev/null) || true
+orig_lines=$(wc -l < "$SYNC" | tr -d ' ')
+strip_lines=$(wc -l < "$BROKEN/scripts/sync-routines.sh" | tr -d ' ')
+shrank=$((orig_lines - strip_lines))
+if [ "$marks" -eq 2 ] && [ "$stripped" -eq 0 ] && [ "$shrank" -ge 3 ]; then
+  ok "a copy of the script without the file-kind guard was built ($shrank lines removed)"
+else
+  ko "the kind-guard markers are not both in $SYNC, or the strip removed nothing (marks=$marks stripped=$stripped shrank=$shrank) -- the control below proves nothing"
+fi
+cp -R "$REPO/routines" "$BROKEN/routines"
+rm -rf "$TMP/broken-installed"
+mkdir -p "$TMP/broken-installed"
+for r in $LOCAL_ROUTINES; do cp -R "$BROKEN/routines/$r" "$TMP/broken-installed/$r"; done
+rm -f "$TMP/broken-installed/$R1/SKILL.md"
+mkdir -p "$TMP/broken-installed/$R1/SKILL.md"
+out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/broken-installed" "$BROKEN/scripts/sync-routines.sh" push 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'after publishing'; then
+  ok "the post-condition catches a publish that left the destination unusable"
+else
+  ko "the guard-less copy reported rc=$rc without the post-condition firing -- $out"
+fi
+printf '%s' "$out" | grep -q "$R1: republished to" \
+  && ko "it still printed 'republished' for a routine it did not republish -- $out" \
+  || ok "...and does not call it republished"
+# The control on the control: the same guard-less copy over a destination with nothing in the way
+# publishes cleanly, so the failure above is the missing guard and not the copy itself.
+rm -rf "$TMP/broken-installed"
+mkdir -p "$TMP/broken-installed"
+for r in $LOCAL_ROUTINES; do cp -R "$BROKEN/routines/$r" "$TMP/broken-installed/$r"; done
+printf 'body v2\n' >> "$BROKEN/routines/$R1/SKILL.md"
+out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/broken-installed" "$BROKEN/scripts/sync-routines.sh" push 2>&1); rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'pushed to' \
+  && ok "...while the same copy publishes cleanly with nothing in the way" \
+  || ko "the guard-less copy fails even a plain push (rc=$rc) -- the control above is not about the guard: $out"
+
+# The post-condition itself: a publish that leaves an unusable destination must not report success.
+# Negative control by construction -- the same publish over a source that IS usable succeeds.
+reset_trees; install_all
+rm -f "$REPO/routines/$R1/SKILL.md"
+printf 'not a prompt\n' > "$REPO/routines/$R1/notes.md"
+expect "push refuses a checkout prompt with no SKILL.md before publishing anything" 1 \
+  "refusing to install it" -- run_sync push
+grep -q 'body v1' "$TMP/installed/$R1/SKILL.md" \
+  && ok "...leaving the installed prompt intact" || ko "the refused push damaged the installation"
+
+# The ordering the source check needed: the not-installed branch used to publish before it ran.
+reset_trees
+rm -rf "$TMP/installed/$R1"
+rm -f "$REPO/routines/$R1/SKILL.md"
+expect "push over a MISSING installation validates the checkout first" 1 "refusing to install it" -- \
+  run_sync push
+[ ! -e "$TMP/installed/$R1" ] \
+  && ok "...installing nothing unusable" || ko "an unusable prompt was installed at $TMP/installed/$R1"
+printf '%s' "$out" | grep -q "$R1: prompt installed" \
+  && ko "it reported the broken routine as installed -- $out" \
+  || ok "...and did not report it installed"
+
+# Same ordering through the symlinked-installation branch, which also publishes.
+reset_trees
+rm -rf "$TMP/installed/$R1"
+ln -s "$REPO/routines/$R1" "$TMP/installed/$R1"
+rm -f "$REPO/routines/$R1/SKILL.md"
+expect "push over a SYMLINKED installation validates the checkout first" 1 "refusing to install it" -- \
+  run_sync push
+[ -L "$TMP/installed/$R1" ] \
+  && ok "...leaving the symlink rather than replacing it with an unusable copy" \
+  || ko "the symlink was replaced by a prompt with no SKILL.md"
 
 # --- one mode per invocation ---------------------------------------------------------------------
 # `pull push` used to run a push, overwriting the installed edits the caller asked to recover.

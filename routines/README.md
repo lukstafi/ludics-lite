@@ -62,7 +62,8 @@ writing through it. It also refuses to `pull` from an installed directory with n
 that is a leftover, not a routine, and taking it would delete the tracked prompt here. `push`
 publishes file by file, staging each inside the destination and renaming it onto its final name,
 so a dispatch that lands mid-push always finds a whole prompt: never a missing one, never a
-half-written one.
+half-written one. It replaces whatever stands in a file's way rather than following or entering it,
+and reads the result before reporting a routine published.
 
 The script only touches the rows above whose Kind is `local scheduled task`, never the cloud
 routine below, and its `LOCAL_ROUTINES` list is exactly those rows -- pinned by

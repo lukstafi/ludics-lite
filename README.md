@@ -222,10 +222,16 @@ through it, and that a destination reached through a link at any component *abov
 directory is refused too: a symlinked `~/.claude` leaves every task directory real and the whole
 tree unreadable. It pins that a directory which exists and is
 still not a usable prompt — a link anywhere inside it, or no `SKILL.md` — is refused rather than
-certified in sync or pulled over the checkout; that a push never leaves the installed prompt
-absent or half-written, sampled by a reader running flat out across twelve of them, with a control
-that the reader can report an absence; that two modes in one invocation are a usage error, since
-`push` and `pull` write in opposite directions and the last token used to win. It pins that
+certified in sync or pulled over the checkout, in both directions and before any branch that
+would publish it; that publishing replaces what stands in its way rather than following or
+entering it (a linked directory at either end, a directory or a link to one where `SKILL.md`
+belongs, a file where a directory belongs), and reads its own result afterwards, so "republished"
+is not a claim about the commands issued — a copy of the script with that guard deleted has to
+fail the post-condition, which is what makes the post-condition worth having; that a push never
+leaves the installed prompt absent or half-written, sampled by a reader running flat out across
+twelve of them, with a control that the reader can report an absence; and that two modes in one
+invocation are a usage error, since `push` and `pull` write in opposite directions and the last
+token used to win. It pins that
 `--dry-run` copies nothing in any mode, the usage exits, and that nothing infers a registration
 state from a missing prompt directory — the registry is the desktop
 app's and unreadable here, so `push` says to check the task list rather than reporting what is in
