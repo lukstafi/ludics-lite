@@ -457,10 +457,17 @@ ludics-lite#39 (2026-09-04) a sibling landed on `main` during round 6, and round
 findings, "the next move is yours", and no CI at all, over eight pushes and 80 minutes; one of
 them landed a broken test suite, and two of them built machinery the sibling had already
 superseded. The first thing that noticed was `merge`. When the line says CONFLICTS, the next
-move is `git merge origin/<base>`, resolve, push — before addressing anything else. GitHub
-recomputes the mergeability after every push, so for the seconds it reports `unknown` the line
-says so as **not yet computed** — a conflict the push just caused would not show yet — and, unlike
-`dirty`, that caveat rides alongside "the next move is yours" rather than replacing it.
+move is `git merge origin/<base>`, resolve, push — before addressing anything else. Commit and
+push that merge on its own *before* writing the round's fixes, because a merge left uncommitted
+absorbs whatever you edit next: on ludics-lite#102 (2026-09-10) the resolved merge sat
+uncommitted while the round's fixes were written on top of it, and one `git add -A && git
+commit` swept both in, so the round's commit — the one that names its findings and their
+severity — hid inside a merge commit, where `git show` renders it against two parents instead of
+as its own readable diff, and had to be recovered by resetting to the pre-merge SHA and redoing
+the merge alone. GitHub recomputes the mergeability after every push, so for the seconds it
+reports `unknown` the line says so as **not yet computed** — a conflict the push just caused would
+not show yet — and, unlike `dirty`, that caveat rides alongside "the next move is yours" rather
+than replacing it.
 
 Two comparisons carry that, and both are easy to get wrong by hand. Whether the reviewer has *seen*
 the head is a SHA equality (each review records the `commit_id` it was submitted against), never a
