@@ -1803,11 +1803,12 @@ run_red_is_advisory_only() {
 
 run_signal() {
   local sha="$1" pr_at="${2:-}" checks="${3:-0}" raw rc rid wid event name status concl
-  local seen_ids=" " red_rows="" rname rconcl
+  local seen_ids=" " red_rows="" rname rconcl created
   local runs=0 inflight=0 nogo=0 red=0 red_note="" pushed_at age pr_age t seen
   raw=$(gh_retry read api --paginate \
     "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
-    --jq '.workflow_runs[] | [((.id // 0) | tostring), ((.workflow_id // 0) | tostring),
+    --jq '.workflow_runs[] | [(.created_at // "-"), ((.id // 0) | tostring),
+          ((.workflow_id // 0) | tostring),
           (.event // "-"), (.name // "-"), (.status // "unknown"), (.conclusion // "pending")]
           | @tsv')
   rc=$?
@@ -1815,13 +1816,26 @@ run_signal() {
     run_reason 0 "the workflow runs for this head could not be read ($(gh_err_line))"
     return 3
   }
+  # The rows are ORDERED HERE, not taken as the feed served them. The feed does come back
+  # newest-first by `created_at` — a belief the contract still pins, since cmd_base's fold does
+  # rely on it — but rows created in the SAME SECOND have no order the API documents or the
+  # fixtures could encode, and the fold below keeps whichever of them it sees first. Two runs of
+  # one workflow-and-event key a second apart is a re-run or a double dispatch, and which one is
+  # "the newest" then decided the gate's verdict by luck. Sorting on (created_at desc, id desc)
+  # settles it: the later second still wins, and a tie inside a second goes to the higher run id,
+  # which is the later allocation. This is a total order over the rows, so the fold's answer no
+  # longer depends on the feed's order at all — and it spans the pages, which a sort inside the
+  # `--jq` filter would not (gh applies that filter per page). A row whose `created_at` moved or
+  # vanished sorts LAST ("-" is below every digit), so a shape drift loses to a well-formed row
+  # rather than silently winning the key.
+  raw=$(LC_ALL=C sort -t$'\t' -k1,1r -k2,2nr <<<"$raw")
   # One row per INVOCATION, the newest — the same `filter=latest` semantics build_checks asks the
   # check API for, and for the same reason: a head can carry several runs of one workflow (a
   # queued invocation cancelled, then a fresh one that passed), and the superseded row's
   # conclusion is not the current answer. Without this an old cancelled row parks the gate at 4
   # forever and an old checkless failure holds it RED over a workflow that has since gone green
-  # (ludics-lite#38, round 3). The feed is newest-first, which is what cmd_base's fold relies on
-  # too, so the first row seen for a key is the one that counts.
+  # (ludics-lite#38, round 3). After the sort above, the first row seen for a key is the one that
+  # counts.
   #
   # The key is workflow id AND event, not the workflow id alone. The id is there because two
   # workflow FILES can share a display name and a name-keyed fold would collapse them; the event
@@ -1837,7 +1851,9 @@ run_signal() {
   # what reconciles round 3's ask (a cancelled predecessor must not park the gate) with round 5's
   # (a queued sibling must not hide behind a finished one) without an identity the API does not
   # give: unfinished work is always work, and only finished rows compete to be the answer.
-  while IFS=$'\t' read -r rid wid event name status concl; do
+  # `created` is read to consume the sort key's column and nothing else: the ordering above is
+  # the only thing this projection needs a timestamp for.
+  while IFS=$'\t' read -r created rid wid event name status concl; do
     [ -n "$rid" ] || continue
     is_advisory "$name" && continue
     # A run reported `completed` before its conclusion is populated is not judged either: the

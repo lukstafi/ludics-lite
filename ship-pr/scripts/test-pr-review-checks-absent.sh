@@ -30,12 +30,20 @@ FAIL_ENDPOINT=""
 check_runs_json() { jq -cn --argjson runs "$1" '{check_runs:$runs}'; }
 # Each row gets a distinct workflow_id unless the case names one, because the gate folds the run
 # list per workflow and a shared id means "these are the same workflow's runs" — which is what the
-# superseded-run cases below say deliberately. Rows are newest-first, as the API returns them.
+# superseded-run cases below say deliberately. Rows are newest-first, as the API returns them, and
+# the default `created_at` says so too: one second earlier per row down the list, so the order and
+# the timestamps agree. The gate sorts on (created_at desc, id desc), so a case meaning "these two
+# were created in the SAME second" has to name `created_at` on both rows — which is what the tie
+# case does. Note that the default ids ASCEND down the list while the times descend: the newest
+# row carries the LOWEST id, so a fold that sorted by id alone would invert every superseded-run
+# case below (test_newest_run_of_a_workflow_still_counts is where that shows).
+RUNS_EPOCH=1767225600 # 2026-01-01T00:00:00Z, a fixed clock: nothing here measures a run's age
 runs_json() {
-  jq -cn --argjson runs "$1" \
+  jq -cn --argjson runs "$1" --argjson t0 "$RUNS_EPOCH" \
     '{workflow_runs: [$runs | to_entries[] | .value + {
         id: (.value.id // (.key + 101)),
         workflow_id: (.value.workflow_id // (.key + 1)),
+        created_at: (.value.created_at // (($t0 - .key) | todateiso8601)),
         event: (.value.event // "push")}]}'
 }
 jobs_json() { jq -cn --argjson jobs "$1" '{jobs:$jobs}'; }
@@ -373,6 +381,34 @@ test_newest_run_of_a_workflow_still_counts() {
   assert_contains "$GATE_OUTPUT" "ci (failure)" "the newest row should be the one classified"
 }
 
+# ludics-lite#70: two runs of ONE workflow-and-event key created in the SAME second. Their order
+# in the feed is documented nowhere and no fixture could encode it, so the fold does not take it:
+# it sorts on (created_at desc, id desc), and the tie goes to the higher run id — the later
+# allocation. Both orientations are here and they disagree about the verdict, which is what makes
+# the claim able to fail: a fold that kept the feed's first row would answer each of them the
+# wrong way round, and one that simply dropped a red twin would answer the second one wrong.
+test_same_second_tie_prefers_the_higher_run_id() {
+  local same=2026-01-01T00:00:00Z
+  reset_fixture
+  RUNS_SEQ=("$(runs_json "$(jq -cn --arg t "$same" '[
+    {id:101, workflow_id:7, created_at:$t, name:"ci", status:"completed", conclusion:"failure"},
+    {id:202, workflow_id:7, created_at:$t, name:"ci", status:"completed", conclusion:"success"}]')")")
+  run_gate
+  assert_eq "$GATE_RC" 0 "the higher run id wins the tie, so the lower-id failure is superseded"
+  assert_not_contains "$GATE_OUTPUT" ": RED" "the lower-id row must not be the one classified"
+  assert_contains "$GATE_OUTPUT" "1 workflow run(s) for this head finished" \
+    "the tied rows should fold to one run, not two"
+  # The control, and the reason this is not just "a red twin is always dropped": with the ids the
+  # other way up — the feed order unchanged — the winner is the red one, and the gate must say so.
+  reset_fixture
+  RUNS_SEQ=("$(runs_json "$(jq -cn --arg t "$same" '[
+    {id:101, workflow_id:7, created_at:$t, name:"ci", status:"completed", conclusion:"success"},
+    {id:202, workflow_id:7, created_at:$t, name:"ci", status:"completed", conclusion:"failure"}]')")")
+  run_gate
+  assert_eq "$GATE_RC" 1 "the higher run id wins the tie the other way up too"
+  assert_contains "$GATE_OUTPUT" "ci (failure)" "the higher-id row should be the one classified"
+}
+
 # Round 3, P2: a committer date in the future (clock skew, an explicit GIT_COMMITTER_DATE) is the
 # newest timestamp there is, and its age is unreadable. The PR clock must still decide.
 test_future_commit_date_falls_back_to_the_pr_clock() {
@@ -628,6 +664,7 @@ tests=(
   test_superseded_stopped_run_does_not_hold
   test_superseded_red_run_does_not_stay_red
   test_newest_run_of_a_workflow_still_counts
+  test_same_second_tie_prefers_the_higher_run_id
   test_future_commit_date_falls_back_to_the_pr_clock
   test_future_commit_date_still_holds_a_fresh_pr
   test_two_events_of_one_workflow_are_two_runs
