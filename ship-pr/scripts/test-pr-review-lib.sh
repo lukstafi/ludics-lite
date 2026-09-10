@@ -17,7 +17,12 @@
 #                                       function itself uses, which it refuses), removed at exit —
 #                                       this file owns the EXIT trap (pr-review.sh installs one of
 #                                       its own when sourced, which the suites used to re-install
-#                                       by hand), so a suite never touches `trap`
+#                                       by hand), so a suite never touches `trap`. <label> is
+#                                       interpolated into the created directory's NAME, so a case
+#                                       that must prove something about a spaced path just asks
+#                                       for one — test_the_guard_survives_a_path_with_spaces
+#                                       hand-rolled its own mktemp and TEST_CLEANUP entry believing
+#                                       it could not ask (ludics-lite#106, undone in #122)
 #   gh_fixture_parse "$@"               inside a fixture `gh`: refuses anything but `gh api`, any
 #   gh_fixture_answer <response>        option outside gh api's own table (below), and any
 #                                       endpoint that is neither `graphql` nor a REST path with a
