@@ -264,7 +264,10 @@ filed on, grouping by body finds zero duplicates among 51 findings while groupin
 finds the four the issue counted). A different place — line, path, commit, position, a `side` or
 `start_line` nobody enumerated, or a field this script has never heard of — stays a separate
 entry, each difference with its own case, because a fold that collapsed unrelated findings would
-pass every other case here. Every verdict that
+pass every other case here. The anchor is rendered as the field the feed actually served — a line
+number, else the diff `position` as `@12`, else `?` — so a row from the per-review endpoint, which
+carries no line at all, no longer prints the unknown place as `:0` and no longer reads like two
+findings at one line. Every verdict that
 says nothing came polls once more first, and re-reads the state behind that poll: a 👍 landing in
 the same gap is reported as the approval it is rather than answered with the nudge that would
 clear it, a state that moved otherwise makes the window quiet, and a read that did not answer

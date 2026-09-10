@@ -641,8 +641,8 @@ mark_of() {
 # next one. Two of these were found the expensive way, one per round: the per-review comments
 # endpoint (the one poll re-reads when the flat feed lags a new review) serves rows with NO `line`
 # and no `original_line` at all, carrying `position`/`original_position` instead — every such row
-# renders `:0`, so an enumerating key collapsed two findings in one file (#86 round 1) — and
-# `side`/`start_line` do the same for a LEFT-vs-RIGHT or multi-line anchor (#86 round 2).
+# renders `:@<position>`, so an enumerating key collapsed two findings in one file (#86 round 1)
+# — and `side`/`start_line` do the same for a LEFT-vs-RIGHT or multi-line anchor (#86 round 2).
 #
 # `pull_request_review_id` is in the deny-list for a measured reason, not a tidy one: the reviewer
 # posts a separate COMMENTED review per inline comment (46 comments over 36 reviews on #39), so
@@ -660,7 +660,17 @@ POLL_ITEM_DEFS='
   def inline_commit: (.original_commit_id // .commit_id) | short;
   def review_commit: .commit_id | short;
   def item_path: .path // "?";
-  def item_line: .line // .original_line // 0;
+  # A row from the per-review comments endpoint (what poll reads while the flat feed lags a new
+  # review) carries no `line` and no `original_line` at all, only `position`/`original_position`.
+  # Rendering that as `0` printed an unknown location in the shape of a known one, and two rows
+  # at different places in one file read as the same place — which is what hid the collapse in
+  # round 1 of #86 from the eye. An unknown line says so (`?`), and a position says which field it is
+  # (`@12`), so nothing downstream reads a location that was never served as a line number.
+  def item_line: (.line // .original_line) as $l
+    | if $l != null then ($l | tostring)
+      else ((.position // .original_position) as $p
+            | if $p != null then "@\($p)" else "?" end)
+      end;
   def fold_key: del(.id, .node_id, .url, .html_url, .pull_request_url, .pull_request_review_id,
                     .created_at, .updated_at, .reactions, ._links, .body);
   def fold_inline:
@@ -2975,6 +2985,14 @@ esac
 # second catches one cut between hunks, where every retained hunk is complete and only the count
 # says a later one is missing. Either shortfall yields null like a missing patch — unread, never
 # disjoint (Codex P2s on #63).
+# The header is matched ONCE — `[capture(...)] | first`, bound and tested for null — and never as
+# a `test` guarding a second, near-identical `capture`. A capture that does not match yields NO
+# output rather than null, and a zero-output sub-expression inside this reduce takes the whole
+# accumulator with it: the fold's result is null, so every hunk of that file, including the ones
+# already read, vanishes and the path reads as "hunks unread" — the split above would then report
+# what an unread patch reports for a patch it in fact read. Two patterns that must agree on every
+# `@@` shape are a standing invitation to that drift; #84 fixed three sibling sites of the same
+# trap.
 compare_hunks() {
   jq -c '
     def ranges:
@@ -2984,9 +3002,10 @@ compare_hunks() {
         or ([.patch | split("\n")[] | select(startswith("-"))] | length) != .deletions then null
       else
         reduce (.patch | split("\n"))[] as $l ({ranges: [], cur: null, ok: true};
-          if ($l | test("^@@ -[0-9]+(,[0-9]+)? \\+[0-9]+(,[0-9]+)? @@")) then
+          ([$l | capture("^@@ -(?<s>[0-9]+)(,(?<n>[0-9]+))? \\+[0-9]+(,(?<m>[0-9]+))? @@")]
+            | first) as $h
+          | if $h != null then
             (if .cur != null and (.cur.o != 0 or .cur.n != 0) then .ok = false else . end)
-            | ($l | capture("^@@ -(?<s>[0-9]+)(,(?<n>[0-9]+))? \\+[0-9]+(,(?<m>[0-9]+))? @@")) as $h
             | ($h.s | tonumber) as $s
             | (if $h.n == null then 1 else ($h.n | tonumber) end) as $n
             | (if $h.m == null then 1 else ($h.m | tonumber) end) as $m
