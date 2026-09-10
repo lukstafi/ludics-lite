@@ -587,7 +587,11 @@ control() {
 # whose label is part of the name and so may carry a space, and copies in what it wants read.
 #
 # What is written is always a throwaway SUITE, never this file: a control that ran the preamble
-# itself would re-enter the case that called it, and that one would run it again, forever.
+# itself would re-enter the case that called it, and that one would run it again, forever. The one
+# control that does run the preamble — test_the_self_test_runs_from_a_renamed_copy, which has to,
+# since what it pins is that the file works when executed under another name — does not go through
+# here for exactly that reason: it runs the copy itself, and passes `--inner-copy` to stop the
+# recursion this paragraph describes.
 control_in() {
   local dir file lib
   dir="$1"
