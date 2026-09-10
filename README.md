@@ -160,11 +160,12 @@ ship-pr/scripts/test-pr-review-checks-absent.sh
 ship-pr/scripts/test-pr-review-rounds.sh
 ship-pr/scripts/test-pr-review-merge.sh
 ship-pr/scripts/test-pr-review-status.sh
+ship-pr/scripts/test-pr-review-run-watch.sh
 scripts/test-wake-lab.sh
 scripts/test-check-prompts.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all ten on Ubuntu, one
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all eleven on Ubuntu, one
 job per suite, and on macOS (the fleet's bash is 3.2) as one job with a step per suite: the hosted
 macOS runners are scarce enough that four separate macOS jobs queued a green PR for one to two
 hours behind nine minutes of work (ludics-lite#55). Alongside them run `bash -n`, shellcheck at
@@ -217,6 +218,17 @@ separately and a queued invocation is never hidden behind a finished twin; and a
 explained entirely by advisory jobs is not a red build signal, since those checks were dropped on
 purpose.
 
+`test-pr-review-run-watch.sh` drives `retry run watch`, which addresses its run as
+`owner/name#<run-id>` like every other subcommand and no longer resolves the repository from the
+cwd (ludics-lite#74): a background shell that had started in another project's worktree awaited a
+run id from this one, the read 404'd against the repo the cwd named, and the await answered about
+the run. So a bare run id with no `-R`/`REPO=` is refused, and its control runs from a scratch
+checkout whose `origin` names a third repository with the fixture answering `gh repo view` too —
+both halves of the removed inference armed, and nothing read. The suite pins the other exits
+against that refusal: a 4xx on the pair is an invocation error (exit 2) and a run that concluded
+`failure` is still the verdict (exit 1), with an unanswered read exit 3 and a run still going at
+the deadline exit 4.
+
 `test-pr-review-status.sh` drives `status` and `watch` against canned reactions, reviews,
 comments and PR reads, and pins the mergeability that rides on every state line: a PR whose merge
 commit GitHub cannot build says `CONFLICTS` on every state and never "the next move is yours",
@@ -227,7 +239,7 @@ tip, leaving stdout byte-identical to `poll`'s. `test-pr-review-base-drift.sh` p
 half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
 which stands still on a conflicted PR.
 
-The five `test-pr-review-*` suites share a preamble, `test-pr-review-lib.sh`, which sources
+The six `test-pr-review-*` suites share a preamble, `test-pr-review-lib.sh`, which sources
 `pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and
 the fixture `gh`'s argument parsing. It also closes the trap that bit twice (ludics-lite#39, #45,
 #46): `pr-review.sh` puts some sixty unqualified functions in scope, and a suite helper sharing a
