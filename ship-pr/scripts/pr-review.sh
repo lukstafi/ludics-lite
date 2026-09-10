@@ -57,6 +57,16 @@
 #   - patience is bounded on BOTH sides, because a stall reads the same from either: a review
 #     that never starts and a 👀 that never lands both end with a verdict to nudge rather than with
 #     another silent hold. "Wait it out" is only honest while something is actually running;
+#   - the reviewer can fail at INITIALIZATION and say so in a plain summary comment, which is its
+#     newest word without being a round at all: "Codex Review: Something went wrong. Try again
+#     later by commenting “@codex review”." with "Provided git ref <sha> does not exist" in a
+#     code block under it — no review, no findings, and no machine tag to tell it apart from a
+#     verdict. On lukstafi/ocannl-staging#677 (2026-09-09) it landed twice, naming two heads that
+#     `git ls-remote` and the PR's own head.sha both served: the reviewer's clone was behind, not
+#     the push. Counted as the reviewer's last word it spends the 👀, and with no review of the
+#     head the state fell to `expected`, so three consecutive windows recommended waiting out a
+#     grace for a round that had already ended, while `rounds` counted the failed attempt as a
+#     round with findings. Hence the `failed` state below (ludics-lite#78);
 #   - and a round is only worth its cost on a head CI can test: GitHub creates no pull_request
 #     workflow run for a PR whose merge commit it cannot build (mergeable_state `dirty`), while
 #     the reviewer reviews it regardless. On ludics-lite#39 (2026-09-04) a sibling landed on main
@@ -112,11 +122,11 @@
 #                                          # new comments/reviews above the watermark; prints next
 #   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands; 0 = act, 1 = quiet
 #   pr-review.sh status <pr>               # merge gate + who owes what: approved / reviewing /
-#                                          # stalled / expected / idle / unknown — and the round
-#                                          # count against the threshold (see `rounds`); says
-#                                          # CONFLICTS when GitHub cannot build the merge commit
-#                                          # (nothing tests the head merged with the base, and
-#                                          # a push gets no run at all, until the base is in)
+#                                          # stalled / failed / expected / idle / unknown — and
+#                                          # the round count against the threshold (see `rounds`);
+#                                          # says CONFLICTS when GitHub cannot build the merge
+#                                          # commit (nothing tests the head merged with the base,
+#                                          # and a push gets no run at all, until the base is in)
 #   pr-review.sh rounds <pr>               # how many review rounds carried findings, read off the
 #                                          # PR (heads the reviewer left comments on), against
 #                                          # SHIP_PR_ROUND_THRESHOLD; exit 1 past it
@@ -617,6 +627,39 @@ case "$STALL" in
 '' | *[!0-9]*) die "SHIP_PR_REVIEW_STALL must be a number of seconds, got '$STALL'" ;;
 esac
 
+# The shape of a reviewer that never started. The connector answers a round it could not
+# initialize with a plain summary comment — no review, no findings, and (unlike the round-started
+# placeholder) no machine tag: "Codex Review: Something went wrong. Try again later by commenting
+# “@codex review”." with "Provided git ref <sha> does not exist" in a fenced block beneath it.
+#
+# ONE expression, and it is the CANONICAL BODY: anchored to the start of the body (\A), the
+# reviewer's own sentence WHOLE — through the command it tells you to comment, not just its first
+# words, or a round opening "Codex Review: Something went wrong in the retry path" (round 3) or
+# "... Try again later by commenting on the retry logic" (round 7) is read as a failure. The
+# quote around that command is matched as "up to a few characters", not as itself: the connector
+# renders it curly (“@codex review”), and pinning typography is a matcher a straight-quote
+# rendering defeats silently. Both callers use it, so a comment can never be a round for one and
+# a failure for the other.
+#
+# The looser shapes were tried and withdrawn (review of #82, rounds 1 and 2). A ref marker taken
+# on any line swallowed a comment-only ROUND whose finding quotes "Provided git ref <sha> does
+# not exist" — a round about this very matcher — and anchoring that marker to the opening line
+# plus a fence did not save it, since a round's summary opens with "Codex Review:" too. What is
+# left is a deliberate, LOUD miss: a failure whose opening sentence is ever worded differently
+# reads as `expected` and costs one grace, where the swallowed round would have cost a finding,
+# silently. (`^` is no use here in either direction: jq's regexes are Oniguruma in Perl mode,
+# where `^` is the start of the STRING and nothing else.)
+INIT_FAILURE_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong\.[ \t]*Try again later by commenting[^\n]{0,4}@codex review'
+# The ref the failure names — the head the reviewer could not fetch. GitHub serves lowercase hex,
+# as does the message. A failure that names none is not attributed to any head: see the branch in
+# status_state.
+INIT_FAILURE_REF_RE='Provided git ref[^0-9a-f]*(?<s>[0-9a-f]{7,40})'
+# The head a comment says it is about. The connector stamps "**Reviewed commit:** `<sha>`" on the
+# comments it delivers a round or a verdict in, truncated; it is the only head association a
+# comment has, and three readers want it — the verdict check, the round count, and the success
+# boundary the failure recurrence is measured from — so they share one expression.
+REVIEWED_COMMIT_RE='Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})'
+
 # ISO 8601 UTC timestamps sort correctly as plain strings, which is why every comparison below is a
 # string comparison: no date(1) is involved, whose parsing flags differ between BSD and GNU.
 newest() {
@@ -656,12 +699,30 @@ fmt_age() {
 #   approved  👍 is on the PR: the merge gate is open.
 #   reviewing 👀 is newer than the reviewer's last word, so a round really is in flight.
 #   stalled   ... and it has been in flight longer than any round takes; nothing is coming.
+#   failed    the reviewer's newest word is the INITIALIZATION failure above: the round never ran.
 #   expected  no live 👀 and no review of the head SHA: a round is due and has not started.
 #   idle      the reviewer has reviewed this exact head and left no 👍, so the next move is yours.
 #   unknown   a read failed. NOT a state of the PR — hold the previous one and retry.
-# <seconds> is how long the state has held: since the 👀 for reviewing/stalled, and for expected
-# since the LATEST of head commit / reviewer's last word / spent 👀 — i.e. since the moment a review
-# became due. "-" when nothing datable was read.
+# <seconds> is how long the state has held: since the 👀 for reviewing/stalled, since the failure
+# comment for failed, and for expected since the LATEST of head commit / reviewer's last word /
+# spent 👀 — i.e. since the moment a review became due. "-" when nothing datable was read.
+#
+# `failed` sits below 👍 and below a live 👀, and above everything else. A 👍 is the merge gate
+# and outranks any later trouble; a 👀 newer than the failure is a round that started AFTER it,
+# and waiting that out is right. Below them it outranks `idle` and `expected` because it is the
+# reviewer's newest word about this head and it says the round did not run: `idle` would say the
+# head was reviewed (the findings, if any, are an older round's), and `expected` would send the
+# caller to wait out a grace for a round that already ended — the reading ocannl-staging#677 got
+# for three windows. `stalled` cannot compete: a failure comment is the reviewer speaking, so the
+# 👀 above it is spent by definition. It fires only when the failure comment is the reviewer's
+# newest non-placeholder comment, is newer than any review OF THE CURRENT HEAD (a round that
+# landed after it is the newer truth), and NAMES the current head as the ref it could not fetch.
+# A failure about a head that has since been replaced is `expected`, correctly: the new head's
+# round has not started yet and has its grace to run. One that names no ref at all is not
+# attributed to a head — the branch says why.
+#
+# For that token ALONE the detail carries one leading `|`-separated field, the head's short SHA,
+# which the rendered line names. status_line splits it off; nothing else parses a detail.
 # <mergeability> is the PR's mergeable_state as GitHub reports it (clean, dirty, unstable, blocked,
 # behind, draft, unknown while it is recomputing), "unread" when the PR read failed, or "-" when
 # no PR read was attempted (a feed failed before it). "unread" is rendered as such: a line that
@@ -703,6 +764,7 @@ pr_head_read() {
 status_state() {
   local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local vline verd_at verd_sha mstate="-" head_err=""
+  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -732,6 +794,9 @@ status_state() {
     echo "unknown|-|$mstate|the reviews API did not answer ($(gh_err_line))"
     return 0
   }
+  # Kept whole for the `failed` branch, which asks whether any review is of the CURRENT head — a
+  # question this point in the function cannot yet ask, the head being read after the feeds.
+  reviews_raw="$raw"
   # Your own replies land in this feed as COMMENTED reviews, hence the login filter; PENDING reviews
   # have no submitted_at and are not yet the reviewer speaking.
   line=$(jq -r --arg rev "$REVIEWER" '
@@ -757,6 +822,7 @@ status_state() {
     echo "unknown|-|$mstate|the comments API did not answer ($(gh_err_line))"
     return 0
   }
+  comments_raw="$raw"
   com_at=$(jq -r --arg rev "$REVIEWER" '
       [.[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | test("codex-pull-request-review-summary") | not)
@@ -775,18 +841,32 @@ status_state() {
   # round's 👀, as it must be to count), while a verdict comment left over from an earlier
   # round keeps its old time and loses to a fresh 👀 — the re-request-without-a-push case,
   # where the SHA still matches but a new round is running that may yet find something.
-  vline=$(jq -r --arg rev "$REVIEWER" '
+  vline=$(jq -r --arg rev "$REVIEWER" --arg rc "$REVIEWED_COMMIT_RE" '
       [.[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | test("[Dd]idn.t find any major issues"))
            | {at: (.updated_at // .created_at),
-              sha: (try ((.body // "")
-                    | capture("Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})").s)
-                    catch "")}]
+              sha: (try ((.body // "") | capture($rc).s) catch "")}]
       | sort_by(.at) | last
       | if . == null then "|" else "\(.at)|\(.sha)" end' \
     <<<"$raw" 2>/dev/null) || vline="|"
   verd_at="${vline%%|*}"
   verd_sha="${vline#*|}"
+  # The initialization failure (INIT_FAILURE_RE above). Only the NEWEST non-placeholder comment is
+  # tested, never all of them: any later word supersedes the failure — a findings summary, a
+  # no-findings verdict, a second failure naming a different head — and the state it leaves is
+  # that word's, not this one's. `created_at`, not `updated_at`: this comment is posted fresh
+  # (the placeholder that gets edited in place is filtered out here as everywhere), and taking
+  # the same clock as com_at is what makes "the failure IS the reviewer's last word" exact.
+  fline=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" --arg refre "$INIT_FAILURE_REF_RE" '
+      [.[] | select((.user.login // "") | startswith($rev))
+           | select((.body // "") | test("codex-pull-request-review-summary") | not)]
+      | sort_by(.created_at) | last
+      | if . == null or ((.body // "") | test($re) | not) then "|"
+        else "\(.created_at)|"
+             + (((try ((.body // "") | capture($refre).s) catch "") // ""))
+        end' <<<"$raw" 2>/dev/null) || fline="|"
+  fail_at="${fline%%|*}"
+  fail_ref="${fline#*|}"
   last_spoke=$(newest "$rev_at" "$com_at")
 
   # The head SHA and the mergeability, in ONE read of the PR, made AFTER the feeds: every review
@@ -837,6 +917,42 @@ status_state() {
     echo "unknown|-|unread|the pulls API did not answer for the head SHA ($head_err)"
     return 0
   }
+
+  # The round that never started. The 👍 and a live 👀 have already returned above, so what is
+  # left to rule out is a round that landed ON THIS HEAD after the failure, and a failure about
+  # some other head — which the ref it names answers exactly.
+  #
+  # A failure that names NO ref is not attributed to any head, and falls through to the ordinary
+  # due-round states. Two rounds of review went into trying to attribute one (review of #82): the
+  # only clock available is the head commit's committer date, and it is commit metadata, not the
+  # time that SHA became the head — a force-push or a reset to an older commit dates the new head
+  # BEFORE the failure, so the old failure would be reported against it and `watch` would exit on
+  # a round still inside its grace. Every failure the connector has posted names its ref in the
+  # fenced block, so what this gives up is a shape nobody has seen, and what it costs when that
+  # shape appears is one grace — the state before this existed.
+  if [ -n "$fail_at" ] && [ -n "$fail_ref" ]; then
+    case "$head_sha" in
+    "$fail_ref"*)
+      rev_head_at=$(jq -r --arg rev "$REVIEWER" --arg sha "$head_sha" '
+          [.[] | select((.user.login // "") | startswith($rev))
+               | select(.submitted_at != null) | select((.commit_id // "") == $sha)
+               | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || rev_head_at=""
+      if [ -z "$rev_head_at" ] || [[ "$fail_at" > "$rev_head_at" ]]; then
+        # No recurrence count rides on this line. One was tried and removed (review of #82,
+        # rounds 1, 3, 4, 5 and 6): "has this head failed before?" has to be measured from the
+        # last time the reviewer GOT THROUGH on it, and that success is not always recorded —
+        # a clean round posts no review and only a 👍, and the very re-request that then fails
+        # CLEARS that reaction, leaving nothing behind to measure from. Every fix made the
+        # boundary wider and the next round found the next hole. So the line states both moves
+        # unconditionally, which is what the issue asked for and what a caller can act on
+        # without the script deciding which case it is in.
+        echo "failed|$(age_of "$fail_at")|$mstate|${head_sha:0:7}|$REVIEWER reported an" \
+          "initialization failure at $fail_at for ref ${fail_ref:0:7}"
+        return 0
+      fi
+      ;;
+    esac
+  fi
 
   # A verdict comment naming the current head is an approval — without this arm it reads as
   # "no review of this head", which is what invited the '@codex review' re-request that
@@ -938,7 +1054,7 @@ conflict_note() {
 # Takes a whole state line, not a token: the age and the detail are what make the difference between
 # "wait it out" and "nothing is coming" legible to whoever reads the log.
 status_line() {
-  local tok age detail merge conflict
+  local tok age detail merge conflict fsha frest
   tok=$(state_tok "$1")
   age=$(state_age "$1")
   detail=$(state_detail "$1")
@@ -952,6 +1068,22 @@ status_line() {
     "a comment or a 👍 this state machine missed. Only if the feed truly has nothing for the" \
     "current head, nudge with a '@codex review' comment — knowing a re-request CLEARS the" \
     "reviewer's existing 👍${conflict:+; $conflict}" ;;
+  # The remedy, not the diagnosis, is what this line is for: the reviewer's clone is behind, and
+  # nothing the caller waits for changes that. A nudge re-runs the fetch and usually succeeds
+  # (ocannl-staging#677's third head reviewed normally after one); if the same head fails again,
+  # only a new head gives the reviewer an object its clone can resolve. Both moves are stated,
+  # in order, rather than the script deciding which one the caller is due — see status_state for
+  # why counting the failures on a head cannot be done honestly.
+  failed)
+    fsha="${detail%%|*}"
+    frest="${detail#*|}"
+    echo "reviewer FAILED at initialization on head $fsha — nudge it once with a '@codex review'" \
+      "comment (pr-review.sh comment $REPO#${PR_NUM:-<pr>} '@codex review'); if the SAME head" \
+      "fails again, push a new head instead (an amend suffices: git commit --amend --no-edit &&" \
+      "git push --force-with-lease), since the reviewer's clone is behind, not your push — the" \
+      "ref it could not fetch is one the PR and git ls-remote both serve. This is not a round —" \
+      "$frest, standing for $(fmt_age "$age")${conflict:+; $conflict}"
+    ;;
   expected) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")${conflict:+; $conflict}" ;;
   # "The next move is yours" is exactly the line that sent #39 into seven untested rounds: on a
   # conflicted PR the move is the base merge, and saying anything else invites another push. A
@@ -991,10 +1123,17 @@ review_rounds() {
     return 0
   }
   # A round can also arrive as an issue comment alone — the same shape status_state treats as
-  # the reviewer speaking — so those count too, minus the round-started placeholder and the
-  # no-findings verdict. A comment quoting "Reviewed commit: <sha>" joins that head's burst;
-  # one that names none is its own head, so a summary-only round is never folded into an
-  # inline round it did not belong to.
+  # the reviewer speaking — so those count too, minus the round-started placeholder, the
+  # no-findings verdict, and the initialization failure: an attempt that never ran carries no
+  # findings, and counting it inflated ocannl-staging#677 to "1 round(s) of findings over 0
+  # head(s)" — a threshold reading made of two failed fetches (ludics-lite#78). It is dropped
+  # from the COMMENT feed alone, which is the only feed it has ever arrived in: a review carries
+  # the commit it was submitted against, and the reviewer submits none when it cannot fetch it.
+  #
+  # The test is INIT_FAILURE_RE, the canonical body, which is `status_state`'s test too: a
+  # comment is a failure for both or a round for both. A comment-only round whose finding quotes
+  # "Provided git ref <sha> does not exist" — a round about this very matcher — is a round here
+  # and on the state line, and that is what the anchored expression buys (review of #82).
   comments=$(api_list "issues/$pr/comments?per_page=100") || {
     echo "unknown|the comments API did not answer ($(gh_err_line))"
     return 0
@@ -1002,7 +1141,7 @@ review_rounds() {
   # Both feeds go in on stdin (slurped: reviews first, comments second), never as arguments —
   # a long PR's comment history outgrows the argument list (128 KB per argument on Linux).
   line=$(printf '%s\n%s\n' "$raw" "$comments" | jq -r -s --arg rev "$REVIEWER" \
-    --argjson gap "$ROUND_GAP" '
+    --argjson gap "$ROUND_GAP" --arg fail "$INIT_FAILURE_RE" --arg rc "$REVIEWED_COMMIT_RE" '
       .[1] as $comments | .[0]
       | ([.[] | select((.user.login // "") | startswith($rev))
            | select(.submitted_at != null)
@@ -1011,9 +1150,8 @@ review_rounds() {
        + [$comments[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | test("codex-pull-request-review-summary") | not)
            | select((.body // "") | test("[Dd]idn.t find any major issues") | not)
-           | {sha: ((((.body // "")
-                     | capture("Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})")).s)
-                    // "comment"),
+           | select((.body // "") | test($fail) | not)
+           | {sha: ((((.body // "") | capture($rc)).s) // "comment"),
               t: (.created_at | fromdateiso8601)}])
       | sort_by(.t)
       # Same head when equal, or when one is a prefix of the other: a comment quotes a
@@ -1185,6 +1323,16 @@ cmd_watch() {
     stalled)
       # Bounded patience on a LIVE 👀 as well: a round that never lands stalls the loop exactly as a
       # spent 👀 does, and the answer is the same — say so and let the caller nudge.
+      watch_drift_note "$pr"
+      status_line "$state"
+      echo "watermark: $mark"
+      return 0
+      ;;
+    failed)
+      # Nothing is running and nothing will start on its own: the reviewer said it could not fetch
+      # the head. Exiting here rather than falling into the `expected` arm below is the whole
+      # point of the state — that arm would hold the window and then hold the grace out (three
+      # times over, on ocannl-staging#677) before recommending the nudge this prints now.
       watch_drift_note "$pr"
       status_line "$state"
       echo "watermark: $mark"

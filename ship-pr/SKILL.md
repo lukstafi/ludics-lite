@@ -230,10 +230,15 @@ round has been paid for.
 
 An exit 0 is not always a round: `watch` also returns when it can tell that **nothing is coming** —
 the 👀 went spent without a review of the head, or never landed, or a push has been sitting
-unreviewed past the grace (20 min, `SHIP_PR_REVIEW_GRACE`). Its line says so and names the remedy:
-post a plain `@codex review` comment on the PR — `pr-review.sh comment <owner>/<repo>#<pr>
-'@codex review'` — which starts a round within one window. Do that rather than re-arming a fourth
-identical wait; see the state table below for why waiting cannot distinguish itself.
+unreviewed past the grace (20 min, `SHIP_PR_REVIEW_GRACE`), or the reviewer said outright that it
+could not start (`failed`, below, which exits at once rather than holding the grace). Its line says
+so and names the remedy: post a plain `@codex review` comment on the PR — `pr-review.sh comment
+<owner>/<repo>#<pr> '@codex review'` — which starts a round within one window. Do that rather than
+re-arming a fourth identical wait; see the state table below for why waiting cannot distinguish
+itself. Read the remedy off the line rather than from this paragraph when the two differ: on
+`failed` the nudge is the first move and not the only one — if the SAME head fails to initialize
+again, the next move is a new head (an amend suffices), because the reviewer's clone is what is
+behind.
 
 Hand-rolling that query has produced seven false readings, all of which the script handles: app
 reviewers' logins carry a `[bot]` suffix so an exact-match filter never fires; your own replies
@@ -344,16 +349,30 @@ The 👀 reaction is the one signal you cannot read on its own. It is a level, n
 app does not reliably take it back: on #364 a 👀 outlived the review it announced by an hour, and
 three consecutive 15-minute windows reported "reviewing — wait it out" over a PR nothing was
 reading. So `status` crosses the reactions with what the reviewer has actually posted and with the
-head SHA, and answers with one of six:
+head SHA, and answers with one of seven:
 
 | state | means | what to do |
 | --- | --- | --- |
 | `approved` | 👍 is on the PR | merge |
 | `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
 | `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
+| `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) |
 | `expected` | no live 👀, and no review of the head SHA: a round is due and has not started | wait out the grace, then `@codex review` |
 | `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push — or, at one of the loop's exits (below), close out and merge |
 | `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
+
+`failed` is the reviewer telling you its own clone is behind: the ref it says does not exist is
+one the PR's `head.sha` and `git ls-remote` both serve, so nothing about your push is wrong and
+nothing you wait for fixes it (on lukstafi/ocannl-staging#677 it fired on two consecutive heads,
+and the third reviewed normally after one nudge). It ranks below the 👍 and below a 👀 raised
+after it — a round that started later is a round to wait out — and above `idle` and `expected`,
+which is what it used to read as: three `watch` windows recommending the grace for a round that
+had already ended. A failure naming a head you have since replaced is not it; that is `expected`
+again, correctly — and so is one that names no ref at all, which is attributed to no head. Nudge
+once, and if the same head fails again, amend and push; the line states both moves in order,
+because no feed records a reaction-only success reliably enough for the script to say which of
+the two you are due. The failed attempt is not a round, so it does not count against the
+convergence threshold.
 
 Every one of those lines also says **`CONFLICTS with the base (mergeable_state=dirty)`** when
 GitHub cannot build the PR's merge commit, and on `idle` that replaces "the next move is yours".
