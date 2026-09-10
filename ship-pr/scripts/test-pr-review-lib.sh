@@ -17,8 +17,11 @@
 #                                       file owns the EXIT trap (pr-review.sh installs one of its
 #                                       own when sourced, which the suites used to re-install by
 #                                       hand), so a suite never touches `trap`
-#   gh_fixture_parse "$@"               inside a fixture `gh`: refuses anything but `gh api`,
-#   gh_fixture_answer <response>        sets FIXTURE_ENDPOINT / FIXTURE_FILTER / FIXTURE_PAGINATE,
+#   gh_fixture_parse "$@"               inside a fixture `gh`: refuses anything but `gh api`, and
+#   gh_fixture_answer <response>        anything whose endpoint is neither `graphql` nor a REST
+#                                       path with a `/` (an option's value in the endpoint slot,
+#                                       ludics-lite#86); sets FIXTURE_ENDPOINT / FIXTURE_FILTER
+#                                       / FIXTURE_PAGINATE,
 #                                       logs the endpoint to $REQUEST_LOG (and, when paginated,
 #                                       $PAGINATE_LOG) if the suite set them; the answer goes
 #                                       through the --jq filter the call carried, if any
@@ -114,7 +117,7 @@ FIXTURE_FILTER=""
 FIXTURE_PAGINATE=""
 
 gh_fixture_parse() {
-  local arg
+  local arg call="$*"
   FIXTURE_ENDPOINT=""
   FIXTURE_FILTER=""
   FIXTURE_PAGINATE=""
@@ -137,6 +140,16 @@ gh_fixture_parse() {
     *) [ -n "$FIXTURE_ENDPOINT" ] || FIXTURE_ENDPOINT="$arg" ;;
     esac
   done
+  # The endpoint's SHAPE, checked before a fixture dispatches on it. The list above is a list of
+  # options gh has today; the next one it grows is one this parser does not know, and its value
+  # would take the endpoint slot as a bare word again — the #86 shape, one option later, and just
+  # as silent: the fixture answers the wrong branch and the suite passes on it. Every endpoint
+  # pr-review.sh addresses is `graphql` or a REST path, so anything else is this bug and not a
+  # call worth answering.
+  case "$FIXTURE_ENDPOINT" in
+  graphql | */*) ;;
+  *) bail "fixture parsed '$FIXTURE_ENDPOINT' as the endpoint of: gh $call — an endpoint is 'graphql' or a REST path carrying a '/', so an option's value took the slot: teach gh_fixture_parse the option that carries it" ;;
+  esac
   [ -z "${REQUEST_LOG:-}" ] || printf '%s\n' "$FIXTURE_ENDPOINT" >>"$REQUEST_LOG"
   [ -z "$FIXTURE_PAGINATE" ] || [ -z "${PAGINATE_LOG:-}" ] ||
     printf '%s\n' "$FIXTURE_ENDPOINT" >>"$PAGINATE_LOG"
@@ -378,6 +391,24 @@ test_gh_fixture_parse() {
   assert_eq "$?" 1 "a non-api call is refused"
   set -e
   assert_contains "$out" "fixture received non-api gh call: pr merge" "the call should be quoted"
+  # The shape guard, in a subshell because bail exits: an option this parser does not know
+  # carries its value into the endpoint slot, and `5m` is not an endpoint. This is what makes the
+  # next recurrence of #86 loud instead of a wrongly answered branch.
+  : >"$log"
+  set +e
+  out=$(gh_fixture_parse api --cache 5m repos/o/n/thing --jq .a 2>&1)
+  assert_eq "$?" 1 "an unknown option's value in the endpoint slot is refused"
+  set -e
+  assert_contains "$out" "fixture parsed '5m' as the endpoint" "the bad endpoint should be named"
+  assert_contains "$out" "gh api --cache 5m repos/o/n/thing --jq .a" "the whole call should be quoted"
+  assert_contains "$out" "teach gh_fixture_parse the option that carries it" "the fix should be named"
+  # An api call with no endpoint at all is the same refusal.
+  set +e
+  out=$(gh_fixture_parse api --paginate 2>&1)
+  assert_eq "$?" 1 "an api call with no endpoint is refused"
+  set -e
+  assert_contains "$out" "fixture parsed '' as the endpoint" "the empty endpoint should be named"
+  assert_eq "$(cat "$log")" "" "a refused call is not logged"
   REQUEST_LOG=""
   PAGINATE_LOG=""
 }
