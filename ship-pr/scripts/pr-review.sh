@@ -2621,14 +2621,14 @@ base_red_detail() {
   # nothing rather than print a "first red" the rows do not support.
   [ "$reds" -gt 0 ] || return 0
   if [ "$bounded" -eq 1 ]; then
-    printf '%sred since %s (%s), %d run(s) back; the judged run before it was not red\n' \
+    printf '%sred since %s (run created %s), %d run(s) back; the judged run before it was not red\n' \
       "$indent" "${first_sha:0:8}" "$first_when" "$reds"
   else
     # The window is the newest runs of this workflow on this branch, not its whole history: with
     # no green under the streak the first red commit is NOT known, and saying so is the point —
     # an owner told "red since <the oldest run the page happened to hold>" would start bisecting
     # from the wrong end.
-    printf '%sred for all %d judged run(s) in the window, back to %s (%s) — the window holds no\n%sgreen under it, so the red may start further back\n' \
+    printf '%sred for all %d judged run(s) in the window, back to %s (run created %s) — the window holds no\n%sgreen under it, so the red may start further back\n' \
       "$indent" "$reds" "${first_sha:0:8}" "$first_when" "$indent"
   fi
   case "$run_id" in '' | *[!0-9]*) return 0 ;; esac
