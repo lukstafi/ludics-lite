@@ -166,7 +166,7 @@ EOF
 # codex: `exec --json ... -o <file> -` and `exec resume <id> --yolo --json -`.
 cat > "$TMP/bin/codex" <<'EOF'
 #!/usr/bin/env bash
-[ "$1" = login ] && exit 0
+[ "$1" = login ] && { [ -z "${SHIM_CODEX_LOGIN_DOWN:-}" ]; exit $?; }
 [ "$1" = exec ] && shift
 case " $* " in *" -C / "*) case " $* " in *" --skip-git-repo-check "*) ;; *) echo "Not inside a trusted directory and --skip-git-repo-check was not specified." >&2; exit 1 ;; esac ;; esac
 if [ -n "${SHIM_CODEX_DOWN:-}" ]; then printf '{"type":"thread.started","thread_id":"x"}\n{"type":"turn.failed","error":{"message":"401 Unauthorized"}}\n'; exit 1; fi
@@ -455,6 +455,8 @@ expect "a reachable sibling does not swallow the refusal that follows the probe"
 git -C "$repo" checkout -q -- ship-pr/SKILL.md
 [ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
 expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
+expect "native preflight needs neither CLI login nor a model probe" 0 "PREFLIGHT OK" -- env SHIM_CODEX_LOGIN_DOWN=1 SHIM_CODEX_DOWN=1 SHIM_CLAUDE_DOWN=1 "$FW" preflight testbox --native-codex
+expect "legacy preflight still requires CLI login" 1 "codex not logged in" -- env SHIM_CODEX_LOGIN_DOWN=1 "$FW" preflight testbox --codex --no-probe
 expect "codex that cannot run headless refuses despite login status" 1 "codex cannot run headless: \"message\":\"401 Unauthorized\"" -- env SHIM_CODEX_DOWN=1 "$FW" preflight testbox --codex
 echo x >> "$repo/ship-pr/SKILL.md"
 expect "a tracked change under the served tree refuses" 1 "1 local change(s) in the served tree" -- "$FW" preflight testbox --no-probe
@@ -501,6 +503,7 @@ expect "wrong branch refuses" 1 "checked out topic, not main" -- "$FW" preflight
 git -C "$repo" checkout -q main && git -C "$repo" branch -q -D topic
 rm "$HOME/.codex/skills/after-merge"
 expect "missing codex skill link refuses only for codex" 1 "codex/skills/after-merge -> missing" -- "$FW" preflight testbox --codex --no-probe
+expect "native preflight still requires Codex skill links" 1 "codex/skills/after-merge -> missing" -- "$FW" preflight testbox --native-codex
 expect "...and claude preflight still passes" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --no-probe
 ln -sfn "$repo/after-merge" "$HOME/.codex/skills/after-merge"
 mkdir -p "$TMP/elsewhere"; ln -sfn "$TMP/elsewhere" "$HOME/.claude/skills/ship-pr"
@@ -755,9 +758,15 @@ need_lease
 mkdir -p "$ISSUE_WAVE_STATE/HALT"
 expect "halt that cannot write its marker fails loudly" 1 "HALT FAILED: cannot write" -- "$FW" halt "unwritable"
 rmdir "$ISSUE_WAVE_STATE/HALT"
+expect "native gate accepts the lease holder" 0 "" -- "$FW" gate
+expect "native gate refuses another coordinator" 1 "coordinator lease held" -- "${B[@]}" gate
+expect "native gate rejects unknown flags" 2 "gate: expected" -- "$FW" gate --oops
 expect "halted reports open" 0 "launches open" -- "$FW" halted
 expect "halt records the reason" 0 "HALTED: launches refused" -- "$FW" halt "master red at abc123, owner: coordinator"
 expect "halted reports the reason, exit 1" 1 "HALTED .*master red at abc123" -- "$FW" halted
+expect "native gate refuses while halted" 1 "launches halted" -- "$FW" gate
+expect "native triage gate allows the holder during halt" 0 "" -- "$FW" gate --force
+expect "native triage gate still refuses a non-holder" 1 "coordinator lease held" -- "${B[@]}" gate --force
 expect "launch refuses while halted" 1 "LAUNCH REFUSED testbox/h1: launches halted -- .*master red" -- "$FW" launch testbox h1 --kind claude --brief "$brief" --cwd "$proj"
 expect "--force launches anyway (the triage worker)" 0 "LAUNCHED testbox/h1" -- "$FW" launch testbox h1 --kind claude --brief "$brief" --cwd "$proj" --force
 "$FW" attach testbox h1 --interval 1 >/dev/null

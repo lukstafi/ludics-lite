@@ -3,7 +3,11 @@
 # fleet and supervises them there, with the same commands whether the box is the coordinator's
 # own machine or a remote one reached over ssh (ludics-lite#4).
 #
-# A worker is a detached tmux session on its box running one headless CLI turn --
+# Native Codex workers use app thread tools; this script supplies their --native-codex
+# freshness preflight and point-in-time gate. Their board is coordinator-maintained (see
+# references/native-codex.md); ls/status/attach/unstick below only handle CLI workers.
+#
+# A CLI worker is a detached tmux session on its box running one headless CLI turn --
 # `claude -p --output-format stream-json` or `codex exec --json` -- with its brief on stdin and
 # its event stream on disk under the box's ~/.local/state/issue-wave/workers/<name>/. Everything
 # the coordinator needs later is a file there: the JSONL stream, stderr, the exit code, and a
@@ -32,7 +36,8 @@
 # Usage:
 #   fleet-worker.sh claim [--take]         # take the fleet's coordinator lease (--take adopts)
 #   fleet-worker.sh coordinator | release  # who holds it (exit 0 me, 1 other, 3 nobody) / give it up
-#   fleet-worker.sh preflight <box> [--codex] [--no-probe] [--no-cross]   # launch runs this itself, too
+#   fleet-worker.sh preflight <box> [--codex|--native-codex] [--no-probe] [--no-cross]   # launch runs this itself, too
+#   fleet-worker.sh gate [--force]          # lease + halt read before native dispatch (not a reservation)
 #   fleet-worker.sh launch <box> <name> --kind claude|codex --brief <file>
 #                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
 #                          [--force] [--replace] [-- <extra CLI args>]
@@ -394,21 +399,23 @@ for skill_dir in "$repo"/*; do
   t=$(resolved "$HOME/.claude/skills/$s")
   [ "$t" = "$canon/$s" ] || note "~/.claude/skills/$s -> ${t:-missing/not a link} (not $repo/$s)"
 done
-if [ "$codex" = 1 ]; then
+if [ "$codex" != 0 ]; then
   for s in ship-pr wait-and-proceed after-merge; do
     t=$(resolved "$HOME/.codex/skills/$s")
     [ "$t" = "$canon/$s" ] || note "~/.codex/skills/$s -> ${t:-missing/not a link} (README's Codex loop not run)"
   done
-  command -v codex >/dev/null 2>&1 || note "no codex on PATH"
-  codex login status >/dev/null 2>&1 || note "codex not logged in"
-  # A status read is not a proof either way; only a live headless turn is.
-  if [ "$probe" = 1 ] && command -v codex >/dev/null 2>&1; then
-    prompt=$(mktemp "${TMPDIR:-/tmp}/fw-prompt.XXXXXX"); printf 'Reply with the single word ok.' > "$prompt"
-    out=$(cd / && bounded --stdin "$prompt" "$probe_timeout" codex exec --json --ephemeral --skip-git-repo-check -C / -); prc=$?
-    rm -f "$prompt"
-    if [ "$prc" -eq 124 ]; then note "codex headless probe timed out after ${probe_timeout}s"
-    elif ! printf '%s' "$out" | grep -q '"type":"turn.completed"'; then
-      note "codex cannot run headless: $(printf '%s' "$out" | grep -o '"message":"[^"]*"' | head -n1 | cut -c1-120)"
+  if [ "$codex" = 1 ]; then
+    command -v codex >/dev/null 2>&1 || note "no codex on PATH"
+    codex login status >/dev/null 2>&1 || note "codex not logged in"
+    # A status read is not a proof either way; only a live headless turn is.
+    if [ "$probe" = 1 ] && command -v codex >/dev/null 2>&1; then
+      prompt=$(mktemp "${TMPDIR:-/tmp}/fw-prompt.XXXXXX"); printf 'Reply with the single word ok.' > "$prompt"
+      out=$(cd / && bounded --stdin "$prompt" "$probe_timeout" codex exec --json --ephemeral --skip-git-repo-check -C / -); prc=$?
+      rm -f "$prompt"
+      if [ "$prc" -eq 124 ]; then note "codex headless probe timed out after ${probe_timeout}s"
+      elif ! printf '%s' "$out" | grep -q '"type":"turn.completed"'; then
+        note "codex cannot run headless: $(printf '%s' "$out" | grep -o '"message":"[^"]*"' | head -n1 | cut -c1-120)"
+      fi
     fi
   fi
 else
@@ -425,7 +432,7 @@ else
     fi
   fi
 fi
-command -v tmux >/dev/null 2>&1 || note "no tmux"
+[ "$codex" = native ] || command -v tmux >/dev/null 2>&1 || note "no tmux"
 command -v jq >/dev/null 2>&1 || note "no jq"
 # Cross-box reach (ludics-lite#57): a worker's brief may drive a fleet sibling over ssh for a
 # one-off leg, and on 2026-09-04 the first such leg found no credential mid-task. A refused
@@ -478,6 +485,7 @@ cmd_preflight() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --codex) codex=1 ;;
+      --native-codex) codex=native ;;
       --no-probe) probe=0 ;;
       --no-cross) cross="" ;;
       *) die "preflight: unknown option $1" ;;
@@ -1107,6 +1115,14 @@ EOF
 # ---------------------------------------------------------------------------------------------
 cmd="${1:-}"; [ -n "$cmd" ] && shift
 case "$cmd" in
+  gate)
+    force=0
+    case "$#:${1:-}" in
+      0:) ;;
+      1:--force) force=1 ;;
+      *) die "gate: expected no arguments or --force" ;;
+    esac
+    anchor_gate GATE native-worker "$force" ;;
   preflight) cmd_preflight "$@" ;;
   launch) cmd_launch "$@" ;;
   attach) cmd_attach "$@" ;;
