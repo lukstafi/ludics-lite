@@ -52,7 +52,7 @@ discover the skills.
 
 On a machine that runs Codex workers (see the Codex workers section of `issue-wave/SKILL.md`),
 also link the skills Codex uses into `~/.codex/skills`. The issue-wave coordinator's per-launch
-preflight (`issue-wave/scripts/fleet-worker.sh preflight <box> --codex`) refuses to launch a
+preflight (`issue-wave/scripts/fleet-worker.sh preflight <box> --native-codex`) refuses to launch a
 Codex worker on a box where these links are missing:
 
 ```sh
@@ -101,7 +101,12 @@ upstream main and refuses on a dirty or diverged checkout. That pull-side step i
 propagates merged skill edits to boxes that slept through the merge. A headless worker also
 needs the box's CLI logged in: `claude auth login` for Claude workers (an expired OAuth session
 cannot refresh headless, and `claude auth status` does not notice) and `codex login` for Codex
-ones. The preflight proves both with a live call, not a status read.
+CLI ones. The CLI preflight proves both with a live call, not a status read.
+Codex issue-wave workers normally use native app threads in dedicated worktrees; their
+`--native-codex` preflight checks skills and fleet reach without a CLI login or tmux dependency.
+The coordinator uses native thread tools for launch, supervision and follow-up, and keeps a
+shared anchor board alongside the CLI records. See
+[Native Codex workers](issue-wave/references/native-codex.md) for placement and recovery.
 
 ## Routines
 
