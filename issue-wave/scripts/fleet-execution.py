@@ -95,6 +95,10 @@ def main():
     identity = data["request_id"]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", identity):
         refuse("invalid request_id")
+    # APFS commonly preserves case but aliases filenames differing only by case.
+    # Preserve existing mixed-case identities; never publish another spelling over them.
+    if any(name.casefold() == identity.casefold() and name != identity for name in records):
+        refuse("request_id collides with an existing identity by case")
     now = datetime.now(timezone.utc).isoformat()
     halt_path = Path(root) / "HALT"
     halt_identity = halt_path.read_text() if halt_path.exists() else None

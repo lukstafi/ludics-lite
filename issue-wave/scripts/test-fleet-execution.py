@@ -38,6 +38,18 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     change('reserve', {**request('bad-triage'), 'triage_reason': True}, expected=1)
     change('reserve', {**request('premarked'), 'triage_reason': 'future triage'}, expected=1)
     assert records() == {}
+    mixed_case = request('CaseJob', 'case-one')
+    change('reserve', mixed_case)
+    case_record = records()['CaseJob']
+    case_bytes = (root / 'executions' / 'CaseJob.json').read_bytes()
+    change('reserve', request('casejob', 'case-two'), expected=1)
+    assert records() == {'CaseJob': case_record}
+    for operation in ['dispatch', 'record', 'reconcile', 'conclude']:
+        change(operation, dict(request_id='casejob', evidence='must not alias'), expected=1)
+        assert (root / 'executions' / 'CaseJob.json').read_bytes() == case_bytes
+    change('reserve', mixed_case)
+    change('conclude', dict(request_id='CaseJob', verdict='not-launched',
+                           log='/logs/case-check', evidence='fixture never dispatched'))
     # Two simultaneous ROG requests cannot both win. Independent Minix can proceed.
     def contend(identity):
         try:
@@ -68,7 +80,7 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     sibling_path.write_bytes(sibling_bytes)
     change('reserve', request(identity))
     assert records()[identity] == first
-    assert len(records()) == 2 and first['state'] == 'reserved'
+    assert len(records()) == 3 and first['state'] == 'reserved'
     change('reserve', {**request(identity), 'purpose': 'different'}, expected=1)
     change('dispatch', dict(request_id=identity, evidence='about to invoke runner'))
     change('dispatch', dict(request_id=identity, evidence='blind retry'), expected=1)

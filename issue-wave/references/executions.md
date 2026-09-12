@@ -40,6 +40,7 @@ A reservation must exist before launch. For example `reserve.json`:
 Run `fleet-worker.sh execution reserve <absolute-reserve.json>`. A conflicting request reports
 its current owner and changes nothing. Retrying identical request identity and fields returns
 the existing assignment, including terminal state; a changed request with that ID is refused.
+IDs that differ only by case collide and are refused, including on case-sensitive hosts.
 Use a new ID for a genuinely new execution. `execution list` prints all records, including
 history; it requires no coordinator identity. The creating coordinator and wave remain recorded
 after adoption. Transport is `subagent`, `app`, `cli` or `coordinator`.
