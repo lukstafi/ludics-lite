@@ -36,6 +36,7 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
 
     run('claim')
     change('reserve', {**request('bad-triage'), 'triage_reason': True}, expected=1)
+    change('reserve', {**request('premarked'), 'triage_reason': 'future triage'}, expected=1)
     assert records() == {}
     # Two simultaneous ROG requests cannot both win. Independent Minix can proceed.
     def contend(identity):
@@ -51,6 +52,20 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     identity = winners[0]
     change('reserve', request('minix', 'minix'))
     first = records()[identity]
+    sibling_path = root / 'executions' / 'minix.json'
+    sibling_bytes = sibling_path.read_bytes()
+    # A malformed unrelated owner must block dispatch of an otherwise valid request.
+    for missing in ['request', 'lease_token', 'history']:
+        broken = json.loads(sibling_bytes)
+        del broken[missing]
+        sibling_path.write_text(json.dumps(broken))
+        change('dispatch', dict(request_id=identity, evidence='must fail closed'), expected=1)
+        assert json.loads((root / 'executions' / (identity + '.json')).read_text()) == first
+    broken = json.loads(sibling_bytes)
+    del broken['request']['execution_host']
+    sibling_path.write_text(json.dumps(broken))
+    change('dispatch', dict(request_id=identity, evidence='unknown sibling box'), expected=1)
+    sibling_path.write_bytes(sibling_bytes)
     change('reserve', request(identity))
     assert records()[identity] == first
     assert len(records()) == 2 and first['state'] == 'reserved'
@@ -91,3 +106,30 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     # Real durable records survive ownership change; no timeout or worker status frees them.
     assert records()['triage']['state'] == 'launching'
     print('PASS: conflicts, independent boxes, idempotency, adoption, halt, uncertainty and terminal evidence')
+
+# Exercise real fsync calls and their publication order, including first directory creation.
+import runpy
+import stat
+import io
+from contextlib import redirect_stdout
+from unittest.mock import patch
+
+with tempfile.TemporaryDirectory(prefix='fleet-durable-') as temporary:
+    events = []
+    real_sync, real_replace = os.fsync, os.replace
+
+    def sync(descriptor):
+        events.append('directory' if stat.S_ISDIR(os.fstat(descriptor).st_mode) else 'file')
+        return real_sync(descriptor)
+
+    def replace(source, target):
+        events.append('replace')
+        return real_replace(source, target)
+
+    payload = request('durable')
+    with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload)]), \
+            patch('os.fsync', side_effect=sync), patch('os.replace', side_effect=replace):
+        with redirect_stdout(io.StringIO()):
+            runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
+    assert events == ['directory', 'file', 'replace', 'directory'], events
+    print('PASS: parent and record directory synced around atomic publication')

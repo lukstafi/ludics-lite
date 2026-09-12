@@ -21,6 +21,60 @@ def nonempty(obj, keys):
             refuse(f"{key} must be a nonempty string")
 
 
+REQUEST_FIELDS = {"request_id", "wave", "worker", "transport", "issue", "purpose",
+                  "agent_host", "execution_host", "repository", "requested_revision", "kind"}
+STATES = {"reserved", "launching", "running", "uncertain", "concluded"}
+
+
+def validate_request(data):
+    if not isinstance(data, dict) or set(data) - REQUEST_FIELDS - {"triage_reason"}:
+        refuse("unknown reservation fields or invalid request")
+    nonempty(data, REQUEST_FIELDS)
+    if "triage_reason" in data:
+        nonempty(data, ["triage_reason"])
+    if data["kind"] not in {"correctness", "measurement"}:
+        refuse("kind must be correctness or measurement")
+    if data["transport"] not in {"subagent", "app", "cli", "coordinator"}:
+        refuse("invalid transport")
+
+
+def validate_record(record, path):
+    if not isinstance(record, dict):
+        refuse(f"invalid execution record: {path}")
+    nonempty(record, ["request_id", "coordinator", "lease_token", "state", "created_at", "updated_at"])
+    if record["request_id"] != path.stem or record["state"] not in STATES:
+        refuse(f"invalid execution record: {path}")
+    validate_request(record.get("request"))
+    if record["request"]["request_id"] != record["request_id"]:
+        refuse(f"mismatched request identity: {path}")
+    history = record.get("history")
+    if not isinstance(history, list) or not history:
+        refuse(f"missing execution history: {path}")
+    for event in history:
+        if not isinstance(event, dict) or not isinstance(event.get("data"), dict):
+            refuse(f"invalid execution history: {path}")
+        nonempty(event, ["at", "coordinator", "action"])
+    for key in ("remote_checkout", "handle", "log", "observed_sha", "verdict"):
+        if key in record:
+            nonempty(record, [key])
+    if "observed_sha" in record and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", record["observed_sha"]):
+        refuse(f"invalid observed SHA: {path}")
+    if record["state"] == "concluded":
+        nonempty(record, ["verdict", "log"])
+        if record["verdict"] not in {"pass", "fail", "timeout", "cancelled", "not-launched"}:
+            refuse(f"invalid terminal verdict: {path}")
+        if record["verdict"] != "not-launched":
+            nonempty(record, ["observed_sha", "remote_checkout", "handle"])
+
+
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def main():
     root, action, coordinator, token, raw = sys.argv[1:]
     directory = Path(root) / "executions"
@@ -29,10 +83,7 @@ def main():
     if directory.exists():
         for path in sorted(directory.glob("*.json")):
             record = json.loads(path.read_text())
-            if record.get("request_id") != path.stem or record.get("state") not in {
-                "reserved", "launching", "running", "uncertain", "concluded"
-            }:
-                refuse(f"invalid execution record: {path}")
+            validate_record(record, path)
             records[path.stem] = record
     if action == "list":
         print(json.dumps(list(records.values()), indent=2))
@@ -47,26 +98,19 @@ def main():
     now = datetime.now(timezone.utc).isoformat()
     record = records.get(identity)
     if action == "reserve":
-        required = {"request_id", "wave", "worker", "transport", "issue", "purpose",
-                    "agent_host", "execution_host", "repository", "requested_revision", "kind"}
-        if set(data) - required - {"triage_reason"}:
-            refuse("unknown reservation fields")
-        nonempty(data, required)
-        if "triage_reason" in data:
-            nonempty(data, ["triage_reason"])
-        if data["kind"] not in {"correctness", "measurement"}:
-            refuse("kind must be correctness or measurement")
-        if data["transport"] not in {"subagent", "app", "cli", "coordinator"}:
-            refuse("invalid transport")
+        validate_request(data)
         if record:
             if record["request"] != data:
                 refuse("request_id already names a different assignment")
             print(json.dumps(record, indent=2))
             return
+        halted = (Path(root) / "HALT").exists()
+        if "triage_reason" in data and not halted:
+            refuse("triage reservations require an active halt")
         for existing in records.values():
             if existing["state"] != "concluded" and existing["request"]["execution_host"] == data["execution_host"]:
                 refuse(f"box owned by {existing['request']['worker']} request={existing['request_id']} coordinator={existing['coordinator']}")
-        if (Path(root) / "HALT").exists():
+        if halted:
             nonempty(data, ["triage_reason"])
             # One explicitly named exception, not an unrestricted force flag.
             if any(r["state"] != "concluded" and r["request"].get("triage_reason") for r in records.values()):
@@ -126,6 +170,8 @@ def main():
     record["updated_at"] = now
     record["history"].append({"at": now, "coordinator": coordinator, "action": action, "data": data})
     directory.mkdir(exist_ok=True)
+    # Sync even on retry: an earlier failed sync may have left the new directory visible.
+    sync_directory(directory.parent)
     fd, temporary = tempfile.mkstemp(prefix=".execution-", dir=directory)
     try:
         with os.fdopen(fd, "w") as stream:
@@ -134,6 +180,7 @@ def main():
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, directory / (identity + ".json"))
+        sync_directory(directory)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

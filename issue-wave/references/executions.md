@@ -88,7 +88,8 @@ later dispatch. Otherwise preserve uncertainty or conclude with verified termina
 Recording and concluding existing executions remain available during a halt for reconciliation.
 
 A halt refuses ordinary reservations and dispatch. The one named regression-triage reservation
-may include a nonempty `triage_reason`; its dispatch is allowed during the halt. An outstanding
+may include a nonempty `triage_reason` only while a halt is active; its dispatch is allowed
+during the halt. Premarking ordinary reservations as future triage is refused. An outstanding
 triage assignment blocks another triage reservation while halted. This exception must correspond
 to the board's named triage worker, not a general bypass for ordinary work.
 
