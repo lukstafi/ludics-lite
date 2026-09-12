@@ -683,17 +683,18 @@ PERL
 mutant() {
   local root copy
   # The field-splitting mutant must load before the target case puts it in a spaced path.
-  # Keep this outer copy outside an ambient TMPDIR with spaces; the case still inherits it.
+  # Keep the outer copy outside an ambient TMPDIR with spaces. Each case creates its own
+  # required path; confine even a broken probe's uncleaned diagnostics to this registered root.
   TMPDIR=/tmp test_tmpdir root mutation
   copy="$root/$LIB_BASENAME"
   cp "$HELPER" "$root/"
   mutation_copy "$copy" "$1" "$2" "$2"
-  control_run "$copy"
+  TMPDIR="$root" control_run "$copy"
   assert_eq "$CONTROL_RC" 0 "mutation baseline for $1 ($CONTROL_ERR)"
   assert_eq "$CONTROL_OUT" "PASS: $1" "the selected baseline case must run"
   assert_eq "$CONTROL_ERR" "" "the baseline must be clean"
   mutation_copy "$copy" "$1" "$2" "$3"
-  control_run "$copy"
+  TMPDIR="$root" control_run "$copy"
   assert_eq "$CONTROL_RC" 1 "mutant must fail the assertion in $1 ($CONTROL_ERR)"
   assert_eq "$CONTROL_OUT" "" "the mutated case must not report a pass"
   assert_contains "$CONTROL_ERR" "FAIL: $4" "the named case must fail for the intended reason"
