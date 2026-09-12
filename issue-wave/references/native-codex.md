@@ -40,10 +40,14 @@ launch --kind codex`, or a shared-directory runtime subagent for these workers.
    must preserve the existing branch and first establish that its prior writer has stopped.
 6. A ready result supplies `threadId` and `hostId`. Record both. A setup-in-progress result
    may supply only `clientThreadId`: record it as pending, do not pass it to tools requiring
-   `threadId`, and do not call `create_thread` again just because setup is slow. Reconcile
-   with `list_threads` using project, host and the pending task's title/context; obtain the
-   real thread ID and confirm startup with `read_thread`. An ambiguous or failed creation
-   stays a gate until the app state establishes whether a task exists.
+   `threadId`, and do not call `create_thread` again just because setup is slow. A task can
+   remain absent from `list_threads` even while it is working, so absence is not a failed
+   creation and never justifies a duplicate. Reconcile by project, host and the pending task's
+   title/context when possible. More importantly, put the coordinator's actual thread ID in
+   the brief and require the worker to send its real thread/host ID, worktree, branch and base
+   SHA to the coordinator's recorded thread **and host** at startup. A known real ID can be
+   checked directly with `read_thread` even when discovery still omits it. An ambiguous creation
+   remains recorded as pending until app or worker evidence establishes its identity.
 
 An example of the creation arguments, after substituting a verified project ID and full brief:
 
@@ -59,10 +63,12 @@ An example of the creation arguments, after substituting a verified project ID a
 }
 ```
 
-The first worker update should identify its actual host, worktree path, branch and base SHA.
-Check them against the plan before treating the launch as successful. App-managed worktree
-paths replace the CLI launcher's `<checkout>-worktrees/<name>` convention for these workers.
-The worker owns only its issue; it must not claim the fleet lease or start another wave.
+The first worker update should identify its real thread and host IDs, worktree path, branch and
+base SHA, sent directly to the coordinator thread rather than left only in the worker's own
+transcript. Check them against the plan before treating the launch as successful. Require the
+same direct message for the final structured hand-back. App-managed worktree paths replace the
+CLI launcher's `<checkout>-worktrees/<name>` convention for these workers. The worker owns only
+its issue; it must not claim the fleet lease or start another wave.
 
 ## Shared board and recovery
 
@@ -86,6 +92,26 @@ resume supervision of the same identities. Read archived threads if a recorded t
 archived; disappearance from the recent list is not proof of failure. Do not assume a
 coordinator interruption stopped a worker, or that a persistent thread is still running.
 
+Treat discovery and hand-back as administrative evidence gates, distinct from code dependency
+gates. A dependent whose prerequisite merge and repository state are independently verified may
+start even if the prerequisite task is missing from discovery or its formal hand-back is late;
+record the evidence gap and keep pursuing it for close-out. Conversely, missing administrative
+evidence is not silently waived: account for every pending identity and hand-back before release.
+A user-relayed final hand-back is acceptable when the coordinator independently verifies its PR,
+merge, issue and Git/test claims and records that provenance.
+
+## Startup permissions
+
+Have the worker verify one harmless repository read and its first required Git mutation before
+substantial work. If the app shows full access but a mutation still opens a Deny/Allow-once gate,
+first report the mismatch. Changing the selection or sending guidance into the already-running
+turn may not change that turn's effective permissions. A recovery observed in multiple tasks is
+for the user to stop that active turn, select the intended access, and send a new `Continue` in
+the same task; verify the next mutation before proceeding. Use this only when the mismatch occurs:
+it is not a mandatory restart or a guaranteed remedy. Do not have the coordinator execute the
+blocked command, substitute a CLI worker, weaken configuration, or infer a tool setting that the
+current schema does not expose.
+
 ## Supervision and intervention
 
 Use `wait_threads` to await completion or attention, at most eight thread IDs per call,
@@ -93,6 +119,14 @@ with returned cursors to avoid replaying old reports. Use bounded waits and rota
 batches so one batch does not hide another. `read_thread` supplies progress and recent output;
 `list_threads` is discovery and recovery. A completed turn is not a merged issue: verify the
 PR state, issue state, commits and tests externally and continue unfinished work in that thread.
+
+Poll according to state, not a fixed forever cadence: short bounded waits for a running turn or
+new review, longer backoff for setup/discovery gaps or queued CI, and escalation or a deliberately
+slower scheduled recheck after three unchanged observations by default. Persist the last
+observation and next check on the board. Keep progressing other authorized, dependency-ready work
+while an administrative gate is quiet. A heartbeat should stay silent on unchanged, non-actionable
+state and notify only for a meaningful transition, failure, completion or required user action;
+repeated "still missing" or "still pending" notices do not supervise anything.
 
 Use `send_message_to_thread` with the recorded thread/host IDs to give corrections, request
 progress, continue a finished turn or request the final hand-back. Send a clear human-readable
@@ -109,6 +143,42 @@ gated and report the blocker. Never start a second writer or switch runtimes to 
 permission or policy block. A finisher's brief names the inherited branch, commits and PR;
 request the original worker's brainstorm in the original thread when it remains usable.
 
+Keep long local verification in a bounded harness-tracked foreground session and retrieve its
+actual exit verdict. A detached supervisor can disappear across a turn boundary while its child
+`dune` keeps running. If tracking is lost, inspect the process and its durable log/session first;
+do not start a duplicate build in the same `_build`, and do not claim a root cause the available
+evidence does not prove. Recover the existing verdict when possible; otherwise wait for the one
+active build to finish before rerunning under tracked supervision.
+
+## CI and review evidence
+
+All gates name a commit. A `pr-review.sh checks --wait` observation snapshots the PR head when it
+starts; after a push, identify and retire only this worker's obsolete waiter, then arm a new check
+for the new head. Never cancel an unverified process or another worker's watcher, and never count a
+green result for an older SHA as current-head evidence.
+
+`gh run view --log-failed` can wait for the entire workflow even when the failed job has already
+completed. For early diagnosis, read the completed job's log directly from
+`repos/<owner>/<repo>/actions/jobs/<job-id>/logs`, without treating that diagnostic read as the
+workflow verdict. Pass `--allow-escape-sequences` to `gh api` when `gh api --help` advertises the
+flag; older GitHub CLI releases use the same endpoint without it. The response can contain NUL
+bytes and ANSI control sequences: keep the raw log in a file and make a sanitized display copy for
+text inspection rather than placing raw output in shell variables or command substitutions.
+Continue to gate on the exact-head workflow and required jobs.
+
+When a brief requires an explicitly dispatched extended Windows workflow, ordinary PR CI is not
+a substitute and Windows must not be assumed to join it. Verify the dispatched run's `headSha`
+equals the intended commit, enumerate its jobs, and require the real Windows jobs to complete with
+the expected test execution evidence. Linux/macOS rows on that run do not prove Windows coverage.
+
+If sibling fixes become mutually gated on red branches, freeze both writers and confirm their
+remote SHAs, unpushed commits, and staged, unstaged and untracked state before changing ownership.
+Have the original owner commit useful dirty work, or durably capture its exact diff after proving
+the writer stopped. Then designate one owner and one PR, preserve and integrate the useful history,
+retire the superseded path only after every commit and saved diff is accounted for, and run review
+plus the full exact-head gate on the combined result. Consolidation removes the circular gate; it
+does not relax verification or permit two active writers.
+
 For a regression, set the anchor halt and tell native workers through
 `send_message_to_thread`; also follow the shared PR/integration protocol in SKILL.md.
 Every new native dispatch must pass `gate` even though the app itself does not know the halt.
@@ -121,10 +191,11 @@ apply Claude Desktop's `/loop`, `ScheduleWakeup` or pause timing to the Codex ap
 
 ## Close-out
 
-Collect the structured hand-back through `read_thread` (request it in the same thread if
-missing), verify merge and issue closure externally, and consolidate proposals as SKILL.md
-requires. Confirm no worker or its child processes can still write before cleanup. Keep the
-thread and its app-managed worktree through hand-back and any interventions. Do not apply the
+Collect the structured hand-back from the worker's direct coordinator message or through
+`read_thread` (request it in the same thread if missing), verify merge and issue closure
+externally, and consolidate proposals as SKILL.md requires. Confirm no worker or its child
+processes can still write before cleanup. Keep the thread and its app-managed worktree through
+hand-back and any interventions. Do not apply the
 CLI worktree-removal recipe to an app-managed worktree; use a documented app cleanup control
 when available, otherwise retain it and record that fact. Archiving a thread is not evidence
 that its worktree was removed. Release the fleet lease only after both native and CLI boards
