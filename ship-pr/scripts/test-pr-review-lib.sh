@@ -62,7 +62,12 @@
 # `retune` is covered in the same run, by a pair of cases: one moves two constants, the next reads
 # them back as pr-review.sh set them, which is the restore no case performs itself.
 #
-# To SHOW a guard can fail — which is how a control earns its place here — copy this file and
+# The mutation controls below automate two recorded regressions: splitting the snapshot path
+# into fields, and losing the failed probe status. Each runs only its target case, so there is
+# no recursive self-test; an unchanged copy must pass before the mutant fails its named assertion.
+# mutation_copy refuses patches that match zero or multiple sites, with its own refusal controls.
+#
+# To SHOW another guard can fail — which is how a control earns its place here — copy this file and
 # pr-review.sh into a scratch directory, revert the fix in the COPY, and run the copy:
 #
 #   cp ship-pr/scripts/{test-pr-review-lib.sh,pr-review.sh} "$d"/ && mv "$d"/test-pr-review-lib.sh "$d"/lib-reverted.sh
@@ -642,6 +647,58 @@ control_run() {
   CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
 }
 
+# mutation_copy <destination> <case> <old> <new>: patch exactly one literal occurrence
+# in the sourced preamble, then run only the named existing case. Restricting the patch to the
+# sourced section keeps the mutation's own quoted recipe out of its match count. The tracked
+# file is read only; a missing/ambiguous target refuses before any output file is written.
+mutation_copy() {
+  perl - "$TEST_LIB_FILE" "$@" <<'PERL'
+use strict;
+use warnings;
+my ($source, $dest, $case, $old, $new) = @ARGV;
+open my $in, '<', $source or die "$source: $!\n";
+local $/;
+my $text = <$in>;
+my $boundary = index($text, '# --- executed:');
+die "mutation_copy: missing executed boundary\n" if $boundary < 0;
+my $preamble = substr($text, 0, $boundary);
+my $count = 0;
+my $pos = -1;
+if (length $old) {
+  while (($pos = index($preamble, $old, $pos + 1)) >= 0) { $count++; }
+}
+die "mutation_copy: expected exactly one patch target, found $count\n" if $count != 1;
+substr($text, index($preamble, $old), length($old)) = $new;
+die "mutation_copy: invalid case\n" unless $case =~ /^test_[a-z0-9_]+$/;
+$text =~ s/\nrun_tests "\$\{tests\[\@\]\}"\n\z/\nrun_tests $case\n/
+  or die "mutation_copy: missing final case runner\n";
+open my $out, '>', $dest or die "$dest: $!\n";
+print {$out} $text or die "$dest: $!\n";
+close $out or die "$dest: $!\n";
+PERL
+}
+
+# mutant <case> <old> <new> <failure>: prove the unmodified case passes first, then
+# require its assertion failure, not a syntax/load failure or an unrelated earlier case.
+mutant() {
+  local root copy
+  # The field-splitting mutant must load before the target case puts it in a spaced path.
+  # Keep this outer copy outside an ambient TMPDIR with spaces; the case still inherits it.
+  TMPDIR=/tmp test_tmpdir root mutation
+  copy="$root/$LIB_BASENAME"
+  cp "$HELPER" "$root/"
+  mutation_copy "$copy" "$1" "$2" "$2"
+  control_run "$copy"
+  assert_eq "$CONTROL_RC" 0 "mutation baseline for $1 ($CONTROL_ERR)"
+  assert_eq "$CONTROL_OUT" "PASS: $1" "the selected baseline case must run"
+  assert_eq "$CONTROL_ERR" "" "the baseline must be clean"
+  mutation_copy "$copy" "$1" "$2" "$3"
+  control_run "$copy"
+  assert_eq "$CONTROL_RC" 1 "mutant must fail the assertion in $1 ($CONTROL_ERR)"
+  assert_eq "$CONTROL_OUT" "" "the mutated case must not report a pass"
+  assert_contains "$CONTROL_ERR" "FAIL: $4" "the named case must fail for the intended reason"
+}
+
 # The refusal is matched WITH the name the file gives itself — "$LIB_BASENAME: REFUSING", not the
 # bare word. Every refusal here opens with that prefix, and under a renamed copy the prefix is the
 # copy's name, so this one line is what pins the LIB_BASENAME rendering in every refusal a control
@@ -1062,6 +1119,34 @@ test_the_guard_survives_a_path_with_spaces() {
     "the snapshot should be populated, not empty-and-refused"
 }
 
+test_mutation_copy_refuses_missing_or_ambiguous_targets() {
+  local root rc err old
+  test_tmpdir root mutation-target
+  for old in 'no such preamble text' 'local'; do
+    rc=0
+    mutation_copy "$root/copy.sh" test_own_functions_pass "$old" broken 2>"$root/err" || rc=$?
+    err=$(cat "$root/err")
+    [ "$rc" -ne 0 ] || bail "a missing or ambiguous mutation target must fail"
+    assert_contains "$err" 'mutation_copy: expected exactly one patch target, found' \
+      "the patch count should explain the refusal"
+    [ ! -e "$root/copy.sh" ] || bail "a refused mutation must not write a copy"
+  done
+}
+
+test_snapshot_path_mutation_is_caught() {
+  mutant test_the_guard_survives_a_path_with_spaces \
+    '    path = $0
+    sub(/^[^ ]+ [^ ]+ /, "", path)' '    path = $3' \
+    'the refusal should name the shadow, not the snapshot'
+}
+
+test_probe_status_mutation_is_caught() {
+  mutant test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason \
+    ')" || lib_probe_rc=$?' ')"' \
+    "a probe that cannot read the constants is a refusal, not a suite failure ("
+  assert_contains "$CONTROL_ERR" "got '1', expected '2'" "the probe must expose the lost status capture"
+}
+
 # The route the whole file depends on: to SHOW a guard can fail you copy this file and pr-review.sh
 # into a scratch directory, revert the fix in the COPY, and run the copy — the tracked file is
 # never touched, so a session that dies between mutating and restoring leaves the repo clean. The
@@ -1142,6 +1227,9 @@ tests=(
   test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason
   test_the_guard_survives_a_path_with_spaces
   test_the_self_test_runs_from_a_renamed_copy
+  test_mutation_copy_refuses_missing_or_ambiguous_targets
+  test_snapshot_path_mutation_is_caught
+  test_probe_status_mutation_is_caught
 )
 
 run_tests "${tests[@]}"
