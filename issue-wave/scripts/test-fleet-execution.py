@@ -12,7 +12,8 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     root = Path(temporary)
     env = {**os.environ, 'FLEET_ANCHOR': 'local', 'FLEET_LOCAL_BOX': 'fixture',
            'ISSUE_WAVE_STATE': str(root), 'FLEET_ANCHOR_STATE': str(root),
-           'FLEET_COORDINATOR': 'first'}
+           'FLEET_COORDINATOR': 'first', 'FLEET_LOCK_WAIT': '10',
+           'FLEET_BOXES': 'rog minix other another case-one case-two'}
 
     def run(*args, owner='first', expected=0):
         result = subprocess.run(['bash', str(SCRIPT), *args], env={**env, 'FLEET_COORDINATOR': owner},
@@ -64,6 +65,10 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     identity = winners[0]
     change('reserve', request('minix', 'minix'))
     first = records()[identity]
+    owner_bytes = (root / 'executions' / (identity + '.json')).read_bytes()
+    for alias in ['ROG', 'rog-alias']:
+        change('reserve', request('wrong-host', alias), expected=1)
+        assert (root / 'executions' / (identity + '.json')).read_bytes() == owner_bytes
     sibling_path = root / 'executions' / 'minix.json'
     sibling_bytes = sibling_path.read_bytes()
     # A malformed unrelated owner must block dispatch of an otherwise valid request.
@@ -77,6 +82,13 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     del broken['request']['execution_host']
     sibling_path.write_text(json.dumps(broken))
     change('dispatch', dict(request_id=identity, evidence='unknown sibling box'), expected=1)
+    sibling_path.write_bytes(sibling_bytes)
+    legacy = json.loads(sibling_bytes)
+    legacy['request']['execution_host'] = 'old-minix-alias'
+    sibling_path.write_text(json.dumps(legacy))
+    change('dispatch', dict(request_id=identity, evidence='unknown legacy ownership'), expected=1)
+    change('reconcile', dict(request_id='minix', state='reserved', evidence='legacy record remains reconcilable'))
+    assert records()['minix']['request']['execution_host'] == 'old-minix-alias'
     sibling_path.write_bytes(sibling_bytes)
     change('reserve', request(identity))
     assert records()[identity] == first
@@ -149,13 +161,13 @@ with tempfile.TemporaryDirectory(prefix='fleet-durable-') as temporary:
         return real_replace(source, target)
 
     payload = request('durable')
-    with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload)]), \
+    with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload), env['FLEET_BOXES']]), \
             patch('os.fsync', side_effect=sync), patch('os.replace', side_effect=replace):
         with redirect_stdout(io.StringIO()):
             runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
     assert events == ['directory', 'file', 'replace', 'directory'], events
     events.clear()
-    with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload)]), \
+    with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload), env['FLEET_BOXES']]), \
             patch('os.fsync', side_effect=sync), redirect_stdout(io.StringIO()):
         runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
     assert events == ['directory', 'directory'], events

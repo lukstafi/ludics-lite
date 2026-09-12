@@ -6,7 +6,10 @@ under the existing coordinator lease lock. Use the same fleet environment as `cl
 
 There is one exclusive active assignment per execution host, for correctness and measurement
 alike. Use one canonical box name from the site's roster consistently (for example `rog-nv-wsl`,
-not an alternating SSH alias and app host ID). Choose placement using required hardware, current
+not an alternating SSH alias and app host ID). New reservations and dispatch require exact
+`FLEET_BOXES` entries; aliases and case variants are refused. Configure one canonical entry per
+physical box. Outstanding records outside a changed roster block dispatch until reconciled;
+reads and evidence/conclusion remain available. No SSH alias discovery is performed. Choose placement using required hardware, current
 load, outstanding assignments and available warm checkouts. Record the checkout actually used;
 this does not introduce persistent verifier worktrees, sync, scheduling or remote agent launch.
 

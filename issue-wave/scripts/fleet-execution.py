@@ -76,7 +76,7 @@ def sync_directory(path):
 
 
 def main():
-    root, action, coordinator, token, raw = sys.argv[1:]
+    root, action, coordinator, token, raw, boxes = sys.argv[1:]
     directory = Path(root) / "executions"
     # A corrupt record blocks dispatch instead of silently making its box available.
     records = {}
@@ -105,8 +105,19 @@ def main():
     if halt_identity is not None and not halt_identity.strip():
         refuse("invalid empty halt record")
     record = records.get(identity)
+    if action in {"reserve", "dispatch"}:
+        canonical_hosts = set(boxes.split())
+        if not canonical_hosts:
+            refuse("FLEET_BOXES must name the canonical fleet hosts")
+        # A changed roster cannot silently erase ownership recorded under an old alias.
+        # Keep reads and evidence/conclusion available to reconcile those records.
+        for existing in records.values():
+            if existing["state"] != "concluded" and existing["request"]["execution_host"] not in canonical_hosts:
+                refuse(f"reconcile noncanonical execution host on request {existing['request_id']} before dispatch")
     if action == "reserve":
         validate_request(data)
+        if data["execution_host"] not in canonical_hosts:
+            refuse("execution_host must exactly match a canonical FLEET_BOXES entry")
         if record:
             if record["request"] != data:
                 refuse("request_id already names a different assignment")
