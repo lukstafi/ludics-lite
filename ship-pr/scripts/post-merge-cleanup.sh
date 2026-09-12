@@ -1402,9 +1402,15 @@ if [ "$MASTER_AFTER_STATUS" -ne 0 ]; then
 fi
 MASTER_AFTER_OID=${MASTER_AFTER_LINE%%[[:space:]]*}
 if [ "$MASTER_AFTER_OID" != "$REMOTE_MASTER" ]; then
-  restore_remote_topic "$LOCAL_BRANCH_OID" ||
-    fail "remote $BASE_BRANCH changed to $MASTER_AFTER_OID, and the topic could not be restored"
-  fail "remote $BASE_BRANCH changed from $REMOTE_MASTER to $MASTER_AFTER_OID; origin/$BRANCH was restored"
+  # A sibling merge preserves the containment already proved against REMOTE_MASTER. Fetch
+  # the exact advertised object without advancing tracking refs or the prepared local base;
+  # fetching the branch name could instead validate a different tip after another remote move.
+  if ! git -C "$MAIN" fetch --no-tags --no-write-fetch-head "$ORIGIN_PUSH_URL" "$MASTER_AFTER_OID" ||
+    ! git -C "$MAIN" merge-base --is-ancestor "$REMOTE_MASTER" "$MASTER_AFTER_OID"; then
+    restore_remote_topic "$LOCAL_BRANCH_OID" ||
+      fail "remote $BASE_BRANCH changed to $MASTER_AFTER_OID without a verified fast-forward, and the topic could not be restored"
+    fail "remote $BASE_BRANCH changed from $REMOTE_MASTER to $MASTER_AFTER_OID without a verified fast-forward; origin/$BRANCH was restored"
+  fi
 fi
 
 CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
