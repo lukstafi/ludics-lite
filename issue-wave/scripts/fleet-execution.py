@@ -52,6 +52,8 @@ def main():
         if set(data) - required - {"triage_reason"}:
             refuse("unknown reservation fields")
         nonempty(data, required)
+        if "triage_reason" in data:
+            nonempty(data, ["triage_reason"])
         if data["kind"] not in {"correctness", "measurement"}:
             refuse("kind must be correctness or measurement")
         if data["transport"] not in {"subagent", "app", "cli", "coordinator"}:

@@ -1,6 +1,6 @@
 ---
 name: issue-wave
-description: Run a delegation wave over the issue backlog with ONE coordinator for the whole fleet - read the daily sequencing plan, propose a scope of D1/D2 issues with a box per issue from the plan's placement table, launch one worker per issue in its own worktree on that box using within-session Codex subagents or the Claude fleet launcher, each shipping via ship-pr, and supervise the wave to full merge. Use when asked to burn down issues, run a wave, or work the backlog. User decides worker type (Opus or Codex).
+description: Run a delegation wave over the issue backlog with ONE coordinator for the whole fleet - read the daily sequencing plan, propose a scope of D1/D2 issues with a box per issue from the plan's placement table, launch one worker per issue in its own worktree using within-session Codex subagents or the Claude fleet launcher, each shipping via ship-pr, and supervise the wave to full merge. Use when asked to burn down issues, run a wave, or work the backlog. User decides worker type (Opus or Codex).
 ---
 
 # Issue wave

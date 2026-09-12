@@ -35,6 +35,8 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
         return {r['request_id']: r for r in json.loads(run('execution', 'list'))}
 
     run('claim')
+    change('reserve', {**request('bad-triage'), 'triage_reason': True}, expected=1)
+    assert records() == {}
     # Two simultaneous ROG requests cannot both win. Independent Minix can proceed.
     def contend(identity):
         try:
