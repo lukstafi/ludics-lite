@@ -103,6 +103,10 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     assert records()[identity]['state'] == 'uncertain'
     change('dispatch', dict(request_id='minix', evidence='new coordinator'), owner='second', expected=1)
     change('reconcile', dict(request_id='minix', state='reserved', evidence='runner ledger proves no launch'), owner='second')
+    for state in ['running', 'uncertain']:
+        change('record', dict(request_id='minix', state=state, evidence='no dispatch'), owner='second', expected=1)
+    change('reconcile', dict(request_id='minix', state='uncertain', evidence='prelaunch outcome unclear'), owner='second')
+    change('reconcile', dict(request_id='minix', state='reserved', evidence='runner ledger proves no launch'), owner='second')
     run('halt', 'regression triage', owner='second')
     change('dispatch', dict(request_id='minix', evidence='ordinary halted'), owner='second', expected=1)
     change('reserve', request('halted', 'other'), owner='second', expected=1)
@@ -110,11 +114,24 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     change('reserve', triage, owner='second')
     change('reserve', {**request('second-triage', 'another'), 'triage_reason': 'another'}, owner='second', expected=1)
     old_halt = records()['triage']['halt_identity']
+    run('halt', 'updated regression reason', owner='second')
+    assert old_halt in (root / 'HALT').read_text()
+    change('reserve', {**request('reason-update-triage', 'another'), 'triage_reason': 'second slot'}, owner='second', expected=1)
+    run('claim', '--take', owner='third')
+    run('halt', 'adopted regression reason', owner='third')
+    assert old_halt in (root / 'HALT').read_text()
+    change('reconcile', dict(request_id='triage', state='reserved', evidence='adopter verified no launch'), owner='third')
+    change('dispatch', dict(request_id='triage', evidence='same generation after adoption'), owner='third')
+    # No runner was invoked by this fixture: reset through explicit evidence reconciliation.
+    change('reconcile', dict(request_id='triage', state='reserved', evidence='fixture never invoked runner'), owner='third')
+    run('claim', '--take', owner='second')
+    change('reconcile', dict(request_id='triage', state='reserved', evidence='ownership returned; no runner'), owner='second')
     run('resume-launches', owner='second')
     change('dispatch', dict(request_id='triage', evidence='ended halt'), owner='second', expected=1)
     # Identical reasons, even within one second, still create distinct halt generations.
     run('halt', 'regression triage', owner='second')
     change('dispatch', dict(request_id='triage', evidence='stale exception'), owner='second', expected=1)
+    change('reserve', {**request('occupied-old-box', 'other'), 'triage_reason': 'new halt'}, owner='second', expected=1)
     new_triage = {**request('current-triage', 'another'), 'triage_reason': 'current regression'}
     change('reserve', new_triage, owner='second')
     assert records()['current-triage']['halt_identity'] != old_halt

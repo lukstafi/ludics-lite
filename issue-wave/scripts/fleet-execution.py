@@ -75,6 +75,15 @@ def sync_directory(path):
         os.close(descriptor)
 
 
+def halt_generation(marker):
+    if marker is None:
+        return None
+    first_line = marker.splitlines()[0] if marker.splitlines() else ""
+    match = re.match(r"^\S+ id=(\S+) ", first_line)
+    # Also recognizes records saved by the earlier full-marker representation.
+    return match.group(1) if match else first_line
+
+
 def main():
     root, action, coordinator, token, raw, boxes = sys.argv[1:]
     directory = Path(root) / "executions"
@@ -101,7 +110,7 @@ def main():
         refuse("request_id collides with an existing identity by case")
     now = datetime.now(timezone.utc).isoformat()
     halt_path = Path(root) / "HALT"
-    halt_identity = halt_path.read_text() if halt_path.exists() else None
+    halt_identity = halt_generation(halt_path.read_text()) if halt_path.exists() else None
     if halt_identity is not None and not halt_identity.strip():
         refuse("invalid empty halt record")
     record = records.get(identity)
@@ -134,7 +143,7 @@ def main():
         if halted:
             nonempty(data, ["triage_reason"])
             # One explicitly named exception, not an unrestricted force flag.
-            if any(r["state"] != "concluded" and r.get("halt_identity") == halt_identity for r in records.values()):
+            if any(r["state"] != "concluded" and halt_generation(r.get("halt_identity")) == halt_identity for r in records.values()):
                 refuse("an outstanding triage assignment already exists")
         record = {"request_id": identity, "request": data, "coordinator": coordinator,
                   "lease_token": token, "state": "reserved", "created_at": now, "history": []}
@@ -164,12 +173,14 @@ def main():
             if record["lease_token"] != token:
                 refuse("adopted assignment must be reconciled before dispatch")
             triage = record["request"].get("triage_reason")
-            if triage and (halt_identity is None or record.get("halt_identity") != halt_identity):
+            if triage and (halt_identity is None or halt_generation(record.get("halt_identity")) != halt_identity):
                 refuse("triage assignment belongs to a different or ended halt")
             if halt_identity is not None and not triage:
                 refuse("fleet halted; ordinary dispatch refused")
             state = "launching"
         elif action == "record":
+            if record["state"] not in {"launching", "running", "uncertain"}:
+                refuse("record requires dispatch; use reconcile for recovered execution evidence")
             state = data.get("state")
             if state not in {"running", "uncertain"}:
                 refuse("record state must be running or uncertain")

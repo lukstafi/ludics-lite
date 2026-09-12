@@ -56,7 +56,8 @@ pending launch before making the call, and never repeat a launch because the con
 If adoption or halt occurs in that gap, reconciliation must account for the possible execution.
 
 Use `execution record` with the request ID, `state` (`running` or `uncertain`), and nonempty
-`evidence`. Add `observed_sha` (exact Git SHA), `remote_checkout`, `handle`, and `log` as known.
+`evidence`. This requires a dispatched assignment (`launching`, `running` or `uncertain`);
+use explicit reconciliation for recovered prelaunch observations. Add `observed_sha` (exact Git SHA), `remote_checkout`, `handle`, and `log` as known.
 SSH failure means uncertain execution, not a terminal failure. Elapsed time, agent completion
 and worker hand-back do not free a box. Record the requested revision separately from the
 observed SHA; the project's verifier determines whether the source/configuration is acceptable.
@@ -93,7 +94,8 @@ Recording and concluding existing executions remain available during a halt for 
 
 A halt refuses ordinary reservations and dispatch. The one named regression-triage reservation
 may include a nonempty `triage_reason` only while a halt is active; its dispatch is allowed
-during the halt. Premarking ordinary reservations as future triage is refused. Each halt receives a unique ID. A triage assignment is bound to that halt and cannot
+during the halt. Premarking ordinary reservations as future triage is refused. Each new halt receives a unique ID. Repeating `halt` to update its reason preserves that ID,
+including after coordinator adoption; only resume followed by a new halt changes it. A triage assignment is bound to that halt and cannot
 dispatch after it ends or during a later halt; its box stays reserved until reconciled. Only an
 outstanding triage assignment for the current halt blocks its next triage reservation. This exception must correspond
 to the board's named triage worker, not a general bypass for ordinary work.

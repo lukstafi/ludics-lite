@@ -1029,7 +1029,19 @@ cmd_halt() {
   local halt_id; halt_id=$(gen_uuid) || die "halt: cannot generate a halt identity"
   check_identity
   { prelude "$ANCHOR"; lease_mutation_prelude; cat <<'EOF'
-if ! printf '%s id=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$1" > "$ANCHOR_STATE/HALT" 2>/dev/null || [ ! -f "$ANCHOR_STATE/HALT" ]; then
+halt="$ANCHOR_STATE/HALT"; halt_id="$2"
+if [ -f "$halt" ]; then
+  existing_id=$(sed -n '1s/^[^ ]* id=\([^ ]*\) .*/\1/p' "$halt")
+  if [ -z "$existing_id" ]; then
+    # Legacy markers have no ID: retain their first line as the generation, append the update.
+    if printf 'update %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$halt"; then
+      echo "HALTED: launches refused until resume-launches -- $1"; exit 0
+    fi
+    echo "HALT FAILED: cannot update $halt on $BOX"; exit 1
+  fi
+  halt_id="$existing_id"
+fi
+if ! printf '%s id=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$halt_id" "$1" > "$ANCHOR_STATE/HALT" 2>/dev/null || [ ! -f "$ANCHOR_STATE/HALT" ]; then
   echo "HALT FAILED: cannot write $ANCHOR_STATE/HALT on $BOX -- the fleet is NOT halted"; exit 1
 fi
 echo "HALTED: launches refused until resume-launches -- $1"
