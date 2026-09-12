@@ -45,9 +45,9 @@ launch --kind codex`, or a shared-directory runtime subagent for these workers.
    creation and never justifies a duplicate. Reconcile by project, host and the pending task's
    title/context when possible. More importantly, put the coordinator's actual thread ID in
    the brief and require the worker to send its real thread/host ID, worktree, branch and base
-   SHA to that thread at startup. A known real ID can be checked directly with `read_thread`
-   even when discovery still omits it. An ambiguous creation remains recorded as pending until
-   app or worker evidence establishes its identity.
+   SHA to the coordinator's recorded thread **and host** at startup. A known real ID can be
+   checked directly with `read_thread` even when discovery still omits it. An ambiguous creation
+   remains recorded as pending until app or worker evidence establishes its identity.
 
 An example of the creation arguments, after substituting a verified project ID and full brief:
 
@@ -158,12 +158,13 @@ for the new head. Never cancel an unverified process or another worker's watcher
 green result for an older SHA as current-head evidence.
 
 `gh run view --log-failed` can wait for the entire workflow even when the failed job has already
-completed. For early diagnosis, read the completed job's log directly with
-`gh api --allow-escape-sequences repos/<owner>/<repo>/actions/jobs/<job-id>/logs`, without treating
-that diagnostic read as the workflow verdict. The response can contain NUL bytes and ANSI control
-sequences: keep the raw log in a file and make a sanitized display copy for text inspection rather
-than placing raw output in shell variables or command substitutions. Continue to gate on the
-exact-head workflow and required jobs.
+completed. For early diagnosis, read the completed job's log directly from
+`repos/<owner>/<repo>/actions/jobs/<job-id>/logs`, without treating that diagnostic read as the
+workflow verdict. Pass `--allow-escape-sequences` to `gh api` when `gh api --help` advertises the
+flag; older GitHub CLI releases use the same endpoint without it. The response can contain NUL
+bytes and ANSI control sequences: keep the raw log in a file and make a sanitized display copy for
+text inspection rather than placing raw output in shell variables or command substitutions.
+Continue to gate on the exact-head workflow and required jobs.
 
 When a brief requires an explicitly dispatched extended Windows workflow, ordinary PR CI is not
 a substitute and Windows must not be assumed to join it. Verify the dispatched run's `headSha`
