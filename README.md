@@ -69,6 +69,10 @@ mkdir -p "$HOME/.codex/skills"
 ln -sfn "$HOME/ludics-lite/issue-wave" "$HOME/.codex/skills/issue-wave"
 ```
 
+An optional [stop nudge](ship-pr/hooks/README.md) works with Claude Code and Codex to
+remind a session to consider landing finished work. It requires a separate hook
+registration and deliberately stays quiet during common exploratory workflows.
+
 ## Fleet configuration
 
 `issue-wave` assumes a fleet of boxes reachable over ssh, with one anchor box that holds the
