@@ -2425,6 +2425,49 @@ test_symbolic_ref_refusal() {
   echo "PASS: symbolic local and tracking refs are refused"
 }
 
+test_remote_base_advance() {
+  local real_git advanced_oid hook mode fake_bin log
+  for mode in success fetch-failure; do
+    setup_case "remote-base-advance-$mode" merge main-off main
+    real_git=$(command -v git)
+    git -C "$CASE_INTEGRATOR" commit --allow-empty -m sibling >/dev/null
+    advanced_oid=$(git -C "$CASE_INTEGRATOR" rev-parse HEAD)
+    if git -C "$CASE_MAIN" cat-file -e "$advanced_oid" 2>/dev/null; then
+      fail "sibling commit must initially be absent from the cleanup repository"
+    fi
+    hook="$CASE_MAIN/.git/hooks/pre-push"
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      '"$REAL_GIT" -C "$RACE_INTEGRATOR" push origin "$RACE_OID:refs/heads/main" >/dev/null' \
+      'exit 0' >"$hook"
+    chmod +x "$hook"
+    fake_bin="$CASE_ROOT/bin"
+    mkdir -p "$fake_bin"
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'if [ "$3" = fetch ] && [ "$5" = --no-write-fetch-head ] && [ "$RACE_MODE" = fetch-failure ]; then exit 1; fi' \
+      'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+    chmod +x "$fake_bin/git"
+    log="$CASE_ROOT/cleanup.log"
+    if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_INTEGRATOR="$CASE_INTEGRATOR" \
+      RACE_OID="$advanced_oid" RACE_MODE="$mode" \
+      "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --base main >"$log" 2>&1; then
+      [ "$mode" = success ] || fail "cleanup accepted an unverifiable base advance"
+      assert_cleaned
+      git -C "$CASE_MAIN" cat-file -e "$advanced_oid^{commit}" ||
+        fail "cleanup did not fetch the newly advertised base commit"
+    else
+      [ "$mode" = fetch-failure ] || { cat "$log"; fail "cleanup refused a sibling fast-forward"; }
+      assert_topic_preserved
+      grep 'without a verified fast-forward' "$log" >/dev/null ||
+        fail "cleanup did not refuse at the post-deletion ancestry guard"
+    fi
+    assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/main | awk '{print $1}')" \
+      "$advanced_oid" "cleanup must preserve the sibling base advance"
+  done
+  echo "PASS: sibling base advances are accepted only after a successful exact-tip fetch"
+}
+
 test_remote_master_lease() {
   local real_git remote_base hook log
   setup_case remote-master-lease merge main-off
@@ -3802,6 +3845,7 @@ TESTS=(
   test_late_active_session_operation_refusal
   test_late_session_module_refusal
   test_symbolic_ref_refusal
+  test_remote_base_advance
   test_remote_master_lease
   test_stale_master_response_retains_recovery
   test_symbolic_recovery_ref_refusal

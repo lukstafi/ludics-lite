@@ -910,8 +910,10 @@ explicitly, independent of the remote's configured fetch map, and proves the loc
 fast-forward before any remote deletion. A clean worktree keeps the base continuously reserved
 while the named ref is conditionally updated and its tree refreshed; when no worktree owns it, the
 helper creates a temporary owner for that same critical section. Remote topic deletion is leased
-on the observed topic OID and followed by fresh base and local-topic reads; if either changed
-or the base became unreadable, the current topic recovery ref is restored before refusal. The
+on the observed topic OID and followed by fresh base and local-topic reads. A changed base is
+fetched by its exact advertised OID and accepted only if it descends from the validated base;
+local and tracking base refs retain their already prepared tip. If that verification fails, the
+topic changes, or the base becomes unreadable, the topic is restored before refusal. The
 validated tip also remains reachable under a direct `refs/ship-pr/recovery/` ref because no finite
 remote read can rule out a later base rollback; a divergent remote-tracking tip is retained
 separately under `refs/ship-pr/tracking-recovery/` before pruning. The base-owner refresh uses a non-destructive porcelain
