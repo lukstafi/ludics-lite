@@ -85,7 +85,16 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     triage = {**request('triage', 'other'), 'triage_reason': 'named regression verification'}
     change('reserve', triage, owner='second')
     change('reserve', {**request('second-triage', 'another'), 'triage_reason': 'another'}, owner='second', expected=1)
-    change('dispatch', dict(request_id='triage', evidence='triage runner invocation'), owner='second')
+    old_halt = records()['triage']['halt_identity']
+    run('resume-launches', owner='second')
+    change('dispatch', dict(request_id='triage', evidence='ended halt'), owner='second', expected=1)
+    # Identical reasons, even within one second, still create distinct halt generations.
+    run('halt', 'regression triage', owner='second')
+    change('dispatch', dict(request_id='triage', evidence='stale exception'), owner='second', expected=1)
+    new_triage = {**request('current-triage', 'another'), 'triage_reason': 'current regression'}
+    change('reserve', new_triage, owner='second')
+    assert records()['current-triage']['halt_identity'] != old_halt
+    change('dispatch', dict(request_id='current-triage', evidence='current triage runner invocation'), owner='second')
     change('conclude', dict(request_id=identity, verdict='pass', evidence='worker handed back', log='worker.log'), owner='second', expected=1)
     for verdict in ['pass', 'fail', 'timeout', 'cancelled']:
         name = identity if verdict == 'pass' else verdict
@@ -104,7 +113,8 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
                             evidence='verified invocation never began'), owner='second')
     change('record', dict(request_id='triage', state='uncertain', observed_sha='main', evidence='bad SHA'), owner='second', expected=1)
     # Real durable records survive ownership change; no timeout or worker status frees them.
-    assert records()['triage']['state'] == 'launching'
+    assert records()['triage']['state'] == 'reserved'
+    assert records()['current-triage']['state'] == 'launching'
     print('PASS: conflicts, independent boxes, idempotency, adoption, halt, uncertainty and terminal evidence')
 
 # Exercise real fsync calls and their publication order, including first directory creation.
@@ -132,4 +142,9 @@ with tempfile.TemporaryDirectory(prefix='fleet-durable-') as temporary:
         with redirect_stdout(io.StringIO()):
             runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
     assert events == ['directory', 'file', 'replace', 'directory'], events
+    events.clear()
+    with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload)]), \
+            patch('os.fsync', side_effect=sync), redirect_stdout(io.StringIO()):
+        runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
+    assert events == ['directory', 'directory'], events
     print('PASS: parent and record directory synced around atomic publication')

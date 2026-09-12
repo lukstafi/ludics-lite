@@ -89,8 +89,9 @@ Recording and concluding existing executions remain available during a halt for 
 
 A halt refuses ordinary reservations and dispatch. The one named regression-triage reservation
 may include a nonempty `triage_reason` only while a halt is active; its dispatch is allowed
-during the halt. Premarking ordinary reservations as future triage is refused. An outstanding
-triage assignment blocks another triage reservation while halted. This exception must correspond
+during the halt. Premarking ordinary reservations as future triage is refused. Each halt receives a unique ID. A triage assignment is bound to that halt and cannot
+dispatch after it ends or during a later halt; its box stays reserved until reconciled. Only an
+outstanding triage assignment for the current halt blocks its next triage reservation. This exception must correspond
 to the board's named triage worker, not a general bypass for ordinary work.
 
 Fixtures: `python3 issue-wave/scripts/test-fleet-execution.py` exercises actual temporary anchor

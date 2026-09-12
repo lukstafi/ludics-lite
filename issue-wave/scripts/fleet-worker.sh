@@ -1026,14 +1026,15 @@ EXECUTION_COMMAND
 
 cmd_halt() {
   local reason="$*"; [ -n "$reason" ] || die "halt: give the reason (what regressed, who owns the fix)"
+  local halt_id; halt_id=$(gen_uuid) || die "halt: cannot generate a halt identity"
   check_identity
   { prelude "$ANCHOR"; lease_mutation_prelude; cat <<'EOF'
-if ! printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" > "$ANCHOR_STATE/HALT" 2>/dev/null || [ ! -f "$ANCHOR_STATE/HALT" ]; then
+if ! printf '%s id=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$1" > "$ANCHOR_STATE/HALT" 2>/dev/null || [ ! -f "$ANCHOR_STATE/HALT" ]; then
   echo "HALT FAILED: cannot write $ANCHOR_STATE/HALT on $BOX -- the fleet is NOT halted"; exit 1
 fi
 echo "HALTED: launches refused until resume-launches -- $1"
 EOF
-  } | run_on "$ANCHOR" HALT "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$reason"
+  } | run_on "$ANCHOR" HALT "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$reason" "$halt_id"
   local rc=$?; if unreachable "$rc"; then echo "HALT UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
 }
 
