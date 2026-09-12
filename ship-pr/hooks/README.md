@@ -7,7 +7,7 @@ continue once. It does not decide that a goal is finished or perform any landing
 
 ## Install
 
-Install the skill symlinks from the repository README first. Merge this entry into
+Point the hook directly at your persistent ludics-lite checkout. Merge this entry into
 `hooks.Stop` in `~/.claude/settings.json` for Claude Code or `~/.codex/hooks.json`
 for Codex, preserving any existing hooks:
 
@@ -19,7 +19,7 @@ for Codex, preserving any existing hooks:
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.claude/skills/ship-pr/hooks/ship-pr-nudge.sh",
+            "command": "\"$HOME/ludics-lite/ship-pr/hooks/ship-pr-nudge.sh\"",
             "timeout": 20
           }
         ]
@@ -29,8 +29,16 @@ for Codex, preserving any existing hooks:
 }
 ```
 
-Both use the canonical skill path above (including on Codex boxes). Replace any
-older registration of `~/.claude/hooks/ship-pr-nudge.sh` instead of keeping both.
+The example assumes the checkout is at `~/ludics-lite`; substitute its actual path
+on each machine, keeping the shell quotes for paths containing spaces. Both clients
+can use the same script directly. Use a persistent checkout, not a temporary task
+worktree. The hook reads the repository to inspect from the event's `cwd`, so its
+own location does not need to match the session's repository.
+
+Skill discovery is separate: follow the repository README to make `ship-pr`
+available to your agent. Hook registration does not require a skill-directory
+symlink. Replace any older registration through `~/.claude/hooks/` or
+`~/.claude/skills/` instead of keeping duplicate hooks.
 Codex requires review/trust of newly configured hooks before running them. Keep
 this hook synchronous: an asynchronous hook cannot request turn continuation.
 See the [Codex hook reference](https://learn.chatgpt.com/docs/hooks) and
