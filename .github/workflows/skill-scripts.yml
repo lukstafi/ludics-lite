@@ -293,6 +293,8 @@ jobs:
           set -e
           sudo apt-get update -q && sudo apt-get install -y -q tmux
           command -v tmux && command -v jq
+      - name: Exercise execution reservations
+        run: python3 issue-wave/scripts/test-fleet-execution.py
       - name: Exercise the fleet launcher against the local box
         run: issue-wave/scripts/test-fleet-worker.sh
 
@@ -369,6 +371,9 @@ jobs:
       - name: prompt checker fixtures
         if: ${{ !cancelled() }}
         run: scripts/test-check-prompts.sh || { echo '::error title=macOS suite failed::test-check-prompts.sh'; exit 1; }
+      - name: execution reservations
+        if: ${{ !cancelled() }}
+        run: python3 issue-wave/scripts/test-fleet-execution.py
       - name: fleet launcher
         if: ${{ !cancelled() }}
         run: issue-wave/scripts/test-fleet-worker.sh || { echo '::error title=macOS suite failed::test-fleet-worker.sh'; exit 1; }

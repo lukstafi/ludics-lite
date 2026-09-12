@@ -106,11 +106,13 @@ propagates merged skill edits to boxes that slept through the merge. A headless 
 needs the box's CLI logged in: `claude auth login` for Claude workers (an expired OAuth session
 cannot refresh headless, and `claude auth status` does not notice) and `codex login` for Codex
 CLI ones. The CLI preflight proves both with a live call, not a status read.
-Codex issue-wave workers normally use native app threads in dedicated worktrees; their
+Codex issue-wave workers normally use within-session runtime subagents in dedicated external worktrees; their
 `--native-codex` preflight checks skills and fleet reach without a CLI login or tmux dependency.
-The coordinator uses native thread tools for launch, supervision and follow-up, and keeps a
+The coordinator creates each worktree, uses runtime agent tools for supervision and follow-up, and keeps a
 shared anchor board alongside the CLI records. See
-[Native Codex workers](issue-wave/references/native-codex.md) for placement and recovery.
+[Native Codex workers](issue-wave/references/native-codex.md) for placement and recovery,
+the explicit separate-conversation alternative, and [execution reservations](issue-wave/references/executions.md)
+for remote legs and coordinator integration. The reservation helper requires Python 3 on the anchor.
 
 ## Routines
 

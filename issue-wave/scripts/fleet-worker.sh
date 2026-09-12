@@ -3,7 +3,7 @@
 # fleet and supervises them there, with the same commands whether the box is the coordinator's
 # own machine or a remote one reached over ssh (ludics-lite#4).
 #
-# Native Codex workers use app thread tools; this script supplies their --native-codex
+# Native Codex workers use runtime subagents (or explicitly chosen app tasks); this script supplies their --native-codex
 # freshness preflight and point-in-time gate. Their board is coordinator-maintained (see
 # references/native-codex.md); ls/status/attach/unstick below only handle CLI workers.
 #
@@ -47,6 +47,8 @@
 #   fleet-worker.sh unstick <box> <name> --message <file> [--kill] [-- <extra CLI args>]
 #   fleet-worker.sh ls [<box> ...]
 #   fleet-worker.sh load
+#   fleet-worker.sh execution list
+#   fleet-worker.sh execution reserve|dispatch|record|reconcile|conclude <json-file>
 #   fleet-worker.sh halt <reason> | resume-launches | halted
 #
 # `launch`, `unstick`, `halt` and `resume-launches` require the lease; `launch` also refuses
@@ -995,6 +997,33 @@ held=$(sed -n 's/^token=//p' "$lease" 2>/dev/null); hhost=$(sed -n 's/^host=//p'
 EOF
 }
 
+# JSON payloads travel as quoted positional arguments. The helper executes on the anchor
+# while the existing lease lock fences both adoption and concurrent reservations.
+cmd_execution() {
+  local action="${1:-}" payload='{}'
+  case "$action" in
+    list) [ "$#" -eq 1 ] || die "execution list: no arguments" ;;
+    reserve|dispatch|record|reconcile|conclude)
+      [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
+      payload=$(cat "$2") || die "execution: cannot read payload"
+      check_identity ;;
+    *) die "execution: list or reserve|dispatch|record|reconcile|conclude <json-file>" ;;
+  esac
+  local helper; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
+  [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
+  {
+    prelude "$ANCHOR"
+    if [ "$action" != list ]; then lease_mutation_prelude; else printf 'shift 3\n'; fi
+    cat <<'EXECUTION_COMMAND'
+python3 - "$ANCHOR_STATE" "$@" <<'FLEET_EXECUTION_PY'
+EXECUTION_COMMAND
+    cat "$helper"
+    printf '\nFLEET_EXECUTION_PY\n'
+  } | run_on "$ANCHOR" EXECUTION "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$action" "$(coordinator_id)" "$(my_token)" "$payload"
+  local rc=$?; if unreachable "$rc"; then echo "EXECUTION UNREACHABLE $ANCHOR: outcome unknown; reconcile before retrying dispatch"; exit 4; fi
+  exit "$rc"
+}
+
 cmd_halt() {
   local reason="$*"; [ -n "$reason" ] || die "halt: give the reason (what regressed, who owns the fix)"
   check_identity
@@ -1131,6 +1160,7 @@ case "$cmd" in
   unstick) cmd_unstick "$@" ;;
   ls) cmd_ls "$@" ;;
   load) cmd_load "$@" ;;
+  execution) cmd_execution "$@" ;;
   halt) cmd_halt "$@" ;;
   resume-launches) cmd_resume_launches "$@" ;;
   halted) cmd_halted "$@" ;;
