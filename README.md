@@ -410,10 +410,10 @@ every run. Run it locally with `gh` auth: `ship-pr/scripts/pr-review-api-contrac
 `.github/workflows/base-watch.yml` gives main's own CI verdict an owner (ludics-lite#73). Every
 worker's session starts by branching off main, and nothing read main's verdict between waves: main
 was once red for a day, unnamed, until a pull request tripped over it. So the read a worker does at
-session start, `pr-review.sh base lukstafi/ludics-lite main`, runs daily (06:47 UTC, away from the
-contract's slot) and on demand, and a scheduled run that finds a red — or a tip with no verdict at
-all, or a check that broke — opens one issue naming the workflow, the failing job and where the red
-starts, from a second job that checks nothing out and holds the only writing token. One issue per
+session start, `pr-review.sh base lukstafi/ludics-lite main`, runs after `skill scripts` completes a
+push run on main, daily (06:47 UTC, away from the contract's slot), and on demand. An unattended
+run that finds a red — or a tip with no verdict at all, or a check that broke — opens one issue
+naming the workflow, the failing job and where the red starts, from a second job that checks nothing out and holds the only writing token. One issue per
 red EPISODE, not per day: while it is open the next run comments on it, so closing it once main is
 green is what lets the next red open a fresh one. On a pull request it reads and reports without
 filing, and a red main does not redden the pull request: that verdict is about main, and a PR
