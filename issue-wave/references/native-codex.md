@@ -172,10 +172,12 @@ equals the intended commit, enumerate its jobs, and require the real Windows job
 the expected test execution evidence. Linux/macOS rows on that run do not prove Windows coverage.
 
 If sibling fixes become mutually gated on red branches, freeze both writers and confirm their
-remote SHAs and unpushed state before changing ownership. Designate one owner and one PR, preserve
-and integrate the useful committed history, retire the superseded path only after every commit is
-accounted for, and run review plus the full exact-head gate on the combined result. Consolidation
-removes the circular gate; it does not relax verification or permit two active writers.
+remote SHAs, unpushed commits, and staged, unstaged and untracked state before changing ownership.
+Have the original owner commit useful dirty work, or durably capture its exact diff after proving
+the writer stopped. Then designate one owner and one PR, preserve and integrate the useful history,
+retire the superseded path only after every commit and saved diff is accounted for, and run review
+plus the full exact-head gate on the combined result. Consolidation removes the circular gate; it
+does not relax verification or permit two active writers.
 
 For a regression, set the anchor halt and tell native workers through
 `send_message_to_thread`; also follow the shared PR/integration protocol in SKILL.md.
