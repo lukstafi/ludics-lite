@@ -58,7 +58,7 @@ jobs:
       - name: Check shell syntax
         run: |
           set -e
-          for f in */scripts/*.sh scripts/*.sh; do bash -n "$f"; done
+          for f in */scripts/*.sh ship-pr/hooks/*.sh scripts/*.sh; do bash -n "$f"; done
       - name: Check the mode bit
         # The same list as the syntax check above, under a two-way rule: a script must be
         # executable, and an `*.example.sh` must NOT be. A `> tmp && mv` rewrite of a script drops
@@ -75,7 +75,7 @@ jobs:
         run: |
           set -e
           rc=0
-          for f in */scripts/*.sh scripts/*.sh; do
+          for f in */scripts/*.sh ship-pr/hooks/*.sh scripts/*.sh; do
             case "$f" in
               *.example.sh)
                 if [ -x "$f" ]; then
@@ -95,7 +95,7 @@ jobs:
       - name: Shellcheck
         # Errors only: the warning tier is style and a few false positives on deliberately
         # unquoted globs; the error tier is what breaks a script.
-        run: shellcheck --severity=error --external-sources */scripts/*.sh scripts/*.sh
+        run: shellcheck --severity=error --external-sources */scripts/*.sh ship-pr/hooks/*.sh scripts/*.sh
       - name: Check PowerShell syntax
         # pwsh is preinstalled on the hosted Ubuntu and macOS images. Parse the Windows repair
         # script without executing its Windows-only networking and registry commands.
@@ -188,6 +188,16 @@ jobs:
   # what lets the job evaluate its condition at all when `changes` was skipped (a push), while a
   # `changes` job that FAILED leaves the output empty, so the suites are skipped and the red
   # `changes` check is the head's verdict: fail closed.
+
+  ship-pr-nudge:
+    name: ship-pr nudge (ubuntu)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 ship-pr/hooks/test-ship-pr-nudge.py
 
   pr-review:
     name: pr-review fixtures (ubuntu)
@@ -308,6 +318,9 @@ jobs:
           command -v tmux && command -v jq
       # Every suite step below runs whether or not an earlier one failed, and a failure names
       # its suite in the run's annotations; the job's conclusion is red if any step's is.
+      - name: ship-pr nudge
+        if: ${{ !cancelled() }}
+        run: python3 ship-pr/hooks/test-ship-pr-nudge.py || { echo '::error title=macOS suite failed::test-ship-pr-nudge.py'; exit 1; }
       - name: pr-review fixtures, shared preamble and shadow guard
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-lib.sh || { echo '::error title=macOS suite failed::test-pr-review-lib.sh'; exit 1; }
