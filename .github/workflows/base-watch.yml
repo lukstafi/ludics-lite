@@ -7,18 +7,21 @@ name: base watch
 # could read green. Every worker's session starts by branching off main, so the cost of an
 # unowned red is paid by everyone who starts work under it, in "is this my change?" time.
 #
-# So the same read a worker does at session start (`pr-review.sh base`) runs daily against main
-# itself, and what it finds gets an owner: one issue naming the workflow, the job that failed and
-# the commit the red starts at. Daily rather than per push, because this is the backstop behind
-# skill-scripts.yml's own run and not a second copy of it — a push's red is already visible on the
-# push; what this catches is a red nobody looked at. On demand as well, for the same reason the
-# contract check is: to be able to ask.
+# So the same read a worker does at session start (`pr-review.sh base`) runs when main's skill
+# scripts finishes, with a daily backstop, and gives a red an owner: one issue naming the workflow,
+# the job that failed and the commit the red starts at. A merger does not wait for trailing CI,
+# so waiting until morning would leave its red unowned (ludics-lite#126). On demand as well, for
+# the same reason the contract check is: to be able to ask.
 #
 # This workflow never appears in its own report: `base` folds `event=push` runs only, and nothing
 # here triggers on push. Giving it a push trigger would make a red base-watch file an issue about
 # base-watch.
 
 on:
+  workflow_run:
+    workflows: [skill scripts]
+    types: [completed]
+    branches: [main]
   schedule:
     # Away from api-contract.yml's 05:23 UTC: both read this repository's Actions API, and two
     # scheduled runs in the same minute would share a rate-limit window for no reason.
@@ -38,6 +41,8 @@ permissions:
 jobs:
   read:
     name: main's CI verdict
+    # A PR can also have a branch named main. Only a push in this repository owns main's CI.
+    if: ${{ github.event_name != 'workflow_run' || (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.id == github.repository_id) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -87,7 +92,7 @@ jobs:
           # workflow: on a pull request every verdict the command REACHED exits 0 here, or a PR
           # opened while main is red would carry a red check of its own and `pr-review.sh merge`
           # would refuse to land the very fix. A usage error or a crash (anything but 0, 1, 3, 4)
-          # is the PR's doing and stays red. On the schedule the run's own colour is the verdict.
+          # is the PR's doing and stays red. On unattended runs the run's colour is the verdict.
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             case "$rc" in
             0 | 1 | 3 | 4) exit 0 ;;
@@ -99,7 +104,7 @@ jobs:
     name: give the red an owner
     # A scheduled run nobody watches is exactly the state this workflow exists for, so the finding
     # has to leave the run. One issue per red EPISODE, not one per day: while the issue is open the
-    # next day's run comments on it instead, and closing it (main is green again) is what lets a
+    # next unattended run comments on it instead, and closing it (main is green again) is what lets a
     # later red open a fresh one. The title is therefore stable and carries no sha — a title
     # naming the first red commit would file a second issue the moment the commit scrolled out of
     # the run window.
@@ -107,12 +112,16 @@ jobs:
     # `!cancelled()` rather than `failure()`: a read job that died before writing its outputs
     # leaves rc empty, which is itself a silent failure of this check and is reported as one.
     # Exit 3 is the API not answering — an outage, not a fact about main — and is left to the
-    # next day's run, as the contract check leaves its own 3.
+    # next unattended run, as the contract check leaves its own 3.
     #
-    # Schedule only: a `workflow_dispatch` run is watched by whoever fired it, and an issue filed
+    # Unattended runs only: a `workflow_dispatch` run is watched by whoever fired it, and an issue filed
     # under their eyes is noise they then have to close.
     needs: read
-    if: ${{ !cancelled() && github.event_name == 'schedule' && needs.read.outputs.rc != '0' && needs.read.outputs.rc != '3' }}
+    if: ${{ !cancelled() && needs.read.result != 'skipped' && (github.event_name == 'schedule' || github.event_name == 'workflow_run') && needs.read.outputs.rc != '0' && needs.read.outputs.rc != '3' }}
+    # Serialize the lookup-and-create pair when a completion overlaps the daily backstop.
+    concurrency:
+      group: base-watch-report
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -146,11 +155,11 @@ jobs:
           esac
           # shellcheck disable=SC2016 # the backticks in the format are markdown, not substitution
           body=$(printf '%s: %s\n\n%s\n\n```\n%s\n```\n\n%s\n' \
-            "The daily base watch (\`ship-pr/scripts/pr-review.sh base $GITHUB_REPOSITORY main\`) $what" \
+            "The base watch (\`ship-pr/scripts/pr-review.sh base $GITHUB_REPOSITORY main\`) $what" \
             "$run_url" \
             "What it read, at $(date -u +%Y-%m-%dT%H:%M:%SZ):" \
             "${REPORT:-(the read produced no report)}" \
-            "Every worker's session starts by branching off main, so this is filed the day it happens rather than when a pull request trips over it (ludics-lite#73). One issue per episode: while this is open the daily run comments here instead of filing again, so close it once main is green.")
+            "Every worker's session starts by branching off main, so this is filed the day it happens rather than when a pull request trips over it (ludics-lite#73). One issue per episode: while this is open each unattended run comments here instead of filing again, so close it once main is green.")
           # The search API matches the phrase in the title; the issue this finds is this
           # workflow's own, because no other title is this one.
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
