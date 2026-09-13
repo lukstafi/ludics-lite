@@ -210,7 +210,9 @@ That window also extends past the ordinary timeout until the nudge's grace expir
 when the nudge follows a failed or stalled review. A temporary unreadable status retains the
 last healthy deadline; it cannot renew it. When pickup becomes an active review, the deadline
 hands off once to that review's eyes-start grace, then stays fixed. Quiet exits report the
-extended elapsed duration.
+extended elapsed duration. The observer treats older review results as preceding that explicit
+request; an approval newer than the nudge still wins immediately. Unreadable status reads
+leave newly seen nudge identities pending instead of consuming their grace.
 The outgoing watermark consumes the nudge identity, so carrying it into another watch does
 not buy fresh grace. Ordinary replies and edits reset nothing.
 

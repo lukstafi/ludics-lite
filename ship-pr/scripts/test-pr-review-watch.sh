@@ -39,7 +39,8 @@ age_of() {
   fi
 }
 status_state() {
-  if [ -n "${UNKNOWN_STATUS_ROUND:-}" ] && [ "$(poll_rounds)" -eq "$UNKNOWN_STATUS_ROUND" ]; then
+  if [ "${FIXTURE_STATUS_UNKNOWN:-0}" = 1 ] ||
+    { [ -n "${UNKNOWN_STATUS_ROUND:-}" ] && [ "$(poll_rounds)" -eq "$UNKNOWN_STATUS_ROUND" ]; }; then
     echo 'unknown|-|-|injected reactions outage'
   else
     fixture_original_status_state "$@"
@@ -922,7 +923,52 @@ test_a_final_poll_leaves_an_unarmed_nudge_pending() (
   done
 )
 
+test_a_fresh_nudge_supersedes_old_same_head_results() (
+  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 kind old comments
+  old=2026-09-01T00:00:00Z
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+  for kind in idle verdict thumb; do
+    reset_fixture
+    FIXTURE_FRESH_AGE=0
+    FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+    comments=$(jq -cn --arg at "$FIXTURE_FRESH_AT"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
+    case "$kind" in
+    idle) schedule reviews 1 "[$(review 599 "$H2" "$old")]" ;;
+    verdict) comments=$(jq -cn --argjson n "$comments" --argjson v "$(stamped_summary 699 "$old" "$H2" "Codex Review: Didn't find any major issues.")" '$n + [$v]') ;;
+    thumb) schedule reactions 1 "[$(reaction +1 "$old")]" ;;
+    esac
+    schedule comments 1 "$comments"
+    run_watch 0,699,599 1 0
+    assert_contains "$WATCH_ERR" 'extending watch' "a fresh request supersedes the older $kind result"
+    assert_not_contains "$WATCH_OUT" 'approved' "the older $kind cannot approve the requested round"
+  done
+  # A demonstrably newer approval still wins immediately.
+  reset_fixture
+  FIXTURE_FRESH_AGE=0
+  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+  schedule comments 1 "$(jq -cn --arg at "$FIXTURE_FRESH_AT"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  schedule reactions 1 "[$(reaction +1 "$(jq -rn --arg at "$FIXTURE_FRESH_AT" '($at|fromdateiso8601) + 1 | todate')")]"
+  run_watch 0,699,599 1 0
+  assert_contains "$WATCH_OUT" 'approved' "a later thumbs-up approves the new round"
+)
+
+test_unreadable_status_cannot_consume_a_loop_nudge() (
+  reset_fixture
+  local FIXTURE_STATUS_UNKNOWN=1 FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 mark
+  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+  schedule comments 1 "$(jq -cn --arg at "$FIXTURE_FRESH_AT"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  run_watch 0,0,0 1 0
+  mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
+  assert_eq "$mark" 0,0,0 "no healthy status read ever armed this nudge"
+  FIXTURE_STATUS_UNKNOWN=0
+  run_watch "$mark" 1 0
+  assert_contains "$WATCH_ERR" 'extending watch' "the recovered observer grants the still-pending nudge grace"
+)
+
 tests=(
+  test_a_fresh_nudge_supersedes_old_same_head_results
+  test_unreadable_status_cannot_consume_a_loop_nudge
   test_a_final_poll_leaves_an_unarmed_nudge_pending
   test_a_late_review_gets_its_own_grace_after_the_nudge
   test_an_unknown_boundary_uses_the_last_live_deadline

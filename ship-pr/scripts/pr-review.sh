@@ -1003,10 +1003,14 @@ pr_head_read() {
   return 0
 }
 
+review_after_nudge() { # <event timestamp> <eligible nudge timestamp, or empty>
+  [ -z "$2" ] || [[ "$1" > "$2" ]]
+}
+
 status_state() {
-  local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
+  local pr="$1" raw line age plus plus_at eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local vline verd_at verd_sha mstate="-" head_err="" pr_created=""
-  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at="" nudge_age nudge_active=false
+  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at="" nudge_age comments_loaded=false
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -1015,18 +1019,38 @@ status_state() {
   line=$(jq -r --arg rev "$REVIEWER" '
       [.[] | select((.user.login // "") | startswith($rev))]
       | "\(any(.[]; .content == "+1"))"
-        + "|" + ((map(select(.content == "eyes") | .created_at) | max) // "")' \
+        + "|" + ((map(select(.content == "eyes") | .created_at) | max) // "")
+        + "|" + ((map(select(.content == "+1") | .created_at) | max) // "")' \
     <<<"$raw" 2>/dev/null) || {
     echo "unknown|-|-|the reactions feed did not parse"
     return 0
   }
   plus="${line%%|*}"
-  eyes_at="${line#*|}"
+  line="${line#*|}"
+  eyes_at="${line%%|*}"
+  plus_at="${line#*|}"
+
+  # A watch must identify its pending request before accepting a standing verdict.
+  # Reuse this comments read below; standalone status keeps its reactions-only
+  # approval fast path because it has no incoming watch watermark to spend.
+  if [ -n "${watch_nudge_after:-}" ]; then
+    comments_raw=$(api_list "issues/$pr/comments?per_page=100") || {
+      echo "unknown|-|-|the comments API did not answer ($(gh_err_line))"
+      return 0
+    }
+    comments_loaded=true
+    nudge_at=$(jq -r --argjson after "$watch_nudge_after" '
+      [.[] | select(.id > $after)
+       | select((.body // "") | test("^@codex review[ \t\r\n]*(_🤖 Addressed by an automated coding agent_)?[ \t\r\n]*$"))
+       | .created_at // empty] | max // ""' <<<"$comments_raw")
+    nudge_age=$(age_of "$nudge_at")
+    case "$nudge_age" in '' | *[!0-9]*) nudge_at="" ;; esac
+  fi
 
   # 👍 is the merge gate and the reactions feed alone answers it, so it is answered before any feed
   # that could fail: an outage on the reviews feed must not hide an approval behind "unknown".
   # The PR read here is for the mergeability alone, and cannot change the verdict.
-  [ "$plus" = true ] && {
+  [ "$plus" = true ] && review_after_nudge "$plus_at" "$nudge_at" && {
     pr_head_read "$pr"
     echo "approved|-|$mstate|👍 from $REVIEWER"
     return 0
@@ -1060,11 +1084,15 @@ status_state() {
   # two polls, and one that never did times out at the shorter grace while the round is still
   # running (review of self-improve#13). It is an announcement, not the reviewer speaking; the
   # verdict scan below still reads it, in case a verdict is ever delivered by editing it in place.
-  raw=$(api_list "issues/$pr/comments?per_page=100") || {
-    echo "unknown|-|$mstate|the comments API did not answer ($(gh_err_line))"
-    return 0
-  }
-  comments_raw="$raw"
+  if [ "$comments_loaded" = true ]; then
+    raw="$comments_raw"
+  else
+    raw=$(api_list "issues/$pr/comments?per_page=100") || {
+      echo "unknown|-|$mstate|the comments API did not answer ($(gh_err_line))"
+      return 0
+    }
+    comments_raw="$raw"
+  fi
   com_at=$(jq -r --arg rev "$REVIEWER" '
       [.[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | test("codex-pull-request-review-summary") | not)
@@ -1113,6 +1141,14 @@ status_state() {
         end' <<<"$raw" 2>/dev/null) || fline="|"
   fail_at="${fline%%|*}"
   fail_ref="${fline#*|}"
+  # A new explicit request supersedes older evidence uniformly: neither an old
+  # success, failure, idle review nor reaction can settle that requested round.
+  # Newer events retain the established priority rules below.
+  review_after_nudge "$eyes_at" "$nudge_at" || eyes_at=""
+  if ! review_after_nudge "$rev_at" "$nudge_at"; then rev_at=""; rev_sha=""; fi
+  review_after_nudge "$com_at" "$nudge_at" || com_at=""
+  if ! review_after_nudge "$verd_at" "$nudge_at"; then verd_at=""; verd_sha=""; fi
+  if ! review_after_nudge "$fail_at" "$nudge_at"; then fail_at=""; fail_ref=""; fi
   last_spoke=$(newest "$rev_at" "$com_at")
 
   # The head SHA and the mergeability, in ONE read of the PR, made AFTER the feeds: every review
@@ -1123,21 +1159,6 @@ status_state() {
   # reading this state machine exists to prevent (review of ludics-lite#47). One read serves the
   # verdict check and the post-round states, which used to read it separately.
   pr_head_read "$pr"
-
-  # Only a watch can spend a nudge: its incoming watermark identifies comments not yet
-  # observed by an earlier window. Use creation time, never edits or ordinary replies.
-  # The outgoing poll watermark consumes that identity without adding persistent state.
-  if [ -n "${watch_nudge_after:-}" ]; then
-    nudge_at=$(jq -r --argjson after "$watch_nudge_after" '
-      [.[] | select(.id > $after)
-       | select((.body // "") | test("^@codex review[ \t\r\n]*(_🤖 Addressed by an automated coding agent_)?[ \t\r\n]*$"))
-       | .created_at // empty] | max // ""' <<<"$comments_raw")
-  fi
-  nudge_age=$(age_of "$nudge_at")
-  case "$nudge_age" in
-  '' | *[!0-9]*) ;;
-  *) [ "$nudge_age" -ge "$GRACE" ] || nudge_active=true ;;
-  esac
 
   # A no-findings verdict naming the CURRENT head outranks a live-looking 👀, and must be checked
   # BEFORE the in-flight return below: with the placeholder off the comment clock, a verdict
@@ -1165,10 +1186,6 @@ status_state() {
     case "$age" in
     '' | *[!0-9]*) ;;
     *) [ "$age" -ge "$STALL" ] && {
-      if [ "$nudge_active" = true ] && [[ "$nudge_at" > "$eyes_at" ]]; then
-        echo "nudged|$nudge_age|$mstate|fresh review nudge after the stalled 👀; waiting for pickup"
-        return 0
-      fi
       echo "stalled|$age|$mstate|👀 from $REVIEWER at $eyes_at with nothing posted since"
       return 0
     } ;;
@@ -1211,10 +1228,6 @@ status_state() {
         # boundary wider and the next round found the next hole. So the line states both moves
         # unconditionally, which is what the issue asked for and what a caller can act on
         # without the script deciding which case it is in.
-        if [ "$nudge_active" = true ] && [[ "$nudge_at" > "$fail_at" ]]; then
-          echo "nudged|$nudge_age|$mstate|fresh review nudge after the initialization failure; waiting for pickup"
-          return 0
-        fi
         echo "failed|$(age_of "$fail_at")|$mstate|${head_sha:0:7}|$REVIEWER reported an" \
           "initialization failure at $fail_at for ref ${fail_ref:0:7}"
         return 0
@@ -1247,7 +1260,7 @@ status_state() {
     return 0
   fi
 
-  if [ "$nudge_active" = true ]; then
+  if [ -n "$nudge_at" ]; then
     echo "nudged|$nudge_age|$mstate|fresh review nudge; waiting for pickup"
     return 0
   fi
@@ -1826,7 +1839,7 @@ cmd_watch() {
   pr="$PR_NUM"
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"
   local start=$SECONDS was state tok age quiet=0 saw=0 blind=0 past_seen=0 past_last=""
-  local watch_nudge_after extension_end="" candidate_end candidate_kind extension_kind="" remaining pause elapsed before_settle final_state
+  local watch_nudge_after extension_end="" candidate_end candidate_kind extension_kind="" remaining pause elapsed final_state last_healthy_mark="$mark"
   watch_nudge_after=$(mark_of "$mark" 2)
 
   state=$(status_state "$pr")
@@ -1852,6 +1865,7 @@ cmd_watch() {
     if [ "$tok" != unknown ]; then
       candidate_end=$(watch_grace_deadline "$state")
       candidate_kind="$tok"
+      last_healthy_mark="$mark"
     fi
 
     # A round's stdout is byte-identical to poll's, watermark last, so a caller can consume watch
@@ -1961,16 +1975,15 @@ cmd_watch() {
   # a whole re-arm (item 3 of ludics-lite#72).
   # A settle that did not answer falls through to the blind branch below, which already says the
   # tail of the window was not observed — the same fact, in the report that window is owed.
-  before_settle="$mark"
   watch_settle "$pr"
   if [ $? -eq 1 ]; then
     watch_act "$pr" "$(status_state "$pr")"
     return 0
   fi
 
-  if [ "$(mark_of "$mark" 2)" -gt "$(mark_of "$before_settle" 2)" ]; then
+  if [ "$(mark_of "$mark" 2)" -gt "$(mark_of "$last_healthy_mark" 2)" ]; then
     final_state=$(status_state "$pr")
-    watch_preserve_unarmed_nudge "$before_settle" "$state" "$final_state"
+    watch_preserve_unarmed_nudge "$last_healthy_mark" "$state" "$final_state"
   fi
 
   if [ "$saw" -eq 0 ]; then
