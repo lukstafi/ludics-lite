@@ -30,6 +30,8 @@ eval "$(declare -f status_state | sed '1s/status_state/fixture_original_status_s
 age_of() {
   if [ -n "${FIXTURE_FRESH_AT:-}" ] && [ "$1" = "$FIXTURE_FRESH_AT" ]; then
     echo "${FIXTURE_FRESH_AGE:-0}"
+  elif [ -n "${FIXTURE_REVIEW_AT:-}" ] && [ "$1" = "$FIXTURE_REVIEW_AT" ]; then
+    echo $((FIXTURE_FRESH_AGE - FIXTURE_REVIEW_START))
   elif [ -n "${FIXTURE_AGE:-}" ]; then
     echo "$FIXTURE_AGE"
   else
@@ -882,7 +884,25 @@ test_an_unknown_boundary_uses_the_last_live_deadline() (
   assert_contains "$WATCH_ERR" "holding 'reviewing'" "the boundary actually read unknown"
 )
 
+test_a_late_review_gets_its_own_grace_after_the_nudge() (
+  reset_fixture
+  local GRACE=1000 FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 FIXTURE_REVIEW_AT FIXTURE_REVIEW_START=900
+  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+  FIXTURE_REVIEW_AT=$(jq -rn --arg t "$FIXTURE_FRESH_AT" '($t | fromdateiso8601) + 900 | todate')
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + $1)); SECONDS=$((SECONDS + $1)); }
+  schedule comments 1 "$(jq -cn --arg at "$FIXTURE_FRESH_AT"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  schedule reactions 2 "[$(reaction eyes "$FIXTURE_REVIEW_AT")]"
+  # Without handoff, the nudge deadline stops at round 3 and settles at 4.
+  schedule reviews 5 "[$(review 501 "$H2" "$FIXTURE_REVIEW_AT")]"
+  run_watch 0,699,0 900 0
+  assert_eq "$WATCH_RC" 0 "the late-started review owns a full eyes-start grace"
+  assert_contains "$WATCH_OUT" '--- review id=501' "the review outlives the nudge pickup deadline"
+  assert_contains "$WATCH_ERR" 'handing off' "the phase transition is explicit"
+  assert_eq "$(occurrences "$WATCH_ERR" 'handing off')" 1 "later eyes observations cannot renew it"
+)
+
 tests=(
+  test_a_late_review_gets_its_own_grace_after_the_nudge
   test_an_unknown_boundary_uses_the_last_live_deadline
   test_nudges_wait_past_old_failed_and_stalled_states
   test_an_extension_holds_through_unknown_status

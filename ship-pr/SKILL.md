@@ -208,7 +208,9 @@ watch with the last watch's watermark. That newly observed comment buys one boun
 window measured from its creation time (the `comment` helper's automation footer is accepted).
 That window also extends past the ordinary timeout until the nudge's grace expires, including
 when the nudge follows a failed or stalled review. A temporary unreadable status retains the
-last healthy deadline; it cannot renew it. Quiet exits report the extended elapsed duration.
+last healthy deadline; it cannot renew it. When pickup becomes an active review, the deadline
+hands off once to that review's eyes-start grace, then stays fixed. Quiet exits report the
+extended elapsed duration.
 The outgoing watermark consumes the nudge identity, so carrying it into another watch does
 not buy fresh grace. Ordinary replies and edits reset nothing.
 

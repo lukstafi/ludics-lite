@@ -1807,12 +1807,13 @@ cmd_watch() {
   pr="$PR_NUM"
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"
   local start=$SECONDS was state tok age quiet=0 saw=0 blind=0 past_seen=0 past_last=""
-  local watch_nudge_after extension_end="" candidate_end remaining pause elapsed
+  local watch_nudge_after extension_end="" candidate_end candidate_kind extension_kind="" remaining pause elapsed
   watch_nudge_after=$(mark_of "$mark" 2)
 
   state=$(status_state "$pr")
   was=$(state_tok "$state")
   candidate_end=$(watch_grace_deadline "$state")
+  candidate_kind="$was"
   echo "watching PR $REPO#$pr, every ${interval}s for up to ${timeout}s;" \
     "from: $(status_line "$state")" >&2
 
@@ -1831,6 +1832,7 @@ cmd_watch() {
     age=$(state_age "$state")
     if [ "$tok" != unknown ]; then
       candidate_end=$(watch_grace_deadline "$state")
+      candidate_kind="$tok"
     fi
 
     # A round's stdout is byte-identical to poll's, watermark last, so a caller can consume watch
@@ -1918,7 +1920,15 @@ cmd_watch() {
         remaining=$((candidate_end - SECONDS))
         [ "$remaining" -gt 0 ] || break
         extension_end="$candidate_end"
+        extension_kind="$candidate_kind"
         warn "extending watch for the live review or fresh nudge, at most ${remaining}s beyond this poll"
+      fi
+      # Pickup and execution are distinct phases: allow the first live review
+      # its own eyes-start grace after a nudge. Once reviewing, never renew again.
+      if [ "$extension_kind" = nudged ] && [ "$candidate_kind" = reviewing ]; then
+        extension_end="$candidate_end"
+        extension_kind=reviewing
+        warn "review started after the nudge; handing off to its fixed live-review deadline"
       fi
       remaining=$((extension_end - SECONDS))
       [ "$remaining" -gt 0 ] || break
