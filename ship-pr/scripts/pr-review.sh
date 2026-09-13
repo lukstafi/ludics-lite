@@ -1724,8 +1724,26 @@ watch_settle() { # <pr>
 # The state is re-read after that poll, and only the state the verdict was ABOUT is still the
 # verdict: cmd_poll reads comments and reviews, and the 👍 is on neither, so an approval landing
 # in this same gap would otherwise be answered with a nudge — the one move that destroys it.
+# A final poll may see a nudge that no watch status read has armed yet. Keep
+# only that feed's old cursor when a fresh nudge (or an unreadable status) is
+# discovered at exit; the next watch can then spend it. Other feed cursors stand.
+watch_preserve_unarmed_nudge() { # <pre-settle watermark> <previous state> <new state>
+  local old_issue next_issue next_tok
+  old_issue=$(mark_of "$1" 2)
+  next_issue=$(mark_of "$mark" 2)
+  [ "$next_issue" -gt "$old_issue" ] || return 0
+  next_tok=$(state_tok "$3")
+  case "$next_tok" in
+  nudged) [ "$(state_tok "$2")" != nudged ] || return 0 ;;
+  unknown) ;; # An unreadable final status cannot prove a new nudge was consumed safely.
+  *) return 0 ;;
+  esac
+  mark="$(mark_of "$mark" 1),$old_issue,$(mark_of "$mark" 3)"
+  warn "keeping the final poll's issue comments pending for the next watch; a new nudge may still need its grace"
+}
+
 watch_end() { # <pr> <the state token the verdict is about> <message, empty for none>
-  local rc
+  local rc before_settle="$mark"
   watch_settle "$1"
   rc=$?
   if [ "$rc" -eq 1 ]; then
@@ -1743,6 +1761,7 @@ watch_end() { # <pr> <the state token the verdict is about> <message, empty for 
   fi
   state=$(status_state "$1")
   tok=$(state_tok "$state")
+  watch_preserve_unarmed_nudge "$before_settle" "$2" "$state"
   if [ "$tok" = unknown ]; then
     echo "the state could not be re-read after the final poll on PR $REPO#$1, so the '$2' verdict" \
       "is WITHHELD — $(state_detail "$state"); this is NOT 'the reviewer stayed quiet', re-arm"
@@ -1807,7 +1826,7 @@ cmd_watch() {
   pr="$PR_NUM"
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"
   local start=$SECONDS was state tok age quiet=0 saw=0 blind=0 past_seen=0 past_last=""
-  local watch_nudge_after extension_end="" candidate_end candidate_kind extension_kind="" remaining pause elapsed
+  local watch_nudge_after extension_end="" candidate_end candidate_kind extension_kind="" remaining pause elapsed before_settle final_state
   watch_nudge_after=$(mark_of "$mark" 2)
 
   state=$(status_state "$pr")
@@ -1942,10 +1961,16 @@ cmd_watch() {
   # a whole re-arm (item 3 of ludics-lite#72).
   # A settle that did not answer falls through to the blind branch below, which already says the
   # tail of the window was not observed — the same fact, in the report that window is owed.
+  before_settle="$mark"
   watch_settle "$pr"
   if [ $? -eq 1 ]; then
     watch_act "$pr" "$(status_state "$pr")"
     return 0
+  fi
+
+  if [ "$(mark_of "$mark" 2)" -gt "$(mark_of "$before_settle" 2)" ]; then
+    final_state=$(status_state "$pr")
+    watch_preserve_unarmed_nudge "$before_settle" "$state" "$final_state"
   fi
 
   if [ "$saw" -eq 0 ]; then

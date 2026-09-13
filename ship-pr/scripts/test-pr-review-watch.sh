@@ -901,7 +901,29 @@ test_a_late_review_gets_its_own_grace_after_the_nudge() (
   assert_eq "$(occurrences "$WATCH_ERR" 'handing off')" 1 "later eyes observations cannot renew it"
 )
 
+test_a_final_poll_leaves_an_unarmed_nudge_pending() (
+  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 kind mark
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+  for kind in quiet overdue; do
+    reset_fixture
+    FIXTURE_FRESH_AGE=0
+    FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+    if [ "$kind" = overdue ]; then
+      HEAD_AT=2026-09-01T00:00:00Z
+      PR_CREATED_AT="$HEAD_AT"
+    fi
+    schedule comments 2 "$(jq -cn --arg at "$FIXTURE_FRESH_AT"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+    run_watch 0,0,0 1 0
+    assert_eq "$WATCH_RC" 1 "the $kind final poll discovers a nudge it has not observed through grace"
+    mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
+    assert_eq "$mark" 0,0,0 "the $kind exit must leave the final nudge unconsumed"
+    run_watch "$mark" 1 0
+    assert_contains "$WATCH_ERR" 'extending watch' "the next watch grants the pending nudge its full grace"
+  done
+)
+
 tests=(
+  test_a_final_poll_leaves_an_unarmed_nudge_pending
   test_a_late_review_gets_its_own_grace_after_the_nudge
   test_an_unknown_boundary_uses_the_last_live_deadline
   test_nudges_wait_past_old_failed_and_stalled_states
