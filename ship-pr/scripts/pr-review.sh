@@ -3016,7 +3016,9 @@ compare_hunks() {
           elif ($l | startswith("+")) then .cur.n -= 1
           elif ($l | startswith(" ")) then .cur.o -= 1 | .cur.n -= 1
           else . end)
-        | if .ok and (.cur == null or (.cur.o == 0 and .cur.n == 0)) then .ranges else null end
+        # No recognized header means no evidence of disjointness, even when the totals match.
+        | if .ok and (.ranges | length) > 0 and (.cur.o == 0 and .cur.n == 0)
+          then .ranges else null end
       end;
     [.files[] | {key: .filename, value: ranges}] | from_entries' <<<"$1" 2>/dev/null
 }
@@ -3210,7 +3212,7 @@ warn_base_drift() {
       "$overlap_meet_count path(s) changed by"
     printf '!!! %s#%s: %s\n' "$REPO" "$pr" "$overlap_meet"
     if [ "$overlap_unread_count" -gt 0 ]; then
-      echo "!!! (hunks unread for $overlap_unread_count of them — no patch in the compare response," \
+      echo "!!! (hunks unread for $overlap_unread_count of them — patch missing or unreadable in the compare response," \
         "so counted as meeting: $overlap_unread)"
     fi
     if [ "$overlap_disjoint_count" -gt 0 ]; then
