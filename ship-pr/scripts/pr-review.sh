@@ -1877,7 +1877,7 @@ cmd_watch() {
   pr="$PR_NUM"
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"
   local start=$SECONDS was state tok age quiet=0 saw=0 blind=0 past_seen=0 past_last=""
-  local watch_nudge_after extension_end="" candidate_end candidate_kind extension_kind="" remaining pause elapsed final_state last_healthy_mark="$mark"
+  local watch_nudge_after extension_end="" candidate_end candidate_kind extension_kind="" extension_mark="" remaining pause elapsed final_state last_healthy_mark="$mark"
   watch_nudge_after=$(mark_of "$mark" 2)
 
   state=$(status_state "$pr")
@@ -1998,6 +1998,7 @@ cmd_watch() {
         [ "$remaining" -gt 0 ] || break
         extension_end="$candidate_end"
         extension_kind="$candidate_kind"
+        extension_mark="$mark"
         warn "extending watch for the live review or fresh nudge, at most ${remaining}s beyond this poll"
       fi
       # Pickup and execution are distinct phases: allow the first live review
@@ -2028,6 +2029,15 @@ cmd_watch() {
   if [ "$(mark_of "$mark" 2)" -gt "$(mark_of "$last_healthy_mark" 2)" ]; then
     final_state=$(status_state "$pr")
     watch_preserve_unarmed_nudge "$last_healthy_mark" "$state" "$final_state"
+  fi
+
+  # A later request cannot renew this frozen window, but it must remain
+  # eligible for the next observer. Keep comments after the extension checkpoint
+  # pending conservatively; no extra feed read or per-request deadline is needed.
+  if [ -n "$extension_mark" ] &&
+    [ "$(mark_of "$mark" 2)" -gt "$(mark_of "$extension_mark" 2)" ]; then
+    mark="$(mark_of "$mark" 1),$(mark_of "$extension_mark" 2),$(mark_of "$mark" 3)"
+    warn "comments after the fixed grace began remain pending; re-arm to observe any newer request"
   fi
 
   if [ "$saw" -eq 0 ]; then

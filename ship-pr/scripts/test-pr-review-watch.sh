@@ -1078,7 +1078,39 @@ test_an_actionable_result_with_unknown_status_keeps_pending_comments() (
   assert_not_contains "$WATCH_OUT" 'actionable during status outage' "the consumed review is not replayed"
 )
 
+test_a_new_request_during_fixed_grace_remains_pending() (
+  local kind FIXTURE_FRESH_AT FIXTURE_FRESH_AGE FIXTURE_REVIEW_AT FIXTURE_REVIEW_START mark comments second_nudge
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + 100)); SECONDS=$((SECONDS + 100)); }
+  for kind in nudged reviewing; do
+    reset_fixture
+    retune GRACE=200
+    FIXTURE_FRESH_AT=$(jq -rn 'now - 5 | todate')
+    FIXTURE_FRESH_AGE=0
+    FIXTURE_REVIEW_AT=$(jq -rn 'now | todate')
+    FIXTURE_REVIEW_START=100
+    HEAD_AT=2026-09-01T00:00:00Z
+    PR_CREATED_AT="$HEAD_AT"
+    comments=$(jq -cn --arg at "$FIXTURE_FRESH_AT" '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
+    schedule comments 1 "$comments"
+    second_nudge="$FIXTURE_REVIEW_AT"
+    [ "$kind" != reviewing ] || second_nudge=$(jq -rn 'now - 1 | todate')
+    schedule comments 2 "$(jq -cn --argjson old "$comments" --arg at "$second_nudge" '$old + [{id:701,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+    if [ "$kind" = reviewing ]; then
+      schedule reactions 1 "[$(reaction eyes "$(jq -rn 'now - 2 | todate')")]"
+      schedule reactions 2 "[$(reaction eyes "$FIXTURE_REVIEW_AT")]"
+    fi
+    run_watch 0,699,0 1 0
+    assert_eq "$WATCH_RC" 1 "the $kind extension stays bounded at the original deadline"
+    mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
+    assert_eq "$(mark_of "$mark" 2)" 700 "the request arriving during fixed $kind grace remains pending"
+    assert_contains "$WATCH_ERR" 'comments after the fixed grace began remain pending' "the caller is told to re-arm"
+    run_watch "$mark" 1 0
+    assert_contains "$WATCH_ERR" 'extending watch' "the next observer grants the remaining new request grace"
+  done
+)
+
 tests=(
+  test_a_new_request_during_fixed_grace_remains_pending
   test_a_second_nudge_at_settle_remains_pending
   test_an_actionable_result_with_unknown_status_keeps_pending_comments
   test_one_empty_reaction_read_retains_the_live_boundary
