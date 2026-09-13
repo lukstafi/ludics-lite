@@ -248,9 +248,10 @@ worker kinds, with transport-specific setup and identity, and includes:
   [CLI reservation handoff](references/executions.md#cli-reservation-handoff) before resuming it.
   A resumed worker runs only the assigned bounded command/batch, writes runner evidence to the
   named result file and exits again; neither turn completion nor its report releases the box.
-- Landing: the ship-pr skill through review to merge, then close the upstream issue with a
-  summary comment - `gh issue comment --body-file` first and `gh issue close` only if the merge
-  left it open, per ship-pr's *After it lands*, because `gh issue close --comment` on an issue a
+- Landing: the ship-pr skill through review to merge; for a PR that fully resolves the issue,
+  include `Closes #N` in its body (`Closes owner/repo#N` for a separate upstream tracker), per
+  ship-pr's *Open*. Then close out the tracked issue with a summary comment -
+  `gh issue comment --body-file` first and `gh issue close` only if the merge left it open, per ship-pr's *After it lands*, because `gh issue close --comment` on an issue a
   PR body's `Closes #N` already closed posts nothing at all - then the after-merge brainstorm
   ship-pr ends with, in **hand-back mode**:
   propose issues and chip candidates in the close-out report, file and spawn nothing - the
