@@ -28,7 +28,13 @@ stub age_of status_state
 eval "$(declare -f age_of | sed '1s/age_of/fixture_original_age_of/')"
 eval "$(declare -f status_state | sed '1s/status_state/fixture_original_status_state/')"
 age_of() {
-  if [ -n "${FIXTURE_AGE:-}" ]; then echo "$FIXTURE_AGE"; else fixture_original_age_of "$@"; fi
+  if [ -n "${FIXTURE_FRESH_AT:-}" ] && [ "$1" = "$FIXTURE_FRESH_AT" ]; then
+    echo "${FIXTURE_FRESH_AGE:-0}"
+  elif [ -n "${FIXTURE_AGE:-}" ]; then
+    echo "$FIXTURE_AGE"
+  else
+    fixture_original_age_of "$@"
+  fi
 }
 status_state() {
   if [ -n "${UNKNOWN_STATUS_ROUND:-}" ] && [ "$(poll_rounds)" -eq "$UNKNOWN_STATUS_ROUND" ]; then
@@ -751,23 +757,27 @@ test_the_same_body_against_two_heads_is_not_folded() {
 
 # A nudge buys one observer window, identified by its comment id. Carrying the
 # returned watermark into the next window must not buy that same grace again.
-test_a_nudge_buys_exactly_one_window() {
+test_a_nudge_buys_exactly_one_window() (
+  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
   reset_fixture
   HEAD_AT=2026-09-01T00:00:00Z
   PR_CREATED_AT="$HEAD_AT"
   local now mark
   now=$(jq -rn 'now | todate')
+  FIXTURE_FRESH_AT="$now"
   schedule comments 1 "$(jq -cn --arg at "$now" '{id:700,user:{login:"maintainer"},created_at:$at,
     body:"@codex review\n\n_🤖 Addressed by an automated coding agent_"}' | jq -s '.')"
   run_watch 0,699,0 1 0
-  assert_eq "$WATCH_RC" 1 "a fresh nudge keeps the otherwise overdue observer armed"
-  assert_not_contains "$WATCH_OUT" "no review materialized" "no immediate repeat nudge verdict"
+  assert_eq "$WATCH_RC" 0 "a fresh nudge is observed until its grace expires"
+  assert_contains "$WATCH_ERR" "extending watch" "the nudge owns the full grace beyond timeout"
+  [ "$(poll_rounds)" -ge 3 ] || bail "the nudge verdict returned on the first poll"
   mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
   assert_eq "$mark" 0,700,0 "the nudge identity is consumed by the outgoing watermark"
   run_watch "$mark" 1 0
   assert_eq "$WATCH_RC" 0 "the next window cannot renew the same nudge"
   assert_contains "$WATCH_OUT" "no review materialized" "the overdue verdict remains available"
-}
+)
 
 test_an_ordinary_reply_or_old_nudge_does_not_reset_grace() {
   local body
@@ -811,14 +821,19 @@ test_a_live_round_extension_is_bounded() (
   assert_eq "$WATCH_RC" 1 "a round with no result cannot extend forever"
   assert_contains "$WATCH_OUT" 'no reviewer activity' "the exhausted extension returns quiet"
   assert_contains "$WATCH_ERR" 'extending watch' "the ordinary window was extended first"
+  assert_not_contains "$WATCH_OUT" 'in 0s' "the verdict reports the extended elapsed duration"
 )
 
-test_nudges_wait_past_old_failed_and_stalled_states() {
+test_nudges_wait_past_old_failed_and_stalled_states() (
+  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
   local kind old now comments
   old=2026-09-01T00:00:00Z
   for kind in failed stalled; do
     reset_fixture
     now=$(jq -rn 'now | todate')
+    FIXTURE_FRESH_AT="$now"
+    FIXTURE_FRESH_AGE=0
     comments=$(jq -cn --arg at "$now"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
     if [ "$kind" = stalled ]; then
       schedule reactions 1 "[$(reaction eyes "$old")]"
@@ -829,12 +844,13 @@ test_nudges_wait_past_old_failed_and_stalled_states() {
     fi
     schedule comments 1 "$comments"
     run_watch 0,699,0 1 0
-    assert_eq "$WATCH_RC" 1 "fresh nudge waits beyond the old $kind verdict"
+    assert_eq "$WATCH_RC" 0 "fresh nudge waits until its grace expires before $kind"
+    [ "$(poll_rounds)" -ge 3 ] || bail "the $kind verdict returned before the nudge grace"
     assert_contains "$WATCH_ERR" 'fresh review nudge' "the nudge explains the new wait"
     run_watch 0,700,0 1 0
     assert_eq "$WATCH_RC" 0 "the same nudge cannot suppress $kind for another window"
   done
-}
+)
 
 test_an_extension_holds_through_unknown_status() (
   reset_fixture
@@ -852,7 +868,22 @@ test_an_extension_holds_through_unknown_status() (
   assert_contains "$WATCH_ERR" "holding 'reviewing'" "the unknown status held the known live state"
 )
 
+test_an_unknown_boundary_uses_the_last_live_deadline() (
+  reset_fixture
+  local UNKNOWN_STATUS_ROUND=2
+  sleep() { SECONDS=$((SECONDS + 100)); }
+  local now
+  now=$(jq -rn 'now | todate')
+  schedule reactions 1 "[$(reaction eyes "$now")]"
+  schedule reviews 4 "[$(review 501 "$H2" "$now")]"
+  run_watch 0,0,0 1 100
+  assert_eq "$WATCH_RC" 0 "the first boundary outage keeps the cached live deadline"
+  assert_contains "$WATCH_OUT" '--- review id=501' "the later round is still observed"
+  assert_contains "$WATCH_ERR" "holding 'reviewing'" "the boundary actually read unknown"
+)
+
 tests=(
+  test_an_unknown_boundary_uses_the_last_live_deadline
   test_nudges_wait_past_old_failed_and_stalled_states
   test_an_extension_holds_through_unknown_status
   test_a_nudge_buys_exactly_one_window

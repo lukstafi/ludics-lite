@@ -935,10 +935,12 @@ fmt_age() {
 #   failed    the reviewer's newest word is the INITIALIZATION failure above: the round never ran.
 #   expected  no live 👀 and no review of the head SHA: a round is due and has not started.
 #   idle      the reviewer has reviewed this exact head and left no 👍, so the next move is yours.
+#   nudged    watch-only: a fresh nudge owns one creation-time grace window.
 #   unknown   a read failed. NOT a state of the PR — hold the previous one and retry.
 # <seconds> is how long the state has held: since the 👀 for reviewing/stalled, since the failure
 # comment for failed, and for expected since the LATEST of head commit / PR creation / reviewer's
-# last word / spent 👀 — i.e. since the moment a review became due. "-" when nothing datable was
+# last word / spent 👀 — i.e. since the moment a review became due; nudged uses
+# the fresh nudge comment creation time. "-" when nothing datable was
 # read.
 #
 # `failed` sits below 👍 and below a live 👀, and above everything else. A 👍 is the merge gate
@@ -1164,7 +1166,7 @@ status_state() {
     '' | *[!0-9]*) ;;
     *) [ "$age" -ge "$STALL" ] && {
       if [ "$nudge_active" = true ] && [[ "$nudge_at" > "$eyes_at" ]]; then
-        echo "expected|$nudge_age|$mstate|fresh review nudge after the stalled 👀; waiting for pickup"
+        echo "nudged|$nudge_age|$mstate|fresh review nudge after the stalled 👀; waiting for pickup"
         return 0
       fi
       echo "stalled|$age|$mstate|👀 from $REVIEWER at $eyes_at with nothing posted since"
@@ -1210,7 +1212,7 @@ status_state() {
         # unconditionally, which is what the issue asked for and what a caller can act on
         # without the script deciding which case it is in.
         if [ "$nudge_active" = true ] && [[ "$nudge_at" > "$fail_at" ]]; then
-          echo "expected|$nudge_age|$mstate|fresh review nudge after the initialization failure; waiting for pickup"
+          echo "nudged|$nudge_age|$mstate|fresh review nudge after the initialization failure; waiting for pickup"
           return 0
         fi
         echo "failed|$(age_of "$fail_at")|$mstate|${head_sha:0:7}|$REVIEWER reported an" \
@@ -1242,6 +1244,11 @@ status_state() {
   # is exactly "has the reviewer seen THIS head" with no push time to estimate.
   if [ "$rev_sha" = "$head_sha" ]; then
     echo "idle|$(age_of "$last_spoke")|$mstate|$REVIEWER reviewed head ${head_sha:0:7} at $rev_at"
+    return 0
+  fi
+
+  if [ "$nudge_active" = true ]; then
+    echo "nudged|$nudge_age|$mstate|fresh review nudge; waiting for pickup"
     return 0
   fi
 
@@ -1370,7 +1377,7 @@ status_line() {
       "ref it could not fetch is one the PR and git ls-remote both serve. This is not a round —" \
       "$frest, standing for $(fmt_age "$age")${conflict:+; $conflict}"
     ;;
-  expected) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")${conflict:+; $conflict}" ;;
+  expected | nudged) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")${conflict:+; $conflict}" ;;
   # "The next move is yours" is exactly the line that sent #39 into seven untested rounds: on a
   # conflicted PR the move is the base merge, and saying anything else invites another push. A
   # draft takes it away for the same reason (#49): its move is `gh pr ready`, and "yours" would
@@ -1783,17 +1790,29 @@ watch_end() { # <pr> <the state token the verdict is about> <message, empty for 
 # Every other state gets a bounded wait and then a verdict, because a window that reports nothing is
 # indistinguishable — to the caller and to the user watching the clock — from a window that reported
 # a stale 👀 three times in a row.
+# A healthy live-round or nudge read provides an absolute grace deadline. An
+# unreadable state supplies none; cmd_watch retains its last healthy candidate.
+watch_grace_deadline() {
+  local tok age
+  tok=$(state_tok "$1")
+  case "$tok" in reviewing | nudged) ;; *) return 0 ;; esac
+  age=$(state_age "$1")
+  case "$age" in '' | *[!0-9]*) return 0 ;; esac
+  echo $((SECONDS + GRACE - age))
+}
+
 cmd_watch() {
   local pr="${1:?usage: watch <pr> [watermark]}" mark="${2:-}"
   pr_arg "$pr"
   pr="$PR_NUM"
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"
   local start=$SECONDS was state tok age quiet=0 saw=0 blind=0 past_seen=0 past_last=""
-  local watch_nudge_after extension_end="" remaining pause
+  local watch_nudge_after extension_end="" candidate_end remaining pause elapsed
   watch_nudge_after=$(mark_of "$mark" 2)
 
   state=$(status_state "$pr")
   was=$(state_tok "$state")
+  candidate_end=$(watch_grace_deadline "$state")
   echo "watching PR $REPO#$pr, every ${interval}s for up to ${timeout}s;" \
     "from: $(status_line "$state")" >&2
 
@@ -1810,6 +1829,9 @@ cmd_watch() {
     state=$(status_state "$pr")
     tok=$(state_tok "$state")
     age=$(state_age "$state")
+    if [ "$tok" != unknown ]; then
+      candidate_end=$(watch_grace_deadline "$state")
+    fi
 
     # A round's stdout is byte-identical to poll's, watermark last, so a caller can consume watch
     # and poll the same way; the state is context, not the finding, so it goes to stderr.
@@ -1854,7 +1876,7 @@ cmd_watch() {
       # A 👀 that stops being in flight without a review of the head is a round that ended with
       # nothing. Make it prove itself over two rounds, since one read can be a false negative — and
       # this is the fast path to the same verdict the grace below reaches on the clock alone.
-      if [ "$was" = reviewing ] && [ "$tok" != reviewing ]; then
+      if [ "$was" = reviewing ] && [ "$tok" != reviewing ] && [ "$tok" != nudged ]; then
         quiet=$((quiet + 1))
         if [ "$quiet" -ge 2 ]; then
           watch_end "$pr" "$tok" "$(echo "the 👀 round on PR $REPO#$pr ended without a review of" \
@@ -1869,7 +1891,7 @@ cmd_watch() {
       # takes minutes to pick a push up — and then it is worth SAYING, because there is nothing on
       # the other end to wait for. The grace runs from the PR's clock, not the window's, so it is
       # reached in the second window rather than never.
-      if [ "$tok" = expected ]; then
+      if [ "$tok" = expected ] || [ "$tok" = nudged ]; then
         case "$age" in
         '' | *[!0-9]*) ;;
         *)
@@ -1889,17 +1911,14 @@ cmd_watch() {
     if [ $((SECONDS - start + interval)) -gt "$timeout" ]; then
       # A live round can outlast the ordinary quiet window. Freeze the extension's
       # deadline on its first use so changing reactions cannot renew it indefinitely.
-      if [ "$tok" != reviewing ]; then
-        # A failed status read holds a known live round, but cannot create or renew
-        # its extension. The same frozen deadline bounds even a lasting outage.
-        [ "$tok" = unknown ] && [ "$was" = reviewing ] && [ -n "$extension_end" ] || break
-      fi
+      # Cache deadlines on healthy reads, including before the ordinary boundary.
+      # Unknown reads retain that evidence; none can invent or renew a deadline.
+      [ -n "$candidate_end" ] || break
       if [ -z "$extension_end" ]; then
-        case "$age" in '' | *[!0-9]*) break ;; esac
-        remaining=$((GRACE - age))
+        remaining=$((candidate_end - SECONDS))
         [ "$remaining" -gt 0 ] || break
-        extension_end=$((SECONDS + remaining))
-        warn "extending watch for the in-flight 👀, at most ${remaining}s beyond this poll"
+        extension_end="$candidate_end"
+        warn "extending watch for the live review or fresh nudge, at most ${remaining}s beyond this poll"
       fi
       remaining=$((extension_end - SECONDS))
       [ "$remaining" -gt 0 ] || break
@@ -1937,7 +1956,9 @@ cmd_watch() {
   fi
   # The state is the last round's, not a fresh read: it is what the window actually observed, and a
   # re-read here would report a change this window never saw and never acted on.
-  echo "$(watch_quiet_line "$timeout"); status: $(status_line "$state")"
+  elapsed="$timeout"
+  [ -z "$extension_end" ] || elapsed=$((SECONDS - start))
+  echo "$(watch_quiet_line "$elapsed"); status: $(status_line "$state")"
   echo "watermark: $mark"
   return 1
 }

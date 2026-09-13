@@ -206,6 +206,9 @@ A live 👀 at the quiet-window deadline extends the watch until at most
 more reactions cannot renew it. When you post a plain `@codex review` nudge, arm the next
 watch with the last watch's watermark. That newly observed comment buys one bounded grace
 window measured from its creation time (the `comment` helper's automation footer is accepted).
+That window also extends past the ordinary timeout until the nudge's grace expires, including
+when the nudge follows a failed or stalled review. A temporary unreadable status retains the
+last healthy deadline; it cannot renew it. Quiet exits report the extended elapsed duration.
 The outgoing watermark consumes the nudge identity, so carrying it into another watch does
 not buy fresh grace. Ordinary replies and edits reset nothing.
 
