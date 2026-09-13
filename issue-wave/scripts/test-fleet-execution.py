@@ -51,10 +51,15 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     change('reserve', mixed_case)
     change('conclude', dict(request_id='CaseJob', verdict='not-launched',
                            log='/logs/case-check', evidence='fixture never dispatched'))
-    # Two simultaneous ROG requests cannot both win. Independent Minix can proceed.
+    # Host-local CLI and remote native requests contend for the same box, regardless of
+    # transport/residence. The same issue can independently reserve another box.
+    competitors = {
+        "worker-rog": {**request("worker-rog"), "transport": "cli", "agent_host": "rog"},
+        "integration-rog": request("integration-rog"),
+    }
     def contend(identity):
         try:
-            change('reserve', request(identity))
+            change('reserve', competitors[identity])
             return identity
         except AssertionError as exc:
             assert 'box owned by' in str(exc), exc
@@ -65,6 +70,11 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     identity = winners[0]
     change('reserve', request('minix', 'minix'))
     first = records()[identity]
+    assert first['request'] == competitors[identity]
+    assert records()['minix']['request']['issue'] == first['request']['issue']
+    loser = next(name for name in competitors if name != identity)
+    change('reserve', competitors[loser], expected=1)
+    assert loser not in records()
     owner_bytes = (root / 'executions' / (identity + '.json')).read_bytes()
     for alias in ['ROG', 'rog-alias']:
         change('reserve', request('wrong-host', alias), expected=1)
@@ -90,7 +100,7 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     change('reconcile', dict(request_id='minix', state='reserved', evidence='legacy record remains reconcilable'))
     assert records()['minix']['request']['execution_host'] == 'old-minix-alias'
     sibling_path.write_bytes(sibling_bytes)
-    change('reserve', request(identity))
+    change('reserve', competitors[identity])
     assert records()[identity] == first
     assert len(records()) == 3 and first['state'] == 'reserved'
     change('reserve', {**request(identity), 'purpose': 'different'}, expected=1)

@@ -3,7 +3,7 @@
 # fleet and supervises them there, with the same commands whether the box is the coordinator's
 # own machine or a remote one reached over ssh (ludics-lite#4).
 #
-# Native Codex workers use runtime subagents (or explicitly chosen app tasks); this script supplies their --native-codex
+# Native workers use runtime subagents (or explicitly chosen app tasks); this script supplies their provider-specific native
 # freshness preflight and point-in-time gate. Their board is coordinator-maintained (see
 # references/native-codex.md); ls/status/attach/unstick below only handle CLI workers.
 #
@@ -36,7 +36,7 @@
 # Usage:
 #   fleet-worker.sh claim [--take]         # take the fleet's coordinator lease (--take adopts)
 #   fleet-worker.sh coordinator | release  # who holds it (exit 0 me, 1 other, 3 nobody) / give it up
-#   fleet-worker.sh preflight <box> [--codex|--native-codex] [--no-probe] [--no-cross]   # launch runs this itself, too
+#   fleet-worker.sh preflight <box> [--codex|--native-codex|--native-claude] [--no-probe] [--no-cross]   # launch runs this itself, too
 #   fleet-worker.sh gate [--force]          # lease + halt read before native dispatch (not a reservation)
 #   fleet-worker.sh launch <box> <name> --kind claude|codex --brief <file>
 #                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
@@ -401,7 +401,7 @@ for skill_dir in "$repo"/*; do
   t=$(resolved "$HOME/.claude/skills/$s")
   [ "$t" = "$canon/$s" ] || note "~/.claude/skills/$s -> ${t:-missing/not a link} (not $repo/$s)"
 done
-if [ "$codex" != 0 ]; then
+if [ "$codex" = 1 ] || [ "$codex" = native ]; then
   for s in ship-pr wait-and-proceed after-merge; do
     t=$(resolved "$HOME/.codex/skills/$s")
     [ "$t" = "$canon/$s" ] || note "~/.codex/skills/$s -> ${t:-missing/not a link} (README's Codex loop not run)"
@@ -420,7 +420,7 @@ if [ "$codex" != 0 ]; then
       fi
     fi
   fi
-else
+elif [ "$codex" = 0 ]; then
   command -v claude >/dev/null 2>&1 || note "no claude on PATH"
   # `claude auth status` reports loggedIn:true over an expired, unrefreshable OAuth session
   # (observed 2026-09-02 on minix); only a live turn proves the CLI can run headless here.
@@ -434,7 +434,7 @@ else
     fi
   fi
 fi
-[ "$codex" = native ] || command -v tmux >/dev/null 2>&1 || note "no tmux"
+case "$codex" in native|native-claude) ;; *) command -v tmux >/dev/null 2>&1 || note "no tmux" ;; esac
 command -v jq >/dev/null 2>&1 || note "no jq"
 # Cross-box reach (ludics-lite#57): a worker's brief may drive a fleet sibling over ssh for a
 # one-off leg, and on 2026-09-04 the first such leg found no credential mid-task. A refused
@@ -488,6 +488,7 @@ cmd_preflight() {
     case "$1" in
       --codex) codex=1 ;;
       --native-codex) codex=native ;;
+      --native-claude) codex=native-claude ;;
       --no-probe) probe=0 ;;
       --no-cross) cross="" ;;
       *) die "preflight: unknown option $1" ;;

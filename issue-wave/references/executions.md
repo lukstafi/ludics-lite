@@ -1,7 +1,9 @@
 # Coordinator-owned execution reservations
 
-Use `fleet-worker.sh execution` for remote worker legs and coordinator integration with any
-transport. Python 3 is required on the anchor. State lives in `FLEET_ANCHOR_STATE/executions`,
+Use `fleet-worker.sh execution` for every worker correctness/test or measurement/experiment
+execution on a fleet box and every coordinator integration run, with either provider and any
+transport. This includes a CLI worker running tests on its own host, just as it includes a
+native subagent driving that host over SSH. Agent residence never grants execution ownership. Python 3 is required on the anchor. State lives in `FLEET_ANCHOR_STATE/executions`,
 under the existing coordinator lease lock. Use the same fleet environment as `claim`.
 
 There is one exclusive active assignment per execution host, for correctness and measurement
@@ -46,7 +48,11 @@ the existing assignment, including terminal state; a changed request with that I
 IDs that differ only by case collide and are refused, including on case-sensitive hosts.
 Use a new ID for a genuinely new execution. `execution list` prints all records, including
 history; it requires no coordinator identity. The creating coordinator and wave remain recorded
-after adoption. Transport is `subagent`, `app`, `cli` or `coordinator`.
+after adoption. Transport is `subagent`, `app`, `cli` or `coordinator`. Transport and `agent_host`
+are provenance; exclusivity depends on `execution_host`, whether the agent is local or remote.
+Provider is not an ownership key. The same issue may hold separate reservations on different
+boxes. Planned placement is a default for iteration; agent capacity and issue dependency readiness
+remain coordinator decisions outside this API.
 
 Immediately before invoking the existing bounded project runner, use `execution dispatch` with
 `{"request_id":"wave-issue123-cuda-1","evidence":"about to invoke project verifier"}`.
@@ -82,6 +88,33 @@ evidence and log are required in the conclusion. If reconciliation proves nothin
 `not-launched` with evidence and a reconciliation log. Terminal records are immutable; an identical
 conclusion retry is harmless. There is no expiry or automatic release. Never remove a checkout
 while an outstanding record refers to it, or while a pending assignment could still be using it.
+
+## CLI reservation handoff
+
+A detached CLI worker cannot rely on a native message channel. Its self-contained brief names
+absolute request and result paths under its worker state directory on its agent host. Before
+fleet tests or experiments, it writes the requested revision, execution host, workload kind,
+exact bounded command/batch, checkout and intended log path to the request file, prints
+`EXECUTION_REQUEST <absolute-path>`, and ends its turn without starting that execution.
+
+The coordinator observes the tracked `attach` exit, reads the file (over SSH when needed), and
+confirms through `status` and process evidence that the CLI has stopped. Queue the request until
+the execution host is available. Reserve it with `transport: "cli"` and the actual `agent_host`,
+then call `execution dispatch`. Only after successful dispatch, resume that same session with
+`fleet-worker.sh unstick <agent-box> <worker> --message <brief-file>`. The continuation names the
+request ID, assigned command/batch, revision, checkout, log and result paths; it instructs the
+worker to run only that assignment and return its actual runner handle, observed SHA, log and
+terminal outcome in the result file, then exit again before additional fleet work. Start a new
+tracked `attach` waiter and record the resume/runner evidence on the board.
+
+Dispatch preceding the resume is a point-in-time gate just as it precedes an SSH runner call.
+If resume fails or its outcome is unclear, retain ownership and reconcile whether anything
+started; never blindly dispatch or resume twice. When the result turn ends, verify actual runner
+termination and conclude with its evidence before resuming ordinary implementation/review.
+A `DONE` turn with a request or result is an intermediate handoff, not issue completion. A new
+execution needs a new request and reservation. CLI workers never mutate the coordinator lease
+or reservation registry themselves. Native workers use their live coordinator message channel
+for the same reserve/dispatch/evidence lifecycle.
 
 ## Adoption and halt
 
