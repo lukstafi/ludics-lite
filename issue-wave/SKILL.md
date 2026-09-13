@@ -483,7 +483,8 @@ linked reference's selected native lifecycle wherever a bullet below names CLI e
   residence. A local runtime worker can execute a reserved hardware leg over SSH using the
   project's verifier at a pushed revision. Repeated iteration may justify proposing an explicitly
   selected host-resident app task; connectivity alone is not remote subagent capability. Before
-  any remote leg or coordinator integration, obtain an [execution reservation](references/executions.md).
+  every fleet correctness/test or measurement/experiment run, including host-local CLI work
+  and coordinator integration, obtain an [execution reservation](references/executions.md).
   Timing experiments also inspect external activity and wait when it compromises measurement.
 - **Experiment-only items** (the user says "measurement only, don't recommend"): the brief
   forbids implementing or recommending a fix direction, the deliverable is an issue comment
