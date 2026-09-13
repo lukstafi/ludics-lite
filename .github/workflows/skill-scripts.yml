@@ -386,6 +386,8 @@ jobs:
           if-no-files-found: ignore
 
   windows-driver:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     name: bounded Windows driver (PowerShell 5.1 and 7)
     runs-on: windows-latest
     timeout-minutes: 5

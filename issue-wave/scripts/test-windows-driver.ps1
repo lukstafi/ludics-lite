@@ -41,6 +41,29 @@ try {
         try { $null = Resolve-WaveExit $case[0] $case[1] } catch { $refused = $true }
         Assert-Equal "refuse record=$($case[0]) native=$($case[1])" $refused $true
     }
+    # Deterministically model delayed output draining after the timed wait returns.
+    # Without the parameterless wait this exposes an early success instead of final failure.
+    function Start-Process {
+        param($FilePath, $ArgumentList, $RedirectStandardOutput, $RedirectStandardError,
+            [switch] $PassThru)
+        [IO.File]::WriteAllText($RedirectStandardOutput, "exit: 0`n")
+        $fake = [pscustomobject] @{ Id = 1; Handle = 1; HasExited = $true;
+            ExitCode = $null; Log = $RedirectStandardOutput }
+        $fake | Add-Member ScriptMethod WaitForExit {
+            param($Milliseconds = $null)
+            if ($null -ne $Milliseconds) { return $true }
+            [IO.File]::WriteAllText($this.Log, "exit: 0`nexit: 7`n")
+        }
+        $fake | Add-Member ScriptMethod Dispose {}
+        return $fake
+    }
+    try {
+        Assert-Equal 'drain final failure before trusting null native exit' (
+            Invoke-WaveWindowsDriver -ScriptPath '/mock' -LogPath (Join-Path $root 'drain.log') `
+                -ErrorPath (Join-Path $root 'drain.err')) 7
+    } finally {
+        Remove-Item Function:Start-Process
+    }
     Run-Case 'native success' "printf 'exit: 0\n'`nexit 0`n" 0
     Run-Case 'native failure' "printf 'exit: 7\n'`nexit 7`n" 7
     Run-Case 'inner Bash failure with null Process.ExitCode' @'
@@ -68,3 +91,6 @@ wait
 } finally {
     Remove-Item -LiteralPath $root -Recurse -Force
 }
+# CI's PowerShell wrapper otherwise inherits the intentionally nonzero child verdict.
+# Uncaught assertion failures terminate above; only the fully passing suite reaches here.
+exit 0

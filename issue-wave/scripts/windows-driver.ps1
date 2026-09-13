@@ -66,6 +66,8 @@ function Invoke-WaveWindowsDriver {
             Write-Host 'TIMEOUT: owned process tree terminated'
             return 124
         }
+        # Complete asynchronous redirected-output handling before reading the final line.
+        $process.WaitForExit()
         $nativeExit = Get-WaveNativeExit $process
         Write-Host "runner_exit=$nativeExit has_exited=$($process.HasExited)"
         Get-Content -LiteralPath $out | Out-Host
