@@ -1,9 +1,12 @@
-# Within-session Codex workers (default)
+# Within-session native workers
 
-An ordinary supervised Codex wave uses runtime subagents, one issue per coordinator-created
-external worktree. Preserve the user's Codex versus Claude choice. Read the currently callable
-runtime tool schemas: typically `spawn_agent`, `list_agents`, `send_message`, `followup_task`,
-`interrupt_agent` and `wait_agent`. Tool names and concurrency limits come from this runtime,
+Codex and Claude Code can both run same-provider runtime subagents, one issue per
+coordinator-created external worktree. Provider choice does not force native transport:
+`fleet-worker.sh launch --kind claude|codex` also supports either provider, including
+cross-provider delegation and residence on a task's iteration box. Preserve the user's provider,
+model and transport choices. Read the currently callable runtime tool schemas: Codex typically exposes `spawn_agent`, `list_agents`, `send_message`, `followup_task`,
+`interrupt_agent` and `wait_agent`; Claude Code uses its available Agent/task tools and
+tracked completion mechanism. Do not copy Codex tool names into a Claude brief. Tool names and concurrency limits come from this runtime,
 not from a remembered wave. If subagents are unavailable, report the capability gate; do not
 silently create app tasks or substitute CLI workers. The user may explicitly choose the complete
 [separate-conversation alternative](separate-codex.md).
@@ -13,7 +16,9 @@ silently create app tasks or substitute CLI workers. The user may explicitly cho
 Interpret the plan with separate columns for **agent host** and **execution host**. A local
 agent can drive a reserved CUDA leg on ROG or HIP leg on Minix. Required hardware constrains
 execution, not necessarily the residence of the agent. Repeated hardware iteration can justify
-proposing a separate task on that host, subject to user choice and its actual host-aware tools.
+choosing a CLI worker on that host, or proposing an explicitly selected separate app task
+subject to its actual host-aware tools. This default does not preclude checks on other boxes;
+reserve each execution separately, including runs local to the agent.
 SSH or Control other devices connectivity does not establish remote runtime-subagent support.
 
 1. Claim the fleet lease and read the plan, existing board, halt, PRs, and execution reservations.
@@ -24,7 +29,8 @@ SSH or Control other devices connectivity does not establish remote runtime-suba
    occupied and launch as capacity frees. If capacity is unknown, establish it from tool evidence;
    do not invent a fixed limit. Dependency readiness and agent capacity are separate gates, as
    is exclusive execution capacity on each machine.
-3. Run `fleet-worker.sh preflight <agent-box> --native-codex`. This verifies deployed skills and
+3. Run `fleet-worker.sh preflight <agent-box> --native-codex` for Codex or `--native-claude`
+   for Claude. This verifies the provider's deployed skills and
    fleet reach without CLI login or tmux. Confirm actual runtime tools and mutation permissions.
 4. Create one external worktree and branch per issue before spawning. For example, with resolved
    absolute paths and a verified base: `git -C <repo> worktree add -b codex/<issue> <external-path>
@@ -44,7 +50,8 @@ runtime identity, applicable project guidance, test bounds, ship-pr and issue-cl
 and after-merge hand-back mode. Require **an explicit command working directory for every shell
 call and absolute assigned paths for edits**. Runtime children share the environment: cooperative
 cross-path reads are allowed, but each checkout has one writer. Never rely on inherited cwd as
-isolation. Workers must ask the coordinator for a remote execution assignment before launching,
+isolation. Workers must ask the coordinator for an execution assignment before launching fleet tests or
+experiments, including runs local to their agent host,
 return the actual runner handle/log/verdict, and leave worktree cleanup to the coordinator.
 
 ## Supervision, recovery and evidence

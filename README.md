@@ -50,7 +50,7 @@ Keep these `~/.claude/skills` links even on a Codex-only box: command examples u
 canonical script paths. The `~/.codex/skills` links below are additionally required for Codex to
 discover the skills.
 
-On a machine that runs Codex workers (see the Codex workers section of `issue-wave/SKILL.md`),
+On a machine that runs Codex workers (see the Native workers section of `issue-wave/SKILL.md`),
 also link the skills Codex uses into `~/.codex/skills`. The issue-wave coordinator's per-launch
 preflight (`issue-wave/scripts/fleet-worker.sh preflight <box> --native-codex`) refuses to launch a
 Codex worker on a box where these links are missing:
@@ -106,13 +106,17 @@ propagates merged skill edits to boxes that slept through the merge. A headless 
 needs the box's CLI logged in: `claude auth login` for Claude workers (an expired OAuth session
 cannot refresh headless, and `claude auth status` does not notice) and `codex login` for Codex
 CLI ones. The CLI preflight proves both with a live call, not a status read.
-Codex issue-wave workers normally use within-session runtime subagents in dedicated external worktrees; their
-`--native-codex` preflight checks skills and fleet reach without a CLI login or tmux dependency.
-The coordinator creates each worktree, uses runtime agent tools for supervision and follow-up, and keeps a
-shared anchor board alongside the CLI records. See
-[Native Codex workers](issue-wave/references/native-codex.md) for placement and recovery,
-the explicit separate-conversation alternative, and [execution reservations](issue-wave/references/executions.md)
-for remote legs and coordinator integration. The reservation helper requires Python 3 on the anchor.
+Provider/model, launch transport and execution placement are separate choices. Both Codex and
+Claude Code support their own native subagents in coordinator-created external worktrees, or
+CLI workers launched with `--kind codex` or `--kind claude`. Only the CLI route provides
+cross-provider delegation, and it can place the agent directly on the best iteration box.
+Native workers use their runtime tools and a shared anchor board; CLI workers use the launcher's
+tracked process lifecycle. See [Native workers](issue-wave/references/native-codex.md) for tool
+discovery, placement and recovery, and the explicit separate-conversation alternative.
+[Execution reservations](issue-wave/references/executions.md) apply to fleet test/experiment runs
+for either transport, including host-local CLI work, and coordinator integration. Agent residence
+does not confer ownership, and an issue may reserve checks on several boxes. The reservation
+helper requires Python 3 on the anchor.
 
 ## Routines
 

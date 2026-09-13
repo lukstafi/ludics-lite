@@ -1,7 +1,9 @@
 # Coordinator-owned execution reservations
 
-Use `fleet-worker.sh execution` for remote worker legs and coordinator integration with any
-transport. Python 3 is required on the anchor. State lives in `FLEET_ANCHOR_STATE/executions`,
+Use `fleet-worker.sh execution` for every worker correctness/test or measurement/experiment
+execution on a fleet box and every coordinator integration run, with either provider and any
+transport. This includes a CLI worker running tests on its own host, just as it includes a
+native subagent driving that host over SSH. Agent residence never grants execution ownership. Python 3 is required on the anchor. State lives in `FLEET_ANCHOR_STATE/executions`,
 under the existing coordinator lease lock. Use the same fleet environment as `claim`.
 
 There is one exclusive active assignment per execution host, for correctness and measurement
@@ -46,7 +48,11 @@ the existing assignment, including terminal state; a changed request with that I
 IDs that differ only by case collide and are refused, including on case-sensitive hosts.
 Use a new ID for a genuinely new execution. `execution list` prints all records, including
 history; it requires no coordinator identity. The creating coordinator and wave remain recorded
-after adoption. Transport is `subagent`, `app`, `cli` or `coordinator`.
+after adoption. Transport is `subagent`, `app`, `cli` or `coordinator`. Transport and `agent_host`
+are provenance; exclusivity depends on `execution_host`, whether the agent is local or remote.
+Provider is not an ownership key. The same issue may hold separate reservations on different
+boxes. Planned placement is a default for iteration; agent capacity and issue dependency readiness
+remain coordinator decisions outside this API.
 
 Immediately before invoking the existing bounded project runner, use `execution dispatch` with
 `{"request_id":"wave-issue123-cuda-1","evidence":"about to invoke project verifier"}`.
