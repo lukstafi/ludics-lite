@@ -148,17 +148,17 @@ brief=$(cat)
 # The real CLI refuses an empty stdin prompt; the shim must too, or a probe whose prompt was lost
 # on the way (bash 3.2 backgrounding, the mac-studio preflight failure) passes here and fails live.
 [ -n "$brief" ] || { echo "Error: Input must be provided either through stdin or as a prompt argument when using --print" >&2; exit 1; }
-sleep_s=$(printf '%s\n' "$brief" | sed -n 's/^SLEEP \([0-9]*\).*/\1/p' | head -n1)
+sleep_s=$(sed -n '/^SLEEP [0-9]/ { s/^SLEEP \([0-9]*\).*/\1/; p; q; }' <<<"$brief")
 [ -n "${SHIM_CLAUDE_HANG:-}" ] && sleep 30
 if [ "$fmt" = json ]; then
   printf '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"%s"}\n' "${sid:-none}"; exit 0
 fi
-if printf '%s' "$brief" | grep -q '^SILENT'; then exit 0; fi
+if grep -q '^SILENT' <<<"$brief"; then exit 0; fi
 printf '{"type":"system","subtype":"init","session_id":"%s","resumed":%s}\n' "$sid" "$([ -n "$resume" ] && echo true || echo false)"
 [ -n "$sleep_s" ] && sleep "$sleep_s"
-text="did: $(printf '%s' "$brief" | head -c 40 | tr '\n' ' ')"
+text="did: $(LC_ALL=C; printf '%s' "${brief:0:40}" | tr '\n' ' ')"
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$text"
-if printf '%s' "$brief" | grep -q '^FAIL'; then
+if grep -q '^FAIL' <<<"$brief"; then
   printf '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"result":"boom","session_id":"%s"}\n' "$sid"; exit 1
 fi
 printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"%s","session_id":"%s"}\n' "$text" "$sid"
@@ -181,7 +181,7 @@ if [ -n "${SHIM_CODEX_SILENT_RESUME:-}" ] && [ "$1" != "" ] 2>/dev/null; then :;
 if [ -n "${SHIM_CODEX_SILENT_RESUME:-}" ] && [ -n "$resumed" ]; then exit 0; fi
 printf '{"type":"thread.started","thread_id":"%s"}\n{"type":"turn.started"}\n' "$tid"
 sleep 1
-text="codex did: $(printf '%s' "$brief" | head -c 40 | tr '\n' ' ')"
+text="codex did: $(LC_ALL=C; printf '%s' "${brief:0:40}" | tr '\n' ' ')"
 printf '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}\n{"type":"turn.completed"}\n' "$text"
 [ -n "$out" ] && printf '%s\n' "$text" > "$out"
 exit 0
@@ -307,8 +307,8 @@ shellcheck_files=$(workflow_matches "$shellcheck_globs")
 uncovered=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  printf '%s\n' "$syntax_files" | grep -Fqx -- "$f" || uncovered="$uncovered bash-n:$f"
-  printf '%s\n' "$shellcheck_files" | grep -Fqx -- "$f" || uncovered="$uncovered shellcheck:$f"
+  grep -Fqx -- "$f" <<<"$syntax_files" || uncovered="$uncovered bash-n:$f"
+  grep -Fqx -- "$f" <<<"$shellcheck_files" || uncovered="$uncovered shellcheck:$f"
 done <<EOF
 $shell_files
 EOF
@@ -331,7 +331,7 @@ while IFS= read -r s; do
   [ -n "$s" ] || continue
   rm "$real_home/.claude/skills/$s"
   missing_out=$(env -u FLEET_SKILLS_REPO HOME="$real_home" "$FW" preflight testbox --no-probe 2>&1); missing_rc=$?
-  if [ "$missing_rc" -ne 1 ] || ! printf '%s' "$missing_out" | grep -Fq ".claude/skills/$s -> missing"; then
+  if [ "$missing_rc" -ne 1 ] || ! grep -Fq ".claude/skills/$s -> missing" <<<"$missing_out"; then
     unverified_skills="$unverified_skills $s"
   fi
   ln -sfn "$real_home/ludics-lite/$s" "$real_home/.claude/skills/$s"
@@ -744,7 +744,7 @@ expect "a truncated JSONL line does not hide the events after it" 0 "after the d
 sed -i.bak '/^session=/d' "$ISSUE_WAVE_STATE/workers/c1/meta" && rm -f "$ISSUE_WAVE_STATE/workers/c1/meta.bak"
 expect "status recovers the thread id from the stream when meta lacks it" 0 "session=0199-shim-" -- "$FW" status testbox c1
 expect "codex unstick resumes by thread id (from the stream) with --yolo" 0 "RESUMED testbox/c1 kind=codex session=0199-shim-" -- "$FW" unstick testbox c1 --message "$TMP/msg.md"
-tid=$(sed -n 's/^session=//p' "$ISSUE_WAVE_STATE/workers/c1/meta" | head -n1)
+tid=$(sed -n '/^session=/ { s/^session=//; p; q; }' "$ISSUE_WAVE_STATE/workers/c1/meta")
 grep -q -- "codex exec resume $tid --yolo --json -" "$ISSUE_WAVE_STATE/workers/c1/run.sh" && ok "codex resume command shape" || ko "codex resume: $(cat "$ISSUE_WAVE_STATE/workers/c1/run.sh")"
 "$FW" attach testbox c1 --interval 1 >/dev/null
 expect "a resumed turn that emits nothing is FAILED even though the first turn succeeded" 1 "FAILED testbox/c1 exit=0 no terminal event" -- \

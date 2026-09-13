@@ -7,6 +7,7 @@
 # Usage: test-check-prompts.sh   (exit 0 all pass, 1 otherwise)
 
 set -uo pipefail
+# Feed captured assertions with here-strings: early-exiting grep must not SIGPIPE a writer.
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 CP="$HERE/check-prompts.sh"
@@ -20,7 +21,7 @@ ko() { fail=$((fail + 1)); echo "FAIL: $*"; }
 expect() {
   local label="$1" want_rc="$2" want="$3"; shift 3; [ "$1" = -- ] && shift
   out=$("$@" 2>&1); rc=$?
-  if [ "$rc" -eq "$want_rc" ] && printf '%s' "$out" | grep -qF -- "$want"; then ok "$label"
+  if [ "$rc" -eq "$want_rc" ] && grep -qF -- "$want" <<<"$out"; then ok "$label"
   else ko "$label (rc=$rc want $want_rc; want /$want/) -- $out"; fi
 }
 
@@ -198,7 +199,7 @@ fresh "$R"; skill "$R" alpha 'name: alpha' "description: CRLF line$(printf '\r')
 expect "a carriage return" 1 'frontmatter carries a control character' -- "$CP" "$R"
 # ...found however large the frontmatter: the test is judged on grep's output, so a tab early
 # in 20000 lines is not lost to grep stopping and printf dying of SIGPIPE under pipefail.
-fresh "$R"; { printf -- '---\nname: alpha\n# an early tab\there\n'; yes '# filler' | head -n 20000; printf -- 'description: late\n---\n'; } > "$R/alpha/SKILL.md"
+fresh "$R"; { printf -- '---\nname: alpha\n# an early tab\there\n'; awk 'BEGIN { for (i = 0; i < 20000; i++) print "# filler" }'; printf -- 'description: late\n---\n'; } > "$R/alpha/SKILL.md"
 expect "a tab early in a large frontmatter" 1 'frontmatter carries a control character' -- "$CP" "$R"
 
 # A NUL byte never reaches a shell variable (bash drops it, warning on stderr where no verdict
@@ -217,7 +218,7 @@ fresh "$R"; printf -- '---\nname: alpha\ndescription: a\342\200\250b, split by a
 expect "U+2028, a line break to YAML 1.1" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
 # ...and read to the end: an early forbidden character in a large frontmatter is not lost to
 # grep stopping at its first match and awk dying of SIGPIPE under pipefail.
-fresh "$R"; { printf -- '---\nname: alpha\ndescription: a\357\277\276 early non-character\n'; yes '# filler' | head -n 5000; printf -- '---\n'; } > "$R/alpha/SKILL.md"
+fresh "$R"; { printf -- '---\nname: alpha\ndescription: a\357\277\276 early non-character\n'; awk 'BEGIN { for (i = 0; i < 5000; i++) print "# filler" }'; printf -- '---\n'; } > "$R/alpha/SKILL.md"
 expect "U+FFFE early in a large frontmatter" 1 'a byte sequence no loader accepts' -- "$CP" "$R"
 fresh "$R"; printf -- '---\nname: alpha\ndescription: fine\n---\n\nA body line\342\200\250split by a separator, which is not YAML.\n' > "$R/alpha/SKILL.md"
 expect "...but only in the frontmatter: the Markdown body is not YAML" 0 '6 passed, 0 failed' -- "$CP" "$R"
@@ -296,8 +297,8 @@ expect "...and a fenced README still satisfies the lookup" 0 '6 passed, 0 failed
 # Two defects in one run are both reported: the per-file loop does not stop at the first.
 fresh "$R"; skill "$R" alpha 'description: nameless'; skill "$R/routines" weekly 'name: weekly'
 out=$("$CP" "$R" 2>&1)
-if printf '%s' "$out" | grep -q "alpha/SKILL.md: frontmatter has no 'name:' line" \
-  && printf '%s' "$out" | grep -q "weekly/SKILL.md: frontmatter has no 'description:' line"; then
+if grep -q "alpha/SKILL.md: frontmatter has no 'name:' line" <<<"$out" \
+  && grep -q "weekly/SKILL.md: frontmatter has no 'description:' line" <<<"$out"; then
   ok "every defective file is reported, not only the first"
 else ko "a second defective file went unreported -- $out"; fi
 
@@ -306,7 +307,7 @@ fresh "$R"; skill "$R" alpha 'name: alpah' 'description: x'
 expect "GitHub annotations name the file" 1 '::error file=alpha/SKILL.md::' -- env GITHUB_ACTIONS=true "$CP" "$R"
 fresh "$R"; skill "$R" alpha 'name: alpah' 'description: x'
 out=$(env -u GITHUB_ACTIONS "$CP" "$R" 2>&1)
-printf '%s' "$out" | grep -q '::error' && ko "annotations leak outside Actions" \
+grep -q '::error' <<<"$out" && ko "annotations leak outside Actions" \
   || ok "...and only under Actions"
 
 # --- this checkout ---------------------------------------------------------------------------
