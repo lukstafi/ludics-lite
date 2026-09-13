@@ -1857,7 +1857,7 @@ test_session_index_recovery() {
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
   blob_oid=$(cat "$TEST_ROOT/session-index-recovery.blob")
   index_ref=$(git -C "$CASE_MAIN" for-each-ref --format='%(refname)' \
-    refs/ship-pr/session-recovery/topic | sed -n '/\/index-tree-/ {p;q;}')
+    refs/ship-pr/session-recovery/topic | awk '/\/index-tree-/ && !found { print; found = 1 }')
   [ -n "$index_ref" ] || fail "archived session index tree received no recovery ref"
   index_tree=$(git -C "$CASE_MAIN" rev-parse "$index_ref")
   retained_blob=$(git -C "$CASE_MAIN" ls-tree "$index_tree" -- staged-only | awk '{print $3}')
@@ -3743,8 +3743,8 @@ test_runner_refuses_bad_arguments() {
   *) fail "a bad deadline was not refused by name: $out" ;;
   esac
   out=$("$RUNNER" --list) || fail "--list exited nonzero"
-  printf '%s\n' "$out" | grep -qx "$SELF_CASE" || fail "--list does not spell $SELF_CASE"
-  printf '%s\n' "$out" | grep -qx test_runner_refuses_bad_arguments || fail "--list does not spell this case"
+  grep -qx "$SELF_CASE" <<<"$out" || fail "--list does not spell $SELF_CASE"
+  grep -qx test_runner_refuses_bad_arguments <<<"$out" || fail "--list does not spell this case"
   echo "PASS: refused arguments exit 1 before any case starts"
 }
 
