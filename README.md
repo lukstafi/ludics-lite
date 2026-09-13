@@ -238,9 +238,13 @@ directory is refused too: a symlinked `~/.claude` leaves every task directory re
 tree unreadable. It pins that a directory which exists and is
 still not a usable prompt — a link anywhere inside it, no `SKILL.md`, or a `SKILL.md` that is
 empty or carries no readable frontmatter — is refused rather than certified in sync or pulled over
-the checkout, in both directions and before any branch that would publish it, with legal but unusual prompts as the control that the
-floor is not simply refusing everything — CRLF line endings, unknown frontmatter keys, a
-description quoting the parser's own markers, and this repository's own two prompts; that the two
+the checkout, in both directions and before any branch that would publish it, with legal but unusual prompts
+as passing controls. Frontmatter validation delegates to `check-prompts.sh --one <dir>`, including
+optional fields and the checker's LF-only grammar: CRLF prompts are now refused consistently
+with repository validation. Single-directory mode skips README indexing and name/directory
+equality, so installed task IDs may differ from prompt names; repository mode keeps both checks.
+Sync separately requires a nonempty Markdown body. The suite also checks missing-validator
+refusal, a description quoting the former parser's markers, and this repository's own prompts; that the two
 roots must be disjoint however the overlap is spelled, since a destination under `routines/` has
 the publisher walk the tree it is writing; that publishing replaces what stands in its way rather than following or
 entering it (a linked directory at either end, a directory or a link to one where `SKILL.md`
