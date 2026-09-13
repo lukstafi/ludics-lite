@@ -1004,7 +1004,7 @@ pr_head_read() {
 status_state() {
   local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local vline verd_at verd_sha mstate="-" head_err="" pr_created=""
-  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at=""
+  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at="" nudge_age nudge_active=false
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -1122,6 +1122,21 @@ status_state() {
   # verdict check and the post-round states, which used to read it separately.
   pr_head_read "$pr"
 
+  # Only a watch can spend a nudge: its incoming watermark identifies comments not yet
+  # observed by an earlier window. Use creation time, never edits or ordinary replies.
+  # The outgoing poll watermark consumes that identity without adding persistent state.
+  if [ -n "${watch_nudge_after:-}" ]; then
+    nudge_at=$(jq -r --argjson after "$watch_nudge_after" '
+      [.[] | select(.id > $after)
+       | select((.body // "") | test("^@codex review[ \t\r\n]*(_🤖 Addressed by an automated coding agent_)?[ \t\r\n]*$"))
+       | .created_at // empty] | max // ""' <<<"$comments_raw")
+  fi
+  nudge_age=$(age_of "$nudge_at")
+  case "$nudge_age" in
+  '' | *[!0-9]*) ;;
+  *) [ "$nudge_age" -ge "$GRACE" ] || nudge_active=true ;;
+  esac
+
   # A no-findings verdict naming the CURRENT head outranks a live-looking 👀, and must be checked
   # BEFORE the in-flight return below: with the placeholder off the comment clock, a verdict
   # delivered by editing that placeholder in place leaves the 👀 newer than the reviewer's last
@@ -1148,6 +1163,10 @@ status_state() {
     case "$age" in
     '' | *[!0-9]*) ;;
     *) [ "$age" -ge "$STALL" ] && {
+      if [ "$nudge_active" = true ] && [[ "$nudge_at" > "$eyes_at" ]]; then
+        echo "expected|$nudge_age|$mstate|fresh review nudge after the stalled 👀; waiting for pickup"
+        return 0
+      fi
       echo "stalled|$age|$mstate|👀 from $REVIEWER at $eyes_at with nothing posted since"
       return 0
     } ;;
@@ -1190,6 +1209,10 @@ status_state() {
         # boundary wider and the next round found the next hole. So the line states both moves
         # unconditionally, which is what the issue asked for and what a caller can act on
         # without the script deciding which case it is in.
+        if [ "$nudge_active" = true ] && [[ "$nudge_at" > "$fail_at" ]]; then
+          echo "expected|$nudge_age|$mstate|fresh review nudge after the initialization failure; waiting for pickup"
+          return 0
+        fi
         echo "failed|$(age_of "$fail_at")|$mstate|${head_sha:0:7}|$REVIEWER reported an" \
           "initialization failure at $fail_at for ref ${fail_ref:0:7}"
         return 0
@@ -1246,15 +1269,6 @@ status_state() {
   # A failed commit read costs precision, not the state: the PR's own timestamps remain.
   head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
     head_at=""
-  # Only a watch can spend a nudge: its incoming watermark identifies comments not yet
-  # observed by an earlier window. Use creation time, never edits or ordinary replies.
-  # The outgoing poll watermark consumes that identity without adding persistent state.
-  if [ -n "${watch_nudge_after:-}" ]; then
-    nudge_at=$(jq -r --argjson after "$watch_nudge_after" '
-      [.[] | select(.id > $after)
-       | select((.body // "") | test("^@codex review[ \t\r\n]*(_🤖 Addressed by an automated coding agent_)?[ \t\r\n]*$"))
-       | .created_at // empty] | max // ""' <<<"$comments_raw")
-  fi
   echo "expected|$(freshest_age "$head_at" "$pr_created" "$last_spoke" "$eyes_at" "$nudge_at")|$mstate|no 👀" \
     "in flight and no review of head ${head_sha:0:7}${rev_sha:+; $REVIEWER last reviewed ${rev_sha:0:7} at $rev_at}"
 }
@@ -1875,9 +1889,13 @@ cmd_watch() {
     if [ $((SECONDS - start + interval)) -gt "$timeout" ]; then
       # A live round can outlast the ordinary quiet window. Freeze the extension's
       # deadline on its first use so changing reactions cannot renew it indefinitely.
-      [ "$tok" = reviewing ] || break
-      case "$age" in '' | *[!0-9]*) break ;; esac
+      if [ "$tok" != reviewing ]; then
+        # A failed status read holds a known live round, but cannot create or renew
+        # its extension. The same frozen deadline bounds even a lasting outage.
+        [ "$tok" = unknown ] && [ "$was" = reviewing ] && [ -n "$extension_end" ] || break
+      fi
       if [ -z "$extension_end" ]; then
+        case "$age" in '' | *[!0-9]*) break ;; esac
         remaining=$((GRACE - age))
         [ "$remaining" -gt 0 ] || break
         extension_end=$((SECONDS + remaining))

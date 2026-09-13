@@ -782,7 +782,11 @@ test_a_live_round_extends_the_quiet_window() {
   assert_contains "$WATCH_ERR" 'extending watch' "the extension is explicit"
 }
 
-test_a_live_round_extension_is_bounded() {
+test_a_live_round_extension_is_bounded() (
+  # Isolate an injected clock in this subshell: neither slow setup nor scheduler
+  # delays should spend the fixture's five-second extension before it starts.
+  age_of() { echo 0; }
+  sleep() { SECONDS=$((SECONDS + $1)); }
   reset_fixture
   local now GRACE=5
   now=$(jq -rn 'now | todate')
@@ -791,9 +795,57 @@ test_a_live_round_extension_is_bounded() {
   assert_eq "$WATCH_RC" 1 "a round with no result cannot extend forever"
   assert_contains "$WATCH_OUT" 'no reviewer activity' "the exhausted extension returns quiet"
   assert_contains "$WATCH_ERR" 'extending watch' "the ordinary window was extended first"
+)
+
+test_nudges_wait_past_old_failed_and_stalled_states() {
+  local kind old now comments
+  old=2026-09-01T00:00:00Z
+  for kind in failed stalled; do
+    reset_fixture
+    now=$(jq -rn 'now | todate')
+    comments=$(jq -cn --arg at "$now"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
+    if [ "$kind" = stalled ]; then
+      schedule reactions 1 "[$(reaction eyes "$old")]"
+    else
+      local body
+      body=$(printf 'Codex Review: Something went wrong. Try again later by commenting “@codex review”.\n```\nProvided git ref %s does not exist\n```' "$H2")
+      comments=$(jq -cn --argjson n "$comments" --argjson f "$(summary_comment 699 "$old" "$body")" '$n + [$f]')
+    fi
+    schedule comments 1 "$comments"
+    run_watch 0,699,0 1 0
+    assert_eq "$WATCH_RC" 1 "fresh nudge waits beyond the old $kind verdict"
+    assert_contains "$WATCH_ERR" 'fresh review nudge' "the nudge explains the new wait"
+    run_watch 0,700,0 1 0
+    assert_eq "$WATCH_RC" 0 "the same nudge cannot suppress $kind for another window"
+  done
 }
 
+test_an_extension_holds_through_unknown_status() (
+  reset_fixture
+  # Preserve actual feed/status parsing, failing only the status read at round 2.
+  eval "$(declare -f status_state | sed '1s/status_state/original_status_state/')"
+  status_state() {
+    if [ "$(poll_rounds)" -eq 2 ]; then
+      echo 'unknown|-|-|injected reactions outage'
+    else
+      original_status_state "$@"
+    fi
+  }
+  sleep() { SECONDS=$((SECONDS + $1)); }
+  local now
+  now=$(jq -rn 'now | todate')
+  schedule reactions 1 "[$(reaction eyes "$now")]"
+  # Before the fix, unknown round 2 broke out and settled at round 3, missing 4.
+  schedule reviews 4 "[$(review 501 "$H2" "$now")]"
+  run_watch 0,0,0 1 0
+  assert_eq "$WATCH_RC" 0 "a transient status outage cannot cut short the frozen extension"
+  assert_contains "$WATCH_OUT" '--- review id=501' "the later round is caught"
+  assert_contains "$WATCH_ERR" "holding 'reviewing'" "the unknown status held the known live state"
+)
+
 tests=(
+  test_nudges_wait_past_old_failed_and_stalled_states
+  test_an_extension_holds_through_unknown_status
   test_a_nudge_buys_exactly_one_window
   test_an_ordinary_reply_or_old_nudge_does_not_reset_grace
   test_a_live_round_extends_the_quiet_window
