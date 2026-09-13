@@ -348,6 +348,22 @@ test_boundary_truncated_patch_is_unread() {
     "a patch cut between hunks must never read as disjoint"
 }
 
+test_unrecognized_headers_are_unread() {
+  # Matching +/- totals cannot prove a header was understood. Include a combined-diff shape,
+  # an unknown header, and an empty patch: none gives the parser a range to compare.
+  local patch
+  for patch in $'@@@ -1,2 -1,2 +1,3 @@@\n-a\n+b\n+c' $'unrecognized header\n-a\n+b' ''; do
+    set_compares 2 1 "[$(patched a.txt "$patch")]" \
+      "[$(patched a.txt $'@@ -400,1 +400,1 @@\n-a\n+b')]"
+    run_drift
+    assert_eq "$DRIFT_RC" 1 "a patch without recognized headers stays loud"
+    assert_contains "$DRIFT_OUTPUT" "hunks unread for 1 of them" \
+      "a patch without recognized headers is reported unread"
+    assert_not_contains "$DRIFT_OUTPUT" "DISJOINT" \
+      "no parsed ranges must never imply disjoint hunks"
+  done
+}
+
 test_count_omitted_headers_are_read() {
   # git omits the count on a one-line side: `@@ -5 +5,2 @@` and `@@ -5,2 +5 @@` are the shapes
   # where the header regex's two optional groups carry meaning, and all four combinations of
@@ -394,6 +410,7 @@ tests=(
   test_mixed_paths_split_by_hunks
   test_truncated_patch_is_unread
   test_boundary_truncated_patch_is_unread
+  test_unrecognized_headers_are_unread
   test_unread_hunks_count_as_meeting
   test_count_omitted_headers_are_read
   test_spaces

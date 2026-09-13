@@ -3016,7 +3016,9 @@ compare_hunks() {
           elif ($l | startswith("+")) then .cur.n -= 1
           elif ($l | startswith(" ")) then .cur.o -= 1 | .cur.n -= 1
           else . end)
-        | if .ok and (.cur == null or (.cur.o == 0 and .cur.n == 0)) then .ranges else null end
+        # No recognized header means no evidence of disjointness, even when the totals match.
+        | if .ok and (.ranges | length) > 0 and (.cur.o == 0 and .cur.n == 0)
+          then .ranges else null end
       end;
     [.files[] | {key: .filename, value: ranges}] | from_entries' <<<"$1" 2>/dev/null
 }
