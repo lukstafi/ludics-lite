@@ -233,6 +233,9 @@ jobs:
         run: ship-pr/scripts/test-pr-review-reply.sh
       - name: Exercise the run await's addressing and its invocation-vs-verdict split
         run: ship-pr/scripts/test-pr-review-run-watch.sh
+      - name: Check hostile-runner verdicts with synthetic scratch suites
+        if: ${{ !cancelled() }}
+        run: python3 ship-pr/scripts/test-pr-review-hostile.py
       - name: Repeat fixtures with inherited names, spaced paths, and a non-C locale
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/run-pr-review-hostile.sh
