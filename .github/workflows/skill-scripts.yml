@@ -207,7 +207,8 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Two complete fixture passes; allow slower runners time to finish both.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Exercise the suites' shared preamble and its shadow guard
