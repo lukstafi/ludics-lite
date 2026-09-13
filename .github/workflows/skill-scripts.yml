@@ -384,3 +384,19 @@ jobs:
           name: cleanup-logs-macos
           path: ${{ runner.temp }}/cleanup-logs
           if-no-files-found: ignore
+
+  windows-driver:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    name: bounded Windows driver (PowerShell 5.1 and 7)
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows PowerShell 5.1 verdicts and owned-tree timeout
+        shell: powershell
+        run: ./issue-wave/scripts/test-windows-driver.ps1
+      - name: PowerShell 7 verdicts and owned-tree timeout
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./issue-wave/scripts/test-windows-driver.ps1
