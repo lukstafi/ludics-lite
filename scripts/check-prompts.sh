@@ -24,6 +24,8 @@
 #
 # Usage: check-prompts.sh [root]   (root defaults to the checkout this script lives in;
 #                                   exit 0 all pass, 1 otherwise)
+# Single directory: check-prompts.sh --one <dir> (frontmatter only; no index or directory-name
+# equality requirement, since installed scheduler IDs may differ from prompt names).
 # Under GitHub Actions each failure is also an `::error` annotation on the file it names.
 
 set -uo pipefail
@@ -36,7 +38,15 @@ set -uo pipefail
 export LC_ALL=C
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=${1:-$(cd "$HERE/.." && pwd)}
+ONE=false
+case "${1:-}" in
+  --one) [ "$#" -eq 2 ] || { echo 'usage: check-prompts.sh --one <dir>' >&2; exit 2; }
+    ONE=true; ROOT=$2 ;;
+  -h|--help) echo 'usage: check-prompts.sh [root] | --one <dir>'; exit 0 ;;
+  -*) echo "check-prompts: unknown option: $1" >&2; exit 2 ;;
+  *) [ "$#" -le 1 ] || { echo 'usage: check-prompts.sh [root] | --one <dir>' >&2; exit 2; }
+    ROOT=${1:-$(cd "$HERE/.." && pwd)} ;;
+esac
 [ -d "$ROOT" ] || { echo "check-prompts: no such directory: $ROOT" >&2; exit 2; }
 
 pass=0; fail=0
@@ -214,7 +224,7 @@ check_skill_file() {
   for key in name description; do
     matches "^$key:" "$fm" || ko "$rel" "frontmatter has no '$key:' line"
   done
-  if [ -n "$name" ] && [ "$name" != "$dir" ]; then
+  if ! $ONE && [ -n "$name" ] && [ "$name" != "$dir" ]; then
     ko "$rel" "frontmatter name '$name' does not match its directory '$dir'"
   fi
   [ "$fail" -eq 0 ] || return 0
@@ -283,6 +293,14 @@ check_index() {
 }
 
 # --- run --------------------------------------------------------------------------------------
+if $ONE; then
+  if [ -f "$ROOT/SKILL.md" ]; then check_skill_file SKILL.md
+  else ko SKILL.md "missing regular SKILL.md in $ROOT"; fi
+  echo "check-prompts: $pass passed, $fail failed"
+  [ "$fail" -eq 0 ]
+  exit $?
+fi
+
 files=$(cd "$ROOT" && for f in */SKILL.md routines/*/SKILL.md; do [ -f "$f" ] && echo "$f"; done)
 [ -n "$files" ] || ko . "no */SKILL.md or routines/*/SKILL.md under $ROOT"
 for f in $files; do

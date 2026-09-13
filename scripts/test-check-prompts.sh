@@ -85,6 +85,23 @@ fresh "$R"
 expect "a well-formed tree passes" 0 '6 passed, 0 failed' -- "$CP" "$R"
 expect "a missing root is refused, not passed" 2 'no such directory' -- "$CP" "$TMP/nowhere"
 
+# Single-directory mode shares the grammar but has no repository layout requirements.
+fresh "$R"
+expect "one prompt needs no README" 0 '1 passed, 0 failed' -- "$CP" --one "$R/alpha"
+mv "$R/alpha" "$R/installed task"
+expect "installed IDs may differ from prompt names, including paths with spaces" 0 '1 passed, 0 failed' -- "$CP" --one "$R/installed task/"
+expect "missing single prompt" 1 'missing regular SKILL.md' -- "$CP" --one "$R/scripts"
+expect "one requires a directory argument" 2 'usage:' -- "$CP" --one
+expect "one rejects extra arguments" 2 'usage:' -- "$CP" --one "$R" extra
+expect "root rejects extra arguments" 2 'usage:' -- "$CP" "$R" extra
+for field in 'description: null' 'description: [' 'allowed-tools: ['; do
+  skill "$R" alpha 'name: alpha' 'description: valid' "$field"
+  expect "one refuses $field with the shared grammar" 1 'FAIL: SKILL.md:' -- "$CP" --one "$R/alpha"
+done
+skill "$R" alpha 'name: alpha' 'description: valid'
+printf '\000' >> "$R/alpha/SKILL.md"
+expect "one retains byte validation" 1 'NUL or invalid UTF-8' -- "$CP" --one "$R/alpha"
+
 # --- frontmatter defects ---------------------------------------------------------------------
 fresh "$R"; sed -i.bak '1d' "$R/alpha/SKILL.md"
 expect "no opening fence" 1 'alpha/SKILL.md: no YAML frontmatter' -- "$CP" "$R"

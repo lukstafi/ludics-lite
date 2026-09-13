@@ -202,66 +202,18 @@ prompt_problem() {
     printf 'has no SKILL.md, which is the file the registry names by path\n'
     return 0
   fi
-  # A regular file is not yet a prompt. An empty or frontmatter-less SKILL.md installs happily,
-  # compares equal to itself afterwards, and leaves the scheduler with a task whose description
-  # is blank and whose body is nothing -- the same quiet nothing-ran as an unreadable file, by a
-  # different route. This is a FLOOR, not a second copy of the frontmatter grammar:
-  # scripts/check-prompts.sh owns that, and owns it for the repository's prompts, on every head,
-  # in one of the three CI jobs that run whatever the diff touched. What is checked here is what
-  # the LOADERS need to find at all -- a name, a description, something to run -- which is also
-  # exactly what this script can claim without a YAML value grammar of its own. The division is
-  # deliberate and is pinned from both sides in scripts/test-sync-routines.sh: a malformed
-  # OPTIONAL field (`allowed-tools: [`) passes here and is refused by check-prompts.sh, which
-  # names the indicator character. Two grammars for one file is the defect ludics-lite#75
-  # documents, and the second one is always the one that goes stale.
-  if [ ! -s "$dir/SKILL.md" ]; then
-    printf 'has an EMPTY SKILL.md\n'
+  # One grammar owner, including optional fields and byte validation. Installed task IDs
+  # need not equal the prompt name, so use the checker's directory-independent mode.
+  if ! problem=$("$repo_root/scripts/check-prompts.sh" --one "$dir" 2>&1); then
+    printf 'has a SKILL.md rejected by check-prompts:\n%s\n' "$problem"
     return 0
   fi
-  # ONE pass, which decides and reports in the same place. The first draft of this floor was a
-  # `read` for the fence, an awk that printed the frontmatter, and shell `case` tests over that
-  # text; each of those was wrong in its own way -- an in-band `@@UNCLOSED@@` marker a real
-  # description could contain, a `name:` test that a key called `x-name:` satisfied, and a value
-  # nobody looked at, so `name:` with nothing after it passed. Fields are matched anchored, with
-  # their value read, and closure is the parser's own state rather than something written into
-  # its output. A trailing CR is stripped per line, so a CRLF checkout is judged on its text.
-  if problem=$(awk '
-    NR == 1 {
-      line = $0; sub(/\r$/, "", line)
-      if (line !~ /^---[[:space:]]*$/) {
-        print "has a SKILL.md that does not open with a --- frontmatter fence"
-        bad = 1
-        exit 0
-      }
-      next
-    }
-    !closed {
-      line = $0; sub(/\r$/, "", line)
-      if (line ~ /^---[[:space:]]*$/) { closed = 1; next }
-      if (match(line, /^[A-Za-z0-9_.-]+:/)) {
-        key = substr(line, 1, RLENGTH - 1)
-        val = substr(line, RLENGTH + 1)
-        gsub(/^[[:space:]]+/, "", val)
-        gsub(/[[:space:]]+$/, "", val)
-        if (key == "name" && val != "") have_name = 1
-        if (key == "description" && val != "") have_desc = 1
-      }
-      next
-    }
-    {
-      line = $0; sub(/\r$/, "", line)
-      if (line ~ /[^[:space:]]/) have_body = 1
-    }
-    END {
-      if (bad) exit 0
-      if (!closed) { print "has a SKILL.md whose frontmatter is never closed by a second ---"; exit 0 }
-      if (!have_name) { print "has a SKILL.md whose frontmatter carries no non-empty name: field"; exit 0 }
-      if (!have_desc) { print "has a SKILL.md whose frontmatter carries no non-empty description: field"; exit 0 }
-      if (!have_body) { print "has a SKILL.md with nothing under its frontmatter: no prompt to run"; exit 0 }
-      exit 1
-    }
-  ' "$dir/SKILL.md"); then
-    printf '%s\n' "$problem"
+  # A scheduled task still needs something to run. This is a Markdown-body requirement,
+  # not frontmatter grammar; the checker above has already proved the exact fences.
+  if ! awk 'NR == 1 { next } !closed && /^---$/ { closed=1; next }
+    closed && /[^[:space:]]/ { body=1 }
+    END { exit body ? 0 : 1 }' "$dir/SKILL.md"; then
+    printf 'has a SKILL.md with nothing under its frontmatter: no prompt to run\n'
     return 0
   fi
   return 1

@@ -15,10 +15,10 @@
 #   - that a directory which EXISTS and is still not a usable prompt -- a symlink anywhere
 #     inside it, no SKILL.md, or a SKILL.md that is empty or carries no readable frontmatter --
 #     is refused rather than certified in sync or pulled over the checkout, in both directions,
-#     with legal-but-unusual prompts as the control that the floor is not refusing everything --
+#     with legal-but-unusual prompts as the control that the shared check is not refusing everything --
 #     including a description that quotes the parser's own markers, and this repository's own
-#     prompts -- and that the frontmatter GRAMMAR is check-prompts.sh's job and not this
-#     floor's, a division pinned from both sides on a malformed optional field;
+#     prompts -- and that malformed optional fields are refused by both callers of the
+#     single frontmatter grammar in check-prompts.sh;
 #   - that the two roots must be disjoint, however the overlap is spelled, since a destination
 #     under routines/ has the publisher walk the tree it is writing;
 #   - that a push never leaves the installed prompt absent or half-written, sampled by a reader
@@ -108,6 +108,7 @@ fi
 # check-prompts.sh is what judges the real prompts.
 REPO="$TMP/repo"
 mkdir -p "$REPO/scripts"
+cp "$HERE/check-prompts.sh" "$REPO/scripts/check-prompts.sh"
 cp "$SYNC" "$REPO/scripts/sync-routines.sh"
 chmod +x "$REPO/scripts/sync-routines.sh"
 SR="$REPO/scripts/sync-routines.sh"
@@ -364,6 +365,7 @@ done
 LINKREPO="$TMP/linkrepo"
 rm -rf "$LINKREPO"
 mkdir -p "$LINKREPO/scripts"
+cp "$HERE/check-prompts.sh" "$LINKREPO/scripts/check-prompts.sh"
 cp "$SYNC" "$LINKREPO/scripts/sync-routines.sh"
 chmod +x "$LINKREPO/scripts/sync-routines.sh"
 ln -s "$TMP/outside-routines" "$LINKREPO/routines"
@@ -449,8 +451,8 @@ expect "...while pull onto it is allowed, since that is the repair" 0 "pulled in
 # --- a regular file is not yet a prompt -----------------------------------------------------------
 # A zero-byte or frontmatter-less SKILL.md installs happily and then compares equal to itself, so
 # push would replace a working prompt with one the loaders can read no name, no description and no
-# body out of -- the same quiet nothing-ran as an unreadable file, by a different route. The floor
-# below is not a second copy of check-prompts.sh's grammar; it is what the loaders need to find.
+# body out of -- the same quiet nothing-ran as an unreadable file, by a different route. The shared check
+# below delegates to check-prompts.sh instead of reimplementing its grammar.
 for defect in empty no-fence unclosed no-name no-description; do
   reset_trees; install_all
   case "$defect" in
@@ -466,10 +468,10 @@ for defect in empty no-fence unclosed no-name no-description; do
     || ko "the $defect prompt replaced the installed one"
   expect "...and status calls it out" 1 "$R1: $REPO/routines/$R1" -- run_sync
 done
-# The same floor on the installed side.
+# The same shared check on the installed side.
 reset_trees; install_all
 : > "$TMP/installed/$R1/SKILL.md"
-expect "status refuses an installed SKILL.md that is empty" 1 "EMPTY SKILL.md" -- run_sync
+expect "status refuses an installed SKILL.md that is empty" 1 "no YAML frontmatter" -- run_sync
 expect "...pull refuses to take it" 1 "refusing to pull from it" -- run_sync pull
 [ -s "$REPO/routines/$R1/SKILL.md" ] \
   && ok "...leaving the checkout's prompt alone" || ko "pull emptied the checkout's prompt"
@@ -477,27 +479,27 @@ expect "...while push republishes over it" 0 "republished to" -- run_sync push
 [ -s "$TMP/installed/$R1/SKILL.md" ] \
   && ok "...restoring a real prompt" || ko "the installed prompt is still empty"
 
-# The control: a well-formed prompt with unusual but legal content passes, so the floor is not
-# just refusing everything. A CRLF first line counts, since a checkout can carry one.
+# The control: a well-formed prompt with unusual but legal content passes, so the shared check is not
+# just refusing everything. CRLF is refused consistently with repository validation.
 reset_trees; install_all
 printf -- '---\r\nname: %s\r\ndescription: a prompt with CRLF line endings\r\n---\r\n\r\nbody\r\n' \
   "$R1" > "$REPO/routines/$R1/SKILL.md"
-expect "a CRLF prompt is still a prompt" 0 "pushed to" -- run_sync push
+expect "CRLF is refused by the shared LF grammar" 1 "no YAML frontmatter" -- run_sync push
 expect "...and reads as in sync afterwards" 0 "all local routines in sync" -- run_sync
 reset_trees; install_all
 expect "...as does the ordinary one, which is the baseline for all of the above" 0 "in sync" -- run_sync
 
-# --- the frontmatter floor is a floor, not a substring search -------------------------------------
+# --- the frontmatter shared check is a shared check, not a substring search -------------------------------------
 # The first draft of it was three ad-hoc tests. Each of these is a shape it got wrong.
 reset_trees; install_all
 printf -- '---\nname:\ndescription: d\n---\n\nbody\n' > "$REPO/routines/$R1/SKILL.md"
-expect "push refuses a name: with no value" 1 "no non-empty name: field" -- run_sync push
+expect "push refuses a name: with no value" 1 "frontmatter 'name:' has no value" -- run_sync push
 reset_trees; install_all
 printf -- '---\nname: %s\ndescription:   \n---\n\nbody\n' "$R1" > "$REPO/routines/$R1/SKILL.md"
-expect "...and a description: that is only whitespace" 1 "no non-empty description: field" -- run_sync push
+expect "...and a description: that is only whitespace" 1 "frontmatter 'description:' has no value" -- run_sync push
 reset_trees; install_all
 printf -- '---\nx-name: %s\nx-description: d\n---\n\nbody\n' "$R1" > "$REPO/routines/$R1/SKILL.md"
-expect "...and keys that merely CONTAIN the field names" 1 "no non-empty name: field" -- run_sync push
+expect "...and keys that merely CONTAIN the field names" 1 "frontmatter has no 'name:' line" -- run_sync push
 reset_trees; install_all
 printf -- '---\nname: %s\ndescription: d\n---\n' "$R1" > "$REPO/routines/$R1/SKILL.md"
 expect "...and frontmatter with no prompt under it" 1 "no prompt to run" -- run_sync push
@@ -508,7 +510,7 @@ grep -q 'body v1' "$TMP/installed/$R1/SKILL.md" \
   && ok "...with the working installation left in place throughout" \
   || ko "one of the refused pushes still replaced the installed prompt"
 
-# The other direction: shapes that are legal must PASS, or the floor is just a wall. A value that
+# The other direction: shapes that are legal must PASS, or the shared check is just a wall. A value that
 # contains the parser's own vocabulary is the one that caught an in-band marker.
 reset_trees; install_all
 printf -- '---\nname: %s\ndescription: Reports an @@UNCLOSED@@ parser state, and --- fences\n---\n\nbody v2\n' \
@@ -518,23 +520,27 @@ expect "...and reads as in sync afterwards" 0 "all local routines in sync" -- ru
 reset_trees; install_all
 printf -- '---\nname: %s\ndescription: d\nallowed-tools: Bash, Read\n---\n\nbody v2\n' \
   "$R1" > "$REPO/routines/$R1/SKILL.md"
-expect "...as is frontmatter carrying keys this floor does not know" 0 "pushed to" -- run_sync push
-# The repository's own prompts are the last word: whatever this floor is, they must pass it.
+expect "...as is frontmatter carrying keys this shared check does not know" 0 "pushed to" -- run_sync push
+# The repository's own prompts are the last word: whatever this shared check is, they must pass it.
 for r in $LOCAL_ROUTINES; do
   out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/probe-$r" "$SYNC" 2>&1) || true
   contains "$out" "routines/$r has" \
-    && ko "the floor rejects this repository's own $r prompt: $out" \
-    || ok "this repository's $r prompt passes the floor"
+    && ko "the shared check rejects this repository's own $r prompt: $out" \
+    || ok "this repository's $r prompt passes the shared check"
 done
 
-# The division of labour, pinned from both sides. This floor asks what the LOADERS must find; the
-# frontmatter GRAMMAR belongs to scripts/check-prompts.sh, which CI runs on every head. A
-# malformed optional field is the case that separates them, and if that ever stops being true --
-# the checker losing its rule, or this floor growing a value grammar -- this is where it shows.
+# A missing validator must refuse, never turn failed delegation into a clean verdict.
+reset_trees; install_all
+mv "$REPO/scripts/check-prompts.sh" "$REPO/scripts/check-prompts.saved"
+expect "missing grammar owner fails closed" 1 'rejected by check-prompts' -- run_sync push
+mv "$REPO/scripts/check-prompts.saved" "$REPO/scripts/check-prompts.sh"
+expect "restoring the grammar owner restores the control" 0 'all local routines in sync' -- run_sync
+
+# The shared grammar is pinned from both callers with a malformed optional field.
 reset_trees; install_all
 printf -- '---\nname: %s\ndescription: d\nallowed-tools: [\n---\n\nbody v2\n' \
   "$R1" > "$REPO/routines/$R1/SKILL.md"
-expect "the floor passes a malformed OPTIONAL field, which is not its claim to make" 0 "pushed to" -- \
+expect "sync delegates malformed OPTIONAL fields to the grammar owner" 1 "allowed-tools" -- \
   run_sync push
 CPTREE="$TMP/cptree"
 rm -rf "$CPTREE"
@@ -917,6 +923,7 @@ strip_check() {
 }
 BROKEN="$TMP/broken"
 mkdir -p "$BROKEN/scripts"
+cp "$HERE/check-prompts.sh" "$BROKEN/scripts/check-prompts.sh"
 strip_marked_block kind-guard "$BROKEN/scripts/sync-routines.sh"
 strip_check kind-guard "$BROKEN/scripts/sync-routines.sh" \
   "a copy of the script without the file-kind guard was built"
@@ -941,6 +948,7 @@ contains "$out" "$R1: republished to" \
 # pruning pass.
 NOPRUNE="$TMP/noprune"
 mkdir -p "$NOPRUNE/scripts"
+cp "$HERE/check-prompts.sh" "$NOPRUNE/scripts/check-prompts.sh"
 strip_marked_block prune-guard "$NOPRUNE/scripts/sync-routines.sh"
 strip_check prune-guard "$NOPRUNE/scripts/sync-routines.sh" \
   "a copy of the script that publishes without pruning was built"
