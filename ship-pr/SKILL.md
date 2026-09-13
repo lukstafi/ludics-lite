@@ -201,6 +201,14 @@ and ends on a watermark either way:
 ~/.claude/skills/ship-pr/scripts/pr-review.sh poll <owner>/<repo>#<pr> [watermark]   # one shot
 ```
 
+A live 👀 at the quiet-window deadline extends the watch until at most
+`SHIP_PR_REVIEW_GRACE` after that reaction started. The first extension fixes the deadline;
+more reactions cannot renew it. When you post a plain `@codex review` nudge, arm the next
+watch with the last watch's watermark. That newly observed comment buys one bounded grace
+window measured from its creation time (the `comment` helper's automation footer is accepted).
+The outgoing watermark consumes the nudge identity, so carrying it into another watch does
+not buy fresh grace. Ordinary replies and edits reset nothing.
+
 Its default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it) outlasts a foreground
 tool's timeout, which is why it is backgrounded. Spell the repo out, as above: a background shell
 does not reliably start in the checkout.

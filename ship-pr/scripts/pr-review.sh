@@ -1004,7 +1004,7 @@ pr_head_read() {
 status_state() {
   local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local vline verd_at verd_sha mstate="-" head_err="" pr_created=""
-  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at
+  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at=""
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -1246,7 +1246,16 @@ status_state() {
   # A failed commit read costs precision, not the state: the PR's own timestamps remain.
   head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
     head_at=""
-  echo "expected|$(freshest_age "$head_at" "$pr_created" "$last_spoke" "$eyes_at")|$mstate|no 👀" \
+  # Only a watch can spend a nudge: its incoming watermark identifies comments not yet
+  # observed by an earlier window. Use creation time, never edits or ordinary replies.
+  # The outgoing poll watermark consumes that identity without adding persistent state.
+  if [ -n "${watch_nudge_after:-}" ]; then
+    nudge_at=$(jq -r --argjson after "$watch_nudge_after" '
+      [.[] | select(.id > $after)
+       | select((.body // "") | test("^@codex review[ \t\r\n]*(_🤖 Addressed by an automated coding agent_)?[ \t\r\n]*$"))
+       | .created_at // empty] | max // ""' <<<"$comments_raw")
+  fi
+  echo "expected|$(freshest_age "$head_at" "$pr_created" "$last_spoke" "$eyes_at" "$nudge_at")|$mstate|no 👀" \
     "in flight and no review of head ${head_sha:0:7}${rev_sha:+; $REVIEWER last reviewed ${rev_sha:0:7} at $rev_at}"
 }
 
@@ -1766,6 +1775,8 @@ cmd_watch() {
   pr="$PR_NUM"
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"
   local start=$SECONDS was state tok age quiet=0 saw=0 blind=0 past_seen=0 past_last=""
+  local watch_nudge_after extension_end="" remaining pause
+  watch_nudge_after=$(mark_of "$mark" 2)
 
   state=$(status_state "$pr")
   was=$(state_tok "$state")
@@ -1860,8 +1871,23 @@ cmd_watch() {
       ;;
     esac
 
-    [ $((SECONDS - start + interval)) -le "$timeout" ] || break
-    sleep "$interval"
+    pause="$interval"
+    if [ $((SECONDS - start + interval)) -gt "$timeout" ]; then
+      # A live round can outlast the ordinary quiet window. Freeze the extension's
+      # deadline on its first use so changing reactions cannot renew it indefinitely.
+      [ "$tok" = reviewing ] || break
+      case "$age" in '' | *[!0-9]*) break ;; esac
+      if [ -z "$extension_end" ]; then
+        remaining=$((GRACE - age))
+        [ "$remaining" -gt 0 ] || break
+        extension_end=$((SECONDS + remaining))
+        warn "extending watch for the in-flight 👀, at most ${remaining}s beyond this poll"
+      fi
+      remaining=$((extension_end - SECONDS))
+      [ "$remaining" -gt 0 ] || break
+      [ "$pause" -le "$remaining" ] || pause="$remaining"
+    fi
+    sleep "$pause"
   done
 
   # The window is out, and the last thing it does is look once more: the round this watch exists

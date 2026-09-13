@@ -733,7 +733,71 @@ test_the_same_body_against_two_heads_is_not_folded() {
     "and is rendered under the stamp it was written against, not this head's"
 }
 
+# A nudge buys one observer window, identified by its comment id. Carrying the
+# returned watermark into the next window must not buy that same grace again.
+test_a_nudge_buys_exactly_one_window() {
+  reset_fixture
+  HEAD_AT=2026-09-01T00:00:00Z
+  PR_CREATED_AT="$HEAD_AT"
+  local now mark
+  now=$(jq -rn 'now | todate')
+  schedule comments 1 "$(jq -cn --arg at "$now" '{id:700,user:{login:"maintainer"},created_at:$at,
+    body:"@codex review\n\n_🤖 Addressed by an automated coding agent_"}' | jq -s '.')"
+  run_watch 0,699,0 1 0
+  assert_eq "$WATCH_RC" 1 "a fresh nudge keeps the otherwise overdue observer armed"
+  assert_not_contains "$WATCH_OUT" "no review materialized" "no immediate repeat nudge verdict"
+  mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
+  assert_eq "$mark" 0,700,0 "the nudge identity is consumed by the outgoing watermark"
+  run_watch "$mark" 1 0
+  assert_eq "$WATCH_RC" 0 "the next window cannot renew the same nudge"
+  assert_contains "$WATCH_OUT" "no review materialized" "the overdue verdict remains available"
+}
+
+test_an_ordinary_reply_or_old_nudge_does_not_reset_grace() {
+  local body
+  for body in 'Thanks, @codex review was requested earlier' '@codex review'; do
+    reset_fixture
+    HEAD_AT=2026-09-01T00:00:00Z
+    PR_CREATED_AT="$HEAD_AT"
+    local at
+    at=$(jq -rn 'now | todate')
+    [ "$body" != '@codex review' ] || at="$HEAD_AT"
+    schedule comments 1 "$(jq -cn --arg at "$at" --arg body "$body"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:$body}]')"
+    run_watch 0,699,0 1 0
+    assert_eq "$WATCH_RC" 0 "an ordinary reply or expired nudge grants no grace"
+    assert_contains "$WATCH_OUT" "no review materialized" "the old PR clock still expires"
+  done
+}
+
+test_a_live_round_extends_the_quiet_window() {
+  reset_fixture
+  local now
+  now=$(jq -rn 'now | todate')
+  schedule reactions 1 "[$(reaction eyes "$now")]"
+  # With timeout zero, the old loop settled at round 2 and missed round 3.
+  schedule reviews 3 "[$(review 501 "$H2" "$now")]"
+  run_watch 0,0,0 1 0
+  assert_eq "$WATCH_RC" 0 "the in-flight round is observed beyond the quiet deadline"
+  assert_contains "$WATCH_OUT" '--- review id=501' "the eventual round ends the wait"
+  assert_contains "$WATCH_ERR" 'extending watch' "the extension is explicit"
+}
+
+test_a_live_round_extension_is_bounded() {
+  reset_fixture
+  local now GRACE=5
+  now=$(jq -rn 'now | todate')
+  schedule reactions 1 "[$(reaction eyes "$now")]"
+  run_watch 0,0,0 1 0
+  assert_eq "$WATCH_RC" 1 "a round with no result cannot extend forever"
+  assert_contains "$WATCH_OUT" 'no reviewer activity' "the exhausted extension returns quiet"
+  assert_contains "$WATCH_ERR" 'extending watch' "the ordinary window was extended first"
+}
+
 tests=(
+  test_a_nudge_buys_exactly_one_window
+  test_an_ordinary_reply_or_old_nudge_does_not_reset_grace
+  test_a_live_round_extends_the_quiet_window
+  test_a_live_round_extension_is_bounded
   test_a_review_of_another_head_does_not_end_the_wait
   test_an_inline_finding_is_bound_by_the_commit_it_was_written_against
   test_identical_inline_threads_fold_into_one_entry
