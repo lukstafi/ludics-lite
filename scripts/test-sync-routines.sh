@@ -485,11 +485,11 @@ reset_trees; install_all
 printf -- '---\r\nname: %s\r\ndescription: a prompt with CRLF line endings\r\n---\r\n\r\nbody\r\n' \
   "$R1" > "$REPO/routines/$R1/SKILL.md"
 expect "CRLF is refused by the shared LF grammar" 1 "no YAML frontmatter" -- run_sync push
-expect "...and reads as in sync afterwards" 0 "all local routines in sync" -- run_sync
+expect "...and status reports the same defect" 1 "no YAML frontmatter" -- run_sync
 reset_trees; install_all
 expect "...as does the ordinary one, which is the baseline for all of the above" 0 "in sync" -- run_sync
 
-# --- the frontmatter shared check is a shared check, not a substring search -------------------------------------
+# --- delegated field and body validation ------------------------------------------------------
 # The first draft of it was three ad-hoc tests. Each of these is a shape it got wrong.
 reset_trees; install_all
 printf -- '---\nname:\ndescription: d\n---\n\nbody\n' > "$REPO/routines/$R1/SKILL.md"
