@@ -159,6 +159,11 @@ Write the body as the reviewer's map, not a changelog: what is now true that was
 tests pin, what changes for existing users, and where the risky corner is. Reviewers — human and
 automated — spend their attention where the body sends it.
 
+When the PR fully resolves a tracked issue, include `Closes #N` in its body. If the tracker
+lives in another repository, use `Closes owner/repo#N`. For a partial phase of a multi-PR arc,
+use a non-closing reference (`Refs #N` or `Refs owner/repo#N`); reserve the closing keyword for
+the final PR that completes the issue.
+
 Report the URL on its own line, wrapped as below. The Claude Desktop client renders a live status
 card from the tag; other harnesses ignore it:
 
@@ -955,8 +960,8 @@ a plain `base` read seconds after a merge would only report the previous tip's g
 so do not treat one as a post-merge verdict.
 
 Close the tracked issue out in two commands, comment first — never as one `gh issue close
---comment`. A PR body that links the issue (`Closes #N`, the ordinary way to write one) has
-already closed it at merge time, and `gh issue close N --repo O/R --comment "…"` on an
+--comment`. A PR body with the closing keyword prescribed in *Open* normally closes the issue
+at merge time, and `gh issue close N --repo O/R --comment "…"` on an
 issue that is already closed prints `! Issue … is already closed`, posts NOTHING, and exits 0:
 the summary is lost silently, with the close-out reading as done (ludics-lite#70 and #76 both,
 2026-09-10). So post the summary unconditionally, then close only if the merge did not:
