@@ -22,6 +22,22 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 source "$SCRIPT_DIR/test-pr-review-lib.sh"
 test_tmpdir TEST_ROOT watch-test
 
+# The two clock/outage controls are scoped by each test's locals; ordinary cases
+# still execute the production functions. Declare these overrides to the guard.
+stub age_of status_state
+eval "$(declare -f age_of | sed '1s/age_of/fixture_original_age_of/')"
+eval "$(declare -f status_state | sed '1s/status_state/fixture_original_status_state/')"
+age_of() {
+  if [ -n "${FIXTURE_AGE:-}" ]; then echo "$FIXTURE_AGE"; else fixture_original_age_of "$@"; fi
+}
+status_state() {
+  if [ -n "${UNKNOWN_STATUS_ROUND:-}" ] && [ "$(poll_rounds)" -eq "$UNKNOWN_STATUS_ROUND" ]; then
+    echo 'unknown|-|-|injected reactions outage'
+  else
+    fixture_original_status_state "$@"
+  fi
+}
+
 REPO=example/repo
 REQUEST_LOG="$TEST_ROOT/requests"
 FEEDS="$TEST_ROOT/feeds"
@@ -785,7 +801,7 @@ test_a_live_round_extends_the_quiet_window() {
 test_a_live_round_extension_is_bounded() (
   # Isolate an injected clock in this subshell: neither slow setup nor scheduler
   # delays should spend the fixture's five-second extension before it starts.
-  age_of() { echo 0; }
+  local FIXTURE_AGE=0
   sleep() { SECONDS=$((SECONDS + $1)); }
   reset_fixture
   local now GRACE=5
@@ -823,14 +839,7 @@ test_nudges_wait_past_old_failed_and_stalled_states() {
 test_an_extension_holds_through_unknown_status() (
   reset_fixture
   # Preserve actual feed/status parsing, failing only the status read at round 2.
-  eval "$(declare -f status_state | sed '1s/status_state/original_status_state/')"
-  status_state() {
-    if [ "$(poll_rounds)" -eq 2 ]; then
-      echo 'unknown|-|-|injected reactions outage'
-    else
-      original_status_state "$@"
-    fi
-  }
+  local UNKNOWN_STATUS_ROUND=2
   sleep() { SECONDS=$((SECONDS + $1)); }
   local now
   now=$(jq -rn 'now | todate')
