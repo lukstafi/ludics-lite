@@ -48,6 +48,9 @@ jobs:
       - name: Check every SKILL.md's frontmatter and the README index tables
         # No `if:` on this job, ever: it is the check-run a prompt-only head is judged by.
         run: scripts/check-prompts.sh
+      - name: Reporter guards and fallback rendering
+        # Execute the actual embedded shells with a fake gh; keep reporter vocabulary local.
+        run: python3 scripts/test-workflow-reporters.py
 
   lint:
     name: syntax, shellcheck, mode bits, parse guard
