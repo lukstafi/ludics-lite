@@ -1010,7 +1010,7 @@ review_after_nudge() { # <event timestamp> <eligible nudge timestamp, or empty>
 status_state() {
   local pr="$1" raw line age plus plus_at eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local vline verd_at verd_sha mstate="-" head_err="" pr_created=""
-  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at="" nudge_age comments_loaded=false
+  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at="" nudge_age nudge_id="" nudge_line comments_loaded=false
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -1039,10 +1039,13 @@ status_state() {
       return 0
     }
     comments_loaded=true
-    nudge_at=$(jq -r --argjson after "$watch_nudge_after" '
+    nudge_line=$(jq -r --argjson after "$watch_nudge_after" '
       [.[] | select(.id > $after)
        | select((.body // "") | test("^@codex review[ \t\r\n]*(_🤖 Addressed by an automated coding agent_)?[ \t\r\n]*$"))
-       | .created_at // empty] | max // ""' <<<"$comments_raw")
+       | {id, at: .created_at}] | max_by(.at)
+       | if . == null then "|" else "\(.id)|\(.at)" end' <<<"$comments_raw")
+    nudge_id="${nudge_line%%|*}"
+    nudge_at="${nudge_line#*|}"
     nudge_age=$(age_of "$nudge_at")
     case "$nudge_age" in '' | *[!0-9]*) nudge_at="" ;; esac
   fi
@@ -1260,11 +1263,6 @@ status_state() {
     return 0
   fi
 
-  if [ -n "$nudge_at" ]; then
-    echo "nudged|$nudge_age|$mstate|fresh review nudge; waiting for pickup"
-    return 0
-  fi
-
   # The clock on a review that has not started runs from whichever came last: the push, the
   # reviewer's last word, or the spent 👀 — and how late a review is decides whether `watch`
   # waits or tells the caller to nudge, so what stands in for the push matters (ludics-lite#72).
@@ -1289,6 +1287,13 @@ status_state() {
   # A failed commit read costs precision, not the state: the PR's own timestamps remain.
   head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
     head_at=""
+  if [ -n "$nudge_at" ]; then
+    # An earlier request must not shorten a newly committed head or newly opened
+    # PR's pickup grace. Reuse the same validated clocks as ordinary expected.
+    nudge_age=$(freshest_age "$nudge_at" "$head_at" "$pr_created")
+    echo "nudged|$nudge_age|$mstate|$nudge_id|fresh review nudge; waiting for pickup"
+    return 0
+  fi
   echo "expected|$(freshest_age "$head_at" "$pr_created" "$last_spoke" "$eyes_at" "$nudge_at")|$mstate|no 👀" \
     "in flight and no review of head ${head_sha:0:7}${rev_sha:+; $REVIEWER last reviewed ${rev_sha:0:7} at $rev_at}"
 }
@@ -1364,6 +1369,7 @@ status_line() {
   tok=$(state_tok "$1")
   age=$(state_age "$1")
   detail=$(state_detail "$1")
+  [ "$tok" != nudged ] || detail="${detail#*|}"
   merge=$(state_merge "$1")
   conflict=$(conflict_note "$merge")
   case "$tok" in
@@ -1692,6 +1698,25 @@ watch_act() { # <pr> <state line>
   [ "$POLLED_PAST_N" -eq 0 ] || extra="$extra (+$POLLED_PAST_N about another commit, below)"
   [ -n "$POLLED_HEAD" ] ||
     extra="$extra (the head did not read this round, so nothing was held back for being old)"
+  # Same-head findings preceding a pending request remain actionable. Surface
+  # them, but leave the nudge itself pending so the next observer can await the
+  # requested round without replaying these older issue comments.
+  if [ "$(state_tok "$2")" = nudged ]; then
+    local pending_id
+    pending_id=$(state_detail "$2")
+    pending_id="${pending_id%%|*}"
+    case "$pending_id" in
+    '' | *[!0-9]*) ;;
+    *)
+      if [ "$pending_id" -gt 0 ] && [ "$(mark_of "$mark" 2)" -ge "$pending_id" ]; then
+        mark="$(mark_of "$mark" 1),$((pending_id - 1)),$(mark_of "$mark" 3)"
+        POLLED_OUT=$(sed '$d' <<<"$POLLED_OUT")
+        POLLED_OUT="$POLLED_OUT"$'\n'"watermark: $mark"
+        warn "nudge $pending_id remains pending; keep an observer after handling these review items"
+      fi
+      ;;
+    esac
+  fi
   echo "status: $(status_line "$2")" >&2
   watch_drift_note "$1"
   warn "PR $REPO#$1: ending the wait on ${POLLED_ON:-reviewer activity}$extra"
@@ -1863,8 +1888,13 @@ cmd_watch() {
     tok=$(state_tok "$state")
     age=$(state_age "$state")
     if [ "$tok" != unknown ]; then
-      candidate_end=$(watch_grace_deadline "$state")
-      candidate_kind="$tok"
+      # The first negative read still holds the live round: only the second
+      # confirms it ended. Do not discard its deadline at that first boundary.
+      if ! { [ "$was" = reviewing ] && [ "$tok" != reviewing ] &&
+        [ "$tok" != nudged ] && [ "$quiet" -eq 0 ]; }; then
+        candidate_end=$(watch_grace_deadline "$state")
+        candidate_kind="$tok"
+      fi
       last_healthy_mark="$mark"
     fi
 
@@ -1926,7 +1956,8 @@ cmd_watch() {
       # takes minutes to pick a push up — and then it is worth SAYING, because there is nothing on
       # the other end to wait for. The grace runs from the PR's clock, not the window's, so it is
       # reached in the second window rather than never.
-      if [ "$tok" = expected ] || [ "$tok" = nudged ]; then
+      if { [ "$tok" = expected ] || [ "$tok" = nudged ]; } &&
+        ! { [ "$was" = reviewing ] && [ "$quiet" -eq 1 ]; }; then
         case "$age" in
         '' | *[!0-9]*) ;;
         *)

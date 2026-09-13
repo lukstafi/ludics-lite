@@ -39,7 +39,9 @@ age_of() {
   fi
 }
 status_state() {
-  if [ "${FIXTURE_STATUS_UNKNOWN:-0}" = 1 ] ||
+  if [ -n "${FIXTURE_INITIAL_STATE:-}" ] && [ "$(poll_rounds)" -eq 0 ]; then
+    echo "$FIXTURE_INITIAL_STATE"
+  elif [ "${FIXTURE_STATUS_UNKNOWN:-0}" = 1 ] ||
     { [ -n "${UNKNOWN_STATUS_ROUND:-}" ] && [ "$(poll_rounds)" -eq "$UNKNOWN_STATUS_ROUND" ]; }; then
     echo 'unknown|-|-|injected reactions outage'
   else
@@ -834,6 +836,8 @@ test_nudges_wait_past_old_failed_and_stalled_states() (
   old=2026-09-01T00:00:00Z
   for kind in failed stalled; do
     reset_fixture
+    HEAD_AT="$old"
+    PR_CREATED_AT="$old"
     now=$(jq -rn 'now | todate')
     FIXTURE_FRESH_AT="$now"
     FIXTURE_FRESH_AGE=0
@@ -966,7 +970,83 @@ test_unreadable_status_cannot_consume_a_loop_nudge() (
   assert_contains "$WATCH_ERR" 'extending watch' "the recovered observer grants the still-pending nudge grace"
 )
 
+test_one_empty_reaction_read_retains_the_live_boundary() (
+  reset_fixture
+  local now
+  now=$(jq -rn 'now | todate')
+  sleep() { SECONDS=$((SECONDS + 100)); }
+  schedule reactions 1 "[$(reaction eyes "$now")]"
+  schedule reactions 2 '[]'
+  schedule reactions 3 "[$(reaction eyes "$now")]"
+  schedule reviews 4 "[$(review 501 "$H2" "$now")]"
+  run_watch 0,0,0 1 100
+  assert_eq "$WATCH_RC" 0 "one empty reaction read cannot terminate a held live deadline"
+  assert_contains "$WATCH_OUT" '--- review id=501' "the returning live round remains observed"
+)
+
+test_a_pre_push_nudge_keeps_the_fresher_head_clock() (
+  reset_fixture
+  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0
+  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+  HEAD_AT="$FIXTURE_FRESH_AT"
+  PR_CREATED_AT=2026-09-01T00:00:00Z
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+  schedule comments 1 '[{"id":700,"user":{"login":"maintainer"},"created_at":"2026-09-01T00:00:00Z","body":"@codex review"}]'
+  run_watch 0,699,0 1 0
+  assert_contains "$WATCH_ERR" 'extending watch' "the old request cannot shorten a fresh head clock"
+  [ "$(poll_rounds)" -ge 3 ] || bail "the fresh head received no observation window"
+)
+
+test_old_unseen_findings_leave_the_new_request_pending() (
+  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 kind comments mark
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+  for kind in review summary inline; do
+    reset_fixture
+    FIXTURE_FRESH_AGE=0
+    FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+    comments=$(jq -cn --arg at "$FIXTURE_FRESH_AT"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
+    case "$kind" in
+    review) schedule reviews 1 "[$(review 599 "$H2" 2026-09-01T00:00:00Z 'still actionable old finding')]" ;;
+    summary) comments=$(jq -cn --argjson n "$comments" --argjson r "$(stamped_summary 699 2026-09-01T00:00:00Z "$H2" 'still actionable old finding')" '$n + [$r]') ;;
+    inline) schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'still actionable old finding')]" ;;
+    esac
+    schedule comments 1 "$comments"
+    run_watch 0,0,0 1 0
+    assert_eq "$WATCH_RC" 0 "old $kind findings are still actionable"
+    assert_contains "$WATCH_OUT" 'still actionable old finding' "the finding must not be filtered away"
+    mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
+    assert_eq "$(mark_of "$mark" 2)" 699 "the new request remains pending after the old $kind result"
+    run_watch "$mark" 1 0
+    assert_contains "$WATCH_ERR" 'extending watch' "the next observer grants the pending request grace"
+    assert_not_contains "$WATCH_OUT" 'still actionable old finding' "the old $kind is not replayed"
+  done
+)
+
+test_initial_grace_cannot_renew_indefinitely_after_unknown_reads() (
+  reset_fixture
+  local FIXTURE_STATUS_UNKNOWN=1 FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 FIXTURE_INITIAL_STATE mark
+  FIXTURE_INITIAL_STATE='nudged|0|clean|700|fresh review nudge; waiting for pickup'
+  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+  schedule comments 1 "$(jq -cn --arg at "$FIXTURE_FRESH_AT"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  # Keep the head older too, so recovery cannot inherit an unrelated fresh-head clock.
+  HEAD_AT=2026-09-01T00:00:00Z
+  PR_CREATED_AT="$HEAD_AT"
+  run_watch 0,0,0 1 0
+  assert_contains "$WATCH_ERR" 'extending watch' "initial healthy status grants the creation-time grace"
+  mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
+  FIXTURE_INITIAL_STATE=""
+  FIXTURE_STATUS_UNKNOWN=0
+  run_watch "$mark" 1 0
+  assert_not_contains "$WATCH_ERR" 'extending watch' "the creation-time clock cannot restart on recovery"
+  assert_contains "$WATCH_OUT" 'no review materialized' "recovery returns a due verdict, not another full window"
+)
+
 tests=(
+  test_one_empty_reaction_read_retains_the_live_boundary
+  test_a_pre_push_nudge_keeps_the_fresher_head_clock
+  test_old_unseen_findings_leave_the_new_request_pending
+  test_initial_grace_cannot_renew_indefinitely_after_unknown_reads
   test_a_fresh_nudge_supersedes_old_same_head_results
   test_unreadable_status_cannot_consume_a_loop_nudge
   test_a_final_poll_leaves_an_unarmed_nudge_pending
