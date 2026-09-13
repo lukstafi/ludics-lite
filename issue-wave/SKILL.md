@@ -240,6 +240,14 @@ worker kinds, with transport-specific setup and identity, and includes:
   shells, the backend to select and how to prove the run executed on it (a backend-uniform
   golden proves nothing - the OCANNL notes on `OCANNL_BACKEND` and self-announcing legs), and
   still one dune per _build.
+- Execution handoff: require an assignment before every fleet test/experiment, including local
+  CLI runs. Native workers message the coordinator with revision, host, command, checkout and log
+  path, then wait for dispatch. CLI briefs name an absolute request-file path under the worker's
+  state directory: write the same payload there, print `EXECUTION_REQUEST <path>`, and exit the
+  turn without launching the test. The coordinator follows the
+  [CLI reservation handoff](references/executions.md#cli-reservation-handoff) before resuming it.
+  A resumed worker runs only the assigned bounded command/batch, writes runner evidence to the
+  named result file and exits again; neither turn completion nor its report releases the box.
 - Landing: the ship-pr skill through review to merge, then close the upstream issue with a
   summary comment - `gh issue comment --body-file` first and `gh issue close` only if the merge
   left it open, per ship-pr's *After it lands*, because `gh issue close --comment` on an issue a
@@ -347,6 +355,12 @@ linked reference's selected native lifecycle wherever a bullet below names CLI e
   `pgrep -fl '[p]r-review.sh watch <owner>/<repo>#<pr>( |$)'` - not by cwd; after a harness
   restart those claims are unreliable in both directions (observed 3x on 2026-08-23; commits
   proved durable every time).
+- **CLI execution requests are handoffs, not completed issues.** When `attach` reports a turn
+  ended, inspect its output and the brief's request/result paths before classifying it as finished.
+  An `EXECUTION_REQUEST` goes through the [reservation handoff](references/executions.md#cli-reservation-handoff);
+  resume the same worker after the coordinator reserves and dispatches its assignment. On the
+  result turn, independently verify runner termination and evidence, conclude the reservation,
+  then resume implementation/review. Do not launch a second writer or infer success from `DONE`.
 - **CLI workers: unstick through the script, and only a dead exec.** Write the imperative
   message to a file (do X now, in this turn, do not yield; never as command-line text - issue prose is
   full of backticks and `$()`) and run `fleet-worker.sh unstick <box> <name> --message

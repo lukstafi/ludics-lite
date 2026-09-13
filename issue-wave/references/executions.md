@@ -89,6 +89,33 @@ evidence and log are required in the conclusion. If reconciliation proves nothin
 conclusion retry is harmless. There is no expiry or automatic release. Never remove a checkout
 while an outstanding record refers to it, or while a pending assignment could still be using it.
 
+## CLI reservation handoff
+
+A detached CLI worker cannot rely on a native message channel. Its self-contained brief names
+absolute request and result paths under its worker state directory on its agent host. Before
+fleet tests or experiments, it writes the requested revision, execution host, workload kind,
+exact bounded command/batch, checkout and intended log path to the request file, prints
+`EXECUTION_REQUEST <absolute-path>`, and ends its turn without starting that execution.
+
+The coordinator observes the tracked `attach` exit, reads the file (over SSH when needed), and
+confirms through `status` and process evidence that the CLI has stopped. Queue the request until
+the execution host is available. Reserve it with `transport: "cli"` and the actual `agent_host`,
+then call `execution dispatch`. Only after successful dispatch, resume that same session with
+`fleet-worker.sh unstick <agent-box> <worker> --message <brief-file>`. The continuation names the
+request ID, assigned command/batch, revision, checkout, log and result paths; it instructs the
+worker to run only that assignment and return its actual runner handle, observed SHA, log and
+terminal outcome in the result file, then exit again before additional fleet work. Start a new
+tracked `attach` waiter and record the resume/runner evidence on the board.
+
+Dispatch preceding the resume is a point-in-time gate just as it precedes an SSH runner call.
+If resume fails or its outcome is unclear, retain ownership and reconcile whether anything
+started; never blindly dispatch or resume twice. When the result turn ends, verify actual runner
+termination and conclude with its evidence before resuming ordinary implementation/review.
+A `DONE` turn with a request or result is an intermediate handoff, not issue completion. A new
+execution needs a new request and reservation. CLI workers never mutate the coordinator lease
+or reservation registry themselves. Native workers use their live coordinator message channel
+for the same reserve/dispatch/evidence lifecycle.
+
 ## Adoption and halt
 
 Lease adoption fences stale coordinator mutations; outstanding records survive. Read them and
