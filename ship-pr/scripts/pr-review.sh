@@ -935,10 +935,12 @@ fmt_age() {
 #   failed    the reviewer's newest word is the INITIALIZATION failure above: the round never ran.
 #   expected  no live 👀 and no review of the head SHA: a round is due and has not started.
 #   idle      the reviewer has reviewed this exact head and left no 👍, so the next move is yours.
+#   nudged    watch-only: a fresh nudge owns one creation-time grace window.
 #   unknown   a read failed. NOT a state of the PR — hold the previous one and retry.
 # <seconds> is how long the state has held: since the 👀 for reviewing/stalled, since the failure
 # comment for failed, and for expected since the LATEST of head commit / PR creation / reviewer's
-# last word / spent 👀 — i.e. since the moment a review became due. "-" when nothing datable was
+# last word / spent 👀 — i.e. since the moment a review became due; nudged uses
+# the fresh nudge comment creation time. "-" when nothing datable was
 # read.
 #
 # `failed` sits below 👍 and below a live 👀, and above everything else. A 👍 is the merge gate
@@ -1001,10 +1003,14 @@ pr_head_read() {
   return 0
 }
 
+review_after_nudge() { # <event timestamp> <eligible nudge timestamp, or empty>
+  [ -z "$2" ] || [[ "$1" > "$2" ]]
+}
+
 status_state() {
-  local pr="$1" raw line age plus eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
+  local pr="$1" raw line age plus plus_at eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local vline verd_at verd_sha mstate="-" head_err="" pr_created=""
-  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at
+  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at="" nudge_age nudge_id="" nudge_line comments_loaded=false
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -1013,18 +1019,41 @@ status_state() {
   line=$(jq -r --arg rev "$REVIEWER" '
       [.[] | select((.user.login // "") | startswith($rev))]
       | "\(any(.[]; .content == "+1"))"
-        + "|" + ((map(select(.content == "eyes") | .created_at) | max) // "")' \
+        + "|" + ((map(select(.content == "eyes") | .created_at) | max) // "")
+        + "|" + ((map(select(.content == "+1") | .created_at) | max) // "")' \
     <<<"$raw" 2>/dev/null) || {
     echo "unknown|-|-|the reactions feed did not parse"
     return 0
   }
   plus="${line%%|*}"
-  eyes_at="${line#*|}"
+  line="${line#*|}"
+  eyes_at="${line%%|*}"
+  plus_at="${line#*|}"
+
+  # A watch must identify its pending request before accepting a standing verdict.
+  # Reuse this comments read below; standalone status keeps its reactions-only
+  # approval fast path because it has no incoming watch watermark to spend.
+  if [ -n "${watch_nudge_after:-}" ]; then
+    comments_raw=$(api_list "issues/$pr/comments?per_page=100") || {
+      echo "unknown|-|-|the comments API did not answer ($(gh_err_line))"
+      return 0
+    }
+    comments_loaded=true
+    nudge_line=$(jq -r --argjson after "$watch_nudge_after" '
+      [.[] | select(.id > $after)
+       | select((.body // "") | test("^@codex review[ \t\r\n]*(_🤖 Addressed by an automated coding agent_)?[ \t\r\n]*$"))
+       | {id, at: .created_at}] | max_by(.at)
+       | if . == null then "|" else "\(.id)|\(.at)" end' <<<"$comments_raw")
+    nudge_id="${nudge_line%%|*}"
+    nudge_at="${nudge_line#*|}"
+    nudge_age=$(age_of "$nudge_at")
+    case "$nudge_age" in '' | *[!0-9]*) nudge_at="" ;; esac
+  fi
 
   # 👍 is the merge gate and the reactions feed alone answers it, so it is answered before any feed
   # that could fail: an outage on the reviews feed must not hide an approval behind "unknown".
   # The PR read here is for the mergeability alone, and cannot change the verdict.
-  [ "$plus" = true ] && {
+  [ "$plus" = true ] && review_after_nudge "$plus_at" "$nudge_at" && {
     pr_head_read "$pr"
     echo "approved|-|$mstate|👍 from $REVIEWER"
     return 0
@@ -1058,11 +1087,15 @@ status_state() {
   # two polls, and one that never did times out at the shorter grace while the round is still
   # running (review of self-improve#13). It is an announcement, not the reviewer speaking; the
   # verdict scan below still reads it, in case a verdict is ever delivered by editing it in place.
-  raw=$(api_list "issues/$pr/comments?per_page=100") || {
-    echo "unknown|-|$mstate|the comments API did not answer ($(gh_err_line))"
-    return 0
-  }
-  comments_raw="$raw"
+  if [ "$comments_loaded" = true ]; then
+    raw="$comments_raw"
+  else
+    raw=$(api_list "issues/$pr/comments?per_page=100") || {
+      echo "unknown|-|$mstate|the comments API did not answer ($(gh_err_line))"
+      return 0
+    }
+    comments_raw="$raw"
+  fi
   com_at=$(jq -r --arg rev "$REVIEWER" '
       [.[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | test("codex-pull-request-review-summary") | not)
@@ -1111,6 +1144,14 @@ status_state() {
         end' <<<"$raw" 2>/dev/null) || fline="|"
   fail_at="${fline%%|*}"
   fail_ref="${fline#*|}"
+  # A new explicit request supersedes older evidence uniformly: neither an old
+  # success, failure, idle review nor reaction can settle that requested round.
+  # Newer events retain the established priority rules below.
+  review_after_nudge "$eyes_at" "$nudge_at" || eyes_at=""
+  if ! review_after_nudge "$rev_at" "$nudge_at"; then rev_at=""; rev_sha=""; fi
+  review_after_nudge "$com_at" "$nudge_at" || com_at=""
+  if ! review_after_nudge "$verd_at" "$nudge_at"; then verd_at=""; verd_sha=""; fi
+  if ! review_after_nudge "$fail_at" "$nudge_at"; then fail_at=""; fail_ref=""; fi
   last_spoke=$(newest "$rev_at" "$com_at")
 
   # The head SHA and the mergeability, in ONE read of the PR, made AFTER the feeds: every review
@@ -1246,7 +1287,14 @@ status_state() {
   # A failed commit read costs precision, not the state: the PR's own timestamps remain.
   head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
     head_at=""
-  echo "expected|$(freshest_age "$head_at" "$pr_created" "$last_spoke" "$eyes_at")|$mstate|no 👀" \
+  if [ -n "$nudge_at" ]; then
+    # An earlier request must not shorten a newly committed head or newly opened
+    # PR's pickup grace. Reuse the same validated clocks as ordinary expected.
+    nudge_age=$(freshest_age "$nudge_at" "$head_at" "$pr_created")
+    echo "nudged|$nudge_age|$mstate|$nudge_id|fresh review nudge; waiting for pickup"
+    return 0
+  fi
+  echo "expected|$(freshest_age "$head_at" "$pr_created" "$last_spoke" "$eyes_at" "$nudge_at")|$mstate|no 👀" \
     "in flight and no review of head ${head_sha:0:7}${rev_sha:+; $REVIEWER last reviewed ${rev_sha:0:7} at $rev_at}"
 }
 
@@ -1321,6 +1369,7 @@ status_line() {
   tok=$(state_tok "$1")
   age=$(state_age "$1")
   detail=$(state_detail "$1")
+  [ "$tok" != nudged ] || detail="${detail#*|}"
   merge=$(state_merge "$1")
   conflict=$(conflict_note "$merge")
   case "$tok" in
@@ -1347,7 +1396,7 @@ status_line() {
       "ref it could not fetch is one the PR and git ls-remote both serve. This is not a round —" \
       "$frest, standing for $(fmt_age "$age")${conflict:+; $conflict}"
     ;;
-  expected) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")${conflict:+; $conflict}" ;;
+  expected | nudged) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")${conflict:+; $conflict}" ;;
   # "The next move is yours" is exactly the line that sent #39 into seven untested rounds: on a
   # conflicted PR the move is the base merge, and saying anything else invites another push. A
   # draft takes it away for the same reason (#49): its move is `gh pr ready`, and "yours" would
@@ -1644,11 +1693,34 @@ watch_quiet_line() { # <window seconds, or - for a verdict mid-window>
 # differently in a log that used to show the same line for both: the descriptor poll rendered
 # carries the id, the review state, the short commit and the author.
 watch_act() { # <pr> <state line>
-  local extra=""
+  local extra="" original_mark="$mark"
   [ "$POLLED_ON_N" -le 1 ] || extra=" (+$((POLLED_ON_N - 1)) more about this head)"
   [ "$POLLED_PAST_N" -eq 0 ] || extra="$extra (+$POLLED_PAST_N about another commit, below)"
   [ -n "$POLLED_HEAD" ] ||
     extra="$extra (the head did not read this round, so nothing was held back for being old)"
+  # Same-head findings preceding a pending request remain actionable. Surface
+  # them, but leave the nudge itself pending so the next observer can await the
+  # requested round without replaying these older issue comments.
+  if [ "$(state_tok "$2")" = nudged ]; then
+    local pending_id
+    pending_id=$(state_detail "$2")
+    pending_id="${pending_id%%|*}"
+    case "$pending_id" in
+    '' | *[!0-9]*) ;;
+    *)
+      if [ "$pending_id" -gt 0 ] && [ "$(mark_of "$mark" 2)" -ge "$pending_id" ]; then
+        mark="$(mark_of "$mark" 1),$((pending_id - 1)),$(mark_of "$mark" 3)"
+        warn "nudge $pending_id remains pending; keep an observer after handling these review items"
+      fi
+      ;;
+    esac
+  elif [ "$(state_tok "$2")" = unknown ]; then
+    watch_preserve_unarmed_nudge "$last_healthy_mark" "" "$2"
+  fi
+  if [ "$mark" != "$original_mark" ]; then
+    POLLED_OUT=$(sed '$d' <<<"$POLLED_OUT")
+    POLLED_OUT="$POLLED_OUT"$'\n'"watermark: $mark"
+  fi
   echo "status: $(status_line "$2")" >&2
   watch_drift_note "$1"
   warn "PR $REPO#$1: ending the wait on ${POLLED_ON:-reviewer activity}$extra"
@@ -1694,8 +1766,29 @@ watch_settle() { # <pr>
 # The state is re-read after that poll, and only the state the verdict was ABOUT is still the
 # verdict: cmd_poll reads comments and reviews, and the 👍 is on neither, so an approval landing
 # in this same gap would otherwise be answered with a nudge — the one move that destroys it.
+# A final poll may see a nudge that no watch status read has armed yet. Keep
+# only that feed's old cursor when a fresh nudge (or an unreadable status) is
+# discovered at exit; the next watch can then spend it. Other feed cursors stand.
+watch_preserve_unarmed_nudge() { # <pre-settle watermark> <previous state> <new state>
+  local old_issue next_issue next_tok
+  old_issue=$(mark_of "$1" 2)
+  next_issue=$(mark_of "$mark" 2)
+  [ "$next_issue" -gt "$old_issue" ] || return 0
+  next_tok=$(state_tok "$3")
+  case "$next_tok" in
+  nudged)
+    if [ "$(state_tok "$2")" = nudged ] &&
+      [ "$(state_detail "$2")" = "$(state_detail "$3")" ]; then return 0; fi
+    ;;
+  unknown) ;; # An unreadable final status cannot prove a new nudge was consumed safely.
+  *) return 0 ;;
+  esac
+  mark="$(mark_of "$mark" 1),$old_issue,$(mark_of "$mark" 3)"
+  warn "keeping the final poll's issue comments pending for the next watch; a new nudge may still need its grace"
+}
+
 watch_end() { # <pr> <the state token the verdict is about> <message, empty for none>
-  local rc
+  local rc before_settle="$mark" before_state="$state"
   watch_settle "$1"
   rc=$?
   if [ "$rc" -eq 1 ]; then
@@ -1713,6 +1806,7 @@ watch_end() { # <pr> <the state token the verdict is about> <message, empty for 
   fi
   state=$(status_state "$1")
   tok=$(state_tok "$state")
+  watch_preserve_unarmed_nudge "$before_settle" "$before_state" "$state"
   if [ "$tok" = unknown ]; then
     echo "the state could not be re-read after the final poll on PR $REPO#$1, so the '$2' verdict" \
       "is WITHHELD — $(state_detail "$state"); this is NOT 'the reviewer stayed quiet', re-arm"
@@ -1724,6 +1818,12 @@ watch_end() { # <pr> <the state token the verdict is about> <message, empty for 
       "$(status_line "$state")"
     echo "watermark: $mark"
     return 0
+  fi
+  if [ "$tok" = nudged ] && [ "$(state_tok "$before_state")" = nudged ] &&
+    [ "$(state_detail "$before_state")" != "$(state_detail "$state")" ]; then
+    echo "the '$2' verdict on PR $REPO#$1 was dropped: a newer nudge still needs its grace; re-arm"
+    echo "watermark: $mark"
+    return 1
   fi
   if [ "$tok" != "$2" ]; then
     echo "the '$2' verdict on PR $REPO#$1 was dropped: the state moved to '$tok' while it was" \
@@ -1760,15 +1860,30 @@ watch_end() { # <pr> <the state token the verdict is about> <message, empty for 
 # Every other state gets a bounded wait and then a verdict, because a window that reports nothing is
 # indistinguishable — to the caller and to the user watching the clock — from a window that reported
 # a stale 👀 three times in a row.
+# A healthy live-round or nudge read provides an absolute grace deadline. An
+# unreadable state supplies none; cmd_watch retains its last healthy candidate.
+watch_grace_deadline() {
+  local tok age
+  tok=$(state_tok "$1")
+  case "$tok" in reviewing | nudged) ;; *) return 0 ;; esac
+  age=$(state_age "$1")
+  case "$age" in '' | *[!0-9]*) return 0 ;; esac
+  echo $((SECONDS + GRACE - age))
+}
+
 cmd_watch() {
   local pr="${1:?usage: watch <pr> [watermark]}" mark="${2:-}"
   pr_arg "$pr"
   pr="$PR_NUM"
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"
   local start=$SECONDS was state tok age quiet=0 saw=0 blind=0 past_seen=0 past_last=""
+  local watch_nudge_after extension_end="" candidate_end candidate_kind extension_kind="" extension_mark="" remaining pause elapsed final_state last_healthy_mark="$mark"
+  watch_nudge_after=$(mark_of "$mark" 2)
 
   state=$(status_state "$pr")
   was=$(state_tok "$state")
+  candidate_end=$(watch_grace_deadline "$state")
+  candidate_kind="$was"
   echo "watching PR $REPO#$pr, every ${interval}s for up to ${timeout}s;" \
     "from: $(status_line "$state")" >&2
 
@@ -1785,6 +1900,16 @@ cmd_watch() {
     state=$(status_state "$pr")
     tok=$(state_tok "$state")
     age=$(state_age "$state")
+    if [ "$tok" != unknown ]; then
+      # The first negative read still holds the live round: only the second
+      # confirms it ended. Do not discard its deadline at that first boundary.
+      if ! { [ "$was" = reviewing ] && [ "$tok" != reviewing ] &&
+        [ "$tok" != nudged ] && [ "$quiet" -eq 0 ]; }; then
+        candidate_end=$(watch_grace_deadline "$state")
+        candidate_kind="$tok"
+      fi
+      last_healthy_mark="$mark"
+    fi
 
     # A round's stdout is byte-identical to poll's, watermark last, so a caller can consume watch
     # and poll the same way; the state is context, not the finding, so it goes to stderr.
@@ -1829,7 +1954,7 @@ cmd_watch() {
       # A 👀 that stops being in flight without a review of the head is a round that ended with
       # nothing. Make it prove itself over two rounds, since one read can be a false negative — and
       # this is the fast path to the same verdict the grace below reaches on the clock alone.
-      if [ "$was" = reviewing ] && [ "$tok" != reviewing ]; then
+      if [ "$was" = reviewing ] && [ "$tok" != reviewing ] && [ "$tok" != nudged ]; then
         quiet=$((quiet + 1))
         if [ "$quiet" -ge 2 ]; then
           watch_end "$pr" "$tok" "$(echo "the 👀 round on PR $REPO#$pr ended without a review of" \
@@ -1844,7 +1969,8 @@ cmd_watch() {
       # takes minutes to pick a push up — and then it is worth SAYING, because there is nothing on
       # the other end to wait for. The grace runs from the PR's clock, not the window's, so it is
       # reached in the second window rather than never.
-      if [ "$tok" = expected ]; then
+      if { [ "$tok" = expected ] || [ "$tok" = nudged ]; } &&
+        ! { [ "$was" = reviewing ] && [ "$quiet" -eq 1 ]; }; then
         case "$age" in
         '' | *[!0-9]*) ;;
         *)
@@ -1860,8 +1986,33 @@ cmd_watch() {
       ;;
     esac
 
-    [ $((SECONDS - start + interval)) -le "$timeout" ] || break
-    sleep "$interval"
+    pause="$interval"
+    if [ $((SECONDS - start + interval)) -gt "$timeout" ]; then
+      # A live round can outlast the ordinary quiet window. Freeze the extension's
+      # deadline on its first use so changing reactions cannot renew it indefinitely.
+      # Cache deadlines on healthy reads, including before the ordinary boundary.
+      # Unknown reads retain that evidence; none can invent or renew a deadline.
+      [ -n "$candidate_end" ] || break
+      if [ -z "$extension_end" ]; then
+        remaining=$((candidate_end - SECONDS))
+        [ "$remaining" -gt 0 ] || break
+        extension_end="$candidate_end"
+        extension_kind="$candidate_kind"
+        extension_mark="$mark"
+        warn "extending watch for the live review or fresh nudge, at most ${remaining}s beyond this poll"
+      fi
+      # Pickup and execution are distinct phases: allow the first live review
+      # its own eyes-start grace after a nudge. Once reviewing, never renew again.
+      if [ "$extension_kind" = nudged ] && [ "$candidate_kind" = reviewing ]; then
+        extension_end="$candidate_end"
+        extension_kind=reviewing
+        warn "review started after the nudge; handing off to its fixed live-review deadline"
+      fi
+      remaining=$((extension_end - SECONDS))
+      [ "$remaining" -gt 0 ] || break
+      [ "$pause" -le "$remaining" ] || pause="$remaining"
+    fi
+    sleep "$pause"
   done
 
   # The window is out, and the last thing it does is look once more: the round this watch exists
@@ -1873,6 +2024,20 @@ cmd_watch() {
   if [ $? -eq 1 ]; then
     watch_act "$pr" "$(status_state "$pr")"
     return 0
+  fi
+
+  if [ "$(mark_of "$mark" 2)" -gt "$(mark_of "$last_healthy_mark" 2)" ]; then
+    final_state=$(status_state "$pr")
+    watch_preserve_unarmed_nudge "$last_healthy_mark" "$state" "$final_state"
+  fi
+
+  # A later request cannot renew this frozen window, but it must remain
+  # eligible for the next observer. Keep comments after the extension checkpoint
+  # pending conservatively; no extra feed read or per-request deadline is needed.
+  if [ -n "$extension_mark" ] &&
+    [ "$(mark_of "$mark" 2)" -gt "$(mark_of "$extension_mark" 2)" ]; then
+    mark="$(mark_of "$mark" 1),$(mark_of "$extension_mark" 2),$(mark_of "$mark" 3)"
+    warn "comments after the fixed grace began remain pending; re-arm to observe any newer request"
   fi
 
   if [ "$saw" -eq 0 ]; then
@@ -1893,7 +2058,9 @@ cmd_watch() {
   fi
   # The state is the last round's, not a fresh read: it is what the window actually observed, and a
   # re-read here would report a change this window never saw and never acted on.
-  echo "$(watch_quiet_line "$timeout"); status: $(status_line "$state")"
+  elapsed="$timeout"
+  [ -z "$extension_end" ] || elapsed=$((SECONDS - start))
+  echo "$(watch_quiet_line "$elapsed"); status: $(status_line "$state")"
   echo "watermark: $mark"
   return 1
 }

@@ -201,6 +201,24 @@ and ends on a watermark either way:
 ~/.claude/skills/ship-pr/scripts/pr-review.sh poll <owner>/<repo>#<pr> [watermark]   # one shot
 ```
 
+A live 👀 at the quiet-window deadline extends the watch until at most
+`SHIP_PR_REVIEW_GRACE` after that reaction started. The first extension fixes the deadline;
+more reactions cannot renew it. When you post a plain `@codex review` nudge, arm the next
+watch with the last watch's watermark. That newly observed comment buys one bounded grace
+window measured from its creation time (the `comment` helper's automation footer is accepted).
+That window also extends past the ordinary timeout until the nudge's grace expires, including
+when the nudge follows a failed or stalled review. A temporary unreadable status retains the
+last healthy deadline; it cannot renew it. When pickup becomes an active review, the deadline
+hands off once to that review's eyes-start grace, then stays fixed. Quiet exits report the
+extended elapsed duration. The observer treats older review results as preceding that explicit
+request. An approval newer than the nudge settles the status immediately; queued actionable
+findings are still surfaced with that approved status. Unreadable status reads
+leave newly seen nudge identities pending instead of consuming their grace.
+The outgoing watermark consumes the nudge identity, so carrying it into another watch does
+not buy fresh grace. Comments arriving after the extension was fixed remain pending for the
+next observer, so a later request cannot renew this window or lose its own opportunity to be
+observed. Ordinary replies and edits reset nothing.
+
 Its default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it) outlasts a foreground
 tool's timeout, which is why it is backgrounded. Spell the repo out, as above: a background shell
 does not reliably start in the checkout.
