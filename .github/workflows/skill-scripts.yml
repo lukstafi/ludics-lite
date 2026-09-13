@@ -384,3 +384,17 @@ jobs:
           name: cleanup-logs-macos
           path: ${{ runner.temp }}/cleanup-logs
           if-no-files-found: ignore
+
+  windows-driver:
+    name: bounded Windows driver (${{ matrix.shell }})
+    runs-on: windows-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise native Bash verdicts and owned-tree timeout
+        shell: ${{ matrix.shell }}
+        run: ./issue-wave/scripts/test-windows-driver.ps1

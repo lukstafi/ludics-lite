@@ -105,3 +105,40 @@ state and concurrent processes without SSH, accounts or hardware. For live valid
 one box, run one existing bounded verification command at a recorded SHA, retain the actual
 handle/log/verdict and conclude. Lack of hardware access remains a validation gate, not evidence
 of success. The bounded two-worker transport smoke is in [native-codex.md](native-codex.md).
+
+## Bounded native Windows verification
+
+Use `issue-wave/scripts/windows-driver.ps1` for a foreground Git Bash verifier on native
+Windows. It extracts the corrected driver from the #671 verification evidence. For example:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:/tools/ludics-lite/issue-wave/scripts/windows-driver.ps1 `
+  -ScriptPath C:/work/verify.sh -LogPath C:/evidence/run-123.log `
+  -ErrorPath C:/evidence/run-123.err -CapSeconds 120
+```
+
+`BashPath` defaults to `C:/Program Files/Git/usr/bin/bash.exe`. Use a fresh pair of log paths
+in an existing directory for every invocation. The driver prints its PID and cap, caches the
+process handle before waiting, and on timeout calls `taskkill /PID <owned-pid> /T /F`.
+The verifier must keep its child work in the foreground (wait for all children) and emit its
+verdict as stdout's **last line**, after all output, then exit with that same status:
+
+```bash
+bash --noprofile --norc /c/work/check.sh
+rc=$?
+printf 'exit: %s\n' "$rc"
+exit "$rc"
+```
+
+Do not let `set -e` skip verdict publication: capture the command's failure explicitly if
+using it. The driver accepts only `exit: N` with N in 0..255, requires that record even when
+Windows supplies a native exit code, and cross-checks the native code whenever non-null.
+A null native code never implies success. It returns the recorded code, 124 for a confirmed
+timeout cleanup, or 2 for incomplete/inconsistent evidence or runner errors. Logs remain for
+inspection. An unconfirmed cleanup leaves the execution reservation uncertain; do not conclude
+it merely from wrapper termination. This foreground runner does not supervise detached work
+or replace the reservation protocol above.
+
+Run `powershell -NoProfile -File issue-wave/scripts/test-windows-driver.ps1` (or `pwsh`) on
+Windows. CI runs both engines, including a real inner Bash failure with the native exit accessor
+forced to null, absent/trailing/stale verdicts, mismatched codes, and owned-tree timeout.
