@@ -75,7 +75,8 @@ reset_fixture() {
   RUNS_1=$(runs_json 1 '[]')
   # Every RUNS_<n>/JOBS_<n> a previous case set is cleared, or a case that names none would be
   # served the last case's answers and pass for its neighbour's reasons.
-  for v in $(set | sed -n 's/^\(RUNS_[0-9][0-9]*\)=.*/\1/p;s/^\(JOBS_[0-9][0-9]*\)=.*/\1/p'); do
+  # Shell values can contain non-text bytes; only the ASCII variable names are parsed.
+  for v in $(set | LC_ALL=C sed -n 's/^\(RUNS_[0-9][0-9]*\)=.*/\1/p;s/^\(JOBS_[0-9][0-9]*\)=.*/\1/p'); do
     [ "$v" = RUNS_1 ] || unset "$v"
   done
   JOBS_DEFAULT=$(jobs_json '[]')

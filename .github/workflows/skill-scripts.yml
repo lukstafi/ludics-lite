@@ -207,7 +207,8 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Two complete fixture passes; allow slower runners time to finish both.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Exercise the suites' shared preamble and its shadow guard
@@ -232,6 +233,9 @@ jobs:
         run: ship-pr/scripts/test-pr-review-reply.sh
       - name: Exercise the run await's addressing and its invocation-vs-verdict split
         run: ship-pr/scripts/test-pr-review-run-watch.sh
+      - name: Repeat fixtures with inherited names, spaced paths, and a non-C locale
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/run-pr-review-hostile.sh
 
   cleanup:
     name: post-merge cleanup (ubuntu)
