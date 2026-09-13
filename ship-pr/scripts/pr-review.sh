@@ -1693,7 +1693,7 @@ watch_quiet_line() { # <window seconds, or - for a verdict mid-window>
 # differently in a log that used to show the same line for both: the descriptor poll rendered
 # carries the id, the review state, the short commit and the author.
 watch_act() { # <pr> <state line>
-  local extra=""
+  local extra="" original_mark="$mark"
   [ "$POLLED_ON_N" -le 1 ] || extra=" (+$((POLLED_ON_N - 1)) more about this head)"
   [ "$POLLED_PAST_N" -eq 0 ] || extra="$extra (+$POLLED_PAST_N about another commit, below)"
   [ -n "$POLLED_HEAD" ] ||
@@ -1710,12 +1710,16 @@ watch_act() { # <pr> <state line>
     *)
       if [ "$pending_id" -gt 0 ] && [ "$(mark_of "$mark" 2)" -ge "$pending_id" ]; then
         mark="$(mark_of "$mark" 1),$((pending_id - 1)),$(mark_of "$mark" 3)"
-        POLLED_OUT=$(sed '$d' <<<"$POLLED_OUT")
-        POLLED_OUT="$POLLED_OUT"$'\n'"watermark: $mark"
         warn "nudge $pending_id remains pending; keep an observer after handling these review items"
       fi
       ;;
     esac
+  elif [ "$(state_tok "$2")" = unknown ]; then
+    watch_preserve_unarmed_nudge "$last_healthy_mark" "" "$2"
+  fi
+  if [ "$mark" != "$original_mark" ]; then
+    POLLED_OUT=$(sed '$d' <<<"$POLLED_OUT")
+    POLLED_OUT="$POLLED_OUT"$'\n'"watermark: $mark"
   fi
   echo "status: $(status_line "$2")" >&2
   watch_drift_note "$1"
@@ -1772,7 +1776,10 @@ watch_preserve_unarmed_nudge() { # <pre-settle watermark> <previous state> <new 
   [ "$next_issue" -gt "$old_issue" ] || return 0
   next_tok=$(state_tok "$3")
   case "$next_tok" in
-  nudged) [ "$(state_tok "$2")" != nudged ] || return 0 ;;
+  nudged)
+    if [ "$(state_tok "$2")" = nudged ] &&
+      [ "$(state_detail "$2")" = "$(state_detail "$3")" ]; then return 0; fi
+    ;;
   unknown) ;; # An unreadable final status cannot prove a new nudge was consumed safely.
   *) return 0 ;;
   esac
@@ -1781,7 +1788,7 @@ watch_preserve_unarmed_nudge() { # <pre-settle watermark> <previous state> <new 
 }
 
 watch_end() { # <pr> <the state token the verdict is about> <message, empty for none>
-  local rc before_settle="$mark"
+  local rc before_settle="$mark" before_state="$state"
   watch_settle "$1"
   rc=$?
   if [ "$rc" -eq 1 ]; then
@@ -1799,7 +1806,7 @@ watch_end() { # <pr> <the state token the verdict is about> <message, empty for 
   fi
   state=$(status_state "$1")
   tok=$(state_tok "$state")
-  watch_preserve_unarmed_nudge "$before_settle" "$2" "$state"
+  watch_preserve_unarmed_nudge "$before_settle" "$before_state" "$state"
   if [ "$tok" = unknown ]; then
     echo "the state could not be re-read after the final poll on PR $REPO#$1, so the '$2' verdict" \
       "is WITHHELD — $(state_detail "$state"); this is NOT 'the reviewer stayed quiet', re-arm"
@@ -1811,6 +1818,12 @@ watch_end() { # <pr> <the state token the verdict is about> <message, empty for 
       "$(status_line "$state")"
     echo "watermark: $mark"
     return 0
+  fi
+  if [ "$tok" = nudged ] && [ "$(state_tok "$before_state")" = nudged ] &&
+    [ "$(state_detail "$before_state")" != "$(state_detail "$state")" ]; then
+    echo "the '$2' verdict on PR $REPO#$1 was dropped: a newer nudge still needs its grace; re-arm"
+    echo "watermark: $mark"
+    return 1
   fi
   if [ "$tok" != "$2" ]; then
     echo "the '$2' verdict on PR $REPO#$1 was dropped: the state moved to '$tok' while it was" \

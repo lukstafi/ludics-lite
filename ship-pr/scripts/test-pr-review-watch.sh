@@ -1042,7 +1042,45 @@ test_initial_grace_cannot_renew_indefinitely_after_unknown_reads() (
   assert_contains "$WATCH_OUT" 'no review materialized' "recovery returns a due verdict, not another full window"
 )
 
+test_a_second_nudge_at_settle_remains_pending() (
+  reset_fixture
+  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 mark
+  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+  HEAD_AT=2026-09-01T00:00:00Z
+  PR_CREATED_AT="$HEAD_AT"
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+  schedule comments 1 '[{"id":700,"user":{"login":"maintainer"},"created_at":"2026-09-01T00:00:00Z","body":"@codex review"}]'
+  schedule comments 2 "$(jq -cn --arg at "$FIXTURE_FRESH_AT" '[{id:700,user:{login:"maintainer"},created_at:"2026-09-01T00:00:00Z",body:"@codex review"},{id:701,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  run_watch 0,699,0 1 0
+  assert_contains "$WATCH_OUT" 'a newer nudge still needs its grace' "same state token does not mean same request"
+  assert_not_contains "$WATCH_OUT" 'no review materialized' "the older expired verdict is dropped"
+  mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
+  assert_eq "$(mark_of "$mark" 2)" 700 "the second request remains pending"
+  run_watch "$mark" 1 0
+  assert_contains "$WATCH_ERR" 'extending watch' "the recovered observer grants the second request its grace"
+)
+
+test_an_actionable_result_with_unknown_status_keeps_pending_comments() (
+  reset_fixture
+  local UNKNOWN_STATUS_ROUND=1 FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 mark
+  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+  HEAD_AT=2026-09-01T00:00:00Z
+  PR_CREATED_AT="$HEAD_AT"
+  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+  schedule reviews 1 "[$(review 599 "$H2" 2026-09-01T00:00:00Z 'actionable during status outage')]"
+  schedule comments 1 "$(jq -cn --arg at "$FIXTURE_FRESH_AT" '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  run_watch 0,699,0 1 0
+  assert_contains "$WATCH_OUT" 'actionable during status outage' "the readable review is surfaced"
+  mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
+  assert_eq "$mark" 0,699,599 "only the unverified issue cursor is retained"
+  run_watch "$mark" 1 0
+  assert_contains "$WATCH_ERR" 'extending watch' "the fresh request receives grace on recovery"
+  assert_not_contains "$WATCH_OUT" 'actionable during status outage' "the consumed review is not replayed"
+)
+
 tests=(
+  test_a_second_nudge_at_settle_remains_pending
+  test_an_actionable_result_with_unknown_status_keeps_pending_comments
   test_one_empty_reaction_read_retains_the_live_boundary
   test_a_pre_push_nudge_keeps_the_fresher_head_clock
   test_old_unseen_findings_leave_the_new_request_pending
