@@ -69,10 +69,13 @@ it. It also refuses to `pull` from an installed directory with no
 here — and from one whose `SKILL.md` is not a prompt: empty, opening with no
 `---` fence, with frontmatter never closed, with no non-empty `name:` or `description:` field, or
 with nothing under the frontmatter to run. Any of those installs just as happily and leaves the
-scheduler a task it can read no name, no description and no instructions out of. That check is a
-floor, not a second copy of `check-prompts.sh`'s grammar: it asks only for what the loaders have
-to find at all, and it is one parser pass rather than a set of substring tests, so a description
-that quotes `---` is a valid description.
+scheduler a task it can read no name, no description and no instructions out of. Frontmatter
+validation delegates to `scripts/check-prompts.sh --one <dir>`, using the same grammar and byte
+checks as repository validation, including optional fields. CRLF frontmatter and malformed
+optional fields are refused; use LF line endings and the checker's one-line scalar grammar.
+Single-directory mode skips README indexing and name/directory equality, so an installed task ID
+may differ from its prompt name. Sync separately requires a nonempty Markdown body and retains
+its filesystem safety checks. A description that quotes `---` remains valid.
 
 The two roots have to be disjoint, and that is checked on the resolved paths before anything is
 written: a `CLAUDE_SCHEDULED_TASKS_DIR` pointing inside `routines/` would have the publisher walk
