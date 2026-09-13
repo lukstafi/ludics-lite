@@ -386,15 +386,15 @@ jobs:
           if-no-files-found: ignore
 
   windows-driver:
-    name: bounded Windows driver (${{ matrix.shell }})
+    name: bounded Windows driver (PowerShell 5.1 and 7)
     runs-on: windows-latest
     timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      matrix:
-        shell: [powershell, pwsh]
     steps:
       - uses: actions/checkout@v4
-      - name: Exercise native Bash verdicts and owned-tree timeout
-        shell: ${{ matrix.shell }}
+      - name: Windows PowerShell 5.1 verdicts and owned-tree timeout
+        shell: powershell
+        run: ./issue-wave/scripts/test-windows-driver.ps1
+      - name: PowerShell 7 verdicts and owned-tree timeout
+        if: ${{ !cancelled() }}
+        shell: pwsh
         run: ./issue-wave/scripts/test-windows-driver.ps1
