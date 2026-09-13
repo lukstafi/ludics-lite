@@ -3212,7 +3212,7 @@ warn_base_drift() {
       "$overlap_meet_count path(s) changed by"
     printf '!!! %s#%s: %s\n' "$REPO" "$pr" "$overlap_meet"
     if [ "$overlap_unread_count" -gt 0 ]; then
-      echo "!!! (hunks unread for $overlap_unread_count of them — no patch in the compare response," \
+      echo "!!! (hunks unread for $overlap_unread_count of them — patch missing or unreadable in the compare response," \
         "so counted as meeting: $overlap_unread)"
     fi
     if [ "$overlap_disjoint_count" -gt 0 ]; then

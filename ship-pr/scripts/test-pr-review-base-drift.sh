@@ -359,6 +359,8 @@ test_unrecognized_headers_are_unread() {
     assert_eq "$DRIFT_RC" 1 "a patch without recognized headers stays loud"
     assert_contains "$DRIFT_OUTPUT" "hunks unread for 1 of them" \
       "a patch without recognized headers is reported unread"
+    assert_contains "$DRIFT_OUTPUT" "patch missing or unreadable" \
+      "the diagnostic must cover a present but unsupported patch"
     assert_not_contains "$DRIFT_OUTPUT" "DISJOINT" \
       "no parsed ranges must never imply disjoint hunks"
   done
