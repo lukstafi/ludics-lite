@@ -137,6 +137,26 @@ triage is wrong, not the backlog.
 
 ## Launch
 
+**Default Codex model choice:** unless the user specifies otherwise, use Sol / medium
+(`gpt-5.6-sol`) for bounded implementation and documentation work, including tightly scoped D2s;
+consider Sol / high for broader but bounded workflow and portability work. Prefer Astra / medium
+(`gpt-6-astra`) for coordination and escalations, semantic analysis, cross-platform lifecycle
+behavior, changes to verification logic, and interacting states, clocks, identities or partial
+observations. Astra / low ("Light") fits prescribed execution and genuinely narrow fixes;
+hardware timeouts and loader failures alone do not justify more reasoning effort. Keep D1/D2/D3
+as implementation-difficulty labels, and assess semantic coupling, verification risk (low:
+local deterministic acceptance; medium: timing-sensitive claims or extensive negative controls;
+high: platform semantics, GPU searches or expanding language-feature combinations), and delivery
+overhead (shared files, dependencies, slow CI or likely repeated reviews) separately. D1/D2 alone
+should not select the model, and high verification risk calls for a concrete verification plan,
+not automatically a stronger model. If the first substantial review exposes interacting semantics
+or expanding scope, reassess toward D3 and Astra / medium, clarifying contract boundaries before
+another incremental fix cycle. Sol workers still own implementation through `ship-pr` and merge,
+with explicit briefs, test evidence, CI gates and coordinator escalation. These defaults reflect
+qualitative observations from the OCANNL-staging and ludics-lite waves, not a controlled cost or
+speed comparison; evaluate future assignments by review rounds, coordinator interventions and
+time to merge, separating queueing, CI and dependency waits from active work where possible.
+
 Choose **provider/model**, **transport and agent residence**, and **execution placement**
 separately. Both Codex and Claude Code coordinators can use their own provider's native
 subagents or launch either provider through the CLI. Cross-provider delegation uses the CLI
