@@ -14,7 +14,10 @@ those backends. The sweep places them on three boxes: cc and metal on this Mac (
 Linux on purpose (load balance, and cross-OS coverage of the CPU backends). So minix carries TWO
 backends: a minix that stays down leaves both hip and multidev_cc uncovered. Throughout this
 routine, "the box's backends" means all of them — rog: cuda; minix: hip AND multidev_cc — and every
-outcome that makes a box untestable is reported for each backend on it. The CUDA box (rog-nv-wsl) and HIP box
+outcome step 1 reports BEFORE the sweep (no wake, no WSL, a failed restart) is reported for each
+backend on that box. What happens DURING the sweep is per unit instead: minix runs hip and then
+multidev_cc, so a VM can vanish after hip recorded a real result; judge each backend by its own row,
+and only a unit that recorded `skip (unreachable)` is uncovered. The CUDA box (rog-nv-wsl) and HIP box
 (minix-amd-wsl) are often hibernated, and sometimes powered off; step 1 tries to wake them, but if that fails,
 "skip (unreachable)" is a normal outcome, not an error. CI's Windows OS target is likewise off the per-PR path: it runs only on the
 twice-weekly scheduled CI sweep, and on demand via `workflow_dispatch`, because at 62-74min it
@@ -219,7 +222,8 @@ For each of the FIVE backends (cc, multidev_cc, metal, cuda, hip) find the most 
 liveness row. Flag backends with no pass in more than 2 days. For cuda, hip or multidev_cc (the
 backends on the WSL boxes), say which of the three step-1 outcomes applied: woken
   and swept; woken but `-wsl` never appeared or was gone again by the time the unit probed it
-  (machine up, the box's backends untestable — the cold-boot kicked-VM trap in step 1; a re-kick plus an
+  (machine up, that unit untestable — only the units whose row says `skip (unreachable)`, while a
+  unit that ran before the VM vanished keeps its result — the cold-boot kicked-VM trap in step 1; a re-kick plus an
   incremental rerun usually recovers it); or the wake itself failed. A failed wake with settled `router-active=1` means the NIC was
   powered and listening, so the magic packet was ignored: the WoL option itself (BIOS, or the
   Windows NIC driver's wake settings) has been lost. With settled `router-active=0` the NIC is not powered while the
