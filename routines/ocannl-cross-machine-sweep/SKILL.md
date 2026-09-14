@@ -12,7 +12,9 @@ have no automated coverage except this sweep, so this routine is the ONLY gate f
 those backends. The sweep places them on three boxes: cc and metal on this Mac (`m4-max`), cuda on
 `rog-nv-wsl`, and hip then multidev_cc on `minix-amd-wsl` — the CPU pair is split across macOS and
 Linux on purpose (load balance, and cross-OS coverage of the CPU backends). So minix carries TWO
-backends: a minix that stays down leaves both hip and multidev_cc uncovered. The CUDA box (rog-nv-wsl) and HIP box
+backends: a minix that stays down leaves both hip and multidev_cc uncovered. Throughout this
+routine, "the box's backends" means all of them — rog: cuda; minix: hip AND multidev_cc — and every
+outcome that makes a box untestable is reported for each backend on it. The CUDA box (rog-nv-wsl) and HIP box
 (minix-amd-wsl) are often hibernated, and sometimes powered off; step 1 tries to wake them, but if that fails,
 "skip (unreachable)" is a normal outcome, not an error. CI's Windows OS target is likewise off the per-PR path: it runs only on the
 twice-weekly scheduled CI sweep, and on demand via `workflow_dispatch`, because at 62-74min it
@@ -39,7 +41,7 @@ Read its last lines:
 
 - `did NOT wake: <box>` is **not** an error: that box's backends (rog: cuda; minix: hip and
   multidev_cc) simply go uncovered today, surfacing through the staleness thresholds in step 4. Do not send the wake command again.
-- `wsl still down after 3 min` on a box that woke means the machine is up but the backend is
+- `wsl still down after 3 min` on a box that woke means the machine is up but that box's backends (minix: both) are
   untestable — say so explicitly in the report, since it is a different finding from a box that
   never woke.
 - `no host table at ~/.config/wake-lab/hosts.sh`: nothing was woken and nothing will be. That
@@ -55,7 +57,7 @@ Read its last lines:
   previous bullet applies to it twice over: the sweep's ssh sessions have to follow promptly.
   `wsl restart FAILED on: <box>` in the last lines means no fresh VM there — the line says
   whether the shutdown was refused (a `-wsl` that still answers is the old VM) or the start
-  failed after it (no VM at all) — so that backend is untestable today: report it as such rather
+  failed after it (no VM at all) — so that box's backends (minix: hip and multidev_cc both) are untestable today: report it as such rather
   than sweeping it. Each such line names only the boxes it applies to.
 
 `~/bin/wake-lab.sh status` prints the per-box picture (router-active, `-lan`, `-win`, `-wsl`) if you need to
@@ -216,7 +218,7 @@ For each of the FIVE backends (cc, multidev_cc, metal, cuda, hip) find the most 
 liveness row. Flag backends with no pass in more than 2 days. For cuda, hip or multidev_cc (the
 backends on the WSL boxes), say which of the three step-1 outcomes applied: woken
   and swept; woken but `-wsl` never appeared or was gone again by the time the unit probed it
-  (machine up, backend untestable — the cold-boot kicked-VM trap in step 1; a re-kick plus an
+  (machine up, the box's backends untestable — the cold-boot kicked-VM trap in step 1; a re-kick plus an
   incremental rerun usually recovers it); or the wake itself failed. A failed wake with settled `router-active=1` means the NIC was
   powered and listening, so the magic packet was ignored: the WoL option itself (BIOS, or the
   Windows NIC driver's wake settings) has been lost. With settled `router-active=0` the NIC is not powered while the
