@@ -24,10 +24,10 @@ coordinator integration. Agent host selection does not reserve machine execution
    or tmux. Confirm the project setup can supply the task's tools and permissions; a passing
    filesystem preflight alone does not prove native startup will succeed.
 3. Write the self-contained brief and a pending entry to the shared wave board. Recheck rival
-   PRs and dependencies, then run `fleet-worker.sh gate` immediately before `create_thread`.
+   PRs and dependencies, then run `fleet-worker.sh gate --target-repo <owner/repo> [--base-branch <branch>]` immediately before `create_thread`.
    Exit 0 permits dispatch; any other exit blocks it. `gate` checks the anchor lease and halt
    state at that instant; it does not reserve a worker or atomically fence a later app call.
-   An adoption must reconcile pending entries before creating anything. Use `gate --force`
+   An adoption must reconcile pending entries before creating anything. Use `gate --target-repo <owner/repo> --force --allow-red-base "<triage reason>"`
    only for the single named regression-triage worker while halted, and record the exception.
 4. Call `create_thread` with `target.type: "project"`, the returned `projectId`, and
    `target.environment: {type: "worktree"}`. Put the complete brief in `prompt` and use a

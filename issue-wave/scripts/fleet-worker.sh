@@ -37,8 +37,8 @@
 #   fleet-worker.sh claim [--take]         # take the fleet's coordinator lease (--take adopts)
 #   fleet-worker.sh coordinator | release  # who holds it (exit 0 me, 1 other, 3 nobody) / give it up
 #   fleet-worker.sh preflight <box> [--codex|--native-codex|--native-claude] [--no-probe] [--no-cross]   # launch runs this itself, too
-#   fleet-worker.sh gate [--force]          # lease + halt read before native dispatch (not a reservation)
-#   fleet-worker.sh launch <box> <name> --kind claude|codex --brief <file>
+#   fleet-worker.sh gate --target-repo <owner/repo> [--base-branch <branch>] [--force --allow-red-base <reason>] # lease + halt read before native dispatch (not a reservation)
+#   fleet-worker.sh launch <box> <name> --target-repo <owner/repo> --kind claude|codex --brief <file>
 #                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
 #                          [--force] [--replace] [-- <extra CLI args>]
 #   fleet-worker.sh attach <box> <name> [--interval <sec>]
@@ -502,20 +502,68 @@ cmd_preflight() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Read on the coordinator, where gh is authenticated, never on the worker box.
+# Keep complete diagnostics and exits. A named triage may override RED, never unknown.
+base_gate() {
+  local target="$1" branch="$2" force="$3" reason="$4" helper rc
+  [[ "$target" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "base gate: --target-repo <owner/repo> required"
+  [ -z "$reason" ] || [ "$force" -eq 1 ] || die "base gate: --allow-red-base requires --force for a triage worker"
+  case "$branch" in -*|*$'\n'*) die "base gate: invalid --base-branch" ;; esac
+  helper="$(cd "$(dirname "$0")/../../ship-pr/scripts" 2>/dev/null && pwd)/pr-review.sh"
+  [ -x "$helper" ] || { echo "BASE REFUSED: coordinator base checker missing: $helper" >&2; return 3; }
+  if [ -n "$branch" ]; then "$helper" base "$target" "$branch" >&2
+  else "$helper" base "$target" >&2; fi
+  rc=$?
+  if [ "$rc" -eq 1 ] && [ "$force" -eq 1 ] && [ -n "$reason" ]; then
+    echo "BASE TRIAGE OVERRIDE: $target ${branch:-default branch}: $reason" >&2
+    return 0
+  fi
+  [ "$rc" -eq 0 ] || echo "BASE REFUSED: $target ${branch:-default branch} (base checker exit $rc); dispatch blocked" >&2
+  return "$rc"
+}
+
+cmd_gate() {
+  local force=0 target="" branch="" reason=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --allow-red-base)
+        [ "$#" -ge 2 ] && [[ "$2" =~ [^[:space:]] ]] || die "base gate: --allow-red-base requires a triage reason"
+        reason="$2"; shift ;;
+      --force) force=1 ;;
+      --target-repo|--base-branch)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die "gate: expected value for $1"
+        if [ "$1" = --target-repo ]; then target="$2"; else branch="$2"; fi
+        shift ;;
+      *) die "gate: expected --target-repo <owner/repo> [--base-branch <branch>] [--force]" ;;
+    esac
+    shift
+  done
+  anchor_gate GATE native-worker "$force" || return $?
+  base_gate "$target" "$branch" "$force" "$reason" || return $?
+  anchor_gate GATE native-worker "$force"
+}
+
 cmd_launch() {
   local box="${1:-}" name="${2:-}"
   [ -n "$box" ] && [ -n "$name" ] || die "launch: <box> <name> required"
   valid_name "$name" || die "launch: name must be [A-Za-z0-9._-]+ and not start with a dot"
   shift 2
-  local kind="" brief="" cwd="" repo="" branch="" base="$BASE_REF" force=0 replace=0
+  local kind="" brief="" cwd="" repo="" branch="" base="$BASE_REF" force=0 replace=0 target="" base_branch="" reason=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --target-repo|--base-branch)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die "launch: expected value for $1"
+        if [ "$1" = --target-repo ]; then target="$2"; else base_branch="$2"; fi
+        shift ;;
       --kind) kind="${2:-}"; shift ;;
       --brief) brief="${2:-}"; shift ;;
       --cwd) cwd="${2:-}"; shift ;;
       --repo) repo="${2:-}"; shift ;;
       --branch) branch="${2:-}"; shift ;;
       --base) base="${2:-}"; shift ;;
+      --allow-red-base)
+        [ "$#" -ge 2 ] && [[ "$2" =~ [^[:space:]] ]] || die "base gate: --allow-red-base requires a triage reason"
+        reason="$2"; shift ;;
       --force) force=1 ;;
       --replace) replace=1 ;;
       --) shift; break ;;
@@ -530,6 +578,13 @@ cmd_launch() {
     [ -n "$repo" ] && [ -n "$branch" ] || die "launch: --cwd <dir>, or --repo <dir> --branch <branch>"
   fi
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
+  # Worktree creation names its base already. An explicit CI branch is needed for
+  # non-origin refs (tags, SHAs, or another remote); existing cwd uses repo default.
+  if [ -z "$cwd" ] && [ -z "$base_branch" ]; then
+    case "$base" in origin/*) base_branch="${base#origin/}" ;;
+      *) die "launch: --base-branch required for a non-origin --base" ;; esac
+  fi
+  base_gate "$target" "$base_branch" "$force" "$reason" || exit $?
   local codex=0 pf; [ "$kind" = codex ] && codex=1
   pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$(siblings_of "$box")" "${FLEET_CROSS_TIMEOUT:-20}" )
   local prc=$?
@@ -1158,14 +1213,7 @@ EOF
 # ---------------------------------------------------------------------------------------------
 cmd="${1:-}"; [ -n "$cmd" ] && shift
 case "$cmd" in
-  gate)
-    force=0
-    case "$#:${1:-}" in
-      0:) ;;
-      1:--force) force=1 ;;
-      *) die "gate: expected no arguments or --force" ;;
-    esac
-    anchor_gate GATE native-worker "$force" ;;
+  gate) cmd_gate "$@" ;;
   preflight) cmd_preflight "$@" ;;
   launch) cmd_launch "$@" ;;
   attach) cmd_attach "$@" ;;

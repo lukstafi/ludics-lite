@@ -35,8 +35,8 @@ SSH or Control other devices connectivity does not establish remote runtime-suba
 4. Create one external worktree and branch per issue before spawning. For example, with resolved
    absolute paths and a verified base: `git -C <repo> worktree add -b codex/<issue> <external-path>
    <verified-base-sha>`. Record ownership first; do not reuse a checkout with an unresolved writer.
-5. Persist the complete brief and pending entry on the anchor. Run `fleet-worker.sh gate`
-   immediately before spawning. Nonzero blocks dispatch. `gate --force` is only for the named
+5. Persist the complete brief and pending entry on the anchor. Run `fleet-worker.sh gate --target-repo <owner/repo> [--base-branch <branch>]`
+   immediately before spawning. Nonzero blocks dispatch. `gate --target-repo <owner/repo> --force --allow-red-base "<triage reason>"` is only for the named
    regression-triage worker and must be recorded. This check is point-in-time, not atomic with a
    runtime tool call; adoption must reconcile pending dispatches before replacement.
 6. Spawn with that brief, recording the returned actual agent identity/canonical task name.

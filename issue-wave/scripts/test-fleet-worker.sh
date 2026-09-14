@@ -30,6 +30,7 @@ FW="$HERE/fleet-worker.sh"
 SECTIONS=(
   "the real checkout under the README's install loops"
   "coordinator lease"
+  "base gate"
   "preflight"
   "launch / attach / status / log with a project repo and --repo/--branch"
   "failure verdicts"
@@ -118,6 +119,20 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 
 cleanup() { tmux -L "$FLEET_TMUX_SOCKET" kill-server 2>/dev/null; rm -rf "$TMP"; }
 trap cleanup EXIT
+
+# Copy the dispatcher beside a canned base helper: no live GitHub reads, and no
+# production bypass knob. The production helper's own suites pin its red diagnostics.
+mkdir -p "$TMP/dispatcher/issue-wave/scripts" "$TMP/dispatcher/ship-pr/scripts"
+cp "$FW" "$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
+FW="$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
+export BASE_CALL_LOG="$TMP/base-calls"
+cat > "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$BASE_CALL_LOG"
+echo "${SHIM_BASE_MESSAGE:-BASE GREEN example/project tested abc1234}"
+exit "${SHIM_BASE_RC:-0}"
+EOF
+chmod +x "$TMP/dispatcher/ship-pr/scripts/pr-review.sh"
 
 pass=0 fail=0
 ok() { pass=$((pass + 1)); echo "PASS: $*"; }
@@ -375,9 +390,32 @@ need_lease() { "$FW" claim >/dev/null || ko "could not claim the coordinator lea
 need_worker() {
   [ -d "$ISSUE_WAVE_STATE/workers/$1" ] && return 0
   need_lease
-  "$FW" launch testbox "$1" --kind claude --brief "$brief" --repo "$proj" --branch "claude/$1" >/dev/null &&
+  "$FW" launch testbox "$1" --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch "claude/$1" >/dev/null &&
     "$FW" attach testbox "$1" --interval 1 >/dev/null ||
     ko "could not prepare worker $1 (setup, not the launcher)"
+}
+
+section "base gate" && {
+need_lease
+for verdict in 1 3 4; do
+  expect "native gate blocks base exit $verdict with diagnostics" "$verdict" "job broken; first red commit deadbee" -- \
+    env SHIM_BASE_RC="$verdict" SHIM_BASE_MESSAGE="job broken; first red commit deadbee" "$FW" gate --target-repo example/project --base-branch topic
+  expect "CLI blocks base exit $verdict before creating worker" "$verdict" "dispatch blocked" -- \
+    env SHIM_BASE_RC="$verdict" "$FW" launch testbox base-red --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/base-red
+  [ ! -e "$ISSUE_WAVE_STATE/workers/base-red" ] && [ ! -e "$proj-worktrees/base-red" ] && ok "refusal left no worker or checkout" || ko "base refusal wrote worker state"
+done
+expect "native green passes" 0 "BASE GREEN" -- "$FW" gate --target-repo example/project --base-branch topic
+expect "missing repository refuses" 2 "--target-repo" -- "$FW" gate
+expect "triage force cannot bypass red base" 1 "dispatch blocked" -- env SHIM_BASE_RC=1 "$FW" gate --target-repo example/project --force
+expect "explicit red triage override passes with reason" 0 "BASE TRIAGE OVERRIDE: example/project default branch: fix broken job" -- env SHIM_BASE_RC=1 "$FW" gate --target-repo example/project --force --allow-red-base 'fix broken job'
+expect "override needs force" 2 "requires --force" -- "$FW" gate --target-repo example/project --allow-red-base fix
+for verdict in 3 4; do
+  expect "triage cannot override unknown $verdict" "$verdict" "dispatch blocked" -- env SHIM_BASE_RC="$verdict" "$FW" gate --target-repo example/project --force --allow-red-base fix
+done
+expect "missing helper is unknown" 3 "checker missing" -- env SHIM_BASE_RC=0 bash -c 'mv "$1" "$1.saved"; "$2" gate --target-repo example/project; rc=$?; mv "$1.saved" "$1"; exit "$rc"' _ "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" "$FW"
+grep -Fxq 'base example/project topic' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
+grep -Fxq 'base example/project master' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
+"$FW" release >/dev/null
 }
 
 section "coordinator lease" && {
@@ -401,7 +439,7 @@ expect "--take adopts the lease" 0 "CLAIMED (adopted) coordinator lease" -- "${B
 expect "the previous holder now sees the lease as not theirs" 1 "(not you)" -- "$FW" coordinator
 expect "...and takes it back with --take" 0 "CLAIMED (adopted)" -- "$FW" claim --take
 expect "another session on the same box (same state dir) is not the holder" 1 "CLAIM REFUSED" -- env FLEET_COORDINATOR=other-session "$FW" claim
-expect "...and cannot launch through the holder's token" 1 "coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" launch testbox nope --kind claude --brief /dev/null --cwd "$TMP"
+expect "...and cannot launch through the holder's token" 1 "coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" launch testbox nope --target-repo example/project --kind claude --brief /dev/null --cwd "$TMP"
 # Two adopters at once: the takeover lock serializes them, exactly one holds afterwards.
 env FLEET_COORDINATOR=race-a "$FW" claim --take >"$TMP/race-a.out" 2>&1 & ra=$!
 env FLEET_COORDINATOR=race-b "$FW" claim --take >"$TMP/race-b.out" 2>&1 & rb=$!
@@ -522,23 +560,23 @@ ln -sfn "$repo/ship-pr" "$HOME/.claude/skills/ship-pr"
 
 section "launch / attach / status / log with a project repo and --repo/--branch" && {
 expect "launch without a lease refuses" 1 "LAUNCH REFUSED testbox/w1: no coordinator lease" -- \
-  "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
+  "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 "$FW" claim >/dev/null
 expect "launch says on stderr which sibling did not answer, and still launches" 0 "preflight note for testbox/w-cross: (cross-box unreachable, asleep or off the network: otherbox)" -- \
-  env FLEET_BOXES="testbox otherbox" SHIM_SSH_DOWN=otherbox "$FW" launch testbox w-cross --kind claude --brief "$brief" --cwd "$proj"
+  env FLEET_BOXES="testbox otherbox" SHIM_SSH_DOWN=otherbox "$FW" launch testbox w-cross --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 "$FW" attach testbox w-cross --interval 1 >/dev/null
 echo x >> "$repo/ship-pr/SKILL.md"
 expect "launch runs the preflight on the box and refuses a dirty served tree" 1 "LAUNCH REFUSED testbox/w1: PREFLIGHT REFUSED testbox: 1 local change(s) in the served tree" -- \
-  "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
+  "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 git -C "$repo" checkout -q -- .
 expect "launch creates the worktree and reports the session" 0 "LAUNCHED testbox/w1 kind=claude session=[0-9a-f-]\{36\} cwd=$proj-worktrees/w1" -- \
-  "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 -- --model opus
+  "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 -- --model opus
 [ -d "$proj-worktrees/w1" ] && [ "$(git -C "$proj-worktrees/w1" rev-parse --abbrev-ref HEAD)" = claude/w1 ] && ok "worktree on the requested branch" || ko "worktree missing or wrong branch"
 grep -q -- "--model opus" "$ISSUE_WAVE_STATE/workers/w1/run.sh" && ok "extra CLI args reach the command line" || ko "extra args lost"
 expect "attach returns the verdict" 0 "DONE testbox/w1 exit=0 success is_error=false" -- "$FW" attach testbox w1 --interval 1
 git -C "$proj" branch -q -f alt-base master && echo b > "$proj/b" && git -C "$proj" add b && git -C "$proj" commit -q -m b && git -C "$proj" push -q origin master alt-base
 expect "FLEET_BASE_REF sets the worktree's start point when --base is not given" 0 "LAUNCHED testbox/wb " -- \
-  env FLEET_BASE_REF=origin/alt-base "$FW" launch testbox wb --kind claude --brief "$brief" --repo "$proj" --branch claude/wb
+  env FLEET_BASE_REF=origin/alt-base "$FW" launch testbox wb --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/wb
 [ "$(git -C "$proj-worktrees/wb" rev-parse HEAD)" = "$(git -C "$proj" rev-parse origin/alt-base)" ] && ok "worktree started from FLEET_BASE_REF" || ko "worktree did not start from FLEET_BASE_REF"
 "$FW" attach testbox wb --interval 1 >/dev/null
 [ "$(cat "$ISSUE_WAVE_STATE/workers/w1/brief.md")" = "$(cat "$brief")" ] && ok "brief crossed byte-for-byte" || ko "brief mangled"
@@ -548,32 +586,32 @@ expect "unknown worker is UNKNOWN, exit 3" 3 "UNKNOWN testbox/nope" -- "$FW" sta
 expect "the literal box name local is the same box, labelled as typed" 0 "EXITED(0) local/w1 kind=claude" -- "$FW" status local w1
 printf 'a different brief\n' > "$TMP/brief2.md"
 expect "a finished worker's name is not reused silently" 1 "finished worker's record is here" -- \
-  "$FW" launch testbox w1 --kind claude --brief "$TMP/brief2.md" --cwd "$proj-worktrees/w1"
+  "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$TMP/brief2.md" --cwd "$proj-worktrees/w1"
 [ "$(cat "$ISSUE_WAVE_STATE/workers/w1/brief.md")" = "$(cat "$brief")" ] && ok "a refused launch leaves the recorded brief untouched" || ko "refused launch overwrote brief.md"
 grep -q '^w1-' <<<"$(ls "$ISSUE_WAVE_STATE/incoming/" 2>/dev/null)" && ko "refused launch left its staged brief behind" || ok "refused launch cleans up its staged brief"
 git -C "$proj-worktrees/w1" checkout -q -b other
 expect "a reused worktree on another branch refuses" 1 "exists but is on 'other', not claude/w1" -- \
-  "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
+  "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
 git -C "$proj-worktrees/w1" checkout -q claude/w1 && git -C "$proj-worktrees/w1" branch -q -D other
 foreign="$proj-worktrees/wx"; git init -q -b claude/wx "$foreign" && echo z > "$foreign/z" && git -C "$foreign" add z && git -C "$foreign" commit -q -m z
 expect "a foreign repository at the derived path is refused even on the right branch" 1 "exists but is not a worktree of" -- \
-  "$FW" launch testbox wx --kind claude --brief "$brief" --repo "$proj" --branch claude/wx
+  "$FW" launch testbox wx --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/wx
 rm -rf "$foreign"
 expect "a reused worktree on the requested branch is accepted" 0 "reusing existing worktree .* (on claude/w1)" -- \
-  "$FW" launch testbox w1 --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
+  "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
 "$FW" attach testbox w1 --interval 1 >/dev/null
 bash -c 'sleep 30; :' claude "$ISSUE_WAVE_STATE/workers/w1/" >/dev/null 2>&1 & orphan=$!
 expect "--replace refuses while a process still carries the old worker's path" 1 "a CLI from the previous launch is still running" -- \
-  "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
+  "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
 kill "$orphan" 2>/dev/null; wait "$orphan" 2>/dev/null
 rm -rf "$ISSUE_WAVE_STATE/replaced"; : > "$ISSUE_WAVE_STATE/replaced"
 expect "--replace with an unusable archive namespace refuses and changes nothing" 1 "cannot archive the previous record .* nothing was changed" -- \
-  "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
+  "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
 [ -s "$ISSUE_WAVE_STATE/workers/w1/stream.jsonl" ] && [ -f "$ISSUE_WAVE_STATE/workers/w1/exit" ] && ok "the old record is intact" || ko "old record damaged by a failed archive"
 rm -f "$ISSUE_WAVE_STATE/replaced"
 oldstream=$(cat "$ISSUE_WAVE_STATE/workers/w1/stream.jsonl")
 expect "--replace archives the previous record and starts a fresh one" 0 "LAUNCHED testbox/w1 .* replaced=.*/replaced/w1-" -- \
-  "$FW" launch testbox w1 --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
+  "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
 arch=$(printf '%s' "$out" | sed -n 's/.* replaced=//p')
 [ -n "$arch" ] && [ "$(cat "$arch/stream.jsonl")" = "$oldstream" ] && [ -f "$arch/exit" ] && ok "the archived record keeps the old stream and exit" || ko "archive missing or incomplete: $arch"
 [ "$(cat "$ISSUE_WAVE_STATE/workers/w1/brief.md")" = "$(cat "$brief")" ] && ok "the fresh record has the new brief" || ko "fresh record brief wrong"
@@ -586,16 +624,16 @@ out=$(FLEET_BOXES="testbox" "$FW" ls 2>&1)
 section "failure verdicts" && {
 need_lease   # this section and every one below launch workers; see the shared setup above
 printf 'FAIL on purpose\n' > "$TMP/fail.md"
-"$FW" launch testbox wf --kind claude --brief "$TMP/fail.md" --cwd "$proj" >/dev/null
+"$FW" launch testbox wf --target-repo example/project --kind claude --brief "$TMP/fail.md" --cwd "$proj" >/dev/null
 expect "an erroring worker attaches as FAILED, exit 1" 1 "FAILED testbox/wf exit=1 error_during_execution is_error=true" -- "$FW" attach testbox wf --interval 1
 printf 'SILENT\n' > "$TMP/silent.md"
-"$FW" launch testbox wsil --kind claude --brief "$TMP/silent.md" --cwd "$proj" >/dev/null
+"$FW" launch testbox wsil --target-repo example/project --kind claude --brief "$TMP/silent.md" --cwd "$proj" >/dev/null
 expect "exit 0 with no terminal event is FAILED, not DONE" 1 "FAILED testbox/wsil exit=0 no terminal event" -- "$FW" attach testbox wsil --interval 1
 printf 'SLEEP 30\n' > "$TMP/slow.md"
-"$FW" launch testbox wv --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null
+"$FW" launch testbox wv --target-repo example/project --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null
 sleep 1; tmux -L "$FLEET_TMUX_SOCKET" kill-session -t iw-wv
 expect "a killed session with no exit record is VANISHED, exit 3" 3 "VANISHED testbox/wv" -- "$FW" attach testbox wv --interval 1
-expect "relaunching a vanished name refuses without --replace" 1 "left no exit record" -- "$FW" launch testbox wv --kind claude --brief "$brief" --cwd "$proj"
+expect "relaunching a vanished name refuses without --replace" 1 "left no exit record" -- "$FW" launch testbox wv --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 # An orphan: tmux gone, a process still carrying the worker's state dir. Supervision must see it.
 bash -c 'sleep 4; :' claude "$ISSUE_WAVE_STATE/workers/wv/" >/dev/null 2>&1 & disown; sleep 0.5
 expect "status reports an orphaned CLI as ORPHANED" 0 "ORPHANED testbox/wv" -- "$FW" status testbox wv
@@ -609,7 +647,7 @@ section "unstick" && {
 need_lease
 need_worker w1   # its own worktree, for the sibling-session case below
 printf 'SLEEP 60 then report\n' > "$TMP/slow.md"
-"$FW" launch testbox ws --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1
+"$FW" launch testbox ws --target-repo example/project --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1
 expect "unstick refuses while the exec is alive" 1 "still running.*pass --kill" -- "$FW" unstick testbox ws --message "$TMP/msg.md"
 expect "unstick --kill stops it and resumes the same session" 0 "RESUMED testbox/ws kind=claude session=[0-9a-f-]\{36\} resume=1" -- \
   "$FW" unstick testbox ws --message "$TMP/msg.md" --kill
@@ -620,15 +658,15 @@ grep -q '"resumed":true' "$ISSUE_WAVE_STATE/workers/ws/stream.jsonl" && ok "stre
 grep -q '^resumes=1$' "$ISSUE_WAVE_STATE/workers/ws/meta" && ok "meta counts the resume" || ko "meta resumes not bumped"
 
 printf 'SLEEP 60\n' > "$TMP/slow.md"
-"$FW" launch testbox a.b --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1
+"$FW" launch testbox a.b --target-repo example/project --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1
 expect "a dotted name is killed by a literal match, not a regex" 0 "RESUMED testbox/a.b" -- "$FW" unstick testbox a.b --message "$TMP/msg.md" --kill
 "$FW" attach testbox a.b --interval 1 >/dev/null
 mkdir -p "$TMP/nouuid"; printf '#!/bin/sh\nexit 1\n' > "$TMP/nouuid/uuidgen"; chmod +x "$TMP/nouuid/uuidgen"
 expect "no uuidgen: a fallback still yields a session id" 0 "LAUNCHED testbox/nu kind=claude session=[0-9a-f-]\{36\}" -- \
-  env PATH="$TMP/nouuid:$PATH" "$FW" launch testbox nu --kind claude --brief "$brief" --cwd "$proj"
+  env PATH="$TMP/nouuid:$PATH" "$FW" launch testbox nu --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 "$FW" attach testbox nu --interval 1 >/dev/null
 
-"$FW" launch testbox wo --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox wo --interval 1 >/dev/null
+"$FW" launch testbox wo --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox wo --interval 1 >/dev/null
 bash -c 'sleep 30; :' claude "$ISSUE_WAVE_STATE/workers/wo/" >/dev/null 2>&1 & orphan=$!; disown; sleep 0.5
 expect "an orphaned CLI (tmux gone) refuses a plain unstick" 1 "tmux is gone but a CLI still runs" -- "$FW" unstick testbox wo --message "$TMP/msg.md"
 kill -0 "$orphan" 2>/dev/null && ok "the orphan was not killed by the refused unstick" || ko "plain unstick killed the orphan"
@@ -655,8 +693,8 @@ mv "$proj.moved" "$proj"
 expect "a non-holder cannot unstick" 1 "UNSTICK REFUSED testbox/wo: coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" unstick testbox wo --message "$TMP/msg.md"
 
 printf 'SLEEP 5\n' > "$TMP/slow5.md"
-"$FW" launch testbox dup --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/dup-a.out" 2>&1 & da=$!
-"$FW" launch testbox dup --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/dup-b.out" 2>&1 & db=$!
+"$FW" launch testbox dup --target-repo example/project --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/dup-a.out" 2>&1 & da=$!
+"$FW" launch testbox dup --target-repo example/project --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/dup-b.out" 2>&1 & db=$!
 wait "$da" "$db"
 launched=$(cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -c '^LAUNCHED testbox/dup')
 [ "$launched" -eq 1 ] && ok "two overlapping launches of one name: exactly one LAUNCHED" || ko "overlapping launches: $launched LAUNCHED -- $(cat "$TMP/dup-a.out" "$TMP/dup-b.out")"
@@ -667,21 +705,21 @@ grep -q 'another launch of this name is in progress\|already running\|already ow
 [ -d "$ISSUE_WAVE_STATE/locks/dup" ] && ko "launch lock left behind" || ok "launch lock released"
 "$FW" attach testbox dup --interval 1 >/dev/null   # dup shares $proj; a live owner would refuse q
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo 999999 > "$ISSUE_WAVE_STATE/locks/q/pid"
-expect "a lock left by a dead holder is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj"
+expect "a lock left by a dead holder is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 "$FW" attach testbox q --interval 1 >/dev/null
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"
-expect "a fresh ownerless lock (registration in progress) still refuses" 1 "another launch or unstick of this name is in progress" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace
+expect "a fresh ownerless lock (registration in progress) still refuses" 1 "another launch or unstick of this name is in progress" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
 touch -t 202001010000 "$ISSUE_WAVE_STATE/locks/q"
-expect "an old ownerless lock (shell died before the pid write) is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace
+expect "an old ownerless lock (shell died before the pid write) is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
 "$FW" attach testbox q --interval 1 >/dev/null
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo $$ > "$ISSUE_WAVE_STATE/locks/q/pid"; echo "bogus start" > "$ISSUE_WAVE_STATE/locks/q/start"
-expect "a lock whose pid is live but whose start time differs (pid reuse) is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace
+expect "a lock whose pid is live but whose start time differs (pid reuse) is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
 "$FW" attach testbox q --interval 1 >/dev/null
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo $$ > "$ISSUE_WAVE_STATE/locks/q/pid"; ps -o lstart= -p $$ | tr -s ' ' > "$ISSUE_WAVE_STATE/locks/q/start"
-expect "a lock held by a live process still refuses" 1 "another launch or unstick of this name is in progress" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace
+expect "a lock held by a live process still refuses" 1 "another launch or unstick of this name is in progress" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
 rm -rf "$ISSUE_WAVE_STATE/locks/q"
-"$FW" launch testbox q.mutating --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox q.mutating --interval 1 >/dev/null
-expect "a worker named like a lock suffix does not block its sibling" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --kind claude --brief "$brief" --cwd "$proj" --replace
+"$FW" launch testbox q.mutating --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox q.mutating --interval 1 >/dev/null
+expect "a worker named like a lock suffix does not block its sibling" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
 "$FW" attach testbox q --interval 1 >/dev/null
 "$FW" attach testbox dup --interval 1 >/dev/null
 "$FW" unstick testbox dup --message "$TMP/msg.md" >"$TMP/un-a.out" 2>&1 & ua=$!
@@ -693,44 +731,44 @@ resumed=$(cat "$TMP/un-a.out" "$TMP/un-b.out" | grep -c '^RESUMED testbox/dup')
 bash -c 'sleep 3; :' tail -f "$ISSUE_WAVE_STATE/workers/dup/stream.jsonl" >/dev/null 2>&1 & disown; sleep 0.5
 expect "a diagnostic process on a record file is not the worker" 0 "EXITED(0) testbox/dup" -- "$FW" status testbox dup
 rm -rf "$ISSUE_WAVE_STATE/incoming"; : > "$ISSUE_WAVE_STATE/incoming"
-expect "a brief that cannot be staged is a refusal, not an unreachable box" 1 "LAUNCH REFUSED testbox/blocked: cannot stage the brief" -- "$FW" launch testbox blocked --kind claude --brief "$brief" --cwd "$proj"
+expect "a brief that cannot be staged is a refusal, not an unreachable box" 1 "LAUNCH REFUSED testbox/blocked: cannot stage the brief" -- "$FW" launch testbox blocked --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 rm -f "$ISSUE_WAVE_STATE/incoming"
 : > "$ISSUE_WAVE_STATE/workers/blocked"
-expect "a record directory that cannot be created is a refusal naming it" 1 "LAUNCH REFUSED testbox/blocked: cannot create the worker record" -- "$FW" launch testbox blocked --kind claude --brief "$brief" --cwd "$proj"
+expect "a record directory that cannot be created is a refusal naming it" 1 "LAUNCH REFUSED testbox/blocked: cannot create the worker record" -- "$FW" launch testbox blocked --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 rm -f "$ISSUE_WAVE_STATE/workers/blocked"
 
 printf 'SLEEP 20\n' > "$TMP/slow20.md"
-"$FW" launch testbox own-a --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
-expect "a second worker on a worktree a live worker owns is refused" 1 "already owned by live worker own-a" -- "$FW" launch testbox own-b --kind claude --brief "$brief" --cwd "$proj/"
+"$FW" launch testbox own-a --target-repo example/project --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
+expect "a second worker on a worktree a live worker owns is refused" 1 "already owned by live worker own-a" -- "$FW" launch testbox own-b --target-repo example/project --kind claude --brief "$brief" --cwd "$proj/"
 "$FW" unstick testbox own-a --message "$TMP/msg.md" --kill >/dev/null; "$FW" attach testbox own-a --interval 1 >/dev/null
-expect "...and allowed once that worker has finished" 0 "LAUNCHED testbox/own-b" -- "$FW" launch testbox own-b --kind claude --brief "$brief" --cwd "$proj"
+expect "...and allowed once that worker has finished" 0 "LAUNCHED testbox/own-b" -- "$FW" launch testbox own-b --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 "$FW" attach testbox own-b --interval 1 >/dev/null
-"$FW" launch testbox race-x --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/rx.out" 2>&1 & rx=$!
-"$FW" launch testbox race-y --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/ry.out" 2>&1 & ry=$!
+"$FW" launch testbox race-x --target-repo example/project --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/rx.out" 2>&1 & rx=$!
+"$FW" launch testbox race-y --target-repo example/project --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/ry.out" 2>&1 & ry=$!
 wait "$rx" "$ry"
 n=$(cat "$TMP/rx.out" "$TMP/ry.out" | grep -c '^LAUNCHED ')
 [ "$n" -eq 1 ] && ok "two concurrent launches under different names on one worktree: exactly one LAUNCHED" || ko "worktree race: $n LAUNCHED -- $(cat "$TMP/rx.out" "$TMP/ry.out")"
 grep -q 'already owned by live worker' "$TMP/rx.out" "$TMP/ry.out" && ok "the other was refused by ownership" || ko "no ownership refusal: $(cat "$TMP/rx.out" "$TMP/ry.out")"
 [ -d "$ISSUE_WAVE_STATE/launch.lock" ] && ko "box-wide launch lock left behind" || ok "box-wide launch lock released"
 for w in race-x race-y; do "$FW" unstick testbox $w --message "$TMP/msg.md" --kill >/dev/null 2>&1; "$FW" attach testbox $w --interval 1 >/dev/null 2>&1; done
-"$FW" launch testbox hold --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
+"$FW" launch testbox hold --target-repo example/project --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
 expect "unstick refuses to resume into a worktree another live worker now owns" 1 "UNSTICK REFUSED testbox/own-b: worktree .* is now owned by live worker hold" -- "$FW" unstick testbox own-b --message "$TMP/msg.md"
 "$FW" unstick testbox hold --message "$TMP/msg.md" --kill >/dev/null; "$FW" attach testbox hold --interval 1 >/dev/null
-"$FW" launch testbox p-1 --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox p-1 --interval 1 >/dev/null
-"$FW" launch testbox p-12 --kind claude --brief "$TMP/slow20.md" --cwd "$proj-worktrees/w1" >/dev/null; sleep 1   # its own worktree: ownership is not what this case tests
+"$FW" launch testbox p-1 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox p-1 --interval 1 >/dev/null
+"$FW" launch testbox p-12 --target-repo example/project --kind claude --brief "$TMP/slow20.md" --cwd "$proj-worktrees/w1" >/dev/null; sleep 1   # its own worktree: ownership is not what this case tests
 expect "a finished worker is not read as running through a prefix-matching sibling session" 0 "EXITED(0) testbox/p-1 " -- "$FW" status testbox p-1
 expect "unstick --kill of the finished worker leaves the sibling session alone" 0 "RESUMED testbox/p-1" -- "$FW" unstick testbox p-1 --message "$TMP/msg.md" --kill
 expect "...the sibling is still running" 0 "RUNNING testbox/p-12" -- "$FW" status testbox p-12
 "$FW" attach testbox p-1 --interval 1 >/dev/null
 "$FW" unstick testbox p-12 --message "$TMP/msg.md" --kill >/dev/null; "$FW" attach testbox p-12 --interval 1 >/dev/null
-expect "a first launch whose tmux fails leaves no record behind" 1 "LAUNCH REFUSED testbox/tf: tmux failed" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" launch testbox tf --kind claude --brief "$brief" --cwd "$proj"
+expect "a first launch whose tmux fails leaves no record behind" 1 "LAUNCH REFUSED testbox/tf: tmux failed" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" launch testbox tf --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 [ -d "$ISSUE_WAVE_STATE/workers/tf" ] && ko "failed first launch left a record" || ok "no record left by the failed first launch"
-expect "...so the name launches normally afterwards" 0 "LAUNCHED testbox/tf" -- "$FW" launch testbox tf --kind claude --brief "$brief" --cwd "$proj"
+expect "...so the name launches normally afterwards" 0 "LAUNCHED testbox/tf" -- "$FW" launch testbox tf --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 "$FW" attach testbox tf --interval 1 >/dev/null
-expect "a --replace whose tmux fails restores the previous record" 1 "tmux failed (previous record restored)" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" launch testbox tf --kind claude --brief "$brief" --cwd "$proj" --replace
+expect "a --replace whose tmux fails restores the previous record" 1 "tmux failed (previous record restored)" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" launch testbox tf --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
 expect "...and the previous worker still reads as done" 0 "EXITED(0) testbox/tf" -- "$FW" status testbox tf
 expect "a stalling project fetch is bounded and refused before any record is touched" 1 "git fetch in .* timed out after 2s" -- \
-  env SHIM_GIT_HANG_FETCH=1 FLEET_FETCH_TIMEOUT=2 "$FW" launch testbox fh --kind claude --brief "$brief" --repo "$proj" --branch claude/fh
+  env SHIM_GIT_HANG_FETCH=1 FLEET_FETCH_TIMEOUT=2 "$FW" launch testbox fh --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/fh
 [ -d "$ISSUE_WAVE_STATE/workers/fh" ] && ko "a refused fetch left a record" || ok "no record left by the refused fetch"
 grep -q '^fh-' <<<"$(ls "$ISSUE_WAVE_STATE/incoming/" 2>/dev/null)" && ko "a refused fetch left a staged brief" || ok "no staged brief left by the refused fetch"
 }
@@ -738,7 +776,7 @@ grep -q '^fh-' <<<"$(ls "$ISSUE_WAVE_STATE/incoming/" 2>/dev/null)" && ko "a ref
 section "codex workers" && {
 need_lease
 expect "codex launch captures the thread id from the stream" 0 "LAUNCHED testbox/c1 kind=codex session=0199-shim-" -- \
-  "$FW" launch testbox c1 --kind codex --brief "$brief" --cwd "$proj"
+  "$FW" launch testbox c1 --target-repo example/project --kind codex --brief "$brief" --cwd "$proj"
 grep -qF -- "codex exec --json --yolo -C $(printf '%q' "$proj") -o " "$ISSUE_WAVE_STATE/workers/c1/run.sh" && grep -qF -- "last-message.md - < " "$ISSUE_WAVE_STATE/workers/c1/run.sh" && ok "codex command shape (brief on stdin, -o last message)" || ko "codex command: $(cat "$ISSUE_WAVE_STATE/workers/c1/run.sh")"
 expect "codex attach reads turn.completed and the last message" 0 "DONE testbox/c1 exit=0 turn.completed .*codex did: Fix issue" -- "$FW" attach testbox c1 --interval 1
 expect "codex log prints agent messages" 0 "codex did: Fix issue" -- "$FW" log testbox c1
@@ -761,25 +799,25 @@ need_lease
 mkdir -p "$ISSUE_WAVE_STATE/HALT"
 expect "halt that cannot write its marker fails loudly" 1 "HALT FAILED: cannot write" -- "$FW" halt "unwritable"
 rmdir "$ISSUE_WAVE_STATE/HALT"
-expect "native gate accepts the lease holder" 0 "" -- "$FW" gate
-expect "native gate refuses another coordinator" 1 "coordinator lease held" -- "${B[@]}" gate
-expect "native gate rejects unknown flags" 2 "gate: expected" -- "$FW" gate --oops
+expect "native gate accepts the lease holder" 0 "" -- "$FW" gate --target-repo example/project
+expect "native gate refuses another coordinator" 1 "coordinator lease held" -- "${B[@]}" gate --target-repo example/project
+expect "native gate rejects unknown flags" 2 "gate: expected" -- "$FW" gate --target-repo example/project --oops
 expect "halted reports open" 0 "launches open" -- "$FW" halted
 expect "halt records the reason" 0 "HALTED: launches refused" -- "$FW" halt "master red at abc123, owner: coordinator"
 expect "halted reports the reason, exit 1" 1 "HALTED .*master red at abc123" -- "$FW" halted
-expect "native gate refuses while halted" 1 "launches halted" -- "$FW" gate
-expect "native triage gate allows the holder during halt" 0 "" -- "$FW" gate --force
-expect "native triage gate still refuses a non-holder" 1 "coordinator lease held" -- "${B[@]}" gate --force
-expect "launch refuses while halted" 1 "LAUNCH REFUSED testbox/h1: launches halted -- .*master red" -- "$FW" launch testbox h1 --kind claude --brief "$brief" --cwd "$proj"
-expect "--force launches anyway (the triage worker)" 0 "LAUNCHED testbox/h1" -- "$FW" launch testbox h1 --kind claude --brief "$brief" --cwd "$proj" --force
+expect "native gate refuses while halted" 1 "launches halted" -- "$FW" gate --target-repo example/project
+expect "native triage gate allows the holder during halt" 0 "" -- "$FW" gate --target-repo example/project --force
+expect "native triage gate still refuses a non-holder" 1 "coordinator lease held" -- "${B[@]}" gate --target-repo example/project --force
+expect "launch refuses while halted" 1 "LAUNCH REFUSED testbox/h1: launches halted -- .*master red" -- "$FW" launch testbox h1 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
+expect "--force launches anyway (the triage worker)" 0 "LAUNCHED testbox/h1" -- "$FW" launch testbox h1 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --force
 "$FW" attach testbox h1 --interval 1 >/dev/null
 expect "resume-launches clears it" 0 "RESUMED launches" -- "$FW" resume-launches
-expect "launch works again" 0 "LAUNCHED testbox/h2" -- "$FW" launch testbox h2 --kind claude --brief "$brief" --cwd "$proj"
+expect "launch works again" 0 "LAUNCHED testbox/h2" -- "$FW" launch testbox h2 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 "$FW" attach testbox h2 --interval 1 >/dev/null
 "$FW" halt "adopted mid-halt" >/dev/null
 "${B[@]}" claim --take >/dev/null
 expect "a coordinator adopting the lease inherits the halt" 1 "LAUNCH REFUSED testbox/h3: launches halted -- .*adopted mid-halt" -- \
-  "${B[@]}" launch testbox h3 --kind claude --brief "$brief" --cwd "$proj"
+  "${B[@]}" launch testbox h3 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 expect "...and reads it with halted" 1 "HALTED .*adopted mid-halt" -- "${B[@]}" halted
 "$FW" claim --take >/dev/null; "$FW" resume-launches >/dev/null
 }
@@ -788,9 +826,9 @@ section "usage" && {
 need_lease
 need_worker w1
 expect "no command prints usage, exit 2" 2 "Usage:" -- "$FW"
-expect "bad worker name refuses" 2 "name must be" -- "$FW" launch testbox "bad name" --kind claude --brief "$brief" --cwd "$proj"
-expect "dot names refuse" 2 "name must be" -- "$FW" launch testbox .. --kind claude --brief "$brief" --cwd "$proj"
-expect "a dot-prefixed name refuses (ls could not see it)" 2 "not start with a dot" -- "$FW" launch testbox .triage --kind claude --brief "$brief" --cwd "$proj"
+expect "bad worker name refuses" 2 "name must be" -- "$FW" launch testbox "bad name" --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
+expect "dot names refuse" 2 "name must be" -- "$FW" launch testbox .. --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
+expect "a dot-prefixed name refuses (ls could not see it)" 2 "not start with a dot" -- "$FW" launch testbox .triage --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 expect "unstick validates the name before writing anything" 2 "unstick: name must be" -- "$FW" unstick testbox ../escape --message "$TMP/msg.md"
 expect "status validates the name" 2 "status: name must be" -- "$FW" status testbox "a b"
 expect "without FLEET_LOCAL_BOX an unrecognized host is local only to 'local'" 0 "EXITED(0) local/w1" -- env -u FLEET_LOCAL_BOX "$FW" status local w1
@@ -804,10 +842,10 @@ expect "hostname-map tokens do not expand as filenames in the launcher's cwd" 0 
   bash -c 'cd "$1" && exec env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="*=testbox" "$2" status testbox w1' _ "$TMP/glob-cwd" "$FW"
 expect "attach rejects a zero interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval 0
 expect "attach rejects a non-numeric interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval fast
-expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --kind claude --brief "$TMP/none.md" --cwd "$proj"
-( cd "$TMP" && "$FW" launch testbox rel --kind claude --brief "$brief" --cwd "pro j" >/dev/null ) && "$FW" attach testbox rel --interval 1 >/dev/null
+expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --target-repo example/project --kind claude --brief "$TMP/none.md" --cwd "$proj"
+( cd "$TMP" && "$FW" launch testbox rel --target-repo example/project --kind claude --brief "$brief" --cwd "pro j" >/dev/null ) && "$FW" attach testbox rel --interval 1 >/dev/null
 grep -q "^cwd=$proj\$" "$ISSUE_WAVE_STATE/workers/rel/meta" && ok "a relative --cwd is recorded as its absolute path" || ko "relative cwd recorded: $(grep '^cwd=' "$ISSUE_WAVE_STATE/workers/rel/meta")"
-expect "a path with a newline refuses" 2 "must not contain newlines" -- "$FW" launch testbox nl --kind claude --brief "$brief" --cwd "$(printf '%s\nx' "$proj")"
+expect "a path with a newline refuses" 2 "must not contain newlines" -- "$FW" launch testbox nl --target-repo example/project --kind claude --brief "$brief" --cwd "$(printf '%s\nx' "$proj")"
 }
 
 echo
