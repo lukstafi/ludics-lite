@@ -327,6 +327,87 @@ out=$(env -u GITHUB_ACTIONS "$CP" "$R" 2>&1)
 grep -q '::error' <<<"$out" && ko "annotations leak outside Actions" \
   || ok "...and only under Actions"
 
+# --- fixture command membership ---------------------------------------------------------------
+fixture_tree() {
+  fresh "$R"
+  mkdir -p "$R/alpha/scripts" "$R/alpha/hooks" "$R/issue-wave/scripts" "$R/ship-pr/scripts" "$R/.github/workflows"
+  touch "$R/alpha/scripts/test-shell.sh" "$R/alpha/scripts/test-python.py" "$R/alpha/hooks/test-hook.py" \
+    "$R/scripts/test-workflow-reporters.py" "$R/ship-pr/scripts/test-pr-review-hostile.py" \
+    "$R/issue-wave/scripts/test-windows-driver.ps1"
+  cat >> "$R/README.md" <<'EOF'
+## Tests
+
+alpha/scripts/test-shell.sh
+python3 alpha/scripts/test-python.py
+python3 alpha/hooks/test-hook.py
+python3 scripts/test-workflow-reporters.py
+python3 ship-pr/scripts/test-pr-review-hostile.py
+./issue-wave/scripts/test-windows-driver.ps1
+EOF
+  cat > "$R/.github/workflows/skill-scripts.yml" <<'EOF'
+jobs:
+  unix:
+    runs-on: ubuntu-latest
+    steps:
+      - run: alpha/scripts/test-shell.sh
+      - run: python3 alpha/scripts/test-python.py
+      - run: python3 alpha/hooks/test-hook.py
+      - run: python3 scripts/test-workflow-reporters.py
+      - run: python3 ship-pr/scripts/test-pr-review-hostile.py
+  macos:
+    runs-on: macos-latest
+    steps:
+      - run: alpha/scripts/test-shell.sh || { echo failed; exit 1; }
+      - run: python3 alpha/scripts/test-python.py
+      - run: python3 alpha/hooks/test-hook.py
+  windows:
+    runs-on: windows-latest
+    steps:
+      - run: ./issue-wave/scripts/test-windows-driver.ps1
+EOF
+}
+fixture_tree
+expect "shell, Python, hook and platform-specific register passes" 0 'required CI platforms agree' -- "$CP" "$R"
+for suite in alpha/scripts/test-shell.sh alpha/scripts/test-python.py alpha/hooks/test-hook.py scripts/test-workflow-reporters.py issue-wave/scripts/test-windows-driver.ps1; do
+  fixture_tree
+  # Keep prose and a longer filename: neither substitutes for a registered command.
+  CP_REMOVE="$suite" awk 'index($0, ENVIRON["CP_REMOVE"]) { print "Mention: " $0; print $0 ".extra"; next } { print }' \
+    "$R/README.md" > "$R/register.tmp"
+  mv "$R/register.tmp" "$R/README.md"
+  expect "README refuses missing $suite command" 1 "fixture '$suite' has no command line" -- "$CP" "$R"
+done
+for platform in ubuntu macos; do
+  for suite in alpha/scripts/test-shell.sh alpha/scripts/test-python.py alpha/hooks/test-hook.py; do
+    fixture_tree
+    CP_REMOVE="$suite" CP_OS="$platform" awk '
+      /runs-on:/ { os=$2; sub(/-latest$/, "", os) }
+      os == ENVIRON["CP_OS"] && index($0, ENVIRON["CP_REMOVE"]) {
+        print "      # run: " ENVIRON["CP_REMOVE"]
+        print "      - name: " ENVIRON["CP_REMOVE"]
+        print "      - run: echo " ENVIRON["CP_REMOVE"]
+        print "      - run: " ENVIRON["CP_REMOVE"] ".extra"
+        next
+      }
+      { print }
+    ' "$R/.github/workflows/skill-scripts.yml" > "$R/workflow.tmp"
+    mv "$R/workflow.tmp" "$R/.github/workflows/skill-scripts.yml"
+    expect "$platform refuses missing $suite execution" 1 "fixture '$suite' has no inline run command on $platform" -- "$CP" "$R"
+  done
+done
+for suite in scripts/test-workflow-reporters.py ship-pr/scripts/test-pr-review-hostile.py issue-wave/scripts/test-windows-driver.ps1; do
+  fixture_tree
+  CP_REMOVE="$suite" awk 'index($0, ENVIRON["CP_REMOVE"]) == 0' "$R/.github/workflows/skill-scripts.yml" > "$R/workflow.tmp"
+  mv "$R/workflow.tmp" "$R/.github/workflows/skill-scripts.yml"
+  expect "platform-specific $suite still requires its CI command" 1 "fixture '$suite' has no inline run command" -- "$CP" "$R"
+done
+fixture_tree
+rm "$R/.github/workflows/skill-scripts.yml"
+expect "fixtures require a workflow" 1 'no inline run command on ubuntu' -- "$CP" "$R"
+fixture_tree
+rm "$R/alpha/scripts/test-python.py"
+# The lookup is one-way, as the prompt register is: stale commands require no table model.
+expect "a removed fixture leaves no membership obligation" 0 '0 failed' -- "$CP" "$R"
+
 # --- this checkout ---------------------------------------------------------------------------
 expect "this checkout's prompts pass" 0 '0 failed' -- "$CP"
 

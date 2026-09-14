@@ -53,12 +53,9 @@
 # suite never redefined is refused too, so the declarations stay honest. A suite's fixture `gh`
 # is outside the guard's scope on purpose: it shadows a command, not a function of the library.
 #
-# Executed rather than sourced, this file runs its own controls: throwaway suites that source it
-# and, respectively, redefine an undeclared library function (the ludics-lite#46 shape itself,
-# a reporter named `fail`), declare a stub and honour it, declare one and do not, stub a name the
-# library lacks, redefine one of this file's own helpers, and define a function before sourcing;
-# then two over test_tmpdir's target variable (ludics-lite#79) and one over gh_fixture_parse.
-# The negative controls are what prove the guard can fail; CI runs it beside the nine suites.
+# Executed rather than sourced, this file runs its own controls: throwaway suites that source it.
+# The tests array below is the register of those controls. The negative controls prove the guard
+# can fail; CI runs this file beside the fixture suites.
 # `retune` is covered in the same run, by a pair of cases: one moves two constants, the next reads
 # them back as pr-review.sh set them, which is the restore no case performs itself.
 #

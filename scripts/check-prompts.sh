@@ -292,6 +292,64 @@ check_index() {
   fi
 }
 
+# --- fixture membership -----------------------------------------------------------------------
+# A register lookup, like the prompt index: every test file has a command line in README and
+# an inline run command on each required platform. This deliberately checks the workflow's
+# current simple shape (literal runs-on and run), not arbitrary YAML or shell execution.
+# Comments, names, echo arguments and longer filenames cannot stand in for a command.
+fixture_command() {
+  CP_SUITE="$2" CP_PLATFORM="${3:-}" awk '
+    BEGIN { want = ENVIRON["CP_SUITE"]; required = ENVIRON["CP_PLATFORM"] }
+    /^## / { tests = ($0 == "## Tests") }
+    /^  [A-Za-z0-9_-]+:/ { platform = "" }
+    /^[[:space:]]*runs-on: / {
+      platform = $2; sub(/-latest$/, "", platform)
+    }
+    {
+      if (required == "" && !tests) next
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      if (required != "") {
+        if (platform != required || line !~ /^(- )?run: /) next
+        sub(/^(- )?run: /, "", line)
+      }
+      sub(/^python3[[:space:]]+/, "", line)
+      sub(/^\.\//, "", line)
+      split(line, words, /[[:space:]]+/)
+      if (words[1] == want) { found = 1; exit }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$1"
+}
+
+check_fixtures() {
+  local suite platforms platform bad=0 count=0
+  local workflow=.github/workflows/skill-scripts.yml
+  # Include root scripts, skill scripts and hook fixtures; PowerShell belongs to Windows.
+  for suite in "$ROOT"/scripts/test-* "$ROOT"/*/scripts/test-* "$ROOT"/*/hooks/test-*; do
+    [ -f "$suite" ] || continue
+    case "$suite" in *.sh|*.py|*.ps1) ;; *) continue ;; esac
+    suite=${suite#"$ROOT"/}
+    count=$((count + 1))
+    case "$suite" in
+      *.ps1) platforms=windows ;;
+      # These probe Ubuntu production reporters and the Ubuntu-only hostile runner.
+      scripts/test-workflow-reporters.py|ship-pr/scripts/test-pr-review-hostile.py) platforms=ubuntu ;;
+      *) platforms="ubuntu macos" ;;
+    esac
+    if [ ! -f "$ROOT/README.md" ] || ! fixture_command "$ROOT/README.md" "$suite"; then
+      ko README.md "fixture '$suite' has no command line in the test register"; bad=1
+    fi
+    for platform in $platforms; do
+      if [ ! -f "$ROOT/$workflow" ] || ! fixture_command "$ROOT/$workflow" "$suite" "$platform"; then
+        ko "$workflow" "fixture '$suite' has no inline run command on $platform"; bad=1
+      fi
+    done
+  done
+  # Scratch prompt-only roots need no workflow; a fixture creates the membership obligation.
+  [ "$count" -eq 0 ] || [ "$bad" -ne 0 ] || ok "fixture command register and required CI platforms agree"
+}
+
 # --- run --------------------------------------------------------------------------------------
 if $ONE; then
   if [ -f "$ROOT/SKILL.md" ]; then check_skill_file SKILL.md
@@ -312,6 +370,7 @@ done
 
 check_index README.md "" skill
 check_index routines/README.md routines/ routine
+check_fixtures
 
 echo
 echo "check-prompts: $pass passed, $fail failed"
