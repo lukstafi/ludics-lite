@@ -1,6 +1,6 @@
 ---
 name: ocannl-cross-machine-sweep
-description: Daily OCANNL test sweep across cc/multidev_cc/metal locally and cuda/hip on the GPU boxes
+description: Daily OCANNL test sweep, one concurrent lane per box - cc/metal locally, cuda on rog-nv, hip/multidev_cc on minix
 ---
 
 Run the OCANNL cross-machine test sweep and report failures, especially what changed since the previous sweep.
@@ -9,7 +9,10 @@ GitHub CI covers exactly one backend — `test/config/ocannl_config` pins `backe
 HIP — and multidev_cc, which needs no hardware but is deliberately kept off CI to keep the per-PR
 matrix fast (gh-ocannl-756; the decision is recorded at the runtest step in `.github/workflows/ci.yml`) —
 have no automated coverage except this sweep, so this routine is the ONLY gate for all five of
-those backends. The CUDA box (rog-nv-wsl) and HIP box
+those backends. The sweep places them on three boxes: cc and metal on this Mac (`m4-max`), cuda on
+`rog-nv-wsl`, and hip then multidev_cc on `minix-amd-wsl` — the CPU pair is split across macOS and
+Linux on purpose (load balance, and cross-OS coverage of the CPU backends). So minix carries TWO
+backends: a minix that stays down leaves both hip and multidev_cc uncovered. The CUDA box (rog-nv-wsl) and HIP box
 (minix-amd-wsl) are often hibernated, and sometimes powered off; step 1 tries to wake them, but if that fails,
 "skip (unreachable)" is a normal outcome, not an error. CI's Windows OS target is likewise off the per-PR path: it runs only on the
 twice-weekly scheduled CI sweep, and on demand via `workflow_dispatch`, because at 62-74min it
@@ -34,8 +37,8 @@ box still gets its WSL kick.
 
 Read its last lines:
 
-- `did NOT wake: <box>` is **not** an error: that backend simply goes uncovered today, surfacing
-  through the staleness thresholds in step 4. Do not send the wake command again.
+- `did NOT wake: <box>` is **not** an error: that box's backends (rog: cuda; minix: hip and
+  multidev_cc) simply go uncovered today, surfacing through the staleness thresholds in step 4. Do not send the wake command again.
 - `wsl still down after 3 min` on a box that woke means the machine is up but the backend is
   untestable — say so explicitly in the report, since it is a different finding from a box that
   never woke.
@@ -58,7 +61,7 @@ Read its last lines:
 `~/bin/wake-lab.sh status` prints the per-box picture (router-active, `-lan`, `-win`, `-wsl`) if you need to
 say precisely what happened.
 
-The retry budget is exactly one re-kick and one rerun. If the sweep records cuda or hip as
+The retry budget is exactly one re-kick and one rerun. If the sweep records cuda, hip or multidev_cc as
 `skip (unreachable)` while `status` shows that box `win=UP`, the VM was up and vanished: run
 `~/bin/wake-lab.sh kick-wsl rog minix` once, then rerun the sweep once — reruns are incremental
 and cheap. If the unit still skips, report it as "woken but `-wsl` gone" (step 4 names this
@@ -126,6 +129,11 @@ not refresh execution coverage. The raised cap is for the forced runs only: a co
 `@slow` legitimately exceeds the default 90-minute unit cap, and cutting it short would file lost
 coverage as `timeout`.
 Run it in the background and wait for it to finish — a cold unit can take tens of minutes.
+Each box's units run as one lane, and the three lanes run concurrently (gh-ocannl-976): the remote
+units start within seconds of launch, which is what keeps a freshly kicked WSL VM alive, and the
+run lasts as long as its longest lane — normally this Mac's, which carries metal's suite. The stdout header's `lanes:` line names each
+box's units. Units on different boxes finish in any order, so their summary blocks and their
+history rows appear in completion order, not in the order this routine lists them.
 The script deliberately exits 0 even when tests
 fail; its exit code tells you nothing about test results, so do not read anything into it. Read
 the results from the history file instead.
@@ -138,6 +146,12 @@ from the instructions above (a missing box ID, a stale or incomplete extraction,
 running"). Do not retry the same command hoping for a different answer — the 2026-09-05 run burned
 a second attempt on that before recognizing the failure. Whatever the outcome of the single
 corrected relaunch, an exit 2 is reported in step 5 as non-coverage and notified in step 6.
+
+One exit 2 comes AFTER testing: `sweep: lane(s) stopped before finishing: <box> (exit N)` means a
+lane could not write a history row or unit state (the lane's own `sweep:` line above says which)
+and stopped, while the other lanes ran to completion. Their rows are real results — read them —
+but the stopped lane's remaining units are non-coverage, and no skip-coverage report was written.
+Do not relaunch for it: an unwritable state directory is the finding.
 
 ## 3. Diff against the previous sweep
 
@@ -153,6 +167,15 @@ The `machine` column holds the measurement-box ID, so rows and filenames from be
 spell the same units `local` (now `m4-max`) and `rog` (now `rog-nv`); `minix` is unchanged. When
 looking for a unit's previous non-pass run, match on `backend` and accept the old machine spelling
 of its fingerprint filename.
+
+multidev_cc also MOVED, from this Mac to minix (gh-ocannl-976): its older rows and fingerprints say
+`m4-max`/`local`, its newer ones `minix`. Match it on `backend` across both, but read the first
+minix failures with that in mind: a multidev_cc unit that is red on minix while its last `m4-max`
+rows were green may be a Linux-only finding the move newly exposed rather than a regression of
+master — still news, and worth a task chip, but say which it looks like (does cc on this Mac pass
+the same tests? is the failing golden platform-sensitive?). The sweep's own per-unit cursor is
+keyed by machine, so its `REGRESSION OR FIX DID NOT TAKE` and `fingerprint moved` lines start
+fresh for minix/multidev_cc and cannot flag that first transition; this diff is what catches it.
 
 A unit going from `pass` to `fail`, or a new entry appearing in a fingerprint, IS news.
 
@@ -186,7 +209,8 @@ are different claims:
   missed week) — incremental greens in between may be cache hits and cannot stand in for it.
 
 For each of the FIVE backends (cc, multidev_cc, metal, cuda, hip) find the most recent qualifying
-liveness row. Flag backends with no pass in more than 2 days. For cuda or hip, say which of the three step-1 outcomes applied: woken
+liveness row. Flag backends with no pass in more than 2 days. For cuda, hip or multidev_cc (the
+backends on the WSL boxes), say which of the three step-1 outcomes applied: woken
   and swept; woken but `-wsl` never appeared or was gone again by the time the unit probed it
   (machine up, backend untestable — the cold-boot kicked-VM trap in step 1; a re-kick plus an
   incremental rerun usually recovers it); or the wake itself failed. A failed wake with settled `router-active=1` means the NIC was
