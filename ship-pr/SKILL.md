@@ -129,6 +129,12 @@ ocannl-staging `ci` carries `paths-ignore: docs/**`, so a docs-only push produce
 the newest verdict legitimately trails the tip by a commit or several — that is a gap in coverage,
 not a stale reading, and the printed SHA is what lets you tell them apart.
 
+For OCANNL, “full matrix” means the ordinary Linux/macOS PR matrix. GitHub-hosted Windows
+runs independently on its schedule and is not a PR merge gate. Run development Windows checks
+on `rog-nv-win` or `minix-amd-win` using native Windows Git Bash and `tools/test-run.sh`;
+record the tested host, commit, command and exit sentinel. Do not dispatch Windows CI to supplement
+PR checks. If both hosts are unavailable, report the verification gap.
+
 ## Open
 
 Look at the working tree first: commit what belongs to this goal, and say explicitly what you did

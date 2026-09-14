@@ -171,10 +171,14 @@ bytes and ANSI control sequences: keep the raw log in a file and make a sanitize
 text inspection rather than placing raw output in shell variables or command substitutions.
 Continue to gate on the exact-head workflow and required jobs.
 
-When a brief requires an explicitly dispatched extended Windows workflow, ordinary PR CI is not
-a substitute and Windows must not be assumed to join it. Verify the dispatched run's `headSha`
-equals the intended commit, enumerate its jobs, and require the real Windows jobs to complete with
-the expected test execution evidence. Linux/macOS rows on that run do not prove Windows coverage.
+For OCANNL, development Windows verification runs on `rog-nv-win` or `minix-amd-win`
+under native Windows Git Bash. GitHub-hosted Windows CI belongs only to its independent schedule;
+do not dispatch it or make it a PR merge prerequisite, including for goldens and toolchain changes.
+Correct an inherited brief that asks for extended Windows CI to use these hosts. Record the host,
+tested commit, relevant test command and exit sentinel through `tools/test-run.sh`.
+WSL results do not establish native Windows coverage. If neither Windows host is available,
+report the missing evidence instead of falling back to remote CI. Ordinary current-head PR checks
+remain required.
 
 If sibling fixes become mutually gated on red branches, freeze both writers and confirm their
 remote SHAs, unpushed commits, and staged, unstaged and untracked state before changing ownership.
