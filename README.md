@@ -165,10 +165,15 @@ and run it from an elevated PowerShell (`powershell -ExecutionPolicy Bypass -Fil
 
 ## Tests
 
-The shell scripts carry their own test suites:
+The scripts carry their own test suites (Python fixtures use `python3`; PowerShell fixtures run on Windows):
 
 ```sh
 issue-wave/scripts/test-fleet-worker.sh
+python3 issue-wave/scripts/test-fleet-execution.py
+./issue-wave/scripts/test-windows-driver.ps1
+python3 ship-pr/hooks/test-ship-pr-nudge.py
+python3 ship-pr/scripts/test-pr-review-hostile.py
+python3 scripts/test-workflow-reporters.py
 ship-pr/scripts/test-post-merge-cleanup.sh
 ship-pr/scripts/test-pr-review-lib.sh
 ship-pr/scripts/test-pr-review-base-drift.sh
@@ -185,8 +190,9 @@ scripts/test-check-prompts.sh
 scripts/test-sync-routines.sh
 ```
 
-The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs all fifteen on Ubuntu, one
-job per suite, and on macOS (the fleet's bash is 3.2) as one job with a step per suite: the hosted
+The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs the shell suites and
+shared Python fixtures on Ubuntu and on macOS (the fleet's bash is 3.2), with macOS sharing one
+job and a step per suite: the hosted
 macOS runners are scarce enough that four separate macOS jobs queued a green PR for one to two
 hours behind nine minutes of work (ludics-lite#55). Alongside them run `bash -n`, shellcheck at
 error severity, and a check that the two cleanup scripts still carry their parse guard. The suites
@@ -196,6 +202,11 @@ every head regardless, the prompt hygiene check (`scripts/check-prompts.sh`), th
 sync-routines suite, so every PR's merge gate reads a verdict rather than `ABSENT`, a prompt-only
 PR included. The third is unconditional for a reason of its own: the routines-table pin it carries
 is broken by exactly the all-Markdown PR the classification calls prompt-only.
+
+The reporter and hostile-runner Python controls run on Ubuntu; the driver fixture runs on Windows.
+`check-prompts.sh` checks each fixture file against this command register and the inline CI run
+commands on its required platforms, so a new shell or Python suite cannot silently miss either
+Unix platform. Platform-specific fixtures have explicit exceptions in the checker.
 
 `check-prompts.sh` is the prompt hygiene check itself: every skill and routine `SKILL.md` opens
 with YAML frontmatter carrying one `name`, equal to its directory, and one single-line
@@ -372,7 +383,7 @@ going ends no streak because it judged nothing, two workflow files sharing a dis
 their histories apart, a jobs read that fails prints UNKNOWN and leaves the red standing rather
 than reporting no failing job, and a green base spends no call on any of it.
 
-The nine `test-pr-review-*` suites share a preamble, `test-pr-review-lib.sh`, which sources
+The `test-pr-review-*.sh` suites share a preamble, `test-pr-review-lib.sh`, which sources
 `pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and
 the fixture `gh`'s argument parsing. It also closes the trap that bit twice (ludics-lite#39, #45,
 #46): `pr-review.sh` puts some sixty unqualified functions in scope, and a suite helper sharing a
