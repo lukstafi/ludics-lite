@@ -1161,7 +1161,35 @@ test_current_head_running_blocks_older_approval_until_completion() {
   assert_eq "$(state_tok "$STATE")" approved "a newer approval supersedes a lingering Running row"
 }
 
+test_current_head_evidence_handles_unknown_age_footer_and_large_feeds() {
+  reset_fixture
+  echo 1 >"$FEEDS/round"
+  local future earlier current body
+  future=$(jq -rn 'now + 3600 | todate')
+  earlier=$(jq -rn 'now - 60 | todate')
+  current=$(jq -rn 'now - 2 | todate')
+  schedule reactions 1 "[$(reaction +1 "$earlier")]"
+  schedule comments 1 "[$(activity_summary "${H2:0:7}" Running "$future")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" reviewing "clock skew cannot erase known Running evidence"
+  assert_eq "$(state_age "$STATE")" - "unknown age only prevents the stalled decision"
+
+  body="The older result said **Reviewed commit:** \`$H1\`.
+Current findings follow.
+**Reviewed commit:** \`$H2\`"
+  schedule comments 1 "[$(summary_comment 701 "$current" "$body")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "the footer stamp attributes comment-only findings to this head"
+
+  # Generate the large feed on stdin, too: the fixture must reach the production parser.
+  { printf '%s\n' "[$(summary_comment 701 "$current" "$body")]"; } | \
+    jq '.[0].body += ("x" * 200000)' >"$FEEDS/comments.1"
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "paginated evidence larger than one argv element still parses"
+}
+
 tests=(
+  test_current_head_evidence_handles_unknown_age_footer_and_large_feeds
   test_current_head_running_blocks_older_approval_until_completion
   test_a_new_request_during_fixed_grace_remains_pending
   test_a_second_nudge_at_settle_remains_pending

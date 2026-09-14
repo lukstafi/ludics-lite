@@ -1060,8 +1060,8 @@ status_state() {
     fi
     reviews_raw=$(api_list "pulls/$pr/reviews?per_page=100") || reviews_raw='[]'
     pr_head_read "$pr"
-    evidence=$(jq -rn --arg rev "$REVIEWER" --arg head "$head_sha" --arg rc "$REVIEWED_COMMIT_RE" \
-      --argjson comments "$comments_raw" --argjson reviews "$reviews_raw" '
+    evidence=$(jq -rs --arg rev "$REVIEWER" --arg head "$head_sha" --arg rc "$REVIEWED_COMMIT_RE" '
+      .[0] as $comments | .[1] as $reviews |
       def reviewer: select((.user.login // "") | startswith($rev));
       def current: select(.sha != "" and $head != "")
         | select(.sha as $sha | $head | startswith($sha));
@@ -1074,12 +1074,12 @@ status_state() {
        ($reviews[] | reviewer | select(.submitted_at != null)
          | {sha:(.commit_id // ""), at:.submitted_at, kind:"findings"}),
        ($comments[] | reviewer
-         | {sha: ([(.body // "") | capture($rc).s] | first // ""),
+         | {sha: ([(.body // "") | capture($rc; "g").s] | last // ""),
             at:(.updated_at // .created_at),
             kind:(if (.body // "") | test("[Dd]idn.t find any major issues")
                   then "verdict" else "findings" end)})]
       | map(current | .at |= sub("\\.[0-9]+Z$"; "Z"))
-      | max_by(.at) | if . == null then "|" else "\(.kind)|\(.at)" end') || {
+      | max_by(.at) | if . == null then "|" else "\(.kind)|\(.at)" end' <<<"$comments_raw"$'\n'"$reviews_raw") || {
       echo "unknown|-|$mstate|the current-head review evidence did not parse"
       return 0
     }
@@ -1095,12 +1095,12 @@ status_state() {
         *)
           if [ "$age" -ge "$STALL" ]; then
             echo "stalled|$age|$mstate|$REVIEWER Code Review Running for head ${head_sha:0:7} at $running_at"
-          else
-            echo "reviewing|$age|$mstate|$REVIEWER Code Review Running for head ${head_sha:0:7} at $running_at"
+            return 0
           fi
-          return 0
           ;;
         esac
+        echo "reviewing|$age|$mstate|$REVIEWER Code Review Running for head ${head_sha:0:7} at $running_at"
+        return 0
         ;;
       findings)
         echo "idle|$(age_of "$evidence_at")|$mstate|$REVIEWER posted findings for head ${head_sha:0:7} at $evidence_at"
