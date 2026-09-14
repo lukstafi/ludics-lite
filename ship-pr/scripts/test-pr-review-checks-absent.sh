@@ -640,13 +640,15 @@ test_unreadable_jobs_keep_the_red() {
 # A successor never inherits the observed head's checks, even when those checks passed
 # or were cancelled. The unchanged sequence is the control for the additional head reads.
 test_wait_superseded_head() {
-  local conclusion
+  local conclusion terminal_checks
   for conclusion in success cancelled; do
     reset_fixture
     HEAD_SEQ=("$HEAD_SHA" "$HEAD_SHA" feedbeeffeedbeeffeedbeeffeedbeeffeedbeef)
+    terminal_checks=$(jq -cn --arg conclusion "$conclusion" \
+      '{check_runs:[{name:"ci",conclusion:$conclusion}]}')
     CHECK_RUNS_SEQ=(
       "$(check_runs_json '[{"name":"ci","status":"in_progress"}]')"
-      "$(check_runs_json "[{\"name\":\"ci\",\"conclusion\":\"$conclusion\"}]")"
+      "$terminal_checks"
     )
     RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
     run_gate 30
@@ -672,7 +674,7 @@ test_wait_unchanged_head_turns_green() {
 
 test_head_reread_unknown() {
   local head
-  for head in UNREADABLE '' ; do
+  for head in UNREADABLE ''; do
     reset_fixture
     HEAD_SEQ=("$HEAD_SHA" "$head")
     CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ci","conclusion":"success"}]')")
