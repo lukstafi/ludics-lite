@@ -37,10 +37,11 @@
 #   fleet-worker.sh claim [--take]         # take the fleet's coordinator lease (--take adopts)
 #   fleet-worker.sh coordinator | release  # who holds it (exit 0 me, 1 other, 3 nobody) / give it up
 #   fleet-worker.sh preflight <box> [--codex|--native-codex|--native-claude] [--no-probe] [--no-cross]   # launch runs this itself, too
-#   fleet-worker.sh gate [--force]          # lease + halt read before native dispatch (not a reservation)
-#   fleet-worker.sh launch <box> <name> --kind claude|codex --brief <file>
+#   fleet-worker.sh gate --target-repo <owner/repo> [--base-branch <branch>] [--force --allow-red-base <reason>] # lease + halt read before native dispatch (not a reservation)
+#   fleet-worker.sh launch <box> <name> --target-repo <owner/repo> --kind claude|codex --brief <file>
 #                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
-#                          [--force] [--replace] [-- <extra CLI args>]
+#                          [--base-branch <branch>] [--force --allow-red-base <reason>]
+#                          [--replace] [-- <extra CLI args>]
 #   fleet-worker.sh attach <box> <name> [--interval <sec>]
 #   fleet-worker.sh status <box> <name>
 #   fleet-worker.sh log <box> <name> [-n <lines>]
@@ -502,20 +503,95 @@ cmd_preflight() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Read on the coordinator, where gh is authenticated, never on the worker box.
+# Keep complete helper diagnostics; CI refusals use fleet exit 1, never transport 4.
+# A named triage may override RED, never unknown.
+base_checker() (
+  # Gate policy and bounds are not inherited from an unrelated ship-pr operation.
+  # Keep connection/auth, state paths and review-only settings; they do not decide base CI.
+  unset SHIP_PR_ADVISORY_CHECKS SHIP_PR_TEST_SOURCE_ONLY SHIP_PR_CHECKS_INTERVAL
+  unset SHIP_PR_CHECKS_WAIT SHIP_PR_CHECKS_HEARTBEAT SHIP_PR_API_ATTEMPTS SHIP_PR_API_BACKOFF
+  SHIP_PR_BASE_ABSENT_GRACE=300 "$@"
+)
+
+base_gate() {
+  local target="$1" branch="$2" force="$3" reason="$4" expected="${5:-}" helper rc tip encoded
+  [[ "$target" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "base gate: --target-repo <owner/repo> required"
+  [ -z "$reason" ] || [ "$force" -eq 1 ] || die "base gate: --allow-red-base requires --force for a triage worker"
+  case "$branch" in -*|*$'\n'*) die "base gate: invalid --base-branch" ;; esac
+  helper="$(cd "$(dirname "$0")/../../ship-pr/scripts" 2>/dev/null && pwd)/pr-review.sh"
+  [ -x "$helper" ] || { echo "BASE REFUSED: coordinator base checker missing: $helper" >&2; return 1; }
+  # The ordinary base read may carry an older green while the tip is running.
+  # Reuse its bounded integration mode; preserve the established absence grace
+  # for path-filtered tips, independent of the coordinator's ambient settings.
+  if [ -n "$branch" ]; then
+    base_checker "$helper" --repo "$target" base "$branch" --wait=301 >&2
+  else
+    base_checker "$helper" --repo "$target" base --wait=301 >&2
+  fi
+  rc=$?
+  if [ "$rc" -eq 1 ] && [ "$force" -eq 1 ] && [ -n "$reason" ]; then
+    echo "BASE TRIAGE OVERRIDE: $target ${branch:-default branch}: $reason" >&2
+    rc=0
+  fi
+  [ "$rc" -eq 0 ] || echo "BASE REFUSED: $target ${branch:-default branch} (base checker exit $rc); dispatch blocked" >&2
+  [ "$rc" -eq 0 ] || return 1
+  if [ -n "$expected" ]; then
+    encoded=$(jq -rn --arg ref "$branch" '$ref | @uri') || return 1
+    tip=$(base_checker "$helper" --repo "$target" retry --read api "repos/$target/commits/$encoded" --jq .sha) || {
+      echo "BASE REFUSED: cannot confirm $target $branch after verdict" >&2; return 1;
+    }
+    [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || { echo "BASE REFUSED: invalid target tip" >&2; return 1; }
+    [ "$tip" = "$expected" ] || {
+      echo "BASE REFUSED: $target $branch moved or differs from fetched base $expected (now $tip); dispatch blocked" >&2
+      return 1
+    }
+  fi
+  return 0
+}
+
+cmd_gate() {
+  local force=0 target="" branch="" reason=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --allow-red-base)
+        [ "$#" -ge 2 ] && [[ "$2" =~ [^[:space:]] ]] || die "base gate: --allow-red-base requires a triage reason"
+        reason="$2"; shift ;;
+      --force) force=1 ;;
+      --target-repo|--base-branch)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die "gate: expected value for $1"
+        if [ "$1" = --target-repo ]; then target="$2"; else branch="$2"; fi
+        shift ;;
+      *) die "gate: expected --target-repo <owner/repo> [--base-branch <branch>] [--force]" ;;
+    esac
+    shift
+  done
+  anchor_gate GATE native-worker "$force" || return $?
+  base_gate "$target" "$branch" "$force" "$reason" || return $?
+  anchor_gate GATE native-worker "$force"
+}
+
 cmd_launch() {
   local box="${1:-}" name="${2:-}"
   [ -n "$box" ] && [ -n "$name" ] || die "launch: <box> <name> required"
   valid_name "$name" || die "launch: name must be [A-Za-z0-9._-]+ and not start with a dot"
   shift 2
-  local kind="" brief="" cwd="" repo="" branch="" base="$BASE_REF" force=0 replace=0
+  local kind="" brief="" cwd="" repo="" branch="" base="$BASE_REF" force=0 replace=0 target="" base_branch="" reason=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --target-repo|--base-branch)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die "launch: expected value for $1"
+        if [ "$1" = --target-repo ]; then target="$2"; else base_branch="$2"; fi
+        shift ;;
       --kind) kind="${2:-}"; shift ;;
       --brief) brief="${2:-}"; shift ;;
       --cwd) cwd="${2:-}"; shift ;;
       --repo) repo="${2:-}"; shift ;;
       --branch) branch="${2:-}"; shift ;;
       --base) base="${2:-}"; shift ;;
+      --allow-red-base)
+        [ "$#" -ge 2 ] && [[ "$2" =~ [^[:space:]] ]] || die "base gate: --allow-red-base requires a triage reason"
+        reason="$2"; shift ;;
       --force) force=1 ;;
       --replace) replace=1 ;;
       --) shift; break ;;
@@ -530,6 +606,12 @@ cmd_launch() {
     [ -n "$repo" ] && [ -n "$branch" ] || die "launch: --cwd <dir>, or --repo <dir> --branch <branch>"
   fi
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
+  # Worktree creation names its base already. An explicit CI branch is needed for
+  # non-origin refs (tags, SHAs, or another remote); existing cwd uses repo default.
+  if [ -z "$cwd" ] && [ -z "$base_branch" ]; then
+    case "$base" in origin/*) base_branch="${base#origin/}" ;;
+      *) die "launch: --base-branch required for a non-origin --base" ;; esac
+  fi
   local codex=0 pf; [ "$kind" = codex ] && codex=1
   pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$(siblings_of "$box")" "${FLEET_CROSS_TIMEOUT:-20}" )
   local prc=$?
@@ -539,7 +621,25 @@ cmd_launch() {
   # cross-box leg: a sibling that did not answer. Said on stderr, so the LAUNCHED line stays
   # the one thing on stdout.
   case "$pf" in *"cross-box unreachable"*) echo "preflight note for $box/$name: ${pf#*skills=* }" >&2 ;; esac
-  # The preflight fetches and runs a live probe; a halt or an adoption during that window
+  local pinned=""
+  if [ -z "$cwd" ]; then
+    # Fetch before reading CI and carry an immutable object into worktree add.
+    pinned=$( { prelude "$box"; cat <<'EOF'
+repo=$(expand_tilde "$1"); base="$2"; fetch_timeout="$3"
+bounded "$fetch_timeout" git -C "$repo" fetch -q origin >/dev/null; frc=$?
+[ "$frc" -ne 124 ] || { echo "LAUNCH REFUSED: git fetch in $repo timed out after ${fetch_timeout}s" >&2; exit 1; }
+[ "$frc" -eq 0 ] || { echo "LAUNCH REFUSED: fetch failed in $repo" >&2; exit 1; }
+git -C "$repo" rev-parse --verify "$base^{commit}"
+EOF
+    } | run_on "$box" "$repo" "$base" "${FLEET_FETCH_TIMEOUT:-300}" )
+    prc=$?
+    if unreachable "$prc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
+    [ "$prc" -eq 0 ] || exit "$prc"
+    [[ "$pinned" =~ ^[0-9a-f]{40}$ ]] || die "launch: could not resolve base commit"
+  fi
+  base_gate "$target" "$base_branch" "$force" "$reason" "$pinned" || exit $?
+  [ -z "$pinned" ] || base="$pinned"
+  # The preflight and base read may take minutes; a halt or adoption during that window
   # must still fence this launch, so the gate is read again right before anything is written.
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
   local sid=""
@@ -597,11 +697,7 @@ if [ -z "$cwd" ]; then
   repo=$(expand_tilde "$repo")
   cwd="$repo-worktrees/$name"
   if [ ! -d "$cwd" ]; then
-    # Bounded: a stalling origin must not hold the worker lock (or, below, an archived record)
-    # indefinitely.
-    bounded "$fetch_timeout" git -C "$repo" fetch -q origin >/dev/null; frc=$?
-    [ "$frc" -ne 124 ] || refuse "git fetch in $repo timed out after ${fetch_timeout}s"
-    [ "$frc" -eq 0 ] || refuse "fetch failed in $repo"
+    # base is the immutable SHA fetched and confirmed before admission.
     git -C "$repo" worktree add -q "$cwd" -b "$branch" "$base" 2>&1 || refuse "worktree add failed"
   else
     # An existing directory is reused only when it is the worktree the caller described.
@@ -1158,14 +1254,7 @@ EOF
 # ---------------------------------------------------------------------------------------------
 cmd="${1:-}"; [ -n "$cmd" ] && shift
 case "$cmd" in
-  gate)
-    force=0
-    case "$#:${1:-}" in
-      0:) ;;
-      1:--force) force=1 ;;
-      *) die "gate: expected no arguments or --force" ;;
-    esac
-    anchor_gate GATE native-worker "$force" ;;
+  gate) cmd_gate "$@" ;;
   preflight) cmd_preflight "$@" ;;
   launch) cmd_launch "$@" ;;
   attach) cmd_attach "$@" ;;

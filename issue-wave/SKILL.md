@@ -80,7 +80,7 @@ coordinators cannot both drive; a point-in-time `ls` alone could not promise tha
 coordinators starting on an idle fleet would both see it empty. The lease is per coordinator
 SESSION (the session identity inherited from the harness), so a restarted coordinator adopts
 with `--take` rather than inheriting silently, and `unstick` is fenced by it too - only the holder
-intervenes in a wave's workers. Native dispatch uses `fleet-worker.sh gate` and the shared
+intervenes in a wave's workers. Native dispatch uses `fleet-worker.sh gate --target-repo <owner/repo> [--base-branch <branch>]` and the shared
 board as described below.
 `release` at close-out.
 
@@ -215,10 +215,35 @@ linked reference. For CLI workers, write the brief to a file and launch with the
 with the user's supported Codex model flags):
 
 ```bash
-fleet-worker.sh launch <box> <repo>-<issue> --kind claude --brief <brief-file> \
+fleet-worker.sh launch <box> <repo>-<issue> --target-repo <owner/repo> --kind claude --brief <brief-file> \
   --repo '~/<project checkout>' --branch claude/<topic> [-- <model flags>]
 fleet-worker.sh attach <box> <repo>-<issue>     # Bash run_in_background: the wake signal
 ```
+
+Both CLI `launch` and native `gate` require `--target-repo owner/repo` (the GitHub
+repository, distinct from the far-side `--repo` checkout path). They run the sibling
+`ship-pr/scripts/pr-review.sh base` on the coordinator with its local `gh` authentication,
+printing its complete verdict, failing job and first-red-commit diagnostics. CI refusal uses fleet exit 1 (the diagnostic retains the helper’s original exit);
+fleet exit 4 remains a worker-box transport failure. Unknown, no verdict and a missing
+checker never mean green. The helper uses its default advisory policy, clearing the
+coordinator’s repository-specific `SHIP_PR_ADVISORY_CHECKS` override. Source-only test
+mode and API/check polling overrides are also cleared; the helper’s defaults supply
+those bounds. Connection/authentication and state paths remain the coordinator’s. For a new worktree,
+`origin/<branch>` supplies the checked branch; other base refs require `--base-branch`.
+For `--cwd` and native dispatch the repository default branch is checked unless
+`--base-branch` names the intended base. The coordinator must name the repository/base
+matching the worker's brief and checkout. New worktrees fetch and resolve their base to an immutable SHA before the verdict,
+confirm that SHA still matches the target CI branch after the verdict, and create from
+that SHA. A mismatch or unreadable confirmation blocks dispatch; retry explicitly after
+reconciling the branch. Existing worktrees and native dispatch keep the coordinator’s
+responsibility for the recorded startup SHA. The read runs after worker-box freshness preflight and uses the existing checker's
+`--wait=301` mode with its absence grace pinned to 300 seconds: a covered green exits
+immediately, a pending base blocks at the ceiling, and a path-filtered tip may use the
+older verdict after the grace. This is a bounded pre-dispatch check, not another observer.
+A known-red regression needs one triage worker: only `--force --allow-red-base "<reason>"`
+permits that red verdict, prints the reason, and still refuses unknown/no-verdict. Record
+the reason and diagnostics in the board. `--force` alone only lifts the halt.
+For lease-only administrative reads use `coordinator`, rather than the dispatch `gate`.
 
 `launch` creates `<checkout>-worktrees/<name>` off `origin/master` on the box (`FLEET_BASE_REF`
 for another default, `--base` for one launch, `--cwd` for a worktree that already exists) and
@@ -486,8 +511,8 @@ linked reference's selected native lifecycle wherever a bullet below names CLI e
   another box inherits the halt rather than launching into a known red.
   Then tell the running workers through the channel they already read - a `pr-review.sh
   comment` on every open wave PR stating that master's red is established and owned, so nobody
-  bisects it independently - and dispatch one triage worker with `launch --force` (or native
-  `gate --force` followed by the selected native spawn tool, recorded in the board; the only launch the halt
+  bisects it independently - and dispatch one triage worker with `launch --force --allow-red-base "<triage reason>"` (or native
+  `gate --target-repo <owner/repo> --force --allow-red-base "<triage reason>"` followed by the selected native spawn tool, recorded in the board; the only launch the halt
   admits): fix directly when the fix is straightforward, file an issue when it
   involves a trade-off with no clearly better option. Diagnose from `git log` on master
   between the last green and first red integration run, not by local re-bisecting; one owner
