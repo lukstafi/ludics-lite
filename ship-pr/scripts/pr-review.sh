@@ -226,7 +226,8 @@
 #             apart from 0 for the same reason 3 is: "nothing has failed" and "everything passed"
 #             are different facts.
 #             From `merge`, 4 means the merge was REFUSED for want of a verdict (see
-#             --allow-no-verdict).
+#             --allow-no-verdict). `checks` and `merge` add 5: SUPERSEDED — the PR head
+#             moved from the observed SHA. Re-run to judge the successor; no override bypasses 5.
 #
 # Env: REPO=owner/name (else the <pr> argument, else the cwd's checkout, else the per-PR cache —
 #      `retry run watch` takes only the first two, never the cwd and never the cache),
@@ -3046,10 +3047,10 @@ run_signal() {
 # leave nothing to wait for — the head's workflow runs. Sets VERDICT and prints the report.
 # 0 = green, or an absence run_signal confirmed is the verdict (nothing is red), 1 = RED (a check
 # or a checkless run), 3 = the API did not answer, 4 = no verdict yet (still running, stopped
-# without a verdict, or a run for this head has yet to produce its checks).
+# without a verdict, or a run for this head has yet to produce its checks), 5 = superseded head.
 gate_checks() {
   local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining
-  local run_why="" run_info note pr_at=""
+  local run_why="" run_info note pr_at="" current_sha
   # One read for both: the head to judge, and the PR's own last-updated stamp, which run_signal
   # uses as the push clock a stale committer date cannot provide. Tab-separated with a placeholder
   # for the same reason build_checks uses one — an empty field would collapse under tab-IFS.
@@ -3066,7 +3067,6 @@ gate_checks() {
       "which is NOT 'nothing is red'."
     return 3
   fi
-  CHECK_SHA="$sha" # what the verdict is ABOUT; merge binds to it
   CHECK_SHA="$sha" # what the verdict is ABOUT; merge binds to it
   started=$(date +%s)
   deadline=$((started + wait_for))
@@ -3113,6 +3113,21 @@ gate_checks() {
       # for the run that was still coming (round 4). The stopped checks stay in the report below.
       4) case "$VERDICT" in pending) ;; *) VERDICT=unjudged ;; esac ;;
       esac
+    fi
+    # Revalidate every observation, including a terminal green or stopped old head. This
+    # never follows the successor: the checks and merge binding remain about the original SHA.
+    current_sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq \
+      '.head.sha | select(type == "string" and length > 0)')
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$current_sha" ] || [ "$current_sha" = null ]; then
+      VERDICT=unknown
+      warn "could not re-read $REPO#$pr's head SHA; the build signal is UNKNOWN."
+      return 3
+    fi
+    if [ "$current_sha" != "$sha" ]; then
+      VERDICT=superseded
+      echo "build signal $REPO#$pr: SUPERSEDED — observed $sha, current $current_sha; re-run for the new head"
+      return 5
     fi
     now=$(date +%s)
     case "$VERDICT" in pending | unjudged) ;; *) break ;; esac
@@ -3612,6 +3627,7 @@ cmd_merge() {
     ;;
   3) fail 3 "NOT merging $REPO#$PR_NUM: the build signal could not be READ. Nothing is known," \
     "so this is not 'nothing is red' — retry rather than merging past it." ;;
+  5) fail 5 "NOT merging $REPO#$PR_NUM: the observed head was SUPERSEDED; re-run to judge the new head." ;;
   4)
     # No verdict is not "nothing is red" either. On 2026-08-23 a day-long ~2h runner queue outran
     # the 30-minute wait, two PRs merged unread on the warning below, and master was red for two

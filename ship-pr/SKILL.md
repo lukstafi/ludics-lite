@@ -633,6 +633,7 @@ The other verdicts are not refusals, and none of them is a green light either:
 | 0 | absent | no build check ran on this commit, and the run list confirms none is coming — path filters (ocannl's `ci` ignores `docs/**`), or CI never started |
 | 1 | RED | a build check concluded `failure`, or a workflow run for the head concluded red without producing one — refused |
 | 3 | unknown | the checks or the head's runs could not be read — refused |
+| 5 | superseded | the PR head moved from the observed SHA — refused; re-run to judge the successor |
 | 4 | no verdict | still running, every finished job was `cancelled`, or a run for the head is queued, stopped without a verdict, or has yet to create its checks — refused without `--allow-no-verdict` |
 
 **Exit 4 refuses too, by default.** Nothing has failed, but nothing has passed, and a merge that
@@ -646,7 +647,11 @@ leaving `master` red for two hours. So:
 
 `--wait` holds for the verdict up to 120 min (`SHIP_PR_CHECKS_WAIT` seconds, or `--wait=<seconds>`)
 with a one-line heartbeat every 10 min (`SHIP_PR_CHECKS_HEARTBEAT`), so background it and let it
-hold. If the ceiling runs out it exits 4 naming `--allow-no-verdict`; for anything a compiler sees,
+hold. Each observation re-reads the PR head, including before returning a terminal verdict.
+If it moved, `checks` and `merge` return **5 (SUPERSEDED)** with both SHAs; neither follows
+the successor automatically, and neither merge override bypasses this refusal. An unreadable
+head returns 3, never superseded or green. Detection occurs on the next poll (after any active
+API calls), not through a push notification. If the ceiling runs out it exits 4 naming `--allow-no-verdict`; for anything a compiler sees,
 wait again instead.
 
 **`ABSENT` seconds after a push used to be the trap here** — a push (a rebase before merging, or
@@ -716,7 +721,7 @@ head that genuinely runs no build (path filters) gets one dispatched onto it (`g
 path-filter allowance the ordinary gate gives is exactly what a merge without a 👍 does not get.
 
 Whatever the verdict, the merge is bound to the head it was read for: `merge` passes
-`--match-head-commit` with that SHA, so a push that moves the PR during a long `--wait` makes the
+`--match-head-commit` with that SHA, so a push after the last head re-read makes the
 merge refuse (exit 1, naming the SHA it read) instead of landing a head nothing has read. Re-run
 `merge`; it reads the gate again.
 
