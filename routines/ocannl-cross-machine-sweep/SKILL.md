@@ -155,7 +155,8 @@ N)` means a lane could not write a history row or unit state (the lane's own `sw
 says which) and stopped, while the other lanes ran to completion. This is a PARTIAL sweep, not an
 absent one: the rows the run did write, today's `when` stamp in the history file, are real
 results, and steps 3–5 process them exactly as for a completed run — a failure in a lane that
-finished is news like any other. The stopped lane's units without a row are non-coverage, and no
+finished is news like any other. Units without a row, which only the stopped lane can have, are non-coverage; any row
+the stopped lane did write is a result like the rest, and no
 skip-coverage report was written. Do not relaunch for it: an unwritable state directory is the
 finding, and it is notify-worthy.
 
@@ -238,9 +239,10 @@ Outcomes are `pass`, `incremental-pass`, `legacy-pass`, `fail`, `skip`, `timeout
 put that machine's worktree on the commit under test, so NOTHING was tested there — report it as
 non-coverage rather than as a test failure, and treat it as notify-worthy. If the script itself
 exits 2 at startup, no sweep happened at all: report that as the finding and do not read the history
-file as though the run had completed. A lane-stopped exit 2 (step 2) is the exception: report the
-stopped lane and its unrecorded units as non-coverage, AND report today's recorded rows from the
-other lanes, including any new failures among them, as this step describes. The same applies when this routine never got as far as launching
+file as though the run had completed. A lane-stopped exit 2 (step 2) is the exception: report every row the run
+recorded — the stopped lane's own included, since it may have finished a unit (minix's hip) before
+stopping — including any new failures among them, as this step describes, and report only the
+units with no row as non-coverage. The same applies when this routine never got as far as launching
 it because `~/.config/ocannl-sweep/local-box` is missing: report the missing site configuration,
 not the backends.
 
