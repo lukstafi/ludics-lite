@@ -209,6 +209,14 @@ A row with a narrower target came from a manual smoke run that executed a fracti
 and treating it as coverage would certify tests that never ran. Likewise, when judging whether
 slow coverage is current, count only rows with `slow` = 1.
 
+And age a backend only by rows from the box that runs it NOW — the one today's `lanes:` header line
+puts it on — normalizing only the historical renames of the same box (`local` → `m4-max`, `rog` →
+`rog-nv`). A backend that moved boxes has not been covered on its new box until a row there says
+so: multidev_cc's `m4-max`/`local` passes do not count toward its liveness or its 14-day forced
+check once the sweep runs it on minix, so the move shows as stale until minix records its own pass
+and forced pass — which is the point, since the move exists to add coverage that had never run.
+Failure comparison in step 3 still matches across the move; only aging is per box.
+
 Two distinct ages per backend, because a green incremental run and a genuinely re-executed suite
 are different claims:
 - **Liveness**: the most recent full-scope passing row of ANY passing outcome (`pass`,
