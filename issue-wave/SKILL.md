@@ -228,7 +228,10 @@ dispatch: unknown, no verdict and a missing checker never mean green. For a new 
 `origin/<branch>` supplies the checked branch; other base refs require `--base-branch`.
 For `--cwd` and native dispatch the repository default branch is checked unless
 `--base-branch` names the intended base. The coordinator must name the repository/base
-matching the worker's brief and checkout. This is one pre-dispatch read, not an observer.
+matching the worker's brief and checkout. The read runs after worker-box freshness preflight and uses the existing checker's
+`--wait=301` mode with its absence grace pinned to 300 seconds: a covered green exits
+immediately, a pending base blocks at the ceiling, and a path-filtered tip may use the
+older verdict after the grace. This is a bounded pre-dispatch check, not another observer.
 A known-red regression needs one triage worker: only `--force --allow-red-base "<reason>"`
 permits that red verdict, prints the reason, and still refuses unknown/no-verdict. Record
 the reason and diagnostics in the board. `--force` alone only lifts the halt.

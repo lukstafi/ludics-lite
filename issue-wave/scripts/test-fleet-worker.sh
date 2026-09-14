@@ -128,7 +128,14 @@ FW="$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
 export BASE_CALL_LOG="$TMP/base-calls"
 cat > "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "$BASE_CALL_LOG"
+printf '%s\n' "$* grace=${SHIP_PR_BASE_ABSENT_GRACE:-unset}" >> "$BASE_CALL_LOG"
+# Fail if the dispatch contract drifts; ambient REPO must not select this read.
+[ "$1" = --repo ] && [ "$2" = example/project ] && [ "$3" = base ] || exit 2
+[ "${SHIP_PR_BASE_ABSENT_GRACE:-}" = 300 ] || exit 3
+case " $* " in *" --wait=301 "*) ;; *) exit 4 ;; esac
+if [ -n "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] && [ ! -e "$SHIM_BASE_REQUIRE_PREFLIGHT" ]; then
+  echo 'base read occurred before preflight'; exit 3
+fi
 echo "${SHIM_BASE_MESSAGE:-BASE GREEN example/project tested abc1234}"
 exit "${SHIM_BASE_RC:-0}"
 EOF
@@ -166,6 +173,7 @@ brief=$(cat)
 sleep_s=$(sed -n '/^SLEEP [0-9]/ { s/^SLEEP \([0-9]*\).*/\1/; p; q; }' <<<"$brief")
 [ -n "${SHIM_CLAUDE_HANG:-}" ] && sleep 30
 if [ "$fmt" = json ]; then
+  [ -z "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] || touch "$SHIM_BASE_REQUIRE_PREFLIGHT"
   printf '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"%s"}\n' "${sid:-none}"; exit 0
 fi
 if grep -q '^SILENT' <<<"$brief"; then exit 0; fi
@@ -404,7 +412,7 @@ for verdict in 1 3 4; do
     env SHIM_BASE_RC="$verdict" "$FW" launch testbox base-red --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/base-red
   [ ! -e "$ISSUE_WAVE_STATE/workers/base-red" ] && [ ! -e "$proj-worktrees/base-red" ] && ok "refusal left no worker or checkout" || ko "base refusal wrote worker state"
 done
-expect "native green passes" 0 "BASE GREEN" -- "$FW" gate --target-repo example/project --base-branch topic
+expect "native green pins target and wait despite ambient settings" 0 "BASE GREEN" -- env REPO=wrong/repo SHIP_PR_BASE_ABSENT_GRACE=0 "$FW" gate --target-repo example/project --base-branch topic
 expect "missing repository refuses" 2 "--target-repo" -- "$FW" gate
 expect "triage force cannot bypass red base" 1 "dispatch blocked" -- env SHIM_BASE_RC=1 "$FW" gate --target-repo example/project --force
 expect "explicit red triage override passes with reason" 0 "BASE TRIAGE OVERRIDE: example/project default branch: fix broken job" -- env SHIM_BASE_RC=1 "$FW" gate --target-repo example/project --force --allow-red-base 'fix broken job'
@@ -413,8 +421,9 @@ for verdict in 3 4; do
   expect "triage cannot override unknown $verdict" "$verdict" "dispatch blocked" -- env SHIM_BASE_RC="$verdict" "$FW" gate --target-repo example/project --force --allow-red-base fix
 done
 expect "missing helper is unknown" 3 "checker missing" -- env SHIM_BASE_RC=0 bash -c 'mv "$1" "$1.saved"; "$2" gate --target-repo example/project; rc=$?; mv "$1.saved" "$1"; exit "$rc"' _ "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" "$FW"
-grep -Fxq 'base example/project topic' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
-grep -Fxq 'base example/project master' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
+grep -Fxq -- '--repo example/project base topic --wait=301 grace=300' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
+grep -Fxq -- '--repo example/project base master --wait=301 grace=300' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
+expect "base read follows freshness preflight" 1 "dispatch blocked" -- env SHIM_BASE_REQUIRE_PREFLIGHT="$TMP/preflight-ran" SHIM_BASE_RC=1 "$FW" launch testbox base-order --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 "$FW" release >/dev/null
 }
 

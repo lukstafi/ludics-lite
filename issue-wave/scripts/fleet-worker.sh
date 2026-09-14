@@ -40,7 +40,8 @@
 #   fleet-worker.sh gate --target-repo <owner/repo> [--base-branch <branch>] [--force --allow-red-base <reason>] # lease + halt read before native dispatch (not a reservation)
 #   fleet-worker.sh launch <box> <name> --target-repo <owner/repo> --kind claude|codex --brief <file>
 #                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
-#                          [--force] [--replace] [-- <extra CLI args>]
+#                          [--base-branch <branch>] [--force --allow-red-base <reason>]
+#                          [--replace] [-- <extra CLI args>]
 #   fleet-worker.sh attach <box> <name> [--interval <sec>]
 #   fleet-worker.sh status <box> <name>
 #   fleet-worker.sh log <box> <name> [-n <lines>]
@@ -511,8 +512,14 @@ base_gate() {
   case "$branch" in -*|*$'\n'*) die "base gate: invalid --base-branch" ;; esac
   helper="$(cd "$(dirname "$0")/../../ship-pr/scripts" 2>/dev/null && pwd)/pr-review.sh"
   [ -x "$helper" ] || { echo "BASE REFUSED: coordinator base checker missing: $helper" >&2; return 3; }
-  if [ -n "$branch" ]; then "$helper" base "$target" "$branch" >&2
-  else "$helper" base "$target" >&2; fi
+  # The ordinary base read may carry an older green while the tip is running.
+  # Reuse its bounded integration mode; preserve the established absence grace
+  # for path-filtered tips, independent of the coordinator's ambient settings.
+  if [ -n "$branch" ]; then
+    SHIP_PR_BASE_ABSENT_GRACE=300 "$helper" --repo "$target" base "$branch" --wait=301 >&2
+  else
+    SHIP_PR_BASE_ABSENT_GRACE=300 "$helper" --repo "$target" base --wait=301 >&2
+  fi
   rc=$?
   if [ "$rc" -eq 1 ] && [ "$force" -eq 1 ] && [ -n "$reason" ]; then
     echo "BASE TRIAGE OVERRIDE: $target ${branch:-default branch}: $reason" >&2
@@ -584,7 +591,6 @@ cmd_launch() {
     case "$base" in origin/*) base_branch="${base#origin/}" ;;
       *) die "launch: --base-branch required for a non-origin --base" ;; esac
   fi
-  base_gate "$target" "$base_branch" "$force" "$reason" || exit $?
   local codex=0 pf; [ "$kind" = codex ] && codex=1
   pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$(siblings_of "$box")" "${FLEET_CROSS_TIMEOUT:-20}" )
   local prc=$?
@@ -594,7 +600,8 @@ cmd_launch() {
   # cross-box leg: a sibling that did not answer. Said on stderr, so the LAUNCHED line stays
   # the one thing on stdout.
   case "$pf" in *"cross-box unreachable"*) echo "preflight note for $box/$name: ${pf#*skills=* }" >&2 ;; esac
-  # The preflight fetches and runs a live probe; a halt or an adoption during that window
+  base_gate "$target" "$base_branch" "$force" "$reason" || exit $?
+  # The preflight and base read may take minutes; a halt or adoption during that window
   # must still fence this launch, so the gate is read again right before anything is written.
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
   local sid=""
