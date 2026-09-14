@@ -1007,6 +1007,29 @@ review_after_nudge() { # <event timestamp> <eligible nudge timestamp, or empty>
   [ -z "$2" ] || [[ "$1" > "$2" ]]
 }
 
+# A submitted COMMENTED envelope alone proves no findings (#88). Read its OWN
+# comments: the flat PR feed can lag behind that endpoint. A failed read is not
+# an empty review. Keep all other review states and nonempty summaries untouched.
+substantive_reviews() { # <pr>; reviews JSON on stdin
+  local pr="$1" raw ids id inline
+  raw=$(cat)
+  ids=$(jq -r --arg rev "$REVIEWER" '
+    .[] | select((.user.login // "") | startswith($rev))
+    | select(.state == "COMMENTED" and .submitted_at != null)
+    | select((.body // "") | test("[^[:space:]]") | not) | .id' <<<"$raw") || return 1
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    case "$id" in null | *[!0-9]*) return 1 ;; esac
+    inline=$(api_list "pulls/$pr/reviews/$id/comments?per_page=100") || return 1
+    if jq -e 'type == "array" and length == 0' <<<"$inline" >/dev/null; then
+      raw=$(jq --argjson id "$id" 'map(select(.id != $id))' <<<"$raw") || return 1
+    else
+      jq -e 'type == "array"' <<<"$inline" >/dev/null || return 1
+    fi
+  done <<<"$ids"
+  printf '%s\n' "$raw"
+}
+
 status_state() {
   local pr="$1" raw line age plus plus_at eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local running_at evidence evidence_kind evidence_at vline verd_at verd_sha mstate="-" head_err="" pr_created=""
@@ -1059,6 +1082,10 @@ status_state() {
       comments_raw=$(api_list "issues/$pr/comments?per_page=100") || comments_raw='[]'
     fi
     reviews_raw=$(api_list "pulls/$pr/reviews?per_page=100") || reviews_raw='[]'
+    reviews_raw=$(substantive_reviews "$pr" <<<"$reviews_raw") || {
+      echo "unknown|-|$mstate|the review comments API did not establish substantive reviews"
+      return 0
+    }
     pr_head_read "$pr"
     evidence=$(jq -rs --arg rev "$REVIEWER" --arg head "$head_sha" --arg rc "$REVIEWED_COMMIT_RE" '
       .[0] as $comments | .[1] as $reviews |
@@ -1114,6 +1141,10 @@ status_state() {
 
   raw=$(api_list "pulls/$pr/reviews?per_page=100") || {
     echo "unknown|-|$mstate|the reviews API did not answer ($(gh_err_line))"
+    return 0
+  }
+  raw=$(substantive_reviews "$pr" <<<"$raw") || {
+    echo "unknown|-|$mstate|the review comments API did not establish substantive reviews"
     return 0
   }
   # Kept whole for the `failed` branch, which asks whether any review is of the CURRENT head — a
@@ -1485,6 +1516,10 @@ review_rounds() {
   local pr="$1" raw comments line count heads
   raw=$(api_list "pulls/$pr/reviews?per_page=100") || {
     echo "unknown|the reviews API did not answer ($(gh_err_line))"
+    return 0
+  }
+  raw=$(substantive_reviews "$pr" <<<"$raw") || {
+    echo "unknown|the review comments API did not establish substantive reviews"
     return 0
   }
   # A round can also arrive as an issue comment alone — the same shape status_state treats as

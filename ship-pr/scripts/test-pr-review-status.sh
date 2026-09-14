@@ -19,6 +19,8 @@ REQUEST_LOG="$TEST_ROOT/requests"
 REACTIONS_JSON='[]'
 REVIEWS_JSON='[]'
 COMMENTS_JSON='[]'
+INLINE_JSON='[]'
+FAIL_INLINE=""
 HEAD_SHA=head-sha
 MERGEABLE_STATE=clean
 FAIL_PULLS=""
@@ -38,6 +40,8 @@ reset_fixture() {
   REACTIONS_JSON='[]'
   REVIEWS_JSON='[]'
   COMMENTS_JSON='[]'
+  INLINE_JSON='[]'
+  FAIL_INLINE=""
   HEAD_SHA=head-sha
   MERGEABLE_STATE=clean
   HEAD_AT=2026-09-01T00:00:00Z
@@ -118,7 +122,9 @@ gh() {
     ;;
   "repos/$REPO/issues/7/comments?per_page=100") response="$COMMENTS_JSON" ;;
   "repos/$REPO/pulls/7/comments?per_page=100") response='[]' ;;
-  "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100") response='[]' ;;
+  "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100")
+    [ -z "$FAIL_INLINE" ] || return 1
+    response="$INLINE_JSON" ;;
   "repos/$REPO/pulls/7")
     if [ -n "$FAIL_PULLS" ]; then
       echo "gh: pull request unavailable (HTTP 500)" >&2
@@ -607,7 +613,32 @@ test_a_standing_verdict_survives_a_failed_re_request() {
   assert_contains "$LINE" "reviewer FAILED at initialization" "and the line says so"
 }
 
+test_empty_reviews_need_their_own_findings() {
+  reset_fixture
+  REVIEWS_JSON="[$(review 88 "$HEAD_SHA" "$PAST" | jq '.body=" \n\t"')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "empty envelope does not review the head"
+  INLINE_JSON='[{"id":1,"body":"a real finding","pull_request_review_id":88}]'
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "own inline finding reviews head even while flat feed is empty"
+  FAIL_INLINE=1
+  run_status
+  assert_eq "$(state_tok "$STATE")" unknown "unread own inline feed is not empty"
+  FAIL_INLINE=""
+  INLINE_JSON='[]'
+  REACTIONS_JSON="[$(reaction +1 "$PAST")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "empty envelope preserves approval"
+  HEAD_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  REVIEWS_JSON="[$(review 88 "$HEAD_SHA" 2026-09-01T00:02:00Z | jq '.body=null')]"
+  COMMENTS_JSON="[$(plain_comment 1 "$PAST" '<!-- codex-pull-request-review-summary -->
+| Code Review | Running <relative-time datetime="2026-09-01T00:01:00Z"> | `aaaaaaa` |')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" stalled "newer empty envelope cannot supersede current-head Running row"
+}
+
 tests=(
+  test_empty_reviews_need_their_own_findings
   test_idle_clean_says_next_move_is_yours
   test_idle_dirty_says_conflicts_not_next_move
   test_idle_draft_names_gh_pr_ready
