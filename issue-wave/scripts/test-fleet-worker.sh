@@ -275,7 +275,9 @@ real_home="$TMP/real-home"; real_origin="$TMP/real-origin.git"
 mkdir -p "$real_home"
 git init -q --bare "$real_origin"
 git -C "$real_top" push -q "$real_origin" HEAD:refs/heads/main || ko "could not push the real checkout's HEAD to the scratch origin (setup, not the launcher)"
-git clone -q -b main "$real_origin" "$real_home/ludics-lite" || ko "could not clone the scratch origin (setup, not the launcher)"
+# Use the transport even for a local path: push can leave background object maintenance
+# running, and a local clone's hardlink walk races with repacking (seen in PR #149).
+git clone --no-local -q -b main "$real_origin" "$real_home/ludics-lite" || ko "could not clone the scratch origin (setup, not the launcher)"
 claude_loop=$(readme_block 'ludics-lite/*/' | grep -v '^git clone ')
 codex_loop=$(readme_block 'for s in ship-pr wait-and-proceed after-merge' | grep -v '^git clone ')
 [ -n "$claude_loop" ] && [ -n "$codex_loop" ] && ok "README.md carries both install loops" || ko "could not find the README's install loops"
@@ -561,7 +563,7 @@ git -C "$repo" mv .claude/moved.md ship-pr/SKILL.md
 rm -rf "$repo/.claude"
 # Behind origin: a second clone pushes; the preflight must fast-forward and pass. The bare origin
 # has no HEAD for `main` (the runner's git may default to master), so name the branch to clone.
-git clone -q -b main "$origin" "$TMP/other" && echo more >> "$TMP/other/ship-pr/SKILL.md" \
+git clone --no-local -q -b main "$origin" "$TMP/other" && echo more >> "$TMP/other/ship-pr/SKILL.md" \
   && git -C "$TMP/other" commit -q -am upstream && git -C "$TMP/other" push -q origin main \
   || ko "could not advance the scratch origin (setup, not the launcher)"
 expect "behind origin fast-forwards and passes" 0 "PREFLIGHT OK" -- "$FW" preflight testbox --no-probe
