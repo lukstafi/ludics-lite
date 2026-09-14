@@ -138,20 +138,24 @@ The script deliberately exits 0 even when tests
 fail; its exit code tells you nothing about test results, so do not read anything into it. Read
 the results from the history file instead.
 
-The ONE exit code that does carry meaning is 2: the script found its launch environment unusable
-(a `sweep: ...` line on stderr says why) and stopped BEFORE testing anything, on any machine. A
-bare exit 2 is therefore a whole day of non-coverage for all five backends, not a test result:
+The ONE exit code that does carry meaning is 2, and it comes in two kinds; tell them apart by the
+`sweep:` line before doing anything else. The startup kind: the script found its launch environment
+unusable (a `sweep: ...` line on stderr says why) and stopped BEFORE testing anything, on any
+machine. A startup exit 2 is therefore a whole day of non-coverage for all five backends, not a test result:
 read the `sweep:` line first, and relaunch only if it names something this routine can correct
 from the instructions above (a missing box ID, a stale or incomplete extraction, "another sweep is
 running"). Do not retry the same command hoping for a different answer — the 2026-09-05 run burned
 a second attempt on that before recognizing the failure. Whatever the outcome of the single
-corrected relaunch, an exit 2 is reported in step 5 as non-coverage and notified in step 6.
+corrected relaunch, a startup exit 2 is reported in step 5 as non-coverage and notified in step 6.
 
-One exit 2 comes AFTER testing: `sweep: lane(s) stopped before finishing: <box> (exit N)` means a
-lane could not write a history row or unit state (the lane's own `sweep:` line above says which)
-and stopped, while the other lanes ran to completion. Their rows are real results — read them —
-but the stopped lane's remaining units are non-coverage, and no skip-coverage report was written.
-Do not relaunch for it: an unwritable state directory is the finding.
+The lane-stopped kind comes AFTER testing: `sweep: lane(s) stopped before finishing: <box> (exit
+N)` means a lane could not write a history row or unit state (the lane's own `sweep:` line above
+says which) and stopped, while the other lanes ran to completion. This is a PARTIAL sweep, not an
+absent one: the rows the run did write, today's `when` stamp in the history file, are real
+results, and steps 3–5 process them exactly as for a completed run — a failure in a lane that
+finished is news like any other. The stopped lane's units without a row are non-coverage, and no
+skip-coverage report was written. Do not relaunch for it: an unwritable state directory is the
+finding, and it is notify-worthy.
 
 ## 3. Diff against the previous sweep
 
@@ -231,8 +235,10 @@ Outcomes are `pass`, `incremental-pass`, `legacy-pass`, `fail`, `skip`, `timeout
 `error` means the harness could not
 put that machine's worktree on the commit under test, so NOTHING was tested there — report it as
 non-coverage rather than as a test failure, and treat it as notify-worthy. If the script itself
-exits 2, no sweep happened at all: report that as the finding and do not read the history file as
-though the run had completed. The same applies when this routine never got as far as launching
+exits 2 at startup, no sweep happened at all: report that as the finding and do not read the history
+file as though the run had completed. A lane-stopped exit 2 (step 2) is the exception: report the
+stopped lane and its unrecorded units as non-coverage, AND report today's recorded rows from the
+other lanes, including any new failures among them, as this step describes. The same applies when this routine never got as far as launching
 it because `~/.config/ocannl-sweep/local-box` is missing: report the missing site configuration,
 not the backends.
 
