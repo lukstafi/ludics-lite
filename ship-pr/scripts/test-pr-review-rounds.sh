@@ -313,7 +313,7 @@ test_empty_reviews_need_their_own_findings() {
   run_rounds
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 0" "empty envelope is no round"
   assert_contains "$ROUNDS_OUTPUT" "over 0 head(s)" "empty envelope contributes no head"
-  INLINE_JSON='[{id:1,body:"a real finding",pull_request_review_id:88}]'
+  INLINE_JSON='[{"id":1,"body":"a real finding","pull_request_review_id":88}]'
   run_rounds
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1" "own inline finding counts"
   FAIL_INLINE=1

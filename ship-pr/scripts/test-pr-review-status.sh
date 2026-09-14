@@ -618,7 +618,7 @@ test_empty_reviews_need_their_own_findings() {
   REVIEWS_JSON="[$(review 88 "$HEAD_SHA" "$PAST" | jq '.body=" \n\t"')]"
   run_status
   assert_eq "$(state_tok "$STATE")" expected "empty envelope does not review the head"
-  INLINE_JSON='[{id:1,body:"a real finding",pull_request_review_id:88}]'
+  INLINE_JSON='[{"id":1,"body":"a real finding","pull_request_review_id":88}]'
   run_status
   assert_eq "$(state_tok "$STATE")" idle "own inline finding reviews head even while flat feed is empty"
   FAIL_INLINE=1
@@ -629,6 +629,12 @@ test_empty_reviews_need_their_own_findings() {
   REACTIONS_JSON="[$(reaction +1 "$PAST")]"
   run_status
   assert_eq "$(state_tok "$STATE")" approved "empty envelope preserves approval"
+  HEAD_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  REVIEWS_JSON="[$(review 88 "$HEAD_SHA" 2026-09-01T00:02:00Z | jq '.body=null')]"
+  COMMENTS_JSON="[$(plain_comment 1 "$PAST" '<!-- codex-pull-request-review-summary -->
+| Code Review | Running <relative-time datetime="2026-09-01T00:01:00Z"> | `aaaaaaa` |')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" stalled "newer empty envelope cannot supersede current-head Running row"
 }
 
 tests=(
