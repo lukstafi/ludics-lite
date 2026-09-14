@@ -20,6 +20,7 @@ PAGINATE_LOG="$TEST_ROOT/paginated"
 # --- the fixture transport --------------------------------------------------------------------
 # One canned answer per endpoint, each a list so a round can differ from the next: the wait loop
 # re-reads, and a fixture that could only answer once could not tell a hold from a settle.
+HEAD_SEQ=()
 CHECK_RUNS_SEQ=()
 RUNS_SEQ=()
 COMMIT_AGE=""
@@ -64,20 +65,21 @@ next_of() {
 }
 
 reset_fixture() {
+  HEAD_SEQ=("$HEAD_SHA")
   CHECK_RUNS_SEQ=("$(check_runs_json '[]')")
   RUNS_SEQ=("$(runs_json '[]')")
   COMMIT_AGE=3600
   PR_UPDATED_AGE=3600
   JOBS_JSON=$(jobs_json '[]')
   FAIL_ENDPOINT=""
-  rm -f "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls"
+  rm -f "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls" "$TEST_ROOT/HEAD_SEQ.calls"
   retune ABSENT_GRACE=300 CHECKS_INTERVAL=1 CHECKS_HEARTBEAT=600
   : >"$REQUEST_LOG"
   : >"$PAGINATE_LOG"
 }
 
 gh() {
-  local response=""
+  local response="" fixture_head
   gh_fixture_parse "$@"
   # A GLOB, deliberately unquoted: "repos/o/n/commits/<sha>" is a prefix of the check-runs
   # endpoint, so a substring match could not fail the commit read alone — and a case that failed
@@ -93,11 +95,13 @@ gh() {
   fi
   case "$FIXTURE_ENDPOINT" in
   "repos/$REPO/pulls/7")
+    fixture_head=$(next_of HEAD_SEQ)
+    if [ "$fixture_head" = UNREADABLE ]; then return 1; fi
     if [ -n "$PR_UPDATED_AGE" ]; then
-      response=$(jq -cn --arg sha "$HEAD_SHA" --arg at "$(iso_ago "$PR_UPDATED_AGE")" \
+      response=$(jq -cn --arg sha "$fixture_head" --arg at "$(iso_ago "$PR_UPDATED_AGE")" \
         '{head:{sha:$sha}, updated_at:$at}')
     else
-      response=$(jq -cn --arg sha "$HEAD_SHA" '{head:{sha:$sha}}')
+      response=$(jq -cn --arg sha "$fixture_head" '{head:{sha:$sha}}')
     fi
     ;;
   "repos/$REPO/commits/$HEAD_SHA/check-runs?filter=latest&per_page=100")
@@ -633,7 +637,57 @@ test_unreadable_jobs_keep_the_red() {
   assert_contains "$GATE_OUTPUT" ": RED" "the red should still headline"
 }
 
+# A successor never inherits the observed head's checks, even when those checks passed
+# or were cancelled. The unchanged sequence is the control for the additional head reads.
+test_wait_superseded_head() {
+  local conclusion
+  for conclusion in success cancelled; do
+    reset_fixture
+    HEAD_SEQ=("$HEAD_SHA" "$HEAD_SHA" feedbeeffeedbeeffeedbeeffeedbeeffeedbeef)
+    CHECK_RUNS_SEQ=(
+      "$(check_runs_json '[{"name":"ci","status":"in_progress"}]')"
+      "$(check_runs_json "[{\"name\":\"ci\",\"conclusion\":\"$conclusion\"}]")"
+    )
+    RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
+    run_gate 30
+    assert_eq "$GATE_RC" 5 "a moved head supersedes the old $conclusion verdict"
+    assert_contains "$GATE_OUTPUT" "SUPERSEDED" "the distinct outcome is named"
+    assert_contains "$GATE_OUTPUT" "$HEAD_SHA" "the observed head is named"
+    assert_contains "$GATE_OUTPUT" "feedbeef" "the successor is named"
+    assert_eq "$(cat "$TEST_ROOT/CHECK_RUNS_SEQ.calls")" 2 "the superseded wait ends promptly"
+  done
+}
+
+test_wait_unchanged_head_turns_green() {
+  reset_fixture
+  CHECK_RUNS_SEQ=(
+    "$(check_runs_json '[{"name":"ci","status":"in_progress"}]')"
+    "$(check_runs_json '[{"name":"ci","conclusion":"success"}]')"
+  )
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
+  run_gate 30
+  assert_eq "$GATE_RC" 0 "unchanged pending head settles green"
+  assert_contains "$GATE_OUTPUT" "green —" "unchanged green is still reported"
+}
+
+test_head_reread_unknown() {
+  local head
+  for head in UNREADABLE '' ; do
+    reset_fixture
+    HEAD_SEQ=("$HEAD_SHA" "$head")
+    CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ci","conclusion":"success"}]')")
+    RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
+    run_gate 30
+    assert_eq "$GATE_RC" 3 "unreadable or empty head remains unknown over green"
+    assert_not_contains "$GATE_OUTPUT" "SUPERSEDED" "an unread head proves no movement"
+    assert_not_contains "$GATE_OUTPUT" "green —" "an unread head never reports green"
+  done
+}
+
 tests=(
+  test_wait_superseded_head
+  test_wait_unchanged_head_turns_green
+  test_head_reread_unknown
   test_inflight_run_is_not_absent
   test_queued_run_is_not_absent
   test_fresh_push_without_a_run_waits

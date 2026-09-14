@@ -14,6 +14,7 @@ test_tmpdir TEST_ROOT merge-test
 OUT_FILE="$TEST_ROOT/out"
 CALLS_FILE="$TEST_ROOT/calls"
 
+CURRENT_HEAD=head-sha
 SKIPS_ONLY=""                          # the head's checks all skipped/neutral
 MERGE_STATE="merged=true state=MERGED" # what REST says after the merge call
 MERGE_QUEUE=""                         # nonempty = the base has a merge queue
@@ -37,6 +38,7 @@ gh() {
   case "${1:-} ${2:-}" in
   "api repos/$REPO/pulls/7")
     case "$*" in
+    *'select(type'*) echo "$CURRENT_HEAD" ;;
     *'.head.sha'*) printf 'head-sha\t2026-09-01T00:00:00Z\n' ;;
     *'.base.ref'*) echo main ;;
     *merged=*) echo "$MERGE_STATE" ;;
@@ -73,6 +75,7 @@ assert_no_merge_call() {
 }
 
 reset() {
+  CURRENT_HEAD=head-sha
   SKIPS_ONLY=""
   MERGE_STATE="merged=true state=MERGED"
   MERGE_QUEUE=""
@@ -155,7 +158,17 @@ test_require_green_refuses_a_merge_queue() {
   assert_eq "$calls" "CALL api graph,CALL api graph,CALL pr merge ," "both reads precede the merge call"
 }
 
+test_superseded_head_never_merges() {
+  reset
+  CURRENT_HEAD=successor-sha
+  run_merge --wait=30 --allow-no-verdict --override 'unrelated red on base'
+  assert_eq "$MERGE_RC" 5 "superseded refuses even both verdict overrides"
+  assert_contains "$MERGE_OUTPUT" "SUPERSEDED" "refusal names the transition"
+  assert_no_merge_call
+}
+
 tests=(
+  test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
   test_forwarded_head_binding_is_refused
   test_require_green_refuses_green_by_skips_only
