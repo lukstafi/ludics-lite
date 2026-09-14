@@ -11,6 +11,8 @@ source "$SCRIPT_DIR/test-pr-review-lib.sh"
 REPO=example/repo
 REVIEWS_JSON='[]'
 COMMENTS_JSON='[]'
+INLINE_JSON='[]'
+FAIL_INLINE=""
 FAIL_READ=""
 
 # Minimal gh fixture transport: the reviews feed is the only endpoint the counter reads. It is
@@ -27,6 +29,9 @@ gh() {
     response="$REVIEWS_JSON"
     ;;
   "repos/$REPO/issues/7/comments?per_page=100") response="$COMMENTS_JSON" ;;
+  "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100")
+    [ -z "$FAIL_INLINE" ] || return 1
+    response="$INLINE_JSON" ;;
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
   gh_fixture_answer "$response"
@@ -34,7 +39,7 @@ gh() {
 
 review() { # <login> <state> <commit> <submitted_at|null>
   jq -cn --arg u "$1" --arg s "$2" --arg c "$3" --arg t "$4" \
-    '{user:{login:$u}, state:$s, commit_id:$c,
+    '{user:{login:$u}, state:$s, commit_id:$c, body:"findings",
       submitted_at:(if $t == "null" then null else $t end)}'
 }
 
@@ -302,7 +307,24 @@ test_api_failure_is_unknown() {
   assert_not_contains "$ROUNDS_OUTPUT" "rounds with findings: 0" "must not print a zero count"
 }
 
+test_empty_reviews_need_their_own_findings() {
+  set_reviews "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z | jq '. + {id:88,body:" \n\t"}')"
+  INLINE_JSON='[]'
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 0" "empty envelope is no round"
+  assert_contains "$ROUNDS_OUTPUT" "over 0 head(s)" "empty envelope contributes no head"
+  INLINE_JSON='[{id:1,body:"a real finding",pull_request_review_id:88}]'
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1" "own inline finding counts"
+  FAIL_INLINE=1
+  run_rounds
+  assert_eq "$ROUNDS_RC" 3 "unread inline feed is unknown"
+  FAIL_INLINE=""
+  INLINE_JSON='[]'
+}
+
 tests=(
+  test_empty_reviews_need_their_own_findings
   test_counts_distinct_heads_with_findings
   test_rerequested_round_on_same_head_counts
   test_rounds_are_ordered_by_submission_and_chained

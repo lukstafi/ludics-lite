@@ -470,6 +470,12 @@ because no feed records a reaction-only success reliably enough for the script t
 the two you are due. The failed attempt is not a round, so it does not count against the
 convergence threshold.
 
+An empty `COMMENTED` review counts as no completed review unless its own inline-comments
+endpoint contains findings. This also excludes it from the convergence count; comments on another
+review cannot make it substantive, and an unread endpoint yields `unknown`. Existing reactions,
+verdicts and genuine findings still decide status; otherwise the ordinary `expected`/grace path
+applies. This structural check does not classify plain, unstamped setup messages by their prose.
+
 Every one of those lines also says **`CONFLICTS with the base (mergeable_state=dirty)`** when
 GitHub cannot build the PR's merge commit, and on `idle` that replaces "the next move is yours".
 It is not a seventh state — the reviewer keeps reviewing a conflicted PR — but it changes what a
