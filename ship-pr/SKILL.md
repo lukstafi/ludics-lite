@@ -449,7 +449,7 @@ head SHA, and answers with one of seven:
 
 | state | means | what to do |
 | --- | --- | --- |
-| `approved` | 👍 is on the PR | merge |
+| `approved` | 👍 is on the PR, with no newer current-head running review or findings | merge |
 | `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
 | `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
 | `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) |

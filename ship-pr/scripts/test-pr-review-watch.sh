@@ -1109,7 +1109,60 @@ test_a_new_request_during_fixed_grace_remains_pending() (
   done
 )
 
+# The actual summary row uses fractional UTC seconds and a short commit stamp.
+activity_summary() { # <sha> <status> <time>
+  summary_comment 700 "$3" "<!-- codex-pull-request-review-summary -->
+| Review | Status | Commit | Review trigger |
+| 📝 **Code Review** | 🔄 **$2** <relative-time datetime=\"${3%Z}.484070Z\">$3</relative-time> | \`$1\` | New commits |"
+}
+
+test_current_head_running_blocks_older_approval_until_completion() {
+  reset_fixture
+  local started earlier
+  started=$(jq -rn 'now - 2 | todate')
+  earlier=$(jq -rn 'now - 60 | todate')
+  schedule reactions 1 "[$(reaction +1 "$earlier")]"
+  schedule comments 1 "[$(activity_summary "${H2:0:7}" Running "$started")]"
+  schedule comments 2 "[$(activity_summary "${H2:0:7}" Completed "$started")]"
+  run_watch 0,0,0 1 2
+  assert_eq "$WATCH_RC" 0 "completion removes the known contradiction to the standing approval"
+  assert_contains "$WATCH_OUT" 'approved (👍' "the reaction still supplies the approval"
+  [ "$(poll_rounds)" -ge 2 ] || bail "older approval ended watch while current-head review was Running"
+
+  # A completed review with findings contradicts the old reaction too.
+  reset_fixture
+  echo 1 >"$FEEDS/round"
+  schedule reactions 1 "[$(reaction +1 "$earlier")]"
+  schedule comments 1 "[$(activity_summary "${H2:0:7}" Completed "$started")]"
+  schedule reviews 1 "[$(review 500 "$H2" "$started")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "current-head findings supersede the earlier thumbs-up"
+
+  # A newer stamped no-findings verdict beats an outlived Running placeholder.
+  schedule reviews 1 '[]'
+  schedule comments 1 "[$(activity_summary "${H2:0:7}" Running "$earlier"),$(summary_comment 701 "$started" "Didn't find any major issues. **Reviewed commit:** \`$H2\`")]"
+  schedule reactions 1 "[$(reaction +1 2026-01-01T00:00:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "newer current-head no-findings verdict settles the review"
+
+  # Controls: neither another head nor a completed row contradicts this reaction.
+  reset_fixture
+  echo 1 >"$FEEDS/round"
+  schedule reactions 1 "[$(reaction +1 "$earlier")]"
+  schedule comments 1 "[$(activity_summary "${H1:0:7}" Running "$started")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "another head's activity cannot block this approval"
+  schedule comments 1 "[$(activity_summary "${H2:0:7}" Completed "$started")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "completed activity preserves reaction-only approval"
+  schedule comments 1 "[$(activity_summary "${H2:0:7}" Running "$earlier")]"
+  schedule reactions 1 "[$(reaction +1 "$started")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "a newer approval supersedes a lingering Running row"
+}
+
 tests=(
+  test_current_head_running_blocks_older_approval_until_completion
   test_a_new_request_during_fixed_grace_remains_pending
   test_a_second_nudge_at_settle_remains_pending
   test_an_actionable_result_with_unknown_status_keeps_pending_comments
