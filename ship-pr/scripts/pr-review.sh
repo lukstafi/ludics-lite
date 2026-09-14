@@ -1009,7 +1009,7 @@ review_after_nudge() { # <event timestamp> <eligible nudge timestamp, or empty>
 
 status_state() {
   local pr="$1" raw line age plus plus_at eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
-  local vline verd_at verd_sha mstate="-" head_err="" pr_created=""
+  local running_at evidence evidence_kind evidence_at vline verd_at verd_sha mstate="-" head_err="" pr_created=""
   local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at="" nudge_age nudge_id="" nudge_line comments_loaded=false
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
@@ -1050,11 +1050,64 @@ status_state() {
     case "$nudge_age" in '' | *[!0-9]*) nudge_at="" ;; esac
   fi
 
-  # 👍 is the merge gate and the reactions feed alone answers it, so it is answered before any feed
-  # that could fail: an outage on the reviews feed must not hide an approval behind "unknown".
-  # The PR read here is for the mergeability alone, and cannot change the verdict.
+  # Reactions have no commit stamp. Preserve reaction-only approvals, including when
+  # supplemental reads fail, but do not accept an older 👍 over a known current-head
+  # Code Review Running row (#146). Read comments before the head, as below.
+  # Completion removes the contradiction; it is not itself a no-findings verdict.
   [ "$plus" = true ] && review_after_nudge "$plus_at" "$nudge_at" && {
+    if [ "$comments_loaded" != true ]; then
+      comments_raw=$(api_list "issues/$pr/comments?per_page=100") || comments_raw='[]'
+    fi
+    reviews_raw=$(api_list "pulls/$pr/reviews?per_page=100") || reviews_raw='[]'
     pr_head_read "$pr"
+    evidence=$(jq -rs --arg rev "$REVIEWER" --arg head "$head_sha" --arg rc "$REVIEWED_COMMIT_RE" '
+      .[0] as $comments | .[1] as $reviews |
+      def reviewer: select((.user.login // "") | startswith($rev));
+      def current: select(.sha != "" and $head != "")
+        | select(.sha as $sha | $head | startswith($sha));
+      [($comments[] | reviewer
+         | select((.body // "") | contains("codex-pull-request-review-summary"))
+         | (.body // "") | split("\n")[]
+         | select(test("^\\|[^|]*Code Review[^|]*\\|[^|]*Running"))
+         | capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")
+         | . + {kind:"running"}),
+       ($reviews[] | reviewer | select(.submitted_at != null)
+         | {sha:(.commit_id // ""), at:.submitted_at, kind:"findings"}),
+       ($comments[] | reviewer
+         | {sha: ([(.body // "") | capture($rc; "g").s] | last // ""),
+            at:(.updated_at // .created_at),
+            kind:(if (.body // "") | test("[Dd]idn.t find any major issues")
+                  then "verdict" else "findings" end)})]
+      | map(current | .at |= sub("\\.[0-9]+Z$"; "Z"))
+      | max_by(.at) | if . == null then "|" else "\(.kind)|\(.at)" end' <<<"$comments_raw"$'\n'"$reviews_raw") || {
+      echo "unknown|-|$mstate|the current-head review evidence did not parse"
+      return 0
+    }
+    evidence_kind="${evidence%%|*}"
+    evidence_at="${evidence#*|}"
+    if [ -n "$evidence_at" ] && [[ "$evidence_at" > "$plus_at" ]]; then
+      case "$evidence_kind" in
+      running)
+        running_at="$evidence_at"
+        age=$(age_of "$running_at")
+        case "$age" in
+        '' | *[!0-9]*) ;;
+        *)
+          if [ "$age" -ge "$STALL" ]; then
+            echo "stalled|$age|$mstate|$REVIEWER Code Review Running for head ${head_sha:0:7} at $running_at"
+            return 0
+          fi
+          ;;
+        esac
+        echo "reviewing|$age|$mstate|$REVIEWER Code Review Running for head ${head_sha:0:7} at $running_at"
+        return 0
+        ;;
+      findings)
+        echo "idle|$(age_of "$evidence_at")|$mstate|$REVIEWER posted findings for head ${head_sha:0:7} at $evidence_at"
+        return 0
+        ;;
+      esac
+    fi
     echo "approved|-|$mstate|👍 from $REVIEWER"
     return 0
   }
