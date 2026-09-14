@@ -504,21 +504,30 @@ cmd_preflight() {
 
 # ---------------------------------------------------------------------------------------------
 # Read on the coordinator, where gh is authenticated, never on the worker box.
-# Keep complete diagnostics and exits. A named triage may override RED, never unknown.
+# Keep complete helper diagnostics; CI refusals use fleet exit 1, never transport 4.
+# A named triage may override RED, never unknown.
+base_checker() (
+  # Gate policy and bounds are not inherited from an unrelated ship-pr operation.
+  # Keep connection/auth, state paths and review-only settings; they do not decide base CI.
+  unset SHIP_PR_ADVISORY_CHECKS SHIP_PR_TEST_SOURCE_ONLY SHIP_PR_CHECKS_INTERVAL
+  unset SHIP_PR_CHECKS_WAIT SHIP_PR_CHECKS_HEARTBEAT SHIP_PR_API_ATTEMPTS SHIP_PR_API_BACKOFF
+  SHIP_PR_BASE_ABSENT_GRACE=300 "$@"
+)
+
 base_gate() {
   local target="$1" branch="$2" force="$3" reason="$4" expected="${5:-}" helper rc tip encoded
   [[ "$target" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "base gate: --target-repo <owner/repo> required"
   [ -z "$reason" ] || [ "$force" -eq 1 ] || die "base gate: --allow-red-base requires --force for a triage worker"
   case "$branch" in -*|*$'\n'*) die "base gate: invalid --base-branch" ;; esac
   helper="$(cd "$(dirname "$0")/../../ship-pr/scripts" 2>/dev/null && pwd)/pr-review.sh"
-  [ -x "$helper" ] || { echo "BASE REFUSED: coordinator base checker missing: $helper" >&2; return 3; }
+  [ -x "$helper" ] || { echo "BASE REFUSED: coordinator base checker missing: $helper" >&2; return 1; }
   # The ordinary base read may carry an older green while the tip is running.
   # Reuse its bounded integration mode; preserve the established absence grace
   # for path-filtered tips, independent of the coordinator's ambient settings.
   if [ -n "$branch" ]; then
-    SHIP_PR_BASE_ABSENT_GRACE=300 "$helper" --repo "$target" base "$branch" --wait=301 >&2
+    base_checker "$helper" --repo "$target" base "$branch" --wait=301 >&2
   else
-    SHIP_PR_BASE_ABSENT_GRACE=300 "$helper" --repo "$target" base --wait=301 >&2
+    base_checker "$helper" --repo "$target" base --wait=301 >&2
   fi
   rc=$?
   if [ "$rc" -eq 1 ] && [ "$force" -eq 1 ] && [ -n "$reason" ]; then
@@ -526,16 +535,16 @@ base_gate() {
     rc=0
   fi
   [ "$rc" -eq 0 ] || echo "BASE REFUSED: $target ${branch:-default branch} (base checker exit $rc); dispatch blocked" >&2
-  [ "$rc" -eq 0 ] || return "$rc"
+  [ "$rc" -eq 0 ] || return 1
   if [ -n "$expected" ]; then
-    encoded=$(jq -rn --arg ref "$branch" '$ref | @uri') || return 3
-    tip=$("$helper" --repo "$target" retry --read api "repos/$target/commits/$encoded" --jq .sha) || {
-      echo "BASE REFUSED: cannot confirm $target $branch after verdict" >&2; return 3;
+    encoded=$(jq -rn --arg ref "$branch" '$ref | @uri') || return 1
+    tip=$(base_checker "$helper" --repo "$target" retry --read api "repos/$target/commits/$encoded" --jq .sha) || {
+      echo "BASE REFUSED: cannot confirm $target $branch after verdict" >&2; return 1;
     }
-    [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || { echo "BASE REFUSED: invalid target tip" >&2; return 3; }
+    [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || { echo "BASE REFUSED: invalid target tip" >&2; return 1; }
     [ "$tip" = "$expected" ] || {
       echo "BASE REFUSED: $target $branch moved or differs from fetched base $expected (now $tip); dispatch blocked" >&2
-      return 4
+      return 1
     }
   fi
   return 0

@@ -142,6 +142,9 @@ fi
 # Fail if the dispatch contract drifts; ambient REPO must not select this read.
 [ "$1" = --repo ] && [ "$2" = example/project ] && [ "$3" = base ] || exit 2
 [ "${SHIP_PR_BASE_ABSENT_GRACE:-}" = 300 ] || exit 3
+for knob in SHIP_PR_ADVISORY_CHECKS SHIP_PR_TEST_SOURCE_ONLY SHIP_PR_CHECKS_INTERVAL SHIP_PR_CHECKS_WAIT SHIP_PR_CHECKS_HEARTBEAT SHIP_PR_API_ATTEMPTS SHIP_PR_API_BACKOFF; do
+  [ -z "${!knob}" ] || exit 3
+done
 case " $* " in *" --wait=301 "*) ;; *) exit 4 ;; esac
 if [ -n "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] && [ ! -e "$SHIM_BASE_REQUIRE_PREFLIGHT" ]; then
   echo 'base read occurred before preflight'; exit 3
@@ -417,21 +420,21 @@ need_worker() {
 section "base gate" && {
 need_lease
 for verdict in 1 3 4; do
-  expect "native gate blocks base exit $verdict with diagnostics" "$verdict" "job broken; first red commit deadbee" -- \
+  expect "native gate blocks base exit $verdict with diagnostics" 1 "job broken; first red commit deadbee" -- \
     env SHIM_BASE_RC="$verdict" SHIM_BASE_MESSAGE="job broken; first red commit deadbee" "$FW" gate --target-repo example/project --base-branch topic
-  expect "CLI blocks base exit $verdict before creating worker" "$verdict" "dispatch blocked" -- \
+  expect "CLI blocks base exit $verdict before creating worker" 1 "dispatch blocked" -- \
     env SHIM_BASE_RC="$verdict" "$FW" launch testbox base-red --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/base-red
   [ ! -e "$ISSUE_WAVE_STATE/workers/base-red" ] && [ ! -e "$proj-worktrees/base-red" ] && ok "refusal left no worker or checkout" || ko "base refusal wrote worker state"
 done
-expect "native green pins target and wait despite ambient settings" 0 "BASE GREEN" -- env REPO=wrong/repo SHIP_PR_BASE_ABSENT_GRACE=0 "$FW" gate --target-repo example/project --base-branch topic
+expect "native green pins target and wait despite ambient settings" 0 "BASE GREEN" -- env REPO=wrong/repo SHIP_PR_BASE_ABSENT_GRACE=0 SHIP_PR_ADVISORY_CHECKS=.* SHIP_PR_TEST_SOURCE_ONLY=1 SHIP_PR_CHECKS_INTERVAL=0 SHIP_PR_CHECKS_WAIT=0 SHIP_PR_CHECKS_HEARTBEAT=0 SHIP_PR_API_ATTEMPTS=0 SHIP_PR_API_BACKOFF=0 "$FW" gate --target-repo example/project --base-branch topic
 expect "missing repository refuses" 2 "--target-repo" -- "$FW" gate
 expect "triage force cannot bypass red base" 1 "dispatch blocked" -- env SHIM_BASE_RC=1 "$FW" gate --target-repo example/project --force
 expect "explicit red triage override passes with reason" 0 "BASE TRIAGE OVERRIDE: example/project default branch: fix broken job" -- env SHIM_BASE_RC=1 "$FW" gate --target-repo example/project --force --allow-red-base 'fix broken job'
 expect "override needs force" 2 "requires --force" -- "$FW" gate --target-repo example/project --allow-red-base fix
 for verdict in 3 4; do
-  expect "triage cannot override unknown $verdict" "$verdict" "dispatch blocked" -- env SHIM_BASE_RC="$verdict" "$FW" gate --target-repo example/project --force --allow-red-base fix
+  expect "triage cannot override unknown $verdict" 1 "dispatch blocked" -- env SHIM_BASE_RC="$verdict" "$FW" gate --target-repo example/project --force --allow-red-base fix
 done
-expect "missing helper is unknown" 3 "checker missing" -- env SHIM_BASE_RC=0 bash -c 'mv "$1" "$1.saved"; "$2" gate --target-repo example/project; rc=$?; mv "$1.saved" "$1"; exit "$rc"' _ "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" "$FW"
+expect "missing helper refuses with unknown diagnostic" 1 "checker missing" -- env SHIM_BASE_RC=0 bash -c 'mv "$1" "$1.saved"; "$2" gate --target-repo example/project; rc=$?; mv "$1.saved" "$1"; exit "$rc"' _ "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" "$FW"
 grep -Fxq -- '--repo example/project base topic --wait=301 grace=300' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
 grep -Fxq -- '--repo example/project base master --wait=301 grace=300' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
 original_base=$(git -C "$proj" rev-parse origin/master)
@@ -440,9 +443,9 @@ expect "new worktree uses confirmed SHA despite later ref movement" 0 "LAUNCHED 
 "$FW" attach testbox pinned-base --interval 1 >/dev/null
 [ "$(git -C "$proj-worktrees/pinned-base" rev-parse HEAD)" = "$original_base" ] && ok "worktree starts from pinned SHA" || ko "worktree followed moving ref"
 git -C "$proj" update-ref refs/remotes/origin/master "$original_base"
-expect "target movement refuses new worktree" 4 "differs from fetched base" -- env SHIM_BASE_TIP=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$FW" launch testbox moved-base --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/moved-base
+expect "target movement refuses new worktree" 1 "differs from fetched base" -- env SHIM_BASE_TIP=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$FW" launch testbox moved-base --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/moved-base
 [ ! -e "$proj-worktrees/moved-base" ] && ok "moved base created no worktree" || ko "moved base created worktree"
-expect "unreadable target confirmation blocks" 3 "cannot confirm" -- env SHIM_BASE_TIP_FAIL=1 "$FW" launch testbox unread-base --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/unread-base
+expect "unreadable target confirmation blocks" 1 "cannot confirm" -- env SHIM_BASE_TIP_FAIL=1 "$FW" launch testbox unread-base --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/unread-base
 expect "base read follows freshness preflight" 1 "dispatch blocked" -- env SHIM_BASE_REQUIRE_PREFLIGHT="$TMP/preflight-ran" SHIM_BASE_RC=1 "$FW" launch testbox base-order --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 "$FW" release >/dev/null
 }

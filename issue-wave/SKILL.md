@@ -223,8 +223,12 @@ fleet-worker.sh attach <box> <repo>-<issue>     # Bash run_in_background: the wa
 Both CLI `launch` and native `gate` require `--target-repo owner/repo` (the GitHub
 repository, distinct from the far-side `--repo` checkout path). They run the sibling
 `ship-pr/scripts/pr-review.sh base` on the coordinator with its local `gh` authentication,
-printing its complete verdict, failing job and first-red-commit diagnostics. Nonzero blocks
-dispatch: unknown, no verdict and a missing checker never mean green. For a new worktree,
+printing its complete verdict, failing job and first-red-commit diagnostics. CI refusal uses fleet exit 1 (the diagnostic retains the helper’s original exit);
+fleet exit 4 remains a worker-box transport failure. Unknown, no verdict and a missing
+checker never mean green. The helper uses its default advisory policy, clearing the
+coordinator’s repository-specific `SHIP_PR_ADVISORY_CHECKS` override. Source-only test
+mode and API/check polling overrides are also cleared; the helper’s defaults supply
+those bounds. Connection/authentication and state paths remain the coordinator’s. For a new worktree,
 `origin/<branch>` supplies the checked branch; other base refs require `--base-branch`.
 For `--cwd` and native dispatch the repository default branch is checked unless
 `--base-branch` names the intended base. The coordinator must name the repository/base
