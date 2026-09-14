@@ -228,7 +228,11 @@ dispatch: unknown, no verdict and a missing checker never mean green. For a new 
 `origin/<branch>` supplies the checked branch; other base refs require `--base-branch`.
 For `--cwd` and native dispatch the repository default branch is checked unless
 `--base-branch` names the intended base. The coordinator must name the repository/base
-matching the worker's brief and checkout. The read runs after worker-box freshness preflight and uses the existing checker's
+matching the worker's brief and checkout. New worktrees fetch and resolve their base to an immutable SHA before the verdict,
+confirm that SHA still matches the target CI branch after the verdict, and create from
+that SHA. A mismatch or unreadable confirmation blocks dispatch; retry explicitly after
+reconciling the branch. Existing worktrees and native dispatch keep the coordinator’s
+responsibility for the recorded startup SHA. The read runs after worker-box freshness preflight and uses the existing checker's
 `--wait=301` mode with its absence grace pinned to 300 seconds: a covered green exits
 immediately, a pending base blocks at the ceiling, and a path-filtered tip may use the
 older verdict after the grace. This is a bounded pre-dispatch check, not another observer.

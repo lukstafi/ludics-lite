@@ -129,6 +129,16 @@ export BASE_CALL_LOG="$TMP/base-calls"
 cat > "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$* grace=${SHIP_PR_BASE_ABSENT_GRACE:-unset}" >> "$BASE_CALL_LOG"
+if [ "$3" = retry ]; then
+  [ -z "${SHIM_BASE_TIP_FAIL:-}" ] || exit 3
+  ref="${6##*/}"
+  tip=$(git -C "$BASE_PROJECT" rev-parse "origin/$ref") || exit 3
+  if [ -n "${SHIM_MOVE_REF_AFTER_CONFIRM:-}" ]; then
+    git -C "$BASE_PROJECT" update-ref "refs/remotes/origin/$ref" "$SHIM_MOVE_REF_AFTER_CONFIRM" || exit 3
+  fi
+  echo "${SHIM_BASE_TIP:-$tip}"
+  exit 0
+fi
 # Fail if the dispatch contract drifts; ambient REPO must not select this read.
 [ "$1" = --repo ] && [ "$2" = example/project ] && [ "$3" = base ] || exit 2
 [ "${SHIP_PR_BASE_ABSENT_GRACE:-}" = 300 ] || exit 3
@@ -384,6 +394,7 @@ export FLEET_SKILLS_REPO="$repo"
 # on its own still finds them; the two helpers below take what only some sections need.
 proj="$TMP/pro j"; git init -q -b master "$proj" && echo a > "$proj/a" && git -C "$proj" add a && git -C "$proj" commit -q -m a
 git init -q --bare "$TMP/proj.git" && git -C "$proj" remote add origin "$TMP/proj.git" && git -C "$proj" push -q -u origin master
+export BASE_PROJECT="$proj"
 brief="$TMP/brief.md"; printf 'Fix issue #1: handle `$(rm -rf /)` and `backticks` in prose\n' > "$brief"
 # The unstick message: the unstick, codex and usage sections all pass it to `unstick --message`.
 printf 'Stop and answer now.\n' > "$TMP/msg.md"
@@ -423,6 +434,15 @@ done
 expect "missing helper is unknown" 3 "checker missing" -- env SHIM_BASE_RC=0 bash -c 'mv "$1" "$1.saved"; "$2" gate --target-repo example/project; rc=$?; mv "$1.saved" "$1"; exit "$rc"' _ "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" "$FW"
 grep -Fxq -- '--repo example/project base topic --wait=301 grace=300' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
 grep -Fxq -- '--repo example/project base master --wait=301 grace=300' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
+original_base=$(git -C "$proj" rev-parse origin/master)
+later_base=$(git -C "$proj" commit-tree 'HEAD^{tree}' -p HEAD -m later)
+expect "new worktree uses confirmed SHA despite later ref movement" 0 "LAUNCHED testbox/pinned-base" -- env SHIM_MOVE_REF_AFTER_CONFIRM="$later_base" "$FW" launch testbox pinned-base --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/pinned-base
+"$FW" attach testbox pinned-base --interval 1 >/dev/null
+[ "$(git -C "$proj-worktrees/pinned-base" rev-parse HEAD)" = "$original_base" ] && ok "worktree starts from pinned SHA" || ko "worktree followed moving ref"
+git -C "$proj" update-ref refs/remotes/origin/master "$original_base"
+expect "target movement refuses new worktree" 4 "differs from fetched base" -- env SHIM_BASE_TIP=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$FW" launch testbox moved-base --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/moved-base
+[ ! -e "$proj-worktrees/moved-base" ] && ok "moved base created no worktree" || ko "moved base created worktree"
+expect "unreadable target confirmation blocks" 3 "cannot confirm" -- env SHIM_BASE_TIP_FAIL=1 "$FW" launch testbox unread-base --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/unread-base
 expect "base read follows freshness preflight" 1 "dispatch blocked" -- env SHIM_BASE_REQUIRE_PREFLIGHT="$TMP/preflight-ran" SHIM_BASE_RC=1 "$FW" launch testbox base-order --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 "$FW" release >/dev/null
 }

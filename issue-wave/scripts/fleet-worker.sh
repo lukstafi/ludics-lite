@@ -506,7 +506,7 @@ cmd_preflight() {
 # Read on the coordinator, where gh is authenticated, never on the worker box.
 # Keep complete diagnostics and exits. A named triage may override RED, never unknown.
 base_gate() {
-  local target="$1" branch="$2" force="$3" reason="$4" helper rc
+  local target="$1" branch="$2" force="$3" reason="$4" expected="${5:-}" helper rc tip encoded
   [[ "$target" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "base gate: --target-repo <owner/repo> required"
   [ -z "$reason" ] || [ "$force" -eq 1 ] || die "base gate: --allow-red-base requires --force for a triage worker"
   case "$branch" in -*|*$'\n'*) die "base gate: invalid --base-branch" ;; esac
@@ -523,10 +523,22 @@ base_gate() {
   rc=$?
   if [ "$rc" -eq 1 ] && [ "$force" -eq 1 ] && [ -n "$reason" ]; then
     echo "BASE TRIAGE OVERRIDE: $target ${branch:-default branch}: $reason" >&2
-    return 0
+    rc=0
   fi
   [ "$rc" -eq 0 ] || echo "BASE REFUSED: $target ${branch:-default branch} (base checker exit $rc); dispatch blocked" >&2
-  return "$rc"
+  [ "$rc" -eq 0 ] || return "$rc"
+  if [ -n "$expected" ]; then
+    encoded=$(jq -rn --arg ref "$branch" '$ref | @uri') || return 3
+    tip=$("$helper" --repo "$target" retry --read api "repos/$target/commits/$encoded" --jq .sha) || {
+      echo "BASE REFUSED: cannot confirm $target $branch after verdict" >&2; return 3;
+    }
+    [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || { echo "BASE REFUSED: invalid target tip" >&2; return 3; }
+    [ "$tip" = "$expected" ] || {
+      echo "BASE REFUSED: $target $branch moved or differs from fetched base $expected (now $tip); dispatch blocked" >&2
+      return 4
+    }
+  fi
+  return 0
 }
 
 cmd_gate() {
@@ -600,7 +612,24 @@ cmd_launch() {
   # cross-box leg: a sibling that did not answer. Said on stderr, so the LAUNCHED line stays
   # the one thing on stdout.
   case "$pf" in *"cross-box unreachable"*) echo "preflight note for $box/$name: ${pf#*skills=* }" >&2 ;; esac
-  base_gate "$target" "$base_branch" "$force" "$reason" || exit $?
+  local pinned=""
+  if [ -z "$cwd" ]; then
+    # Fetch before reading CI and carry an immutable object into worktree add.
+    pinned=$( { prelude "$box"; cat <<'EOF'
+repo=$(expand_tilde "$1"); base="$2"; fetch_timeout="$3"
+bounded "$fetch_timeout" git -C "$repo" fetch -q origin >/dev/null; frc=$?
+[ "$frc" -ne 124 ] || { echo "LAUNCH REFUSED: git fetch in $repo timed out after ${fetch_timeout}s" >&2; exit 1; }
+[ "$frc" -eq 0 ] || { echo "LAUNCH REFUSED: fetch failed in $repo" >&2; exit 1; }
+git -C "$repo" rev-parse --verify "$base^{commit}"
+EOF
+    } | run_on "$box" "$repo" "$base" "${FLEET_FETCH_TIMEOUT:-300}" )
+    prc=$?
+    if unreachable "$prc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
+    [ "$prc" -eq 0 ] || exit "$prc"
+    [[ "$pinned" =~ ^[0-9a-f]{40}$ ]] || die "launch: could not resolve base commit"
+  fi
+  base_gate "$target" "$base_branch" "$force" "$reason" "$pinned" || exit $?
+  [ -z "$pinned" ] || base="$pinned"
   # The preflight and base read may take minutes; a halt or adoption during that window
   # must still fence this launch, so the gate is read again right before anything is written.
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
@@ -659,11 +688,7 @@ if [ -z "$cwd" ]; then
   repo=$(expand_tilde "$repo")
   cwd="$repo-worktrees/$name"
   if [ ! -d "$cwd" ]; then
-    # Bounded: a stalling origin must not hold the worker lock (or, below, an archived record)
-    # indefinitely.
-    bounded "$fetch_timeout" git -C "$repo" fetch -q origin >/dev/null; frc=$?
-    [ "$frc" -ne 124 ] || refuse "git fetch in $repo timed out after ${fetch_timeout}s"
-    [ "$frc" -eq 0 ] || refuse "fetch failed in $repo"
+    # base is the immutable SHA fetched and confirmed before admission.
     git -C "$repo" worktree add -q "$cwd" -b "$branch" "$base" 2>&1 || refuse "worktree add failed"
   else
     # An existing directory is reused only when it is the worktree the caller described.
