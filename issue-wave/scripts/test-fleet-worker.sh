@@ -956,7 +956,7 @@ expect "a red run concludes as fail, with the given evidence" 0 '"evidence": "sw
 grep -q '"verdict": "fail"' <<<"$out" && ok "...as fail" || ko "exit 1 did not read as fail: $out"
 expect "conclude --from-run on an unknown request is refused before any box is read" 1 "unknown request_id run-zz" -- "${FWX[@]}" execution conclude --from-run "$run1" --request run-zz --sha "$ran"
 # A checkout that moved on after the run still concludes on the reported revision, and says so.
-echo b > "$wt/b" && git -C "$wt" add b && git -C "$wt" commit -q -m b
+git -C "$wt" commit -q --allow-empty -m moved   # a guaranteed new head, whatever the clone holds
 expect "a moved checkout concludes on the reported revision and records the drift" 0 "checkout head is now $(git -C "$wt" rev-parse HEAD), revision $ran as reported" -- run_conclude run-d "$runs/20260915T201414Z-5"
 grep -Fq "\"observed_sha\": \"$ran\"" <<<"$out" && ok "...with the reported revision as observed_sha" || ko "wrong observed_sha: $out"
 jq -n '{request_id:"run-other", verdict:"not-launched", log:"/dev/null", evidence:"fixture never invoked a runner on other"}' > "$TMP/run-other-done.json"
