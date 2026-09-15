@@ -1,7 +1,7 @@
 # Separate Codex conversations (explicit alternative)
 
 Use this path only when the user explicitly chooses separate app conversations. A normal
-Codex wave uses [within-session workers](native-codex.md). The request for a supervised wave
+Codex wave uses [within-session workers](native-workers.md). The request for a supervised wave
 alone is not a request to create independent user-visible tasks. Tool names below refer to the Codex app
 capabilities (`mcp__codex_app__*` in the current harness); discover them when deferred and read
 their current schemas. The app creates ordinary user-level tasks, each with a dedicated Git

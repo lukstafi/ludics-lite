@@ -242,9 +242,17 @@ with tempfile.TemporaryDirectory(prefix='fleet-slots-') as temporary:
     assert '<box>=<positive n>' in out, out
     out = change('reserve', request('spec-bad', 'minix'), expected=1, FLEET_BOX_CORRECTNESS_SLOTS='other=2')
     assert 'not in FLEET_BOXES' in out, out
+    # Evidence naming a box binds to the reserved one, and the binding leaves no field in the record.
+    terminal = dict(request_id='run-1', verdict='pass', evidence='runner terminal record; process stopped',
+                    log='/logs/run-1', observed_sha='b' * 40, remote_checkout='/work/run-1', handle='runner-run-1')
+    out = change('conclude', {**terminal, 'execution_host': 'rog'}, expected=1)
+    assert 'evidence from rog cannot conclude an assignment reserved on mac' in out, out
+    out = change('conclude', {**terminal, 'execution_host': ''}, expected=1)
+    assert records()['run-1']['state'] == 'launching'
     # A concluded correctness run frees its slot.
-    change('conclude', dict(request_id='run-1', verdict='pass', evidence='runner terminal record; process stopped',
-                            log='/logs/run-1', observed_sha='b' * 40, remote_checkout='/work/run-1', handle='runner-run-1'))
+    change('conclude', {**terminal, 'execution_host': 'mac'})
+    assert 'execution_host' not in records()['run-1']['history'][-1]['data']
+    change('conclude', terminal)   # the identical retry, without the binding, is still harmless
     change('run', request('run-4'))
     assert records()['run-4']['state'] == 'launching'
     # Under a halt an ordinary run is refused whole (nothing reserved), the named triage run dispatches.

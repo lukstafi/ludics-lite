@@ -94,14 +94,16 @@ Once runner evidence establishes completion and no process remains, `execution c
 
 When the run went through OCANNL's `tools/test-run.sh` (or any runner leaving `exit`, `log`,
 `wt` and `cmd` under a run directory), `fleet-worker.sh execution conclude --from-run <run-dir>
---request <id> [--box <execution host>] [--sha <sha>] [--evidence <text>]` composes that payload
+--request <id> --sha <sha> [--box <execution host>] [--evidence <text>]` composes that payload
 itself: the verdict from `exit` (0 pass, 142 timeout, a signal code cancelled, anything else
-fail), `log` and the checkout from the record, the handle `test-run:<run>`, and the observed SHA
-from the checkout's head. It refuses a record without a verdict, a run the checkout's own
-`tools/test-run.sh status` does not call finished, and a checkout committed to after the run
-started - the record carries no SHA, so a moved head no longer proves what ran; then `--sha`
-names the revision the worker reported. The run directory is read on `--box` (default
-`local`).
+fail), `log` and the checkout from the record, the handle `test-run:<run>`, and `--sha` as the
+observed SHA - the record carries none, so the revision that ran is the coordinator's to name
+from the worker's result line, and the checkout must at least contain it; a checkout whose head
+has moved on is concluded on the named revision with the drift noted in the evidence. It
+refuses a record without a verdict and a run the checkout's own `tools/test-run.sh status` does
+not call finished. The run directory is read on the reservation's execution host, resolved from
+the registry when `--box` is omitted; the conclusion names the box it read, and the registry
+refuses evidence read on any box but the reserved one.
 
 The actual verdict must be `pass`, `fail`, `timeout` or `cancelled`. A timeout/cancellation needs
 runner evidence that its processes stopped. SHA, checkout and handle may already be in the record;
@@ -127,7 +129,7 @@ round-trips parked three workers idle between review rounds.
 A Claude Code subagent cannot wait for a message mid-turn, so its handoff is turn-shaped: the
 `EXECUTION_REQUEST` block ending a turn, `EXECUTION_ASSIGNED <id>` on resume by agent ID, and one
 `EXECUTION_RESULT {json}` line ending the result turn, which `conclude --from-run` consumes. The
-formats and the coordinator's side are in [native-codex.md](native-codex.md#claude-code-worker-channel).
+formats and the coordinator's side are in [native-claude.md](native-claude.md#worker-channel).
 
 ## CLI reservation handoff
 
@@ -177,7 +179,7 @@ Fixtures: `python3 issue-wave/scripts/test-fleet-execution.py` exercises actual 
 state and concurrent processes without SSH, accounts or hardware. For live validation reserve
 one box, run one existing bounded verification command at a recorded SHA, retain the actual
 handle/log/verdict and conclude. Lack of hardware access remains a validation gate, not evidence
-of success. The bounded two-worker transport smoke is in [native-codex.md](native-codex.md).
+of success. The bounded two-worker transport smoke is in [native-workers.md](native-workers.md).
 
 ## Bounded native Windows verification
 

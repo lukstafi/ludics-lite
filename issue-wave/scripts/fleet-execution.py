@@ -222,9 +222,16 @@ def main():
     else:
         if record is None:
             refuse("unknown request_id")
-        if set(data) - {"request_id", "state", "evidence", "observed_sha", "remote_checkout", "handle", "log", "verdict"}:
+        if set(data) - {"request_id", "state", "evidence", "observed_sha", "remote_checkout", "handle", "log", "verdict", "execution_host"}:
             refuse("unknown evidence fields")
         nonempty(data, ["evidence"])
+        # Evidence read on a named box binds to the box that was reserved: a run record at the
+        # same path on another machine cannot conclude this assignment.
+        if "execution_host" in data:
+            nonempty(data, ["execution_host"])
+            if data["execution_host"] != record["request"]["execution_host"]:
+                refuse(f"evidence from {data['execution_host']} cannot conclude an assignment reserved on {record['request']['execution_host']}")
+            data = {k: v for k, v in data.items() if k != "execution_host"}
         if "verdict" in data and action != "conclude":
             refuse("verdict is only valid for conclude")
         if "state" in data and action not in {"record", "reconcile"}:
