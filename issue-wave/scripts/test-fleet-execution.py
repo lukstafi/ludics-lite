@@ -168,6 +168,105 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     assert records()['current-triage']['state'] == 'launching'
     print('PASS: conflicts, independent boxes, idempotency, adoption, halt, uncertainty and terminal evidence')
 
+# `execution run` (reserve + dispatch under one lock) and per-box correctness slots
+# (ludics-lite#157): measurement stays exclusive, correctness shares up to the box's slots.
+with tempfile.TemporaryDirectory(prefix='fleet-slots-') as temporary:
+    root = Path(temporary)
+    env = {**os.environ, 'FLEET_ANCHOR': 'local', 'FLEET_LOCAL_BOX': 'fixture',
+           'ISSUE_WAVE_STATE': str(root), 'FLEET_ANCHOR_STATE': str(root),
+           'FLEET_COORDINATOR': 'first', 'FLEET_LOCK_WAIT': '10',
+           'FLEET_BOXES': 'mac rog minix', 'FLEET_BOX_CORRECTNESS_SLOTS': 'mac=3 rog=1'}
+
+    def run(*args, expected=0, **extra):
+        result = subprocess.run(['bash', str(SCRIPT), *args], env={**env, **extra},
+                                text=True, capture_output=True, timeout=20)
+        assert result.returncode == expected, (args, result.returncode, result.stdout, result.stderr)
+        return result.stdout + result.stderr
+
+    def change(action, data, expected=0, **extra):
+        with tempfile.NamedTemporaryFile(mode='w', dir=root, suffix='.input') as stream:
+            json.dump(data, stream)
+            stream.flush()
+            return run('execution', action, stream.name, expected=expected, **extra)
+
+    def request(identity, host='mac', kind='correctness'):
+        return dict(request_id=identity, wave='wave', worker=identity, transport='subagent',
+                    issue='repo#157', purpose='fixture', agent_host='mac', execution_host=host,
+                    repository='owner/repo', requested_revision='origin/main', kind=kind)
+
+    def records():
+        return {r['request_id']: r for r in json.loads(run('execution', 'list'))}
+
+    run('claim')
+    # run: one call leaves the record dispatched, with both steps in its history.
+    change('run', {**request('run-1'), 'evidence': 'invoking the runner now'})
+    first = records()['run-1']
+    assert first['state'] == 'launching', first
+    assert [e['action'] for e in first['history']] == ['reserve', 'dispatch'], first['history']
+    assert first['history'][1]['data'] == {'request_id': 'run-1', 'evidence': 'invoking the runner now'}
+    assert first['request'] == request('run-1'), first['request']
+    # A repeated run never repeats a launch, and a changed request is a different assignment.
+    out = change('run', request('run-1'), expected=1)
+    assert 'already dispatched' in out, out
+    out = change('run', {**request('run-1'), 'purpose': 'other'}, expected=1)
+    assert 'different assignment' in out, out
+    assert records()['run-1'] == first
+    out = change('run', {**request('run-bad'), 'evidence': ''}, expected=1)
+    assert 'evidence' in out and 'run-bad' not in records(), out
+    # run on a plain reservation dispatches it; the default dispatch evidence names the step.
+    change('reserve', request('run-2'))
+    change('run', request('run-2'))
+    second = records()['run-2']
+    assert second['state'] == 'launching' and [e['action'] for e in second['history']] == ['reserve', 'dispatch']
+    assert 'execution run' in second['history'][1]['data']['evidence']
+    # Three correctness slots on mac: the third fits, the fourth is refused naming the owners.
+    change('run', request('run-3'))
+    out = change('run', request('run-4'), expected=1)
+    assert 'box owned by' in out and 'correctness slots 3/3 on mac' in out, out
+    assert 'run-4' not in records()
+    # Measurement needs the box to itself, and holds it exclusively once it has it.
+    out = change('reserve', request('measure-mac', kind='measurement'), expected=1)
+    assert 'measurement needs mac to itself' in out, out
+    change('reserve', request('measure-minix', 'minix', kind='measurement'))
+    out = change('reserve', request('check-minix', 'minix'), expected=1)
+    assert 'a measurement holds minix exclusively' in out, out
+    out = change('reserve', request('measure-minix-2', 'minix', kind='measurement'), expected=1)
+    assert 'measurement needs minix to itself' in out, out
+    # rog has one slot: the second correctness request is refused as before.
+    change('reserve', request('check-rog', 'rog'))
+    out = change('reserve', request('check-rog-2', 'rog'), expected=1)
+    assert 'box owned by' in out and 'correctness slots 1/1 on rog' in out, out
+    # An unnamed box has one slot; a malformed spec or one naming a box outside the roster is refused.
+    change('reserve', request('lone-rog', 'rog'), expected=1)
+    out = change('reserve', request('spec-bad', 'minix'), expected=1, FLEET_BOX_CORRECTNESS_SLOTS='mac=x')
+    assert '<box>=<positive n>' in out, out
+    out = change('reserve', request('spec-bad', 'minix'), expected=1, FLEET_BOX_CORRECTNESS_SLOTS='other=2')
+    assert 'not in FLEET_BOXES' in out, out
+    # Evidence naming a box binds to the reserved one, and the binding leaves no field in the record.
+    terminal = dict(request_id='run-1', verdict='pass', evidence='runner terminal record; process stopped',
+                    log='/logs/run-1', observed_sha='b' * 40, remote_checkout='/work/run-1', handle='runner-run-1')
+    out = change('conclude', {**terminal, 'execution_host': 'rog'}, expected=1)
+    assert 'evidence from rog cannot conclude an assignment reserved on mac' in out, out
+    out = change('conclude', {**terminal, 'execution_host': ''}, expected=1)
+    assert records()['run-1']['state'] == 'launching'
+    # A concluded correctness run frees its slot.
+    change('conclude', {**terminal, 'execution_host': 'mac'})
+    assert 'execution_host' not in records()['run-1']['history'][-1]['data']
+    change('conclude', terminal)   # the identical retry, without the binding, is still harmless
+    change('run', request('run-4'))
+    assert records()['run-4']['state'] == 'launching'
+    # Under a halt an ordinary run is refused whole (nothing reserved), the named triage run dispatches.
+    change('conclude', dict(request_id='measure-minix', verdict='not-launched', log='/logs/measure',
+                            evidence='fixture never dispatched'))
+    run('halt', 'regression triage')
+    out = change('run', request('halted-run', 'minix'), expected=1)
+    assert 'fleet halted' in out and 'halted-run' not in records(), out
+    change('run', {**request('triage-run', 'minix'), 'triage_reason': 'named regression verification'})
+    triage = records()['triage-run']
+    assert triage['state'] == 'launching' and triage['halt_identity'], triage
+    run('resume-launches')
+    print('PASS: execution run, correctness slots, exclusive measurement, halt')
+
 # Exercise real fsync calls and their publication order, including first directory creation.
 import runpy
 import stat

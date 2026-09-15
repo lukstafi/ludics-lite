@@ -37,6 +37,7 @@ SECTIONS=(
   "unstick"
   "codex workers"
   "halt"
+  "execution run and conclude --from-run"
   "usage"
 )
 
@@ -124,6 +125,7 @@ trap cleanup EXIT
 # production bypass knob. The production helper's own suites pin its red diagnostics.
 mkdir -p "$TMP/dispatcher/issue-wave/scripts" "$TMP/dispatcher/ship-pr/scripts"
 cp "$FW" "$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
+cp "$HERE/fleet-execution.py" "$TMP/dispatcher/issue-wave/scripts/fleet-execution.py"
 FW="$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
 export BASE_CALL_LOG="$TMP/base-calls"
 cat > "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" <<'EOF'
@@ -131,10 +133,20 @@ cat > "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" <<'EOF'
 printf '%s\n' "$* grace=${SHIP_PR_BASE_ABSENT_GRACE:-unset}" >> "$BASE_CALL_LOG"
 if [ "$3" = retry ]; then
   [ -z "${SHIM_BASE_TIP_FAIL:-}" ] || exit 3
-  ref="${6##*/}"
+  # The settle path's reads (ludics-lite#156): the tip's date is SHIM_TIP_AGE seconds ago, and
+  # SHIM_TIP_RUNS is how many workflow runs the tip has.
+  case "$6" in
+    *'actions/runs?head_sha='*) echo "${SHIM_TIP_RUNS:-1}"; exit 0 ;;
+  esac
+  ref="${6##*/}"; [ "$ref" = HEAD ] && ref=master
   tip=$(git -C "$BASE_PROJECT" rev-parse "origin/$ref") || exit 3
+  # The gate reads the tip more than once (an observation before the wait, the settle path's
+  # read and reconfirm, the post-verdict confirm): SHIM_MOVE_REF_AFTER_CONFIRM moves the ref
+  # after read number SHIM_MOVE_ON_READ (default 2, the post-verdict confirm of a launch), counted
+  # in $BASE_CALL_LOG.reads, which a case resets.
   if [ -n "${SHIM_MOVE_REF_AFTER_CONFIRM:-}" ]; then
-    git -C "$BASE_PROJECT" update-ref "refs/remotes/origin/$ref" "$SHIM_MOVE_REF_AFTER_CONFIRM" || exit 3
+    n=$(( $(cat "$BASE_CALL_LOG.reads" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$BASE_CALL_LOG.reads"
+    [ "$n" -ne "${SHIM_MOVE_ON_READ:-2}" ] || git -C "$BASE_PROJECT" update-ref "refs/remotes/origin/$ref" "$SHIM_MOVE_REF_AFTER_CONFIRM" || exit 3
   fi
   echo "${SHIM_BASE_TIP:-$tip}"
   exit 0
@@ -145,7 +157,14 @@ fi
 for knob in SHIP_PR_ADVISORY_CHECKS SHIP_PR_TEST_SOURCE_ONLY SHIP_PR_CHECKS_INTERVAL SHIP_PR_CHECKS_WAIT SHIP_PR_CHECKS_HEARTBEAT SHIP_PR_API_ATTEMPTS SHIP_PR_API_BACKOFF; do
   [ -z "${!knob}" ] || exit 3
 done
-case " $* " in *" --wait=301 "*) ;; *) exit 4 ;; esac
+# The gate's first read must be the bounded --wait one; the plain read is answered only when a
+# case sets SHIM_BASE_PLAIN_RC (the ludics-lite#156 settle path).
+case " $* " in
+  *" --wait=301 "*) ;;
+  *" --wait"*) exit 4 ;;
+  *) [ -n "${SHIM_BASE_PLAIN_RC:-}" ] || exit 4
+     echo "${SHIM_BASE_PLAIN_MESSAGE:-example/project master: green (tip abc1234)}"; exit "$SHIM_BASE_PLAIN_RC" ;;
+esac
 if [ -n "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] && [ ! -e "$SHIM_BASE_REQUIRE_PREFLIGHT" ]; then
   echo 'base read occurred before preflight'; exit 3
 fi
@@ -437,6 +456,35 @@ for verdict in 3 4; do
   expect "triage cannot override unknown $verdict" 1 "dispatch blocked" -- env SHIM_BASE_RC="$verdict" "$FW" gate --target-repo example/project --force --allow-red-base fix
 done
 expect "missing helper refuses with unknown diagnostic" 1 "checker missing" -- env SHIM_BASE_RC=0 bash -c 'mv "$1" "$1.saved"; "$2" gate --target-repo example/project; rc=$?; mv "$1.saved" "$1"; exit "$rc"' _ "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" "$FW"
+# ludics-lite#156 interim: a docs-only tip parks `--wait` at its ceiling (exit 4); the gate
+# settles on the plain read only when the tip it observed before the wait is still the tip
+# (so it sat unjudged through the whole 301 s, past the grace) and has no run at all.
+settle=(env SHIM_BASE_RC=4 SHIM_BASE_MESSAGE="NO VERDICT for the tip" SHIM_BASE_PLAIN_RC=0 SHIM_TIP_RUNS=0)
+moved_tip=$(git -C "$proj" commit-tree 'HEAD^{tree}' -p HEAD -m moved)
+expect "a paths-ignore tip observed unjudged through the wait with no run settles on the plain read" 0 "BASE SETTLED: example/project default branch: tip .* observed unjudged" -- \
+  "${settle[@]}" "$FW" gate --target-repo example/project
+grep -q "green (tip abc1234)" <<<"$out" && ok "...and prints the plain read it settled on" || ko "settle hides the plain read: $out"
+expect "a tip with a run row (in flight or stopped) does not settle" 1 "in flight or stopped, not paths-ignore" -- \
+  "${settle[@]}" SHIM_TIP_RUNS=1 "$FW" gate --target-repo example/project
+grep -q "dispatch blocked" <<<"$out" && ok "...and stays blocked" || ko "unsettled tip dispatched: $out"
+rm -f "$BASE_CALL_LOG.reads"
+expect "a tip that moved during the wait does not settle (the new tip has had no grace)" 1 "tip moved during the wait" -- \
+  "${settle[@]}" SHIM_MOVE_REF_AFTER_CONFIRM="$moved_tip" SHIM_MOVE_ON_READ=1 "$FW" gate --target-repo example/project
+git -C "$proj" update-ref refs/remotes/origin/master "$(git -C "$proj" rev-parse HEAD)"; rm -f "$BASE_CALL_LOG.reads"
+expect "a tip that moved after the runs read does not settle" 1 "tip moved after the runs read" -- \
+  "${settle[@]}" SHIM_MOVE_REF_AFTER_CONFIRM="$moved_tip" SHIM_MOVE_ON_READ=2 "$FW" gate --target-repo example/project
+git -C "$proj" update-ref refs/remotes/origin/master "$(git -C "$proj" rev-parse HEAD)"; rm -f "$BASE_CALL_LOG.reads"
+expect "a plain read that is not green does not settle" 1 "plain read is not green" -- \
+  env SHIM_BASE_RC=4 SHIM_BASE_PLAIN_RC=4 SHIM_TIP_RUNS=0 "$FW" gate --target-repo example/project
+expect "an unobservable tip does not settle" 1 "not observed before the wait" -- \
+  "${settle[@]}" SHIM_BASE_TIP_FAIL=1 "$FW" gate --target-repo example/project
+expect "a red --wait verdict never reaches the settle path" 1 "dispatch blocked" -- \
+  env SHIM_BASE_RC=1 SHIM_BASE_PLAIN_RC=0 SHIM_TIP_RUNS=0 "$FW" gate --target-repo example/project
+expect "a CLI launch settles the same way, on the named base branch" 0 "LAUNCHED testbox/settled" -- \
+  "${settle[@]}" "$FW" launch testbox settled --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/settled
+"$FW" attach testbox settled --interval 1 >/dev/null
+grep -Fxq -- '--repo example/project base master grace=300' "$BASE_CALL_LOG" && ok "the settle path's plain read names the same branch" || ko "plain read branch lost"
+rm -f "$BASE_CALL_LOG.reads"
 grep -Fxq -- '--repo example/project base topic --wait=301 grace=300' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
 grep -Fxq -- '--repo example/project base master --wait=301 grace=300' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
 original_base=$(git -C "$proj" rev-parse origin/master)
@@ -854,6 +902,66 @@ expect "a coordinator adopting the lease inherits the halt" 1 "LAUNCH REFUSED te
   "${B[@]}" launch testbox h3 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 expect "...and reads it with halted" 1 "HALTED .*adopted mid-halt" -- "${B[@]}" halted
 "$FW" claim --take >/dev/null; "$FW" resume-launches >/dev/null
+}
+
+section "execution run and conclude --from-run" && {
+need_lease
+# A finished test-run.sh record on the local box: `exit`, `log`, `wt`, `cmd` under a
+# timestamped directory, with the checkout it ran in and that checkout's own runner shim
+# (`tools/test-run.sh status <run>` is the authority on "published, nothing left running").
+runs="$TMP/test-runs"; wt="$TMP/run-wt"
+git clone -q "$TMP/proj.git" "$wt" && mkdir -p "$wt/tools"
+cat > "$wt/tools/test-run.sh" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = status ] || exit 2
+exit "${SHIM_RUN_STATUS:-0}"
+EOF
+chmod +x "$wt/tools/test-run.sh"
+ran=$(git -C "$wt" rev-parse HEAD)
+mkrun() { # <name> <exit or ->
+  local d="$runs/$1"; mkdir -p "$d"; printf 'build @scans\n' > "$d/cmd"; printf '%s\n' "$wt" > "$d/wt"
+  printf 'exit: %s\n' "$2" > "$d/log"; [ "$2" = - ] || printf '%s\n' "$2" > "$d/exit"
+}
+mkrun 20260915T201414Z-1 0; mkrun 20260915T201414Z-2 -; mkrun 20260915T201414Z-3 142; mkrun 20260915T201414Z-4 1; mkrun 20260915T201414Z-5 0
+reqjson() { # <id> [host] -> a reservation payload file
+  jq -n --arg id "$1" --arg host "${2:-testbox}" '{request_id:$id, wave:"w", worker:$id, transport:"subagent", issue:"o/r#1", purpose:"fixture",
+    agent_host:"testbox", execution_host:$host, repository:"o/r", requested_revision:"origin/master", kind:"correctness"}' > "$TMP/$1.json"
+  printf '%s' "$TMP/$1.json"
+}
+FWX=(env FLEET_BOXES="testbox other" "$FW")
+run1="$runs/20260915T201414Z-1"
+expect "execution run reserves and dispatches in one call" 0 '"state": "launching"' -- "${FWX[@]}" execution run "$(reqjson run-a)"
+expect "a second run of the same request is refused, never re-launched" 1 "already dispatched" -- "${FWX[@]}" execution run "$(reqjson run-a)"
+expect "conclude --from-run needs an absolute run directory" 2 "must be absolute" -- "${FWX[@]}" execution conclude --from-run runs/x --request run-a --sha "$ran"
+expect "conclude --from-run needs the request id" 2 "--request <id> required" -- "${FWX[@]}" execution conclude --from-run "$run1" --sha "$ran"
+expect "conclude --from-run needs the revision that ran (the record has none)" 2 "--sha <full commit SHA> required" -- "${FWX[@]}" execution conclude --from-run "$run1" --request run-a
+expect "conclude --from-run refuses a stray flag" 2 "conclude --from-run <run-dir>" -- "${FWX[@]}" execution conclude --from-run "$run1" --request run-a --sha "$ran" --oops
+expect "conclude --from-run refuses a short --sha" 2 "full commit SHA" -- "${FWX[@]}" execution conclude --from-run "$run1" --request run-a --sha abc
+expect "a record without a verdict file is refused" 1 "FROM-RUN REFUSED: .*has no exit" -- "${FWX[@]}" execution conclude --from-run "$runs/20260915T201414Z-2" --request run-a --sha "$ran"
+expect "a missing run directory is refused" 1 "FROM-RUN REFUSED: no run directory" -- "${FWX[@]}" execution conclude --from-run "$runs/nope" --request run-a --sha "$ran"
+expect "the checkout's runner saying 'still running' refuses" 1 "not a finished run" -- env SHIM_RUN_STATUS=3 "${FWX[@]}" execution conclude --from-run "$run1" --request run-a --sha "$ran"
+expect "a revision the checkout does not contain is refused" 1 "does not contain the reported revision" -- "${FWX[@]}" execution conclude --from-run "$run1" --request run-a --sha "$(printf 'a%.0s' $(seq 40))"
+"${FWX[@]}" execution run "$(reqjson run-other other)" >/dev/null
+expect "evidence read on a box other than the reserved one is refused by the registry" 1 "evidence from testbox cannot conclude an assignment reserved on other" -- \
+  "${FWX[@]}" execution conclude --from-run "$run1" --request run-other --sha "$ran" --box testbox
+"$FW" execution list | grep -c '"state": "launching"' | grep -qx 2 && ok "every refusal left the assignments dispatched, not concluded" || ko "a refusal changed a record"
+expect "a passed run concludes with its verdict, log, checkout, handle and revision, on the reserved box by default" 0 '"verdict": "pass"' -- "${FWX[@]}" execution conclude --from-run "$run1" --request run-a --sha "$ran"
+for want in "\"observed_sha\": \"$ran\"" "\"remote_checkout\": \"$wt\"" "\"handle\": \"test-run:20260915T201414Z-1\"" "\"log\": \"$run1/log\"" "exit 0 published"; do
+  grep -Fq -- "$want" <<<"$out" && ok "...recorded $want" || ko "missing $want in $out"
+done
+jq -e '.history[-1].data | has("execution_host") | not' <<<"$out" >/dev/null && ok "...and the box check left no field behind" || ko "the box bound to the evidence leaked into the record: $out"
+run_conclude() { local id="$1" dir="$2"; shift 2; "${FWX[@]}" execution run "$(reqjson "$id")" >/dev/null && "${FWX[@]}" execution conclude --from-run "$dir" --request "$id" --sha "$ran" "$@"; }
+expect "a capped run concludes as timeout" 0 '"verdict": "timeout"' -- run_conclude run-b "$runs/20260915T201414Z-3"
+expect "a red run concludes as fail, with the given evidence" 0 '"evidence": "sweep red on scans"' -- run_conclude run-c "$runs/20260915T201414Z-4" --evidence "sweep red on scans"
+grep -q '"verdict": "fail"' <<<"$out" && ok "...as fail" || ko "exit 1 did not read as fail: $out"
+expect "conclude --from-run on an unknown request is refused before any box is read" 1 "unknown request_id run-zz" -- "${FWX[@]}" execution conclude --from-run "$run1" --request run-zz --sha "$ran"
+# A checkout that moved on after the run still concludes on the reported revision, and says so.
+git -C "$wt" commit -q --allow-empty -m moved   # a guaranteed new head, whatever the clone holds
+expect "a moved checkout concludes on the reported revision and records the drift" 0 "checkout head is now $(git -C "$wt" rev-parse HEAD), revision $ran as reported" -- run_conclude run-d "$runs/20260915T201414Z-5"
+grep -Fq "\"observed_sha\": \"$ran\"" <<<"$out" && ok "...with the reported revision as observed_sha" || ko "wrong observed_sha: $out"
+jq -n '{request_id:"run-other", verdict:"not-launched", log:"/dev/null", evidence:"fixture never invoked a runner on other"}' > "$TMP/run-other-done.json"
+"${FWX[@]}" execution conclude "$TMP/run-other-done.json" >/dev/null || ko "could not conclude the off-box fixture (setup)"
+expect "a run of a request outside the roster is refused" 1 "canonical FLEET_BOXES" -- "$FW" execution run "$(reqjson run-e)"
 }
 
 section "usage" && {

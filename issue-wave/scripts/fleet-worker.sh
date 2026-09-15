@@ -5,7 +5,7 @@
 #
 # Native workers use runtime subagents (or explicitly chosen app tasks); this script supplies their provider-specific native
 # freshness preflight and point-in-time gate. Their board is coordinator-maintained (see
-# references/native-codex.md); ls/status/attach/unstick below only handle CLI workers.
+# references/native-workers.md); ls/status/attach/unstick below only handle CLI workers.
 #
 # A CLI worker is a detached tmux session on its box running one headless CLI turn --
 # `claude -p --output-format stream-json` or `codex exec --json` -- with its brief on stdin and
@@ -50,6 +50,10 @@
 #   fleet-worker.sh load
 #   fleet-worker.sh execution list
 #   fleet-worker.sh execution reserve|dispatch|record|reconcile|conclude <json-file>
+#   fleet-worker.sh execution run <json-file>          # reserve + dispatch in one step
+#   fleet-worker.sh execution conclude --from-run <run-dir> --request <id> --sha <sha>
+#                          [--box <box>] [--evidence <text>]   # verdict, log and checkout read from a
+#                                                     # test-run.sh record on the reserved box
 #   fleet-worker.sh halt <reason> | resume-launches | halted
 #
 # `launch`, `unstick`, `halt` and `resume-launches` require the lease; `launch` also refuses
@@ -74,6 +78,9 @@
 #   FLEET_ANCHOR: box where lease and halt live; mac-studio.
 #   FLEET_ANCHOR_STATE: anchor state dir; defaults to ISSUE_WAVE_STATE.
 #   FLEET_BOXES: whole fleet; "mac-studio rog-nv-wsl minix-amd-wsl". `ls` sweeps it minus local.
+#   FLEET_BOX_CORRECTNESS_SLOTS: `<box>=<n>` pairs, how many correctness executions may share a
+#     box (ludics-lite#157); an unnamed box has one. "mac-studio=3" with the default roster,
+#     empty (one slot everywhere) with a custom FLEET_BOXES. Measurement stays exclusive.
 #   FLEET_SKILLS_REPO: skills checkout on each box; ~/ludics-lite.
 #   ISSUE_WAVE_STATE: local worker-state directory; ~/.local/state/issue-wave.
 #   FLEET_TMUX_SOCKET: tmux -L name; tests isolate with it.
@@ -110,6 +117,8 @@ LOCAL_BOX="${FLEET_LOCAL_BOX-$(detect_local_box)}"
 BASE_REF="${FLEET_BASE_REF:-origin/master}"
 ANCHOR="${FLEET_ANCHOR:-mac-studio}"
 BOXES="${FLEET_BOXES:-mac-studio rog-nv-wsl minix-amd-wsl}"
+# Correctness slots per box: the site default only fits the site's roster.
+SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ -n "${FLEET_BOXES:-}" ] || echo mac-studio=3)}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 ANCHOR_STATE="${FLEET_ANCHOR_STATE:-$STATE}"
@@ -514,13 +523,52 @@ base_checker() (
   SHIP_PR_BASE_ABSENT_GRACE=300 "$@"
 )
 
+# base_tip <helper> <target> <branch>: the branch's current tip SHA on stdout, or nothing.
+base_tip() {
+  local encoded tip
+  encoded=$(jq -rn --arg ref "${3:-HEAD}" '$ref | @uri') || return 1
+  tip=$(base_checker "$1" --repo "$2" retry --read api "repos/$2/commits/$encoded" --jq .sha) || return 1
+  [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s' "$tip"
+}
+
+# base_settle_plain <helper> <target> <branch> <tip observed before the wait>: exit 0 when the
+# plain `base` read is green AND the tip is one this gate itself has been observing for longer
+# than the run-creation grace (it was the tip before the 301 s wait and still is) AND no workflow
+# run ever covered it -- the paths-ignore shape `base --wait` cannot settle (ludics-lite#156).
+# Observation, not the commit date, measures the grace: a branch fast-forwarded to an old commit
+# carries a stale committer date while its run row is not created yet. A tip whose run is in
+# flight (the plain read is green over an older verdict there too, which is why a bare plain
+# read is never enough) keeps the refusal, and so does a tip that moved at any point, reconfirmed
+# after the last read. Everything it learned goes to stderr with the verdict.
+base_settle_plain() {
+  local helper="$1" target="$2" branch="$3" seen="$4" plain tip runs
+  [ -n "$seen" ] || { echo "BASE UNSETTLED: the tip was not observed before the wait" >&2; return 1; }
+  plain=$(base_checker "$helper" --repo "$target" base ${branch:+"$branch"} 2>&1) || {
+    printf '%s\n' "$plain" >&2
+    echo "BASE UNSETTLED: the plain read is not green either" >&2; return 1
+  }
+  tip=$(base_tip "$helper" "$target" "$branch") || { echo "BASE UNSETTLED: cannot read the tip" >&2; return 1; }
+  [ "$tip" = "$seen" ] || { echo "BASE UNSETTLED: tip moved during the wait (${seen:0:8} -> ${tip:0:8}); the new tip has had no grace" >&2; return 1; }
+  runs=$(base_checker "$helper" --repo "$target" retry --read api "repos/$target/actions/runs?head_sha=$tip&per_page=1" --jq .total_count) ||
+    { echo "BASE UNSETTLED: cannot read the tip's runs" >&2; return 1; }
+  [ "$runs" = 0 ] || { echo "BASE UNSETTLED: tip ${tip:0:8} has $runs workflow run(s): in flight or stopped, not paths-ignore" >&2; return 1; }
+  tip=$(base_tip "$helper" "$target" "$branch") || { echo "BASE UNSETTLED: cannot reconfirm the tip" >&2; return 1; }
+  [ "$tip" = "$seen" ] || { echo "BASE UNSETTLED: tip moved after the runs read (${seen:0:8} -> ${tip:0:8})" >&2; return 1; }
+  printf '%s\n' "$plain" >&2
+  echo "BASE SETTLED: $target ${branch:-default branch}: tip ${tip:0:8} observed unjudged and without a workflow run through the whole wait (paths-ignore); dispatching on the plain read's older green (ludics-lite#156 interim)" >&2
+}
+
 base_gate() {
-  local target="$1" branch="$2" force="$3" reason="$4" expected="${5:-}" helper rc tip encoded
+  local target="$1" branch="$2" force="$3" reason="$4" expected="${5:-}" helper rc tip encoded seen
   [[ "$target" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "base gate: --target-repo <owner/repo> required"
   [ -z "$reason" ] || [ "$force" -eq 1 ] || die "base gate: --allow-red-base requires --force for a triage worker"
   case "$branch" in -*|*$'\n'*) die "base gate: invalid --base-branch" ;; esac
   helper="$(cd "$(dirname "$0")/../../ship-pr/scripts" 2>/dev/null && pwd)/pr-review.sh"
   [ -x "$helper" ] || { echo "BASE REFUSED: coordinator base checker missing: $helper" >&2; return 1; }
+  # The tip as observed BEFORE the wait: the settle path below may only accept a tip this gate
+  # has itself watched sit unjudged for the whole 301 s, longer than the run-creation grace.
+  seen=$(base_tip "$helper" "$target" "$branch") || seen=""
   # The ordinary base read may carry an older green while the tip is running.
   # Reuse its bounded integration mode; preserve the established absence grace
   # for path-filtered tips, independent of the coordinator's ambient settings.
@@ -530,6 +578,10 @@ base_gate() {
     base_checker "$helper" --repo "$target" base --wait=301 >&2
   fi
   rc=$?
+  # ludics-lite#156 interim: --wait parks a docs-only (paths-ignore) tip at its ceiling and
+  # exits 4 where the plain read settles for the older green. Fall back to the plain read
+  # only for exactly that shape, proven by two more reads rather than assumed.
+  if [ "$rc" -eq 4 ] && base_settle_plain "$helper" "$target" "$branch" "$seen"; then rc=0; fi
   if [ "$rc" -eq 1 ] && [ "$force" -eq 1 ] && [ -n "$reason" ]; then
     echo "BASE TRIAGE OVERRIDE: $target ${branch:-default branch}: $reason" >&2
     rc=0
@@ -1096,15 +1148,110 @@ EOF
 
 # JSON payloads travel as quoted positional arguments. The helper executes on the anchor
 # while the existing lease lock fences both adoption and concurrent reservations.
+# Far side of `conclude --from-run`, on the execution box: read a finished test-run.sh record
+# (OCANNL's `tools/test-run.sh`: `exit`, `log`, `wt` and `cmd` under the run directory) and
+# the checkout's head, and refuse anything short of a published verdict with no process left.
+# Args: run-dir, reported sha. Prints `exit=`, `wt=`, `head=` lines, or one FROM-RUN REFUSED line.
+from_run_script() {
+  cat <<'EOF'
+dir="$1" sha="$2"
+refuse() { echo "FROM-RUN REFUSED: $*"; exit 1; }
+[ -d "$dir" ] || refuse "no run directory $dir on $BOX"
+for f in exit log wt cmd; do
+  [ -f "$dir/$f" ] || refuse "$dir has no $f (the run is unfinished, died without a verdict, or is not a test-run.sh record)"
+done
+code=$(head -n1 "$dir/exit"); case "$code" in ''|*[!0-9]*) refuse "$dir/exit holds '$code', not a status" ;; esac
+wt=$(head -n1 "$dir/wt"); [ -d "$wt" ] || refuse "recorded worktree $wt is gone"
+# The project's runner is the authority on "published and no process remains" (exit 0; 3 still
+# running, 1 died); without it, the supervisor pid must be gone.
+if [ -x "$wt/tools/test-run.sh" ]; then
+  (cd "$wt" && tools/test-run.sh status "$dir" >/dev/null 2>&1); st=$?
+  [ "$st" -eq 0 ] || refuse "tools/test-run.sh status $dir exit $st: not a finished run"
+elif [ -s "$dir/pid" ] && kill -0 "$(head -n1 "$dir/pid")" 2>/dev/null; then
+  refuse "supervisor pid $(head -n1 "$dir/pid") of $dir is still alive"
+fi
+head=$(git -C "$wt" rev-parse --verify HEAD^{commit} 2>/dev/null) || refuse "cannot read HEAD of $wt"
+# The record carries no SHA, so the revision that ran is the coordinator's to name (--sha, from
+# the worker's result line); the checkout only has to KNOW that commit, and its head is reported
+# so a conclusion over a moved checkout says so in its evidence.
+git -C "$wt" cat-file -e "$sha^{commit}" 2>/dev/null || refuse "$wt does not contain the reported revision $sha"
+printf 'exit=%s\nwt=%s\nhead=%s\n' "$code" "$wt" "$head"
+EOF
+}
+
+# execution_host_of <request-id>: the reserved execution host of an outstanding record, from the
+# anchor's registry (empty when unknown; the conclusion then fails on the request id anyway).
+execution_host_of() {
+  local listing
+  listing=$({ prelude "$ANCHOR"; printf 'shift 3\n'
+    cat <<'EXECUTION_COMMAND'
+python3 - "$ANCHOR_STATE" "$@" <<'FLEET_EXECUTION_PY'
+EXECUTION_COMMAND
+    cat "$1"; printf '\nFLEET_EXECUTION_PY\n'
+  } | run_on "$ANCHOR" EXECUTION x x list x x '{}' "$BOXES" "$SLOTS") || return 1
+  jq -r --arg id "$2" '.[] | select(.request_id == $id) | .request.execution_host' <<<"$listing"
+}
+
+# conclude_from_run <run-dir> <request-id> <box> <sha> <evidence>: the conclude payload (JSON on
+# stdout) read off a finished run record on the box, or a refusal line on stdout and exit 1/4.
+# The box is the reservation's execution host: the payload names it and the registry checks it,
+# so a record read on the wrong machine cannot conclude another box's assignment.
+conclude_from_run() {
+  local dir="$1" request="$2" box="$3" sha="$4" evidence="$5" facts rc code wt head verdict
+  facts=$({ prelude "$box"; from_run_script; } | run_on "$box" "$dir" "$sha"); rc=$?
+  if unreachable "$rc"; then echo "FROM-RUN UNREACHABLE $box: nothing concluded"; return 4; fi
+  [ "$rc" -eq 0 ] || { printf '%s\n' "$facts"; return 1; }
+  code=$(sed -n 's/^exit=//p' <<<"$facts"); wt=$(sed -n 's/^wt=//p' <<<"$facts"); head=$(sed -n 's/^head=//p' <<<"$facts")
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] && [ -n "$code" ] && [ -n "$wt" ] || { echo "FROM-RUN REFUSED: unreadable record facts from $box: $facts"; return 1; }
+  # test-run.sh's exit vocabulary: 142 the cap, 129/130/137/143 a signal; every other nonzero
+  # (dune's own 1, a refused invocation, 126/127 toolchain) is a failed run.
+  case "$code" in 0) verdict=pass ;; 142) verdict=timeout ;; 129|130|137|143) verdict=cancelled ;; *) verdict=fail ;; esac
+  [ -n "$evidence" ] || evidence="test-run.sh record $dir on $box: exit $code published, no process remains"
+  [ "$head" = "$sha" ] || evidence="$evidence; checkout head is now $head, revision $sha as reported by the worker"
+  jq -cn --arg id "$request" --arg ev "$evidence" --arg sha "$sha" --arg wt "$wt" --arg host "$box" \
+    --arg handle "test-run:$(basename "$dir")" --arg log "$dir/log" --arg verdict "$verdict" \
+    '{request_id: $id, evidence: $ev, observed_sha: $sha, remote_checkout: $wt, handle: $handle, log: $log, verdict: $verdict, execution_host: $host}'
+}
+
 cmd_execution() {
   local action="${1:-}" payload='{}'
   case "$action" in
     list) [ "$#" -eq 1 ] || die "execution list: no arguments" ;;
-    reserve|dispatch|record|reconcile|conclude)
+    conclude)
+      if [ "${2:-}" = --from-run ]; then
+        local dir="${3:-}" request="" box="" sha="" evidence="" rc
+        [ -n "$dir" ] || die "execution conclude --from-run: <run-dir> required"
+        case "$dir" in /*) ;; *) die "execution conclude --from-run: the run directory must be absolute (it is read on the execution box)" ;; esac
+        shift 3
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --request|--box|--sha|--evidence)
+              [ "$#" -ge 2 ] && [ -n "$2" ] || die "execution conclude: expected value for $1"
+              case "$1" in --request) request="$2" ;; --box) box="$2" ;; --sha) sha="$2" ;; --evidence) evidence="$2" ;; esac
+              shift ;;
+            *) die "execution conclude --from-run <run-dir> --request <id> [--box <box>] [--sha <sha>] [--evidence <text>]" ;;
+          esac
+          shift
+        done
+        [ -n "$request" ] || die "execution conclude --from-run: --request <id> required"
+        [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "execution conclude --from-run: --sha <full commit SHA> required (the record carries none; the worker's result line names it)"
+        check_identity
+        if [ -z "$box" ]; then
+          box=$(execution_host_of "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py" "$request") || { echo "EXECUTION UNREACHABLE $ANCHOR: cannot resolve the request's execution host"; exit 4; }
+          [ -n "$box" ] || { echo "EXECUTION REFUSED: unknown request_id $request (no execution host to read the run on)"; exit 1; }
+        fi
+        payload=$(conclude_from_run "$dir" "$request" "$box" "$sha" "$evidence"); rc=$?
+        [ "$rc" -eq 0 ] || { printf '%s\n' "$payload"; exit "$rc"; }
+      else
+        [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
+        payload=$(cat "$2") || die "execution: cannot read payload"
+        check_identity
+      fi ;;
+    reserve|run|dispatch|record|reconcile)
       [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
       payload=$(cat "$2") || die "execution: cannot read payload"
       check_identity ;;
-    *) die "execution: list or reserve|dispatch|record|reconcile|conclude <json-file>" ;;
+    *) die "execution: list, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run <run-dir> --request <id>" ;;
   esac
   local helper; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
@@ -1116,7 +1263,7 @@ python3 - "$ANCHOR_STATE" "$@" <<'FLEET_EXECUTION_PY'
 EXECUTION_COMMAND
     cat "$helper"
     printf '\nFLEET_EXECUTION_PY\n'
-  } | run_on "$ANCHOR" EXECUTION "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$action" "$(coordinator_id)" "$(my_token)" "$payload" "$BOXES"
+  } | run_on "$ANCHOR" EXECUTION "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$action" "$(coordinator_id)" "$(my_token)" "$payload" "$BOXES" "$SLOTS"
   local rc=$?; if unreachable "$rc"; then echo "EXECUTION UNREACHABLE $ANCHOR: outcome unknown; reconcile before retrying dispatch"; exit 4; fi
   exit "$rc"
 }

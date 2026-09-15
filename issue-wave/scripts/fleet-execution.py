@@ -1,6 +1,14 @@
 """Anchor-side execution records. Invoked by fleet-worker under its coordinator lock.
 
 This records cooperative ownership; it neither launches nor supervises processes.
+
+Argv: <state root> <action> <coordinator> <lease token> <json payload> <FLEET_BOXES>
+      [<FLEET_BOX_CORRECTNESS_SLOTS>]
+
+Ownership per execution host (ludics-lite#157): a `measurement` assignment is exclusive -- it
+refuses while anything else is outstanding on the box, and everything refuses while it is. A
+`correctness` assignment shares the box with other correctness assignments up to that box's
+slot count (`<box>=<n>` pairs in the slots spec; one slot for any box the spec does not name).
 """
 import json
 import os
@@ -84,8 +92,42 @@ def halt_generation(marker):
     return match.group(1) if match else first_line
 
 
+def correctness_slots(spec, canonical_hosts):
+    """`<box>=<n>` pairs; a box the spec does not name has one slot."""
+    slots = {}
+    for pair in spec.split():
+        box, _, count = pair.partition("=")
+        if not box or not count.isdigit() or int(count) < 1:
+            refuse(f"FLEET_BOX_CORRECTNESS_SLOTS entry must be <box>=<positive n>: {pair}")
+        if box not in canonical_hosts:
+            refuse(f"FLEET_BOX_CORRECTNESS_SLOTS names {box}, which is not in FLEET_BOXES")
+        slots[box] = int(count)
+    return slots
+
+
+def check_capacity(data, records, canonical_hosts, slots_spec):
+    """Refuse when the requested host cannot take this assignment beside the outstanding ones."""
+    host, kind = data["execution_host"], data["kind"]
+    slots = correctness_slots(slots_spec, canonical_hosts)
+    outstanding = [r for r in records.values()
+                   if r["state"] != "concluded" and r["request"]["execution_host"] == host]
+    if not outstanding:
+        return
+    owners = ", ".join(f"{r['request']['worker']} request={r['request_id']} coordinator={r['coordinator']}"
+                       for r in outstanding)
+    measuring = [r for r in outstanding if r["request"]["kind"] == "measurement"]
+    if kind == "measurement":
+        refuse(f"box owned by {owners} (measurement needs {host} to itself)")
+    if measuring:
+        refuse(f"box owned by {owners} (a measurement holds {host} exclusively)")
+    cap = slots.get(host, 1)
+    if len(outstanding) >= cap:
+        refuse(f"box owned by {owners} (correctness slots {len(outstanding)}/{cap} on {host} taken)")
+
+
 def main():
-    root, action, coordinator, token, raw, boxes = sys.argv[1:]
+    root, action, coordinator, token, raw, boxes = sys.argv[1:7]
+    slots_spec = sys.argv[7] if len(sys.argv) > 7 else ""
     directory = Path(root) / "executions"
     # A corrupt record blocks dispatch instead of silently making its box available.
     records = {}
@@ -114,7 +156,8 @@ def main():
     if halt_identity is not None and not halt_identity.strip():
         refuse("invalid empty halt record")
     record = records.get(identity)
-    if action in {"reserve", "dispatch"}:
+    events = []   # (action, data) pairs appended to the history, in order
+    if action in {"reserve", "run", "dispatch"}:
         canonical_hosts = set(boxes.split())
         if not canonical_hosts:
             refuse("FLEET_BOXES must name the canonical fleet hosts")
@@ -123,38 +166,72 @@ def main():
         for existing in records.values():
             if existing["state"] != "concluded" and existing["request"]["execution_host"] not in canonical_hosts:
                 refuse(f"reconcile noncanonical execution host on request {existing['request_id']} before dispatch")
-    if action == "reserve":
-        validate_request(data)
-        if data["execution_host"] not in canonical_hosts:
+    if action in {"reserve", "run"}:
+        # `run` is reserve + dispatch under one lock: the payload is the reservation, plus an
+        # optional `evidence` for the dispatch step (ludics-lite: four calls per execution
+        # were a third of a coordinator's tool calls on 2026-09-15).
+        request = data
+        dispatch_evidence = "reserved and dispatched in one step (execution run)"
+        if action == "run":
+            request = {k: v for k, v in data.items() if k != "evidence"}
+            if "evidence" in data:
+                nonempty(data, ["evidence"])
+                dispatch_evidence = data["evidence"]
+        validate_request(request)
+        if request["execution_host"] not in canonical_hosts:
             refuse("execution_host must exactly match a canonical FLEET_BOXES entry")
         if record:
-            if record["request"] != data:
+            if record["request"] != request:
                 refuse("request_id already names a different assignment")
-            sync_directory(directory.parent)
-            sync_directory(directory)
-            print(json.dumps(record, indent=2))
-            return
-        halted = halt_identity is not None
-        if "triage_reason" in data and not halted:
-            refuse("triage reservations require an active halt")
-        for existing in records.values():
-            if existing["state"] != "concluded" and existing["request"]["execution_host"] == data["execution_host"]:
-                refuse(f"box owned by {existing['request']['worker']} request={existing['request_id']} coordinator={existing['coordinator']}")
-        if halted:
-            nonempty(data, ["triage_reason"])
-            # One explicitly named exception, not an unrestricted force flag.
-            if any(r["state"] != "concluded" and halt_generation(r.get("halt_identity")) == halt_identity for r in records.values()):
-                refuse("an outstanding triage assignment already exists")
-        record = {"request_id": identity, "request": data, "coordinator": coordinator,
-                  "lease_token": token, "state": "reserved", "created_at": now, "history": []}
-        if "triage_reason" in data:
-            record["halt_identity"] = halt_identity
+            if action == "reserve":
+                sync_directory(directory.parent)
+                sync_directory(directory)
+                print(json.dumps(record, indent=2))
+                return
+            # A repeated `run` never repeats a launch: the connection that dropped after the
+            # first one may have started the runner. Only a still-reserved own record proceeds.
+            if record["state"] != "reserved":
+                refuse(f"assignment already dispatched (state {record['state']}); reconcile, never run twice")
+            if record["lease_token"] != token:
+                refuse("adopted assignment must be reconciled before dispatch")
+        else:
+            halted = halt_identity is not None
+            if "triage_reason" in request and not halted:
+                refuse("triage reservations require an active halt")
+            check_capacity(request, records, canonical_hosts, slots_spec)
+            if halted:
+                if "triage_reason" not in request:
+                    refuse("fleet halted; ordinary reservations refused (only the named triage_reason reservation is admitted)")
+                nonempty(request, ["triage_reason"])
+                # One explicitly named exception, not an unrestricted force flag.
+                if any(r["state"] != "concluded" and halt_generation(r.get("halt_identity")) == halt_identity for r in records.values()):
+                    refuse("an outstanding triage assignment already exists")
+            record = {"request_id": identity, "request": request, "coordinator": coordinator,
+                      "lease_token": token, "state": "reserved", "created_at": now, "history": []}
+            if "triage_reason" in request:
+                record["halt_identity"] = halt_identity
+            events.append(("reserve", request))
+        if action == "run":
+            triage = record["request"].get("triage_reason")
+            if triage and (halt_identity is None or halt_generation(record.get("halt_identity")) != halt_identity):
+                refuse("triage assignment belongs to a different or ended halt")
+            if halt_identity is not None and not triage:
+                refuse("fleet halted; ordinary dispatch refused")
+            record["state"] = "launching"
+            events.append(("dispatch", {"request_id": identity, "evidence": dispatch_evidence}))
     else:
         if record is None:
             refuse("unknown request_id")
-        if set(data) - {"request_id", "state", "evidence", "observed_sha", "remote_checkout", "handle", "log", "verdict"}:
+        if set(data) - {"request_id", "state", "evidence", "observed_sha", "remote_checkout", "handle", "log", "verdict", "execution_host"}:
             refuse("unknown evidence fields")
         nonempty(data, ["evidence"])
+        # Evidence read on a named box binds to the box that was reserved: a run record at the
+        # same path on another machine cannot conclude this assignment.
+        if "execution_host" in data:
+            nonempty(data, ["execution_host"])
+            if data["execution_host"] != record["request"]["execution_host"]:
+                refuse(f"evidence from {data['execution_host']} cannot conclude an assignment reserved on {record['request']['execution_host']}")
+            data = {k: v for k, v in data.items() if k != "execution_host"}
         if "verdict" in data and action != "conclude":
             refuse("verdict is only valid for conclude")
         if "state" in data and action not in {"record", "reconcile"}:
@@ -206,8 +283,10 @@ def main():
                 nonempty(data, [key])
                 record[key] = data[key]
         record["state"] = state
+        events.append((action, data))
     record["updated_at"] = now
-    record["history"].append({"at": now, "coordinator": coordinator, "action": action, "data": data})
+    for event_action, event_data in events:
+        record["history"].append({"at": now, "coordinator": coordinator, "action": event_action, "data": event_data})
     directory.mkdir(exist_ok=True)
     # Sync even on retry: an earlier failed sync may have left the new directory visible.
     sync_directory(directory.parent)

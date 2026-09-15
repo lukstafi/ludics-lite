@@ -111,12 +111,17 @@ Claude Code support their own native subagents in coordinator-created external w
 CLI workers launched with `--kind codex` or `--kind claude`. Only the CLI route provides
 cross-provider delegation, and it can place the agent directly on the best iteration box.
 Native workers use their runtime tools and a shared anchor board; CLI workers use the launcher's
-tracked process lifecycle. See [Native workers](issue-wave/references/native-codex.md) for tool
-discovery, placement and recovery, and the explicit separate-conversation alternative.
+tracked process lifecycle. See [Native workers](issue-wave/references/native-workers.md) for placement and
+recovery, [native-claude.md](issue-wave/references/native-claude.md) / [native-codex.md](issue-wave/references/native-codex.md)
+for each coordinator's worker channel and tool discovery, [cli-claude.md](issue-wave/references/cli-claude.md)
+for the CLI worker lifecycle, and the explicit separate-conversation alternative.
 [Execution reservations](issue-wave/references/executions.md) apply to fleet test/experiment runs
 for either transport, including host-local CLI work, and coordinator integration. Agent residence
-does not confer ownership, and an issue may reserve checks on several boxes. The reservation
-helper requires Python 3 on the anchor.
+does not confer ownership, and an issue may reserve checks on several boxes. Measurement is
+exclusive per box; correctness runs share a box up to its `FLEET_BOX_CORRECTNESS_SLOTS`. The
+usual coordinator shape is two calls per execution: `execution run <reserve.json>` (reserve and
+dispatch) and `execution conclude --from-run <run-dir> --request <id> --sha <sha>` (verdict, log and
+checkout read off a `test-run.sh` record on the reserved box). The reservation helper requires Python 3 on the anchor.
 
 ## Routines
 
