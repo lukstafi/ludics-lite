@@ -115,8 +115,11 @@ tracked process lifecycle. See [Native workers](issue-wave/references/native-cod
 discovery, placement and recovery, and the explicit separate-conversation alternative.
 [Execution reservations](issue-wave/references/executions.md) apply to fleet test/experiment runs
 for either transport, including host-local CLI work, and coordinator integration. Agent residence
-does not confer ownership, and an issue may reserve checks on several boxes. The reservation
-helper requires Python 3 on the anchor.
+does not confer ownership, and an issue may reserve checks on several boxes. Measurement is
+exclusive per box; correctness runs share a box up to its `FLEET_BOX_CORRECTNESS_SLOTS`. The
+usual coordinator shape is two calls per execution: `execution run <reserve.json>` (reserve and
+dispatch) and `execution conclude --from-run <run-dir> --request <id>` (verdict, log, checkout
+and SHA read off a `test-run.sh` record). The reservation helper requires Python 3 on the anchor.
 
 ## Routines
 

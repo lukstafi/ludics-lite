@@ -51,8 +51,65 @@ and after-merge hand-back mode. Require **an explicit command working directory 
 call and absolute assigned paths for edits**. Runtime children share the environment: cooperative
 cross-path reads are allowed, but each checkout has one writer. Never rely on inherited cwd as
 isolation. Workers must ask the coordinator for an execution assignment before launching fleet tests or
-experiments, including runs local to their agent host,
-return the actual runner handle/log/verdict, and leave worktree cleanup to the coordinator.
+experiments beyond their standing iteration reservation (below), return the actual runner
+handle/log/verdict, and leave worktree cleanup to the coordinator. Brief text is
+model-agnostic: the commit trailer says "credit your own model" rather than naming one (an Opus
+worker inherited a Fable trailer on 2026-09-15 and rightly corrected it), and tool names come
+from what this runtime exposes to the worker, never from a remembered brief for the other
+provider.
+
+## Claude Code worker channel
+
+A Claude Code subagent cannot wait mid-turn: nothing lets it block on a coordinator message, and
+ending its turn is its only way to yield. So the "message the coordinator and wait for dispatch"
+shape above is Codex's; the Claude shape is turn-shaped, and the brief template in SKILL.md
+spells it out. It carried four issues and a release through five PRs on 2026-09-15 with no
+stranded worker.
+
+1. **Standing iteration reservation, at launch.** The coordinator takes one `kind:
+   correctness` reservation per worker on its agent host with `fleet-worker.sh execution run`
+   (request id `<wave>-<issue>-<host>-iterate`; see [executions.md](executions.md)) and names
+   it in the brief. It pre-authorizes the worker's own targeted test batches there - each
+   through the project runner (`tools/test-run.sh run ...`), blocked to completion inside the
+   turn, reported by run directory in the worker's messages - with no per-batch request. It is
+   concluded at hand-back from the last batch's record. Boxes hold as many of these as their
+   correctness slots allow (three on mac-studio); a measurement needs the box to itself.
+2. **Request, for everything else.** A measurement, a cross-box leg, a full suite: the worker
+   ends its turn with its final message carrying one block and nothing after it:
+
+   ```
+   EXECUTION_REQUEST
+   {"request_id":"<wave>-<issue>-<host>-<n>","execution_host":"rog-nv-wsl","kind":"measurement",
+    "requested_revision":"<pushed sha>","checkout":"<absolute path on the execution host>",
+    "command":"<one bounded runner command>","log":"<intended log path, or ->"}
+   END_EXECUTION_REQUEST
+   ```
+
+   The task notification that follows is this hand-back, not completion.
+3. **Assign.** The coordinator completes the reservation (wave, worker, `transport:
+   "subagent"`, agent host, repository, issue, purpose - the request supplies the rest), runs
+   `execution run <reserve.json>`, and on exit 0 resumes the worker by its agent ID (the
+   runtime's continue-an-agent form: SendMessage to the agent's name or ID, never a fresh
+   Agent call) with one line, `EXECUTION_ASSIGNED <request_id>`, followed by the exact
+   command, revision, checkout and log to use. On a refusal, hold the worker - idle, it keeps
+   its context - or answer `EXECUTION_REFUSED <reason>` so it keeps implementing.
+4. **Result.** The resumed worker runs only the assigned command, blocks on it to completion
+   within the turn (`TaskOutput` on the harness's background task, or `tools/test-run.sh wait
+   last`), and ends that turn with one fixed line, so the coordinator concludes without
+   grepping run ids out of prose:
+
+   ```
+   EXECUTION_RESULT {"request_id":"<id>","run":"<absolute test-run.sh run directory>","exit":0,"observed_sha":"<sha that ran>"}
+   ```
+
+   The coordinator runs `fleet-worker.sh execution conclude --from-run <run> --request <id>
+   --box <execution host>`, which reads verdict, log, checkout and head off the record and
+   refuses an unfinished run or a checkout committed to since (then `--sha` from the result
+   line vouches for the revision), and resumes the worker with `EXECUTION_CONCLUDED <id>
+   <verdict>` or its next assignment.
+
+The same request/result lines work for a Codex native worker that prefers them; what differs is
+only that Codex may keep its turn open and wait.
 
 ## Supervision, recovery and evidence
 
@@ -64,7 +121,17 @@ interventions. `fleet-worker.sh ls/status/attach` observe CLI workers only.
 
 Use native messages and bounded native waits, retaining real identities. Follow up in the same
 agent when work is unfinished; observe the response. A returned agent turn is not a merge or a
-remote process verdict. Verify PR, issue, Git and test evidence independently. Keep long tests in
+remote process verdict. **A Claude Code task notification means the agent's turn ended, and
+nothing more**: a worker that started `dune` in the background and yielded produces the same
+notification as one that finished (twice on 2026-09-15 a "finished" notification arrived with
+the worker's dune still running). Briefs therefore require blocking on every run before
+yielding (`TaskOutput` on the background task, or `tools/test-run.sh wait last`), and the
+coordinator reads a notification by the worker's final message: an `EXECUTION_REQUEST` or
+`EXECUTION_RESULT` block is a hand-off, a ship-pr hand-back report is completion, anything else
+is read against the PR feed and the agent listing before it is called a stall. An idle worker
+(turn ended, no background task) disappears from the agent listing but keeps its whole context
+and resumes by ID; a worker still listed as running is mid-turn or holds a background task and is
+not stalled, so spawn no finisher on its worktree. Verify PR, issue, Git and test evidence independently. Keep long tests in
 bounded tracked sessions; recover their actual exit code rather than starting a duplicate when
 output goes quiet. Re-arm review/check waiters for the current commit after a push. The exact-head
 CI and Windows evidence guidance in the separate-conversation reference also applies to runtime

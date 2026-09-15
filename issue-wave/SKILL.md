@@ -36,6 +36,7 @@ author's fleet (the header of `scripts/fleet-worker.sh` is the authoritative lis
 | The flotilla status and wake service, if any | `FLEET_FLOTILLA` |
 | Local state directory for each coordinator | `ISSUE_WAVE_STATE` |
 | State directory on the anchor for the lease and fleet-wide halt | `FLEET_ANCHOR_STATE`; every coordinator must resolve it to the same directory on the anchor |
+| How many correctness executions may share a box (measurement is always exclusive) | `FLEET_BOX_CORRECTNESS_SLOTS` (`<box>=<n>` pairs; `mac-studio=3` with the default roster, one slot otherwise) |
 
 The rest is prose in this file and is edited in place: the **sequencing plan** path and the
 task that maintains it (Inputs, just below), the **fleet roster** with its hardware and the
@@ -92,8 +93,9 @@ sections as the starting truth, then adjust for churn surfaces the plan does not
 issues editing the same file or golden serialize even if logically independent, and an issue
 that adds test stanzas sequences after one that reshapes the affected goldens or scanners. GPU
 boxes serialize per box for measurement work (the plan's Parallelism section orders each box's
-queue). Agent slots are separate from execution slots: all correctness and measurement
-execution assignments on one box serialize under the reservation protocol.
+queue). Agent slots are separate from execution slots: on one box a measurement execution is
+exclusive, and correctness executions share it up to its correctness slots (three on
+mac-studio, one on the WSL boxes; ludics-lite#157) under the reservation protocol.
 
 A box that is asleep or unreachable is a placement fact, not a blocker: wake it through
 flotilla (`curl -X POST http://mac-studio:7799/api/wake -d '{"machine":"rog"}'`; WSL then needs
@@ -208,8 +210,11 @@ seen on the first fleet-preflight day are user-side repairs: an expired Claude l
 needs an interactive `claude auth login` there, and missing `~/.codex/skills` links need the
 README loop run once on that box.
 
-One worker per issue, worktrees outside the repo per project convention, a parallel group
-launched together. Preserve the user's provider/model choice for either transport. For native workers follow the
+One worker per issue - never two issues in one brief, even a sequential pair: the
+#977-then-#979 worker of 2026-09-15 never sent the interim hand-back it was asked for and ran
+straight into phase two. A sequential pair is two workers, the second a stacked launch off the
+first's branch once that is approved (Supervise: *Stacked launches*). Worktrees outside the
+repo per project convention, a parallel group launched together. Preserve the user's provider/model choice for either transport. For native workers follow the
 linked reference. For CLI workers, write the brief to a file and launch with the selected kind
 (`--kind claude` with `-- --model opus --effort high` for requested Opus, or `--kind codex`
 with the user's supported Codex model flags):
@@ -239,7 +244,11 @@ reconciling the branch. Existing worktrees and native dispatch keep the coordina
 responsibility for the recorded startup SHA. The read runs after worker-box freshness preflight and uses the existing checker's
 `--wait=301` mode with its absence grace pinned to 300 seconds: a covered green exits
 immediately, a pending base blocks at the ceiling, and a path-filtered tip may use the
-older verdict after the grace. This is a bounded pre-dispatch check, not another observer.
+older verdict after the grace. Until ludics-lite#156 lands, `--wait` parks a docs-only
+(paths-ignore) tip at its ceiling instead; the gate then settles on the plain `base` read,
+but only when that read is green, the tip's commit is older than the grace, and the tip has no
+workflow run at all (a run in flight or stopped keeps the refusal), printing `BASE SETTLED`
+with what it found. This is a bounded pre-dispatch check, not another observer.
 A known-red regression needs one triage worker: only `--force --allow-red-base "<reason>"`
 permits that red verdict, prints the reason, and still refuses unknown/no-verdict. Record
 the reason and diagnostics in the board. `--force` alone only lifts the halt.
@@ -285,14 +294,30 @@ worker kinds, with transport-specific setup and identity, and includes:
   shells, the backend to select and how to prove the run executed on it (a backend-uniform
   golden proves nothing - the OCANNL notes on `OCANNL_BACKEND` and self-announcing legs), and
   still one dune per _build.
-- Execution handoff: require an assignment before every fleet test/experiment, including local
-  CLI runs. Native workers message the coordinator with revision, host, command, checkout and log
-  path, then wait for dispatch. CLI briefs name an absolute request-file path under the worker's
-  state directory: write the same payload there, print `EXECUTION_REQUEST <path>`, and exit the
-  turn without launching the test. The coordinator follows the
-  [CLI reservation handoff](references/executions.md#cli-reservation-handoff) before resuming it.
-  A resumed worker runs only the assigned bounded command/batch, writes runner evidence to the
-  named result file and exits again; neither turn completion nor its report releases the box.
+- Execution handoff: the worker's own targeted correctness batches on its agent host run under
+  the [standing iteration reservation](references/executions.md#standing-iteration-reservation)
+  the coordinator took at launch - name its request id, the bounded aliases and `-j` width it
+  covers, and that every batch goes through the project runner and is reported by run
+  directory. Every other run - measurement, a cross-box leg, a full suite - needs an assignment
+  first, in the transport's shape: a native Claude worker ends its turn with the
+  `EXECUTION_REQUEST` block and, once resumed with `EXECUTION_ASSIGNED <id>`, runs only that
+  command and ends the result turn with the one-line `EXECUTION_RESULT {json}` (formats in the
+  [Claude Code worker channel](references/native-codex.md#claude-code-worker-channel)); a
+  native Codex worker messages the coordinator with revision, host, command, checkout and log
+  path and waits for dispatch; a CLI brief names an absolute request-file path under the
+  worker's state directory - write the same payload there, print `EXECUTION_REQUEST <path>`,
+  and exit the turn without launching the test, per the
+  [CLI reservation handoff](references/executions.md#cli-reservation-handoff). A resumed
+  worker runs only the assigned bounded command/batch, reports runner evidence and yields
+  again; neither turn completion nor its report releases the box.
+- **Block on every run before yielding**: `TaskOutput` on the harness's background task, or
+  `tools/test-run.sh wait last`. A Claude task notification only says the turn ended, so a
+  worker that yields with its dune running reads as finished (twice on 2026-09-15).
+- Model-agnostic text: the commit trailer says "credit your own model" (the project's
+  `Co-Authored-By` shape with the worker's own model name), never a model the coordinator
+  copied from its own instructions - an Opus worker inherited a Fable line on 2026-09-15 and
+  rightly corrected it - and every tool name in the brief is one the worker's runtime actually
+  exposes, as the native reference asks.
 - Landing: the ship-pr skill through review to merge; for a PR that fully resolves the issue,
   include `Closes #N` in its body (`Closes owner/repo#N` for a separate upstream tracker), per
   ship-pr's *Open*. Then close out the tracked issue with a summary comment -
@@ -314,7 +339,8 @@ worker kinds, with transport-specific setup and identity, and includes:
   merges.
 - Process discipline, stated explicitly because workers re-derive it badly under load: never
   end a turn with only an unobserved detached process outstanding - use the harness's
-  tracked wait mechanism (Codex keeps the turn open or schedules an authorized heartbeat); if a review watch goes quiet suspiciously long, read the PR feed
+  tracked wait mechanism (Codex keeps the turn open or schedules an authorized heartbeat; a
+  Claude worker blocks with `TaskOutput` or the runner's own `wait`); if a review watch goes quiet suspiciously long, read the PR feed
   directly (`gh pr view --comments`) rather than re-arming the watch (reactions persist across
   rounds and strand it); commit early and often - commits are what survives every failure
   mode below.
@@ -401,12 +427,18 @@ linked reference's selected native lifecycle wherever a bullet below names CLI e
   `pgrep -fl '[p]r-review.sh watch <owner>/<repo>#<pr>( |$)'` - not by cwd; after a harness
   restart those claims are unreliable in both directions (observed 3x on 2026-08-23; commits
   proved durable every time).
-- **CLI execution requests are handoffs, not completed issues.** When `attach` reports a turn
-  ended, inspect its output and the brief's request/result paths before classifying it as finished.
-  An `EXECUTION_REQUEST` goes through the [reservation handoff](references/executions.md#cli-reservation-handoff);
-  resume the same worker after the coordinator reserves and dispatches its assignment. On the
-  result turn, independently verify runner termination and evidence, conclude the reservation,
-  then resume implementation/review. Do not launch a second writer or infer success from `DONE`.
+- **Execution requests are handoffs, not completed issues.** When `attach` reports a turn
+  ended, or a native worker's task notification arrives, read its final output before
+  classifying it as finished: an `EXECUTION_REQUEST` goes through the reservation handoff
+  ([CLI](references/executions.md#cli-reservation-handoff), [native
+  Claude](references/native-codex.md#claude-code-worker-channel)) - `fleet-worker.sh execution
+  run <reserve.json>` reserves and dispatches in one call, then resume the SAME worker (by
+  session for CLI, by agent ID for native) with the assignment. On the result turn conclude
+  from the record - `execution conclude --from-run <run-dir> --request <id> --box <host>`
+  reads verdict, log, checkout and head itself and refuses an unfinished run - then resume
+  implementation/review. Do not launch a second writer or infer success from `DONE`, and read
+  a Claude notification for what it is: the turn ended, which is also what a worker that
+  yielded with its test still running produces (the native reference's supervision section).
 - **CLI workers: unstick through the script, and only a dead exec.** Write the imperative
   message to a file (do X now, in this turn, do not yield; never as command-line text - issue prose is
   full of backticks and `$()`) and run `fleet-worker.sh unstick <box> <name> --message
@@ -589,5 +621,8 @@ Follow [execution reservations](references/executions.md) for every worker corre
 including host-local CLI runs, and every coordinator integration run, regardless of provider
 or transport. Agent residence does not confer execution ownership. Workers ask the coordinator first;
 the coordinator reserves before launch, records launch evidence and the project runner outcome,
-and concludes only with evidence. `load` is an observation, not ownership. Neither it nor these
+and concludes only with evidence. The usual shape is two calls per execution - `execution run
+<reserve.json>` then `execution conclude --from-run <run-dir> --request <id>` - plus one
+standing correctness reservation per worker for its own iteration batches, taken at launch and
+concluded at hand-back. `load` is an observation, not ownership. Neither it nor these
 cooperative reservations prevents unrelated processes or scheduled sweeps from using a machine.

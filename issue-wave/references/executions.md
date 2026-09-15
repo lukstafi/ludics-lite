@@ -6,8 +6,14 @@ transport. This includes a CLI worker running tests on its own host, just as it 
 native subagent driving that host over SSH. Agent residence never grants execution ownership. Python 3 is required on the anchor. State lives in `FLEET_ANCHOR_STATE/executions`,
 under the existing coordinator lease lock. Use the same fleet environment as `claim`.
 
-There is one exclusive active assignment per execution host, for correctness and measurement
-alike. Use one canonical box name from the site's roster consistently (for example `rog-nv-wsl`,
+A `measurement` assignment is exclusive: it is refused while anything is outstanding on its
+host, and everything is refused while it is outstanding. A `correctness` assignment shares its
+host with other correctness assignments up to the box's slots - `FLEET_BOX_CORRECTNESS_SLOTS`,
+`<box>=<n>` pairs, `mac-studio=3` with the default roster and one slot for any box it does not
+name (ludics-lite#157: the exclusivity was written for measurement noise and for XProtect
+serializing fresh test binaries, and three workers' targeted `-j 4` batches ran side by side on
+the Mac without a stall once the Developer Tools exemption was in place; the WSL boxes keep one
+slot because the dxg bridge is the limit there). Use one canonical box name from the site's roster consistently (for example `rog-nv-wsl`,
 not an alternating SSH alias and app host ID). New reservations and dispatch require exact
 `FLEET_BOXES` entries; aliases and case variants are refused. Configure one canonical entry per
 physical box. Outstanding records outside a changed roster block dispatch until reconciled;
@@ -42,8 +48,12 @@ A reservation must exist before launch. For example `reserve.json`:
 }
 ```
 
-Run `fleet-worker.sh execution reserve <absolute-reserve.json>`. A conflicting request reports
-its current owner and changes nothing. Retrying identical request identity and fields returns
+Run `fleet-worker.sh execution reserve <absolute-reserve.json>`, or - the usual shape -
+`fleet-worker.sh execution run <absolute-reserve.json>`, which reserves and dispatches under one
+lock and leaves the record `launching` (the payload may add `evidence` for the dispatch step).
+`run` is not idempotent by design: a second `run` of a dispatched request is refused, because the
+connection that dropped after the first may have started the runner; reconcile instead. A
+conflicting request reports its current owner and changes nothing. Retrying identical request identity and fields returns
 the existing assignment, including terminal state; a changed request with that ID is refused.
 IDs that differ only by case collide and are refused, including on case-sensitive hosts.
 Use a new ID for a genuinely new execution. `execution list` prints all records, including
@@ -82,12 +92,42 @@ Once runner evidence establishes completion and no process remains, `execution c
 }
 ```
 
+When the run went through OCANNL's `tools/test-run.sh` (or any runner leaving `exit`, `log`,
+`wt` and `cmd` under a run directory), `fleet-worker.sh execution conclude --from-run <run-dir>
+--request <id> [--box <execution host>] [--sha <sha>] [--evidence <text>]` composes that payload
+itself: the verdict from `exit` (0 pass, 142 timeout, a signal code cancelled, anything else
+fail), `log` and the checkout from the record, the handle `test-run:<run>`, and the observed SHA
+from the checkout's head. It refuses a record without a verdict, a run the checkout's own
+`tools/test-run.sh status` does not call finished, and a checkout committed to after the run
+started - the record carries no SHA, so a moved head no longer proves what ran; then `--sha`
+names the revision the worker reported. The run directory is read on `--box` (default
+`local`).
+
 The actual verdict must be `pass`, `fail`, `timeout` or `cancelled`. A timeout/cancellation needs
 runner evidence that its processes stopped. SHA, checkout and handle may already be in the record;
 evidence and log are required in the conclusion. If reconciliation proves nothing launched, use
 `not-launched` with evidence and a reconciliation log. Terminal records are immutable; an identical
 conclusion retry is harmless. There is no expiry or automatic release. Never remove a checkout
 while an outstanding record refers to it, or while a pending assignment could still be using it.
+
+## Standing iteration reservation
+
+A worker's own targeted correctness batches on its agent host do not each need an assignment.
+The coordinator takes one `kind: correctness` reservation per worker at launch (`execution run`,
+request id `<wave>-<issue>-<host>-iterate`, purpose naming the bounded aliases and `-j` width)
+and names it in the brief; the worker then runs those batches through the project runner
+without asking, blocks on each inside its turn, and reports every run directory. The
+reservation is concluded at hand-back with `conclude --from-run` on the last batch's record.
+Measurement, cross-box legs and full suites still go through a request. This is what the
+2026-09-15 coordinator ended up granting by message after sixteen request/assign/report
+round-trips parked three workers idle between review rounds.
+
+## Native Claude Code handoff
+
+A Claude Code subagent cannot wait for a message mid-turn, so its handoff is turn-shaped: the
+`EXECUTION_REQUEST` block ending a turn, `EXECUTION_ASSIGNED <id>` on resume by agent ID, and one
+`EXECUTION_RESULT {json}` line ending the result turn, which `conclude --from-run` consumes. The
+formats and the coordinator's side are in [native-codex.md](native-codex.md#claude-code-worker-channel).
 
 ## CLI reservation handoff
 
