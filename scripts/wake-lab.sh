@@ -391,14 +391,29 @@ lab_lock_path() { # lab_lock_path <box> — where that box's lock lives
 # that cannot be created or opened at all is treated as free, deliberately: that is a fault in
 # this machine's state directory, and it must not lock the operator out of their own lab (a real
 # holder had to create the file to hold it).
-lab_lock_take() { # lab_lock_take <box> <what> — 0 taken and held, 1 someone else holds it
+# The descriptor is a parameter so that ONE process can hold several boxes at once, each on its
+# own: `power_phase` reserves every box it is about to act on and must keep all of them for as long
+# as it acts. bash 3.2 has no `exec {fd}>`, hence the eval over an explicitly chosen number.
+lab_lock_take_fd() { # lab_lock_take_fd <box> <what> <fd> — 0 taken and held, 1 someone else holds it
   local path; path=$(lab_lock_path "$1")
   mkdir -p "$LOCK_DIR" 2>/dev/null || return 0
-  exec 8>>"$path" 2>/dev/null || return 0
-  perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&8 || return 1
+  eval "exec $3>>\"\$path\"" 2>/dev/null || return 0
+  perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&"$3" || return 1
   printf 'wake-lab %s (pid %s, since %s)\n' "$2" "$$" "$(date -u +%Y%m%dT%H%M%SZ)" \
     >"$path" 2>/dev/null
   return 0
+}
+
+lab_lock_take() { # lab_lock_take <box> <what> — the single-box form, on fd 8
+  lab_lock_take_fd "$1" "$2" 8
+}
+
+# The holder's own description of itself, for the refusal message. Never trusted for the decision
+# -- taking the lock makes that -- so an empty or truncated line degrades to a bare "held".
+lab_lock_holder() { # lab_lock_holder <box>
+  local path line; path=$(lab_lock_path "$1")
+  line=$(head -1 "$path" 2>/dev/null | tr -d '\000-\037')
+  printf '%s' "${line:-held by an unnamed holder}"
 }
 
 # The whole power phase, with every box it acts on RESERVED from before its command is sent until
@@ -412,53 +427,46 @@ lab_lock_take() { # lab_lock_take <box> <what> — 0 taken and held, 1 someone e
 # And it has to cover the EFFECT, not the command. A dropped ssh means the suspend was INITIATED,
 # not that the host is gone: for the seconds or minutes until it actually goes down the box still
 # answers, so a reservation released when `power_action` returns lets another harness take the lock
-# and start work that the pending transition then destroys. That is round 1's mistake one layer
+# and start work that the pending transition then destroys. That is the restart's mistake one layer
 # out — there the reservation did not cover the shutdown, here it did not cover what the shutdown
 # does — so the rule this file holds is that a reservation spans the effect, never the command.
 #
-# Recursive because bash 3.2 cannot allocate a descriptor per box: each level reserves ONE box on
-# its own fd 8 inside its own subshell, so an inner level's `exec 8>>` replaces only its inherited
-# copy of that descriptor while every outer level goes on holding its own. The innermost level acts
-# on the boxes that were reserved and confirms them together against one deadline, which is what
-# keeps the confirmation concurrent — confirming box by box would multiply the worst-case wait by
-# the number of boxes.
-POWER_ACTED=()
-POWER_REFUSED=()
+# THIS process holds every reservation, one descriptor each, and it is also the process that acts.
+# An earlier version reserved box N at recursion level N, each level a subshell, so the descriptors
+# lived in a chain of waiting ancestors — and killing the top-level command then released the first
+# box's lock while the surviving descendant went on issuing and confirming its suspend, freeing a
+# box whose power transition was still pending. Descriptors held by the actor cannot outlive it or
+# be released ahead of it: kill the command and every reservation goes at once, which is the only
+# arrangement where "reserved" and "still acting" cannot come apart. It is also the simpler one —
+# a flat loop rather than a recursion — and it keeps the confirmation concurrent, against one
+# deadline, where confirming box by box would multiply the worst-case wait by the number of boxes.
 power_phase() { # power_phase <verb> <box...> — nonzero if any box was refused or never went down
   local verb=$1; shift
-  local box rc=0
-  if [ $# -eq 0 ]; then
-    if [ ${#POWER_ACTED[@]} -gt 0 ]; then
-      for box in "${POWER_ACTED[@]}"; do power_action "$verb" "$box"; done
-      echo "confirming..."
-      # Its status is the phase's: a box that never went down is a failure of this command, and
-      # letting a trailing conditional swallow it would report success over the very line that
-      # says the suspend may not have taken.
-      confirm_down "${POWER_ACTED[@]}" || rc=1
+  local box fd=8 rc=0 acted=() refused=()
+  for box in "$@"; do
+    if [ "$FORCE" = 1 ]; then acted+=("$box"); continue; fi
+    if lab_lock_take_fd "$box" "$verb" "$fd"; then
+      acted+=("$box"); fd=$((fd + 1))
+    else
+      echo "  $verb REFUSED on $box: $(lab_lock_holder "$box")"
+      refused+=("$box")
     fi
-    if [ ${#POWER_REFUSED[@]} -gt 0 ]; then
-      echo "$verb REFUSED on: ${POWER_REFUSED[*]} (the lab lock is held; wait for the holder, or --force to take the box anyway)"
-      rc=1
-    fi
-    return $rc
+  done
+  # Only the boxes actually acted on are confirmed: polling a refused box for the DOWN signal
+  # would report the holder's live machine as a failure to go down.
+  if [ ${#acted[@]} -gt 0 ]; then
+    for box in "${acted[@]}"; do power_action "$verb" "$box"; done
+    echo "confirming..."
+    # Its status is the phase's: a box that never went down is a failure of this command, and
+    # letting a trailing conditional swallow it would report success over the very line that says
+    # the suspend may not have taken.
+    confirm_down "${acted[@]}" || rc=1
   fi
-  box=$1; shift
-  if [ "$FORCE" != 1 ] && ! lab_lock_take "$box" "$verb"; then
-    echo "  $verb REFUSED on $box: $(lab_lock_holder "$box")"
-    POWER_REFUSED+=("$box")
-    ( power_phase "$verb" "$@" )
-    return $?
+  if [ ${#refused[@]} -gt 0 ]; then
+    echo "$verb REFUSED on: ${refused[*]} (the lab lock is held; wait for the holder, or --force to take the box anyway)"
+    rc=1
   fi
-  POWER_ACTED+=("$box")
-  ( power_phase "$verb" "$@" )
-}
-
-# The holder's own description of itself, for the refusal message. Never trusted for the decision
-# -- lab_lock_free makes that -- so an empty or truncated line degrades to a bare "held".
-lab_lock_holder() { # lab_lock_holder <box>
-  local path line; path=$(lab_lock_path "$1")
-  line=$(head -1 "$path" 2>/dev/null | tr -d '\000-\037')
-  printf '%s' "${line:-held by an unnamed holder}"
+  return $rc
 }
 
 wake() { # wake <box>

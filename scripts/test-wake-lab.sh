@@ -638,6 +638,46 @@ grep -q 'shutdown /h' "$SSH_LOG" \
   && ok "...and stays reserved through the confirmation, not just the command" \
   || ko "the reservation was released before the box was down: $(grep '^lock ' "$SSH_LOG")"
 
+# Every reservation belongs to the process that ACTS, not to a chain of ancestors. An earlier
+# version reserved box N at recursion level N, each level a subshell, so killing the top-level
+# command released the FIRST box's lock while the surviving descendant went on issuing and
+# confirming its suspend — freeing a box whose power transition was still pending, which is the
+# whole hazard the reservation exists to prevent. Killing the command must free every box or none.
+lock_free() { # lock_free <box> — true iff nothing holds that box's lock
+  [ -e "$LOCKS/$1.lock" ] || return 0
+  perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <"$LOCKS/$1.lock" 2>/dev/null
+}
+: > "$SSH_LOG"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=60 \
+    SSH_UP="rog-lan rog-nv-win minix-lan minix-amd-win" \
+    "$WL" hibernate rog minix >"$TMP/phase.out" 2>&1 8>&- &
+phase_pid=$!
+# Wait for the phase to have reserved both boxes and reached its confirmation loop.
+phase_deadline=$((SECONDS + 20))
+while lock_free rog || lock_free minix; do
+  [ "$SECONDS" -ge "$phase_deadline" ] && break
+  sleep 1
+done
+if ! lock_free rog && ! lock_free minix; then
+  ok "a multi-box power command reserves every box it acts on"
+else
+  ko "the phase did not hold both boxes (rog free=$(lock_free rog && echo yes || echo no), minix free=$(lock_free minix && echo yes || echo no))"
+fi
+kill "$phase_pid" 2>/dev/null
+wait "$phase_pid" 2>/dev/null
+# A moment for any child that inherited the descriptors to go with it -- confirm_down's `sleep` is
+# one, and the inherited-descriptor rule above is why it counts.
+kill_deadline=$((SECONDS + 20))
+while ! lock_free rog || ! lock_free minix; do
+  [ "$SECONDS" -ge "$kill_deadline" ] && break
+  sleep 1
+done
+if lock_free rog && lock_free minix; then
+  ok "...and killing it frees every one of them, not just the outermost"
+else
+  ko "a box stayed reserved after the command was killed (rog free=$(lock_free rog && echo yes || echo no), minix free=$(lock_free minix && echo yes || echo no))"
+fi
+
 # The path is the whole contract with the sweep, so it must not need the site table: the harness
 # asking where to put its flock runs from a checkout with no business holding this lab's MACs.
 out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_LOCK_DIR="$LOCKS" "$WL" lock-path minix 2>&1); rc=$?
