@@ -4104,7 +4104,7 @@ cmd_base() {
   local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
   local nogo_at_tip=0 last_tip="" grace_from confirm wf="" wid wname part sleep_for remaining
   local norun=0 tip_seen_at tip_age hold ebranch
-  local tip_unjudged=0 unrun=0 unrun_rows="" settle_why
+  local tip_unjudged=0 unrun_rows="" settle_why
   local started now beat waited_note="" no_tip_verdict=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -4134,7 +4134,7 @@ cmd_base() {
   grace_from=$started
   while :; do
     red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0 norun=0
-    tip_unjudged=0 unrun=0 unrun_rows=""
+    tip_unjudged=0 unrun_rows=""
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
     tip=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || tip=""
@@ -4245,7 +4245,6 @@ cmd_base() {
             '$1 == w && $5 == t { found = 1 } END { exit !found }' <<<"$allruns"; then
             tip_unjudged=$((tip_unjudged + 1))
           else
-            unrun=$((unrun + 1))
             unrun_rows="${unrun_rows}${wfid}"$'\t'"${name}"$'\t'"${vsha}"$'\n'
           fi
         fi
@@ -4361,7 +4360,7 @@ cmd_base() {
     # replacement to appear, and then the honest verdict is "none".
     elif [ "$uncovered" -gt 0 ] && [ "$tip_unjudged" -eq 0 ]; then
       settle_why=""
-      if [ "$unrun" -eq "$uncovered" ] && tip_within_paths_ignore "$unrun_rows" "$tip"; then
+      if tip_within_paths_ignore "$unrun_rows" "$tip"; then
         settle_why="(the tip's diff from the judged commit is entirely within the paths-ignore of $PATHS_IGNORE_WHY, so no run for it is coming — the verdicts above are about the commit each line names)"
       elif [ $((now - grace_from)) -ge "$ABSENT_GRACE" ]; then
         settle_why="(waited $(((now - started) / 60)) min: no run for the tip appeared and none is in flight for it — the verdicts above may trail it)"

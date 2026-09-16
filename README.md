@@ -433,7 +433,9 @@ read, or `skip` with the reason it cannot be checked here), so a failure localiz
 that moved; its exit code separates a moved belief (1), an addressed endpoint answering 4xx (4) and
 a read the token was refused (5) from the API not answering or throttling (3), and the reporter
 files everything but the last, naming which: the fields `run_signal`, `build_checks`, `run_red_is_advisory_only`, `pr_head_read`,
-`warn_base_drift` and `status_state` index; the newest-first order of `actions/runs`; the status,
+`warn_base_drift` and `status_state` index; the workflow file `workflow_paths_ignore` reads under
+the raw media type (the base64 envelope arriving instead would cost every paths-ignore recognition
+silently); the newest-first order of `actions/runs`; the status,
 conclusion, mergeable-state and review-state vocabularies; that a merged PR's `.base.sha` is a
 snapshot standing behind the merge's first parent (anchored on #53); and the reviewer feeds' shapes
 (the `[bot]` suffix, the `+1` approval, `COMMENTED` rounds, the summary tag, 30-per-page

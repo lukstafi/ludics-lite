@@ -300,6 +300,21 @@ if is_num "$wid"; then
   wf=$(api "repos/$REPO/actions/workflows/$wid")
   pin "workflow_id resolves to a workflow FILE whose name is the run's name (the fold keys on the file, not the display name)" \
     '(.path | startswith(".github/workflows/")) and .name == $wname' "$wf" --arg wname "$wname"
+  # The file's own text, which is what `base --wait` reads to decide whether a tip with no run is
+  # one the workflow's paths-ignore excludes (workflow_paths_ignore). It asks for the RAW media
+  # type, because the JSON envelope's base64 body wants a decoder spelled `-d` on one of this
+  # fleet's platforms and `-D` on the other. What can move is the media type being ignored and the
+  # envelope arriving anyway: the parser would see one long line of base64, refuse it, and every
+  # paths-ignore recognition would quietly cost the grace instead.
+  wpath=$(jq -r '.path // empty' <<<"$wf")
+  case "$wpath" in
+  .github/workflows/*)
+    wbody=$(api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/$wpath?ref=$HEAD")
+    pin "contents/<path> under the raw media type answers with the workflow file's own text, not the base64 JSON envelope" \
+      '(test("(^|\n)(on|\"on\")[ ]*:")) and (test("\"content\"[ ]*:") | not)' "$(jq -Rs . <<<"$wbody")"
+    ;;
+  *) skip "the workflow file's own text" "$UNUSABLE" ;;
+  esac
 else
   skip "workflow_id resolves to a workflow file" "$UNUSABLE"
 fi
