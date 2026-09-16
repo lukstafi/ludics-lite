@@ -415,9 +415,10 @@ gh_err_line() {
 }
 
 # --- repo resolution ------------------------------------------------------------------------
-# A background shell does not reliably start in the checkout, so cwd inference is the LAST resort
-# among the sources the caller controls, not the first. Resolution happens after the PR argument
-# is parsed, because that argument may carry the repo itself.
+# A PR is addressed by a repo and a number, and the number alone names one in every repository
+# there is. So the repo is either NAMED or it is refused: there is no inference from the working
+# directory (ludics-lite#92, and see resolve_repo for why verifying such a guess cannot work).
+# Resolution happens after the PR argument is parsed, because that argument may carry the repo.
 
 # Remembering the repo per PR number is what keeps a follow-up call (a reply, a resolve) working
 # when only the first call spelled the repo out. A bare PR number is not unique across repos, so
@@ -476,42 +477,37 @@ verify_repo() {
   [ "$n" = "$2" ]
 }
 
-# The cwd and the cache are the two GUESSES here, and both are verified on the same terms before
-# anything is read or written through them (ludics-lite#92). The cwd branch used to be trusted
-# outright, and cached besides: a bare `reply 7` typed from another project's worktree resolved to
-# whatever repo that checkout names and posted onto ITS PR 7 — the skill's own tooling writing into
-# a stranger's review thread, and then remembering the wrong repo for every later call about 7.
-# #74 (PR #79) removed the same guess from `retry run watch` by refusing it outright; here it is
-# verified instead, because the cwd is the one source a FOREGROUND caller in the right checkout has
-# and refusing it would cost every such caller a `--repo` for a guess that is usually right. What
-# must never happen is trusting it while it is still a guess, and that is the part verification
-# removes: the repo a spelled-out argument, `--repo` or `REPO=` names is authoritative and stays
-# unverified; the two inferred ones are not.
+# Two sources, and only one of them is the caller's WORD. A repo the caller names — a spelled-out
+# owner/name#<n> argument, --repo, REPO= — is authoritative. The cache is a memory of such a
+# naming, keyed by a PR number that is not unique across repositories, so it is verified against
+# the API before it is trusted: a wrong repo would post a reply onto an unrelated PR, which is
+# worse than the error it is standing in for.
+#
+# The cwd used to be a third source, and it was neither named nor verified: `repo_from_cwd` was
+# trusted outright and its answer cached, so a bare `reply 7` typed from a shell sitting in another
+# project's worktree posted into whatever PR 7 is over there — and then remembered that repo for
+# every later call about 7 (ludics-lite#92).
+#
+# Verifying it the way the cache is verified does NOT fix that, and this is the half worth writing
+# down, because it is the fix that looks right: `repos/<repo>/pulls/7` answers "this repository has
+# a seventh PR", not "this is the PR you meant". Every active repository has a PR 7. So on exactly
+# the invocation the safeguard exists for — a worktree of ANOTHER project, which is where a fleet
+# worker's shell sits — the check passes and the write lands on a stranger's review thread, now
+# with a verification behind it. A claim that cannot fail, standing in for a safeguard, is worse
+# than no safeguard at all. And no read can stand in for it either: what the cwd is a guess about
+# is INTENT, and the API has nothing to say about that.
+#
+# So the guess is refused, as ludics-lite#74 (PR #79) refused it for `retry run watch` after a
+# background shell in a sibling worktree turned a wrong-target read into a failed-run verdict. The
+# cost is one `owner/name#<n>` per call, which is what this skill's instructions have always told
+# callers to write; what it buys is that no command here can address a repository nobody named.
+# `repo_from_cwd` survives for `base`, which resolves a repo and a BRANCH — a name the API can
+# actually be asked about — and not a bare number that every repository answers to.
 resolve_repo() {
-  local pr="$1" guess="" cached rc
+  local pr="$1" cached rc
   if [ -n "$REPO" ]; then
     cache_put "$pr" "$REPO"
     return 0
-  fi
-  REPO=""
-  # Into `guess`, never into REPO: an unverified value in REPO is one early `return` away from
-  # being the repo a write addresses, and it is what the cache used to be filled from.
-  if guess=$(repo_from_cwd) && [ -n "$guess" ]; then
-    verify_repo "$guess" "$pr"
-    rc=$?
-    case "$rc" in
-    0)
-      REPO="$guess"
-      cache_put "$pr" "$guess"
-      return 0
-      ;;
-    3) fail 3 "cannot verify PR $pr against $guess, the repo this working directory names — the" \
-      "API did not answer after $API_ATTEMPTS attempts ($(gh_err_line)). This is TRANSPORT, not a" \
-      "wrong repo: retry, or name the repo as owner/name#$pr to skip the verification entirely." ;;
-    esac
-    # rc 1: the API answered, and $guess has no PR $pr. The cwd is simply the wrong checkout for
-    # this number, so fall through — the cache may still know the right repo, and if it does not,
-    # the refusal below names the guess that was rejected rather than pretending none was made.
   fi
   if cached=$(cache_get "$pr"); then
     verify_repo "$cached" "$pr"
@@ -526,16 +522,14 @@ resolve_repo() {
       "retry, or name the repo as owner/name#$pr to skip the verification entirely." ;;
     esac
   fi
-  [ -z "$guess" ] || die "PR $pr is not in $guess, the repo this working directory belongs to," \
-    "so nothing was read there and nothing was written there. A cwd-inferred repo is a GUESS," \
-    "verified against repos/<repo>/pulls/$pr before it is trusted or cached (ludics-lite#92)," \
-    "because a wrong one would post onto an unrelated PR. If $pr is a PR somewhere else, name" \
-    "that repo: owner/name#$pr (or --repo owner/name, or REPO=owner/name)."
-  die "cannot tell which repo PR $pr belongs to." \
+  die "cannot tell which repo PR $pr belongs to, and nothing was read or written anywhere." \
     "Pass it as owner/name#$pr (or --repo owner/name, or REPO=owner/name)." \
-    "This usually means a BACKGROUND invocation: background shells do not start in the checkout," \
-    "so cwd inference only works in the foreground. The skill's documented \`watch\` call is a" \
-    "backgrounded one, which is why it always names the repo."
+    "It is NOT taken from the working directory: a checkout names a repository, and every active" \
+    "repository has a PR $pr, so the wrong checkout resolves to an unrelated PR of that number" \
+    "rather than to an error — a write onto a stranger's review thread (ludics-lite#92)." \
+    "A BACKGROUND invocation is where that bites hardest, since background shells do not start" \
+    "in the checkout; the skill's documented \`watch\` call is a backgrounded one, which is why" \
+    "it always names the repo."
 }
 
 # Accept both a bare number and owner/name#number (the form PR URLs and cards use); anything else

@@ -381,11 +381,15 @@ exits stay apart inside a batch — a 4xx rejected (1), anything else ambiguous 
 pins where a write is ALLOWED to land (ludics-lite#92): `resolve_repo` verified a cached repo
 against `repos/<repo>/pulls/<n>` and trusted the cwd-inferred one above it outright, and cached it,
 so a bare `reply 7` from a shell in another project's worktree posted into that project's PR 7 and
-remembered the wrong repo for every later call. An inferred repo is now verified on the same terms
-as a cached one, through either half of the inference (`gh repo view`, and the `origin` remote it
-falls back to), with the checkout that really has the PR as the passing control and a case that the
-rejected guess is not cached either — the writing commands run from a scratch checkout naming a
-third repository, as in `run-watch`'s control.
+remembered the wrong repo for every later call. The repo is now NAMED or refused — the cwd is not a
+source, and verifying it the way the cache is verified would not have made it one, since
+`repos/<repo>/pulls/7` answers "this repository has a seventh PR" and every active repository does.
+The cases run the writing commands from a scratch checkout naming a third repository with
+`gh repo view` answering a fourth, as in `run-watch`'s control, and nothing is read before the
+refusal; a checkout that really *has* PR 7 gets its own case, since that is the invocation a
+verification could not fail on. The controls are a named repo writing from that same wrong cwd, and
+the cache serving a later bare number — what the caller named, verified, never what the cwd
+pointed at.
 
 `test-pr-review-base-red.sh` covers the other `base` — the one that answers "is the branch I am
 about to work off green", and what it says once the answer is no (ludics-lite#73). A red names the
