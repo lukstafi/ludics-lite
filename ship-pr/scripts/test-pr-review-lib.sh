@@ -114,7 +114,6 @@ fi
 unset lib_predefined
 
 export SHIP_PR_TEST_SOURCE_ONLY=1
-export SHIP_PR_STATE_DIR=off
 export SHIP_PR_API_ATTEMPTS=1
 export SHIP_PR_API_BACKOFF=0
 # The set `retune` accepts: the names sourcing pr-review.sh ASSIGNS, asked of a probe that does
@@ -155,7 +154,7 @@ lib_probe_err="${TMPDIR:-/tmp}/pr-review-probe.$$.err"
 lib_probe_rc=0
 HELPER_CONSTANTS=" $(
   env -i "PATH=$PATH" "HOME=${HOME:-}" "TMPDIR=${TMPDIR:-/tmp}" \
-    SHIP_PR_TEST_SOURCE_ONLY=1 SHIP_PR_STATE_DIR=off \
+    SHIP_PR_TEST_SOURCE_ONLY=1 \
     bash -c '
       # The warm-up: a pipeline for PIPESTATUS, a regex match for BASH_REMATCH, a read for REPLY.
       : | : >/dev/null
@@ -1064,11 +1063,12 @@ test_retune_of_a_name_the_script_does_not_set_is_refused() {
   assert_eq "$CONTROL_RC" 1 "a variable the shell creates is not a constant ($CONTROL_ERR)"
   assert_contains "$CONTROL_ERR" "retune PIPESTATUS: pr-review.sh sets no PIPESTATUS when it is sourced" \
     "PIPESTATUS should be refused by name"
-  # The other side of that probe: the constants it must accept, including one assigned inside a
-  # top-level `case` rather than in a stanza of its own.
-  control 'retune GRACE=1 STALL=2 ROUND_GAP=3 ABSENT_GRACE=4 CHECKS_INTERVAL=5 CACHE_OFF=6' \
-    '[ "$GRACE$STALL$ROUND_GAP$ABSENT_GRACE$CHECKS_INTERVAL$CACHE_OFF" = 123456 ] ||
-       bail "the constants did not take: $GRACE$STALL$ROUND_GAP$ABSENT_GRACE$CHECKS_INTERVAL$CACHE_OFF"'
+  # The other side of that probe: the constants it must accept, from both ends of the file — the
+  # block that runs as pr-review.sh is sourced, and the ones a subcommand's section sets hundreds
+  # of lines further down, which a probe that stopped reading early would miss.
+  control 'retune GRACE=1 STALL=2 ROUND_GAP=3 ABSENT_GRACE=4 CHECKS_INTERVAL=5 STALE_BASE=6' \
+    '[ "$GRACE$STALL$ROUND_GAP$ABSENT_GRACE$CHECKS_INTERVAL$STALE_BASE" = 123456 ] ||
+       bail "the constants did not take: $GRACE$STALL$ROUND_GAP$ABSENT_GRACE$CHECKS_INTERVAL$STALE_BASE"'
   assert_eq "$CONTROL_RC" 0 "every documented constant is retunable ($CONTROL_ERR)"
   assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
 }

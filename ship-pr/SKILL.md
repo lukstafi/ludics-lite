@@ -95,9 +95,10 @@ repository has a seventh PR", not "this is the PR you meant". The refusal also b
 the old inference did not: three `reply` calls in one message, the first two landing and the third
 dying, was a partial success that read as success.
 
-A repo you have named is cached per PR number, verified against the API before it is reused, so a
-later bare-number call in the same session usually still works — but the cache remembers what *you*
-named, never a guess, and it is a safety net rather than something to rely on for the first call.
+There is no per-PR repo cache any more either, and for the same reason: it remembered a repo by
+*number*, across checkouts and across sessions, so once anything had named `repo-a#7`, a later bare
+`reply 7` meant for repo B resolved to repo A — and verifying it passed, because repo A does still
+have a PR 7. Name the repo in every call; nothing remembers it for you.
 
 ## Read the base before you branch
 

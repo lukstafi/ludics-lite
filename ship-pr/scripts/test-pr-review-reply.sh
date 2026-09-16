@@ -74,7 +74,7 @@ threads_json() {
 # parser consumes an option's value on purpose (a `-f body=…` must not become the endpoint), and
 # what these cases are about is exactly WHICH body reached WHICH thread.
 gh() {
-  local arg body="" query="" id repo
+  local arg body="" query="" id
   for arg in "$@"; do
     case "$arg" in
     body=*) body="${arg#body=}" ;;
@@ -102,19 +102,6 @@ gh() {
     fi
     gh_fixture_answer "$(jq -cn --arg id "$id" \
       '{html_url:("https://github.com/example/repo/pull/7#discussion_r" + $id)}')"
-    ;;
-  # `verify_repo`: the read that stands between a guessed repo and a write into it. This repo has
-  # PR 7 and no other repo does, which is what makes a cwd pointing elsewhere a 404 here rather
-  # than a silent success against someone else's seventh PR.
-  "repos/"*"/pulls/7")
-    repo="${FIXTURE_ENDPOINT#repos/}"
-    repo="${repo%/pulls/7}"
-    if [ "$repo" = "$TARGET_REPO" ]; then
-      gh_fixture_answer '{"number":7}'
-    else
-      echo "gh: Not Found (HTTP 404)" >&2
-      return 1
-    fi
     ;;
   graphql)
     case "$query" in
@@ -444,9 +431,10 @@ test_a_missing_thread_names_where_the_batch_stopped() {
 # shell sitting in another project's worktree posted into whatever PR 7 is over there, and then
 # remembered that repo for every later call about 7.
 #
-# Verifying the cwd the way the cache is verified is the fix that looks right and is not one, which
-# is why the collision case below has a case of its own: repos/<repo>/pulls/7 answers "this
-# repository has a seventh PR", and every active repository does. So the cwd is refused instead.
+# Verifying such a guess is the fix that looks right and is not one, which is why the collision
+# case below has a case of its own: repos/<repo>/pulls/7 answers "this repository has a seventh
+# PR", and every active repository does. So the guess is refused instead — the cwd, and the per-PR
+# cache that carried the same ambiguity across checkouts and sessions (round 2 of #161).
 # These cases run the writing commands with no repo named, from a scratch checkout whose `origin`
 # names a third repository and with `gh repo view` answering a fourth: both halves of the inference
 # armed, as in #74's control, and nothing read or written through either.
@@ -487,7 +475,7 @@ test_a_reply_never_takes_its_repo_from_the_cwd() {
   run_cmd_from_cwd cmd_reply 7 900 "Fixed in round 3 (abc1234): the guard now fires."
   assert_eq "$RC" 2 "a bare PR number with no repo named is an invocation error ($ERR)"
   assert_contains "$ERR" "owner/name#7" "the refusal spells the form that names the repo"
-  assert_contains "$ERR" "nothing was read or written anywhere" "and says so plainly"
+  assert_contains "$ERR" "Nothing was read or written anywhere" "and says so plainly"
   assert_not_contains "$ERR" "cwd-inferred/repo" "the cwd's repo is not named as a target"
   assert_not_contains "$ERR" "cwd-git/repo" "and neither is the origin remote's"
   assert_eq "$(posted_to 900)" "" "no reply may reach the thread this number names anywhere"
@@ -532,39 +520,22 @@ test_a_named_repo_writes_from_any_cwd() {
   assert_not_contains "$(cat "$REQUEST_LOG")" "cwd-inferred" "never where the cwd pointed"
 }
 
-# The cache is the one inference left, and what it remembers is a repo the CALLER named — never a
-# cwd, which now reaches it through no path at all. The suites run with the cache off
-# (SHIP_PR_STATE_DIR=off), so this case turns it on for itself, into scratch space.
-test_the_cache_remembers_what_was_named_and_never_the_cwd() {
-  local cache_dir
-  reset_fixture
-  test_tmpdir cache_dir cache
-  retune STATE_DIR="$cache_dir" CACHE="$cache_dir/repo-by-pr" CACHE_OFF="" \
-    CACHE_OFF_FILE="$cache_dir/nocache"
-  scratch_checkout cwd-git/repo
-  CWD_REPO=cwd-inferred/repo
-  run_cmd_from_cwd cmd_reply 7 900 "Fixed in round 3 (abc1234)."
-  assert_eq "$RC" 2 "the bare number is still refused with the cache on ($ERR)"
-  assert_eq "$(cat "$cache_dir/repo-by-pr" 2>/dev/null || true)" "" \
-    "and a refused call remembers nothing for PR 7"
-  # Naming the repo once is what fills the cache.
-  reset_fixture
-  run_cmd cmd_reply 900 "Fixed in round 3 (abc1234)."
-  assert_eq "$RC" 0 "a named repo replies ($ERR)"
-  assert_contains "$(cat "$cache_dir/repo-by-pr" 2>/dev/null || true)" "7 $TARGET_REPO" \
-    "and is remembered for the next call"
-  # And THAT is what a later bare number resolves through — from the wrong checkout, with both
-  # halves of the cwd inference still armed — because it is the caller's own word, verified before
-  # it is trusted. The write goes to the repo that was NAMED, not to the one the cwd points at.
+# What round 2 of #161 caught, and the reason the per-PR repo cache is gone rather than kept as
+# "the one inference left": it carries the same intent ambiguity the cwd did. It remembered a repo
+# by NUMBER, across checkouts and across sessions, so once anything had named repo-a#7, a later
+# bare `reply 7` meant for repo B resolved to repo A — and verification passed, because repo A does
+# still have a PR 7. So a bare number is refused however many repos have been named before it.
+test_a_bare_number_is_refused_even_after_a_named_call() {
   reset_fixture
   scratch_checkout cwd-git/repo
   CWD_REPO=cwd-inferred/repo
+  run_cmd_from_cwd cmd_reply "$TARGET_REPO#7" 900 "Fixed in round 3 (abc1234)."
+  assert_eq "$RC" 0 "naming the repo replies, and is what fills a memory if there is one ($ERR)"
+  reset_fixture
   run_cmd_from_cwd cmd_reply 7 900 "Fixed in round 4 (def5678)."
-  assert_eq "$RC" 0 "a bare number resolves through the cache ($ERR)"
-  assert_contains "$(posted_to 900)" "Fixed in round 4 (def5678)." "and the reply lands"
-  assert_contains "$(cat "$REQUEST_LOG")" "repos/$TARGET_REPO/pulls/7" \
-    "the remembered repo having been verified first"
-  assert_not_contains "$(cat "$REQUEST_LOG")" "cwd-inferred" "and the cwd reached nothing"
+  assert_eq "$RC" 2 "the next bare number is refused all the same ($ERR)"
+  assert_eq "$(posted_to 900)" "" "nothing is posted on the strength of an earlier call"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and nothing is read to try to make one stand up"
 }
 
 tests=(
@@ -585,7 +556,7 @@ tests=(
   test_the_refusal_holds_when_the_cwd_repo_has_that_pr_number
   test_a_resolve_never_takes_its_repo_from_the_cwd
   test_a_named_repo_writes_from_any_cwd
-  test_the_cache_remembers_what_was_named_and_never_the_cwd
+  test_a_bare_number_is_refused_even_after_a_named_call
 )
 
 run_tests "${tests[@]}"

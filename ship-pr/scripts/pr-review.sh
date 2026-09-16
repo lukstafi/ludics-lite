@@ -23,9 +23,9 @@
 #     hides every inline finding — the watermark is per feed, an opaque comma-joined triple;
 #   - reviewThreads paginates at 100 too, so a long-running PR's later threads are unaddressable
 #     ("no review thread starts at comment N") unless the resolve lookup pages to the end;
-#   - the repo cannot be inferred from the cwd in a BACKGROUND shell, and the skill's documented
-#     `watch` invocation is a backgrounded one — so the repo travels in the PR argument
-#     (owner/name#number) and is cached per PR number for the calls that follow;
+#   - a PR number names one PR in EVERY repository, so a repo that was not spelled out in the
+#     invocation is a guess about intent that no read can check — the repo travels in the PR
+#     argument (owner/name#number), and a bare number with no repo named is refused;
 #   - an API failure and a genuinely empty feed both render as `[]`, so a read that failed must
 #     report UNKNOWN and never "no approval yet" — that is a silent false negative on the merge
 #     gate, and it fired for real during the 2026-08-17 GitHub outage on an approved PR;
@@ -142,7 +142,8 @@
 # Thread resolution has no REST equivalent and stays on GraphQL, but reports transport failure as
 # such instead of as "no such thread".
 #
-# Usage (<pr> is a number, or owner/name#number — prefer the latter, see the repo note below):
+# Usage (<pr> is owner/name#number, or a number with the repo named by --repo/REPO=; see the repo
+# note below — a bare number with no repo named anywhere is refused, never taken from the cwd):
 #   pr-review.sh [--repo owner/name] poll <pr> [watermark]
 #                                          # new comments/reviews above the watermark, each stamped
 #                                          # with the commit it is about; ends with one machine
@@ -229,11 +230,11 @@
 #             --allow-no-verdict). `checks` and `merge` add 5: SUPERSEDED — the PR head
 #             moved from the observed SHA. Re-run to judge the successor; no override bypasses 5.
 #
-# Env: REPO=owner/name (else the <pr> argument, else the cwd's checkout, else the per-PR cache —
-#      `retry run watch` takes only the first two, never the cwd and never the cache),
+# Env: REPO=owner/name, overridden by a repo spelled out in the <pr> argument or by --repo; those
+#      three are the ONLY sources, for every subcommand including `retry run watch` (`base`, which
+#      resolves a repo and a branch rather than a bare number, still reads the cwd's checkout),
 #      REVIEWER=login-prefix (default: codex app), WATCH_INTERVAL=seconds between polls (default
-#      90), WATCH_TIMEOUT=seconds to watch (900), SHIP_PR_STATE_DIR=where the cache lives
-#      (`off` disables the cache entirely — for sandboxes where even the attempted write warns),
+#      90), WATCH_TIMEOUT=seconds to watch (900),
 #      SHIP_PR_API_ATTEMPTS=tries per gh call (4), SHIP_PR_API_BACKOFF=first pause in seconds (5,
 #      doubling to a 20s cap: ~35s of retrying before a call is declared dead),
 #      SHIP_PR_REVIEW_GRACE=seconds a due-but-unstarted review is waited for before `watch` returns
@@ -267,28 +268,6 @@ ROUND_THRESHOLD="${SHIP_PR_ROUND_THRESHOLD:-12}"
 # Reviews of one round land within seconds of each other; a re-requested round on the SAME head
 # lands minutes or hours later. This gap is what tells them apart (seconds).
 ROUND_GAP="${SHIP_PR_ROUND_GAP:-900}"
-STATE_DIR="${SHIP_PR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ship-pr}"
-CACHE="$STATE_DIR/repo-by-pr"
-
-# The cache is a convenience, never a requirement, and in a sandboxed worker the write ATTEMPT is
-# what draws the harness's warning — on every call, when the state dir is unwritable and unreadable
-# (ludics-lite#2: workers given explicit owner/name#number arguments, which never need the cache,
-# still warned on each invocation). So it can be switched off outright (SHIP_PR_STATE_DIR=off),
-# and a failed write latches WRITES off. The latch is a file, not a variable, because cache_put
-# runs inside command substitutions (every `watch` round's poll is one), where a variable set
-# there would not survive to the next round — and it must outlive the PROCESS too, since every
-# documented pr-review.sh command is its own invocation and a per-process latch would re-attempt
-# the prohibited write once per command (review of self-improve#13). Hence: keyed by the state
-# dir (overriding SHIP_PR_STATE_DIR to a writable place re-enables caching instead of inheriting
-# a stale latch), and deliberately NOT removed by the exit trap. Reads are gated only by the
-# explicit off switch: a readable-but-unwritable cache keeps serving the mappings it already
-# holds — reading costs no prohibited write, and disabling it would turn every later bare-number
-# call into a usage failure over one unrelated write refusal (same review, round 4).
-CACHE_OFF_FILE="${TMPDIR:-/tmp}/pr-review-nocache.$(printf '%s' "$STATE_DIR" | cksum | cut -d' ' -f1)"
-case "$STATE_DIR" in off | none) CACHE_OFF=1 ;; *) CACHE_OFF="" ;; esac
-cache_disabled() { [ -n "$CACHE_OFF" ]; }
-cache_write_off() { cache_disabled || [ -e "$CACHE_OFF_FILE" ]; }
-
 API_ATTEMPTS="${SHIP_PR_API_ATTEMPTS:-4}"
 API_BACKOFF="${SHIP_PR_API_BACKOFF:-5}"
 
@@ -338,7 +317,7 @@ warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 # blank.
 GH_ERR=""
 GH_ERR_FILE="${TMPDIR:-/tmp}/pr-review-err.$$"
-trap 'rm -f "$GH_ERR_FILE"' EXIT # NOT the cache latch — it must persist across invocations
+trap 'rm -f "$GH_ERR_FILE"' EXIT
 
 gateway_failure() {
   case "$1" in
@@ -415,44 +394,35 @@ gh_err_line() {
 }
 
 # --- repo resolution ------------------------------------------------------------------------
-# A PR is addressed by a repo and a number, and the number alone names one in every repository
-# there is. So the repo is either NAMED or it is refused: there is no inference from the working
-# directory (ludics-lite#92, and see resolve_repo for why verifying such a guess cannot work).
-# Resolution happens after the PR argument is parsed, because that argument may carry the repo.
-
-# Remembering the repo per PR number is what keeps a follow-up call (a reply, a resolve) working
-# when only the first call spelled the repo out. A bare PR number is not unique across repos, so
-# a cache hit is VERIFIED against the API before it is trusted — a wrong repo would post a reply
-# onto an unrelated PR, which is worse than the error it is standing in for.
-cache_get() {
-  cache_disabled && return 1
-  [ -f "$CACHE" ] || return 1
-  local hit
-  hit=$(awk -v n="$1" '$1 == n { r = $2 } END { if (r != "") print r }' "$CACHE" 2>/dev/null)
-  [ -n "$hit" ] || return 1
-  echo "$hit"
-}
-
-# Last write wins, and a concurrent watch on another PR can drop an entry by rewriting the file
-# from a stale read. That costs a later cache MISS, never a wrong repo — the verify above is what
-# makes losing an entry harmless. Skipping the no-op rewrite keeps most of that window shut, since
-# a running `watch` re-resolves every round.
-cache_put() {
-  cache_write_off && return 0
-  [ "$(cache_get "$1" 2>/dev/null)" = "$2" ] && return 0
-  mkdir -p "$STATE_DIR" 2>/dev/null || {
-    : >"$CACHE_OFF_FILE" 2>/dev/null
-    return 0
-  }
-  local tmp="$CACHE.$$"
-  {
-    [ -f "$CACHE" ] && awk -v n="$1" '$1 != n' "$CACHE"
-    echo "$1 $2"
-  } >"$tmp" 2>/dev/null && mv -f "$tmp" "$CACHE" 2>/dev/null || : >"$CACHE_OFF_FILE" 2>/dev/null
-  rm -f "$tmp" 2>/dev/null
-  return 0
-}
-
+# A PR is addressed by a repository and a number, and the number alone names one PR in every
+# repository there is. So the repository is either SPELLED OUT in the invocation — an
+# owner/name#<n> argument, --repo, REPO= — or the call is refused. Resolution happens after the PR
+# argument is parsed, because that argument may carry the repo itself.
+#
+# Two other sources stood here and both are gone (ludics-lite#92). The cwd was trusted outright,
+# and cached: a bare `reply 7` typed from a shell sitting in another project's worktree posted into
+# whatever PR 7 is over there. The per-PR cache remembered a repo by NUMBER, across checkouts and
+# across sessions, so a `reply 7` meant for repo B resolved to the repo A that some earlier call
+# had named for 7.
+#
+# Both were verified against `repos/<repo>/pulls/<n>` before use, or could have been, and this is
+# the half worth writing down because verification is the fix that looks right: that read answers
+# "this repository has a seventh PR", not "this is the PR you meant". Every active repository has a
+# PR 7. So on exactly the invocations these guesses fail on — a worktree of another project, a
+# stale entry from yesterday's PR — the check passes and the write lands on a stranger's review
+# thread, now with a verification behind it. A claim that cannot fail, standing in for a
+# safeguard, is worse than no safeguard. Nor can any other read stand in: what both sources are
+# guesses about is INTENT, and the API has nothing to say about that.
+#
+# So there is no inference left, as ludics-lite#74 (PR #79) left none for `retry run watch` after a
+# background shell in a sibling worktree turned a wrong-target read into a failed-run verdict. The
+# cost is one `owner/name#<n>` per call, which is what this skill's instructions have always told
+# callers to write and what every documented invocation already spells out. What it buys is an
+# invariant with no exception to remember: no command here addresses a repository that this
+# invocation did not name.
+#
+# `repo_from_cwd` survives for `base` alone, which resolves a repo and a BRANCH — a name the API
+# can actually be asked about — rather than a bare number every repository answers to.
 repo_from_cwd() {
   local url
   # `gh repo view` first: it honours remote.origin.gh-resolved, so a fork checkout keeps naming
@@ -467,70 +437,18 @@ repo_from_cwd() {
   case "$url" in */*) echo "$url" ;; *) return 1 ;; esac
 }
 
-# 0 = that repo really has that PR, 1 = it does not, 3 = the API did not answer, so neither is
-# known — the caller must not turn an outage into "wrong repo".
-verify_repo() {
-  local n rc
-  n=$(gh_retry read api "repos/$1/pulls/$2" --jq .number)
-  rc=$?
-  [ "$rc" -eq 0 ] || return "$rc"
-  [ "$n" = "$2" ]
+resolve_repo() {
+  [ -z "$REPO" ] || return 0
+  die "PR $1 was given with no repository, and a PR number alone names one PR in every" \
+    "repository there is. Pass it as owner/name#$1 (or --repo owner/name, or REPO=owner/name)." \
+    "Nothing was read or written anywhere. It is NOT taken from the working directory and there" \
+    "is no per-number memory of an earlier call: either would resolve the wrong checkout, or" \
+    "yesterday's PR $1, to a real PR of that number rather than to an error — a write onto a" \
+    "stranger's review thread (ludics-lite#92). A BACKGROUND invocation is where that bit" \
+    "hardest, since background shells do not start in the checkout, and the skill's documented" \
+    "\`watch\` call is a backgrounded one."
 }
 
-# Two sources, and only one of them is the caller's WORD. A repo the caller names — a spelled-out
-# owner/name#<n> argument, --repo, REPO= — is authoritative. The cache is a memory of such a
-# naming, keyed by a PR number that is not unique across repositories, so it is verified against
-# the API before it is trusted: a wrong repo would post a reply onto an unrelated PR, which is
-# worse than the error it is standing in for.
-#
-# The cwd used to be a third source, and it was neither named nor verified: `repo_from_cwd` was
-# trusted outright and its answer cached, so a bare `reply 7` typed from a shell sitting in another
-# project's worktree posted into whatever PR 7 is over there — and then remembered that repo for
-# every later call about 7 (ludics-lite#92).
-#
-# Verifying it the way the cache is verified does NOT fix that, and this is the half worth writing
-# down, because it is the fix that looks right: `repos/<repo>/pulls/7` answers "this repository has
-# a seventh PR", not "this is the PR you meant". Every active repository has a PR 7. So on exactly
-# the invocation the safeguard exists for — a worktree of ANOTHER project, which is where a fleet
-# worker's shell sits — the check passes and the write lands on a stranger's review thread, now
-# with a verification behind it. A claim that cannot fail, standing in for a safeguard, is worse
-# than no safeguard at all. And no read can stand in for it either: what the cwd is a guess about
-# is INTENT, and the API has nothing to say about that.
-#
-# So the guess is refused, as ludics-lite#74 (PR #79) refused it for `retry run watch` after a
-# background shell in a sibling worktree turned a wrong-target read into a failed-run verdict. The
-# cost is one `owner/name#<n>` per call, which is what this skill's instructions have always told
-# callers to write; what it buys is that no command here can address a repository nobody named.
-# `repo_from_cwd` survives for `base`, which resolves a repo and a BRANCH — a name the API can
-# actually be asked about — and not a bare number that every repository answers to.
-resolve_repo() {
-  local pr="$1" cached rc
-  if [ -n "$REPO" ]; then
-    cache_put "$pr" "$REPO"
-    return 0
-  fi
-  if cached=$(cache_get "$pr"); then
-    verify_repo "$cached" "$pr"
-    rc=$?
-    case "$rc" in
-    0)
-      REPO="$cached"
-      return 0
-      ;;
-    3) fail 3 "cannot verify PR $pr against the cached repo $cached — the API did not answer" \
-      "after $API_ATTEMPTS attempts ($(gh_err_line)). This is TRANSPORT, not a wrong repo:" \
-      "retry, or name the repo as owner/name#$pr to skip the verification entirely." ;;
-    esac
-  fi
-  die "cannot tell which repo PR $pr belongs to, and nothing was read or written anywhere." \
-    "Pass it as owner/name#$pr (or --repo owner/name, or REPO=owner/name)." \
-    "It is NOT taken from the working directory: a checkout names a repository, and every active" \
-    "repository has a PR $pr, so the wrong checkout resolves to an unrelated PR of that number" \
-    "rather than to an error — a write onto a stranger's review thread (ludics-lite#92)." \
-    "A BACKGROUND invocation is where that bites hardest, since background shells do not start" \
-    "in the checkout; the skill's documented \`watch\` call is a backgrounded one, which is why" \
-    "it always names the repo."
-}
 
 # Accept both a bare number and owner/name#number (the form PR URLs and cards use); anything else
 # dies loudly. Without this, a malformed <pr> lands in the API path, api_list eats the error, and
@@ -2529,15 +2447,14 @@ cmd_resolve() {
 # signal, prefer `checks <pr> --wait`, which reads EVERY check on the head commit, not one run.
 #
 # The run is addressed the way a PR is — owner/name#<run-id>, through the same parse_ref — and the
-# repo is NEVER inferred from the cwd (ludics-lite#74). It used to be, and the inference is a
+# repo is NEVER inferred from the cwd (ludics-lite#74) — nor, since ludics-lite#92, is any
+# other subcommand's. It used to be, and the inference is a
 # false-verdict generator on exactly the invocation this await exists for: a worker whose
 # background shell had started in an ocannl-staging worktree awaited a ludics-lite run id, the
 # read 404'd against the repo the cwd named, and the await returned exit 1 over a run that was
 # fine — a red gate manufactured out of a wrong-target invocation. A cwd mismatch has to be an
 # INVOCATION error, so an unnamed repo is refused (exit 2) rather than guessed, and a named pair
-# the API says does not exist is one too (below) rather than a verdict about the run. The per-PR
-# repo cache is not consulted either: it is keyed by PR number, and a run id lives in a different
-# id space, so a hit there would be a coincidence pointing at an unrelated repository.
+# the API says does not exist is one too (below) rather than a verdict about the run.
 #
 # Exit codes, matching `checks`: 0 the run succeeded; 1 it concluded failure — a VERDICT, so do
 # not retry the watch, read the run; 2 the invocation is wrong (no repo named, a malformed run
@@ -4225,7 +4142,8 @@ main() {
   pr-review.sh retry [--read] <gh args...>   # any other gh call, same retry policy
   pr-review.sh retry run watch owner/name#<run-id>  # quiet await of ONE run (never forwarded
                                              # to gh); for a PR prefer: checks <pr> --wait
-  <pr> is a number or owner/name#number; prefer owner/name#number for background invocations.
+  <pr> is owner/name#number, or a number with --repo/REPO= naming the repo; a bare number with
+  no repo named is REFUSED, never resolved from the cwd (a PR number names one PR in every repo).
   The run argument takes the same form, and a bare run id without -R/REPO is refused." ;;
   esac
 }
