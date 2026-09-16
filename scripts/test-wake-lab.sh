@@ -16,6 +16,17 @@ EXAMPLE="$HERE/wake-lab-hosts.example.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/wake-lab-test.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
+# The lab lock directory, for the WHOLE suite and not merely the cases that are about locking.
+# Every `restart-wsl` here reserves its box for real, so without this the suite takes flocks under
+# the developer's own ~/.local/state/wake-lab -- writing lock files into $HOME, blocking a genuine
+# sweep or wake-lab run for as long as a case holds one, and (since a wedged case's orphaned `ssh`
+# inherits the descriptor) leaving one held for minutes after the suite exits. Two suite runs
+# overlapping then fight over the real lab's locks and fail each other's restart cases, which is
+# how this was found. Exported, so every invocation below inherits it whether or not it passes
+# `env`.
+LOCKS="$TMP/locks"; mkdir -p "$LOCKS"
+WAKE_LAB_LOCK_DIR="$LOCKS"; export WAKE_LAB_LOCK_DIR
+
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "PASS: $*"; }
 ko() { fail=$((fail + 1)); echo "FAIL: $*"; }
@@ -73,6 +84,18 @@ while [ $# -gt 0 ]; do
 done
 line=$(printf '%s ::%s' "$dest" "$cmd")
 printf '%s\n' "$line" >> "$SSH_LOG"
+# $LOCK_PROBE names a lock file to test AT THE MOMENT each remote command is issued, which is the
+# only way to observe from outside whether a reservation really spans what it claims to. A
+# restarter that merely probed the lock leaves it free by the time the shutdown lands; a power
+# phase that releases at `power_action` leaves it free by the time the confirmation polls. Both
+# read as HELD if the reservation is right and FREE if it is not, and neither is visible from
+# inside the script.
+if [ -n "${LOCK_PROBE:-}" ]; then
+  if perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' \
+       <"$LOCK_PROBE" 2>/dev/null
+  then printf 'lock FREE during%s\n' "$cmd" >> "$SSH_LOG"
+  else printf 'lock HELD during%s\n' "$cmd" >> "$SSH_LOG"; fi
+fi
 [ -n "${SSH_DELAY:-}" ] && sleep "$SSH_DELAY"
 [ -n "${SSH_HANG:-}" ] && grep -qE "$SSH_HANG" <<<"$line" && exec sleep 900
 case "$cmd" in *"${SSH_REFUSE:-}"*) [ -n "${SSH_REFUSE:-}" ] && exit 1 ;; esac
@@ -445,6 +468,222 @@ env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_WSL_STAR
   && ok "...nor does one whose cap fired and whose watchdog was mid-grace" \
   || ko "a fired cap orphaned its grace sleep: $(ps -eo pid,command | awk '/sleep 311[789]$/')"
 reap_naps
+
+# --- the lab lock stops a restart destroying someone else's VM ----------------------------------
+# 2026-09-16, the third and most expensive shape of the same day: `wsl.exe --shutdown` is
+# host-global, so a restart issued while the cross-machine sweep was 13 minutes into rog-nv/cuda
+# and minix/hip destroyed both VMs and both units. The sweep recorded `error`, which reads as a box
+# fault, and it was misattributed to the GPU autotune tests for two days. The lock is the interlock
+# that was missing; these cases pin that it actually refuses, and that it refuses ONLY the
+# destructive path.
+# Held the way the sweep holds it: a descriptor kept open, flock taken by a perl that exits. The
+# lock belongs to the open file description, so it outlives that perl and dies with this shell --
+# which is the property the whole contract rests on, so take it here exactly as the real holder does
+# rather than simulating a held lock with a flag file.
+hold_lock() { # hold_lock <box> <description>
+  printf '%s\n' "$2" > "$LOCKS/$1.lock"
+  eval "exec $3>>\"$LOCKS/$1.lock\""
+  perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&"$3"
+}
+wl_locked() { # wl_locked <args...> -- a run with both boxes' guests answering and the lock dir live
+  # `8>&-`: the checker must not inherit the HOLDER's descriptor. An flock lives until every
+  # descriptor onto that open file description is closed, so a child that inherited one keeps the
+  # lock alive after the holder let go -- and wake-lab's own `capped` leaves its watchdog `sleep`
+  # orphaned for the length of the cap, which would hold this test's lock for two minutes after
+  # `exec 8>&-`. In production the checker is a separate process that never had the descriptor at
+  # all, so closing it here is what models the real thing; the case below pins the property itself.
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+      SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" "$WL" "$@" 2>&1 8>&-
+}
+if hold_lock minix 'sweep 20260916T074913Z (pid 999, since 20260916T074913Z)' 8; then
+  ok "the lab lock can be taken the way a harness takes it"
+else
+  ko "could not take a test lab lock -- the cases below prove nothing"
+fi
+
+: > "$SSH_LOG"
+out=$(wl_locked restart-wsl rog minix); rc=$?
+grep -q '^minix-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ko "a held box was shut down anyway -- the interlock does not hold: $(cat "$SSH_LOG")" \
+  || ok "a restart does not shut down a box whose lab lock is held"
+[ "$rc" -ne 0 ] && grep -q 'REFUSED on: minix' <<<"$out" \
+  && ok "...and the step FAILS rather than reporting a fresh VM it did not make (rc=$rc)" \
+  || ko "a refused box did not fail the step (rc=$rc) -- $out"
+grep -q 'sweep 20260916T074913Z' <<<"$out" \
+  && ok "...and the refusal names the holder, so the operator knows what to wait for" \
+  || ko "the refusal does not say who holds the box -- $out"
+# The neighbour rule of the wedge cases above, applied to the lock: one held box must not cost the
+# others their restart, and `wsl up` must never appear unqualified over a box that was refused.
+grep -q '^rog-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ok "...and its neighbour still gets its restart" \
+  || ko "a held box cost its neighbour the restart: $(cat "$SSH_LOG")"
+grep -q '^wsl up$' <<<"$out" \
+  && ko "the run claimed a blanket 'wsl up' over a refused box -- $out" \
+  || ok "...and the verdict is never a blanket 'wsl up' while a box was refused"
+
+# --force is the override, and it is the ONLY thing that takes a held box.
+: > "$SSH_LOG"
+out=$(wl_locked restart-wsl --force minix); rc=$?
+[ "$rc" -eq 0 ] && grep -q '^minix-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ok "--force takes a held box anyway (rc=$rc)" \
+  || ko "--force did not override the lock (rc=$rc) -- $out"
+
+# A plain kick starts a VM that is already running as a no-op: it cannot cost a holder anything,
+# and gating it would make `kick-wsl` -- the recovery command for a box with no VM at all --
+# refusable at exactly the moment it is needed.
+: > "$SSH_LOG"
+out=$(wl_locked kick-wsl minix); rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'shutdown' "$SSH_LOG" \
+  && ok "a plain kick is not gated by the lock, and still shuts nothing down (rc=$rc)" \
+  || ko "the lock gated a non-destructive kick (rc=$rc) -- $out $(cat "$SSH_LOG")"
+
+# A free box is the ordinary case and must be untouched by any of this.
+: > "$SSH_LOG"
+out=$(wl_locked restart-wsl rog); rc=$?
+[ "$rc" -eq 0 ] && grep -q '^wsl up$' <<<"$out" \
+  && ok "a box whose lock is free restarts exactly as before (rc=$rc)" \
+  || ko "the lock broke the ordinary restart (rc=$rc) -- $out"
+
+# An INHERITED descriptor holds the lock too, and that is the semantics to want rather than a
+# wart: a child still talking to the box means the box is still in use, so it stays reserved. It is
+# also the sweep's own run lock's behaviour, where an orphaned dune keeping the worktree locked is
+# documented as correct. The consequence to know is that a holder's lock outlives it for as long as
+# any inheriting child runs, and `--force` is the way past one that has outstayed its welcome.
+sleep 30 8>&8 &
+inheritor=$!
+exec 8>&-
+out=$(wl_locked restart-wsl minix); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'REFUSED on: minix' <<<"$out" \
+  && ok "a child that inherited the descriptor keeps the box reserved (rc=$rc)" \
+  || ko "the lock died while an inheriting child was still running (rc=$rc) -- $out"
+expect "...and --force is the way past it" 0 "wsl up" -- \
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+      SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" "$WL" restart-wsl --force minix
+
+# Released with the holder: the sweep's lock dies with the sweep however it dies, which is why
+# there is nothing to reclaim after a crash.
+kill -KILL "$inheritor" 2>/dev/null; wait "$inheritor" 2>/dev/null
+out=$(wl_locked restart-wsl minix); rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "...and a lock whose holders are all gone stops refusing, with nothing to reclaim (rc=$rc)" \
+  || ko "a released lock still refuses (rc=$rc) -- $out"
+
+# The reservation is HELD ACROSS the shutdown, not checked before it. A restarter that only probes
+# the lock leaves a window between its check and its `wsl.exe --shutdown` — and a holder that
+# reserves the box inside that window is destroyed by a restart that had already decided it was
+# allowed to proceed, which is the exact race the interlock exists to close. Observed from the far
+# side: the ssh shim tests the lock at the instant the shutdown is issued.
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+    SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" LOCK_PROBE="$LOCKS/rog.lock" \
+    "$WL" restart-wsl rog 2>&1 8>&-); rc=$?
+grep -q '^lock HELD during .*--shutdown$' "$SSH_LOG" \
+  && ok "the box stays reserved for the length of its own restart (rc=$rc)" \
+  || ko "the lock was free when the shutdown landed — the check/act race is open: $(cat "$SSH_LOG")"
+
+# Power actions take the box away just as surely: hibernate terminates the VM outright, `down` is a
+# full host shutdown, and `sleep` suspends the host under whatever is running on it.
+if hold_lock minix 'sweep 20260916T074913Z (pid 999, since 20260916T074913Z)' 8; then
+  ok "the lab lock can be retaken for the power-action cases"
+else
+  ko "could not retake a test lab lock -- the power cases below prove nothing"
+fi
+for verb in hibernate down sleep; do
+  : > "$SSH_LOG"
+  out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+      SSH_UP="minix-lan minix-amd-win" "$WL" "$verb" minix 2>&1 8>&-); rc=$?
+  if [ "$rc" -ne 0 ] && grep -q "$verb REFUSED on: minix" <<<"$out" && ! grep -q 'shutdown /\|SetSuspendState' "$SSH_LOG"; then
+    ok "$verb refuses a reserved box, and sends nothing (rc=$rc)"
+  else
+    ko "$verb went through on a reserved box (rc=$rc) -- $out $(cat "$SSH_LOG")"
+  fi
+done
+# ...and a refused box is not then polled for the DOWN signal, which would report the holder's
+# live machine as a failure to go down.
+grep -q 'confirming' <<<"$out" \
+  && ko "a refused box was polled for the down signal -- $out" \
+  || ok "...and a refused box is not confirmed down"
+# --force is the same override here as everywhere else.
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="minix-lan minix-amd-win" "$WL" hibernate --force minix 2>&1 8>&-); rc=$?
+grep -q 'shutdown /h' "$SSH_LOG" \
+  && ok "--force hibernates a reserved box anyway (rc=$rc)" \
+  || ko "--force did not override the lock for a power action (rc=$rc) -- $out $(cat "$SSH_LOG")"
+# A free box is unaffected.
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="rog-lan rog-nv-win" "$WL" hibernate rog 2>&1 8>&-); rc=$?
+grep -q 'shutdown /h' "$SSH_LOG" && grep -q 'confirming' <<<"$out" \
+  && ok "a box whose lock is free hibernates exactly as before (rc=$rc)" \
+  || ko "the lock broke the ordinary power action (rc=$rc) -- $out $(cat "$SSH_LOG")"
+exec 8>&-
+
+# The reservation spans the EFFECT, not the command. A dropped ssh means the suspend was
+# INITIATED; until the box actually goes down it still answers, so a reservation released when
+# `power_action` returns lets another harness take the lock and start work the pending transition
+# destroys. Observed the same way as the restart race: the shim tests the lock as each command is
+# issued, and the CONFIRMATION probes come after the power command — so the last reading is the one
+# that says whether the box was still reserved while it was going down.
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="rog-lan rog-nv-win" LOCK_PROBE="$LOCKS/rog.lock" \
+    "$WL" hibernate rog 2>&1 8>&-); rc=$?
+grep -q 'shutdown /h' "$SSH_LOG" \
+  && ok "a free box is hibernated (rc=$rc)" \
+  || ko "the power action never went out (rc=$rc) -- $out $(cat "$SSH_LOG")"
+# More than one reading (so the confirmation really did probe after the power command), and not
+# one of them free.
+[ "$(grep -c '^lock ' "$SSH_LOG")" -gt 1 ] && ! grep -q '^lock FREE' "$SSH_LOG" \
+  && ok "...and stays reserved through the confirmation, not just the command" \
+  || ko "the reservation was released before the box was down: $(grep '^lock ' "$SSH_LOG")"
+
+# Every reservation belongs to the process that ACTS, not to a chain of ancestors. An earlier
+# version reserved box N at recursion level N, each level a subshell, so killing the top-level
+# command released the FIRST box's lock while the surviving descendant went on issuing and
+# confirming its suspend — freeing a box whose power transition was still pending, which is the
+# whole hazard the reservation exists to prevent. Killing the command must free every box or none.
+lock_free() { # lock_free <box> — true iff nothing holds that box's lock
+  [ -e "$LOCKS/$1.lock" ] || return 0
+  perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <"$LOCKS/$1.lock" 2>/dev/null
+}
+: > "$SSH_LOG"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=60 \
+    SSH_UP="rog-lan rog-nv-win minix-lan minix-amd-win" \
+    "$WL" hibernate rog minix >"$TMP/phase.out" 2>&1 8>&- &
+phase_pid=$!
+# Wait for the phase to have reserved both boxes and reached its confirmation loop.
+phase_deadline=$((SECONDS + 20))
+while lock_free rog || lock_free minix; do
+  [ "$SECONDS" -ge "$phase_deadline" ] && break
+  sleep 1
+done
+if ! lock_free rog && ! lock_free minix; then
+  ok "a multi-box power command reserves every box it acts on"
+else
+  ko "the phase did not hold both boxes (rog free=$(lock_free rog && echo yes || echo no), minix free=$(lock_free minix && echo yes || echo no))"
+fi
+kill "$phase_pid" 2>/dev/null
+wait "$phase_pid" 2>/dev/null
+# A moment for any child that inherited the descriptors to go with it -- confirm_down's `sleep` is
+# one, and the inherited-descriptor rule above is why it counts.
+kill_deadline=$((SECONDS + 20))
+while ! lock_free rog || ! lock_free minix; do
+  [ "$SECONDS" -ge "$kill_deadline" ] && break
+  sleep 1
+done
+if lock_free rog && lock_free minix; then
+  ok "...and killing it frees every one of them, not just the outermost"
+else
+  ko "a box stayed reserved after the command was killed (rog free=$(lock_free rog && echo yes || echo no), minix free=$(lock_free minix && echo yes || echo no))"
+fi
+
+# The path is the whole contract with the sweep, so it must not need the site table: the harness
+# asking where to put its flock runs from a checkout with no business holding this lab's MACs.
+out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_LOCK_DIR="$LOCKS" "$WL" lock-path minix 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "$LOCKS/minix.lock" ] \
+  && ok "lock-path answers without the site file, at the path the holder must take (rc=$rc)" \
+  || ko "lock-path did not answer the contract path without hosts.sh (rc=$rc) -- $out"
 
 # --- the polling loops are bounded by elapsed time, not by iteration count -----------------------
 # Every probe of a dark box burns its ConnectTimeout, so an iteration budget was a wall-clock lie:
