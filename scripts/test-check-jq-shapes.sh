@@ -140,6 +140,27 @@ jq -r '[.ids[]] | capture($rc).s | first' <<<"$raw"
 EOF
 )"
 
+# Round 2: jq allows whitespace between a filter name and its argument list, so a literal search
+# for `capture(` reported this file clean. Its control is the same call with no space, refused.
+expect "a capture called with a space before its argument is refused" 1 "$REFUSAL" -- \
+  "$CJ" "$(probe bad_spaced_call <<'EOF'
+jq -r '.[] | capture ("x") | .s' <<<"$raw"
+EOF
+)"
+# ... and a name that merely ENDS in capture is not a capture call.
+expect "a name ending in capture is not a capture call" 0 'every capture( is bracketed' -- \
+  "$CJ" "$(probe safe_suffix_name <<'EOF'
+jq -r 'def safe_capture($re): .s; .[] | safe_capture("x")' <<<"$raw"
+EOF
+)"
+# Round 2, the other half: one wrapper cannot isolate two captures. `first` returns the first
+# match, so a miss by the second is discarded exactly as if it had never been wrapped.
+expect "two captures sharing one wrapper are refused" 1 'sharing its `[...]` with another one' -- \
+  "$CJ" "$(probe bad_shared_wrapper <<'EOF'
+jq -r '[ ("a" | capture("a")), ("x" | capture("b")) ] | first' <<<"$raw"
+EOF
+)"
+
 expect "the refusal names the line" 1 ":3:" -- \
   "$CJ" "$(probe bad_line_number <<'EOF'
 # a comment, which is not a line of the expression below

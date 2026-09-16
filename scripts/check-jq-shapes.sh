@@ -26,14 +26,22 @@
 #
 # THE GRAMMAR. Comment lines are dropped (shell and jq comments alike open with `#`). What is
 # left is grouped into logical expressions: a line that begins with `|` continues the line above
-# it, anything else starts a new one. Then EACH `capture(` in an expression is checked on its own,
-# against its own brackets:
-#   - the nearest `[` before it, with no `]` in between, must exist; and
+# it, anything else starts a new one. Then EACH `capture` call in an expression is checked on its
+# own, against its own brackets:
+#   - the nearest `[` before it, with no `]` in between, must exist;
 #   - the `]` that closes THAT `[` (by depth) must be read back immediately with `| first` or
-#     `| last`.
+#     `| last`; and
+#   - that `[...]` must hold exactly one capture.
 # Per occurrence, never per expression: an existential test over the whole expression certifies
 # `([capture("a")] | first), capture("b")` on the strength of the first capture's brackets while
-# the second one is bare (review of ludics-lite#162, round 1).
+# the second one is bare (review of ludics-lite#162, round 1). And a wrapper is only a wrapper
+# for ONE of them: `[ ("a" | capture("a")), ("x" | capture("b")) ] | first` gives both captures
+# the same brackets, and `first` then returns the first match while a miss by the second is
+# discarded exactly as if it had never been wrapped (round 2).
+#
+# A call is `capture` followed by optional whitespace and `(` — jq allows `capture ("x")`, which
+# a literal search for `capture(` reported as a clean file (round 2) — and preceded by a
+# non-word character, so a name that merely ends in `capture` is not one.
 #
 # The depth count reads `[` and `]` wherever they fall, regex character classes included. Those
 # balance in practice (`[^|]*`, `[0-9a-f]`), and a class that did not — `[^][]`, say — would
@@ -67,9 +75,23 @@ for f in "${files[@]}"; do
     exit 2
   fi
   awk -v file="$f" '
-    # Is the capture( that starts at <pos> in <txt> inside its own [...] read back with
-    # first/last? Its own: the brackets are found from this occurrence, so a safe capture
-    # elsewhere in the same expression vouches for nothing.
+    # How many `capture` calls <s> holds. jq allows whitespace between a filter name and its
+    # argument list, so `capture ("x")` is the same call; and the leading non-word character
+    # keeps a name that merely ENDS in capture (an awk `safe_capture(`, say) out of the count.
+    function captures_in(s,   q, c) {
+      q = 0; c = 0
+      while (match(substr(s, q + 1), /(^|[^A-Za-z0-9_])capture[ \t]*\(/) > 0) {
+        c++
+        q = q + RSTART + RLENGTH - 1
+      }
+      return c
+    }
+    # Is the capture at <pos> in <txt> inside a collection of its OWN, read back with
+    # first/last? Returns 1 yes, 0 no wrapper (or no readback), 2 a wrapper it shares with
+    # another capture. Its own, in both senses: the brackets are found from this occurrence, so
+    # a safe capture elsewhere in the expression vouches for nothing, and a wrapper holding two
+    # captures isolates neither — `[ ("a" | capture("a")), ("x" | capture("b")) ] | first`
+    # returns the first match and discards the miss of the second capture in silence.
     function safe_capture(txt, pos,   i, ch, open, depth, j, rest) {
       open = 0
       for (i = pos - 1; i >= 1; i--) {
@@ -86,19 +108,29 @@ for f in "${files[@]}"; do
       }
       if (depth != 0) return 0         # unbalanced: refuse rather than guess
       rest = substr(txt, j + 1)
-      return (rest ~ /^[ \t]*\|[ \t]*(first|last)([^A-Za-z0-9_]|$)/)
+      if (rest !~ /^[ \t]*\|[ \t]*(first|last)([^A-Za-z0-9_]|$)/) return 0
+      if (captures_in(substr(txt, open, j - open + 1)) != 1) return 2
+      return 1
     }
-    function flush(   i, txt, p, k, why) {
+    function flush(   i, txt, p, cpos, verdict, why) {
       if (n == 0) return
       txt = ""
       for (i = 1; i <= n; i++) txt = txt (i > 1 ? " " : "") buf[i]
       p = 0
-      while ((k = index(substr(txt, p + 1), "capture(")) > 0) {
-        p = p + k
-        if (safe_capture(txt, p)) continue
-        why = "a `capture(` that is not `[capture(...)] | first` (or `| last`): an unmatched capture yields NOTHING, which deletes the expression around it instead of defaulting"
-        if (txt ~ /test\(/)
-          why = why " — and this expression also carries a `test(`, the ludics-lite#104 shape: a guard pattern and a near-identical re-matching pattern that must agree forever, with nothing to notice the day they stop"
+      while (match(substr(txt, p + 1), /(^|[^A-Za-z0-9_])capture[ \t]*\(/) > 0) {
+        # RSTART is the match, which begins one character early unless the capture opens the
+        # text; both are recomputed before safe_capture, which uses match() itself.
+        cpos = p + RSTART + (substr(txt, p + RSTART, 1) == "c" ? 0 : 1)
+        p = p + RSTART + RLENGTH - 1
+        verdict = safe_capture(txt, cpos)
+        if (verdict == 1) continue
+        if (verdict == 2)
+          why = "a `capture(` sharing its `[...]` with another one: the collection is read back with `first`, so only the FIRST match survives and a miss by the other capture is discarded in silence — give each capture a wrapper of its own"
+        else {
+          why = "a `capture(` that is not `[capture(...)] | first` (or `| last`): an unmatched capture yields NOTHING, which deletes the expression around it instead of defaulting"
+          if (txt ~ /test[ \t]*\(/)
+            why = why " — and this expression also carries a `test(`, the ludics-lite#104 shape: a guard pattern and a near-identical re-matching pattern that must agree forever, with nothing to notice the day they stop"
+        }
         printf "::error file=%s,line=%d::%s:%d: %s\n", file, start, file, start, why
         bad = 1
         break                          # one refusal per expression; the rest read the same
