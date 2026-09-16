@@ -17,10 +17,12 @@
 #   wake-lab.sh lock-path box             where that box's lab lock lives, for a harness taking one
 #   wake-lab.sh --list                    dump the router's host table
 #
-# Every path that shuts a WSL VM down (`restart-wsl`, `--restart-wsl`) first checks the box's lab
-# lock and REFUSES a box another tool is using -- the shutdown is host-global and takes that tool's
-# session with it. `--force` overrides, and the lab lock lore below says when that is the right
-# call and what it cost the day it was not there.
+# Every path that takes a box away from whatever is running on it -- `restart-wsl` and
+# `--restart-wsl`, which shut the VM down host-globally, and `sleep`/`hibernate`/`down`, which take
+# the whole host -- RESERVES the box first and refuses one another tool is using. The reservation is
+# held across the destructive command rather than checked before it, because a check and an act
+# with a gap between them is the race this exists to close. `--force` overrides, and the lab lock
+# lore below says when that is the right call and what it cost the day it was not there.
 #
 # Tracked in the ludics-lite repository as scripts/wake-lab.sh and meant to be reached through a
 # ~/bin/wake-lab.sh symlink, so an edit made mid-run lands as a normal `git status`. One part is
@@ -375,16 +377,41 @@ lab_lock_path() { # lab_lock_path <box> — where that box's lock lives
   printf '%s/%s.lock' "$LOCK_DIR" "$1"
 }
 
-# True iff NOTHING holds the box's lock. Probing by taking the lock is the only answer that cannot
-# race: the perl exits immediately and the lock goes with it (a lock belongs to the open file
-# description, and nothing here keeps one open), so a free box is left exactly as it was found.
-# LOCK_EX on a read-only descriptor is what flock(2) specifies and what both platforms here do; a
-# lock file that does not exist yet was never taken, and an unreadable one is reported free rather
-# than blocking the operator out of their own lab on a permissions problem.
-lab_lock_free() { # lab_lock_free <box>
+# Take the box's lock and HOLD it, on a descriptor the calling shell keeps open until it exits.
+#
+# Asking whether the lock is free and then acting on the answer is the very race this interlock
+# exists to close: a probe that takes the lock and releases it leaves a window between the check
+# and the `wsl.exe --shutdown`, and a sweep that reserves the box inside that window is destroyed
+# by a restart that had already decided it was allowed to proceed. So the restarter becomes a
+# holder rather than an observer — there is no window because there is no interval in which
+# nothing holds the lock.
+#
+# Every caller runs this inside a per-box SUBSHELL, so fd 8 is that subshell's own and concurrent
+# boxes cannot collide on it; the lock lives exactly as long as the work it guards. A lock file
+# that cannot be created or opened at all is treated as free, deliberately: that is a fault in
+# this machine's state directory, and it must not lock the operator out of their own lab (a real
+# holder had to create the file to hold it).
+lab_lock_take() { # lab_lock_take <box> <what> — 0 taken and held, 1 someone else holds it
   local path; path=$(lab_lock_path "$1")
-  [ -e "$path" ] || return 0
-  perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <"$path" 2>/dev/null
+  mkdir -p "$LOCK_DIR" 2>/dev/null || return 0
+  exec 8>>"$path" 2>/dev/null || return 0
+  perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&8 || return 1
+  printf 'wake-lab %s (pid %s, since %s)\n' "$2" "$$" "$(date -u +%Y%m%dT%H%M%SZ)" \
+    >"$path" 2>/dev/null
+  return 0
+}
+
+# Refuse a reserved box before a power action that would take it away. `hibernate` terminates the
+# WSL VM outright (kick_wsl's note says so), `down` is a full host shutdown, and `sleep` suspends
+# the host under whatever is running on it — all three destroy a reserved workload exactly as
+# `wsl.exe --shutdown` does, so the interlock that covers the restart has to cover them too. Run in
+# a subshell by its caller: the lock is held across the action, not merely checked before it.
+guarded_power() { # guarded_power <verb> <box> — 3 when the box is reserved
+  if [ "$FORCE" != 1 ] && ! lab_lock_take "$2" "$1"; then
+    echo "  $1 REFUSED on $2: $(lab_lock_holder "$2")"
+    return 3
+  fi
+  power_action "$1" "$2"
 }
 
 # The holder's own description of itself, for the refusal message. Never trusted for the decision
@@ -579,50 +606,50 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 WSL_FAILED=""
 start_wsl() {
   local n i dir krc kphase what=kick started=() unshut=() unstarted=() up=() down=() rc=0 line
-  local targets=() held=()
+  local held=()
   [ "$FRESH_WSL" = fresh ] && what=restart
-  # The lock is consulted ONLY on the destructive path. A plain kick starts a VM that is already
-  # running as a no-op and cannot cost a sweep anything, so gating it would buy nothing and would
-  # make `kick-wsl` -- the operator's recovery command when a box has no VM at all -- refusable at
-  # exactly the moment it is needed. `--restart-wsl` is the one that calls `wsl.exe --shutdown`.
-  for n in "$@"; do
-    if [ "$FRESH_WSL" = fresh ] && [ "$FORCE" != 1 ] && ! lab_lock_free "$n"; then
-      held+=("$n")
-      echo "  wsl restart REFUSED on $n: $(lab_lock_holder "$n")"
-    else
-      targets+=("$n")
-    fi
-  done
   # One box at a time meant one wedged box could cost its neighbours their restart entirely: on
   # 2026-09-16 rog's start probe hung and minix, second in the loop, never got a restart at all —
   # its VM sat eleven hours old and the sweep's hip unit went red on exactly the stale-dxg
   # condition restart-wsl exists to clear. The boxes are independent Windows hosts and nothing in
   # the kick is shared, so kick them all at once. Each box's output is buffered and replayed in
   # target order afterwards, so the log still reads box by box rather than interleaved.
-  if [ ${#targets[@]} -gt 0 ]; then
-    dir=$(mktemp -d "${TMPDIR:-/tmp}/wake-lab-wsl.XXXXXX") || {
-      echo "wsl $what FAILED: no work directory" >&2; WSL_FAILED="wsl $what FAILED: no work directory"; return 1; }
-    i=0
-    for n in "${targets[@]}"; do
-      i=$((i + 1))
-      # KICK_PHASE is set in the subshell, so it comes back alongside the status rather than as a
-      # global; a box whose subshell died outright reads as a plain failed start, never as a success.
-      { kick_wsl "$n" "$FRESH_WSL" >"$dir/$i.out" 2>&1
-        printf '%s %s\n' "$?" "$KICK_PHASE" >"$dir/$i.rc"; } &
-    done
-    wait
-    i=0
-    for n in "${targets[@]}"; do
-      i=$((i + 1))
-      [ -f "$dir/$i.out" ] && cat "$dir/$i.out"
-      krc=1; kphase=start
-      [ -s "$dir/$i.rc" ] && read -r krc kphase < "$dir/$i.rc"
-      if [ "$krc" = 0 ]; then started+=("$n")
-      elif [ "$kphase" = shutdown ]; then unshut+=("$n")
-      else unstarted+=("$n"); fi
-    done
-    rm -rf "$dir"
-  fi
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/wake-lab-wsl.XXXXXX") || {
+    echo "wsl $what FAILED: no work directory" >&2; WSL_FAILED="wsl $what FAILED: no work directory"; return 1; }
+  i=0
+  for n in "$@"; do
+    i=$((i + 1))
+    # The reservation is taken INSIDE this subshell and held until it exits, so the lock covers the
+    # `wsl.exe --shutdown` itself rather than a moment before it. The lock is consulted ONLY on the
+    # destructive path: a plain kick starts an already-running VM as a no-op and cannot cost a
+    # holder anything, so gating it would buy nothing and would make `kick-wsl` -- the recovery
+    # command for a box with no VM at all -- refusable at exactly the moment it is needed.
+    #
+    # KICK_PHASE is set in the subshell, so it comes back alongside the status rather than as a
+    # global; a box whose subshell died outright reads as a plain failed start, never as a success.
+    # `locked` is a phase of its own for the same reason the others are: it names a different
+    # remedy (wait for the holder) from every other way a box can fail to restart.
+    { if [ "$FRESH_WSL" = fresh ] && [ "$FORCE" != 1 ] && ! lab_lock_take "$n" "$what"; then
+        echo "  wsl $what REFUSED on $n: $(lab_lock_holder "$n")" >"$dir/$i.out" 2>&1
+        printf '1 locked\n' >"$dir/$i.rc"
+      else
+        kick_wsl "$n" "$FRESH_WSL" >"$dir/$i.out" 2>&1
+        printf '%s %s\n' "$?" "$KICK_PHASE" >"$dir/$i.rc"
+      fi; } &
+  done
+  wait
+  i=0
+  for n in "$@"; do
+    i=$((i + 1))
+    [ -f "$dir/$i.out" ] && cat "$dir/$i.out"
+    krc=1; kphase=start
+    [ -s "$dir/$i.rc" ] && read -r krc kphase < "$dir/$i.rc"
+    if [ "$krc" = 0 ]; then started+=("$n")
+    elif [ "$kphase" = locked ]; then held+=("$n")
+    elif [ "$kphase" = shutdown ]; then unshut+=("$n")
+    else unstarted+=("$n"); fi
+  done
+  rm -rf "$dir"
   # bash 3.2 under set -u: an empty array cannot be expanded, hence the count guards.
   if [ ${#started[@]} -gt 0 ]; then
     if wait_for_wsl "${started[@]}"; then up=("${started[@]}")
@@ -723,9 +750,23 @@ case "$VERB" in
     start_wsl "${TARGETS[@]}"; exit $?
     ;;
   sleep|hibernate|down)
-    for t in "${TARGETS[@]}"; do power_action "$VERB" "$t"; done
-    echo "confirming..."
-    confirm_down "${TARGETS[@]}"
+    ACTED=(); REFUSED=()
+    for t in "${TARGETS[@]}"; do
+      # A subshell per box: guarded_power holds the reservation on fd 8 for the length of the
+      # action, and each box's descriptor is its own.
+      ( guarded_power "$VERB" "$t" ); prc=$?
+      if [ "$prc" = 3 ]; then REFUSED+=("$t"); else ACTED+=("$t"); fi
+    done
+    # Only the boxes that were actually acted on are confirmed: polling a refused box for the
+    # DOWN signal would report the holder's live machine as a failure to go down.
+    if [ ${#ACTED[@]} -gt 0 ]; then
+      echo "confirming..."
+      confirm_down "${ACTED[@]}"
+    fi
+    if [ ${#REFUSED[@]} -gt 0 ]; then
+      echo "$VERB REFUSED on: ${REFUSED[*]} (the lab lock is held; wait for the holder, or --force to take the box anyway)"
+      exit 1
+    fi
     ;;
   wake)
     for t in "${TARGETS[@]}"; do echo "$t:"; wake "$t"; done

@@ -73,6 +73,18 @@ while [ $# -gt 0 ]; do
 done
 line=$(printf '%s ::%s' "$dest" "$cmd")
 printf '%s\n' "$line" >> "$SSH_LOG"
+# $LOCK_PROBE names a lock file to test AT THE MOMENT a shutdown is issued, which is the only way
+# to observe the check/act race from outside: a restarter that merely probed the lock leaves it
+# free by the time the shutdown lands, and one that holds it does not.
+if [ -n "${LOCK_PROBE:-}" ]; then
+  case "$cmd" in
+    *--shutdown*)
+      if perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' \
+           <"$LOCK_PROBE" 2>/dev/null
+      then printf 'lock FREE during shutdown\n' >> "$SSH_LOG"
+      else printf 'lock HELD during shutdown\n' >> "$SSH_LOG"; fi ;;
+  esac
+fi
 [ -n "${SSH_DELAY:-}" ] && sleep "$SSH_DELAY"
 [ -n "${SSH_HANG:-}" ] && grep -qE "$SSH_HANG" <<<"$line" && exec sleep 900
 case "$cmd" in *"${SSH_REFUSE:-}"*) [ -n "${SSH_REFUSE:-}" ] && exit 1 ;; esac
@@ -545,6 +557,57 @@ out=$(wl_locked restart-wsl minix); rc=$?
 [ "$rc" -eq 0 ] \
   && ok "...and a lock whose holders are all gone stops refusing, with nothing to reclaim (rc=$rc)" \
   || ko "a released lock still refuses (rc=$rc) -- $out"
+
+# The reservation is HELD ACROSS the shutdown, not checked before it. A restarter that only probes
+# the lock leaves a window between its check and its `wsl.exe --shutdown` — and a holder that
+# reserves the box inside that window is destroyed by a restart that had already decided it was
+# allowed to proceed, which is the exact race the interlock exists to close. Observed from the far
+# side: the ssh shim tests the lock at the instant the shutdown is issued.
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+    SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" LOCK_PROBE="$LOCKS/rog.lock" \
+    "$WL" restart-wsl rog 2>&1 8>&-); rc=$?
+grep -q '^lock HELD during shutdown$' "$SSH_LOG" \
+  && ok "the box stays reserved for the length of its own restart (rc=$rc)" \
+  || ko "the lock was free when the shutdown landed — the check/act race is open: $(cat "$SSH_LOG")"
+
+# Power actions take the box away just as surely: hibernate terminates the VM outright, `down` is a
+# full host shutdown, and `sleep` suspends the host under whatever is running on it.
+if hold_lock minix 'sweep 20260916T074913Z (pid 999, since 20260916T074913Z)' 8; then
+  ok "the lab lock can be retaken for the power-action cases"
+else
+  ko "could not retake a test lab lock -- the power cases below prove nothing"
+fi
+for verb in hibernate down sleep; do
+  : > "$SSH_LOG"
+  out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" \
+      SSH_UP="minix-lan minix-amd-win" "$WL" "$verb" minix 2>&1 8>&-); rc=$?
+  if [ "$rc" -ne 0 ] && grep -q "$verb REFUSED on: minix" <<<"$out" && ! grep -q 'shutdown /\|SetSuspendState' "$SSH_LOG"; then
+    ok "$verb refuses a reserved box, and sends nothing (rc=$rc)"
+  else
+    ko "$verb went through on a reserved box (rc=$rc) -- $out $(cat "$SSH_LOG")"
+  fi
+done
+# ...and a refused box is not then polled for the DOWN signal, which would report the holder's
+# live machine as a failure to go down.
+grep -q 'confirming' <<<"$out" \
+  && ko "a refused box was polled for the down signal -- $out" \
+  || ok "...and a refused box is not confirmed down"
+# --force is the same override here as everywhere else.
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" \
+    SSH_UP="minix-lan minix-amd-win" "$WL" hibernate --force minix 2>&1 8>&-); rc=$?
+grep -q 'shutdown /h' "$SSH_LOG" \
+  && ok "--force hibernates a reserved box anyway (rc=$rc)" \
+  || ko "--force did not override the lock for a power action (rc=$rc) -- $out $(cat "$SSH_LOG")"
+# A free box is unaffected.
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" \
+    SSH_UP="rog-lan rog-nv-win" "$WL" hibernate rog 2>&1 8>&-); rc=$?
+grep -q 'shutdown /h' "$SSH_LOG" && grep -q 'confirming' <<<"$out" \
+  && ok "a box whose lock is free hibernates exactly as before (rc=$rc)" \
+  || ko "the lock broke the ordinary power action (rc=$rc) -- $out $(cat "$SSH_LOG")"
+exec 8>&-
 
 # The path is the whole contract with the sweep, so it must not need the site table: the harness
 # asking where to put its flock runs from a checkout with no business holding this lab's MACs.
