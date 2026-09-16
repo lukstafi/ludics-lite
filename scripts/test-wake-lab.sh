@@ -53,7 +53,13 @@ EOF
 # below want. $SSH_DELAY makes each probe slow, the way a real ConnectTimeout against a dark box
 # is, which is what the polling deadlines have to survive. $SSH_REFUSE names a command substring
 # that fails even on a reachable destination: a Windows host that answers ssh but whose
-# `wsl.exe --shutdown` fails, say.
+# `wsl.exe --shutdown` fails, say. $SSH_HANG is an extended regex over the whole `<dest> :: <cmd>`
+# line, and a match WEDGES instead of answering -- the 2026-09-16 shape, where the far side
+# accepts the connection and the remote command never returns, which ConnectTimeout does not bound
+# and only the script's own cap can end. A regex rather than a substring because the cases below
+# need to wedge one box's Windows aliases while leaving its guest and its neighbour answering. It
+# is an `exec sleep`, not a `sleep`, so that the cap's SIGALRM lands on the sleeping process itself
+# rather than on a shell waiting for a foreground child.
 cat > "$TMP/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 dest=""; cmd=""
@@ -65,8 +71,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-printf '%s ::%s\n' "$dest" "$cmd" >> "$SSH_LOG"
+line=$(printf '%s ::%s' "$dest" "$cmd")
+printf '%s\n' "$line" >> "$SSH_LOG"
 [ -n "${SSH_DELAY:-}" ] && sleep "$SSH_DELAY"
+[ -n "${SSH_HANG:-}" ] && grep -qE "$SSH_HANG" <<<"$line" && exec sleep 900
 case "$cmd" in *"${SSH_REFUSE:-}"*) [ -n "${SSH_REFUSE:-}" ] && exit 1 ;; esac
 for u in ${SSH_UP:-}; do [ "$u" = "$dest" ] && exit 0; done
 exit 1
@@ -270,6 +278,173 @@ out=$(kick "rog-nv-wsl" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && grep -q 'wsl kick FAILED on: rog' <<<"$out" && ! grep -q 'wsl up' <<<"$out" \
   && ok "kick-wsl reports its own failure over a live guest as well (rc=$rc)" \
   || ko "a failed kick over a live guest read as success (rc=$rc) -- $out"
+
+# --- a wedged wsl.exe is bounded, and the guest is what settles it ------------------------------
+# 2026-09-16: `--wait --restart-wsl rog minix` ran 2h40m without exiting. ssh's ConnectTimeout
+# bounds the TCP connect alone, so once the Windows side accepted the connection and `wsl.exe -d
+# Ubuntu -e true` wedged, the ssh had no upper bound at all -- and the scheduled sweep that called
+# it hung behind it. Each remote command now runs under a wall-clock cap. The caps are cut to a
+# few seconds here; the shim wedges with `exec sleep 900`, so a run that still finishes proves the
+# cap fired and nothing else.
+hang() { # hang <regex> <up-list> <verb...> -- a restart with some remote commands wedged
+  local re=$1 up=$2; shift 2
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+      WAKE_LAB_WSL_SHUTDOWN_CAP=3 WAKE_LAB_WSL_START_CAP=3 WAKE_LAB_PROBE_CAP=3 \
+      SSH_HANG="$re" SSH_UP="$up" "$WL" "$@"
+}
+# The incident's own shape, and its own resolution: the start probe never returns, and the VM has
+# in fact started -- `uptime -p` inside rog's guest matched the restart to the minute while the
+# Windows-side probe was still stuck. So the cap is not a failure. The guest is asked directly over
+# the -wsl alias, which answered instantly throughout that morning, and its answer is the verdict.
+: > "$SSH_LOG"; started=$SECONDS
+out=$(hang '^rog-lan :: wsl\.exe -d Ubuntu' "rog-lan rog-nv-win rog-nv-wsl" restart-wsl rog 2>&1); rc=$?
+elapsed=$((SECONDS - started))
+[ "$elapsed" -lt 30 ] && ok "a wedged start probe is cut short by its cap instead of hanging (${elapsed}s)" \
+  || ko "the run took ${elapsed}s against a 3s cap: the remote command is still unbounded"
+[ "$rc" -eq 0 ] && grep -q 'wsl start probe timed out after 3s on rog (via rog-lan); the guest answers, so the VM is up' <<<"$out" \
+  && grep -q 'wsl up' <<<"$out" \
+  && ok "...and a guest that answers over its own alias settles it as up, not as a failed restart (rc=$rc)" \
+  || ko "a capped start probe over a live guest did not read as up (rc=$rc) -- $out"
+grep -q '^rog-nv-wsl :: exit 0$' "$SSH_LOG" \
+  && ok "...having really asked the guest, over the -wsl alias the wedged Windows side is not on" \
+  || ko "the guest was never probed after the cap fired: $(cat "$SSH_LOG")"
+# With no guest answering there is no verdict yet, and the poll already has one: it asks the guest,
+# on its own deadline. What must NOT happen is a fall through to the next alias -- in the restart
+# path that is a second `wsl --shutdown`, tearing down the VM the wedged start may just have booted.
+: > "$SSH_LOG"
+out=$(hang 'wsl\.exe -d Ubuntu' "rog-lan rog-nv-win" restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'leaving the verdict to the guest poll' <<<"$out" \
+  && grep -q 'wsl still down after 0 min on: rog' <<<"${out##*$'\n'}" && ! grep -q 'wsl up' <<<"$out" \
+  && ok "...while a capped start with a silent guest is left to the poll, which fails it (rc=$rc)" \
+  || ko "a capped start with no guest answering was not left to the poll (rc=$rc) -- $out"
+[ "$(grep -c -- 'wsl.exe --shutdown' "$SSH_LOG")" -eq 1 ] \
+  && ok "...and no second shutdown is issued onto the VM that start may have booted" \
+  || ko "the capped start retried the whole restart on the next alias: $(cat "$SSH_LOG")"
+# A wedged `wsl --shutdown` is the dangerous one: its status says nothing, and the restart's whole
+# invariant is that no live old VM survives it. So the guest decides again -- and here it decides
+# against. A guest still answering means the teardown has not taken, this alias has not carried the
+# restart, and no start may be issued onto the VM left standing.
+: > "$SSH_LOG"
+out=$(hang 'wsl\.exe --shutdown' "rog-lan rog-nv-win rog-nv-wsl" restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'wsl shutdown TIMED OUT after 3s on rog (via rog-lan); the guest still answers, so the old VM stands' <<<"$out" \
+  && grep -q 'wsl restart FAILED on: rog (shutdown refused' <<<"${out##*$'\n'}" && ! grep -q 'wsl up' <<<"$out" \
+  && ok "a wedged shutdown over a guest that still answers is a failed restart, never 'wsl up' (rc=$rc)" \
+  || ko "a capped shutdown over a live old guest read as success (rc=$rc) -- $out"
+grep -q 'wsl.exe -d Ubuntu' "$SSH_LOG" \
+  && ko "a start was issued onto the VM the capped shutdown left standing: $(cat "$SSH_LOG")" \
+  || ok "...and no start is issued onto it"
+# A SILENT guest is not the opposite evidence, and reading it that way was a real defect (PR #165
+# round 1, P1). The -wsl alias rides tailscaled inside the guest, which this suite's own subject
+# documents as lagging minutes behind a running VM, so "no guest answers" is the everyday reading
+# of a VM that is perfectly alive. Starting on it attaches to the old VM and then reports the
+# fresh restart the sweep waits for -- the stale bridge restart-wsl exists to replace. So a capped
+# shutdown is unconfirmed whichever way the guest goes, and NO start may follow it on that alias.
+: > "$SSH_LOG"
+out=$(hang 'wsl\.exe --shutdown' "rog-lan rog-nv-win" restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'no guest answers, but a silent guest is not a stopped VM — the teardown is unconfirmed' <<<"$out" \
+  && ! grep -q 'wsl up' <<<"$out" && grep -q 'wsl restart FAILED on: rog (shutdown refused' <<<"${out##*$'\n'}" \
+  && ok "a capped shutdown is unconfirmed even with a silent guest, and fails the restart (rc=$rc)" \
+  || ko "a capped shutdown with a silent guest was treated as a teardown (rc=$rc) -- $out"
+grep -q 'wsl.exe -d Ubuntu' "$SSH_LOG" \
+  && ko "a start was issued after a shutdown that was never confirmed: $(cat "$SSH_LOG")" \
+  || ok "...issuing no start on evidence that cannot tell a stopped VM from a lagging tailscaled"
+grep -c -- 'wsl.exe --shutdown' "$SSH_LOG" | grep -qx 2 \
+  && ok "...and retrying the whole restart on the other alias first" \
+  || ko "the capped shutdown did not fall through to the second alias: $(cat "$SSH_LOG")"
+
+# A plain kick has no shutdown to repeat and a second start is idempotent, so a wedged LAN side
+# must not cost the box the start its Tailscale alias would have carried (PR #165 round 1, P2).
+# The restart path keeps the opposite rule, pinned above: it must NOT fall through.
+# The guest must be SILENT here: a guest that answers settles the cap on the spot, and the
+# fallback this pins exists only for the case where nothing has answered yet. The poll then fails
+# the step (no guest ever answers in this fixture), so the evidence is the start on the second
+# alias, not the exit status.
+: > "$SSH_LOG"
+out=$(hang '^rog-lan :: wsl\.exe -d Ubuntu' "rog-lan rog-nv-win" kick-wsl rog 2>&1)
+grep -q 'wsl started on rog (via rog-nv-win)' <<<"$out" \
+  && grep -q '^rog-nv-win :: wsl.exe -d Ubuntu' "$SSH_LOG" \
+  && ok "a plain kick whose start wedges on one alias is carried by the other" \
+  || ko "a wedged plain kick never tried the second alias -- $out; $(cat "$SSH_LOG")"
+# And when every alias wedges, the cap is still not a failure: the poll gets the box.
+: > "$SSH_LOG"
+out=$(hang 'wsl\.exe -d Ubuntu' "rog-lan rog-nv-win" kick-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'start probe timed out on every alias on rog' <<<"$out" \
+  && grep -q 'wsl still down after 0 min on: rog' <<<"${out##*$'\n'}" \
+  && ok "...and a kick that wedges on every alias is left to the poll, not called a failed kick (rc=$rc)" \
+  || ko "a kick wedged on every alias was not handed to the poll (rc=$rc) -- $out"
+
+# --- one wedged box must not cost its neighbours their restart ----------------------------------
+# The second half of the 2026-09-16 damage. The loop over boxes was serialized, so while rog's
+# probe hung minix never got a restart at all: its VM sat eleven hours old and the sweep's hip unit
+# went red on exactly the stale-dxg condition restart-wsl exists to clear (ludics-lite#60).
+: > "$SSH_LOG"
+out=$(hang '^rog-(lan|nv-win) :: wsl\.exe' "rog-lan rog-nv-win minix-lan minix-amd-wsl" restart-wsl rog minix 2>&1); rc=$?
+grep -q '^minix-lan :: wsl.exe --shutdown$' "$SSH_LOG" && grep -q '^minix-lan :: wsl.exe -d Ubuntu' "$SSH_LOG" \
+  && ok "a box whose Windows side wedges does not stop its neighbour getting its restart" \
+  || ko "minix never got its restart while rog was wedged: $(cat "$SSH_LOG")"
+# rog's own outcome is a shutdown failure -- its capped shutdown is unconfirmed on both aliases,
+# which is the P1 rule above -- while minix's is a clean restart. Each box is named for what
+# happened to IT; the wedge is not charged to the neighbour.
+[ "$rc" -ne 0 ] && grep -q '^wsl up on: minix$' <<<"$out" && grep -q 'wsl restart FAILED on: rog' <<<"$out" \
+  && ok "...and the report still names each box's own outcome (rc=$rc)" \
+  || ko "the wedged box's outcome was pinned on its neighbour (rc=$rc) -- $out"
+# ...and they really are kicked at once, not merely bounded one after another: two boxes wedged
+# against a 12s cap cost one cap between them concurrently and two serialized. The numbers have to
+# respect the poll's 5s granularity, because a guest probe that misses its first round adds
+# exactly one of those to either arm: concurrent is 12s or 17s, serialized 24s or 29s, so 20s is
+# the only threshold with a clear margin on both sides. And PROBE_CAP is left at its default --
+# shrinking it to a couple of seconds, as the wedge cases above can afford to, is what makes that
+# missed round likely in the first place: on a loaded machine the shim's own fork can outlast a 3s
+# cap, and the probe then fails for reasons that have nothing to do with what is being measured.
+started=$SECONDS
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_WSL_START_CAP=12 \
+    SSH_HANG='wsl\.exe -d Ubuntu' SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" \
+    "$WL" kick-wsl rog minix 2>&1); rc=$?
+elapsed=$((SECONDS - started))
+[ "$rc" -eq 0 ] && grep -q '^wsl up$' <<<"$out" \
+  && ok "two wedged start probes both fall back to their own guest (rc=$rc)" \
+  || ko "the two-box fallback did not end in wsl up (rc=$rc) -- $out"
+[ "$elapsed" -lt 20 ] && ok "...costing one cap between them, not one each (${elapsed}s)" \
+  || ko "the kick still runs box by box: ${elapsed}s for two boxes against a 12s cap"
+
+# --- a capped call leaves nothing of itself behind ----------------------------------------------
+# capped()'s watchdog naps in a child. Killing the watchdog alone left that nap orphaned for the
+# rest of its interval -- two minutes, at the default start cap -- holding an inherited copy of
+# every descriptor the run had open. Stray processes were the visible half; the half that bites is
+# that an inherited descriptor keeps its resource alive after the caller has dropped it, which is
+# how this surfaced against the lab lock. The caps here are absurd values (3117/3118/3119) so a
+# survivor is unmistakably one of ours and no real sleep can be mistaken for it.
+naps() { ps -eo pid,command 2>/dev/null | awk '/sleep 311[789]$/ { print $1 }'; }
+reap_naps() { local p; for p in $(naps); do kill -KILL "$p" 2>/dev/null; done; }
+# The negative control first: a scan that cannot fail proves nothing. This is exactly the old
+# shape -- a watchdog whose sleep runs in its foreground, killed outright -- and it must leave a
+# survivor, or the assertion below is vacuous.
+reap_naps
+( cmd_pid=""; sleep 1 & cmd_pid=$!
+  { sleep 3117; } >/dev/null 2>&1 & dog=$!
+  wait "$cmd_pid"; kill -KILL "$dog" 2>/dev/null; wait "$dog" 2>/dev/null ) >/dev/null 2>&1
+[ "$(naps | wc -l | tr -d ' ')" -ge 1 ] \
+  && ok "the stray-nap scan catches a watchdog killed without its sleep" \
+  || ko "the stray-nap scan sees nothing even for the leaking shape, so its verdict below is vacuous"
+reap_naps
+# A restart makes several capped calls -- a shutdown, a start, and the probes around them -- and
+# every one of them must come back with its watchdog fully reaped.
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+    WAKE_LAB_WSL_SHUTDOWN_CAP=3118 WAKE_LAB_WSL_START_CAP=3117 WAKE_LAB_PROBE_CAP=3119 \
+    SSH_UP="rog-lan rog-nv-wsl" "$WL" restart-wsl rog >/dev/null 2>&1
+[ "$(naps | wc -l | tr -d ' ')" -eq 0 ] \
+  && ok "...and a restart's capped calls leave no nap of their own behind" \
+  || ko "a capped call orphaned its watchdog's sleep: $(ps -eo pid,command | awk '/sleep 311[789]$/')"
+reap_naps
+# The same when the cap actually FIRES: the watchdog is then mid-grace, napping again, and the old
+# shape leaked that second sleep just as readily as the first.
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_WSL_START_CAP=2 \
+    WAKE_LAB_WSL_SHUTDOWN_CAP=3118 WAKE_LAB_PROBE_CAP=3119 \
+    SSH_HANG='wsl\.exe -d Ubuntu' SSH_UP="rog-lan rog-nv-win" "$WL" restart-wsl rog >/dev/null 2>&1
+[ "$(naps | wc -l | tr -d ' ')" -eq 0 ] \
+  && ok "...nor does one whose cap fired and whose watchdog was mid-grace" \
+  || ko "a fired cap orphaned its grace sleep: $(ps -eo pid,command | awk '/sleep 311[789]$/')"
+reap_naps
 
 # --- the polling loops are bounded by elapsed time, not by iteration count -----------------------
 # Every probe of a dark box burns its ConnectTimeout, so an iteration budget was a wall-clock lie:
