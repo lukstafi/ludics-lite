@@ -163,8 +163,7 @@ not refresh execution coverage. The raised cap is for the forced runs only: a co
 coverage as `timeout`.
 Run it in the background and wait for it to finish — a cold unit can take tens of minutes.
 Each box's units run as one lane, and the three lanes run concurrently (gh-ocannl-976): the remote
-units start within seconds of launch, and the
-run lasts as long as its longest lane — normally this Mac's, which carries metal's suite. The stdout header's `lanes:` line names each
+units start within seconds of launch, and the run lasts as long as its longest lane — normally this Mac's, which carries metal's suite. The stdout header's `lanes:` line names each
 box's units. Units on different boxes finish in any order, so their summary blocks and their
 history rows appear in completion order, not in the order this routine lists them.
 The script deliberately exits 0 even when tests
@@ -294,7 +293,10 @@ non-coverage rather than as a test failure, and treat it as notify-worthy. For a
 harness: System event 1074 on the `-win` side inside the unit's window, from `MoUsoCoreWorker.exe`
 or `TrustedInstaller.exe`, is a Windows Update restart, which takes the VM and its holder with it.
 
-    ssh <box>-win "powershell -NoProfile -Command \"Get-WinEvent -FilterHashtable @{LogName='System';Id=1074;StartTime=(Get-Date).AddHours(-12)} | Format-List TimeCreated,Message\""
+    ssh rog-nv-win "powershell -NoProfile -Command \"Get-WinEvent -FilterHashtable @{LogName='System';Id=1074;StartTime=(Get-Date).AddHours(-12)} | Format-List TimeCreated,Message\""
+
+(`minix-amd-win` for minix — those two, and the `-lan` aliases, are the Windows destinations;
+`wake-lab.sh` names the one that answered when it kicked the box.)
 
 Report that as an update restart, name the active-hours values step 1 read, and file the fix as
 re-pinning active hours on that box — not as a backend regression. If the script itself

@@ -302,6 +302,10 @@ DOWN_WAIT_SECONDS=${WAKE_LAB_DOWN_WAIT_SECONDS:-120}
 # its pid is recorded so that `unhold` — possibly in a later shell, since a lane is a sequence of
 # commands — can end it.
 HOLD_WAIT_SECONDS=${WAKE_LAB_HOLD_WAIT_SECONDS:-60}
+# How long the holder must still be connected AFTER a wsl.exe is seen, before the VM is called
+# held: an ssh still negotiating, or one whose remote command has just failed, is briefly alive
+# next to somebody else's wsl.exe, and those two readings together would certify nothing.
+HOLD_SETTLE_SECONDS=${WAKE_LAB_HOLD_SETTLE_SECONDS:-5}
 HOLD_STATE_DIR=${WAKE_LAB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wake-lab}
 # The local-time hours on the Windows box that the unattended sweep occupies: the routine's 07:20
 # launch plus its longest lane. Written `<start>-<end>`, end exclusive, and it may wrap midnight.
@@ -378,16 +382,30 @@ KICK_DEST=""   # the Windows alias that carried the last successful kick; the ho
 # lane is several units with their own caps plus preparation and diagnostics outside them, so a
 # holder sized to the expected run expires under the last unit, silently, exactly when nobody is
 # watching. It ends by unhold.
-hold_pid_live() { # hold_pid_live <pidfile> — is the recorded holder still OUR holder, still running
-  local p
+# One spelling of the holder, used to spawn it and to recognize it again.
+HOLD_CMD='wsl.exe -d Ubuntu -e sleep infinity'
+
+hold_pid_read() { # hold_pid_read <pidfile> — echo "<pid> <dest>", empty if the file is unusable
+  local line p d
   [ -r "$1" ] || return 1
-  p=$(cat "$1" 2>/dev/null)
+  line=$(cat "$1" 2>/dev/null)
+  p=${line%% *}; d=${line#* }
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$d" ] && [ "$d" != "$p" ] || return 1
+  printf '%s %s\n' "$p" "$d"
+}
+
+hold_pid_live() { # hold_pid_live <pidfile> — is the recorded holder still OUR holder, still running
+  local rec p d
+  rec=$(hold_pid_read "$1") || return 1
+  p=${rec%% *}; d=${rec#* }
   kill -0 "$p" 2>/dev/null || return 1
-  # Pids are reused, and this file outlives the shell that wrote it — so `unhold` run tomorrow
-  # over a stale file must never kill whatever inherited the number. The holder's command line is
-  # its signature, and nothing else on this Mac runs a `sleep infinity` through ssh.
-  ps -o args= -p "$p" 2>/dev/null | grep -q 'sleep infinity'
+  # Pids are reused, and this file outlives the shell that wrote it — so an `unhold` run tomorrow
+  # over a stale file must never kill whatever inherited the number. The signature is the holder's
+  # whole command line INCLUDING its destination: every box's holder runs the same payload, so a
+  # signature without the alias would let one box's stale file kill another box's live holder and
+  # drop that lane.
+  ps -o args= -p "$p" 2>/dev/null | grep -q -- "$d $HOLD_CMD"
 }
 
 win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe runs on the Windows side
@@ -405,13 +423,19 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
   f=$HOLD_STATE_DIR/hold-$name.pid
   mkdir -p "$HOLD_STATE_DIR" 2>/dev/null
   if hold_pid_live "$f"; then
-    pid=$(cat "$f")
+    pid=$(hold_pid_read "$f"); pid=${pid%% *}
     echo "  wsl holder already running for $name (pid $pid)"
   else
     ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-        "$dest" 'wsl.exe -d Ubuntu -e sleep infinity' >/dev/null 2>&1 &
+        "$dest" "$HOLD_CMD" >/dev/null 2>&1 &
     pid=$!
-    printf '%s\n' "$pid" > "$f"
+    # An unrecordable holder is a leaked one: nothing would ever unhold it, and the VM would stay
+    # pinned until the box reboots. Kill it here rather than leave it running unowned.
+    if ! printf '%s %s\n' "$pid" "$dest" > "$f" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      echo "  wsl holder on $name could NOT be recorded at $f — holder (pid $pid) killed rather than leaked"
+      return 1
+    fi
     echo "  wsl holder started on $name (via $dest, pid $pid)"
   fi
   # Both halves, in this order. The local pid alone is not the claim: an ssh client can outlive
@@ -423,8 +447,15 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
   deadline=$((SECONDS + HOLD_WAIT_SECONDS))
   while hold_pid_live "$f"; do
     if win_holder_seen "$dest"; then
-      echo "  wsl holder observed on $name (wsl.exe running on the Windows side)"
-      return 0
+      # ...and still connected a moment later. Without the settle, an ssh that is still
+      # negotiating (or has just failed) is alive beside somebody else's wsl.exe for a second,
+      # and the pair would read as a holder of ours that never started.
+      sleep "$HOLD_SETTLE_SECONDS"
+      if hold_pid_live "$f"; then
+        echo "  wsl holder observed on $name (wsl.exe on the Windows side, holder still connected after ${HOLD_SETTLE_SECONDS}s)"
+        return 0
+      fi
+      break
     fi
     [ "$SECONDS" -ge "$deadline" ] && break
     sleep 5
@@ -436,7 +467,7 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
 release_hold() { # release_hold <box> — end the recorded holder; always rc 0, always says what it did
   local f=$HOLD_STATE_DIR/hold-$1.pid p
   if [ ! -r "$f" ]; then echo "  no wsl holder recorded for $1"; return 0; fi
-  p=$(cat "$f" 2>/dev/null)
+  p=$(hold_pid_read "$f" 2>/dev/null); p=${p%% *}
   if hold_pid_live "$f"; then
     # Killing the local client closes the channel and sshd ends the command it was running. If a
     # wsl.exe is ever orphaned on the Windows side despite that, `restart-wsl` clears it: the
@@ -463,7 +494,7 @@ reg_dword() { # reg_dword <reg-query output> <value name> — its decimal value,
   case "$v" in
     0x[0-9a-fA-F]|0x[0-9a-fA-F][0-9a-fA-F]*) printf '%d\n' "$((v))" ;;
     ''|*[!0-9]*) printf '?\n' ;;
-    *) printf '%s\n' "$v" ;;
+    *) printf '%d\n' "$((10#$v))" ;;
   esac
 }
 
@@ -487,6 +518,9 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
     echo "  ACTIVE HOURS WARNING on $name: WAKE_LAB_SWEEP_HOURS='$SWEEP_HOURS' is not <start>-<end>"
     return 0 ;;
   esac
+  # Base 10 explicitly: `08-11` is the natural way to write a morning window, and bash arithmetic
+  # reads a leading zero as octal and dies on the 8 — aborting a check that promises only to warn.
+  ws=$((10#$ws)); we=$((10#$we))
   out=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" "reg query \"$ACTIVE_HOURS_KEY\"" 2>/dev/null) || out=""
   s=$(reg_dword "$out" ActiveHoursStart)
   e=$(reg_dword "$out" ActiveHoursEnd)
@@ -674,12 +708,25 @@ done
 [ ${#TARGETS[@]} -eq 0 ] && TARGETS=(rog minix)
 
 # A --hold that holds nothing is a lane that believes it is held and is not, which is the exact
-# failure this flag exists to prevent — so refuse it rather than ignore it. Before load_hosts: a
+# failure this flag exists to prevent — so refuse it rather than ignore it. On the wake path that
+# means --wait as well as --wsl: without --wait the wake never reaches start_wsl at all, so
+# `--wsl --hold` alone would send the packets, hold nothing, and exit 0. Before load_hosts: a
 # misspelled command is worth saying so on a box with no host table too.
-if [ "$HOLD" = 1 ] && [ "$VERB" != kick-wsl ] && { [ "$VERB" != wake ] || [ "$WANT_WSL" != 1 ]; }; then
+if [ "$HOLD" = 1 ] && [ "$VERB" != kick-wsl ] &&
+   { [ "$VERB" != wake ] || [ "$WANT_WSL" != 1 ] || [ "$WAIT" != 1 ]; }; then
   echo "wake-lab.sh: --hold needs a WSL start to hold" >&2
-  echo "  use 'kick-wsl --hold' / 'restart-wsl --hold', or '--wait --wsl --hold'; end it with 'unhold'." >&2
+  echo "  use 'kick-wsl --hold' / 'restart-wsl --hold', or '--wait --wsl --hold' (the wake path" >&2
+  echo "  starts WSL only under --wait); end it with 'unhold'." >&2
   exit 1
+fi
+
+# unhold before load_hosts, and before check_targets: releasing a local pid needs neither the MAC
+# table nor the network, and a site file that went missing or unparseable after a lane started
+# would otherwise strand the holder it is the only way to end. The cost is that a misspelled box
+# reports no holder instead of a typo, which is the right trade for a cleanup command.
+if [ "$VERB" = unhold ]; then
+  for t in "${TARGETS[@]}"; do release_hold "$t"; done
+  exit 0
 fi
 
 # After the argument loop on purpose: --help and --list need no site data, and both are what you
@@ -693,12 +740,6 @@ case "$VERB" in
     ;;
   kick-wsl)
     start_wsl "${TARGETS[@]}"; exit $?
-    ;;
-  unhold)
-    # Explicit, idempotent, and never a failure: a lane's cleanup runs on the way out of a failed
-    # lane too, and refusing to exit 0 over a holder that had already died would fail the lane
-    # twice for one event.
-    for t in "${TARGETS[@]}"; do release_hold "$t"; done
     ;;
   sleep|hibernate|down)
     for t in "${TARGETS[@]}"; do power_action "$VERB" "$t"; done
