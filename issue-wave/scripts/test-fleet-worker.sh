@@ -531,6 +531,11 @@ echo x >> "$repo/ship-pr/SKILL.md"
 expect "a reachable sibling does not swallow the refusal that follows the probe" 1 "1 local change(s) in the served tree" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_SLURP=otherbox "$FW" preflight testbox --no-probe
 git -C "$repo" checkout -q -- ship-pr/SKILL.md
 [ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
+# `execution slot` runs a python3 flock on the box that runs the batches, so Python is no longer
+# an anchor-only requirement and the preflight is where a box missing it must say so.
+mkdir -p "$TMP/nopy"; printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/nopy/python3"; chmod +x "$TMP/nopy/python3"
+expect "a box whose python3 cannot import fcntl refuses (the run-time slot lock needs it)" 1 "no python3 with fcntl" -- \
+  env PATH="$TMP/nopy:$PATH" "$FW" preflight testbox --no-probe
 expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
 expect "native preflight needs neither CLI login nor a model probe" 0 "PREFLIGHT OK" -- env SHIM_CODEX_LOGIN_DOWN=1 SHIM_CODEX_DOWN=1 SHIM_CLAUDE_DOWN=1 "$FW" preflight testbox --native-codex
 expect "native Claude needs no CLI model probe" 0 "PREFLIGHT OK" -- env SHIM_CLAUDE_DOWN=1 SHIM_CODEX_LOGIN_DOWN=1 "$FW" preflight testbox --native-claude
@@ -1004,6 +1009,13 @@ expect "a repeated box in the spec reads as its last value, as the registry read
   env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=6 testbox=1" "$FW" execution slot --wait 0 -- echo last-wins
 expect "...and a malformed later entry is still refused" 1 "<box>=<positive n>" -- \
   env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=2 other=0" "$FW" execution slot -- echo bad-tail
+expect "...and a spec naming a box outside the roster, as the registry refuses it" 1 "names stale-box, which is not in FLEET_BOXES" -- \
+  env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=2 stale-box=1" "$FW" execution slot -- echo stale-spec
+# A wrapper must not change a batch's verdict: Python ignores SIGPIPE and an ignored disposition
+# survives exec, so without the reset the pipeline below exits 1 with a "Broken pipe" line.
+expect "a pipeline under the slot dies of SIGPIPE exactly as it does unwrapped" 141 "slot 1 of 1" -- \
+  "${FWS[@]}" execution slot -- bash -c 'set -o pipefail; yes | head -n1 >/dev/null'
+grep -q "Broken pipe" <<<"$out" && ko "the wrapped pipeline reported a broken pipe the bare one does not" || ok "...and without the diagnostic the bare pipeline never prints"
 # The site default, the number the references quote: six on mac-studio (ludics-lite#160), and
 # one anywhere the spec does not name -- which is every box under a custom FLEET_BOXES.
 expect "the site default gives mac-studio six run-time slots" 0 "slot 1 of 6" -- \

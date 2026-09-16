@@ -580,5 +580,6 @@ and concludes only with evidence. The usual shape is two calls per execution - `
 standing correctness reservation per worker for its own iteration batches (`"standing": true`),
 taken at launch and concluded at hand-back. A standing record consumes no correctness slot: the
 worker takes one around each batch with `execution slot` instead, so the cap bounds load on the
-box and never how many workers may be in flight. `load` is an observation, not ownership. Neither it nor these
+box and never how many workers may be in flight. Assigned correctness runs go through the same
+lock, so it is the one mechanism bounding what a box carries at once. `load` is an observation, not ownership. Neither it nor these
 cooperative reservations prevents unrelated processes or scheduled sweeps from using a machine.

@@ -123,7 +123,8 @@ mac-studio), a run-time count a worker takes around each batch with `execution s
 so a standing iteration record gates no agent's start (ludics-lite#160). The
 usual coordinator shape is two calls per execution: `execution run <reserve.json>` (reserve and
 dispatch) and `execution conclude --from-run <run-dir> --request <id> --sha <sha>` (verdict, log and
-checkout read off a `test-run.sh` record on the reserved box). The reservation helper requires Python 3 on the anchor.
+checkout read off a `test-run.sh` record on the reserved box). The reservation helper requires Python 3 on the anchor, and `execution slot` requires it on every
+box that runs batches (the per-box preflight checks it).
 
 ## Routines
 

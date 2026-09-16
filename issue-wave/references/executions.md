@@ -2,8 +2,10 @@
 
 Use `fleet-worker.sh execution` for every worker correctness/test or measurement/experiment
 execution on a fleet box and every coordinator integration run, with either provider and any
-transport. This includes a CLI worker running tests on its own host, just as it includes a
-native subagent driving that host over SSH. Agent residence never grants execution ownership. Python 3 is required on the anchor. State lives in `FLEET_ANCHOR_STATE/executions`,
+transport. Every correctness RUN on a box, assigned or standing, is wrapped in
+`fleet-worker.sh execution slot -- <command>` on that box. This includes a CLI worker running tests on its own host, just as it includes a
+native subagent driving that host over SSH. Agent residence never grants execution ownership. Python 3 is required on the anchor, and on every box that runs
+batches (`execution slot`'s lock is a python3 flock); the per-box preflight checks it. State lives in `FLEET_ANCHOR_STATE/executions`,
 under the existing coordinator lease lock. Use the same fleet environment as `claim`.
 
 A `measurement` assignment is exclusive: it is refused while anything is outstanding on its
@@ -39,6 +41,14 @@ physical box. Outstanding records outside a changed roster block dispatch until 
 reads and evidence/conclusion remain available. No SSH alias discovery is performed. Choose placement using required hardware, current
 load, outstanding assignments and available warm checkouts. Record the checkout actually used;
 this does not introduce persistent verifier worktrees, sync, scheduling or remote agent launch.
+
+`execution slot` is the single RUN-TIME mechanism: every correctness run on a box goes through
+it, an assigned one (a full suite, a cross-box leg) exactly as much as a standing worker's own
+batch, so the box never carries more than its slots however the runs were authorized. The
+registry's cap stays what it always was for non-standing records - a bound on how many such
+assignments may be outstanding on that box - and it is deliberately NOT subtracted from the
+run-time slots: a run refused because of a record that is not running, its own included, is the
+defect ludics-lite#160 exists to remove.
 
 `load` observes activity; reservations provide cooperative ownership. They do not stop unrelated
 users, applications or scheduled sweeps. Before timing experiments inspect external activity and
@@ -83,7 +93,9 @@ Provider is not an ownership key. The same issue may hold separate reservations 
 boxes. Planned placement is a default for iteration; agent capacity and issue dependency readiness
 remain coordinator decisions outside this API.
 
-Immediately before invoking the existing bounded project runner, use `execution dispatch` with
+Immediately before invoking the existing bounded project runner - which the worker invokes
+through `execution slot`, so the box's run-time cap holds for assigned runs too - use
+`execution dispatch` with
 `{"request_id":"wave-issue123-cuda-1","evidence":"about to invoke project verifier"}`.
 This rechecks the lease and halt under lock and changes `reserved` to `launching`. Nonzero means
 no dispatch. This is a point-in-time gate, not atomic with the subsequent SSH/tool call. Record

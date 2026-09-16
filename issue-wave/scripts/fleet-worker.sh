@@ -460,6 +460,9 @@ elif [ "$codex" = 0 ]; then
 fi
 case "$codex" in native|native-claude) ;; *) command -v tmux >/dev/null 2>&1 || note "no tmux" ;; esac
 command -v jq >/dev/null 2>&1 || note "no jq"
+# Every correctness batch on this box now runs under `execution slot`, whose N-holder lock is a
+# real flock taken by python3 (ludics-lite#160), so Python is no longer an anchor-only need.
+python3 -c 'import fcntl' >/dev/null 2>&1 || note "no python3 with fcntl (execution slot's run-time lock)"
 # Cross-box reach (ludics-lite#57): a worker's brief may drive a fleet sibling over ssh for a
 # one-off leg, and on 2026-09-04 the first such leg found no credential mid-task. A refused
 # credential (permission denied, an unverifiable host key) refuses here; a sibling that does not
@@ -1190,6 +1193,16 @@ conclude_from_run() {
     '{request_id: $id, evidence: $ev, observed_sha: $sha, remote_checkout: $wt, handle: $handle, log: $log, verdict: $verdict, execution_host: $host}'
 }
 
+# in_roster <name>: is that an exact FLEET_BOXES entry? The registry refuses an execution host
+# and a slots-spec box that is not one, and the run-time lock must read the same configuration.
+in_roster() {
+  local name="$1" entry
+  local -a roster=()
+  read -r -a roster <<< "$BOXES"
+  for entry in ${roster[@]+"${roster[@]}"}; do [ "$entry" = "$name" ] && return 0; done
+  return 1
+}
+
 # box_correctness_slots <box>: that box's correctness slot count from $SLOTS on stdout (a box
 # the spec does not name has one), or a refusal line on stdout and return 1 for a malformed spec.
 # The same grammar the registry enforces, read here so the run-time lock and the registry agree --
@@ -1204,6 +1217,7 @@ box_correctness_slots() {
     case "$pair" in *=*) ;; *) count="" ;; esac
     case "$count" in ''|*[!0-9]*) echo "FLEET_BOX_CORRECTNESS_SLOTS entry must be <box>=<positive n>: $pair"; return 1 ;; esac
     [ "$count" -ge 1 ] || { echo "FLEET_BOX_CORRECTNESS_SLOTS entry must be <box>=<positive n>: $pair"; return 1; }
+    in_roster "${pair%%=*}" || { echo "FLEET_BOX_CORRECTNESS_SLOTS names ${pair%%=*}, which is not in FLEET_BOXES"; return 1; }
     [ "${pair%%=*}" = "$box" ] && found="$count"
   done
   echo "$found"
@@ -1228,13 +1242,20 @@ box_correctness_slots() {
 # The measurement check is a point-in-time gate read from the anchor's registry, exactly as
 # `execution dispatch` is: it refuses to start a batch beside an outstanding measurement, and
 # a measurement reserved afterwards is the registry's exclusivity to enforce, not this lock's.
+#
+# EVERY correctness run on the box goes through this lock, an assigned one (a full suite, a
+# cross-box leg) exactly as much as a standing worker's batch: it is the single run-time
+# mechanism, and the registry's reservation cap stays a bound on how many non-standing
+# assignments may be QUEUED there. Subtracting outstanding assignments from the cap here would
+# re-introduce the very thing #160 removes - a run refused because of a record that is not
+# running, its own included.
 # Exit: the wrapped command's own status; 1 with a line beginning `EXECUTION SLOT REFUSED` (no
 # free slot before the deadline, an outstanding measurement, a malformed slots spec); 4 when the
 # anchor's registry could not be read; 127 when the command itself could not be run. The command
 # is exec'd and not interpreted, so a pipeline or a builtin goes as `sh -c '...'`.
 slot_lock_py() {
   cat <<'SLOT_PY'
-import fcntl, os, sys, time
+import fcntl, os, signal, sys, time
 box, directory, cap, wait = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 command = sys.argv[5:]
 deadline = time.monotonic() + wait
@@ -1253,6 +1274,10 @@ while True:
                          % (box, index, cap, " ".join(command)))
         sys.stderr.flush()
         try:
+            # Python ignores SIGPIPE, and an IGNORED disposition survives exec: without this the
+            # wrapped batch would see `yes | head -n1` exit 1 with a "Broken pipe" diagnostic
+            # where the same script run directly exits 141. A wrapper must not change verdicts.
+            signal.signal(signal.SIGPIPE, signal.SIG_DFL)
             os.execvp(command[0], command)
         except OSError as exc:
             print("EXECUTION SLOT REFUSED %s: cannot run %s: %s" % (box, command[0], exc))
@@ -1284,11 +1309,7 @@ cmd_execution_slot() {
   # An alias or a typo would lock under a name of its own and read measurements under another,
   # so a batch could run beside a measurement reserved on the canonical spelling of this very box.
   # The registry refuses a noncanonical execution_host for the same reason; this is that check.
-  local canonical=0 entry
-  local -a roster=()
-  read -r -a roster <<< "$BOXES"
-  for entry in ${roster[@]+"${roster[@]}"}; do [ "$entry" = "$box" ] && canonical=1; done
-  [ "$canonical" -eq 1 ] || { echo "EXECUTION SLOT REFUSED $box: not a canonical FLEET_BOXES entry ($BOXES)"; exit 1; }
+  in_roster "$box" || { echo "EXECUTION SLOT REFUSED $box: not a canonical FLEET_BOXES entry ($BOXES)"; exit 1; }
   cap=$(box_correctness_slots "$box") || { echo "EXECUTION SLOT REFUSED $box: $cap"; exit 1; }
   helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"

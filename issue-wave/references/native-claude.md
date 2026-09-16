@@ -50,8 +50,9 @@ stranded worker.
    Agent call) with one line, `EXECUTION_ASSIGNED <request_id>`, followed by the exact
    command, revision, checkout and log to use. On a refusal, hold the worker - idle, it keeps
    its context - or answer `EXECUTION_REFUSED <reason>` so it keeps implementing.
-4. **Result.** The resumed worker runs only the assigned command, blocks on it to completion
-   within the turn (`TaskOutput` on the harness's background task, or `tools/test-run.sh wait
+4. **Result.** The resumed worker runs only the assigned command - wrapped, like its own
+   batches, in `fleet-worker.sh execution slot -- <command>`, which is what bounds the box's
+   concurrent load - blocks on it to completion within the turn (`TaskOutput` on the harness's background task, or `tools/test-run.sh wait
    last`), and ends that turn with one fixed line, so the coordinator concludes without
    grepping run ids out of prose:
 
