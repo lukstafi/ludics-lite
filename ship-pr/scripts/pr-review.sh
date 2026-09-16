@@ -4024,19 +4024,27 @@ glob_ere() {
 # pattern that does not translate fails the whole question rather than just itself — "the rest of
 # them covered everything" is not an answer about a filter half of which was not read.
 paths_ignore_covers() {
-  local pats="$1" files="$2" f p ere hit
+  local pats="$1" files="$2" f p ere eres="" hit
   [ -n "$pats" ] && [ -n "$files" ] || return 1
+  # EVERY pattern is translated BEFORE anything is matched. Translating lazily would let an early
+  # pattern that happens to match end the search before the untranslatable one beside it was ever
+  # looked at, and the filter would be declared read when half of it was not.
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    ere=$(glob_ere "$p") || return 1
+    eres="${eres}${ere}"$'\n'
+  done <<<"$pats"
+  [ -n "$eres" ] || return 1
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     hit=""
-    while IFS= read -r p; do
-      [ -n "$p" ] || continue
-      ere=$(glob_ere "$p") || return 1
+    while IFS= read -r ere; do
+      [ -n "$ere" ] || continue
       printf '%s' "$f" | grep -Eq -- "$ere" && {
         hit=1
         break
       }
-    done <<<"$pats"
+    done <<<"$eres"
     [ -n "$hit" ] || return 1
   done <<<"$files"
   return 0

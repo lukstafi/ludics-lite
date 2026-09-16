@@ -523,52 +523,13 @@ base_checker() (
   SHIP_PR_BASE_ABSENT_GRACE=300 "$@"
 )
 
-# base_tip <helper> <target> <branch>: the branch's current tip SHA on stdout, or nothing.
-base_tip() {
-  local encoded tip
-  encoded=$(jq -rn --arg ref "${3:-HEAD}" '$ref | @uri') || return 1
-  tip=$(base_checker "$1" --repo "$2" retry --read api "repos/$2/commits/$encoded" --jq .sha) || return 1
-  [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || return 1
-  printf '%s' "$tip"
-}
-
-# base_settle_plain <helper> <target> <branch> <tip observed before the wait>: exit 0 when the
-# plain `base` read is green AND the tip is one this gate itself has been observing for longer
-# than the run-creation grace (it was the tip before the 301 s wait and still is) AND no workflow
-# run ever covered it -- the paths-ignore shape `base --wait` cannot settle (ludics-lite#156).
-# Observation, not the commit date, measures the grace: a branch fast-forwarded to an old commit
-# carries a stale committer date while its run row is not created yet. A tip whose run is in
-# flight (the plain read is green over an older verdict there too, which is why a bare plain
-# read is never enough) keeps the refusal, and so does a tip that moved at any point, reconfirmed
-# after the last read. Everything it learned goes to stderr with the verdict.
-base_settle_plain() {
-  local helper="$1" target="$2" branch="$3" seen="$4" plain tip runs
-  [ -n "$seen" ] || { echo "BASE UNSETTLED: the tip was not observed before the wait" >&2; return 1; }
-  plain=$(base_checker "$helper" --repo "$target" base ${branch:+"$branch"} 2>&1) || {
-    printf '%s\n' "$plain" >&2
-    echo "BASE UNSETTLED: the plain read is not green either" >&2; return 1
-  }
-  tip=$(base_tip "$helper" "$target" "$branch") || { echo "BASE UNSETTLED: cannot read the tip" >&2; return 1; }
-  [ "$tip" = "$seen" ] || { echo "BASE UNSETTLED: tip moved during the wait (${seen:0:8} -> ${tip:0:8}); the new tip has had no grace" >&2; return 1; }
-  runs=$(base_checker "$helper" --repo "$target" retry --read api "repos/$target/actions/runs?head_sha=$tip&per_page=1" --jq .total_count) ||
-    { echo "BASE UNSETTLED: cannot read the tip's runs" >&2; return 1; }
-  [ "$runs" = 0 ] || { echo "BASE UNSETTLED: tip ${tip:0:8} has $runs workflow run(s): in flight or stopped, not paths-ignore" >&2; return 1; }
-  tip=$(base_tip "$helper" "$target" "$branch") || { echo "BASE UNSETTLED: cannot reconfirm the tip" >&2; return 1; }
-  [ "$tip" = "$seen" ] || { echo "BASE UNSETTLED: tip moved after the runs read (${seen:0:8} -> ${tip:0:8})" >&2; return 1; }
-  printf '%s\n' "$plain" >&2
-  echo "BASE SETTLED: $target ${branch:-default branch}: tip ${tip:0:8} observed unjudged and without a workflow run through the whole wait (paths-ignore); dispatching on the plain read's older green (ludics-lite#156 interim)" >&2
-}
-
 base_gate() {
-  local target="$1" branch="$2" force="$3" reason="$4" expected="${5:-}" helper rc tip encoded seen
+  local target="$1" branch="$2" force="$3" reason="$4" expected="${5:-}" helper rc tip encoded
   [[ "$target" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "base gate: --target-repo <owner/repo> required"
   [ -z "$reason" ] || [ "$force" -eq 1 ] || die "base gate: --allow-red-base requires --force for a triage worker"
   case "$branch" in -*|*$'\n'*) die "base gate: invalid --base-branch" ;; esac
   helper="$(cd "$(dirname "$0")/../../ship-pr/scripts" 2>/dev/null && pwd)/pr-review.sh"
   [ -x "$helper" ] || { echo "BASE REFUSED: coordinator base checker missing: $helper" >&2; return 1; }
-  # The tip as observed BEFORE the wait: the settle path below may only accept a tip this gate
-  # has itself watched sit unjudged for the whole 301 s, longer than the run-creation grace.
-  seen=$(base_tip "$helper" "$target" "$branch") || seen=""
   # The ordinary base read may carry an older green while the tip is running.
   # Reuse its bounded integration mode; preserve the established absence grace
   # for path-filtered tips, independent of the coordinator's ambient settings.
@@ -578,10 +539,6 @@ base_gate() {
     base_checker "$helper" --repo "$target" base --wait=301 >&2
   fi
   rc=$?
-  # ludics-lite#156 interim: --wait parks a docs-only (paths-ignore) tip at its ceiling and
-  # exits 4 where the plain read settles for the older green. Fall back to the plain read
-  # only for exactly that shape, proven by two more reads rather than assumed.
-  if [ "$rc" -eq 4 ] && base_settle_plain "$helper" "$target" "$branch" "$seen"; then rc=0; fi
   if [ "$rc" -eq 1 ] && [ "$force" -eq 1 ] && [ -n "$reason" ]; then
     echo "BASE TRIAGE OVERRIDE: $target ${branch:-default branch}: $reason" >&2
     rc=0

@@ -42,6 +42,34 @@ TIP=""
 WORKFLOWS_JSON=""
 JOBS_DEFAULT=""
 FAIL_ENDPOINT=""
+# The settle path's three reads (ludics-lite#156): the workflow FILE (its path, then its body at
+# the tip, served raw as the library asks for it) and the compare from the judged commit to the
+# tip. One body and one file list for every workflow here: the cases that care which compare was
+# asked for read $REQUEST_LOG, which records the endpoint.
+WORKFLOW_PATH=""
+WORKFLOW_YAML=""
+COMPARE_FILES=""
+
+# A ci workflow as the fleet's repositories write one: docs are the paths-ignore.
+DOCS_IGNORED_YAML='name: ci
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+'
+
+# The tip read answers TIP until TIP_SWITCH_AFTER reads have gone by, and TIP_NEXT after that: how
+# a case moves the branch between the round's tip read and the settle's re-confirm of it. The
+# counter lives in a FILE because every one of those reads happens inside a command substitution,
+# where an incremented variable would die with the subshell.
+TIP_SWITCH_AFTER=""
+TIP_NEXT=""
+TIP_READS="$TEST_ROOT/tip-reads"
 
 # runs_json <workflow id> <json array of run overrides>, newest first. Each row defaults to a
 # completed push run of a workflow named "ci", with a distinct id and a created_at that decreases
@@ -83,13 +111,20 @@ reset_fixture() {
   FAIL_ENDPOINT=""
   BASE_JOBS_CACHE=""
   BASE_RED_DETAIL=""
+  BASE_IGNORE_CACHE=""
+  WORKFLOW_PATH=".github/workflows/ci.yml"
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  COMPARE_FILES='[]'
+  TIP_SWITCH_AFTER=""
+  TIP_NEXT=""
+  : >"$TIP_READS"
   # The wait loop's clocks, for the one case that takes more than a single round.
   retune ABSENT_GRACE=300 CHECKS_INTERVAL=1 CHECKS_HEARTBEAT=600
   : >"$REQUEST_LOG"
 }
 
 gh() {
-  local response="" rid wid
+  local response="" rid wid reads
   gh_fixture_parse "$@"
   if [ -n "$FAIL_ENDPOINT" ]; then
     # A GLOB, deliberately unquoted, so a case can fail the jobs read alone: it is the read whose
@@ -104,7 +139,15 @@ gh() {
     esac
   fi
   case "$FIXTURE_ENDPOINT" in
-  "repos/$REPO/commits/$BRANCH") response=$(jq -cn --arg sha "$TIP" '{sha: $sha}') ;;
+  "repos/$REPO/commits/$BRANCH")
+    reads=$(($(wc -l <"$TIP_READS") + 1))
+    printf 'x\n' >>"$TIP_READS"
+    if [ -n "$TIP_SWITCH_AFTER" ] && [ "$reads" -gt "$TIP_SWITCH_AFTER" ]; then
+      response=$(jq -cn --arg sha "$TIP_NEXT" '{sha: $sha}')
+    else
+      response=$(jq -cn --arg sha "$TIP" '{sha: $sha}')
+    fi
+    ;;
   "repos/$REPO/actions/workflows?per_page=100") response="$WORKFLOWS_JSON" ;;
   "repos/$REPO/actions/workflows/"*"/runs?branch=$BRANCH&event=push&per_page=10")
     wid=${FIXTURE_ENDPOINT#*/actions/workflows/}
@@ -117,6 +160,12 @@ gh() {
     rid=${rid%%/*}
     response=$(jobs_of "$rid")
     ;;
+  # The workflow's own file: where it lives, then what it says at the tip. The body is served
+  # verbatim — the library asks for the raw media type rather than the base64 JSON, whose decoder
+  # is spelled differently on this fleet's two platforms.
+  "repos/$REPO/actions/workflows/"*) response=$(jq -cn --arg p "$WORKFLOW_PATH" '{path: $p}') ;;
+  "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
+  "repos/$REPO/compare/"*) response=$(jq -cn --argjson f "$COMPARE_FILES" '{files: $f}') ;;
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
   gh_fixture_answer "$response"
@@ -310,6 +359,154 @@ test_a_standing_red_is_read_once_across_wait_rounds() {
     "the remembered line should still be printed on the rounds that did not read"
 }
 
+# --- the tip's own absence, and the one absence that is not a race (ludics-lite#156) -----------
+# The shape that blocked a wave's dispatch on 2026-09-15: the default branch's tip was a docs-only
+# push, `ci` carries `paths-ignore: docs/**`, so no run for the tip was ever going to exist —
+# and `base --wait` sat on it to its ceiling and refused, while the plain read settled for the
+# older green on the same tip. Nothing here is about time: the workflow's own filter says a run
+# cannot be created for this tip, so the wait has nothing to wait for and settles at once. The
+# grace is left at its default so that only the recognition can end this wait.
+test_a_paths_ignored_tip_settles_without_waiting_out_the_grace() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5001}]')")
+  COMPARE_FILES='[{"filename":"docs/agent-notes/build-and-test.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 0 "a tip whose whole diff is paths-ignored settles for the older verdict"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" \
+    "the settle answers about the tip it settled for"
+  assert_contains "$BASE_OUTPUT" "entirely within the paths-ignore of ci" \
+    "the settle should say WHY no run is coming, not just that it waited"
+  assert_contains "$BASE_OUTPUT" "(that verdict is about ${SHA_A:0:8}, not the tip ${SHA_C:0:8})" \
+    "the older commit the verdict is really about stays named"
+  assert_not_contains "$BASE_OUTPUT" "NO VERDICT" "this is a settled verdict, not a refusal"
+  assert_contains "$(cat "$REQUEST_LOG")" "compare/$SHA_A...$SHA_C?per_page=1" \
+    "the diff read is from the JUDGED commit to the tip"
+}
+
+# The recognition is about the WHOLE diff: one path the filter does not cover and a run is coming
+# after all. Then the only thing that can settle this wait is the grace, which is left at its
+# default here — so the wait runs to its ceiling and refuses, as it must.
+test_a_tip_that_changed_a_source_file_is_not_recognized() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5002}]')")
+  COMPARE_FILES='[{"filename":"docs/notes.md"},{"filename":"src/main.ml"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a diff the filter does not cover is a tip whose run is still coming"
+  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" \
+    "an unrecognized tip keeps the refusal"
+  assert_not_contains "$BASE_OUTPUT" "paths-ignore of" "nothing was recognized here"
+  # The three reads are per workflow, judged commit and tip — not per round.
+  assert_eq "$(grep -c "contents/" "$REQUEST_LOG")" 1 \
+    "the workflow file should be read once, not once per round"
+}
+
+# A pattern the translation does not carry fails the WHOLE question rather than just itself: with
+# `!docs/keep.md` in the filter, "the other pattern covered everything" is not an answer about a
+# filter half of which was not read.
+test_an_untranslatable_pattern_refuses_the_recognition() {
+  reset_fixture
+  WORKFLOW_YAML='on:
+  push:
+    paths-ignore: ["docs/**", "!docs/keep.md"]
+'
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5003}]')")
+  COMPARE_FILES='[{"filename":"docs/notes.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a filter that was not fully read cannot explain an absence"
+  assert_not_contains "$BASE_OUTPUT" "paths-ignore of" "no recognition may be claimed"
+}
+
+# A workflow file the narrow parser cannot read (`on: [push]` names no filter at all) is refused
+# the same way: a refusal costs the grace, which is the settle that was already there.
+test_a_workflow_file_without_a_filter_refuses_the_recognition() {
+  reset_fixture
+  WORKFLOW_YAML='on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+'
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5004}]')")
+  COMPARE_FILES='[{"filename":"docs/notes.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a workflow whose push filter cannot be read explains no absence"
+  assert_not_contains "$BASE_OUTPUT" "paths-ignore of" "no recognition may be claimed"
+  assert_eq "$(grep -c "compare/" "$REQUEST_LOG")" 0 \
+    "with no filter in hand there is nothing to compare the tip against"
+}
+
+# The other half of #156, and the part that actually parks a wait: the settle used to be gated on
+# nothing being in flight ANYWHERE on the branch. A run still going at an OLDER commit says
+# nothing about a tip that has no run of its own, and holding the wait on it means the ceiling
+# arrives before the grace can settle anything.
+test_a_run_in_flight_at_an_older_commit_does_not_hold_the_settle() {
+  reset_fixture
+  retune ABSENT_GRACE=0
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg b "$SHA_B" --arg a "$SHA_A" \
+    '[{status:"in_progress", conclusion:null, head_sha:$b, id:5011},
+      {conclusion:"success", head_sha:$a, id:5010}]')")
+  COMPARE_FILES='[{"filename":"src/main.ml"}]' # unrecognized: only the grace can settle this
+  run_base --wait=2
+  assert_eq "$BASE_RC" 0 "a tip with no run of its own settles once its absence outlives the grace"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" \
+    "the settle is for the verdicts in hand"
+  assert_contains "$BASE_OUTPUT" "no run for the tip appeared and none is in flight for it" \
+    "the note should say what was waited for"
+  assert_contains "$BASE_OUTPUT" "(ci is running now at ${SHA_B:0:8})" \
+    "the older commit's run stays visible in the report it does not decide"
+}
+
+# What a run FOR THE TIP means, in both of its shapes: it exists, so no filter explains it, and
+# only that run can answer. In flight, the wait waits — past any grace, and without spending a
+# read on a recognition that could not apply.
+test_a_run_in_flight_at_the_tip_keeps_the_refusal() {
+  reset_fixture
+  retune ABSENT_GRACE=0
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg a "$SHA_A" \
+    '[{status:"in_progress", conclusion:null, head_sha:$c, id:5021},
+      {conclusion:"success", head_sha:$a, id:5020}]')")
+  COMPARE_FILES='[{"filename":"docs/notes.md"}]' # would be recognized if the tip had no run
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a run judging the tip is the answer to wait for"
+  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" "the refusal stands"
+  assert_eq "$(grep -c "compare/" "$REQUEST_LOG")" 0 \
+    "an existing run is not an absence: nothing to recognize, and no read to spend on it"
+}
+
+# Stopped, the wait allows the grace for a superseding run to be created and then says the verdict
+# is NONE — a cancelled run judged nothing, so it is neither absence nor an all-clear.
+test_a_stopped_run_at_the_tip_is_no_verdict_not_an_absence() {
+  reset_fixture
+  retune ABSENT_GRACE=0
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg a "$SHA_A" \
+    '[{conclusion:"cancelled", head_sha:$c, id:5031}, {conclusion:"success", head_sha:$a, id:5030}]')")
+  COMPARE_FILES='[{"filename":"docs/notes.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a stopped run at the tip is not an absence any filter explains"
+  assert_contains "$BASE_OUTPUT" "stopped-not-judged and no replacement appeared" \
+    "the report should say the workflow wants re-running"
+  assert_eq "$(grep -c "compare/" "$REQUEST_LOG")" 0 "a run that existed is not a paths-ignore tip"
+}
+
+# This settle accepts a verdict about an OLDER commit, so the tip it settles for has to still be
+# the tip: a push landing between the round's tip read and the settle would otherwise be answered
+# with a green from two commits back. The branch moves right after the round's own read here, so
+# the first tip is never settled for — the successor is judged on its own.
+test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5041}]')")
+  COMPARE_FILES='[{"filename":"docs/notes.md"}]'
+  TIP_SWITCH_AFTER=1 # the round's tip read answers SHA_C; the re-confirm and everything after it
+  TIP_NEXT=$SHA_B    # answer SHA_B, as a push landing in that window would
+  run_base --wait=4
+  assert_eq "$BASE_RC" 0 "the successor tip is itself paths-ignored, and settles on its own round"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_B:0:8})" \
+    "the settle is for the tip that is still there"
+  assert_not_contains "$BASE_OUTPUT" "green (tip ${SHA_C:0:8})" \
+    "the tip that moved under the round must never be settled for"
+  assert_contains "$(cat "$REQUEST_LOG")" "compare/$SHA_A...$SHA_B?per_page=1" \
+    "the successor is judged by its own diff"
+}
+
 tests=(
   test_red_names_the_failing_job_and_the_first_red_commit
   test_a_window_of_only_reds_does_not_name_a_first_red_commit
@@ -319,6 +516,14 @@ tests=(
   test_a_green_base_asks_for_no_jobs
   test_two_workflows_sharing_a_name_keep_their_streaks_apart
   test_a_standing_red_is_read_once_across_wait_rounds
+  test_a_paths_ignored_tip_settles_without_waiting_out_the_grace
+  test_a_tip_that_changed_a_source_file_is_not_recognized
+  test_an_untranslatable_pattern_refuses_the_recognition
+  test_a_workflow_file_without_a_filter_refuses_the_recognition
+  test_a_run_in_flight_at_an_older_commit_does_not_hold_the_settle
+  test_a_run_in_flight_at_the_tip_keeps_the_refusal
+  test_a_stopped_run_at_the_tip_is_no_verdict_not_an_absence
+  test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict
 )
 
 run_tests "${tests[@]}"

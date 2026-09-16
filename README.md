@@ -388,6 +388,18 @@ going ends no streak because it judged nothing, two workflow files sharing a dis
 their histories apart, a jobs read that fails prints UNKNOWN and leaves the red standing rather
 than reporting no failing job, and a green base spends no call on any of it.
 
+The same suite covers what `base --wait` does when the tip has no verdict of its own
+(ludics-lite#156, where a docs-only default-branch tip parked a wave's dispatch at the ceiling
+while the plain read settled for the older green on it). The absence is read per workflow: a run
+that EXISTS for the tip and has not judged it — queued, running, or stopped — keeps the refusal,
+because only that run can answer, while a tip with no run at all settles for the verdicts in hand,
+whatever is in flight at older commits. What ends that wait without any clock is the workflow's own
+`paths-ignore`: where the diff from the judged commit to the tip lies entirely within it, no run
+can ever be created. The cases pin both directions of that recognition — one path outside the
+filter, a filter pattern the translation does not carry, a workflow file naming no filter at all,
+each of which costs the grace rather than a settle — and the tip re-confirm, since a settle for an
+older verdict must not be handed to a tip that moved under the round.
+
 The `test-pr-review-*.sh` suites share a preamble, `test-pr-review-lib.sh`, which sources
 `pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and
 the fixture `gh`'s argument parsing. It also closes the trap that bit twice (ludics-lite#39, #45,
