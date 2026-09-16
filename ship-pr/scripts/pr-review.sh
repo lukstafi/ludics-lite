@@ -251,8 +251,8 @@
 #      it to the tip — from the first READ of it, not from that round's last answer — and then
 #      SETTLES for the older verdict the plain read settles for, once nothing is in flight on the
 #      branch and no run for the tip exists to judge it. It settles at once, without the grace,
-#      when every commit the tip adds over the judged one changes only paths within the
-#      workflow's own paths-ignore (ludics-lite#156). `checks`/`merge` apply it to the
+#      when every commit on the first-parent path from the judged one up to the tip changes only
+#      paths within the workflow's own paths-ignore (ludics-lite#156). `checks`/`merge` apply it to the
 #      head before calling a build signal ABSENT rather than not-created-yet (ludics-lite#24),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences the commit-count warning). A nonempty file overlap still warns at any count; no
@@ -4090,43 +4090,60 @@ commit_files() {
   printf '%s' "$raw" | tr '\t' '\n' | grep .
 }
 
-# commits_ignored <patterns> <judged sha> <tip>: true when EVERY commit the tip added over the
-# judged one changed only ignored paths.
+# commits_ignored <patterns> <workflow file> <judged sha> <tip>: true when every commit on the
+# FIRST-PARENT path from the judged commit up to the tip changed only ignored paths.
 #
 # Per COMMIT, and not the cumulative diff of the range, because a path filter is evaluated per
 # PUSH: GitHub compares the push's before and after SHAs, and a range that nets out to nothing can
 # still contain a push that touched source. Push boundaries are not in this feed — but a push's
-# own diff is a subset of the union of its commits' diffs, so a range whose every commit is
-# ignored contains no push that is not, whatever the boundaries were. The union can only be
-# LARGER than the push diffs (a change and its revert inside one push cancel there but not here),
-# so the error is always a refusal, which costs the grace and never a green.
+# own diff is a subset of the union of the diffs along ANY path from its before to its after, so a
+# path whose every step is ignored contains no push that is not, whatever the boundaries were. The
+# union can only be LARGER than the push diffs (a change and its revert on the path cancel there
+# but not here), so the error is always a refusal, which costs the grace and never a green.
 #
-# The filter itself must also be ONE filter over the whole range. It is read at the tip, but the
-# push that a mid-range commit belonged to was judged by the workflow file as it stood THEN, and a
-# filter widened by the tip would explain away a run the older file had already asked for
-# (ludics-lite#163 review, round 2). No commit in the range may touch the workflow file: then the
-# file at every commit in it is the file at the tip, and the one filter read is the one that
-# applied. That check costs nothing — the paths are already in hand.
+# The path is the FIRST-PARENT one, and it must really reach the judged commit — two things the
+# range alone does not give (ludics-lite#163 review, round 3). A commit's file list is its diff
+# against its first parent, so only the first-parent chain is a path those diffs actually describe:
+# a merge reached through its second parent hides, behind a docs-only first-parent diff, every
+# source change the push carried from the judged tip. And after a force-push the judged commit is
+# not an ancestor at all, so the three-dot range walks the tip side of a fork and never sees what
+# the push removed — refused here both by `behind_by` and by a chain that cannot reach its base.
 #
-# The range must also be short and completely known: the commit list is one page, and a range
+# The path must also be short and completely known: the commit list is one page, and a range
 # longer than the cap goes to the grace rather than to a read per commit (GitHub's own rule is
 # 1000 commits, above which a push runs whatever the filter says). A `total_commits` the returned
 # list does not match is a truncated answer and settles nothing.
 commits_ignored() {
-  local pats="$1" wfile="$2" vsha="$3" tip="$4" cmp count shas sha files nl=$'\n'
+  local pats="$1" wfile="$2" vsha="$3" tip="$4" cmp count behind rows sha parent files steps nl=$'\n'
   cmp=$(gh_retry read api "repos/$REPO/compare/$vsha...$tip?per_page=$IGNORE_MAX_COMMITS" \
-    --jq '(.total_commits // 0 | tostring), ((.commits // [])[] | .sha)') || return 1
+    --jq '(.total_commits // 0 | tostring), ((.behind_by // -1) | tostring),
+          ((.commits // [])[] | [.sha, ((.parents // [])[0].sha // "-")] | @tsv)') || return 1
   count="${cmp%%$nl*}"
+  cmp="${cmp#*$nl}"
+  behind="${cmp%%$nl*}"
+  rows="${cmp#*$nl}"
   case "$count" in '' | *[!0-9]*) return 1 ;; esac
+  # Not an ancestor: the judged commit is off to the side of a force-push, and the three-dot range
+  # describes a fork rather than what the push did.
+  [ "$behind" = 0 ] || return 1
   [ "$count" -gt 0 ] && [ "$count" -le "$IGNORE_MAX_COMMITS" ] || return 1
-  shas="${cmp#*$nl}"
-  [ "$(printf '%s\n' "$shas" | grep -c '^[0-9a-f]\{7,\}$')" -eq "$count" ] || return 1
-  while IFS= read -r sha; do
-    [ -n "$sha" ] || continue
+  [ "$(printf '%s\n' "$rows" | grep -c '^[0-9a-f]\{7,\}	')" -eq "$count" ] || return 1
+  sha="$tip"
+  steps=0
+  while [ "$sha" != "$vsha" ]; do
+    steps=$((steps + 1))
+    [ "$steps" -le "$count" ] || return 1 # a chain longer than the range it walks: not a chain
+    parent=$(awk -F'\t' -v s="$sha" '$1 == s { print $2; exit }' <<<"$rows")
+    # A step off the listed range before reaching the judged commit: the path from it to the tip
+    # is not the first-parent one (a merge reached through a second parent), so these first-parent
+    # diffs do not describe it.
+    case "$parent" in '' | -) return 1 ;; esac
     files=$(commit_files "$sha") || return 1
     [ -z "$wfile" ] || ! grep -qxF -- "$wfile" <<<"$files" || return 1
     paths_ignore_covers "$pats" "$files" || return 1
-  done <<<"$shas"
+    sha="$parent"
+  done
+  [ "$steps" -gt 0 ] || return 1
   return 0
 }
 
@@ -4442,7 +4459,7 @@ cmd_base() {
     elif [ "$uncovered" -gt 0 ] && [ "$tip_unjudged" -eq 0 ] && [ "$inflight" -eq 0 ]; then
       settle_why=""
       if [ "$norun" -eq 0 ] && tip_within_paths_ignore "$unrun_rows" "$tip"; then
-        settle_why="(every commit the tip adds over the judged one changes only paths within the paths-ignore of $PATHS_IGNORE_WHY, so no run for it is coming — the verdicts above are about the commit each line names)"
+        settle_why="(every commit on the first-parent path from the judged commit up to the tip changes only paths within the paths-ignore of $PATHS_IGNORE_WHY, so no run for it is coming — the verdicts above are about the commit each line names)"
       elif [ $((now - grace_from)) -ge "$ABSENT_GRACE" ]; then
         settle_why="(waited $(((now - started) / 60)) min: no run for the tip appeared and none is in flight for it — the verdicts above may trail it)"
       fi

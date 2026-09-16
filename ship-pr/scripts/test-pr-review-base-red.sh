@@ -56,8 +56,14 @@ WORKFLOW_YAML=""
 # cumulative diff of a range can hide a push that touched source. COMPARE_TOTAL is the compare's
 # own total_commits, which a case moves on its own to stand for a range too long or a list the
 # answer truncated.
+# The commits the tip adds over the judged commit, oldest first, each the first parent of the next
+# — the shape a linear range has. COMPARE_PARENTS overrides the first parent of each of them, for
+# the cases about a merge reached through its SECOND parent; COMPARE_BEHIND makes the judged commit
+# a fork rather than an ancestor, as a force-push leaves it.
 COMPARE_COMMITS=""
+COMPARE_PARENTS=""
 COMPARE_TOTAL=""
+COMPARE_BEHIND=""
 FILES_DEFAULT=""
 # The delay one case needs: an API round takes time, and the grace has to be measured from when
 # the tip was first READ, not from when that round's last answer came back. The marker file is
@@ -134,7 +140,9 @@ reset_fixture() {
   WORKFLOW_PATH=".github/workflows/ci.yml"
   WORKFLOW_YAML="$DOCS_IGNORED_YAML"
   COMPARE_COMMITS=$(jq -cn --arg c "$SHA_C" '[$c]')
+  COMPARE_PARENTS=""
   COMPARE_TOTAL=""
+  COMPARE_BEHIND=""
   FILES_DEFAULT='[]'
   FIRST_READ_DELAY=""
   for v in $(set | LC_ALL=C sed -n 's/^\(FILES_[0-9a-z]\)=.*/\1/p'); do unset "$v"; done
@@ -149,7 +157,7 @@ reset_fixture() {
 }
 
 gh() {
-  local response="" rid wid reads sha
+  local response="" rid wid reads sha base
   if [ -n "$FIRST_READ_DELAY" ] && [ ! -e "$TEST_ROOT/delayed" ]; then
     : >"$TEST_ROOT/delayed"
     sleep "$FIRST_READ_DELAY"
@@ -195,9 +203,18 @@ gh() {
   "repos/$REPO/actions/workflows/"*) response=$(jq -cn --arg p "$WORKFLOW_PATH" '{path: $p}') ;;
   "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
   "repos/$REPO/compare/"*)
+    # Oldest first, so each commit's first parent is the one before it and the first commit's is
+    # the compare's base — the judged commit, which the endpoint names in the path.
+    base=${FIXTURE_ENDPOINT#*/compare/}
+    base=${base%%...*}
     response=$(jq -cn --argjson c "$COMPARE_COMMITS" --arg t "$COMPARE_TOTAL" \
+      --arg b "$base" --arg behind "$COMPARE_BEHIND" --argjson p "${COMPARE_PARENTS:-null}" \
       '{total_commits: (if $t == "" then ($c | length) else ($t | tonumber) end),
-        commits: [$c[] | {sha: .}]}')
+        behind_by: (if $behind == "" then 0 else ($behind | tonumber) end),
+        commits: [$c | to_entries[] |
+          {sha: .value,
+           parents: [{sha: (if $p != null then $p[.key]
+                            else (if .key == 0 then $b else $c[.key - 1] end) end)}]}]}')
     ;;
   "repos/$REPO/commits/"*)
     sha=${FIXTURE_ENDPOINT#*/commits/}
@@ -412,7 +429,7 @@ test_a_paths_ignored_tip_settles_without_waiting_out_the_grace() {
   assert_eq "$BASE_RC" 0 "a tip whose whole diff is paths-ignored settles for the older verdict"
   assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" \
     "the settle answers about the tip it settled for"
-  assert_contains "$BASE_OUTPUT" "every commit the tip adds over the judged one changes only paths within the paths-ignore of ci" \
+  assert_contains "$BASE_OUTPUT" "every commit on the first-parent path from the judged commit up to the tip changes only paths within the paths-ignore of ci" \
     "the settle should say WHY no run is coming, not just that it waited"
   assert_contains "$BASE_OUTPUT" "(that verdict is about ${SHA_A:0:8}, not the tip ${SHA_C:0:8})" \
     "the older commit the verdict is really about stays named"
@@ -487,20 +504,49 @@ test_a_workflow_file_touched_inside_the_range_is_not_recognized() {
 # The counterexample that makes this a per-COMMIT question (ludics-lite#163 review, round 1): a
 # path filter is evaluated per PUSH, over that push's own before/after diff, so a range whose
 # CUMULATIVE diff nets out to docs can still contain a push that touched source — here a commit
-# that changes src/main.ml and a later one that reverts it while adding a doc. GitHub creates a
-# run for that push; a recognition reading only the range's net diff would have called the tip
-# ignored and settled over a run that was on its way.
+# that changes src/main.ml, a later one that reverts it, and a docs commit on top. The net diff of
+# the whole range is one doc; every push in it that carried src/main.ml would get a run.
 test_a_source_change_reverted_inside_the_range_is_not_recognized() {
   reset_fixture
   RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5071}]')")
-  COMPARE_COMMITS=$(jq -cn --arg b "$SHA_B" --arg c "$SHA_C" '[$b, $c]')
-  FILES_b='[{"filename":"src/main.ml"}]'
-  FILES_c='[{"filename":"docs/notes.md"},{"filename":"src/main.ml"}]'
+  COMPARE_COMMITS=$(jq -cn --arg z "$SHA_0" --arg b "$SHA_B" --arg c "$SHA_C" '[$z, $b, $c]')
+  FILES_0='[{"filename":"src/main.ml"}]'                # changed source
+  FILES_b='[{"filename":"src/main.ml"}]'                # ... and reverted it
+  FILES_c='[{"filename":"docs/notes.md"}]'              # the tip itself is docs-only
   run_base --wait=2
   assert_eq "$BASE_RC" 4 "a commit that touched source is a run on its way, whatever the range nets to"
   assert_not_contains "$BASE_OUTPUT" "within the paths-ignore of" "no recognition may be claimed"
   assert_contains "$(cat "$REQUEST_LOG")" "commits/$SHA_B" \
-    "the intervening commit is the one that has to be read"
+    "the walk has to reach the intervening commit, not stop at a clean tip"
+}
+
+# After a force-push the judged commit is not an ancestor of the tip at all: the three-dot range
+# describes the tip side of a fork, and the deletions the push carried are nowhere in it
+# (ludics-lite#163 review, round 3). `behind_by` is what says so.
+test_a_judged_commit_that_is_not_an_ancestor_is_not_recognized() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5121}]')")
+  COMPARE_BEHIND=2 # the judged commit carries two commits the tip does not
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a fork is not a range this recognition can read"
+  assert_not_contains "$BASE_OUTPUT" "within the paths-ignore of" "no recognition may be claimed"
+}
+
+# A commit's file list is its diff against its FIRST parent, so only the first-parent chain is a
+# path those diffs describe. A merge reached through its second parent hides, behind a docs-only
+# first-parent diff, every source change the push carried from the judged tip — so the walk has to
+# reach the judged commit by first parents or refuse (ludics-lite#163 review, round 3).
+test_a_merge_reached_through_its_second_parent_is_not_recognized() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5131}]')")
+  # The tip is a merge whose FIRST parent is an older commit outside the range; the judged commit
+  # is its second parent, which is how it entered the range at all.
+  COMPARE_PARENTS=$(jq -cn --arg z "$SHA_0" '[$z]')
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a first-parent diff does not describe a path that is not first-parent"
+  assert_not_contains "$BASE_OUTPUT" "within the paths-ignore of" "no recognition may be claimed"
 }
 
 # GitHub creates a run for a push of more than 1000 commits whatever the filter says, and a range
@@ -672,6 +718,7 @@ test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict() {
   FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
   TIP_SWITCH_AFTER=1 # the round's tip read answers SHA_C; the re-confirm and everything after it
   TIP_NEXT=$SHA_B    # answer SHA_B, as a push landing in that window would
+  COMPARE_COMMITS=$(jq -cn --arg b "$SHA_B" '[$b]') # the successor's own one-commit range
   run_base --wait=4
   assert_eq "$BASE_RC" 0 "the successor tip is itself paths-ignored, and settles on its own round"
   assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_B:0:8})" \
@@ -696,6 +743,8 @@ tests=(
   test_a_commits_files_are_read_whole
   test_a_workflow_file_touched_inside_the_range_is_not_recognized
   test_a_source_change_reverted_inside_the_range_is_not_recognized
+  test_a_judged_commit_that_is_not_an_ancestor_is_not_recognized
+  test_a_merge_reached_through_its_second_parent_is_not_recognized
   test_a_range_longer_than_the_cap_is_not_recognized
   test_a_truncated_commit_list_is_not_recognized
   test_an_untranslatable_pattern_refuses_the_recognition
