@@ -49,6 +49,8 @@
 #   fleet-worker.sh ls [<box> ...]
 #   fleet-worker.sh load
 #   fleet-worker.sh execution list
+#   fleet-worker.sh execution slot [--wait <seconds>] -- <command...>   # hold one of THIS box's
+#                          # run-time correctness slots around a suite or batch (no lease needed)
 #   fleet-worker.sh execution reserve|dispatch|record|reconcile|conclude <json-file>
 #   fleet-worker.sh execution run <json-file>          # reserve + dispatch in one step
 #   fleet-worker.sh execution conclude --from-run <run-dir> --request <id> --sha <sha>
@@ -79,8 +81,11 @@
 #   FLEET_ANCHOR_STATE: anchor state dir; defaults to ISSUE_WAVE_STATE.
 #   FLEET_BOXES: whole fleet; "mac-studio rog-nv-wsl minix-amd-wsl". `ls` sweeps it minus local.
 #   FLEET_BOX_CORRECTNESS_SLOTS: `<box>=<n>` pairs, how many correctness executions may share a
-#     box (ludics-lite#157); an unnamed box has one. "mac-studio=3" with the default roster,
+#     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" with the default roster,
 #     empty (one slot everywhere) with a custom FLEET_BOXES. Measurement stays exclusive.
+#     Six, not three (ludics-lite#160): three `-j 4` batches ran side by side on the Mac without
+#     a stall on 2026-09-15 and the Developer Tools exemption removed the XProtect tax, and the
+#     cap exists to bound concurrent load, never to bound how many agents may be in flight.
 #   FLEET_SKILLS_REPO: skills checkout on each box; ~/ludics-lite.
 #   ISSUE_WAVE_STATE: local worker-state directory; ~/.local/state/issue-wave.
 #   FLEET_TMUX_SOCKET: tmux -L name; tests isolate with it.
@@ -118,7 +123,7 @@ BASE_REF="${FLEET_BASE_REF:-origin/master}"
 ANCHOR="${FLEET_ANCHOR:-mac-studio}"
 BOXES="${FLEET_BOXES:-mac-studio rog-nv-wsl minix-amd-wsl}"
 # Correctness slots per box: the site default only fits the site's roster.
-SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ -n "${FLEET_BOXES:-}" ] || echo mac-studio=3)}"
+SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ -n "${FLEET_BOXES:-}" ] || echo mac-studio=6)}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 ANCHOR_STATE="${FLEET_ANCHOR_STATE:-$STATE}"
@@ -1136,16 +1141,22 @@ printf 'exit=%s\nwt=%s\nhead=%s\n' "$code" "$wt" "$head"
 EOF
 }
 
-# execution_host_of <request-id>: the reserved execution host of an outstanding record, from the
-# anchor's registry (empty when unknown; the conclusion then fails on the request id anyway).
-execution_host_of() {
-  local listing
-  listing=$({ prelude "$ANCHOR"; printf 'shift 3\n'
+# execution_listing <helper>: the anchor's whole registry as JSON on stdout. `list` takes no
+# lease and mutates nothing, so a worker with no coordinator identity may read it.
+execution_listing() {
+  { prelude "$ANCHOR"; printf 'shift 3\n'
     cat <<'EXECUTION_COMMAND'
 python3 - "$ANCHOR_STATE" "$@" <<'FLEET_EXECUTION_PY'
 EXECUTION_COMMAND
     cat "$1"; printf '\nFLEET_EXECUTION_PY\n'
-  } | run_on "$ANCHOR" EXECUTION x x list x x '{}' "$BOXES" "$SLOTS") || return 1
+  } | run_on "$ANCHOR" EXECUTION x x list x x '{}' "$BOXES" "$SLOTS"
+}
+
+# execution_host_of <helper> <request-id>: the reserved execution host of an outstanding record,
+# from the anchor's registry (empty when unknown; the conclusion then fails on the request id).
+execution_host_of() {
+  local listing
+  listing=$(execution_listing "$1") || return 1
   jq -r --arg id "$2" '.[] | select(.request_id == $id) | .request.execution_host' <<<"$listing"
 }
 
@@ -1170,10 +1181,116 @@ conclude_from_run() {
     '{request_id: $id, evidence: $ev, observed_sha: $sha, remote_checkout: $wt, handle: $handle, log: $log, verdict: $verdict, execution_host: $host}'
 }
 
+# box_correctness_slots <box>: that box's correctness slot count from $SLOTS on stdout (a box
+# the spec does not name has one), or a refusal line on stdout and return 1 for a malformed spec.
+# The same grammar the registry enforces, read here so the run-time lock and the registry agree.
+box_correctness_slots() {
+  local box="$1" pair count
+  local -a pairs=()
+  read -r -a pairs <<< "$SLOTS"
+  for pair in ${pairs[@]+"${pairs[@]}"}; do
+    count="${pair#*=}"
+    case "$pair" in *=*) ;; *) count="" ;; esac
+    case "$count" in ''|*[!0-9]*) echo "FLEET_BOX_CORRECTNESS_SLOTS entry must be <box>=<positive n>: $pair"; return 1 ;; esac
+    [ "$count" -ge 1 ] || { echo "FLEET_BOX_CORRECTNESS_SLOTS entry must be <box>=<positive n>: $pair"; return 1; }
+    [ "${pair%%=*}" = "$box" ] && { echo "$count"; return 0; }
+  done
+  echo 1
+}
+
+# `execution slot [--wait <seconds>] -- <command...>`: the RUN-TIME half of the correctness cap
+# (ludics-lite#160). The registry reservation is ownership and evidence, held for a worker's whole
+# life including its review waits, so counting it against the box's slots capped agents in flight
+# rather than concurrent load -- on 2026-09-16 a fourth worker was refused a standing reservation
+# while the three holding the slots were reading their briefs and nothing was running at all. So a
+# standing record consumes no slot (`"standing": true` in the reservation), and the slots are taken
+# HERE instead, by the worker itself, around one suite or batch.
+#
+# The lock is a real flock, N holders: one file per slot under the box's own state directory, and
+# the holder is the open descriptor, inherited across the exec of the wrapped command. That is why
+# there is no stale-lock reclaim to get wrong -- the kernel drops the lock when the process dies,
+# however it dies, including a kill -9 of a whole batch. The repository's own mkdir `take_lock`
+# could not serve: it is defined in the far-side prelude, for scripts shipped to a box, and this
+# lock has to outlive the acquiring process's exec on THIS box. There is no --box for the same
+# reason: a slot on another machine would be a lock on the wrong disk.
+#
+# The measurement check is a point-in-time gate read from the anchor's registry, exactly as
+# `execution dispatch` is: it refuses to start a batch beside an outstanding measurement, and
+# a measurement reserved afterwards is the registry's exclusivity to enforce, not this lock's.
+# Exit: the wrapped command's own status; 1 with a line beginning `EXECUTION SLOT REFUSED` (no
+# free slot before the deadline, an outstanding measurement, a malformed slots spec); 4 when the
+# anchor's registry could not be read; 127 when the command itself could not be run.
+slot_lock_py() {
+  cat <<'SLOT_PY'
+import fcntl, os, sys, time
+box, directory, cap, wait = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+command = sys.argv[5:]
+deadline = time.monotonic() + wait
+while True:
+    for index in range(1, cap + 1):
+        descriptor = os.open(os.path.join(directory, "slot.%d" % index), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(descriptor)
+            continue
+        # The lock lives on this descriptor: it must survive the exec below, so it must not be
+        # closed on it. Nothing releases it afterwards -- the kernel does, when the process ends.
+        os.set_inheritable(descriptor, True)
+        sys.stderr.write("EXECUTION SLOT %s: slot %d of %d held for: %s\n"
+                         % (box, index, cap, " ".join(command)))
+        sys.stderr.flush()
+        try:
+            os.execvp(command[0], command)
+        except OSError as exc:
+            print("EXECUTION SLOT REFUSED %s: cannot run %s: %s" % (box, command[0], exc))
+            sys.exit(127)
+    if time.monotonic() >= deadline:
+        print("EXECUTION SLOT REFUSED %s: all %d run-time correctness slots busy after %ds"
+              % (box, cap, wait))
+        sys.exit(1)
+    time.sleep(1)
+SLOT_PY
+}
+
+cmd_execution_slot() {
+  local wait=600 box cap listing rc measuring dir helper
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --wait)
+        [ "$#" -ge 2 ] || die "execution slot: expected value for --wait"
+        case "$2" in ''|*[!0-9]*) die "execution slot: --wait takes a whole number of seconds" ;; esac
+        wait="$2"; shift ;;
+      --) shift; break ;;
+      *) die "execution slot [--wait <seconds>] -- <command> [args...]" ;;
+    esac
+    shift
+  done
+  [ "$#" -ge 1 ] || die "execution slot: a command to hold the slot around is required, after --"
+  box="$LOCAL_BOX"
+  [ -n "$box" ] || die "execution slot: this host has no fleet name; set FLEET_LOCAL_BOX (the slot is this box's own)"
+  cap=$(box_correctness_slots "$box") || { echo "EXECUTION SLOT REFUSED $box: $cap"; exit 1; }
+  helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
+  [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
+  listing=$(execution_listing "$helper"); rc=$?
+  if unreachable "$rc"; then echo "EXECUTION SLOT UNREACHABLE $ANCHOR: registry unread, no slot taken"; exit 4; fi
+  [ "$rc" -eq 0 ] || { printf '%s\n' "$listing"; echo "EXECUTION SLOT REFUSED $box: the anchor's registry could not be read"; exit 1; }
+  measuring=$(jq -r --arg box "$box" \
+    '[.[] | select(.state != "concluded" and .request.execution_host == $box and .request.kind == "measurement")
+       | .request_id] | join(", ")' <<<"$listing") ||
+    { echo "EXECUTION SLOT REFUSED $box: the anchor's registry did not parse"; exit 1; }
+  [ -z "$measuring" ] || { echo "EXECUTION SLOT REFUSED $box: a measurement holds the box exclusively ($measuring)"; exit 1; }
+  dir="$(local_path "$STATE")/execution-slots/$box"
+  mkdir -p "$dir" || die "execution slot: cannot create the slot directory $dir"
+  exec python3 -c "$(slot_lock_py)" "$box" "$dir" "$cap" "$wait" "$@"
+}
+
 cmd_execution() {
   local action="${1:-}" payload='{}'
   case "$action" in
     list) [ "$#" -eq 1 ] || die "execution list: no arguments" ;;
+    # The run-time slot lock: no registry mutation, no lease, and the command runs from here.
+    slot) shift; cmd_execution_slot "$@" ;;
     conclude)
       if [ "${2:-}" = --from-run ]; then
         local dir="${3:-}" request="" box="" sha="" evidence="" rc
@@ -1208,7 +1325,7 @@ cmd_execution() {
       [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
       payload=$(cat "$2") || die "execution: cannot read payload"
       check_identity ;;
-    *) die "execution: list, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run <run-dir> --request <id>" ;;
+    *) die "execution: list, slot -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run <run-dir> --request <id>" ;;
   esac
   local helper; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"

@@ -9,6 +9,12 @@ Ownership per execution host (ludics-lite#157): a `measurement` assignment is ex
 refuses while anything else is outstanding on the box, and everything refuses while it is. A
 `correctness` assignment shares the box with other correctness assignments up to that box's
 slot count (`<box>=<n>` pairs in the slots spec; one slot for any box the spec does not name).
+
+A correctness request may carry `"standing": true` (ludics-lite#160): a standing iteration
+record is the ownership/evidence record of a worker's whole life, taken at launch and concluded
+at hand-back, so it consumes no slot -- the slots are taken at run time by
+`fleet-worker.sh execution slot`, around each batch. It is still outstanding for every other
+purpose, so a measurement keeps the box to itself.
 """
 import json
 import os
@@ -35,13 +41,20 @@ STATES = {"reserved", "launching", "running", "uncertain", "concluded"}
 
 
 def validate_request(data):
-    if not isinstance(data, dict) or set(data) - REQUEST_FIELDS - {"triage_reason"}:
+    if not isinstance(data, dict) or set(data) - REQUEST_FIELDS - {"triage_reason", "standing"}:
         refuse("unknown reservation fields or invalid request")
     nonempty(data, REQUEST_FIELDS)
     if "triage_reason" in data:
         nonempty(data, ["triage_reason"])
     if data["kind"] not in {"correctness", "measurement"}:
         refuse("kind must be correctness or measurement")
+    if "standing" in data:
+        # Loud and explicit rather than read off the `-iterate` id convention: a mistyped id
+        # must not silently escape the cap, and `execution list` shows the exemption as a field.
+        if data["standing"] is not True:
+            refuse("standing must be true when present")
+        if data["kind"] != "correctness":
+            refuse("only a correctness reservation can be standing")
     if data["transport"] not in {"subagent", "app", "cli", "coordinator"}:
         refuse("invalid transport")
 
@@ -120,9 +133,14 @@ def check_capacity(data, records, canonical_hosts, slots_spec):
         refuse(f"box owned by {owners} (measurement needs {host} to itself)")
     if measuring:
         refuse(f"box owned by {owners} (a measurement holds {host} exclusively)")
+    # Standing iteration records hold nothing at run time, so they neither fill a slot nor can
+    # be refused for want of one; they remain outstanding for measurement exclusivity above.
+    if data.get("standing"):
+        return
+    counted = [r for r in outstanding if not r["request"].get("standing")]
     cap = slots.get(host, 1)
-    if len(outstanding) >= cap:
-        refuse(f"box owned by {owners} (correctness slots {len(outstanding)}/{cap} on {host} taken)")
+    if len(counted) >= cap:
+        refuse(f"box owned by {owners} (correctness slots {len(counted)}/{cap} on {host} taken)")
 
 
 def main():
