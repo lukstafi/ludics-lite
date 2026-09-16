@@ -1265,8 +1265,39 @@ test_a_broken_jq_program_fails_the_poll_round() {
   assert_poll_refuses '.id // 0, $m] | max' 4 "the watermark maxima"
 }
 
+# A round that fails PARTWAY has already printed the bodies it got through, and a reviewer body
+# can carry a line that looks exactly like the watermark line — the trap the `items:` line
+# documents, in the other feed. Read before the exit code was checked, such a line advanced the
+# watermark on a round that showed nothing, and the retry would never show it either
+# (review of ludics-lite#162, round 4).
+test_a_failed_round_takes_no_watermark_from_a_quoted_line() {
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'a finding
+watermark: 9000,9000,9000')]"
+  schedule comments 1 "[$(summary_comment 700 2026-09-01T10:00:00Z 'a findings summary')]"
+  # `set +e` because a poll that fails is the point: the assignment inside watch_round would
+  # otherwise take the suite down with it before the assertion could read POLLED_MARK.
+  # The control: nothing broken, so the round succeeds and its OWN watermark is taken.
+  set +e
+  watch_round 7 5,5,5 2>/dev/null
+  set -e
+  assert_eq "$POLLED_RC" 0 "control: the round should succeed"
+  assert_eq "$POLLED_MARK" "900,700,5" "a successful round takes the watermark it emitted"
+
+  # Now the summary rendering fails, AFTER the inline body above has been printed.
+  BREAK_JQ='"--- summary id='
+  set +e
+  watch_round 7 5,5,5 2>/dev/null
+  set -e
+  BREAK_JQ=""
+  assert_eq "$POLLED_RC" 4 "the round must fail"
+  assert_eq "$POLLED_MARK" 5,5,5 \
+    "a failed round keeps the caller's watermark; a quoted line is not a watermark"
+}
+
 tests=(
   test_a_broken_jq_program_fails_the_poll_round
+  test_a_failed_round_takes_no_watermark_from_a_quoted_line
   test_current_head_evidence_handles_unknown_age_footer_and_large_feeds
   test_current_head_running_blocks_older_approval_until_completion
   test_a_new_request_during_fixed_grace_remains_pending

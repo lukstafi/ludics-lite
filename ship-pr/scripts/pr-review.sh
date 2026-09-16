@@ -1758,9 +1758,16 @@ watch_round() { # <pr> <watermark>
   POLLED_PAST_N=0
   # A failed API round yields no watermark; keeping the caller's stops a transient error from
   # resetting to 0 and replaying the whole backlog as if it were a new round.
+  #
+  # Read ONLY from a round that succeeded, and after the status check, not before it. A round
+  # that fails partway has already printed the bodies it got through — a rendering that could
+  # not run leaves exactly that (#89) — and a reviewer body can carry a line that looks exactly
+  # like this one, the same trap the `items:` line below documents and which a review of this
+  # script drew for real. Taken from a failed round, such a line advances the watermark past
+  # findings the retry would then never show.
+  [ "$POLLED_RC" -eq 0 ] || return 0
   next=$(sed -n 's/^watermark: //p' <<<"$POLLED_OUT" | tail -1)
   case "$next" in [0-9]*,[0-9]*,[0-9]*) POLLED_MARK="$next" ;; esac
-  [ "$POLLED_RC" -eq 0 ] || return 0
   pr_head_read "$1"
   POLLED_HEAD="$head_sha"
   # From the `items:` line poll emits, never from the rendered headers: a reviewer BODY can carry

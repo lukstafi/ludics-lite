@@ -195,6 +195,36 @@ jq -r '.[] | capture
 EOF
 )"
 
+# Round 4: inside a jq program a `#` opens a comment at a token boundary too, so the
+# whitespace rule from round 3 still let comment text fabricate a wrapper.
+expect "a hash right after a token is a comment too" 1 "$REFUSAL" -- \
+  "$CJ" "$(probe bad_tight_comment <<'EOF'
+jq -r '"y"#[
+  | capture("x")#] | first
+  | .s' <<<"$raw"
+EOF
+)"
+# ... while in SHELL code a `#` inside a word opens nothing, or `${var#x}` would truncate the line.
+expect "a hash inside a shell word is not a comment" 0 'every capture( is bracketed' -- \
+  "$CJ" "$(probe safe_shell_hash <<'EOF'
+sha=${ref#refs/heads/}
+n=$#
+jq -r '{sha: ([(.body // "") | capture("(?<s>x)").s] | first // "")}' <<<"$raw"
+EOF
+)"
+# Round 4: a wrapper that holds something else answers `first` with that instead of the null.
+expect "a wrapper holding another element is refused" 1 'not the only thing its `[...]` holds' -- \
+  "$CJ" "$(probe bad_extra_element <<'EOF'
+jq -r '"y" | [1, capture("x")] | first' <<<"$raw"
+EOF
+)"
+# Round 4: `first(f)` and `last(f)` are different filters — they answer with an output of f.
+expect "first with an argument list is not the readback" 1 "$REFUSAL" -- \
+  "$CJ" "$(probe bad_first_arg <<'EOF'
+jq -r '"y" | [capture("x")] | first(1)' <<<"$raw"
+EOF
+)"
+
 expect "the refusal names the line" 1 ":3:" -- \
   "$CJ" "$(probe bad_line_number <<'EOF'
 # a comment, which is not a line of the expression below

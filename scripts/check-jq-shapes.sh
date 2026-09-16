@@ -24,14 +24,17 @@
 # rather than a row that vanishes. So a `test(`/`capture(` pair that satisfies the rule below is
 # not refused, and one that does not is refused anyway, with #104 named in the message.
 #
-# THE GRAMMAR. Comment lines are dropped (shell and jq comments alike open with `#`). What is
-# left is grouped into logical expressions: a line that begins with `|` continues the line above
-# it, anything else starts a new one. Then EACH `capture` call in an expression is checked on its
-# own, against its own brackets:
+# THE GRAMMAR. Comments are removed first (see `strip` below). What is left is grouped into
+# logical expressions: a line that begins with `|` continues the line above it, anything else
+# starts a new one. Then EACH `capture` call in an expression is checked on its own, against its
+# own brackets:
 #   - the nearest `[` before it, with no `]` in between, must exist;
 #   - the `]` that closes THAT `[` (by depth) must be read back immediately with `| first` or
-#     `| last`; and
-#   - that `[...]` must hold exactly one capture.
+#     `| last` — the zero-argument filters, since `first(f)` answers with an output of f and
+#     hides the miss exactly as an unwrapped capture would; and
+#   - that `[...]` must hold the capture and nothing else: exactly one capture, and no comma at
+#     the depth of the wrapper itself, since a second element answers `first` when the capture
+#     misses and the null the wrapper exists to produce never appears.
 # Per occurrence, never per expression: an existential test over the whole expression certifies
 # `([capture("a")] | first), capture("b")` on the strength of the first capture's brackets while
 # the second one is bare (review of ludics-lite#162, round 1). And a wrapper is only a wrapper
@@ -92,7 +95,7 @@ for f in "${files[@]}"; do
     # a safe capture elsewhere in the expression vouches for nothing, and a wrapper holding two
     # captures isolates neither — `[ ("a" | capture("a")), ("x" | capture("b")) ] | first`
     # returns the first match and discards the miss of the second capture in silence.
-    function safe_capture(txt, pos,   i, ch, open, depth, j, rest) {
+    function safe_capture(txt, pos,   i, ch, open, depth, j, rest, inner) {
       open = 0
       for (i = pos - 1; i >= 1; i--) {
         ch = substr(txt, i, 1)
@@ -108,8 +111,23 @@ for f in "${files[@]}"; do
       }
       if (depth != 0) return 0         # unbalanced: refuse rather than guess
       rest = substr(txt, j + 1)
-      if (rest !~ /^[ \t]*\|[ \t]*(first|last)([^A-Za-z0-9_]|$)/) return 0
-      if (captures_in(substr(txt, open, j - open + 1)) != 1) return 2
+      # `first`/`last` with no argument list. `first(f)` and `last(f)` are different filters —
+      # they return an output of f, so `[capture("x")] | first(1)` answers 1 on a miss and hides
+      # it exactly as an unwrapped capture would (round 4).
+      if (rest !~ /^[ \t]*\|[ \t]*(first|last)([^A-Za-z0-9_(]|$)/) return 0
+      inner = substr(txt, open + 1, j - open - 1)
+      if (captures_in(inner) != 1) return 2
+      # The capture must be what the collection HOLDS, not one of the things it holds: `[1,
+      # capture("x")] | first` answers 1 on a miss, so the null the wrapper is there to produce
+      # never appears (round 4). Approximated by a comma at the depth of the wrapper itself,
+      # which is how a second element is spelled; every safe site here has none.
+      depth = 0
+      for (j = 1; j <= length(inner); j++) {
+        ch = substr(inner, j, 1)
+        if (ch == "[" || ch == "(" || ch == "{") depth++
+        else if (ch == "]" || ch == ")" || ch == "}") depth--
+        else if (ch == "," && depth == 0) return 3
+      }
       return 1
     }
     # Comments removed, with enough quote state to know one when it sees it. A `#` opens a
@@ -128,7 +146,11 @@ for f in "${files[@]}"; do
       i = 1
       while (i <= length(s)) {
         ch = substr(s, i, 1)
-        if (ch == "#" && mode != 2 && mode != 3 &&
+        # Inside a jq program EVERY unquoted `#` opens a comment, token boundary or not
+        # (`"y"#[` is a comment, round 4). In shell code a `#` opens one only at the start of a
+        # word, which is what keeps `${var#x}` and `$#` whole.
+        if (ch == "#" && mode == 1) return out
+        if (ch == "#" && mode == 0 &&
             (out == "" || substr(out, length(out), 1) ~ /[ \t]/)) return out
         if (mode == 0) {
           if (ch == "\\") { out = out ch substr(s, i + 1, 1); i += 2; continue }
@@ -171,6 +193,8 @@ for f in "${files[@]}"; do
         if (verdict == 1) continue
         if (verdict == 2)
           why = "a `capture(` sharing its `[...]` with another one: the collection is read back with `first`, so only the FIRST match survives and a miss by the other capture is discarded in silence — give each capture a wrapper of its own"
+        else if (verdict == 3)
+          why = "a `capture(` that is not the only thing its `[...]` holds: another element answers `first` when the capture misses, so the null the wrapper exists to produce never appears — wrap the capture alone"
         else {
           why = "a `capture(` that is not `[capture(...)] | first` (or `| last`): an unmatched capture yields NOTHING, which deletes the expression around it instead of defaulting"
           if (txt ~ /test[ \t]*\(/)

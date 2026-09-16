@@ -241,7 +241,9 @@ continues the line above it; a `capture` left dangling at the end of an expressi
 list on the next line, which jq accepts — is refused rather than followed, since a line-shaped
 scanner cannot certify a wrapper it cannot see; and then EACH `capture` call in the resulting expression is checked against its own brackets
 — the nearest `[` before it with no `]` in between, the `]` that closes that `[` by depth read
-back immediately with `| first` or `| last`, and exactly one capture inside those brackets. Per
+back immediately with the zero-argument `| first` or `| last` (`first(f)` answers with an output
+of `f`, hiding the miss), and the capture alone inside those brackets — one capture, and no comma
+at the wrapper's own depth, since a second element answers `first` when the capture misses. Per
 occurrence rather than per expression, because an existential test certifies
 `([capture("a")] | first), capture("b")` on the first capture's brackets while the second is
 bare; and one wrapper per capture, because `[ ("a" | capture("a")), ("x" | capture("b")) ] |
