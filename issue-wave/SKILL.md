@@ -300,6 +300,12 @@ worker kinds, with transport-specific setup and identity, and includes:
   copied from its own instructions - an Opus worker inherited a Fable line on 2026-09-15 and
   rightly corrected it - and every tool name in the brief is one the worker's runtime actually
   exposes, as the native reference asks.
+- Two shell traps the brief names outright, because each cost a worker a control run that lied
+  (2026-09-16): the worker's shell tool runs **zsh**, where `"$sha:path"` applies a history
+  modifier (`:s` substitutes) and silently drops the path, so `git show "$sha:file"` prints the
+  commit, not the blob - brace it, `"${sha}:file"`; and the wave's workers share one scratchpad
+  directory (the coordinator's), so scratch files carry the issue number as a prefix
+  (`<N>-pr-body.md`) or live under the worker's worktree, per the native reference.
 - Landing: the ship-pr skill through review to merge; for a PR that fully resolves the issue,
   include `Closes #N` in its body (`Closes owner/repo#N` for a separate upstream tracker), per
   ship-pr's *Open*. Then close out the tracked issue with a summary comment -
