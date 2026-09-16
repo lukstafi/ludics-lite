@@ -14,6 +14,8 @@
 #   wake-lab.sh sleep|hibernate|down box  suspend / hibernate / full shutdown
 #   wake-lab.sh kick-wsl box              start the WSL VM (it never autostarts at boot)
 #   wake-lab.sh restart-wsl box           shut the WSL VM down and start it again (see the lore)
+#   wake-lab.sh kick-wsl --hold box       ...and leave a Windows-side holder keeping the VM alive
+#   wake-lab.sh unhold box                end that holder (a lane ends by unhold, never by expiry)
 #   wake-lab.sh --list                    dump the router's host table
 #
 # Tracked in the ludics-lite repository as scripts/wake-lab.sh and meant to be reached through a
@@ -59,29 +61,57 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 # * WSL never autostarts at boot, so a box coming up from power-down always needs kick_wsl. A box
 #   resuming from sleep/hibernate with the user's GUI WSL shell still open (the usual cycle) keeps
 #   its VM across the resume — verified on minix 2026-09-01: same boot id, -wsl answering seconds
-#   after the wake with no kick; the kick is then a harmless no-op. But a VM kept alive across a
-#   host resume can carry a DEGRADED dxg bridge (the WSL2 GPU paravirtualization both CUDA and HIP
-#   ride on): on 2026-09-05 minix's VM had survived two resumes, and its bridge then refused under
-#   load — `misc dxg: dxgvmb_send_sync_msg: vmbus_sendpacket failed: fffffff5` (-EAGAIN) whenever
-#   more than about two processes held the GPU — while every standalone probe passed, so the
-#   sweep's hip unit went red twice on a "working" device (ludics-lite#60). `restart-wsl` (and
-#   `--wait --restart-wsl`) issues `wsl --shutdown` on the Windows host before the start, which is
-#   a fresh VM for ~a minute's cost; on a cold-booted box the shutdown is a no-op. The sweep uses
-#   it before its GPU units. Nothing inside the VM can issue that restart without killing its own
-#   session, which is why it lives here, on the -win side.
+#   after the wake with no kick; the kick is then a harmless no-op.
+# * The dxg refusal class is decided by CONCURRENCY, not by the VM's age. `misc dxg:
+#   dxgvmb_send_sync_msg: vmbus_sendpacket failed: fffffff5` (-EAGAIN) floods whenever more than
+#   about two processes hold the GPU, and every standalone probe still passes. ludics-lite#60 read
+#   it as a VM kept alive across host resumes and `--restart-wsl` was built on that reading; on
+#   2026-09-15 three FRESH VMs overflowed the same way within minutes at dune's default width
+#   (160–320 refusals), and the same VMs were clean serially and at `-j 2`. The fix that holds is
+#   the job cap — ocannl-staging's `unit_jobs` (`minix:hip -> 2`, since 2026-09-05). `restart-wsl`
+#   (and `--wait --restart-wsl`) issues `wsl --shutdown` on the Windows host before the start,
+#   which is harmless and costs ~a minute; on a cold-booted box the shutdown is a no-op. Keep it,
+#   but do NOT read a fresh VM as protection: a manual run at full width overflows on one too.
+#   Nothing inside the VM can issue that restart without killing its own session, which is why it
+#   lives here, on the -win side.
 # * Under WSL2, /dev/kfd and /dev/dri are never present and `rocm-smi` always says "driver not
 #   initialized (amdgpu not found in modules)"; none of that is evidence of a lost passthrough,
 #   and a "check the device nodes" step in the WSL path would report the box broken every time.
 #   `hipGetDeviceCount` (or `rocminfo` listing the gfx agent) is the evidence. And a stale-but-
 #   alive VM is NOT detectable by a single-process probe: hipGetDeviceCount, hiprtc and a kernel
-#   launch all pass on it. The only signals are the guest's `dmesg | grep -c 'misc dxg'` growing
-#   under a few concurrent GPU processes, or the `hv_utils: TimeSync IC version` renegotiation
-#   lines since boot, one per host resume. That is why the fix is a restart, not a probe.
-# * A kicked VM on a cold-booted box does not necessarily STAY up: on 2026-09-01, twice in a row,
-#   `--wait --wsl` reported both -wsl UP yet both VMs were gone ~4 minutes later (`status`:
-#   win=UP, wsl=--). Use the VM promptly after the kick — and after a restart, whose VM is that
-#   same freshly kicked one; once an ssh session is running inside it, it stays up. `kick-wsl`
-#   re-kicks a box whose Windows side is up.
+#   launch all pass on it. The only signal is the guest's `dmesg | grep -c 'misc dxg'` growing
+#   under a few concurrent GPU processes (the `hv_utils: TimeSync IC version` renegotiation lines,
+#   one per host resume, date the VM but do not predict the refusals). That is why a green
+#   single-process probe certifies nothing about a run at full width: the job cap does.
+# * What keeps a WSL VM alive is a wsl.exe process on the WINDOWS side, never a session inside the
+#   guest. The kick's `wsl.exe -d Ubuntu -e true` returns at once, and the VM then shuts down under
+#   whatever is running inside it: on 2026-09-01, twice in a row, `--wait --wsl` reported both -wsl
+#   UP yet both VMs were gone ~4 minutes later (`status`: win=UP, wsl=--), and on 2026-09-08 three
+#   minix launches died mid-fetch/mid-build the same way. The steady state that hides this is the
+#   owner's console WSL shell, which is exactly such a Windows-side process — and which a Windows
+#   Update restart silently removes (ludics-lite#155). An inbound ssh session inside the guest does
+#   NOT hold it: the 2026-09-15 sweep's hip unit died 76 s in on an unheld VM that had powered off
+#   18 s after its kick.
+# * Hence `--hold`: `kick-wsl --hold` / `restart-wsl --hold` spawns the holder this script owns —
+#   `ssh -o ServerAliveInterval=15 <box>-win 'wsl.exe -d Ubuntu -e sleep infinity'`, backgrounded
+#   here, its pid under $WAKE_LAB_STATE_DIR — and declares the VM up only once a wsl.exe is
+#   OBSERVED on the Windows side (`tasklist`), because a holder that failed to start is exactly the
+#   state the flag exists to rule out. `unhold <box>` ends it. Never size the holder with a fixed
+#   `sleep N`: a lane is several units with their own caps plus preparation, and a 3-hour holder
+#   expires under the last one — `sleep infinity` killed explicitly is the contract, so a lane ends
+#   by unhold, not by expiry. A holder inside the guest would die with the VM, which is the failure
+#   being fixed. `kick-wsl` re-kicks a box whose Windows side is up, so `kick-wsl --hold` is also
+#   how a lane takes a holder over a VM that is already running.
+# * Windows Update restarts are the other way an unattended lane loses its box, and they are
+#   readable in advance: `ActiveHoursStart`, `ActiveHoursEnd` and `SmartActiveHoursState` under
+#   `HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings` on the -win side. On 2026-09-15 KB5129195
+#   restarted minix 21 min into its hip unit, because active hours were 10:00–01:00 and the sweep
+#   runs in the morning; both boxes now pin 6→0 (the 18 h maximum) with SmartActiveHoursState=0,
+#   but a feature update can reset that. `status`, and `--hold`, read those values and warn when
+#   the sweep window ($WAKE_LAB_SWEEP_HOURS, default 7-11 local) is not inside them. After the
+#   fact, the signature is System event 1074 from MoUsoCoreWorker.exe / TrustedInstaller.exe on the
+#   -win side inside the unit's window: an `error` unit with one of those is an update restart, not
+#   a backend failure.
 # * WSL needs no interactive Windows login: the ssh network logon is session enough (verified
 #   with the console logged off). A `console` entry in `query session` after a cold boot comes
 #   from Windows' Automatic Restart Sign-On, not from a human having logged in.
@@ -243,8 +273,15 @@ status_one() { # status_one <box>
 }
 
 do_status() {
+  local n
   echo "box    router-active   lan(direct IP)  win(tailscale)  wsl(tailscale)"
   for n in "$@"; do status_one "$n"; done
+  echo
+  # The update window is part of "is this box fit to run an unattended lane tonight", and nothing
+  # else in the fleet reports it. A box that is down simply has no reading; that is not a warning
+  # about its settings, so say which of the two it is.
+  echo "Windows Update window (active hours vs the sweep window $SWEEP_HOURS, local time on the box):"
+  for n in "$@"; do check_active_hours "$n" "$(win_dest "$n")"; done
   echo
   echo "router-active is the router's NewActive bit for the Ethernet MAC, not the NIC's link state:"
   echo "minutes after a shutdown or hibernate, 1 is a stale DHCP lease still aging out; once settled,"
@@ -261,6 +298,14 @@ do_status() {
 WAIT_SECONDS=${WAKE_LAB_WAIT_SECONDS:-240}
 WSL_WAIT_SECONDS=${WAKE_LAB_WSL_WAIT_SECONDS:-180}
 DOWN_WAIT_SECONDS=${WAKE_LAB_DOWN_WAIT_SECONDS:-120}
+# How long to wait for the spawned holder to show up as a wsl.exe on the Windows side, and where
+# its pid is recorded so that `unhold` — possibly in a later shell, since a lane is a sequence of
+# commands — can end it.
+HOLD_WAIT_SECONDS=${WAKE_LAB_HOLD_WAIT_SECONDS:-60}
+HOLD_STATE_DIR=${WAKE_LAB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wake-lab}
+# The local-time hours on the Windows box that the unattended sweep occupies: the routine's 07:20
+# launch plus its longest lane. Written `<start>-<end>`, end exclusive, and it may wrap midnight.
+SWEEP_HOURS=${WAKE_LAB_SWEEP_HOURS:-7-11}
 
 wake() { # wake <box>
   local name=$1 macs mac err ok=1
@@ -314,6 +359,7 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
     fi
     if ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" 'wsl.exe -d Ubuntu -e true' >/dev/null 2>&1; then
       echo "  wsl started on $name (via $dest)"
+      KICK_DEST=$dest
       return 0
     fi
   done
@@ -324,6 +370,143 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
   return 1
 }
 KICK_PHASE=""
+KICK_DEST=""   # the Windows alias that carried the last successful kick; the holder rides the same
+
+# ---------------------------------------------------------------- the Windows-side holder
+# A VM is held up by a wsl.exe on the Windows side and by nothing else (see the lore). These three
+# own that process: spawn it, observe it, kill it. The holder is `sleep infinity` on purpose — a
+# lane is several units with their own caps plus preparation and diagnostics outside them, so a
+# holder sized to the expected run expires under the last unit, silently, exactly when nobody is
+# watching. It ends by unhold.
+hold_pid_live() { # hold_pid_live <pidfile>
+  local p
+  [ -r "$1" ] || return 1
+  p=$(cat "$1" 2>/dev/null)
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null
+}
+
+win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe runs on the Windows side
+  # `tasklist` answers a filter that matches nothing with "INFO: No tasks are running which match
+  # ...", so the image name in the output IS the signal. Any wsl.exe counts: the claim being made
+  # is that something on the Windows side holds the VM, and the owner's console shell holds it
+  # every bit as well as ours. Local `kill -0` on our own pid is not that claim — an ssh client
+  # can outlive the command it ran.
+  ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" 'tasklist /FI "IMAGENAME eq wsl.exe" /NH' 2>/dev/null \
+    | grep -qi 'wsl[.]exe'
+}
+
+hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait until Windows shows one
+  local name=$1 dest=$2 pid f deadline
+  f=$HOLD_STATE_DIR/hold-$name.pid
+  mkdir -p "$HOLD_STATE_DIR" 2>/dev/null
+  if hold_pid_live "$f"; then
+    pid=$(cat "$f")
+    echo "  wsl holder already running for $name (pid $pid)"
+  else
+    ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+        "$dest" 'wsl.exe -d Ubuntu -e sleep infinity' >/dev/null 2>&1 &
+    pid=$!
+    printf '%s\n' "$pid" > "$f"
+    echo "  wsl holder started on $name (via $dest, pid $pid)"
+  fi
+  deadline=$((SECONDS + HOLD_WAIT_SECONDS))
+  while :; do
+    if win_holder_seen "$dest"; then
+      echo "  wsl holder observed on $name (wsl.exe running on the Windows side)"
+      return 0
+    fi
+    # A holder whose ssh already died cannot start being seen later; stop waiting for it.
+    hold_pid_live "$f" || break
+    [ "$SECONDS" -ge "$deadline" ] && break
+    sleep 5
+  done
+  release_hold "$name" >/dev/null
+  return 1
+}
+
+release_hold() { # release_hold <box> — end the recorded holder; always rc 0, always says what it did
+  local f=$HOLD_STATE_DIR/hold-$1.pid p
+  if [ ! -r "$f" ]; then echo "  no wsl holder recorded for $1"; return 0; fi
+  p=$(cat "$f" 2>/dev/null)
+  if hold_pid_live "$f"; then
+    kill "$p" 2>/dev/null
+    echo "  wsl holder released on $1 (pid $p killed; the VM is unheld from now on)"
+  else
+    echo "  wsl holder on $1 had already exited (pid ${p:-?}); the VM was unheld"
+  fi
+  rm -f "$f"
+  return 0
+}
+
+# ---------------------------------------------------------------- the Windows Update window
+# The other way an unattended lane loses its box: an update restart takes the VM and the holder
+# with it. Active hours are the only setting that prevents it, they live on the Windows side, and
+# a feature update can reset them — so this is a warning, read before the units run, never after.
+# It never fails a command: a box whose registry cannot be read is still a box worth sweeping.
+ACTIVE_HOURS_KEY='HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+
+reg_dword() { # reg_dword <reg-query output> <value name> — its decimal value, or ?
+  local v
+  v=$(printf '%s\n' "$1" | awk -v n="$2" '$1 == n && $2 ~ /REG_DWORD/ { print $3; exit }')
+  case "$v" in
+    0x[0-9a-fA-F]|0x[0-9a-fA-F][0-9a-fA-F]*) printf '%d\n' "$((v))" ;;
+    ''|*[!0-9]*) printf '?\n' ;;
+    *) printf '%s\n' "$v" ;;
+  esac
+}
+
+hour_active() { # hour_active <hour> <start> <end> — is that local hour inside the active window
+  local h=$1 s=$2 e=$3
+  [ "$s" = "$e" ] && return 0
+  if [ "$s" -lt "$e" ]; then [ "$h" -ge "$s" ] && [ "$h" -lt "$e" ]
+  else [ "$h" -ge "$s" ] || [ "$h" -lt "$e" ]; fi          # ...-0 wraps midnight: 6-0 is 06:00-24:00
+}
+
+check_active_hours() { # check_active_hours <box> <windows-alias> — one line, warn-only, rc always 0
+  local name=$1 dest=$2 out s e m ws we len i h uncovered=""
+  if [ -z "$dest" ]; then
+    # A box that is down has no reading; that is not a finding about its settings, and a WARNING
+    # here would fire on every status of a sleeping fleet until nobody read them at all.
+    echo "  active hours on $name: not read (no Windows endpoint answered)"
+    return 0
+  fi
+  ws=${SWEEP_HOURS%%-*}; we=${SWEEP_HOURS##*-}
+  case "$ws$we" in ''|*[!0-9]*)
+    echo "  ACTIVE HOURS WARNING on $name: WAKE_LAB_SWEEP_HOURS='$SWEEP_HOURS' is not <start>-<end>"
+    return 0 ;;
+  esac
+  out=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" "reg query \"$ACTIVE_HOURS_KEY\"" 2>/dev/null) || out=""
+  s=$(reg_dword "$out" ActiveHoursStart)
+  e=$(reg_dword "$out" ActiveHoursEnd)
+  m=$(reg_dword "$out" SmartActiveHoursState)
+  if [ "$s" = '?' ] || [ "$e" = '?' ]; then
+    echo "  ACTIVE HOURS WARNING on $name: could not read ActiveHoursStart/End under $ACTIVE_HOURS_KEY via $dest"
+    return 0
+  fi
+  len=$(( (we - ws + 24) % 24 )); [ "$len" -eq 0 ] && len=1
+  for ((i = 0; i < len; i++)); do
+    h=$(( (ws + i) % 24 ))
+    hour_active "$h" "$s" "$e" || uncovered="$uncovered $h"
+  done
+  if [ -n "$uncovered" ]; then
+    echo "  ACTIVE HOURS WARNING on $name: sweep window $SWEEP_HOURS falls outside active hours $s-$e (smart=$m); uncovered hours:$uncovered — Windows Update can restart the box mid-unit"
+  elif [ "$m" != 0 ]; then
+    echo "  ACTIVE HOURS WARNING on $name: active hours $s-$e cover the sweep window $SWEEP_HOURS, but SmartActiveHoursState=$m lets Windows move them"
+  else
+    echo "  active hours on $name: $s-$e cover the sweep window $SWEEP_HOURS (smart=$m)"
+  fi
+  return 0
+}
+
+win_dest() { # win_dest <box> — the first Windows alias that answers, empty if none does
+  local d
+  for d in $(lan_of "$1") $(ts_of "$1"); do
+    [ -n "$d" ] || continue
+    ssh_probe "$d" && { echo "$d"; return 0; }
+  done
+  echo ""
+}
 
 # `SetSuspendState` drops the connection mid-command; without ServerAlive* the ssh client can hang
 # for minutes instead of returning. The drop IS the success signature — do not treat it as an error,
@@ -386,12 +569,22 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 # neighbour untestable, and a refused shutdown (the old VM still answers) is told apart from a
 # start that failed after the shutdown went through (no VM at all) — and every one of them
 # reaches the wake path's final verdict through WSL_FAILED, so `all up` cannot paper over it.
+# With HOLD, a box joins the started set only once its Windows-side holder is OBSERVED: an
+# unheld VM is one an update restart or an idle shutdown can take mid-unit, which is the whole
+# point of asking for a holder, so it is a failure of the step like the three above and never
+# `wsl up`.
 WSL_FAILED=""
 start_wsl() {
-  local n what=kick started=() unshut=() unstarted=() up=() down=() rc=0 line
+  local n what=kick started=() unshut=() unstarted=() unheld=() up=() down=() rc=0 line
   [ "$FRESH_WSL" = fresh ] && what=restart
   for n in "$@"; do
-    if kick_wsl "$n" "$FRESH_WSL"; then started+=("$n")
+    if kick_wsl "$n" "$FRESH_WSL"; then
+      if [ "$HOLD" = 1 ]; then
+        check_active_hours "$n" "$KICK_DEST"
+        if hold_wsl "$n" "$KICK_DEST"; then started+=("$n"); else unheld+=("$n"); fi
+      else
+        started+=("$n")
+      fi
     elif [ "$KICK_PHASE" = shutdown ]; then unshut+=("$n")
     else unstarted+=("$n"); fi
   done
@@ -419,6 +612,10 @@ start_wsl() {
     else line="wsl $what FAILED on: ${unstarted[*]} (the start failed on every alias)"; fi
     echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
   fi
+  if [ ${#unheld[@]} -gt 0 ]; then
+    line="wsl HOLD FAILED on: ${unheld[*]} (the VM started but no wsl.exe was observed on the Windows side, so nothing holds it)"
+    echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
+  fi
   return $rc
 }
 
@@ -441,12 +638,13 @@ wait_for_wsl() { # wait_for_wsl <box...> — tailscaled inside WSL can take >2 m
 # ---------------------------------------------------------------- dispatch
 WAIT=0
 WANT_WSL=0
+HOLD=0
 FRESH_WSL=""   # "fresh" makes kick_wsl shut the VM down first; --wsl alone never kills a live VM
 VERB=wake
 TARGETS=()
 
 case "${1:-}" in
-  status|sleep|hibernate|down|kick-wsl) VERB=$1; shift ;;
+  status|sleep|hibernate|down|kick-wsl|unhold) VERB=$1; shift ;;
   restart-wsl) VERB=kick-wsl; FRESH_WSL=fresh; shift ;;
 esac
 
@@ -455,6 +653,7 @@ for arg in "$@"; do
     --list) list_hosts; exit 0 ;;
     --wait) WAIT=1 ;;
     --wsl)  WANT_WSL=1 ;;
+    --hold) HOLD=1 ;;
     --restart-wsl) WANT_WSL=1; FRESH_WSL=fresh ;;
     -h|--help) usage; exit 0 ;;
     all) TARGETS+=(rog minix asus) ;;
@@ -462,6 +661,15 @@ for arg in "$@"; do
   esac
 done
 [ ${#TARGETS[@]} -eq 0 ] && TARGETS=(rog minix)
+
+# A --hold that holds nothing is a lane that believes it is held and is not, which is the exact
+# failure this flag exists to prevent — so refuse it rather than ignore it. Before load_hosts: a
+# misspelled command is worth saying so on a box with no host table too.
+if [ "$HOLD" = 1 ] && [ "$VERB" != kick-wsl ] && { [ "$VERB" != wake ] || [ "$WANT_WSL" != 1 ]; }; then
+  echo "wake-lab.sh: --hold needs a WSL start to hold" >&2
+  echo "  use 'kick-wsl --hold' / 'restart-wsl --hold', or '--wait --wsl --hold'; end it with 'unhold'." >&2
+  exit 1
+fi
 
 # After the argument loop on purpose: --help and --list need no site data, and both are what you
 # reach for on a box where the host table has yet to be installed.
@@ -474,6 +682,12 @@ case "$VERB" in
     ;;
   kick-wsl)
     start_wsl "${TARGETS[@]}"; exit $?
+    ;;
+  unhold)
+    # Explicit, idempotent, and never a failure: a lane's cleanup runs on the way out of a failed
+    # lane too, and refusing to exit 0 over a holder that had already died would fail the lane
+    # twice for one event.
+    for t in "${TARGETS[@]}"; do release_hold "$t"; done
     ;;
   sleep|hibernate|down)
     for t in "${TARGETS[@]}"; do power_action "$VERB" "$t"; done
