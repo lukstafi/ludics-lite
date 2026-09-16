@@ -775,7 +775,10 @@ test_the_red_break_reconfirms_the_tip() {
       {conclusion:"success", head_sha:$a, id:6020}]')")
   TIP_SWITCH_AFTER=1 # the round reads SHA_C and sees its red; the re-confirm reads the successor
   TIP_NEXT=$SHA_B
-  run_base --wait=2
+  # The ceiling is roomy on purpose: this case is about the headline round TWO writes, and the
+  # grace cannot settle anything here, so the only thing a short ceiling could do is end the wait
+  # inside round one on a loaded machine (#169, round 2).
+  run_base --wait=6
   assert_eq "$BASE_RC" 4 "the red belongs to a tip that moved, so the successor has no verdict yet"
   assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_B:0:8}" \
     "the refusal should be about the tip that is actually there"
@@ -797,7 +800,7 @@ test_the_covered_break_reconfirms_the_tip() {
   TIP_NEXT=$SHA_B
   COMPARE_COMMITS=$(jq -cn --arg b "$SHA_B" '[$b]')
   FILES_DEFAULT='[{"filename":"src/main.ml"}]' # the successor is unrecognized: nothing settles it
-  run_base --wait=3
+  run_base --wait=6 # roomy for the same reason: the headline this pins is round two's
   assert_eq "$BASE_RC" 4 "the successor is unjudged, and a green for its predecessor is not its verdict"
   assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_B:0:8}" "the refusal is about the tip"
   assert_not_contains "$BASE_OUTPUT" "green (tip ${SHA_C:0:8})" \
@@ -811,12 +814,23 @@ test_the_covered_break_reconfirms_the_tip() {
 # its ceiling.
 test_a_tip_that_moves_mid_wait_restarts_the_grace() {
   reset_fixture
-  retune ABSENT_GRACE=6 CHECKS_INTERVAL=1
+  retune ABSENT_GRACE=4 CHECKS_INTERVAL=1
   RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:6061}]')")
   FILES_DEFAULT='[{"filename":"src/main.ml"}]' # unrecognized: only the clock can settle this
-  TIP_SWITCH_AFTER=5 # about five seconds in, well after the wait began and before the grace is up
+  # WHEN the tip moves is not left to how many rounds fit inside the grace — a round launches a
+  # fixture and several jq subprocesses, and under load four rounds where five were counted on is
+  # enough to make the move land on the wrong side of the clock (#169, round 2). Instead the move
+  # is on the very first round, and the grace is spent by a deliberate delay inside that round's
+  # own reads, the same device the first-read case uses. So: the first tip read answers SHA_C
+  # after 4s, and every read from then on answers the successor. Round one therefore cannot
+  # break — its re-confirm, whichever break reaches it, sees a tip that moved — and from round
+  # two the question is only whether the grace restarted with the successor. Restarted, the
+  # earliest possible settle is a full grace past round two and the ceiling arrives first;
+  # measured from the start of the wait, it elapsed during the delay and round two settles green.
+  FIRST_READ_DELAY=4
+  TIP_SWITCH_AFTER=1
   TIP_NEXT=$SHA_B
-  run_base --wait=8
+  run_base --wait=6
   assert_eq "$BASE_RC" 4 "the successor's own creation window has not run out inside this wait"
   assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_B:0:8}" "the refusal is about the successor"
   assert_contains "$BASE_OUTPUT" "--wait ceiling" "the wait ended at its ceiling, not at a settle"
