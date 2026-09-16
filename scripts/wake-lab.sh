@@ -440,7 +440,7 @@ shutdown_unheld_vm() { # shutdown_unheld_vm <box> <windows-alias>
 }
 
 hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait until Windows shows one
-  local name=$1 dest=$2 pid f deadline rec spawn_epoch
+  local name=$1 dest=$2 pid f deadline rec spawn_epoch spawned=0
   f=$HOLD_STATE_DIR/hold-$name.pid
   mkdir -p "$HOLD_STATE_DIR" 2>/dev/null
   if hold_pid_live "$f"; then
@@ -471,7 +471,7 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
     ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
         "$dest" "$HOLD_CMD" >/dev/null 2>&1 &
     pid=$!
-    spawn_epoch=$(date +%s)
+    spawn_epoch=$(date +%s); spawned=1
     # An unrecordable holder is a leaked one: nothing would ever unhold it. Kill it rather than
     # leave it running unowned.
     if ! printf '%s %s %s\n' "$pid" "$dest" "$spawn_epoch" > "$f" 2>/dev/null; then
@@ -508,7 +508,15 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
     [ "$SECONDS" -ge "$deadline" ] && break
     sleep 5
   done
-  release_hold "$name" >/dev/null
+  # Only a holder THIS call spawned is cleaned up. One we merely reused belongs to an earlier
+  # invocation that may still be protecting a running lane, and killing it over a failed probe of
+  # ours would unhold that lane's VM — the failure this whole flag exists to prevent, caused by a
+  # retry.
+  if [ "$spawned" = 1 ]; then
+    release_hold "$name" >/dev/null
+  else
+    echo "  wsl holder for $name was not observed, but it belongs to an earlier run: left running and recorded"
+  fi
   return 1
 }
 

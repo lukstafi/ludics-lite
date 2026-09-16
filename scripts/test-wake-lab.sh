@@ -482,6 +482,19 @@ out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1); rc=$?
   || ko "an abandoned claim blocked the hold (rc=$rc) -- $out"
 env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
 
+# A holder this call merely REUSED belongs to an earlier invocation that may still be protecting a
+# running lane. A failed probe here must not kill it: that would unhold that lane's VM, which is
+# the failure the flag exists to prevent, caused by a retry.
+rm -rf "$TMP/state"
+held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
+other_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_EMPTY" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'belongs to an earlier run: left running and recorded' <<<"$out" \
+  && kill -0 "$other_pid" 2>/dev/null && [ -s "$TMP/state/hold-rog.pid" ] \
+  && ok "a failed hold does not kill a holder it reused from an earlier run (rc=$rc)" \
+  || ko "a failed retry unheld the earlier run's VM (rc=$rc) -- $out"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+
 # The settle belongs to the HOLDER, not to the invocation: a run that reuses a holder another run
 # started a moment ago has to wait out the rest of that holder's settle, or it certifies an ssh
 # that may still be inside its ConnectTimeout.
