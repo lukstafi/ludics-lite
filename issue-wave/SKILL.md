@@ -277,8 +277,9 @@ worker kinds, with transport-specific setup and identity, and includes:
 - Execution handoff: the worker's own targeted correctness batches on its agent host run under
   the [standing iteration reservation](references/executions.md#standing-iteration-reservation)
   the coordinator took at launch - name its request id, the bounded aliases and `-j` width it
-  covers, and that every batch goes through the project runner and is reported by run
-  directory. Every other run - measurement, a cross-box leg, a full suite - needs an assignment
+  covers, and that every batch goes through the project runner, wrapped in
+  `fleet-worker.sh execution slot -- <batch>` (the run-time slot, which is what the box's
+  correctness cap now counts), and is reported by run directory. Every other run - measurement, a cross-box leg, a full suite - needs an assignment
   first, in the transport's shape: a native Claude worker ends its turn with the
   `EXECUTION_REQUEST` block and, once resumed with `EXECUTION_ASSIGNED <id>`, runs only that
   command and ends the result turn with the one-line `EXECUTION_RESULT {json}` (formats in the
@@ -575,6 +576,8 @@ or transport. Agent residence does not confer execution ownership. Workers ask t
 the coordinator reserves before launch, records launch evidence and the project runner outcome,
 and concludes only with evidence. The usual shape is two calls per execution - `execution run
 <reserve.json>` then `execution conclude --from-run <run-dir> --request <id> --sha <sha>` - plus one
-standing correctness reservation per worker for its own iteration batches, taken at launch and
-concluded at hand-back. `load` is an observation, not ownership. Neither it nor these
+standing correctness reservation per worker for its own iteration batches (`"standing": true`),
+taken at launch and concluded at hand-back. A standing record consumes no correctness slot: the
+worker takes one around each batch with `execution slot` instead, so the cap bounds load on the
+box and never how many workers may be in flight. `load` is an observation, not ownership. Neither it nor these
 cooperative reservations prevents unrelated processes or scheduled sweeps from using a machine.
