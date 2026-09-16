@@ -40,6 +40,12 @@ waits up to 3 minutes for `tailscaled` inside the VM to register. Do not hand-ro
 probe-then-branch logic it replaces; a partial wake (one box up, one dead) is handled — the live
 box still gets its WSL kick.
 
+It always terminates. Every remote command it issues runs under a wall-clock cap, and the boxes
+are restarted concurrently, so it cannot sit on a wedged `wsl.exe` the way it did on 2026-09-16 —
+2h40m in one start probe, which hung this sweep behind it and cost the second box its restart
+entirely. If it has not returned in about a quarter of an hour, that is a bug in the script and
+not a slow box.
+
 Read its last lines:
 
 - `did NOT wake: <box>` is **not** an error: that box's backends (rog: cuda; minix: hip and
