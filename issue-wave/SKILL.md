@@ -231,12 +231,11 @@ that SHA. A mismatch or unreadable confirmation blocks dispatch; retry explicitl
 reconciling the branch. Existing worktrees and native dispatch keep the coordinator’s
 responsibility for the recorded startup SHA. The read runs after worker-box freshness preflight and uses the existing checker's
 `--wait=301` mode with its absence grace pinned to 300 seconds: a covered green exits
-immediately, a pending base blocks at the ceiling, and a path-filtered tip may use the
-older verdict after the grace. Until ludics-lite#156 lands, `--wait` parks a docs-only
-(paths-ignore) tip at its ceiling instead; the gate then settles on the plain `base` read,
-but only when that read is green, the tip's commit is older than the grace, and the tip has no
-workflow run at all (a run in flight or stopped keeps the refusal), printing `BASE SETTLED`
-with what it found. This is a bounded pre-dispatch check, not another observer.
+immediately, a pending base blocks at the ceiling, and a tip with no run of its own settles
+for the older verdict — at once when the checker recognizes the tip's diff as entirely
+within the workflow's `paths-ignore`, otherwise once that absence outlives the grace
+(ludics-lite#156). A run in flight or stopped at the tip keeps the refusal.
+This is a bounded pre-dispatch check, not another observer.
 A known-red regression needs one triage worker: only `--force --allow-red-base "<reason>"`
 permits that red verdict, prints the reason, and still refuses unknown/no-verdict. Record
 the reason and diagnostics in the board. `--force` alone only lifts the halt.

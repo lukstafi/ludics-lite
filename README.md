@@ -400,6 +400,35 @@ going ends no streak because it judged nothing, two workflow files sharing a dis
 their histories apart, a jobs read that fails prints UNKNOWN and leaves the red standing rather
 than reporting no failing job, and a green base spends no call on any of it.
 
+The same suite covers what `base --wait` does when the tip has no verdict of its own
+(ludics-lite#156, where a docs-only default-branch tip parked a wave's dispatch at the ceiling
+while the plain read settled for the older green on it). The grace that separates "never coming"
+from "not yet" runs from the first READ of the tip rather than from the end of the round that read
+it — re-stamping it there spent a round of API latency out of the grace, which is how a
+`--wait=301` over a 300s grace reached its ceiling seconds before the clock it was sized against,
+every time. The absence is then read per workflow: a run that EXISTS for the tip and has not
+judged it — queued, running, or stopped — keeps the refusal because only that run can answer, and
+so does a run in flight anywhere on the branch, which is judging a tree the tip contains (waiting
+for it does better than settling: its commit becomes the verdict the tip then trails). What ends
+the wait with no clock at all is the workflow's own `paths-ignore`: when every commit the tip adds
+over the judged one changes only ignored paths, no run can be created for that tip. Per commit,
+because a filter is evaluated per PUSH and a range that nets out to docs can still contain a push
+that touched source; a push's diff is a subset of the union of its commits', so a range whose
+every commit is ignored contains no push that is not. The path walked is the FIRST-PARENT one from the tip
+down to the judged commit, and it has to really reach it: a commit's file list is its diff against
+its first parent, so a merge reached through its second parent would hide, behind a docs-only
+first-parent diff, everything the push carried — and after a force-push the judged commit is not an
+ancestor at all, which `behind_by` says. The one filter read has to be the one that applied, too —
+so no commit on the path may touch the workflow file, and each commit's files are read across every
+page, since that endpoint serves thirty at a time. The cases pin both directions
+— a source file in the range, a source change reverted inside it, a workflow file changed inside
+it, a judged commit that is not an ancestor, a merge reached through its second parent, a range
+past the commit cap or only partly in hand, a file list at the endpoint's own cap, a
+filter pattern the translation does not carry, a workflow file naming no filter, a workflow with
+no run history whose filter nobody read — each costing the grace rather than a settle, and the tip
+re-confirm, since a settle for an older verdict must not be handed to a tip that moved under the
+round.
+
 The `test-pr-review-*.sh` suites share a preamble, `test-pr-review-lib.sh`, which sources
 `pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and
 the fixture `gh`'s argument parsing. It also closes the trap that bit twice (ludics-lite#39, #45,
@@ -433,7 +462,9 @@ read, or `skip` with the reason it cannot be checked here), so a failure localiz
 that moved; its exit code separates a moved belief (1), an addressed endpoint answering 4xx (4) and
 a read the token was refused (5) from the API not answering or throttling (3), and the reporter
 files everything but the last, naming which: the fields `run_signal`, `build_checks`, `run_red_is_advisory_only`, `pr_head_read`,
-`warn_base_drift` and `status_state` index; the newest-first order of `actions/runs`; the status,
+`warn_base_drift` and `status_state` index; the workflow file `workflow_paths_ignore` reads under
+the raw media type (the base64 envelope arriving instead would cost every paths-ignore recognition
+silently); the newest-first order of `actions/runs`; the status,
 conclusion, mergeable-state and review-state vocabularies; that a merged PR's `.base.sha` is a
 snapshot standing behind the merge's first parent (anchored on #53); and the reviewer feeds' shapes
 (the `[bot]` suffix, the `+1` approval, `COMMENTED` rounds, the summary tag, 30-per-page
