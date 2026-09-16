@@ -290,7 +290,12 @@ which was a hard-coded line range that truncated silently whenever the header gr
 kick reaches the Windows side through whichever of the two aliases answers, since after a cold boot
 that is the LAN one; and that the polling loops honour a wall-clock deadline against slow probes,
 which an iteration budget did not (`WAKE_LAB_WAIT_SECONDS`, `WAKE_LAB_WSL_WAIT_SECONDS` and
-`WAKE_LAB_DOWN_WAIT_SECONDS` are what let the suite ask for a one-second one).
+`WAKE_LAB_DOWN_WAIT_SECONDS` are what let the suite ask for a one-second one). It also pins what
+holds a kicked WSL VM up, which is a `wsl.exe` on the Windows side and nothing else: `--hold`
+spawns that holder as an unsized `sleep infinity`, never inside the guest, and the VM counts as up
+only once `tasklist` shows the process on the Windows side, while `unhold` kills it and says so;
+and it pins the Windows Update active-hours warning together with its quiet path, since a check
+that warned under the 6-to-0 window the boxes pin is one nobody would read.
 
 `test-sync-routines.sh` runs `scripts/sync-routines.sh` against scratch trees, with
 `CLAUDE_SCHEDULED_TASKS_DIR` pointed at them and over a byte-identical copy of the script inside a
