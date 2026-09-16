@@ -248,7 +248,10 @@
 #      between the one-line "still waiting" progress notes a `--wait` prints (600),
 #      SHIP_PR_BASE_ABSENT_GRACE=seconds a commit with no workflow run yet is allowed before its
 #      absence is read as a fact (300; paths-ignore pushes never get one). `base --wait` applies
-#      it to the tip before settling for an older verdict, and `checks`/`merge` apply it to the
+#      it to the tip and then SETTLES for the older verdict the plain read settles for — unless a
+#      run for the tip exists and has not judged it, which no grace explains — and settles at
+#      once, without the grace, when the diff from the judged commit to the tip lies entirely
+#      within the workflow's own paths-ignore (ludics-lite#156). `checks`/`merge` apply it to the
 #      head before calling a build signal ABSENT rather than not-created-yet (ludics-lite#24),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences the commit-count warning). A nonempty file overlap still warns at any count; no
@@ -3773,10 +3776,14 @@ encode_ref() {
 # (the same not-created-yet window as the force-push ABSENT trap on the merge path). Declaring
 # integration green off that is the stale reading this command exists to prevent. So --wait
 # re-reads until nothing non-advisory is mid-flight AND every non-advisory workflow's newest
-# judged run is about the CURRENT tip — or, when no run for the tip has appeared and none is
-# running, until a grace expires (SHIP_PR_BASE_ABSENT_GRACE; paths-ignore means a docs-only push
-# legitimately never gets one, and only the grace separates "never coming" from "not yet"). A
-# red breaks the wait immediately: it is a verdict.
+# judged run is about the CURRENT tip — or, when NO run for the tip exists at all, until the
+# workflow's own paths-ignore says outright that none can be created for this tip (a docs-only
+# push legitimately never gets one), or failing that until a grace expires
+# (SHIP_PR_BASE_ABSENT_GRACE, which is all that separates "never coming" from "not yet"). Then it
+# settles for the verdicts in hand, saying which commit each is about, exactly as the plain read
+# does. A run that EXISTS for the tip and has not judged it — queued, running, or stopped — is not
+# an absence anything can explain, and keeps the wait to its ceiling. A red breaks the wait
+# immediately: it is a verdict.
 # The red runs whose jobs have already been read, one "<run id><TAB><the line>" record per line.
 # `base --wait` re-folds every round, so without this a standing red would spend one jobs call per
 # round — per red workflow — to print the line it printed last time. A LIST rather than one slot
@@ -3878,12 +3885,218 @@ base_red_detail() {
   BASE_RED_DETAIL="${BASE_RED_DETAIL}${line}"$'\n'
 }
 
+# --- paths-ignore: the one absence that is not a race ------------------------------------------
+# A push whose every changed path sits in the workflow's `paths-ignore` NEVER gets a run: there is
+# nothing in flight, nothing late, and no grace that could tell the difference by waiting. `checks`
+# and `merge` settle such a head on the clock alone (run_signal's run-creation grace), which is the
+# honest answer when nothing else is in hand. `base --wait` is the one caller that has more: the
+# tip and the commit the standing verdict is about are both known, so the diff between them is one
+# read, and the workflow's own filter says whether that diff can produce a run at all. Recognizing
+# it is what keeps a docs-only default-branch tip from parking a whole wave's dispatch at the
+# --wait ceiling (ludics-lite#156).
+#
+# Every step REFUSES rather than guesses: a workflow file that does not parse, a filter pattern
+# this translation does not carry, a compare that came back empty or at the endpoint's cap, an
+# `on: push:` naming no `paths-ignore`. A refusal costs the grace — the settle that was already
+# there, one ABSENT_GRACE later — while a guess would claim "no run is coming" for a run that is
+# merely late and settle for an older green over an unbuilt tip. The asymmetry is the whole design:
+# the parser below is deliberately narrow, and every branch it cannot read says so.
+
+# workflow_paths_ignore <workflow id> <ref>: the workflow's `on: push: paths-ignore` patterns, one
+# per line, or nothing (exit 1) when they cannot be established. The workflow file is read AT THE
+# TIP, because the filter that decides whether the tip gets a run is the one the tip carries.
+#
+# The YAML is read by a narrow state machine rather than a parser this repository does not have.
+# It accepts what a workflow file actually looks like — a top-level `on:` (or `"on":`) mapping, a
+# `push:` key under it, a `paths-ignore:` block sequence or one flow sequence, single- or
+# double-quoted items — and refuses everything else, tabs and aliases included: an alias
+# (`paths-ignore: *docs`) reads as a glob to anything that does not track anchors, and "*docs"
+# would match half a repository.
+WORKFLOW_YAML_FILTER='
+function ind_of(s,   n) { n = match(s, /[^ ]/); return n ? n - 1 : -1 }
+function unquote(s,   c) {
+  sub(/^[ ]+/, "", s); sub(/[ ]+$/, "", s)
+  c = substr(s, 1, 1)
+  if ((c == q || c == dq) && substr(s, length(s), 1) == c && length(s) >= 2)
+    s = substr(s, 2, length(s) - 2)
+  return s
+}
+function emit(s) { s = unquote(s); if (s == "") { bad = 1; exit } n++; pat[n] = s }
+function flow(s,   i, m, parts) {
+  s = substr(s, 2, length(s) - 2)
+  m = split(s, parts, ",")
+  for (i = 1; i <= m; i++) emit(parts[i])
+  ok = 1
+}
+/\t/ { bad = 1; exit }
+{
+  line = $0
+  sub(/[ \r]+$/, "", line)
+  if (line == "") next
+  ind = ind_of(line)
+  key = substr(line, ind + 1)
+  if (substr(key, 1, 1) == "#") next
+  rest = key
+  sub(/^[^:]*:/, "", rest)
+  sub(/^[ ]+/, "", rest)
+  sub(/[ ]+#.*$/, "", rest)
+}
+state == 0 {
+  if (ind == 0 && key ~ /^(on|"on")[ ]*:/) {
+    if (rest != "" && substr(rest, 1, 1) != "#") { bad = 1; exit }
+    state = 1; on_ind = ind
+  }
+  next
+}
+state == 1 {
+  if (ind <= on_ind) { bad = 1; exit }
+  if (key ~ /^push[ ]*:/) {
+    if (rest != "" && substr(rest, 1, 1) != "#") { bad = 1; exit }
+    state = 2; push_ind = ind
+  }
+  next
+}
+state == 2 {
+  if (ind <= push_ind) { bad = 1; exit }
+  if (key ~ /^paths-ignore[ ]*:/) {
+    if (rest == "") { state = 3; seq_ind = ind; next }
+    if (rest ~ /^\[.*\]$/) { flow(rest); exit }
+    bad = 1; exit
+  }
+  next
+}
+state == 3 {
+  if (key == "-" || substr(key, 1, 2) == "- ") { emit(substr(key, 2)); next }
+  if (ind <= seq_ind) { ok = 1; exit }
+  bad = 1; exit
+}
+END {
+  if (state == 3 && !bad) ok = 1
+  if (bad || !ok || n == 0) exit 1
+  for (i = 1; i <= n; i++) print pat[i]
+}'
+
+workflow_paths_ignore() {
+  local wid="$1" ref="$2" wpath body pats
+  wpath=$(gh_retry read api "repos/$REPO/actions/workflows/$wid" --jq '.path // ""') || return 1
+  # One path, and one that stays inside the repository: the value is interpolated into a REST
+  # path, so a newline or a traversal in it is a different request, not a workflow file.
+  case "$wpath" in '' | *$'\n'* | */../* | ../* | /*) return 1 ;; esac
+  # The raw media type, so the file arrives as itself: the JSON form is base64 whose decoder is
+  # spelled `-d` on one of this fleet's two platforms and `-D` on the other.
+  body=$(gh_retry read api -H "Accept: application/vnd.github.raw" \
+    "repos/$REPO/contents/$(encode_ref "$wpath")?ref=$ref") || return 1
+  [ -n "$body" ] || return 1
+  pats=$(awk -v q="'" -v dq='"' "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
+  [ -n "$pats" ] || return 1
+  printf '%s\n' "$pats"
+}
+
+# glob_ere <pattern>: one GitHub path filter as an ERE anchored at both ends, or nothing (exit 1)
+# for a pattern this translation does not carry. `**` is any run of characters, `*` any run within
+# one path segment — the two forms every real `paths-ignore` is built from. The cheat sheet's
+# other constructs (`?` and `+` over the PRECEDING character, character classes, a leading `!`
+# that inverts the whole pattern) are refused rather than approximated: each of them can only
+# widen what counts as ignored, and a pattern read too widely settles a tip whose run is coming.
+glob_ere() {
+  local p="$1" out="" c i=0
+  case "$p" in '' | *[!A-Za-z0-9._/*-]*) return 1 ;; esac
+  while [ "$i" -lt "${#p}" ]; do
+    c=${p:i:1}
+    case "$c" in
+    '*')
+      if [ "${p:i:2}" = '**' ]; then
+        out="$out.*"
+        i=$((i + 2))
+        continue
+      fi
+      out="${out}[^/]*"
+      ;;
+    '.') out="$out\\." ;;
+    *) out="$out$c" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '^%s$' "$out"
+}
+
+# paths_ignore_covers <patterns> <changed paths>: every changed path matches some pattern. A
+# pattern that does not translate fails the whole question rather than just itself — "the rest of
+# them covered everything" is not an answer about a filter half of which was not read.
+paths_ignore_covers() {
+  local pats="$1" files="$2" f p ere hit
+  [ -n "$pats" ] && [ -n "$files" ] || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    hit=""
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      ere=$(glob_ere "$p") || return 1
+      printf '%s' "$f" | grep -Eq -- "$ere" && {
+        hit=1
+        break
+      }
+    done <<<"$pats"
+    [ -n "$hit" ] || return 1
+  done <<<"$files"
+  return 0
+}
+
+# The answer per <workflow>/<judged commit>/<tip>, so a wait that cannot recognize the tip spends
+# its three reads ONCE rather than once per round for as long as the grace runs. Keyed by all
+# three because each of them changing changes the answer.
+BASE_IGNORE_CACHE=""
+PATHS_IGNORE_WHY=""
+
+# tip_within_paths_ignore <rows> <tip>: rows are "<workflow id><TAB><name><TAB><judged sha>", one
+# per workflow whose newest judged run trails the tip with no run at the tip at all. True when
+# EVERY one of them is explained by its own filter — one workflow's docs-only diff says nothing
+# about the workflow beside it — and the reason goes into PATHS_IGNORE_WHY for the settle line.
+tip_within_paths_ignore() {
+  local rows="$1" tip="$2" wfid name vsha key hit pats files count why=""
+  PATHS_IGNORE_WHY=""
+  [ -n "$rows" ] || return 1
+  while IFS=$'\t' read -r wfid name vsha; do
+    [ -n "$wfid" ] || continue
+    # No judged run at all: there is no commit to diff the tip against, so nothing here can
+    # explain the absence (and the report says "never judged here" regardless).
+    case "$vsha" in '' | -) return 1 ;; esac
+    key="$wfid/$vsha/$tip"
+    hit=$(awk -F'\t' -v k="$key" '$1 == k { print $2; exit }' <<<"$BASE_IGNORE_CACHE")
+    if [ -z "$hit" ]; then
+      hit=no
+      pats=$(workflow_paths_ignore "$wfid" "$tip") || pats=""
+      if [ -n "$pats" ]; then
+        # The compare's `files` is capped at 300 entries by the endpoint, with the commit list
+        # paginated separately (hence per_page=1, as the drift read does): a diff at the cap is
+        # truncated, and a truncated list is no evidence about the whole diff. The count leads the
+        # output so the cap is visible; renames carry both names, since both are changed paths.
+        files=$(gh_retry read api "repos/$REPO/compare/$vsha...$tip?per_page=1" \
+          --jq '(.files // []) | (length | tostring), (.[] | .filename, (.previous_filename // empty))') ||
+          files=""
+        count="${files%%$'\n'*}"
+        case "$count" in '' | *[!0-9]*) count=0 ;; esac
+        if [ "$count" -gt 0 ] && [ "$count" -lt 300 ] &&
+          paths_ignore_covers "$pats" "${files#*$'\n'}"; then
+          hit=yes
+        fi
+      fi
+      BASE_IGNORE_CACHE="${BASE_IGNORE_CACHE}${key}"$'\t'"${hit}"$'\n'
+    fi
+    [ "$hit" = yes ] || return 1
+    why="${why:+$why, }$name"
+  done <<<"$rows"
+  PATHS_IGNORE_WHY="$why"
+  return 0
+}
+
 cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
   local allruns="" wfid
   local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
   local nogo_at_tip=0 last_tip="" grace_from confirm wf="" wid wname part sleep_for remaining
   local norun=0 tip_seen_at tip_age hold ebranch
+  local tip_unjudged=0 unrun=0 unrun_rows="" settle_why
   local started now beat waited_note="" no_tip_verdict=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3913,6 +4126,7 @@ cmd_base() {
   grace_from=$started
   while :; do
     red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0 norun=0
+    tip_unjudged=0 unrun=0 unrun_rows=""
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
     tip=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || tip=""
@@ -4009,7 +4223,24 @@ cmd_base() {
         [ -n "$name" ] || continue
         is_advisory "$name" && continue
         [ "$status" = completed ] || inflight=$((inflight + 1))
-        [ -n "$tip" ] && [ "$vsha" = "$tip" ] || uncovered=$((uncovered + 1))
+        if [ -n "$tip" ] && [ "$vsha" = "$tip" ]; then
+          : # this workflow's newest judged run is about the tip: covered
+        else
+          uncovered=$((uncovered + 1))
+          # WHICH absence, per workflow, because only one of the two can ever be explained. A run
+          # for the tip EXISTS and has not judged it (queued, running, or stopped) — nothing but
+          # that run can answer, so the wait keeps waiting. Or no run for the tip exists at all,
+          # which is either the not-created-yet window or a push the workflow's filter skips: the
+          # settle below is about exactly those. Read off the unfolded rows, since the fold keeps
+          # only the newest of each kind and an older row at the tip counts just as much.
+          if awk -F'\t' -v w="$wfid" -v t="$tip" \
+            '$1 == w && $5 == t { found = 1 } END { exit !found }' <<<"$allruns"; then
+            tip_unjudged=$((tip_unjudged + 1))
+          else
+            unrun=$((unrun + 1))
+            unrun_rows="${unrun_rows}${wfid}"$'\t'"${name}"$'\t'"${vsha}"$'\n'
+          fi
+        fi
         # A tip run that completed stopped-not-judged (cancelled/stale/action_required) is NOT
         # the same absence as a run that never existed: one wants a re-run, the other may be
         # paths-ignore. Recorded here, before the nogo-swap below overwrites concl/csha.
@@ -4077,52 +4308,72 @@ cmd_base() {
       last_tip="$tip"
       grace_from=$now
     fi
-    if [ "$inflight" -eq 0 ]; then
-      if [ "$uncovered" -eq 0 ]; then
-        # A listed workflow with NO push runs on the branch (norun) is ambiguous: dispatch- or
-        # schedule-only (never coming — staging carries two such smoke workflows, and counting
-        # them as uncovered would park EVERY wait on the full grace), or a push workflow the tip
-        # itself just added, whose first run is not created yet. What separates them is whether
-        # the newcomer has had its creation window SINCE THE PUSH — and the push time is the
-        # sibling runs' own creation time at this tip (every workflow here is judged at the tip,
-        # so sibling rows exist to read: folded col 5 is the newest completed run's sha, col 6
-        # its created_at). Not the commit's committer date (an hours-old commit pushed directly
-        # would erase the window) and not the wait's observation clock (which would hold every
-        # late-started wait on a repo carrying dispatch-only workflows for the full grace).
-        hold=""
-        if [ "$norun" -gt 0 ]; then
-          tip_seen_at=$(awk -F'\t' -v t="$tip" \
-            '$5 == t && $6 > best { best=$6 } END { print best }' <<<"$raw")
-          tip_age=$(age_of "$tip_seen_at")
-          case "$tip_age" in
-          '' | *[!0-9]*) ;; # unreadable age is not evidence to hold on
-          *) [ "$tip_age" -ge "$ABSENT_GRACE" ] || hold=1 ;;
-          esac
-        fi
-        # Covered — against the tip read BEFORE the runs. A sibling merge landing between those
-        # two reads is the integration loop's normal traffic, and would make this a false green
-        # for a branch already pointing elsewhere: accept coverage only when the tip has not
-        # moved meanwhile; otherwise fall through to the sleep and let the next round re-read
-        # everything (the tip-change branch above restarts the grace).
-        if [ -z "$hold" ]; then
-          confirm=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || confirm=""
-          [ "$confirm" = "$tip" ] && break
-        fi
-      # Nothing running and the tip unjudged. A tip run that completed STOPPED (cancelled/stale)
-      # is not absence — it existed and was not judged, so no amount of paths-ignore explains it;
-      # the grace only allows for a superseding replacement to be created, and then the verdict
-      # is "none". A tip with NO run is either the not-created-yet window or paths-ignore, and
-      # only time tells those apart: after the grace, settle for what is there — the
-      # per-workflow lines name which commit each verdict is actually about.
-      elif [ $((now - grace_from)) -ge "$ABSENT_GRACE" ]; then
-        if [ "$nogo_at_tip" -gt 0 ]; then
-          waited_note="(the tip's newest run completed stopped-not-judged and no replacement appeared within the grace — NOT absence and NOT a verdict: re-run the workflow)"
-          no_tip_verdict=1
-        else
-          waited_note="(waited $(((now - started) / 60)) min: no run for the tip appeared and none is in flight — the verdicts above may trail it)"
-        fi
-        break
+    if [ "$inflight" -eq 0 ] && [ "$uncovered" -eq 0 ]; then
+      # A listed workflow with NO push runs on the branch (norun) is ambiguous: dispatch- or
+      # schedule-only (never coming — staging carries two such smoke workflows, and counting
+      # them as uncovered would park EVERY wait on the full grace), or a push workflow the tip
+      # itself just added, whose first run is not created yet. What separates them is whether
+      # the newcomer has had its creation window SINCE THE PUSH — and the push time is the
+      # sibling runs' own creation time at this tip (every workflow here is judged at the tip,
+      # so sibling rows exist to read: folded col 5 is the newest completed run's sha, col 6
+      # its created_at). Not the commit's committer date (an hours-old commit pushed directly
+      # would erase the window) and not the wait's observation clock (which would hold every
+      # late-started wait on a repo carrying dispatch-only workflows for the full grace).
+      hold=""
+      if [ "$norun" -gt 0 ]; then
+        tip_seen_at=$(awk -F'\t' -v t="$tip" \
+          '$5 == t && $6 > best { best=$6 } END { print best }' <<<"$raw")
+        tip_age=$(age_of "$tip_seen_at")
+        case "$tip_age" in
+        '' | *[!0-9]*) ;; # unreadable age is not evidence to hold on
+        *) [ "$tip_age" -ge "$ABSENT_GRACE" ] || hold=1 ;;
+        esac
       fi
+      # Covered — against the tip read BEFORE the runs. A sibling merge landing between those
+      # two reads is the integration loop's normal traffic, and would make this a false green
+      # for a branch already pointing elsewhere: accept coverage only when the tip has not
+      # moved meanwhile; otherwise fall through to the sleep and let the next round re-read
+      # everything (the tip-change branch above restarts the grace).
+      if [ -z "$hold" ]; then
+        confirm=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || confirm=""
+        [ "$confirm" = "$tip" ] && break
+      fi
+    # Every workflow still trailing the tip simply has NO run for it: nothing is coming that this
+    # wait could receive. That is the shape the header promises a settle for, and it is the shape
+    # a docs-only push leaves behind — ludics-lite#156, where a `--wait` sat on one to its ceiling
+    # and refused a dispatch the plain read had already settled. Two things end it. The filter
+    # says outright that no run can be created for this tip, which needs no clock at all; or the
+    # absence outlives the run-creation grace, which is all that separates "never coming" from
+    # "not yet". Either way the settle is for the verdicts in hand, and the per-workflow lines
+    # name which commit each of them is actually about.
+    #
+    # What does NOT settle is a run that exists for the tip and has not judged it — queued,
+    # running, or completed stopped-not-judged (cancelled/stale): it existed, so no filter
+    # explains it, and only that run can answer. A stopped one gets the grace for a superseding
+    # replacement to appear, and then the honest verdict is "none".
+    elif [ "$uncovered" -gt 0 ] && [ "$tip_unjudged" -eq 0 ]; then
+      settle_why=""
+      if [ "$unrun" -eq "$uncovered" ] && tip_within_paths_ignore "$unrun_rows" "$tip"; then
+        settle_why="(the tip's diff from the judged commit is entirely within the paths-ignore of $PATHS_IGNORE_WHY, so no run for it is coming — the verdicts above are about the commit each line names)"
+      elif [ $((now - grace_from)) -ge "$ABSENT_GRACE" ]; then
+        settle_why="(waited $(((now - started) / 60)) min: no run for the tip appeared and none is in flight for it — the verdicts above may trail it)"
+      fi
+      # The same TOCTOU the covered break answers, and for the stronger reason: this settle
+      # accepts verdicts about an OLDER commit, so a push landing between the tip read and here
+      # would settle for a green two commits back. On a moved or unreadable tip, poll again — the
+      # tip-change branch above restarts the grace for the successor.
+      if [ -n "$settle_why" ]; then
+        confirm=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || confirm=""
+        if [ "$confirm" = "$tip" ]; then
+          waited_note="$settle_why"
+          break
+        fi
+      fi
+    elif [ "$inflight" -eq 0 ] && [ "$nogo_at_tip" -gt 0 ] &&
+      [ $((now - grace_from)) -ge "$ABSENT_GRACE" ]; then
+      waited_note="(the tip's newest run completed stopped-not-judged and no replacement appeared within the grace — NOT absence and NOT a verdict: re-run the workflow)"
+      no_tip_verdict=1
+      break
     fi
     [ $((now - started)) -lt "$wait_for" ] || {
       waited_note="(--wait ceiling of $((wait_for / 60)) min reached with a run still unfinished or the tip unjudged — NOT a verdict for the tip)"
