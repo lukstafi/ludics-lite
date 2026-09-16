@@ -662,24 +662,26 @@ KICK_DEST=""   # the Windows alias that carried the last successful kick; the ho
 # One spelling of the holder, used to spawn it and to recognize it again.
 HOLD_CMD='wsl.exe -d Ubuntu -e sleep infinity'
 
-# The record is "<pid> <destination> <spawn epoch>". The destination is part of the holder's
-# identity (every box's holder runs the same payload), and the epoch is how a LATER invocation
-# that reuses this holder knows whether it is past its settle.
-hold_pid_read() { # hold_pid_read <pidfile> — echo "<pid> <dest> <epoch>", fail if unusable
-  local line p d t rest
+# The record is "<pid> <destination> <spawn epoch> <lock sidecar pid>". The destination is part of
+# the holder's identity (every box's holder runs the same payload), the epoch is how a LATER
+# invocation that reuses this holder knows whether it is past its settle, and the sidecar is the
+# process that keeps the box's lab lock open for as long as the holder lives (see hold_wsl).
+hold_pid_read() { # hold_pid_read <pidfile> — echo "<pid> <dest> <epoch> <sidecar>", fail if unusable
+  local line p d t sc
   [ -r "$1" ] || return 1
   line=$(cat "$1" 2>/dev/null)
-  p=${line%% *}; rest=${line#* }; d=${rest%% *}; t=${rest#* }
+  read -r p d t sc <<<"$line"
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
   [ -n "$d" ] && [ "$d" != "$p" ] || return 1
   case "$t" in ''|*[!0-9]*) t=0 ;; esac
-  printf '%s %s %s\n' "$p" "$d" "$t"
+  case "$sc" in ''|*[!0-9]*) sc=0 ;; esac
+  printf '%s %s %s %s\n' "$p" "$d" "$t" "$sc"
 }
 
 hold_pid_live() { # hold_pid_live <pidfile> — is the recorded holder still OUR holder, still running
-  local rec p d
+  local rec p d t sc
   rec=$(hold_pid_read "$1") || return 1
-  p=${rec%% *}; d=${rec#* }; d=${d%% *}
+  read -r p d t sc <<<"$rec"; : "$t" "$sc"
   kill -0 "$p" 2>/dev/null || return 1
   # A zombie answers `kill -0` and, on Linux, still prints its old command line — so an exited
   # holder whose parent has not reaped it would read as live.
@@ -736,7 +738,7 @@ shutdown_unheld_vm() { # shutdown_unheld_vm <box> <windows-alias> — rc 0 only 
 }
 
 hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait until Windows shows one
-  local name=$1 dest=$2 pid f deadline rec spawn_epoch spawned=0 own theirs _
+  local name=$1 dest=$2 pid f deadline rec spawn_epoch spawned=0 sidecar=0 now own theirs _
   # The lane's reservation, and the holder is what carries it. A restart path already holds this
   # box's lab lock on fd 8 (start_wsl takes it before the kick); a plain `kick-wsl --hold` does
   # not, so it takes it here, on the same descriptor. Either way the holder we spawn INHERITS that
@@ -750,7 +752,10 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
   if hold_pid_live "$f"; then
     # Reuse: the live holder already carries this box's lock, and taking it again from here would
     # fail against our own holder.
-    rec=$(hold_pid_read "$f"); pid=${rec%% *}; spawn_epoch=${rec##* }
+    rec=$(hold_pid_read "$f"); read -r pid _ spawn_epoch _ <<<"$rec"
+    # A clock corrected backwards would leave an epoch in the future and park the settle loop
+    # there for as long as the correction; a holder cannot have been spawned after now.
+    now=$(date +%s); [ "$spawn_epoch" -gt "$now" ] && spawn_epoch=$now
     echo "  wsl holder already running for $name (pid $pid)"
   else
     if [ "${LANE_LOCKED:-0}" != 1 ] && ! lab_lock_take "$name" "--hold"; then
@@ -785,14 +790,31 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
     # NOT capped, and that is deliberate: every other remote command here is a finite probe, and
     # this one is meant to run until `unhold` kills it. A cap on the holder would be a timer on
     # the lane — the sized `sleep N` this design exists to avoid, wearing a different hat.
-    ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-        "$dest" "$HOLD_CMD" >/dev/null 2>&1 &
+    # `-n` and </dev/null: an ssh backgrounded from a terminal otherwise reads the caller's stdin
+    # and can be stopped by SIGTTIN — and a STOPPED holder answers `kill -0` exactly like a live
+    # one, so the lane would believe in a holder that is not running.
+    ssh -n -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+        "$dest" "$HOLD_CMD" >/dev/null 2>&1 </dev/null &
     pid=$!
+    # The lock must not depend on what the ssh client does with descriptors it inherited: OpenSSH
+    # may close everything above stderr at startup, and then nothing would hold the flock once
+    # this subshell exits. So a sidecar process holds fd 8 instead — it inherits the very
+    # descriptor the flock lives on, so there is no window in which the box is unreserved — and it
+    # exits as soon as the holder does, by `unhold` or otherwise, taking the lock with it.
+    #
+    # It is an EXEC'd process, not a brace group: a forked bash keeps every descriptor bash holds
+    # internally, including its copy of a caller's pipe, and a background child holding that pipe
+    # hangs `wake-lab.sh kick-wsl --hold rog | tee log` — or any caller reading the command's
+    # output — for the whole life of the lane. Those descriptors are close-on-exec, so exec'ing
+    # anything sheds them; fd 8, opened here, is not, so the lock survives. perl is already the
+    # lab lock's own dependency.
+    perl -e 'my $p = shift; while (kill 0, $p) { sleep 1 }' "$pid" >/dev/null 2>&1 </dev/null &
+    sidecar=$!
     spawn_epoch=$(date +%s); spawned=1
     # An unrecordable holder is a leaked one: nothing would ever unhold it. Kill it rather than
     # leave it running unowned.
-    if ! printf '%s %s %s\n' "$pid" "$dest" "$spawn_epoch" > "$f" 2>/dev/null; then
-      kill "$pid" 2>/dev/null
+    if ! printf '%s %s %s %s\n' "$pid" "$dest" "$spawn_epoch" "$sidecar" > "$f" 2>/dev/null; then
+      kill "$pid" "$sidecar" 2>/dev/null
       rm -f "$f" 2>/dev/null
       echo "  wsl holder on $name could NOT be recorded at $f — holder (pid $pid) killed rather than leaked"
       return 1
@@ -823,6 +845,10 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
       # bound is on the holder's age, not on this invocation's, so a run that REUSES a holder
       # another run started a second ago waits out the rest of that holder's settle too.
       while [ $(( $(date +%s) - spawn_epoch )) -lt "$HOLD_SETTLE_SECONDS" ]; do
+        # The settle waits on the holder, so it ends when the holder does — and never outlives the
+        # step's own deadline, whatever the recorded epoch says.
+        hold_pid_live "$f" || break
+        [ "$SECONDS" -ge "$deadline" ] && break
         sleep 1
       done
       if hold_pid_live "$f"; then
@@ -850,7 +876,7 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
     if hold_pid_live "$f" ||
        { own=$(ps -ww -o args= -p $$ 2>/dev/null); theirs=$(ps -ww -o args= -p "$pid" 2>/dev/null)
          [ -n "$theirs" ] && [ "$theirs" = "$own" ]; }; then
-      kill "$pid" 2>/dev/null
+      kill "$pid" "$sidecar" 2>/dev/null
       echo "  wsl holder on $name stopped (pid $pid): nothing holds that VM"
     else
       echo "  wsl holder on $name is gone (pid $pid no longer names it): nothing holds that VM"
@@ -867,9 +893,13 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
 }
 
 release_hold() { # release_hold <box> — end the recorded holder; always rc 0, always says what it did
-  local f=$HOLD_STATE_DIR/hold-$1.pid p
+  local f=$HOLD_STATE_DIR/hold-$1.pid rec p d t sc
   if [ ! -r "$f" ]; then echo "  no wsl holder recorded for $1"; return 0; fi
-  p=$(hold_pid_read "$f" 2>/dev/null); p=${p%% *}
+  rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
+  read -r p d t sc <<<"${rec:-}"; : "$d" "$t"
+  # The lock sidecar goes with the holder: it exits on its own once the holder is gone, and
+  # killing it here is what makes the box free again immediately rather than a poll later.
+  [ -n "${sc:-}" ] && [ "${sc:-0}" != 0 ] && kill "$sc" 2>/dev/null
   if hold_pid_live "$f"; then
     # Killing the local client closes the channel and sshd ends the command it was running. If a
     # wsl.exe is ever orphaned on the Windows side despite that, `restart-wsl` clears it: the

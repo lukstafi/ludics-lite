@@ -127,7 +127,7 @@ if [ "$up" = 0 ]; then
     # The trap takes the NAP with it, the way wake-lab's own `capped` watchdog does: a shim holder
     # that exits leaving its sleep behind leaves a child holding every descriptor it inherited --
     # including the box's lab lock, which would then outlive the `unhold` that killed the holder.
-    *"sleep infinity"*)  trap 'kill -KILL $(jobs -p) 2>/dev/null; exit 143' TERM
+    *"sleep infinity"*)  trap 'printf "HOLDER-TERMED %s\n" "$$" >> "$SSH_LOG"; kill -KILL $(jobs -p) 2>/dev/null; exit 143' TERM
                          sleep "${SSH_HOLD_LIFE:-0}" & wait ;;
   esac
 fi
@@ -470,6 +470,7 @@ grep -q 'the VM is up and UNHELD and was not shut down: do not sweep that box' <
 reset_hold_state; : > "$SSH_LOG"
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1)
 hold_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
+echo "DBG procs=[$(pgrep -fl 'sleep infinity' | head -3)] sidecar=[$(ps -o pid,args -p "$(cut -d' ' -f4 "$TMP/state/hold-rog.pid")" 2>&1|tail -1)]"
 if [ -n "$hold_pid" ] && alive "$hold_pid"; then
   ok "the holder is a live process while the lane runs (pid $hold_pid)"
 else
@@ -644,7 +645,9 @@ env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold 
 reset_hold_state
 held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
 started=$SECONDS
-out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
+# The step's own deadline bounds the settle too (a settle that outlived HOLD_WAIT_SECONDS would
+# be a hold with no bound at all), so this case gives the step room and lets the settle bind.
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=30 \
       WAKE_LAB_HOLD_SETTLE_SECONDS=6 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
       SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=30 "$WL" kick-wsl --hold rog 2>&1); rc=$?
 elapsed=$((SECONDS - started))
