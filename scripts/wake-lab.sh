@@ -538,6 +538,9 @@ hold_pid_live() { # hold_pid_live <pidfile> — is the recorded holder still OUR
   rec=$(hold_pid_read "$1") || return 1
   p=${rec%% *}; d=${rec#* }; d=${d%% *}
   kill -0 "$p" 2>/dev/null || return 1
+  # A zombie answers `kill -0` and, on Linux, still prints its old command line — so an exited
+  # holder whose parent has not reaped it would read as live.
+  case "$(ps -o state= -p "$p" 2>/dev/null)" in *Z*) return 1 ;; esac
   # Pids are reused, and this file outlives the shell that wrote it — so an `unhold` run tomorrow
   # over a stale file must never kill whatever inherited the number. The signature is the holder's
   # whole command line INCLUDING its destination: every box's holder runs the same payload, so a
@@ -554,8 +557,14 @@ win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe run
   # is that something on the Windows side holds the VM, and the owner's console shell holds it
   # every bit as well as ours. Local `kill -0` on our own pid is not that claim — an ssh client
   # can outlive the command it ran.
-  ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" 'tasklist /FI "IMAGENAME eq wsl.exe" /NH' 2>/dev/null \
-    | tr -d '\r' | grep -qi 'wsl[.]exe'
+  # Capped like every other remote command here: ConnectTimeout bounds the connect, not the
+  # remote command, and an accepted session whose `tasklist` never returns would stop the hold's
+  # own deadline from advancing — the 2026-09-16 wedge, reintroduced behind a new probe. A cap
+  # that fires is simply "not observed this round"; the loop asks again until HOLD_WAIT_SECONDS.
+  local out
+  out=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" \
+        'tasklist /FI "IMAGENAME eq wsl.exe" /NH' 2>/dev/null) || return 1
+  printf '%s' "$out" | tr -d '\r' | grep -qi 'wsl[.]exe'
 }
 
 # A VM this run started fresh and then could not hold is worse than no VM: the sweep's lanes probe
@@ -564,7 +573,8 @@ win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe run
 # honest `skip (unreachable)`. Only for a VM this run created (`restart-wsl`): on a plain kick the
 # guest may be the owner's, and taking it away over a failed hold would be a nasty surprise.
 shutdown_unheld_vm() { # shutdown_unheld_vm <box> <windows-alias>
-  if ssh -o BatchMode=yes -o ConnectTimeout=15 "$2" 'wsl.exe --shutdown' >/dev/null 2>&1; then
+  if capped "$WSL_SHUTDOWN_CAP" \
+      ssh -o BatchMode=yes -o ConnectTimeout=15 "$2" 'wsl.exe --shutdown' >/dev/null 2>&1; then
     echo "  wsl shut down on $1: a fresh VM that cannot be held would die mid-unit, so the lane records no coverage instead"
   else
     echo "  wsl on $1 is up and UNHELD and the shutdown failed too: do not sweep that box"
@@ -600,6 +610,9 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
       fi
       return 1
     fi
+    # NOT capped, and that is deliberate: every other remote command here is a finite probe, and
+    # this one is meant to run until `unhold` kills it. A cap on the holder would be a timer on
+    # the lane — the sized `sleep N` this design exists to avoid, wearing a different hat.
     ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
         "$dest" "$HOLD_CMD" >/dev/null 2>&1 &
     pid=$!
@@ -722,7 +735,8 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
     echo "  ACTIVE HOURS WARNING on $name: WAKE_LAB_SWEEP_HOURS='$SWEEP_HOURS' is not a pair of clock hours (0-23)"
     return 0
   fi
-  out=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" "reg query \"$ACTIVE_HOURS_KEY\"" 2>/dev/null) || out=""
+  out=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" \
+        "reg query \"$ACTIVE_HOURS_KEY\"" 2>/dev/null) || out=""
   s=$(reg_dword "$out" ActiveHoursStart)
   e=$(reg_dword "$out" ActiveHoursEnd)
   m=$(reg_dword "$out" SmartActiveHoursState)

@@ -312,6 +312,17 @@ held_kick() { # held_kick <ssh-up> <tasklist output> [reg output] [holder lifeti
 unhold() { env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog; }
 # `tasklist /FI "IMAGENAME eq wsl.exe" /NH` prints one row per match and an INFO line when nothing
 # matches, so the image name in the output is the whole signal.
+# `kill -0` alone is not a liveness test: a killed orphan whose init does not reap it promptly --
+# a container's PID 1, typically -- stays a zombie and answers it, which would read as "unhold did
+# not kill the holder" when it did.
+alive() { # alive <pid>
+  local st
+  [ -n "$1" ] || return 1
+  kill -0 "$1" 2>/dev/null || return 1
+  st=$(ps -o state= -p "$1" 2>/dev/null)
+  case "$st" in ''|*Z*) return 1 ;; esac
+  return 0
+}
 TASKLIST_HELD='wsl.exe                       6412 Services                   0     12,345 K'
 TASKLIST_EMPTY='INFO: No tasks are running which match the specified criteria.'
 
@@ -378,7 +389,7 @@ out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_EMPTY" 2>&1); rc=$?
 rm -rf "$TMP/state"; : > "$SSH_LOG"
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1)
 hold_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
-if [ -n "$hold_pid" ] && kill -0 "$hold_pid" 2>/dev/null; then
+if [ -n "$hold_pid" ] && alive "$hold_pid"; then
   ok "the holder is a live process while the lane runs (pid $hold_pid)"
 else
   ko "the holder was not running after a successful hold (pid ${hold_pid:-none}) -- $out"
@@ -386,8 +397,8 @@ fi
 out=$(unhold 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q "wsl holder released on rog (pid $hold_pid killed" <<<"$out" \
   && ok "...and unhold kills it, naming the pid (rc=$rc)" || ko "unhold did not release the holder (rc=$rc) -- $out"
-for _ in 1 2 3 4 5; do kill -0 "$hold_pid" 2>/dev/null || break; sleep 1; done
-kill -0 "$hold_pid" 2>/dev/null \
+for _ in 1 2 3 4 5; do alive "$hold_pid" || break; sleep 1; done
+alive "$hold_pid" \
   && ko "unhold reported a kill the holder survived (pid $hold_pid)" \
   || ok "...and the holder really is gone"
 [ ! -f "$TMP/state/hold-rog.pid" ] && ok "...leaving no pid file behind" \
@@ -404,8 +415,8 @@ out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" 
 [ "$rc" -eq 0 ] && grep -q 'wsl holder released on rog' <<<"$out" \
   && ok "unhold releases the holder even with no host table, which it needs nothing from (rc=$rc)" \
   || ko "a missing site file stranded the holder (rc=$rc) -- $out"
-for _ in 1 2 3 4 5; do kill -0 "$stranded" 2>/dev/null || break; sleep 1; done
-kill -0 "$stranded" 2>/dev/null && ko "...but the holder survived" || ok "...and the holder is gone"
+for _ in 1 2 3 4 5; do alive "$stranded" || break; sleep 1; done
+alive "$stranded" && ko "...but the holder survived" || ok "...and the holder is gone"
 mkdir -p "$TMP/state"; printf '999999\n' > "$TMP/state/hold-rog.pid"
 expect "...and a holder that had already died is reported as such, not as a release" 0 "had already exited" -- \
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
@@ -418,7 +429,7 @@ out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1)
 rog_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
 printf '%s minix-lan\n' "$rog_pid" > "$TMP/state/hold-minix.pid"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold minix 2>&1)
-grep -q 'had already exited' <<<"$out" && kill -0 "$rog_pid" 2>/dev/null \
+grep -q 'had already exited' <<<"$out" && alive "$rog_pid" \
   && ok "a stale file for one box does not kill another box's live holder" \
   || ko "unhold minix killed rog's holder, or claimed it as its own -- $out"
 env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
@@ -428,7 +439,7 @@ sleep 30 & innocent=$!
 printf '%s\n' "$innocent" > "$TMP/state/hold-rog.pid"
 expect "a stale pid reused by an unrelated process is not killed as a holder" 0 "had already exited" -- \
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
-kill -0 "$innocent" 2>/dev/null && ok "...and that process is still running" \
+alive "$innocent" && ok "...and that process is still running" \
   || ko "unhold killed a process that merely inherited the holder's pid"
 kill "$innocent" 2>/dev/null; wait "$innocent" 2>/dev/null
 # A --hold that holds nothing is a lane that believes it is held and is not.
@@ -504,7 +515,7 @@ held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
 other_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_EMPTY" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && grep -q 'belongs to an earlier run: left running and recorded' <<<"$out" \
-  && kill -0 "$other_pid" 2>/dev/null && [ -s "$TMP/state/hold-rog.pid" ] \
+  && alive "$other_pid" && [ -s "$TMP/state/hold-rog.pid" ] \
   && ok "a failed hold does not kill a holder it reused from an earlier run (rc=$rc)" \
   || ko "a failed retry unheld the earlier run's VM (rc=$rc) -- $out"
 env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
@@ -628,6 +639,22 @@ grep -q 'active hours on rog: not read (no Windows endpoint answered)' <<<"$out"
   && ! grep -q 'ACTIVE HOURS WARNING' <<<"$out" \
   && ok "...and a box that is down has no reading rather than a warning about its settings" \
   || ko "status warned about the settings of a box it could not reach -- $out"
+
+# Every remote command the hold adds is capped, for the reason the kick's are: ConnectTimeout
+# bounds the connect, not the remote command, so an accepted session whose `tasklist` never
+# returns would stop the hold's own deadline from advancing and hang the sweep behind it. The shim
+# wedges with `exec sleep 900`, so a run that FINISHES at all proves the cap fired.
+rm -rf "$TMP/state"
+started=$SECONDS
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
+      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_PROBE_CAP=2 WAKE_LAB_STATE_DIR="$TMP/state" \
+      SSH_UP="rog-lan rog-nv-wsl" SSH_HANG='tasklist' SSH_TASKLIST="$TASKLIST_HELD" \
+      SSH_HOLD_LIFE=30 "$WL" kick-wsl --hold rog 2>&1); rc=$?
+elapsed=$((SECONDS - started))
+[ "$rc" -ne 0 ] && [ "$elapsed" -lt 90 ] && grep -q 'wsl HOLD FAILED on: rog' <<<"$out" \
+  && ok "a wedged tasklist is cut short rather than hanging the hold (${elapsed}s)" \
+  || ko "the holder observation was not capped (rc=$rc, ${elapsed}s) -- $out"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
 
 # The holder's signature is read from `ps`, and macOS `ps` truncates the argument list to the
 # output width unless it is asked not to. This command line runs well past 79 columns, so a
