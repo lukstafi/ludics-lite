@@ -360,6 +360,13 @@ bname=""
 for wf_id in $(jq -r '.[].id // empty' <<<"$wflist"); do
   is_num "$wf_id" || continue
   bruns=$(api "repos/$REPO/actions/workflows/$wf_id/runs?branch=$(encode_ref "$BASE")&event=push&per_page=10" | pages workflow_runs)
+  # The wrapper is claimed for EVERY workflow this loop asks about, before the answer is used for
+  # anything. A feed that dropped or renamed `workflow_runs` comes back null, and moving on to the
+  # next workflow without recording that would walk the whole list and land on the "no push run"
+  # skip below — the contract exiting 0 over exactly the drift this section exists to catch
+  # (#169, round 1). An empty list is not that: a workflow with no push run on this branch is the
+  # `norun` shape the wait loop has its own grace for, a valid answer and not drift.
+  pin "workflow $wf_id's branch-and-event feed is workflow_runs[]" 'type == "array"' "$bruns"
   is_list "$bruns" || { bruns='[]'; continue; }
   if [ "$(jq length <<<"$bruns")" -gt 0 ]; then
     banchor="$wf_id"
@@ -371,7 +378,6 @@ if [ -z "$banchor" ]; then
   skip "the branch-and-event runs feed" "no listed workflow has a push run on $BASE (every one of them is the norun shape)"
 else
   echo "      anchored on workflow $banchor (${bname:-?}) with $(jq length <<<"$bruns") push run(s) on $BASE"
-  pin "the feed is workflow_runs[]" 'type == "array"' "$bruns"
   # The projection cmd_base reads, column by column: workflow_id (the fold's grouping key), name,
   # status, conclusion, head_sha, created_at, html_url, and — since ludics-lite#81 — id, which
   # anchors the jobs read the red report spends and, since #90, breaks a same-second tie.
