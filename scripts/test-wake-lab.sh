@@ -51,7 +51,9 @@ EOF
 # ssh: logs `<destination> :: <command>` and answers according to $SSH_UP, a space-separated list
 # of destinations that are reachable -- unset, every box is down, which is what most of the cases
 # below want. $SSH_DELAY makes each probe slow, the way a real ConnectTimeout against a dark box
-# is, which is what the polling deadlines have to survive. $SSH_REFUSE names a command substring
+# is, which is what the polling deadlines have to survive. $SSH_DOWN_AFTER (with $SSH_DOWN_LIST
+# naming a scratch file) makes a destination go unreachable partway through a run. $SSH_REFUSE
+# names a command substring
 # that fails even on a reachable destination: a Windows host that answers ssh but whose
 # `wsl.exe --shutdown` fails, say. $SSH_HANG is an extended regex over the whole `<dest> :: <cmd>`
 # line, and a match WEDGES instead of answering -- the 2026-09-16 shape, where the far side
@@ -82,6 +84,16 @@ line=$(printf '%s ::%s' "$dest" "$cmd")
 printf '%s\n' "$line" >> "$SSH_LOG"
 [ -n "${SSH_DELAY:-}" ] && sleep "$SSH_DELAY"
 [ -n "${SSH_HANG:-}" ] && grep -qE "$SSH_HANG" <<<"$line" && exec sleep 900
+# $SSH_DOWN_AFTER is "<regex>|<dest>": once a line matching the regex has been handled, that
+# destination is unreachable for every later command -- an alias that dies mid-run, which is how a
+# cleanup ends up on an endpoint the start went out on and nothing answers any more.
+down_list=${SSH_DOWN_LIST:-/dev/null}
+[ -s "$down_list" ] && grep -qx "$dest" "$down_list" && exit 1
+if [ -n "${SSH_DOWN_AFTER:-}" ]; then
+  case "$SSH_DOWN_AFTER" in *"|"*)
+    grep -qE "${SSH_DOWN_AFTER%%|*}" <<<"$line" && printf '%s\n' "${SSH_DOWN_AFTER##*|}" >> "$down_list" ;;
+  esac
+fi
 case "$cmd" in *"${SSH_REFUSE:-}"*) [ -n "${SSH_REFUSE:-}" ] && exit 1 ;; esac
 up=1
 for u in ${SSH_UP:-}; do [ "$u" = "$dest" ] && up=0; done
@@ -98,6 +110,7 @@ chmod +x "$TMP/bin/curl" "$TMP/bin/python3" "$TMP/bin/ssh"
 PATH="$TMP/bin:$PATH"; export PATH
 CURL_LOG="$TMP/curl.log"; export CURL_LOG
 SSH_LOG="$TMP/ssh.log"; export SSH_LOG
+SSH_DOWN_LIST="$TMP/ssh-down.list"; export SSH_DOWN_LIST
 : > "$CURL_LOG"; : > "$SSH_LOG"
 
 # A host table with obviously fake addresses, in the shape the example file documents.
@@ -373,13 +386,27 @@ rm -rf "$TMP/state"; : > "$SSH_LOG"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
       WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
       SSH_TASKLIST="$TASKLIST_EMPTY" "$WL" restart-wsl --hold rog 2>&1); rc=$?
-[ "$rc" -ne 0 ] && grep -q 'wsl shut down on rog: a fresh VM that cannot be held' <<<"$out" \
+[ "$rc" -ne 0 ] && grep -q 'wsl shut down on rog (via rog-lan): a fresh VM that cannot be held' <<<"$out" \
   && awk '/^rog-lan :: wsl.exe -d Ubuntu -e true$/ { t = NR } /^rog-lan :: wsl.exe --shutdown$/ { s = NR } END { exit !(t && s && t < s) }' "$SSH_LOG" \
   && ok "a fresh VM whose hold failed is shut down again rather than left for the sweep (rc=$rc)" \
   || ko "an unheld fresh VM was left running (rc=$rc) -- $out; $(cat "$SSH_LOG")"
 grep -q 'so it was shut down again: those units record no coverage' <<<"${out##*$'\n'}" \
   && ok "...and the verdict line says the VM is gone, which is what the routine reads" \
   || ko "the verdict did not report the shutdown -- $out"
+# The cleanup tries every alias, not just the one the start went out on: that alias is often
+# exactly what went wrong during the hold, and one endpoint going quiet must not leave a reachable
+# unheld VM up. Here the LAN side dies the moment the observation runs.
+rm -rf "$TMP/state"; : > "$SSH_LOG"; : > "$SSH_DOWN_LIST"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
+      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-win" \
+      SSH_TASKLIST="$TASKLIST_EMPTY" SSH_DOWN_AFTER='tasklist|rog-lan' SSH_HOLD_LIFE=20 \
+      "$WL" restart-wsl --hold rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'wsl shut down on rog (via rog-nv-win)' <<<"$out" \
+  && grep -q 'so it was shut down again' <<<"${out##*$'\n'}" \
+  && ok "an unheld VM is shut down over the other alias when the first one has gone quiet (rc=$rc)" \
+  || ko "the cleanup gave up on one alias and left the VM up (rc=$rc) -- $out"
+: > "$SSH_DOWN_LIST"
+
 # But never a VM that was already there: on a plain kick the guest may be the owner's, and taking
 # it away over a failed hold of ours would be a nasty surprise.
 rm -rf "$TMP/state"; : > "$SSH_LOG"

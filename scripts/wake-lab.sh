@@ -576,12 +576,22 @@ win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe run
 # honest `skip (unreachable)`. Only for a VM this run created (`restart-wsl`): on a plain kick the
 # guest may be the owner's, and taking it away over a failed hold would be a nasty surprise.
 shutdown_unheld_vm() { # shutdown_unheld_vm <box> <windows-alias> — rc 0 only if the VM really went
-  if capped "$WSL_SHUTDOWN_CAP" \
-      ssh -o BatchMode=yes -o ConnectTimeout=15 "$2" 'wsl.exe --shutdown' >/dev/null 2>&1; then
-    echo "  wsl shut down on $1: a fresh VM that cannot be held would die mid-unit, so the lane records no coverage instead"
-    return 0
-  fi
-  echo "  wsl on $1 is up and UNHELD and the shutdown failed too: do not sweep that box"
+  # Every alias, starting with the one that carried the start: the reason we are here is that
+  # something went wrong on that side during the hold, and the alias may be exactly what went
+  # wrong. The kick tries both for the same reason; leaving a reachable unheld VM up because one
+  # endpoint stopped answering is the outcome this whole function exists to avoid.
+  local d tried=""
+  for d in "$2" $(lan_of "$1") $(ts_of "$1"); do
+    [ -n "$d" ] || continue
+    case " $tried " in *" $d "*) continue ;; esac
+    tried="$tried $d"
+    if capped "$WSL_SHUTDOWN_CAP" \
+        ssh -o BatchMode=yes -o ConnectTimeout=15 "$d" 'wsl.exe --shutdown' >/dev/null 2>&1; then
+      echo "  wsl shut down on $1 (via $d): a fresh VM that cannot be held would die mid-unit, so the lane records no coverage instead"
+      return 0
+    fi
+  done
+  echo "  wsl on $1 is up and UNHELD and the shutdown failed on every alias: do not sweep that box"
   return 1
 }
 
