@@ -133,6 +133,17 @@ jobs:
               exit 1
             fi
           done
+      - name: jq shape guard
+        # jq's `capture` yields ZERO outputs when it does not match, and a zero-output
+        # sub-expression deletes the value around it rather than defaulting -- silently, with no
+        # error anywhere and nothing for a test to catch. Five such sites have been fixed across
+        # three PRs (ludics-lite#84 three, #104 a fourth, #89 a fifth) while the safe shape lived
+        # only in prose. The guard refuses a `capture(` that is not `[capture(...)] | first`; its own
+        # fixtures run beside it, since a scan that cannot fail would prove nothing. Both are in
+        # the lint job so they judge every head, including a prompt-only one.
+        run: scripts/check-jq-shapes.sh
+      - name: jq shape guard fixtures
+        run: scripts/test-check-jq-shapes.sh
 
   sync-routines:
     name: sync-routines (ubuntu)
@@ -381,6 +392,9 @@ jobs:
       - name: prompt checker fixtures
         if: ${{ !cancelled() }}
         run: scripts/test-check-prompts.sh || { echo '::error title=macOS suite failed::test-check-prompts.sh'; exit 1; }
+      - name: jq shape guard fixtures
+        if: ${{ !cancelled() }}
+        run: scripts/test-check-jq-shapes.sh || { echo '::error title=macOS suite failed::test-check-jq-shapes.sh'; exit 1; }
       - name: execution reservations
         if: ${{ !cancelled() }}
         run: python3 issue-wave/scripts/test-fleet-execution.py
