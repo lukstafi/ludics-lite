@@ -91,7 +91,10 @@ failure is loud (exit 2, nothing watching) but easy to leave un-noticed once the
 backgrounded and the turn has yielded. It also bites unevenly inside a batch: three `reply` calls
 in one message, the first two landing and the third dying, is a partial success that reads as
 success. A resolved repo is cached per PR number, so later bare-number calls usually still work —
-but that is a safety net, not something to rely on for the first call of a session.
+but that is a safety net, not something to rely on for the first call of a session. An inferred
+repo — from the cwd or from that cache — is now VERIFIED against `repos/<repo>/pulls/<n>` before
+anything is read or written through it, and a repo that does not have that PR is refused (exit 2)
+rather than written to (ludics-lite#92); only a repo you name is taken on trust.
 
 ## Read the base before you branch
 

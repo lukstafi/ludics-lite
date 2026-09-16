@@ -476,17 +476,43 @@ verify_repo() {
   [ "$n" = "$2" ]
 }
 
+# The cwd and the cache are the two GUESSES here, and both are verified on the same terms before
+# anything is read or written through them (ludics-lite#92). The cwd branch used to be trusted
+# outright, and cached besides: a bare `reply 7` typed from another project's worktree resolved to
+# whatever repo that checkout names and posted onto ITS PR 7 — the skill's own tooling writing into
+# a stranger's review thread, and then remembering the wrong repo for every later call about 7.
+# #74 (PR #79) removed the same guess from `retry run watch` by refusing it outright; here it is
+# verified instead, because the cwd is the one source a FOREGROUND caller in the right checkout has
+# and refusing it would cost every such caller a `--repo` for a guess that is usually right. What
+# must never happen is trusting it while it is still a guess, and that is the part verification
+# removes: the repo a spelled-out argument, `--repo` or `REPO=` names is authoritative and stays
+# unverified; the two inferred ones are not.
 resolve_repo() {
-  local pr="$1" cached rc
+  local pr="$1" guess="" cached rc
   if [ -n "$REPO" ]; then
     cache_put "$pr" "$REPO"
     return 0
   fi
-  REPO=$(repo_from_cwd) && [ -n "$REPO" ] && {
-    cache_put "$pr" "$REPO"
-    return 0
-  }
   REPO=""
+  # Into `guess`, never into REPO: an unverified value in REPO is one early `return` away from
+  # being the repo a write addresses, and it is what the cache used to be filled from.
+  if guess=$(repo_from_cwd) && [ -n "$guess" ]; then
+    verify_repo "$guess" "$pr"
+    rc=$?
+    case "$rc" in
+    0)
+      REPO="$guess"
+      cache_put "$pr" "$guess"
+      return 0
+      ;;
+    3) fail 3 "cannot verify PR $pr against $guess, the repo this working directory names — the" \
+      "API did not answer after $API_ATTEMPTS attempts ($(gh_err_line)). This is TRANSPORT, not a" \
+      "wrong repo: retry, or name the repo as owner/name#$pr to skip the verification entirely." ;;
+    esac
+    # rc 1: the API answered, and $guess has no PR $pr. The cwd is simply the wrong checkout for
+    # this number, so fall through — the cache may still know the right repo, and if it does not,
+    # the refusal below names the guess that was rejected rather than pretending none was made.
+  fi
   if cached=$(cache_get "$pr"); then
     verify_repo "$cached" "$pr"
     rc=$?
@@ -500,6 +526,11 @@ resolve_repo() {
       "retry, or name the repo as owner/name#$pr to skip the verification entirely." ;;
     esac
   fi
+  [ -z "$guess" ] || die "PR $pr is not in $guess, the repo this working directory belongs to," \
+    "so nothing was read there and nothing was written there. A cwd-inferred repo is a GUESS," \
+    "verified against repos/<repo>/pulls/$pr before it is trusted or cached (ludics-lite#92)," \
+    "because a wrong one would post onto an unrelated PR. If $pr is a PR somewhere else, name" \
+    "that repo: owner/name#$pr (or --repo owner/name, or REPO=owner/name)."
   die "cannot tell which repo PR $pr belongs to." \
     "Pass it as owner/name#$pr (or --repo owner/name, or REPO=owner/name)." \
     "This usually means a BACKGROUND invocation: background shells do not start in the checkout," \

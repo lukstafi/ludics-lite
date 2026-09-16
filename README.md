@@ -377,7 +377,15 @@ token that is not a comment id or several joined by single `+` is refused before
 posted, and so is an unquoted body (the arity, not `${3:?}`, which would post its first word). A
 failure MID-batch never says "nothing was posted" once the anchor has landed: it names what landed
 and which ids to retry with, with the same failure at the anchor as the control, and the write
-exits stay apart inside a batch — a 4xx rejected (1), anything else ambiguous (3).
+exits stay apart inside a batch — a 4xx rejected (1), anything else ambiguous (3). The suite also
+pins where a write is ALLOWED to land (ludics-lite#92): `resolve_repo` verified a cached repo
+against `repos/<repo>/pulls/<n>` and trusted the cwd-inferred one above it outright, and cached it,
+so a bare `reply 7` from a shell in another project's worktree posted into that project's PR 7 and
+remembered the wrong repo for every later call. An inferred repo is now verified on the same terms
+as a cached one, through either half of the inference (`gh repo view`, and the `origin` remote it
+falls back to), with the checkout that really has the PR as the passing control and a case that the
+rejected guess is not cached either — the writing commands run from a scratch checkout naming a
+third repository, as in `run-watch`'s control.
 
 `test-pr-review-base-red.sh` covers the other `base` — the one that answers "is the branch I am
 about to work off green", and what it says once the answer is no (ludics-lite#73). A red names the
