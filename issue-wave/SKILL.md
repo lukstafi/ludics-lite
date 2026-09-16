@@ -301,11 +301,13 @@ worker kinds, with transport-specific setup and identity, and includes:
   rightly corrected it - and every tool name in the brief is one the worker's runtime actually
   exposes, as the native reference asks.
 - Two shell traps the brief names outright, because each cost a worker a control run that lied
-  (2026-09-16): the worker's shell tool runs **zsh**, where `"$sha:path"` applies a history
-  modifier (`:s` substitutes) and silently drops the path, so `git show "$sha:file"` prints the
-  commit, not the blob - brace it, `"${sha}:file"`; and the wave's workers share one scratchpad
-  directory (the coordinator's), so scratch files carry the issue number as a prefix
-  (`<N>-pr-body.md`) or live under the worker's worktree, per the native reference.
+  (2026-09-16): the worker's shell tool runs **zsh**, where an unbraced `"$var:suffix"` is
+  parsed as a parameter modifier when the suffix starts with a modifier letter (`s`, `h`, `t`,
+  `r`, `e`, `p`, `a`, `l`, `u`, `q`, `c`, ...), so `git show "$sha:scripts/x.sh"` silently
+  drops the path and prints the commit - always brace it, `"${sha}:scripts/x.sh"`; and the
+  wave's workers share one scratchpad directory (the coordinator's), so scratch files carry the
+  issue number as a prefix (`<N>-pr-body.md`), never inside the worktree, per the native
+  reference.
 - Landing: the ship-pr skill through review to merge; for a PR that fully resolves the issue,
   include `Closes #N` in its body (`Closes owner/repo#N` for a separate upstream tracker), per
   ship-pr's *Open*. Then close out the tracked issue with a summary comment -
