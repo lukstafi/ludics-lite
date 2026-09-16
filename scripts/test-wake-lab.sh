@@ -656,9 +656,21 @@ done
 # malformed setting, and reading it as "every hour protected" would print the quiet line over a box
 # with no protection at all.
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x6 0x6 0x0)" 2>&1); rc=$?
-[ "$rc" -eq 0 ] && grep -q 'equal endpoints' <<<"$out" && ! grep -q 'cover the sweep window' <<<"$out" \
+[ "$rc" -eq 0 ] && grep -q 'a span Windows cannot mean' <<<"$out" && ! grep -q 'cover the sweep window' <<<"$out" \
   && ok "equal active-hours endpoints are a warning, not a day-long window (rc=$rc)" \
   || ko "6-6 was read as full coverage (rc=$rc) -- $out"
+# The same bound from the other side: Windows allows at most 18 hours, so 1-23 is as impossible as
+# 6-6, and it covers the sweep window on paper -- which is how an invalid setting would stay quiet.
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x1 0x17 0x0)" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'active hours read as 1-23, a span Windows cannot mean' <<<"$out" \
+  && ! grep -q 'cover the sweep window' <<<"$out" \
+  && ok "...and so is a span longer than the 18 h Windows maximum (rc=$rc)" \
+  || ko "a 22-hour active window was read as coverage (rc=$rc) -- $out"
+# The pinned maximum itself must stay quiet: 6-0 is exactly 18 h.
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x6 0x0 0x0)" 2>&1)
+grep -q 'active hours on rog: 6-0 cover the sweep window' <<<"$out" && ! grep -q 'cannot mean' <<<"$out" \
+  && ok "...while the 18 h maximum the boxes pin is still the quiet path" \
+  || ko "the 6-to-0 window the boxes pin was rejected -- $out"
 # Numeric is not valid: 24-24 reaches the equal-endpoint branch, which would call every hour
 # covered and print the quiet line over a box whose update protection is nonsense.
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x18 0x18 0x0)" 2>&1); rc=$?

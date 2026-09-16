@@ -596,7 +596,7 @@ shutdown_unheld_vm() { # shutdown_unheld_vm <box> <windows-alias> — rc 0 only 
 }
 
 hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait until Windows shows one
-  local name=$1 dest=$2 pid f deadline rec spawn_epoch spawned=0
+  local name=$1 dest=$2 pid f deadline rec spawn_epoch spawned=0 _
   f=$HOLD_STATE_DIR/hold-$name.pid
   mkdir -p "$HOLD_STATE_DIR" 2>/dev/null
   if hold_pid_live "$f"; then
@@ -640,6 +640,15 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
       return 1
     fi
     echo "  wsl holder started on $name (via $dest, pid $pid)"
+    # Between `&` and the exec, the child is still a copy of THIS shell and its command line does
+    # not carry the holder's signature yet — so a signature check run straight away can read a
+    # perfectly good holder as dead, tear the record down, and leave the child to exec into an
+    # infinite holder nobody records. Give the fork a bounded moment to become the ssh.
+    for _ in 1 2 3 4 5; do
+      hold_pid_live "$f" && break
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
   fi
   # Both halves, in this order. The local pid alone is not the claim: an ssh client can outlive
   # the command it ran, and `tasklist` is what says a wsl.exe is really there. A wsl.exe alone is
@@ -672,7 +681,13 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
   # ours would unhold that lane's VM — the failure this whole flag exists to prevent, caused by a
   # retry.
   if [ "$spawned" = 1 ] && [ "$(hold_pid_read "$f" 2>/dev/null | cut -d' ' -f1)" = "$pid" ]; then
-    release_hold "$name" >/dev/null
+    # Our own record, so kill the pid we spawned WITHOUT asking for the signature again: a child
+    # still between fork and exec carries none, and release_hold would then drop the record and
+    # leave it to become an unrecorded holder. There is no pid-reuse hazard here — this pid is our
+    # own child, alive or not, for as long as this shell has not reaped it.
+    kill "$pid" 2>/dev/null
+    rm -f "$f" 2>/dev/null
+    echo "  wsl holder on $name stopped (pid $pid): nothing holds that VM"
   elif [ "$spawned" = 1 ]; then
     # We spawned a holder, but the record no longer names it: a concurrent run replaced it after
     # ours exited. Killing what the file names now would unhold THAT run's lane.
@@ -769,8 +784,12 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
   # Equal endpoints are not a 24-hour window. Windows allows at most 18 hours (this file's own
   # lore: the boxes pin 6→0 as the maximum), so `6-6` is a reset or a malformed setting — and
   # reading it as "every hour protected" would print the quiet line over a box with no protection.
-  if [ "$s" = "$e" ]; then
-    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, equal endpoints — not a window Windows can mean (its maximum span is 18 h), so the setting is reset or malformed"
+  # ...and the same bound from the other side: Windows allows at most 18 hours, so `1-23` is as
+  # impossible as `6-6`, and reading a 22-hour span as coverage hides the risk this line exists to
+  # show. Equal endpoints are the zero/24 case of the same check.
+  len=$(( (e - s + 24) % 24 ))
+  if [ "$len" -eq 0 ] || [ "$len" -gt 18 ]; then
+    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, a span Windows cannot mean (its maximum is 18 h), so the setting is reset or malformed"
     return 0
   fi
   len=$(( (we - ws + 24) % 24 )); [ "$len" -eq 0 ] && len=1
