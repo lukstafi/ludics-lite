@@ -36,6 +36,7 @@ author's fleet (the header of `scripts/fleet-worker.sh` is the authoritative lis
 | The flotilla status and wake service, if any | `FLEET_FLOTILLA` |
 | Local state directory for each coordinator | `ISSUE_WAVE_STATE` |
 | State directory on the anchor for the lease and fleet-wide halt | `FLEET_ANCHOR_STATE`; every coordinator must resolve it to the same directory on the anchor |
+| Where a box keeps its run-time correctness slot locks (`execution slot`) | `FLEET_SLOT_STATE`; box-wide, deliberately not under the per-coordinator `ISSUE_WAVE_STATE`, and every agent on the box must resolve it to the same directory |
 | How many correctness executions may share a box AT RUN TIME (measurement is always exclusive) | `FLEET_BOX_CORRECTNESS_SLOTS` (`<box>=<n>` pairs; `mac-studio=6` with the default roster, one slot otherwise) |
 
 The rest is prose in this file and is edited in place: the **sequencing plan** path and the

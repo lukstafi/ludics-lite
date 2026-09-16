@@ -982,6 +982,28 @@ expect "...which does fill it: the next ordinary reservation is refused" 1 "corr
 expect "...while another standing record is still admitted" 0 '"standing": true' -- "${FWS[@]}" execution run "$(slotreq slot-iterate-2 correctness true)"
 expect "a batch still takes a run-time slot beside them" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo beside-standing
 slotdone slot-iterate; slotdone slot-iterate-2; slotdone slot-ordinary
+# The cap is the BOX's, so the slot files must not hang off ISSUE_WAVE_STATE, which is each
+# coordinator's own directory: two workers on one host under different coordinators would each
+# take slot 1 and the cap would bound nothing (PR #166 review, round 1).
+env ISSUE_WAVE_STATE="$TMP/other-coordinator-state" FLEET_BOXES="testbox other" "$FW" execution slot -- sleep 30 > "$TMP/slot-h3.log" 2>&1 &
+h3=$!
+held "$TMP/slot-h3.log" "slot 1 of 1 held" &&
+  expect "a batch under another coordinator's state contends for the same box slot" 1 "all 1 run-time correctness slots busy after 0s" -- "${FWS[@]}" execution slot --wait 0 -- echo other-state
+kill -9 "$h3" 2>/dev/null; wait "$h3" 2>/dev/null
+[ -e "$HOME/.local/state/fleet-execution-slots/testbox/slot.1" ] && ok "...because the locks live in the box-wide slot directory, not the coordinator's" || ko "the slot lock is not in the box-wide directory"
+expect "FLEET_SLOT_STATE relocates that directory" 0 "slot 1 of 1" -- \
+  env FLEET_SLOT_STATE="$TMP/slot state" FLEET_BOXES="testbox other" "$FW" execution slot --wait 0 -- echo relocated
+[ -e "$TMP/slot state/testbox/slot.1" ] && ok "...to where it says" || ko "FLEET_SLOT_STATE did not move the lock files"
+# A local name outside the roster would lock under a spelling of its own while reading the
+# registry for that spelling too, so a batch could run beside a measurement on the canonical one.
+expect "a local box outside FLEET_BOXES is refused, as the registry refuses a noncanonical host" 1 "not a canonical FLEET_BOXES entry" -- \
+  env FLEET_LOCAL_BOX=testbox-alias FLEET_BOXES="testbox other" "$FW" execution slot -- echo alias
+# The registry parses the spec into a dict, so a repeated box keeps its LAST value; a first-match
+# read here would run six batches against a registry that admits one.
+expect "a repeated box in the spec reads as its last value, as the registry reads it" 0 "slot 1 of 1" -- \
+  env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=6 testbox=1" "$FW" execution slot --wait 0 -- echo last-wins
+expect "...and a malformed later entry is still refused" 1 "<box>=<positive n>" -- \
+  env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=2 other=0" "$FW" execution slot -- echo bad-tail
 # The site default, the number the references quote: six on mac-studio (ludics-lite#160), and
 # one anywhere the spec does not name -- which is every box under a custom FLEET_BOXES.
 expect "the site default gives mac-studio six run-time slots" 0 "slot 1 of 6" -- \

@@ -88,6 +88,10 @@
 #     cap exists to bound concurrent load, never to bound how many agents may be in flight.
 #   FLEET_SKILLS_REPO: skills checkout on each box; ~/ludics-lite.
 #   ISSUE_WAVE_STATE: local worker-state directory; ~/.local/state/issue-wave.
+#   FLEET_SLOT_STATE: where `execution slot` keeps a box's run-time slot locks;
+#     ~/.local/state/fleet-execution-slots. Deliberately NOT under ISSUE_WAVE_STATE, which is
+#     per-coordinator: the cap is the box's, so every agent on the box must resolve this to the
+#     same directory (as every coordinator must resolve FLEET_ANCHOR_STATE to the same one).
 #   FLEET_TMUX_SOCKET: tmux -L name; tests isolate with it.
 #   FLEET_FLOTILLA: status service; http://mac-studio:7799.
 #   FLEET_LOCK_WAIT: seconds a lease mutation waits for a concurrent one; 10.
@@ -126,6 +130,11 @@ BOXES="${FLEET_BOXES:-mac-studio rog-nv-wsl minix-amd-wsl}"
 SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ -n "${FLEET_BOXES:-}" ] || echo mac-studio=6)}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
+# Run-time correctness slots (`execution slot`) are a property of the BOX, so their lock files
+# must not hang off ISSUE_WAVE_STATE: that is each coordinator's own directory, and two workers
+# on one host under different coordinators would then lock different files and each take slot 1,
+# leaving the cap bounding nothing. Every agent on a box must resolve this to one directory.
+SLOT_STATE="${FLEET_SLOT_STATE:-\$HOME/.local/state/fleet-execution-slots}"
 ANCHOR_STATE="${FLEET_ANCHOR_STATE:-$STATE}"
 TMUX_SOCKET="${FLEET_TMUX_SOCKET:-}"
 FLOTILLA="${FLEET_FLOTILLA:-http://mac-studio:7799}"
@@ -1183,9 +1192,11 @@ conclude_from_run() {
 
 # box_correctness_slots <box>: that box's correctness slot count from $SLOTS on stdout (a box
 # the spec does not name has one), or a refusal line on stdout and return 1 for a malformed spec.
-# The same grammar the registry enforces, read here so the run-time lock and the registry agree.
+# The same grammar the registry enforces, read here so the run-time lock and the registry agree --
+# including on a spec that names a box twice, where the registry's dict keeps the LAST value: a
+# first-match read here would have let six batches run against a registry admitting one.
 box_correctness_slots() {
-  local box="$1" pair count
+  local box="$1" pair count found=1
   local -a pairs=()
   read -r -a pairs <<< "$SLOTS"
   for pair in ${pairs[@]+"${pairs[@]}"}; do
@@ -1193,9 +1204,9 @@ box_correctness_slots() {
     case "$pair" in *=*) ;; *) count="" ;; esac
     case "$count" in ''|*[!0-9]*) echo "FLEET_BOX_CORRECTNESS_SLOTS entry must be <box>=<positive n>: $pair"; return 1 ;; esac
     [ "$count" -ge 1 ] || { echo "FLEET_BOX_CORRECTNESS_SLOTS entry must be <box>=<positive n>: $pair"; return 1; }
-    [ "${pair%%=*}" = "$box" ] && { echo "$count"; return 0; }
+    [ "${pair%%=*}" = "$box" ] && found="$count"
   done
-  echo 1
+  echo "$found"
 }
 
 # `execution slot [--wait <seconds>] -- <command...>`: the RUN-TIME half of the correctness cap
@@ -1270,6 +1281,14 @@ cmd_execution_slot() {
   [ "$#" -ge 1 ] || die "execution slot: a command to hold the slot around is required, after --"
   box="$LOCAL_BOX"
   [ -n "$box" ] || die "execution slot: this host has no fleet name; set FLEET_LOCAL_BOX (the slot is this box's own)"
+  # An alias or a typo would lock under a name of its own and read measurements under another,
+  # so a batch could run beside a measurement reserved on the canonical spelling of this very box.
+  # The registry refuses a noncanonical execution_host for the same reason; this is that check.
+  local canonical=0 entry
+  local -a roster=()
+  read -r -a roster <<< "$BOXES"
+  for entry in ${roster[@]+"${roster[@]}"}; do [ "$entry" = "$box" ] && canonical=1; done
+  [ "$canonical" -eq 1 ] || { echo "EXECUTION SLOT REFUSED $box: not a canonical FLEET_BOXES entry ($BOXES)"; exit 1; }
   cap=$(box_correctness_slots "$box") || { echo "EXECUTION SLOT REFUSED $box: $cap"; exit 1; }
   helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
@@ -1281,7 +1300,7 @@ cmd_execution_slot() {
        | .request_id] | join(", ")' <<<"$listing") ||
     { echo "EXECUTION SLOT REFUSED $box: the anchor's registry did not parse"; exit 1; }
   [ -z "$measuring" ] || { echo "EXECUTION SLOT REFUSED $box: a measurement holds the box exclusively ($measuring)"; exit 1; }
-  dir="$(local_path "$STATE")/execution-slots/$box"
+  dir="$(local_path "$SLOT_STATE")/$box"
   mkdir -p "$dir" || die "execution slot: cannot create the slot directory $dir"
   exec python3 -c "$(slot_lock_py)" "$box" "$dir" "$cap" "$wait" "$@"
 }
