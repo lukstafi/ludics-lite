@@ -693,7 +693,10 @@ test_a_broken_jq_program_is_unknown_not_a_value() {
   # a plausible fact about the PR and is the shape ludics-lite#89 was filed on.
   assert_unknown_when_broken 'sort_by(.at) | last' \
     "the verdict comments feed did not parse" "the no-findings verdict scan"
-  assert_unknown_when_broken 'capture($refre)' \
+  # `$refre` rather than the `capture($refre)` that surrounds it: the marker is a literal in
+  # THIS file, and scripts/check-jq-shapes.sh reads a bare `capture(` as jq source wherever it
+  # finds one. The variable appears in no other program, so it names the site just as exactly.
+  assert_unknown_when_broken '$refre' \
     "the initialization-failure comments feed did not parse" "the initialization-failure scan"
 }
 

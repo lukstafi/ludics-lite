@@ -161,6 +161,40 @@ jq -r '[ ("a" | capture("a")), ("x" | capture("b")) ] | first' <<<"$raw"
 EOF
 )"
 
+# Round 3: comment TEXT was read as code, and two comments fabricated the wrapper a bare capture
+# was missing. Its control is the same filter with the comments removed by hand, still refused —
+# so the case cannot pass merely because the guard refuses everything in sight.
+expect "comments cannot fabricate a wrapper" 1 "$REFUSAL" -- \
+  "$CJ" "$(probe bad_comment_wrapper <<'EOF'
+jq -r '.[] # [
+  | capture("x") # ] | first
+  | .s' <<<"$raw"
+EOF
+)"
+expect "the same filter without the comments is refused too" 1 "$REFUSAL" -- \
+  "$CJ" "$(probe bad_comment_wrapper_plain <<'EOF'
+jq -r '.[]
+  | capture("x")
+  | .s' <<<"$raw"
+EOF
+)"
+# ... and a `#` that opens no comment must not truncate the line: the wrapper here is real.
+expect "a hash inside a jq string is not a comment" 0 'every capture( is bracketed' -- \
+  "$CJ" "$(probe safe_hash_in_string <<'EOF'
+jq -r '{tag: "issue #89", sha: ([(.body // "") | capture("(?<s>x)").s] | first // "")}' <<<"$raw"
+EOF
+)"
+
+# Round 3, the other half: jq accepts a newline between a filter name and its argument list, so
+# `capture` on one line and `("x")` on the next read as a clean file. The guard is line-shaped
+# and says so rather than following the call across the break.
+expect "a capture whose arguments are on the next line is refused" 1 'not on the same logical expression' -- \
+  "$CJ" "$(probe bad_split_call <<'EOF'
+jq -r '.[] | capture
+  ("x") | .s' <<<"$raw"
+EOF
+)"
+
 expect "the refusal names the line" 1 ":3:" -- \
   "$CJ" "$(probe bad_line_number <<'EOF'
 # a comment, which is not a line of the expression below

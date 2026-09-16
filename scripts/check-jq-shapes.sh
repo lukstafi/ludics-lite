@@ -112,10 +112,55 @@ for f in "${files[@]}"; do
       if (captures_in(substr(txt, open, j - open + 1)) != 1) return 2
       return 1
     }
+    # Comments removed, with enough quote state to know one when it sees it. A `#` opens a
+    # comment where a shell or a jq reader would see one: at the start of a word, outside a
+    # string. Without this, comment TEXT was read as code, and two of them fabricated the
+    # wrapper a bare capture was missing (`.[] # [` … `| capture("x") # ] | first`, round 3).
+    #
+    # The states are shell code, a shell single-quoted run (which in this file is where a jq
+    # program lives), a shell double-quoted string, and a jq string inside that program. A
+    # comment ends the line and leaves the state as it was, which is what a comment does.
+    # Where the state machine is wrong — a single-quoted shell string that is not a jq program
+    # and carries a ` #` of its own — the line is truncated, and a truncation unbalances
+    # brackets and REFUSES. That is the direction to be wrong in.
+    function strip(s,   out, i, ch) {
+      out = ""
+      i = 1
+      while (i <= length(s)) {
+        ch = substr(s, i, 1)
+        if (ch == "#" && mode != 2 && mode != 3 &&
+            (out == "" || substr(out, length(out), 1) ~ /[ \t]/)) return out
+        if (mode == 0) {
+          if (ch == "\\") { out = out ch substr(s, i + 1, 1); i += 2; continue }
+          if (ch == "'"'"'") mode = 1
+          else if (ch == "\"") mode = 2
+        } else if (mode == 1) {
+          if (ch == "'"'"'") mode = 0
+          else if (ch == "\"") mode = 3
+        } else {
+          if (ch == "\\") { out = out ch substr(s, i + 1, 1); i += 2; continue }
+          if (ch == "\"") mode = (mode == 3 ? 1 : 0)
+        }
+        out = out ch
+        i++
+      }
+      return out
+    }
     function flush(   i, txt, p, cpos, verdict, why) {
       if (n == 0) return
       txt = ""
       for (i = 1; i <= n; i++) txt = txt (i > 1 ? " " : "") buf[i]
+      # jq accepts a newline between a filter name and its argument list, so a `capture` left
+      # dangling at the end of an expression is a call whose arguments this scanner will never
+      # see — `capture` on one line and `("x")` on the next read as a clean file (round 3).
+      # Refused rather than followed: the grammar below is line-shaped, and a call written
+      # across the break is asking the guard for something it does not do.
+      if (txt ~ /(^|[^A-Za-z0-9_])capture[ \t]*$/) {
+        printf "::error file=%s,line=%d::%s:%d: a `capture` whose argument list is not on the same logical expression: this guard is line-shaped and cannot follow the call across the break, so it cannot certify the wrapper either — put the call and its `[...]` together\n", file, start, file, start
+        bad = 1
+        n = 0
+        return
+      }
       p = 0
       while (match(substr(txt, p + 1), /(^|[^A-Za-z0-9_])capture[ \t]*\(/) > 0) {
         # RSTART is the match, which begins one character early unless the capture opens the
@@ -138,9 +183,10 @@ for f in "${files[@]}"; do
       n = 0
     }
     {
-      line = $0
+      line = strip($0)
       sub(/^[ \t]+/, "", line)
-      if (line ~ /^#/) next          # a comment continues neither expression nor evidence
+      sub(/[ \t]+$/, "", line)
+      if (line == "") { flush(); next }   # a comment or a blank line ends the expression
       if (line !~ /^\|/) flush()
       if (n == 0) start = NR
       buf[++n] = line

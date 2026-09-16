@@ -234,8 +234,12 @@ whole accumulator goes, so a fold over ten hunks returns null and the path reads
 patch that parsed fine. Nothing errors, so nothing catches it. Five such sites have been fixed
 across three PRs (ludics-lite#84 three, #104 a fourth, #89 a fifth) while `[capture(…)] | first`
 was documented only in prose beside one of them. The guard is deliberately grep-shaped rather
-than a jq parser: comment lines are dropped, a line beginning with `|` continues the line above
-it, and then EACH `capture` call in the resulting expression is checked against its own brackets
+than a jq parser: comments are removed first, with enough shell/jq quote state to know a `#`
+that opens one from a `#` inside a string (without that, comment text read as code, and two
+comments could fabricate the wrapper a bare capture was missing); a line beginning with `|`
+continues the line above it; a `capture` left dangling at the end of an expression — its argument
+list on the next line, which jq accepts — is refused rather than followed, since a line-shaped
+scanner cannot certify a wrapper it cannot see; and then EACH `capture` call in the resulting expression is checked against its own brackets
 — the nearest `[` before it with no `]` in between, the `]` that closes that `[` by depth read
 back immediately with `| first` or `| last`, and exactly one capture inside those brackets. Per
 occurrence rather than per expression, because an existential test certifies
