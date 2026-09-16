@@ -68,9 +68,26 @@ Read its last lines:
   whether the shutdown was refused (a `-wsl` that still answers is the old VM) or the start
   failed after it (no VM at all) — so that box's backends (minix: hip and multidev_cc both) are untestable today: report it as such rather
   than sweeping it. Each such line names only the boxes it applies to.
+- `wsl restart REFUSED on: <box>` is a different line and a different situation: **another tool is
+  using that box right now**, and the refusal names it. `wsl.exe --shutdown` is host-global, so
+  restarting a box mid-sweep destroys the VM under whatever is running there — on 2026-09-16 that
+  cost this sweep both GPU units, and the failure was read as a GPU fault for two days. Almost
+  always the holder is another sweep that has not finished. Wait for it and run the wake command
+  again; do **not** reach for `--force`, which takes the box anyway and is there for a holder that
+  has demonstrably gone (a crashed run whose ssh is still orphaned), not for one you are impatient
+  with. If you wait, say in the report that the run started late and why.
 
 `~/bin/wake-lab.sh status` prints the per-box picture (router-active, `-lan`, `-win`, `-wsl`) if you need to
 say precisely what happened.
+
+The sweep reserves each WSL box for the length of that box's lane, and `wake-lab.sh` refuses to
+destroy a reserved box, so the 2026-09-16 collision cannot repeat silently. Two consequences to
+know. A unit recorded as `skip (box <box> reserved by ...)` is a box another run held for longer
+than the sweep was willing to wait: nothing was tested and nothing failed, so report it the way
+`skip (unreachable)` is reported, naming the holder. And a dxg window whose verdict is
+`vm-replaced` means the guest was destroyed and recreated while that unit ran — the unit's result
+says nothing about the code, it gets the serial rerun automatically, and the thing to investigate
+is who restarted the box, not the backend.
 
 The retry budget is exactly one re-kick and one rerun. If the sweep records cuda, hip or multidev_cc as
 `skip (unreachable)` while `status` shows that box `win=UP`, the VM was up and vanished: run

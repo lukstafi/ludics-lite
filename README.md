@@ -157,6 +157,16 @@ cp "$HOME/ludics-lite/scripts/wake-lab-hosts.example.sh" "$HOME/.config/wake-lab
 chmod 600 "$HOME/.config/wake-lab/hosts.sh"   # then fill in mac_of, eth_mac_of and ip_of
 ```
 
+The WSL boxes are shared, and `wsl.exe --shutdown` is host-global — it destroys the whole VM, so
+every session on that box dies with it. Anything that uses a box for a while therefore reserves it,
+as an `flock` on `~/.local/state/wake-lab/<box>.lock` (`WAKE_LAB_LOCK_DIR` overrides the
+directory), and `restart-wsl` refuses a reserved box until the holder lets go, or `--force` takes
+it anyway. `wake-lab.sh lock-path <box>` answers the path for a harness that wants to take one;
+the contract is only the path and a one-line holder description, so the reserving tool needs
+nothing installed from here. The OCANNL cross-machine sweep reserves each box for the length of
+its lane — on 2026-09-16, before any of this existed, a restart issued mid-sweep destroyed both
+GPU boxes' VMs and cost that run both GPU units.
+
 `WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the verified lab
 lore in the header comment (wake-on-LAN over Ethernet only, waking from a full shutdown, what
 `router-active=1` means, the cold-boot kicked-VM trap, the `exit 0` vs `true` probe trap), the router

@@ -446,6 +446,113 @@ env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_WSL_STAR
   || ko "a fired cap orphaned its grace sleep: $(ps -eo pid,command | awk '/sleep 311[789]$/')"
 reap_naps
 
+# --- the lab lock stops a restart destroying someone else's VM ----------------------------------
+# 2026-09-16, the third and most expensive shape of the same day: `wsl.exe --shutdown` is
+# host-global, so a restart issued while the cross-machine sweep was 13 minutes into rog-nv/cuda
+# and minix/hip destroyed both VMs and both units. The sweep recorded `error`, which reads as a box
+# fault, and it was misattributed to the GPU autotune tests for two days. The lock is the interlock
+# that was missing; these cases pin that it actually refuses, and that it refuses ONLY the
+# destructive path.
+LOCKS="$TMP/locks"; mkdir -p "$LOCKS"
+# Held the way the sweep holds it: a descriptor kept open, flock taken by a perl that exits. The
+# lock belongs to the open file description, so it outlives that perl and dies with this shell --
+# which is the property the whole contract rests on, so take it here exactly as the real holder does
+# rather than simulating a held lock with a flag file.
+hold_lock() { # hold_lock <box> <description>
+  printf '%s\n' "$2" > "$LOCKS/$1.lock"
+  eval "exec $3>>\"$LOCKS/$1.lock\""
+  perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&"$3"
+}
+wl_locked() { # wl_locked <args...> -- a run with both boxes' guests answering and the lock dir live
+  # `8>&-`: the checker must not inherit the HOLDER's descriptor. An flock lives until every
+  # descriptor onto that open file description is closed, so a child that inherited one keeps the
+  # lock alive after the holder let go -- and wake-lab's own `capped` leaves its watchdog `sleep`
+  # orphaned for the length of the cap, which would hold this test's lock for two minutes after
+  # `exec 8>&-`. In production the checker is a separate process that never had the descriptor at
+  # all, so closing it here is what models the real thing; the case below pins the property itself.
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+      SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" "$WL" "$@" 2>&1 8>&-
+}
+if hold_lock minix 'sweep 20260916T074913Z (pid 999, since 20260916T074913Z)' 8; then
+  ok "the lab lock can be taken the way a harness takes it"
+else
+  ko "could not take a test lab lock -- the cases below prove nothing"
+fi
+
+: > "$SSH_LOG"
+out=$(wl_locked restart-wsl rog minix); rc=$?
+grep -q '^minix-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ko "a held box was shut down anyway -- the interlock does not hold: $(cat "$SSH_LOG")" \
+  || ok "a restart does not shut down a box whose lab lock is held"
+[ "$rc" -ne 0 ] && grep -q 'REFUSED on: minix' <<<"$out" \
+  && ok "...and the step FAILS rather than reporting a fresh VM it did not make (rc=$rc)" \
+  || ko "a refused box did not fail the step (rc=$rc) -- $out"
+grep -q 'sweep 20260916T074913Z' <<<"$out" \
+  && ok "...and the refusal names the holder, so the operator knows what to wait for" \
+  || ko "the refusal does not say who holds the box -- $out"
+# The neighbour rule of the wedge cases above, applied to the lock: one held box must not cost the
+# others their restart, and `wsl up` must never appear unqualified over a box that was refused.
+grep -q '^rog-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ok "...and its neighbour still gets its restart" \
+  || ko "a held box cost its neighbour the restart: $(cat "$SSH_LOG")"
+grep -q '^wsl up$' <<<"$out" \
+  && ko "the run claimed a blanket 'wsl up' over a refused box -- $out" \
+  || ok "...and the verdict is never a blanket 'wsl up' while a box was refused"
+
+# --force is the override, and it is the ONLY thing that takes a held box.
+: > "$SSH_LOG"
+out=$(wl_locked restart-wsl --force minix); rc=$?
+[ "$rc" -eq 0 ] && grep -q '^minix-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ok "--force takes a held box anyway (rc=$rc)" \
+  || ko "--force did not override the lock (rc=$rc) -- $out"
+
+# A plain kick starts a VM that is already running as a no-op: it cannot cost a holder anything,
+# and gating it would make `kick-wsl` -- the recovery command for a box with no VM at all --
+# refusable at exactly the moment it is needed.
+: > "$SSH_LOG"
+out=$(wl_locked kick-wsl minix); rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'shutdown' "$SSH_LOG" \
+  && ok "a plain kick is not gated by the lock, and still shuts nothing down (rc=$rc)" \
+  || ko "the lock gated a non-destructive kick (rc=$rc) -- $out $(cat "$SSH_LOG")"
+
+# A free box is the ordinary case and must be untouched by any of this.
+: > "$SSH_LOG"
+out=$(wl_locked restart-wsl rog); rc=$?
+[ "$rc" -eq 0 ] && grep -q '^wsl up$' <<<"$out" \
+  && ok "a box whose lock is free restarts exactly as before (rc=$rc)" \
+  || ko "the lock broke the ordinary restart (rc=$rc) -- $out"
+
+# An INHERITED descriptor holds the lock too, and that is the semantics to want rather than a
+# wart: a child still talking to the box means the box is still in use, so it stays reserved. It is
+# also the sweep's own run lock's behaviour, where an orphaned dune keeping the worktree locked is
+# documented as correct. The consequence to know is that a holder's lock outlives it for as long as
+# any inheriting child runs, and `--force` is the way past one that has outstayed its welcome.
+sleep 30 8>&8 &
+inheritor=$!
+exec 8>&-
+out=$(wl_locked restart-wsl minix); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'REFUSED on: minix' <<<"$out" \
+  && ok "a child that inherited the descriptor keeps the box reserved (rc=$rc)" \
+  || ko "the lock died while an inheriting child was still running (rc=$rc) -- $out"
+expect "...and --force is the way past it" 0 "wsl up" -- \
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+      SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" "$WL" restart-wsl --force minix
+
+# Released with the holder: the sweep's lock dies with the sweep however it dies, which is why
+# there is nothing to reclaim after a crash.
+kill -KILL "$inheritor" 2>/dev/null; wait "$inheritor" 2>/dev/null
+out=$(wl_locked restart-wsl minix); rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "...and a lock whose holders are all gone stops refusing, with nothing to reclaim (rc=$rc)" \
+  || ko "a released lock still refuses (rc=$rc) -- $out"
+
+# The path is the whole contract with the sweep, so it must not need the site table: the harness
+# asking where to put its flock runs from a checkout with no business holding this lab's MACs.
+out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_LOCK_DIR="$LOCKS" "$WL" lock-path minix 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "$LOCKS/minix.lock" ] \
+  && ok "lock-path answers without the site file, at the path the holder must take (rc=$rc)" \
+  || ko "lock-path did not answer the contract path without hosts.sh (rc=$rc) -- $out"
+
 # --- the polling loops are bounded by elapsed time, not by iteration count -----------------------
 # Every probe of a dark box burns its ConnectTimeout, so an iteration budget was a wall-clock lie:
 # 36 rounds of a "3 minute" WSL wait ran for nine when the probes were slow. Three-second probes
