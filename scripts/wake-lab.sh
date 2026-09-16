@@ -378,12 +378,16 @@ KICK_DEST=""   # the Windows alias that carried the last successful kick; the ho
 # lane is several units with their own caps plus preparation and diagnostics outside them, so a
 # holder sized to the expected run expires under the last unit, silently, exactly when nobody is
 # watching. It ends by unhold.
-hold_pid_live() { # hold_pid_live <pidfile>
+hold_pid_live() { # hold_pid_live <pidfile> — is the recorded holder still OUR holder, still running
   local p
   [ -r "$1" ] || return 1
   p=$(cat "$1" 2>/dev/null)
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
-  kill -0 "$p" 2>/dev/null
+  kill -0 "$p" 2>/dev/null || return 1
+  # Pids are reused, and this file outlives the shell that wrote it — so `unhold` run tomorrow
+  # over a stale file must never kill whatever inherited the number. The holder's command line is
+  # its signature, and nothing else on this Mac runs a `sleep infinity` through ssh.
+  ps -o args= -p "$p" 2>/dev/null | grep -q 'sleep infinity'
 }
 
 win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe runs on the Windows side
@@ -410,14 +414,18 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
     printf '%s\n' "$pid" > "$f"
     echo "  wsl holder started on $name (via $dest, pid $pid)"
   fi
+  # Both halves, in this order. The local pid alone is not the claim: an ssh client can outlive
+  # the command it ran, and `tasklist` is what says a wsl.exe is really there. A wsl.exe alone is
+  # not it either: the owner's console shell is one, and it would certify a holder of ours that
+  # never started — with a log-off or an update restart then taking away the only thing holding
+  # the VM. A holder whose ssh has already died cannot start being seen later, so that ends the
+  # wait rather than burning the budget.
   deadline=$((SECONDS + HOLD_WAIT_SECONDS))
-  while :; do
+  while hold_pid_live "$f"; do
     if win_holder_seen "$dest"; then
       echo "  wsl holder observed on $name (wsl.exe running on the Windows side)"
       return 0
     fi
-    # A holder whose ssh already died cannot start being seen later; stop waiting for it.
-    hold_pid_live "$f" || break
     [ "$SECONDS" -ge "$deadline" ] && break
     sleep 5
   done
@@ -430,6 +438,9 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0, 
   if [ ! -r "$f" ]; then echo "  no wsl holder recorded for $1"; return 0; fi
   p=$(cat "$f" 2>/dev/null)
   if hold_pid_live "$f"; then
+    # Killing the local client closes the channel and sshd ends the command it was running. If a
+    # wsl.exe is ever orphaned on the Windows side despite that, `restart-wsl` clears it: the
+    # `wsl --shutdown` it issues takes every holder with the VM.
     kill "$p" 2>/dev/null
     echo "  wsl holder released on $1 (pid $p killed; the VM is unheld from now on)"
   else

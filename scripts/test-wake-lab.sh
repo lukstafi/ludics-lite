@@ -292,9 +292,12 @@ out=$(kick "rog-nv-wsl" 2>&1); rc=$?
 # process is OBSERVED there -- a holder that failed to start is the exact state the flag exists to
 # rule out.
 held_kick() { # held_kick <ssh-up> <tasklist output> [reg output] [holder lifetime] -- kick-wsl --hold rog
+  # The default lifetime is not 0: the script requires its own holder to still be running when it
+  # sees a wsl.exe on the Windows side, so a shim holder that exits instantly is an already-dead
+  # one, not a held VM.
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
       WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="$1" SSH_TASKLIST="$2" SSH_REG="${3:-}" \
-      SSH_HOLD_LIFE="${4:-0}" "$WL" kick-wsl --hold rog
+      SSH_HOLD_LIFE="${4:-20}" "$WL" kick-wsl --hold rog
 }
 unhold() { env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog; }
 # `tasklist /FI "IMAGENAME eq wsl.exe" /NH` prints one row per match and an INFO line when nothing
@@ -364,11 +367,20 @@ kill -0 "$hold_pid" 2>/dev/null \
 # A lane's cleanup runs on the way out of a FAILED lane too, so unhold over nothing is not an error.
 expect "unhold with no holder recorded says so and still succeeds" 0 "no wsl holder recorded for rog" -- \
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
-printf '999999\n' > "$TMP/state/hold-rog.pid"
+mkdir -p "$TMP/state"; printf '999999\n' > "$TMP/state/hold-rog.pid"
 expect "...and a holder that had already died is reported as such, not as a release" 0 "had already exited" -- \
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
 [ ! -f "$TMP/state/hold-rog.pid" ] && ok "...and its stale pid file is cleared" \
   || ko "a dead holder's pid file survived unhold"
+# The pid file outlives the shell that wrote it, and pids are reused: a stale one whose number has
+# been taken over by something else must not get that process killed.
+sleep 30 & innocent=$!
+printf '%s\n' "$innocent" > "$TMP/state/hold-rog.pid"
+expect "a stale pid reused by an unrelated process is not killed as a holder" 0 "had already exited" -- \
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
+kill -0 "$innocent" 2>/dev/null && ok "...and that process is still running" \
+  || ko "unhold killed a process that merely inherited the holder's pid"
+kill "$innocent" 2>/dev/null; wait "$innocent" 2>/dev/null
 # A --hold that holds nothing is a lane that believes it is held and is not.
 : > "$CURL_LOG"
 expect "--hold without a WSL start is refused rather than ignored" 1 "hold needs a WSL start" -- \
@@ -379,7 +391,7 @@ expect "--hold without a WSL start is refused rather than ignored" 1 "hold needs
 wake_hold() { # wake_hold <tasklist output>
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WAIT_SECONDS=1 \
       WAKE_LAB_HOLD_WAIT_SECONDS=1 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
-      SSH_TASKLIST="$1" "$WL" --wait --restart-wsl --hold rog
+      SSH_TASKLIST="$1" SSH_HOLD_LIFE=20 "$WL" --wait --restart-wsl --hold rog
 }
 rm -rf "$TMP/state"
 out=$(wake_hold "$TASKLIST_HELD" 2>&1); rc=$?
@@ -426,7 +438,8 @@ grep -q 'SmartActiveHoursState=1 lets Windows move them' <<<"$out" \
 # A window that wraps midnight is read on both sides of it.
 out=$(env WAKE_LAB_SWEEP_HOURS=23-2 WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 \
       WAKE_LAB_HOLD_WAIT_SECONDS=1 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
-      SSH_TASKLIST="$TASKLIST_HELD" SSH_REG="$(reg_out 0x6 0x0 0x0)" "$WL" kick-wsl --hold rog 2>&1)
+      SSH_TASKLIST="$TASKLIST_HELD" SSH_REG="$(reg_out 0x6 0x0 0x0)" SSH_HOLD_LIFE=20 \
+      "$WL" kick-wsl --hold rog 2>&1)
 grep -q 'uncovered hours: 0 1' <<<"$out" && ! grep -q 'uncovered hours:.*23' <<<"$out" \
   && ok "...and a sweep window that wraps midnight is judged hour by hour across it" \
   || ko "a wrapping sweep window was misjudged -- $out"
