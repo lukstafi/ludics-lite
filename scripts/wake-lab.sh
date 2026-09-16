@@ -387,20 +387,24 @@ KICK_DEST=""   # the Windows alias that carried the last successful kick; the ho
 # One spelling of the holder, used to spawn it and to recognize it again.
 HOLD_CMD='wsl.exe -d Ubuntu -e sleep infinity'
 
-hold_pid_read() { # hold_pid_read <pidfile> — echo "<pid> <dest>", empty if the file is unusable
-  local line p d
+# The record is "<pid> <destination> <spawn epoch>". The destination is part of the holder's
+# identity (every box's holder runs the same payload), and the epoch is how a LATER invocation
+# that reuses this holder knows whether it is past its settle.
+hold_pid_read() { # hold_pid_read <pidfile> — echo "<pid> <dest> <epoch>", fail if unusable
+  local line p d t rest
   [ -r "$1" ] || return 1
   line=$(cat "$1" 2>/dev/null)
-  p=${line%% *}; d=${line#* }
+  p=${line%% *}; rest=${line#* }; d=${rest%% *}; t=${rest#* }
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
   [ -n "$d" ] && [ "$d" != "$p" ] || return 1
-  printf '%s %s\n' "$p" "$d"
+  case "$t" in ''|*[!0-9]*) t=0 ;; esac
+  printf '%s %s %s\n' "$p" "$d" "$t"
 }
 
 hold_pid_live() { # hold_pid_live <pidfile> — is the recorded holder still OUR holder, still running
   local rec p d
   rec=$(hold_pid_read "$1") || return 1
-  p=${rec%% *}; d=${rec#* }
+  p=${rec%% *}; d=${rec#* }; d=${d%% *}
   kill -0 "$p" 2>/dev/null || return 1
   # Pids are reused, and this file outlives the shell that wrote it — so an `unhold` run tomorrow
   # over a stale file must never kill whatever inherited the number. The signature is the holder's
@@ -423,17 +427,25 @@ win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe run
 }
 
 hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait until Windows shows one
-  local name=$1 dest=$2 pid f deadline started_at=""
+  local name=$1 dest=$2 pid f deadline rec spawn_epoch
   f=$HOLD_STATE_DIR/hold-$name.pid
   mkdir -p "$HOLD_STATE_DIR" 2>/dev/null
   if hold_pid_live "$f"; then
-    pid=$(hold_pid_read "$f"); pid=${pid%% *}
+    rec=$(hold_pid_read "$f"); pid=${rec%% *}; spawn_epoch=${rec##* }
     echo "  wsl holder already running for $name (pid $pid)"
   else
+    # An EMPTY record is another run's claim, between its noclobber create and its pid write —
+    # removing it as stale would let both runs spawn a holder with only one pid recorded, which is
+    # the race this claim exists to prevent. Only an empty claim old enough to be abandoned (its
+    # creator died in that one fork) is cleared; a record with a pid in it has already been judged
+    # by hold_pid_live above.
+    if [ -e "$f" ] && [ ! -s "$f" ] && [ -z "$(find "$f" -mmin +1 2>/dev/null)" ]; then
+      echo "  wsl holder for $name is being created by another run ($f is claimed); nothing was started"
+      return 1
+    fi
     # Claim the record BEFORE spawning, with noclobber. Two `--hold` runs for one box would
     # otherwise both spawn a holder and the second write would erase the first pid, leaving a
-    # holder nobody can unhold and a VM pinned until the box reboots. A file left by a holder that
-    # is no longer ours (checked just above) is stale and goes first.
+    # holder nobody can unhold and a VM pinned until the box reboots.
     rm -f "$f" 2>/dev/null
     if ! ( set -C; : > "$f" ) 2>/dev/null; then
       if [ -e "$f" ]; then
@@ -446,10 +458,10 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
     ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
         "$dest" "$HOLD_CMD" >/dev/null 2>&1 &
     pid=$!
-    started_at=$SECONDS
+    spawn_epoch=$(date +%s)
     # An unrecordable holder is a leaked one: nothing would ever unhold it. Kill it rather than
     # leave it running unowned.
-    if ! printf '%s %s\n' "$pid" "$dest" > "$f" 2>/dev/null; then
+    if ! printf '%s %s %s\n' "$pid" "$dest" "$spawn_epoch" > "$f" 2>/dev/null; then
       kill "$pid" 2>/dev/null
       rm -f "$f" 2>/dev/null
       echo "  wsl holder on $name could NOT be recorded at $f — holder (pid $pid) killed rather than leaked"
@@ -466,10 +478,12 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
   deadline=$((SECONDS + HOLD_WAIT_SECONDS))
   while hold_pid_live "$f"; do
     if win_holder_seen "$dest"; then
-      # ...and our own holder still connected, at least HOLD_SETTLE_SECONDS after it was spawned —
+      # ...and our own holder still connected, at least HOLD_SETTLE_SECONDS after it was SPAWNED —
       # past its ConnectTimeout, so it is not one still negotiating beside somebody else's
-      # wsl.exe, and not one whose remote command has already ended (ssh would have exited).
-      while [ -n "$started_at" ] && [ $((SECONDS - started_at)) -lt "$HOLD_SETTLE_SECONDS" ]; do
+      # wsl.exe, and not one whose remote command has already ended (ssh would have exited). The
+      # bound is on the holder's age, not on this invocation's, so a run that REUSES a holder
+      # another run started a second ago waits out the rest of that holder's settle too.
+      while [ $(( $(date +%s) - spawn_epoch )) -lt "$HOLD_SETTLE_SECONDS" ]; do
         sleep 1
       done
       if hold_pid_live "$f"; then

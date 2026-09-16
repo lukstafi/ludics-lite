@@ -447,6 +447,38 @@ out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1); rc=$?
   || ko "a second --hold spawned another holder (rc=$rc) -- $out; $(cat "$SSH_LOG")"
 env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
 
+# A holder that another run is in the middle of creating is an EMPTY record, between its claim and
+# its pid write. Clearing that as stale would let both runs spawn a holder with one pid recorded --
+# the race the claim exists to prevent -- so a fresh empty claim is refused, and only an abandoned
+# one (older than a minute: its creator died inside a single fork) is cleared.
+rm -rf "$TMP/state"; mkdir -p "$TMP/state"; : > "$TMP/state/hold-rog.pid"
+: > "$SSH_LOG"
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'is being created by another run' <<<"$out" && ! grep -q 'sleep infinity' "$SSH_LOG" \
+  && ok "a claim another run is still filling in is not cleared, and no second holder is spawned (rc=$rc)" \
+  || ko "an in-progress claim was taken over (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+touch -t 202001010000 "$TMP/state/hold-rog.pid"
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'wsl holder started on rog' <<<"$out" \
+  && ok "...while an abandoned claim is taken over rather than blocking the hold forever (rc=$rc)" \
+  || ko "an abandoned claim blocked the hold (rc=$rc) -- $out"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+
+# The settle belongs to the HOLDER, not to the invocation: a run that reuses a holder another run
+# started a moment ago has to wait out the rest of that holder's settle, or it certifies an ssh
+# that may still be inside its ConnectTimeout.
+rm -rf "$TMP/state"
+held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
+started=$SECONDS
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
+      WAKE_LAB_HOLD_SETTLE_SECONDS=6 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+      SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=30 "$WL" kick-wsl --hold rog 2>&1); rc=$?
+elapsed=$((SECONDS - started))
+[ "$rc" -eq 0 ] && grep -q 'wsl holder already running for rog' <<<"$out" && [ "$elapsed" -ge 4 ] \
+  && ok "a reused holder still has to clear its own settle (${elapsed}s against a 6s settle)" \
+  || ko "reusing a holder skipped the settle (rc=$rc, ${elapsed}s) -- $out"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+
 # The wake path carries the hold too, and its final verdict is the hold's as well.
 wake_hold() { # wake_hold <tasklist output>
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WAIT_SECONDS=1 \
