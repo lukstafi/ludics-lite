@@ -401,17 +401,56 @@ lab_lock_take() { # lab_lock_take <box> <what> — 0 taken and held, 1 someone e
   return 0
 }
 
-# Refuse a reserved box before a power action that would take it away. `hibernate` terminates the
-# WSL VM outright (kick_wsl's note says so), `down` is a full host shutdown, and `sleep` suspends
-# the host under whatever is running on it — all three destroy a reserved workload exactly as
-# `wsl.exe --shutdown` does, so the interlock that covers the restart has to cover them too. Run in
-# a subshell by its caller: the lock is held across the action, not merely checked before it.
-guarded_power() { # guarded_power <verb> <box> — 3 when the box is reserved
-  if [ "$FORCE" != 1 ] && ! lab_lock_take "$2" "$1"; then
-    echo "  $1 REFUSED on $2: $(lab_lock_holder "$2")"
-    return 3
+# The whole power phase, with every box it acts on RESERVED from before its command is sent until
+# that box is confirmed down.
+#
+# `hibernate` terminates the WSL VM outright (kick_wsl's note says so), `down` is a full host
+# shutdown, and `sleep` suspends the host under whatever is running on it — all three destroy a
+# reserved workload exactly as `wsl.exe --shutdown` does, so the interlock that covers the restart
+# has to cover them too.
+#
+# And it has to cover the EFFECT, not the command. A dropped ssh means the suspend was INITIATED,
+# not that the host is gone: for the seconds or minutes until it actually goes down the box still
+# answers, so a reservation released when `power_action` returns lets another harness take the lock
+# and start work that the pending transition then destroys. That is round 1's mistake one layer
+# out — there the reservation did not cover the shutdown, here it did not cover what the shutdown
+# does — so the rule this file holds is that a reservation spans the effect, never the command.
+#
+# Recursive because bash 3.2 cannot allocate a descriptor per box: each level reserves ONE box on
+# its own fd 8 inside its own subshell, so an inner level's `exec 8>>` replaces only its inherited
+# copy of that descriptor while every outer level goes on holding its own. The innermost level acts
+# on the boxes that were reserved and confirms them together against one deadline, which is what
+# keeps the confirmation concurrent — confirming box by box would multiply the worst-case wait by
+# the number of boxes.
+POWER_ACTED=()
+POWER_REFUSED=()
+power_phase() { # power_phase <verb> <box...> — nonzero if any box was refused or never went down
+  local verb=$1; shift
+  local box rc=0
+  if [ $# -eq 0 ]; then
+    if [ ${#POWER_ACTED[@]} -gt 0 ]; then
+      for box in "${POWER_ACTED[@]}"; do power_action "$verb" "$box"; done
+      echo "confirming..."
+      # Its status is the phase's: a box that never went down is a failure of this command, and
+      # letting a trailing conditional swallow it would report success over the very line that
+      # says the suspend may not have taken.
+      confirm_down "${POWER_ACTED[@]}" || rc=1
+    fi
+    if [ ${#POWER_REFUSED[@]} -gt 0 ]; then
+      echo "$verb REFUSED on: ${POWER_REFUSED[*]} (the lab lock is held; wait for the holder, or --force to take the box anyway)"
+      rc=1
+    fi
+    return $rc
   fi
-  power_action "$1" "$2"
+  box=$1; shift
+  if [ "$FORCE" != 1 ] && ! lab_lock_take "$box" "$verb"; then
+    echo "  $verb REFUSED on $box: $(lab_lock_holder "$box")"
+    POWER_REFUSED+=("$box")
+    ( power_phase "$verb" "$@" )
+    return $?
+  fi
+  POWER_ACTED+=("$box")
+  ( power_phase "$verb" "$@" )
 }
 
 # The holder's own description of itself, for the refusal message. Never trusted for the decision
@@ -750,23 +789,9 @@ case "$VERB" in
     start_wsl "${TARGETS[@]}"; exit $?
     ;;
   sleep|hibernate|down)
-    ACTED=(); REFUSED=()
-    for t in "${TARGETS[@]}"; do
-      # A subshell per box: guarded_power holds the reservation on fd 8 for the length of the
-      # action, and each box's descriptor is its own.
-      ( guarded_power "$VERB" "$t" ); prc=$?
-      if [ "$prc" = 3 ]; then REFUSED+=("$t"); else ACTED+=("$t"); fi
-    done
-    # Only the boxes that were actually acted on are confirmed: polling a refused box for the
-    # DOWN signal would report the holder's live machine as a failure to go down.
-    if [ ${#ACTED[@]} -gt 0 ]; then
-      echo "confirming..."
-      confirm_down "${ACTED[@]}"
-    fi
-    if [ ${#REFUSED[@]} -gt 0 ]; then
-      echo "$VERB REFUSED on: ${REFUSED[*]} (the lab lock is held; wait for the holder, or --force to take the box anyway)"
-      exit 1
-    fi
+    # Only the boxes actually acted on are confirmed: polling a refused box for the DOWN signal
+    # would report the holder's live machine as a failure to go down.
+    power_phase "$VERB" "${TARGETS[@]}" || exit 1
     ;;
   wake)
     for t in "${TARGETS[@]}"; do echo "$t:"; wake "$t"; done

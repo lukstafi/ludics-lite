@@ -16,6 +16,17 @@ EXAMPLE="$HERE/wake-lab-hosts.example.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/wake-lab-test.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
+# The lab lock directory, for the WHOLE suite and not merely the cases that are about locking.
+# Every `restart-wsl` here reserves its box for real, so without this the suite takes flocks under
+# the developer's own ~/.local/state/wake-lab -- writing lock files into $HOME, blocking a genuine
+# sweep or wake-lab run for as long as a case holds one, and (since a wedged case's orphaned `ssh`
+# inherits the descriptor) leaving one held for minutes after the suite exits. Two suite runs
+# overlapping then fight over the real lab's locks and fail each other's restart cases, which is
+# how this was found. Exported, so every invocation below inherits it whether or not it passes
+# `env`.
+LOCKS="$TMP/locks"; mkdir -p "$LOCKS"
+WAKE_LAB_LOCK_DIR="$LOCKS"; export WAKE_LAB_LOCK_DIR
+
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "PASS: $*"; }
 ko() { fail=$((fail + 1)); echo "FAIL: $*"; }
@@ -73,17 +84,17 @@ while [ $# -gt 0 ]; do
 done
 line=$(printf '%s ::%s' "$dest" "$cmd")
 printf '%s\n' "$line" >> "$SSH_LOG"
-# $LOCK_PROBE names a lock file to test AT THE MOMENT a shutdown is issued, which is the only way
-# to observe the check/act race from outside: a restarter that merely probed the lock leaves it
-# free by the time the shutdown lands, and one that holds it does not.
+# $LOCK_PROBE names a lock file to test AT THE MOMENT each remote command is issued, which is the
+# only way to observe from outside whether a reservation really spans what it claims to. A
+# restarter that merely probed the lock leaves it free by the time the shutdown lands; a power
+# phase that releases at `power_action` leaves it free by the time the confirmation polls. Both
+# read as HELD if the reservation is right and FREE if it is not, and neither is visible from
+# inside the script.
 if [ -n "${LOCK_PROBE:-}" ]; then
-  case "$cmd" in
-    *--shutdown*)
-      if perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' \
-           <"$LOCK_PROBE" 2>/dev/null
-      then printf 'lock FREE during shutdown\n' >> "$SSH_LOG"
-      else printf 'lock HELD during shutdown\n' >> "$SSH_LOG"; fi ;;
-  esac
+  if perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' \
+       <"$LOCK_PROBE" 2>/dev/null
+  then printf 'lock FREE during%s\n' "$cmd" >> "$SSH_LOG"
+  else printf 'lock HELD during%s\n' "$cmd" >> "$SSH_LOG"; fi
 fi
 [ -n "${SSH_DELAY:-}" ] && sleep "$SSH_DELAY"
 [ -n "${SSH_HANG:-}" ] && grep -qE "$SSH_HANG" <<<"$line" && exec sleep 900
@@ -465,7 +476,6 @@ reap_naps
 # fault, and it was misattributed to the GPU autotune tests for two days. The lock is the interlock
 # that was missing; these cases pin that it actually refuses, and that it refuses ONLY the
 # destructive path.
-LOCKS="$TMP/locks"; mkdir -p "$LOCKS"
 # Held the way the sweep holds it: a descriptor kept open, flock taken by a perl that exits. The
 # lock belongs to the open file description, so it outlives that perl and dies with this shell --
 # which is the property the whole contract rests on, so take it here exactly as the real holder does
@@ -567,7 +577,7 @@ out=$(wl_locked restart-wsl minix); rc=$?
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_WSL_WAIT_SECONDS=1 \
     SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" LOCK_PROBE="$LOCKS/rog.lock" \
     "$WL" restart-wsl rog 2>&1 8>&-); rc=$?
-grep -q '^lock HELD during shutdown$' "$SSH_LOG" \
+grep -q '^lock HELD during .*--shutdown$' "$SSH_LOG" \
   && ok "the box stays reserved for the length of its own restart (rc=$rc)" \
   || ko "the lock was free when the shutdown landed — the check/act race is open: $(cat "$SSH_LOG")"
 
@@ -580,7 +590,7 @@ else
 fi
 for verb in hibernate down sleep; do
   : > "$SSH_LOG"
-  out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" \
+  out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
       SSH_UP="minix-lan minix-amd-win" "$WL" "$verb" minix 2>&1 8>&-); rc=$?
   if [ "$rc" -ne 0 ] && grep -q "$verb REFUSED on: minix" <<<"$out" && ! grep -q 'shutdown /\|SetSuspendState' "$SSH_LOG"; then
     ok "$verb refuses a reserved box, and sends nothing (rc=$rc)"
@@ -595,19 +605,38 @@ grep -q 'confirming' <<<"$out" \
   || ok "...and a refused box is not confirmed down"
 # --force is the same override here as everywhere else.
 : > "$SSH_LOG"
-out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" \
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
     SSH_UP="minix-lan minix-amd-win" "$WL" hibernate --force minix 2>&1 8>&-); rc=$?
 grep -q 'shutdown /h' "$SSH_LOG" \
   && ok "--force hibernates a reserved box anyway (rc=$rc)" \
   || ko "--force did not override the lock for a power action (rc=$rc) -- $out $(cat "$SSH_LOG")"
 # A free box is unaffected.
 : > "$SSH_LOG"
-out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" \
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
     SSH_UP="rog-lan rog-nv-win" "$WL" hibernate rog 2>&1 8>&-); rc=$?
 grep -q 'shutdown /h' "$SSH_LOG" && grep -q 'confirming' <<<"$out" \
   && ok "a box whose lock is free hibernates exactly as before (rc=$rc)" \
   || ko "the lock broke the ordinary power action (rc=$rc) -- $out $(cat "$SSH_LOG")"
 exec 8>&-
+
+# The reservation spans the EFFECT, not the command. A dropped ssh means the suspend was
+# INITIATED; until the box actually goes down it still answers, so a reservation released when
+# `power_action` returns lets another harness take the lock and start work the pending transition
+# destroys. Observed the same way as the restart race: the shim tests the lock as each command is
+# issued, and the CONFIRMATION probes come after the power command — so the last reading is the one
+# that says whether the box was still reserved while it was going down.
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="rog-lan rog-nv-win" LOCK_PROBE="$LOCKS/rog.lock" \
+    "$WL" hibernate rog 2>&1 8>&-); rc=$?
+grep -q 'shutdown /h' "$SSH_LOG" \
+  && ok "a free box is hibernated (rc=$rc)" \
+  || ko "the power action never went out (rc=$rc) -- $out $(cat "$SSH_LOG")"
+# More than one reading (so the confirmation really did probe after the power command), and not
+# one of them free.
+[ "$(grep -c '^lock ' "$SSH_LOG")" -gt 1 ] && ! grep -q '^lock FREE' "$SSH_LOG" \
+  && ok "...and stays reserved through the confirmation, not just the command" \
+  || ko "the reservation was released before the box was down: $(grep '^lock ' "$SSH_LOG")"
 
 # The path is the whole contract with the sweep, so it must not need the site table: the harness
 # asking where to put its flock runs from a checkout with no business holding this lab's MACs.
