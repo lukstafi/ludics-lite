@@ -241,12 +241,14 @@ echo "      events seen on the tip: $(jq -r '[.[].event] | unique | join(" ")' <
 echo "      status/conclusion seen: $(jq -r '[.[] | "\(.status)/\(.conclusion)"] | unique | join(" ")' <<<"$runs")"
 fi
 
-# Newest-first is what cmd_base's supersession fold rests on: the first row seen per key is the
-# one that counts, and cmd_base takes the feed's order as given. run_signal no longer does — it
-# sorts by (created_at desc, id desc) itself (ludics-lite#70) — so this claim is about cmd_base's
-# reliance, not about a shape that would change the gate's verdict on a head. One row proves
-# nothing about order, so the claim is made on the tip when it has several, else on the
-# repository's whole feed, which the same endpoint serves.
+# Newest-first on this feed is no longer load-bearing for any fold: run_signal sorts its rows on
+# (created_at desc, id desc) itself (ludics-lite#70), and since ludics-lite#90 so does cmd_base —
+# which reads a different endpoint besides (the per-workflow, branch-and-event feed pinned in its
+# own section below, where the order still decides WHICH rows a per_page=10 window holds). The
+# claim stays because this endpoint IS read unpaged at per_page=100 and an order that moved would
+# change which runs a head's page carries; one row proves nothing about order, so it is made on
+# the tip when it has several, else on the repository's whole feed, which the same endpoint
+# serves.
 if [ "$(jq length <<<"$runs")" -ge 2 ]; then
   pin "runs?head_sha= comes back newest-first (created_at non-increasing, on the tip's $(jq length <<<"$runs") rows)" \
     '[.[].created_at] | . == (sort | reverse)' "$runs"
@@ -317,6 +319,92 @@ if is_num "$wid"; then
   esac
 else
   skip "workflow_id resolves to a workflow file" "$UNUSABLE"
+fi
+
+# --- actions/workflows, and actions/workflows/<id>/runs?branch=&event=push -----------------------
+# The two endpoints `cmd_base` reads, and neither was addressed here until ludics-lite#90: the
+# suites' fixtures imitated both shapes and nothing checked the imitation against the live API —
+# #41's class exactly. `base` is what every worker reads at session start, what the coordinator
+# reads after a merge, and what base-watch files issues from, so a field that moved here is a
+# false green or a false red with no fixture able to notice.
+section "actions/workflows?per_page=100 and actions/workflows/<id>/runs?branch=&event=push — cmd_base's feeds"
+wfs=$(api "repos/$REPO/actions/workflows?per_page=100")
+pin "the workflow list is workflows[], with total_count beside it" \
+  '(.workflows | type == "array") and (.total_count | type == "number")' "$wfs"
+wflist=$(jq -c '.workflows // null' <<<"$wfs")
+if ! is_list "$wflist" || [ "$(jq length <<<"$wflist")" -eq 0 ]; then
+  skip "the row-level claims on the workflow list" "$UNUSABLE"
+  wflist='[]'
+else
+  # The projection is `[(.id | tostring), .name] | @tsv`: two columns, and a name carrying a TAB
+  # would shift the second past the first through the fold's tab-IFS `read`. The id is what the
+  # fold groups on — two workflow FILES can share a display name — and `is_advisory` matches on
+  # the name, so an empty one would silently opt a workflow out of that classification.
+  pin "every workflow carries the two fields the row projection reads: a numeric id and a non-empty name with no tab in it" \
+    'all(.[]; (.id | type == "number") and (.name | type == "string" and length > 0 and (test("\t") | not)))' "$wflist"
+  pin "every workflow carries the path the paths-ignore read asks for, under .github/workflows/" \
+    'all(.[]; .path | type == "string" and startswith(".github/workflows/"))' "$wflist"
+  # One page of 100 is all cmd_base asks for: past that a workflow simply vanishes from the
+  # report, and its standing verdict with it. Worth knowing before it happens, not after.
+  pin "this repository's workflows fit the single page cmd_base reads ($(jq length <<<"$wflist") of a page of 100)" \
+    '(.total_count // 0) <= 100 and ((.workflows | length) == (.total_count // 0))' "$wfs"
+fi
+
+# The runs feed, asked per workflow rather than as one flat page: on an active branch a page of
+# mixed runs can entirely postdate an infrequent workflow's newest run. The anchor is the first
+# listed workflow that actually has push runs on the base — a workflow with none is the `norun`
+# shape the wait loop has its own grace for, a valid answer and not drift.
+bruns='[]'
+banchor=""
+bname=""
+for wf_id in $(jq -r '.[].id // empty' <<<"$wflist"); do
+  is_num "$wf_id" || continue
+  bruns=$(api "repos/$REPO/actions/workflows/$wf_id/runs?branch=$(encode_ref "$BASE")&event=push&per_page=10" | pages workflow_runs)
+  is_list "$bruns" || { bruns='[]'; continue; }
+  if [ "$(jq length <<<"$bruns")" -gt 0 ]; then
+    banchor="$wf_id"
+    bname=$(jq -r --argjson w "$wf_id" '[.[] | select(.id == $w)][0].name // empty' <<<"$wflist")
+    break
+  fi
+done
+if [ -z "$banchor" ]; then
+  skip "the branch-and-event runs feed" "no listed workflow has a push run on $BASE (every one of them is the norun shape)"
+else
+  echo "      anchored on workflow $banchor (${bname:-?}) with $(jq length <<<"$bruns") push run(s) on $BASE"
+  pin "the feed is workflow_runs[]" 'type == "array"' "$bruns"
+  # The projection cmd_base reads, column by column: workflow_id (the fold's grouping key), name,
+  # status, conclusion, head_sha, created_at, html_url, and — since ludics-lite#81 — id, which
+  # anchors the jobs read the red report spends and, since #90, breaks a same-second tie.
+  pin "every row carries the eight fields the fold projects: numeric workflow_id and id, string name and status, a 40-hex head_sha, an ISO created_at, and an html_url" \
+    "all(.[]; (.workflow_id | type == \"number\") and (.id | type == \"number\")
+              and (.name | type == \"string\") and (.status | type == \"string\")
+              and (.head_sha | test(\"$HEX40\")) and (.created_at | test(\"$ISO\"))
+              and (.html_url | type == \"string\" and length > 0))" "$bruns"
+  # Asserted PRESENT and then null-or-known: jq reads an absent key as null, and the projection's
+  # `.conclusion // "pending"` would render a dropped field as pending forever — a workflow stuck
+  # at "no verdict" on a branch that is in fact green or red, the silent direction.
+  pin "every row carries conclusion (present, null until completed), in the vocabulary conclusion_class classifies" \
+    "all(.[]; has(\"conclusion\") and (.conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c))))" "$bruns"
+  pin "status strings are in the known vocabulary" \
+    "all(.[]; .status as \$s | $STATUS_VOCAB | index(\$s))" "$bruns"
+  pin "the workflow_id in the path is the workflow every row belongs to (the per-workflow query really is per workflow)" \
+    'all(.[]; .workflow_id == $w)' "$bruns" --argjson w "$banchor"
+  pin "the event= filter filters: every row is a push run" 'all(.[]; .event == "push")' "$bruns"
+  pin "the branch= filter filters: every row's head_branch is $BASE" \
+    'all(.[]; .head_branch == $b)' "$bruns" --arg b "$BASE"
+  # Newest-first is what makes `per_page=10` a WINDOW of the newest ten runs rather than ten
+  # arbitrary ones: cmd_base's fold and base_red_detail's streak walk both read that window as a
+  # history, and a page ordered any other way would report a red as starting at the wrong commit
+  # — or hide a newer verdict behind an older one entirely. Since ludics-lite#90 the fold no
+  # longer depends on the order WITHIN the page (it sorts each page on (created_at desc, id desc)
+  # itself), so this claim is now about which rows the page holds, not about which of them wins.
+  if [ "$(jq length <<<"$bruns")" -ge 2 ]; then
+    pin "the page comes back newest-first (created_at non-increasing over its $(jq length <<<"$bruns") rows), so per_page=10 is the newest ten" \
+      '[.[].created_at] | . == (sort | reverse)' "$bruns"
+    echo "      created_at ties in this window: $(jq '[group_by(.created_at)[] | select(length > 1)] | length' <<<"$bruns") group(s) — settled by the higher run id since ludics-lite#90"
+  else
+    skip "the page comes back newest-first" "one push run on $BASE for this workflow: a single row shows no order"
+  fi
 fi
 
 # --- actions/runs/<id>/jobs ---------------------------------------------------------------------
