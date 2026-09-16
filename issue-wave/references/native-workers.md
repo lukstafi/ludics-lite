@@ -52,7 +52,14 @@ runtime identity, applicable project guidance, test bounds, ship-pr and issue-cl
 and after-merge hand-back mode. Require **an explicit command working directory for every shell
 call and absolute assigned paths for edits**. Runtime children share the environment: cooperative
 cross-path reads are allowed, but each checkout has one writer. Never rely on inherited cwd as
-isolation. Workers must ask the coordinator for an execution assignment before launching fleet tests or
+isolation. The same holds for scratch space: every native worker of a wave shares the
+COORDINATOR's scratchpad directory (it is keyed on the coordinator's session, not the worker's),
+so the brief requires every scratch file there to carry the issue number as a prefix (or to
+live in a per-issue subdirectory of that scratchpad) - never inside the worker's worktree, which
+must be clean of local and ignored data at close-out - and a body file re-read immediately
+before the `gh` command that consumes it - on
+2026-09-16 two workers overwrote each other's `pr-body.md` there minutes apart, and only timing
+kept the wrong body off a PR. Workers must ask the coordinator for an execution assignment before launching fleet tests or
 experiments beyond their standing iteration reservation ([executions.md](executions.md#standing-iteration-reservation)), return the actual runner
 handle/log/verdict, and leave worktree cleanup to the coordinator. Brief text is
 model-agnostic: the commit trailer says "credit your own model" rather than naming one (an Opus
