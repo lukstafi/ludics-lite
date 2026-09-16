@@ -26,12 +26,19 @@
 #
 # THE GRAMMAR. Comment lines are dropped (shell and jq comments alike open with `#`). What is
 # left is grouped into logical expressions: a line that begins with `|` continues the line above
-# it, anything else starts a new one. Every expression containing `capture(` must carry both
-#   - a `[` with no `]` between it and the `capture(`, and
-#   - a `]` followed by `| first` or `| last`.
-# That is an approximation of "the capture is immediately inside a collection constructor whose
-# result is read back as a value", and it is the approximation on purpose: a rule a reader can
-# check by eye is a rule that gets kept.
+# it, anything else starts a new one. Then EACH `capture(` in an expression is checked on its own,
+# against its own brackets:
+#   - the nearest `[` before it, with no `]` in between, must exist; and
+#   - the `]` that closes THAT `[` (by depth) must be read back immediately with `| first` or
+#     `| last`.
+# Per occurrence, never per expression: an existential test over the whole expression certifies
+# `([capture("a")] | first), capture("b")` on the strength of the first capture's brackets while
+# the second one is bare (review of ludics-lite#162, round 1).
+#
+# The depth count reads `[` and `]` wherever they fall, regex character classes included. Those
+# balance in practice (`[^|]*`, `[0-9a-f]`), and a class that did not — `[^][]`, say — would
+# unbalance the count and REFUSE, which is the safe direction: the guard would ask for a rewrite
+# of a line that is fine, not pass one that is not.
 #
 # Usage: check-jq-shapes.sh [file...]   (default: ship-pr/scripts/pr-review.sh)
 # Exit 0 when every capture is in the safe shape, 1 when one is not, 2 on a usage error.
@@ -60,18 +67,41 @@ for f in "${files[@]}"; do
     exit 2
   fi
   awk -v file="$f" '
-    function flush(   i, txt) {
+    # Is the capture( that starts at <pos> in <txt> inside its own [...] read back with
+    # first/last? Its own: the brackets are found from this occurrence, so a safe capture
+    # elsewhere in the same expression vouches for nothing.
+    function safe_capture(txt, pos,   i, ch, open, depth, j, rest) {
+      open = 0
+      for (i = pos - 1; i >= 1; i--) {
+        ch = substr(txt, i, 1)
+        if (ch == "]") return 0        # a closed collection, not the one this capture is in
+        if (ch == "[") { open = i; break }
+      }
+      if (open == 0) return 0
+      depth = 0
+      for (j = open; j <= length(txt); j++) {
+        ch = substr(txt, j, 1)
+        if (ch == "[") depth++
+        else if (ch == "]") { depth--; if (depth == 0) break }
+      }
+      if (depth != 0) return 0         # unbalanced: refuse rather than guess
+      rest = substr(txt, j + 1)
+      return (rest ~ /^[ \t]*\|[ \t]*(first|last)([^A-Za-z0-9_]|$)/)
+    }
+    function flush(   i, txt, p, k, why) {
       if (n == 0) return
       txt = ""
       for (i = 1; i <= n; i++) txt = txt (i > 1 ? " " : "") buf[i]
-      if (txt ~ /capture\(/) {
-        if (txt !~ /\[[^]]*capture\(/ || txt !~ /\][ \t]*\|[ \t]*(first|last)/) {
-          why = "a `capture(` that is not `[capture(...)] | first` (or `| last`): an unmatched capture yields NOTHING, which deletes the expression around it instead of defaulting"
-          if (txt ~ /test\(/)
-            why = why " — and this expression also carries a `test(`, the ludics-lite#104 shape: a guard pattern and a near-identical re-matching pattern that must agree forever, with nothing to notice the day they stop"
-          printf "::error file=%s,line=%d::%s:%d: %s\n", file, start, file, start, why
-          bad = 1
-        }
+      p = 0
+      while ((k = index(substr(txt, p + 1), "capture(")) > 0) {
+        p = p + k
+        if (safe_capture(txt, p)) continue
+        why = "a `capture(` that is not `[capture(...)] | first` (or `| last`): an unmatched capture yields NOTHING, which deletes the expression around it instead of defaulting"
+        if (txt ~ /test\(/)
+          why = why " — and this expression also carries a `test(`, the ludics-lite#104 shape: a guard pattern and a near-identical re-matching pattern that must agree forever, with nothing to notice the day they stop"
+        printf "::error file=%s,line=%d::%s:%d: %s\n", file, start, file, start, why
+        bad = 1
+        break                          # one refusal per expression; the rest read the same
       }
       n = 0
     }

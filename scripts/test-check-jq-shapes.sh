@@ -113,6 +113,33 @@ jq -r '
 EOF
 )"
 
+# Round 1 of the review of ludics-lite#162: the rule is per OCCURRENCE, not per expression. An
+# existential test over the whole expression certifies this line on the strength of the first
+# capture's brackets while the second one is bare. Its control is the same line with both
+# captures bracketed, which must pass.
+expect "a bare capture beside a bracketed one is refused" 1 "$REFUSAL" -- \
+  "$CJ" "$(probe bad_second_capture <<'EOF'
+jq -r '([capture("a")] | first), capture("b")' <<<"$raw"
+EOF
+)"
+expect "two bracketed captures on one expression pass" 0 'every capture( is bracketed' -- \
+  "$CJ" "$(probe safe_two_captures <<'EOF'
+jq -r '([capture("a")] | first), ([capture("b")] | first)' <<<"$raw"
+EOF
+)"
+# The mirror: the bare capture FIRST, so a scan that stopped at the first safe one would miss it.
+expect "a bare capture before a bracketed one is refused" 1 "$REFUSAL" -- \
+  "$CJ" "$(probe bad_first_capture <<'EOF'
+jq -r 'capture("a"), ([capture("b")] | first)' <<<"$raw"
+EOF
+)"
+# The brackets must be the capture's OWN: a closed `[...]` between them is a different collection.
+expect "a capture after a closed collection is refused" 1 "$REFUSAL" -- \
+  "$CJ" "$(probe bad_foreign_brackets <<'EOF'
+jq -r '[.ids[]] | capture($rc).s | first' <<<"$raw"
+EOF
+)"
+
 expect "the refusal names the line" 1 ":3:" -- \
   "$CJ" "$(probe bad_line_number <<'EOF'
 # a comment, which is not a line of the expression below

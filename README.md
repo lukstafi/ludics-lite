@@ -235,8 +235,12 @@ patch that parsed fine. Nothing errors, so nothing catches it. Five such sites h
 across three PRs (ludics-lite#84 three, #104 a fourth, #89 a fifth) while `[capture(…)] | first`
 was documented only in prose beside one of them. The guard is deliberately grep-shaped rather
 than a jq parser: comment lines are dropped, a line beginning with `|` continues the line above
-it, and every resulting expression carrying a `capture(` must show a `[` with no `]` before it
-and a `]` read back with `| first` or `| last`. The issue's second proposed rule — refuse a
+it, and then EACH `capture(` in the resulting expression is checked against its own brackets —
+the nearest `[` before it with no `]` in between, and the `]` that closes that `[` by depth, read
+back immediately with `| first` or `| last`. Per occurrence rather than per expression, because
+an existential test certifies `([capture("a")] | first), capture("b")` on the first capture's
+brackets while the second is bare; a bracket count that a regex character class unbalanced would
+refuse, which is the direction that asks for a rewrite rather than passing a bare capture. The issue's second proposed rule — refuse a
 `test(` and a `capture(` on one expression, the #104 shape — collapses into that one, since what
 makes the pair dangerous is the unbracketed capture and not the pairing; a pair that satisfies
 the rule passes, and one that does not is refused with #104 named in the message.
