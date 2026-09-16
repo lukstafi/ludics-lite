@@ -915,6 +915,31 @@ elapsed=$((SECONDS - started))
   || ko "reading the command's output waited for the holder (${elapsed}s): something of the lane's holds the pipe"
 env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
 
+# A settle cut short by the step's own deadline is not a settle served: the holder has not shown
+# it outlived its own ConnectTimeout, so the hold must fail rather than report it observed.
+reset_hold_state
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
+      WAKE_LAB_HOLD_SETTLE_SECONDS=30 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+      SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=45 "$WL" kick-wsl --hold rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ! grep -q 'holder observed on rog' <<<"$out" \
+  && grep -q 'wsl HOLD FAILED on: rog' <<<"$out" \
+  && ok "a settle the step's deadline cut short is not reported as a holder observed (rc=$rc)" \
+  || ko "an unserved settle read as success (rc=$rc) -- $out"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+# ...and the lock process is identified before it is signalled, exactly as the holder is: a record
+# outlives both, and by the time anyone runs `unhold` the number may belong to something else.
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 45 >/dev/null 2>&1
+sc_pid=$(cut -d' ' -f4 "$TMP/state/hold-rog.pid" 2>/dev/null)
+sleep 30 & bystander=$!
+printf '%s rog-lan %s %s\n' "$(cut -d' ' -f1 "$TMP/state/hold-rog.pid")" "$(date +%s)" "$bystander" \
+  > "$TMP/state/hold-rog.pid"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+alive "$bystander" \
+  && ok "a recorded lock pid that is not the lock process is left alone by unhold" \
+  || ko "unhold killed an unrelated process recorded as the lock"
+kill "$bystander" 2>/dev/null; kill "$sc_pid" 2>/dev/null; reset_hold_state
+
 # The holder's signature is read from `ps`, and macOS `ps` truncates the argument list to the
 # output width unless it is asked not to. This command line runs well past 79 columns, so a
 # truncated reading matches nothing and every live holder would look like somebody else's process

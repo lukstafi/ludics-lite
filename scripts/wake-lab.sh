@@ -808,7 +808,8 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
     # output — for the whole life of the lane. Those descriptors are close-on-exec, so exec'ing
     # anything sheds them; fd 8, opened here, is not, so the lock survives. perl is already the
     # lab lock's own dependency.
-    perl -e 'my $p = shift; while (kill 0, $p) { sleep 1 }' "$pid" >/dev/null 2>&1 </dev/null &
+    perl -e 'my $tag = "wake-lab-hold-lock"; my $p = shift; while (kill 0, $p) { sleep 1 }' \
+      "$pid" >/dev/null 2>&1 </dev/null &
     sidecar=$!
     spawn_epoch=$(date +%s); spawned=1
     # An unrecordable holder is a leaked one: nothing would ever unhold it. Kill it rather than
@@ -851,7 +852,11 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
         [ "$SECONDS" -ge "$deadline" ] && break
         sleep 1
       done
-      if hold_pid_live "$f"; then
+      # The settle must have been SERVED, not merely attempted: the loop above also ends on the
+      # step's deadline, and a settle cut short by it is a holder that has not shown it outlived
+      # its own ConnectTimeout. Reporting that as observed would be the claim this whole check
+      # exists to make, made without the evidence.
+      if [ $(( $(date +%s) - spawn_epoch )) -ge "$HOLD_SETTLE_SECONDS" ] && hold_pid_live "$f"; then
         echo "  wsl holder observed on $name (wsl.exe on the Windows side, holder connected past its ${HOLD_SETTLE_SECONDS}s settle)"
         return 0
       fi
@@ -898,8 +903,13 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0, 
   rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
   read -r p d t sc <<<"${rec:-}"; : "$d" "$t"
   # The lock sidecar goes with the holder: it exits on its own once the holder is gone, and
-  # killing it here is what makes the box free again immediately rather than a poll later.
-  [ -n "${sc:-}" ] && [ "${sc:-0}" != 0 ] && kill "$sc" 2>/dev/null
+  # killing it here is what makes the box free again immediately rather than a poll later. Its pid
+  # is checked the way the holder's is — a record outlives both processes, and by the time anyone
+  # runs `unhold` the number may belong to something else entirely.
+  if [ -n "${sc:-}" ] && [ "${sc:-0}" != 0 ] &&
+     ps -ww -o args= -p "$sc" 2>/dev/null | grep -q 'wake-lab-hold-lock'; then
+    kill "$sc" 2>/dev/null
+  fi
   if hold_pid_live "$f"; then
     # Killing the local client closes the channel and sshd ends the command it was running. If a
     # wsl.exe is ever orphaned on the Windows side despite that, `restart-wsl` clears it: the
