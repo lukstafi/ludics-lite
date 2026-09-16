@@ -357,18 +357,23 @@ grep -q '^minix-lan :: wsl.exe --shutdown$' "$SSH_LOG" && grep -q '^minix-lan ::
   && ok "...and the report still names each box's own outcome (rc=$rc)" \
   || ko "the wedged box's outcome was pinned on its neighbour (rc=$rc) -- $out"
 # ...and they really are kicked at once, not merely bounded one after another: two boxes wedged
-# against a 6s cap cost one cap between them concurrently and two serialized. Both guests answer,
-# so the poll returns on its first round and the wall clock here is the kicks' alone.
+# against a 12s cap cost one cap between them concurrently and two serialized. The numbers have to
+# respect the poll's 5s granularity, because a guest probe that misses its first round adds
+# exactly one of those to either arm: concurrent is 12s or 17s, serialized 24s or 29s, so 20s is
+# the only threshold with a clear margin on both sides. And PROBE_CAP is left at its default --
+# shrinking it to a couple of seconds, as the wedge cases above can afford to, is what makes that
+# missed round likely in the first place: on a loaded machine the shim's own fork can outlast a 3s
+# cap, and the probe then fails for reasons that have nothing to do with what is being measured.
 started=$SECONDS
-out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_WSL_START_CAP=6 \
-    WAKE_LAB_PROBE_CAP=3 SSH_HANG='wsl\.exe -d Ubuntu' SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" \
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_WSL_START_CAP=12 \
+    SSH_HANG='wsl\.exe -d Ubuntu' SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" \
     "$WL" kick-wsl rog minix 2>&1); rc=$?
 elapsed=$((SECONDS - started))
 [ "$rc" -eq 0 ] && grep -q '^wsl up$' <<<"$out" \
   && ok "two wedged start probes both fall back to their own guest (rc=$rc)" \
   || ko "the two-box fallback did not end in wsl up (rc=$rc) -- $out"
-[ "$elapsed" -lt 10 ] && ok "...costing one cap between them, not one each (${elapsed}s)" \
-  || ko "the kick still runs box by box: ${elapsed}s for two boxes against a 6s cap"
+[ "$elapsed" -lt 20 ] && ok "...costing one cap between them, not one each (${elapsed}s)" \
+  || ko "the kick still runs box by box: ${elapsed}s for two boxes against a 12s cap"
 
 # --- a capped call leaves nothing of itself behind ----------------------------------------------
 # capped()'s watchdog naps in a child. Killing the watchdog alone left that nap orphaned for the
