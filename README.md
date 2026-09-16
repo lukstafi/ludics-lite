@@ -368,8 +368,20 @@ commit GitHub cannot build says `CONFLICTS` on every state and never "the next m
 GitHub still computing is not a conflict, a failed PR read cannot hide a 👍 and is `unknown`
 (exit 3) only where the head SHA decides the state, one PR read serves a whole `status`, and a
 `watch` that returns on a round prints the base-drift read on stderr, against the base branch's
-tip, leaving stdout byte-identical to `poll`'s. `test-pr-review-base-drift.sh` pins the other
-half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
+tip, leaving stdout byte-identical to `poll`'s. It also pins the round's ONE observation
+(ludics-lite#95): a watch round reads the comments, the reviews and the PR once each, publishes
+them, and the state reported beside that round is computed from those same bytes instead of a
+second read a second later — the comments and reviews feeds, the PR, and a new review's own
+comments endpoint each drop from three reads a window to two, one for the state the watch opens
+with and one for the round (the third PR read on a landing round is the base-drift read, a
+different question). Three things the second read was carrying are pinned with it: the round
+reads its head AFTER its feeds, so a push landing on the round's feed read leaves the item
+classified against the new head rather than matched to the one it named (the ludics-lite#47
+ordering, now a property of the round); a push landing AFTER the round's head read cannot
+re-anchor the state to a head the round classified nothing against (the P2 rebutted in the review
+of ludics-lite#84); and a round that did not answer publishes nothing, so the state read after it
+reads the feeds itself, as does a `status` asked after the watch has ended.
+`test-pr-review-base-drift.sh` pins the other half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
 which stands still on a conflicted PR.
 
 `test-pr-review-watch.sh` drives what ends a `watch` (ludics-lite#72), against a fixture that
