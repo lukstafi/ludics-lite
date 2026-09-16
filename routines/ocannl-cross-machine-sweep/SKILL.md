@@ -147,8 +147,11 @@ notify-worthy (step 6):
 
 If that fires, DO NOT launch the sweep. An empty `OCANNL_TOOL_SWEEP_LOCAL_BOX` is not "let the
 script decide": it dies with the same exit 2 as any other unusable environment, which reads like
-something the corrected relaunch below could fix and is not. Go straight to step 5 and report the
-missing site configuration as the finding, then notify in step 6.
+something the corrected relaunch below could fix and is not. Release step 1's holders first
+(`~/bin/wake-lab.sh unhold rog minix`) — they are already running by then, nothing else ends them,
+and this path never reaches the cleanup below — then go straight to step 5 and report the missing
+site configuration as the finding, and notify in step 6. The same goes for any other exit from
+this step that never launches the sweep: unhold before you leave it.
 
 A typo in the file is caught by the script itself: it checks that every declared box has a sweep
 unit, so a misspelled local ID dies with `declared measurement box 'm4-max' has no sweep unit`.
@@ -190,8 +193,9 @@ the stopped lane did write is a result like the rest, and no
 skip-coverage report was written. Do not relaunch for it: an unwritable state directory is the
 finding, and it is notify-worthy.
 
-When the run is over — however it ended, including a startup exit 2 that swept nothing — release
-the holders step 1 took:
+When you leave this step — however that happens: the run finished, it died at startup, or one of
+the refusals above sent you to step 5 without launching anything — release the holders step 1
+took:
 
     ~/bin/wake-lab.sh unhold rog minix
 

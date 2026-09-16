@@ -421,19 +421,31 @@ expect "...and --restart-wsl --hold without --wait" 1 "hold needs a WSL start" -
 
 # An unrecordable holder is a leaked one: nothing would ever unhold it, and the VM would stay
 # pinned until the box reboots.
-rm -rf "$TMP/state"; : > "$TMP/state"      # a FILE where the state directory should be
+rm -rf "$TMP/state"; mkdir -p "$TMP/state"; chmod 555 "$TMP/state"   # unwritable state directory
+: > "$SSH_LOG"
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" 2>&1); rc=$?
-[ "$rc" -ne 0 ] && grep -q 'could NOT be recorded' <<<"$out" && grep -q 'wsl HOLD FAILED on: rog' <<<"$out" \
-  && ok "a holder whose pid cannot be recorded is killed, not leaked, and the hold fails (rc=$rc)" \
-  || ko "an unrecordable holder did not fail the hold (rc=$rc) -- $out"
-leaked=$(sed -n 's/.*holder (pid \([0-9]*\)) killed.*/\1/p' <<<"$out" | head -1)
-for _ in 1 2 3 4 5; do [ -n "$leaked" ] && kill -0 "$leaked" 2>/dev/null || break; sleep 1; done
-if [ -n "$leaked" ] && ! kill -0 "$leaked" 2>/dev/null; then
-  ok "...with that holder process (pid $leaked) really gone, not left pinning the VM"
-else
-  ko "the unrecorded holder is still running (pid ${leaked:-unnamed in the message})"
-fi
-rm -f "$TMP/state"
+[ "$rc" -ne 0 ] && grep -q 'wsl HOLD FAILED on: rog' <<<"$out" \
+  && grep -q 'could NOT be recorded at .*; nothing was started' <<<"$out" \
+  && ok "a holder that cannot be recorded fails the hold, and is never spawned to begin with (rc=$rc)" \
+  || ko "an unrecordable holder did not fail the hold, or was spawned before its record (rc=$rc) -- $out"
+# The wording is the evidence for the ordering: the record is claimed (noclobber) BEFORE the ssh
+# exists, so there is no window in which a holder runs that nothing can unhold. Spawning first and
+# killing on a failed write leaves that window, and says "killed rather than leaked" instead.
+grep -q 'sleep infinity' "$SSH_LOG" \
+  && ko "a holder was spawned before its record was claimed: $(cat "$SSH_LOG")" \
+  || ok "...with no holder command issued at all"
+chmod 755 "$TMP/state"; rm -rf "$TMP/state"
+# The same claim serializes two --hold runs for one box: the second reuses the live holder rather
+# than spawning a second one whose pid the first would never see.
+rm -rf "$TMP/state"
+held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
+: > "$SSH_LOG"
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'wsl holder already running for rog' <<<"$out" \
+  && ! grep -q 'sleep infinity' "$SSH_LOG" \
+  && ok "a second --hold over a live holder reuses it and spawns no second one (rc=$rc)" \
+  || ko "a second --hold spawned another holder (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
 
 # The wake path carries the hold too, and its final verdict is the hold's as well.
 wake_hold() { # wake_hold <tasklist output>
@@ -502,6 +514,16 @@ out=$(env WAKE_LAB_SWEEP_HOURS=08-11 WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL
 [ "$rc" -eq 0 ] && grep -q 'uncovered hours: 8 9' <<<"$out" && ! grep -qi 'value too great\|base' <<<"$out" \
   && ok "...and a zero-padded sweep window is read as decimal, not as octal (rc=$rc)" \
   || ko "a zero-padded window aborted the warn-only check (rc=$rc) -- $out"
+# A window that is not a pair of clock hours is a configuration finding, not an hour to judge:
+# `7`, `7--11` and `24-25` all survived a check that read only the two extracted endpoints.
+for bad in 7 7--11 24-25 morning; do
+  out=$(env WAKE_LAB_SWEEP_HOURS="$bad" WAKE_LAB_HOSTS="$TMP/hosts.sh" SSH_UP="rog-lan" \
+        SSH_REG="$(reg_out 0x6 0x0 0x0)" "$WL" status rog 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && grep -q "WAKE_LAB_SWEEP_HOURS='$bad' is not" <<<"$out" \
+    && ! grep -q 'uncovered hours' <<<"$out" \
+    && ok "a malformed sweep window ($bad) is reported as malformed, not judged (rc=$rc)" \
+    || ko "the sweep window '$bad' was accepted (rc=$rc) -- $out"
+done
 # Unreadable is its own answer: the box may still be swept, but nothing is known about its updates.
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'ACTIVE HOURS WARNING on rog: could not read ActiveHoursStart/End' <<<"$out" \
@@ -519,6 +541,15 @@ grep -q 'active hours on rog: not read (no Windows endpoint answered)' <<<"$out"
   && ! grep -q 'ACTIVE HOURS WARNING' <<<"$out" \
   && ok "...and a box that is down has no reading rather than a warning about its settings" \
   || ko "status warned about the settings of a box it could not reach -- $out"
+
+# The holder's signature is read from `ps`, and macOS `ps` truncates the argument list to the
+# output width unless it is asked not to. This command line runs well past 79 columns, so a
+# truncated reading matches nothing and every live holder would look like somebody else's process
+# -- a false negative that fails the hold and deletes the record without killing the holder. The
+# fixture cannot make a pipe narrow, so the guard is on the invocation itself.
+grep -q 'ps -ww -o args=' "$WL" \
+  && ok "the holder signature is read with ps -ww, which macOS does not truncate" \
+  || ko "ps is called without -ww: on macOS the signature is cut off and no holder is ever recognized"
 
 # --- the polling loops are bounded by elapsed time, not by iteration count -----------------------
 # Every probe of a dark box burns its ConnectTimeout, so an iteration budget was a wall-clock lie:

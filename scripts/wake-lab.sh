@@ -302,10 +302,12 @@ DOWN_WAIT_SECONDS=${WAKE_LAB_DOWN_WAIT_SECONDS:-120}
 # its pid is recorded so that `unhold` — possibly in a later shell, since a lane is a sequence of
 # commands — can end it.
 HOLD_WAIT_SECONDS=${WAKE_LAB_HOLD_WAIT_SECONDS:-60}
-# How long the holder must still be connected AFTER a wsl.exe is seen, before the VM is called
-# held: an ssh still negotiating, or one whose remote command has just failed, is briefly alive
-# next to somebody else's wsl.exe, and those two readings together would certify nothing.
-HOLD_SETTLE_SECONDS=${WAKE_LAB_HOLD_SETTLE_SECONDS:-5}
+# How long our holder must have been alive, counted FROM ITS SPAWN, before the VM is called held.
+# The bound is not arbitrary: it exceeds the holder's own ConnectTimeout (15s), and ssh exits both
+# when it cannot connect and when its remote command ends. A client still alive past that is
+# therefore one that connected AND whose `sleep infinity` is running — which a `tasklist` reading
+# on its own cannot say, since the wsl.exe it sees may be the owner's console shell.
+HOLD_SETTLE_SECONDS=${WAKE_LAB_HOLD_SETTLE_SECONDS:-20}
 HOLD_STATE_DIR=${WAKE_LAB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wake-lab}
 # The local-time hours on the Windows box that the unattended sweep occupies: the routine's 07:20
 # launch plus its longest lane. Written `<start>-<end>`, end exclusive, and it may wrap midnight.
@@ -405,7 +407,9 @@ hold_pid_live() { # hold_pid_live <pidfile> — is the recorded holder still OUR
   # whole command line INCLUDING its destination: every box's holder runs the same payload, so a
   # signature without the alias would let one box's stale file kill another box's live holder and
   # drop that lane.
-  ps -o args= -p "$p" 2>/dev/null | grep -q -- "$d $HOLD_CMD"
+  # -ww: macOS ps truncates args to the output width otherwise, and this command line is long —
+  # a truncated one matches nothing, and every live holder would read as somebody else's process.
+  ps -ww -o args= -p "$p" 2>/dev/null | grep -q -- "$d $HOLD_CMD"
 }
 
 win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe runs on the Windows side
@@ -419,20 +423,35 @@ win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe run
 }
 
 hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait until Windows shows one
-  local name=$1 dest=$2 pid f deadline
+  local name=$1 dest=$2 pid f deadline started_at=""
   f=$HOLD_STATE_DIR/hold-$name.pid
   mkdir -p "$HOLD_STATE_DIR" 2>/dev/null
   if hold_pid_live "$f"; then
     pid=$(hold_pid_read "$f"); pid=${pid%% *}
     echo "  wsl holder already running for $name (pid $pid)"
   else
+    # Claim the record BEFORE spawning, with noclobber. Two `--hold` runs for one box would
+    # otherwise both spawn a holder and the second write would erase the first pid, leaving a
+    # holder nobody can unhold and a VM pinned until the box reboots. A file left by a holder that
+    # is no longer ours (checked just above) is stale and goes first.
+    rm -f "$f" 2>/dev/null
+    if ! ( set -C; : > "$f" ) 2>/dev/null; then
+      if [ -e "$f" ]; then
+        echo "  wsl holder for $name is already being created by another run ($f is claimed); nothing was started"
+      else
+        echo "  wsl holder on $name could NOT be recorded at $f; nothing was started"
+      fi
+      return 1
+    fi
     ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
         "$dest" "$HOLD_CMD" >/dev/null 2>&1 &
     pid=$!
-    # An unrecordable holder is a leaked one: nothing would ever unhold it, and the VM would stay
-    # pinned until the box reboots. Kill it here rather than leave it running unowned.
+    started_at=$SECONDS
+    # An unrecordable holder is a leaked one: nothing would ever unhold it. Kill it rather than
+    # leave it running unowned.
     if ! printf '%s %s\n' "$pid" "$dest" > "$f" 2>/dev/null; then
       kill "$pid" 2>/dev/null
+      rm -f "$f" 2>/dev/null
       echo "  wsl holder on $name could NOT be recorded at $f — holder (pid $pid) killed rather than leaked"
       return 1
     fi
@@ -447,12 +466,14 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
   deadline=$((SECONDS + HOLD_WAIT_SECONDS))
   while hold_pid_live "$f"; do
     if win_holder_seen "$dest"; then
-      # ...and still connected a moment later. Without the settle, an ssh that is still
-      # negotiating (or has just failed) is alive beside somebody else's wsl.exe for a second,
-      # and the pair would read as a holder of ours that never started.
-      sleep "$HOLD_SETTLE_SECONDS"
+      # ...and our own holder still connected, at least HOLD_SETTLE_SECONDS after it was spawned —
+      # past its ConnectTimeout, so it is not one still negotiating beside somebody else's
+      # wsl.exe, and not one whose remote command has already ended (ssh would have exited).
+      while [ -n "$started_at" ] && [ $((SECONDS - started_at)) -lt "$HOLD_SETTLE_SECONDS" ]; do
+        sleep 1
+      done
       if hold_pid_live "$f"; then
-        echo "  wsl holder observed on $name (wsl.exe on the Windows side, holder still connected after ${HOLD_SETTLE_SECONDS}s)"
+        echo "  wsl holder observed on $name (wsl.exe on the Windows side, holder connected past its ${HOLD_SETTLE_SECONDS}s settle)"
         return 0
       fi
       break
@@ -513,14 +534,20 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
     echo "  active hours on $name: not read (no Windows endpoint answered)"
     return 0
   fi
-  ws=${SWEEP_HOURS%%-*}; we=${SWEEP_HOURS##*-}
-  case "$ws$we" in ''|*[!0-9]*)
-    echo "  ACTIVE HOURS WARNING on $name: WAKE_LAB_SWEEP_HOURS='$SWEEP_HOURS' is not <start>-<end>"
-    return 0 ;;
+  # The WHOLE shape, not just the two ends: `7`, `7--11` and `24-25` all survive a check that only
+  # looks at the extracted endpoints, and each would then be reported as an ordinary window.
+  case "$SWEEP_HOURS" in
+    [0-9]-[0-9]|[0-9]-[0-9][0-9]|[0-9][0-9]-[0-9]|[0-9][0-9]-[0-9][0-9]) ;;
+    *) echo "  ACTIVE HOURS WARNING on $name: WAKE_LAB_SWEEP_HOURS='$SWEEP_HOURS' is not <start>-<end>"
+       return 0 ;;
   esac
   # Base 10 explicitly: `08-11` is the natural way to write a morning window, and bash arithmetic
   # reads a leading zero as octal and dies on the 8 — aborting a check that promises only to warn.
-  ws=$((10#$ws)); we=$((10#$we))
+  ws=$((10#${SWEEP_HOURS%%-*})); we=$((10#${SWEEP_HOURS##*-}))
+  if [ "$ws" -gt 23 ] || [ "$we" -gt 23 ]; then
+    echo "  ACTIVE HOURS WARNING on $name: WAKE_LAB_SWEEP_HOURS='$SWEEP_HOURS' is not a pair of clock hours (0-23)"
+    return 0
+  fi
   out=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" "reg query \"$ACTIVE_HOURS_KEY\"" 2>/dev/null) || out=""
   s=$(reg_dword "$out" ActiveHoursStart)
   e=$(reg_dword "$out" ActiveHoursEnd)
