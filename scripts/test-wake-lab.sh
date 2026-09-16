@@ -333,16 +333,45 @@ out=$(hang 'wsl\.exe --shutdown' "rog-lan rog-nv-win rog-nv-wsl" restart-wsl rog
 grep -q 'wsl.exe -d Ubuntu' "$SSH_LOG" \
   && ko "a start was issued onto the VM the capped shutdown left standing: $(cat "$SSH_LOG")" \
   || ok "...and no start is issued onto it"
-# The same wedge with no guest answering is the opposite evidence: whatever the command did, there
-# is no live VM left for the start to attach to, which is the only property the shutdown is for.
+# A SILENT guest is not the opposite evidence, and reading it that way was a real defect (PR #165
+# round 1, P1). The -wsl alias rides tailscaled inside the guest, which this suite's own subject
+# documents as lagging minutes behind a running VM, so "no guest answers" is the everyday reading
+# of a VM that is perfectly alive. Starting on it attaches to the old VM and then reports the
+# fresh restart the sweep waits for -- the stale bridge restart-wsl exists to replace. So a capped
+# shutdown is unconfirmed whichever way the guest goes, and NO start may follow it on that alias.
 : > "$SSH_LOG"
-out=$(hang 'wsl\.exe --shutdown' "rog-lan rog-nv-win" restart-wsl rog 2>&1)
-grep -q 'wsl shutdown timed out after 3s on rog (via rog-lan); no guest answers, so the VM is down' <<<"$out" \
-  && grep -q 'wsl started on rog (via rog-lan)' <<<"$out" \
-  && ok "...but with no guest answering the teardown counts as taken, and the start goes ahead" \
-  || ko "a capped shutdown with a silent guest did not proceed to the start -- $out"
-awk '/^rog-lan :: wsl.exe --shutdown$/ { s = NR } /^rog-lan :: wsl.exe -d Ubuntu/ { t = NR } END { exit !(s && t && s < t) }' "$SSH_LOG" \
-  && ok "...over the same alias, in the same order" || ko "the start did not follow the capped shutdown: $(cat "$SSH_LOG")"
+out=$(hang 'wsl\.exe --shutdown' "rog-lan rog-nv-win" restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'no guest answers, but a silent guest is not a stopped VM — the teardown is unconfirmed' <<<"$out" \
+  && ! grep -q 'wsl up' <<<"$out" && grep -q 'wsl restart FAILED on: rog (shutdown refused' <<<"${out##*$'\n'}" \
+  && ok "a capped shutdown is unconfirmed even with a silent guest, and fails the restart (rc=$rc)" \
+  || ko "a capped shutdown with a silent guest was treated as a teardown (rc=$rc) -- $out"
+grep -q 'wsl.exe -d Ubuntu' "$SSH_LOG" \
+  && ko "a start was issued after a shutdown that was never confirmed: $(cat "$SSH_LOG")" \
+  || ok "...issuing no start on evidence that cannot tell a stopped VM from a lagging tailscaled"
+grep -c -- 'wsl.exe --shutdown' "$SSH_LOG" | grep -qx 2 \
+  && ok "...and retrying the whole restart on the other alias first" \
+  || ko "the capped shutdown did not fall through to the second alias: $(cat "$SSH_LOG")"
+
+# A plain kick has no shutdown to repeat and a second start is idempotent, so a wedged LAN side
+# must not cost the box the start its Tailscale alias would have carried (PR #165 round 1, P2).
+# The restart path keeps the opposite rule, pinned above: it must NOT fall through.
+# The guest must be SILENT here: a guest that answers settles the cap on the spot, and the
+# fallback this pins exists only for the case where nothing has answered yet. The poll then fails
+# the step (no guest ever answers in this fixture), so the evidence is the start on the second
+# alias, not the exit status.
+: > "$SSH_LOG"
+out=$(hang '^rog-lan :: wsl\.exe -d Ubuntu' "rog-lan rog-nv-win" kick-wsl rog 2>&1)
+grep -q 'wsl started on rog (via rog-nv-win)' <<<"$out" \
+  && grep -q '^rog-nv-win :: wsl.exe -d Ubuntu' "$SSH_LOG" \
+  && ok "a plain kick whose start wedges on one alias is carried by the other" \
+  || ko "a wedged plain kick never tried the second alias -- $out; $(cat "$SSH_LOG")"
+# And when every alias wedges, the cap is still not a failure: the poll gets the box.
+: > "$SSH_LOG"
+out=$(hang 'wsl\.exe -d Ubuntu' "rog-lan rog-nv-win" kick-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'start probe timed out on every alias on rog' <<<"$out" \
+  && grep -q 'wsl still down after 0 min on: rog' <<<"${out##*$'\n'}" \
+  && ok "...and a kick that wedges on every alias is left to the poll, not called a failed kick (rc=$rc)" \
+  || ko "a kick wedged on every alias was not handed to the poll (rc=$rc) -- $out"
 
 # --- one wedged box must not cost its neighbours their restart ----------------------------------
 # The second half of the 2026-09-16 damage. The loop over boxes was serialized, so while rog's
@@ -353,7 +382,10 @@ out=$(hang '^rog-(lan|nv-win) :: wsl\.exe' "rog-lan rog-nv-win minix-lan minix-a
 grep -q '^minix-lan :: wsl.exe --shutdown$' "$SSH_LOG" && grep -q '^minix-lan :: wsl.exe -d Ubuntu' "$SSH_LOG" \
   && ok "a box whose Windows side wedges does not stop its neighbour getting its restart" \
   || ko "minix never got its restart while rog was wedged: $(cat "$SSH_LOG")"
-[ "$rc" -ne 0 ] && grep -q '^wsl up on: minix$' <<<"$out" && grep -q 'wsl still down after 0 min on: rog' <<<"$out" \
+# rog's own outcome is a shutdown failure -- its capped shutdown is unconfirmed on both aliases,
+# which is the P1 rule above -- while minix's is a clean restart. Each box is named for what
+# happened to IT; the wedge is not charged to the neighbour.
+[ "$rc" -ne 0 ] && grep -q '^wsl up on: minix$' <<<"$out" && grep -q 'wsl restart FAILED on: rog' <<<"$out" \
   && ok "...and the report still names each box's own outcome (rc=$rc)" \
   || ko "the wedged box's outcome was pinned on its neighbour (rc=$rc) -- $out"
 # ...and they really are kicked at once, not merely bounded one after another: two boxes wedged

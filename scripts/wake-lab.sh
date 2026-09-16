@@ -103,9 +103,14 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 #   that fires is NOT a failure: the VM had in fact started that day, `uptime -p` inside the guest
 #   matching the restart to the minute while the Windows-side probe was still stuck. So on expiry
 #   the guest is asked directly over its -wsl alias — which answered instantly throughout — and
-#   that answer, not the wedged probe, is the evidence. The restart's invariant survives it: the
-#   shutdown is only ever counted as taken when no guest answers, so a guest answering after a
-#   start is always the fresh VM.
+#   that answer, not the wedged probe, is the evidence. But only in ONE direction: a guest that
+#   answers is proof a VM is up, while a guest that does not answer proves nothing at all, because
+#   the -wsl alias rides tailscaled inside the guest and that lags minutes behind a running VM
+#   (the bullet above says so about every fresh kick). So a capped START with a silent guest is
+#   left to the poll, and a capped SHUTDOWN with a silent guest is UNCONFIRMED — never permission
+#   to start, which would attach to the old VM and then report it as the fresh one. That keeps the
+#   restart's invariant: a start is issued only after a shutdown that actually returned, so a
+#   guest answering after one is always the fresh VM.
 #
 # mac_of (every MAC of a box), eth_mac_of (the Ethernet one alone, whose lease is what
 # router_active asks the router about) and ip_of are NOT here: they are the fleet's hardware
@@ -375,7 +380,7 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
   # operator: `shutdown` — no alias carried the shutdown, so a -wsl guest that still answers is
   # the OLD VM; `start` — the shutdown went through and the start then failed everywhere, so
   # there is no VM at all until a kick succeeds; `kick` — the plain kick's start failed.
-  local name=$1 fresh=${2:-} dest what=kick shut=0 guest rc
+  local name=$1 fresh=${2:-} dest what=kick shut=0 capped_start=0 guest rc
   [ "$fresh" = fresh ] && what=restart
   guest=$(wsl_of "$name")
   for dest in $(lan_of "$name") $(ts_of "$name"); do
@@ -386,17 +391,23 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
         ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" 'wsl.exe --shutdown' >/dev/null 2>&1
       rc=$?
       if [ "$rc" = "$CAP_EXPIRED" ]; then
-        # The command never returned, so its status says nothing about the teardown. The guest's
-        # own liveness does, and it answers over a path the wedged Windows side is not on: with no
-        # VM answering there is no live old VM for the start below to attach to, which is the only
-        # property the shutdown exists to establish. A guest still answering is the opposite
-        # evidence — this alias has not carried the restart, so fall through and retry the whole
-        # thing on the next one rather than start onto the VM that is still standing.
+        # The command never returned, so its status says nothing about the teardown — and NOTHING
+        # here can supply that. A silent guest does not mean a stopped VM: the -wsl alias rides
+        # tailscaled inside the guest, which this file's own lore says lags minutes behind a
+        # running VM, so "no guest answers" is the everyday reading of a VM that is perfectly
+        # alive. Starting on that evidence would attach to the old VM and then report the fresh
+        # restart the sweep is waiting for, which is precisely the stale bridge restart-wsl exists
+        # to replace. So a capped shutdown is UNCONFIRMED, whatever the guest says, and this alias
+        # has not carried the restart: retry the whole thing on the next one, and if none carries
+        # it the step fails as a shutdown failure. The guest is still probed, because "the old VM
+        # demonstrably still answers" and "nothing is known" read differently to an operator, but
+        # neither of them is permission to start.
         if [ -n "$guest" ] && ssh_probe "$guest"; then
           echo "  wsl shutdown TIMED OUT after ${WSL_SHUTDOWN_CAP}s on $name (via $dest); the guest still answers, so the old VM stands"
-          continue
+        else
+          echo "  wsl shutdown TIMED OUT after ${WSL_SHUTDOWN_CAP}s on $name (via $dest); no guest answers, but a silent guest is not a stopped VM — the teardown is unconfirmed"
         fi
-        echo "  wsl shutdown timed out after ${WSL_SHUTDOWN_CAP}s on $name (via $dest); no guest answers, so the VM is down"
+        continue
       elif [ "$rc" != 0 ]; then
         continue
       else
@@ -412,21 +423,29 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
       return 0
     fi
     if [ "$rc" = "$CAP_EXPIRED" ]; then
-      # The start was issued and the probe simply never came back. Whether a VM is now running is
-      # the guest's to answer, so hand the box to start_wsl's poll either way and let that be the
-      # verdict — it asks the guest, on its deadline. What is NOT done here is falling through to
-      # the next alias: in the restart path that would issue a second `wsl --shutdown`, tearing
-      # down the very VM this start may have just booted. Either way the restart's invariant holds
-      # — a guest that answers from here on is a fresh VM, because the shutdown above is known to
-      # have taken before any start was issued.
+      # The start was issued and the probe simply never came back. A guest that answers settles it.
       if [ -n "$guest" ] && ssh_probe "$guest"; then
         echo "  wsl start probe timed out after ${WSL_START_CAP}s on $name (via $dest); the guest answers, so the VM is up"
-      else
-        echo "  wsl start probe timed out after ${WSL_START_CAP}s on $name (via $dest); leaving the verdict to the guest poll"
+        return 0
       fi
-      return 0
+      capped_start=1
+      # With the guest silent there is no verdict here, and what to do next differs by path. A
+      # RESTART must not fall through: the next alias would issue a second `wsl --shutdown`,
+      # tearing down the very VM this start may have just booted, so the box goes to start_wsl's
+      # poll, which asks the guest on its own deadline. A plain KICK has no shutdown to repeat and
+      # a second start is idempotent, so the other alias is worth trying — a wedged LAN side must
+      # not cost a box the start its Tailscale alias would have carried.
+      echo "  wsl start probe timed out after ${WSL_START_CAP}s on $name (via $dest); leaving the verdict to the guest poll"
+      [ "$fresh" = fresh ] && return 0
     fi
   done
+  # Every alias tried and one of them left a start in flight: a cap is not a failure anywhere else
+  # in this function and it is not one here either, so the poll gets the box rather than the
+  # operator getting a kick that may well have worked.
+  if [ "$capped_start" = 1 ]; then
+    echo "  wsl $what start probe timed out on every alias on $name; leaving the verdict to the guest poll"
+    return 0
+  fi
   if [ "$fresh" = fresh ] && [ "$shut" = 0 ]; then KICK_PHASE=shutdown
   elif [ "$fresh" = fresh ]; then KICK_PHASE=start
   else KICK_PHASE=kick; fi
