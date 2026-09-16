@@ -36,7 +36,8 @@ author's fleet (the header of `scripts/fleet-worker.sh` is the authoritative lis
 | The flotilla status and wake service, if any | `FLEET_FLOTILLA` |
 | Local state directory for each coordinator | `ISSUE_WAVE_STATE` |
 | State directory on the anchor for the lease and fleet-wide halt | `FLEET_ANCHOR_STATE`; every coordinator must resolve it to the same directory on the anchor |
-| How many correctness executions may share a box (measurement is always exclusive) | `FLEET_BOX_CORRECTNESS_SLOTS` (`<box>=<n>` pairs; `mac-studio=3` with the default roster, one slot otherwise) |
+| Where a box keeps its run-time correctness slot locks (`execution slot`) | `FLEET_SLOT_STATE`; box-wide, deliberately not under the per-coordinator `ISSUE_WAVE_STATE`, and every agent on the box must resolve it to the same directory |
+| How many correctness executions may share a box AT RUN TIME (measurement is always exclusive) | `FLEET_BOX_CORRECTNESS_SLOTS` (`<box>=<n>` pairs; `mac-studio=6` with the default roster, one slot otherwise) |
 
 The rest is prose in this file and is edited in place: the **sequencing plan** path and the
 task that maintains it (Inputs, just below), the **fleet roster** with its hardware and the
@@ -93,9 +94,11 @@ sections as the starting truth, then adjust for churn surfaces the plan does not
 issues editing the same file or golden serialize even if logically independent, and an issue
 that adds test stanzas sequences after one that reshapes the affected goldens or scanners. GPU
 boxes serialize per box for measurement work (the plan's Parallelism section orders each box's
-queue). Agent slots are separate from execution slots: on one box a measurement execution is
-exclusive, and correctness executions share it up to its correctness slots (three on
-mac-studio, one on the WSL boxes; ludics-lite#157) under the reservation protocol.
+queue). Agent slots are separate from execution slots, and the correctness slots bound neither:
+on one box a measurement execution is exclusive through the registry, while correctness batches
+share the box up to its correctness slots (six on mac-studio, one on the WSL boxes;
+ludics-lite#157, #160) - a count taken at RUN TIME by `execution slot`, around each batch, so a
+worker's standing iteration record never gates another worker's start.
 
 A box that is asleep or unreachable is a placement fact, not a blocker: wake it through
 flotilla (`curl -X POST http://mac-studio:7799/api/wake -d '{"machine":"rog"}'`; WSL then needs
@@ -275,8 +278,9 @@ worker kinds, with transport-specific setup and identity, and includes:
 - Execution handoff: the worker's own targeted correctness batches on its agent host run under
   the [standing iteration reservation](references/executions.md#standing-iteration-reservation)
   the coordinator took at launch - name its request id, the bounded aliases and `-j` width it
-  covers, and that every batch goes through the project runner and is reported by run
-  directory. Every other run - measurement, a cross-box leg, a full suite - needs an assignment
+  covers, and that every batch goes through the project runner, wrapped in
+  `fleet-worker.sh execution slot -- <batch>` (the run-time slot, which is what the box's
+  correctness cap now counts), and is reported by run directory. Every other run - measurement, a cross-box leg, a full suite - needs an assignment
   first, in the transport's shape: a native Claude worker ends its turn with the
   `EXECUTION_REQUEST` block and, once resumed with `EXECUTION_ASSIGNED <id>`, runs only that
   command and ends the result turn with the one-line `EXECUTION_RESULT {json}` (formats in the
@@ -573,6 +577,9 @@ or transport. Agent residence does not confer execution ownership. Workers ask t
 the coordinator reserves before launch, records launch evidence and the project runner outcome,
 and concludes only with evidence. The usual shape is two calls per execution - `execution run
 <reserve.json>` then `execution conclude --from-run <run-dir> --request <id> --sha <sha>` - plus one
-standing correctness reservation per worker for its own iteration batches, taken at launch and
-concluded at hand-back. `load` is an observation, not ownership. Neither it nor these
+standing correctness reservation per worker for its own iteration batches (`"standing": true`),
+taken at launch and concluded at hand-back. A standing record consumes no correctness slot: the
+worker takes one around each batch with `execution slot` instead, so the cap bounds load on the
+box and never how many workers may be in flight. Assigned correctness runs go through the same
+lock, so it is the one mechanism bounding what a box carries at once. `load` is an observation, not ownership. Neither it nor these
 cooperative reservations prevents unrelated processes or scheduled sweeps from using a machine.
