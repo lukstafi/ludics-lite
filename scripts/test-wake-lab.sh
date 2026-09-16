@@ -54,6 +54,25 @@ expect() {
   else ko "$label (rc=$rc want $want_rc; want /$want/) -- $out"; fi
 }
 
+# lock_holders <diff> -- the holder line of each lock file the diff names, one per line.
+# The diff says a file is new or changed but not by whom, and the two readings of that call for
+# opposite responses: a case that escaped WAKE_LAB_LOCK_DIR is a bug in this suite to fix, while
+# a genuine cross-machine sweep that reserved a box mid-run is the lab working correctly and the
+# suite merely watching. wake-lab's `lab_lock_take_fd` already writes WHO took the lock on its
+# first line -- `wake-lab <what> (pid <n>, since <utc>)` -- so print that beside the diff and
+# reading it stops being a manual `cat` after the fact. The suite's own pid goes in the message
+# for the comparison: its cases run as its children, so a holder pid near it and gone is this
+# suite escaping, while a stranger's is the sweep. Only the files the diff names, so a busy lab
+# does not bury the diff. Control characters go, and a missing or empty line degrades rather than
+# failing, both as `lab_lock_holder` does -- this text goes to a terminal, and a lock a sweep is
+# mid-write on has no first line yet.
+lock_holders() {
+  sed -n 's/^> \([^ ][^ ]*\).*/\1/p' <<<"$1" | sort -u | while IFS= read -r f; do
+    local line; line=$(head -1 "$REAL_LOCK_DIR/$f" 2>/dev/null | tr -d '\000-\037')
+    printf '\n  %s: %s' "$f" "${line:-(no holder line)}"
+  done
+}
+
 # lab_untouched <region> -- the real lab's lock directory is exactly as the suite found it.
 # Called after the cases that reserve and again at the end, so a failure names a region rather
 # than the whole file.
@@ -62,8 +81,9 @@ lab_untouched() {
   if [ "$now" = "$REAL_LOCK_BEFORE" ]; then
     ok "the real lab's lock directory is untouched ($1)"
   else
-    ko "$1 reached $REAL_LOCK_DIR: a case escaped WAKE_LAB_LOCK_DIR and reserved the real lab -- $(
-      diff <(printf '%s\n' "$REAL_LOCK_BEFORE") <(printf '%s\n' "$now") | sed -n '1,10p')"
+    local d; d=$(diff <(printf '%s\n' "$REAL_LOCK_BEFORE") <(printf '%s\n' "$now") | sed -n '1,10p')
+    ko "$1 reached $REAL_LOCK_DIR: a case escaped WAKE_LAB_LOCK_DIR and reserved the real lab \
+(this suite is pid $$) -- $d$(lock_holders "$d")"
   fi
 }
 
