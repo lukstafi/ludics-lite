@@ -615,6 +615,13 @@ for bad in 7 7--11 24-25 morning; do
     && ok "a malformed sweep window ($bad) is reported as malformed, not judged (rc=$rc)" \
     || ko "the sweep window '$bad' was accepted (rc=$rc) -- $out"
 done
+# Equal endpoints are not a 24-hour window: Windows allows at most 18 hours, so 6-6 is a reset or
+# malformed setting, and reading it as "every hour protected" would print the quiet line over a box
+# with no protection at all.
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x6 0x6 0x0)" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'equal endpoints' <<<"$out" && ! grep -q 'cover the sweep window' <<<"$out" \
+  && ok "equal active-hours endpoints are a warning, not a day-long window (rc=$rc)" \
+  || ko "6-6 was read as full coverage (rc=$rc) -- $out"
 # Numeric is not valid: 24-24 reaches the equal-endpoint branch, which would call every hour
 # covered and print the quiet line over a box whose update protection is nonsense.
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x18 0x18 0x0)" 2>&1); rc=$?
@@ -639,6 +646,20 @@ grep -q 'active hours on rog: not read (no Windows endpoint answered)' <<<"$out"
   && ! grep -q 'ACTIVE HOURS WARNING' <<<"$out" \
   && ok "...and a box that is down has no reading rather than a warning about its settings" \
   || ko "status warned about the settings of a box it could not reach -- $out"
+
+# A start probe that wedges on one alias must not leave the holder pointed at the OTHER one: on
+# the kick path the loop tries the Tailscale alias next, and when that start fails the box is
+# still reported up (the wedged start may well have worked), so the holder has to ride the alias
+# whose start actually went out.
+rm -rf "$TMP/state"; : > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
+      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_WSL_START_CAP=2 WAKE_LAB_PROBE_CAP=3 \
+      WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" SSH_HANG='rog-lan :: wsl\.exe -d Ubuntu -e true' \
+      SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=30 "$WL" kick-wsl --hold rog 2>&1); rc=$?
+grep -q '^rog-lan :: wsl.exe -d Ubuntu -e sleep infinity$' "$SSH_LOG" \
+  && ok "the holder rides the alias whose start went out, not the one that answered nothing" \
+  || ko "the holder was put on the wrong alias after a capped start (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
 
 # Every remote command the hold adds is capped, for the reason the kick's are: ConnectTimeout
 # bounds the connect, not the remote command, so an accepted session whose `tasklist` never

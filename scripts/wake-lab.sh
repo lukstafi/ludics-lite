@@ -431,15 +431,11 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
   # operator: `shutdown` — no alias carried the shutdown, so a -wsl guest that still answers is
   # the OLD VM; `start` — the shutdown went through and the start then failed everywhere, so
   # there is no VM at all until a kick succeeds; `kick` — the plain kick's start failed.
-  local name=$1 fresh=${2:-} dest what=kick shut=0 capped_start=0 guest rc
+  local name=$1 fresh=${2:-} dest what=kick shut=0 capped_start=0 capped_dest="" guest rc
   [ "$fresh" = fresh ] && what=restart
   guest=$(wsl_of "$name")
   for dest in $(lan_of "$name") $(ts_of "$name"); do
     [ -n "$dest" ] || continue
-    # The alias this iteration is using, recorded for every path that returns 0 — including the
-    # capped ones that leave the verdict to the guest poll — so that `--hold` has a Windows side
-    # to put the holder on. On a failure nothing reads it: no kick, no hold.
-    KICK_DEST=$dest
     # An ssh network logon is session enough: this works with nobody logged in at the console.
     if [ "$fresh" = fresh ]; then
       capped "$WSL_SHUTDOWN_CAP" \
@@ -475,15 +471,21 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
     rc=$?
     if [ "$rc" = 0 ]; then
       echo "  wsl started on $name (via $dest)"
+      KICK_DEST=$dest
       return 0
     fi
     if [ "$rc" = "$CAP_EXPIRED" ]; then
       # The start was issued and the probe simply never came back. A guest that answers settles it.
       if [ -n "$guest" ] && ssh_probe "$guest"; then
         echo "  wsl start probe timed out after ${WSL_START_CAP}s on $name (via $dest); the guest answers, so the VM is up"
+        KICK_DEST=$dest
         return 0
       fi
       capped_start=1
+      # The alias whose start went out, kept for the hold: on the kick path the loop goes on to
+      # try the other alias, and a later alias that FAILS must not leave the holder pointed at an
+      # endpoint that answers nothing. Only a start that succeeds later replaces it.
+      [ -n "$capped_dest" ] || capped_dest=$dest
       # With the guest silent there is no verdict here, and what to do next differs by path. A
       # RESTART must not fall through: the next alias would issue a second `wsl --shutdown`,
       # tearing down the very VM this start may have just booted, so the box goes to start_wsl's
@@ -491,7 +493,7 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
       # a second start is idempotent, so the other alias is worth trying — a wedged LAN side must
       # not cost a box the start its Tailscale alias would have carried.
       echo "  wsl start probe timed out after ${WSL_START_CAP}s on $name (via $dest); leaving the verdict to the guest poll"
-      [ "$fresh" = fresh ] && return 0
+      if [ "$fresh" = fresh ]; then KICK_DEST=$dest; return 0; fi
     fi
   done
   # Every alias tried and one of them left a start in flight: a cap is not a failure anywhere else
@@ -499,6 +501,7 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
   # operator getting a kick that may well have worked.
   if [ "$capped_start" = 1 ]; then
     echo "  wsl $what start probe timed out on every alias on $name; leaving the verdict to the guest poll"
+    KICK_DEST=$capped_dest
     return 0
   fi
   if [ "$fresh" = fresh ] && [ "$shut" = 0 ]; then KICK_PHASE=shutdown
@@ -707,8 +710,9 @@ reg_dword() { # reg_dword <reg-query output> <value name> — its decimal value,
 }
 
 hour_active() { # hour_active <hour> <start> <end> — is that local hour inside the active window
+  # Equal endpoints never reach here: check_active_hours refuses them as a malformed setting
+  # rather than reading them as a 24-hour window.
   local h=$1 s=$2 e=$3
-  [ "$s" = "$e" ] && return 0
   if [ "$s" -lt "$e" ]; then [ "$h" -ge "$s" ] && [ "$h" -lt "$e" ]
   else [ "$h" -ge "$s" ] || [ "$h" -lt "$e" ]; fi          # ...-0 wraps midnight: 6-0 is 06:00-24:00
 }
@@ -749,6 +753,13 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
   # the quiet line instead of the warning that is the only notice anyone gets.
   if [ "$s" -gt 23 ] || [ "$e" -gt 23 ]; then
     echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, which are not clock hours (0-23): the update protection on that box is not valid"
+    return 0
+  fi
+  # Equal endpoints are not a 24-hour window. Windows allows at most 18 hours (this file's own
+  # lore: the boxes pin 6→0 as the maximum), so `6-6` is a reset or a malformed setting — and
+  # reading it as "every hour protected" would print the quiet line over a box with no protection.
+  if [ "$s" = "$e" ]; then
+    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, equal endpoints — not a window Windows can mean (its maximum span is 18 h), so the setting is reset or malformed"
     return 0
   fi
   len=$(( (we - ws + 24) % 24 )); [ "$len" -eq 0 ] && len=1
