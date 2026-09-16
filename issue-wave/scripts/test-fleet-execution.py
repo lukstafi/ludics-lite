@@ -224,6 +224,24 @@ with tempfile.TemporaryDirectory(prefix='fleet-slots-') as temporary:
     out = change('run', request('run-4'), expected=1)
     assert 'box owned by' in out and 'correctness slots 3/3 on mac' in out, out
     assert 'run-4' not in records()
+    # A standing iteration record (ludics-lite#160) is ownership and evidence, not a running
+    # batch: it is admitted past a full box and never fills a slot itself. The slots are taken
+    # at run time instead, by `fleet-worker.sh execution slot` around each batch.
+    change('run', {**request('iterate-4'), 'standing': True})
+    assert records()['iterate-4']['request']['standing'] is True
+    out = change('run', request('run-4b'), expected=1)
+    assert 'correctness slots 3/3 on mac' in out, out
+    assert 'run-4b' not in records()
+    change('run', {**request('iterate-5'), 'standing': True})
+    # It is loud, not read off the `-iterate` id convention: only `true`, only on correctness.
+    out = change('run', {**request('standing-bad'), 'standing': 'yes'}, expected=1)
+    assert 'standing must be true when present' in out and 'standing-bad' not in records(), out
+    out = change('run', {**request('standing-measure', 'minix', kind='measurement'), 'standing': True}, expected=1)
+    assert 'only a correctness reservation can be standing' in out, out
+    change('conclude', dict(request_id='iterate-4', verdict='not-launched', log='/logs/iterate-4',
+                            evidence='fixture concluded the standing record at hand-back'))
+    change('conclude', dict(request_id='iterate-5', verdict='not-launched', log='/logs/iterate-5',
+                            evidence='fixture concluded the standing record at hand-back'))
     # Measurement needs the box to itself, and holds it exclusively once it has it.
     out = change('reserve', request('measure-mac', kind='measurement'), expected=1)
     assert 'measurement needs mac to itself' in out, out
@@ -265,7 +283,7 @@ with tempfile.TemporaryDirectory(prefix='fleet-slots-') as temporary:
     triage = records()['triage-run']
     assert triage['state'] == 'launching' and triage['halt_identity'], triage
     run('resume-launches')
-    print('PASS: execution run, correctness slots, exclusive measurement, halt')
+    print('PASS: execution run, correctness slots, standing records, exclusive measurement, halt')
 
 # Exercise real fsync calls and their publication order, including first directory creation.
 import runpy

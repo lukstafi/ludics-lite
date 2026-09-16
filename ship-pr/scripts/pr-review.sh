@@ -321,7 +321,11 @@ warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 # blank.
 GH_ERR=""
 GH_ERR_FILE="${TMPDIR:-/tmp}/pr-review-err.$$"
-trap 'rm -f "$GH_ERR_FILE"' EXIT
+# The round snapshot's files live beside it, for the same subshell reason; see "the round
+# snapshot" below for what is in them. Both names are built from `$$`, which a command
+# substitution's subshell inherits from its parent, so the two sides address the same files.
+SNAP="${TMPDIR:-/tmp}/pr-review-snap.$$"
+trap 'rm -f "$GH_ERR_FILE" "$SNAP".*' EXIT
 
 gateway_failure() {
   case "$1" in
@@ -534,6 +538,157 @@ mark_of() {
   case "$field" in '' | *[!0-9]*) echo 0 ;; *) echo "$field" ;; esac
 }
 
+# --- the round snapshot -------------------------------------------------------------------------
+# A watch round used to read the same endpoints twice. `cmd_poll` reads the inline, comments and
+# reviews feeds, `watch_round` then reads the PR for the head its items are classified against, and
+# `status_state` — called on the same round, a second later — read the comments, the reviews and the
+# PR all over again for its own question. Of the eight or so calls a round made, four were the
+# second copy of a read already in hand (ludics-lite#95).
+#
+# The snapshot is that first read, published for the state to take. What it buys is not only the
+# calls: two reads a second apart are also what made "the item was classified against a head that
+# has since moved" expressible at all, because each answer was about a different instant. With ONE
+# observation per round, the round's classification and the state reported beside it are about the
+# same instant by construction — the watch's claims about a head are true of the feeds they were
+# made from, instead of nearly true of a PR that has moved on since.
+#
+# The ordering INSIDE a round is unchanged, and it is the whole point: the feeds first, the head
+# after (review of ludics-lite#47). Every item in the snapshot's feeds is then about a head no newer
+# than the snapshot's head, so "the reviewer's review names the head" means the CURRENT head was
+# reviewed; read the other way round, a push landing between the two would match the previous head's
+# review to the previous head and report `idle` while the new head sits unreviewed. And because the
+# state now TAKES the head rather than reading it again, a push landing after the round can no
+# longer re-anchor the state to a head the round never classified against — which is how a round
+# just delivered about the head being watched came to be reported beside a state about its
+# successor (the P2 rebutted on exactly this ground in the review of ludics-lite#84).
+#
+# What is NOT in the snapshot: the reactions feed, which `cmd_poll` does not read and which is the
+# only place a 👍 lives. Every state read still asks it live, so an approval landing beside a round
+# is still reported as the approval it is rather than answered with the nudge that would clear it.
+#
+# It lives in files rather than variables for the reason GH_ERR_FILE does: `cmd_poll` runs inside a
+# command substitution, and an assignment made there dies with the subshell.
+#
+# Three rules keep a snapshot from ever being read as something it is not:
+#   - it is ARMED only inside a watch round (`snapshot_arm`). `poll` and `status` invoked on their
+#     own read for themselves, exactly as before, and nothing is written for them;
+#   - each part's `.pr` marker names the PR and is written LAST, so a half-written or foreign
+#     snapshot is simply absent rather than half-believed; and `snapshot_arm` removes the round
+#     before's before any of this round's is written, so a stale answer can never be served as this
+#     round's observation;
+#   - only a SUCCESSFUL read is published, and a failed round drops the snapshot outright. A state
+#     read with no snapshot reads for itself and reports what that read says, so the collapse
+#     api_list exists to refuse — a failed read reading as an empty feed — cannot come back in
+#     through here.
+SNAPSHOT_ARMED=0
+
+# A new round: nothing observed before it may be read as part of it.
+snapshot_arm() {
+  SNAPSHOT_ARMED=1
+  rm -f "$SNAP".*
+}
+
+# The round ended without an observation worth sharing (a feed that did not answer). Callers of
+# status_state then read for themselves.
+snapshot_drop() {
+  rm -f "$SNAP".*
+}
+
+# The watch is over. Disarming is not tidiness: this script's functions outlive a command when it is
+# sourced (every fixture suite sources it), and a `status` asked afterwards must read the PR as it
+# is NOW, not as the last round saw it. Armed state that survived its watch turned a standalone
+# status into a replay of a window that had already ended.
+snapshot_off() {
+  SNAPSHOT_ARMED=0
+  rm -f "$SNAP".*
+}
+
+# Is <kind> (feeds|head) of the current round in hand, and about <pr>?
+snapshot_has() { # <kind> <pr>
+  [ "$SNAPSHOT_ARMED" = 1 ] || return 1
+  [ -f "$SNAP.$1.pr" ] || return 1
+  [ "$(cat "$SNAP.$1.pr" 2>/dev/null)" = "$2" ]
+}
+
+# The feeds cmd_poll read this round. The marker last, so a write that fails partway leaves no
+# snapshot at all rather than one missing a feed.
+snapshot_put_feeds() { # <pr> <issue comments json> <reviews json>
+  [ "$SNAPSHOT_ARMED" = 1 ] || return 0
+  rm -f "$SNAP.feeds.pr"
+  printf '%s\n' "$2" >"$SNAP.feeds.comments" 2>/dev/null &&
+    printf '%s\n' "$3" >"$SNAP.feeds.reviews" 2>/dev/null &&
+    printf '%s\n' "$1" >"$SNAP.feeds.pr" 2>/dev/null
+  return 0
+}
+
+# The head read watch_round made AFTER those feeds, with the fields pr_head_read sets. head_err is
+# a whole error line and may contain anything, so each field gets its own file rather than sharing
+# a delimiter with it.
+snapshot_put_head() { # <pr>; head_sha, mstate, pr_created and head_err in the caller's scope
+  [ "$SNAPSHOT_ARMED" = 1 ] || return 0
+  rm -f "$SNAP.head.pr"
+  printf '%s' "$head_sha" >"$SNAP.head.sha" 2>/dev/null &&
+    printf '%s' "$mstate" >"$SNAP.head.mstate" 2>/dev/null &&
+    printf '%s' "$pr_created" >"$SNAP.head.created" 2>/dev/null &&
+    printf '%s' "$head_err" >"$SNAP.head.err" 2>/dev/null &&
+    printf '%s\n' "$1" >"$SNAP.head.pr" 2>/dev/null
+  return 0
+}
+
+# The comments and the reviews for a state read: the round's own observation when there is one —
+# the SAME bytes cmd_poll classified its items from, so the state and the round cannot disagree
+# about what the reviewer has said — and a read of its own otherwise. Failure is api_list's: return
+# nonzero having printed nothing, so a caller can still tell a failed read from an empty feed.
+state_comments() { # <pr>
+  if snapshot_has feeds "$1"; then
+    cat "$SNAP.feeds.comments"
+    return $?
+  fi
+  api_list "issues/$1/comments?per_page=100"
+}
+
+state_reviews() { # <pr>
+  if snapshot_has feeds "$1"; then
+    cat "$SNAP.feeds.reviews"
+    return $?
+  fi
+  api_list "pulls/$1/reviews?per_page=100"
+}
+
+# The head for a state read. The snapshot's head was read after the snapshot's feeds, which is the
+# ordering status_state's own read exists to keep; taking it here keeps that ordering AND stops a
+# push that landed since from re-anchoring the state to a head this round never classified against.
+# Sets the same four variables pr_head_read sets, in the caller's scope.
+state_head_read() { # <pr>
+  if snapshot_has head "$1"; then
+    head_sha=$(cat "$SNAP.head.sha")
+    mstate=$(cat "$SNAP.head.mstate")
+    pr_created=$(cat "$SNAP.head.created")
+    head_err=$(cat "$SNAP.head.err")
+    [ -n "$mstate" ] || mstate="-"
+    return 0
+  fi
+  pr_head_read "$1"
+}
+
+# A review's own comments endpoint, read at most once per round for a given review. Two callers ask
+# for it on the round that matters: cmd_poll re-reads every NEW review's comments (the flat feed
+# lags a fresh review), and substantive_reviews reads the empty-bodied COMMENTED ones to tell an
+# envelope from findings — on the round a review lands, that is one read made twice. Only a
+# SUCCESSFUL read is cached, so a read that did not answer is never served as a review with no
+# findings; the cache is per round, cleared with the rest of the snapshot.
+review_comments() { # <pr> <review id>
+  local out
+  case "$2" in '' | *[!0-9]*) api_list "pulls/$1/reviews/$2/comments?per_page=100" ; return $? ;; esac
+  if [ "$SNAPSHOT_ARMED" = 1 ] && [ -f "$SNAP.review.$2" ]; then
+    cat "$SNAP.review.$2"
+    return $?
+  fi
+  out=$(api_list "pulls/$1/reviews/$2/comments?per_page=100") || return $?
+  [ "$SNAPSHOT_ARMED" != 1 ] || printf '%s\n' "$out" >"$SNAP.review.$2" 2>/dev/null || true
+  printf '%s\n' "$out"
+}
+
 # The commit each kind of item is ABOUT, as one jq prelude shared by the rendering and the index
 # below, so the two can never disagree about an item. Spliced into a jq program, which is why it
 # carries no apostrophe.
@@ -664,6 +819,14 @@ cmd_poll() {
       "($(gh_err_line)) — this round is UNKNOWN, not quiet"
     return 3
   fi
+  # The one read of these feeds the round makes. status_state takes its comments and reviews from
+  # here instead of reading them again a second later (see "the round snapshot"), so the state a
+  # round is reported beside is computed from the very bytes the round was classified from. The
+  # UNFILTERED feeds: poll's question is "what is new since the watermark" and the state's is "what
+  # has the reviewer ever said", and the second cannot be answered from the first's leftovers.
+  # Nothing is published unless all three answered — the return above is what a failed read owes
+  # the caller, and a snapshot of two feeds would hand the state an empty third.
+  snapshot_put_feeds "$pr" "$issue" "$reviews"
 
   # A new review's inline comments can lag the flat listing read above (see the header), so every
   # review this round is about to report gets its own comments endpoint read too, merged by
@@ -682,7 +845,7 @@ cmd_poll() {
   }
   # shellcheck disable=SC2086 # one id per word, and the point is to split them
   for rid in $new_review_ids; do
-    more=$(api_list "pulls/$pr/reviews/$rid/comments?per_page=100") || {
+    more=$(review_comments "$pr" "$rid") || {
       warn "API error reading review $rid's comments on PR $pr after $API_ATTEMPTS attempts" \
         "($(gh_err_line)) — this round is UNKNOWN, not quiet"
       return 3
@@ -986,7 +1149,7 @@ substantive_reviews() { # <pr>; reviews JSON on stdin
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     case "$id" in null | *[!0-9]*) return 1 ;; esac
-    inline=$(api_list "pulls/$pr/reviews/$id/comments?per_page=100") || return 1
+    inline=$(review_comments "$pr" "$id") || return 1
     if jq -e 'type == "array" and length == 0' <<<"$inline" >/dev/null; then
       raw=$(jq --argjson id "$id" 'map(select(.id != $id))' <<<"$raw") || return 1
     else
@@ -1023,7 +1186,7 @@ status_state() {
   # Reuse this comments read below; standalone status keeps its reactions-only
   # approval fast path because it has no incoming watch watermark to spend.
   if [ -n "${watch_nudge_after:-}" ]; then
-    comments_raw=$(api_list "issues/$pr/comments?per_page=100") || {
+    comments_raw=$(state_comments "$pr") || {
       echo "unknown|-|-|the comments API did not answer ($(gh_err_line))"
       return 0
     }
@@ -1048,14 +1211,14 @@ status_state() {
   # Completion removes the contradiction; it is not itself a no-findings verdict.
   [ "$plus" = true ] && review_after_nudge "$plus_at" "$nudge_at" && {
     if [ "$comments_loaded" != true ]; then
-      comments_raw=$(api_list "issues/$pr/comments?per_page=100") || comments_raw='[]'
+      comments_raw=$(state_comments "$pr") || comments_raw='[]'
     fi
-    reviews_raw=$(api_list "pulls/$pr/reviews?per_page=100") || reviews_raw='[]'
+    reviews_raw=$(state_reviews "$pr") || reviews_raw='[]'
     reviews_raw=$(substantive_reviews "$pr" <<<"$reviews_raw") || {
       echo "unknown|-|$mstate|the review comments API did not establish substantive reviews"
       return 0
     }
-    pr_head_read "$pr"
+    state_head_read "$pr"
     evidence=$(jq -rs --arg rev "$REVIEWER" --arg head "$head_sha" --arg rc "$REVIEWED_COMMIT_RE" '
       .[0] as $comments | .[1] as $reviews |
       def reviewer: select((.user.login // "") | startswith($rev));
@@ -1130,7 +1293,7 @@ status_state() {
     return 0
   }
 
-  raw=$(api_list "pulls/$pr/reviews?per_page=100") || {
+  raw=$(state_reviews "$pr") || {
     echo "unknown|-|$mstate|the reviews API did not answer ($(gh_err_line))"
     return 0
   }
@@ -1165,7 +1328,7 @@ status_state() {
   if [ "$comments_loaded" = true ]; then
     raw="$comments_raw"
   else
-    raw=$(api_list "issues/$pr/comments?per_page=100") || {
+    raw=$(state_comments "$pr") || {
       echo "unknown|-|$mstate|the comments API did not answer ($(gh_err_line))"
       return 0
     }
@@ -1241,8 +1404,11 @@ status_state() {
   # between the two reads would match the previous head's review to the previous head and report
   # `idle` (or a verdict comment as `approved`) while the new head sits unreviewed — the false
   # reading this state machine exists to prevent (review of ludics-lite#47). One read serves the
-  # verdict check and the post-round states, which used to read it separately.
-  pr_head_read "$pr"
+  # verdict check and the post-round states, which used to read it separately. Inside a watch round
+  # it is the round's own head read, taken from the snapshot: that read was made after the feeds
+  # this function is holding, so the ordering is the same one — and the state cannot then be
+  # anchored on a head the round classified nothing against (ludics-lite#95).
+  state_head_read "$pr"
 
   # A no-findings verdict naming the CURRENT head outranks a live-looking 👀, and must be checked
   # BEFORE the in-flight return below: with the placeholder off the comment clock, a verdict
@@ -1688,13 +1854,15 @@ item_about_head() { # <stamp> <head sha>
 # matched to a head that replaced the one it was written against. The read is skipped when the
 # poll failed: there is nothing to classify, and an outage is not the moment to spend a call.
 #
-# It is a read of its own, not status_state's, and that is one extra call per round on top of the
-# eight or so a round already makes. Sharing one would mean sharing the FEED reads too — the two
-# read the same three feeds for different questions — and the ordering each depends on is what
-# makes both answers exact. A round of a watch is 90 seconds apart; the call is affordable and the
-# guarantee is not.
+# It is the round's ONE head read, and status_state takes it from here rather than making its own
+# (ludics-lite#95): the feeds were read first, this head after them, and both halves of the round
+# are then about that one pair of instants. Sharing it is what makes the ordering a property of the
+# round instead of a coincidence of two functions that each got it right — a push landing between
+# this read and the state read used to leave the state anchored on a head this round never
+# classified anything against.
 watch_round() { # <pr> <watermark>
   local entry rest kind id commit login state desc next head_sha mstate head_err pr_created
+  snapshot_arm
   POLLED_OUT=$(cmd_poll "$1" "$2")
   POLLED_RC=$?
   POLLED_MARK="$2"
@@ -1712,10 +1880,16 @@ watch_round() { # <pr> <watermark>
   # like this one, the same trap the `items:` line below documents and which a review of this
   # script drew for real. Taken from a failed round, such a line advances the watermark past
   # findings the retry would then never show.
-  [ "$POLLED_RC" -eq 0 ] || return 0
+  # A round that did not answer publishes nothing: a caller reading the state next must read the
+  # feeds itself and report what ITS read says, rather than take an outage for a quiet feed.
+  [ "$POLLED_RC" -eq 0 ] || {
+    snapshot_drop
+    return 0
+  }
   next=$(sed -n 's/^watermark: //p' <<<"$POLLED_OUT" | tail -1)
   case "$next" in [0-9]*,[0-9]*,[0-9]*) POLLED_MARK="$next" ;; esac
   pr_head_read "$1"
+  snapshot_put_head "$1"
   POLLED_HEAD="$head_sha"
   # From the `items:` line poll emits, never from the rendered headers: a reviewer BODY can carry
   # a line that looks exactly like a header (see cmd_poll). Splitting on whitespace is the point.
@@ -1966,7 +2140,17 @@ watch_grace_deadline() {
   echo $((SECONDS + GRACE - age))
 }
 
+# The round snapshot belongs to this command and to nothing after it, hence the wrapper: the loop
+# arms a snapshot on every round, and the arming must not outlive the watch. Its locals stay in
+# watch_loop, which is the scope watch_note_past and pr_head_read reach into.
 cmd_watch() {
+  local rc=0
+  watch_loop "$@" || rc=$?
+  snapshot_off
+  return "$rc"
+}
+
+watch_loop() {
   local pr="${1:?usage: watch <pr> [watermark]}" mark="${2:-}"
   pr_arg "$pr"
   pr="$PR_NUM"
@@ -4260,6 +4444,22 @@ cmd_base() {
       [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's '$wname' runs on $branch" \
         "($(gh_err_line)); the base's health is UNKNOWN, which is NOT 'green'."
       if [ -n "$part" ]; then
+        # This workflow's rows are ORDERED HERE, not taken as the page served them, exactly as
+        # run_signal has ordered its own feed since ludics-lite#83. The page does come back
+        # newest-first by `created_at` — still a belief the contract pins, because WHICH ten rows
+        # a `per_page=10` page holds depends on it — but rows created in the SAME SECOND have no
+        # order the API documents, and both readers below keep whichever of them they see first:
+        # the fold's newest / newest-completed / newest-judged columns, and base_red_detail's
+        # walk for where a red streak starts. Two pushes to this branch inside one second is
+        # rarer than the two dispatches #83 was about, but the verdict is decided by luck just
+        # the same. (created_at desc, id desc) is a total order over these rows: the later second
+        # still wins, and a tie inside a second goes to the higher run id, the later allocation.
+        # Sorting each workflow's page on its own, rather than the assembled rows, leaves the
+        # report's per-workflow lines in the order the workflow list gave them. A row whose
+        # `created_at` moved or vanished sorts LAST ("-" is below every digit under LC_ALL=C,
+        # and the key is reversed), so a shape drift loses to a well-formed row rather than
+        # silently winning its workflow.
+        part=$(LC_ALL=C sort -t$'\t' -k6,6r -k8,8nr <<<"$part")
         raw="${raw}${part}"$'\n'
       else
         # A listed non-advisory workflow with NO push runs on this branch yet — just added, or

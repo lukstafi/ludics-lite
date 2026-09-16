@@ -118,10 +118,13 @@ for the CLI worker lifecycle, and the explicit separate-conversation alternative
 [Execution reservations](issue-wave/references/executions.md) apply to fleet test/experiment runs
 for either transport, including host-local CLI work, and coordinator integration. Agent residence
 does not confer ownership, and an issue may reserve checks on several boxes. Measurement is
-exclusive per box; correctness runs share a box up to its `FLEET_BOX_CORRECTNESS_SLOTS`. The
+exclusive per box; correctness runs share a box up to its `FLEET_BOX_CORRECTNESS_SLOTS` (six on
+mac-studio), a run-time count a worker takes around each batch with `execution slot -- <batch>`,
+so a standing iteration record gates no agent's start (ludics-lite#160). The
 usual coordinator shape is two calls per execution: `execution run <reserve.json>` (reserve and
 dispatch) and `execution conclude --from-run <run-dir> --request <id> --sha <sha>` (verdict, log and
-checkout read off a `test-run.sh` record on the reserved box). The reservation helper requires Python 3 on the anchor.
+checkout read off a `test-run.sh` record on the reserved box). The reservation helper requires Python 3 on the anchor, and `execution slot` requires it on every
+box that runs batches (the per-box preflight checks it).
 
 ## Routines
 
@@ -156,6 +159,16 @@ mkdir -p "$HOME/.config/wake-lab"
 cp "$HOME/ludics-lite/scripts/wake-lab-hosts.example.sh" "$HOME/.config/wake-lab/hosts.sh"
 chmod 600 "$HOME/.config/wake-lab/hosts.sh"   # then fill in mac_of, eth_mac_of and ip_of
 ```
+
+The WSL boxes are shared, and `wsl.exe --shutdown` is host-global — it destroys the whole VM, so
+every session on that box dies with it. Anything that uses a box for a while therefore reserves it,
+as an `flock` on `~/.local/state/wake-lab/<box>.lock` (`WAKE_LAB_LOCK_DIR` overrides the
+directory), and `restart-wsl` refuses a reserved box until the holder lets go, or `--force` takes
+it anyway. `wake-lab.sh lock-path <box>` answers the path for a harness that wants to take one;
+the contract is only the path and a one-line holder description, so the reserving tool needs
+nothing installed from here. The OCANNL cross-machine sweep reserves each box for the length of
+its lane — on 2026-09-16, before any of this existed, a restart issued mid-sweep destroyed both
+GPU boxes' VMs and cost that run both GPU units.
 
 `WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the verified lab
 lore in the header comment (wake-on-LAN over Ethernet only, waking from a full shutdown, what
@@ -373,8 +386,20 @@ commit GitHub cannot build says `CONFLICTS` on every state and never "the next m
 GitHub still computing is not a conflict, a failed PR read cannot hide a 👍 and is `unknown`
 (exit 3) only where the head SHA decides the state, one PR read serves a whole `status`, and a
 `watch` that returns on a round prints the base-drift read on stderr, against the base branch's
-tip, leaving stdout byte-identical to `poll`'s. `test-pr-review-base-drift.sh` pins the other
-half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
+tip, leaving stdout byte-identical to `poll`'s. It also pins the round's ONE observation
+(ludics-lite#95): a watch round reads the comments, the reviews and the PR once each, publishes
+them, and the state reported beside that round is computed from those same bytes instead of a
+second read a second later — the comments and reviews feeds, the PR, and a new review's own
+comments endpoint each drop from three reads a window to two, one for the state the watch opens
+with and one for the round (the third PR read on a landing round is the base-drift read, a
+different question). Three things the second read was carrying are pinned with it: the round
+reads its head AFTER its feeds, so a push landing on the round's feed read leaves the item
+classified against the new head rather than matched to the one it named (the ludics-lite#47
+ordering, now a property of the round); a push landing AFTER the round's head read cannot
+re-anchor the state to a head the round classified nothing against (the P2 rebutted in the review
+of ludics-lite#84); and a round that did not answer publishes nothing, so the state read after it
+reads the feeds itself, as does a `status` asked after the watch has ended.
+`test-pr-review-base-drift.sh` pins the other half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
 which stands still on a conflicted PR.
 
 `test-pr-review-watch.sh` drives what ends a `watch` (ludics-lite#72), against a fixture that
@@ -469,6 +494,27 @@ no run history whose filter nobody read — each costing the grace rather than a
 re-confirm, since a settle for an older verdict must not be handed to a tip that moved under the
 round.
 
+What the wait loop DECIDES is pinned by the same suite (ludics-lite#93). A red at the tip is the
+tip's own verdict and ends the wait on the round that saw it; a red behind an unjudged tip is the
+fix-in-progress shape and keeps it, so both breaks — the red one and the covered-green one —
+re-confirm the tip before they trust the read that reached them, and at the ceiling `NO VERDICT`
+headlines instead of an older tip's red. The absence grace restarts whenever the tip MOVES, so a
+merge landing after it has already elapsed is not declared green on the spot. A listed workflow
+with no push run at all is ambiguous — dispatch-only, or a newcomer the tip just added — and what
+separates them is the tip's own age, read off the sibling runs at the tip rather than off the
+wait's observation clock (an unreadable timestamp holds nothing). A run that completed
+stopped-not-judged does not speak for the run under it: the newest JUDGED run carries the verdict,
+so a red beneath a cancelled one still stands and a green beneath one still covers the tip. And
+under `--wait` the tip is the question, so a tip read that failed is UNKNOWN rather than something
+to wait through; without `--wait` the same failure costs only the "not the tip" notes.
+
+Each workflow's page of runs is sorted on `(created_at desc, id desc)` before the fold
+(ludics-lite#90), as `run_signal`'s feed has been since #83: two pushes to the branch inside one
+second give their runs the same `created_at`, GitHub documents no order between them, and the fold
+and the streak walk both keep whichever row they see first — so the verdict was decided by luck. A
+tie now goes to the higher run id, the later allocation. Sorting each page rather than the
+assembled rows leaves the report's per-workflow lines in the order the workflow list gave them.
+
 The `test-pr-review-*.sh` suites share a preamble, `test-pr-review-lib.sh`, which sources
 `pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and
 the fixture `gh`'s argument parsing. It also closes the trap that bit twice (ludics-lite#39, #45,
@@ -504,7 +550,13 @@ a read the token was refused (5) from the API not answering or throttling (3), a
 files everything but the last, naming which: the fields `run_signal`, `build_checks`, `run_red_is_advisory_only`, `pr_head_read`,
 `warn_base_drift` and `status_state` index; the workflow file `workflow_paths_ignore` reads under
 the raw media type (the base64 envelope arriving instead would cost every paths-ignore recognition
-silently); the newest-first order of `actions/runs`; the status,
+silently); the newest-first order of `actions/runs`; the two feeds `cmd_base` reads and nothing checked until
+ludics-lite#90 — the workflow list (`actions/workflows?per_page=100`: the id and name the fold
+groups on, the path the filter read asks for, and that this repository fits the single page) and
+the per-workflow, branch-and-event runs page (`actions/workflows/<id>/runs?branch=&event=push`: the
+eight fields the fold projects, `.id` among them since #81, that the `branch=` and `event=` filters
+really filter, and the newest-first order that makes `per_page=10` the newest TEN runs and not ten
+arbitrary ones); the status,
 conclusion, mergeable-state and review-state vocabularies; that a merged PR's `.base.sha` is a
 snapshot standing behind the merge's first parent (anchored on #53); and the reviewer feeds' shapes
 (the `[bot]` suffix, the `+1` approval, `COMMENTED` rounds, the summary tag, 30-per-page

@@ -24,7 +24,18 @@ FAIL_INLINE=""
 HEAD_SHA=head-sha
 MERGEABLE_STATE=clean
 FAIL_PULLS=""
+# Which READS the two simulated pushes fire on, counted from the start of the case: a watch reads
+# every feed once for its opening status and again for each round, so "the push landed on the
+# round's read" is 2, and a bare `status` case's only read is 1.
 PUSH_ON_REVIEWS_READ=""
+# The same simulated push, one read later: the PR read itself arms it, so the FIRST PR read of the
+# process answers the old head and every one after it answers the pushed one. That is a push landing
+# in the gap between a round's head read and the state read beside it — the gap ludics-lite#95
+# closes, and the one a state that re-read the PR would report the round through.
+PUSH_AFTER_PULLS_READ=""
+# The flat inline feed refusing to answer: the shape that fails a poll ROUND, so a case can ask what
+# a round that did not answer leaves behind for the state read after it.
+FAIL_INLINE_FEED=""
 # The base's tip, and the head PUSH_ON_REVIEWS_READ swaps in. With HEAD_SHA these are the only
 # SHAs the transport below spells out, so a case that needs a new head just sets HEAD_SHA.
 BASE_SHA=base-sha
@@ -47,7 +58,9 @@ reset_fixture() {
   HEAD_AT=2026-09-01T00:00:00Z
   FAIL_PULLS=""
   PUSH_ON_REVIEWS_READ=""
-  rm -f "$TEST_ROOT/pushed"
+  PUSH_AFTER_PULLS_READ=""
+  FAIL_INLINE_FEED=""
+  rm -f "$TEST_ROOT/pushed" "$TEST_ROOT"/nth.*
   : >"$REQUEST_LOG"
 }
 
@@ -98,6 +111,15 @@ compare_json() { # <behind> <ahead> <file>
       files:[{filename:$f}]}'
 }
 
+# Which read of <feed> this is, counted from the case's reset. gh runs in a subshell, so the count
+# lives in a file for the same reason the pushed marker does.
+FIXTURE_NTH=0
+fixture_nth() { # <feed>
+  local f="$TEST_ROOT/nth.$1"
+  FIXTURE_NTH=$(($(cat "$f" 2>/dev/null || echo 0) + 1))
+  echo "$FIXTURE_NTH" >"$f"
+}
+
 # Is this SHA a head the fixture is standing behind? The commit read and both compare directions
 # ask, so the three of them agree on one answer and a case that needs a new head costs the one
 # HEAD_SHA assignment it already makes — spelling a head into an endpoint pattern is what used to
@@ -117,11 +139,18 @@ gh() {
   "repos/$REPO/pulls/7/reviews?per_page=100")
     # The simulated push: gh runs in a subshell, so the "new head" travels through a file that
     # the PR read below consults.
-    [ -z "$PUSH_ON_REVIEWS_READ" ] || : >"$TEST_ROOT/pushed"
+    fixture_nth reviews
+    [ "$PUSH_ON_REVIEWS_READ" != "$FIXTURE_NTH" ] || : >"$TEST_ROOT/pushed"
     response="$REVIEWS_JSON"
     ;;
   "repos/$REPO/issues/7/comments?per_page=100") response="$COMMENTS_JSON" ;;
-  "repos/$REPO/pulls/7/comments?per_page=100") response='[]' ;;
+  "repos/$REPO/pulls/7/comments?per_page=100")
+    if [ -n "$FAIL_INLINE_FEED" ]; then
+      echo "gh: 503 No server is currently available to service your request" >&2
+      return 1
+    fi
+    response='[]'
+    ;;
   "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100")
     [ -z "$FAIL_INLINE" ] || return 1
     response="$INLINE_JSON" ;;
@@ -134,6 +163,9 @@ gh() {
     [ ! -e "$TEST_ROOT/pushed" ] || HEAD_SHA="$PUSHED_HEAD"
     response=$(jq -cn --arg h "$HEAD_SHA" --arg m "$MERGEABLE_STATE" \
       '{base:{ref:"main",sha:"stale-base-sha"}, head:{sha:$h}, mergeable_state:$m}')
+    # Armed AFTER the answer, so THIS read still sees the old head and the next one does not.
+    fixture_nth pulls
+    [ "$PUSH_AFTER_PULLS_READ" != "$FIXTURE_NTH" ] || : >"$TEST_ROOT/pushed"
     ;;
   # Before the head arm: `main` is a ref this fixture resolves, not a head it serves.
   "repos/$REPO/commits/main") response="{\"sha\":\"$BASE_SHA\"}" ;;
@@ -181,10 +213,12 @@ run_cmd_status() {
 
 # A watch that returns on its first poll. stdout and stderr are kept apart: the contract is that
 # a round's stdout is byte-identical to poll's, so the drift read has to be on stderr.
-run_watch() {
+# The interval and the timeout are arguments so a case can pin the number of ROUNDS a window makes:
+# an interval past the timeout is exactly one loop round and then the settle.
+run_watch() { # [watermark] [interval] [timeout]
   local rc
   set +e
-  WATCH_INTERVAL=1 WATCH_TIMEOUT=3 cmd_watch 7 "${1:-0,0,0}" >"$TEST_ROOT/watch.out" 2>"$TEST_ROOT/watch.err"
+  WATCH_INTERVAL="${2:-1}" WATCH_TIMEOUT="${3:-3}" cmd_watch 7 "${1:-0,0,0}" >"$TEST_ROOT/watch.out" 2>"$TEST_ROOT/watch.err"
   rc=$?
   set -e
   WATCH_RC="$rc"
@@ -194,6 +228,11 @@ run_watch() {
 
 pulls_reads() {
   grep -c "^repos/$REPO/pulls/7\$" "$REQUEST_LOG" || true
+}
+
+# How many times an endpoint was asked, for the cases that count a round's calls.
+reads_of() { # <endpoint, without the repos/<repo>/ prefix>
+  grep -c -F -x "repos/$REPO/$1" "$REQUEST_LOG" || true
 }
 
 idle_fixture() {
@@ -384,6 +423,114 @@ test_watch_approved_leaves_the_drift_to_merge() {
   assert_contains "$WATCH_OUT" "approved (👍 from" "the approval is on stdout"
   assert_not_contains "$(cat "$REQUEST_LOG")" "compare/" \
     "merge prints the drift read next; the watch does not duplicate it"
+}
+
+
+# --- one observation per round (ludics-lite#95) ------------------------------------------------
+# A watch round used to read the comments, the reviews and the PR twice: once for the round and
+# once again, a second later, for the state reported beside it. The round now publishes what it
+# read and the state takes it, so both halves of a round are about one pair of instants. These
+# cases pin the three things that made the second read look necessary — the call count it cost,
+# the ordering it kept, and the head it was anchored on — and the two it must not break: a failed
+# round hands the state nothing, and a `status` on its own still reads for itself.
+
+test_a_round_and_its_state_are_one_read() {
+  idle_fixture
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "a review of the head is a round to act on"
+  # Two of each, and both are reads the watch could not do without: one for the state the watch
+  # opens with (nothing has been polled yet) and one for the round. Before the snapshot each of
+  # these was read THREE times a window — the opening state, the round, and the state read again
+  # beside it — which on a real watch is four duplicated calls every ninety seconds.
+  assert_eq "$(reads_of 'issues/7/comments?per_page=100')" 2 \
+    "the comments feed should be read once for the opening state and once for the round"
+  assert_eq "$(reads_of 'pulls/7/reviews?per_page=100')" 2 \
+    "the reviews feed should be read once for the opening state and once for the round"
+  # Three PR reads, and the third is not a duplicate of either: `watch_act` reads the base drift
+  # when a round lands, which asks the PR for its base branch and its mergeability at merge-advice
+  # time. It is one read per ROUND THAT LANDS, not one per poll, and it is a different question.
+  assert_eq "$(pulls_reads)" 3 \
+    "one PR read for the opening state, one for the round, and the drift read a landing round makes"
+  # The per-review comments endpoint is the other duplicate: poll re-reads a new review's own
+  # comments because the flat feed lags it, and substantive_reviews asks the same question of the
+  # same review to tell an envelope from findings.
+  reset_fixture
+  REVIEWS_JSON="[$(review 5 head-sha "$PAST" | jq '.body=""')]"
+  INLINE_JSON="[$(jq -cn --arg rev "$REVIEWER" \
+    '{id:41, user:{login:($rev + "[bot]")}, path:"a.sh", line:3, body:"a finding",
+      original_commit_id:"head-sha", commit_id:"head-sha"}')]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "an empty-bodied review with findings of its own is still a round"
+  assert_eq "$(reads_of 'pulls/7/reviews/5/comments?per_page=100')" 2 \
+    "review 5's own comments should be read once for the opening state and once for the round"
+}
+
+test_a_round_reads_the_head_after_its_feeds() {
+  # The #47 ordering, now a property of the ROUND: the push lands on the round's reviews read, so
+  # the review on file is of the head as it was when the feeds were read and the head read after
+  # them is the new one. The round holds its item back and the state is about the new head.
+  # Reversed — the head read before the feeds — the round would have matched that review to the
+  # head it named and acted on it, and the state beside it would have reported `idle` for a head
+  # that had already been replaced.
+  idle_fixture
+  # A head pushed seconds ago, so the `expected` grace this leaves cannot expire underneath the
+  # case and turn the quiet window into the nudge verdict.
+  HEAD_AT=$(jq -rn 'now | todate')
+  PUSH_ON_REVIEWS_READ=2
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 1 "a review of the head the feeds were read at is not a review of the new head"
+  assert_contains "$WATCH_ERR" "NOT about head ${PUSHED_HEAD:0:7}" \
+    "the round should classify its item against the head read after its feeds"
+  assert_contains "$WATCH_ERR" "no review of head ${PUSHED_HEAD:0:7}" \
+    "and the state beside it should be about that same head, never the one the push replaced"
+  local order
+  order=$(awk -v feed="repos/$REPO/pulls/7/reviews?per_page=100" -v pr="repos/$REPO/pulls/7" '
+    $0 == feed { f = NR } $0 == pr { p = NR }
+    END { if (f && p && p > f) print "after"; else print "feed=" f " pr=" p }' "$REQUEST_LOG")
+  assert_eq "$order" after "the round's PR read should come after its feeds"
+}
+
+test_the_state_is_about_the_head_the_round_was_classified_against() {
+  # The push lands in the gap the second read opened: after the round's head read, before the
+  # state beside it. Re-anchoring there is what swallowed a round just delivered about the head
+  # being watched (the P2 rebutted in the review of ludics-lite#84) — the watch would print the
+  # round and, beside it, a state saying no review of the head exists.
+  idle_fixture
+  PUSH_AFTER_PULLS_READ=2
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "the round about the head the feeds were read at is still the round"
+  assert_contains "$WATCH_ERR" "reviewed head ${HEAD_SHA:0:7}" \
+    "the state should name the head the round was classified against"
+  assert_not_contains "$WATCH_ERR" "no review of head" \
+    "a push landing after the round's head read must not re-anchor the state to it"
+}
+
+test_a_failed_round_hands_the_state_nothing() {
+  # Only a round that ANSWERED publishes. A poll that failed leaves no snapshot, so the state read
+  # after it reads the feeds itself and reports what its own read says — the collapse api_list
+  # refuses to make (a failed read as an empty feed) must not come back in through the snapshot.
+  idle_fixture
+  FAIL_INLINE_FEED=1
+  run_watch 0,0,0 9 1
+  assert_eq "$WATCH_RC" 3 "a window whose polls never answered is not a quiet window"
+  assert_contains "$WATCH_ERR" "the next move is yours" \
+    "the state beside a failed round is still read, and reads the reviewer's idle head"
+  assert_eq "$(reads_of 'pulls/7/reviews?per_page=100')" 4 \
+    "one read per failed poll and one per state read after it: nothing is shared from a round that failed"
+}
+
+test_status_after_a_watch_reads_for_itself() {
+  # The snapshot belongs to its watch. A `status` asked afterwards — the same process, since these
+  # suites source the script — must read the PR as it is now, not replay the window that ended.
+  idle_fixture
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "the round lands and the watch returns"
+  REVIEWS_JSON="[$(review 5 other-sha "$PAST")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected \
+    "a status after the watch should read the feeds as they are now"
+  assert_contains "$(state_detail "$STATE")" "no review of head ${HEAD_SHA:0:7}" \
+    "and report the head it just read, not the one the watch was holding"
 }
 
 # --- the reviewer that never started (ludics-lite#78) ------------------------------------------
@@ -770,6 +917,11 @@ tests=(
   test_detail_is_the_last_field_and_keeps_pipes
   test_watch_reads_the_drift_when_a_round_lands
   test_watch_approved_leaves_the_drift_to_merge
+  test_a_round_and_its_state_are_one_read
+  test_a_round_reads_the_head_after_its_feeds
+  test_the_state_is_about_the_head_the_round_was_classified_against
+  test_a_failed_round_hands_the_state_nothing
+  test_status_after_a_watch_reads_for_itself
   test_initialization_failure_is_its_own_state
   test_a_failure_naming_no_ref_is_not_attributed
   test_a_differently_worded_failure_is_missed_not_guessed
