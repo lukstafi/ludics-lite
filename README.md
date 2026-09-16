@@ -377,7 +377,19 @@ token that is not a comment id or several joined by single `+` is refused before
 posted, and so is an unquoted body (the arity, not `${3:?}`, which would post its first word). A
 failure MID-batch never says "nothing was posted" once the anchor has landed: it names what landed
 and which ids to retry with, with the same failure at the anchor as the control, and the write
-exits stay apart inside a batch — a 4xx rejected (1), anything else ambiguous (3).
+exits stay apart inside a batch — a 4xx rejected (1), anything else ambiguous (3). The suite also
+pins where a write is ALLOWED to land (ludics-lite#92): `resolve_repo` verified a cached repo
+against `repos/<repo>/pulls/<n>` and trusted the cwd-inferred one above it outright, and cached it,
+so a bare `reply 7` from a shell in another project's worktree posted into that project's PR 7 and
+remembered the wrong repo for every later call. The repo is now NAMED or refused — neither the cwd nor
+the per-PR cache is a source any longer, and verifying either would not have made it one, since
+`repos/<repo>/pulls/7` answers "this repository has a seventh PR" and every active repository does.
+The cases run the writing commands from a scratch checkout naming a third repository with
+`gh repo view` answering a fourth, as in `run-watch`'s control, and nothing is read before the
+refusal; a checkout that really *has* PR 7 gets its own case, since that is the invocation a
+verification could not fail on, and so does a bare number following a call that named a repo, which
+is the ambiguity the cache carried across checkouts and sessions. The control is a named repo
+writing from that same wrong cwd.
 
 `test-pr-review-base-red.sh` covers the other `base` — the one that answers "is the branch I am
 about to work off green", and what it says once the answer is no (ludics-lite#73). A red names the
