@@ -1188,7 +1188,85 @@ Current findings follow.
   assert_eq "$(state_tok "$STATE")" idle "paginated evidence larger than one argv element still parses"
 }
 
+# --- a jq program that ERRORS must fail the poll round (ludics-lite#89) -------------------------
+# The shim the status and rounds suites use: refuse exactly the jq invocation whose program
+# carries the marker — nonzero status, nothing on stdout — and forward everything else to the real
+# jq. It shadows a command, not a library function, so it needs no `stub`.
+#
+# cmd_poll's reads used to be unguarded, and each failed in the shape that is hardest to see: the
+# list of new reviews to re-read came back empty (no new reviews), a rendering printed nothing (no
+# items of that kind), and an `items:`/`watermark:` field built inside the `echo`'s own command
+# substitution came back empty while the line still printed — and the watermark was then advanced
+# past findings that were never shown.
+BREAK_JQ=""
+jq() {
+  local arg
+  if [ -n "$BREAK_JQ" ]; then
+    for arg in "$@"; do
+      case "$arg" in
+      *"$BREAK_JQ"*)
+        echo "jq: error: \$broken is not defined at <top-level>" >&2
+        return 3
+        ;;
+      esac
+    done
+  fi
+  command jq "$@"
+}
+
+run_poll() { # [watermark]
+  local rc
+  set +e
+  POLL_OUT=$(cmd_poll 7 "${1:-0,0,0}" 2>"$TEST_ROOT/poll.err")
+  rc=$?
+  set -e
+  POLL_RC="$rc"
+  POLL_ERR=$(cat "$TEST_ROOT/poll.err")
+}
+
+# assert_poll_refuses <marker> <expected exit> <site>: break the one program the marker names and
+# require the round to be refused whole — no watermark, so the caller keeps the one it had and
+# polls the same feed again rather than advancing past what this round could not render.
+assert_poll_refuses() {
+  BREAK_JQ="$1"
+  run_poll
+  BREAK_JQ=""
+  assert_eq "$POLL_RC" "$2" "$3: a jq program error must fail the round"
+  assert_not_contains "$POLL_OUT" "watermark: " "$3: a failed round must not write a watermark"
+}
+
+test_a_broken_jq_program_fails_the_poll_round() {
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2")]"
+  schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z)]"
+  schedule comments 1 "[$(summary_comment 700 2026-09-01T10:00:00Z 'a findings summary')]"
+  # The control: a marker no program carries leaves an ordinary, complete round.
+  BREAK_JQ='zzz-no-program-carries-this'
+  run_poll
+  BREAK_JQ=""
+  assert_eq "$POLL_RC" 0 "the shim must break only the program it is pointed at"
+  assert_contains "$POLL_OUT" "items: inline:900" "the control round renders its inline item"
+  assert_contains "$POLL_OUT" "summary:700" "and its summary item"
+  assert_contains "$POLL_OUT" "review:800" "and its review item"
+  assert_contains "$POLL_OUT" "watermark: 900,700,800" "and writes the watermark"
+
+  # The review list feeding the per-review re-read: empty used to mean "no new reviews", so a
+  # broken program dropped every review's own inline comments and the round still printed.
+  assert_poll_refuses '| .[].id' 3 "the list of reviews to re-read"
+  assert_contains "$POLL_ERR" "this round is UNKNOWN, not quiet" \
+    "the refusal should say the round is unknown rather than quiet"
+
+  assert_poll_refuses '(no new inline comments)' 4 "the inline rendering"
+  assert_poll_refuses '"--- summary id=' 4 "the summary rendering"
+  assert_poll_refuses '"--- review id=' 4 "the review rendering"
+  assert_poll_refuses '"inline:\(thread_list)' 4 "the items line's inline field"
+  assert_poll_refuses '"summary:\(.id)' 4 "the items line's summary field"
+  assert_poll_refuses '"review:\(.id)' 4 "the items line's review field"
+  assert_poll_refuses '.id // 0, $m] | max' 4 "the watermark maxima"
+}
+
 tests=(
+  test_a_broken_jq_program_fails_the_poll_round
   test_current_head_evidence_handles_unknown_age_footer_and_large_feeds
   test_current_head_running_blocks_older_approval_until_completion
   test_a_new_request_during_fixed_grace_remains_pending
