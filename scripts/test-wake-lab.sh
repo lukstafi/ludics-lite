@@ -527,6 +527,28 @@ out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1); rc=$?
   || ko "a second --hold spawned another holder (rc=$rc) -- $out; $(cat "$SSH_LOG")"
 env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
 
+# `wsl --shutdown` is HOST-GLOBAL, so a restart on a box a lane is holding destroys that lane's VM
+# and its holder. The reuse check inside the hold comes too late -- the shutdown has already gone
+# out -- so the restart is refused before the kick, while a plain kick stays available because it
+# has no shutdown to refuse and is the recovery command for a box with no VM.
+rm -rf "$TMP/state"
+held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
+lane_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
+      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+      SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=30 "$WL" restart-wsl --hold rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ! grep -q -- '--shutdown' "$SSH_LOG" \
+  && grep -q "wsl restart REFUSED on: rog" <<<"${out##*$'\n'}" && alive "$lane_pid" \
+  && ok "a restart is refused on a box a lane is holding, before any host-global shutdown (rc=$rc)" \
+  || ko "a restart tore down a held lane's VM (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+: > "$SSH_LOG"
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'wsl holder already running for rog' <<<"$out" && ! grep -q -- '--shutdown' "$SSH_LOG" \
+  && ok "...while a plain kick-wsl --hold on the same box is still allowed and reuses the holder (rc=$rc)" \
+  || ko "the refusal also blocked the recovery kick (rc=$rc) -- $out"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+
 # A holder that another run is in the middle of creating is an EMPTY record, between its claim and
 # its pid write. Clearing that as stale would let both runs spawn a holder with one pid recorded --
 # the race the claim exists to prevent -- so a fresh empty claim is refused, and only an abandoned
@@ -644,6 +666,13 @@ out=$(env WAKE_LAB_SWEEP_HOURS=08-11 WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL
   || ko "a zero-padded window aborted the warn-only check (rc=$rc) -- $out"
 # A window that is not a pair of clock hours is a configuration finding, not an hour to judge:
 # `7`, `7--11` and `24-25` all survived a check that read only the two extracted endpoints.
+# Equal endpoints are an EMPTY range, the end being exclusive -- not a one-hour window.
+out=$(env WAKE_LAB_SWEEP_HOURS=7-7 WAKE_LAB_HOSTS="$TMP/hosts.sh" SSH_UP="rog-lan" \
+      SSH_REG="$(reg_out 0x6 0x0 0x0)" "$WL" status rog 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q "WAKE_LAB_SWEEP_HOURS='7-7' is an empty range" <<<"$out" \
+  && ! grep -q 'cover the sweep window' <<<"$out" \
+  && ok "an empty sweep window is reported as empty, not judged as one hour (rc=$rc)" \
+  || ko "7-7 was silently read as a one-hour window (rc=$rc) -- $out"
 for bad in 7 7--11 24-25 morning; do
   out=$(env WAKE_LAB_SWEEP_HOURS="$bad" WAKE_LAB_HOSTS="$TMP/hosts.sh" SSH_UP="rog-lan" \
         SSH_REG="$(reg_out 0x6 0x0 0x0)" "$WL" status rog 2>&1); rc=$?

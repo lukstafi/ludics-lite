@@ -596,7 +596,7 @@ shutdown_unheld_vm() { # shutdown_unheld_vm <box> <windows-alias> — rc 0 only 
 }
 
 hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait until Windows shows one
-  local name=$1 dest=$2 pid f deadline rec spawn_epoch spawned=0 _
+  local name=$1 dest=$2 pid f deadline rec spawn_epoch spawned=0 own theirs _
   f=$HOLD_STATE_DIR/hold-$name.pid
   mkdir -p "$HOLD_STATE_DIR" 2>/dev/null
   if hold_pid_live "$f"; then
@@ -685,9 +685,19 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
     # still between fork and exec carries none, and release_hold would then drop the record and
     # leave it to become an unrecorded holder. There is no pid-reuse hazard here — this pid is our
     # own child, alive or not, for as long as this shell has not reaped it.
-    kill "$pid" 2>/dev/null
+    # ...but prove the pid is still ours before signalling it. Two shapes count: it carries the
+    # holder's signature, or its command line is still a copy of OURS, which is what a child
+    # between fork and exec looks like. Anything else is a number that has been recycled onto an
+    # unrelated process, and killing that would be far worse than leaving a holder to be reaped.
+    if hold_pid_live "$f" ||
+       { own=$(ps -ww -o args= -p $$ 2>/dev/null); theirs=$(ps -ww -o args= -p "$pid" 2>/dev/null)
+         [ -n "$theirs" ] && [ "$theirs" = "$own" ]; }; then
+      kill "$pid" 2>/dev/null
+      echo "  wsl holder on $name stopped (pid $pid): nothing holds that VM"
+    else
+      echo "  wsl holder on $name is gone (pid $pid no longer names it): nothing holds that VM"
+    fi
     rm -f "$f" 2>/dev/null
-    echo "  wsl holder on $name stopped (pid $pid): nothing holds that VM"
   elif [ "$spawned" = 1 ]; then
     # We spawned a holder, but the record no longer names it: a concurrent run replaced it after
     # ours exited. Killing what the file names now would unhold THAT run's lane.
@@ -792,7 +802,13 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
     echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, a span Windows cannot mean (its maximum is 18 h), so the setting is reset or malformed"
     return 0
   fi
-  len=$(( (we - ws + 24) % 24 )); [ "$len" -eq 0 ] && len=1
+  # End-exclusive, so equal endpoints are an empty range, not a one-hour one: forcing len=1 would
+  # judge a single hour and print the quiet line over a window nobody meant.
+  if [ "$ws" -eq "$we" ]; then
+    echo "  ACTIVE HOURS WARNING on $name: WAKE_LAB_SWEEP_HOURS='$SWEEP_HOURS' is an empty range (the end is exclusive)"
+    return 0
+  fi
+  len=$(( (we - ws + 24) % 24 ))
   for ((i = 0; i < len; i++)); do
     h=$(( (ws + i) % 24 ))
     hour_active "$h" "$s" "$e" || uncovered="$uncovered $h"
@@ -884,7 +900,7 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 WSL_FAILED=""
 start_wsl() {
   local n i dir krc kphase kheld what=kick started=() unshut=() unstarted=() up=() down=() rc=0 line
-  local unheld_down=() unheld_up=()
+  local unheld_down=() unheld_up=() refused=()
   [ "$FRESH_WSL" = fresh ] && what=restart
   # One box at a time meant one wedged box could cost its neighbours their restart entirely: on
   # 2026-09-16 rog's start probe hung and minix, second in the loop, never got a restart at all —
@@ -901,7 +917,18 @@ start_wsl() {
     # rather than as globals; a box whose subshell died outright reads as a plain failed start,
     # never as a success. The HOLD step runs in that same subshell, for the same reason the kick
     # does: a box whose holder cannot be established must not cost its neighbour the settle.
-    { kick_wsl "$n" "$FRESH_WSL" >"$dir/$i.out" 2>&1
+    { # A held box is a lane in progress, and `wsl --shutdown` is HOST-GLOBAL: it destroys that
+      # lane's VM and the holder with it. The reuse check inside hold_wsl comes too late, since
+      # the shutdown has already gone out by then — so refuse the restart before the kick, and say
+      # what to run instead. (A plain kick has no shutdown to refuse and stays available: it is
+      # the recovery command for a box with no VM at all.)
+      if [ "$HOLD" = 1 ] && [ "$FRESH_WSL" = fresh ] &&
+         hold_pid_live "$HOLD_STATE_DIR/hold-$n.pid"; then
+        echo "  wsl restart REFUSED on $n: a holder of ours is live there, so another lane is using that VM, and wsl --shutdown would take it down with the lane. Run 'wake-lab.sh unhold $n' first, or use kick-wsl --hold." >"$dir/$i.out"
+        printf '%s %s %s\n' 1 heldelsewhere na >"$dir/$i.rc"
+        exit 0
+      fi
+      kick_wsl "$n" "$FRESH_WSL" >"$dir/$i.out" 2>&1
       krc=$?; kheld=na
       if [ "$krc" = 0 ] && [ "$HOLD" = 1 ]; then
         { check_active_hours "$n" "$KICK_DEST"
@@ -934,6 +961,7 @@ start_wsl() {
         failup)   unheld_up+=("$n") ;;
         *)        started+=("$n") ;;
       esac
+    elif [ "$kphase" = heldelsewhere ]; then refused+=("$n")
     elif [ "$kphase" = shutdown ]; then unshut+=("$n")
     else unstarted+=("$n"); fi
   done
@@ -965,6 +993,10 @@ start_wsl() {
   # Two shapes, and they are different findings: a VM that is gone costs the lane its coverage,
   # while one still running unheld gets swept by the lanes (they probe the guest themselves) and
   # dies mid-unit. Never claim a shutdown that did not happen.
+  if [ ${#refused[@]} -gt 0 ]; then
+    line="wsl $what REFUSED on: ${refused[*]} (a live holder of ours is on that box: another lane is using the VM, and wsl --shutdown is host-global). Run 'unhold' there first."
+    echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
+  fi
   if [ ${#unheld_down[@]} -gt 0 ]; then
     line="wsl HOLD FAILED on: ${unheld_down[*]} (nothing on the Windows side holds the VM, so it was shut down again: those units record no coverage)"
     echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
