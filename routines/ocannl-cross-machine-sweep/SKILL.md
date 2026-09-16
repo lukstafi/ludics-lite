@@ -53,11 +53,15 @@ explicitly** once the sweep has finished (step 2), for every box you held:
 
 Run that even when the sweep failed or a box never woke — `unhold` over a box with no holder says
 so and exits 0. `wsl HOLD FAILED on: <box>` in the last lines means the VM started but nothing on
-the Windows side holds it. You do not have to keep that box out of the sweep by hand: a VM the
-same command created is shut down again, so the lane's units record `skip (unreachable)` — honest
-non-coverage — instead of running on a VM that can vanish under them. Report that box's backends
-as untestable today, the same as `wsl still down` below. If the line also says the shutdown failed,
-the guest is up and unheld: say so in the report, since its units may run and die mid-unit.
+the Windows side holds it, and the line says which of two situations that is:
+
+- `...so it was shut down again: those units record no coverage` — the VM this command created is
+  gone, you need do nothing by hand, and that box's units will record `skip (unreachable)`. Report
+  its backends as untestable today, the same as `wsl still down` below.
+- `...the VM is up and UNHELD and was not shut down: do not sweep that box` — the guest is still
+  reachable, so the lanes WILL run its units and those units can die mid-run. This is the shape the
+  recovery rerun below can produce. Do not launch the sweep for that box: report its backends as
+  untestable, and say in the report that an unheld guest was left running.
 
 It always terminates. Every remote command it issues runs under a wall-clock cap, and the boxes
 are restarted concurrently, so it cannot sit on a wedged `wsl.exe` the way it did on 2026-09-16 —

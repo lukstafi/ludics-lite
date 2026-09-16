@@ -575,13 +575,14 @@ win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe run
 # mid-run, which is the whole failure being fixed. Shut it down instead and let the unit record an
 # honest `skip (unreachable)`. Only for a VM this run created (`restart-wsl`): on a plain kick the
 # guest may be the owner's, and taking it away over a failed hold would be a nasty surprise.
-shutdown_unheld_vm() { # shutdown_unheld_vm <box> <windows-alias>
+shutdown_unheld_vm() { # shutdown_unheld_vm <box> <windows-alias> — rc 0 only if the VM really went
   if capped "$WSL_SHUTDOWN_CAP" \
       ssh -o BatchMode=yes -o ConnectTimeout=15 "$2" 'wsl.exe --shutdown' >/dev/null 2>&1; then
     echo "  wsl shut down on $1: a fresh VM that cannot be held would die mid-unit, so the lane records no coverage instead"
-  else
-    echo "  wsl on $1 is up and UNHELD and the shutdown failed too: do not sweep that box"
+    return 0
   fi
+  echo "  wsl on $1 is up and UNHELD and the shutdown failed too: do not sweep that box"
+  return 1
 }
 
 hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait until Windows shows one
@@ -853,7 +854,8 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 # `wsl up`.
 WSL_FAILED=""
 start_wsl() {
-  local n i dir krc kphase kheld what=kick started=() unshut=() unstarted=() unheld=() up=() down=() rc=0 line
+  local n i dir krc kphase kheld what=kick started=() unshut=() unstarted=() up=() down=() rc=0 line
+  local unheld_down=() unheld_up=()
   [ "$FRESH_WSL" = fresh ] && what=restart
   # One box at a time meant one wedged box could cost its neighbours their restart entirely: on
   # 2026-09-16 rog's start probe hung and minix, second in the loop, never got a restart at all —
@@ -879,8 +881,12 @@ start_wsl() {
             kheld=fail
           elif hold_wsl "$n" "$KICK_DEST"; then kheld=ok
           else
-            [ "$FRESH_WSL" = fresh ] && shutdown_unheld_vm "$n" "$KICK_DEST"
-            kheld=fail
+            # `failup` unless the VM was really taken down: on the kick path there is no shutdown
+            # to attempt (the guest may be the owner's), and a fresh-VM shutdown can itself fail.
+            # The verdict must say which, because a guest that is still up and unheld gets swept
+            # by the lanes and dies mid-unit, and one that is gone simply records no coverage.
+            kheld=failup
+            if [ "$FRESH_WSL" = fresh ] && shutdown_unheld_vm "$n" "$KICK_DEST"; then kheld=faildown; fi
           fi; } >>"$dir/$i.out" 2>&1
       fi
       printf '%s %s %s\n' "$krc" "${KICK_PHASE:-none}" "$kheld" >"$dir/$i.rc"; } &
@@ -894,7 +900,11 @@ start_wsl() {
     [ -s "$dir/$i.rc" ] && read -r krc kphase kheld < "$dir/$i.rc"
     if [ "$krc" = 0 ]; then
       # A VM nothing holds is not a started box: it is the one shape --hold exists to refuse.
-      if [ "$kheld" = fail ]; then unheld+=("$n"); else started+=("$n"); fi
+      case "$kheld" in
+        faildown) unheld_down+=("$n") ;;
+        failup)   unheld_up+=("$n") ;;
+        *)        started+=("$n") ;;
+      esac
     elif [ "$kphase" = shutdown ]; then unshut+=("$n")
     else unstarted+=("$n"); fi
   done
@@ -923,8 +933,15 @@ start_wsl() {
     else line="wsl $what FAILED on: ${unstarted[*]} (the start failed on every alias)"; fi
     echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
   fi
-  if [ ${#unheld[@]} -gt 0 ]; then
-    line="wsl HOLD FAILED on: ${unheld[*]} (the VM started but nothing on the Windows side holds it; a VM this run created was shut down again)"
+  # Two shapes, and they are different findings: a VM that is gone costs the lane its coverage,
+  # while one still running unheld gets swept by the lanes (they probe the guest themselves) and
+  # dies mid-unit. Never claim a shutdown that did not happen.
+  if [ ${#unheld_down[@]} -gt 0 ]; then
+    line="wsl HOLD FAILED on: ${unheld_down[*]} (nothing on the Windows side holds the VM, so it was shut down again: those units record no coverage)"
+    echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
+  fi
+  if [ ${#unheld_up[@]} -gt 0 ]; then
+    line="wsl HOLD FAILED on: ${unheld_up[*]} (the VM is up and UNHELD and was not shut down: do not sweep that box, its units can die mid-unit)"
     echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
   fi
   return $rc

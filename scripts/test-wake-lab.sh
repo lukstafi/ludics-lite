@@ -377,6 +377,9 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HO
   && awk '/^rog-lan :: wsl.exe -d Ubuntu -e true$/ { t = NR } /^rog-lan :: wsl.exe --shutdown$/ { s = NR } END { exit !(t && s && t < s) }' "$SSH_LOG" \
   && ok "a fresh VM whose hold failed is shut down again rather than left for the sweep (rc=$rc)" \
   || ko "an unheld fresh VM was left running (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+grep -q 'so it was shut down again: those units record no coverage' <<<"${out##*$'\n'}" \
+  && ok "...and the verdict line says the VM is gone, which is what the routine reads" \
+  || ko "the verdict did not report the shutdown -- $out"
 # But never a VM that was already there: on a plain kick the guest may be the owner's, and taking
 # it away over a failed hold of ours would be a nasty surprise.
 rm -rf "$TMP/state"; : > "$SSH_LOG"
@@ -384,6 +387,13 @@ out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_EMPTY" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ! grep -q -- '--shutdown' "$SSH_LOG" \
   && ok "...while a plain kick-wsl --hold never shuts down a VM it did not create (rc=$rc)" \
   || ko "a failed hold shut down a VM this run did not create (rc=$rc) -- $(cat "$SSH_LOG")"
+# ...and then the verdict must NOT claim a shutdown that did not happen. This is the sweep
+# routine's own retry command: an operator told the VM is gone leaves a reachable unheld guest for
+# the lanes to find, and its unit dies mid-run.
+grep -q 'the VM is up and UNHELD and was not shut down: do not sweep that box' <<<"${out##*$'\n'}" \
+  && ! grep -q 'shut down again' <<<"$out" \
+  && ok "...and the verdict says the guest is still up and unheld, never that it was shut down" \
+  || ko "the verdict claimed a shutdown that never happened -- $out"
 
 # unhold ends the holder explicitly, which is the only way a lane ends.
 rm -rf "$TMP/state"; : > "$SSH_LOG"
