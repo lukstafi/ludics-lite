@@ -36,7 +36,7 @@ author's fleet (the header of `scripts/fleet-worker.sh` is the authoritative lis
 | The flotilla status and wake service, if any | `FLEET_FLOTILLA` |
 | Local state directory for each coordinator | `ISSUE_WAVE_STATE` |
 | State directory on the anchor for the lease and fleet-wide halt | `FLEET_ANCHOR_STATE`; every coordinator must resolve it to the same directory on the anchor |
-| How many correctness executions may share a box (measurement is always exclusive) | `FLEET_BOX_CORRECTNESS_SLOTS` (`<box>=<n>` pairs; `mac-studio=3` with the default roster, one slot otherwise) |
+| How many correctness executions may share a box AT RUN TIME (measurement is always exclusive) | `FLEET_BOX_CORRECTNESS_SLOTS` (`<box>=<n>` pairs; `mac-studio=6` with the default roster, one slot otherwise) |
 
 The rest is prose in this file and is edited in place: the **sequencing plan** path and the
 task that maintains it (Inputs, just below), the **fleet roster** with its hardware and the
@@ -93,9 +93,11 @@ sections as the starting truth, then adjust for churn surfaces the plan does not
 issues editing the same file or golden serialize even if logically independent, and an issue
 that adds test stanzas sequences after one that reshapes the affected goldens or scanners. GPU
 boxes serialize per box for measurement work (the plan's Parallelism section orders each box's
-queue). Agent slots are separate from execution slots: on one box a measurement execution is
-exclusive, and correctness executions share it up to its correctness slots (three on
-mac-studio, one on the WSL boxes; ludics-lite#157) under the reservation protocol.
+queue). Agent slots are separate from execution slots, and the correctness slots bound neither:
+on one box a measurement execution is exclusive through the registry, while correctness batches
+share the box up to its correctness slots (six on mac-studio, one on the WSL boxes;
+ludics-lite#157, #160) - a count taken at RUN TIME by `execution slot`, around each batch, so a
+worker's standing iteration record never gates another worker's start.
 
 A box that is asleep or unreachable is a placement fact, not a blocker: wake it through
 flotilla (`curl -X POST http://mac-studio:7799/api/wake -d '{"machine":"rog"}'`; WSL then needs

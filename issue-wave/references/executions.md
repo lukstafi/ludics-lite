@@ -9,11 +9,25 @@ under the existing coordinator lease lock. Use the same fleet environment as `cl
 A `measurement` assignment is exclusive: it is refused while anything is outstanding on its
 host, and everything is refused while it is outstanding. A `correctness` assignment shares its
 host with other correctness assignments up to the box's slots - `FLEET_BOX_CORRECTNESS_SLOTS`,
-`<box>=<n>` pairs, `mac-studio=3` with the default roster and one slot for any box it does not
+`<box>=<n>` pairs, `mac-studio=6` with the default roster and one slot for any box it does not
 name (ludics-lite#157: the exclusivity was written for measurement noise and for XProtect
 serializing fresh test binaries, and three workers' targeted `-j 4` batches ran side by side on
 the Mac without a stall once the Developer Tools exemption was in place; the WSL boxes keep one
-slot because the dxg bridge is the limit there). Use one canonical box name from the site's roster consistently (for example `rog-nv-wsl`,
+slot because the dxg bridge is the limit there. Six, not three, since ludics-lite#160: the cap
+bounds concurrent load on the box and must never bound how many agents may be in flight).
+
+The count is a RUN-TIME count (ludics-lite#160). A reservation carrying `"standing": true` - a
+correctness record held for a worker's whole life, review waits and idle included - consumes no
+slot; it stays outstanding for everything else, so a measurement still needs the box to itself.
+The slots are taken instead by `fleet-worker.sh execution slot [--wait <seconds>] -- <command>`,
+which the worker runs on its own box around one suite or batch: it refuses while a measurement
+is outstanding on that box, holds one of the box's N slots as a real flock for exactly as long
+as the command runs (the kernel drops it even when the batch is killed), and returns the
+command's own status. It needs no coordinator lease, takes no `--box` (the slot is the local
+box's), and refuses with a line beginning `EXECUTION SLOT REFUSED` - exit 1 for no free slot,
+a measurement or a malformed spec, 4 when the anchor's registry cannot be read. Counting the
+standing record instead had capped agents: on 2026-09-16 a fourth worker was refused a
+reservation while the three holding mac-studio's slots were reading their briefs. Use one canonical box name from the site's roster consistently (for example `rog-nv-wsl`,
 not an alternating SSH alias and app host ID). New reservations and dispatch require exact
 `FLEET_BOXES` entries; aliases and case variants are refused. Configure one canonical entry per
 physical box. Outstanding records outside a changed roster block dispatch until reconciled;
@@ -116,11 +130,24 @@ while an outstanding record refers to it, or while a pending assignment could st
 
 A worker's own targeted correctness batches on its agent host do not each need an assignment.
 The coordinator takes one `kind: correctness` reservation per worker at launch (`execution run`,
-request id `<wave>-<issue>-<host>-iterate`, purpose naming the bounded aliases and `-j` width)
-and names it in the brief; the worker then runs those batches through the project runner
-without asking, blocks on each inside its turn, and reports every run directory. The
-reservation is concluded at hand-back with `conclude --from-run` on the last batch's record.
-Measurement, cross-box legs and full suites still go through a request. This is what the
+request id `<wave>-<issue>-<host>-iterate`, `"standing": true`, purpose naming the bounded
+aliases and `-j` width) and names it in the brief; the worker then runs those batches through
+the project runner without asking, blocks on each inside its turn, and reports every run
+directory. The reservation is concluded at hand-back with `conclude --from-run` on the last
+batch's record. Measurement, cross-box legs and full suites still go through a request.
+
+`"standing": true` is what exempts the record from the box's slot count, and it is explicit
+rather than read off the `-iterate` id convention: a mistyped id must not silently escape the
+cap, and `execution list` shows the exemption as a field. Only a correctness reservation may
+carry it, and only as `true`. In exchange the worker wraps each batch in the run-time lock:
+
+```
+fleet-worker.sh execution slot -- tools/test-run.sh run <alias> -j 4
+```
+
+which blocks until one of the box's slots is free (`--wait`, default 600 seconds, then a
+refusal), runs the batch under it, and returns the batch's own status. The bare suites of a
+repository whose runner is a plain script go through it the same way, one batch per call. This is what the
 2026-09-15 coordinator ended up granting by message after sixteen request/assign/report
 round-trips parked three workers idle between review rounds.
 

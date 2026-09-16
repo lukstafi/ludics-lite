@@ -38,6 +38,7 @@ SECTIONS=(
   "codex workers"
   "halt"
   "execution run and conclude --from-run"
+  "execution slot"
   "usage"
 )
 
@@ -918,6 +919,81 @@ grep -Fq "\"observed_sha\": \"$ran\"" <<<"$out" && ok "...with the reported revi
 jq -n '{request_id:"run-other", verdict:"not-launched", log:"/dev/null", evidence:"fixture never invoked a runner on other"}' > "$TMP/run-other-done.json"
 "${FWX[@]}" execution conclude "$TMP/run-other-done.json" >/dev/null || ko "could not conclude the off-box fixture (setup)"
 expect "a run of a request outside the roster is refused" 1 "canonical FLEET_BOXES" -- "$FW" execution run "$(reqjson run-e)"
+}
+
+section "execution slot" && {
+need_lease
+# The run-time half of the correctness cap (ludics-lite#160): the registry record is ownership,
+# the flock here is what actually bounds concurrent load on the box. testbox has one slot unless
+# the spec says otherwise, and every holder below is killed before the section ends.
+FWS=(env FLEET_BOXES="testbox other" "$FW")
+FWS2=(env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=2" "$FW")
+# held <log> <pattern>: wait until a background holder has announced the slot it took. The line
+# is written after the flock succeeded, so seeing it proves the lock is held, not merely asked for.
+held() {
+  local i
+  for i in $(seq 40); do grep -q "$2" "$1" 2>/dev/null && return 0; sleep 1; done
+  ko "no holder announced $2 in $1: $(cat "$1" 2>/dev/null)"; return 1
+}
+slotreq() { # <id> <kind> [standing] -> a reservation payload file on testbox
+  jq -n --arg id "$1" --arg kind "$2" --argjson standing "${3:-false}" \
+    '{request_id:$id, wave:"w", worker:$id, transport:"subagent", issue:"o/r#1", purpose:"slot fixture",
+      agent_host:"testbox", execution_host:"testbox", repository:"o/r", requested_revision:"origin/master",
+      kind:$kind} + (if $standing then {standing:true} else {} end)' > "$TMP/slot-$1.json"
+  printf '%s' "$TMP/slot-$1.json"
+}
+slotdone() { # <id>: free the box again for the cases below
+  jq -n --arg id "$1" '{request_id:$id, verdict:"not-launched", log:"/dev/null", evidence:"slot fixture never ran a runner"}' > "$TMP/slot-$1-done.json"
+  "${FWS[@]}" execution conclude "$TMP/slot-$1-done.json" >/dev/null || ko "could not conclude $1 (setup)"
+}
+expect "a batch runs under one of the box's run-time slots" 0 "EXECUTION SLOT testbox: slot 1 of 1 held for: echo batch-ran" -- "${FWS[@]}" execution slot -- echo batch-ran
+grep -q batch-ran <<<"$out" && ok "...and the command's own output came through" || ko "the wrapped command's output was lost: $out"
+expect "...and the wrapped command's own status is what the slot call returns" 3 "slot 1 of 1" -- "${FWS[@]}" execution slot -- sh -c 'exit 3'
+expect "a command that cannot be run is a refusal, not a held slot" 127 "cannot run /nonexistent/runner" -- "${FWS[@]}" execution slot -- /nonexistent/runner
+expect "...and the slot it never took is still free" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo still-free
+"${FWS[@]}" execution slot -- sleep 30 > "$TMP/slot-h0.log" 2>&1 &
+h0=$!
+held "$TMP/slot-h0.log" "slot 1 of 1 held" &&
+  expect "a second batch is refused while the box's only run-time slot is held" 1 "all 1 run-time correctness slots busy after 0s" -- "${FWS[@]}" execution slot --wait 0 -- echo second
+# The lock is the kernel's, held on an open descriptor through the exec, so there is no lock file
+# to strand: killing the batch outright -- what a cancelled or stuck suite gets -- frees the slot.
+kill -9 "$h0" 2>/dev/null; wait "$h0" 2>/dev/null
+expect "a killed batch frees its slot at once (the kernel holds the lock, not a file)" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo after-kill
+"${FWS2[@]}" execution slot -- sleep 30 > "$TMP/slot-h1.log" 2>&1 &
+h1=$!
+"${FWS2[@]}" execution slot -- sleep 30 > "$TMP/slot-h2.log" 2>&1 &
+h2=$!
+if held "$TMP/slot-h1.log" "held" && held "$TMP/slot-h2.log" "held"; then
+  grep -q "slot 2 of 2 held" "$TMP/slot-h1.log" "$TMP/slot-h2.log" && ok "two batches run side by side on a two-slot box" || ko "the second batch did not take the second slot"
+  expect "...and a third waits for the deadline, then is refused" 1 "all 2 run-time correctness slots busy after 1s" -- "${FWS2[@]}" execution slot --wait 1 -- echo third
+fi
+kill -9 "$h1" "$h2" 2>/dev/null; wait "$h1" 2>/dev/null; wait "$h2" 2>/dev/null
+expect "the widened cap is read from FLEET_BOX_CORRECTNESS_SLOTS, not baked in" 0 "slot 1 of 2" -- "${FWS2[@]}" execution slot --wait 0 -- echo widened
+# A measurement owns the box through the registry, and the run-time lock reads that before locking.
+"${FWS[@]}" execution run "$(slotreq slot-measure measurement)" >/dev/null || ko "could not reserve the measurement (setup)"
+expect "a batch is refused while a measurement is outstanding on the box" 1 "a measurement holds the box exclusively (slot-measure)" -- "${FWS[@]}" execution slot -- echo during-measurement
+slotdone slot-measure
+expect "...and admitted once the measurement is concluded" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo after-measurement
+# The standing iteration record is ownership and evidence for the worker's whole life, so it
+# does not consume the box's one correctness slot -- an agent start is never gated on it.
+expect "a standing iteration reservation is admitted" 0 '"standing": true' -- "${FWS[@]}" execution run "$(slotreq slot-iterate correctness true)"
+expect "...and leaves the box's correctness slot free for an ordinary reservation" 0 '"state": "launching"' -- "${FWS[@]}" execution run "$(slotreq slot-ordinary correctness)"
+expect "...which does fill it: the next ordinary reservation is refused" 1 "correctness slots 1/1 on testbox" -- "${FWS[@]}" execution run "$(slotreq slot-ordinary-2 correctness)"
+expect "...while another standing record is still admitted" 0 '"standing": true' -- "${FWS[@]}" execution run "$(slotreq slot-iterate-2 correctness true)"
+expect "a batch still takes a run-time slot beside them" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo beside-standing
+slotdone slot-iterate; slotdone slot-iterate-2; slotdone slot-ordinary
+# The site default, the number the references quote: six on mac-studio (ludics-lite#160), and
+# one anywhere the spec does not name -- which is every box under a custom FLEET_BOXES.
+expect "the site default gives mac-studio six run-time slots" 0 "slot 1 of 6" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES FLEET_LOCAL_BOX=mac-studio FLEET_ANCHOR=mac-studio "$FW" execution slot --wait 0 -- echo default-cap
+expect "...and a box the spec does not name has one" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo unnamed-box
+expect "execution slot needs a command after --" 2 "a command to hold the slot around is required" -- "${FWS[@]}" execution slot --
+expect "execution slot refuses a non-numeric --wait" 2 "whole number of seconds" -- "${FWS[@]}" execution slot --wait soon -- echo x
+expect "execution slot takes no --box: the slot is this box's own" 2 "execution slot .--wait <seconds>. -- <command>" -- "${FWS[@]}" execution slot --box other -- echo x
+expect "a malformed slots spec refuses before anything is locked" 1 "<box>=<positive n>" -- \
+  env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=x" "$FW" execution slot -- echo x
+expect "a host with no fleet name has no slot to take" 2 "no fleet name" -- \
+  env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=testbox" "$FW" execution slot -- echo x
 }
 
 section "usage" && {

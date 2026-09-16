@@ -118,7 +118,9 @@ for the CLI worker lifecycle, and the explicit separate-conversation alternative
 [Execution reservations](issue-wave/references/executions.md) apply to fleet test/experiment runs
 for either transport, including host-local CLI work, and coordinator integration. Agent residence
 does not confer ownership, and an issue may reserve checks on several boxes. Measurement is
-exclusive per box; correctness runs share a box up to its `FLEET_BOX_CORRECTNESS_SLOTS`. The
+exclusive per box; correctness runs share a box up to its `FLEET_BOX_CORRECTNESS_SLOTS` (six on
+mac-studio), a run-time count a worker takes around each batch with `execution slot -- <batch>`,
+so a standing iteration record gates no agent's start (ludics-lite#160). The
 usual coordinator shape is two calls per execution: `execution run <reserve.json>` (reserve and
 dispatch) and `execution conclude --from-run <run-dir> --request <id> --sha <sha>` (verdict, log and
 checkout read off a `test-run.sh` record on the reserved box). The reservation helper requires Python 3 on the anchor.

@@ -19,13 +19,18 @@ spells it out. It carried four issues and a release through five PRs on 2026-09-
 stranded worker.
 
 1. **Standing iteration reservation, at launch.** The coordinator takes one `kind:
-   correctness` reservation per worker on its agent host with `fleet-worker.sh execution run`
-   (request id `<wave>-<issue>-<host>-iterate`; see [executions.md](executions.md)) and names
-   it in the brief. It pre-authorizes the worker's own targeted test batches there - each
-   through the project runner (`tools/test-run.sh run ...`), blocked to completion inside the
-   turn, reported by run directory in the worker's messages - with no per-batch request. It is
-   concluded at hand-back from the last batch's record. Boxes hold as many of these as their
-   correctness slots allow (three on mac-studio); a measurement needs the box to itself.
+   correctness`, `"standing": true` reservation per worker on its agent host with
+   `fleet-worker.sh execution run` (request id `<wave>-<issue>-<host>-iterate`; see
+   [executions.md](executions.md)) and names it in the brief. It pre-authorizes the worker's own
+   targeted test batches there - each through the project runner (`tools/test-run.sh run ...`),
+   blocked to completion inside the turn, reported by run directory in the worker's messages -
+   with no per-batch request. It is concluded at hand-back from the last batch's record. Being
+   standing, it consumes no correctness slot, so a box holds as many as it has workers and a
+   worker never waits on a sibling's brief-reading to start. The brief tells the worker to wrap
+   each batch in the run-time lock instead - `fleet-worker.sh execution slot -- <batch>`, which
+   takes one of the box's slots for exactly as long as the batch runs (six on mac-studio, one
+   on a box the spec does not name) and refuses while a measurement is outstanding there; a
+   measurement still needs the box to itself through the registry.
 2. **Request, for everything else.** A measurement, a cross-box leg, a full suite: the worker
    ends its turn with its final message carrying one block and nothing after it:
 
