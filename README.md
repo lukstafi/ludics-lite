@@ -192,6 +192,7 @@ ship-pr/scripts/test-pr-review-reply.sh
 ship-pr/scripts/test-pr-review-run-watch.sh
 scripts/test-wake-lab.sh
 scripts/test-check-prompts.sh
+scripts/test-check-jq-shapes.sh
 scripts/test-sync-routines.sh
 ```
 
@@ -200,7 +201,8 @@ shared Python fixtures on Ubuntu and on macOS (the fleet's bash is 3.2), with ma
 job and a step per suite: the hosted
 macOS runners are scarce enough that four separate macOS jobs queued a green PR for one to two
 hours behind nine minutes of work (ludics-lite#55). Alongside them run `bash -n`, shellcheck at
-error severity, and a check that the two cleanup scripts still carry their parse guard. The suites
+error severity, a check that the two cleanup scripts still carry their parse guard, and the jq
+shape guard (`scripts/check-jq-shapes.sh`, with `scripts/test-check-jq-shapes.sh` beside it). The suites
 run on every push to main and on a pull request that touches anything but Markdown (the top-level
 README counts as script input, since the fleet suite executes its install loops); three jobs run on
 every head regardless, the prompt hygiene check (`scripts/check-prompts.sh`), the lint, and the
@@ -223,6 +225,39 @@ longer reads the other direction, a row that outlived its directory. The scanner
 thirteen rounds of table-syntax edge cases in one review and reopened on every new rule
 (ludics-lite#75). `test-check-prompts.sh` runs it against scratch trees, one per defect, with the
 well-formed tree as the control, and ends by running it on this checkout.
+
+`check-jq-shapes.sh` is the jq shape guard, run in the lint job on every head. jq's `capture`
+yields ZERO outputs when its pattern does not match — not null — and a zero-output sub-expression
+deletes the value that contains it rather than falling back to a default: a string interpolation
+loses the string, an object loses the object, and inside the update expression of a `reduce` the
+whole accumulator goes, so a fold over ten hunks returns null and the path reads as "unread" on a
+patch that parsed fine. Nothing errors, so nothing catches it. Five such sites have been fixed
+across three PRs (ludics-lite#84 three, #104 a fourth, #89 a fifth) while `[capture(…)] | first`
+was documented only in prose beside one of them. The guard is deliberately grep-shaped rather
+than a jq parser: comments are removed first, with enough shell/jq quote state to know a `#`
+that opens one from a `#` inside a string (without that, comment text read as code, and two
+comments could fabricate the wrapper a bare capture was missing); a line beginning with `|`
+continues the line above it; a `capture` left dangling at the end of an expression — its argument
+list on the next line, which jq accepts — is refused rather than followed, since a line-shaped
+scanner cannot certify a wrapper it cannot see; and then EACH `capture` call in the resulting expression is checked against its own brackets
+— the nearest `[` before it with no `]` in between, the `]` that closes that `[` by depth read
+back immediately with the zero-argument `| first` or `| last` (`first(f)` answers with an output
+of `f`, hiding the miss), and the capture alone inside those brackets — one capture, and no comma
+at the wrapper's own depth, since a second element answers `first` when the capture misses. Per
+occurrence rather than per expression, because an existential test certifies
+`([capture("a")] | first), capture("b")` on the first capture's brackets while the second is
+bare; and one wrapper per capture, because `[ ("a" | capture("a")), ("x" | capture("b")) ] |
+first` returns the first match and discards a miss by the second exactly as if it had never been
+wrapped. A call is `capture` with optional whitespace before its argument list, since jq allows
+`capture ("x")`, and a bracket count that a regex character class unbalanced refuses, which is
+the direction that asks for a rewrite rather than passing a bare capture. The issue's second proposed rule — refuse a
+`test(` and a `capture(` on one expression, the #104 shape — collapses into that one, since what
+makes the pair dangerous is the unbracketed capture and not the pairing; a pair that satisfies
+the rule passes, and one that does not is refused with #104 named in the message.
+`test-check-jq-shapes.sh` runs the guard against a scratch file per shape, with the passing shape
+beside each as the control, and then against pr-review.sh as it stood before ludics-lite#89, where
+it must still find the site that PR fixed (skipped on the depth-1 Ubuntu checkout, run on the
+macOS one, which fetches the full history).
 
 `test-fleet-worker.sh` runs its ~180 assertions top to bottom in one shell, which takes about three
 and a half minutes. Arguments narrow that: each one selects every section whose name contains it

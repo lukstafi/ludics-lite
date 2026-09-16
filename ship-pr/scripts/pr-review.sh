@@ -670,10 +670,18 @@ cmd_poll() {
   # comment id — the flat feed's copy wins when both exist, since only it carries current line
   # numbers. A failed per-review read fails the ROUND (unknown, watermark unwritten): the
   # alternative is printing the review while silently dropping its findings.
-  local rid extra='[]' more
-  for rid in $(jq -r --arg rev "$REVIEWER" --argjson since "$m_review" '
+  # The list of reviews to re-read is itself a read that can fail. Unguarded it failed EMPTY —
+  # indistinguishable from "no new reviews this round" — and the round would then render every
+  # review without its own comments and still advance the watermark past them (#89).
+  local rid extra='[]' more new_review_ids
+  new_review_ids=$(jq -r --arg rev "$REVIEWER" --argjson since "$m_review" '
     map(select((.user.login // "") | startswith($rev)) | select(.id > $since))
-    | .[].id' <<<"$reviews"); do
+    | .[].id' <<<"$reviews" 2>/dev/null) || {
+    warn "could not read which reviews on PR $pr are new — this round is UNKNOWN, not quiet"
+    return 3
+  }
+  # shellcheck disable=SC2086 # one id per word, and the point is to split them
+  for rid in $new_review_ids; do
     more=$(api_list "pulls/$pr/reviews/$rid/comments?per_page=100") || {
       warn "API error reading review $rid's comments on PR $pr after $API_ATTEMPTS attempts" \
         "($(gh_err_line)) — this round is UNKNOWN, not quiet"
@@ -720,7 +728,7 @@ cmd_poll() {
   jq -r "$POLL_ITEM_DEFS"'
     if length == 0 then "(no new inline comments)"
     else .[] | "--- inline id=\(thread_list) \(item_path):\(item_line) commit=\(inline_commit) by \(.user.login)\(dupe_note)\n\(body_block)"
-    end' <<<"$new_inline"
+    end' <<<"$new_inline" || return 4
 
   # The connector's "Review Summary" placeholder is machine-tagged with an HTML comment and posted
   # the moment a round STARTS ("🔄 Running"); it carries no findings, but its id is above the
@@ -735,10 +743,12 @@ cmd_poll() {
   # A comment's only head association is the stamp POLL_ITEM_DEFS describes; one carrying none
   # renders `commit=-`, and nothing downstream may read that as "another commit".
   jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
-    .[] | "--- summary id=\(.id) commit=\(item_stamp($rc)) by \(.user.login)\n\(.body)"' <<<"$new_issue"
+    .[] | "--- summary id=\(.id) commit=\(item_stamp($rc)) by \(.user.login)\n\(.body)"' <<<"$new_issue" ||
+    return 4
 
   jq -r "$POLL_ITEM_DEFS"'
-    .[] | "--- review id=\(.id) state=\(.state) commit=\(review_commit) by \(.user.login)\n\(.body // "")"' <<<"$new_reviews"
+    .[] | "--- review id=\(.id) state=\(.state) commit=\(review_commit) by \(.user.login)\n\(.body // "")"' <<<"$new_reviews" ||
+    return 4
 
   # The items above, as one machine-readable line, for a caller that has to decide something about
   # them — `watch` asks which of them are about the head it is watching. Fields per item:
@@ -753,23 +763,31 @@ cmd_poll() {
   # would take a quoted header for an item and end the wait on the round it was there to skip.
   # Read it as the watermark is read, the LAST match: it is emitted after every body, so a body
   # that quotes one of these lines cannot displace it.
-  echo "items: $(
-    jq -r "$POLL_ITEM_DEFS"'[.[] | "inline:\(thread_list):\(inline_commit):\(.user.login):-"] | join(" ")' \
-      <<<"$new_inline"
-  ) $(
-    jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
-      [.[] | "summary:\(.id):\(item_stamp($rc)):\(.user.login):-"] | join(" ")' <<<"$new_issue"
-  ) $(
-    jq -r "$POLL_ITEM_DEFS"'
+  #
+  # Each field is built into a variable before the line is echoed, rather than inside the `echo`'s
+  # command substitutions: a jq that failed there contributed an empty field and the line still
+  # printed, so a broken program read downstream as "this round had no items of that kind" — the
+  # same silent defect the state line's arms exist to prevent (#89). A failed render exits 4 with
+  # the watermark unwritten, so the round is retried rather than advanced past.
+  local items_inline items_issue items_review
+  items_inline=$(jq -r "$POLL_ITEM_DEFS"'[.[] | "inline:\(thread_list):\(inline_commit):\(.user.login):-"] | join(" ")' \
+    <<<"$new_inline") || return 4
+  items_issue=$(jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
+      [.[] | "summary:\(.id):\(item_stamp($rc)):\(.user.login):-"] | join(" ")' <<<"$new_issue") || return 4
+  items_review=$(jq -r "$POLL_ITEM_DEFS"'
       [.[] | "review:\(.id):\(review_commit):\(.user.login):\(.state // "-")"] | join(" ")' \
-      <<<"$new_reviews"
-  )"
+    <<<"$new_reviews") || return 4
+  echo "items: $items_inline $items_issue $items_review"
 
   # Pass this back verbatim next time: per-feed maxima, so replies you post in this round cannot
-  # read back as new findings and a big review id cannot mask a smaller comment id.
-  echo "watermark: $(jq -s --argjson m "$m_inline" '[.[][].id // 0, $m] | max' <<<"$inline"),$(
-    jq -s --argjson m "$m_issue" '[.[][].id // 0, $m] | max' <<<"$issue"),$(
-    jq -s --argjson m "$m_review" '[.[][].id // 0, $m] | max' <<<"$reviews")"
+  # read back as new findings and a big review id cannot mask a smaller comment id. Same rule as
+  # the items line: an empty field here would be read back as the watermark 0 and replay the
+  # whole feed, so each maximum is taken before the line exists.
+  local mark_inline mark_issue mark_review
+  mark_inline=$(jq -s --argjson m "$m_inline" '[.[][].id // 0, $m] | max' <<<"$inline") || return 4
+  mark_issue=$(jq -s --argjson m "$m_issue" '[.[][].id // 0, $m] | max' <<<"$issue") || return 4
+  mark_review=$(jq -s --argjson m "$m_review" '[.[][].id // 0, $m] | max' <<<"$reviews") || return 4
+  echo "watermark: $mark_inline,$mark_issue,$mark_review"
 }
 
 # --- reviewer state ---------------------------------------------------------------------------
@@ -980,7 +998,7 @@ substantive_reviews() { # <pr>; reviews JSON on stdin
 
 status_state() {
   local pr="$1" raw line age plus plus_at eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
-  local running_at evidence evidence_kind evidence_at vline verd_at verd_sha mstate="-" head_err="" pr_created=""
+  local running_at evidence evidence_kind evidence_at running_unread vline verd_at verd_sha mstate="-" head_err="" pr_created=""
   local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at="" nudge_age nudge_id="" nudge_line comments_loaded=false
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
@@ -1014,7 +1032,10 @@ status_state() {
       [.[] | select(.id > $after)
        | select((.body // "") | test("^@codex review[ \t\r\n]*(_🤖 Addressed by an automated coding agent_)?[ \t\r\n]*$"))
        | {id, at: .created_at}] | max_by(.at)
-       | if . == null then "|" else "\(.id)|\(.at)" end' <<<"$comments_raw")
+       | if . == null then "|" else "\(.id)|\(.at)" end' <<<"$comments_raw" 2>/dev/null) || {
+      echo "unknown|-|-|the pending-request comments feed did not parse"
+      return 0
+    }
     nudge_id="${nudge_line%%|*}"
     nudge_at="${nudge_line#*|}"
     nudge_age=$(age_of "$nudge_at")
@@ -1040,12 +1061,19 @@ status_state() {
       def reviewer: select((.user.login // "") | startswith($rev));
       def current: select(.sha != "" and $head != "")
         | select(.sha as $sha | $head | startswith($sha));
-      [($comments[] | reviewer
+      # One entry per Running row the table test admits, each re-matched by the stamp pattern
+      # beside it: `[capture(...)] | first` yields null where they disagree instead of yielding
+      # NOTHING, which unbracketed here would delete not just that row but every later row of
+      # the same stream. The two patterns have to keep agreeing on every Running row, and the
+      # count of nulls is the third field below — how the caller hears that they stopped
+      # agreeing, rather than reading a deleted row as "no round is running" (#89, #104).
+      [$comments[] | reviewer
          | select((.body // "") | contains("codex-pull-request-review-summary"))
          | (.body // "") | split("\n")[]
          | select(test("^\\|[^|]*Code Review[^|]*\\|[^|]*Running"))
-         | capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")
-         | . + {kind:"running"}),
+         | ([capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")] | first)]
+        as $running |
+      [($running[] | select(. != null) | . + {kind:"running"}),
        ($reviews[] | reviewer | select(.submitted_at != null)
          | {sha:(.commit_id // ""), at:.submitted_at, kind:"findings"}),
        ($comments[] | reviewer
@@ -1054,12 +1082,27 @@ status_state() {
             kind:(if (.body // "") | test("[Dd]idn.t find any major issues")
                   then "verdict" else "findings" end)})]
       | map(current | .at |= sub("\\.[0-9]+Z$"; "Z"))
-      | max_by(.at) | if . == null then "|" else "\(.kind)|\(.at)" end' <<<"$comments_raw"$'\n'"$reviews_raw") || {
+      | max_by(.at)
+      | (if . == null then "|" else "\(.kind)|\(.at)" end)
+        + "|" + (($running | map(select(. == null)) | length) | tostring)' \
+      <<<"$comments_raw"$'\n'"$reviews_raw" 2>/dev/null) || {
       echo "unknown|-|$mstate|the current-head review evidence did not parse"
       return 0
     }
     evidence_kind="${evidence%%|*}"
+    running_unread="${evidence##*|}"
     evidence_at="${evidence#*|}"
+    evidence_at="${evidence_at%|*}"
+    # The two Running patterns disagreed on a row. Neither "a round is running" nor "none is"
+    # is readable from a table this script can only half parse, so neither is claimed.
+    case "$running_unread" in
+    0) ;;
+    *)
+      echo "unknown|-|$mstate|a $REVIEWER Code Review row matched the Running test but not the" \
+        "stamp pattern beside it, so the running round could not be read"
+      return 0
+      ;;
+    esac
     if [ -n "$evidence_at" ] && [[ "$evidence_at" > "$plus_at" ]]; then
       case "$evidence_kind" in
       running)
@@ -1158,7 +1201,10 @@ status_state() {
               sha: ([(.body // "") | capture($rc).s] | first // "")}]
       | sort_by(.at) | last
       | if . == null then "|" else "\(.at)|\(.sha)" end' \
-    <<<"$raw" 2>/dev/null) || vline="|"
+    <<<"$raw" 2>/dev/null) || {
+    echo "unknown|-|$mstate|the verdict comments feed did not parse"
+    return 0
+  }
   verd_at="${vline%%|*}"
   verd_sha="${vline#*|}"
   # The initialization failure (INIT_FAILURE_RE above). Only the NEWEST non-placeholder comment is
@@ -1173,7 +1219,10 @@ status_state() {
       | sort_by(.created_at) | last
       | if . == null or ((.body // "") | test($re) | not) then "|"
         else "\(.created_at)|" + ([(.body // "") | capture($refre).s] | first // "")
-        end' <<<"$raw" 2>/dev/null) || fline="|"
+        end' <<<"$raw" 2>/dev/null) || {
+    echo "unknown|-|$mstate|the initialization-failure comments feed did not parse"
+    return 0
+  }
   fail_at="${fline%%|*}"
   fail_ref="${fline#*|}"
   # A new explicit request supersedes older evidence uniformly: neither an old
@@ -1253,7 +1302,10 @@ status_state() {
       rev_head_at=$(jq -r --arg rev "$REVIEWER" --arg sha "$head_sha" '
           [.[] | select((.user.login // "") | startswith($rev))
                | select(.submitted_at != null) | select((.commit_id // "") == $sha)
-               | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || rev_head_at=""
+               | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || {
+        echo "unknown|-|$mstate|the reviews feed did not parse for the failed head"
+        return 0
+      }
       if [ -z "$rev_head_at" ] || [[ "$fail_at" > "$rev_head_at" ]]; then
         # No recurrence count rides on this line. One was tried and removed (review of #82,
         # rounds 1, 3, 4, 5 and 6): "has this head failed before?" has to be measured from the
@@ -1653,9 +1705,16 @@ watch_round() { # <pr> <watermark>
   POLLED_PAST_N=0
   # A failed API round yields no watermark; keeping the caller's stops a transient error from
   # resetting to 0 and replaying the whole backlog as if it were a new round.
+  #
+  # Read ONLY from a round that succeeded, and after the status check, not before it. A round
+  # that fails partway has already printed the bodies it got through — a rendering that could
+  # not run leaves exactly that (#89) — and a reviewer body can carry a line that looks exactly
+  # like this one, the same trap the `items:` line below documents and which a review of this
+  # script drew for real. Taken from a failed round, such a line advances the watermark past
+  # findings the retry would then never show.
+  [ "$POLLED_RC" -eq 0 ] || return 0
   next=$(sed -n 's/^watermark: //p' <<<"$POLLED_OUT" | tail -1)
   case "$next" in [0-9]*,[0-9]*,[0-9]*) POLLED_MARK="$next" ;; esac
-  [ "$POLLED_RC" -eq 0 ] || return 0
   pr_head_read "$1"
   POLLED_HEAD="$head_sha"
   # From the `items:` line poll emits, never from the rendered headers: a reviewer BODY can carry

@@ -637,6 +637,123 @@ test_empty_reviews_need_their_own_findings() {
   assert_eq "$(state_tok "$STATE")" stalled "newer empty envelope cannot supersede current-head Running row"
 }
 
+# --- a jq program that ERRORS must not render as a fact (ludics-lite#89) ------------------------
+# Every jq program status_state runs is a literal inside pr-review.sh, so the way to make ONE of
+# them fail without touching the tracked script is to shim `jq` itself: the shim refuses exactly
+# the invocation whose program carries the marker — nonzero status, nothing on stdout, which is
+# what a rebinding error or a typo'd `$var` produces — and forwards every other call to the real
+# jq. `command jq`, so the shim does not call itself. Like the `gh` fixture above it shadows a
+# COMMAND rather than a library function, which is why it needs no `stub` declaration.
+BREAK_JQ=""
+jq() {
+  local arg
+  if [ -n "$BREAK_JQ" ]; then
+    for arg in "$@"; do
+      case "$arg" in
+      *"$BREAK_JQ"*)
+        echo "jq: error: \$broken is not defined at <top-level>" >&2
+        return 3
+        ;;
+      esac
+    done
+  fi
+  command jq "$@"
+}
+
+# assert_unknown_when_broken <marker> <detail fragment> <site>: break the one program the marker
+# names, on whatever fixture the caller has standing, and require the state to refuse rather than
+# answer. Each case pairs this with a control run on the same fixture, so an `unknown` the shim
+# itself produced could not pass for the site's own refusal.
+assert_unknown_when_broken() {
+  BREAK_JQ="$1"
+  run_status
+  BREAK_JQ=""
+  assert_eq "$(state_tok "$STATE")" unknown "$3: a jq program error must not render as a value"
+  assert_contains "$(state_detail "$STATE")" "$2" "$3: the detail should name the read that did not answer"
+  assert_contains "$LINE" "this is NOT 'not approved', retry" \
+    "$3: the rendered line should refuse, not report"
+}
+
+test_a_broken_jq_program_is_unknown_not_a_value() {
+  idle_fixture
+  # The control the rest of this case rests on: a marker no program carries leaves the state
+  # exactly as it was, so every `unknown` below is the site refusing and not the shim firing.
+  BREAK_JQ='zzz-no-program-carries-this'
+  run_status
+  BREAK_JQ=""
+  assert_eq "$(state_tok "$STATE")" idle "the shim must break only the program it is pointed at"
+
+  assert_unknown_when_broken 'any(.[]; .content == "+1")' \
+    "the reactions feed did not parse" "the reactions feed"
+  assert_unknown_when_broken 'sort_by(.submitted_at) | last' \
+    "the reviews feed did not parse" "the reviews feed"
+  assert_unknown_when_broken '.created_at] | max // ""' \
+    "the comments feed did not parse" "the reviewer's last comment"
+  # These two used to default to "|" — no verdict comment, no initialization failure — which is
+  # a plausible fact about the PR and is the shape ludics-lite#89 was filed on.
+  assert_unknown_when_broken 'sort_by(.at) | last' \
+    "the verdict comments feed did not parse" "the no-findings verdict scan"
+  # `$refre` rather than the `capture($refre)` that surrounds it: the marker is a literal in
+  # THIS file, and scripts/check-jq-shapes.sh reads a bare `capture(` as jq source wherever it
+  # finds one. The variable appears in no other program, so it names the site just as exactly.
+  assert_unknown_when_broken '$refre' \
+    "the initialization-failure comments feed did not parse" "the initialization-failure scan"
+}
+
+test_a_broken_jq_program_is_unknown_on_the_failed_head_read() {
+  failed_fixture "$FAILED_HEAD"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "control: this fixture reaches the failed-head read"
+  # It used to default to "", which reads as "no review of this head" — the very question this
+  # arm is asking, answered by a read that did not happen.
+  assert_unknown_when_broken '(.commit_id // "") == $sha' \
+    "the reviews feed did not parse for the failed head" "the failed-head review read"
+}
+
+test_a_broken_jq_program_is_unknown_on_the_pending_request_read() {
+  idle_fixture
+  # The watch watermark cmd_watch passes down; status_state reads it to identify the request a
+  # round is owed to. A standalone `status` has none, so the site is reached by setting it here.
+  local watch_nudge_after=0
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "control: the pending-request read changes nothing here"
+  assert_unknown_when_broken '^@codex review' \
+    "the pending-request comments feed did not parse" "the pending-request read"
+}
+
+test_a_broken_jq_program_is_unknown_on_the_current_head_evidence() {
+  reset_fixture
+  REACTIONS_JSON="[$(reaction +1 "$PAST")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "control: this fixture reaches the evidence scan"
+  assert_unknown_when_broken '$running | map(select(. == null))' \
+    "the current-head review evidence did not parse" "the current-head evidence scan"
+}
+
+# The other half of ludics-lite#89: a `capture` that never errors, it just stops producing. The
+# table test admits a Code Review Running row and the stamp pattern beside it re-matches the same
+# row; unbracketed, a row the second pattern misses is deleted from the stream — with every row
+# after it — and the older 👍 then stands unopposed. Bracketed, the miss is a null that is
+# counted, and a table this script can only half read is not an approval.
+test_a_running_row_the_stamp_pattern_misses_is_unknown() {
+  reset_fixture
+  HEAD_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  REACTIONS_JSON="[$(reaction +1 "$PAST")]"
+  COMMENTS_JSON="[$(plain_comment 1 "$PAST" '<!-- codex-pull-request-review-summary -->
+| Code Review | Running <relative-time datetime="2026-09-01T00:01:00Z"> | `aaaaaaa` |')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" stalled "control: a row both patterns read is read"
+  # The same row with the `datetime` attribute the stamp pattern needs taken out: still a Running
+  # row to the test beside it, no longer one the stamp can read.
+  COMMENTS_JSON="[$(plain_comment 1 "$PAST" '<!-- codex-pull-request-review-summary -->
+| Code Review | Running now | `aaaaaaa` |')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" unknown \
+    "a Running row the stamp pattern cannot read is not an approval"
+  assert_contains "$(state_detail "$STATE")" "matched the Running test but not the" \
+    "the detail should name the two patterns that stopped agreeing"
+}
+
 tests=(
   test_empty_reviews_need_their_own_findings
   test_idle_clean_says_next_move_is_yours
@@ -664,6 +781,11 @@ tests=(
   test_a_quoted_failure_is_not_a_failure
   test_watch_exits_on_the_initialization_failure
   test_a_standing_verdict_survives_a_failed_re_request
+  test_a_broken_jq_program_is_unknown_not_a_value
+  test_a_broken_jq_program_is_unknown_on_the_failed_head_read
+  test_a_broken_jq_program_is_unknown_on_the_pending_request_read
+  test_a_broken_jq_program_is_unknown_on_the_current_head_evidence
+  test_a_running_row_the_stamp_pattern_misses_is_unknown
 )
 
 run_tests "${tests[@]}"
