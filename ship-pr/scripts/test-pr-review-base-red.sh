@@ -48,7 +48,19 @@ FAIL_ENDPOINT=""
 # asked for read $REQUEST_LOG, which records the endpoint.
 WORKFLOW_PATH=""
 WORKFLOW_YAML=""
-COMPARE_FILES=""
+# The range the tip adds over the judged commit, and what each of its commits changed: the
+# recognition reads the commits ONE BY ONE, because a path filter is evaluated per push and the
+# cumulative diff of a range can hide a push that touched source. COMPARE_TOTAL is the compare's
+# own total_commits, which a case moves on its own to stand for a range too long or a list the
+# answer truncated.
+COMPARE_COMMITS=""
+COMPARE_TOTAL=""
+FILES_DEFAULT=""
+# The delay one case needs: an API round takes time, and the grace has to be measured from when
+# the tip was first READ, not from when that round's last answer came back. The marker file is
+# what makes it happen once — every read is a command substitution, where a cleared variable
+# would not survive.
+FIRST_READ_DELAY=""
 
 # A ci workflow as the fleet's repositories write one: docs are the paths-ignore.
 DOCS_IGNORED_YAML='name: ci
@@ -95,6 +107,10 @@ jobs_json() { jq -cn --argjson jobs "$1" '{jobs: $jobs}'; }
 # 3003` reads JOBS_3003 and falls back to JOBS_DEFAULT.
 runs_of() { eval "printf '%s' \"\${RUNS_$1:-}\""; }
 jobs_of() { eval "printf '%s' \"\${JOBS_$1:-\$JOBS_DEFAULT}\""; }
+# One commit's changed files: keyed by the first character of its sha, which is what tells this
+# suite's commits apart (SHA_A, SHA_B, SHA_C, SHA_0 are runs of one character), falling back to
+# FILES_DEFAULT for a case that gives every commit the same diff.
+files_of() { eval "printf '%s' \"\${FILES_${1:0:1}:-\$FILES_DEFAULT}\""; }
 
 reset_fixture() {
   local v
@@ -114,7 +130,12 @@ reset_fixture() {
   BASE_IGNORE_CACHE=""
   WORKFLOW_PATH=".github/workflows/ci.yml"
   WORKFLOW_YAML="$DOCS_IGNORED_YAML"
-  COMPARE_FILES='[]'
+  COMPARE_COMMITS=$(jq -cn --arg c "$SHA_C" '[$c]')
+  COMPARE_TOTAL=""
+  FILES_DEFAULT='[]'
+  FIRST_READ_DELAY=""
+  for v in $(set | LC_ALL=C sed -n 's/^\(FILES_[0-9a-z]\)=.*/\1/p'); do unset "$v"; done
+  rm -f "$TEST_ROOT/delayed"
   TIP_SWITCH_AFTER=""
   TIP_NEXT=""
   : >"$TIP_READS"
@@ -124,7 +145,11 @@ reset_fixture() {
 }
 
 gh() {
-  local response="" rid wid reads
+  local response="" rid wid reads sha
+  if [ -n "$FIRST_READ_DELAY" ] && [ ! -e "$TEST_ROOT/delayed" ]; then
+    : >"$TEST_ROOT/delayed"
+    sleep "$FIRST_READ_DELAY"
+  fi
   gh_fixture_parse "$@"
   if [ -n "$FAIL_ENDPOINT" ]; then
     # A GLOB, deliberately unquoted, so a case can fail the jobs read alone: it is the read whose
@@ -165,7 +190,15 @@ gh() {
   # is spelled differently on this fleet's two platforms.
   "repos/$REPO/actions/workflows/"*) response=$(jq -cn --arg p "$WORKFLOW_PATH" '{path: $p}') ;;
   "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
-  "repos/$REPO/compare/"*) response=$(jq -cn --argjson f "$COMPARE_FILES" '{files: $f}') ;;
+  "repos/$REPO/compare/"*)
+    response=$(jq -cn --argjson c "$COMPARE_COMMITS" --arg t "$COMPARE_TOTAL" \
+      '{total_commits: (if $t == "" then ($c | length) else ($t | tonumber) end),
+        commits: [$c[] | {sha: .}]}')
+    ;;
+  "repos/$REPO/commits/"*)
+    sha=${FIXTURE_ENDPOINT#*/commits/}
+    response=$(jq -cn --argjson f "$(files_of "$sha")" '{files: $f}')
+    ;;
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
   gh_fixture_answer "$response"
@@ -369,18 +402,20 @@ test_a_standing_red_is_read_once_across_wait_rounds() {
 test_a_paths_ignored_tip_settles_without_waiting_out_the_grace() {
   reset_fixture
   RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5001}]')")
-  COMPARE_FILES='[{"filename":"docs/agent-notes/build-and-test.md"}]'
+  FILES_DEFAULT='[{"filename":"docs/agent-notes/build-and-test.md"}]'
   run_base --wait=2
   assert_eq "$BASE_RC" 0 "a tip whose whole diff is paths-ignored settles for the older verdict"
   assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" \
     "the settle answers about the tip it settled for"
-  assert_contains "$BASE_OUTPUT" "entirely within the paths-ignore of ci" \
+  assert_contains "$BASE_OUTPUT" "every commit the tip adds over the judged one changes only paths within the paths-ignore of ci" \
     "the settle should say WHY no run is coming, not just that it waited"
   assert_contains "$BASE_OUTPUT" "(that verdict is about ${SHA_A:0:8}, not the tip ${SHA_C:0:8})" \
     "the older commit the verdict is really about stays named"
   assert_not_contains "$BASE_OUTPUT" "NO VERDICT" "this is a settled verdict, not a refusal"
-  assert_contains "$(cat "$REQUEST_LOG")" "compare/$SHA_A...$SHA_C?per_page=1" \
-    "the diff read is from the JUDGED commit to the tip"
+  assert_contains "$(cat "$REQUEST_LOG")" "compare/$SHA_A...$SHA_C?per_page=" \
+    "the range read is from the JUDGED commit to the tip"
+  assert_contains "$(cat "$REQUEST_LOG")" "commits/$SHA_C" \
+    "and each commit in that range is read for its own diff"
 }
 
 # The recognition is about the WHOLE diff: one path the filter does not cover and a run is coming
@@ -389,7 +424,7 @@ test_a_paths_ignored_tip_settles_without_waiting_out_the_grace() {
 test_a_tip_that_changed_a_source_file_is_not_recognized() {
   reset_fixture
   RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5002}]')")
-  COMPARE_FILES='[{"filename":"docs/notes.md"},{"filename":"src/main.ml"}]'
+  FILES_DEFAULT='[{"filename":"docs/notes.md"},{"filename":"src/main.ml"}]'
   run_base --wait=2
   assert_eq "$BASE_RC" 4 "a diff the filter does not cover is a tip whose run is still coming"
   assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" \
@@ -398,6 +433,52 @@ test_a_tip_that_changed_a_source_file_is_not_recognized() {
   # The three reads are per workflow, judged commit and tip — not per round.
   assert_eq "$(grep -c "contents/" "$REQUEST_LOG")" 1 \
     "the workflow file should be read once, not once per round"
+}
+
+# The counterexample that makes this a per-COMMIT question (ludics-lite#163 review, round 1): a
+# path filter is evaluated per PUSH, over that push's own before/after diff, so a range whose
+# CUMULATIVE diff nets out to docs can still contain a push that touched source — here a commit
+# that changes src/main.ml and a later one that reverts it while adding a doc. GitHub creates a
+# run for that push; a recognition reading only the range's net diff would have called the tip
+# ignored and settled over a run that was on its way.
+test_a_source_change_reverted_inside_the_range_is_not_recognized() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5071}]')")
+  COMPARE_COMMITS=$(jq -cn --arg b "$SHA_B" --arg c "$SHA_C" '[$b, $c]')
+  FILES_b='[{"filename":"src/main.ml"}]'
+  FILES_c='[{"filename":"docs/notes.md"},{"filename":"src/main.ml"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a commit that touched source is a run on its way, whatever the range nets to"
+  assert_not_contains "$BASE_OUTPUT" "within the paths-ignore of" "no recognition may be claimed"
+  assert_contains "$(cat "$REQUEST_LOG")" "commits/$SHA_B" \
+    "the intervening commit is the one that has to be read"
+}
+
+# GitHub creates a run for a push of more than 1000 commits whatever the filter says, and a range
+# that long is not what this recognition is for besides: past the cap it goes to the grace rather
+# than to a read per commit. Every commit here is docs-only, so nothing but the length refuses it.
+test_a_range_longer_than_the_cap_is_not_recognized() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5081}]')")
+  COMPARE_COMMITS=$(jq -cn '[range(21) | "cccccccccccccccccccccccccccccccccccc" + (1000 + . | tostring)]')
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a range past the cap explains no absence"
+  assert_not_contains "$BASE_OUTPUT" "within the paths-ignore of" "no recognition may be claimed"
+  assert_eq "$(grep -c "commits/cccccccccccccccccccccccccccccccccccc1000" "$REQUEST_LOG")" 0 \
+    "and it spends no per-commit read on a range it has already refused"
+}
+
+# A commit list the answer truncated is not evidence about the range either: the total says one
+# thing and the rows another, and the recognition believes neither.
+test_a_truncated_commit_list_is_not_recognized() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5091}]')")
+  COMPARE_TOTAL=5 # the list below carries one
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a range only partly in hand explains no absence"
+  assert_not_contains "$BASE_OUTPUT" "within the paths-ignore of" "no recognition may be claimed"
 }
 
 # A pattern the translation does not carry fails the WHOLE question rather than just itself: with
@@ -410,10 +491,10 @@ test_an_untranslatable_pattern_refuses_the_recognition() {
     paths-ignore: ["docs/**", "!docs/keep.md"]
 '
   RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5003}]')")
-  COMPARE_FILES='[{"filename":"docs/notes.md"}]'
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
   run_base --wait=2
   assert_eq "$BASE_RC" 4 "a filter that was not fully read cannot explain an absence"
-  assert_not_contains "$BASE_OUTPUT" "paths-ignore of" "no recognition may be claimed"
+  assert_not_contains "$BASE_OUTPUT" "within the paths-ignore of" "no recognition may be claimed"
 }
 
 # A workflow file the narrow parser cannot read (`on: [push]` names no filter at all) is refused
@@ -426,33 +507,78 @@ jobs:
     runs-on: ubuntu-latest
 '
   RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5004}]')")
-  COMPARE_FILES='[{"filename":"docs/notes.md"}]'
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
   run_base --wait=2
   assert_eq "$BASE_RC" 4 "a workflow whose push filter cannot be read explains no absence"
-  assert_not_contains "$BASE_OUTPUT" "paths-ignore of" "no recognition may be claimed"
+  assert_not_contains "$BASE_OUTPUT" "within the paths-ignore of" "no recognition may be claimed"
   assert_eq "$(grep -c "compare/" "$REQUEST_LOG")" 0 \
     "with no filter in hand there is nothing to compare the tip against"
 }
 
-# The other half of #156, and the part that actually parks a wait: the settle used to be gated on
-# nothing being in flight ANYWHERE on the branch. A run still going at an OLDER commit says
-# nothing about a tip that has no run of its own, and holding the wait on it means the ceiling
-# arrives before the grace can settle anything.
-test_a_run_in_flight_at_an_older_commit_does_not_hold_the_settle() {
+# A run in flight ANYWHERE on this branch is judging a tree the tip contains, so the older green
+# under it is not an all-clear for the tip: settling there hands out a verdict for a tree whose
+# own run is minutes from answering (ludics-lite#163 review, round 1). Waiting also does BETTER
+# than settling — when that run lands, its commit is what the tip's absence then trails.
+test_a_run_in_flight_on_the_branch_keeps_the_wait() {
   reset_fixture
   retune ABSENT_GRACE=0
   RUNS_1=$(runs_json 1 "$(jq -cn --arg b "$SHA_B" --arg a "$SHA_A" \
     '[{status:"in_progress", conclusion:null, head_sha:$b, id:5011},
       {conclusion:"success", head_sha:$a, id:5010}]')")
-  COMPARE_FILES='[{"filename":"src/main.ml"}]' # unrecognized: only the grace can settle this
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]' # would be recognized with nothing in flight
   run_base --wait=2
-  assert_eq "$BASE_RC" 0 "a tip with no run of its own settles once its absence outlives the grace"
+  assert_eq "$BASE_RC" 4 "an unfinished run on the branch is a verdict still coming"
+  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" "the refusal stands"
+  assert_contains "$BASE_OUTPUT" "(ci is running now at ${SHA_B:0:8})" \
+    "the run being waited for should be named"
+  assert_eq "$(grep -c "compare/" "$REQUEST_LOG")" 0 \
+    "with a verdict in flight there is nothing for the filter to explain"
+}
+
+# The grace is a clock about the TIP, and it starts when the tip is first read — not when that
+# round's last answer comes back. Re-stamping it on the first round spends the round's own API
+# latency out of the grace, and `--wait=301` over a 300s grace then reaches its ceiling a few
+# seconds before the clock it was sized against, every time: #156's dispatch refusal. The first
+# read here is slow on purpose, which is what an API round is.
+test_the_grace_runs_from_the_first_read_of_the_tip() {
+  reset_fixture
+  retune ABSENT_GRACE=3 CHECKS_INTERVAL=1
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5051}]')")
+  FILES_DEFAULT='[{"filename":"src/main.ml"}]' # unrecognized: only the clock can settle this
+  # The round's own reads take 3s, the grace is 3s and the ceiling 4s: measured from the first
+  # READ the grace expires inside the wait, measured from the round's last answer it cannot.
+  FIRST_READ_DELAY=3
+  run_base --wait=4
+  assert_eq "$BASE_RC" 0 "the grace should expire inside a wait sized against it"
   assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" \
     "the settle is for the verdicts in hand"
-  assert_contains "$BASE_OUTPUT" "no run for the tip appeared and none is in flight for it" \
-    "the note should say what was waited for"
-  assert_contains "$BASE_OUTPUT" "(ci is running now at ${SHA_B:0:8})" \
-    "the older commit's run stays visible in the report it does not decide"
+  assert_contains "$BASE_OUTPUT" "no run for the tip appeared" "the note should say what was waited for"
+}
+
+# A listed workflow with NO push run on this branch at all is not in the fold, so no filter of its
+# was read: it may be dispatch- or schedule-only, or a workflow the tip itself just added whose
+# first run is on its way. One workflow's docs-only diff cannot speak for it, so the FAST settle
+# has to hold — and the grace, which is exactly that newcomer's creation window, still settles.
+test_a_workflow_with_no_run_history_holds_the_fast_settle() {
+  reset_fixture
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"fresh"}]')
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5061}]')")
+  RUNS_2=$(jq -cn '{workflow_runs: []}')
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a filter nobody read cannot be settled over"
+  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" "the refusal stands"
+  # ... and the grace, which is the newcomer's own creation window, settles it as it always did.
+  reset_fixture
+  retune ABSENT_GRACE=0
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"fresh"}]')
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5062}]')")
+  RUNS_2=$(jq -cn '{workflow_runs: []}')
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 0 "the grace is the newcomer's creation window, and it still settles"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" \
+    "a repository carrying a dispatch-only workflow must not park on it forever"
 }
 
 # What a run FOR THE TIP means, in both of its shapes: it exists, so no filter explains it, and
@@ -464,7 +590,7 @@ test_a_run_in_flight_at_the_tip_keeps_the_refusal() {
   RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg a "$SHA_A" \
     '[{status:"in_progress", conclusion:null, head_sha:$c, id:5021},
       {conclusion:"success", head_sha:$a, id:5020}]')")
-  COMPARE_FILES='[{"filename":"docs/notes.md"}]' # would be recognized if the tip had no run
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]' # would be recognized if the tip had no run
   run_base --wait=2
   assert_eq "$BASE_RC" 4 "a run judging the tip is the answer to wait for"
   assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" "the refusal stands"
@@ -479,7 +605,7 @@ test_a_stopped_run_at_the_tip_is_no_verdict_not_an_absence() {
   retune ABSENT_GRACE=0
   RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg a "$SHA_A" \
     '[{conclusion:"cancelled", head_sha:$c, id:5031}, {conclusion:"success", head_sha:$a, id:5030}]')")
-  COMPARE_FILES='[{"filename":"docs/notes.md"}]'
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
   run_base --wait=2
   assert_eq "$BASE_RC" 4 "a stopped run at the tip is not an absence any filter explains"
   assert_contains "$BASE_OUTPUT" "stopped-not-judged and no replacement appeared" \
@@ -494,7 +620,7 @@ test_a_stopped_run_at_the_tip_is_no_verdict_not_an_absence() {
 test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict() {
   reset_fixture
   RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5041}]')")
-  COMPARE_FILES='[{"filename":"docs/notes.md"}]'
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
   TIP_SWITCH_AFTER=1 # the round's tip read answers SHA_C; the re-confirm and everything after it
   TIP_NEXT=$SHA_B    # answer SHA_B, as a push landing in that window would
   run_base --wait=4
@@ -503,8 +629,8 @@ test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict() {
     "the settle is for the tip that is still there"
   assert_not_contains "$BASE_OUTPUT" "green (tip ${SHA_C:0:8})" \
     "the tip that moved under the round must never be settled for"
-  assert_contains "$(cat "$REQUEST_LOG")" "compare/$SHA_A...$SHA_B?per_page=1" \
-    "the successor is judged by its own diff"
+  assert_contains "$(cat "$REQUEST_LOG")" "compare/$SHA_A...$SHA_B?per_page=" \
+    "the successor is judged by its own range"
 }
 
 tests=(
@@ -518,9 +644,14 @@ tests=(
   test_a_standing_red_is_read_once_across_wait_rounds
   test_a_paths_ignored_tip_settles_without_waiting_out_the_grace
   test_a_tip_that_changed_a_source_file_is_not_recognized
+  test_a_source_change_reverted_inside_the_range_is_not_recognized
+  test_a_range_longer_than_the_cap_is_not_recognized
+  test_a_truncated_commit_list_is_not_recognized
   test_an_untranslatable_pattern_refuses_the_recognition
   test_a_workflow_file_without_a_filter_refuses_the_recognition
-  test_a_run_in_flight_at_an_older_commit_does_not_hold_the_settle
+  test_a_run_in_flight_on_the_branch_keeps_the_wait
+  test_the_grace_runs_from_the_first_read_of_the_tip
+  test_a_workflow_with_no_run_history_holds_the_fast_settle
   test_a_run_in_flight_at_the_tip_keeps_the_refusal
   test_a_stopped_run_at_the_tip_is_no_verdict_not_an_absence
   test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict

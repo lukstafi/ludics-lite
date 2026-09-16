@@ -248,10 +248,11 @@
 #      between the one-line "still waiting" progress notes a `--wait` prints (600),
 #      SHIP_PR_BASE_ABSENT_GRACE=seconds a commit with no workflow run yet is allowed before its
 #      absence is read as a fact (300; paths-ignore pushes never get one). `base --wait` applies
-#      it to the tip and then SETTLES for the older verdict the plain read settles for — unless a
-#      run for the tip exists and has not judged it, which no grace explains — and settles at
-#      once, without the grace, when the diff from the judged commit to the tip lies entirely
-#      within the workflow's own paths-ignore (ludics-lite#156). `checks`/`merge` apply it to the
+#      it to the tip — from the first READ of it, not from that round's last answer — and then
+#      SETTLES for the older verdict the plain read settles for, once nothing is in flight on the
+#      branch and no run for the tip exists to judge it. It settles at once, without the grace,
+#      when every commit the tip adds over the judged one changes only paths within the
+#      workflow's own paths-ignore (ludics-lite#156). `checks`/`merge` apply it to the
 #      head before calling a build signal ABSENT rather than not-created-yet (ludics-lite#24),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences the commit-count warning). A nonempty file overlap still warns at any count; no
@@ -3776,14 +3777,16 @@ encode_ref() {
 # (the same not-created-yet window as the force-push ABSENT trap on the merge path). Declaring
 # integration green off that is the stale reading this command exists to prevent. So --wait
 # re-reads until nothing non-advisory is mid-flight AND every non-advisory workflow's newest
-# judged run is about the CURRENT tip — or, when NO run for the tip exists at all, until the
-# workflow's own paths-ignore says outright that none can be created for this tip (a docs-only
-# push legitimately never gets one), or failing that until a grace expires
+# judged run is about the CURRENT tip — or, with nothing in flight and NO run for the tip at all,
+# until the workflow's own paths-ignore says outright that none can be created for this tip (a
+# docs-only push legitimately never gets one), or failing that until a grace expires
 # (SHIP_PR_BASE_ABSENT_GRACE, which is all that separates "never coming" from "not yet"). Then it
 # settles for the verdicts in hand, saying which commit each is about, exactly as the plain read
-# does. A run that EXISTS for the tip and has not judged it — queued, running, or stopped — is not
-# an absence anything can explain, and keeps the wait to its ceiling. A red breaks the wait
-# immediately: it is a verdict.
+# does. Two absences it will not settle: a run that EXISTS for the tip and has not judged it
+# (queued, running, or stopped), which only that run can answer; and a run in flight anywhere on
+# the branch, which is judging a tree the tip contains — waiting for it does better than settling,
+# since its commit becomes the verdict the tip then trails. A red breaks the wait immediately: it
+# is a verdict.
 # The red runs whose jobs have already been read, one "<run id><TAB><the line>" record per line.
 # `base --wait` re-folds every round, so without this a standing red would spend one jobs call per
 # round — per red workflow — to print the line it printed last time. A LIST rather than one slot
@@ -4050,18 +4053,72 @@ paths_ignore_covers() {
   return 0
 }
 
+# How many commits the recognition reads one by one before it gives up and lets the grace answer
+# instead. GitHub creates a run for a push of more than 1000 commits WHATEVER the filter says, so
+# any cap at or below that is sound; this one is far below, because the recognition exists for a
+# docs push of a handful of commits and reading a long range is neither cheap nor what it is for.
+IGNORE_MAX_COMMITS=20
+
 # The answer per <workflow>/<judged commit>/<tip>, so a wait that cannot recognize the tip spends
-# its three reads ONCE rather than once per round for as long as the grace runs. Keyed by all
-# three because each of them changing changes the answer.
+# its reads ONCE rather than once per round for as long as the grace runs. Keyed by all three
+# because each of them changing changes the answer.
 BASE_IGNORE_CACHE=""
 PATHS_IGNORE_WHY=""
+
+# commit_files <sha>: the paths ONE commit changed, one per line, or nothing (exit 1) when the
+# answer is not evidence — an empty list (a commit whose files the API omitted, an empty
+# first-parent diff) and a list at the endpoint's 300-file cap both say nothing about the whole
+# commit. A merge commit answers with its FIRST-PARENT diff, which is the change the merge brought
+# to the branch. Renames carry both names, since both are changed paths.
+commit_files() {
+  local sha="$1" out count nl=$'\n'
+  out=$(gh_retry read api "repos/$REPO/commits/$sha" \
+    --jq '(.files // []) | (length | tostring), (.[] | .filename, (.previous_filename // empty))') ||
+    return 1
+  count="${out%%$nl*}"
+  case "$count" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$count" -gt 0 ] && [ "$count" -lt 300 ] || return 1
+  printf '%s\n' "${out#*$nl}"
+}
+
+# commits_ignored <patterns> <judged sha> <tip>: true when EVERY commit the tip added over the
+# judged one changed only ignored paths.
+#
+# Per COMMIT, and not the cumulative diff of the range, because a path filter is evaluated per
+# PUSH: GitHub compares the push's before and after SHAs, and a range that nets out to nothing can
+# still contain a push that touched source. Push boundaries are not in this feed — but a push's
+# own diff is a subset of the union of its commits' diffs, so a range whose every commit is
+# ignored contains no push that is not, whatever the boundaries were. The union can only be
+# LARGER than the push diffs (a change and its revert inside one push cancel there but not here),
+# so the error is always a refusal, which costs the grace and never a green.
+#
+# The range must also be short and completely known: the commit list is one page, and a range
+# longer than the cap goes to the grace rather than to a read per commit (ludics-lite#163 review,
+# rounds on GitHub's own 1000-commit rule). A `total_commits` the returned list does not match is
+# a truncated answer and settles nothing.
+commits_ignored() {
+  local pats="$1" vsha="$2" tip="$3" cmp count shas sha files nl=$'\n'
+  cmp=$(gh_retry read api "repos/$REPO/compare/$vsha...$tip?per_page=$IGNORE_MAX_COMMITS" \
+    --jq '(.total_commits // 0 | tostring), ((.commits // [])[] | .sha)') || return 1
+  count="${cmp%%$nl*}"
+  case "$count" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$count" -gt 0 ] && [ "$count" -le "$IGNORE_MAX_COMMITS" ] || return 1
+  shas="${cmp#*$nl}"
+  [ "$(printf '%s\n' "$shas" | grep -c '^[0-9a-f]\{7,\}$')" -eq "$count" ] || return 1
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    files=$(commit_files "$sha") || return 1
+    paths_ignore_covers "$pats" "$files" || return 1
+  done <<<"$shas"
+  return 0
+}
 
 # tip_within_paths_ignore <rows> <tip>: rows are "<workflow id><TAB><name><TAB><judged sha>", one
 # per workflow whose newest judged run trails the tip with no run at the tip at all. True when
 # EVERY one of them is explained by its own filter — one workflow's docs-only diff says nothing
 # about the workflow beside it — and the reason goes into PATHS_IGNORE_WHY for the settle line.
 tip_within_paths_ignore() {
-  local rows="$1" tip="$2" wfid name vsha key hit pats files count why=""
+  local rows="$1" tip="$2" wfid name vsha key hit pats why=""
   PATHS_IGNORE_WHY=""
   [ -n "$rows" ] || return 1
   while IFS=$'\t' read -r wfid name vsha; do
@@ -4074,20 +4131,8 @@ tip_within_paths_ignore() {
     if [ -z "$hit" ]; then
       hit=no
       pats=$(workflow_paths_ignore "$wfid" "$tip") || pats=""
-      if [ -n "$pats" ]; then
-        # The compare's `files` is capped at 300 entries by the endpoint, with the commit list
-        # paginated separately (hence per_page=1, as the drift read does): a diff at the cap is
-        # truncated, and a truncated list is no evidence about the whole diff. The count leads the
-        # output so the cap is visible; renames carry both names, since both are changed paths.
-        files=$(gh_retry read api "repos/$REPO/compare/$vsha...$tip?per_page=1" \
-          --jq '(.files // []) | (length | tostring), (.[] | .filename, (.previous_filename // empty))') ||
-          files=""
-        count="${files%%$'\n'*}"
-        case "$count" in '' | *[!0-9]*) count=0 ;; esac
-        if [ "$count" -gt 0 ] && [ "$count" -lt 300 ] &&
-          paths_ignore_covers "$pats" "${files#*$'\n'}"; then
-          hit=yes
-        fi
+      if [ -n "$pats" ] && commits_ignored "$pats" "$vsha" "$tip"; then
+        hit=yes
       fi
       BASE_IGNORE_CACHE="${BASE_IGNORE_CACHE}${key}"$'\t'"${hit}"$'\n'
     fi
@@ -4312,8 +4357,12 @@ cmd_base() {
     # further merge landing after the grace had already elapsed would otherwise be declared
     # integration-green on the spot, its run not yet created and the timer long spent.
     if [ "$tip" != "$last_tip" ]; then
+      # A MOVE restarts the grace; the FIRST observation does not. `now` here is read after the
+      # round's own API calls, so re-stamping it on round one spends that round's latency out of
+      # the grace — which is how `--wait=301` over a 300s grace could never reach it: the ceiling
+      # arrived a few seconds before the clock it was sized against, every time (ludics-lite#156).
+      [ -z "$last_tip" ] || grace_from=$now
       last_tip="$tip"
-      grace_from=$now
     fi
     if [ "$inflight" -eq 0 ] && [ "$uncovered" -eq 0 ]; then
       # A listed workflow with NO push runs on the branch (norun) is ambiguous: dispatch- or
@@ -4354,14 +4403,25 @@ cmd_base() {
     # "not yet". Either way the settle is for the verdicts in hand, and the per-workflow lines
     # name which commit each of them is actually about.
     #
-    # What does NOT settle is a run that exists for the tip and has not judged it — queued,
-    # running, or completed stopped-not-judged (cancelled/stale): it existed, so no filter
-    # explains it, and only that run can answer. A stopped one gets the grace for a superseding
-    # replacement to appear, and then the honest verdict is "none".
-    elif [ "$uncovered" -gt 0 ] && [ "$tip_unjudged" -eq 0 ]; then
+    # Three shapes do NOT settle here, and each is a different thing the wait is still owed.
+    # A run that EXISTS for the tip and has not judged it — queued, running, or completed
+    # stopped-not-judged — existed, so no filter explains it, and only that run can answer; a
+    # stopped one gets the grace for a superseding replacement, and then the verdict is "none".
+    # A run in flight ANYWHERE on this branch is judging a tree the tip contains (on a branch
+    # this command reads, an older run's commit is an ancestor of the tip): settling for a green
+    # under it would hand out an all-clear for a tree whose verdict is minutes away, and waiting
+    # for it does better than settle — when it lands, its own commit is what the tip's absence
+    # then trails. That is the honest reading of a `--wait`, and it is not what parked the 09-15
+    # wave: the tip there was never going to get a run at all.
+    # And a listed workflow with NO push run on this branch at all (norun) is not in the fold, so
+    # no filter of its was read: it may be dispatch- or schedule-only, or it may be a workflow the
+    # tip itself just added whose first run is on its way. The FAST settle cannot speak for it —
+    # a docs-only diff under one workflow's filter says nothing about a filter nobody read — so
+    # only the grace, which is that newcomer's creation window, may settle a repo carrying one.
+    elif [ "$uncovered" -gt 0 ] && [ "$tip_unjudged" -eq 0 ] && [ "$inflight" -eq 0 ]; then
       settle_why=""
-      if tip_within_paths_ignore "$unrun_rows" "$tip"; then
-        settle_why="(the tip's diff from the judged commit is entirely within the paths-ignore of $PATHS_IGNORE_WHY, so no run for it is coming — the verdicts above are about the commit each line names)"
+      if [ "$norun" -eq 0 ] && tip_within_paths_ignore "$unrun_rows" "$tip"; then
+        settle_why="(every commit the tip adds over the judged one changes only paths within the paths-ignore of $PATHS_IGNORE_WHY, so no run for it is coming — the verdicts above are about the commit each line names)"
       elif [ $((now - grace_from)) -ge "$ABSENT_GRACE" ]; then
         settle_why="(waited $(((now - started) / 60)) min: no run for the tip appeared and none is in flight for it — the verdicts above may trail it)"
       fi

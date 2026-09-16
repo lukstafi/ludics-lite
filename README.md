@@ -390,15 +390,24 @@ than reporting no failing job, and a green base spends no call on any of it.
 
 The same suite covers what `base --wait` does when the tip has no verdict of its own
 (ludics-lite#156, where a docs-only default-branch tip parked a wave's dispatch at the ceiling
-while the plain read settled for the older green on it). The absence is read per workflow: a run
-that EXISTS for the tip and has not judged it — queued, running, or stopped — keeps the refusal,
-because only that run can answer, while a tip with no run at all settles for the verdicts in hand,
-whatever is in flight at older commits. What ends that wait without any clock is the workflow's own
-`paths-ignore`: where the diff from the judged commit to the tip lies entirely within it, no run
-can ever be created. The cases pin both directions of that recognition — one path outside the
-filter, a filter pattern the translation does not carry, a workflow file naming no filter at all,
-each of which costs the grace rather than a settle — and the tip re-confirm, since a settle for an
-older verdict must not be handed to a tip that moved under the round.
+while the plain read settled for the older green on it). The grace that separates "never coming"
+from "not yet" runs from the first READ of the tip rather than from the end of the round that read
+it — re-stamping it there spent a round of API latency out of the grace, which is how a
+`--wait=301` over a 300s grace reached its ceiling seconds before the clock it was sized against,
+every time. The absence is then read per workflow: a run that EXISTS for the tip and has not
+judged it — queued, running, or stopped — keeps the refusal because only that run can answer, and
+so does a run in flight anywhere on the branch, which is judging a tree the tip contains (waiting
+for it does better than settling: its commit becomes the verdict the tip then trails). What ends
+the wait with no clock at all is the workflow's own `paths-ignore`: when every commit the tip adds
+over the judged one changes only ignored paths, no run can be created for that tip. Per commit,
+because a filter is evaluated per PUSH and a range that nets out to docs can still contain a push
+that touched source; a push's diff is a subset of the union of its commits', so a range whose
+every commit is ignored contains no push that is not. The cases pin both directions — a source
+file in the range, a source change reverted inside it, a range past the commit cap or only partly
+in hand, a filter pattern the translation does not carry, a workflow file naming no filter, a
+workflow with no run history whose filter nobody read — each costing the grace rather than a
+settle, and the tip re-confirm, since a settle for an older verdict must not be handed to a tip
+that moved under the round.
 
 The `test-pr-review-*.sh` suites share a preamble, `test-pr-review-lib.sh`, which sources
 `pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and
