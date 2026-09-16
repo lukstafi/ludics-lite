@@ -347,6 +347,24 @@ out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_EMPTY" 2>&1); rc=$?
 [ ! -f "$TMP/state/hold-rog.pid" ] \
   && ok "...and the failed holder is not left recorded for a later unhold to believe in" \
   || ko "a failed hold left a pid file behind: $(cat "$TMP/state/hold-rog.pid")"
+# ...and the VM does not stay up unheld. The sweep's lanes probe the -wsl guest themselves, so a
+# reachable-but-unheld guest runs a GPU unit that then dies mid-run -- the exact failure being
+# fixed. A VM THIS run created is shut down again, so the unit records honest non-coverage.
+rm -rf "$TMP/state"; : > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
+      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+      SSH_TASKLIST="$TASKLIST_EMPTY" "$WL" restart-wsl --hold rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'wsl shut down on rog: a fresh VM that cannot be held' <<<"$out" \
+  && awk '/^rog-lan :: wsl.exe -d Ubuntu -e true$/ { t = NR } /^rog-lan :: wsl.exe --shutdown$/ { s = NR } END { exit !(t && s && t < s) }' "$SSH_LOG" \
+  && ok "a fresh VM whose hold failed is shut down again rather than left for the sweep (rc=$rc)" \
+  || ko "an unheld fresh VM was left running (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+# But never a VM that was already there: on a plain kick the guest may be the owner's, and taking
+# it away over a failed hold of ours would be a nasty surprise.
+rm -rf "$TMP/state"; : > "$SSH_LOG"
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_EMPTY" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ! grep -q -- '--shutdown' "$SSH_LOG" \
+  && ok "...while a plain kick-wsl --hold never shuts down a VM it did not create (rc=$rc)" \
+  || ko "a failed hold shut down a VM this run did not create (rc=$rc) -- $(cat "$SSH_LOG")"
 
 # unhold ends the holder explicitly, which is the only way a lane ends.
 rm -rf "$TMP/state"; : > "$SSH_LOG"
@@ -501,11 +519,14 @@ out=$(wake_hold "$TASKLIST_EMPTY" 2>&1); rc=$?
 # KB5129195 restarted minix 21 min into its hip unit on 2026-09-15: active hours were 10:00-01:00
 # and the sweep runs in the morning. The registry values are readable in advance from the -win
 # side, so a feature update that resets them is a warning before the sweep, not a lost unit after.
-reg_out() { # reg_out <start> <end> <smart> -- as `reg query` prints the key
-  printf 'HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings\n'
-  printf '    ActiveHoursStart    REG_DWORD    %s\n' "$1"
-  printf '    ActiveHoursEnd    REG_DWORD    %s\n' "$2"
-  printf '    SmartActiveHoursState    REG_DWORD    %s\n' "$3"
+# reg.exe writes CRLF, and Windows OpenSSH passes it through: a parser that leaves the \r on the
+# value matches neither the hex nor the decimal shape, and every real box would read as an
+# unreadable registry. So the fixture is CRLF, like the real thing.
+reg_out() { # reg_out <start> <end> <smart> -- as `reg query` prints the key, CRLF included
+  printf 'HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings\r\n'
+  printf '    ActiveHoursStart    REG_DWORD    %s\r\n' "$1"
+  printf '    ActiveHoursEnd    REG_DWORD    %s\r\n' "$2"
+  printf '    SmartActiveHoursState    REG_DWORD    %s\r\n' "$3"
 }
 rm -rf "$TMP/state"; : > "$SSH_LOG"
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0xa 0x1 0x0)" 2>&1)

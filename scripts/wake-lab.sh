@@ -423,7 +423,20 @@ win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe run
   # every bit as well as ours. Local `kill -0` on our own pid is not that claim — an ssh client
   # can outlive the command it ran.
   ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" 'tasklist /FI "IMAGENAME eq wsl.exe" /NH' 2>/dev/null \
-    | grep -qi 'wsl[.]exe'
+    | tr -d '\r' | grep -qi 'wsl[.]exe'
+}
+
+# A VM this run started fresh and then could not hold is worse than no VM: the sweep's lanes probe
+# the -wsl guest themselves, so a reachable-but-unheld guest runs a GPU unit that then dies
+# mid-run, which is the whole failure being fixed. Shut it down instead and let the unit record an
+# honest `skip (unreachable)`. Only for a VM this run created (`restart-wsl`): on a plain kick the
+# guest may be the owner's, and taking it away over a failed hold would be a nasty surprise.
+shutdown_unheld_vm() { # shutdown_unheld_vm <box> <windows-alias>
+  if ssh -o BatchMode=yes -o ConnectTimeout=15 "$2" 'wsl.exe --shutdown' >/dev/null 2>&1; then
+    echo "  wsl shut down on $1: a fresh VM that cannot be held would die mid-unit, so the lane records no coverage instead"
+  else
+    echo "  wsl on $1 is up and UNHELD and the shutdown failed too: do not sweep that box"
+  fi
 }
 
 hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait until Windows shows one
@@ -525,7 +538,10 @@ ACTIVE_HOURS_KEY='HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
 
 reg_dword() { # reg_dword <reg-query output> <value name> — its decimal value, or ?
   local v
-  v=$(printf '%s\n' "$1" | awk -v n="$2" '$1 == n && $2 ~ /REG_DWORD/ { print $3; exit }')
+  # The CR is not cosmetic: reg.exe writes CRLF, and a value carrying a trailing \r matches
+  # neither the hex nor the decimal branch below, so every real reading would come back `?` and
+  # the check would report an unreadable registry on every box, forever.
+  v=$(printf '%s\n' "$1" | awk -v n="$2" '{ sub(/\r$/, "") } $1 == n && $2 ~ /REG_DWORD/ { print $3; exit }')
   case "$v" in
     0x[0-9a-fA-F]|0x[0-9a-fA-F][0-9a-fA-F]*) printf '%d\n' "$((v))" ;;
     ''|*[!0-9]*) printf '?\n' ;;
@@ -667,7 +683,11 @@ start_wsl() {
     if kick_wsl "$n" "$FRESH_WSL"; then
       if [ "$HOLD" = 1 ]; then
         check_active_hours "$n" "$KICK_DEST"
-        if hold_wsl "$n" "$KICK_DEST"; then started+=("$n"); else unheld+=("$n"); fi
+        if hold_wsl "$n" "$KICK_DEST"; then started+=("$n")
+        else
+          [ "$FRESH_WSL" = fresh ] && shutdown_unheld_vm "$n" "$KICK_DEST"
+          unheld+=("$n")
+        fi
       else
         started+=("$n")
       fi
@@ -699,7 +719,7 @@ start_wsl() {
     echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
   fi
   if [ ${#unheld[@]} -gt 0 ]; then
-    line="wsl HOLD FAILED on: ${unheld[*]} (the VM started but no wsl.exe was observed on the Windows side, so nothing holds it)"
+    line="wsl HOLD FAILED on: ${unheld[*]} (the VM started but nothing on the Windows side holds it; a VM this run created was shut down again)"
     echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
   fi
   return $rc
