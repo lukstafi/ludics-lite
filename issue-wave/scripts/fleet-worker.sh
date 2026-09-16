@@ -1219,7 +1219,8 @@ box_correctness_slots() {
 # a measurement reserved afterwards is the registry's exclusivity to enforce, not this lock's.
 # Exit: the wrapped command's own status; 1 with a line beginning `EXECUTION SLOT REFUSED` (no
 # free slot before the deadline, an outstanding measurement, a malformed slots spec); 4 when the
-# anchor's registry could not be read; 127 when the command itself could not be run.
+# anchor's registry could not be read; 127 when the command itself could not be run. The command
+# is exec'd and not interpreted, so a pipeline or a builtin goes as `sh -c '...'`.
 slot_lock_py() {
   cat <<'SLOT_PY'
 import fcntl, os, sys, time

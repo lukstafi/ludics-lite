@@ -25,7 +25,8 @@ is outstanding on that box, holds one of the box's N slots as a real flock for e
 as the command runs (the kernel drops it even when the batch is killed), and returns the
 command's own status. It needs no coordinator lease, takes no `--box` (the slot is the local
 box's), and refuses with a line beginning `EXECUTION SLOT REFUSED` - exit 1 for no free slot,
-a measurement or a malformed spec, 4 when the anchor's registry cannot be read. Counting the
+a measurement or a malformed spec, 4 when the anchor's registry cannot be read. The command
+after `--` is exec'd, not interpreted, so a pipeline or a shell builtin goes as `sh -c '...'`. Counting the
 standing record instead had capped agents: on 2026-09-16 a fourth worker was refused a
 reservation while the three holding mac-studio's slots were reading their briefs. Use one canonical box name from the site's roster consistently (for example `rog-nv-wsl`,
 not an alternating SSH alias and app host ID). New reservations and dispatch require exact
