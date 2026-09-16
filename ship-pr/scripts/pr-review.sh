@@ -3905,8 +3905,9 @@ base_red_detail() {
 # merely late and settle for an older green over an unbuilt tip. The asymmetry is the whole design:
 # the parser below is deliberately narrow, and every branch it cannot read says so.
 
-# workflow_paths_ignore <workflow id> <ref>: the workflow's `on: push: paths-ignore` patterns, one
-# per line, or nothing (exit 1) when they cannot be established. The workflow file is read AT THE
+# workflow_paths_ignore <workflow id> <ref>: the workflow FILE's path, then its
+# `on: push: paths-ignore` patterns one per line, or nothing (exit 1) when they cannot be
+# established. The workflow file is read AT THE
 # TIP, because the filter that decides whether the tip gets a run is the one the tip carries.
 #
 # The YAML is read by a narrow state machine rather than a parser this repository does not have.
@@ -3992,7 +3993,12 @@ workflow_paths_ignore() {
   [ -n "$body" ] || return 1
   pats=$(awk -v q="'" -v dq='"' "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
   [ -n "$pats" ] || return 1
-  printf '%s\n' "$pats"
+  # WHICH file these patterns came out of leads the answer, because the range walk has to know
+  # whether any commit in it changed that file — a filter that moved mid-range is not one filter.
+  # It travels in the OUTPUT and not in a variable: every caller here reads through a command
+  # substitution, where an assignment dies with the subshell (the same trap base_red_detail's
+  # cache documents).
+  printf '%s\n%s\n' "$wpath" "$pats"
 }
 
 # glob_ere <pattern>: one GitHub path filter as an ERE anchored at both ends, or nothing (exit 1)
@@ -4070,15 +4076,18 @@ PATHS_IGNORE_WHY=""
 # first-parent diff) and a list at the endpoint's 300-file cap both say nothing about the whole
 # commit. A merge commit answers with its FIRST-PARENT diff, which is the change the merge brought
 # to the branch. Renames carry both names, since both are changed paths.
+#
+# PAGINATED, because a commit's files are: the endpoint serves 30 a page by default and 300 in
+# all, so an unpaginated read of a 45-file commit answers with 30 ignored paths and hides the
+# source file behind them — a page taken for a diff (ludics-lite#163 review, round 2). One row per
+# file, both of a rename's names on it, so the count below counts FILES and not paths.
 commit_files() {
-  local sha="$1" out count nl=$'\n'
-  out=$(gh_retry read api "repos/$REPO/commits/$sha" \
-    --jq '(.files // []) | (length | tostring), (.[] | .filename, (.previous_filename // empty))') ||
-    return 1
-  count="${out%%$nl*}"
-  case "$count" in '' | *[!0-9]*) return 1 ;; esac
+  local sha="$1" raw count
+  raw=$(gh_retry read api --paginate "repos/$REPO/commits/$sha?per_page=100" \
+    --jq '.files[]? | [.filename, (.previous_filename // "")] | @tsv') || return 1
+  count=$(printf '%s' "$raw" | grep -c .)
   [ "$count" -gt 0 ] && [ "$count" -lt 300 ] || return 1
-  printf '%s\n' "${out#*$nl}"
+  printf '%s' "$raw" | tr '\t' '\n' | grep .
 }
 
 # commits_ignored <patterns> <judged sha> <tip>: true when EVERY commit the tip added over the
@@ -4092,12 +4101,19 @@ commit_files() {
 # LARGER than the push diffs (a change and its revert inside one push cancel there but not here),
 # so the error is always a refusal, which costs the grace and never a green.
 #
+# The filter itself must also be ONE filter over the whole range. It is read at the tip, but the
+# push that a mid-range commit belonged to was judged by the workflow file as it stood THEN, and a
+# filter widened by the tip would explain away a run the older file had already asked for
+# (ludics-lite#163 review, round 2). No commit in the range may touch the workflow file: then the
+# file at every commit in it is the file at the tip, and the one filter read is the one that
+# applied. That check costs nothing — the paths are already in hand.
+#
 # The range must also be short and completely known: the commit list is one page, and a range
-# longer than the cap goes to the grace rather than to a read per commit (ludics-lite#163 review,
-# rounds on GitHub's own 1000-commit rule). A `total_commits` the returned list does not match is
-# a truncated answer and settles nothing.
+# longer than the cap goes to the grace rather than to a read per commit (GitHub's own rule is
+# 1000 commits, above which a push runs whatever the filter says). A `total_commits` the returned
+# list does not match is a truncated answer and settles nothing.
 commits_ignored() {
-  local pats="$1" vsha="$2" tip="$3" cmp count shas sha files nl=$'\n'
+  local pats="$1" wfile="$2" vsha="$3" tip="$4" cmp count shas sha files nl=$'\n'
   cmp=$(gh_retry read api "repos/$REPO/compare/$vsha...$tip?per_page=$IGNORE_MAX_COMMITS" \
     --jq '(.total_commits // 0 | tostring), ((.commits // [])[] | .sha)') || return 1
   count="${cmp%%$nl*}"
@@ -4108,6 +4124,7 @@ commits_ignored() {
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
     files=$(commit_files "$sha") || return 1
+    [ -z "$wfile" ] || ! grep -qxF -- "$wfile" <<<"$files" || return 1
     paths_ignore_covers "$pats" "$files" || return 1
   done <<<"$shas"
   return 0
@@ -4118,7 +4135,7 @@ commits_ignored() {
 # EVERY one of them is explained by its own filter — one workflow's docs-only diff says nothing
 # about the workflow beside it — and the reason goes into PATHS_IGNORE_WHY for the settle line.
 tip_within_paths_ignore() {
-  local rows="$1" tip="$2" wfid name vsha key hit pats why=""
+  local rows="$1" tip="$2" wfid name vsha key hit pats read_pats wfile why=""
   PATHS_IGNORE_WHY=""
   [ -n "$rows" ] || return 1
   while IFS=$'\t' read -r wfid name vsha; do
@@ -4130,8 +4147,12 @@ tip_within_paths_ignore() {
     hit=$(awk -F'\t' -v k="$key" '$1 == k { print $2; exit }' <<<"$BASE_IGNORE_CACHE")
     if [ -z "$hit" ]; then
       hit=no
-      pats=$(workflow_paths_ignore "$wfid" "$tip") || pats=""
-      if [ -n "$pats" ] && commits_ignored "$pats" "$vsha" "$tip"; then
+      # The file's path leads the answer; the patterns are the rest of it.
+      read_pats=$(workflow_paths_ignore "$wfid" "$tip") || read_pats=""
+      wfile="${read_pats%%$'\n'*}"
+      pats="${read_pats#*$'\n'}"
+      if [ -n "$read_pats" ] && [ -n "$wfile" ] && [ -n "$pats" ] &&
+        commits_ignored "$pats" "$wfile" "$vsha" "$tip"; then
         hit=yes
       fi
       BASE_IGNORE_CACHE="${BASE_IGNORE_CACHE}${key}"$'\t'"${hit}"$'\n'

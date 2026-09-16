@@ -402,12 +402,15 @@ the wait with no clock at all is the workflow's own `paths-ignore`: when every c
 over the judged one changes only ignored paths, no run can be created for that tip. Per commit,
 because a filter is evaluated per PUSH and a range that nets out to docs can still contain a push
 that touched source; a push's diff is a subset of the union of its commits', so a range whose
-every commit is ignored contains no push that is not. The cases pin both directions — a source
-file in the range, a source change reverted inside it, a range past the commit cap or only partly
-in hand, a filter pattern the translation does not carry, a workflow file naming no filter, a
-workflow with no run history whose filter nobody read — each costing the grace rather than a
-settle, and the tip re-confirm, since a settle for an older verdict must not be handed to a tip
-that moved under the round.
+every commit is ignored contains no push that is not. The one filter read has to be the one that
+applied, too — so no commit in the range may touch the workflow file, and each commit's files are
+read across every page, since that endpoint serves thirty at a time. The cases pin both directions
+— a source file in the range, a source change reverted inside it, a workflow file changed inside
+it, a range past the commit cap or only partly in hand, a file list at the endpoint's own cap, a
+filter pattern the translation does not carry, a workflow file naming no filter, a workflow with
+no run history whose filter nobody read — each costing the grace rather than a settle, and the tip
+re-confirm, since a settle for an older verdict must not be handed to a tip that moved under the
+round.
 
 The `test-pr-review-*.sh` suites share a preamble, `test-pr-review-lib.sh`, which sources
 `pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and

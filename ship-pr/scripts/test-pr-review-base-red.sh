@@ -25,6 +25,9 @@ test_tmpdir TEST_ROOT base-red-test
 REPO=example/repo
 BRANCH=main
 REQUEST_LOG="$TEST_ROOT/requests"
+# What the fixture `gh` records as PAGINATED: a commit's files are served 30 to a page, so the
+# read that walks them has to ask for every one.
+PAGINATE_LOG="$TEST_ROOT/paginated"
 
 # Four commits, oldest last, in the order the fixtures list their runs.
 SHA_C=cccccccccccccccccccccccccccccccccccccccc
@@ -136,6 +139,7 @@ reset_fixture() {
   FIRST_READ_DELAY=""
   for v in $(set | LC_ALL=C sed -n 's/^\(FILES_[0-9a-z]\)=.*/\1/p'); do unset "$v"; done
   rm -f "$TEST_ROOT/delayed"
+  : >"$PAGINATE_LOG"
   TIP_SWITCH_AFTER=""
   TIP_NEXT=""
   : >"$TIP_READS"
@@ -197,6 +201,7 @@ gh() {
     ;;
   "repos/$REPO/commits/"*)
     sha=${FIXTURE_ENDPOINT#*/commits/}
+    sha=${sha%%\?*}
     response=$(jq -cn --argjson f "$(files_of "$sha")" '{files: $f}')
     ;;
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
@@ -435,6 +440,50 @@ test_a_tip_that_changed_a_source_file_is_not_recognized() {
     "the workflow file should be read once, not once per round"
 }
 
+# A commit's changed files are PAGINATED — 30 to a page by default, 300 in all — so an
+# unpaginated read of a 45-file commit answers with 30 ignored paths and hides the source file
+# behind them (ludics-lite#163 review, round 2). The read asks for every page, and a list at the
+# endpoint's own 300-file cap is a truncated diff that settles nothing.
+test_a_commits_files_are_read_whole() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5101}]')")
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 0 "the ordinary docs-only tip still settles"
+  assert_contains "$(cat "$PAGINATE_LOG")" "commits/$SHA_C" \
+    "the commit's files must be read across every page, not one page of thirty"
+  # ... and a diff at the cap is not a diff.
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5102}]')")
+  FILES_DEFAULT=$(jq -cn '[range(300) | {filename: ("docs/f" + (. | tostring) + ".md")}]')
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a file list at the endpoint's cap is truncated, and truncated is not evidence"
+  assert_not_contains "$BASE_OUTPUT" "within the paths-ignore of" "no recognition may be claimed"
+}
+
+# The filter is read at the TIP, but a mid-range push was judged by the workflow file as it stood
+# then: a filter the tip widened would explain away a run the older file had already asked for
+# (ludics-lite#163 review, round 2). So no commit in the range may touch the workflow file — then
+# the one filter read is the one that applied to every push in it.
+test_a_workflow_file_touched_inside_the_range_is_not_recognized() {
+  reset_fixture
+  # A filter that ignores the workflow directory too, so that nothing BUT the moved-filter check
+  # can refuse this range: the commit changing ci.yml is itself covered by the patterns.
+  WORKFLOW_YAML='on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - ".github/workflows/**"
+'
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5111}]')")
+  COMPARE_COMMITS=$(jq -cn --arg b "$SHA_B" --arg c "$SHA_C" '[$b, $c]')
+  FILES_b='[{"filename":".github/workflows/ci.yml"}]' # the commit that widened the filter
+  FILES_c='[{"filename":"docs/notes.md"}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a filter that moved mid-range is not one filter"
+  assert_not_contains "$BASE_OUTPUT" "within the paths-ignore of" "no recognition may be claimed"
+}
+
 # The counterexample that makes this a per-COMMIT question (ludics-lite#163 review, round 1): a
 # path filter is evaluated per PUSH, over that push's own before/after diff, so a range whose
 # CUMULATIVE diff nets out to docs can still contain a push that touched source — here a commit
@@ -644,6 +693,8 @@ tests=(
   test_a_standing_red_is_read_once_across_wait_rounds
   test_a_paths_ignored_tip_settles_without_waiting_out_the_grace
   test_a_tip_that_changed_a_source_file_is_not_recognized
+  test_a_commits_files_are_read_whole
+  test_a_workflow_file_touched_inside_the_range_is_not_recognized
   test_a_source_change_reverted_inside_the_range_is_not_recognized
   test_a_range_longer_than_the_cap_is_not_recognized
   test_a_truncated_commit_list_is_not_recognized
