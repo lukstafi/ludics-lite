@@ -4444,6 +4444,22 @@ cmd_base() {
       [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's '$wname' runs on $branch" \
         "($(gh_err_line)); the base's health is UNKNOWN, which is NOT 'green'."
       if [ -n "$part" ]; then
+        # This workflow's rows are ORDERED HERE, not taken as the page served them, exactly as
+        # run_signal has ordered its own feed since ludics-lite#83. The page does come back
+        # newest-first by `created_at` — still a belief the contract pins, because WHICH ten rows
+        # a `per_page=10` page holds depends on it — but rows created in the SAME SECOND have no
+        # order the API documents, and both readers below keep whichever of them they see first:
+        # the fold's newest / newest-completed / newest-judged columns, and base_red_detail's
+        # walk for where a red streak starts. Two pushes to this branch inside one second is
+        # rarer than the two dispatches #83 was about, but the verdict is decided by luck just
+        # the same. (created_at desc, id desc) is a total order over these rows: the later second
+        # still wins, and a tie inside a second goes to the higher run id, the later allocation.
+        # Sorting each workflow's page on its own, rather than the assembled rows, leaves the
+        # report's per-workflow lines in the order the workflow list gave them. A row whose
+        # `created_at` moved or vanished sorts LAST ("-" is below every digit under LC_ALL=C,
+        # and the key is reversed), so a shape drift loses to a well-formed row rather than
+        # silently winning its workflow.
+        part=$(LC_ALL=C sort -t$'\t' -k6,6r -k8,8nr <<<"$part")
         raw="${raw}${part}"$'\n'
       else
         # A listed non-advisory workflow with NO push runs on this branch yet — just added, or
