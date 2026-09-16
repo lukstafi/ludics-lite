@@ -370,6 +370,45 @@ elapsed=$((SECONDS - started))
 [ "$elapsed" -lt 10 ] && ok "...costing one cap between them, not one each (${elapsed}s)" \
   || ko "the kick still runs box by box: ${elapsed}s for two boxes against a 6s cap"
 
+# --- a capped call leaves nothing of itself behind ----------------------------------------------
+# capped()'s watchdog naps in a child. Killing the watchdog alone left that nap orphaned for the
+# rest of its interval -- two minutes, at the default start cap -- holding an inherited copy of
+# every descriptor the run had open. Stray processes were the visible half; the half that bites is
+# that an inherited descriptor keeps its resource alive after the caller has dropped it, which is
+# how this surfaced against the lab lock. The caps here are absurd values (3117/3118/3119) so a
+# survivor is unmistakably one of ours and no real sleep can be mistaken for it.
+naps() { ps -eo pid,command 2>/dev/null | awk '/sleep 311[789]$/ { print $1 }'; }
+reap_naps() { local p; for p in $(naps); do kill -KILL "$p" 2>/dev/null; done; }
+# The negative control first: a scan that cannot fail proves nothing. This is exactly the old
+# shape -- a watchdog whose sleep runs in its foreground, killed outright -- and it must leave a
+# survivor, or the assertion below is vacuous.
+reap_naps
+( cmd_pid=""; sleep 1 & cmd_pid=$!
+  { sleep 3117; } >/dev/null 2>&1 & dog=$!
+  wait "$cmd_pid"; kill -KILL "$dog" 2>/dev/null; wait "$dog" 2>/dev/null ) >/dev/null 2>&1
+[ "$(naps | wc -l | tr -d ' ')" -ge 1 ] \
+  && ok "the stray-nap scan catches a watchdog killed without its sleep" \
+  || ko "the stray-nap scan sees nothing even for the leaking shape, so its verdict below is vacuous"
+reap_naps
+# A restart makes several capped calls -- a shutdown, a start, and the probes around them -- and
+# every one of them must come back with its watchdog fully reaped.
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+    WAKE_LAB_WSL_SHUTDOWN_CAP=3118 WAKE_LAB_WSL_START_CAP=3117 WAKE_LAB_PROBE_CAP=3119 \
+    SSH_UP="rog-lan rog-nv-wsl" "$WL" restart-wsl rog >/dev/null 2>&1
+[ "$(naps | wc -l | tr -d ' ')" -eq 0 ] \
+  && ok "...and a restart's capped calls leave no nap of their own behind" \
+  || ko "a capped call orphaned its watchdog's sleep: $(ps -eo pid,command | awk '/sleep 311[789]$/')"
+reap_naps
+# The same when the cap actually FIRES: the watchdog is then mid-grace, napping again, and the old
+# shape leaked that second sleep just as readily as the first.
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_WSL_START_CAP=2 \
+    WAKE_LAB_WSL_SHUTDOWN_CAP=3118 WAKE_LAB_PROBE_CAP=3119 \
+    SSH_HANG='wsl\.exe -d Ubuntu' SSH_UP="rog-lan rog-nv-win" "$WL" restart-wsl rog >/dev/null 2>&1
+[ "$(naps | wc -l | tr -d ' ')" -eq 0 ] \
+  && ok "...nor does one whose cap fired and whose watchdog was mid-grace" \
+  || ko "a fired cap orphaned its grace sleep: $(ps -eo pid,command | awk '/sleep 311[789]$/')"
+reap_naps
+
 # --- the polling loops are bounded by elapsed time, not by iteration count -----------------------
 # Every probe of a dark box burns its ConnectTimeout, so an iteration budget was a wall-clock lie:
 # 36 rounds of a "3 minute" WSL wait ran for nine when the probes were slow. Three-second probes

@@ -204,11 +204,27 @@ capped() { # capped <seconds> <cmd...> — run cmd under a hard wall-clock cap
   # Redirections belong on the CALL, not in here: they then cover the watchdog too, which has
   # nothing to say, and the command keeps whatever the caller wanted to do with its output.
   "$@" & pid=$!
-  { sleep "$secs"; kill -ALRM "$pid" 2>/dev/null
-    sleep "$CAP_GRACE"; kill -KILL "$pid" 2>/dev/null; } >/dev/null 2>&1 &
+  # The watchdog has to be killable TOGETHER WITH its nap, and that is the whole reason for the
+  # shape below. A `sleep` run in the watchdog's foreground is a separate process, so a signal to
+  # the watchdog leaves it orphaned for the rest of its interval — up to WSL_START_CAP, two
+  # minutes — still holding every descriptor the watchdog inherited. That is not only litter: an
+  # orphan holding an inherited copy of the lab lock's descriptor keeps the lock alive after the
+  # caller believes it has dropped it, which is how this was found. So the watchdog naps in a
+  # background child and waits for it, which leaves it free to run a TERM trap that takes the nap
+  # with it. `jobs -p` rather than a remembered `$!`, because a TERM arriving between the fork and
+  # the assignment would find that variable unset, and that is the one window a remembered pid
+  # cannot cover; `jobs -p` is whatever is actually running, whenever the trap happens to run.
+  { trap 'kill -KILL $(jobs -p) 2>/dev/null; exit 0' TERM
+    sleep "$secs" & wait $!
+    kill -ALRM "$pid" 2>/dev/null
+    sleep "$CAP_GRACE" & wait $!
+    kill -KILL "$pid" 2>/dev/null; } >/dev/null 2>&1 &
   dog=$!
+  # TERM, not KILL: the trap above is what reaps the nap, and an untrappable signal would put the
+  # orphan straight back. A watchdog that somehow missed the trap still dies on TERM's default
+  # action, so there is no path on which this wait outlives the watchdog.
   wait "$pid"; rc=$?
-  kill -KILL "$dog" >/dev/null 2>&1; wait "$dog" >/dev/null 2>&1
+  kill -TERM "$dog" >/dev/null 2>&1; wait "$dog" >/dev/null 2>&1
   case "$rc" in 142|137) return "$CAP_EXPIRED" ;; esac
   return "$rc"
 }
