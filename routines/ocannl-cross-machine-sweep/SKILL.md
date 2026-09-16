@@ -58,6 +58,9 @@ explicitly** once the sweep has finished (step 2), for every box you held:
 
     ~/bin/wake-lab.sh unhold rog minix
 
+Name only the boxes THIS run held — the ones whose `wsl holder observed on <box>` line you read in
+step 1. The record is per box and global to the machine, so `unhold` on a box you did not hold
+would release whatever holder is there, and if another run put it there you would unhold its lane.
 Run that even when the sweep failed or a box never woke — `unhold` over a box with no holder says
 so and exits 0. `wsl HOLD FAILED on: <box>` in the last lines means the VM started but nothing on
 the Windows side holds it, and the line says which of two situations that is:

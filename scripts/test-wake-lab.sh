@@ -27,6 +27,22 @@ trap 'rm -rf "$TMP"' EXIT
 LOCKS="$TMP/locks"; mkdir -p "$LOCKS"
 WAKE_LAB_LOCK_DIR="$LOCKS"; export WAKE_LAB_LOCK_DIR
 
+# ...and the control that the export above is really doing it. The redirection is one variable
+# deep: a case that builds its own environment with `env -i`, or an explicit `env` list that drops
+# this name, falls back to the real lab's directory and reserves the real lab, with nothing going
+# red. So fingerprint that directory before any case runs and compare it afterwards. Contents and
+# not merely names, because the hazard includes a lock file that is ALREADY there: taking a lock
+# rewrites its holder line, which a listing of names would not show.
+REAL_LOCK_DIR="$HOME/.local/state/wake-lab"
+lock_dir_state() { # lock_dir_state <dir> -- a printable fingerprint of what that directory holds
+  [ -d "$1" ] || { printf '(absent)\n'; return 0; }
+  ( cd "$1" && ls -A 2>/dev/null | sort | while IFS= read -r f; do
+      if [ -f "$f" ]; then printf '%s %s\n' "$f" "$(cksum <"$f" 2>/dev/null)"
+      else printf '%s (not a regular file)\n' "$f"; fi
+    done )
+}
+REAL_LOCK_BEFORE=$(lock_dir_state "$REAL_LOCK_DIR")
+
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "PASS: $*"; }
 ko() { fail=$((fail + 1)); echo "FAIL: $*"; }
@@ -37,6 +53,71 @@ expect() {
   if [ "$rc" -eq "$want_rc" ] && grep -q -- "$want" <<<"$out"; then ok "$label"
   else ko "$label (rc=$rc want $want_rc; want /$want/) -- $out"; fi
 }
+
+# lock_holders <diff> -- the holder line of each lock file the diff names, one per line.
+# The diff says a file is new or changed but not by whom, and the two readings of that call for
+# opposite responses: a case that escaped WAKE_LAB_LOCK_DIR is a bug in this suite to fix, while
+# a genuine cross-machine sweep that reserved a box mid-run is the lab working correctly and the
+# suite merely watching. wake-lab's `lab_lock_take_fd` already writes WHO took the lock on its
+# first line -- `wake-lab <what> (pid <n>, since <utc>)` -- so print that beside the diff and
+# reading it stops being a manual `cat` after the fact. The suite's own pid goes in the message
+# for the comparison: its cases run as its children, so a holder pid near it and gone is this
+# suite escaping, while a stranger's is the sweep. Only the files the diff names, so a busy lab
+# does not bury the diff. Control characters go, and a missing or empty line degrades rather than
+# failing, both as `lab_lock_holder` does -- this text goes to a terminal, and a lock a sweep is
+# mid-write on has no first line yet.
+lock_holders() {
+  sed -n 's/^> \([^ ][^ ]*\).*/\1/p' <<<"$1" | sort -u | while IFS= read -r f; do
+    local line; line=$(head -1 "$REAL_LOCK_DIR/$f" 2>/dev/null | tr -d '\000-\037')
+    printf '\n  %s: %s' "$f" "${line:-(no holder line)}"
+  done
+}
+
+# lab_untouched <region> -- the real lab's lock directory is exactly as the suite found it.
+# Called after the cases that reserve and again at the end, so a failure names a region rather
+# than the whole file.
+lab_untouched() {
+  local now; now=$(lock_dir_state "$REAL_LOCK_DIR")
+  if [ "$now" = "$REAL_LOCK_BEFORE" ]; then
+    ok "the real lab's lock directory is untouched ($1)"
+  else
+    local d; d=$(diff <(printf '%s\n' "$REAL_LOCK_BEFORE") <(printf '%s\n' "$now") | sed -n '1,10p')
+    ko "$1 reached $REAL_LOCK_DIR: a case escaped WAKE_LAB_LOCK_DIR and reserved the real lab \
+(this suite is pid $$) -- $d$(lock_holders "$d")"
+  fi
+}
+
+# --- the hermeticity control is itself controlled -----------------------------------------------
+# A fingerprint that cannot notice anything would pass with the export deleted, and then the two
+# `lab_untouched` calls below would be decoration. Prove it notices both shapes of the hazard --
+# a lock file that was not there before, and a lock file that was there and has been taken since
+# (same name, rewritten holder line) -- and that it tells a missing directory from an empty one,
+# which is the shape of a suite that creates the directory on a machine that had none.
+probe="$TMP/lockprobe"; mkdir -p "$probe"; printf 'wake-lab restart (pid 1)\n' > "$probe/rog.lock"
+probe_before=$(lock_dir_state "$probe")
+printf 'wake-lab restart (pid 2)\n' > "$probe/rog.lock"
+[ "$(lock_dir_state "$probe")" != "$probe_before" ] \
+  && ok "the lock-directory fingerprint notices a lock that has been retaken" \
+  || ko "the fingerprint cannot see a rewritten holder line, so lab_untouched proves nothing"
+printf 'wake-lab restart (pid 1)\n' > "$probe/rog.lock"      # back to the fingerprinted content
+[ "$(lock_dir_state "$probe")" = "$probe_before" ] \
+  && ok "...and is stable when nothing has changed" \
+  || ko "the fingerprint differs from itself over an unchanged directory: it would cry wolf"
+: > "$probe/minix.lock"
+[ "$(lock_dir_state "$probe")" != "$probe_before" ] \
+  && ok "...and notices a lock file that was not there before" \
+  || ko "the fingerprint cannot see a new lock file, so lab_untouched proves nothing"
+[ "$(lock_dir_state "$TMP/never-created")" = "(absent)" ] && [ "$(lock_dir_state "$probe")" != "(absent)" ] \
+  && ok "...and tells a directory that does not exist from one that does" \
+  || ko "the fingerprint cannot tell a missing lock directory from a present one"
+
+# And that the directory it watches is the one wake-lab.sh would fall back to: a guard aimed at
+# some other path is vacuous however sharp its fingerprint. `lock-path` only prints, so asking
+# with the variable unset creates nothing.
+out=$(env -u WAKE_LAB_LOCK_DIR WAKE_LAB_HOSTS="$TMP/absent.sh" "$WL" lock-path minix 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "$REAL_LOCK_DIR/minix.lock" ] \
+  && ok "the guarded directory is the one wake-lab falls back to with no WAKE_LAB_LOCK_DIR" \
+  || ko "wake-lab's default lock path is not under $REAL_LOCK_DIR (rc=$rc) -- $out; the guard watches the wrong directory"
 
 # --- shims ------------------------------------------------------------------------------------
 # curl: logs the SOAP action and the MACs it was asked about to $CURL_LOG, and answers with
@@ -817,6 +898,23 @@ elapsed=$((SECONDS - started))
   || ko "the holder observation was not capped (rc=$rc, ${elapsed}s) -- $out"
 env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
 
+# A caller that READS the command's output must not wait for the lane. The holder and the process
+# that keeps its lab lock both outlive the command by design, so anything of theirs still holding
+# the caller's pipe hangs `kick-wsl --hold | tee log` — or any `$( )` around it, which is how this
+# suite calls it — for the whole life of the lane. The lock process is exec'd for exactly that
+# reason: a forked shell keeps bash's own descriptors, a caller's pipe among them, while an exec
+# sheds them (they are close-on-exec) and keeps only the lock's own fd.
+reset_hold_state
+started=$SECONDS
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
+    WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+    SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=45 "$WL" kick-wsl --hold rog 2>&1 | cat >/dev/null
+elapsed=$((SECONDS - started))
+[ "$elapsed" -lt 20 ] \
+  && ok "a held lane does not hold its caller's pipe open behind it (${elapsed}s against a 45s holder)" \
+  || ko "reading the command's output waited for the holder (${elapsed}s): something of the lane's holds the pipe"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+
 # The holder's signature is read from `ps`, and macOS `ps` truncates the argument list to the
 # output width unless it is asked not to. This command line runs well past 79 columns, so a
 # truncated reading matches nothing and every live holder would look like somebody else's process
@@ -1215,6 +1313,10 @@ out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_LOCK_DIR="$LOCKS" "$WL" lock-
   && ok "lock-path answers without the site file, at the path the holder must take (rc=$rc)" \
   || ko "lock-path did not answer the contract path without hosts.sh (rc=$rc) -- $out"
 
+# Everything above this line is what reserves: every `restart-wsl`, every power command, every
+# lock case. Check here as well as at the end, so an escape is attributed to that region.
+lab_untouched "the restart, power and lock cases"
+
 # --- the polling loops are bounded by elapsed time, not by iteration count -----------------------
 # Every probe of a dark box burns its ConnectTimeout, so an iteration budget was a wall-clock lie:
 # 36 rounds of a "3 minute" WSL wait ran for nine when the probes were slow. Three-second probes
@@ -1300,6 +1402,8 @@ leaks=$(printf '%s\n%s\n' "$tracked" "$(ls -d "$HERE"/*.sh)" | sort -u | grep -v
 done)
 if [ -z "$leaks" ]; then ok "no MAC address is tracked in the repository"
 else ko "MAC-shaped literals in tracked files:"; printf '%s\n' "$leaks"; fi
+
+lab_untouched "the suite as a whole"
 
 echo
 echo "$pass passed, $fail failed"
