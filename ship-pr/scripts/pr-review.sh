@@ -23,9 +23,9 @@
 #     hides every inline finding — the watermark is per feed, an opaque comma-joined triple;
 #   - reviewThreads paginates at 100 too, so a long-running PR's later threads are unaddressable
 #     ("no review thread starts at comment N") unless the resolve lookup pages to the end;
-#   - the repo cannot be inferred from the cwd in a BACKGROUND shell, and the skill's documented
-#     `watch` invocation is a backgrounded one — so the repo travels in the PR argument
-#     (owner/name#number) and is cached per PR number for the calls that follow;
+#   - a PR number names one PR in EVERY repository, so a repo that was not spelled out in the
+#     invocation is a guess about intent that no read can check — the repo travels in the PR
+#     argument (owner/name#number), and a bare number with no repo named is refused;
 #   - an API failure and a genuinely empty feed both render as `[]`, so a read that failed must
 #     report UNKNOWN and never "no approval yet" — that is a silent false negative on the merge
 #     gate, and it fired for real during the 2026-08-17 GitHub outage on an approved PR;
@@ -142,7 +142,8 @@
 # Thread resolution has no REST equivalent and stays on GraphQL, but reports transport failure as
 # such instead of as "no such thread".
 #
-# Usage (<pr> is a number, or owner/name#number — prefer the latter, see the repo note below):
+# Usage (<pr> is owner/name#number, or a number with the repo named by --repo/REPO=; see the repo
+# note below — a bare number with no repo named anywhere is refused, never taken from the cwd):
 #   pr-review.sh [--repo owner/name] poll <pr> [watermark]
 #                                          # new comments/reviews above the watermark, each stamped
 #                                          # with the commit it is about; ends with one machine
@@ -229,11 +230,11 @@
 #             --allow-no-verdict). `checks` and `merge` add 5: SUPERSEDED — the PR head
 #             moved from the observed SHA. Re-run to judge the successor; no override bypasses 5.
 #
-# Env: REPO=owner/name (else the <pr> argument, else the cwd's checkout, else the per-PR cache —
-#      `retry run watch` takes only the first two, never the cwd and never the cache),
+# Env: REPO=owner/name, overridden by a repo spelled out in the <pr> argument or by --repo; those
+#      three are the ONLY sources, for every subcommand including `retry run watch` (`base`, which
+#      resolves a repo and a branch rather than a bare number, still reads the cwd's checkout),
 #      REVIEWER=login-prefix (default: codex app), WATCH_INTERVAL=seconds between polls (default
-#      90), WATCH_TIMEOUT=seconds to watch (900), SHIP_PR_STATE_DIR=where the cache lives
-#      (`off` disables the cache entirely — for sandboxes where even the attempted write warns),
+#      90), WATCH_TIMEOUT=seconds to watch (900),
 #      SHIP_PR_API_ATTEMPTS=tries per gh call (4), SHIP_PR_API_BACKOFF=first pause in seconds (5,
 #      doubling to a 20s cap: ~35s of retrying before a call is declared dead),
 #      SHIP_PR_REVIEW_GRACE=seconds a due-but-unstarted review is waited for before `watch` returns
@@ -248,7 +249,11 @@
 #      between the one-line "still waiting" progress notes a `--wait` prints (600),
 #      SHIP_PR_BASE_ABSENT_GRACE=seconds a commit with no workflow run yet is allowed before its
 #      absence is read as a fact (300; paths-ignore pushes never get one). `base --wait` applies
-#      it to the tip before settling for an older verdict, and `checks`/`merge` apply it to the
+#      it to the tip — from the first READ of it, not from that round's last answer — and then
+#      SETTLES for the older verdict the plain read settles for, once nothing is in flight on the
+#      branch and no run for the tip exists to judge it. It settles at once, without the grace,
+#      when every commit on the first-parent path from the judged one up to the tip changes only
+#      paths within the workflow's own paths-ignore (ludics-lite#156). `checks`/`merge` apply it to the
 #      head before calling a build signal ABSENT rather than not-created-yet (ludics-lite#24),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences the commit-count warning). A nonempty file overlap still warns at any count; no
@@ -267,28 +272,6 @@ ROUND_THRESHOLD="${SHIP_PR_ROUND_THRESHOLD:-12}"
 # Reviews of one round land within seconds of each other; a re-requested round on the SAME head
 # lands minutes or hours later. This gap is what tells them apart (seconds).
 ROUND_GAP="${SHIP_PR_ROUND_GAP:-900}"
-STATE_DIR="${SHIP_PR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ship-pr}"
-CACHE="$STATE_DIR/repo-by-pr"
-
-# The cache is a convenience, never a requirement, and in a sandboxed worker the write ATTEMPT is
-# what draws the harness's warning — on every call, when the state dir is unwritable and unreadable
-# (ludics-lite#2: workers given explicit owner/name#number arguments, which never need the cache,
-# still warned on each invocation). So it can be switched off outright (SHIP_PR_STATE_DIR=off),
-# and a failed write latches WRITES off. The latch is a file, not a variable, because cache_put
-# runs inside command substitutions (every `watch` round's poll is one), where a variable set
-# there would not survive to the next round — and it must outlive the PROCESS too, since every
-# documented pr-review.sh command is its own invocation and a per-process latch would re-attempt
-# the prohibited write once per command (review of self-improve#13). Hence: keyed by the state
-# dir (overriding SHIP_PR_STATE_DIR to a writable place re-enables caching instead of inheriting
-# a stale latch), and deliberately NOT removed by the exit trap. Reads are gated only by the
-# explicit off switch: a readable-but-unwritable cache keeps serving the mappings it already
-# holds — reading costs no prohibited write, and disabling it would turn every later bare-number
-# call into a usage failure over one unrelated write refusal (same review, round 4).
-CACHE_OFF_FILE="${TMPDIR:-/tmp}/pr-review-nocache.$(printf '%s' "$STATE_DIR" | cksum | cut -d' ' -f1)"
-case "$STATE_DIR" in off | none) CACHE_OFF=1 ;; *) CACHE_OFF="" ;; esac
-cache_disabled() { [ -n "$CACHE_OFF" ]; }
-cache_write_off() { cache_disabled || [ -e "$CACHE_OFF_FILE" ]; }
-
 API_ATTEMPTS="${SHIP_PR_API_ATTEMPTS:-4}"
 API_BACKOFF="${SHIP_PR_API_BACKOFF:-5}"
 
@@ -338,7 +321,7 @@ warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 # blank.
 GH_ERR=""
 GH_ERR_FILE="${TMPDIR:-/tmp}/pr-review-err.$$"
-trap 'rm -f "$GH_ERR_FILE"' EXIT # NOT the cache latch — it must persist across invocations
+trap 'rm -f "$GH_ERR_FILE"' EXIT
 
 gateway_failure() {
   case "$1" in
@@ -415,43 +398,35 @@ gh_err_line() {
 }
 
 # --- repo resolution ------------------------------------------------------------------------
-# A background shell does not reliably start in the checkout, so cwd inference is the LAST resort
-# among the sources the caller controls, not the first. Resolution happens after the PR argument
-# is parsed, because that argument may carry the repo itself.
-
-# Remembering the repo per PR number is what keeps a follow-up call (a reply, a resolve) working
-# when only the first call spelled the repo out. A bare PR number is not unique across repos, so
-# a cache hit is VERIFIED against the API before it is trusted — a wrong repo would post a reply
-# onto an unrelated PR, which is worse than the error it is standing in for.
-cache_get() {
-  cache_disabled && return 1
-  [ -f "$CACHE" ] || return 1
-  local hit
-  hit=$(awk -v n="$1" '$1 == n { r = $2 } END { if (r != "") print r }' "$CACHE" 2>/dev/null)
-  [ -n "$hit" ] || return 1
-  echo "$hit"
-}
-
-# Last write wins, and a concurrent watch on another PR can drop an entry by rewriting the file
-# from a stale read. That costs a later cache MISS, never a wrong repo — the verify above is what
-# makes losing an entry harmless. Skipping the no-op rewrite keeps most of that window shut, since
-# a running `watch` re-resolves every round.
-cache_put() {
-  cache_write_off && return 0
-  [ "$(cache_get "$1" 2>/dev/null)" = "$2" ] && return 0
-  mkdir -p "$STATE_DIR" 2>/dev/null || {
-    : >"$CACHE_OFF_FILE" 2>/dev/null
-    return 0
-  }
-  local tmp="$CACHE.$$"
-  {
-    [ -f "$CACHE" ] && awk -v n="$1" '$1 != n' "$CACHE"
-    echo "$1 $2"
-  } >"$tmp" 2>/dev/null && mv -f "$tmp" "$CACHE" 2>/dev/null || : >"$CACHE_OFF_FILE" 2>/dev/null
-  rm -f "$tmp" 2>/dev/null
-  return 0
-}
-
+# A PR is addressed by a repository and a number, and the number alone names one PR in every
+# repository there is. So the repository is either SPELLED OUT in the invocation — an
+# owner/name#<n> argument, --repo, REPO= — or the call is refused. Resolution happens after the PR
+# argument is parsed, because that argument may carry the repo itself.
+#
+# Two other sources stood here and both are gone (ludics-lite#92). The cwd was trusted outright,
+# and cached: a bare `reply 7` typed from a shell sitting in another project's worktree posted into
+# whatever PR 7 is over there. The per-PR cache remembered a repo by NUMBER, across checkouts and
+# across sessions, so a `reply 7` meant for repo B resolved to the repo A that some earlier call
+# had named for 7.
+#
+# Both were verified against `repos/<repo>/pulls/<n>` before use, or could have been, and this is
+# the half worth writing down because verification is the fix that looks right: that read answers
+# "this repository has a seventh PR", not "this is the PR you meant". Every active repository has a
+# PR 7. So on exactly the invocations these guesses fail on — a worktree of another project, a
+# stale entry from yesterday's PR — the check passes and the write lands on a stranger's review
+# thread, now with a verification behind it. A claim that cannot fail, standing in for a
+# safeguard, is worse than no safeguard. Nor can any other read stand in: what both sources are
+# guesses about is INTENT, and the API has nothing to say about that.
+#
+# So there is no inference left, as ludics-lite#74 (PR #79) left none for `retry run watch` after a
+# background shell in a sibling worktree turned a wrong-target read into a failed-run verdict. The
+# cost is one `owner/name#<n>` per call, which is what this skill's instructions have always told
+# callers to write and what every documented invocation already spells out. What it buys is an
+# invariant with no exception to remember: no command here addresses a repository that this
+# invocation did not name.
+#
+# `repo_from_cwd` survives for `base` alone, which resolves a repo and a BRANCH — a name the API
+# can actually be asked about — rather than a bare number every repository answers to.
 repo_from_cwd() {
   local url
   # `gh repo view` first: it honours remote.origin.gh-resolved, so a fork checkout keeps naming
@@ -466,46 +441,18 @@ repo_from_cwd() {
   case "$url" in */*) echo "$url" ;; *) return 1 ;; esac
 }
 
-# 0 = that repo really has that PR, 1 = it does not, 3 = the API did not answer, so neither is
-# known — the caller must not turn an outage into "wrong repo".
-verify_repo() {
-  local n rc
-  n=$(gh_retry read api "repos/$1/pulls/$2" --jq .number)
-  rc=$?
-  [ "$rc" -eq 0 ] || return "$rc"
-  [ "$n" = "$2" ]
+resolve_repo() {
+  [ -z "$REPO" ] || return 0
+  die "PR $1 was given with no repository, and a PR number alone names one PR in every" \
+    "repository there is. Pass it as owner/name#$1 (or --repo owner/name, or REPO=owner/name)." \
+    "Nothing was read or written anywhere. It is NOT taken from the working directory and there" \
+    "is no per-number memory of an earlier call: either would resolve the wrong checkout, or" \
+    "yesterday's PR $1, to a real PR of that number rather than to an error — a write onto a" \
+    "stranger's review thread (ludics-lite#92). A BACKGROUND invocation is where that bit" \
+    "hardest, since background shells do not start in the checkout, and the skill's documented" \
+    "\`watch\` call is a backgrounded one."
 }
 
-resolve_repo() {
-  local pr="$1" cached rc
-  if [ -n "$REPO" ]; then
-    cache_put "$pr" "$REPO"
-    return 0
-  fi
-  REPO=$(repo_from_cwd) && [ -n "$REPO" ] && {
-    cache_put "$pr" "$REPO"
-    return 0
-  }
-  REPO=""
-  if cached=$(cache_get "$pr"); then
-    verify_repo "$cached" "$pr"
-    rc=$?
-    case "$rc" in
-    0)
-      REPO="$cached"
-      return 0
-      ;;
-    3) fail 3 "cannot verify PR $pr against the cached repo $cached — the API did not answer" \
-      "after $API_ATTEMPTS attempts ($(gh_err_line)). This is TRANSPORT, not a wrong repo:" \
-      "retry, or name the repo as owner/name#$pr to skip the verification entirely." ;;
-    esac
-  fi
-  die "cannot tell which repo PR $pr belongs to." \
-    "Pass it as owner/name#$pr (or --repo owner/name, or REPO=owner/name)." \
-    "This usually means a BACKGROUND invocation: background shells do not start in the checkout," \
-    "so cwd inference only works in the foreground. The skill's documented \`watch\` call is a" \
-    "backgrounded one, which is why it always names the repo."
-}
 
 # Accept both a bare number and owner/name#number (the form PR URLs and cards use); anything else
 # dies loudly. Without this, a malformed <pr> lands in the API path, api_list eats the error, and
@@ -723,10 +670,18 @@ cmd_poll() {
   # comment id — the flat feed's copy wins when both exist, since only it carries current line
   # numbers. A failed per-review read fails the ROUND (unknown, watermark unwritten): the
   # alternative is printing the review while silently dropping its findings.
-  local rid extra='[]' more
-  for rid in $(jq -r --arg rev "$REVIEWER" --argjson since "$m_review" '
+  # The list of reviews to re-read is itself a read that can fail. Unguarded it failed EMPTY —
+  # indistinguishable from "no new reviews this round" — and the round would then render every
+  # review without its own comments and still advance the watermark past them (#89).
+  local rid extra='[]' more new_review_ids
+  new_review_ids=$(jq -r --arg rev "$REVIEWER" --argjson since "$m_review" '
     map(select((.user.login // "") | startswith($rev)) | select(.id > $since))
-    | .[].id' <<<"$reviews"); do
+    | .[].id' <<<"$reviews" 2>/dev/null) || {
+    warn "could not read which reviews on PR $pr are new — this round is UNKNOWN, not quiet"
+    return 3
+  }
+  # shellcheck disable=SC2086 # one id per word, and the point is to split them
+  for rid in $new_review_ids; do
     more=$(api_list "pulls/$pr/reviews/$rid/comments?per_page=100") || {
       warn "API error reading review $rid's comments on PR $pr after $API_ATTEMPTS attempts" \
         "($(gh_err_line)) — this round is UNKNOWN, not quiet"
@@ -773,7 +728,7 @@ cmd_poll() {
   jq -r "$POLL_ITEM_DEFS"'
     if length == 0 then "(no new inline comments)"
     else .[] | "--- inline id=\(thread_list) \(item_path):\(item_line) commit=\(inline_commit) by \(.user.login)\(dupe_note)\n\(body_block)"
-    end' <<<"$new_inline"
+    end' <<<"$new_inline" || return 4
 
   # The connector's "Review Summary" placeholder is machine-tagged with an HTML comment and posted
   # the moment a round STARTS ("🔄 Running"); it carries no findings, but its id is above the
@@ -788,10 +743,12 @@ cmd_poll() {
   # A comment's only head association is the stamp POLL_ITEM_DEFS describes; one carrying none
   # renders `commit=-`, and nothing downstream may read that as "another commit".
   jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
-    .[] | "--- summary id=\(.id) commit=\(item_stamp($rc)) by \(.user.login)\n\(.body)"' <<<"$new_issue"
+    .[] | "--- summary id=\(.id) commit=\(item_stamp($rc)) by \(.user.login)\n\(.body)"' <<<"$new_issue" ||
+    return 4
 
   jq -r "$POLL_ITEM_DEFS"'
-    .[] | "--- review id=\(.id) state=\(.state) commit=\(review_commit) by \(.user.login)\n\(.body // "")"' <<<"$new_reviews"
+    .[] | "--- review id=\(.id) state=\(.state) commit=\(review_commit) by \(.user.login)\n\(.body // "")"' <<<"$new_reviews" ||
+    return 4
 
   # The items above, as one machine-readable line, for a caller that has to decide something about
   # them — `watch` asks which of them are about the head it is watching. Fields per item:
@@ -806,23 +763,31 @@ cmd_poll() {
   # would take a quoted header for an item and end the wait on the round it was there to skip.
   # Read it as the watermark is read, the LAST match: it is emitted after every body, so a body
   # that quotes one of these lines cannot displace it.
-  echo "items: $(
-    jq -r "$POLL_ITEM_DEFS"'[.[] | "inline:\(thread_list):\(inline_commit):\(.user.login):-"] | join(" ")' \
-      <<<"$new_inline"
-  ) $(
-    jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
-      [.[] | "summary:\(.id):\(item_stamp($rc)):\(.user.login):-"] | join(" ")' <<<"$new_issue"
-  ) $(
-    jq -r "$POLL_ITEM_DEFS"'
+  #
+  # Each field is built into a variable before the line is echoed, rather than inside the `echo`'s
+  # command substitutions: a jq that failed there contributed an empty field and the line still
+  # printed, so a broken program read downstream as "this round had no items of that kind" — the
+  # same silent defect the state line's arms exist to prevent (#89). A failed render exits 4 with
+  # the watermark unwritten, so the round is retried rather than advanced past.
+  local items_inline items_issue items_review
+  items_inline=$(jq -r "$POLL_ITEM_DEFS"'[.[] | "inline:\(thread_list):\(inline_commit):\(.user.login):-"] | join(" ")' \
+    <<<"$new_inline") || return 4
+  items_issue=$(jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
+      [.[] | "summary:\(.id):\(item_stamp($rc)):\(.user.login):-"] | join(" ")' <<<"$new_issue") || return 4
+  items_review=$(jq -r "$POLL_ITEM_DEFS"'
       [.[] | "review:\(.id):\(review_commit):\(.user.login):\(.state // "-")"] | join(" ")' \
-      <<<"$new_reviews"
-  )"
+    <<<"$new_reviews") || return 4
+  echo "items: $items_inline $items_issue $items_review"
 
   # Pass this back verbatim next time: per-feed maxima, so replies you post in this round cannot
-  # read back as new findings and a big review id cannot mask a smaller comment id.
-  echo "watermark: $(jq -s --argjson m "$m_inline" '[.[][].id // 0, $m] | max' <<<"$inline"),$(
-    jq -s --argjson m "$m_issue" '[.[][].id // 0, $m] | max' <<<"$issue"),$(
-    jq -s --argjson m "$m_review" '[.[][].id // 0, $m] | max' <<<"$reviews")"
+  # read back as new findings and a big review id cannot mask a smaller comment id. Same rule as
+  # the items line: an empty field here would be read back as the watermark 0 and replay the
+  # whole feed, so each maximum is taken before the line exists.
+  local mark_inline mark_issue mark_review
+  mark_inline=$(jq -s --argjson m "$m_inline" '[.[][].id // 0, $m] | max' <<<"$inline") || return 4
+  mark_issue=$(jq -s --argjson m "$m_issue" '[.[][].id // 0, $m] | max' <<<"$issue") || return 4
+  mark_review=$(jq -s --argjson m "$m_review" '[.[][].id // 0, $m] | max' <<<"$reviews") || return 4
+  echo "watermark: $mark_inline,$mark_issue,$mark_review"
 }
 
 # --- reviewer state ---------------------------------------------------------------------------
@@ -1033,7 +998,7 @@ substantive_reviews() { # <pr>; reviews JSON on stdin
 
 status_state() {
   local pr="$1" raw line age plus plus_at eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
-  local running_at evidence evidence_kind evidence_at vline verd_at verd_sha mstate="-" head_err="" pr_created=""
+  local running_at evidence evidence_kind evidence_at running_unread vline verd_at verd_sha mstate="-" head_err="" pr_created=""
   local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at="" nudge_age nudge_id="" nudge_line comments_loaded=false
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
@@ -1067,7 +1032,10 @@ status_state() {
       [.[] | select(.id > $after)
        | select((.body // "") | test("^@codex review[ \t\r\n]*(_🤖 Addressed by an automated coding agent_)?[ \t\r\n]*$"))
        | {id, at: .created_at}] | max_by(.at)
-       | if . == null then "|" else "\(.id)|\(.at)" end' <<<"$comments_raw")
+       | if . == null then "|" else "\(.id)|\(.at)" end' <<<"$comments_raw" 2>/dev/null) || {
+      echo "unknown|-|-|the pending-request comments feed did not parse"
+      return 0
+    }
     nudge_id="${nudge_line%%|*}"
     nudge_at="${nudge_line#*|}"
     nudge_age=$(age_of "$nudge_at")
@@ -1093,12 +1061,19 @@ status_state() {
       def reviewer: select((.user.login // "") | startswith($rev));
       def current: select(.sha != "" and $head != "")
         | select(.sha as $sha | $head | startswith($sha));
-      [($comments[] | reviewer
+      # One entry per Running row the table test admits, each re-matched by the stamp pattern
+      # beside it: `[capture(...)] | first` yields null where they disagree instead of yielding
+      # NOTHING, which unbracketed here would delete not just that row but every later row of
+      # the same stream. The two patterns have to keep agreeing on every Running row, and the
+      # count of nulls is the third field below — how the caller hears that they stopped
+      # agreeing, rather than reading a deleted row as "no round is running" (#89, #104).
+      [$comments[] | reviewer
          | select((.body // "") | contains("codex-pull-request-review-summary"))
          | (.body // "") | split("\n")[]
          | select(test("^\\|[^|]*Code Review[^|]*\\|[^|]*Running"))
-         | capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")
-         | . + {kind:"running"}),
+         | ([capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")] | first)]
+        as $running |
+      [($running[] | select(. != null) | . + {kind:"running"}),
        ($reviews[] | reviewer | select(.submitted_at != null)
          | {sha:(.commit_id // ""), at:.submitted_at, kind:"findings"}),
        ($comments[] | reviewer
@@ -1107,12 +1082,27 @@ status_state() {
             kind:(if (.body // "") | test("[Dd]idn.t find any major issues")
                   then "verdict" else "findings" end)})]
       | map(current | .at |= sub("\\.[0-9]+Z$"; "Z"))
-      | max_by(.at) | if . == null then "|" else "\(.kind)|\(.at)" end' <<<"$comments_raw"$'\n'"$reviews_raw") || {
+      | max_by(.at)
+      | (if . == null then "|" else "\(.kind)|\(.at)" end)
+        + "|" + (($running | map(select(. == null)) | length) | tostring)' \
+      <<<"$comments_raw"$'\n'"$reviews_raw" 2>/dev/null) || {
       echo "unknown|-|$mstate|the current-head review evidence did not parse"
       return 0
     }
     evidence_kind="${evidence%%|*}"
+    running_unread="${evidence##*|}"
     evidence_at="${evidence#*|}"
+    evidence_at="${evidence_at%|*}"
+    # The two Running patterns disagreed on a row. Neither "a round is running" nor "none is"
+    # is readable from a table this script can only half parse, so neither is claimed.
+    case "$running_unread" in
+    0) ;;
+    *)
+      echo "unknown|-|$mstate|a $REVIEWER Code Review row matched the Running test but not the" \
+        "stamp pattern beside it, so the running round could not be read"
+      return 0
+      ;;
+    esac
     if [ -n "$evidence_at" ] && [[ "$evidence_at" > "$plus_at" ]]; then
       case "$evidence_kind" in
       running)
@@ -1211,7 +1201,10 @@ status_state() {
               sha: ([(.body // "") | capture($rc).s] | first // "")}]
       | sort_by(.at) | last
       | if . == null then "|" else "\(.at)|\(.sha)" end' \
-    <<<"$raw" 2>/dev/null) || vline="|"
+    <<<"$raw" 2>/dev/null) || {
+    echo "unknown|-|$mstate|the verdict comments feed did not parse"
+    return 0
+  }
   verd_at="${vline%%|*}"
   verd_sha="${vline#*|}"
   # The initialization failure (INIT_FAILURE_RE above). Only the NEWEST non-placeholder comment is
@@ -1226,7 +1219,10 @@ status_state() {
       | sort_by(.created_at) | last
       | if . == null or ((.body // "") | test($re) | not) then "|"
         else "\(.created_at)|" + ([(.body // "") | capture($refre).s] | first // "")
-        end' <<<"$raw" 2>/dev/null) || fline="|"
+        end' <<<"$raw" 2>/dev/null) || {
+    echo "unknown|-|$mstate|the initialization-failure comments feed did not parse"
+    return 0
+  }
   fail_at="${fline%%|*}"
   fail_ref="${fline#*|}"
   # A new explicit request supersedes older evidence uniformly: neither an old
@@ -1306,7 +1302,10 @@ status_state() {
       rev_head_at=$(jq -r --arg rev "$REVIEWER" --arg sha "$head_sha" '
           [.[] | select((.user.login // "") | startswith($rev))
                | select(.submitted_at != null) | select((.commit_id // "") == $sha)
-               | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || rev_head_at=""
+               | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || {
+        echo "unknown|-|$mstate|the reviews feed did not parse for the failed head"
+        return 0
+      }
       if [ -z "$rev_head_at" ] || [[ "$fail_at" > "$rev_head_at" ]]; then
         # No recurrence count rides on this line. One was tried and removed (review of #82,
         # rounds 1, 3, 4, 5 and 6): "has this head failed before?" has to be measured from the
@@ -1706,9 +1705,16 @@ watch_round() { # <pr> <watermark>
   POLLED_PAST_N=0
   # A failed API round yields no watermark; keeping the caller's stops a transient error from
   # resetting to 0 and replaying the whole backlog as if it were a new round.
+  #
+  # Read ONLY from a round that succeeded, and after the status check, not before it. A round
+  # that fails partway has already printed the bodies it got through — a rendering that could
+  # not run leaves exactly that (#89) — and a reviewer body can carry a line that looks exactly
+  # like this one, the same trap the `items:` line below documents and which a review of this
+  # script drew for real. Taken from a failed round, such a line advances the watermark past
+  # findings the retry would then never show.
+  [ "$POLLED_RC" -eq 0 ] || return 0
   next=$(sed -n 's/^watermark: //p' <<<"$POLLED_OUT" | tail -1)
   case "$next" in [0-9]*,[0-9]*,[0-9]*) POLLED_MARK="$next" ;; esac
-  [ "$POLLED_RC" -eq 0 ] || return 0
   pr_head_read "$1"
   POLLED_HEAD="$head_sha"
   # From the `items:` line poll emits, never from the rendered headers: a reviewer BODY can carry
@@ -2504,15 +2510,14 @@ cmd_resolve() {
 # signal, prefer `checks <pr> --wait`, which reads EVERY check on the head commit, not one run.
 #
 # The run is addressed the way a PR is — owner/name#<run-id>, through the same parse_ref — and the
-# repo is NEVER inferred from the cwd (ludics-lite#74). It used to be, and the inference is a
+# repo is NEVER inferred from the cwd (ludics-lite#74) — nor, since ludics-lite#92, is any
+# other subcommand's. It used to be, and the inference is a
 # false-verdict generator on exactly the invocation this await exists for: a worker whose
 # background shell had started in an ocannl-staging worktree awaited a ludics-lite run id, the
 # read 404'd against the repo the cwd named, and the await returned exit 1 over a run that was
 # fine — a red gate manufactured out of a wrong-target invocation. A cwd mismatch has to be an
 # INVOCATION error, so an unnamed repo is refused (exit 2) rather than guessed, and a named pair
-# the API says does not exist is one too (below) rather than a verdict about the run. The per-PR
-# repo cache is not consulted either: it is keyed by PR number, and a run id lives in a different
-# id space, so a hit there would be a coincidence pointing at an unrelated repository.
+# the API says does not exist is one too (below) rather than a verdict about the run.
 #
 # Exit codes, matching `checks`: 0 the run succeeded; 1 it concluded failure — a VERDICT, so do
 # not retry the watch, read the run; 2 the invocation is wrong (no repo named, a malformed run
@@ -3773,10 +3778,16 @@ encode_ref() {
 # (the same not-created-yet window as the force-push ABSENT trap on the merge path). Declaring
 # integration green off that is the stale reading this command exists to prevent. So --wait
 # re-reads until nothing non-advisory is mid-flight AND every non-advisory workflow's newest
-# judged run is about the CURRENT tip — or, when no run for the tip has appeared and none is
-# running, until a grace expires (SHIP_PR_BASE_ABSENT_GRACE; paths-ignore means a docs-only push
-# legitimately never gets one, and only the grace separates "never coming" from "not yet"). A
-# red breaks the wait immediately: it is a verdict.
+# judged run is about the CURRENT tip — or, with nothing in flight and NO run for the tip at all,
+# until the workflow's own paths-ignore says outright that none can be created for this tip (a
+# docs-only push legitimately never gets one), or failing that until a grace expires
+# (SHIP_PR_BASE_ABSENT_GRACE, which is all that separates "never coming" from "not yet"). Then it
+# settles for the verdicts in hand, saying which commit each is about, exactly as the plain read
+# does. Two absences it will not settle: a run that EXISTS for the tip and has not judged it
+# (queued, running, or stopped), which only that run can answer; and a run in flight anywhere on
+# the branch, which is judging a tree the tip contains — waiting for it does better than settling,
+# since its commit becomes the verdict the tip then trails. A red breaks the wait immediately: it
+# is a verdict.
 # The red runs whose jobs have already been read, one "<run id><TAB><the line>" record per line.
 # `base --wait` re-folds every round, so without this a standing red would spend one jobs call per
 # round — per red workflow — to print the line it printed last time. A LIST rather than one slot
@@ -3878,12 +3889,306 @@ base_red_detail() {
   BASE_RED_DETAIL="${BASE_RED_DETAIL}${line}"$'\n'
 }
 
+# --- paths-ignore: the one absence that is not a race ------------------------------------------
+# A push whose every changed path sits in the workflow's `paths-ignore` NEVER gets a run: there is
+# nothing in flight, nothing late, and no grace that could tell the difference by waiting. `checks`
+# and `merge` settle such a head on the clock alone (run_signal's run-creation grace), which is the
+# honest answer when nothing else is in hand. `base --wait` is the one caller that has more: the
+# tip and the commit the standing verdict is about are both known, so the diff between them is one
+# read, and the workflow's own filter says whether that diff can produce a run at all. Recognizing
+# it is what keeps a docs-only default-branch tip from parking a whole wave's dispatch at the
+# --wait ceiling (ludics-lite#156).
+#
+# Every step REFUSES rather than guesses: a workflow file that does not parse, a filter pattern
+# this translation does not carry, a compare that came back empty or at the endpoint's cap, an
+# `on: push:` naming no `paths-ignore`. A refusal costs the grace — the settle that was already
+# there, one ABSENT_GRACE later — while a guess would claim "no run is coming" for a run that is
+# merely late and settle for an older green over an unbuilt tip. The asymmetry is the whole design:
+# the parser below is deliberately narrow, and every branch it cannot read says so.
+
+# workflow_paths_ignore <workflow id> <ref>: the workflow FILE's path, then its
+# `on: push: paths-ignore` patterns one per line, or nothing (exit 1) when they cannot be
+# established. The workflow file is read AT THE
+# TIP, because the filter that decides whether the tip gets a run is the one the tip carries.
+#
+# The YAML is read by a narrow state machine rather than a parser this repository does not have.
+# It accepts what a workflow file actually looks like — a top-level `on:` (or `"on":`) mapping, a
+# `push:` key under it, a `paths-ignore:` block sequence or one flow sequence, single- or
+# double-quoted items — and refuses everything else, tabs and aliases included: an alias
+# (`paths-ignore: *docs`) reads as a glob to anything that does not track anchors, and "*docs"
+# would match half a repository.
+WORKFLOW_YAML_FILTER='
+function ind_of(s,   n) { n = match(s, /[^ ]/); return n ? n - 1 : -1 }
+function unquote(s,   c) {
+  sub(/^[ ]+/, "", s); sub(/[ ]+$/, "", s)
+  c = substr(s, 1, 1)
+  if ((c == q || c == dq) && substr(s, length(s), 1) == c && length(s) >= 2)
+    s = substr(s, 2, length(s) - 2)
+  return s
+}
+function emit(s) { s = unquote(s); if (s == "") { bad = 1; exit } n++; pat[n] = s }
+function flow(s,   i, m, parts) {
+  s = substr(s, 2, length(s) - 2)
+  m = split(s, parts, ",")
+  for (i = 1; i <= m; i++) emit(parts[i])
+  ok = 1
+}
+/\t/ { bad = 1; exit }
+{
+  line = $0
+  sub(/[ \r]+$/, "", line)
+  if (line == "") next
+  ind = ind_of(line)
+  key = substr(line, ind + 1)
+  if (substr(key, 1, 1) == "#") next
+  rest = key
+  sub(/^[^:]*:/, "", rest)
+  sub(/^[ ]+/, "", rest)
+  sub(/[ ]+#.*$/, "", rest)
+}
+state == 0 {
+  if (ind == 0 && key ~ /^(on|"on")[ ]*:/) {
+    if (rest != "" && substr(rest, 1, 1) != "#") { bad = 1; exit }
+    state = 1; on_ind = ind
+  }
+  next
+}
+state == 1 {
+  if (ind <= on_ind) { bad = 1; exit }
+  if (key ~ /^push[ ]*:/) {
+    if (rest != "" && substr(rest, 1, 1) != "#") { bad = 1; exit }
+    state = 2; push_ind = ind
+  }
+  next
+}
+state == 2 {
+  if (ind <= push_ind) { bad = 1; exit }
+  if (key ~ /^paths-ignore[ ]*:/) {
+    if (rest == "") { state = 3; seq_ind = ind; next }
+    if (rest ~ /^\[.*\]$/) { flow(rest); exit }
+    bad = 1; exit
+  }
+  next
+}
+state == 3 {
+  if (key == "-" || substr(key, 1, 2) == "- ") { emit(substr(key, 2)); next }
+  if (ind <= seq_ind) { ok = 1; exit }
+  bad = 1; exit
+}
+END {
+  if (state == 3 && !bad) ok = 1
+  if (bad || !ok || n == 0) exit 1
+  for (i = 1; i <= n; i++) print pat[i]
+}'
+
+workflow_paths_ignore() {
+  local wid="$1" ref="$2" wpath body pats
+  wpath=$(gh_retry read api "repos/$REPO/actions/workflows/$wid" --jq '.path // ""') || return 1
+  # One path, and one that stays inside the repository: the value is interpolated into a REST
+  # path, so a newline or a traversal in it is a different request, not a workflow file.
+  case "$wpath" in '' | *$'\n'* | */../* | ../* | /*) return 1 ;; esac
+  # The raw media type, so the file arrives as itself: the JSON form is base64 whose decoder is
+  # spelled `-d` on one of this fleet's two platforms and `-D` on the other.
+  body=$(gh_retry read api -H "Accept: application/vnd.github.raw" \
+    "repos/$REPO/contents/$(encode_ref "$wpath")?ref=$ref") || return 1
+  [ -n "$body" ] || return 1
+  pats=$(awk -v q="'" -v dq='"' "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
+  [ -n "$pats" ] || return 1
+  # WHICH file these patterns came out of leads the answer, because the range walk has to know
+  # whether any commit in it changed that file — a filter that moved mid-range is not one filter.
+  # It travels in the OUTPUT and not in a variable: every caller here reads through a command
+  # substitution, where an assignment dies with the subshell (the same trap base_red_detail's
+  # cache documents).
+  printf '%s\n%s\n' "$wpath" "$pats"
+}
+
+# glob_ere <pattern>: one GitHub path filter as an ERE anchored at both ends, or nothing (exit 1)
+# for a pattern this translation does not carry. `**` is any run of characters, `*` any run within
+# one path segment — the two forms every real `paths-ignore` is built from. The cheat sheet's
+# other constructs (`?` and `+` over the PRECEDING character, character classes, a leading `!`
+# that inverts the whole pattern) are refused rather than approximated: each of them can only
+# widen what counts as ignored, and a pattern read too widely settles a tip whose run is coming.
+glob_ere() {
+  local p="$1" out="" c i=0
+  case "$p" in '' | *[!A-Za-z0-9._/*-]*) return 1 ;; esac
+  while [ "$i" -lt "${#p}" ]; do
+    c=${p:i:1}
+    case "$c" in
+    '*')
+      if [ "${p:i:2}" = '**' ]; then
+        out="$out.*"
+        i=$((i + 2))
+        continue
+      fi
+      out="${out}[^/]*"
+      ;;
+    '.') out="$out\\." ;;
+    *) out="$out$c" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '^%s$' "$out"
+}
+
+# paths_ignore_covers <patterns> <changed paths>: every changed path matches some pattern. A
+# pattern that does not translate fails the whole question rather than just itself — "the rest of
+# them covered everything" is not an answer about a filter half of which was not read.
+paths_ignore_covers() {
+  local pats="$1" files="$2" f p ere eres="" hit
+  [ -n "$pats" ] && [ -n "$files" ] || return 1
+  # EVERY pattern is translated BEFORE anything is matched. Translating lazily would let an early
+  # pattern that happens to match end the search before the untranslatable one beside it was ever
+  # looked at, and the filter would be declared read when half of it was not.
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    ere=$(glob_ere "$p") || return 1
+    eres="${eres}${ere}"$'\n'
+  done <<<"$pats"
+  [ -n "$eres" ] || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    hit=""
+    while IFS= read -r ere; do
+      [ -n "$ere" ] || continue
+      printf '%s' "$f" | grep -Eq -- "$ere" && {
+        hit=1
+        break
+      }
+    done <<<"$eres"
+    [ -n "$hit" ] || return 1
+  done <<<"$files"
+  return 0
+}
+
+# How many commits the recognition reads one by one before it gives up and lets the grace answer
+# instead. GitHub creates a run for a push of more than 1000 commits WHATEVER the filter says, so
+# any cap at or below that is sound; this one is far below, because the recognition exists for a
+# docs push of a handful of commits and reading a long range is neither cheap nor what it is for.
+IGNORE_MAX_COMMITS=20
+
+# The answer per <workflow>/<judged commit>/<tip>, so a wait that cannot recognize the tip spends
+# its reads ONCE rather than once per round for as long as the grace runs. Keyed by all three
+# because each of them changing changes the answer.
+BASE_IGNORE_CACHE=""
+PATHS_IGNORE_WHY=""
+
+# commit_files <sha>: the paths ONE commit changed, one per line, or nothing (exit 1) when the
+# answer is not evidence — an empty list (a commit whose files the API omitted, an empty
+# first-parent diff) and a list at the endpoint's 300-file cap both say nothing about the whole
+# commit. A merge commit answers with its FIRST-PARENT diff, which is the change the merge brought
+# to the branch. Renames carry both names, since both are changed paths.
+#
+# PAGINATED, because a commit's files are: the endpoint serves 30 a page by default and 300 in
+# all, so an unpaginated read of a 45-file commit answers with 30 ignored paths and hides the
+# source file behind them — a page taken for a diff (ludics-lite#163 review, round 2). One row per
+# file, both of a rename's names on it, so the count below counts FILES and not paths.
+commit_files() {
+  local sha="$1" raw count
+  raw=$(gh_retry read api --paginate "repos/$REPO/commits/$sha?per_page=100" \
+    --jq '.files[]? | [.filename, (.previous_filename // "")] | @tsv') || return 1
+  count=$(printf '%s' "$raw" | grep -c .)
+  [ "$count" -gt 0 ] && [ "$count" -lt 300 ] || return 1
+  printf '%s' "$raw" | tr '\t' '\n' | grep .
+}
+
+# commits_ignored <patterns> <workflow file> <judged sha> <tip>: true when every commit on the
+# FIRST-PARENT path from the judged commit up to the tip changed only ignored paths.
+#
+# Per COMMIT, and not the cumulative diff of the range, because a path filter is evaluated per
+# PUSH: GitHub compares the push's before and after SHAs, and a range that nets out to nothing can
+# still contain a push that touched source. Push boundaries are not in this feed — but a push's
+# own diff is a subset of the union of the diffs along ANY path from its before to its after, so a
+# path whose every step is ignored contains no push that is not, whatever the boundaries were. The
+# union can only be LARGER than the push diffs (a change and its revert on the path cancel there
+# but not here), so the error is always a refusal, which costs the grace and never a green.
+#
+# The path is the FIRST-PARENT one, and it must really reach the judged commit — two things the
+# range alone does not give (ludics-lite#163 review, round 3). A commit's file list is its diff
+# against its first parent, so only the first-parent chain is a path those diffs actually describe:
+# a merge reached through its second parent hides, behind a docs-only first-parent diff, every
+# source change the push carried from the judged tip. And after a force-push the judged commit is
+# not an ancestor at all, so the three-dot range walks the tip side of a fork and never sees what
+# the push removed — refused here both by `behind_by` and by a chain that cannot reach its base.
+#
+# The path must also be short and completely known: the commit list is one page, and a range
+# longer than the cap goes to the grace rather than to a read per commit (GitHub's own rule is
+# 1000 commits, above which a push runs whatever the filter says). A `total_commits` the returned
+# list does not match is a truncated answer and settles nothing.
+commits_ignored() {
+  local pats="$1" wfile="$2" vsha="$3" tip="$4" cmp count behind rows sha parent files steps nl=$'\n'
+  cmp=$(gh_retry read api "repos/$REPO/compare/$vsha...$tip?per_page=$IGNORE_MAX_COMMITS" \
+    --jq '(.total_commits // 0 | tostring), ((.behind_by // -1) | tostring),
+          ((.commits // [])[] | [.sha, ((.parents // [])[0].sha // "-")] | @tsv)') || return 1
+  count="${cmp%%$nl*}"
+  cmp="${cmp#*$nl}"
+  behind="${cmp%%$nl*}"
+  rows="${cmp#*$nl}"
+  case "$count" in '' | *[!0-9]*) return 1 ;; esac
+  # Not an ancestor: the judged commit is off to the side of a force-push, and the three-dot range
+  # describes a fork rather than what the push did.
+  [ "$behind" = 0 ] || return 1
+  [ "$count" -gt 0 ] && [ "$count" -le "$IGNORE_MAX_COMMITS" ] || return 1
+  [ "$(printf '%s\n' "$rows" | grep -c '^[0-9a-f]\{7,\}	')" -eq "$count" ] || return 1
+  sha="$tip"
+  steps=0
+  while [ "$sha" != "$vsha" ]; do
+    steps=$((steps + 1))
+    [ "$steps" -le "$count" ] || return 1 # a chain longer than the range it walks: not a chain
+    parent=$(awk -F'\t' -v s="$sha" '$1 == s { print $2; exit }' <<<"$rows")
+    # A step off the listed range before reaching the judged commit: the path from it to the tip
+    # is not the first-parent one (a merge reached through a second parent), so these first-parent
+    # diffs do not describe it.
+    case "$parent" in '' | -) return 1 ;; esac
+    files=$(commit_files "$sha") || return 1
+    [ -z "$wfile" ] || ! grep -qxF -- "$wfile" <<<"$files" || return 1
+    paths_ignore_covers "$pats" "$files" || return 1
+    sha="$parent"
+  done
+  [ "$steps" -gt 0 ] || return 1
+  return 0
+}
+
+# tip_within_paths_ignore <rows> <tip>: rows are "<workflow id><TAB><name><TAB><judged sha>", one
+# per workflow whose newest judged run trails the tip with no run at the tip at all. True when
+# EVERY one of them is explained by its own filter — one workflow's docs-only diff says nothing
+# about the workflow beside it — and the reason goes into PATHS_IGNORE_WHY for the settle line.
+tip_within_paths_ignore() {
+  local rows="$1" tip="$2" wfid name vsha key hit pats read_pats wfile why=""
+  PATHS_IGNORE_WHY=""
+  [ -n "$rows" ] || return 1
+  while IFS=$'\t' read -r wfid name vsha; do
+    [ -n "$wfid" ] || continue
+    # No judged run at all: there is no commit to diff the tip against, so nothing here can
+    # explain the absence (and the report says "never judged here" regardless).
+    case "$vsha" in '' | -) return 1 ;; esac
+    key="$wfid/$vsha/$tip"
+    hit=$(awk -F'\t' -v k="$key" '$1 == k { print $2; exit }' <<<"$BASE_IGNORE_CACHE")
+    if [ -z "$hit" ]; then
+      hit=no
+      # The file's path leads the answer; the patterns are the rest of it.
+      read_pats=$(workflow_paths_ignore "$wfid" "$tip") || read_pats=""
+      wfile="${read_pats%%$'\n'*}"
+      pats="${read_pats#*$'\n'}"
+      if [ -n "$read_pats" ] && [ -n "$wfile" ] && [ -n "$pats" ] &&
+        commits_ignored "$pats" "$wfile" "$vsha" "$tip"; then
+        hit=yes
+      fi
+      BASE_IGNORE_CACHE="${BASE_IGNORE_CACHE}${key}"$'\t'"${hit}"$'\n'
+    fi
+    [ "$hit" = yes ] || return 1
+    why="${why:+$why, }$name"
+  done <<<"$rows"
+  PATHS_IGNORE_WHY="$why"
+  return 0
+}
+
 cmd_base() {
   local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
   local allruns="" wfid
   local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
   local nogo_at_tip=0 last_tip="" grace_from confirm wf="" wid wname part sleep_for remaining
   local norun=0 tip_seen_at tip_age hold ebranch
+  local tip_unjudged=0 unrun_rows="" settle_why
   local started now beat waited_note="" no_tip_verdict=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3913,6 +4218,7 @@ cmd_base() {
   grace_from=$started
   while :; do
     red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0 norun=0
+    tip_unjudged=0 unrun_rows=""
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
     tip=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || tip=""
@@ -4009,7 +4315,23 @@ cmd_base() {
         [ -n "$name" ] || continue
         is_advisory "$name" && continue
         [ "$status" = completed ] || inflight=$((inflight + 1))
-        [ -n "$tip" ] && [ "$vsha" = "$tip" ] || uncovered=$((uncovered + 1))
+        if [ -n "$tip" ] && [ "$vsha" = "$tip" ]; then
+          : # this workflow's newest judged run is about the tip: covered
+        else
+          uncovered=$((uncovered + 1))
+          # WHICH absence, per workflow, because only one of the two can ever be explained. A run
+          # for the tip EXISTS and has not judged it (queued, running, or stopped) — nothing but
+          # that run can answer, so the wait keeps waiting. Or no run for the tip exists at all,
+          # which is either the not-created-yet window or a push the workflow's filter skips: the
+          # settle below is about exactly those. Read off the unfolded rows, since the fold keeps
+          # only the newest of each kind and an older row at the tip counts just as much.
+          if awk -F'\t' -v w="$wfid" -v t="$tip" \
+            '$1 == w && $5 == t { found = 1 } END { exit !found }' <<<"$allruns"; then
+            tip_unjudged=$((tip_unjudged + 1))
+          else
+            unrun_rows="${unrun_rows}${wfid}"$'\t'"${name}"$'\t'"${vsha}"$'\n'
+          fi
+        fi
         # A tip run that completed stopped-not-judged (cancelled/stale/action_required) is NOT
         # the same absence as a run that never existed: one wants a re-run, the other may be
         # paths-ignore. Recorded here, before the nogo-swap below overwrites concl/csha.
@@ -4074,55 +4396,90 @@ cmd_base() {
     # further merge landing after the grace had already elapsed would otherwise be declared
     # integration-green on the spot, its run not yet created and the timer long spent.
     if [ "$tip" != "$last_tip" ]; then
+      # A MOVE restarts the grace; the FIRST observation does not. `now` here is read after the
+      # round's own API calls, so re-stamping it on round one spends that round's latency out of
+      # the grace — which is how `--wait=301` over a 300s grace could never reach it: the ceiling
+      # arrived a few seconds before the clock it was sized against, every time (ludics-lite#156).
+      [ -z "$last_tip" ] || grace_from=$now
       last_tip="$tip"
-      grace_from=$now
     fi
-    if [ "$inflight" -eq 0 ]; then
-      if [ "$uncovered" -eq 0 ]; then
-        # A listed workflow with NO push runs on the branch (norun) is ambiguous: dispatch- or
-        # schedule-only (never coming — staging carries two such smoke workflows, and counting
-        # them as uncovered would park EVERY wait on the full grace), or a push workflow the tip
-        # itself just added, whose first run is not created yet. What separates them is whether
-        # the newcomer has had its creation window SINCE THE PUSH — and the push time is the
-        # sibling runs' own creation time at this tip (every workflow here is judged at the tip,
-        # so sibling rows exist to read: folded col 5 is the newest completed run's sha, col 6
-        # its created_at). Not the commit's committer date (an hours-old commit pushed directly
-        # would erase the window) and not the wait's observation clock (which would hold every
-        # late-started wait on a repo carrying dispatch-only workflows for the full grace).
-        hold=""
-        if [ "$norun" -gt 0 ]; then
-          tip_seen_at=$(awk -F'\t' -v t="$tip" \
-            '$5 == t && $6 > best { best=$6 } END { print best }' <<<"$raw")
-          tip_age=$(age_of "$tip_seen_at")
-          case "$tip_age" in
-          '' | *[!0-9]*) ;; # unreadable age is not evidence to hold on
-          *) [ "$tip_age" -ge "$ABSENT_GRACE" ] || hold=1 ;;
-          esac
-        fi
-        # Covered — against the tip read BEFORE the runs. A sibling merge landing between those
-        # two reads is the integration loop's normal traffic, and would make this a false green
-        # for a branch already pointing elsewhere: accept coverage only when the tip has not
-        # moved meanwhile; otherwise fall through to the sleep and let the next round re-read
-        # everything (the tip-change branch above restarts the grace).
-        if [ -z "$hold" ]; then
-          confirm=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || confirm=""
-          [ "$confirm" = "$tip" ] && break
-        fi
-      # Nothing running and the tip unjudged. A tip run that completed STOPPED (cancelled/stale)
-      # is not absence — it existed and was not judged, so no amount of paths-ignore explains it;
-      # the grace only allows for a superseding replacement to be created, and then the verdict
-      # is "none". A tip with NO run is either the not-created-yet window or paths-ignore, and
-      # only time tells those apart: after the grace, settle for what is there — the
-      # per-workflow lines name which commit each verdict is actually about.
-      elif [ $((now - grace_from)) -ge "$ABSENT_GRACE" ]; then
-        if [ "$nogo_at_tip" -gt 0 ]; then
-          waited_note="(the tip's newest run completed stopped-not-judged and no replacement appeared within the grace — NOT absence and NOT a verdict: re-run the workflow)"
-          no_tip_verdict=1
-        else
-          waited_note="(waited $(((now - started) / 60)) min: no run for the tip appeared and none is in flight — the verdicts above may trail it)"
-        fi
-        break
+    if [ "$inflight" -eq 0 ] && [ "$uncovered" -eq 0 ]; then
+      # A listed workflow with NO push runs on the branch (norun) is ambiguous: dispatch- or
+      # schedule-only (never coming — staging carries two such smoke workflows, and counting
+      # them as uncovered would park EVERY wait on the full grace), or a push workflow the tip
+      # itself just added, whose first run is not created yet. What separates them is whether
+      # the newcomer has had its creation window SINCE THE PUSH — and the push time is the
+      # sibling runs' own creation time at this tip (every workflow here is judged at the tip,
+      # so sibling rows exist to read: folded col 5 is the newest completed run's sha, col 6
+      # its created_at). Not the commit's committer date (an hours-old commit pushed directly
+      # would erase the window) and not the wait's observation clock (which would hold every
+      # late-started wait on a repo carrying dispatch-only workflows for the full grace).
+      hold=""
+      if [ "$norun" -gt 0 ]; then
+        tip_seen_at=$(awk -F'\t' -v t="$tip" \
+          '$5 == t && $6 > best { best=$6 } END { print best }' <<<"$raw")
+        tip_age=$(age_of "$tip_seen_at")
+        case "$tip_age" in
+        '' | *[!0-9]*) ;; # unreadable age is not evidence to hold on
+        *) [ "$tip_age" -ge "$ABSENT_GRACE" ] || hold=1 ;;
+        esac
       fi
+      # Covered — against the tip read BEFORE the runs. A sibling merge landing between those
+      # two reads is the integration loop's normal traffic, and would make this a false green
+      # for a branch already pointing elsewhere: accept coverage only when the tip has not
+      # moved meanwhile; otherwise fall through to the sleep and let the next round re-read
+      # everything (the tip-change branch above restarts the grace).
+      if [ -z "$hold" ]; then
+        confirm=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || confirm=""
+        [ "$confirm" = "$tip" ] && break
+      fi
+    # Every workflow still trailing the tip simply has NO run for it: nothing is coming that this
+    # wait could receive. That is the shape the header promises a settle for, and it is the shape
+    # a docs-only push leaves behind — ludics-lite#156, where a `--wait` sat on one to its ceiling
+    # and refused a dispatch the plain read had already settled. Two things end it. The filter
+    # says outright that no run can be created for this tip, which needs no clock at all; or the
+    # absence outlives the run-creation grace, which is all that separates "never coming" from
+    # "not yet". Either way the settle is for the verdicts in hand, and the per-workflow lines
+    # name which commit each of them is actually about.
+    #
+    # Three shapes do NOT settle here, and each is a different thing the wait is still owed.
+    # A run that EXISTS for the tip and has not judged it — queued, running, or completed
+    # stopped-not-judged — existed, so no filter explains it, and only that run can answer; a
+    # stopped one gets the grace for a superseding replacement, and then the verdict is "none".
+    # A run in flight ANYWHERE on this branch is judging a tree the tip contains (on a branch
+    # this command reads, an older run's commit is an ancestor of the tip): settling for a green
+    # under it would hand out an all-clear for a tree whose verdict is minutes away, and waiting
+    # for it does better than settle — when it lands, its own commit is what the tip's absence
+    # then trails. That is the honest reading of a `--wait`, and it is not what parked the 09-15
+    # wave: the tip there was never going to get a run at all.
+    # And a listed workflow with NO push run on this branch at all (norun) is not in the fold, so
+    # no filter of its was read: it may be dispatch- or schedule-only, or it may be a workflow the
+    # tip itself just added whose first run is on its way. The FAST settle cannot speak for it —
+    # a docs-only diff under one workflow's filter says nothing about a filter nobody read — so
+    # only the grace, which is that newcomer's creation window, may settle a repo carrying one.
+    elif [ "$uncovered" -gt 0 ] && [ "$tip_unjudged" -eq 0 ] && [ "$inflight" -eq 0 ]; then
+      settle_why=""
+      if [ "$norun" -eq 0 ] && tip_within_paths_ignore "$unrun_rows" "$tip"; then
+        settle_why="(every commit on the first-parent path from the judged commit up to the tip changes only paths within the paths-ignore of $PATHS_IGNORE_WHY, so no run for it is coming — the verdicts above are about the commit each line names)"
+      elif [ $((now - grace_from)) -ge "$ABSENT_GRACE" ]; then
+        settle_why="(waited $(((now - started) / 60)) min: no run for the tip appeared and none is in flight for it — the verdicts above may trail it)"
+      fi
+      # The same TOCTOU the covered break answers, and for the stronger reason: this settle
+      # accepts verdicts about an OLDER commit, so a push landing between the tip read and here
+      # would settle for a green two commits back. On a moved or unreadable tip, poll again — the
+      # tip-change branch above restarts the grace for the successor.
+      if [ -n "$settle_why" ]; then
+        confirm=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || confirm=""
+        if [ "$confirm" = "$tip" ]; then
+          waited_note="$settle_why"
+          break
+        fi
+      fi
+    elif [ "$inflight" -eq 0 ] && [ "$nogo_at_tip" -gt 0 ] &&
+      [ $((now - grace_from)) -ge "$ABSENT_GRACE" ]; then
+      waited_note="(the tip's newest run completed stopped-not-judged and no replacement appeared within the grace — NOT absence and NOT a verdict: re-run the workflow)"
+      no_tip_verdict=1
+      break
     fi
     [ $((now - started)) -lt "$wait_for" ] || {
       waited_note="(--wait ceiling of $((wait_for / 60)) min reached with a run still unfinished or the tip unjudged — NOT a verdict for the tip)"
@@ -4200,7 +4557,8 @@ main() {
   pr-review.sh retry [--read] <gh args...>   # any other gh call, same retry policy
   pr-review.sh retry run watch owner/name#<run-id>  # quiet await of ONE run (never forwarded
                                              # to gh); for a PR prefer: checks <pr> --wait
-  <pr> is a number or owner/name#number; prefer owner/name#number for background invocations.
+  <pr> is owner/name#number, or a number with --repo/REPO= naming the repo; a bare number with
+  no repo named is REFUSED, never resolved from the cwd (a PR number names one PR in every repo).
   The run argument takes the same form, and a bare run id without -R/REPO is refused." ;;
   esac
 }

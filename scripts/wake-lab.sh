@@ -122,6 +122,25 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 #   Firewall profile to be Private, currently true of both.
 # * Probing the -win / -lan aliases by hand: the command must be `exit 0`, NOT `true` — they land
 #   in cmd.exe, which has no `true`; see ssh_probe().
+# * `wsl.exe` on the Windows side can wedge and never return, and ssh will wait for it forever:
+#   ConnectTimeout bounds the TCP connect ALONE, never the remote command. On 2026-09-16 a
+#   `--wait --restart-wsl rog minix` sat 2h40m in `wsl.exe -d Ubuntu -e true` on rog, hanging the
+#   scheduled sweep that called it — and because the loop over boxes was serialized, minix never
+#   got its restart at all, so the sweep's hip unit went red on the stale-dxg condition the
+#   restart exists to clear (ludics-lite#60). Two things follow, and both are load-bearing. Every
+#   remote command runs under a wall-clock cap (capped(); macOS ships no timeout(1)), and the
+#   boxes are kicked concurrently, so a wedge is bounded and is one box's problem alone. And a cap
+#   that fires is NOT a failure: the VM had in fact started that day, `uptime -p` inside the guest
+#   matching the restart to the minute while the Windows-side probe was still stuck. So on expiry
+#   the guest is asked directly over its -wsl alias — which answered instantly throughout — and
+#   that answer, not the wedged probe, is the evidence. But only in ONE direction: a guest that
+#   answers is proof a VM is up, while a guest that does not answer proves nothing at all, because
+#   the -wsl alias rides tailscaled inside the guest and that lags minutes behind a running VM
+#   (the bullet above says so about every fresh kick). So a capped START with a silent guest is
+#   left to the poll, and a capped SHUTDOWN with a silent guest is UNCONFIRMED — never permission
+#   to start, which would attach to the old VM and then report it as the fresh one. That keeps the
+#   restart's invariant: a start is issued only after a shutdown that actually returned, so a
+#   guest answering after one is always the fresh VM.
 #
 # mac_of (every MAC of a box), eth_mac_of (the Ethernet one alone, whose lease is what
 # router_active asks the router about) and ip_of are NOT here: they are the fleet's hardware
@@ -204,12 +223,59 @@ soap_checked() { # soap_checked <control-url> <serviceType> <action> <inner-xml>
   printf '%s' "$resp"
 }
 
+# ssh's ConnectTimeout bounds the TCP connect ALONE and never the remote command, so every ssh
+# here is unbounded the moment the far side accepts the connection and then wedges. On 2026-09-16
+# that cost 2h40m: `wsl.exe -d Ubuntu -e true` on rog never returned, the caller (the scheduled
+# cross-machine sweep) hung behind it, and the VM had in fact started — only the probe was stuck.
+# Every remote command below therefore runs under a wall-clock cap. macOS ships no timeout(1), so
+# the watchdog is a background subshell: SIGALRM at the deadline, SIGKILL a grace period later for
+# anything that ignores it, and the 142/137 `wait` then reports is mapped to CAP_EXPIRED so a
+# command the cap cut short is never read as one that ran and failed — the two mean opposite
+# things, and the callers below act on the difference.
+CAP_EXPIRED=124        # what `capped` returns for a cut-short command, as timeout(1) does
+CAP_GRACE=5            # seconds between the SIGALRM and the SIGKILL behind it
+capped() { # capped <seconds> <cmd...> — run cmd under a hard wall-clock cap
+  local secs=$1 pid dog rc; shift
+  # Redirections belong on the CALL, not in here: they then cover the watchdog too, which has
+  # nothing to say, and the command keeps whatever the caller wanted to do with its output.
+  "$@" & pid=$!
+  # The watchdog has to be killable TOGETHER WITH its nap, and that is the whole reason for the
+  # shape below. A `sleep` run in the watchdog's foreground is a separate process, so a signal to
+  # the watchdog leaves it orphaned for the rest of its interval — up to WSL_START_CAP, two
+  # minutes — still holding every descriptor the watchdog inherited. That is not only litter: an
+  # orphan holding an inherited copy of the lab lock's descriptor keeps the lock alive after the
+  # caller believes it has dropped it, which is how this was found. So the watchdog naps in a
+  # background child and waits for it, which leaves it free to run a TERM trap that takes the nap
+  # with it. `jobs -p` rather than a remembered `$!`, because a TERM arriving between the fork and
+  # the assignment would find that variable unset, and that is the one window a remembered pid
+  # cannot cover; `jobs -p` is whatever is actually running, whenever the trap happens to run.
+  { trap 'kill -KILL $(jobs -p) 2>/dev/null; exit 0' TERM
+    sleep "$secs" & wait $!
+    kill -ALRM "$pid" 2>/dev/null
+    sleep "$CAP_GRACE" & wait $!
+    kill -KILL "$pid" 2>/dev/null; } >/dev/null 2>&1 &
+  dog=$!
+  # TERM, not KILL: the trap above is what reaps the nap, and an untrappable signal would put the
+  # orphan straight back. A watchdog that somehow missed the trap still dies on TERM's default
+  # action, so there is no path on which this wait outlives the watchdog.
+  wait "$pid"; rc=$?
+  kill -TERM "$dog" >/dev/null 2>&1; wait "$dog" >/dev/null 2>&1
+  case "$rc" in 142|137) return "$CAP_EXPIRED" ;; esac
+  return "$rc"
+}
+
+# The probes are capped as well, and not only for tidiness: a single wedged probe inside one of the
+# polling loops below hangs it forever, because those loops check their deadline BETWEEN
+# iterations. The cap is deliberately loose against the ConnectTimeout it wraps — it exists to
+# bound a remote command that never returns, not to second-guess a slow connect.
+PROBE_CAP=${WAKE_LAB_PROBE_CAP:-20}
 ssh_probe() { # ssh_probe <alias> [timeout] — true iff sshd answers and authentication succeeds
   [ -n "$1" ] || return 1
   # `exit 0`, NOT `true`: the -win/-lan aliases land in cmd.exe, which has no `true` and would
   # report every Windows box as down. `exit 0` is valid in cmd.exe and in POSIX shells alike.
-  ssh -o BatchMode=yes -o ConnectTimeout="${2:-5}" -o StrictHostKeyChecking=accept-new \
-      "$1" 'exit 0' >/dev/null 2>&1
+  capped "$PROBE_CAP" \
+    ssh -o BatchMode=yes -o ConnectTimeout="${2:-5}" -o StrictHostKeyChecking=accept-new \
+        "$1" 'exit 0' >/dev/null 2>&1
 }
 
 magic_packet() { # magic_packet <MAC>
@@ -312,6 +378,12 @@ HOLD_STATE_DIR=${WAKE_LAB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wake-
 # The local-time hours on the Windows box that the unattended sweep occupies: the routine's 07:20
 # launch plus its longest lane. Written `<start>-<end>`, end exclusive, and it may wrap midnight.
 SWEEP_HOURS=${WAKE_LAB_SWEEP_HOURS:-7-11}
+# Caps for the two remote commands of the kick/restart path, which are the ones observed to wedge.
+# Sized to be generous against how long each really takes — a `wsl --shutdown` is seconds and a
+# cold VM start is well under a minute — because the cap is here to end a command that will never
+# return, not to give up on a slow one.
+WSL_SHUTDOWN_CAP=${WAKE_LAB_WSL_SHUTDOWN_CAP:-60}
+WSL_START_CAP=${WAKE_LAB_WSL_START_CAP:-120}
 
 wake() { # wake <box>
   local name=$1 macs mac err ok=1
@@ -349,26 +421,86 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
   # it. A start that then fails falls through to the next alias, shutdown included, which is a
   # natural retry of the whole restart rather than a start on a VM only half torn down.
   #
+  # Both commands run under `capped`, and a cap that fires is NOT a failure: it is a command with
+  # no verdict, and the guest itself is then asked instead (see the CAP_EXPIRED branches). That
+  # distinction is the whole point — on 2026-09-16 the start probe wedged on rog for 2h40m over a
+  # VM that had started perfectly, and reading the wedge as a failure would have been as wrong as
+  # the old unbounded wait was.
+  #
   # On failure KICK_PHASE says which phase failed, because the two mean opposite things to the
   # operator: `shutdown` — no alias carried the shutdown, so a -wsl guest that still answers is
   # the OLD VM; `start` — the shutdown went through and the start then failed everywhere, so
   # there is no VM at all until a kick succeeds; `kick` — the plain kick's start failed.
-  local name=$1 fresh=${2:-} dest what=kick shut=0
+  local name=$1 fresh=${2:-} dest what=kick shut=0 capped_start=0 guest rc
   [ "$fresh" = fresh ] && what=restart
+  guest=$(wsl_of "$name")
   for dest in $(lan_of "$name") $(ts_of "$name"); do
     [ -n "$dest" ] || continue
+    # The alias this iteration is using, recorded for every path that returns 0 — including the
+    # capped ones that leave the verdict to the guest poll — so that `--hold` has a Windows side
+    # to put the holder on. On a failure nothing reads it: no kick, no hold.
+    KICK_DEST=$dest
     # An ssh network logon is session enough: this works with nobody logged in at the console.
     if [ "$fresh" = fresh ]; then
-      ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" 'wsl.exe --shutdown' >/dev/null 2>&1 || continue
-      echo "  wsl shut down on $name (via $dest)"
+      capped "$WSL_SHUTDOWN_CAP" \
+        ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" 'wsl.exe --shutdown' >/dev/null 2>&1
+      rc=$?
+      if [ "$rc" = "$CAP_EXPIRED" ]; then
+        # The command never returned, so its status says nothing about the teardown — and NOTHING
+        # here can supply that. A silent guest does not mean a stopped VM: the -wsl alias rides
+        # tailscaled inside the guest, which this file's own lore says lags minutes behind a
+        # running VM, so "no guest answers" is the everyday reading of a VM that is perfectly
+        # alive. Starting on that evidence would attach to the old VM and then report the fresh
+        # restart the sweep is waiting for, which is precisely the stale bridge restart-wsl exists
+        # to replace. So a capped shutdown is UNCONFIRMED, whatever the guest says, and this alias
+        # has not carried the restart: retry the whole thing on the next one, and if none carries
+        # it the step fails as a shutdown failure. The guest is still probed, because "the old VM
+        # demonstrably still answers" and "nothing is known" read differently to an operator, but
+        # neither of them is permission to start.
+        if [ -n "$guest" ] && ssh_probe "$guest"; then
+          echo "  wsl shutdown TIMED OUT after ${WSL_SHUTDOWN_CAP}s on $name (via $dest); the guest still answers, so the old VM stands"
+        else
+          echo "  wsl shutdown TIMED OUT after ${WSL_SHUTDOWN_CAP}s on $name (via $dest); no guest answers, but a silent guest is not a stopped VM — the teardown is unconfirmed"
+        fi
+        continue
+      elif [ "$rc" != 0 ]; then
+        continue
+      else
+        echo "  wsl shut down on $name (via $dest)"
+      fi
       shut=1
     fi
-    if ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" 'wsl.exe -d Ubuntu -e true' >/dev/null 2>&1; then
+    capped "$WSL_START_CAP" \
+      ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" 'wsl.exe -d Ubuntu -e true' >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" = 0 ]; then
       echo "  wsl started on $name (via $dest)"
-      KICK_DEST=$dest
       return 0
     fi
+    if [ "$rc" = "$CAP_EXPIRED" ]; then
+      # The start was issued and the probe simply never came back. A guest that answers settles it.
+      if [ -n "$guest" ] && ssh_probe "$guest"; then
+        echo "  wsl start probe timed out after ${WSL_START_CAP}s on $name (via $dest); the guest answers, so the VM is up"
+        return 0
+      fi
+      capped_start=1
+      # With the guest silent there is no verdict here, and what to do next differs by path. A
+      # RESTART must not fall through: the next alias would issue a second `wsl --shutdown`,
+      # tearing down the very VM this start may have just booted, so the box goes to start_wsl's
+      # poll, which asks the guest on its own deadline. A plain KICK has no shutdown to repeat and
+      # a second start is idempotent, so the other alias is worth trying — a wedged LAN side must
+      # not cost a box the start its Tailscale alias would have carried.
+      echo "  wsl start probe timed out after ${WSL_START_CAP}s on $name (via $dest); leaving the verdict to the guest poll"
+      [ "$fresh" = fresh ] && return 0
+    fi
   done
+  # Every alias tried and one of them left a start in flight: a cap is not a failure anywhere else
+  # in this function and it is not one here either, so the poll gets the box rather than the
+  # operator getting a kick that may well have worked.
+  if [ "$capped_start" = 1 ]; then
+    echo "  wsl $what start probe timed out on every alias on $name; leaving the verdict to the guest poll"
+    return 0
+  fi
   if [ "$fresh" = fresh ] && [ "$shut" = 0 ]; then KICK_PHASE=shutdown
   elif [ "$fresh" = fresh ]; then KICK_PHASE=start
   else KICK_PHASE=kick; fi
@@ -512,8 +644,12 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
   # invocation that may still be protecting a running lane, and killing it over a failed probe of
   # ours would unhold that lane's VM — the failure this whole flag exists to prevent, caused by a
   # retry.
-  if [ "$spawned" = 1 ]; then
+  if [ "$spawned" = 1 ] && [ "$(hold_pid_read "$f" 2>/dev/null | cut -d' ' -f1)" = "$pid" ]; then
     release_hold "$name" >/dev/null
+  elif [ "$spawned" = 1 ]; then
+    # We spawned a holder, but the record no longer names it: a concurrent run replaced it after
+    # ours exited. Killing what the file names now would unhold THAT run's lane.
+    echo "  wsl holder for $name was not observed; the record now names another run's holder, left alone"
   else
     echo "  wsl holder for $name was not observed, but it belongs to an earlier run: left running and recorded"
   fi
@@ -592,6 +728,13 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
   m=$(reg_dword "$out" SmartActiveHoursState)
   if [ "$s" = '?' ] || [ "$e" = '?' ]; then
     echo "  ACTIVE HOURS WARNING on $name: could not read ActiveHoursStart/End under $ACTIVE_HOURS_KEY via $dest"
+    return 0
+  fi
+  # Numeric is not the same as valid. `24-24` reaches hour_active's equal-endpoint branch, which
+  # calls every hour covered — so a box whose update protection is set to nonsense would report
+  # the quiet line instead of the warning that is the only notice anyone gets.
+  if [ "$s" -gt 23 ] || [ "$e" -gt 23 ]; then
+    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, which are not clock hours (0-23): the update protection on that box is not valid"
     return 0
   fi
   len=$(( (we - ws + 24) % 24 )); [ "$len" -eq 0 ] && len=1
@@ -685,23 +828,52 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 # `wsl up`.
 WSL_FAILED=""
 start_wsl() {
-  local n what=kick started=() unshut=() unstarted=() unheld=() up=() down=() rc=0 line
+  local n i dir krc kphase kheld what=kick started=() unshut=() unstarted=() unheld=() up=() down=() rc=0 line
   [ "$FRESH_WSL" = fresh ] && what=restart
+  # One box at a time meant one wedged box could cost its neighbours their restart entirely: on
+  # 2026-09-16 rog's start probe hung and minix, second in the loop, never got a restart at all —
+  # its VM sat eleven hours old and the sweep's hip unit went red on exactly the stale-dxg
+  # condition restart-wsl exists to clear. The boxes are independent Windows hosts and nothing in
+  # the kick is shared, so kick them all at once. Each box's output is buffered and replayed in
+  # target order afterwards, so the log still reads box by box rather than interleaved.
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/wake-lab-wsl.XXXXXX") || {
+    echo "wsl $what FAILED: no work directory" >&2; WSL_FAILED="wsl $what FAILED: no work directory"; return 1; }
+  i=0
   for n in "$@"; do
-    if kick_wsl "$n" "$FRESH_WSL"; then
-      if [ "$HOLD" = 1 ]; then
-        check_active_hours "$n" "$KICK_DEST"
-        if hold_wsl "$n" "$KICK_DEST"; then started+=("$n")
-        else
-          [ "$FRESH_WSL" = fresh ] && shutdown_unheld_vm "$n" "$KICK_DEST"
-          unheld+=("$n")
-        fi
-      else
-        started+=("$n")
+    i=$((i + 1))
+    # KICK_PHASE and KICK_DEST are set in the subshell, so they come back alongside the status
+    # rather than as globals; a box whose subshell died outright reads as a plain failed start,
+    # never as a success. The HOLD step runs in that same subshell, for the same reason the kick
+    # does: a box whose holder cannot be established must not cost its neighbour the settle.
+    { kick_wsl "$n" "$FRESH_WSL" >"$dir/$i.out" 2>&1
+      krc=$?; kheld=na
+      if [ "$krc" = 0 ] && [ "$HOLD" = 1 ]; then
+        { check_active_hours "$n" "$KICK_DEST"
+          if [ -z "$KICK_DEST" ]; then
+            echo "  wsl holder NOT started on $n: no Windows alias carried the start"
+            kheld=fail
+          elif hold_wsl "$n" "$KICK_DEST"; then kheld=ok
+          else
+            [ "$FRESH_WSL" = fresh ] && shutdown_unheld_vm "$n" "$KICK_DEST"
+            kheld=fail
+          fi; } >>"$dir/$i.out" 2>&1
       fi
-    elif [ "$KICK_PHASE" = shutdown ]; then unshut+=("$n")
+      printf '%s %s %s\n' "$krc" "${KICK_PHASE:-none}" "$kheld" >"$dir/$i.rc"; } &
+  done
+  wait
+  i=0
+  for n in "$@"; do
+    i=$((i + 1))
+    [ -f "$dir/$i.out" ] && cat "$dir/$i.out"
+    krc=1; kphase=start; kheld=na
+    [ -s "$dir/$i.rc" ] && read -r krc kphase kheld < "$dir/$i.rc"
+    if [ "$krc" = 0 ]; then
+      # A VM nothing holds is not a started box: it is the one shape --hold exists to refuse.
+      if [ "$kheld" = fail ]; then unheld+=("$n"); else started+=("$n"); fi
+    elif [ "$kphase" = shutdown ]; then unshut+=("$n")
     else unstarted+=("$n"); fi
   done
+  rm -rf "$dir"
   # bash 3.2 under set -u: an empty array cannot be expanded, hence the count guards.
   if [ ${#started[@]} -gt 0 ]; then
     if wait_for_wsl "${started[@]}"; then up=("${started[@]}")

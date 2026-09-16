@@ -27,11 +27,18 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 source "$SCRIPT_DIR/test-pr-review-lib.sh"
 test_tmpdir TEST_ROOT reply-test
 
-REPO=example/repo
+# The repo the fixture IS, and the repo pr-review.sh is told about. Two names for one string
+# because the cwd cases below clear REPO to drive `resolve_repo`'s inference, and the fixture must
+# still know which repository it is answering for.
+TARGET_REPO=example/repo
+REPO="$TARGET_REPO"
 REQUEST_LOG="$TEST_ROOT/requests"
 BODIES="$TEST_ROOT/bodies"
 UNEXPECTED="$TEST_ROOT/unexpected"
 
+# What `gh repo view` answers, i.e. what `repo_from_cwd` infers. Empty = gh does not answer, and
+# the inference falls through to the cwd's `origin` remote, as it does in production.
+CWD_REPO=""
 # The comment id whose write fails, and how. 0 is never.
 FAIL_ID=0
 FAIL_MSG=""
@@ -46,6 +53,8 @@ reset_fixture() {
   mkdir -p "$BODIES"
   FAIL_ID=0
   FAIL_MSG=""
+  CWD_REPO=""
+  REPO="$TARGET_REPO"
   THREADS="900:false 901:false 902:false 903:true"
 }
 
@@ -72,10 +81,19 @@ gh() {
     query=*) query="${arg#query=}" ;;
     esac
   done
+  # `repo view` is not an `api` call, so it is answered before gh_fixture_parse, which refuses
+  # everything else. It is answered at all because `repo_from_cwd` asks it first and the cwd cases
+  # below need the inference armed; with CWD_REPO empty it fails the way gh does when GraphQL is
+  # down, and the inference falls through to the `origin` remote.
+  if [ "${1:-}" = repo ] && [ "${2:-}" = view ]; then
+    [ -n "$CWD_REPO" ] || return 1
+    printf '%s\n' "$CWD_REPO"
+    return 0
+  fi
   gh_fixture_parse "$@"
   case "$FIXTURE_ENDPOINT" in
-  "repos/$REPO/pulls/7/comments/"*"/replies")
-    id="${FIXTURE_ENDPOINT#repos/$REPO/pulls/7/comments/}"
+  "repos/$TARGET_REPO/pulls/7/comments/"*"/replies")
+    id="${FIXTURE_ENDPOINT#repos/$TARGET_REPO/pulls/7/comments/}"
     id="${id%/replies}"
     printf '%s' "$body" >>"$BODIES/$id"
     if [ "$FAIL_ID" != 0 ] && [ "$id" = "$FAIL_ID" ]; then
@@ -405,6 +423,121 @@ test_a_missing_thread_names_where_the_batch_stopped() {
     "nothing was closed, so nothing may be claimed"
 }
 
+# --- the repo a write lands on is NAMED, never inferred from the cwd (ludics-lite#92) -----------
+
+# `resolve_repo` verified a CACHED repo against repos/<repo>/pulls/<n> before trusting it — its
+# comment says why, in these words: a wrong repo would post a reply onto an unrelated PR. The cwd
+# branch ABOVE it did no such check and cached its answer besides, so a bare `reply 7` typed from a
+# shell sitting in another project's worktree posted into whatever PR 7 is over there, and then
+# remembered that repo for every later call about 7.
+#
+# Verifying such a guess is the fix that looks right and is not one, which is why the collision
+# case below has a case of its own: repos/<repo>/pulls/7 answers "this repository has a seventh
+# PR", and every active repository does. So the guess is refused instead — the cwd, and the per-PR
+# cache that carried the same ambiguity across checkouts and sessions (round 2 of #161).
+# These cases run the writing commands with no repo named, from a scratch checkout whose `origin`
+# names a third repository and with `gh repo view` answering a fourth: both halves of the inference
+# armed, as in #74's control, and nothing read or written through either.
+CWD_CHECKOUT=""
+scratch_checkout() { # <owner/name the origin remote points at>
+  test_tmpdir CWD_CHECKOUT cwd-checkout
+  git -C "$CWD_CHECKOUT" init -q >/dev/null 2>&1 || bail "git init failed in $CWD_CHECKOUT"
+  git -C "$CWD_CHECKOUT" remote add origin "https://github.com/$1.git" ||
+    bail "git remote add failed in $CWD_CHECKOUT"
+}
+
+# run_cmd, but from the scratch checkout with REPO cleared and the PR spelled as the caller would,
+# so the command has nothing but its argument to resolve from. The clearing happens INSIDE the
+# subshell: resolve_repo assigns REPO, and a case that leaked that assignment would hand the next
+# case a repo it never named.
+run_cmd_from_cwd() { # <cmd_reply|cmd_resolve> <pr ref> <args...>
+  local fn="$1" ref="$2"
+  shift 2
+  set +e
+  (
+    cd "$CWD_CHECKOUT" || exit 9
+    REPO=""
+    "$fn" "$ref" "$@"
+  ) >"$TEST_ROOT/out" 2>"$TEST_ROOT/err"
+  RC=$?
+  set -e
+  OUT=$(cat "$TEST_ROOT/out")
+  ERR=$(cat "$TEST_ROOT/err")
+  [ ! -s "$UNEXPECTED" ] || bail "the fixture was asked for an endpoint it does not know: $(cat "$UNEXPECTED")"
+}
+
+# The case the issue was filed on. On the code this replaces, the reply lands in cwd-inferred/repo's
+# PR 7 and the command exits 0.
+test_a_reply_never_takes_its_repo_from_the_cwd() {
+  reset_fixture
+  scratch_checkout cwd-git/repo
+  CWD_REPO=cwd-inferred/repo
+  run_cmd_from_cwd cmd_reply 7 900 "Fixed in round 3 (abc1234): the guard now fires."
+  assert_eq "$RC" 2 "a bare PR number with no repo named is an invocation error ($ERR)"
+  assert_contains "$ERR" "owner/name#7" "the refusal spells the form that names the repo"
+  assert_contains "$ERR" "Nothing was read or written anywhere" "and says so plainly"
+  assert_not_contains "$ERR" "cwd-inferred/repo" "the cwd's repo is not named as a target"
+  assert_not_contains "$ERR" "cwd-git/repo" "and neither is the origin remote's"
+  assert_eq "$(posted_to 900)" "" "no reply may reach the thread this number names anywhere"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "nothing may be read before the repo is known"
+}
+
+# The reviewer's case, and the reason the cwd is refused rather than verified: a checkout that DOES
+# have a PR 7 passes repos/<repo>/pulls/7 exactly as a stranger's would. A verification that cannot
+# fail on the invocation it exists for is not a safeguard, so it is not what stands here.
+test_the_refusal_holds_when_the_cwd_repo_has_that_pr_number() {
+  reset_fixture
+  scratch_checkout "$TARGET_REPO"
+  CWD_REPO="$TARGET_REPO"
+  run_cmd_from_cwd cmd_reply 7 900 "Fixed in round 3 (abc1234): the guard now fires."
+  assert_eq "$RC" 2 "a cwd whose repo really has PR 7 is refused just the same ($ERR)"
+  assert_eq "$(posted_to 900)" "" "nothing is posted on the strength of the cwd"
+  assert_eq "$(cat "$REQUEST_LOG")" "" \
+    "and no verification is attempted: it would have PASSED, here and in the wrong repo alike"
+}
+
+# `resolve` is the other writing command and resolves through the same call, so it is refused on
+# the same terms — and, being a GraphQL mutation, it would otherwise carry the guessed repo into
+# the query itself. On the code this replaces it exits 0, having mutated the wrong repository.
+test_a_resolve_never_takes_its_repo_from_the_cwd() {
+  reset_fixture
+  scratch_checkout cwd-git/repo
+  CWD_REPO=cwd-inferred/repo
+  run_cmd_from_cwd cmd_resolve 7 900
+  assert_eq "$RC" 2 "resolve refuses a bare number too ($ERR)"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "no mutation, and no read, may be sent"
+}
+
+# The positive control: the refusal is about the repo being UNNAMED, not about the cwd. Naming it
+# in the argument writes from the same wrong checkout, and writes to the repo the argument names.
+test_a_named_repo_writes_from_any_cwd() {
+  reset_fixture
+  scratch_checkout cwd-git/repo
+  CWD_REPO=cwd-inferred/repo
+  run_cmd_from_cwd cmd_reply "$TARGET_REPO#7" 900 "Fixed in round 3 (abc1234): the guard now fires."
+  assert_eq "$RC" 0 "an argument that names the repo is enough from anywhere ($ERR)"
+  assert_contains "$(posted_to 900)" "the guard now fires." "and the reply lands where it names"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "cwd-inferred" "never where the cwd pointed"
+}
+
+# What round 2 of #161 caught, and the reason the per-PR repo cache is gone rather than kept as
+# "the one inference left": it carries the same intent ambiguity the cwd did. It remembered a repo
+# by NUMBER, across checkouts and across sessions, so once anything had named repo-a#7, a later
+# bare `reply 7` meant for repo B resolved to repo A — and verification passed, because repo A does
+# still have a PR 7. So a bare number is refused however many repos have been named before it.
+test_a_bare_number_is_refused_even_after_a_named_call() {
+  reset_fixture
+  scratch_checkout cwd-git/repo
+  CWD_REPO=cwd-inferred/repo
+  run_cmd_from_cwd cmd_reply "$TARGET_REPO#7" 900 "Fixed in round 3 (abc1234)."
+  assert_eq "$RC" 0 "naming the repo replies, and is what fills a memory if there is one ($ERR)"
+  reset_fixture
+  run_cmd_from_cwd cmd_reply 7 900 "Fixed in round 4 (def5678)."
+  assert_eq "$RC" 2 "the next bare number is refused all the same ($ERR)"
+  assert_eq "$(posted_to 900)" "" "nothing is posted on the strength of an earlier call"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and nothing is read to try to make one stand up"
+}
+
 tests=(
   test_a_folded_entry_is_answered_by_one_invocation
   test_a_single_thread_reply_is_unchanged
@@ -419,6 +552,11 @@ tests=(
   test_resolve_closes_every_thread_the_token_names
   test_an_already_resolved_thread_costs_no_write
   test_a_missing_thread_names_where_the_batch_stopped
+  test_a_reply_never_takes_its_repo_from_the_cwd
+  test_the_refusal_holds_when_the_cwd_repo_has_that_pr_number
+  test_a_resolve_never_takes_its_repo_from_the_cwd
+  test_a_named_repo_writes_from_any_cwd
+  test_a_bare_number_is_refused_even_after_a_named_call
 )
 
 run_tests "${tests[@]}"

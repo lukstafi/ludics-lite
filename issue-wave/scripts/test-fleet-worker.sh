@@ -133,20 +133,10 @@ cat > "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" <<'EOF'
 printf '%s\n' "$* grace=${SHIP_PR_BASE_ABSENT_GRACE:-unset}" >> "$BASE_CALL_LOG"
 if [ "$3" = retry ]; then
   [ -z "${SHIM_BASE_TIP_FAIL:-}" ] || exit 3
-  # The settle path's reads (ludics-lite#156): the tip's date is SHIM_TIP_AGE seconds ago, and
-  # SHIM_TIP_RUNS is how many workflow runs the tip has.
-  case "$6" in
-    *'actions/runs?head_sha='*) echo "${SHIM_TIP_RUNS:-1}"; exit 0 ;;
-  esac
-  ref="${6##*/}"; [ "$ref" = HEAD ] && ref=master
+  ref="${6##*/}"
   tip=$(git -C "$BASE_PROJECT" rev-parse "origin/$ref") || exit 3
-  # The gate reads the tip more than once (an observation before the wait, the settle path's
-  # read and reconfirm, the post-verdict confirm): SHIM_MOVE_REF_AFTER_CONFIRM moves the ref
-  # after read number SHIM_MOVE_ON_READ (default 2, the post-verdict confirm of a launch), counted
-  # in $BASE_CALL_LOG.reads, which a case resets.
   if [ -n "${SHIM_MOVE_REF_AFTER_CONFIRM:-}" ]; then
-    n=$(( $(cat "$BASE_CALL_LOG.reads" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$BASE_CALL_LOG.reads"
-    [ "$n" -ne "${SHIM_MOVE_ON_READ:-2}" ] || git -C "$BASE_PROJECT" update-ref "refs/remotes/origin/$ref" "$SHIM_MOVE_REF_AFTER_CONFIRM" || exit 3
+    git -C "$BASE_PROJECT" update-ref "refs/remotes/origin/$ref" "$SHIM_MOVE_REF_AFTER_CONFIRM" || exit 3
   fi
   echo "${SHIM_BASE_TIP:-$tip}"
   exit 0
@@ -157,14 +147,9 @@ fi
 for knob in SHIP_PR_ADVISORY_CHECKS SHIP_PR_TEST_SOURCE_ONLY SHIP_PR_CHECKS_INTERVAL SHIP_PR_CHECKS_WAIT SHIP_PR_CHECKS_HEARTBEAT SHIP_PR_API_ATTEMPTS SHIP_PR_API_BACKOFF; do
   [ -z "${!knob}" ] || exit 3
 done
-# The gate's first read must be the bounded --wait one; the plain read is answered only when a
-# case sets SHIM_BASE_PLAIN_RC (the ludics-lite#156 settle path).
-case " $* " in
-  *" --wait=301 "*) ;;
-  *" --wait"*) exit 4 ;;
-  *) [ -n "${SHIM_BASE_PLAIN_RC:-}" ] || exit 4
-     echo "${SHIM_BASE_PLAIN_MESSAGE:-example/project master: green (tip abc1234)}"; exit "$SHIM_BASE_PLAIN_RC" ;;
-esac
+# The gate's one base read is the bounded --wait one: `base --wait` settles a path-filtered tip
+# for the older verdict itself (ludics-lite#156), so the gate has no second, plain read to make.
+case " $* " in *" --wait=301 "*) ;; *) exit 4 ;; esac
 if [ -n "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] && [ ! -e "$SHIM_BASE_REQUIRE_PREFLIGHT" ]; then
   echo 'base read occurred before preflight'; exit 3
 fi
@@ -456,35 +441,6 @@ for verdict in 3 4; do
   expect "triage cannot override unknown $verdict" 1 "dispatch blocked" -- env SHIM_BASE_RC="$verdict" "$FW" gate --target-repo example/project --force --allow-red-base fix
 done
 expect "missing helper refuses with unknown diagnostic" 1 "checker missing" -- env SHIM_BASE_RC=0 bash -c 'mv "$1" "$1.saved"; "$2" gate --target-repo example/project; rc=$?; mv "$1.saved" "$1"; exit "$rc"' _ "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" "$FW"
-# ludics-lite#156 interim: a docs-only tip parks `--wait` at its ceiling (exit 4); the gate
-# settles on the plain read only when the tip it observed before the wait is still the tip
-# (so it sat unjudged through the whole 301 s, past the grace) and has no run at all.
-settle=(env SHIM_BASE_RC=4 SHIM_BASE_MESSAGE="NO VERDICT for the tip" SHIM_BASE_PLAIN_RC=0 SHIM_TIP_RUNS=0)
-moved_tip=$(git -C "$proj" commit-tree 'HEAD^{tree}' -p HEAD -m moved)
-expect "a paths-ignore tip observed unjudged through the wait with no run settles on the plain read" 0 "BASE SETTLED: example/project default branch: tip .* observed unjudged" -- \
-  "${settle[@]}" "$FW" gate --target-repo example/project
-grep -q "green (tip abc1234)" <<<"$out" && ok "...and prints the plain read it settled on" || ko "settle hides the plain read: $out"
-expect "a tip with a run row (in flight or stopped) does not settle" 1 "in flight or stopped, not paths-ignore" -- \
-  "${settle[@]}" SHIM_TIP_RUNS=1 "$FW" gate --target-repo example/project
-grep -q "dispatch blocked" <<<"$out" && ok "...and stays blocked" || ko "unsettled tip dispatched: $out"
-rm -f "$BASE_CALL_LOG.reads"
-expect "a tip that moved during the wait does not settle (the new tip has had no grace)" 1 "tip moved during the wait" -- \
-  "${settle[@]}" SHIM_MOVE_REF_AFTER_CONFIRM="$moved_tip" SHIM_MOVE_ON_READ=1 "$FW" gate --target-repo example/project
-git -C "$proj" update-ref refs/remotes/origin/master "$(git -C "$proj" rev-parse HEAD)"; rm -f "$BASE_CALL_LOG.reads"
-expect "a tip that moved after the runs read does not settle" 1 "tip moved after the runs read" -- \
-  "${settle[@]}" SHIM_MOVE_REF_AFTER_CONFIRM="$moved_tip" SHIM_MOVE_ON_READ=2 "$FW" gate --target-repo example/project
-git -C "$proj" update-ref refs/remotes/origin/master "$(git -C "$proj" rev-parse HEAD)"; rm -f "$BASE_CALL_LOG.reads"
-expect "a plain read that is not green does not settle" 1 "plain read is not green" -- \
-  env SHIM_BASE_RC=4 SHIM_BASE_PLAIN_RC=4 SHIM_TIP_RUNS=0 "$FW" gate --target-repo example/project
-expect "an unobservable tip does not settle" 1 "not observed before the wait" -- \
-  "${settle[@]}" SHIM_BASE_TIP_FAIL=1 "$FW" gate --target-repo example/project
-expect "a red --wait verdict never reaches the settle path" 1 "dispatch blocked" -- \
-  env SHIM_BASE_RC=1 SHIM_BASE_PLAIN_RC=0 SHIM_TIP_RUNS=0 "$FW" gate --target-repo example/project
-expect "a CLI launch settles the same way, on the named base branch" 0 "LAUNCHED testbox/settled" -- \
-  "${settle[@]}" "$FW" launch testbox settled --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/settled
-"$FW" attach testbox settled --interval 1 >/dev/null
-grep -Fxq -- '--repo example/project base master grace=300' "$BASE_CALL_LOG" && ok "the settle path's plain read names the same branch" || ko "plain read branch lost"
-rm -f "$BASE_CALL_LOG.reads"
 grep -Fxq -- '--repo example/project base topic --wait=301 grace=300' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
 grep -Fxq -- '--repo example/project base master --wait=301 grace=300' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
 original_base=$(git -C "$proj" rev-parse origin/master)
