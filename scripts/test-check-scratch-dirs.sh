@@ -184,7 +184,7 @@ probe safe_heredoc <<'OUTER'
 cat <<'DOC'
 The idiom is TMP=$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX"), resolved on the line below.
 DOC
-cat <<-TABBED
+cat <<-'TABBED'
 	and an indented one: work=$(mktemp -d /tmp/work.XXXXXX)
 	TABBED
 OUTER
@@ -235,6 +235,36 @@ mkdir -p "$TMP/bin"
 EOF
 expect "a quoted command substitution is still a capture" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_quoted_capture.sh"
+
+# Round 4: `declare`/`typeset` are ordinary declaration syntax, and the assignment table already
+# read them; only the capture check did not.
+probe safe_declare <<'EOF'
+declare TMP="$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX")" || exit 1
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+mkdir -p "$TMP/bin"
+EOF
+expect "a declare/typeset capture is a capture" 0 "$CLEAN" -- "$CS" "$TMP/safe_declare.sh"
+
+# Round 4: `mktemp [OPTION]... [TEMPLATE]` -- the directory flag can sit anywhere in the option
+# list, bundled or spelled long, and a resolved one of any of those spellings passes.
+probe safe_option_spellings <<'EOF'
+a=$(mktemp -q -d "${TMPDIR:-/tmp}/a.XXXXXX") || exit 1
+a=$(cd "$a" && pwd -P) || exit 1
+b=$(mktemp --directory "${TMPDIR:-/tmp}/b.XXXXXX") || exit 1
+b=$(cd "$b" && pwd -P) || exit 1
+c=$(mktemp -qd "${TMPDIR:-/tmp}/c.XXXXXX") || exit 1
+c=$(cd "$c" && pwd -P) || exit 1
+echo "$a $b $c"
+EOF
+expect "every spelling of the directory option is read, and passes when resolved" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_option_spellings.sh"
+
+# A plain `mktemp` (a FILE) is out of the rule's way whatever else is on its option list.
+probe safe_file_mktemp <<'EOF'
+f=$(mktemp -q "${TMPDIR:-/tmp}/f.XXXXXX") || exit 1
+printf 'x' > "$f"
+EOF
+expect "a file mktemp is not a directory mktemp" 0 "$CLEAN" -- "$CS" "$TMP/safe_file_mktemp.sh"
 
 # --- the shapes that must be refused --------------------------------------------------------
 
@@ -420,6 +450,82 @@ EOF
 expect "a bare-name export before the resolution is a use" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_bare_export.sh"
 
+# Round 4: the option list is a list. A literal `-d` right after the name was the only spelling
+# the first cut saw, so `-q -d`, `--directory` and a bundled `-qd` were skipped entirely.
+probe bad_option_spellings <<'EOF'
+a=$(mktemp -q -d "${TMPDIR:-/tmp}/a.XXXXXX") || exit 1
+mkdir -p "$a/bin"
+EOF
+expect "an unresolved mktemp -q -d is refused" 1 "$REFUSAL" -- "$CS" "$TMP/bad_option_spellings.sh"
+probe bad_long_option <<'EOF'
+a=$(mktemp --directory "${TMPDIR:-/tmp}/a.XXXXXX") || exit 1
+mkdir -p "$a/bin"
+EOF
+expect "an unresolved mktemp --directory is refused" 1 "$REFUSAL" -- "$CS" "$TMP/bad_long_option.sh"
+probe bad_bundled_option <<'EOF'
+a=$(mktemp -qd "${TMPDIR:-/tmp}/a.XXXXXX") || exit 1
+mkdir -p "$a/bin"
+EOF
+expect "an unresolved bundled -qd is refused" 1 "$REFUSAL" -- "$CS" "$TMP/bad_bundled_option.sh"
+
+# Round 4: a resolution has to RUN where the allocation did. Defining a function does not execute
+# its body, so the commands after the allocation still see the environment's spelling.
+probe bad_resolution_in_function <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+normalize() {
+  TMP=$(cd "$TMP" && pwd -P)
+}
+echo "$TMP"
+EOF
+expect "a resolution inside an uncalled function is not a resolution" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_resolution_in_function.sh"
+
+# ...and neither is one inside a branch that may not be taken.
+probe bad_resolution_in_branch <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+if [ -n "${CANONICAL:-}" ]; then
+  TMP=$(cd "$TMP" && pwd -P)
+fi
+echo "$TMP"
+EOF
+expect "a resolution inside a conditional branch is not a resolution" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_resolution_in_branch.sh"
+
+# Round 4: a resolver is recognized by what its body RETURNS. A `pwd -P` whose output goes to
+# /dev/null, with the environment spelling printed after it, is not one.
+probe bad_fake_resolver <<'EOF'
+looks_canonical() {
+  (cd "$1" && pwd -P) >/dev/null
+  printf '%s\n' "${TMPDIR:-/tmp}"
+}
+BASE=$(looks_canonical "${TMPDIR:-/tmp}")
+work=$(mktemp -d "$BASE/work.XXXXXX") || exit 1
+echo "$work"
+EOF
+expect "a function that discards its pwd -P is not a resolver" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_fake_resolver.sh"
+
+# Round 4: dirname removes the last component only, so its argument has to be the resolved
+# variable itself -- `dirname "$ROOT/cache/file"` answers $ROOT/cache, and cache can be a link.
+probe bad_dirname_deep <<'EOF'
+ROOT=$(cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+BASE=$(dirname "$ROOT/cache/file")
+work=$(mktemp -d "$BASE/work.XXXXXX") || exit 1
+echo "$work"
+EOF
+expect "a dirname of a deeper path does not inherit the root's resolution" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_dirname_deep.sh"
+
+# Round 4: only a QUOTED heredoc delimiter stops the shell expanding the body. With `cat <<EOF`
+# the command substitution runs before cat sees a byte of it.
+probe bad_unquoted_heredoc <<'OUTER'
+cat <<EOF
+the directory is $(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX")
+EOF
+OUTER
+expect "a mktemp -d in an UNQUOTED heredoc body is code, and is refused" 1 'not captured in a variable assignment' -- \
+  "$CS" "$TMP/bad_unquoted_heredoc.sh"
+
 # --- the default sweep's scope --------------------------------------------------------------
 # With no arguments the guard reads every `*/scripts/*.sh` and `scripts/*.sh` in its checkout.
 # Exercised against scratch checkouts: what has to be pinned is that a file in a scripts
@@ -464,6 +570,16 @@ echo "$work"
 EOF
 expect "a second scripts directory that resolves its scratch dir passes the default sweep" 0 \
   "$CLEAN" -- "$TMP/sweep_second_dir_ok/scripts/check-scratch-dirs.sh"
+
+# Round 4: the hooks are in the lint job's file list, so they are in this sweep's. The first
+# `mktemp -d` added to one of them must not need a line here to be judged.
+scratch_tree sweep_hooks
+in_tree sweep_hooks ship-pr/hooks/ship-pr-nudge.sh <<'EOF'
+state=$(mktemp -d "${TMPDIR:-/tmp}/nudge.XXXXXX") || exit 1
+echo "$state"
+EOF
+expect "an unresolved scratch dir in ship-pr/hooks is refused by the default sweep" 1 \
+  "$REFUSAL" -- "$TMP/sweep_hooks/scripts/check-scratch-dirs.sh"
 
 scratch_tree sweep_top_level
 in_tree sweep_top_level scripts/check-scratch-stamps.sh <<'EOF'

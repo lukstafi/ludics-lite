@@ -51,8 +51,8 @@
 # the dozens of snapshot files in post-merge-cleanup.sh would refuse a great deal to catch
 # nothing. The day a file path is compared, this is where the rule grows.
 #
-# Usage: check-scratch-dirs.sh [file...]   (default: every */scripts/*.sh and scripts/*.sh in the
-# checkout, less this guard and its fixtures -- see EXCLUDED below)
+# Usage: check-scratch-dirs.sh [file...]   (default: every */scripts/*.sh, scripts/*.sh and
+# ship-pr/hooks/*.sh in the checkout, less this guard and its fixtures -- see EXCLUDED below)
 # Exit 0 when every `mktemp -d` is resolved or inherits one, 1 when one is not, 2 on a usage error.
 
 set -euo pipefail
@@ -67,8 +67,10 @@ case "${1:-}" in
 esac
 
 # THE SCOPE, and the exclusions, both as check-jq-shapes.sh has them: the two globs are the lint
-# job's own file list in .github/workflows/skill-scripts.yml, less ship-pr/hooks (no mktemp there
-# today; add it the day there is one). Two files are excluded by name because both carry text that
+# job's own file list in .github/workflows/skill-scripts.yml, ship-pr/hooks included: the first cut
+# left the hooks out because none of them shells out to mktemp today, which is exactly the manual
+# scope update this guard exists to make unnecessary -- the first one added there would have been
+# read as clean (round 4). Two files are excluded by name because both carry text that
 # READS as an unresolved `mktemp -d` and is not: this guard's own comments quote the shape it
 # refuses, and its fixtures write a scratch probe per shape.
 EXCLUDED=(
@@ -80,7 +82,7 @@ if [ "$#" -gt 0 ]; then
   files=("$@")
 else
   files=()
-  for f in "$ROOT"/*/scripts/*.sh "$ROOT"/scripts/*.sh; do
+  for f in "$ROOT"/*/scripts/*.sh "$ROOT"/scripts/*.sh "$ROOT"/ship-pr/hooks/*.sh; do
     [ -f "$f" ] || continue # an unmatched glob arrives as the pattern itself
     rel=${f#"$ROOT"/}
     excluded=
@@ -101,7 +103,7 @@ else
   done
   # Fail closed rather than print a clean verdict over nothing.
   if [ "${#files[@]}" -eq 0 ]; then
-    echo "check-scratch-dirs.sh: no scripts matched */scripts/*.sh or scripts/*.sh under $ROOT" >&2
+    echo "check-scratch-dirs.sh: no scripts matched */scripts/*.sh, scripts/*.sh or ship-pr/hooks/*.sh under $ROOT" >&2
     exit 2
   fi
 fi
@@ -168,6 +170,22 @@ for f in "${files[@]}"; do
       }
       return out
     }
+    # The contents of every `$( ... )` in <s>, concatenated: what a shell would EXECUTE in a line
+    # that is otherwise text.
+    function subst_only(s,   out, i, ch, depth, start) {
+      out = ""; depth = 0
+      for (i = 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        if (depth == 0 && ch == "$" && substr(s, i + 1, 1) == "(") { depth = 1; start = i + 2; i++ }
+        else if (depth > 0 && ch == "(") depth++
+        else if (depth > 0 && ch == ")") {
+          depth--
+          if (depth == 0) out = out " " substr(s, start, i - start)
+        }
+      }
+      if (depth > 0) out = out " " substr(s, start)
+      return out
+    }
     # Does <s> mention $NAME or ${NAME}?
     function mentions(s, name) {
       return (s ~ ("\\$" name "([^A-Za-z0-9_]|$)")) || (s ~ ("\\$\\{" name "[^A-Za-z0-9_]"))
@@ -207,20 +225,41 @@ for f in "${files[@]}"; do
       if (substr(rest, 2) ~ /\//) return ""   # more than one component below the root
       return m
     }
-    # A `mktemp -d` CALL: the option, then whitespace, end of text, or any character that can end a
-    # word in shell. `$(mktemp -d)` takes no template at all and defaults to tmp.XXXXXXXXXX, which
-    # is every bit as unresolved as a spelled-out one, and a rule that demanded whitespace after
-    # the `-d` reported that file clean (round 1).
-    function has_mktemp_d(s) { return s ~ /mktemp[ \t]+-d([ \t)|&;<>"'"'"']|$)/ }
-    # Its template: the first word after `-d`, unquoted; "" when there is none.
-    function template_of(s,   t) {
-      t = s
-      if (t !~ /mktemp[ \t]+-d[ \t]+[^ \t)|&;<>]/) return ""
-      sub(/^.*mktemp[ \t]+-d[ \t]+/, "", t)
-      sub(/[ \t].*$/, "", t)
-      gsub(/["'"'"']/, "", t)
-      return t
+    # A `mktemp` CALL that makes a DIRECTORY, read the way the command documents itself:
+    # `mktemp [OPTION]... [TEMPLATE]`, with `-d`/`--directory` anywhere in the option list. The
+    # first cut demanded a literal `-d` right after the name, so `mktemp -q -d ...`, `mktemp
+    # --directory ...` and a bundled `-qd` were skipped entirely (round 4); and `$(mktemp -d)`
+    # takes no template at all, defaulting to tmp.XXXXXXXXXX, which is every bit as unresolved as
+    # a spelled-out one (round 1). Sets MT_DIR and MT_TPL; MT_TPL is "" when there is no template.
+    function scan_mktemp(s,   rest, w, i, n, parts, opts) {
+      MT_DIR = 0; MT_TPL = ""
+      if (s !~ /(^|[^A-Za-z0-9_.\/-])mktemp[ \t]/) return 0
+      rest = s
+      sub(/^.*(^|[^A-Za-z0-9_.\/-])mktemp[ \t]+/, "", rest)
+      # Stop at whatever ends the command; what follows is another command, not an argument.
+      sub(/[ \t]*(\)|;|\||&|<|>).*$/, "", rest)
+      n = split(rest, parts, /[ \t]+/)
+      opts = 1
+      for (i = 1; i <= n; i++) {
+        w = parts[i]
+        if (w == "") continue
+        if (opts && w == "--") { opts = 0; continue }
+        if (opts && w ~ /^--/) {
+          if (w ~ /^--directory/) MT_DIR = 1
+          continue
+        }
+        if (opts && w ~ /^-[A-Za-z]+$/) {           # short options, bundled or not
+          if (w ~ /d/) MT_DIR = 1
+          continue
+        }
+        gsub(/["'"'"']/, "", w)
+        MT_TPL = w                                  # the first non-option word is the template
+        break
+      }
+      return MT_DIR
     }
+    function has_mktemp_d(s) { return scan_mktemp(s) }
+    function template_of(s) { scan_mktemp(s); return MT_TPL }
     function refuse(line, why) {
       printf "::error file=%s,line=%d::%s:%d: %s\n", file, line, file, line, why
       bad = 1
@@ -233,9 +272,15 @@ for f in "${files[@]}"; do
     FNR == NR {
       last = FNR
       raw[FNR] = $0
-      if (hd != "") {                      # inside a heredoc body: data, not code
-        if ($0 == hd || (hdtab && $0 ~ ("^[ \t]*" hd "$"))) hd = ""
-        code[FNR] = ""
+      if (hd != "") {
+        # A heredoc body is data -- but only a QUOTED delimiter stops the shell expanding it.
+        # With `cat <<EOF`, a `$(mktemp -d ...)` in the body RUNS before cat ever sees the text
+        # (round 4), so an unquoted body is reduced to the contents of its command substitutions
+        # and those are scanned; everything around them is text and goes.
+        if ($0 == hd || (hdtab && $0 ~ ("^[ \t]*" hd "$"))) { hd = ""; code[FNR] = ""; }
+        else code[FNR] = hdquoted ? "" : subst_only(blank_sq(decomment($0)))
+        funcof[FNR] = infunc
+        depth[FNR] = dep
         next
       }
       # A backslash at end of line continues the command, and bash reads the two physical lines as
@@ -259,7 +304,8 @@ for f in "${files[@]}"; do
         d = src
         sub(/^.*<<-?[ \t]*/, "", d)
         hdtab = (src ~ /<<-/)
-        gsub(/^["'"'"']/, "", d)
+        hdquoted = (d ~ /^["'"'"'\\]/)     # only a quoted delimiter disables expansion
+        gsub(/^["'"'"'\\]/, "", d)
         sub(/["'"'"'].*$/, "", d)
         sub(/[^A-Za-z0-9_].*$/, "", d)
         if (d != "") hd = d
@@ -271,10 +317,33 @@ for f in "${files[@]}"; do
         infunc = fname
       } else if (infunc != "" && l ~ /^\}/) {
         infunc = ""
-      } else if (infunc != "" && l ~ /\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)/) {
-        resolver[infunc] = 1     # canonical_dir and its kin, by body and not by name
+      } else if (infunc != "") {
+        # A resolver is a function whose LAST statement is the idiom, since that is what it
+        # returns. Merely CONTAINING a `pwd -P` proves nothing -- `(cd "$1" && pwd -P) >/dev/null`
+        # followed by a printf of ${TMPDIR:-/tmp} contains one and answers with the environment
+        # spelling (round 4). Every statement resets the verdict; the one standing when the body
+        # closes is the one that counts.
+        t = l
+        gsub(/^[ \t]+|[ \t]+$/, "", t)
+        if (t != "") resolver[infunc] = (t ~ /^\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)([ \t]|$)/) ? 1 : 0
       }
       funcof[FNR] = infunc       # which function a line is inside, for the local shadows below
+      # Control depth, for the rule that a resolution has to sit where the allocation does.
+      # Keywords only: braces would need `${...}` and `$(...)` parsed out of the count, and the
+      # `|| { ...; }` tail an allocation is routinely written with is balanced within one
+      # statement anyway. A `fi`/`done`/`esac` closing on the same line it opened nets to zero.
+      depth[FNR] = dep
+      n = split(l, w, /[ \t]+/)
+      for (k = 1; k <= n; k++) {
+        if (w[k] == "") continue
+        # Only a keyword in COMMAND POSITION is one: the first word, or one behind a separator.
+        # Splitting on every non-word character instead read the `case` out of
+        # `"${TMPDIR:-/tmp}/case.XXXXXX"` and opened a block that never closed.
+        if (!(k == 1 || w[k-1] ~ /(;|&&|\|\||\{|^then$|^do$|^else$)$/)) continue
+        if (w[k] ~ /^(if|case|for|while|until)$/) dep++
+        else if (w[k] ~ /^(fi|esac|done)$/) dep--
+      }
+      if (dep < 0) dep = 0
       next
     }
     # Does the value of an ordinary assignment yield a physical path? The house idiom and nothing
@@ -290,11 +359,18 @@ for f in "${files[@]}"; do
         sub(/\).*$/, "", inner)
         gsub(/^[ \t]+/, "", inner)
         fn = inner; sub(/[ \t].*$/, "", fn)
-        if (fn in resolver) return 1
-        if (fn == "dirname") {             # the parent of a physical path is physical
+        # `in`, and then the VALUE: an awk assignment of 0 creates the element, so a function
+        # whose body reset the verdict to 0 was still "in" the table (round 4, found by its own
+        # fixture).
+        if ((fn in resolver) && resolver[fn]) return 1
+        if (fn == "dirname") {
+          # The parent of a physical path is physical -- but only of a path that IS one. A
+          # `dirname "$ROOT/cache/file"` answers `$ROOT/cache`, and `cache` can be a symlink
+          # (round 4), so the argument must be the resolved variable and nothing more.
           arg = inner; sub(/^dirname[ \t]*/, "", arg); gsub(/["'"'"']/, "", arg)
+          gsub(/[ \t]+$/, "", arg)
           lv = var_head(arg)
-          if (lv != "" && (lv in resolved)) return 1
+          if (lv != "" && (lv in resolved) && arg ~ ("^\\$\\{?" lv "\\}?$")) return 1
         }
         return 0
       }
@@ -342,9 +418,14 @@ for f in "${files[@]}"; do
       if (mentions(tail_of(code[i]), nm) || exports(tail_of(code[i]), nm)) return 0
       u = first_use(nm, i)
       if (u == 0) return 0
+      # ...and it has to RUN where the allocation did. A resolution written inside a function body
+      # that nothing has called yet, or inside a branch that may not be taken, is an assignment
+      # the commands after the allocation never see (round 4): `TMP=$(mktemp -d ...);
+      # normalize() { TMP=$(cd "$TMP" && pwd -P); }; echo "$TMP"` echoes the unresolved spelling.
+      if (funcof[u] != funcof[i] || depth[u] != depth[i]) return 0
       l = code[u]
       gsub(/^[ \t]+/, "", l)
-      return (l ~ ("^(local[ \t]+|export[ \t]+)?" nm "=\"?\\$\\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)")) ? 1 : 0
+      return (l ~ ("^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?" nm "=\"?\\$\\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)")) ? 1 : 0
     }
     # The fixpoint, once, before the first line of pass 2 is judged. A name is resolved only when
     # EVERY assignment to it leaves a physical path: `BASE=$(cd /tmp && pwd -P)` followed by
@@ -406,7 +487,7 @@ for f in "${files[@]}"; do
     {
       line = code[FNR]
       if (!has_mktemp_d(line)) next
-      if (line !~ /^[ \t]*(local[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/) {
+      if (line !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/) {
         refuse(FNR, "a `mktemp -d` whose result is not captured in a variable assignment: this guard resolves a scratch directory by following the variable it lands in, and cannot follow this one — write it as `VAR=$(mktemp -d ...)` and resolve VAR with `pwd -P`")
         next
       }

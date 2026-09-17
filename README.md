@@ -302,8 +302,8 @@ excluded files must not be read; and then against pr-review.sh as it stood befor
 where it must still find the site that PR fixed (skipped on the depth-1 Ubuntu checkout, run on
 the macOS one, which fetches the full history).
 
-`check-scratch-dirs.sh` is the scratch directory guard, run in the lint job over the same file
-list. `mktemp -d` answers with the path as the environment spells it, and on macOS both `/var` and
+`check-scratch-dirs.sh` is the scratch directory guard, run in the lint job over that job's own
+file list, `ship-pr/hooks` included. `mktemp -d` answers with the path as the environment spells it, and on macOS both `/var` and
 `/tmp` are symlinks into `/private`, while every script here computes its own root with `pwd -P`.
 Unresolved, one directory has two spellings, so an assertion comparing a script's output against a
 scratch path stops matching in silence and the ones phrased as "this must NOT appear" pass over
