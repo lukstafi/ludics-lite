@@ -137,7 +137,7 @@ recorded in [routines/README.md](routines/README.md), which also carries the ins
 symptoms of an unreadable prompt. That push is manual and is part of landing any PR that
 touches a prompt — merging moves this checkout, never the scheduler's copy — so after such a merge,
 on `mac-studio`, through the chained recipe in [routines/README.md](routines/README.md): put the
-checkout on `main`, prove it is level with `origin/main` and clean under `routines/` — only such a
+checkout on `main`, prove it is level with `origin/main` and clean where it matters — only such a
 checkout may be installed from, since `push` installs whatever it holds — then
 `scripts/sync-routines.sh` to read the direction, and `push`, or `pull` on the rarer drift whose
 newer text is the installed copy. Forgetting it is silent (the routine keeps firing the old prompt and its

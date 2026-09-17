@@ -130,7 +130,7 @@ git -C ~/ludics-lite fetch origin \
   && git -C ~/ludics-lite checkout main \
   && git -C ~/ludics-lite merge --ff-only origin/main \
   && git -C ~/ludics-lite rev-list --left-right --count HEAD...origin/main \
-  && git -C ~/ludics-lite status --porcelain -- routines \
+  && git -C ~/ludics-lite status --porcelain -- routines scripts/sync-routines.sh \
   && ~/ludics-lite/scripts/sync-routines.sh
 ```
 
@@ -139,10 +139,15 @@ Chained, not five separate lines: a fetch that fails on auth, DNS or the network
 the remote. Read the last three outputs before doing anything. The counts must be `0 0` — the
 merge does NOT establish that, since `--ff-only` only refuses a merge it cannot fast-forward and
 says "Already up to date" for a `main` that is AHEAD, carrying a prompt edit that never left this
-box. The `status` line must print nothing. Only then is the checkout canonical.
+box. The `status` line must print nothing — it covers `scripts/sync-routines.sh` as well as `routines/`,
+since the next command runs that script and a local edit to its routine list or its publishing logic
+would install a state nobody reviewed. Only then is the checkout canonical.
 
 Then READ the sync status and choose the direction; there is deliberately no unconditional command
-after it. `push` when the checkout holds the newer text — the usual case, a prompt that merged and
+after it. The diff's orientation is not the direction — `sync-routines.sh` always diffs the checkout
+first, so the checkout is the `-` side whether it is stale or holds the only copy of an edit; what
+says which text is newer is provenance, `git log -- routines/<name>/SKILL.md` against what the diff
+shows, and where that is unclear the answer is neither. `push` when the checkout holds the newer text — the usual case, a prompt that merged and
 was never installed. `pull` when the INSTALLED copy does: a routine that edited its own prompt in
 place is a supported workflow, and a push over it destroys the only copy of that edit before anyone
 has committed it. When both sides have moved, neither: reconcile by hand.
@@ -157,7 +162,7 @@ only then run the sync.
 
 Canonical is what makes a `push` safe, and nothing weaker will do: `push` installs whatever the
 checkout holds, so out of a topic branch, a checkout ahead of `origin/main` — committed or not —
-or one with an uncommitted edit under `routines/`, it publishes prompt text nobody reviewed into
+or one with an uncommitted edit under `routines/` or in the sync script itself, it publishes prompt text nobody reviewed into
 the live scheduler, a worse failure than the drift it was fixing. `pull` needs none of that
 gating: it writes into the checkout, where `git diff` shows it and review still stands between it
 and the scheduler.
