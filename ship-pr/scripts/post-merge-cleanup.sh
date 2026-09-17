@@ -122,14 +122,27 @@ session_ignored_file_is_a_base_copy() {
 # stops the walk. The first path that is not a base copy refuses the whole entry, so a large build
 # tree costs one `cmp` and not a traversal.
 session_ignored_directory_holds_only_base_copies() {
-  local dir="$1" absolute relative
+  local dir="$1" absolute relative walked=0
   path_has_no_link_component "$SESSION" "$dir" || return 1
   [ -d "$SESSION/$dir" ] || return 1
-  while IFS= read -r -d '' absolute; do
-    relative="$dir/${absolute#"$SESSION/$dir/"}"
-    session_ignored_file_is_a_base_copy "$relative" || return 1
-  done < <(find "$SESSION/$dir" ! -type d -print0 2>/dev/null)
-  return 0
+  # Through a snapshot file rather than a process substitution: an unreadable subtree, or any other
+  # I/O error, makes `find` exit nonzero after listing only part of the tree, and a walk that did
+  # not see everything cannot clear anything. The status is read before the entries are trusted.
+  SESSION_IGNORED_WALK_FILE=$(mktemp "$TEMP_ROOT/ship-pr-session-ignored.XXXXXX") ||
+    fail "could not allocate the ignored-directory walk snapshot"
+  find "$SESSION/$dir" ! -type d -print0 >"$SESSION_IGNORED_WALK_FILE" || walked=1
+  if [ "$walked" -eq 0 ]; then
+    while IFS= read -r -d '' absolute; do
+      relative="$dir/${absolute#"$SESSION/$dir/"}"
+      session_ignored_file_is_a_base_copy "$relative" || {
+        walked=1
+        break
+      }
+    done <"$SESSION_IGNORED_WALK_FILE"
+  fi
+  unlink "$SESSION_IGNORED_WALK_FILE" || fail "could not remove the ignored-directory walk snapshot"
+  SESSION_IGNORED_WALK_FILE=""
+  [ "$walked" -eq 0 ]
 }
 
 session_ignored_path_is_archivable_without_loss() {
@@ -1022,6 +1035,9 @@ cleanup_reservations() {
   if [ -n "${SESSION_STATUS_FILE:-}" ] && [ -f "$SESSION_STATUS_FILE" ]; then
     unlink "$SESSION_STATUS_FILE" >/dev/null 2>&1 || true
   fi
+  if [ -n "${SESSION_IGNORED_WALK_FILE:-}" ] && [ -f "$SESSION_IGNORED_WALK_FILE" ]; then
+    unlink "$SESSION_IGNORED_WALK_FILE" >/dev/null 2>&1 || true
+  fi
   if [ -n "${WORKTREE_LIST_FILE:-}" ] && [ -f "$WORKTREE_LIST_FILE" ]; then
     unlink "$WORKTREE_LIST_FILE" >/dev/null 2>&1 || true
   fi
@@ -1111,6 +1127,7 @@ CONFIG_LOCK=""
 CONFIG_LOCK_OWNED=0
 CHANGED_PATHS_FILE=""
 SESSION_STATUS_FILE=""
+SESSION_IGNORED_WALK_FILE=""
 WORKTREE_LIST_FILE=""
 MASTER_INDEX_PROBE=""
 MASTER_SKIP_PATHS_FILE=""

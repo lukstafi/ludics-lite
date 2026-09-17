@@ -808,6 +808,39 @@ test_session_ignored_path_control_characters_are_escaped() {
   echo "PASS: a refused ignored path is rendered without its control characters"
 }
 
+# A walk that did not see the whole tree cannot clear it (review round 3 on ludics-lite#210).
+test_session_ignored_directory_unreadable_subtree_refusal() {
+  local refusal outcome
+  setup_case ignored-directory-unreadable merge main-off
+  echo 'cache/' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_MAIN/cache" "$CASE_SESSION/cache/locked"
+  echo 'copied' >"$CASE_MAIN/cache/config"
+  cp "$CASE_MAIN/cache/config" "$CASE_SESSION/cache/config"
+  echo irreplaceable >"$CASE_SESSION/cache/locked/session-only"
+  chmod 000 "$CASE_SESSION/cache/locked"
+  if [ -r "$CASE_SESSION/cache/locked" ]; then
+    chmod 755 "$CASE_SESSION/cache/locked"
+    echo "PASS: unreadable-subtree case skipped — this user reads a 000 directory (root?)"
+    return 0
+  fi
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    outcome=accepted
+  else
+    outcome=refused
+  fi
+  chmod 755 "$CASE_SESSION/cache/locked"
+  assert_eq "$outcome" refused \
+    "an ignored directory whose walk failed must not be cleared as base copies"
+  case "$refusal" in
+  *"cache/"*) ;;
+  *) fail "the refusal did not name the ignored directory: $refusal" ;;
+  esac
+  assert_eq "$(cat "$CASE_SESSION/cache/locked/session-only")" irreplaceable \
+    "data in the unreadable subtree must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: an ignored directory with an unreadable subtree keeps its refusal"
+}
+
 test_master_reservation() {
   local fake_bin real_git candidate remote_master checkout_status
   setup_case master-owner-switch merge other
@@ -4010,6 +4043,7 @@ TESTS=(
   test_session_ignored_symlinked_base_ancestor_refusal
   test_session_ignored_quoted_path_passes
   test_session_ignored_directory_of_base_copies
+  test_session_ignored_directory_unreadable_subtree_refusal
   test_session_ignored_path_control_characters_are_escaped
   test_master_reservation
   test_unowned_master_reservation
