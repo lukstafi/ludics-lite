@@ -52,6 +52,10 @@ case "${1:-}" in
     ROOT=${1:-$(cd "$HERE/.." && pwd)} ;;
 esac
 [ -d "$ROOT" ] || { echo "check-prompts: no such directory: $ROOT" >&2; exit 2; }
+# Canonical and without a trailing slash, so every `$ROOT/`-relative path built below reads
+# the same whether the caller wrote `<dir>` or `<dir>/` -- a `<dir>//` prefix matched none of
+# find's output, which silently emptied the slot scan and then reported the prompts as silent.
+ROOT=$(cd "$ROOT" && pwd) || { echo "check-prompts: cannot enter: $ROOT" >&2; exit 2; }
 
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok: $*"; }
@@ -372,7 +376,10 @@ check_fixtures() {
 # WHAT counts as a statement is three shapes, which are the three the prose uses -- `mac-studio=<n>`
 # (the whole token, so a malformed `mac-studio=6oops` is refused rather than accepted on its
 # prefix), the number word in `<n> on mac-studio`, and the word opening the `<N>, not <m>`
-# justification. That last one is scoped to slot prose: both sides must be number words AND `slot`
+# justification. A numeral is read whole, hyphens included, so `twenty-six on mac-studio` states
+# twenty-six and is refused -- never read as the `six` it ends with. An ASSIGNMENT of the variable
+# (`FLEET_BOX_CORRECTNESS_SLOTS=mac-studio=2`, quoted or not) is skipped: a fixture configuring a
+# two-slot box states its own input, and claims nothing about the default. That last one is scoped to slot prose: both sides must be number words AND `slot`
 # must stand within $SLOT_CONTEXT characters, so an ordinary "one, not both" sentence elsewhere in
 # these long documents is not read as a slot declaration. Mentions are matched against the file
 # joined into one line, so a sentence that wraps reads like one that does not. A root without
@@ -412,8 +419,9 @@ slot_files() {
 slot_mentions() {
   local q="'"
   RE_DIGIT="mac-studio=[^[:space:]\`\"$q),;]*" \
-  RE_WORD="[^a-z]($NUMBER_ERE)[[:space:]]+on[[:space:]]+mac-studio" \
-  RE_NOT="[^a-z]($NUMBER_ERE), not[[:space:]]+($NUMBER_ERE)[^a-z]" \
+  RE_WORD="[^a-z0-9][a-z-]*($NUMBER_ERE)[[:space:]]+on[[:space:]]+mac-studio" \
+  RE_NOT="[^a-z0-9][a-z-]*($NUMBER_ERE), not[[:space:]]+[a-z-]*($NUMBER_ERE)[^a-z0-9]" \
+  RE_ASSIGN="slots=[\`\"$q]?\$" \
   CTX="$SLOT_CONTEXT" awk '
     { text = text " " $0 }
     END {
@@ -423,21 +431,27 @@ slot_mentions() {
       scan(ENVIRON["RE_NOT"], "not")
     }
     # Walk every match of <re>, reporting each by its position in the joined text.
-    function scan(re, kind,   rest, base, at, len) {
+    # RSTART/RLENGTH are read ONCE per iteration and carried in locals: emit() matches too, and
+    # advancing `rest` by a clobbered RSTART walks the cursor into the middle of the text.
+    function scan(re, kind,   rest, base, st, len, at) {
       rest = lower; base = 0
       while (match(rest, re)) {
-        at = base + RSTART; len = RLENGTH
+        st = RSTART; len = RLENGTH; at = base + st
         emit(kind, substr(text, at, len), at, len)
         base = at + len - 1
-        rest = substr(rest, RSTART + len)
+        rest = substr(rest, st + len)
       }
     }
     function emit(kind, frag, at, len,   n, from, window) {
       if (kind == "digit") {
+        # `…SLOTS=mac-studio=2` is the variable being SET, not a statement of its default.
+        from = at - 32; if (from < 1) from = 1
+        if (match(substr(lower, from, at - from), ENVIRON["RE_ASSIGN"])) return
         n = substr(frag, index(frag, "=") + 1)
         sub(/\.$/, "", n)            # a sentence-final period is punctuation, not the value
       } else {
-        n = tolower(frag); sub(/^[^a-z]+/, "", n); sub(/[^a-z].*$/, "", n)
+        # The whole numeral, hyphens and all: `twenty-six` is not the `six` it ends with.
+        n = tolower(frag); sub(/^[^a-z]+/, "", n); sub(/[^a-z-].*$/, "", n); sub(/-$/, "", n)
         if (kind == "not") {         # only inside slot prose: see the header above
           from = at - ctx; if (from < 1) from = 1
           window = substr(lower, from, len + 2 * ctx)
@@ -461,7 +475,10 @@ check_slots() {
   # An unspellable default (past twelve) leaves the word forms unmatchable rather than unchecked:
   # any number word then mismatches and says what the script actually pins.
   word=$(number_word "$default")
-  for f in $(slot_files); do
+  # Line by line: a path with a space in it would otherwise split into words, and the resulting
+  # reads of nonexistent paths increment nothing -- the file would be skipped under a clean pass.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
     mentions=$(slot_mentions "$ROOT/$f")
     [ -n "$mentions" ] || continue
     stated="$stated$f "
@@ -474,7 +491,7 @@ check_slots() {
           || { ko "$f" "spells the mac-studio slot count '$n'; $SLOT_SCRIPT defaults to mac-studio=$default"; bad=1; } ;;
       esac
     done <<<"$mentions"
-  done
+  done <<<"$(slot_files)"
   # A prompt that stops stating the count is how the agreement would quietly stop being checked.
   for f in $SLOT_PROMPTS; do
     case "$stated" in

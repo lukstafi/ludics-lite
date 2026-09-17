@@ -492,6 +492,32 @@ slots_tree
 slots_edit README.md 's/a run-time count a worker takes/a run-time count. Choose one, not both. A worker takes/'
 expect "ordinary '<n>, not <m>' prose beside the slot sentence is not a count" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
+# A numeral is whole: reading `twenty-six` as the `six` it ends with would pass a tree whose prose
+# states twenty-six, which is the one way a mismatch could go unreported rather than refused.
+slots_tree
+slots_edit issue-wave/SKILL.md 's/([a-z]* on mac-studio/(twenty-six on mac-studio/'
+expect "a compound numeral is read whole, not by its suffix" 1 "SKILL.md: spells the mac-studio slot count 'twenty-six'" -- "$CP" "$R"
+
+# An assignment of the variable is an input, not a claim about the default -- a fixture that
+# configures a two-slot box says nothing about what an unconfigured box gets.
+slots_tree
+printf '%s\n' "FLEET_BOX_CORRECTNESS_SLOTS=mac-studio=2 $WORKER execution slot -- true" >> "$R/$WORKER"
+expect "an override in front of a command states no default" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+slots_tree
+printf '%s\n' 'export FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=2"' >> "$R/$WORKER"
+expect "...and a quoted override states none either" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# A path with a space in it used to split into words, and a read of a nonexistent path increments
+# nothing: the file was skipped silently, under a clean pass.
+slots_tree
+printf 'notes\n\nmac-studio=%s slots.\n' "$OTHER" > "$R/issue-wave/references/old notes.md"
+expect "a discovered path with a space is scanned, not split" 1 "old notes.md: states 'mac-studio=$OTHER'" -- "$CP" "$R"
+
+# The root is read the same spelled with a trailing slash: a `<dir>//` prefix matched none of the
+# scan's paths, which emptied it and then reported the required prompts as silent.
+slots_tree
+expect "a root spelled with a trailing slash reads the same" 0 'mac-studio correctness slots agree' -- "$CP" "$R/"
+
 # A prompt that stops stating the count is how the agreement would quietly stop being checked.
 slots_tree
 slots_edit README.md 's/([a-z]* on$/(as configured on/'
