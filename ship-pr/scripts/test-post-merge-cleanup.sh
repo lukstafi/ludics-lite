@@ -595,6 +595,252 @@ test_ignored_session_refusal() {
   echo "PASS: ignored session data is refused before cleanup"
 }
 
+# The session gate's two narrow exceptions (ludics-lite#194, ludics-lite#205 §1). Everything the
+# rules do not clear keeps its refusal: test_ignored_session_refusal covers an ignored file with no
+# counterpart in the base checkout, and the two refusal cases below cover a differing file and a
+# symlink. These four fail against the pre-fix gate, which refused on any ignored path at all.
+test_session_harness_ignored_data_passes() {
+  local session_physical
+  # The harness-owned directory as Git collapses it: the exclude matches the directory itself.
+  setup_case harness-ignored-session merge main-off
+  echo '.claude/' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_SESSION/.claude"
+  echo '{"sessionId":"other-session","pid":1}' >"$CASE_SESSION/.claude/scheduled_tasks.lock"
+  session_physical=$(cd "$CASE_SESSION" && pwd -P)
+  assert_eq "$(git -C "$CASE_SESSION" status --porcelain --ignored=matching)" '!! .claude/' \
+    "the fixture must reproduce the collapsed harness directory"
+  "$HELPER" "$CASE_MAIN" "$session_physical" topic >/dev/null
+  assert_cleaned
+  [ -f "$CASE_ARCHIVE/worktree/.claude/scheduled_tasks.lock" ] ||
+    fail "the archived session must still carry the harness directory"
+
+  # And as individual files, which is what an exclude naming the files produces.
+  setup_case harness-ignored-session-files merge main-off
+  printf '.claude/scheduled_tasks.lock\n.claude/settings.local.json\n' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_SESSION/.claude"
+  echo lock >"$CASE_SESSION/.claude/scheduled_tasks.lock"
+  echo '{}' >"$CASE_SESSION/.claude/settings.local.json"
+  "$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic >/dev/null
+  assert_cleaned
+  echo "PASS: harness-owned ignored .claude data passes the session gate"
+}
+
+test_session_ignored_identical_to_base_passes() {
+  setup_case identical-ignored-session merge main-off
+  echo copied.conf >>"$CASE_MAIN/.git/info/exclude"
+  echo 'copied at worktree creation' >"$CASE_MAIN/copied.conf"
+  cp "$CASE_MAIN/copied.conf" "$CASE_SESSION/copied.conf"
+  "$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(cat "$CASE_MAIN/copied.conf")" 'copied at worktree creation' \
+    "the base checkout's own copy must be untouched"
+  echo "PASS: an ignored file identical to the base checkout's copy passes the session gate"
+}
+
+test_session_ignored_differing_from_base_refusal() {
+  local refusal
+  setup_case differing-ignored-session merge main-off
+  echo copied.conf >>"$CASE_MAIN/.git/info/exclude"
+  echo 'base copy' >"$CASE_MAIN/copied.conf"
+  echo 'edited in the session' >"$CASE_SESSION/copied.conf"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored file differing from the base checkout was accepted for destructive cleanup"
+  fi
+  case "$refusal" in
+  *"copied.conf"*) ;;
+  *) fail "the refusal did not name the ignored path it tripped on: $refusal" ;;
+  esac
+  case "$refusal" in
+  *stash*) fail "the refusal must not advise a stash: $refusal" ;;
+  esac
+  assert_eq "$(cat "$CASE_SESSION/copied.conf")" 'edited in the session' \
+    "differing ignored session data must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: an ignored file differing from the base checkout is refused and named"
+}
+
+test_session_ignored_symlink_refusal() {
+  local refusal
+  # A symlink names a target rather than holding content, so it never passes the identity rule
+  # even when its target reads the same as the base checkout's regular file.
+  setup_case symlink-ignored-session merge main-off
+  echo copied.conf >>"$CASE_MAIN/.git/info/exclude"
+  echo 'same bytes' >"$CASE_MAIN/copied.conf"
+  echo 'same bytes' >"$CASE_ROOT/symlink-target"
+  ln -s "$(cd "$CASE_ROOT" && pwd -P)/symlink-target" "$CASE_SESSION/copied.conf"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored symlink was accepted for destructive cleanup"
+  fi
+  case "$refusal" in
+  *"copied.conf"*) ;;
+  *) fail "the symlink refusal did not name the ignored path: $refusal" ;;
+  esac
+  [ -L "$CASE_SESSION/copied.conf" ] || fail "the ignored symlink must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: an ignored symlink is refused even when its target matches the base checkout"
+}
+
+# Neither exemption may follow a symbolic link, and neither may be decided by how Git RENDERS a
+# path (review round 1 on ludics-lite#210). These three fail against round 1's gate.
+test_session_bare_claude_entry_refusal() {
+  local refusal
+  # `.claude` as a regular file is not the harness directory, and Git reports it as `!! .claude`.
+  setup_case bare-claude-file merge main-off
+  echo '.claude' >>"$CASE_MAIN/.git/info/exclude"
+  echo irreplaceable >"$CASE_SESSION/.claude"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored regular file named .claude was accepted for destructive cleanup"
+  fi
+  case "$refusal" in
+  *".claude"*) ;;
+  *) fail "the refusal did not name the bare .claude path: $refusal" ;;
+  esac
+  assert_eq "$(cat "$CASE_SESSION/.claude")" irreplaceable \
+    "a bare .claude file must survive refused cleanup"
+  assert_topic_preserved
+
+  # And as a symlink, whose target cleanup would leave behind entirely.
+  setup_case bare-claude-symlink merge main-off
+  echo '.claude' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_ROOT/elsewhere"
+  ln -s "$(cd "$CASE_ROOT" && pwd -P)/elsewhere" "$CASE_SESSION/.claude"
+  if "$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic >/dev/null 2>&1; then
+    fail "an ignored symlink named .claude was accepted for destructive cleanup"
+  fi
+  assert_topic_preserved
+  echo "PASS: an ignored .claude that is not a directory keeps its refusal"
+}
+
+test_session_ignored_symlinked_base_ancestor_refusal() {
+  local refusal
+  # The base checkout reaches the comparison path through a symlinked ancestor, so its "copy" is a
+  # file outside the checkout: the session file has no in-tree counterpart and must be refused.
+  setup_case symlinked-base-ancestor merge main-off
+  echo 'cache/config' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_ROOT/outside"
+  echo 'shared bytes' >"$CASE_ROOT/outside/config"
+  ln -s "$(cd "$CASE_ROOT" && pwd -P)/outside" "$CASE_MAIN/cache"
+  mkdir -p "$CASE_SESSION/cache"
+  echo 'shared bytes' >"$CASE_SESSION/cache/config"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored file cleared through a symlinked base ancestor was accepted for cleanup"
+  fi
+  case "$refusal" in
+  *"cache/config"*) ;;
+  *) fail "the refusal did not name the path it tripped on: $refusal" ;;
+  esac
+  assert_eq "$(cat "$CASE_SESSION/cache/config")" 'shared bytes' \
+    "the session's ignored file must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: a symlinked ancestor in the base checkout is not a base-checkout copy"
+}
+
+test_session_ignored_quoted_path_passes() {
+  local name='copied config.coné'
+  # Porcelain v1 C-quotes this name (whitespace, and non-ASCII under the default core.quotePath),
+  # so a gate that read the rendering would refuse a file it is supposed to clear.
+  setup_case quoted-ignored-session merge main-off
+  printf '%s\n' "$name" >>"$CASE_MAIN/.git/info/exclude"
+  echo 'copied at worktree creation' >"$CASE_MAIN/$name"
+  cp "$CASE_MAIN/$name" "$CASE_SESSION/$name"
+  case "$(git -C "$CASE_SESSION" status --porcelain --ignored=matching)" in
+  '!! "'*) ;;
+  *) fail "the fixture must produce a C-quoted porcelain path" ;;
+  esac
+  "$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic >/dev/null
+  assert_cleaned
+  echo "PASS: a C-quoted ignored path identical to the base checkout's copy passes the session gate"
+}
+
+# Git reports an excluded DIRECTORY as one entry with nothing inside it shown, and a pathname is
+# data the operator's terminal will render (review round 2 on ludics-lite#210). Both fail against
+# round 2's gate.
+test_session_ignored_directory_of_base_copies() {
+  local refusal
+  setup_case ignored-directory-of-base-copies merge main-off
+  echo 'cache/' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_MAIN/cache/sub" "$CASE_SESSION/cache/sub" "$CASE_SESSION/cache/empty"
+  echo 'copied' >"$CASE_MAIN/cache/config"
+  echo 'copied deeper' >"$CASE_MAIN/cache/sub/deep"
+  cp "$CASE_MAIN/cache/config" "$CASE_SESSION/cache/config"
+  cp "$CASE_MAIN/cache/sub/deep" "$CASE_SESSION/cache/sub/deep"
+  assert_eq "$(git -C "$CASE_SESSION" status --porcelain --ignored=matching)" '!! cache/' \
+    "the fixture must reproduce the collapsed ignored directory"
+  "$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic >/dev/null
+  assert_cleaned
+
+  # One file beneath it that is not a base copy refuses the whole entry.
+  setup_case ignored-directory-with-session-data merge main-off
+  echo 'cache/' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_MAIN/cache" "$CASE_SESSION/cache"
+  echo 'copied' >"$CASE_MAIN/cache/config"
+  cp "$CASE_MAIN/cache/config" "$CASE_SESSION/cache/config"
+  echo irreplaceable >"$CASE_SESSION/cache/session-only"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored directory holding session-only data was accepted for destructive cleanup"
+  fi
+  case "$refusal" in
+  *"cache/"*) ;;
+  *) fail "the refusal did not name the ignored directory: $refusal" ;;
+  esac
+  assert_eq "$(cat "$CASE_SESSION/cache/session-only")" irreplaceable \
+    "session-only data under an ignored directory must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: an ignored directory is cleared exactly when every file beneath it is a base copy"
+}
+
+test_session_ignored_path_control_characters_are_escaped() {
+  local name refusal lines
+  name=$(printf 'evil\npost-merge-cleanup.sh: forged line')
+  setup_case control-character-ignored-session merge main-off
+  printf '%s\n' 'evil*' >>"$CASE_MAIN/.git/info/exclude"
+  echo session-only >"$CASE_SESSION/$name"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored path with a newline in its name was accepted for destructive cleanup"
+  fi
+  lines=$(printf '%s\n' "$refusal" | wc -l | tr -d ' ')
+  assert_eq "$lines" 1 "the refusal must stay one line, so a pathname cannot forge another"
+  case "$refusal" in
+  *'forged line'*) ;;
+  *) fail "the refusal should still name the path, escaped: $refusal" ;;
+  esac
+  assert_topic_preserved
+  echo "PASS: a refused ignored path is rendered without its control characters"
+}
+
+# A walk that did not see the whole tree cannot clear it (review round 3 on ludics-lite#210).
+test_session_ignored_directory_unreadable_subtree_refusal() {
+  local refusal outcome
+  setup_case ignored-directory-unreadable merge main-off
+  echo 'cache/' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_MAIN/cache" "$CASE_SESSION/cache/locked"
+  echo 'copied' >"$CASE_MAIN/cache/config"
+  cp "$CASE_MAIN/cache/config" "$CASE_SESSION/cache/config"
+  echo irreplaceable >"$CASE_SESSION/cache/locked/session-only"
+  chmod 000 "$CASE_SESSION/cache/locked"
+  if [ -r "$CASE_SESSION/cache/locked" ]; then
+    chmod 755 "$CASE_SESSION/cache/locked"
+    echo "PASS: unreadable-subtree case skipped — this user reads a 000 directory (root?)"
+    return 0
+  fi
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    outcome=accepted
+  else
+    outcome=refused
+  fi
+  chmod 755 "$CASE_SESSION/cache/locked"
+  assert_eq "$outcome" refused \
+    "an ignored directory whose walk failed must not be cleared as base copies"
+  case "$refusal" in
+  *"cache/"*) ;;
+  *) fail "the refusal did not name the ignored directory: $refusal" ;;
+  esac
+  assert_eq "$(cat "$CASE_SESSION/cache/locked/session-only")" irreplaceable \
+    "data in the unreadable subtree must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: an ignored directory with an unreadable subtree keeps its refusal"
+}
+
 test_master_reservation() {
   local fake_bin real_git candidate remote_master checkout_status
   setup_case master-owner-switch merge other
@@ -3789,6 +4035,16 @@ TESTS=(
   test_other_topic_owner_refusal
   test_dirty_session_refusal
   test_ignored_session_refusal
+  test_session_harness_ignored_data_passes
+  test_session_ignored_identical_to_base_passes
+  test_session_ignored_differing_from_base_refusal
+  test_session_ignored_symlink_refusal
+  test_session_bare_claude_entry_refusal
+  test_session_ignored_symlinked_base_ancestor_refusal
+  test_session_ignored_quoted_path_passes
+  test_session_ignored_directory_of_base_copies
+  test_session_ignored_directory_unreadable_subtree_refusal
+  test_session_ignored_path_control_characters_are_escaped
   test_master_reservation
   test_unowned_master_reservation
   test_concurrent_master_edit_refusal

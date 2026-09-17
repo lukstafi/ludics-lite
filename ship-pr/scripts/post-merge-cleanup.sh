@@ -66,6 +66,137 @@ atomic_rename() {
   perl -e 'rename $ARGV[0], $ARGV[1] or die "$ARGV[0] -> $ARGV[1]: $!\n"' -- "$1" "$2"
 }
 
+# path_has_no_link_component <root> <relative path>: true when every component of the path, the
+# leaf included, exists under the root as something Git could have listed there — no component is
+# a symbolic link. Neither exemption below may follow a link: `cmp` through a symlinked ANCESTOR
+# in the base checkout (`MAIN/cache -> /elsewhere`) would clear a session file against a file the
+# base checkout does not hold, and a `.claude` that is itself a link or a file is not the harness
+# directory the allow-list is about. Components are split by parameter expansion rather than word
+# splitting, so a name containing whitespace or a glob character is walked as itself.
+path_has_no_link_component() {
+  local root="$1" rest="$2" walked="$1" component
+  while [ -n "$rest" ]; do
+    component=${rest%%/*}
+    if [ "$component" = "$rest" ]; then rest=""; else rest=${rest#*/}; fi
+    [ -n "$component" ] || continue
+    case "$component" in . | ..) return 1 ;; esac
+    walked="$walked/$component"
+    [ ! -L "$walked" ] || return 1
+    [ -e "$walked" ] || return 1
+  done
+  return 0
+}
+
+# The session gate reads ignored data as well as tracked and untracked changes, because cleanup
+# archives the session by renaming it into a sibling: ignored data is not destroyed, it is moved
+# somewhere the operator may never look, and "not moved" is stronger than "not lost". Two narrow
+# classes carry no such loss, and both refused every desktop session unconditionally
+# (ludics-lite#194, ludics-lite#205 §1):
+#
+#   1. Harness-owned state under a top-level `.claude/` DIRECTORY. The agent harness writes it into
+#      every worktree it opens, before the session does anything; the helper never created it and
+#      never reads it. Its `scheduled_tasks.lock` can also belong to a DIFFERENT live session, so
+#      the remedy the old message implied — remove it — is one the merging session must decline.
+#      An ignored regular file or symlink named `.claude` is none of that, and keeps its refusal.
+#   2. An ignored regular file byte-identical to the base checkout's copy, which is how a
+#      worktree-creation copy looks — and an ignored directory every file beneath which is one. Archiving it preserves nothing the base checkout does not
+#      already hold. A path absent from the base checkout has no such copy and keeps its refusal,
+#      and a symlink — at the leaf or at any component of either side's path — is never compared:
+#      it names a target rather than holding content.
+#
+# Everything else ignored still refuses, so the strictness stays in force for genuinely
+# session-local data — which by construction differs from the base copy or has no counterpart there.
+session_ignored_file_is_a_base_copy() {
+  local path="$1"
+  path_has_no_link_component "$SESSION" "$path" || return 1
+  path_has_no_link_component "$MAIN" "$path" || return 1
+  { [ -f "$SESSION/$path" ] && [ -f "$MAIN/$path" ]; } || return 1
+  cmp -s -- "$SESSION/$path" "$MAIN/$path"
+}
+
+# Git prints one entry per matching IGNORE PATTERN, not one per file: an excluded `cache/` is
+# reported as `!! cache/` with nothing inside it shown, in every ignored mode and at every
+# untracked-files setting. The exemption is about paths, not about the granularity Git chose to
+# print them at, so a directory entry is cleared exactly when every file beneath it is — an empty
+# directory carries nothing to lose, and anything that is not a regular file (a symlink, a socket)
+# stops the walk. The first path that is not a base copy refuses the whole entry, so a large build
+# tree costs one `cmp` and not a traversal.
+session_ignored_directory_holds_only_base_copies() {
+  local dir="$1" absolute relative walked=0
+  path_has_no_link_component "$SESSION" "$dir" || return 1
+  [ -d "$SESSION/$dir" ] || return 1
+  # Through a snapshot file rather than a process substitution: an unreadable subtree, or any other
+  # I/O error, makes `find` exit nonzero after listing only part of the tree, and a walk that did
+  # not see everything cannot clear anything. The status is read before the entries are trusted.
+  SESSION_IGNORED_WALK_FILE=$(mktemp "$TEMP_ROOT/ship-pr-session-ignored.XXXXXX") ||
+    fail "could not allocate the ignored-directory walk snapshot"
+  find "$SESSION/$dir" ! -type d -print0 >"$SESSION_IGNORED_WALK_FILE" || walked=1
+  if [ "$walked" -eq 0 ]; then
+    while IFS= read -r -d '' absolute; do
+      relative="$dir/${absolute#"$SESSION/$dir/"}"
+      session_ignored_file_is_a_base_copy "$relative" || {
+        walked=1
+        break
+      }
+    done <"$SESSION_IGNORED_WALK_FILE"
+  fi
+  unlink "$SESSION_IGNORED_WALK_FILE" || fail "could not remove the ignored-directory walk snapshot"
+  SESSION_IGNORED_WALK_FILE=""
+  [ "$walked" -eq 0 ]
+}
+
+session_ignored_path_is_archivable_without_loss() {
+  local path="${1%/}"
+  case "$path" in
+  .claude | .claude/*)
+    { [ ! -L "$SESSION/.claude" ] && [ -d "$SESSION/.claude" ]; } || return 1
+    return 0
+    ;;
+  esac
+  if [ ! -L "$SESSION/$path" ] && [ -d "$SESSION/$path" ]; then
+    session_ignored_directory_holds_only_base_copies "$path"
+    return $?
+  fi
+  session_ignored_file_is_a_base_copy "$path"
+}
+
+# Refuse the session worktree over any change, and over ignored data the two rules above do not
+# clear. The refusal names the ignored paths it tripped on, since the operator's decision for
+# `.claude/` is nothing like the one for a forgotten build tree; it does not suggest a stash,
+# because worktrees share one stash stack with the primary checkout and with concurrent sessions.
+refuse_session_local_data() {
+  local entry path changed=0 ignored=""
+  # NUL-delimited, so a path Git would C-quote in the default porcelain rendering — whitespace and,
+  # under core.quotePath, most non-ASCII names — is read as the name it actually has and judged on
+  # the same terms as any other. A command substitution would drop the delimiters, hence the file.
+  SESSION_STATUS_FILE=$(mktemp "$TEMP_ROOT/ship-pr-session-status.XXXXXX") ||
+    fail "could not allocate the session cleanliness snapshot"
+  git -C "$SESSION" status --porcelain -z --untracked-files=normal --ignored=matching \
+    >"$SESSION_STATUS_FILE" ||
+    fail "could not inspect session worktree cleanliness"
+  while IFS= read -r -d '' entry; do
+    [ -n "$entry" ] || continue
+    case "$entry" in
+    '!! '*)
+      path=${entry#'!! '}
+      session_ignored_path_is_archivable_without_loss "$path" && continue
+      # A pathname is attacker-shaped data: a newline in it would forge a second diagnostic line,
+      # and an escape sequence would reach the operator's terminal. The raw name did the
+      # filesystem checks above; what is printed is its shell-quoted rendering.
+      ignored="$ignored${ignored:+, }$(printf '%q' "$path")"
+      ;;
+    # Anything else is a tracked change, an untracked file, or a rename's second NUL field.
+    *) changed=1 ;;
+    esac
+  done <"$SESSION_STATUS_FILE"
+  unlink "$SESSION_STATUS_FILE" || fail "could not remove the session cleanliness snapshot"
+  SESSION_STATUS_FILE=""
+  [ "$changed" -eq 0 ] ||
+    fail "session worktree is dirty; commit or remove its changes before cleanup"
+  [ -z "$ignored" ] ||
+    fail "session worktree holds ignored data that cleanup would archive out of sight; move or remove it before cleanup: $ignored"
+}
+
 refuse_initialized_submodules() {
   local worktree="$1" description="$2" line status
   status=$(git -C "$worktree" submodule status --recursive) ||
@@ -901,6 +1032,12 @@ cleanup_reservations() {
   if [ -n "${CHANGED_PATHS_FILE:-}" ] && [ -f "$CHANGED_PATHS_FILE" ]; then
     unlink "$CHANGED_PATHS_FILE" >/dev/null 2>&1 || true
   fi
+  if [ -n "${SESSION_STATUS_FILE:-}" ] && [ -f "$SESSION_STATUS_FILE" ]; then
+    unlink "$SESSION_STATUS_FILE" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${SESSION_IGNORED_WALK_FILE:-}" ] && [ -f "$SESSION_IGNORED_WALK_FILE" ]; then
+    unlink "$SESSION_IGNORED_WALK_FILE" >/dev/null 2>&1 || true
+  fi
   if [ -n "${WORKTREE_LIST_FILE:-}" ] && [ -f "$WORKTREE_LIST_FILE" ]; then
     unlink "$WORKTREE_LIST_FILE" >/dev/null 2>&1 || true
   fi
@@ -989,6 +1126,8 @@ PRIVATE_NAMESPACE_BLOCKERS=()
 CONFIG_LOCK=""
 CONFIG_LOCK_OWNED=0
 CHANGED_PATHS_FILE=""
+SESSION_STATUS_FILE=""
+SESSION_IGNORED_WALK_FILE=""
 WORKTREE_LIST_FILE=""
 MASTER_INDEX_PROBE=""
 MASTER_SKIP_PATHS_FILE=""
@@ -1088,9 +1227,7 @@ if [ -n "$SESSION_REF" ]; then
 else
   [ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "detached session cannot clean $BRANCH while another worktree owns it: $BRANCH_OWNER"
 fi
-SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal --ignored=matching) ||
-  fail "could not inspect session worktree cleanliness"
-[ -z "$SESSION_STATUS" ] || fail "session worktree is dirty; commit, stash, or remove its changes before cleanup"
+refuse_session_local_data
 refuse_initialized_submodules "$SESSION" "session worktree"
 refuse_session_module_gitdirs "$SESSION"
 refuse_private_worktree_refs "$SESSION"
