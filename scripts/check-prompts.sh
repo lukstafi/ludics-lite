@@ -388,7 +388,11 @@ check_fixtures() {
 # window, and a window wide enough to catch them is wide enough to read "Choose one, not two modes"
 # beside the slot paragraph as a slot count. Every file still states its count in a form above, so
 # the agreement is pinned; what is no longer pinned is that one sentence's number, which is a
-# smaller loss than prose that cannot be written near a slot paragraph (ludics-lite#202).
+# smaller loss than prose that cannot be written near a slot paragraph (ludics-lite#202). The word
+# form is read WITHOUT such context for the same reason: `on mac-studio` is what makes a numeral a
+# statement about this box, and the only stronger test available is the same proximity window that
+# form was removed for. The cost is stated in #202 -- an unrelated `version six on mac-studio`
+# would satisfy a required prompt's obligation to state the count.
 # A numeral is a word, or hyphenated words, from $NUMERALS. Text INSIDE an assignment of the
 # variable is skipped: a fixture configuring a two-slot box states its own input and claims nothing
 # about the default. Which text that is, is answered structurally rather than by looking back a
@@ -407,7 +411,7 @@ NUMBER_WORDS='zero one two three four five six seven eight nine ten eleven twelv
 # The vocabulary a word-shaped count is recognized by -- wider than the spellings a default can
 # take, because its job is to tell a stated count apart from an ordinary word, not to name one.
 NUMERALS="$NUMBER_WORDS thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty
-  thirty forty fifty sixty seventy eighty ninety hundred"
+  thirty forty fifty sixty seventy eighty ninety hundred thousand million billion"
 
 # number_word <n>: the English spelling of a small number; empty past the list above.
 number_word() {
@@ -559,6 +563,21 @@ SLOT_AWK_LIB='
     if (q != "" && plain > 0) return plain
     return i - 1
   }
+  # uncommented <line>: <line> up to its comment, if it carries one -- a `#` outside quotes, at the
+  # start or after a blank. A heredoc named in a comment opens no body, and queueing one would skip
+  # the rest of the file as if it were data.
+  function uncommented(line,   i, c, q, sq) {
+    q = ""; sq = sprintf("%c", 39)
+    for (i = 1; i <= length(line); i++) {
+      c = substr(line, i, 1)
+      if (q == "") {
+        if (c == "\\") { i++; continue }
+        if (c == "\"" || c == sq) { q = c; continue }
+        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) return substr(line, 1, i - 1)
+      } else if (c == q) q = ""
+    }
+    return line
+  }
   # unquote <s>: <s> with the quote characters that grouped it removed.
   function unquote(s,   out, i, c, q) {
     out = ""; q = ""; sq = sprintf("%c", 39)
@@ -600,7 +619,7 @@ slot_default() {
     {
       # Every heredoc the line opens, in the order the shell consumes their bodies: one command
       # may declare several.
-      rest = $0
+      rest = uncommented($0)
       while (match(rest, hd)) {
         tag = substr(rest, RSTART, RLENGTH)
         sub(/^[^<]/, "", tag)                  # the guard character, when the match took one
@@ -622,8 +641,14 @@ slot_default() {
     # as an assignment, so nothing else would catch it either).
     /^SLOTS=/ {
       eq = index($0, "=")
+      stop = word_end($0, eq)
+      # `SLOTS=… some-command` scopes the assignment to that command and leaves the shell variable
+      # alone, so only an assignment standing as the whole command sets the default. Nothing but a
+      # comment may follow it.
+      tail = substr($0, stop + 1); sub(/^[[:space:]]+/, "", tail)
+      if (tail != "" && substr(tail, 1, 1) != "#") next
       # The value as the shell would take it: the assignment word with its quoting removed.
-      val = unquote(substr($0, eq + 1, word_end($0, eq) - eq))
+      val = unquote(substr($0, eq + 1, stop - eq))
       # EVERY mac-studio pair in the value, since `box_correctness_slots` validates the pairs in
       # order and refuses the whole spec on the first malformed one -- a good pair standing after
       # a bad one is never reached. The last VALID one is the default, since the registry dict
@@ -667,15 +692,16 @@ check_slots() {
     # well-formed duplicate later in the same spec.
     '!'*) ko "$SLOT_SCRIPT" "SLOTS assignment states '${default#\!}', which is not <box>=<positive n>"; return 0 ;;
     *[!0-9]* | '') ko "$SLOT_SCRIPT" "SLOTS assignment states no 'mac-studio=<n>' default"; return 0 ;;
-    # The worker's own grammar: `box_correctness_slots` refuses a pair whose count is below one,
-    # so a zero default is a roster every mac-studio slot call dies on, not a count to agree with.
-    0) ko "$SLOT_SCRIPT" "SLOTS assignment states mac-studio=0; the worker requires <box>=<positive n>"; return 0 ;;
   esac
-  # An unspellable default (past twelve) leaves the word forms unmatchable rather than unchecked:
-  # any number word then mismatches and says what the script actually pins.
-  # As a NUMBER, not as the digits that spell it: the worker reads `mac-studio=06` as six (`test`
-  # and Python both take the leading zero as decimal), so the prose that agrees with it says six.
+  # As a NUMBER before anything is decided about it, not as the digits that spell it: the worker
+  # reads `mac-studio=06` as six and `mac-studio=00` as zero (`test` and Python both take the
+  # leading zero as decimal), so both the positivity rule and the spelling below judge the value.
   default=$(as_number "$default")
+  # The worker's own grammar: `box_correctness_slots` refuses a pair whose count is below one, so
+  # a zero default is a roster every mac-studio slot call dies on, not a count to agree with.
+  [ "$default" -ge 1 ] || { ko "$SLOT_SCRIPT" "SLOTS assignment states mac-studio=$default; the worker requires <box>=<positive n>"; return 0; }
+  # An unspellable default (past the vocabulary) leaves the word forms unmatchable rather than
+  # unchecked: any numeral then mismatches and says what the script actually pins.
   word=$(number_word "$default")
   # Line by line: a path with a space in it would otherwise split into words, and the resulting
   # reads of nonexistent paths increment nothing -- the file would be skipped under a clean pass.

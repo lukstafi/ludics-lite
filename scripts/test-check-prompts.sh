@@ -429,7 +429,9 @@ WANT=$(sed -n 's/^SLOTS=.*mac-studio=\([0-9][0-9]*\).*/\1/p' "$SRC/$WORKER" | ta
 case "$WANT" in
   '' | *[!0-9]*) ko "the slot probes need one numeric mac-studio default in $WORKER; read '$WANT'"; WANT=; ;;
 esac
-OTHER=$(( ${WANT:-0} + 1 ))
+# Base ten explicitly: a default legitimately spelled `08` is eight to the worker and to the
+# checker, and an octal token to bash arithmetic -- which would end the suite here.
+OTHER=$(( 10#0${WANT:-0} + 1 ))
 slots_tree() {
   rm -rf "$R"
   mkdir -p "$R/issue-wave/references" "$R/issue-wave/scripts" "$R/routines"
@@ -590,6 +592,31 @@ expect "an override whose blank is escaped states no default" 0 'mac-studio corr
 slots_tree
 printf ": <<'HD'\nSLOTS=mac-studio=%s\nHD\n" "$OTHER" >> "$R/$WORKER"
 expect "a SLOTS line inside a heredoc assigns nothing" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# An assignment standing in front of a command is scoped to that command: the shell variable keeps
+# its old value, so the default does not move.
+slots_tree
+printf 'SLOTS=mac-studio=%s true\n' "$OTHER" >> "$R/$WORKER"
+expect "a command-prefix assignment sets no default" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# A heredoc named in a comment opens no body -- and queueing one would skip the rest of the file
+# as data, hiding every assignment after it.
+slots_tree
+printf '# example: cat <<IGNORED\nSLOTS=mac-studio=%s\n' "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "a heredoc named in a comment hides nothing after it" \
+  || ko "a heredoc named in a comment hides nothing after it (rc=$rc) -- $out"
+
+# The scale words English joins with `and` are numerals too, so the phrase is read whole.
+slots_tree
+slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(one thousand and six on mac-studio/'
+expect "a scale word is part of the numeral, not a stop" 1 "native-claude.md: spells the mac-studio slot count 'one thousand and six'" -- "$CP" "$R"
+
+# The positivity rule judges the VALUE, so it sees through a leading zero.
+slots_tree
+slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo mac-studio=00/"
+expect "a zero written with a leading zero is still zero" 1 "$WORKER: SLOTS assignment states mac-studio=0" -- "$CP" "$R"
 
 # `and` joins a numeral phrase, and only between two numerals: the phrase is the count, while a
 # bare `and` before it leaves the run where it was.
