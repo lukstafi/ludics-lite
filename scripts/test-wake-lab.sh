@@ -777,6 +777,14 @@ grep -q 'ACTIVE HOURS WARNING on rog: sweep window 7-11 falls outside active hou
 grep -q 'reg query "HKLM\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings"' "$SSH_LOG" \
   && ok "...read from the UX\\Settings key on the Windows side" \
   || ko "the active-hours check did not query the registry key: $(cat "$SSH_LOG")"
+# A warning whose repair has to be reconstructed from a registry path is one that gets read and
+# left: nothing re-applies the values, so the line names the tracked script that writes them back.
+grep -q 'repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)' <<<"$out" \
+  && ok "...and points the repair at the tracked active-hours script" \
+  || ko "the active-hours warning does not name scripts/enable-active-hours-windows.ps1 -- $out"
+[ -f "$HERE/enable-active-hours-windows.ps1" ] \
+  && ok "...which is tracked where the warning says it is" \
+  || ko "the warning names scripts/enable-active-hours-windows.ps1, which is not in the checkout"
 # The quiet path: the 6-to-0 maximum the boxes now pin covers a morning sweep, and a check that
 # warned there too would be one nobody reads.
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x6 0x0 0x0)" 2>&1); rc=$?

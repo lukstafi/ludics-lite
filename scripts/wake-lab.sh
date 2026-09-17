@@ -120,8 +120,10 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 #   `HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings` on the -win side. On 2026-09-15 KB5129195
 #   restarted minix 21 min into its hip unit, because active hours were 10:00–01:00 and the sweep
 #   runs in the morning; both boxes now pin 6→0 (the 18 h maximum) with SmartActiveHoursState=0,
-#   but a feature update can reset that. `status`, and `--hold`, read those values and warn when
-#   the sweep window ($WAKE_LAB_SWEEP_HOURS, default 7-11 local) is not inside them. After the
+#   but a feature update can reset that and nothing re-applies it. `status`, and `--hold`, read
+#   those values and warn when the sweep window ($WAKE_LAB_SWEEP_HOURS, default 7-11 local) is not
+#   inside them; `scripts/enable-active-hours-windows.ps1`, run from an elevated PowerShell on the
+#   box the warning named, writes the three values back and is the whole repair. After the
 #   fact, the signature is System event 1074 from MoUsoCoreWorker.exe / TrustedInstaller.exe on the
 #   -win side inside the unit's window: an `error` unit with one of those is an update restart, not
 #   a backend failure.
@@ -928,6 +930,11 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0, 
 # with it. Active hours are the only setting that prevents it, they live on the Windows side, and
 # a feature update can reset them — so this is a warning, read before the units run, never after.
 # It never fails a command: a box whose registry cannot be read is still a box worth sweeping.
+# Every warning about the BOX's own values names scripts/enable-active-hours-windows.ps1, which
+# writes the three of them back: a warning whose repair has to be reconstructed from the registry
+# path is one that gets read and left. The WAKE_LAB_SWEEP_HOURS warnings do not name it — those
+# are a misconfiguration on this side, and nothing on the box would change — and neither does the
+# unreadable-registry one, which knows of no setting to repair.
 ACTIVE_HOURS_KEY='HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
 
 reg_dword() { # reg_dword <reg-query output> <value name> — its decimal value, or ?
@@ -986,7 +993,7 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
   # calls every hour covered — so a box whose update protection is set to nonsense would report
   # the quiet line instead of the warning that is the only notice anyone gets.
   if [ "$s" -gt 23 ] || [ "$e" -gt 23 ]; then
-    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, which are not clock hours (0-23): the update protection on that box is not valid"
+    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, which are not clock hours (0-23): the update protection on that box is not valid — repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)"
     return 0
   fi
   # Equal endpoints are not a 24-hour window. Windows allows at most 18 hours (this file's own
@@ -997,7 +1004,7 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
   # show. Equal endpoints are the zero/24 case of the same check.
   len=$(( (e - s + 24) % 24 ))
   if [ "$len" -eq 0 ] || [ "$len" -gt 18 ]; then
-    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, a span Windows cannot mean (its maximum is 18 h), so the setting is reset or malformed"
+    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, a span Windows cannot mean (its maximum is 18 h), so the setting is reset or malformed — repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)"
     return 0
   fi
   # End-exclusive, so equal endpoints are an empty range, not a one-hour one: forcing len=1 would
@@ -1012,9 +1019,9 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
     hour_active "$h" "$s" "$e" || uncovered="$uncovered $h"
   done
   if [ -n "$uncovered" ]; then
-    echo "  ACTIVE HOURS WARNING on $name: sweep window $SWEEP_HOURS falls outside active hours $s-$e (smart=$m); uncovered hours:$uncovered — Windows Update can restart the box mid-unit"
+    echo "  ACTIVE HOURS WARNING on $name: sweep window $SWEEP_HOURS falls outside active hours $s-$e (smart=$m); uncovered hours:$uncovered — Windows Update can restart the box mid-unit; repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)"
   elif [ "$m" != 0 ]; then
-    echo "  ACTIVE HOURS WARNING on $name: active hours $s-$e cover the sweep window $SWEEP_HOURS, but SmartActiveHoursState=$m lets Windows move them"
+    echo "  ACTIVE HOURS WARNING on $name: active hours $s-$e cover the sweep window $SWEEP_HOURS, but SmartActiveHoursState=$m lets Windows move them — repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)"
   else
     echo "  active hours on $name: $s-$e cover the sweep window $SWEEP_HOURS (smart=$m)"
   fi
