@@ -136,12 +136,11 @@ The desktop app's registry (cron, working directory, model) is not in the reposi
 recorded in [routines/README.md](routines/README.md), which also carries the install order and the
 symptoms of an unreadable prompt. That push is manual and is part of landing any PR that
 touches a prompt — merging moves this checkout, never the scheduler's copy — so after such a merge,
-on `mac-studio`: put the checkout on `origin/main` (`git -C ~/ludics-lite fetch origin && git -C
-~/ludics-lite checkout main && git -C ~/ludics-lite merge --ff-only origin/main` — a bare `pull
---ff-only` follows whatever the current branch tracks), `scripts/sync-routines.sh` to read the
-direction, then `push` — or `pull`, on the rarer drift whose newer text is the installed copy. Only
-a checkout on `main`, level with `origin/main` and clean under `routines/`, may be pushed from: a
-`push` installs whatever it holds. Forgetting it is silent (the routine keeps firing the old prompt and its
+on `mac-studio`, through the chained recipe in [routines/README.md](routines/README.md): put the
+checkout on `main`, prove it is level with `origin/main` and clean under `routines/` — only such a
+checkout may be installed from, since `push` installs whatever it holds — then
+`scripts/sync-routines.sh` to read the direction, and `push`, or `pull` on the rarer drift whose
+newer text is the installed copy. Forgetting it is silent (the routine keeps firing the old prompt and its
 record looks normal), so both live prompts open by running `scripts/sync-routines.sh` and reporting
 their own drift, and `daily-issue-planning` reports every routine's verdict once a day
 (ludics-lite#199). The third, the CI-red triage routine `ship-pr` defers master's
