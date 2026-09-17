@@ -376,8 +376,11 @@ check_fixtures() {
 # WHAT counts as a statement is three shapes, which are the three the prose uses -- `mac-studio=<n>`
 # (the whole token, so a malformed `mac-studio=6oops` is refused rather than accepted on its
 # prefix), the number word in `<n> on mac-studio`, and the word opening the `<N>, not <m>`
-# justification. A numeral is read whole, hyphens included, so `twenty-six on mac-studio` states
-# twenty-six and is refused -- never read as the `six` it ends with. An ASSIGNMENT of the variable
+# justification. The word forms match the WHOLE word and then ask whether it is a numeral, rather
+# than matching a number word inside one: `twenty-six on mac-studio` and `thirteen on mac-studio`
+# both state a count and are refused, while `done on mac-studio` states none and is passed over --
+# a suffix rule reads the first as `six`, the second as nothing at all, and the third as `done`.
+# A numeral is a word, or hyphenated words, from $NUMERALS. An ASSIGNMENT of the variable
 # (`FLEET_BOX_CORRECTNESS_SLOTS=mac-studio=2`, quoted or not) is skipped: a fixture configuring a
 # two-slot box states its own input, and claims nothing about the default. That last one is scoped to slot prose: both sides must be number words AND `slot`
 # must stand within $SLOT_CONTEXT characters, so an ordinary "one, not both" sentence elsewhere in
@@ -390,7 +393,11 @@ SLOT_PROMPTS='README.md issue-wave/SKILL.md issue-wave/references/executions.md'
 SLOT_MECHANISM='scripts/check-prompts.sh scripts/test-check-prompts.sh'
 SLOT_CONTEXT=160
 NUMBER_WORDS='zero one two three four five six seven eight nine ten eleven twelve'
-NUMBER_ERE='zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve'
+# The vocabulary a word-shaped count is recognized by -- wider than the spellings a default can
+# take, because its job is to tell a stated count apart from an ordinary word, not to name one.
+NUMERALS="$NUMBER_WORDS thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty
+  thirty forty fifty sixty seventy eighty ninety hundred"
+
 # number_word <n>: the English spelling of a small number; empty past the list above.
 number_word() {
   local i=0 w
@@ -419,9 +426,10 @@ slot_files() {
 slot_mentions() {
   local q="'"
   RE_DIGIT="mac-studio=[^[:space:]\`\"$q),;]*" \
-  RE_WORD="[^a-z0-9][a-z-]*($NUMBER_ERE)[[:space:]]+on[[:space:]]+mac-studio" \
-  RE_NOT="[^a-z0-9][a-z-]*($NUMBER_ERE), not[[:space:]]+[a-z-]*($NUMBER_ERE)[^a-z0-9]" \
+  RE_WORD="[^a-z0-9][a-z][a-z-]*[[:space:]]+on[[:space:]]+mac-studio" \
+  RE_NOT="[^a-z0-9][a-z][a-z-]*, not[[:space:]]+[a-z][a-z-]*[^a-z0-9]" \
   RE_ASSIGN="slots=[\`\"$q]?\$" \
+  NUMERALS="$(printf '%s' " $NUMERALS " | tr -s '[:space:]' ' ')" \
   CTX="$SLOT_CONTEXT" awk '
     { text = text " " $0 }
     END {
@@ -450,9 +458,12 @@ slot_mentions() {
         n = substr(frag, index(frag, "=") + 1)
         sub(/\.$/, "", n)            # a sentence-final period is punctuation, not the value
       } else {
-        # The whole numeral, hyphens and all: `twenty-six` is not the `six` it ends with.
-        n = tolower(frag); sub(/^[^a-z]+/, "", n); sub(/[^a-z-].*$/, "", n); sub(/-$/, "", n)
+        # The whole word, hyphens and all -- and then: is it a count at all? `twenty-six` is not
+        # the `six` it ends with, and `done on mac-studio` states nothing.
+        n = tolower(frag); sub(/^[^a-z]+/, "", n); sub(/[^a-z-].*$/, "", n); sub(/-+$/, "", n)
+        if (!numeral(n)) return
         if (kind == "not") {         # only inside slot prose: see the header above
+          if (!numeral(second(frag))) return
           from = at - ctx; if (from < 1) from = 1
           window = substr(lower, from, len + 2 * ctx)
           if (index(window, "slot") == 0) return
@@ -461,14 +472,51 @@ slot_mentions() {
       sub(/^[^A-Za-z0-9]+/, "", frag); sub(/[^A-Za-z0-9]+$/, "", frag)
       print kind "\t" n "\t" frag
     }
+    # numeral <word>: whether <word> is a count -- a word from the vocabulary, or hyphenated words
+    # all of which are ("twenty-six"). An empty word is not one.
+    function numeral(w,   parts, i, k) {
+      if (w == "") return 0
+      k = split(w, parts, "-")
+      for (i = 1; i <= k; i++)
+        if (index(ENVIRON["NUMERALS"], " " parts[i] " ") == 0) return 0
+      return 1
+    }
+    # second <fragment>: the word after ", not " in a justification match.
+    function second(f,   rest) {
+      rest = tolower(f); sub(/^.*, not[[:space:]]+/, "", rest)
+      sub(/[^a-z-].*$/, "", rest); sub(/-+$/, "", rest)
+      return rest
+    }
+  ' "$1"
+}
+
+# slot_default <file>: the `mac-studio=<n>` default inside the value assigned to SLOTS, or empty.
+slot_default() {
+  awk '
+    /^SLOTS=/ && !seen {
+      seen = 1; v = substr($0, index($0, "=") + 1); q = ""; val = ""
+      for (i = 1; i <= length(v); i++) {
+        c = substr(v, i, 1)
+        if (q == "") {
+          if (c == "\"" || c == "'"'"'") { q = c; continue }
+          if (c == " " || c == "\t") break          # the assignment word ends here
+        } else if (c == q) { q = ""; continue }
+        val = val c
+      }
+      if (match(val, /mac-studio=[0-9]+/))
+        print substr(val, RSTART + 11, RLENGTH - 11)
+    }
   ' "$1"
 }
 
 check_slots() {
   local default word f kind n shown mentions stated=' ' bad=0
   [ -f "$ROOT/$SLOT_SCRIPT" ] || return 0
-  # The default as the shell takes it: the `mac-studio=<n>` inside the SLOTS assignment itself.
-  default=$(sed -n 's/^SLOTS=.*mac-studio=\([0-9][0-9]*\).*/\1/p' "$ROOT/$SLOT_SCRIPT")
+  # The default as the shell takes it: the `mac-studio=<n>` inside the SLOTS assignment's VALUE.
+  # Read to the first UNQUOTED blank rather than to the end of the line, so a trailing comment --
+  # `SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-}" # old mac-studio=6` -- cannot stand in for a default
+  # the script no longer has.
+  default=$(slot_default "$ROOT/$SLOT_SCRIPT")
   case "$default" in
     *[!0-9]* | '') ko "$SLOT_SCRIPT" "SLOTS assignment states no 'mac-studio=<n>' default"; return 0 ;;
   esac

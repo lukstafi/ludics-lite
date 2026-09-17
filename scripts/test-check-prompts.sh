@@ -492,11 +492,33 @@ slots_tree
 slots_edit README.md 's/a run-time count a worker takes/a run-time count. Choose one, not both. A worker takes/'
 expect "ordinary '<n>, not <m>' prose beside the slot sentence is not a count" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
-# A numeral is whole: reading `twenty-six` as the `six` it ends with would pass a tree whose prose
-# states twenty-six, which is the one way a mismatch could go unreported rather than refused.
+# The word before `on mac-studio` is read WHOLE and then asked whether it is a count at all. Both
+# halves matter and pull opposite ways: a suffix rule reads `twenty-six` as the `six` it ends with
+# and `done` as a count of `done`, while a bare vocabulary rule lets `thirteen` state a number no
+# spelling is checked against -- silently, in a file nothing requires to speak.
 slots_tree
 slots_edit issue-wave/SKILL.md 's/([a-z]* on mac-studio/(twenty-six on mac-studio/'
 expect "a compound numeral is read whole, not by its suffix" 1 "SKILL.md: spells the mac-studio slot count 'twenty-six'" -- "$CP" "$R"
+
+slots_tree
+slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(thirteen on mac-studio/'
+expect "a numeral past the default's own spellings is still a count" 1 "native-claude.md: spells the mac-studio slot count 'thirteen'" -- "$CP" "$R"
+
+for sentence in 'The cleanup is done on mac-studio.' 'Someone on mac-studio noticed.'; do
+  slots_tree
+  printf '\n%s\n' "$sentence" >> "$R/README.md"
+  expect "ordinary prose ending in a number word states no count: ${sentence%% *}..." 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+done
+
+slots_tree
+slots_edit README.md 's/a run-time count a worker takes/a run-time count. Done, not three. A worker takes/'
+expect "...and a justification shape whose opening word is not a numeral states none" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# The default is the assignment's VALUE: prose on the line cannot stand in for a default the
+# script no longer has.
+slots_tree
+slots_edit "$WORKER" 's/^SLOTS=.*/SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-}" # old mac-studio=6/'
+expect "a default left only in a trailing comment is no default" 1 "$WORKER: SLOTS assignment states no 'mac-studio=<n>' default" -- "$CP" "$R"
 
 # An assignment of the variable is an input, not a claim about the default -- a fixture that
 # configures a two-slot box says nothing about what an unconfigured box gets.
