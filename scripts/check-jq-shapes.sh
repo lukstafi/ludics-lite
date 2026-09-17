@@ -51,7 +51,8 @@
 # unbalance the count and REFUSE, which is the safe direction: the guard would ask for a rewrite
 # of a line that is fine, not pass one that is not.
 #
-# Usage: check-jq-shapes.sh [file...]   (default: ship-pr/scripts/pr-review.sh)
+# Usage: check-jq-shapes.sh [file...]   (default: every */scripts/*.sh and scripts/*.sh in the
+# checkout, less this guard and its fixtures -- see EXCLUDED below)
 # Exit 0 when every capture is in the safe shape, 1 when one is not, 2 on a usage error.
 
 set -euo pipefail
@@ -65,10 +66,59 @@ case "${1:-}" in
   ;;
 esac
 
+# THE SCOPE. Every script the skills and the toolbox carry, not the one file this guard was
+# written for. The trap is a property of jq, not of pr-review.sh: a bare `capture` in any of
+# these fails the same silent way, and a default that reads one file certifies two dozen others
+# it never opened -- the summary line says "every capture(" either way. The two globs are
+# the lint job's own file list in .github/workflows/skill-scripts.yml, less ship-pr/hooks, whose
+# shell shells out to no jq today; add it here the day it does.
+#
+# Two files are excluded, named one path at a time. Both deliberately carry strings that READ as
+# jq source and are not: this guard's grammar comments above quote the shapes it refuses, and
+# scripts/test-check-jq-shapes.sh writes a scratch probe per shape as a heredoc. Scanning either
+# reports the documentation of the rule as a violation of it. The list is explicit rather than a
+# glob (`*check-jq*`, `*/test-*.sh`) on purpose: a glob also covers files nobody has written
+# yet, and a real `capture` in some future suite is exactly what widening the scope is for.
+EXCLUDED=(
+  scripts/check-jq-shapes.sh
+  scripts/test-check-jq-shapes.sh
+)
+
 if [ "$#" -gt 0 ]; then
+  # An explicit argument is scanned whatever its name. The exclusions are about what the
+  # unattended default reads, not a claim that those files cannot be looked at -- the fixtures
+  # below run the guard on scratch files and on an old revision of pr-review.sh by path.
   files=("$@")
 else
-  files=("$ROOT/ship-pr/scripts/pr-review.sh")
+  files=()
+  for f in "$ROOT"/*/scripts/*.sh "$ROOT"/scripts/*.sh; do
+    [ -f "$f" ] || continue # an unmatched glob arrives as the pattern itself
+    rel=${f#"$ROOT"/}
+    excluded=
+    for x in "${EXCLUDED[@]}"; do
+      if [ "$rel" = "$x" ]; then
+        excluded=1
+        break
+      fi
+    done
+    [ -n "$excluded" ] || files+=("$f")
+  done
+  # Every exclusion must name a file that is really there. Renaming the guard or its fixtures is
+  # caught loudly on its own (the new name is scanned, and its probe strings refused), but the
+  # entry left behind would sit in the list reading as though it still covered something, and
+  # the next reader would trust it.
+  for x in "${EXCLUDED[@]}"; do
+    if [ ! -f "$ROOT/$x" ]; then
+      echo "check-jq-shapes.sh: excluded file not found: $x -- the list in $0 is stale" >&2
+      exit 2
+    fi
+  done
+  # Fail closed rather than print a clean verdict over nothing: an empty sweep means the globs
+  # have stopped describing the checkout, which reads as a pass on every head thereafter.
+  if [ "${#files[@]}" -eq 0 ]; then
+    echo "check-jq-shapes.sh: no scripts matched */scripts/*.sh or scripts/*.sh under $ROOT" >&2
+    exit 2
+  fi
 fi
 
 rc=0

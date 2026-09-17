@@ -140,7 +140,10 @@ jobs:
         # three PRs (ludics-lite#84 three, #104 a fourth, #89 a fifth) while the safe shape lived
         # only in prose. The guard refuses a `capture(` that is not `[capture(...)] | first`; its own
         # fixtures run beside it, since a scan that cannot fail would prove nothing. Both are in
-        # the lint job so they judge every head, including a prompt-only one.
+        # the lint job so they judge every head, including a prompt-only one. With no argument it
+        # sweeps the same `*/scripts/*.sh` and `scripts/*.sh` this job's other steps read, less two
+        # files it excludes by name (itself and its fixtures, which quote the refused shapes on
+        # purpose) -- so a script added to any skill is scanned without a line here.
         run: scripts/check-jq-shapes.sh
       - name: jq shape guard fixtures
         run: scripts/test-check-jq-shapes.sh
