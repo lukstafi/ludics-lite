@@ -408,6 +408,414 @@ rm "$R/alpha/scripts/test-python.py"
 # The lookup is one-way, as the prompt register is: stale commands require no table model.
 expect "a removed fixture leaves no membership obligation" 0 '0 failed' -- "$CP" "$R"
 
+# --- the mac-studio correctness-slot count ----------------------------------------------------
+# The prompts quote a number that lives in one line of fleet-worker.sh (ludics-lite#160), so this
+# tree is the real files, COPIED: a probe over invented prose would keep passing while the
+# checker's spellings drifted away from the ones the prompts actually use. Every mutation below
+# rewrites a copy under $TMP; nothing in the checkout is touched. The tree is a valid root on its
+# own -- the real README indexes more skills than it holds, which the index lookup allows, and it
+# carries no fixture, so no membership obligation comes with it. `native-claude.md` is in it as a
+# file the scan DISCOVERS rather than requires: it states the count and is held for it.
+SRC=$(cd "$HERE/.." && pwd)
+WORKER=issue-wave/scripts/fleet-worker.sh
+# The default as the checker reads it, and a number that is not it: the probes state no literal
+# count, so raising the default again leaves them testing the same thing.
+# The LAST such assignment, as the shell and the checker both take it: reading every match would
+# make WANT a two-line string the moment a second one landed, and the arithmetic below would end
+# the suite with a syntax error before a single assertion ran. Derived independently of the
+# checker -- a probe that computed its expectation with the code under test would prove nothing --
+# and refused outright if it is not one plain number.
+WANT=$(sed -n 's/^SLOTS=.*mac-studio=\([0-9][0-9]*\).*/\1/p' "$SRC/$WORKER" | tail -n 1)
+case "$WANT" in
+  '' | *[!0-9]*) ko "the slot probes need one numeric mac-studio default in $WORKER; read '$WANT'"; WANT=; ;;
+esac
+# Base ten explicitly: a default legitimately spelled `08` is eight to the worker and to the
+# checker, and an octal token to bash arithmetic -- which would end the suite here.
+OTHER=$(( 10#0${WANT:-0} + 1 ))
+# A spelling used as the STALE one must not be the default's own, or the mutation would replace a
+# word with itself: `slots_edit` would report that nothing changed and the probe would assert a
+# refusal the tree no longer earns. Both pairs move out of the way if the default ever becomes the
+# number they spell -- which is the very change this whole check exists for.
+STALE=eleven;     [ "${WANT:-0}" = 11 ] && STALE=twelve
+STALE_HYPHEN=twenty-six; [ "${WANT:-0}" = 26 ] && STALE_HYPHEN=twenty-seven
+slots_tree() {
+  rm -rf "$R"
+  mkdir -p "$R/issue-wave/references" "$R/issue-wave/scripts" "$R/routines"
+  cp "$SRC/README.md" "$R/README.md"
+  cp "$SRC/routines/README.md" "$R/routines/README.md"
+  cp "$SRC/issue-wave/SKILL.md" "$R/issue-wave/SKILL.md"
+  cp "$SRC/issue-wave/references/executions.md" "$R/issue-wave/references/executions.md"
+  cp "$SRC/issue-wave/references/native-claude.md" "$R/issue-wave/references/native-claude.md"
+  cp "$SRC/$WORKER" "$R/$WORKER"
+}
+# slots_edit <file> <sed-expression>: rewrites one copy. An expression that matched nothing would
+# leave a probe asserting a refusal the tree no longer earns, so the helper says so instead.
+slots_edit() {
+  sed "$2" "$R/$1" > "$R/slots.tmp" || { ko "slots_edit: sed failed on $1"; return 1; }
+  cmp -s "$R/slots.tmp" "$R/$1" && { ko "slots_edit: '$2' matched nothing in $1"; return 1; }
+  mv "$R/slots.tmp" "$R/$1"
+}
+
+slots_tree
+expect "the prompts and fleet-worker.sh state one mac-studio slot count" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# The script moves and the prose does not: one edit at the source, every file that states the
+# count refused -- the discovered `native-claude.md` among them, not just the required three.
+slots_tree
+slots_edit "$WORKER" "s/mac-studio=$WANT/mac-studio=$OTHER/g"
+out=$("$CP" "$R" 2>&1); rc=$?
+miss=
+for f in README.md issue-wave/SKILL.md issue-wave/references/executions.md issue-wave/references/native-claude.md; do
+  grep -qF "FAIL: $f: " <<<"$out" || miss="$miss $f"
+done
+[ "$rc" -eq 1 ] && [ -z "$miss" ] \
+  && ok "a new default in the script alone leaves every file that states the count refused" \
+  || ko "a new default in the script alone leaves every file that states the count refused (rc=$rc; silent:$miss) -- $out"
+
+# ...and each file moving alone, in each spelling the prose uses: `mac-studio=<n>`, and the
+# numeral phrase before `on mac-studio`.
+slots_tree
+slots_edit issue-wave/references/executions.md "s/mac-studio=$WANT/mac-studio=$OTHER/"
+expect "a rewritten mac-studio=<n> is refused" 1 "states 'mac-studio=$OTHER'" -- "$CP" "$R"
+
+slots_tree
+slots_edit README.md "s/([a-z]* on$/($STALE on/"
+expect "a rewritten count word is refused, wrapped across a line" 1 "README.md: spells the mac-studio slot count '$STALE'" -- "$CP" "$R"
+
+slots_tree
+slots_edit issue-wave/SKILL.md "s/([a-z]* on mac-studio/($STALE on mac-studio/"
+expect "a rewritten count word is refused in the skill" 1 "SKILL.md: spells the mac-studio slot count '$STALE'" -- "$CP" "$R"
+
+# A file nobody listed: the scan holds whatever states the count, which is what keeps a list from
+# going stale behind a new quotation of the number.
+slots_tree
+slots_edit issue-wave/references/native-claude.md "s/([a-z]* on mac-studio/($STALE on mac-studio/"
+expect "a discovered reference is held to the count too" 1 "native-claude.md: spells the mac-studio slot count '$STALE'" -- "$CP" "$R"
+
+# The whole token, not its prefix: `<box>=<n>` takes an integer, and a value the worker would
+# reject must not read as agreement because it starts with the right digit.
+slots_tree
+slots_edit issue-wave/references/executions.md "s/mac-studio=$WANT/mac-studio=${WANT}oops/"
+expect "a malformed mac-studio=<n> is not agreement" 1 "states 'mac-studio=${WANT}oops'" -- "$CP" "$R"
+
+# ...and the justification shape stays scoped to slot prose: an ordinary sentence of that shape,
+# even dropped into the slot paragraph itself, states no slot count.
+# The word before `on mac-studio` is read WHOLE and then asked whether it is a count at all. Both
+# halves matter and pull opposite ways: a suffix rule reads `twenty-six` as the `six` it ends with
+# and `done` as a count of `done`, while a bare vocabulary rule lets `thirteen` state a number no
+# spelling is checked against -- silently, in a file nothing requires to speak.
+slots_tree
+slots_edit issue-wave/SKILL.md "s/([a-z]* on mac-studio/($STALE_HYPHEN on mac-studio/"
+expect "a compound numeral is read whole, not by its suffix" 1 "SKILL.md: spells the mac-studio slot count '$STALE_HYPHEN'" -- "$CP" "$R"
+
+slots_tree
+slots_edit issue-wave/references/native-claude.md "s/([a-z]* on mac-studio/(${STALE_HYPHEN%%-*} on mac-studio/"
+expect "a numeral past the default's own spellings is still a count" 1 "native-claude.md: spells the mac-studio slot count '${STALE_HYPHEN%%-*}'" -- "$CP" "$R"
+
+for sentence in 'The cleanup is done on mac-studio.' 'Someone on mac-studio noticed.'; do
+  slots_tree
+  printf '\n%s\n' "$sentence" >> "$R/README.md"
+  expect "ordinary prose ending in a number word states no count: ${sentence%% *}..." 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+done
+
+# The `<N>, not <m>` justification is deliberately not a form this check reads (ludics-lite#202):
+# nothing in that shape is about slots, and a window wide enough to catch the real ones reads
+# ordinary comparisons beside the slot paragraph as counts. Both of these are ordinary prose.
+for sentence in 'Choose one, not two modes.' 'Eleven, not three, since nothing.'; do
+  slots_tree
+  slots_edit README.md "s/a run-time count a worker takes/a run-time count. $sentence A worker takes/"
+  expect "a numeral comparison beside the slot paragraph states no count: ${sentence%% *}..." 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+done
+
+# Punctuation that closes a mention is punctuation, wherever Markdown puts it -- a correct count
+# inside brackets or braces states the default, and only a non-punctuation suffix is malformed.
+for wrap in '[mac-studio=%s]' '{mac-studio=%s}:' '"mac-studio=%s".'; do
+  slots_tree
+  printf "\nRoster $wrap here.\n" "$WANT" >> "$R/README.md"
+  expect "a count closed by Markdown punctuation is the count: $wrap" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+done
+slots_tree
+printf '\nRoster [mac-studio=%s] here.\n' "$OTHER" >> "$R/README.md"
+expect "...and a stale one inside brackets is still refused" 1 "states 'mac-studio=$OTHER'" -- "$CP" "$R"
+slots_tree
+printf '\nRoster mac-studio=%soops here.\n' "$WANT" >> "$R/README.md"
+expect "...while a suffix that is not punctuation is still malformed" 1 "states 'mac-studio=${WANT}oops'" -- "$CP" "$R"
+
+# The box name at a token boundary: another box's name ending in it is another box, and a roster
+# that names no mac-studio has no mac-studio default to check the prompts against.
+slots_tree
+slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo not-mac-studio=$WANT/"
+expect "a box whose name merely ends in mac-studio is another box" 1 "$WORKER: SLOTS assignment states no 'mac-studio=<n>' default" -- "$CP" "$R"
+
+# The shell keeps the LAST assignment, so this check reads that one: reading the first would
+# report a default a later line replaced, and the later line is skipped as an assignment.
+slots_tree
+printf 'SLOTS=mac-studio=%s\n' "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "a later SLOTS assignment is the default the prompts are held to" \
+  || ko "a later SLOTS assignment is the default the prompts are held to (rc=$rc) -- $out"
+
+# The default is the assignment's VALUE: prose on the line cannot stand in for a default the
+# script no longer has.
+slots_tree
+slots_edit "$WORKER" 's/^SLOTS=.*/SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-}" # old mac-studio=6/'
+expect "a default left only in a trailing comment is no default" 1 "$WORKER: SLOTS assignment states no 'mac-studio=<n>' default" -- "$CP" "$R"
+# ...and the default token is bounded at BOTH ends: a count the worker would reject is not a
+# default of the digits it starts with, and the assignment scan would not catch it as prose.
+slots_tree
+slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo mac-studio=${WANT}oops/"
+expect "a malformed default is no default" 1 "$WORKER: SLOTS assignment states 'mac-studio=${WANT}oops'" -- "$CP" "$R"
+# The value is read as the shell takes it, so a pair list with another box first still defaults.
+slots_tree
+slots_edit "$WORKER" "s|^SLOTS=.*|SLOTS=\"\${FLEET_BOX_CORRECTNESS_SLOTS-testbox=2 mac-studio=$WANT}\"|"
+expect "a default behind another box's pair is still the default" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# The box name ends at a token boundary, and the count is the whole numeral PHRASE before the
+# sentence, not a number word standing inside it. Each of these states something other than the
+# default; a suffix rule reads them as `six`, `six` and a count of `done`.
+slots_tree
+slots_edit README.md 's/([a-z]* on$/(six on/;s/^mac-studio)/mac-studio-pro)/'
+expect "a count about a box whose name starts with mac-studio is not this one's" 1 'README.md: states no mac-studio slot count' -- "$CP" "$R"
+
+slots_tree
+slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(twenty six on mac-studio/'
+expect "a numeral phrase is read whole, spaces and all" 1 "native-claude.md: spells the mac-studio slot count 'twenty six'" -- "$CP" "$R"
+
+# A word carrying punctuation ends the phrase rather than joining it: the `one.` closing a
+# sentence is not part of the `Six` opening the next.
+slots_tree
+slots_edit issue-wave/SKILL.md 's/([a-z]* on mac-studio/(the WSL boxes have one. Six on mac-studio/'
+expect "a numeral across a sentence boundary does not join the phrase" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# A blank the shell does not split on does not end the assignment word either.
+slots_tree
+printf '%s\n' 'export FLEET_BOX_CORRECTNESS_SLOTS=testbox=2\ mac-studio=2' >> "$R/$WORKER"
+expect "an override whose blank is escaped states no default" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# A heredoc body is data the script writes, not code it runs -- this one hands workers their
+# briefs, and the assignment scan would not catch a `SLOTS=` line inside one as prose either.
+slots_tree
+printf ": <<'HD'\nSLOTS=mac-studio=%s\nHD\n" "$OTHER" >> "$R/$WORKER"
+expect "a SLOTS line inside a heredoc assigns nothing" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# Prose written in the SHAPE of an assignment, inside a comment, is still prose -- and
+# fleet-worker.sh's header is one of the declarations this check exists to hold in sync, so
+# excusing it there would defeat the check on the file it was built around.
+slots_tree
+slots_edit "$WORKER" "s/^#     box (ludics-lite#157); an unnamed box has one. .mac-studio=$WANT./#     box (ludics-lite#157); an unnamed box has one. FLEET_BOX_CORRECTNESS_SLOTS=mac-studio=$OTHER/"
+expect "a count in a comment is held even when it is spelled as an assignment" 1 "$WORKER: states 'mac-studio=$OTHER'" -- "$CP" "$R"
+slots_tree
+printf '# was: SLOTS=mac-studio=%s\n' "$OTHER" >> "$R/$WORKER"
+expect "...and a commented-out assignment is a statement, not a setting" 1 "$WORKER: states 'mac-studio=$OTHER'" -- "$CP" "$R"
+# The other side of that reading: a real assignment keeps its quoted value, which is part of it.
+slots_tree
+printf '\n    FLEET_BOX_CORRECTNESS_SLOTS="rog-nv-wsl=3 mac-studio=2" fleet-worker.sh ls\n' \
+  >> "$R/issue-wave/references/executions.md"
+expect "a quoted override is still an input, not a statement" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# A heredoc-like operator inside quotes opens no body either -- the other half of "what the shell
+# would execute", and the same skip-to-EOF failure if it were queued.
+slots_tree
+printf "printf %%s '<<IGNORED'\nSLOTS=mac-studio=%s\n" "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "a heredoc-like string in quotes hides nothing after it" \
+  || ko "a heredoc-like string in quotes hides nothing after it (rc=$rc) -- $out"
+
+# A separator after an assignment-only command is not another command: the assignment persists.
+slots_tree
+printf 'SLOTS=mac-studio=%s ; export SLOTS\n' "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "an assignment before a separator is still the default" \
+  || ko "an assignment before a separator is still the default (rc=$rc) -- $out"
+
+# The box name is matched in lowercase, so a mention that shouts is the same mention.
+slots_tree
+printf '\nThe roster sets MAC-STUDIO=%s for the Mac.\n' "$WANT" >> "$R/README.md"
+expect "a mention in capitals is the same statement" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+slots_tree
+printf '\nThe roster sets MAC-STUDIO=%s for the Mac.\n' "$OTHER" >> "$R/README.md"
+expect "...and a stale one in capitals is refused as written" 1 "README.md: states 'MAC-STUDIO=$OTHER'" -- "$CP" "$R"
+
+# An assignment standing in front of a command is scoped to that command: the shell variable keeps
+# its old value, so the default does not move.
+slots_tree
+printf 'SLOTS=mac-studio=%s true\n' "$OTHER" >> "$R/$WORKER"
+expect "a command-prefix assignment sets no default" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# A heredoc named in a comment opens no body -- and queueing one would skip the rest of the file
+# as data, hiding every assignment after it.
+slots_tree
+printf '# example: cat <<IGNORED\nSLOTS=mac-studio=%s\n' "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "a heredoc named in a comment hides nothing after it" \
+  || ko "a heredoc named in a comment hides nothing after it (rc=$rc) -- $out"
+
+# The scale words English joins with `and` are numerals too, so the phrase is read whole.
+slots_tree
+slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(one thousand and six on mac-studio/'
+expect "a scale word is part of the numeral, not a stop" 1 "native-claude.md: spells the mac-studio slot count 'one thousand and six'" -- "$CP" "$R"
+
+# The positivity rule judges the VALUE, so it sees through a leading zero.
+slots_tree
+slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo mac-studio=00/"
+expect "a zero written with a leading zero is still zero" 1 "$WORKER: SLOTS assignment states mac-studio=0" -- "$CP" "$R"
+
+# `and` joins a numeral phrase, and only between two numerals: the phrase is the count, while a
+# bare `and` before it leaves the run where it was.
+slots_tree
+slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(one hundred and six on mac-studio/'
+expect "a numeral phrase joined by 'and' is read whole" 1 "native-claude.md: spells the mac-studio slot count 'one hundred and six'" -- "$CP" "$R"
+slots_tree
+slots_edit issue-wave/references/native-claude.md "s/([a-z]* on mac-studio/(a slot and $(sed -n 's/.*(\([a-z]*\) on mac-studio.*/\1/p' "$SRC/issue-wave/references/native-claude.md" | head -1) on mac-studio/"
+expect "...while a bare 'and' before it joins nothing" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# The box-name boundary is the same on the far side of the name: `mac-studio_backup` is another box.
+slots_tree
+slots_edit README.md 's/([a-z]* on$/(six on/;s/^mac-studio)/mac-studio_backup)/'
+expect "a count about mac-studio_backup is not this box's either" 1 'README.md: states no mac-studio slot count' -- "$CP" "$R"
+
+# A heredoc delimiter is a word, not a shell identifier -- and a here-STRING is not a heredoc.
+slots_tree
+printf ': <<123\nSLOTS=mac-studio=%s\n123\n' "$OTHER" >> "$R/$WORKER"
+expect "a heredoc delimited by digits is still a heredoc" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+slots_tree
+printf 'read -r -a pairs <<<"$SLOTS"\nSLOTS=mac-studio=%s\n' "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "...and a here-string opens no body for the next line to hide in" \
+  || ko "...and a here-string opens no body for the next line to hide in (rc=$rc) -- $out"
+
+# A box name may hold `_` and `.` as well as `-`, so the boundary before the name is "a character
+# a box name could hold": `not_mac-studio` is another box, and the roster then names no mac-studio.
+slots_tree
+slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo not_mac-studio=$WANT/"
+expect "a box name ending in mac-studio after an underscore is another box" 1 "$WORKER: SLOTS assignment states no 'mac-studio=<n>' default" -- "$CP" "$R"
+
+# Defining a function is not running it: an assignment in a body sets nothing until something
+# calls it. The control matters as much -- past the body, the script is top level again.
+slots_tree
+printf 'unused_helper() {\nSLOTS=mac-studio=%s\n}\n' "$OTHER" >> "$R/$WORKER"
+expect "an assignment inside a function body is not the default" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+slots_tree
+printf 'unused_helper() {\nx=1\n}\nSLOTS=mac-studio=%s\n' "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "...and one after the body closes is" \
+  || ko "...and one after the body closes is (rc=$rc) -- $out"
+
+# A heredoc delimiter may be quoted with a backslash as well as with quotes.
+slots_tree
+printf 'cat <<\\HD\nSLOTS=mac-studio=%s\nHD\n' "$OTHER" >> "$R/$WORKER"
+expect "...however the heredoc delimiter is quoted" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# An assignment word may be continued onto the next line -- by a trailing backslash, or by a quote
+# still open. The shell reads one word; so does this check, because the mask spans the joined text.
+slots_tree
+printf '\n    FLEET_BOX_CORRECTNESS_SLOTS="rog-nv-wsl=3 \\\n      mac-studio=2" fleet-worker.sh ls\n' \
+  >> "$R/issue-wave/references/executions.md"
+expect "an override continued onto the next line is still one assignment" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# The positive-count rule is the worker's, and it applies to every pair it reads, not just this
+# box's: the spec is refused before the mac-studio entry can be used.
+slots_tree
+slots_edit "$WORKER" 's|^SLOTS=.*|SLOTS="rog-nv-wsl=0 mac-studio=6"|'
+expect "a zero count for another box refuses the spec too" 1 "$WORKER: SLOTS assignment states 'rog-nv-wsl=0'" -- "$CP" "$R"
+
+# The count is a NUMBER: `06` is the six the worker reads, on either side of the comparison.
+slots_tree
+slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo mac-studio=0$WANT/"
+expect "a default written with a leading zero still spells its number" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+slots_tree
+slots_edit issue-wave/references/executions.md "s/mac-studio=$WANT/mac-studio=0$WANT/"
+expect "...and so does a prompt that writes one" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# One command may declare several heredocs, and their bodies follow in order.
+slots_tree
+printf 'cat <<A <<B\nfirst\nA\nSLOTS=mac-studio=%s\nB\n' "$OTHER" >> "$R/$WORKER"
+expect "a body behind a second delimiter on one line is still a body" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+# The control the queue needs: once a body ends, the script is code again.
+slots_tree
+printf 'cat <<A\nx\nA\nSLOTS=mac-studio=%s\n' "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "...and an assignment after the terminator is executed again" \
+  || ko "...and an assignment after the terminator is executed again (rc=$rc) -- $out"
+
+# A LITERAL pair list is what the worker splits and validates in order, so a malformed pair
+# anywhere in one refuses the spec -- the mac-studio entry behind it would never be reached.
+slots_tree
+slots_edit "$WORKER" 's|^SLOTS=.*|SLOTS="rog-nv-wsl=oops mac-studio=6"|'
+expect "another box's malformed pair refuses the whole spec" 1 "$WORKER: SLOTS assignment states 'rog-nv-wsl=oops'" -- "$CP" "$R"
+slots_tree
+slots_edit "$WORKER" "s|^SLOTS=.*|SLOTS=\"rog-nv-wsl=1 mac-studio=$WANT\"|"
+expect "...while a list whose pairs are all valid still defaults" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# Every mac-studio pair in the value is validated, not just the last recognizable one: the worker
+# refuses the whole spec on the first malformed pair, so a good duplicate behind it is unreachable.
+slots_tree
+slots_edit "$WORKER" 's|^SLOTS=.*|SLOTS="mac-studio=oops mac-studio=6"|'
+expect "a malformed pair is refused even with a valid one behind it" 1 "$WORKER: SLOTS assignment states 'mac-studio=oops'" -- "$CP" "$R"
+# ...and where every pair is valid, the last one for the box is the default, as the registry keeps.
+slots_tree
+slots_edit "$WORKER" "s|^SLOTS=.*|SLOTS=\"mac-studio=$OTHER mac-studio=$WANT\"|"
+expect "a box named twice takes its last count" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# The worker's own grammar: `box_correctness_slots` refuses a count below one, so a zero default
+# is a roster every mac-studio slot call dies on rather than a count the prompts could agree with.
+slots_tree
+slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo mac-studio=0/"
+expect "a zero default is refused, not agreed with" 1 "$WORKER: SLOTS assignment states mac-studio=0" -- "$CP" "$R"
+
+# An assignment of the variable is an input, not a claim about the default -- a fixture that
+# configures a two-slot box says nothing about what an unconfigured box gets.
+slots_tree
+printf '%s\n' "FLEET_BOX_CORRECTNESS_SLOTS=mac-studio=2 $WORKER execution slot -- true" >> "$R/$WORKER"
+expect "an override in front of a command states no default" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+slots_tree
+printf '%s\n' 'export FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=2"' >> "$R/$WORKER"
+expect "...and a quoted override states none either" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+# The variable takes `<box>=<n>` PAIRS, so another box may legitimately stand first: what makes a
+# mention an assignment is standing inside the assignment word, not what the characters before it
+# happen to spell.
+slots_tree
+printf '%s\n' 'export FLEET_BOX_CORRECTNESS_SLOTS="testbox=2 mac-studio=2"' >> "$R/$WORKER"
+expect "...and one behind another box's pair states none either" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+slots_tree
+printf '\n    FLEET_BOX_CORRECTNESS_SLOTS="rog-nv-wsl=3 mac-studio=2" fleet-worker.sh ls\n' \
+  >> "$R/issue-wave/references/executions.md"
+expect "...and so does one in a document's example command" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+# Positionally, though: prose after an assignment on the same line is still prose.
+slots_tree
+printf '\nRun FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=2" to halve it; mac-studio=%s is not the default.\n' \
+  "$OTHER" >> "$R/README.md"
+expect "a count beside an assignment on one line is still judged" 1 "README.md: states 'mac-studio=$OTHER'" -- "$CP" "$R"
+
+# A path with a space in it used to split into words, and a read of a nonexistent path increments
+# nothing: the file was skipped silently, under a clean pass.
+slots_tree
+printf 'notes\n\nmac-studio=%s slots.\n' "$OTHER" > "$R/issue-wave/references/old notes.md"
+expect "a discovered path with a space is scanned, not split" 1 "old notes.md: states 'mac-studio=$OTHER'" -- "$CP" "$R"
+
+# The root is read the same spelled with a trailing slash: a `<dir>//` prefix matched none of the
+# scan's paths, which emptied it and then reported the required prompts as silent.
+slots_tree
+expect "a root spelled with a trailing slash reads the same" 0 'mac-studio correctness slots agree' -- "$CP" "$R/"
+
+# A prompt that stops stating the count is how the agreement would quietly stop being checked.
+slots_tree
+slots_edit README.md 's/([a-z]* on$/(as configured on/'
+expect "a prompt that drops the count is refused" 1 'README.md: states no mac-studio slot count' -- "$CP" "$R"
+
+# The obligation comes from the script, as the fixtures' comes from a fixture.
+fresh "$R"
+out=$("$CP" "$R" 2>&1)
+grep -q 'mac-studio' <<<"$out" && ko "a root without $WORKER is held to a slot count" \
+  || ok "...and a root without $WORKER carries no slot obligation"
+
 # --- this checkout ---------------------------------------------------------------------------
 expect "this checkout's prompts pass" 0 '0 failed' -- "$CP"
 
