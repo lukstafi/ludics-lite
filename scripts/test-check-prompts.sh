@@ -558,6 +558,44 @@ slots_tree
 slots_edit "$WORKER" "s|^SLOTS=.*|SLOTS=\"\${FLEET_BOX_CORRECTNESS_SLOTS-testbox=2 mac-studio=$WANT}\"|"
 expect "a default behind another box's pair is still the default" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
+# The box name ends at a token boundary, and the count is the whole numeral PHRASE before the
+# sentence, not a number word standing inside it. Each of these states something other than the
+# default; a suffix rule reads them as `six`, `six` and a count of `done`.
+slots_tree
+slots_edit README.md 's/([a-z]* on$/(six on/;s/^mac-studio)/mac-studio-pro)/'
+expect "a count about a box whose name starts with mac-studio is not this one's" 1 'README.md: states no mac-studio slot count' -- "$CP" "$R"
+
+slots_tree
+slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(twenty six on mac-studio/'
+expect "a numeral phrase is read whole, spaces and all" 1 "native-claude.md: spells the mac-studio slot count 'twenty six'" -- "$CP" "$R"
+
+slots_tree
+slots_edit issue-wave/references/executions.md 's/[A-Z][a-z]*, not /Twenty six, not /'
+expect "...and so is the one opening a justification" 1 "executions.md: spells the mac-studio slot count 'twenty six'" -- "$CP" "$R"
+
+# A word carrying punctuation ends the phrase rather than joining it: the `one.` closing a
+# sentence is not part of the `Six` opening the next.
+slots_tree
+slots_edit issue-wave/SKILL.md 's/([a-z]* on mac-studio/(the WSL boxes have one. Six on mac-studio/'
+expect "a numeral across a sentence boundary does not join the phrase" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# A blank the shell does not split on does not end the assignment word either.
+slots_tree
+printf '%s\n' 'export FLEET_BOX_CORRECTNESS_SLOTS=testbox=2\ mac-studio=2' >> "$R/$WORKER"
+expect "an override whose blank is escaped states no default" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# A heredoc body is data the script writes, not code it runs -- this one hands workers their
+# briefs, and the assignment scan would not catch a `SLOTS=` line inside one as prose either.
+slots_tree
+printf ": <<'HD'\nSLOTS=mac-studio=%s\nHD\n" "$OTHER" >> "$R/$WORKER"
+expect "a SLOTS line inside a heredoc assigns nothing" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# The worker's own grammar: `box_correctness_slots` refuses a count below one, so a zero default
+# is a roster every mac-studio slot call dies on rather than a count the prompts could agree with.
+slots_tree
+slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo mac-studio=0/"
+expect "a zero default is refused, not agreed with" 1 "$WORKER: SLOTS assignment states mac-studio=0" -- "$CP" "$R"
+
 # An assignment of the variable is an input, not a claim about the default -- a fixture that
 # configures a two-slot box says nothing about what an unconfigured box gets.
 slots_tree

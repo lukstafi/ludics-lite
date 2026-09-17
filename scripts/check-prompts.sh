@@ -376,10 +376,11 @@ check_fixtures() {
 # WHAT counts as a statement is three shapes, which are the three the prose uses -- `mac-studio=<n>`
 # (the whole token, so a malformed `mac-studio=6oops` is refused rather than accepted on its
 # prefix), the number word in `<n> on mac-studio`, and the word opening the `<N>, not <m>`
-# justification. The word forms match the WHOLE word and then ask whether it is a numeral, rather
-# than matching a number word inside one: `twenty-six on mac-studio` and `thirteen on mac-studio`
-# both state a count and are refused, while `done on mac-studio` states none and is passed over --
-# a suffix rule reads the first as `six`, the second as nothing at all, and the third as `done`.
+# justification. The word forms find the PHRASE -- `on mac-studio` at a token boundary, or `, not`
+# -- and read the count as the run of numeral words standing before it: `twenty-six`, `twenty six`
+# and `thirteen` are each the whole count they state and are refused, while `done on mac-studio`
+# and `six on mac-studio-pro` state none. Matching a number word instead reads the first as `six`,
+# the third as nothing at all, and `done` as a count.
 # A numeral is a word, or hyphenated words, from $NUMERALS. Text INSIDE an assignment of the
 # variable is skipped: a fixture configuring a two-slot box states its own input and claims nothing
 # about the default. Which text that is, is answered structurally rather than by looking back a
@@ -429,8 +430,8 @@ slot_files() {
 slot_mentions() {
   local q="'"
   RE_DIGIT="[^a-z0-9-]mac-studio=[^[:space:]\`\"$q),;]*" \
-  RE_WORD="[^a-z0-9][a-z][a-z-]*[[:space:]]+on[[:space:]]+mac-studio" \
-  RE_NOT="[^a-z0-9][a-z][a-z-]*, not[[:space:]]+[a-z][a-z-]*[^a-z0-9]" \
+  RE_WORD="[[:space:]]on[[:space:]]+mac-studio([^a-z0-9-]|$)" \
+  RE_NOT=", not[[:space:]]+" \
   NUMERALS="$(printf '%s' " $NUMERALS " | tr -s '[:space:]' ' ')" \
   CTX="$SLOT_CONTEXT" awk "$SLOT_AWK_LIB"'
     # Each line is joined into one text, and masked alongside it: `a` marks a character inside an
@@ -467,16 +468,18 @@ slot_mentions() {
         # `6.`, `6:` state six. A suffix that is not punctuation still makes the value malformed.
         sub(/[^A-Za-z0-9]+$/, "", n)
       } else {
-        # The whole word, hyphens and all -- and then: is it a count at all? `twenty-six` is not
-        # the `six` it ends with, and `done on mac-studio` states nothing.
-        n = tolower(frag); sub(/^[^a-z]+/, "", n); sub(/[^a-z-].*$/, "", n); sub(/-+$/, "", n)
-        if (!numeral(n)) return
+        # The count is the RUN of numeral words standing before the phrase, read backwards: not a
+        # number word found inside the text before it. `twenty-six`, `twenty six` and `six` are
+        # each the whole count they state; `done on mac-studio` and `boxes. Six` state none here.
+        n = numerals_before(at)
+        if (n == "") return
         if (kind == "not") {         # only inside slot prose: see the header above
-          if (!numeral(second(frag))) return
+          if (numerals_after(at + len - 1) == "") return
           from = at - ctx; if (from < 1) from = 1
           window = substr(lower, from, len + 2 * ctx)
           if (index(window, "slot") == 0) return
         }
+        frag = n " " frag           # report the count with the phrase that carried it
       }
       sub(/^[^A-Za-z0-9]+/, "", frag); sub(/[^A-Za-z0-9]+$/, "", frag)
       print kind "\t" n "\t" frag
@@ -504,18 +507,42 @@ slot_mentions() {
         if (index(ENVIRON["NUMERALS"], " " parts[i] " ") == 0) return 0
       return 1
     }
-    # second <fragment>: the word after ", not " in a justification match.
-    function second(f,   rest) {
-      rest = tolower(f); sub(/^.*, not[[:space:]]+/, "", rest)
-      sub(/[^a-z-].*$/, "", rest); sub(/-+$/, "", rest)
-      return rest
+    # numerals_before <at>: the maximal run of numeral words ending just before <at>, in order and
+    # separated by single blanks, or empty when the word there is not a numeral. A word carrying
+    # trailing punctuation ENDS the run without joining it, so the `one.` closing a sentence does
+    # not join the `Six` opening the next.
+    function numerals_before(at,   from, w, k, i, word, run) {
+      from = at - 90; if (from < 1) from = 1
+      k = split(substr(lower, from, at - from), w, /[[:space:]]+/)
+      run = ""
+      for (i = k; i >= 1; i--) {
+        word = w[i]; sub(/^[^a-z]+/, "", word)
+        if (word !~ /^[a-z][a-z-]*$/ || !numeral(word)) break
+        run = (run == "") ? word : word " " run
+      }
+      return run
+    }
+    # numerals_after <at>: the same run, read forwards from just after <at>. Punctuation ends the
+    # run here too, but on the word that CARRIES it -- `three,` is the three, and what follows the
+    # comma is another clause.
+    function numerals_after(at,   w, k, i, word, tail, run) {
+      k = split(substr(lower, at + 1, 90), w, /[[:space:]]+/)
+      run = ""
+      for (i = 1; i <= k; i++) {
+        word = w[i]; sub(/^[^a-z]+/, "", word)
+        tail = (word ~ /[^a-z-]$/); sub(/[^a-z-]+$/, "", word)
+        if (word !~ /^[a-z][a-z-]*$/ || !numeral(word)) break
+        run = (run == "") ? word : run " " word
+        if (tail) break
+      }
+      return run
     }
   ' "$1"
 }
 
 # Shared by both readers below, so "where does the assigned value end" has one answer. A shell
-# word ends at the first UNQUOTED blank, which is why `SLOTS="testbox=2 mac-studio=6"` is one word
-# and not two: the blank between the pairs stands inside the quotes.
+# word ends at the first UNQUOTED, UNESCAPED blank, which is why `SLOTS="testbox=2 mac-studio=6"`
+# and `SLOTS=testbox=2\ mac-studio=6` are each one word and not two.
 SLOT_AWK_LIB='
   # word_end <line> <from>: index of the last character of the word that starts after <from>.
   function word_end(line, from,   i, c, q) {
@@ -523,6 +550,7 @@ SLOT_AWK_LIB='
     for (i = from + 1; i <= length(line); i++) {
       c = substr(line, i, 1)
       if (q == "") {
+        if (c == "\\") { i++; continue }            # an escaped blank is part of the word
         if (c == "\"" || c == sq) { q = c; continue }
         if (c == " " || c == "\t") break
       } else if (c == q) q = ""
@@ -535,6 +563,7 @@ SLOT_AWK_LIB='
     for (i = 1; i <= length(s); i++) {
       c = substr(s, i, 1)
       if (q == "") {
+        if (c == "\\") { out = out substr(s, ++i, 1); continue }   # the character, not the escape
         if (c == "\"" || c == sq) { q = c; continue }
       } else if (c == q) { q = ""; continue }
       out = out c
@@ -546,6 +575,20 @@ SLOT_AWK_LIB='
 # slot_default <file>: the `mac-studio=<n>` default inside the value assigned to SLOTS, or empty.
 slot_default() {
   awk "$SLOT_AWK_LIB"'
+    # A heredoc body is data the script WRITES, not code it runs: this one hands workers their
+    # briefs, and a column-zero `SLOTS=` inside one assigns nothing. Bodies are skipped whole.
+    BEGIN { hd = "<<-?[[:space:]]*[\"" sprintf("%c", 39) "]?[A-Za-z_][A-Za-z0-9_]*" }
+    delim != "" {
+      line = $0; if (dash) sub(/^\t+/, "", line)
+      if (line == delim) delim = ""
+      next
+    }
+    match($0, hd) {
+      tag = substr($0, RSTART, RLENGTH)
+      dash = (substr(tag, 3, 1) == "-")
+      sub(/^<<-?[[:space:]]*/, "", tag); gsub(/["'"'"']/, "", tag)
+      delim = tag
+    }
     # The LAST top-level assignment, which is the one the shell is left holding -- reading the
     # first would report a default a later line has replaced (and `slot_mentions` skips that line
     # as an assignment, so nothing else would catch it either).
@@ -580,6 +623,9 @@ check_slots() {
   default=$(slot_default "$ROOT/$SLOT_SCRIPT")
   case "$default" in
     *[!0-9]* | '') ko "$SLOT_SCRIPT" "SLOTS assignment states no 'mac-studio=<n>' default"; return 0 ;;
+    # The worker's own grammar: `box_correctness_slots` refuses a pair whose count is below one,
+    # so a zero default is a roster every mac-studio slot call dies on, not a count to agree with.
+    0) ko "$SLOT_SCRIPT" "SLOTS assignment states mac-studio=0; the worker requires <box>=<positive n>"; return 0 ;;
   esac
   # An unspellable default (past twelve) leaves the word forms unmatchable rather than unchecked:
   # any number word then mismatches and says what the script actually pins.
