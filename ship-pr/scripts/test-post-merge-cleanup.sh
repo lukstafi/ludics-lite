@@ -680,6 +680,78 @@ test_session_ignored_symlink_refusal() {
   echo "PASS: an ignored symlink is refused even when its target matches the base checkout"
 }
 
+# Neither exemption may follow a symbolic link, and neither may be decided by how Git RENDERS a
+# path (review round 1 on ludics-lite#210). These three fail against round 1's gate.
+test_session_bare_claude_entry_refusal() {
+  local refusal
+  # `.claude` as a regular file is not the harness directory, and Git reports it as `!! .claude`.
+  setup_case bare-claude-file merge main-off
+  echo '.claude' >>"$CASE_MAIN/.git/info/exclude"
+  echo irreplaceable >"$CASE_SESSION/.claude"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored regular file named .claude was accepted for destructive cleanup"
+  fi
+  case "$refusal" in
+  *".claude"*) ;;
+  *) fail "the refusal did not name the bare .claude path: $refusal" ;;
+  esac
+  assert_eq "$(cat "$CASE_SESSION/.claude")" irreplaceable \
+    "a bare .claude file must survive refused cleanup"
+  assert_topic_preserved
+
+  # And as a symlink, whose target cleanup would leave behind entirely.
+  setup_case bare-claude-symlink merge main-off
+  echo '.claude' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_ROOT/elsewhere"
+  ln -s "$(cd "$CASE_ROOT" && pwd -P)/elsewhere" "$CASE_SESSION/.claude"
+  if "$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic >/dev/null 2>&1; then
+    fail "an ignored symlink named .claude was accepted for destructive cleanup"
+  fi
+  assert_topic_preserved
+  echo "PASS: an ignored .claude that is not a directory keeps its refusal"
+}
+
+test_session_ignored_symlinked_base_ancestor_refusal() {
+  local refusal
+  # The base checkout reaches the comparison path through a symlinked ancestor, so its "copy" is a
+  # file outside the checkout: the session file has no in-tree counterpart and must be refused.
+  setup_case symlinked-base-ancestor merge main-off
+  echo 'cache/config' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_ROOT/outside"
+  echo 'shared bytes' >"$CASE_ROOT/outside/config"
+  ln -s "$(cd "$CASE_ROOT" && pwd -P)/outside" "$CASE_MAIN/cache"
+  mkdir -p "$CASE_SESSION/cache"
+  echo 'shared bytes' >"$CASE_SESSION/cache/config"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored file cleared through a symlinked base ancestor was accepted for cleanup"
+  fi
+  case "$refusal" in
+  *"cache/config"*) ;;
+  *) fail "the refusal did not name the path it tripped on: $refusal" ;;
+  esac
+  assert_eq "$(cat "$CASE_SESSION/cache/config")" 'shared bytes' \
+    "the session's ignored file must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: a symlinked ancestor in the base checkout is not a base-checkout copy"
+}
+
+test_session_ignored_quoted_path_passes() {
+  local name='copied config.coné'
+  # Porcelain v1 C-quotes this name (whitespace, and non-ASCII under the default core.quotePath),
+  # so a gate that read the rendering would refuse a file it is supposed to clear.
+  setup_case quoted-ignored-session merge main-off
+  printf '%s\n' "$name" >>"$CASE_MAIN/.git/info/exclude"
+  echo 'copied at worktree creation' >"$CASE_MAIN/$name"
+  cp "$CASE_MAIN/$name" "$CASE_SESSION/$name"
+  case "$(git -C "$CASE_SESSION" status --porcelain --ignored=matching)" in
+  '!! "'*) ;;
+  *) fail "the fixture must produce a C-quoted porcelain path" ;;
+  esac
+  "$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic >/dev/null
+  assert_cleaned
+  echo "PASS: a C-quoted ignored path identical to the base checkout's copy passes the session gate"
+}
+
 test_master_reservation() {
   local fake_bin real_git candidate remote_master checkout_status
   setup_case master-owner-switch merge other
@@ -3878,6 +3950,9 @@ TESTS=(
   test_session_ignored_identical_to_base_passes
   test_session_ignored_differing_from_base_refusal
   test_session_ignored_symlink_refusal
+  test_session_bare_claude_entry_refusal
+  test_session_ignored_symlinked_base_ancestor_refusal
+  test_session_ignored_quoted_path_passes
   test_master_reservation
   test_unowned_master_reservation
   test_concurrent_master_edit_refusal
