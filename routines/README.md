@@ -160,7 +160,9 @@ away without CI saying so.
 
 Status mode compares the installed copies with the checkout, not with `origin/main`: a checkout
 behind the remote reports `in sync` while the installed prompt is older than what merged. That is
-why both prompts read `git status -sb` beside the verdict, and why the push recipe pulls first.
+why both prompts count `HEAD...origin/main` beside the verdict — against that ref by name, since
+the checkout may sit on a topic branch whose own tracking state says nothing about `main` — and why
+the push recipe pulls first.
 
 ## The cloud routine: synced by hand
 

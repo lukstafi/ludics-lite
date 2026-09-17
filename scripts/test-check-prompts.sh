@@ -890,6 +890,8 @@ a commented-out invocation|# \2
 an invocation commented out with no space|#\2
 the path as another command's argument|echo \2
 ...and as cat's|cat \2
+the path assigned to a variable|DRIFT_COMMAND=\2
+...and assigned with export|export DRIFT_COMMAND=\2
 EOF
 
 # Which prompts are held is read off the script, so a name added to LOCAL_ROUTINES arrives obliged
