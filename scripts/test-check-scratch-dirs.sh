@@ -57,7 +57,7 @@ probe() {
 }
 
 CLEAN='every mktemp -d is resolved or rooted in a resolved path'
-REFUSAL='without being resolved physically'
+REFUSAL='is not its resolution'
 
 # --- the shapes that must pass ------------------------------------------------------------------
 
@@ -68,26 +68,24 @@ mkdir -p "$TMP/bin"
 EOF
 expect "the house idiom passes" 0 "$CLEAN" -- "$CS" "$TMP/safe_idiom.sh"
 
-# A trap body runs at exit, after every resolution in the file, so it is not a use: two of the
-# three suites that already do this right register their cleanup between the mktemp and the
-# resolution.
-probe safe_trap_first <<'EOF'
+# The resolution is the NEXT command, so the cleanup trap goes under it -- which is also the only
+# order in which the trap's own body is the resolved path, should anyone ever write it unquoted.
+probe safe_trap_after <<'EOF'
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
 trap 'rm -rf "$TMP"' EXIT
-TMP=$(cd "$TMP" && pwd -P) || exit 1
 echo "$TMP"
 EOF
-expect "a trap between the mktemp and the resolution is not a use" 0 "$CLEAN" -- \
-  "$CS" "$TMP/safe_trap_first.sh"
+expect "the cleanup trap goes under the resolution" 0 "$CLEAN" -- "$CS" "$TMP/safe_trap_after.sh"
 
-# The comment explaining the resolution names the variable, directly above the resolution.
+# A comment is not a command, so the explanation still fits between the two lines.
 probe safe_comment <<'EOF'
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
 # An unresolved $TMP here and the script's idea of the same directory are spelled differently.
 TMP=$(cd "$TMP" && pwd -P) || exit 1
 echo "$TMP"
 EOF
-expect "a comment naming the variable is not a use" 0 "$CLEAN" -- "$CS" "$TMP/safe_comment.sh"
+expect "a comment between the two lines is not a command" 0 "$CLEAN" -- "$CS" "$TMP/safe_comment.sh"
 
 # A child of a physical path is physical, so a template rooted in an already-resolved variable
 # needs nothing further. This is post-merge-cleanup.sh's shape.
@@ -364,6 +362,31 @@ EOF
 expect "an escaped substitution in probe source is not a call here" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_escaped_probe_source.sh"
 
+# Round 8, the false-refusal half: a multiline subshell, a `||` failure handler inside the
+# capture, and a `#` comment opened right after a separator.
+probe safe_subshell_and_handler <<'EOF'
+(
+  TMP=$(mktemp -d /tmp/probe.XXXXXX || exit 1) || exit 1
+  TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
+  echo "$TMP"
+)
+echo done;# an example, not a call: mktemp -d /tmp/probe.XXXXXX
+EOF
+expect "a subshell, a || handler inside the capture, and a comment after a separator" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_subshell_and_handler.sh"
+
+# A resolved local root certifies its child inside the same function.
+probe safe_local_root <<'EOF'
+work() {
+  local BASE TMP
+  BASE=$(CDPATH= cd /tmp && pwd -P) || return 1
+  TMP=$(mktemp -d "$BASE/probe.XXXXXX") || return 1
+  echo "$TMP"
+}
+EOF
+expect "a resolved local root certifies its child in the same function" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_local_root.sh"
+
 # --- the shapes that must be refused --------------------------------------------------------
 
 probe bad_tmpdir <<'EOF'
@@ -392,7 +415,7 @@ TMP=$(cd "$TMP" && pwd -P) || exit 1
 EOF
 expect "a resolution after the first use is refused" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_late_resolution.sh"
-expect "...and the refusal names the line that used it" 1 "used at line 2" -- \
+expect "...and the refusal names the line that should have resolved it" 1 "at line 2, is not its resolution" -- \
   "$CS" "$TMP/bad_late_resolution.sh"
 
 # `pwd` alone answers with the logical path, $PWD, which on macOS is the very /var spelling the
@@ -424,7 +447,7 @@ expect "a mktemp -d whose result is not captured is refused" 1 'not captured in 
 probe bad_unused <<'EOF'
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
 EOF
-expect "a mktemp -d that is never used and never resolved is refused" 1 'never used and never resolved' -- \
+expect "a mktemp -d with nothing after it is refused" 1 'with nothing after it' -- \
   "$CS" "$TMP/bad_unused.sh"
 
 # Round 1: the common `$(mktemp -d)` takes no template at all. A rule that demanded whitespace
@@ -755,6 +778,51 @@ EOF
 expect "an unset before the resolution is a use" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_unset_before_resolution.sh"
 
+# Round 8: what adjacency buys. A resolution in the sibling `else` arm has the same function and
+# the same numeric depth as the allocation, so depth alone could not tell them apart -- and it
+# cannot run on the path that made the directory.
+probe bad_else_arm_resolution <<'EOF'
+if [ -n "${WANT:-}" ]; then
+  TMP=$(mktemp -d "${TMPDIR:-/tmp}/probe.XXXXXX") || exit 1
+else
+  TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
+fi
+echo "$TMP"
+EOF
+expect "a resolution in the sibling else arm is not the next command" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_else_arm_resolution.sh"
+
+# ...and a plain reassignment between them, which mentions nothing and so was invisible to a
+# use-scan, is simply not the resolution.
+probe bad_reassignment_between <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/probe.XXXXXX") || exit 1
+TMP=/tmp
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
+EOF
+expect "a reassignment between the two lines is not the resolution" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_reassignment_between.sh"
+
+# Round 8: a delimiter is a whole word. Truncating it left a terminator that could never match,
+# and everything after it read as heredoc data -- a clean verdict over an unscanned file.
+probe bad_after_hyphenated_heredoc <<'OUTER'
+usage() {
+  cat <<'USAGE-TEXT'
+usage: thing [--list]
+USAGE-TEXT
+}
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+mkdir -p "$TMP/bin"
+OUTER
+expect "a hyphenated heredoc delimiter does not swallow the rest of the file" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_after_hyphenated_heredoc.sh"
+
+# Round 8: `command mktemp` runs mktemp.
+probe bad_command_wrapper <<'EOF'
+TMP=$(command mktemp -d /tmp/probe.XXXXXX)
+echo "$TMP"
+EOF
+expect "a command-wrapped call is the same call" 1 "$REFUSAL" -- "$CS" "$TMP/bad_command_wrapper.sh"
+
 # --- the default sweep's scope --------------------------------------------------------------
 # With no arguments the guard reads every `*/scripts/*.sh` and `scripts/*.sh` in its checkout.
 # Exercised against scratch checkouts: what has to be pinned is that a file in a scripts
@@ -879,7 +947,7 @@ witness() {
   fi
   # The resolution line and nothing else. A removal that matched nothing would leave a probe
   # asserting a refusal the file earns on its own, which proves nothing about the line.
-  grep -vE '^[A-Za-z_][A-Za-z0-9_]*=\$\(cd "\$[A-Za-z_][A-Za-z0-9_]*" && pwd -P\)' "$ROOT/$rel" >"$src"
+  grep -vE '^[A-Za-z_][A-Za-z0-9_]*=\$\((CDPATH= )?cd "\$[A-Za-z_][A-Za-z0-9_]*" && pwd -P\)' "$ROOT/$rel" >"$src"
   if [ "$(wc -l <"$src")" -eq "$(wc -l <"$ROOT/$rel")" ]; then
     ko "$name: no resolution line was removed, so this witness proves nothing"
     return

@@ -1117,12 +1117,14 @@ start_wsl() {
   # condition restart-wsl exists to clear. The boxes are independent Windows hosts and nothing in
   # the kick is shared, so kick them all at once. Each box's output is buffered and replayed in
   # target order afterwards, so the log still reads box by box rather than interleaved.
-  dir=$(mktemp -d "${TMPDIR:-/tmp}/wake-lab-wsl.XXXXXX") || {
-    echo "wsl $what FAILED: no work directory" >&2; WSL_FAILED="wsl $what FAILED: no work directory"; return 1; }
+  # Both failures say the same thing, so it is written once rather than in two copies that can
+  # drift; and each tail stays on ONE line, which is what keeps the resolution the very next
+  # command after the allocation (ludics-lite#208).
+  local nowork="wsl $what FAILED: no work directory"
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/wake-lab-wsl.XXXXXX") || { echo "$nowork" >&2; WSL_FAILED="$nowork"; return 1; }
   # Physical path, the house idiom: $TMPDIR on macOS is under /var, a symlink to /private/var
   # (ludics-lite#208).
-  dir=$(CDPATH= cd "$dir" && pwd -P) || {
-    echo "wsl $what FAILED: no work directory" >&2; WSL_FAILED="wsl $what FAILED: no work directory"; return 1; }
+  dir=$(CDPATH= cd "$dir" && pwd -P) || { echo "$nowork" >&2; WSL_FAILED="$nowork"; return 1; }
   i=0
   for n in "$@"; do
     i=$((i + 1))

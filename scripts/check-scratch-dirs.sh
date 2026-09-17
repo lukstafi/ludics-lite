@@ -145,10 +145,15 @@ for f in "${files[@]}"; do
       for (i = 1; i <= length(s); i++) {
         ch = substr(s, i, 1)
         if (Q == "") {
-          if (ch == "#" && (out == "" || substr(out, length(out), 1) ~ /[ \t]/)) return out
+          # A `#` opens a comment at the start of a WORD, and a separator ends a word too
+          # (`echo hi;# an example, not a call`, round 8).
+          if (ch == "#" && (out == "" || substr(out, length(out), 1) ~ /[ \t;&|(]/)) return out
           if (ch == "\\") { out = out ch substr(s, i + 1, 1); i++; continue }
           if (ch == "\"" || ch == "'"'"'") Q = ch
-          else if (ch == "(") SUBDEPTH++
+          # Only a COMMAND SUBSTITUTION continues a line. Counting every `(` collapsed a
+          # multiline subshell onto its opening paren, and the logical line then did not begin
+          # with the assignment inside it (round 8).
+          else if (ch == "$" && substr(s, i + 1, 1) == "(") { SUBDEPTH++; out = out ch; i++; ch = "(" }
           else if (ch == ")" && SUBDEPTH > 0) SUBDEPTH--
         } else if (ch == Q) {
           Q = ""
@@ -231,6 +236,19 @@ for f in "${files[@]}"; do
     # (round 2). The component mktemp itself creates cannot be a link, so one level below a
     # physical root is physical and everything deeper has to be resolved on its own. Every
     # inheriting site in this repository is one level down.
+    # Is <v> resolved as seen from line <i>? The enclosing function'"'"'s verdict when that function
+    # assigns the name at all, the top level'"'"'s otherwise.
+    function scope_resolved(i, v,   sc) {
+      if (v == "") return 0
+      sc = ((funcof[i] SUBSEP v) in assigns) ? funcof[i] : ""
+      return ((sc SUBSEP v) in resolved)
+    }
+    # The same question for a name read inside a value, where the scope is passed directly.
+    function name_resolved(v, sc) {
+      if (v == "") return 0
+      if (!((sc SUBSEP v) in assigns)) sc = ""
+      return ((sc SUBSEP v) in resolved)
+    }
     # The plain variable a string opens with, whatever follows it: `$VAR`, `${VAR}`, or "" when it
     # opens with neither. `${TMPDIR:-/tmp}` is deliberately neither -- the name carries a default,
     # so the value is whatever the environment said and nothing resolved it.
@@ -270,8 +288,8 @@ for f in "${files[@]}"; do
     # what finds BOTH calls in `mktemp -d /tmp/a.XXXXXX; mktemp /tmp/b.XXXXXX` -- a scan that
     # looked for the last textual occurrence saw only the second and let the first leak (round 7).
     # Fills CMD[1..NCMD].
-    function commands(s,   i, ch, cur, q, sp, stack) {
-      NCMD = 0; cur = ""; q = ""; sp = 0
+    function commands(s,   i, ch, cur, q, sp, stack, sep) {
+      NCMD = 0; cur = ""; q = ""; sp = 0; sep = ""
       for (i = 1; i <= length(s); i++) {
         ch = substr(s, i, 1)
         # A `$(` opens a command even inside a double-quoted string -- `cd "$(mktemp -d ...)"`
@@ -280,25 +298,30 @@ for f in "${files[@]}"; do
         # to run later, and this guard reads the file in front of it.
         if (ch == "$" && substr(s, i + 1, 1) == "(" && !escaped(s, i)) {
           stack[++sp] = q; q = ""
-          if (cur != "") CMD[++NCMD] = cur
-          cur = ""; i++
+          if (cur != "") { CMD[++NCMD] = cur; SEP[NCMD] = sep }
+          cur = ""; sep = "$("; i++
           continue
         }
         if (ch == ")" && sp > 0 && q == "") {
-          if (cur != "") CMD[++NCMD] = cur
-          cur = ""; q = stack[sp--]
+          if (cur != "") { CMD[++NCMD] = cur; SEP[NCMD] = sep }
+          cur = ""; sep = ")"; q = stack[sp--]
           continue
         }
         if (q != "") { cur = cur ch; if (ch == q) q = ""; continue }
         if (ch == "\"" || ch == "'"'"'") { q = ch; cur = cur ch; continue }
         if (ch == ";" || ch == "|" || ch == "&" || ch == "(" || ch == ")" || ch == "{" || ch == "}") {
-          if (cur != "") CMD[++NCMD] = cur
+          if (cur != "") { CMD[++NCMD] = cur; SEP[NCMD] = sep }
+          # `||` and `&&` remember themselves, so a failure handler can be told from an ordinary
+          # next command: `$(mktemp -d ... || exit 1)` is answered by the mktemp on every path
+          # that produces a value at all (round 8).
+          if ((ch == "|" || ch == "&") && substr(s, i + 1, 1) == ch) { sep = ch ch; i++ }
+          else sep = ch
           cur = ""
           continue
         }
         cur = cur ch
       }
-      if (cur != "") CMD[++NCMD] = cur
+      if (cur != "") { CMD[++NCMD] = cur; SEP[NCMD] = sep }
       return NCMD
     }
     # Is <c>'"'"'s command word mktemp (by basename, so /usr/bin/mktemp counts), and if so does the
@@ -311,6 +334,10 @@ for f in "${files[@]}"; do
       n = split(c, parts, /[ \t]+/)
       i = 1
       while (i <= n && (parts[i] == "" || parts[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) i++  # assignment prefix
+      # `command mktemp -d ...` runs mktemp, and so do the `builtin` and `exec` wrappers
+      # (round 8); their own options go with them.
+      while (i <= n && (parts[i] ~ /^(command|builtin|exec)$/ ||
+                        (i > 1 && parts[i-1] ~ /^(command|builtin|exec)$/ && parts[i] ~ /^-/))) i++
       if (i > n) return 0
       name = parts[i]
       sub(/^.*\//, "", name)                    # the basename names the command
@@ -421,7 +448,10 @@ for f in "${files[@]}"; do
         hdquoted = (d ~ /^["'"'"'\\]/)     # only a quoted delimiter disables expansion
         gsub(/^["'"'"'\\]/, "", d)
         sub(/["'"'"'].*$/, "", d)
-        sub(/[^A-Za-z0-9_].*$/, "", d)
+        # The WHOLE word: a delimiter may carry any character a word may, and truncating
+        # `USAGE-TEXT` to `USAGE` left a terminator that could never match -- which swallowed the
+        # rest of the file and read as a clean verdict (round 8).
+        sub(/[ \t;&|<>()].*$/, "", d)
         if (d != "") hd = d
       }
       if (l ~ /^[ \t]*(function[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/) {
@@ -441,7 +471,7 @@ for f in "${files[@]}"; do
         gsub(/^[ \t]+|[ \t]+$/, "", t)
         if (t != "") resolver[infunc] = (t ~ /^\((CDPATH=[ \t]+)?cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)([ \t]|$)/) ? 1 : 0
       }
-      funcof[FNR] = infunc       # which function a line is inside, for the local shadows below
+      funcof[FNR] = infunc       # which function a line is inside: the scope its names live in
       # Control depth, for the rule that a resolution has to sit where the allocation does.
       # Keywords only: braces would need `${...}` and `$(...)` parsed out of the count, and the
       # `|| { ...; }` tail an allocation is routinely written with is balanced within one
@@ -465,7 +495,7 @@ for f in "${files[@]}"; do
     # follows it. A `pwd -P` anywhere in the value proved nothing -- `BASE=$(pwd -P >/dev/null;
     # printf %s "${TMPDIR:-/tmp}")` leaves the environment spelling and was marked resolved
     # (round 2) -- and a guard that names one idiom in its refusals may as well require it.
-    function value_resolves(val,   inner, fn, arg, lv) {
+    function value_resolves(val, sc,   inner, fn, arg, lv) {
       sub(/^"/, "", val)                       # `VAR="$(...)"` is the same capture as `VAR=$(...)`
       # The substitution has to BE the value, not open it: `$(cd ... && pwd -P)/cache` is a
       # physical root with a component glued on, and that component can be a symlink (round 5).
@@ -488,13 +518,12 @@ for f in "${files[@]}"; do
           arg = inner; sub(/^dirname[ \t]*/, "", arg); gsub(/["'"'"']/, "", arg)
           gsub(/[ \t]+$/, "", arg)
           lv = var_head(arg)
-          if (lv != "" && (lv in resolved) && arg ~ ("^\\$\\{?" lv "\\}?$")) return 1
+          if (name_resolved(lv, sc) && arg ~ ("^\\$\\{?" lv "\\}?$")) return 1
         }
         return 0
       }
       inner = val; gsub(/^["'"'"']|["'"'"']$/, "", inner)
-      lv = lead_var(inner)
-      return (lv != "" && (lv in resolved)) ? 1 : 0
+      return name_resolved(lead_var(inner), sc)
     }
     # The rest of the assignment line, past the `$(...)` the value opens with. A use HERE is a use
     # before the resolution on the next line: `TMP=$(mktemp -d ...); consume "$TMP"` handed the
@@ -519,9 +548,11 @@ for f in "${files[@]}"; do
     # unreachable and unresolved (round 6). Same rule as the resolver functions: what a construct
     # returns is its LAST command, and a stdout redirect on that command sends the path elsewhere
     # (`2>/dev/null`, which this repository writes, redirects stderr and is fine).
-    function answers_with_mktemp(h,   tail_cmd) {
+    function answers_with_mktemp(h,   tail_cmd, k) {
       if (commands(h) == 0) return 0
-      tail_cmd = CMD[NCMD]
+      k = NCMD
+      while (k > 1 && SEP[k] == "||") k--   # a failure handler supplies nothing on the live path
+      tail_cmd = CMD[k]
       if (!scan_cmd(tail_cmd)) return 0
       if (tail_cmd ~ /(^|[ \t])1?>[^&]/) return 0   # the path goes to the redirect, not to the caller
       return 1
@@ -549,12 +580,18 @@ for f in "${files[@]}"; do
     function exports(s, name) {
       return s ~ ("^(export|readonly|declare|typeset|unset)[ \t]+([^ \t]+[ \t]+)*" name "([ \t=]|$)")
     }
-    function first_use(name, from,   i, l) {
+    # THE NEXT CODE LINE, and nothing looser. Eight rounds of review found the same defect in a
+    # new place each time -- a resolution in the sibling `else` arm, a reassignment or an `unset`
+    # in between, an `export` handing the old spelling to a child -- because "somewhere below,
+    # before the first use" invites a search, and a search over shell text is a bash interpreter
+    # nobody asked for. The house shape is two adjacent lines; every site in this repository is
+    # written that way; and a scanner that asks for exactly that has nothing left to approximate,
+    # because anything between them, whatever it is, refuses.
+    function next_code_line(from,   i, l) {
       for (i = from + 1; i <= last; i++) {
         l = code[i]
-        gsub(/^[ \t]+/, "", l)
-        if (l == "") continue
-        if (mentions(l, name) || exports(l, name)) return i
+        gsub(/^[ \t]+|[ \t]+$/, "", l)
+        if (l != "") return i
       }
       return 0
     }
@@ -563,12 +600,12 @@ for f in "${files[@]}"; do
     function resolved_below(i,   nm, l, u) {
       nm = an[i]
       if (mentions(tail_of(code[i]), nm) || exports(tail_of(code[i]), nm)) return 0
-      u = first_use(nm, i)
+      u = next_code_line(i)
       if (u == 0) return 0
-      # ...and it has to RUN where the allocation did. A resolution written inside a function body
-      # that nothing has called yet, or inside a branch that may not be taken, is an assignment
-      # the commands after the allocation never see (round 4): `TMP=$(mktemp -d ...);
-      # normalize() { TMP=$(CDPATH= cd "$TMP" && pwd -P); }; echo "$TMP"` echoes the unresolved spelling.
+      # ...and it has to RUN where the allocation did, which adjacency nearly gives on its own:
+      # a resolution inside an uncalled function body or a `then` arm is separated from the
+      # allocation by the line that opens the block, so it is not the next code line at all. The
+      # scope test stays as the belt to that brace.
       if (funcof[u] != funcof[i] || depth[u] != depth[i]) return 0
       l = code[u]
       gsub(/^[ \t]+/, "", l)
@@ -590,21 +627,6 @@ for f in "${files[@]}"; do
         if (l !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) continue
         nm = l
         sub(/^[ \t]*/, "", nm)
-        # A `local`/`declare`/`typeset` assignment belongs to one function'"'"'s scope, and a short name
-        # is routinely reused across functions: folding a helper'"'"'s `local BASE=${TMPDIR:-/tmp}` into
-        # the global BASE made a correct file fail the mandatory lint job (round 2). It still gets
-        # an entry -- the mktemp rules below are about the LINE and apply wherever it is written --
-        # but it is left out of the name-global conjunction.
-        isloc[i] = (nm ~ /^(local|declare|typeset)[ \t]/) ? 1 : 0
-        # A local that SHADOWS a name: inside this function the global'"'"'s resolution says nothing
-        # about the value, so nothing there may inherit from it. Leaving locals out of the
-        # conjunction (round 2) fixed the false refusal and opened this, its inverse (round 3).
-        if (isloc[i]) {
-          nmloc = nm
-          sub(/^(local|declare|typeset)[ \t]+/, "", nmloc)
-          sub(/=.*$/, "", nmloc)
-          shadow[funcof[i] SUBSEP nmloc] = 1
-        }
         sub(/^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)/, "", nm)
         val = nm
         sub(/=.*$/, "", nm)
@@ -613,25 +635,31 @@ for f in "${files[@]}"; do
         av[i] = val
       }
       for (i = 1; i <= last; i++) if (i in an) mkok[i] = resolved_below(i)
+      # WHICH SCOPE a name is resolved in, rather than one name-global verdict. A short name is
+      # reused across functions, so a helper'"'"'s `local BASE=${TMPDIR:-/tmp}` must not un-resolve the
+      # global BASE (round 2), an allocation inside that helper must not inherit the global'"'"'s
+      # resolution either (round 3), a function-body assignment cannot certify the global, which
+      # runs only when something calls it (round 8) -- and a local root that IS resolved must
+      # still certify its own child in its own function (round 8 again). All four are the same
+      # statement once the verdict is keyed by scope: a name is resolved IN A SCOPE, the scope
+      # being the function that assigns it or the top level; a lookup inside a function that
+      # assigns the name at all reads that function'"'"'s verdict and never the global one. The
+      # two-sided rules stay: only an assignment at control depth 0 can certify, any assignment
+      # can disqualify, and five rounds of the fixpoint is more than any chain here.
+      for (i = 1; i <= last; i++) if (i in an) assigns[funcof[i] SUBSEP an[i]] = 1
       for (round = 0; round < 5; round++) {
         for (n in seen) delete seen[n]
         for (n in bad_assign) delete bad_assign[n]
         for (i = 1; i <= last; i++) {
-          if (!(i in an) || isloc[i]) continue
-          # An assignment that may never run cannot CERTIFY a name: not one inside a branch (`if
-          # false; then BASE=$(CDPATH= cd /tmp && pwd -P); fi`, round 5) and not one inside a
-          # function body, which executes only when something calls it (round 7). It can still
-          # DISQUALIFY one, which is the safe direction: a name assigned the environment spelling
-          # anywhere is a name this guard will not certify.
-          if (depth[i] == 0 && funcof[i] == "") seen[an[i]] = 1
+          if (!(i in an)) continue
+          key = funcof[i] SUBSEP an[i]
+          if (depth[i] == 0) seen[key] = 1
           if (has_mktemp_d(head_of(code[i]))) {
-            if (!answers_with_mktemp(head_of(code[i]))) { bad_assign[an[i]] = 1; continue }
-            lv = lead_var(template_of(head_of(code[i])))
-            if (lv != "" && ((funcof[i] SUBSEP lv) in shadow)) lv = ""
-            if ((lv != "" && (lv in resolved)) || mkok[i]) continue
-            bad_assign[an[i]] = 1
-          } else if (!value_resolves(av[i])) {
-            bad_assign[an[i]] = 1
+            if (!answers_with_mktemp(head_of(code[i]))) { bad_assign[key] = 1; continue }
+            if (scope_resolved(i, lead_var(template_of(head_of(code[i])))) || mkok[i]) continue
+            bad_assign[key] = 1
+          } else if (!value_resolves(av[i], funcof[i])) {
+            bad_assign[key] = 1
           }
         }
         for (n in seen) if (!(n in bad_assign)) resolved[n] = 1; else delete resolved[n]
@@ -653,20 +681,18 @@ for f in "${files[@]}"; do
         next
       }
       nm = an[FNR]
-      lv = lead_var(template_of(head_of(line)))
-      if (lv != "" && ((funcof[FNR] SUBSEP lv) in shadow)) lv = ""   # a local shadow, not the global
-      if (lv != "" && (lv in resolved)) next   # inherited from a resolved root
+      if (scope_resolved(FNR, lead_var(template_of(head_of(line))))) next   # inherited root
       if (mkok[FNR]) next
       if (mentions(tail_of(line), nm) || exports(tail_of(line), nm)) {
         refuse(FNR, "a `mktemp -d` into $" nm " that is used later on its OWN line, before anything could resolve it: the resolution below does not reach a command that already ran with the environment'"'"'s spelling — put `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)` between them")
         next
       }
-      u = first_use(nm, FNR)
+      u = next_code_line(FNR)
       if (u == 0) {
-        refuse(FNR, "a `mktemp -d` into $" nm " that is never used and never resolved: if the directory is wanted, resolve it with `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)`; if it is not, drop the call")
+        refuse(FNR, "a `mktemp -d` into $" nm " with nothing after it: if the directory is wanted, resolve it on the next line with `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)`; if it is not, drop the call")
         next
       }
-      refuse(FNR, "a `mktemp -d` into $" nm " whose result is used at line " u " without being resolved physically: mktemp answers with the path as the environment spells it, and on macOS /var and /tmp are symlinks into /private, so this is a second spelling of a directory every `pwd -P` in the repository names differently — an assertion comparing it against a script'"'"'s output stops matching in silence, and a \"must NOT appear\" one then passes over anything. Add `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)` directly below, or build the template on a directory this file already resolved")
+      refuse(FNR, "a `mktemp -d` into $" nm " whose next command, at line " u ", is not its resolution: mktemp answers with the path as the environment spells it, and on macOS /var and /tmp are symlinks into /private, so this is a second spelling of a directory every `pwd -P` in the repository names differently — an assertion comparing it against a script'"'"'s output stops matching in silence, and a \"must NOT appear\" one then passes over anything. The guard asks for the two lines adjacent rather than searching for a resolution below: put `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)` directly under it, or build the template on a directory this file already resolved")
     }
     END { exit bad ? 1 : 0 }
   ' "$f" "$f" || rc=1
