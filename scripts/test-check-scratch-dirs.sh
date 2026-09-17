@@ -266,6 +266,36 @@ printf 'x' > "$f"
 EOF
 expect "a file mktemp is not a directory mktemp" 0 "$CLEAN" -- "$CS" "$TMP/safe_file_mktemp.sh"
 
+# Round 5: the call is the same command however it is spelled on disk, and its value-taking
+# options take their values.
+probe safe_path_and_valued_options <<'EOF'
+a=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/a.XXXXXX") || exit 1
+a=$(cd "$a" && pwd -P) || exit 1
+b=$(mktemp -p "${TMPDIR:-/tmp}" -d b.XXXXXX) || exit 1
+b=$(cd "$b" && pwd -P) || exit 1
+echo "$a $b"
+EOF
+expect "a path-qualified call and a -p DIR -d call pass when resolved" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_path_and_valued_options.sh"
+
+# Round 5: an escaped dollar in an unquoted heredoc is emitted as text and runs nothing.
+probe safe_escaped_substitution <<'OUTER'
+cat <<EOF
+the idiom is \$(mktemp -d "\${TMPDIR:-/tmp}/x.XXXXXX"), resolved on the line below
+EOF
+OUTER
+expect "an escaped substitution in an unquoted heredoc is text" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_escaped_substitution.sh"
+
+# Round 5: a `mktemp -d` named inside a double-quoted MESSAGE is not a second allocation.
+probe safe_quoted_message <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || bail "mktemp -d failed for the suite"
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+echo "$TMP"
+EOF
+expect "a mktemp -d named in an error message is not a second call" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_quoted_message.sh"
+
 # --- the shapes that must be refused --------------------------------------------------------
 
 probe bad_tmpdir <<'EOF'
@@ -525,6 +555,63 @@ EOF
 OUTER
 expect "a mktemp -d in an UNQUOTED heredoc body is code, and is refused" 1 'not captured in a variable assignment' -- \
   "$CS" "$TMP/bad_unquoted_heredoc.sh"
+
+# Round 5: `/usr/bin/mktemp` is the same command. The basename names it; the slash is a path.
+probe bad_path_qualified <<'EOF'
+TMP=$(/usr/bin/mktemp -d "/tmp/probe.XXXXXX")
+consume "$TMP"
+EOF
+expect "a path-qualified mktemp -d is the same call" 1 "$REFUSAL" -- "$CS" "$TMP/bad_path_qualified.sh"
+
+# Round 5: `-p DIR` takes its value, so the word after it is not the template and the `-d` behind
+# it still has to be seen.
+probe bad_valued_option <<'EOF'
+TMP=$(mktemp -p "${TMPDIR:-/tmp}" -d probe.XXXXXX)
+consume "$TMP"
+EOF
+expect "a value-taking option does not hide the directory flag" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_valued_option.sh"
+
+# Round 5: the resolving substitution has to BE the value. A component glued on afterwards can be
+# a symlink, which is the guard's own failure mode one directory further along.
+probe bad_suffixed_resolution <<'EOF'
+ROOT=$(cd "${TMPDIR:-/tmp}" && pwd -P)/cache
+TMP=$(mktemp -d "$ROOT/probe.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a resolved substitution with a component appended does not certify what is under it" 1 \
+  "$REFUSAL" -- "$CS" "$TMP/bad_suffixed_resolution.sh"
+
+# Round 5: an assignment in a branch that may never run cannot certify a name.
+probe bad_conditional_resolution <<'EOF'
+BASE=${BASE:-/tmp}
+if false; then
+  BASE=$(cd /tmp && pwd -P)
+fi
+TMP=$(mktemp -d "$BASE/probe.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an assignment inside a branch does not certify the name" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_conditional_resolution.sh"
+
+# Round 5: an assignment-shaped prefix and a call later on the line are two different commands.
+probe bad_uncaptured_second_call <<'EOF'
+ROOT=$(pwd -P); mktemp -d /tmp/leaked.XXXXXX
+ROOT=$(cd "$ROOT" && pwd -P)
+echo "$ROOT"
+EOF
+expect "a call outside the captured substitution is uncaptured" 1 'not captured in a variable assignment' -- \
+  "$CS" "$TMP/bad_uncaptured_second_call.sh"
+
+# ...and so is a second one trailing a capture that is otherwise correct: the first directory is
+# resolved, the second is leaked.
+probe bad_trailing_second_call <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/a.XXXXXX"); mktemp -d /tmp/leaked.XXXXXX
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+echo "$TMP"
+EOF
+expect "a second call trailing a good capture is refused on its own" 1 \
+  'outside the substitution the assignment captures' -- "$CS" "$TMP/bad_trailing_second_call.sh"
 
 # --- the default sweep's scope --------------------------------------------------------------
 # With no arguments the guard reads every `*/scripts/*.sh` and `scripts/*.sh` in its checkout.

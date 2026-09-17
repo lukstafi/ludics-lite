@@ -151,6 +151,24 @@ for f in "${files[@]}"; do
       }
       return out
     }
+    # The same for double-quoted runs, used only where a COMMAND is being looked for: `|| bail
+    # "mktemp -d failed for $2"` is a message, not a second allocation (round 5). Double quotes
+    # are not blanked anywhere else, because every template in this repository is one.
+    function blank_dq(s,   out, i, ch, q) {
+      out = ""; q = ""
+      for (i = 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        if (q == "") {
+          if (ch == "\\") { out = out ch substr(s, i + 1, 1); i++; continue }
+          if (ch == "\"") q = ch
+          out = out ch
+        } else if (ch == q) {
+          q = ""
+          out = out ch
+        } else out = out "x"
+      }
+      return out
+    }
     # Inside a single-quoted run the character is data: keep the width, lose the meaning. A
     # double-quoted run is kept as it is -- every template in this repository is one.
     function blank_sq(s,   out, i, ch, q) {
@@ -176,7 +194,9 @@ for f in "${files[@]}"; do
       out = ""; depth = 0
       for (i = 1; i <= length(s); i++) {
         ch = substr(s, i, 1)
-        if (depth == 0 && ch == "$" && substr(s, i + 1, 1) == "(") { depth = 1; start = i + 2; i++ }
+        # A backslash-escaped dollar is a literal one: `\\$(mktemp -d ...)` in an unquoted body is
+        # emitted as text and runs nothing (round 5).
+        if (depth == 0 && ch == "$" && substr(s, i + 1, 1) == "(" && substr(s, i - 1, 1) != "\\") { depth = 1; start = i + 2; i++ }
         else if (depth > 0 && ch == "(") depth++
         else if (depth > 0 && ch == ")") {
           depth--
@@ -231,11 +251,16 @@ for f in "${files[@]}"; do
     # --directory ...` and a bundled `-qd` were skipped entirely (round 4); and `$(mktemp -d)`
     # takes no template at all, defaulting to tmp.XXXXXXXXXX, which is every bit as unresolved as
     # a spelled-out one (round 1). Sets MT_DIR and MT_TPL; MT_TPL is "" when there is no template.
-    function scan_mktemp(s,   rest, w, i, n, parts, opts) {
-      MT_DIR = 0; MT_TPL = ""
-      if (s !~ /(^|[^A-Za-z0-9_.\/-])mktemp[ \t]/) return 0
+    function scan_mktemp(s,   rest, w, i, n, parts, opts, skip) {
+      MT_DIR = 0; MT_TPL = ""; skip = 0
+      # A leading space, so the "not a word character before it" test has something to match even
+      # when the call opens the text: `^` inside an alternation is not anchored by every awk.
+      s = " " s
+      # `/usr/bin/mktemp` is the same command: the basename is what names it, and a slash before
+      # it is a path, not a different word (round 5).
+      if (s !~ /(^|[^A-Za-z0-9_.-])mktemp[ \t]/) return 0
       rest = s
-      sub(/^.*(^|[^A-Za-z0-9_.\/-])mktemp[ \t]+/, "", rest)
+      sub(/^.*(^|[^A-Za-z0-9_.-])mktemp[ \t]+/, "", rest)
       # Stop at whatever ends the command; what follows is another command, not an argument.
       sub(/[ \t]*(\)|;|\||&|<|>).*$/, "", rest)
       n = split(rest, parts, /[ \t]+/)
@@ -244,12 +269,17 @@ for f in "${files[@]}"; do
         w = parts[i]
         if (w == "") continue
         if (opts && w == "--") { opts = 0; continue }
+        if (skip) { skip = 0; continue }            # the value of the option before it
         if (opts && w ~ /^--/) {
           if (w ~ /^--directory/) MT_DIR = 1
+          # A long option that takes a value and was not given one with `=` takes the next word.
+          if (w ~ /^--(suffix|tmpdir|p)$/) skip = 1
           continue
         }
         if (opts && w ~ /^-[A-Za-z]+$/) {           # short options, bundled or not
           if (w ~ /d/) MT_DIR = 1
+          # -p DIR and -t PREFIX take the following word; bundled, only the LAST letter can.
+          if (substr(w, length(w), 1) ~ /[pt]/) skip = 1
           continue
         }
         gsub(/["'"'"']/, "", w)
@@ -353,7 +383,9 @@ for f in "${files[@]}"; do
     # (round 2) -- and a guard that names one idiom in its refusals may as well require it.
     function value_resolves(val,   inner, fn, arg, lv) {
       sub(/^"/, "", val)                       # `VAR="$(...)"` is the same capture as `VAR=$(...)`
-      if (val ~ /^\$\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)/) return 1
+      # The substitution has to BE the value, not open it: `$(cd ... && pwd -P)/cache` is a
+      # physical root with a component glued on, and that component can be a symlink (round 5).
+      if (val ~ /^\$\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)"?[ \t]*($|\|\||&&|;)/) return 1
       if (val ~ /^\$\(/) {
         inner = substr(val, 3)
         sub(/\).*$/, "", inner)
@@ -391,6 +423,20 @@ for f in "${files[@]}"; do
       }
       return ""
     }
+    # ...and its complement: what the assignment'"'"'s own `$( ... )` CAPTURES. An assignment-shaped
+    # prefix and a `mktemp -d` somewhere later on the line are two different things --
+    # `ROOT=$(pwd -P); mktemp -d /tmp/leaked.XXXXXX` is a resolved ROOT beside a leaked directory,
+    # and reading the line as one captured call credited the next line'"'"'s resolution to it
+    # (round 5).
+    function head_of(l,   i, depth, ch, started, start) {
+      depth = 0; started = 0
+      for (i = 1; i <= length(l); i++) {
+        ch = substr(l, i, 1)
+        if (ch == "(") { depth++; if (!started) { started = 1; start = i + 1 } }
+        else if (ch == ")") { depth--; if (started && depth <= 0) return substr(l, start, i - start) }
+      }
+      return started ? substr(l, start) : ""
+    }
     # The first line after <from> that USES <name>, or 0. A deferred `trap '"'"'rm -rf "$TMP"'"'"' EXIT` is
     # not a use and needs no rule of its own: its body is single-quoted, so blank_sq already made
     # it data. Skipping the whole trap LINE, as the first cut did, also hid a `trap ... ; consume
@@ -425,7 +471,7 @@ for f in "${files[@]}"; do
       if (funcof[u] != funcof[i] || depth[u] != depth[i]) return 0
       l = code[u]
       gsub(/^[ \t]+/, "", l)
-      return (l ~ ("^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?" nm "=\"?\\$\\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)")) ? 1 : 0
+      return (l ~ ("^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?" nm "=\"?\\$\\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)\"?[ \t]*($|\\|\\||&&|;)")) ? 1 : 0
     }
     # The fixpoint, once, before the first line of pass 2 is judged. A name is resolved only when
     # EVERY assignment to it leaves a physical path: `BASE=$(cd /tmp && pwd -P)` followed by
@@ -471,9 +517,13 @@ for f in "${files[@]}"; do
         for (n in bad_assign) delete bad_assign[n]
         for (i = 1; i <= last; i++) {
           if (!(i in an) || isloc[i]) continue
-          seen[an[i]] = 1
-          if (has_mktemp_d(av[i])) {
-            lv = lead_var(template_of(av[i]))
+          # An assignment inside a branch may never run, so it cannot CERTIFY a name -- `if false;
+          # then BASE=$(cd /tmp && pwd -P); fi` left BASE resolved (round 5). It can still
+          # DISQUALIFY one, which is the safe direction: a name assigned the environment spelling
+          # anywhere is a name this guard will not certify.
+          if (depth[i] == 0) seen[an[i]] = 1
+          if (has_mktemp_d(head_of(code[i]))) {
+            lv = lead_var(template_of(head_of(code[i])))
             if (lv != "" && ((funcof[i] SUBSEP lv) in shadow)) lv = ""
             if ((lv != "" && (lv in resolved)) || mkok[i]) continue
             bad_assign[an[i]] = 1
@@ -487,12 +537,20 @@ for f in "${files[@]}"; do
     {
       line = code[FNR]
       if (!has_mktemp_d(line)) next
-      if (line !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/) {
+      # Captured means captured BY THIS ASSIGNMENT: the call has to sit inside the `$( ... )` the
+      # line opens with, and a second one past that substitution is uncaptured whatever the line
+      # begins with.
+      if (line !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/ ||
+          !has_mktemp_d(head_of(line))) {
         refuse(FNR, "a `mktemp -d` whose result is not captured in a variable assignment: this guard resolves a scratch directory by following the variable it lands in, and cannot follow this one — write it as `VAR=$(mktemp -d ...)` and resolve VAR with `pwd -P`")
         next
       }
+      if (has_mktemp_d(blank_dq(tail_of(line)))) {
+        refuse(FNR, "a second `mktemp -d` on this line, outside the substitution the assignment captures: its directory is leaked and never resolved — give it a capture and a resolution of its own")
+        next
+      }
       nm = an[FNR]
-      lv = lead_var(template_of(line))
+      lv = lead_var(template_of(head_of(line)))
       if (lv != "" && ((funcof[FNR] SUBSEP lv) in shadow)) lv = ""   # a local shadow, not the global
       if (lv != "" && (lv in resolved)) next   # inherited from a resolved root
       if (mkok[FNR]) next
