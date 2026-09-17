@@ -877,6 +877,21 @@ drift_edit "routines/$DRIFT_ONE/SKILL.md" 's|^\( *\)\([^ `]*sync-routines\.sh\)$
 expect "an indented line quoting the command is not the command" 1 \
   "routines/$DRIFT_ONE/SKILL.md: runs no scripts/sync-routines.sh" -- "$CP" "$R"
 
+# The ways a line can hold the path without running it. Each is what somebody reaches for when
+# they want the step gone but the prompt to still look like it has one -- the comment especially,
+# which is how a guard is disabled rather than deleted.
+while IFS='|' read -r label repl; do
+  drift_tree
+  drift_edit "routines/$DRIFT_ONE/SKILL.md" "s|^\\( *\\)\\([^ \`]*sync-routines\\.sh\\)$|\\1$repl|"
+  expect "$label is not the command" 1 \
+    "routines/$DRIFT_ONE/SKILL.md: runs no scripts/sync-routines.sh" -- "$CP" "$R"
+done <<'EOF'
+a commented-out invocation|# \2
+an invocation commented out with no space|#\2
+the path as another command's argument|echo \2
+...and as cat's|cat \2
+EOF
+
 # Which prompts are held is read off the script, so a name added to LOCAL_ROUTINES arrives obliged
 # -- and one it installs with nothing to install from is refused rather than skipped.
 drift_tree

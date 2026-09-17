@@ -804,10 +804,12 @@ check_slots() {
 # would go on passing over a prompt whose indented command line had been deleted -- the guard
 # gone, the prose about it left standing, and the checker reporting the step present. So the
 # match is the shape a prompt runs a command in: a Markdown indented-code line (four spaces or
-# more, which is what both prompts use) whose whole content is an invocation of the script in
-# STATUS mode -- the path, ending the line. A `push` or `pull` argument does not satisfy it and
-# should not: those write, and what every routine owes is the read. A line carrying a backtick is
-# prose quoting a command, not a command. Whether the prompt then READS the verdict is a review
+# more, which is what both prompts use) whose whole content is a single token ending in the
+# script's name -- the invocation, in STATUS mode, and nothing else. Every weaker reading was
+# tried and is refused for a reason somebody would otherwise reach for: a `push`/`pull` argument
+# writes where the obligation is to read; `echo`/`cat` and friends put the path in some other
+# command's argument; a leading `#` is how a guard is usually disabled rather than deleted; and a
+# backtick makes the line prose quoting a command. Whether the prompt then READS the verdict is a review
 # question no lookup settles; this pins the one thing a lookup can see, which is that the command
 # is still there. Same shape as the fixture register and the slot count.
 SYNC_SCRIPT=scripts/sync-routines.sh
@@ -831,9 +833,15 @@ check_drift_guard() {
     if [ ! -f "$ROOT/$f" ]; then
       ko "$SYNC_SCRIPT" "installs '$r', but this checkout has no $f to install from"; bad=1; continue
     fi
-    # An indented-code line that IS the invocation: no backtick (prose quoting it), nothing but
-    # the path, and no mode argument -- status is the read every routine owes.
-    matches '^ {4,}[^`]*[^[:space:]]*sync-routines\.sh[[:space:]]*$' "$(cat "$ROOT/$f")" \
+    # An indented-code line that IS the invocation: the line's whole content, after the
+    # indent, is ONE token ending in the script's name. That is what makes it executed rather
+    # than merely written down -- the token class admits no blank, so `echo .../sync-routines.sh`
+    # and `cat scripts/sync-routines.sh` are arguments to some other command and do not count;
+    # no `#`, so a commented-out invocation does not (which is how a guard is usually disabled,
+    # not by deleting it); no backtick, so prose quoting the command is prose. And nothing may
+    # follow the path, so a `push`/`pull` argument does not satisfy it: those write, and what
+    # every installed routine owes is the status read.
+    matches '^ {4,}[^[:space:]#`]*sync-routines\.sh[[:space:]]*$' "$(cat "$ROOT/$f")" \
       || { ko "$f" "runs no $SYNC_SCRIPT: an installed routine reads its own drift with an indented command line invoking it in status mode (ludics-lite#199)"; bad=1; }
   done <<<"$(tr -s '[:space:]' '\n' <<<"$names")"
   [ "$bad" -ne 0 ] || ok "every routine $SYNC_SCRIPT installs runs it to read its own drift"

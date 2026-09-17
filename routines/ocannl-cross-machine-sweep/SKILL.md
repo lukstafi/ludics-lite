@@ -380,8 +380,10 @@ A `FAIL` notifies even when unchanged — it fires at most weekly (forced runs o
 claim has zero execution coverage on every backend, which must keep reaching a human until fixed;
 an unchanged POTENTIAL set stays silent like an unchanged fingerprint.
 Drift notifies every day it lasts, for the same reason: it says this run may have followed superseded
-instructions, only a person can end it (`sync-routines.sh push`), and it is silent everywhere else — the
-2026-09-17 instance went a week unseen.
+instructions, only a person can end it, and it is silent everywhere else — the 2026-09-17 instance went a
+week unseen. Put the DIFF's direction in the notification, never a fixed command: `sync-routines.sh push`
+when the checkout holds the newer text, `pull` when the installed copy does (a run that edited its own
+prompt in place — a push would destroy the only copy of that edit), and neither when both sides have moved.
 A green sweep, or a red-but-unchanged sweep, must stay silent — a notification that fires every
 day is one that gets ignored, which would defeat the point. A box that failed to wake is not by
 itself notify-worthy; it becomes so only through the staleness thresholds above.
