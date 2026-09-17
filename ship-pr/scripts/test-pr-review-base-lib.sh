@@ -339,6 +339,12 @@ at_round() {
   TIP_NEXT="$2"
 }
 
+# Everything above is in scope in all three suites, exactly as pr-review.sh's functions are, so it
+# is protected exactly as they are: the preamble's snapshot was taken before this file existed, and
+# `protect_library` extends it over what this file defines (review of ludics-lite#212, round 1).
+# `${BASH_SOURCE[0]}` verbatim, because that is the path `declare -F` recorded.
+protect_library "${BASH_SOURCE[0]}"
+
 # --- executed: this file's own controls --------------------------------------------------------
 # What is controlled here is the TRANSPORT, read directly — a `gh` call at a time, with no `base`
 # run around it. The three wall-clock devices above are the whole reason: a control that drove
@@ -455,12 +461,40 @@ test_a_suite_that_skips_the_preamble_is_refused() {
     "the refusal should say what is missing, under the name the file goes by"
 }
 
+# The reviewer's scenario, from the suite's side: a suite that redefines one of the transport's
+# own helpers is refused rather than silently served its own. `reset_fixture` is the one that
+# would hurt most — every case opens with it — and before `protect_library` the guard accepted it,
+# since the preamble's snapshot was taken before this file was sourced.
+test_a_suite_that_shadows_the_transport_is_refused() {
+  local dir rc out
+  test_tmpdir dir base-lib-shadow
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    printf 'source %s\n' "\"$BASE_LIB_DIR/test-pr-review-lib.sh\""
+    printf 'source %s\n' "\"$BASE_LIB_DIR/$BASE_LIB_BASENAME\""
+    echo 'reset_fixture() { :; }'
+    echo 'test_a_case() { assert_eq 1 1 "one is one"; }'
+    echo 'run_tests test_a_case'
+  } >"$dir/shadow.sh"
+  set +e
+  out=$(bash "$dir/shadow.sh" 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 2 "a shadow of the transport is a refusal, exit 2 ($out)"
+  assert_contains "$out" "$BASE_LIB_BASENAME's reset_fixture ($BASE_LIB_BASENAME:" \
+    "the refusal should name this file as the owner, by basename"
+  assert_contains "$out" "without \`stub reset_fixture\`" "and name the remedy"
+  assert_not_contains "$out" "PASS:" "no case may run under a refusal"
+}
+
 tests=(
   test_the_round_counter_counts_rounds_and_not_reads
   test_the_grace_is_spent_once_on_the_first_read
   test_at_round_moves_the_tip_inside_the_round_it_names
   test_the_wall_clock_setters_refuse_what_they_cannot_mean
   test_a_suite_that_skips_the_preamble_is_refused
+  test_a_suite_that_shadows_the_transport_is_refused
 )
 
 run_tests "${tests[@]}"

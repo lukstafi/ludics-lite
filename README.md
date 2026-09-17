@@ -556,7 +556,12 @@ case can prove a read that did not parse refuses instead of rendering a plausibl
 (ludics-lite#89). Three suites carried that shim byte-identically, each re-proving with a control
 of its own that it breaks only what it is pointed at; that claim is about the shim, so the
 preamble's own controls pin it once and a suite keeps only the baseline its broken runs are
-measured against (ludics-lite#179). It also closes the trap that bit twice (ludics-lite#39, #45,
+measured against (ludics-lite#179). The guard reaches one library further out too: the base
+suites' shared fixture transport is sourced after the preamble, so its own helpers were outside
+the snapshot and a suite colliding with one of them — `reset_fixture`, say, which every case
+opens with — was accepted in silence. `protect_library <file>`, called by such a library from
+inside itself, extends the snapshot over what it defines, and a call that would add nothing is
+refused rather than protecting nothing. It also closes the trap that bit twice (ludics-lite#39, #45,
 #46): `pr-review.sh` puts some sixty unqualified functions in scope, and a suite helper sharing a
 name — a reporter called `fail` — silently replaces the library's, turning every refusal's exit
 code into the reporter's. So the preamble snapshots the function table when it is sourced, and

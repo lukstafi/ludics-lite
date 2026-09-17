@@ -45,6 +45,9 @@
 #                                       the marked program and nothing else — is pinned by this
 #                                       file's own controls, so a suite needs only the baseline
 #                                       its broken runs are measured against
+#   protect_library <file>              extends the guard over a second library sourced after
+#                                       this one (test-pr-review-base-lib.sh), whose functions
+#                                       the snapshot below could not see
 #   run_tests <case>...                 the guard below, then each case with a PASS line
 #
 # The guard is why the file exists. pr-review.sh defines some sixty top-level functions, every
@@ -546,11 +549,21 @@ stub() {
 
 lib_declared_stub() { case "$STUBS" in *" $1 "*) ;; *) return 1 ;; esac; }
 
-# A path as the suite's reader would write it: the library files by basename, the suite as it was
-# invoked (which is what `declare -F` records).
+# The files whose functions are protected, one per line — pr-review.sh and this file to begin
+# with, and whatever `protect_library` adds. Newline-separated rather than space-separated
+# because a checkout's path can contain spaces, which is a shape this file's own controls run in.
+LIB_PROTECTED_FILES="$HELPER
+$TEST_LIB_FILE"
+
+# A path as the suite's reader would write it: a protected library file by basename, the suite as
+# it was invoked (which is what `declare -F` records).
 lib_show_file() {
-  case "$1" in
-  "$HELPER" | "$TEST_LIB_FILE") basename "$1" ;;
+  case "
+$LIB_PROTECTED_FILES
+" in
+  *"
+$1
+"*) basename "$1" ;;
   *) printf '%s' "$1" ;;
   esac
 }
@@ -590,6 +603,33 @@ run_tests() {
     restore_tuning
     echo "PASS: $test_name"
   done
+}
+
+# protect_library <file>: extend the guard over a SECOND library, sourced after this one — the
+# base suites' shared fixture transport is the first (ludics-lite#179). The snapshot below is
+# taken while this file is being sourced, so everything a later library defines is outside it, and
+# a suite redefining one of those names was accepted in silence: the three suites over
+# test-pr-review-base-lib.sh share `gh`, `reset_fixture`, `run_base` and the wall-clock setters,
+# and a suite helper colliding with one of them replaces it for every call the transport makes —
+# which is ludics-lite#46 exactly, one library further out (review of #212, round 1).
+#
+# <file> is the path as the shell records it, which is `${BASH_SOURCE[0]}` inside the library
+# itself: `declare -F` prints the path the file was sourced through, and a resolved one would
+# match nothing. A file that defines no function is refused rather than protecting nothing —
+# an empty extension is the same silent pass as no extension at all.
+protect_library() {
+  local file="$1" added
+  [ -n "$file" ] || bail "protect_library: no file named"
+  added=$(lib_function_table |
+    awk -v f="$file" '{ path = $0; sub(/^[^ ]+ [^ ]+ /, "", path); if (path == f) print }')
+  case "$added" in
+  *[![:space:]]*) ;;
+  *) bail "protect_library: $file defines no function in this shell — name the file as \`\${BASH_SOURCE[0]}\` from inside it, after its definitions" ;;
+  esac
+  LIB_SNAPSHOT="$LIB_SNAPSHOT
+$added"
+  LIB_PROTECTED_FILES="$LIB_PROTECTED_FILES
+$file"
 }
 
 # What is PROTECTED is what these two files define, and only that — the table is filtered on the
@@ -1132,6 +1172,51 @@ test_with_broken_jq_clears_the_marker_whichever_way_the_command_goes() {
     "and say what was missing"
 }
 
+# --- protecting a second library ---------------------------------------------------------------
+# The guard's snapshot is taken while this file is sourced, so a library sourced AFTER it — the
+# base suites' shared fixture transport — is outside it until `protect_library` says otherwise.
+# `extra_control <redefinition...>` builds that situation: a second library beside the throwaway
+# suite, protecting itself the way the real one does, and a suite that sources it and then does
+# whatever the caller passes.
+extra_control() {
+  local dir="$CONTROL_ROOT/extra"
+  mkdir -p "$dir"
+  {
+    echo 'extra_helper() { echo library; }'
+    echo 'protect_library "${BASH_SOURCE[0]}"'
+  } >"$dir/extra-lib.sh"
+  control "source \"$dir/extra-lib.sh\"" "$@"
+}
+
+# The shape the base transport was in when the review found it: its helpers outside the snapshot,
+# so a suite could replace one and `run_tests` would accept it.
+test_a_second_library_is_protected_once_it_says_so() {
+  extra_control
+  assert_eq "$CONTROL_RC" 0 "a suite over a second library still runs ($CONTROL_ERR)"
+  assert_eq "$CONTROL_OUT" "PASS: test_a_case" "and its case passes"
+
+  extra_control 'extra_helper() { echo suite; }'
+  assert_refused "a suite-defined extra_helper"
+  assert_contains "$CONTROL_ERR" "extra-lib.sh's extra_helper (extra-lib.sh:" \
+    "the second library is named by its basename, like the other two"
+  assert_contains "$CONTROL_ERR" "redefined at $CONTROL_FILE:" "and the suite's line is located"
+
+  # And the declaration works over it, so a deliberate override is still available.
+  extra_control 'stub extra_helper' 'extra_helper() { echo suite; }'
+  assert_eq "$CONTROL_RC" 0 "a declared stub of the second library's function is allowed ($CONTROL_ERR)"
+}
+
+# A library that protects nothing is refused rather than passing: the whole value of the call is
+# the names it adds, and a path that matches no record — a resolved one, say, where the shell
+# recorded the path it was sourced through — adds none and would look exactly like success.
+test_protect_library_refuses_a_file_that_defines_nothing() {
+  control 'protect_library "/nowhere/not-a-library.sh"'
+  assert_eq "$CONTROL_RC" 1 "a file defining nothing must refuse ($CONTROL_OUT)"
+  assert_contains "$CONTROL_ERR" "protect_library: /nowhere/not-a-library.sh defines no function" \
+    "the refusal should name the file"
+  assert_not_contains "$CONTROL_OUT" "PASS:" "and no case may run under it"
+}
+
 # --- retune, and the restore no case performs itself -------------------------------------------
 # The values pr-review.sh gave the two constants when this file sourced it, read once so the pair
 # below asserts against the script's own defaults rather than a number copied out of it.
@@ -1356,6 +1441,8 @@ tests=(
   test_the_jq_shim_breaks_the_program_it_is_pointed_at
   test_the_jq_shim_leaves_every_other_program_alone
   test_with_broken_jq_clears_the_marker_whichever_way_the_command_goes
+  test_a_second_library_is_protected_once_it_says_so
+  test_protect_library_refuses_a_file_that_defines_nothing
   test_retune_moves_a_constant
   test_retune_is_undone_when_the_case_ends # must stay directly after the case above
   test_retune_of_a_name_the_script_does_not_set_is_refused
