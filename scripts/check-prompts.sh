@@ -21,10 +21,13 @@
 # directory carrying a SKILL.md is named, in backticks, in the first cell of a row there, so a new
 # prompt cannot land unindexed. That is a lookup, not a rendering claim: see `indexed` below for
 # what it stopped asserting when the table scanner went (ludics-lite#75).
-# Two cross-file agreements ride along, each pinning a fact the prompts only restate: every test
+# Three cross-file agreements ride along, each pinning a fact the prompts only restate: every test
 # fixture has a command in the README's register and a run line on each CI platform it needs, and
 # every file that quotes the mac-studio correctness-slot count quotes the one fleet-worker.sh
 # actually defaults to (ludics-lite#160) -- which files those are is discovered, not listed.
+# A third reads the routines sync-routines.sh installs off its own LOCAL_ROUTINES line and
+# requires each of their prompts to name that script, so the step 0 that makes an installed
+# copy's drift visible cannot be edited away in silence (ludics-lite#199).
 #
 # Usage: check-prompts.sh [root]   (root defaults to the checkout this script lives in;
 #                                   exit 0 all pass, 1 otherwise)
@@ -783,6 +786,47 @@ check_slots() {
   [ "$bad" -ne 0 ] || ok "mac-studio correctness slots agree: $SLOT_SCRIPT and every file that states the count say $default"
 }
 
+# --- the installed-routine drift guard ---------------------------------------------------------
+# A local scheduled task runs from a COPY under ~/.claude/scheduled-tasks, necessarily (the
+# scheduler refuses a task file reached through a symlink), and a copy drifts from this checkout
+# in silence: the task fires on time, the run looks normal, and the only thing wrong is that the
+# prompt is old. ludics-lite#199 is a week of that. The guard against it lives inside the prompts
+# -- each installed routine opens by running scripts/sync-routines.sh and reading its own verdict
+# -- and prose does not fail a test when somebody edits it away. So this pins that it is there.
+#
+# WHICH prompts are held is read off the script that installs them: the one-line LOCAL_ROUTINES
+# assignment, the same line scripts/test-sync-routines.sh reads, so a routine added to the sync
+# arrives here already obliged and a retired one stops being. The claim is only that the prompt
+# NAMES the script -- whether the step reads well is a review question, and no lookup settles it,
+# but a prompt that does not mention the script certainly does not run it. Same shape as the
+# fixture register and the slot count: a lookup, small enough to be obviously right.
+SYNC_SCRIPT=scripts/sync-routines.sh
+
+check_drift_guard() {
+  local names r f bad=0
+  # A root without the sync script installs nothing, so it carries no obligation -- as with the
+  # fixture register, whose obligation comes from a fixture, and the slot count's from the worker.
+  [ -f "$ROOT/$SYNC_SCRIPT" ] || return 0
+  names=$(sed -n 's/^LOCAL_ROUTINES="\([^"]*\)"[[:space:]]*$/\1/p' "$ROOT/$SYNC_SCRIPT")
+  if [ -z "$names" ]; then
+    # Not a pass: the obligation exists and this reader cannot see who carries it.
+    ko "$SYNC_SCRIPT" "has no one-line LOCAL_ROUTINES=\"...\" naming the routines it installs"
+    return 0
+  fi
+  # A name a word at a time, through `tr`: an unquoted expansion would also GLOB, and a routine
+  # name holding a `*` would be replaced by whatever it matched in the caller's directory.
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    f="routines/$r/SKILL.md"
+    if [ ! -f "$ROOT/$f" ]; then
+      ko "$SYNC_SCRIPT" "installs '$r', but this checkout has no $f to install from"; bad=1; continue
+    fi
+    matches 'sync-routines\.sh' "$(cat "$ROOT/$f")" \
+      || { ko "$f" "names no $SYNC_SCRIPT: an installed routine reads its own drift (ludics-lite#199)"; bad=1; }
+  done <<<"$(tr -s '[:space:]' '\n' <<<"$names")"
+  [ "$bad" -ne 0 ] || ok "every routine $SYNC_SCRIPT installs reads its own drift"
+}
+
 # --- run --------------------------------------------------------------------------------------
 if $ONE; then
   if [ -f "$ROOT/SKILL.md" ]; then check_skill_file SKILL.md
@@ -805,6 +849,7 @@ check_index README.md "" skill
 check_index routines/README.md routines/ routine
 check_fixtures
 check_slots
+check_drift_guard
 
 echo
 echo "check-prompts: $pass passed, $fail failed"

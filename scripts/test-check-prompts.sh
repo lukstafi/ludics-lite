@@ -816,6 +816,64 @@ out=$("$CP" "$R" 2>&1)
 grep -q 'mac-studio' <<<"$out" && ko "a root without $WORKER is held to a slot count" \
   || ok "...and a root without $WORKER carries no slot obligation"
 
+# --- the installed-routine drift guard ---------------------------------------------------------
+# ludics-lite#199: each routine sync-routines.sh installs opens by running it and reading its own
+# drift, and nothing but this check stops that step being edited away. Like the slot probes, the
+# tree is the REAL prompts and the REAL script, copied -- a probe over invented prose would keep
+# passing while the checker and the prompts drifted apart. Both READMEs come along because the
+# index lookup wants them; no fixture and no fleet-worker.sh, so neither other agreement applies.
+DRIFT_ROUTINES=$(sed -n 's/^LOCAL_ROUTINES="\([^"]*\)"[[:space:]]*$/\1/p' "$SRC/scripts/sync-routines.sh")
+[ -n "$DRIFT_ROUTINES" ] \
+  || ko "the drift probes need a one-line LOCAL_ROUTINES=\"...\" in scripts/sync-routines.sh"
+DRIFT_ONE=${DRIFT_ROUTINES%% *}
+drift_tree() {
+  rm -rf "$R"
+  mkdir -p "$R/routines" "$R/scripts"
+  cp "$SRC/README.md" "$R/README.md"
+  cp "$SRC/routines/README.md" "$R/routines/README.md"
+  cp "$SRC/scripts/sync-routines.sh" "$R/scripts/sync-routines.sh"
+  for r in $DRIFT_ROUTINES; do
+    mkdir -p "$R/routines/$r"
+    cp "$SRC/routines/$r/SKILL.md" "$R/routines/$r/SKILL.md"
+  done
+}
+# drift_edit <file> <sed-expression>: rewrites one copy, and says so if it matched nothing --
+# a mutation that changed nothing leaves a probe asserting a refusal the tree no longer earns.
+drift_edit() {
+  sed "$2" "$R/$1" > "$R/drift.tmp" || { ko "drift_edit: sed failed on $1"; return 1; }
+  cmp -s "$R/drift.tmp" "$R/$1" && { ko "drift_edit: '$2' matched nothing in $1"; return 1; }
+  mv "$R/drift.tmp" "$R/$1"
+}
+
+drift_tree
+expect "every installed routine's prompt reads its own drift" 0 \
+  'reads its own drift' -- "$CP" "$R"
+
+# The step edited out of a prompt is the drift this check exists for: prose that stops being run
+# looks exactly like prose that is.
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" 's/sync-routines\.sh/the-sync-script/g'
+expect "a routine that stops naming the sync script is refused" 1 \
+  "routines/$DRIFT_ONE/SKILL.md: names no scripts/sync-routines.sh" -- "$CP" "$R"
+
+# Which prompts are held is read off the script, so a name added to LOCAL_ROUTINES arrives obliged
+# -- and one it installs with nothing to install from is refused rather than skipped.
+drift_tree
+rm -rf "$R/routines/$DRIFT_ONE"
+expect "a routine the script installs with no prompt here is refused" 1 \
+  "installs '$DRIFT_ONE', but this checkout has no routines/$DRIFT_ONE/SKILL.md" -- "$CP" "$R"
+
+drift_tree
+drift_edit scripts/sync-routines.sh 's/^LOCAL_ROUTINES=.*/LOCAL_ROUTINES="a b" # not the one-line shape/'
+expect "a LOCAL_ROUTINES this reader cannot see is refused, not passed" 1 \
+  'has no one-line LOCAL_ROUTINES' -- "$CP" "$R"
+
+# The obligation comes from the installer, as the fixtures' comes from a fixture.
+fresh "$R"
+out=$("$CP" "$R" 2>&1)
+grep -q 'drift' <<<"$out" && ko "a root without scripts/sync-routines.sh is held to a drift step" \
+  || ok "...and a root without the sync script carries no drift obligation"
+
 # --- this checkout ---------------------------------------------------------------------------
 expect "this checkout's prompts pass" 0 '0 failed' -- "$CP"
 

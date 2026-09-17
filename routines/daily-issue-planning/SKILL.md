@@ -3,6 +3,21 @@ name: daily-issue-planning
 description: Sequence open issues for execution with focus on what and where to do today.
 ---
 
+## 0. Check you are running the current prompt
+
+Before anything else, run the drift check in the ludics-lite checkout:
+
+    git -C ~/ludics-lite fetch --quiet origin; git -C ~/ludics-lite status -sb | head -1
+    ~/ludics-lite/scripts/sync-routines.sh
+
+`scripts/sync-routines.sh` with no argument is status mode: one line per local scheduled task, and exit 1 on any drift. Read your own line first — `daily-issue-planning: DRIFT` means the prompt the scheduler dispatched, the one you are reading now, is not the one the checkout holds, so the instructions below may be a superseded revision and the diff it prints says which way. Then read the other lines: this is the only run on this box that looks at them (ludics-lite#199, where the cross-machine sweep ran a week on a prompt predating `--hold`).
+
+The `fetch`/`status -sb` line is not decoration. Status mode compares the installed copies with THIS checkout, not with `origin/main`, so a checkout behind the remote reports `in sync` while the installed prompt is older than what merged; if the branch line says `[behind N]`, the verdict below it is only as current as the checkout.
+
+Do NOT run `sync-routines.sh push`. The installed copies are live scheduler state, and re-installing a prompt is a person's call made after reading the diff; your job is to make the drift visible.
+
+## 1. Update the sequencing plan
+
 Do not start editing until `git -C ~/self-improve pull --rebase` has actually succeeded — the plan is edited from other boxes too, and every recovery below ends by running it again, since nothing else fetches what they pushed. If it does not succeed, a previous run may have left a conflicted rebase behind: finish it (`git -C ~/self-improve rebase --continue`, or `--abort` for a clean tree), pull again, and if you still cannot get a clean pull, stop and report that the plan was not updated at all and why.
 
 Update ~/self-improve/ClaudeDesktop/sequencing_plan.md with the account of all currently open issues across my active GitHub repositories: ahrefs/ocannl (PRs at lukstafi/ocannl-staging), lukstafi/flotilla, lukstafi/ocaml-cudajit, lukstafi/ocaml-metal, lukstafi/ocaml-hipjit, lukstafi/ocaml-dataprep, lukstafi/lukstafi.github.io, lukstafi/ludics-lite.
@@ -27,3 +42,7 @@ Arrange the material without unhelpful redundancy, the following are needs, not 
 Updating the doc means removing issues that are closed and adding issues that are missing. For OCANNL, also assign issues that miss a milestone to the appropriate milestone. Keep the file's "Last updated" header to a few lines — the date, the run number, and one line on what changed — because the issue-wave skill reads the whole file live at every invocation; the narrative of the previous day's activity (what merged, what was filed, what closed) goes into the sync commit message, not into the header. After done, do a sync commit of all changes on ~/self-improve and push. If the push does not succeed — rejected, or failing for any other reason (auth, network, remote down) — run `git -C ~/self-improve pull --rebase` once and push again. If that still fails, do not leave it silent: end your report with an explicit final line saying the plan was updated locally but not pushed, and why (the error, and any rebase conflict you left behind) — other boxes read this file live and would otherwise keep working off a stale plan.
 
 This routine is started inside the ocannl-staging repository, as this one has the richest related memory and context.
+
+## 2. Report
+
+Close the report with the routine-drift finding from step 0 — below step 1's "updated locally but not pushed" line, if that one applies, so neither hides the other: the verdict line for each local routine, the branch line if the checkout is behind `origin/main`, and — when anything drifted — the diff `sync-routines.sh` printed and the two commands that repair it (`git -C ~/ludics-lite pull --ff-only` if the checkout is behind, then `~/ludics-lite/scripts/sync-routines.sh push`, run by a person). Say it even when everything is in sync, in one line: a check whose silence and whose absence look alike is not a check. Re-run the script first if anything this run did could have moved either side.

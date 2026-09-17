@@ -119,6 +119,49 @@ the task directory symlinked into this checkout, and deleting the target here le
 which a plain existence test calls absent. Drop the tombstone once the fleet is known to be clean.
 `ocannl-format-sweep` is the one carried today.
 
+### The push is manual, and two prompts watch for the day it is forgotten
+
+Nothing installs a prompt on its own. Merging a change to `routines/<id>/SKILL.md` moves this
+checkout and nothing else; the scheduler keeps dispatching the copy it already has until a person
+runs, on the box that fires them (`mac-studio`):
+
+```sh
+git -C ~/ludics-lite pull --ff-only     # the checkout is what push installs from
+~/ludics-lite/scripts/sync-routines.sh  # status: what would change, and in which direction
+~/ludics-lite/scripts/sync-routines.sh push
+```
+
+That is the whole discipline, and it is a step in `ship-pr`'s sense of "landed" for any PR that
+touches a prompt here. A git hook could close the window, but installing one is a per-checkout
+side effect this repository has no idiom for — `ship-pr/hooks` is an agent-harness `Stop` hook
+merged into the harness's own settings, not a `.git/hooks` installer — so the push stays a
+documented manual step (ludics-lite#199).
+
+Forgetting it used to be invisible. The scheduler fires on time, the run looks normal, and the
+routine's own record shows nothing amiss, because the only thing that is wrong is that the prompt
+is old: on 2026-09-17 the cross-machine sweep was found to have run about a week on a revision
+predating the `--hold` fix, which is exactly the coverage the sweep exists to provide. So the two
+live prompts now read their own drift, which is the one report that reaches a human every day:
+
+- each one's **step 0** runs `scripts/sync-routines.sh` and reads its OWN verdict line, since a
+  DRIFT there means the instructions it is about to follow are not the ones that were merged;
+- `daily-issue-planning` **also reports the whole verdict**, every routine's line, because it is
+  the only run on this box that looks at the others (the sweep would not see a stale planning
+  prompt, and a retired-but-installed routine belongs to neither);
+- the sweep **notifies** on its own drift, every day it lasts — the same rule as a skip-coverage
+  `FAIL`, and for the same reason: only a person can end it.
+
+Neither routine pushes. The installed copies are live scheduler state, the direction of the drift
+is a judgment (`push` if the checkout is canonical, `pull` if the edit was made in place), and a
+routine that quietly re-installed its own prompt would be the silent step this all exists to
+remove. `scripts/check-prompts.sh` pins the guard from the other side: every routine in
+`LOCAL_ROUTINES` must name `sync-routines.sh` in its prompt, so the step 0 above cannot be edited
+away without CI saying so.
+
+Status mode compares the installed copies with the checkout, not with `origin/main`: a checkout
+behind the remote reports `in sync` while the installed prompt is older than what merged. That is
+why both prompts read `git status -sb` beside the verdict, and why the push recipe pulls first.
+
 ## The cloud routine: synced by hand
 
 `ocannl-ci-red-triage/SKILL.md` is a copy of the prompt of the "ocannl-staging CI-red triage"
@@ -143,7 +186,8 @@ Its non-prompt configuration, for re-creating it:
 
 Like the skills, these prompts name the author's setup in prose and are edited in place:
 `~/self-improve/ClaudeDesktop/sequencing_plan.md` and the repository list in
-`daily-issue-planning`; `~/ocannl-staging`, `~/.ocannl-sweep`, `~/bin/wake-lab.sh` and the box
+`daily-issue-planning`; `~/ludics-lite`, the checkout both prompts run their step-0 drift check in
+(the clone path the top-level README installs); `~/ocannl-staging`, `~/.ocannl-sweep`, `~/bin/wake-lab.sh` and the box
 names `rog`/`minix` (`rog-nv-wsl`, `minix-amd-wsl`) in the cross-machine sweep; the two OCANNL
 repositories in the triage routine. `~/bin/wake-lab.sh` is a symlink to `scripts/wake-lab.sh` in
 this checkout, so the cross-machine sweep's lab lore is reviewable here rather than living only on

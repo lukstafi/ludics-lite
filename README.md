@@ -134,7 +134,13 @@ so the two local ones install as copies under `~/.claude/scheduled-tasks`, pushe
 `scripts/sync-routines.sh` (`status` after a merge that touched a prompt, `push` to install it).
 The desktop app's registry (cron, working directory, model) is not in the repository and is
 recorded in [routines/README.md](routines/README.md), which also carries the install order and the
-symptoms of an unreadable prompt. The third, the CI-red triage routine `ship-pr` defers master's
+symptoms of an unreadable prompt. That push is manual and is part of landing any PR that
+touches a prompt — merging moves this checkout, never the scheduler's copy — so after such a merge,
+on `mac-studio`: `git -C ~/ludics-lite pull --ff-only`, `scripts/sync-routines.sh` to read the
+direction, then `push`. Forgetting it is silent (the routine keeps firing the old prompt and its
+record looks normal), so both live prompts open by running `scripts/sync-routines.sh` and reporting
+their own drift, and `daily-issue-planning` reports every routine's verdict once a day
+(ludics-lite#199). The third, the CI-red triage routine `ship-pr` defers master's
 trailing failures to, runs in the cloud and is synced by hand.
 
 ## The lab script
