@@ -2924,6 +2924,25 @@ conclusion_class() {
   esac
 }
 
+# Orders run rows NEWEST FIRST, on (created_at desc, id desc): rows on stdin, the two columns that
+# hold those fields named as arguments, since the two feeds of workflow runs project them at
+# different offsets. run_signal has ordered its head's feed this way since ludics-lite#83, cmd_base
+# its page per workflow since ludics-lite#90.
+#
+# The rows are ORDERED HERE, not taken as a feed served them. A feed does come back newest-first by
+# `created_at` — a belief the contract still pins, for the reasons each caller notes — but rows
+# created in the SAME SECOND have no order the API documents or the fixtures could encode, and
+# every reader downstream keeps whichever of them it sees first. Two runs a second apart are a
+# re-run or a double dispatch, and which one is "the newest" then decided the verdict by luck.
+# (created_at desc, id desc) settles it: the later second still wins, and a tie inside a second
+# goes to the higher run id, which is the later allocation. That is a total order over the rows, so
+# no reader's answer depends on the order a feed happened to serve. A row whose `created_at` moved
+# or vanished sorts LAST ("-" is below every digit under LC_ALL=C, and the key is reversed), so a
+# shape drift loses to a well-formed row rather than silently winning its key.
+newest_first() { # <created_at column> <id column>; rows on stdin
+  LC_ALL=C sort -t$'\t' -k"$1,$1"r -k"$2,$2"nr
+}
+
 # Prints "class<TAB>name<TAB>conclusion<TAB>url" per non-advisory check-run of <sha>. Returns 3
 # printing NOTHING when the read failed, so the caller can tell an outage from a commit with no
 # checks — collapsing those two is how a merge gate says "nothing is red" about a PR it never read.
@@ -3092,19 +3111,13 @@ run_signal() {
     run_reason 0 "the workflow runs for this head could not be read ($(gh_err_line))"
     return 3
   }
-  # The rows are ORDERED HERE, not taken as the feed served them. The feed does come back
-  # newest-first by `created_at` — a belief the contract still pins, since cmd_base's fold does
-  # rely on it — but rows created in the SAME SECOND have no order the API documents or the
-  # fixtures could encode, and the fold below keeps whichever of them it sees first. Two runs of
-  # one workflow-and-event key a second apart is a re-run or a double dispatch, and which one is
-  # "the newest" then decided the gate's verdict by luck. Sorting on (created_at desc, id desc)
-  # settles it: the later second still wins, and a tie inside a second goes to the higher run id,
-  # which is the later allocation. This is a total order over the rows, so the fold's answer no
-  # longer depends on the feed's order at all — and it spans the pages, which a sort inside the
-  # `--jq` filter would not (gh applies that filter per page). A row whose `created_at` moved or
-  # vanished sorts LAST ("-" is below every digit), so a shape drift loses to a well-formed row
-  # rather than silently winning the key.
-  raw=$(LC_ALL=C sort -t$'\t' -k1,1r -k2,2nr <<<"$raw")
+  # Ordered before the fold (see newest_first): two runs of one workflow-and-event key created in
+  # the same second are a re-run or a double dispatch, and the fold below would otherwise keep
+  # whichever of them it saw first. The sort is here rather than inside the `--jq` filter so that
+  # it spans the pages — gh applies that filter per page. The feed's own newest-first order is
+  # still a belief the contract pins, because this endpoint is read unpaged at `per_page=100` and
+  # an order that moved would change WHICH runs a head's page carries; no fold here rests on it.
+  raw=$(newest_first 1 2 <<<"$raw")
   # One row per INVOCATION, the newest — the same `filter=latest` semantics build_checks asks the
   # check API for, and for the same reason: a head can carry several runs of one workflow (a
   # queued invocation cancelled, then a fresh one that passed), and the superseded row's
@@ -4444,22 +4457,16 @@ cmd_base() {
       [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's '$wname' runs on $branch" \
         "($(gh_err_line)); the base's health is UNKNOWN, which is NOT 'green'."
       if [ -n "$part" ]; then
-        # This workflow's rows are ORDERED HERE, not taken as the page served them, exactly as
-        # run_signal has ordered its own feed since ludics-lite#83. The page does come back
-        # newest-first by `created_at` — still a belief the contract pins, because WHICH ten rows
-        # a `per_page=10` page holds depends on it — but rows created in the SAME SECOND have no
-        # order the API documents, and both readers below keep whichever of them they see first:
-        # the fold's newest / newest-completed / newest-judged columns, and base_red_detail's
-        # walk for where a red streak starts. Two pushes to this branch inside one second is
-        # rarer than the two dispatches #83 was about, but the verdict is decided by luck just
-        # the same. (created_at desc, id desc) is a total order over these rows: the later second
-        # still wins, and a tie inside a second goes to the higher run id, the later allocation.
+        # This workflow's rows are ordered before either reader below sees them (see
+        # newest_first): the fold's newest / newest-completed / newest-judged columns, and
+        # base_red_detail's walk for where a red streak starts, both keep whichever row of a
+        # same-second tie they see first. Two pushes to this branch inside one second is rarer
+        # than the two dispatches ludics-lite#83 was about, but the verdict is decided by luck
+        # just the same. The page's own newest-first order stays load-bearing ABOVE the sort, and
+        # the contract still pins it: WHICH ten rows a `per_page=10` page holds depends on it.
         # Sorting each workflow's page on its own, rather than the assembled rows, leaves the
-        # report's per-workflow lines in the order the workflow list gave them. A row whose
-        # `created_at` moved or vanished sorts LAST ("-" is below every digit under LC_ALL=C,
-        # and the key is reversed), so a shape drift loses to a well-formed row rather than
-        # silently winning its workflow.
-        part=$(LC_ALL=C sort -t$'\t' -k6,6r -k8,8nr <<<"$part")
+        # report's per-workflow lines in the order the workflow list gave them.
+        part=$(newest_first 6 8 <<<"$part")
         raw="${raw}${part}"$'\n'
       else
         # A listed non-advisory workflow with NO push runs on this branch yet — just added, or
