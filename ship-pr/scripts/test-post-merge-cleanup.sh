@@ -17,6 +17,11 @@ set -euo pipefail
 {
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 HELPER="$SCRIPT_DIR/post-merge-cleanup.sh"
+# The physical spelling of the template's own parent, whatever /tmp is a link to on this host --
+# /private/tmp on macOS, itself on Linux, and neither is hardcoded: the removal guard below
+# compares against THIS, so a host where /tmp points somewhere else neither leaks its scratch tree
+# nor needs a new arm (ludics-lite#208, review round 1).
+TEST_ROOT_PARENT=$(cd /tmp && pwd -P) || exit 1
 TEST_ROOT=$(mktemp -d "/tmp/post-merge-cleanup-test.XXXXXX") || exit 1
 # Physically resolved, and this suite needs it most: the helper under test refuses anything but
 # the exact session-worktree root, and computes that root with `pwd -P` (its canonical_dir). On
@@ -46,12 +51,14 @@ cleanup() {
   for pid in ${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}; do
     wait "$pid" >/dev/null 2>&1 || true
   done
-  # Both spellings of the one directory: the template above is the literal /tmp, and /tmp is a
-  # symlink to /private/tmp on macOS, so the resolved root this suite now works in is spelled
-  # /private/tmp there. Matching only the first pattern would refuse to remove the suite's own
-  # root on every macOS run and leak a scratch tree per run (ludics-lite#208).
+  # $TEST_ROOT is now the PHYSICAL spelling of a directory the template made under /tmp, so the
+  # guard compares it against the physical spelling of that same parent rather than against the
+  # literal the template used. Matching `/tmp/...` alone would refuse to remove the suite's own
+  # root on every macOS run -- where /tmp is a symlink to /private/tmp -- and leak a scratch tree
+  # per run (ludics-lite#208). The pattern is still anchored and still carries the suite's own
+  # name: it stays a guard against removing something this suite did not make.
   case "$TEST_ROOT" in
-  /tmp/post-merge-cleanup-test.* | /private/tmp/post-merge-cleanup-test.*) rm -rf "$TEST_ROOT" ;;
+  "$TEST_ROOT_PARENT"/post-merge-cleanup-test.*) rm -rf "$TEST_ROOT" ;;
   *) echo "refusing to remove unexpected test root: $TEST_ROOT" >&2 ;;
   esac
 }

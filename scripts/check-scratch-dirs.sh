@@ -119,11 +119,22 @@ for f in "${files[@]}"; do
   display=$f
   case "$f" in "$ROOT"/*) display=${f#"$ROOT"/} ;; esac
   awk -v file="$display" '
-    # A `#` that opens a comment: at the start of a word and outside quotes. Without the quote
-    # state, the `#` in ${var#x} and in a quoted "#" would truncate the line, and a truncation
-    # here can only HIDE a use, never invent one -- so the state machine is kept simple and the
-    # error is in the direction of scanning more of the line than less.
-    function strip(s,   out, i, ch, q) {
+    # THE TEXT THIS SCANNER READS is the file with three things taken out, because none of them is
+    # shell this file executes: a comment (it is where the resolution gets explained, and naming
+    # the variable there is not a use), the CONTENTS of a single-quoted run, and a heredoc body.
+    # The last two are round 1: a usage string `echo '"'"'TMP=$(mktemp -d /tmp/x.XXXXXX)'"'"'`, or the
+    # same text in a documentation heredoc, was read as a real allocation and refused — and since
+    # this guard judges every head, adding ordinary help text to any scanned script would have
+    # turned CI red. Single-quoted contents are blanked rather than deleted, so the STRUCTURE of
+    # the line (an assignment outside the quotes, the `trap` in front of them) survives. The cost
+    # is that a `mktemp -d` inside `bash -c '"'"'...'"'"'` is out of scope; that is a script being
+    # generated or handed to another shell, and this guard reads the file in front of it.
+    #
+    # Two steps, because the heredoc OPENER has to be read before the blanking: `cat <<'"'"'USAGE'"'"'`
+    # names its delimiter inside single quotes, and blanking it first left the scanner waiting for
+    # a terminator that never came -- which swallowed the rest of the file, and with it the very
+    # mktemp the fixtures were watching for.
+    function decomment(s,   out, i, ch, q) {
       out = ""; q = ""
       for (i = 1; i <= length(s); i++) {
         ch = substr(s, i, 1)
@@ -131,8 +142,29 @@ for f in "${files[@]}"; do
           if (ch == "#" && (out == "" || substr(out, length(out), 1) ~ /[ \t]/)) return out
           if (ch == "\\") { out = out ch substr(s, i + 1, 1); i++; continue }
           if (ch == "\"" || ch == "'"'"'") q = ch
-        } else if (ch == q) q = ""
+        } else if (ch == q) {
+          q = ""
+        }
         out = out ch
+      }
+      return out
+    }
+    # Inside a single-quoted run the character is data: keep the width, lose the meaning. A
+    # double-quoted run is kept as it is -- every template in this repository is one.
+    function blank_sq(s,   out, i, ch, q) {
+      out = ""; q = ""
+      for (i = 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        if (q == "") {
+          if (ch == "\\") { out = out ch substr(s, i + 1, 1); i++; continue }
+          if (ch == "\"" || ch == "'"'"'") q = ch
+          out = out ch
+        } else if (ch == q) {
+          q = ""
+          out = out ch
+        } else {
+          out = out (q == "'"'"'" ? "x" : ch)
+        }
       }
       return out
     }
@@ -141,8 +173,8 @@ for f in "${files[@]}"; do
       return (s ~ ("\\$" name "([^A-Za-z0-9_]|$)")) || (s ~ ("\\$\\{" name "[^A-Za-z0-9_]"))
     }
     # The leading `$VAR` / `${VAR}` of a template, or "" when it does not start with one. A
-    # `${TMPDIR:-/tmp}` is deliberately NOT one: the name carries a default, which means the
-    # value is whatever the environment said and nothing resolved it.
+    # `${TMPDIR:-/tmp}` is deliberately NOT one: the name carries a default, which means the value
+    # is whatever the environment said and nothing resolved it.
     function lead_var(t,   m) {
       if (t ~ /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/) {
         m = substr(t, 3); sub(/\}.*/, "", m); return m
@@ -152,18 +184,61 @@ for f in "${files[@]}"; do
       }
       return ""
     }
+    # A `mktemp -d` CALL: the option, then whitespace, end of text, or any character that can end a
+    # word in shell. `$(mktemp -d)` takes no template at all and defaults to tmp.XXXXXXXXXX, which
+    # is every bit as unresolved as a spelled-out one, and a rule that demanded whitespace after
+    # the `-d` reported that file clean (round 1).
+    function has_mktemp_d(s) { return s ~ /mktemp[ \t]+-d([ \t)|&;<>"'"'"']|$)/ }
+    # Its template: the first word after `-d`, unquoted; "" when there is none.
+    function template_of(s,   t) {
+      t = s
+      if (t !~ /mktemp[ \t]+-d[ \t]+[^ \t)|&;<>]/) return ""
+      sub(/^.*mktemp[ \t]+-d[ \t]+/, "", t)
+      sub(/[ \t].*$/, "", t)
+      gsub(/["'"'"']/, "", t)
+      return t
+    }
     function refuse(line, why) {
       printf "::error file=%s,line=%d::%s:%d: %s\n", file, line, file, line, why
       bad = 1
     }
-    # Pass 1 collects the functions whose body carries `pwd -P` (canonical_dir and its kin) and
-    # every assignment in the file; pass 2 does the scanning. Reading the file twice is what lets
-    # a resolver, or a resolved root, defined BELOW its first use still count — post-merge-cleanup.sh
-    # sets TEMP_ROOT at the bottom and builds scratch directories on it from functions at the top,
-    # and a one-pass scanner reported all three of those as unresolved.
+    # Pass 1 collects the code text of every line, the functions whose body carries `pwd -P`
+    # (canonical_dir and its kin), and every assignment. Pass 2 does the scanning. Reading the
+    # file twice is what lets a resolver, or a resolved root, defined BELOW its first use still
+    # count -- post-merge-cleanup.sh sets TEMP_ROOT at the bottom and builds scratch directories
+    # on it from functions at the top, and a one-pass scanner reported all three as unresolved.
     FNR == NR {
+      last = FNR
       raw[FNR] = $0
-      l = strip($0)
+      if (hd != "") {                      # inside a heredoc body: data, not code
+        if ($0 == hd || (hdtab && $0 ~ ("^[ \t]*" hd "$"))) hd = ""
+        code[FNR] = ""
+        next
+      }
+      src = decomment($0)                  # comments gone, quotes still readable
+      l = blank_sq(src)
+      code[FNR] = l
+      # A heredoc opener: `<<WORD`, `<<-WORD`, `<<"WORD"`, `<<'"'"'WORD'"'"'`. The body starts on the
+      # next line and belongs to whatever reads it, not to this file.
+      if (src ~ /<<-?[ \t]*["'"'"']?[A-Za-z_][A-Za-z0-9_]*["'"'"']?/) {
+        d = src
+        sub(/^.*<<-?[ \t]*/, "", d)
+        hdtab = (src ~ /<<-/)
+        gsub(/^["'"'"']/, "", d)
+        sub(/["'"'"'].*$/, "", d)
+        sub(/[^A-Za-z0-9_].*$/, "", d)
+        if (d != "") hd = d
+      }
+      if (l ~ /^[ \t]*(local[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) {
+        nm = l
+        sub(/^[ \t]*(local[ \t]+|export[ \t]+)?/, "", nm)
+        val = nm
+        sub(/=.*$/, "", nm)
+        sub(/^[^=]*=/, "", val)
+        an[FNR] = nm
+        av[FNR] = val
+        count[nm]++
+      }
       if (l ~ /^[ \t]*(function[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/) {
         fname = l
         sub(/^[ \t]*(function[ \t]+)?/, "", fname)
@@ -174,39 +249,9 @@ for f in "${files[@]}"; do
       } else if (infunc != "" && l ~ /pwd[ \t]+-P/) {
         resolver[infunc] = 1
       }
-      if (l ~ /^[ \t]*(local[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) {
-        nm = l
-        sub(/^[ \t]*(local[ \t]+|export[ \t]+)?/, "", nm)
-        val = nm
-        sub(/=.*$/, "", nm)
-        sub(/^[^=]*=/, "", val)
-        an[FNR] = nm
-        av[FNR] = val
-      }
-      last = FNR
       next
     }
-    # The fixpoint, once, before the first line of pass 2 is judged: a resolved variable can be
-    # named by an assignment anywhere in the file, and a chain (TEMP_ROOT -> a mktemp under it ->
-    # a path under that) takes one round per link. Five rounds is more than any chain here; a
-    # longer one simply does not certify its tail, which refuses rather than passes.
-    FNR == 1 {
-      for (round = 0; round < 5; round++)
-        for (i = 1; i <= last; i++) {
-          if (!(i in an) || (an[i] in resolved)) continue
-          if (av[i] ~ /mktemp[ \t]+-d/) {
-            tpl = av[i]
-            sub(/^.*mktemp[ \t]+-d[ \t]+/, "", tpl)
-            sub(/[ \t].*$/, "", tpl)
-            gsub(/["'"'"']/, "", tpl)
-            lv = lead_var(tpl)
-            if (lv != "" && (lv in resolved)) resolved[an[i]] = 1
-            continue
-          }
-          if (value_resolves(av[i])) resolved[an[i]] = 1
-        }
-    }
-    # Is the value of an assignment one that yields a physical path?
+    # Does the value of an ordinary assignment yield a physical path?
     function value_resolves(val,   inner, fn, arg, lv) {
       if (val ~ /pwd[ \t]+-P/) return 1
       if (val ~ /^\$\(/) {
@@ -215,56 +260,101 @@ for f in "${files[@]}"; do
         gsub(/^[ \t]+/, "", inner)
         fn = inner; sub(/[ \t].*$/, "", fn)
         if (fn in resolver) return 1
-        if (fn == "dirname") {
+        if (fn == "dirname") {             # the parent of a physical path is physical
           arg = inner; sub(/^dirname[ \t]*/, "", arg); gsub(/["'"'"']/, "", arg)
           lv = lead_var(arg)
           if (lv != "" && (lv in resolved)) return 1
         }
         return 0
       }
-      # A plain string whose leading component is a resolved variable.
       inner = val; gsub(/^["'"'"']|["'"'"']$/, "", inner)
       lv = lead_var(inner)
       return (lv != "" && (lv in resolved)) ? 1 : 0
     }
-    # The first line after <from> that USES <name>, or 0. Comments and `trap` lines are not uses:
-    # a comment is where the resolution gets explained, and a trap body runs at exit, after every
-    # resolution in the file.
+    # The rest of the assignment line, past the `$(...)` the value opens with. A use HERE is a use
+    # before the resolution on the next line: `TMP=$(mktemp -d ...); consume "$TMP"` handed the
+    # unresolved spelling to consume, and the line-granular first-use scan read it as clean
+    # (round 1).
+    function tail_of(l,   i, depth, ch, started) {
+      depth = 0; started = 0
+      for (i = 1; i <= length(l); i++) {
+        ch = substr(l, i, 1)
+        if (ch == "(") { depth++; started = 1 }
+        else if (ch == ")") { depth--; if (started && depth <= 0) return substr(l, i + 1) }
+      }
+      return ""
+    }
+    # The first line after <from> that USES <name>, or 0. A `trap` line is not one: its body runs
+    # at exit, after every resolution in the file, and two of the three suites that already do
+    # this right register their cleanup between the mktemp and the resolution.
     function first_use(name, from,   i, l) {
       for (i = from + 1; i <= last; i++) {
-        l = strip(raw[i])
+        l = code[i]
         gsub(/^[ \t]+/, "", l)
-        if (l == "" || l ~ /^#/) continue
+        if (l == "") continue
         if (l ~ /^trap[ \t]/) continue
         if (mentions(l, name)) return i
       }
       return 0
     }
+    # Is the mktemp assignment at line <i> resolved by the line below it -- and not used before
+    # that? Text only, so it can be computed before the fixpoint that consults it.
+    function resolved_below(i,   nm, l, u) {
+      nm = an[i]
+      if (mentions(tail_of(code[i]), nm)) return 0
+      u = first_use(nm, i)
+      if (u == 0) return 0
+      l = code[u]
+      gsub(/^[ \t]+/, "", l)
+      return (l ~ ("^(local[ \t]+|export[ \t]+)?" nm "=") && l ~ /pwd[ \t]+-P/) ? 1 : 0
+    }
+    # The fixpoint, once, before the first line of pass 2 is judged. A name is resolved only when
+    # EVERY assignment to it leaves a physical path: `BASE=$(cd /tmp && pwd -P)` followed by
+    # `BASE=${TMPDIR:-/tmp}` is not a resolved BASE, and a name-global set that never looked at the
+    # second assignment let a plain reassignment walk a scratch directory past the guard (round 1).
+    # A `mktemp -d` assignment counts as leaving one when it inherits a resolved root or is
+    # resolved on the line below, which is what lets a CHAIN of scratch directories certify its
+    # tail. Order does not enter into it, and five rounds is more than any chain here; a longer one
+    # simply does not certify its tail, which refuses rather than passes.
+    FNR == 1 {
+      for (i = 1; i <= last; i++) if (i in an) mkok[i] = resolved_below(i)
+      for (round = 0; round < 5; round++) {
+        for (n in seen) delete seen[n]
+        for (n in bad_assign) delete bad_assign[n]
+        for (i = 1; i <= last; i++) {
+          if (!(i in an)) continue
+          seen[an[i]] = 1
+          if (has_mktemp_d(av[i])) {
+            lv = lead_var(template_of(av[i]))
+            if ((lv != "" && (lv in resolved)) || mkok[i]) continue
+            bad_assign[an[i]] = 1
+          } else if (!value_resolves(av[i])) {
+            bad_assign[an[i]] = 1
+          }
+        }
+        for (n in seen) if (!(n in bad_assign)) resolved[n] = 1; else delete resolved[n]
+      }
+    }
     {
-      line = strip(raw[FNR])
-      if (line !~ /mktemp[ \t]+-d([ \t]|$)/) next
+      line = code[FNR]
+      if (!has_mktemp_d(line)) next
       if (line !~ /^[ \t]*(local[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=\$\(/) {
         refuse(FNR, "a `mktemp -d` whose result is not captured in a variable assignment: this guard resolves a scratch directory by following the variable it lands in, and cannot follow this one — write it as `VAR=$(mktemp -d ...)` and resolve VAR with `pwd -P`")
         next
       }
-      nm = line
-      sub(/^[ \t]*(local[ \t]+|export[ \t]+)?/, "", nm)
-      sub(/=.*$/, "", nm)
-      # The template: the first word after `-d`, unquoted.
-      tpl = line
-      sub(/^.*mktemp[ \t]+-d[ \t]+/, "", tpl)
-      sub(/[ \t].*$/, "", tpl)
-      gsub(/["'"'"']/, "", tpl)
-      lv = lead_var(tpl)
+      nm = an[FNR]
+      lv = lead_var(template_of(line))
       if (lv != "" && (lv in resolved)) next   # inherited from a resolved root
+      if (mkok[FNR]) next
+      if (mentions(tail_of(line), nm)) {
+        refuse(FNR, "a `mktemp -d` into $" nm " that is used later on its OWN line, before anything could resolve it: the resolution below does not reach a command that already ran with the environment'"'"'s spelling — put `" nm "=$(cd \"$" nm "\" && pwd -P)` between them")
+        next
+      }
       u = first_use(nm, FNR)
       if (u == 0) {
         refuse(FNR, "a `mktemp -d` into $" nm " that is never used and never resolved: if the directory is wanted, resolve it with `" nm "=$(cd \"$" nm "\" && pwd -P)`; if it is not, drop the call")
         next
       }
-      l = strip(raw[u])
-      gsub(/^[ \t]+/, "", l)
-      if (l ~ ("^(local[ \t]+|export[ \t]+)?" nm "=") && l ~ /pwd[ \t]+-P/) next
       refuse(FNR, "a `mktemp -d` into $" nm " whose result is used at line " u " without being resolved physically: mktemp answers with the path as the environment spells it, and on macOS /var and /tmp are symlinks into /private, so this is a second spelling of a directory every `pwd -P` in the repository names differently — an assertion comparing it against a script'"'"'s output stops matching in silence, and a \"must NOT appear\" one then passes over anything. Add `" nm "=$(cd \"$" nm "\" && pwd -P)` directly below, or build the template on a directory this file already resolved")
     }
     END { exit bad ? 1 : 0 }

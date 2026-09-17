@@ -169,6 +169,38 @@ echo "$ROOT"
 EOF
 expect "a file with no mktemp -d passes" 0 "$CLEAN" -- "$CS" "$TMP/safe_no_mktemp.sh"
 
+# Round 1: a usage string is data. `echo 'TMP=$(mktemp -d ...)'` in a --help body is not an
+# allocation, and refusing it would turn CI red the day any scanned script grows help text.
+probe safe_quoted_usage <<'EOF'
+usage() {
+  echo 'Every suite opens with TMP=$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX") and resolves it.'
+}
+EOF
+expect "a mktemp -d inside a single-quoted string is data, not code" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_quoted_usage.sh"
+
+# ...and so is a heredoc body: it belongs to whatever reads it.
+probe safe_heredoc <<'OUTER'
+cat <<'DOC'
+The idiom is TMP=$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX"), resolved on the line below.
+DOC
+cat <<-TABBED
+	and an indented one: work=$(mktemp -d /tmp/work.XXXXXX)
+	TABBED
+OUTER
+expect "a mktemp -d inside a heredoc body is data, not code" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_heredoc.sh"
+
+# A template-less `mktemp -d` defaults to tmp.XXXXXXXXXX under $TMPDIR -- as unresolved as a
+# spelled-out template, and resolved the same way.
+probe safe_no_template <<'EOF'
+d=$(mktemp -d) || exit 1
+d=$(cd "$d" && pwd -P) || exit 1
+echo "$d"
+EOF
+expect "a template-less mktemp -d that is resolved passes" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_no_template.sh"
+
 # --- the shapes that must be refused --------------------------------------------------------
 
 probe bad_tmpdir <<'EOF'
@@ -231,6 +263,52 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
 EOF
 expect "a mktemp -d that is never used and never resolved is refused" 1 'never used and never resolved' -- \
   "$CS" "$TMP/bad_unused.sh"
+
+# Round 1: the common `$(mktemp -d)` takes no template at all. A rule that demanded whitespace
+# after the `-d` never saw it, and reported the file clean.
+probe bad_no_template <<'EOF'
+d=$(mktemp -d) || exit 1
+echo "$d"
+EOF
+expect "a template-less mktemp -d that is not resolved is refused" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_no_template.sh"
+
+# ...and the body must END where its terminator says. A delimiter named inside single quotes --
+# `cat <<'USAGE'`, the shape every usage() in this repository uses -- was read after the quotes had
+# been blanked, so the scanner waited for a terminator that could never arrive and swallowed the
+# rest of the file. Everything below such a heredoc must still be judged:
+probe bad_after_heredoc <<'OUTER'
+usage() {
+  cat <<'USAGE'
+usage: thing [--list]
+USAGE
+}
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+mkdir -p "$TMP/bin"
+OUTER
+expect "an unresolved scratch dir below a quoted-delimiter heredoc is still refused" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_after_heredoc.sh"
+
+# Round 1: resolved-ness is a property of the name across the WHOLE file, so an ordinary
+# reassignment un-resolves it. Without this, a resolved root could be overwritten with the
+# environment's own spelling and every scratch directory under it would still read as clean.
+probe bad_reassigned_root <<'EOF'
+BASE=$(cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+BASE=${TMPDIR:-/tmp}
+work=$(mktemp -d "$BASE/work.XXXXXX") || exit 1
+echo "$work"
+EOF
+expect "a resolved root that is reassigned no longer certifies what is under it" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_reassigned_root.sh"
+
+# Round 1: the use can share the assignment's own line, and the resolution below does not reach a
+# command that already ran.
+probe bad_same_line_use <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX"); consume "$TMP"
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+EOF
+expect "a use on the assignment line itself is refused" 1 'used later on its OWN line' -- \
+  "$CS" "$TMP/bad_same_line_use.sh"
 
 # --- the default sweep's scope --------------------------------------------------------------
 # With no arguments the guard reads every `*/scripts/*.sh` and `scripts/*.sh` in its checkout.
