@@ -437,7 +437,7 @@ slot_files() {
 slot_mentions() {
   local q="'"
   RE_DIGIT="[^a-z0-9_.-]mac-studio=[^[:space:]\`\"$q),;]*" \
-  RE_WORD="[[:space:]]on[[:space:]]+mac-studio([^a-z0-9-]|$)" \
+  RE_WORD="[[:space:]]on[[:space:]]+mac-studio([^a-z0-9_.-]|$)" \
   NUMERALS="$(printf '%s' " $NUMERALS " | tr -s '[:space:]' ' ')" \
   awk "$SLOT_AWK_LIB"'
     # Each line is joined into one text, and masked alongside it: `a` marks a character inside an
@@ -517,14 +517,21 @@ slot_mentions() {
     # separated by single blanks, or empty when the word there is not a numeral. A word carrying
     # trailing punctuation ENDS the run without joining it, so the `one.` closing a sentence does
     # not join the `Six` opening the next.
-    function numerals_before(at,   from, w, k, i, word, run) {
+    function numerals_before(at,   from, w, k, i, word, run, joined) {
       from = at - 90; if (from < 1) from = 1
       k = split(substr(lower, from, at - from), w, /[[:space:]]+/)
-      run = ""
+      run = ""; joined = ""
       for (i = k; i >= 1; i--) {
         word = w[i]; sub(/^[^a-z]+/, "", word)
-        if (word !~ /^[a-z][a-z-]*$/ || !numeral(word)) break
-        run = (run == "") ? word : word " " run
+        if (word !~ /^[a-z][a-z-]*$/) break
+        if (numeral(word)) {
+          run = (joined != "") ? word " " joined " " run : (run == "" ? word : word " " run)
+          joined = ""
+        }
+        # `one hundred and six` is one numeral; `and` joins only between two of them, so a bare
+        # `and` before the phrase (`… and six on mac-studio`) leaves the run at six.
+        else if (word == "and" && run != "" && joined == "") joined = "and"
+        else break
       }
       return run
     }
@@ -578,7 +585,10 @@ slot_default() {
   awk "$SLOT_AWK_LIB"'
     # A heredoc body is data the script WRITES, not code it runs: this one hands workers their
     # briefs, and a column-zero `SLOTS=` inside one assigns nothing. Bodies are skipped whole.
-    BEGIN { hd = "<<-?[[:space:]]*[\"\\\\" sprintf("%c", 39) "]?[A-Za-z_][A-Za-z0-9_]*" }
+    # A delimiter is any word (`<<123` is valid), quoted however; the leading `[^<]` keeps a
+    # here-STRING (`read -r -a pairs <<< "$SLOTS"`) from reading as a heredoc opened by its
+    # second `<`.
+    BEGIN { hd = "(^|[^<])<<-?[[:space:]]*[\"\\\\" sprintf("%c", 39) "]?[^[:space:];&|<>()]+" }
     queued > 0 {
       line = $0; if (dash[1]) sub(/^\t+/, "", line)
       if (line == delims[1]) {                 # this body ends; the next one on that line begins
@@ -593,6 +603,7 @@ slot_default() {
       rest = $0
       while (match(rest, hd)) {
         tag = substr(rest, RSTART, RLENGTH)
+        sub(/^[^<]/, "", tag)                  # the guard character, when the match took one
         queued++
         dash[queued] = (substr(tag, 3, 1) == "-")
         sub(/^<<-?[[:space:]]*/, "", tag); gsub(/["'"'"'\\]/, "", tag)   # bare, quoted or backslashed

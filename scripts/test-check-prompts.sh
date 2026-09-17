@@ -591,6 +591,31 @@ slots_tree
 printf ": <<'HD'\nSLOTS=mac-studio=%s\nHD\n" "$OTHER" >> "$R/$WORKER"
 expect "a SLOTS line inside a heredoc assigns nothing" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
+# `and` joins a numeral phrase, and only between two numerals: the phrase is the count, while a
+# bare `and` before it leaves the run where it was.
+slots_tree
+slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(one hundred and six on mac-studio/'
+expect "a numeral phrase joined by 'and' is read whole" 1 "native-claude.md: spells the mac-studio slot count 'one hundred and six'" -- "$CP" "$R"
+slots_tree
+slots_edit issue-wave/references/native-claude.md "s/([a-z]* on mac-studio/(a slot and $(sed -n 's/.*(\([a-z]*\) on mac-studio.*/\1/p' "$SRC/issue-wave/references/native-claude.md" | head -1) on mac-studio/"
+expect "...while a bare 'and' before it joins nothing" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# The box-name boundary is the same on the far side of the name: `mac-studio_backup` is another box.
+slots_tree
+slots_edit README.md 's/([a-z]* on$/(six on/;s/^mac-studio)/mac-studio_backup)/'
+expect "a count about mac-studio_backup is not this box's either" 1 'README.md: states no mac-studio slot count' -- "$CP" "$R"
+
+# A heredoc delimiter is a word, not a shell identifier -- and a here-STRING is not a heredoc.
+slots_tree
+printf ': <<123\nSLOTS=mac-studio=%s\n123\n' "$OTHER" >> "$R/$WORKER"
+expect "a heredoc delimited by digits is still a heredoc" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+slots_tree
+printf 'read -r -a pairs <<<"$SLOTS"\nSLOTS=mac-studio=%s\n' "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "...and a here-string opens no body for the next line to hide in" \
+  || ko "...and a here-string opens no body for the next line to hide in (rc=$rc) -- $out"
+
 # A box name may hold `_` and `.` as well as `-`, so the boundary before the name is "a character
 # a box name could hold": `not_mac-studio` is another box, and the roster then names no mac-studio.
 slots_tree
