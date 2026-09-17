@@ -274,6 +274,7 @@ for f in "${files[@]}"; do
       } else if (infunc != "" && l ~ /\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)/) {
         resolver[infunc] = 1     # canonical_dir and its kin, by body and not by name
       }
+      funcof[FNR] = infunc       # which function a line is inside, for the local shadows below
       next
     }
     # Does the value of an ordinary assignment yield a physical path? The house idiom and nothing
@@ -282,6 +283,7 @@ for f in "${files[@]}"; do
     # printf %s "${TMPDIR:-/tmp}")` leaves the environment spelling and was marked resolved
     # (round 2) -- and a guard that names one idiom in its refusals may as well require it.
     function value_resolves(val,   inner, fn, arg, lv) {
+      sub(/^"/, "", val)                       # `VAR="$(...)"` is the same capture as `VAR=$(...)`
       if (val ~ /^\$\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)/) return 1
       if (val ~ /^\$\(/) {
         inner = substr(val, 3)
@@ -318,12 +320,18 @@ for f in "${files[@]}"; do
     # it data. Skipping the whole trap LINE, as the first cut did, also hid a `trap ... ; consume
     # "$TMP"` beside it -- and hid a DOUBLE-quoted body, whose expansion happens when the trap is
     # registered and is a genuine use of the unresolved spelling (round 2).
+    # A bare-name `export TMP` is a use too, and the one that does not look like one: the value
+    # goes into the environment of every command after it, so a `consume` two lines down receives
+    # the unresolved spelling without any textual expansion for this scanner to see (round 3).
+    function exports(s, name) {
+      return s ~ ("^(export|readonly|declare|typeset)[ \t]+([^ \t]+[ \t]+)*" name "([ \t=]|$)")
+    }
     function first_use(name, from,   i, l) {
       for (i = from + 1; i <= last; i++) {
         l = code[i]
         gsub(/^[ \t]+/, "", l)
         if (l == "") continue
-        if (mentions(l, name)) return i
+        if (mentions(l, name) || exports(l, name)) return i
       }
       return 0
     }
@@ -331,12 +339,12 @@ for f in "${files[@]}"; do
     # that? Text only, so it can be computed before the fixpoint that consults it.
     function resolved_below(i,   nm, l, u) {
       nm = an[i]
-      if (mentions(tail_of(code[i]), nm)) return 0
+      if (mentions(tail_of(code[i]), nm) || exports(tail_of(code[i]), nm)) return 0
       u = first_use(nm, i)
       if (u == 0) return 0
       l = code[u]
       gsub(/^[ \t]+/, "", l)
-      return (l ~ ("^(local[ \t]+|export[ \t]+)?" nm "=\\$\\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)")) ? 1 : 0
+      return (l ~ ("^(local[ \t]+|export[ \t]+)?" nm "=\"?\\$\\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)")) ? 1 : 0
     }
     # The fixpoint, once, before the first line of pass 2 is judged. A name is resolved only when
     # EVERY assignment to it leaves a physical path: `BASE=$(cd /tmp && pwd -P)` followed by
@@ -360,6 +368,15 @@ for f in "${files[@]}"; do
         # an entry -- the mktemp rules below are about the LINE and apply wherever it is written --
         # but it is left out of the name-global conjunction.
         isloc[i] = (nm ~ /^(local|declare|typeset)[ \t]/) ? 1 : 0
+        # A local that SHADOWS a name: inside this function the global'"'"'s resolution says nothing
+        # about the value, so nothing there may inherit from it. Leaving locals out of the
+        # conjunction (round 2) fixed the false refusal and opened this, its inverse (round 3).
+        if (isloc[i]) {
+          nmloc = nm
+          sub(/^(local|declare|typeset)[ \t]+/, "", nmloc)
+          sub(/=.*$/, "", nmloc)
+          shadow[funcof[i] SUBSEP nmloc] = 1
+        }
         sub(/^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)/, "", nm)
         val = nm
         sub(/=.*$/, "", nm)
@@ -376,6 +393,7 @@ for f in "${files[@]}"; do
           seen[an[i]] = 1
           if (has_mktemp_d(av[i])) {
             lv = lead_var(template_of(av[i]))
+            if (lv != "" && ((funcof[i] SUBSEP lv) in shadow)) lv = ""
             if ((lv != "" && (lv in resolved)) || mkok[i]) continue
             bad_assign[an[i]] = 1
           } else if (!value_resolves(av[i])) {
@@ -388,15 +406,16 @@ for f in "${files[@]}"; do
     {
       line = code[FNR]
       if (!has_mktemp_d(line)) next
-      if (line !~ /^[ \t]*(local[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=\$\(/) {
+      if (line !~ /^[ \t]*(local[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/) {
         refuse(FNR, "a `mktemp -d` whose result is not captured in a variable assignment: this guard resolves a scratch directory by following the variable it lands in, and cannot follow this one — write it as `VAR=$(mktemp -d ...)` and resolve VAR with `pwd -P`")
         next
       }
       nm = an[FNR]
       lv = lead_var(template_of(line))
+      if (lv != "" && ((funcof[FNR] SUBSEP lv) in shadow)) lv = ""   # a local shadow, not the global
       if (lv != "" && (lv in resolved)) next   # inherited from a resolved root
       if (mkok[FNR]) next
-      if (mentions(tail_of(line), nm)) {
+      if (mentions(tail_of(line), nm) || exports(tail_of(line), nm)) {
         refuse(FNR, "a `mktemp -d` into $" nm " that is used later on its OWN line, before anything could resolve it: the resolution below does not reach a command that already ran with the environment'"'"'s spelling — put `" nm "=$(cd \"$" nm "\" && pwd -P)` between them")
         next
       }

@@ -226,6 +226,16 @@ EOF
 expect "a function-local of the same name does not un-resolve the global" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_local_shadow.sh"
 
+# Round 3: a quoted command substitution is the same capture. Refusing it would have failed an
+# ordinary spelling in the mandatory lint job.
+probe safe_quoted_capture <<'EOF'
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX")" || exit 1
+TMP="$(cd "$TMP" && pwd -P)" || exit 1
+mkdir -p "$TMP/bin"
+EOF
+expect "a quoted command substitution is still a capture" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_quoted_capture.sh"
+
 # --- the shapes that must be refused --------------------------------------------------------
 
 probe bad_tmpdir <<'EOF'
@@ -384,6 +394,31 @@ TMP=$(cd "$TMP" && pwd -P) || exit 1
 EOF
 expect "a double-quoted trap body is a use, since it expands at registration" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_trap_double_quoted.sh"
+
+# Round 3, the inverse of round 2's scope fix: inside a function that SHADOWS a resolved global,
+# the global's resolution says nothing about the value, so nothing there may inherit from it.
+probe bad_local_shadow_inherits <<'EOF'
+BASE=$(cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+helper() {
+  local BASE=${TMPDIR:-/tmp}
+  work=$(mktemp -d "$BASE/work.XXXXXX") || return 1
+  echo "$work"
+}
+helper
+EOF
+expect "a mktemp under a locally shadowed root does not inherit the global's resolution" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_local_shadow_inherits.sh"
+
+# Round 3: `export TMP` hands the unresolved value to every command after it, with no textual
+# expansion for a scanner to see. It is a use.
+probe bad_bare_export <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+export TMP
+consume
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+EOF
+expect "a bare-name export before the resolution is a use" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_bare_export.sh"
 
 # --- the default sweep's scope --------------------------------------------------------------
 # With no arguments the guard reads every `*/scripts/*.sh` and `scripts/*.sh` in its checkout.
