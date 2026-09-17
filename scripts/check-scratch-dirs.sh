@@ -172,10 +172,18 @@ for f in "${files[@]}"; do
     function mentions(s, name) {
       return (s ~ ("\\$" name "([^A-Za-z0-9_]|$)")) || (s ~ ("\\$\\{" name "[^A-Za-z0-9_]"))
     }
-    # The leading `$VAR` / `${VAR}` of a template, or "" when it does not start with one. A
-    # `${TMPDIR:-/tmp}` is deliberately NOT one: the name carries a default, which means the value
-    # is whatever the environment said and nothing resolved it.
-    function lead_var(t,   m) {
+    # The leading `$VAR` / `${VAR}` of a template, or "" when it does not start with one, AND the
+    # template names exactly one component below it. A `${TMPDIR:-/tmp}` is deliberately not one:
+    # the name carries a default, so the value is whatever the environment said and nothing
+    # resolved it. Neither is `$BASE/cache/work.XXXXXX`: the root may be physical while `cache` is
+    # a symlink, and then mktemp answers through the link exactly as it does under /var
+    # (round 2). The component mktemp itself creates cannot be a link, so one level below a
+    # physical root is physical and everything deeper has to be resolved on its own. Every
+    # inheriting site in this repository is one level down.
+    # The plain variable a string opens with, whatever follows it: `$VAR`, `${VAR}`, or "" when it
+    # opens with neither. `${TMPDIR:-/tmp}` is deliberately neither -- the name carries a default,
+    # so the value is whatever the environment said and nothing resolved it.
+    function var_head(t,   m) {
       if (t ~ /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/) {
         m = substr(t, 3); sub(/\}.*/, "", m); return m
       }
@@ -183,6 +191,21 @@ for f in "${files[@]}"; do
         m = substr(t, 2); sub(/[^A-Za-z0-9_].*/, "", m); return m
       }
       return ""
+    }
+    # The variable a template may INHERIT its resolution from: var_head, and the template names
+    # exactly one component below it. Not `$BASE/cache/work.XXXXXX`: the root may be physical
+    # while `cache` is a symlink, and then mktemp answers through the link exactly as it does
+    # under /var (round 2). The component mktemp itself creates cannot be a link, so one level
+    # below a physical root is physical and everything deeper has to be resolved on its own.
+    # Every inheriting site in this repository is one level down.
+    function lead_var(t,   m, rest) {
+      m = var_head(t)
+      if (m == "") return ""
+      rest = t
+      if (!sub(/^\$\{[A-Za-z_][A-Za-z0-9_]*\}/, "", rest)) sub(/^\$[A-Za-z_][A-Za-z0-9_]*/, "", rest)
+      if (rest !~ /^\//) return ""            # `$BASEsomething`, not a path under $BASE
+      if (substr(rest, 2) ~ /\//) return ""   # more than one component below the root
+      return m
     }
     # A `mktemp -d` CALL: the option, then whitespace, end of text, or any character that can end a
     # word in shell. `$(mktemp -d)` takes no template at all and defaults to tmp.XXXXXXXXXX, which
@@ -215,8 +238,20 @@ for f in "${files[@]}"; do
         code[FNR] = ""
         next
       }
+      # A backslash at end of line continues the command, and bash reads the two physical lines as
+      # one. Joined here, so the call `TMP=$(mktemp \` / `-d "...")` -- which matches nothing on
+      # either line of its own -- is read as what it is (round 2). The continued text is attached
+      # to the line the command STARTED on, which is the line a refusal should name, and the lines
+      # it came from are left empty so nothing is judged twice.
+      if (cont != 0) {
+        code[cont] = code[cont] " " blank_sq(decomment($0))
+        code[FNR] = ""
+        if ($0 !~ /\\$/) cont = 0
+        next
+      }
       src = decomment($0)                  # comments gone, quotes still readable
       l = blank_sq(src)
+      if ($0 ~ /\\$/) { sub(/\\[ \t]*$/, "", l); cont = FNR }
       code[FNR] = l
       # A heredoc opener: `<<WORD`, `<<-WORD`, `<<"WORD"`, `<<'"'"'WORD'"'"'`. The body starts on the
       # next line and belongs to whatever reads it, not to this file.
@@ -229,16 +264,6 @@ for f in "${files[@]}"; do
         sub(/[^A-Za-z0-9_].*$/, "", d)
         if (d != "") hd = d
       }
-      if (l ~ /^[ \t]*(local[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) {
-        nm = l
-        sub(/^[ \t]*(local[ \t]+|export[ \t]+)?/, "", nm)
-        val = nm
-        sub(/=.*$/, "", nm)
-        sub(/^[^=]*=/, "", val)
-        an[FNR] = nm
-        av[FNR] = val
-        count[nm]++
-      }
       if (l ~ /^[ \t]*(function[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/) {
         fname = l
         sub(/^[ \t]*(function[ \t]+)?/, "", fname)
@@ -246,14 +271,18 @@ for f in "${files[@]}"; do
         infunc = fname
       } else if (infunc != "" && l ~ /^\}/) {
         infunc = ""
-      } else if (infunc != "" && l ~ /pwd[ \t]+-P/) {
-        resolver[infunc] = 1
+      } else if (infunc != "" && l ~ /\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)/) {
+        resolver[infunc] = 1     # canonical_dir and its kin, by body and not by name
       }
       next
     }
-    # Does the value of an ordinary assignment yield a physical path?
+    # Does the value of an ordinary assignment yield a physical path? The house idiom and nothing
+    # looser: a command substitution that IS `$(cd <where> && pwd -P)`, with whatever error tail
+    # follows it. A `pwd -P` anywhere in the value proved nothing -- `BASE=$(pwd -P >/dev/null;
+    # printf %s "${TMPDIR:-/tmp}")` leaves the environment spelling and was marked resolved
+    # (round 2) -- and a guard that names one idiom in its refusals may as well require it.
     function value_resolves(val,   inner, fn, arg, lv) {
-      if (val ~ /pwd[ \t]+-P/) return 1
+      if (val ~ /^\$\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)/) return 1
       if (val ~ /^\$\(/) {
         inner = substr(val, 3)
         sub(/\).*$/, "", inner)
@@ -262,7 +291,7 @@ for f in "${files[@]}"; do
         if (fn in resolver) return 1
         if (fn == "dirname") {             # the parent of a physical path is physical
           arg = inner; sub(/^dirname[ \t]*/, "", arg); gsub(/["'"'"']/, "", arg)
-          lv = lead_var(arg)
+          lv = var_head(arg)
           if (lv != "" && (lv in resolved)) return 1
         }
         return 0
@@ -284,15 +313,16 @@ for f in "${files[@]}"; do
       }
       return ""
     }
-    # The first line after <from> that USES <name>, or 0. A `trap` line is not one: its body runs
-    # at exit, after every resolution in the file, and two of the three suites that already do
-    # this right register their cleanup between the mktemp and the resolution.
+    # The first line after <from> that USES <name>, or 0. A deferred `trap '"'"'rm -rf "$TMP"'"'"' EXIT` is
+    # not a use and needs no rule of its own: its body is single-quoted, so blank_sq already made
+    # it data. Skipping the whole trap LINE, as the first cut did, also hid a `trap ... ; consume
+    # "$TMP"` beside it -- and hid a DOUBLE-quoted body, whose expansion happens when the trap is
+    # registered and is a genuine use of the unresolved spelling (round 2).
     function first_use(name, from,   i, l) {
       for (i = from + 1; i <= last; i++) {
         l = code[i]
         gsub(/^[ \t]+/, "", l)
         if (l == "") continue
-        if (l ~ /^trap[ \t]/) continue
         if (mentions(l, name)) return i
       }
       return 0
@@ -306,7 +336,7 @@ for f in "${files[@]}"; do
       if (u == 0) return 0
       l = code[u]
       gsub(/^[ \t]+/, "", l)
-      return (l ~ ("^(local[ \t]+|export[ \t]+)?" nm "=") && l ~ /pwd[ \t]+-P/) ? 1 : 0
+      return (l ~ ("^(local[ \t]+|export[ \t]+)?" nm "=\\$\\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)")) ? 1 : 0
     }
     # The fixpoint, once, before the first line of pass 2 is judged. A name is resolved only when
     # EVERY assignment to it leaves a physical path: `BASE=$(cd /tmp && pwd -P)` followed by
@@ -317,12 +347,32 @@ for f in "${files[@]}"; do
     # tail. Order does not enter into it, and five rounds is more than any chain here; a longer one
     # simply does not certify its tail, which refuses rather than passes.
     FNR == 1 {
+      # The assignment table is built HERE and not in pass 1, so that it reads the joined
+      # continuation lines rather than their halves.
+      for (i = 1; i <= last; i++) {
+        l = code[i]
+        if (l !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) continue
+        nm = l
+        sub(/^[ \t]*/, "", nm)
+        # A `local`/`declare`/`typeset` assignment belongs to one function'"'"'s scope, and a short name
+        # is routinely reused across functions: folding a helper'"'"'s `local BASE=${TMPDIR:-/tmp}` into
+        # the global BASE made a correct file fail the mandatory lint job (round 2). It still gets
+        # an entry -- the mktemp rules below are about the LINE and apply wherever it is written --
+        # but it is left out of the name-global conjunction.
+        isloc[i] = (nm ~ /^(local|declare|typeset)[ \t]/) ? 1 : 0
+        sub(/^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)/, "", nm)
+        val = nm
+        sub(/=.*$/, "", nm)
+        sub(/^[^=]*=/, "", val)
+        an[i] = nm
+        av[i] = val
+      }
       for (i = 1; i <= last; i++) if (i in an) mkok[i] = resolved_below(i)
       for (round = 0; round < 5; round++) {
         for (n in seen) delete seen[n]
         for (n in bad_assign) delete bad_assign[n]
         for (i = 1; i <= last; i++) {
-          if (!(i in an)) continue
+          if (!(i in an) || isloc[i]) continue
           seen[an[i]] = 1
           if (has_mktemp_d(av[i])) {
             lv = lead_var(template_of(av[i]))

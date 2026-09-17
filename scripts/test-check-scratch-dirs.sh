@@ -201,6 +201,31 @@ EOF
 expect "a template-less mktemp -d that is resolved passes" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_no_template.sh"
 
+# Round 2: bash joins a backslash-continued command, so the guard does too -- and the joined text
+# is judged at the line the command started on.
+probe safe_continuation <<'EOF'
+TMP=$(mktemp \
+  -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+echo "$TMP"
+EOF
+expect "a line-continued mktemp -d that is resolved passes" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_continuation.sh"
+
+# Round 2: a `local` assignment belongs to one function's scope, and short names are reused across
+# functions. Folding a helper's local into the global of the same name made a correct file fail.
+probe safe_local_shadow <<'EOF'
+BASE=$(cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+helper() {
+  local BASE=${TMPDIR:-/tmp}
+  echo "$BASE"
+}
+work=$(mktemp -d "$BASE/work.XXXXXX") || exit 1
+echo "$work"
+EOF
+expect "a function-local of the same name does not un-resolve the global" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_local_shadow.sh"
+
 # --- the shapes that must be refused --------------------------------------------------------
 
 probe bad_tmpdir <<'EOF'
@@ -309,6 +334,56 @@ TMP=$(cd "$TMP" && pwd -P) || exit 1
 EOF
 expect "a use on the assignment line itself is refused" 1 'used later on its OWN line' -- \
   "$CS" "$TMP/bad_same_line_use.sh"
+
+# Round 2: ordinary command wrapping must not walk past the guard. Neither physical line carries
+# a `mktemp -d` on its own.
+probe bad_continuation <<'EOF'
+TMP=$(mktemp \
+  -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+mkdir -p "$TMP/bin"
+EOF
+expect "a line-continued mktemp -d that is not resolved is refused" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_continuation.sh"
+
+# Round 2: a `pwd -P` present in the value proves nothing about the value. The resolution has to
+# BE the assignment, which is the one idiom every refusal names.
+probe bad_decorative_pwd <<'EOF'
+BASE=$(pwd -P >/dev/null; printf '%s\n' "${TMPDIR:-/tmp}")
+work=$(mktemp -d "$BASE/work.XXXXXX") || exit 1
+echo "$work"
+EOF
+expect "a side-effect-only pwd -P does not resolve the variable it decorates" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_decorative_pwd.sh"
+
+# Round 2: inheritance reaches exactly one component below a physical root. A deeper template
+# passes through a component that can itself be a symlink -- the same aliasing, one directory in.
+probe bad_deep_template <<'EOF'
+BASE=$(cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+work=$(mktemp -d "$BASE/cache/work.XXXXXX") || exit 1
+echo "$work"
+EOF
+expect "a template that traverses a component below the resolved root is refused" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_deep_template.sh"
+
+# Round 2: the deferred trap is data because its body is single-quoted -- not because it is on a
+# line beginning with `trap`. A command beside it on the same line runs now.
+probe bad_trap_then_use <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+trap 'rm -rf "$TMP"' EXIT; consume "$TMP"
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+EOF
+expect "a command beside a trap on the same line is still a use" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_trap_then_use.sh"
+
+# ...and a DOUBLE-quoted trap body expands when the trap is registered, so it is itself a use of
+# the unresolved spelling.
+probe bad_trap_double_quoted <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+trap "rm -rf $TMP" EXIT
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+EOF
+expect "a double-quoted trap body is a use, since it expands at registration" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_trap_double_quoted.sh"
 
 # --- the default sweep's scope --------------------------------------------------------------
 # With no arguments the guard reads every `*/scripts/*.sh` and `scripts/*.sh` in its checkout.
