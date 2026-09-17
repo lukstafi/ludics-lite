@@ -180,6 +180,12 @@ endpoints, the ssh aliases and all of the logic. `wake-lab.sh --help` prints tha
 To repair the Windows-side NIC settings, copy `scripts/enable-wol-windows.ps1` to the Windows box
 and run it from an elevated PowerShell (`powershell -ExecutionPolicy Bypass -File
 .\enable-wol-windows.ps1`); BIOS/UEFI Wake-on-LAN still has to be enabled separately.
+`scripts/enable-active-hours-windows.ps1` is its counterpart for the other way an unattended lane
+loses a box: it writes back the Windows Update active hours (`ActiveHoursStart=6`,
+`ActiveHoursEnd=0` — the 18-hour maximum — and `SmartActiveHoursState=0`, or a `-Start` / `-End`
+pair of your own, refusing a span Windows cannot mean rather than writing it), printing the values
+before and after. Nothing re-applies those, and a feature update can reset them, which is what
+`wake-lab.sh status` warns about; this is the one-step repair for that warning.
 
 ## Tests
 

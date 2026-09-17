@@ -73,8 +73,9 @@ jobs:
         # half is asserted rather than merely exempted, because the pass the suffix buys is sound
         # only while the class really is the sourced one: a future `*.example.sh` written to be
         # run would otherwise skip the mode check in silence, and a stray `chmod +x` on a template
-        # would void the convention this comment claims. The PowerShell script is outside the glob
-        # entirely -- it is `.ps1`, and `Check PowerShell syntax` parses it rather than running it.
+        # would void the convention this comment claims. The PowerShell scripts are outside the
+        # glob entirely -- they are `.ps1`, and `Check PowerShell syntax` parses them rather than
+        # running them.
         run: |
           set -e
           rc=0
@@ -101,20 +102,36 @@ jobs:
         run: shellcheck --severity=error --external-sources */scripts/*.sh ship-pr/hooks/*.sh scripts/*.sh
       - name: Check PowerShell syntax
         # pwsh is preinstalled on the hosted Ubuntu and macOS images. Parse the Windows repair
-        # script without executing its Windows-only networking and registry commands.
+        # scripts without executing their Windows-only networking and registry commands. The glob
+        # is what keeps this honest: enable-active-hours-windows.ps1 joined enable-wol-windows.ps1
+        # here, and a third repair script must not need an edit to this step to be judged. Only
+        # `scripts/*.ps1` -- the PowerShell under a skill directory
+        # (issue-wave/scripts/test-windows-driver.ps1) is really EXECUTED by the windows-driver
+        # job below, which is a stronger check than parsing it twice.
         run: |
           pwsh -NoProfile -Command '
-            $tokens = $null
-            $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile(
-              (Resolve-Path "scripts/enable-wol-windows.ps1"),
-              [ref] $tokens,
-              [ref] $errors
-            ) > $null
-            if ($errors.Count -ne 0) {
-              $errors | ForEach-Object { Write-Error $_ }
+            $rc = 0
+            $files = @(Get-ChildItem -Path "scripts" -Filter "*.ps1" | Sort-Object Name)
+            if ($files.Count -eq 0) {
+              Write-Error "no scripts/*.ps1 found: the parse check is judging nothing"
               exit 1
             }
+            foreach ($f in $files) {
+              $tokens = $null
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                $f.FullName,
+                [ref] $tokens,
+                [ref] $errors
+              ) > $null
+              if ($errors.Count -ne 0) {
+                $errors | ForEach-Object { Write-Error "$($f.Name): $_" }
+                $rc = 1
+              } else {
+                Write-Host "$($f.Name): parsed"
+              }
+            }
+            exit $rc
           '
       - name: Parse guard
         # post-merge-cleanup.sh and test-post-merge-cleanup.sh are each one brace group ending
