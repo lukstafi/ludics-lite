@@ -321,11 +321,19 @@ warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 # blank.
 GH_ERR=""
 GH_ERR_FILE="${TMPDIR:-/tmp}/pr-review-err.$$"
-# The round snapshot's files live beside it, for the same subshell reason; see "the round
-# snapshot" below for what is in them. Both names are built from `$$`, which a command
-# substitution's subshell inherits from its parent, so the two sides address the same files.
-SNAP="${TMPDIR:-/tmp}/pr-review-snap.$$"
-trap 'rm -f "$GH_ERR_FILE" "$SNAP".*' EXIT
+# The round snapshot's files live in the same directory as GH_ERR_FILE, for the same subshell
+# reason; see "the round snapshot" below for what is in them. They share ONE directory per process, created on the first
+# arm and removed by this trap, rather than a spray of `$$`-keyed files: a watch killed with
+# SIGKILL runs no trap, and one leftover directory a later watch can recognize and sweep beats a
+# handful of loose files nothing ever collects. The pid is in the directory's NAME, which is what
+# makes that sweep possible — see `snapshot_sweep_stale`. SNAP_DIR and SNAP are set in the shell
+# that arms, and a command substitution's subshell inherits both, so the two sides address the
+# same files.
+SNAP_ROOT="${TMPDIR:-/tmp}"
+SNAP_ROOT="${SNAP_ROOT%/}"
+SNAP_DIR=""
+SNAP=""
+trap 'rm -f "$GH_ERR_FILE"; [ -z "$SNAP_DIR" ] || rm -rf "$SNAP_DIR"' EXIT
 
 gateway_failure() {
   case "$1" in
@@ -582,16 +590,66 @@ mark_of() {
 #     through here.
 SNAPSHOT_ARMED=0
 
-# A new round: nothing observed before it may be read as part of it.
-snapshot_arm() {
-  SNAPSHOT_ARMED=1
+# The files of the round in hand, if there are any. Guarded on SNAP rather than assuming it: the
+# snapshot directory is made on the first arm, and before that `rm -f "$SNAP".*` would be
+# `rm -f .*` in whatever directory the caller happens to be standing in.
+snapshot_clear() {
+  [ -n "$SNAP" ] || return 0
   rm -f "$SNAP".*
+}
+
+# The one directory this process's snapshots live in, made on demand. mktemp picks the suffix, so
+# two watches started in the same second cannot collide even if a pid were somehow reused.
+snapshot_dir_ensure() {
+  [ -z "$SNAP_DIR" ] || return 0
+  SNAP_DIR=$(mktemp -d "$SNAP_ROOT/pr-review-snap.$$.XXXXXX" 2>/dev/null) || {
+    SNAP_DIR=""
+    return 1
+  }
+  SNAP="$SNAP_DIR/round"
+}
+
+# A watch killed with SIGKILL never reaches its EXIT trap, so its snapshot directory outlives it.
+# The owning pid is in the name, which is how a later watch tells a dead owner's leftovers from a
+# CONCURRENT watch's live ones — several watches share a TMPDIR routinely, one per PR in flight,
+# and sweeping a live one would pull the feeds out from under its round. Only directories this
+# user owns are considered, since /tmp is shared where TMPDIR is unset. A pid reused by an
+# unrelated live process leaves its directory behind for the next sweep to find; that is the safe
+# way round.
+snapshot_sweep_stale() {
+  local dir pid
+  [ -d "$SNAP_ROOT" ] || return 0
+  for dir in "$SNAP_ROOT"/pr-review-snap.*; do
+    # The unmatched glob itself when there is nothing to sweep. The loose `$$`-keyed FILES the
+    # first cut of the snapshot left in TMPDIR are keyed the same way and are swept on the same
+    # test, so a machine that ran that revision is cleaned up rather than left with its debris.
+    [ -e "$dir" ] || continue
+    [ -O "$dir" ] || continue
+    pid=${dir##*/pr-review-snap.}
+    pid=${pid%%.*}
+    case "$pid" in '' | *[!0-9]*) continue ;; esac
+    if kill -0 "$pid" 2>/dev/null; then continue; fi
+    rm -rf "$dir"
+  done
+}
+
+# A new round: nothing observed before it may be read as part of it. A round whose directory could
+# not be made stays DISARMED — every reader is gated on SNAPSHOT_ARMED, so the watch falls back to
+# the read-for-yourself behaviour the snapshot replaced rather than writing to a bare `.feeds.pr`.
+snapshot_arm() {
+  snapshot_clear
+  if snapshot_dir_ensure; then
+    SNAPSHOT_ARMED=1
+  else
+    SNAPSHOT_ARMED=0
+    warn "could not create a snapshot directory under $SNAP_ROOT; this round's state will read the feeds again"
+  fi
 }
 
 # The round ended without an observation worth sharing (a feed that did not answer). Callers of
 # status_state then read for themselves.
 snapshot_drop() {
-  rm -f "$SNAP".*
+  snapshot_clear
 }
 
 # The watch is over. Disarming is not tidiness: this script's functions outlive a command when it is
@@ -600,7 +658,7 @@ snapshot_drop() {
 # status into a replay of a window that had already ended.
 snapshot_off() {
   SNAPSHOT_ARMED=0
-  rm -f "$SNAP".*
+  snapshot_clear
 }
 
 # Is <kind> (feeds|head) of the current round in hand, and about <pr>?
@@ -2143,8 +2201,12 @@ watch_grace_deadline() {
 # The round snapshot belongs to this command and to nothing after it, hence the wrapper: the loop
 # arms a snapshot on every round, and the arming must not outlive the watch. Its locals stay in
 # watch_loop, which is the scope watch_note_past and pr_head_read reach into.
+#
+# The sweep is here for the same reason: a watch is the only thing that makes snapshot
+# directories, so the start of one is where a directory a SIGKILLed watch left behind is noticed.
 cmd_watch() {
   local rc=0
+  snapshot_sweep_stale
   watch_loop "$@" || rc=$?
   snapshot_off
   return "$rc"
