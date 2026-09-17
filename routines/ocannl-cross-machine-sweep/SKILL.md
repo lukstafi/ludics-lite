@@ -23,6 +23,22 @@ and only a unit that recorded `skip (unreachable)` is uncovered. The CUDA box (r
 twice-weekly scheduled CI sweep, and on demand via `workflow_dispatch`, because at 62-74min it
 set the latency of the whole per-PR matrix.
 
+## 0. Check you are running the current prompt
+
+Before waking anything, run the drift check in the ludics-lite checkout, which is where this prompt is canonical:
+
+    git -C ~/ludics-lite fetch --quiet origin \
+      && git -C ~/ludics-lite rev-parse --abbrev-ref HEAD \
+      && git -C ~/ludics-lite rev-list --left-right --count HEAD...origin/main \
+      && git -C ~/ludics-lite status --porcelain -- routines scripts/sync-routines.sh
+    ~/ludics-lite/scripts/sync-routines.sh
+
+`scripts/sync-routines.sh` with no argument is status mode: one line per local scheduled task, and exit 1 on any drift. Read your own line. `ocannl-cross-machine-sweep: DRIFT` means the prompt the scheduler dispatched — the one you are reading now — is not the one the checkout holds, so the steps below may be a superseded revision; the diff it prints says in what, though not which side is the newer one — its orientation is argument order, and step 6 says how to read that from provenance instead. It is not hypothetical: on 2026-09-17 the installed copy was found nineteen lines of superseded prose behind, still telling the run to wake the lab without `--hold`, and it had been that way for about a week (ludics-lite#199).
+
+Status mode compares the installed copies with THIS checkout, not with `origin/main`, so a checkout behind the remote reports `in sync` while the installed prompt is older than what merged. `rev-list --left-right --count HEAD...origin/main` prints `<ahead> <behind>`. **Canonical**, once, since everything below turns on it: the checkout is canonical when the branch is `main`, the counts are `0 0`, and the `status --porcelain` line printed NOTHING. Only then does it hold exactly what merged, and only then may anyone install from it. A nonzero BEHIND means it is missing prompts that merged. A nonzero AHEAD, any other branch, or a dirty `routines/` or `scripts/sync-routines.sh` means it carries text that has not been through review — the script is in the pathspec because the next command RUNS it, and a local edit to its routine list, its destination or its publishing logic installs a state nobody reviewed — and `sync-routines.sh` compares the working tree, so uncommitted text reads as the checkout being newer and would be published as-is. Installing from a non-canonical checkout is a worse failure than the drift it would be fixing: the scheduler would then be running something nobody reviewed. Against `origin/main` by name, not `git status -sb`: the checkout may be on a topic branch or one with no upstream, whose tracking state says nothing about `main`. The `&&` is deliberate too — a failed fetch (auth, DNS, network) prints no counts at all, and that absence is the answer: the remote comparison is UNKNOWN, not clean, because stale remote-tracking refs would show a checkout matching the installed copies as up to date. Report the fetch failure in its place.
+
+Carry on with the sweep either way — a drifted prompt still runs a useful sweep, and the coverage window is the thing that must not be missed — but report the finding in step 5 and notify on it in step 6. Do NOT run `sync-routines.sh push` and do not edit the installed copy: those are live scheduler state, and re-installing a prompt is a person's call made after reading the diff. Where the two disagree about a step below, this prompt is what the scheduler gave you; say so and follow it.
+
 ## 1. Wake the GPU boxes
 
 The sweep talks to the WSL sides (`rog-nv-wsl`, `minix-amd-wsl`); waking and liveness go through
@@ -323,7 +339,11 @@ backends on the WSL boxes), say which of the three step-1 outcomes applied: woke
 ## 5. Report
 
 Print a short summary: one line per unit (machine/backend, outcome, duration), preceded by a line
-on what step 1 did if any box needed waking. Then either "no change since the last sweep" or the
+on what step 1 did if any box needed waking. Open with step 0's drift verdict, in one line when
+everything is in sync and with the diff when it is not (plus the branch, the `rev-list` counts and every path the
+`status --porcelain` line printed when the checkout is not canonical — the sync script's own path
+included, which no sync diff would show — or the fetch's error if that comparison could not be made,
+and any `RETIRED, but still installed` warning with the two steps the script names for it) — a check whose silence and whose absence look alike is not a check. Then either "no change since the last sweep" or the
 specific new failures with the relevant log excerpt (the full log path is in the history row —
 quote a few lines, do not paste the whole thing). On a forced run, also include the skip-coverage
 `result:` line and every `FAIL:`/`POTENTIAL:` claim from today's report, plus the report path —
@@ -356,12 +376,32 @@ not the backends.
 
 Send a PushNotification ONLY if there is (a) a new failure or timeout, (b) a staleness flag,
 (c) a skip-coverage `FAIL`, or a FAIL/POTENTIAL claim set that differs from the previous report's,
-or (d) an `error` outcome, a script exit of 2, or a launch refused for a missing
+(d) step 0 reporting DRIFT on this routine's own prompt, a checkout that is not canonical as
+step 0 defines it, or a remote comparison it could not make at all — each says this run may have executed
+instructions that have been superseded, and nothing else on this box notices; an installed prompt that
+matches an equally stale checkout reads `in sync` and is exactly as wrong,
+or (e) an `error` outcome, a script exit of 2, or a launch refused for a missing
 `~/.config/ocannl-sweep/local-box`: nothing was tested there, which step 5 already
 calls notify-worthy, and it must not go silent for being neither a failure nor yet stale.
 A `FAIL` notifies even when unchanged — it fires at most weekly (forced runs only) and means some
 claim has zero execution coverage on every backend, which must keep reaching a human until fixed;
 an unchanged POTENTIAL set stays silent like an unchanged fingerprint.
+Drift — and a checkout that is not canonical, and a fetch that failed — notifies every day it lasts, for
+the same reason: each says this run may have followed superseded instructions, only a person can end it,
+and it is silent everywhere else — the 2026-09-17 instance went a
+week unseen. Name the direction from PROVENANCE, never from the diff's orientation (`sync-routines.sh` always diffs
+the checkout first, so the `-` side is the checkout whether it is the stale one or not; the checkout's
+`git log` for that prompt is what says which text landed and when). Put THAT in the notification, never a
+fixed command, and never a `push` out of a
+checkout step 0 did not find canonical — that installs unreviewed text, and the notification is read by
+someone who will run what it says. So: `pull` whenever the INSTALLED copy holds the newer text (a run
+that edited its own prompt in place — a push would destroy the only copy of that edit), canonical or
+not, since a pull writes into the checkout where `git diff` shows it and review still stands between it
+and the scheduler; `push` when the checkout holds the newer text AND step 0 found it canonical; and no
+command at all — just what is wrong — when the checkout holds the newer text but is not canonical, or
+when both sides have moved — or when another local routine's drift points the OTHER way, since
+`push` and `pull` take no routine argument and apply to every local routine at once, so one of the two
+would be destroyed.
 A green sweep, or a red-but-unchanged sweep, must stay silent — a notification that fires every
 day is one that gets ignored, which would defeat the point. A box that failed to wake is not by
 itself notify-worthy; it becomes so only through the staleness thresholds above.

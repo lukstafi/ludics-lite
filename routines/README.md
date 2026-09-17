@@ -119,6 +119,92 @@ the task directory symlinked into this checkout, and deleting the target here le
 which a plain existence test calls absent. Drop the tombstone once the fleet is known to be clean.
 `ocannl-format-sweep` is the one carried today.
 
+### The push is manual, and two prompts watch for the day it is forgotten
+
+Nothing installs a prompt on its own. Merging a change to `routines/<id>/SKILL.md` moves this
+checkout and nothing else; the scheduler keeps dispatching the copy it already has until a person
+runs, on the box that fires them (`mac-studio`):
+
+```sh
+git -C ~/ludics-lite fetch origin \
+  && git -C ~/ludics-lite checkout main \
+  && git -C ~/ludics-lite merge --ff-only origin/main \
+  && git -C ~/ludics-lite rev-list --left-right --count HEAD...origin/main \
+  && git -C ~/ludics-lite status --porcelain -- routines scripts/sync-routines.sh \
+  && ~/ludics-lite/scripts/sync-routines.sh
+```
+
+Chained, not five separate lines: a fetch that fails on auth, DNS or the network leaves a stale
+`origin/main` standing, and every command after it then agrees that a stale checkout is level with
+the remote. Read the last three outputs before doing anything. The counts must be `0 0` — the
+merge does NOT establish that, since `--ff-only` only refuses a merge it cannot fast-forward and
+says "Already up to date" for a `main` that is AHEAD, carrying a prompt edit that never left this
+box. The `status` line must print nothing — it covers `scripts/sync-routines.sh` as well as `routines/`,
+since the next command runs that script and a local edit to its routine list or its publishing logic
+would install a state nobody reviewed. Only then is the checkout canonical.
+
+Then READ the sync status and choose the direction; there is deliberately no unconditional command
+after it. The diff's orientation is not the direction — `sync-routines.sh` always diffs the checkout
+first, so the checkout is the `-` side whether it is stale or holds the only copy of an edit; what
+says which text is newer is provenance, `git log -- routines/<name>/SKILL.md` against what the diff
+shows, and where that is unclear the answer is neither. `push` when the checkout holds the newer text — the usual case, a prompt that merged and
+was never installed. `pull` when the INSTALLED copy does: a routine that edited its own prompt in
+place is a supported workflow, and a push over it destroys the only copy of that edit before anyone
+has committed it. When both sides have moved, neither: reconcile by hand.
+
+The direction is a decision about the WHOLE run, not about one routine: `push` and `pull` take no
+routine argument and apply their mode to every name in `LOCAL_ROUTINES`. So when the routines
+disagree — one drifted with the checkout newer, another with the installed copy newer — there is
+no direction to pick, and running either destroys one side of one of them. Reconcile by hand
+first: copy the installed-only edit into the checkout and commit it (that is what a `pull` would
+have done, done to one routine), leaving every remaining difference pointing the same way, and
+only then run the sync.
+
+Canonical is what makes a `push` safe, and nothing weaker will do: `push` installs whatever the
+checkout holds, so out of a topic branch, a checkout ahead of `origin/main` — committed or not —
+or one with an uncommitted edit under `routines/` or in the sync script itself, it publishes prompt text nobody reviewed into
+the live scheduler, a worse failure than the drift it was fixing. `pull` needs none of that
+gating: it writes into the checkout, where `git diff` shows it and review still stands between it
+and the scheduler.
+
+That is the whole discipline, and it is a step in `ship-pr`'s sense of "landed" for any PR that
+touches a prompt here. A git hook could close the window, but installing one is a per-checkout
+side effect this repository has no idiom for — `ship-pr/hooks` is an agent-harness `Stop` hook
+merged into the harness's own settings, not a `.git/hooks` installer — so the push stays a
+documented manual step (ludics-lite#199).
+
+Forgetting it used to be invisible. The scheduler fires on time, the run looks normal, and the
+routine's own record shows nothing amiss, because the only thing that is wrong is that the prompt
+is old: on 2026-09-17 the cross-machine sweep was found to have run about a week on a revision
+predating the `--hold` fix, which is exactly the coverage the sweep exists to provide. So the two
+live prompts now read their own drift, which is the one report that reaches a human every day:
+
+- each one's **step 0** runs `scripts/sync-routines.sh` and reads its OWN verdict line, since a
+  DRIFT there means the instructions it is about to follow are not the ones that were merged;
+- `daily-issue-planning` **also reports the whole verdict**, every routine's line, because it is
+  the only run on this box that looks at the others (the sweep would not see a stale planning
+  prompt, and a retired-but-installed routine belongs to neither);
+- the sweep **notifies** on its own drift, every day it lasts — the same rule as a skip-coverage
+  `FAIL`, and for the same reason: only a person can end it.
+
+Neither routine pushes. The installed copies are live scheduler state, the direction of the drift
+is a judgment (`push` if the checkout is canonical, `pull` if the edit was made in place), and a
+routine that quietly re-installed its own prompt would be the silent step this all exists to
+remove. `scripts/check-prompts.sh` pins the guard from the other side: every routine in
+`LOCAL_ROUTINES` must name `sync-routines.sh` in its prompt, so the step 0 above cannot be edited
+away without CI saying so.
+
+Status mode compares the installed copies with the checkout, not with `origin/main`: a checkout
+behind the remote reports `in sync` while the installed prompt is older than what merged. That is
+why both prompts count `HEAD...origin/main` beside the verdict — against that ref by name, since
+the checkout may sit on a topic branch whose own tracking state says nothing about `main` — and why
+they call a checkout canonical only on `main`, with both counts at `0` and `routines/` clean:
+installing from a checkout that is ahead, on another branch, or dirty publishes prompt text that
+has not been through review into the live scheduler, which is worse than the drift it would be
+fixing. Every push prescription in either prompt is gated on that one definition. It is also why the push recipe takes `origin/main` by
+name first — a bare `git pull --ff-only` follows whatever the
+current branch tracks, which on a checkout parked on a topic branch advances the wrong thing.
+
 ## The cloud routine: synced by hand
 
 `ocannl-ci-red-triage/SKILL.md` is a copy of the prompt of the "ocannl-staging CI-red triage"
@@ -143,7 +229,8 @@ Its non-prompt configuration, for re-creating it:
 
 Like the skills, these prompts name the author's setup in prose and are edited in place:
 `~/self-improve/ClaudeDesktop/sequencing_plan.md` and the repository list in
-`daily-issue-planning`; `~/ocannl-staging`, `~/.ocannl-sweep`, `~/bin/wake-lab.sh` and the box
+`daily-issue-planning`; `~/ludics-lite`, the checkout both prompts run their step-0 drift check in
+(the clone path the top-level README installs); `~/ocannl-staging`, `~/.ocannl-sweep`, `~/bin/wake-lab.sh` and the box
 names `rog`/`minix` (`rog-nv-wsl`, `minix-amd-wsl`) in the cross-machine sweep; the two OCANNL
 repositories in the triage routine. `~/bin/wake-lab.sh` is a symlink to `scripts/wake-lab.sh` in
 this checkout, so the cross-machine sweep's lab lore is reviewable here rather than living only on

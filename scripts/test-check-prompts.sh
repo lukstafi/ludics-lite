@@ -816,6 +816,124 @@ out=$("$CP" "$R" 2>&1)
 grep -q 'mac-studio' <<<"$out" && ko "a root without $WORKER is held to a slot count" \
   || ok "...and a root without $WORKER carries no slot obligation"
 
+# --- the installed-routine drift guard ---------------------------------------------------------
+# ludics-lite#199: each routine sync-routines.sh installs opens by running it and reading its own
+# drift, and nothing but this check stops that step being edited away. Like the slot probes, the
+# tree is the REAL prompts and the REAL script, copied -- a probe over invented prose would keep
+# passing while the checker and the prompts drifted apart. Both READMEs come along because the
+# index lookup wants them; no fixture and no fleet-worker.sh, so neither other agreement applies.
+DRIFT_ROUTINES=$(sed -n 's/^LOCAL_ROUTINES="\([^"]*\)"[[:space:]]*$/\1/p' "$SRC/scripts/sync-routines.sh")
+[ -n "$DRIFT_ROUTINES" ] \
+  || ko "the drift probes need a one-line LOCAL_ROUTINES=\"...\" in scripts/sync-routines.sh"
+DRIFT_ONE=${DRIFT_ROUTINES%% *}
+# The path the prompts must invoke, read off the README's clone command the way the checker reads
+# it -- independently, so a probe states no literal path and moving the checkout moves both.
+DRIFT_HOME=$(sed -n 's|^git clone [^ ]*ludics-lite\.git \(~/[^ ]*\)[[:space:]]*$|\1|p' "$SRC/README.md")
+DRIFT_HOME=${DRIFT_HOME%%$'\n'*}
+[ -n "$DRIFT_HOME" ] \
+  || ko "the drift probes need a 'git clone … ~/<dir>' line in README.md; read '$DRIFT_HOME'"
+DRIFT_WANT="runs no $DRIFT_HOME/scripts/sync-routines.sh"
+drift_tree() {
+  rm -rf "$R"
+  mkdir -p "$R/routines" "$R/scripts"
+  cp "$SRC/README.md" "$R/README.md"
+  cp "$SRC/routines/README.md" "$R/routines/README.md"
+  cp "$SRC/scripts/sync-routines.sh" "$R/scripts/sync-routines.sh"
+  for r in $DRIFT_ROUTINES; do
+    mkdir -p "$R/routines/$r"
+    cp "$SRC/routines/$r/SKILL.md" "$R/routines/$r/SKILL.md"
+  done
+}
+# drift_edit <file> <sed-expression>: rewrites one copy, and says so if it matched nothing --
+# a mutation that changed nothing leaves a probe asserting a refusal the tree no longer earns.
+drift_edit() {
+  sed "$2" "$R/$1" > "$R/drift.tmp" || { ko "drift_edit: sed failed on $1"; return 1; }
+  cmp -s "$R/drift.tmp" "$R/$1" && { ko "drift_edit: '$2' matched nothing in $1"; return 1; }
+  mv "$R/drift.tmp" "$R/$1"
+}
+
+drift_tree
+expect "every installed routine's prompt runs the drift check" 0 \
+  'runs it to read its own drift' -- "$CP" "$R"
+
+# The step edited out of a prompt is the drift this check exists for: prose that stops being run
+# looks exactly like prose that is.
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" 's/sync-routines\.sh/the-sync-script/g'
+expect "a routine that stops naming the sync script is refused" 1 \
+  "routines/$DRIFT_ONE/SKILL.md: $DRIFT_WANT" -- "$CP" "$R"
+
+# The mutation that matters, and the one a filename match would pass: delete the COMMAND and
+# leave every mention of it standing. Both prompts name the script in explanatory and reporting
+# prose, so this is what an edited-away guard actually looks like.
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" '/^ \{4,\}[^`]*sync-routines\.sh[[:space:]]*$/d'
+expect "a routine that keeps the prose and drops the command is refused" 1 \
+  "routines/$DRIFT_ONE/SKILL.md: $DRIFT_WANT" -- "$CP" "$R"
+
+# A write is not the read. `push` and `pull` install and recover; what every installed routine
+# owes is the status invocation, so a line that ends in a mode argument does not satisfy it.
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" 's|^\( *[^ `]*sync-routines\.sh\)$|\1 push|'
+expect "an invocation that writes instead of reading is refused" 1 \
+  "routines/$DRIFT_ONE/SKILL.md: $DRIFT_WANT" -- "$CP" "$R"
+
+# ...and prose quoting the command is prose, however it is indented.
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" 's|^\( *\)\([^ `]*sync-routines\.sh\)$|\1run `\2`|'
+expect "an indented line quoting the command is not the command" 1 \
+  "routines/$DRIFT_ONE/SKILL.md: $DRIFT_WANT" -- "$CP" "$R"
+
+# The ways a line can hold the path without running it. Each is what somebody reaches for when
+# they want the step gone but the prompt to still look like it has one -- the comment especially,
+# which is how a guard is disabled rather than deleted.
+while IFS='|' read -r label repl; do
+  drift_tree
+  drift_edit "routines/$DRIFT_ONE/SKILL.md" "s|^\\( *\\)\\([^ \`]*sync-routines\\.sh\\)$|\\1$repl|"
+  expect "$label is not the command" 1 \
+    "routines/$DRIFT_ONE/SKILL.md: $DRIFT_WANT" -- "$CP" "$R"
+done <<'EOF'
+a commented-out invocation|# \2
+an invocation commented out with no space|#\2
+the path as another command's argument|echo \2
+...and as cat's|cat \2
+the path assigned to a variable|DRIFT_COMMAND=\2
+...and assigned with export|export DRIFT_COMMAND=\2
+some other file of the same name|/tmp/sync-routines.sh
+...and one under a same-named directory elsewhere|/tmp/scripts/sync-routines.sh
+EOF
+
+# The path is the README's to state, and the checker reads it from there rather than restating
+# it: a root whose install line is gone cannot be judged, and says so instead of passing.
+drift_tree
+drift_edit README.md 's|^git clone .*ludics-lite\.git ~/.*$|git clone https://example.invalid/x.git|'
+expect "a README with no clone destination is refused, not passed" 1 \
+  'no ' -- "$CP" "$R"
+
+# ...and a checkout cloned somewhere else is judged against THAT path, not a hardcoded one.
+drift_tree
+drift_edit README.md 's|\(^git clone .*ludics-lite\.git \)~/ludics-lite$|\1~/elsewhere|'
+expect "the checkout path comes from the README, so moving it refuses the old invocation" 1 \
+  '~/elsewhere/scripts/sync-routines.sh' -- "$CP" "$R"
+
+# Which prompts are held is read off the script, so a name added to LOCAL_ROUTINES arrives obliged
+# -- and one it installs with nothing to install from is refused rather than skipped.
+drift_tree
+rm -rf "$R/routines/$DRIFT_ONE"
+expect "a routine the script installs with no prompt here is refused" 1 \
+  "installs '$DRIFT_ONE', but this checkout has no routines/$DRIFT_ONE/SKILL.md" -- "$CP" "$R"
+
+drift_tree
+drift_edit scripts/sync-routines.sh 's/^LOCAL_ROUTINES=.*/LOCAL_ROUTINES="a b" # not the one-line shape/'
+expect "a LOCAL_ROUTINES this reader cannot see is refused, not passed" 1 \
+  'has no one-line LOCAL_ROUTINES' -- "$CP" "$R"
+
+# The obligation comes from the installer, as the fixtures' comes from a fixture.
+fresh "$R"
+out=$("$CP" "$R" 2>&1)
+grep -q 'drift' <<<"$out" && ko "a root without scripts/sync-routines.sh is held to a drift step" \
+  || ok "...and a root without the sync script carries no drift obligation"
+
 # --- this checkout ---------------------------------------------------------------------------
 expect "this checkout's prompts pass" 0 '0 failed' -- "$CP"
 

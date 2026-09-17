@@ -21,10 +21,14 @@
 # directory carrying a SKILL.md is named, in backticks, in the first cell of a row there, so a new
 # prompt cannot land unindexed. That is a lookup, not a rendering claim: see `indexed` below for
 # what it stopped asserting when the table scanner went (ludics-lite#75).
-# Two cross-file agreements ride along, each pinning a fact the prompts only restate: every test
+# Three cross-file agreements ride along, each pinning a fact the prompts only restate: every test
 # fixture has a command in the README's register and a run line on each CI platform it needs, and
 # every file that quotes the mac-studio correctness-slot count quotes the one fleet-worker.sh
 # actually defaults to (ludics-lite#160) -- which files those are is discovered, not listed.
+# A third reads the routines sync-routines.sh installs off its own LOCAL_ROUTINES line and
+# requires each of their prompts to RUN that script -- the command line, not a mention of the
+# name -- so the step 0 that makes an installed copy's drift visible cannot be edited away in
+# silence (ludics-lite#199).
 #
 # Usage: check-prompts.sh [root]   (root defaults to the checkout this script lives in;
 #                                   exit 0 all pass, 1 otherwise)
@@ -783,6 +787,93 @@ check_slots() {
   [ "$bad" -ne 0 ] || ok "mac-studio correctness slots agree: $SLOT_SCRIPT and every file that states the count say $default"
 }
 
+# --- the installed-routine drift guard ---------------------------------------------------------
+# A local scheduled task runs from a COPY under ~/.claude/scheduled-tasks, necessarily (the
+# scheduler refuses a task file reached through a symlink), and a copy drifts from this checkout
+# in silence: the task fires on time, the run looks normal, and the only thing wrong is that the
+# prompt is old. ludics-lite#199 is a week of that. The guard against it lives inside the prompts
+# -- each installed routine opens by running scripts/sync-routines.sh and reading its own verdict
+# -- and prose does not fail a test when somebody edits it away. So this pins that it is there.
+#
+# WHICH prompts are held is read off the script that installs them: the one-line LOCAL_ROUTINES
+# assignment, the same line scripts/test-sync-routines.sh reads, so a routine added to the sync
+# arrives here already obliged and a retired one stops being.
+#
+# WHAT is required is the COMMAND, not a mention of it. Both prompts name sync-routines.sh in
+# their explanatory and reporting prose several times over, so a check that matched the filename
+# would go on passing over a prompt whose indented command line had been deleted -- the guard
+# gone, the prose about it left standing, and the checker reporting the step present. So the
+# match is the shape a prompt runs a command in: a Markdown indented-code line (four spaces or
+# more, which is what both prompts use) whose whole content is THE path to this checkout's copy
+# of the script -- the invocation, in STATUS mode, and nothing else. That path is not restated
+# here either: its `~/ludics-lite` half is read off the README's own clone command. Every weaker
+# reading was tried and is refused for a reason somebody would otherwise reach for: a
+# `push`/`pull` argument writes where the obligation is to read; `echo`/`cat` and friends put the
+# path in some other command's argument; `DRIFT_COMMAND=<path>` assigns it and runs nothing; a
+# leading `#` is how a guard is usually disabled rather than deleted; a backtick makes the line
+# prose quoting a command; and a same-basename path elsewhere is another file entirely. Whether the prompt then READS the verdict is a review
+# question no lookup settles; this pins the one thing a lookup can see, which is that the command
+# is still there. Same shape as the fixture register and the slot count.
+SYNC_SCRIPT=scripts/sync-routines.sh
+
+# checkout_path: where the README's install section clones this repository to (`~/ludics-lite`),
+# read off that clone command rather than restated here -- the prompts invoke the script through
+# that path, and it is the README's fact. Empty when there is no such line to read.
+checkout_path() {
+  [ -f "$ROOT/README.md" ] || return 0
+  # The first match, taken by expansion rather than by `| head -1`: an early-exiting reader would
+  # SIGPIPE the producer, which under pipefail is the failure this file's `matches` avoids too.
+  local all
+  all=$(sed -n 's|^git clone [^ ]*ludics-lite\.git \(~/[A-Za-z0-9_.-][A-Za-z0-9_.-]*\)[[:space:]]*$|\1|p' \
+    "$ROOT/README.md")
+  printf '%s\n' "${all%%$'\n'*}"
+}
+
+check_drift_guard() {
+  local names r f home want bad=0
+  # A root without the sync script installs nothing, so it carries no obligation -- as with the
+  # fixture register, whose obligation comes from a fixture, and the slot count's from the worker.
+  [ -f "$ROOT/$SYNC_SCRIPT" ] || return 0
+  # The path the prompts must invoke, spelled from the README's clone destination and this
+  # script's own repo-relative location -- so neither is restated here, and a `/tmp/…` or any
+  # other same-basename path is not this checkout's script.
+  home=$(checkout_path)
+  if [ -z "$home" ]; then
+    ko README.md "no 'git clone … ~/<dir>' line to read the checkout path from; the routines' drift step cannot be checked"
+    return 0
+  fi
+  # As an ERE: `~` and `.` are literals, and `$HOME` is accepted for the same path.
+  want="(~|[$]HOME)/$(printf '%s' "${home#\~/}" | sed 's/[.]/[.]/g')/$(printf '%s' "$SYNC_SCRIPT" | sed 's/[.]/[.]/g')"
+  names=$(sed -n 's/^LOCAL_ROUTINES="\([^"]*\)"[[:space:]]*$/\1/p' "$ROOT/$SYNC_SCRIPT")
+  if [ -z "$names" ]; then
+    # Not a pass: the obligation exists and this reader cannot see who carries it.
+    ko "$SYNC_SCRIPT" "has no one-line LOCAL_ROUTINES=\"...\" naming the routines it installs"
+    return 0
+  fi
+  # A name a word at a time, through `tr`: an unquoted expansion would also GLOB, and a routine
+  # name holding a `*` would be replaced by whatever it matched in the caller's directory.
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    f="routines/$r/SKILL.md"
+    if [ ! -f "$ROOT/$f" ]; then
+      ko "$SYNC_SCRIPT" "installs '$r', but this checkout has no $f to install from"; bad=1; continue
+    fi
+    # An indented-code line that IS the invocation: the line's whole content, after the indent,
+    # is THE path to this checkout's script and nothing else. Spelling the whole path is what
+    # makes the match a claim about this script rather than about a basename -- a /tmp one is
+    # some other file, possibly none -- and it rules out, in one shape, every way of holding the
+    # path without running it: a blank (so `echo …` and `cat …` put it in another command's
+    # arguments), an `=` (an assignment executes nothing), a `#` (how a guard gets disabled,
+    # rather than by deleting it), a backtick (prose quoting a command), and anything following
+    # the path (a `push`/`pull` argument writes, where the obligation is the status read).
+    # `${want}` braced: `$want[` reads as an array expansion to shellcheck (SC1087), and the
+    # `[` here opens the bracket expression, not a subscript.
+    matches "^ {4,}${want}[[:space:]]*\$" "$(cat "$ROOT/$f")" \
+      || { ko "$f" "runs no $home/$SYNC_SCRIPT: an installed routine reads its own drift with an indented command line invoking THAT path in status mode (ludics-lite#199)"; bad=1; }
+  done <<<"$(tr -s '[:space:]' '\n' <<<"$names")"
+  [ "$bad" -ne 0 ] || ok "every routine $SYNC_SCRIPT installs runs it to read its own drift"
+}
+
 # --- run --------------------------------------------------------------------------------------
 if $ONE; then
   if [ -f "$ROOT/SKILL.md" ]; then check_skill_file SKILL.md
@@ -805,6 +896,7 @@ check_index README.md "" skill
 check_index routines/README.md routines/ routine
 check_fixtures
 check_slots
+check_drift_guard
 
 echo
 echo "check-prompts: $pass passed, $fail failed"
