@@ -425,7 +425,7 @@ slot_files() {
 # text is joined and space-prefixed so that stand-in always has a character to match.
 slot_mentions() {
   local q="'"
-  RE_DIGIT="mac-studio=[^[:space:]\`\"$q),;]*" \
+  RE_DIGIT="[^a-z0-9-]mac-studio=[^[:space:]\`\"$q),;]*" \
   RE_WORD="[^a-z0-9][a-z][a-z-]*[[:space:]]+on[[:space:]]+mac-studio" \
   RE_NOT="[^a-z0-9][a-z][a-z-]*, not[[:space:]]+[a-z][a-z-]*[^a-z0-9]" \
   RE_ASSIGN="slots=[\`\"$q]?\$" \
@@ -450,13 +450,18 @@ slot_mentions() {
         rest = substr(rest, st + len)
       }
     }
-    function emit(kind, frag, at, len,   n, from, window) {
+    function emit(kind, frag, at, len,   n, box, from, window) {
       if (kind == "digit") {
+        # The box name starts where the match says it does, past the boundary character: the
+        # position of the name, not of the match, is what the lookback and the value hang off.
+        box = at + index(frag, "mac-studio=") - 1
         # `…SLOTS=mac-studio=2` is the variable being SET, not a statement of its default.
-        from = at - 32; if (from < 1) from = 1
-        if (match(substr(lower, from, at - from), ENVIRON["RE_ASSIGN"])) return
-        n = substr(frag, index(frag, "=") + 1)
-        sub(/\.$/, "", n)            # a sentence-final period is punctuation, not the value
+        from = box - 32; if (from < 1) from = 1
+        if (match(substr(lower, from, box - from), ENVIRON["RE_ASSIGN"])) return
+        n = substr(frag, index(frag, "mac-studio=") + 11)
+        # Punctuation that closes the mention is punctuation, wherever Markdown puts it -- `6]`,
+        # `6.`, `6:` state six. A suffix that is not punctuation still makes the value malformed.
+        sub(/[^A-Za-z0-9]+$/, "", n)
       } else {
         # The whole word, hyphens and all -- and then: is it a count at all? `twenty-six` is not
         # the `six` it ends with, and `done on mac-studio` states nothing.
@@ -493,8 +498,11 @@ slot_mentions() {
 # slot_default <file>: the `mac-studio=<n>` default inside the value assigned to SLOTS, or empty.
 slot_default() {
   awk '
-    /^SLOTS=/ && !seen {
-      seen = 1; v = substr($0, index($0, "=") + 1); q = ""; val = ""
+    # The LAST top-level assignment, which is the one the shell is left holding -- reading the
+    # first would report a default a later line has replaced (and `slot_mentions` skips that line
+    # as an assignment, so nothing else would catch it either).
+    /^SLOTS=/ {
+      v = substr($0, index($0, "=") + 1); q = ""; val = ""
       for (i = 1; i <= length(v); i++) {
         c = substr(v, i, 1)
         if (q == "") {
@@ -503,9 +511,13 @@ slot_default() {
         } else if (c == q) { q = ""; continue }
         val = val c
       }
-      if (match(val, /mac-studio=[0-9]+/))
-        print substr(val, RSTART + 11, RLENGTH - 11)
+      # At a token boundary: `not-mac-studio=6` is another box, and the roster has no mac-studio.
+      if (match(val, /(^|[^a-z0-9-])mac-studio=[0-9]+/)) {
+        m = substr(val, RSTART, RLENGTH)         # the boundary character may lead it
+        last = substr(m, index(m, "mac-studio=") + 11)
+      } else last = ""
     }
+    END { print last }
   ' "$1"
 }
 
@@ -515,7 +527,7 @@ check_slots() {
   # The default as the shell takes it: the `mac-studio=<n>` inside the SLOTS assignment's VALUE.
   # Read to the first UNQUOTED blank rather than to the end of the line, so a trailing comment --
   # `SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-}" # old mac-studio=6` -- cannot stand in for a default
-  # the script no longer has.
+  # the script no longer has; from the LAST such assignment, which is the one the shell keeps.
   default=$(slot_default "$ROOT/$SLOT_SCRIPT")
   case "$default" in
     *[!0-9]* | '') ko "$SLOT_SCRIPT" "SLOTS assignment states no 'mac-studio=<n>' default"; return 0 ;;

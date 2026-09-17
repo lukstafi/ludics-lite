@@ -514,6 +514,35 @@ slots_tree
 slots_edit README.md 's/a run-time count a worker takes/a run-time count. Done, not three. A worker takes/'
 expect "...and a justification shape whose opening word is not a numeral states none" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
+# Punctuation that closes a mention is punctuation, wherever Markdown puts it -- a correct count
+# inside brackets or braces states the default, and only a non-punctuation suffix is malformed.
+for wrap in '[mac-studio=%s]' '{mac-studio=%s}:' '"mac-studio=%s".'; do
+  slots_tree
+  printf "\nRoster $wrap here.\n" "$WANT" >> "$R/README.md"
+  expect "a count closed by Markdown punctuation is the count: $wrap" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+done
+slots_tree
+printf '\nRoster [mac-studio=%s] here.\n' "$OTHER" >> "$R/README.md"
+expect "...and a stale one inside brackets is still refused" 1 "states 'mac-studio=$OTHER'" -- "$CP" "$R"
+slots_tree
+printf '\nRoster mac-studio=%soops here.\n' "$WANT" >> "$R/README.md"
+expect "...while a suffix that is not punctuation is still malformed" 1 "states 'mac-studio=${WANT}oops'" -- "$CP" "$R"
+
+# The box name at a token boundary: another box's name ending in it is another box, and a roster
+# that names no mac-studio has no mac-studio default to check the prompts against.
+slots_tree
+slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo not-mac-studio=$WANT/"
+expect "a box whose name merely ends in mac-studio is another box" 1 "$WORKER: SLOTS assignment states no 'mac-studio=<n>' default" -- "$CP" "$R"
+
+# The shell keeps the LAST assignment, so this check reads that one: reading the first would
+# report a default a later line replaced, and the later line is skipped as an assignment.
+slots_tree
+printf 'SLOTS=mac-studio=%s\n' "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "a later SLOTS assignment is the default the prompts are held to" \
+  || ko "a later SLOTS assignment is the default the prompts are held to (rc=$rc) -- $out"
+
 # The default is the assignment's VALUE: prose on the line cannot stand in for a default the
 # script no longer has.
 slots_tree
