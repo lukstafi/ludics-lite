@@ -376,11 +376,19 @@ check_fixtures() {
 # WHAT counts as a statement is three shapes, which are the three the prose uses -- `mac-studio=<n>`
 # (the whole token, so a malformed `mac-studio=6oops` is refused rather than accepted on its
 # prefix), the number word in `<n> on mac-studio`, and the word opening the `<N>, not <m>`
-# justification. The word forms find the PHRASE -- `on mac-studio` at a token boundary, or `, not`
-# -- and read the count as the run of numeral words standing before it: `twenty-six`, `twenty six`
-# and `thirteen` are each the whole count they state and are refused, while `done on mac-studio`
-# and `six on mac-studio-pro` state none. Matching a number word instead reads the first as `six`,
-# the third as nothing at all, and `done` as a count.
+# justification. The word form finds the PHRASE -- `on mac-studio` at a token boundary -- and reads
+# the count as the run of numeral words standing before it: `twenty-six`, `twenty six` and
+# `thirteen` are each the whole count they state and are refused, while `done on mac-studio` and
+# `six on mac-studio-pro` state none. Matching a number word instead reads the first as `six`, the
+# third as nothing at all, and `done` as a count.
+#
+# A third form was read and is deliberately no longer: the `<N>, not <m>` opening the justification
+# sentence ("Six, not three, since ludics-lite#160"). Nothing in that shape says it is about slots
+# -- the real ones carry `slot` only in the PREVIOUS sentence -- so reading it meant a proximity
+# window, and a window wide enough to catch them is wide enough to read "Choose one, not two modes"
+# beside the slot paragraph as a slot count. Every file still states its count in a form above, so
+# the agreement is pinned; what is no longer pinned is that one sentence's number, which is a
+# smaller loss than prose that cannot be written near a slot paragraph (ludics-lite#202).
 # A numeral is a word, or hyphenated words, from $NUMERALS. Text INSIDE an assignment of the
 # variable is skipped: a fixture configuring a two-slot box states its own input and claims nothing
 # about the default. Which text that is, is answered structurally rather than by looking back a
@@ -395,7 +403,6 @@ check_fixtures() {
 SLOT_SCRIPT=issue-wave/scripts/fleet-worker.sh
 SLOT_PROMPTS='README.md issue-wave/SKILL.md issue-wave/references/executions.md'
 SLOT_MECHANISM='scripts/check-prompts.sh scripts/test-check-prompts.sh'
-SLOT_CONTEXT=160
 NUMBER_WORDS='zero one two three four five six seven eight nine ten eleven twelve'
 # The vocabulary a word-shaped count is recognized by -- wider than the spellings a default can
 # take, because its job is to tell a stated count apart from an ordinary word, not to name one.
@@ -429,20 +436,18 @@ slot_files() {
 # text is joined and space-prefixed so that stand-in always has a character to match.
 slot_mentions() {
   local q="'"
-  RE_DIGIT="[^a-z0-9-]mac-studio=[^[:space:]\`\"$q),;]*" \
+  RE_DIGIT="[^a-z0-9_.-]mac-studio=[^[:space:]\`\"$q),;]*" \
   RE_WORD="[[:space:]]on[[:space:]]+mac-studio([^a-z0-9-]|$)" \
-  RE_NOT=", not[[:space:]]+" \
   NUMERALS="$(printf '%s' " $NUMERALS " | tr -s '[:space:]' ' ')" \
-  CTX="$SLOT_CONTEXT" awk "$SLOT_AWK_LIB"'
+  awk "$SLOT_AWK_LIB"'
     # Each line is joined into one text, and masked alongside it: `a` marks a character inside an
     # assignment of the variable, `.` one in prose. Position for position, so a mention is judged
     # by where it stands rather than by what the 32 characters before it happen to spell.
     { text = text " " $0 }
     END {
-      ctx = ENVIRON["CTX"]; lower = tolower(text); find_assignments()
+      lower = tolower(text); find_assignments()
       scan(ENVIRON["RE_DIGIT"], "digit")
       scan(ENVIRON["RE_WORD"], "word")
-      scan(ENVIRON["RE_NOT"], "not")
     }
     # Walk every match of <re>, reporting each by its position in the joined text.
     # RSTART/RLENGTH are read ONCE per iteration and carried in locals: emit() matches too, and
@@ -456,7 +461,7 @@ slot_mentions() {
         rest = substr(rest, st + len)
       }
     }
-    function emit(kind, frag, at, len,   n, box, from, window) {
+    function emit(kind, frag, at, len,   n, box) {
       if (kind == "digit") {
         # The box name starts where the match says it does, past the boundary character: the
         # position of the name, not of the match, is what the value and the mask hang off.
@@ -473,12 +478,6 @@ slot_mentions() {
         # each the whole count they state; `done on mac-studio` and `boxes. Six` state none here.
         n = numerals_before(at)
         if (n == "") return
-        if (kind == "not") {         # only inside slot prose: see the header above
-          if (numerals_after(at + len - 1) == "") return
-          from = at - ctx; if (from < 1) from = 1
-          window = substr(lower, from, len + 2 * ctx)
-          if (index(window, "slot") == 0) return
-        }
         frag = n " " frag           # report the count with the phrase that carried it
       }
       sub(/^[^A-Za-z0-9]+/, "", frag); sub(/[^A-Za-z0-9]+$/, "", frag)
@@ -526,21 +525,6 @@ slot_mentions() {
         word = w[i]; sub(/^[^a-z]+/, "", word)
         if (word !~ /^[a-z][a-z-]*$/ || !numeral(word)) break
         run = (run == "") ? word : word " " run
-      }
-      return run
-    }
-    # numerals_after <at>: the same run, read forwards from just after <at>. Punctuation ends the
-    # run here too, but on the word that CARRIES it -- `three,` is the three, and what follows the
-    # comma is another clause.
-    function numerals_after(at,   w, k, i, word, tail, run) {
-      k = split(substr(lower, at + 1, 90), w, /[[:space:]]+/)
-      run = ""
-      for (i = 1; i <= k; i++) {
-        word = w[i]; sub(/^[^a-z]+/, "", word)
-        tail = (word ~ /[^a-z-]$/); sub(/[^a-z-]+$/, "", word)
-        if (word !~ /^[a-z][a-z-]*$/ || !numeral(word)) break
-        run = (run == "") ? word : run " " word
-        if (tail) break
       }
       return run
     }
@@ -616,6 +600,12 @@ slot_default() {
         rest = substr(rest, RSTART + RLENGTH)
       }
     }
+    # A function body is defined, not run: an assignment inside one sets nothing until something
+    # calls it, and nothing here does. Conventional shell layout is what this reads -- a definition
+    # opening at column zero, its body closed by a `}` at column zero -- which is also what the
+    # column-zero anchor below already assumes about the top level.
+    /^[A-Za-z_][A-Za-z0-9_]*(\(\))?[[:space:]]*\{/ || /^function[[:space:]]/ { in_func = 1; next }
+    in_func { if ($0 ~ /^\}/) in_func = 0; next }
     # The LAST top-level assignment, which is the one the shell is left holding -- reading the
     # first would report a default a later line has replaced (and `slot_mentions` skips that line
     # as an assignment, so nothing else would catch it either).
@@ -640,7 +630,7 @@ slot_default() {
         for (i = 1; i <= k && bad == ""; i++)
           if (pairs[i] != "" && pairs[i] !~ /^[^=[:space:]]+=0*[1-9][0-9]*$/) bad = pairs[i]
       }
-      while (match(rest, /(^|[^a-z0-9-])mac-studio=[^[:space:])}]*/)) {
+      while (match(rest, /(^|[^a-z0-9_.-])mac-studio=[^[:space:])}]*/)) {
         m = substr(rest, RSTART, RLENGTH)
         sub(/^[^m]/, "", m)                      # the boundary character, if the match took one
         count = substr(m, 12)
