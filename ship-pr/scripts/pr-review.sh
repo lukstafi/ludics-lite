@@ -624,7 +624,7 @@ snapshot_dir_ensure() {
   # comparison a fixture makes against it (ludics-lite#208). A `cd` into a directory mktemp just
   # created fails only if the filesystem went away underneath it, and then there is nothing to
   # remove anyway.
-  SNAP_DIR=$(cd "$SNAP_DIR" && pwd -P) || {
+  SNAP_DIR=$(CDPATH= cd "$SNAP_DIR" && pwd -P) || {
     SNAP_DIR=""
     return 1
   }

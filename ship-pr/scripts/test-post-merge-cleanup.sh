@@ -21,14 +21,14 @@ HELPER="$SCRIPT_DIR/post-merge-cleanup.sh"
 # /private/tmp on macOS, itself on Linux, and neither is hardcoded: the removal guard below
 # compares against THIS, so a host where /tmp points somewhere else neither leaks its scratch tree
 # nor needs a new arm (ludics-lite#208, review round 1).
-TEST_ROOT_PARENT=$(cd /tmp && pwd -P) || exit 1
+TEST_ROOT_PARENT=$(CDPATH= cd /tmp && pwd -P) || exit 1
 TEST_ROOT=$(mktemp -d "/tmp/post-merge-cleanup-test.XXXXXX") || exit 1
 # Physically resolved, and this suite needs it most: the helper under test refuses anything but
 # the exact session-worktree root, and computes that root with `pwd -P` (its canonical_dir). On
 # macOS /tmp is a symlink to /private/tmp, so an unresolved $TEST_ROOT is a different spelling of
 # every path this suite builds, and a comparison against one stops matching in silence
 # (ludics-lite#208).
-TEST_ROOT=$(cd "$TEST_ROOT" && pwd -P) || exit 1
+TEST_ROOT=$(CDPATH= cd "$TEST_ROOT" && pwd -P) || exit 1
 # The in-flight cases' subshell pids and names, kept by the runner at the bottom. Declared before
 # the EXIT trap is installed: an exit ahead of the runner (--help, --list, a refused argument)
 # must not find an inherited variable of the same name and signal whatever it lists.

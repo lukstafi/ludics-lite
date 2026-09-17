@@ -20,7 +20,7 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/check-scratch-dirs-test.XXXXXX") || exit 1
 # reason the guard gives: the scratch checkouts below install the guard, which computes its ROOT
 # with `pwd -P`, so an unresolved $TMP and the guard's idea of the same directory would be spelled
 # differently and every assertion comparing its output against a $TMP path would stop matching.
-TMP=$(cd "$TMP" && pwd -P) || exit 1
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 pass=0
@@ -295,6 +295,25 @@ echo "$TMP"
 EOF
 expect "a mktemp -d named in an error message is not a second call" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_quoted_message.sh"
+
+# Round 6: the CDPATH-proof spelling every refusal now recommends, and a stderr redirect on the
+# capturing call, which this repository writes and which sends nothing but diagnostics away.
+probe safe_cdpath_form <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX" 2>/dev/null) || exit 1
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
+echo "$TMP"
+EOF
+expect "the CDPATH-proof resolution and a 2>/dev/null capture pass" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_cdpath_form.sh"
+
+# Round 6: an attached short-option value, resolved.
+probe safe_attached_option <<'EOF'
+d=$(mktemp -p/tmp -d probe.XXXXXX) || exit 1
+d=$(CDPATH= cd "$d" && pwd -P) || exit 1
+echo "$d"
+EOF
+expect "an attached -p/tmp value does not hide the directory flag" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_attached_option.sh"
 
 # --- the shapes that must be refused --------------------------------------------------------
 
@@ -612,6 +631,44 @@ echo "$TMP"
 EOF
 expect "a second call trailing a good capture is refused on its own" 1 \
   'outside the substitution the assignment captures' -- "$CS" "$TMP/bad_trailing_second_call.sh"
+
+# Round 6: the whole-value rule reaches the resolver-function branch too.
+probe bad_resolver_suffix <<'EOF'
+canonical_dir() {
+  (CDPATH= cd "$1" && pwd -P)
+}
+ROOT=$(canonical_dir "${TMPDIR:-/tmp}")/cache
+TMP=$(mktemp -d "$ROOT/probe.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a resolver call with a component appended does not certify what is under it" 1 \
+  "$REFUSAL" -- "$CS" "$TMP/bad_resolver_suffix.sh"
+
+# Round 6: `-p/tmp` is the option with its value attached, not the template.
+probe bad_attached_option <<'EOF'
+d=$(mktemp -p/tmp -d probe.XXXXXX) || exit 1
+echo "$d"
+EOF
+expect "an unresolved mktemp -p/tmp -d is refused" 1 "$REFUSAL" -- "$CS" "$TMP/bad_attached_option.sh"
+
+# Round 6: only an ODD run of backslashes escapes the dollar; `\\$(` is an escaped backslash
+# followed by a live substitution.
+probe bad_even_backslashes <<'OUTER'
+cat <<EOF
+two backslashes and a live call: \\$(mktemp -d /tmp/x.XXXXXX)
+EOF
+OUTER
+expect "an even run of backslashes does not escape the substitution" 1 'not captured in a variable assignment' -- \
+  "$CS" "$TMP/bad_even_backslashes.sh"
+
+# Round 6: containment is not capture. The substitution has to ANSWER with the call.
+probe bad_not_answered <<'EOF'
+TMP=$(mktemp -d /tmp/leak.XXXXXX >/dev/null; printf '%s\n' /tmp)
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
+echo "$TMP"
+EOF
+expect "a substitution that holds the call but answers with something else is refused" 1 \
+  'not captured in a variable assignment' -- "$CS" "$TMP/bad_not_answered.sh"
 
 # --- the default sweep's scope --------------------------------------------------------------
 # With no arguments the guard reads every `*/scripts/*.sh` and `scripts/*.sh` in its checkout.

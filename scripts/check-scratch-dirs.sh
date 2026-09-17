@@ -12,7 +12,7 @@
 # script's output against a path built on it stops matching, and the ones phrased as "this string
 # must NOT appear" then pass over anything at all.
 #
-# The fix is one line, `TMP=$(cd "$TMP" && pwd -P)`, and it was independently rediscovered three
+# The fix is one line, `TMP=$(CDPATH= cd "$TMP" && pwd -P)`, and it was independently rediscovered three
 # times — scripts/test-sync-routines.sh, issue-wave/scripts/test-fleet-worker.sh, and
 # scripts/test-check-jq-shapes.sh (ludics-lite#206) — each time with its own comment explaining
 # the same /var rewrite, because THE ABSENCE OF THE LINE IS NOT VISIBLE IN THE FILE THAT LACKS IT.
@@ -188,6 +188,12 @@ for f in "${files[@]}"; do
       }
       return out
     }
+    # Is the character at <pos> preceded by an odd run of backslashes?
+    function escaped(s, pos,   k, c) {
+      c = 0
+      for (k = pos - 1; k >= 1 && substr(s, k, 1) == "\\"; k--) c++
+      return c % 2
+    }
     # The contents of every `$( ... )` in <s>, concatenated: what a shell would EXECUTE in a line
     # that is otherwise text.
     function subst_only(s,   out, i, ch, depth, start) {
@@ -195,8 +201,9 @@ for f in "${files[@]}"; do
       for (i = 1; i <= length(s); i++) {
         ch = substr(s, i, 1)
         # A backslash-escaped dollar is a literal one: `\\$(mktemp -d ...)` in an unquoted body is
-        # emitted as text and runs nothing (round 5).
-        if (depth == 0 && ch == "$" && substr(s, i + 1, 1) == "(" && substr(s, i - 1, 1) != "\\") { depth = 1; start = i + 2; i++ }
+        # emitted as text and runs nothing (round 5) -- but only an ODD run of backslashes escapes
+        # it, since each pair is itself an escaped backslash (round 6).
+        if (depth == 0 && ch == "$" && substr(s, i + 1, 1) == "(" && !escaped(s, i)) { depth = 1; start = i + 2; i++ }
         else if (depth > 0 && ch == "(") depth++
         else if (depth > 0 && ch == ")") {
           depth--
@@ -251,7 +258,7 @@ for f in "${files[@]}"; do
     # --directory ...` and a bundled `-qd` were skipped entirely (round 4); and `$(mktemp -d)`
     # takes no template at all, defaulting to tmp.XXXXXXXXXX, which is every bit as unresolved as
     # a spelled-out one (round 1). Sets MT_DIR and MT_TPL; MT_TPL is "" when there is no template.
-    function scan_mktemp(s,   rest, w, i, n, parts, opts, skip) {
+    function scan_mktemp(s,   rest, w, i, j, c, n, parts, opts, skip) {
       MT_DIR = 0; MT_TPL = ""; skip = 0
       # A leading space, so the "not a word character before it" test has something to match even
       # when the call opens the text: `^` inside an alternation is not anchored by every awk.
@@ -276,10 +283,16 @@ for f in "${files[@]}"; do
           if (w ~ /^--(suffix|tmpdir|p)$/) skip = 1
           continue
         }
-        if (opts && w ~ /^-[A-Za-z]+$/) {           # short options, bundled or not
-          if (w ~ /d/) MT_DIR = 1
-          # -p DIR and -t PREFIX take the following word; bundled, only the LAST letter can.
-          if (substr(w, length(w), 1) ~ /[pt]/) skip = 1
+        if (opts && w ~ /^-[A-Za-z]/) {             # short options, bundled or not
+          # Letter by letter, because a value can be ATTACHED: `-p/tmp` is -p with its argument,
+          # and `-pd` would be -p taking "d" as its value rather than the directory flag
+          # (round 6). A flag that takes a value ends the cluster: the rest of the word is its
+          # value, or the next word when nothing is left.
+          for (j = 2; j <= length(w); j++) {
+            c = substr(w, j, 1)
+            if (c == "d") { MT_DIR = 1; continue }
+            if (c ~ /[pt]/) { if (j == length(w)) skip = 1; j = length(w); break }
+          }
           continue
         }
         gsub(/["'"'"']/, "", w)
@@ -355,7 +368,7 @@ for f in "${files[@]}"; do
         # closes is the one that counts.
         t = l
         gsub(/^[ \t]+|[ \t]+$/, "", t)
-        if (t != "") resolver[infunc] = (t ~ /^\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)([ \t]|$)/) ? 1 : 0
+        if (t != "") resolver[infunc] = (t ~ /^\((CDPATH=[ \t]+)?cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)([ \t]|$)/) ? 1 : 0
       }
       funcof[FNR] = infunc       # which function a line is inside, for the local shadows below
       # Control depth, for the rule that a resolution has to sit where the allocation does.
@@ -385,8 +398,10 @@ for f in "${files[@]}"; do
       sub(/^"/, "", val)                       # `VAR="$(...)"` is the same capture as `VAR=$(...)`
       # The substitution has to BE the value, not open it: `$(cd ... && pwd -P)/cache` is a
       # physical root with a component glued on, and that component can be a symlink (round 5).
-      if (val ~ /^\$\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)"?[ \t]*($|\|\||&&|;)/) return 1
-      if (val ~ /^\$\(/) {
+      if (val ~ /^\$\((CDPATH=[ \t]+)?cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\)"?[ \t]*($|\|\||&&|;)/) return 1
+      # ...and the same anchor for the branch below: `$(canonical_dir "$x")/cache` is a resolver
+      # call with a component glued on, which round 5 fixed for the direct idiom only (round 6).
+      if (val ~ /^\$\(/ && val ~ /\)"?[ \t]*($|\|\||&&|;)/) {
         inner = substr(val, 3)
         sub(/\).*$/, "", inner)
         gsub(/^[ \t]+/, "", inner)
@@ -428,6 +443,18 @@ for f in "${files[@]}"; do
     # `ROOT=$(pwd -P); mktemp -d /tmp/leaked.XXXXXX` is a resolved ROOT beside a leaked directory,
     # and reading the line as one captured call credited the next line'"'"'s resolution to it
     # (round 5).
+    # Does the substitution <h> ANSWER with its mktemp? Containment is not capture: `$(mktemp -d
+    # ... >/dev/null; printf %s /tmp)` holds the call and assigns /tmp, leaving the directory
+    # unreachable and unresolved (round 6). Same rule as the resolver functions: what a construct
+    # returns is its LAST command, and a stdout redirect on that command sends the path elsewhere
+    # (`2>/dev/null`, which this repository writes, redirects stderr and is fine).
+    function answers_with_mktemp(h,   n, parts, k, tail_cmd) {
+      n = split(h, parts, /;/)
+      tail_cmd = parts[n]
+      if (!has_mktemp_d(blank_dq(tail_cmd))) return 0
+      if (tail_cmd ~ /(^|[ \t])1?>[^&]/) return 0
+      return 1
+    }
     function head_of(l,   i, depth, ch, started, start) {
       depth = 0; started = 0
       for (i = 1; i <= length(l); i++) {
@@ -467,11 +494,11 @@ for f in "${files[@]}"; do
       # ...and it has to RUN where the allocation did. A resolution written inside a function body
       # that nothing has called yet, or inside a branch that may not be taken, is an assignment
       # the commands after the allocation never see (round 4): `TMP=$(mktemp -d ...);
-      # normalize() { TMP=$(cd "$TMP" && pwd -P); }; echo "$TMP"` echoes the unresolved spelling.
+      # normalize() { TMP=$(CDPATH= cd "$TMP" && pwd -P); }; echo "$TMP"` echoes the unresolved spelling.
       if (funcof[u] != funcof[i] || depth[u] != depth[i]) return 0
       l = code[u]
       gsub(/^[ \t]+/, "", l)
-      return (l ~ ("^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?" nm "=\"?\\$\\(cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)\"?[ \t]*($|\\|\\||&&|;)")) ? 1 : 0
+      return (l ~ ("^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?" nm "=\"?\\$\\((CDPATH=[ \t]+)?cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)\"?[ \t]*($|\\|\\||&&|;)")) ? 1 : 0
     }
     # The fixpoint, once, before the first line of pass 2 is judged. A name is resolved only when
     # EVERY assignment to it leaves a physical path: `BASE=$(cd /tmp && pwd -P)` followed by
@@ -523,6 +550,7 @@ for f in "${files[@]}"; do
           # anywhere is a name this guard will not certify.
           if (depth[i] == 0) seen[an[i]] = 1
           if (has_mktemp_d(head_of(code[i]))) {
+            if (!answers_with_mktemp(head_of(code[i]))) { bad_assign[an[i]] = 1; continue }
             lv = lead_var(template_of(head_of(code[i])))
             if (lv != "" && ((funcof[i] SUBSEP lv) in shadow)) lv = ""
             if ((lv != "" && (lv in resolved)) || mkok[i]) continue
@@ -541,7 +569,7 @@ for f in "${files[@]}"; do
       # line opens with, and a second one past that substitution is uncaptured whatever the line
       # begins with.
       if (line !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/ ||
-          !has_mktemp_d(head_of(line))) {
+          !has_mktemp_d(head_of(line)) || !answers_with_mktemp(head_of(line))) {
         refuse(FNR, "a `mktemp -d` whose result is not captured in a variable assignment: this guard resolves a scratch directory by following the variable it lands in, and cannot follow this one — write it as `VAR=$(mktemp -d ...)` and resolve VAR with `pwd -P`")
         next
       }
@@ -555,15 +583,15 @@ for f in "${files[@]}"; do
       if (lv != "" && (lv in resolved)) next   # inherited from a resolved root
       if (mkok[FNR]) next
       if (mentions(tail_of(line), nm) || exports(tail_of(line), nm)) {
-        refuse(FNR, "a `mktemp -d` into $" nm " that is used later on its OWN line, before anything could resolve it: the resolution below does not reach a command that already ran with the environment'"'"'s spelling — put `" nm "=$(cd \"$" nm "\" && pwd -P)` between them")
+        refuse(FNR, "a `mktemp -d` into $" nm " that is used later on its OWN line, before anything could resolve it: the resolution below does not reach a command that already ran with the environment'"'"'s spelling — put `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)` between them")
         next
       }
       u = first_use(nm, FNR)
       if (u == 0) {
-        refuse(FNR, "a `mktemp -d` into $" nm " that is never used and never resolved: if the directory is wanted, resolve it with `" nm "=$(cd \"$" nm "\" && pwd -P)`; if it is not, drop the call")
+        refuse(FNR, "a `mktemp -d` into $" nm " that is never used and never resolved: if the directory is wanted, resolve it with `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)`; if it is not, drop the call")
         next
       }
-      refuse(FNR, "a `mktemp -d` into $" nm " whose result is used at line " u " without being resolved physically: mktemp answers with the path as the environment spells it, and on macOS /var and /tmp are symlinks into /private, so this is a second spelling of a directory every `pwd -P` in the repository names differently — an assertion comparing it against a script'"'"'s output stops matching in silence, and a \"must NOT appear\" one then passes over anything. Add `" nm "=$(cd \"$" nm "\" && pwd -P)` directly below, or build the template on a directory this file already resolved")
+      refuse(FNR, "a `mktemp -d` into $" nm " whose result is used at line " u " without being resolved physically: mktemp answers with the path as the environment spells it, and on macOS /var and /tmp are symlinks into /private, so this is a second spelling of a directory every `pwd -P` in the repository names differently — an assertion comparing it against a script'"'"'s output stops matching in silence, and a \"must NOT appear\" one then passes over anything. Add `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)` directly below, or build the template on a directory this file already resolved")
     }
     END { exit bad ? 1 : 0 }
   ' "$f" "$f" || rc=1

@@ -1121,7 +1121,7 @@ start_wsl() {
     echo "wsl $what FAILED: no work directory" >&2; WSL_FAILED="wsl $what FAILED: no work directory"; return 1; }
   # Physical path, the house idiom: $TMPDIR on macOS is under /var, a symlink to /private/var
   # (ludics-lite#208).
-  dir=$(cd "$dir" && pwd -P) || {
+  dir=$(CDPATH= cd "$dir" && pwd -P) || {
     echo "wsl $what FAILED: no work directory" >&2; WSL_FAILED="wsl $what FAILED: no work directory"; return 1; }
   i=0
   for n in "$@"; do
