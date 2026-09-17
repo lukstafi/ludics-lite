@@ -127,14 +127,24 @@ runs, on the box that fires them (`mac-studio`):
 
 ```sh
 git -C ~/ludics-lite fetch origin
-git -C ~/ludics-lite checkout main                       # push installs from the CHECKOUT, so
-git -C ~/ludics-lite merge --ff-only origin/main         # it has to hold origin/main first
-~/ludics-lite/scripts/sync-routines.sh  # status: what would change, and in which direction
-~/ludics-lite/scripts/sync-routines.sh push
+git -C ~/ludics-lite checkout main                # push installs from the CHECKOUT, so it has to
+git -C ~/ludics-lite merge --ff-only origin/main  # hold origin/main, and nothing else
+git -C ~/ludics-lite status --porcelain -- routines   # silent, or you are about to install that
+~/ludics-lite/scripts/sync-routines.sh            # status: what differs, and in which direction
 ```
 
-From `main`, and only with nothing of your own unmerged on it: `push` installs whatever the
-checkout holds, so an ahead checkout installs an unreviewed prompt.
+Then READ that status and choose the direction; there is no unconditional third command. `push`
+when the checkout holds the newer text — the usual case, a prompt that merged and was never
+installed. `pull` when the INSTALLED copy does: a routine that edited its own prompt in place is a
+supported workflow, and a push over it destroys the only copy of that edit before anyone has
+committed it. When both sides have moved, neither: reconcile by hand.
+
+The first three lines are the whole of "canonical", and they are what makes a `push` safe: `push`
+installs whatever the checkout holds, so out of a topic branch, a checkout ahead of `origin/main`,
+or one with an uncommitted edit under `routines/`, it publishes prompt text nobody reviewed into
+the live scheduler — a worse failure than the drift it was fixing. `pull` needs none of that
+gating: it writes into the checkout, where `git diff` shows it and review still stands between it
+and the scheduler.
 
 That is the whole discipline, and it is a step in `ship-pr`'s sense of "landed" for any PR that
 touches a prompt here. A git hook could close the window, but installing one is a per-checkout
@@ -167,9 +177,10 @@ Status mode compares the installed copies with the checkout, not with `origin/ma
 behind the remote reports `in sync` while the installed prompt is older than what merged. That is
 why both prompts count `HEAD...origin/main` beside the verdict — against that ref by name, since
 the checkout may sit on a topic branch whose own tracking state says nothing about `main` — and why
-they call a checkout canonical only on `main` with both counts at `0`: installing from a checkout
-that is AHEAD publishes prompt text that has not been through review into the live scheduler, which
-is worse than the drift it would be fixing. It is also why the push recipe takes `origin/main` by
+they call a checkout canonical only on `main`, with both counts at `0` and `routines/` clean:
+installing from a checkout that is ahead, on another branch, or dirty publishes prompt text that
+has not been through review into the live scheduler, which is worse than the drift it would be
+fixing. Every push prescription in either prompt is gated on that one definition. It is also why the push recipe takes `origin/main` by
 name first — a bare `git pull --ff-only` follows whatever the
 current branch tracks, which on a checkout parked on a topic branch advances the wrong thing.
 
