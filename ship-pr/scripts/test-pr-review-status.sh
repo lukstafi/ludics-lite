@@ -842,35 +842,16 @@ test_empty_reviews_need_their_own_findings() {
 
 # --- a jq program that ERRORS must not render as a fact (ludics-lite#89) ------------------------
 # Every jq program status_state runs is a literal inside pr-review.sh, so the way to make ONE of
-# them fail without touching the tracked script is to shim `jq` itself: the shim refuses exactly
-# the invocation whose program carries the marker — nonzero status, nothing on stdout, which is
-# what a rebinding error or a typo'd `$var` produces — and forwards every other call to the real
-# jq. `command jq`, so the shim does not call itself. Like the `gh` fixture above it shadows a
-# COMMAND rather than a library function, which is why it needs no `stub` declaration.
-BREAK_JQ=""
-jq() {
-  local arg
-  if [ -n "$BREAK_JQ" ]; then
-    for arg in "$@"; do
-      case "$arg" in
-      *"$BREAK_JQ"*)
-        echo "jq: error: \$broken is not defined at <top-level>" >&2
-        return 3
-        ;;
-      esac
-    done
-  fi
-  command jq "$@"
-}
+# them fail without touching the tracked script is to shim `jq` itself. The shim and its
+# `with_broken_jq <marker> <cmd>...` helper are the preamble's (ludics-lite#179), and so is the
+# control that it breaks only the invocation the marker names.
 
 # assert_unknown_when_broken <marker> <detail fragment> <site>: break the one program the marker
 # names, on whatever fixture the caller has standing, and require the state to refuse rather than
 # answer. Each case pairs this with a control run on the same fixture, so an `unknown` the shim
 # itself produced could not pass for the site's own refusal.
 assert_unknown_when_broken() {
-  BREAK_JQ="$1"
-  run_status
-  BREAK_JQ=""
+  with_broken_jq "$1" run_status
   assert_eq "$(state_tok "$STATE")" unknown "$3: a jq program error must not render as a value"
   assert_contains "$(state_detail "$STATE")" "$2" "$3: the detail should name the read that did not answer"
   assert_contains "$LINE" "this is NOT 'not approved', retry" \
@@ -879,12 +860,10 @@ assert_unknown_when_broken() {
 
 test_a_broken_jq_program_is_unknown_not_a_value() {
   idle_fixture
-  # The control the rest of this case rests on: a marker no program carries leaves the state
-  # exactly as it was, so every `unknown` below is the site refusing and not the shim firing.
-  BREAK_JQ='zzz-no-program-carries-this'
+  # The baseline the rest of this case rests on: read with nothing broken, this fixture is idle,
+  # so every `unknown` below is a site refusing rather than the fixture's own reading.
   run_status
-  BREAK_JQ=""
-  assert_eq "$(state_tok "$STATE")" idle "the shim must break only the program it is pointed at"
+  assert_eq "$(state_tok "$STATE")" idle "the ordinary reading of this fixture"
 
   assert_unknown_when_broken 'any(.[]; .content == "+1")' \
     "the reactions feed did not parse" "the reactions feed"
