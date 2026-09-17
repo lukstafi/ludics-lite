@@ -394,7 +394,9 @@ that edited its own prompt in place — a push would destroy the only copy of th
 not, since a pull writes into the checkout where `git diff` shows it and review still stands between it
 and the scheduler; `push` when the checkout holds the newer text AND step 0 found it canonical; and no
 command at all — just what is wrong — when the checkout holds the newer text but is not canonical, or
-when both sides have moved.
+when both sides have moved — or when another local routine's drift points the OTHER way, since
+`push` and `pull` take no routine argument and apply to every local routine at once, so one of the two
+would be destroyed.
 A green sweep, or a red-but-unchanged sweep, must stay silent — a notification that fires every
 day is one that gets ignored, which would defeat the point. A box that failed to wake is not by
 itself notify-worthy; it becomes so only through the staleness thresholds above.

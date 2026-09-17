@@ -147,6 +147,14 @@ was never installed. `pull` when the INSTALLED copy does: a routine that edited 
 place is a supported workflow, and a push over it destroys the only copy of that edit before anyone
 has committed it. When both sides have moved, neither: reconcile by hand.
 
+The direction is a decision about the WHOLE run, not about one routine: `push` and `pull` take no
+routine argument and apply their mode to every name in `LOCAL_ROUTINES`. So when the routines
+disagree — one drifted with the checkout newer, another with the installed copy newer — there is
+no direction to pick, and running either destroys one side of one of them. Reconcile by hand
+first: copy the installed-only edit into the checkout and commit it (that is what a `pull` would
+have done, done to one routine), leaving every remaining difference pointing the same way, and
+only then run the sync.
+
 Canonical is what makes a `push` safe, and nothing weaker will do: `push` installs whatever the
 checkout holds, so out of a topic branch, a checkout ahead of `origin/main` — committed or not —
 or one with an uncommitted edit under `routines/`, it publishes prompt text nobody reviewed into
