@@ -804,21 +804,46 @@ check_slots() {
 # would go on passing over a prompt whose indented command line had been deleted -- the guard
 # gone, the prose about it left standing, and the checker reporting the step present. So the
 # match is the shape a prompt runs a command in: a Markdown indented-code line (four spaces or
-# more, which is what both prompts use) whose whole content is a PATH to the script -- the
-# invocation, in STATUS mode, and nothing else. Every weaker reading was tried and is refused for
-# a reason somebody would otherwise reach for: a `push`/`pull` argument writes where the
-# obligation is to read; `echo`/`cat` and friends put the path in some other command's argument;
-# `DRIFT_COMMAND=<path>` assigns it and runs nothing; a leading `#` is how a guard is usually
-# disabled rather than deleted; and a backtick makes the line prose quoting a command. Whether the prompt then READS the verdict is a review
+# more, which is what both prompts use) whose whole content is THE path to this checkout's copy
+# of the script -- the invocation, in STATUS mode, and nothing else. That path is not restated
+# here either: its `~/ludics-lite` half is read off the README's own clone command. Every weaker
+# reading was tried and is refused for a reason somebody would otherwise reach for: a
+# `push`/`pull` argument writes where the obligation is to read; `echo`/`cat` and friends put the
+# path in some other command's argument; `DRIFT_COMMAND=<path>` assigns it and runs nothing; a
+# leading `#` is how a guard is usually disabled rather than deleted; a backtick makes the line
+# prose quoting a command; and a same-basename path elsewhere is another file entirely. Whether the prompt then READS the verdict is a review
 # question no lookup settles; this pins the one thing a lookup can see, which is that the command
 # is still there. Same shape as the fixture register and the slot count.
 SYNC_SCRIPT=scripts/sync-routines.sh
 
+# checkout_path: where the README's install section clones this repository to (`~/ludics-lite`),
+# read off that clone command rather than restated here -- the prompts invoke the script through
+# that path, and it is the README's fact. Empty when there is no such line to read.
+checkout_path() {
+  [ -f "$ROOT/README.md" ] || return 0
+  # The first match, taken by expansion rather than by `| head -1`: an early-exiting reader would
+  # SIGPIPE the producer, which under pipefail is the failure this file's `matches` avoids too.
+  local all
+  all=$(sed -n 's|^git clone [^ ]*ludics-lite\.git \(~/[A-Za-z0-9_.-][A-Za-z0-9_.-]*\)[[:space:]]*$|\1|p' \
+    "$ROOT/README.md")
+  printf '%s\n' "${all%%$'\n'*}"
+}
+
 check_drift_guard() {
-  local names r f bad=0
+  local names r f home want bad=0
   # A root without the sync script installs nothing, so it carries no obligation -- as with the
   # fixture register, whose obligation comes from a fixture, and the slot count's from the worker.
   [ -f "$ROOT/$SYNC_SCRIPT" ] || return 0
+  # The path the prompts must invoke, spelled from the README's clone destination and this
+  # script's own repo-relative location -- so neither is restated here, and a `/tmp/…` or any
+  # other same-basename path is not this checkout's script.
+  home=$(checkout_path)
+  if [ -z "$home" ]; then
+    ko README.md "no 'git clone … ~/<dir>' line to read the checkout path from; the routines' drift step cannot be checked"
+    return 0
+  fi
+  # As an ERE: `~` and `.` are literals, and `$HOME` is accepted for the same path.
+  want="(~|[$]HOME)/$(printf '%s' "${home#\~/}" | sed 's/[.]/[.]/g')/$(printf '%s' "$SYNC_SCRIPT" | sed 's/[.]/[.]/g')"
   names=$(sed -n 's/^LOCAL_ROUTINES="\([^"]*\)"[[:space:]]*$/\1/p' "$ROOT/$SYNC_SCRIPT")
   if [ -z "$names" ]; then
     # Not a pass: the obligation exists and this reader cannot see who carries it.
@@ -834,19 +859,15 @@ check_drift_guard() {
       ko "$SYNC_SCRIPT" "installs '$r', but this checkout has no $f to install from"; bad=1; continue
     fi
     # An indented-code line that IS the invocation: the line's whole content, after the indent,
-    # is a PATH to the script and nothing else. The class is a path's own characters, which is
-    # what makes the line executed rather than merely written down: no blank, so
-    # `echo .../sync-routines.sh` and `cat scripts/sync-routines.sh` are arguments to some other
-    # command; no `=`, so `DRIFT_COMMAND=~/…/sync-routines.sh` is an assignment that runs
-    # nothing; no `#`, so a commented-out invocation does not count (which is how a guard is
-    # usually disabled, rather than by deleting it); no backtick, so prose quoting the command is
-    # prose. The `/` before the name is required for the same reason -- it is what makes the
-    # token a path rather than a suffix of some other word -- and costs nothing, since a routine
-    # runs in its own working directory and has to say where the checkout is. Nothing may follow
-    # the path either, so a `push`/`pull` argument does not satisfy it: those write, and what
-    # every installed routine owes is the status read.
-    matches '^ {4,}[A-Za-z0-9_.~$/-]*/sync-routines\.sh[[:space:]]*$' "$(cat "$ROOT/$f")" \
-      || { ko "$f" "runs no $SYNC_SCRIPT: an installed routine reads its own drift with an indented command line invoking it in status mode (ludics-lite#199)"; bad=1; }
+    # is THE path to this checkout's script and nothing else. Spelling the whole path is what
+    # makes the match a claim about this script rather than about a basename -- a /tmp one is
+    # some other file, possibly none -- and it rules out, in one shape, every way of holding the
+    # path without running it: a blank (so `echo …` and `cat …` put it in another command's
+    # arguments), an `=` (an assignment executes nothing), a `#` (how a guard gets disabled,
+    # rather than by deleting it), a backtick (prose quoting a command), and anything following
+    # the path (a `push`/`pull` argument writes, where the obligation is the status read).
+    matches "^ {4,}$want[[:space:]]*\$" "$(cat "$ROOT/$f")" \
+      || { ko "$f" "runs no $home/$SYNC_SCRIPT: an installed routine reads its own drift with an indented command line invoking THAT path in status mode (ludics-lite#199)"; bad=1; }
   done <<<"$(tr -s '[:space:]' '\n' <<<"$names")"
   [ "$bad" -ne 0 ] || ok "every routine $SYNC_SCRIPT installs runs it to read its own drift"
 }

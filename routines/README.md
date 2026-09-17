@@ -126,7 +126,9 @@ checkout and nothing else; the scheduler keeps dispatching the copy it already h
 runs, on the box that fires them (`mac-studio`):
 
 ```sh
-git -C ~/ludics-lite pull --ff-only     # the checkout is what push installs from
+git -C ~/ludics-lite fetch origin
+git -C ~/ludics-lite checkout main                       # push installs from the CHECKOUT, so
+git -C ~/ludics-lite merge --ff-only origin/main         # it has to hold origin/main first
 ~/ludics-lite/scripts/sync-routines.sh  # status: what would change, and in which direction
 ~/ludics-lite/scripts/sync-routines.sh push
 ```
@@ -162,7 +164,8 @@ Status mode compares the installed copies with the checkout, not with `origin/ma
 behind the remote reports `in sync` while the installed prompt is older than what merged. That is
 why both prompts count `HEAD...origin/main` beside the verdict — against that ref by name, since
 the checkout may sit on a topic branch whose own tracking state says nothing about `main` — and why
-the push recipe pulls first.
+the push recipe takes `origin/main` by name first — a bare `git pull --ff-only` follows whatever the
+current branch tracks, which on a checkout parked on a topic branch advances the wrong thing.
 
 ## The cloud routine: synced by hand
 

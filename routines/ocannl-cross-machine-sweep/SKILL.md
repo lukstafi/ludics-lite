@@ -371,16 +371,19 @@ not the backends.
 
 Send a PushNotification ONLY if there is (a) a new failure or timeout, (b) a staleness flag,
 (c) a skip-coverage `FAIL`, or a FAIL/POTENTIAL claim set that differs from the previous report's,
-(d) step 0 reporting DRIFT on this routine's own prompt — the run just executed instructions the
-checkout has superseded, and nothing else on this box notices,
+(d) step 0 reporting DRIFT on this routine's own prompt, a nonzero behind count against
+`origin/main`, or a remote comparison it could not make at all — each says this run may have executed
+instructions that have been superseded, and nothing else on this box notices; an installed prompt that
+matches an equally stale checkout reads `in sync` and is exactly as wrong,
 or (e) an `error` outcome, a script exit of 2, or a launch refused for a missing
 `~/.config/ocannl-sweep/local-box`: nothing was tested there, which step 5 already
 calls notify-worthy, and it must not go silent for being neither a failure nor yet stale.
 A `FAIL` notifies even when unchanged — it fires at most weekly (forced runs only) and means some
 claim has zero execution coverage on every backend, which must keep reaching a human until fixed;
 an unchanged POTENTIAL set stays silent like an unchanged fingerprint.
-Drift notifies every day it lasts, for the same reason: it says this run may have followed superseded
-instructions, only a person can end it, and it is silent everywhere else — the 2026-09-17 instance went a
+Drift — and a checkout behind `origin/main`, and a fetch that failed — notifies every day it lasts, for
+the same reason: each says this run may have followed superseded instructions, only a person can end it,
+and it is silent everywhere else — the 2026-09-17 instance went a
 week unseen. Put the DIFF's direction in the notification, never a fixed command: `sync-routines.sh push`
 when the checkout holds the newer text, `pull` when the installed copy does (a run that edited its own
 prompt in place — a push would destroy the only copy of that edit), and neither when both sides have moved.
