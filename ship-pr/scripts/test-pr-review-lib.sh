@@ -201,6 +201,12 @@ unset lib_probe_err lib_probe_rc
 # shellcheck source=pr-review.sh
 source "$HELPER"
 
+# What sourcing pr-review.sh installed on EXIT, read HERE because this file installs a trap of its
+# own a few lines down and a trap is REPLACED, not chained: after that line the script's own is
+# gone and unrecoverable. The guard under the snapshot holds this file's trap to it
+# (ludics-lite#195).
+LIB_HELPER_EXIT_TRAP=$(trap -p EXIT)
+
 # --- the reporter and the assertions ----------------------------------------------------------
 # Not `fail`: that is pr-review.sh's, and its refusals' exit codes are what the suites read.
 bail() {
@@ -221,15 +227,17 @@ assert_not_contains() {
 }
 
 # --- temporary paths and the one EXIT trap ----------------------------------------------------
-# pr-review.sh's trap removes GH_ERR_FILE; sourcing it replaced whatever trap the suite had. This
-# one does both jobs, and the suite registers its scratch space through test_tmpdir instead of
-# installing a trap of its own. Only paths mktemp created are ever removed.
+# Sourcing pr-review.sh installed an EXIT trap, and this one REPLACES it — a trap is not chained.
+# So this trap does both jobs, and the suite registers its scratch space through test_tmpdir
+# instead of installing a trap of its own. Only paths mktemp created are ever removed.
 TEST_CLEANUP=()
 test_cleanup() {
-  rm -f "$GH_ERR_FILE"
-  # This trap REPLACES pr-review.sh's, so the snapshot directory a sourced watch made is this
-  # file's to remove: leaving it is the very leak the sweep exists to clean up after.
-  [ -z "${SNAP_DIR:-}" ] || rm -rf "$SNAP_DIR"
+  # pr-review.sh's cleanup, CALLED rather than restated: it removes GH_ERR_FILE and the snapshot
+  # directory a sourced watch made, and what it removes changes. The restatement this line
+  # replaced is how #191's snapshot directory leaked into the real TMPDIR from every suite run,
+  # green throughout, until the copy was updated by hand (ludics-lite#195). The guard under the
+  # function-table snapshot refuses the suites if this call goes away.
+  pr_review_cleanup
   local p
   # bash 3.2 under `set -u` rejects "${TEST_CLEANUP[@]}" while it is empty.
   [ "${#TEST_CLEANUP[@]}" -eq 0 ] || for p in "${TEST_CLEANUP[@]}"; do rm -rf "$p"; done
@@ -632,6 +640,59 @@ $added"
 $file"
 }
 
+# --- the second guard: this file's EXIT trap must still reach pr-review.sh's ------------------
+# Sourcing pr-review.sh installs an EXIT trap; this file installs its own over it, and that is a
+# REPLACEMENT — a trap is not chained. So the script's cleanup runs in a suite only if this file's
+# trap calls it. It used to RESTATE it instead, as did pr-review-api-contract.sh, and the copies
+# drifted: ludics-lite#191 added a snapshot directory to the script's trap alone, and from then on
+# every suite run leaked one into the real TMPDIR while every suite and CI stayed green, because
+# the only artifact of the failure is a directory nobody looks at (ludics-lite#195). The
+# restatements are gone — both traps call `pr_review_cleanup` — and this is what keeps them gone.
+#
+# What is checked is reachability by NAME, in the same register as the shadow guard below: the
+# script's trap must BE a function the script defines, this file's trap must be a function this
+# file defines, and the script's name must appear in its body. A body-text check cannot prove the
+# call runs, but it fails the moment the call is deleted or the function renamed on one side only,
+# which is every way the copies drifted.
+lib_trap_command() { # <`trap -p` output>: the command it installs, unquoted; empty if none
+  local cmd="$1"
+  cmd=${cmd#trap -- }
+  cmd=${cmd% EXIT}
+  case "$cmd" in
+  "'"*"'")
+    cmd=${cmd#\'}
+    cmd=${cmd%\'}
+    ;;
+  esac
+  printf '%s' "$cmd"
+}
+
+lib_refuse_trap() {
+  echo "$LIB_BASENAME: REFUSING to run: $1 — sourcing pr-review.sh installs an EXIT trap and this file installs its own over it, REPLACING it, so pr-review.sh's cleanup runs in a suite only if this file's trap calls it by name. Restating what it does instead is how ludics-lite#191's snapshot directory leaked from every suite run in silence (ludics-lite#195)." >&2
+  exit 2
+}
+
+lib_helper_trap_fn=$(lib_trap_command "$LIB_HELPER_EXIT_TRAP")
+lib_own_trap_fn=$(lib_trap_command "$(trap -p EXIT)")
+lib_trap_table=$(lib_function_table)
+case "$lib_helper_trap_fn" in
+'') lib_refuse_trap "sourcing pr-review.sh installed no EXIT trap at all, so there is nothing for this file's trap to call and the guard would check nothing" ;;
+*[!A-Za-z0-9_]*) lib_refuse_trap "pr-review.sh's EXIT trap is \`$lib_helper_trap_fn\`, a command rather than a call to a named function: give it one (\`pr_review_cleanup\`) and trap that, so this file can call it" ;;
+esac
+case "$(lib_owner_of "$lib_helper_trap_fn" "$lib_trap_table")" in
+*"$HELPER") ;;
+*) lib_refuse_trap "pr-review.sh's EXIT trap names \`$lib_helper_trap_fn\`, which pr-review.sh does not define" ;;
+esac
+[ -n "$(lib_owner_of "$lib_own_trap_fn" "$lib_trap_table")" ] ||
+  lib_refuse_trap "this file's EXIT trap is \`$lib_own_trap_fn\`, not a call to a function it defines"
+case "
+$(declare -f "$lib_own_trap_fn")
+" in
+*[!A-Za-z0-9_]"$lib_helper_trap_fn"[!A-Za-z0-9_]*) ;;
+*) lib_refuse_trap "this file's EXIT trap (\`$lib_own_trap_fn\`) never calls \`$lib_helper_trap_fn\`, the function pr-review.sh's own trap runs" ;;
+esac
+unset lib_helper_trap_fn lib_own_trap_fn lib_trap_table
+
 # What is PROTECTED is what these two files define, and only that — the table is filtered on the
 # defining file rather than taken whole. A function the environment exported in (`export -f`) is
 # in scope here too, and bash records it with no file at all; recorded as library-owned, it made a
@@ -951,6 +1012,60 @@ test_tmpdir_refuses_a_name_it_uses() {
   assert_eq "$CONTROL_RC" 1 "the cleanup list as the target is refused too ($CONTROL_ERR)"
   assert_contains "$CONTROL_ERR" 'refusing to write the path into $TEST_CLEANUP' \
     "the refusal should name the cleanup list"
+}
+
+# The EXIT trap's OTHER job, which is pr-review.sh's: a watch sourced into a suite leaves a
+# snapshot directory and an error file in TMPDIR, and this file's trap — which replaced the
+# script's — is what removes them. This is ludics-lite#191's leak measured directly: the paths are
+# created in a registered root, so the case cannot itself leak whichever way it goes, and both
+# must be gone once the suite that made them has exited.
+test_the_exit_trap_removes_what_pr_review_sh_s_trap_removes() {
+  local root snap err
+  test_tmpdir root trap-removes
+  control "SNAP_DIR=\$(mktemp -d \"$root/snap.XXXXXX\")" \
+    "GH_ERR_FILE=\$(mktemp \"$root/err.XXXXXX\")" \
+    'printf "snap=%s\nerr=%s\n" "$SNAP_DIR" "$GH_ERR_FILE"'
+  assert_eq "$CONTROL_RC" 0 "the probe suite must run ($CONTROL_ERR)"
+  snap=$(sed -n 's/^snap=//p' <<<"$CONTROL_OUT")
+  err=$(sed -n 's/^err=//p' <<<"$CONTROL_OUT")
+  assert_contains "$snap" "$root/snap." "the probe should report the directory it made"
+  [ ! -e "$snap" ] || bail "the snapshot directory survived the suite's exit: $snap (ludics-lite#191)"
+  [ ! -e "$err" ] || bail "the error file survived the suite's exit: $err"
+}
+
+# And the guard that keeps the above true as the script's trap grows. Three ways the wiring can
+# come apart, each shown to refuse rather than to pass quietly — which is what the hand-copied
+# trap bodies did for a whole release (ludics-lite#195).
+test_a_trap_that_stops_reaching_pr_review_sh_s_is_refused() {
+  local root copy inline
+  test_tmpdir root trap-guard
+  copy="$root/$LIB_BASENAME"
+  cp "$HELPER" "$TEST_LIB_FILE" "$root/"
+
+  # (1) The call deleted from this file's trap — the state the restatement decayed into, where
+  # the script's cleanup simply never runs in a suite.
+  perl -0777 -i -pe 'my $n = s/\n  pr_review_cleanup\n/\n/; die "expected one call to delete, found $n\n" unless $n == 1' "$copy"
+  control_in "$root"
+  assert_refused "a trap that no longer calls the script's cleanup"
+  assert_contains "$CONTROL_ERR" 'never calls `pr_review_cleanup`' "the missing call should be named"
+  assert_contains "$CONTROL_ERR" "ludics-lite#195" "the refusal should cite the trap it exists against"
+  cp "$TEST_LIB_FILE" "$copy"
+
+  # (2) pr-review.sh's trap written back as an inline body — the shape there is no way to call.
+  inline='trap '\''rm -f "$GH_ERR_FILE"'\'' EXIT'
+  NEW="$inline" perl -0777 -i -pe 'my $n = s/\Qtrap pr_review_cleanup EXIT\E/$ENV{NEW}/; die "expected one trap line, found $n\n" unless $n == 1' "$root/pr-review.sh"
+  control_in "$root"
+  assert_refused "an inline trap body in pr-review.sh"
+  assert_contains "$CONTROL_ERR" "a command rather than a call to a named function" \
+    "the refusal should say what shape is wanted instead"
+
+  # (3) A trap naming a function pr-review.sh does not define — a rename landed on one side only.
+  cp "$HELPER" "$root/"
+  NEW='trap no_such_cleanup EXIT' perl -0777 -i -pe 'my $n = s/\Qtrap pr_review_cleanup EXIT\E/$ENV{NEW}/; die "expected one trap line, found $n\n" unless $n == 1' "$root/pr-review.sh"
+  control_in "$root"
+  assert_refused "a trap naming a function the script does not define"
+  assert_contains "$CONTROL_ERR" 'names `no_such_cleanup`, which pr-review.sh does not define' \
+    "the unknown name should be named"
 }
 
 # The parser the api-only suites share, pinned once: the endpoint, the filter, the pagination
@@ -1435,6 +1550,8 @@ tests=(
   test_definitions_before_sourcing_are_refused
   test_tmpdir_writes_to_a_target_named_dir
   test_tmpdir_refuses_a_name_it_uses
+  test_the_exit_trap_removes_what_pr_review_sh_s_trap_removes
+  test_a_trap_that_stops_reaching_pr_review_sh_s_is_refused
   test_gh_fixture_parse
   test_gh_fixture_parse_knows_gh_s_option_table
   test_gh_fixture_parse_refuses_what_it_cannot_parse
