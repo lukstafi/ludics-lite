@@ -4,7 +4,9 @@
 # prove nothing (ludics-lite#55). It ends by running the guard on this checkout, which is the
 # verdict CI's lint job reads, and on pr-review.sh as it stood before ludics-lite#89, where the
 # guard must find the site that PR fixed: a rule nobody has ever seen fire is a rule nobody can
-# trust.
+# trust. Between the two, scratch CHECKOUTS -- a guard installed in a tree of their own -- pin
+# what the argument-less default sweep reads, which the probes above cannot: they are passed by
+# path and so say nothing about scope.
 #
 # Usage: test-check-jq-shapes.sh   (exit 0 all pass, 1 otherwise)
 
@@ -256,6 +258,80 @@ if grep -qF 'ludics-lite#104 shape' <<<"$out"; then
 else
   ok "an expression with no test( is not reported as the #104 shape"
 fi
+
+# --- the default sweep's scope ------------------------------------------------------------------
+# With no arguments the guard reads every `*/scripts/*.sh` and `scripts/*.sh` in its checkout, not
+# the one file it was written for. Exercised against scratch checkouts rather than this one: what
+# has to be pinned is that a file in a scripts directory the guard was NOT written for is read at
+# all, and this repo's own scripts pass (which is the point of the case at the end).
+
+# scratch_tree <name>: a scratch checkout with the guard installed where it lives here, so that
+# running it with no arguments exercises the real default sweep over a tree we control. Three
+# files come with it.
+# Both excluded ones, since the guard refuses a sweep whose exclusion list names a file that is
+# not there -- and their probe strings coming along is the point: a tree that passes is a tree in
+# which neither was scanned. And a ship-pr/scripts/pr-review.sh holding the safe shape, which is
+# what the default used to be, alone. That last one is what makes the cases below fail the right
+# way with the widening reverted: not "no such file" on a tree that happens to lack it, but a
+# clean verdict printed over a checkout whose bad shape was never opened.
+scratch_tree() {
+  local d="$TMP/$1"
+  mkdir -p "$d/scripts" "$d/ship-pr/scripts"
+  cp "$CJ" "$d/scripts/check-jq-shapes.sh"
+  cp "$HERE/test-check-jq-shapes.sh" "$d/scripts/test-check-jq-shapes.sh"
+  chmod +x "$d/scripts/check-jq-shapes.sh"
+  cat >"$d/ship-pr/scripts/pr-review.sh" <<'PRE'
+jq -r '{sha: ([(.body // "") | capture($rc).s] | first // "")}' <<<"$raw"
+PRE
+  printf '%s' "$d/scripts/check-jq-shapes.sh"
+}
+
+# in_tree <tree> <path>: a file inside a scratch checkout, written from stdin.
+in_tree() {
+  mkdir -p "$TMP/$1/$(dirname "$2")"
+  cat >"$TMP/$1/$2"
+}
+
+# The widening itself: before it, the default read ship-pr/scripts/pr-review.sh and nothing else,
+# so this bad shape sat in a sibling skill's scripts directory unread on every head.
+T=$(scratch_tree wide_second_dir)
+in_tree wide_second_dir other-skill/scripts/stamp.sh <<'EOF'
+jq -r '.[] | capture($rc) | {sha: .s}' <<<"$raw"
+EOF
+expect "a bad shape in a second scripts directory is refused by the default sweep" 1 "$REFUSAL" \
+  -- "$T"
+# Its control, and with it the proof that the two excluded files above were not scanned: the same
+# tree with the shape wrapped passes, probe strings and grammar comments and all.
+T=$(scratch_tree wide_second_dir_ok)
+in_tree wide_second_dir_ok other-skill/scripts/stamp.sh <<'EOF'
+jq -r '.[] | {sha: ([capture($rc).s] | first // "")}' <<<"$raw"
+EOF
+expect "a second scripts directory with the safe shape passes the default sweep" 0 'every capture( is bracketed' \
+  -- "$T"
+
+# The top-level scripts directory is swept too, and the exclusions there are two named paths
+# rather than a pattern: a `scripts/check-jq*` or `scripts/test-*.sh` glob would have covered this
+# file, which is a script nobody had written when the list was, holding a real bare capture.
+T=$(scratch_tree wide_top_level)
+in_tree wide_top_level scripts/check-jq-stamps.sh <<'EOF'
+jq -r '.[] | capture($rc) | {sha: .s}' <<<"$raw"
+EOF
+expect "a bad shape in the top-level scripts directory is refused by the default sweep" 1 "$REFUSAL" \
+  -- "$T"
+
+# Fail closed on a scope that has stopped describing the checkout. An exclusion entry naming a
+# file that is not there is a list nobody updated; an empty sweep is a clean verdict over nothing,
+# which every head afterwards would read as a pass.
+T=$(scratch_tree wide_stale_exclusion)
+in_tree wide_stale_exclusion other-skill/scripts/stamp.sh <<'EOF'
+jq -r '.[] | {sha: ([capture($rc).s] | first // "")}' <<<"$raw"
+EOF
+rm -f "$TMP/wide_stale_exclusion/scripts/test-check-jq-shapes.sh"
+expect "an exclusion naming a file that is gone is a usage error" 2 'excluded file not found' \
+  -- "$T"
+T=$(scratch_tree wide_empty_sweep)
+rm -f "$TMP/wide_empty_sweep/ship-pr/scripts/pr-review.sh"
+expect "a sweep that matches nothing is a usage error, not a pass" 2 'no scripts matched' -- "$T"
 
 # --- usage ------------------------------------------------------------------------------------
 

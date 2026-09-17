@@ -239,7 +239,14 @@ thirteen rounds of table-syntax edge cases in one review and reopened on every n
 (ludics-lite#75). `test-check-prompts.sh` runs it against scratch trees, one per defect, with the
 well-formed tree as the control, and ends by running it on this checkout.
 
-`check-jq-shapes.sh` is the jq shape guard, run in the lint job on every head. jq's `capture`
+`check-jq-shapes.sh` is the jq shape guard, run in the lint job on every head over every
+`*/scripts/*.sh` and `scripts/*.sh` in the checkout — the lint job's own file list, less
+`ship-pr/hooks`, whose shell shells out to no jq yet. The trap is a property of jq and not of any
+one script, so the one-file default it opened with printed "every capture( is bracketed" over two
+dozen files it had never read. Two are excluded, named one path at a time rather than matched by a
+glob that would also cover a file nobody has written yet: the guard itself and its fixtures, which
+quote and write the refused shapes on purpose and would otherwise have their documentation of the
+rule reported as a breach of it. An explicit argument is read whatever its name. jq's `capture`
 yields ZERO outputs when its pattern does not match — not null — and a zero-output sub-expression
 deletes the value that contains it rather than falling back to a default: a string interpolation
 loses the string, an object loses the object, and inside the update expression of a `reduce` the
@@ -268,9 +275,11 @@ the direction that asks for a rewrite rather than passing a bare capture. The is
 makes the pair dangerous is the unbracketed capture and not the pairing; a pair that satisfies
 the rule passes, and one that does not is refused with #104 named in the message.
 `test-check-jq-shapes.sh` runs the guard against a scratch file per shape, with the passing shape
-beside each as the control, and then against pr-review.sh as it stood before ludics-lite#89, where
-it must still find the site that PR fixed (skipped on the depth-1 Ubuntu checkout, run on the
-macOS one, which fetches the full history).
+beside each as the control; against scratch checkouts that pin the default sweep's scope, where a
+bad shape in a second scripts directory and in the top-level one must each be refused and the two
+excluded files must not be read; and then against pr-review.sh as it stood before ludics-lite#89,
+where it must still find the site that PR fixed (skipped on the depth-1 Ubuntu checkout, run on
+the macOS one, which fetches the full history).
 
 `test-fleet-worker.sh` runs its ~180 assertions top to bottom in one shell, which takes about three
 and a half minutes. Arguments narrow that: each one selects every section whose name contains it
