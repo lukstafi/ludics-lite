@@ -954,10 +954,12 @@ fetch/push endpoint for `origin`. The session must also carry no ignored local d
 archives the session by renaming it: two classes are exempt because archiving them loses nothing —
 harness-owned state under a top-level `.claude/` directory, which the agent harness writes into
 every worktree it opens and whose lock may belong to another live session, and an ignored regular
-file byte-identical to the base checkout's copy. Neither exemption follows a symbolic link — at
+file byte-identical to the base checkout's copy — or an ignored directory, which Git reports as one
+entry with nothing inside it shown, every file beneath which is such a copy. Neither exemption follows a symbolic link — at
 the leaf or at any component of either side's path, so a base checkout reaching the path through a
 symlinked ancestor holds no copy of it — and a path the base checkout does not have is never
-exempt. The gate reads the status NUL-delimited, so a name Git would quote is judged as itself. A refusal names the ignored paths it tripped on, and suggests no stash: session
+exempt. The gate reads the status NUL-delimited, so a name Git would quote is judged as itself, and
+shell-quotes each refused path on the way out, so a pathname cannot forge a diagnostic line. A refusal names the ignored paths it tripped on, and suggests no stash: session
 worktrees share one stash stack with the primary checkout. It treats an already absent topic as a safe retry state and
 refuses an unreadable ref, a symbolic local/tracking ref, or a remote tip newer than the local
 branch; an absent remote topic sends no deletion, while present remote and local deletions carry

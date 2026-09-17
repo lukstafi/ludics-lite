@@ -752,6 +752,62 @@ test_session_ignored_quoted_path_passes() {
   echo "PASS: a C-quoted ignored path identical to the base checkout's copy passes the session gate"
 }
 
+# Git reports an excluded DIRECTORY as one entry with nothing inside it shown, and a pathname is
+# data the operator's terminal will render (review round 2 on ludics-lite#210). Both fail against
+# round 2's gate.
+test_session_ignored_directory_of_base_copies() {
+  local refusal
+  setup_case ignored-directory-of-base-copies merge main-off
+  echo 'cache/' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_MAIN/cache/sub" "$CASE_SESSION/cache/sub" "$CASE_SESSION/cache/empty"
+  echo 'copied' >"$CASE_MAIN/cache/config"
+  echo 'copied deeper' >"$CASE_MAIN/cache/sub/deep"
+  cp "$CASE_MAIN/cache/config" "$CASE_SESSION/cache/config"
+  cp "$CASE_MAIN/cache/sub/deep" "$CASE_SESSION/cache/sub/deep"
+  assert_eq "$(git -C "$CASE_SESSION" status --porcelain --ignored=matching)" '!! cache/' \
+    "the fixture must reproduce the collapsed ignored directory"
+  "$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic >/dev/null
+  assert_cleaned
+
+  # One file beneath it that is not a base copy refuses the whole entry.
+  setup_case ignored-directory-with-session-data merge main-off
+  echo 'cache/' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_MAIN/cache" "$CASE_SESSION/cache"
+  echo 'copied' >"$CASE_MAIN/cache/config"
+  cp "$CASE_MAIN/cache/config" "$CASE_SESSION/cache/config"
+  echo irreplaceable >"$CASE_SESSION/cache/session-only"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored directory holding session-only data was accepted for destructive cleanup"
+  fi
+  case "$refusal" in
+  *"cache/"*) ;;
+  *) fail "the refusal did not name the ignored directory: $refusal" ;;
+  esac
+  assert_eq "$(cat "$CASE_SESSION/cache/session-only")" irreplaceable \
+    "session-only data under an ignored directory must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: an ignored directory is cleared exactly when every file beneath it is a base copy"
+}
+
+test_session_ignored_path_control_characters_are_escaped() {
+  local name refusal lines
+  name=$(printf 'evil\npost-merge-cleanup.sh: forged line')
+  setup_case control-character-ignored-session merge main-off
+  printf '%s\n' 'evil*' >>"$CASE_MAIN/.git/info/exclude"
+  echo session-only >"$CASE_SESSION/$name"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored path with a newline in its name was accepted for destructive cleanup"
+  fi
+  lines=$(printf '%s\n' "$refusal" | wc -l | tr -d ' ')
+  assert_eq "$lines" 1 "the refusal must stay one line, so a pathname cannot forge another"
+  case "$refusal" in
+  *'forged line'*) ;;
+  *) fail "the refusal should still name the path, escaped: $refusal" ;;
+  esac
+  assert_topic_preserved
+  echo "PASS: a refused ignored path is rendered without its control characters"
+}
+
 test_master_reservation() {
   local fake_bin real_git candidate remote_master checkout_status
   setup_case master-owner-switch merge other
@@ -3953,6 +4009,8 @@ TESTS=(
   test_session_bare_claude_entry_refusal
   test_session_ignored_symlinked_base_ancestor_refusal
   test_session_ignored_quoted_path_passes
+  test_session_ignored_directory_of_base_copies
+  test_session_ignored_path_control_characters_are_escaped
   test_master_reservation
   test_unowned_master_reservation
   test_concurrent_master_edit_refusal

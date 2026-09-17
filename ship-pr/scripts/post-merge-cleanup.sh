@@ -99,13 +99,39 @@ path_has_no_link_component() {
 #      the remedy the old message implied — remove it — is one the merging session must decline.
 #      An ignored regular file or symlink named `.claude` is none of that, and keeps its refusal.
 #   2. An ignored regular file byte-identical to the base checkout's copy, which is how a
-#      worktree-creation copy looks. Archiving it preserves nothing the base checkout does not
+#      worktree-creation copy looks — and an ignored directory every file beneath which is one. Archiving it preserves nothing the base checkout does not
 #      already hold. A path absent from the base checkout has no such copy and keeps its refusal,
 #      and a symlink — at the leaf or at any component of either side's path — is never compared:
 #      it names a target rather than holding content.
 #
 # Everything else ignored still refuses, so the strictness stays in force for genuinely
 # session-local data — which by construction differs from the base copy or has no counterpart there.
+session_ignored_file_is_a_base_copy() {
+  local path="$1"
+  path_has_no_link_component "$SESSION" "$path" || return 1
+  path_has_no_link_component "$MAIN" "$path" || return 1
+  { [ -f "$SESSION/$path" ] && [ -f "$MAIN/$path" ]; } || return 1
+  cmp -s -- "$SESSION/$path" "$MAIN/$path"
+}
+
+# Git prints one entry per matching IGNORE PATTERN, not one per file: an excluded `cache/` is
+# reported as `!! cache/` with nothing inside it shown, in every ignored mode and at every
+# untracked-files setting. The exemption is about paths, not about the granularity Git chose to
+# print them at, so a directory entry is cleared exactly when every file beneath it is — an empty
+# directory carries nothing to lose, and anything that is not a regular file (a symlink, a socket)
+# stops the walk. The first path that is not a base copy refuses the whole entry, so a large build
+# tree costs one `cmp` and not a traversal.
+session_ignored_directory_holds_only_base_copies() {
+  local dir="$1" absolute relative
+  path_has_no_link_component "$SESSION" "$dir" || return 1
+  [ -d "$SESSION/$dir" ] || return 1
+  while IFS= read -r -d '' absolute; do
+    relative="$dir/${absolute#"$SESSION/$dir/"}"
+    session_ignored_file_is_a_base_copy "$relative" || return 1
+  done < <(find "$SESSION/$dir" ! -type d -print0 2>/dev/null)
+  return 0
+}
+
 session_ignored_path_is_archivable_without_loss() {
   local path="${1%/}"
   case "$path" in
@@ -114,10 +140,11 @@ session_ignored_path_is_archivable_without_loss() {
     return 0
     ;;
   esac
-  path_has_no_link_component "$SESSION" "$path" || return 1
-  path_has_no_link_component "$MAIN" "$path" || return 1
-  { [ -f "$SESSION/$path" ] && [ -f "$MAIN/$path" ]; } || return 1
-  cmp -s -- "$SESSION/$path" "$MAIN/$path"
+  if [ ! -L "$SESSION/$path" ] && [ -d "$SESSION/$path" ]; then
+    session_ignored_directory_holds_only_base_copies "$path"
+    return $?
+  fi
+  session_ignored_file_is_a_base_copy "$path"
 }
 
 # Refuse the session worktree over any change, and over ignored data the two rules above do not
@@ -140,7 +167,10 @@ refuse_session_local_data() {
     '!! '*)
       path=${entry#'!! '}
       session_ignored_path_is_archivable_without_loss "$path" && continue
-      ignored="$ignored${ignored:+, }$path"
+      # A pathname is attacker-shaped data: a newline in it would forge a second diagnostic line,
+      # and an escape sequence would reach the operator's terminal. The raw name did the
+      # filesystem checks above; what is printed is its shell-quoted rendering.
+      ignored="$ignored${ignored:+, }$(printf '%q' "$path")"
       ;;
     # Anything else is a tracked change, an untracked file, or a rename's second NUL field.
     *) changed=1 ;;
