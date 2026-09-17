@@ -949,9 +949,14 @@ make the exception explicit and leave its reason in the transcript:
 ```
 
 The helper requires Git's transactional `update-ref` symbolic-ref commands, Perl for an atomic
-filesystem rename, the exact session-worktree root, a clean and unlocked session with no ignored
-local data, and one shared
-fetch/push endpoint for `origin`. It treats an already absent topic as a safe retry state and
+filesystem rename, the exact session-worktree root, a clean and unlocked session, and one shared
+fetch/push endpoint for `origin`. The session must also carry no ignored local data, since cleanup
+archives the session by renaming it: two classes are exempt because archiving them loses nothing —
+harness-owned state under a top-level `.claude/`, which the agent harness writes into every
+worktree it opens and whose lock may belong to another live session, and an ignored file
+byte-identical to the base checkout's copy (a symlink, and a path the base checkout does not have,
+are never exempt). A refusal names the ignored paths it tripped on, and suggests no stash: session
+worktrees share one stash stack with the primary checkout. It treats an already absent topic as a safe retry state and
 refuses an unreadable ref, a symbolic local/tracking ref, or a remote tip newer than the local
 branch; an absent remote topic sends no deletion, while present remote and local deletions carry
 exact-OID leases. It also fetches the selected base

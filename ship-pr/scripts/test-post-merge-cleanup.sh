@@ -595,6 +595,91 @@ test_ignored_session_refusal() {
   echo "PASS: ignored session data is refused before cleanup"
 }
 
+# The session gate's two narrow exceptions (ludics-lite#194, ludics-lite#205 §1). Everything the
+# rules do not clear keeps its refusal: test_ignored_session_refusal covers an ignored file with no
+# counterpart in the base checkout, and the two refusal cases below cover a differing file and a
+# symlink. These four fail against the pre-fix gate, which refused on any ignored path at all.
+test_session_harness_ignored_data_passes() {
+  local session_physical
+  # The harness-owned directory as Git collapses it: the exclude matches the directory itself.
+  setup_case harness-ignored-session merge main-off
+  echo '.claude/' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_SESSION/.claude"
+  echo '{"sessionId":"other-session","pid":1}' >"$CASE_SESSION/.claude/scheduled_tasks.lock"
+  session_physical=$(cd "$CASE_SESSION" && pwd -P)
+  assert_eq "$(git -C "$CASE_SESSION" status --porcelain --ignored=matching)" '!! .claude/' \
+    "the fixture must reproduce the collapsed harness directory"
+  "$HELPER" "$CASE_MAIN" "$session_physical" topic >/dev/null
+  assert_cleaned
+  [ -f "$CASE_ARCHIVE/worktree/.claude/scheduled_tasks.lock" ] ||
+    fail "the archived session must still carry the harness directory"
+
+  # And as individual files, which is what an exclude naming the files produces.
+  setup_case harness-ignored-session-files merge main-off
+  printf '.claude/scheduled_tasks.lock\n.claude/settings.local.json\n' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_SESSION/.claude"
+  echo lock >"$CASE_SESSION/.claude/scheduled_tasks.lock"
+  echo '{}' >"$CASE_SESSION/.claude/settings.local.json"
+  "$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic >/dev/null
+  assert_cleaned
+  echo "PASS: harness-owned ignored .claude data passes the session gate"
+}
+
+test_session_ignored_identical_to_base_passes() {
+  setup_case identical-ignored-session merge main-off
+  echo copied.conf >>"$CASE_MAIN/.git/info/exclude"
+  echo 'copied at worktree creation' >"$CASE_MAIN/copied.conf"
+  cp "$CASE_MAIN/copied.conf" "$CASE_SESSION/copied.conf"
+  "$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(cat "$CASE_MAIN/copied.conf")" 'copied at worktree creation' \
+    "the base checkout's own copy must be untouched"
+  echo "PASS: an ignored file identical to the base checkout's copy passes the session gate"
+}
+
+test_session_ignored_differing_from_base_refusal() {
+  local refusal
+  setup_case differing-ignored-session merge main-off
+  echo copied.conf >>"$CASE_MAIN/.git/info/exclude"
+  echo 'base copy' >"$CASE_MAIN/copied.conf"
+  echo 'edited in the session' >"$CASE_SESSION/copied.conf"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored file differing from the base checkout was accepted for destructive cleanup"
+  fi
+  case "$refusal" in
+  *"copied.conf"*) ;;
+  *) fail "the refusal did not name the ignored path it tripped on: $refusal" ;;
+  esac
+  case "$refusal" in
+  *stash*) fail "the refusal must not advise a stash: $refusal" ;;
+  esac
+  assert_eq "$(cat "$CASE_SESSION/copied.conf")" 'edited in the session' \
+    "differing ignored session data must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: an ignored file differing from the base checkout is refused and named"
+}
+
+test_session_ignored_symlink_refusal() {
+  local refusal
+  # A symlink names a target rather than holding content, so it never passes the identity rule
+  # even when its target reads the same as the base checkout's regular file.
+  setup_case symlink-ignored-session merge main-off
+  echo copied.conf >>"$CASE_MAIN/.git/info/exclude"
+  echo 'same bytes' >"$CASE_MAIN/copied.conf"
+  echo 'same bytes' >"$CASE_ROOT/symlink-target"
+  ln -s "$(cd "$CASE_ROOT" && pwd -P)/symlink-target" "$CASE_SESSION/copied.conf"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$(cd "$CASE_SESSION" && pwd -P)" topic 2>&1); then
+    fail "an ignored symlink was accepted for destructive cleanup"
+  fi
+  case "$refusal" in
+  *"copied.conf"*) ;;
+  *) fail "the symlink refusal did not name the ignored path: $refusal" ;;
+  esac
+  [ -L "$CASE_SESSION/copied.conf" ] || fail "the ignored symlink must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: an ignored symlink is refused even when its target matches the base checkout"
+}
+
 test_master_reservation() {
   local fake_bin real_git candidate remote_master checkout_status
   setup_case master-owner-switch merge other
@@ -3789,6 +3874,10 @@ TESTS=(
   test_other_topic_owner_refusal
   test_dirty_session_refusal
   test_ignored_session_refusal
+  test_session_harness_ignored_data_passes
+  test_session_ignored_identical_to_base_passes
+  test_session_ignored_differing_from_base_refusal
+  test_session_ignored_symlink_refusal
   test_master_reservation
   test_unowned_master_reservation
   test_concurrent_master_edit_refusal

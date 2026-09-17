@@ -66,6 +66,62 @@ atomic_rename() {
   perl -e 'rename $ARGV[0], $ARGV[1] or die "$ARGV[0] -> $ARGV[1]: $!\n"' -- "$1" "$2"
 }
 
+# The session gate reads ignored data as well as tracked and untracked changes, because cleanup
+# archives the session by renaming it into a sibling: ignored data is not destroyed, it is moved
+# somewhere the operator may never look, and "not moved" is stronger than "not lost". Two narrow
+# classes carry no such loss, and both refused every desktop session unconditionally
+# (ludics-lite#194, ludics-lite#205 §1):
+#
+#   1. Harness-owned state under a top-level `.claude/`. The agent harness writes it into every
+#      worktree it opens, before the session does anything; the helper never created it and never
+#      reads it. Its `scheduled_tasks.lock` can also belong to a DIFFERENT live session, so the
+#      remedy the old message implied — remove it — is one the merging session must decline.
+#   2. An ignored file byte-identical to the base checkout's copy, which is how a worktree-creation
+#      copy looks. Archiving it preserves nothing the base checkout does not already hold. A path
+#      absent from the base checkout has no such copy and keeps its refusal, and a symlink is
+#      compared by neither side: it names a target rather than holding content.
+#
+# Everything else ignored still refuses, so the strictness stays in force for genuinely
+# session-local data — which by construction differs from the base copy or has no counterpart there.
+session_ignored_path_is_archivable_without_loss() {
+  local path="$1"
+  case "$path" in
+  '"'*) return 1 ;; # a C-quoted porcelain path: resolve nothing, refuse it by name as printed
+  .claude | .claude/ | .claude/*) return 0 ;;
+  esac
+  { [ ! -L "$SESSION/$path" ] && [ -f "$SESSION/$path" ]; } || return 1
+  { [ ! -L "$MAIN/$path" ] && [ -f "$MAIN/$path" ]; } || return 1
+  cmp -s -- "$SESSION/$path" "$MAIN/$path"
+}
+
+# Refuse the session worktree over any change, and over ignored data the two rules above do not
+# clear. The refusal names the ignored paths it tripped on, since the operator's decision for
+# `.claude/` is nothing like the one for a forgotten build tree; it does not suggest a stash,
+# because worktrees share one stash stack with the primary checkout and with concurrent sessions.
+refuse_session_local_data() {
+  local status entry path changed=0 ignored=""
+  status=$(git -C "$SESSION" status --porcelain --untracked-files=normal --ignored=matching) ||
+    fail "could not inspect session worktree cleanliness"
+  # Porcelain v1 C-quotes a path containing a newline, so no entry spans two lines here.
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    case "$entry" in
+    '!! '*)
+      path=${entry#'!! '}
+      session_ignored_path_is_archivable_without_loss "$path" && continue
+      ignored="$ignored${ignored:+, }$path"
+      ;;
+    *) changed=1 ;;
+    esac
+  done <<EOF
+$status
+EOF
+  [ "$changed" -eq 0 ] ||
+    fail "session worktree is dirty; commit or remove its changes before cleanup"
+  [ -z "$ignored" ] ||
+    fail "session worktree holds ignored data that cleanup would archive out of sight; move or remove it before cleanup: $ignored"
+}
+
 refuse_initialized_submodules() {
   local worktree="$1" description="$2" line status
   status=$(git -C "$worktree" submodule status --recursive) ||
@@ -1088,9 +1144,7 @@ if [ -n "$SESSION_REF" ]; then
 else
   [ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "detached session cannot clean $BRANCH while another worktree owns it: $BRANCH_OWNER"
 fi
-SESSION_STATUS=$(git -C "$SESSION" status --porcelain --untracked-files=normal --ignored=matching) ||
-  fail "could not inspect session worktree cleanliness"
-[ -z "$SESSION_STATUS" ] || fail "session worktree is dirty; commit, stash, or remove its changes before cleanup"
+refuse_session_local_data
 refuse_initialized_submodules "$SESSION" "session worktree"
 refuse_session_module_gitdirs "$SESSION"
 refuse_private_worktree_refs "$SESSION"
