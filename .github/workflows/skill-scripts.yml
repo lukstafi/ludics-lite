@@ -246,10 +246,18 @@ jobs:
         # The negative controls first: a suite that redefines a pr-review.sh function without
         # declaring it must be refused, or the suites below prove less than they print.
         run: ship-pr/scripts/test-pr-review-lib.sh
+      - name: Exercise the base suites' shared fixture transport
+        # Its own controls over the round counter, the delay and the tip move: the three devices
+        # the wall-clock cases below rest on (ludics-lite#179).
+        run: ship-pr/scripts/test-pr-review-base-lib.sh
       - name: Exercise the merge-time base-drift intersection
         run: ship-pr/scripts/test-pr-review-base-drift.sh
       - name: Exercise the base command's red report
         run: ship-pr/scripts/test-pr-review-base-red.sh
+      - name: Exercise the paths-ignore settle of a tip with no verdict
+        run: ship-pr/scripts/test-pr-review-base-settle.sh
+      - name: Exercise what the base wait loop decides
+        run: ship-pr/scripts/test-pr-review-base-verdict.sh
       - name: Exercise the build gate's absent-vs-not-yet split
         run: ship-pr/scripts/test-pr-review-checks-absent.sh
       - name: Exercise the review-round count
@@ -367,12 +375,21 @@ jobs:
       - name: pr-review fixtures, shared preamble and shadow guard
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-lib.sh || { echo '::error title=macOS suite failed::test-pr-review-lib.sh'; exit 1; }
+      - name: pr-review fixtures, the base suites' shared fixture transport
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-base-lib.sh || { echo '::error title=macOS suite failed::test-pr-review-base-lib.sh'; exit 1; }
       - name: pr-review fixtures, base drift
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-base-drift.sh || { echo '::error title=macOS suite failed::test-pr-review-base-drift.sh'; exit 1; }
       - name: pr-review fixtures, the base command's red report
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-base-red.sh || { echo '::error title=macOS suite failed::test-pr-review-base-red.sh'; exit 1; }
+      - name: pr-review fixtures, the paths-ignore settle
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-base-settle.sh || { echo '::error title=macOS suite failed::test-pr-review-base-settle.sh'; exit 1; }
+      - name: pr-review fixtures, what the base wait loop decides
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-base-verdict.sh || { echo '::error title=macOS suite failed::test-pr-review-base-verdict.sh'; exit 1; }
       - name: pr-review fixtures, absent vs not yet
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-checks-absent.sh || { echo '::error title=macOS suite failed::test-pr-review-checks-absent.sh'; exit 1; }
