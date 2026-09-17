@@ -38,6 +38,13 @@
 #   stub <fn>...                        declares the library functions this suite redefines on
 #                                       purpose (the merge suite's build_checks, run_signal and
 #                                       warn_base_drift)
+#   BREAK_JQ / jq()                     the shim that makes ONE named jq program fail, so a case
+#   with_broken_jq <marker> <cmd>...    can prove a read that did not parse refuses instead of
+#                                       rendering a plausible value (ludics-lite#89); three
+#                                       suites carried a byte-identical copy (#179). Its scope —
+#                                       the marked program and nothing else — is pinned by this
+#                                       file's own controls, so a suite needs only the baseline
+#                                       its broken runs are measured against
 #   run_tests <case>...                 the guard below, then each case with a PASS line
 #
 # The guard is why the file exists. pr-review.sh defines some sixty top-level functions, every
@@ -384,6 +391,61 @@ gh_fixture_answer() {
   else
     printf '%s\n' "$1"
   fi
+}
+
+# --- breaking ONE jq program on purpose (ludics-lite#89, #179) --------------------------------
+# Every jq program pr-review.sh runs is a literal inside the tracked script, so the way to make
+# one of them — and only that one — fail is to shim `jq` itself: the shim refuses exactly the
+# invocation whose command line carries the marker (nonzero status, nothing on stdout, which is
+# what a rebinding error or a typo'd `$var` produces) and forwards every other call to the real
+# jq through `command jq`, so it never calls itself. Like a suite's fixture `gh` it shadows a
+# COMMAND rather than a library function — but it is defined HERE, above the snapshot, so it is a
+# protected name like any other: a suite that wants its own jq declares `stub jq` and says why.
+#
+# Three suites carried a byte-identical copy of this (rounds, status, watch), each with its own
+# "a marker no program carries" control to prove the shim breaks only what it is pointed at
+# (ludics-lite#179). That claim is about the shim and not about any one suite's fixture, so it is
+# pinned once, by this file's own controls below; a suite keeps only the baseline reading its
+# broken-program cases are measured against, which it gets from an ordinary run with no marker
+# set.
+#
+# The marker is matched against EVERY argument, not just the program text, because a program can
+# be assembled from `--arg`s and because a filter is an argument too. That reach is the one thing
+# to hold still when choosing a marker: `gh_fixture_answer` runs the suite's own `--jq` filter
+# through this same shim, so a marker that also matches the fixture's filter breaks the fixture's
+# ANSWER rather than the script's read of it, and the case then passes for the wrong reason. Pick
+# a fragment that appears in exactly one program, and pick it out of pr-review.sh.
+BREAK_JQ=""
+jq() {
+  local arg
+  if [ -n "$BREAK_JQ" ]; then
+    for arg in "$@"; do
+      case "$arg" in
+      *"$BREAK_JQ"*)
+        echo "jq: error: \$broken is not defined at <top-level>" >&2
+        return 3
+        ;;
+      esac
+    done
+  fi
+  command jq "$@"
+}
+
+# with_broken_jq <marker> <command> [arg...]: run <command> with the marker standing, and clear it
+# again whichever way the command goes. Set and cleared by hand — the three suites' idiom — the
+# clearing line is skipped by any command that fails under `set -e`, and a marker left standing is
+# not a failure but a WRONG RESULT: every later case in the suite runs with one of the script's
+# programs broken. The status is the command's own, so a caller can still read it; `|| rc=$?`
+# also means the command runs with `set -e` suspended, which is what the cases that drive a
+# failing round used to write as a `set +e` / `set -e` pair around the call.
+with_broken_jq() {
+  local marker="$1" rc=0
+  shift
+  [ $# -gt 0 ] || bail "with_broken_jq: no command named"
+  BREAK_JQ="$marker"
+  "$@" || rc=$?
+  BREAK_JQ=""
+  return "$rc"
 }
 
 # --- retuning pr-review.sh's source-time constants --------------------------------------------
@@ -1001,6 +1063,75 @@ test_gh_fixture_parse_refuses_what_it_cannot_parse() {
   REQUEST_LOG=""
 }
 
+# --- the jq shim, and the scope three suites used to re-prove a control each --------------------
+# `probe_jq <program>` runs one real jq program through the shim and lands its status, stdout and
+# stderr in PROBE_RC / _OUT / _ERR. The program is a trivial one of this file's own: what the
+# controls below are about is the SHIM, so tying them to a program of pr-review.sh's would make
+# them fail whenever that script's text moved.
+PROBE_RC=0
+PROBE_OUT=""
+PROBE_ERR=""
+probe_jq() {
+  local rc=0
+  PROBE_OUT=$(jq -cn --arg tag "$1" '{marked: $tag}' 2>"$CONTROL_ROOT/jq.err") || rc=$?
+  PROBE_RC="$rc"
+  PROBE_ERR=$(cat "$CONTROL_ROOT/jq.err")
+  # The status is answered as well as recorded, so a case can read what `with_broken_jq` hands
+  # back from the command it ran.
+  return "$rc"
+}
+
+# Pointed at a fragment the call carries, the shim refuses it the way a broken program does:
+# nonzero, nothing on stdout, the error on stderr. Nothing on stdout is the half that matters —
+# a shim that failed but still printed would let a site's unguarded read carry on with a value.
+test_the_jq_shim_breaks_the_program_it_is_pointed_at() {
+  with_broken_jq 'marked' probe_jq mine || :
+  assert_eq "$PROBE_RC" 3 "a marked program must fail"
+  assert_eq "$PROBE_OUT" "" "and print nothing, or the site under test reads a value anyway"
+  assert_contains "$PROBE_ERR" "jq: error:" "and say what a jq error says"
+  # The marker reaches every argument, not only the program: a program assembled from `--arg`s,
+  # and a suite's own `--jq` filter, both go through this same shim.
+  with_broken_jq 'mine' probe_jq mine || :
+  assert_eq "$PROBE_RC" 3 "a marker matching an argument breaks the call too"
+}
+
+# The claim each of the three suites used to carry its own control for: the shim breaks what it is
+# pointed at and nothing else. Both halves are here — a marker that matches nothing leaves the
+# call alone, and so does no marker at all — because they are different code paths through the
+# shim, and it is the first that a suite's `BREAK_JQ='zzz-no-program-carries-this'` stood for.
+test_the_jq_shim_leaves_every_other_program_alone() {
+  # `|| :` on a call that must SUCCEED: a shim broken the other way — refusing everything while
+  # any marker stands — would otherwise take the suite down at this line under `set -e`, with an
+  # exit 3 and no FAIL naming the claim that failed.
+  with_broken_jq 'zzz-no-program-carries-this' probe_jq mine || :
+  assert_eq "$PROBE_RC" 0 "a marker no call carries must break nothing"
+  assert_eq "$PROBE_OUT" '{"marked":"mine"}' "and the answer must be the real jq's"
+  probe_jq mine || :
+  assert_eq "$PROBE_RC" 0 "and with no marker standing the shim is transparent"
+  assert_eq "$PROBE_OUT" '{"marked":"mine"}' "answering exactly as the real jq does"
+}
+
+# The leak the helper exists against. Set and cleared by hand, the clearing line is skipped by a
+# command that fails under `set -e`, and a marker left standing is not a failure but a wrong
+# RESULT: every case after it runs with one of the script's programs broken, and each of them
+# still reports PASS.
+test_with_broken_jq_clears_the_marker_whichever_way_the_command_goes() {
+  local rc=0
+  with_broken_jq 'marked' probe_jq mine || rc=$?
+  assert_eq "$rc" 3 "the command's own status is what the helper answers"
+  assert_eq "$BREAK_JQ" "" "a failing command must still leave the marker cleared"
+  with_broken_jq 'zzz-no-program-carries-this' probe_jq mine
+  assert_eq "$BREAK_JQ" "" "and so must one that succeeds"
+  # A command that is not there at all is a typo in the case, not a broken jq program.
+  set +e
+  (with_broken_jq 'marked') 2>"$CONTROL_ROOT/err"
+  rc=$?
+  set -e
+  assert_eq "$rc" 1 "with_broken_jq with no command must refuse"
+  assert_contains "$(cat "$CONTROL_ROOT/err")" "with_broken_jq: no command named" \
+    "and say what was missing"
+}
+
 # --- retune, and the restore no case performs itself -------------------------------------------
 # The values pr-review.sh gave the two constants when this file sourced it, read once so the pair
 # below asserts against the script's own defaults rather than a number copied out of it.
@@ -1222,6 +1353,9 @@ tests=(
   test_gh_fixture_parse
   test_gh_fixture_parse_knows_gh_s_option_table
   test_gh_fixture_parse_refuses_what_it_cannot_parse
+  test_the_jq_shim_breaks_the_program_it_is_pointed_at
+  test_the_jq_shim_leaves_every_other_program_alone
+  test_with_broken_jq_clears_the_marker_whichever_way_the_command_goes
   test_retune_moves_a_constant
   test_retune_is_undone_when_the_case_ends # must stay directly after the case above
   test_retune_of_a_name_the_script_does_not_set_is_refused
