@@ -593,6 +593,31 @@ slots_tree
 printf ": <<'HD'\nSLOTS=mac-studio=%s\nHD\n" "$OTHER" >> "$R/$WORKER"
 expect "a SLOTS line inside a heredoc assigns nothing" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
+# A heredoc-like operator inside quotes opens no body either -- the other half of "what the shell
+# would execute", and the same skip-to-EOF failure if it were queued.
+slots_tree
+printf "printf %%s '<<IGNORED'\nSLOTS=mac-studio=%s\n" "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "a heredoc-like string in quotes hides nothing after it" \
+  || ko "a heredoc-like string in quotes hides nothing after it (rc=$rc) -- $out"
+
+# A separator after an assignment-only command is not another command: the assignment persists.
+slots_tree
+printf 'SLOTS=mac-studio=%s ; export SLOTS\n' "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "an assignment before a separator is still the default" \
+  || ko "an assignment before a separator is still the default (rc=$rc) -- $out"
+
+# The box name is matched in lowercase, so a mention that shouts is the same mention.
+slots_tree
+printf '\nThe roster sets MAC-STUDIO=%s for the Mac.\n' "$WANT" >> "$R/README.md"
+expect "a mention in capitals is the same statement" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+slots_tree
+printf '\nThe roster sets MAC-STUDIO=%s for the Mac.\n' "$OTHER" >> "$R/README.md"
+expect "...and a stale one in capitals is refused as written" 1 "README.md: states 'MAC-STUDIO=$OTHER'" -- "$CP" "$R"
+
 # An assignment standing in front of a command is scoped to that command: the shell variable keeps
 # its old value, so the default does not move.
 slots_tree

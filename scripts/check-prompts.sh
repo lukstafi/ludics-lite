@@ -465,14 +465,18 @@ slot_mentions() {
         rest = substr(rest, st + len)
       }
     }
-    function emit(kind, frag, at, len,   n, box) {
+    function emit(kind, frag, at, len,   n, box, name) {
       if (kind == "digit") {
+        # The match was found in the lowercased text, so the box name is located there: `frag`
+        # keeps the original case (`MAC-STUDIO=6` is the same statement) and an index into it
+        # would miss.
+        name = index(tolower(frag), "mac-studio=")
         # The box name starts where the match says it does, past the boundary character: the
         # position of the name, not of the match, is what the value and the mask hang off.
-        box = at + index(frag, "mac-studio=") - 1
+        box = at + name - 1
         # The variable being SET, not a statement of its default.
         if (assignment_at(box)) return
-        n = substr(frag, index(frag, "mac-studio=") + 11)
+        n = substr(frag, name + 11)
         # Punctuation that closes the mention is punctuation, wherever Markdown puts it -- `6]`,
         # `6.`, `6:` state six. A suffix that is not punctuation still makes the value malformed.
         sub(/[^A-Za-z0-9]+$/, "", n)
@@ -563,20 +567,43 @@ SLOT_AWK_LIB='
     if (q != "" && plain > 0) return plain
     return i - 1
   }
-  # uncommented <line>: <line> up to its comment, if it carries one -- a `#` outside quotes, at the
-  # start or after a blank. A heredoc named in a comment opens no body, and queueing one would skip
-  # the rest of the file as if it were data.
-  function uncommented(line,   i, c, q, sq) {
-    q = ""; sq = sprintf("%c", 39)
+  # code_of <line>: the part of <line> the shell would EXECUTE -- its comment dropped (a `#`
+  # outside quotes, at the start or after a blank) and its quoted text blanked out. Both are places
+  # a `<<word` can stand without opening anything, and queueing a heredoc that never arrives skips
+  # the rest of the file as if it were data, which hides every assignment after it.
+  function code_of(line,   i, j, c, q, sq, dq, out) {
+    q = ""; sq = sprintf("%c", 39); out = ""
     for (i = 1; i <= length(line); i++) {
       c = substr(line, i, 1)
       if (q == "") {
-        if (c == "\\") { i++; continue }
-        if (c == "\"" || c == sq) { q = c; continue }
-        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) return substr(line, 1, i - 1)
-      } else if (c == q) q = ""
+        if (c == "\\") { out = out "  "; i++; continue }
+        # A redirection operator and the word after it are copied whole, quotes and all: the
+        # quotes in `<<'"'"'EOF'"'"'` belong to the operator, and blanking them would lose the heredoc
+        # this function exists to find.
+        if (c == "<" && substr(line, i + 1, 1) == "<") {
+          j = i
+          while (substr(line, j, 1) == "<") { out = out "<"; j++ }
+          if (substr(line, j, 1) == "-") { out = out "-"; j++ }
+          while (j <= length(line) && substr(line, j, 1) ~ /[[:space:]]/) { out = out substr(line, j, 1); j++ }
+          dq = substr(line, j, 1)
+          if (dq == "\"" || dq == sq) {
+            out = out dq; j++
+            while (j <= length(line) && substr(line, j, 1) != dq) { out = out substr(line, j, 1); j++ }
+            if (j <= length(line)) { out = out dq; j++ }
+          } else
+            while (j <= length(line) && substr(line, j, 1) !~ /[[:space:];&|<>()]/) { out = out substr(line, j, 1); j++ }
+          i = j - 1
+          continue
+        }
+        if (c == "\"" || c == sq) { q = c; out = out " "; continue }
+        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) return out
+        out = out c
+      } else {
+        if (c == q) q = ""
+        out = out " "          # same length, so nothing shifts under the caller
+      }
     }
-    return line
+    return out
   }
   # unquote <s>: <s> with the quote characters that grouped it removed.
   function unquote(s,   out, i, c, q) {
@@ -619,7 +646,7 @@ slot_default() {
     {
       # Every heredoc the line opens, in the order the shell consumes their bodies: one command
       # may declare several.
-      rest = uncommented($0)
+      rest = code_of($0)
       while (match(rest, hd)) {
         tag = substr(rest, RSTART, RLENGTH)
         sub(/^[^<]/, "", tag)                  # the guard character, when the match took one
@@ -643,10 +670,10 @@ slot_default() {
       eq = index($0, "=")
       stop = word_end($0, eq)
       # `SLOTS=… some-command` scopes the assignment to that command and leaves the shell variable
-      # alone, so only an assignment standing as the whole command sets the default. Nothing but a
-      # comment may follow it.
+      # alone, so a WORD after the assignment means it sets nothing. A separator or a redirection
+      # does not: `SLOTS=…; export SLOTS` is an assignment-only command, and it persists.
       tail = substr($0, stop + 1); sub(/^[[:space:]]+/, "", tail)
-      if (tail != "" && substr(tail, 1, 1) != "#") next
+      if (tail != "" && tail !~ /^[#;&|<>)]/) next
       # The value as the shell would take it: the assignment word with its quoting removed.
       val = unquote(substr($0, eq + 1, stop - eq))
       # EVERY mac-studio pair in the value, since `box_correctness_slots` validates the pairs in
