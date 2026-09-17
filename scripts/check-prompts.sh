@@ -26,8 +26,9 @@
 # every file that quotes the mac-studio correctness-slot count quotes the one fleet-worker.sh
 # actually defaults to (ludics-lite#160) -- which files those are is discovered, not listed.
 # A third reads the routines sync-routines.sh installs off its own LOCAL_ROUTINES line and
-# requires each of their prompts to name that script, so the step 0 that makes an installed
-# copy's drift visible cannot be edited away in silence (ludics-lite#199).
+# requires each of their prompts to RUN that script -- the command line, not a mention of the
+# name -- so the step 0 that makes an installed copy's drift visible cannot be edited away in
+# silence (ludics-lite#199).
 #
 # Usage: check-prompts.sh [root]   (root defaults to the checkout this script lives in;
 #                                   exit 0 all pass, 1 otherwise)
@@ -796,10 +797,19 @@ check_slots() {
 #
 # WHICH prompts are held is read off the script that installs them: the one-line LOCAL_ROUTINES
 # assignment, the same line scripts/test-sync-routines.sh reads, so a routine added to the sync
-# arrives here already obliged and a retired one stops being. The claim is only that the prompt
-# NAMES the script -- whether the step reads well is a review question, and no lookup settles it,
-# but a prompt that does not mention the script certainly does not run it. Same shape as the
-# fixture register and the slot count: a lookup, small enough to be obviously right.
+# arrives here already obliged and a retired one stops being.
+#
+# WHAT is required is the COMMAND, not a mention of it. Both prompts name sync-routines.sh in
+# their explanatory and reporting prose several times over, so a check that matched the filename
+# would go on passing over a prompt whose indented command line had been deleted -- the guard
+# gone, the prose about it left standing, and the checker reporting the step present. So the
+# match is the shape a prompt runs a command in: a Markdown indented-code line (four spaces or
+# more, which is what both prompts use) whose whole content is an invocation of the script in
+# STATUS mode -- the path, ending the line. A `push` or `pull` argument does not satisfy it and
+# should not: those write, and what every routine owes is the read. A line carrying a backtick is
+# prose quoting a command, not a command. Whether the prompt then READS the verdict is a review
+# question no lookup settles; this pins the one thing a lookup can see, which is that the command
+# is still there. Same shape as the fixture register and the slot count.
 SYNC_SCRIPT=scripts/sync-routines.sh
 
 check_drift_guard() {
@@ -821,10 +831,12 @@ check_drift_guard() {
     if [ ! -f "$ROOT/$f" ]; then
       ko "$SYNC_SCRIPT" "installs '$r', but this checkout has no $f to install from"; bad=1; continue
     fi
-    matches 'sync-routines\.sh' "$(cat "$ROOT/$f")" \
-      || { ko "$f" "names no $SYNC_SCRIPT: an installed routine reads its own drift (ludics-lite#199)"; bad=1; }
+    # An indented-code line that IS the invocation: no backtick (prose quoting it), nothing but
+    # the path, and no mode argument -- status is the read every routine owes.
+    matches '^ {4,}[^`]*[^[:space:]]*sync-routines\.sh[[:space:]]*$' "$(cat "$ROOT/$f")" \
+      || { ko "$f" "runs no $SYNC_SCRIPT: an installed routine reads its own drift with an indented command line invoking it in status mode (ludics-lite#199)"; bad=1; }
   done <<<"$(tr -s '[:space:]' '\n' <<<"$names")"
-  [ "$bad" -ne 0 ] || ok "every routine $SYNC_SCRIPT installs reads its own drift"
+  [ "$bad" -ne 0 ] || ok "every routine $SYNC_SCRIPT installs runs it to read its own drift"
 }
 
 # --- run --------------------------------------------------------------------------------------

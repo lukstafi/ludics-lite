@@ -27,12 +27,12 @@ set the latency of the whole per-PR matrix.
 
 Before waking anything, run the drift check in the ludics-lite checkout, which is where this prompt is canonical:
 
-    git -C ~/ludics-lite fetch --quiet origin; git -C ~/ludics-lite status -sb | head -1
+    git -C ~/ludics-lite fetch --quiet origin && git -C ~/ludics-lite status -sb | head -1
     ~/ludics-lite/scripts/sync-routines.sh
 
 `scripts/sync-routines.sh` with no argument is status mode: one line per local scheduled task, and exit 1 on any drift. Read your own line. `ocannl-cross-machine-sweep: DRIFT` means the prompt the scheduler dispatched — the one you are reading now — is not the one the checkout holds, so the steps below may be a superseded revision; the diff it prints says which way and in what. It is not hypothetical: on 2026-09-17 the installed copy was found nineteen lines of superseded prose behind, still telling the run to wake the lab without `--hold`, and it had been that way for about a week (ludics-lite#199).
 
-Status mode compares the installed copies with THIS checkout, not with `origin/main`, so a checkout behind the remote reports `in sync` while the installed prompt is older than what merged; if the `status -sb` branch line says `[behind N]`, the verdict under it is only as current as the checkout.
+Status mode compares the installed copies with THIS checkout, not with `origin/main`, so a checkout behind the remote reports `in sync` while the installed prompt is older than what merged; if the `status -sb` branch line says `[behind N]`, the verdict under it is only as current as the checkout. The `&&` is deliberate: a failed fetch (auth, DNS, network) prints no branch line at all, and that absence is the answer — the remote comparison is UNKNOWN, not clean, because stale remote-tracking refs would show a checkout matching the installed copies as up to date while `origin/main` holds a newer prompt. Report the fetch failure instead of the branch line.
 
 Carry on with the sweep either way — a drifted prompt still runs a useful sweep, and the coverage window is the thing that must not be missed — but report the finding in step 5 and notify on it in step 6. Do NOT run `sync-routines.sh push` and do not edit the installed copy: those are live scheduler state, and re-installing a prompt is a person's call made after reading the diff. Where the two disagree about a step below, this prompt is what the scheduler gave you; say so and follow it.
 

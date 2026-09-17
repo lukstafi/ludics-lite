@@ -846,15 +846,36 @@ drift_edit() {
 }
 
 drift_tree
-expect "every installed routine's prompt reads its own drift" 0 \
-  'reads its own drift' -- "$CP" "$R"
+expect "every installed routine's prompt runs the drift check" 0 \
+  'runs it to read its own drift' -- "$CP" "$R"
 
 # The step edited out of a prompt is the drift this check exists for: prose that stops being run
 # looks exactly like prose that is.
 drift_tree
 drift_edit "routines/$DRIFT_ONE/SKILL.md" 's/sync-routines\.sh/the-sync-script/g'
 expect "a routine that stops naming the sync script is refused" 1 \
-  "routines/$DRIFT_ONE/SKILL.md: names no scripts/sync-routines.sh" -- "$CP" "$R"
+  "routines/$DRIFT_ONE/SKILL.md: runs no scripts/sync-routines.sh" -- "$CP" "$R"
+
+# The mutation that matters, and the one a filename match would pass: delete the COMMAND and
+# leave every mention of it standing. Both prompts name the script in explanatory and reporting
+# prose, so this is what an edited-away guard actually looks like.
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" '/^ \{4,\}[^`]*sync-routines\.sh[[:space:]]*$/d'
+expect "a routine that keeps the prose and drops the command is refused" 1 \
+  "routines/$DRIFT_ONE/SKILL.md: runs no scripts/sync-routines.sh" -- "$CP" "$R"
+
+# A write is not the read. `push` and `pull` install and recover; what every installed routine
+# owes is the status invocation, so a line that ends in a mode argument does not satisfy it.
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" 's|^\( *[^ `]*sync-routines\.sh\)$|\1 push|'
+expect "an invocation that writes instead of reading is refused" 1 \
+  "routines/$DRIFT_ONE/SKILL.md: runs no scripts/sync-routines.sh" -- "$CP" "$R"
+
+# ...and prose quoting the command is prose, however it is indented.
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" 's|^\( *\)\([^ `]*sync-routines\.sh\)$|\1run `\2`|'
+expect "an indented line quoting the command is not the command" 1 \
+  "routines/$DRIFT_ONE/SKILL.md: runs no scripts/sync-routines.sh" -- "$CP" "$R"
 
 # Which prompts are held is read off the script, so a name added to LOCAL_ROUTINES arrives obliged
 # -- and one it installs with nothing to install from is refused rather than skipped.
