@@ -533,6 +533,62 @@ test_status_after_a_watch_reads_for_itself() {
     "and report the head it just read, not the one the watch was holding"
 }
 
+test_a_dead_watch_s_snapshot_directory_is_swept() {
+  # A watch killed with SIGKILL runs no EXIT trap, so its snapshot files outlive it. They are one
+  # directory per process, named with the owning pid, and the next watch to start sweeps the ones
+  # whose owner is gone — without touching a CONCURRENT watch's, which is the failure mode that
+  # matters: several watches share a TMPDIR routinely, one per PR in flight.
+  idle_fixture
+  local root live dead dead_dir live_dir own
+  root="$TEST_ROOT/snap-root"
+  mkdir -p "$root"
+  # A pid that is certainly gone: a child that has already exited and been reaped.
+  (exit 0) &
+  dead=$!
+  wait "$dead" 2>/dev/null || true
+  # And one that is certainly alive for the length of this case.
+  sleep 30 &
+  live=$!
+  dead_dir="$root/pr-review-snap.$dead.AAAAAA"
+  live_dir="$root/pr-review-snap.$live.BBBBBB"
+  mkdir -p "$dead_dir" "$live_dir"
+  : >"$dead_dir/round.feeds.pr"
+  : >"$live_dir/round.feeds.pr"
+  # And the loose files the first cut of the snapshot left in TMPDIR, keyed the same way.
+  : >"$root/pr-review-snap.$dead.feeds.pr"
+  : >"$root/pr-review-snap.$live.feeds.pr"
+
+  local saved_root="$SNAP_ROOT" saved_dir="$SNAP_DIR" saved_snap="$SNAP"
+  SNAP_ROOT="$root" SNAP_DIR="" SNAP=""
+  run_watch 0,0,0
+  own="$SNAP_DIR"
+  SNAP_ROOT="$saved_root" SNAP_DIR="$saved_dir" SNAP="$saved_snap"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+
+  assert_eq "$WATCH_RC" 0 "the round still lands; the sweep is not part of what a watch reports"
+  if [ -d "$dead_dir" ]; then
+    bail "the snapshot directory of a pid that is gone should be swept at watch start"
+  fi
+  if [ ! -d "$live_dir" ]; then
+    bail "a live watch's snapshot directory must survive another watch's sweep"
+  fi
+  if [ -e "$root/pr-review-snap.$dead.feeds.pr" ]; then
+    bail "a loose snapshot file of a pid that is gone should be swept too"
+  fi
+  if [ ! -e "$root/pr-review-snap.$live.feeds.pr" ]; then
+    bail "a live watch's loose snapshot file must survive another watch's sweep"
+  fi
+  # And the watch's own files went into a directory of its own, not loose into the root, so there
+  # is nothing a SIGKILL could leave that a later sweep cannot collect as one unit.
+  assert_eq "$(find "$root" -maxdepth 1 -type f -name "pr-review-snap.$$.*" | wc -l | tr -d ' ')" 0 \
+    "the snapshot files should live inside a per-process directory, not beside it"
+  case "$own" in "$root"/pr-review-snap.$$.*) ;;
+  *) bail "the watch's own snapshot directory should be named for this process, got '$own'" ;;
+  esac
+  rm -rf "$root"
+}
+
 # --- the reviewer that never started (ludics-lite#78) ------------------------------------------
 # The head is the SHA the first ocannl-staging#677 failure named, so "the ref it could not fetch"
 # and "the PR's head" are the same string, as they were there.
@@ -922,6 +978,7 @@ tests=(
   test_the_state_is_about_the_head_the_round_was_classified_against
   test_a_failed_round_hands_the_state_nothing
   test_status_after_a_watch_reads_for_itself
+  test_a_dead_watch_s_snapshot_directory_is_swept
   test_initialization_failure_is_its_own_state
   test_a_failure_naming_no_ref_is_not_attributed
   test_a_differently_worded_failure_is_missed_not_guessed

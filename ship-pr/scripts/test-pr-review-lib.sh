@@ -217,6 +217,9 @@ assert_not_contains() {
 TEST_CLEANUP=()
 test_cleanup() {
   rm -f "$GH_ERR_FILE"
+  # This trap REPLACES pr-review.sh's, so the snapshot directory a sourced watch made is this
+  # file's to remove: leaving it is the very leak the sweep exists to clean up after.
+  [ -z "${SNAP_DIR:-}" ] || rm -rf "$SNAP_DIR"
   local p
   # bash 3.2 under `set -u` rejects "${TEST_CLEANUP[@]}" while it is empty.
   [ "${#TEST_CLEANUP[@]}" -eq 0 ] || for p in "${TEST_CLEANUP[@]}"; do rm -rf "$p"; done
