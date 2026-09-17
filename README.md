@@ -224,6 +224,7 @@ ship-pr/scripts/test-pr-review-run-watch.sh
 scripts/test-wake-lab.sh
 scripts/test-check-prompts.sh
 scripts/test-check-jq-shapes.sh
+scripts/test-check-scratch-dirs.sh
 scripts/test-sync-routines.sh
 ```
 
@@ -233,7 +234,9 @@ job and a step per suite: the hosted
 macOS runners are scarce enough that four separate macOS jobs queued a green PR for one to two
 hours behind nine minutes of work (ludics-lite#55). Alongside them run `bash -n`, shellcheck at
 error severity, a check that the two cleanup scripts still carry their parse guard, and the jq
-shape guard (`scripts/check-jq-shapes.sh`, with `scripts/test-check-jq-shapes.sh` beside it). The suites
+shape guard (`scripts/check-jq-shapes.sh`, with `scripts/test-check-jq-shapes.sh` beside it) and the
+scratch directory guard (`scripts/check-scratch-dirs.sh`, with `scripts/test-check-scratch-dirs.sh`
+beside it). The suites
 run on every push to main and on a pull request that touches anything but Markdown (the top-level
 README counts as script input, since the fleet suite executes its install loops); three jobs run on
 every head regardless, the prompt hygiene check (`scripts/check-prompts.sh`), the lint, and the
@@ -298,6 +301,23 @@ bad shape in a second scripts directory and in the top-level one must each be re
 excluded files must not be read; and then against pr-review.sh as it stood before ludics-lite#89,
 where it must still find the site that PR fixed (skipped on the depth-1 Ubuntu checkout, run on
 the macOS one, which fetches the full history).
+
+`check-scratch-dirs.sh` is the scratch directory guard, run in the lint job over the same file
+list. `mktemp -d` answers with the path as the environment spells it, and on macOS both `/var` and
+`/tmp` are symlinks into `/private`, while every script here computes its own root with `pwd -P`.
+Unresolved, one directory has two spellings, so an assertion comparing a script's output against a
+scratch path stops matching in silence and the ones phrased as "this must NOT appear" pass over
+anything at all. The one-line fix, `TMP=$(cd "$TMP" && pwd -P)`, was independently rediscovered
+three times, because the absence of the line is not visible in the file that lacks it: a suite with
+it and a suite without it read identically at the `mktemp` call (ludics-lite#208). The guard
+refuses a `mktemp -d` whose result is neither resolved before its first use nor rooted in a path
+the file already resolved — a child of a physical path is physical, which is what lets
+post-merge-cleanup.sh's two dozen scratch paths under its canonicalized `TEMP_ROOT` pass without a
+line each. A comment and a `trap` body are not uses: the first is where the resolution gets
+explained, the second runs at exit. `test-check-scratch-dirs.sh` runs it against a scratch file per
+shape with the passing shape beside each, against scratch checkouts that pin the default sweep's
+scope, and finally against the three suites that rediscovered the fix, each with its resolution
+line removed, where the guard must find what their authors found by accident.
 
 `test-fleet-worker.sh` runs its ~180 assertions top to bottom in one shell, which takes about three
 and a half minutes. Arguments narrow that: each one selects every section whose name contains it

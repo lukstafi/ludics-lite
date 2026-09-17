@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# Exercises check-scratch-dirs.sh against scratch files: one file per shape the guard exists to
+# refuse, each with the shape that must PASS beside it -- a scan that cannot fail would prove
+# nothing, and a scan that refuses everything is worse than none (ludics-lite#55). Scratch
+# CHECKOUTS then pin what the argument-less default sweep reads, which the probes cannot: they
+# are passed by path and so say nothing about scope. It ends on the three suites that
+# independently rediscovered this fix -- test-sync-routines.sh, test-fleet-worker.sh,
+# test-check-jq-shapes.sh -- each with its one resolution line removed, where the guard must find
+# what its author found by accident. A rule nobody has ever seen fire is a rule nobody can trust.
+#
+# Usage: test-check-scratch-dirs.sh   (exit 0 all pass, 1 otherwise)
+
+set -uo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd -P)
+ROOT=$(cd "$HERE/.." && pwd -P)
+CS="$HERE/check-scratch-dirs.sh"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/check-scratch-dirs-test.XXXXXX") || exit 1
+# The suite's own scratch root, resolved physically -- the very rule under test, and here for the
+# reason the guard gives: the scratch checkouts below install the guard, which computes its ROOT
+# with `pwd -P`, so an unresolved $TMP and the guard's idea of the same directory would be spelled
+# differently and every assertion comparing its output against a $TMP path would stop matching.
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+trap 'rm -rf "$TMP"' EXIT
+
+pass=0
+fail=0
+ok() {
+  pass=$((pass + 1))
+  echo "PASS: $*"
+}
+ko() {
+  fail=$((fail + 1))
+  echo "FAIL: $*"
+}
+
+# expect LABEL WANT_RC WANT_SUBSTRING -- COMMAND...
+expect() {
+  local label="$1" want_rc="$2" want="$3" out rc
+  shift 3
+  [ "$1" = -- ] && shift
+  out=$("$@" 2>&1)
+  rc=$?
+  if [ "$rc" -eq "$want_rc" ] && grep -qF -- "$want" <<<"$out"; then
+    ok "$label"
+  else
+    ko "$label (rc=$rc want $want_rc; want /$want/) -- $out"
+  fi
+}
+
+# probe NAME: writes the scratch file $TMP/NAME.sh from stdin. It does not PRINT the path the way
+# the jq guard's fixtures do: a heredoc body carrying a `$(` inside a `$(probe ...)` loses bash's
+# parser in the command substitution, and every probe here is shell source full of them. Each
+# case names its file on the expect line instead.
+probe() {
+  cat >"$TMP/$1.sh"
+}
+
+CLEAN='every mktemp -d is resolved or rooted in a resolved path'
+REFUSAL='without being resolved physically'
+
+# --- the shapes that must pass ------------------------------------------------------------------
+
+probe safe_idiom <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+mkdir -p "$TMP/bin"
+EOF
+expect "the house idiom passes" 0 "$CLEAN" -- "$CS" "$TMP/safe_idiom.sh"
+
+# A trap body runs at exit, after every resolution in the file, so it is not a use: two of the
+# three suites that already do this right register their cleanup between the mktemp and the
+# resolution.
+probe safe_trap_first <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+trap 'rm -rf "$TMP"' EXIT
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+echo "$TMP"
+EOF
+expect "a trap between the mktemp and the resolution is not a use" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_trap_first.sh"
+
+# The comment explaining the resolution names the variable, directly above the resolution.
+probe safe_comment <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+# An unresolved $TMP here and the script's idea of the same directory are spelled differently.
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+echo "$TMP"
+EOF
+expect "a comment naming the variable is not a use" 0 "$CLEAN" -- "$CS" "$TMP/safe_comment.sh"
+
+# A child of a physical path is physical, so a template rooted in an already-resolved variable
+# needs nothing further. This is post-merge-cleanup.sh's shape.
+probe safe_inherited <<'EOF'
+canonical_dir() {
+  (cd "$1" && pwd -P) || fail "cannot resolve: $1"
+}
+TEMP_ROOT=$(canonical_dir "${TMPDIR:-/tmp}") || exit 1
+work=$(mktemp -d "$TEMP_ROOT/ship-pr-work.XXXXXX") || exit 1
+git init "$work"
+EOF
+expect "a template rooted in a variable resolved by a function passes" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_inherited.sh"
+
+# ...including when the root is assigned BELOW the function that builds on it, which is exactly
+# how post-merge-cleanup.sh reads: TEMP_ROOT is set near the bottom, its scratch directories are
+# made in functions near the top. A one-pass scanner called all three of those unresolved.
+probe safe_root_below <<'EOF'
+canonical_dir() {
+  (cd "$1" && pwd -P)
+}
+make_work() {
+  WORK=$(mktemp -d "$TEMP_ROOT/work.XXXXXX") || return 1
+  git init "$WORK"
+}
+TEMP_ROOT=$(canonical_dir "${TMPDIR:-/tmp}") || exit 1
+make_work
+EOF
+expect "a root assigned below its use still counts" 0 "$CLEAN" -- "$CS" "$TMP/safe_root_below.sh"
+
+probe safe_inherited_inline <<'EOF'
+BASE=$(cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+d=$(mktemp -d "$BASE/thing.XXXXXX") || exit 1
+echo "$d"
+EOF
+expect "a template rooted in a pwd -P substitution passes" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_inherited_inline.sh"
+
+# The parent of a physical path is physical: post-merge-cleanup.sh allocates its session archives
+# beside a session worktree it has already canonicalized.
+probe safe_dirname <<'EOF'
+canonical_dir() {
+  (cd "$1" && pwd -P)
+}
+SESSION=$(canonical_dir "$2") || exit 1
+SESSION_PARENT=$(dirname "$SESSION")
+ARCHIVE=$(mktemp -d "$SESSION_PARENT/.recovery.XXXXXX") || exit 1
+echo "$ARCHIVE"
+EOF
+expect "a template rooted in the dirname of a resolved path passes" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_dirname.sh"
+
+# A chain: a scratch directory under a resolved root is itself resolved, and certifies the next
+# one down. Each link costs a round of the guard's fixpoint.
+probe safe_chain <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+inner=$(mktemp -d "$TMP/inner.XXXXXX") || exit 1
+deeper=$(mktemp -d "$inner/deeper.XXXXXX") || exit 1
+echo "$deeper"
+EOF
+expect "a scratch directory under a resolved scratch directory passes" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_chain.sh"
+
+probe safe_local <<'EOF'
+case_root() {
+  local d
+  d=$(mktemp -d "${TMPDIR:-/tmp}/case.XXXXXX") || return 1
+  d=$(cd "$d" && pwd -P) || return 1
+  printf '%s' "$d"
+}
+EOF
+expect "a local variable inside a function passes" 0 "$CLEAN" -- "$CS" "$TMP/safe_local.sh"
+
+# A file with no mktemp -d at all is out of the rule's way, and says so in the same summary line.
+probe safe_no_mktemp <<'EOF'
+ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+echo "$ROOT"
+EOF
+expect "a file with no mktemp -d passes" 0 "$CLEAN" -- "$CS" "$TMP/safe_no_mktemp.sh"
+
+# --- the shapes that must be refused --------------------------------------------------------
+
+probe bad_tmpdir <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+mkdir -p "$TMP/bin"
+EOF
+expect "an unresolved TMPDIR scratch directory is refused" 1 "$REFUSAL" -- "$CS" "$TMP/bad_tmpdir.sh"
+
+# The literal /tmp is the same defect wearing a different template: /tmp is a symlink to
+# /private/tmp on macOS just as /var is to /private/var.
+probe bad_literal_tmp <<'EOF'
+TEST_ROOT=$(mktemp -d "/tmp/suite-test.XXXXXX") || exit 1
+mkdir -p "$TEST_ROOT/case"
+EOF
+expect "an unresolved literal /tmp scratch directory is refused" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_literal_tmp.sh"
+
+# Before FIRST USE, not merely somewhere in the file: the line that used the unresolved spelling
+# does not get the resolution that follows it, and this is how the defect survives a reader who
+# greps for `pwd -P` and finds one.
+probe bad_late_resolution <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+mkdir -p "$TMP/bin"
+out=$(run_it "$TMP/bin")
+TMP=$(cd "$TMP" && pwd -P) || exit 1
+EOF
+expect "a resolution after the first use is refused" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_late_resolution.sh"
+expect "...and the refusal names the line that used it" 1 "used at line 2" -- \
+  "$CS" "$TMP/bad_late_resolution.sh"
+
+# `pwd` alone answers with the logical path, $PWD, which on macOS is the very /var spelling the
+# resolution exists to leave behind.
+probe bad_logical_pwd <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+TMP=$(cd "$TMP" && pwd) || exit 1
+mkdir -p "$TMP/bin"
+EOF
+expect "a resolution with pwd but not pwd -P is refused" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_logical_pwd.sh"
+
+# The resolution has to land back in the SAME variable. Resolving into a second name leaves every
+# later reader of the first one holding the environment's spelling.
+probe bad_other_name <<'EOF'
+SNAP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/snap.XXXXXX") || exit 1
+real=$(cd "$SNAP_DIR" && pwd -P) || exit 1
+echo "$SNAP_DIR"
+EOF
+expect "a resolution into a different variable is refused" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_other_name.sh"
+
+probe bad_uncaptured <<'EOF'
+cd "$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX")" || exit 1
+EOF
+expect "a mktemp -d whose result is not captured is refused" 1 'not captured in a variable assignment' -- \
+  "$CS" "$TMP/bad_uncaptured.sh"
+
+probe bad_unused <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+EOF
+expect "a mktemp -d that is never used and never resolved is refused" 1 'never used and never resolved' -- \
+  "$CS" "$TMP/bad_unused.sh"
+
+# --- the default sweep's scope --------------------------------------------------------------
+# With no arguments the guard reads every `*/scripts/*.sh` and `scripts/*.sh` in its checkout.
+# Exercised against scratch checkouts: what has to be pinned is that a file in a scripts
+# directory nobody has written yet is read at all.
+
+# scratch_tree NAME: a scratch checkout with the guard installed where it lives here, plus both
+# files its exclusion list names (the guard refuses a sweep whose list names a file that is not
+# there) and one clean script elsewhere, so a tree that passes is a tree in which the two
+# excluded files -- which carry the refused shapes in their own text -- were really not scanned.
+scratch_tree() {
+  local d="$TMP/$1"
+  mkdir -p "$d/scripts" "$d/ship-pr/scripts"
+  cp "$CS" "$d/scripts/check-scratch-dirs.sh"
+  cp "$HERE/test-check-scratch-dirs.sh" "$d/scripts/test-check-scratch-dirs.sh"
+  chmod +x "$d/scripts/check-scratch-dirs.sh"
+  cat >"$d/ship-pr/scripts/pr-review.sh" <<'PRE'
+SNAP=$(mktemp -d "${TMPDIR:-/tmp}/pr-review.XXXXXX") || exit 1
+SNAP=$(cd "$SNAP" && pwd -P) || exit 1
+echo "$SNAP"
+PRE
+}
+
+# in_tree TREE PATH: a file inside a scratch checkout, written from stdin.
+in_tree() {
+  mkdir -p "$TMP/$1/$(dirname "$2")"
+  cat >"$TMP/$1/$2"
+}
+
+scratch_tree sweep_second_dir
+in_tree sweep_second_dir other-skill/scripts/stage.sh <<'EOF'
+work=$(mktemp -d "${TMPDIR:-/tmp}/stage.XXXXXX") || exit 1
+echo "$work"
+EOF
+expect "an unresolved scratch dir in a second scripts directory is refused by the default sweep" 1 \
+  "$REFUSAL" -- "$TMP/sweep_second_dir/scripts/check-scratch-dirs.sh"
+
+scratch_tree sweep_second_dir_ok
+in_tree sweep_second_dir_ok other-skill/scripts/stage.sh <<'EOF'
+work=$(mktemp -d "${TMPDIR:-/tmp}/stage.XXXXXX") || exit 1
+work=$(cd "$work" && pwd -P) || exit 1
+echo "$work"
+EOF
+expect "a second scripts directory that resolves its scratch dir passes the default sweep" 0 \
+  "$CLEAN" -- "$TMP/sweep_second_dir_ok/scripts/check-scratch-dirs.sh"
+
+scratch_tree sweep_top_level
+in_tree sweep_top_level scripts/check-scratch-stamps.sh <<'EOF'
+d=$(mktemp -d "/tmp/stamps.XXXXXX") || exit 1
+echo "$d"
+EOF
+expect "an unresolved scratch dir in the top-level scripts directory is refused by the default sweep" 1 \
+  "$REFUSAL" -- "$TMP/sweep_top_level/scripts/check-scratch-dirs.sh"
+
+# GitHub Actions resolves an `::error file=` against the workspace root, so the absolute path the
+# default sweep builds from ROOT would anchor the refusal to no file in the diff.
+scratch_tree sweep_annotation
+in_tree sweep_annotation other-skill/scripts/stage.sh <<'EOF'
+work=$(mktemp -d "${TMPDIR:-/tmp}/stage.XXXXXX") || exit 1
+echo "$work"
+EOF
+expect "a default-sweep refusal annotates a repo-relative path" 1 \
+  '::error file=other-skill/scripts/stage.sh,line=' -- \
+  "$TMP/sweep_annotation/scripts/check-scratch-dirs.sh"
+# ...and no absolute spelling may remain, whether instead of the relative one or beside it. Any
+# leading `/` is the tell, deliberately broader than a comparison against $TMP: it refuses an
+# absolute path from anywhere.
+out=$("$TMP/sweep_annotation/scripts/check-scratch-dirs.sh" 2>&1)
+if grep -qE -- '::error file=/' <<<"$out"; then
+  ko "a default-sweep refusal must not annotate an absolute path -- $out"
+else
+  ok "a default-sweep refusal does not annotate an absolute path"
+fi
+
+# An explicitly passed file outside the checkout has no relative spelling and keeps the path it
+# was given. The needle is a $TMP path compared against the guard's own output, which is vacuous
+# unless $TMP is the physical spelling the guard prints -- this suite's own stake in its rule.
+out=$("$CS" "$TMP/bad_tmpdir.sh" 2>&1)
+if grep -qF -- "::error file=$TMP/bad_tmpdir.sh," <<<"$out"; then
+  ok "a file passed by a path outside the checkout is annotated as given"
+else
+  ko "a file passed by a path outside the checkout must be annotated as given -- $out"
+fi
+
+# Fail closed on a scope that has stopped describing the checkout.
+scratch_tree sweep_stale_exclusion
+rm -f "$TMP/sweep_stale_exclusion/scripts/test-check-scratch-dirs.sh"
+expect "an exclusion naming a file that is gone is a usage error" 2 'excluded file not found' -- \
+  "$TMP/sweep_stale_exclusion/scripts/check-scratch-dirs.sh"
+scratch_tree sweep_empty
+rm -f "$TMP/sweep_empty/ship-pr/scripts/pr-review.sh"
+expect "a sweep that matches nothing is a usage error, not a pass" 2 'no scripts matched' -- \
+  "$TMP/sweep_empty/scripts/check-scratch-dirs.sh"
+
+# --- usage ------------------------------------------------------------------------------------
+
+expect "a missing file is a usage error, not a pass" 2 'no such file' -- \
+  "$CS" "$TMP/there-is-no-such-file.sh"
+expect "--help prints the header" 0 'symlinks into' -- "$CS" --help
+
+# --- this checkout, and the three heads that rediscovered the fix -----------------------------
+
+expect "this checkout passes the guard" 0 "$CLEAN" -- "$CS"
+
+# The three independent rediscoveries, each with its one resolution line removed: the guard must
+# find what each of those authors found by accident, after an assertion had been vacuous for some
+# number of heads. If any of these stops failing, the guard has stopped guarding.
+witness() {
+  local rel="$1" name="$2" src="$TMP/witness-$2"
+  if [ ! -f "$ROOT/$rel" ]; then
+    ko "the witness $rel is not in this checkout"
+    return
+  fi
+  # The resolution line and nothing else. A removal that matched nothing would leave a probe
+  # asserting a refusal the file earns on its own, which proves nothing about the line.
+  grep -vE '^[A-Za-z_][A-Za-z0-9_]*=\$\(cd "\$[A-Za-z_][A-Za-z0-9_]*" && pwd -P\)' "$ROOT/$rel" >"$src"
+  if [ "$(wc -l <"$src")" -eq "$(wc -l <"$ROOT/$rel")" ]; then
+    ko "$name: no resolution line was removed, so this witness proves nothing"
+    return
+  fi
+  expect "$name is refused with its resolution line removed" 1 "$REFUSAL" -- "$CS" "$src"
+  expect "...and passes with it" 0 "$CLEAN" -- "$CS" "$ROOT/$rel"
+}
+witness scripts/test-sync-routines.sh test-sync-routines.sh
+witness issue-wave/scripts/test-fleet-worker.sh test-fleet-worker.sh
+witness scripts/test-check-jq-shapes.sh test-check-jq-shapes.sh
+
+echo
+echo "$pass passed, $fail failed"
+[ "$fail" -eq 0 ]
