@@ -389,10 +389,12 @@ the same reason: each says this run may have followed superseded instructions, o
 and it is silent everywhere else — the 2026-09-17 instance went a
 week unseen. Put the DIFF's direction in the notification, never a fixed command, and never a `push` out of a
 checkout step 0 did not find canonical — that installs unreviewed text, and the notification is read by
-someone who will run what it says. So: `sync-routines.sh push` when the checkout is canonical AND holds
-the newer text; `pull` when the installed copy holds it (a run that edited its own prompt in place — a
-push would destroy the only copy of that edit); and when the checkout is not canonical, or both sides
-have moved, say what is wrong and recommend no command at all.
+someone who will run what it says. So: `pull` whenever the INSTALLED copy holds the newer text (a run
+that edited its own prompt in place — a push would destroy the only copy of that edit), canonical or
+not, since a pull writes into the checkout where `git diff` shows it and review still stands between it
+and the scheduler; `push` when the checkout holds the newer text AND step 0 found it canonical; and no
+command at all — just what is wrong — when the checkout holds the newer text but is not canonical, or
+when both sides have moved.
 A green sweep, or a red-but-unchanged sweep, must stay silent — a notification that fires every
 day is one that gets ignored, which would defeat the point. A box that failed to wake is not by
 itself notify-worthy; it becomes so only through the staleness thresholds above.
