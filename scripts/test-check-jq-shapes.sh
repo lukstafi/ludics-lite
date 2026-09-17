@@ -319,6 +319,37 @@ EOF
 expect "a bad shape in the top-level scripts directory is refused by the default sweep" 1 "$REFUSAL" \
   -- "$T"
 
+# The annotation a refusal prints must be repo-relative. GitHub Actions resolves an `::error
+# file=` against the workspace root, so the absolute path the default sweep builds from ROOT
+# anchors the comment to no file in the diff and the refusal degrades to a bare log line -- which
+# is the guard's primary output now that the sweep reads two dozen files rather than one.
+T=$(scratch_tree wide_relative_annotation)
+in_tree wide_relative_annotation other-skill/scripts/stamp.sh <<'EOF'
+jq -r '.[] | capture($rc) | {sha: .s}' <<<"$raw"
+EOF
+expect "a default-sweep refusal annotates a repo-relative path" 1 \
+  '::error file=other-skill/scripts/stamp.sh,line=' -- "$T"
+# ...and no absolute spelling may remain, whether instead of the relative one or beside it: a
+# printf carrying both satisfies the substring above and still fails to anchor. Any leading `/`
+# is the tell -- the scratch tree lives under a temp directory whose spelling the guard resolves
+# with `pwd -P`, so comparing against $TMP itself would miss a /var -> /private/var rewrite.
+out=$("$T" 2>&1)
+if grep -qE -- '::error file=/' <<<"$out"; then
+  ko "a default-sweep refusal must not annotate an absolute path -- $out"
+else
+  ok "a default-sweep refusal does not annotate an absolute path"
+fi
+
+# An explicitly passed file outside the checkout has no relative spelling and keeps the path it
+# was given -- there is nothing for a `${f#$ROOT/}` to strip, and a truncated path would name a
+# file that is not there.
+out=$("$CJ" "$TMP/bad_no_test.sh" 2>&1)
+if grep -qF -- "::error file=$TMP/bad_no_test.sh," <<<"$out"; then
+  ok "a file passed by a path outside the checkout is annotated as given"
+else
+  ko "a file passed by a path outside the checkout must be annotated as given -- $out"
+fi
+
 # Fail closed on a scope that has stopped describing the checkout. An exclusion entry naming a
 # file that is not there is a list nobody updated; an empty sweep is a clean verdict over nothing,
 # which every head afterwards would read as a pass.

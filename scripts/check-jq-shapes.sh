@@ -127,7 +127,14 @@ for f in "${files[@]}"; do
     echo "check-jq-shapes.sh: no such file: $f" >&2
     exit 2
   fi
-  awk -v file="$f" '
+  # The annotation's `file=` is resolved by GitHub Actions relative to the workspace root, so an
+  # absolute path anchors the refusal to nothing and it shows up as a bare log line rather than a
+  # comment on the offending line of the diff. The path is still READ absolute -- the guard is
+  # invoked from any cwd -- and only what is printed is made repo-relative. An explicitly passed
+  # file outside the checkout has no relative spelling and keeps the path it was given.
+  display=$f
+  case "$f" in "$ROOT"/*) display=${f#"$ROOT"/} ;; esac
+  awk -v file="$display" '
     # How many `capture` calls <s> holds. jq allows whitespace between a filter name and its
     # argument list, so `capture ("x")` is the same call; and the leading non-word character
     # keeps a name that merely ENDS in capture (an awk `safe_capture(`, say) out of the count.
