@@ -595,6 +595,27 @@ slots_tree
 printf 'cat <<\\HD\nSLOTS=mac-studio=%s\nHD\n' "$OTHER" >> "$R/$WORKER"
 expect "...however the heredoc delimiter is quoted" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
+# An assignment word may be continued onto the next line -- by a trailing backslash, or by a quote
+# still open. The shell reads one word; so does this check, because the mask spans the joined text.
+slots_tree
+printf '\n    FLEET_BOX_CORRECTNESS_SLOTS="rog-nv-wsl=3 \\\n      mac-studio=2" fleet-worker.sh ls\n' \
+  >> "$R/issue-wave/references/executions.md"
+expect "an override continued onto the next line is still one assignment" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# The positive-count rule is the worker's, and it applies to every pair it reads, not just this
+# box's: the spec is refused before the mac-studio entry can be used.
+slots_tree
+slots_edit "$WORKER" 's|^SLOTS=.*|SLOTS="rog-nv-wsl=0 mac-studio=6"|'
+expect "a zero count for another box refuses the spec too" 1 "$WORKER: SLOTS assignment states 'rog-nv-wsl=0'" -- "$CP" "$R"
+
+# The count is a NUMBER: `06` is the six the worker reads, on either side of the comparison.
+slots_tree
+slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo mac-studio=0$WANT/"
+expect "a default written with a leading zero still spells its number" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+slots_tree
+slots_edit issue-wave/references/executions.md "s/mac-studio=$WANT/mac-studio=0$WANT/"
+expect "...and so does a prompt that writes one" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
 # One command may declare several heredocs, and their bodies follow in order.
 slots_tree
 printf 'cat <<A <<B\nfirst\nA\nSLOTS=mac-studio=%s\nB\n' "$OTHER" >> "$R/$WORKER"

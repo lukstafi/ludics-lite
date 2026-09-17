@@ -437,9 +437,9 @@ slot_mentions() {
     # Each line is joined into one text, and masked alongside it: `a` marks a character inside an
     # assignment of the variable, `.` one in prose. Position for position, so a mention is judged
     # by where it stands rather than by what the 32 characters before it happen to spell.
-    { text = text " " $0; mask = mask "." assigned($0) }
+    { text = text " " $0 }
     END {
-      ctx = ENVIRON["CTX"]; lower = tolower(text)
+      ctx = ENVIRON["CTX"]; lower = tolower(text); find_assignments()
       scan(ENVIRON["RE_DIGIT"], "digit")
       scan(ENVIRON["RE_WORD"], "word")
       scan(ENVIRON["RE_NOT"], "not")
@@ -462,7 +462,7 @@ slot_mentions() {
         # position of the name, not of the match, is what the value and the mask hang off.
         box = at + index(frag, "mac-studio=") - 1
         # The variable being SET, not a statement of its default.
-        if (substr(mask, box, 1) == "a") return
+        if (assignment_at(box)) return
         n = substr(frag, index(frag, "mac-studio=") + 11)
         # Punctuation that closes the mention is punctuation, wherever Markdown puts it -- `6]`,
         # `6.`, `6:` state six. A suffix that is not punctuation still makes the value malformed.
@@ -484,19 +484,26 @@ slot_mentions() {
       sub(/^[^A-Za-z0-9]+/, "", frag); sub(/[^A-Za-z0-9]+$/, "", frag)
       print kind "\t" n "\t" frag
     }
-    # assigned <line>: <line> masked character for character -- `a` inside an assignment of the
-    # variable (from `…SLOTS=` through the end of the assignment word), `.` everywhere else.
-    function assigned(line,   m, low, rest, off, st, at, stop, i) {
-      m = ""; for (i = 1; i <= length(line); i++) m = m "."
-      low = tolower(line); rest = low; off = 0
+    # find_assignments: the span of every assignment of the variable, over the JOINED text -- from
+    # `…SLOTS=` through the end of the assignment word. Spans rather than a mask string, and over
+    # the joined text rather than line by line: a word continued onto the next line (a trailing
+    # backslash, or a quote still open) is one word to the shell, and it reads as one here because
+    # the line break arrives as the blank that the escape or the quote covers.
+    function find_assignments(   rest, base, st, at) {
+      rest = lower; base = 0; spans = 0
       while (match(rest, /(^|[^a-z0-9_])[a-z0-9_]*slots=/)) {
-        st = RSTART; at = off + st
-        stop = word_end(line, at + RLENGTH - 1)
-        for (i = at; i <= stop; i++) m = substr(m, 1, i - 1) "a" substr(m, i + 1)
-        off = at + RLENGTH - 1
+        st = RSTART; at = base + st
+        spans++
+        span_from[spans] = at
+        span_to[spans] = word_end(text, at + RLENGTH - 1)
+        base = at + RLENGTH - 1
         rest = substr(rest, st + RLENGTH)
       }
-      return m
+    }
+    # assignment_at <pos>: whether the character at <pos> stands inside one of those spans.
+    function assignment_at(pos,   i) {
+      for (i = 1; i <= spans; i++) if (pos >= span_from[i] && pos <= span_to[i]) return 1
+      return 0
     }
     # numeral <word>: whether <word> is a count -- a word from the vocabulary, or hyphenated words
     # all of which are ("twenty-six"). An empty word is not one.
@@ -545,8 +552,8 @@ slot_mentions() {
 # and `SLOTS=testbox=2\ mac-studio=6` are each one word and not two.
 SLOT_AWK_LIB='
   # word_end <line> <from>: index of the last character of the word that starts after <from>.
-  function word_end(line, from,   i, c, q) {
-    q = ""; sq = sprintf("%c", 39)
+  function word_end(line, from,   i, c, q, plain) {
+    q = ""; sq = sprintf("%c", 39); plain = 0
     for (i = from + 1; i <= length(line); i++) {
       c = substr(line, i, 1)
       if (q == "") {
@@ -554,7 +561,11 @@ SLOT_AWK_LIB='
         if (c == "\"" || c == sq) { q = c; continue }
         if (c == " " || c == "\t") break
       } else if (c == q) q = ""
+      else if ((c == " " || c == "\t") && plain == 0) plain = i - 1
     }
+    # A quote that never closes was not quoting: prose carries apostrophes, and a word must not
+    # run to the end of the text because one of them opened. Fall back to the unquoted reading.
+    if (q != "" && plain > 0) return plain
     return i - 1
   }
   # unquote <s>: <s> with the quote characters that grouped it removed.
@@ -571,6 +582,12 @@ SLOT_AWK_LIB='
     return out
   }
 '
+
+# as_number <token>: <token> as a decimal number, leading zeros dropped; a token that is not all
+# digits is echoed back unchanged, so it is reported as written and agrees with nothing.
+as_number() {
+  case "$1" in '' | *[!0-9]*) printf '%s\n' "$1" ;; *) printf '%d\n' "$((10#$1))" ;; esac
+}
 
 # slot_default <file>: the `mac-studio=<n>` default inside the value assigned to SLOTS, or empty.
 slot_default() {
@@ -621,7 +638,7 @@ slot_default() {
       if (val !~ /[$`(]/) {
         k = split(val, pairs, /[[:space:]]+/)
         for (i = 1; i <= k && bad == ""; i++)
-          if (pairs[i] != "" && pairs[i] !~ /^[^=[:space:]]+=[0-9]+$/) bad = pairs[i]
+          if (pairs[i] != "" && pairs[i] !~ /^[^=[:space:]]+=0*[1-9][0-9]*$/) bad = pairs[i]
       }
       while (match(rest, /(^|[^a-z0-9-])mac-studio=[^[:space:])}]*/)) {
         m = substr(rest, RSTART, RLENGTH)
@@ -655,6 +672,9 @@ check_slots() {
   esac
   # An unspellable default (past twelve) leaves the word forms unmatchable rather than unchecked:
   # any number word then mismatches and says what the script actually pins.
+  # As a NUMBER, not as the digits that spell it: the worker reads `mac-studio=06` as six (`test`
+  # and Python both take the leading zero as decimal), so the prose that agrees with it says six.
+  default=$(as_number "$default")
   word=$(number_word "$default")
   # Line by line: a path with a space in it would otherwise split into words, and the resulting
   # reads of nonexistent paths increment nothing -- the file would be skipped under a clean pass.
@@ -666,7 +686,7 @@ check_slots() {
     while IFS="$(printf '\t')" read -r kind n shown; do
       [ -n "$kind" ] || continue
       case "$kind" in
-        digit) [ "$n" = "$default" ] \
+        digit) [ "$(as_number "$n")" = "$default" ] \
           || { ko "$f" "states '$shown'; $SLOT_SCRIPT defaults to mac-studio=$default"; bad=1; } ;;
         *) [ "$n" = "$word" ] \
           || { ko "$f" "spells the mac-studio slot count '$n'; $SLOT_SCRIPT defaults to mac-studio=$default"; bad=1; } ;;
