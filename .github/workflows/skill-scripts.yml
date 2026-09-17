@@ -164,6 +164,19 @@ jobs:
         run: scripts/check-jq-shapes.sh
       - name: jq shape guard fixtures
         run: scripts/test-check-jq-shapes.sh
+      - name: scratch directory guard
+        # `mktemp -d` answers with the path as the environment spells it, and on macOS /var and
+        # /tmp are symlinks into /private, while every script here computes its own root with
+        # `pwd -P`. Unresolved, one directory has two spellings: an assertion comparing a script's
+        # output against a scratch path stops matching in silence, and the "must NOT appear" half
+        # passes over anything. The one-line fix was independently rediscovered three times
+        # (ludics-lite#208), because the absence of the line is not visible in the file that lacks
+        # it. Here rather than in a suite, and in the lint job, for the same reason the jq guard
+        # is: it judges every head, prompt-only ones included, and a new script in any skill is
+        # scanned without a line here.
+        run: scripts/check-scratch-dirs.sh
+      - name: scratch directory guard fixtures
+        run: scripts/test-check-scratch-dirs.sh
 
   sync-routines:
     name: sync-routines (ubuntu)
@@ -432,6 +445,12 @@ jobs:
       - name: jq shape guard fixtures
         if: ${{ !cancelled() }}
         run: scripts/test-check-jq-shapes.sh || { echo '::error title=macOS suite failed::test-check-jq-shapes.sh'; exit 1; }
+      - name: scratch directory guard fixtures
+        # The one platform where the rule has teeth: /var and /tmp are symlinks into /private
+        # here, so a probe that passes on Ubuntu because the two spellings coincide is judged for
+        # real on this leg.
+        if: ${{ !cancelled() }}
+        run: scripts/test-check-scratch-dirs.sh || { echo '::error title=macOS suite failed::test-check-scratch-dirs.sh'; exit 1; }
       - name: execution reservations
         if: ${{ !cancelled() }}
         run: python3 issue-wave/scripts/test-fleet-execution.py

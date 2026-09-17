@@ -12,6 +12,10 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 CP="$HERE/check-prompts.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/check-prompts-test.XXXXXX") || exit 1
+# Physical path: check-prompts.sh resolves its own root with `pwd -P`, and on macOS $TMPDIR is
+# under /var, a symlink to /private/var. Unresolved, every assertion comparing the checker's
+# output against a $TMP path stops matching in silence (ludics-lite#208).
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 pass=0; fail=0

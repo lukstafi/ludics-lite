@@ -17,7 +17,18 @@ set -euo pipefail
 {
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 HELPER="$SCRIPT_DIR/post-merge-cleanup.sh"
+# The physical spelling of the template's own parent, whatever /tmp is a link to on this host --
+# /private/tmp on macOS, itself on Linux, and neither is hardcoded: the removal guard below
+# compares against THIS, so a host where /tmp points somewhere else neither leaks its scratch tree
+# nor needs a new arm (ludics-lite#208, review round 1).
+TEST_ROOT_PARENT=$(CDPATH= cd /tmp && pwd -P) || exit 1
 TEST_ROOT=$(mktemp -d "/tmp/post-merge-cleanup-test.XXXXXX") || exit 1
+# Physically resolved, and this suite needs it most: the helper under test refuses anything but
+# the exact session-worktree root, and computes that root with `pwd -P` (its canonical_dir). On
+# macOS /tmp is a symlink to /private/tmp, so an unresolved $TEST_ROOT is a different spelling of
+# every path this suite builds, and a comparison against one stops matching in silence
+# (ludics-lite#208).
+TEST_ROOT=$(CDPATH= cd "$TEST_ROOT" && pwd -P) || exit 1
 # The in-flight cases' subshell pids and names, kept by the runner at the bottom. Declared before
 # the EXIT trap is installed: an exit ahead of the runner (--help, --list, a refused argument)
 # must not find an inherited variable of the same name and signal whatever it lists.
@@ -40,8 +51,14 @@ cleanup() {
   for pid in ${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}; do
     wait "$pid" >/dev/null 2>&1 || true
   done
+  # $TEST_ROOT is now the PHYSICAL spelling of a directory the template made under /tmp, so the
+  # guard compares it against the physical spelling of that same parent rather than against the
+  # literal the template used. Matching `/tmp/...` alone would refuse to remove the suite's own
+  # root on every macOS run -- where /tmp is a symlink to /private/tmp -- and leak a scratch tree
+  # per run (ludics-lite#208). The pattern is still anchored and still carries the suite's own
+  # name: it stays a guard against removing something this suite did not make.
   case "$TEST_ROOT" in
-  /tmp/post-merge-cleanup-test.*) rm -rf "$TEST_ROOT" ;;
+  "$TEST_ROOT_PARENT"/post-merge-cleanup-test.*) rm -rf "$TEST_ROOT" ;;
   *) echo "refusing to remove unexpected test root: $TEST_ROOT" >&2 ;;
   esac
 }

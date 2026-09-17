@@ -263,6 +263,17 @@ test_tmpdir() {
     ;;
   esac
   __test_tmpdir_path=$(mktemp -d "${TMPDIR:-/tmp}/pr-review-$2.XXXXXX") || bail "mktemp -d failed for $2"
+  # Physically resolved before anyone sees it, and here rather than in each suite: on macOS
+  # $TMPDIR sits under /var, a symlink to /private/var, while pr-review.sh computes its own
+  # paths with `pwd -P`. Unresolved, the two spellings of one directory differ, so a suite's
+  # comparison against a $scratch path silently stops matching -- and the "must NOT appear"
+  # half then passes over anything at all (ludics-lite#208).
+  #
+  # `CDPATH= cd`, not a bare `cd`: with CDPATH exported and a RELATIVE $TMPDIR, a successful `cd`
+  # PRINTS the directory it chose, and the substitution then captures two lines while still
+  # exiting zero -- a scratch path that does not exist, written into every case below. The
+  # assignment prefix is temporary, `cd` being a regular builtin.
+  __test_tmpdir_path=$(CDPATH= cd "$__test_tmpdir_path" && pwd -P) || bail "cannot resolve the scratch directory for $2"
   TEST_CLEANUP+=("$__test_tmpdir_path")
   printf -v "$1" '%s' "$__test_tmpdir_path"
 }

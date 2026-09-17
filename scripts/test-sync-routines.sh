@@ -58,11 +58,12 @@ ROOT=$(cd "$HERE/.." && pwd)
 SYNC="$HERE/sync-routines.sh"
 ROUTINES_README="$ROOT/routines/README.md"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/sync-routines-test.XXXXXX") || exit 1
-trap 'rm -rf "$TMP"' EXIT
 # Physical path: the script refuses a destination reached through a symlink at ANY component,
 # and on macOS $TMPDIR sits under /var, which is a link to /private/var. Every case below wants
-# a clean root, so the symlink cases can put the link where they mean it.
-TMP=$(cd "$TMP" && pwd -P) || exit 1
+# a clean root, so the symlink cases can put the link where they mean it. Directly under the
+# allocation, which is where check-scratch-dirs.sh looks and all it looks at (ludics-lite#208).
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
+trap 'rm -rf "$TMP"' EXIT
 
 pass=0; fail=0
 # Both report and then RETURN 0 explicitly. These are used as `<test> && ok ... || ko ...`, the

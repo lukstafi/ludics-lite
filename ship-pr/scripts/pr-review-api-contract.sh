@@ -141,6 +141,10 @@ pages() { # <field>
 # list grows with every re-run, so a list never rides the argument vector — a claim's subject
 # arrives on stdin and its comparison lists through --slurpfile (each read as $name[0]).
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/pr-review-api-contract.XXXXXX")
+# Physical path, the house idiom: on macOS $TMPDIR is under /var, a symlink to /private/var, and
+# a path that reaches a message or a comparison unresolved reads as a different directory than
+# the same one spelled with `pwd -P` (ludics-lite#208).
+SCRATCH=$(CDPATH= cd "$SCRATCH" && pwd -P)
 
 # Any exit this script did not choose — a jq that cannot iterate a wrapper that moved, say — is
 # named here, so the log says what stopped and the workflow's reporter (every exit but 0 and 3)

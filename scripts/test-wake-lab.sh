@@ -14,6 +14,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 WL="$HERE/wake-lab.sh"
 EXAMPLE="$HERE/wake-lab-hosts.example.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/wake-lab-test.XXXXXX") || exit 1
+# Physical path, for the same reason the other suites resolve theirs: on macOS $TMPDIR is under
+# /var, a symlink to /private/var, so an unresolved $TMP and the path wake-lab.sh prints for the
+# same directory are spelled differently and a comparison quietly stops matching
+# (ludics-lite#208).
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 # The lab lock directory, for the WHOLE suite and not merely the cases that are about locking.
