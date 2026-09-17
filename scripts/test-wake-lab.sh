@@ -785,6 +785,30 @@ grep -q 'repair with scripts/enable-active-hours-windows.ps1 on the box (elevate
 [ -f "$HERE/enable-active-hours-windows.ps1" ] \
   && ok "...which is tracked where the warning says it is" \
   || ko "the warning names scripts/enable-active-hours-windows.ps1, which is not in the checkout"
+# The advice is one constant now, and pinning one use of it would leave the other three free to
+# drift. Every warning about the BOX's own values carries it, whichever branch printed it.
+for fixture in '0x18 0x18 0x0' '0x6 0x6 0x0' '0x6 0x0 0x1'; do
+  # shellcheck disable=SC2086 # the fixture is three fields, deliberately split
+  branch=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out $fixture)" 2>&1)
+  grep -q 'ACTIVE HOURS WARNING' <<<"$branch" \
+    && grep -q 'repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)' <<<"$branch" \
+    && ok "...on every branch that warns about the box's values ($fixture)" \
+    || ko "the active-hours warning for $fixture carries no repair advice -- $branch"
+done
+# ...and the two that deliberately do not: a malformed WAKE_LAB_SWEEP_HOURS is a misconfiguration
+# on THIS side, where the Windows script would change nothing, and an unreadable registry knows of
+# no setting to repair. Pinning the constant's reach means pinning where it stops, too.
+out=$(env WAKE_LAB_SWEEP_HOURS=morning WAKE_LAB_HOSTS="$TMP/hosts.sh" SSH_UP="rog-lan" \
+      SSH_REG="$(reg_out 0x6 0x0 0x0)" "$WL" status rog 2>&1)
+grep -q "WAKE_LAB_SWEEP_HOURS='morning' is not" <<<"$out" \
+  && ! grep -q 'enable-active-hours-windows.ps1' <<<"$out" \
+  && ok "...but a sweep-window misconfiguration on this side does not point at the box's script" \
+  || ko "the WAKE_LAB_SWEEP_HOURS warning names a repair on the box -- $out"
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 2>&1)
+grep -q 'could not read ActiveHoursStart/End' <<<"$out" \
+  && ! grep -q 'enable-active-hours-windows.ps1' <<<"$out" \
+  && ok "...and an unreadable registry names no repair, knowing of no setting to fix" \
+  || ko "the unreadable-registry warning claimed a repair -- $out"
 # The quiet path: the 6-to-0 maximum the boxes now pin covers a morning sweep, and a check that
 # warned there too would be one nobody reads.
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x6 0x0 0x0)" 2>&1); rc=$?

@@ -936,6 +936,10 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0, 
 # are a misconfiguration on this side, and nothing on the box would change — and neither does the
 # unreadable-registry one, which knows of no setting to repair.
 ACTIVE_HOURS_KEY='HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+# The repair advice itself, once: four warnings carried four verbatim copies, and only one of them
+# was pinned by a test. It has no leading punctuation, so each site spells its own joiner — the
+# "falls outside" line already carries an em-dash and takes a semicolon instead.
+ACTIVE_HOURS_REPAIR='repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)'
 
 reg_dword() { # reg_dword <reg-query output> <value name> — its decimal value, or ?
   local v
@@ -993,7 +997,7 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
   # calls every hour covered — so a box whose update protection is set to nonsense would report
   # the quiet line instead of the warning that is the only notice anyone gets.
   if [ "$s" -gt 23 ] || [ "$e" -gt 23 ]; then
-    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, which are not clock hours (0-23): the update protection on that box is not valid — repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)"
+    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, which are not clock hours (0-23): the update protection on that box is not valid — $ACTIVE_HOURS_REPAIR"
     return 0
   fi
   # Equal endpoints are not a 24-hour window. Windows allows at most 18 hours (this file's own
@@ -1004,7 +1008,7 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
   # show. Equal endpoints are the zero/24 case of the same check.
   len=$(( (e - s + 24) % 24 ))
   if [ "$len" -eq 0 ] || [ "$len" -gt 18 ]; then
-    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, a span Windows cannot mean (its maximum is 18 h), so the setting is reset or malformed — repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)"
+    echo "  ACTIVE HOURS WARNING on $name: active hours read as $s-$e, a span Windows cannot mean (its maximum is 18 h), so the setting is reset or malformed — $ACTIVE_HOURS_REPAIR"
     return 0
   fi
   # End-exclusive, so equal endpoints are an empty range, not a one-hour one: forcing len=1 would
@@ -1019,9 +1023,9 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
     hour_active "$h" "$s" "$e" || uncovered="$uncovered $h"
   done
   if [ -n "$uncovered" ]; then
-    echo "  ACTIVE HOURS WARNING on $name: sweep window $SWEEP_HOURS falls outside active hours $s-$e (smart=$m); uncovered hours:$uncovered — Windows Update can restart the box mid-unit; repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)"
+    echo "  ACTIVE HOURS WARNING on $name: sweep window $SWEEP_HOURS falls outside active hours $s-$e (smart=$m); uncovered hours:$uncovered — Windows Update can restart the box mid-unit; $ACTIVE_HOURS_REPAIR"
   elif [ "$m" != 0 ]; then
-    echo "  ACTIVE HOURS WARNING on $name: active hours $s-$e cover the sweep window $SWEEP_HOURS, but SmartActiveHoursState=$m lets Windows move them — repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)"
+    echo "  ACTIVE HOURS WARNING on $name: active hours $s-$e cover the sweep window $SWEEP_HOURS, but SmartActiveHoursState=$m lets Windows move them — $ACTIVE_HOURS_REPAIR"
   else
     echo "  active hours on $name: $s-$e cover the sweep window $SWEEP_HOURS (smart=$m)"
   fi
