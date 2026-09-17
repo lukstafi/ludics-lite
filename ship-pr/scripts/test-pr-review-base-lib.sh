@@ -47,7 +47,6 @@ fi
 
 test_tmpdir TEST_ROOT base-fixture
 
-
 REPO=example/repo
 BRANCH=main
 REQUEST_LOG="$TEST_ROOT/requests"
