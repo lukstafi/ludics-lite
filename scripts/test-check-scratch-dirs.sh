@@ -315,6 +315,45 @@ EOF
 expect "an attached -p/tmp value does not hide the directory flag" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_attached_option.sh"
 
+# Round 7, the false-refusal half: five ordinary spellings the line-shaped reader got wrong.
+probe safe_multiline_forms <<'EOF'
+printf '%s\n' 'usage:
+  TMP=$(mktemp -d /tmp/example.XXXXXX)   # not code: the quote is still open'
+TMP=$(
+  mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX"
+) || exit 1
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
+echo "a directory is made with mktemp -d, then resolved" <<<"$TMP"
+echo "$TMP"
+EOF
+expect "an open quote, a multiline substitution and a here-string are read as bash reads them" 0 \
+  "$CLEAN" -- "$CS" "$TMP/safe_multiline_forms.sh"
+
+# A `mktemp -d` that is an ARGUMENT to another command is a diagnostic, not an allocation.
+probe safe_not_command_position <<'EOF'
+echo To create a directory, run mktemp -d /tmp/example.XXXXXX
+EOF
+expect "a mktemp -d that is not the command word is not a call" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_not_command_position.sh"
+
+# `-p DIR` puts the result one component below DIR, so a resolved DIR certifies it by the guard's
+# own inheritance rule.
+probe safe_p_root_inherits <<'EOF'
+BASE=$(CDPATH= cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+TMP=$(mktemp -p "$BASE" -d probe.XXXXXX) || exit 1
+echo "$TMP"
+EOF
+expect "a -p DIR under a resolved root inherits it" 0 "$CLEAN" -- "$CS" "$TMP/safe_p_root_inherits.sh"
+
+# A redirection between the command name and its options does not hide them.
+probe safe_redirect_before_options <<'EOF'
+TMP=$(mktemp 2>/dev/null -d "${TMPDIR:-/tmp}/probe.XXXXXX") || exit 1
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
+echo "$TMP"
+EOF
+expect "a redirection before the options does not hide them" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_redirect_before_options.sh"
+
 # --- the shapes that must be refused --------------------------------------------------------
 
 probe bad_tmpdir <<'EOF'
@@ -669,6 +708,42 @@ echo "$TMP"
 EOF
 expect "a substitution that holds the call but answers with something else is refused" 1 \
   'not captured in a variable assignment' -- "$CS" "$TMP/bad_not_answered.sh"
+
+# Round 7, the missed-detection half.
+probe bad_redirect_before_options <<'EOF'
+TMP=$(mktemp 2>/dev/null -d "${TMPDIR:-/tmp}/probe.XXXXXX")
+echo "$TMP"
+EOF
+expect "an unresolved call with a redirection before its options is still refused" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_redirect_before_options.sh"
+
+# A later plain `mktemp` must not hide an earlier `mktemp -d`.
+probe bad_two_calls <<'EOF'
+mktemp -d /tmp/leak.XXXXXX; mktemp /tmp/file.XXXXXX
+EOF
+expect "a plain mktemp behind a mktemp -d does not hide it" 1 'not captured in a variable assignment' -- \
+  "$CS" "$TMP/bad_two_calls.sh"
+
+# An assignment inside a function body runs only when something calls the function.
+probe bad_resolver_in_uncalled_function <<'EOF'
+BASE=${BASE:-/tmp}
+normalize() {
+  BASE=$(CDPATH= cd /tmp && pwd -P)
+}
+TMP=$(mktemp -d "$BASE/probe.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an assignment in an uncalled function does not certify the global" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_resolver_in_uncalled_function.sh"
+
+# `unset` makes the directory unreachable before the resolution can run.
+probe bad_unset_before_resolution <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/probe.XXXXXX") || exit 1
+unset TMP
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
+EOF
+expect "an unset before the resolution is a use" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_unset_before_resolution.sh"
 
 # --- the default sweep's scope --------------------------------------------------------------
 # With no arguments the guard reads every `*/scripts/*.sh` and `scripts/*.sh` in its checkout.

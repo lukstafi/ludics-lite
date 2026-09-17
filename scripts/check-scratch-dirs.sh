@@ -136,17 +136,23 @@ for f in "${files[@]}"; do
     # names its delimiter inside single quotes, and blanking it first left the scanner waiting for
     # a terminator that never came -- which swallowed the rest of the file, and with it the very
     # mktemp the fixtures were watching for.
-    function decomment(s,   out, i, ch, q) {
-      out = ""; q = ""
+    # Q is the open quote, carried ACROSS physical lines: a single-quoted string that runs over a
+    # line break makes every line under it literal, and starting each line unquoted read the
+    # continuation of a usage string as real code (round 7). SUBDEPTH does the same for an open
+    # `$(`, so a call written across lines is still one command.
+    function decomment(s,   out, i, ch) {
+      out = ""
       for (i = 1; i <= length(s); i++) {
         ch = substr(s, i, 1)
-        if (q == "") {
+        if (Q == "") {
           if (ch == "#" && (out == "" || substr(out, length(out), 1) ~ /[ \t]/)) return out
           if (ch == "\\") { out = out ch substr(s, i + 1, 1); i++; continue }
-          if (ch == "\"" || ch == "'"'"'") q = ch
-        } else if (ch == q) {
-          q = ""
-        }
+          if (ch == "\"" || ch == "'"'"'") Q = ch
+          else if (ch == "(") SUBDEPTH++
+          else if (ch == ")" && SUBDEPTH > 0) SUBDEPTH--
+        } else if (ch == Q) {
+          Q = ""
+        } else if (Q == "\"" && ch == "\\") { out = out ch substr(s, i + 1, 1); i++; continue }
         out = out ch
       }
       return out
@@ -171,8 +177,8 @@ for f in "${files[@]}"; do
     }
     # Inside a single-quoted run the character is data: keep the width, lose the meaning. A
     # double-quoted run is kept as it is -- every template in this repository is one.
-    function blank_sq(s,   out, i, ch, q) {
-      out = ""; q = ""
+    function blank_sq(s, q0,   out, i, ch, q) {
+      out = ""; q = q0
       for (i = 1; i <= length(s); i++) {
         ch = substr(s, i, 1)
         if (q == "") {
@@ -258,51 +264,103 @@ for f in "${files[@]}"; do
     # --directory ...` and a bundled `-qd` were skipped entirely (round 4); and `$(mktemp -d)`
     # takes no template at all, defaulting to tmp.XXXXXXXXXX, which is every bit as unresolved as
     # a spelled-out one (round 1). Sets MT_DIR and MT_TPL; MT_TPL is "" when there is no template.
-    function scan_mktemp(s,   rest, w, i, j, c, n, parts, opts, skip) {
-      MT_DIR = 0; MT_TPL = ""; skip = 0
-      # A leading space, so the "not a word character before it" test has something to match even
-      # when the call opens the text: `^` inside an alternation is not anchored by every awk.
-      s = " " s
-      # `/usr/bin/mktemp` is the same command: the basename is what names it, and a slash before
-      # it is a path, not a different word (round 5).
-      if (s !~ /(^|[^A-Za-z0-9_.-])mktemp[ \t]/) return 0
-      rest = s
-      sub(/^.*(^|[^A-Za-z0-9_.-])mktemp[ \t]+/, "", rest)
-      # Stop at whatever ends the command; what follows is another command, not an argument.
-      sub(/[ \t]*(\)|;|\||&|<|>).*$/, "", rest)
-      n = split(rest, parts, /[ \t]+/)
-      opts = 1
-      for (i = 1; i <= n; i++) {
-        w = parts[i]
-        if (w == "") continue
-        if (opts && w == "--") { opts = 0; continue }
-        if (skip) { skip = 0; continue }            # the value of the option before it
-        if (opts && w ~ /^--/) {
-          if (w ~ /^--directory/) MT_DIR = 1
-          # A long option that takes a value and was not given one with `=` takes the next word.
-          if (w ~ /^--(suffix|tmpdir|p)$/) skip = 1
+    # Every COMMAND in <s>, in order: the text is split on the operators that end one, and the
+    # first word of each piece (past any variable-assignment prefixes) is its command name. That
+    # is what makes `echo run mktemp -d /tmp/x.XXXXXX` a diagnostic rather than an allocation, and
+    # what finds BOTH calls in `mktemp -d /tmp/a.XXXXXX; mktemp /tmp/b.XXXXXX` -- a scan that
+    # looked for the last textual occurrence saw only the second and let the first leak (round 7).
+    # Fills CMD[1..NCMD].
+    function commands(s,   i, ch, cur, q, sp, stack) {
+      NCMD = 0; cur = ""; q = ""; sp = 0
+      for (i = 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        # A `$(` opens a command even inside a double-quoted string -- `cd "$(mktemp -d ...)"`
+        # runs the call, and a splitter that stopped at the quote saw only the `cd`.
+        if (ch == "$" && substr(s, i + 1, 1) == "(") {
+          stack[++sp] = q; q = ""
+          if (cur != "") CMD[++NCMD] = cur
+          cur = ""; i++
           continue
         }
-        if (opts && w ~ /^-[A-Za-z]/) {             # short options, bundled or not
-          # Letter by letter, because a value can be ATTACHED: `-p/tmp` is -p with its argument,
-          # and `-pd` would be -p taking "d" as its value rather than the directory flag
-          # (round 6). A flag that takes a value ends the cluster: the rest of the word is its
-          # value, or the next word when nothing is left.
+        if (ch == ")" && sp > 0 && q == "") {
+          if (cur != "") CMD[++NCMD] = cur
+          cur = ""; q = stack[sp--]
+          continue
+        }
+        if (q != "") { cur = cur ch; if (ch == q) q = ""; continue }
+        if (ch == "\"" || ch == "'"'"'") { q = ch; cur = cur ch; continue }
+        if (ch == ";" || ch == "|" || ch == "&" || ch == "(" || ch == ")" || ch == "{" || ch == "}") {
+          if (cur != "") CMD[++NCMD] = cur
+          cur = ""
+          continue
+        }
+        cur = cur ch
+      }
+      if (cur != "") CMD[++NCMD] = cur
+      return NCMD
+    }
+    # Is <c>'"'"'s command word mktemp (by basename, so /usr/bin/mktemp counts), and if so does the
+    # call make a DIRECTORY? `mktemp [OPTION]... [TEMPLATE]`, with `-d`/`--directory` anywhere in
+    # the option list, values attached or separate, and redirections skipped wherever they fall --
+    # `mktemp 2>/dev/null -d ...` is valid and put the whole option list out of reach (round 7).
+    # Sets MT_DIR, MT_TPL and MT_ROOT (the `-p DIR` the template is taken relative to).
+    function scan_cmd(c,   w, i, j, ch, n, parts, opts, skip, root_next, name) {
+      MT_DIR = 0; MT_TPL = ""; MT_ROOT = ""
+      n = split(c, parts, /[ \t]+/)
+      i = 1
+      while (i <= n && (parts[i] == "" || parts[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) i++  # assignment prefix
+      if (i > n) return 0
+      name = parts[i]
+      sub(/^.*\//, "", name)                    # the basename names the command
+      if (name != "mktemp") return 0
+      opts = 1
+      for (i = i + 1; i <= n; i++) {
+        w = parts[i]
+        if (w == "") continue
+        if (w ~ /^[0-9]*(>>|>|<)/) {            # a redirection and, if it stands alone, its target
+          if (w ~ /^[0-9]*(>>|>|<)$/) i++
+          continue
+        }
+        if (skip) { skip = 0; MT_ROOT = root_next ? w : MT_ROOT; root_next = 0; continue }
+        if (opts && w == "--") { opts = 0; continue }
+        if (opts && w ~ /^--/) {
+          if (w ~ /^--directory/) MT_DIR = 1
+          if (w ~ /^--tmpdir=/) { MT_ROOT = w; sub(/^--tmpdir=/, "", MT_ROOT) }
+          if (w ~ /^--(suffix|tmpdir|p)$/) { skip = 1; root_next = (w == "--tmpdir") }
+          continue
+        }
+        if (opts && w ~ /^-[A-Za-z]/) {
           for (j = 2; j <= length(w); j++) {
-            c = substr(w, j, 1)
-            if (c == "d") { MT_DIR = 1; continue }
-            if (c ~ /[pt]/) { if (j == length(w)) skip = 1; j = length(w); break }
+            ch = substr(w, j, 1)
+            if (ch == "d") { MT_DIR = 1; continue }
+            if (ch ~ /[pt]/) {
+              if (j == length(w)) { skip = 1; root_next = (ch == "p") }
+              else if (ch == "p") MT_ROOT = substr(w, j + 1)
+              j = length(w)
+              break
+            }
           }
           continue
         }
         gsub(/["'"'"']/, "", w)
-        MT_TPL = w                                  # the first non-option word is the template
+        MT_TPL = w                              # the first non-option word is the template
         break
       }
+      gsub(/["'"'"']/, "", MT_ROOT)
+      # `-p DIR` means the template is taken relative to DIR, so THAT is the path the result sits
+      # under and the template is one component of it (round 7).
+      if (MT_ROOT != "") MT_TPL = MT_ROOT "/" MT_TPL
       return MT_DIR
     }
-    function has_mktemp_d(s) { return scan_mktemp(s) }
-    function template_of(s) { scan_mktemp(s); return MT_TPL }
+    # How many command-position `mktemp` calls in <s> make a directory; MT_* describe the last one.
+    function dir_calls(s,   i, c, hits) {
+      hits = 0
+      commands(s)
+      for (i = 1; i <= NCMD; i++) { c = CMD[i]; if (scan_cmd(c)) { hits++; DIR_CMD = c } }
+      return hits
+    }
+    function has_mktemp_d(s) { return dir_calls(s) > 0 }
+    function template_of(s) { if (!dir_calls(s)) return ""; scan_cmd(DIR_CMD); return MT_TPL }
     function refuse(line, why) {
       printf "::error file=%s,line=%d::%s:%d: %s\n", file, line, file, line, why
       bad = 1
@@ -331,21 +389,32 @@ for f in "${files[@]}"; do
       # either line of its own -- is read as what it is (round 2). The continued text is attached
       # to the line the command STARTED on, which is the line a refusal should name, and the lines
       # it came from are left empty so nothing is judged twice.
+      # A LOGICAL line: physical lines joined while a backslash continues the command, while a
+      # quote is still open, or while a `$(` is still unclosed -- bash reads all three as one
+      # command, and reading their halves in isolation both missed calls and refused correct ones
+      # (rounds 2 and 7). The joined text is attached to the line the command STARTED on, which is
+      # the line a refusal should name, and the lines it came from are left empty so nothing is
+      # judged twice.
       if (cont != 0) {
-        code[cont] = code[cont] " " blank_sq(decomment($0))
+        q0 = Q
+        code[cont] = code[cont] " " blank_sq(decomment($0), q0)
         code[FNR] = ""
-        if ($0 !~ /\\$/) cont = 0
+        if ($0 !~ /\\$/ && Q == "" && SUBDEPTH == 0) cont = 0
         next
       }
+      q0 = Q
       src = decomment($0)                  # comments gone, quotes still readable
-      l = blank_sq(src)
-      if ($0 ~ /\\$/) { sub(/\\[ \t]*$/, "", l); cont = FNR }
+      l = blank_sq(src, q0)
+      if ($0 ~ /\\$/) sub(/\\[ \t]*$/, "", l)
+      if ($0 ~ /\\$/ || Q != "" || SUBDEPTH != 0) cont = FNR
       code[FNR] = l
       # A heredoc opener: `<<WORD`, `<<-WORD`, `<<"WORD"`, `<<'"'"'WORD'"'"'`. The body starts on the
       # next line and belongs to whatever reads it, not to this file.
-      if (src ~ /<<-?[ \t]*["'"'"']?[A-Za-z_][A-Za-z0-9_]*["'"'"']?/) {
+      # `<<<word` is a here-string, not a heredoc opener: taking its word for a delimiter swallowed
+      # every line after it until a line happened to equal that word (round 7).
+      if (src ~ /<<[^<]/ && src ~ /<<-?[ \t]*["'"'"']?[A-Za-z_][A-Za-z0-9_]*["'"'"']?/) {
         d = src
-        sub(/^.*<<-?[ \t]*/, "", d)
+        sub(/^.*<<(<+[^<]*<<)?-?[ \t]*/, "", d)
         hdtab = (src ~ /<<-/)
         hdquoted = (d ~ /^["'"'"'\\]/)     # only a quoted delimiter disables expansion
         gsub(/^["'"'"'\\]/, "", d)
@@ -448,11 +517,11 @@ for f in "${files[@]}"; do
     # unreachable and unresolved (round 6). Same rule as the resolver functions: what a construct
     # returns is its LAST command, and a stdout redirect on that command sends the path elsewhere
     # (`2>/dev/null`, which this repository writes, redirects stderr and is fine).
-    function answers_with_mktemp(h,   n, parts, k, tail_cmd) {
-      n = split(h, parts, /;/)
-      tail_cmd = parts[n]
-      if (!has_mktemp_d(blank_dq(tail_cmd))) return 0
-      if (tail_cmd ~ /(^|[ \t])1?>[^&]/) return 0
+    function answers_with_mktemp(h,   tail_cmd) {
+      if (commands(h) == 0) return 0
+      tail_cmd = CMD[NCMD]
+      if (!scan_cmd(tail_cmd)) return 0
+      if (tail_cmd ~ /(^|[ \t])1?>[^&]/) return 0   # the path goes to the redirect, not to the caller
       return 1
     }
     function head_of(l,   i, depth, ch, started, start) {
@@ -472,8 +541,11 @@ for f in "${files[@]}"; do
     # A bare-name `export TMP` is a use too, and the one that does not look like one: the value
     # goes into the environment of every command after it, so a `consume` two lines down receives
     # the unresolved spelling without any textual expansion for this scanner to see (round 3).
+    # ...and so is `unset TMP`, which makes the directory unreachable before anything could
+    # resolve it: with `set -u` the next line exits and leaks it, without one it canonicalizes
+    # whatever `cd ""` lands on (round 7).
     function exports(s, name) {
-      return s ~ ("^(export|readonly|declare|typeset)[ \t]+([^ \t]+[ \t]+)*" name "([ \t=]|$)")
+      return s ~ ("^(export|readonly|declare|typeset|unset)[ \t]+([^ \t]+[ \t]+)*" name "([ \t=]|$)")
     }
     function first_use(name, from,   i, l) {
       for (i = from + 1; i <= last; i++) {
@@ -544,11 +616,12 @@ for f in "${files[@]}"; do
         for (n in bad_assign) delete bad_assign[n]
         for (i = 1; i <= last; i++) {
           if (!(i in an) || isloc[i]) continue
-          # An assignment inside a branch may never run, so it cannot CERTIFY a name -- `if false;
-          # then BASE=$(cd /tmp && pwd -P); fi` left BASE resolved (round 5). It can still
+          # An assignment that may never run cannot CERTIFY a name: not one inside a branch (`if
+          # false; then BASE=$(CDPATH= cd /tmp && pwd -P); fi`, round 5) and not one inside a
+          # function body, which executes only when something calls it (round 7). It can still
           # DISQUALIFY one, which is the safe direction: a name assigned the environment spelling
           # anywhere is a name this guard will not certify.
-          if (depth[i] == 0) seen[an[i]] = 1
+          if (depth[i] == 0 && funcof[i] == "") seen[an[i]] = 1
           if (has_mktemp_d(head_of(code[i]))) {
             if (!answers_with_mktemp(head_of(code[i]))) { bad_assign[an[i]] = 1; continue }
             lv = lead_var(template_of(head_of(code[i])))
@@ -573,7 +646,7 @@ for f in "${files[@]}"; do
         refuse(FNR, "a `mktemp -d` whose result is not captured in a variable assignment: this guard resolves a scratch directory by following the variable it lands in, and cannot follow this one — write it as `VAR=$(mktemp -d ...)` and resolve VAR with `pwd -P`")
         next
       }
-      if (has_mktemp_d(blank_dq(tail_of(line)))) {
+      if (has_mktemp_d(tail_of(line))) {
         refuse(FNR, "a second `mktemp -d` on this line, outside the substitution the assignment captures: its directory is leaked and never resolved — give it a capture and a resolution of its own")
         next
       }
