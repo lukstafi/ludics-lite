@@ -595,6 +595,27 @@ slots_tree
 printf 'cat <<\\HD\nSLOTS=mac-studio=%s\nHD\n' "$OTHER" >> "$R/$WORKER"
 expect "...however the heredoc delimiter is quoted" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
+# One command may declare several heredocs, and their bodies follow in order.
+slots_tree
+printf 'cat <<A <<B\nfirst\nA\nSLOTS=mac-studio=%s\nB\n' "$OTHER" >> "$R/$WORKER"
+expect "a body behind a second delimiter on one line is still a body" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+# The control the queue needs: once a body ends, the script is code again.
+slots_tree
+printf 'cat <<A\nx\nA\nSLOTS=mac-studio=%s\n' "$OTHER" >> "$R/$WORKER"
+out=$("$CP" "$R" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -qF "defaults to mac-studio=$OTHER" <<<"$out" \
+  && ok "...and an assignment after the terminator is executed again" \
+  || ko "...and an assignment after the terminator is executed again (rc=$rc) -- $out"
+
+# A LITERAL pair list is what the worker splits and validates in order, so a malformed pair
+# anywhere in one refuses the spec -- the mac-studio entry behind it would never be reached.
+slots_tree
+slots_edit "$WORKER" 's|^SLOTS=.*|SLOTS="rog-nv-wsl=oops mac-studio=6"|'
+expect "another box's malformed pair refuses the whole spec" 1 "$WORKER: SLOTS assignment states 'rog-nv-wsl=oops'" -- "$CP" "$R"
+slots_tree
+slots_edit "$WORKER" "s|^SLOTS=.*|SLOTS=\"rog-nv-wsl=1 mac-studio=$WANT\"|"
+expect "...while a list whose pairs are all valid still defaults" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
 # Every mac-studio pair in the value is validated, not just the last recognizable one: the worker
 # refuses the whole spec on the first malformed pair, so a good duplicate behind it is unreachable.
 slots_tree

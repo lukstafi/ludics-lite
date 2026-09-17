@@ -578,16 +578,26 @@ slot_default() {
     # A heredoc body is data the script WRITES, not code it runs: this one hands workers their
     # briefs, and a column-zero `SLOTS=` inside one assigns nothing. Bodies are skipped whole.
     BEGIN { hd = "<<-?[[:space:]]*[\"\\\\" sprintf("%c", 39) "]?[A-Za-z_][A-Za-z0-9_]*" }
-    delim != "" {
-      line = $0; if (dash) sub(/^\t+/, "", line)
-      if (line == delim) delim = ""
+    queued > 0 {
+      line = $0; if (dash[1]) sub(/^\t+/, "", line)
+      if (line == delims[1]) {                 # this body ends; the next one on that line begins
+        for (i = 1; i < queued; i++) { delims[i] = delims[i + 1]; dash[i] = dash[i + 1] }
+        queued--
+      }
       next
     }
-    match($0, hd) {
-      tag = substr($0, RSTART, RLENGTH)
-      dash = (substr(tag, 3, 1) == "-")
-      sub(/^<<-?[[:space:]]*/, "", tag); gsub(/["'"'"'\\]/, "", tag)   # bare, quoted or backslashed
-      delim = tag
+    {
+      # Every heredoc the line opens, in the order the shell consumes their bodies: one command
+      # may declare several.
+      rest = $0
+      while (match(rest, hd)) {
+        tag = substr(rest, RSTART, RLENGTH)
+        queued++
+        dash[queued] = (substr(tag, 3, 1) == "-")
+        sub(/^<<-?[[:space:]]*/, "", tag); gsub(/["'"'"'\\]/, "", tag)   # bare, quoted or backslashed
+        delims[queued] = tag
+        rest = substr(rest, RSTART + RLENGTH)
+      }
     }
     # The LAST top-level assignment, which is the one the shell is left holding -- reading the
     # first would report a default a later line has replaced (and `slot_mentions` skips that line
@@ -604,6 +614,15 @@ slot_default() {
       # `… || echo mac-studio=6`), so a count ends at a blank or at the `)` and `}` closing that
       # expression; anything else in it means the pair was never `<box>=<n>`.
       last = ""; bad = ""; rest = val
+      # A literal pair list -- no expansion, no substitution -- is exactly what the worker splits
+      # and validates in order, so a malformed pair ANYWHERE in one refuses the whole spec and the
+      # mac-studio entry behind it is never usable. An expression cannot be read this way: its
+      # blank-separated tokens are shell syntax, not pairs, so only the mac-studio ones below are.
+      if (val !~ /[$`(]/) {
+        k = split(val, pairs, /[[:space:]]+/)
+        for (i = 1; i <= k && bad == ""; i++)
+          if (pairs[i] != "" && pairs[i] !~ /^[^=[:space:]]+=[0-9]+$/) bad = pairs[i]
+      }
       while (match(rest, /(^|[^a-z0-9-])mac-studio=[^[:space:])}]*/)) {
         m = substr(rest, RSTART, RLENGTH)
         sub(/^[^m]/, "", m)                      # the boundary character, if the match took one
