@@ -16,6 +16,12 @@ HERE=$(cd "$(dirname "$0")" && pwd -P)
 ROOT=$(cd "$HERE/.." && pwd -P)
 CJ="$HERE/check-jq-shapes.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/check-jq-shapes-test.XXXXXX") || exit 1
+# Resolved once, physically. On macOS $TMPDIR is under /var, a symlink to /private/var, and a
+# guard installed in a scratch checkout computes its own ROOT with `pwd -P` -- so an unresolved
+# $TMP here and the guard's idea of the same directory are spelled differently, and every
+# assertion that compares the guard's output against a $TMP path silently stops matching. The
+# ones phrased as "this must NOT appear" then pass over anything.
+TMP=$(cd "$TMP" && pwd -P) || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 pass=0
@@ -331,8 +337,8 @@ expect "a default-sweep refusal annotates a repo-relative path" 1 \
   '::error file=other-skill/scripts/stamp.sh,line=' -- "$T"
 # ...and no absolute spelling may remain, whether instead of the relative one or beside it: a
 # printf carrying both satisfies the substring above and still fails to anchor. Any leading `/`
-# is the tell -- the scratch tree lives under a temp directory whose spelling the guard resolves
-# with `pwd -P`, so comparing against $TMP itself would miss a /var -> /private/var rewrite.
+# is the tell, and it is deliberately broader than a comparison against $TMP would be: it refuses
+# an absolute path from anywhere, not only one under the scratch tree.
 out=$("$T" 2>&1)
 if grep -qE -- '::error file=/' <<<"$out"; then
   ko "a default-sweep refusal must not annotate an absolute path -- $out"
