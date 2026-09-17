@@ -1119,6 +1119,10 @@ start_wsl() {
   # target order afterwards, so the log still reads box by box rather than interleaved.
   dir=$(mktemp -d "${TMPDIR:-/tmp}/wake-lab-wsl.XXXXXX") || {
     echo "wsl $what FAILED: no work directory" >&2; WSL_FAILED="wsl $what FAILED: no work directory"; return 1; }
+  # Physical path, the house idiom: $TMPDIR on macOS is under /var, a symlink to /private/var
+  # (ludics-lite#208).
+  dir=$(cd "$dir" && pwd -P) || {
+    echo "wsl $what FAILED: no work directory" >&2; WSL_FAILED="wsl $what FAILED: no work directory"; return 1; }
   i=0
   for n in "$@"; do
     i=$((i + 1))

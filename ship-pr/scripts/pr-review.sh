@@ -618,6 +618,16 @@ snapshot_dir_ensure() {
     SNAP_DIR=""
     return 1
   }
+  # Physically resolved: $SNAP_ROOT is $TMPDIR as the environment spells it, which on macOS is
+  # under /var, a symlink to /private/var. Everything else this script computes is `pwd -P`-ed,
+  # so an unresolved snapshot path is a second spelling of one directory in the logs and in any
+  # comparison a fixture makes against it (ludics-lite#208). A `cd` into a directory mktemp just
+  # created fails only if the filesystem went away underneath it, and then there is nothing to
+  # remove anyway.
+  SNAP_DIR=$(cd "$SNAP_DIR" && pwd -P) || {
+    SNAP_DIR=""
+    return 1
+  }
   SNAP="$SNAP_DIR/round"
 }
 

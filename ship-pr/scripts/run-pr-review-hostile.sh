@@ -18,6 +18,9 @@ locale.setlocale(locale.LC_ALL, name)
 PY
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/pr-review hostile.XXXXXX")
+# Physical path: this runner hands $scratch to the suites as their TMPDIR, so an unresolved one
+# is inherited by every fixture path they build (ludics-lite#208).
+scratch=$(cd "$scratch" && pwd -P)
 trap 'rm -rf "$scratch"' EXIT
 mkdir "$scratch/scripts with spaces" "$scratch/tmp with spaces"
 cp -p "$script_dir/"*.sh "$scratch/scripts with spaces/"
