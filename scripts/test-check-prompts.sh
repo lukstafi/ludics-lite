@@ -414,7 +414,8 @@ expect "a removed fixture leaves no membership obligation" 0 '0 failed' -- "$CP"
 # checker's spellings drifted away from the ones the prompts actually use. Every mutation below
 # rewrites a copy under $TMP; nothing in the checkout is touched. The tree is a valid root on its
 # own -- the real README indexes more skills than it holds, which the index lookup allows, and it
-# carries no fixture, so no membership obligation comes with it.
+# carries no fixture, so no membership obligation comes with it. `native-claude.md` is in it as a
+# file the scan DISCOVERS rather than requires: it states the count and is held for it.
 SRC=$(cd "$HERE/.." && pwd)
 WORKER=issue-wave/scripts/fleet-worker.sh
 # The default as the checker reads it, and a number that is not it: the probes state no literal
@@ -428,6 +429,7 @@ slots_tree() {
   cp "$SRC/routines/README.md" "$R/routines/README.md"
   cp "$SRC/issue-wave/SKILL.md" "$R/issue-wave/SKILL.md"
   cp "$SRC/issue-wave/references/executions.md" "$R/issue-wave/references/executions.md"
+  cp "$SRC/issue-wave/references/native-claude.md" "$R/issue-wave/references/native-claude.md"
   cp "$SRC/$WORKER" "$R/$WORKER"
 }
 # slots_edit <file> <sed-expression>: rewrites one copy. An expression that matched nothing would
@@ -441,19 +443,20 @@ slots_edit() {
 slots_tree
 expect "the prompts and fleet-worker.sh state one mac-studio slot count" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
-# The script moves and the prose does not: one edit at the source, every prompt refused.
+# The script moves and the prose does not: one edit at the source, every file that states the
+# count refused -- the discovered `native-claude.md` among them, not just the required three.
 slots_tree
 slots_edit "$WORKER" "s/mac-studio=$WANT/mac-studio=$OTHER/g"
 out=$("$CP" "$R" 2>&1); rc=$?
 miss=
-for f in README.md issue-wave/SKILL.md issue-wave/references/executions.md; do
+for f in README.md issue-wave/SKILL.md issue-wave/references/executions.md issue-wave/references/native-claude.md; do
   grep -qF "FAIL: $f: " <<<"$out" || miss="$miss $f"
 done
 [ "$rc" -eq 1 ] && [ -z "$miss" ] \
-  && ok "a new default in the script alone leaves every prompt refused" \
-  || ko "a new default in the script alone leaves every prompt refused (rc=$rc; silent:$miss) -- $out"
+  && ok "a new default in the script alone leaves every file that states the count refused" \
+  || ko "a new default in the script alone leaves every file that states the count refused (rc=$rc; silent:$miss) -- $out"
 
-# ...and each prompt moving alone, in each spelling the prose uses: `mac-studio=<n>`, the number
+# ...and each file moving alone, in each spelling the prose uses: `mac-studio=<n>`, the number
 # word before `on mac-studio`, and the word opening the "<N>, not <m>" justification.
 slots_tree
 slots_edit issue-wave/references/executions.md "s/mac-studio=$WANT/mac-studio=$OTHER/"
@@ -470,6 +473,24 @@ expect "a rewritten count word is refused in the skill" 1 "SKILL.md: spells the 
 slots_tree
 slots_edit issue-wave/references/executions.md 's/[A-Z][a-z]*, not /Eleven, not /'
 expect "a rewritten justification word is refused" 1 "executions.md: spells the mac-studio slot count 'eleven'" -- "$CP" "$R"
+
+# A file nobody listed: the scan holds whatever states the count, which is what keeps a list from
+# going stale behind a new quotation of the number.
+slots_tree
+slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(eleven on mac-studio/'
+expect "a discovered reference is held to the count too" 1 "native-claude.md: spells the mac-studio slot count 'eleven'" -- "$CP" "$R"
+
+# The whole token, not its prefix: `<box>=<n>` takes an integer, and a value the worker would
+# reject must not read as agreement because it starts with the right digit.
+slots_tree
+slots_edit issue-wave/references/executions.md "s/mac-studio=$WANT/mac-studio=${WANT}oops/"
+expect "a malformed mac-studio=<n> is not agreement" 1 "states 'mac-studio=${WANT}oops'" -- "$CP" "$R"
+
+# ...and the justification shape stays scoped to slot prose: an ordinary sentence of that shape,
+# even dropped into the slot paragraph itself, states no slot count.
+slots_tree
+slots_edit README.md 's/a run-time count a worker takes/a run-time count. Choose one, not both. A worker takes/'
+expect "ordinary '<n>, not <m>' prose beside the slot sentence is not a count" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
 # A prompt that stops stating the count is how the agreement would quietly stop being checked.
 slots_tree

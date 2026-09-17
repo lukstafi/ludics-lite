@@ -23,8 +23,8 @@
 # what it stopped asserting when the table scanner went (ludics-lite#75).
 # Two cross-file agreements ride along, each pinning a fact the prompts only restate: every test
 # fixture has a command in the README's register and a run line on each CI platform it needs, and
-# every prompt that quotes the mac-studio correctness-slot count quotes the one fleet-worker.sh
-# actually defaults to (ludics-lite#160).
+# every file that quotes the mac-studio correctness-slot count quotes the one fleet-worker.sh
+# actually defaults to (ludics-lite#160) -- which files those are is discovered, not listed.
 #
 # Usage: check-prompts.sh [root]   (root defaults to the checkout this script lives in;
 #                                   exit 0 all pass, 1 otherwise)
@@ -356,17 +356,32 @@ check_fixtures() {
 
 # --- the mac-studio correctness-slot count ----------------------------------------------------
 # ludics-lite#160 raised `FLEET_BOX_CORRECTNESS_SLOTS`' mac-studio default from three to six, and
-# the number is restated as prose in three prompts. The default is one line of fleet-worker.sh;
-# every other statement of it is English, and English does not fail a test when it goes stale --
-# so read the number off the script and require every mention to say the same thing. Two spellings
-# carry it, and the checker knows both: `mac-studio=<n>`, and the number word in `<n> on
-# mac-studio` / `<N>, not <m>` (the justification line). The script's own header comment is scanned
-# alongside the prompts: it restates the default a few lines above the assignment. Mentions are
-# matched against the file joined into one line, so a sentence that wraps reads like one that does
-# not. A root without fleet-worker.sh -- a scratch tree, a prompt-only checkout -- carries no
-# obligation, as with the fixture register.
+# the number is restated as prose all over the prompts. The default is one line of fleet-worker.sh;
+# every other statement of it is English, and English does not fail a test when it goes stale -- so
+# read the number off the script and require every statement to say the same thing.
+#
+# WHICH files are held is discovered, not listed: every `*.md` and `*.sh` under the root is scanned,
+# and one is held exactly when it states the count. A list would need a member added each time a
+# prompt starts quoting the number, which is the mistake this check exists to stop -- the first
+# revision listed three files while `references/native-claude.md` and `scripts/test-fleet-worker.sh`
+# quoted the count too. The checker and its own suite are the two exclusions: their `mac-studio=`
+# text is patterns and messages, not a statement about the fleet. The three prompts PR #166 quoted
+# it in are also REQUIRED to keep stating it, so the agreement cannot go vacuous by the prose
+# quietly going away.
+#
+# WHAT counts as a statement is three shapes, which are the three the prose uses -- `mac-studio=<n>`
+# (the whole token, so a malformed `mac-studio=6oops` is refused rather than accepted on its
+# prefix), the number word in `<n> on mac-studio`, and the word opening the `<N>, not <m>`
+# justification. That last one is scoped to slot prose: both sides must be number words AND `slot`
+# must stand within $SLOT_CONTEXT characters, so an ordinary "one, not both" sentence elsewhere in
+# these long documents is not read as a slot declaration. Mentions are matched against the file
+# joined into one line, so a sentence that wraps reads like one that does not. A root without
+# fleet-worker.sh -- a scratch tree, a prompt-only checkout -- carries no obligation, as with the
+# fixture register.
 SLOT_SCRIPT=issue-wave/scripts/fleet-worker.sh
 SLOT_PROMPTS='README.md issue-wave/SKILL.md issue-wave/references/executions.md'
+SLOT_MECHANISM='scripts/check-prompts.sh scripts/test-check-prompts.sh'
+SLOT_CONTEXT=160
 NUMBER_WORDS='zero one two three four five six seven eight nine ten eleven twelve'
 NUMBER_ERE='zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve'
 # number_word <n>: the English spelling of a small number; empty past the list above.
@@ -377,15 +392,66 @@ number_word() {
     i=$((i + 1))
   done
 }
-# slot_mentions <ERE> <text>: every match of <ERE>, one per line. The expression is written with a
-# leading `[^A-Za-z]` in place of a word boundary, which BSD and GNU ERE do not spell alike; the
+
+# slot_files: every file the scan considers, root-relative and sorted, minus the mechanism's own.
+slot_files() {
+  find "$ROOT" -name .git -prune -o -type f \( -name '*.md' -o -name '*.sh' \) -print \
+    | awk -v root="$ROOT/" -v skip=" $SLOT_MECHANISM " '
+        index($0, root) == 1 {
+          f = substr($0, length(root) + 1)
+          if (index(skip, " " f " ") == 0) print f
+        }' \
+    | sort
+}
+
+# slot_mentions <file>: every statement of the mac-studio slot count in <file>, one per line, as
+# `<kind> TAB <number> TAB <as written>` -- kind `digit` carrying the token past `mac-studio=`
+# (which is the number only when the mention is well formed) and `word`/`not` the number word.
+# Boundaries are spelled `[^a-z]` rather than `\b`, which BSD and GNU EREs do not read alike; the
 # text is joined and space-prefixed so that stand-in always has a character to match.
-slot_mentions() { printf '%s\n' "$2" | grep -oiE "$1"; }
-# slot_number <match>: the number the match opens with, lowercased, past the boundary character.
-slot_number() { printf '%s\n' "${1#?}" | tr 'A-Z' 'a-z' | sed 's/[^A-Za-z0-9=].*//'; }
+slot_mentions() {
+  local q="'"
+  RE_DIGIT="mac-studio=[^[:space:]\`\"$q),;]*" \
+  RE_WORD="[^a-z]($NUMBER_ERE)[[:space:]]+on[[:space:]]+mac-studio" \
+  RE_NOT="[^a-z]($NUMBER_ERE), not[[:space:]]+($NUMBER_ERE)[^a-z]" \
+  CTX="$SLOT_CONTEXT" awk '
+    { text = text " " $0 }
+    END {
+      ctx = ENVIRON["CTX"]; lower = tolower(text)
+      scan(ENVIRON["RE_DIGIT"], "digit")
+      scan(ENVIRON["RE_WORD"], "word")
+      scan(ENVIRON["RE_NOT"], "not")
+    }
+    # Walk every match of <re>, reporting each by its position in the joined text.
+    function scan(re, kind,   rest, base, at, len) {
+      rest = lower; base = 0
+      while (match(rest, re)) {
+        at = base + RSTART; len = RLENGTH
+        emit(kind, substr(text, at, len), at, len)
+        base = at + len - 1
+        rest = substr(rest, RSTART + len)
+      }
+    }
+    function emit(kind, frag, at, len,   n, from, window) {
+      if (kind == "digit") {
+        n = substr(frag, index(frag, "=") + 1)
+        sub(/\.$/, "", n)            # a sentence-final period is punctuation, not the value
+      } else {
+        n = tolower(frag); sub(/^[^a-z]+/, "", n); sub(/[^a-z].*$/, "", n)
+        if (kind == "not") {         # only inside slot prose: see the header above
+          from = at - ctx; if (from < 1) from = 1
+          window = substr(lower, from, len + 2 * ctx)
+          if (index(window, "slot") == 0) return
+        }
+      }
+      sub(/^[^A-Za-z0-9]+/, "", frag); sub(/[^A-Za-z0-9]+$/, "", frag)
+      print kind "\t" n "\t" frag
+    }
+  ' "$1"
+}
 
 check_slots() {
-  local default word f text hits hit n found bad=0
+  local default word f kind n shown mentions stated=' ' bad=0
   [ -f "$ROOT/$SLOT_SCRIPT" ] || return 0
   # The default as the shell takes it: the `mac-studio=<n>` inside the SLOTS assignment itself.
   default=$(sed -n 's/^SLOTS=.*mac-studio=\([0-9][0-9]*\).*/\1/p' "$ROOT/$SLOT_SCRIPT")
@@ -395,32 +461,28 @@ check_slots() {
   # An unspellable default (past twelve) leaves the word forms unmatchable rather than unchecked:
   # any number word then mismatches and says what the script actually pins.
   word=$(number_word "$default")
-  for f in $SLOT_PROMPTS $SLOT_SCRIPT; do
-    if [ ! -f "$ROOT/$f" ]; then ko "$f" "missing: it states the mac-studio correctness slots"; bad=1; continue; fi
-    text=" $(tr '\n' ' ' < "$ROOT/$f")"
-    found=false
-    hits=$(slot_mentions "mac-studio=[0-9]+" "$text")
-    while IFS= read -r hit; do
-      [ -n "$hit" ] || continue
-      found=true
-      [ "${hit#mac-studio=}" = "$default" ] \
-        || { ko "$f" "states '$hit'; $SLOT_SCRIPT defaults to mac-studio=$default"; bad=1; }
-    done <<<"$hits"
-    hits=$(slot_mentions "[^A-Za-z]($NUMBER_ERE)([[:space:]]+on[[:space:]]+mac-studio|, not[^A-Za-z])" "$text")
-    while IFS= read -r hit; do
-      [ -n "$hit" ] || continue
-      n=$(slot_number "$hit")
-      found=true
-      [ "$n" = "$word" ] \
-        || { ko "$f" "spells the mac-studio slot count '$n'; $SLOT_SCRIPT defaults to mac-studio=$default"; bad=1; }
-    done <<<"$hits"
-    # A file that stops stating the count is how the agreement quietly stops being checked.
-    case "$f:$found" in
-      "$SLOT_SCRIPT:"*) ;;
-      *:false) ko "$f" "states no mac-studio slot count in a form this check reads ('mac-studio=$default', '$word on mac-studio')"; bad=1 ;;
+  for f in $(slot_files); do
+    mentions=$(slot_mentions "$ROOT/$f")
+    [ -n "$mentions" ] || continue
+    stated="$stated$f "
+    while IFS="$(printf '\t')" read -r kind n shown; do
+      [ -n "$kind" ] || continue
+      case "$kind" in
+        digit) [ "$n" = "$default" ] \
+          || { ko "$f" "states '$shown'; $SLOT_SCRIPT defaults to mac-studio=$default"; bad=1; } ;;
+        *) [ "$n" = "$word" ] \
+          || { ko "$f" "spells the mac-studio slot count '$n'; $SLOT_SCRIPT defaults to mac-studio=$default"; bad=1; } ;;
+      esac
+    done <<<"$mentions"
+  done
+  # A prompt that stops stating the count is how the agreement would quietly stop being checked.
+  for f in $SLOT_PROMPTS; do
+    case "$stated" in
+      *" $f "*) ;;
+      *) ko "$f" "states no mac-studio slot count in a form this check reads ('mac-studio=$default', '$word on mac-studio')"; bad=1 ;;
     esac
   done
-  [ "$bad" -ne 0 ] || ok "mac-studio correctness slots agree: $SLOT_SCRIPT and every prompt say $default"
+  [ "$bad" -ne 0 ] || ok "mac-studio correctness slots agree: $SLOT_SCRIPT and every file that states the count say $default"
 }
 
 # --- run --------------------------------------------------------------------------------------
