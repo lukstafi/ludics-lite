@@ -324,49 +324,29 @@ test_empty_reviews_need_their_own_findings() {
 }
 
 # --- a jq program that ERRORS must not render as a count (ludics-lite#89) -----------------------
-# The same shim the status suite uses: refuse exactly the jq invocation whose program carries the
-# marker, forward everything else to the real jq. It shadows a command, not a library function,
-# so it needs no `stub`. The count's own arm already refuses; the head tally beside it defaults,
-# and what this pins is that the default is the visible `?` and never a plausible number.
-BREAK_JQ=""
-jq() {
-  local arg
-  if [ -n "$BREAK_JQ" ]; then
-    for arg in "$@"; do
-      case "$arg" in
-      *"$BREAK_JQ"*)
-        echo "jq: error: \$broken is not defined at <top-level>" >&2
-        return 3
-        ;;
-      esac
-    done
-  fi
-  command jq "$@"
-}
+# The shim is the preamble's (`with_broken_jq`, ludics-lite#179), and so is the control that it
+# breaks only the program it is pointed at. The count's own arm already refuses; the head tally
+# beside it defaults, and what this pins is that the default is the visible `?` and never a
+# plausible number.
 
 test_a_broken_jq_program_is_not_a_round_count() {
   set_reviews \
     "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)" \
     "$(review "$REVIEWER" COMMENTED bbbb 2026-09-01T11:00:00Z)"
   ROUND_THRESHOLD=12
-  # The control: a marker no program carries leaves the ordinary reading in place.
-  BREAK_JQ='zzz-no-program-carries-this'
+  # The baseline every broken run below is measured against: this fixture, read with nothing
+  # broken. That the shim breaks ONLY what it is pointed at is the preamble's control now.
   run_rounds
-  BREAK_JQ=""
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
-    "the shim must break only the program it is pointed at"
+    "the ordinary reading of this fixture"
   assert_contains "$ROUNDS_OUTPUT" "over 2 head(s)" "and the head tally with it"
 
-  BREAK_JQ='reduce .[] as $r'
-  run_rounds
-  BREAK_JQ=""
+  with_broken_jq 'reduce .[] as $r' run_rounds
   assert_eq "$ROUNDS_RC" 3 "a broken count program is UNKNOWN, not a number"
   assert_contains "$ROUNDS_OUTPUT" "NOT 'no rounds yet'" "and the line says so"
   assert_not_contains "$ROUNDS_OUTPUT" "rounds with findings: 0" "must not print a zero count"
 
-  BREAK_JQ='| unique | map(select(. != "")) | length'
-  run_rounds
-  BREAK_JQ=""
+  with_broken_jq '| unique | map(select(. != "")) | length' run_rounds
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
     "an unreadable head tally does not make the count unknown"
   assert_contains "$ROUNDS_OUTPUT" "over ? head(s)" \

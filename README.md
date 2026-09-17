@@ -200,8 +200,11 @@ python3 ship-pr/scripts/test-pr-review-hostile.py
 python3 scripts/test-workflow-reporters.py
 ship-pr/scripts/test-post-merge-cleanup.sh
 ship-pr/scripts/test-pr-review-lib.sh
+ship-pr/scripts/test-pr-review-base-lib.sh
 ship-pr/scripts/test-pr-review-base-drift.sh
 ship-pr/scripts/test-pr-review-base-red.sh
+ship-pr/scripts/test-pr-review-base-settle.sh
+ship-pr/scripts/test-pr-review-base-verdict.sh
 ship-pr/scripts/test-pr-review-checks-absent.sh
 ship-pr/scripts/test-pr-review-rounds.sh
 ship-pr/scripts/test-pr-review-merge.sh
@@ -471,8 +474,12 @@ verification could not fail on, and so does a bare number following a call that 
 is the ambiguity the cache carried across checkouts and sessions. The control is a named repo
 writing from that same wrong cwd.
 
-`test-pr-review-base-red.sh` covers the other `base` — the one that answers "is the branch I am
-about to work off green", and what it says once the answer is no (ludics-lite#73). A red names the
+Three suites cover the other `base` — the one that answers "is the branch I am about to work off
+green" — over one shared fixture transport, `test-pr-review-base-lib.sh`. They were one 900-line,
+33-case file until ludics-lite#179, where "which suite failed" said only "base".
+
+`test-pr-review-base-red.sh` is the red REPORT: what the command says once the answer is no
+(ludics-lite#73). A red names the
 failing JOB and the commit the red starts at, and the cases pin the claims that could be quietly
 wrong: a first red commit is named only when a judged run under the streak was not red (a window
 red to its end says the red may start further back instead), a run that was cancelled or is still
@@ -480,8 +487,8 @@ going ends no streak because it judged nothing, two workflow files sharing a dis
 their histories apart, a jobs read that fails prints UNKNOWN and leaves the red standing rather
 than reporting no failing job, and a green base spends no call on any of it.
 
-The same suite covers what `base --wait` does when the tip has no verdict of its own
-(ludics-lite#156, where a docs-only default-branch tip parked a wave's dispatch at the ceiling
+`test-pr-review-base-settle.sh` covers what `base --wait` does when the tip has no verdict of its
+own (ludics-lite#156, where a docs-only default-branch tip parked a wave's dispatch at the ceiling
 while the plain read settled for the older green on it). The grace that separates "never coming"
 from "not yet" runs from the first READ of the tip rather than from the end of the round that read
 it — re-stamping it there spent a round of API latency out of the grace, which is how a
@@ -509,7 +516,19 @@ no run history whose filter nobody read — each costing the grace rather than a
 re-confirm, since a settle for an older verdict must not be handed to a tip that moved under the
 round.
 
-What the wait loop DECIDES is pinned by the same suite (ludics-lite#93). A red at the tip is the
+Five cases across those suites are on the CLOCK — a retuned grace, a `--wait` ceiling, a delay
+inside the fixture — and they went red on a loaded machine twice before settling into one shape,
+which the shared transport now writes down and provides: the grace is spent by an explicit delay
+inside the first round's own reads (`spend_grace`), the fixture's event lands on round one
+(`at_round`, counted on the runs-feed read, which is one per round by construction), and the
+ceiling is kept clear of both. Counting ROUNDS against a clock was the trap: a round launches a
+fixture and several jq subprocesses, so under load four happened where five were counted on and a
+tip move landed on the wrong side of the grace (ludics-lite#169). A case that wants to know how
+far a wait got reads `rounds_polled` rather than elapsed time. Executed rather than sourced, the
+transport runs its own controls over those three devices — read a `gh` call at a time, with no
+`base` run around them, since a control driven through the wait loop would be on the clock itself.
+
+`test-pr-review-base-verdict.sh` pins what the wait loop DECIDES (ludics-lite#93). A red at the tip is the
 tip's own verdict and ends the wait on the round that saw it; a red behind an unjudged tip is the
 fix-in-progress shape and keeps it, so both breaks — the red one and the covered-green one —
 re-confirm the tip before they trust the read that reached them, and at the ceiling `NO VERDICT`
@@ -531,8 +550,18 @@ tie now goes to the higher run id, the later allocation. Sorting each page rathe
 assembled rows leaves the report's per-workflow lines in the order the workflow list gave them.
 
 The `test-pr-review-*.sh` suites share a preamble, `test-pr-review-lib.sh`, which sources
-`pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup and
-the fixture `gh`'s argument parsing. It also closes the trap that bit twice (ludics-lite#39, #45,
+`pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup,
+the fixture `gh`'s argument parsing, and the `jq` shim that makes ONE named jq program fail so a
+case can prove a read that did not parse refuses instead of rendering a plausible value
+(ludics-lite#89). Three suites carried that shim byte-identically, each re-proving with a control
+of its own that it breaks only what it is pointed at; that claim is about the shim, so the
+preamble's own controls pin it once and a suite keeps only the baseline its broken runs are
+measured against (ludics-lite#179). The guard reaches one library further out too: the base
+suites' shared fixture transport is sourced after the preamble, so its own helpers were outside
+the snapshot and a suite colliding with one of them — `reset_fixture`, say, which every case
+opens with — was accepted in silence. `protect_library <file>`, called by such a library from
+inside itself, extends the snapshot over what it defines, and a call that would add nothing is
+refused rather than protecting nothing. It also closes the trap that bit twice (ludics-lite#39, #45,
 #46): `pr-review.sh` puts some sixty unqualified functions in scope, and a suite helper sharing a
 name — a reporter called `fail` — silently replaces the library's, turning every refusal's exit
 code into the reporter's. So the preamble snapshots the function table when it is sourced, and

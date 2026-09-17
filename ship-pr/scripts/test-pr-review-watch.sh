@@ -1189,30 +1189,14 @@ Current findings follow.
 }
 
 # --- a jq program that ERRORS must fail the poll round (ludics-lite#89) -------------------------
-# The shim the status and rounds suites use: refuse exactly the jq invocation whose program
-# carries the marker — nonzero status, nothing on stdout — and forward everything else to the real
-# jq. It shadows a command, not a library function, so it needs no `stub`.
+# The shim is the preamble's (`with_broken_jq`, ludics-lite#179), and so is the control that it
+# refuses only the invocation the marker names.
 #
 # cmd_poll's reads used to be unguarded, and each failed in the shape that is hardest to see: the
 # list of new reviews to re-read came back empty (no new reviews), a rendering printed nothing (no
 # items of that kind), and an `items:`/`watermark:` field built inside the `echo`'s own command
 # substitution came back empty while the line still printed — and the watermark was then advanced
 # past findings that were never shown.
-BREAK_JQ=""
-jq() {
-  local arg
-  if [ -n "$BREAK_JQ" ]; then
-    for arg in "$@"; do
-      case "$arg" in
-      *"$BREAK_JQ"*)
-        echo "jq: error: \$broken is not defined at <top-level>" >&2
-        return 3
-        ;;
-      esac
-    done
-  fi
-  command jq "$@"
-}
 
 run_poll() { # [watermark]
   local rc
@@ -1228,9 +1212,7 @@ run_poll() { # [watermark]
 # require the round to be refused whole — no watermark, so the caller keeps the one it had and
 # polls the same feed again rather than advancing past what this round could not render.
 assert_poll_refuses() {
-  BREAK_JQ="$1"
-  run_poll
-  BREAK_JQ=""
+  with_broken_jq "$1" run_poll
   assert_eq "$POLL_RC" "$2" "$3: a jq program error must fail the round"
   assert_not_contains "$POLL_OUT" "watermark: " "$3: a failed round must not write a watermark"
 }
@@ -1240,11 +1222,10 @@ test_a_broken_jq_program_fails_the_poll_round() {
   schedule inline 1 "[$(inline_comment 900 "$H2" "$H2")]"
   schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z)]"
   schedule comments 1 "[$(summary_comment 700 2026-09-01T10:00:00Z 'a findings summary')]"
-  # The control: a marker no program carries leaves an ordinary, complete round.
-  BREAK_JQ='zzz-no-program-carries-this'
+  # The baseline every refusal below is measured against: this fixture, polled with nothing
+  # broken, is an ordinary complete round.
   run_poll
-  BREAK_JQ=""
-  assert_eq "$POLL_RC" 0 "the shim must break only the program it is pointed at"
+  assert_eq "$POLL_RC" 0 "the ordinary round succeeds"
   assert_contains "$POLL_OUT" "items: inline:900" "the control round renders its inline item"
   assert_contains "$POLL_OUT" "summary:700" "and its summary item"
   assert_contains "$POLL_OUT" "review:800" "and its review item"
@@ -1284,12 +1265,9 @@ watermark: 9000,9000,9000')]"
   assert_eq "$POLLED_RC" 0 "control: the round should succeed"
   assert_eq "$POLLED_MARK" "900,700,5" "a successful round takes the watermark it emitted"
 
-  # Now the summary rendering fails, AFTER the inline body above has been printed.
-  BREAK_JQ='"--- summary id='
-  set +e
-  watch_round 7 5,5,5 2>/dev/null
-  set -e
-  BREAK_JQ=""
+  # Now the summary rendering fails, AFTER the inline body above has been printed. No `set +e`
+  # pair of its own: `with_broken_jq` answers the round's status rather than propagating it.
+  with_broken_jq '"--- summary id=' watch_round 7 5,5,5 2>/dev/null || :
   assert_eq "$POLLED_RC" 4 "the round must fail"
   assert_eq "$POLLED_MARK" 5,5,5 \
     "a failed round keeps the caller's watermark; a quoted line is not a watermark"
