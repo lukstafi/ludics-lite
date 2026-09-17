@@ -27,12 +27,14 @@ set the latency of the whole per-PR matrix.
 
 Before waking anything, run the drift check in the ludics-lite checkout, which is where this prompt is canonical:
 
-    git -C ~/ludics-lite fetch --quiet origin && git -C ~/ludics-lite rev-list --left-right --count HEAD...origin/main
+    git -C ~/ludics-lite fetch --quiet origin \
+      && git -C ~/ludics-lite rev-parse --abbrev-ref HEAD \
+      && git -C ~/ludics-lite rev-list --left-right --count HEAD...origin/main
     ~/ludics-lite/scripts/sync-routines.sh
 
 `scripts/sync-routines.sh` with no argument is status mode: one line per local scheduled task, and exit 1 on any drift. Read your own line. `ocannl-cross-machine-sweep: DRIFT` means the prompt the scheduler dispatched — the one you are reading now — is not the one the checkout holds, so the steps below may be a superseded revision; the diff it prints says which way and in what. It is not hypothetical: on 2026-09-17 the installed copy was found nineteen lines of superseded prose behind, still telling the run to wake the lab without `--hold`, and it had been that way for about a week (ludics-lite#199).
 
-Status mode compares the installed copies with THIS checkout, not with `origin/main`, so a checkout behind the remote reports `in sync` while the installed prompt is older than what merged. `rev-list --left-right --count HEAD...origin/main` prints `<ahead> <behind>`; the second number is how many commits of `origin/main` the checkout does not have, and anything but `0` means the verdict under it is only as current as the checkout. Against `origin/main` by name, not `git status -sb`: the checkout may be on a topic branch or one with no upstream, whose tracking state says nothing about `main`. The `&&` is deliberate too — a failed fetch (auth, DNS, network) prints no counts at all, and that absence is the answer: the remote comparison is UNKNOWN, not clean, because stale remote-tracking refs would show a checkout matching the installed copies as up to date. Report the fetch failure in its place.
+Status mode compares the installed copies with THIS checkout, not with `origin/main`, so a checkout behind the remote reports `in sync` while the installed prompt is older than what merged. `rev-list --left-right --count HEAD...origin/main` prints `<ahead> <behind>`, and the checkout is canonical only on branch `main` with both at `0`: a nonzero BEHIND means the verdict under it is only as current as a checkout missing merged prompts, and a nonzero AHEAD means the checkout carries prompt text that has not been through review, which nobody should install from. Against `origin/main` by name, not `git status -sb`: the checkout may be on a topic branch or one with no upstream, whose tracking state says nothing about `main`. The `&&` is deliberate too — a failed fetch (auth, DNS, network) prints no counts at all, and that absence is the answer: the remote comparison is UNKNOWN, not clean, because stale remote-tracking refs would show a checkout matching the installed copies as up to date. Report the fetch failure in its place.
 
 Carry on with the sweep either way — a drifted prompt still runs a useful sweep, and the coverage window is the thing that must not be missed — but report the finding in step 5 and notify on it in step 6. Do NOT run `sync-routines.sh push` and do not edit the installed copy: those are live scheduler state, and re-installing a prompt is a person's call made after reading the diff. Where the two disagree about a step below, this prompt is what the scheduler gave you; say so and follow it.
 
@@ -337,8 +339,8 @@ backends on the WSL boxes), say which of the three step-1 outcomes applied: woke
 
 Print a short summary: one line per unit (machine/backend, outcome, duration), preceded by a line
 on what step 1 did if any box needed waking. Open with step 0's drift verdict, in one line when
-everything is in sync and with the diff when it is not (plus the `rev-list` counts if the checkout is behind
-`origin/main`, or the fetch's error if that comparison is unknown) — a check whose silence and whose absence look alike is not a check. Then either "no change since the last sweep" or the
+everything is in sync and with the diff when it is not (plus the branch and the `rev-list` counts when they are not
+`main` and `0 0`, or the fetch's error if that comparison could not be made) — a check whose silence and whose absence look alike is not a check. Then either "no change since the last sweep" or the
 specific new failures with the relevant log excerpt (the full log path is in the history row —
 quote a few lines, do not paste the whole thing). On a forced run, also include the skip-coverage
 `result:` line and every `FAIL:`/`POTENTIAL:` claim from today's report, plus the report path —
@@ -371,8 +373,8 @@ not the backends.
 
 Send a PushNotification ONLY if there is (a) a new failure or timeout, (b) a staleness flag,
 (c) a skip-coverage `FAIL`, or a FAIL/POTENTIAL claim set that differs from the previous report's,
-(d) step 0 reporting DRIFT on this routine's own prompt, a nonzero behind count against
-`origin/main`, or a remote comparison it could not make at all — each says this run may have executed
+(d) step 0 reporting DRIFT on this routine's own prompt, a checkout that is not `main` at
+`0 0` against `origin/main`, or a remote comparison it could not make at all — each says this run may have executed
 instructions that have been superseded, and nothing else on this box notices; an installed prompt that
 matches an equally stale checkout reads `in sync` and is exactly as wrong,
 or (e) an `error` outcome, a script exit of 2, or a launch refused for a missing
@@ -381,7 +383,7 @@ calls notify-worthy, and it must not go silent for being neither a failure nor y
 A `FAIL` notifies even when unchanged — it fires at most weekly (forced runs only) and means some
 claim has zero execution coverage on every backend, which must keep reaching a human until fixed;
 an unchanged POTENTIAL set stays silent like an unchanged fingerprint.
-Drift — and a checkout behind `origin/main`, and a fetch that failed — notifies every day it lasts, for
+Drift — and a checkout that is not `main` at `0 0`, and a fetch that failed — notifies every day it lasts, for
 the same reason: each says this run may have followed superseded instructions, only a person can end it,
 and it is silent everywhere else — the 2026-09-17 instance went a
 week unseen. Put the DIFF's direction in the notification, never a fixed command: `sync-routines.sh push`

@@ -133,6 +133,9 @@ git -C ~/ludics-lite merge --ff-only origin/main         # it has to hold origin
 ~/ludics-lite/scripts/sync-routines.sh push
 ```
 
+From `main`, and only with nothing of your own unmerged on it: `push` installs whatever the
+checkout holds, so an ahead checkout installs an unreviewed prompt.
+
 That is the whole discipline, and it is a step in `ship-pr`'s sense of "landed" for any PR that
 touches a prompt here. A git hook could close the window, but installing one is a per-checkout
 side effect this repository has no idiom for — `ship-pr/hooks` is an agent-harness `Stop` hook
@@ -164,7 +167,10 @@ Status mode compares the installed copies with the checkout, not with `origin/ma
 behind the remote reports `in sync` while the installed prompt is older than what merged. That is
 why both prompts count `HEAD...origin/main` beside the verdict — against that ref by name, since
 the checkout may sit on a topic branch whose own tracking state says nothing about `main` — and why
-the push recipe takes `origin/main` by name first — a bare `git pull --ff-only` follows whatever the
+they call a checkout canonical only on `main` with both counts at `0`: installing from a checkout
+that is AHEAD publishes prompt text that has not been through review into the live scheduler, which
+is worse than the drift it would be fixing. It is also why the push recipe takes `origin/main` by
+name first — a bare `git pull --ff-only` follows whatever the
 current branch tracks, which on a checkout parked on a topic branch advances the wrong thing.
 
 ## The cloud routine: synced by hand
