@@ -144,10 +144,13 @@ SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/pr-review-api-contract.XXXXXX")
 
 # Any exit this script did not choose — a jq that cannot iterate a wrapper that moved, say — is
 # named here, so the log says what stopped and the workflow's reporter (every exit but 0 and 3)
-# has something to point at. pr-review.sh's own trap is folded in.
+# has something to point at. This trap REPLACED the one sourcing pr-review.sh installed — a trap
+# is not chained — so pr-review.sh's cleanup is CALLED here rather than restated (ludics-lite#195:
+# the restatement was a copy that drifted, and #191's snapshot directory leaked from the other
+# copy for a whole release).
 on_exit() {
   local rc=$?
-  rm -f "$GH_ERR_FILE"
+  pr_review_cleanup
   rm -rf "$SCRATCH"
   case "$rc" in
   0 | 1 | 2 | 3 | 4 | 5) ;;

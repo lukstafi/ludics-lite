@@ -333,7 +333,19 @@ SNAP_ROOT="${TMPDIR:-/tmp}"
 SNAP_ROOT="${SNAP_ROOT%/}"
 SNAP_DIR=""
 SNAP=""
-trap 'rm -f "$GH_ERR_FILE"; [ -z "$SNAP_DIR" ] || rm -rf "$SNAP_DIR"' EXIT
+# The cleanup is a NAMED function rather than a body written into the trap, because two scripts
+# source this one and then install an EXIT trap of their own: a trap is REPLACED, never chained,
+# so each of them used to hand-copy what this trap does, and nothing checked the copies still
+# agreed (ludics-lite#195). The snapshot directory above is the proof: added to this trap alone,
+# it leaked from every fixture-suite run into the real TMPDIR until the copy in
+# test-pr-review-lib.sh was updated by hand, with every suite and CI green throughout. A sourcing
+# script calls this function from its own trap instead, so there is no copy to drift; the suites'
+# preamble refuses to run if its trap no longer reaches whatever this one installs.
+pr_review_cleanup() {
+  rm -f "$GH_ERR_FILE"
+  [ -z "$SNAP_DIR" ] || rm -rf "$SNAP_DIR"
+}
+trap pr_review_cleanup EXIT
 
 gateway_failure() {
   case "$1" in
