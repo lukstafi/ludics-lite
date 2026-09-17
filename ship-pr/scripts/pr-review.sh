@@ -3188,12 +3188,13 @@ run_signal() {
   # (ludics-lite#38, round 3). After the sort above, the first row seen for a key is the one that
   # counts.
   #
-  # The key is workflow id AND event, not the workflow id alone. The id is there because two
-  # workflow FILES can share a display name and a name-keyed fold would collapse them; the event
-  # is there because ONE file triggered on both `push` and `pull_request` produces two INDEPENDENT
-  # runs at the same head that share a workflow id — collapsing those hides a queued invocation
-  # behind a newer one that finished (round 4). cmd_base does not need this because it queries a
-  # single event; this feed is every event at a head.
+  # The key is workflow id AND event, not the workflow id alone. The id half is there for the
+  # reason cmd_base's per-workflow projection sets out: a display name does not identify a
+  # workflow FILE. The event half is this feed's own: ONE file triggered on both `push` and
+  # `pull_request` produces two INDEPENDENT runs at the same head that share a workflow id —
+  # collapsing those hides a queued invocation behind a newer one that finished (round 4).
+  # cmd_base keys on the id alone because it queries a single event; this feed is every event at
+  # a head.
   #
   # And the fold only ever collapses COMPLETED rows. No key identifies an invocation — two manual
   # dispatches of one workflow at one head share workflow id and event and are independent work
@@ -4509,7 +4510,9 @@ cmd_base() {
       is_advisory "$wname" && continue
       # The workflow ID leads each row so the fold can group by it: two workflow FILES can share
       # one display name, and a name-keyed fold would collapse them into a single row — the
-      # first-listed one's green masking the other still running or red (round 9).
+      # first-listed one's green masking the other still running or red (round 9). This is the
+      # whole reason either fold over workflow runs carries an id at all; run_signal's keys on it
+      # too, with an event alongside for a feed that spans every event at one head.
       part=$(gh_retry read api \
         "repos/$REPO/actions/workflows/$wid/runs?branch=$ebranch&event=push&per_page=10" \
         --jq '.workflow_runs[] | [(.workflow_id | tostring), .name, .status,
