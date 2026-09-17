@@ -408,6 +408,80 @@ rm "$R/alpha/scripts/test-python.py"
 # The lookup is one-way, as the prompt register is: stale commands require no table model.
 expect "a removed fixture leaves no membership obligation" 0 '0 failed' -- "$CP" "$R"
 
+# --- the mac-studio correctness-slot count ----------------------------------------------------
+# The prompts quote a number that lives in one line of fleet-worker.sh (ludics-lite#160), so this
+# tree is the real files, COPIED: a probe over invented prose would keep passing while the
+# checker's spellings drifted away from the ones the prompts actually use. Every mutation below
+# rewrites a copy under $TMP; nothing in the checkout is touched. The tree is a valid root on its
+# own -- the real README indexes more skills than it holds, which the index lookup allows, and it
+# carries no fixture, so no membership obligation comes with it.
+SRC=$(cd "$HERE/.." && pwd)
+WORKER=issue-wave/scripts/fleet-worker.sh
+# The default as the checker reads it, and a number that is not it: the probes state no literal
+# count, so raising the default again leaves them testing the same thing.
+WANT=$(sed -n 's/^SLOTS=.*mac-studio=\([0-9][0-9]*\).*/\1/p' "$SRC/$WORKER")
+OTHER=$((WANT + 1))
+slots_tree() {
+  rm -rf "$R"
+  mkdir -p "$R/issue-wave/references" "$R/issue-wave/scripts" "$R/routines"
+  cp "$SRC/README.md" "$R/README.md"
+  cp "$SRC/routines/README.md" "$R/routines/README.md"
+  cp "$SRC/issue-wave/SKILL.md" "$R/issue-wave/SKILL.md"
+  cp "$SRC/issue-wave/references/executions.md" "$R/issue-wave/references/executions.md"
+  cp "$SRC/$WORKER" "$R/$WORKER"
+}
+# slots_edit <file> <sed-expression>: rewrites one copy. An expression that matched nothing would
+# leave a probe asserting a refusal the tree no longer earns, so the helper says so instead.
+slots_edit() {
+  sed "$2" "$R/$1" > "$R/slots.tmp" || { ko "slots_edit: sed failed on $1"; return 1; }
+  cmp -s "$R/slots.tmp" "$R/$1" && { ko "slots_edit: '$2' matched nothing in $1"; return 1; }
+  mv "$R/slots.tmp" "$R/$1"
+}
+
+slots_tree
+expect "the prompts and fleet-worker.sh state one mac-studio slot count" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# The script moves and the prose does not: one edit at the source, every prompt refused.
+slots_tree
+slots_edit "$WORKER" "s/mac-studio=$WANT/mac-studio=$OTHER/g"
+out=$("$CP" "$R" 2>&1); rc=$?
+miss=
+for f in README.md issue-wave/SKILL.md issue-wave/references/executions.md; do
+  grep -qF "FAIL: $f: " <<<"$out" || miss="$miss $f"
+done
+[ "$rc" -eq 1 ] && [ -z "$miss" ] \
+  && ok "a new default in the script alone leaves every prompt refused" \
+  || ko "a new default in the script alone leaves every prompt refused (rc=$rc; silent:$miss) -- $out"
+
+# ...and each prompt moving alone, in each spelling the prose uses: `mac-studio=<n>`, the number
+# word before `on mac-studio`, and the word opening the "<N>, not <m>" justification.
+slots_tree
+slots_edit issue-wave/references/executions.md "s/mac-studio=$WANT/mac-studio=$OTHER/"
+expect "a rewritten mac-studio=<n> is refused" 1 "states 'mac-studio=$OTHER'" -- "$CP" "$R"
+
+slots_tree
+slots_edit README.md 's/([a-z]* on$/(eleven on/'
+expect "a rewritten count word is refused, wrapped across a line" 1 "README.md: spells the mac-studio slot count 'eleven'" -- "$CP" "$R"
+
+slots_tree
+slots_edit issue-wave/SKILL.md 's/([a-z]* on mac-studio/(eleven on mac-studio/'
+expect "a rewritten count word is refused in the skill" 1 "SKILL.md: spells the mac-studio slot count 'eleven'" -- "$CP" "$R"
+
+slots_tree
+slots_edit issue-wave/references/executions.md 's/[A-Z][a-z]*, not /Eleven, not /'
+expect "a rewritten justification word is refused" 1 "executions.md: spells the mac-studio slot count 'eleven'" -- "$CP" "$R"
+
+# A prompt that stops stating the count is how the agreement would quietly stop being checked.
+slots_tree
+slots_edit README.md 's/([a-z]* on$/(as configured on/'
+expect "a prompt that drops the count is refused" 1 'README.md: states no mac-studio slot count' -- "$CP" "$R"
+
+# The obligation comes from the script, as the fixtures' comes from a fixture.
+fresh "$R"
+out=$("$CP" "$R" 2>&1)
+grep -q 'mac-studio' <<<"$out" && ko "a root without $WORKER is held to a slot count" \
+  || ok "...and a root without $WORKER carries no slot obligation"
+
 # --- this checkout ---------------------------------------------------------------------------
 expect "this checkout's prompts pass" 0 '0 failed' -- "$CP"
 
