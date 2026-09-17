@@ -432,6 +432,12 @@ esac
 # Base ten explicitly: a default legitimately spelled `08` is eight to the worker and to the
 # checker, and an octal token to bash arithmetic -- which would end the suite here.
 OTHER=$(( 10#0${WANT:-0} + 1 ))
+# A spelling used as the STALE one must not be the default's own, or the mutation would replace a
+# word with itself: `slots_edit` would report that nothing changed and the probe would assert a
+# refusal the tree no longer earns. Both pairs move out of the way if the default ever becomes the
+# number they spell -- which is the very change this whole check exists for.
+STALE=eleven;     [ "${WANT:-0}" = 11 ] && STALE=twelve
+STALE_HYPHEN=twenty-six; [ "${WANT:-0}" = 26 ] && STALE_HYPHEN=twenty-seven
 slots_tree() {
   rm -rf "$R"
   mkdir -p "$R/issue-wave/references" "$R/issue-wave/scripts" "$R/routines"
@@ -473,18 +479,18 @@ slots_edit issue-wave/references/executions.md "s/mac-studio=$WANT/mac-studio=$O
 expect "a rewritten mac-studio=<n> is refused" 1 "states 'mac-studio=$OTHER'" -- "$CP" "$R"
 
 slots_tree
-slots_edit README.md 's/([a-z]* on$/(eleven on/'
-expect "a rewritten count word is refused, wrapped across a line" 1 "README.md: spells the mac-studio slot count 'eleven'" -- "$CP" "$R"
+slots_edit README.md "s/([a-z]* on$/($STALE on/"
+expect "a rewritten count word is refused, wrapped across a line" 1 "README.md: spells the mac-studio slot count '$STALE'" -- "$CP" "$R"
 
 slots_tree
-slots_edit issue-wave/SKILL.md 's/([a-z]* on mac-studio/(eleven on mac-studio/'
-expect "a rewritten count word is refused in the skill" 1 "SKILL.md: spells the mac-studio slot count 'eleven'" -- "$CP" "$R"
+slots_edit issue-wave/SKILL.md "s/([a-z]* on mac-studio/($STALE on mac-studio/"
+expect "a rewritten count word is refused in the skill" 1 "SKILL.md: spells the mac-studio slot count '$STALE'" -- "$CP" "$R"
 
 # A file nobody listed: the scan holds whatever states the count, which is what keeps a list from
 # going stale behind a new quotation of the number.
 slots_tree
-slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(eleven on mac-studio/'
-expect "a discovered reference is held to the count too" 1 "native-claude.md: spells the mac-studio slot count 'eleven'" -- "$CP" "$R"
+slots_edit issue-wave/references/native-claude.md "s/([a-z]* on mac-studio/($STALE on mac-studio/"
+expect "a discovered reference is held to the count too" 1 "native-claude.md: spells the mac-studio slot count '$STALE'" -- "$CP" "$R"
 
 # The whole token, not its prefix: `<box>=<n>` takes an integer, and a value the worker would
 # reject must not read as agreement because it starts with the right digit.
@@ -499,12 +505,12 @@ expect "a malformed mac-studio=<n> is not agreement" 1 "states 'mac-studio=${WAN
 # and `done` as a count of `done`, while a bare vocabulary rule lets `thirteen` state a number no
 # spelling is checked against -- silently, in a file nothing requires to speak.
 slots_tree
-slots_edit issue-wave/SKILL.md 's/([a-z]* on mac-studio/(twenty-six on mac-studio/'
-expect "a compound numeral is read whole, not by its suffix" 1 "SKILL.md: spells the mac-studio slot count 'twenty-six'" -- "$CP" "$R"
+slots_edit issue-wave/SKILL.md "s/([a-z]* on mac-studio/($STALE_HYPHEN on mac-studio/"
+expect "a compound numeral is read whole, not by its suffix" 1 "SKILL.md: spells the mac-studio slot count '$STALE_HYPHEN'" -- "$CP" "$R"
 
 slots_tree
-slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(thirteen on mac-studio/'
-expect "a numeral past the default's own spellings is still a count" 1 "native-claude.md: spells the mac-studio slot count 'thirteen'" -- "$CP" "$R"
+slots_edit issue-wave/references/native-claude.md "s/([a-z]* on mac-studio/(${STALE_HYPHEN%%-*} on mac-studio/"
+expect "a numeral past the default's own spellings is still a count" 1 "native-claude.md: spells the mac-studio slot count '${STALE_HYPHEN%%-*}'" -- "$CP" "$R"
 
 for sentence in 'The cleanup is done on mac-studio.' 'Someone on mac-studio noticed.'; do
   slots_tree
@@ -592,6 +598,21 @@ expect "an override whose blank is escaped states no default" 0 'mac-studio corr
 slots_tree
 printf ": <<'HD'\nSLOTS=mac-studio=%s\nHD\n" "$OTHER" >> "$R/$WORKER"
 expect "a SLOTS line inside a heredoc assigns nothing" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# Prose written in the SHAPE of an assignment, inside a comment, is still prose -- and
+# fleet-worker.sh's header is one of the declarations this check exists to hold in sync, so
+# excusing it there would defeat the check on the file it was built around.
+slots_tree
+slots_edit "$WORKER" "s/^#     box (ludics-lite#157); an unnamed box has one. .mac-studio=$WANT./#     box (ludics-lite#157); an unnamed box has one. FLEET_BOX_CORRECTNESS_SLOTS=mac-studio=$OTHER/"
+expect "a count in a comment is held even when it is spelled as an assignment" 1 "$WORKER: states 'mac-studio=$OTHER'" -- "$CP" "$R"
+slots_tree
+printf '# was: SLOTS=mac-studio=%s\n' "$OTHER" >> "$R/$WORKER"
+expect "...and a commented-out assignment is a statement, not a setting" 1 "$WORKER: states 'mac-studio=$OTHER'" -- "$CP" "$R"
+# The other side of that reading: a real assignment keeps its quoted value, which is part of it.
+slots_tree
+printf '\n    FLEET_BOX_CORRECTNESS_SLOTS="rog-nv-wsl=3 mac-studio=2" fleet-worker.sh ls\n' \
+  >> "$R/issue-wave/references/executions.md"
+expect "a quoted override is still an input, not a statement" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
 # A heredoc-like operator inside quotes opens no body either -- the other half of "what the shell
 # would execute", and the same skip-to-EOF failure if it were queued.

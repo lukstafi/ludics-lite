@@ -447,7 +447,7 @@ slot_mentions() {
     # Each line is joined into one text, and masked alongside it: `a` marks a character inside an
     # assignment of the variable, `.` one in prose. Position for position, so a mention is judged
     # by where it stands rather than by what the 32 characters before it happen to spell.
-    { text = text " " $0 }
+    { text = text " " $0; code = code " " uncommented($0) }
     END {
       lower = tolower(text); find_assignments()
       scan(ENVIRON["RE_DIGIT"], "digit")
@@ -497,12 +497,16 @@ slot_mentions() {
     # backslash, or a quote still open) is one word to the shell, and it reads as one here because
     # the line break arrives as the blank that the escape or the quote covers.
     function find_assignments(   rest, base, st, at) {
-      rest = lower; base = 0; spans = 0
+      # Past the comments, not over the raw text: `# … SLOTS=mac-studio=6 with the default roster`
+      # is one of the prose declarations this check exists to hold, and masking it would excuse it
+      # from the agreement it is supposed to keep. Same positions either way -- the line keeps its
+      # length -- and quoted values are kept, since a quoted value is part of its assignment.
+      rest = tolower(code); base = 0; spans = 0
       while (match(rest, /(^|[^a-z0-9_])[a-z0-9_]*slots=/)) {
         st = RSTART; at = base + st
         spans++
         span_from[spans] = at
-        span_to[spans] = word_end(text, at + RLENGTH - 1)
+        span_to[spans] = word_end(code, at + RLENGTH - 1)
         base = at + RLENGTH - 1
         rest = substr(rest, st + RLENGTH)
       }
@@ -567,6 +571,25 @@ SLOT_AWK_LIB='
     if (q != "" && plain > 0) return plain
     return i - 1
   }
+  # uncommented <line>: <line> with its comment dropped -- a `#` outside quotes, at the start or
+  # after a blank -- and padded back to its original length so positions do not shift. Quoted text
+  # is KEPT: the value of an assignment is usually quoted, and belongs to it.
+  function uncommented(line,   i, c, q, sq, out) {
+    q = ""; sq = sprintf("%c", 39)
+    for (i = 1; i <= length(line); i++) {
+      c = substr(line, i, 1)
+      if (q == "") {
+        if (c == "\\") { i++; continue }
+        if (c == "\"" || c == sq) { q = c; continue }
+        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) {
+          out = substr(line, 1, i - 1)
+          while (length(out) < length(line)) out = out " "
+          return out
+        }
+      } else if (c == q) q = ""
+    }
+    return line
+  }
   # code_of <line>: the part of <line> the shell would EXECUTE -- its comment dropped (a `#`
   # outside quotes, at the start or after a blank) and its quoted text blanked out. Both are places
   # a `<<word` can stand without opening anything, and queueing a heredoc that never arrives skips
@@ -596,7 +619,10 @@ SLOT_AWK_LIB='
           continue
         }
         if (c == "\"" || c == sq) { q = c; out = out " "; continue }
-        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) return out
+        if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/)) {
+          while (length(out) < length(line)) out = out " "      # the length stands; the code stops
+          return out
+        }
         out = out c
       } else {
         if (c == q) q = ""
