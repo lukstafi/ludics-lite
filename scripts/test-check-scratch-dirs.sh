@@ -354,6 +354,16 @@ EOF
 expect "a redirection before the options does not hide them" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_redirect_before_options.sh"
 
+# An ESCAPED substitution opens no command here: `control "SNAP_DIR=\$(mktemp -d ...)"` is shell
+# source this file hands to another shell to run later, which is a file this guard has not been
+# asked about. (ludics-lite#195's new case in test-pr-review-lib.sh is exactly this shape.)
+probe safe_escaped_probe_source <<'EOF'
+control "SNAP_DIR=\$(mktemp -d \"$root/snap.XXXXXX\")" \
+  'printf "snap=%s\n" "$SNAP_DIR"'
+EOF
+expect "an escaped substitution in probe source is not a call here" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_escaped_probe_source.sh"
+
 # --- the shapes that must be refused --------------------------------------------------------
 
 probe bad_tmpdir <<'EOF'

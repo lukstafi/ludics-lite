@@ -275,8 +275,10 @@ for f in "${files[@]}"; do
       for (i = 1; i <= length(s); i++) {
         ch = substr(s, i, 1)
         # A `$(` opens a command even inside a double-quoted string -- `cd "$(mktemp -d ...)"`
-        # runs the call, and a splitter that stopped at the quote saw only the `cd`.
-        if (ch == "$" && substr(s, i + 1, 1) == "(") {
+        # runs the call, and a splitter that stopped at the quote saw only the `cd`. An ESCAPED
+        # one does not: `control "SNAP_DIR=\$(mktemp -d ...)"` hands that text to another shell
+        # to run later, and this guard reads the file in front of it.
+        if (ch == "$" && substr(s, i + 1, 1) == "(" && !escaped(s, i)) {
           stack[++sp] = q; q = ""
           if (cur != "") CMD[++NCMD] = cur
           cur = ""; i++
