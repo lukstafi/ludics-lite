@@ -552,7 +552,7 @@ expect "a default left only in a trailing comment is no default" 1 "$WORKER: SLO
 # default of the digits it starts with, and the assignment scan would not catch it as prose.
 slots_tree
 slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo mac-studio=${WANT}oops/"
-expect "a malformed default is no default" 1 "$WORKER: SLOTS assignment states no 'mac-studio=<n>' default" -- "$CP" "$R"
+expect "a malformed default is no default" 1 "$WORKER: SLOTS assignment states 'mac-studio=${WANT}oops'" -- "$CP" "$R"
 # The value is read as the shell takes it, so a pair list with another box first still defaults.
 slots_tree
 slots_edit "$WORKER" "s|^SLOTS=.*|SLOTS=\"\${FLEET_BOX_CORRECTNESS_SLOTS-testbox=2 mac-studio=$WANT}\"|"
@@ -589,6 +589,21 @@ expect "an override whose blank is escaped states no default" 0 'mac-studio corr
 slots_tree
 printf ": <<'HD'\nSLOTS=mac-studio=%s\nHD\n" "$OTHER" >> "$R/$WORKER"
 expect "a SLOTS line inside a heredoc assigns nothing" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# A heredoc delimiter may be quoted with a backslash as well as with quotes.
+slots_tree
+printf 'cat <<\\HD\nSLOTS=mac-studio=%s\nHD\n' "$OTHER" >> "$R/$WORKER"
+expect "...however the heredoc delimiter is quoted" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+
+# Every mac-studio pair in the value is validated, not just the last recognizable one: the worker
+# refuses the whole spec on the first malformed pair, so a good duplicate behind it is unreachable.
+slots_tree
+slots_edit "$WORKER" 's|^SLOTS=.*|SLOTS="mac-studio=oops mac-studio=6"|'
+expect "a malformed pair is refused even with a valid one behind it" 1 "$WORKER: SLOTS assignment states 'mac-studio=oops'" -- "$CP" "$R"
+# ...and where every pair is valid, the last one for the box is the default, as the registry keeps.
+slots_tree
+slots_edit "$WORKER" "s|^SLOTS=.*|SLOTS=\"mac-studio=$OTHER mac-studio=$WANT\"|"
+expect "a box named twice takes its last count" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
 # The worker's own grammar: `box_correctness_slots` refuses a count below one, so a zero default
 # is a roster every mac-studio slot call dies on rather than a count the prompts could agree with.

@@ -577,7 +577,7 @@ slot_default() {
   awk "$SLOT_AWK_LIB"'
     # A heredoc body is data the script WRITES, not code it runs: this one hands workers their
     # briefs, and a column-zero `SLOTS=` inside one assigns nothing. Bodies are skipped whole.
-    BEGIN { hd = "<<-?[[:space:]]*[\"" sprintf("%c", 39) "]?[A-Za-z_][A-Za-z0-9_]*" }
+    BEGIN { hd = "<<-?[[:space:]]*[\"\\\\" sprintf("%c", 39) "]?[A-Za-z_][A-Za-z0-9_]*" }
     delim != "" {
       line = $0; if (dash) sub(/^\t+/, "", line)
       if (line == delim) delim = ""
@@ -586,7 +586,7 @@ slot_default() {
     match($0, hd) {
       tag = substr($0, RSTART, RLENGTH)
       dash = (substr(tag, 3, 1) == "-")
-      sub(/^<<-?[[:space:]]*/, "", tag); gsub(/["'"'"']/, "", tag)
+      sub(/^<<-?[[:space:]]*/, "", tag); gsub(/["'"'"'\\]/, "", tag)   # bare, quoted or backslashed
       delim = tag
     }
     # The LAST top-level assignment, which is the one the shell is left holding -- reading the
@@ -596,18 +596,22 @@ slot_default() {
       eq = index($0, "=")
       # The value as the shell would take it: the assignment word with its quoting removed.
       val = unquote(substr($0, eq + 1, word_end($0, eq) - eq))
-      # The count is a whole `<box>=<n>` token, bounded at BOTH ends -- `not-mac-studio=6` is
-      # another box, and `mac-studio=6oops` is a value the worker rejects, not a default of six.
-      # The value is an expression here, not a literal pair list (the roster default reaches it
-      # through `… || echo mac-studio=6`), so the boundary is what the token ends against: `)` and
-      # `}` close it, a letter or digit means the count was never a number.
-      last = ""; rest = val; off = 0
-      while (match(rest, /(^|[^a-z0-9-])mac-studio=[0-9]+/)) {
+      # EVERY mac-studio pair in the value, since `box_correctness_slots` validates the pairs in
+      # order and refuses the whole spec on the first malformed one -- a good pair standing after
+      # a bad one is never reached. The last VALID one is the default, since the registry dict
+      # keeps the last value for a box named twice (a note in fleet-worker.sh). The value is an
+      # expression here rather than a literal pair list (the roster default reaches it through
+      # `… || echo mac-studio=6`), so a count ends at a blank or at the `)` and `}` closing that
+      # expression; anything else in it means the pair was never `<box>=<n>`.
+      last = ""; bad = ""; rest = val
+      while (match(rest, /(^|[^a-z0-9-])mac-studio=[^[:space:])}]*/)) {
         m = substr(rest, RSTART, RLENGTH)
-        after = substr(rest, RSTART + RLENGTH, 1)
-        last = (after ~ /^[A-Za-z0-9_-]$/) ? "" : substr(m, index(m, "mac-studio=") + 11)
+        sub(/^[^m]/, "", m)                      # the boundary character, if the match took one
+        count = substr(m, 12)
+        if (count ~ /^[0-9]+$/) last = count; else if (bad == "") bad = m
         rest = substr(rest, RSTART + RLENGTH)
       }
+      if (bad != "") last = "!" bad
     }
     END { print last }
   ' "$1"
@@ -622,6 +626,9 @@ check_slots() {
   # the script no longer has; from the LAST such assignment, which is the one the shell keeps.
   default=$(slot_default "$ROOT/$SLOT_SCRIPT")
   case "$default" in
+    # A pair the worker refuses outright, so nothing downstream of it is reached -- including a
+    # well-formed duplicate later in the same spec.
+    '!'*) ko "$SLOT_SCRIPT" "SLOTS assignment states '${default#\!}', which is not <box>=<positive n>"; return 0 ;;
     *[!0-9]* | '') ko "$SLOT_SCRIPT" "SLOTS assignment states no 'mac-studio=<n>' default"; return 0 ;;
     # The worker's own grammar: `box_correctness_slots` refuses a pair whose count is below one,
     # so a zero default is a roster every mac-studio slot call dies on, not a count to agree with.
