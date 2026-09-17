@@ -340,8 +340,10 @@ backends on the WSL boxes), say which of the three step-1 outcomes applied: woke
 
 Print a short summary: one line per unit (machine/backend, outcome, duration), preceded by a line
 on what step 1 did if any box needed waking. Open with step 0's drift verdict, in one line when
-everything is in sync and with the diff when it is not (plus the branch, the `rev-list` counts and any dirty `routines/`
-path when the checkout is not canonical, or the fetch's error if that comparison could not be made) — a check whose silence and whose absence look alike is not a check. Then either "no change since the last sweep" or the
+everything is in sync and with the diff when it is not (plus the branch, the `rev-list` counts and every path the
+`status --porcelain` line printed when the checkout is not canonical — the sync script's own path
+included, which no sync diff would show — or the fetch's error if that comparison could not be made,
+and any `RETIRED, but still installed` warning with the two steps the script names for it) — a check whose silence and whose absence look alike is not a check. Then either "no change since the last sweep" or the
 specific new failures with the relevant log excerpt (the full log path is in the history row —
 quote a few lines, do not paste the whole thing). On a forced run, also include the skip-coverage
 `result:` line and every `FAIL:`/`POTENTIAL:` claim from today's report, plus the report path —
