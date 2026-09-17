@@ -866,7 +866,9 @@ check_drift_guard() {
     # arguments), an `=` (an assignment executes nothing), a `#` (how a guard gets disabled,
     # rather than by deleting it), a backtick (prose quoting a command), and anything following
     # the path (a `push`/`pull` argument writes, where the obligation is the status read).
-    matches "^ {4,}$want[[:space:]]*\$" "$(cat "$ROOT/$f")" \
+    # `${want}` braced: `$want[` reads as an array expansion to shellcheck (SC1087), and the
+    # `[` here opens the bracket expression, not a subscript.
+    matches "^ {4,}${want}[[:space:]]*\$" "$(cat "$ROOT/$f")" \
       || { ko "$f" "runs no $home/$SYNC_SCRIPT: an installed routine reads its own drift with an indented command line invoking THAT path in status mode (ludics-lite#199)"; bad=1; }
   done <<<"$(tr -s '[:space:]' '\n' <<<"$names")"
   [ "$bad" -ne 0 ] || ok "every routine $SYNC_SCRIPT installs runs it to read its own drift"
