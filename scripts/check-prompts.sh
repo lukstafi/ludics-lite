@@ -380,9 +380,12 @@ check_fixtures() {
 # than matching a number word inside one: `twenty-six on mac-studio` and `thirteen on mac-studio`
 # both state a count and are refused, while `done on mac-studio` states none and is passed over --
 # a suffix rule reads the first as `six`, the second as nothing at all, and the third as `done`.
-# A numeral is a word, or hyphenated words, from $NUMERALS. An ASSIGNMENT of the variable
-# (`FLEET_BOX_CORRECTNESS_SLOTS=mac-studio=2`, quoted or not) is skipped: a fixture configuring a
-# two-slot box states its own input, and claims nothing about the default. That last one is scoped to slot prose: both sides must be number words AND `slot`
+# A numeral is a word, or hyphenated words, from $NUMERALS. Text INSIDE an assignment of the
+# variable is skipped: a fixture configuring a two-slot box states its own input and claims nothing
+# about the default. Which text that is, is answered structurally rather than by looking back a
+# fixed distance -- the assignment word is walked from `…SLOTS=` to its first unquoted blank, so
+# `export FLEET_BOX_CORRECTNESS_SLOTS="testbox=2 mac-studio=2"` is inside it however many pairs
+# stand first. That last one is scoped to slot prose: both sides must be number words AND `slot`
 # must stand within $SLOT_CONTEXT characters, so an ordinary "one, not both" sentence elsewhere in
 # these long documents is not read as a slot declaration. Mentions are matched against the file
 # joined into one line, so a sentence that wraps reads like one that does not. A root without
@@ -428,10 +431,12 @@ slot_mentions() {
   RE_DIGIT="[^a-z0-9-]mac-studio=[^[:space:]\`\"$q),;]*" \
   RE_WORD="[^a-z0-9][a-z][a-z-]*[[:space:]]+on[[:space:]]+mac-studio" \
   RE_NOT="[^a-z0-9][a-z][a-z-]*, not[[:space:]]+[a-z][a-z-]*[^a-z0-9]" \
-  RE_ASSIGN="slots=[\`\"$q]?\$" \
   NUMERALS="$(printf '%s' " $NUMERALS " | tr -s '[:space:]' ' ')" \
-  CTX="$SLOT_CONTEXT" awk '
-    { text = text " " $0 }
+  CTX="$SLOT_CONTEXT" awk "$SLOT_AWK_LIB"'
+    # Each line is joined into one text, and masked alongside it: `a` marks a character inside an
+    # assignment of the variable, `.` one in prose. Position for position, so a mention is judged
+    # by where it stands rather than by what the 32 characters before it happen to spell.
+    { text = text " " $0; mask = mask "." assigned($0) }
     END {
       ctx = ENVIRON["CTX"]; lower = tolower(text)
       scan(ENVIRON["RE_DIGIT"], "digit")
@@ -453,11 +458,10 @@ slot_mentions() {
     function emit(kind, frag, at, len,   n, box, from, window) {
       if (kind == "digit") {
         # The box name starts where the match says it does, past the boundary character: the
-        # position of the name, not of the match, is what the lookback and the value hang off.
+        # position of the name, not of the match, is what the value and the mask hang off.
         box = at + index(frag, "mac-studio=") - 1
-        # `…SLOTS=mac-studio=2` is the variable being SET, not a statement of its default.
-        from = box - 32; if (from < 1) from = 1
-        if (match(substr(lower, from, box - from), ENVIRON["RE_ASSIGN"])) return
+        # The variable being SET, not a statement of its default.
+        if (substr(mask, box, 1) == "a") return
         n = substr(frag, index(frag, "mac-studio=") + 11)
         # Punctuation that closes the mention is punctuation, wherever Markdown puts it -- `6]`,
         # `6.`, `6:` state six. A suffix that is not punctuation still makes the value malformed.
@@ -477,6 +481,20 @@ slot_mentions() {
       sub(/^[^A-Za-z0-9]+/, "", frag); sub(/[^A-Za-z0-9]+$/, "", frag)
       print kind "\t" n "\t" frag
     }
+    # assigned <line>: <line> masked character for character -- `a` inside an assignment of the
+    # variable (from `…SLOTS=` through the end of the assignment word), `.` everywhere else.
+    function assigned(line,   m, low, rest, off, st, at, stop, i) {
+      m = ""; for (i = 1; i <= length(line); i++) m = m "."
+      low = tolower(line); rest = low; off = 0
+      while (match(rest, /(^|[^a-z0-9_])[a-z0-9_]*slots=/)) {
+        st = RSTART; at = off + st
+        stop = word_end(line, at + RLENGTH - 1)
+        for (i = at; i <= stop; i++) m = substr(m, 1, i - 1) "a" substr(m, i + 1)
+        off = at + RLENGTH - 1
+        rest = substr(rest, st + RLENGTH)
+      }
+      return m
+    }
     # numeral <word>: whether <word> is a count -- a word from the vocabulary, or hyphenated words
     # all of which are ("twenty-six"). An empty word is not one.
     function numeral(w,   parts, i, k) {
@@ -495,27 +513,58 @@ slot_mentions() {
   ' "$1"
 }
 
+# Shared by both readers below, so "where does the assigned value end" has one answer. A shell
+# word ends at the first UNQUOTED blank, which is why `SLOTS="testbox=2 mac-studio=6"` is one word
+# and not two: the blank between the pairs stands inside the quotes.
+SLOT_AWK_LIB='
+  # word_end <line> <from>: index of the last character of the word that starts after <from>.
+  function word_end(line, from,   i, c, q) {
+    q = ""; sq = sprintf("%c", 39)
+    for (i = from + 1; i <= length(line); i++) {
+      c = substr(line, i, 1)
+      if (q == "") {
+        if (c == "\"" || c == sq) { q = c; continue }
+        if (c == " " || c == "\t") break
+      } else if (c == q) q = ""
+    }
+    return i - 1
+  }
+  # unquote <s>: <s> with the quote characters that grouped it removed.
+  function unquote(s,   out, i, c, q) {
+    out = ""; q = ""; sq = sprintf("%c", 39)
+    for (i = 1; i <= length(s); i++) {
+      c = substr(s, i, 1)
+      if (q == "") {
+        if (c == "\"" || c == sq) { q = c; continue }
+      } else if (c == q) { q = ""; continue }
+      out = out c
+    }
+    return out
+  }
+'
+
 # slot_default <file>: the `mac-studio=<n>` default inside the value assigned to SLOTS, or empty.
 slot_default() {
-  awk '
+  awk "$SLOT_AWK_LIB"'
     # The LAST top-level assignment, which is the one the shell is left holding -- reading the
     # first would report a default a later line has replaced (and `slot_mentions` skips that line
     # as an assignment, so nothing else would catch it either).
     /^SLOTS=/ {
-      v = substr($0, index($0, "=") + 1); q = ""; val = ""
-      for (i = 1; i <= length(v); i++) {
-        c = substr(v, i, 1)
-        if (q == "") {
-          if (c == "\"" || c == "'"'"'") { q = c; continue }
-          if (c == " " || c == "\t") break          # the assignment word ends here
-        } else if (c == q) { q = ""; continue }
-        val = val c
+      eq = index($0, "=")
+      # The value as the shell would take it: the assignment word with its quoting removed.
+      val = unquote(substr($0, eq + 1, word_end($0, eq) - eq))
+      # The count is a whole `<box>=<n>` token, bounded at BOTH ends -- `not-mac-studio=6` is
+      # another box, and `mac-studio=6oops` is a value the worker rejects, not a default of six.
+      # The value is an expression here, not a literal pair list (the roster default reaches it
+      # through `… || echo mac-studio=6`), so the boundary is what the token ends against: `)` and
+      # `}` close it, a letter or digit means the count was never a number.
+      last = ""; rest = val; off = 0
+      while (match(rest, /(^|[^a-z0-9-])mac-studio=[0-9]+/)) {
+        m = substr(rest, RSTART, RLENGTH)
+        after = substr(rest, RSTART + RLENGTH, 1)
+        last = (after ~ /^[A-Za-z0-9_-]$/) ? "" : substr(m, index(m, "mac-studio=") + 11)
+        rest = substr(rest, RSTART + RLENGTH)
       }
-      # At a token boundary: `not-mac-studio=6` is another box, and the roster has no mac-studio.
-      if (match(val, /(^|[^a-z0-9-])mac-studio=[0-9]+/)) {
-        m = substr(val, RSTART, RLENGTH)         # the boundary character may lead it
-        last = substr(m, index(m, "mac-studio=") + 11)
-      } else last = ""
     }
     END { print last }
   ' "$1"

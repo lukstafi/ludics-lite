@@ -548,6 +548,15 @@ out=$("$CP" "$R" 2>&1); rc=$?
 slots_tree
 slots_edit "$WORKER" 's/^SLOTS=.*/SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-}" # old mac-studio=6/'
 expect "a default left only in a trailing comment is no default" 1 "$WORKER: SLOTS assignment states no 'mac-studio=<n>' default" -- "$CP" "$R"
+# ...and the default token is bounded at BOTH ends: a count the worker would reject is not a
+# default of the digits it starts with, and the assignment scan would not catch it as prose.
+slots_tree
+slots_edit "$WORKER" "s/echo mac-studio=$WANT/echo mac-studio=${WANT}oops/"
+expect "a malformed default is no default" 1 "$WORKER: SLOTS assignment states no 'mac-studio=<n>' default" -- "$CP" "$R"
+# The value is read as the shell takes it, so a pair list with another box first still defaults.
+slots_tree
+slots_edit "$WORKER" "s|^SLOTS=.*|SLOTS=\"\${FLEET_BOX_CORRECTNESS_SLOTS-testbox=2 mac-studio=$WANT}\"|"
+expect "a default behind another box's pair is still the default" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
 
 # An assignment of the variable is an input, not a claim about the default -- a fixture that
 # configures a two-slot box says nothing about what an unconfigured box gets.
@@ -557,6 +566,21 @@ expect "an override in front of a command states no default" 0 'mac-studio corre
 slots_tree
 printf '%s\n' 'export FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=2"' >> "$R/$WORKER"
 expect "...and a quoted override states none either" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+# The variable takes `<box>=<n>` PAIRS, so another box may legitimately stand first: what makes a
+# mention an assignment is standing inside the assignment word, not what the characters before it
+# happen to spell.
+slots_tree
+printf '%s\n' 'export FLEET_BOX_CORRECTNESS_SLOTS="testbox=2 mac-studio=2"' >> "$R/$WORKER"
+expect "...and one behind another box's pair states none either" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+slots_tree
+printf '\n    FLEET_BOX_CORRECTNESS_SLOTS="rog-nv-wsl=3 mac-studio=2" fleet-worker.sh ls\n' \
+  >> "$R/issue-wave/references/executions.md"
+expect "...and so does one in a document's example command" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+# Positionally, though: prose after an assignment on the same line is still prose.
+slots_tree
+printf '\nRun FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=2" to halve it; mac-studio=%s is not the default.\n' \
+  "$OTHER" >> "$R/README.md"
+expect "a count beside an assignment on one line is still judged" 1 "README.md: states 'mac-studio=$OTHER'" -- "$CP" "$R"
 
 # A path with a space in it used to split into words, and a read of a nonexistent path increments
 # nothing: the file was skipped silently, under a clean pass.
