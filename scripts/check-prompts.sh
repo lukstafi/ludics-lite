@@ -769,6 +769,18 @@ check_slots() {
   # reads of nonexistent paths increment nothing -- the file would be skipped under a clean pass.
   while IFS= read -r f; do
     [ -n "$f" ] || continue
+    # A file that cannot state the count is skipped before the heavy scan, rather than joined and
+    # walked to be found silent. The filter is exactly equivalent: BOTH mention shapes
+    # `slot_mentions` reads -- the `mac-studio=<n>` digit form and the `<numerals> on mac-studio`
+    # word form -- contain the literal string `mac-studio`, so a file without it anywhere states
+    # no count in either. The word form may WRAP across a line, and the scan joins the lines to
+    # read it; `mac-studio` itself is never what the wrap splits (it is one word, and the blank
+    # the scan restores stands between words), so a line-based grep still finds it. Judged on
+    # grep's OUTPUT, never on a `grep -q` pipeline's status, for the reason `matches` gives: -q
+    # stops at the first match, the producer then dies of SIGPIPE, and under pipefail the result
+    # would invert on a large file. -m1 is grep's own early exit reading the file directly, with
+    # no producer to kill.
+    [ -n "$(grep -iFm1 -e mac-studio -- "$ROOT/$f")" ] || continue
     mentions=$(slot_mentions "$ROOT/$f")
     [ -n "$mentions" ] || continue
     stated="$stated$f "
