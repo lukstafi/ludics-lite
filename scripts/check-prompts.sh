@@ -780,7 +780,17 @@ check_slots() {
     # stops at the first match, the producer then dies of SIGPIPE, and under pipefail the result
     # would invert on a large file. -m1 is grep's own early exit reading the file directly, with
     # no producer to kill.
-    [ -n "$(grep -iFm1 -e mac-studio -- "$ROOT/$f")" ] || continue
+    #
+    # -a and -o are what keep that equivalence true of the OUTPUT rather than only of the match.
+    # A NUL anywhere in the file makes grep call it binary, and the three greps this script runs
+    # under then disagree in a way that would decide the check: BSD grep prints `Binary file …
+    # matches` on STDOUT (non-empty, so the file is scanned), GNU grep 3.5+ prints that same line
+    # on STDERR and leaves stdout empty, and ugrep reports no match at all -- so the same tree
+    # would be held on macOS and let through on the Linux CI. -a reads the file as the text every
+    # other reader here takes it for, and -o then prints the MATCH rather than its line, so a NUL
+    # on the matching line cannot ride into the command substitution (where bash drops it with a
+    # warning on stderr) and the capture stays one word however long the line is.
+    [ -n "$(grep -aiFom1 -e mac-studio -- "$ROOT/$f")" ] || continue
     mentions=$(slot_mentions "$ROOT/$f")
     [ -n "$mentions" ] || continue
     stated="$stated$f "
