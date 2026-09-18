@@ -654,12 +654,26 @@ for f in "${files[@]}"; do
         # unblanked copy of every declaration line -- names from one spelling and values from the
         # other, since `readonly BASE='$(cd /tmp && pwd -P)'` is literal text that must not read as a
         # resolution. That is recorded in the PR rather than built here.
-        if (l !~ /^[ \t]*((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)?"?[A-Za-z_][A-Za-z0-9_]*\+?=/) continue
+        # A declaration'"'"'s operands are `[name[=value] ...]`, so the FIRST of them may carry no
+        # value at all: `readonly AUX BASE=${TMPDIR:-/tmp}` really does overwrite BASE, and a filter
+        # demanding an `=` on the first operand skipped the whole line -- taking the list scan below
+        # with it, which is the half that would have caught it (ludics-lite#252 review round 12).
+        # Leading bare names are stepped over here so the first ASSIGNING operand is the one read.
+        # Registering those bare names as bindings in their own scope is a separate matter and is
+        # not done: it is the same question for `local BASE` alone, which main does not read either.
         nm = l
         sub(/^[ \t]*/, "", nm)
-        sub(/^((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)/, "", nm)
+        if (nm ~ /^((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)/) {
+          sub(/^((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)/, "", nm)
+          while (nm ~ /^"?[A-Za-z_][A-Za-z0-9_]*[ \t]/) {
+            sub(/^"?[A-Za-z_][A-Za-z0-9_]*[ \t]+/, "", nm)
+            barelead[i] = 1
+          }
+        }
         sub(/^"/, "", nm)          # `readonly "BASE=/var"` names BASE
+        if (nm !~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) continue
         val = nm
+        append[i] = (nm ~ /^[A-Za-z_][A-Za-z0-9_]*\+=/)
         sub(/=.*$/, "", nm)
         sub(/\+$/, "", nm)          # `BASE+=v` names BASE, not `BASE+`
         sub(/^[^=]*=/, "", val)
@@ -757,7 +771,21 @@ for f in "${files[@]}"; do
           # means the line can take a name away and never hand one over, which is round 4'"'"'s
           # asymmetry again and costs only a `declare -r BASE=$(... pwd -P)` that has to be written
           # without the flag to certify.
-          if (depth[i] == 0 && code[i] !~ /^[ \t]*readonly([ \t]|$)/ &&
+          # An APPEND certifies nothing either, and for the plainest reason of all: it concatenates
+          # onto whatever the name already held, so its text is only the SUFFIX. Round 9 taught the
+          # first operand to read `+=` and then let `value_resolves` judge the line by that suffix
+          # alone -- so an inherited BASE naming a symlink, plus `BASE+=$(CDPATH= cd /tmp && pwd
+          # -P)`, certified a path that still traverses it (ludics-lite#252 review round 12, and the
+          # first genuine LOOSENING this branch produced: main refuses that file). An append can
+          # take a name away and never hand one over, like an option-bearing line beside it.
+          # ...nor does a line whose first operand was BARE. Stepping over `readonly AUX
+          # BASE=${TMPDIR:-/tmp}` to reach the assignment behind it is what lets that line
+          # disqualify; letting the same step CERTIFY would read a name the guard reached only by
+          # skipping something it does not model -- and the generated corpus caught exactly that,
+          # eight shapes of `declare AUX BASE=$(... pwd -P)` passing where main skipped the line
+          # whole. Stepping over is for taking away, like everything else the keyword buys here.
+          if (depth[i] == 0 && !append[i] && !barelead[i] &&
+              code[i] !~ /^[ \t]*readonly([ \t]|$)/ &&
               code[i] !~ /^[ \t]*(local|declare|typeset|export|readonly)[ \t]+[-+]/) seen[key] = 1
           # The operand list is disqualified FIRST, ahead of every branch below -- two of which
           # `continue` out of the iteration. A first operand that captures a `mktemp -d` under a
@@ -774,7 +802,7 @@ for f in "${files[@]}"; do
             if (!answers_with_mktemp(head_of(code[i]))) { bad_assign[key] = 1; continue }
             if (scope_resolved(i, lead_var(template_of(head_of(code[i])))) || mkok[i]) continue
             bad_assign[key] = 1
-          } else if (!value_resolves(av[i], funcof[i]) ||
+          } else if (!value_resolves(av[i], funcof[i]) || append[i] ||
                      code[i] ~ /^[ \t]*(local|declare|typeset|export|readonly)[ \t]+[-+]/) {
             # ...the option-bearing half of which is round 8'"'"'s rule finished. Round 8 stopped such a
             # line CERTIFYING, on the ground that an option decides whether the mode assigns at all;

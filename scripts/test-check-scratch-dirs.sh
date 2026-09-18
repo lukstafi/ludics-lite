@@ -555,6 +555,43 @@ EOF
 expect "a double-quoted operand is read in the list too, not only first" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_quoted_list_operand.sh"
 
+# Round 12 of #252, and the one genuine LOOSENING this branch produced -- main refuses this file.
+# An APPEND concatenates onto whatever the name already held, so its text is only the SUFFIX; round
+# 9 taught the first operand to read `+=` and then let the value judge the line by that suffix
+# alone. With BASE inherited from the environment naming a symlink, the certified path still
+# traverses it. An append can take a name away and never hand one over.
+probe bad_append_certifies <<'EOF'
+BASE+=$(CDPATH= cd /tmp && pwd -P)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an append never certifies, since its text is only the suffix" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_append_certifies.sh"
+
+# ...and a declaration's operands are `[name[=value] ...]`, so the FIRST may carry no value at all.
+# A filter demanding an `=` on it skipped the whole line -- taking the list scan with it, which is
+# the half that would have caught the assignment behind the bare name.
+probe bad_bare_leading_operand <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly AUX BASE=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a bare first operand does not hide the assignment behind it" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_bare_leading_operand.sh"
+
+# ...but stepping over that bare name is for taking away only. Letting it CERTIFY would read a root
+# the guard reached by skipping something it does not model, and the generated corpus caught
+# exactly that: eight shapes of `declare AUX BASE=$(... pwd -P)` passing where main skipped the
+# line whole.
+probe bad_bare_leading_does_not_certify <<'EOF'
+declare AUX BASE=$(CDPATH= cd /tmp && pwd -P)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "stepping over a bare operand disqualifies but never certifies" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_bare_leading_does_not_certify.sh"
+
 # ...while the quoted text the blanking exists to protect is still data: a usage string naming the
 # idiom is not an allocation, whatever keyword precedes it.
 probe safe_quoted_usage_after_readonly <<'EOF'
