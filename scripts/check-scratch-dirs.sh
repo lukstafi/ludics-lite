@@ -654,23 +654,30 @@ for f in "${files[@]}"; do
         # unblanked copy of every declaration line -- names from one spelling and values from the
         # other, since `readonly BASE='$(cd /tmp && pwd -P)'` is literal text that must not read as a
         # resolution. That is recorded in the PR rather than built here.
-        # A declaration'"'"'s operands are `[name[=value] ...]`, so the FIRST of them may carry no
-        # value at all: `readonly AUX BASE=${TMPDIR:-/tmp}` really does overwrite BASE, and a filter
-        # demanding an `=` on the first operand skipped the whole line -- taking the list scan below
-        # with it, which is the half that would have caught it (ludics-lite#252 review round 12).
-        # Leading bare names are stepped over here so the first ASSIGNING operand is the one read.
-        # Registering those bare names as bindings in their own scope is a separate matter and is
-        # not done: it is the same question for `local BASE` alone, which main does not read either.
+        # A declaration keyword may carry options and a `--`, and its operand may be double
+        # quoted: quote removal happens before the builtin sees it, so `readonly "BASE=/var"`
+        # assigns BASE. The quote is read ONLY behind a keyword. Without one, `"BASE=$(CDPATH= cd
+        # /tmp && pwd -P)"` is a quoted WORD, which bash runs as a command name and which assigns
+        # nothing -- reading it as an assignment certified a root that was never set
+        # (ludics-lite#252 review round 14).
+        #
+        # ONE OPERAND, which is what main reads too. A declaration takes a list, and rounds 6 to 14
+        # spent six of them trying to read it: the scan had to be hoisted above an early `continue`,
+        # taught `+=`, taught scope, taught quotes -- and then read past a `;` into the next command
+        # (round 13), matched assignment-shaped text inside a quoted VALUE, and treated the
+        # assignment prefix of `A=x BASE=/var true` as a persistent declaration (round 14), each of
+        # those refusing a correct file that main accepts. Reading a list correctly needs shell word
+        # splitting, and this file has said from its first round what that becomes. The list was
+        # never the reported defect either: main reads only the first operand for EVERY keyword, so
+        # `readonly AUX=x BASE=...` is a gap this PR inherited rather than opened. It goes to
+        # ludics-lite#258 with the rest of the grammar, and what stays here is the single operand
+        # the bug was about.
         nm = l
         sub(/^[ \t]*/, "", nm)
         if (nm ~ /^((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)/) {
           sub(/^((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)/, "", nm)
-          while (nm ~ /^"?[A-Za-z_][A-Za-z0-9_]*[ \t]/) {
-            sub(/^"?[A-Za-z_][A-Za-z0-9_]*[ \t]+/, "", nm)
-            barelead[i] = 1
-          }
+          sub(/^"/, "", nm)        # `readonly "BASE=/var"` names BASE; only behind the keyword
         }
-        sub(/^"/, "", nm)          # `readonly "BASE=/var"` names BASE
         if (nm !~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) continue
         val = nm
         append[i] = (nm ~ /^[A-Za-z_][A-Za-z0-9_]*\+=/)
@@ -688,24 +695,6 @@ for f in "${files[@]}"; do
         # mis-tokenized operand can do is refuse. The line has already had its single-quoted runs
         # blanked, so a `=` inside `'"'"'...'"'"'` is gone; a double-quoted one still reads as an operand,
         # which is the conservative direction.
-        # ...and the list ENDS where the command does. `export AUX=x; BASE=$(CDPATH= cd /tmp && pwd
-        # -P)` is two commands, and reading past the `;` took the second one'"'"'s assignment for a third
-        # operand -- disqualifying a BASE the line had just resolved, and refusing a correct file
-        # that main accepts (ludics-lite#252 review round 13). This is the one direction the
-        # `loosened=0` check cannot see: it counts refusals main does not make, and says nothing
-        # about whether they are deserved. Truncating at the first `;`, `&` or `|` can only end the
-        # scan EARLY -- a separator inside a double-quoted value stops it short of real operands --
-        # which loses a disqualification and never invents one.
-        rest = val
-        sub(/[;&|].*$/, "", rest)
-        while (match(rest, /[ \t]+"?[A-Za-z_][A-Za-z0-9_]*\+?=/)) {
-          ex = substr(rest, RSTART, RLENGTH)
-          gsub(/^[ \t]+/, "", ex)
-          sub(/^"/, "", ex)          # `readonly AUX=x "BASE=/var"` names BASE here too
-          sub(/\+?=$/, "", ex)
-          more[i] = more[i] " " ex
-          rest = substr(rest, RSTART + RLENGTH)
-        }
       }
       for (i = 1; i <= last; i++) if (i in an) mkok[i] = resolved_below(i)
       # WHICH SCOPE a name is resolved in, rather than one name-global verdict. A short name is
@@ -735,14 +724,7 @@ for f in "${files[@]}"; do
       # the function without one, so a lookup inside it fell back to the resolved GLOBAL and an
       # allocation under the shadowing local passed (ludics-lite#252 review round 9). The
       # single-operand `local BASE=...` was refused all along; this makes the list agree with it.
-      for (i = 1; i <= last; i++) if (i in an) {
-        assigns[funcof[i] SUBSEP an[i]] = 1; nassign++
-        if (i in more) {
-          nex = split(more[i], exn, / /)
-          for (xi = 1; xi <= nex; xi++)
-            if (exn[xi] != "") { assigns[funcof[i] SUBSEP exn[xi]] = 1; nassign++ }
-        }
-      }
+      for (i = 1; i <= last; i++) if (i in an) { assigns[funcof[i] SUBSEP an[i]] = 1; nassign++ }
       # This block is entered exactly once: awk reads the file twice, but the pass-1 rule ends in
       # `next`, so `FNR == 1` is reached only on pass 2, with a complete `last`. The clear is not
       # there to undo a previous entry -- there is none -- it keeps the precondition of the loop
@@ -793,20 +775,9 @@ for f in "${files[@]}"; do
           # skipping something it does not model -- and the generated corpus caught exactly that,
           # eight shapes of `declare AUX BASE=$(... pwd -P)` passing where main skipped the line
           # whole. Stepping over is for taking away, like everything else the keyword buys here.
-          if (depth[i] == 0 && !append[i] && !barelead[i] &&
+          if (depth[i] == 0 && !append[i] &&
               code[i] !~ /^[ \t]*readonly([ \t]|$)/ &&
               code[i] !~ /^[ \t]*(local|declare|typeset|export|readonly)[ \t]+[-+]/) seen[key] = 1
-          # The operand list is disqualified FIRST, ahead of every branch below -- two of which
-          # `continue` out of the iteration. A first operand that captures a `mktemp -d` under a
-          # resolved root is one of them, and `export AUX=$(mktemp -d "$OTHER/a.XXXXXX")
-          # ROOT=${TMPDIR:-/tmp}` then left ROOT certified, because the scan that should have
-          # disqualified it sat after the `continue` this line takes (ludics-lite#252 review round
-          # 7). What the first operand is worth has nothing to do with what the later ones assign.
-          if (i in more) {
-            nex = split(more[i], exn, / /)
-            for (xi = 1; xi <= nex; xi++)
-              if (exn[xi] != "") bad_assign[funcof[i] SUBSEP exn[xi]] = 1
-          }
           if (has_mktemp_d(head_of(code[i]))) {
             if (!answers_with_mktemp(head_of(code[i]))) { bad_assign[key] = 1; continue }
             if (scope_resolved(i, lead_var(template_of(head_of(code[i])))) || mkok[i]) continue

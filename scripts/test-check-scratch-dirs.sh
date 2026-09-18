@@ -345,46 +345,6 @@ EOF
 expect "...which is what export already did, here as the control for that claim" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_subshell_reassignment_plain.sh"
 
-# Round 6 of #252: `readonly NAME=v` takes a LIST, and reading only the first operand left the
-# second invisible -- this change's own defect, one operand along. `readonly AUX=x
-# BASE=${TMPDIR:-/tmp}` really does overwrite and freeze BASE, and the file below passed with a
-# certified BASE while printing a `/var/...` path at runtime. Every declaration keyword takes the
-# list, so all of them are read rather than `readonly` singled out; the `export` spelling is here
-# as the control for that, and it is a shape main passes too.
-probe bad_multi_operand_readonly <<'EOF'
-BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
-readonly AUX=x BASE=${TMPDIR:-/tmp}
-TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
-echo "$TMP"
-EOF
-expect "a later operand of a readonly list disqualifies its own name" 1 "$REFUSAL" -- \
-  "$CS" "$TMP/bad_multi_operand_readonly.sh"
-
-probe bad_multi_operand_export <<'EOF'
-BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
-export AUX=x BASE=${TMPDIR:-/tmp}
-TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
-echo "$TMP"
-EOF
-expect "...and so does one of an export list, which is the same rule not singling readonly out" 1 \
-  "$REFUSAL" -- "$CS" "$TMP/bad_multi_operand_export.sh"
-
-# ...while an operand list that touches no root is ordinary code and stays passing. The repository
-# writes `local a="$1" b="$2"` some forty times, and a rule that disqualified on sight of a list
-# rather than on the NAMES in it would have refused a great deal of correct shell.
-probe safe_multi_operand_unrelated <<'EOF'
-BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
-helper() {
-  local checkout="$1" value="$2" rest
-  rest="$checkout$value"
-  echo "$rest"
-}
-TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
-echo "$TMP"
-EOF
-expect "an operand list that names no root is left alone" 0 "$CLEAN" -- \
-  "$CS" "$TMP/safe_multi_operand_unrelated.sh"
-
 # Round 7 of #252: the keyword's own OPTIONS and the `--` terminator sit between it and the first
 # operand. `readonly -- BASE=...` and `declare -r BASE=...` are ordinary declarations that really do
 # overwrite BASE, and a pattern demanding the name immediately after the keyword skipped the whole
@@ -407,19 +367,6 @@ echo "$TMP"
 EOF
 expect "an attribute flag does not hide the assignment behind it" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_declare_r.sh"
-
-# ...and the operand list is disqualified BEFORE the branches that `continue`. A first operand that
-# captures a `mktemp -d` under a resolved root is one of them, and the later operand was left
-# certified because the scan sat after that `continue`.
-probe bad_list_after_capture <<'EOF'
-OTHER=$(CDPATH= cd /tmp && pwd -P) || exit 1
-ROOT=$(CDPATH= cd /tmp && pwd -P) || exit 1
-export AUX=$(mktemp -d "$OTHER/a.XXXXXX") ROOT=${TMPDIR:-/tmp}
-TMP=$(mktemp -d "$ROOT/x.XXXXXX") || exit 1
-echo "$TMP"
-EOF
-expect "a later operand is disqualified even when the first one captured cleanly" 1 "$REFUSAL" -- \
-  "$CS" "$TMP/bad_list_after_capture.sh"
 
 # ...while an option list with no assignment on it is not an assignment. `declare -p` and
 # `readonly -f name` name no variable value, and reading them as one would refuse working code.
@@ -484,35 +431,6 @@ EOF
 expect "an append in the first operand disqualifies the root it rewrites" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_append_first_operand.sh"
 
-# ...and a later operand is an assignment IN ITS SCOPE, not merely a bad one. `assigns` is what
-# `scope_resolved` reads to decide whether a function has its own binding for a name; a later
-# operand that was only ever marked bad left the function without one, so a lookup inside it fell
-# back to the resolved GLOBAL and the allocation under the shadowing local passed. The
-# single-operand spelling below was refused all along, and is the control for that.
-probe bad_local_list_shadow <<'EOF'
-BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
-helper() {
-  local AUX=x BASE=${TMPDIR:-/tmp}
-  TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
-  echo "$AUX $TMP"
-}
-helper
-EOF
-expect "a later operand shadows in its own scope, as the single-operand form already did" 1 \
-  "$REFUSAL" -- "$CS" "$TMP/bad_local_list_shadow.sh"
-
-probe bad_local_single_shadow <<'EOF'
-BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
-helper() {
-  local BASE=${TMPDIR:-/tmp}
-  TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
-  echo "$TMP"
-}
-helper
-EOF
-expect "...the single-operand spelling, which is the control for that claim" 1 "$REFUSAL" -- \
-  "$CS" "$TMP/bad_local_single_shadow.sh"
-
 # Round 10 of #252: an option-bearing assignment is purely DISQUALIFYING, which is round 8's rule
 # finished. Round 8 stopped such a line certifying, because an option decides whether the mode
 # assigns at all; the same ignorance says it cannot be trusted to leave a resolved root alone,
@@ -543,18 +461,6 @@ EOF
 expect "a double-quoted operand is the same assignment" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_quoted_operand.sh"
 
-# Round 11 of #252: ...in every operand position, not only the first. Round 10 taught the first
-# operand to read a double quote and left the list scan behind it, so whether the quote hid the
-# assignment depended on WHICH operand carried it -- the same split round 9 found for `+=`.
-probe bad_quoted_list_operand <<'EOF'
-BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
-readonly AUX=x "BASE=/var"
-TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
-echo "$TMP"
-EOF
-expect "a double-quoted operand is read in the list too, not only first" 1 "$REFUSAL" -- \
-  "$CS" "$TMP/bad_quoted_list_operand.sh"
-
 # Round 12 of #252, and the one genuine LOOSENING this branch produced -- main refuses this file.
 # An APPEND concatenates onto whatever the name already held, so its text is only the SUFFIX; round
 # 9 taught the first operand to read `+=` and then let the value judge the line by that suffix
@@ -568,35 +474,13 @@ EOF
 expect "an append never certifies, since its text is only the suffix" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_append_certifies.sh"
 
-# ...and a declaration's operands are `[name[=value] ...]`, so the FIRST may carry no value at all.
-# A filter demanding an `=` on it skipped the whole line -- taking the list scan with it, which is
-# the half that would have caught the assignment behind the bare name.
-probe bad_bare_leading_operand <<'EOF'
-BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
-readonly AUX BASE=${TMPDIR:-/tmp}
-TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
-echo "$TMP"
-EOF
-expect "a bare first operand does not hide the assignment behind it" 1 "$REFUSAL" -- \
-  "$CS" "$TMP/bad_bare_leading_operand.sh"
-
-# ...but stepping over that bare name is for taking away only. Letting it CERTIFY would read a root
-# the guard reached by skipping something it does not model, and the generated corpus caught
-# exactly that: eight shapes of `declare AUX BASE=$(... pwd -P)` passing where main skipped the
-# line whole.
-probe bad_bare_leading_does_not_certify <<'EOF'
-declare AUX BASE=$(CDPATH= cd /tmp && pwd -P)
-TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
-echo "$TMP"
-EOF
-expect "stepping over a bare operand disqualifies but never certifies" 1 "$REFUSAL" -- \
-  "$CS" "$TMP/bad_bare_leading_does_not_certify.sh"
-
-# Round 13 of #252: the operand list ENDS where the command does. `export AUX=x; BASE=$(CDPATH= cd
-# /tmp && pwd -P)` is two commands, and reading past the `;` took the second one's assignment for a
-# third operand -- disqualifying a BASE the line had just resolved, and refusing a correct file that
-# main accepts. This is the one direction the `loosened=0` harness cannot see: it counts refusals
-# main does not make, and says nothing about whether they are deserved.
+# Rounds 13-14 of #252: the shapes that ended the operand-list scan. Reading a declaration's operand
+# LIST needs shell word splitting, and six rounds of trying produced, in both directions: a scan
+# that read past a `;` into the next command, one that matched assignment-shaped text inside a
+# quoted value, and one that took the assignment prefix of `A=x BASE=/var true` -- which bash scopes
+# to that one command -- for a persistent declaration. Each refused a correct file. The scan is
+# gone; only the first operand is read, which is what main reads too. These three are the
+# regression tests for its absence, and the list gap itself is filed in ludics-lite#258.
 probe safe_separator_ends_operand_list <<'EOF'
 BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
 export AUX=x; BASE=$(CDPATH= cd /tmp && pwd -P)
@@ -605,6 +489,34 @@ echo "$TMP"
 EOF
 expect "a command after a separator is not another operand" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_separator_ends_operand_list.sh"
+
+probe safe_assignment_shaped_text_in_value <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly AUX="use BASE=/var"
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "assignment-shaped text inside a quoted value is not an operand" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_assignment_shaped_text_in_value.sh"
+
+probe safe_command_env_prefix <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+A=x BASE=/var true
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an assignment prefix is scoped to its command, not to the shell" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_command_env_prefix.sh"
+
+# ...and a quoted assignment-looking WORD with no declaration keyword is a command name, not an
+# assignment: bash runs it and assigns nothing, so certifying from it invented a root.
+probe bad_quoted_word_is_not_assignment <<'EOF'
+"BASE=$(CDPATH= cd /tmp && pwd -P)"
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a quoted word without a keyword is a command, not an assignment" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_quoted_word_is_not_assignment.sh"
 
 # ...while the quoted text the blanking exists to protect is still data: a usage string naming the
 # idiom is not an allocation, whatever keyword precedes it.
