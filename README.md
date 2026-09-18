@@ -228,7 +228,12 @@ scripts/test-check-scratch-dirs.sh
 scripts/test-sync-routines.sh
 ```
 
-Three conventions travel with that list.
+Three conventions travel with that list. Each is held by a scanner that reads line shapes — a
+register lookup, a line regex — and not by a parser, so a green check says a line of the required
+shape is present and never that the thing it stands for is true: text crafted to carry the shape
+without the substance passes every one of them. That is the design (ludics-lite#75, where a table
+parser drew thirteen rounds of edge cases and was replaced by a scan), so the conventions below
+state what each check establishes rather than enumerate the shapes that would fool it.
 
 **A `test-*` name is a promise to run.** `check-prompts.sh`'s fixture check walks `scripts/test-*`,
 `*/scripts/test-*` and `*/hooks/test-*`, and of every `.sh`, `.py` or `.ps1` it finds there it
@@ -249,13 +254,12 @@ step that tests nothing.
 **Scratch directories have one house shape:** `VAR=$(mktemp -d …)`, then directly under it
 `VAR=$(CDPATH= cd "$VAR" && pwd -P)`, and the cleanup `trap` under that.
 `scripts/check-scratch-dirs.sh` has enforced the adjacency of those first two lines since
-ludics-lite#214. Like the jq guard below it, it is a scanner over line shapes and not an
-interpreter, so every rule here is a claim about how a line is written: it reads the next code line
-after the assignment and refuses anything that is not the resolution — which it knows by shape, the
-same name on the left and a `cd … && pwd -P` on the right, the `cd`'s own target unchecked — whether
-or not that line mentions the variable, and it asks for the same function and block depth, so a
-resolution inside a `then` arm is not adjacent either. Adjacency rather than a resolution somewhere
-below, because a line that already ran with the environment's spelling does not get the physical one
+ludics-lite#214, in the line-shaped way just described: it reads the next code line after the
+assignment and refuses anything that is not the resolution — which it knows by shape, the same name
+on the left and a `cd … && pwd -P` on the right, the `cd`'s own target unchecked — whether or not
+that line mentions the variable, and it asks for the same function and block depth, so a resolution
+inside a `then` arm is not adjacent either. Adjacency rather than a resolution somewhere below,
+because a line that already ran with the environment's spelling does not get the physical one
 retroactively. The rest of the shape it does not check. The `CDPATH=` prefix is optional to it — a
 bare `cd "$VAR" && pwd -P` passes, and two suites here still spell it that way — and is convention
 against a nonempty `CDPATH`, under which a `cd` to a relative target can print the directory it
