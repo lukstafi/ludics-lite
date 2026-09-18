@@ -644,10 +644,21 @@ for f in "${files[@]}"; do
         # The later-operand scan already read `+=`; the first operand did not, which made the line
         # an assignment or not depending on WHICH operand carried the append (ludics-lite#252 review
         # round 9).
-        if (l !~ /^[ \t]*((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)?[A-Za-z_][A-Za-z0-9_]*\+?=/) continue
+        # A DOUBLE-quoted operand is the same assignment: quote removal happens before the builtin
+        # sees it, so `readonly "BASE=/var"` really does assign BASE (ludics-lite#252 review round
+        # 10). The quote is read here, where it only ever adds a name to disqualify; the capture and
+        # resolver patterns keep main'"'"'s shape, so it cannot make a line into a capture or a
+        # resolution. A SINGLE-quoted operand is a different matter and is not read: `blank_sq` has
+        # replaced its contents with `x` by the time this runs, which is what keeps a `mktemp -d`
+        # inside a usage string from being a call, and reading the name back would mean carrying an
+        # unblanked copy of every declaration line -- names from one spelling and values from the
+        # other, since `readonly BASE='$(cd /tmp && pwd -P)'` is literal text that must not read as a
+        # resolution. That is recorded in the PR rather than built here.
+        if (l !~ /^[ \t]*((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)?"?[A-Za-z_][A-Za-z0-9_]*\+?=/) continue
         nm = l
         sub(/^[ \t]*/, "", nm)
         sub(/^((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)/, "", nm)
+        sub(/^"/, "", nm)          # `readonly "BASE=/var"` names BASE
         val = nm
         sub(/=.*$/, "", nm)
         sub(/\+$/, "", nm)          # `BASE+=v` names BASE, not `BASE+`
@@ -762,7 +773,19 @@ for f in "${files[@]}"; do
             if (!answers_with_mktemp(head_of(code[i]))) { bad_assign[key] = 1; continue }
             if (scope_resolved(i, lead_var(template_of(head_of(code[i])))) || mkok[i]) continue
             bad_assign[key] = 1
-          } else if (!value_resolves(av[i], funcof[i])) {
+          } else if (!value_resolves(av[i], funcof[i]) ||
+                     code[i] ~ /^[ \t]*(local|declare|typeset|export|readonly)[ \t]+[-+]/) {
+            # ...the option-bearing half of which is round 8'"'"'s rule finished. Round 8 stopped such a
+            # line CERTIFYING, on the ground that an option decides whether the mode assigns at all;
+            # the same ignorance says it cannot be trusted to leave a resolved root alone, because
+            # an option also decides what the stored value IS. `declare -l BASE=$(cd /tmp/UPPER &&
+            # pwd -P)` has a value that resolves on its face and stores the lowercased spelling,
+            # which on a case-insensitive or symlinked path is the alias this guard exists to
+            # refuse (ludics-lite#252 review round 10; `-l` is bash 4+, so the Ubuntu leg of CI is
+            # where it bites, not the 3.2 one). `-u` and `-i` transform a value the same way. So an
+            # option-bearing assignment is purely disqualifying: it can take a name away and never
+            # hand one over, which is what round 8 said and only half implemented. The cost is the
+            # one round 8 already named -- a root declared with a flag has to drop it to certify.
             bad_assign[key] = 1
           }
         }

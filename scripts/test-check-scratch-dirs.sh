@@ -513,6 +513,47 @@ EOF
 expect "...the single-operand spelling, which is the control for that claim" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_local_single_shadow.sh"
 
+# Round 10 of #252: an option-bearing assignment is purely DISQUALIFYING, which is round 8's rule
+# finished. Round 8 stopped such a line certifying, because an option decides whether the mode
+# assigns at all; the same ignorance says it cannot be trusted to leave a resolved root alone,
+# because an option also decides what the stored value IS. `declare -l` lowercases it (bash 4+, so
+# the Ubuntu leg of CI is where this bites and not the 3.2 one), `-u` uppercases, `-i` makes it
+# arithmetic -- and a lowercased path on a case-insensitive or symlinked tree is exactly the alias
+# this guard refuses. The value resolves on its face, so `bad_assign` stayed clear and the root
+# above survived.
+probe bad_option_transforms_value <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+declare -l BASE=$(CDPATH= cd /tmp && pwd -P)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an option-bearing assignment disqualifies even when its value looks resolved" 1 \
+  "$REFUSAL" -- "$CS" "$TMP/bad_option_transforms_value.sh"
+
+# ...and a DOUBLE-quoted operand is the same assignment, since quote removal happens before the
+# builtin sees it. Read here, where it only ever adds a name to disqualify. (The single-quoted
+# spelling is NOT read -- `blank_sq` has replaced its contents with `x` by then, which is what keeps
+# a `mktemp -d` inside a usage string from being a call; see the PR body.)
+probe bad_quoted_operand <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly "BASE=/var"
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a double-quoted operand is the same assignment" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_quoted_operand.sh"
+
+# ...while the quoted text the blanking exists to protect is still data: a usage string naming the
+# idiom is not an allocation, whatever keyword precedes it.
+probe safe_quoted_usage_after_readonly <<'EOF'
+readonly USAGE='write it as TMP=$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX")'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$USAGE $TMP"
+EOF
+expect "a usage string in a readonly constant is still data" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_quoted_usage_after_readonly.sh"
+
 # Round 3 of #252: and the guard does NOT try to work out whether an earlier `readonly` is in
 # force, which is why these two pass. `readonly -f TMP` freezes a FUNCTION named TMP and leaves the
 # variable alone, and a freeze inside `( ... )` is gone when the subshell exits; both files run
