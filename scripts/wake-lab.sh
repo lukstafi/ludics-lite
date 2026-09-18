@@ -784,7 +784,9 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
     # Claim the record BEFORE spawning, with noclobber. Two `--hold` runs for one box would
     # otherwise both spawn a holder and the second write would erase the first pid, leaving a
     # holder nobody can unhold and a VM pinned until the box reboots.
-    rm -f "$f" 2>/dev/null
+    # ...and a marker from some earlier release goes with it: left in place it would mask the loss
+    # of the holder about to be spawned, which is the one thing this reporting exists to catch.
+    rm -f "$f" "${f%.pid}.releasing" 2>/dev/null
     if ! ( set -C; : > "$f" ) 2>/dev/null; then
       if [ -e "$f" ]; then
         echo "  wsl holder for $name is already being created by another run ($f is claimed); nothing was started"
@@ -906,8 +908,15 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
 release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (an already-dead
                  # holder is reported by setting HOLD_ANOMALY, which the caller turns into rc 2),
                  # always says what it did
-  local f=$HOLD_STATE_DIR/hold-$1.pid rec p d t sc
-  if [ ! -r "$f" ]; then echo "  no wsl holder recorded for $1"; return 0; fi
+  local f=$HOLD_STATE_DIR/hold-$1.pid rec p d t sc rel
+  # An unhold is not atomic: it kills the holder and then removes the record, and between those
+  # two it can be interrupted (or a second unhold can overlap it -- which the routine now invites,
+  # since it tells a run whose unhold has not come back to chase it). The record left behind then
+  # names a pid that IS dead, and without this marker the retry would read a deliberate release as
+  # a holder the lane lost and call valid results suspect. So intent is written down BEFORE the
+  # kill: whoever finds the record next can tell "an unhold ended this" from "this died".
+  rel=${f%.pid}.releasing
+  if [ ! -r "$f" ]; then rm -f "$rel"; echo "  no wsl holder recorded for $1"; return 0; fi
   rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
   read -r p d t sc <<<"${rec:-}"; : "$d" "$t"
   # The lock sidecar goes with the holder: it exits on its own once the holder is gone, and
@@ -922,8 +931,13 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     # Killing the local client closes the channel and sshd ends the command it was running. If a
     # wsl.exe is ever orphaned on the Windows side despite that, `restart-wsl` clears it: the
     # `wsl --shutdown` it issues takes every holder with the VM.
+    : > "$rel" 2>/dev/null
     kill "$p" 2>/dev/null
     echo "  wsl holder released on $1 (pid $p killed; the VM is unheld from now on)"
+  elif [ -e "$rel" ]; then
+    # The holder is gone and an unhold is on record as having ended it. That is a completed
+    # release whose record outlived it, not a loss: say so, clear up, and leave rc 0.
+    echo "  wsl holder on $1 was already ended by an earlier unhold (pid ${p:-?}); its record is cleared"
   else
     # NOT a routine outcome, though this reported it as one until 2026-09-18. A lane ends by
     # unhold and nothing else ENDS the holder deliberately, so a holder already gone is one the
@@ -954,7 +968,7 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     echo "    wsl.exe rather than taking it down -- but nothing owns that orphan and nothing short"
     echo "    of restart-wsl or a reboot ends it. Treat this lane's results on $1 as suspect."
   fi
-  rm -f "$f"
+  rm -f "$f" "$rel"
   return 0
 }
 

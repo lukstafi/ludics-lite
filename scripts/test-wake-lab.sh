@@ -598,6 +598,29 @@ grep -q 'stopped being RESERVED' <<<"$out" \
   || ko "the anomaly does not say the box stopped being reserved when the holder died -- $out"
 [ ! -f "$TMP/state/hold-rog.pid" ] && ok "...and its stale pid file is cleared" \
   || ko "a dead holder's pid file survived unhold"
+# An unhold is not atomic -- it kills the holder, then removes the record -- so an interruption
+# between the two (or a second unhold overlapping the first, which the routine now invites by
+# telling a run whose unhold has not come back to chase it) leaves a record naming a pid that
+# unhold itself deliberately ended. Reporting that as a lost holder would mark valid lane results
+# suspect, so the release writes its intent down BEFORE the kill and a retry reads it.
+mkdir -p "$TMP/state"; printf '999999 rog-lan 1 0\n' > "$TMP/state/hold-rog.pid"
+: > "$TMP/state/hold-rog.releasing"
+expect "an interrupted unhold's leftover record is a completed release, not a lost holder" 0 "was already ended by an earlier unhold" -- \
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
+grep -q 'ANOMALY' <<<"$out" \
+  && ko "a deliberate release was reported as a lost holder -- $out" \
+  || ok "...and raises no anomaly, so the lane's results are not called suspect"
+[ ! -f "$TMP/state/hold-rog.releasing" ] && ok "...and the release marker is cleared with the record" \
+  || ko "the release marker survived unhold"
+# ...and that marker must not outlive its lane: left in place it would mask the loss of the NEXT
+# holder, which is the one thing this reporting exists to catch.
+reset_hold_state
+mkdir -p "$TMP/state"; : > "$TMP/state/hold-rog.releasing"
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1)
+[ ! -f "$TMP/state/hold-rog.releasing" ] \
+  && ok "a fresh hold clears a stale release marker, so the next lost holder is still reported" \
+  || ko "a stale release marker survived a fresh hold -- it would mask the next loss -- $out"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
 # Every box's holder runs the same payload, so a signature that did not include the destination
 # would let one box's stale file kill another box's LIVE holder -- dropping that lane silently.
 reset_hold_state
