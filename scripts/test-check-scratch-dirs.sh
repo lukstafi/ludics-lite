@@ -543,6 +543,18 @@ EOF
 expect "a double-quoted operand is the same assignment" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_quoted_operand.sh"
 
+# Round 11 of #252: ...in every operand position, not only the first. Round 10 taught the first
+# operand to read a double quote and left the list scan behind it, so whether the quote hid the
+# assignment depended on WHICH operand carried it -- the same split round 9 found for `+=`.
+probe bad_quoted_list_operand <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly AUX=x "BASE=/var"
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a double-quoted operand is read in the list too, not only first" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_quoted_list_operand.sh"
+
 # ...while the quoted text the blanking exists to protect is still data: a usage string naming the
 # idiom is not an allocation, whatever keyword precedes it.
 probe safe_quoted_usage_after_readonly <<'EOF'

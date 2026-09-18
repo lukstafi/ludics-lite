@@ -675,9 +675,10 @@ for f in "${files[@]}"; do
         # blanked, so a `=` inside `'"'"'...'"'"'` is gone; a double-quoted one still reads as an operand,
         # which is the conservative direction.
         rest = val
-        while (match(rest, /[ \t]+[A-Za-z_][A-Za-z0-9_]*\+?=/)) {
+        while (match(rest, /[ \t]+"?[A-Za-z_][A-Za-z0-9_]*\+?=/)) {
           ex = substr(rest, RSTART, RLENGTH)
           gsub(/^[ \t]+/, "", ex)
+          sub(/^"/, "", ex)          # `readonly AUX=x "BASE=/var"` names BASE here too
           sub(/\+?=$/, "", ex)
           more[i] = more[i] " " ex
           rest = substr(rest, RSTART + RLENGTH)
