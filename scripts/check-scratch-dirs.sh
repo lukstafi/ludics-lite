@@ -625,8 +625,8 @@ for f in "${files[@]}"; do
     # second assignment let a plain reassignment walk a scratch directory past the guard (round 1).
     # A `mktemp -d` assignment counts as leaving one when it inherits a resolved root or is
     # resolved on the line below, which is what lets a CHAIN of scratch directories certify its
-    # tail. Order does not enter into it, and five rounds is more than any chain here; a longer one
-    # simply does not certify its tail, which refuses rather than passes.
+    # tail. Order does not enter into it: the rounds run until the verdicts stop moving, so a chain
+    # is certified to whatever depth it has rather than to a depth this file picked in advance.
     FNR == 1 {
       # The assignment table is built HERE and not in pass 1, so that it reads the joined
       # continuation lines rather than their halves.
@@ -652,10 +652,25 @@ for f in "${files[@]}"; do
       # statement once the verdict is keyed by scope: a name is resolved IN A SCOPE, the scope
       # being the function that assigns it or the top level; a lookup inside a function that
       # assigns the name at all reads that function'"'"'s verdict and never the global one. The
-      # two-sided rules stay: only an assignment at control depth 0 can certify, any assignment
-      # can disqualify, and five rounds of the fixpoint is more than any chain here.
-      for (i = 1; i <= last; i++) if (i in an) assigns[funcof[i] SUBSEP an[i]] = 1
-      for (round = 0; round < 5; round++) {
+      # two-sided rules stay: only an assignment at control depth 0 can certify, and any assignment
+      # can disqualify.
+      #
+      # THE ROUNDS RUN TO A FIXPOINT, not a fixed count. Each link of a chain of scratch
+      # directories is certified by the round that certified the link above it, so a fixed five
+      # rounds was a fixed maximum depth: a sixth level was refused as unresolved although every
+      # link satisfied the inheritance rule, and the refusal named the deepest line rather than the
+      # bound it had hit (ludics-lite#228 review round 4). A pass either adds or removes a
+      # `resolved` entry or is the last, and there are only as many entries as assignments, so
+      # `nassign` passes cannot be exceeded -- the bound is the file'"'"'s own size, and nothing here
+      # has to be more than any chain.
+      nassign = 0
+      for (i = 1; i <= last; i++) if (i in an) { assigns[funcof[i] SUBSEP an[i]] = 1; nassign++ }
+      # The verdicts are recomputed from nothing each time this block runs, so a round carries
+      # only what the rounds before it in THIS fixpoint established.
+      for (n in resolved) delete resolved[n]
+      changed = 1
+      for (round = 0; changed && round <= nassign; round++) {
+        changed = 0
         for (n in seen) delete seen[n]
         for (n in bad_assign) delete bad_assign[n]
         for (i = 1; i <= last; i++) {
@@ -670,7 +685,10 @@ for f in "${files[@]}"; do
             bad_assign[key] = 1
           }
         }
-        for (n in seen) if (!(n in bad_assign)) resolved[n] = 1; else delete resolved[n]
+        for (n in seen) {
+          if (!(n in bad_assign)) { if (!(n in resolved)) { resolved[n] = 1; changed = 1 } }
+          else if (n in resolved) { delete resolved[n]; changed = 1 }
+        }
       }
     }
     {
