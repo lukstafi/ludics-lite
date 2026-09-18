@@ -1441,9 +1441,12 @@ out=$(wl_locked restart-wsl minix); rc=$?
   && grep -q 'wake-lab --hold (pid 999' <<<"$out" \
   && ok "a restart is refused by the HOLD lock alone, with the lane lock free (rc=$rc)" \
   || ko "a held VM was restarted with no lane on the box (rc=$rc) -- $out; $(cat "$SSH_LOG")"
-file_free "$LOCKS/minix.lock" \
+# `-e` as well as free: `file_free` calls a lock file that does not exist free, so the assertion
+# without it would also pass over a destroyer that never opened the lane lock at all -- which is
+# not what is being claimed, and would hide the take going missing.
+[ -e "$LOCKS/minix.lock" ] && file_free "$LOCKS/minix.lock" \
   && ok "...and the lane lock it took on the way to that refusal is given back" \
-  || ko "a refused destroyer kept the lane lock: $(head -1 "$LOCKS/minix.lock" 2>/dev/null)"
+  || ko "a refused destroyer kept the lane lock, or never took it: $(head -1 "$LOCKS/minix.lock" 2>/dev/null)"
 exec 7>&-
 # Nothing of the suite's own is left holding it, so the box is ordinary again.
 out=$(wl_locked restart-wsl minix); rc=$?
