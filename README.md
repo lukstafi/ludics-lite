@@ -230,52 +230,53 @@ scripts/test-sync-routines.sh
 
 Three conventions travel with that list.
 
-**A `test-*` name is a promise to run.** `check-prompts.sh`'s fixture check walks
-`scripts/test-*`, `*/scripts/test-*` and `*/hooks/test-*`, and of every `.sh`, `.py` or `.ps1` it
-finds there it requires a line in this Tests section whose first token is that path and an
-inline `run:` line in `.github/workflows/skill-scripts.yml` on each platform that file needs — both Ubuntu and macOS for
-a shell suite, with the Ubuntu-only and Windows-only fixtures named as exceptions in the checker.
-The lookup is the section and not the block — a path-first line anywhere under `## Tests` satisfies
-it, so the register above is where those lines are kept by convention rather than by enforcement.
-The glob asks the filename, not the file, so it cannot tell a suite from a helper that is only ever
+**A `test-*` name is a promise to run.** `check-prompts.sh`'s fixture check walks `scripts/test-*`,
+`*/scripts/test-*` and `*/hooks/test-*`, and of every `.sh`, `.py` or `.ps1` it finds there it
+requires a line in this Tests section whose first token is that path and an inline `run:` line in
+`.github/workflows/skill-scripts.yml` on each platform that file needs — both Ubuntu and macOS for a
+shell suite, with the Ubuntu-only and Windows-only fixtures named as exceptions in the checker. The
+lookup is the section and not the block — a path-first line anywhere under `## Tests` satisfies it,
+so the register above is where those lines are kept by convention rather than by enforcement. The
+glob asks the filename, not the file, so it cannot tell a suite from a helper that is only ever
 sourced: such a helper either earns the name by carrying its own controls and being run, as
 `ship-pr/scripts/test-pr-review-base-lib.sh` has since ludics-lite#212 (executed rather than
 sourced, it proves the round counter, the grace and the tip move straight off the fixture rather
 than through a `base` run, and the refusals it owes its three callers), or it must not be named
-`test-*`. The third option, a register line and two CI steps for a file nothing executes, is a
-green step that tests nothing.
+`test-*`. The third option, a register line and two CI steps for a file nothing executes, is a green
+step that tests nothing.
 
 **Scratch directories have one house shape:** `VAR=$(mktemp -d …)`, then directly under it
 `VAR=$(CDPATH= cd "$VAR" && pwd -P)`, and the cleanup `trap` under that.
 `scripts/check-scratch-dirs.sh` has enforced the adjacency of those first two lines since
 ludics-lite#214. Like the jq guard below it, it is a scanner over line shapes and not an
-interpreter, so every rule here is a claim about how a line is written: it reads the next code line after the assignment and refuses anything that is not
-the resolution, whether or not that line mentions the variable, and it asks for the same function
-and block depth, so a resolution inside a `then` arm is not adjacent either. Adjacency rather than a
-resolution somewhere below, because a line that already ran with the environment's spelling does not
-get the physical one retroactively. The rest of the shape it does not check. The `CDPATH=` prefix is
-optional to it — a bare `cd "$VAR" && pwd -P` passes, and two suites here still spell it that way —
-and is convention against a nonempty `CDPATH`, under which a `cd` to a relative target can print the
-directory it found and put a second line inside the substitution. The `trap` it does not read at
-all, but the adjacency rule places it anyway: only comments may stand between the allocation and the
-resolution, which is where the `/var`-to-`/private/var` explanation goes, so a trap belongs above the
-allocation or below the resolution and never between them, and the house order is below, where the
-reading order matches the running order. The alternative to a resolution is inheritance, and it
-reaches exactly one component: `mktemp -d "$TEMP_ROOT/x.XXXXXX"` under a resolved `TEMP_ROOT` needs
-no line of its own, which is what lets post-merge-cleanup.sh's scratch directories pass, while
+interpreter, so every rule here is a claim about how a line is written: it reads the next code line
+after the assignment and refuses anything that is not the resolution, whether or not that line
+mentions the variable, and it asks for the same function and block depth, so a resolution inside a
+`then` arm is not adjacent either. Adjacency rather than a resolution somewhere below, because a
+line that already ran with the environment's spelling does not get the physical one retroactively.
+The rest of the shape it does not check. The `CDPATH=` prefix is optional to it — a bare
+`cd "$VAR" && pwd -P` passes, and two suites here still spell it that way — and is convention
+against a nonempty `CDPATH`, under which a `cd` to a relative target can print the directory it
+found and put a second line inside the substitution. The `trap` it does not read at all, but the
+adjacency rule places it anyway: only comments may stand between the allocation and the resolution,
+which is where the `/var`-to-`/private/var` explanation goes, so a trap belongs above the allocation
+or below the resolution and never between them, and the house order is below, where the reading
+order matches the running order. The alternative to a resolution is inheritance, and it reaches
+exactly one component: `mktemp -d "$TEMP_ROOT/x.XXXXXX"` under a resolved `TEMP_ROOT` needs no line
+of its own, which is what lets post-merge-cleanup.sh's scratch directories pass, while
 `"$TEMP_ROOT/cache/x.XXXXXX"` is refused — the component `mktemp` itself creates cannot be a
-symlink, but an intermediate one can. One component per assignment, though, is
-not one per chain: an ordinary `A="$ROOT/cache"` is resolved by the same rule, so `B="$A/work"` and
-a `mktemp -d "$B/x.XXXXXX"` under it walk as far as they like — the guard reads each line's shape
-and never asks whether `cache` is a directory or a symlink. That root counts as resolved only when EVERY assignment
-to it in that scope leaves a physical path and at least one of them stands at control depth zero:
-a non-resolving assignment that opens its own line disqualifies at any
-depth, while only an unconditional one can certify, so a later `BASE=${TMPDIR:-/tmp}`, or a resolution reached only
+symlink, but an intermediate one can. One component per assignment, though, is not one per chain: an
+ordinary `A="$ROOT/cache"` is resolved by the same rule, so `B="$A/work"` and a
+`mktemp -d "$B/x.XXXXXX"` under it walk as far as they like — the guard reads each line's shape and
+never asks whether `cache` is a directory or a symlink. That root counts as resolved only when EVERY
+assignment to it in that scope leaves a physical path and at least one of them stands at control
+depth zero: a non-resolving assignment that opens its own line disqualifies at any depth, while only
+an unconditional one can certify, so a later `BASE=${TMPDIR:-/tmp}`, or a resolution reached only
 inside an `if` arm, leaves the whole scope unresolved — where a second `pwd -P` assignment beside
 the first changes nothing. An assignment that does not open a line is not in the table at all, so
-`if true; then BASE=${TMPDIR:-/tmp}; fi` disqualifies nothing. What the fixpoint does not compare is line ORDER, so a root resolved *below* the
-allocation satisfies the guard while leaving the allocation itself unresolved: resolving it first is
-convention the guard cannot verify.
+`if true; then BASE=${TMPDIR:-/tmp}; fi` disqualifies nothing. What the fixpoint does not compare is
+line ORDER, so a root resolved *below* the allocation satisfies the guard while leaving the
+allocation itself unresolved: resolving it first is convention the guard cannot verify.
 
 **`routines/*/SKILL.md` are Markdown prompts read by an agent, not shell scripts.** Nothing execs
 the file and no shell parses it: `bash -n`, shellcheck, `check-jq-shapes.sh` and
