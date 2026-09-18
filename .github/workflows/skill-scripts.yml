@@ -20,8 +20,15 @@ name: skill scripts
 # and a green PR sat one to two hours behind ~9 minutes of actual work (ludics-lite#55). So every
 # macOS suite is one step of ONE macOS job, which installs the shared dependencies once; each
 # step still runs after an earlier one fails (`if: !cancelled()`), still names its suite when it
-# fails (the `::error` annotation), and the job is red if any step is. The Ubuntu suites stay
-# one job each: Ubuntu runners are plentiful and the split keeps their failures apart.
+# fails (the `::error` annotation), and the job is red if any step is. Those annotations are a
+# macOS-jobs-only device, and that `if:` is the whole reason for them: with every suite running
+# whatever the suite before it did, one red macOS job can hold several failures spread across its
+# steps, and the annotation is what names them without reading the log. It is NOT that Ubuntu is
+# one suite per job -- `pr-review` runs fifteen suites as steps, `lint` nine -- but that an Ubuntu
+# suite that fails stops the job it is in, leaving a single red step to find. The two `pr-review`
+# steps that do carry `if: !cancelled()` are unannotated exceptions to that; ludics-lite#266 is
+# about holding the `!cancelled()`/annotation pairing mechanically rather than by reading this
+# paragraph.
 
 on:
   pull_request:
