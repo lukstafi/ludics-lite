@@ -935,7 +935,8 @@ check_drift_guard() {
 # keeps a references/ directory today, so the glob is there ahead of the first one.
 link_files() {
   (cd "$ROOT" && for f in README.md routines/README.md */SKILL.md routines/*/SKILL.md \
-    */references/*.md routines/*/references/*.md; do [ -f "$f" ] && echo "$f"; done) | sort -u
+    */references/*.md */references/.*.md routines/*/references/*.md \
+    routines/*/references/.*.md; do [ -f "$f" ] && echo "$f"; done) | sort -u
 }
 
 # md_links <rel> <dir>: every link of the read shape in the root-relative file <rel>, one per line,
@@ -1218,6 +1219,24 @@ heading_slugs() {
       }
       SPAN_TEXT = text; SPAN_BARE = bare
     }
+    # linked <text>: whether <text> carries a `](` whose `]` closes a bracket opened earlier -- the
+    # same label test `md_links` applies, and for the same reason: `## Token ](literal)` renders no
+    # link, and GitHub gives it the ordinary `token-literal`. No escape parity is needed here, as
+    # `render_spans` has already replaced every escaped character, and every span, with a `.`.
+    function linked(t,   i, k, c, depth, from) {
+      from = 1
+      while ((i = index(substr(t, from), "](")) > 0) {
+        i = from + i - 1
+        depth = 0
+        for (k = i - 1; k >= 1; k--) {
+          c = substr(t, k, 1)
+          if (c == "]") depth++
+          else if (c == "[") { if (depth == 0) return 1; else depth-- }
+        }
+        from = i + 2
+      }
+      return 0
+    }
     function slug(h,   i, c, out) {
       # A heading whose RENDERED text differs from its SOURCE is one this check will not spell:
       # GitHub slugs what it renders, and rendering means a Markdown parser. Three shapes do that,
@@ -1234,20 +1253,28 @@ heading_slugs() {
       # Emphasis, strong and code spans need no test: their markers are punctuation that both
       # readings drop, so `## **Bold** text` and `## `code` here` already agree.
       render_spans(h)
-      if (index(SPAN_BARE, "](") > 0 || index(SPAN_BARE, "][") > 0) return "!"
+      if (linked(SPAN_BARE) || index(SPAN_BARE, "][") > 0) return "!"
       # A `<` is only markup once the construct CLOSES: `## Use <Type` parses no tag, and GitHub
       # gives it the ordinary `use-type`, so refusing on the opening character alone refused a
       # heading that is plain text. A tag, an autolink or a comment, each spelled whole.
       if (SPAN_BARE ~ /<\/?[A-Za-z][A-Za-z0-9-]*([[:space:]][^<>]*)?\/?>/) return "!"
       if (SPAN_BARE ~ /<[A-Za-z][A-Za-z0-9+.-]*:[^<>[:space:]]*>/) return "!"
-      if (index(SPAN_BARE, "<!--") > 0) return "!"
+      if (SPAN_BARE ~ /<!--.*-->/) return "!"
       # The rest of the raw-HTML forms, which render as markup and contribute no heading text:
       # a processing instruction, a declaration, a CDATA section. `## <?target?>` is nothing at
       # all to GitHub, where the source reading gave it `target`.
       if (SPAN_BARE ~ /<\?[^<>]*\?>/) return "!"
       if (SPAN_BARE ~ /<![A-Za-z][^<>]*>/) return "!"
       if (index(SPAN_BARE, "<![CDATA[") > 0) return "!"
-      if (SPAN_BARE ~ /&[A-Za-z0-9#]+;/) return "!"
+      # A character reference renders as markup only when it DECODES. A numeric one always does;
+      # a named one does only if HTML defines it, and that table is two thousand entries this
+      # check will not carry -- so the named ones held are the ones this prose could plausibly
+      # write, and anything else is read as the literal text it renders as. `## Rock &bogus; Roll`
+      # keeps its anchor, where the shape test alone refused it. The residue is stated rather than
+      # hidden: a VALID named reference outside this list reads as literal text here, which is the
+      # permissive direction, and the list is the place to add one if a heading ever needs it.
+      if (SPAN_BARE ~ /&#[0-9]+;/ || SPAN_BARE ~ /&#[xX][0-9A-Fa-f]+;/) return "!"
+      if (SPAN_BARE ~ /&(amp|lt|gt|quot|apos|nbsp|copy|reg|trade|hellip|mdash|ndash|laquo|raquo|deg|times|divide|plusmn|micro|para|sect|dagger|bull|lsquo|rsquo|ldquo|rdquo);/) return "!"
       # Underscore emphasis is the one emphasis marker the two readings do NOT agree on, because
       # the slugger keeps `_` as a word character: `## _Foo_` renders as `Foo` and is `foo` there,
       # while the source reading gives `_foo_`. `*` needs no such test -- it is punctuation both

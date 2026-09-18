@@ -1613,6 +1613,56 @@ printf '\n## A < B still text\n\nAn opening bracket that is not markup.\n' >> "$
 links_body alpha/SKILL.md 'See [text, not markup](references/notes.md#a--b-still-text).'
 expect "...while a bare < among them is still text on both sides" 0 '(1 checked)' -- "$CP" "$R"
 
+# The heading guard applies the same label test `md_links` does: `## Token ](literal)` renders no
+# link and GitHub gives it the ordinary slug, where refusing on the substring alone refused plain
+# text (round 12, P2).
+links_tree
+printf '\n## Token ](literal)\n\nA token, not a link.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a token in a heading](references/notes.md#token-literal).'
+expect "a heading carrying a link-shaped token with no label keeps its anchor" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## [Real](https://example.invalid) link\n\nA link, which renders.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a real one](references/notes.md#reallinkhttpsexampleinvalid-link).'
+expect "...while one carrying a real label still spells no anchor" 1 \
+  'will not spell an anchor for' -- "$CP" "$R"
+
+# A comment refuses the heading only once it CLOSES, as a tag has since round 10: `## Use <!--
+# literal` renders the opener as text and has the anchor GitHub built from it (round 12, P2).
+links_tree
+printf '\n## Use <!-- literal\n\nAn opener that closes nothing.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [an unclosed comment](references/notes.md#use----literal).'
+expect "an unclosed comment opener is text, so its heading keeps its anchor" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## Hidden <!-- gone --> here\n\nA comment spelled whole.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a closed comment](references/notes.md#hidden---gone----here).'
+expect "...while a closed one still spells no anchor" 1 'will not spell an anchor for' -- "$CP" "$R"
+
+# A character reference renders as markup only when it DECODES. The full named table is two
+# thousand entries this check will not carry, so a numeric reference and the names this prose could
+# plausibly write are held, and anything else reads as the literal text it renders as (round 12,
+# P2). `## Rock &bogus; Roll` keeps its anchor; `&amp;` does not.
+links_tree
+printf '\n## Rock &bogus; Roll\n\nA name HTML does not define.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a name that decodes to nothing](references/notes.md#rock-bogus-roll).'
+expect "a character reference HTML does not define is text, and keeps its anchor" 0 \
+  '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## Rock &amp; Roll\n\nA name HTML defines.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [one that decodes](references/notes.md#rock-amp-roll).'
+expect "...while one that decodes still spells no anchor" 1 'will not spell an anchor for' -- "$CP" "$R"
+links_tree
+printf '\n## Rock &#38; Roll\n\nA numeric reference, which always decodes.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a numeric one](references/notes.md#rock-38-roll).'
+expect "...and so does a numeric one, which always decodes" 1 'will not spell an anchor for' -- "$CP" "$R"
+
+# A reference file whose name begins with a dot is a reference file: the first hop to it was
+# checked and the links INSIDE it were never scanned, which is the hole round 5 closed for
+# routines and round 8 for path components (round 12, P2).
+links_tree
+printf '# Guide\n\nSee [the second hop](gone.md).\n' > "$R/alpha/references/.guide.md"
+expect "a dotted reference file is a linking file too" 1 \
+  'alpha/references/.guide.md: link to gone.md resolves to no file' -- "$CP" "$R"
+
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.
 fresh "$R"
