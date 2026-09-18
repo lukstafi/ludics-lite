@@ -139,7 +139,8 @@ expect "a template rooted in the dirname of a resolved path passes" 0 "$CLEAN" -
   "$CS" "$TMP/safe_dirname.sh"
 
 # A chain: a scratch directory under a resolved root is itself resolved, and certifies the next
-# one down. Each link costs a round of the guard's fixpoint.
+# one down. Each link costs a round of the guard's fixpoint, so the chain below and the deeper one
+# after it are the same shape at two lengths.
 probe safe_chain <<'EOF'
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
 TMP=$(cd "$TMP" && pwd -P) || exit 1
@@ -149,6 +150,40 @@ echo "$deeper"
 EOF
 expect "a scratch directory under a resolved scratch directory passes" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_chain.sh"
+
+# ...and the chain has no maximum length. The fixpoint used to run a fixed five rounds, one link
+# per round, so a sixth level was refused as unresolved with every link satisfying the inheritance
+# rule -- and the refusal named the deepest line rather than the bound it had hit, which is the
+# worst way for a limit to be spelled. Six levels is one past the old constant, so this case fails
+# the moment a fixed count comes back. No file in the checkout is this deep today; that is why the
+# limit could sit here unnoticed, and why the fixture rather than a scanned file has to hold it.
+probe safe_chain_deep <<'EOF'
+D0=$(CDPATH= cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+D1=$(mktemp -d "$D0/l1.XXXXXX") || exit 1
+D2=$(mktemp -d "$D1/l2.XXXXXX") || exit 1
+D3=$(mktemp -d "$D2/l3.XXXXXX") || exit 1
+D4=$(mktemp -d "$D3/l4.XXXXXX") || exit 1
+D5=$(mktemp -d "$D4/l5.XXXXXX") || exit 1
+D6=$(mktemp -d "$D5/l6.XXXXXX") || exit 1
+echo "$D6"
+EOF
+expect "a chain deeper than five links passes" 0 "$CLEAN" -- "$CS" "$TMP/safe_chain_deep.sh"
+
+# The other side of the same case: depth is not what certifies a chain, its ROOT is. With the root
+# left as the environment's own spelling, no length of chain may pass -- a fixpoint that ran until
+# nothing moved would be free to keep looking for a certification that is not there.
+probe bad_chain_deep_unrooted <<'EOF'
+D0=${TMPDIR:-/tmp}
+D1=$(mktemp -d "$D0/l1.XXXXXX") || exit 1
+D2=$(mktemp -d "$D1/l2.XXXXXX") || exit 1
+D3=$(mktemp -d "$D2/l3.XXXXXX") || exit 1
+D4=$(mktemp -d "$D3/l4.XXXXXX") || exit 1
+D5=$(mktemp -d "$D4/l5.XXXXXX") || exit 1
+D6=$(mktemp -d "$D5/l6.XXXXXX") || exit 1
+echo "$D6"
+EOF
+expect "a deep chain on an unresolved root is still refused" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_chain_deep_unrooted.sh"
 
 probe safe_local <<'EOF'
 case_root() {
