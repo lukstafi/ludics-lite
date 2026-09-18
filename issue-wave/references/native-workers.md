@@ -16,16 +16,17 @@ provider's tool names into a brief for the other's worker.
 
 ## Placement and launch
 
-Interpret the plan with separate columns for **agent host** and **execution host**. A local
-native worker can drive a reserved CUDA leg on ROG or HIP leg on Minix over ssh; required
-hardware constrains execution, not necessarily where the agent runs. **ssh reach, or the app's
-Control-other-devices connectivity, does not establish remote native-worker support**: a native
-worker runs where the coordinator's runtime runs its subagents. This is the one statement of
-that rule. When repeated hardware iteration argues for an agent resident on the box, the
-options are a CLI worker there ([cli-claude.md](cli-claude.md)) or an explicitly selected app
-worker, subject to the app's actual host-aware tools ([separate-codex.md](separate-codex.md)).
-Residence does not preclude checks on other boxes; each execution is reserved separately, runs
-local to the agent included.
+Record **agent host** and **execution host** as separate facts on the board and in each
+reservation: the plan places execution only (a home box and legs), and the agent host follows
+from the transport chosen at launch. A local native worker can drive a reserved CUDA leg on
+ROG or HIP leg on Minix over ssh; required hardware constrains execution, not necessarily where
+the agent runs. **ssh reach, or the app's Control-other-devices connectivity, does not
+establish remote native-worker support**: a native worker runs where the coordinator's runtime
+runs its subagents. This is the one statement of that rule. When repeated hardware iteration
+argues for an agent resident on the box, the options are a CLI worker there
+([cli-claude.md](cli-claude.md)) or an explicitly selected app worker, subject to the app's
+actual host-aware tools ([separate-codex.md](separate-codex.md)). Residence does not preclude
+checks on other boxes; each execution is reserved separately, runs local to the agent included.
 
 1. Claim the fleet lease and read the plan, the board, the halt, the PRs and the execution
    registry. Resolve the project's development remote (including staging versus upstream),
