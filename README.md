@@ -256,26 +256,26 @@ file nothing executes, is a green step that tests nothing.
 `scripts/check-scratch-dirs.sh` has enforced since ludics-lite#214 is the adjacency of the first
 two: the next code line after the allocation must be the resolution — in the same function, at the
 same block depth, whatever that line would otherwise be — because a line that already ran with the
-environment's spelling does not get the physical one retroactively. Only comments may stand between
-them, which is where the `/var`-to-`/private/var` explanation goes, and that is what places the
-`trap` the guard never reads: above the allocation or below the resolution, never between, with the
-house order below, where the reading order matches the running order. The rest is convention.
-`CDPATH=` is optional to the guard — a bare `cd "$VAR" && pwd -P` passes, as two suites here still
-spell it — and is there against a nonempty `CDPATH`, under which a `cd` to a relative target prints
-the directory it found and puts a second line inside the substitution. The resolution itself is
-matched by shape, the same name on the left and a `cd … && pwd -P` on the right with the `cd`'s own
-target unchecked, so resolving the wrong directory into the right variable passes. The alternative
-to resolving is inheritance: `mktemp -d "$TEMP_ROOT/x.XXXXXX"` under a resolved `TEMP_ROOT` needs no
-line of its own, which is what lets post-merge-cleanup.sh's scratch directories pass, while
-`"$TEMP_ROOT/cache/x.XXXXXX"` is refused — the component `mktemp` creates cannot be a symlink, an
-intermediate one can. That is one component per assignment and not one per chain: `A="$ROOT/cache"`
-is resolved by the same rule, so `B="$A/work"` and a `mktemp -d "$B/x.XXXXXX"` under it walk as far
-as they like. A root counts as resolved for a scope when every assignment to it there leaves a
-physical path and at least one stands at control depth zero — keyword depth, so a `then` arm cannot
-certify while a line inside `( … )` still does — and a non-resolving assignment disqualifies from
-any depth, though only one that opens its own line is in the table to do it. Line ORDER is not
-compared, so a root resolved below the allocation satisfies the guard while the allocation itself
-ran unresolved: resolving it first is convention the guard cannot verify.
+environment's spelling does not get the physical one retroactively. Only comments and blank lines
+may stand between them, which is where the `/var`-to-`/private/var` explanation goes, and that is
+what places the `trap` the guard never reads: above the allocation or below the resolution, never
+between, with the house order below, where the reading order matches the running order. The rest is
+convention. `CDPATH=` is optional to the guard — a bare `cd "$VAR" && pwd -P` passes, as two suites
+here still spell it — and is there against a nonempty `CDPATH`, under which a `cd` to a relative
+target prints the directory it found and puts a second line inside the substitution. The resolution
+itself is matched by shape, the same name on the left and a `cd … && pwd -P` on the right with the
+`cd`'s own target unchecked, so resolving the wrong directory into the right variable passes. The
+alternative to resolving is inheritance: `mktemp -d "$TEMP_ROOT/x.XXXXXX"` under a resolved
+`TEMP_ROOT` needs no line of its own, which is what lets post-merge-cleanup.sh's scratch directories
+pass, while `"$TEMP_ROOT/cache/x.XXXXXX"` is refused — the component `mktemp` creates cannot be a
+symlink, an intermediate one can. That is one component per assignment and not one per chain:
+`A="$ROOT/cache"` is resolved by the same rule, so `B="$A/work"` and a `mktemp -d "$B/x.XXXXXX"`
+under it walk as far as they like. A root counts as resolved for a scope when every assignment to it
+there leaves a physical path and at least one stands at control depth zero — keyword depth, so a
+`then` arm cannot certify while a line inside `( … )` still does — and a non-resolving assignment
+disqualifies from any depth, though only one that opens its own line is in the table to do it. Line
+ORDER is not compared, so a root resolved below the allocation satisfies the guard while the
+allocation itself ran unresolved: resolving it first is convention the guard cannot verify.
 
 **`routines/*/SKILL.md` are Markdown prompts read by an agent, not shell scripts.** Nothing execs
 the file and no shell parses it: `bash -n`, shellcheck, `check-jq-shapes.sh` and
