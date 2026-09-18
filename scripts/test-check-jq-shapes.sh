@@ -346,6 +346,34 @@ else
   ok "a default-sweep refusal does not annotate an absolute path"
 fi
 
+# The control for that non-match, and the reason it means anything. A "must NOT appear" check
+# passes both when the guard is right and when the check was written so it could never match --
+# which is what an earlier draft of it did (ludics-lite#197: it grepped for a $TMP path that the
+# /var -> /private/var symlink kept it from ever seeing, and passed against a guard with the fix
+# torn out). So tear the fix out here, in a scratch checkout's COPY of the guard, and prove the
+# grep above fires: the relative spelling is gone and the absolute one is what gets annotated.
+# The real scripts/check-jq-shapes.sh is never touched -- scratch_tree already cp'd it, and the
+# rewrite lands on that copy.
+T=$(scratch_tree wide_annotation_mutant)
+in_tree wide_annotation_mutant other-skill/scripts/stamp.sh <<'EOF'
+jq -r '.[] | capture($rc) | {sha: .s}' <<<"$raw"
+EOF
+sed -i.bak 's/awk -v file="$display"/awk -v file="$f"/' "$T" && rm -f "$T.bak"
+# A sed that matched nothing would leave the guard whole and hand back a case that passes for the
+# same vacuous reason it exists to rule out, so the mutation is asserted before it is run.
+if grep -qF -- 'awk -v file="$f"' "$T" && ! grep -qF -- 'awk -v file="$display"' "$T"; then
+  ok "the annotation guard can be reverted in a scratch copy"
+else
+  ko "reverting the annotation guard in a scratch copy did not take -- $(grep -n 'awk -v file=' "$T")"
+fi
+out=$("$T" 2>&1)
+if grep -qF -- "::error file=$TMP/wide_annotation_mutant/other-skill/scripts/stamp.sh,line=" <<<"$out" &&
+  ! grep -qF -- '::error file=other-skill/scripts/stamp.sh,line=' <<<"$out"; then
+  ok "a guard without the fix annotates the absolute path, which is what the two cases above catch"
+else
+  ko "a guard without the fix must annotate the absolute path and not the relative one -- $out"
+fi
+
 # An explicitly passed file outside the checkout has no relative spelling and keeps the path it
 # was given -- there is nothing for a `${f#$ROOT/}` to strip, and a truncated path would name a
 # file that is not there.
