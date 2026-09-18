@@ -240,16 +240,16 @@ state what each check establishes rather than enumerate the shapes that would fo
 requires a line in this Tests section that is that path once an optional `python3` or `./` prefix is
 stripped — the two forms the register itself uses — and an inline `run:` line in
 `.github/workflows/skill-scripts.yml` on each platform that file needs — both Ubuntu and macOS for a
-shell suite, with the Ubuntu-only and Windows-only fixtures named as exceptions in the checker. The
-lookup is the section and not the block — any such line anywhere under `## Tests` satisfies it, so
-the register above is where those lines are kept by convention rather than by enforcement. The glob
-asks the filename, not the file, so it cannot tell a suite from a helper that is only ever sourced:
-such a helper either earns the name by carrying its own controls and being run, as
-`ship-pr/scripts/test-pr-review-base-lib.sh` has since ludics-lite#212 (executed rather than
-sourced, it proves the round counter, the grace and the tip move straight off the fixture rather
-than through a `base` run, and the refusals it owes its three callers), or it must not be named
-`test-*`. The third option, a register line and two CI steps for a file nothing executes, is a green
-step that tests nothing.
+shell suite, while a `.ps1` goes to Windows on its extension and the two Ubuntu-only Python fixtures
+are the ones named by path in the checker. The lookup is the section and not the block — any such
+line anywhere under `## Tests` satisfies it, so the register above is where those lines are kept by
+convention rather than by enforcement. The glob asks the filename, not the file, so it cannot tell a
+suite from a helper that is only ever sourced: such a helper either earns the name by carrying its
+own controls and being run, as `ship-pr/scripts/test-pr-review-base-lib.sh` has since
+ludics-lite#212 (executed rather than sourced, it proves the round counter, the grace and the tip
+move straight off the fixture rather than through a `base` run, and the refusals it owes its three
+callers), or it must not be named `test-*`. The third option, a register line and two CI steps for a
+file nothing executes, is a green step that tests nothing.
 
 **Scratch directories have one house shape:** `VAR=$(mktemp -d …)`, then directly under it
 `VAR=$(CDPATH= cd "$VAR" && pwd -P)`, and the cleanup `trap` under that.
