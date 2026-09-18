@@ -43,8 +43,16 @@
 # resolved, so a chain of scratch directories is certified from its root.
 #
 # WHAT IS NOT A USE. Comments, which discuss the variable precisely where the resolution is being
-# explained; and a `trap` line, whose body runs at exit and is written before the resolution in
-# two of the three files that already do this right. Everything else is a use.
+# explained; and a `trap` line, whose body runs at exit rather than where it is written, so it
+# cannot read the unresolved value. Everything else is a use.
+#
+# Exempt from the use rule is not exempt from the adjacency one. Only comments and blank lines may
+# stand BETWEEN the allocation and its resolution: the resolution has to BE the next code line, and
+# a `trap` written there is a code line, so it is what gets picked and the allocation is refused.
+# The trap therefore goes above the allocation or below the resolution -- below is the house order,
+# where reading order matches running order, and is where all four suites here that resolve a
+# scratch directory install it. See README.md's Tests section, "Scratch directories have one house
+# shape" (ludics-lite#228, review round 2).
 #
 # Files, not just directories: a plain `mktemp` (no -d) is out of scope. Its result is a path
 # under the same unresolved root, but nothing here compares one, and widening the rule to cover
