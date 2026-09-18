@@ -939,8 +939,19 @@ md_links() {
       line = $0
       while ((i = index(line, "](")) > 0) {
         line = substr(line, i + 2)
-        j = index(line, ")")
-        if (j == 0) break                          # no closing paren on this line: not the shape
+        # The target ends at the paren that CLOSES the one the link opened, not at the first `)`:
+        # a Markdown destination may carry balanced parentheses, and `a_(b).md` cut at the first
+        # one is `a_(b`, which then fails the `.md` test and takes a real link out of the scan in
+        # silence. A destination whose parens do not balance on the line -- an escaped one
+        # included, since this reads no escapes -- leaves the line with no close, and is outside
+        # the shape like every other link this cannot see the end of.
+        depth = 1; j = 0
+        for (k = 1; k <= length(line); k++) {
+          c = substr(line, k, 1)
+          if (c == "(") depth++
+          else if (c == ")" && --depth == 0) { j = k; break }
+        }
+        if (j == 0) break
         target = substr(line, 1, j - 1)
         line = substr(line, j + 1)
         if (target ~ /[[:space:]]/) continue       # a titled link, say: outside the form
@@ -974,12 +985,20 @@ md_links() {
 # word characters and the hyphen kept and everything else dropped -- and a slug already seen in the
 # file takes the `-1`, `-2` suffix GitHub gives a repeated heading, so the second `## Close-out` is
 # reachable as `#close-out-1` rather than unreachable.
-# A byte outside ASCII is dropped with the punctuation, which is GitHub's reading of a dash or a
-# quotation mark and NOT of a letter: a heading carrying a non-ASCII letter is one whose anchor
-# this check cannot spell, so a link into it is refused rather than accepted on a guess.
+# A heading whose anchor this check will not spell -- one carrying a non-ASCII byte that is not
+# General Punctuation, so possibly a letter GitHub keeps -- contributes no slug, and is reported as
+# `!<heading>` instead, so a link that misses in that file can say why it could not be answered.
 heading_slugs() {
   CP_PREFIX="${2:-}" awk '
-    BEGIN { prefix = ENVIRON["CP_PREFIX"] }
+    BEGIN {
+      prefix = ENVIRON["CP_PREFIX"]
+      # The byte sets `slug` reads, built rather than spelled: an octal byte range inside a
+      # bracket expression is not something every awk on the fleet reads alike, and sprintf is.
+      for (n = 1; n <= 127; n++) ascii[sprintf("%c", n)] = 1
+      # U+2000-U+206F, General Punctuation, in UTF-8: E2 80 80 .. E2 81 AF.
+      for (n = 128; n <= 191; n++) punctuation[sprintf("%c%c%c", 226, 128, n)] = 1
+      for (n = 128; n <= 175; n++) punctuation[sprintf("%c%c%c", 226, 129, n)] = 1
+    }
     {
       line = $0
       # An ATX heading, by GFM: up to three leading spaces, one to six hashes, then a blank. The
@@ -993,28 +1012,42 @@ heading_slugs() {
       if (rest !~ /^[ \t]/) next                   # `#tag` is text to GFM, not a heading
       sub(/[ \t]+#+[ \t]*$/, "", rest)             # the optional closing run of hashes
       s = slug(rest)
+      if (s == "!") { print prefix "!" rest; next }   # a heading this check will not spell
       if (s == "") next
-      # `print (expr) ? a : b` is a shape awk implementations do not all parse alike -- the
-      # parenthesis reads as an output list to some of them -- so the suffix is applied first.
-      n = seen[s]++
-      if (n > 0) s = s "-" n
+      # The numbering GitHub does is a LOOP over free names, not a counter per base: a candidate
+      # already taken takes the next `-<n>` that is not, so `# Foo`, `# Foo-1`, `# Foo` give `foo`,
+      # `foo-1`, `foo-2`. A counter gives `foo-1` twice -- which both rejects a good link to
+      # `#foo-2` and lets `#foo-1` answer for either heading.
+      base = s
+      while (taken[s]) { occurrences[base]++; s = base "-" occurrences[base] }
+      taken[s] = 1
       print prefix s
     }
+    # slug <heading>: its GitHub anchor, or `!` for a heading whose anchor this check will not
+    # spell. The ASCII half is exact. Beyond it, only the General Punctuation block is known --
+    # the dashes, curly quotes and ellipsis this prose is written with, every one of which GitHub
+    # drops -- and any OTHER non-ASCII byte is a character that may be a letter GitHub keeps
+    # (`# Cafe\u0301` slugs to `cafe\u0301`, not to `caf`). Dropping it silently would not only refuse the
+    # right anchor, it would ACCEPT the wrong one: `#caf` would answer for that heading. So such a
+    # heading contributes no slug at all, and a link that means it is refused, with the reason.
     function slug(h,   i, c, out) {
       h = tolower(h)                               # ASCII only, by locale, as GitHub folds ASCII
       sub(/^[ \t]+/, "", h); sub(/[ \t]+$/, "", h)
       out = ""
       for (i = 1; i <= length(h); i++) {
         c = substr(h, i, 1)
-        if (c == " " || c == "\t") out = out "-"
-        else if (c ~ /^[a-z0-9_-]$/) out = out c
+        if (c == " " || c == "\t") { out = out "-"; continue }
+        if (c ~ /^[a-z0-9_-]$/) { out = out c; continue }
+        if (c in ascii) continue                   # ASCII punctuation, which GitHub drops
+        if (substr(h, i, 3) in punctuation) { i += 2; continue }
+        return "!"
       }
       return out
     }' "$1"
 }
 
 check_links() {
-  local rel dir links all="" wanted t target resolved anchor slugs="" nl tab count=0 bad=0
+  local rel dir links all="" wanted t target resolved anchor slugs="" hint nl tab count=0 bad=0
   nl=$'\n'; tab=$(printf '\t')
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
@@ -1038,6 +1071,13 @@ check_links() {
   while IFS="$tab" read -r rel target resolved anchor; do
     [ -n "$rel" ] || continue
     count=$((count + 1))
+    # A path that climbed past the root is refused on the path itself, and never probed on the
+    # filesystem: `$ROOT/../outside.md` is a real path on the host, so a file of that name beside
+    # the checkout would make an out-of-repository link read as resolving -- a verdict about the
+    # machine the check ran on rather than about the prompts.
+    case "$resolved" in
+      .. | ../*) ko "$rel" "link to $target resolves outside the checkout: $resolved"; bad=1; continue ;;
+    esac
     if [ ! -f "$ROOT/$resolved" ]; then
       ko "$rel" "link to $target resolves to no file: $resolved"; bad=1; continue
     fi
@@ -1047,7 +1087,14 @@ check_links() {
     # whole `<target> TAB <slug>` line of the table with a newline on either side of it.
     case "$nl$slugs" in
       *"$nl$resolved$tab$anchor$nl"*) ;;
-      *) ko "$rel" "link to $target names no heading: $resolved has none whose GitHub slug is '$anchor'"
+      *)
+        # A file carrying a heading the slug reader would not spell says so, rather than leaving a
+        # maintainer to compare an anchor against a heading that is visibly right.
+        hint=""
+        case "$nl$slugs" in
+          *"$nl$resolved$tab!"*) hint=" (and a heading it will not spell an anchor for: see heading_slugs)" ;;
+        esac
+        ko "$rel" "link to $target names no heading: $resolved has none whose GitHub slug is '$anchor'$hint"
         bad=1 ;;
     esac
   done <<<"$all"

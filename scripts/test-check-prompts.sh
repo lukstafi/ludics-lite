@@ -981,7 +981,23 @@ Punctuation to drop, blanks to hyphenate.
 ## Close-out
 
 The second one, which GitHub numbers.
+
+## Notes-1
+
+An explicit suffix, standing where a repeat would want to land.
+
+## Notes
+
+A third collision, which has to step over the explicit one.
+
 EOF
+  # Two headings written as BYTES, which a quoted heredoc would have left as backslash text: an em
+  # dash, the non-ASCII punctuation this prose is written with and GitHub drops; and a heading
+  # carrying a letter GitHub keeps, whose anchor the check will not guess at -- so it contributes
+  # no slug rather than the ASCII residue `caf`.
+  printf '## Close \342\200\224 out\n\nPunctuation GitHub drops.\n\n' >> "$R/alpha/references/notes.md"
+  printf '## Caf\303\251\n\nA letter GitHub keeps.\n' >> "$R/alpha/references/notes.md"
+  printf 'A parenthesized filename.\n' > "$R/alpha/references/a_(b).md"
 }
 # links_body <file> <line...>: appends Markdown to a file in the scratch tree.
 links_body() { local f="$1"; shift; printf '%s\n' "$@" >> "$R/$f"; }
@@ -1036,10 +1052,16 @@ expect "a path is read from the linking file's directory, not from the root" 1 \
 links_tree
 links_body alpha/references/notes.md 'Back to [the prompt](../SKILL.md).'
 expect "a reference file is a linking file too, and '..' climbs from it" 0 '(1 checked)' -- "$CP" "$R"
+# A path that climbed out of the checkout is refused on the PATH, and never probed on the
+# filesystem: `$ROOT/../outside.md` is a real path on the host, so the probe plants exactly that
+# file beside the tree -- which under a filesystem test would make the link read as resolving, and
+# the verdict a fact about the machine rather than about the prompts.
 links_tree
+printf 'Outside the checkout.\n' > "$TMP/outside.md"
 links_body alpha/references/notes.md 'Out of [the checkout](../../../outside.md).'
-expect "a path that climbs past the root is the missing file it names" 1 \
-  'resolves to no file: ../outside.md' -- "$CP" "$R"
+expect "a path that climbs past the root is refused, even where that file exists" 1 \
+  'resolves outside the checkout: ../outside.md' -- "$CP" "$R"
+rm -f "$TMP/outside.md"
 
 # Every file the scan reads links in is one, not just the skill prompts.
 links_tree; links_body README.md 'See [nothing](missing.md).'
@@ -1087,6 +1109,47 @@ links_tree
 links_body alpha/SKILL.md 'The shape read is `[label](references/gone.md)`, quoted here in prose.'
 expect "...and one quoted between backticks is read as the link it spells" 1 \
   'link to references/gone.md resolves to no file' -- "$CP" "$R"
+
+# A Markdown destination may carry balanced parentheses, so the target ends at the paren that
+# closes the link and not at the first one. Cut at the first, `a_(b).md` reads as `a_(b`, fails
+# the `.md` test and drops out of the scan in silence -- so a renamed parenthesized file would
+# pass this check rather than be reported (round 1, P2).
+links_tree
+links_body alpha/SKILL.md 'See [a parenthesized name](references/a_(b).md).'
+expect "a destination carrying balanced parentheses is read whole" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'See [a parenthesized name](references/a_(c).md).'
+expect "...so a missing one is reported, not skipped" 1 \
+  'resolves to no file: alpha/references/a_(c).md' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'Prose [linking](references/notes.md) and then (an aside in parentheses).'
+expect "...while an aside after a link is not part of its target" 0 '(1 checked)' -- "$CP" "$R"
+
+# GitHub numbers a repeated heading by taking the next FREE name, so an explicit `## Notes-1`
+# standing between two `## Notes` pushes the second repeat to `notes-2`. A per-base counter hands
+# out `notes-1` twice instead: it rejects the good link and lets one anchor answer for two
+# headings (round 1, P2). The scratch file writes exactly that sequence.
+links_tree
+links_body alpha/SKILL.md 'See [past the explicit suffix](references/notes.md#notes-2).'
+expect "a repeat steps over a heading that already holds its suffix" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'See [the explicit one](references/notes.md#notes-1).'
+expect "...and that heading keeps its own name" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'See [one repeat too many](references/notes.md#notes-3).'
+expect "...and no further name is handed out" 1 "GitHub slug is 'notes-3'" -- "$CP" "$R"
+
+# Beyond ASCII the slug is knowable for General Punctuation, which GitHub drops -- and is not for a
+# byte that may be a letter GitHub keeps. Dropping such a byte silently would ACCEPT the ASCII
+# residue as the anchor (`#caf` for `## Cafe<acute>`), so the heading contributes no slug and the link
+# is refused with the reason (round 1, P2).
+links_tree
+links_body alpha/SKILL.md 'See [an em dash dropped](references/notes.md#close--out).'
+expect "the punctuation GitHub drops is dropped here too" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'See [the ASCII residue](references/notes.md#caf).'
+expect "a heading carrying a letter past ASCII spells no anchor, so its residue answers for none" 1 \
+  'will not spell an anchor for' -- "$CP" "$R"
 
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.
