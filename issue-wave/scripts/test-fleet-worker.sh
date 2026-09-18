@@ -346,8 +346,8 @@ linked_skills=$(find "$real_home/.claude/skills" -mindepth 1 -maxdepth 1 -type l
 
 # Extract each lint step's patterns from the workflow: restating them here would let the test and
 # workflow drift together. Every shell file must be covered by BOTH the syntax and shellcheck step.
-workflow_globs() { # workflow_globs <step name>
-  awk -v want="$1" '
+workflow_globs() { # workflow_globs <checkout> <step name>
+  awk -v want="$2" '
     /^[[:space:]]*- name: / {
       if (in_step) exit
       if (index($0, "- name: " want) != 0) in_step = 1
@@ -359,12 +359,12 @@ workflow_globs() { # workflow_globs <step name>
       n = split(line, field, /[[:space:]]+/)
       for (i = 1; i <= n; i++) if (field[i] ~ /[*].*[.]sh$/) print field[i]
     }
-  ' "$real_top/.github/workflows/skill-scripts.yml"
+  ' "$1/.github/workflows/skill-scripts.yml"
 }
-workflow_matches() { # workflow_matches <newline-separated patterns>: expand from the checkout root
-  local patterns="$1"
+workflow_matches() { # workflow_matches <checkout> <newline-separated patterns>: expand from its root
+  local patterns="$2"
   (
-    cd "$real_top" || exit 1
+    cd "$1" || exit 1
     while IFS= read -r pattern; do
       [ -n "$pattern" ] || continue
       # Unquoted on purpose: the workflow's shell expands the same pathname glob. Unlike `case`,
@@ -376,22 +376,48 @@ $patterns
 EOF
   ) | sort -u
 }
-syntax_globs=$(workflow_globs 'Check shell syntax')
-shellcheck_globs=$(workflow_globs 'Shellcheck')
-shell_files=$(cd "$real_top" && find . -type f -name '*.sh' -print | sed 's|^\./||' | sort)
-syntax_files=$(workflow_matches "$syntax_globs")
-shellcheck_files=$(workflow_matches "$shellcheck_globs")
-uncovered=""
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  grep -Fqx -- "$f" <<<"$syntax_files" || uncovered="$uncovered bash-n:$f"
-  grep -Fqx -- "$f" <<<"$shellcheck_files" || uncovered="$uncovered shellcheck:$f"
-done <<EOF
-$shell_files
+tracked_shell_files() { # <checkout>: the shell scripts the repository tracks, one per line
+  # Tracked paths, for the reason the layout guard above reads them: CI's lint steps run over an
+  # actions/checkout, which holds no untracked file, so a scratch `*.sh` an agent leaves in a local
+  # worktree is not something these globs were ever meant to cover -- and under `find` it failed
+  # this guard with a message about the workflow. `*.sh` here is a git pathspec, not a pathname
+  # glob: its `*` crosses `/`, so it matches at every depth, which is what this guard wants, since
+  # the workflow's globs cover nested paths too.
+  git -C "$1" ls-files -z -- '*.sh' | while IFS= read -r -d '' path; do printf '%s\n' "$path"; done | sort
+}
+uncovered_shell_files() { # <checkout>: "<step>:<path>" for every tracked script a lint step misses
+  local syntax_files shellcheck_files uncovered="" f
+  syntax_files=$(workflow_matches "$1" "$(workflow_globs "$1" 'Check shell syntax')")
+  shellcheck_files=$(workflow_matches "$1" "$(workflow_globs "$1" 'Shellcheck')")
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    grep -Fqx -- "$f" <<<"$syntax_files" || uncovered="$uncovered bash-n:$f"
+    grep -Fqx -- "$f" <<<"$shellcheck_files" || uncovered="$uncovered shellcheck:$f"
+  done <<EOF
+$(tracked_shell_files "$1")
 EOF
+  printf '%s' "$uncovered"
+}
+syntax_globs=$(workflow_globs "$real_top" 'Check shell syntax')
+shellcheck_globs=$(workflow_globs "$real_top" 'Shellcheck')
+uncovered=$(uncovered_shell_files "$real_top")
 [ -n "$syntax_globs" ] && [ -n "$shellcheck_globs" ] && [ -z "$uncovered" ] \
   && ok "the workflow's own syntax and shellcheck globs cover every shell script in the tree" \
   || ko "workflow shell globs are missing or leave files uncovered:$uncovered (bash -n: $syntax_globs; shellcheck: $shellcheck_globs)"
+
+# Both halves of that reading, on the layout guard's clone: the scratch script an agent drops in a
+# worktree stays invisible, and the same path once the tree TRACKS it -- at the root, where none of
+# the workflow's globs reach -- is still reported against both lint steps.
+printf '#!/usr/bin/env bash\ntrue\n' > "$guard_clone/scratch-probe.sh"
+untracked_sh_verdict=$(uncovered_shell_files "$guard_clone")
+[ -z "$untracked_sh_verdict" ] \
+  && ok "an untracked shell script does not reach the lint-coverage guard" \
+  || ko "an untracked shell script tripped the lint-coverage guard:$untracked_sh_verdict"
+git -C "$guard_clone" add scratch-probe.sh || ko "could not track the guard clone's scratch script (setup, not the launcher)"
+tracked_sh_verdict=$(uncovered_shell_files "$guard_clone")
+[ "$tracked_sh_verdict" = " bash-n:scratch-probe.sh shellcheck:scratch-probe.sh" ] \
+  && ok "...while a tracked shell script no lint glob covers trips it" \
+  || ko "the lint-coverage guard missed a tracked uncovered shell script (verdict:$tracked_sh_verdict)"
 
 [ -L "$real_home/.claude/skills/ship-pr" ] && ok "the README's loop links ship-pr" || ko "the README's loop did not link ship-pr into ~/.claude/skills"
 [ ! -e "$real_home/.claude/skills/routines" ] && ok "the README's loop keeps routines/ out of ~/.claude/skills" || ko "the README's loop linked routines/ into ~/.claude/skills"
