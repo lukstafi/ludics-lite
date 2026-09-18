@@ -556,7 +556,6 @@ grep -q 'the VM is up and UNHELD and was not shut down: do not sweep that box' <
 reset_hold_state; : > "$SSH_LOG"
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1)
 hold_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
-echo "DBG procs=[$(pgrep -fl 'sleep infinity' | head -3)] sidecar=[$(ps -o pid,args -p "$(cut -d' ' -f4 "$TMP/state/hold-rog.pid")" 2>&1|tail -1)]"
 if [ -n "$hold_pid" ] && alive "$hold_pid"; then
   ok "the holder is a live process while the lane runs (pid $hold_pid)"
 else
