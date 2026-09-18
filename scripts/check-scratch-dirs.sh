@@ -716,7 +716,18 @@ for f in "${files[@]}"; do
           # only ever assigned with `readonly` is refused exactly as it is on main, and a file that
           # merely FREEZES an already-resolved root is refused too, which is the conservative
           # direction. The effect is that reading the keyword can only turn a pass into a refusal.
-          if (depth[i] == 0 && code[i] !~ /^[ \t]*readonly[ \t]+/) seen[key] = 1
+          # ...and an OPTION-BEARING declaration is disqualifying-only for the same reason. Reading
+          # options (round 7) let one into the table, and certifying from it assumed the option mode
+          # assigns -- which `declare -p BASE=$(cd /tmp && pwd -P)` does not: `-p` DISPLAYS each
+          # name, bash reports the expanded operand as a name it cannot find, BASE keeps whatever it
+          # inherited, and the guard certified it anyway (ludics-lite#252 review round 8). Which
+          # modes assign is a table of every option of five builtins, and the wrong entry certifies
+          # a root that was never set. The guard does not keep that table: an option on the line
+          # means the line can take a name away and never hand one over, which is round 4'"'"'s
+          # asymmetry again and costs only a `declare -r BASE=$(... pwd -P)` that has to be written
+          # without the flag to certify.
+          if (depth[i] == 0 && code[i] !~ /^[ \t]*readonly([ \t]|$)/ &&
+              code[i] !~ /^[ \t]*(local|declare|typeset|export|readonly)[ \t]+[-+]/) seen[key] = 1
           # The operand list is disqualified FIRST, ahead of every branch below -- two of which
           # `continue` out of the iteration. A first operand that captures a `mktemp -d` under a
           # resolved root is one of them, and `export AUX=$(mktemp -d "$OTHER/a.XXXXXX")

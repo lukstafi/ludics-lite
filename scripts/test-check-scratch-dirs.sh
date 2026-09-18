@@ -434,6 +434,43 @@ EOF
 expect "an option list with no assignment on it is not an assignment" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_option_without_assignment.sh"
 
+# Round 8 of #252: reading options (round 7) let an OPTION-BEARING declaration into the table, and
+# certifying from one assumes the option mode assigns. `declare -p` does not: it DISPLAYS each
+# name, so bash reports the expanded `BASE=/private/tmp` as a name it cannot find, BASE keeps
+# whatever it inherited, and the guard certified it anyway -- which main refuses, since main never
+# saw the line at all. Which modes assign is a table of every option of five builtins, and the
+# wrong entry certifies a root that was never set; so an option on the line means the line can take
+# a name away and never hand one over. Round 4's asymmetry, one axis over.
+probe bad_option_mode_certifies <<'EOF'
+declare -p BASE=$(cd /tmp && pwd -P)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an option-bearing declaration does not certify a root" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_option_mode_certifies.sh"
+
+# ...the same line without the flag does certify, which is what keeps the rule about OPTIONS rather
+# than about the keyword: a plain `declare BASE=$(... pwd -P)` assigns, and is the control for the
+# refusal above.
+probe safe_declare_root_no_option <<'EOF'
+declare BASE=$(CDPATH= cd /tmp && pwd -P)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a plain declare root still certifies" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_declare_root_no_option.sh"
+
+# ...and an option-bearing declaration still DISQUALIFIES, which is the half round 7 added: the two
+# directions are read differently on purpose.
+probe bad_option_mode_disqualifies <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+declare -r BASE=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "...while it still disqualifies, which is the asymmetry" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_option_mode_disqualifies.sh"
+
 # Round 3 of #252: and the guard does NOT try to work out whether an earlier `readonly` is in
 # force, which is why these two pass. `readonly -f TMP` freezes a FUNCTION named TMP and leaves the
 # variable alone, and a freeze inside `( ... )` is gone when the subshell exits; both files run
