@@ -1454,14 +1454,54 @@ ex_ips=$(grep -oE '\b(10|127|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]+\.[0-9]
 [ -z "$ex_ips" ] && ok "...and the example's IPs are documentation addresses, not a real LAN" \
   || ko "the example file carries private-range addresses: $ex_ips"
 
+# tracked_paths <checkout> -- its tracked files, absolute, NUL-delimited.
+# NUL-delimited because every line-based Git rendering C-quotes a pathname carrying a newline, a
+# quote, a backslash or -- under the default core.quotePath -- any non-ASCII byte, and the quoted
+# rendering names no file on disk. A line-based read would hand `[ -f ]` a miss and leave that
+# file unscanned, while the verdict below still said the repository carries no address.
+tracked_paths() {
+  local root="$1" f
+  (cd "$root" && git ls-files -z 2>/dev/null) | while IFS= read -r -d '' f; do
+    printf '%s\0' "$root/$f"
+  done
+}
+# macs_under <checkout> -- the leaks in what that checkout tracks.
+macs_under() {
+  local f
+  while IFS= read -r -d '' f; do
+    [ -f "$f" ] && mac_hits "$f"
+  done < <(tracked_paths "$1")
+}
+# The C-quoting control, for the same reason as the address control above: a scan that cannot
+# reach a quoted name proves nothing about the names this repository might grow. The fixture
+# carries both a newline and a non-ASCII byte, so it is quoted whatever core.quotePath says.
+quoted_repo="$TMP/quoted-name-repo"
+mkdir -p "$quoted_repo" &&
+  git -C "$quoted_repo" init -q 2>/dev/null &&
+  git -C "$quoted_repo" config user.email wake@lab.test &&
+  git -C "$quoted_repo" config user.name wake-lab-test || exit 1
+quoted_name=$(printf 'conf\nig-con\303\251.sh')
+printf 'eth_mac_of() { echo %s; }\n' \
+  "$(printf 'de%sad%sbe%sef%s12%s34' : : : : :)" >"$quoted_repo/$quoted_name"
+git -C "$quoted_repo" add -A >/dev/null 2>&1
+git -C "$quoted_repo" commit -qm 'a tracked name git quotes' >/dev/null 2>&1
+case "$(git -C "$quoted_repo" ls-files)" in
+'"'*) ok "the C-quoting fixture is a name git renders quoted" ;;
+*) ko "the fixture is not quoted, so the scan below proves nothing about quoted names" ;;
+esac
+[ -n "$(macs_under "$quoted_repo")" ] \
+  && ok "...and the MAC scan reaches a tracked file whose name git quotes" \
+  || ko "the MAC scan skips a tracked file whose name git quotes -- it would miss a leak there"
+
 # Tracked files, so a leak is judged by what the repository would publish. Before the first
 # commit of a new script `git ls-files` does not list it yet; scan scripts/ as well, always.
-tracked=$(cd "$HERE/.." && git ls-files 2>/dev/null | sed "s|^|$(cd "$HERE/.." && pwd)/|")
-[ -n "$tracked" ] && ok "the repository's tracked files are readable to scan" \
+ROOT_DIR=$(cd "$HERE/.." && pwd)
+tracked_count=0
+while IFS= read -r -d '' f; do tracked_count=$((tracked_count + 1)); done < <(tracked_paths "$ROOT_DIR")
+[ "$tracked_count" -gt 0 ] && ok "the repository's tracked files are readable to scan" \
   || ko "git ls-files came back empty -- the scan below covers only scripts/"
-leaks=$(printf '%s\n%s\n' "$tracked" "$(ls -d "$HERE"/*.sh)" | sort -u | grep -v '^$' | while read -r f; do
-  [ -f "$f" ] && mac_hits "$f"
-done)
+leaks=$( { macs_under "$ROOT_DIR"; for f in "$HERE"/*.sh; do [ -f "$f" ] && mac_hits "$f"; done; } \
+  | sort -u)
 if [ -z "$leaks" ]; then ok "no MAC address is tracked in the repository"
 else ko "MAC-shaped literals in tracked files:"; printf '%s\n' "$leaks"; fi
 
