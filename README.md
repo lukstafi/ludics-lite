@@ -338,8 +338,21 @@ of a row of the README that indexes it — the skill table above, the routine ta
 parser: it claims only that the name is written down as a row, not that the row renders, and it no
 longer reads the other direction, a row that outlived its directory. The scanner it replaced drew
 thirteen rounds of table-syntax edge cases in one review and reopened on every new rule
-(ludics-lite#75). `test-check-prompts.sh` runs it against scratch trees, one per defect, with the
-well-formed tree as the control, and ends by running it on this checkout.
+(ludics-lite#75). It also reads the relative Markdown links in those prompts, in the reference
+files they delegate to and in both READMEs: the path half of a `.md` link has to exist relative to
+the linking file, and an anchor on it has to be the GitHub slug of a heading in the target.
+ludics-lite#260 cut the wave prompt into sections addressed by anchor — `cli-claude.md#close-out`,
+`native-workers.md#placement-and-launch` and six more — and verified them by hand, once; a renamed
+file or a retitled heading leaves such a link rendering as a link and landing nowhere, which is a
+defect a reader finds and a test never did. This is the same kind of lookup as the index one, over
+one fixed shape, spelled out in the checker's own header: a parenthesized target directly after a
+bracketed label, on one line, with no blank in it and a path half ending in `.md`. Anything else —
+a URL, a title after the target, a site-absolute path, a bare anchor, a reference-style link, a
+target that wrapped onto the next line — is not checked rather than guessed at. There is no
+inline-code or fenced-code scope either, deliberately and at a cost paid in this very paragraph:
+prose that spells a whole link in backticks is read as that link, so documentation of the syntax
+has to describe it rather than write one. `test-check-prompts.sh` runs it against scratch trees,
+one per defect, with the well-formed tree as the control, and ends by running it on this checkout.
 
 `check-jq-shapes.sh` is the jq shape guard, run in the lint job on every head over every
 `*/scripts/*.sh` and `scripts/*.sh` in the checkout — the lint job's own file list, less

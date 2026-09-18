@@ -417,11 +417,32 @@ expect "a removed fixture leaves no membership obligation" 0 '0 failed' -- "$CP"
 # tree is the real files, COPIED: a probe over invented prose would keep passing while the
 # checker's spellings drifted away from the ones the prompts actually use. Every mutation below
 # rewrites a copy under $TMP; nothing in the checkout is touched. The tree is a valid root on its
-# own -- the real README indexes more skills than it holds, which the index lookup allows, and it
-# carries no fixture, so no membership obligation comes with it. `native-claude.md` is in it as a
-# file the scan DISCOVERS rather than requires: it states the count and is held for it.
+# own -- the real README indexes more skills than it holds, which the index lookup allows, its
+# links all have their targets ($LINK_TARGETS), and it carries no fixture, so no membership
+# obligation comes with it. `native-claude.md` is in it as a file the slot scan DISCOVERS rather
+# than requires: it states the count and is held for it.
 SRC=$(cd "$HERE/.." && pwd)
 WORKER=issue-wave/scripts/fleet-worker.sh
+# copy_prompts <root> <file>...: each named file of this checkout, at the path it lives in.
+copy_prompts() {
+  local root="$1" f; shift
+  for f in "$@"; do
+    mkdir -p "$root/$(dirname "$f")"
+    cp "$SRC/$f" "$root/$f"
+  done
+}
+# LINK_TARGETS: the Markdown that README.md, issue-wave/SKILL.md and each other reach by relative
+# link -- the wave's reference files and the hook README, which is the whole closure. The two
+# real-file trees below carry them because the link check reads every such link in the prompts they
+# copy, and a tree holding a linking file without its target would fail on a defect its probes are
+# not about. Listed rather than discovered: discovering them means running the extraction under
+# test, and copying every Markdown file instead doubles this suite's runtime, since each rebuild is
+# then re-scanned in full. A link added to a copied prompt whose target is not named here fails
+# LOUDLY -- on every probe of that tree at once, with the path it could not resolve in the message.
+LINK_TARGETS="issue-wave/references/cli-claude.md issue-wave/references/executions.md
+  issue-wave/references/native-claude.md issue-wave/references/native-codex.md
+  issue-wave/references/native-workers.md issue-wave/references/separate-codex.md
+  ship-pr/hooks/README.md"
 # The default as the checker reads it, and a number that is not it: the probes state no literal
 # count, so raising the default again leaves them testing the same thing.
 # The LAST such assignment, as the shell and the checker both take it: reading every match would
@@ -444,12 +465,10 @@ STALE=eleven;     [ "${WANT:-0}" = 11 ] && STALE=twelve
 STALE_HYPHEN=twenty-six; [ "${WANT:-0}" = 26 ] && STALE_HYPHEN=twenty-seven
 slots_tree() {
   rm -rf "$R"
-  mkdir -p "$R/issue-wave/references" "$R/issue-wave/scripts" "$R/routines"
-  cp "$SRC/README.md" "$R/README.md"
-  cp "$SRC/routines/README.md" "$R/routines/README.md"
-  cp "$SRC/issue-wave/SKILL.md" "$R/issue-wave/SKILL.md"
-  cp "$SRC/issue-wave/references/executions.md" "$R/issue-wave/references/executions.md"
-  cp "$SRC/issue-wave/references/native-claude.md" "$R/issue-wave/references/native-claude.md"
+  mkdir -p "$R/issue-wave/scripts"
+  # $LINK_TARGETS unquoted on purpose: a list of paths, none of which carries a blank.
+  # shellcheck disable=SC2086
+  copy_prompts "$R" README.md routines/README.md issue-wave/SKILL.md $LINK_TARGETS
   cp "$SRC/$WORKER" "$R/$WORKER"
 }
 # slots_edit <file> <sed-expression>: rewrites one copy. An expression that matched nothing would
@@ -825,7 +844,8 @@ grep -q 'mac-studio' <<<"$out" && ko "a root without $WORKER is held to a slot c
 # drift, and nothing but this check stops that step being edited away. Like the slot probes, the
 # tree is the REAL prompts and the REAL script, copied -- a probe over invented prose would keep
 # passing while the checker and the prompts drifted apart. Both READMEs come along because the
-# index lookup wants them; no fixture and no fleet-worker.sh, so neither other agreement applies.
+# index lookup wants them and $LINK_TARGETS because the link check does; no fixture and no
+# fleet-worker.sh, so neither of those two agreements applies.
 DRIFT_ROUTINES=$(sed -n 's/^LOCAL_ROUTINES="\([^"]*\)"[[:space:]]*$/\1/p' "$SRC/scripts/sync-routines.sh")
 [ -n "$DRIFT_ROUTINES" ] \
   || ko "the drift probes need a one-line LOCAL_ROUTINES=\"...\" in scripts/sync-routines.sh"
@@ -839,14 +859,11 @@ DRIFT_HOME=${DRIFT_HOME%%$'\n'*}
 DRIFT_WANT="runs no $DRIFT_HOME/scripts/sync-routines.sh"
 drift_tree() {
   rm -rf "$R"
-  mkdir -p "$R/routines" "$R/scripts"
-  cp "$SRC/README.md" "$R/README.md"
-  cp "$SRC/routines/README.md" "$R/routines/README.md"
+  mkdir -p "$R/scripts"
+  # shellcheck disable=SC2086
+  copy_prompts "$R" README.md routines/README.md $LINK_TARGETS
   cp "$SRC/scripts/sync-routines.sh" "$R/scripts/sync-routines.sh"
-  for r in $DRIFT_ROUTINES; do
-    mkdir -p "$R/routines/$r"
-    cp "$SRC/routines/$r/SKILL.md" "$R/routines/$r/SKILL.md"
-  done
+  for r in $DRIFT_ROUTINES; do copy_prompts "$R" "routines/$r/SKILL.md"; done
 }
 # drift_edit <file> <sed-expression>: rewrites one copy, and says so if it matched nothing --
 # a mutation that changed nothing leaves a probe asserting a refusal the tree no longer earns.
@@ -937,6 +954,194 @@ fresh "$R"
 out=$("$CP" "$R" 2>&1)
 grep -q 'drift' <<<"$out" && ko "a root without scripts/sync-routines.sh is held to a drift step" \
   || ok "...and a root without the sync script carries no drift obligation"
+
+# --- relative links and anchors ---------------------------------------------------------------
+# ludics-lite#260 cut the wave prompt and its references into sections addressed by anchor, and
+# every one of those links was verified by hand, once; this is what re-verifies them. Two trees,
+# for the two things there are to pin. A scratch one for the READING -- what counts as a link,
+# which directory a path is read from, what a heading slugs to -- where each probe is one defect
+# against the well-formed control. Then the REAL prompts, copied, for the claim that today's links
+# resolve and that a moved heading or a renamed file is caught, which is the drift the check is
+# for: a probe over invented headings would keep passing while the prompts' own links rotted.
+
+links_tree() {   # a passing layout, plus a reference file for the prompts to link into
+  fresh "$R"
+  mkdir -p "$R/alpha/references"
+  cat > "$R/alpha/references/notes.md" <<'EOF'
+# Notes
+
+## Close-out
+
+The first one.
+
+## Supervision, recovery and evidence
+
+Punctuation to drop, blanks to hyphenate.
+
+## Close-out
+
+The second one, which GitHub numbers.
+EOF
+}
+# links_body <file> <line...>: appends Markdown to a file in the scratch tree.
+links_body() { local f="$1"; shift; printf '%s\n' "$@" >> "$R/$f"; }
+
+links_tree
+links_body alpha/SKILL.md 'See [one section](references/notes.md#close-out) and [all of it](references/notes.md).'
+expect "a resolving link, with an anchor and without" 0 '(2 checked)' -- "$CP" "$R"
+
+links_tree
+links_body alpha/SKILL.md 'See [what moved](references/gone.md).'
+expect "a link to a file that is not there" 1 \
+  'alpha/SKILL.md: link to references/gone.md resolves to no file: alpha/references/gone.md' -- "$CP" "$R"
+
+links_tree
+links_body alpha/SKILL.md 'See [what was retitled](references/notes.md#launch).'
+expect "an anchor no heading slugs to" 1 \
+  "link to references/notes.md#launch names no heading: alpha/references/notes.md has none whose GitHub slug is 'launch'" -- "$CP" "$R"
+
+# The slug is GitHub's: blanks become hyphens, a hyphen already there stays, and the punctuation
+# between them goes. Each half is pinned by an anchor that only holds if that half is right.
+links_tree
+links_body alpha/SKILL.md 'See [a slugged heading](references/notes.md#supervision-recovery-and-evidence).'
+expect "punctuation is dropped and blanks become hyphens" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'See [a hyphen dropped too](references/notes.md#closeout).'
+expect "...while a hyphen in the heading is kept, not dropped with the punctuation" 1 \
+  "GitHub slug is 'closeout'" -- "$CP" "$R"
+
+# A heading written twice is reachable twice: GitHub numbers the repeats, and a link to the second
+# one is a link this check must not report as broken.
+links_tree
+links_body alpha/SKILL.md 'See [the second one](references/notes.md#close-out-1).'
+expect "a repeated heading takes GitHub's -1 suffix" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'See [a third one](references/notes.md#close-out-2).'
+expect "...and only as many of them as the file writes" 1 "GitHub slug is 'close-out-2'" -- "$CP" "$R"
+
+# The anchor is compared as TEXT and in full, the way the README index lookup compares a name.
+links_tree
+links_body alpha/SKILL.md 'See [a prefix of one](references/notes.md#close).'
+expect "an anchor that is a prefix of a slug is not that slug" 1 "GitHub slug is 'close'" -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'See [a pattern](references/notes.md#close.out).'
+expect "a '.' in an anchor is that character, not a wildcard" 1 "GitHub slug is 'close.out'" -- "$CP" "$R"
+
+# A path is read from the LINKING file's directory. Both directions: the root-relative spelling of
+# a target that resolves is a different file, and `..` climbs out of a reference directory.
+links_tree
+links_body alpha/SKILL.md 'See [the root-relative spelling](alpha/references/notes.md).'
+expect "a path is read from the linking file's directory, not from the root" 1 \
+  'resolves to no file: alpha/alpha/references/notes.md' -- "$CP" "$R"
+links_tree
+links_body alpha/references/notes.md 'Back to [the prompt](../SKILL.md).'
+expect "a reference file is a linking file too, and '..' climbs from it" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+links_body alpha/references/notes.md 'Out of [the checkout](../../../outside.md).'
+expect "a path that climbs past the root is the missing file it names" 1 \
+  'resolves to no file: ../outside.md' -- "$CP" "$R"
+
+# Every file the scan reads links in is one, not just the skill prompts.
+links_tree; links_body README.md 'See [nothing](missing.md).'
+expect "README.md is a linking file" 1 'FAIL: README.md: link to missing.md resolves to no file: missing.md' -- "$CP" "$R"
+links_tree; links_body routines/README.md 'See [nothing](missing.md).'
+expect "...and routines/README.md" 1 'FAIL: routines/README.md: link to missing.md resolves to no file: routines/missing.md' -- "$CP" "$R"
+links_tree; links_body routines/nightly/SKILL.md 'See [nothing](missing.md).'
+expect "...and a routine prompt" 1 'FAIL: routines/nightly/SKILL.md: link to missing.md resolves to no file: routines/nightly/missing.md' -- "$CP" "$R"
+
+# What falls outside the one shape this reads is NOT CHECKED rather than guessed at. Each target
+# below names something that is not there, so a probe that passes is a probe reporting the gap it
+# is meant to report -- and each gap reports nothing rather than reporting wrongly.
+while IFS='|' read -r label link; do
+  links_tree
+  links_body alpha/SKILL.md "See $link."
+  expect "outside the shape, so not read: $label" 0 '0 failed' -- "$CP" "$R"
+done <<'EOF'
+an http(s) URL|[released](https://example.invalid/missing.md)
+another URI scheme|[write in](mailto:nobody@example.invalid)
+a link carrying a title|[titled](references/gone.md "Not read")
+a site-absolute path|[absolute](/references/gone.md)
+a same-file anchor, which names no file|[here](#close-out)
+a target that is not Markdown|[the licence](LICENSE)
+EOF
+links_tree
+links_body alpha/SKILL.md 'See [a target on the next line](' 'references/gone.md).'
+expect "outside the shape, so not read: a link split across two lines" 0 '0 failed' -- "$CP" "$R"
+
+# There is no fenced-code scope, which is the reading's one gap that cuts both ways -- pinned from
+# both sides, so it is a decision on record rather than a hole nobody meant (as with the table
+# model ludics-lite#75 removed). A `#` line inside a fence reads as a heading, which only makes the
+# anchor lookup more permissive; a link inside a fence is read like any other, which is stricter.
+links_tree
+links_body alpha/references/notes.md '```sh' '# Improvised heading' '```'
+links_body alpha/SKILL.md 'See [a comment in a fence](references/notes.md#improvised-heading).'
+expect "a '#' comment inside a fence reads as a heading" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md '```' 'See [an example](references/gone.md).' '```'
+expect "...and a link inside a fence is read like any other" 1 \
+  'link to references/gone.md resolves to no file' -- "$CP" "$R"
+# The same on one line, which is the form documentation actually reaches for and the one this
+# repository paid for: the README's paragraph about this check had to describe the shape rather
+# than spell one. Pinned so that cost is a decision, not a surprise.
+links_tree
+links_body alpha/SKILL.md 'The shape read is `[label](references/gone.md)`, quoted here in prose.'
+expect "...and one quoted between backticks is read as the link it spells" 1 \
+  'link to references/gone.md resolves to no file' -- "$CP" "$R"
+
+# The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
+# reported as link-checked.
+fresh "$R"
+out=$("$CP" "$R" 2>&1)
+grep -q 'relative Markdown link' <<<"$out" && ko "a tree with no link is reported as link-checked" \
+  || ok "...and a tree carrying no such link takes no link obligation"
+
+# Under Actions the failure is an annotation on the LINKING file, which is the file to edit.
+links_tree
+links_body alpha/SKILL.md 'See [what moved](references/gone.md).'
+expect "GitHub annotations name the linking file" 1 '::error file=alpha/SKILL.md::link to references/gone.md' \
+  -- env GITHUB_ACTIONS=true "$CP" "$R"
+
+# The real prompts. The link probed is read OFF the wave prompt rather than restated here: the
+# anchors ludics-lite#260 created are exactly what moves next time the sections do, and a probe
+# naming one literally would go stale at that edit instead of catching it.
+LINK_ALL=$(sed -n 's|.*(\(references/[A-Za-z0-9_.-]*\.md#[A-Za-z0-9_-]*\)).*|\1|p' "$SRC/issue-wave/SKILL.md")
+LINK_TARGET=${LINK_ALL%%$'\n'*}
+LINK_FILE=${LINK_TARGET%%#*}
+[ -n "${LINK_TARGET#*#}" ] && [ -f "$SRC/issue-wave/$LINK_FILE" ] \
+  || ko "the link probes need an anchored references/....md#... link in issue-wave/SKILL.md; read '$LINK_TARGET'"
+# The one tree that takes EVERY Markdown file, because the real link graph is its subject. The
+# other two take $LINK_TARGETS, which costs a tenth of the time over their seventy-odd rebuilds.
+links_real() {
+  local f
+  rm -rf "$R"; mkdir -p "$R"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    copy_prompts "$R" "$f"
+  done <<<"$(cd "$SRC" && find . -name .git -prune -o -name '*.md' -print | sed 's|^\./||' | sort)"
+}
+# links_edit <file> <sed-expression>: rewrites one copy, and says so if it matched nothing -- a
+# mutation that changed nothing leaves a probe asserting a refusal the tree no longer earns.
+links_edit() {
+  sed "$2" "$R/$1" > "$R/links.tmp" || { ko "links_edit: sed failed on $1"; return 1; }
+  cmp -s "$R/links.tmp" "$R/$1" && { ko "links_edit: '$2' matched nothing in $1"; return 1; }
+  mv "$R/links.tmp" "$R/$1"
+}
+
+links_real
+expect "every relative link in the real prompts resolves, anchors included" 0 \
+  'anchors included' -- "$CP" "$R"
+
+# The two drifts this check exists for, each made at the source: a section retitled, and the file
+# holding it renamed. Both look exactly like a working link until somebody clicks one.
+links_real
+links_edit "issue-wave/$LINK_FILE" 's/^## /## Renamed /'
+expect "a retitled heading is caught in the prompt that anchors into it" 1 \
+  "issue-wave/SKILL.md: link to $LINK_TARGET names no heading" -- "$CP" "$R"
+
+links_real
+mv "$R/issue-wave/$LINK_FILE" "$R/issue-wave/${LINK_FILE%.md}-renamed.md"
+expect "a renamed reference file is caught the same way" 1 \
+  "issue-wave/SKILL.md: link to $LINK_FILE" -- "$CP" "$R"
 
 # --- this checkout ---------------------------------------------------------------------------
 expect "this checkout's prompts pass" 0 '0 failed' -- "$CP"

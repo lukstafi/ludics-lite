@@ -21,7 +21,7 @@
 # directory carrying a SKILL.md is named, in backticks, in the first cell of a row there, so a new
 # prompt cannot land unindexed. That is a lookup, not a rendering claim: see `indexed` below for
 # what it stopped asserting when the table scanner went (ludics-lite#75).
-# Three cross-file agreements ride along, each pinning a fact the prompts only restate: every test
+# Four cross-file agreements ride along, each pinning a fact the prompts only restate: every test
 # fixture has a command in the README's register and a run line on each CI platform it needs, and
 # every file that quotes the mac-studio correctness-slot count quotes the one fleet-worker.sh
 # actually defaults to (ludics-lite#160) -- which files those are is discovered, not listed.
@@ -29,6 +29,11 @@
 # requires each of their prompts to RUN that script -- the command line, not a mention of the
 # name -- so the step 0 that makes an installed copy's drift visible cannot be edited away in
 # silence (ludics-lite#199).
+#
+# A fourth reads the relative Markdown links in those prompts, their reference files and the two
+# READMEs: the path a `](….md)` link spells exists relative to the linking file, and an anchor on
+# it is the GitHub slug of a heading in the target -- so the section links ludics-lite#260 created
+# and verified by hand cannot rot in silence (see `check_links` for the one shape it reads).
 #
 # Usage: check-prompts.sh [root]   (root defaults to the checkout this script lives in;
 #                                   exit 0 all pass, 1 otherwise)
@@ -874,6 +879,182 @@ check_drift_guard() {
   [ "$bad" -ne 0 ] || ok "every routine $SYNC_SCRIPT installs runs it to read its own drift"
 }
 
+# --- relative links and anchors ----------------------------------------------------------------
+# A prompt that points at another prompt points at a PATH, and since ludics-lite#260 often at a
+# HEADING inside it: that PR cut `issue-wave/SKILL.md` and its references into sections addressed
+# by anchor -- `cli-claude.md#supervising`, `native-workers.md#placement-and-launch`,
+# `separate-codex.md#ci-and-review-evidence` and five more -- and every one of them was verified by
+# hand, once. Nothing re-verifies them: a renamed file, a moved section and a retitled heading all
+# leave the link rendering as a link and landing nowhere, which is a defect a reader finds and a
+# test never does. This makes that one-time verification permanent.
+#
+# Scope is the prompts and the two READMEs that index them, plus the reference files the prompts
+# delegate to: `*/SKILL.md`, `*/references/*.md`, `routines/*/SKILL.md`, `README.md` and
+# `routines/README.md`.
+#
+# The scan is fixed and deterministic, and carries no Markdown model, for the reason `indexed`
+# above carries none (ludics-lite#75): what it reads is ONE shape, `](<target>)` on one line with
+# no blank inside the target and a path half ending in `.md`, and what it then claims is two
+# lookups -- the path exists relative to the LINKING file, and the anchor is the GitHub slug of one
+# of the target's ATX headings. Everything outside that shape is not checked rather than guessed
+# at, and each of those gaps reports nothing rather than reporting wrongly: a target carrying a URI
+# scheme or a leading `/` (`https://…`, `mailto:…`, `/x.md`) is not a file in this checkout; a
+# target with a blank in it -- a `](path.md "Title")` link -- is outside the form; a `](#anchor)`
+# names no file and a non-`.md` target has no headings to name; a reference-style `[text][ref]` is
+# a different syntax; and a link whose `](` and `)` fall on different lines is not one line.
+#
+# There is no code scope either, fenced or inline, and that is the one gap cutting both ways. A
+# `# ` line inside a fence reads here as a heading, which only makes the ANCHOR lookup more
+# permissive; but a link written inside a fence or between backticks is read like any other, so
+# prose ILLUSTRATING the syntax is read as the link it spells. That cost is real and was paid the
+# first time this check was documented -- the README's own sentence about it had to describe the
+# shape rather than write one. It is still the cheaper side: a code model -- info strings, tildes,
+# nesting, indentation, backtick runs -- is the same table model whose edge cases took thirteen
+# review rounds of ludics-lite#75, while this costs one rephrasing, at a failure that names the
+# file and the line's target.
+
+# link_files: the Markdown whose links this check reads, root-relative.
+link_files() {
+  (cd "$ROOT" && for f in README.md routines/README.md */SKILL.md routines/*/SKILL.md \
+    */references/*.md; do [ -f "$f" ] && echo "$f"; done) | sort -u
+}
+
+# md_links <rel> <dir>: every link of the read shape in the root-relative file <rel>, one per line,
+# as `<rel> TAB <target> TAB <resolved> TAB <anchor>` -- the file, for the message; the target as
+# WRITTEN, which is what the message names; the path it spells, resolved; and the anchor, empty
+# when the link carries none. Resolution happens inside this scan, rather than in a reader of its
+# own, because this is the one thing in the file that runs once per LINK and not once per file: a
+# reader per link is six dozen processes per run of the checker, over a string operation awk is
+# already standing in front of.
+#
+# resolve: the path as written, read from <rel>'s directory, with its `.` and `..` segments taken
+# out. Lexically, and never through the filesystem: what a link means is the path it spells, and
+# `readlink -f` would answer for wherever a symlink under it points -- and would answer nothing at
+# all for the missing file this is about to report. A path that climbs past the root keeps its
+# leading `..`, so it is reported as the nonexistent file it is.
+md_links() {
+  CP_REL="$1" CP_DIR="$2" awk '
+    BEGIN { rel = ENVIRON["CP_REL"]; dir = ENVIRON["CP_DIR"] }
+    {
+      line = $0
+      while ((i = index(line, "](")) > 0) {
+        line = substr(line, i + 2)
+        j = index(line, ")")
+        if (j == 0) break                          # no closing paren on this line: not the shape
+        target = substr(line, 1, j - 1)
+        line = substr(line, j + 1)
+        if (target ~ /[[:space:]]/) continue       # a titled link, say: outside the form
+        if (target ~ /^[A-Za-z][A-Za-z0-9+.-]*:/) continue    # a URI scheme: not a path here
+        if (substr(target, 1, 1) == "/") continue             # nor is an absolute path
+        hash = index(target, "#")
+        path = (hash > 0) ? substr(target, 1, hash - 1) : target
+        anchor = (hash > 0) ? substr(target, hash + 1) : ""
+        if (path !~ /\.md$/) continue              # `](#anchor)` and `](LICENSE)` alike
+        print rel "\t" target "\t" resolve(dir, path) "\t" anchor
+      }
+    }
+    function resolve(dir, path,   parts, k, i, out, n, s) {
+      k = split(dir "/" path, parts, "/")
+      n = 0
+      for (i = 1; i <= k; i++) {
+        if (parts[i] == "" || parts[i] == ".") continue
+        if (parts[i] == ".." && n > 0 && out[n] != "..") { n--; continue }
+        out[++n] = parts[i]
+      }
+      s = ""
+      for (i = 1; i <= n; i++) s = (s == "") ? out[i] : s "/" out[i]
+      return s
+    }' "$ROOT/$1"
+}
+
+# heading_slugs <file> [prefix]: the GitHub anchor of every ATX heading in <file>, one per line and
+# in file order, each behind the optional <prefix> -- which is how the whole lookup table below is
+# built with one reader per target file rather than one per anchor.
+# The slug is GitHub's own reading: lowercased, each blank turned into a hyphen, the ASCII
+# word characters and the hyphen kept and everything else dropped -- and a slug already seen in the
+# file takes the `-1`, `-2` suffix GitHub gives a repeated heading, so the second `## Close-out` is
+# reachable as `#close-out-1` rather than unreachable.
+# A byte outside ASCII is dropped with the punctuation, which is GitHub's reading of a dash or a
+# quotation mark and NOT of a letter: a heading carrying a non-ASCII letter is one whose anchor
+# this check cannot spell, so a link into it is refused rather than accepted on a guess.
+heading_slugs() {
+  CP_PREFIX="${2:-}" awk '
+    BEGIN { prefix = ENVIRON["CP_PREFIX"] }
+    {
+      line = $0
+      # An ATX heading, by GFM: up to three leading spaces, one to six hashes, then a blank. The
+      # counts are walked rather than matched, since an ERE interval is not something every awk on
+      # the fleet reads alike.
+      spaces = 0; while (substr(line, spaces + 1, 1) == " ") spaces++
+      if (spaces > 3) next
+      hashes = 0; while (substr(line, spaces + hashes + 1, 1) == "#") hashes++
+      if (hashes < 1 || hashes > 6) next
+      rest = substr(line, spaces + hashes + 1)
+      if (rest !~ /^[ \t]/) next                   # `#tag` is text to GFM, not a heading
+      sub(/[ \t]+#+[ \t]*$/, "", rest)             # the optional closing run of hashes
+      s = slug(rest)
+      if (s == "") next
+      # `print (expr) ? a : b` is a shape awk implementations do not all parse alike -- the
+      # parenthesis reads as an output list to some of them -- so the suffix is applied first.
+      n = seen[s]++
+      if (n > 0) s = s "-" n
+      print prefix s
+    }
+    function slug(h,   i, c, out) {
+      h = tolower(h)                               # ASCII only, by locale, as GitHub folds ASCII
+      sub(/^[ \t]+/, "", h); sub(/[ \t]+$/, "", h)
+      out = ""
+      for (i = 1; i <= length(h); i++) {
+        c = substr(h, i, 1)
+        if (c == " " || c == "\t") out = out "-"
+        else if (c ~ /^[a-z0-9_-]$/) out = out c
+      }
+      return out
+    }' "$1"
+}
+
+check_links() {
+  local rel dir links all="" wanted t target resolved anchor slugs="" nl tab count=0 bad=0
+  nl=$'\n'; tab=$(printf '\t')
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    dir=${rel%/*}; [ "$dir" = "$rel" ] && dir=.
+    links=$(md_links "$rel" "$dir")
+    [ -n "$links" ] || continue
+    all="$all$links$nl"
+  done <<<"$(link_files)"
+  # No link is no verdict on the links, as no fixture is no verdict on the register: the obligation
+  # comes from a link, and a prompt-only scratch root may carry none.
+  [ -n "$all" ] || return 0
+  # The slug table: every heading of every target an ANCHORED link names, read ONCE per target file.
+  # A prompt that points eight times into one reference would otherwise re-read it eight times.
+  wanted=$(printf '%s' "$all" | awk -F"$tab" '$4 != "" { print $3 }' | sort -u)
+  while IFS= read -r t; do
+    [ -n "$t" ] && [ -f "$ROOT/$t" ] || continue
+    slugs="$slugs$(heading_slugs "$ROOT/$t" "$t$tab")$nl"
+  done <<<"$wanted"
+  # A tab at a time, and line by line: a path may hold a blank, and splitting on one would read a
+  # link nobody wrote and then report the file it did not find.
+  while IFS="$tab" read -r rel target resolved anchor; do
+    [ -n "$rel" ] || continue
+    count=$((count + 1))
+    if [ ! -f "$ROOT/$resolved" ]; then
+      ko "$rel" "link to $target resolves to no file: $resolved"; bad=1; continue
+    fi
+    [ -n "$anchor" ] || continue
+    # The anchor is compared as TEXT and in full, the way `indexed` compares a name: a `.` in an
+    # anchor is that character and `#close` does not find `close-out`, because the pattern is a
+    # whole `<target> TAB <slug>` line of the table with a newline on either side of it.
+    case "$nl$slugs" in
+      *"$nl$resolved$tab$anchor$nl"*) ;;
+      *) ko "$rel" "link to $target names no heading: $resolved has none whose GitHub slug is '$anchor'"
+        bad=1 ;;
+    esac
+  done <<<"$all"
+  [ "$bad" -ne 0 ] \
+    || ok "every relative Markdown link in the prompts resolves, anchors included ($count checked)"
+}
+
 # --- run --------------------------------------------------------------------------------------
 if $ONE; then
   if [ -f "$ROOT/SKILL.md" ]; then check_skill_file SKILL.md
@@ -897,6 +1078,7 @@ check_index routines/README.md routines/ routine
 check_fixtures
 check_slots
 check_drift_guard
+check_links
 
 echo
 echo "check-prompts: $pass passed, $fail failed"
