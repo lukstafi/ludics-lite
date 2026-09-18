@@ -122,10 +122,22 @@ physical_of() {
     rounds=$((rounds + 1))
     d=$p
     suffix=
+    # Peel with parameter expansion rather than `$(basename)`/`$(dirname)`: command
+    # substitution strips trailing newlines, so a component whose name ends in one would come
+    # back truncated and the path would resolve to a neighbour that is not it. ${d%/*} empties
+    # out on a component sitting directly under the root (`/a` -> ``), which the loop's own
+    # `[ -n "$d" ]` reads as the end of the walk -- the same place `dirname`'s `/` stopped it.
     while [ "$d" != "/" ] && [ -n "$d" ] && [ ! -d "$d" ]; do
-      suffix="/$(basename "$d")$suffix"
-      d=$(dirname "$d")
+      comp=${d##*/}
+      suffix="/$comp$suffix"
+      case "$d" in */*) d=${d%/*} ;; *) d= ;; esac
     done
+    # The resolver below is command substitution over a pathname too, and that one stays: `pwd
+    # -P` can only leave its subshell as output, command substitution eats the trailing newlines
+    # it would have to carry, and there is no realpath on stock macOS to ask instead. So the
+    # residual: an EXISTING directory whose own name ends in a newline is not resolved faithfully
+    # by this function -- only the non-existent tail peeled above is exact. Issue #239 tracks the
+    # class and records `$(cd ... && pwd -P)` as wanting a permanent exemption.
     if [ -d "$d" ]; then base=$(cd "$d" && pwd -P); else base=$d; fi
     [ "$base" = "/" ] && base=
     oldifs=$IFS
