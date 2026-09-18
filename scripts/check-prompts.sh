@@ -21,7 +21,7 @@
 # directory carrying a SKILL.md is named, in backticks, in the first cell of a row there, so a new
 # prompt cannot land unindexed. That is a lookup, not a rendering claim: see `indexed` below for
 # what it stopped asserting when the table scanner went (ludics-lite#75).
-# Three cross-file agreements ride along, each pinning a fact the prompts only restate: every test
+# Four cross-file agreements ride along, each pinning a fact the prompts only restate: every test
 # fixture has a command in the README's register and a run line on each CI platform it needs, and
 # every file that quotes the mac-studio correctness-slot count quotes the one fleet-worker.sh
 # actually defaults to (ludics-lite#160) -- which files those are is discovered, not listed.
@@ -29,6 +29,11 @@
 # requires each of their prompts to RUN that script -- the command line, not a mention of the
 # name -- so the step 0 that makes an installed copy's drift visible cannot be edited away in
 # silence (ludics-lite#199).
+#
+# A fourth reads the relative Markdown links in those prompts, their reference files and the two
+# READMEs: the path a `](….md)` link spells exists relative to the linking file, and an anchor on
+# it is the GitHub slug of a heading in the target -- so the section links ludics-lite#260 created
+# and verified by hand cannot rot in silence (see `check_links` for the one shape it reads).
 #
 # Usage: check-prompts.sh [root]   (root defaults to the checkout this script lives in;
 #                                   exit 0 all pass, 1 otherwise)
@@ -874,6 +879,561 @@ check_drift_guard() {
   [ "$bad" -ne 0 ] || ok "every routine $SYNC_SCRIPT installs runs it to read its own drift"
 }
 
+# --- relative links and anchors ----------------------------------------------------------------
+# A prompt that points at another prompt points at a PATH, and since ludics-lite#260 often at a
+# HEADING inside it: that PR cut `issue-wave/SKILL.md` and its references into sections addressed
+# by anchor -- `cli-claude.md#supervising`, `native-workers.md#placement-and-launch`,
+# `separate-codex.md#ci-and-review-evidence` and five more -- and every one of them was verified by
+# hand, once. Nothing re-verifies them: a renamed file, a moved section and a retitled heading all
+# leave the link rendering as a link and landing nowhere, which is a defect a reader finds and a
+# test never does. This makes that one-time verification permanent.
+#
+# Scope is the prompts and the two READMEs that index them, plus the reference files the prompts
+# delegate to: `*/SKILL.md`, `*/references/*.md`, `routines/*/SKILL.md`, `README.md` and
+# `routines/README.md`.
+#
+# The scan is fixed and deterministic, and carries no Markdown model, for the reason `indexed`
+# above carries none (ludics-lite#75): what it reads is ONE shape, `](<target>)` on one line with
+# no blank inside the target and a path half ending in `.md`, and what it then claims is two
+# lookups -- the path exists relative to the LINKING file, and the anchor is the GitHub slug of one
+# of the target's ATX headings. Everything outside that shape is not checked rather than guessed
+# at, and each of those gaps reports nothing rather than reporting wrongly: a target carrying a URI
+# scheme or a leading `/` (`https://…`, `mailto:…`, `/x.md`) is not a file in this checkout; a
+# target with a blank in it -- a `](path.md "Title")` link -- is outside the form; a `](#anchor)`
+# names no file and a non-`.md` target has no headings to name; a target spelled in anything but
+# ordinary path characters (a `%` escape, a backslash, an angle-bracket destination) is one this
+# scan does not decode; a reference-style `[text][ref]` is a different syntax; and a link whose
+# `](` and `)` fall on different lines is not one line.
+#
+# What the scan will not do is answer about the MACHINE instead of the prompts. A path spelling its
+# way out of the checkout, and one walking out through a symbolic link, are both refused on the
+# path -- never probed, so no file beside the checkout can make an outside link read as resolving.
+#
+# There is no BLOCK scope, and that is the one gap cutting both ways. Every line is read on its
+# own, so a heading-shaped line GFM would not render as a heading -- inside a fenced block, an
+# HTML block, an HTML comment -- contributes a slug here anyway. That direction only makes the
+# ANCHOR lookup more permissive: it can accept a link GitHub would not resolve, and it refuses
+# none. Keeping that second half TRUE is a constraint on everything else in this section, and it
+# has been broken once already: the slug suppression round 3 added let a phantom heading refuse
+# real anchors, which is what took it out again in round 9. The other direction is the costly one: a link written inside a fence or between backticks
+# is read like any other, so prose ILLUSTRATING the syntax is read as the link it spells. That
+# cost is real and was paid the first time this check was documented -- the README's own sentence
+# about it had to describe the shape rather than write one.
+#
+# It is still the cheaper side, and the alternative was weighed rather than assumed. A block model
+# -- fences with their info strings, tildes, nesting and indentation, HTML blocks with their seven
+# start conditions, comments -- is the same table model whose edge cases took thirteen review
+# rounds of ludics-lite#75. Refusing anchors in any file that CONTAINS such a block is worse than
+# the gap it closes: with no fence scope, an HTML comment quoted inside a fenced example would
+# take every anchored link into that file down with it, and these prompts quote a great deal of
+# markup. A permissive lookup accepts a link nobody wrote; that refusal would reject links people
+# did write. Both directions are pinned by probes, so the shape of the gap is on record.
+
+# link_files: the Markdown whose links this check reads, root-relative. A routine's reference
+# files are in it for the same reason a skill's are: the prompt delegating to one is checked, and
+# the second hop out of it would otherwise be the one place a missing target passed. No routine
+# keeps a references/ directory today, so the glob is there ahead of the first one.
+link_files() {
+  (cd "$ROOT" && for f in README.md routines/README.md */SKILL.md routines/*/SKILL.md \
+    */references/*.md */references/.*.md routines/*/references/*.md \
+    routines/*/references/.*.md; do [ -f "$f" ] && echo "$f"; done) | sort -u
+}
+
+# md_links <rel> <dir>: every link of the read shape in the root-relative file <rel>, one per line,
+# as `<rel> TAB <target> TAB <resolved> TAB <anchor>` -- the file, for the message; the target as
+# WRITTEN, which is what the message names; the path it spells, resolved; and the anchor, empty
+# when the link carries none. Resolution happens inside this scan, rather than in a reader of its
+# own, because this is the one thing in the file that runs once per LINK and not once per file: a
+# reader per link is six dozen processes per run of the checker, over a string operation awk is
+# already standing in front of.
+#
+# resolve: the path as written, read from <rel>'s directory, with its `.` and `..` segments taken
+# out. Lexically, and never through the filesystem: what a link means is the path it spells, and
+# `readlink -f` would answer for wherever a symlink under it points -- and would answer nothing at
+# all for the missing file this is about to report. A path that climbs past the root keeps its
+# leading `..`, so it is reported as the nonexistent file it is.
+md_links() {
+  CP_REL="$1" CP_DIR="$2" awk '
+    BEGIN { rel = ENVIRON["CP_REL"]; dir = ENVIRON["CP_DIR"] }
+    {
+      line = $0
+      while ((i = index(line, "](")) > 0) {
+        # A link opens with a LABEL, and the label is the bracket THIS `]` closes -- not any `[`
+        # standing earlier. `[note] then ](x.md)` has a bracket before it and opens no link, so
+        # looking for any at all still failed prose that is perfectly fine, which is the one way
+        # this scan can fail a file with nothing wrong with it. Walked backwards from the `]`,
+        # counting the pairs that close on the way, so a `[` already closed answers for nothing.
+        # A bracket a backslash made literal is text, and closes or opens nothing -- `\[note](x.md)`
+        # renders as prose. Parity, not presence: `\\[note]` is an escaped BACKSLASH followed by a
+        # real opener. The `]` of this candidate is read the same way, since an escaped one closes
+        # no label either.
+        label = 0; depth = 0
+        if (escaped(line, i)) { line = substr(line, i + 2); continue }
+        for (k = i - 1; k >= 1; k--) {
+          c = substr(line, k, 1)
+          if (c != "[" && c != "]") continue
+          if (escaped(line, k)) continue
+          if (c == "]") depth++
+          else if (depth == 0) { label = 1; break }
+          else depth--
+        }
+        line = substr(line, i + 2)
+        if (label == 0) continue
+        # The target ends at the paren that CLOSES the one the link opened, not at the first `)`:
+        # a Markdown destination may carry balanced parentheses, and `a_(b).md` cut at the first
+        # one is `a_(b`, which then fails the `.md` test and takes a real link out of the scan in
+        # silence. A destination whose parens do not balance on the line -- an escaped one
+        # included, since this reads no escapes -- leaves the line with no close, and is outside
+        # the shape like every other link this cannot see the end of.
+        depth = 1; j = 0
+        for (k = 1; k <= length(line); k++) {
+          c = substr(line, k, 1)
+          if (c == "(") depth++
+          else if (c == ")" && --depth == 0) { j = k; break }
+        }
+        # The cursor now stands just past this `](`, and it STAYS there for every candidate this
+        # pass does not accept -- whether the parens never close or the target is refused below.
+        # A false `](` is a false candidate, and everything after it on the line is still text to
+        # read: `Token ]( prose [guide](missing.md).)` balances its parens around the real link,
+        # so advancing past the closing one swallowed that link and the run came out green.
+        # Only an ACCEPTED link advances the cursor past itself. Progress holds either way,
+        # because each pass has already shortened the line by the `](` it stepped over.
+        if (j == 0) continue
+        target = substr(line, 1, j - 1)
+        if (target ~ /[[:space:]]/) continue       # a titled link, say: outside the form
+        if (target ~ /^[A-Za-z][A-Za-z0-9+.-]*:/) continue    # a URI scheme: not a path here
+        if (substr(target, 1, 1) == "/") continue             # nor is an absolute path
+        hash = index(target, "#")
+        path = (hash > 0) ? substr(target, 1, hash - 1) : target
+        anchor = (hash > 0) ? substr(target, hash + 1) : ""
+        if (path !~ /\.md$/) continue              # `](#anchor)` and `](LICENSE)` alike
+        # And SPELLED as a path in this checkout: ASCII letters and digits with `. _ - / ( ) ~ +`,
+        # and `#` for the anchor. A percent escape (`my%20notes.md`), a backslash, an angle-bracket
+        # destination or an entity is a spelling this scan does not decode -- and a decoded reading
+        # is one it would have to guess at, then guess at again for the next encoding somebody
+        # reaches for. One rule instead: a target written in anything else is outside the shape,
+        # like a titled one. The cost is that a file whose name needs escaping goes unchecked; the
+        # names in this checkout are dashed and lowercase, and that is the convention to keep.
+        if (target ~ /[^A-Za-z0-9._\/()~+#-]/) continue
+        line = substr(line, j + 1)                 # accepted: the cursor may pass the whole link
+        print rel "\t" target "\t" resolve(dir, path) "\t" anchor
+      }
+    }
+    # escaped <text> <at>: whether the character at <at> stands behind an odd number of
+    # backslashes, which is what makes it literal rather than a delimiter.
+    function escaped(text, at,   b) {
+      b = 0
+      while (at - b - 1 >= 1 && substr(text, at - b - 1, 1) == "\\") b++
+      return b % 2
+    }
+    function resolve(dir, path,   parts, k, i, out, n, s) {
+      k = split(dir "/" path, parts, "/")
+      n = 0
+      for (i = 1; i <= k; i++) {
+        if (parts[i] == "" || parts[i] == ".") continue
+        if (parts[i] == ".." && n > 0 && out[n] != "..") { n--; continue }
+        out[++n] = parts[i]
+      }
+      s = ""
+      for (i = 1; i <= n; i++) s = (s == "") ? out[i] : s "/" out[i]
+      return s
+    }' "$ROOT/$1"
+}
+
+# heading_slugs <file> [prefix]: the GitHub anchor of every ATX heading in <file>, one per line and
+# in file order, each behind the optional <prefix> -- which is how the whole lookup table below is
+# built with one reader per target file rather than one per anchor.
+# The slug is GitHub's own reading: lowercased, each blank turned into a hyphen, the ASCII
+# word characters and the hyphen kept and everything else dropped -- and a slug already seen in the
+# file takes the `-1`, `-2` suffix GitHub gives a repeated heading, so the second `## Close-out` is
+# reachable as `#close-out-1` rather than unreachable.
+# A heading whose anchor this check will not spell -- one carrying a non-ASCII byte that is not
+# General Punctuation, so possibly a letter GitHub keeps -- contributes no slug, and is reported as
+# `!<heading>` instead, so a link that misses in that file can say why it could not be answered.
+heading_slugs() {
+  CP_PREFIX="${2:-}" awk '
+    BEGIN {
+      prefix = ENVIRON["CP_PREFIX"]
+      # The byte sets `slug` reads, built rather than spelled: an octal byte range inside a
+      # bracket expression is not something every awk on the fleet reads alike, and sprintf is.
+      for (n = 1; n <= 127; n++) ascii[sprintf("%c", n)] = 1
+      # U+2000-U+206F, General Punctuation, in UTF-8: E2 80 80 .. E2 81 AF.
+      for (n = 128; n <= 191; n++) punctuation[sprintf("%c%c%c", 226, 128, n)] = 1
+      for (n = 128; n <= 175; n++) punctuation[sprintf("%c%c%c", 226, 129, n)] = 1
+      # The ASCII punctuation a backslash may escape, which is the list CommonMark gives: the
+      # four ranges standing either side of the letters and digits.
+      for (n = 33; n <= 47; n++) escapable[sprintf("%c", n)] = 1
+      for (n = 58; n <= 64; n++) escapable[sprintf("%c", n)] = 1
+      for (n = 91; n <= 96; n++) escapable[sprintf("%c", n)] = 1
+      for (n = 123; n <= 126; n++) escapable[sprintf("%c", n)] = 1
+      bom = sprintf("%c%c%c", 239, 187, 191)
+      cr = sprintf("%c", 13)
+    }
+    {
+      line = $0
+      # A byte-order mark opens a file rather than a line, and GFM removes it before it parses
+      # anything -- so the first heading of a file that carries one is a heading, and leaving the
+      # bytes in front of its hashes refused a link that works.
+      if (FNR == 1 && index(line, bom) == 1) line = substr(line, 4)
+      # A carriage return is the other half of a CRLF line ending, not content: awk splits on the
+      # LF and leaves it standing. It defeated the closing-hash rule outright -- `## Foo ##<CR>`
+      # kept the blank before the hashes and slugged to `foo-`, refusing `#foo` and accepting a
+      # `#foo-` that is not there -- and it turned every trailing blank into a hyphen besides.
+      if (substr(line, length(line), 1) == cr) line = substr(line, 1, length(line) - 1)
+      # A blockquote marker before the heading is the container, not the heading: GFM renders
+      # `> ## Foo` as a heading with the anchor `foo`, and skipping it refused a link that works.
+      # A run of them is stripped, which is the whole of the block model this reads -- and with
+      # the indentation limits GFM puts on it, since four spaces opens an indented code block
+      # instead: `    > ## Foo` is code, and stripping its marker recorded an anchor that does not
+      # exist. At most three spaces before each marker, then the one space the marker itself
+      # takes; what is left goes to the same limit again in the ATX test below, so `>     ## Foo`
+      # is code inside the quote and stays unread.
+      # A heading inside a LIST item is deliberately not read -- whether `- ## Foo` opens one
+      # depends on the list indentation and continuation rules around it, which is the block
+      # parser this file does not have -- and such a link is refused, loudly and naming the
+      # anchor, never accepted for a heading that is not there.
+      col = 0
+      while (1) {
+        indent = 0; while (substr(line, indent + 1, 1) == " ") indent++
+        if (indent > 3 || substr(line, indent + 1, 1) != ">") break
+        col += indent + 1                          # past the indent and the marker itself
+        line = substr(line, indent + 2)
+        # The one space the marker takes may be written as a tab, which GFM expands to the next
+        # tab stop -- and the marker takes ONE column of that expansion, not the whole of it. The
+        # columns left over are indentation, and dropping them changed the block: `><TAB>  ##`
+        # is four columns in and so an indented code block, where discarding the tab left two and
+        # recorded a heading GFM does not render. Kept as the spaces they expand to, so the ATX
+        # test below reads the same indentation GFM does.
+        if (substr(line, 1, 1) == " ") { line = substr(line, 2); col++ }
+        else if (substr(line, 1, 1) == "\t") {
+          pad = 4 - (col % 4) - 1                  # the tab stop, less the column the marker takes
+          line = substr(line, 2)
+          while (pad-- > 0) line = " " line
+          col++
+        }
+      }
+      # An ATX heading, by GFM: up to three leading spaces, one to six hashes, then a blank. The
+      # counts are walked rather than matched, since an ERE interval is not something every awk on
+      # the fleet reads alike.
+      spaces = 0; while (substr(line, spaces + 1, 1) == " ") spaces++
+      if (spaces > 3) next
+      hashes = 0; while (substr(line, spaces + hashes + 1, 1) == "#") hashes++
+      if (hashes < 1 || hashes > 6) next
+      rest = substr(line, spaces + hashes + 1)
+      # A heading may END at its hash run -- `#` alone is an empty heading to GFM, and skipping it
+      # cost its successors their numbering as well as itself: with `#` before `## !!!`, the
+      # second is `-1` on GitHub and was being read as the first empty slug.
+      if (rest != "" && rest !~ /^[ \t]/) next     # `#tag` is text to GFM, not a heading
+      sub(/[ \t]+#+[ \t]*$/, "", rest)             # the optional closing run of hashes
+      # The content of a heading is trimmed HERE, as GFM trims it -- before the inline reading,
+      # not after. Trimming the rendered text instead threw away a space a code span had
+      # preserved: `## ` foo`` renders ` foo` (one-sided padding is kept, where two-sided is
+      # stripped) and is `-foo` on GitHub, which a later trim turned into `foo`.
+      sub(/^[ \t]+/, "", rest); sub(/[ \t]+$/, "", rest)
+      s = slug(rest)
+      # A heading this check will not spell still OCCUPIES a slug on GitHub, and the numbering is
+      # occupancy-based: `## [Foo](…)` then `## Foo` are `foo` and `foo-1` there, while this reads
+      # the second as `foo`. What that costs is bounded, and the bound is what makes it the right
+      # trade: every slug this reading emits for a heading is a slug GitHub HAS -- for that
+      # heading, or for the earlier one it collided with -- so an anchor accepted here always
+      # resolves there. What is lost is the other direction: a `-<n>` anchor standing after such a
+      # heading is refused, and the `!` line below tells the reader why.
+      #
+      # Suppressing every later slug instead was tried and is deliberately gone (ludics-lite#268,
+      # round 9). It refused anchors rather than merely failing to confirm them, and with no block
+      # scope above, a heading-shaped line inside a FENCE could be the unspellable one -- so a
+      # fenced `## [Example](…)` took every real anchor after it in the file down with it. That
+      # also cost the block-scope gap the property the whole of it rests on, which is that a
+      # phantom heading can only make the lookup more permissive and can refuse nothing.
+      if (s == "!") { if (refused == 0) print prefix "!" rest; refused = 1; next }
+      # The numbering GitHub does is a LOOP over free names, not a counter per base: a candidate
+      # already taken takes the next `-<n>` that is not, so `# Foo`, `# Foo-1`, `# Foo` give `foo`,
+      # `foo-1`, `foo-2`. A counter gives `foo-1` twice -- which both rejects a good link to
+      # `#foo-2` and lets `#foo-1` answer for either heading.
+      # An empty slug is still an OCCUPANT: a heading of pure punctuation slugs to nothing, and
+      # `## !!!` written twice is "" and "-1" on GitHub, so a link to `#-1` works there. Skipping
+      # both left `-1` out of the table and refused it. The empty name itself is never printed --
+      # no anchor can spell it, and a `file.md#` carries no anchor to this scan -- but it takes
+      # its place in the numbering, so its repeats take theirs.
+      base = s
+      while (taken[s]) { occurrences[base]++; s = base "-" occurrences[base] }
+      taken[s] = 1
+      if (s != "") print prefix s
+    }
+    # slug <heading>: its GitHub anchor, or `!` for a heading whose anchor this check will not
+    # spell. The ASCII half is exact. Beyond it, only the General Punctuation block is known --
+    # the dashes, curly quotes and ellipsis this prose is written with, every one of which GitHub
+    # drops -- and any OTHER non-ASCII byte is a character that may be a letter GitHub keeps
+    # (`# Cafe\u0301` slugs to `cafe\u0301`, not to `caf`). Dropping it silently would not only refuse the
+    # right anchor, it would ACCEPT the wrong one: `#caf` would answer for that heading. So such a
+    # heading contributes no slug at all, and a link that means it is refused, with the reason.
+    # render_spans <h>: the one construct whose CONTENT is literal text, resolved rather than
+    # refused, because these headings are full of it. It sets two readings of the heading, from
+    # one walk -- the same text-and-mask shape `slot_mentions` uses further up this file.
+    #   SPAN_TEXT: each code span replaced by what it RENDERS to. A span opens at a backtick run
+    #     and closes at the next run of the SAME length; where its content both begins and ends
+    #     with a space and is not all spaces, CommonMark strips one from each end, which is the
+    #     divergence that brought this here -- `## ` foo ` ` is `foo` on GitHub, and reading the
+    #     source gave `-foo-`. A run with no closing match is literal backticks, left as it is.
+    #   SPAN_BARE: the same heading with each span, and each backslash-escaped character, replaced
+    #     by a single `.`, for the markup tests below to read. The content of a span is literal text, so `## `_foo_`` is `_foo_` on
+    #     GitHub and must not be refused as emphasis; `.` rather than a letter, because it is
+    #     punctuation to the flanking rule, which is the conservative side of that test.
+    function render_spans(h,   i, c, n, j, k, m, content, text, bare) {
+      # ONE walk, left to right, which is the order the inline reading actually happens in. Two
+      # global passes -- escapes resolved everywhere, then spans paired -- were wrong about their
+      # interaction, and in the direction that matters: a backslash does not escape INSIDE a code
+      # span, so `## `\`_foo_`` opens a span at the first backtick, closes it at the one after the
+      # backslash, and leaves `_foo_` outside it as emphasis. Marking that closing backtick
+      # escaped paired the first with the LAST instead and recorded `_foo_`.
+      # Walking once gets both rules from their position in the walk rather than from a rule about
+      # which pass wins: a backslash is an escape only when it is REACHED as text, which is to say
+      # outside a span, and the search for a closing run reads the raw backticks it passes.
+      text = ""; bare = ""; i = 1
+      while (i <= length(h)) {
+        c = substr(h, i, 1)
+        if (c == "\\" && i < length(h) && (substr(h, i + 1, 1) in escapable)) {
+          # An escaped character is literal, and so is a delimiter of nothing: it stands in the
+          # rendered text as itself and reads as `.` to the markup tests.
+          text = text substr(h, i + 1, 1); bare = bare "."
+          i += 2
+          continue
+        }
+        if (c != "`") { text = text c; bare = bare c; i++; continue }
+        n = 0; while (substr(h, i + n, 1) == "`") n++
+        j = i + n; k = 0
+        while (j <= length(h)) {
+          if (substr(h, j, 1) != "`") { j++; continue }
+          m = 0; while (substr(h, j + m, 1) == "`") m++
+          if (m == n) { k = j; break }
+          j += m
+        }
+        if (k == 0) {                              # no closing run: literal backticks
+          text = text substr(h, i, n); bare = bare substr(h, i, n); i += n; continue
+        }
+        content = substr(h, i + n, k - i - n)
+        if (content ~ /^ / && content ~ / $/ && content ~ /[^ ]/)
+          content = substr(content, 2, length(content) - 2)
+        text = text content; bare = bare "."
+        i = k + n
+      }
+      SPAN_TEXT = text; SPAN_BARE = bare
+    }
+    # linked <text>: whether <text> carries a `](` whose `]` closes a bracket opened earlier -- the
+    # same label test `md_links` applies, and for the same reason: `## Token ](literal)` renders no
+    # link, and GitHub gives it the ordinary `token-literal`. No escape parity is needed here, as
+    # `render_spans` has already replaced every escaped character, and every span, with a `.`.
+    function linked(t,   i, k, c, depth, from) {
+      from = 1
+      while ((i = index(substr(t, from), "](")) > 0) {
+        i = from + i - 1
+        depth = 0
+        for (k = i - 1; k >= 1; k--) {
+          c = substr(t, k, 1)
+          if (c == "]") depth++
+          else if (c == "[") { if (depth == 0) return 1; else depth-- }
+        }
+        from = i + 2
+      }
+      return 0
+    }
+    function slug(h,   i, c, out) {
+      # A heading whose RENDERED text differs from its SOURCE is one this check will not spell:
+      # GitHub slugs what it renders, and rendering means a Markdown parser. Three shapes do that,
+      # and they are tested narrowly so the far commoner literal readings keep working --
+      #   - inline link, image or reference syntax (`## [Foo](https://example.com)` is `foo`
+      #     there and `foohttpsexamplecom` here), while a literal `## Notes [draft]` renders as
+      #     its source and slugs to `notes-draft` on both sides;
+      #   - an HTML tag or an autolink, `<` before a letter or a `/!?` (`## <em>Foo</em>` is
+      #     `foo` there and `emfooem` here), while a literal `## A < B` renders as its source and
+      #     gives `a--b` on both sides;
+      #   - a character entity, `&<name>;` (`## A &amp; B` renders `A & B` and gives `a--b`,
+      #     where the source reading gives `a-amp-b`), while a bare `## Launch & supervise` is
+      #     text on both sides.
+      # Emphasis, strong and code spans need no test: their markers are punctuation that both
+      # readings drop, so `## **Bold** text` and `## `code` here` already agree.
+      render_spans(h)
+      if (linked(SPAN_BARE) || index(SPAN_BARE, "][") > 0) return "!"
+      # A `<` is only markup once the construct CLOSES: `## Use <Type` parses no tag, and GitHub
+      # gives it the ordinary `use-type`, so refusing on the opening character alone refused a
+      # heading that is plain text. A tag, an autolink or a comment, each spelled whole.
+      if (SPAN_BARE ~ /<\/?[A-Za-z][A-Za-z0-9-]*([[:space:]][^<>]*)?\/?>/) return "!"
+      if (SPAN_BARE ~ /<[A-Za-z][A-Za-z0-9+.-]*:[^<>[:space:]]*>/) return "!"
+      if (SPAN_BARE ~ /<!--.*-->/) return "!"
+      # The rest of the raw-HTML forms, which render as markup and contribute no heading text:
+      # a processing instruction, a declaration, a CDATA section. `## <?target?>` is nothing at
+      # all to GitHub, where the source reading gave it `target`.
+      if (SPAN_BARE ~ /<\?[^<>]*\?>/) return "!"
+      if (SPAN_BARE ~ /<![A-Za-z][^<>]*>/) return "!"
+      if (index(SPAN_BARE, "<![CDATA[") > 0) return "!"
+      # A character reference renders as markup only when it DECODES. A numeric one always does;
+      # a named one does only if HTML defines it, and that table is two thousand entries this
+      # check will not carry -- so the named ones held are the ones this prose could plausibly
+      # write, and anything else is read as the literal text it renders as. `## Rock &bogus; Roll`
+      # keeps its anchor, where the shape test alone refused it. The residue is stated rather than
+      # hidden: a VALID named reference outside this list reads as literal text here, which is the
+      # permissive direction, and the list is the place to add one if a heading ever needs it.
+      if (SPAN_BARE ~ /&#[0-9]+;/ || SPAN_BARE ~ /&#[xX][0-9A-Fa-f]+;/) return "!"
+      if (SPAN_BARE ~ /&(amp|lt|gt|quot|apos|nbsp|copy|reg|trade|hellip|mdash|ndash|laquo|raquo|deg|times|divide|plusmn|micro|para|sect|dagger|bull|lsquo|rsquo|ldquo|rdquo);/) return "!"
+      # Underscore emphasis is the one emphasis marker the two readings do NOT agree on, because
+      # the slugger keeps `_` as a word character: `## _Foo_` renders as `Foo` and is `foo` there,
+      # while the source reading gives `_foo_`. `*` needs no such test -- it is punctuation both
+      # readings drop. CommonMark makes `_` emphasis only where it is not intraword, and that
+      # flanking rule is the whole test here: an `_` with an alphanumeric on BOTH sides is
+      # literal, so `## snake_case` and `## FLEET_BOX_CORRECTNESS_SLOTS` are text on both sides
+      # and keep their anchors; any other `_` may open or close emphasis, and its heading is not
+      # spelled. A `substr` before the first character is the empty string, which flanks nothing.
+      for (i = 1; i <= length(SPAN_BARE); i++)
+        if (substr(SPAN_BARE, i, 1) == "_" && !(substr(SPAN_BARE, i - 1, 1) ~ /^[A-Za-z0-9]$/ \
+            && substr(SPAN_BARE, i + 1, 1) ~ /^[A-Za-z0-9]$/)) return "!"
+      h = tolower(SPAN_TEXT)                       # ASCII only, by locale, as GitHub folds ASCII
+      out = ""
+      for (i = 1; i <= length(h); i++) {
+        c = substr(h, i, 1)
+        # Only a literal SPACE becomes a hyphen. A tab is a control character, which the slugger
+        # removes before it replaces spaces, so `## Foo<TAB>Bar` is `foobar` there -- hyphenating
+        # it approved a `#foo-bar` that does not exist and refused the `#foobar` that does. It
+        # falls through to the ASCII drop below.
+        if (c == " ") { out = out "-"; continue }
+        if (c ~ /^[a-z0-9_-]$/) { out = out c; continue }
+        if (c in ascii) continue                   # ASCII punctuation, which GitHub drops
+        if (substr(h, i, 3) in punctuation) { i += 2; continue }
+        return "!"
+      }
+      return out
+    }' "$1"
+}
+
+# symlinked <relpath>: whether <relpath>, under the root, is a symbolic link or is reached through
+# one. The lexical `..` guard keeps a path from SPELLING its way out of the checkout; a symlink
+# walks out without spelling anything, and `-f` follows it, so a `references/x.md` pointing at the
+# runner's filesystem would have its existence -- and its headings -- read off the host. Same class
+# as the `..` guard, and the same answer: refused on the path, before anything is read.
+# Every component is tested, since it is as easily a parent directory that leaves. Only components
+# BELOW the root are, so a checkout reached through a symlink (macOS `/tmp`, this suite's own
+# scratch tree) is not itself the finding. A symlink that stays inside the checkout is refused
+# too: nothing here uses one, and "no symlink on the path" is a rule with no host in it, where
+# "no symlink that escapes" needs the canonical resolution this deliberately does not do.
+symlinked() {
+  local rest="$1" acc="" seg
+  while [ -n "$rest" ]; do
+    seg=${rest%%/*}
+    if [ "$seg" = "$rest" ]; then rest=""; else rest=${rest#*/}; fi
+    [ -n "$seg" ] || continue
+    acc="${acc:+$acc/}$seg"
+    [ -L "$ROOT/$acc" ] && return 0
+  done
+  return 1
+}
+
+# cased <relpath>: whether every component of <relpath> is spelled as the checkout spells it. On
+# a case-insensitive filesystem -- the macOS default, and this suite runs on macOS and on Ubuntu
+# both -- `-f` answers yes for a link to `References/Notes.md` over a `references/notes.md`, while
+# GitHub serves that link as a 404. Unchecked, the same head passes on one runner and fails on the
+# other, and the verdict is about the box rather than about the prompts: the same class as the
+# `..` and symlink guards above.
+# Read with a GLOB rather than with `ls`, so a path still costs no process: the kernel matches a
+# name case-insensitively, but the shell compares the names a directory actually holds, and it
+# compares them exactly.
+cased() {
+  local rest="$1" parent="" seg entry found
+  while [ -n "$rest" ]; do
+    seg=${rest%%/*}
+    if [ "$seg" = "$rest" ]; then rest=""; else rest=${rest#*/}; fi
+    [ -n "$seg" ] || continue
+    found=0
+    # Three globs, because `*` alone skips every name beginning with a dot -- so a component like
+    # `.refs` was never enumerated and a correctly spelled path read as mis-cased. The other two
+    # take the dotted names while leaving `.` and `..` out, which is the whole of what they add.
+    for entry in "$ROOT${parent:+/$parent}"/* "$ROOT${parent:+/$parent}"/.[!.]* \
+      "$ROOT${parent:+/$parent}"/..?*; do
+      [ "${entry##*/}" = "$seg" ] && { found=1; break; }
+    done
+    [ "$found" -eq 1 ] || return 1
+    parent="${parent:+$parent/}$seg"
+  done
+  return 0
+}
+
+check_links() {
+  local rel dir links all="" wanted t target resolved anchor slugs="" hint nl tab count=0 bad=0
+  nl=$'\n'; tab=$(printf '\t')
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    # The same guard the targets get, on the READING side: `link_files` globs, and `-f` follows a
+    # symbolic link, so a `references/x.md` pointing out of the checkout would have its links --
+    # and its size -- taken from the host. Reported rather than skipped: a prompt file that is a
+    # symlink is a defect in the checkout, and skipping it would leave its links unread in silence.
+    if symlinked "$rel"; then
+      ko "$rel" "is reached through a symbolic link, so its links are not read"; bad=1; continue
+    fi
+    dir=${rel%/*}; [ "$dir" = "$rel" ] && dir=.
+    links=$(md_links "$rel" "$dir")
+    [ -n "$links" ] || continue
+    all="$all$links$nl"
+  done <<<"$(link_files)"
+  # No link is no verdict on the links, as no fixture is no verdict on the register: the obligation
+  # comes from a link, and a prompt-only scratch root may carry none.
+  [ -n "$all" ] || return 0
+  # The slug table: every heading of every target an ANCHORED link names, read ONCE per target file.
+  # A prompt that points eight times into one reference would otherwise re-read it eight times.
+  wanted=$(printf '%s' "$all" | awk -F"$tab" '$4 != "" { print $3 }' | sort -u)
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    # The same two guards the report loop applies, applied HERE as well, because this is where the
+    # target is first touched: a prepass that probed and then read a target the loop below was
+    # about to refuse would have opened the host file the guards exist to keep out, and the
+    # refusal afterwards would come too late to matter.
+    case "$t" in .. | ../*) continue ;; esac
+    symlinked "$t" && continue
+    [ -f "$ROOT/$t" ] || continue
+    cased "$t" || continue
+    slugs="$slugs$(heading_slugs "$ROOT/$t" "$t$tab")$nl"
+  done <<<"$wanted"
+  # A tab at a time, and line by line: a path may hold a blank, and splitting on one would read a
+  # link nobody wrote and then report the file it did not find.
+  while IFS="$tab" read -r rel target resolved anchor; do
+    [ -n "$rel" ] || continue
+    count=$((count + 1))
+    # A path that climbed past the root is refused on the path itself, and never probed on the
+    # filesystem: `$ROOT/../outside.md` is a real path on the host, so a file of that name beside
+    # the checkout would make an out-of-repository link read as resolving -- a verdict about the
+    # machine the check ran on rather than about the prompts.
+    case "$resolved" in
+      .. | ../*) ko "$rel" "link to $target resolves outside the checkout: $resolved"; bad=1; continue ;;
+    esac
+    if symlinked "$resolved"; then
+      ko "$rel" "link to $target is reached through a symbolic link: $resolved"; bad=1; continue
+    fi
+    if [ ! -f "$ROOT/$resolved" ]; then
+      ko "$rel" "link to $target resolves to no file: $resolved"; bad=1; continue
+    fi
+    if ! cased "$resolved"; then
+      ko "$rel" "link to $target finds $resolved only on a case-insensitive filesystem; the checkout spells that path differently, and GitHub serves the link as written"
+      bad=1; continue
+    fi
+    [ -n "$anchor" ] || continue
+    # The anchor is compared as TEXT and in full, the way `indexed` compares a name: a `.` in an
+    # anchor is that character and `#close` does not find `close-out`, because the pattern is a
+    # whole `<target> TAB <slug>` line of the table with a newline on either side of it.
+    case "$nl$slugs" in
+      *"$nl$resolved$tab$anchor$nl"*) ;;
+      *)
+        # A file carrying a heading the slug reader would not spell says so, rather than leaving a
+        # maintainer to compare an anchor against a heading that is visibly right -- and it is
+        # also the one thing that can make a `-<n>` anchor miss when GitHub has it.
+        hint=""
+        case "$nl$slugs" in
+          *"$nl$resolved$tab!"*) hint=" (it also carries a heading this check will not spell an anchor for, which can leave a numbered repeat unconfirmed: see heading_slugs)" ;;
+        esac
+        ko "$rel" "link to $target names no heading: $resolved has none whose GitHub slug is '$anchor'$hint"
+        bad=1 ;;
+    esac
+  done <<<"$all"
+  [ "$bad" -ne 0 ] \
+    || ok "every relative Markdown link in the prompts resolves, anchors included ($count checked)"
+}
+
 # --- run --------------------------------------------------------------------------------------
 if $ONE; then
   if [ -f "$ROOT/SKILL.md" ]; then check_skill_file SKILL.md
@@ -897,6 +1457,7 @@ check_index routines/README.md routines/ routine
 check_fixtures
 check_slots
 check_drift_guard
+check_links
 
 echo
 echo "check-prompts: $pass passed, $fail failed"

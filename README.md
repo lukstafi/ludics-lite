@@ -338,8 +338,35 @@ of a row of the README that indexes it — the skill table above, the routine ta
 parser: it claims only that the name is written down as a row, not that the row renders, and it no
 longer reads the other direction, a row that outlived its directory. The scanner it replaced drew
 thirteen rounds of table-syntax edge cases in one review and reopened on every new rule
-(ludics-lite#75). `test-check-prompts.sh` runs it against scratch trees, one per defect, with the
-well-formed tree as the control, and ends by running it on this checkout.
+(ludics-lite#75). It also reads the relative Markdown links in those prompts, in the reference
+files they delegate to — a routine's as well as a skill's — and in both READMEs: the path half of
+a `.md` link has to exist relative to the linking file, and an anchor on it has to be the GitHub
+slug of a heading in the target.
+ludics-lite#260 cut the wave prompt into sections addressed by anchor — `cli-claude.md#close-out`,
+`native-workers.md#placement-and-launch` and six more — and verified them by hand, once; a renamed
+file or a retitled heading leaves such a link rendering as a link and landing nowhere, which is a
+defect a reader finds and a test never did. This is the same kind of lookup as the index one, over
+one fixed shape, spelled out in the checker's own header: a parenthesized target directly after a
+bracketed label, on one line, with no blank in it, a path half ending in `.md`, and the whole
+target spelled in ordinary path characters. Anything else — a URL, a title after the target, a
+site-absolute path, a bare anchor, a percent escape or other spelling it would have to decode, a
+reference-style link, a target that wrapped onto the next line — is not checked rather than
+guessed at. What it will not do is answer about the machine instead of the prompts: a path that
+spells its way out of the checkout, and one that walks out through a symbolic link, are both
+refused on the path rather than probed, so no file beside the checkout can make an outside link
+read as resolving; and a path is checked against the spelling the checkout actually has, since a
+case-insensitive filesystem — the macOS default, and these suites run on macOS and Ubuntu both —
+resolves a link GitHub serves as a 404. There is no
+block scope either — no fences, no HTML blocks, no comments — deliberately, and at a cost paid in
+this very paragraph: prose that spells a whole link in backticks is read as that link, so
+documentation of the syntax has to describe it rather than write one. The other direction of that
+gap is the mild one: a heading-shaped line GFM would not render, inside a fence or a comment,
+still contributes an anchor, which can accept a link GitHub would not resolve but refuses none. On the other side, a heading whose rendered text differs
+from its source — inline link syntax, an HTML tag, a character entity — or which carries a letter
+past ASCII, is one whose anchor it will not spell: it reports no slug and says so, rather than
+answering with the source reading, which would refuse the right anchor and accept one GitHub never
+creates. `test-check-prompts.sh` runs it against scratch trees,
+one per defect, with the well-formed tree as the control, and ends by running it on this checkout.
 
 `check-jq-shapes.sh` is the jq shape guard, run in the lint job on every head over every
 `*/scripts/*.sh` and `scripts/*.sh` in the checkout — the lint job's own file list, less
