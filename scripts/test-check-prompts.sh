@@ -1313,6 +1313,62 @@ links_body alpha/SKILL.md 'See [a listed heading](references/notes.md#listed-hea
 expect "...while one inside a list item is refused rather than guessed at" 1 \
   "GitHub slug is 'listed-heading'" -- "$CP" "$R"
 
+# Underscore emphasis is the one emphasis marker the two readings disagree on: the slugger keeps
+# `_` as a word character, so `## _Foo_` is `foo` on GitHub and `_foo_` from the source. The test
+# is CommonMark's flanking rule and nothing more, so the intraword underscores this repository
+# would actually write in a heading keep their anchors (round 4, P2).
+links_tree
+printf '\n## _Foo_\n\nUnderscore emphasis.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [the source of emphasis](references/notes.md#_foo_).'
+expect "a heading carrying underscore emphasis spells no anchor from its source" 1 \
+  'will not spell an anchor for' -- "$CP" "$R"
+links_tree
+printf '\n## FLEET_BOX_CORRECTNESS_SLOTS\n\nIntraword, so literal on both sides.\n' \
+  >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [an intraword underscore](references/notes.md#fleet_box_correctness_slots).'
+expect "...while an intraword underscore is text to both readings and keeps its anchor" 0 \
+  '(1 checked)' -- "$CP" "$R"
+
+# The blockquote strip takes GFM's indentation limits with it: four spaces before the marker is an
+# indented code block, not a quote, and stripping it recorded an anchor that does not exist
+# (round 4, P2). Inside the quote the same limit applies again.
+links_tree
+printf '\n    > ## Indented quote\n\nFour spaces: code, not a container.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [an indented quote](references/notes.md#indented-quote).'
+expect "four spaces before a blockquote marker is code, not a heading" 1 \
+  "GitHub slug is 'indented-quote'" -- "$CP" "$R"
+links_tree
+printf '\n>     ## Indented content\n\nCode inside the quote.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [code inside a quote](references/notes.md#indented-content).'
+expect "...and so is content indented four spaces inside one" 1 \
+  "GitHub slug is 'indented-content'" -- "$CP" "$R"
+links_tree
+printf '\n   > ## Barely quoted\n>\n> Three spaces is still a quote.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a barely indented quote](references/notes.md#barely-quoted).'
+expect "...while three spaces is still a blockquote, and its heading still a heading" 0 \
+  '(1 checked)' -- "$CP" "$R"
+
+# The symlink guard on the READING side: `link_files` globs and `-f` follows, so a prompt file
+# that is a symlink out of the checkout would have its links taken from the host (round 4, P2).
+# Reported rather than skipped -- a prompt that is a symlink is a defect in the checkout, and
+# skipping it would leave its links unread in silence.
+links_tree
+printf '# Outside\n\nSee [a host link](gone.md).\n' > "$TMP/outside.md"
+ln -s "$TMP/outside.md" "$R/alpha/references/extra.md"
+expect "a linking file reached through a symbolic link is not read" 1 \
+  'alpha/references/extra.md: is reached through a symbolic link' -- "$CP" "$R"
+rm -f "$TMP/outside.md"
+
+# The other direction of the block-scope gap, pinned so it is a decision rather than a hole: a
+# heading-shaped line GFM would not render -- inside an HTML comment, as inside a fence -- still
+# contributes an anchor here. That can ACCEPT a link GitHub would not resolve; it refuses none,
+# which is why it is the side this scan is willing to be wrong on (round 4, P2, rebutted).
+links_tree
+printf '\n<!--\n## Hidden\n-->\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a heading inside a comment](references/notes.md#hidden).'
+expect "a heading inside an HTML comment contributes an anchor, as one inside a fence does" 0 \
+  '(1 checked)' -- "$CP" "$R"
+
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.
 fresh "$R"

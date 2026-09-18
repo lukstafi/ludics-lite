@@ -354,9 +354,11 @@ guessed at. What it will not do is answer about the machine instead of the promp
 spells its way out of the checkout, and one that walks out through a symbolic link, are both
 refused on the path rather than probed, so no file beside the checkout can make an outside link
 read as resolving. There is no
-inline-code or fenced-code scope either, deliberately and at a cost paid in this very paragraph:
-prose that spells a whole link in backticks is read as that link, so documentation of the syntax
-has to describe it rather than write one. On the other side, a heading whose rendered text differs
+block scope either — no fences, no HTML blocks, no comments — deliberately, and at a cost paid in
+this very paragraph: prose that spells a whole link in backticks is read as that link, so
+documentation of the syntax has to describe it rather than write one. The other direction of that
+gap is the mild one: a heading-shaped line GFM would not render, inside a fence or a comment,
+still contributes an anchor, which can accept a link GitHub would not resolve but refuses none. On the other side, a heading whose rendered text differs
 from its source — inline link syntax, an HTML tag, a character entity — or which carries a letter
 past ASCII, is one whose anchor it will not spell: it reports no slug and says so, rather than
 answering with the source reading, which would refuse the right anchor and accept one GitHub never

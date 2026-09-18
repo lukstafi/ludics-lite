@@ -909,15 +909,23 @@ check_drift_guard() {
 # way out of the checkout, and one walking out through a symbolic link, are both refused on the
 # path -- never probed, so no file beside the checkout can make an outside link read as resolving.
 #
-# There is no code scope either, fenced or inline, and that is the one gap cutting both ways. A
-# `# ` line inside a fence reads here as a heading, which only makes the ANCHOR lookup more
-# permissive; but a link written inside a fence or between backticks is read like any other, so
-# prose ILLUSTRATING the syntax is read as the link it spells. That cost is real and was paid the
-# first time this check was documented -- the README's own sentence about it had to describe the
-# shape rather than write one. It is still the cheaper side: a code model -- info strings, tildes,
-# nesting, indentation, backtick runs -- is the same table model whose edge cases took thirteen
-# review rounds of ludics-lite#75, while this costs one rephrasing, at a failure that names the
-# file and the line's target.
+# There is no BLOCK scope, and that is the one gap cutting both ways. Every line is read on its
+# own, so a heading-shaped line GFM would not render as a heading -- inside a fenced block, an
+# HTML block, an HTML comment -- contributes a slug here anyway. That direction only makes the
+# ANCHOR lookup more permissive: it can accept a link GitHub would not resolve, and it refuses
+# none. The other direction is the costly one: a link written inside a fence or between backticks
+# is read like any other, so prose ILLUSTRATING the syntax is read as the link it spells. That
+# cost is real and was paid the first time this check was documented -- the README's own sentence
+# about it had to describe the shape rather than write one.
+#
+# It is still the cheaper side, and the alternative was weighed rather than assumed. A block model
+# -- fences with their info strings, tildes, nesting and indentation, HTML blocks with their seven
+# start conditions, comments -- is the same table model whose edge cases took thirteen review
+# rounds of ludics-lite#75. Refusing anchors in any file that CONTAINS such a block is worse than
+# the gap it closes: with no fence scope, an HTML comment quoted inside a fenced example would
+# take every anchored link into that file down with it, and these prompts quote a great deal of
+# markup. A permissive lookup accepts a link nobody wrote; that refusal would reject links people
+# did write. Both directions are pinned by probes, so the shape of the gap is on record.
 
 # link_files: the Markdown whose links this check reads, root-relative.
 link_files() {
@@ -1024,12 +1032,22 @@ heading_slugs() {
       line = $0
       # A blockquote marker before the heading is the container, not the heading: GFM renders
       # `> ## Foo` as a heading with the anchor `foo`, and skipping it refused a link that works.
-      # A run of them is stripped, which is the whole of the block model this reads. A heading
-      # inside a LIST item is deliberately not read -- whether `- ## Foo` opens one depends on the
-      # list indentation and continuation rules around it, which is the block parser this file
-      # does not have -- and such a link is refused, loudly and naming the anchor, never accepted
-      # for a heading that is not there.
-      sub(/^[[:space:]]*(>[[:space:]]*)+/, "", line)
+      # A run of them is stripped, which is the whole of the block model this reads -- and with
+      # the indentation limits GFM puts on it, since four spaces opens an indented code block
+      # instead: `    > ## Foo` is code, and stripping its marker recorded an anchor that does not
+      # exist. At most three spaces before each marker, then the one space the marker itself
+      # takes; what is left goes to the same limit again in the ATX test below, so `>     ## Foo`
+      # is code inside the quote and stays unread.
+      # A heading inside a LIST item is deliberately not read -- whether `- ## Foo` opens one
+      # depends on the list indentation and continuation rules around it, which is the block
+      # parser this file does not have -- and such a link is refused, loudly and naming the
+      # anchor, never accepted for a heading that is not there.
+      while (1) {
+        indent = 0; while (substr(line, indent + 1, 1) == " ") indent++
+        if (indent > 3 || substr(line, indent + 1, 1) != ">") break
+        line = substr(line, indent + 2)
+        if (substr(line, 1, 1) == " ") line = substr(line, 2)
+      }
       # An ATX heading, by GFM: up to three leading spaces, one to six hashes, then a blank. The
       # counts are walked rather than matched, since an ERE interval is not something every awk on
       # the fleet reads alike.
@@ -1085,6 +1103,17 @@ heading_slugs() {
       if (index(h, "](") > 0 || index(h, "][") > 0) return "!"
       if (h ~ /<[A-Za-z\/!?]/) return "!"
       if (h ~ /&[A-Za-z0-9#]+;/) return "!"
+      # Underscore emphasis is the one emphasis marker the two readings do NOT agree on, because
+      # the slugger keeps `_` as a word character: `## _Foo_` renders as `Foo` and is `foo` there,
+      # while the source reading gives `_foo_`. `*` needs no such test -- it is punctuation both
+      # readings drop. CommonMark makes `_` emphasis only where it is not intraword, and that
+      # flanking rule is the whole test here: an `_` with an alphanumeric on BOTH sides is
+      # literal, so `## snake_case` and `## FLEET_BOX_CORRECTNESS_SLOTS` are text on both sides
+      # and keep their anchors; any other `_` may open or close emphasis, and its heading is not
+      # spelled. A `substr` before the first character is the empty string, which flanks nothing.
+      for (i = 1; i <= length(h); i++)
+        if (substr(h, i, 1) == "_" && !(substr(h, i - 1, 1) ~ /^[A-Za-z0-9]$/ \
+            && substr(h, i + 1, 1) ~ /^[A-Za-z0-9]$/)) return "!"
       h = tolower(h)                               # ASCII only, by locale, as GitHub folds ASCII
       sub(/^[ \t]+/, "", h); sub(/[ \t]+$/, "", h)
       out = ""
@@ -1131,6 +1160,13 @@ check_links() {
   nl=$'\n'; tab=$(printf '\t')
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
+    # The same guard the targets get, on the READING side: `link_files` globs, and `-f` follows a
+    # symbolic link, so a `references/x.md` pointing out of the checkout would have its links --
+    # and its size -- taken from the host. Reported rather than skipped: a prompt file that is a
+    # symlink is a defect in the checkout, and skipping it would leave its links unread in silence.
+    if symlinked "$rel"; then
+      ko "$rel" "is reached through a symbolic link, so its links are not read"; bad=1; continue
+    fi
     dir=${rel%/*}; [ "$dir" = "$rel" ] && dir=.
     links=$(md_links "$rel" "$dir")
     [ -n "$links" ] || continue
