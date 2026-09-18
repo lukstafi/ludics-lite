@@ -3602,6 +3602,59 @@ test_ignored_master_descendant_refusal() {
   echo "PASS: ignored descendant under replaced master directory is refused"
 }
 
+# A pathname carrying a newline is C-quoted by every line-based Git rendering, so the read this
+# replaced returned `"collision/lo\ncal.log"` -- a name no file on disk has -- and sent the
+# operator after it. The refusal must carry the name the file actually has, and must carry it
+# escaped: printed raw, the newline would forge a second diagnostic line out of the name's tail.
+test_ignored_master_descendant_newline_name_refusal() {
+  local collision descendant tracked_tip refusal
+  setup_case ignored-master-descendant-newline merge other
+  collision="$CASE_MASTER_OWNER/collision"
+  descendant=$(printf 'lo\ncal.log')
+  mkdir "$CASE_INTEGRATOR/collision"
+  echo tracked >"$CASE_INTEGRATOR/collision/tracked"
+  git -C "$CASE_INTEGRATOR" add collision/tracked
+  git -C "$CASE_INTEGRATOR" commit -m "add tracked master directory" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  tracked_tip=$(git -C "$CASE_INTEGRATOR" rev-parse HEAD)
+  git -C "$CASE_MAIN" fetch origin refs/heads/master:refs/remotes/origin/master >/dev/null
+  git -C "$CASE_MASTER_OWNER" reset --hard "$tracked_tip" >/dev/null
+
+  git -C "$CASE_INTEGRATOR" rm collision/tracked >/dev/null
+  echo remote-file >"$CASE_INTEGRATOR/collision"
+  git -C "$CASE_INTEGRATOR" add collision
+  git -C "$CASE_INTEGRATOR" commit -m "replace tracked directory with a file" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  # A glob rather than the name itself: the exclude file is line-based and could not spell a
+  # newline. It must leave `collision` and the tracked `collision/tracked` unignored, or the
+  # check-ignore branch above the descendant read claims the refusal first.
+  echo 'collision/*.log' >>"$CASE_MAIN/.git/info/exclude"
+  echo local-data >"$collision/$descendant"
+  case "$(git -C "$CASE_MASTER_OWNER" ls-files --others --ignored --exclude-standard \
+    -- collision)" in
+  '"'*) ;;
+  *) fail "the fixture must produce a C-quoted ls-files path" ;;
+  esac
+
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "master refresh replaced a directory holding a newline-named ignored file"
+  fi
+  assert_eq "$(cat "$collision/$descendant")" local-data \
+    "the newline-named ignored descendant must survive"
+  # The name the file has, shell-quoted -- not the `"collision/lo\ncal.log"` Git would print.
+  case "$refusal" in
+  *"$(printf '%q' "$collision/$descendant")"*) ;;
+  *) fail "the refusal did not name the descendant as it is spelled on disk: $refusal" ;;
+  esac
+  # And carries it escaped, not raw: the newline itself must never reach the operator's terminal,
+  # where it would forge a second diagnostic line out of the tail of a pathname.
+  case "$refusal" in
+  *"$descendant"*) fail "the refusal printed the pathname's newline raw: $refusal" ;;
+  esac
+  assert_topic_preserved
+  echo "PASS: a newline-named ignored descendant is refused and named as it is spelled"
+}
+
 test_missing_branch_config() {
   setup_case missing-branch-config merge main-off
   git -C "$CASE_MAIN" config --remove-section branch.topic
@@ -4153,6 +4206,7 @@ TESTS=(
   test_symbolic_worktree_config_preflight
   test_ignored_master_collision_refusal
   test_ignored_master_descendant_refusal
+  test_ignored_master_descendant_newline_name_refusal
   test_missing_branch_config
   test_inherited_branch_config
   test_dotted_branch_config

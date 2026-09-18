@@ -1388,8 +1388,14 @@ while IFS= read -r -d '' CHANGED_PATH; do
   if [ -d "$MASTER_OWNER/$CHANGED_PATH" ]; then
     REMOTE_PATH_TYPE=$(git -C "$MAIN" cat-file -t "$REMOTE_MASTER:$CHANGED_PATH" 2>/dev/null || true)
     if [ "$REMOTE_PATH_TYPE" != tree ]; then
-      IGNORED_DESCENDANT=$(git -C "$MASTER_OWNER" ls-files --others --ignored \
-        --exclude-standard -- "$CHANGED_PATH" | sed -n '1p')
+      # NUL-delimited for the same reason as the session gate: the default rendering C-quotes a
+      # name carrying a newline, a quote, a backslash or -- under core.quotePath -- any non-ASCII
+      # byte, and this name is reported to the operator as the path to go clear. The quoted
+      # rendering names no file on disk, so it would send them after something that is not there.
+      # One record is enough; `read` stops at the first NUL and leaves the rest unread.
+      IGNORED_DESCENDANT=""
+      IFS= read -r -d '' IGNORED_DESCENDANT < <(git -C "$MASTER_OWNER" ls-files --others \
+        --ignored --exclude-standard -z -- "$CHANGED_PATH") || :
       if [ -n "$IGNORED_DESCENDANT" ]; then
         IGNORED_COLLISION="$IGNORED_DESCENDANT"
         break
@@ -1399,8 +1405,11 @@ while IFS= read -r -d '' CHANGED_PATH; do
 done <"$CHANGED_PATHS_FILE"
 unlink "$CHANGED_PATHS_FILE" || fail "could not remove the $BASE_BRANCH changed-path snapshot"
 CHANGED_PATHS_FILE=""
+# Shell-quoted for the reason the session gate's refusal is: both sources of this name are read
+# NUL-delimited, so a pathname holding a newline arrives intact and would forge a second
+# diagnostic line, and an escape sequence in one would reach the operator's terminal.
 [ -z "$IGNORED_COLLISION" ] ||
-  fail "$BASE_BRANCH fast-forward would overwrite ignored local data: $MASTER_OWNER/$IGNORED_COLLISION"
+  fail "$BASE_BRANCH fast-forward would overwrite ignored local data: $(printf '%q' "$MASTER_OWNER/$IGNORED_COLLISION")"
 
 # Keep an existing owner's symbolic HEAD and real index locked across the complete named-ref and
 # worktree refresh. An initially unowned base instead remains reserved by its helper worktree.
