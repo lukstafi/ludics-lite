@@ -177,7 +177,10 @@ automated — spend their attention where the body sends it.
 When the PR fully resolves a tracked issue, include `Closes #N` in its body. If the tracker
 lives in another repository, use `Closes owner/repo#N`. For a partial phase of a multi-PR arc,
 use a non-closing reference (`Refs #N` or `Refs owner/repo#N`); reserve the closing keyword for
-the final PR that completes the issue.
+the final PR that completes the issue. A closing keyword binds to every `#N` in the same
+sentence, so "Resolves #194 and #205 §1" closed #205 too (PR #210, 2026-09-17; #205 had to be
+reopened). A PR that only partially addresses a second issue references it in a separate
+sentence with no keyword: "Addresses part 1 of #205".
 
 Report the URL on its own line, wrapped as below. The Claude Desktop client renders a live status
 card from the tag; other harnesses ignore it:
