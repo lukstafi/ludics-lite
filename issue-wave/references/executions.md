@@ -1,65 +1,74 @@
 # Coordinator-owned execution reservations
 
-Use `fleet-worker.sh execution` for every worker correctness/test or measurement/experiment
-execution on a fleet box and every coordinator integration run, with either provider and any
-transport. Every correctness RUN on a box, assigned or standing, is wrapped in
-`fleet-worker.sh execution slot -- <command>` on that box. This includes a CLI worker running tests on its own host, just as it includes a
-native subagent driving that host over SSH. Agent residence never grants execution ownership. Python 3 is required on the anchor, and on every box that runs
-batches (`execution slot`'s lock is a python3 flock); the per-box preflight checks it. State lives in `FLEET_ANCHOR_STATE/executions`,
-under the existing coordinator lease lock. Use the same fleet environment as `claim`.
+Use `fleet-worker.sh execution` for every worker correctness or measurement run on a fleet box
+and every coordinator integration run, with either provider and any transport: a CLI worker
+running tests on its own agent host exactly as much as a native worker driving that host over
+ssh. Agent residence never grants execution ownership. Python 3 is required on the anchor, and
+on every box that runs batches (`execution slot`'s lock is a python3 flock); the per-box
+preflight checks it. State lives in `FLEET_ANCHOR_STATE/executions`, under the existing
+coordinator lease lock. Use the same fleet environment as `claim`.
 
-A `measurement` assignment is exclusive: it is refused while anything is outstanding on its
-host, and everything is refused while it is outstanding. A `correctness` assignment shares its
-host with other correctness assignments up to the box's slots - `FLEET_BOX_CORRECTNESS_SLOTS`,
+The vocabulary is SKILL.md's: a worker *requests*, the coordinator *reserves* (one record in
+this registry), and the *assignment* is the message that resumes the worker with the reserved
+command.
+
+## Exclusivity and the run-time slots
+
+A `measurement` reservation is exclusive: it is refused while anything is outstanding on its
+host, and everything is refused while it is outstanding. A `correctness` reservation shares its
+host with other correctness reservations up to the box's slots - `FLEET_BOX_CORRECTNESS_SLOTS`,
 `<box>=<n>` pairs, `mac-studio=6` with the default roster and one slot for any box it does not
 name (ludics-lite#157: the exclusivity was written for measurement noise and for XProtect
 serializing fresh test binaries, and three workers' targeted `-j 4` batches ran side by side on
 the Mac without a stall once the Developer Tools exemption was in place; the WSL boxes keep one
-slot because the dxg bridge is the limit there. Six, not three, since ludics-lite#160: the cap
-bounds concurrent load on the box and must never bound how many agents may be in flight).
+slot because the dxg bridge is the limit there).
 
-The count is a RUN-TIME count (ludics-lite#160). A reservation carrying `"standing": true` - a
-correctness record held for a worker's whole life, review waits and idle included - consumes no
-slot; it stays outstanding for everything else, so a measurement still needs the box to itself.
-The slots are taken instead by `fleet-worker.sh execution slot [--wait <seconds>] -- <command>`,
-which the worker runs on its own box around one suite or batch: it refuses while a measurement
-is outstanding on that box, holds one of the box's N slots as a real flock for exactly as long
-as the command runs (the kernel drops it even when the batch is killed), and returns the
-command's own status. It needs no coordinator lease, takes no `--box` (the slot is the local
-box's), and refuses with a line beginning `EXECUTION SLOT REFUSED` - exit 1 for no free slot,
-a measurement, a malformed spec or a local box name outside `FLEET_BOXES` (an alias would lock
-and read measurements under a spelling of its own), 4 when the anchor's registry cannot be read.
-Its lock files live under `FLEET_SLOT_STATE` (`~/.local/state/fleet-execution-slots/<box>`),
-which is box-wide on purpose: `ISSUE_WAVE_STATE` is each coordinator's own directory, and slots
-kept there would let two workers under different coordinators each take slot 1 on one machine. The command
-after `--` is exec'd, not interpreted, so a pipeline or a shell builtin goes as `sh -c '...'`. Counting the
-standing record instead had capped agents: on 2026-09-16 a fourth worker was refused a
-reservation while the three holding mac-studio's slots were reading their briefs. Use one canonical box name from the site's roster consistently (for example `rog-nv-wsl`,
-not an alternating SSH alias and app host ID). New reservations and dispatch require exact
+The slot count is a RUN-TIME count, and `execution slot` is the single run-time mechanism
+(ludics-lite#160): every correctness run on a box, assigned or standing, is wrapped in
+`fleet-worker.sh execution slot [--wait <seconds>] -- <command>` on that box, so the box never
+carries more than its slots however the runs were authorized. A reservation carrying
+`"standing": true` - a correctness record held for a worker's whole life, review waits and idle
+included - consumes no slot; it stays outstanding for everything else, so a measurement still
+needs the box to itself. The registry's cap stays a bound on how many non-standing reservations
+may be outstanding on a box and is deliberately NOT subtracted from the run-time slots: a run
+refused because of a record that is not running, its own included, is the defect ludics-lite#160
+removed (2026-09-16: a fourth worker was refused a reservation while the three holding
+mac-studio's slots were reading their briefs; six slots, not three, for the same reason - the
+cap bounds concurrent load, never how many agents may be in flight).
+
+`execution slot` runs on the worker's own box around one suite or batch: it refuses while a
+measurement is outstanding on that box, holds one of the box's N slots as a real flock for
+exactly as long as the command runs (the kernel drops it even when the batch is killed), and
+returns the command's own status. It needs no coordinator lease, takes no `--box` (the slot is
+the local box's), and refuses with a line beginning `EXECUTION SLOT REFUSED` - exit 1 for no
+free slot, a measurement, a malformed spec or a local box name outside `FLEET_BOXES` (an alias
+would lock and read measurements under a spelling of its own), 4 when the anchor's registry
+cannot be read. Its lock files live under `FLEET_SLOT_STATE`
+(`~/.local/state/fleet-execution-slots/<box>`), which is box-wide on purpose: `ISSUE_WAVE_STATE`
+is each coordinator's own directory, and slots kept there would let two workers under different
+coordinators each take slot 1 on one machine. The command after `--` is exec'd, not
+interpreted, so a pipeline or a shell builtin goes as `sh -c '...'`.
+
+Use one canonical box name from the site's roster consistently (for example `rog-nv-wsl`, not
+an alternating ssh alias and app host ID). New reservations and dispatch require exact
 `FLEET_BOXES` entries; aliases and case variants are refused. Configure one canonical entry per
 physical box. Outstanding records outside a changed roster block dispatch until reconciled;
-reads and evidence/conclusion remain available. No SSH alias discovery is performed. Choose placement using required hardware, current
-load, outstanding assignments and available warm checkouts. Record the checkout actually used;
-this does not introduce persistent verifier worktrees, sync, scheduling or remote agent launch.
+reads and evidence/conclusion remain available. No ssh alias discovery is performed. Choose
+placement using required hardware, current load, outstanding reservations and available warm
+checkouts. Record the checkout actually used; this does not introduce persistent verifier
+worktrees, sync, scheduling or remote agent launch.
 
-`execution slot` is the single RUN-TIME mechanism: every correctness run on a box goes through
-it, an assigned one (a full suite, a cross-box leg) exactly as much as a standing worker's own
-batch, so the box never carries more than its slots however the runs were authorized. The
-registry's cap stays what it always was for non-standing records - a bound on how many such
-assignments may be outstanding on that box - and it is deliberately NOT subtracted from the
-run-time slots: a run refused because of a record that is not running, its own included, is the
-defect ludics-lite#160 exists to remove.
-
-`load` observes activity; reservations provide cooperative ownership. They do not stop unrelated
-users, applications or scheduled sweeps. Before timing experiments inspect external activity and
-wait when it compromises the measurement. Existing project runners continue to own process
-locks, time limits, cancellation and logs. This interface never starts or stops a process.
+`load` observes activity; reservations provide cooperative ownership. They do not stop
+unrelated users, applications or scheduled sweeps. Before timing experiments inspect external
+activity and wait when it compromises the measurement. Existing project runners continue to
+own process locks, time limits, cancellation and logs. This interface never starts or stops a
+process.
 
 ## Reserve, launch, observe, conclude
 
-The coordinator performs mutations; workers request assignments with issue/purpose, requested
-revision, execution host and workload kind. Persist JSON payloads on the anchor board as evidence.
-A reservation must exist before launch. For example `reserve.json`:
+The coordinator performs mutations; workers request with issue/purpose, requested revision,
+execution host and workload kind. Persist JSON payloads on the board as evidence. A reservation
+must exist before launch. For example `reserve.json`:
 
 ```json
 {
@@ -80,34 +89,37 @@ A reservation must exist before launch. For example `reserve.json`:
 Run `fleet-worker.sh execution reserve <absolute-reserve.json>`, or - the usual shape -
 `fleet-worker.sh execution run <absolute-reserve.json>`, which reserves and dispatches under one
 lock and leaves the record `launching` (the payload may add `evidence` for the dispatch step).
-`run` is not idempotent by design: a second `run` of a dispatched request is refused, because the
-connection that dropped after the first may have started the runner; reconcile instead. A
-conflicting request reports its current owner and changes nothing. Retrying identical request identity and fields returns
-the existing assignment, including terminal state; a changed request with that ID is refused.
-IDs that differ only by case collide and are refused, including on case-sensitive hosts.
-Use a new ID for a genuinely new execution. `execution list` prints all records, including
-history; it requires no coordinator identity. The creating coordinator and wave remain recorded
-after adoption. Transport is `subagent`, `app`, `cli` or `coordinator`. Transport and `agent_host`
-are provenance; exclusivity depends on `execution_host`, whether the agent is local or remote.
-Provider is not an ownership key. The same issue may hold separate reservations on different
-boxes. Planned placement is a default for iteration; agent capacity and issue dependency readiness
-remain coordinator decisions outside this API.
+`run` is not idempotent by design: a second `run` of a dispatched request is refused, because
+the connection that dropped after the first may have started the runner; reconcile instead. A
+conflicting request reports its current owner and changes nothing. Retrying identical request
+identity and fields returns the existing reservation, including terminal state; a changed
+request with that ID is refused. IDs that differ only by case collide and are refused,
+including on case-sensitive hosts. Use a new ID for a genuinely new execution. `execution list`
+prints all records, including history; it requires no coordinator identity. The creating
+coordinator and wave remain recorded after adoption. Transport is `subagent`, `app`, `cli` or
+`coordinator`. Transport and `agent_host` are provenance; exclusivity depends on
+`execution_host`, whether the agent is local or remote. Provider is not an ownership key. The
+same issue may hold separate reservations on different boxes. Planned placement is a default
+for iteration; agent capacity and issue dependency readiness remain coordinator decisions
+outside this API.
 
 Immediately before invoking the existing bounded project runner - which the worker invokes
 through `execution slot`, so the box's run-time cap holds for assigned runs too - use
 `execution dispatch` with
 `{"request_id":"wave-issue123-cuda-1","evidence":"about to invoke project verifier"}`.
 This rechecks the lease and halt under lock and changes `reserved` to `launching`. Nonzero means
-no dispatch. This is a point-in-time gate, not atomic with the subsequent SSH/tool call. Record
-pending launch before making the call, and never repeat a launch because the connection dropped.
-If adoption or halt occurs in that gap, reconciliation must account for the possible execution.
+no dispatch. This is a point-in-time gate, not atomic with the subsequent ssh or tool call.
+Record the pending launch before making the call, and never repeat a launch because the
+connection dropped. If adoption or halt occurs in that gap, reconciliation must account for the
+possible execution.
 
 Use `execution record` with the request ID, `state` (`running` or `uncertain`), and nonempty
-`evidence`. This requires a dispatched assignment (`launching`, `running` or `uncertain`);
-use explicit reconciliation for recovered prelaunch observations. Add `observed_sha` (exact Git SHA), `remote_checkout`, `handle`, and `log` as known.
-SSH failure means uncertain execution, not a terminal failure. Elapsed time, agent completion
-and worker hand-back do not free a box. Record the requested revision separately from the
-observed SHA; the project's verifier determines whether the source/configuration is acceptable.
+`evidence`. This requires a dispatched reservation (`launching`, `running` or `uncertain`); use
+explicit reconciliation for recovered prelaunch observations. Add `observed_sha` (exact Git
+SHA), `remote_checkout`, `handle`, and `log` as known. ssh failure means uncertain execution,
+not a terminal failure. Elapsed time, a returned turn and a worker hand-back do not free a box.
+Record the requested revision separately from the observed SHA; the project's verifier
+determines whether the source/configuration is acceptable.
 
 Once runner evidence establishes completion and no process remains, `execution conclude` accepts:
 
@@ -141,12 +153,12 @@ runner evidence that its processes stopped. SHA, checkout and handle may already
 evidence and log are required in the conclusion. If reconciliation proves nothing launched, use
 `not-launched` with evidence and a reconciliation log. Terminal records are immutable; an identical
 conclusion retry is harmless. There is no expiry or automatic release. Never remove a checkout
-while an outstanding record refers to it, or while a pending assignment could still be using it.
+while an outstanding record refers to it, or while a pending reservation could still be using it.
 
 ## Standing iteration reservation
 
-A worker's own targeted correctness batches on its agent host do not each need an assignment.
-The coordinator takes one `kind: correctness` reservation per worker at launch (`execution run`,
+A worker's own targeted correctness batches on its agent host do not each need a request. The
+coordinator takes one `kind: correctness` reservation per worker at launch (`execution run`,
 request id `<wave>-<issue>-<host>-iterate`, `"standing": true`, purpose naming the bounded
 aliases and `-j` width) and names it in the brief; the worker then runs those batches through
 the project runner without asking, blocks on each inside its turn, and reports every run
@@ -164,26 +176,28 @@ fleet-worker.sh execution slot -- tools/test-run.sh run <alias> -j 4
 
 which blocks until one of the box's slots is free (`--wait`, default 600 seconds, then a
 refusal), runs the batch under it, and returns the batch's own status. The bare suites of a
-repository whose runner is a plain script go through it the same way, one batch per call. This is what the
-2026-09-15 coordinator ended up granting by message after sixteen request/assign/report
-round-trips parked three workers idle between review rounds.
+repository whose runner is a plain script go through it the same way, one batch per call
+(2026-09-15: the coordinator ended up granting this by message after sixteen
+request/assign/report round-trips parked three workers idle between review rounds).
 
-## Native Claude Code handoff
+## Native handoffs
 
-A Claude Code subagent cannot wait for a message mid-turn, so its handoff is turn-shaped: the
-`EXECUTION_REQUEST` block ending a turn, `EXECUTION_ASSIGNED <id>` on resume by agent ID, and one
-`EXECUTION_RESULT {json}` line ending the result turn, which `conclude --from-run` consumes. The
-formats and the coordinator's side are in [native-claude.md](native-claude.md#worker-channel).
+A Claude Code native worker cannot wait for a message mid-turn, so its handoff is turn-shaped:
+the `EXECUTION_REQUEST` block ending a turn, `EXECUTION_ASSIGNED <id>` on resume by agent ID,
+and one `EXECUTION_RESULT {json}` line ending the result turn, which `conclude --from-run`
+consumes; the formats and the coordinator's side are in
+[native-claude.md](native-claude.md#worker-channel). A Codex native worker keeps its turn open
+and messages instead ([native-codex.md](native-codex.md#worker-channel)).
 
 ## CLI reservation handoff
 
-A detached CLI worker cannot rely on a native message channel. Its self-contained brief names
+A detached CLI worker has no message channel to the coordinator. Its self-contained brief names
 absolute request and result paths under its worker state directory on its agent host. Before
 fleet tests or experiments, it writes the requested revision, execution host, workload kind,
 exact bounded command/batch, checkout and intended log path to the request file, prints
 `EXECUTION_REQUEST <absolute-path>`, and ends its turn without starting that execution.
 
-The coordinator observes the tracked `attach` exit, reads the file (over SSH when needed), and
+The coordinator observes the tracked `attach` exit, reads the file (over ssh when needed), and
 confirms through `status` and process evidence that the CLI has stopped. Queue the request until
 the execution host is available. Reserve it with `transport: "cli"` and the actual `agent_host`,
 then call `execution dispatch`. Only after successful dispatch, resume that same session with
@@ -193,14 +207,13 @@ worker to run only that assignment and return its actual runner handle, observed
 terminal outcome in the result file, then exit again before additional fleet work. Start a new
 tracked `attach` waiter and record the resume/runner evidence on the board.
 
-Dispatch preceding the resume is a point-in-time gate just as it precedes an SSH runner call.
+Dispatch preceding the resume is a point-in-time gate just as it precedes an ssh runner call.
 If resume fails or its outcome is unclear, retain ownership and reconcile whether anything
 started; never blindly dispatch or resume twice. When the result turn ends, verify actual runner
-termination and conclude with its evidence before resuming ordinary implementation/review.
-A `DONE` turn with a request or result is an intermediate handoff, not issue completion. A new
-execution needs a new request and reservation. CLI workers never mutate the coordinator lease
-or reservation registry themselves. Native workers use their live coordinator message channel
-for the same reserve/dispatch/evidence lifecycle.
+termination and conclude with its evidence before resuming ordinary implementation/review. A
+`DONE` turn carrying a request or a result is a handoff, not issue completion (SKILL.md,
+Supervise: *A returned turn means the turn ended*). A new execution needs a new request and
+reservation. CLI workers never mutate the coordinator lease or reservation registry themselves.
 
 ## Adoption and halt
 
@@ -213,17 +226,19 @@ Recording and concluding existing executions remain available during a halt for 
 
 A halt refuses ordinary reservations and dispatch. The one named regression-triage reservation
 may include a nonempty `triage_reason` only while a halt is active; its dispatch is allowed
-during the halt. Premarking ordinary reservations as future triage is refused. Each new halt receives a unique ID. Repeating `halt` to update its reason preserves that ID,
-including after coordinator adoption; only resume followed by a new halt changes it. A triage assignment is bound to that halt and cannot
-dispatch after it ends or during a later halt; its box stays reserved until reconciled. Only an
-outstanding triage assignment for the current halt blocks its next triage reservation. This exception must correspond
-to the board's named triage worker, not a general bypass for ordinary work.
+during the halt. Premarking ordinary reservations as future triage is refused. Each new halt
+receives a unique ID. Repeating `halt` to update its reason preserves that ID, including after
+coordinator adoption; only resume followed by a new halt changes it. A triage reservation is
+bound to that halt and cannot dispatch after it ends or during a later halt; its box stays
+reserved until reconciled. Only an outstanding triage reservation for the current halt blocks
+its next triage reservation. This exception must correspond to the board's named triage worker,
+not a general bypass for ordinary work.
 
 Fixtures: `python3 issue-wave/scripts/test-fleet-execution.py` exercises actual temporary anchor
-state and concurrent processes without SSH, accounts or hardware. For live validation reserve
+state and concurrent processes without ssh, accounts or hardware. For live validation reserve
 one box, run one existing bounded verification command at a recorded SHA, retain the actual
 handle/log/verdict and conclude. Lack of hardware access remains a validation gate, not evidence
-of success. The bounded two-worker transport smoke is in [native-workers.md](native-workers.md).
+of success. The bounded two-worker transport smoke is in [native-workers.md](native-workers.md#close-out-and-bounded-smoke).
 
 ## Bounded native Windows verification
 
@@ -254,9 +269,9 @@ using it. The driver accepts only `exit: N` with N in 0..255, requires that reco
 Windows supplies a native exit code, and cross-checks the native code whenever non-null.
 A null native code never implies success. It returns the recorded code, 124 for a confirmed
 timeout cleanup, or 2 for incomplete/inconsistent evidence or runner errors. Logs remain for
-inspection. An unconfirmed cleanup leaves the execution reservation uncertain; do not conclude
-it merely from wrapper termination. This foreground runner does not supervise detached work
-or replace the reservation protocol above.
+inspection. An unconfirmed cleanup leaves the reservation uncertain; do not conclude it merely
+from wrapper termination. This foreground runner does not supervise detached work or replace
+the reservation protocol above.
 
 Run `powershell -NoProfile -File issue-wave/scripts/test-windows-driver.ps1` (or `pwsh`) on
 Windows. CI runs both engines, including a real inner Bash failure with the native exit accessor

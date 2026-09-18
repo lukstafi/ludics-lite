@@ -1,24 +1,25 @@
 # Claude Code coordinator, CLI workers
 
 A CLI worker is a headless `claude -p` or `codex exec` turn in a detached tmux session on a
-fleet box, launched and supervised through `fleet-worker.sh` by a coordinator that can be
-either provider - this file is written for a Claude Code coordinator, and its workers can be
-Claude or Codex invocations (`--kind claude` / `--kind codex`); the shared issue requirements
-of the brief, the base gate and the preflight are in SKILL.md, and the reservation handoff for a
-worker that cannot message the coordinator is [executions.md](executions.md#cli-reservation-handoff).
+fleet box, launched and supervised through `fleet-worker.sh` by a coordinator of either
+provider. This file is written for a Claude Code coordinator, and its workers can be Claude or
+Codex invocations (`--kind claude` / `--kind codex`); the shared issue requirements of the
+brief, the base gate and the preflight are in SKILL.md, and the handoff for a worker that
+cannot message the coordinator is the [CLI reservation handoff](executions.md#cli-reservation-handoff).
 
 ## Launch
 
 CLI workers use `~/.claude/skills/issue-wave/scripts/fleet-worker.sh`. Each is a detached
-tmux session on its agent box running the selected `claude` or `codex` CLI, with the brief on stdin
-and events, stderr, exit code and session id under `~/.local/state/issue-wave/workers/<name>/`.
-Detached CLI workers run without permission prompts: retain the triage screen of the full
-issue body and comments before launch. Issues with untrusted outside participation are
-deferred or handled under ordinary permission controls, not dispatched unscreened.
+tmux session on its agent box running the selected `claude` or `codex` CLI, with the brief on
+stdin and events, stderr, exit code and session id under
+`~/.local/state/issue-wave/workers/<name>/`. Detached CLI workers run without permission
+prompts: retain the triage screen of the full issue body and comments before launch. Issues
+with untrusted outside participation are deferred or handled under ordinary permission
+controls, not dispatched unscreened.
 
-Write the brief to a file and launch with the selected kind
-(`--kind claude` with `-- --model opus --effort high` for requested Opus, or `--kind codex`
-with the user's supported Codex model flags):
+Write the brief to a file and launch with the selected kind (`--kind claude` with `-- --model
+opus --effort high` for requested Opus, or `--kind codex` with the user's supported Codex model
+flags):
 
 ```bash
 fleet-worker.sh launch <box> <repo>-<issue> --target-repo <owner/repo> --kind claude --brief <brief-file> \
@@ -28,18 +29,35 @@ fleet-worker.sh attach <box> <repo>-<issue>     # Bash run_in_background: the wa
 
 `launch` creates `<checkout>-worktrees/<name>` off `origin/master` on the box (`FLEET_BASE_REF`
 for another default, `--base` for one launch, `--cwd` for a worktree that already exists) and
-prints the session id that addresses every later intervention. `attach` blocks until the worker's session exits and prints
-one verdict line (`DONE` / `FAILED` / `VANISHED`), riding out ssh drops and box naps by
-retrying from the coordinator's side; run it as a harness-tracked background task, one per
-worker, and its completion notification is the wake signal - exactly the wait-and-proceed
-shape. Native subagents use their runtime wait mechanism instead; do not assume they or their
-child processes survive a coordinator interruption. Detached CLI workers continue independently.
+prints the session id that addresses every later intervention. `attach` blocks until the
+worker's session exits and prints one verdict line (`DONE` / `FAILED` / `VANISHED`), riding out
+ssh drops and box naps by retrying from the coordinator's side; run it as a harness-tracked
+background task, one per worker, and its completion notification is the wake signal - exactly
+the wait-and-proceed shape. A `DONE` line is a returned turn and nothing more (SKILL.md,
+Supervise: *A returned turn means the turn ended*): read the final output for a request or a
+result before calling the issue finished.
+
+## Supervising
+
+- **The stall test is `fleet-worker.sh status <box> <name>`**: one line with the session's
+  liveness, the stream's event count and quiet time, the last event type, and the worktree's
+  head age and dirty count. A `codex exec` or `claude -p` run is silent between events and has
+  no yield signal, so the test is **stream quiet AND worktree unmoved over a wall-clock window
+  sized to the task** (a long test run is quiet on both for its duration; a review round is
+  not), read the same way on every box. The machine-level checks of SKILL.md's *Verify
+  externally* apply on top.
+- **Nothing is stranded by a coordinator interruption; the wave just went unobserved.**
+  Detached workers keep running on their boxes, so after any interruption the recovery is
+  `fleet-worker.sh ls` across the fleet, then `attach` again per running worker and
+  `status`/verdict per finished one. A fleet-length wave (10 h and more) is therefore not a
+  heartbeat problem. `attach` itself retries an unreachable box for ~40 minutes before giving
+  up (exit 4 - wake the box and re-attach).
 
 ## Intervening
 
 - **CLI workers: unstick through the script, and only a dead exec.** Write the imperative
-  message to a file (do X now, in this turn, do not yield; never as command-line text - issue prose is
-  full of backticks and `$()`) and run `fleet-worker.sh unstick <box> <name> --message
+  message to a file (do X now, in this turn, do not yield; never as command-line text - issue
+  prose is full of backticks and `$()`) and run `fleet-worker.sh unstick <box> <name> --message
   <file>`. It resumes the recorded session in a fresh detached turn - full context retained,
   same worktree (resume has no `-C`; the script `cd`s first) - and REFUSES while the exec is
   alive, because a resume beside a live exec gives the branch two writers, one of them
@@ -58,9 +76,19 @@ child processes survive a coordinator interruption. Detached CLI workers continu
   alive; only if the session is unresumable does the coordinator brainstorm from the diff and
   say so.
 - **CLI model-capacity errors end execs; resume the recorded session.** A CLI worker whose
-  `attach` line reads `FAILED ... turn.failed ... "Selected model is at capacity"` (or a Claude worker's
-  `is_error=true` on a provider error) is terminal for that turn, not for the session. The
-  work is durable (briefs mandate early commits): `unstick` with a disk-first note (trust
+  `attach` line reads `FAILED ... turn.failed ... "Selected model is at capacity"` (or a Claude
+  worker's `is_error=true` on a provider error) is terminal for that turn, not for the session.
+  The work is durable (briefs mandate early commits): `unstick` with a disk-first note (trust
   `git log`/`git status` and the PR state over the session's memory; re-run anything whose
   result is not in a file) recovered 2/2 cleanly on 2026-08-30. Expect kills to cluster
   (capacity is global); resume victims as their `attach` notifications arrive.
+
+## Close-out
+
+`fleet-worker.sh ls` must show no `RUNNING` and no `ORPHANED` CLI worker on any box before the
+wave closes: an orphan is a CLI still writing after its tmux session died - wait for it, or
+`unstick --kill` it, never close out over it. Then, and only then, remove CLI workers'
+worktrees on their boxes (`ssh <box> 'git -C <checkout> worktree remove <path>'`), once no
+outstanding reservation refers to the checkout. The finished worker records under
+`~/.local/state/issue-wave/workers/` can stay as evidence; `launch` refuses to overwrite one
+without `--replace`.
