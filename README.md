@@ -271,11 +271,15 @@ pass, while `"$TEMP_ROOT/cache/x.XXXXXX"` is refused — the component `mktemp` 
 symlink, an intermediate one can. That is one component per assignment and not one per chain:
 `A="$ROOT/cache"` is resolved by the same rule, so `B="$A/work"` and a `mktemp -d "$B/x.XXXXXX"`
 under it walk as far as they like. A root counts as resolved for a scope when every assignment to it
-there leaves a physical path and at least one stands at control depth zero — keyword depth, so a
-`then` arm cannot certify while a line inside `( … )` still does — and a non-resolving assignment
-disqualifies from any depth, though only one that opens its own line is in the table to do it. Line
-ORDER is not compared, so a root resolved below the allocation satisfies the guard while the
-allocation itself ran unresolved: resolving it first is convention the guard cannot verify.
+there matches one of the shapes the scanner reads as physical — its `cd … && pwd -P` idiom, a
+resolver function defined in the same file, a `dirname` of a resolved variable, or inheritance from
+one — and at least one of them stands at control depth zero. Depth there is keyword depth, so a
+`then` arm cannot certify while a line inside `( … )` still does, and a non-resolving assignment
+disqualifies from any depth, though only one that opens its own line is in the table to do it. A
+shape it does not read is no resolution to it, however physical the path: a bare `ROOT=$(pwd -P)`
+after a `cd` is refused. Line ORDER is not compared, so a root resolved below the allocation
+satisfies the guard while the allocation itself ran unresolved: resolving it first is convention the
+guard cannot verify.
 
 **`routines/*/SKILL.md` are Markdown prompts read by an agent, not shell scripts.** Nothing execs
 the file and no shell parses it: `bash -n`, shellcheck, `check-jq-shapes.sh` and
