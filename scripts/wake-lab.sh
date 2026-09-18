@@ -390,6 +390,10 @@ HOLD_WAIT_SECONDS=${WAKE_LAB_HOLD_WAIT_SECONDS:-60}
 # on its own cannot say, since the wsl.exe it sees may be the owner's console shell.
 HOLD_SETTLE_SECONDS=${WAKE_LAB_HOLD_SETTLE_SECONDS:-20}
 HOLD_STATE_DIR=${WAKE_LAB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wake-lab}
+# Set when a holder was found already dead at unhold: a lane that lost its box without anyone
+# noticing. It is a FAULT and not a cleanup detail, so it leaves the command non-zero -- see
+# release_hold for why a holder can only be gone by having died under the lane.
+HOLD_ANOMALY=0
 # The local-time hours on the Windows box that the unattended sweep occupies: the routine's 07:20
 # launch plus its longest lane. Written `<start>-<end>`, end exclusive, and it may wrap midnight.
 SWEEP_HOURS=${WAKE_LAB_SWEEP_HOURS:-7-11}
@@ -780,7 +784,9 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
     # Claim the record BEFORE spawning, with noclobber. Two `--hold` runs for one box would
     # otherwise both spawn a holder and the second write would erase the first pid, leaving a
     # holder nobody can unhold and a VM pinned until the box reboots.
-    rm -f "$f" 2>/dev/null
+    # ...and a marker from some earlier release goes with it: left in place it would mask the loss
+    # of the holder about to be spawned, which is the one thing this reporting exists to catch.
+    rm -f "$f" "${f%.pid}.releasing" 2>/dev/null
     if ! ( set -C; : > "$f" ) 2>/dev/null; then
       if [ -e "$f" ]; then
         echo "  wsl holder for $name is already being created by another run ($f is claimed); nothing was started"
@@ -899,9 +905,18 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
   return 1
 }
 
-release_hold() { # release_hold <box> — end the recorded holder; always rc 0, always says what it did
-  local f=$HOLD_STATE_DIR/hold-$1.pid rec p d t sc
-  if [ ! -r "$f" ]; then echo "  no wsl holder recorded for $1"; return 0; fi
+release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (an already-dead
+                 # holder is reported by setting HOLD_ANOMALY, which the caller turns into rc 2),
+                 # always says what it did
+  local f=$HOLD_STATE_DIR/hold-$1.pid rec p d t sc rel
+  # An unhold is not atomic: it kills the holder and then removes the record, and between those
+  # two it can be interrupted (or a second unhold can overlap it -- which the routine now invites,
+  # since it tells a run whose unhold has not come back to chase it). The record left behind then
+  # names a pid that IS dead, and without this marker the retry would read a deliberate release as
+  # a holder the lane lost and call valid results suspect. So intent is written down BEFORE the
+  # kill: whoever finds the record next can tell "an unhold ended this" from "this died".
+  rel=${f%.pid}.releasing
+  if [ ! -r "$f" ]; then rm -f "$rel"; echo "  no wsl holder recorded for $1"; return 0; fi
   rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
   read -r p d t sc <<<"${rec:-}"; : "$d" "$t"
   # The lock sidecar goes with the holder: it exits on its own once the holder is gone, and
@@ -916,12 +931,55 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0, 
     # Killing the local client closes the channel and sshd ends the command it was running. If a
     # wsl.exe is ever orphaned on the Windows side despite that, `restart-wsl` clears it: the
     # `wsl --shutdown` it issues takes every holder with the VM.
+    : > "$rel" 2>/dev/null
     kill "$p" 2>/dev/null
     echo "  wsl holder released on $1 (pid $p killed; the VM is unheld from now on)"
+  elif [ -e "$rel" ]; then
+    # The holder is gone and an unhold is on record as having ended it. That is a completed
+    # release whose record outlived it, not a loss: say so, clear up, and leave rc 0.
+    echo "  wsl holder on $1 was already ended by an earlier unhold (pid ${p:-?}); its record is cleared"
+  elif [ ! -e "$f" ]; then
+    # The record VANISHED between this run's entry and here, which is the one interleaving the
+    # marker cannot cover on its own: a concurrent unhold got through its whole release -- marker,
+    # kill, `rm -f` of both files -- inside that window, leaving nothing behind to read. The fix is
+    # not to serialize, but to stop treating an absent record as evidence: a record is removed by
+    # exactly one thing, a release that completed, so a record that is GONE never witnesses a loss.
+    # Only a record that is STILL THERE naming a holder that is not does that, which is the branch
+    # below. Locking this instead would put an acquire in front of the one command that has to work
+    # when everything else is wedged -- unhold is how a lane ends -- and a marker that outlived its
+    # release, the other suggestion, would mask the next holder's loss.
+    echo "  wsl holder on $1 was released by a concurrent unhold; nothing to do"
   else
-    echo "  wsl holder on $1 had already exited (pid ${p:-?}); the VM was unheld"
+    # NOT a routine outcome, though this reported it as one until 2026-09-18. A lane ends by
+    # unhold and nothing else ENDS the holder deliberately, so a holder already gone is one the
+    # lane LOST -- the box slept or rebooted under it, the network dropped, something killed it.
+    # What that costs is the LAB LOCK, not usually the VM: the lock lives on the
+    # holder's descriptor, so it was released the moment the holder died and the box stopped being
+    # reserved -- another session's `restart-wsl` was then free to take it with a host-global
+    # `wsl --shutdown`, which is the 2026-09-16 failure the interlock exists to prevent. Note that
+    # the interlock only covers THIS script's `sleep`/`down` verbs, which reserve the box and are
+    # refused while it is held: a box slept by hand or from Windows bypasses it entirely and takes
+    # the holder with it. That is 2026-09-18 -- both boxes slept at 11:33 with a hold outstanding,
+    # four hours into the lane, and the only thing that ever said so was this line, which called it
+    # a release and was believed. The VM
+    # itself commonly survives, because a dying holder ORPHANS its wsl.exe on the Windows side
+    # rather than taking it down (measured 2026-09-18: a holder killed at 12:47:37 left its two
+    # wsl.exe running, and four from 07:08 were still up six hours later). That is not a
+    # consolation -- an orphan is unowned, invisible to this script, and ends only at the next
+    # restart-wsl or reboot. Either way the lane no longer holds what it believes it holds, so
+    # this says it in the words of a fault and the caller exits non-zero.
+    HOLD_ANOMALY=1
+    case ${t:-} in
+      ''|*[!0-9]*) echo "  ANOMALY: wsl holder on $1 had already exited (pid ${p:-?})" ;;
+      *) echo "  ANOMALY: wsl holder on $1 had already exited (pid ${p:-?}, spawned $(date -r "$t" '+%H:%M:%S' 2>/dev/null || echo '?'), so it lived at most $(( ($(date +%s) - t) / 60 )) min)" ;;
+    esac
+    echo "    This unhold did not end it. The lab lock died with it, so $1 stopped being RESERVED"
+    echo "    at that moment and another session's restart-wsl was free to shut the VM down under"
+    echo "    the lane. The VM may well have stayed up regardless -- a dying holder orphans its"
+    echo "    wsl.exe rather than taking it down -- but nothing owns that orphan and nothing short"
+    echo "    of restart-wsl or a reboot ends it. Treat this lane's results on $1 as suspect."
   fi
-  rm -f "$f"
+  rm -f "$f" "$rel"
   return 0
 }
 
@@ -1298,6 +1356,11 @@ fi
 # reports no holder instead of a typo, which is the right trade for a cleanup command.
 if [ "$VERB" = unhold ]; then
   for t in "${TARGETS[@]}"; do release_hold "$t"; done
+  # rc 2, not 1: a lane's cleanup must be able to tell "the holder died under me" (the lane's
+  # results are suspect) from an ordinary failure of the unhold command itself. Nothing was left
+  # un-cleaned either way -- the record is gone and the box is free -- so a caller that only
+  # cares about cleanup can ignore it, while the sweep can fail the lane on it.
+  [ "$HOLD_ANOMALY" = 1 ] && exit 2
   exit 0
 fi
 

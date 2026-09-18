@@ -586,10 +586,76 @@ out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" 
 for _ in 1 2 3 4 5; do alive "$stranded" || break; sleep 1; done
 alive "$stranded" && ko "...but the holder survived" || ok "...and the holder is gone"
 mkdir -p "$TMP/state"; printf '999999\n' > "$TMP/state/hold-rog.pid"
-expect "...and a holder that had already died is reported as such, not as a release" 0 "had already exited" -- \
+# A holder found already dead is a lane that lost its box with nobody noticing -- the very failure
+# --hold exists to prevent -- so it is reported as a FAULT and leaves rc 2, never as a release. On
+# 2026-09-18 both holders died ~30-38 min into a lane, unhold called it a release, and the run read
+# as clean; the boxes stayed up by luck. rc 2 and not 1 so a cleanup can tell this from an ordinary
+# failure of the unhold command.
+expect "...and a holder that had already died is reported as an ANOMALY, not as a release" 2 "ANOMALY: wsl holder on rog had already exited" -- \
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
+grep -q 'stopped being RESERVED' <<<"$out" \
+  && ok "...and says what it cost the lane -- the lab lock -- not merely that a pid was gone" \
+  || ko "the anomaly does not say the box stopped being reserved when the holder died -- $out"
 [ ! -f "$TMP/state/hold-rog.pid" ] && ok "...and its stale pid file is cleared" \
   || ko "a dead holder's pid file survived unhold"
+# An unhold is not atomic -- it kills the holder, then removes the record -- so an interruption
+# between the two (or a second unhold overlapping the first, which the routine now invites by
+# telling a run whose unhold has not come back to chase it) leaves a record naming a pid that
+# unhold itself deliberately ended. Reporting that as a lost holder would mark valid lane results
+# suspect, so the release writes its intent down BEFORE the kill and a retry reads it.
+mkdir -p "$TMP/state"; printf '999999 rog-lan 1 0\n' > "$TMP/state/hold-rog.pid"
+: > "$TMP/state/hold-rog.releasing"
+expect "an interrupted unhold's leftover record is a completed release, not a lost holder" 0 "was already ended by an earlier unhold" -- \
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
+grep -q 'ANOMALY' <<<"$out" \
+  && ko "a deliberate release was reported as a lost holder -- $out" \
+  || ok "...and raises no anomaly, so the lane's results are not called suspect"
+[ ! -f "$TMP/state/hold-rog.releasing" ] && ok "...and the release marker is cleared with the record" \
+  || ko "the release marker survived unhold"
+# ...and that marker must not outlive its lane: left in place it would mask the loss of the NEXT
+# holder, which is the one thing this reporting exists to catch.
+reset_hold_state
+mkdir -p "$TMP/state"; : > "$TMP/state/hold-rog.releasing"
+out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1)
+[ ! -f "$TMP/state/hold-rog.releasing" ] \
+  && ok "a fresh hold clears a stale release marker, so the next lost holder is still reported" \
+  || ko "a stale release marker survived a fresh hold -- it would mask the next loss -- $out"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+# Two unholds racing over one box must never report an intentional release as a loss. The marker
+# alone does not close this: the record can vanish between one run's entry and its own checks,
+# which is why an absent record is read as "a release completed" rather than as evidence. Note what
+# this case can and cannot do -- it runs the pair concurrently and cannot prove it ever hit the
+# window, so the guarantee rests on that argument and this is the regression net under it. It also
+# cannot fail spuriously in the other direction: the only things that fail it, an ANOMALY line and
+# an rc 2, are both the bug itself.
+race_bad=0
+for i in 1 2 3; do
+  reset_hold_state
+  held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
+  ( env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog \
+      > "$TMP/race-a" 2>&1; echo $? > "$TMP/race-a.rc" ) &
+  ( env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog \
+      > "$TMP/race-b" 2>&1; echo $? > "$TMP/race-b.rc" ) &
+  wait
+  if grep -q 'ANOMALY' "$TMP/race-a" "$TMP/race-b" 2>/dev/null; then
+    race_bad=$((race_bad + 1)); echo "  race $i raised an anomaly: $(cat "$TMP/race-a" "$TMP/race-b")"
+  fi
+  for half in a b; do
+    [ "$(cat "$TMP/race-$half.rc" 2>/dev/null)" = 2 ] && race_bad=$((race_bad + 1))
+  done
+done
+[ "$race_bad" -eq 0 ] \
+  && ok "overlapping unholds never report a deliberate release as a lost holder" \
+  || ko "overlapping unholds reported an intentional release as a loss ($race_bad of 6 halves)"
+# ...and the pair really did release something, so the case above is not passing on two no-ops.
+if grep -q 'wsl holder released on rog' "$TMP/race-a" "$TMP/race-b" 2>/dev/null; then
+  ok "...and the racing pair between them released the holder"
+else
+  ko "neither half of the race released anything -- $(cat "$TMP/race-a" "$TMP/race-b" 2>/dev/null)"
+fi
+[ ! -f "$TMP/state/hold-rog.pid" ] && [ ! -f "$TMP/state/hold-rog.releasing" ] \
+  && ok "...and leaves neither the record nor the marker behind" \
+  || ko "a raced unhold left state behind for the next lane to trip on"
 # Every box's holder runs the same payload, so a signature that did not include the destination
 # would let one box's stale file kill another box's LIVE holder -- dropping that lane silently.
 reset_hold_state
@@ -605,7 +671,7 @@ env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold 
 # been taken over by something else must not get that process killed.
 sleep 30 & innocent=$!
 printf '%s\n' "$innocent" > "$TMP/state/hold-rog.pid"
-expect "a stale pid reused by an unrelated process is not killed as a holder" 0 "had already exited" -- \
+expect "a stale pid reused by an unrelated process is not killed as a holder" 2 "had already exited" -- \
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
 alive "$innocent" && ok "...and that process is still running" \
   || ko "unhold killed a process that merely inherited the holder's pid"
