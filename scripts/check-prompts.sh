@@ -962,11 +962,19 @@ md_links() {
         # looking for any at all still failed prose that is perfectly fine, which is the one way
         # this scan can fail a file with nothing wrong with it. Walked backwards from the `]`,
         # counting the pairs that close on the way, so a `[` already closed answers for nothing.
+        # A bracket a backslash made literal is text, and closes or opens nothing -- `\[note](x.md)`
+        # renders as prose. Parity, not presence: `\\[note]` is an escaped BACKSLASH followed by a
+        # real opener. The `]` of this candidate is read the same way, since an escaped one closes
+        # no label either.
         label = 0; depth = 0
+        if (escaped(line, i)) { line = substr(line, i + 2); continue }
         for (k = i - 1; k >= 1; k--) {
           c = substr(line, k, 1)
+          if (c != "[" && c != "]") continue
+          if (escaped(line, k)) continue
           if (c == "]") depth++
-          else if (c == "[") { if (depth == 0) { label = 1; break } else depth-- }
+          else if (depth == 0) { label = 1; break }
+          else depth--
         }
         line = substr(line, i + 2)
         if (label == 0) continue
@@ -1009,6 +1017,13 @@ md_links() {
         line = substr(line, j + 1)                 # accepted: the cursor may pass the whole link
         print rel "\t" target "\t" resolve(dir, path) "\t" anchor
       }
+    }
+    # escaped <text> <at>: whether the character at <at> stands behind an odd number of
+    # backslashes, which is what makes it literal rather than a delimiter.
+    function escaped(text, at,   b) {
+      b = 0
+      while (at - b - 1 >= 1 && substr(text, at - b - 1, 1) == "\\") b++
+      return b % 2
     }
     function resolve(dir, path,   parts, k, i, out, n, s) {
       k = split(dir "/" path, parts, "/")
@@ -1226,6 +1241,12 @@ heading_slugs() {
       if (SPAN_BARE ~ /<\/?[A-Za-z][A-Za-z0-9-]*([[:space:]][^<>]*)?\/?>/) return "!"
       if (SPAN_BARE ~ /<[A-Za-z][A-Za-z0-9+.-]*:[^<>[:space:]]*>/) return "!"
       if (index(SPAN_BARE, "<!--") > 0) return "!"
+      # The rest of the raw-HTML forms, which render as markup and contribute no heading text:
+      # a processing instruction, a declaration, a CDATA section. `## <?target?>` is nothing at
+      # all to GitHub, where the source reading gave it `target`.
+      if (SPAN_BARE ~ /<\?[^<>]*\?>/) return "!"
+      if (SPAN_BARE ~ /<![A-Za-z][^<>]*>/) return "!"
+      if (index(SPAN_BARE, "<![CDATA[") > 0) return "!"
       if (SPAN_BARE ~ /&[A-Za-z0-9#]+;/) return "!"
       # Underscore emphasis is the one emphasis marker the two readings do NOT agree on, because
       # the slugger keeps `_` as a word character: `## _Foo_` renders as `Foo` and is `foo` there,

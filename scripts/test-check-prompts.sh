@@ -1584,6 +1584,35 @@ links_body alpha/SKILL.md 'See [an indented phantom](references/notes.md#hidden-
 expect "the columns a tab leaves after a blockquote marker are indentation" 1 \
   "GitHub slug is 'hidden-by-indentation'" -- "$CP" "$R"
 
+# A bracket a backslash made literal opens no label, so `\[note](x.md)` is prose (round 11, P2).
+# Parity, not presence: `\\[note]` is an escaped BACKSLASH followed by a real opener.
+links_tree
+links_body alpha/SKILL.md 'Prose with \[note](references/gone.md) escaped, which renders as text.'
+expect "an escaped bracket opens no label" 0 '0 failed' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'Prose with \\[note](references/gone.md), where the backslash is the escaped one.'
+expect "...while two backslashes escape each other and leave a real opener" 1 \
+  'resolves to no file: alpha/references/gone.md' -- "$CP" "$R"
+
+# The raw-HTML forms beyond tags and comments render as markup and contribute no heading text, so
+# the source reading handed `## <?target?>` the anchor `target`, which GitHub does not create
+# (round 11, P2). A processing instruction, a declaration and a CDATA section, each spelled whole.
+while IFS='|' read -r label heading anchor; do
+  links_tree
+  printf '\n## %s\n\nRaw HTML, which renders as markup.\n' "$heading" >> "$R/alpha/references/notes.md"
+  links_body alpha/SKILL.md "See [$label](references/notes.md#$anchor)."
+  expect "a heading that is raw HTML spells no anchor: $label" 1 \
+    'will not spell an anchor for' -- "$CP" "$R"
+done <<'EOF'
+a processing instruction|<?target?>|target
+a declaration|<!DOCTYPE html>|doctype-html
+a CDATA section|<![CDATA[x]]>|cdatax
+EOF
+links_tree
+printf '\n## A < B still text\n\nAn opening bracket that is not markup.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [text, not markup](references/notes.md#a--b-still-text).'
+expect "...while a bare < among them is still text on both sides" 0 '(1 checked)' -- "$CP" "$R"
+
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.
 fresh "$R"
