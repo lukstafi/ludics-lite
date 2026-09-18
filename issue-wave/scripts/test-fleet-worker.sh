@@ -346,8 +346,8 @@ linked_skills=$(find "$real_home/.claude/skills" -mindepth 1 -maxdepth 1 -type l
 
 # Extract each lint step's patterns from the workflow: restating them here would let the test and
 # workflow drift together. Every shell file must be covered by BOTH the syntax and shellcheck step.
-workflow_globs() { # workflow_globs <step name>
-  awk -v want="$1" '
+workflow_globs() { # workflow_globs <checkout> <step name>
+  awk -v want="$2" '
     /^[[:space:]]*- name: / {
       if (in_step) exit
       if (index($0, "- name: " want) != 0) in_step = 1
@@ -359,39 +359,99 @@ workflow_globs() { # workflow_globs <step name>
       n = split(line, field, /[[:space:]]+/)
       for (i = 1; i <= n; i++) if (field[i] ~ /[*].*[.]sh$/) print field[i]
     }
-  ' "$real_top/.github/workflows/skill-scripts.yml"
+  ' "$1/.github/workflows/skill-scripts.yml"
 }
-workflow_matches() { # workflow_matches <newline-separated patterns>: expand from the checkout root
-  local patterns="$1"
+workflow_matches() { # workflow_matches <checkout> <newline-separated patterns>: the paths they cover
+  # Expand the patterns the way the workflow's own shell does, over a tree holding exactly what the
+  # repository TRACKS -- mirrored here as empty files, since only the paths decide the match.
+  # Tracked paths on this side too, for the reason the other side reads them: expanding into the
+  # checkout answers what the worktree HOLDS, so a tracked script the worktree is missing (an
+  # unstaged deletion, a sparse checkout) would be matched by no pattern and reported uncovered,
+  # which is the very false positive this guard was fixed for. Re-implementing the expansion over
+  # a list of paths instead is the trap: `case` lets `*` cross a slash, and git's `:(glob)`
+  # pathspec stops that but still matches a leading `.`, which bash does only under `dotglob` --
+  # so a tracked `.github/scripts/check.sh` would read as covered while the workflow's glob never
+  # expands to it. Mirroring keeps every rule of the expansion with the shell that has them.
+  local checkout="$1" patterns="$2" mirror path matched
+  mirror=$(mktemp -d "$TMP/glob-mirror.XXXXXX") || return 1
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    case $path in */*) mkdir -p "$mirror/${path%/*}" || return 1 ;; esac
+    : > "$mirror/$path" || return 1
+  done <<EOF
+$(tracked_shell_files "$checkout")
+EOF
   (
-    cd "$real_top" || exit 1
+    cd "$mirror" || exit 1
     while IFS= read -r pattern; do
       [ -n "$pattern" ] || continue
-      # Unquoted on purpose: the workflow's shell expands the same pathname glob. Unlike `case`,
-      # pathname expansion does not let * cross a slash.
+      # Unquoted on purpose: this is the workflow's own pathname expansion, run by the same shell
+      # over the same names. Only `*.sh` is mirrored, and every pattern ends in `.sh`.
       # shellcheck disable=SC2086
       for matched in $pattern; do [ -f "$matched" ] && printf '%s\n' "$matched"; done
     done <<EOF
 $patterns
 EOF
   ) | sort -u
+  rm -rf "$mirror"
 }
-syntax_globs=$(workflow_globs 'Check shell syntax')
-shellcheck_globs=$(workflow_globs 'Shellcheck')
-shell_files=$(cd "$real_top" && find . -type f -name '*.sh' -print | sed 's|^\./||' | sort)
-syntax_files=$(workflow_matches "$syntax_globs")
-shellcheck_files=$(workflow_matches "$shellcheck_globs")
-uncovered=""
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  grep -Fqx -- "$f" <<<"$syntax_files" || uncovered="$uncovered bash-n:$f"
-  grep -Fqx -- "$f" <<<"$shellcheck_files" || uncovered="$uncovered shellcheck:$f"
-done <<EOF
-$shell_files
+tracked_shell_files() { # <checkout>: the shell scripts the repository tracks, one per line
+  # Tracked paths, for the reason the layout guard above reads them: CI's lint steps run over an
+  # actions/checkout, which holds no untracked file, so a scratch `*.sh` an agent leaves in a local
+  # worktree is not something these globs were ever meant to cover -- and under `find` it failed
+  # this guard with a message about the workflow. `*.sh` here is a git pathspec, not a pathname
+  # glob: its `*` crosses `/`, so it matches at every depth, which is what this guard wants, since
+  # the workflow's globs cover nested paths too.
+  git -C "$1" ls-files -z -- '*.sh' | while IFS= read -r -d '' path; do printf '%s\n' "$path"; done | sort
+}
+uncovered_shell_files() { # <checkout>: "<step>:<path>" for every tracked script a lint step misses
+  local syntax_files shellcheck_files uncovered="" f
+  syntax_files=$(workflow_matches "$1" "$(workflow_globs "$1" 'Check shell syntax')")
+  shellcheck_files=$(workflow_matches "$1" "$(workflow_globs "$1" 'Shellcheck')")
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    grep -Fqx -- "$f" <<<"$syntax_files" || uncovered="$uncovered bash-n:$f"
+    grep -Fqx -- "$f" <<<"$shellcheck_files" || uncovered="$uncovered shellcheck:$f"
+  done <<EOF
+$(tracked_shell_files "$1")
 EOF
+  printf '%s' "$uncovered"
+}
+syntax_globs=$(workflow_globs "$real_top" 'Check shell syntax')
+shellcheck_globs=$(workflow_globs "$real_top" 'Shellcheck')
+uncovered=$(uncovered_shell_files "$real_top")
 [ -n "$syntax_globs" ] && [ -n "$shellcheck_globs" ] && [ -z "$uncovered" ] \
   && ok "the workflow's own syntax and shellcheck globs cover every shell script in the tree" \
   || ko "workflow shell globs are missing or leave files uncovered:$uncovered (bash -n: $syntax_globs; shellcheck: $shellcheck_globs)"
+
+# Both halves of that reading, on the layout guard's clone: the scratch script an agent drops in a
+# worktree stays invisible, and the same path once the tree TRACKS it -- at the root, where none of
+# the workflow's globs reach -- is still reported against both lint steps.
+printf '#!/usr/bin/env bash\ntrue\n' > "$guard_clone/scratch-probe.sh"
+untracked_sh_verdict=$(uncovered_shell_files "$guard_clone")
+[ -z "$untracked_sh_verdict" ] \
+  && ok "an untracked shell script does not reach the lint-coverage guard" \
+  || ko "an untracked shell script tripped the lint-coverage guard:$untracked_sh_verdict"
+git -C "$guard_clone" add scratch-probe.sh || ko "could not track the guard clone's scratch script (setup, not the launcher)"
+tracked_sh_verdict=$(uncovered_shell_files "$guard_clone")
+[ "$tracked_sh_verdict" = " bash-n:scratch-probe.sh shellcheck:scratch-probe.sh" ] \
+  && ok "...while a tracked shell script no lint glob covers trips it" \
+  || ko "the lint-coverage guard missed a tracked uncovered shell script (verdict:$tracked_sh_verdict)"
+rm "$guard_clone/scratch-probe.sh" "$guard_clone/scripts/sync-routines.sh" \
+  || ko "could not remove the guard clone's shell scripts (setup, not the launcher)"
+missing_sh_verdict=$(uncovered_shell_files "$guard_clone")
+[ "$missing_sh_verdict" = " bash-n:scratch-probe.sh shellcheck:scratch-probe.sh" ] \
+  && ok "...and both sides read the declaration: a covered script the worktree is missing stays covered" \
+  || ko "a tracked script absent from the worktree changed the lint-coverage verdict (verdict:$missing_sh_verdict)"
+# A hidden directory is the one place the expansion's rules decide the verdict rather than merely
+# where it reads from: `*/scripts/*.sh` does not reach `.github/scripts/`, because bash matches a
+# leading `.` only when the pattern spells it, so a script there is genuinely unlinted in CI.
+mkdir -p "$guard_clone/.github/scripts" && : > "$guard_clone/.github/scripts/check.sh"
+git -C "$guard_clone" add .github/scripts/check.sh || ko "could not track the guard clone's hidden-directory script (setup, not the launcher)"
+hidden_sh_verdict=$(uncovered_shell_files "$guard_clone")
+[ "$hidden_sh_verdict" = " bash-n:.github/scripts/check.sh shellcheck:.github/scripts/check.sh bash-n:scratch-probe.sh shellcheck:scratch-probe.sh" ] \
+  && ok "...and a tracked script under a hidden directory, which the workflow's glob never expands to, trips it" \
+  || ko "the lint-coverage guard read a hidden-directory script as covered (verdict:$hidden_sh_verdict)"
 
 [ -L "$real_home/.claude/skills/ship-pr" ] && ok "the README's loop links ship-pr" || ko "the README's loop did not link ship-pr into ~/.claude/skills"
 [ ! -e "$real_home/.claude/skills/routines" ] && ok "the README's loop keeps routines/ out of ~/.claude/skills" || ko "the README's loop linked routines/ into ~/.claude/skills"
