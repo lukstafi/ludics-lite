@@ -1093,15 +1093,19 @@ heading_slugs() {
       # the one `!` line tells a miss below why the rest of the file went quiet.
       if (s == "!") { if (refused == 0) print prefix "!" rest; refused = 1; next }
       if (refused) next
-      if (s == "") next
       # The numbering GitHub does is a LOOP over free names, not a counter per base: a candidate
       # already taken takes the next `-<n>` that is not, so `# Foo`, `# Foo-1`, `# Foo` give `foo`,
       # `foo-1`, `foo-2`. A counter gives `foo-1` twice -- which both rejects a good link to
       # `#foo-2` and lets `#foo-1` answer for either heading.
+      # An empty slug is still an OCCUPANT: a heading of pure punctuation slugs to nothing, and
+      # `## !!!` written twice is "" and "-1" on GitHub, so a link to `#-1` works there. Skipping
+      # both left `-1` out of the table and refused it. The empty name itself is never printed --
+      # no anchor can spell it, and a `file.md#` carries no anchor to this scan -- but it takes
+      # its place in the numbering, so its repeats take theirs.
       base = s
       while (taken[s]) { occurrences[base]++; s = base "-" occurrences[base] }
       taken[s] = 1
-      print prefix s
+      if (s != "") print prefix s
     }
     # slug <heading>: its GitHub anchor, or `!` for a heading whose anchor this check will not
     # spell. The ASCII half is exact. Beyond it, only the General Punctuation block is known --
@@ -1256,7 +1260,11 @@ cased() {
     if [ "$seg" = "$rest" ]; then rest=""; else rest=${rest#*/}; fi
     [ -n "$seg" ] || continue
     found=0
-    for entry in "$ROOT${parent:+/$parent}"/*; do
+    # Three globs, because `*` alone skips every name beginning with a dot -- so a component like
+    # `.refs` was never enumerated and a correctly spelled path read as mis-cased. The other two
+    # take the dotted names while leaving `.` and `..` out, which is the whole of what they add.
+    for entry in "$ROOT${parent:+/$parent}"/* "$ROOT${parent:+/$parent}"/.[!.]* \
+      "$ROOT${parent:+/$parent}"/..?*; do
       [ "${entry##*/}" = "$seg" ] && { found=1; break; }
     done
     [ "$found" -eq 1 ] || return 1

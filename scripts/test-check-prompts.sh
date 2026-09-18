@@ -1467,6 +1467,33 @@ links_tree
 links_body alpha/SKILL.md 'See [the spelling it has](references/notes.md).'
 expect "...while the spelling the checkout has resolves" 0 '(1 checked)' -- "$CP" "$R"
 
+# A hidden path component: `*` alone skips every name beginning with a dot, so round 7's casing
+# scan never enumerated one and read a correctly spelled path as mis-cased (round 8, P2).
+links_tree
+mkdir -p "$R/alpha/.refs"
+printf '# Hidden\n\n## A section\n' > "$R/alpha/.refs/notes.md"
+links_body alpha/SKILL.md 'See [a hidden directory](.refs/notes.md#a-section).'
+expect "a hidden path component is spelled as the checkout spells it" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+mkdir -p "$R/alpha/.refs"
+printf '# Hidden\n' > "$R/alpha/.refs/notes.md"
+links_body alpha/SKILL.md 'See [a mis-cased hidden directory](.Refs/notes.md).'
+expect "...and a mis-cased one is still refused" 1 \
+  'alpha/SKILL.md: link to .Refs/notes.md' -- "$CP" "$R"
+
+# A heading of pure punctuation slugs to nothing, and an empty slug is still an OCCUPANT: `## !!!`
+# written twice is "" and "-1" on GitHub, so a link to `#-1` works there. Skipping both left `-1`
+# out of the table and refused it (round 8, P2). The empty name itself is never reported -- no
+# anchor can spell it -- but it takes its place in the numbering.
+links_tree
+printf '\n## !!!\n\n## !!!\n\n## !!!\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [the first repeat](references/notes.md#-1) and [the second](references/notes.md#-2).'
+expect "an empty slug numbers its repeats, which are anchors that work" 0 '(2 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## !!!\n\n## !!!\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [one repeat too many](references/notes.md#-2).'
+expect "...and stops where the file does" 1 "GitHub slug is '-2'" -- "$CP" "$R"
+
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.
 fresh "$R"
