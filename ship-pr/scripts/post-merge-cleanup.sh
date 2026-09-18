@@ -204,7 +204,15 @@ refuse_initialized_submodules() {
   while IFS= read -r line; do
     case "$line" in
     "" | -*) ;;
-    *) fail "$description has an initialized submodule; deinitialize it before cleanup: ${line#?}" ;;
+    # The submodule path is `.gitmodules` content, so it is attacker-shaped data in the same
+    # sense a pathname is: a newline in it would forge a second diagnostic line, and an escape
+    # sequence would reach the operator's terminal. What is printed is its shell-quoted
+    # rendering. `git submodule status` has no NUL-delimited mode, so a name holding a newline
+    # arrives split across physical lines; the refusal still fires, because only an entry's
+    # first physical line begins with the status character the cases above match.
+    *)
+      fail "$description has an initialized submodule; deinitialize it before cleanup: $(printf '%q' "${line#?}")"
+      ;;
     esac
   done <<<"$status"
 }
@@ -219,8 +227,12 @@ refuse_session_module_gitdirs() {
   [ -d "$modules" ] || fail "session submodule repository root is not a directory: $modules"
   first=$(find "$modules" -mindepth 1 -print -quit) ||
     fail "could not inspect residual session submodule repositories: $modules"
+  # The residual repository's directory name comes from the submodule name in `.gitmodules`, so
+  # it is attacker-shaped data: a newline in it would forge a second diagnostic line, and an
+  # escape sequence would reach the operator's terminal. The raw name did the `find` above; what
+  # is printed is its shell-quoted rendering.
   [ -z "$first" ] ||
-    fail "session has a residual submodule repository; retain or remove it before cleanup: $first"
+    fail "session has a residual submodule repository; retain or remove it before cleanup: $(printf '%q' "$first")"
 }
 
 refuse_private_worktree_refs() {

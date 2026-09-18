@@ -1509,6 +1509,78 @@ test_initialized_session_submodule_refusal() {
   echo "PASS: initialized session submodule is refused before mutation"
 }
 
+test_escape_named_session_submodule_refusal() {
+  local entry local_master name refusal sub_remote sub_seed submodule_oid
+  setup_case escape-named-session-submodule merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  sub_remote="$CASE_ROOT/submodule.git"
+  sub_seed="$CASE_ROOT/submodule-seed"
+  git init --bare "$sub_remote" >/dev/null
+  git -C "$sub_remote" symbolic-ref HEAD refs/heads/main
+  git init -b main "$sub_seed" >/dev/null
+  git_config "$sub_seed"
+  echo submodule-base >"$sub_seed/payload"
+  git -C "$sub_seed" add payload
+  git -C "$sub_seed" commit -m "submodule base" >/dev/null
+  git -C "$sub_seed" remote add origin "$sub_remote"
+  git -C "$sub_seed" push -u origin main >/dev/null
+  # `submodule add` cannot spell this path -- the escape sequence is fine in a config *value* but
+  # git refuses to write `submodule.<name>.url` for it -- so the entry is laid down by hand: the
+  # checkout, the `.gitmodules` record, and the gitlink. That is the shape an attacker's
+  # repository has, not a shape git's own porcelain would produce. A newline would be the other
+  # half of the vector, but `git submodule status` has no NUL-delimited mode and the helper's
+  # line-based read truncates the name at it; an escape sequence survives the read whole and is
+  # what would reach the operator's terminal.
+  name=$(printf 'na\033[31mme')
+  git clone --quiet "$sub_remote" "$CASE_SESSION/$name"
+  git_config "$CASE_SESSION/$name"
+  submodule_oid=$(git -C "$CASE_SESSION/$name" rev-parse HEAD)
+  printf '[submodule "nested"]\n\tpath = %s\n\turl = %s\n' "$name" "$sub_remote" \
+    >"$CASE_SESSION/.gitmodules"
+  git -C "$CASE_SESSION" update-index --add --cacheinfo "160000,$submodule_oid,$name"
+  git -C "$CASE_SESSION" add .gitmodules
+  git -C "$CASE_SESSION" commit -m "add escape-named submodule" >/dev/null
+  git -C "$CASE_SESSION" push origin topic >/dev/null
+  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
+  git -C "$CASE_INTEGRATOR" fetch origin topic >/dev/null
+  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge escape-named submodule" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  git -C "$CASE_SESSION" config submodule.nested.url "$sub_remote"
+  git -C "$CASE_SESSION" config submodule.nested.active true
+  git -C "$CASE_SESSION" config submodule.nested.ignore all
+  entry=$(git -C "$CASE_SESSION" submodule status --recursive)
+  case "$entry" in
+  -*) fail "the fixture must present the submodule as initialized" ;;
+  esac
+  [ -z "$(git -C "$CASE_SESSION" status --porcelain --untracked-files=normal --ignored=matching)" ] ||
+    fail "the escape-named submodule fixture must leave the session worktree clean"
+
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "an escape-named initialized session submodule was accepted for cleanup"
+  fi
+  case "$refusal" in
+  *"has an initialized submodule"*) ;;
+  *) fail "the escape-named submodule did not reach its refusal: $refusal" ;;
+  esac
+  # The entry the helper reads, shell-quoted -- the whole of it, because `printf '%q'` renders a
+  # word holding both spaces and an escape sequence as one `$'...'` string rather than escaping
+  # each character where it stands. This test script and the helper are the same bash, so the two
+  # renderings agree.
+  case "$refusal" in
+  *"$(printf '%q' "${entry#?}")"*) ;;
+  *) fail "the refusal did not name the submodule as it is spelled: $refusal" ;;
+  esac
+  # And carries it escaped, not raw: the escape sequence itself must never reach the operator's
+  # terminal, which would act on it rather than print it.
+  case "$refusal" in
+  *"$name"*) fail "the refusal printed the submodule name's escape sequence raw: $refusal" ;;
+  esac
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "initialized submodule refusal must precede master advancement"
+  assert_topic_preserved
+  echo "PASS: an escape-named initialized submodule is refused and named as it is spelled"
+}
+
 test_deinitialized_session_submodule_refusal() {
   local local_master log session_git_dir status sub_remote sub_seed unique_submodule_oid
   setup_case deinitialized-session-submodule merge main-off
@@ -1563,6 +1635,46 @@ test_deinitialized_session_submodule_refusal() {
     fail "unique deinitialized submodule commit was lost"
   assert_topic_preserved
   echo "PASS: residual deinitialized submodule repository is refused before mutation"
+}
+
+test_session_module_gitdir_newline_name_refusal() {
+  local local_master refusal residual session_git_dir
+  setup_case session-module-gitdir-newline merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  session_git_dir=$(git -C "$CASE_SESSION" rev-parse --absolute-git-dir)
+  # A residual repository's directory under `.git/modules` is named for the submodule name in
+  # `.gitmodules`, which is config data and can hold a newline. The refusal reads whatever that
+  # directory holds, so a bare directory is fixture enough -- and unlike `submodule add`, plain
+  # `mkdir` will spell a name Git would not.
+  residual=$(printf 'nes\nted')
+  mkdir "$session_git_dir/modules"
+  mkdir "$session_git_dir/modules/$residual"
+  [ -z "$(git -C "$CASE_SESSION" status --porcelain --untracked-files=normal --ignored=matching)" ] ||
+    fail "the residual-repository fixture must leave the session worktree clean"
+
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "a newline-named residual submodule repository was accepted for cleanup"
+  fi
+  case "$refusal" in
+  *"session has a residual submodule repository"*) ;;
+  *) fail "the newline-named residual repository did not reach its refusal: $refusal" ;;
+  esac
+  # The name the directory has, shell-quoted.
+  case "$refusal" in
+  *"$(printf '%q' "$session_git_dir/modules/$residual")"*) ;;
+  *) fail "the refusal did not name the residual repository as it is spelled: $refusal" ;;
+  esac
+  # And carries it escaped, not raw: the newline itself must never reach the operator's terminal,
+  # where it would forge a second diagnostic line out of the tail of a directory name.
+  case "$refusal" in
+  *"$residual"*) fail "the refusal printed the residual repository's newline raw: $refusal" ;;
+  esac
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "residual submodule refusal must precede master advancement"
+  [ -d "$session_git_dir/modules/$residual" ] ||
+    fail "the newline-named residual submodule repository was removed"
+  assert_topic_preserved
+  echo "PASS: a newline-named residual submodule repository is refused and named as it is spelled"
 }
 
 test_initialized_master_submodule_refusal() {
@@ -4139,7 +4251,9 @@ TESTS=(
   test_attached_session_head_compare_and_swap
   test_detached_session_head_compare_and_swap
   test_initialized_session_submodule_refusal
+  test_escape_named_session_submodule_refusal
   test_deinitialized_session_submodule_refusal
+  test_session_module_gitdir_newline_name_refusal
   test_initialized_master_submodule_refusal
   test_master_resolve_undo_refusal
   test_assume_unchanged_master_refusal
