@@ -263,9 +263,10 @@ no line of its own, which is what lets post-merge-cleanup.sh's scratch directori
 `"$TEMP_ROOT/cache/x.XXXXXX"` is refused — the component `mktemp` itself creates cannot be a
 symlink, but an intermediate one can. That root counts as resolved only when EVERY assignment
 to it in that scope leaves a physical path and at least one of them stands at control depth zero:
-any assignment disqualifies and only an unconditional one certifies, so a later
-`BASE=${TMPDIR:-/tmp}`, or a resolution reached only inside an `if` arm, un-resolves it for the
-whole scope. What the fixpoint does not compare is line ORDER, so a root resolved *below* the
+a non-resolving assignment disqualifies at any depth, while only an
+unconditional one can certify, so a later `BASE=${TMPDIR:-/tmp}`, or a resolution reached only
+inside an `if` arm, leaves the whole scope unresolved — where a second `pwd -P` assignment beside
+the first changes nothing. What the fixpoint does not compare is line ORDER, so a root resolved *below* the
 allocation satisfies the guard while leaving the allocation itself unresolved: resolving it first is
 convention the guard cannot verify.
 
