@@ -510,7 +510,7 @@ jobs:
         run: scripts/test-check-scratch-dirs.sh || { echo '::error title=macOS suite failed::test-check-scratch-dirs.sh'; exit 1; }
       - name: execution reservations
         if: ${{ !cancelled() }}
-        run: python3 issue-wave/scripts/test-fleet-execution.py
+        run: python3 issue-wave/scripts/test-fleet-execution.py || { echo '::error title=macOS suite failed::test-fleet-execution.py'; exit 1; }
       - name: fleet launcher
         if: ${{ !cancelled() }}
         run: issue-wave/scripts/test-fleet-worker.sh || { echo '::error title=macOS suite failed::test-fleet-worker.sh'; exit 1; }
