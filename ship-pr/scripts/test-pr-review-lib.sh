@@ -48,7 +48,9 @@
 #   protect_library <file>              extends the guard over a second library sourced after
 #                                       this one (test-pr-review-base-lib.sh), whose functions
 #                                       the snapshot below could not see
-#   run_tests <case>...                 the guard below, then each case with a PASS line
+#   run_tests <case>...                 the guard below, then each case with a PASS line — and,
+#                                       after each case, the refusal of a BREAK_JQ left standing,
+#                                       which would break a jq program for every case after it
 #
 # The guard is why the file exists. pr-review.sh defines some sixty top-level functions, every
 # one in scope in every suite the moment it is sourced, and a suite helper that happens to share
@@ -460,6 +462,10 @@ jq() {
 # programs broken. The status is the command's own, so a caller can still read it; `|| rc=$?`
 # also means the command runs with `set -e` suspended, which is what the cases that drive a
 # failing round used to write as a `set +e` / `set -e` pair around the call.
+#
+# Going through the helper is not left to discipline: `run_tests` refuses a case that ends with
+# the marker still set, naming it, so the hand-rolled pair fails the case that wrote it instead
+# of the cases after it silently passing on broken reads.
 with_broken_jq() {
   local marker="$1" rc=0
   shift
@@ -613,12 +619,23 @@ check_shadows() {
 
 # run_tests <case>...: the guard, then the cases in order, each announced on stdout. A case's
 # retuned constants are put back before the next one starts, whether or not it restored them.
+#
+# A marker left standing is the other leak between cases, and the one nothing can put back: the
+# constants have a value as sourced to restore to, but a broken jq program is a claim about the
+# case that set it, and a case that ends with BREAK_JQ set has already told every case after it
+# to run with one of the script's programs refusing — each of them still reporting PASS, since
+# what a broken read costs is a wrong RESULT and not a failure. `with_broken_jq` clears the
+# marker whichever way its command goes, so a case that goes through it never trips this; what
+# trips it is the hand-rolled set/clear pair the helper replaced, whose clearing line is skipped
+# by any command that fails under `set -e`. So it is refused rather than silently restored: the
+# case that leaked is named, and the cases after it do not run under it.
 run_tests() {
   local test_name
   check_shadows
   [ $# -gt 0 ] || bail "run_tests: no cases named"
   for test_name in "$@"; do
     "$test_name"
+    [ -z "$BREAK_JQ" ] || bail "$test_name left BREAK_JQ set to '$BREAK_JQ': every case after it would run with the jq programs matching that marker refusing, and report PASS anyway — break a program with \`with_broken_jq $BREAK_JQ <command>...\`, which clears the marker whichever way the command goes"
     restore_tuning
     echo "PASS: $test_name"
   done
@@ -1298,6 +1315,36 @@ test_with_broken_jq_clears_the_marker_whichever_way_the_command_goes() {
     "and say what was missing"
 }
 
+# The refusal that makes the clearing above more than an idiom: a case that sets the marker by
+# hand and returns is failed BY NAME, so the broken program never reaches the cases after it. It
+# is written out as a throwaway suite because what is under test happens BETWEEN cases — a body
+# line handed to `control` runs while the suite is sourced, not inside one — and the suite holds
+# three cases, one per outcome the refusal has to tell apart: one that broke a program through
+# the helper and must pass, the one that leaked, and one after it that must not run at all.
+test_a_leaked_marker_fails_the_case_that_leaked_it() {
+  local file="$CONTROL_ROOT/leaked-marker.sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    printf 'source %s\n' "\"$TEST_LIB_FILE\""
+    echo 'test_that_clears() { with_broken_jq zzz-no-program-carries-this true; }'
+    echo 'test_that_leaks() { BREAK_JQ=".[] | select(.marked)"; }'
+    echo 'test_after_the_leak() { :; }'
+    echo 'run_tests test_that_clears test_that_leaks test_after_the_leak'
+  } >"$file"
+  control_run "$file"
+  assert_eq "$CONTROL_RC" 1 "a leaked marker is the reporter's exit 1 ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "FAIL: test_that_leaks left BREAK_JQ set to '.[] | select(.marked)'" \
+    "the leaking case and the marker it left standing should both be named"
+  assert_contains "$CONTROL_ERR" "with_broken_jq .[] | select(.marked) <command>" \
+    "and the remedy should be named, with the marker the case meant to break"
+  # Only the case that went through the helper may pass: the leaking one is not a pass, and the
+  # case after it never ran — which is the whole point, since under the leak it would have run
+  # with that program refusing and reported PASS.
+  assert_eq "$CONTROL_OUT" "PASS: test_that_clears" \
+    "the cleared case passes, the leaking case does not, and nothing after it runs"
+}
+
 # --- protecting a second library ---------------------------------------------------------------
 # The guard's snapshot is taken while this file is sourced, so a library sourced AFTER it — the
 # base suites' shared fixture transport — is outside it until `protect_library` says otherwise.
@@ -1569,6 +1616,7 @@ tests=(
   test_the_jq_shim_breaks_the_program_it_is_pointed_at
   test_the_jq_shim_leaves_every_other_program_alone
   test_with_broken_jq_clears_the_marker_whichever_way_the_command_goes
+  test_a_leaked_marker_fails_the_case_that_leaked_it
   test_a_second_library_is_protected_once_it_says_so
   test_protect_library_refuses_a_file_that_defines_nothing
   test_retune_moves_a_constant
