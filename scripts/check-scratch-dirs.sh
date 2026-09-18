@@ -688,7 +688,16 @@ for f in "${files[@]}"; do
         # mis-tokenized operand can do is refuse. The line has already had its single-quoted runs
         # blanked, so a `=` inside `'"'"'...'"'"'` is gone; a double-quoted one still reads as an operand,
         # which is the conservative direction.
+        # ...and the list ENDS where the command does. `export AUX=x; BASE=$(CDPATH= cd /tmp && pwd
+        # -P)` is two commands, and reading past the `;` took the second one'"'"'s assignment for a third
+        # operand -- disqualifying a BASE the line had just resolved, and refusing a correct file
+        # that main accepts (ludics-lite#252 review round 13). This is the one direction the
+        # `loosened=0` check cannot see: it counts refusals main does not make, and says nothing
+        # about whether they are deserved. Truncating at the first `;`, `&` or `|` can only end the
+        # scan EARLY -- a separator inside a double-quoted value stops it short of real operands --
+        # which loses a disqualification and never invents one.
         rest = val
+        sub(/[;&|].*$/, "", rest)
         while (match(rest, /[ \t]+"?[A-Za-z_][A-Za-z0-9_]*\+?=/)) {
           ex = substr(rest, RSTART, RLENGTH)
           gsub(/^[ \t]+/, "", ex)

@@ -592,6 +592,20 @@ EOF
 expect "stepping over a bare operand disqualifies but never certifies" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_bare_leading_does_not_certify.sh"
 
+# Round 13 of #252: the operand list ENDS where the command does. `export AUX=x; BASE=$(CDPATH= cd
+# /tmp && pwd -P)` is two commands, and reading past the `;` took the second one's assignment for a
+# third operand -- disqualifying a BASE the line had just resolved, and refusing a correct file that
+# main accepts. This is the one direction the `loosened=0` harness cannot see: it counts refusals
+# main does not make, and says nothing about whether they are deserved.
+probe safe_separator_ends_operand_list <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+export AUX=x; BASE=$(CDPATH= cd /tmp && pwd -P)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a command after a separator is not another operand" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_separator_ends_operand_list.sh"
+
 # ...while the quoted text the blanking exists to protect is still data: a usage string naming the
 # idiom is not an allocation, whatever keyword precedes it.
 probe safe_quoted_usage_after_readonly <<'EOF'
