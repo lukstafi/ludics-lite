@@ -228,6 +228,71 @@ scripts/test-check-scratch-dirs.sh
 scripts/test-sync-routines.sh
 ```
 
+Three conventions travel with that list. Each is held by a scanner that reads line shapes — a
+register lookup, a line regex — and not by a parser, so a green check says a line of the required
+shape is present and never that the thing it stands for is true: text crafted to carry the shape
+without the substance passes every one of them. That is the design (ludics-lite#75, where a table
+parser drew thirteen rounds of edge cases and was replaced by a scan), so the conventions below
+state what each check establishes rather than enumerate the shapes that would fool it.
+
+**A `test-*` name is a promise to run.** `check-prompts.sh`'s fixture check walks `scripts/test-*`,
+`*/scripts/test-*` and `*/hooks/test-*`, and of every `.sh`, `.py` or `.ps1` it finds there it
+requires a line in this Tests section that is that path once an optional `python3` or `./` prefix is
+stripped — the two forms the register itself uses — and an inline `run:` line in
+`.github/workflows/skill-scripts.yml` on each platform that file needs — both Ubuntu and macOS for a
+shell suite, while a `.ps1` goes to Windows on its extension and the two Ubuntu-only Python fixtures
+are the ones named by path in the checker. The lookup is the section and not the block — any such
+line anywhere under `## Tests` satisfies it, so the register above is where those lines are kept by
+convention rather than by enforcement. The glob asks the filename, not the file, so it cannot tell a
+suite from a helper that is only ever sourced: such a helper either earns the name by carrying its
+own controls and being run, as `ship-pr/scripts/test-pr-review-base-lib.sh` has since
+ludics-lite#212 (executed rather than sourced, it proves the round counter, the grace and the tip
+move straight off the fixture rather than through a `base` run, and the refusals it owes its three
+callers), or it must not be named `test-*`. The third option, a register line and two CI steps for a
+file nothing executes, is a green step that tests nothing.
+
+**Scratch directories have one house shape:** `VAR=$(mktemp -d …)`, then directly under it
+`VAR=$(CDPATH= cd "$VAR" && pwd -P)`, and the cleanup `trap` under that. What
+`scripts/check-scratch-dirs.sh` has enforced since ludics-lite#214 is the adjacency of the first
+two: the next code line after the allocation must be the resolution — in the same function, at the
+same block depth, whatever that line would otherwise be — because a line that already ran with the
+environment's spelling does not get the physical one retroactively. Only comments and blank lines
+may stand between them, which is where the `/var`-to-`/private/var` explanation goes, and that is
+what places the `trap` the guard never reads: above the allocation or below the resolution, never
+between, with the house order below, where the reading order matches the running order. The rest is
+convention. `CDPATH=` is optional to the guard — a bare `cd "$VAR" && pwd -P` passes, as two suites
+here still spell it — and is there against a nonempty `CDPATH`, under which a `cd` to a relative
+target prints the directory it found and puts a second line inside the substitution. The resolution
+itself is matched by shape, the same name on the left and a `cd … && pwd -P` on the right with the
+`cd`'s own target unchecked, so resolving the wrong directory into the right variable passes. The
+alternative to resolving is inheritance: `mktemp -d "$TEMP_ROOT/x.XXXXXX"` under a resolved
+`TEMP_ROOT` needs no line of its own, which is what lets post-merge-cleanup.sh's scratch directories
+pass, while `"$TEMP_ROOT/cache/x.XXXXXX"` is refused — the component `mktemp` creates cannot be a
+symlink, an intermediate one can. That is one component per assignment and not one per chain:
+`A="$ROOT/cache"` is resolved by the same rule, so `B="$A/work"` and a `mktemp -d "$B/x.XXXXXX"`
+under it walk as far as they like. A root counts as resolved for a scope when every assignment to it
+there matches one of the shapes the scanner reads as physical — its `cd … && pwd -P` idiom, a
+resolver function defined in the same file, a `dirname` of a resolved variable, or inheritance from
+one — and at least one of them stands at control depth zero. Depth there is keyword depth, so a
+`then` arm cannot certify while a line inside `( … )` still does, and a non-resolving assignment
+disqualifies from any depth, though only one that opens its own line is in the table to do it. A
+shape it does not read is no resolution to it, however physical the path: a bare `ROOT=$(pwd -P)`
+after a `cd` is refused. Line ORDER is not compared, so a root resolved below the allocation
+satisfies the guard while the allocation itself ran unresolved: resolving it first is convention the
+guard cannot verify.
+
+**`routines/*/SKILL.md` are Markdown prompts read by an agent, not shell scripts.** Nothing execs
+the file and no shell parses it: `bash -n`, shellcheck, `check-jq-shapes.sh` and
+`check-scratch-dirs.sh` all sweep `*.sh`, and `check-prompts.sh` reads a routine prompt as text —
+its frontmatter, its row in `routines/README.md`, the indented line that is this checkout's
+`sync-routines.sh` invocation and nothing else, and the correctness-slot count where a file states
+it. So a finding whose consequence comes from parsing the whole document as a program describes
+something nothing does: a `: <<'X'` … `X` pair around a line does not swallow it, and a trailing
+backslash on the line above does not join it to the next. Both were rebutted in ludics-lite#211, two
+rounds apart. The boundary is the file and not the commands in it — the agent is told to RUN the
+commands in those indented blocks, one at a time, so a command malformed in itself is a real defect;
+what does not apply is the reproduction that needs bash to read the prose around it.
+
 The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs the shell suites and
 shared Python fixtures on Ubuntu and on macOS (the fleet's bash is 3.2), with macOS sharing one
 job and a step per suite: the hosted
