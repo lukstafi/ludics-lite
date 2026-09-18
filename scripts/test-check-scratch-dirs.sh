@@ -309,6 +309,42 @@ EOF
 expect "a readonly root does not certify, in a subshell or out of one" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_readonly_root_in_subshell.sh"
 
+# Round 5 of #252, and the direction the guard is deliberately conservative in. A reassignment
+# inside `( ... )` is discarded when the subshell exits, so disqualifying the outer root over it
+# refuses a script that is in fact safe. The guard does it anyway, and has always done it: parens
+# move neither `depth` nor `funcof`, so every spelling it can READ disqualifies from inside a
+# subshell -- the plain assignment, `export`, `local`, `declare`, `typeset`. `readonly` passed on
+# main only because main could not see it at all, and making it behave like its four siblings is
+# this change. Exempting it instead would need to know the line is inside a subshell, which is the
+# paren tracking this file does not do (`${...}` and `$(...)` would have to be parsed out of the
+# count) -- and would have to loosen the other four to stay coherent, turning current refusals into
+# passes in the dangerous direction. The cost is one refusal of a safe shape whose remedy is the
+# line the guard wants anyway: resolve the allocation underneath it. This case pins the uniformity
+# so the asymmetry cannot come back by accident.
+probe bad_subshell_reassignment_uniform <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+(
+  readonly BASE=${TMPDIR:-/tmp}
+  echo "$BASE"
+)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a readonly reassignment in a subshell disqualifies, as every other spelling does" 1 \
+  "$REFUSAL" -- "$CS" "$TMP/bad_subshell_reassignment_uniform.sh"
+
+probe bad_subshell_reassignment_plain <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+(
+  export BASE=${TMPDIR:-/tmp}
+  echo "$BASE"
+)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "...which is what export already did, here as the control for that claim" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_subshell_reassignment_plain.sh"
+
 # Round 3 of #252: and the guard does NOT try to work out whether an earlier `readonly` is in
 # force, which is why these two pass. `readonly -f TMP` freezes a FUNCTION named TMP and leaves the
 # variable alone, and a freeze inside `( ... )` is gone when the subshell exits; both files run
