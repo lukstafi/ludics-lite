@@ -243,26 +243,33 @@ than through a `base` run, and the refusals it owes its three callers), or it mu
 `test-*`. The third option, a register line and two CI steps for a file nothing executes, is a
 green step that tests nothing.
 
-**Scratch directories have one house shape**, enforced by `scripts/check-scratch-dirs.sh` since
-ludics-lite#214: `VAR=$(mktemp -d …)`, then directly under it `VAR=$(CDPATH= cd "$VAR" && pwd -P)`,
-and the cleanup `trap` below that resolution. The guard reads the first command after the
-assignment that mentions the variable and refuses anything that is not the resolution — adjacency,
-not a resolution somewhere further down, because a line that already ran with the environment's
-spelling does not get it retroactively. Comments between the two are not uses, which is where the
-`/var`-to-`/private/var` explanation goes; a `trap` body is not a use either, since it runs at exit,
-but writing it under the resolution keeps the reading order and the running order the same. The
-alternative to a resolution is inheritance: a template whose leading component is a variable this
-file already resolved needs no line of its own, which is what lets post-merge-cleanup.sh's scratch
-paths under its canonicalized `TEMP_ROOT` pass.
+**Scratch directories have one house shape:** `VAR=$(mktemp -d …)`, then directly under it
+`VAR=$(CDPATH= cd "$VAR" && pwd -P)`, and the cleanup `trap` under that.
+`scripts/check-scratch-dirs.sh` has enforced the first two since ludics-lite#214 and enforces
+nothing about the trap — it reads the next code line after the assignment and refuses anything that
+is not the resolution, whether or not that line mentions the variable, and it asks for the same
+function and block depth, so a resolution inside a `then` arm is not adjacent either. Adjacency
+rather than a resolution somewhere below, because a line that already ran with the environment's
+spelling does not get the physical one retroactively. Comments sit between the two freely, which is
+where the `/var`-to-`/private/var` explanation goes, and a `trap` body is not a use either, since it
+runs at exit — so a trap written above passes; putting it below the resolution is convention, kept
+so the reading order matches the running order. The alternative to a resolution is inheritance, and
+it reaches exactly one component: `mktemp -d "$TEMP_ROOT/x.XXXXXX"` under an already resolved
+`TEMP_ROOT` needs no line of its own, which is what lets post-merge-cleanup.sh's scratch directories
+pass, while `"$TEMP_ROOT/cache/x.XXXXXX"` is refused — the component `mktemp` itself creates cannot
+be a symlink, but an intermediate one can.
 
-**`routines/*/SKILL.md` are Markdown prompts read by an agent, not shell scripts.** Their fenced
-blocks are commands for the agent to run one at a time, and the repository executes none of them:
-`bash -n`, shellcheck, `check-jq-shapes.sh` and `check-scratch-dirs.sh` all sweep `*.sh`, and
-`check-prompts.sh` reads a routine prompt only as a prompt — its frontmatter, and its row in
-`routines/README.md`. So shell-parsing findings against a routine prompt — a heredoc that wants a
-wrapper, a line continuation that must be joined before it is read, quoting a scanner would
-enforce — are findings about a program nobody runs. Not holding that boundary cost ludics-lite#211
-two review rounds.
+**`routines/*/SKILL.md` are Markdown prompts read by an agent, not shell scripts.** Nothing execs
+the file and no shell parses it: `bash -n`, shellcheck, `check-jq-shapes.sh` and
+`check-scratch-dirs.sh` all sweep `*.sh`, and `check-prompts.sh` reads a routine prompt as text —
+its frontmatter, its row in `routines/README.md`, the indented line that is this checkout's
+`sync-routines.sh` invocation and nothing else, and the correctness-slot count where a file states
+it. So a finding whose consequence comes from parsing the whole document as a program describes
+something nothing does: a `: <<'X'` … `X` pair around a line does not swallow it, and a trailing
+backslash on the line above does not join it to the next. Both were rebutted in ludics-lite#211, two
+rounds apart. The boundary is the file and not the commands in it — the agent is told to RUN the
+commands in those indented blocks, one at a time, so a command malformed in itself is a real defect;
+what does not apply is the reproduction that needs bash to read the prose around it.
 
 The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs the shell suites and
 shared Python fixtures on Ubuntu and on macOS (the fleet's bash is 3.2), with macOS sharing one
