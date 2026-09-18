@@ -243,6 +243,16 @@ mkdir -p "$TMP/bin"
 EOF
 expect "a declare/typeset capture is a capture" 0 "$CLEAN" -- "$CS" "$TMP/safe_declare.sh"
 
+# `readonly` is the same declaration syntax, and a file that freezes the resolved spelling is
+# writing the house idiom with one more keyword on it -- the guard has to read the resolution
+# through that keyword or the shape below could never pass.
+probe safe_readonly <<'EOF'
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+readonly TMP=$(CDPATH= cd "$TMP" && pwd -P)
+mkdir -p "$TMP/bin"
+EOF
+expect "a readonly resolution is a resolution" 0 "$CLEAN" -- "$CS" "$TMP/safe_readonly.sh"
+
 # Round 4: `mktemp [OPTION]... [TEMPLATE]` -- the directory flag can sit anywhere in the option
 # list, bundled or spelled long, and a resolved one of any of those spellings passes.
 probe safe_option_spellings <<'EOF'
@@ -486,6 +496,31 @@ echo "$work"
 EOF
 expect "a resolved root that is reassigned no longer certifies what is under it" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_reassigned_root.sh"
+
+# ...and the reassignment that un-resolves it can carry a declaration keyword. `readonly` was
+# missing from the alternation the assignment table and `resolved_below` spell, so this line was
+# not an assignment to the guard at all: it read the certified BASE above, never saw the spelling
+# that replaces it, and passed a root holding the environment's own /var path by the time mktemp
+# ran. The file is legal bash and it runs -- a plain assignment followed by a `readonly` one is
+# fine, and only a THIRD assignment would error -- so nothing else was going to catch it.
+probe bad_readonly_reassignment <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly BASE=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a readonly reassignment un-resolves the root it overwrites" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_readonly_reassignment.sh"
+
+# ...and the same file without that line is the control: the root above certifies its child, so
+# the refusal above is the `readonly` line and nothing else about the shape.
+probe safe_readonly_control <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "the same file without the readonly line passes" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_readonly_control.sh"
 
 # Round 1: the use can share the assignment's own line, and the resolution below does not reach a
 # command that already ran.

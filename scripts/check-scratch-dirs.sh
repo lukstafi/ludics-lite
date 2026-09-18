@@ -617,7 +617,7 @@ for f in "${files[@]}"; do
       if (funcof[u] != funcof[i] || depth[u] != depth[i]) return 0
       l = code[u]
       gsub(/^[ \t]+/, "", l)
-      return (l ~ ("^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?" nm "=\"?\\$\\((CDPATH=[ \t]+)?cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)\"?[ \t]*($|\\|\\||&&|;)")) ? 1 : 0
+      return (l ~ ("^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+|readonly[ \t]+)?" nm "=\"?\\$\\((CDPATH=[ \t]+)?cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)\"?[ \t]*($|\\|\\||&&|;)")) ? 1 : 0
     }
     # The fixpoint, once, before the first line of pass 2 is judged. A name is resolved only when
     # EVERY assignment to it leaves a physical path: `BASE=$(cd /tmp && pwd -P)` followed by
@@ -632,10 +632,10 @@ for f in "${files[@]}"; do
       # continuation lines rather than their halves.
       for (i = 1; i <= last; i++) {
         l = code[i]
-        if (l !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) continue
+        if (l !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+|readonly[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) continue
         nm = l
         sub(/^[ \t]*/, "", nm)
-        sub(/^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)/, "", nm)
+        sub(/^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+|readonly[ \t]+)/, "", nm)
         val = nm
         sub(/=.*$/, "", nm)
         sub(/^[^=]*=/, "", val)
@@ -679,7 +679,7 @@ for f in "${files[@]}"; do
       # Captured means captured BY THIS ASSIGNMENT: the call has to sit inside the `$( ... )` the
       # line opens with, and a second one past that substitution is uncaptured whatever the line
       # begins with.
-      if (line !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/ ||
+      if (line !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+|readonly[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/ ||
           !has_mktemp_d(head_of(line)) || !answers_with_mktemp(head_of(line))) {
         refuse(FNR, "a `mktemp -d` whose result is not captured in a variable assignment: this guard resolves a scratch directory by following the variable it lands in, and cannot follow this one — write it as `VAR=$(mktemp -d ...)` and resolve VAR with `pwd -P`")
         next
