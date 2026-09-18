@@ -1369,6 +1369,44 @@ links_body alpha/SKILL.md 'See [a heading inside a comment](references/notes.md#
 expect "a heading inside an HTML comment contributes an anchor, as one inside a fence does" 0 \
   '(1 checked)' -- "$CP" "$R"
 
+# A code span is the one construct whose CONTENT is literal text, and it is resolved rather than
+# refused, because these headings are full of it. Rendering a span means three things at once
+# (round 5, P2): its padding is stripped the way CommonMark strips it; its content slugs as the
+# text it is; and the markup tests do not read into it, which took two latent false refusals out
+# that rounds 3 and 4 had put in.
+links_tree
+printf '\n## ` padded `\n\nA span whose content is padded.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a padded span](references/notes.md#padded).'
+expect "a padded code span renders without its padding" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## ` padded `\n\nA span whose content is padded.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [the source of one](references/notes.md#-padded-).'
+expect "...so the source reading, spaces and all, names no heading" 1 \
+  "GitHub slug is '-padded-'" -- "$CP" "$R"
+links_tree
+printf '\n## `_foo_`\n\nEmphasis markers inside a span are literal.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [underscores in a span](references/notes.md#_foo_).'
+expect "underscores inside a code span are literal, not emphasis" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## `<T>` and `&amp;`\n\nMarkup inside a span is literal too.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [markup in a span](references/notes.md#t-and-amp).'
+expect "...and so are a tag and an entity, which the markup tests must not read into" 0 \
+  '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## unclosed `run\n\nA backtick run with no match is literal.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [an unclosed run](references/notes.md#unclosed-run).'
+expect "...while a backtick run with no closing match is just a backtick" 0 '(1 checked)' -- "$CP" "$R"
+
+# A routine keeps its reference files under `routines/<name>/references/`, and the second hop out
+# of one was the place a missing target passed: the link FROM the prompt was checked, the links
+# INSIDE the reference were not (round 5, P2). No routine keeps such a directory today, so this is
+# the glob standing ahead of the first one.
+links_tree
+mkdir -p "$R/routines/nightly/references"
+printf '# Guide\n\nSee [the second hop](gone.md).\n' > "$R/routines/nightly/references/guide.md"
+expect "a routine reference file is a linking file too" 1 \
+  'routines/nightly/references/guide.md: link to gone.md resolves to no file' -- "$CP" "$R"
+
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.
 fresh "$R"

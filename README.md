@@ -339,8 +339,9 @@ parser: it claims only that the name is written down as a row, not that the row 
 longer reads the other direction, a row that outlived its directory. The scanner it replaced drew
 thirteen rounds of table-syntax edge cases in one review and reopened on every new rule
 (ludics-lite#75). It also reads the relative Markdown links in those prompts, in the reference
-files they delegate to and in both READMEs: the path half of a `.md` link has to exist relative to
-the linking file, and an anchor on it has to be the GitHub slug of a heading in the target.
+files they delegate to — a routine's as well as a skill's — and in both READMEs: the path half of
+a `.md` link has to exist relative to the linking file, and an anchor on it has to be the GitHub
+slug of a heading in the target.
 ludics-lite#260 cut the wave prompt into sections addressed by anchor — `cli-claude.md#close-out`,
 `native-workers.md#placement-and-launch` and six more — and verified them by hand, once; a renamed
 file or a retitled heading leaves such a link rendering as a link and landing nowhere, which is a

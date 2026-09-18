@@ -927,10 +927,13 @@ check_drift_guard() {
 # markup. A permissive lookup accepts a link nobody wrote; that refusal would reject links people
 # did write. Both directions are pinned by probes, so the shape of the gap is on record.
 
-# link_files: the Markdown whose links this check reads, root-relative.
+# link_files: the Markdown whose links this check reads, root-relative. A routine's reference
+# files are in it for the same reason a skill's are: the prompt delegating to one is checked, and
+# the second hop out of it would otherwise be the one place a missing target passed. No routine
+# keeps a references/ directory today, so the glob is there ahead of the first one.
 link_files() {
   (cd "$ROOT" && for f in README.md routines/README.md */SKILL.md routines/*/SKILL.md \
-    */references/*.md; do [ -f "$f" ] && echo "$f"; done) | sort -u
+    */references/*.md routines/*/references/*.md; do [ -f "$f" ] && echo "$f"; done) | sort -u
 }
 
 # md_links <rel> <dir>: every link of the read shape in the root-relative file <rel>, one per line,
@@ -1085,6 +1088,42 @@ heading_slugs() {
     # (`# Cafe\u0301` slugs to `cafe\u0301`, not to `caf`). Dropping it silently would not only refuse the
     # right anchor, it would ACCEPT the wrong one: `#caf` would answer for that heading. So such a
     # heading contributes no slug at all, and a link that means it is refused, with the reason.
+    # render_spans <h>: the one construct whose CONTENT is literal text, resolved rather than
+    # refused, because these headings are full of it. It sets two readings of the heading, from
+    # one walk -- the same text-and-mask shape `slot_mentions` uses further up this file.
+    #   SPAN_TEXT: each code span replaced by what it RENDERS to. A span opens at a backtick run
+    #     and closes at the next run of the SAME length; where its content both begins and ends
+    #     with a space and is not all spaces, CommonMark strips one from each end, which is the
+    #     divergence that brought this here -- `## ` foo ` ` is `foo` on GitHub, and reading the
+    #     source gave `-foo-`. A run with no closing match is literal backticks, left as it is.
+    #   SPAN_BARE: the same heading with each span replaced by a single `.`, for the markup tests
+    #     below to read. The content of a span is literal text, so `## `_foo_`` is `_foo_` on
+    #     GitHub and must not be refused as emphasis; `.` rather than a letter, because it is
+    #     punctuation to the flanking rule, which is the conservative side of that test.
+    function render_spans(h,   i, c, n, j, k, m, content, text, bare) {
+      text = ""; bare = ""; i = 1
+      while (i <= length(h)) {
+        c = substr(h, i, 1)
+        if (c != "`") { text = text c; bare = bare c; i++; continue }
+        n = 0; while (substr(h, i + n, 1) == "`") n++
+        j = i + n; k = 0
+        while (j <= length(h)) {
+          if (substr(h, j, 1) != "`") { j++; continue }
+          m = 0; while (substr(h, j + m, 1) == "`") m++
+          if (m == n) { k = j; break }
+          j += m
+        }
+        if (k == 0) {                              # no closing run: literal backticks
+          text = text substr(h, i, n); bare = bare substr(h, i, n); i += n; continue
+        }
+        content = substr(h, i + n, k - i - n)
+        if (content ~ /^ / && content ~ / $/ && content ~ /[^ ]/)
+          content = substr(content, 2, length(content) - 2)
+        text = text content; bare = bare "."
+        i = k + n
+      }
+      SPAN_TEXT = text; SPAN_BARE = bare
+    }
     function slug(h,   i, c, out) {
       # A heading whose RENDERED text differs from its SOURCE is one this check will not spell:
       # GitHub slugs what it renders, and rendering means a Markdown parser. Three shapes do that,
@@ -1100,9 +1139,10 @@ heading_slugs() {
       #     text on both sides.
       # Emphasis, strong and code spans need no test: their markers are punctuation that both
       # readings drop, so `## **Bold** text` and `## `code` here` already agree.
-      if (index(h, "](") > 0 || index(h, "][") > 0) return "!"
-      if (h ~ /<[A-Za-z\/!?]/) return "!"
-      if (h ~ /&[A-Za-z0-9#]+;/) return "!"
+      render_spans(h)
+      if (index(SPAN_BARE, "](") > 0 || index(SPAN_BARE, "][") > 0) return "!"
+      if (SPAN_BARE ~ /<[A-Za-z\/!?]/) return "!"
+      if (SPAN_BARE ~ /&[A-Za-z0-9#]+;/) return "!"
       # Underscore emphasis is the one emphasis marker the two readings do NOT agree on, because
       # the slugger keeps `_` as a word character: `## _Foo_` renders as `Foo` and is `foo` there,
       # while the source reading gives `_foo_`. `*` needs no such test -- it is punctuation both
@@ -1111,10 +1151,10 @@ heading_slugs() {
       # literal, so `## snake_case` and `## FLEET_BOX_CORRECTNESS_SLOTS` are text on both sides
       # and keep their anchors; any other `_` may open or close emphasis, and its heading is not
       # spelled. A `substr` before the first character is the empty string, which flanks nothing.
-      for (i = 1; i <= length(h); i++)
-        if (substr(h, i, 1) == "_" && !(substr(h, i - 1, 1) ~ /^[A-Za-z0-9]$/ \
-            && substr(h, i + 1, 1) ~ /^[A-Za-z0-9]$/)) return "!"
-      h = tolower(h)                               # ASCII only, by locale, as GitHub folds ASCII
+      for (i = 1; i <= length(SPAN_BARE); i++)
+        if (substr(SPAN_BARE, i, 1) == "_" && !(substr(SPAN_BARE, i - 1, 1) ~ /^[A-Za-z0-9]$/ \
+            && substr(SPAN_BARE, i + 1, 1) ~ /^[A-Za-z0-9]$/)) return "!"
+      h = tolower(SPAN_TEXT)                       # ASCII only, by locale, as GitHub folds ASCII
       sub(/^[ \t]+/, "", h); sub(/[ \t]+$/, "", h)
       out = ""
       for (i = 1; i <= length(h); i++) {
