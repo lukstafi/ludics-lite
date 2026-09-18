@@ -639,12 +639,18 @@ for f in "${files[@]}"; do
         # the DISQUALIFYING side only, like the keyword itself: the capture and resolver patterns
         # keep main'"'"'s shape, so an option cannot make a `mktemp -d` line into a capture or a
         # `pwd -P` line into a resolution -- both of which would loosen the guard.
-        if (l !~ /^[ \t]*((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) continue
+        # `NAME+=v` appends and is an assignment like any other -- `readonly BASE+=/../var` turns a
+        # certified root into `/tmp/../var`, a path no `pwd -P` in this repository spells that way.
+        # The later-operand scan already read `+=`; the first operand did not, which made the line
+        # an assignment or not depending on WHICH operand carried the append (ludics-lite#252 review
+        # round 9).
+        if (l !~ /^[ \t]*((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)?[A-Za-z_][A-Za-z0-9_]*\+?=/) continue
         nm = l
         sub(/^[ \t]*/, "", nm)
         sub(/^((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)/, "", nm)
         val = nm
         sub(/=.*$/, "", nm)
+        sub(/\+$/, "", nm)          # `BASE+=v` names BASE, not `BASE+`
         sub(/^[^=]*=/, "", val)
         an[i] = nm
         av[i] = val
@@ -688,7 +694,20 @@ for f in "${files[@]}"; do
       # `nassign` passes cannot be exceeded -- the bound is the file'"'"'s own size, and nothing here
       # has to be more than any chain.
       nassign = 0
-      for (i = 1; i <= last; i++) if (i in an) { assigns[funcof[i] SUBSEP an[i]] = 1; nassign++ }
+      # Every operand is an assignment IN ITS SCOPE, later ones included. `assigns` is what
+      # `scope_resolved` reads to decide whether a function has its own binding for a name, and a
+      # later operand that was only ever marked bad -- `local AUX=x BASE=${TMPDIR:-/tmp}` -- left
+      # the function without one, so a lookup inside it fell back to the resolved GLOBAL and an
+      # allocation under the shadowing local passed (ludics-lite#252 review round 9). The
+      # single-operand `local BASE=...` was refused all along; this makes the list agree with it.
+      for (i = 1; i <= last; i++) if (i in an) {
+        assigns[funcof[i] SUBSEP an[i]] = 1; nassign++
+        if (i in more) {
+          nex = split(more[i], exn, / /)
+          for (xi = 1; xi <= nex; xi++)
+            if (exn[xi] != "") { assigns[funcof[i] SUBSEP exn[xi]] = 1; nassign++ }
+        }
+      }
       # This block is entered exactly once: awk reads the file twice, but the pass-1 rule ends in
       # `next`, so `FNR == 1` is reached only on pass 2, with a complete `last`. The clear is not
       # there to undo a previous entry -- there is none -- it keeps the precondition of the loop

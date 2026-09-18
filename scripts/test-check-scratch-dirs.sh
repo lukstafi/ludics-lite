@@ -471,6 +471,48 @@ EOF
 expect "...while it still disqualifies, which is the asymmetry" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_option_mode_disqualifies.sh"
 
+# Round 9 of #252: `NAME+=v` appends and is an assignment like any other. `readonly BASE+=/../var`
+# turns a certified root into `/tmp/../var`, which no `pwd -P` in this repository spells that way.
+# The later-operand scan read `+=` from the start; the first operand did not, so whether the line
+# counted as an assignment depended on WHICH operand carried the append.
+probe bad_append_first_operand <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly BASE+=/../var
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an append in the first operand disqualifies the root it rewrites" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_append_first_operand.sh"
+
+# ...and a later operand is an assignment IN ITS SCOPE, not merely a bad one. `assigns` is what
+# `scope_resolved` reads to decide whether a function has its own binding for a name; a later
+# operand that was only ever marked bad left the function without one, so a lookup inside it fell
+# back to the resolved GLOBAL and the allocation under the shadowing local passed. The
+# single-operand spelling below was refused all along, and is the control for that.
+probe bad_local_list_shadow <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+helper() {
+  local AUX=x BASE=${TMPDIR:-/tmp}
+  TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+  echo "$AUX $TMP"
+}
+helper
+EOF
+expect "a later operand shadows in its own scope, as the single-operand form already did" 1 \
+  "$REFUSAL" -- "$CS" "$TMP/bad_local_list_shadow.sh"
+
+probe bad_local_single_shadow <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+helper() {
+  local BASE=${TMPDIR:-/tmp}
+  TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+  echo "$TMP"
+}
+helper
+EOF
+expect "...the single-operand spelling, which is the control for that claim" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_local_single_shadow.sh"
+
 # Round 3 of #252: and the guard does NOT try to work out whether an earlier `readonly` is in
 # force, which is why these two pass. `readonly -f TMP` freezes a FUNCTION named TMP and leaves the
 # variable alone, and a freeze inside `( ... )` is gone when the subshell exits; both files run
