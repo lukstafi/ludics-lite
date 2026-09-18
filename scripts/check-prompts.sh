@@ -913,7 +913,9 @@ check_drift_guard() {
 # own, so a heading-shaped line GFM would not render as a heading -- inside a fenced block, an
 # HTML block, an HTML comment -- contributes a slug here anyway. That direction only makes the
 # ANCHOR lookup more permissive: it can accept a link GitHub would not resolve, and it refuses
-# none. The other direction is the costly one: a link written inside a fence or between backticks
+# none. Keeping that second half TRUE is a constraint on everything else in this section, and it
+# has been broken once already: the slug suppression round 3 added let a phantom heading refuse
+# real anchors, which is what took it out again in round 9. The other direction is the costly one: a link written inside a fence or between backticks
 # is read like any other, so prose ILLUSTRATING the syntax is read as the link it spells. That
 # cost is real and was paid the first time this check was documented -- the README's own sentence
 # about it had to describe the shape rather than write one.
@@ -955,7 +957,13 @@ md_links() {
     {
       line = $0
       while ((i = index(line, "](")) > 0) {
+        # A link opens with a LABEL. Without one, `](x.md)` standing in prose is a token somebody
+        # wrote, not a link Markdown renders -- and reporting its target as a broken link is the
+        # one way this scan can fail a file that has nothing wrong with it. The bracket is looked
+        # for in the text since the last cursor, which is where a label would be.
+        label = index(substr(line, 1, i - 1), "[")
         line = substr(line, i + 2)
+        if (label == 0) continue
         # The target ends at the paren that CLOSES the one the link opened, not at the first `)`:
         # a Markdown destination may carry balanced parentheses, and `a_(b).md` cut at the first
         # one is `a_(b`, which then fails the `.md` test and takes a real link out of the scan in
@@ -1081,18 +1089,32 @@ heading_slugs() {
       hashes = 0; while (substr(line, spaces + hashes + 1, 1) == "#") hashes++
       if (hashes < 1 || hashes > 6) next
       rest = substr(line, spaces + hashes + 1)
-      if (rest !~ /^[ \t]/) next                   # `#tag` is text to GFM, not a heading
+      # A heading may END at its hash run -- `#` alone is an empty heading to GFM, and skipping it
+      # cost its successors their numbering as well as itself: with `#` before `## !!!`, the
+      # second is `-1` on GitHub and was being read as the first empty slug.
+      if (rest != "" && rest !~ /^[ \t]/) next     # `#tag` is text to GFM, not a heading
       sub(/[ \t]+#+[ \t]*$/, "", rest)             # the optional closing run of hashes
+      # The content of a heading is trimmed HERE, as GFM trims it -- before the inline reading,
+      # not after. Trimming the rendered text instead threw away a space a code span had
+      # preserved: `## ` foo`` renders ` foo` (one-sided padding is kept, where two-sided is
+      # stripped) and is `-foo` on GitHub, which a later trim turned into `foo`.
+      sub(/^[ \t]+/, "", rest); sub(/[ \t]+$/, "", rest)
       s = slug(rest)
       # A heading this check will not spell still OCCUPIES a slug on GitHub, and the numbering is
-      # occupancy-based: `## [Foo](…)` then `## Foo` are `foo` and `foo-1` there, so reading the
-      # second as `foo` both refuses the good link to `#foo-1` and answers `#foo` with the wrong
-      # heading. Which rendered slug it occupies is exactly what this check cannot know, so from
-      # the first such heading on, the numbering in this file is not knowable and no further slug
-      # is reported. Headings BEFORE it are untouched -- nothing later can move their names -- and
-      # the one `!` line tells a miss below why the rest of the file went quiet.
+      # occupancy-based: `## [Foo](…)` then `## Foo` are `foo` and `foo-1` there, while this reads
+      # the second as `foo`. What that costs is bounded, and the bound is what makes it the right
+      # trade: every slug this reading emits for a heading is a slug GitHub HAS -- for that
+      # heading, or for the earlier one it collided with -- so an anchor accepted here always
+      # resolves there. What is lost is the other direction: a `-<n>` anchor standing after such a
+      # heading is refused, and the `!` line below tells the reader why.
+      #
+      # Suppressing every later slug instead was tried and is deliberately gone (ludics-lite#268,
+      # round 9). It refused anchors rather than merely failing to confirm them, and with no block
+      # scope above, a heading-shaped line inside a FENCE could be the unspellable one -- so a
+      # fenced `## [Example](…)` took every real anchor after it in the file down with it. That
+      # also cost the block-scope gap the property the whole of it rests on, which is that a
+      # phantom heading can only make the lookup more permissive and can refuse nothing.
       if (s == "!") { if (refused == 0) print prefix "!" rest; refused = 1; next }
-      if (refused) next
       # The numbering GitHub does is a LOOP over free names, not a counter per base: a candidate
       # already taken takes the next `-<n>` that is not, so `# Foo`, `# Foo-1`, `# Foo` give `foo`,
       # `foo-1`, `foo-2`. A counter gives `foo-1` twice -- which both rejects a good link to
@@ -1204,7 +1226,6 @@ heading_slugs() {
         if (substr(SPAN_BARE, i, 1) == "_" && !(substr(SPAN_BARE, i - 1, 1) ~ /^[A-Za-z0-9]$/ \
             && substr(SPAN_BARE, i + 1, 1) ~ /^[A-Za-z0-9]$/)) return "!"
       h = tolower(SPAN_TEXT)                       # ASCII only, by locale, as GitHub folds ASCII
-      sub(/^[ \t]+/, "", h); sub(/[ \t]+$/, "", h)
       out = ""
       for (i = 1; i <= length(h); i++) {
         c = substr(h, i, 1)
@@ -1338,10 +1359,11 @@ check_links() {
       *"$nl$resolved$tab$anchor$nl"*) ;;
       *)
         # A file carrying a heading the slug reader would not spell says so, rather than leaving a
-        # maintainer to compare an anchor against a heading that is visibly right.
+        # maintainer to compare an anchor against a heading that is visibly right -- and it is
+        # also the one thing that can make a `-<n>` anchor miss when GitHub has it.
         hint=""
         case "$nl$slugs" in
-          *"$nl$resolved$tab!"*) hint=" (and a heading it will not spell an anchor for: see heading_slugs)" ;;
+          *"$nl$resolved$tab!"*) hint=" (it also carries a heading this check will not spell an anchor for, which can leave a numbered repeat unconfirmed: see heading_slugs)" ;;
         esac
         ko "$rel" "link to $target names no heading: $resolved has none whose GitHub slug is '$anchor'$hint"
         bad=1 ;;

@@ -1262,25 +1262,35 @@ links_body alpha/SKILL.md 'See [a tab hyphenated](references/notes.md#foo-bar).'
 expect "...so the hyphenated reading names no heading" 1 "GitHub slug is 'foo-bar'" -- "$CP" "$R"
 
 # A heading this check will not spell still OCCUPIES a slug on GitHub, and the numbering is
-# occupancy-based: `## [Foo](…)` then `## Foo` are `foo` and `foo-1` there. Reading the second as
-# `foo` both refused the good link and answered the other anchor with the wrong heading, so from
-# the first unspellable heading on, no further slug in that file is reported (round 3, P2).
+# occupancy-based: `## [Foo](…)` then `## Foo` are `foo` and `foo-1` there, while this reads the
+# second as `foo` (round 3, P2). What that costs is bounded, and the bound is the point: every
+# slug this emits is one GitHub HAS -- for that heading, or for the earlier one it collided with
+# -- so an anchor accepted here resolves there, and only the `-<n>` spelling goes unconfirmed.
+# Suppressing every later slug instead was tried and taken out in round 9: it refused anchors
+# rather than failing to confirm them, and a phantom heading inside a fence could trigger it.
 links_tree
 links_unspellable alpha/references/notes.md
 printf '\n## Foo\n\nThe heading GitHub numbers past the refused one.\n' >> "$R/alpha/references/notes.md"
-links_body alpha/SKILL.md 'See [the unnumbered reading](references/notes.md#foo).'
-expect "a heading after an unspellable one is not reported under the name it would have taken" 1 \
-  'will not spell an anchor for' -- "$CP" "$R"
+links_body alpha/SKILL.md 'See [the name GitHub has](references/notes.md#foo).'
+expect "an anchor an unspellable heading holds on GitHub still resolves here" 0 '(1 checked)' -- "$CP" "$R"
 links_tree
 links_unspellable alpha/references/notes.md
 printf '\n## Foo\n\nThe heading GitHub numbers past the refused one.\n' >> "$R/alpha/references/notes.md"
 links_body alpha/SKILL.md 'See [the numbered reading](references/notes.md#foo-1).'
-expect "...nor under the one GitHub would give it, since which it takes is not knowable here" 1 \
-  'will not spell an anchor for' -- "$CP" "$R"
+expect "...while the -<n> spelling goes unconfirmed, and the message names what did it" 1 \
+  'leave a numbered repeat unconfirmed' -- "$CP" "$R"
 links_tree
 links_unspellable alpha/references/notes.md
 links_body alpha/SKILL.md 'See [a heading standing before it](references/notes.md#close-out).'
-expect "...while a heading BEFORE it keeps its name, which nothing later can move" 0 '(1 checked)' -- "$CP" "$R"
+expect "...and a heading BEFORE it keeps its name, which nothing later can move" 0 '(1 checked)' -- "$CP" "$R"
+# The property the whole block-scope gap rests on, pinned from the side that broke it: a
+# heading-shaped line inside a FENCE that the slug reader will not spell must not take the real
+# headings after it down with it. Round 3's suppression did exactly that (round 9, P2).
+links_tree
+printf '\n```\n## [Example](https://example.invalid)\n```\n\n## After the fence\n' \
+  >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [past a phantom heading](references/notes.md#after-the-fence).'
+expect "an unspellable heading inside a fence refuses no anchor after it" 0 '(1 checked)' -- "$CP" "$R"
 
 # The guards belong where the target is first TOUCHED. The prepass that builds the slug table
 # probed and read anchored targets before the loop below refused them, so a link out of the
@@ -1493,6 +1503,39 @@ links_tree
 printf '\n## !!!\n\n## !!!\n' >> "$R/alpha/references/notes.md"
 links_body alpha/SKILL.md 'See [one repeat too many](references/notes.md#-2).'
 expect "...and stops where the file does" 1 "GitHub slug is '-2'" -- "$CP" "$R"
+
+# A link opens with a LABEL. Without one, `](x.md)` standing in prose is a token somebody wrote,
+# not a link Markdown renders -- and reporting its target as a broken link is the one way this
+# scan can fail a file that has nothing wrong with it (round 9, P2). The balanced-paren and
+# rejected-candidate fixes of rounds 2 and 3 never reached it, because a bare token with a valid
+# `.md` target is accepted, not rejected.
+links_tree
+links_body alpha/SKILL.md 'The token ](references/gone.md) is documented, and is not a link.'
+expect "a target with no opening label is not a link, so its file is not required" 0 '0 failed' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'The token ](references/gone.md) is documented; [and here](references/gone.md) it is.'
+expect "...while the labelled one on the same line is still read" 1 \
+  'resolves to no file: alpha/references/gone.md' -- "$CP" "$R"
+
+# A heading may END at its hash run: `#` alone is an empty heading to GFM, and skipping it cost
+# its successors their numbering as well as itself -- with `#` before `## !!!`, the second is `-1`
+# on GitHub and was being read as the first empty slug (round 9, P2).
+links_tree
+printf '\n#\n\n## !!!\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [past an empty heading](references/notes.md#-1).'
+expect "a heading that ends at its hash run is a heading, and occupies its slug" 0 '(1 checked)' -- "$CP" "$R"
+
+# Code-span padding is stripped only when BOTH ends are spaces; one-sided padding is preserved, so
+# `## ` foo`` is `-foo` on GitHub. Trimming the RENDERED text threw that space away -- the trim
+# belongs to the ATX parse, before the inline reading, which is where GFM does it (round 9, P2).
+links_tree
+printf '\n## ` foo`\n\nOne-sided padding, which survives.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a preserved space](references/notes.md#-foo).'
+expect "a space a code span preserves is not trimmed away after rendering" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## ` foo`\n\nOne-sided padding, which survives.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [the trimmed reading](references/notes.md#foo).'
+expect "...so the trimmed reading names no heading" 1 "GitHub slug is 'foo'" -- "$CP" "$R"
 
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.
