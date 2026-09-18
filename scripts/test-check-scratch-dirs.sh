@@ -345,6 +345,46 @@ EOF
 expect "...which is what export already did, here as the control for that claim" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_subshell_reassignment_plain.sh"
 
+# Round 6 of #252: `readonly NAME=v` takes a LIST, and reading only the first operand left the
+# second invisible -- this change's own defect, one operand along. `readonly AUX=x
+# BASE=${TMPDIR:-/tmp}` really does overwrite and freeze BASE, and the file below passed with a
+# certified BASE while printing a `/var/...` path at runtime. Every declaration keyword takes the
+# list, so all of them are read rather than `readonly` singled out; the `export` spelling is here
+# as the control for that, and it is a shape main passes too.
+probe bad_multi_operand_readonly <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly AUX=x BASE=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a later operand of a readonly list disqualifies its own name" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_multi_operand_readonly.sh"
+
+probe bad_multi_operand_export <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+export AUX=x BASE=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "...and so does one of an export list, which is the same rule not singling readonly out" 1 \
+  "$REFUSAL" -- "$CS" "$TMP/bad_multi_operand_export.sh"
+
+# ...while an operand list that touches no root is ordinary code and stays passing. The repository
+# writes `local a="$1" b="$2"` some forty times, and a rule that disqualified on sight of a list
+# rather than on the NAMES in it would have refused a great deal of correct shell.
+probe safe_multi_operand_unrelated <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+helper() {
+  local checkout="$1" value="$2" rest
+  rest="$checkout$value"
+  echo "$rest"
+}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an operand list that names no root is left alone" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_multi_operand_unrelated.sh"
+
 # Round 3 of #252: and the guard does NOT try to work out whether an earlier `readonly` is in
 # force, which is why these two pass. `readonly -f TMP` freezes a FUNCTION named TMP and leaves the
 # variable alone, and a freeze inside `( ... )` is gone when the subshell exits; both files run

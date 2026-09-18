@@ -641,6 +641,23 @@ for f in "${files[@]}"; do
         sub(/^[^=]*=/, "", val)
         an[i] = nm
         av[i] = val
+        # `readonly NAME=v` takes a LIST: `readonly AUX=x BASE=${TMPDIR:-/tmp}` assigns and freezes
+        # both, and reading only the first left the second invisible -- the very defect this change
+        # is for, one operand along (ludics-lite#252 review round 6). Every declaration keyword
+        # takes the list, so this reads them all rather than singling `readonly` out. Conservative
+        # by construction: an operand past the first can DISQUALIFY its name and never certify it,
+        # so nothing here has to work out what the value is worth, and the worst a
+        # mis-tokenized operand can do is refuse. The line has already had its single-quoted runs
+        # blanked, so a `=` inside `'"'"'...'"'"'` is gone; a double-quoted one still reads as an operand,
+        # which is the conservative direction.
+        rest = val
+        while (match(rest, /[ \t]+[A-Za-z_][A-Za-z0-9_]*\+?=/)) {
+          ex = substr(rest, RSTART, RLENGTH)
+          gsub(/^[ \t]+/, "", ex)
+          sub(/\+?=$/, "", ex)
+          more[i] = more[i] " " ex
+          rest = substr(rest, RSTART + RLENGTH)
+        }
       }
       for (i = 1; i <= last; i++) if (i in an) mkok[i] = resolved_below(i)
       # WHICH SCOPE a name is resolved in, rather than one name-global verdict. A short name is
@@ -699,6 +716,13 @@ for f in "${files[@]}"; do
             bad_assign[key] = 1
           } else if (!value_resolves(av[i], funcof[i])) {
             bad_assign[key] = 1
+          }
+          # ...and every operand past the first, which disqualifies its own name whatever this
+          # line'"'"'s first operand did.
+          if (i in more) {
+            nex = split(more[i], exn, / /)
+            for (xi = 1; xi <= nex; xi++)
+              if (exn[xi] != "") bad_assign[funcof[i] SUBSEP exn[xi]] = 1
           }
         }
         for (n in seen) {
