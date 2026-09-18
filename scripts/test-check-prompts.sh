@@ -605,6 +605,17 @@ slots_tree
 slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(twenty six on mac-studio/'
 expect "a numeral phrase is read whole, spaces and all" 1 "native-claude.md: spells the mac-studio slot count 'twenty six'" -- "$CP" "$R"
 
+# A file the scan skips before reading it is a file the scan cannot hold, so the one filter that
+# stands before `slot_mentions` is pinned here. A NUL anywhere makes grep call the file binary,
+# and the greps this suite runs under disagree about what that prints and where -- BSD grep says
+# `Binary file … matches` on stdout, GNU grep 3.5+ says it on stderr, ugrep reports no match --
+# so without `-a` this probe passes on macOS and fails on the Linux CI, which is the defect it
+# is here to keep out. The NUL stands BEFORE the mention, where the binary verdict is reached
+# first; the file is a discovered one, stating a count nothing requires it to state.
+slots_tree
+printf 'a stray \000 byte, and then:\n\n%s on mac-studio, this note says.\n' "$STALE" > "$R/notes-with-a-nul.md"
+expect "a stale count in a file carrying a NUL is still refused" 1 "notes-with-a-nul.md: spells the mac-studio slot count '$STALE'" -- "$CP" "$R"
+
 # A word carrying punctuation ends the phrase rather than joining it: the `one.` closing a
 # sentence is not part of the `Six` opening the next.
 slots_tree
