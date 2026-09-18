@@ -906,6 +906,39 @@ else
   ok "a default-sweep refusal does not annotate an absolute path"
 fi
 
+# The control for that non-match, and the reason it needs one. A "must NOT appear" check passes
+# both when the guard is right and when the check was written so that it could never match, and
+# the two are indistinguishable from a green run -- which is how an earlier draft of this one's
+# twin over in the jq guard (ludics-lite#197) got away with grepping for a $TMP path the
+# /var -> /private/var symlink kept it from ever seeing: it PASSED against a guard whose fix had
+# been torn out. The repo-wide resolution sweep that followed was ludics-lite#208. So tear the fix
+# out here, in a scratch checkout's COPY of the guard, and prove the grep above can fire: with
+# `display` gone the relative spelling is gone with it, and the absolute path is what gets
+# annotated. The real scripts/check-scratch-dirs.sh is never touched -- scratch_tree cp'd it into
+# the tree, and the rewrite lands on that copy.
+scratch_tree annotation_mutant
+in_tree annotation_mutant other-skill/scripts/stage.sh <<'EOF'
+work=$(mktemp -d "${TMPDIR:-/tmp}/stage.XXXXXX") || exit 1
+echo "$work"
+EOF
+mutant="$TMP/annotation_mutant/scripts/check-scratch-dirs.sh"
+# `-i.bak` and a removal, not a bare `-i`: the in-place-without-suffix spelling is GNU-only.
+sed -i.bak 's/awk -v file="$display"/awk -v file="$f"/' "$mutant" && rm -f "$mutant.bak"
+# A sed that matched nothing would leave the guard whole and hand back a case passing for exactly
+# the vacuity it exists to rule out, so the mutation is asserted on the file's text before it runs.
+if grep -qF -- 'awk -v file="$f"' "$mutant" && ! grep -qF -- 'awk -v file="$display"' "$mutant"; then
+  ok "the annotation guard can be reverted in a scratch copy"
+else
+  ko "reverting the annotation guard in a scratch copy did not take -- $(grep -n 'awk -v file=' "$mutant")"
+fi
+out=$("$mutant" 2>&1)
+if grep -qF -- "::error file=$TMP/annotation_mutant/other-skill/scripts/stage.sh,line=" <<<"$out" &&
+  ! grep -qF -- '::error file=other-skill/scripts/stage.sh,line=' <<<"$out"; then
+  ok "a guard without the fix annotates the absolute path, which is what the two cases above catch"
+else
+  ko "a guard without the fix must annotate the absolute path and not the relative one -- $out"
+fi
+
 # An explicitly passed file outside the checkout has no relative spelling and keeps the path it
 # was given. The needle is a $TMP path compared against the guard's own output, which is vacuous
 # unless $TMP is the physical spelling the guard prints -- this suite's own stake in its rule.
