@@ -1407,6 +1407,33 @@ printf '# Guide\n\nSee [the second hop](gone.md).\n' > "$R/routines/nightly/refe
 expect "a routine reference file is a linking file too" 1 \
   'routines/nightly/references/guide.md: link to gone.md resolves to no file' -- "$CP" "$R"
 
+# A backslash makes the next ASCII punctuation character literal, and a literal character is not a
+# delimiter of anything -- not a code span, not emphasis, not a tag. Resolving escapes before any
+# of those tests read the heading is what keeps the next escaped delimiter somebody writes from
+# being a finding of its own (round 6, P2). Two of these were false REFUSALS before it.
+links_tree
+printf '\n## \\_Foo\\_\n\nEscaped underscores, which render as themselves.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [escaped underscores](references/notes.md#_foo_).'
+expect "an escaped underscore is literal, so its heading keeps its anchor" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## \\<em\\> literal\n\nAn escaped angle bracket is not a tag.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [an escaped bracket](references/notes.md#em-literal).'
+expect "...and an escaped angle bracket opens no tag" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## \\`_foo_\\`\n\nEscaped backticks open no span, so the underscores are emphasis.\n' \
+  >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [escaped backticks](references/notes.md#_foo_).'
+expect "...while an escaped backtick opens no span, so what it held is read as emphasis" 1 \
+  'will not spell an anchor for' -- "$CP" "$R"
+
+# A byte-order mark opens a FILE, not a line, and GFM removes it before parsing anything -- so the
+# first heading of a file carrying one is a heading, and leaving those bytes in front of its
+# hashes refused a link that works (round 6, P2).
+links_tree
+printf '\357\273\277# Marked\n\n## Close-out\n' > "$R/alpha/references/marked.md"
+links_body alpha/SKILL.md 'See [past a byte-order mark](references/marked.md#marked).'
+expect "a byte-order mark does not hide the first heading of a file" 0 '(1 checked)' -- "$CP" "$R"
+
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.
 fresh "$R"

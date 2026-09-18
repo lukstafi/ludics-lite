@@ -1030,9 +1030,20 @@ heading_slugs() {
       # U+2000-U+206F, General Punctuation, in UTF-8: E2 80 80 .. E2 81 AF.
       for (n = 128; n <= 191; n++) punctuation[sprintf("%c%c%c", 226, 128, n)] = 1
       for (n = 128; n <= 175; n++) punctuation[sprintf("%c%c%c", 226, 129, n)] = 1
+      # The ASCII punctuation a backslash may escape, which is the list CommonMark gives: the
+      # four ranges standing either side of the letters and digits.
+      for (n = 33; n <= 47; n++) escapable[sprintf("%c", n)] = 1
+      for (n = 58; n <= 64; n++) escapable[sprintf("%c", n)] = 1
+      for (n = 91; n <= 96; n++) escapable[sprintf("%c", n)] = 1
+      for (n = 123; n <= 126; n++) escapable[sprintf("%c", n)] = 1
+      bom = sprintf("%c%c%c", 239, 187, 191)
     }
     {
       line = $0
+      # A byte-order mark opens a file rather than a line, and GFM removes it before it parses
+      # anything -- so the first heading of a file that carries one is a heading, and leaving the
+      # bytes in front of its hashes refused a link that works.
+      if (FNR == 1 && index(line, bom) == 1) line = substr(line, 4)
       # A blockquote marker before the heading is the container, not the heading: GFM renders
       # `> ## Foo` as a heading with the anchor `foo`, and skipping it refused a link that works.
       # A run of them is stripped, which is the whole of the block model this reads -- and with
@@ -1096,27 +1107,50 @@ heading_slugs() {
     #     with a space and is not all spaces, CommonMark strips one from each end, which is the
     #     divergence that brought this here -- `## ` foo ` ` is `foo` on GitHub, and reading the
     #     source gave `-foo-`. A run with no closing match is literal backticks, left as it is.
-    #   SPAN_BARE: the same heading with each span replaced by a single `.`, for the markup tests
-    #     below to read. The content of a span is literal text, so `## `_foo_`` is `_foo_` on
+    #   SPAN_BARE: the same heading with each span, and each backslash-escaped character, replaced
+    #     by a single `.`, for the markup tests below to read. The content of a span is literal text, so `## `_foo_`` is `_foo_` on
     #     GitHub and must not be refused as emphasis; `.` rather than a letter, because it is
     #     punctuation to the flanking rule, which is the conservative side of that test.
-    function render_spans(h,   i, c, n, j, k, m, content, text, bare) {
-      text = ""; bare = ""; i = 1
-      while (i <= length(h)) {
+    function render_spans(h,   i, c, n, j, k, m, content, lit, mark, text, bare) {
+      # First the backslash escapes, because a character a backslash made literal is not a
+      # delimiter of anything -- not a code span, not emphasis, not a tag -- and every test after
+      # this one would otherwise read it as one. `lit` is the heading with each escape resolved to
+      # the character it stands for, and `mark` records, position for position, which characters
+      # arrived that way. Resolving them here rather than case by case is what keeps the next
+      # escaped delimiter somebody writes from being a finding of its own.
+      lit = ""; mark = ""
+      for (i = 1; i <= length(h); i++) {
         c = substr(h, i, 1)
-        if (c != "`") { text = text c; bare = bare c; i++; continue }
-        n = 0; while (substr(h, i + n, 1) == "`") n++
+        if (c == "\\" && i < length(h) && (substr(h, i + 1, 1) in escapable)) {
+          lit = lit substr(h, i + 1, 1); mark = mark "E"; i++
+        } else {
+          lit = lit c; mark = mark "."
+        }
+      }
+      # Then the spans, over the escape-resolved text: a backtick that arrived escaped opens and
+      # closes nothing, and stands in the rendered text as the backtick it is.
+      text = ""; bare = ""; i = 1
+      while (i <= length(lit)) {
+        c = substr(lit, i, 1)
+        if (c != "`" || substr(mark, i, 1) == "E") {
+          text = text c
+          if (substr(mark, i, 1) == "E") bare = bare "."
+          else bare = bare c
+          i++
+          continue
+        }
+        n = 0; while (substr(lit, i + n, 1) == "`" && substr(mark, i + n, 1) != "E") n++
         j = i + n; k = 0
-        while (j <= length(h)) {
-          if (substr(h, j, 1) != "`") { j++; continue }
-          m = 0; while (substr(h, j + m, 1) == "`") m++
+        while (j <= length(lit)) {
+          if (substr(lit, j, 1) != "`" || substr(mark, j, 1) == "E") { j++; continue }
+          m = 0; while (substr(lit, j + m, 1) == "`" && substr(mark, j + m, 1) != "E") m++
           if (m == n) { k = j; break }
           j += m
         }
         if (k == 0) {                              # no closing run: literal backticks
-          text = text substr(h, i, n); bare = bare substr(h, i, n); i += n; continue
+          text = text substr(lit, i, n); bare = bare substr(lit, i, n); i += n; continue
         }
-        content = substr(h, i + n, k - i - n)
+        content = substr(lit, i + n, k - i - n)
         if (content ~ /^ / && content ~ / $/ && content ~ /[^ ]/)
           content = substr(content, 2, length(content) - 2)
         text = text content; bare = bare "."
