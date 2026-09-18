@@ -900,8 +900,14 @@ check_drift_guard() {
 # at, and each of those gaps reports nothing rather than reporting wrongly: a target carrying a URI
 # scheme or a leading `/` (`https://…`, `mailto:…`, `/x.md`) is not a file in this checkout; a
 # target with a blank in it -- a `](path.md "Title")` link -- is outside the form; a `](#anchor)`
-# names no file and a non-`.md` target has no headings to name; a reference-style `[text][ref]` is
-# a different syntax; and a link whose `](` and `)` fall on different lines is not one line.
+# names no file and a non-`.md` target has no headings to name; a target spelled in anything but
+# ordinary path characters (a `%` escape, a backslash, an angle-bracket destination) is one this
+# scan does not decode; a reference-style `[text][ref]` is a different syntax; and a link whose
+# `](` and `)` fall on different lines is not one line.
+#
+# What the scan will not do is answer about the MACHINE instead of the prompts. A path spelling its
+# way out of the checkout, and one walking out through a symbolic link, are both refused on the
+# path -- never probed, so no file beside the checkout can make an outside link read as resolving.
 #
 # There is no code scope either, fenced or inline, and that is the one gap cutting both ways. A
 # `# ` line inside a fence reads here as a heading, which only makes the ANCHOR lookup more
@@ -951,7 +957,11 @@ md_links() {
           if (c == "(") depth++
           else if (c == ")" && --depth == 0) { j = k; break }
         }
-        if (j == 0) break
+        # Not `break`: an unbalanced `](` is a FALSE candidate -- `the token \]( is documented`
+        # before a real link on the same line -- and abandoning the line there left the real link
+        # unread and the run green. The cursor has already advanced past this one, so resuming
+        # finds the next; progress is guaranteed because each pass shortens the line.
+        if (j == 0) continue
         target = substr(line, 1, j - 1)
         line = substr(line, j + 1)
         if (target ~ /[[:space:]]/) continue       # a titled link, say: outside the form
@@ -961,6 +971,14 @@ md_links() {
         path = (hash > 0) ? substr(target, 1, hash - 1) : target
         anchor = (hash > 0) ? substr(target, hash + 1) : ""
         if (path !~ /\.md$/) continue              # `](#anchor)` and `](LICENSE)` alike
+        # And SPELLED as a path in this checkout: ASCII letters and digits with `. _ - / ( ) ~ +`,
+        # and `#` for the anchor. A percent escape (`my%20notes.md`), a backslash, an angle-bracket
+        # destination or an entity is a spelling this scan does not decode -- and a decoded reading
+        # is one it would have to guess at, then guess at again for the next encoding somebody
+        # reaches for. One rule instead: a target written in anything else is outside the shape,
+        # like a titled one. The cost is that a file whose name needs escaping goes unchecked; the
+        # names in this checkout are dashed and lowercase, and that is the convention to keep.
+        if (target ~ /[^A-Za-z0-9._\/()~+#-]/) continue
         print rel "\t" target "\t" resolve(dir, path) "\t" anchor
       }
     }
@@ -1031,6 +1049,13 @@ heading_slugs() {
     # right anchor, it would ACCEPT the wrong one: `#caf` would answer for that heading. So such a
     # heading contributes no slug at all, and a link that means it is refused, with the reason.
     function slug(h,   i, c, out) {
+      # Inline link, image or reference syntax: GitHub slugs the RENDERED text of a heading and
+      # this reads its SOURCE. `## [Foo](https://example.com)` is `foo` there and
+      # `foohttpsexamplecom` here -- which refuses the right anchor and accepts one GitHub never
+      # creates. Rendering it means a Markdown parser, so a heading carrying either shape is one
+      # this check will not spell. Literal brackets are untouched: `## Notes [draft]` renders as
+      # its source and slugs to `notes-draft` on both sides.
+      if (index(h, "](") > 0 || index(h, "][") > 0) return "!"
       h = tolower(h)                               # ASCII only, by locale, as GitHub folds ASCII
       sub(/^[ \t]+/, "", h); sub(/[ \t]+$/, "", h)
       out = ""
@@ -1044,6 +1069,28 @@ heading_slugs() {
       }
       return out
     }' "$1"
+}
+
+# symlinked <relpath>: whether <relpath>, under the root, is a symbolic link or is reached through
+# one. The lexical `..` guard keeps a path from SPELLING its way out of the checkout; a symlink
+# walks out without spelling anything, and `-f` follows it, so a `references/x.md` pointing at the
+# runner's filesystem would have its existence -- and its headings -- read off the host. Same class
+# as the `..` guard, and the same answer: refused on the path, before anything is read.
+# Every component is tested, since it is as easily a parent directory that leaves. Only components
+# BELOW the root are, so a checkout reached through a symlink (macOS `/tmp`, this suite's own
+# scratch tree) is not itself the finding. A symlink that stays inside the checkout is refused
+# too: nothing here uses one, and "no symlink on the path" is a rule with no host in it, where
+# "no symlink that escapes" needs the canonical resolution this deliberately does not do.
+symlinked() {
+  local rest="$1" acc="" seg
+  while [ -n "$rest" ]; do
+    seg=${rest%%/*}
+    if [ "$seg" = "$rest" ]; then rest=""; else rest=${rest#*/}; fi
+    [ -n "$seg" ] || continue
+    acc="${acc:+$acc/}$seg"
+    [ -L "$ROOT/$acc" ] && return 0
+  done
+  return 1
 }
 
 check_links() {
@@ -1078,6 +1125,9 @@ check_links() {
     case "$resolved" in
       .. | ../*) ko "$rel" "link to $target resolves outside the checkout: $resolved"; bad=1; continue ;;
     esac
+    if symlinked "$resolved"; then
+      ko "$rel" "link to $target is reached through a symbolic link: $resolved"; bad=1; continue
+    fi
     if [ ! -f "$ROOT/$resolved" ]; then
       ko "$rel" "link to $target resolves to no file: $resolved"; bad=1; continue
     fi

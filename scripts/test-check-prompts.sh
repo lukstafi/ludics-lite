@@ -996,7 +996,9 @@ EOF
   # carrying a letter GitHub keeps, whose anchor the check will not guess at -- so it contributes
   # no slug rather than the ASCII residue `caf`.
   printf '## Close \342\200\224 out\n\nPunctuation GitHub drops.\n\n' >> "$R/alpha/references/notes.md"
-  printf '## Caf\303\251\n\nA letter GitHub keeps.\n' >> "$R/alpha/references/notes.md"
+  printf '## Caf\303\251\n\nA letter GitHub keeps.\n\n' >> "$R/alpha/references/notes.md"
+  # A heading GitHub slugs by its RENDERED text (`foo`), which is not its source.
+  printf '## [Foo](https://example.invalid)\n\nInline link syntax.\n' >> "$R/alpha/references/notes.md"
   printf 'A parenthesized filename.\n' > "$R/alpha/references/a_(b).md"
 }
 # links_body <file> <line...>: appends Markdown to a file in the scratch tree.
@@ -1150,6 +1152,64 @@ links_tree
 links_body alpha/SKILL.md 'See [the ASCII residue](references/notes.md#caf).'
 expect "a heading carrying a letter past ASCII spells no anchor, so its residue answers for none" 1 \
   'will not spell an anchor for' -- "$CP" "$R"
+
+# A false `](` -- the token written in prose, or a bracket pair that opens no link -- used to
+# abandon the rest of the LINE, so a real broken link standing after one went unread and the run
+# came out green. The scan resumes past the false candidate instead (round 2, P2).
+links_tree
+links_body alpha/SKILL.md 'The token ]( is documented; see [the guide](references/gone.md).'
+expect "a false ]( does not abandon the link after it" 1 \
+  'resolves to no file: alpha/references/gone.md' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md '[Mismatched](references/notes.md and then [a real one](references/gone.md).'
+expect "...nor does a destination whose parens never close" 1 \
+  'resolves to no file: alpha/references/gone.md' -- "$CP" "$R"
+
+# The target must be SPELLED as a path in this checkout. A percent escape is the encoding a file
+# with a blank in its name would need, and decoding it is a reading this scan does not do -- so
+# such a target is outside the shape and not checked, rather than probed literally and failed
+# (round 2, P2). The probe plants the DECODED file, so a literal probe would refuse a link that
+# GitHub resolves, and a decoding one would resolve it: neither happens, it is simply not read.
+links_tree
+printf 'A name needing an escape.\n' > "$R/alpha/references/my notes.md"
+links_body alpha/SKILL.md 'See [an escaped name](references/my%20notes.md).'
+expect "outside the shape, so not read: a percent-escaped destination" 0 '0 failed' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'See [an angle-bracket destination](<references/gone.md>).'
+expect "outside the shape, so not read: a destination in angle brackets" 0 '0 failed' -- "$CP" "$R"
+
+# GitHub slugs a heading by its RENDERED text; this reads the source. `## [Foo](...)` is `foo`
+# there and `foohttpsexampleinvalid` here, so the source reading both refuses the right anchor and
+# accepts one GitHub never creates. Such a heading spells no anchor at all (round 2, P2).
+links_tree
+links_body alpha/SKILL.md 'See [the source reading](references/notes.md#foohttpsexampleinvalid).'
+expect "a heading carrying inline link syntax accepts no anchor from its source" 1 \
+  'will not spell an anchor for' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'See [the rendered reading](references/notes.md#foo).'
+expect "...and says so rather than answering for the rendered one either" 1 \
+  'will not spell an anchor for' -- "$CP" "$R"
+links_tree
+links_body alpha/references/notes.md '## Notes [draft]' '' 'Literal brackets, which render as themselves.'
+links_body alpha/SKILL.md 'See [literal brackets](references/notes.md#notes-draft).'
+expect "...while literal brackets render as their source and still slug" 0 '(1 checked)' -- "$CP" "$R"
+
+# The lexical `..` guard stops a path SPELLING its way out of the checkout; a symbolic link walks
+# out without spelling anything, and `-f` would follow it -- so the target's existence, and its
+# headings, would be read off the runner (round 2, P2). Refused on the path, at any component.
+links_tree
+printf '# Outside\n\n## Planted\n' > "$TMP/outside.md"
+ln -s "$TMP/outside.md" "$R/alpha/references/linked.md"
+links_body alpha/SKILL.md 'See [a link out](references/linked.md#planted).'
+expect "a target that is a symbolic link is refused, not followed" 1 \
+  'reached through a symbolic link: alpha/references/linked.md' -- "$CP" "$R"
+links_tree
+mkdir -p "$TMP/elsewhere" && printf '# Outside\n' > "$TMP/elsewhere/notes.md"
+ln -s "$TMP/elsewhere" "$R/alpha/linked"
+links_body alpha/SKILL.md 'See [a link out of a parent](linked/notes.md).'
+expect "...and so is one reached through a symlinked parent" 1 \
+  'reached through a symbolic link: alpha/linked/notes.md' -- "$CP" "$R"
+rm -rf "$TMP/outside.md" "$TMP/elsewhere"
 
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.

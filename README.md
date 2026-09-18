@@ -346,9 +346,14 @@ ludics-lite#260 cut the wave prompt into sections addressed by anchor — `cli-c
 file or a retitled heading leaves such a link rendering as a link and landing nowhere, which is a
 defect a reader finds and a test never did. This is the same kind of lookup as the index one, over
 one fixed shape, spelled out in the checker's own header: a parenthesized target directly after a
-bracketed label, on one line, with no blank in it and a path half ending in `.md`. Anything else —
-a URL, a title after the target, a site-absolute path, a bare anchor, a reference-style link, a
-target that wrapped onto the next line — is not checked rather than guessed at. There is no
+bracketed label, on one line, with no blank in it, a path half ending in `.md`, and the whole
+target spelled in ordinary path characters. Anything else — a URL, a title after the target, a
+site-absolute path, a bare anchor, a percent escape or other spelling it would have to decode, a
+reference-style link, a target that wrapped onto the next line — is not checked rather than
+guessed at. What it will not do is answer about the machine instead of the prompts: a path that
+spells its way out of the checkout, and one that walks out through a symbolic link, are both
+refused on the path rather than probed, so no file beside the checkout can make an outside link
+read as resolving. There is no
 inline-code or fenced-code scope either, deliberately and at a cost paid in this very paragraph:
 prose that spells a whole link in backticks is read as that link, so documentation of the syntax
 has to describe it rather than write one. `test-check-prompts.sh` runs it against scratch trees,
