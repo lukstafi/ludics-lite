@@ -185,10 +185,15 @@ jobs:
     # prompt -- which the classification below calls prompt-only. Conditioned like the other
     # suites, the one check that compares the table with the script's LOCAL_ROUTINES would be
     # skipped on exactly the PRs that can break it, and `prompts` does not compare them (its index
-    # claim is a per-directory lookup, ludics-lite#75, and is not to be grown into one). The suite
-    # runs in about a second with no dependencies, so it costs what the hygiene job costs. Its
-    # macOS leg stays in the conditioned macos job below: bash 3.2 coverage is the expensive half,
-    # and the pin itself is platform-independent.
+    # claim is a per-directory lookup, ludics-lite#75, and is not to be grown into one). The pin is
+    # the whole of the reason, and it does not rest on the job being cheap. The suite needs no
+    # dependencies, but it is not free: its step took 22-27s on the hosted Ubuntu runner across the
+    # three most recent main runs (2026-09-18, 260 assertions), which places this job between the
+    # other two unconditional ones -- above `prompts` at ~8s, below `lint` at ~40s. Expect the
+    # figure to grow with the suite. Growth alone is not an argument for an `if:` here: any
+    # condition cheap enough to be worth adding would reopen exactly the all-Markdown gap the pin
+    # exists to close. Its macOS leg stays in the conditioned macos job below: bash 3.2 coverage is
+    # the expensive half, and the pin itself is platform-independent.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -367,9 +372,12 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: macos-latest
-    # The suites take about nine minutes together (the cleanup and fleet suites are ~4 each).
-    # The cleanup suite kills a stalled case at SHIP_PR_TEST_CASE_TIMEOUT (ludics-lite#14), so
-    # this is the backstop behind that, sized for the whole sequence rather than one suite.
+    # The suites take about 16-18 minutes together (2026-09-18: 973s and 1057s on the two most
+    # recent main runs; post-merge cleanup, the fleet launcher and wake-lab are the largest, at
+    # ~3.5, ~3.5 and ~2.8 minutes). The cleanup suite kills a stalled case at
+    # SHIP_PR_TEST_CASE_TIMEOUT (ludics-lite#14), so this is the backstop behind that, sized for
+    # the whole sequence rather than one suite -- with the margin over a measured run now under
+    # 2x, re-read this figure before assuming the 30 is still generous.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
