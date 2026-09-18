@@ -290,20 +290,54 @@ codex_loop=$(readme_block 'for s in ship-pr wait-and-proceed after-merge' | grep
 
 # Read the layout rather than naming today's skills. A new top-level directory has to declare
 # itself as infrastructure here, or carry SKILL.md and therefore become part of the install set.
-non_skill_dirs=".git .github routines scripts"
-top_dirs=$(find "$real_top" -mindepth 1 -maxdepth 1 -type d -print | sort)
-tree_skills=$(printf '%s\n' "$top_dirs" | while IFS= read -r d; do
-  [ -f "$d/SKILL.md" ] && basename "$d"
+# What the repository tracks, not what the working tree holds: the agent harness writes an
+# untracked `.claude/` into every checkout it opens, so reading the working tree failed this guard
+# on every local run while CI, whose actions/checkout leaves no such scratch, stayed green -- a
+# suite whose one local failure is always the same false positive is a suite people stop reading.
+# Tracked paths close the class rather than one name (post-merge-cleanup.sh, which has to judge a
+# real checkout rather than a declaration, exempts `.claude/` by name instead). `.git` is never
+# tracked, so unlike under `find` it no longer has to be declared.
+non_skill_dirs=".github routines scripts"
+top_dirs() { # <checkout>: the top-level directories the repository declares, one per line
+  git -C "$1" ls-files -z | while IFS= read -r -d '' path; do
+    case $path in */*) printf '%s\n' "${path%%/*}" ;; esac
+  done | sort -u
+}
+is_tracked_skill() { # <checkout> <name>: does that top-level directory declare a SKILL.md?
+  git -C "$1" ls-files --error-unmatch -- "$2/SKILL.md" >/dev/null 2>&1
+}
+undeclared_dirs() { # <checkout>: declared directories that are neither a skill nor infrastructure
+  top_dirs "$1" | while IFS= read -r name; do
+    is_tracked_skill "$1" "$name" && continue
+    declared=0
+    for non_skill in $non_skill_dirs; do [ "$name" = "$non_skill" ] && declared=1; done
+    [ "$declared" -eq 1 ] || printf ' %s' "$name"
+  done
+}
+tree_skills=$(top_dirs "$real_top" | while IFS= read -r name; do
+  is_tracked_skill "$real_top" "$name" && printf '%s\n' "$name"
 done)
-unknown_dirs=$(printf '%s\n' "$top_dirs" | while IFS= read -r d; do
-  [ -f "$d/SKILL.md" ] && continue
-  name=${d##*/}; declared=0
-  for non_skill in $non_skill_dirs; do [ "$name" = "$non_skill" ] && declared=1; done
-  [ "$declared" -eq 1 ] || printf ' %s' "$name"
-done)
+unknown_dirs=$(undeclared_dirs "$real_top")
 [ -n "$tree_skills" ] && [ -z "$unknown_dirs" ] \
   && ok "every top-level directory is a skill or a declared non-skill ($non_skill_dirs)" \
   || ko "top-level directories without SKILL.md outside the declared non-skill set:$unknown_dirs"
+
+# Both halves of that reading, on a clone of the real tree: the untracked scratch the harness
+# leaves behind stays invisible, and a directory the tree actually gains -- declaring neither
+# SKILL.md nor infrastructure -- still trips the guard, which is the whole point of having it.
+guard_clone="$TMP/guard-clone"
+git clone --no-local -q -b main "$real_origin" "$guard_clone" || ko "could not clone the scratch origin for the layout guard (setup, not the launcher)"
+mkdir -p "$guard_clone/.claude/skills" && : > "$guard_clone/.claude/settings.json"
+untracked_verdict=$(undeclared_dirs "$guard_clone")
+[ -z "$untracked_verdict" ] \
+  && ok "an untracked top-level directory does not reach the layout guard" \
+  || ko "an untracked top-level directory tripped the layout guard:$untracked_verdict"
+mkdir -p "$guard_clone/newthing" && : > "$guard_clone/newthing/notes.md"
+git -C "$guard_clone" add newthing/notes.md || ko "could not track the guard clone's new directory (setup, not the launcher)"
+tracked_verdict=$(undeclared_dirs "$guard_clone")
+[ "$tracked_verdict" = " newthing" ] \
+  && ok "...while a tracked directory that is neither a skill nor declared infrastructure trips it" \
+  || ko "the layout guard missed a tracked undeclared top-level directory (verdict:$tracked_verdict)"
 
 linked_skills=$(find "$real_home/.claude/skills" -mindepth 1 -maxdepth 1 -type l -exec basename {} \; | sort)
 [ "$linked_skills" = "$tree_skills" ] \
