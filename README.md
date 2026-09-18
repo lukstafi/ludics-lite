@@ -228,6 +228,42 @@ scripts/test-check-scratch-dirs.sh
 scripts/test-sync-routines.sh
 ```
 
+Three conventions travel with that list.
+
+**A `test-*` name is a promise to run.** `check-prompts.sh`'s fixture check walks
+`scripts/test-*`, `*/scripts/test-*` and `*/hooks/test-*`, and of every `.sh`, `.py` or `.ps1` it
+finds there it requires a command line in the register above and an inline `run:` line in
+`.github/workflows/skill-scripts.yml` on each platform that file needs — both Ubuntu and macOS for
+a shell suite, with the Ubuntu-only and Windows-only fixtures named as exceptions in the checker.
+The glob asks the filename, not the file, so it cannot tell a suite from a helper that is only ever
+sourced: such a helper either earns the name by carrying its own controls and being run, as
+`ship-pr/scripts/test-pr-review-base-lib.sh` has since ludics-lite#212 (executed rather than
+sourced, it proves the round counter, the grace and the tip move straight off the fixture rather
+than through a `base` run, and the refusals it owes its three callers), or it must not be named
+`test-*`. The third option, a register line and two CI steps for a file nothing executes, is a
+green step that tests nothing.
+
+**Scratch directories have one house shape**, enforced by `scripts/check-scratch-dirs.sh` since
+ludics-lite#214: `VAR=$(mktemp -d …)`, then directly under it `VAR=$(CDPATH= cd "$VAR" && pwd -P)`,
+and the cleanup `trap` below that resolution. The guard reads the first command after the
+assignment that mentions the variable and refuses anything that is not the resolution — adjacency,
+not a resolution somewhere further down, because a line that already ran with the environment's
+spelling does not get it retroactively. Comments between the two are not uses, which is where the
+`/var`-to-`/private/var` explanation goes; a `trap` body is not a use either, since it runs at exit,
+but writing it under the resolution keeps the reading order and the running order the same. The
+alternative to a resolution is inheritance: a template whose leading component is a variable this
+file already resolved needs no line of its own, which is what lets post-merge-cleanup.sh's scratch
+paths under its canonicalized `TEMP_ROOT` pass.
+
+**`routines/*/SKILL.md` are Markdown prompts read by an agent, not shell scripts.** Their fenced
+blocks are commands for the agent to run one at a time, and the repository executes none of them:
+`bash -n`, shellcheck, `check-jq-shapes.sh` and `check-scratch-dirs.sh` all sweep `*.sh`, and
+`check-prompts.sh` reads a routine prompt only as a prompt — its frontmatter, and its row in
+`routines/README.md`. So shell-parsing findings against a routine prompt — a heredoc that wants a
+wrapper, a line continuation that must be joined before it is read, quoting a scanner would
+enforce — are findings about a program nobody runs. Not holding that boundary cost ludics-lite#211
+two review rounds.
+
 The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs the shell suites and
 shared Python fixtures on Ubuntu and on macOS (the fleet's bash is 3.2), with macOS sharing one
 job and a step per suite: the hosted
