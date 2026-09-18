@@ -17,7 +17,7 @@ set -uo pipefail
 # mutations away from the explicit checkout arguments. Ask Git for its complete local set, then
 # clear it before interpreting either path.
 GIT_LOCAL_ENV_VARS=$(git rev-parse --local-env-vars 2>/dev/null) || {
-  echo "post-merge-cleanup.sh: could not enumerate Git repository-selection environment" >&2
+  printf '%s\n' "post-merge-cleanup.sh: could not enumerate Git repository-selection environment" >&2
   exit 1
 }
 for GIT_LOCAL_ENV_VAR in $GIT_LOCAL_ENV_VARS; do
@@ -26,8 +26,14 @@ done
 unset GIT_LOCAL_ENV_VAR GIT_LOCAL_ENV_VARS
 export GIT_NO_REPLACE_OBJECTS=1
 
+# Diagnostics are written with `printf '%s\n'`, never `echo`. A diagnostic carries
+# repository-controlled names shell-quoted (see the `printf '%q'` sites), and bash's `echo`
+# interprets backslash escapes whenever `xpg_echo` is on -- a build configured with
+# `--enable-xpg-echo-default`, or a `BASH_ENV` file that sets it -- which would turn the `\n`
+# that quoting produced back into the real newline it was there to withhold, forging the second
+# diagnostic line. `printf '%s'` interprets nothing in its argument.
 fail() {
-  echo "post-merge-cleanup.sh: $*" >&2
+  printf '%s\n' "post-merge-cleanup.sh: $*" >&2
   exit 1
 }
 
@@ -479,7 +485,7 @@ discard_master_refresh_admin() {
   if rmdir "$MASTER_REFRESH_GIT_DIR" >/dev/null 2>&1; then
     MASTER_REFRESH_GIT_DIR=""
   else
-    echo "post-merge-cleanup.sh: retained temporary $BASE_BRANCH refresh metadata at $MASTER_REFRESH_GIT_DIR" >&2
+    printf '%s\n' "post-merge-cleanup.sh: retained temporary $BASE_BRANCH refresh metadata at $MASTER_REFRESH_GIT_DIR" >&2
   fi
 }
 
@@ -735,12 +741,12 @@ delete_ref_with_locked_reflog() {
   printf 'start\noption no-deref\ndelete %s %s\nprepare\n' "$ref" "$expected_oid" >&7 ||
     fail "could not prepare the ref deletion: $ref"
   if ! IFS= read -r response <&8 || [ "$response" != "start: ok" ]; then
-    echo "post-merge-cleanup.sh: ref deletion transaction did not start: $ref: $response" >&2
+    printf '%s\n' "post-merge-cleanup.sh: ref deletion transaction did not start: $ref: $response" >&2
     discard_ref_transaction
     return 1
   fi
   if ! IFS= read -r response <&8 || [ "$response" != "prepare: ok" ]; then
-    echo "post-merge-cleanup.sh: ref deletion transaction was not prepared: $ref: $response" >&2
+    printf '%s\n' "post-merge-cleanup.sh: ref deletion transaction was not prepared: $ref: $response" >&2
     discard_ref_transaction
     return 1
   fi
@@ -1321,7 +1327,7 @@ if [ -z "$FORCE_REASON" ]; then
   git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" "$BASE_REMOTE_REF" ||
     fail "$BRANCH is not an ancestor of origin/$BASE_BRANCH; independently confirm a squash/rebase merge and use --force-integrated with a reason"
 else
-  echo "post-merge-cleanup.sh: FORCE-INTEGRATED override: $FORCE_REASON" >&2
+  printf '%s\n' "post-merge-cleanup.sh: FORCE-INTEGRATED override: $FORCE_REASON" >&2
 fi
 
 # Read and delete the branch through the same push endpoint, leasing the mutation against the OID
@@ -1545,7 +1551,7 @@ case "$REMOTE_BRANCH_STATUS" in
 2)
   # An empty force-with-lease can still delete a ref created after push advertisement. Absence is
   # already the desired state, so do not send a deletion at all; a concurrent creation survives.
-  echo "post-merge-cleanup.sh: origin/$BRANCH was already absent (no deletion sent)" >&2
+  printf '%s\n' "post-merge-cleanup.sh: origin/$BRANCH was already absent (no deletion sent)" >&2
   ;;
 *) fail "could not determine whether origin/$BRANCH exists (ls-remote exit $REMOTE_BRANCH_STATUS)" ;;
 esac
@@ -1726,8 +1732,8 @@ git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" ||
 TOPIC_RESERVATION=""
 
 if [ -n "$LATE_SESSION_ARCHIVE" ]; then
-  echo "post-merge-cleanup.sh: data appearing at the former session path was archived at $LATE_SESSION_ARCHIVE" >&2
+  printf '%s\n' "post-merge-cleanup.sh: data appearing at the former session path was archived at $LATE_SESSION_ARCHIVE" >&2
 fi
-echo "post-merge-cleanup.sh: cleaned $BRANCH and unregistered $SESSION_ORIGINAL; session archived at $SESSION_ARCHIVED_WORKTREE; recovery retained at $RECOVERY_REF and $SESSION_RECOVERY_REF"
+printf '%s\n' "post-merge-cleanup.sh: cleaned $BRANCH and unregistered $SESSION_ORIGINAL; session archived at $SESSION_ARCHIVED_WORKTREE; recovery retained at $RECOVERY_REF and $SESSION_RECOVERY_REF"
 exit "$?"
 }

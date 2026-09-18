@@ -65,8 +65,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# `printf '%s\n'`, not `echo`, for the reason the helper's own `fail` gives: a failure report
+# quotes a refusal that can carry a shell-quoted attacker-shaped name, and `echo` under
+# `xpg_echo` would unescape it on the way out.
 fail() {
-  echo "FAIL: $*" >&2
+  printf '%s\n' "FAIL: $*" >&2
   exit 1
 }
 
@@ -1675,6 +1678,45 @@ test_session_module_gitdir_newline_name_refusal() {
     fail "the newline-named residual submodule repository was removed"
   assert_topic_preserved
   echo "PASS: a newline-named residual submodule repository is refused and named as it is spelled"
+}
+
+test_refusal_escaping_survives_xpg_echo() {
+  local local_master refusal residual session_git_dir xpg_env
+  setup_case refusal-escaping-xpg-echo merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  session_git_dir=$(git -C "$CASE_SESSION" rev-parse --absolute-git-dir)
+  residual=$(printf 'nes\nted')
+  mkdir "$session_git_dir/modules"
+  mkdir "$session_git_dir/modules/$residual"
+  # Shell-quoting a name only withholds its newline if what writes the diagnostic does not
+  # interpret the escape again. Bash's `echo` does exactly that whenever `xpg_echo` is on -- a
+  # build configured with `--enable-xpg-echo-default`, or, as here, a `BASH_ENV` file that sets
+  # it -- turning `%q`'s `\n` back into the real newline it was there to withhold. `BASH_ENV` is
+  # this test's way of reaching that shell; the property under test is the helper's, and the
+  # helper satisfies it by writing every diagnostic with `printf '%s\n'`.
+  xpg_env="$CASE_ROOT/enable-xpg-echo.bash"
+  printf 'shopt -s xpg_echo\n' >"$xpg_env"
+  case "$(BASH_ENV="$xpg_env" bash -c 'shopt xpg_echo')" in
+  *on*) ;;
+  *) fail "this bash does not take xpg_echo from BASH_ENV, so the case would prove nothing" ;;
+  esac
+
+  if refusal=$(BASH_ENV="$xpg_env" "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "a newline-named residual submodule repository was accepted for cleanup"
+  fi
+  case "$refusal" in
+  *"$(printf '%q' "$session_git_dir/modules/$residual")"*) ;;
+  *) fail "the refusal did not name the residual repository as it is spelled: $refusal" ;;
+  esac
+  # The escaping must survive the write: under `echo` the quoted `\n` comes back out as the
+  # newline itself, which is the forged second diagnostic line the quoting exists to prevent.
+  case "$refusal" in
+  *"$residual"*) fail "xpg_echo unescaped the residual repository's newline: $refusal" ;;
+  esac
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "residual submodule refusal must precede master advancement"
+  assert_topic_preserved
+  echo "PASS: a refusal's shell-quoting survives a shell whose echo would reinterpret it"
 }
 
 test_initialized_master_submodule_refusal() {
@@ -4254,6 +4296,7 @@ TESTS=(
   test_escape_named_session_submodule_refusal
   test_deinitialized_session_submodule_refusal
   test_session_module_gitdir_newline_name_refusal
+  test_refusal_escaping_survives_xpg_echo
   test_initialized_master_submodule_refusal
   test_master_resolve_undo_refusal
   test_assume_unchanged_master_refusal
