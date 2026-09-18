@@ -171,13 +171,22 @@ chmod 600 "$HOME/.config/wake-lab/hosts.sh"   # then fill in mac_of, eth_mac_of 
 
 The WSL boxes are shared, and `wsl.exe --shutdown` is host-global — it destroys the whole VM, so
 every session on that box dies with it. Anything that uses a box for a while therefore reserves it,
-as an `flock` on `~/.local/state/wake-lab/<box>.lock` (`WAKE_LAB_LOCK_DIR` overrides the
-directory), and `restart-wsl` refuses a reserved box until the holder lets go, or `--force` takes
-it anyway. `wake-lab.sh lock-path <box>` answers the path for a harness that wants to take one;
-the contract is only the path and a one-line holder description, so the reserving tool needs
-nothing installed from here. The OCANNL cross-machine sweep reserves each box for the length of
-its lane — on 2026-09-16, before any of this existed, a restart issued mid-sweep destroyed both
-GPU boxes' VMs and cost that run both GPU units.
+with an `flock` under `~/.local/state/wake-lab/` (`WAKE_LAB_LOCK_DIR` overrides the directory).
+There are two locks per box, because "in use" is two different claims:
+
+- `<box>.lock`, the **lane** lock — "no other lane runs on this box". A harness that is about to
+  work on a box takes this one, for as long as it is working; `wake-lab.sh lock-path <box>`
+  answers its path. The contract is only the path and a one-line holder description, so the
+  reserving tool needs nothing installed from here.
+- `<box>.hold.lock`, the **hold** lock — "this box's VM must not be destroyed". `--hold` takes it
+  and the Windows-side holder carries it until `unhold`.
+
+`restart-wsl` and the power verbs take **both** and refuse the box if either is held, until the
+holder lets go or `--force` takes it anyway. The OCANNL cross-machine sweep reserves each box's
+lane lock for the length of its lane — on 2026-09-16, before any of this existed, a restart issued
+mid-sweep destroyed both GPU boxes' VMs and cost that run both GPU units. The split into two locks
+came later, on 2026-09-18: while one lock said both things, the sweep routine's own `--hold` in
+step 1 reserved the boxes against its own sweep in step 2, and three backends went uncovered.
 
 `WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the verified lab
 lore in the header comment (wake-on-LAN over Ethernet only, waking from a full shutdown, what
