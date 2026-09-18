@@ -632,10 +632,17 @@ for f in "${files[@]}"; do
       # continuation lines rather than their halves.
       for (i = 1; i <= last; i++) {
         l = code[i]
-        if (l !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+|readonly[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) continue
+        # The keyword'"'"'s own OPTIONS and the `--` terminator sit between it and the first operand:
+        # `readonly -- BASE=${TMPDIR:-/tmp}` and `declare -r BASE=${TMPDIR:-/tmp}` are ordinary
+        # declarations that really do overwrite BASE, and a pattern demanding the name immediately
+        # after the keyword skipped the whole line (ludics-lite#252 review round 7). This is read on
+        # the DISQUALIFYING side only, like the keyword itself: the capture and resolver patterns
+        # keep main'"'"'s shape, so an option cannot make a `mktemp -d` line into a capture or a
+        # `pwd -P` line into a resolution -- both of which would loosen the guard.
+        if (l !~ /^[ \t]*((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) continue
         nm = l
         sub(/^[ \t]*/, "", nm)
-        sub(/^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+|readonly[ \t]+)/, "", nm)
+        sub(/^((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)/, "", nm)
         val = nm
         sub(/=.*$/, "", nm)
         sub(/^[^=]*=/, "", val)
@@ -710,19 +717,23 @@ for f in "${files[@]}"; do
           # merely FREEZES an already-resolved root is refused too, which is the conservative
           # direction. The effect is that reading the keyword can only turn a pass into a refusal.
           if (depth[i] == 0 && code[i] !~ /^[ \t]*readonly[ \t]+/) seen[key] = 1
+          # The operand list is disqualified FIRST, ahead of every branch below -- two of which
+          # `continue` out of the iteration. A first operand that captures a `mktemp -d` under a
+          # resolved root is one of them, and `export AUX=$(mktemp -d "$OTHER/a.XXXXXX")
+          # ROOT=${TMPDIR:-/tmp}` then left ROOT certified, because the scan that should have
+          # disqualified it sat after the `continue` this line takes (ludics-lite#252 review round
+          # 7). What the first operand is worth has nothing to do with what the later ones assign.
+          if (i in more) {
+            nex = split(more[i], exn, / /)
+            for (xi = 1; xi <= nex; xi++)
+              if (exn[xi] != "") bad_assign[funcof[i] SUBSEP exn[xi]] = 1
+          }
           if (has_mktemp_d(head_of(code[i]))) {
             if (!answers_with_mktemp(head_of(code[i]))) { bad_assign[key] = 1; continue }
             if (scope_resolved(i, lead_var(template_of(head_of(code[i])))) || mkok[i]) continue
             bad_assign[key] = 1
           } else if (!value_resolves(av[i], funcof[i])) {
             bad_assign[key] = 1
-          }
-          # ...and every operand past the first, which disqualifies its own name whatever this
-          # line'"'"'s first operand did.
-          if (i in more) {
-            nex = split(more[i], exn, / /)
-            for (xi = 1; xi <= nex; xi++)
-              if (exn[xi] != "") bad_assign[funcof[i] SUBSEP exn[xi]] = 1
           }
         }
         for (n in seen) {

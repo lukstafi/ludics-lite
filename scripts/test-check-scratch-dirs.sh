@@ -385,6 +385,55 @@ EOF
 expect "an operand list that names no root is left alone" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_multi_operand_unrelated.sh"
 
+# Round 7 of #252: the keyword's own OPTIONS and the `--` terminator sit between it and the first
+# operand. `readonly -- BASE=...` and `declare -r BASE=...` are ordinary declarations that really do
+# overwrite BASE, and a pattern demanding the name immediately after the keyword skipped the whole
+# line. Read on the disqualifying side only: the capture and resolver patterns keep main's shape, so
+# an option cannot turn a `mktemp -d` line into a capture or a `pwd -P` line into a resolution.
+probe bad_option_terminator <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly -- BASE=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a -- terminator does not hide the assignment behind it" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_option_terminator.sh"
+
+probe bad_declare_r <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+declare -r BASE=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an attribute flag does not hide the assignment behind it" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_declare_r.sh"
+
+# ...and the operand list is disqualified BEFORE the branches that `continue`. A first operand that
+# captures a `mktemp -d` under a resolved root is one of them, and the later operand was left
+# certified because the scan sat after that `continue`.
+probe bad_list_after_capture <<'EOF'
+OTHER=$(CDPATH= cd /tmp && pwd -P) || exit 1
+ROOT=$(CDPATH= cd /tmp && pwd -P) || exit 1
+export AUX=$(mktemp -d "$OTHER/a.XXXXXX") ROOT=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$ROOT/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a later operand is disqualified even when the first one captured cleanly" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_list_after_capture.sh"
+
+# ...while an option list with no assignment on it is not an assignment. `declare -p` and
+# `readonly -f name` name no variable value, and reading them as one would refuse working code.
+probe safe_option_without_assignment <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+helper() { :; }
+readonly -f helper
+declare -p BASE >/dev/null
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an option list with no assignment on it is not an assignment" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_option_without_assignment.sh"
+
 # Round 3 of #252: and the guard does NOT try to work out whether an earlier `readonly` is in
 # force, which is why these two pass. `readonly -f TMP` freezes a FUNCTION named TMP and leaves the
 # variable alone, and a freeze inside `( ... )` is gone when the subshell exits; both files run
