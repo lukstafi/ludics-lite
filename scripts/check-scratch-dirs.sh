@@ -605,8 +605,32 @@ for f in "${files[@]}"; do
     }
     # Is the mktemp assignment at line <i> resolved by the line below it -- and not used before
     # that? Text only, so it can be computed before the fixpoint that consults it.
+    # Has an earlier line in this scope FROZEN <name>? `readonly` makes a name immutable, and every
+    # later assignment to it is refused by bash -- the command on the right still RUNS, so a
+    # `mktemp -d` still makes its directory, and then the capture is thrown away: the name keeps the
+    # value it was frozen with and the directory is unreachable, with no `set -e` to stop on the
+    # nonzero status. Round 1 read that on the allocation line itself; the freeze can equally sit
+    # any distance above it, and the capturing line then looks perfectly ordinary. Both the bare
+    # `readonly TMP` and the assigning `readonly TMP=old` freeze, so this matches the same shape
+    # `exports` does -- keyword, any number of intervening words, the name, then a separator, an
+    # `=`, or the end. A freeze at TOP LEVEL reaches every scope, because `local` does not shadow it:
+    # `readonly TMP=/etc` above a function whose body says `local TMP` makes bash refuse the `local`
+    # itself (`local: TMP: readonly variable`, verified on 3.2) and the assignment after it, so the
+    # allocation inside is as dead as one at top level. A freeze INSIDE a function is that
+    # function'"'"'s own -- it can be freezing a `local`, which nothing outside the body can see.
+    function freezes(s, name) {
+      return s ~ ("^[ \t]*readonly[ \t]+([^ \t]+[ \t]+)*" name "([ \t=]|$)")
+    }
+    function frozen_before(i, nm,   j) {
+      for (j = 1; j < i; j++) {
+        if (funcof[j] != funcof[i] && funcof[j] != "") continue
+        if (freezes(code[j], nm)) return 1
+      }
+      return 0
+    }
     function resolved_below(i,   nm, l, u) {
       nm = an[i]
+      if (frozen_before(i, nm)) return 0
       # A name the allocation FROZE has no line below it that could resolve it. `readonly
       # TMP=$(mktemp -d ...)` makes TMP immutable where the directory is made, so the adjacent
       # `TMP=$(CDPATH= cd "$TMP" && pwd -P)` is refused by bash itself -- `TMP: readonly variable`
@@ -702,6 +726,12 @@ for f in "${files[@]}"; do
         next
       }
       nm = an[FNR]
+      # Before the inherited root, because a frozen name is not a capture at all: the template may
+      # be as physical as you like, and the path mktemp answers with still goes nowhere.
+      if (frozen_before(FNR, nm)) {
+        refuse(FNR, "a `mktemp -d` into $" nm ", which an earlier `readonly` in this scope already froze: bash refuses the assignment, so the call runs, the directory is made, and the capture is discarded — $" nm " keeps the value it was frozen with and the new directory is unreachable, with nothing but a message on stderr and a nonzero status no `set -e` is here to catch. Capture it in a name nothing has frozen, and resolve THAT with `pwd -P`")
+        next
+      }
       if (scope_resolved(FNR, lead_var(template_of(head_of(line))))) next   # inherited root
       if (mkok[FNR]) next
       if (line ~ /^[ \t]*readonly[ \t]+/) {

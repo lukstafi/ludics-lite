@@ -264,6 +264,22 @@ EOF
 expect "a readonly allocation on a resolved root passes" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_readonly_allocation.sh"
 
+# Round 2 of #252: a freeze INSIDE a function is that function's own -- it can be freezing a
+# `local`, which nothing outside the body can see -- so it must not reach a global of the same
+# name. This is the false refusal the frozen-name rule below could have bought.
+probe safe_frozen_in_function <<'EOF'
+helper() {
+  local TMP
+  readonly TMP=/etc
+  echo "$TMP"
+}
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX") || exit 1
+TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
+echo "$TMP"
+EOF
+expect "a freeze inside a function does not reach the global" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_frozen_in_function.sh"
+
 # Round 4: `mktemp [OPTION]... [TEMPLATE]` -- the directory flag can sit anywhere in the option
 # list, bundled or spelled long, and a resolved one of any of those spellings passes.
 probe safe_option_spellings <<'EOF'
@@ -548,6 +564,57 @@ echo "$TMP"
 EOF
 expect "a readonly allocation cannot be resolved by the line below it" 1 'freezes the name' -- \
   "$CS" "$TMP/bad_readonly_allocation.sh"
+
+# Round 2 of #252: and the freeze does not have to be ON the allocation. `readonly` makes the name
+# immutable, and bash then refuses every later assignment to it -- but the right-hand side still
+# RUNS, so `mktemp -d` makes its directory and the capture is thrown away: the name keeps the value
+# it was frozen with, the directory is unreachable, and the nonzero status goes by with no `set -e`
+# to catch it. All three of these passed the guard and printed the frozen value at runtime. The
+# capturing line carries the keyword in the first, looks perfectly ordinary in the second, and in
+# the third the freeze is the bare `readonly TMP` form, which declares no value and so never
+# entered the assignment table at all.
+probe bad_frozen_then_allocated <<'EOF'
+BASE=$(CDPATH= cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+readonly TMP=old
+readonly TMP=$(mktemp -d "$BASE/x.XXXXXX")
+echo "$TMP"
+EOF
+expect "a readonly allocation into an already-frozen name is refused, resolved root or not" 1 \
+  'already froze' -- "$CS" "$TMP/bad_frozen_then_allocated.sh"
+
+probe bad_frozen_then_plain <<'EOF'
+readonly TMP=old
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX")
+TMP=$(CDPATH= cd "$TMP" && pwd -P)
+echo "$TMP"
+EOF
+expect "an ordinary-looking allocation into a frozen name is refused too" 1 'already froze' -- \
+  "$CS" "$TMP/bad_frozen_then_plain.sh"
+
+probe bad_bare_readonly_freeze <<'EOF'
+TMP=/tmp
+readonly TMP
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX")
+TMP=$(CDPATH= cd "$TMP" && pwd -P)
+echo "$TMP"
+EOF
+expect "a bare readonly freezes the name just as an assigning one does" 1 'already froze' -- \
+  "$CS" "$TMP/bad_bare_readonly_freeze.sh"
+
+# ...and the freeze reaches into a function body, because `local` does not shadow it: bash refuses
+# the `local` itself (`local: TMP: readonly variable`, verified on 3.2) and the assignment after it.
+probe bad_frozen_reaches_function <<'EOF'
+readonly TMP=/etc
+helper() {
+  local TMP
+  TMP=$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX") || exit 1
+  TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
+  echo "$TMP"
+}
+helper
+EOF
+expect "a top-level freeze reaches a function body, which local cannot shadow" 1 'already froze' -- \
+  "$CS" "$TMP/bad_frozen_reaches_function.sh"
 
 # Round 1: the use can share the assignment's own line, and the resolution below does not reach a
 # command that already ran.
