@@ -607,6 +607,19 @@ for f in "${files[@]}"; do
     # that? Text only, so it can be computed before the fixpoint that consults it.
     function resolved_below(i,   nm, l, u) {
       nm = an[i]
+      # A name the allocation FROZE has no line below it that could resolve it. `readonly
+      # TMP=$(mktemp -d ...)` makes TMP immutable where the directory is made, so the adjacent
+      # `TMP=$(CDPATH= cd "$TMP" && pwd -P)` is refused by bash itself -- `TMP: readonly variable`
+      # on stderr, a nonzero status that a script without `set -e` walks straight past -- and every
+      # command below it runs on the environment'"'"'s own spelling, which is the defect this guard
+      # exists to catch, now arriving silently and with a zero exit. Reading the alternation for
+      # `readonly` is what made this shape expressible at all (it used to refuse as an uncaptured
+      # call, for the wrong reason), so the keyword has to be read on BOTH sides: a `readonly`
+      # allocation passes only by inheriting a root its template already resolved, never by a
+      # reassignment that cannot run. A `readonly` RESOLUTION is untouched by this -- a plain
+      # assignment followed by a `readonly` one is ordinary bash, and it is the line below that
+      # carries the keyword there, not this one.
+      if (code[i] ~ /^[ \t]*readonly[ \t]+/) return 0
       if (mentions(tail_of(code[i]), nm) || exports(tail_of(code[i]), nm)) return 0
       u = next_code_line(i)
       if (u == 0) return 0
@@ -691,6 +704,10 @@ for f in "${files[@]}"; do
       nm = an[FNR]
       if (scope_resolved(FNR, lead_var(template_of(head_of(line))))) next   # inherited root
       if (mkok[FNR]) next
+      if (line ~ /^[ \t]*readonly[ \t]+/) {
+        refuse(FNR, "a `readonly` `mktemp -d` into $" nm ": the allocation freezes the name, so no resolution below it can run — bash refuses the reassignment with `" nm ": readonly variable` and, without `set -e`, every command after it uses the environment'"'"'s own spelling and the script still exits 0. Drop the `readonly` and put `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)` on the next line, or keep the `readonly` and build the template on a directory this file already resolved")
+        next
+      }
       if (mentions(tail_of(line), nm) || exports(tail_of(line), nm)) {
         refuse(FNR, "a `mktemp -d` into $" nm " that is used later on its OWN line, before anything could resolve it: the resolution below does not reach a command that already ran with the environment'"'"'s spelling — put `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)` between them")
         next

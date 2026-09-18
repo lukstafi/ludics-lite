@@ -253,6 +253,17 @@ mkdir -p "$TMP/bin"
 EOF
 expect "a readonly resolution is a resolution" 0 "$CLEAN" -- "$CS" "$TMP/safe_readonly.sh"
 
+# ...but the keyword has to be read on BOTH sides of the adjacency pair. A `readonly` ALLOCATION
+# is the one that cannot be resolved below, so the passing shape for it is an inherited root: the
+# template is already physical and no reassignment has to run.
+probe safe_readonly_allocation <<'EOF'
+BASE=$(CDPATH= cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+readonly TMP=$(mktemp -d "$BASE/probe.XXXXXX")
+echo "$TMP"
+EOF
+expect "a readonly allocation on a resolved root passes" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_readonly_allocation.sh"
+
 # Round 4: `mktemp [OPTION]... [TEMPLATE]` -- the directory flag can sit anywhere in the option
 # list, bundled or spelled long, and a resolved one of any of those spellings passes.
 probe safe_option_spellings <<'EOF'
@@ -521,6 +532,22 @@ echo "$TMP"
 EOF
 expect "the same file without the readonly line passes" 0 "$CLEAN" -- \
   "$CS" "$TMP/safe_readonly_control.sh"
+
+# Round 1 of #252: and the half of the same keyword that reading it OPENED. `readonly` on the
+# ALLOCATION freezes the name where the directory is made, so the resolution below is refused by
+# bash -- `TMP: readonly variable`, a nonzero status a script without `set -e` walks past -- and
+# every command after it runs on the environment's spelling while the script still exits 0. Until
+# the alternation read the keyword this shape was refused for the wrong reason (an uncaptured
+# call); reading it made the shape expressible, so the adjacency rule had to learn that a frozen
+# name has no line below it that can resolve it. The passing counterpart is safe_readonly_allocation
+# above -- inherit a resolved root instead of reassigning.
+probe bad_readonly_allocation <<'EOF'
+readonly TMP=$(mktemp -d "${TMPDIR:-/tmp}/probe.XXXXXX")
+TMP=$(CDPATH= cd "$TMP" && pwd -P)
+echo "$TMP"
+EOF
+expect "a readonly allocation cannot be resolved by the line below it" 1 'freezes the name' -- \
+  "$CS" "$TMP/bad_readonly_allocation.sh"
 
 # Round 1: the use can share the assignment's own line, and the resolution below does not reach a
 # command that already ran.
