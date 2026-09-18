@@ -390,6 +390,10 @@ HOLD_WAIT_SECONDS=${WAKE_LAB_HOLD_WAIT_SECONDS:-60}
 # on its own cannot say, since the wsl.exe it sees may be the owner's console shell.
 HOLD_SETTLE_SECONDS=${WAKE_LAB_HOLD_SETTLE_SECONDS:-20}
 HOLD_STATE_DIR=${WAKE_LAB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wake-lab}
+# Set when a holder was found already dead at unhold: a lane that lost its box without anyone
+# noticing. It is a FAULT and not a cleanup detail, so it leaves the command non-zero -- see
+# release_hold for why a holder can only be gone by having died under the lane.
+HOLD_ANOMALY=0
 # The local-time hours on the Windows box that the unattended sweep occupies: the routine's 07:20
 # launch plus its longest lane. Written `<start>-<end>`, end exclusive, and it may wrap midnight.
 SWEEP_HOURS=${WAKE_LAB_SWEEP_HOURS:-7-11}
@@ -899,7 +903,9 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
   return 1
 }
 
-release_hold() { # release_hold <box> — end the recorded holder; always rc 0, always says what it did
+release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (an already-dead
+                 # holder is reported by setting HOLD_ANOMALY, which the caller turns into rc 2),
+                 # always says what it did
   local f=$HOLD_STATE_DIR/hold-$1.pid rec p d t sc
   if [ ! -r "$f" ]; then echo "  no wsl holder recorded for $1"; return 0; fi
   rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
@@ -919,7 +925,34 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0, 
     kill "$p" 2>/dev/null
     echo "  wsl holder released on $1 (pid $p killed; the VM is unheld from now on)"
   else
-    echo "  wsl holder on $1 had already exited (pid ${p:-?}); the VM was unheld"
+    # NOT a routine outcome, though this reported it as one until 2026-09-18. A lane ends by
+    # unhold and nothing else ENDS the holder deliberately, so a holder already gone is one the
+    # lane LOST -- the box slept or rebooted under it, the network dropped, something killed it.
+    # What that costs is the LAB LOCK, not usually the VM: the lock lives on the
+    # holder's descriptor, so it was released the moment the holder died and the box stopped being
+    # reserved -- another session's `restart-wsl` was then free to take it with a host-global
+    # `wsl --shutdown`, which is the 2026-09-16 failure the interlock exists to prevent. Note that
+    # the interlock only covers THIS script's `sleep`/`down` verbs, which reserve the box and are
+    # refused while it is held: a box slept by hand or from Windows bypasses it entirely and takes
+    # the holder with it. That is 2026-09-18 -- both boxes slept at 11:33 with a hold outstanding,
+    # four hours into the lane, and the only thing that ever said so was this line, which called it
+    # a release and was believed. The VM
+    # itself commonly survives, because a dying holder ORPHANS its wsl.exe on the Windows side
+    # rather than taking it down (measured 2026-09-18: a holder killed at 12:47:37 left its two
+    # wsl.exe running, and four from 07:08 were still up six hours later). That is not a
+    # consolation -- an orphan is unowned, invisible to this script, and ends only at the next
+    # restart-wsl or reboot. Either way the lane no longer holds what it believes it holds, so
+    # this says it in the words of a fault and the caller exits non-zero.
+    HOLD_ANOMALY=1
+    case ${t:-} in
+      ''|*[!0-9]*) echo "  ANOMALY: wsl holder on $1 had already exited (pid ${p:-?})" ;;
+      *) echo "  ANOMALY: wsl holder on $1 had already exited (pid ${p:-?}, spawned $(date -r "$t" '+%H:%M:%S' 2>/dev/null || echo '?'), so it lived at most $(( ($(date +%s) - t) / 60 )) min)" ;;
+    esac
+    echo "    This unhold did not end it. The lab lock died with it, so $1 stopped being RESERVED"
+    echo "    at that moment and another session's restart-wsl was free to shut the VM down under"
+    echo "    the lane. The VM may well have stayed up regardless -- a dying holder orphans its"
+    echo "    wsl.exe rather than taking it down -- but nothing owns that orphan and nothing short"
+    echo "    of restart-wsl or a reboot ends it. Treat this lane's results on $1 as suspect."
   fi
   rm -f "$f"
   return 0
@@ -1298,6 +1331,11 @@ fi
 # reports no holder instead of a typo, which is the right trade for a cleanup command.
 if [ "$VERB" = unhold ]; then
   for t in "${TARGETS[@]}"; do release_hold "$t"; done
+  # rc 2, not 1: a lane's cleanup must be able to tell "the holder died under me" (the lane's
+  # results are suspect) from an ordinary failure of the unhold command itself. Nothing was left
+  # un-cleaned either way -- the record is gone and the box is free -- so a caller that only
+  # cares about cleanup can ignore it, while the sweep can fail the lane on it.
+  [ "$HOLD_ANOMALY" = 1 ] && exit 2
   exit 0
 fi
 

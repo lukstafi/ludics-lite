@@ -78,7 +78,32 @@ Name only the boxes THIS run held — the ones whose `wsl holder observed on <bo
 step 1. The record is per box and global to the machine, so `unhold` on a box you did not hold
 would release whatever holder is there, and if another run put it there you would unhold its lane.
 Run that even when the sweep failed or a box never woke — `unhold` over a box with no holder says
-so and exits 0. `wsl HOLD FAILED on: <box>` in the last lines means the VM started but nothing on
+so and exits 0. But `ANOMALY: wsl holder on <box> had already exited`, with **exit 2**, is the
+opposite of a clean cleanup: nothing but `unhold` ENDS a holder deliberately, so one already gone is
+one the lane LOST — the box slept or rebooted under it, the network dropped, something killed it. What that costs is the **lab lock**, which lives on the holder's
+descriptor and was released the moment it died — from then on the box was not reserved, and another
+session's `restart-wsl` was free to shut its VM down mid-unit, the 2026-09-16 failure the interlock
+exists to prevent. The VM itself usually survives, because a dying holder orphans its `wsl.exe` on
+the Windows side instead of taking it down; that orphan is unowned and invisible, and only a
+`restart-wsl` or a reboot ends it. Treat it as a failed lane for that box: report it, quote the line
+(it carries the pid and how long the holder lived), and do not call the run clean on the strength of
+green units. Note the interlock only covers wake-lab's own `sleep`/`down` verbs, which are refused
+while a box is held — a box slept by hand or from Windows takes its holder with it and nothing
+refuses anything. That is what happened on 2026-09-18: both boxes were slept at 11:33 with a hold
+still outstanding, and the only thing that ever reported it was this line, calling it a release.
+
+**An `unhold` that does not come back is the run's most urgent item.** It is a cleanup step, so it
+reads as something to fire and forget, and it is not: the boxes stay held and their lab locks stay
+taken until it returns. On 2026-09-18 this `unhold` was issued at 07:39 and did not return until
+**11:39** — two earlier attempts were refused by the permission classifier and the third sat four
+hours waiting for an approval. Nothing else in the run was blocked, so nothing looked wrong, and
+both boxes stayed held and locked through the whole morning. It also corrupts the record afterwards:
+the holders were lost at 11:33 when the boxes were slept, but the report of that loss carries the
+timestamp of the stalled command, so a later reading puts the death minutes after the spawn instead
+of four hours after it. If an `unhold` is denied or does not return, say so in the run's report and
+chase it — do not treat a missing result as a completed cleanup.
+
+`wsl HOLD FAILED on: <box>` in the last lines means the VM started but nothing on
 the Windows side holds it, and the line says which of two situations that is:
 
 - `...so it was shut down again: those units record no coverage` — the VM this command created is
