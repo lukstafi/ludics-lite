@@ -938,6 +938,17 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     # The holder is gone and an unhold is on record as having ended it. That is a completed
     # release whose record outlived it, not a loss: say so, clear up, and leave rc 0.
     echo "  wsl holder on $1 was already ended by an earlier unhold (pid ${p:-?}); its record is cleared"
+  elif [ ! -e "$f" ]; then
+    # The record VANISHED between this run's entry and here, which is the one interleaving the
+    # marker cannot cover on its own: a concurrent unhold got through its whole release -- marker,
+    # kill, `rm -f` of both files -- inside that window, leaving nothing behind to read. The fix is
+    # not to serialize, but to stop treating an absent record as evidence: a record is removed by
+    # exactly one thing, a release that completed, so a record that is GONE never witnesses a loss.
+    # Only a record that is STILL THERE naming a holder that is not does that, which is the branch
+    # below. Locking this instead would put an acquire in front of the one command that has to work
+    # when everything else is wedged -- unhold is how a lane ends -- and a marker that outlived its
+    # release, the other suggestion, would mask the next holder's loss.
+    echo "  wsl holder on $1 was released by a concurrent unhold; nothing to do"
   else
     # NOT a routine outcome, though this reported it as one until 2026-09-18. A lane ends by
     # unhold and nothing else ENDS the holder deliberately, so a holder already gone is one the
