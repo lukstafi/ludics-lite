@@ -632,15 +632,69 @@ for f in "${files[@]}"; do
       # continuation lines rather than their halves.
       for (i = 1; i <= last; i++) {
         l = code[i]
-        if (l !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) continue
+        # The keyword'"'"'s own OPTIONS and the `--` terminator sit between it and the first operand:
+        # `readonly -- BASE=${TMPDIR:-/tmp}` and `declare -r BASE=${TMPDIR:-/tmp}` are ordinary
+        # declarations that really do overwrite BASE, and a pattern demanding the name immediately
+        # after the keyword skipped the whole line (ludics-lite#252 review round 7). This is read on
+        # the DISQUALIFYING side only, like the keyword itself: the capture and resolver patterns
+        # keep main'"'"'s shape, so an option cannot make a `mktemp -d` line into a capture or a
+        # `pwd -P` line into a resolution -- both of which would loosen the guard.
+        # `NAME+=v` appends and is an assignment like any other -- `readonly BASE+=/../var` turns a
+        # certified root into `/tmp/../var`, a path no `pwd -P` in this repository spells that way.
+        # The later-operand scan already read `+=`; the first operand did not, which made the line
+        # an assignment or not depending on WHICH operand carried the append (ludics-lite#252 review
+        # round 9).
+        # A DOUBLE-quoted operand is the same assignment: quote removal happens before the builtin
+        # sees it, so `readonly "BASE=/var"` really does assign BASE (ludics-lite#252 review round
+        # 10). The quote is read here, where it only ever adds a name to disqualify; the capture and
+        # resolver patterns keep main'"'"'s shape, so it cannot make a line into a capture or a
+        # resolution. A SINGLE-quoted operand is a different matter and is not read: `blank_sq` has
+        # replaced its contents with `x` by the time this runs, which is what keeps a `mktemp -d`
+        # inside a usage string from being a call, and reading the name back would mean carrying an
+        # unblanked copy of every declaration line -- names from one spelling and values from the
+        # other, since `readonly BASE='$(cd /tmp && pwd -P)'` is literal text that must not read as a
+        # resolution. That is recorded in the PR rather than built here.
+        # A declaration keyword may carry options and a `--`, and its operand may be double
+        # quoted: quote removal happens before the builtin sees it, so `readonly "BASE=/var"`
+        # assigns BASE. The quote is read ONLY behind a keyword. Without one, `"BASE=$(CDPATH= cd
+        # /tmp && pwd -P)"` is a quoted WORD, which bash runs as a command name and which assigns
+        # nothing -- reading it as an assignment certified a root that was never set
+        # (ludics-lite#252 review round 14).
+        #
+        # ONE OPERAND, which is what main reads too. A declaration takes a list, and rounds 6 to 14
+        # spent six of them trying to read it: the scan had to be hoisted above an early `continue`,
+        # taught `+=`, taught scope, taught quotes -- and then read past a `;` into the next command
+        # (round 13), matched assignment-shaped text inside a quoted VALUE, and treated the
+        # assignment prefix of `A=x BASE=/var true` as a persistent declaration (round 14), each of
+        # those refusing a correct file that main accepts. Reading a list correctly needs shell word
+        # splitting, and this file has said from its first round what that becomes. The list was
+        # never the reported defect either: main reads only the first operand for EVERY keyword, so
+        # `readonly AUX=x BASE=...` is a gap this PR inherited rather than opened. It goes to
+        # ludics-lite#258 with the rest of the grammar, and what stays here is the single operand
+        # the bug was about.
         nm = l
         sub(/^[ \t]*/, "", nm)
-        sub(/^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)/, "", nm)
+        if (nm ~ /^((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)/) {
+          sub(/^((local|declare|typeset|export|readonly)([ \t]+[-+][A-Za-z-]*)*[ \t]+)/, "", nm)
+          sub(/^"/, "", nm)        # `readonly "BASE=/var"` names BASE; only behind the keyword
+        }
+        if (nm !~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) continue
         val = nm
+        append[i] = (nm ~ /^[A-Za-z_][A-Za-z0-9_]*\+=/)
         sub(/=.*$/, "", nm)
+        sub(/\+$/, "", nm)          # `BASE+=v` names BASE, not `BASE+`
         sub(/^[^=]*=/, "", val)
         an[i] = nm
         av[i] = val
+        # `readonly NAME=v` takes a LIST: `readonly AUX=x BASE=${TMPDIR:-/tmp}` assigns and freezes
+        # both, and reading only the first left the second invisible -- the very defect this change
+        # is for, one operand along (ludics-lite#252 review round 6). Every declaration keyword
+        # takes the list, so this reads them all rather than singling `readonly` out. Conservative
+        # by construction: an operand past the first can DISQUALIFY its name and never certify it,
+        # so nothing here has to work out what the value is worth, and the worst a
+        # mis-tokenized operand can do is refuse. The line has already had its single-quoted runs
+        # blanked, so a `=` inside `'"'"'...'"'"'` is gone; a double-quoted one still reads as an operand,
+        # which is the conservative direction.
       }
       for (i = 1; i <= last; i++) if (i in an) mkok[i] = resolved_below(i)
       # WHICH SCOPE a name is resolved in, rather than one name-global verdict. A short name is
@@ -664,6 +718,12 @@ for f in "${files[@]}"; do
       # `nassign` passes cannot be exceeded -- the bound is the file'"'"'s own size, and nothing here
       # has to be more than any chain.
       nassign = 0
+      # Every operand is an assignment IN ITS SCOPE, later ones included. `assigns` is what
+      # `scope_resolved` reads to decide whether a function has its own binding for a name, and a
+      # later operand that was only ever marked bad -- `local AUX=x BASE=${TMPDIR:-/tmp}` -- left
+      # the function without one, so a lookup inside it fell back to the resolved GLOBAL and an
+      # allocation under the shadowing local passed (ludics-lite#252 review round 9). The
+      # single-operand `local BASE=...` was refused all along; this makes the list agree with it.
       for (i = 1; i <= last; i++) if (i in an) { assigns[funcof[i] SUBSEP an[i]] = 1; nassign++ }
       # This block is entered exactly once: awk reads the file twice, but the pass-1 rule ends in
       # `next`, so `FNR == 1` is reached only on pass 2, with a complete `last`. The clear is not
@@ -679,12 +739,62 @@ for f in "${files[@]}"; do
         for (i = 1; i <= last; i++) {
           if (!(i in an)) continue
           key = funcof[i] SUBSEP an[i]
-          if (depth[i] == 0) seen[key] = 1
+          # `readonly` is read here for what it can take AWAY and never for what it could grant.
+          # Reading the keyword at all is what this change is for -- a `readonly` reassignment of a
+          # resolved root has to un-resolve it, which is the defect that went unseen -- and
+          # `bad_assign` below does that whatever the line'"'"'s shape. Certifying is the other
+          # direction, and every attempt to let the keyword do it walked into something this
+          # scanner cannot see: the same declaration inside `( ... )` disappears when the subshell
+          # exits, and parens move neither `depth` nor `funcof`, so it would certify an outer root
+          # that never got one (ludics-lite#252 review round 4). The house rule was already
+          # two-sided -- only an assignment at control depth 0 can certify, any assignment can
+          # disqualify -- and this is the same asymmetry one keyword further: a file whose root is
+          # only ever assigned with `readonly` is refused exactly as it is on main, and a file that
+          # merely FREEZES an already-resolved root is refused too, which is the conservative
+          # direction. The effect is that reading the keyword can only turn a pass into a refusal.
+          # ...and an OPTION-BEARING declaration is disqualifying-only for the same reason. Reading
+          # options (round 7) let one into the table, and certifying from it assumed the option mode
+          # assigns -- which `declare -p BASE=$(cd /tmp && pwd -P)` does not: `-p` DISPLAYS each
+          # name, bash reports the expanded operand as a name it cannot find, BASE keeps whatever it
+          # inherited, and the guard certified it anyway (ludics-lite#252 review round 8). Which
+          # modes assign is a table of every option of five builtins, and the wrong entry certifies
+          # a root that was never set. The guard does not keep that table: an option on the line
+          # means the line can take a name away and never hand one over, which is round 4'"'"'s
+          # asymmetry again and costs only a `declare -r BASE=$(... pwd -P)` that has to be written
+          # without the flag to certify.
+          # An APPEND certifies nothing either, and for the plainest reason of all: it concatenates
+          # onto whatever the name already held, so its text is only the SUFFIX. Round 9 taught the
+          # first operand to read `+=` and then let `value_resolves` judge the line by that suffix
+          # alone -- so an inherited BASE naming a symlink, plus `BASE+=$(CDPATH= cd /tmp && pwd
+          # -P)`, certified a path that still traverses it (ludics-lite#252 review round 12, and the
+          # first genuine LOOSENING this branch produced: main refuses that file). An append can
+          # take a name away and never hand one over, like an option-bearing line beside it.
+          # ...nor does a line whose first operand was BARE. Stepping over `readonly AUX
+          # BASE=${TMPDIR:-/tmp}` to reach the assignment behind it is what lets that line
+          # disqualify; letting the same step CERTIFY would read a name the guard reached only by
+          # skipping something it does not model -- and the generated corpus caught exactly that,
+          # eight shapes of `declare AUX BASE=$(... pwd -P)` passing where main skipped the line
+          # whole. Stepping over is for taking away, like everything else the keyword buys here.
+          if (depth[i] == 0 && !append[i] &&
+              code[i] !~ /^[ \t]*readonly([ \t]|$)/ &&
+              code[i] !~ /^[ \t]*(local|declare|typeset|export|readonly)[ \t]+[-+]/) seen[key] = 1
           if (has_mktemp_d(head_of(code[i]))) {
             if (!answers_with_mktemp(head_of(code[i]))) { bad_assign[key] = 1; continue }
             if (scope_resolved(i, lead_var(template_of(head_of(code[i])))) || mkok[i]) continue
             bad_assign[key] = 1
-          } else if (!value_resolves(av[i], funcof[i])) {
+          } else if (!value_resolves(av[i], funcof[i]) || append[i] ||
+                     code[i] ~ /^[ \t]*(local|declare|typeset|export|readonly)[ \t]+[-+]/) {
+            # ...the option-bearing half of which is round 8'"'"'s rule finished. Round 8 stopped such a
+            # line CERTIFYING, on the ground that an option decides whether the mode assigns at all;
+            # the same ignorance says it cannot be trusted to leave a resolved root alone, because
+            # an option also decides what the stored value IS. `declare -l BASE=$(cd /tmp/UPPER &&
+            # pwd -P)` has a value that resolves on its face and stores the lowercased spelling,
+            # which on a case-insensitive or symlinked path is the alias this guard exists to
+            # refuse (ludics-lite#252 review round 10; `-l` is bash 4+, so the Ubuntu leg of CI is
+            # where it bites, not the 3.2 one). `-u` and `-i` transform a value the same way. So an
+            # option-bearing assignment is purely disqualifying: it can take a name away and never
+            # hand one over, which is what round 8 said and only half implemented. The cost is the
+            # one round 8 already named -- a root declared with a flag has to drop it to certify.
             bad_assign[key] = 1
           }
         }
@@ -697,6 +807,24 @@ for f in "${files[@]}"; do
     {
       line = code[FNR]
       if (!has_mktemp_d(line)) next
+      # `readonly` on the ALLOCATION, refused ahead of the capture check so it gets a message about
+      # the freeze rather than the generic one about an uncaptured call. The house shape is two
+      # adjacent lines, and `readonly` on the first makes the second impossible: the name is
+      # immutable from the moment the directory is made, so bash refuses the resolution with `TMP:
+      # readonly variable` and, with no `set -e`, every command below runs on the environment'"'"'s own
+      # spelling while the script still exits 0. A template that is already resolved does not save
+      # it either -- the same allocation under an earlier freeze of the same name runs mktemp, has
+      # its capture refused, and leaks the directory. Whether THAT earlier freeze is in force is not
+      # a question a scanner can answer: bash'"'"'s `readonly` inside a helper is global unless the name
+      # was localized, a definition above a call is not execution order, `readonly -f` freezes a
+      # function and not the variable, `TMP+=` freezes too, and a freeze inside `( ... )` is gone
+      # when the subshell exits. So the guard does not ask. It asks for the house shape instead,
+      # which is decidable from this line alone: capture plainly, resolve on the line below, and
+      # freeze afterwards with a bare `readonly` if the name should be immutable.
+      if (line ~ /^[ \t]*readonly[ \t]+/) {
+        refuse(FNR, "a `readonly` `mktemp -d`: the allocation freezes the name where the directory is made, so the resolution this guard asks for on the next line cannot run — bash refuses it with a `readonly variable` message and a nonzero status that no `set -e` here is catching, and every command below then uses the environment'"'"'s own spelling. Capture it plainly, resolve it with `VAR=$(CDPATH= cd \"$VAR\" && pwd -P)` on the line below, and freeze it after that with a bare `readonly VAR` if it should be immutable")
+        next
+      }
       # Captured means captured BY THIS ASSIGNMENT: the call has to sit inside the `$( ... )` the
       # line opens with, and a second one past that substitution is uncaptured whatever the line
       # begins with.

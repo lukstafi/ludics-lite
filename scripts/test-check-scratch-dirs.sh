@@ -278,6 +278,283 @@ mkdir -p "$TMP/bin"
 EOF
 expect "a declare/typeset capture is a capture" 0 "$CLEAN" -- "$CS" "$TMP/safe_declare.sh"
 
+# Round 4 of #252: `readonly` is read for what it takes AWAY and never for what it could grant, so
+# a `readonly` RESOLUTION is not a resolution -- refused here exactly as it is on main. Accepting it
+# certified a plain allocation whose assignments bash then refuses outright: under an earlier
+# `readonly TMP=old` this file runs mktemp, rejects both assignments, keeps `old`, leaks the
+# directory and can still exit 0. The resolver pattern does not check WHICH directory is
+# canonicalized either, so `readonly TMP=$(CDPATH= cd / && pwd -P)` read as a resolution too. Both
+# are the certifying direction, and the keyword does not get to work in it.
+probe bad_readonly_resolution <<'EOF'
+readonly TMP=old
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX")
+readonly TMP=$(CDPATH= cd "$TMP" && pwd -P)
+mkdir -p "$TMP/bin"
+EOF
+expect "a readonly resolution does not certify the allocation above it" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_readonly_resolution.sh"
+
+# ...and a root that is only ever assigned with `readonly` certifies nothing, which is main's
+# verdict too: a declaration inside `( ... )` is gone when the subshell exits, and parens move
+# neither `depth` nor `funcof`, so certifying from one would hand an outer allocation a root it
+# never got.
+probe bad_readonly_root_in_subshell <<'EOF'
+(
+  readonly BASE=$(CDPATH= cd /tmp && pwd -P)
+  echo "$BASE"
+)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a readonly root does not certify, in a subshell or out of one" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_readonly_root_in_subshell.sh"
+
+# Round 5 of #252, and the direction the guard is deliberately conservative in. A reassignment
+# inside `( ... )` is discarded when the subshell exits, so disqualifying the outer root over it
+# refuses a script that is in fact safe. The guard does it anyway, and has always done it: parens
+# move neither `depth` nor `funcof`, so every spelling it can READ disqualifies from inside a
+# subshell -- the plain assignment, `export`, `local`, `declare`, `typeset`. `readonly` passed on
+# main only because main could not see it at all, and making it behave like its four siblings is
+# this change. Exempting it instead would need to know the line is inside a subshell, which is the
+# paren tracking this file does not do (`${...}` and `$(...)` would have to be parsed out of the
+# count) -- and would have to loosen the other four to stay coherent, turning current refusals into
+# passes in the dangerous direction. The cost is one refusal of a safe shape whose remedy is the
+# line the guard wants anyway: resolve the allocation underneath it. This case pins the uniformity
+# so the asymmetry cannot come back by accident.
+probe bad_subshell_reassignment_uniform <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+(
+  readonly BASE=${TMPDIR:-/tmp}
+  echo "$BASE"
+)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a readonly reassignment in a subshell disqualifies, as every other spelling does" 1 \
+  "$REFUSAL" -- "$CS" "$TMP/bad_subshell_reassignment_uniform.sh"
+
+probe bad_subshell_reassignment_plain <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+(
+  export BASE=${TMPDIR:-/tmp}
+  echo "$BASE"
+)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "...which is what export already did, here as the control for that claim" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_subshell_reassignment_plain.sh"
+
+# Round 7 of #252: the keyword's own OPTIONS and the `--` terminator sit between it and the first
+# operand. `readonly -- BASE=...` and `declare -r BASE=...` are ordinary declarations that really do
+# overwrite BASE, and a pattern demanding the name immediately after the keyword skipped the whole
+# line. Read on the disqualifying side only: the capture and resolver patterns keep main's shape, so
+# an option cannot turn a `mktemp -d` line into a capture or a `pwd -P` line into a resolution.
+probe bad_option_terminator <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly -- BASE=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a -- terminator does not hide the assignment behind it" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_option_terminator.sh"
+
+probe bad_declare_r <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+declare -r BASE=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an attribute flag does not hide the assignment behind it" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_declare_r.sh"
+
+# ...while an option list with no assignment on it is not an assignment. `declare -p` and
+# `readonly -f name` name no variable value, and reading them as one would refuse working code.
+probe safe_option_without_assignment <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+helper() { :; }
+readonly -f helper
+declare -p BASE >/dev/null
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an option list with no assignment on it is not an assignment" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_option_without_assignment.sh"
+
+# Round 8 of #252: reading options (round 7) let an OPTION-BEARING declaration into the table, and
+# certifying from one assumes the option mode assigns. `declare -p` does not: it DISPLAYS each
+# name, so bash reports the expanded `BASE=/private/tmp` as a name it cannot find, BASE keeps
+# whatever it inherited, and the guard certified it anyway -- which main refuses, since main never
+# saw the line at all. Which modes assign is a table of every option of five builtins, and the
+# wrong entry certifies a root that was never set; so an option on the line means the line can take
+# a name away and never hand one over. Round 4's asymmetry, one axis over.
+probe bad_option_mode_certifies <<'EOF'
+declare -p BASE=$(cd /tmp && pwd -P)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an option-bearing declaration does not certify a root" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_option_mode_certifies.sh"
+
+# ...the same line without the flag does certify, which is what keeps the rule about OPTIONS rather
+# than about the keyword: a plain `declare BASE=$(... pwd -P)` assigns, and is the control for the
+# refusal above.
+probe safe_declare_root_no_option <<'EOF'
+declare BASE=$(CDPATH= cd /tmp && pwd -P)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a plain declare root still certifies" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_declare_root_no_option.sh"
+
+# ...and an option-bearing declaration still DISQUALIFIES, which is the half round 7 added: the two
+# directions are read differently on purpose.
+probe bad_option_mode_disqualifies <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+declare -r BASE=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "...while it still disqualifies, which is the asymmetry" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_option_mode_disqualifies.sh"
+
+# Round 9 of #252: `NAME+=v` appends and is an assignment like any other. `readonly BASE+=/../var`
+# turns a certified root into `/tmp/../var`, which no `pwd -P` in this repository spells that way.
+# The later-operand scan read `+=` from the start; the first operand did not, so whether the line
+# counted as an assignment depended on WHICH operand carried the append.
+probe bad_append_first_operand <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly BASE+=/../var
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an append in the first operand disqualifies the root it rewrites" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_append_first_operand.sh"
+
+# Round 10 of #252: an option-bearing assignment is purely DISQUALIFYING, which is round 8's rule
+# finished. Round 8 stopped such a line certifying, because an option decides whether the mode
+# assigns at all; the same ignorance says it cannot be trusted to leave a resolved root alone,
+# because an option also decides what the stored value IS. `declare -l` lowercases it (bash 4+, so
+# the Ubuntu leg of CI is where this bites and not the 3.2 one), `-u` uppercases, `-i` makes it
+# arithmetic -- and a lowercased path on a case-insensitive or symlinked tree is exactly the alias
+# this guard refuses. The value resolves on its face, so `bad_assign` stayed clear and the root
+# above survived.
+probe bad_option_transforms_value <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+declare -l BASE=$(CDPATH= cd /tmp && pwd -P)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an option-bearing assignment disqualifies even when its value looks resolved" 1 \
+  "$REFUSAL" -- "$CS" "$TMP/bad_option_transforms_value.sh"
+
+# ...and a DOUBLE-quoted operand is the same assignment, since quote removal happens before the
+# builtin sees it. Read here, where it only ever adds a name to disqualify. (The single-quoted
+# spelling is NOT read -- `blank_sq` has replaced its contents with `x` by then, which is what keeps
+# a `mktemp -d` inside a usage string from being a call; see the PR body.)
+probe bad_quoted_operand <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly "BASE=/var"
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a double-quoted operand is the same assignment" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_quoted_operand.sh"
+
+# Round 12 of #252, and the one genuine LOOSENING this branch produced -- main refuses this file.
+# An APPEND concatenates onto whatever the name already held, so its text is only the SUFFIX; round
+# 9 taught the first operand to read `+=` and then let the value judge the line by that suffix
+# alone. With BASE inherited from the environment naming a symlink, the certified path still
+# traverses it. An append can take a name away and never hand one over.
+probe bad_append_certifies <<'EOF'
+BASE+=$(CDPATH= cd /tmp && pwd -P)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an append never certifies, since its text is only the suffix" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_append_certifies.sh"
+
+# Rounds 13-14 of #252: the shapes that ended the operand-list scan. Reading a declaration's operand
+# LIST needs shell word splitting, and six rounds of trying produced, in both directions: a scan
+# that read past a `;` into the next command, one that matched assignment-shaped text inside a
+# quoted value, and one that took the assignment prefix of `A=x BASE=/var true` -- which bash scopes
+# to that one command -- for a persistent declaration. Each refused a correct file. The scan is
+# gone; only the first operand is read, which is what main reads too. These three are the
+# regression tests for its absence, and the list gap itself is filed in ludics-lite#258.
+probe safe_separator_ends_operand_list <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+export AUX=x; BASE=$(CDPATH= cd /tmp && pwd -P)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a command after a separator is not another operand" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_separator_ends_operand_list.sh"
+
+probe safe_assignment_shaped_text_in_value <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly AUX="use BASE=/var"
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "assignment-shaped text inside a quoted value is not an operand" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_assignment_shaped_text_in_value.sh"
+
+probe safe_command_env_prefix <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+A=x BASE=/var true
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "an assignment prefix is scoped to its command, not to the shell" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_command_env_prefix.sh"
+
+# ...and a quoted assignment-looking WORD with no declaration keyword is a command name, not an
+# assignment: bash runs it and assigns nothing, so certifying from it invented a root.
+probe bad_quoted_word_is_not_assignment <<'EOF'
+"BASE=$(CDPATH= cd /tmp && pwd -P)"
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a quoted word without a keyword is a command, not an assignment" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_quoted_word_is_not_assignment.sh"
+
+# ...while the quoted text the blanking exists to protect is still data: a usage string naming the
+# idiom is not an allocation, whatever keyword precedes it.
+probe safe_quoted_usage_after_readonly <<'EOF'
+readonly USAGE='write it as TMP=$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX")'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$USAGE $TMP"
+EOF
+expect "a usage string in a readonly constant is still data" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_quoted_usage_after_readonly.sh"
+
+# Round 3 of #252: and the guard does NOT try to work out whether an earlier `readonly` is in
+# force, which is why these two pass. `readonly -f TMP` freezes a FUNCTION named TMP and leaves the
+# variable alone, and a freeze inside `( ... )` is gone when the subshell exits; both files run
+# correctly, and a scanner that read either as a freeze would refuse working code.
+probe safe_readonly_f <<'EOF'
+BASE=$(CDPATH= cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+TMP() { :; }
+readonly -f TMP
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "readonly -f freezes a function, not the variable" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_readonly_f.sh"
+
+probe safe_readonly_in_subshell <<'EOF'
+BASE=$(CDPATH= cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+(
+  readonly TMP=old
+  echo "$TMP"
+)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a freeze inside a subshell does not outlive it" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_readonly_in_subshell.sh"
+
 # Round 4: `mktemp [OPTION]... [TEMPLATE]` -- the directory flag can sit anywhere in the option
 # list, bundled or spelled long, and a resolved one of any of those spellings passes.
 probe safe_option_spellings <<'EOF'
@@ -521,6 +798,61 @@ echo "$work"
 EOF
 expect "a resolved root that is reassigned no longer certifies what is under it" 1 "$REFUSAL" -- \
   "$CS" "$TMP/bad_reassigned_root.sh"
+
+# ...and the reassignment that un-resolves it can carry a declaration keyword. `readonly` was
+# missing from the alternation the assignment table and `resolved_below` spell, so this line was
+# not an assignment to the guard at all: it read the certified BASE above, never saw the spelling
+# that replaces it, and passed a root holding the environment's own /var path by the time mktemp
+# ran. The file is legal bash and it runs -- a plain assignment followed by a `readonly` one is
+# fine, and only a THIRD assignment would error -- so nothing else was going to catch it.
+probe bad_readonly_reassignment <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+readonly BASE=${TMPDIR:-/tmp}
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a readonly reassignment un-resolves the root it overwrites" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_readonly_reassignment.sh"
+
+# ...and the same file without that line is the control: the root above certifies its child, so
+# the refusal above is the `readonly` line and nothing else about the shape.
+probe safe_readonly_control <<'EOF'
+BASE=$(CDPATH= cd /tmp && pwd -P) || exit 1
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "the same file without the readonly line passes" 0 "$CLEAN" -- \
+  "$CS" "$TMP/safe_readonly_control.sh"
+
+# Rounds 1-3 of #252: `readonly` on the ALLOCATION, which is the half of the keyword that reading
+# it opened. The house shape is two adjacent lines, and `readonly` on the first makes the second
+# impossible -- the name is immutable from the moment the directory is made, so bash refuses the
+# resolution with `TMP: readonly variable` and, with no `set -e`, every command below runs on the
+# environment's spelling while the script exits 0. Verified: before this rule the first file passed
+# the guard and printed a `/var/...` path.
+probe bad_readonly_allocation <<'EOF'
+readonly TMP=$(mktemp -d "${TMPDIR:-/tmp}/probe.XXXXXX")
+TMP=$(CDPATH= cd "$TMP" && pwd -P)
+echo "$TMP"
+EOF
+expect "a readonly allocation cannot be resolved by the line below it" 1 'freezes the name' -- \
+  "$CS" "$TMP/bad_readonly_allocation.sh"
+
+# ...and a resolved template does not save it: under an earlier freeze of the same name the call
+# still runs, its capture is still refused, and the directory is still leaked (`TMP is: old`). The
+# guard refuses on the keyword alone rather than working out whether that earlier freeze is in
+# force -- which is not a question a scanner can answer, since bash's `readonly` inside a helper is
+# global unless the name was localized, a definition above a call is not execution order,
+# `readonly -f` freezes a function and not the variable, `TMP+=` freezes too, and a freeze inside
+# `( ... )` is gone when the subshell exits. One textual rule settles every one of those.
+probe bad_readonly_allocation_rooted <<'EOF'
+BASE=$(CDPATH= cd "${TMPDIR:-/tmp}" && pwd -P) || exit 1
+readonly TMP=old
+readonly TMP=$(mktemp -d "$BASE/x.XXXXXX")
+echo "$TMP"
+EOF
+expect "a readonly allocation is refused even over a resolved root" 1 'freezes the name' -- \
+  "$CS" "$TMP/bad_readonly_allocation_rooted.sh"
 
 # Round 1: the use can share the assignment's own line, and the resolution below does not reach a
 # command that already ran.
