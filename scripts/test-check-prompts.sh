@@ -996,11 +996,15 @@ EOF
   # carrying a letter GitHub keeps, whose anchor the check will not guess at -- so it contributes
   # no slug rather than the ASCII residue `caf`.
   printf '## Close \342\200\224 out\n\nPunctuation GitHub drops.\n\n' >> "$R/alpha/references/notes.md"
-  printf '## Caf\303\251\n\nA letter GitHub keeps.\n\n' >> "$R/alpha/references/notes.md"
-  # A heading GitHub slugs by its RENDERED text (`foo`), which is not its source.
-  printf '## [Foo](https://example.invalid)\n\nInline link syntax.\n' >> "$R/alpha/references/notes.md"
   printf 'A parenthesized filename.\n' > "$R/alpha/references/a_(b).md"
 }
+# links_nonascii <file>: appends a heading carrying a letter GitHub keeps, whose anchor this check
+# will not guess at. Appended by the probes that mean it, for the same reason as the next helper.
+links_nonascii() { printf '\n## Caf\303\251\n\nA letter GitHub keeps.\n' >> "$R/$1"; }
+# links_unspellable: appends a heading GitHub slugs by its RENDERED text (`foo`), which is not its
+# source. It goes on the END of a file on purpose -- it suppresses the numbering after it -- so
+# probes about ordinary headings add it only when they mean to.
+links_unspellable() { printf '\n## [Foo](https://example.invalid)\n\nInline link syntax.\n' >> "$R/$1"; }
 # links_body <file> <line...>: appends Markdown to a file in the scratch tree.
 links_body() { local f="$1"; shift; printf '%s\n' "$@" >> "$R/$f"; }
 
@@ -1149,6 +1153,7 @@ links_tree
 links_body alpha/SKILL.md 'See [an em dash dropped](references/notes.md#close--out).'
 expect "the punctuation GitHub drops is dropped here too" 0 '(1 checked)' -- "$CP" "$R"
 links_tree
+links_nonascii alpha/references/notes.md
 links_body alpha/SKILL.md 'See [the ASCII residue](references/notes.md#caf).'
 expect "a heading carrying a letter past ASCII spells no anchor, so its residue answers for none" 1 \
   'will not spell an anchor for' -- "$CP" "$R"
@@ -1182,10 +1187,12 @@ expect "outside the shape, so not read: a destination in angle brackets" 0 '0 fa
 # there and `foohttpsexampleinvalid` here, so the source reading both refuses the right anchor and
 # accepts one GitHub never creates. Such a heading spells no anchor at all (round 2, P2).
 links_tree
+links_unspellable alpha/references/notes.md
 links_body alpha/SKILL.md 'See [the source reading](references/notes.md#foohttpsexampleinvalid).'
 expect "a heading carrying inline link syntax accepts no anchor from its source" 1 \
   'will not spell an anchor for' -- "$CP" "$R"
 links_tree
+links_unspellable alpha/references/notes.md
 links_body alpha/SKILL.md 'See [the rendered reading](references/notes.md#foo).'
 expect "...and says so rather than answering for the rendered one either" 1 \
   'will not spell an anchor for' -- "$CP" "$R"
@@ -1210,6 +1217,101 @@ links_body alpha/SKILL.md 'See [a link out of a parent](linked/notes.md).'
 expect "...and so is one reached through a symlinked parent" 1 \
   'reached through a symbolic link: alpha/linked/notes.md' -- "$CP" "$R"
 rm -rf "$TMP/outside.md" "$TMP/elsewhere"
+
+# A candidate REJECTED for any reason must not consume the line either -- round 2 fixed only the
+# one whose parens never closed. `Token ]( prose [guide](missing.md).)` balances its parens around
+# the real link, so the cursor jumped past the closing one and swallowed it (round 3, P2). Only an
+# accepted link advances the cursor past itself now.
+links_tree
+links_body alpha/SKILL.md 'Token ]( prose [the guide](references/gone.md).)'
+expect "a rejected candidate does not swallow the link nested inside it" 1 \
+  'resolves to no file: alpha/references/gone.md' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'A [titled one](references/notes.md "T") then [a real one](references/gone.md).'
+expect "...and neither does a title, which is rejected for a different reason" 1 \
+  'resolves to no file: alpha/references/gone.md' -- "$CP" "$R"
+
+# The two shapes beyond link syntax whose RENDERED text differs from their source. Each is tested
+# narrowly, so the far commoner literal readings -- where both sides agree -- keep working
+# (round 3, P2).
+links_tree
+printf '\n## <em>Foo</em>\n\nAn HTML tag.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [the source of a tag](references/notes.md#emfooem).'
+expect "a heading carrying an HTML tag spells no anchor from its source" 1 \
+  'will not spell an anchor for' -- "$CP" "$R"
+links_tree
+printf '\n## A &amp; B\n\nAn entity.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [the source of an entity](references/notes.md#a-amp-b).'
+expect "...and neither does one carrying a character entity" 1 \
+  'will not spell an anchor for' -- "$CP" "$R"
+links_tree
+printf '\n## A < B and Launch & supervise\n\nLiteral, on both sides.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [literal punctuation](references/notes.md#a--b-and-launch--supervise).'
+expect "...while a bare < or & is text to both readings and still slugs" 0 '(1 checked)' -- "$CP" "$R"
+
+# A tab inside a heading is a control character GitHub REMOVES before it hyphenates spaces, so
+# `## Foo<TAB>Bar` is `foobar` there; hyphenating it approved an anchor that does not exist and
+# refused the one that does (round 3, P2).
+links_tree
+printf '\n## Foo\tBar\n\nAn internal tab.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a tab removed](references/notes.md#foobar).'
+expect "an internal tab is removed, not turned into a hyphen" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## Foo\tBar\n\nAn internal tab.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a tab hyphenated](references/notes.md#foo-bar).'
+expect "...so the hyphenated reading names no heading" 1 "GitHub slug is 'foo-bar'" -- "$CP" "$R"
+
+# A heading this check will not spell still OCCUPIES a slug on GitHub, and the numbering is
+# occupancy-based: `## [Foo](…)` then `## Foo` are `foo` and `foo-1` there. Reading the second as
+# `foo` both refused the good link and answered the other anchor with the wrong heading, so from
+# the first unspellable heading on, no further slug in that file is reported (round 3, P2).
+links_tree
+links_unspellable alpha/references/notes.md
+printf '\n## Foo\n\nThe heading GitHub numbers past the refused one.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [the unnumbered reading](references/notes.md#foo).'
+expect "a heading after an unspellable one is not reported under the name it would have taken" 1 \
+  'will not spell an anchor for' -- "$CP" "$R"
+links_tree
+links_unspellable alpha/references/notes.md
+printf '\n## Foo\n\nThe heading GitHub numbers past the refused one.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [the numbered reading](references/notes.md#foo-1).'
+expect "...nor under the one GitHub would give it, since which it takes is not knowable here" 1 \
+  'will not spell an anchor for' -- "$CP" "$R"
+links_tree
+links_unspellable alpha/references/notes.md
+links_body alpha/SKILL.md 'See [a heading standing before it](references/notes.md#close-out).'
+expect "...while a heading BEFORE it keeps its name, which nothing later can move" 0 '(1 checked)' -- "$CP" "$R"
+
+# The guards belong where the target is first TOUCHED. The prepass that builds the slug table
+# probed and read anchored targets before the loop below refused them, so a link out of the
+# checkout still had its host file opened and scanned (round 3, P2). The probe plants a real file
+# with a real heading at both destinations, so a prepass that still read them would find the
+# anchor and turn the refusal into a pass.
+links_tree
+printf '# Outside\n\n## Planted\n' > "$TMP/outside.md"
+ln -s "$TMP/outside.md" "$R/alpha/references/linked.md"
+links_body alpha/SKILL.md 'See [an anchored link out](references/linked.md#planted).'
+expect "an anchored symlinked target is refused before its headings are read" 1 \
+  'reached through a symbolic link: alpha/references/linked.md' -- "$CP" "$R"
+links_tree
+links_body alpha/references/notes.md 'See [an anchored climb out](../../../outside.md#planted).'
+expect "...and so is an anchored target that climbs past the root" 1 \
+  'resolves outside the checkout: ../outside.md' -- "$CP" "$R"
+rm -f "$TMP/outside.md"
+
+# A heading inside a blockquote is a heading: GFM renders `> ## Foo` with the anchor `foo`, and
+# skipping it refused a link that works (round 3, P2). A list item is deliberately not read -- that
+# needs the block model this file does not have -- so such a link is refused, loudly, rather than
+# answered for a heading that is not there.
+links_tree
+printf '\n> ## Quoted heading\n>\n> In a blockquote.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a quoted heading](references/notes.md#quoted-heading).'
+expect "an ATX heading inside a blockquote is a heading" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n- ## Listed heading\n\n  In a list item.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a listed heading](references/notes.md#listed-heading).'
+expect "...while one inside a list item is refused rather than guessed at" 1 \
+  "GitHub slug is 'listed-heading'" -- "$CP" "$R"
 
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.

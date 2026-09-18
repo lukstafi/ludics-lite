@@ -957,13 +957,15 @@ md_links() {
           if (c == "(") depth++
           else if (c == ")" && --depth == 0) { j = k; break }
         }
-        # Not `break`: an unbalanced `](` is a FALSE candidate -- `the token \]( is documented`
-        # before a real link on the same line -- and abandoning the line there left the real link
-        # unread and the run green. The cursor has already advanced past this one, so resuming
-        # finds the next; progress is guaranteed because each pass shortens the line.
+        # The cursor now stands just past this `](`, and it STAYS there for every candidate this
+        # pass does not accept -- whether the parens never close or the target is refused below.
+        # A false `](` is a false candidate, and everything after it on the line is still text to
+        # read: `Token ]( prose [guide](missing.md).)` balances its parens around the real link,
+        # so advancing past the closing one swallowed that link and the run came out green.
+        # Only an ACCEPTED link advances the cursor past itself. Progress holds either way,
+        # because each pass has already shortened the line by the `](` it stepped over.
         if (j == 0) continue
         target = substr(line, 1, j - 1)
-        line = substr(line, j + 1)
         if (target ~ /[[:space:]]/) continue       # a titled link, say: outside the form
         if (target ~ /^[A-Za-z][A-Za-z0-9+.-]*:/) continue    # a URI scheme: not a path here
         if (substr(target, 1, 1) == "/") continue             # nor is an absolute path
@@ -979,6 +981,7 @@ md_links() {
         # like a titled one. The cost is that a file whose name needs escaping goes unchecked; the
         # names in this checkout are dashed and lowercase, and that is the convention to keep.
         if (target ~ /[^A-Za-z0-9._\/()~+#-]/) continue
+        line = substr(line, j + 1)                 # accepted: the cursor may pass the whole link
         print rel "\t" target "\t" resolve(dir, path) "\t" anchor
       }
     }
@@ -1019,6 +1022,14 @@ heading_slugs() {
     }
     {
       line = $0
+      # A blockquote marker before the heading is the container, not the heading: GFM renders
+      # `> ## Foo` as a heading with the anchor `foo`, and skipping it refused a link that works.
+      # A run of them is stripped, which is the whole of the block model this reads. A heading
+      # inside a LIST item is deliberately not read -- whether `- ## Foo` opens one depends on the
+      # list indentation and continuation rules around it, which is the block parser this file
+      # does not have -- and such a link is refused, loudly and naming the anchor, never accepted
+      # for a heading that is not there.
+      sub(/^[[:space:]]*(>[[:space:]]*)+/, "", line)
       # An ATX heading, by GFM: up to three leading spaces, one to six hashes, then a blank. The
       # counts are walked rather than matched, since an ERE interval is not something every awk on
       # the fleet reads alike.
@@ -1030,7 +1041,15 @@ heading_slugs() {
       if (rest !~ /^[ \t]/) next                   # `#tag` is text to GFM, not a heading
       sub(/[ \t]+#+[ \t]*$/, "", rest)             # the optional closing run of hashes
       s = slug(rest)
-      if (s == "!") { print prefix "!" rest; next }   # a heading this check will not spell
+      # A heading this check will not spell still OCCUPIES a slug on GitHub, and the numbering is
+      # occupancy-based: `## [Foo](…)` then `## Foo` are `foo` and `foo-1` there, so reading the
+      # second as `foo` both refuses the good link to `#foo-1` and answers `#foo` with the wrong
+      # heading. Which rendered slug it occupies is exactly what this check cannot know, so from
+      # the first such heading on, the numbering in this file is not knowable and no further slug
+      # is reported. Headings BEFORE it are untouched -- nothing later can move their names -- and
+      # the one `!` line tells a miss below why the rest of the file went quiet.
+      if (s == "!") { if (refused == 0) print prefix "!" rest; refused = 1; next }
+      if (refused) next
       if (s == "") next
       # The numbering GitHub does is a LOOP over free names, not a counter per base: a candidate
       # already taken takes the next `-<n>` that is not, so `# Foo`, `# Foo-1`, `# Foo` give `foo`,
@@ -1049,19 +1068,33 @@ heading_slugs() {
     # right anchor, it would ACCEPT the wrong one: `#caf` would answer for that heading. So such a
     # heading contributes no slug at all, and a link that means it is refused, with the reason.
     function slug(h,   i, c, out) {
-      # Inline link, image or reference syntax: GitHub slugs the RENDERED text of a heading and
-      # this reads its SOURCE. `## [Foo](https://example.com)` is `foo` there and
-      # `foohttpsexamplecom` here -- which refuses the right anchor and accepts one GitHub never
-      # creates. Rendering it means a Markdown parser, so a heading carrying either shape is one
-      # this check will not spell. Literal brackets are untouched: `## Notes [draft]` renders as
-      # its source and slugs to `notes-draft` on both sides.
+      # A heading whose RENDERED text differs from its SOURCE is one this check will not spell:
+      # GitHub slugs what it renders, and rendering means a Markdown parser. Three shapes do that,
+      # and they are tested narrowly so the far commoner literal readings keep working --
+      #   - inline link, image or reference syntax (`## [Foo](https://example.com)` is `foo`
+      #     there and `foohttpsexamplecom` here), while a literal `## Notes [draft]` renders as
+      #     its source and slugs to `notes-draft` on both sides;
+      #   - an HTML tag or an autolink, `<` before a letter or a `/!?` (`## <em>Foo</em>` is
+      #     `foo` there and `emfooem` here), while a literal `## A < B` renders as its source and
+      #     gives `a--b` on both sides;
+      #   - a character entity, `&<name>;` (`## A &amp; B` renders `A & B` and gives `a--b`,
+      #     where the source reading gives `a-amp-b`), while a bare `## Launch & supervise` is
+      #     text on both sides.
+      # Emphasis, strong and code spans need no test: their markers are punctuation that both
+      # readings drop, so `## **Bold** text` and `## `code` here` already agree.
       if (index(h, "](") > 0 || index(h, "][") > 0) return "!"
+      if (h ~ /<[A-Za-z\/!?]/) return "!"
+      if (h ~ /&[A-Za-z0-9#]+;/) return "!"
       h = tolower(h)                               # ASCII only, by locale, as GitHub folds ASCII
       sub(/^[ \t]+/, "", h); sub(/[ \t]+$/, "", h)
       out = ""
       for (i = 1; i <= length(h); i++) {
         c = substr(h, i, 1)
-        if (c == " " || c == "\t") { out = out "-"; continue }
+        # Only a literal SPACE becomes a hyphen. A tab is a control character, which the slugger
+        # removes before it replaces spaces, so `## Foo<TAB>Bar` is `foobar` there -- hyphenating
+        # it approved a `#foo-bar` that does not exist and refused the `#foobar` that does. It
+        # falls through to the ASCII drop below.
+        if (c == " ") { out = out "-"; continue }
         if (c ~ /^[a-z0-9_-]$/) { out = out c; continue }
         if (c in ascii) continue                   # ASCII punctuation, which GitHub drops
         if (substr(h, i, 3) in punctuation) { i += 2; continue }
@@ -1110,7 +1143,14 @@ check_links() {
   # A prompt that points eight times into one reference would otherwise re-read it eight times.
   wanted=$(printf '%s' "$all" | awk -F"$tab" '$4 != "" { print $3 }' | sort -u)
   while IFS= read -r t; do
-    [ -n "$t" ] && [ -f "$ROOT/$t" ] || continue
+    [ -n "$t" ] || continue
+    # The same two guards the report loop applies, applied HERE as well, because this is where the
+    # target is first touched: a prepass that probed and then read a target the loop below was
+    # about to refuse would have opened the host file the guards exist to keep out, and the
+    # refusal afterwards would come too late to matter.
+    case "$t" in .. | ../*) continue ;; esac
+    symlinked "$t" && continue
+    [ -f "$ROOT/$t" ] || continue
     slugs="$slugs$(heading_slugs "$ROOT/$t" "$t$tab")$nl"
   done <<<"$wanted"
   # A tab at a time, and line by line: a path may hold a blank, and splitting on one would read a

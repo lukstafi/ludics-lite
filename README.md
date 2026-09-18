@@ -356,7 +356,11 @@ refused on the path rather than probed, so no file beside the checkout can make 
 read as resolving. There is no
 inline-code or fenced-code scope either, deliberately and at a cost paid in this very paragraph:
 prose that spells a whole link in backticks is read as that link, so documentation of the syntax
-has to describe it rather than write one. `test-check-prompts.sh` runs it against scratch trees,
+has to describe it rather than write one. On the other side, a heading whose rendered text differs
+from its source — inline link syntax, an HTML tag, a character entity — or which carries a letter
+past ASCII, is one whose anchor it will not spell: it reports no slug and says so, rather than
+answering with the source reading, which would refuse the right anchor and accept one GitHub never
+creates. `test-check-prompts.sh` runs it against scratch trees,
 one per defect, with the well-formed tree as the control, and ends by running it on this checkout.
 
 `check-jq-shapes.sh` is the jq shape guard, run in the lint job on every head over every
