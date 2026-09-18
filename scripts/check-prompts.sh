@@ -1037,6 +1037,7 @@ heading_slugs() {
       for (n = 91; n <= 96; n++) escapable[sprintf("%c", n)] = 1
       for (n = 123; n <= 126; n++) escapable[sprintf("%c", n)] = 1
       bom = sprintf("%c%c%c", 239, 187, 191)
+      cr = sprintf("%c", 13)
     }
     {
       line = $0
@@ -1044,6 +1045,11 @@ heading_slugs() {
       # anything -- so the first heading of a file that carries one is a heading, and leaving the
       # bytes in front of its hashes refused a link that works.
       if (FNR == 1 && index(line, bom) == 1) line = substr(line, 4)
+      # A carriage return is the other half of a CRLF line ending, not content: awk splits on the
+      # LF and leaves it standing. It defeated the closing-hash rule outright -- `## Foo ##<CR>`
+      # kept the blank before the hashes and slugged to `foo-`, refusing `#foo` and accepting a
+      # `#foo-` that is not there -- and it turned every trailing blank into a hyphen besides.
+      if (substr(line, length(line), 1) == cr) line = substr(line, 1, length(line) - 1)
       # A blockquote marker before the heading is the container, not the heading: GFM renders
       # `> ## Foo` as a heading with the anchor `foo`, and skipping it refused a link that works.
       # A run of them is stripped, which is the whole of the block model this reads -- and with
@@ -1060,7 +1066,12 @@ heading_slugs() {
         indent = 0; while (substr(line, indent + 1, 1) == " ") indent++
         if (indent > 3 || substr(line, indent + 1, 1) != ">") break
         line = substr(line, indent + 2)
-        if (substr(line, 1, 1) == " ") line = substr(line, 2)
+        # The one space the marker takes may be written as a tab, which GFM expands to the next
+        # tab stop: `><TAB>## Foo` is a heading with two columns of indentation left over, well
+        # inside the three the ATX rule allows. Leaving the tab in place hid the hashes and
+        # refused a link that works. A SECOND tab is not taken, and needs none to be: it leaves
+        # six columns, which is an indented code block, and the ATX test below refuses it anyway.
+        if (substr(line, 1, 1) == " " || substr(line, 1, 1) == "\t") line = substr(line, 2)
       }
       # An ATX heading, by GFM: up to three leading spaces, one to six hashes, then a blank. The
       # counts are walked rather than matched, since an ERE interval is not something every awk on
@@ -1229,6 +1240,31 @@ symlinked() {
   return 1
 }
 
+# cased <relpath>: whether every component of <relpath> is spelled as the checkout spells it. On
+# a case-insensitive filesystem -- the macOS default, and this suite runs on macOS and on Ubuntu
+# both -- `-f` answers yes for a link to `References/Notes.md` over a `references/notes.md`, while
+# GitHub serves that link as a 404. Unchecked, the same head passes on one runner and fails on the
+# other, and the verdict is about the box rather than about the prompts: the same class as the
+# `..` and symlink guards above.
+# Read with a GLOB rather than with `ls`, so a path still costs no process: the kernel matches a
+# name case-insensitively, but the shell compares the names a directory actually holds, and it
+# compares them exactly.
+cased() {
+  local rest="$1" parent="" seg entry found
+  while [ -n "$rest" ]; do
+    seg=${rest%%/*}
+    if [ "$seg" = "$rest" ]; then rest=""; else rest=${rest#*/}; fi
+    [ -n "$seg" ] || continue
+    found=0
+    for entry in "$ROOT${parent:+/$parent}"/*; do
+      [ "${entry##*/}" = "$seg" ] && { found=1; break; }
+    done
+    [ "$found" -eq 1 ] || return 1
+    parent="${parent:+$parent/}$seg"
+  done
+  return 0
+}
+
 check_links() {
   local rel dir links all="" wanted t target resolved anchor slugs="" hint nl tab count=0 bad=0
   nl=$'\n'; tab=$(printf '\t')
@@ -1261,6 +1297,7 @@ check_links() {
     case "$t" in .. | ../*) continue ;; esac
     symlinked "$t" && continue
     [ -f "$ROOT/$t" ] || continue
+    cased "$t" || continue
     slugs="$slugs$(heading_slugs "$ROOT/$t" "$t$tab")$nl"
   done <<<"$wanted"
   # A tab at a time, and line by line: a path may hold a blank, and splitting on one would read a
@@ -1280,6 +1317,10 @@ check_links() {
     fi
     if [ ! -f "$ROOT/$resolved" ]; then
       ko "$rel" "link to $target resolves to no file: $resolved"; bad=1; continue
+    fi
+    if ! cased "$resolved"; then
+      ko "$rel" "link to $target finds $resolved only on a case-insensitive filesystem; the checkout spells that path differently, and GitHub serves the link as written"
+      bad=1; continue
     fi
     [ -n "$anchor" ] || continue
     # The anchor is compared as TEXT and in full, the way `indexed` compares a name: a `.` in an

@@ -354,7 +354,9 @@ reference-style link, a target that wrapped onto the next line — is not checke
 guessed at. What it will not do is answer about the machine instead of the prompts: a path that
 spells its way out of the checkout, and one that walks out through a symbolic link, are both
 refused on the path rather than probed, so no file beside the checkout can make an outside link
-read as resolving. There is no
+read as resolving; and a path is checked against the spelling the checkout actually has, since a
+case-insensitive filesystem — the macOS default, and these suites run on macOS and Ubuntu both —
+resolves a link GitHub serves as a 404. There is no
 block scope either — no fences, no HTML blocks, no comments — deliberately, and at a cost paid in
 this very paragraph: prose that spells a whole link in backticks is read as that link, so
 documentation of the syntax has to describe it rather than write one. The other direction of that

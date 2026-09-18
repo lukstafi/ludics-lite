@@ -1434,6 +1434,39 @@ printf '\357\273\277# Marked\n\n## Close-out\n' > "$R/alpha/references/marked.md
 links_body alpha/SKILL.md 'See [past a byte-order mark](references/marked.md#marked).'
 expect "a byte-order mark does not hide the first heading of a file" 0 '(1 checked)' -- "$CP" "$R"
 
+# The one space a blockquote marker takes may be written as a tab, which GFM expands to the next
+# tab stop: `><TAB>## Foo` is a heading with two columns of indentation left, well inside the
+# three the ATX rule allows. Leaving the tab in place hid the hashes (round 7, P2).
+links_tree
+printf '\n>\t## Tabbed quote\n>\n> A tab where the space would be.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a tab after the marker](references/notes.md#tabbed-quote).'
+expect "a tab may stand for the space a blockquote marker takes" 0 '(1 checked)' -- "$CP" "$R"
+
+# A carriage return is the other half of a CRLF line ending, not content -- awk splits on the LF
+# and leaves it standing. It defeated the closing-hash rule outright, slugging `## Foo ##<CR>` to
+# `foo-`: refusing `#foo` and accepting a `#foo-` that is not there (round 7, P2).
+links_tree
+printf '\n## Closed off ##\r\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [past a carriage return](references/notes.md#closed-off).'
+expect "a CRLF line ending does not join the closing hashes to the heading" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## Closed off ##\r\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [the reading with it](references/notes.md#closed-off-).'
+expect "...so the reading that keeps it names no heading" 1 "GitHub slug is 'closed-off-'" -- "$CP" "$R"
+
+# A case-insensitive filesystem -- the macOS default, and this suite runs on macOS and on Ubuntu
+# both -- answers `-f` yes for a link whose spelling the checkout does not have, while GitHub
+# serves that link as a 404. Unchecked, the same head passes on one runner and fails on the other
+# (round 7, P2). The probe is written so it MEANS something on either: on a case-sensitive box the
+# path does not exist at all, so the refusal is asserted by the half of the message both share.
+links_tree
+links_body alpha/SKILL.md 'See [a mis-cased path](references/Notes.md).'
+expect "a link the checkout spells differently is refused, however the filesystem answers" 1 \
+  'alpha/SKILL.md: link to references/Notes.md' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'See [the spelling it has](references/notes.md).'
+expect "...while the spelling the checkout has resolves" 0 '(1 checked)' -- "$CP" "$R"
+
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.
 fresh "$R"
