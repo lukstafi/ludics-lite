@@ -30,6 +30,10 @@
 #     commands issued;
 #   - that the checkout side is validated BEFORE any branch that would publish it, the
 #     not-installed and symlinked-installation branches included;
+#   - that a routine file whose name carries a newline is published under the name it has and is
+#     not deleted by the pruning pass, `find` being a line-wise producer the way git's path
+#     listings were before PR #215 -- with a leftover of the same shape as the control that the
+#     pruning still works, and a bystander in the caller's working directory that must survive;
 #   - that two modes in one invocation are a usage error, since push and pull write in opposite
 #     directions and the last token used to win;
 #   - that a RETIRED routine still installed on a box is reported rather than passed over -- the
@@ -987,6 +991,67 @@ out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/broken-installed" "$BROKEN/scripts/sy
 [ "$rc" -eq 0 ] && contains "$out" 'pushed to' \
   && ok "...while the same copy publishes cleanly with nothing in the way" \
   || ko "the guard-less copy fails even a plain push (rc=$rc) -- the control above is not about the guard: $out"
+
+# --- a routine file whose name carries a newline -------------------------------------------------
+# `find -print` hands out one path per LINE, so such a name arrives as two paths: the staging loop
+# copies a source path that does not exist, and the pruning loop `rm -f`s the two halves instead
+# of the file -- the second half RELATIVE to the caller's working directory, since stripping the
+# "$dst" prefix off a path that no longer begins with it leaves the bare tail. PR #215 fixed this
+# hazard where git produced the paths; the producer here is find, so it was fixed separately.
+# The names are built once, so every case below means the same file.
+NL_NAME=$'two\nlines.md'
+SP_NAME=' spaced name.md'
+reset_trees; install_all
+printf 'an asset whose name holds a newline\n' > "$REPO/routines/$R1/$NL_NAME"
+printf 'an asset whose name holds leading and trailing spaces\n' > "$REPO/routines/$R1/$SP_NAME"
+expect "push publishes a file whose name contains a newline" 0 "$R1: pushed to" -- run_sync push
+[ -f "$TMP/installed/$R1/$NL_NAME" ] \
+  && ok "...under the name it has, not one the split invented" \
+  || ko "no such file installed -- the directory holds: $(ls -b "$TMP/installed/$R1" | tr '\n' ' ')"
+[ ! -e "$TMP/installed/$R1/two" ] && [ ! -e "$TMP/installed/$R1/lines.md" ] \
+  && ok "...and neither half of the name was published as a file of its own" \
+  || ko "a split half was published: $(ls -b "$TMP/installed/$R1" | tr '\n' ' ')"
+contains "$(cat "$TMP/installed/$R1/$NL_NAME" 2>/dev/null)" 'holds a newline' \
+  && ok "...carrying the source file's bytes" \
+  || ko "the published copy is not the source file"
+[ -f "$TMP/installed/$R1/$SP_NAME" ] \
+  && ok "...and a name with leading and trailing spaces is published untrimmed" \
+  || ko "the spaced name did not survive: $(ls -b "$TMP/installed/$R1" | tr '\n' ' ')"
+expect "...leaving status clean" 0 "all local routines in sync" -- run_sync
+
+# The pruning pass is the destructive half of a publish: it walks the DESTINATION and removes what
+# the source no longer has. Make it run with the newline-named file present at both ends -- an
+# edit elsewhere in the routine is what gets publish_dir called at all -- and the file must still
+# be there afterwards.
+printf 'body v2\n' >> "$REPO/routines/$R1/SKILL.md"
+expect "a later push does not prune the newline-named file it published" 0 "$R1: pushed to" -- \
+  run_sync push
+[ -f "$TMP/installed/$R1/$NL_NAME" ] \
+  && ok "...the file is still installed after the pruning pass" \
+  || ko "the pruning pass deleted a file the checkout has: $(ls -b "$TMP/installed/$R1" | tr '\n' ' ')"
+grep -q 'body v2' "$TMP/installed/$R1/SKILL.md" \
+  && ok "...and the edit that occasioned the push landed" \
+  || ko "the push did not update SKILL.md, so the pruning pass above may not have run"
+
+# ...and it must still prune such a file when the checkout drops it, so the case above is not
+# passing because the pruning stopped working on these names. The decoy is the other half of the
+# old defect: the tail of a split path is RELATIVE, so `rm -f` aimed it at whatever sits under
+# that name in the caller's working directory.
+reset_trees; install_all
+printf 'a leftover the checkout does not have\n' > "$TMP/installed/$R1/$NL_NAME"
+DECOY="$TMP/decoy"
+mkdir -p "$DECOY"
+printf 'a bystander in the working directory the push is run from\n' > "$DECOY/lines.md"
+out=$(cd "$DECOY" && env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/installed" "$SR" push 2>&1); rc=$?
+[ "$rc" -eq 0 ] && contains "$out" "$R1: pushed to" \
+  && ok "a push prunes a leftover whose name contains a newline" \
+  || ko "the push over the leftover exited $rc -- $out"
+[ ! -e "$TMP/installed/$R1/$NL_NAME" ] \
+  && ok "...removing it from the installation" \
+  || ko "the leftover survived: $(ls -b "$TMP/installed/$R1" | tr '\n' ' ')"
+[ -f "$DECOY/lines.md" ] \
+  && ok "...and nothing under the caller's working directory was removed" \
+  || ko "the prune deleted $DECOY/lines.md, which no publish has any business touching"
 
 # The post-condition itself: a publish that leaves an unusable destination must not report success.
 # Negative control by construction -- the same publish over a source that IS usable succeeds.

@@ -180,7 +180,7 @@ first_symlinked_ancestor() {
 #     is a leftover, not a routine, and pulling from it would replace the checkout's prompt
 #     with nothing.
 prompt_problem() {
-  local dir=$1 link problem
+  local dir=$1 link l problem
   # The two ways a prompt directory is not even a directory. Both matter on the SOURCE side,
   # where `pull` is the repair: a deleted routine and one someone linked out of the tree are
   # exactly what a pull should be able to restore from a usable installed copy.
@@ -192,7 +192,10 @@ prompt_problem() {
     printf 'is not a directory\n'
     return 0
   fi
-  link=$(find "$dir" -type l -print 2>/dev/null | head -n 1)
+  # NUL-delimited, and only the first record: a link whose own name holds a newline would be
+  # reported truncated by `-print | head -n 1`, and a name is exactly what this line is for.
+  link=""
+  while IFS= read -r -d '' l; do link=$l; break; done < <(find "$dir" -type l -print0 2>/dev/null)
   if [ -n "$link" ]; then
     printf 'holds a symlink (%s -> %s), and the scheduler refuses any component of the path\n' \
       "$link" "$(readlink "$link")"
@@ -228,8 +231,12 @@ prompt_problem() {
 # which rename(2) does make atomic, and only then is what src no longer has removed. A file is
 # therefore never absent, only briefly old.
 #
-# Paths are read from `find` a line at a time, so a newline in a routine's filename would split;
-# these trees are a checkout's tracked prompts and a scheduler's copies of them.
+# Paths come off `find` NUL-delimited and are read with `read -d ""`. A line at a time is what
+# this did, and a newline in a routine's filename split one path into two: the staging loop below
+# would `cp` a path that does not exist, and the pruning loop would `rm -f` the halves -- the
+# second of them relative to the caller's working directory, since stripping the `$dst` prefix
+# off a path that no longer starts with it leaves the name alone. Same hazard, and same fix, as
+# PR #215 made for git's `--porcelain`/`ls-files` output; the producer here is `find`.
 # Every step is checked. publish_dir is called as the condition of an `if`, which suspends
 # `set -e` for the whole dynamic extent of the call, so an unchecked `cp` or `mv` that failed --
 # a full or unwritable destination -- would leave the OLD prompt in place and the caller would
@@ -250,7 +257,7 @@ publish_dir() {
   # Directories first, so a file's parent exists when the file is staged. Anything of another
   # kind standing in a directory's place goes: mkdir would fail on it, and a link would send the
   # files below it out of the tree.
-  find "$src" -type d -print | while IFS= read -r d; do
+  find "$src" -type d -print0 | while IFS= read -r -d '' d; do
     rel=${d#"$src"}; rel=${rel#/}
     [ -n "$rel" ] || continue
     if [ -L "$dst/$rel" ] || { [ -e "$dst/$rel" ] && [ ! -d "$dst/$rel" ]; }; then
@@ -258,7 +265,7 @@ publish_dir() {
     fi
     mkdir -p "$dst/$rel" || exit 1
   done || return 1
-  find "$src" -type f -print | while IFS= read -r f; do
+  find "$src" -type f -print0 | while IFS= read -r -d '' f; do
     rel=${f#"$src"}; rel=${rel#/}
     # A DIRECTORY standing where a file belongs is the one case rename(2) does not resolve:
     # `mv -f file dir/` moves the file INTO it and the destination keeps the directory. That is
@@ -274,7 +281,11 @@ publish_dir() {
       rm -rf "$dst/$rel" || exit 1
     fi
     # <<< kind-guard
-    tmp="$dst/$(dirname "$rel")/.sync-$$-$(basename "$rel")"
+    # Split with parameter expansion rather than `$(dirname)`/`$(basename)`: command
+    # substitution strips trailing newlines, so a component whose name ends in one would be
+    # staged into a directory that does not exist.
+    base=${rel##*/}; parent=${rel%"$base"}
+    tmp="$dst/$parent.sync-$$-$base"
     cp "$f" "$tmp" || exit 1
     mv -f "$tmp" "$dst/$rel" || { rm -f "$tmp"; exit 1; }
   done || return 1
@@ -283,12 +294,15 @@ publish_dir() {
   # >>> prune-guard: scripts/test-sync-routines.sh builds a copy of this script with the block
   # between these two markers deleted, to show that publish_checked's tree comparison catches a
   # destination that merely LOOKS like a prompt. Keep the markers if the pruning moves.
-  find "$dst" ! -type d -print | while IFS= read -r f; do
+  find "$dst" ! -type d -print0 | while IFS= read -r -d '' f; do
     rel=${f#"$dst"}; rel=${rel#/}
     case "$rel" in .sync-$$-* | */.sync-$$-*) continue ;; esac
     [ -e "$src/$rel" ] || rm -f "$f" || exit 1
   done || return 1
-  find "$dst" -type d -print | sort -r | while IFS= read -r d; do
+  # `sort -z` keeps the ordering NUL-delimited too; plain `sort -r` would re-split on the
+  # newlines `-print0` just protected. Lexicographic descending puts "a/b" before "a", which is
+  # the deepest-first order rmdir needs.
+  find "$dst" -type d -print0 | sort -z -r | while IFS= read -r -d '' d; do
     rel=${d#"$dst"}; rel=${rel#/}
     [ -n "$rel" ] || continue
     [ -d "$src/$rel" ] || rmdir "$d" 2>/dev/null || true
