@@ -1537,6 +1537,53 @@ printf '\n## ` foo`\n\nOne-sided padding, which survives.\n' >> "$R/alpha/refere
 links_body alpha/SKILL.md 'See [the trimmed reading](references/notes.md#foo).'
 expect "...so the trimmed reading names no heading" 1 "GitHub slug is 'foo'" -- "$CP" "$R"
 
+# The label is the bracket THIS `]` closes, not any `[` standing earlier: `[note] then ](x.md)`
+# has one before it and opens no link, so looking for any at all still failed prose that is fine
+# (round 10, P2). Walked backwards, counting the pairs that close on the way.
+links_tree
+links_body alpha/SKILL.md 'A [note] then ](references/gone.md) as a token, not a link.'
+expect "a bracket already closed is not this link's label" 0 '0 failed' -- "$CP" "$R"
+links_tree
+links_body alpha/SKILL.md 'A [note] then [a real one](references/gone.md).'
+expect "...while the one that does close at it opens a link" 1 \
+  'resolves to no file: alpha/references/gone.md' -- "$CP" "$R"
+
+# A backslash does not escape INSIDE a code span, so the span walk and the escape reading cannot be
+# two global passes: `## `\`_foo_`` opens a span at the first backtick and closes it at the one
+# after the backslash, leaving `_foo_` outside as emphasis. Marking that backtick escaped paired
+# the first with the LAST instead and recorded `_foo_` (round 10, P2). One walk now, left to right.
+links_tree
+printf '\n## `\\`_foo_`\n\nA backslash inside a span, which escapes nothing.\n' \
+  >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a span holding a backslash](references/notes.md#_foo_).'
+expect "a backslash inside a code span escapes nothing, so what follows is not span content" 1 \
+  'will not spell an anchor for' -- "$CP" "$R"
+links_tree
+printf '\n## `_lit_` and ` padded `\n\nSpan contents, still literal.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [span contents](references/notes.md#_lit_-and-padded).'
+expect "...while the one walk keeps both readings a span is owed" 0 '(1 checked)' -- "$CP" "$R"
+
+# A `<` is markup only once the construct CLOSES: `## Use <Type` parses no tag and GitHub gives it
+# the ordinary slug, so refusing on the opening character alone refused plain text (round 10, P2).
+links_tree
+printf '\n## Use <Type\n\nAn opening bracket that closes nothing.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [an unclosed bracket](references/notes.md#use-type).'
+expect "an incomplete HTML construct is not HTML, so its heading keeps its anchor" 0 \
+  '(1 checked)' -- "$CP" "$R"
+links_tree
+printf '\n## Use <em>tags</em>\n\nA tag spelled whole.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a complete tag](references/notes.md#use-emtagsem).'
+expect "...while a complete one still spells no anchor" 1 'will not spell an anchor for' -- "$CP" "$R"
+
+# The blockquote marker takes ONE column of a tab's expansion, not the whole of it, and the columns
+# left over are indentation: `><TAB>  ##` is four columns in, an indented code block, where
+# discarding the tab left two and recorded a heading GFM does not render (round 10, P2).
+links_tree
+printf '\n>\t  ## Hidden by indentation\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [an indented phantom](references/notes.md#hidden-by-indentation).'
+expect "the columns a tab leaves after a blockquote marker are indentation" 1 \
+  "GitHub slug is 'hidden-by-indentation'" -- "$CP" "$R"
+
 # The obligation comes from a link, as the fixtures' comes from a fixture: a tree with none is not
 # reported as link-checked.
 fresh "$R"

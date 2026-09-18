@@ -957,11 +957,17 @@ md_links() {
     {
       line = $0
       while ((i = index(line, "](")) > 0) {
-        # A link opens with a LABEL. Without one, `](x.md)` standing in prose is a token somebody
-        # wrote, not a link Markdown renders -- and reporting its target as a broken link is the
-        # one way this scan can fail a file that has nothing wrong with it. The bracket is looked
-        # for in the text since the last cursor, which is where a label would be.
-        label = index(substr(line, 1, i - 1), "[")
+        # A link opens with a LABEL, and the label is the bracket THIS `]` closes -- not any `[`
+        # standing earlier. `[note] then ](x.md)` has a bracket before it and opens no link, so
+        # looking for any at all still failed prose that is perfectly fine, which is the one way
+        # this scan can fail a file with nothing wrong with it. Walked backwards from the `]`,
+        # counting the pairs that close on the way, so a `[` already closed answers for nothing.
+        label = 0; depth = 0
+        for (k = i - 1; k >= 1; k--) {
+          c = substr(line, k, 1)
+          if (c == "]") depth++
+          else if (c == "[") { if (depth == 0) { label = 1; break } else depth-- }
+        }
         line = substr(line, i + 2)
         if (label == 0) continue
         # The target ends at the paren that CLOSES the one the link opened, not at the first `)`:
@@ -1070,16 +1076,25 @@ heading_slugs() {
       # depends on the list indentation and continuation rules around it, which is the block
       # parser this file does not have -- and such a link is refused, loudly and naming the
       # anchor, never accepted for a heading that is not there.
+      col = 0
       while (1) {
         indent = 0; while (substr(line, indent + 1, 1) == " ") indent++
         if (indent > 3 || substr(line, indent + 1, 1) != ">") break
+        col += indent + 1                          # past the indent and the marker itself
         line = substr(line, indent + 2)
         # The one space the marker takes may be written as a tab, which GFM expands to the next
-        # tab stop: `><TAB>## Foo` is a heading with two columns of indentation left over, well
-        # inside the three the ATX rule allows. Leaving the tab in place hid the hashes and
-        # refused a link that works. A SECOND tab is not taken, and needs none to be: it leaves
-        # six columns, which is an indented code block, and the ATX test below refuses it anyway.
-        if (substr(line, 1, 1) == " " || substr(line, 1, 1) == "\t") line = substr(line, 2)
+        # tab stop -- and the marker takes ONE column of that expansion, not the whole of it. The
+        # columns left over are indentation, and dropping them changed the block: `><TAB>  ##`
+        # is four columns in and so an indented code block, where discarding the tab left two and
+        # recorded a heading GFM does not render. Kept as the spaces they expand to, so the ATX
+        # test below reads the same indentation GFM does.
+        if (substr(line, 1, 1) == " ") { line = substr(line, 2); col++ }
+        else if (substr(line, 1, 1) == "\t") {
+          pad = 4 - (col % 4) - 1                  # the tab stop, less the column the marker takes
+          line = substr(line, 2)
+          while (pad-- > 0) line = " " line
+          col++
+        }
       }
       # An ATX heading, by GFM: up to three leading spaces, one to six hashes, then a blank. The
       # counts are walked rather than matched, since an ERE interval is not something every awk on
@@ -1148,46 +1163,39 @@ heading_slugs() {
     #     by a single `.`, for the markup tests below to read. The content of a span is literal text, so `## `_foo_`` is `_foo_` on
     #     GitHub and must not be refused as emphasis; `.` rather than a letter, because it is
     #     punctuation to the flanking rule, which is the conservative side of that test.
-    function render_spans(h,   i, c, n, j, k, m, content, lit, mark, text, bare) {
-      # First the backslash escapes, because a character a backslash made literal is not a
-      # delimiter of anything -- not a code span, not emphasis, not a tag -- and every test after
-      # this one would otherwise read it as one. `lit` is the heading with each escape resolved to
-      # the character it stands for, and `mark` records, position for position, which characters
-      # arrived that way. Resolving them here rather than case by case is what keeps the next
-      # escaped delimiter somebody writes from being a finding of its own.
-      lit = ""; mark = ""
-      for (i = 1; i <= length(h); i++) {
+    function render_spans(h,   i, c, n, j, k, m, content, text, bare) {
+      # ONE walk, left to right, which is the order the inline reading actually happens in. Two
+      # global passes -- escapes resolved everywhere, then spans paired -- were wrong about their
+      # interaction, and in the direction that matters: a backslash does not escape INSIDE a code
+      # span, so `## `\`_foo_`` opens a span at the first backtick, closes it at the one after the
+      # backslash, and leaves `_foo_` outside it as emphasis. Marking that closing backtick
+      # escaped paired the first with the LAST instead and recorded `_foo_`.
+      # Walking once gets both rules from their position in the walk rather than from a rule about
+      # which pass wins: a backslash is an escape only when it is REACHED as text, which is to say
+      # outside a span, and the search for a closing run reads the raw backticks it passes.
+      text = ""; bare = ""; i = 1
+      while (i <= length(h)) {
         c = substr(h, i, 1)
         if (c == "\\" && i < length(h) && (substr(h, i + 1, 1) in escapable)) {
-          lit = lit substr(h, i + 1, 1); mark = mark "E"; i++
-        } else {
-          lit = lit c; mark = mark "."
-        }
-      }
-      # Then the spans, over the escape-resolved text: a backtick that arrived escaped opens and
-      # closes nothing, and stands in the rendered text as the backtick it is.
-      text = ""; bare = ""; i = 1
-      while (i <= length(lit)) {
-        c = substr(lit, i, 1)
-        if (c != "`" || substr(mark, i, 1) == "E") {
-          text = text c
-          if (substr(mark, i, 1) == "E") bare = bare "."
-          else bare = bare c
-          i++
+          # An escaped character is literal, and so is a delimiter of nothing: it stands in the
+          # rendered text as itself and reads as `.` to the markup tests.
+          text = text substr(h, i + 1, 1); bare = bare "."
+          i += 2
           continue
         }
-        n = 0; while (substr(lit, i + n, 1) == "`" && substr(mark, i + n, 1) != "E") n++
+        if (c != "`") { text = text c; bare = bare c; i++; continue }
+        n = 0; while (substr(h, i + n, 1) == "`") n++
         j = i + n; k = 0
-        while (j <= length(lit)) {
-          if (substr(lit, j, 1) != "`" || substr(mark, j, 1) == "E") { j++; continue }
-          m = 0; while (substr(lit, j + m, 1) == "`" && substr(mark, j + m, 1) != "E") m++
+        while (j <= length(h)) {
+          if (substr(h, j, 1) != "`") { j++; continue }
+          m = 0; while (substr(h, j + m, 1) == "`") m++
           if (m == n) { k = j; break }
           j += m
         }
         if (k == 0) {                              # no closing run: literal backticks
-          text = text substr(lit, i, n); bare = bare substr(lit, i, n); i += n; continue
+          text = text substr(h, i, n); bare = bare substr(h, i, n); i += n; continue
         }
-        content = substr(lit, i + n, k - i - n)
+        content = substr(h, i + n, k - i - n)
         if (content ~ /^ / && content ~ / $/ && content ~ /[^ ]/)
           content = substr(content, 2, length(content) - 2)
         text = text content; bare = bare "."
@@ -1212,7 +1220,12 @@ heading_slugs() {
       # readings drop, so `## **Bold** text` and `## `code` here` already agree.
       render_spans(h)
       if (index(SPAN_BARE, "](") > 0 || index(SPAN_BARE, "][") > 0) return "!"
-      if (SPAN_BARE ~ /<[A-Za-z\/!?]/) return "!"
+      # A `<` is only markup once the construct CLOSES: `## Use <Type` parses no tag, and GitHub
+      # gives it the ordinary `use-type`, so refusing on the opening character alone refused a
+      # heading that is plain text. A tag, an autolink or a comment, each spelled whole.
+      if (SPAN_BARE ~ /<\/?[A-Za-z][A-Za-z0-9-]*([[:space:]][^<>]*)?\/?>/) return "!"
+      if (SPAN_BARE ~ /<[A-Za-z][A-Za-z0-9+.-]*:[^<>[:space:]]*>/) return "!"
+      if (index(SPAN_BARE, "<!--") > 0) return "!"
       if (SPAN_BARE ~ /&[A-Za-z0-9#]+;/) return "!"
       # Underscore emphasis is the one emphasis marker the two readings do NOT agree on, because
       # the slugger keeps `_` as a word character: `## _Foo_` renders as `Foo` and is `foo` there,
