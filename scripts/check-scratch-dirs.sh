@@ -665,8 +665,11 @@ for f in "${files[@]}"; do
       # has to be more than any chain.
       nassign = 0
       for (i = 1; i <= last; i++) if (i in an) { assigns[funcof[i] SUBSEP an[i]] = 1; nassign++ }
-      # The verdicts are recomputed from nothing each time this block runs, so a round carries
-      # only what the rounds before it in THIS fixpoint established.
+      # This block is entered exactly once: awk reads the file twice, but the pass-1 rule ends in
+      # `next`, so `FNR == 1` is reached only on pass 2, with a complete `last`. The clear is not
+      # there to undo a previous entry -- there is none -- it keeps the precondition of the loop
+      # local, so the empty `resolved` a round starts from is stated here rather than inferred
+      # from that `next` far above.
       for (n in resolved) delete resolved[n]
       changed = 1
       for (round = 0; changed && round <= nassign; round++) {
