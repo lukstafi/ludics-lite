@@ -303,10 +303,17 @@ commands in those indented blocks, one at a time, so a command malformed in itse
 what does not apply is the reproduction that needs bash to read the prose around it.
 
 The GitHub Actions workflow in `.github/workflows/skill-scripts.yml` runs the shell suites and
-shared Python fixtures on Ubuntu and on macOS (the fleet's bash is 3.2), with macOS sharing one
-job and a step per suite: the hosted
-macOS runners are scarce enough that four separate macOS jobs queued a green PR for one to two
-hours behind nine minutes of work (ludics-lite#55). Alongside them run `bash -n`, shellcheck at
+shared Python fixtures on Ubuntu and on macOS (the fleet's bash is 3.2), with macOS spread over two
+jobs and a step per suite. The count of macOS jobs is itself the thing being tuned: the hosted
+runners are scarce enough that four separate macOS jobs queued a green PR for one to two hours
+behind nine minutes of work (ludics-lite#55). Two rather than four, because that exposure grows
+with the runner assignments and not with the work — the second job re-pays only a checkout and a
+`brew install tmux`. Two rather than one, because the suites now take about eighteen minutes
+together and all of it sits on the merge gate's critical path; the halves are cut along what they
+exercise, ship-pr's own suites in one and the repo and fleet guards in the other, and come out at
+roughly nine minutes each. The workflow carries the measured queue waits that trade rests on, and
+the standing answer if the macOS pool starts starving these jobs: not a third assignment, but
+moving suites off the per-push path onto periodic CI. Alongside them run `bash -n`, shellcheck at
 error severity, a check that the two cleanup scripts still carry their parse guard, and the jq
 shape guard (`scripts/check-jq-shapes.sh`, with `scripts/test-check-jq-shapes.sh` beside it) and the
 scratch directory guard (`scripts/check-scratch-dirs.sh`, with `scripts/test-check-scratch-dirs.sh`
