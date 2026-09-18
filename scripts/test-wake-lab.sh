@@ -69,7 +69,7 @@ expect() {
 # for the comparison: its cases run as its children, so a holder pid near it and gone is this
 # suite escaping, while a stranger's is the sweep. Only the files the diff names, so a busy lab
 # does not bury the diff. Control characters go, and a missing or empty line degrades rather than
-# failing, both as `lab_lock_holder` does -- this text goes to a terminal, and a lock a sweep is
+# failing, both as `lock_holder` does -- this text goes to a terminal, and a lock a sweep is
 # mid-write on has no first line yet.
 lock_holders() {
   sed -n 's/^> \([^ ][^ ]*\).*/\1/p' <<<"$1" | sort -u | while IFS= read -r f; do
@@ -658,12 +658,12 @@ out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1); rc=$?
   || ko "a second --hold spawned another holder (rc=$rc) -- $out; $(cat "$SSH_LOG")"
 env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
 
-# `wsl --shutdown` is HOST-GLOBAL, so a restart on a box a lane is holding destroys that lane's VM
-# and its holder -- the 2026-09-16 loss, from inside the flag meant to prevent it. The holder
-# carries that box's LAB LOCK (ludics-lite#168): it inherits the descriptor, so the flock lives as
-# long as the holder and the next restart is refused by the same interlock that protects every
-# other tool. A plain kick stays available because it has no shutdown to refuse and is the recovery
-# command for a box with no VM.
+# `wsl --shutdown` is HOST-GLOBAL, so a restart on a held box destroys the VM the holder is keeping
+# alive, and the holder with it -- the 2026-09-16 loss, from inside the flag meant to prevent it.
+# The holder carries that box's HOLD LOCK (ludics-lite#168): it inherits the descriptor, so the
+# flock lives as long as the holder and the next restart is refused by the same interlock that
+# protects every other tool. A plain kick stays available because it has no shutdown to refuse and
+# is the recovery command for a box with no VM.
 reset_hold_state
 held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
 lane_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
@@ -672,13 +672,42 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HO
       WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
       SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=30 "$WL" restart-wsl --hold rog 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ! grep -q -- '--shutdown' "$SSH_LOG" \
-  && grep -q "wsl restart REFUSED on: rog (the lab lock is held" <<<"${out##*$'\n'}" \
+  && grep -q "wsl restart REFUSED on: rog (a lab lock is held" <<<"${out##*$'\n'}" \
   && grep -q 'wake-lab --hold' <<<"$out" && alive "$lane_pid" \
-  && ok "a restart is refused on a box a lane is holding, before any host-global shutdown (rc=$rc)" \
-  || ko "a restart tore down a held lane's VM (rc=$rc) -- $out; $(cat "$SSH_LOG")"
-[ -n "$(env WAKE_LAB_HOSTS="$TMP/absent.sh" "$WL" lock-path rog)" ] \
-  && ok "...and the refusal names the holder as the hold itself, at the lock path lock-path reports" \
-  || ko "lock-path does not answer for the box the holder locked"
+  && ok "a restart is refused on a box a holder is keeping alive, before any host-global shutdown (rc=$rc)" \
+  || ko "a restart tore down a held VM (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+
+# ...and the refusal names the HOLD, not the restart whose descriptor the hold inherited. Before
+# ludics-lite#224 the line read `wake-lab restart (pid <restarter>, ...)` for the whole life of the
+# lane: a finished command and an exited pid, quoted at every later refusal here and in every
+# `skip (box ... reserved by ...)` the sweep published.
+hold_line=$(head -1 "$WAKE_LAB_LOCK_DIR/rog.hold.lock" 2>/dev/null)
+case "$hold_line" in
+  *"wake-lab --hold (pid $lane_pid,"*)
+    ok "...and the hold lock's line names the holder that is actually there" ;;
+  *) ko "the hold lock's line does not name the live holder (pid $lane_pid): $hold_line" ;;
+esac
+
+# The point of the split (ludics-lite#224): a hold says "do not destroy this VM", never "nobody
+# else may work here", so the LANE lock -- the one a sweep takes, and the one `lock-path` answers
+# -- is left FREE by a hold. The routine holds both boxes in step 1 and sweeps them in step 2 of
+# the same session; while one file said both things, every remote lane waited out its 300s
+# LAB_LOCK_WAIT against that routine's own holder and skipped, and three backends went uncovered.
+lane_lock=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_LOCK_DIR="$WAKE_LAB_LOCK_DIR" "$WL" lock-path rog)
+[ "$lane_lock" = "$WAKE_LAB_LOCK_DIR/rog.lock" ] \
+  && ok "...and lock-path answers the LANE lock, which is the one a harness takes" \
+  || ko "lock-path does not answer the lane lock path -- $lane_lock"
+# Taken exactly as the sweep takes it, in a child so the suite keeps none of it.
+if ( exec 7>>"$lane_lock"
+     perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7 ); then
+  ok "...so a sweep lane can still reserve the box its own holder is keeping alive"
+else
+  ko "a --hold holder still occupies the lane lock: the sweep it exists to serve would skip \
+(holder $(head -1 "$lane_lock" 2>/dev/null))"
+fi
+alive "$lane_pid" \
+  && ok "...with the holder still running, so the VM it protects is not the price of that" \
+  || ko "the holder died while the lane lock was being taken"
 : > "$SSH_LOG"
 out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'wsl holder already running for rog' <<<"$out" && ! grep -q -- '--shutdown' "$SSH_LOG" \
@@ -754,6 +783,26 @@ out=$(wake_hold "$TASKLIST_HELD" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'wsl holder observed on rog' <<<"$out" && grep -q '^all up$' <<<"${out##*$'\n'}" \
   && ok "--wait --restart-wsl --hold ends in all up with the holder observed (rc=$rc)" \
   || ko "the wake path did not hold the fresh VM (rc=$rc) -- $out"
+# And this is step 1 of the cross-machine sweep routine, verbatim, so the state it leaves behind is
+# what step 2 meets: the LANE lock free for the sweep, the HOLD lock carried by the holder. The
+# restart itself takes both -- it is a destroyer -- so the lane lock has to be given back when the
+# restart returns AND must not have travelled to the holder it spawned, which inherits every
+# descriptor the restart's own subshell left open. Both halves are asserted, because a holder
+# holding a released lane lock looks exactly like a released one from the parent (ludics-lite#224).
+if ( exec 7>>"$WAKE_LAB_LOCK_DIR/rog.lock"
+     perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7 ); then
+  ok "...leaving the lane lock free, so the sweep it woke the box for can reserve it"
+else
+  ko "step 1 left its own lane lock held: step 2 would skip every unit on that box \
+(holder $(head -1 "$WAKE_LAB_LOCK_DIR/rog.lock" 2>/dev/null))"
+fi
+if ( exec 7>>"$WAKE_LAB_LOCK_DIR/rog.hold.lock"
+     perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7 ); then
+  ko "...but nothing holds the hold lock, so another session's restart-wsl would take the VM"
+else
+  ok "...while the hold lock IS held, so another session's restart-wsl is still refused"
+fi
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
 reset_hold_state
 out=$(wake_hold "$TASKLIST_EMPTY" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ! grep -q '^all up$' <<<"$out" && grep -q 'NOT all up: wsl HOLD FAILED on: rog' <<<"${out##*$'\n'}" \
@@ -1333,9 +1382,15 @@ grep -q 'shutdown /h' "$SSH_LOG" \
 # command released the FIRST box's lock while the surviving descendant went on issuing and
 # confirming its suspend — freeing a box whose power transition was still pending, which is the
 # whole hazard the reservation exists to prevent. Killing the command must free every box or none.
-lock_free() { # lock_free <box> — true iff nothing holds that box's lock
-  [ -e "$LOCKS/$1.lock" ] || return 0
-  perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <"$LOCKS/$1.lock" 2>/dev/null
+file_free() { # file_free <path> — true iff nothing holds that lock file
+  [ -e "$1" ] || return 0
+  perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <"$1" 2>/dev/null
+}
+# A destroyer takes BOTH of a box's locks, so "reserved" means neither is free: a phase that held
+# only the lane lock would leave the VM destroyable by a concurrent `--hold`, and one that held
+# only the hold lock would leave a sweep lane free to start work the pending suspend destroys.
+lock_free() { # lock_free <box> — true iff nothing holds EITHER of that box's locks
+  file_free "$LOCKS/$1.lock" && file_free "$LOCKS/$1.hold.lock"
 }
 : > "$SSH_LOG"
 env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=60 \
@@ -1367,6 +1422,77 @@ if lock_free rog && lock_free minix; then
 else
   ko "a box stayed reserved after the command was killed (rog free=$(lock_free rog && echo yes || echo no), minix free=$(lock_free minix && echo yes || echo no))"
 fi
+
+# Half a reservation is worse than none. A destroyer takes the lane lock first and the hold lock
+# second, and if the second is refused -- a `--hold` holder is on that box -- it must give the
+# first one back: a lane lock kept by a command that is not going to act would block the very sweep
+# the holder was taken for, which is the deadlock ludics-lite#224 is about, re-entered from the
+# other side.
+printf 'wake-lab --hold (pid 999, since 20260918T050814Z)\n' > "$LOCKS/minix.hold.lock"
+exec 7>>"$LOCKS/minix.hold.lock"
+if perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7; then
+  ok "a box's hold lock can be taken the way a holder takes it"
+else
+  ko "could not take a test hold lock -- the cases below prove nothing"
+fi
+: > "$SSH_LOG"
+out=$(wl_locked restart-wsl minix); rc=$?
+[ "$rc" -ne 0 ] && ! grep -q '^minix-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && grep -q 'wake-lab --hold (pid 999' <<<"$out" \
+  && ok "a restart is refused by the HOLD lock alone, with the lane lock free (rc=$rc)" \
+  || ko "a held VM was restarted with no lane on the box (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+file_free "$LOCKS/minix.lock" \
+  && ok "...and the lane lock it took on the way to that refusal is given back" \
+  || ko "a refused destroyer kept the lane lock: $(head -1 "$LOCKS/minix.lock" 2>/dev/null)"
+exec 7>&-
+# Nothing of the suite's own is left holding it, so the box is ordinary again.
+out=$(wl_locked restart-wsl minix); rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "...and the box restarts normally once the hold is released (rc=$rc)" \
+  || ko "the released hold lock still refuses (rc=$rc) -- $out"
+
+# Three boxes in ONE command, which is where bash 3.2's descriptor ceiling bites: a destroyer holds
+# two descriptors per box, and bash parks a redirection's displaced fd on the first free one at or
+# above 10 -- so a reservation that counted up into 10 opened its lock onto the slot holding this
+# shell's stderr and had it closed again underneath, reporting the box as somebody else's. Every
+# lock descriptor therefore stays below 10, and the whole host table has to fit.
+cat > "$TMP/hosts3.sh" <<'HOSTS3'
+mac_of() { case "$1" in
+  rog)   echo aa:bb:cc:00:00:01 ;;
+  minix) echo aa:bb:cc:00:00:03 ;;
+  asus)  echo aa:bb:cc:00:00:05 ;;
+  *) return 1 ;; esac; }
+eth_mac_of() { mac_of "$1"; }
+ip_of() { case "$1" in
+  rog)   echo 10.0.0.1 ;;
+  minix) echo 10.0.0.2 ;;
+  asus)  echo 10.0.0.3 ;;
+  *) return 1 ;; esac; }
+HOSTS3
+env WAKE_LAB_HOSTS="$TMP/hosts3.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=60 \
+    SSH_UP="rog-lan rog-nv-win minix-lan minix-amd-win asus-amd-win" \
+    "$WL" hibernate rog minix asus >"$TMP/phase3.out" 2>&1 8>&- &
+phase3_pid=$!
+phase3_deadline=$((SECONDS + 20))
+while lock_free rog || lock_free minix || lock_free asus; do
+  [ "$SECONDS" -ge "$phase3_deadline" ] && break
+  sleep 1
+done
+if ! lock_free rog && ! lock_free minix && ! lock_free asus; then
+  ok "all three boxes of the host table are reserved by one command, both locks each"
+else
+  ko "a third box could not be reserved -- the descriptors ran into bash's save slot (rog=$(lock_free rog && echo free || echo held), minix=$(lock_free minix && echo free || echo held), asus=$(lock_free asus && echo free || echo held))"
+fi
+grep -q 'REFUSED' "$TMP/phase3.out" \
+  && ko "a box of the table was refused for want of a descriptor: $(grep REFUSED "$TMP/phase3.out")" \
+  || ok "...and none of them was refused for want of one"
+kill "$phase3_pid" 2>/dev/null
+wait "$phase3_pid" 2>/dev/null
+kill3_deadline=$((SECONDS + 20))
+while ! lock_free rog || ! lock_free minix || ! lock_free asus; do
+  [ "$SECONDS" -ge "$kill3_deadline" ] && break
+  sleep 1
+done
 
 # The path is the whole contract with the sweep, so it must not need the site table: the harness
 # asking where to put its flock runs from a checkout with no business holding this lab's MACs.

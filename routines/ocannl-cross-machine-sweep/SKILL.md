@@ -56,12 +56,28 @@ waits up to 3 minutes for `tailscaled` inside the VM to register. Do not hand-ro
 probe-then-branch logic it replaces; a partial wake (one box up, one dead) is handled — the live
 box still gets its WSL kick.
 
-`--hold` also takes that box's **lab lock** (the interlock `--restart-wsl` consults) and leaves it
-with the holder, so while a lane is held another session's `restart-wsl` is REFUSED — naming this
-lane as the holder — instead of destroying the VM under it with a host-global `wsl.exe --shutdown`.
+`--hold` also takes that box's **hold lock** (one of the two interlocks `--restart-wsl` consults)
+and leaves it with the holder, so while a box is held another session's `restart-wsl` is REFUSED —
+naming this holder — instead of destroying the VM under it with a host-global `wsl.exe --shutdown`.
 `unhold` releases the lock along with the holder. That is the other half of the 2026-09-16 story:
 one loss was the update restart, the other was a second session restarting WSL under a running
 unit.
+
+There are two locks per box and this run takes one of each, at different times, which is what lets
+step 1 and step 2 belong to the same session:
+
+- `<box>.hold.lock`, the **hold lock** — "this box's VM must not be destroyed". Step 1's `--hold`
+  takes it, the Windows-side holder carries it, and `unhold` in step 2 releases it.
+- `<box>.lock`, the **lane lock** — "no other lane runs on this box". The sweep takes it in step 2,
+  per box, for the length of that box's lane, and the hold deliberately does not touch it.
+
+`restart-wsl` and the power verbs take both and refuse the box if either is held. Do not expect
+step 1's hold to keep the sweep out of its own boxes: before 2026-09-18 it did exactly that — one
+file said both things, so every remote lane waited out its five-minute lock budget against this
+routine's own holder and skipped, and three of the five backends this routine gates got no
+coverage at all that day (ludics-lite#224). If you ever see `skip (box <box> reserved by wake-lab
+--hold ...)`, that regression is back: report it as the finding, because it means the run held the
+boxes against itself.
 
 `--hold` is what keeps each GPU lane's VM alive for the whole lane. A WSL VM is held up by a
 `wsl.exe` process on the WINDOWS side and by nothing else; the sweep's ssh sessions inside the
@@ -130,19 +146,23 @@ Read its last lines:
   using that box right now**, and the refusal names it. `wsl.exe --shutdown` is host-global, so
   restarting a box mid-sweep destroys the VM under whatever is running there — on 2026-09-16 that
   cost this sweep both GPU units, and the failure was read as a GPU fault for two days. Almost
-  always the holder is another sweep that has not finished. Wait for it and run the wake command
-  again; do **not** reach for `--force`, which takes the box anyway and is there for a holder that
-  has demonstrably gone (a crashed run whose ssh is still orphaned), not for one you are impatient
-  with. If you wait, say in the report that the run started late and why.
+  always the holder is another sweep that has not finished, or a `--hold` holder another session
+  left behind. Wait for it and run the wake command again; do **not** reach for `--force`, which
+  takes the box anyway and is there for a holder that has demonstrably gone (a crashed run whose
+  ssh is still orphaned), not for one you are impatient with. If you wait, say in the report that
+  the run started late and why. One holder it can never name is this run's own: the command that
+  prints this line is the one that would have taken the locks, and it took none.
 
 `~/bin/wake-lab.sh status` prints the per-box picture (router-active, `-lan`, `-win`, `-wsl`) if you need to
 say precisely what happened.
 
-The sweep reserves each WSL box for the length of that box's lane, and `wake-lab.sh` refuses to
-destroy a reserved box, so the 2026-09-16 collision cannot repeat silently. Two consequences to
-know. A unit recorded as `skip (box <box> reserved by ...)` is a box another run held for longer
-than the sweep was willing to wait: nothing was tested and nothing failed, so report it the way
-`skip (unreachable)` is reported, naming the holder. And a dxg window whose verdict is
+The sweep takes each WSL box's lane lock for the length of that box's lane, and `wake-lab.sh`
+refuses to destroy a box either of whose locks is held, so the 2026-09-16 collision cannot repeat
+silently. Two consequences to know. A unit recorded as `skip (box <box> reserved by ...)` is a box
+ANOTHER run's lane held for longer than the sweep was willing to wait: nothing was tested and
+nothing failed, so report it the way `skip (unreachable)` is reported, naming the holder. (A
+holder line reading `wake-lab --hold` there is the regression above, not another run.) And a dxg
+window whose verdict is
 `vm-replaced` means the guest was destroyed and recreated while that unit ran — the unit's result
 says nothing about the code, it gets the serial rerun automatically, and the thing to investigate
 is who restarted the box, not the backend.
@@ -151,9 +171,12 @@ The retry budget is exactly one re-kick and one rerun. If the sweep records cuda
 `skip (unreachable)` while `status` shows that box `win=UP`, the VM was up and vanished: run
 `~/bin/wake-lab.sh kick-wsl --hold <box>` once — **with `--hold`**, or the rerun runs an unheld VM
 the way the 2026-09-15 recovery rerun did, and it died 76 s in — then rerun the sweep once (reruns
-are incremental and cheap) and `~/bin/wake-lab.sh unhold <box>` when it finishes. If the unit still
-skips, report it as "woken but `-wsl` gone" (step 4 names this outcome) and do not kick or rerun
-again.
+are incremental and cheap) and `~/bin/wake-lab.sh unhold <box>` when it finishes. The re-kick takes
+only that box's hold lock, so the rerun's own lane still reserves the box normally; before
+ludics-lite#224 this recovery reproduced the skip exactly, taking the same lock the lane then
+waited on, which is why a rerun that skips for `reserved by wake-lab --hold` means the fix has
+regressed rather than that the box is busy. If the unit still skips, report it as "woken but
+`-wsl` gone" (step 4 names this outcome) and do not kick or rerun again.
 
 Everything else about these boxes — WoL over Ethernet only, waking from a full shutdown, what
 `router-active=1` means, what actually holds a kicked VM up (a Windows-side `wsl.exe`, which is
