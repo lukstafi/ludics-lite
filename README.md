@@ -261,10 +261,13 @@ reading order matches the running order. The alternative to a resolution is inhe
 reaches exactly one component: `mktemp -d "$TEMP_ROOT/x.XXXXXX"` under a resolved `TEMP_ROOT` needs
 no line of its own, which is what lets post-merge-cleanup.sh's scratch directories pass, while
 `"$TEMP_ROOT/cache/x.XXXXXX"` is refused — the component `mktemp` itself creates cannot be a
-symlink, but an intermediate one can. That root counts as resolved from any assignment in its scope,
-with no comparison of line order, so a root resolved *below* the allocation satisfies the guard
-while leaving the allocation itself unresolved: resolving it first is convention the guard cannot
-verify.
+symlink, but an intermediate one can. That root counts as resolved only when EVERY assignment
+to it in that scope leaves a physical path and at least one of them stands at control depth zero:
+any assignment disqualifies and only an unconditional one certifies, so a later
+`BASE=${TMPDIR:-/tmp}`, or a resolution reached only inside an `if` arm, un-resolves it for the
+whole scope. What the fixpoint does not compare is line ORDER, so a root resolved *below* the
+allocation satisfies the guard while leaving the allocation itself unresolved: resolving it first is
+convention the guard cannot verify.
 
 **`routines/*/SKILL.md` are Markdown prompts read by an agent, not shell scripts.** Nothing execs
 the file and no shell parses it: `bash -n`, shellcheck, `check-jq-shapes.sh` and
