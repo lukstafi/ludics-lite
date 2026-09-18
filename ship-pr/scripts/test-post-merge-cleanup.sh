@@ -683,7 +683,7 @@ test_session_ignored_symlink_refusal() {
   echo copied.conf >>"$CASE_MAIN/.git/info/exclude"
   echo 'same bytes' >"$CASE_MAIN/copied.conf"
   echo 'same bytes' >"$CASE_ROOT/symlink-target"
-  ln -s "$(cd "$CASE_ROOT" && pwd -P)/symlink-target" "$CASE_SESSION/copied.conf"
+  ln -s "$CASE_ROOT/symlink-target" "$CASE_SESSION/copied.conf"
   if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
     fail "an ignored symlink was accepted for destructive cleanup"
   fi
@@ -719,7 +719,7 @@ test_session_bare_claude_entry_refusal() {
   setup_case bare-claude-symlink merge main-off
   echo '.claude' >>"$CASE_MAIN/.git/info/exclude"
   mkdir -p "$CASE_ROOT/elsewhere"
-  ln -s "$(cd "$CASE_ROOT" && pwd -P)/elsewhere" "$CASE_SESSION/.claude"
+  ln -s "$CASE_ROOT/elsewhere" "$CASE_SESSION/.claude"
   if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
     fail "an ignored symlink named .claude was accepted for destructive cleanup"
   fi
@@ -735,7 +735,7 @@ test_session_ignored_symlinked_base_ancestor_refusal() {
   echo 'cache/config' >>"$CASE_MAIN/.git/info/exclude"
   mkdir -p "$CASE_ROOT/outside"
   echo 'shared bytes' >"$CASE_ROOT/outside/config"
-  ln -s "$(cd "$CASE_ROOT" && pwd -P)/outside" "$CASE_MAIN/cache"
+  ln -s "$CASE_ROOT/outside" "$CASE_MAIN/cache"
   mkdir -p "$CASE_SESSION/cache"
   echo 'shared bytes' >"$CASE_SESSION/cache/config"
   if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
