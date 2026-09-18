@@ -361,16 +361,20 @@ workflow_globs() { # workflow_globs <checkout> <step name>
     }
   ' "$1/.github/workflows/skill-scripts.yml"
 }
-workflow_matches() { # workflow_matches <checkout> <newline-separated patterns>: expand from its root
-  local patterns="$2"
+workflow_matches() { # workflow_matches <checkout> <newline-separated patterns>: the paths they cover
+  local checkout="$1" patterns="$2"
   (
-    cd "$1" || exit 1
     while IFS= read -r pattern; do
       [ -n "$pattern" ] || continue
-      # Unquoted on purpose: the workflow's shell expands the same pathname glob. Unlike `case`,
-      # pathname expansion does not let * cross a slash.
-      # shellcheck disable=SC2086
-      for matched in $pattern; do [ -f "$matched" ] && printf '%s\n' "$matched"; done
+      # Tracked paths on this side too, for the same reason as the other: expanding these as
+      # pathname globs answers what the worktree HOLDS, so a tracked script the worktree is
+      # missing -- an unstaged deletion, a sparse checkout -- would be matched by no pattern and
+      # reported uncovered, the very false positive this guard is being fixed for. `:(glob)` is
+      # the pathspec magic that gives git's matcher fnmatch's FNM_PATHNAME semantics, under which
+      # `*` stops at a `/` exactly as the workflow's shell expands it -- unlike the bare `*.sh`
+      # pathspec above, whose `*` crosses `/` on purpose.
+      git -C "$checkout" ls-files -z -- ":(glob)$pattern" \
+        | while IFS= read -r -d '' path; do printf '%s\n' "$path"; done
     done <<EOF
 $patterns
 EOF
@@ -418,6 +422,12 @@ tracked_sh_verdict=$(uncovered_shell_files "$guard_clone")
 [ "$tracked_sh_verdict" = " bash-n:scratch-probe.sh shellcheck:scratch-probe.sh" ] \
   && ok "...while a tracked shell script no lint glob covers trips it" \
   || ko "the lint-coverage guard missed a tracked uncovered shell script (verdict:$tracked_sh_verdict)"
+rm "$guard_clone/scratch-probe.sh" "$guard_clone/scripts/sync-routines.sh" \
+  || ko "could not remove the guard clone's shell scripts (setup, not the launcher)"
+missing_sh_verdict=$(uncovered_shell_files "$guard_clone")
+[ "$missing_sh_verdict" = " bash-n:scratch-probe.sh shellcheck:scratch-probe.sh" ] \
+  && ok "...and both sides read the declaration: a covered script the worktree is missing stays covered" \
+  || ko "a tracked script absent from the worktree changed the lint-coverage verdict (verdict:$missing_sh_verdict)"
 
 [ -L "$real_home/.claude/skills/ship-pr" ] && ok "the README's loop links ship-pr" || ko "the README's loop did not link ship-pr into ~/.claude/skills"
 [ ! -e "$real_home/.claude/skills/routines" ] && ok "the README's loop keeps routines/ out of ~/.claude/skills" || ko "the README's loop linked routines/ into ~/.claude/skills"
