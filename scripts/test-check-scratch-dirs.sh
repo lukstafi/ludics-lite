@@ -278,15 +278,36 @@ mkdir -p "$TMP/bin"
 EOF
 expect "a declare/typeset capture is a capture" 0 "$CLEAN" -- "$CS" "$TMP/safe_declare.sh"
 
-# `readonly` is the same declaration syntax, and a file that freezes the resolved spelling is
-# writing the house idiom with one more keyword on it -- the guard has to read the resolution
-# through that keyword or the shape below could never pass.
-probe safe_readonly <<'EOF'
-TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX") || exit 1
+# Round 4 of #252: `readonly` is read for what it takes AWAY and never for what it could grant, so
+# a `readonly` RESOLUTION is not a resolution -- refused here exactly as it is on main. Accepting it
+# certified a plain allocation whose assignments bash then refuses outright: under an earlier
+# `readonly TMP=old` this file runs mktemp, rejects both assignments, keeps `old`, leaks the
+# directory and can still exit 0. The resolver pattern does not check WHICH directory is
+# canonicalized either, so `readonly TMP=$(CDPATH= cd / && pwd -P)` read as a resolution too. Both
+# are the certifying direction, and the keyword does not get to work in it.
+probe bad_readonly_resolution <<'EOF'
+readonly TMP=old
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/suite.XXXXXX")
 readonly TMP=$(CDPATH= cd "$TMP" && pwd -P)
 mkdir -p "$TMP/bin"
 EOF
-expect "a readonly resolution is a resolution" 0 "$CLEAN" -- "$CS" "$TMP/safe_readonly.sh"
+expect "a readonly resolution does not certify the allocation above it" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_readonly_resolution.sh"
+
+# ...and a root that is only ever assigned with `readonly` certifies nothing, which is main's
+# verdict too: a declaration inside `( ... )` is gone when the subshell exits, and parens move
+# neither `depth` nor `funcof`, so certifying from one would hand an outer allocation a root it
+# never got.
+probe bad_readonly_root_in_subshell <<'EOF'
+(
+  readonly BASE=$(CDPATH= cd /tmp && pwd -P)
+  echo "$BASE"
+)
+TMP=$(mktemp -d "$BASE/x.XXXXXX") || exit 1
+echo "$TMP"
+EOF
+expect "a readonly root does not certify, in a subshell or out of one" 1 "$REFUSAL" -- \
+  "$CS" "$TMP/bad_readonly_root_in_subshell.sh"
 
 # Round 3 of #252: and the guard does NOT try to work out whether an earlier `readonly` is in
 # force, which is why these two pass. `readonly -f TMP` freezes a FUNCTION named TMP and leaves the

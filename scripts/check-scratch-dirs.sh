@@ -617,7 +617,7 @@ for f in "${files[@]}"; do
       if (funcof[u] != funcof[i] || depth[u] != depth[i]) return 0
       l = code[u]
       gsub(/^[ \t]+/, "", l)
-      return (l ~ ("^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+|readonly[ \t]+)?" nm "=\"?\\$\\((CDPATH=[ \t]+)?cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)\"?[ \t]*($|\\|\\||&&|;)")) ? 1 : 0
+      return (l ~ ("^(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?" nm "=\"?\\$\\((CDPATH=[ \t]+)?cd[ \t].*&&[ \t]*pwd[ \t]+-P[ \t]*\\)\"?[ \t]*($|\\|\\||&&|;)")) ? 1 : 0
     }
     # The fixpoint, once, before the first line of pass 2 is judged. A name is resolved only when
     # EVERY assignment to it leaves a physical path: `BASE=$(cd /tmp && pwd -P)` followed by
@@ -676,7 +676,20 @@ for f in "${files[@]}"; do
         for (i = 1; i <= last; i++) {
           if (!(i in an)) continue
           key = funcof[i] SUBSEP an[i]
-          if (depth[i] == 0) seen[key] = 1
+          # `readonly` is read here for what it can take AWAY and never for what it could grant.
+          # Reading the keyword at all is what this change is for -- a `readonly` reassignment of a
+          # resolved root has to un-resolve it, which is the defect that went unseen -- and
+          # `bad_assign` below does that whatever the line'"'"'s shape. Certifying is the other
+          # direction, and every attempt to let the keyword do it walked into something this
+          # scanner cannot see: the same declaration inside `( ... )` disappears when the subshell
+          # exits, and parens move neither `depth` nor `funcof`, so it would certify an outer root
+          # that never got one (ludics-lite#252 review round 4). The house rule was already
+          # two-sided -- only an assignment at control depth 0 can certify, any assignment can
+          # disqualify -- and this is the same asymmetry one keyword further: a file whose root is
+          # only ever assigned with `readonly` is refused exactly as it is on main, and a file that
+          # merely FREEZES an already-resolved root is refused too, which is the conservative
+          # direction. The effect is that reading the keyword can only turn a pass into a refusal.
+          if (depth[i] == 0 && code[i] !~ /^[ \t]*readonly[ \t]+/) seen[key] = 1
           if (has_mktemp_d(head_of(code[i]))) {
             if (!answers_with_mktemp(head_of(code[i]))) { bad_assign[key] = 1; continue }
             if (scope_resolved(i, lead_var(template_of(head_of(code[i])))) || mkok[i]) continue
