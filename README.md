@@ -232,13 +232,14 @@ Three conventions travel with that list.
 
 **A `test-*` name is a promise to run.** `check-prompts.sh`'s fixture check walks `scripts/test-*`,
 `*/scripts/test-*` and `*/hooks/test-*`, and of every `.sh`, `.py` or `.ps1` it finds there it
-requires a line in this Tests section whose first token is that path and an inline `run:` line in
+requires a line in this Tests section that is that path once an optional `python3` or `./` prefix is
+stripped — the two forms the register itself uses — and an inline `run:` line in
 `.github/workflows/skill-scripts.yml` on each platform that file needs — both Ubuntu and macOS for a
 shell suite, with the Ubuntu-only and Windows-only fixtures named as exceptions in the checker. The
-lookup is the section and not the block — a path-first line anywhere under `## Tests` satisfies it,
-so the register above is where those lines are kept by convention rather than by enforcement. The
-glob asks the filename, not the file, so it cannot tell a suite from a helper that is only ever
-sourced: such a helper either earns the name by carrying its own controls and being run, as
+lookup is the section and not the block — any such line anywhere under `## Tests` satisfies it, so
+the register above is where those lines are kept by convention rather than by enforcement. The glob
+asks the filename, not the file, so it cannot tell a suite from a helper that is only ever sourced:
+such a helper either earns the name by carrying its own controls and being run, as
 `ship-pr/scripts/test-pr-review-base-lib.sh` has since ludics-lite#212 (executed rather than
 sourced, it proves the round counter, the grace and the tip move straight off the fixture rather
 than through a `base` run, and the refusals it owes its three callers), or it must not be named
@@ -270,8 +271,10 @@ ordinary `A="$ROOT/cache"` is resolved by the same rule, so `B="$A/work"` and a
 `mktemp -d "$B/x.XXXXXX"` under it walk as far as they like — the guard reads each line's shape and
 never asks whether `cache` is a directory or a symlink. That root counts as resolved only when EVERY
 assignment to it in that scope leaves a physical path and at least one of them stands at control
-depth zero: a non-resolving assignment that opens its own line disqualifies at any depth, while only
-an unconditional one can certify, so a later `BASE=${TMPDIR:-/tmp}`, or a resolution reached only
+depth zero — keyword depth, so a `then` arm or a loop body cannot certify, while an assignment alone
+inside `( … )` still does, having vanished with the subshell before the allocation runs: a
+non-resolving assignment that opens its own line disqualifies at any depth, while only an
+unconditional one can certify, so a later `BASE=${TMPDIR:-/tmp}`, or a resolution reached only
 inside an `if` arm, leaves the whole scope unresolved — where a second `pwd -P` assignment beside
 the first changes nothing. An assignment that does not open a line is not in the table at all, so
 `if true; then BASE=${TMPDIR:-/tmp}; fi` disqualifies nothing. What the fixpoint does not compare is
