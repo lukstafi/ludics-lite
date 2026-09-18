@@ -32,13 +32,15 @@ One term per concept, used in this file and in every reference it links:
   is a separate Codex app conversation (an app thread) created with `create_thread`, used only
   on the user's explicit choice.
 - **Agent host**: the box the worker's process runs on. **Execution host**: the box a test or
-  measurement runs on. The plan, the board and every reservation carry both.
+  measurement runs on. The plan places execution only (a home box and legs); the agent host
+  follows from the transport chosen at launch; the board and every reservation carry both.
 - **Anchor**: the box (mac-studio) holding the coordinator lease, the halt, the board and the
   execution registry under `FLEET_ANCHOR_STATE`.
-- **Board**: the coordinator-maintained file on the anchor recording every worker of the wave.
-  CLI workers also have the script's own records under `~/.local/state/issue-wave/workers/`,
-  which `fleet-worker.sh ls/status/log/attach/unstick` read; those commands know nothing of
-  native or app workers.
+- **Board**: the coordinator-maintained file on the anchor recording every worker of the wave:
+  native and app workers in full, and for a CLI worker its issue, box, PR, gates and hand-back,
+  since the script's own records under `~/.local/state/issue-wave/workers/` hold only that
+  worker's session, stream and exit. `fleet-worker.sh ls/status/log/attach/unstick` read those
+  records and know nothing of native or app workers.
 - **Request**, **reservation**, **assignment**: a worker *requests* an execution; the
   coordinator turns the request into a *reservation*, one record in the execution registry
   (`fleet-worker.sh execution run`); the *assignment* is the message that resumes the worker
@@ -46,8 +48,9 @@ One term per concept, used in this file and in every reference it links:
   per worker, taken at launch, that covers the worker's own iteration batches.
 - **Returned turn**: the runtime's signal that a worker's turn ended - a Claude Code task
   notification, a Codex `wait_agent` return, a CLI `attach` verdict line. **Handoff**: a
-  returned turn whose final message is a request or a result, so the work continues once the
-  coordinator acts. **Hand-back**: the worker's final report after its merge and after-merge
+  worker's request or result message, after which the work continues once the coordinator
+  acts; it ends the worker's turn on Claude Code and CLI, while a Codex worker sends it
+  mid-turn and waits. **Hand-back**: the worker's final report after its merge and after-merge
   brainstorm, which ends its lifecycle.
 - **Finisher**: a fresh worker launched on a stalled worker's branch after that worker is
   proven stopped.
