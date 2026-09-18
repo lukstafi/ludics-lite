@@ -605,45 +605,8 @@ for f in "${files[@]}"; do
     }
     # Is the mktemp assignment at line <i> resolved by the line below it -- and not used before
     # that? Text only, so it can be computed before the fixpoint that consults it.
-    # Has an earlier line in this scope FROZEN <name>? `readonly` makes a name immutable, and every
-    # later assignment to it is refused by bash -- the command on the right still RUNS, so a
-    # `mktemp -d` still makes its directory, and then the capture is thrown away: the name keeps the
-    # value it was frozen with and the directory is unreachable, with no `set -e` to stop on the
-    # nonzero status. Round 1 read that on the allocation line itself; the freeze can equally sit
-    # any distance above it, and the capturing line then looks perfectly ordinary. Both the bare
-    # `readonly TMP` and the assigning `readonly TMP=old` freeze, so this matches the same shape
-    # `exports` does -- keyword, any number of intervening words, the name, then a separator, an
-    # `=`, or the end. A freeze at TOP LEVEL reaches every scope, because `local` does not shadow it:
-    # `readonly TMP=/etc` above a function whose body says `local TMP` makes bash refuse the `local`
-    # itself (`local: TMP: readonly variable`, verified on 3.2) and the assignment after it, so the
-    # allocation inside is as dead as one at top level. A freeze INSIDE a function is that
-    # function'"'"'s own -- it can be freezing a `local`, which nothing outside the body can see.
-    function freezes(s, name) {
-      return s ~ ("^[ \t]*readonly[ \t]+([^ \t]+[ \t]+)*" name "([ \t=]|$)")
-    }
-    function frozen_before(i, nm,   j) {
-      for (j = 1; j < i; j++) {
-        if (funcof[j] != funcof[i] && funcof[j] != "") continue
-        if (freezes(code[j], nm)) return 1
-      }
-      return 0
-    }
     function resolved_below(i,   nm, l, u) {
       nm = an[i]
-      if (frozen_before(i, nm)) return 0
-      # A name the allocation FROZE has no line below it that could resolve it. `readonly
-      # TMP=$(mktemp -d ...)` makes TMP immutable where the directory is made, so the adjacent
-      # `TMP=$(CDPATH= cd "$TMP" && pwd -P)` is refused by bash itself -- `TMP: readonly variable`
-      # on stderr, a nonzero status that a script without `set -e` walks straight past -- and every
-      # command below it runs on the environment'"'"'s own spelling, which is the defect this guard
-      # exists to catch, now arriving silently and with a zero exit. Reading the alternation for
-      # `readonly` is what made this shape expressible at all (it used to refuse as an uncaptured
-      # call, for the wrong reason), so the keyword has to be read on BOTH sides: a `readonly`
-      # allocation passes only by inheriting a root its template already resolved, never by a
-      # reassignment that cannot run. A `readonly` RESOLUTION is untouched by this -- a plain
-      # assignment followed by a `readonly` one is ordinary bash, and it is the line below that
-      # carries the keyword there, not this one.
-      if (code[i] ~ /^[ \t]*readonly[ \t]+/) return 0
       if (mentions(tail_of(code[i]), nm) || exports(tail_of(code[i]), nm)) return 0
       u = next_code_line(i)
       if (u == 0) return 0
@@ -713,10 +676,28 @@ for f in "${files[@]}"; do
     {
       line = code[FNR]
       if (!has_mktemp_d(line)) next
+      # `readonly` on the ALLOCATION, refused ahead of the capture check so it gets a message about
+      # the freeze rather than the generic one about an uncaptured call. The house shape is two
+      # adjacent lines, and `readonly` on the first makes the second impossible: the name is
+      # immutable from the moment the directory is made, so bash refuses the resolution with `TMP:
+      # readonly variable` and, with no `set -e`, every command below runs on the environment'"'"'s own
+      # spelling while the script still exits 0. A template that is already resolved does not save
+      # it either -- the same allocation under an earlier freeze of the same name runs mktemp, has
+      # its capture refused, and leaks the directory. Whether THAT earlier freeze is in force is not
+      # a question a scanner can answer: bash'"'"'s `readonly` inside a helper is global unless the name
+      # was localized, a definition above a call is not execution order, `readonly -f` freezes a
+      # function and not the variable, `TMP+=` freezes too, and a freeze inside `( ... )` is gone
+      # when the subshell exits. So the guard does not ask. It asks for the house shape instead,
+      # which is decidable from this line alone: capture plainly, resolve on the line below, and
+      # freeze afterwards with a bare `readonly` if the name should be immutable.
+      if (line ~ /^[ \t]*readonly[ \t]+/) {
+        refuse(FNR, "a `readonly` `mktemp -d`: the allocation freezes the name where the directory is made, so the resolution this guard asks for on the next line cannot run — bash refuses it with a `readonly variable` message and a nonzero status that no `set -e` here is catching, and every command below then uses the environment'"'"'s own spelling. Capture it plainly, resolve it with `VAR=$(CDPATH= cd \"$VAR\" && pwd -P)` on the line below, and freeze it after that with a bare `readonly VAR` if it should be immutable")
+        next
+      }
       # Captured means captured BY THIS ASSIGNMENT: the call has to sit inside the `$( ... )` the
       # line opens with, and a second one past that substitution is uncaptured whatever the line
       # begins with.
-      if (line !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+|readonly[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/ ||
+      if (line !~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+|export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/ ||
           !has_mktemp_d(head_of(line)) || !answers_with_mktemp(head_of(line))) {
         refuse(FNR, "a `mktemp -d` whose result is not captured in a variable assignment: this guard resolves a scratch directory by following the variable it lands in, and cannot follow this one — write it as `VAR=$(mktemp -d ...)` and resolve VAR with `pwd -P`")
         next
@@ -726,18 +707,8 @@ for f in "${files[@]}"; do
         next
       }
       nm = an[FNR]
-      # Before the inherited root, because a frozen name is not a capture at all: the template may
-      # be as physical as you like, and the path mktemp answers with still goes nowhere.
-      if (frozen_before(FNR, nm)) {
-        refuse(FNR, "a `mktemp -d` into $" nm ", which an earlier `readonly` in this scope already froze: bash refuses the assignment, so the call runs, the directory is made, and the capture is discarded — $" nm " keeps the value it was frozen with and the new directory is unreachable, with nothing but a message on stderr and a nonzero status no `set -e` is here to catch. Capture it in a name nothing has frozen, and resolve THAT with `pwd -P`")
-        next
-      }
       if (scope_resolved(FNR, lead_var(template_of(head_of(line))))) next   # inherited root
       if (mkok[FNR]) next
-      if (line ~ /^[ \t]*readonly[ \t]+/) {
-        refuse(FNR, "a `readonly` `mktemp -d` into $" nm ": the allocation freezes the name, so no resolution below it can run — bash refuses the reassignment with `" nm ": readonly variable` and, without `set -e`, every command after it uses the environment'"'"'s own spelling and the script still exits 0. Drop the `readonly` and put `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)` on the next line, or keep the `readonly` and build the template on a directory this file already resolved")
-        next
-      }
       if (mentions(tail_of(line), nm) || exports(tail_of(line), nm)) {
         refuse(FNR, "a `mktemp -d` into $" nm " that is used later on its OWN line, before anything could resolve it: the resolution below does not reach a command that already ran with the environment'"'"'s spelling — put `" nm "=$(CDPATH= cd \"$" nm "\" && pwd -P)` between them")
         next
