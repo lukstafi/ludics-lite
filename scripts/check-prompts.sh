@@ -916,8 +916,8 @@ check_drift_guard() {
 # helper is one usage() lists. What is an option OF the helper, on the prompt's side, is a line
 # shape and not a judgement: the helper's command lines -- a line inside a backtick fence naming
 # `post-merge-cleanup.sh`, from that name to the first shell separator, and every line a trailing
-# backslash continues it onto. The shell's grammar is modelled only as far as those shapes (see
-# `invocation_options` for what is and is not: separators, redirections, quotes). A `--flag` in
+# backslash continues it onto, read a WORD at a time. The shell's grammar is modelled only as far
+# as `invocation_options` states, and its residue errs toward refusal. A `--flag` in
 # prose, or on some other command's line (`gh pr merge --delete-branch`, the test runner's
 # `--list`), is attributed to nothing, so an option the prompt explains but never passes is not
 # held to the register from that side. And a name present is a name present: whether the prose
@@ -925,13 +925,14 @@ check_drift_guard() {
 CLEANUP_HELPER=ship-pr/scripts/post-merge-cleanup.sh
 CLEANUP_PROMPT=ship-pr/SKILL.md
 
-# usage_options <script>: the options usage()'s heredoc lists, one per line -- each line of the
-# body, between the `usage() {` line and its closing `}`, that opens with two blanks and a
-# `--name`, which is the listing's own shape (`  --base <branch>  Base branch …`). The delimiter is
-# whatever the `<<` names, quoted or not and with or without a blank after the operator, so the
-# reader is not tied to `EOF`; a `}` inside the heredoc is text and does not close the function;
-# the prose below the listing, which mentions an option mid-sentence, is at no such indent and
-# is not read.
+# usage_options <script>: the options usage()'s heredoc lists, one per line as `--name<TAB>arity`
+# -- each line of the body, between the `usage() {` line and its closing `}`, that opens with two
+# blanks and a `--name`, which is the listing's own shape (`  --base <branch>  Base branch …`), and
+# the arity is 1 when a `<value>` placeholder follows the name, else 0. The delimiter is whatever
+# word the `<<` names, quoted or not, with or without a blank after the operator, and under `<<-`
+# the body's leading tabs are stripped as the shell strips them; a `}` inside the heredoc is text
+# and does not close the function; the prose below the listing, which mentions an option
+# mid-sentence, is at no such indent and is not read.
 usage_options() {
   awk '
     !infn && /^usage\(\) \{/ { infn = 1; next }
@@ -939,33 +940,46 @@ usage_options() {
     # data, and exiting on it would drop every option listed below it while the register stayed
     # nonempty -- an agreement over half the list.
     infn && !inhd && /^\}/ { exit }
-    infn && !inhd && match($0, /<<-?[[:space:]]*["'"'"']?[A-Za-z_][A-Za-z_0-9]*["'"'"']?[[:space:]]*$/) {
+    infn && !inhd && match($0, /<<-?[[:space:]]*("[^"]+"|'"'"'[^'"'"']+'"'"'|[^[:space:]"'"'"'<>|&;]+)[[:space:]]*$/) {
       d = substr($0, RSTART, RLENGTH); dash = (d ~ /^<<-/)
-      sub(/^<<-?/, "", d); gsub(/["'"'"'[:space:]]/, "", d)
+      sub(/^<<-?[[:space:]]*/, "", d); sub(/[[:space:]]*$/, "", d); gsub(/["'"'"']/, "", d)
       inhd = 1; next
     }
     inhd {
       l = $0
-      # `<<-` strips leading tabs from the body and the delimiter, so this reader does too.
       if (dash) sub("^\t+", "", l)
       if (l == d) { inhd = 0; next }
       if (match(l, /^  --[A-Za-z0-9][A-Za-z0-9-]*([[:space:]]|$)/)) {
-        o = substr(l, 3, RLENGTH - 2); sub(/[[:space:]]$/, "", o); print o
+        o = substr(l, 3, RLENGTH - 2); sub(/[[:space:]]$/, "", o)
+        print o "\t" (substr(l, RLENGTH + 1) ~ /^[[:space:]]*</ ? 1 : 0)
       }
     }
   ' "$1"
 }
 
-# invocation_options <prompt>: every `--option` token on the helper's command lines in the prompt,
-# one per line. A command line is a line inside a backtick fence that names `post-merge-cleanup.sh`
-# as a path component or a word -- `test-post-merge-cleanup.sh` is another file -- plus each line
-# a trailing backslash continues it onto, up to the first shell separator after the name. Fences
-# are the block scope here, unlike the link check: the shape being read is a command, and a
-# command the prompt tells the agent to run is fenced.
+# invocation_options <prompt> <valued>: every `--option` the prompt's helper command lines pass,
+# one per line. A command line is a line inside a backtick fence on which `post-merge-cleanup.sh`
+# stands as a whole name -- preceded by nothing that could extend it leftward into a longer name,
+# so a `/`, a blank, a quote, a `(` or the line's start all serve, and `test-post-merge-cleanup.sh`
+# is another file -- from that name to the first shell separator (`;`, `&&`, `||`, `|`, `&`, or the
+# `)` that closes a subshell or substitution), plus each line a trailing
+# backslash continues it onto; what follows a separator is searched again for a second invocation.
+# Within that, the shell is modelled at the WORD: the segment is split on blanks, a word wrapped
+# whole in one kind of quote is unquoted, a word opening with `--` is an option, and the word after
+# an option in <valued> (the register's arity-1 names, blank-separated) is that option's value
+# whatever it looks like, since the helper takes it so. A fence is a run of three or more
+# backticks up to three blanks in, closed only by a run at least as long with nothing after it,
+# as CommonMark reads them. What is NOT modelled: a quoted argument holding a blank is several
+# words here, so a separator or a `--word` inside one is read as if unquoted, which drops options
+# or reports one the shell never passed -- both refusals, never an acceptance -- and a `~~~`
+# fence is prose.
 invocation_options() {
-  awk '
-    # A fence may stand up to three blanks in, as CommonMark allows.
-    /^ {0,3}```/ { fence = !fence; cont = 0; next }
+  awk -v valued=" $2 " '
+    match($0, /^ {0,3}`{3,}/) {
+      run = RLENGTH - index($0, "`") + 1
+      if (!fence) { fence = 1; flen = run; cont = 0; skip = 0; next }
+      if (run >= flen && substr($0, RLENGTH + 1) ~ /^[[:space:]]*$/) { fence = 0; cont = 0; next }
+    }
     !fence { cont = 0; next }
     {
       line = $0
@@ -974,26 +988,22 @@ invocation_options() {
       gsub(/[0-9]*[<>]&[0-9-]*/, " ", line); gsub(/&>>?/, " ", line)
       while (1) {
         if (!cont) {
-          # The helper'"'"'s own simple command starts at its name -- a path component or a word,
-          # closed by a blank, a shell quote or the end of the line -- so a command chained
-          # BEFORE it contributes nothing.
-          if (!match(line, /(^|[\/[:space:]])post-merge-cleanup\.sh([[:space:]"'"'"']|$)/)) break
-          line = substr(line, RSTART)
+          if (!match(line, /(^|[^A-Za-z0-9_.-])post-merge-cleanup\.sh([^A-Za-z0-9_.-]|$)/)) break
+          line = substr(line, RSTART); sub(/^[^p]/, "", line); skip = 0
         }
         cont = (line ~ /\\[[:space:]]*$/)
-        # ...and it ends at the first shell separator -- `;`, `&&`, `||`, `|`, `&` -- after which
-        # the `--json` of a chained `gh` is that command'"'"'s and no continuation is the helper'"'"'s;
-        # what follows the separator is searched again, since a second invocation may stand
-        # there. Quoting is not modelled: a separator inside a quoted argument ends the read
-        # early, which drops options rather than inventing them, and a `--word` inside a quoted
-        # argument is read as passed, which refuses rather than accepts.
         rest = ""
-        if (match(line, /[;&|]/)) { rest = substr(line, RSTART + 1); line = substr(line, 1, RSTART - 1); cont = 0 }
-        # A token is the WHOLE shell word: `--base_branch` is not `--base` with a suffix, and
-        # `--base=main` is a spelling the helper does not take, so both are reported as passed.
-        while (match(line, /(^|[[:space:]])--[^[:space:]]+/)) {
-          tok = substr(line, RSTART, RLENGTH); sub(/^[[:space:]]/, "", tok); print tok
-          line = substr(line, RSTART + RLENGTH)
+        # A `)` ends the command as a separator does: a subshell or a substitution closes there.
+        if (match(line, /[;&|)]/)) { rest = substr(line, RSTART + 1); line = substr(line, 1, RSTART - 1); cont = 0 }
+        sub(/\\[[:space:]]*$/, "", line)
+        n = split(line, w, /[[:space:]]+/)
+        for (i = 1; i <= n; i++) {
+          if (w[i] == "") continue
+          if (skip) { skip = 0; continue }
+          if (w[i] ~ /^"[^"]*"$/ || w[i] ~ /^'"'"'[^'"'"']*'"'"'$/) w[i] = substr(w[i], 2, length(w[i]) - 2)
+          if (w[i] !~ /^--./) continue
+          print w[i]
+          if (index(valued, " " w[i] " ") > 0) skip = 1
         }
         if (rest == "") break
         line = rest; cont = 0
@@ -1003,7 +1013,7 @@ invocation_options() {
 }
 
 check_cleanup_options() {
-  local listed passed o n nl bad=0
+  local listed valued passed o n nl bad=0
   nl=$'\n'
   # A root without the helper documents no helper, so it carries no obligation -- the same rule as
   # the drift guard's sync script and the slot count's worker.
@@ -1018,12 +1028,15 @@ check_cleanup_options() {
     ko "$CLEANUP_HELPER" "usage() lists no options this reader can see: a heredoc line opening with two blanks and a --name"
     return 0
   fi
+  valued=$(printf '%s\n' "$listed" | awk -F'\t' '$2 == 1 { printf "%s ", $1 }')
+  listed=$(printf '%s\n' "$listed" | cut -f1)
   n=$(printf '%s\n' "$listed" | grep -c .)
-  passed=$(invocation_options "$ROOT/$CLEANUP_PROMPT" | sort -u)
+  passed=$(invocation_options "$ROOT/$CLEANUP_PROMPT" "$valued" | sort -u)
   while IFS= read -r o; do
     [ -n "$o" ] || continue
-    # The token whole: `--base` is not found inside `--base-branch`, and `.` is a literal.
-    matches "(^|[^A-Za-z0-9-])$(printf '%s' "$o" | sed 's/[.]/[.]/g')([^A-Za-z0-9-]|\$)" "$(cat "$ROOT/$CLEANUP_PROMPT")" \
+    # The token whole, and in the token grammar the invocation side uses: `--base` is not found
+    # inside `--base-branch` or `--base_branch`, and `.` is a literal.
+    matches "(^|[^A-Za-z0-9_.-])$(printf '%s' "$o" | sed 's/[.]/[.]/g')([^A-Za-z0-9_.-]|\$)" "$(cat "$ROOT/$CLEANUP_PROMPT")" \
       || { ko "$CLEANUP_PROMPT" "names no '$o', which $CLEANUP_HELPER's usage() lists: the prompt is where the option is learned of (ludics-lite#276)"; bad=1; }
   done <<<"$listed"
   while IFS= read -r o; do

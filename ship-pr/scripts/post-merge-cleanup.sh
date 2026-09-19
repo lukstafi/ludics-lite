@@ -43,7 +43,8 @@ usage: post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> [option
 
 Options:
   --base <branch>       Base branch to refresh and verify (default: master)
-  --force-integrated    Followed by why this squash/rebase merge is confirmed
+  --force-integrated <reason>
+                        Why this squash/rebase merge is confirmed
   --regenerable <name>  A top-level directory of the session worktree that cleanup may
                         REMOVE rather than refuse over or archive, such as a build tree.
                         Repeatable, no default; the name must be one untracked directory

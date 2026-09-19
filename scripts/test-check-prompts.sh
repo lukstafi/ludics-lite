@@ -1107,6 +1107,44 @@ cleanup_edit "$CLEANUP_HELPER" "/<<'EOF'/,/^EOF\$/{ s/<<'EOF'/<<-'EOF'/; /<<-'EO
 expect "a <<- heredoc with a tab-indented body and delimiter is still the listing" 0 \
   "$CLEANUP_AGREE" -- "$CP" "$R"
 
+# Round 3, P2 x6: the word model. A quoted word is unquoted; the helper's name is whole whatever
+# operator precedes it; a heredoc delimiter is any word; the listing side uses the same token
+# grammar as the invocation side; a fence closes only on a run as long as its opener; and the
+# word after a valued option is its value whatever it looks like.
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c "--keep-branch"\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a quoted option word is the option" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n(post-merge-cleanup.sh a b c --keep-branch)\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a bare invocation after a shell operator is the helper" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\nout=$(~/x/post-merge-cleanup.sh a b c --keep-branch)\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...and one inside a command substitution" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" "s/<<'EOF'/<<'USAGE-END'/; s/^EOF\$/USAGE-END/"
+expect "a heredoc delimiter that is not an identifier is still the delimiter" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_PROMPT" 's/--base\([^-A-Za-z0-9_]\)/--base_branch\1/g'
+expect "a misspelling in prose does not name the listed option" 1 "names no '--base'" -- "$CP" "$R"
+cleanup_tree
+printf '\n````bash\ncat <<X\n```\nX\n~/x/post-merge-cleanup.sh a b c --keep-branch\n````\n' >> "$R/$CLEANUP_PROMPT"
+expect "a three-backtick line inside a four-backtick fence does not close it" 1 \
+  "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --force-integrated --confirmed-by-GitHub --regenerable --cache\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a valued option's value is its value, however it is spelled" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --base \\\n  --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...across a continuation too" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+# ...while an option usage() lists with no <value> placeholder consumes nothing.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^\(  --base .*\)$/\1\
+  --dry-run             Report what cleanup would do and change nothing/'
+printf '\nPass `--dry-run` to rehearse.\n\n```bash\n~/x/post-merge-cleanup.sh a b c --dry-run --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a flag option consumes no value, so the word after it is read" 1 \
+  "passes '--keep-branch'" -- "$CP" "$R"
+
 # The listing side is a mention, verbatim, anywhere in the prompt: the option's command lines
 # deleted and its prose kept still names it. That is the residue this check states rather than
 # hides -- a name present says nothing about whether the prose around it is true.
