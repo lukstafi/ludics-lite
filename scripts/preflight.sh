@@ -11,7 +11,8 @@
 # `if: !cancelled()` shape -- and prints a summary. Exit 0 when nothing failed, 1 when something
 # did, 2 on a usage error or a scope that describes nothing.
 #
-#   - syntax           bash -n over every tracked script (THE FILE LIST below)
+#   - syntax           bash -n over every tracked script (THE FILE LIST below; inside a git work
+#                      tree the scope is what git holds, which is what a push carries)
 #   - modes            the two-way mode rule: a script is executable, an *.example.sh is not
 #   - shellcheck       shellcheck --severity=error --external-sources over the same list
 #   - powershell       pwsh parses scripts/*.ps1, and refuses to judge zero of them
@@ -106,9 +107,37 @@ step_command() { # step_command <name>: the external command, `-`, or empty when
   return 1
 }
 
+is_tracked() { # is_tracked <path>: is it one of the paths git carries?
+  local tracked
+  for tracked in ${TRACKED_FILES[@]+"${TRACKED_FILES[@]}"}; do
+    [ "$tracked" = "$1" ] && return 0
+  done
+  return 1
+}
+
 collect_files() { # fills FILES with the paths the globs expand to, relative to the judged checkout
   local pattern path matched
   [ "${#FILES[@]}" -eq 0 ] || return 0
+  # THE SCOPE IS WHAT A PUSH CARRIES. Inside a git work tree the expansion is intersected with the
+  # paths git holds -- the index included, so a `git add`ed file is judged before it is committed.
+  # `actions/checkout` contains no untracked file, so a scratch `scripts/probe.sh` an agent left
+  # in a worktree is not something CI will ever open, and going red over it would make the local
+  # command and the CI command disagree in the one direction that matters: a red the push does not
+  # have is what teaches the reader to stop running the preflight (round 5).
+  # issue-wave/scripts/test-fleet-worker.sh's coverage guard reads tracked paths for this reason
+  # and said so first. Outside a work tree -- the scratch checkouts scripts/test-preflight.sh
+  # builds, and any unpacked copy -- the filesystem is the list, which is also the fixtures' way
+  # of judging trees git knows nothing about.
+  TRACKED_FILES=()
+  TRACKED_SCOPE=
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    TRACKED_SCOPE=1
+    # NUL-delimited, since a tracked path may hold anything but a NUL. The pathspec's `*` crosses
+    # `/`, so one pattern reaches every depth.
+    while IFS= read -r -d '' path; do
+      TRACKED_FILES+=("$path")
+    done < <(git ls-files -z -- '*.sh')
+  fi
   for pattern in "${GLOBS[@]}"; do
     matched=0
     # Unquoted: this is pathname expansion, the workflow's own. An unmatched pattern arrives as
@@ -118,10 +147,10 @@ collect_files() { # fills FILES with the paths the globs expand to, relative to 
     # this replaced handed it to bash and went red. A path that exists as a link is a path this
     # list owes a verdict on, and bash and shellcheck both refuse it loudly (round 1).
     for path in $pattern; do
-      { [ -e "$path" ] || [ -L "$path" ]; } && {
-        FILES+=("$path")
-        matched=1
-      }
+      { [ -e "$path" ] || [ -L "$path" ]; } || continue
+      [ -z "$TRACKED_SCOPE" ] || is_tracked "$path" || continue
+      FILES+=("$path")
+      matched=1
     done
     # Fail closed per PATTERN, not merely when the whole sweep is empty: the inline loops this
     # replaced handed an unmatched pattern to bash and shellcheck as the literal it arrives as,
@@ -130,7 +159,7 @@ collect_files() { # fills FILES with the paths the globs expand to, relative to 
     # stopped describing the checkout (round 2). A pattern that should no longer match is an edit
     # to this list, which is the whole point of the list being here.
     [ "$matched" -eq 1 ] ||
-      die "no file matched $pattern under $ROOT -- the file list has stopped describing the checkout"
+      die "no ${TRACKED_SCOPE:+tracked }file matched $pattern under $ROOT -- the file list has stopped describing the checkout"
   done
 }
 

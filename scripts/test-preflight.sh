@@ -219,6 +219,34 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$T/scripts/check-prompts.sh"
 chmod +x "$T/scripts/check-prompts.sh"
 expect "...and runs it when it is" 0 'prompts: PASS' -- "$PF" --root "$T" prompts
 
+# --- the scope inside a git work tree -----------------------------------------------------------
+#
+# CI judges an actions/checkout, which holds no untracked file. A scratch script an agent leaves
+# in a worktree must therefore not turn the pre-push command red, and the same file must be judged
+# the moment it is staged, which is when a push would carry it (round 5).
+
+tree git_scope
+if git -C "$T" init -q >/dev/null 2>&1 && git -C "$T" add -A >/dev/null 2>&1; then
+  ok "the git-scope control could be built"
+  expect "a tracked tree passes" 0 'syntax: PASS' -- "$PF" --root "$T" syntax
+  printf '#!/usr/bin/env bash\nif [ ; then\n' >"$T/scripts/agent-scratch.sh"
+  chmod +x "$T/scripts/agent-scratch.sh"
+  git_files=$("$PF" --root "$T" files)
+  case $git_files in
+  *agent-scratch.sh*) ko "an untracked scratch script was in the file list: $git_files" ;;
+  *) ok "...an untracked scratch script is not in the file list, as it is not in the push" ;;
+  esac
+  expect "...so the syntax step does not go red over a file CI will never see" \
+    0 'syntax: PASS' -- "$PF" --root "$T" syntax
+  git -C "$T" add scripts/agent-scratch.sh >/dev/null 2>&1
+  expect "...and the same file staged IS judged, which is when a push would carry it" \
+    1 'scripts/agent-scratch.sh does not parse' -- "$PF" --root "$T" syntax
+  expect "...while outside a work tree the filesystem is the list, as the trees above rely on" \
+    1 'does not parse' -- "$PF" --root "$TMP/syntax_broken" syntax
+else
+  ko "could not build a scratch git repository: the tracked-scope controls below would prove nothing"
+fi
+
 # --- a step in the table with nothing behind it -------------------------------------------------
 #
 # The negative control needs a table entry that no arm implements, which only a patched copy of
@@ -326,14 +354,18 @@ job_run_commands() { # job_run_commands <job>
 # hygiene job is the case that matters most: it is the only check a prompt-only head gets.
 workflow_bare_commands() {
   awk '
-    $1 == "run:" {
-      if (NF == 2) { print $2; next }
-      if ($3 == "||" || $3 == "&&" || $3 == ";" || $3 == "|") print $2
+    # An operator tail counts only when the line still FAILS if the command does. `|| true`,
+    # `; true` and `| cat` each swallow the status, and a pin that took any operator for a bare
+    # invocation would pass over a prompt hygiene step that can no longer go red (round 5). The
+    # one tail accepted is the `|| { echo ...; exit 1; }` this workflow uses; another spelling that
+    # propagates is a line here, deliberately, rather than an attempt to read shell semantics.
+    function bare(cmd, first, tail) {
+      if (first == "") return cmd
+      if (first == "||" && tail ~ /exit 1[ \t]*[;}]/) return cmd
+      return ""
     }
-    $1 == "-" && $2 == "run:" {
-      if (NF == 3) { print $3; next }
-      if ($4 == "||" || $4 == "&&" || $4 == ";" || $4 == "|") print $3
-    }
+    $1 == "run:" { c = bare($2, (NF >= 3 ? $3 : ""), $0); if (c != "") print c }
+    $1 == "-" && $2 == "run:" { c = bare($3, (NF >= 4 ? $4 : ""), $0); if (c != "") print c }
   ' "$WORKFLOW"
 }
 # The steps the lint job invokes WITHOUT --require-tools. A step with an interpreter that CI does
@@ -594,6 +626,24 @@ if probe_workflow_swap '        run: scripts/check-prompts.sh' \
   grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
     && ok "...while a shell operator after the command is not an argument, and is not refused" \
     || ko "the macOS '<suite> || { ... }' spelling was read as an argument"
+else
+  ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
+fi
+
+# ...and a tail that swallows the command's status is not a run of it either.
+if probe_workflow_swap '        run: scripts/check-prompts.sh' \
+  '        run: scripts/check-prompts.sh || true'; then
+  grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+    && ko "'|| true' after the prompt hygiene step still read as a bare invocation" \
+    || ok "...and a '|| true' tail, which cannot go red, does not count as running the check"
+else
+  ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
+fi
+if probe_workflow_swap '        run: scripts/check-prompts.sh' \
+  '        run: scripts/check-prompts.sh | cat'; then
+  grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+    && ko "a pipe after the prompt hygiene step still read as a bare invocation" \
+    || ok "...nor does a pipe, whose status is the last command's"
 else
   ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
 fi
