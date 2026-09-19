@@ -33,7 +33,8 @@
 # --root DIR judges DIR instead of this script's own checkout. It is how scripts/test-preflight.sh
 # puts a defective tree in front of each assertion; nothing else needs it.
 #
-# `steps` prints "name<TAB>command" per step (`-` for one implemented here), `globs` the file-list
+# `steps` prints "name<TAB>command<TAB>tool" per step (`-` for one implemented here, an empty tool
+# for one that needs nothing beyond this shell), `globs` the file-list
 # patterns, `files` the paths they expand to in the judged checkout. They are the read-only half of
 # "one place": scripts/test-preflight.sh pins the step table against the lint job's steps, and
 # issue-wave/scripts/test-fleet-worker.sh reads `globs` for its lint-coverage guard rather than
@@ -346,7 +347,12 @@ CDPATH= cd "$ROOT" || die "cannot enter $ROOT"
 if [ "${#WANTED[@]}" -eq 1 ]; then
   case "${WANTED[0]}" in
   steps)
-    for entry in "${STEPS[@]}"; do printf '%s\t%s\n' "${entry%%:*}" "${entry#*:}"; done
+    # The tool column is what lets scripts/test-preflight.sh ask which of these steps CI must
+    # invoke with --require-tools: a step with an interpreter is one whose absence would
+    # otherwise be a SKIP on a hosted runner (round 4).
+    for entry in "${STEPS[@]}"; do
+      printf '%s\t%s\t%s\n' "${entry%%:*}" "${entry#*:}" "$(step_tool "${entry%%:*}")"
+    done
     exit 0
     ;;
   globs)

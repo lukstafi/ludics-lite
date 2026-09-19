@@ -317,8 +317,43 @@ job_run_commands() { # job_run_commands <job>
     in_job && $1 == "run:" { print $2 }
   ' "$WORKFLOW"
 }
-workflow_run_commands() {
-  awk '$1 == "run:" { print $2 } $1 == "-" && $2 == "run:" { print $3 }' "$WORKFLOW"
+# The command word of every `run:` line whose invocation carries NO ARGUMENTS -- nothing between
+# the command and the end of the line or the shell operator that follows it (the macOS legs spell
+# every suite `<suite> || { echo ...; exit 1; }`, which is a bare invocation of the suite). An
+# argument is what turns a run into something other than the check the table names: `--help` exits
+# 0 having asserted nothing, and a path narrows a guard's sweep from the checkout to that file,
+# either of which would satisfy a pin that read the command word alone (round 4). The prompt
+# hygiene job is the case that matters most: it is the only check a prompt-only head gets.
+workflow_bare_commands() {
+  awk '
+    $1 == "run:" {
+      if (NF == 2) { print $2; next }
+      if ($3 == "||" || $3 == "&&" || $3 == ";" || $3 == "|") print $2
+    }
+    $1 == "-" && $2 == "run:" {
+      if (NF == 3) { print $3; next }
+      if ($4 == "||" || $4 == "&&" || $4 == ";" || $4 == "|") print $3
+    }
+  ' "$WORKFLOW"
+}
+# The steps the lint job invokes WITHOUT --require-tools. A step with an interpreter that CI does
+# not demand is one a runner losing that interpreter turns into a SKIP and a green job -- the
+# fail-closed half of this PR's own promise, dropped by deleting one word from a run line.
+lint_preflight_unguarded() {
+  awk -v want="  lint:" '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_job = ($0 == want); next }
+    in_job && $1 == "run:" && $2 == "scripts/preflight.sh" {
+      for (i = 3; i <= NF; i++) if ($i == "-h" || $i == "--help") next
+      for (i = 3; i <= NF; i++) if ($i == "--require-tools") next
+      named = 0
+      for (i = 3; i <= NF; i++) {
+        if ($i ~ /^-/) { if ($i == "--root") i++; continue }
+        print $i
+        named = 1
+      }
+      if (!named) print "*"
+    }
+  ' "$WORKFLOW"
 }
 # The STEP NAMES the lint job passes to preflight.sh, `*` for an invocation that names none and so
 # runs them all. Reading only the command word would exempt every preflight line unconditionally:
@@ -355,8 +390,10 @@ table_commands=$("$PF" steps | awk -F'\t' '$2 != "-" { print $2 }')
 # they are pinned by the name the lint job passes.
 table_internal=$("$PF" steps | awk -F'\t' '$2 == "-" { print $1 }')
 table_names=$("$PF" steps | awk -F'\t' '{ print $1 }')
+# The steps that need an interpreter, which is what CI must demand with --require-tools.
+table_tooled=$("$PF" steps | awk -F'\t' '$3 != "" { print $1 }')
 lint_commands=$(job_run_commands lint)
-all_run_commands=$(workflow_run_commands)
+bare_run_commands=$(workflow_bare_commands)
 
 [ -n "$lint_commands" ] && ok "the lint job's run: lines can be read" \
   || ko "no run: lines found in the lint job -- the pin below would pass over nothing"
@@ -379,13 +416,30 @@ EOF
 unrun=
 while IFS= read -r cmd; do
   [ -n "$cmd" ] || continue
-  grep -Fqx -- "$cmd" <<<"$all_run_commands" || unrun="$unrun $cmd"
+  grep -Fqx -- "$cmd" <<<"$bare_run_commands" || unrun="$unrun $cmd"
 done <<EOF
 $table_commands
 EOF
 [ -z "$unrun" ] \
-  && ok "...and every check preflight.sh runs is one the workflow runs too" \
-  || ko "preflight.sh runs what no workflow step does:$unrun"
+  && ok "...and every check preflight.sh runs is one the workflow runs too, with no argument to neuter it" \
+  || ko "preflight.sh runs what no workflow step runs bare:$unrun"
+[ -n "$bare_run_commands" ] && ok "the workflow's bare invocations can be read" \
+  || ko "no bare run: invocation found in the workflow -- the pin above would pass over nothing"
+
+# The same validation on the flag CI's own fail-closed promise rests on.
+unguarded=$(lint_preflight_unguarded)
+ungated=
+while IFS= read -r name; do
+  [ -n "$name" ] || continue
+  if grep -Fqx -- '*' <<<"$unguarded" || grep -Fqx -- "$name" <<<"$unguarded"; then
+    ungated="$ungated $name"
+  fi
+done <<EOF
+$table_tooled
+EOF
+[ -z "$ungated" ] \
+  && ok "...and every step with an interpreter is invoked by CI with --require-tools" \
+  || ko "the lint job invokes a tool-dependent step without --require-tools:$ungated"
 
 # unrun_steps LIST: the internal steps no line of LIST names, `*` covering all of them.
 unrun_steps() { # unrun_steps <newline-separated step names>
@@ -522,6 +576,36 @@ if probe_workflow_swap '        run: scripts/preflight.sh --require-tools syntax
     || ko "a --help invocation was read as running its step (verdict:$(unrun_steps "$(lint_preflight_steps)"))"
 else
   ko "the swap probe rewrote nothing: the lint job no longer spells the syntax step as this file expects"
+fi
+
+# An argument that neuters an external check is the same drift on the other side of the table.
+if probe_workflow_swap '        run: scripts/check-prompts.sh' \
+  '        run: scripts/check-prompts.sh --help'; then
+  probe_bare=$(workflow_bare_commands)
+  grep -Fqx -- scripts/check-prompts.sh <<<"$probe_bare" \
+    && ko "a --help argument on the prompt hygiene step still read as a bare invocation" \
+    || ok "...and an argument on an external check's own step trips the bare-invocation pin"
+else
+  ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
+fi
+# ...while the macOS spelling, which is an operator and not an argument, must NOT be refused.
+if probe_workflow_swap '        run: scripts/check-prompts.sh' \
+  "        run: scripts/check-prompts.sh || { echo 'failed'; exit 1; }"; then
+  grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+    && ok "...while a shell operator after the command is not an argument, and is not refused" \
+    || ko "the macOS '<suite> || { ... }' spelling was read as an argument"
+else
+  ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
+fi
+
+# Dropping --require-tools is one word, and it turns CI's fail-closed step into a SKIP.
+if probe_workflow_swap '        run: scripts/preflight.sh --require-tools shellcheck' \
+  '        run: scripts/preflight.sh shellcheck'; then
+  grep -Fqx -- shellcheck <<<"$(lint_preflight_unguarded)" \
+    && ok "...and a tool-dependent step invoked without --require-tools is reported" \
+    || ko "dropping --require-tools from the shellcheck step was not reported"
+else
+  ko "the swap probe rewrote nothing: the lint job no longer spells the shellcheck step as this file expects"
 fi
 
 # The shape that must NOT be refused: one invocation with no step names runs them all, which is a
