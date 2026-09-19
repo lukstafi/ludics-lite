@@ -1001,7 +1001,7 @@ env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold 
   && ok "an unconfirmed release leaves both its record and its marker for the next run to find" \
   || ko "the unconfirmed release did not leave its pending state behind"
 out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
-[ "$rc" -eq 0 ] && grep -q 'finishing that release before taking the box' <<<"$out" \
+[ "$rc" -eq 0 ] && grep -q 'confirming the VM is free of it before taking the box' <<<"$out" \
   && grep -q "guest shell (pid $old_guest) is gone from the VM" <<<"$out" \
   && ok "...and the next --hold finishes it before taking the box (rc=$rc)" \
   || ko "a new hold ignored the pending release (rc=$rc) -- $out"
@@ -1059,6 +1059,37 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP=
   && [ -f "$TMP/state/hold-rog.pid" ] \
   && ok "a probe whose connection dropped after the header is unverified, not a release (rc=$rc)" \
   || ko "an ssh error status was consumed as a complete probe (rc=$rc) -- $out"
+reset_hold_state
+
+# ...and the confirmation is gated on the RECORD, not on the release marker beside it. The marker
+# can fail to be written (a state filesystem briefly full) and it is absent entirely when a holder
+# DIED rather than being released -- the #237 shape, whose orphan the lore says nothing can name.
+# Either way a record carrying a token could mean a holder of ours is still in that VM, and that is
+# the only question a new hold has to answer before discarding it (review round 5, P1).
+reset_hold_state
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+    WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
+    SSH_REMOTE_LEAKS=2 "$WL" kick-wsl --hold rog >/dev/null 2>&1
+# The holder dies with no unhold at all, so nothing writes a marker -- and its remote survives.
+kill "$(awk '{ print $1 }' "$TMP/state/hold-rog.pid")" 2>/dev/null
+for _ in 1 2 3 4 5; do alive "$(awk '{ print $1 }' "$TMP/state/hold-rog.pid")" || break; sleep 1; done
+rm -f "$TMP/state/hold-rog.releasing"
+# The hold lock goes with the holder, but its sidecar only notices on its next poll -- so wait for
+# the box to be free before taking it, or this case measures that one-second refusal instead.
+for _ in $(seq 1 15); do
+  ( exec 7>>"$WAKE_LAB_LOCK_DIR/rog.hold.lock"
+    perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7 ) && break
+  sleep 1
+done
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+      WAKE_LAB_HOLD_TEARDOWN_SECONDS=4 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+      SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" "$WL" kick-wsl --hold rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'has a holder on record whose client is gone' <<<"$out" \
+  && grep -q 'may still be running in the VM' <<<"$out" \
+  && ! grep -q -- '-e sh -s' "$SSH_LOG" \
+  && ok "a tokened record with NO marker still blocks a new hold over a survivor (rc=$rc)" \
+  || ko "a hold discarded a tokened record without confirming the VM (rc=$rc) -- $out; $(cat "$SSH_LOG")"
 reset_hold_state
 
 # A holder taken with --force never held the box's hold lock, so nothing refused another session's

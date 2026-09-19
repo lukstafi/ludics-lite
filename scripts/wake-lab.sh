@@ -1115,21 +1115,27 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   # a second holder would make the first one permanently untracked, still pinning the VM, and
   # outliving the release of the holder about to be spawned. So this run finishes that job first,
   # and only takes the box if the VM says the old guest shell is gone.
-  if [ -e "${f%.pid}.releasing" ]; then
-    rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
-    if [ -n "$rec" ]; then
-      read -r rp rd rt rsc rtok rgp rprot <<<"$rec"; : "$rp" "$rt" "$rsc" "$rprot"
-      if [ -n "$rtok" ] && [ "$rtok" != '-' ]; then
-        echo "  an earlier unhold on $name ended its holder's client but never confirmed the VM was free;"
-        echo "  finishing that release before taking the box:"
-        HOLD_CONFIRM=""
-        hold_confirm_gone "$name" "$rd" "$rgp" "$rtok" "an earlier unhold ended its client"
-        if [ "$HOLD_CONFIRM" != gone ]; then
-          echo "  wsl holder NOT started on $name: that earlier holder may still be running in the VM,"
-          echo "    and starting a second one would leave it untracked and pinning the box for good."
-          echo "    Its record is kept; run 'wake-lab.sh unhold $name' again when the box answers."
-          return 1
-        fi
+  # The gate is the RECORD, not the marker. A marker says an unhold ended the client deliberately,
+  # which is what release_hold needs to tell a release from a loss -- but the question here is
+  # different and simpler: could a holder of ours still be running in that VM? Any record carrying
+  # a token could mean yes, however its client died, so the marker is not required to ask. Two
+  # things follow. A marker that could not be written (a state filesystem briefly full) no longer
+  # loses the pending cleanup it was the only sign of, and a holder that died WITHOUT an unhold --
+  # the ludics-lite#237 shape, whose orphan the lore says nothing can name -- is confirmed here
+  # too, where before this it was simply deleted.
+  rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
+  if [ -n "$rec" ]; then
+    read -r rp rd rt rsc rtok rgp rprot <<<"$rec"; : "$rp" "$rt" "$rsc" "$rprot"
+    if [ -n "$rtok" ] && [ "$rtok" != '-' ]; then
+      { echo "  $name has a holder on record whose client is gone (token $rtok);"
+        echo "  confirming the VM is free of it before taking the box:"; }
+      HOLD_CONFIRM=""
+      hold_confirm_gone "$name" "$rd" "$rgp" "$rtok" "its client ended"
+      if [ "$HOLD_CONFIRM" != gone ]; then
+        echo "  wsl holder NOT started on $name: that earlier holder may still be running in the VM,"
+        echo "    and starting a second one would leave it untracked and pinning the box for good."
+        echo "    Its record is kept; run 'wake-lab.sh unhold $name' again when the box answers."
+        return 1
       fi
     fi
   fi
@@ -1288,7 +1294,8 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
     else
       # The marker says the client was ended deliberately, which is what stops the next reader
       # calling this a holder the lane lost.
-      : > "${f%.pid}.releasing" 2>/dev/null
+      : > "${f%.pid}.releasing" 2>/dev/null ||
+        echo "    (its release marker could not be written; the record below is what matters)"
       echo "    Its record is KEPT (token $token): that is the only way anything can name what may"
       echo "    still be running in $name's VM. 'wake-lab.sh unhold $name' finishes it."
     fi
