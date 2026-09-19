@@ -3992,12 +3992,26 @@ refuse_merge_queue() {
 # `close-out`, `closed-loop` and `fixed-point`, and a body saying "a close-out merge of #3 and #4"
 # is not closing anything.
 MULTI_CLOSE_FILTER='
-function refs_of(unit,   rest, r, out, n) {
-  rest = unit; out = ""; n = 0
-  while (match(rest, /(^|[^a-zA-Z0-9_])([a-zA-Z0-9][-a-zA-Z0-9._]*\/[-a-zA-Z0-9._]+)?#[0-9]+/)) {
+function refs_of(unit,   rest, r, out, n, seen) {
+  # URLs go first. A body here is full of run links, and a fragment in one is not an issue: a
+  # trailing /#703 was counted as an issue, and a page#705 was even reported as a cross-repository
+  # reference to a HOST (review round 3). An issue bound through its full URL is a shape this
+  # scanner does not read and SKILL.md says so, so blanking them keeps that boundary exact rather
+  # than half-reading it. The owner is tightened for the same reason: a GitHub login carries only
+  # alphanumerics and hyphens, never the dots that let example.com pass as one.
+  rest = unit
+  gsub(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^ \t]*/, " ", rest)
+  out = ""; n = 0
+  while (match(rest, /(^|[^a-zA-Z0-9_])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[0-9]+/)) {
     r = substr(rest, RSTART, RLENGTH)
     rest = substr(rest, RSTART + RLENGTH)
     sub(/^[^a-zA-Z0-9#]/, "", r)
+    # DISTINCT issues, not occurrences: "the request in #701 is done, so this closes #701" names
+    # one issue twice, and reporting it as two made the count, the list and the reopen advice all
+    # false (review round 3). A bare #N and an owner/repo#N are left distinct, since which
+    # repository a bare one means is not knowable from here.
+    if (r in seen) continue
+    seen[r] = 1
     n++
     out = (n == 1 ? r : out " " r)
   }
@@ -4010,7 +4024,7 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
   cnt = split(refs, parts, " ")
   if (cnt < 2 && !quoted) return
   shown = unit
-  sub(/^[ \t>]+/, "", shown)
+  sub(/^[ \t>*+-]+/, "", shown)
   sub(/[ \t]+$/, "", shown)
   if (length(shown) > 200) shown = substr(shown, 1, 197) "..."
   cls = quoted ? "quoted" : "sentence"
@@ -4036,6 +4050,13 @@ function protect_abbrev(s,   out) {
   sub(/\r$/, "", line)
   trimmed = line
   sub(/^[ \t]+/, "", trimmed)
+  # A blockquote or a fence nested in a LIST ITEM is still a blockquote or a fence: `- > Closes #1`
+  # renders as one, and leaving the marker in front made the `>` test miss it entirely (review
+  # round 3). Markers are peeled repeatedly, so a quote two list levels down is reached too.
+  while (match(trimmed, /^([-*+][ \t]+|[0-9]+[.)][ \t]+)/)) {
+    trimmed = substr(trimmed, RLENGTH + 1)
+    sub(/^[ \t]+/, "", trimmed)
+  }
   quoted = 0
   # A fence closes only on its OWN delimiter, at least as long as the one that opened it. A
   # four-backtick fence exists precisely so that it can CONTAIN a three-backtick one, and an
@@ -4057,7 +4078,10 @@ function protect_abbrev(s,   out) {
   if (fence) quoted = 1
   if (trimmed ~ /^>/) quoted = 1
   s = protect_abbrev(line)
-  gsub(/[.!?][ \t]+/, "&\001", s)
+  # A closing quote or bracket sits BETWEEN the terminator and the space often enough to matter:
+  # requiring whitespace immediately after the full stop kept `... "Closes #1." See #2 ...` as one
+  # unit and had the scan name an issue belonging to the next sentence (review round 3).
+  gsub(/[.!?]["\047)\]}`*_]*[ \t]+/, "&\001", s)
   n = split(s, parts, "\001")
   for (i = 1; i <= n; i++) {
     unit = parts[i]
@@ -4369,7 +4393,9 @@ cmd_merge() {
       "--disable-auto) before anything else."
   fi
   fail 1 "$REPO#$PR_NUM is not merged ($state) — \`gh pr merge\` returned having only enabled" \
-    "auto-merge. It will land when the base's required checks pass; do not treat it as landed."
+    "auto-merge. It will land when the base's required checks pass; do not treat it as landed." \
+    "The closing-keyword scan above spoke for the body as it is NOW: a deferred merge lands" \
+    "whatever the body says at that later moment, and nothing here will be running to re-read it."
 }
 
 # A branch name is data, not URL structure: `release#1` and `release&one` are valid refs, but

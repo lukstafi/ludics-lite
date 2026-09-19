@@ -448,6 +448,69 @@ Closes #427
   assert_not_contains "$MERGE_STDOUT" "427" "the line after the real close is outside the block"
 }
 
+# Review round 3, P2. A blockquote nested in a list item is still a blockquote, and the `>` test
+# ran against a line the list marker still led -- so the quoted rule, which fires at ONE reference,
+# never saw it and the ordinary rule ignores a single reference by design.
+test_a_quote_nested_in_a_list_item_is_still_quoted() {
+  reset
+  PR_BODY='The shapes to avoid:
+
+- > Closes #601
+  1. > Fixes #602
+
+Closes #603
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #601" \
+    "a quote behind a list marker is quoted"
+  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #602" \
+    "and behind an ordered one too"
+  assert_not_contains "$MERGE_STDOUT" "603" "the plain line is still silent"
+}
+
+# Review round 3, P2. A closing quote sits between the full stop and the space often enough to
+# matter: without it the two sentences stayed one unit and the warning named an issue belonging to
+# the next one -- a false positive that would have sent the operator to reopen a live issue.
+test_a_closing_quote_still_ends_the_sentence() {
+  reset
+  PR_BODY='The example says "Closes #604." See #605 for follow-up.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "the quoted full stop ends the sentence, so #605 is not bound"
+}
+
+# Review round 3, P2. A body here is full of run links. A fragment in one is not an issue, and a
+# host with a path was even being reported as a cross-repository reference.
+test_a_url_fragment_is_not_an_issue_reference() {
+  reset
+  PR_BODY='Closes #606; see https://example.com/docs/#607 and https://example.com/page#608 for details.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "one real reference and two URL fragments is one reference"
+}
+
+# Review round 3, P2. One issue named twice is one issue: counting occurrences made the count, the
+# list and the reopen advice all false.
+test_the_same_issue_named_twice_is_one_issue() {
+  reset
+  PR_BODY='The request in #609 is complete, so this closes #609.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "a repeated reference is not a second issue"
+  # Two distinct ones in the same shape still warn, so the dedupe did not disarm the rule.
+  PR_BODY='The request in #610 is complete, so this closes #611.
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #610 #611" "two distinct ones still warn"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -468,6 +531,10 @@ tests=(
   test_an_unchanged_body_is_not_reported_twice
   test_a_repository_name_may_lead_with_punctuation
   test_a_closing_fence_takes_no_info_string
+  test_a_quote_nested_in_a_list_item_is_still_quoted
+  test_a_closing_quote_still_ends_the_sentence
+  test_a_url_fragment_is_not_an_issue_reference
+  test_the_same_issue_named_twice_is_one_issue
 )
 
 run_tests "${tests[@]}"
