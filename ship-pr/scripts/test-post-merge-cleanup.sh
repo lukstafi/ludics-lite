@@ -210,6 +210,22 @@ setup_case() {
   esac
 }
 
+# Add tracked content to the topic after `setup_case` and land it in the base branch through the
+# integrator, the way a follow-up commit on a merged topic would reach `origin/master`. Stages the
+# given session paths, commits them with the first message, and merges the pushed topic under the
+# second. Refreshes `CASE_TOPIC_OID`, which `assert_cleaned` reads for the recovery ref.
+land_topic_change() {
+  local commit_message="$1" merge_message="$2"
+  shift 2
+  git -C "$CASE_SESSION" add -- "$@"
+  git -C "$CASE_SESSION" commit -m "$commit_message" >/dev/null
+  git -C "$CASE_SESSION" push origin topic >/dev/null
+  git -C "$CASE_INTEGRATOR" fetch origin >/dev/null 2>&1
+  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "$merge_message" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin "$CASE_BASE_BRANCH" >/dev/null
+  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
+}
+
 test_unchecked_out_master() {
   setup_case unchecked-out-master merge none
   (cd "$CASE_SESSION" && "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null)
@@ -1039,12 +1055,7 @@ test_regenerable_refusals() {
   setup_case regenerable-tracked merge main-off
   mkdir -p "$CASE_SESSION/src"
   echo 'let () = ()' >"$CASE_SESSION/src/main.ml"
-  git -C "$CASE_SESSION" add src/main.ml
-  git -C "$CASE_SESSION" commit -m "tracked source directory" >/dev/null
-  git -C "$CASE_SESSION" push origin topic >/dev/null
-  git -C "$CASE_INTEGRATOR" fetch origin >/dev/null 2>&1
-  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge tracked source" >/dev/null
-  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  land_topic_change "tracked source directory" "merge tracked source" src/main.ml
   if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable src 2>&1); then
     fail "a tracked directory was accepted as regenerable"
   fi
@@ -1090,13 +1101,7 @@ test_regenerable_name_resolution_refusals() {
   setup_case regenerable-case-alias merge main-off
   mkdir -p "$CASE_SESSION/src"
   echo 'let () = ()' >"$CASE_SESSION/src/main.ml"
-  git -C "$CASE_SESSION" add src/main.ml
-  git -C "$CASE_SESSION" commit -m "tracked source directory" >/dev/null
-  git -C "$CASE_SESSION" push origin topic >/dev/null
-  git -C "$CASE_INTEGRATOR" fetch origin >/dev/null 2>&1
-  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge tracked source" >/dev/null
-  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
-  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
+  land_topic_change "tracked source directory" "merge tracked source" src/main.ml
   if [ -d "$CASE_SESSION/SRC" ]; then
     # A name-folding volume: the alias resolves, and must be refused before the tracked-path guard
     # is asked about a spelling the index does not hold.
@@ -1316,13 +1321,7 @@ test_master_owner_harness_untracked_data_passes() {
   setup_case harness-untracked-master-files merge main
   mkdir -p "$CASE_SESSION/.claude"
   echo 'tracked by the repository' >"$CASE_SESSION/.claude/tracked"
-  git -C "$CASE_SESSION" add .claude/tracked
-  git -C "$CASE_SESSION" commit -m "repository content under .claude" >/dev/null
-  git -C "$CASE_SESSION" push origin topic >/dev/null
-  git -C "$CASE_INTEGRATOR" fetch origin >/dev/null 2>&1
-  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge .claude content" >/dev/null
-  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
-  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
+  land_topic_change "repository content under .claude" "merge .claude content" .claude/tracked
   mkdir -p "$CASE_MAIN/.claude"
   echo lock >"$CASE_MAIN/.claude/scheduled_tasks.lock"
   assert_eq "$(git -C "$CASE_MAIN" status --porcelain --untracked-files=normal)" '?? .claude/' \
