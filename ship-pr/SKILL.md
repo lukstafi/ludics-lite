@@ -286,7 +286,7 @@ as `:12` and `:40` would be. The anchor is the WHOLE anchor: `a.sh:36-40` is a m
 `side=LEFT` after it is the deletion side of the diff (`RIGHT` is where every other finding is and
 prints nothing), `start_side=LEFT` is a range that starts on the deletion side and ends on the
 addition side, and `was=30-34` is where the reviewer wrote a finding GitHub has since migrated
-forward. Those fields are what keeps two entries apart in the fold, so two entries that differ
+forward (`was=@9` on a row anchored by a diff position rather than by a line). Those fields are what keeps two entries apart in the fold, so two entries that differ
 only by one of them say so on the line rather than reading as one finding posted twice — a
 correct non-fold must not look like a broken one. A folded entry is still one finding for the loop: the round
 count and the watch's act/quiet decision are unchanged, and every folded id is still advanced past

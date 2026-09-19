@@ -882,13 +882,26 @@ POLL_ITEM_DEFS='
   # pairs are in the key, so two findings written at different places can sit at one place today
   # and print one header between them. The same rule as the side fields: it prints only when the
   # row carries an original that differs from what was rendered.
+  #
+  # In whichever unit the row is anchored by. A row from the per-review endpoint has no line at
+  # all and migrates in `position`/`original_position` instead, both of them in the key, so it
+  # has the same defect one field over and gets the same token (review of #272, round 1). The two
+  # units are never mixed on one line: a position is a second name for a place a row with lines
+  # has already named, and the API computes it from the same diff, so a pair of rows agreeing on
+  # both line fields cannot disagree on it.
   def item_was: (.line // .original_line) as $l
-    | (.start_line // .original_start_line) as $s
-    | if $l == null then ""
-      elif (.original_line != null and .original_line != $l)
-        or (.original_start_line != null and .original_start_line != $s) then
-        " was=\(anchor(.original_start_line; (.original_line // $l)))"
-      else "" end;
+    | if $l != null then
+        (.start_line // .original_start_line) as $s
+        | if (.original_line != null and .original_line != $l)
+            or (.original_start_line != null and .original_start_line != $s) then
+            " was=\(anchor(.original_start_line; (.original_line // $l)))"
+          else "" end
+      else
+        (.position // .original_position) as $p
+        | if $p != null and .original_position != null and .original_position != $p then
+            " was=@\(.original_position)"
+          else "" end
+      end;
   def fold_key: del(.id, .node_id, .url, .html_url, .pull_request_url, .pull_request_review_id,
                     .created_at, .updated_at, .reactions, ._links, .body);
   def fold_inline:

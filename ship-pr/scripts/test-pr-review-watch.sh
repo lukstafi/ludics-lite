@@ -157,10 +157,11 @@ distinct_inline_headers() { # <haystack>
 # 2026-09-10 — with the location carried by position/original_position instead. poll renders such
 # a row by the field it actually has, `:@<position>`, so two of them at different places in one
 # file are told apart by the eye as well as by the fold key.
-positional_comment() { # <id> <original commit> <body> <position>
-  jq -cn --argjson id "$1" --arg orig "$2" --arg b "$3" --argjson pos "$4" --arg rev "$REVIEWER" \
+positional_comment() { # <id> <original commit> <body> <position> [original position]
+  jq -cn --argjson id "$1" --arg orig "$2" --arg b "$3" --argjson pos "$4" \
+    --argjson opos "${5:-$4}" --arg rev "$REVIEWER" \
     '{id:$id, user:{login:($rev + "[bot]")}, path:"a.sh", body:$b, position:$pos,
-      original_position:$pos, original_commit_id:$orig, commit_id:$orig}'
+      original_position:$opos, original_commit_id:$orig, commit_id:$orig}'
 }
 
 summary_comment() { # <id> <created_at> <body>
@@ -801,6 +802,28 @@ test_the_anchor_fields_that_keep_two_rows_apart_are_on_the_line() {
   assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:36-40 was=32-34 commit=${H2:0:7}" \
     "which is the only thing telling this one from the last"
   assert_eq "$(distinct_inline_headers "$WATCH_OUT")" 2 "two places, however alike they sit today"
+  # A positional row migrates too, in the unit it has: the per-review endpoint serves no line at
+  # all, and `position`/`original_position` are both in the key, so two rows at one current
+  # position written at different ones are two findings (review of #272, round 1).
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
+  schedule review_comments 1 "[$(positional_comment 900 "$H2" "$same" 12 5),$(positional_comment 901 "$H2" "$same" 12 9)]"
+  run_watch 0,0,0
+  assert_not_contains "$WATCH_OUT" "id=900+901" "two original positions are two findings"
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:@12 was=@5 commit=${H2:0:7}" \
+    "a position that has moved prints the one it was written at"
+  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:@12 was=@9 commit=${H2:0:7}" \
+    "which is the only thing telling these two apart"
+  assert_eq "$(distinct_inline_headers "$WATCH_OUT")" 2 "so they read as the two places they are"
+  # And a row that has NOT moved prints no token at all, in either unit: `was=` on every row
+  # would be the `side=RIGHT` noise one column over.
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
+  schedule review_comments 1 "[$(positional_comment 900 "$H2" "$same" 12)]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:@12 commit=${H2:0:7}" \
+    "an unmigrated position is the position, and nothing else"
+  assert_not_contains "$WATCH_OUT" "was=" "with no token for a move that did not happen"
   # And the control the whole rendering rests on: rows agreeing on every anchor field still fold,
   # and the folded entry prints that anchor once. Without it these cases would pass on a header
   # that had simply started printing the id of every thread separately.
