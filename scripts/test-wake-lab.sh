@@ -1224,9 +1224,12 @@ alive "$legacy" \
   && ok "...and it is left running, not killed as a record naming something else" \
   || ko "the legacy holder was killed as an unrecognized process"
 out=$(unhold 2>&1); rc=$?
-[ "$rc" -eq 0 ] && grep -q 'carries no token' <<<"$out" \
+# rc 3, not 0: the release ended the client it could reach and cannot say the box is free, and a
+# caller reading 0 there treats a possibly pinned VM as clean -- which the runbook now does
+# explicitly (review round 11, P1).
+[ "$rc" -eq 3 ] && grep -q 'carries no token' <<<"$out" \
   && ! grep -q 'is gone from the VM' <<<"$out" \
-  && ok "...and its release ends it while saying it cannot tell whether the tree went with it (rc=$rc)" \
+  && ok "...and its release ends it, says it cannot tell whether the tree went, and exits 3 (rc=$rc)" \
   || ko "the legacy release claimed an observation it cannot make (rc=$rc) -- $out"
 for _ in 1 2 3 4 5; do alive "$legacy" || break; sleep 1; done
 alive "$legacy" && ko "the legacy holder survived its unhold" \

@@ -1242,7 +1242,10 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   rm -f "$fifo" "$out" 2>/dev/null
   if ! mkfifo -m 600 "$fifo" 2>/dev/null || ! : > "$out" 2>/dev/null; then
     echo "  wsl holder on $name could NOT be given a channel at $fifo; nothing was started"
-    rm -f "$f" "$fifo" "$out" 2>/dev/null
+    # The claim goes LAST. It is what keeps another run out, so unlinking it first opens a window
+    # in which a second hold can claim the box and create its channel -- and the operands still to
+    # come would then delete that new channel out from under it.
+    rm -f "$fifo" "$out" "$f" 2>/dev/null
     return 1
   fi
   # READ-WRITE, and that is the whole teardown contract on this side. The holder must not see EOF
@@ -1518,7 +1521,9 @@ hold_state_clear() { # hold_state_clear <box> <pid> <token> — rc 1 if the stat
     rm -f "${f%.pid}.releasing"
     return 0
   fi
-  rm -f "$f" "${f%.pid}.releasing" "$(hold_fifo_path "$1")" "$(hold_out_path "$1")"
+  # Channel first, claim last, for the reason the spawn path gives: the record is what keeps
+  # another run out, so it is the last thing to go.
+  rm -f "$(hold_fifo_path "$1")" "$(hold_out_path "$1")" "${f%.pid}.releasing" "$f"
   return 0
 }
 
@@ -1597,9 +1602,12 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     if [ -z "${tok:-}" ] || [ "$tok" = '-' ]; then
       # A legacy record, or one whose handshake never answered: there is no pid in that VM to ask
       # about, so the one thing this must not do is repeat the old sentence and call it unheld.
+      HOLD_CONFIRM=unverified; HOLD_LEAK=1
       echo "    Its holder carries no token (a record from before the handshake), so nothing here"
       echo "    can say whether its Windows-side tree ended with it -- on Windows it usually does"
-      echo "    NOT (ludics-lite#192). Treat $1 as possibly still pinned."
+      echo "    NOT (ludics-lite#192). Treat $1 as possibly still pinned: this release exits 3 and"
+      echo "    keeps what it knows, because saying 0 here is the sentence #192 was filed about,"
+      echo "    and the runbook now reads a clean exit as a box that needs nothing."
     else
       hold_confirm_gone "$1" "$d" "$gp" "$tok" "its client was killed"
     fi
