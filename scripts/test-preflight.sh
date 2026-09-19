@@ -341,143 +341,129 @@ expect "...and as an annotation on the file's line under GitHub Actions" \
   1 '::error file=scripts/ok.sh::' -- env GITHUB_ACTIONS=true "$PF" --root "$T" modes
 
 # --- the pin: the lint job and the step table are one set of checks ---------------------------
-
-# Every `run:` command word in the lint job, and every one in the whole workflow.
-job_run_commands() { # job_run_commands <job>
-  awk -v want="  $1:" "$WORKFLOW_AWK"'
-    { i = cmd_at(); if (i && job == want) print $i }
-  ' "$WORKFLOW"
-}
-# THE BARE-INVOCATION RULE.
 #
-# The tail rule was three rounds of grammar before it was one line. Round 4 accepted any operator
-# tail, round 5 accepted `|| { ...; exit 1; }` by substring, round 6 anchored the match -- and
-# round 8 showed `|| { echo exit 1; }` satisfying the anchored pattern, because a text rule cannot
-# say whether a handler FAILS. The tolerance is gone rather than hardened a fourth time: every
-# command in the step table already has an invocation with no tail at all (the lint job runs each
-# of them bare, and the prompt hygiene job runs check-prompts.sh bare), so accepting a tail bought
-# nothing and cost four rounds. A macOS-style `<suite> || { echo ...; exit 1; }` line is simply
-# not the invocation this pin reads; the command needs one plain line somewhere, which is what the
-# refusal asks for.
+# THE READER these six share, so they cannot disagree about what the workflow says. What it
+# answers is one question -- is THIS step an invocation of THIS command that a failure of the
+# command would fail the job over? -- and eight rounds of this review went into the ways a step
+# can look like one without being one. Three rules carry all of them:
 #
-# The attributes are read here and not only in the lint job (round 8): the table deliberately lets
-# an external command be satisfied by a step in ANY job -- check-prompts.sh is satisfied by the
-# prompt hygiene job, the only check a prompt-only head gets -- so a `continue-on-error: true` or
-# an `if: ${{ false }}` there would otherwise be invisible. A disabled step is not an invocation.
-# THE READER these four share, so they cannot disagree about what the workflow says. Two axes,
-# each of which cost a round on its own before they were read as axes:
+#   1. A STEP IS DECIDED WHOLE, at its boundary, not at its `run:` line. A YAML mapping is
+#      unordered, so `run:` above `continue-on-error: true` is the same step as the other way
+#      round, and a reader that emitted at the run line called the first one live (round 12).
+#   2. WHAT A PINNED STEP MAY CARRY IS AN ALLOW-LIST -- `name:`, `run:`, `id:`, and an `if:` that
+#      is `${{ !cancelled() }}` -- and a job may carry `name:`, `runs-on:`, `timeout-minutes:`
+#      and that same `if:`. Rounds 6 to 12 each named one more key that neuters a step or a job
+#      (`continue-on-error:`, `shell: bash -n {0}`, `working-directory:`, `env:`, `needs:`, a
+#      `defaults:` block setting the shell), and that supply is not exhausted while Actions grows
+#      keys. Inverting the rule closes the class by construction; a step or job that legitimately
+#      needs another key gets a loud refusal here, which is one deliberate line to answer.
+#   3. A KEY IS FOUND BY INDEX AND BY PLACE. `run:`, `if:` and the rest may each open a step
+#      behind the list dash (`- run: x`), which is valid YAML this workflow already uses (round
+#      9); and a `run:` key is only a command when it stands in the `steps:` list of a job, so a
+#      job output or an environment value spelled `run: scripts/check-prompts.sh` is not a check
+#      anyone runs (round 12).
 #
-#   WHERE a key stands. A job-level `if:` or `continue-on-error:` (four spaces) governs every step
-#   under it and must not be cleared when a step begins, or a whole pinned job is switched off
-#   unseen (rounds 9, 10); a step-level one governs its step alone.
-#   HOW a line is spelled. `run:`, `if:` and `continue-on-error:` may each open a step behind the
-#   list dash -- `- run: x`, `- continue-on-error: true` -- which is valid YAML this workflow
-#   already uses, so every key is found at a field index rather than at field 1 (rounds 9, 10).
-#
-# A step is LIVE when nothing on either axis can stop its failure failing the job, and that is an
-# ALLOW-LIST rather than a list of the keys that can. Five rounds of this review each named one
-# more key -- `if:`, `continue-on-error:`, then the same two at job level and behind the dash,
-# then `shell: bash -n {0}`, which parses the run script and never runs it -- and the supply is
-# not exhausted (`working-directory:`, `env:`, `uses:`, a job-level or workflow-level `defaults:`
-# setting the shell). A deny-list of keys is a list this review can always add to, so the rule is
-# inverted: a pinned step may carry `name:`, `run:`, `id:` and an `if:` that is `${{ !cancelled() }}`,
-# and ANY other key means the step is not the invocation this pin reads. A `defaults:` block at
-# job or workflow level does the same for everything under it. The class is closed by construction
-# -- a new Actions key cannot open it -- and a step that legitimately needs another key gets a
-# loud refusal here, which is one line to answer deliberately.
+# A BARE invocation additionally has nothing after the command word. That rule was three rounds
+# of failure-handler grammar (`|| { ...; exit 1; }` by substring, then anchored, then defeated by
+# `|| { echo exit 1; }`) before the tolerance was removed outright: every command in the step
+# table already has a plain line somewhere -- the lint job runs each of its checks bare, and the
+# prompt hygiene job runs check-prompts.sh bare -- so the grammar was buying nothing.
 WORKFLOW_AWK='
   function rest(n,   i, t) {
     t = ""
     for (i = n; i <= NF; i++) t = t (t == "" ? "" : " ") $i
     return t
   }
-  function cmd_at(   ) {
-    if ($1 == "run:") return 2
-    if ($1 == "-" && $2 == "run:") return 3
-    return 0
-  }
   function open_cond(c) {
     return (c == "" || c ~ /^\$\{\{[ ]*![ ]*cancelled\(\)[ ]*\}\}$/)
   }
-  function live() {
-    return (!wother && !jother && !sother && open_cond(jcond) && open_cond(scond))
+  function live() { return (wok && jok && sok) }
+  function flush() {
+    if (scmd != "" || suses != "") emit()
+    scmd = ""; sargs = ""; stail = 0; suses = ""; sok = 1
   }
+  BEGIN { wok = 1; jok = 0; sok = 1 }
   /^[[:space:]]*$/ { next }
   /^[[:space:]]*#/ { next }
-  /^defaults:/ { wother = 1; next }
+  /^defaults:/ { wok = 0; next }
   /^[A-Za-z]/ { next }
-  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job = $0; jcond = ""; jother = ""; scond = ""; sother = ""; next }
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { flush(); job = $0; jok = 1; in_steps = 0; next }
   /^    [A-Za-z]/ {
-    if ($1 == "if:") jcond = rest(2)
-    else if ($1 == "continue-on-error:" && $2 != "false") jother = 1
-    else if ($1 == "defaults:") jother = 1
+    flush()
+    if ($1 == "steps:") { in_steps = 1; next }
+    in_steps = 0
+    if ($1 == "if:") { if (!open_cond(rest(2))) jok = 0 }
+    else if ($1 == "name:" || $1 == "runs-on:" || $1 == "timeout-minutes:") { }
+    else jok = 0
     next
   }
-  /^      - / { scond = ""; sother = "" }
+  !in_steps { next }
+  /^      - / { flush() }
   {
     a = ($1 == "-" ? 2 : 1)
-    if ($a == "if:") scond = rest(a + 1)
-    else if ($a == "name:" || $a == "run:" || $a == "id:") { }
-    else sother = 1
+    k = $a
+    if (k == "run:") { scmd = $(a + 1); sargs = rest(a + 2); stail = (NF > a + 1) }
+    else if (k == "uses:") { suses = $(a + 1) }
+    else if (k == "if:") { if (!open_cond(rest(a + 1))) sok = 0 }
+    else if (k == "name:" || k == "id:") { }
+    else sok = 0
   }
+  END { flush() }
 '
 
-# THE BARE-INVOCATION RULE.
-#
-# The tail rule was three rounds of grammar before it was one line. Round 4 accepted any operator
-# tail, round 5 accepted `|| { ...; exit 1; }` by substring, round 6 anchored the match -- and
-# round 8 showed `|| { echo exit 1; }` satisfying the anchored pattern, because a text rule cannot
-# say whether a handler FAILS. The tolerance is gone rather than hardened a fourth time: every
-# command in the step table already has an invocation with no tail at all (the lint job runs each
-# of them bare, and the prompt hygiene job runs check-prompts.sh bare), so accepting a tail bought
-# nothing and cost four rounds. A macOS-style `<suite> || { echo ...; exit 1; }` line is simply
-# not the invocation this pin reads; the command needs one plain line somewhere, which is what the
-# refusal asks for.
-#
-# The attributes are read here and not only in the lint job (round 8): the table deliberately lets
-# an external command be satisfied by a step in ANY job -- check-prompts.sh is satisfied by the
-# prompt hygiene job, the only check a prompt-only head gets -- so a `continue-on-error: true` or
-# an `if: ${{ false }}` there would otherwise be invisible. A disabled step is not an invocation.
-# THE READER these four share, so they cannot disagree about what the workflow says. Two axes,
-# each of which cost a round on its own before they were read as axes:
-#
-#   WHERE a key stands. A job-level `if:` or `continue-on-error:` (four spaces) governs every step
-#   under it and must not be cleared when a step begins, or a whole pinned job is switched off
-#   unseen (rounds 9, 10); a step-level one governs its step alone.
-#   HOW a line is spelled. `run:`, `if:` and `continue-on-error:` may each open a step behind the
-#   list dash -- `- run: x`, `- continue-on-error: true` -- which is valid YAML this workflow
-#   already uses, so every key is found at a field index rather than at field 1 (rounds 9, 10).
-#
-# A step is LIVE when nothing on either axis can stop its failure failing the job, and that is an
-# ALLOW-LIST rather than a list of the keys that can. Five rounds of this review each named one
-# more key -- `if:`, `continue-on-error:`, then the same two at job level and behind the dash,
-# then `shell: bash -n {0}`, which parses the run script and never runs it -- and the supply is
-# not exhausted (`working-directory:`, `env:`, `uses:`, a job-level or workflow-level `defaults:`
-# setting the shell). A deny-list of keys is a list this review can always add to, so the rule is
-# inverted: a pinned step may carry `name:`, `run:`, `id:` and an `if:` that is `${{ !cancelled() }}`,
-# and ANY other key means the step is not the invocation this pin reads. A `defaults:` block at
-# job or workflow level does the same for everything under it. The class is closed by construction
-# -- a new Actions key cannot open it -- and a step that legitimately needs another key gets a
-# loud refusal here, which is one line to answer deliberately.
-
-# The command word of every `run:` line that is a LIVE, BARE invocation: nothing at all after the
-# command word, in a step and a job that carry nothing able to stop it failing.
+# The command word of every LIVE, BARE invocation anywhere in the workflow. The table deliberately
+# accepts one from any job -- check-prompts.sh is satisfied by the prompt hygiene job, the only
+# check a prompt-only head gets -- so this reads every job rather than the lint job alone.
 workflow_bare_commands() {
   awk "$WORKFLOW_AWK"'
-    { i = cmd_at(); if (i && NF == i && live()) print $i }
+    function emit() { if (scmd != "" && !stail && live()) print scmd }
   ' "$WORKFLOW"
 }
 
-# The command word of every lint `run:` whose STEP carries an attribute that stops it failing the
-# job. Two of them exist: an `if:` decides whether the step runs at all, and `continue-on-error`
-# decides whether its failure counts -- either turns a pinned check off without touching the run
-# line the pins read, and GitHub reports the job green (rounds 6 and 7). Read as the genre rather
-# than the two instances: a pinned step carries neither, with one exception spelled out, the
-# `${{ !cancelled() }}` this workflow uses for "run even after an earlier step failed", which
-# skips only a cancelled run.
+# Every command a job runs, live or not, for the pin that asks whether preflight runs it too.
+job_run_commands() { # job_run_commands <job>
+  awk -v want="  $1:" "$WORKFLOW_AWK"'
+    function emit() { if (scmd != "" && job == want) print scmd }
+  ' "$WORKFLOW"
+}
+
+# Every lint step whose command is pinned and whose step or job can stop it failing the job.
+# Dropping it from the bare list above would be enough for correctness; it is reported by name so
+# a disabled pinned step says so rather than reading as a missing one.
 lint_disabled_runs() {
   awk "$WORKFLOW_AWK"'
-    { i = cmd_at(); if (i && job == "  lint:" && !live()) print $i }
+    function emit() { if (scmd != "" && job == "  lint:" && !live()) print scmd }
+  ' "$WORKFLOW"
+}
+
+# Every `uses:` step of the lint job that is not the checkout. A check added to CI as an action is
+# a blocking assertion preflight cannot run, and the parity this PR claims would fail quietly
+# rather than here (round 12).
+lint_uses_steps() {
+  awk "$WORKFLOW_AWK"'
+    function emit() {
+      if (suses != "" && job == "  lint:" && suses !~ /^actions\/checkout@/) print suses
+    }
+  ' "$WORKFLOW"
+}
+
+# The STEP NAMES the lint job passes to preflight.sh, `*` for an invocation that names none and so
+# runs them all. Reading only the command word would exempt every preflight line unconditionally:
+# a mode-bit step rewritten to a second `syntax` invocation would leave the mode rule unrun in CI
+# while the pin stayed green (round 1).
+lint_preflight_steps() {
+  awk "$WORKFLOW_AWK"'
+    function emit(   n, w, i, named) {
+      if (scmd != "scripts/preflight.sh" || job != "  lint:") return
+      # An invocation that asserts nothing about THIS checkout covers no step: `--help` prints
+      # the manual and exits 0 (round 2), and `--root <dir>` judges some other tree while the
+      # checkout goes unchecked (round 12). Either way the missing-step pin must fire.
+      n = split(sargs, w, / /)
+      for (i = 1; i <= n; i++) if (w[i] == "-h" || w[i] == "--help" || w[i] == "--root") return
+      named = 0
+      for (i = 1; i <= n; i++) { if (w[i] ~ /^-/) continue; print w[i]; named = 1 }
+      if (!named) print "*"
+    }
   ' "$WORKFLOW"
 }
 
@@ -485,41 +471,16 @@ lint_disabled_runs() {
 # not demand is one a runner losing that interpreter turns into a SKIP and a green job -- the
 # fail-closed half of this PR's own promise, dropped by deleting one word from a run line.
 lint_preflight_unguarded() {
-  awk -v want="  lint:" "$WORKFLOW_AWK"'
-    {
-      i = cmd_at()
-      if (!i || job != want || $i != "scripts/preflight.sh") next
-      for (k = i + 1; k <= NF; k++) if ($k == "-h" || $k == "--help") next
-      for (k = i + 1; k <= NF; k++) if ($k == "--require-tools") next
-      named = 0
-      for (k = i + 1; k <= NF; k++) {
-        if ($k ~ /^-/) { if ($k == "--root") k++; continue }
-        print $k
-        named = 1
+  awk "$WORKFLOW_AWK"'
+    function emit(   n, w, i, named) {
+      if (scmd != "scripts/preflight.sh" || job != "  lint:") return
+      n = split(sargs, w, / /)
+      for (i = 1; i <= n; i++) {
+        if (w[i] == "-h" || w[i] == "--help" || w[i] == "--root") return
+        if (w[i] == "--require-tools") return
       }
-      if (!named) print "*"
-    }
-  ' "$WORKFLOW"
-}
-# The STEP NAMES the lint job passes to preflight.sh, `*` for an invocation that names none and so
-# runs them all. Reading only the command word would exempt every preflight line unconditionally:
-# a mode-bit step rewritten to a second `syntax` invocation would leave the mode rule unrun in CI
-# while the pin below stayed green, which is the drift this pin exists to catch (round 1).
-lint_preflight_steps() {
-  awk -v want="  lint:" "$WORKFLOW_AWK"'
-    {
-      i = cmd_at()
-      if (!i || job != want || $i != "scripts/preflight.sh") next
-      # A help flag is not a run: `preflight.sh --help syntax` prints the manual and exits 0
-      # without asserting anything, so the line covers NO step and the pin must say so rather
-      # than read `syntax` off it (round 2).
-      for (k = i + 1; k <= NF; k++) if ($k == "-h" || $k == "--help") next
       named = 0
-      for (k = i + 1; k <= NF; k++) {
-        if ($k ~ /^-/) { if ($k == "--root") k++; continue }
-        print $k
-        named = 1
-      }
+      for (i = 1; i <= n; i++) { if (w[i] ~ /^-/) continue; print w[i]; named = 1 }
       if (!named) print "*"
     }
   ' "$WORKFLOW"
@@ -568,6 +529,11 @@ EOF
   || ko "preflight.sh runs what no workflow step runs bare:$unrun"
 [ -n "$bare_run_commands" ] && ok "the workflow's bare invocations can be read" \
   || ko "no bare run: invocation found in the workflow -- the pin above would pass over nothing"
+
+action_checks=$(lint_uses_steps)
+[ -z "$action_checks" ] \
+  && ok "...and the lint job runs no check as an action, which preflight could not run at all" \
+  || ko "the lint job runs a check preflight cannot:$action_checks"
 
 disabled=$(lint_disabled_runs)
 [ -z "$disabled" ] \
@@ -853,6 +819,75 @@ if probe_workflow_swap '  prompts:' \
     || ok "...nor is any step under a defaults block, which can set the shell for all of them"
 else
   ko "the swap probe rewrote nothing: the workflow no longer opens the prompts job as this file expects"
+fi
+
+# A mapping is unordered, so the same keys below the run line are the same step.
+for probe_after in 'continue-on-error: true' 'if: ${{ false }}' 'shell: bash -n {0}'; do
+  if probe_workflow_swap '        run: scripts/check-prompts.sh' \
+    "        run: scripts/check-prompts.sh
+        $probe_after"; then
+    grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+      && ko "a key BELOW the run line was read as a different step: $probe_after" \
+      || ok "...and a key below the run line is the same step, since a mapping is unordered: $probe_after"
+  else
+    ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
+  fi
+done
+
+# A `run:` key that is not in a step list is not a command anyone runs. Two guards stand between
+# the two: the job-level allow-list refuses a job carrying any mapping such a key could hide in
+# (`outputs:`, `env:`, `defaults:`), and the reader only reads keys inside `steps:` at all. This
+# probes the second directly -- a stray `run:` at the top of the file, with the real step renamed
+# so nothing else can satisfy the command.
+if probe_workflow_swap '        run: scripts/check-prompts.sh' \
+  '        run: scripts/check-prompts-renamed.sh'; then
+  awk '
+    { print }
+    $0 == "concurrency:" { print "  run: scripts/check-prompts.sh" }
+  ' "$WORKFLOW" >"$TMP/probe-outside.yml"
+  WORKFLOW="$TMP/probe-outside.yml"
+  if grep -q "check-prompts-renamed" "$WORKFLOW" && grep -q "^  run: scripts/check-prompts.sh" "$WORKFLOW"; then
+    grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+      && ko "a run: key outside any steps list was read as a command" \
+      || ok "...and a run: key outside any steps list is not a command anyone runs"
+  else
+    ko "the outside-steps probe did not build: the workflow no longer spells concurrency as this file expects"
+  fi
+else
+  ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
+fi
+
+# A job dependency can skip the whole job, and a `needs:` is one more key a pinned job may not
+# carry -- which the job-level allow-list refuses without knowing what `needs` means.
+if probe_workflow_swap '  prompts:' \
+  '  prompts:
+    needs: changes'; then
+  grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+    && ko "a job-level needs: left the job's steps counting as live" \
+    || ok "...nor is a step of a job that depends on another, which can skip it"
+else
+  ko "the swap probe rewrote nothing: the workflow no longer opens the prompts job as this file expects"
+fi
+
+# A check added to CI as an action is one preflight cannot run at all.
+if probe_workflow_swap '      - name: Check shell syntax' \
+  '      - uses: owner/linter-action@v1
+      - name: Check shell syntax'; then
+  [ "$(lint_uses_steps)" = owner/linter-action@v1 ] \
+    && ok "...and a lint check added as an action is reported, since preflight cannot run it" \
+    || ko "an action-based lint check was invisible to the parity pin (verdict:$(lint_uses_steps))"
+else
+  ko "the swap probe rewrote nothing: the lint job no longer spells the syntax step as this file expects"
+fi
+
+# --root judges some other tree, so the checkout itself goes unchecked.
+if probe_workflow_swap '        run: scripts/preflight.sh --require-tools syntax' \
+  '        run: scripts/preflight.sh --root testdata --require-tools syntax'; then
+  [ "$(unrun_steps "$(lint_preflight_steps)")" = " syntax" ] \
+    && ok "...and a --root invocation, which judges another tree, covers no step of this one" \
+    || ko "a --root invocation was read as running its step (verdict:$(unrun_steps "$(lint_preflight_steps)"))"
+else
+  ko "the swap probe rewrote nothing: the lint job no longer spells the syntax step as this file expects"
 fi
 
 # The compact step form is valid YAML and is used in this workflow, so every reader must see it.
