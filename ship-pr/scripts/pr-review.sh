@@ -4002,16 +4002,22 @@ function refs_of(unit, repo,   rest, r, out, n, seen, key) {
   # reference to a HOST (review round 3). An issue bound through its full URL is a shape this
   # scanner does not read and SKILL.md says so, so blanking them keeps that boundary exact rather
   # than half-reading it. The owner is tightened for the same reason: a GitHub login carries only
-  # alphanumerics and hyphens, never the dots that let example.com pass as one. What CLOSES that
-  # genre rather than chasing it is the boundary: a reference whose preceding character is a dot or
-  # a slash is a host label or a path component, which is true of a schemeless `www.example.com/p#2`
-  # as much as of a scheme-bearing one (review round 5), so enumerating URL spellings stopped. A number starts at
+  # alphanumerics and hyphens, never the dots that let example.com pass as one.
+  #
+  # The boundary before a reference is a WHITELIST, and that is the point. Two rounds were spent
+  # excluding what a URL puts in front of a hash -- first the scheme, then a dot or a slash -- and
+  # a query string answered each time with another character (`=`, `&`; review rounds 5 and 7). A
+  # blacklist of punctuation cannot be finished, because the next URL shape brings the next
+  # character. So a reference is one only after the start of the unit, whitespace, an OPENING
+  # bracket or quote, or Markdown emphasis -- the places a human writes one. Anything else in
+  # front of a hash, whatever it is, is not an issue reference here. What that costs is a shape
+  # nobody writes (`see:#1`), and what it buys is a rule no further URL can outflank. A number starts at
   # 1, so `#0` is prose -- "step #0 initializes the state" was a second issue, and a nonexistent
   # one at that (review round 4).
   rest = unit
   gsub(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^ \t]*/, " ", rest)
   out = ""; n = 0
-  while (match(rest, /(^|[^a-zA-Z0-9_.\/])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[1-9][0-9]*/)) {
+  while (match(rest, /(^|[ \t([{<"\047`*_,;])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[1-9][0-9]*/)) {
     r = substr(rest, RSTART, RLENGTH)
     rest = substr(rest, RSTART + RLENGTH)
     sub(/^[^a-zA-Z0-9#]/, "", r)
@@ -4116,10 +4122,13 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
   # and goes unreported, which is the fourth documented limitation in SKILL.md. That is the right
   # side of the trade for a warning -- silence is the status quo this PR improves on, while advice
   # to reopen the wrong issue is what teaches a reader to stop reading the warning at all.
-  # A closing quote or bracket sits BETWEEN the terminator and the space often enough to matter:
-  # requiring whitespace immediately after the full stop kept `... "Closes #1." See #2 ...` as one
-  # unit and had the scan name an issue belonging to the next sentence (review round 3).
-  gsub(/[.!?]["\047)\]}`*_]*[ \t]+/, "&\001", s)
+  # What may sit BETWEEN the terminator and the space is generalized rather than listed. A closing
+  # quote was the first thing found there (review round 3), a Markdown link destination the second
+  # (round 7), and a list of closers would have grown a member per round. Any run of
+  # non-alphanumerics ends the unit, plus one parenthesized group for `](https://…)`, which is the
+  # only shape that legitimately carries alphanumerics after a full stop. Requiring an alphanumeric
+  # NOT to follow immediately is what keeps a version number ("3.5") from splitting.
+  gsub(/[.!?][^ \ta-zA-Z0-9]*(\([^ \t]*\))?[^ \ta-zA-Z0-9]*[ \t]+/, "&\001", s)
   n = split(s, parts, "\001")
   for (i = 1; i <= n; i++) scan(parts[i], quoted)
 }'
@@ -4137,6 +4146,11 @@ multi_close_say() { # <line...>; joined like warn's, so a continued line stays o
 # did not run" must not compare equal -- the same distinction the read failure above is written for.
 MULTI_CLOSE_LAST=""
 MULTI_CLOSE_HAVE=""
+# The BODY the last scan read, not its findings. Comparing findings said "unchanged" about a body
+# that had gained a separate `Closes #3` line, because an ordinary single-reference line produces
+# no finding -- so the re-scan confirmed the merge closed what it had listed while it was about to
+# close one more (review round 7). The findings are what is PRINTED; the body is what is compared.
+MULTI_CLOSE_BODY=""
 
 # GitHub applies a body keyword when the PR merges into the repository DEFAULT branch, and not
 # otherwise. A PR landing on a release or staging branch closes nothing, so a warning there names
@@ -4147,27 +4161,38 @@ MULTI_CLOSE_HAVE=""
 # yes / no / unknown. UNKNOWN is not "no": an unread comparison cannot say the keyword is inert, so
 # the findings are still printed, with the doubt on the line. That is the same rule the body read
 # itself follows -- a read that failed is not a clean body.
+#
+# Read EVERY time, with no cache. A cache stood here for one round and was wrong for the same
+# reason the merge-queue check is made twice: a PR can be RETARGETED during a wait that runs two
+# hours, and a cached comparison would then skip the scan on a PR moved onto the default branch,
+# or advise reopening on one moved off it (review round 7). Two reads per scan is the price of an
+# answer about the base this merge will actually use, and it is the same price cmd_merge already
+# pays for the queue.
 MULTI_CLOSE_BINDS=""
-multi_close_binds() { # <pr>; sets MULTI_CLOSE_BINDS
-  [ -z "$MULTI_CLOSE_BINDS" ] || return 0
-  local base def
+# The reason for an `unknown`, kept HERE rather than read back from gh_err_line: the successful
+# body read that follows clears the shared error file, so the message printed `failed ()` with the
+# cause gone -- the diagnostic that says whether a retry is worth making (review round 7).
+MULTI_CLOSE_ERR=""
+multi_close_binds() { # <pr>; sets MULTI_CLOSE_BINDS and MULTI_CLOSE_ERR
+  local base def rc
+  MULTI_CLOSE_ERR=""
   base=$(gh_retry read api "repos/$REPO/pulls/$1" --jq '.base.ref // ""')
-  if [ $? -ne 0 ] || [ -z "$base" ]; then
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$base" ]; then
     MULTI_CLOSE_BINDS=unknown
+    MULTI_CLOSE_ERR="the PR base could not be read: $(gh_err_line)"
     return 0
   fi
   def=$(gh_retry read api "repos/$REPO" --jq '.default_branch // ""')
-  if [ $? -ne 0 ] || [ -z "$def" ]; then
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$def" ]; then
     MULTI_CLOSE_BINDS=unknown
+    MULTI_CLOSE_ERR="the default branch could not be read: $(gh_err_line)"
     return 0
   fi
-  MULTI_CLOSE_BASE="$base"
-  MULTI_CLOSE_DEFAULT="$def"
   if [ "$base" = "$def" ]; then MULTI_CLOSE_BINDS=yes; else MULTI_CLOSE_BINDS=no; fi
   return 0
 }
-MULTI_CLOSE_BASE=""
-MULTI_CLOSE_DEFAULT=""
 
 warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a merge is a gate
   local body scan rc class cnt refs sent n=0 again="${2:-}"
@@ -4203,7 +4228,7 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
   # was edited during the gate gets the new findings in full, or, when the edit removed them, a
   # line retracting the ones printed earlier.
   if [ -n "$again" ] && [ -n "$MULTI_CLOSE_HAVE" ]; then
-    if [ "$scan" = "$MULTI_CLOSE_LAST" ]; then
+    if [ "$body" = "$MULTI_CLOSE_BODY" ]; then
       [ -z "$scan" ] || multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body is UNCHANGED" \
         "since the scan above, so the merge closes what it listed."
       return 0
@@ -4212,12 +4237,14 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
       multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1's body was edited since the" \
         "scan above and now binds no keyword to more than it names."
       MULTI_CLOSE_LAST=""
+      MULTI_CLOSE_BODY="$body"
       return 0
     fi
     multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body was EDITED since the scan above;" \
       "what this merge closes is below, not there."
   fi
   MULTI_CLOSE_LAST="$scan"
+  MULTI_CLOSE_BODY="$body"
   MULTI_CLOSE_HAVE=1
   [ -n "$scan" ] || return 0
   # The body is data from the PR, so every line of it is written through printf and never echoed.
@@ -4239,17 +4266,22 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
     "fenced copy of an example binds the same way:"
   multi_close_say "  ludics-lite#205 was closed twice over exactly that, by a phase reference" \
     "in #210 and then by #226 quoting it back."
-  # NOT `--repo $REPO`: a reference is reported as the body spells it, and the cross-repository
-  # form `owner/tracker#123` names an issue this PR's repository does not have. Following a
-  # hardcoded --repo would reopen a same-numbered issue HERE, or fail (review round 1).
-  multi_close_say "  If an issue listed above must stay OPEN, reopen it now in the repository its" \
-    "own reference names"
-  multi_close_say "  (gh issue reopen <n> --repo <owner>/<name>; a bare #<n> is $REPO), and fix" \
-    "the body."
+  # EDIT first, reopen only after. Every scan prints BEFORE its merge attempt -- the lead-time one
+  # before a wait that may end in a refusal, the authoritative one moments before the call -- so at
+  # the point these lines are read nothing has closed yet, and "reopen it now" was advice that
+  # could not work and left the body to close the issue again on the next attempt (review round 7).
+  # The repository is NOT `$REPO`: a reference is reported as the body spells it, and the
+  # cross-repository form names an issue this PR own repository does not have, so a hardcoded
+  # --repo would act on a same-numbered issue HERE, or fail (review round 1).
+  multi_close_say "  If an issue listed above must stay OPEN, EDIT THE BODY now -- nothing has" \
+    "closed yet, and this scan runs before the merge."
+  multi_close_say "  If the merge has already landed by the time you read this, reopen it in the" \
+    "repository its own reference names"
+  multi_close_say "  (gh issue reopen <n> --repo <owner>/<name>; a bare #<n> is $REPO)."
   if [ "$MULTI_CLOSE_BINDS" = unknown ]; then
     multi_close_say "  Whether these bind at all could NOT be read: a body keyword closes only on a" \
       "merge into the repository default"
-    multi_close_say "  branch, and the comparison failed ($(gh_err_line)). Unread is not inert."
+    multi_close_say "  branch, and $MULTI_CLOSE_ERR. Unread is not inert."
   fi
   multi_close_say "  This is a WARNING and not a gate: one sentence closing two issues is" \
     "sometimes exactly what was meant,"

@@ -35,6 +35,7 @@ MERGE_STATE="merged=true state=MERGED" # what REST says after the merge call
 MERGE_QUEUE=""                         # nonempty = the base has a merge queue
 MERGE_NOT_MERGEABLE=""                 # nonempty = the FIRST pr merge call fails as not mergeable
 PR_BASE=main                           # the branch this PR targets
+BASE_LATER=""                          # nonempty = the base read answers with this from the 2nd on
 DEFAULT_BRANCH=main                    # the repository default branch
 DEFAULT_BRANCH_FAIL=""                 # nonempty = the default-branch read answers with a 404
 PR_BODY="A body with nothing to close."  # what the body read answers with
@@ -43,6 +44,7 @@ BODY_FAIL=""                           # nonempty = the body read answers with a
 # The read counter travels in a FILE: gh_retry calls the fixture inside a command substitution,
 # so a variable it increments dies with that subshell -- as CALLS_FILE already exists for.
 READS_FILE="$TEST_ROOT/body-reads"
+BASE_READS_FILE="$TEST_ROOT/base-reads"
 
 # The three library functions this suite replaces, declared so the shadow guard lets them through:
 # the build signal is not under test here. gate_checks calls them inside command substitutions;
@@ -71,7 +73,14 @@ gh() {
     # successor, so the two are told apart by `updated_at` rather than by field count.
     *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
     *'.head.sha'*) printf '%s\tbase-sha\tclaude/topic\n' "$CURRENT_HEAD" ;;
-    *'.base.ref'*) printf '%s\n' "$PR_BASE" ;;
+    *'.base.ref'*)
+      printf 'base\n' >>"$BASE_READS_FILE"
+      if [ -n "$BASE_LATER" ] && [ "$(wc -l <"$BASE_READS_FILE" | tr -d ' ')" -ge 2 ]; then
+        printf '%s\n' "$BASE_LATER"
+      else
+        printf '%s\n' "$PR_BASE"
+      fi
+      ;;
     *'.body'*)
       printf 'read\n' >>"$READS_FILE"
       if [ -n "$BODY_FAIL" ]; then
@@ -124,6 +133,7 @@ gh() {
 run_merge() {
   local rc
   : >"$READS_FILE"
+  : >"$BASE_READS_FILE"
   : >"$CALLS_FILE"
   set +e
   (cmd_merge "$REPO#7" "$@") >"$OUT_FILE" 2>"$ERR_FILE"
@@ -149,6 +159,7 @@ reset() {
   MERGE_QUEUE=""
   MERGE_NOT_MERGEABLE=""
   PR_BASE=main
+  BASE_LATER=""
   DEFAULT_BRANCH=main
   DEFAULT_BRANCH_FAIL=""
   rm -f "$TEST_ROOT/merge-failed-once"
@@ -731,6 +742,87 @@ Closes #643
     "a valid info string still opens a fence"
 }
 
+# Review round 7, P2. A PR can be RETARGETED during a wait that runs two hours, so the base/default
+# comparison is read every time rather than cached -- the same reason cmd_merge reads the merge
+# queue twice. A cached answer would skip the scan on a PR moved ONTO the default branch.
+test_a_retarget_during_the_gate_is_seen() {
+  reset
+  PR_BODY='Closes #644 and #645
+'
+  PR_BASE=release-1.2
+  # The early scan sees a non-default base and says nothing; the fixture then reports the default
+  # base from the second read on, which is what a retarget during the wait looks like.
+  BASE_LATER=main
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge still lands ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #644 #645" \
+    "the authoritative scan re-reads the base and finds the keyword now binds"
+}
+
+# Review round 7, P2. The unknown state must carry the reason that caused it: the successful body
+# read that follows clears the shared error file, so reading it back printed an empty cause.
+test_an_unknown_comparison_names_its_cause() {
+  reset
+  PR_BODY='Closes #646 and #647
+'
+  DEFAULT_BRANCH_FAIL=1
+  run_merge
+  assert_contains "$MERGE_STDOUT" "the default branch could not be read: gh: Not Found (HTTP 404)" \
+    "the cause of the uncertainty survives the body read"
+}
+
+# Review round 7, P2. A Markdown link destination sits between the terminator and the space, so the
+# two sentences stayed one unit and the scan named a reference from the next one.
+test_a_link_destination_does_not_join_two_sentences() {
+  reset
+  PR_BODY='[Closes #648.](https://example.test/x) See #649 for context.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "the link destination does not hold two sentences together"
+  # A version number must still NOT split, which is what the alphanumeric guard is for.
+  PR_BODY='Closes #650 and #651 in release 3.5 of the tool
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #650 #651" "a decimal is not a boundary"
+}
+
+# Review round 7, P2. "Unchanged" was decided on the FINDINGS, so a body that gained an ordinary
+# single-reference `Closes` line compared equal -- and the re-scan confirmed the merge closed what
+# it had listed while it was about to close one more.
+test_an_added_plain_closes_line_is_not_an_unchanged_body() {
+  reset
+  PR_BODY='Closes #652 and #653
+'
+  PR_BODY_LATER='Closes #652 and #653
+
+Closes #654
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge still lands ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_STDOUT" "is UNCHANGED since the scan above" \
+    "a body that gained a closing line is not unchanged"
+  assert_contains "$MERGE_STDOUT" "was EDITED since the scan above" "the re-scan says the body moved"
+}
+
+# Review round 7, P2. A query string puts `=` or `&` in front of a hash, which two rounds of
+# blacklisting the preceding character did not cover. The boundary is a whitelist now.
+test_a_query_string_hash_is_not_an_issue_reference() {
+  reset
+  PR_BODY='Closes #655; see www.example.com/?issue=#656 for details.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" "a query-string hash is not a reference"
+  # The shapes a human actually writes still count, including a reference in inline code or
+  # brackets -- the whitelist has to admit those or the scan goes quiet on ordinary bodies.
+  PR_BODY='Closes (#657) and `#658`
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "2 issues: #657 #658" "brackets and inline code still open a reference"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -766,6 +858,11 @@ tests=(
   test_reference_case_does_not_make_a_second_issue
   test_a_tab_after_spaces_is_still_code_indentation
   test_an_invalid_backtick_opener_opens_no_fence
+  test_a_retarget_during_the_gate_is_seen
+  test_an_unknown_comparison_names_its_cause
+  test_a_link_destination_does_not_join_two_sentences
+  test_an_added_plain_closes_line_is_not_an_unchanged_body
+  test_a_query_string_hash_is_not_an_issue_reference
 )
 
 run_tests "${tests[@]}"
