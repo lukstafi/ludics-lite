@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Focused fixture tests for pr-review.sh's `merge`: the binding of the merge to the head the build
-# signal was read for, and the refusals of a --require-green (close-out) merge (ludics-lite#39).
+# signal was read for, the refusals of a --require-green (close-out) merge (ludics-lite#39), and the
+# closing-keyword scan of the PR body that runs before the merge is issued (ludics-lite#227).
 # The build signal itself is stubbed; the gate's own behaviour is test-pr-review-checks-absent.sh's.
 
 set -euo pipefail
@@ -23,6 +24,7 @@ source "$SCRIPT_DIR/test-pr-review-lib.sh"
 REPO=example/repo
 test_tmpdir TEST_ROOT merge-test
 OUT_FILE="$TEST_ROOT/out"
+ERR_FILE="$TEST_ROOT/err"
 CALLS_FILE="$TEST_ROOT/calls"
 
 CURRENT_HEAD=head-sha
@@ -31,6 +33,8 @@ NO_CHECKS=""                           # the head carries no build check at all
 RUN_REASON="every run for the head finished and was judged" # what the run list settled on
 MERGE_STATE="merged=true state=MERGED" # what REST says after the merge call
 MERGE_QUEUE=""                         # nonempty = the base has a merge queue
+PR_BODY="A body with nothing to close."  # what the body read answers with
+BODY_FAIL=""                           # nonempty = the body read answers with a 404
 
 # The three library functions this suite replaces, declared so the shadow guard lets them through:
 # the build signal is not under test here. gate_checks calls them inside command substitutions;
@@ -60,6 +64,13 @@ gh() {
     *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
     *'.head.sha'*) printf '%s\tbase-sha\tclaude/topic\n' "$CURRENT_HEAD" ;;
     *'.base.ref'*) echo main ;;
+    *'.body'*)
+      if [ -n "$BODY_FAIL" ]; then
+        printf 'gh: Not Found (HTTP 404)\n' >&2
+        return 1
+      fi
+      printf '%s\n' "$PR_BODY"
+      ;;
     *merged=*) echo "$MERGE_STATE" ;;
     *) bail "unexpected pulls read: $*" ;;
     esac
@@ -77,14 +88,19 @@ gh() {
 
 # In a subshell: cmd_merge's refusals are `fail`, which exits the shell it runs in. The calls
 # and output travel through files, so the subshell costs nothing the assertions need.
+# The two streams are kept APART as well as together: the closing-keyword warning is required to
+# reach BOTH, and a single merged capture cannot tell a line that went to one from a line that went
+# to the other. MERGE_OUTPUT stays the pair, which is what every older case asserts against.
 run_merge() {
   local rc
   : >"$CALLS_FILE"
   set +e
-  (cmd_merge "$REPO#7" "$@") >"$OUT_FILE" 2>&1
+  (cmd_merge "$REPO#7" "$@") >"$OUT_FILE" 2>"$ERR_FILE"
   rc=$?
   set -e
-  MERGE_OUTPUT=$(cat "$OUT_FILE")
+  MERGE_STDOUT=$(cat "$OUT_FILE")
+  MERGE_STDERR=$(cat "$ERR_FILE")
+  MERGE_OUTPUT=$(cat "$OUT_FILE" "$ERR_FILE")
   MERGE_RC="$rc"
   MERGE_CALLS=$(cat "$CALLS_FILE")
 }
@@ -100,6 +116,8 @@ reset() {
   RUN_REASON="every run for the head finished and was judged"
   MERGE_STATE="merged=true state=MERGED"
   MERGE_QUEUE=""
+  PR_BODY="A body with nothing to close."
+  BODY_FAIL=""
 }
 
 # The merge is bound to the head the gate read: a push during a long --wait must not land a head
@@ -211,6 +229,85 @@ test_superseded_head_never_merges() {
   assert_no_merge_call
 }
 
+# ludics-lite#227. A closing keyword binds to every `#N` in its sentence, so one sentence naming two
+# issues closes both -- which is how ludics-lite#205 was closed by a phase reference in #210. The
+# scan says so before the merge lands, on both streams, naming the sentence and every issue.
+test_one_sentence_closing_two_issues_warns() {
+  reset
+  PR_BODY='## What
+
+The scanner lands. Closes #401 and #402
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the warning is not a gate: the merge still lands ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_CALLS" "pr merge" "the merge call is still made"
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD WARNING" "warns on stdout"
+  assert_contains "$MERGE_STDERR" "CLOSING-KEYWORD WARNING" "and on stderr"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #401 #402" "names every issue it closes"
+  assert_contains "$MERGE_STDOUT" "Closes #401 and #402" "names the sentence"
+  # The sentence, not the line: the half before the full stop carries no keyword of its own.
+  assert_not_contains "$MERGE_STDOUT" "The scanner lands." "the unit is the sentence, not the line"
+}
+
+# The other half of #227, and the shape that closed #205 a SECOND time: a keyword inside a `> `
+# quote or a fenced block closes exactly as a statement does, so there ONE reference is already one
+# nobody meant to close. The single plain `Closes` line in the same body stays out of the report.
+test_a_closing_keyword_in_a_quoted_or_fenced_line_warns() {
+  reset
+  PR_BODY='Review record: the reviewer asked about the shape
+
+> Closes #205
+
+and about the one the skill prescribes:
+
+```
+Fixes #206
+```
+
+Closes #403
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_CALLS" "pr merge" "the merge call is still made"
+  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #205" \
+    "a quoted keyword is reported at ONE reference"
+  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #206" \
+    "a fenced one too"
+  assert_contains "$MERGE_STDERR" "#205" "the quoted finding reaches stderr as well"
+  assert_not_contains "$MERGE_STDOUT" "403" "the plain single-issue Closes line is not reported"
+}
+
+# The control, and the one that decides the unit: the shape ship-pr/SKILL.md *Open* PRESCRIBES --
+# one `Closes #N` per line -- is silent. Markdown joins those two lines into one paragraph, so a
+# paragraph-sized unit would make the prescribed shape the loudest warning in the file.
+test_the_prescribed_shape_stays_silent() {
+  reset
+  PR_BODY='Two issues, one PR, and a third this only partially addresses.
+
+Closes #404
+Closes #405
+
+Refs #406 and #407. A close-out merge of #408 and #409 names neither as done.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the control merges ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "two Closes lines, a keyword-free reference and a hyphenated close-out are all silent"
+}
+
+# A body that could not be READ is not a body with nothing in it. Without this line the scan's
+# silence is indistinguishable from a clean body -- the false negative this file refuses everywhere
+# else (an unread approval is never "no approval yet").
+test_an_unread_body_is_not_a_clean_body() {
+  reset
+  BODY_FAIL=1
+  run_merge
+  assert_eq "$MERGE_RC" 0 "an unreadable body does not block the merge"
+  assert_contains "$MERGE_CALLS" "pr merge" "the merge call is still made"
+  assert_contains "$MERGE_STDERR" "the closing-keyword scan did NOT run" \
+    "the silence is announced as unread, not as clean"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -220,6 +317,10 @@ tests=(
   test_require_green_disables_a_deferred_auto_merge
   test_require_green_refuses_a_merge_queue
   test_a_paths_ignored_head_merges_on_the_recognized_absence
+  test_one_sentence_closing_two_issues_warns
+  test_a_closing_keyword_in_a_quoted_or_fenced_line_warns
+  test_the_prescribed_shape_stays_silent
+  test_an_unread_body_is_not_a_clean_body
 )
 
 run_tests "${tests[@]}"

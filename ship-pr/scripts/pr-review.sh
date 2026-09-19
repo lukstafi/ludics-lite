@@ -3950,6 +3950,139 @@ refuse_merge_queue() {
     "with the record on the PR."
 }
 
+# --- the PR body's closing keywords ------------------------------------------------------------
+# GitHub closes issues from a PR body by KEYWORD, and the keyword binds to every `#N` in the same
+# SENTENCE rather than to the one reference that follows it. "Resolves #194 and #205 §1" in
+# ludics-lite#210 closed #205 -- a phase reference, not a completion -- and #205 had to be reopened.
+# The doc line ship-pr/SKILL.md *Open* grew afterwards (#226) was already in front of the author who
+# wrote that sentence, and #226's own body then closed #205 a SECOND time, out of a QUOTED copy of
+# the example it was warning about: a `> ...` line closes exactly as a statement does. So the trap
+# is not that the rule is unknown. It is that the rule is applied at the moment the body is written
+# and read back by nothing, while the body itself is machine-read on the landing path three times
+# over. `merge` is where that read is worth spending: the last moment the body can still be edited
+# before the issues close.
+#
+# It WARNS and does not refuse, and that is not softness. `Closes #3 and #4` is a correct body; the
+# deliberate pair and the accidental one differ in INTENT and not in text, and nothing readable from
+# here tells them apart. A refusal would therefore be a FALSE refusal on a shape that is common, and
+# its escape hatch would be a flag one keystroke wide -- the failure mode --override's REASON
+# argument exists in this same file to avoid, and the one that would retire this check permanently
+# the first time an agent learned to type the flag. What the warning does instead, a refusal cannot
+# do better: name the sentence and every issue it binds, so a wrong close is undone in the minute
+# after the merge (`gh issue reopen`) instead of at the next audit.
+#
+# The unit is a SENTENCE WITHIN A LINE and not a Markdown paragraph, which is the one deliberate
+# under-approximation here. Markdown joins wrapped lines, so a paragraph unit would read the shape
+# this skill PRESCRIBES --
+#     Closes #1
+#     Closes #2
+# -- as one sentence closing two issues, and the loudest warning in the file would be the shape
+# callers are told to write. What that costs is a sentence WRAPPED across a line break with its
+# references split over it, which this scanner does not see. Two more shapes it does not read: an
+# issue closed through a full issue URL, and a four-space-indented code block (a fenced one it does
+# read). All three are named in SKILL.md so the silence is not mistaken for a clean body.
+#
+# One offending unit per line on stdout: "<class><TAB><count><TAB><refs><TAB><the sentence>", where
+# <class> is `sentence` (a closing keyword binding two or more references) or `quoted` (a keyword
+# inside a `>` quote or a fenced block, where even ONE reference is one nobody meant to close).
+# The keyword boundaries exclude `-` on both sides on purpose: this repo's own vocabulary is full of
+# `close-out`, `closed-loop` and `fixed-point`, and a body saying "a close-out merge of #3 and #4"
+# is not closing anything.
+MULTI_CLOSE_FILTER='
+function refs_of(unit,   rest, r, out, n) {
+  rest = unit; out = ""; n = 0
+  while (match(rest, /(^|[^a-zA-Z0-9_])([a-zA-Z0-9][-a-zA-Z0-9._]*\/[a-zA-Z0-9][-a-zA-Z0-9._]*)?#[0-9]+/)) {
+    r = substr(rest, RSTART, RLENGTH)
+    rest = substr(rest, RSTART + RLENGTH)
+    sub(/^[^a-zA-Z0-9#]/, "", r)
+    n++
+    out = (n == 1 ? r : out " " r)
+  }
+  return out
+}
+function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
+  if (tolower(unit) !~ /(^|[^a-z0-9_-])(close[sd]?|fix(e[sd])?|resolve[sd]?)([^a-z0-9_-]|$)/) return
+  refs = refs_of(unit)
+  if (refs == "") return
+  cnt = split(refs, parts, " ")
+  if (cnt < 2 && !quoted) return
+  shown = unit
+  sub(/^[ \t>]+/, "", shown)
+  sub(/[ \t]+$/, "", shown)
+  if (length(shown) > 200) shown = substr(shown, 1, 197) "..."
+  cls = quoted ? "quoted" : "sentence"
+  print cls "\t" cnt "\t" refs "\t" shown
+}
+{
+  line = $0
+  sub(/\r$/, "", line)
+  trimmed = line
+  sub(/^[ \t]+/, "", trimmed)
+  quoted = 0
+  if (trimmed ~ /^(```|~~~)/) { fence = 1 - fence; quoted = 1 }
+  if (fence) quoted = 1
+  if (trimmed ~ /^>/) quoted = 1
+  s = line
+  gsub(/[.!?][ \t]+/, "&\001", s)
+  n = split(s, parts, "\001")
+  for (i = 1; i <= n; i++) scan(parts[i], quoted)
+}'
+
+# One line of the warning on BOTH streams: stdout is the transcript a later reader scrolls back
+# through, and stderr is what a caller that kept only the merge's error output still sees. The
+# OVERRIDE and ALLOW-NO-VERDICT announcements in cmd_merge are written the same way.
+multi_close_say() { # <line...>; joined like warn's, so a continued line stays one line
+  printf '%s\n' "$*"
+  warn "$*"
+}
+
+warn_multi_close() { # <pr>; always 0 -- a warning that can refuse a merge is a gate
+  local body scan rc class cnt refs sent n=0
+  body=$(gh_retry read api "repos/$REPO/pulls/$1" --jq '.body // ""')
+  rc=$?
+  # A read that FAILED is not a body with nothing in it. Say so, or the silence below is read as a
+  # scan that found nothing -- the same false negative the approval read is written against.
+  if [ "$rc" -ne 0 ]; then
+    warn "could not read $REPO#$1's body ($(gh_err_line)); the closing-keyword scan did NOT run," \
+      "so nothing here says this merge closes only what it means to."
+    return 0
+  fi
+  [ -n "$body" ] || return 0
+  scan=$(awk "$MULTI_CLOSE_FILTER" <<<"$body")
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "the closing-keyword scan of $REPO#$1's body did not run (awk exit $rc); its silence is" \
+      "not a clean body."
+    return 0
+  fi
+  [ -n "$scan" ] || return 0
+  # The body is data from the PR, so every line of it is written through printf and never echoed.
+  while IFS=$'\t' read -r class cnt refs sent; do
+    [ -n "$class" ] || continue
+    n=$((n + 1))
+    if [ "$n" -eq 1 ]; then
+      multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body closes issues it does not look" \
+        "like it closes:"
+    fi
+    case "$class" in
+    quoted) multi_close_say "  a QUOTED or FENCED line, which closes just the same -- $cnt: $refs" ;;
+    *) multi_close_say "  ONE sentence, $cnt issues: $refs" ;;
+    esac
+    multi_close_say "      $sent"
+  done <<<"$scan"
+  [ "$n" -gt 0 ] || return 0
+  multi_close_say "  A closing keyword binds to EVERY #N in its sentence, and a quoted or" \
+    "fenced copy of an example binds the same way:"
+  multi_close_say "  ludics-lite#205 was closed twice over exactly that, by a phase reference" \
+    "in #210 and then by #226 quoting it back."
+  multi_close_say "  If an issue listed above must stay OPEN, reopen it now (gh issue reopen" \
+    "<n> --repo $REPO) and fix the body."
+  multi_close_say "  This is a WARNING and not a gate: one sentence closing two issues is" \
+    "sometimes exactly what was meant,"
+  multi_close_say "  and nothing readable from here tells that apart from the accident."
+  return 0
+}
+
 cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
@@ -4018,6 +4151,14 @@ cmd_merge() {
       "same red on master before this branch existed'."
   fi
   pr_arg "$pr"
+  # Read the body FIRST, before the merge-queue refusal and before a --wait that can run two hours.
+  # Two reasons for the position. It is a fact about the PR and not about the build signal, so it is
+  # owed to the refusal paths too -- a merge stopped by a red gate is a merge that will be re-run,
+  # and the body is fixable in between, which it is not once the issues are closed. And under a long
+  # --wait an operator watching the run gets the whole wait as lead time. What it costs is being the
+  # FIRST thing on screen rather than the last: warn_base_drift keeps the position just before the
+  # merge call, where its comment says it belongs.
+  warn_multi_close "$PR_NUM"
   # A merge queue turns `gh pr merge` into an ENQUEUE — the PR lands later, on whatever head it
   # has then, and --disable-auto does not take an entry out of a queue. A close-out merge lands
   # the gated head now or refuses, so on a queued base it refuses before calling merge at all:
