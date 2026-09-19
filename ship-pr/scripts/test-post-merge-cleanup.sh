@@ -2416,14 +2416,19 @@ test_commit_message_archive() {
   echo "PASS: rejected commit messages are copied into the recovery archive"
 }
 
-# handshake_attempts <case-start-seconds>: how many 0.1 s polls the concurrent-commit fixture may
-# spend waiting for the other side of one of its handshakes. Both waits used a bare 50 polls -- a
-# fixed five seconds with no relation to anything the suite promises. When a loaded box needed
-# longer than that to resume the paused commit and run its commit-msg hook, the fake git gave up
-# and returned 91, the helper's `worktree remove` failed, and the case reported the helper's
+# handshake_budget <case-start-seconds>: how many SECONDS the concurrent-commit fixture may spend
+# waiting for the other side of one of its handshakes. Both waits used a bare 50 polls -- a fixed
+# five seconds with no relation to anything the suite promises. When a loaded box needed longer
+# than that to resume the paused commit and run its commit-msg hook, the fake git gave up and
+# returned 91, the helper's `worktree remove` failed, and the case reported the helper's
 # genuine-lock message: a fixture stall wearing the helper's failure, which cost several PRs a day
 # of proving their diff innocent (ludics-lite#216). Budget against the deadline the harness
 # actually enforces instead, so the wait scales with the box the suite was told to expect.
+#
+# Seconds, and both loops compare $SECONDS against a deadline built from this -- never a count of
+# `sleep 0.1` iterations. A poll count is not a wall clock: on the loaded host this case is being
+# fixed for, each sleep resumes late, so N iterations run well past N/10 seconds. Budgeting in
+# polls would restate, inside the fix, the exact confusion the fix exists to remove.
 #
 # Half of the time the case has LEFT, not half of the deadline: the case runs two of these
 # handshakes in sequence, and two independent half-deadline budgets sum past the deadline, so the
@@ -2431,26 +2436,26 @@ test_commit_message_archive() {
 # its own stall -- reinstating the very failure this case is being fixed to stop producing.
 # Halving what remains is self-limiting: any number of waits in sequence still sum to less than
 # the deadline. Floored so it is never tighter than the 5 s it replaces.
-handshake_attempts() {
+handshake_budget() {
   local budget="${CASE_TIMEOUT:-300}" remaining
   case "$budget" in
   '' | 0 | *[!0-9]*) budget=300 ;;
   esac
   remaining=$(((budget - (SECONDS - $1)) / 2))
   [ "$remaining" -ge 5 ] || remaining=5
-  printf '%s\n' "$((remaining * 10))"
+  printf '%s\n' "$remaining"
 }
 
 test_concurrent_commit_message_archive() {
-  local attempts commit_pid done fake_bin file late_message limit message_count message_snapshot
-  local case_started pre_commit ready real_git release stall
+  local budget case_started commit_pid deadline done fake_bin file late_message message_count
+  local message_snapshot pre_commit ready real_git release stall
   case_started=$SECONDS
   setup_case concurrent-commit-message-archive merge main-off
   ready="$TEST_ROOT/concurrent-commit-message.ready"
   release="$TEST_ROOT/concurrent-commit-message.release"
   done="$TEST_ROOT/concurrent-commit-message.done"
   stall="$TEST_ROOT/concurrent-commit-message.stalled"
-  limit=$(handshake_attempts "$case_started")
+  budget=$(handshake_budget "$case_started")
   pre_commit="$CASE_MAIN/.git/hooks/pre-commit"
   # The paused hook polls at the same 0.1 s the other side does. At `sleep 1` it spent up to a
   # whole second merely noticing its release, which on a quiet box was already the whole of the
@@ -2463,15 +2468,14 @@ test_concurrent_commit_message_archive() {
   late_message="late rejected commit proposal"
   git -C "$CASE_SESSION" commit --allow-empty -m "$late_message" >/dev/null 2>&1 &
   commit_pid=$!
-  attempts=0
-  while [ ! -e "$ready" ] && [ "$attempts" -lt "$limit" ]; do
+  deadline=$((SECONDS + budget))
+  while [ ! -e "$ready" ] && [ "$SECONDS" -lt "$deadline" ]; do
     sleep 0.1
-    attempts=$((attempts + 1))
   done
   if [ ! -e "$ready" ]; then
     touch "$release"
     wait "$commit_pid" >/dev/null 2>&1 || true
-    fail "concurrent commit did not pause in its pre-commit hook within $((limit / 10))s"
+    fail "concurrent commit did not pause in its pre-commit hook within ${budget}s"
   fi
 
   fake_bin="$TEST_ROOT/concurrent-commit-message-bin"
@@ -2484,10 +2488,9 @@ test_concurrent_commit_message_archive() {
     '  */session*)' \
     '    : >"$RELEASE_MARKER"' \
     '    touch "$COMMIT_RELEASE"' \
-    '    attempts=0' \
-    '    while [ ! -e "$COMMIT_DONE" ] && [ "$attempts" -lt "$HANDSHAKE_LIMIT" ]; do sleep 0.1; attempts=$((attempts + 1)); done' \
+    '    while [ ! -e "$COMMIT_DONE" ] && [ "$SECONDS" -lt "$HANDSHAKE_SECONDS" ]; do sleep 0.1; done' \
     '    if [ ! -e "$COMMIT_DONE" ]; then' \
-    '      printf "%s\\n" "$attempts" >"$HANDSHAKE_STALL"' \
+    '      printf "%s\\n" "$SECONDS" >"$HANDSHAKE_STALL"' \
     '      exit 91' \
     '    fi' \
     '    ;;' \
@@ -2496,10 +2499,10 @@ test_concurrent_commit_message_archive() {
     'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
   chmod +x "$fake_bin/git"
 
-  limit=$(handshake_attempts "$case_started")
+  budget=$(handshake_budget "$case_started")
   if ! PATH="$fake_bin:$PATH" REAL_GIT="$real_git" COMMIT_RELEASE="$release" \
     COMMIT_DONE="$done" RELEASE_MARKER="$TEST_ROOT/concurrent-commit-message.released" \
-    HANDSHAKE_LIMIT="$limit" HANDSHAKE_STALL="$stall" \
+    HANDSHAKE_SECONDS="$budget" HANDSHAKE_STALL="$stall" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null; then
     # Read the stall marker BEFORE joining the commit. Waiting first would block the diagnosis
     # behind the stall it describes, until the harness killed the case at its deadline and
@@ -2512,7 +2515,7 @@ test_concurrent_commit_message_archive() {
       # finishes on its own, and there is nothing here to clean up. Joining it would block the
       # diagnosis behind the very stall it describes, and signalling its PID is unsafe once Bash
       # may have reaped the job, because the number can by then belong to another case's process.
-      fail "fixture stall, not a helper failure: the released commit did not reach its commit-msg hook within $((limit / 10))s ($(cat "$stall") polls), so the fake git failed the helper's worktree removal"
+      fail "fixture stall, not a helper failure: the released commit did not reach its commit-msg hook within ${budget}s (waited $(cat "$stall")s), so the fake git failed the helper's worktree removal"
     fi
     # Not a stall: the commit may still be paused in its pre-commit hook, so release it and reap.
     # The helper's own failure is the finding here -- a genuine registration it could not unlock
