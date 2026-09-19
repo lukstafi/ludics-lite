@@ -103,6 +103,14 @@ expect "steps prints the table" 0 'prompts	scripts/check-prompts.sh' -- "$PF" st
 mkdir -p "$TMP/empty/docs"
 expect "a checkout the file list does not describe is a usage error, not a pass" \
   2 'stopped describing the checkout' -- "$PF" --root "$TMP/empty" syntax
+# Per pattern, not merely when the whole sweep is empty: two patterns still matching would
+# otherwise hide the third going away, and every step would pass over the smaller scope.
+tree scope_partial
+rm "$T/ship-pr/hooks/hook.sh"
+expect "...and so is ONE pattern of the list matching nothing, with the others still full" \
+  2 'no file matched ship-pr/hooks/*.sh' -- "$PF" --root "$T" syntax
+expect "...which the mode step refuses too, rather than judging the smaller scope" \
+  2 'stopped describing the checkout' -- "$PF" --root "$T" modes
 expect "...and so is a missing --root" 2 'no such directory' -- "$PF" --root "$TMP/nowhere" syntax
 expect "an unknown step is a usage error" 2 'no such step' -- "$PF" --root "$T" lint
 expect "an unknown option is a usage error" 2 'unknown option' -- "$PF" --root "$T" --lint
@@ -296,6 +304,10 @@ lint_preflight_steps() {
   awk -v want="  lint:" '
     /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_job = ($0 == want); next }
     in_job && $1 == "run:" && $2 == "scripts/preflight.sh" {
+      # A help flag is not a run: `preflight.sh --help syntax` prints the manual and exits 0
+      # without asserting anything, so the line covers NO step and the pin must say so rather
+      # than read `syntax` off it (round 2).
+      for (i = 3; i <= NF; i++) if ($i == "-h" || $i == "--help") next
       named = 0
       for (i = 3; i <= NF; i++) {
         if ($i ~ /^-/) { if ($i == "--root") i++; continue }
@@ -476,6 +488,16 @@ if probe_workflow_swap '        run: scripts/preflight.sh --require-tools modes'
     || ko "a lint step naming a step that does not exist did not trip the pin"
 else
   ko "the swap probe rewrote nothing: the lint job no longer spells the mode step as this file expects"
+fi
+
+# A help flag exits 0 having asserted nothing, so the step it names is not run (round 2).
+if probe_workflow_swap '        run: scripts/preflight.sh --require-tools syntax' \
+  '        run: scripts/preflight.sh --help syntax'; then
+  [ "$(unrun_steps "$(lint_preflight_steps)")" = " syntax" ] \
+    && ok "...and a step turned into a --help invocation, which asserts nothing, trips it" \
+    || ko "a --help invocation was read as running its step (verdict:$(unrun_steps "$(lint_preflight_steps)"))"
+else
+  ko "the swap probe rewrote nothing: the lint job no longer spells the syntax step as this file expects"
 fi
 
 # The shape that must NOT be refused: one invocation with no step names runs them all, which is a

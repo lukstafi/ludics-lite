@@ -106,9 +106,10 @@ step_command() { # step_command <name>: the external command, `-`, or empty when
 }
 
 collect_files() { # fills FILES with the paths the globs expand to, relative to the judged checkout
-  local pattern path
+  local pattern path matched
   [ "${#FILES[@]}" -eq 0 ] || return 0
   for pattern in "${GLOBS[@]}"; do
+    matched=0
     # Unquoted: this is pathname expansion, the workflow's own. An unmatched pattern arrives as
     # itself, which the existence test drops. A BROKEN SYMLINK is kept, which `-f` would not have
     # been: `-f` follows the link, so a dangling one read as "no such path" and was dropped from
@@ -116,15 +117,20 @@ collect_files() { # fills FILES with the paths the globs expand to, relative to 
     # this replaced handed it to bash and went red. A path that exists as a link is a path this
     # list owes a verdict on, and bash and shellcheck both refuse it loudly (round 1).
     for path in $pattern; do
-      { [ -e "$path" ] || [ -L "$path" ]; } && FILES+=("$path")
+      { [ -e "$path" ] || [ -L "$path" ]; } && {
+        FILES+=("$path")
+        matched=1
+      }
     done
+    # Fail closed per PATTERN, not merely when the whole sweep is empty: the inline loops this
+    # replaced handed an unmatched pattern to bash and shellcheck as the literal it arrives as,
+    # and went red. Dropping it silently would let the last ship-pr/hooks script move away while
+    # the other two patterns keep FILES nonempty and every step green over a scope that has
+    # stopped describing the checkout (round 2). A pattern that should no longer match is an edit
+    # to this list, which is the whole point of the list being here.
+    [ "$matched" -eq 1 ] ||
+      die "no file matched $pattern under $ROOT -- the file list has stopped describing the checkout"
   done
-  # Fail closed rather than pass over nothing, the rule the two guards already carry: an empty
-  # sweep means the list has stopped describing the checkout, and a clean verdict over zero files
-  # reads as a pass on every head thereafter.
-  if [ "${#FILES[@]}" -eq 0 ]; then
-    die "no scripts matched ${GLOBS[*]} under $ROOT -- the file list has stopped describing the checkout"
-  fi
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
