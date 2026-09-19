@@ -557,15 +557,17 @@ stopped check alike. Exit 0: green over a finished, judged run list, and the abs
 the grace is spent — or, for a head with no run at all, as soon as no workflow of
 the repository can create one for it (ludics-lite#176): every `pull_request` trigger's
 `paths-ignore` covers every commit from the PR's merge base up, every `push` trigger is out of the
-head branch's reach, and every other trigger is on a short named-inert list. The cases pin the
+head branch's reach, and every other trigger is one whose run can never carry this
+commit as its head (`merge_group` and `workflow_call`, and nothing else). The cases pin the
 refusals as much as the recognition — a trigger with no filter, a source path in the range, a path
 under `.github/workflows/` anywhere in it (which is a workflow the repository's list cannot carry,
 as well as a filter that moved), an unparseable workflow, an unreadable or truncated workflow list,
 a PR whose base SHA or branch did not come back, a push trigger the branch reaches (whose filter
 cannot describe a force-push's own diff), a `branches-ignore`, an event outside the inert list
-(`pull_request_target` and the review events among them), a base-side edit to the workflow (a
+(`pull_request_target`, the review events, `schedule` and `workflow_dispatch` among them), a base-side edit to the workflow (a
 `pull_request` run uses the merge context's copy, so the two sides must be identical), and a
-sampled merged PR whose check runs show a provider other than Actions, or none at all — each of
+sampled merged PR whose check runs show a provider other than Actions, none at all, or more than
+its page holds — each of
 which leaves the grace to answer as it did before, while the named inert events do not block the
 recognition, because none of their runs is created at this head; and that the question costs no read at all where it cannot change the answer
 (a head that already has a run, or one already past the grace). A read that fails is exit 3, never a reassuring 0. Only finished runs are

@@ -4692,23 +4692,29 @@ tip_within_paths_ignore() {
 # would not see it. It is rare enough that reading a second copy of the file is not worth the
 # branch.
 #
-# EVERY OTHER EVENT REFUSES unless it is on the short list below. Rounds 1 and 3 each arrived with
-# a member of the same class — `merge_group` wrongly counted, `pull_request_review` and
-# `pull_request_review_comment` wrongly ignored — so the rule is inverted rather than patched a
-# third time: an event is inert only when it is named here, and an event nobody reasoned about
-# costs the grace instead of a wrong absence. `pull_request_target` is inert in no sense and is
-# refused by the same default.
+# EVERY OTHER EVENT REFUSES unless it is on the list below, and the list is now down to the two
+# entries that can be defended from the shape of the event rather than from what has or has not
+# happened yet. Three rounds running produced a member of the same class — round 1 that
+# `merge_group` was wrongly counted, round 3 that the review events were wrongly ignored, round 4
+# that `workflow_dispatch`, `schedule` and `workflow_run` were — and the third time is the signal
+# that the list was the defect, not its contents. So the criterion is stated, and everything that
+# does not meet it is gone:
 #
-# What earns a place: the event cannot produce a run whose head is THIS commit, whatever the
-# change. `schedule`, `workflow_dispatch` and `repository_dispatch` are fired by a clock or a
-# person, not by this push — and a run either of them had already created would have been in the
-# head's run list, which is empty, since that emptiness is the only reason this question is asked.
-# `workflow_call` produces no run of its own; its jobs appear inside the caller's. `workflow_run`
-# fires on another run's completion, and there is no run here to complete. `merge_group` is created
-# only after the PR enters a merge queue, at the queue's own temporary ref, never this head — and
-# an unfiltered `merge_group` beside a filtered `pull_request` is an ordinary shape, so counting it
-# would have cost the fast path its common case.
-HEAD_INERT_EVENTS='schedule workflow_dispatch repository_dispatch workflow_call workflow_run merge_group'
+#   an event is inert here only when a run of it can NEVER carry this commit as its head.
+#
+# `merge_group` meets it: its run is created after the PR enters a merge queue, at the queue's own
+# temporary ref, and never at the PR head. `workflow_call` meets it: a called workflow produces no
+# run of its own at all — its jobs appear inside the caller's run.
+#
+# `schedule`, `workflow_dispatch`, `repository_dispatch` and `workflow_run` did NOT meet it, and
+# round 4 is right about why. Each of them CAN put a run on this head, and "the head's run list is
+# empty" does not say one is not on its way — that emptiness is a not-created-yet window, which is
+# the whole question. `workflow_dispatch` is the sharpest case: `gh workflow run --ref <branch>` is
+# a validation somebody asked for by hand, and merging inside its creation window is exactly the
+# thing the grace exists to prevent. `workflow_run` is the subtlest: `run_signal` drops ADVISORY
+# runs before it counts, so a head carrying only the review app's run reaches here with runs=0
+# while a downstream workflow waits on it. All four now refuse, and cost the grace.
+HEAD_INERT_EVENTS='workflow_call merge_group'
 
 # providers_are_actions_only: true when the newest MERGED pull request of this repository carries
 # non-advisory check runs and every one of them was created by GitHub Actions. The recognition
@@ -4736,14 +4742,24 @@ HEAD_INERT_EVENTS='schedule workflow_dispatch repository_dispatch workflow_call 
 # SKILL.md beside the verdict, and `--require-green` — which refuses ABSENT outright — is the hatch
 # for a merge that must have READ a green rather than found nothing.
 providers_are_actions_only() {
-  local sample raw name slug seen=0
+  local sample raw total name slug seen=0
   sample=$(gh_retry read api \
     "repos/$REPO/pulls?state=closed&sort=updated&direction=desc&per_page=20" \
     --jq '[.[] | select(.merged_at != null) | .head.sha] | (.[0] // "")') || return 1
   case "$sample" in '' | *[!0-9a-f]*) return 1 ;; esac
+  # The count leads the rows, and they have to agree, for the reason the workflow list's does
+  # (review round 4): a large Actions matrix can fill one page while the third-party provider this
+  # is looking for sits on the next, and a page read as the whole sample would report exactly the
+  # answer that settles a head wrongly. Refused rather than paginated, so an incomplete sample
+  # costs the grace like every other piece of missing evidence here.
   raw=$(gh_retry read api "repos/$REPO/commits/$sample/check-runs?filter=latest&per_page=100" \
-    --jq '.check_runs[] | [(.name // "-"), (.app.slug // "-")] | @tsv') || return 1
-  [ -n "$raw" ] || return 1
+    --jq '((.total_count // 0) | tostring),
+          (.check_runs[] | [(.name // "-"), (.app.slug // "-")] | @tsv)') || return 1
+  total="${raw%%$'\n'*}"
+  raw="${raw#*$'\n'}"
+  case "$total" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$total" -gt 0 ] || return 1
+  [ "$(printf '%s\n' "$raw" | grep -c .)" -eq "$total" ] || return 1
   while IFS=$'\t' read -r name slug; do
     [ -n "$name" ] || continue
     is_advisory "$name" && continue

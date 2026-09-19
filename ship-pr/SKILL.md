@@ -700,21 +700,28 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   the fresher of the head's commit date and the PR's own `updated_at` — each validated on its own,
   so a long-local commit pushed just now counts as fresh and a future commit date does not blind
   the gate), and only past that is `ABSENT` the verdict — with the evidence on the line. A head
-  with **no run at all** skips that wait when no workflow the repository lists can create one for
-  it: every `pull_request` trigger's `paths-ignore` covers every commit from the PR's merge base
-  up to the head, and every `push` trigger is out of this branch's reach (a `branches:` list the
-  head's branch matches none of). A push trigger the branch DOES reach is never explained by its
-  filter — a push event's files are computed between its own before and after, and after a
-  force-push the before is not on that path — and `pull_request_target`, which GitHub runs from
-  the base's copy of the workflow, is not explained by the head's. `merge_group` and every other
-  event are inert: their runs are not created by this change. The workflow file is read at the head AND at the base tip and the two must
-  be identical, because a `pull_request` run uses the merge context's copy; and the whole
-  recognition is admitted only where the base tip's own non-advisory check runs are Actions' alone
-  — it reads workflows, so it cannot speak for a third-party provider whose check is still being
-  created. Anything less than certain — an unparseable workflow, a pattern the translation does
-  not carry, a trigger with no filter, a workflow list longer than its page, a range past the cap,
-  a base-side edit to the workflow, a second provider — refuses and costs the grace, exactly as
-  `base --wait` does (ludics-lite#176). The same grace is what
+  with **no run at all** skips that wait when no workflow of the repository can create one for it
+  (ludics-lite#176). Every `pull_request` trigger's `paths-ignore` must cover every commit from the
+  PR's merge base up to the head; every `push` trigger must be out of this branch's reach (a
+  `branches:` list the head's branch matches none of), because a push event's files are computed
+  between its own before and after and after a force-push the before is not on that path, so no
+  filter describes it; and every other trigger must be one whose run can NEVER carry this commit as
+  its head — `merge_group`, created at the queue's own ref, and `workflow_call`, which produces no
+  run of its own. Everything else refuses, `pull_request_target`, the review events, `schedule` and
+  `workflow_dispatch` among them: each of those CAN put a run on this head, and an empty run list
+  is the not-created-yet window rather than evidence that none is coming. The workflow file is read
+  at the head *and* at the base tip and the two must be identical, since a `pull_request` run uses
+  the merge context's copy; and any path under `.github/workflows/` anywhere in the range refuses,
+  which covers both a filter that moved mid-range and a workflow the head ADDS, which the
+  repository's workflow list does not carry. The recognition is admitted at all only where the
+  newest merged PR's head shows non-advisory check runs from Actions alone: it reads workflows, so
+  it cannot speak for a third-party provider. That last one is a filter and not an inventory — no
+  endpoint enumerates a repository's providers — so the residual is a provider absent from that
+  sample, and `--require-green`, which refuses `ABSENT` outright, is the hatch for a merge that
+  must have READ a green. Anything less than certain — an unparseable workflow, a pattern the
+  translation does not carry, a trigger with no filter, a list longer than its page on either read,
+  a range past the cap, a base-side edit to the workflow, a second provider — refuses and costs the
+  grace, exactly as `base --wait` does. The same grace is what
   `base --wait`'s ceiling is sized against, and a `--wait` in the band between the grace and one
   poll interval past it is refused: it cannot reach the round that settles (ludics-lite#175).
 

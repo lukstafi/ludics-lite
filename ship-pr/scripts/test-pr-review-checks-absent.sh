@@ -72,6 +72,7 @@ WORKFLOW_YAML_BASE=""
 # where the base tip (round 2's sample) was not.
 MERGED_PRS_JSON=""
 SAMPLE_CHECKS_JSON=""
+SAMPLE_CHECKS_TOTAL=""
 COMPARE_COMMITS=""
 FILES_JSON=""
 
@@ -162,6 +163,7 @@ reset_fixture() {
   MERGED_PRS_JSON=$(jq -cn --arg s "$SAMPLE_SHA" \
     '[{merged_at:"2026-09-18T00:00:00Z", head:{sha:$s}}]')
   SAMPLE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}}]')
+  SAMPLE_CHECKS_TOTAL=""
   COMPARE_COMMITS=$(jq -cn --arg h "$HEAD_SHA" '[$h]')
   FILES_JSON='[{"filename":"docs/notes.md"}]'
   rm -f "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls" "$TEST_ROOT/HEAD_SEQ.calls"
@@ -228,7 +230,9 @@ gh() {
     response="$MERGED_PRS_JSON"
     ;;
   "repos/$REPO/commits/$SAMPLE_SHA/check-runs?filter=latest&per_page=100")
-    response="$SAMPLE_CHECKS_JSON"
+    response=$(jq -c --arg t "$SAMPLE_CHECKS_TOTAL" \
+      '. + {total_count: (if $t == "" then (.check_runs | length) else ($t | tonumber) end)}' \
+      <<<"$SAMPLE_CHECKS_JSON")
     ;;
   # One answer for both compares the recognition makes: `base...head`, read for the merge base
   # alone, and `merge_base...head`, read for the commits. Oldest first, each commit the first
@@ -368,10 +372,11 @@ jobs:
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and the absence is not yet a fact"
 }
 
-# A trigger nothing about this change fires needs no filter: a scheduled or dispatched run is not
-# a run that is COMING for this head, and one created by either would already have been in the run
-# list this question is only asked about because it came back empty.
-test_an_inert_trigger_needs_no_filter() {
+# A dispatched or scheduled run CAN carry this head, and an empty run list does not say one is not
+# on its way — that emptiness is the not-created-yet window, which is the whole question.
+# `gh workflow run --ref <branch>` is a validation somebody asked for by hand, and merging inside
+# its creation window is what the grace exists to prevent (review round 4).
+test_a_dispatchable_trigger_keeps_the_head_waiting() {
   reset_fixture
   COMMIT_AGE=5
   WORKFLOW_YAML='name: ci
@@ -386,8 +391,8 @@ jobs:
     runs-on: ubuntu-latest
 '
   run_gate
-  assert_eq "$GATE_RC" 0 "schedule and workflow_dispatch cannot be fired by this head"
-  assert_contains "$GATE_OUTPUT" ": ABSENT" "so the pull_request filter answers alone"
+  assert_eq "$GATE_RC" 4 "a run either of them creates would carry this head"
+  assert_contains "$GATE_OUTPUT" "creation grace" "so the grace answers"
 }
 
 # Per COMMIT, as `base --wait` reads it and for the same reason: a path filter is evaluated per
@@ -510,7 +515,8 @@ jobs:
 # reasoned about costs the grace instead of a wrong absence.
 test_an_event_outside_the_inert_list_keeps_the_head_waiting() {
   local ev
-  for ev in pull_request_target pull_request_review pull_request_review_comment release; do
+  for ev in pull_request_target pull_request_review pull_request_review_comment release \
+    schedule workflow_dispatch repository_dispatch workflow_run; do
     reset_fixture
     COMMIT_AGE=5
     WORKFLOW_YAML="name: ci
@@ -528,18 +534,16 @@ jobs:
   done
 }
 
-# The short list itself, all of it at once: a clock, a person, a caller, another run, and a queue.
+# The list itself, both of it. What earns a place is not "nothing has fired it yet" but "a run of
+# this event can NEVER carry this commit as its head": a merge-group run is created at the queue's
+# own temporary ref, and a called workflow produces no run of its own at all — its jobs appear
+# inside the caller's.
 test_the_named_inert_events_do_not_block_the_recognition() {
   reset_fixture
   COMMIT_AGE=5
   WORKFLOW_YAML='name: ci
 on:
-  schedule:
-    - cron: "0 0 * * *"
-  workflow_dispatch:
-  repository_dispatch:
   workflow_call:
-  workflow_run:
   merge_group:
   pull_request:
     paths-ignore: ["docs/**", "**.md"]
@@ -548,7 +552,7 @@ jobs:
     runs-on: ubuntu-latest
 '
   run_gate
-  assert_eq "$GATE_RC" 0 "none of the named inert events can create a run for this head"
+  assert_eq "$GATE_RC" 0 "neither event can put a run on this head, whatever has happened yet"
   assert_contains "$GATE_OUTPUT" ": ABSENT" "so the pull_request filter answers alone"
 }
 
@@ -660,6 +664,19 @@ test_a_base_side_workflow_edit_keeps_the_head_waiting() {
   assert_eq "$GATE_RC" 4 "the head's copy does not speak for the merge context"
   assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers"
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and nothing is settled on the stale copy"
+}
+
+# One page of 100 on the provider sample too: a large Actions matrix can fill it while the
+# third-party provider this is looking for sits on the next page, which would read as exactly the
+# answer that settles a head wrongly.
+test_a_truncated_provider_sample_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  SAMPLE_CHECKS_TOTAL=2 # one row served, two claimed
+  run_gate
+  assert_eq "$GATE_RC" 4 "a page is not the sample"
+  assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers instead"
 }
 
 # One page of 100, and a repository with more workflows than that would have the later ones
@@ -1202,7 +1219,7 @@ tests=(
   test_advisory_run_does_not_hold_the_gate
   test_a_docs_only_head_is_absent_without_waiting_out_the_grace
   test_a_trigger_without_a_filter_keeps_the_head_waiting
-  test_an_inert_trigger_needs_no_filter
+  test_a_dispatchable_trigger_keeps_the_head_waiting
   test_a_source_file_in_the_range_keeps_the_head_waiting
   test_an_unreadable_workflow_file_keeps_the_head_waiting
   test_an_unreadable_workflow_list_keeps_the_head_waiting
@@ -1214,6 +1231,7 @@ tests=(
   test_a_workflow_added_by_the_range_keeps_the_head_waiting
   test_an_unfiltered_merge_group_does_not_block_the_recognition
   test_a_truncated_workflow_list_keeps_the_head_waiting
+  test_a_truncated_provider_sample_keeps_the_head_waiting
   test_a_second_check_provider_keeps_the_head_waiting
   test_an_advisory_provider_does_not_block_the_recognition
   test_a_sample_without_checks_keeps_the_head_waiting
