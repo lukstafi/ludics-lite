@@ -517,7 +517,14 @@ fresher of the commit date and the PR's `updated_at` (each validated on its own,
 commit pushed a moment ago counts as fresh and a future commit date does not blind the gate).
 Exit 1: a run that concluded red without producing a check to be red, over a green, pending or
 stopped check alike. Exit 0: green over a finished, judged run list, and the absence itself once
-the grace is spent. A read that fails is exit 3, never a reassuring 0. Only finished runs are
+the grace is spent — or, for a head with no run at all, as soon as the workflows' own
+`paths-ignore` says none can be created for it (ludics-lite#176): every commit from the PR's merge
+base up changes only ignored paths, under every trigger a push or a pull request fires, across
+every workflow the repository lists. The cases pin the refusals as much as the recognition — a
+trigger with no filter, a source path in the range, an unparseable workflow, an unreadable
+workflow list, a PR whose base SHA did not come back — each of which leaves the grace to answer
+as it did before; and that the question costs no read at all where it cannot change the answer
+(a head that already has a run, or one already past the grace). A read that fails is exit 3, never a reassuring 0. Only finished runs are
 folded away as superseded, per workflow and event, so a re-triggered invocation does not park the
 gate on its cancelled predecessor while one file's `push` and `pull_request` runs still count
 separately and a queued invocation is never hidden behind a finished twin; and a run whose red is
@@ -630,7 +637,10 @@ while the plain read settled for the older green on it). The grace that separate
 from "not yet" runs from the first READ of the tip rather than from the end of the round that read
 it — re-stamping it there spent a round of API latency out of the grace, which is how a
 `--wait=301` over a 300s grace reached its ceiling seconds before the clock it was sized against,
-every time. The absence is then read per workflow: a run that EXISTS for the tip and has not
+every time. The ceiling's own arithmetic is pinned here too (ludics-lite#175): the grace is tested
+once per round and rounds are one poll interval apart, so a `--wait` in the band between the grace
+and one interval past it is refused — sized to outlive the grace, unable to reach the round that
+settles it — while one at or below the grace stays a bounded peek that reports no verdict. The absence is then read per workflow: a run that EXISTS for the tip and has not
 judged it — queued, running, or stopped — keeps the refusal because only that run can answer, and
 so does a run in flight anywhere on the branch, which is judging a tree the tip contains (waiting
 for it does better than settling: its commit becomes the verdict the tip then trails). What ends

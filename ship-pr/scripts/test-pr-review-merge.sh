@@ -16,6 +16,8 @@ CALLS_FILE="$TEST_ROOT/calls"
 
 CURRENT_HEAD=head-sha
 SKIPS_ONLY=""                          # the head's checks all skipped/neutral
+NO_CHECKS=""                           # the head carries no build check at all
+RUN_REASON="every run for the head finished and was judged" # what the run list settled on
 MERGE_STATE="merged=true state=MERGED" # what REST says after the merge call
 MERGE_QUEUE=""                         # nonempty = the base has a merge queue
 
@@ -24,14 +26,16 @@ MERGE_QUEUE=""                         # nonempty = the base has a merge queue
 # they print, they do not set variables.
 stub build_checks run_signal warn_base_drift
 build_checks() {
-  if [ -n "$SKIPS_ONLY" ]; then
+  if [ -n "$NO_CHECKS" ]; then
+    : # a head with no build check at all: the run list alone decides
+  elif [ -n "$SKIPS_ONLY" ]; then
     printf 'green\tci\tskipped\thttps://example/run\ngreen\tdocs\tneutral\thttps://example/run2\n'
   else
     printf 'green\tci\tsuccess\thttps://example/run\n'
   fi
   return 0
 }
-run_signal() { printf '0\tevery run for the head finished and was judged\n'; return 0; }
+run_signal() { printf '0\t%s\n' "$RUN_REASON"; return 0; }
 warn_base_drift() { return 0; }
 
 gh() {
@@ -39,7 +43,7 @@ gh() {
   "api repos/$REPO/pulls/7")
     case "$*" in
     *'select(type'*) echo "$CURRENT_HEAD" ;;
-    *'.head.sha'*) printf 'head-sha\t2026-09-01T00:00:00Z\n' ;;
+    *'.head.sha'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\n' ;;
     *'.base.ref'*) echo main ;;
     *merged=*) echo "$MERGE_STATE" ;;
     *) bail "unexpected pulls read: $*" ;;
@@ -77,6 +81,8 @@ assert_no_merge_call() {
 reset() {
   CURRENT_HEAD=head-sha
   SKIPS_ONLY=""
+  NO_CHECKS=""
+  RUN_REASON="every run for the head finished and was judged"
   MERGE_STATE="merged=true state=MERGED"
   MERGE_QUEUE=""
 }
@@ -158,6 +164,29 @@ test_require_green_refuses_a_merge_queue() {
   assert_eq "$calls" "CALL api graph,CALL api graph,CALL pr merge ," "both reads precede the merge call"
 }
 
+# A docs-only PR head gets no workflow run at all, and since ludics-lite#176 the gate reads that
+# off the workflows' own paths-ignore instead of waiting the absence grace out first: what reaches
+# `merge` is an ABSENT verdict carrying that reason, minutes earlier than it used to. The
+# recognition itself is test-pr-review-checks-absent.sh's subject, as every build-signal behaviour
+# is here; what this pins is what `merge` does with it. The ordinary gate lands the gated head
+# (nothing is red, and nothing is coming), and a close-out merge still refuses — a record-based
+# merge is required to have READ a green, and a head nothing builds has none to read.
+test_a_paths_ignored_head_merges_on_the_recognized_absence() {
+  reset
+  NO_CHECKS=1
+  RUN_REASON="no workflow run exists for this head, and none can be created: every commit from the merge base up to it changes only paths within the paths-ignore of ci, under every trigger this push or this pull request fires"
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the ordinary gate merges a head nothing can build ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" ": ABSENT" "the verdict is the absence, not a green"
+  assert_contains "$MERGE_OUTPUT" "none can be created" "carrying the reason the recognition gave"
+  assert_contains "$MERGE_CALLS" "--match-head-commit head-sha " "still bound to the gated head"
+  run_merge --require-green
+  assert_eq "$MERGE_RC" 4 "a close-out merge needs a green it READ, which this head has none of"
+  assert_contains "$MERGE_OUTPUT" "the build signal is absent" "the refusal names the verdict"
+  assert_contains "$MERGE_OUTPUT" "path filters" "and points at the dispatch that would get one"
+  assert_no_merge_call
+}
+
 test_superseded_head_never_merges() {
   reset
   CURRENT_HEAD=successor-sha
@@ -175,6 +204,7 @@ tests=(
   test_require_green_refuses_auto
   test_require_green_disables_a_deferred_auto_merge
   test_require_green_refuses_a_merge_queue
+  test_a_paths_ignored_head_merges_on_the_recognized_absence
 )
 
 run_tests "${tests[@]}"

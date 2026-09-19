@@ -351,6 +351,12 @@ else
     'all(.[]; (.id | type == "number") and (.name | type == "string" and length > 0 and (test("\t") | not)))' "$wflist"
   pin "every workflow carries the path the paths-ignore read asks for, under .github/workflows/" \
     'all(.[]; .path | type == "string" and startswith(".github/workflows/"))' "$wflist"
+  # head_within_paths_ignore examines only an `active` workflow: a disabled one, or one listed
+  # after its file was deleted, has no filter to read at the head and no run to wait for. A state
+  # vocabulary that grew a new word for "live" would make that read skip a workflow that does run,
+  # and the recognition would settle a head whose run is on its way.
+  pin "every workflow carries a state drawn from the vocabulary the head recognition reads (active = can create a run)" \
+    'all(.[]; .state | type == "string" and (["active", "deleted", "disabled_fork", "disabled_inactivity", "disabled_manually"] | index(.)))' "$wflist"
   # One page of 100 is all cmd_base asks for: past that a workflow simply vanishes from the
   # report, and its standing verdict with it. Worth knowing before it happens, not after.
   pin "this repository's workflows fit the single page cmd_base reads ($(jq length <<<"$wflist") of a page of 100)" \

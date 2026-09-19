@@ -14,6 +14,11 @@ test_tmpdir TEST_ROOT checks-absent-test
 
 REPO=example/repo
 HEAD_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+# The PR's base branch tip, and the fork point the compare answers with. They are different on
+# purpose: the base branch moves under every sibling merge, so the range the paths-ignore
+# recognition walks starts at the MERGE BASE and never at `base.sha` (ludics-lite#176).
+BASE_SHA=babababababababababababababababababababa
+MERGE_BASE=1111111111111111111111111111111111111111
 REQUEST_LOG="$TEST_ROOT/requests"
 PAGINATE_LOG="$TEST_ROOT/paginated"
 
@@ -27,6 +32,49 @@ COMMIT_AGE=""
 PR_UPDATED_AGE=""
 JOBS_JSON=""
 FAIL_ENDPOINT=""
+# --- the paths-ignore recognition's own feeds (ludics-lite#176) --------------------------------
+# A run-less head inside the grace is the one place the gate can do better than the clock: if
+# every workflow's own filter says no run can be created for this head, the absence is settled on
+# the spot. These are the answers that question reads — the workflow list, each workflow's file at
+# the head, the compare that names the merge base, and what each commit in the range changed.
+# PR_BASE is the base SHA the PR read answers with; a case clears it to stand for a PR whose base
+# could not be read, which refuses the recognition before any of the rest is asked.
+PR_BASE=""
+WORKFLOWS_JSON=""
+WORKFLOW_PATH=""
+WORKFLOW_YAML=""
+COMPARE_COMMITS=""
+FILES_JSON=""
+
+# A workflow with NO path filter at all, which is what this repository's own CI looks like and
+# what every case here that is about the CLOCK needs: nothing about it can explain an absence, so
+# the recognition refuses and the grace answers, exactly as it did before #176.
+UNFILTERED_YAML='name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+'
+
+# The same workflow with docs filtered out of BOTH triggers a pull request fires. Both, because
+# one of them saying "no run for this diff" says nothing about the other: a repo whose push is
+# filtered and whose pull_request is not still gets a run for every PR head.
+DOCS_IGNORED_YAML='name: ci
+on:
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+'
 
 check_runs_json() { jq -cn --argjson runs "$1" '{check_runs:$runs}'; }
 # Each row gets a distinct workflow_id unless the case names one, because the gate folds the run
@@ -72,6 +120,12 @@ reset_fixture() {
   PR_UPDATED_AGE=3600
   JOBS_JSON=$(jobs_json '[]')
   FAIL_ENDPOINT=""
+  PR_BASE="$BASE_SHA"
+  WORKFLOWS_JSON=$(jq -cn '{workflows:[{id:1,name:"ci",state:"active"}]}')
+  WORKFLOW_PATH=".github/workflows/ci.yml"
+  WORKFLOW_YAML="$UNFILTERED_YAML"
+  COMPARE_COMMITS=$(jq -cn --arg h "$HEAD_SHA" '[$h]')
+  FILES_JSON='[{"filename":"docs/notes.md"}]'
   rm -f "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls" "$TEST_ROOT/HEAD_SEQ.calls"
   retune ABSENT_GRACE=300 CHECKS_INTERVAL=1 CHECKS_HEARTBEAT=600
   : >"$REQUEST_LOG"
@@ -99,9 +153,11 @@ gh() {
     if [ "$fixture_head" = UNREADABLE ]; then return 1; fi
     if [ -n "$PR_UPDATED_AGE" ]; then
       response=$(jq -cn --arg sha "$fixture_head" --arg at "$(iso_ago "$PR_UPDATED_AGE")" \
-        '{head:{sha:$sha}, updated_at:$at}')
+        --arg base "$PR_BASE" \
+        '{head:{sha:$sha}, updated_at:$at} + (if $base == "" then {} else {base:{sha:$base}} end)')
     else
-      response=$(jq -cn --arg sha "$fixture_head" '{head:{sha:$sha}}')
+      response=$(jq -cn --arg sha "$fixture_head" --arg base "$PR_BASE" \
+        '{head:{sha:$sha}} + (if $base == "" then {} else {base:{sha:$base}} end)')
     fi
     ;;
   "repos/$REPO/commits/$HEAD_SHA/check-runs?filter=latest&per_page=100")
@@ -114,6 +170,24 @@ gh() {
   "repos/$REPO/commits/$HEAD_SHA")
     response=$(jq -cn --arg at "$(iso_ago "$COMMIT_AGE")" '{commit:{committer:{date:$at}}}')
     ;;
+  # --- the recognition's feeds; the exact commit read above wins over the glob below ------------
+  "repos/$REPO/actions/workflows?per_page=100") response="$WORKFLOWS_JSON" ;;
+  # The workflow's own file: where it lives, then what it says AT THE HEAD. Served raw, as the
+  # library asks for it — the base64 JSON envelope's decoder is spelled differently on this
+  # fleet's two platforms.
+  "repos/$REPO/actions/workflows/"*) response=$(jq -cn --arg p "$WORKFLOW_PATH" '{path:$p}') ;;
+  "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
+  # One answer for both compares the recognition makes: `base...head`, read for the merge base
+  # alone, and `merge_base...head`, read for the commits. Oldest first, each commit the first
+  # parent of the next and the first one's parent the merge base — the shape a linear range has.
+  "repos/$REPO/compare/"*)
+    response=$(jq -cn --argjson c "$COMPARE_COMMITS" --arg m "$MERGE_BASE" \
+      '{merge_base_commit: {sha: $m}, total_commits: ($c | length), behind_by: 0,
+        commits: [$c | to_entries[] |
+          {sha: .value,
+           parents: [{sha: (if .key == 0 then $m else $c[.key - 1] end)}]}]}')
+    ;;
+  "repos/$REPO/commits/"*) response=$(jq -cn --argjson f "$FILES_JSON" '{files:$f}') ;;
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
   gh_fixture_answer "$response"
@@ -194,6 +268,144 @@ test_finished_run_without_checks_is_absent() {
   assert_contains "$GATE_OUTPUT" ": ABSENT" "a finished run with no checks should print ABSENT"
   assert_contains "$GATE_OUTPUT" "finished and left no build check behind" \
     "the absence should name the finished run"
+}
+
+# --- a head no run can be created for (ludics-lite#176) ----------------------------------------
+# `base --wait` has recognized a paths-ignore TIP since #156; the same head, on a PR, waited the
+# full grace out before its absence was called. It is the same question with two differences: the
+# range is the PR's own (from its merge base, not from a standing verdict's commit), and a PR head
+# can be given a run by `pull_request` as readily as by `push`, so every trigger has to answer.
+test_a_docs_only_head_is_absent_without_waiting_out_the_grace() {
+  reset_fixture
+  COMMIT_AGE=5 # seconds into a 300s grace: only the filter can settle this
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  run_gate
+  assert_eq "$GATE_RC" 0 "a head whose whole range is paths-ignored is absence, not a wait"
+  assert_contains "$GATE_OUTPUT" ": ABSENT" "the recognized absence is the verdict"
+  assert_contains "$GATE_OUTPUT" "no workflow run exists for this head, and none can be created" \
+    "the reason should say no run is coming, not that one may still appear"
+  assert_contains "$GATE_OUTPUT" "paths-ignore of ci" "and name the workflow whose filter said so"
+  assert_not_contains "$GATE_OUTPUT" "creation grace" "the clock is not what settled this"
+  # The range is the PR's own fork point, never the base branch tip, which moves under every
+  # sibling merge: reading base.sha for the range would walk the base branch's commits too.
+  assert_contains "$(cat "$REQUEST_LOG")" "compare/$MERGE_BASE...$HEAD_SHA?per_page=" \
+    "the commits are read from the merge base up"
+}
+
+# The whole reason the trigger set is read before any filter is: one trigger's docs-only filter
+# says nothing about the trigger beside it. A repository whose push is filtered and whose
+# pull_request is not gets a run for every PR head, and settling this would be a green over an
+# unbuilt one.
+test_a_trigger_without_a_filter_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML='name: ci
+on:
+  pull_request:
+  push:
+    paths-ignore: ["docs/**"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a trigger with no filter can still create the run"
+  assert_contains "$GATE_OUTPUT" "creation grace" "so the clock is all that is left"
+  assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and the absence is not yet a fact"
+}
+
+# A trigger nothing about this change fires needs no filter: a scheduled or dispatched run is not
+# a run that is COMING for this head, and one created by either would already have been in the run
+# list this question is only asked about because it came back empty.
+test_an_inert_trigger_needs_no_filter() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML='name: ci
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths-ignore: ["docs/**", "**.md"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+'
+  run_gate
+  assert_eq "$GATE_RC" 0 "schedule and workflow_dispatch cannot be fired by this head"
+  assert_contains "$GATE_OUTPUT" ": ABSENT" "so the pull_request filter answers alone"
+}
+
+# Per COMMIT, as `base --wait` reads it and for the same reason: a path filter is evaluated per
+# push, and a range that nets out to docs can still contain a push that touched source.
+test_a_source_file_in_the_range_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  FILES_JSON='[{"filename":"docs/notes.md"},{"filename":"src/main.ml"}]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "one source path in the range is a run that is coming"
+  assert_contains "$GATE_OUTPUT" "creation grace" "the grace is what answers instead"
+}
+
+# Every way the recognition can be less than certain leaves the wait waiting rather than hand out
+# an absence: the parser is narrow on purpose, and a refusal costs only the grace that was there
+# before it. A tab is YAML this state machine will not claim to have read.
+test_an_unreadable_workflow_file_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML=$(printf 'name: ci\non:\n\tpull_request:\n\t\tpaths-ignore: ["docs/**"]\n')
+  run_gate
+  assert_eq "$GATE_RC" 4 "a workflow file that does not parse explains nothing"
+  assert_contains "$GATE_OUTPUT" "creation grace" "and the grace answers as before"
+}
+
+test_an_unreadable_workflow_list_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  FAIL_ENDPOINT="*actions/workflows*"
+  run_gate
+  assert_eq "$GATE_RC" 4 "a workflow list that could not be read is not evidence of anything"
+  assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers"
+  assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and a failed read never becomes an absence"
+}
+
+# A PR whose base SHA the read did not carry has no range to walk. The recognition refuses before
+# it asks the API anything at all.
+test_a_head_without_a_base_sha_is_never_recognized() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  PR_BASE=""
+  run_gate
+  assert_eq "$GATE_RC" 4 "with no base there is no range and nothing to recognize"
+  assert_eq "$(grep -c "compare/" "$REQUEST_LOG")" 0 "and nothing is asked of the API"
+}
+
+# A run that EXISTS is never explained by a filter: it was created, so the filter did not stop it,
+# and only that run can answer for it. The question is not even asked.
+test_a_head_with_a_run_never_consults_the_filter() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"in_progress","conclusion":null}]')")
+  run_gate
+  assert_eq "$GATE_RC" 4 "an in-flight run is a verdict on its way"
+  assert_eq "$(grep -c "compare/" "$REQUEST_LOG")" 0 \
+    "with a run in hand there is nothing for a filter to explain"
+}
+
+# Past the grace the absence is already the verdict, so the reads the recognition would make buy
+# nothing and are not made.
+test_a_head_past_the_grace_never_consults_the_filter() {
+  reset_fixture
+  COMMIT_AGE=1800
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  run_gate
+  assert_eq "$GATE_RC" 0 "past the grace the clock has already settled it"
+  assert_contains "$GATE_OUTPUT" "past the" "and says so on the clock's own terms"
+  assert_eq "$(grep -c "compare/" "$REQUEST_LOG")" 0 "no read is spent on an answer already given"
 }
 
 # The advisory list is the same list in both directions: the review app's own run must not hold a
@@ -697,6 +909,15 @@ tests=(
   test_grace_of_zero_settles_at_once
   test_finished_run_without_checks_is_absent
   test_advisory_run_does_not_hold_the_gate
+  test_a_docs_only_head_is_absent_without_waiting_out_the_grace
+  test_a_trigger_without_a_filter_keeps_the_head_waiting
+  test_an_inert_trigger_needs_no_filter
+  test_a_source_file_in_the_range_keeps_the_head_waiting
+  test_an_unreadable_workflow_file_keeps_the_head_waiting
+  test_an_unreadable_workflow_list_keeps_the_head_waiting
+  test_a_head_without_a_base_sha_is_never_recognized
+  test_a_head_with_a_run_never_consults_the_filter
+  test_a_head_past_the_grace_never_consults_the_filter
   test_unreadable_run_list_is_unknown
   test_unreadable_push_time_is_unknown
   test_cancelled_run_is_not_absent
