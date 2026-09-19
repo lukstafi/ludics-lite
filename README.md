@@ -578,7 +578,12 @@ entry, each difference with its own case, because a fold that collapsed unrelate
 pass every other case here. The anchor is rendered as the field the feed actually served — a line
 number, else the diff `position` as `@12`, else `?` — so a row from the per-review endpoint, which
 carries no line at all, no longer prints the unknown place as `:0` and no longer reads like two
-findings at one line. Every verdict that
+findings at one line. The rest of that anchor is on the line too (ludics-lite#113), since the key
+separates on fields the header used to omit: the range of a multi-line comment (`a.sh:36-40`),
+`side=LEFT` on the deletion side, `start_side=` when a range ends on the other side, and `was=`
+when GitHub has migrated the anchor forward since it was written — the sibling case asserts that
+two entries the fold kept apart render as two distinct headers, the id aside, and that rows
+agreeing on every anchor field still fold and print that anchor once. Every verdict that
 says nothing came polls once more first, and re-reads the state behind that poll: a 👍 landing in
 the same gap is reported as the approval it is rather than answered with the nudge that would
 clear it, a state that moved otherwise makes the window quiet, and a read that did not answer
