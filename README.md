@@ -524,8 +524,10 @@ the head branch's reach. The cases pin the refusals as much as the recognition �
 filter, a source path in the range, an unparseable workflow, an unreadable or truncated workflow
 list, a PR whose base SHA or branch did not come back, a push trigger the branch reaches (whose
 filter cannot describe a force-push's own diff), a `branches-ignore`, a `pull_request_target`
-(which GitHub runs from the base's copy of the file) — each of which leaves the grace to answer
-as it did before, and an unfiltered `merge_group`, which does not block the recognition because
+(which GitHub runs from the base's copy of the file), a base-side edit to the workflow (a
+`pull_request` run uses the merge context's copy, so the two sides must be identical), and a base
+tip whose check runs show a provider other than Actions (which no workflow filter can speak for)
+— each of which leaves the grace to answer as it did before, and an unfiltered `merge_group`, which does not block the recognition because
 its runs are never created at this head; and that the question costs no read at all where it cannot change the answer
 (a head that already has a run, or one already past the grace). A read that fails is exit 3, never a reassuring 0. Only finished runs are
 folded away as superseded, per workflow and event, so a re-triggered invocation does not park the

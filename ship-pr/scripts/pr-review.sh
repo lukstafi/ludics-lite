@@ -4582,6 +4582,13 @@ tip_within_paths_ignore() {
 # request's own two-dot diff, which the first-parent walk from the merge base up is a superset of,
 # so a walk whose every step is ignored says the diff is — and it says so however the head got
 # there, a force-push included, because the merge base is recomputed against the head in hand.
+# The FILE, though, is not the head's: a `pull_request` run uses the workflow from the merge
+# context, base merged with head, so a base-side edit that removed a paths-ignore takes effect
+# while the head's own copy still carries it — and that edit is outside the walked range, so
+# `commits_ignored`'s workflow-file guard never sees it (review round 2). The file is therefore
+# read at the head AND at the base tip and the two must be identical: when both sides of a merge
+# hold the same content, that content is what the merge produces, so the copy in hand IS the
+# merge context's. Any difference, or a copy that cannot be read on either side, refuses.
 #
 # `push` is the one a filter CANNOT explain, and this is the finding that matters most in the
 # round: a push event's changed files are computed between the push's own before and after, and
@@ -4606,6 +4613,36 @@ tip_within_paths_ignore() {
 # `workflow_dispatch`, `workflow_run`, the issue and release events — is inert for the same reason
 # it always was: nothing about this change fires it, and a run created by any other means would
 # already have been in the run list this question is only asked about because it came back empty.
+
+# checks_are_actions_only <sha>: true when every non-advisory check run on that commit was created
+# by GitHub Actions. The recognition below reads WORKFLOWS, so it can only ever answer for Actions
+# — and `build_checks` deliberately accepts every provider's check runs, so a repository with a
+# third-party CI app has a second way to grow a check on a fresh head that no workflow filter
+# describes (review round 2). That is the mirror of the rule ludics-lite#38 round 3 already holds
+# in the other direction: an early Codecov green over an empty run list does not shortcut the
+# grace either, because it proves nothing about Actions.
+#
+# The evidence is read off the PR's BASE BRANCH TIP rather than the head: the head is the commit
+# whose checks have not appeared yet, which is the whole question, while the base tip is an
+# ordinary commit of this repository carrying whatever set of providers it is configured with. No
+# non-advisory check run there at all is no evidence, and refuses — as does a read that fails.
+# Advisory names are dropped first, for the reason the list exists: the review app posts a check
+# run of its own from a non-Actions app, and counting it would refuse on every repository this
+# skill is used in.
+checks_are_actions_only() {
+  local sha="$1" raw name slug seen=0
+  case "$sha" in '' | *[!0-9a-f]*) return 1 ;; esac
+  raw=$(gh_retry read api "repos/$REPO/commits/$sha/check-runs?filter=latest&per_page=100" \
+    --jq '.check_runs[] | [(.name // "-"), (.app.slug // "-")] | @tsv') || return 1
+  [ -n "$raw" ] || return 1
+  while IFS=$'\t' read -r name slug; do
+    [ -n "$name" ] || continue
+    is_advisory "$name" && continue
+    [ "$slug" = github-actions ] || return 1
+    seen=$((seen + 1))
+  done <<<"$raw"
+  [ "$seen" -gt 0 ]
+}
 
 # push_cannot_reach <workflow body> <head ref>: true when a push to this branch does not reach the
 # workflow's `push` trigger, because it declares a `branches:` list and the branch matches none of
@@ -4653,8 +4690,8 @@ push_cannot_reach() {
 # one workflow file. Nothing here is memoized, because run_signal is called from inside a command
 # substitution where an assignment dies with the subshell (the trap BASE_RED_DETAIL documents).
 head_within_paths_ignore() {
-  local head="$1" base="$2" ref="$3" mbase wf total rows wid wname wstate src wpath body evs ev
-  local pats why=""
+  local head="$1" base="$2" ref="$3" mbase wf total rows wid wname wstate src bsrc wpath body
+  local evs ev pats why=""
   PATHS_IGNORE_WHY=""
   case "$head" in '' | *[!0-9a-f]*) return 1 ;; esac
   case "$base" in '' | *[!0-9a-f]*) return 1 ;; esac
@@ -4665,6 +4702,9 @@ head_within_paths_ignore() {
   # A head that IS the merge base adds nothing, so there is no range to read and nothing here can
   # say why a run is missing.
   [ "$mbase" != "$head" ] || return 1
+  # Everything below reads WORKFLOWS, so it can only answer for Actions. If this repository has a
+  # second check provider, no filter here describes what it may still create.
+  checks_are_actions_only "$base" || return 1
   # The count leads the rows, and they have to agree: this endpoint serves one page, and a
   # repository with more workflows than fit it would have the later ones silently left out — the
   # ones that CAN run for this head, while the ones read say they cannot (review round 1). A
@@ -4684,6 +4724,8 @@ head_within_paths_ignore() {
     # has no filter to read at this head and no run to wait for either.
     [ "$wstate" = active ] || continue
     src=$(workflow_source "$wid" "$head") || return 1
+    bsrc=$(workflow_source "$wid" "$base") || return 1
+    [ "$src" = "$bsrc" ] || return 1
     wpath="${src%%$'\n'*}"
     body="${src#*$'\n'}"
     evs=$(awk -v q="'" -v dq='"' "$WORKFLOW_ON_EVENTS" <<<"$body") || return 1

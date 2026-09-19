@@ -701,10 +701,14 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   filter — a push event's files are computed between its own before and after, and after a
   force-push the before is not on that path — and `pull_request_target`, which GitHub runs from
   the base's copy of the workflow, is not explained by the head's. `merge_group` and every other
-  event are inert: their runs are not created by this change. Anything less than certain — an
-  unparseable workflow, a pattern the translation does not carry, a trigger with no filter, a
-  workflow list longer than its page, a range past the cap — refuses and costs the grace, exactly
-  as `base --wait` does (ludics-lite#176). The same grace is what
+  event are inert: their runs are not created by this change. The workflow file is read at the head AND at the base tip and the two must
+  be identical, because a `pull_request` run uses the merge context's copy; and the whole
+  recognition is admitted only where the base tip's own non-advisory check runs are Actions' alone
+  — it reads workflows, so it cannot speak for a third-party provider whose check is still being
+  created. Anything less than certain — an unparseable workflow, a pattern the translation does
+  not carry, a trigger with no filter, a workflow list longer than its page, a range past the cap,
+  a base-side edit to the workflow, a second provider — refuses and costs the grace, exactly as
+  `base --wait` does (ludics-lite#176). The same grace is what
   `base --wait`'s ceiling is sized against, and a `--wait` in the band between the grace and one
   poll interval past it is refused: it cannot reach the round that settles (ludics-lite#175).
 

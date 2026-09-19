@@ -49,6 +49,13 @@ WORKFLOWS_JSON=""
 WORKFLOW_TOTAL=""
 WORKFLOW_PATH=""
 WORKFLOW_YAML=""
+# The base tip's copy of the same file. A `pull_request` run uses the workflow from the MERGE
+# context, so the head's copy only speaks for it when the base's copy is identical; a case that
+# sets this differently stands for a base-side edit made after the branch diverged.
+WORKFLOW_YAML_BASE=""
+# The base tip's check runs, which is where "does this repository have a provider other than
+# Actions" is read: the recognition reads workflows, so it can answer for nothing else.
+BASE_CHECKS_JSON=""
 COMPARE_COMMITS=""
 FILES_JSON=""
 
@@ -135,6 +142,8 @@ reset_fixture() {
   WORKFLOW_TOTAL=""
   WORKFLOW_PATH=".github/workflows/ci.yml"
   WORKFLOW_YAML="$UNFILTERED_YAML"
+  WORKFLOW_YAML_BASE=""
+  BASE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}}]')
   COMPARE_COMMITS=$(jq -cn --arg h "$HEAD_SHA" '[$h]')
   FILES_JSON='[{"filename":"docs/notes.md"}]'
   rm -f "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls" "$TEST_ROOT/HEAD_SEQ.calls"
@@ -193,7 +202,13 @@ gh() {
   # library asks for it — the base64 JSON envelope's decoder is spelled differently on this
   # fleet's two platforms.
   "repos/$REPO/actions/workflows/"*) response=$(jq -cn --arg p "$WORKFLOW_PATH" '{path:$p}') ;;
+  "repos/$REPO/contents/"*"?ref=$BASE_SHA")
+    response="${WORKFLOW_YAML_BASE:-$WORKFLOW_YAML}"
+    ;;
   "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
+  "repos/$REPO/commits/$BASE_SHA/check-runs?filter=latest&per_page=100")
+    response="$BASE_CHECKS_JSON"
+    ;;
   # One answer for both compares the recognition makes: `base...head`, read for the merge base
   # alone, and `merge_base...head`, read for the commits. Oldest first, each commit the first
   # parent of the next and the first one's parent the merge base — the shape a linear range has.
@@ -508,6 +523,63 @@ jobs:
   run_gate
   assert_eq "$GATE_RC" 0 "merge_group cannot create a run for this head"
   assert_contains "$GATE_OUTPUT" ": ABSENT" "so the pull_request filter still answers"
+}
+
+# --- review round 2: what a workflow filter cannot speak for -----------------------------------
+# The recognition reads WORKFLOWS, so it can only ever answer for Actions — and `build_checks`
+# accepts every provider's check runs, so a repository with a third-party CI app has a second way
+# to grow a check on a fresh head that no workflow filter describes. That is the mirror of the
+# rule the gate already holds in the other direction: an early Codecov green over an empty run
+# list does not shortcut the grace either.
+test_a_second_check_provider_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  BASE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}},
+                                       {"name":"buildkite","app":{"slug":"buildkite"}}]')
+  run_gate
+  assert_eq "$GATE_RC" 4 "a provider the workflows do not describe keeps the creation window open"
+  assert_contains "$GATE_OUTPUT" "creation grace" "so the grace answers, as it did before"
+}
+
+# The review app posts a check run of its own from a non-Actions app, and counting it would refuse
+# on every repository this skill is used in. Advisory names are dropped first, as everywhere else.
+test_an_advisory_provider_does_not_block_the_recognition() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  BASE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}},
+                                       {"name":"claude","app":{"slug":"claude"}}]')
+  run_gate
+  assert_eq "$GATE_RC" 0 "the review app is advisory in this direction too"
+  assert_contains "$GATE_OUTPUT" ": ABSENT" "and the recognition still answers"
+}
+
+# No non-advisory check run on the base tip at all is no evidence about this repository's
+# providers, so it is not evidence that Actions is the only one.
+test_a_base_tip_without_checks_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  BASE_CHECKS_JSON=$(check_runs_json '[]')
+  run_gate
+  assert_eq "$GATE_RC" 4 "an empty base-tip check list says nothing about providers"
+}
+
+# A `pull_request` run uses the workflow from the MERGE context, base merged with head, so a
+# base-side edit that removed a paths-ignore takes effect while the head's own copy still carries
+# it — and that edit is outside the walked range, so the workflow-file guard never sees it. The
+# two copies must be identical; when both sides of a merge hold the same content, that content is
+# what the merge produces.
+test_a_base_side_workflow_edit_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  WORKFLOW_YAML_BASE="$UNFILTERED_YAML" # main dropped the paths-ignore after the branch diverged
+  run_gate
+  assert_eq "$GATE_RC" 4 "the head's copy does not speak for the merge context"
+  assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers"
+  assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and nothing is settled on the stale copy"
 }
 
 # One page of 100, and a repository with more workflows than that would have the later ones
@@ -1060,6 +1132,10 @@ tests=(
   test_a_pull_request_target_trigger_keeps_the_head_waiting
   test_an_unfiltered_merge_group_does_not_block_the_recognition
   test_a_truncated_workflow_list_keeps_the_head_waiting
+  test_a_second_check_provider_keeps_the_head_waiting
+  test_an_advisory_provider_does_not_block_the_recognition
+  test_a_base_tip_without_checks_keeps_the_head_waiting
+  test_a_base_side_workflow_edit_keeps_the_head_waiting
   test_a_head_with_a_run_never_consults_the_filter
   test_a_head_past_the_grace_never_consults_the_filter
   test_unreadable_run_list_is_unknown
