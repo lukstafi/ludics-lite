@@ -193,10 +193,13 @@ itself and neither side reads anything from the other, so four facts stay equal 
 directory, the `<box>.lock` name, the box name the sweep derives from an ssh alias, and a negative
 one, that the sweep must never take or honour the **hold** lock. The first three fail open (the two
 sides quietly stop meeting and the interlock is gone) and the fourth fails closed (a held box can
-no longer sweep itself). `test-wake-lab.sh` compares all four against the sweep's own code, read
-out of `${OCANNL_STAGING:-$HOME/ocannl-staging}/tools/sweep.sh` — read-only, it is a shared
-checkout. Where that checkout is absent, as in CI, the case prints a named `SKIP:` line that the
-summary counts, so a green run says what it did not check. The staging side has no matching check.
+no longer sweep itself). `test-wake-lab.sh` compares all four against the sweep's own code. It
+reads the revision the sweep routine actually runs — `origin/master` of
+`${OCANNL_STAGING:-$HOME/ocannl-staging}`, since that checkout is often on a WIP branch — and it
+runs the sweep's own `take_lab_lock` under a HOME of its own rather than rebuilding the path,
+so the comparison is against the lock file that really appears. The checkout is read strictly
+read-only. Where it is absent, as in CI, the case prints a named `SKIP:` line that the summary
+counts, so a green run says what it did not check. The staging side has no matching check.
 
 `WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the verified lab
 lore in the header comment (wake-on-LAN over Ethernet only, waking from a full shutdown, what
