@@ -164,11 +164,16 @@ sidesteps both.
 If the branch already has a PR, push to it and reuse it — never open a second one for the same
 branch.
 
-Before **every** push that touches code, run the formatter check the repository's CI gates on,
-if it has one — its AGENTS.md or CLAUDE.md names it (OCANNL: `dune build @fmt`). A
-formatting-only fix push costs a CI round and, since automated reviews fire on every push, a
-review round; a round's fixes are exactly as able to break formatting as the first commit was,
-so the habit belongs on the push and not on the branch.
+Before **every** push that touches code, run the gates the repository's CI judges the head by:
+the formatter check if it has one — its AGENTS.md or CLAUDE.md names it (OCANNL: `dune build
+@fmt`) — and in this repository, the skills repo, `scripts/preflight.sh`, which *is* CI's `lint`
+job rather than a reconstruction of it (shell syntax, the mode bits, shellcheck at error
+severity, the PowerShell parse, the parse guard and the prompt, jq-shape and scratch-directory
+guards). A push that CI reds on a syntax error or a lost mode bit costs a CI round and, since
+automated reviews fire on every push, a review round — and after the reviewer has approved it
+costs the approval too, which is the round ludics-lite#221 was filed for. A round's fixes are
+exactly as able to break a gate as the first commit was, so the habit belongs on the push and not
+on the branch.
 
 Write the body as the reviewer's map, not a changelog: what is now true that was not, what the
 tests pin, what changes for existing users, and where the risky corner is. Reviewers — human and

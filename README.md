@@ -207,6 +207,16 @@ before and after. Nothing re-applies those, and a feature update can reset them,
 
 ## Tests
 
+**Before every push, run `scripts/preflight.sh` from the checkout.** It is CI's `lint` job — the
+same command the workflow runs, not a reconstruction of it: shell syntax, the two-way mode rule,
+shellcheck at error severity, the PowerShell parse, the cleanup scripts' parse guard, and the
+prompt, jq-shape and scratch-directory guards with their fixtures, about 25 seconds for the lot. A
+step whose interpreter this box lacks (`pwsh` on the macs) is a named SKIP rather than a failure;
+CI passes `--require-tools`, where the same absence is red. `preflight.sh steps` lists what it
+runs, `preflight.sh globs` the file list every sweep here is spelled from, and a single step runs
+alone (`preflight.sh shellcheck`) while you iterate. The workflow calls this script for those
+steps, so the two cannot drift, and `scripts/test-preflight.sh` pins that they have not.
+
 The scripts carry their own test suites (Python fixtures use `python3`; PowerShell fixtures run on Windows):
 
 ```sh
@@ -234,6 +244,7 @@ scripts/test-wake-lab.sh
 scripts/test-check-prompts.sh
 scripts/test-check-jq-shapes.sh
 scripts/test-check-scratch-dirs.sh
+scripts/test-preflight.sh
 scripts/test-sync-routines.sh
 ```
 
@@ -313,11 +324,14 @@ together and all of it sits on the merge gate's critical path; the halves are cu
 exercise, ship-pr's own suites in one and the repo and fleet guards in the other, and come out at
 roughly nine minutes each. The workflow carries the measured queue waits that trade rests on, and
 the standing answer if the macOS pool starts starving these jobs: not a third assignment, but
-moving suites off the per-push path onto periodic CI. Alongside them run `bash -n`, shellcheck at
-error severity, a check that the two cleanup scripts still carry their parse guard, and the jq
+moving suites off the per-push path onto periodic CI. Alongside them runs the `lint` job, which is
+`scripts/preflight.sh` step by step: `bash -n`, shellcheck at error severity, the mode bits, the
+PowerShell parse, a check that the two cleanup scripts still carry their parse guard, and the jq
 shape guard (`scripts/check-jq-shapes.sh`, with `scripts/test-check-jq-shapes.sh` beside it) and the
 scratch directory guard (`scripts/check-scratch-dirs.sh`, with `scripts/test-check-scratch-dirs.sh`
-beside it). The suites
+beside it). Those assertions were inline `run:` shell in that job until ludics-lite#123: nothing
+but a push ran them, nothing probed them, and the file list they sweep was spelled three times in
+the YAML and a fourth time by hand in whatever buffer the next worker pre-flighted a push in. The suites
 run on every push to main and on a pull request that touches anything but Markdown (the top-level
 README counts as script input, since the fleet suite executes its install loops); three jobs run on
 every head regardless, the prompt hygiene check (`scripts/check-prompts.sh`), the lint, and the
