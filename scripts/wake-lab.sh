@@ -1066,6 +1066,18 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   f=$HOLD_STATE_DIR/hold-$name.pid
   fifo=$(hold_fifo_path "$name"); out=$(hold_out_path "$name")
   mkdir -p "$HOLD_STATE_DIR" 2>/dev/null
+  if [ -e "${f%.pid}.releasing" ] && hold_pid_live "$f"; then
+    # A live holder with a release marker beside it is a holder being ENDED right now: `unhold`
+    # writes that marker before it signals the client. Reusing it would hand this lane a holder
+    # that the release kills a moment later, and return 0 while doing it -- the lane is then
+    # running on a box with neither a holder nor protection, which is the failure --hold exists to
+    # prevent, reached through the flag itself. Nothing here can wait for that release either: it
+    # is another process, and its own kill is what clears this. So refuse and say what to do.
+    echo "  wsl holder NOT started on $name: its holder (pid $(hold_pid_read "$f" | cut -d' ' -f1)) is"
+    echo "    being released right now -- an unhold has marked it and is about to end it. Reusing it"
+    echo "    would give this lane a holder that disappears under it. Retry once that unhold returns."
+    return 1
+  fi
   if hold_pid_live "$f"; then
     # Reuse: the live holder already carries this box's lock, and taking it again from here would
     # fail against our own holder. Everything this branch says about it is said over the alias the

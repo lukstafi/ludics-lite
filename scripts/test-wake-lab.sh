@@ -1133,6 +1133,21 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HO
   || ko "a hold discarded a tokened record without confirming the VM (rc=$rc) -- $out; $(cat "$SSH_LOG")"
 reset_hold_state
 
+# A live holder with a release marker beside it is one being ended right now: `unhold` writes that
+# marker before it signals the client. Reusing it hands the lane a holder that disappears under it
+# moments later, and returns 0 while doing so (review round 15, P1).
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+: > "$TMP/state/hold-rog.releasing"
+: > "$SSH_LOG"
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'being released right now' <<<"$out" \
+  && ! grep -q -- '-e sh -s' "$SSH_LOG" \
+  && ok "a hold over a holder being released is refused, not reused (rc=$rc)" \
+  || ko "a hold reused a holder an unhold was about to kill (rc=$rc) -- $out"
+rm -f "$TMP/state/hold-rog.releasing"
+unhold >/dev/null 2>&1; reset_hold_state
+
 # A holder taken with --force never held the box's hold lock, so nothing refused another session's
 # restart-wsl while it ran. That is a property of the LANE, read long afterwards by whoever cleans
 # it up, so it goes in the record and not only in the line that scrolled past at the time (#184 b).
