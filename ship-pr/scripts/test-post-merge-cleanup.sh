@@ -133,8 +133,10 @@ git_config() {
 git_log_path() {
   local checkout="$1" ref="$2" path
   path=$(git -C "$checkout" rev-parse --git-path "logs/$ref") || return 1
+  # The helper's own classification, which this suite's fixtures need for the same reason it does:
+  # under Git Bash a path Git read from a `.git` file is reported drive-rooted (ludics-lite#147).
   case "$path" in
-  /*) printf '%s\n' "$path" ;;
+  /* | [ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]:[/\\]*) printf '%s\n' "$path" ;;
   *) printf '%s\n' "$checkout/$path" ;;
   esac
 }

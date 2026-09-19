@@ -44,6 +44,10 @@ usage: post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> [option
 Options:
   --base <branch>       Base branch to refresh and verify (default: master)
   --force-integrated    Followed by why this squash/rebase merge is confirmed
+  --regenerable <name>  A top-level directory of the session worktree that cleanup may
+                        REMOVE rather than refuse over or archive, such as a build tree.
+                        Repeatable, no default; the name must be one untracked directory
+                        of the worktree root and is never followed through a symlink.
 
 The ordinary path requires the topic branch to be an ancestor of origin/<base>. Use
 --force-integrated only after independently confirming a squash or rebase merge; its
@@ -57,12 +61,34 @@ canonical_dir() {
   (cd "$1" && pwd -P) || fail "cannot resolve directory: $1"
 }
 
+# git_path_is_absolute <path>: true when a path Git reported is already rooted, so joining it to
+# the checkout it was read from would name something else entirely. A leading slash is the POSIX
+# root and covers a `//server/share` UNC spelling too. The second arm is Git for Windows: a path
+# Git read from a `.git` file's gitdir line, from core.worktree or from `--git-common-dir` is
+# reported in NATIVE form (`C:/Users/...`) even under Git Bash, whose own other outputs are
+# `/c/...`. Joining that to the checkout produced
+# `/c/.../worktree/C:/Users/.../.git` and refused a clean, merged session (ludics-lite#147).
+# The drive letter is exactly one character, so `AB:/x` stays relative, and it is matched by
+# ENUMERATION rather than as an `[A-Za-z]` range: bash's bracket ranges follow the locale's
+# collation order, under which a range can match characters that are not ASCII letters. A
+# backslash root is recognized as well; Git writes forward slashes, and a path that somehow
+# arrives spelled `C:\Users\...` is better refused as a directory that does not exist than
+# silently joined to a checkout.
+git_path_is_absolute() {
+  case "$1" in
+  /*) return 0 ;;
+  [ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]:[/\\]*) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
 git_path() {
   local checkout="$1" value="$2"
-  case "$value" in
-  /*) canonical_dir "$value" ;;
-  *) canonical_dir "$checkout/$value" ;;
-  esac
+  if git_path_is_absolute "$value"; then
+    canonical_dir "$value"
+  else
+    canonical_dir "$checkout/$value"
+  fi
 }
 
 atomic_rename() {
@@ -203,6 +229,128 @@ refuse_session_local_data() {
     fail "session worktree holds ignored data that cleanup would archive out of sight; move or remove it before cleanup: $ignored"
 }
 
+# The BASE-OWNER gate is the mirror image, and its stakes are the opposite ones. Nothing here is
+# archived or moved, so ignored data deliberately passes it (see the comment at its call site);
+# untracked data does not, because the fast-forward writes into this tree. One class carries no
+# such stake and refused every harness-opened checkout unconditionally (ludics-lite#215):
+# harness-owned state under a top-level `.claude/` DIRECTORY. The agent harness writes it into
+# every checkout it opens -- the PRIMARY one included, which is where the desktop harness most
+# often sits and which owns the base on the standard layout -- before the session does anything;
+# the helper never created it and never reads it. A repository whose ignore rules do not carry the
+# name meets it here rather than at the session gate, which exempts it only as IGNORED data.
+#
+# The exemption is by NAME on purpose. ludics-lite#240 fixed the neighbouring fleet-worker layout
+# guard, which met the same directory, by enumerating from `git ls-files` instead of `find`; that
+# guard judges what the repository DECLARES, so the index is the right source for it. This gate
+# judges a live checkout's CONTENTS before writing into it, and an untracked path is precisely the
+# thing in question -- reading the index here would defeat the gate rather than fix it.
+#
+# An untracked regular file or symbolic link named `.claude` is not the harness directory and
+# keeps its refusal, and no component of a spelled-out entry may be a symbolic link.
+base_owner_untracked_is_harness_owned() {
+  local worktree="$1" path="${2%/}"
+  case "$path" in
+  .claude | .claude/*) ;;
+  *) return 1 ;;
+  esac
+  { [ ! -L "$worktree/.claude" ] && [ -d "$worktree/.claude" ]; } || return 1
+  path_has_no_link_component "$worktree" "$path"
+}
+
+# scan_base_owner_local_data <worktree> [index file]: set BASE_OWNER_LOCAL_DATA to the entries the
+# rule above does not clear, shell-quoted and comma-joined, empty when the owner holds nothing the
+# gate objects to. Nonzero only when the status itself could not be read, so each caller keeps its
+# own wording for that; the callers that must install a prepared refresh before refusing read the
+# variable after doing so, which is why the verdict is a variable rather than an exit status.
+#
+# NUL-delimited, for the reason the session gate is: the default porcelain rendering C-quotes a
+# name carrying whitespace or -- under core.quotePath -- most non-ASCII bytes, and the refusal now
+# NAMES the paths, so a quoted rendering would send the operator after a file that is not there.
+# What is printed is the shell-quoted rendering of the real name: a pathname is attacker-shaped
+# data, and a newline in one would forge a second diagnostic line. A rename's second `-z` field
+# carries no status prefix and is skipped rather than named as an entry of its own.
+BASE_OWNER_LOCAL_DATA=""
+scan_base_owner_local_data() {
+  local worktree="$1" index_file="${2:-}" entry code path original=0 status_rc=0
+  BASE_OWNER_LOCAL_DATA=""
+  MASTER_STATUS_FILE=$(mktemp "$TEMP_ROOT/ship-pr-base-owner-status.XXXXXX") ||
+    fail "could not allocate the $BASE_BRANCH owner cleanliness snapshot"
+  if [ -n "$index_file" ]; then
+    GIT_INDEX_FILE="$index_file" git -C "$worktree" status --porcelain -z       --untracked-files=normal >"$MASTER_STATUS_FILE" || status_rc=1
+  else
+    git -C "$worktree" status --porcelain -z       --untracked-files=normal >"$MASTER_STATUS_FILE" || status_rc=1
+  fi
+  if [ "$status_rc" -eq 0 ]; then
+    while IFS= read -r -d '' entry; do
+      if [ "$original" -eq 1 ]; then
+        original=0
+        continue
+      fi
+      [ -n "$entry" ] || continue
+      code=${entry:0:2}
+      path=${entry:3}
+      case "$code" in
+      '??')
+        base_owner_untracked_is_harness_owned "$worktree" "$path" && continue
+        ;;
+      R? | C? | ?R | ?C) original=1 ;;
+      esac
+      BASE_OWNER_LOCAL_DATA="$BASE_OWNER_LOCAL_DATA${BASE_OWNER_LOCAL_DATA:+, }$(printf '%q' "$path")"
+    done <"$MASTER_STATUS_FILE"
+  fi
+  unlink "$MASTER_STATUS_FILE" || fail "could not remove the $BASE_BRANCH owner cleanliness snapshot"
+  MASTER_STATUS_FILE=""
+  [ "$status_rc" -eq 0 ]
+}
+
+# ludics-lite#205 §2. A build tree slips between both session-gate exemptions by construction: it
+# is not harness-owned `.claude/`, and it is build output, so never being byte-identical to the
+# base checkout's copy is the whole point of it. It therefore refused every worktree that had ever
+# built -- 92M on the sighting recorded in ludics-lite#215 -- and ARCHIVING it would be worse than
+# refusing: the sibling archive is exactly the "out of sight" the gate guards against, and one
+# would accumulate per landed PR. So the operator may name such a directory as one the helper
+# REMOVES instead. The helper stays build-system-agnostic: it learns no `dune`, and the flag names
+# a class of paths rather than a command to run inside a checkout it is about to judge.
+#
+# The value is ONE top-level directory of the session worktree. A value carrying a slash is
+# refused rather than resolved, which is what keeps an absolute path, a nested path and every `..`
+# traversal out without a containment check to get wrong; `.` and `..` are refused by name. A
+# symbolic link is never followed -- `rm -rf` through one removes a tree the worktree does not
+# hold -- and a tracked path is repository content whatever the operator typed. An absent name is
+# a no-op, because a worktree that never built has no `_build` and the operator's command line
+# does not change between one cleanup and the next.
+#
+# This runs before either gate reads the worktree, and so before the merge-ancestry proof: a later
+# refusal still leaves the named directories removed. That is the contract the flag's name states
+# -- what it removes costs CPU to rebuild and nothing else.
+remove_regenerable_directories() {
+  local name target tracked
+  for name in ${REGENERABLE_NAMES[@]+"${REGENERABLE_NAMES[@]}"}; do
+    case "$name" in
+    */*)
+      fail "--regenerable names one top-level directory, not a path: $(printf '%q' "$name")"
+      ;;
+    . | ..)
+      fail "--regenerable cannot name a directory entry of the worktree root: $(printf '%q' "$name")"
+      ;;
+    esac
+    target="$SESSION/$name"
+    { [ ! -e "$target" ] && [ ! -L "$target" ]; } && continue
+    [ ! -L "$target" ] ||
+      fail "--regenerable path is a symbolic link, which is never followed; remove it yourself before cleanup: $(printf '%q' "$name")"
+    [ -d "$target" ] ||
+      fail "--regenerable path is not a directory: $(printf '%q' "$name")"
+    tracked=$(git -C "$SESSION" ls-files -z -- ":(literal)$name" | tr -d '\0' | sed -n '1p') ||
+      fail "could not inspect whether the --regenerable path is tracked: $(printf '%q' "$name")"
+    [ -z "$tracked" ] ||
+      fail "--regenerable path is tracked by the repository and is not regenerable: $(printf '%q' "$name")"
+    rm -rf -- "$target" ||
+      fail "could not remove the --regenerable directory: $(printf '%q' "$name")"
+    { [ ! -e "$target" ] && [ ! -L "$target" ]; } ||
+      fail "the --regenerable directory remained after its removal: $(printf '%q' "$name")"
+  done
+}
+
 refuse_initialized_submodules() {
   local worktree="$1" description="$2" line status
   status=$(git -C "$worktree" submodule status --recursive) ||
@@ -257,10 +405,7 @@ preflight_session_metadata_locks() {
     index config.worktree; do
     path=$(git -C "$SESSION" rev-parse --git-path "$name") ||
       fail "could not locate session metadata: $name"
-    case "$path" in
-    /*) ;;
-    *) path="$SESSION/$path" ;;
-    esac
+    git_path_is_absolute "$path" || path="$SESSION/$path"
     path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
     path="$path_dir/$(basename "$path")"
     [ ! -L "$path" ] || fail "session metadata is symbolic; replace it before cleanup: $name"
@@ -286,10 +431,7 @@ preflight_sparse_checkout_metadata() {
   local path path_dir lock
   path=$(git -C "$SESSION" rev-parse --git-path info/sparse-checkout) ||
     fail "could not locate session sparse-checkout metadata"
-  case "$path" in
-  /*) ;;
-  *) path="$SESSION/$path" ;;
-  esac
+  git_path_is_absolute "$path" || path="$SESSION/$path"
   path_dir=$(dirname "$path")
   if [ ! -d "$path_dir" ]; then
     { [ ! -e "$path" ] && [ ! -L "$path" ]; } ||
@@ -311,10 +453,7 @@ refuse_active_session_operations() {
     BISECT_ANCESTORS_OK BISECT_EXPECTED_REV sequencer rebase-merge rebase-apply; do
     path=$(git -C "$worktree" rev-parse --git-path "$name") ||
       fail "could not locate session operation state: $name"
-    case "$path" in
-    /*) ;;
-    *) path="$worktree/$path" ;;
-    esac
+    git_path_is_absolute "$path" || path="$worktree/$path"
     path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
     path="$path_dir/$(basename "$path")"
     { [ ! -e "$path" ] && [ ! -L "$path" ]; } ||
@@ -334,10 +473,7 @@ refuse_hidden_index_changes() {
   local worktree="$1" description="$2" index_path index_dir entry path sparse_enabled
   index_path=$(git -C "$worktree" rev-parse --git-path index) ||
     fail "could not locate $description index: $worktree"
-  case "$index_path" in
-  /*) ;;
-  *) index_path="$worktree/$index_path" ;;
-  esac
+  git_path_is_absolute "$index_path" || index_path="$worktree/$index_path"
   index_dir=$(canonical_dir "$(dirname "$index_path")") || exit $?
   index_path="$index_dir/$(basename "$index_path")"
   [ ! -L "$index_path" ] || fail "$description index is symbolic: $worktree"
@@ -409,10 +545,7 @@ reserve_master_owner_handoff() {
   local head_path head_dir index_path index_dir raw
   head_path=$(git -C "$ORIGINAL_MASTER_OWNER" rev-parse --git-path HEAD) ||
     fail "could not locate the $BASE_BRANCH owner's HEAD"
-  case "$head_path" in
-  /*) ;;
-  *) head_path="$ORIGINAL_MASTER_OWNER/$head_path" ;;
-  esac
+  git_path_is_absolute "$head_path" || head_path="$ORIGINAL_MASTER_OWNER/$head_path"
   head_dir=$(canonical_dir "$(dirname "$head_path")") || exit $?
   head_path="$head_dir/$(basename "$head_path")"
   [ ! -L "$head_path" ] || fail "$BASE_BRANCH owner's HEAD is symbolic on disk"
@@ -423,10 +556,7 @@ reserve_master_owner_handoff() {
   [ "$raw" = "ref: $BASE_LOCAL_REF" ] || return 1
 
   index_path=$(git -C "$ORIGINAL_MASTER_OWNER" rev-parse --git-path index) || return 1
-  case "$index_path" in
-  /*) ;;
-  *) index_path="$ORIGINAL_MASTER_OWNER/$index_path" ;;
-  esac
+  git_path_is_absolute "$index_path" || index_path="$ORIGINAL_MASTER_OWNER/$index_path"
   index_dir=$(canonical_dir "$(dirname "$index_path")") || exit $?
   MASTER_OWNER_INDEX_PATH="$index_dir/$(basename "$index_path")"
   [ ! -L "$MASTER_OWNER_INDEX_PATH" ] || return 1
@@ -563,10 +693,7 @@ retain_topic_reflog_sides() {
   local ref="$1" kind="$2" path path_dir line old_oid new_oid rest oid
   path=$(git -C "$MAIN" rev-parse --git-path "logs/$ref") ||
     fail "could not locate $ref reflog"
-  case "$path" in
-  /*) ;;
-  *) path="$MAIN/$path" ;;
-  esac
+  git_path_is_absolute "$path" || path="$MAIN/$path"
   path_dir=$(dirname "$path")
   if [ ! -d "$path_dir" ]; then
     { [ ! -e "$path" ] && [ ! -L "$path" ]; } || fail "$ref reflog has an invalid parent"
@@ -591,10 +718,7 @@ retain_session_reflog_sides() {
   if [ -z "$path" ]; then
     path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "logs/$ref") ||
       fail "could not locate session-private reflog: $ref"
-    case "$path" in
-    /*) ;;
-    *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
-    esac
+    git_path_is_absolute "$path" || path="$SESSION_ARCHIVED_WORKTREE/$path"
   fi
   path_dir=$(dirname "$path")
   if [ ! -d "$path_dir" ]; then
@@ -678,10 +802,7 @@ retain_private_session_refs() {
   for namespace in refs/worktree refs/bisect refs/rewritten; do
     probe=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "$namespace/ship-pr-probe") ||
       fail "could not locate private namespace: $namespace"
-    case "$probe" in
-    /*) ;;
-    *) probe="$SESSION_ARCHIVED_WORKTREE/$probe" ;;
-    esac
+    git_path_is_absolute "$probe" || probe="$SESSION_ARCHIVED_WORKTREE/$probe"
     blocker=$(dirname "$probe")
     blocker_parent=$(dirname "$blocker")
     if [ ! -d "$blocker_parent" ]; then
@@ -776,10 +897,7 @@ lock_and_retain_session_metadata() {
     BISECT_HEAD AUTO_MERGE FETCH_HEAD; do
     path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "$name") ||
       fail "could not locate archived session pseudoref: $name"
-    case "$path" in
-    /*) ;;
-    *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
-    esac
+    git_path_is_absolute "$path" || path="$SESSION_ARCHIVED_WORKTREE/$path"
     path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
     path="$path_dir/$(basename "$path")"
     lock="$path.lock"
@@ -803,10 +921,7 @@ lock_and_retain_session_metadata() {
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path COMMIT_EDITMSG) ||
     fail "could not locate archived commit message"
-  case "$path" in
-  /*) ;;
-  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
-  esac
+  git_path_is_absolute "$path" || path="$SESSION_ARCHIVED_WORKTREE/$path"
   path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
   path="$path_dir/$(basename "$path")"
   lock="$path.lock"
@@ -824,10 +939,7 @@ lock_and_retain_session_metadata() {
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path SQUASH_MSG) ||
     fail "could not locate archived squash message"
-  case "$path" in
-  /*) ;;
-  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
-  esac
+  git_path_is_absolute "$path" || path="$SESSION_ARCHIVED_WORKTREE/$path"
   path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
   path="$path_dir/$(basename "$path")"
   lock="$path.lock"
@@ -845,10 +957,7 @@ lock_and_retain_session_metadata() {
   for name in TAG_EDITMSG NOTES_EDITMSG; do
     path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path "$name") ||
       fail "could not locate archived edit message: $name"
-    case "$path" in
-    /*) ;;
-    *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
-    esac
+    git_path_is_absolute "$path" || path="$SESSION_ARCHIVED_WORKTREE/$path"
     path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
     path="$path_dir/$(basename "$path")"
     lock="$path.lock"
@@ -867,10 +976,7 @@ lock_and_retain_session_metadata() {
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path config.worktree) ||
     fail "could not locate archived per-worktree configuration"
-  case "$path" in
-  /*) ;;
-  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
-  esac
+  git_path_is_absolute "$path" || path="$SESSION_ARCHIVED_WORKTREE/$path"
   path_dir=$(dirname "$path")
   if [ -d "$path_dir" ]; then
     path_dir=$(canonical_dir "$path_dir") || exit $?
@@ -892,10 +998,7 @@ lock_and_retain_session_metadata() {
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path info/sparse-checkout) ||
     fail "could not locate archived sparse-checkout metadata"
-  case "$path" in
-  /*) ;;
-  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
-  esac
+  git_path_is_absolute "$path" || path="$SESSION_ARCHIVED_WORKTREE/$path"
   path_dir=$(dirname "$path")
   if [ -d "$path_dir" ]; then
     path_dir=$(canonical_dir "$path_dir") || exit $?
@@ -917,10 +1020,7 @@ lock_and_retain_session_metadata() {
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path index) ||
     fail "could not locate archived session index"
-  case "$path" in
-  /*) ;;
-  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
-  esac
+  git_path_is_absolute "$path" || path="$SESSION_ARCHIVED_WORKTREE/$path"
   path_dir=$(canonical_dir "$(dirname "$path")") || exit $?
   lock="$path_dir/$(basename "$path").lock"
   (set -o noclobber; printf '%s\n' "$$" >"$lock") 2>/dev/null ||
@@ -932,10 +1032,7 @@ lock_and_retain_session_metadata() {
   shared_index=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --shared-index-path) ||
     fail "could not locate the archived session shared index"
   if [ -n "$shared_index" ]; then
-    case "$shared_index" in
-    /*) ;;
-    *) shared_index="$SESSION_ARCHIVED_WORKTREE/$shared_index" ;;
-    esac
+    git_path_is_absolute "$shared_index" || shared_index="$SESSION_ARCHIVED_WORKTREE/$shared_index"
     path_dir=$(canonical_dir "$(dirname "$shared_index")") || exit $?
     shared_index="$path_dir/$(basename "$shared_index")"
     [ ! -L "$shared_index" ] || fail "archived session shared index is symbolic"
@@ -965,10 +1062,7 @@ lock_and_retain_session_metadata() {
 
   path=$(git -C "$SESSION_ARCHIVED_WORKTREE" rev-parse --git-path logs/HEAD) ||
     fail "could not locate the archived session HEAD reflog"
-  case "$path" in
-  /*) ;;
-  *) path="$SESSION_ARCHIVED_WORKTREE/$path" ;;
-  esac
+  git_path_is_absolute "$path" || path="$SESSION_ARCHIVED_WORKTREE/$path"
   path_dir=$(dirname "$path")
   if [ -d "$path_dir" ]; then
     path_dir=$(canonical_dir "$path_dir") || exit $?
@@ -1052,6 +1146,9 @@ cleanup_reservations() {
   fi
   if [ -n "${SESSION_STATUS_FILE:-}" ] && [ -f "$SESSION_STATUS_FILE" ]; then
     unlink "$SESSION_STATUS_FILE" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${MASTER_STATUS_FILE:-}" ] && [ -f "$MASTER_STATUS_FILE" ]; then
+    unlink "$MASTER_STATUS_FILE" >/dev/null 2>&1 || true
   fi
   if [ -n "${SESSION_IGNORED_WALK_FILE:-}" ] && [ -f "$SESSION_IGNORED_WALK_FILE" ]; then
     unlink "$SESSION_IGNORED_WALK_FILE" >/dev/null 2>&1 || true
@@ -1145,6 +1242,7 @@ CONFIG_LOCK=""
 CONFIG_LOCK_OWNED=0
 CHANGED_PATHS_FILE=""
 SESSION_STATUS_FILE=""
+MASTER_STATUS_FILE=""
 SESSION_IGNORED_WALK_FILE=""
 WORKTREE_LIST_FILE=""
 MASTER_INDEX_PROBE=""
@@ -1164,6 +1262,7 @@ shift 3
 
 BASE_BRANCH="master"
 FORCE_REASON=""
+REGENERABLE_NAMES=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
   --base)
@@ -1176,6 +1275,12 @@ while [ "$#" -gt 0 ]; do
     [ "$#" -ge 2 ] || usage
     FORCE_REASON="$2"
     [ -n "$FORCE_REASON" ] || usage
+    shift 2
+    ;;
+  --regenerable)
+    [ "$#" -ge 2 ] || usage
+    [ -n "$2" ] || usage
+    REGENERABLE_NAMES+=("$2")
     shift 2
     ;;
   *) usage ;;
@@ -1245,6 +1350,7 @@ if [ -n "$SESSION_REF" ]; then
 else
   [ "$BRANCH_OWNER_COUNT" -eq 0 ] || fail "detached session cannot clean $BRANCH while another worktree owns it: $BRANCH_OWNER"
 fi
+remove_regenerable_directories
 refuse_session_local_data
 refuse_initialized_submodules "$SESSION" "session worktree"
 refuse_session_module_gitdirs "$SESSION"
@@ -1254,10 +1360,7 @@ preflight_session_metadata_locks
 preflight_sparse_checkout_metadata
 
 SESSION_HEAD_PATH=$(git -C "$SESSION" rev-parse --git-path HEAD) || fail "cannot locate session HEAD"
-case "$SESSION_HEAD_PATH" in
-/*) ;;
-*) SESSION_HEAD_PATH="$SESSION/$SESSION_HEAD_PATH" ;;
-esac
+git_path_is_absolute "$SESSION_HEAD_PATH" || SESSION_HEAD_PATH="$SESSION/$SESSION_HEAD_PATH"
 SESSION_HEAD_DIR=$(canonical_dir "$(dirname "$SESSION_HEAD_PATH")") || exit $?
 SESSION_HEAD_LOCK="$SESSION_HEAD_DIR/$(basename "$SESSION_HEAD_PATH").lock"
 { [ ! -e "$SESSION_HEAD_LOCK" ] && [ ! -L "$SESSION_HEAD_LOCK" ]; } ||
@@ -1383,11 +1486,14 @@ MASTER_OWNER_HEAD=$(git -C "$MASTER_OWNER" rev-parse HEAD) || fail "cannot read 
 # "no ignored data anywhere" makes the helper unusable there. Ignored data is only at risk on
 # paths the fast-forward actually touches, and those are refused by the changed-path collision
 # scan below; the locked refresh itself runs checkout --no-overwrite-ignore, which refuses loudly
-# if ignored data appears on a touched path after that scan.
-MASTER_OWNER_STATUS=$(git -C "$MASTER_OWNER" status \
-  --porcelain --untracked-files=normal) ||
+# if ignored data appears on a touched path after that scan. Untracked data IS part of the gate,
+# minus the one harness-owned class the scanner clears (ludics-lite#215); the two rechecks after
+# the refresh read the owner through the same scanner, so a `.claude/` that passed here cannot
+# reappear as data the owner "gained" once the fast-forward has already landed.
+scan_base_owner_local_data "$MASTER_OWNER" ||
   fail "could not inspect $BASE_BRANCH owner cleanliness"
-[ -z "$MASTER_OWNER_STATUS" ] || fail "$BASE_BRANCH owner is dirty; clean it before cleanup: $MASTER_OWNER"
+[ -z "$BASE_OWNER_LOCAL_DATA" ] ||
+  fail "$BASE_BRANCH owner is dirty; clean it before cleanup: $MASTER_OWNER: $BASE_OWNER_LOCAL_DATA"
 refuse_hidden_index_changes "$MASTER_OWNER" "$BASE_BRANCH owner"
 refuse_initialized_submodules "$MASTER_OWNER" "$BASE_BRANCH owner"
 refuse_index_resolve_undo "$MASTER_OWNER" "$BASE_BRANCH owner"
@@ -1444,13 +1550,11 @@ if ! git -C "$MAIN" update-ref --no-deref "$BASE_LOCAL_REF" "$REMOTE_MASTER" "$L
       fail "could not read $BASE_BRANCH after its conditional update failed"
     refresh_master_owner_to "$MASTER_DURING_REFRESH" ||
       fail "local $BASE_BRANCH moved and its locked owner could not follow the concurrent tip"
-    MASTER_OWNER_STATUS=$(GIT_INDEX_FILE="$MASTER_OWNER_INDEX_LOCK" \
-      git -C "$ORIGINAL_MASTER_OWNER" status \
-        --porcelain --untracked-files=normal) ||
+    scan_base_owner_local_data "$ORIGINAL_MASTER_OWNER" "$MASTER_OWNER_INDEX_LOCK" ||
       fail "could not recheck the $BASE_BRANCH owner after its ref moved"
     install_master_owner_refresh
-    [ -z "$MASTER_OWNER_STATUS" ] ||
-      fail "local $BASE_BRANCH moved and its owner gained data; the data was preserved"
+    [ -z "$BASE_OWNER_LOCAL_DATA" ] ||
+      fail "local $BASE_BRANCH moved and its owner gained data; the data was preserved: $BASE_OWNER_LOCAL_DATA"
   fi
   fail "local $BASE_BRANCH moved after its owner preflight"
 fi
@@ -1472,12 +1576,11 @@ if [ -n "$ORIGINAL_MASTER_OWNER" ]; then
   # Ignored files pass here for the same reason as the preflight gate: pre-existing ignored data
   # on untouched paths is expected on the standard layout, and touched paths were either refused
   # by the collision scan or protected by the refresh's --no-overwrite-ignore.
-  MASTER_OWNER_STATUS=$(GIT_INDEX_FILE="$MASTER_OWNER_INDEX_LOCK" git -C "$ORIGINAL_MASTER_OWNER" status \
-    --porcelain --untracked-files=normal) ||
+  scan_base_owner_local_data "$ORIGINAL_MASTER_OWNER" "$MASTER_OWNER_INDEX_LOCK" ||
     fail "could not recheck the locked $BASE_BRANCH owner"
   install_master_owner_refresh
-  [ -z "$MASTER_OWNER_STATUS" ] ||
-    fail "$BASE_BRANCH owner gained local data during its locked update; the data was preserved"
+  [ -z "$BASE_OWNER_LOCAL_DATA" ] ||
+    fail "$BASE_BRANCH owner gained local data during its locked update; the data was preserved: $BASE_OWNER_LOCAL_DATA"
   [ "$MASTER_DURING_REFRESH" = "$REMOTE_MASTER" ] ||
     fail "$BASE_BRANCH moved during its locked refresh; its owner followed the concurrent tip"
 else
