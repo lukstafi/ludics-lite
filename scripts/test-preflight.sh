@@ -219,6 +219,30 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$T/scripts/check-prompts.sh"
 chmod +x "$T/scripts/check-prompts.sh"
 expect "...and runs it when it is" 0 'prompts: PASS' -- "$PF" --root "$T" prompts
 
+# --- a step in the table with nothing behind it -------------------------------------------------
+#
+# The negative control needs a table entry that no arm implements, which only a patched copy of
+# the script can have. `case` matching nothing exits 0, so without the default arm this prints
+# PASS over an assertion that never ran.
+
+mkdir -p "$TMP/handler/scripts"
+PATCH_ADD="  'nosuchhandler:-'" awk '
+  { print }
+  $0 ~ /^  .syntax:-.$/ { print ENVIRON["PATCH_ADD"] }
+' "$PF" >"$TMP/handler/scripts/preflight.sh"
+chmod +x "$TMP/handler/scripts/preflight.sh"
+PATCHED="$TMP/handler/scripts/preflight.sh"
+tree handler
+if grep -q "nosuchhandler" "$PATCHED"; then
+  ok "the unimplemented-step control could be built"
+  expect "a step the table names and nothing implements is a failure, not a PASS" \
+    1 'no assertion here implements it' -- "$PATCHED" --root "$T" nosuchhandler
+  expect "...while the same patched copy still passes a step that has an arm" \
+    0 'syntax: PASS' -- "$PATCHED" --root "$T" syntax
+else
+  ko "could not patch a table entry into a copy of preflight.sh: the control below would prove nothing"
+fi
+
 # --- the missing-tool rule --------------------------------------------------------------------
 #
 # PATH is emptied rather than shellcheck hidden: with --root given, the step needs no external

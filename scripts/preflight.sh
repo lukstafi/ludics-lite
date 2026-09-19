@@ -285,6 +285,14 @@ run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped
     shellcheck) step_shellcheck ;;
     powershell) step_powershell ;;
     parse-guard) step_parse_guard ;;
+    # A `case` that matches nothing exits 0, so an entry added to the table as `name:-` whose arm
+    # was never written would print PASS having run nothing -- a claim that cannot fail, and
+    # exactly the registration drift this file exists to refuse (round 3). The table is the
+    # registration; this arm is what makes it mean something.
+    *)
+      printf 'preflight: %s: FAIL (the step table names it and no assertion here implements it)\n' "$name"
+      return 1
+      ;;
     esac
   fi
   local rc=$?
