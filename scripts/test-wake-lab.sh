@@ -965,6 +965,7 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP=
 # refused by the interlock instead of racing it (review round 2, P1).
 reset_hold_state
 held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+slow_sidecar=$(awk '{ print $4 }' "$TMP/state/hold-rog.pid" 2>/dev/null)
 ( env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" SSH_DELAY=3 \
       "$WL" unhold rog > "$TMP/slow-unhold2.out" 2>&1 ) &
 slow=$!
@@ -972,9 +973,15 @@ slow=$!
 # is really gone, and `kill -0` can keep answering past a fixed sleep -- so a timed wait can launch
 # the competitor into a window that has not opened, where winning the lock is legitimate and the
 # case fails for the wrong reason (review round 3, P2, reproduced by the reviewer).
+# The sidecar holds that lock until it sees its holder go, and it looks with `kill -0` -- which a
+# ZOMBIE answers. The holder here is orphaned when wake-lab exits, so on a system whose PID 1 does
+# not reap promptly (a container) it stays a zombie, the sidecar never lets go, and the competing
+# hold below would be refused by a stale lock rather than by the release. The reviewer hit exactly
+# that. So the fixture ends the sidecar itself if the lock has not come free (review round 6, P2).
 locked=0
-for _ in $(seq 1 20); do
+for i in $(seq 1 20); do
   grep -q '^wake-lab unhold (pid' "$WAKE_LAB_LOCK_DIR/rog.hold.lock" 2>/dev/null && { locked=1; break; }
+  [ "$i" = 5 ] && [ -n "$slow_sidecar" ] && kill "$slow_sidecar" 2>/dev/null
   sleep 1
 done
 out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?

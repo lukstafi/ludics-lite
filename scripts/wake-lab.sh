@@ -812,6 +812,11 @@ KICK_DEST=""   # the Windows alias that carried the last successful kick; the ho
 # bare words, the same quoting profile as the `sleep infinity` it replaces, with the interesting
 # part travelling as DATA inside the channel, where no Windows parser looks at it.
 HOLD_PAYLOAD='wsl.exe -d Ubuntu -e sh -s'
+# What that payload runs INSIDE the guest, which is what the guest's own process list shows. The
+# two must agree: this is the shape the cleanup probe looks for, and a token found anywhere else on
+# a line is not a holder. An operator debugging a stuck lane with `watch ... grep <token>` has that
+# token in their argv, and matching it would end their command instead of the holder.
+HOLD_GUEST_ARGV='sh -s'
 # The holder every version before this one spawned. A hold outlives the shell that took it -- a
 # lane is a sequence of commands and this script is updated between them -- so an `unhold` from the
 # new script can meet a record the old one wrote. That holder has no token, cannot be handshaken
@@ -982,7 +987,8 @@ hold_remote_gone() { # hold_remote_gone <windows-alias> <token>
   out=$(printf '%s' "$out" | tr -d '\r')
   printf '%s\n' "$out" | grep -q 'PID' || return 2
   HOLD_REMOTE_PID=$(printf '%s\n' "$out" |
-    awk -v t="$2" 'index($0, t) && $1 ~ /^[0-9]+$/ { print $1; exit }')
+    awk -v t="$2" -v g="$HOLD_GUEST_ARGV" \
+      '$1 ~ /^[0-9]+$/ && ($2 " " $3) == g && $4 == t { print $1; exit }')
   [ -n "$HOLD_REMOTE_PID" ] && return 1
   return 0
 }
@@ -1227,8 +1233,17 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   # leave it running unowned. The guest pid is 0 until the handshake answers with it.
   if ! hold_record_write "$f" "$pid" "$dest" "$spawn_epoch" "$sidecar" "$token" 0 "$prot"; then
     kill "$pid" "$sidecar" 2>/dev/null
-    rm -f "$f" "$fifo" "$out" 2>/dev/null
     echo "  wsl holder on $name could NOT be recorded at $f — holder (pid $pid) killed rather than leaked"
+    # ...but killing the client is not the end of it, and here the token cannot be written down at
+    # all: this is the one path where the identity exists only in this shell. The guest shell may
+    # already be running, a plain `kick-wsl --hold` leaves the VM up, and the tree can outlive its
+    # channel -- so the VM is asked now, while the token is still known, rather than after it is
+    # lost with the record that could not be written.
+    HOLD_CONFIRM=""
+    hold_confirm_gone "$name" "$dest" 0 "$token" "its unrecordable hold killed the client"
+    [ "$HOLD_CONFIRM" = gone ] ||
+      echo "    That holder cannot be recorded, so nothing will name it later: its token is $token."
+    hold_state_clear "$name" "$pid" "$token" >/dev/null
     return 1
   fi
   # The lock this holder now carries says whatever the take that opened the descriptor said, and
@@ -1290,7 +1305,12 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
     hold_confirm_gone "$name" "$dest" 0 "$token" "its failed hold killed the client"
     if [ "$HOLD_CONFIRM" = gone ]; then
       echo "    nothing of ours holds that VM"
-      rm -f "$f" "$fifo" "$out" 2>/dev/null
+      # Compare-and-delete, as the release does. This shell normally still holds the box's hold
+      # lock -- lock_take_fd opened it here and the holder only inherited a copy -- so a competing
+      # --hold is refused throughout. Not always, though: a `--force` hold never took it, and
+      # lock_take_fd fails open when it cannot even create the file. In those cases the probe above
+      # has just spent seconds unlocked, which is long enough for another run to own these paths.
+      hold_state_clear "$name" "$pid" "$token" >/dev/null
     else
       # The marker says the client was ended deliberately, which is what stops the next reader
       # calling this a holder the lane lost.

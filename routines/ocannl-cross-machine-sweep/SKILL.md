@@ -102,8 +102,11 @@ one the lane LOST — the box slept or rebooted under it, the network dropped, s
 descriptor and was released the moment it died — from then on the box was not reserved, and another
 session's `restart-wsl` was free to shut its VM down mid-unit, the 2026-09-16 failure the interlock
 exists to prevent. The VM itself usually survives, because a dying holder orphans its `wsl.exe` on
-the Windows side instead of taking it down; that orphan is unowned and invisible, and only a
-`restart-wsl` or a reboot ends it. Treat it as a failed lane for that box: report it, quote the line
+the Windows side instead of taking it down. That orphan is no longer unowned: the holder carries a
+token, so this same `unhold` asks the VM whether that guest shell is still there and ends it by pid
+if it is, and its output says which happened. Read those lines before reaching for anything else —
+`restart-wsl` is host-global and destroys every other session on the box, so it is for an orphan
+the release reported it could NOT end (exit 3), never for one it has already cleaned up. Treat it as a failed lane for that box: report it, quote the line
 (it carries the pid and how long the holder lived), and do not call the run clean on the strength of
 green units. Note the interlock only covers wake-lab's own `sleep`/`down` verbs, which are refused
 while a box is held — a box slept by hand or from Windows takes its holder with it and nothing
