@@ -3992,9 +3992,11 @@ refuse_merge_queue() {
 # made a body naming two of them produce no warning at all (review round 2).
 # The keyword boundaries exclude `-` on both sides on purpose: this repo's own vocabulary is full of
 # `close-out`, `closed-loop` and `fixed-point`, and a body saying "a close-out merge of #3 and #4"
-# is not closing anything.
+# is not closing anything. `/` is excluded on both sides for the same reason: an owner or a
+# repository may be NAMED `closed`, and `see closed/tracker#10 and closed/tracker#11` carries no
+# closing directive at all (review round 6).
 MULTI_CLOSE_FILTER='
-function refs_of(unit,   rest, r, out, n, seen) {
+function refs_of(unit, repo,   rest, r, out, n, seen, key) {
   # URLs go first. A body here is full of run links, and a fragment in one is not an issue: a
   # trailing /#703 was counted as an issue, and a page#705 was even reported as a cross-repository
   # reference to a HOST (review round 3). An issue bound through its full URL is a shape this
@@ -4018,20 +4020,23 @@ function refs_of(unit,   rest, r, out, n, seen) {
     # spelling in one sentence stop counting twice (review round 5). A reference to any OTHER
     # repository stays as written: it is a different issue.
     if (repo != "" && index(tolower(r), tolower(repo) "#") == 1) r = substr(r, length(repo) + 1)
+    # Keyed on the lowercased spelling, displayed as written: GitHub owner and repository names are
+    # case-insensitive, so `Other/Tracker#10` and `other/tracker#10` are one issue (review round 6).
+    key = tolower(r)
     # DISTINCT issues, not occurrences: "the request in #701 is done, so this closes #701" names
     # one issue twice, and reporting it as two made the count, the list and the reopen advice all
     # false (review round 3). A bare #N and an owner/repo#N are left distinct, since which
     # repository a bare one means is not knowable from here.
-    if (r in seen) continue
-    seen[r] = 1
+    if (key in seen) continue
+    seen[key] = 1
     n++
     out = (n == 1 ? r : out " " r)
   }
   return out
 }
 function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
-  if (tolower(unit) !~ /(^|[^a-z0-9_-])(close[sd]?|fix(e[sd])?|resolve[sd]?)([^a-z0-9_-]|$)/) return
-  refs = refs_of(unit)
+  if (tolower(unit) !~ /(^|[^a-z0-9_\/-])(close[sd]?|fix(e[sd])?|resolve[sd]?)([^a-z0-9_\/-]|$)/) return
+  refs = refs_of(unit, repo)
   if (refs == "") return
   cnt = split(refs, parts, " ")
   if (cnt < 2 && !quoted) return
@@ -4045,16 +4050,23 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
 {
   line = $0
   sub(/\r$/, "", line)
-  # Markdown keeps up to THREE leading spaces as ordinary indentation and makes four (or a tab) an
+  # Markdown keeps up to THREE leading columns as ordinary indentation and makes four an
   # indented CODE block. Stripping all of it turned `    > Closes #1` into a blockquote and warned
   # about an example SKILL.md says this scanner does not read, and let an indented fence open a
   # phantom block that swallowed the ordinary text after it (review round 4). An indented line is
   # therefore neither quote nor fence; inside an already-open fence it is content, which the fence
-  # test below still catches. Indentation is counted from the LINE, not relative to a list item is
+  # test below still catches. Indentation is COLUMNS and not characters, because a tab advances to
+  # the next stop and one to three spaces before it still reach column four (review round 6).
+  # It is counted from the LINE, not relative to a list item is
   # container -- modelling that is a Markdown parser, and its absence can only lose a fence.
-  lead = 0
-  while (substr(line, lead + 1, 1) == " ") lead++
-  indented = (lead >= 4 || substr(line, 1, 1) == "\t")
+  col = 0
+  for (i = 1; i <= length(line); i++) {
+    c = substr(line, i, 1)
+    if (c == " ") col++
+    else if (c == "\t") col += 4 - (col % 4)
+    else break
+  }
+  indented = (col >= 4)
   trimmed = line
   sub(/^[ \t]+/, "", trimmed)
   # A blockquote or a fence nested in a LIST ITEM is still a blockquote or a fence: `- > Closes #1`
@@ -4078,9 +4090,20 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
     flen = 0
     while (substr(trimmed, flen + 1, 1) == fch) flen++
     frest = substr(trimmed, flen + 1)
-    if (fence == 0) { fence = 1; fence_ch = fch; fence_len = flen }
-    else if (fch == fence_ch && flen >= fence_len && frest ~ /^[ \t]*$/) { fence = 0 }
-    quoted = 1
+    if (fence == 0) {
+      # A BACKTICK opener carries no backtick in its info string. Such a line opens nothing, so
+      # treating it as an opener left the rest of the body in a phantom block and reported ordinary
+      # prose as fenced (review round 6). A tilde fence has no such rule.
+      if (fch != "`" || index(frest, "`") == 0) {
+        fence = 1
+        fence_ch = fch
+        fence_len = flen
+        quoted = 1
+      }
+    } else if (fch == fence_ch && flen >= fence_len && frest ~ /^[ \t]*$/) {
+      fence = 0
+      quoted = 1
+    }
   }
   if (fence) quoted = 1
   if (!indented && trimmed ~ /^>/) quoted = 1
@@ -4115,8 +4138,45 @@ multi_close_say() { # <line...>; joined like warn's, so a continued line stays o
 MULTI_CLOSE_LAST=""
 MULTI_CLOSE_HAVE=""
 
+# GitHub applies a body keyword when the PR merges into the repository DEFAULT branch, and not
+# otherwise. A PR landing on a release or staging branch closes nothing, so a warning there names
+# issues this merge leaves open and offers to reopen issues that were never closed (review round 6)
+# -- which is the one thing this scan may never do. Read once per merge and cached, because the
+# authoritative scan now runs before every merge attempt.
+#
+# yes / no / unknown. UNKNOWN is not "no": an unread comparison cannot say the keyword is inert, so
+# the findings are still printed, with the doubt on the line. That is the same rule the body read
+# itself follows -- a read that failed is not a clean body.
+MULTI_CLOSE_BINDS=""
+multi_close_binds() { # <pr>; sets MULTI_CLOSE_BINDS
+  [ -z "$MULTI_CLOSE_BINDS" ] || return 0
+  local base def
+  base=$(gh_retry read api "repos/$REPO/pulls/$1" --jq '.base.ref // ""')
+  if [ $? -ne 0 ] || [ -z "$base" ]; then
+    MULTI_CLOSE_BINDS=unknown
+    return 0
+  fi
+  def=$(gh_retry read api "repos/$REPO" --jq '.default_branch // ""')
+  if [ $? -ne 0 ] || [ -z "$def" ]; then
+    MULTI_CLOSE_BINDS=unknown
+    return 0
+  fi
+  MULTI_CLOSE_BASE="$base"
+  MULTI_CLOSE_DEFAULT="$def"
+  if [ "$base" = "$def" ]; then MULTI_CLOSE_BINDS=yes; else MULTI_CLOSE_BINDS=no; fi
+  return 0
+}
+MULTI_CLOSE_BASE=""
+MULTI_CLOSE_DEFAULT=""
+
 warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a merge is a gate
   local body scan rc class cnt refs sent n=0 again="${2:-}"
+  # Nothing to say when nothing can close: on a PR that does not target the default branch the
+  # body's keywords are inert, and saying otherwise would be the false positive this scan exists
+  # to avoid making. Silent rather than one-line-noisy, because a base that never closes anything
+  # has nothing about it worth repeating on every merge.
+  multi_close_binds "$1"
+  [ "$MULTI_CLOSE_BINDS" != no ] || return 0
   body=$(gh_retry read api "repos/$REPO/pulls/$1" --jq '.body // ""')
   rc=$?
   # A read that FAILED is not a body with nothing in it. Say so, or the silence below is read as a
@@ -4186,6 +4246,11 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
     "own reference names"
   multi_close_say "  (gh issue reopen <n> --repo <owner>/<name>; a bare #<n> is $REPO), and fix" \
     "the body."
+  if [ "$MULTI_CLOSE_BINDS" = unknown ]; then
+    multi_close_say "  Whether these bind at all could NOT be read: a body keyword closes only on a" \
+      "merge into the repository default"
+    multi_close_say "  branch, and the comparison failed ($(gh_err_line)). Unread is not inert."
+  fi
   multi_close_say "  This is a WARNING and not a gate: one sentence closing two issues is" \
     "sometimes exactly what was meant,"
   multi_close_say "  and nothing readable from here tells that apart from the accident."

@@ -34,6 +34,9 @@ RUN_REASON="every run for the head finished and was judged" # what the run list 
 MERGE_STATE="merged=true state=MERGED" # what REST says after the merge call
 MERGE_QUEUE=""                         # nonempty = the base has a merge queue
 MERGE_NOT_MERGEABLE=""                 # nonempty = the FIRST pr merge call fails as not mergeable
+PR_BASE=main                           # the branch this PR targets
+DEFAULT_BRANCH=main                    # the repository default branch
+DEFAULT_BRANCH_FAIL=""                 # nonempty = the default-branch read answers with a 404
 PR_BODY="A body with nothing to close."  # what the body read answers with
 PR_BODY_LATER=""                       # nonempty = what the SECOND body read on answers with
 BODY_FAIL=""                           # nonempty = the body read answers with a 404
@@ -68,7 +71,7 @@ gh() {
     # successor, so the two are told apart by `updated_at` rather than by field count.
     *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
     *'.head.sha'*) printf '%s\tbase-sha\tclaude/topic\n' "$CURRENT_HEAD" ;;
-    *'.base.ref'*) echo main ;;
+    *'.base.ref'*) printf '%s\n' "$PR_BASE" ;;
     *'.body'*)
       printf 'read\n' >>"$READS_FILE"
       if [ -n "$BODY_FAIL" ]; then
@@ -85,6 +88,13 @@ gh() {
     *'.mergeable'*) echo true ;;
     *) bail "unexpected pulls read: $*" ;;
     esac
+    ;;
+  "api repos/$REPO")
+    if [ -n "$DEFAULT_BRANCH_FAIL" ]; then
+      printf 'gh: Not Found (HTTP 404)\n' >&2
+      return 1
+    fi
+    printf '%s\n' "$DEFAULT_BRANCH"
     ;;
   "api graphql")
     case "$*" in
@@ -138,6 +148,9 @@ reset() {
   MERGE_STATE="merged=true state=MERGED"
   MERGE_QUEUE=""
   MERGE_NOT_MERGEABLE=""
+  PR_BASE=main
+  DEFAULT_BRANCH=main
+  DEFAULT_BRANCH_FAIL=""
   rm -f "$TEST_ROOT/merge-failed-once"
   PR_BODY="A body with nothing to close."
   PR_BODY_LATER=""
@@ -624,6 +637,100 @@ test_the_body_is_rescanned_before_a_retried_merge() {
     "the body added during the mergeability wait is reported"
 }
 
+# Review round 6, P2. A body keyword binds only on a merge into the repository DEFAULT branch. On a
+# PR targeting a release or staging branch it closes nothing, so warning there would name issues
+# this merge leaves open and offer to reopen issues that were never closed -- the one thing this
+# scan may never do.
+test_no_warning_when_the_base_is_not_the_default_branch() {
+  reset
+  PR_BODY='Closes #632 and #633
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #632 #633" "on the default branch it warns"
+  reset
+  PR_BODY='Closes #632 and #633
+'
+  PR_BASE=release-1.2
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge still lands ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "a keyword is inert on a merge into a non-default branch"
+}
+
+# ... and an unread comparison is not an inert one: the findings still print, with the doubt named.
+test_an_unread_default_branch_is_not_an_inert_keyword() {
+  reset
+  PR_BODY='Closes #634 and #635
+'
+  DEFAULT_BRANCH_FAIL=1
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge still lands ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #634 #635" "the findings still print"
+  assert_contains "$MERGE_STDOUT" "could NOT be read" "with the doubt on the line"
+}
+
+# Review round 6, P2. An owner or a repository may be NAMED `closed`, and the keyword boundary
+# accepted the `/` that follows it -- so a sentence carrying no closing directive at all produced a
+# two-issue warning with reopen guidance.
+test_a_repository_named_like_a_keyword_is_not_a_keyword() {
+  reset
+  PR_BODY='See closed/tracker#636 and closed/tracker#637 for context.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "a keyword that is a path component is not a directive"
+}
+
+# Review round 6, P2. Owner and repository names are case-insensitive on GitHub, so two spellings
+# of one reference are one issue.
+test_reference_case_does_not_make_a_second_issue() {
+  reset
+  PR_BODY='Closes Other/Tracker#638 and other/tracker#638
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "two spellings of one reference are one issue"
+}
+
+# Review round 6, P2. Indentation is COLUMNS: a tab advances to the next stop, so one to three
+# spaces before one still reach column four, which is code and not a blockquote.
+test_a_tab_after_spaces_is_still_code_indentation() {
+  reset
+  PR_BODY=$(printf 'An indented example:\n\n  \t> Closes #639\n\nCloses #640 and #641\n')
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_STDOUT" "639" "two spaces then a tab is column four, so code"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #640 #641" "the ordinary line still reads"
+}
+
+# Review round 6, P2. A backtick opener carries no backtick in its info string; such a line opens
+# nothing, and treating it as an opener left the rest of the body in a phantom fenced block.
+test_an_invalid_backtick_opener_opens_no_fence() {
+  reset
+  PR_BODY='An invalid opener:
+
+```bad`info
+
+Closes #642
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "the plain line after an invalid opener is not fenced"
+  # A valid opener still opens one.
+  PR_BODY='A valid opener:
+
+```markdown
+Closes #643
+```
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #643" \
+    "a valid info string still opens a fence"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -653,6 +760,12 @@ tests=(
   test_a_schemeless_link_is_not_an_issue_reference
   test_the_local_qualified_spelling_is_the_same_issue
   test_the_body_is_rescanned_before_a_retried_merge
+  test_no_warning_when_the_base_is_not_the_default_branch
+  test_an_unread_default_branch_is_not_an_inert_keyword
+  test_a_repository_named_like_a_keyword_is_not_a_keyword
+  test_reference_case_does_not_make_a_second_issue
+  test_a_tab_after_spaces_is_still_code_indentation
+  test_an_invalid_backtick_opener_opens_no_fence
 )
 
 run_tests "${tests[@]}"
