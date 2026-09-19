@@ -1069,6 +1069,44 @@ printf '\n```bash\n~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh a b c 
 expect "...and a continuation past a separator is not the helper's either" 0 \
   "$CLEANUP_AGREE" -- "$CP" "$R"
 
+# Round 2, P2 x6: the shell's word boundaries, as far as the reader models them. Each is a shape
+# that let an unlisted option through (or refused a valid helper), and each is a line the prompt
+# could plausibly come to hold.
+# A second invocation after the separator is searched for too.
+cleanup_tree
+printf '\n```bash\ngh pr view; ~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh a b c --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "an invocation chained AFTER another command is still read" 1 \
+  "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --base main && ~/x/post-merge-cleanup.sh a b c --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...and a second invocation of the helper on one line" 1 "passes '--keep-branch'" -- "$CP" "$R"
+# A redirection's ampersand ends no command.
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c 2>&1 --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "an option after a redirection is still the helper's" 1 "passes '--keep-branch'" -- "$CP" "$R"
+# A quoted command word is the command.
+cleanup_tree
+printf '\n```bash\n"$HOME/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh" a b c --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a quoted helper path is still the helper" 1 "passes '--keep-branch'" -- "$CP" "$R"
+# A fence indented up to three blanks is a fence.
+cleanup_tree
+printf '\n   ```bash\n   ~/x/post-merge-cleanup.sh a b c --keep-branch\n   ```\n' >> "$R/$CLEANUP_PROMPT"
+expect "an indented fence is a fence" 1 "passes '--keep-branch'" -- "$CP" "$R"
+# The token is the whole word: a suffix the helper's parser refuses is not the listed prefix.
+cleanup_tree
+cleanup_edit "$CLEANUP_PROMPT" "${CLEANUP_LINE}s/--base main/--base_branch main/"
+expect "a misspelled option is reported whole, not truncated to its listed prefix" 1 \
+  "passes '--base_branch'" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_PROMPT" "${CLEANUP_LINE}s/--base main/--base=main/"
+expect "...and so is the = spelling, which the helper does not take" 1 "passes '--base=main'" -- "$CP" "$R"
+# `<<-` strips leading tabs from the body and the delimiter, and so does the reader.
+cleanup_tree
+TAB=$(printf '\t')
+cleanup_edit "$CLEANUP_HELPER" "/<<'EOF'/,/^EOF\$/{ s/<<'EOF'/<<-'EOF'/; /<<-'EOF'/!s/^/${TAB}/; }"
+expect "a <<- heredoc with a tab-indented body and delimiter is still the listing" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+
 # The listing side is a mention, verbatim, anywhere in the prompt: the option's command lines
 # deleted and its prose kept still names it. That is the residue this check states rather than
 # hides -- a name present says nothing about whether the prose around it is true.

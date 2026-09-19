@@ -915,7 +915,9 @@ check_drift_guard() {
 # LISTS is named, verbatim, somewhere in the prompt, and every `--option` the prompt PASSES to the
 # helper is one usage() lists. What is an option OF the helper, on the prompt's side, is a line
 # shape and not a judgement: the helper's command lines -- a line inside a backtick fence naming
-# `post-merge-cleanup.sh`, and every line a trailing backslash continues it onto. A `--flag` in
+# `post-merge-cleanup.sh`, from that name to the first shell separator, and every line a trailing
+# backslash continues it onto. The shell's grammar is modelled only as far as those shapes (see
+# `invocation_options` for what is and is not: separators, redirections, quotes). A `--flag` in
 # prose, or on some other command's line (`gh pr merge --delete-branch`, the test runner's
 # `--list`), is attributed to nothing, so an option the prompt explains but never passes is not
 # held to the register from that side. And a name present is a name present: whether the prose
@@ -938,12 +940,18 @@ usage_options() {
     # nonempty -- an agreement over half the list.
     infn && !inhd && /^\}/ { exit }
     infn && !inhd && match($0, /<<-?[[:space:]]*["'"'"']?[A-Za-z_][A-Za-z_0-9]*["'"'"']?[[:space:]]*$/) {
-      d = substr($0, RSTART, RLENGTH); sub(/^<<-?/, "", d); gsub(/["'"'"'[:space:]]/, "", d)
+      d = substr($0, RSTART, RLENGTH); dash = (d ~ /^<<-/)
+      sub(/^<<-?/, "", d); gsub(/["'"'"'[:space:]]/, "", d)
       inhd = 1; next
     }
-    inhd && $0 == d { inhd = 0; next }
-    inhd && match($0, /^  --[A-Za-z0-9][A-Za-z0-9-]*([[:space:]]|$)/) {
-      o = substr($0, 3, RLENGTH - 2); sub(/[[:space:]]$/, "", o); print o
+    inhd {
+      l = $0
+      # `<<-` strips leading tabs from the body and the delimiter, so this reader does too.
+      if (dash) sub("^\t+", "", l)
+      if (l == d) { inhd = 0; next }
+      if (match(l, /^  --[A-Za-z0-9][A-Za-z0-9-]*([[:space:]]|$)/)) {
+        o = substr(l, 3, RLENGTH - 2); sub(/[[:space:]]$/, "", o); print o
+      }
     }
   ' "$1"
 }
@@ -956,25 +964,39 @@ usage_options() {
 # command the prompt tells the agent to run is fenced.
 invocation_options() {
   awk '
-    /^```/ { fence = !fence; cont = 0; next }
+    # A fence may stand up to three blanks in, as CommonMark allows.
+    /^ {0,3}```/ { fence = !fence; cont = 0; next }
     !fence { cont = 0; next }
     {
       line = $0
-      if (!cont) {
-        # The helper'"'"'s own simple command starts at its name, so a command chained BEFORE it
-        # on the line contributes nothing.
-        if (!match(line, /(^|[\/[:space:]])post-merge-cleanup\.sh([[:space:]]|$)/)) next
-        line = substr(line, RSTART)
-      }
-      cont = (line ~ /\\[[:space:]]*$/)
-      # ...and it ends at the first shell separator -- `;`, `&&`, `||`, `|`, `&` -- after which
-      # the `--json` of a chained `gh` is that command'"'"'s, and no continuation is the helper'"'"'s
-      # either. Quoting is not modelled: a separator inside a quoted argument ends the read
-      # early, which drops options rather than inventing them.
-      if (match(line, /[;&|]/)) { line = substr(line, 1, RSTART - 1); cont = 0 }
-      while (match(line, /(^|[[:space:]])--[A-Za-z0-9][A-Za-z0-9-]*/)) {
-        tok = substr(line, RSTART, RLENGTH); sub(/^[[:space:]]/, "", tok); print tok
-        line = substr(line, RSTART + RLENGTH)
+      # A redirection is not a separator: `2>&1`, `>&2`, `<&0`, `&>log` carry an `&` that ends no
+      # command, so they are blanked before the separators are read.
+      gsub(/[0-9]*[<>]&[0-9-]*/, " ", line); gsub(/&>>?/, " ", line)
+      while (1) {
+        if (!cont) {
+          # The helper'"'"'s own simple command starts at its name -- a path component or a word,
+          # closed by a blank, a shell quote or the end of the line -- so a command chained
+          # BEFORE it contributes nothing.
+          if (!match(line, /(^|[\/[:space:]])post-merge-cleanup\.sh([[:space:]"'"'"']|$)/)) break
+          line = substr(line, RSTART)
+        }
+        cont = (line ~ /\\[[:space:]]*$/)
+        # ...and it ends at the first shell separator -- `;`, `&&`, `||`, `|`, `&` -- after which
+        # the `--json` of a chained `gh` is that command'"'"'s and no continuation is the helper'"'"'s;
+        # what follows the separator is searched again, since a second invocation may stand
+        # there. Quoting is not modelled: a separator inside a quoted argument ends the read
+        # early, which drops options rather than inventing them, and a `--word` inside a quoted
+        # argument is read as passed, which refuses rather than accepts.
+        rest = ""
+        if (match(line, /[;&|]/)) { rest = substr(line, RSTART + 1); line = substr(line, 1, RSTART - 1); cont = 0 }
+        # A token is the WHOLE shell word: `--base_branch` is not `--base` with a suffix, and
+        # `--base=main` is a spelling the helper does not take, so both are reported as passed.
+        while (match(line, /(^|[[:space:]])--[^[:space:]]+/)) {
+          tok = substr(line, RSTART, RLENGTH); sub(/^[[:space:]]/, "", tok); print tok
+          line = substr(line, RSTART + RLENGTH)
+        }
+        if (rest == "") break
+        line = rest; cont = 0
       }
     }
   ' "$1"
