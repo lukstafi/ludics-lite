@@ -120,12 +120,13 @@ jobs:
 # The tip read answers TIP until the wait has run TIP_AT_ROUND rounds, and TIP_NEXT from then on:
 # how a case moves the branch between the round's own tip read and everything that round does
 # after it, the settle's and the breaks' re-confirms included. Set through `at_round` below. The
-# counters live in FILES because every one of these reads happens inside a command substitution,
-# where an incremented variable would die with the subshell. ROUND_READS is the round counter
-# itself: one line per read of the first listed workflow's runs feed, which is one per round.
+# round counter is the lib's `fixture_call_count rounds`: a file, not a variable, because every
+# one of these reads happens inside a command substitution, where an incremented variable would
+# die with the subshell (test-pr-review-lib.sh, "counting a fixture's calls"). One count per read
+# of the first listed workflow's runs feed, which is one per round; `rounds_polled` below reads
+# it back.
 TIP_AT_ROUND=""
 TIP_NEXT=""
-ROUND_READS="$TEST_ROOT/rounds"
 # The first listed workflow's id, cached: it is read off WORKFLOWS_JSON, which a case sets after
 # reset_fixture, and every read that would compute it happens in a command substitution of its
 # own. Cleared with the rest of the fixture.
@@ -196,7 +197,7 @@ reset_fixture() {
   : >"$PAGINATE_LOG"
   TIP_AT_ROUND=""
   TIP_NEXT=""
-  : >"$ROUND_READS"
+  fixture_call_reset rounds
   rm -f "$FIRST_WID_CACHE"
   # The wait loop's clocks, for the one case that takes more than a single round.
   retune ABSENT_GRACE=300 CHECKS_INTERVAL=1 CHECKS_HEARTBEAT=600
@@ -239,7 +240,9 @@ gh() {
     # round, so the FIRST listed workflow's read is one per round and nothing else here is.
     # (A fixture whose first workflow is advisory would never be read, and would count no
     # rounds — no case lists one, and `is_advisory` is pr-review.sh's own test for it.)
-    [ "$wid" != "$(first_wid)" ] || printf 'x\n' >>"$ROUND_READS"
+    # `|| return 1`: the fixture runs in gh_retry's command substitution, which does not inherit
+    # errexit, so a count that bails must be turned into a failed read by hand.
+    [ "$wid" != "$(first_wid)" ] || fixture_call_count rounds >/dev/null || return 1
     response=$(runs_of "$wid")
     [ -n "$response" ] || response=$(runs_json "$wid" '[]')
     ;;
@@ -335,7 +338,7 @@ delays_taken() { wc -l <"$DELAY_LOG" | tr -d ' '; }
 # non-advisory workflow's runs exactly once per round. Counting the runs feed as a whole would
 # multiply by the number of workflows a case lists; counting tip reads would add the re-confirm
 # read that only some breaks perform.
-rounds_polled() { wc -l <"$ROUND_READS" | tr -d ' '; }
+rounds_polled() { fixture_call_total rounds; }
 
 # at_round <n> <sha>: from the <n>th round on, the branch tip answers <sha>. The move lands
 # between that round's own tip read and everything the round does after it — which is where a
