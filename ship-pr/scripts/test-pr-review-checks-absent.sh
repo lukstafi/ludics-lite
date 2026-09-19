@@ -81,6 +81,12 @@ WORKFLOW_DIR_OTHER=""
 MERGED_PRS_JSON=""
 SAMPLE_CHECKS_JSON=""
 SAMPLE_CHECKS_TOTAL=""
+# Branches of THIS repository that the head is the head of. A push to any of them carries the same
+# SHA, so a `branches:` list one of them matches is a trigger in reach whatever the PR's own ref is.
+BRANCHES_AT_HEAD=""
+# What the PR read answers with from its SECOND call on: a retarget, or a base advance, which moves
+# the evidence the recognition rests on without moving the head.
+PR_BASE_NEXT=""
 COMPARE_COMMITS=""
 FILES_JSON=""
 
@@ -153,6 +159,19 @@ next_of() {
   eval "printf '%s' \"\${${name}[$idx]}\""
 }
 
+# The base the PR read answers with: PR_BASE until PR_BASE_NEXT is set, and that from the SECOND
+# call on — how a case retargets the PR, or advances its base, between the round's first read and
+# the recognition's own re-confirm. The count lives in a FILE for the reason every other counter
+# here does: each read is a command substitution, where an incremented variable dies.
+next_base() {
+  local n
+  [ -n "$PR_BASE_NEXT" ] || { printf '%s' "$PR_BASE"; return 0; }
+  n=$(cat "$TEST_ROOT/pulls.calls" 2>/dev/null) || n=0
+  case "$n" in '' | *[!0-9]*) n=0 ;; esac
+  printf '%s' "$((n + 1))" >"$TEST_ROOT/pulls.calls"
+  if [ "$n" -eq 0 ]; then printf '%s' "$PR_BASE"; else printf '%s' "$PR_BASE_NEXT"; fi
+}
+
 reset_fixture() {
   HEAD_SEQ=("$HEAD_SHA")
   CHECK_RUNS_SEQ=("$(check_runs_json '[]')")
@@ -176,9 +195,11 @@ reset_fixture() {
     '[{merged_at:"2026-09-18T00:00:00Z", head:{sha:$s}}]')
   SAMPLE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}}]')
   SAMPLE_CHECKS_TOTAL=""
+  BRANCHES_AT_HEAD='[]'
+  PR_BASE_NEXT=""
   COMPARE_COMMITS=$(jq -cn --arg h "$HEAD_SHA" '[$h]')
   FILES_JSON='[{"filename":"docs/notes.md"}]'
-  rm -f "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls" "$TEST_ROOT/HEAD_SEQ.calls"
+  rm -f "$TEST_ROOT/pulls.calls" "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls" "$TEST_ROOT/HEAD_SEQ.calls"
   retune ABSENT_GRACE=300 CHECKS_INTERVAL=1 CHECKS_HEARTBEAT=600
   : >"$REQUEST_LOG"
   : >"$PAGINATE_LOG"
@@ -205,11 +226,11 @@ gh() {
     if [ "$fixture_head" = UNREADABLE ]; then return 1; fi
     if [ -n "$PR_UPDATED_AGE" ]; then
       response=$(jq -cn --arg sha "$fixture_head" --arg at "$(iso_ago "$PR_UPDATED_AGE")" \
-        --arg base "$PR_BASE" --arg ref "$PR_HEAD_REF" \
+        --arg base "$(next_base)" --arg ref "$PR_HEAD_REF" \
         '{head:({sha:$sha} + (if $ref == "" then {} else {ref:$ref} end)), updated_at:$at}
          + (if $base == "" then {} else {base:{sha:$base}} end)')
     else
-      response=$(jq -cn --arg sha "$fixture_head" --arg base "$PR_BASE" --arg ref "$PR_HEAD_REF" \
+      response=$(jq -cn --arg sha "$fixture_head" --arg base "$(next_base)" --arg ref "$PR_HEAD_REF" \
         '{head:({sha:$sha} + (if $ref == "" then {} else {ref:$ref} end))}
          + (if $base == "" then {} else {base:{sha:$base}} end)')
     fi
@@ -257,6 +278,9 @@ gh() {
   "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
   "repos/$REPO/pulls?state=closed&sort=updated&direction=desc&per_page=20")
     response="$MERGED_PRS_JSON"
+    ;;
+  "repos/$REPO/commits/$HEAD_SHA/branches-where-head")
+    response=$(jq -cn --argjson b "$BRANCHES_AT_HEAD" '[$b[] | {name:.}]')
     ;;
   "repos/$REPO/commits/$SAMPLE_SHA/check-runs?filter=latest&per_page=100")
     response=$(jq -c --arg t "$SAMPLE_CHECKS_TOTAL" \
@@ -693,6 +717,57 @@ test_a_base_side_workflow_edit_keeps_the_head_waiting() {
   assert_eq "$GATE_RC" 4 "the head's copy does not speak for the merge context"
   assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers"
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and nothing is settled on the stale copy"
+}
+
+# --- review round 9 ---------------------------------------------------------------------------
+# Proving that the PR's own branch misses a `branches:` list does not prove that no push run can be
+# created for this COMMIT. A tag push at the same SHA creates one, and there is no ref name here to
+# test a tag pattern against; and a branch other than the PR's that carries this SHA as its head
+# matches the list on its own account.
+test_a_push_reachable_through_another_ref_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML='name: ci
+on:
+  pull_request:
+    paths-ignore: ["docs/**", "**.md"]
+  push:
+    branches: [main]
+    tags: ["v*"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a tag filter is a ref namespace with no candidate name to test"
+  assert_contains "$GATE_OUTPUT" "creation grace" "so the grace answers"
+  # No tag filter, but the commit is also the head of a branch the list DOES match.
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  BRANCHES_AT_HEAD='["main"]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "another branch at this SHA reaches the trigger on its own account"
+  # And the ordinary shape: the SHA is the head of the PR's branch alone.
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  BRANCHES_AT_HEAD='["claude/topic"]'
+  run_gate
+  assert_eq "$GATE_RC" 0 "the PR's own branch is the one the filter was read against"
+}
+
+# The BASE is evidence here — the workflow bodies, the file inventory and the merge base all came
+# from it — and a PR can be RETARGETED, or its base advance, with the head untouched. The caller's
+# head-only revalidation would not notice, and `--match-head-commit` does not bind the base either.
+test_a_base_that_moves_under_the_recognition_settles_nothing() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  PR_BASE_NEXT=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+  run_gate
+  assert_eq "$GATE_RC" 4 "evidence about a target the PR no longer has settles nothing"
+  assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and nothing is called absent on it"
 }
 
 # --- review round 8 ---------------------------------------------------------------------------
@@ -1385,6 +1460,8 @@ tests=(
   test_a_workflow_the_list_calls_advisory_is_still_explained
   test_a_capped_workflow_directory_keeps_the_head_waiting
   test_a_deleted_workflow_still_in_the_merge_context_is_examined
+  test_a_push_reachable_through_another_ref_keeps_the_head_waiting
+  test_a_base_that_moves_under_the_recognition_settles_nothing
   test_a_second_check_provider_keeps_the_head_waiting
   test_an_advisory_provider_does_not_block_the_recognition
   test_a_sample_without_checks_keeps_the_head_waiting

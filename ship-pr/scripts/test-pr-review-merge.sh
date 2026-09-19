@@ -53,8 +53,12 @@ gh() {
   case "${1:-} ${2:-}" in
   "api repos/$REPO/pulls/7")
     case "$*" in
-    *'select(type'*) echo "$CURRENT_HEAD" ;;
-    *'.head.sha'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\n' ;;
+    # The gate reads the PR twice per round with DIFFERENT projections: `updated_at` rides on the
+    # first, which binds the head, and the revalidation at the end of the round asks for the head,
+    # the base and the head ref alone. The revalidation is the one that can answer with a
+    # successor, so the two are told apart by `updated_at` rather than by field count.
+    *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
+    *'.head.sha'*) printf '%s\tbase-sha\tclaude/topic\n' "$CURRENT_HEAD" ;;
     *'.base.ref'*) echo main ;;
     *merged=*) echo "$MERGE_STATE" ;;
     *) bail "unexpected pulls read: $*" ;;

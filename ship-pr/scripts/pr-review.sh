@@ -3270,7 +3270,7 @@ run_red_is_advisory_only() {
 }
 
 run_signal() {
-  local sha="$1" pr_at="${2:-}" checks="${3:-0}" base_sha="${4:-}" head_ref="${5:-}"
+  local sha="$1" pr_at="${2:-}" checks="${3:-0}" base_sha="${4:-}" head_ref="${5:-}" pr="${6:-}"
   local raw rc rid wid event name status concl
   local seen_ids=" " red_rows="" rname rconcl created
   local runs=0 inflight=0 nogo=0 red=0 red_note="" pushed_at age seen
@@ -3415,7 +3415,7 @@ run_signal() {
   # DID get a run is never asked, since a run existed and no filter explains its silence
   # (ludics-lite#176). The refusal costs exactly what it cost before: this grace.
   if [ "$runs" -eq 0 ] && [ "$age" -lt "$ABSENT_GRACE" ] &&
-    head_within_paths_ignore "$sha" "$base_sha" "$head_ref"; then
+    head_within_paths_ignore "$pr" "$sha" "$base_sha" "$head_ref"; then
     run_reason 0 "no workflow run exists for this head, and none can be created by" \
       " $PATHS_IGNORE_WHY: every trigger of theirs that this change fires is either filtered" \
       " out by its own paths-ignore — every commit from the merge base up changes only ignored" \
@@ -3449,10 +3449,18 @@ gate_checks() {
   # The PR's base SHA rides along for the same reason `updated_at` does: it costs no extra call,
   # and run_signal needs it to ask whether a run for a run-less head can be created at all — the
   # range it walks starts at this head's merge base with the base branch (ludics-lite#176).
+  # EVERY field gets the placeholder, not just the ones that can be null. An empty string is not
+  # null, so `// "-"` alone leaves it empty — and one empty field COLLAPSES under tab-IFS `read`,
+  # shifting every later field into the slot before it. With `.head.sha` leading, a PR read
+  # answering with an empty head would put `updated_at` into `sha` and sail past the emptiness
+  # check below. That is the same trap build_checks' own placeholder documents; it just had one
+  # field to lose before and has four now.
   lines=$(gh_retry read api "repos/$REPO/pulls/$pr" \
-    --jq '[.head.sha, (.updated_at // "-"), (.base.sha // "-"), (.head.ref // "-")] | @tsv')
+    --jq '[(.head.sha // "-"), (.updated_at // "-"), (.base.sha // "-"), (.head.ref // "-")]
+          | map(if type == "string" and length > 0 then . else "-" end) | @tsv')
   rc=$?
   IFS=$'\t' read -r sha pr_at base_sha head_ref <<<"$lines"
+  [ "${sha:--}" != - ] || sha=""
   [ "${pr_at:--}" != - ] || pr_at=""
   [ "${base_sha:--}" != - ] || base_sha=""
   [ "${head_ref:--}" != - ] || head_ref=""
@@ -3486,7 +3494,7 @@ gate_checks() {
     # where the honest answer to "is there a signal here" is 4, not a 0 the merge gate would take
     # for "nothing is red".
     if [ "$VERDICT" != red ]; then
-      run_info=$(run_signal "$sha" "$pr_at" "$CHECK_TOTAL" "$base_sha" "$head_ref")
+      run_info=$(run_signal "$sha" "$pr_at" "$CHECK_TOTAL" "$base_sha" "$head_ref" "$pr")
       rc=$?
       run_why="${run_info#*$'\t'}"
       case "$rc" in
@@ -3511,9 +3519,18 @@ gate_checks() {
     fi
     # Revalidate every observation, including a terminal green or stopped old head. This
     # never follows the successor: the checks and merge binding remain about the original SHA.
-    current_sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq \
-      '.head.sha | select(type == "string" and length > 0)')
+    # The base and the head ref ride along, refreshed for the NEXT round: a retarget or a base
+    # advance moves the evidence the paths-ignore recognition rests on without moving the head
+    # (review round 9). The recognition re-confirms them itself before it settles anything, so a
+    # move mid-round costs a round rather than a wrong absence.
+    lines=$(gh_retry read api "repos/$REPO/pulls/$pr" \
+      --jq '[(.head.sha // "-"), (.base.sha // "-"), (.head.ref // "-")]
+            | map(if type == "string" and length > 0 then . else "-" end) | @tsv')
     rc=$?
+    IFS=$'\t' read -r current_sha base_sha head_ref <<<"$lines"
+    [ "${current_sha:--}" != - ] || current_sha=""
+    [ "${base_sha:--}" != - ] || base_sha=""
+    [ "${head_ref:--}" != - ] || head_ref=""
     if [ "$rc" -ne 0 ] || [ -z "$current_sha" ] || [ "$current_sha" = null ]; then
       VERDICT=unknown
       warn "could not re-read $REPO#$pr's head SHA; the build signal is UNKNOWN."
@@ -4821,31 +4838,55 @@ providers_are_actions_only() {
   [ "$seen" -gt 0 ]
 }
 
-# push_cannot_reach <workflow body> <head ref>: true when a push to this branch does not reach the
-# workflow's `push` trigger, because it declares a `branches:` list and the branch matches none of
-# its patterns. False for every other shape, including every shape this cannot read.
+# push_cannot_reach <workflow body> <head ref> <head sha>: true when NO push can reach the
+# workflow's `push` trigger with this commit — it declares a `branches:` list, declares no tag
+# filter, and no ref that carries this SHA as its head matches any of the branch patterns. False
+# for every other shape, including every shape this cannot read.
+#
+# The SHA half is review round 9's, and the finding was exact: proving that the PR's own branch
+# misses the list does not prove that no push run can be created for this commit. A `tags:` beside
+# the branches means a tag push at this SHA creates one, and a branch OTHER than the PR's that
+# carries this SHA as its head matches the list on its own account. Both are read rather than
+# assumed away: a tag filter of any kind refuses outright (there is no ref name to test a tag
+# pattern against — the PR has none), and the branch patterns are tested against every branch this
+# repository reports the commit at the head of, the PR's own ref included since a fork's branch is
+# in no listing of this repository's.
 push_cannot_reach() {
-  local body="$1" ref="$2" brs pat ere
+  local body="$1" ref="$2" sha="$3" brs refs pat ere r
   [ -n "$ref" ] || return 1
   # A branches-ignore: is a different filter with the opposite sense, and a workflow carrying one
-  # is not described by the list above it. Present at all is a refusal.
+  # is not described by the list above it. A tags:/tags-ignore: is a whole other ref namespace
+  # this has no candidate name for. Either present at all is a refusal.
   awk -v q="'" -v dq='"' -v want=push -v seq=branches-ignore \
+    "$WORKFLOW_YAML_FILTER" <<<"$body" >/dev/null 2>&1 && return 1
+  awk -v q="'" -v dq='"' -v want=push -v seq=tags \
+    "$WORKFLOW_YAML_FILTER" <<<"$body" >/dev/null 2>&1 && return 1
+  awk -v q="'" -v dq='"' -v want=push -v seq=tags-ignore \
     "$WORKFLOW_YAML_FILTER" <<<"$body" >/dev/null 2>&1 && return 1
   brs=$(awk -v q="'" -v dq='"' -v want=push -v seq=branches \
     "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
   [ -n "$brs" ] || return 1
+  # Every branch of THIS repository that the commit is the head of. A fork's branch is in none of
+  # them, which is why the PR's own ref is added rather than looked up. An unreadable answer is no
+  # answer, and refuses.
+  refs=$(gh_retry read api "repos/$REPO/commits/$sha/branches-where-head" --jq '.[].name') ||
+    return 1
+  refs="$ref"$'\n'"$refs"
   # Branch patterns use the same glob vocabulary the path filters do, so the same translation
   # reads them — and refuses, here as there, any pattern it does not carry: one read too narrowly
-  # would report "cannot reach" for a trigger the branch does match.
+  # would report "cannot reach" for a trigger some ref does match.
   while IFS= read -r pat; do
     [ -n "$pat" ] || continue
     ere=$(glob_ere "$pat") || return 1
-    printf '%s' "$ref" | grep -Eq -- "$ere" && return 1
+    while IFS= read -r r; do
+      [ -n "$r" ] || continue
+      printf '%s' "$r" | grep -Eq -- "$ere" && return 1
+    done <<<"$refs"
   done <<<"$brs"
   return 0
 }
 
-# head_within_paths_ignore <head sha> <PR base sha> <PR head ref>: true when NO workflow of this
+# head_within_paths_ignore <pr> <head sha> <PR base sha> <PR head ref>: true when NO workflow of this
 # repository can produce a run for this PR head — every trigger of every one of them is either one
 # this change cannot fire, one this branch cannot reach, or one whose paths-ignore covers every
 # commit the head adds over the merge base. The reason goes into PATHS_IGNORE_WHY.
@@ -4867,8 +4908,8 @@ push_cannot_reach() {
 # one workflow file. Nothing here is memoized, because run_signal is called from inside a command
 # substitution where an assignment dies with the subshell (the trap BASE_RED_DETAIL documents).
 head_within_paths_ignore() {
-  local head="$1" base="$2" ref="$3" mbase wf total rows wid wname wstate wpath body bbody
-  local rfiles declared bdeclared listed="" f evs ev pats why=""
+  local pr="$1" head="$2" base="$3" ref="$4" mbase wf total rows wid wname wstate wpath body bbody
+  local rfiles declared bdeclared listed="" f evs ev pats confirm why=""
   PATHS_IGNORE_WHY=""
   case "$head" in '' | *[!0-9a-f]*) return 1 ;; esac
   case "$base" in '' | *[!0-9a-f]*) return 1 ;; esac
@@ -4944,7 +4985,7 @@ head_within_paths_ignore() {
         [ -n "$pats" ] || return 1
         paths_ignore_covers "$pats" "$rfiles" || return 1
         ;;
-      push) push_cannot_reach "$body" "$ref" || return 1 ;;
+      push) push_cannot_reach "$body" "$ref" "$head" || return 1 ;;
       *) case " $HEAD_INERT_EVENTS " in *" $ev "*) ;; *) return 1 ;; esac ;;
       esac
     done <<<"$evs"
@@ -4959,6 +5000,16 @@ head_within_paths_ignore() {
     [ -n "$f" ] || continue
     grep -qxF -- "$f" <<<"$listed" || return 1
   done <<<"$declared"$'\n'"$bdeclared"
+  # The BASE is evidence here, not just the head — the workflow bodies, the file inventory and the
+  # merge base all came from it — and a PR can be RETARGETED, or its base advance, with the head
+  # untouched, which the caller's head-only revalidation would not notice and which
+  # `--match-head-commit` does not bind either (review round 9). So all three are re-read at the
+  # end and must be what they were: anything else, and this round's evidence is about a target the
+  # PR no longer has. The caller refreshes them for the next round, which then judges the new one.
+  confirm=$(gh_retry read api "repos/$REPO/pulls/$pr" \
+    --jq '[(.head.sha // "-"), (.base.sha // "-"), (.head.ref // "-")]
+          | map(if type == "string" and length > 0 then . else "-" end) | @tsv') || return 1
+  [ "$confirm" = "$head"$'\t'"$base"$'\t'"$ref" ] || return 1
   PATHS_IGNORE_WHY="$why"
   return 0
 }

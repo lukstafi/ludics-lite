@@ -702,10 +702,11 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   the gate), and only past that is `ABSENT` the verdict — with the evidence on the line. A head
   with **no run at all** skips that wait when no workflow of the repository can create one for it
   (ludics-lite#176). Every `pull_request` trigger's `paths-ignore` must cover every commit from the
-  PR's merge base up to the head; every `push` trigger must be out of this branch's reach (a
-  `branches:` list the head's branch matches none of), because a push event's files are computed
-  between its own before and after and after a force-push the before is not on that path, so no
-  filter describes it; and every other trigger must be one whose run can NEVER carry this commit as
+  PR's merge base up to the head; every `push` trigger must be out of reach of every ref that carries
+  this commit (a `branches:` list matched neither by the head's branch nor by any branch the commit
+  is the head of, and no tag filter at all), because a push event's files are computed between its
+  own before and after and after a force-push the before is not on that path, so no path filter
+  describes it; and every other trigger must be one whose run can NEVER carry this commit as
   its head — `merge_group`, created at the queue's own ref, and `workflow_call`, which produces no
   run of its own. Everything else refuses, `pull_request_target`, the review events, `schedule` and
   `workflow_dispatch` among them: each of those CAN put a run on this head, and an empty run list
@@ -722,7 +723,9 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   it cannot speak for a third-party provider. That last one is a filter and not an inventory — no
   endpoint enumerates a repository's providers — so the residual is a provider absent from that
   sample, and `--require-green`, which refuses `ABSENT` outright, is the hatch for a merge that
-  must have READ a green. Anything less than certain — an unparseable workflow, a pattern the
+  must have READ a green. The head SHA, the base SHA and the head ref are all re-read before the
+  verdict is accepted: a retarget, or a base that advances, moves the evidence all of this rests on
+  without moving the head, and `--match-head-commit` binds only the head. Anything less than certain — an unparseable workflow, a pattern the
   translation does not carry, a trigger with no filter, a list longer than its page on either read,
   a range past the cap, a base-side edit to the workflow, a second provider — refuses and costs the
   grace, exactly as `base --wait` does. The same grace is what

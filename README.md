@@ -566,8 +566,9 @@ default branch plus whatever has run, so it is no inventory of the merge context
 workflow-directory response at the Contents API's cap, a listed workflow the advisory NAME would
 once have skipped (those names have no ref, so they describe the default branch's copy and not the
 one that runs here), an unparseable workflow, an unreadable or truncated workflow list,
-a PR whose base SHA or branch did not come back, a push trigger the branch reaches (whose filter
-cannot describe a force-push's own diff), a `branches-ignore`, an event outside the inert list
+a PR whose base SHA or branch did not come back, a push trigger that any ref carrying this commit
+reaches (whose filter cannot describe a force-push's own diff), a tag filter, a `branches-ignore`,
+a base that moved under the recognition (a retarget moves the evidence without moving the head), an event outside the inert list
 (`pull_request_target`, the review events, `schedule` and `workflow_dispatch` among them), a base-side edit to the workflow (a
 `pull_request` run uses the merge context's copy, so the two sides must be identical), and a
 sampled merged PR whose check runs show a provider other than Actions, none at all, or more than
