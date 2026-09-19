@@ -820,6 +820,9 @@ review_comments() { # <pr> <review id>
 # and no `original_line` at all, carrying `position`/`original_position` instead — every such row
 # renders `:@<position>`, so an enumerating key collapsed two findings in one file (#86 round 1)
 # — and `side`/`start_line` do the same for a LEFT-vs-RIGHT or multi-line anchor (#86 round 2).
+# The RENDERING names them even so (`item_side`, `item_was` below, #113): the key and the header
+# have different jobs, and a key that must separate on a field nobody has heard of leaves the
+# header owing the reader every separation it CAN explain.
 #
 # `pull_request_review_id` is in the deny-list for a measured reason, not a tidy one: the reviewer
 # posts a separate COMMENTED review per inline comment (46 comments over 36 reviews on #39), so
@@ -837,6 +840,11 @@ POLL_ITEM_DEFS='
   def inline_commit: (.original_commit_id // .commit_id) | short;
   def review_commit: .commit_id | short;
   def item_path: .path // "?";
+  # The line half of an anchor: the range when the row carries a start, the line alone otherwise.
+  # A start equal to the end still renders as a range — GitHub refuses `start_line == line`, so
+  # the shape does not arise from the API, and collapsing it to a bare line would print a row the
+  # key separates on identically to one with no start at all.
+  def anchor($s; $l): if $s != null then "\($s)-\($l)" else "\($l)" end;
   # A row from the per-review comments endpoint (what poll reads while the flat feed lags a new
   # review) carries no `line` and no `original_line` at all, only `position`/`original_position`.
   # Rendering that as `0` printed an unknown location in the shape of a known one, and two rows
@@ -844,9 +852,55 @@ POLL_ITEM_DEFS='
   # round 1 of #86 from the eye. An unknown line says so (`?`), and a position says which field it is
   # (`@12`), so nothing downstream reads a location that was never served as a line number.
   def item_line: (.line // .original_line) as $l
-    | if $l != null then ($l | tostring)
+    | if $l != null then anchor((.start_line // .original_start_line); $l)
       else ((.position // .original_position) as $p
             | if $p != null then "@\($p)" else "?" end)
+      end;
+  # The rest of the anchor, in the `k=v` grammar the rest of the header already speaks
+  # (ludics-lite#113). The key above separates on `side`, `start_line`, `start_side` and
+  # `original_start_line` — #86 round 2 put them there because a LEFT-vs-RIGHT or multi-line
+  # anchor was folding two distinct findings into one — while the header named none of them, so a
+  # deletion commented on the left and an addition on the right at line 40 of one file printed two
+  # rows byte-identical apart from the id and correctly did not fold. That reads as the reviewer
+  # posting one finding twice and the fold failing to catch it, which is the mirror of the `:0`
+  # defect of #105 and costs the reader the same round: either the anchors are re-derived from the
+  # API by hand, or the fold stops being trusted, which is what the fold note exists to prevent.
+  #
+  # Only what is NOT the default prints. RIGHT is the side of every row that is not about a
+  # deleted line, and a `side=RIGHT` on every entry would be noise bought at the price of the one
+  # row where the side matters; `start_side` prints when it differs from the side of the end,
+  # the only case where naming one side reads a range wrong. A header cannot be a
+  # total discriminator for a deny-list key — the next field GitHub invents is in the key and not
+  # on this line, which is the direction the key is deliberately wrong in — so what this owes the
+  # reader is every anchor field the row actually carries, not a proof of distinctness.
+  def item_side:
+    (if (.side // "") == "LEFT" then " side=LEFT" else "" end)
+    + (if .start_side != null and .start_side != (.side // "RIGHT") then " start_side=\(.start_side)"
+       else "" end);
+  # Where the finding was WRITTEN, when that is not where it sits now. GitHub migrates `line` and
+  # `start_line` forward as the branch advances while the `original_*` pair stays put, and both
+  # pairs are in the key, so two findings written at different places can sit at one place today
+  # and print one header between them. The same rule as the side fields: it prints only when the
+  # row carries an original that differs from what was rendered.
+  #
+  # In whichever unit the row is anchored by. A row from the per-review endpoint has no line at
+  # all and migrates in `position`/`original_position` instead, both of them in the key, so it
+  # has the same defect one field over and gets the same token (review of #272, round 1). The two
+  # units are never mixed on one line: a position is a second name for a place a row with lines
+  # has already named, and the API computes it from the same diff, so a pair of rows agreeing on
+  # both line fields cannot disagree on it.
+  def item_was: (.line // .original_line) as $l
+    | if $l != null then
+        (.start_line // .original_start_line) as $s
+        | if (.original_line != null and .original_line != $l)
+            or (.original_start_line != null and .original_start_line != $s) then
+            " was=\(anchor(.original_start_line; (.original_line // $l)))"
+          else "" end
+      else
+        (.position // .original_position) as $p
+        | if $p != null and .original_position != null and .original_position != $p then
+            " was=@\(.original_position)"
+          else "" end
       end;
   def fold_key: del(.id, .node_id, .url, .html_url, .pull_request_url, .pull_request_review_id,
                     .created_at, .updated_at, .reactions, ._links, .body);
@@ -964,7 +1018,7 @@ cmd_poll() {
 
   jq -r "$POLL_ITEM_DEFS"'
     if length == 0 then "(no new inline comments)"
-    else .[] | "--- inline id=\(thread_list) \(item_path):\(item_line) commit=\(inline_commit) by \(.user.login)\(dupe_note)\n\(body_block)"
+    else .[] | "--- inline id=\(thread_list) \(item_path):\(item_line)\(item_side)\(item_was) commit=\(inline_commit) by \(.user.login)\(dupe_note)\n\(body_block)"
     end' <<<"$new_inline" || return 4
 
   # The connector's "Review Summary" placeholder is machine-tagged with an HTML comment and posted
