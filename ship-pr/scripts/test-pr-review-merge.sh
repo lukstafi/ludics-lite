@@ -511,6 +511,62 @@ test_the_same_issue_named_twice_is_one_issue() {
   assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #610 #611" "two distinct ones still warn"
 }
 
+# Review round 4, P2. Four leading spaces make an indented CODE block, which SKILL.md names as a
+# shape this scanner does not read. Stripping all leading whitespace made one a blockquote, so the
+# scan warned about the very example the documentation says it ignores -- and an indented fence
+# opened a phantom block that swallowed the ordinary text after it.
+test_four_space_indentation_is_not_a_quote_or_a_fence() {
+  reset
+  PR_BODY='An indented example, which is code and is not read:
+
+    > Closes #612
+    ```
+    Closes #613
+    ```
+
+Closes #614 and #615
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_STDOUT" "612" "an indented quote is code, not a blockquote"
+  assert_not_contains "$MERGE_STDOUT" "613" "and the indented fence opens nothing"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #614 #615" \
+    "the ordinary line after it is still read, so no phantom fence swallowed it"
+}
+
+# Review round 4, P2. The abbreviation rule protected every single character, digits included, so
+# an ordinary numeric sentence end held two sentences together and bound a reference from the next.
+test_a_digit_before_a_full_stop_still_ends_the_sentence() {
+  reset
+  PR_BODY='Closes #616 in version 2. See #617 for follow-up.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "a version number is a sentence end, not an abbreviation"
+  # The letter rule it was generalized from must survive.
+  PR_BODY='Closes #618 and, e.g. #619
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #618 #619" "e.g. is still protected"
+}
+
+# Review round 4, P2. GitHub numbers start at 1, so `#0` is prose -- and reopen advice for it would
+# point at an issue that does not exist.
+test_hash_zero_is_not_an_issue_reference() {
+  reset
+  PR_BODY='Closes #620; step #0 initializes the state.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" "#0 is not a second issue"
+  # A number that merely starts with a zero digit later is untouched.
+  PR_BODY='Closes #620 and #1024
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #620 #1024" "ordinary numbers still count"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -535,6 +591,9 @@ tests=(
   test_a_closing_quote_still_ends_the_sentence
   test_a_url_fragment_is_not_an_issue_reference
   test_the_same_issue_named_twice_is_one_issue
+  test_four_space_indentation_is_not_a_quote_or_a_fence
+  test_a_digit_before_a_full_stop_still_ends_the_sentence
+  test_hash_zero_is_not_an_issue_reference
 )
 
 run_tests "${tests[@]}"

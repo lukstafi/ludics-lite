@@ -3998,11 +3998,13 @@ function refs_of(unit,   rest, r, out, n, seen) {
   # reference to a HOST (review round 3). An issue bound through its full URL is a shape this
   # scanner does not read and SKILL.md says so, so blanking them keeps that boundary exact rather
   # than half-reading it. The owner is tightened for the same reason: a GitHub login carries only
-  # alphanumerics and hyphens, never the dots that let example.com pass as one.
+  # alphanumerics and hyphens, never the dots that let example.com pass as one. A number starts at
+  # 1, so `#0` is prose -- "step #0 initializes the state" was a second issue, and a nonexistent
+  # one at that (review round 4).
   rest = unit
   gsub(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^ \t]*/, " ", rest)
   out = ""; n = 0
-  while (match(rest, /(^|[^a-zA-Z0-9_])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[0-9]+/)) {
+  while (match(rest, /(^|[^a-zA-Z0-9_])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[1-9][0-9]*/)) {
     r = substr(rest, RSTART, RLENGTH)
     rest = substr(rest, RSTART + RLENGTH)
     sub(/^[^a-zA-Z0-9#]/, "", r)
@@ -4034,12 +4036,14 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
 # put back after it, because the split below would otherwise cut "Closes #1 and, e.g. #2" in two
 # and leave one reference on each side of the cut -- a silent miss of exactly the shape the scan
 # exists for (review round 1). The rule is the one that covers the class without a dictionary: a
-# period whose preceding alphanumeric run is a SINGLE character (e.g., i.e., initials, "§1."),
-# plus the handful of two- and three-letter forms that carry one. Splitting can only ever LOSE a
+# period whose preceding run is a SINGLE LETTER (e.g., i.e., initials), plus the handful of two-
+# and three-letter forms that carry one. A single DIGIT is excluded: "in version 2. See #3" is an
+# ordinary sentence end, and protecting it bound a reference from the NEXT sentence (review round
+# 4), while a digit-and-period that opens a line is a list marker, peeled as a container below. Splitting can only ever LOSE a
 # warning, so where the two readings differ this takes the one that splits LESS.
 function protect_abbrev(s,   out) {
   out = ""
-  while (match(s, /(^|[^a-zA-Z0-9])([a-zA-Z0-9]|cf|vs|al|no|eq|ch|fig|etc|resp)\./)) {
+  while (match(s, /(^|[^a-zA-Z0-9])([a-zA-Z]|cf|vs|al|no|eq|ch|fig|etc|resp)\./)) {
     out = out substr(s, 1, RSTART + RLENGTH - 2) "\002"
     s = substr(s, RSTART + RLENGTH)
   }
@@ -4048,12 +4052,22 @@ function protect_abbrev(s,   out) {
 {
   line = $0
   sub(/\r$/, "", line)
+  # Markdown keeps up to THREE leading spaces as ordinary indentation and makes four (or a tab) an
+  # indented CODE block. Stripping all of it turned `    > Closes #1` into a blockquote and warned
+  # about an example SKILL.md says this scanner does not read, and let an indented fence open a
+  # phantom block that swallowed the ordinary text after it (review round 4). An indented line is
+  # therefore neither quote nor fence; inside an already-open fence it is content, which the fence
+  # test below still catches. Indentation is counted from the LINE, not relative to a list item is
+  # container -- modelling that is a Markdown parser, and its absence can only lose a fence.
+  lead = 0
+  while (substr(line, lead + 1, 1) == " ") lead++
+  indented = (lead >= 4 || substr(line, 1, 1) == "\t")
   trimmed = line
   sub(/^[ \t]+/, "", trimmed)
   # A blockquote or a fence nested in a LIST ITEM is still a blockquote or a fence: `- > Closes #1`
   # renders as one, and leaving the marker in front made the `>` test miss it entirely (review
   # round 3). Markers are peeled repeatedly, so a quote two list levels down is reached too.
-  while (match(trimmed, /^([-*+][ \t]+|[0-9]+[.)][ \t]+)/)) {
+  while (!indented && match(trimmed, /^([-*+][ \t]+|[0-9]+[.)][ \t]+)/)) {
     trimmed = substr(trimmed, RLENGTH + 1)
     sub(/^[ \t]+/, "", trimmed)
   }
@@ -4066,7 +4080,7 @@ function protect_abbrev(s,   out) {
   # awks this fleet runs. A CLOSING fence also carries no info string -- only spaces or tabs may
   # follow its run -- so a content line that merely STARTS with the delimiter does not end the
   # block (review round 2); an opening fence may carry one, which is what ````markdown is.
-  if (substr(trimmed, 1, 3) == "```" || substr(trimmed, 1, 3) == "~~~") {
+  if (!indented && (substr(trimmed, 1, 3) == "```" || substr(trimmed, 1, 3) == "~~~")) {
     fch = substr(trimmed, 1, 1)
     flen = 0
     while (substr(trimmed, flen + 1, 1) == fch) flen++
@@ -4076,7 +4090,7 @@ function protect_abbrev(s,   out) {
     quoted = 1
   }
   if (fence) quoted = 1
-  if (trimmed ~ /^>/) quoted = 1
+  if (!indented && trimmed ~ /^>/) quoted = 1
   s = protect_abbrev(line)
   # A closing quote or bracket sits BETWEEN the terminator and the space often enough to matter:
   # requiring whitespace immediately after the full stop kept `... "Closes #1." See #2 ...` as one
