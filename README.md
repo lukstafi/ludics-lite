@@ -243,8 +243,11 @@ scratch-directory guards with their fixtures, about 25 seconds for the lot. A
 step whose interpreter this box lacks (`pwsh` on the macs) is a named SKIP rather than a failure;
 CI passes `--require-tools`, where the same absence is red. `preflight.sh steps` lists what it
 runs, `preflight.sh globs` the file list every sweep here is spelled from, and a single step runs
-alone (`preflight.sh shellcheck`) while you iterate. The workflow calls this script for those
-steps, so the two cannot drift, and `scripts/test-preflight.sh` pins that they have not.
+alone (`preflight.sh shellcheck`) while you iterate. `--as-ci` exports `GITHUB_ACTIONS=true` for
+the run, so a refusal prints the `::error file=` annotation the lint job prints and every step
+script sees the variable CI sets: a control that reads it by accident goes red at your prompt
+instead of on the push (PR #275). The workflow calls this script for those steps, so the two
+cannot drift, and `scripts/test-preflight.sh` pins that they have not.
 
 The scripts carry their own test suites (Python fixtures use `python3`; PowerShell fixtures run on Windows):
 

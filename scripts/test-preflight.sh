@@ -344,6 +344,13 @@ expect "a refusal reads as a sentence outside CI" 1 'preflight: scripts/ok.sh: s
   -- env -u GITHUB_ACTIONS "$PF" --root "$T" modes
 expect "...and as an annotation on the file's line under GitHub Actions" \
   1 '::error file=scripts/ok.sh::' -- env GITHUB_ACTIONS=true "$PF" --root "$T" modes
+# --as-ci is the local spelling of that environment (PR #275: the control above read the ambient
+# variable, went red only in CI, and cost a CI round and a review round before anyone could see
+# it at a prompt). Asserted under `env -u`, so it is the flag and not the box that flips the form.
+expect "...and --as-ci flips it to the annotation with the variable absent from the environment" \
+  1 '::error file=scripts/ok.sh::' -- env -u GITHUB_ACTIONS "$PF" --as-ci --root "$T" modes
+expect "...without changing the verdict, which is still the failing step" \
+  1 '0 passed, 1 failed' -- env -u GITHUB_ACTIONS "$PF" --as-ci --root "$T" modes
 
 # --- the pin: the lint job and the step table are one set of checks ---------------------------
 #
