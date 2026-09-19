@@ -1185,6 +1185,9 @@ cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" "s/<<'EOF'/<< 'EOF'/"
 expect "...and with a blank between the operator and the delimiter (round 1, P2)" 0 \
   "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" "s/cat >&2 <<'EOF'/cat <<'EOF' >\&2 # the usage text/"
+expect "...and with shell syntax after the delimiter (round 5, P2)" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
 # A `}` inside the usage text is text: reading it as the function's close would end the register
 # at that line, and an option listed below it could leave the prompt unnoticed (round 1, P2).
 cleanup_tree

@@ -930,7 +930,8 @@ CLEANUP_PROMPT=ship-pr/SKILL.md
 # -- each line of the body, between the `usage() {` line and its closing `}`, that opens with two
 # blanks and a `--name`, which is the listing's own shape (`  --base <branch>  Base branch …`), and
 # the arity is 1 when a `<value>` placeholder follows the name, else 0. The delimiter is whatever
-# word the `<<` names, quoted or not, with or without a blank after the operator, and under `<<-`
+# word the `<<` names, quoted or not, with or without a blank after the operator and whatever
+# else the line carries after it (a `>&2`, a comment), and under `<<-`
 # the body's leading tabs are stripped as the shell strips them; a `}` inside the heredoc is text
 # and does not close the function; the prose below the listing, which mentions an option
 # mid-sentence, is at no such indent and is not read.
@@ -941,9 +942,9 @@ usage_options() {
     # data, and exiting on it would drop every option listed below it while the register stayed
     # nonempty -- an agreement over half the list.
     infn && !inhd && /^\}/ { exit }
-    infn && !inhd && match($0, /<<-?[[:space:]]*("[^"]+"|'"'"'[^'"'"']+'"'"'|[^[:space:]"'"'"'<>|&;]+)[[:space:]]*$/) {
+    infn && !inhd && match($0, /<<-?[[:space:]]*("[^"]+"|'"'"'[^'"'"']+'"'"'|[^[:space:]"'"'"'<>|&;()]+)/) {
       d = substr($0, RSTART, RLENGTH); dash = (d ~ /^<<-/)
-      sub(/^<<-?[[:space:]]*/, "", d); sub(/[[:space:]]*$/, "", d); gsub(/["'"'"']/, "", d)
+      sub(/^<<-?[[:space:]]*/, "", d); gsub(/["'"'"']/, "", d)
       inhd = 1; next
     }
     inhd {
@@ -971,11 +972,17 @@ usage_options() {
 # an option in <valued> (the register's arity-1 names, blank-separated) is that option's value
 # whatever it looks like, since the helper takes it so. A fence is a run of three or more
 # backticks up to three blanks in, closed only by a run at least as long with nothing after it, as
-# CommonMark reads them. What is NOT modelled, and how it errs: a quoted argument that spans lines
-# is read to its line's end and the next line as unquoted, which can report a `--word` the shell
-# never passed (a refusal); an unquoted `$var` is a word and not its expansion, so options held in a variable are
-# unread (an acceptance, and the one shape that stays open by design -- the prompt spells its
-# commands out); and a `~~~` fence is prose.
+# CommonMark reads them.
+# That grammar is the reader's boundary, and it is the boundary every scanner in this file has
+# (README, Tests: a scanner reads line shapes, and text crafted to carry the shape without the
+# substance, or the substance in another shape, is outside it -- ludics-lite#75). What this
+# establishes is that the options the prompt's commands SPELL agree with usage(); it does not
+# establish that every shell-valid encoding of an invocation is read. Encodings outside the
+# grammar are unread, not misread, and the prompt writes none of them: a quoted argument spanning
+# lines, a `$(…)` substitution standing as an argument, a redirection glued to the command word, a
+# word split by a backslash continuation, options held in a `$var`, a `~~~` fence. Each could be
+# added as a shape; none is, because the check reads the prompt's commands and not the shell's
+# language, and the list of encodings a shell accepts has no end that a scan would reach.
 invocation_options() {
   awk -v valued=" $2 " '
     # lex <line>: the words of one simple command into W[1..NW]; TERM and REST when a separator
