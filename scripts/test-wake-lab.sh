@@ -1116,7 +1116,7 @@ reset_hold_state
 hang() { # hang <regex> <up-list> <verb...> -- a restart with some remote commands wedged
   local re=$1 up=$2; shift 2
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 \
-      WAKE_LAB_WSL_SHUTDOWN_CAP=3 WAKE_LAB_WSL_START_CAP=3 WAKE_LAB_PROBE_CAP=3 \
+      WAKE_LAB_WSL_SHUTDOWN_CAP=3 WAKE_LAB_WSL_START_CAP=3 \
       SSH_HANG="$re" SSH_UP="$up" "$WL" "$@"
 }
 # The incident's own shape, and its own resolution: the start probe never returns, and the VM has
@@ -1219,10 +1219,10 @@ grep -q '^minix-lan :: wsl.exe --shutdown$' "$SSH_LOG" && grep -q '^minix-lan ::
 # against a 12s cap cost one cap between them concurrently and two serialized. The numbers have to
 # respect the poll's 5s granularity, because a guest probe that misses its first round adds
 # exactly one of those to either arm: concurrent is 12s or 17s, serialized 24s or 29s, so 20s is
-# the only threshold with a clear margin on both sides. And PROBE_CAP is left at its default --
-# shrinking it to a couple of seconds, as the wedge cases above can afford to, is what makes that
-# missed round likely in the first place: on a loaded machine the shim's own fork can outlast a 3s
-# cap, and the probe then fails for reasons that have nothing to do with what is being measured.
+# the only threshold with a clear margin on both sides. And PROBE_CAP is left at its default, as
+# it is in the wedge cases above -- shrinking it to a couple of seconds is what makes that missed
+# round likely in the first place: on a loaded machine the shim's own fork can outlast a 3s cap,
+# and the probe then fails for reasons that have nothing to do with what is being measured.
 started=$SECONDS
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_WSL_START_CAP=12 \
     SSH_HANG='wsl\.exe -d Ubuntu' SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" \
@@ -1245,7 +1245,10 @@ naps() { ps -eo pid,command 2>/dev/null | awk '/sleep 311[789]$/ { print $1 }'; 
 reap_naps() { local p; for p in $(naps); do kill -KILL "$p" 2>/dev/null; done; }
 # The negative control first: a scan that cannot fail proves nothing. This is exactly the old
 # shape -- a watchdog whose sleep runs in its foreground, killed outright -- and it must leave a
-# survivor, or the assertion below is vacuous.
+# survivor, or the assertion below is vacuous. The command is `sleep 1` rather than something
+# instant on purpose: a watchdog whose command finishes immediately is killed before it ever forks
+# its nap, so the control leaves no orphan and proves nothing. An instant command here once
+# reported zero orphans and nearly confirmed that the leak did not exist.
 reap_naps
 ( cmd_pid=""; sleep 1 & cmd_pid=$!
   { sleep 3117; } >/dev/null 2>&1 & dog=$!
