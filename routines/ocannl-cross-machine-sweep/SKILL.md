@@ -82,10 +82,12 @@ boxes against itself.
 `--hold` is what keeps each GPU lane's VM alive for the whole lane. A WSL VM is held up by a
 `wsl.exe` process on the WINDOWS side and by nothing else; the sweep's ssh sessions inside the
 guest do not hold it, and the owner's console shell — the process that usually does — is removed by
-a Windows Update restart. `--hold` spawns `wsl.exe -d Ubuntu -e sleep infinity` on each box's
-Windows side, reports it, and declares the VM up only once that process is observed there. It is
-never sized with a fixed `sleep N`: a lane is hip then multidev_cc, each with its own cap, plus
-preparation outside them, so a sized holder expires under the last unit. **You must end it
+a Windows Update restart. `--hold` spawns `wsl.exe -d Ubuntu -e sh -s <token>` on each box's
+Windows side — a shell reading its commands off the ssh channel — reports it, and declares the VM
+up only once that holder has said its token back from inside the guest. It is never sized with a
+fixed `sleep N`: a lane is hip then multidev_cc, each with its own cap, plus preparation outside
+them, so a sized holder expires under the last unit, and a shell waiting for input cannot expire
+at all. **You must end it
 explicitly** once the sweep has finished (step 2), for every box you held:
 
     ~/bin/wake-lab.sh unhold rog minix
@@ -303,9 +305,11 @@ took:
 
     ~/bin/wake-lab.sh unhold rog minix
 
-Nothing else ends them: the holder is `sleep infinity` precisely so that it cannot expire under the
-last unit, so a lane that is never unheld leaves a `wsl.exe` pinning the VM (and an ssh connection
-from this Mac) until the box reboots. Do it before the retry budget's rerun too, or take the rerun's
+Nothing else ends them deliberately: the holder cannot expire under the last unit, so a lane that
+is never unheld leaves a `wsl.exe` pinning the VM (and an ssh connection from this Mac) until the
+box reboots or that connection dies. `unhold` exits 2 if a holder had already died under the lane
+(treat that box's results as suspect) and 3 if one is still pinning the box after the release tried
+both its channel and a kill by pid — that box needs a human, though the lane's results are fine. Do it before the retry budget's rerun too, or take the rerun's
 own `kick-wsl --hold` over the still-held box — `kick-wsl --hold` reuses a live holder rather than
 stacking a second one.
 

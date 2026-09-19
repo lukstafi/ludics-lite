@@ -1012,10 +1012,12 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
       echo "  wsl holder observed on $name (guest shell $gp answered its token over $rd)"
       return 0
     fi
-    echo "  wsl holder for $name (pid $rp) did not answer its token within ${HOLD_WAIT_SECONDS}s"
-    echo "    over $rd: the client is alive, so this is not a holder that exited — but nothing"
-    echo "    proves it still holds that VM. It belongs to an earlier run and is left running and"
-    echo "    recorded; end it with 'wake-lab.sh unhold $name' if this lane needs the box."
+    echo "  wsl holder for $name (pid $rp) did not answer its token within ${HOLD_WAIT_SECONDS}s over $rd"
+    echo "    The client is alive, so this is not a holder that exited -- but nothing proves it is"
+    echo "    still holding that VM. It belongs to an earlier run: left running and recorded, because"
+    echo "    killing it over a failed probe of OURS would unhold that lane's VM, which is the exact"
+    echo "    failure this flag exists to prevent. End it with 'wake-lab.sh unhold $name' if this"
+    echo "    lane needs the box."
     return 1
   fi
   if [ "${HOLD_LOCKED:-0}" != 1 ] &&
@@ -1189,18 +1191,23 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
 # thing this script can only do at all because the holder carries a token: without one, every
 # `wsl.exe` on that Windows side looks alike and the only cure documented for an orphan was a
 # host-global `restart-wsl`, which destroys every other session's work on the box.
-hold_confirm_gone() { # hold_confirm_gone <box> <alias> <guest pid> <token> <what ended it>
-  local name=$1 dest=$2 gp=$3 tok=$4 what=$5 obs deadline
-  deadline=$((SECONDS + HOLD_TEARDOWN_SECONDS))
+# Poll the VM until it stops saying "still there". Only that answer is worth asking again: EOF has
+# to cross a dead channel, a Windows sshd and wsl.exe before the guest shell reads it, and a kill
+# by pid has to reach a process that may be mid-syscall -- neither is instant, and a single
+# immediate look would report every slow teardown as a leak. "Gone" and "no answer" are both final.
+hold_watch_gone() { # hold_watch_gone <windows-alias> <guest pid> <token>
+  local deadline=$((SECONDS + HOLD_TEARDOWN_SECONDS)) obs
   while :; do
-    hold_remote_gone "$dest" "$gp" "$tok"; obs=$?
-    # Only "still there" is worth asking again: EOF has to cross a channel, a Windows sshd and
-    # wsl.exe before the guest shell reads it, and none of that is instant. "Gone" and "no answer"
-    # are both final.
-    [ "$obs" = 1 ] || break
-    [ "$SECONDS" -ge "$deadline" ] && break
+    hold_remote_gone "$1" "$2" "$3"; obs=$?
+    [ "$obs" = 1 ] || return "$obs"
+    [ "$SECONDS" -ge "$deadline" ] && return 1
     sleep 2
   done
+}
+
+hold_confirm_gone() { # hold_confirm_gone <box> <alias> <guest pid> <token> <what ended it>
+  local name=$1 dest=$2 gp=$3 tok=$4 what=$5 obs
+  hold_watch_gone "$dest" "$gp" "$tok"; obs=$?
   case "$obs" in
     0) echo "    ...and its guest shell (pid $gp) is gone from the VM, observed over $dest" ;;
     2) echo "    ...but $dest did not answer, so this does NOT claim the VM is unheld: the holder's"
@@ -1210,10 +1217,11 @@ hold_confirm_gone() { # hold_confirm_gone <box> <alias> <guest pid> <token> <wha
        echo "    Ending it by pid over $dest, which is what the token makes possible:"
        capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" \
          "wsl.exe -d Ubuntu -e kill $gp" >/dev/null 2>&1
-       hold_remote_gone "$dest" "$gp" "$tok"; obs=$?
+       hold_watch_gone "$dest" "$gp" "$tok"; obs=$?
        case "$obs" in
-         0) echo "    ...ended: the guest shell is gone. Nothing of ours is left on $name, but note"
-            echo "    that the channel did not end it -- report that, it is the contract this holder is built on." ;;
+         0) echo "    ...ended: the guest shell is gone and nothing of ours is left on $name. Note that"
+            echo "    the CHANNEL did not end it -- that is the contract this holder is built on, so a"
+            echo "    box reaching this line is worth reporting rather than just cleaning up." ;;
          *) HOLD_LEAK=1
             echo "    ...and it SURVIVED that too. $name is still pinned by a holder of ours: guest"
             echo "    pid $gp, token $tok. Nothing short of ending that process or a restart-wsl"

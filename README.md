@@ -181,6 +181,17 @@ There are two locks per box, because "in use" is two different claims:
 - `<box>.hold.lock`, the **hold** lock — "this box's VM must not be destroyed". `--hold` takes it
   and the Windows-side holder carries it until `unhold`.
 
+The holder itself is `wsl.exe -d Ubuntu -e sh -s <token>`: a shell reading its commands off the ssh
+channel. It ends when that channel does, which is not something sshd can be relied on to arrange —
+on Windows it exits without reaping the command tree, so a holder that never read its stdin was
+orphaned by every `unhold`, one `cmd.exe` and two `wsl.exe` per lane (ludics-lite#192). The token
+is this lane's identity: `--hold` declares the VM up only once the holder has said that token back
+from inside the guest, which no `tasklist` reading can substitute for (both lab boxes already show
+a `wsl.exe` with nothing of ours running), and `unhold` uses it to ask the VM whether that exact
+guest shell is gone before it claims anything. `unhold` exits 2 when the holder had already died
+under the lane — its results are suspect — and 3 when a holder of ours is still pinning the box
+after both its channel and a kill by pid.
+
 `restart-wsl` and the power verbs take **both** and refuse the box if either is held, until the
 holder lets go or `--force` takes it anyway. The OCANNL cross-machine sweep reserves each box's
 lane lock for the length of its lane — on 2026-09-16, before any of this existed, a restart issued
@@ -447,8 +458,14 @@ that is the LAN one; and that the polling loops honour a wall-clock deadline aga
 which an iteration budget did not (`WAKE_LAB_WAIT_SECONDS`, `WAKE_LAB_WSL_WAIT_SECONDS` and
 `WAKE_LAB_DOWN_WAIT_SECONDS` are what let the suite ask for a one-second one). It also pins what
 holds a kicked WSL VM up, which is a `wsl.exe` on the Windows side and nothing else: `--hold`
-spawns that holder as an unsized `sleep infinity`, never inside the guest, and the VM counts as up
-only once `tasklist` shows the process on the Windows side, while `unhold` kills it and says so;
+spawns that holder as an unsized shell reading the ssh channel, never inside the guest, and the VM
+counts as up only once that holder has said its token back from inside the guest. Its shim models
+the holder as TWO processes — a client and a remote with a channel between them, and no reach from
+one to the other — because the teardown defect it now pins (ludics-lite#192) is precisely a remote
+tree outliving its channel, which a one-process shim ends by killing and therefore cannot express;
+so the cases cover the guest shell ending on EOF, `unhold` observing that before it claims a
+release, a leaked holder being ended by its recorded guest pid, and one that survives even that
+leaving rc 3 rather than the sentence the issue was filed about;
 and it pins the Windows Update active-hours warning together with its quiet path, since a check
 that warned under the 6-to-0 window the boxes pin is one nobody would read.
 
