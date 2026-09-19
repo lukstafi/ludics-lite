@@ -110,9 +110,13 @@ collect_files() { # fills FILES with the paths the globs expand to, relative to 
   [ "${#FILES[@]}" -eq 0 ] || return 0
   for pattern in "${GLOBS[@]}"; do
     # Unquoted: this is pathname expansion, the workflow's own. An unmatched pattern arrives as
-    # itself, which `-f` drops.
+    # itself, which the existence test drops. A BROKEN SYMLINK is kept, which `-f` would not have
+    # been: `-f` follows the link, so a dangling one read as "no such path" and was dropped from
+    # every sweep in silence -- while the inline `for f in */scripts/*.sh; do bash -n "$f"; done`
+    # this replaced handed it to bash and went red. A path that exists as a link is a path this
+    # list owes a verdict on, and bash and shellcheck both refuse it loudly (round 1).
     for path in $pattern; do
-      [ -f "$path" ] && FILES+=("$path")
+      { [ -e "$path" ] || [ -L "$path" ]; } && FILES+=("$path")
     done
   done
   # Fail closed rather than pass over nothing, the rule the two guards already carry: an empty

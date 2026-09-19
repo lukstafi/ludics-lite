@@ -129,6 +129,18 @@ printf '#!/usr/bin/env bash\nif [ ; then\n' >"$T/ship-pr/hooks/broken.sh"
 chmod +x "$T/ship-pr/hooks/broken.sh"
 expect "a broken hook fails it" 1 'ship-pr/hooks/broken.sh does not parse' -- "$PF" --root "$T" syntax
 
+# A broken symlink is a path the list owes a verdict on: `-f` followed the link and dropped it,
+# so the sweep went green over a file bash cannot open (round 1).
+tree syntax_dangling
+ln -s missing-target.sh "$T/scripts/dangling.sh"
+expect "a broken symlink is in the file list, not dropped by it" 0 'scripts/dangling.sh' -- "$PF" --root "$T" files
+expect "...and the syntax step refuses it rather than passing over it" 1 'syntax: FAIL' -- "$PF" --root "$T" syntax
+expect "...and the mode step too, since a dangling link is not executable" \
+  1 'scripts/dangling.sh is not executable' -- "$PF" --root "$T" modes
+if command -v shellcheck >/dev/null 2>&1; then
+  expect "...and shellcheck is handed it" 1 'shellcheck: FAIL' -- "$PF" --root "$T" shellcheck
+fi
+
 # --- the two-way mode rule --------------------------------------------------------------------
 
 tree modes_clean
@@ -276,6 +288,24 @@ job_run_commands() { # job_run_commands <job>
 workflow_run_commands() {
   awk '$1 == "run:" { print $2 } $1 == "-" && $2 == "run:" { print $3 }' "$WORKFLOW"
 }
+# The STEP NAMES the lint job passes to preflight.sh, `*` for an invocation that names none and so
+# runs them all. Reading only the command word would exempt every preflight line unconditionally:
+# a mode-bit step rewritten to a second `syntax` invocation would leave the mode rule unrun in CI
+# while the pin below stayed green, which is the drift this pin exists to catch (round 1).
+lint_preflight_steps() {
+  awk -v want="  lint:" '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_job = ($0 == want); next }
+    in_job && $1 == "run:" && $2 == "scripts/preflight.sh" {
+      named = 0
+      for (i = 3; i <= NF; i++) {
+        if ($i ~ /^-/) { if ($i == "--root") i++; continue }
+        print $i
+        named = 1
+      }
+      if (!named) print "*"
+    }
+  ' "$WORKFLOW"
+}
 
 # The one exemption, and it is named rather than glob-shaped: this suite runs preflight, so
 # preflight running this suite would recurse. Asserted to exist, since an exemption naming nothing
@@ -285,6 +315,10 @@ SELF=scripts/test-preflight.sh
   || ko "the pin exempts $SELF, which is not in the checkout"
 
 table_commands=$("$PF" steps | awk -F'\t' '$2 != "-" { print $2 }')
+# The steps preflight implements itself: these have no script for the reader above to find, so
+# they are pinned by the name the lint job passes.
+table_internal=$("$PF" steps | awk -F'\t' '$2 == "-" { print $1 }')
+table_names=$("$PF" steps | awk -F'\t' '{ print $1 }')
 lint_commands=$(job_run_commands lint)
 all_run_commands=$(workflow_run_commands)
 
@@ -317,6 +351,43 @@ EOF
   && ok "...and every check preflight.sh runs is one the workflow runs too" \
   || ko "preflight.sh runs what no workflow step does:$unrun"
 
+# unrun_steps LIST: the internal steps no line of LIST names, `*` covering all of them.
+unrun_steps() { # unrun_steps <newline-separated step names>
+  local invoked="$1" name missing=""
+  grep -Fqx -- '*' <<<"$invoked" && return 0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    grep -Fqx -- "$name" <<<"$invoked" || missing="$missing $name"
+  done <<EOF
+$table_internal
+EOF
+  printf '%s' "$missing"
+}
+# unknown_steps LIST: the names LIST passes that are not steps at all.
+unknown_steps() { # unknown_steps <newline-separated step names>
+  local invoked="$1" name bad=""
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    [ "$name" = '*' ] && continue
+    grep -Fqx -- "$name" <<<"$table_names" || bad="$bad $name"
+  done <<EOF
+$invoked
+EOF
+  printf '%s' "$bad"
+}
+
+invoked_steps=$(lint_preflight_steps)
+[ -n "$invoked_steps" ] && ok "the lint job's preflight invocations name their steps" \
+  || ko "no preflight step names read from the lint job -- the two pins below would pass over nothing"
+missing_steps=$(unrun_steps "$invoked_steps")
+[ -z "$missing_steps" ] \
+  && ok "...and every assertion preflight implements itself is one the lint job names" \
+  || ko "the lint job names no step for:$missing_steps"
+bad_steps=$(unknown_steps "$invoked_steps")
+[ -z "$bad_steps" ] \
+  && ok "...and names no step the table does not hold" \
+  || ko "the lint job passes preflight a step that does not exist:$bad_steps"
+
 # Both halves of that reading, on a scratch copy of the workflow: a lint step the table cannot
 # hold must trip the pin, or the two assertions above are claims nothing could falsify. Inline
 # shell is the shape that matters -- it is what the lint job carried until ludics-lite#123.
@@ -338,6 +409,19 @@ probe_workflow() { # probe_workflow <text to insert into the lint job>
   # nothing -- which is how this probe first "passed".
   WORKFLOW="$TMP/probe/.github/workflows/skill-scripts.yml"
 }
+# The other shape of drift: a lint step's run line rewritten rather than added. The swap is
+# asserted to have happened, so a change to the workflow's spelling fails here loudly instead of
+# leaving a probe that rewrites nothing and passes.
+probe_workflow_swap() { # probe_workflow_swap <exact old line> <new line>
+  mkdir -p "$TMP/probe/.github/workflows"
+  PROBE_OLD="$1" PROBE_NEW="$2" awk '
+    $0 == ENVIRON["PROBE_OLD"] { print ENVIRON["PROBE_NEW"]; next }
+    { print }
+  ' "$ROOT/.github/workflows/skill-scripts.yml" >"$TMP/probe/.github/workflows/skill-scripts.yml"
+  WORKFLOW="$TMP/probe/.github/workflows/skill-scripts.yml"
+  grep -Fqx -- "$2" "$WORKFLOW" && ! grep -Fqx -- "$1" "$WORKFLOW"
+}
+
 probe_workflow '      - name: A new check
         run: scripts/check-something-new.sh'
 probe_unpinned=
@@ -369,6 +453,41 @@ EOF
 [ "$probe_inline" = " |" ] \
   && ok "...as does a lint step written back as inline shell, which is what #123 filed" \
   || ko "inline shell in the lint job did not trip the pin (verdict:$probe_inline)"
+
+# The drift the command word cannot see: a step that still calls preflight, with the wrong
+# subcommand. Round 1's finding, and the reason the step names are read at all.
+if probe_workflow_swap '        run: scripts/preflight.sh --require-tools modes' \
+  '        run: scripts/preflight.sh --require-tools syntax'; then
+  probe_steps=$(lint_preflight_steps)
+  [ "$(unrun_steps "$probe_steps")" = " modes" ] \
+    && ok "...and a lint step rewritten to a duplicate of another trips the step pin" \
+    || ko "a lint step that stopped running the mode rule did not trip the step pin (verdict:$(unrun_steps "$probe_steps"))"
+  [ -z "$(unknown_steps "$probe_steps")" ] \
+    && ok "...without reporting the duplicate as a step that does not exist" \
+    || ko "the duplicated step name was reported unknown (verdict:$(unknown_steps "$probe_steps"))"
+else
+  ko "the swap probe rewrote nothing: the lint job no longer spells the mode step as this file expects"
+fi
+
+if probe_workflow_swap '        run: scripts/preflight.sh --require-tools modes' \
+  '        run: scripts/preflight.sh --require-tools mode-bits'; then
+  [ "$(unknown_steps "$(lint_preflight_steps)")" = " mode-bits" ] \
+    && ok "...and a step name the table does not hold is reported as such" \
+    || ko "a lint step naming a step that does not exist did not trip the pin"
+else
+  ko "the swap probe rewrote nothing: the lint job no longer spells the mode step as this file expects"
+fi
+
+# The shape that must NOT be refused: one invocation with no step names runs them all, which is a
+# valid way to spell this job and would otherwise read as five missing assertions.
+if probe_workflow_swap '        run: scripts/preflight.sh --require-tools modes' \
+  '        run: scripts/preflight.sh --require-tools'; then
+  [ -z "$(unrun_steps "$(lint_preflight_steps)")" ] \
+    && ok "...while an invocation that names no step covers them all, and is not refused" \
+    || ko "a bare preflight invocation was read as running no step"
+else
+  ko "the swap probe rewrote nothing: the lint job no longer spells the mode step as this file expects"
+fi
 WORKFLOW="$ROOT/.github/workflows/skill-scripts.yml"
 
 # --- the checkout this suite runs in ------------------------------------------------------------
