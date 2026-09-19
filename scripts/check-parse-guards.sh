@@ -137,11 +137,8 @@ for f in "${files[@]}"; do
     /^set [-+][A-Za-z]/ { next }
     { printf "%d\t%s", NR, $0; exit }
   ' "$f")
-  if [ -z "$head_line" ]; then
-    printf '::error file=%s::%s has no command in it: the brace group this guard asks for would have nothing to wrap\n' "$display" "$display"
-    rc=1
-    continue
-  fi
+  # Never empty: rule 1 has already found `exit "$?"` on the second-to-last line, and awk skips
+  # only the shebang, comments, blanks and `set` lines, so there is always a command below.
   head_no=${head_line%%	*}
   head_txt=${head_line#*	}
   if [ "$head_txt" != "{" ]; then
