@@ -77,6 +77,29 @@ STEPS=(
   'preflight-fixtures:scripts/test-preflight.sh'
 )
 
+# The read-only words `steps`, `globs` and `files` are dispatched before any step is, so a step
+# that took one of those names would be answered by the query and never run -- and the workflow
+# pin would still read it as a step CI invokes (round 10). A name used twice is the same failure
+# from the other end: the lookup answers with the first entry, so the default run would run one
+# command twice and the other never, with both paths still in `steps` for the pin to accept. Both
+# are refused here, before anything is judged, because a table that does not mean what it says is
+# not something to run a check from.
+QUERY_WORDS='steps globs files'
+
+validate_table() {
+  local entry name seen=' '
+  for entry in "${STEPS[@]}"; do
+    name=${entry%%:*}
+    case "$seen" in
+    *" $name "*) die "the step table names '$name' twice: the lookup would answer with the first entry and the second would never run" ;;
+    esac
+    case " $QUERY_WORDS " in
+    *" $name "*) die "the step table names '$name', which is a read-only query word ($QUERY_WORDS): the query would answer and the assertion would never run" ;;
+    esac
+    seen="$seen$name "
+  done
+}
+
 usage() { # the leading comment block, which is this script's manual
   awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
 }
@@ -372,6 +395,8 @@ fi
 # Every glob, every step's script and every annotation path is relative to the checkout, so the
 # expansion and the run happen there and nowhere else.
 CDPATH= cd "$ROOT" || die "cannot enter $ROOT"
+
+validate_table
 
 # The read-only queries, before anything is judged.
 if [ "${#WANTED[@]}" -eq 1 ]; then

@@ -244,6 +244,37 @@ else
   ko "could not patch a table entry into a copy of preflight.sh: the control below would prove nothing"
 fi
 
+# --- a table that does not mean what it says ----------------------------------------------------
+#
+# Both need a patched copy, since the real table is correct: a name used twice would run one
+# command in place of the other, and a name that is also a query word would be answered by the
+# query and never run -- each of them invisible to the workflow pin, which reads the table.
+
+patch_table() { # patch_table <name> <entry line>: a copy of preflight.sh with one entry added
+  mkdir -p "$TMP/$1/scripts"
+  PATCH_ADD="$2" awk '
+    { print }
+    $0 ~ /^  .modes:-.$/ { print ENVIRON["PATCH_ADD"] }
+  ' "$PF" >"$TMP/$1/scripts/preflight.sh"
+  chmod +x "$TMP/$1/scripts/preflight.sh"
+  grep -Fq -- "$2" "$TMP/$1/scripts/preflight.sh"
+}
+
+if patch_table dup "  'syntax:-'"; then
+  expect "a step table naming one step twice is refused before anything is judged" \
+    2 "names 'syntax' twice" -- "$TMP/dup/scripts/preflight.sh" steps
+else
+  ko "could not patch a duplicate entry into a copy of preflight.sh"
+fi
+if patch_table query "  'files:-'"; then
+  expect "...and so is a step named after a read-only query word, which would answer instead of it" \
+    2 "which is a read-only query word" -- "$TMP/query/scripts/preflight.sh" files
+else
+  ko "could not patch a query-word entry into a copy of preflight.sh"
+fi
+expect "...while the real table passes that validation on every invocation" \
+  0 'syntax' -- "$PF" steps
+
 # --- the missing-tool rule --------------------------------------------------------------------
 #
 # PATH is emptied rather than shellcheck hidden: with --root given, the step needs no external
@@ -333,13 +364,24 @@ job_run_commands() { # job_run_commands <job>
 # an external command be satisfied by a step in ANY job -- check-prompts.sh is satisfied by the
 # prompt hygiene job, the only check a prompt-only head gets -- so a `continue-on-error: true` or
 # an `if: ${{ false }}` there would otherwise be invisible. A disabled step is not an invocation.
-# THE READER these four share. A run line is `run: <cmd> …` or the compact `- run: <cmd> …`, both
-# valid and both used in this workflow, so the command is at a field index rather than at field 2
-# (round 9). A step is live only when NOTHING above it can stop it: a JOB-level condition counts
-# as well as a step-level one, read apart from it because the first step of the job would
-# otherwise clear it and a whole pinned job could be switched off unseen (round 9). The only
+# THE READER these four share, so they cannot disagree about what the workflow says. Two axes,
+# each of which cost a round on its own before they were read as axes:
+#
+#   WHERE a key stands. A job-level `if:` or `continue-on-error:` (four spaces) governs every step
+#   under it and must not be cleared when a step begins, or a whole pinned job is switched off
+#   unseen (rounds 9, 10); a step-level one governs its step alone.
+#   HOW a line is spelled. `run:`, `if:` and `continue-on-error:` may each open a step behind the
+#   list dash -- `- run: x`, `- continue-on-error: true` -- which is valid YAML this workflow
+#   already uses, so every key is found at a field index rather than at field 1 (rounds 9, 10).
+#
+# A step is LIVE when nothing on either axis can stop its failure failing the job. The one
 # condition accepted is `${{ !cancelled() }}`, which skips a cancelled run and nothing else.
 WORKFLOW_AWK='
+  function rest(n,   i, t) {
+    t = ""
+    for (i = n; i <= NF; i++) t = t (t == "" ? "" : " ") $i
+    return t
+  }
   function cmd_at(   ) {
     if ($1 == "run:") return 2
     if ($1 == "-" && $2 == "run:") return 3
@@ -348,12 +390,21 @@ WORKFLOW_AWK='
   function open_cond(c) {
     return (c == "" || c ~ /^\$\{\{[ ]*![ ]*cancelled\(\)[ ]*\}\}$/)
   }
-  function live() { return (!soft && open_cond(jcond) && open_cond(scond)) }
-  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job = $0; jcond = ""; scond = ""; soft = ""; next }
-  /^    if:/ { jcond = $0; sub(/^[[:space:]]*if:[[:space:]]*/, "", jcond); next }
-  /^      - / { scond = ""; soft = "" }
-  /^ +if:/ { scond = $0; sub(/^[[:space:]]*if:[[:space:]]*/, "", scond) }
-  /^ +continue-on-error:/ { soft = ($2 != "false") }
+  function live() {
+    return (!jsoft && !ssoft && open_cond(jcond) && open_cond(scond))
+  }
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job = $0; jcond = ""; jsoft = ""; scond = ""; ssoft = ""; next }
+  /^    [A-Za-z]/ {
+    if ($1 == "if:") jcond = rest(2)
+    else if ($1 == "continue-on-error:") jsoft = ($2 != "false")
+    next
+  }
+  /^      - / { scond = ""; ssoft = "" }
+  {
+    a = ($1 == "-" ? 2 : 1)
+    if ($a == "if:") scond = rest(a + 1)
+    else if ($a == "continue-on-error:") ssoft = ($(a + 1) != "false")
+  }
 '
 
 # The command word of every `run:` line that is a LIVE, BARE invocation: nothing at all after the
@@ -692,6 +743,33 @@ if probe_workflow_swap '  prompts:' \
 else
   ko "the swap probe rewrote nothing: the workflow no longer opens the prompts job as this file expects"
 fi
+
+# Both attributes, on both axes: job-level failure tolerance, and either attribute opening a step
+# behind the list dash. Each of these must stop check-prompts.sh counting as run.
+for probe_attr in \
+  '  prompts:
+    continue-on-error: true' \
+  '  prompts:
+    if: ${{ false }}'; do
+  if probe_workflow_swap '  prompts:' "$probe_attr"; then
+    grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+      && ko "a job-level attribute left the job's steps counting as live: $probe_attr" \
+      || ok "...nor is a step of a job carrying: $(printf '%s' "$probe_attr" | tail -n 1)"
+  else
+    ko "the swap probe rewrote nothing: the workflow no longer opens the prompts job as this file expects"
+  fi
+done
+for probe_attr in 'continue-on-error: true' 'if: ${{ false }}'; do
+  if probe_workflow_swap '      - name: Check every SKILL.md'"'"'s frontmatter and the README index tables' \
+    "      - $probe_attr
+        name: Check every SKILL.md's frontmatter and the README index tables"; then
+    grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+      && ko "an attribute behind the list dash was not read: $probe_attr" \
+      || ok "...and an attribute opening the step behind the dash is read: $probe_attr"
+  else
+    ko "the swap probe rewrote nothing: the prompts job no longer opens its step as this file expects"
+  fi
+done
 
 # The compact step form is valid YAML and is used in this workflow, so every reader must see it.
 if probe_workflow_swap '        run: scripts/check-jq-shapes.sh' \
