@@ -880,6 +880,43 @@ test_a_non_ascii_word_is_not_a_keyword() {
     "a keyword followed by a non-ASCII letter is part of another word"
 }
 
+# Review round 9, P2. The fourth Markdown link form to reach the sentence boundary in four rounds,
+# and the one that ended the enumeration: the boundary no longer lists closers at all.
+test_a_reference_style_link_does_not_join_two_sentences() {
+  reset
+  PR_BODY='[Closes #667.][details] See #668 for context.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "a reference-style link suffix does not hold two sentences together"
+  # The three earlier forms, and the decimal that must still not split, all in one body.
+  PR_BODY='[Closes #669.](https://example.test/x "t") See #670. "Closes #671." See #672.
+'
+  run_merge
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" "the earlier link forms still split"
+  PR_BODY='Closes #673 and #674 in release 3.5 of the tool
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #673 #674" "a decimal is still not a boundary"
+}
+
+# Review round 9, P2. A boundary is owed on both sides of a reference: the numeric run stopped
+# where the digits did, so a CSS colour was read as an issue and carried reopen advice for it.
+test_a_reference_needs_a_boundary_after_its_digits() {
+  reset
+  PR_BODY='Closes #675 after changing #123abc.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" "a hex colour is not an issue"
+  # A reference followed by ordinary punctuation, or ending the line, still counts.
+  PR_BODY='Closes #676, #677.
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "2 issues: #676 #677" "punctuation and end of line are boundaries"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -924,6 +961,8 @@ tests=(
   test_a_titled_link_does_not_join_two_sentences
   test_a_schemeless_url_containing_a_delimiter_is_stripped
   test_a_non_ascii_word_is_not_a_keyword
+  test_a_reference_style_link_does_not_join_two_sentences
+  test_a_reference_needs_a_boundary_after_its_digits
 )
 
 run_tests "${tests[@]}"

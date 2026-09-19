@@ -3999,7 +3999,7 @@ refuse_merge_queue() {
 # in French prose matched as a keyword (review round 8). A keyword is one only where an ASCII
 # separator a human writes stands on each side of it.
 MULTI_CLOSE_FILTER='
-function refs_of(unit, repo,   rest, r, out, n, seen, key) {
+function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
   # URLs go first. A body here is full of run links, and a fragment in one is not an issue: a
   # trailing /#703 was counted as an issue, and a page#705 was even reported as a cross-repository
   # reference to a HOST (review round 3). An issue bound through its full URL is a shape this
@@ -4029,6 +4029,11 @@ function refs_of(unit, repo,   rest, r, out, n, seen, key) {
     r = substr(rest, RSTART, RLENGTH)
     rest = substr(rest, RSTART + RLENGTH)
     sub(/^[^a-zA-Z0-9#]/, "", r)
+    # A boundary is owed on BOTH sides. The numeric run simply stopped where the digits did, so the
+    # CSS colour `#123abc` was read as issue 123 and carried reopen advice for it (review round 9).
+    # `rest` already stands just past the match, so its first character is the one that follows.
+    nxt = substr(rest, 1, 1)
+    if (nxt ~ /[0-9a-zA-Z_-]/) continue
     # `example/repo#1` and `#1` are ONE issue when the repo is this PR own -- and that is knowable
     # here, because the caller passes it in. Normalizing before the dedupe is what makes the mixed
     # spelling in one sentence stop counting twice (review round 5). A reference to any OTHER
@@ -4130,15 +4135,16 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
   # and goes unreported, which is the fourth documented limitation in SKILL.md. That is the right
   # side of the trade for a warning -- silence is the status quo this PR improves on, while advice
   # to reopen the wrong issue is what teaches a reader to stop reading the warning at all.
-  # What may sit BETWEEN the terminator and the space is generalized rather than listed. A closing
-  # quote was the first thing found there (review round 3), a Markdown link destination the second
-  # (round 7), and a list of closers would have grown a member per round. Any run of
-  # non-alphanumerics ends the unit, plus one parenthesized group for `](https://…)`, which is the
-  # only shape that legitimately carries alphanumerics after a full stop. That group runs to its
-  # closing paren rather than to the next space, because a Markdown destination may be followed by
-  # a quoted TITLE inside the same parentheses (review round 8). Requiring an alphanumeric
-  # NOT to follow immediately is what keeps a version number ("3.5") from splitting.
-  gsub(/[.!?][^ \ta-zA-Z0-9]*(\([^)]*\))?[^ \ta-zA-Z0-9]*[ \t]+/, "&\001", s)
+  # What may sit BETWEEN the terminator and the space is not enumerated at all. Four rounds were
+  # spent adding members to a list of closers -- a closing quote (review round 3), an inline link
+  # destination (7), a link TITLE inside the same parens (8), a reference-style `][label]` suffix
+  # (9) -- and Markdown has more link forms than any list will hold. So the rule is: a full stop
+  # ends the unit when whitespace follows it, or when anything that does NOT begin with an
+  # alphanumeric follows it up to the next whitespace. Every closer, bracket, destination and
+  # label satisfies that by construction, and no Markdown spelling can add a member.
+  # The alphanumeric condition is the whole of what it excludes, and it is what keeps a version
+  # number ("3.5") from splitting -- a digit or letter straight after the stop continues the word.
+  gsub(/[.!?]([^ \ta-zA-Z0-9][^ \t]*)?[ \t]+/, "&\001", s)
   n = split(s, parts, "\001")
   for (i = 1; i <= n; i++) scan(parts[i], quoted)
 }'
@@ -4464,6 +4470,13 @@ cmd_merge() {
     # change (review round 1) -- and the same holds inside this loop, where await_mergeable can
     # hold for tens of seconds before a retry (review round 5). It reports only what MOVED, so a
     # body that has not changed costs one line however many attempts are made.
+    #
+    # What this does NOT cover is gh_retry own retries of the call below: a gateway refusal makes
+    # it wait and re-issue, and a body edited inside that backoff lands unscanned (review round 9).
+    # Closing it would mean handing a per-feature callback to a generic transport helper, or
+    # dropping the write retry that exists so a merge refused before it ran is not reported as
+    # ambiguous. Both cost more than the window is worth: it is bounded by the backoff (about 35s
+    # over four attempts) and opens only during a GitHub gateway incident.
     warn_multi_close "$PR_NUM" again
     out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" --match-head-commit "$CHECK_SHA" \
       "${gh_args[@]}")
