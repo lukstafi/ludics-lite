@@ -191,9 +191,12 @@ body stays editable through a `--wait` and editing it moves no head — and warn
 sentence carries a closing keyword and more than one `#N` or when a closing keyword sits in a
 quoted (`> …`) or fenced line, where an example closes exactly as a statement does (that is how
 #226's own body closed #205 a second time) — a warning and not a refusal, because one sentence
-closing two issues is sometimes what was meant; its silence is not a clean body in three cases it
-does not read, an issue closed through a full URL, a four-space-indented code block, and a
-sentence wrapped across a line break with its references split over it.
+closing two issues is sometimes what was meant; its silence is not a clean body in five cases it
+does not read — an issue closed through a full URL, a four-space-indented code block, a blockquote
+or fence on a continuation line of a list item (its indentation is relative to a container the
+scanner does not model), a sentence wrapped across a line break with its references split over it,
+and a sentence split at an abbreviation period such as `e.g.` — every one of which is a missed
+warning and never a wrong one.
 
 Report the URL on its own line, wrapped as below. The Claude Desktop client renders a live status
 card from the tag; other harnesses ignore it:

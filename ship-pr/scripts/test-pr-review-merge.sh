@@ -33,6 +33,7 @@ NO_CHECKS=""                           # the head carries no build check at all
 RUN_REASON="every run for the head finished and was judged" # what the run list settled on
 MERGE_STATE="merged=true state=MERGED" # what REST says after the merge call
 MERGE_QUEUE=""                         # nonempty = the base has a merge queue
+MERGE_NOT_MERGEABLE=""                 # nonempty = the FIRST pr merge call fails as not mergeable
 PR_BODY="A body with nothing to close."  # what the body read answers with
 PR_BODY_LATER=""                       # nonempty = what the SECOND body read on answers with
 BODY_FAIL=""                           # nonempty = the body read answers with a 404
@@ -81,6 +82,7 @@ gh() {
       fi
       ;;
     *merged=*) echo "$MERGE_STATE" ;;
+    *'.mergeable'*) echo true ;;
     *) bail "unexpected pulls read: $*" ;;
     esac
     ;;
@@ -90,7 +92,16 @@ gh() {
     *) bail "unexpected graphql call: $*" ;;
     esac
     ;;
-  "pr merge") printf 'CALL %s\n' "$*" >>"$CALLS_FILE" ;;
+  "pr merge")
+    printf 'CALL %s\n' "$*" >>"$CALLS_FILE"
+    # The stale pre-recompute verdict: the first attempt fails as not mergeable, await_mergeable
+    # then reads mergeable=true and cmd_merge retries. One failure only, so the retry lands.
+    if [ -n "$MERGE_NOT_MERGEABLE" ] && [ ! -f "$TEST_ROOT/merge-failed-once" ]; then
+      : >"$TEST_ROOT/merge-failed-once"
+      printf 'gh: Pull request is not mergeable\n' >&2
+      return 1
+    fi
+    ;;
   *) bail "unexpected fixture gh call: $*" ;;
   esac
 }
@@ -126,6 +137,8 @@ reset() {
   RUN_REASON="every run for the head finished and was judged"
   MERGE_STATE="merged=true state=MERGED"
   MERGE_QUEUE=""
+  MERGE_NOT_MERGEABLE=""
+  rm -f "$TEST_ROOT/merge-failed-once"
   PR_BODY="A body with nothing to close."
   PR_BODY_LATER=""
   BODY_FAIL=""
@@ -342,22 +355,35 @@ Closes #411
   assert_not_contains "$MERGE_STDOUT" "411" "the plain line after the real fence close is silent"
 }
 
-# Review round 1, P2. A period that ends an abbreviation is not a sentence boundary: splitting at
-# `e.g.` puts one reference on each side of the cut and loses the finding entirely.
-test_an_abbreviation_does_not_split_the_sentence() {
+# Review rounds 1, 4 and 5 on one rule, and its removal. An abbreviation guard stood here for three
+# rounds and was narrowed twice; both of its errors were FALSE POSITIVES, naming a reference that
+# belonged to the next sentence and offering to reopen a live issue. Terminal punctuation now ends a
+# unit outright: the cost is a missed warning when an abbreviation sits between two references, which
+# is the fourth documented limitation, and the gain is that a sentence ending in a version number or
+# a section letter can no longer produce wrong reopen advice.
+test_a_period_ends_the_unit_with_no_abbreviation_guard() {
   reset
-  PR_BODY='Closes #412 and, e.g. #413
+  # The two false positives the guard used to cause: both silent now.
+  PR_BODY='Closes #616 in version 2. See #617 for follow-up.
 '
   run_merge
   assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
-  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #412 #413" \
-    "e.g. must not end the sentence"
-  assert_contains "$MERGE_STDOUT" "Closes #412 and, e.g. #413" "the abbreviation is restored"
-  # A real full stop still splits, or the unit would be the whole line again.
-  PR_BODY='Closes #414. See also #415
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" "a version number ends the sentence"
+  PR_BODY='Closes #618 in appendix A. See #619 for context.
 '
   run_merge
-  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" "a real sentence end still splits"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" "a section letter ends it too"
+  # The documented cost, asserted rather than merely described: this one IS missed.
+  PR_BODY='Closes #621 and, e.g. #622
+'
+  run_merge
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "an abbreviation between two references is the fourth documented limitation"
+  # And the rule the whole scan exists for is untouched.
+  PR_BODY='Closes #623 and #624
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #623 #624" "the ordinary shape still warns"
 }
 
 # Review round 1, P2. A reference is reported as the body spells it, and `owner/tracker#123` names
@@ -534,23 +560,6 @@ Closes #614 and #615
     "the ordinary line after it is still read, so no phantom fence swallowed it"
 }
 
-# Review round 4, P2. The abbreviation rule protected every single character, digits included, so
-# an ordinary numeric sentence end held two sentences together and bound a reference from the next.
-test_a_digit_before_a_full_stop_still_ends_the_sentence() {
-  reset
-  PR_BODY='Closes #616 in version 2. See #617 for follow-up.
-'
-  run_merge
-  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
-  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
-    "a version number is a sentence end, not an abbreviation"
-  # The letter rule it was generalized from must survive.
-  PR_BODY='Closes #618 and, e.g. #619
-'
-  run_merge
-  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #618 #619" "e.g. is still protected"
-}
-
 # Review round 4, P2. GitHub numbers start at 1, so `#0` is prose -- and reopen advice for it would
 # point at an issue that does not exist.
 test_hash_zero_is_not_an_issue_reference() {
@@ -567,6 +576,54 @@ test_hash_zero_is_not_an_issue_reference() {
   assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #620 #1024" "ordinary numbers still count"
 }
 
+# Review round 5, P2. A schemeless link produced a bogus cross-repository reference out of a host
+# label and a path. Enumerating URL spellings was the wrong shape of fix; the boundary closes the
+# genre instead -- a reference preceded by a dot or a slash is a path or a host, whatever scheme it
+# carries or does not carry.
+test_a_schemeless_link_is_not_an_issue_reference() {
+  reset
+  PR_BODY='Closes #625; see www.example.com/page#626 and https://example.com/docs/#627 for details.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "one real reference and two links is one reference"
+}
+
+# Review round 5, P2. The bare and the fully qualified spelling of an issue in THIS repository name
+# one issue, and the repository is knowable here because the caller passes it in.
+test_the_local_qualified_spelling_is_the_same_issue() {
+  reset
+  PR_BODY='Closes #628 (example/repo#628).
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "a bare and a locally qualified reference are one issue"
+  # A reference to another repository is a different issue, and still counts.
+  PR_BODY='Closes #629 (other/tracker#629).
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "2 issues: #629 other/tracker#629" \
+    "another repository is another issue"
+}
+
+# Review round 5, P2. await_mergeable can hold for tens of seconds before the loop retries the
+# merge, and a body edited in that window moves no head. The authoritative scan therefore runs
+# before EVERY attempt, not once before the loop.
+test_the_body_is_rescanned_before_a_retried_merge() {
+  reset
+  MERGE_NOT_MERGEABLE=1
+  PR_BODY='Nothing to see here.
+'
+  PR_BODY_LATER='Closes #630 and #631
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the retry still merges ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #630 #631" \
+    "the body added during the mergeability wait is reported"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -581,7 +638,7 @@ tests=(
   test_the_prescribed_shape_stays_silent
   test_an_unread_body_is_not_a_clean_body
   test_a_longer_fence_is_not_closed_by_an_inner_one
-  test_an_abbreviation_does_not_split_the_sentence
+  test_a_period_ends_the_unit_with_no_abbreviation_guard
   test_the_reopen_remedy_does_not_hardcode_this_repo
   test_the_body_is_scanned_again_before_the_merge
   test_an_unchanged_body_is_not_reported_twice
@@ -592,8 +649,10 @@ tests=(
   test_a_url_fragment_is_not_an_issue_reference
   test_the_same_issue_named_twice_is_one_issue
   test_four_space_indentation_is_not_a_quote_or_a_fence
-  test_a_digit_before_a_full_stop_still_ends_the_sentence
   test_hash_zero_is_not_an_issue_reference
+  test_a_schemeless_link_is_not_an_issue_reference
+  test_the_local_qualified_spelling_is_the_same_issue
+  test_the_body_is_rescanned_before_a_retried_merge
 )
 
 run_tests "${tests[@]}"

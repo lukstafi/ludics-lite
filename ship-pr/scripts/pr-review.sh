@@ -3978,9 +3978,11 @@ refuse_merge_queue() {
 #     Closes #2
 # -- as one sentence closing two issues, and the loudest warning in the file would be the shape
 # callers are told to write. What that costs is a sentence WRAPPED across a line break with its
-# references split over it, which this scanner does not see. Two more shapes it does not read: an
+# references split over it, which this scanner does not see. More shapes it does not read: an
 # issue closed through a full issue URL, and a four-space-indented code block (a fenced one it does
-# read). All three are named in SKILL.md so the silence is not mistaken for a clean body.
+# read), a blockquote or fence on a CONTINUATION line of a list item, whose indentation is relative
+# to a container this scanner does not model, and a sentence split at an abbreviation period. All
+# of them are named in SKILL.md, so the silence is not mistaken for a clean body.
 #
 # One offending unit per line on stdout: "<class><TAB><count><TAB><refs><TAB><the sentence>", where
 # <class> is `sentence` (a closing keyword binding two or more references) or `quoted` (a keyword
@@ -3998,16 +4000,24 @@ function refs_of(unit,   rest, r, out, n, seen) {
   # reference to a HOST (review round 3). An issue bound through its full URL is a shape this
   # scanner does not read and SKILL.md says so, so blanking them keeps that boundary exact rather
   # than half-reading it. The owner is tightened for the same reason: a GitHub login carries only
-  # alphanumerics and hyphens, never the dots that let example.com pass as one. A number starts at
+  # alphanumerics and hyphens, never the dots that let example.com pass as one. What CLOSES that
+  # genre rather than chasing it is the boundary: a reference whose preceding character is a dot or
+  # a slash is a host label or a path component, which is true of a schemeless `www.example.com/p#2`
+  # as much as of a scheme-bearing one (review round 5), so enumerating URL spellings stopped. A number starts at
   # 1, so `#0` is prose -- "step #0 initializes the state" was a second issue, and a nonexistent
   # one at that (review round 4).
   rest = unit
   gsub(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^ \t]*/, " ", rest)
   out = ""; n = 0
-  while (match(rest, /(^|[^a-zA-Z0-9_])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[1-9][0-9]*/)) {
+  while (match(rest, /(^|[^a-zA-Z0-9_.\/])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[1-9][0-9]*/)) {
     r = substr(rest, RSTART, RLENGTH)
     rest = substr(rest, RSTART + RLENGTH)
     sub(/^[^a-zA-Z0-9#]/, "", r)
+    # `example/repo#1` and `#1` are ONE issue when the repo is this PR own -- and that is knowable
+    # here, because the caller passes it in. Normalizing before the dedupe is what makes the mixed
+    # spelling in one sentence stop counting twice (review round 5). A reference to any OTHER
+    # repository stays as written: it is a different issue.
+    if (repo != "" && index(tolower(r), tolower(repo) "#") == 1) r = substr(r, length(repo) + 1)
     # DISTINCT issues, not occurrences: "the request in #701 is done, so this closes #701" names
     # one issue twice, and reporting it as two made the count, the list and the reopen advice all
     # false (review round 3). A bare #N and an owner/repo#N are left distinct, since which
@@ -4031,23 +4041,6 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
   if (length(shown) > 200) shown = substr(shown, 1, 197) "..."
   cls = quoted ? "quoted" : "sentence"
   print cls "\t" cnt "\t" refs "\t" shown
-}
-# A period that ends an ABBREVIATION is not a sentence boundary. Marked out before the split and
-# put back after it, because the split below would otherwise cut "Closes #1 and, e.g. #2" in two
-# and leave one reference on each side of the cut -- a silent miss of exactly the shape the scan
-# exists for (review round 1). The rule is the one that covers the class without a dictionary: a
-# period whose preceding run is a SINGLE LETTER (e.g., i.e., initials), plus the handful of two-
-# and three-letter forms that carry one. A single DIGIT is excluded: "in version 2. See #3" is an
-# ordinary sentence end, and protecting it bound a reference from the NEXT sentence (review round
-# 4), while a digit-and-period that opens a line is a list marker, peeled as a container below. Splitting can only ever LOSE a
-# warning, so where the two readings differ this takes the one that splits LESS.
-function protect_abbrev(s,   out) {
-  out = ""
-  while (match(s, /(^|[^a-zA-Z0-9])([a-zA-Z]|cf|vs|al|no|eq|ch|fig|etc|resp)\./)) {
-    out = out substr(s, 1, RSTART + RLENGTH - 2) "\002"
-    s = substr(s, RSTART + RLENGTH)
-  }
-  return out s
 }
 {
   line = $0
@@ -4091,17 +4084,21 @@ function protect_abbrev(s,   out) {
   }
   if (fence) quoted = 1
   if (!indented && trimmed ~ /^>/) quoted = 1
-  s = protect_abbrev(line)
+  s = line
+  # Terminal punctuation ends a unit, with no abbreviation rule in front of it. One stood here for
+  # three rounds and was narrowed twice; each revision traded one error for another, and both of
+  # its errors were FALSE POSITIVES -- "in version 2. See #3" and "in appendix A. See #2" each had
+  # the scan name a reference belonging to the next sentence and offer to reopen a live issue. Its
+  # removal costs a false NEGATIVE instead: a reference on each side of an "e.g." is now two units
+  # and goes unreported, which is the fourth documented limitation in SKILL.md. That is the right
+  # side of the trade for a warning -- silence is the status quo this PR improves on, while advice
+  # to reopen the wrong issue is what teaches a reader to stop reading the warning at all.
   # A closing quote or bracket sits BETWEEN the terminator and the space often enough to matter:
   # requiring whitespace immediately after the full stop kept `... "Closes #1." See #2 ...` as one
   # unit and had the scan name an issue belonging to the next sentence (review round 3).
   gsub(/[.!?]["\047)\]}`*_]*[ \t]+/, "&\001", s)
   n = split(s, parts, "\001")
-  for (i = 1; i <= n; i++) {
-    unit = parts[i]
-    gsub(/\002/, ".", unit)
-    scan(unit, quoted)
-  }
+  for (i = 1; i <= n; i++) scan(parts[i], quoted)
 }'
 
 # One line of the warning on BOTH streams: stdout is the transcript a later reader scrolls back
@@ -4132,7 +4129,7 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
   fi
   scan=""
   if [ -n "$body" ]; then
-    scan=$(awk "$MULTI_CLOSE_FILTER" <<<"$body")
+    scan=$(awk -v repo="$REPO" "$MULTI_CLOSE_FILTER" <<<"$body")
     rc=$?
     if [ "$rc" -ne 0 ]; then
       MULTI_CLOSE_HAVE=""
@@ -4336,18 +4333,19 @@ cmd_merge() {
   # has already said UNKNOWN loudly; neither outcome blocks the merge.
   warn_base_drift "$PR_NUM" || true
   [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
-  # Read the body ONE more time, last of all. The scan after pr_arg above is for lead time; this is
-  # the one whose findings land. A PR body stays editable throughout a --wait that can run two
-  # hours, and editing it does not move the head, so --match-head-commit does not see the change
-  # and the early scan alone would let a multi-close sentence added during the wait through
-  # unannounced (review round 1). It reports only what moved: one line when the body is unchanged.
-  warn_multi_close "$PR_NUM" again
   # The verdict above is about ONE head, the one gate_checks read — and a --wait is minutes to
   # hours long, during which a push can move the PR. `gh pr merge` merges whatever the head is at
   # the moment of the call; --match-head-commit makes it refuse unless that is still the gated
   # SHA, so a close-out merge cannot land a head with neither a read green nor a 👍 (review of
   # ludics-lite#39). The refusal is final, not retried: re-run merge, which re-reads the gate.
   while :; do
+    # Read the body ONE more time, immediately before EVERY merge attempt. The scan after pr_arg is
+    # for lead time; this is the one whose findings land. A body stays editable throughout a --wait
+    # that can run two hours, and editing it moves no head, so --match-head-commit cannot see the
+    # change (review round 1) -- and the same holds inside this loop, where await_mergeable can
+    # hold for tens of seconds before a retry (review round 5). It reports only what MOVED, so a
+    # body that has not changed costs one line however many attempts are made.
+    warn_multi_close "$PR_NUM" again
     out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" --match-head-commit "$CHECK_SHA" \
       "${gh_args[@]}")
     rc=$?
