@@ -185,7 +185,14 @@ use a non-closing reference (`Refs #N` or `Refs owner/repo#N`); reserve the clos
 the final PR that completes the issue. A closing keyword binds to every `#N` in the same
 sentence, so "Resolves #194 and #205 §1" closed #205 too (PR #210, 2026-09-17; #205 had to be
 reopened). A PR that only partially addresses a second issue references it in a separate
-sentence with no keyword: "Addresses part 1 of #205".
+sentence with no keyword: "Addresses part 1 of #205". `pr-review.sh merge` reads the body
+before it merges and warns on both streams, naming the sentence and every issue, when one
+sentence carries a closing keyword and more than one `#N` or when a closing keyword sits in a
+quoted (`> …`) or fenced line, where an example closes exactly as a statement does (that is how
+#226's own body closed #205 a second time) — a warning and not a refusal, because one sentence
+closing two issues is sometimes what was meant; its silence is not a clean body in three cases it
+does not read, an issue closed through a full URL, a four-space-indented code block, and a
+sentence wrapped across a line break with its references split over it.
 
 Report the URL on its own line, wrapped as below. The Claude Desktop client renders a live status
 card from the tag; other harnesses ignore it:
