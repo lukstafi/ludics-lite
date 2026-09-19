@@ -837,6 +837,24 @@ hold_out_path()  { printf '%s\n' "$HOLD_STATE_DIR/hold-$1.out"; }
 # stayed silent about that would let a lane believe in an interlock it never had (#184 (b)).
 # A record written before those three fields existed is a legacy record: it reads with token "-",
 # guest pid 0 and protection "unknown", which every caller here handles as the holder it is.
+# Write a record, or leave the existing one alone. `>` truncates the moment the redirection opens,
+# so a short write -- a state filesystem that filled between one field and the next -- destroys the
+# only usable record of a holder that is still running, and the reuse path deliberately leaves that
+# holder alive. The next `unhold` would then have no local pid, no sidecar, no token and no guest
+# pid: a stranded lock and a stranded tree. A rename is atomic within the directory, so the record
+# is either the old one or the new one and never half of either.
+hold_record_write() { # hold_record_write <pidfile> <pid> <dest> <epoch> <sidecar> <token> <gp> <prot>
+  local f=$1 tmp
+  shift
+  tmp=$f.$$.new
+  if ! printf '%s %s %s %s %s %s %s\n' "$@" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
 hold_pid_read() { # hold_pid_read <pidfile> — echo the seven fields, fail if unusable
   local line p d t sc tok gp prot
   [ -r "$1" ] || return 1
@@ -920,14 +938,32 @@ hold_handshake() { # hold_handshake <box> <token> <seconds> — echo the holder'
 # hands back the remote command's status and `wsl --list --running` with nothing running, `ps` with
 # no such pid, and an ssh that never connected are all "non-zero" — only the output tells them
 # apart. Silence is therefore never read as good news: it is rc 2, and the caller says so.
-hold_remote_gone() { # hold_remote_gone <windows-alias> <guest pid> <token>
+# Is a holder of ours still running in that VM? Asked over the holder's OWN recorded alias, after
+# the local client has been killed, because #192 is exactly the case where the local half of the
+# teardown is complete and the remote half is not. rc 0 gone, 1 still there (with its guest pid in
+# HOLD_REMOTE_PID), 2 could not tell.
+#
+# It asks by TOKEN and not by recorded pid, which is what lets every caller use it. A hold whose
+# handshake never answered has a token in its payload and no guest pid to have recorded, and that
+# holder is the most dangerous one there is: it may be running in the VM with nothing naming it.
+# The token is in the guest process's argv by construction, so the process list answers for it.
+#
+# Neither probe can START anything. `wsl.exe -e <cmd>` BOOTS a stopped distro, so asking the guest
+# first would let an `unhold` bring up the VM it just released; the running-distro question is
+# asked first and answers the whole thing when the distro is down -- a guest shell cannot outlive
+# the guest. Every reading is gated on `capped`'s status first: a wedged command's partial output
+# is kept by the command substitution, and a `wsl --list` cut off before "Ubuntu" or a process list
+# cut off before our line both look exactly like the good news this exists to be careful about.
+# The header is what proves the probe RAN, so it is required by name rather than inferred from any
+# non-empty reply; silence is never read as good news.
+HOLD_REMOTE_PID=""     # the guest pid the last probe found, which is what a kill by pid needs
+hold_remote_gone() { # hold_remote_gone <windows-alias> <token>
   local out rc
-  # A CAPPED probe answers nothing, whatever it managed to print first. `capped` kills a wedged
-  # remote command and the command substitution keeps the bytes that arrived before it did, so a
-  # `wsl --list` cut off before it reached "Ubuntu", or a `ps` header cut off before its process
-  # row, both LOOK exactly like the good news this function exists to be careful about. Every
-  # reading below is therefore gated on the status first: the only thing a fired cap establishes
-  # is that nothing was established.
+  HOLD_REMOTE_PID=""
+  # No token is no question. `index($0, "")` is true of every line, so an empty one would match the
+  # first process in the guest's list and report it as ours -- a finding invented out of a record
+  # that names nothing. Callers guard this too; it is cheap to be certain here.
+  [ -n "${2:-}" ] && [ "$2" != '-' ] || return 2
   out=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" \
         'wsl.exe --list --running' 2>/dev/null); rc=$?
   [ "$rc" = "$CAP_EXPIRED" ] && return 2
@@ -935,16 +971,16 @@ hold_remote_gone() { # hold_remote_gone <windows-alias> <guest pid> <token>
   out=$(printf '%s' "$out" | tr -d '\000\r')
   [ -n "$out" ] || return 2
   printf '%s\n' "$out" | grep -qi '^Ubuntu' || return 0
-  # `-o args` and not `args=`: the header is printed whether or not the pid exists, so the HEADER
-  # is what separates "no such process" from "no answer". It is required by name rather than taken
-  # as any non-empty output, for the reason above -- a truncated reply is not a reading.
-  # No `=` or `,` reaches cmd.exe either, both of which it treats as argument delimiters.
+  # `-eo pid -o args` rather than `-o pid,args`: cmd.exe treats a comma as an argument delimiter,
+  # and nothing in this command may depend on surviving that. The PID header is the marker.
   out=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" \
-        "wsl.exe -d Ubuntu -e ps -o args -p $2" 2>/dev/null); rc=$?
+        'wsl.exe -d Ubuntu -e ps -eo pid -o args' 2>/dev/null); rc=$?
   [ "$rc" = "$CAP_EXPIRED" ] && return 2
   out=$(printf '%s' "$out" | tr -d '\r')
-  printf '%s\n' "$out" | grep -q 'COMMAND' || return 2
-  printf '%s\n' "$out" | grep -q -- "$3" && return 1
+  printf '%s\n' "$out" | grep -q 'PID' || return 2
+  HOLD_REMOTE_PID=$(printf '%s\n' "$out" |
+    awk -v t="$2" 'index($0, t) && $1 ~ /^[0-9]+$/ { print $1; exit }')
+  [ -n "$HOLD_REMOTE_PID" ] && return 1
   return 0
 }
 
@@ -1029,7 +1065,7 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
       # it is the only thing a later `unhold` can check the VM against or end the tree by, so it
       # goes into the record before this call reports the holder as observed.
       if [ "$rgp" = 0 ] &&
-         ! printf '%s %s %s %s %s %s %s\n' "$rp" "$rd" "$rt" "$rsc" "$rtok" "$gp" "$rprot" > "$f" 2>/dev/null; then
+         ! hold_record_write "$f" "$rp" "$rd" "$rt" "$rsc" "$rtok" "$gp" "$rprot"; then
         echo "  wsl holder for $name answered from guest shell $gp, but that pid could NOT be recorded at $f"
         echo "    An unhold would then have no pid to check the VM against, which is the state this"
         echo "    reuse exists to leave behind. Fix the state directory and take the hold again."
@@ -1082,7 +1118,7 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
     rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
     if [ -n "$rec" ]; then
       read -r rp rd rt rsc rtok rgp rprot <<<"$rec"; : "$rp" "$rt" "$rsc" "$rprot"
-      if [ "$rtok" != '-' ] && [ "$rgp" != 0 ]; then
+      if [ -n "$rtok" ] && [ "$rtok" != '-' ]; then
         echo "  an earlier unhold on $name ended its holder's client but never confirmed the VM was free;"
         echo "  finishing that release before taking the box:"
         HOLD_CONFIRM=""
@@ -1182,8 +1218,7 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   spawn_epoch=$(date +%s); spawned=1
   # An unrecordable holder is a leaked one: nothing would ever unhold it. Kill it rather than
   # leave it running unowned. The guest pid is 0 until the handshake answers with it.
-  if ! printf '%s %s %s %s %s %s %s\n' \
-       "$pid" "$dest" "$spawn_epoch" "$sidecar" "$token" 0 "$prot" > "$f" 2>/dev/null; then
+  if ! hold_record_write "$f" "$pid" "$dest" "$spawn_epoch" "$sidecar" "$token" 0 "$prot"; then
     kill "$pid" "$sidecar" 2>/dev/null
     rm -f "$f" "$fifo" "$out" 2>/dev/null
     echo "  wsl holder on $name could NOT be recorded at $f — holder (pid $pid) killed rather than leaked"
@@ -1207,8 +1242,7 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
     # record with guest pid 0 or a truncated one, and reporting the hold established over that
     # hands the lane a holder `unhold` cannot check the VM for or end by pid. An unusable record
     # is the unrecordable holder one step later, and it gets the same treatment.
-    if ! printf '%s %s %s %s %s %s %s\n' \
-         "$pid" "$dest" "$spawn_epoch" "$sidecar" "$token" "$gp" "$prot" > "$f" 2>/dev/null; then
+    if ! hold_record_write "$f" "$pid" "$dest" "$spawn_epoch" "$sidecar" "$token" "$gp" "$prot"; then
       kill "$pid" "$sidecar" 2>/dev/null
       rm -f "$f" "$fifo" "$out" 2>/dev/null
       echo "  wsl holder on $name answered its token, but its record could NOT be completed at $f"
@@ -1234,11 +1268,28 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
        { own=$(ps -ww -o args= -p $$ 2>/dev/null); theirs=$(ps -ww -o args= -p "$pid" 2>/dev/null)
          [ -n "$theirs" ] && [ "$theirs" = "$own" ]; }; then
       kill "$pid" "$sidecar" 2>/dev/null
-      echo "  wsl holder on $name stopped (pid $pid): nothing of ours holds that VM"
+      echo "  wsl holder on $name stopped (pid $pid)"
     else
-      echo "  wsl holder on $name is gone (pid $pid no longer names it): nothing of ours holds that VM"
+      echo "  wsl holder on $name is gone (pid $pid no longer names it)"
     fi
-    rm -f "$f" "$fifo" "$out" 2>/dev/null
+    # Killing the client is not the claim here either, and this is the WORST place to assume it.
+    # A handshake that did not answer in time does not mean the guest shell never started: it may
+    # be running in that VM right now, and if it survives its channel -- the #192 shape -- killing
+    # the client and deleting the record would leave it pinning the box with nothing naming it,
+    # while every later `unhold` reports no holder recorded. The token is in its argv, so the VM
+    # can still be asked, and the record is kept unless the answer is that it is gone.
+    HOLD_CONFIRM=""
+    hold_confirm_gone "$name" "$dest" 0 "$token" "its failed hold killed the client"
+    if [ "$HOLD_CONFIRM" = gone ]; then
+      echo "    nothing of ours holds that VM"
+      rm -f "$f" "$fifo" "$out" 2>/dev/null
+    else
+      # The marker says the client was ended deliberately, which is what stops the next reader
+      # calling this a holder the lane lost.
+      : > "${f%.pid}.releasing" 2>/dev/null
+      echo "    Its record is KEPT (token $token): that is the only way anything can name what may"
+      echo "    still be running in $name's VM. 'wake-lab.sh unhold $name' finishes it."
+    fi
   else
     # We spawned a holder, but the record no longer names it: a concurrent run replaced it after
     # ours exited. Killing what the file names now would unhold THAT run's lane.
@@ -1256,10 +1307,10 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
 # to cross a dead channel, a Windows sshd and wsl.exe before the guest shell reads it, and a kill
 # by pid has to reach a process that may be mid-syscall -- neither is instant, and a single
 # immediate look would report every slow teardown as a leak. "Gone" and "no answer" are both final.
-hold_watch_gone() { # hold_watch_gone <windows-alias> <guest pid> <token>
+hold_watch_gone() { # hold_watch_gone <windows-alias> <token>
   local deadline=$((SECONDS + HOLD_TEARDOWN_SECONDS)) obs
   while :; do
-    hold_remote_gone "$1" "$2" "$3"; obs=$?
+    hold_remote_gone "$1" "$2"; obs=$?
     [ "$obs" = 1 ] || return "$obs"
     [ "$SECONDS" -ge "$deadline" ] && return 1
     sleep 2
@@ -1268,7 +1319,11 @@ hold_watch_gone() { # hold_watch_gone <windows-alias> <guest pid> <token>
 
 hold_confirm_gone() { # hold_confirm_gone <box> <alias> <guest pid> <token> <what ended it>
   local name=$1 dest=$2 gp=$3 tok=$4 what=$5 obs
-  hold_watch_gone "$dest" "$gp" "$tok"; obs=$?
+  hold_watch_gone "$dest" "$tok"; obs=$?
+  # The pid to speak about, and to kill by: whatever the VM just showed us, falling back to what
+  # the record knew. A hold whose handshake never answered has only the former.
+  [ -n "$HOLD_REMOTE_PID" ] && gp=$HOLD_REMOTE_PID
+  [ -n "$gp" ] && [ "$gp" != 0 ] || gp='?'
   case "$obs" in
     0) HOLD_CONFIRM=gone
        echo "    ...and its guest shell (pid $gp) is gone from the VM, observed over $dest" ;;
@@ -1282,7 +1337,7 @@ hold_confirm_gone() { # hold_confirm_gone <box> <alias> <guest pid> <token> <wha
        echo "    Ending it by pid over $dest, which is what the token makes possible:"
        capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" \
          "wsl.exe -d Ubuntu -e kill $gp" >/dev/null 2>&1
-       hold_watch_gone "$dest" "$gp" "$tok"; obs=$?
+       hold_watch_gone "$dest" "$tok"; obs=$?
        case "$obs" in
          0) HOLD_CONFIRM=gone
             echo "    ...ended: the guest shell is gone and nothing of ours is left on $name. Note that"
@@ -1411,7 +1466,7 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     echo "  wsl holder released on $1 (pid $p killed)"
     [ "$prot" = unprotected ] &&
       echo "    It was taken with --force and never held $1's hold lock, so the box was NOT protected from another session's restart-wsl while it ran"
-    if [ "$tok" = '-' ] || [ "${gp:-0}" = 0 ]; then
+    if [ -z "${tok:-}" ] || [ "$tok" = '-' ]; then
       # A legacy record, or one whose handshake never answered: there is no pid in that VM to ask
       # about, so the one thing this must not do is repeat the old sentence and call it unheld.
       echo "    Its holder carries no token (a record from before the handshake), so nothing here"
@@ -1428,7 +1483,7 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     # client and then not reached the box to see whether the tree went with it; it keeps its record
     # precisely so that this run can finish the job, and clearing that record would throw away the
     # guest pid and token that are the only way to end that tree short of a restart-wsl.
-    if [ "$tok" != '-' ] && [ "${gp:-0}" != 0 ]; then
+    if [ -n "${tok:-}" ] && [ "$tok" != '-' ]; then
       hold_confirm_gone "$1" "$d" "$gp" "$tok" "an earlier unhold ended its client"
     else
       echo "    ...and it carries no guest pid to check the VM against; its record is cleared"
@@ -1476,7 +1531,7 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     # holder carried a token there was no way to name that tree, so the only documented cure was a
     # restart-wsl that destroys every other session on the box. With a token there is: the guest
     # shell has a pid, the pid can be checked, and if it is still there it can be ended alone.
-    if [ "$tok" != '-' ] && [ "${gp:-0}" != 0 ]; then
+    if [ -n "${tok:-}" ] && [ "$tok" != '-' ]; then
       hold_confirm_gone "$1" "$d" "$gp" "$tok" "the holder died"
     fi
   fi
@@ -1489,6 +1544,17 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
   case "$HOLD_CONFIRM" in
     pinned|unverified) hold_cleanup_unlock "$cleanup_locked"; return 0 ;;
   esac
+  # ...and only under the lock. Without it the compare-and-delete is two operations with nothing
+  # holding the box between them: a competitor that took the lock first can be paused between its
+  # take and its record write, long enough for the check below to read OUR identity and the unlink
+  # to land on THEIRS. Keeping a stale record costs the next `--hold` a confirmation it will do
+  # anyway; deleting a live one costs a VM until the box reboots.
+  if [ "$cleanup_locked" != 1 ]; then
+    echo "    ...and its record is left in place: without $1's hold lock this release cannot remove"
+    echo "    state without racing whoever holds it. The next --hold clears it after confirming."
+    hold_cleanup_unlock "$cleanup_locked"
+    return 0
+  fi
   hold_state_clear "$1" "${p:-0}" "${tok:--}"
   hold_cleanup_unlock "$cleanup_locked"
   return 0

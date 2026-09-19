@@ -217,7 +217,7 @@ fi
 if [ -n "${SSH_PARTIAL:-}" ] && grep -qE "$SSH_PARTIAL" <<<"$line"; then
   case "$cmd" in
     *"--list --running"*) printf 'Windows Subsystem for Linux Distri' | perl -pe 's/(.)/$1\0/g' ;;
-    *) printf 'COMMAND\n' ;;
+    *) printf '  PID COMMAND\n' ;;
   esac
   exec sleep 900
 fi
@@ -252,9 +252,15 @@ if [ "$up" = 0 ]; then
     # exists, because the real one does: it is how the script tells "no such process" from "no
     # answer at all", and a shim that printed nothing for a dead pid would let silence pass as
     # evidence.
-    *"-e ps -o args -p "*)
-      printf 'COMMAND\n'
-      [ -f "$SSH_HOLD_DIR/guest.${cmd##* }" ] && cat "$SSH_HOLD_DIR/guest.${cmd##* }" ;;
+    *"-e ps -eo pid -o args"*)
+      # The guest's process list. Every remote holder records itself as guest.<pid> and clears that
+      # on the way out, so the directory IS the list -- and the header is printed either way,
+      # because the real one is: it is how the script tells "no such process" from "no answer".
+      printf '  PID COMMAND\n'
+      for g in "$SSH_HOLD_DIR"/guest.*; do
+        [ -e "$g" ] || continue
+        printf '%s %s\n' "${g##*.}" "$(cat "$g")"
+      done ;;
     # ...and ending that guest process by pid, which is what `unhold` falls back to.
     *"-e kill "*)        kill "${cmd##* }" 2>/dev/null ;;
     *"-e sh -s "*)
@@ -750,9 +756,14 @@ grep -q "HOLDER-EOF $guest" "$SSH_LOG" \
 # By OUR guest pid, over the alias the RECORD names. "No wsl.exe on that box" was never available
 # as evidence -- on both lab boxes it was false with nothing of ours running -- so the question the
 # release asks is about this lane's process and no other.
-grep -q "^rog-lan :: wsl.exe -d Ubuntu -e ps -o args -p $guest$" "$SSH_LOG" \
-  && ok "...asked of the VM by the guest pid the handshake recorded" \
-  || ko "the release did not ask the VM about its own guest pid: $(cat "$SSH_LOG")"
+grep -q "^rog-lan :: wsl.exe -d Ubuntu -e ps -eo pid -o args$" "$SSH_LOG" \
+  && ok "...asked of the VM itself, over the alias the record names" \
+  || ko "the release did not ask the VM for its process list: $(cat "$SSH_LOG")"
+# By TOKEN, not by the recorded pid: a hold whose handshake never answered has a token in its
+# payload and no guest pid to have recorded, and that is the holder most in need of being found.
+grep -q 'ps -eo pid -o args' "$SSH_LOG" && ! grep -q -- '-p [0-9]' "$SSH_LOG" \
+  && ok "...for the whole list, which a holder with no recorded guest pid can still be found in" \
+  || ko "the release can only ask about a pid it recorded: $(cat "$SSH_LOG")"
 
 # ...and asking must never START the VM. `wsl.exe -e` boots a stopped distro, so a release that
 # went straight to the guest would bring up the box it had just let go -- and a distro that is not
@@ -898,7 +909,7 @@ unchecked=$(sed -e :a -e '/\\$/N; s/\\\n//; ta' "$WL" | grep -n 'printf .*> "\$f
 # "Ubuntu" and a `ps` cut off before its process row both look exactly like "gone" to anything that
 # reads the output without the status. Reporting that as a verified release would delete the guest
 # pid and token over a holder that may still be running (review round 2, P1).
-for probe in 'list --running' 'ps -o args'; do
+for probe in 'list --running' 'ps -eo pid'; do
   reset_hold_state
   held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
   out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
@@ -938,16 +949,24 @@ held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
 ( env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" SSH_DELAY=3 \
       "$WL" unhold rog > "$TMP/slow-unhold2.out" 2>&1 ) &
 slow=$!
-sleep 2
+# Synchronize on the LOCK, not on the clock: the release cannot take it until the holder it killed
+# is really gone, and `kill -0` can keep answering past a fixed sleep -- so a timed wait can launch
+# the competitor into a window that has not opened, where winning the lock is legitimate and the
+# case fails for the wrong reason (review round 3, P2, reproduced by the reviewer).
+locked=0
+for _ in $(seq 1 20); do
+  grep -q '^wake-lab unhold (pid' "$WAKE_LAB_LOCK_DIR/rog.hold.lock" 2>/dev/null && { locked=1; break; }
+  sleep 1
+done
 out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
-if alive "$slow"; then
+if [ "$locked" = 1 ] && alive "$slow"; then
   wait "$slow"
   [ "$rc" -ne 0 ] && grep -q 'already spoken for' <<<"$out" && grep -q 'unhold (pid' <<<"$out" \
     && ok "a --hold arriving mid-release is refused by the lock the release holds (rc=$rc)" \
     || ko "a --hold raced a release instead of being refused by it (rc=$rc) -- $out"
 else
   wait "$slow"
-  ko "the case did not stage its window: the unhold finished before the competing hold ran"
+  ko "the case did not stage its window: the release never held the lock while the hold ran"
 fi
 reset_hold_state
 
@@ -985,6 +1004,28 @@ out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
   && ! grep -q -- '-e sh -s' "$SSH_LOG" \
   && ok "a hold over a survivor of an unfinished release is refused, and spawns nothing (rc=$rc)" \
   || ko "a second holder was stacked over an untracked survivor (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+reset_hold_state
+
+# A hold whose handshake never answered is the holder most in need of an identity, not least: the
+# guest shell may have started anyway, and if it survives its channel -- the #192 shape -- killing
+# the client and deleting the record leaves it pinning the VM with nothing naming it, while every
+# later unhold reports no holder recorded. So the failed path asks the VM by token before it
+# discards anything (review round 3, P1).
+reset_hold_state
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=2 \
+      WAKE_LAB_HOLD_TEARDOWN_SECONDS=4 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+      SSH_HOLD_ANSWERS="$HOLDER_SILENT" SSH_REMOTE_LEAKS=2 "$WL" kick-wsl --hold rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'Its record is KEPT' <<<"$out" \
+  && grep -q 'wlh-' "$TMP/state/hold-rog.pid" 2>/dev/null \
+  && ok "a failed hold whose guest shell survived keeps the token that names it (rc=$rc)" \
+  || ko "a failed hold discarded the identity of a survivor (rc=$rc) -- $out"
+# ...and that retained token is usable: the release finds the process by it, with no guest pid ever
+# having been recorded, where the old code would have said there was no holder at all.
+out=$(unhold 2>&1); rc=$?
+[ "$rc" -eq 3 ] && grep -q 'still pinned by a holder of ours' <<<"$out" \
+  && ! grep -q 'no wsl holder recorded' <<<"$out" \
+  && ok "...and a later unhold names that survivor by token, rather than reporting no holder (rc=$rc)" \
+  || ko "the retained token did not let the release find the survivor (rc=$rc) -- $out"
 reset_hold_state
 
 # A holder taken with --force never held the box's hold lock, so nothing refused another session's
