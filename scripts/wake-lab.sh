@@ -990,7 +990,18 @@ hold_remote_gone() { # hold_remote_gone <windows-alias> <token>
   # wsl.exe writes UTF-16LE, which arrives here as NUL-interleaved bytes.
   out=$(printf '%s' "$out" | tr -d '\000\r')
   [ -n "$out" ] || return 2
-  printf '%s\n' "$out" | grep -qi '^Ubuntu' || return 0
+  # "Gone" has to be something wsl SAID, not something it failed to say. `wsl --list --running`
+  # exits 1 with "There are no running distributions." when nothing runs, and every other failure
+  # -- a wsl.exe that errored, a distro in a bad state -- also prints something without our distro
+  # in it, so inferring absence from a missing line reported those as a verified teardown and let
+  # the release delete the record.
+  if printf '%s\n' "$out" | grep -qi 'no running distributions'; then return 0; fi
+  # ...and "running" has to name OUR distro EXACTLY. A prefix test matches `Ubuntu-22.04` beside a
+  # stopped `Ubuntu`, and the guest probe below would then BOOT the stopped one -- an unhold
+  # starting the VM it exists only to inspect. Trailing blanks only, plus wsl's `(Default)` mark.
+  printf '%s\n' "$out" |
+    awk '{ sub(/[ \t]+$/, "") } $0 == "Ubuntu" || $0 == "Ubuntu (Default)" { f = 1 }
+         END { exit !f }' || return 2
   # `-eo pid -o args` rather than `-o pid,args`: cmd.exe treats a comma as an argument delimiter,
   # and nothing in this command may depend on surviving that. The PID header is the marker.
   out=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" \
@@ -1442,8 +1453,14 @@ hold_confirm_gone() { # hold_confirm_gone <box> <alias> <guest pid> <token> <wha
     1) echo "    ...but its guest shell (pid $gp) is STILL RUNNING in the VM ${HOLD_TEARDOWN_SECONDS}s after $what:"
        echo "    the holder outlived its channel, which is ludics-lite#192 happening on this box."
        echo "    Ending it by pid over $dest, which is what the token makes possible:"
+       # `pkill -x -f <shape>` and not `kill <pid>`: the match and the signal happen in the same
+       # guest-side operation, so a holder that exits between them cannot have its number reused by
+       # something else that then gets killed instead. `-x` anchors the pattern to the WHOLE
+       # command line and the dots stand in for its spaces, which keeps the argument free of
+       # anything cmd.exe would take apart on the way.
        capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" \
-         "wsl.exe -d Ubuntu -e kill $gp" >/dev/null 2>&1
+         "wsl.exe -d Ubuntu -e pkill -x -f $(printf '%s' "$HOLD_GUEST_ARGV" | tr ' ' '.').$tok" \
+         >/dev/null 2>&1
        hold_watch_gone "$dest" "$tok"; obs=$?
        case "$obs" in
          0) HOLD_CONFIRM=gone

@@ -270,8 +270,15 @@ if [ "$up" = 0 ]; then
         [ -e "$g" ] || continue
         printf '%s %s\n' "${g##*.}" "$(cat "$g")"
       done ;;
-    # ...and ending that guest process by pid, which is what `unhold` falls back to.
-    *"-e kill "*)        kill "${cmd##* }" 2>/dev/null ;;
+    # ...and ending that guest process, which is what `unhold` falls back to. It goes by the
+    # holder's command shape and not by pid, so that the match and the signal are one operation in
+    # the guest: the shim reads the same guest.<pid> files, which record that shape.
+    *"-e pkill -x -f "*)
+      pat=${cmd##* }
+      for g in "$SSH_HOLD_DIR"/guest.*; do
+        [ -e "$g" ] || continue
+        [ "$(cat "$g" | tr ' ' '.')" = "$pat" ] && kill "${g##*.}" 2>/dev/null
+      done ;;
     *"-e sh -s "*)
       # The client. It owns the channel and the pump, and NOT the remote.
       chan="$SSH_HOLD_DIR/chan.$$"
@@ -950,7 +957,7 @@ env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAI
 guest=$(awk '{ print $6 }' "$TMP/state/hold-rog.pid" 2>/dev/null)
 : > "$SSH_DOWN_LIST"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
-      WAKE_LAB_HOLD_TEARDOWN_SECONDS=4 SSH_DOWN_AFTER='-e kill|rog-lan' "$WL" unhold rog 2>&1); rc=$?
+      WAKE_LAB_HOLD_TEARDOWN_SECONDS=4 SSH_DOWN_AFTER='-e pkill|rog-lan' "$WL" unhold rog 2>&1); rc=$?
 [ "$rc" -eq 3 ] && grep -q 'stopped answering, so whether that kill landed is unknown' <<<"$out" \
   && ok "a post-kill probe that cannot reach the box is unknown, not a confirmed survivor (rc=$rc)" \
   || ko "an unreachable post-kill probe was classified as a confirmed leak (rc=$rc) -- $out"
