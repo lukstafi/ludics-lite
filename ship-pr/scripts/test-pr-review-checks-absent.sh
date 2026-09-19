@@ -71,6 +71,9 @@ WORKFLOW_YAML_BASE=""
 # carries is a workflow nothing examines while its first run is on its way.
 WORKFLOW_DIR_HEAD=""
 WORKFLOW_DIR_BASE=""
+# Entries in that directory that are not workflow files. They count towards the endpoint's cap
+# just the same, which is what the cap guard has to be read against.
+WORKFLOW_DIR_OTHER=""
 # The newest merged pull request of this repository, and its head's check runs: where "does this
 # repository have a provider other than Actions" is read. The recognition reads workflows, so it
 # can answer for nothing else — and a merged PR's head is the population the question is about,
@@ -167,6 +170,7 @@ reset_fixture() {
   WORKFLOW_YAML_BASE=""
   WORKFLOW_DIR_HEAD='[".github/workflows/ci.yml"]'
   WORKFLOW_DIR_BASE=""
+  WORKFLOW_DIR_OTHER='[]'
   MERGED_PRS_JSON=$(jq -cn --arg s "$SAMPLE_SHA" \
     '[{merged_at:"2026-09-18T00:00:00Z", head:{sha:$s}}]')
   SAMPLE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}}]')
@@ -229,12 +233,16 @@ gh() {
   # library asks for it — the base64 JSON envelope's decoder is spelled differently on this
   # fleet's two platforms.
   "repos/$REPO/actions/workflows/"*) response=$(jq -cn --arg p "$WORKFLOW_PATH" '{path:$p}') ;;
+  # Entries, not only files: the endpoint's cap is on the array, and a response holding
+  # directories can carry fewer files than the cap and still be truncated.
   "repos/$REPO/contents/.github/workflows?ref=$BASE_SHA")
     response=$(jq -cn --argjson f "${WORKFLOW_DIR_BASE:-$WORKFLOW_DIR_HEAD}" \
-      '[$f[] | {type:"file", path:.}]')
+      --argjson d "$WORKFLOW_DIR_OTHER" \
+      '[$f[] | {type:"file", path:.}] + [$d[] | {type:"dir", path:.}]')
     ;;
   "repos/$REPO/contents/.github/workflows?ref="*)
-    response=$(jq -cn --argjson f "$WORKFLOW_DIR_HEAD" '[$f[] | {type:"file", path:.}]')
+    response=$(jq -cn --argjson f "$WORKFLOW_DIR_HEAD" --argjson d "$WORKFLOW_DIR_OTHER" \
+      '[$f[] | {type:"file", path:.}] + [$d[] | {type:"dir", path:.}]')
     ;;
   "repos/$REPO/contents/"*"?ref=$BASE_SHA")
     response="${WORKFLOW_YAML_BASE:-$WORKFLOW_YAML}"
@@ -715,6 +723,14 @@ test_a_capped_workflow_directory_keeps_the_head_waiting() {
   run_gate
   assert_eq "$GATE_RC" 4 "a directory response at the endpoint cap is not an inventory"
   assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers instead"
+  # The cap is on ENTRIES, so a response padded to it with directories is truncated even though
+  # its FILE count is far below (review round 7).
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  WORKFLOW_DIR_OTHER=$(jq -cn '[range(999) | ".github/workflows/d\(.)"]')
+  run_gate
+  assert_eq "$GATE_RC" 4 "the cap is read against the whole array, not the files in it"
 }
 
 # --- review round 5: the list is not the file set, and the range is read once ------------------

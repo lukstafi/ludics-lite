@@ -4481,11 +4481,19 @@ CONTENTS_DIR_CAP=1000
 
 workflow_files_at() {
   local raw count
+  # The count is of the WHOLE array and leads the rows, as it does on the workflow list and on the
+  # provider sample. Counting what survived `select(.type == "file")` would be the cap read one
+  # projection too late (review round 7): the limit is on entries, so a response holding
+  # directories can carry fewer than the cap in files and still have left a later workflow out.
   raw=$(gh_retry read api "repos/$REPO/contents/.github/workflows?ref=$1" \
-    --jq 'if type == "array" then (.[] | select(.type == "file") | .path) else empty end') ||
-    return 1
+    --jq 'if type == "array" then (((. | length) | tostring),
+                                   (.[] | select(.type == "file") | .path))
+          else empty end') || return 1
   [ -n "$raw" ] || return 1
-  count=$(printf '%s\n' "$raw" | grep -c .)
+  count="${raw%%$'\n'*}"
+  raw="${raw#*$'\n'}"
+  case "$count" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$count" -gt 0 ] || return 1
   [ "$count" -lt "$CONTENTS_DIR_CAP" ] || return 1
   printf '%s\n' "$raw" | grep -E '\.ya?ml$'
 }
