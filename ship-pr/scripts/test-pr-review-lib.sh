@@ -31,6 +31,15 @@
 #                                       logs the endpoint to $REQUEST_LOG (and, when paginated,
 #                                       $PAGINATE_LOG) if the suite set them; the answer goes
 #                                       through the --jq filter the call carried, if any
+#   fixture_call_count <name>           inside a fixture `gh`: one more call under <name>, and
+#   fixture_call_reset [<name>...]      the new total on stdout, so `[ "$(fixture_call_count
+#                                       body)" -ge 2 ]` is "from the second read on". The count
+#                                       lives in a FILE under $TEST_ROOT, never in a variable:
+#                                       gh_retry runs the fixture inside a command substitution,
+#                                       and a variable the fixture increments dies with that
+#                                       subshell — the merge suite hand-rolled three such files
+#                                       (ludics-lite#274) before this took their place. reset
+#                                       zeroes the named counters, or all of them, between cases
 #   retune <NAME>=<value>...            moves pr-review.sh's source-time constants (GRACE, STALL,
 #                                       ROUND_GAP, ABSENT_GRACE, CHECKS_INTERVAL, …) for the
 #   restore_tuning                      current case; run_tests restores them when it ends, and a
@@ -430,6 +439,45 @@ gh_fixture_answer() {
   else
     printf '%s\n' "$1"
   fi
+}
+
+# --- counting a fixture's calls --------------------------------------------------------------
+# A fixture `gh` that must answer differently from the Nth call on needs a count that SURVIVES
+# it: gh_retry runs the fixture as `$(gh ...)`, so the fixture's whole life is one subshell, and
+# a `CALLS=$((CALLS + 1))` inside it is thrown away with the answer captured. A file is the only
+# thing a subshell can leave behind for the next one, which is why every suite that needed this
+# grew a `printf x >>"$FILE"` and a `wc -l` of its own (the merge suite three of them, the base
+# fixture's ROUND_READS a fourth). One helper, keyed by name, under the suite's $TEST_ROOT so the
+# EXIT trap collects it with everything else; there is no default root to write into, so a suite
+# without a TEST_ROOT is refused rather than counted in $PWD.
+#
+# One line appended and the lines counted, rather than a number read, bumped and written back:
+# appends of one short line are atomic where a read-modify-write is not, and the fixture runs in
+# whatever order gh_retry and the shell fork it, so a rewritten total could lose a call.
+fixture_call_count() {
+  local dir
+  [ $# -eq 1 ] && [ -n "$1" ] || bail "fixture_call_count: one counter name expected, got $# argument(s): $*"
+  [ -n "${TEST_ROOT:-}" ] || bail "fixture_call_count $1: TEST_ROOT is unset — ask test_tmpdir for one before the fixture runs"
+  dir="$TEST_ROOT/fixture-calls"
+  mkdir -p "$dir" || bail "fixture_call_count $1: cannot create $dir"
+  printf 'x\n' >>"$dir/$1"
+  wc -l <"$dir/$1" | tr -d ' '
+}
+
+# fixture_call_reset [<name>...]: the named counters back to zero, or every counter with no name.
+# A missing counter is already zero, so resetting one that never counted is not an error.
+fixture_call_reset() {
+  local dir name
+  [ -n "${TEST_ROOT:-}" ] || bail "fixture_call_reset: TEST_ROOT is unset — ask test_tmpdir for one before the fixture runs"
+  dir="$TEST_ROOT/fixture-calls"
+  if [ $# -eq 0 ]; then
+    rm -rf "$dir"
+    return 0
+  fi
+  for name in "$@"; do
+    [ -n "$name" ] || bail "fixture_call_reset: an empty counter name"
+    rm -f "$dir/$name"
+  done
 }
 
 # --- breaking ONE jq program on purpose (ludics-lite#89, #179) --------------------------------
@@ -1554,6 +1602,38 @@ test_a_refused_probe_leaves_no_diagnostics_in_tmpdir() {
 # The control cannot be "run this file from a spaced directory" — it would run this case again,
 # forever. It is a throwaway suite there instead, carrying the ludics-lite#46 shadow, which must
 # still be refused.
+# The counter's one claim: a fixture run inside a command substitution can still count. The
+# body below increments from a `$(...)` exactly the way gh_retry calls a fixture, and a variable
+# bumped in the same place is shown NOT to reach the case — which is the reason the helper exists.
+test_fixture_call_count_survives_a_command_substitution() {
+  local root
+  test_tmpdir root fixture-calls
+  control "TEST_ROOT=$(printf '%q' "$root")" \
+    'VAR=0' \
+    'fixture() { VAR=$((VAR + 1)); fixture_call_count body; }' \
+    'test_counts() {' \
+    '  local n' \
+    '  n=$(fixture); assert_eq "$n" 1 "the first call"' \
+    '  n=$(fixture); assert_eq "$n" 2 "the second call, counted across the substitution"' \
+    '  assert_eq "$VAR" 0 "the variable bumped in the same substitution never reaches the case"' \
+    '  n=$(fixture_call_count other); assert_eq "$n" 1 "a second name counts on its own"' \
+    '  fixture_call_reset body' \
+    '  n=$(fixture); assert_eq "$n" 1 "reset by name starts that counter over"' \
+    '  n=$(fixture_call_count other); assert_eq "$n" 2 "and leaves the other alone"' \
+    '  fixture_call_reset' \
+    '  n=$(fixture_call_count other); assert_eq "$n" 1 "reset with no name zeroes them all"' \
+    '}' \
+    'run_tests test_counts'
+  assert_eq "$CONTROL_RC" 0 "the counter should survive the substitution ($CONTROL_ERR)"
+  assert_contains "$CONTROL_OUT" "PASS: test_counts" "the throwaway case should run"
+  control 'TEST_ROOT=' 'test_no_root() { fixture_call_count body; }' 'run_tests test_no_root'
+  assert_eq "$CONTROL_RC" 1 "with no TEST_ROOT the count is refused, not written somewhere ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "TEST_ROOT is unset" "the refusal should say what is missing"
+  control 'test_two_names() { fixture_call_count a b; }' 'run_tests test_two_names'
+  assert_eq "$CONTROL_RC" 1 "two names is a call that meant something else ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "one counter name expected" "and the refusal says so"
+}
+
 test_the_guard_survives_a_path_with_spaces() {
   local root
   test_tmpdir root "lib space"
@@ -1698,6 +1778,7 @@ tests=(
   test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason
   test_a_refused_probe_leaves_no_diagnostics_in_tmpdir
   test_the_guard_survives_a_path_with_spaces
+  test_fixture_call_count_survives_a_command_substitution
   test_the_self_test_runs_from_a_renamed_copy
   test_mutation_copy_refuses_missing_or_ambiguous_targets
   test_snapshot_path_mutation_is_caught

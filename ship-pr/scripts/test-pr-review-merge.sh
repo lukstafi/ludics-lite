@@ -42,11 +42,10 @@ DEFAULT_BRANCH_FAIL_LATER=""           # nonempty = it answers with a 404 from t
 PR_BODY="A body with nothing to close."  # what the body read answers with
 PR_BODY_LATER=""                       # nonempty = what the SECOND body read on answers with
 BODY_FAIL=""                           # nonempty = the body read answers with a 404
-# The read counter travels in a FILE: gh_retry calls the fixture inside a command substitution,
-# so a variable it increments dies with that subshell -- as CALLS_FILE already exists for.
-READS_FILE="$TEST_ROOT/body-reads"
-BASE_READS_FILE="$TEST_ROOT/base-reads"
-DEF_READS_FILE="$TEST_ROOT/def-reads"
+# The "from the SECOND read on" switches above are counted by the lib's fixture_call_count, under
+# the names body, base and default-branch: gh_retry calls the fixture inside a command
+# substitution, so a variable it increments dies with that subshell, and the count has to travel
+# in a file -- as CALLS_FILE already does. Three hand-rolled files did this before (ludics-lite#274).
 
 # The three library functions this suite replaces, declared so the shadow guard lets them through:
 # the build signal is not under test here. gate_checks calls them inside command substitutions;
@@ -66,6 +65,7 @@ run_signal() { printf '0\t%s\n' "$RUN_REASON"; return 0; }
 warn_base_drift() { return 0; }
 
 gh() {
+  local reads
   case "${1:-} ${2:-}" in
   "api repos/$REPO/pulls/7")
     case "$*" in
@@ -76,20 +76,19 @@ gh() {
     *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
     *'.head.sha'*) printf '%s\tbase-sha\tclaude/topic\n' "$CURRENT_HEAD" ;;
     *'.base.ref'*)
-      printf 'base\n' >>"$BASE_READS_FILE"
-      if [ -n "$BASE_LATER" ] && [ "$(wc -l <"$BASE_READS_FILE" | tr -d ' ')" -ge 2 ]; then
+      if [ "$(fixture_call_count base)" -ge 2 ] && [ -n "$BASE_LATER" ]; then
         printf '%s\n' "$BASE_LATER"
       else
         printf '%s\n' "$PR_BASE"
       fi
       ;;
     *'.body'*)
-      printf 'read\n' >>"$READS_FILE"
+      reads=$(fixture_call_count body)
       if [ -n "$BODY_FAIL" ]; then
         printf 'gh: Not Found (HTTP 404)\n' >&2
         return 1
       fi
-      if [ -n "$PR_BODY_LATER" ] && [ "$(wc -l <"$READS_FILE" | tr -d ' ')" -ge 2 ]; then
+      if [ -n "$PR_BODY_LATER" ] && [ "$reads" -ge 2 ]; then
         printf '%s\n' "$PR_BODY_LATER"
       else
         printf '%s\n' "$PR_BODY"
@@ -101,8 +100,7 @@ gh() {
     esac
     ;;
   "api repos/$REPO")
-    printf 'def\n' >>"$DEF_READS_FILE"
-    if [ -n "$DEFAULT_BRANCH_FAIL_LATER" ] && [ "$(wc -l <"$DEF_READS_FILE" | tr -d ' ')" -ge 2 ]; then
+    if [ "$(fixture_call_count default-branch)" -ge 2 ] && [ -n "$DEFAULT_BRANCH_FAIL_LATER" ]; then
       printf 'gh: Not Found (HTTP 404)\n' >&2
       return 1
     fi
@@ -139,9 +137,7 @@ gh() {
 # to the other. MERGE_OUTPUT stays the pair, which is what every older case asserts against.
 run_merge() {
   local rc
-  : >"$READS_FILE"
-  : >"$BASE_READS_FILE"
-  : >"$DEF_READS_FILE"
+  fixture_call_reset
   : >"$CALLS_FILE"
   set +e
   (cmd_merge "$REPO#7" "$@") >"$OUT_FILE" 2>"$ERR_FILE"
