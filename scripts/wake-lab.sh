@@ -406,11 +406,17 @@ HOLD_STATE_DIR=${WAKE_LAB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wake-
 # noticing. It is a FAULT and not a cleanup detail, so it leaves the command non-zero -- see
 # release_hold for why a holder can only be gone by having died under the lane.
 HOLD_ANOMALY=0
-# Set when a holder was still running in the VM after its channel died AND after unhold tried to
-# end it by pid: the box is still pinned by something of ours and no command here can free it. A
-# different fault from the one above and reported as a different exit status, because it says the
-# opposite thing about the lane -- the results are fine, the BOX is not.
+# Set when a release could NOT leave the box demonstrably free: either a holder of ours was still
+# running in the VM after its channel died and after unhold ended it by pid, or the box never
+# answered and nothing here knows either way. A different fault from the one above and reported as
+# a different exit status, because it says the opposite thing about the lane -- the results are
+# fine, the BOX is not. The two share a status deliberately: what a caller does about them is the
+# same, which is to look at that box.
 HOLD_LEAK=0
+# What the last confirmation established: gone, pinned, or unverified. It is what decides whether
+# a release may remove the record -- an unverified teardown keeps the guest pid and token, which
+# are the only things a later unhold could finish the job with.
+HOLD_CONFIRM=""
 # The local-time hours on the Windows box that the unattended sweep occupies: the routine's 07:20
 # launch plus its longest lane. Written `<start>-<end>`, end exclusive, and it may wrap midnight.
 SWEEP_HOURS=${WAKE_LAB_SWEEP_HOURS:-7-11}
@@ -1009,6 +1015,17 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
         echo "  ANOMALY: the holder for $name answers its token from guest pid $gp, not the recorded $rgp; the record does not describe what is running"
         return 1
       fi
+      # A record whose handshake never completed carries guest pid 0 -- its `--hold` was
+      # interrupted between the spawn and the rewrite. This reuse just learned the real one, and
+      # it is the only thing a later `unhold` can check the VM against or end the tree by, so it
+      # goes into the record before this call reports the holder as observed.
+      if [ "$rgp" = 0 ] &&
+         ! printf '%s %s %s %s %s %s %s\n' "$rp" "$rd" "$rt" "$rsc" "$rtok" "$gp" "$rprot" > "$f" 2>/dev/null; then
+        echo "  wsl holder for $name answered from guest shell $gp, but that pid could NOT be recorded at $f"
+        echo "    An unhold would then have no pid to check the VM against, which is the state this"
+        echo "    reuse exists to leave behind. Fix the state directory and take the hold again."
+        return 1
+      fi
       echo "  wsl holder observed on $name (guest shell $gp answered its token over $rd)"
       return 0
     fi
@@ -1152,8 +1169,18 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   # not exist), and the 20-second settle those two needed between them was a proxy for exactly what
   # the handshake now measures directly -- so it is gone, along with the wait it cost every hold.
   if gp=$(hold_handshake "$name" "$token" "$HOLD_WAIT_SECONDS"); then
-    printf '%s %s %s %s %s %s %s\n' \
-      "$pid" "$dest" "$spawn_epoch" "$sidecar" "$token" "$gp" "$prot" > "$f" 2>/dev/null
+    # Checked, like the first write: a state directory that filled up between the two leaves a
+    # record with guest pid 0 or a truncated one, and reporting the hold established over that
+    # hands the lane a holder `unhold` cannot check the VM for or end by pid. An unusable record
+    # is the unrecordable holder one step later, and it gets the same treatment.
+    if ! printf '%s %s %s %s %s %s %s\n' \
+         "$pid" "$dest" "$spawn_epoch" "$sidecar" "$token" "$gp" "$prot" > "$f" 2>/dev/null; then
+      kill "$pid" "$sidecar" 2>/dev/null
+      rm -f "$f" "$fifo" "$out" 2>/dev/null
+      echo "  wsl holder on $name answered its token, but its record could NOT be completed at $f"
+      echo "    — holder (pid $pid) killed rather than left running with no pid to unhold it by"
+      return 1
+    fi
     echo "  wsl holder observed on $name (guest shell $gp in the VM answered its token over $dest)"
     return 0
   fi
@@ -1209,9 +1236,13 @@ hold_confirm_gone() { # hold_confirm_gone <box> <alias> <guest pid> <token> <wha
   local name=$1 dest=$2 gp=$3 tok=$4 what=$5 obs
   hold_watch_gone "$dest" "$gp" "$tok"; obs=$?
   case "$obs" in
-    0) echo "    ...and its guest shell (pid $gp) is gone from the VM, observed over $dest" ;;
-    2) echo "    ...but $dest did not answer, so this does NOT claim the VM is unheld: the holder's"
-       echo "    tree may still be running there. Check the box when it is reachable." ;;
+    0) HOLD_CONFIRM=gone
+       echo "    ...and its guest shell (pid $gp) is gone from the VM, observed over $dest" ;;
+    2) HOLD_CONFIRM=unverified; HOLD_LEAK=1
+       echo "    ...but $dest did not answer, so this does NOT claim the VM is unheld: the holder's"
+       echo "    tree may still be running there. The record is KEPT -- its guest pid ($gp) and"
+       echo "    token are the only things that could ever end that tree without a restart-wsl --"
+       echo "    so run 'wake-lab.sh unhold $name' again when the box answers, and it will finish." ;;
     1) echo "    ...but its guest shell (pid $gp) is STILL RUNNING in the VM ${HOLD_TEARDOWN_SECONDS}s after $what:"
        echo "    the holder outlived its channel, which is ludics-lite#192 happening on this box."
        echo "    Ending it by pid over $dest, which is what the token makes possible:"
@@ -1219,10 +1250,11 @@ hold_confirm_gone() { # hold_confirm_gone <box> <alias> <guest pid> <token> <wha
          "wsl.exe -d Ubuntu -e kill $gp" >/dev/null 2>&1
        hold_watch_gone "$dest" "$gp" "$tok"; obs=$?
        case "$obs" in
-         0) echo "    ...ended: the guest shell is gone and nothing of ours is left on $name. Note that"
+         0) HOLD_CONFIRM=gone
+            echo "    ...ended: the guest shell is gone and nothing of ours is left on $name. Note that"
             echo "    the CHANNEL did not end it -- that is the contract this holder is built on, so a"
             echo "    box reaching this line is worth reporting rather than just cleaning up." ;;
-         *) HOLD_LEAK=1
+         *) HOLD_LEAK=1; HOLD_CONFIRM=pinned
             echo "    ...and it SURVIVED that too. $name is still pinned by a holder of ours: guest"
             echo "    pid $gp, token $tok. Nothing short of ending that process or a restart-wsl"
             echo "    (which destroys every other session on the box) will free it." ;;
@@ -1230,11 +1262,50 @@ hold_confirm_gone() { # hold_confirm_gone <box> <alias> <guest pid> <token> <wha
   esac
 }
 
+# Remove a holder's record and channel, and ONLY that holder's.
+#
+# `unhold` now spends up to HOLD_TEARDOWN_SECONDS between the kill and here, asking the VM whether
+# the guest shell is gone -- and the hold lock went with the sidecar at the top of the release, so
+# that window is long enough for another session's `kick-wsl --hold` to take the lock and write ITS
+# record, fifo and stdout file at these very paths. Unlinking those would leave that holder running,
+# locked, and unrecorded: a VM pinned until the box reboots, caused by a cleanup. It would not even
+# notice, because an open fifo survives its own unlink. So the removal is conditional on the state
+# still naming the holder this call ended.
+hold_state_clear() { # hold_state_clear <box> <pid> <token> — rc 1 if the state is somebody else's
+  local f=$HOLD_STATE_DIR/hold-$1.pid rec p2 tok2
+  rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
+  if [ -n "$rec" ]; then
+    read -r p2 _ _ _ tok2 _ _ <<<"$rec"
+    if [ "$p2" != "$2" ] || [ "$tok2" != "$3" ]; then
+      echo "    ...and $1's record now names another run's holder (pid $p2): its state is left alone"
+      return 1
+    fi
+  elif [ -e "$f" ] && [ ! -s "$f" ]; then
+    # EMPTY, which is specifically another run's claim, taken between its noclobber create and its
+    # pid write. A record that is merely unparseable is NOT that: a claim is filled in with one
+    # write, so nothing else ever leaves a non-empty record this cannot read, and the entry above
+    # has already judged it as naming no holder. Reading the two as one would let a corrupt record
+    # outlive every unhold, which is a box nothing can ever be recorded against again.
+    echo "    ...and another run has claimed $1's record: its state is left alone"
+    return 1
+  elif [ ! -e "$f" ]; then
+    # No record at all: nothing here is demonstrably ours, and the fifo and stdout file at these
+    # paths may already belong to a hold being taken right now. Only the marker goes.
+    rm -f "${f%.pid}.releasing"
+    return 0
+  fi
+  rm -f "$f" "${f%.pid}.releasing" "$(hold_fifo_path "$1")" "$(hold_out_path "$1")"
+  return 0
+}
+
 release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (an already-dead
                  # holder is reported by setting HOLD_ANOMALY, which the caller turns into rc 2,
                  # and a holder that outlived its channel by setting HOLD_LEAK, which becomes
                  # rc 3), always says what it did and never claims more than it observed
   local f=$HOLD_STATE_DIR/hold-$1.pid rec p d t sc tok gp prot rel fifo out sargs i
+  # Per box: `unhold rog minix` releases them in one process, and a verdict carried over from the
+  # first box would decide what is kept or removed for the second.
+  HOLD_CONFIRM=""
   # An unhold is not atomic: it kills the holder and then removes the record, and between those
   # two it can be interrupted (or a second unhold can overlap it -- which the routine now invites,
   # since it tells a run whose unhold has not come back to chase it). The record left behind then
@@ -1243,7 +1314,9 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
   # kill: whoever finds the record next can tell "an unhold ended this" from "this died".
   rel=${f%.pid}.releasing
   fifo=$(hold_fifo_path "$1"); out=$(hold_out_path "$1")
-  if [ ! -r "$f" ]; then rm -f "$rel" "$fifo" "$out"; echo "  no wsl holder recorded for $1"; return 0; fi
+  # Only the marker: the fifo and stdout file at these paths may belong to a hold being taken right
+  # now, and a record is what says otherwise.
+  if [ ! -r "$f" ]; then rm -f "$rel"; echo "  no wsl holder recorded for $1"; return 0; fi
   rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
   read -r p d t sc tok gp prot <<<"${rec:-}"; : "$t"
   # The hold-lock sidecar goes with the holder: it exits on its own once the holder is gone, and
@@ -1282,7 +1355,16 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
   elif [ -e "$rel" ]; then
     # The holder is gone and an unhold is on record as having ended it. That is a completed
     # release whose record outlived it, not a loss: say so, clear up, and leave rc 0.
-    echo "  wsl holder on $1 was already ended by an earlier unhold (pid ${p:-?}); its record is cleared"
+    echo "  wsl holder on $1 was already ended by an earlier unhold (pid ${p:-?})"
+    # ...except that "ended" is only half of it since #192. An earlier unhold may have killed the
+    # client and then not reached the box to see whether the tree went with it; it keeps its record
+    # precisely so that this run can finish the job, and clearing that record would throw away the
+    # guest pid and token that are the only way to end that tree short of a restart-wsl.
+    if [ "$tok" != '-' ] && [ "${gp:-0}" != 0 ]; then
+      hold_confirm_gone "$1" "$d" "$gp" "$tok" "an earlier unhold ended its client"
+    else
+      echo "    ...and it carries no guest pid to check the VM against; its record is cleared"
+    fi
   elif [ ! -e "$f" ]; then
     # The record VANISHED between this run's entry and here, which is the one interleaving the
     # marker cannot cover on its own: a concurrent unhold got through its whole release -- marker,
@@ -1330,7 +1412,13 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
       hold_confirm_gone "$1" "$d" "$gp" "$tok" "the holder died"
     fi
   fi
-  rm -f "$f" "$rel" "$fifo" "$out"
+  # What the release leaves behind. An UNVERIFIED teardown keeps everything: the record is the only
+  # place the guest pid and token live, and a later unhold re-probes the box off exactly those two
+  # (the marker branch above). Anything else is done with, and goes only if it still names us.
+  if [ "$HOLD_CONFIRM" = unverified ]; then
+    return 0
+  fi
+  hold_state_clear "$1" "${p:-0}" "${tok:--}"
   return 0
 }
 
@@ -1714,10 +1802,13 @@ if [ "$VERB" = unhold ]; then
   # the lane on it.
   #
   # rc 3 is the opposite fault and is deliberately not folded into it: the holder did its job and
-  # the lane's results are fine, but the box is still pinned by a process of ours that survived
-  # both its channel dying and being ended by pid. That needs a human on that box, and it needs
-  # them for a reason that has nothing to do with the lane's results -- reporting both as rc 2
+  # the lane's results are fine, but this release could not leave the box demonstrably free -- a
+  # process of ours survived both its channel dying and being ended by pid, or the box never
+  # answered and nothing here knows either way. That needs a human on that box, and it needs them
+  # for a reason that has nothing to do with the lane's results -- reporting both as rc 2
   # would make the sweep discard good work over a box it should instead be complaining about.
+  # An unverified release KEEPS its record, so running `unhold` again once the box answers picks
+  # the job up where this one left it rather than starting from no identity at all.
   # The anomaly is checked first: of the two, it is the one that says the results cannot be
   # trusted, and a caller reacting to only one status should react to that one.
   [ "$HOLD_ANOMALY" = 1 ] && exit 2

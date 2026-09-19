@@ -308,8 +308,10 @@ took:
 Nothing else ends them deliberately: the holder cannot expire under the last unit, so a lane that
 is never unheld leaves a `wsl.exe` pinning the VM (and an ssh connection from this Mac) until the
 box reboots or that connection dies. `unhold` exits 2 if a holder had already died under the lane
-(treat that box's results as suspect) and 3 if one is still pinning the box after the release tried
-both its channel and a kill by pid — that box needs a human, though the lane's results are fine. Do it before the retry budget's rerun too, or take the rerun's
+(treat that box's results as suspect) and 3 if the release could not leave the box demonstrably
+free — a holder survived both its channel and a kill by pid, or the box never answered. That box
+needs a human, though the lane's results are fine; on the "never answered" case, run `unhold` again
+once it is reachable and the release finishes the job off the record it kept. Do it before the retry budget's rerun too, or take the rerun's
 own `kick-wsl --hold` over the still-held box — `kick-wsl --hold` reuses a live holder rather than
 stacking a second one.
 

@@ -189,8 +189,10 @@ is this lane's identity: `--hold` declares the VM up only once the holder has sa
 from inside the guest, which no `tasklist` reading can substitute for (both lab boxes already show
 a `wsl.exe` with nothing of ours running), and `unhold` uses it to ask the VM whether that exact
 guest shell is gone before it claims anything. `unhold` exits 2 when the holder had already died
-under the lane — its results are suspect — and 3 when a holder of ours is still pinning the box
-after both its channel and a kill by pid.
+under the lane — its results are suspect — and 3 when it could not leave the box demonstrably
+free: a holder of ours survived both its channel and a kill by pid, or the box never answered. An
+unverified release keeps its record, because the guest pid and token in it are the only things a
+later `unhold` could finish the job with; run it again when the box answers.
 
 `restart-wsl` and the power verbs take **both** and refuse the box if either is held, until the
 holder lets go or `--force` takes it anyway. The OCANNL cross-machine sweep reserves each box's
