@@ -1640,11 +1640,26 @@ sweep_lock() { # sweep_lock <lock-dir|-> <home> <ssh-alias> [<ready> <keep>]
     else WAKE_LAB_LOCK_DIR=$1; export WAKE_LAB_LOCK_DIR; fi
     HOME=$2; export HOME
     LAB_LOCK_WAIT=2; export LAB_LOCK_WAIT
-    bash -c '. "$1" || exit 2
-             take_lab_lock "$(lab_box_of "$2")" || exit 1
-             [ -n "$3" ] || exit 0
-             : > "$3"
-             while [ -e "$4" ]; do sleep 1; done' \
+    # Its OWN process group, so the watchdog below can kill the whole tree. Killing the wrapper
+    # alone leaves whatever it was blocked in -- a `sleep`, a blocking flock -- orphaned WITH the
+    # inherited lock descriptor, and an flock lives until every descriptor onto that open file
+    # description is closed. That is not a new hazard here: it is the one the stray-nap cases above
+    # exist for, and it surfaced against this very lab lock. `perl` rather than `set -m`, which
+    # would make the shell print job-control notices into the suite's output.
+    # ...and it RECORDS that group rather than letting the caller assume it. `$!` is the pid of
+    # the job bash started, which is not reliably the process that ends up leading the group: how
+    # many levels of subshell survive between them is a bash optimization, not a contract. The
+    # first draft killed `-$!`, that named no group, the kill was a no-op and the `wait` behind it
+    # never returned -- the suite wedged for 20 minutes. So the leader writes its own pgid down.
+    exec perl -e 'setpgrp(0,0);
+                  open my $fh, ">", $ARGV[0] or die $!; print $fh "$$\n"; close $fh;
+                  shift @ARGV; exec @ARGV or die $!' \
+      "$TMP/sweep-pgid" \
+      bash -c '. "$1" || exit 2
+               take_lab_lock "$(lab_box_of "$2")" || exit 1
+               [ -n "$3" ] || exit 0
+               : > "$3"
+               while [ -e "$4" ]; do sleep 1; done' \
       _ "$TMP/sweep-lock.sh" "$3" "${4:-}" "${5:-}" )
 }
 # EVERY call into that imported helper goes through these two, so every one of them runs in the
@@ -1653,8 +1668,9 @@ sweep_lock() { # sweep_lock <lock-dir|-> <home> <ssh-alias> [<ready> <keep>]
 # no longer observes LAB_LOCK_WAIT would otherwise hang this suite outright instead of reporting
 # the regression the cases below exist to report. Holding rather than returning is also what lets
 # a caller prove the lock is REAL, since the flock lives exactly as long as the shell that took it.
+SUITE_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
 sweep_hold_start() { # sweep_hold_start <lock-dir|-> <home> <ssh-alias> -- 0 iff it is now holding
-  rm -f "$TMP/sweep-ready"; : > "$TMP/sweep-keep"
+  rm -f "$TMP/sweep-ready" "$TMP/sweep-pgid"; : > "$TMP/sweep-keep"
   sweep_lock "$1" "$2" "$3" "$TMP/sweep-ready" "$TMP/sweep-keep" >"$TMP/sweep-holder.log" 2>&1 &
   sweep_holder=$!
   local deadline=$((SECONDS + 30))
@@ -1668,12 +1684,23 @@ sweep_hold_stop() { # sweep_hold_stop -- let the holder go, and do not return un
   local deadline=$((SECONDS + 15))
   rm -f "$TMP/sweep-keep"
   while kill -0 "$sweep_holder" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+  # The recorded group first -- that is what reaches a `sleep` or a blocking flock the helper was
+  # stuck in, holding an inherited lock descriptor. Never this suite's own group, however the file
+  # got its contents. Then the job itself, which is what makes the `wait` below terminate.
+  local pgid; pgid=$(cat "$TMP/sweep-pgid" 2>/dev/null)
+  case $pgid in
+    ''|*[!0-9]*) ;;
+    "$SUITE_PGID") ko "the sweep holder recorded this suite's own process group ($pgid); not killing it" ;;
+    *) kill -KILL -"$pgid" 2>/dev/null ;;
+  esac
   kill -KILL "$sweep_holder" 2>/dev/null
   wait "$sweep_holder" 2>/dev/null
   # The kernel closes a killed holder's descriptor a moment after the kill returns, and the next
-  # case takes the same lock, so do not hand it back until it is really free.
+  # case takes the same lock, so do not hand it back until it is really free. The LANE lock only:
+  # `lock_free` would also test `<box>.hold.lock`, which the held-hold-lock case above is holding
+  # ON PURPOSE across this call, so waiting on it would burn the whole deadline every single run.
   deadline=$((SECONDS + 15))
-  while ! lock_free rog && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+  while ! file_free "$LOCKS/rog.lock" && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
 }
 if ! git -C "$STAGING" rev-parse --git-dir >/dev/null 2>&1; then
   skip "the cross-repository lock contract is UNCHECKED: no ocannl-staging git checkout at \
@@ -1704,14 +1731,18 @@ its lock the way the cases below assume, so they would stop being about the live
       home="$TMP/sweep-home-$box"; mkdir -p "$home"
       sweep_hold_start - "$home" "$sshalias"; rc=$?
       mine=$(env -u WAKE_LAB_LOCK_DIR HOME="$home" WAKE_LAB_HOSTS="$TMP/absent.sh" \
-        "$WL" lock-path "$box" 2>&1)
+        "$WL" lock-path "$box" 2>&1); mine_rc=$?
       rel=".local/state/wake-lab/$box.lock"
-      if [ "$rc" -eq 0 ] && [ "$(created "$home")" = "$(printf '%q' "$rel")" ] \
+      # lock-path's own status is part of the claim: printing the right path and exiting nonzero is
+      # a broken public command, and comparing only the text would report it as agreement.
+      if [ "$rc" -eq 0 ] && [ "$mine_rc" -eq 0 ] \
+         && [ "$(created "$home")" = "$(printf '%q' "$rel")" ] \
          && [ "$mine" = "$home/$rel" ]; then
         ok "the lock the sweep really takes for $sshalias is the one lock-path answers for $box"
       else
         ko "the two repositories disagree about $sshalias (rc=$rc): the sweep's own take_lab_lock \
-left [$(created "$home")] under its HOME, while wake-lab answers '$mine' for box $box -- the \
+left [$(created "$home")] under its HOME, while wake-lab answers '$mine' (rc=$mine_rc) for box \
+$box -- the \
 interlock is off, and nothing else in either repository would say so. \
 $(cat "$TMP/sweep-holder.log" 2>/dev/null)"
       fi
