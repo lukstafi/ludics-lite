@@ -921,20 +921,29 @@ hold_handshake() { # hold_handshake <box> <token> <seconds> — echo the holder'
 # no such pid, and an ssh that never connected are all "non-zero" — only the output tells them
 # apart. Silence is therefore never read as good news: it is rc 2, and the caller says so.
 hold_remote_gone() { # hold_remote_gone <windows-alias> <guest pid> <token>
-  local out
+  local out rc
+  # A CAPPED probe answers nothing, whatever it managed to print first. `capped` kills a wedged
+  # remote command and the command substitution keeps the bytes that arrived before it did, so a
+  # `wsl --list` cut off before it reached "Ubuntu", or a `ps` header cut off before its process
+  # row, both LOOK exactly like the good news this function exists to be careful about. Every
+  # reading below is therefore gated on the status first: the only thing a fired cap establishes
+  # is that nothing was established.
   out=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" \
-        'wsl.exe --list --running' 2>/dev/null)
+        'wsl.exe --list --running' 2>/dev/null); rc=$?
+  [ "$rc" = "$CAP_EXPIRED" ] && return 2
   # wsl.exe writes UTF-16LE, which arrives here as NUL-interleaved bytes.
   out=$(printf '%s' "$out" | tr -d '\000\r')
   [ -n "$out" ] || return 2
   printf '%s\n' "$out" | grep -qi '^Ubuntu' || return 0
-  # `-o args` and not `args=`: the header is printed whether or not the pid exists, so a non-empty
-  # reply is proof the probe RAN in the guest, which is what separates "no such process" from "no
-  # answer". No `=` or `,` reaches cmd.exe either, both of which it treats as argument delimiters.
+  # `-o args` and not `args=`: the header is printed whether or not the pid exists, so the HEADER
+  # is what separates "no such process" from "no answer". It is required by name rather than taken
+  # as any non-empty output, for the reason above -- a truncated reply is not a reading.
+  # No `=` or `,` reaches cmd.exe either, both of which it treats as argument delimiters.
   out=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" \
-        "wsl.exe -d Ubuntu -e ps -o args -p $2" 2>/dev/null)
+        "wsl.exe -d Ubuntu -e ps -o args -p $2" 2>/dev/null); rc=$?
+  [ "$rc" = "$CAP_EXPIRED" ] && return 2
   out=$(printf '%s' "$out" | tr -d '\r')
-  [ -n "$out" ] || return 2
+  printf '%s\n' "$out" | grep -q 'COMMAND' || return 2
   printf '%s\n' "$out" | grep -q -- "$3" && return 1
   return 0
 }
@@ -1062,6 +1071,31 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   # Claim the record BEFORE spawning, with noclobber. Two `--hold` runs for one box would
   # otherwise both spawn a holder and the second write would erase the first pid, leaving a
   # holder nobody can unhold and a VM pinned until the box reboots.
+  # ...but a marker with a usable record behind it is not stale state, it is an UNFINISHED
+  # RELEASE. Since #192 an unhold that could not reach the box keeps both deliberately, so that a
+  # later one can re-probe off the recorded guest pid and token -- and those two are the only way
+  # that tree can ever be ended short of a host-global restart-wsl. Deleting them here and starting
+  # a second holder would make the first one permanently untracked, still pinning the VM, and
+  # outliving the release of the holder about to be spawned. So this run finishes that job first,
+  # and only takes the box if the VM says the old guest shell is gone.
+  if [ -e "${f%.pid}.releasing" ]; then
+    rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
+    if [ -n "$rec" ]; then
+      read -r rp rd rt rsc rtok rgp rprot <<<"$rec"; : "$rp" "$rt" "$rsc" "$rprot"
+      if [ "$rtok" != '-' ] && [ "$rgp" != 0 ]; then
+        echo "  an earlier unhold on $name ended its holder's client but never confirmed the VM was free;"
+        echo "  finishing that release before taking the box:"
+        HOLD_CONFIRM=""
+        hold_confirm_gone "$name" "$rd" "$rgp" "$rtok" "an earlier unhold ended its client"
+        if [ "$HOLD_CONFIRM" != gone ]; then
+          echo "  wsl holder NOT started on $name: that earlier holder may still be running in the VM,"
+          echo "    and starting a second one would leave it untracked and pinning the box for good."
+          echo "    Its record is kept; run 'wake-lab.sh unhold $name' again when the box answers."
+          return 1
+        fi
+      fi
+    fi
+  fi
   # ...and a marker from some earlier release goes with it: left in place it would mask the loss
   # of the holder about to be spawned, which is the one thing this reporting exists to catch.
   rm -f "$f" "${f%.pid}.releasing" 2>/dev/null
@@ -1254,12 +1288,23 @@ hold_confirm_gone() { # hold_confirm_gone <box> <alias> <guest pid> <token> <wha
             echo "    ...ended: the guest shell is gone and nothing of ours is left on $name. Note that"
             echo "    the CHANNEL did not end it -- that is the contract this holder is built on, so a"
             echo "    box reaching this line is worth reporting rather than just cleaning up." ;;
+         2) HOLD_CONFIRM=unverified; HOLD_LEAK=1
+            echo "    ...and then $dest stopped answering, so whether that kill landed is unknown."
+            echo "    The record is KEPT: run 'wake-lab.sh unhold $name' again when the box answers." ;;
          *) HOLD_LEAK=1; HOLD_CONFIRM=pinned
             echo "    ...and it SURVIVED that too. $name is still pinned by a holder of ours: guest"
             echo "    pid $gp, token $tok. Nothing short of ending that process or a restart-wsl"
             echo "    (which destroys every other session on the box) will free it." ;;
        esac ;;
   esac
+}
+
+# Give the box's hold lock back at the end of a release. Closing the descriptor is what releases
+# the flock, and it is spelled with the literal bash 3.2 needs in a redirection.
+hold_cleanup_unlock() { # hold_cleanup_unlock <took-it?>
+  [ "$1" = 1 ] || return 0
+  eval "exec $HOLD_FD>&-" 2>/dev/null
+  return 0
 }
 
 # Remove a holder's record and channel, and ONLY that holder's.
@@ -1302,7 +1347,7 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
                  # holder is reported by setting HOLD_ANOMALY, which the caller turns into rc 2,
                  # and a holder that outlived its channel by setting HOLD_LEAK, which becomes
                  # rc 3), always says what it did and never claims more than it observed
-  local f=$HOLD_STATE_DIR/hold-$1.pid rec p d t sc tok gp prot rel fifo out sargs i
+  local f=$HOLD_STATE_DIR/hold-$1.pid rec p d t sc tok gp prot rel fifo out sargs i cleanup_locked=0 was_live=0
   # Per box: `unhold rog minix` releases them in one process, and a verdict carried over from the
   # first box would decide what is kept or removed for the second.
   HOLD_CONFIRM=""
@@ -1317,6 +1362,7 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
   # Only the marker: the fifo and stdout file at these paths may belong to a hold being taken right
   # now, and a record is what says otherwise.
   if [ ! -r "$f" ]; then rm -f "$rel"; echo "  no wsl holder recorded for $1"; return 0; fi
+  # From here the release can hold the box's lock, and every return below goes through the unlock.
   rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
   read -r p d t sc tok gp prot <<<"${rec:-}"; : "$t"
   # The hold-lock sidecar goes with the holder: it exits on its own once the holder is gone, and
@@ -1333,6 +1379,7 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     esac
   fi
   if hold_pid_live "$f"; then
+    was_live=1
     : > "$rel" 2>/dev/null
     kill "$p" 2>/dev/null
     # The kill is where this used to stop, on the reasoning that "killing the local client closes
@@ -1340,6 +1387,27 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     # client is first waited out -- a signalled process is not a dead one, and the EOF the holder
     # ends on cannot cross a channel that is still open -- and then the VM itself is asked.
     for i in 1 2 3 4 5; do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+  fi
+  # ...and only NOW can the release take the box's hold lock, which is why this sits below the kill
+  # rather than beside the sidecar's. The lock lives on a descriptor the HOLDER inherits -- that is
+  # the whole mechanism, the flock lasting exactly as long as the holder -- so while that client is
+  # alive the lock is not free to take, and a take attempted before the kill simply fails.
+  #
+  # Taking it matters because comparing the record's identity and then unlinking it are two
+  # operations, and between them -- as between any two steps from here on, and this release now
+  # spends seconds asking the VM a question -- another session's `kick-wsl --hold` can take the box
+  # the sidecar has stopped protecting and write its own record, fifo and stdout file at these
+  # paths. The identity check narrows that window; holding the box is what closes it. A `--hold`
+  # arriving now is refused by the same interlock that refuses a restart, and one that got in FIRST
+  # refuses us instead -- the honest outcome, with the identity check keeping this release off its
+  # state.
+  for i in 1 2 3 4 5; do
+    lock_take_fd "$(hold_lock_path "$1")" "unhold" "$HOLD_FD" && { cleanup_locked=1; break; }
+    sleep 1
+  done
+  [ "$cleanup_locked" = 1 ] ||
+    echo "  note: $1's hold lock is held by something else, so this release is not serialized against it; nothing of another run's will be removed"
+  if [ "$was_live" = 1 ]; then
     echo "  wsl holder released on $1 (pid $p killed)"
     [ "$prot" = unprotected ] &&
       echo "    It was taken with --force and never held $1's hold lock, so the box was NOT protected from another session's restart-wsl while it ran"
@@ -1412,13 +1480,17 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
       hold_confirm_gone "$1" "$d" "$gp" "$tok" "the holder died"
     fi
   fi
-  # What the release leaves behind. An UNVERIFIED teardown keeps everything: the record is the only
-  # place the guest pid and token live, and a later unhold re-probes the box off exactly those two
-  # (the marker branch above). Anything else is done with, and goes only if it still names us.
-  if [ "$HOLD_CONFIRM" = unverified ]; then
-    return 0
-  fi
+  # What the release leaves behind, and the rule is one line: the state goes only when the box has
+  # been OBSERVED free. An unverified teardown keeps it because the record is the only place the
+  # guest pid and token live and a later unhold re-probes off exactly those two (the marker branch
+  # above); a PINNED one keeps it for the same reason and a better one, since something of ours is
+  # demonstrably still running there. Anything that reaches here having confirmed nothing at all --
+  # a legacy record, which has no identity to confirm with -- is cleared as before.
+  case "$HOLD_CONFIRM" in
+    pinned|unverified) hold_cleanup_unlock "$cleanup_locked"; return 0 ;;
+  esac
   hold_state_clear "$1" "${p:-0}" "${tok:--}"
+  hold_cleanup_unlock "$cleanup_locked"
   return 0
 }
 
