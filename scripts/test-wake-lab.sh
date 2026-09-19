@@ -620,7 +620,7 @@ held_kick() { # held_kick <ssh-up> <answers?> [reg output] [holder lifetime] -- 
   # does and at no other time, so a case that wants one dying under the lane asks for it.
   # WAKE_LAB_HOLD_WAIT_SECONDS is the handshake's wait and not a settle any more -- there is
   # nothing left to settle, because the token cannot come back before the holder is running.
-  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=3 \
       WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="$1" \
       SSH_HOLD_ANSWERS="$2" SSH_REG="${3:-}" SSH_HOLD_LIFE="${4:-0}" "$WL" kick-wsl --hold rog
 }
