@@ -1622,7 +1622,14 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     if [ -n "${tok:-}" ] && [ "$tok" != '-' ]; then
       hold_confirm_gone "$1" "$d" "$gp" "$tok" "an earlier unhold ended its client"
     else
-      echo "    ...and it carries no guest pid to check the VM against; its record is cleared"
+      # A tokenless record on the retry path: the same unverifiable box as the live legacy branch,
+      # one invocation later. Clearing it and exiting 0 here would undo that fix on the second
+      # `unhold` -- which is the one an operator runs precisely BECAUSE the first said 3.
+      HOLD_CONFIRM=unverified; HOLD_LEAK=1
+      echo "    ...and it carries no token, so nothing here can check the VM against it: $1 stays"
+      echo "    unverified (exit 3) and its record is kept. Nothing automatic can settle a holder"
+      echo "    from before the handshake; a fresh 'kick-wsl --hold $1' clears the record once you"
+      echo "    have satisfied yourself about that box."
     fi
   elif [ ! -e "$f" ]; then
     # The record VANISHED between this run's entry and here, which is the one interleaving the

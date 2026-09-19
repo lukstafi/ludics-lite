@@ -592,6 +592,24 @@ out=$(kick "rog-nv-wsl" 2>&1); rc=$?
 # does not continue from a previous holder starts from a clean state AND a free lock. Unlinking
 # the lock file is enough: the flock belongs to the inode, so the next take creates a new one.
 reset_hold_state() {
+  local rec
+  # The recorded LOCAL processes go too, and by record rather than by pattern: a holder's sidecar
+  # carries its box's hold lock for as long as it lives, so one left running by a case refuses
+  # every reservation in the cases after it -- which reads as a restart being refused by a lock
+  # nobody took, in a block that has nothing to do with holds. Fields 1 and 4 are the client and
+  # its sidecar. By record and not by a scan of the process table, because that table is shared
+  # with whatever else runs on this machine, including another copy of this suite.
+  # Each field is checked for being a real pid before it is signalled, and `0` is the reason why:
+  # a legacy record carries `0` in the sidecar field, and `kill 0` signals the caller's whole
+  # PROCESS GROUP -- which is this suite. It killed the run outright, silently, three cases later
+  # than the record that caused it.
+  local p sc
+  for rec in "$TMP/state"/hold-*.pid; do
+    [ -e "$rec" ] || continue
+    p=$(awk '{ print $1 }' "$rec"); sc=$(awk '{ print $4 }' "$rec")
+    case "$p" in ''|0|*[!0-9]*) ;; *) kill "$p" 2>/dev/null ;; esac
+    case "$sc" in ''|0|*[!0-9]*) ;; *) kill "$sc" 2>/dev/null ;; esac
+  done
   kill_stub_holders
   rm -rf "$TMP/state"
   rm -f "$WAKE_LAB_LOCK_DIR"/*.lock
@@ -1275,10 +1293,15 @@ grep -q 'stopped being RESERVED' <<<"$out" \
 # telling a run whose unhold has not come back to chase it) leaves a record naming a pid that
 # unhold itself deliberately ended. Reporting that as a lost holder would mark valid lane results
 # suspect, so the release writes its intent down BEFORE the kill and a retry reads it.
-mkdir -p "$TMP/state"; printf '999999 rog-lan 1 0\n' > "$TMP/state/hold-rog.pid"
+# A TOKENED leftover, which is what a modern interrupted release leaves: the retry re-probes the
+# VM over that token, finds nothing of ours (no such guest here), and only then calls it complete.
+# A tokenless leftover is a different answer now -- nothing can check it, so it stays unverified --
+# and that is the legacy shape, tested with the legacy holder further down.
+mkdir -p "$TMP/state"
+printf '999999 rog-lan 1 0 wlh-gone-0-0 4242 protected\n' > "$TMP/state/hold-rog.pid"
 : > "$TMP/state/hold-rog.releasing"
 expect "an interrupted unhold's leftover record is a completed release, not a lost holder" 0 "was already ended by an earlier unhold" -- \
-  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog
 grep -q 'ANOMALY' <<<"$out" \
   && ko "a deliberate release was reported as a lost holder -- $out" \
   || ok "...and raises no anomaly, so the lane's results are not called suspect"
