@@ -694,8 +694,9 @@ it — re-stamping it there spent a round of API latency out of the grace, which
 `--wait=301` over a 300s grace reached its ceiling seconds before the clock it was sized against,
 every time. The ceiling's own arithmetic is pinned here too (ludics-lite#175): the grace is tested
 once per round and rounds are one poll interval apart, so a `--wait` in the band between the grace
-and one interval past it is refused — sized to outlive the grace, unable to reach the round that
-settles it — while one at or below the grace stays a bounded peek that reports no verdict. The absence is then read per workflow: a run that EXISTS for the tip and has not
+and one interval past it draws a loud line — the ceiling cap does schedule it one settling round,
+which a tip that moves takes away — while one at or below the grace is a bounded peek that reports
+no verdict, and a zero grace is outside the question entirely. The absence is then read per workflow: a run that EXISTS for the tip and has not
 judged it — queued, running, or stopped — keeps the refusal because only that run can answer, and
 so does a run in flight anywhere on the branch, which is judging a tree the tip contains (waiting
 for it does better than settling: its commit becomes the verdict the tip then trails). What ends

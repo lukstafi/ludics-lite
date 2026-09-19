@@ -254,8 +254,9 @@
 #      branch and no run for the tip exists to judge it. It settles at once, without the grace,
 #      when every commit on the first-parent path from the judged one up to the tip changes only
 #      paths within the workflow's own paths-ignore (ludics-lite#156). A `base --wait=N` in the
-#      band (grace, grace+SHIP_PR_CHECKS_INTERVAL) is REFUSED: it is sized to outlive the grace
-#      and cannot reach the round that settles it (ludics-lite#175). `checks`/`merge` apply the
+#      band (grace, grace+SHIP_PR_CHECKS_INTERVAL) is WARNED about: it reaches the settle only on
+#      the single round the ceiling cap schedules, and only if the tip has not moved
+#      (ludics-lite#175). `checks`/`merge` apply the
 #      grace to the head before calling a build signal ABSENT rather than not-created-yet
 #      (ludics-lite#24), and settle a run-less head at once on the same paths-ignore recognition,
 #      walking the PR's own commits from its merge base (ludics-lite#176),
@@ -4920,9 +4921,15 @@ head_within_paths_ignore() {
     # carries the file at all.
     wpath=$(workflow_path "$wid") || return 1
     listed="${listed}${wpath}"$'\n'
-    # Only an `active` workflow creates runs: one disabled, or listed after its file was deleted,
-    # has no filter to read at this head and no run to wait for either.
-    [ "$wstate" = active ] || continue
+    # A non-`active` row — disabled, or listed after the file was deleted — describes the DEFAULT
+    # branch, like every other field of this list. If the file is nonetheless present at either end
+    # of THIS merge, the merge context can still run it (a PR against a branch that kept a workflow
+    # the default branch dropped is the shape), so it is examined like any other. Only a row whose
+    # file is in neither end is skipped: there is nothing there to read and nothing to wait for
+    # (review round 8).
+    if [ "$wstate" != active ]; then
+      grep -qxF -- "$wpath" <<<"$declared"$'\n'"$bdeclared" || continue
+    fi
     body=$(workflow_body "$wpath" "$head") || return 1
     bbody=$(workflow_body "$wpath" "$base") || return 1
     [ "$body" = "$bbody" ] || return 1
@@ -4978,31 +4985,29 @@ cmd_base() {
     shift
   done
   case "$wait_for" in '' | *[!0-9]*) die "base: --wait takes seconds, got '$wait_for'" ;; esac
-  # A --wait sized to outlive the absence grace, but not by a whole round, cannot reach the round
-  # that settles (ludics-lite#175). The grace is only ever tested once per round, after that
-  # round's own API calls, and rounds are one CHECKS_INTERVAL apart — so between the round before
-  # the grace expires and the one after it lies a whole interval, and a ceiling landing inside
-  # that interval ends the wait at NO VERDICT for a tip whose absence the next round would have
-  # settled. `--wait=301` over a 300s grace was exactly that, and read as a red-adjacent refusal
-  # by every caller of the wave gate.
+  # A --wait sized to outlive the absence grace, but not by a whole round, gets exactly ONE chance
+  # at the settle, and a WARNING says so (ludics-lite#175). It is not a refusal, and round 8 is why
+  # the first draft's was wrong: the sleep is capped at the remaining ceiling, so the last round is
+  # scheduled AT the ceiling and its grace test — which runs before the ceiling test, on a `now`
+  # read after that round's API calls — does reach the settle. `--wait=301` over a 300s grace
+  # works. What it does not have is a second chance: that single round has to find the tip where it
+  # left it, and a tip that MOVED restamps the grace from that round's own clock, after which no
+  # ceiling this close can reach it. A ceiling a whole poll interval past the grace has an ordinary
+  # round after the grace expires and does not depend on the last one landing well.
   #
-  # A --wait at or BELOW the grace is not that mistake and is not refused: it is a bounded peek —
-  # "tell me what you have within N seconds" — which cannot settle an absence and says so, exit 4.
-  # Only the band between the grace and one round past it is a number that means to outlive the
-  # grace and cannot.
-  # A zero grace is outside the band entirely: with nothing to outlive, the absence is eligible
-  # to settle on the FIRST round, so every positive ceiling reaches it and `--wait=30` over
-  # `SHIP_PR_BASE_ABSENT_GRACE=0` is a perfectly good bounded wait for what is in flight (review
-  # round 1). The band is about a grace a ceiling has to outlast, and there is none.
+  # So the line is loud and the call proceeds. A --wait at or BELOW the grace is not this shape at
+  # all and is not warned about: it is a bounded peek — "tell me what you have within N seconds" —
+  # which cannot settle an absence and says so, exit 4. And a ZERO grace is outside the question
+  # entirely, since the absence is eligible to settle on the first round and every positive ceiling
+  # reaches it.
   if [ "$ABSENT_GRACE" -gt 0 ] && [ "$wait_for" -gt "$ABSENT_GRACE" ] &&
     [ "$wait_for" -lt $((ABSENT_GRACE + CHECKS_INTERVAL)) ]; then
-    die "base: --wait=$wait_for cannot outlive the ${ABSENT_GRACE}s absence grace it is sized" \
-      "against. The absence of a run for the tip is only settled on the round AFTER the grace" \
-      "expires, and a round is one ${CHECKS_INTERVAL}s poll interval, so a ceiling in" \
-      "($ABSENT_GRACE, $((ABSENT_GRACE + CHECKS_INTERVAL))) always arrives first and reports NO" \
-      "VERDICT for a tip that was about to settle (ludics-lite#175). Use --wait of at least" \
-      "$((ABSENT_GRACE + CHECKS_INTERVAL)) (SHIP_PR_BASE_ABSENT_GRACE + SHIP_PR_CHECKS_INTERVAL)," \
-      "or --wait of at most $ABSENT_GRACE for a bounded peek that does not claim to settle one."
+    warn "base: --wait=$wait_for is inside the ${ABSENT_GRACE}s absence grace's own round" \
+      "(SHIP_PR_BASE_ABSENT_GRACE=$ABSENT_GRACE, SHIP_PR_CHECKS_INTERVAL=$CHECKS_INTERVAL)." \
+      "It reaches the settle only on the single round scheduled at the ceiling, and only if the" \
+      "tip has not moved — a tip that moves restamps the grace and no ceiling this close can then" \
+      "reach it. Size it from the two knobs instead:" \
+      "--wait=$((ABSENT_GRACE + CHECKS_INTERVAL)) or more (ludics-lite#175)."
   fi
   [ -n "$REPO" ] || REPO=$(repo_from_cwd) || true
   [ -n "$REPO" ] || die "base: name the repo — \`base owner/name [branch]\`, --repo, or REPO=." \

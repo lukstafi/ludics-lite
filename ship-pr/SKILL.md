@@ -727,7 +727,9 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   a range past the cap, a base-side edit to the workflow, a second provider — refuses and costs the
   grace, exactly as `base --wait` does. The same grace is what
   `base --wait`'s ceiling is sized against, and a `--wait` in the band between the grace and one
-  poll interval past it is refused: it cannot reach the round that settles (ludics-lite#175).
+  poll interval past it draws a loud line: it reaches the settle only on the single round the
+  ceiling cap schedules, and a tip that moves restamps the grace out from under it
+  (ludics-lite#175).
 
 Only the newest **completed** run of each workflow and event is judged, the same `filter=latest`
 semantics the check lookup asks for: a re-triggered invocation supersedes its own cancelled

@@ -553,7 +553,7 @@ grep -Fxq -- '--repo example/project base master --wait=360 grace=300 interval=6
 # The value itself, and the relation behind it: 360 is 300 + 60, a whole round of margin over the
 # grace. `--wait=301` left a one-second margin that one round's API latency swallowed, so the gate
 # reached its ceiling and refused dispatch for a docs-only tip the next round would have settled
-# (ludics-lite#175); the checker now refuses that band outright, and nothing here may spell it.
+# (ludics-lite#175); the checker now warns loudly about that band, and nothing here may spell it.
 grep -q -- '--wait=301 ' "$BASE_CALL_LOG" && ko "the hand-spelled 301 ceiling is back" || ok "no base read carries a ceiling inside the grace's own round"
 original_base=$(git -C "$proj" rev-parse origin/master)
 later_base=$(git -C "$proj" commit-tree 'HEAD^{tree}' -p HEAD -m later)

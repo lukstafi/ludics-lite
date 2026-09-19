@@ -166,6 +166,7 @@ reset_fixture() {
   WORKFLOWS_JSON=$(jq -cn '{workflows:[{id:1,name:"ci",state:"active"}]}')
   WORKFLOW_TOTAL=""
   WORKFLOW_PATH=".github/workflows/ci.yml"
+  for v in $(set | LC_ALL=C sed -n 's/^\(WORKFLOW_PATH_[0-9][0-9]*\)=.*/\1/p'); do unset "$v"; done
   WORKFLOW_YAML="$UNFILTERED_YAML"
   WORKFLOW_YAML_BASE=""
   WORKFLOW_DIR_HEAD='[".github/workflows/ci.yml"]'
@@ -184,7 +185,7 @@ reset_fixture() {
 }
 
 gh() {
-  local response="" fixture_head
+  local response="" fixture_head wid fixture_wpath
   gh_fixture_parse "$@"
   # A GLOB, deliberately unquoted: "repos/o/n/commits/<sha>" is a prefix of the check-runs
   # endpoint, so a substring match could not fail the commit read alone — and a case that failed
@@ -232,7 +233,13 @@ gh() {
   # The workflow's own file: where it lives, then what it says AT THE HEAD. Served raw, as the
   # library asks for it — the base64 JSON envelope's decoder is spelled differently on this
   # fleet's two platforms.
-  "repos/$REPO/actions/workflows/"*) response=$(jq -cn --arg p "$WORKFLOW_PATH" '{path:$p}') ;;
+  "repos/$REPO/actions/workflows/"*)
+    # Per id, so a case can give one listed workflow a path of its own (a row whose file is not in
+    # either end of the merge); every other id answers with the shared path.
+    wid=${FIXTURE_ENDPOINT##*/actions/workflows/}
+    eval "fixture_wpath=\${WORKFLOW_PATH_$wid:-\$WORKFLOW_PATH}"
+    response=$(jq -cn --arg p "$fixture_wpath" '{path:$p}')
+    ;;
   # Entries, not only files: the endpoint's cap is on the array, and a response holding
   # directories can carry fewer files than the cap and still be truncated.
   "repos/$REPO/contents/.github/workflows?ref=$BASE_SHA")
@@ -686,6 +693,32 @@ test_a_base_side_workflow_edit_keeps_the_head_waiting() {
   assert_eq "$GATE_RC" 4 "the head's copy does not speak for the merge context"
   assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers"
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and nothing is settled on the stale copy"
+}
+
+# --- review round 8 ---------------------------------------------------------------------------
+# A non-`active` row describes the DEFAULT branch, like every other field of this list. A PR
+# against a branch that KEPT a workflow the default branch dropped still has that file in its
+# merge context, and the merge context is what runs — so the row's state is not proof that the
+# copy here cannot run, and a path present at either end is examined like any other.
+test_a_deleted_workflow_still_in_the_merge_context_is_examined() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$UNFILTERED_YAML" # the retained copy cannot explain itself
+  WORKFLOWS_JSON=$(jq -cn '{workflows:[{id:1,name:"ci",state:"deleted"}]}')
+  run_gate
+  assert_eq "$GATE_RC" 4 "a file the merge context still holds is not excused by the list's state"
+  assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers instead"
+  # The same row when the file really is gone from both ends: nothing to read, nothing to wait
+  # for, and the OTHER workflow's filter answers.
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  WORKFLOWS_JSON=$(jq -cn '{workflows:[{id:1,name:"ci",state:"active"},
+                                       {id:9,name:"gone",state:"deleted"}]}')
+  WORKFLOW_PATH_9=".github/workflows/gone.yml" # listed, but in neither directory
+  run_gate
+  assert_eq "$GATE_RC" 0 "a row whose file is in neither end of the merge is skipped"
+  assert_contains "$GATE_OUTPUT" ": ABSENT" "and the live workflow's filter answers"
 }
 
 # --- review round 6 ---------------------------------------------------------------------------
@@ -1351,6 +1384,7 @@ tests=(
   test_the_range_is_read_once_for_every_workflow
   test_a_workflow_the_list_calls_advisory_is_still_explained
   test_a_capped_workflow_directory_keeps_the_head_waiting
+  test_a_deleted_workflow_still_in_the_merge_context_is_examined
   test_a_second_check_provider_keeps_the_head_waiting
   test_an_advisory_provider_does_not_block_the_recognition
   test_a_sample_without_checks_keeps_the_head_waiting
