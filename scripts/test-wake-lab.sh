@@ -1145,6 +1145,20 @@ for _ in 1 2 3 4 5; do grep -q held "$TMP/extlock2.out" 2>/dev/null && break; sl
 env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
     WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
     "$WL" kick-wsl --hold --force rog >/dev/null 2>&1
+# ...and while that lock is STILL held, an ordinary --hold over the unprotected holder is refused
+# rather than reported as a successful hold: `wsl up` is read as "the VM is held", and this one can
+# still be destroyed mid-lane by another session's restart-wsl (review round 9, P1).
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'carries no' <<<"$out" && ! grep -q '^wsl up$' <<<"$out" \
+  && ok "a reuse that cannot repair a --force holder's protection is refused, not reported up (rc=$rc)" \
+  || ko "an unprotected holder was reported as a held VM (rc=$rc) -- $out"
+# ...unless this run says --force too, which is how a caller accepts an unprotected box.
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+      WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
+      "$WL" kick-wsl --hold --force rog 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'NOT protected' <<<"$out" \
+  && ok "...while --force accepts it and says what it is accepting (rc=$rc)" \
+  || ko "--force did not carry the unprotected reuse (rc=$rc) -- $out"
 # The lock's owner goes away, as the run that held it would at the end of its own lane.
 kill "$extlock2" 2>/dev/null; wait "$extlock2" 2>/dev/null
 out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?

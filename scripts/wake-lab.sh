@@ -1040,7 +1040,8 @@ LANE_FD=8
 HOLD_FD=9      # the descriptor the box's HOLD lock lives on; the holder inherits exactly this one
 hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it is ours, in that VM
   local name=$1 dest=$2 pid f fifo out token spawn_epoch spawned=0 sidecar=0 gp prot=protected
-  local rec rec_seen rp rd rt rsc rtok rgp rprot own theirs
+  local rec rec_seen rec_existed now_existed rp rd rt rsc rtok rgp rprot own theirs
+  local hold_locked=${HOLD_LOCKED:-0}
   # The box's HOLD lock — "do not destroy this VM" — and the holder is what carries it. A restart
   # path already holds it on HOLD_FD (its reservation took both of that box's locks before the
   # kick, and set HOLD_LOCKED to say so); a plain `kick-wsl --hold` does not, so it takes it here,
@@ -1081,9 +1082,20 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
         else
           echo "    ...was taken with --force; this run took $name's hold lock for it, but could not record that"
         fi
-      else
+      elif [ "$FORCE" = 1 ]; then
         echo "    ...taken with --force: it never held $name's hold lock, and this run cannot take it either,"
         echo "    so $name's VM is NOT protected from another session's restart-wsl for the rest of this lane"
+      else
+        # An ordinary --hold asks for a held VM, and `wsl up` is read as one. This holder carries
+        # no flock and this run could not take one for it, so returning success here would report a
+        # box as held that another session's restart-wsl can still destroy mid-lane -- the one
+        # claim this flag exists to make truthfully. Refusing says the same thing honestly, and
+        # --force is how a caller says it accepts an unprotected box.
+        echo "  wsl holder NOT started on $name: the live holder was taken with --force and carries no"
+        echo "    hold lock, and $(lock_holder "$(hold_lock_path "$name")") holds it now, so this run"
+        echo "    cannot take one for it. That VM is not protected from another session's restart-wsl."
+        echo "    Wait for that lock, or pass --force to accept an unprotected box."
+        return 1
       fi
     fi
     if [ "$rtok" = '-' ]; then
@@ -1124,12 +1136,12 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
     return 1
   fi
   if [ "${HOLD_LOCKED:-0}" != 1 ] &&
-     ! lock_take_fd "$(hold_lock_path "$name")" "--hold" "$HOLD_FD"; then
+     ! lock_take_fd_strict "$(hold_lock_path "$name")" "--hold" "$HOLD_FD"; then
     if [ "$FORCE" = 1 ]; then
       # Recorded, not just printed: the line below scrolls past, while the record is what `unhold`
       # reads at the end of the lane -- and "this box was never protected" is exactly what a lane
       # whose results depend on the VM surviving needs told, however long afterwards (#184 (b)).
-      prot=unprotected
+      prot=unprotected; hold_locked=0
       echo "  wsl holder on $name proceeds WITHOUT the hold lock (--force): $(lock_holder "$(hold_lock_path "$name")")"
     else
       echo "  wsl holder NOT started on $name: $(lock_holder "$(hold_lock_path "$name")") — that box's VM is already spoken for; wait for the holder, or --force"
@@ -1163,8 +1175,11 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   # loses the pending cleanup it was the only sign of, and a holder that died WITHOUT an unhold --
   # the ludics-lite#237 shape, whose orphan the lore says nothing can name -- is confirmed here
   # too, where before this it was simply deleted.
-  # The record exactly as this call saw it, which is what the unlink below is allowed to remove.
-  rec_seen=$(cat "$f" 2>/dev/null)
+  # The record exactly as this call saw it, which is what the unlink below is allowed to remove --
+  # including whether it was THERE. Content alone cannot tell "no record" from "another run's
+  # zero-length claim", since `cat` answers the empty string for both, and reading the second as
+  # the first would let an unserialized racer delete a claim created a moment ago.
+  rec_seen=$(cat "$f" 2>/dev/null); rec_existed=0; [ -e "$f" ] && rec_existed=1
   rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
   if [ -n "$rec" ]; then
     read -r rp rd rt rsc rtok rgp rprot <<<"$rec"; : "$rp" "$rt" "$rsc" "$rprot"
@@ -1190,7 +1205,8 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   # freshly created noclobber claim and let both spawn a holder over one record. The claim exists
   # precisely to make that impossible, so what is removed here is the record this call INSPECTED
   # and nothing else; a record that changed underneath is another run's, and its claim stands.
-  if [ "$(cat "$f" 2>/dev/null)" = "${rec_seen:-}" ]; then
+  now_existed=0; [ -e "$f" ] && now_existed=1
+  if [ "$now_existed" = "$rec_existed" ] && [ "$(cat "$f" 2>/dev/null)" = "${rec_seen:-}" ]; then
     rm -f "$f" "${f%.pid}.releasing" 2>/dev/null
   else
     echo "  wsl holder for $name is being created by another run ($f changed underneath); nothing was started"
@@ -1207,6 +1223,7 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   # This lane's identity, and the only thing about the holder that is not the same on every box and
   # in every run. Bare word characters: it is spelled into a Windows command line, into the guest's
   # argv, and into a grep pattern over `ps` output, and it must mean the same thing in all three.
+  [ "$prot" = protected ] && hold_locked=1
   token=wlh-$$-$(date +%s)-${RANDOM:-0}
   # The channel. It is a fifo and not a pipe because a pipe cannot be reopened, and the handshake
   # -- including a LATER invocation's handshake against this same holder -- has to be able to write
@@ -1359,12 +1376,19 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
     hold_confirm_gone "$name" "$dest" 0 "$token" "its failed hold killed the client"
     if [ "$HOLD_CONFIRM" = gone ]; then
       echo "    nothing of ours holds that VM"
-      # Compare-and-delete, as the release does. This shell normally still holds the box's hold
-      # lock -- lock_take_fd opened it here and the holder only inherited a copy -- so a competing
-      # --hold is refused throughout. Not always, though: a `--force` hold never took it, and
-      # lock_take_fd fails open when it cannot even create the file. In those cases the probe above
-      # has just spent seconds unlocked, which is long enough for another run to own these paths.
-      hold_state_clear "$name" "$pid" "$token" >/dev/null
+      # Compare-and-delete, as the release does, and only while this shell really holds the box's
+      # hold lock -- which it normally does, since lock_take_fd_strict opened fd 9 HERE and the
+      # holder only inherited a copy, so a competing --hold is refused throughout. When it does
+      # not (a --force hold, or a lock directory that could not be opened at all) the probe above
+      # has just spent seconds unlocked, and compare-and-delete is two operations: a replacement
+      # landing between them would have this call remove a LIVE holder's state. Unserialized, the
+      # state stays; the next --hold confirms and clears it, which it now does for any record.
+      if [ "$hold_locked" = 1 ]; then
+        hold_state_clear "$name" "$pid" "$token" >/dev/null
+      else
+        echo "    Its record is left in place: without $name's hold lock this cannot remove state"
+        echo "    without racing whoever holds it. The next --hold clears it after confirming."
+      fi
     else
       # The marker says the client was ended deliberately, which is what stops the next reader
       # calling this a holder the lane lost.
