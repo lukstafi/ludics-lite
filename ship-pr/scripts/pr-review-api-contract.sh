@@ -351,6 +351,12 @@ else
     'all(.[]; (.id | type == "number") and (.name | type == "string" and length > 0 and (test("\t") | not)))' "$wflist"
   pin "every workflow carries the path the paths-ignore read asks for, under .github/workflows/" \
     'all(.[]; .path | type == "string" and startswith(".github/workflows/"))' "$wflist"
+  # head_within_paths_ignore examines only an `active` workflow: a disabled one, or one listed
+  # after its file was deleted, has no filter to read at the head and no run to wait for. A state
+  # vocabulary that grew a new word for "live" would make that read skip a workflow that does run,
+  # and the recognition would settle a head whose run is on its way.
+  pin "every workflow carries a state drawn from the vocabulary the head recognition reads (active = can create a run)" \
+    'all(.[]; .state as $s | ($s | type == "string") and (["active", "deleted", "disabled_fork", "disabled_inactivity", "disabled_manually"] | index($s)))' "$wflist"
   # One page of 100 is all cmd_base asks for: past that a workflow simply vanishes from the
   # report, and its standing verdict with it. Worth knowing before it happens, not after.
   pin "this repository's workflows fit the single page cmd_base reads ($(jq length <<<"$wflist") of a page of 100)" \
@@ -466,7 +472,10 @@ else
 # `.status` is not pinned here either, for the same reason as on jobs[]: build_checks projects
 # `.name`, `.conclusion` and `.html_url`, and the pending/finished distinction it needs it reads
 # off the null conclusion, never off the status. `.app.slug` is pinned because the correlation
-# below selects on it.
+# below selects on it — and because providers_are_actions_only now decides a GATE on it: it answers
+# "does this repository have a check provider the workflow filters cannot speak for", and a slug
+# for Actions that moved would make every check look like a third party's and cost the
+# paths-ignore recognition its fast path (ludics-lite#176, review round 2).
 pin "every check run carries a non-empty name (build_checks skips a row with none), conclusion (present, null while unfinished), html_url and app.slug" \
   'all(.[]; (.name | type == "string" and length > 0) and has("conclusion") and (.conclusion == null or (.conclusion | type == "string"))
              and (.html_url | type == "string") and (.app.slug | type == "string"))' "$checks"
@@ -474,6 +483,11 @@ pin "check-run conclusions are in the vocabulary conclusion_class classifies" \
   "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$checks"
 pin "every check run carries a check_suite.id (build_checks reads by name across every suite and provider)" \
   'all(.[]; .check_suite.id | type == "number")' "$checks"
+# The literal providers_are_actions_only compares against. This repository's own checks are Actions'
+# alone, so at least one row must carry it; a slug that moved shows up here rather than as a
+# recognition that silently stopped firing.
+pin "GitHub Actions' own check runs carry app.slug == \"github-actions\" (providers_are_actions_only's literal)" \
+  'any(.[]; .app.slug == "github-actions")' "$checks"
 # What build_checks asks of filter=latest is not uniqueness — two jobs may legally share a name,
 # and it emits one row per check run — but that a re-run's superseded attempt is DROPPED, since
 # a stale red twin would otherwise redden the head. So the belief is stated against filter=all:

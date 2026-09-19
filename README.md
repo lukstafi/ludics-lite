@@ -588,7 +588,28 @@ fresher of the commit date and the PR's `updated_at` (each validated on its own,
 commit pushed a moment ago counts as fresh and a future commit date does not blind the gate).
 Exit 1: a run that concluded red without producing a check to be red, over a green, pending or
 stopped check alike. Exit 0: green over a finished, judged run list, and the absence itself once
-the grace is spent. A read that fails is exit 3, never a reassuring 0. Only finished runs are
+the grace is spent — or, for a head with no run at all, as soon as no workflow of
+the repository can create one for it (ludics-lite#176): every `pull_request` trigger's
+`paths-ignore` covers every commit from the PR's merge base up, every declared `push` trigger refuses outright — nothing about a
+push event is establishable from these feeds, which is most of the recognition's reach given away
+deliberately — and every other trigger is one whose run can never carry this commit as its head
+(`merge_group` and `workflow_call`, and nothing else). The cases pin the
+refusals as much as the recognition — a trigger with no filter, a source path in the range, a path
+under `.github/workflows/` anywhere in it (a filter that moved mid-range), a workflow file at
+either end of the merge that the repository's list does not carry (that list is built from the
+default branch plus whatever has run, so it is no inventory of the merge context's files), a
+workflow-directory response at the Contents API's cap, a listed workflow the advisory NAME would
+once have skipped (those names have no ref, so they describe the default branch's copy and not the
+one that runs here), an unparseable workflow, an unreadable or truncated workflow list,
+a PR whose base SHA or branch did not come back, a declared `push` trigger in any form, a base
+that moved under the recognition (a retarget moves the evidence without moving the head), an event outside the inert list
+(`pull_request_target`, the review events, `schedule` and `workflow_dispatch` among them), a base-side edit to the workflow (a
+`pull_request` run uses the merge context's copy, so the two sides must be identical), and a
+sampled merged PR whose check runs show a provider other than Actions, none at all, or more than
+its page holds — each of
+which leaves the grace to answer as it did before, while the named inert events do not block the
+recognition, because none of their runs is created at this head; and that the question costs no read at all where it cannot change the answer
+(a head that already has a run, or one already past the grace). A read that fails is exit 3, never a reassuring 0. Only finished runs are
 folded away as superseded, per workflow and event, so a re-triggered invocation does not park the
 gate on its cancelled predecessor while one file's `push` and `pull_request` runs still count
 separately and a queued invocation is never hidden behind a finished twin; and a run whose red is
@@ -706,7 +727,11 @@ while the plain read settled for the older green on it). The grace that separate
 from "not yet" runs from the first READ of the tip rather than from the end of the round that read
 it — re-stamping it there spent a round of API latency out of the grace, which is how a
 `--wait=301` over a 300s grace reached its ceiling seconds before the clock it was sized against,
-every time. The absence is then read per workflow: a run that EXISTS for the tip and has not
+every time. The ceiling's own arithmetic is pinned here too (ludics-lite#175): the grace is tested
+once per round and rounds are one poll interval apart, so a `--wait` in the band between the grace
+and one interval past it draws a loud line — the ceiling cap does schedule it one settling round,
+which a tip that moves takes away — while one at or below the grace is a bounded peek that reports
+no verdict, and a zero grace is outside the question entirely. The absence is then read per workflow: a run that EXISTS for the tip and has not
 judged it — queued, running, or stopped — keeps the refusal because only that run can answer, and
 so does a run in flight anywhere on the branch, which is judging a tree the tip contains (waiting
 for it does better than settling: its commit becomes the verdict the tip then trails). What ends

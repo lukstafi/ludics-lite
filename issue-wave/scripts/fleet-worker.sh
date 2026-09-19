@@ -532,12 +532,27 @@ cmd_preflight() {
 # Read on the coordinator, where gh is authenticated, never on the worker box.
 # Keep complete helper diagnostics; CI refusals use fleet exit 1, never transport 4.
 # A named triage may override RED, never unknown.
+#
+# The gate's two clocks, pinned here so the ceiling below cannot drift away from them. The grace
+# is how long a tip with no run of its own is given before its absence is read as a fact; the
+# interval is how long a round of the checker's wait takes, and the grace is only ever tested
+# once per round. The CEILING is DERIVED from both rather than spelled as a number beside them
+# (ludics-lite#175): `--wait=301` over a 300s grace left a one-second margin that one round's API
+# latency swallowed, so the wave gate reached its ceiling and refused dispatch for a docs-only
+# default-branch tip that the very next round would have settled. One round of margin is the
+# smallest that always reaches the round after the grace, and the checker refuses anything in
+# between, so these three numbers cannot disagree silently again.
+BASE_ABSENT_GRACE=300
+BASE_POLL_INTERVAL=60
+BASE_WAIT=$((BASE_ABSENT_GRACE + BASE_POLL_INTERVAL))
 base_checker() (
   # Gate policy and bounds are not inherited from an unrelated ship-pr operation.
   # Keep connection/auth, state paths and review-only settings; they do not decide base CI.
-  unset SHIP_PR_ADVISORY_CHECKS SHIP_PR_TEST_SOURCE_ONLY SHIP_PR_CHECKS_INTERVAL
+  # The interval is PINNED rather than unset, for the same reason the grace is: the ceiling above
+  # is arithmetic over both, and a default that moved would move the margin without moving it.
+  unset SHIP_PR_ADVISORY_CHECKS SHIP_PR_TEST_SOURCE_ONLY
   unset SHIP_PR_CHECKS_WAIT SHIP_PR_CHECKS_HEARTBEAT SHIP_PR_API_ATTEMPTS SHIP_PR_API_BACKOFF
-  SHIP_PR_BASE_ABSENT_GRACE=300 "$@"
+  SHIP_PR_BASE_ABSENT_GRACE="$BASE_ABSENT_GRACE" SHIP_PR_CHECKS_INTERVAL="$BASE_POLL_INTERVAL" "$@"
 )
 
 base_gate() {
@@ -550,10 +565,11 @@ base_gate() {
   # The ordinary base read may carry an older green while the tip is running.
   # Reuse its bounded integration mode; preserve the established absence grace
   # for path-filtered tips, independent of the coordinator's ambient settings.
+  # The ceiling is BASE_WAIT, derived from the grace and the poll interval pinned above.
   if [ -n "$branch" ]; then
-    base_checker "$helper" --repo "$target" base "$branch" --wait=301 >&2
+    base_checker "$helper" --repo "$target" base "$branch" "--wait=$BASE_WAIT" >&2
   else
-    base_checker "$helper" --repo "$target" base --wait=301 >&2
+    base_checker "$helper" --repo "$target" base "--wait=$BASE_WAIT" >&2
   fi
   rc=$?
   if [ "$rc" -eq 1 ] && [ "$force" -eq 1 ] && [ -n "$reason" ]; then

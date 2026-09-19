@@ -253,8 +253,13 @@
 #      SETTLES for the older verdict the plain read settles for, once nothing is in flight on the
 #      branch and no run for the tip exists to judge it. It settles at once, without the grace,
 #      when every commit on the first-parent path from the judged one up to the tip changes only
-#      paths within the workflow's own paths-ignore (ludics-lite#156). `checks`/`merge` apply it to the
-#      head before calling a build signal ABSENT rather than not-created-yet (ludics-lite#24),
+#      paths within the workflow's own paths-ignore (ludics-lite#156). A `base --wait=N` in the
+#      band (grace, grace+SHIP_PR_CHECKS_INTERVAL) is WARNED about: it reaches the settle only on
+#      the single round the ceiling cap schedules, and only if the tip has not moved
+#      (ludics-lite#175). `checks`/`merge` apply the
+#      grace to the head before calling a build signal ABSENT rather than not-created-yet
+#      (ludics-lite#24), and settle a run-less head at once on the same paths-ignore recognition,
+#      walking the PR's own commits from its merge base (ludics-lite#176),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences the commit-count warning). A nonempty file overlap still warns at any count; no
 #      base-drift warning blocks the merge. SHIP_PR_ROUND_THRESHOLD=review rounds with findings
@@ -3265,7 +3270,8 @@ run_red_is_advisory_only() {
 }
 
 run_signal() {
-  local sha="$1" pr_at="${2:-}" checks="${3:-0}" raw rc rid wid event name status concl
+  local sha="$1" pr_at="${2:-}" checks="${3:-0}" base_sha="${4:-}" head_ref="${5:-}" pr="${6:-}"
+  local raw rc rid wid event name status concl
   local seen_ids=" " red_rows="" rname rconcl created
   local runs=0 inflight=0 nogo=0 red=0 red_note="" pushed_at age seen
   raw=$(gh_retry read api --paginate \
@@ -3403,6 +3409,19 @@ run_signal() {
   else
     seen="no workflow run exists for this head"
   fi
+  # Inside the grace the clock alone cannot tell "never coming" from "not yet" — but for a head
+  # with NO run at all the workflows' own filters can, and this is the only window where that
+  # answer changes anything: past the grace the absence is already the verdict, and a head that
+  # DID get a run is never asked, since a run existed and no filter explains its silence
+  # (ludics-lite#176). The refusal costs exactly what it cost before: this grace.
+  if [ "$runs" -eq 0 ] && [ "$age" -lt "$ABSENT_GRACE" ] &&
+    head_within_paths_ignore "$pr" "$sha" "$base_sha" "$head_ref"; then
+    run_reason 0 "no workflow run exists for this head, and none can be created by" \
+      " $PATHS_IGNORE_WHY: every trigger of theirs that this change fires is either filtered" \
+      " out by its own paths-ignore — every commit from the merge base up changes only ignored" \
+      " paths — or cannot reach this branch at all"
+    return 0
+  fi
   if [ "$age" -lt "$ABSENT_GRACE" ]; then
     run_reason 0 "$seen, and the head has been in place at most $(fmt_age "$age") — inside the" \
       " $(fmt_age "$ABSENT_GRACE") run-creation grace (SHIP_PR_BASE_ABSENT_GRACE), so a run" \
@@ -3421,17 +3440,30 @@ run_signal() {
 # without a verdict, or a run for this head has yet to produce its checks), 5 = superseded head.
 gate_checks() {
   local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining
-  local run_why="" run_info note pr_at="" current_sha
+  local run_why="" run_info note pr_at="" base_sha="" head_ref="" current_sha
   # One read for both: the head to judge, and the PR's own last-updated stamp, which run_signal
   # uses as the push clock a stale committer date cannot provide. Tab-separated with a placeholder
   # for the same reason build_checks uses one — an empty field would collapse under tab-IFS.
   # Captured first, then split: a process substitution would hand `read` the exit status and lose
   # gh_retry's, and a failed read that reports 0 is the one thing this gate must never do.
+  # The PR's base SHA rides along for the same reason `updated_at` does: it costs no extra call,
+  # and run_signal needs it to ask whether a run for a run-less head can be created at all — the
+  # range it walks starts at this head's merge base with the base branch (ludics-lite#176).
+  # EVERY field gets the placeholder, not just the ones that can be null. An empty string is not
+  # null, so `// "-"` alone leaves it empty — and one empty field COLLAPSES under tab-IFS `read`,
+  # shifting every later field into the slot before it. With `.head.sha` leading, a PR read
+  # answering with an empty head would put `updated_at` into `sha` and sail past the emptiness
+  # check below. That is the same trap build_checks' own placeholder documents; it just had one
+  # field to lose before and has four now.
   lines=$(gh_retry read api "repos/$REPO/pulls/$pr" \
-    --jq '[.head.sha, (.updated_at // "-")] | @tsv')
+    --jq '[(.head.sha // "-"), (.updated_at // "-"), (.base.sha // "-"), (.head.ref // "-")]
+          | map(if type == "string" and length > 0 then . else "-" end) | @tsv')
   rc=$?
-  IFS=$'\t' read -r sha pr_at <<<"$lines"
+  IFS=$'\t' read -r sha pr_at base_sha head_ref <<<"$lines"
+  [ "${sha:--}" != - ] || sha=""
   [ "${pr_at:--}" != - ] || pr_at=""
+  [ "${base_sha:--}" != - ] || base_sha=""
+  [ "${head_ref:--}" != - ] || head_ref=""
   if [ "$rc" -ne 0 ] || [ -z "$sha" ]; then
     VERDICT=unknown
     warn "could not read $REPO#$pr's head SHA ($(gh_err_line)); the build signal is UNKNOWN," \
@@ -3462,7 +3494,7 @@ gate_checks() {
     # where the honest answer to "is there a signal here" is 4, not a 0 the merge gate would take
     # for "nothing is red".
     if [ "$VERDICT" != red ]; then
-      run_info=$(run_signal "$sha" "$pr_at" "$CHECK_TOTAL")
+      run_info=$(run_signal "$sha" "$pr_at" "$CHECK_TOTAL" "$base_sha" "$head_ref" "$pr")
       rc=$?
       run_why="${run_info#*$'\t'}"
       case "$rc" in
@@ -3487,9 +3519,18 @@ gate_checks() {
     fi
     # Revalidate every observation, including a terminal green or stopped old head. This
     # never follows the successor: the checks and merge binding remain about the original SHA.
-    current_sha=$(gh_retry read api "repos/$REPO/pulls/$pr" --jq \
-      '.head.sha | select(type == "string" and length > 0)')
+    # The base and the head ref ride along, refreshed for the NEXT round: a retarget or a base
+    # advance moves the evidence the paths-ignore recognition rests on without moving the head
+    # (review round 9). The recognition re-confirms them itself before it settles anything, so a
+    # move mid-round costs a round rather than a wrong absence.
+    lines=$(gh_retry read api "repos/$REPO/pulls/$pr" \
+      --jq '[(.head.sha // "-"), (.base.sha // "-"), (.head.ref // "-")]
+            | map(if type == "string" and length > 0 then . else "-" end) | @tsv')
     rc=$?
+    IFS=$'\t' read -r current_sha base_sha head_ref <<<"$lines"
+    [ "${current_sha:--}" != - ] || current_sha=""
+    [ "${base_sha:--}" != - ] || base_sha=""
+    [ "${head_ref:--}" != - ] || head_ref=""
     if [ "$rc" -ne 0 ] || [ -z "$current_sha" ] || [ "$current_sha" = null ]; then
       VERDICT=unknown
       warn "could not re-read $REPO#$pr's head SHA; the build signal is UNKNOWN."
@@ -4272,17 +4313,21 @@ base_red_detail() {
 # merely late and settle for an older green over an unbuilt tip. The asymmetry is the whole design:
 # the parser below is deliberately narrow, and every branch it cannot read says so.
 
-# workflow_paths_ignore <workflow id> <ref>: the workflow FILE's path, then its
-# `on: push: paths-ignore` patterns one per line, or nothing (exit 1) when they cannot be
-# established. The workflow file is read AT THE
-# TIP, because the filter that decides whether the tip gets a run is the one the tip carries.
+# WORKFLOW_YAML_FILTER: the items of `on: <want>: <seq>` in a workflow file, one per line, or
+# exit 1 when they cannot be established. The event and the sequence key are both PARAMETERS
+# (`-v want=push -v seq=paths-ignore`), because a PR head asks this of more than one event and of
+# more than one list: `pull_request`'s `paths-ignore` says whether a run would be filtered out,
+# and `push`'s `branches` says whether a push to THIS branch reaches the trigger at all
+# (ludics-lite#176). Exit 1 covers both "the file does not parse" and "that key is not there";
+# every caller treats the two the same, as evidence it does not have.
 #
 # The YAML is read by a narrow state machine rather than a parser this repository does not have.
 # It accepts what a workflow file actually looks like — a top-level `on:` (or `"on":`) mapping, a
-# `push:` key under it, a `paths-ignore:` block sequence or one flow sequence, single- or
+# `<want>:` key under it, a `paths-ignore:` block sequence or one flow sequence, single- or
 # double-quoted items — and refuses everything else, tabs and aliases included: an alias
 # (`paths-ignore: *docs`) reads as a glob to anything that does not track anchors, and "*docs"
-# would match half a repository.
+# would match half a repository. An INCLUDE filter (`paths:`) is not a paths-ignore and is not
+# read as one: the event is then declared with no paths-ignore, which refuses.
 WORKFLOW_YAML_FILTER='
 function ind_of(s,   n) { n = match(s, /[^ ]/); return n ? n - 1 : -1 }
 function unquote(s,   c) {
@@ -4321,7 +4366,7 @@ state == 0 {
 }
 state == 1 {
   if (ind <= on_ind) { bad = 1; exit }
-  if (key ~ /^push[ ]*:/) {
+  if (key ~ ("^" want "[ ]*:")) {
     if (rest != "" && substr(rest, 1, 1) != "#") { bad = 1; exit }
     state = 2; push_ind = ind
   }
@@ -4329,7 +4374,7 @@ state == 1 {
 }
 state == 2 {
   if (ind <= push_ind) { bad = 1; exit }
-  if (key ~ /^paths-ignore[ ]*:/) {
+  if (key ~ ("^" seq "[ ]*:")) {
     if (rest == "") { state = 3; seq_ind = ind; next }
     if (rest ~ /^\[.*\]$/) { flow(rest); exit }
     bad = 1; exit
@@ -4347,25 +4392,172 @@ END {
   for (i = 1; i <= n; i++) print pat[i]
 }'
 
-workflow_paths_ignore() {
-  local wid="$1" ref="$2" wpath body pats
-  wpath=$(gh_retry read api "repos/$REPO/actions/workflows/$wid" --jq '.path // ""') || return 1
+# WORKFLOW_KEYS: the keys a workflow file DECLARES at one level of its `on:` block — the trigger
+# events themselves with `-v want=`, or the keys under one named event with `-v want=push` — one
+# per line, or exit 1 when they cannot be established.
+#
+# PRESENCE, separately from parsing, and round 10 is why that distinction has to exist. The probes
+# that ask "does this trigger carry a tag filter" used to be the pattern reader run for its exit
+# status, which is 1 both when the key is absent and when it is present in a form this narrow
+# parser cannot read — so an unparseable `tags:` read as no tags at all, and a push that a tag
+# could reach was declared unreachable. A key is now found by name, and only the keys whose VALUES
+# are needed are parsed.
+#
+# Same narrowness as the pattern reader: the mapping form, the one-scalar form (`on: push`) and the
+# flow form (`on: [push, pull_request]`), and a refusal for everything else, a key that is not a
+# plain identifier included. Under a named event, no keys at all is an answer (exit 0, nothing
+# printed); at the `on:` level it is not, since a workflow with no trigger is a file this has
+# misread.
+WORKFLOW_KEYS='
+function ind_of(s,   n) { n = match(s, /[^ ]/); return n ? n - 1 : -1 }
+function unquote(s,   c) {
+  sub(/^[ ]+/, "", s); sub(/[ ]+$/, "", s)
+  c = substr(s, 1, 1)
+  if ((c == q || c == dq) && substr(s, length(s), 1) == c && length(s) >= 2)
+    s = substr(s, 2, length(s) - 2)
+  return s
+}
+function emit(s) {
+  s = unquote(s)
+  if (s !~ /^[A-Za-z_][A-Za-z0-9_-]*$/) { bad = 1; exit }
+  n++; key_of[n] = s
+}
+function flow(s,   i, m, parts) {
+  s = substr(s, 2, length(s) - 2)
+  m = split(s, parts, ",")
+  for (i = 1; i <= m; i++) emit(parts[i])
+  ok = 1
+}
+BEGIN { ev_ind = -1; kw_ind = -1 }
+/\t/ { bad = 1; exit }
+{
+  line = $0
+  sub(/[ \r]+$/, "", line)
+  if (line == "") next
+  ind = ind_of(line)
+  key = substr(line, ind + 1)
+  if (substr(key, 1, 1) == "#") next
+  rest = key
+  sub(/^[^:]*:/, "", rest)
+  sub(/^[ ]+/, "", rest)
+  sub(/[ ]+#.*$/, "", rest)
+}
+state == 0 {
+  if (ind == 0 && key ~ /^(on|"on")[ ]*:/) {
+    on_ind = ind
+    if (rest == "") { state = 1; next }
+    # `on: push` and `on: [push, ...]` declare events and NOTHING under them, so a caller asking
+    # for one event finds no keys — which is not the same as finding the file unreadable, and the
+    # END below tells them apart by the state.
+    if (rest ~ /^\[.*\]$/) { if (want == "") flow(rest); else ok = 1; exit }
+    if (want == "") { emit(rest); ok = 1; exit }
+    ok = 1; exit
+  }
+  next
+}
+state == 1 {
+  if (ind <= on_ind) { ok = 1; exit }
+  # The events are the keys at the FIRST level under `on:`; anything deeper is one event own
+  # mapping, and anything shallower than that level but still inside the block is a file this
+  # parser will not claim to have read.
+  if (ev_ind < 0) ev_ind = ind
+  if (ind < ev_ind) { bad = 1; exit }
+  if (ind > ev_ind) next
+  if (key !~ /^[A-Za-z_][A-Za-z0-9_-]*[ ]*:/) { bad = 1; exit }
+  k = key
+  sub(/[ ]*:.*$/, "", k)
+  if (want == "") { emit(k); next }
+  if (k == want) { state = 2; want_ind = ind }
+  next
+}
+state == 2 {
+  if (ind <= want_ind) { ok = 1; exit }
+  if (kw_ind < 0) kw_ind = ind
+  if (ind < kw_ind) { bad = 1; exit }
+  if (ind > kw_ind) next
+  if (key !~ /^[A-Za-z_][A-Za-z0-9_-]*[ ]*:/) { bad = 1; exit }
+  k = key
+  sub(/[ ]*:.*$/, "", k)
+  emit(k)
+  next
+}
+END {
+  if (!bad && (state == 1 || state == 2)) ok = 1
+  if (bad || !ok) exit 1
+  # An `on:` MAPPING that never reached the named event did not declare it, and that is not an
+  # answer about its keys. (State 0 here is the scalar or flow form, where the event is declared
+  # with no keys at all, which IS an answer.)
+  if (want != "" && state == 1) exit 1
+  # At the on: level, a file declaring no trigger at all is one this has misread.
+  if (want == "" && n == 0) exit 1
+  for (i = 1; i <= n; i++) print key_of[i]
+}'
+
+# workflow_path <workflow id>: where that workflow's file lives, or nothing (exit 1).
+workflow_path() {
+  local wpath
+  wpath=$(gh_retry read api "repos/$REPO/actions/workflows/$1" --jq '.path // ""') || return 1
   # One path, and one that stays inside the repository: the value is interpolated into a REST
   # path, so a newline or a traversal in it is a different request, not a workflow file.
   case "$wpath" in '' | *$'\n'* | */../* | ../* | /*) return 1 ;; esac
+  printf '%s\n' "$wpath"
+}
+
+# workflow_body <path> <ref>: the file's own text at that ref, or nothing (exit 1). The ref
+# matters: the filter that decides whether a commit gets a run is the one that commit carries.
+workflow_body() {
+  local body
   # The raw media type, so the file arrives as itself: the JSON form is base64 whose decoder is
   # spelled `-d` on one of this fleet's two platforms and `-D` on the other.
   body=$(gh_retry read api -H "Accept: application/vnd.github.raw" \
-    "repos/$REPO/contents/$(encode_ref "$wpath")?ref=$ref") || return 1
+    "repos/$REPO/contents/$(encode_ref "$1")?ref=$2") || return 1
   [ -n "$body" ] || return 1
-  pats=$(awk -v q="'" -v dq='"' "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
+  printf '%s\n' "$body"
+}
+
+# workflow_files_at <ref>: every YAML file directly under `.github/workflows/` at that ref, one
+# path per line, or nothing (exit 1). What the repository's workflow LIST is not: that list is
+# built from the default branch plus whatever has run, so a workflow file living only on a PR's
+# base branch, or only on its head, is simply absent from it — and the loop below would then pass
+# every workflow it knows about while the one it does not know about creates the run (review
+# rounds 3 and 5). Read at both ends of the merge, since a `pull_request` run sees the union.
+# How many entries the Contents API serves for a directory before it truncates. It offers no
+# pagination past this, so a directory at the cap is a directory this cannot read, and the answer
+# is a refusal rather than a shorter inventory (review round 6) — the same shape commit_files uses
+# for its own 300-file cap.
+CONTENTS_DIR_CAP=1000
+
+
+workflow_files_at() {
+  local raw count
+  # The count is of the WHOLE array and leads the rows, as it does on the workflow list and on the
+  # provider sample. Counting what survived `select(.type == "file")` would be the cap read one
+  # projection too late (review round 7): the limit is on entries, so a response holding
+  # directories can carry fewer than the cap in files and still have left a later workflow out.
+  raw=$(gh_retry read api "repos/$REPO/contents/.github/workflows?ref=$1" \
+    --jq 'if type == "array" then (((. | length) | tostring),
+                                   (.[] | select(.type == "file") | .path))
+          else empty end') || return 1
+  [ -n "$raw" ] || return 1
+  count="${raw%%$'\n'*}"
+  raw="${raw#*$'\n'}"
+  case "$count" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$count" -gt 0 ] || return 1
+  [ "$count" -lt "$CONTENTS_DIR_CAP" ] || return 1
+  printf '%s\n' "$raw" | grep -E '\.ya?ml$'
+}
+
+# workflow_paths_ignore <workflow id> <ref>: a workflow's `on: push: paths-ignore` patterns, one
+# per line, or nothing (exit 1) when they cannot be established. cmd_base's reader: it queries one
+# event, `push`, because that is the only event whose runs it folds.
+workflow_paths_ignore() {
+  local wid="$1" ref="$2" wpath body pats
+  wpath=$(workflow_path "$wid") || return 1
+  body=$(workflow_body "$wpath" "$ref") || return 1
+  pats=$(awk -v q="'" -v dq='"' -v want=push -v seq=paths-ignore \
+    "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
   [ -n "$pats" ] || return 1
-  # WHICH file these patterns came out of leads the answer, because the range walk has to know
-  # whether any commit in it changed that file — a filter that moved mid-range is not one filter.
-  # It travels in the OUTPUT and not in a variable: every caller here reads through a command
-  # substitution, where an assignment dies with the subshell (the same trap base_red_detail's
-  # cache documents).
-  printf '%s\n%s\n' "$wpath" "$pats"
+  printf '%s\n' "$pats"
 }
 
 # glob_ere <pattern>: one GitHub path filter as an ERE anchored at both ends, or nothing (exit 1)
@@ -4457,7 +4649,7 @@ commit_files() {
   printf '%s' "$raw" | tr '\t' '\n' | grep .
 }
 
-# commits_ignored <patterns> <workflow file> <judged sha> <tip>: true when every commit on the
+# commits_ignored <patterns> <judged sha> <tip>: true when every commit on the
 # FIRST-PARENT path from the judged commit up to the tip changed only ignored paths.
 #
 # Per COMMIT, and not the cumulative diff of the range, because a path filter is evaluated per
@@ -4480,8 +4672,18 @@ commit_files() {
 # longer than the cap goes to the grace rather than to a read per commit (GitHub's own rule is
 # 1000 commits, above which a push runs whatever the filter says). A `total_commits` the returned
 # list does not match is a truncated answer and settles nothing.
-commits_ignored() {
-  local pats="$1" wfile="$2" vsha="$3" tip="$4" cmp count behind rows sha parent files steps nl=$'\n'
+# range_files <judged sha> <tip>: every path changed anywhere on the first-parent path from the
+# judged commit up to the tip, one per line, or nothing (exit 1) when the range is not evidence.
+#
+# The UNION rather than a list per commit, and that is not a weakening: "every commit's files are
+# ignored" and "the union of the files is ignored" are the same claim, because a path is covered
+# or it is not. Making it the union is what lets a caller with several workflows read the range
+# ONCE and then ask each filter about the same lines — at the supported limits that is the
+# difference between ~2100 requests and ~21, and the old shape spent them again every polling
+# round inside the grace, which could turn the gate UNKNOWN on rate limits for exactly the heads
+# the fast path exists to settle (review round 5).
+range_files() {
+  local vsha="$1" tip="$2" cmp count behind rows sha parent files steps out="" nl=$'\n'
   cmp=$(gh_retry read api "repos/$REPO/compare/$vsha...$tip?per_page=$IGNORE_MAX_COMMITS" \
     --jq '(.total_commits // 0 | tostring), ((.behind_by // -1) | tostring),
           ((.commits // [])[] | [.sha, ((.parents // [])[0].sha // "-")] | @tsv)') || return 1
@@ -4506,12 +4708,25 @@ commits_ignored() {
     # diffs do not describe it.
     case "$parent" in '' | -) return 1 ;; esac
     files=$(commit_files "$sha") || return 1
-    [ -z "$wfile" ] || ! grep -qxF -- "$wfile" <<<"$files" || return 1
-    paths_ignore_covers "$pats" "$files" || return 1
+    # ANY file under the workflow directory, not just the one workflow whose filter is being
+    # applied (review round 3). A range that edits a workflow is a range across two different
+    # filters, and a range that ADDS one adds a workflow the repository's own list does not carry.
+    ! grep -q '^\.github/workflows/' <<<"$files" || return 1
+    out="${out}${files}"$'\n'
     sha="$parent"
   done
   [ "$steps" -gt 0 ] || return 1
-  return 0
+  [ -n "$out" ] || return 1
+  printf '%s' "$out" | grep .
+}
+
+# commits_ignored <patterns> <judged sha> <tip>: the range, read and then covered. cmd_base's
+# caller, where each workflow brings its OWN judged commit and so its own range; the PR head's
+# caller reads the one range itself and applies each filter to it.
+commits_ignored() {
+  local files
+  files=$(range_files "$2" "$3") || return 1
+  paths_ignore_covers "$1" "$files"
 }
 
 # tip_within_paths_ignore <rows> <tip>: rows are "<workflow id><TAB><name><TAB><judged sha>", one
@@ -4519,7 +4734,7 @@ commits_ignored() {
 # EVERY one of them is explained by its own filter — one workflow's docs-only diff says nothing
 # about the workflow beside it — and the reason goes into PATHS_IGNORE_WHY for the settle line.
 tip_within_paths_ignore() {
-  local rows="$1" tip="$2" wfid name vsha key hit pats read_pats wfile why=""
+  local rows="$1" tip="$2" wfid name vsha key hit pats why=""
   PATHS_IGNORE_WHY=""
   [ -n "$rows" ] || return 1
   while IFS=$'\t' read -r wfid name vsha; do
@@ -4532,11 +4747,8 @@ tip_within_paths_ignore() {
     if [ -z "$hit" ]; then
       hit=no
       # The file's path leads the answer; the patterns are the rest of it.
-      read_pats=$(workflow_paths_ignore "$wfid" "$tip") || read_pats=""
-      wfile="${read_pats%%$'\n'*}"
-      pats="${read_pats#*$'\n'}"
-      if [ -n "$read_pats" ] && [ -n "$wfile" ] && [ -n "$pats" ] &&
-        commits_ignored "$pats" "$wfile" "$vsha" "$tip"; then
+      pats=$(workflow_paths_ignore "$wfid" "$tip") || pats=""
+      if [ -n "$pats" ] && commits_ignored "$pats" "$vsha" "$tip"; then
         hit=yes
       fi
       BASE_IGNORE_CACHE="${BASE_IGNORE_CACHE}${key}"$'\t'"${hit}"$'\n'
@@ -4548,8 +4760,254 @@ tip_within_paths_ignore() {
   return 0
 }
 
+# --- which trigger can still create a run for THIS head ----------------------------------------
+# Only three of a workflow's triggers have anything to do with the change under judgement, and the
+# three are answered differently (ludics-lite#176, review round 1).
+#
+# `pull_request` is the one a filter can EXPLAIN. Its path filter is evaluated against the pull
+# request's own two-dot diff, which the first-parent walk from the merge base up is a superset of,
+# so a walk whose every step is ignored says the diff is — and it says so however the head got
+# there, a force-push included, because the merge base is recomputed against the head in hand.
+# The FILE, though, is not the head's: a `pull_request` run uses the workflow from the merge
+# context, base merged with head, so a base-side edit that removed a paths-ignore takes effect
+# while the head's own copy still carries it — and that edit is outside the walked range, so
+# `commits_ignored`'s workflow-file guard never sees it (review round 2). The file is therefore
+# read at the head AND at the base tip and the two must be identical: when both sides of a merge
+# hold the same content, that content is what the merge produces, so the copy in hand IS the
+# merge context's. Any difference, or a copy that cannot be read on either side, refuses.
+#
+# `push` REFUSES, always, and four rounds of review are the argument. Nothing about a push event
+# can be established from the feeds this reads. Its changed files are computed between the push's
+# own before and after, and after a non-fast-forward push the before is not on the path walked here
+# (round 1), so no path filter describes it. Whether its `branches:` list can be reached is not
+# answerable either: a tag push carries the same SHA (round 9), so does a push to another branch,
+# and `branches-where-head` — the one lookup that could name those branches — describes where the
+# SHA is head NOW rather than where it was pushed, so a matching branch that has since advanced or
+# been deleted is invisible while its run is still being created (round 11). Each fix closed its
+# case and the next round found another, which is the signal to stop: the pre-push context is not
+# in any feed here, and a rule that cannot see it cannot be completed.
+#
+# What that costs is stated plainly, because it is most of this recognition's reach: a repository
+# whose CI workflow declares `on: push` at all — which is most of them — gets no fast path, and its
+# docs-only PR heads wait the absence grace out exactly as they did before ludics-lite#176. What
+# remains is the workflow triggered on `pull_request` alone, where the question is answerable, and
+# the grace carries every other head as it always has.
+#
+# `pull_request_target` refuses outright. GitHub runs it from the workflow file in the PR's BASE
+# context, not the head's, so the file read here is not the file that decides; a base-side edit
+# removing a paths-ignore is outside the walked range and `commits_ignored`'s workflow-file guard
+# would not see it. It is rare enough that reading a second copy of the file is not worth the
+# branch.
+#
+# EVERY OTHER EVENT REFUSES unless it is on the list below, and the list is now down to the two
+# entries that can be defended from the shape of the event rather than from what has or has not
+# happened yet. Three rounds running produced a member of the same class — round 1 that
+# `merge_group` was wrongly counted, round 3 that the review events were wrongly ignored, round 4
+# that `workflow_dispatch`, `schedule` and `workflow_run` were — and the third time is the signal
+# that the list was the defect, not its contents. So the criterion is stated, and everything that
+# does not meet it is gone:
+#
+#   an event is inert here only when a run of it can NEVER carry this commit as its head.
+#
+# `merge_group` meets it: its run is created after the PR enters a merge queue, at the queue's own
+# temporary ref, and never at the PR head. `workflow_call` meets it: a called workflow produces no
+# run of its own at all — its jobs appear inside the caller's run.
+#
+# `schedule`, `workflow_dispatch`, `repository_dispatch` and `workflow_run` did NOT meet it, and
+# round 4 is right about why. Each of them CAN put a run on this head, and "the head's run list is
+# empty" does not say one is not on its way — that emptiness is a not-created-yet window, which is
+# the whole question. `workflow_dispatch` is the sharpest case: `gh workflow run --ref <branch>` is
+# a validation somebody asked for by hand, and merging inside its creation window is exactly the
+# thing the grace exists to prevent. `workflow_run` is the subtlest: `run_signal` drops ADVISORY
+# runs before it counts, so a head carrying only the review app's run reaches here with runs=0
+# while a downstream workflow waits on it. All four now refuse, and cost the grace.
+HEAD_INERT_EVENTS='workflow_call merge_group'
+
+# providers_are_actions_only: true when the newest MERGED pull request of this repository carries
+# non-advisory check runs and every one of them was created by GitHub Actions. The recognition
+# below reads WORKFLOWS, so it can only ever answer for Actions — and `build_checks` deliberately
+# accepts every provider's check runs, so a repository with a third-party CI app has a second way
+# to grow a check on a fresh head that no workflow filter describes (review round 2). That is the
+# mirror of the rule ludics-lite#38 round 3 already holds in the other direction: an early Codecov
+# green over an empty run list does not shortcut the grace either, because it proves nothing about
+# Actions.
+#
+# It is a FILTER, not an inventory, and says so here because that is the honest description: no
+# endpoint enumerates the check providers configured for a repository, so no read at any cost
+# proves the negative. What it does is rule out the case that actually happens — a provider the
+# repository is configured with, which therefore leaves check runs on its pull requests.
+#
+# A MERGED pull request's head is the population the question is about, and round 3 is why: a base
+# branch tip, which this sampled first, is exactly where a provider that runs only on pull requests
+# does not appear, and where a freshly pushed commit may not have its checks yet either. A merged
+# PR's head is settled and is a pull request. No non-advisory row on it is no evidence and refuses,
+# as does a read that fails, or a repository with no merged pull request to sample. Advisory names
+# are dropped first, for the reason the list exists: the review app posts a check run of its own
+# from a non-Actions app, and counting it would refuse on every repository this skill is used in.
+#
+# The residual is a provider configured but absent from that sample. It is named in ship-pr's
+# SKILL.md beside the verdict, and `--require-green` — which refuses ABSENT outright — is the hatch
+# for a merge that must have READ a green rather than found nothing.
+providers_are_actions_only() {
+  local sample raw total name slug seen=0
+  sample=$(gh_retry read api \
+    "repos/$REPO/pulls?state=closed&sort=updated&direction=desc&per_page=20" \
+    --jq '[.[] | select(.merged_at != null) | .head.sha] | (.[0] // "")') || return 1
+  case "$sample" in '' | *[!0-9a-f]*) return 1 ;; esac
+  # The count leads the rows, and they have to agree, for the reason the workflow list's does
+  # (review round 4): a large Actions matrix can fill one page while the third-party provider this
+  # is looking for sits on the next, and a page read as the whole sample would report exactly the
+  # answer that settles a head wrongly. Refused rather than paginated, so an incomplete sample
+  # costs the grace like every other piece of missing evidence here.
+  raw=$(gh_retry read api "repos/$REPO/commits/$sample/check-runs?filter=latest&per_page=100" \
+    --jq '((.total_count // 0) | tostring),
+          (.check_runs[] | [(.name // "-"), (.app.slug // "-")] | @tsv)') || return 1
+  total="${raw%%$'\n'*}"
+  raw="${raw#*$'\n'}"
+  case "$total" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$total" -gt 0 ] || return 1
+  [ "$(printf '%s\n' "$raw" | grep -c .)" -eq "$total" ] || return 1
+  while IFS=$'\t' read -r name slug; do
+    [ -n "$name" ] || continue
+    is_advisory "$name" && continue
+    [ "$slug" = github-actions ] || return 1
+    seen=$((seen + 1))
+  done <<<"$raw"
+  [ "$seen" -gt 0 ]
+}
+
+# head_within_paths_ignore <pr> <head sha> <PR base sha> <PR head ref>: true when NO workflow of this
+# repository can produce a run for this PR head — every trigger of every one of them is either one
+# this change cannot fire, one this branch cannot reach, or one whose paths-ignore covers every
+# commit the head adds over the merge base. The reason goes into PATHS_IGNORE_WHY.
+#
+# This is `checks`/`merge`'s end of ludics-lite#156's recognition (ludics-lite#176), and it refuses
+# on the same evidence cmd_base's does, through the same helpers: the same YAML reader, the same
+# glob translation, the same per-commit first-parent walk with the same cap, and the same rule that
+# a workflow file changed inside the range is not one filter.
+#
+# The RANGE is the PR's own: the first-parent path from the MERGE BASE up. The merge base is read
+# from the compare endpoint rather than assumed to be the PR's `base.sha`, which is the base
+# BRANCH's tip and moves under every sibling merge — on a busy day that is most of the time, and
+# taking it for the fork point would put commits of the base branch into the range.
+#
+# COST. Bounded, and paid only where it can change the answer: run_signal asks this only for a head
+# with NO run at all and only while it is still inside the grace, so at most one attempt per round
+# for the handful of rounds the grace spans. A refusal short-circuits at the first trigger that
+# cannot be explained, which on a repository with no path filters at all is one workflow list and
+# one workflow file. Nothing here is memoized, because run_signal is called from inside a command
+# substitution where an assignment dies with the subshell (the trap BASE_RED_DETAIL documents).
+head_within_paths_ignore() {
+  local pr="$1" head="$2" base="$3" ref="$4" mbase wf total rows wid wname wstate wpath body bbody
+  local rfiles declared bdeclared listed="" f evs ev pats confirm why=""
+  # The head ref is not read for a filter any more — `push` refuses outright — but it is still
+  # evidence about WHICH pull request this is, and it is re-confirmed with the two SHAs below: a
+  # retarget that moved it would mean the round's reads were about another target.
+  PATHS_IGNORE_WHY=""
+  case "$head" in '' | *[!0-9a-f]*) return 1 ;; esac
+  case "$base" in '' | *[!0-9a-f]*) return 1 ;; esac
+  [ -n "$ref" ] || return 1
+  mbase=$(gh_retry read api "repos/$REPO/compare/$base...$head" \
+    --jq '.merge_base_commit.sha // ""') || return 1
+  case "$mbase" in '' | *[!0-9a-f]*) return 1 ;; esac
+  # A head that IS the merge base adds nothing, so there is no range to read and nothing here can
+  # say why a run is missing.
+  [ "$mbase" != "$head" ] || return 1
+  # Everything below reads WORKFLOWS, so it can only answer for Actions. If this repository has a
+  # second check provider, no filter here describes what it may still create.
+  providers_are_actions_only || return 1
+  # The count leads the rows, and they have to agree: this endpoint serves one page, and a
+  # repository with more workflows than fit it would have the later ones silently left out — the
+  # ones that CAN run for this head, while the ones read say they cannot (review round 1). A
+  # truncated list is not a list of this repository's workflows.
+  wf=$(gh_retry read api "repos/$REPO/actions/workflows?per_page=100" \
+    --jq '((.total_count // 0) | tostring),
+          (.workflows[] | [(.id | tostring), (.name // "-"), (.state // "-")] | @tsv)') || return 1
+  total="${wf%%$'\n'*}"
+  rows="${wf#*$'\n'}"
+  case "$total" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$total" -gt 0 ] || return 1
+  [ "$(printf '%s\n' "$rows" | grep -c '^[0-9][0-9]*	')" -eq "$total" ] || return 1
+  # The range, ONCE: every workflow below asks its own filter about the same lines.
+  rfiles=$(range_files "$mbase" "$head") || return 1
+  # Every workflow FILE that the merge context will hold — the union of the two ends, since a
+  # `pull_request` run sees the merge — has to be one the repository's list carries, or it is a
+  # workflow nothing below examines while its first run is on its way (review round 5). The
+  # head's set and the base's set are read separately because neither contains the other: a
+  # workflow the base added after the fork is absent from the head, and one the head adds is
+  # absent from the base.
+  declared=$(workflow_files_at "$head") || return 1
+  bdeclared=$(workflow_files_at "$base") || return 1
+  # EVERY listed workflow is explained, the advisory ones included. The shortcut that skipped them
+  # was mine and it rested on the wrong reading of the wrong file: the name in this list has no
+  # ref, so it describes the DEFAULT branch's copy, while what runs for this PR is the copy at the
+  # head and the base. A file whose default-branch copy is named `github pages docs` and whose
+  # target-context copy is an ordinary `ci` would have been skipped while its run was being
+  # created (review round 6). Reading the name out of the body instead would mean one more YAML
+  # reader and one more thing to get wrong, for a saving of a few reads — so the shortcut is gone
+  # instead. What it costs is a repository carrying an advisory workflow whose own filter cannot
+  # explain it: that head now waits the grace out, which is the safe direction and where it was
+  # before any of this. `wname` survives only to name the workflows in the settle line.
+  while IFS=$'\t' read -r wid wname wstate; do
+    [ -n "$wid" ] || continue
+    # The path is read for EVERY listed workflow, disabled ones included, because what it is
+    # collected for is the completeness check below: what matters there is only whether the list
+    # carries the file at all.
+    wpath=$(workflow_path "$wid") || return 1
+    listed="${listed}${wpath}"$'\n'
+    # A non-`active` row — disabled, or listed after the file was deleted — describes the DEFAULT
+    # branch, like every other field of this list. If the file is nonetheless present at either end
+    # of THIS merge, the merge context can still run it (a PR against a branch that kept a workflow
+    # the default branch dropped is the shape), so it is examined like any other. Only a row whose
+    # file is in neither end is skipped: there is nothing there to read and nothing to wait for
+    # (review round 8).
+    if [ "$wstate" != active ]; then
+      grep -qxF -- "$wpath" <<<"$declared"$'\n'"$bdeclared" || continue
+    fi
+    body=$(workflow_body "$wpath" "$head") || return 1
+    bbody=$(workflow_body "$wpath" "$base") || return 1
+    [ "$body" = "$bbody" ] || return 1
+    evs=$(awk -v q="'" -v dq='"' -v want= "$WORKFLOW_KEYS" <<<"$body") || return 1
+    [ -n "$evs" ] || return 1
+    while IFS= read -r ev; do
+      [ -n "$ev" ] || continue
+      case "$ev" in
+      pull_request)
+        pats=$(awk -v q="'" -v dq='"' -v want=pull_request -v seq=paths-ignore \
+          "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
+        [ -n "$pats" ] || return 1
+        paths_ignore_covers "$pats" "$rfiles" || return 1
+        ;;
+      *) case " $HEAD_INERT_EVENTS " in *" $ev "*) ;; *) return 1 ;; esac ;;
+      esac
+    done <<<"$evs"
+    why="${why:+$why, }$wname"
+  done <<<"$rows"
+  # Nothing was examined — every workflow advisory, disabled, or the list a single empty row —
+  # so nothing has been explained.
+  [ -n "$why" ] || return 1
+  # And nothing was MISSED: every workflow file at either end of the merge is one the list carried,
+  # so the loop above spoke for all of them.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    grep -qxF -- "$f" <<<"$listed" || return 1
+  done <<<"$declared"$'\n'"$bdeclared"
+  # The BASE is evidence here, not just the head — the workflow bodies, the file inventory and the
+  # merge base all came from it — and a PR can be RETARGETED, or its base advance, with the head
+  # untouched, which the caller's head-only revalidation would not notice and which
+  # `--match-head-commit` does not bind either (review round 9). So all three are re-read at the
+  # end and must be what they were: anything else, and this round's evidence is about a target the
+  # PR no longer has. The caller refreshes them for the next round, which then judges the new one.
+  confirm=$(gh_retry read api "repos/$REPO/pulls/$pr" \
+    --jq '[(.head.sha // "-"), (.base.sha // "-"), (.head.ref // "-")]
+          | map(if type == "string" and length > 0 then . else "-" end) | @tsv') || return 1
+  [ "$confirm" = "$head"$'\t'"$base"$'\t'"$ref" ] || return 1
+  PATHS_IGNORE_WHY="$why"
+  return 0
+}
+
 cmd_base() {
-  local branch="" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
+  local branch="""" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
   local allruns="" wfid
   local vconcl vsha vwhen vurl stopped_note wait_for=0 inflight=0 uncovered=0 red_at_tip=0
   local nogo_at_tip=0 last_tip="" grace_from confirm wf="" wid wname part sleep_for remaining
@@ -4570,6 +5028,30 @@ cmd_base() {
     shift
   done
   case "$wait_for" in '' | *[!0-9]*) die "base: --wait takes seconds, got '$wait_for'" ;; esac
+  # A --wait sized to outlive the absence grace, but not by a whole round, gets exactly ONE chance
+  # at the settle, and a WARNING says so (ludics-lite#175). It is not a refusal, and round 8 is why
+  # the first draft's was wrong: the sleep is capped at the remaining ceiling, so the last round is
+  # scheduled AT the ceiling and its grace test — which runs before the ceiling test, on a `now`
+  # read after that round's API calls — does reach the settle. `--wait=301` over a 300s grace
+  # works. What it does not have is a second chance: that single round has to find the tip where it
+  # left it, and a tip that MOVED restamps the grace from that round's own clock, after which no
+  # ceiling this close can reach it. A ceiling a whole poll interval past the grace has an ordinary
+  # round after the grace expires and does not depend on the last one landing well.
+  #
+  # So the line is loud and the call proceeds. A --wait at or BELOW the grace is not this shape at
+  # all and is not warned about: it is a bounded peek — "tell me what you have within N seconds" —
+  # which cannot settle an absence and says so, exit 4. And a ZERO grace is outside the question
+  # entirely, since the absence is eligible to settle on the first round and every positive ceiling
+  # reaches it.
+  if [ "$ABSENT_GRACE" -gt 0 ] && [ "$wait_for" -gt "$ABSENT_GRACE" ] &&
+    [ "$wait_for" -lt $((ABSENT_GRACE + CHECKS_INTERVAL)) ]; then
+    warn "base: --wait=$wait_for is inside the ${ABSENT_GRACE}s absence grace's own round" \
+      "(SHIP_PR_BASE_ABSENT_GRACE=$ABSENT_GRACE, SHIP_PR_CHECKS_INTERVAL=$CHECKS_INTERVAL)." \
+      "It reaches the settle only on the single round scheduled at the ceiling, and only if the" \
+      "tip has not moved — a tip that moves restamps the grace and no ceiling this close can then" \
+      "reach it. Size it from the two knobs instead:" \
+      "--wait=$((ABSENT_GRACE + CHECKS_INTERVAL)) or more (ludics-lite#175)."
+  fi
   [ -n "$REPO" ] || REPO=$(repo_from_cwd) || true
   [ -n "$REPO" ] || die "base: name the repo — \`base owner/name [branch]\`, --repo, or REPO=." \
     "cwd inference only works from a checkout, and not from a background shell."

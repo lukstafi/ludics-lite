@@ -271,6 +271,70 @@ test_the_grace_runs_from_the_first_read_of_the_tip() {
   assert_contains "$BASE_OUTPUT" "no run for the tip appeared" "the note should say what was waited for"
 }
 
+# --- the ceiling's own arithmetic (ludics-lite#175) --------------------------------------------
+# The grace is tested ONCE PER ROUND, after that round's own API calls, and rounds are one poll
+# interval apart. A ceiling between the grace and one interval past it therefore gets exactly one
+# chance at the settle — the round the remaining-ceiling cap schedules AT the ceiling — and that
+# round has to find the tip where it left it, because a tip that MOVED restamps the grace from its
+# own clock and no ceiling this close can then reach it. `--wait=301` over a 300s grace is that
+# number, and it is what the wave gate spelled until #175.
+#
+# It is a WARNING and not a refusal, which review round 8 is the reason for: the cap does schedule
+# that last round, so the wait works, and refusing it would turn a caller that has always worked
+# into a usage error. The line names both knobs and the ceiling that does not depend on one good
+# round.
+test_a_wait_inside_the_graces_own_round_is_warned_about() {
+  reset_fixture
+  retune ABSENT_GRACE=3 CHECKS_INTERVAL=2
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5071}]')")
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]' # recognized, so the case is about the line only
+  run_base --wait=4
+  assert_eq "$BASE_RC" 0 "the wait runs: this is a warning, not a usage error"
+  assert_contains "$BASE_OUTPUT" "--wait=4 is inside the 3s absence grace's own round" \
+    "the line should name the ceiling and the grace it sits inside"
+  assert_contains "$BASE_OUTPUT" "SHIP_PR_CHECKS_INTERVAL=2" "and the interval that makes the round"
+  assert_contains "$BASE_OUTPUT" "--wait=5 or more" "and the ceiling that needs no good round"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" "and it still answers"
+}
+
+# One whole round of margin: an ordinary wait, and no line.
+test_a_wait_of_one_round_over_the_grace_is_not_warned_about() {
+  reset_fixture
+  retune ABSENT_GRACE=3 CHECKS_INTERVAL=2
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5072}]')")
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
+  run_base --wait=5
+  assert_eq "$BASE_RC" 0 "grace plus one round is the derived ceiling"
+  assert_not_contains "$BASE_OUTPUT" "absence grace's own round" "and carries no warning"
+}
+
+# A ceiling at or BELOW the grace is a different thing entirely: a bounded peek — "tell me what you
+# have within N seconds" — which cannot settle an absence and says so, exit 4. Every case in this
+# suite that reads a refusal at the ceiling asks exactly that, so it is neither refused nor warned
+# about.
+test_a_wait_inside_the_grace_is_a_bounded_peek() {
+  reset_fixture
+  retune ABSENT_GRACE=300 CHECKS_INTERVAL=60
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5081}]')")
+  FILES_DEFAULT='[{"filename":"src/main.ml"}]' # unrecognized: only the clock could settle this
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a wait shorter than the grace reports no verdict"
+  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" "and says so about the tip"
+  assert_not_contains "$BASE_OUTPUT" "absence grace's own round" "and is not warned about"
+}
+
+# A ZERO grace is outside the question: with nothing to outlive, the absence is eligible to settle
+# on the first round, so every positive ceiling reaches it.
+test_a_zero_grace_is_never_warned_about() {
+  reset_fixture
+  retune ABSENT_GRACE=0 CHECKS_INTERVAL=60
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5091}]')")
+  FILES_DEFAULT='[{"filename":"src/main.ml"}]' # unrecognized: the zero grace is what settles it
+  run_base --wait=30
+  assert_eq "$BASE_RC" 0 "a wait shorter than one interval is fine when there is no grace"
+  assert_not_contains "$BASE_OUTPUT" "absence grace's own round" "and nothing is said about it"
+}
+
 # A listed workflow with NO push run on this branch at all is not in the fold, so no filter of its
 # was read: it may be dispatch- or schedule-only, or a workflow the tip itself just added whose
 # first run is on its way. One workflow's docs-only diff cannot speak for it, so the FAST settle
@@ -365,6 +429,10 @@ tests=(
   test_a_workflow_file_without_a_filter_refuses_the_recognition
   test_a_run_in_flight_on_the_branch_keeps_the_wait
   test_the_grace_runs_from_the_first_read_of_the_tip
+  test_a_wait_inside_the_graces_own_round_is_warned_about
+  test_a_wait_of_one_round_over_the_grace_is_not_warned_about
+  test_a_wait_inside_the_grace_is_a_bounded_peek
+  test_a_zero_grace_is_never_warned_about
   test_a_workflow_with_no_run_history_holds_the_fast_settle
   test_a_run_in_flight_at_the_tip_keeps_the_refusal
   test_a_stopped_run_at_the_tip_is_no_verdict_not_an_absence
