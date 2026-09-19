@@ -454,9 +454,22 @@ gh_fixture_answer() {
 # One line appended and the lines counted, rather than a number read, bumped and written back:
 # appends of one short line are atomic where a read-modify-write is not, and the fixture runs in
 # whatever order gh_retry and the shell fork it, so a rewritten total could lose a call.
+#
+# A name is ONE path component, and a plain one: it is joined to the directory as a filename, so
+# `../victim` would count — and `fixture_call_reset ../victim` would remove — a file outside the
+# root the EXIT trap owns. Refused by shape rather than resolved: a slash either way, `.` and
+# `..`, an empty name, and a leading `-` (which `rm -f` would read as an option) are all names no
+# suite means, and the refusal is cheaper than a counter that lands somewhere else.
+fixture_call_name_ok() {
+  case "$1" in
+  '' | . | .. | -* | */* | *\\*) return 1 ;;
+  esac
+}
+
 fixture_call_count() {
   local dir
-  [ $# -eq 1 ] && [ -n "$1" ] || bail "fixture_call_count: one counter name expected, got $# argument(s): $*"
+  [ $# -eq 1 ] || bail "fixture_call_count: one counter name expected, got $# argument(s): $*"
+  fixture_call_name_ok "$1" || bail "fixture_call_count: a counter name is one plain path component, not '$1'"
   [ -n "${TEST_ROOT:-}" ] || bail "fixture_call_count $1: TEST_ROOT is unset — ask test_tmpdir for one before the fixture runs"
   dir="$TEST_ROOT/fixture-calls"
   mkdir -p "$dir" || bail "fixture_call_count $1: cannot create $dir"
@@ -475,7 +488,9 @@ fixture_call_reset() {
     return 0
   fi
   for name in "$@"; do
-    [ -n "$name" ] || bail "fixture_call_reset: an empty counter name"
+    fixture_call_name_ok "$name" || bail "fixture_call_reset: a counter name is one plain path component, not '$name'"
+  done
+  for name in "$@"; do
     rm -f "$dir/$name"
   done
 }
@@ -1632,6 +1647,26 @@ test_fixture_call_count_survives_a_command_substitution() {
   control 'test_two_names() { fixture_call_count a b; }' 'run_tests test_two_names'
   assert_eq "$CONTROL_RC" 1 "two names is a call that meant something else ($CONTROL_ERR)"
   assert_contains "$CONTROL_ERR" "one counter name expected" "and the refusal says so"
+  # A name that is not one plain path component is refused BEFORE it is joined to the directory,
+  # by count and by reset alike: `../victim` would otherwise land — and be removed — outside the
+  # root the EXIT trap owns (review round 1 of ludics-lite#301). The victim is planted to show it.
+  local bad
+  for bad in '../victim' 'a/b' '.' '..' '' '-rf' 'a\\b'; do
+    control "TEST_ROOT=$(printf '%q' "$root")" \
+      "test_bad_name() { fixture_call_count $(printf '%q' "$bad"); }" 'run_tests test_bad_name'
+    assert_eq "$CONTROL_RC" 1 "counting under '$bad' must be refused ($CONTROL_ERR)"
+    assert_contains "$CONTROL_ERR" "one plain path component" "and the refusal says what a name is ('$bad')"
+    control "TEST_ROOT=$(printf '%q' "$root")" \
+      "test_bad_name() { fixture_call_reset $(printf '%q' "$bad"); }" 'run_tests test_bad_name'
+    assert_eq "$CONTROL_RC" 1 "resetting '$bad' must be refused too ($CONTROL_ERR)"
+    assert_contains "$CONTROL_ERR" "one plain path component" "with the same refusal ('$bad')"
+  done
+  : >"$root/victim"
+  mkdir -p "$root/fixture-calls"
+  control "TEST_ROOT=$(printf '%q' "$root/fixture-calls")" \
+    'test_traversal() { fixture_call_reset ../victim; }' 'run_tests test_traversal'
+  assert_eq "$CONTROL_RC" 1 "a traversal reset is refused ($CONTROL_ERR)"
+  [ -f "$root/victim" ] || bail "the refusal came after the removal: the planted file is gone"
 }
 
 test_the_guard_survives_a_path_with_spaces() {

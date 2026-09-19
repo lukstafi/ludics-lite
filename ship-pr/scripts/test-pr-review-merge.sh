@@ -46,6 +46,10 @@ BODY_FAIL=""                           # nonempty = the body read answers with a
 # the names body, base and default-branch: gh_retry calls the fixture inside a command
 # substitution, so a variable it increments dies with that subshell, and the count has to travel
 # in a file -- as CALLS_FILE already does. Three hand-rolled files did this before (ludics-lite#274).
+# Each count is captured with its status and a failure returned before an answer is chosen: a
+# `[ "$(...)" -ge 2 ]` over a count that could not be made is merely false, and the fixture would
+# then answer the FIRST-read shape with a clean status, passing a case that never reached the
+# later-read behaviour it exists for (review round 1 of ludics-lite#301).
 
 # The three library functions this suite replaces, declared so the shadow guard lets them through:
 # the build signal is not under test here. gate_checks calls them inside command substitutions;
@@ -76,14 +80,15 @@ gh() {
     *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
     *'.head.sha'*) printf '%s\tbase-sha\tclaude/topic\n' "$CURRENT_HEAD" ;;
     *'.base.ref'*)
-      if [ "$(fixture_call_count base)" -ge 2 ] && [ -n "$BASE_LATER" ]; then
+      reads=$(fixture_call_count base) || return 1
+      if [ -n "$BASE_LATER" ] && [ "$reads" -ge 2 ]; then
         printf '%s\n' "$BASE_LATER"
       else
         printf '%s\n' "$PR_BASE"
       fi
       ;;
     *'.body'*)
-      reads=$(fixture_call_count body)
+      reads=$(fixture_call_count body) || return 1
       if [ -n "$BODY_FAIL" ]; then
         printf 'gh: Not Found (HTTP 404)\n' >&2
         return 1
@@ -100,7 +105,8 @@ gh() {
     esac
     ;;
   "api repos/$REPO")
-    if [ "$(fixture_call_count default-branch)" -ge 2 ] && [ -n "$DEFAULT_BRANCH_FAIL_LATER" ]; then
+    reads=$(fixture_call_count default-branch) || return 1
+    if [ -n "$DEFAULT_BRANCH_FAIL_LATER" ] && [ "$reads" -ge 2 ]; then
       printf 'gh: Not Found (HTTP 404)\n' >&2
       return 1
     fi
