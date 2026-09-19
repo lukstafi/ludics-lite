@@ -32,13 +32,16 @@
 #                                       $PAGINATE_LOG) if the suite set them; the answer goes
 #                                       through the --jq filter the call carried, if any
 #   fixture_call_count <name>           inside a fixture `gh`: one more call under <name>, and
-#   fixture_call_reset [<name>...]      the new total on stdout, so `[ "$(fixture_call_count
-#                                       body)" -ge 2 ]` is "from the second read on". The count
+#   fixture_call_total <name>           the new total on stdout, so `[ "$(fixture_call_count
+#   fixture_call_reset [<name>...]      body)" -ge 2 ]` is "from the second read on". The count
 #                                       lives in a FILE under $TEST_ROOT, never in a variable:
 #                                       gh_retry runs the fixture inside a command substitution,
 #                                       and a variable the fixture increments dies with that
 #                                       subshell — the merge suite hand-rolled three such files
-#                                       (ludics-lite#274) before this took their place. reset
+#                                       (ludics-lite#274) and the base fixture a fourth before
+#                                       these took their place. total is the current count
+#                                       WITHOUT counting — 0 for a counter never made — for a
+#                                       case's assertion or a fixture's other branches. reset
 #                                       zeroes the named counters, or all of them, between cases
 #   retune <NAME>=<value>...            moves pr-review.sh's source-time constants (GRACE, STALL,
 #                                       ROUND_GAP, ABSENT_GRACE, CHECKS_INTERVAL, …) for the
@@ -447,16 +450,18 @@ gh_fixture_answer() {
 # a `CALLS=$((CALLS + 1))` inside it is thrown away with the answer captured. A file is the only
 # thing a subshell can leave behind for the next one, which is why every suite that needed this
 # grew a `printf x >>"$FILE"` and a `wc -l` of its own (the merge suite three of them, the base
-# fixture's ROUND_READS a fourth). One helper, keyed by name, under the suite's $TEST_ROOT so the
-# EXIT trap collects it with everything else; there is no default root to write into, so a suite
-# without a TEST_ROOT is refused rather than counted in $PWD.
+# fixture's round counter a fourth). One helper, keyed by name, under the suite's $TEST_ROOT so
+# the EXIT trap collects it with everything else; there is no default root to write into, so a
+# suite without a TEST_ROOT is refused rather than counted in $PWD. `fixture_call_total` reads
+# the same file without appending: what a case asserts on, and what a fixture branch that must
+# NOT be the counting one (the base fixture's tip read, keyed off its round count) consults.
 #
 # One line appended and the lines counted, rather than a number read, bumped and written back:
 # appends of one short line are atomic where a read-modify-write is not, and the fixture runs in
 # whatever order gh_retry and the shell fork it, so a rewritten total could lose a call.
 #
-# EVERY filesystem step in both helpers is `|| bail`: the mkdir, the append, the count, and each
-# removal. A count runs inside a command substitution, which does not inherit errexit, so a step
+# EVERY filesystem step in all three helpers is `|| bail`: the mkdir, the append, each count, and
+# each removal. A count runs inside a command substitution, which does not inherit errexit, so a step
 # whose status is dropped there answers with a stale or empty total under a clean status — and a
 # caller's `reads=$(fixture_call_count x) || return 1` then sees nothing wrong. `bail` exits the
 # substitution's shell with 1, which is what that caller's `||` catches; from a reset, called at
@@ -484,6 +489,23 @@ fixture_call_count() {
   mkdir -p "$dir" || bail "fixture_call_count $1: cannot create $dir"
   printf 'x\n' >>"$dir/$1" || bail "fixture_call_count $1: cannot append to $dir/$1"
   total=$(wc -l <"$dir/$1") || bail "fixture_call_count $1: cannot read $dir/$1"
+  printf '%s\n' "${total// /}"
+}
+
+# fixture_call_total <name>: the current total under <name>, WITHOUT counting; 0 when nothing has
+# counted under it yet (the file does not exist), which is also what a reset leaves behind. A
+# counter file that exists but cannot be read is a failed call, not a zero.
+fixture_call_total() {
+  local dir total
+  [ $# -eq 1 ] || bail "fixture_call_total: one counter name expected, got $# argument(s): $*"
+  fixture_call_name_ok "$1" || bail "fixture_call_total: a counter name is one plain path component, not '$1'"
+  [ -n "${TEST_ROOT:-}" ] || bail "fixture_call_total $1: TEST_ROOT is unset — ask test_tmpdir for one before the fixture runs"
+  dir="$TEST_ROOT/fixture-calls"
+  if [ ! -e "$dir/$1" ]; then
+    echo 0
+    return 0
+  fi
+  total=$(wc -l <"$dir/$1") || bail "fixture_call_total $1: cannot read $dir/$1"
   printf '%s\n' "${total// /}"
 }
 
@@ -1638,11 +1660,16 @@ test_fixture_call_count_survives_a_command_substitution() {
     'fixture() { VAR=$((VAR + 1)); fixture_call_count body; }' \
     'test_counts() {' \
     '  local n' \
+    '  n=$(fixture_call_total body); assert_eq "$n" 0 "a total before any count is 0, not a refusal"' \
     '  n=$(fixture); assert_eq "$n" 1 "the first call"' \
     '  n=$(fixture); assert_eq "$n" 2 "the second call, counted across the substitution"' \
     '  assert_eq "$VAR" 0 "the variable bumped in the same substitution never reaches the case"' \
+    '  n=$(fixture_call_total body); assert_eq "$n" 2 "the total after two counts is 2"' \
+    '  n=$(fixture_call_total body); assert_eq "$n" 2 "and reading the total does not count"' \
+    '  n=$(fixture); assert_eq "$n" 3 "the next count carries on from 2, not from a total that counted"' \
     '  n=$(fixture_call_count other); assert_eq "$n" 1 "a second name counts on its own"' \
     '  fixture_call_reset body' \
+    '  n=$(fixture_call_total body); assert_eq "$n" 0 "a reset counter totals 0 again"' \
     '  n=$(fixture); assert_eq "$n" 1 "reset by name starts that counter over"' \
     '  n=$(fixture_call_count other); assert_eq "$n" 2 "and leaves the other alone"' \
     '  fixture_call_reset' \
@@ -1654,9 +1681,15 @@ test_fixture_call_count_survives_a_command_substitution() {
   control 'TEST_ROOT=' 'test_no_root() { fixture_call_count body; }' 'run_tests test_no_root'
   assert_eq "$CONTROL_RC" 1 "with no TEST_ROOT the count is refused, not written somewhere ($CONTROL_ERR)"
   assert_contains "$CONTROL_ERR" "TEST_ROOT is unset" "the refusal should say what is missing"
+  control 'TEST_ROOT=' 'test_no_root() { fixture_call_total body; }' 'run_tests test_no_root'
+  assert_eq "$CONTROL_RC" 1 "with no TEST_ROOT a total is refused too, not answered 0 ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "TEST_ROOT is unset" "with the same refusal"
   control 'test_two_names() { fixture_call_count a b; }' 'run_tests test_two_names'
   assert_eq "$CONTROL_RC" 1 "two names is a call that meant something else ($CONTROL_ERR)"
   assert_contains "$CONTROL_ERR" "one counter name expected" "and the refusal says so"
+  control 'test_two_names() { fixture_call_total a b; }' 'run_tests test_two_names'
+  assert_eq "$CONTROL_RC" 1 "two names to a total meant something else as well ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "one counter name expected" "with the same refusal"
   # A name that is not one plain path component is refused BEFORE it is joined to the directory,
   # by count and by reset alike: `../victim` would otherwise land — and be removed — outside the
   # root the EXIT trap owns (review round 1 of ludics-lite#301). The victim is planted to show it.
@@ -1669,6 +1702,10 @@ test_fixture_call_count_survives_a_command_substitution() {
     control "TEST_ROOT=$(printf '%q' "$root")" \
       "test_bad_name() { fixture_call_reset $(printf '%q' "$bad"); }" 'run_tests test_bad_name'
     assert_eq "$CONTROL_RC" 1 "resetting '$bad' must be refused too ($CONTROL_ERR)"
+    assert_contains "$CONTROL_ERR" "one plain path component" "with the same refusal ('$bad')"
+    control "TEST_ROOT=$(printf '%q' "$root")" \
+      "test_bad_name() { fixture_call_total $(printf '%q' "$bad"); }" 'run_tests test_bad_name'
+    assert_eq "$CONTROL_RC" 1 "a total under '$bad' must be refused too ($CONTROL_ERR)"
     assert_contains "$CONTROL_ERR" "one plain path component" "with the same refusal ('$bad')"
   done
   : >"$root/victim"
@@ -1691,6 +1728,14 @@ test_fixture_call_count_survives_a_command_substitution() {
     assert_eq "$CONTROL_RC" 1 "an append that fails is a failed count ($CONTROL_ERR)"
     assert_contains "$CONTROL_ERR" "cannot append" "and says so"
     assert_not_contains "$CONTROL_ERR" "stale total" "the caller's \`|| return 1\` must see the failure"
+    chmod 0000 "$root/ro/fixture-calls/body"
+    control "TEST_ROOT=$(printf '%q' "$root/ro")" \
+      'test_ro_total() { local n; n=$(fixture_call_total body) || return 1; bail "stale total $n under a clean status"; }' \
+      'run_tests test_ro_total'
+    assert_eq "$CONTROL_RC" 1 "a counter that exists but cannot be read is a failed total, not 0 ($CONTROL_ERR)"
+    assert_contains "$CONTROL_ERR" "cannot read" "and says so"
+    assert_not_contains "$CONTROL_ERR" "stale total" "through the substitution the caller reads it in"
+    chmod 0444 "$root/ro/fixture-calls/body"
     chmod 0555 "$root/ro/fixture-calls"
     control "TEST_ROOT=$(printf '%q' "$root/ro")" 'test_reset() { fixture_call_reset; }' 'run_tests test_reset'
     assert_eq "$CONTROL_RC" 1 "a reset that cannot remove the counters refuses ($CONTROL_ERR)"
