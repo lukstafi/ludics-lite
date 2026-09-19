@@ -374,8 +374,17 @@ job_run_commands() { # job_run_commands <job>
 #   list dash -- `- run: x`, `- continue-on-error: true` -- which is valid YAML this workflow
 #   already uses, so every key is found at a field index rather than at field 1 (rounds 9, 10).
 #
-# A step is LIVE when nothing on either axis can stop its failure failing the job. The one
-# condition accepted is `${{ !cancelled() }}`, which skips a cancelled run and nothing else.
+# A step is LIVE when nothing on either axis can stop its failure failing the job, and that is an
+# ALLOW-LIST rather than a list of the keys that can. Five rounds of this review each named one
+# more key -- `if:`, `continue-on-error:`, then the same two at job level and behind the dash,
+# then `shell: bash -n {0}`, which parses the run script and never runs it -- and the supply is
+# not exhausted (`working-directory:`, `env:`, `uses:`, a job-level or workflow-level `defaults:`
+# setting the shell). A deny-list of keys is a list this review can always add to, so the rule is
+# inverted: a pinned step may carry `name:`, `run:`, `id:` and an `if:` that is `${{ !cancelled() }}`,
+# and ANY other key means the step is not the invocation this pin reads. A `defaults:` block at
+# job or workflow level does the same for everything under it. The class is closed by construction
+# -- a new Actions key cannot open it -- and a step that legitimately needs another key gets a
+# loud refusal here, which is one line to answer deliberately.
 WORKFLOW_AWK='
   function rest(n,   i, t) {
     t = ""
@@ -391,21 +400,65 @@ WORKFLOW_AWK='
     return (c == "" || c ~ /^\$\{\{[ ]*![ ]*cancelled\(\)[ ]*\}\}$/)
   }
   function live() {
-    return (!jsoft && !ssoft && open_cond(jcond) && open_cond(scond))
+    return (!wother && !jother && !sother && open_cond(jcond) && open_cond(scond))
   }
-  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job = $0; jcond = ""; jsoft = ""; scond = ""; ssoft = ""; next }
+  /^[[:space:]]*$/ { next }
+  /^[[:space:]]*#/ { next }
+  /^defaults:/ { wother = 1; next }
+  /^[A-Za-z]/ { next }
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job = $0; jcond = ""; jother = ""; scond = ""; sother = ""; next }
   /^    [A-Za-z]/ {
     if ($1 == "if:") jcond = rest(2)
-    else if ($1 == "continue-on-error:") jsoft = ($2 != "false")
+    else if ($1 == "continue-on-error:" && $2 != "false") jother = 1
+    else if ($1 == "defaults:") jother = 1
     next
   }
-  /^      - / { scond = ""; ssoft = "" }
+  /^      - / { scond = ""; sother = "" }
   {
     a = ($1 == "-" ? 2 : 1)
     if ($a == "if:") scond = rest(a + 1)
-    else if ($a == "continue-on-error:") ssoft = ($(a + 1) != "false")
+    else if ($a == "name:" || $a == "run:" || $a == "id:") { }
+    else sother = 1
   }
 '
+
+# THE BARE-INVOCATION RULE.
+#
+# The tail rule was three rounds of grammar before it was one line. Round 4 accepted any operator
+# tail, round 5 accepted `|| { ...; exit 1; }` by substring, round 6 anchored the match -- and
+# round 8 showed `|| { echo exit 1; }` satisfying the anchored pattern, because a text rule cannot
+# say whether a handler FAILS. The tolerance is gone rather than hardened a fourth time: every
+# command in the step table already has an invocation with no tail at all (the lint job runs each
+# of them bare, and the prompt hygiene job runs check-prompts.sh bare), so accepting a tail bought
+# nothing and cost four rounds. A macOS-style `<suite> || { echo ...; exit 1; }` line is simply
+# not the invocation this pin reads; the command needs one plain line somewhere, which is what the
+# refusal asks for.
+#
+# The attributes are read here and not only in the lint job (round 8): the table deliberately lets
+# an external command be satisfied by a step in ANY job -- check-prompts.sh is satisfied by the
+# prompt hygiene job, the only check a prompt-only head gets -- so a `continue-on-error: true` or
+# an `if: ${{ false }}` there would otherwise be invisible. A disabled step is not an invocation.
+# THE READER these four share, so they cannot disagree about what the workflow says. Two axes,
+# each of which cost a round on its own before they were read as axes:
+#
+#   WHERE a key stands. A job-level `if:` or `continue-on-error:` (four spaces) governs every step
+#   under it and must not be cleared when a step begins, or a whole pinned job is switched off
+#   unseen (rounds 9, 10); a step-level one governs its step alone.
+#   HOW a line is spelled. `run:`, `if:` and `continue-on-error:` may each open a step behind the
+#   list dash -- `- run: x`, `- continue-on-error: true` -- which is valid YAML this workflow
+#   already uses, so every key is found at a field index rather than at field 1 (rounds 9, 10).
+#
+# A step is LIVE when nothing on either axis can stop its failure failing the job, and that is an
+# ALLOW-LIST rather than a list of the keys that can. Five rounds of this review each named one
+# more key -- `if:`, `continue-on-error:`, then the same two at job level and behind the dash,
+# then `shell: bash -n {0}`, which parses the run script and never runs it -- and the supply is
+# not exhausted (`working-directory:`, `env:`, `uses:`, a job-level or workflow-level `defaults:`
+# setting the shell). A deny-list of keys is a list this review can always add to, so the rule is
+# inverted: a pinned step may carry `name:`, `run:`, `id:` and an `if:` that is `${{ !cancelled() }}`,
+# and ANY other key means the step is not the invocation this pin reads. A `defaults:` block at
+# job or workflow level does the same for everything under it. The class is closed by construction
+# -- a new Actions key cannot open it -- and a step that legitimately needs another key gets a
+# loud refusal here, which is one line to answer deliberately.
 
 # The command word of every `run:` line that is a LIVE, BARE invocation: nothing at all after the
 # command word, in a step and a job that carry nothing able to stop it failing.
@@ -770,6 +823,37 @@ for probe_attr in 'continue-on-error: true' 'if: ${{ false }}'; do
     ko "the swap probe rewrote nothing: the prompts job no longer opens its step as this file expects"
   fi
 done
+
+# The allow-list closes the class: a key nobody has thought of yet is refused by default. These
+# four are the shapes this review found one round at a time, and the last of them -- a shell that
+# parses the run script instead of running it -- is the one a deny-list would have missed again.
+for probe_key in \
+  'shell: bash -n {0}' \
+  'working-directory: docs' \
+  'continue-on-error: true' \
+  'env:'; do
+  if probe_workflow_swap '        run: scripts/check-prompts.sh' \
+    "        $probe_key
+        run: scripts/check-prompts.sh"; then
+    grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+      && ko "a step key outside the allow-list left the check counting as run: $probe_key" \
+      || ok "...and a step carrying anything else is not that invocation: $probe_key"
+  else
+    ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
+  fi
+done
+# ...and the same at job level, where one `defaults:` sets the shell for every step under it.
+if probe_workflow_swap '  prompts:' \
+  '  prompts:
+    defaults:
+      run:
+        shell: bash -n {0}'; then
+  grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+    && ko "a job-level defaults block left the job's steps counting as live" \
+    || ok "...nor is any step under a defaults block, which can set the shell for all of them"
+else
+  ko "the swap probe rewrote nothing: the workflow no longer opens the prompts job as this file expects"
+fi
 
 # The compact step form is valid YAML and is used in this workflow, so every reader must see it.
 if probe_workflow_swap '        run: scripts/check-jq-shapes.sh' \
