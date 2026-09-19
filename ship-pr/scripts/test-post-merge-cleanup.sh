@@ -1138,12 +1138,7 @@ test_regenerable_name_resolution_refusals() {
   newline_dir=$(printf '\nbuild')
   mkdir -p "$CASE_SESSION/$newline_dir"
   echo 'tracked output' >"$CASE_SESSION/$newline_dir/kept"
-  git -C "$CASE_SESSION" add -- "$newline_dir/kept"
-  git -C "$CASE_SESSION" commit -m "tracked directory whose name starts with a newline" >/dev/null
-  git -C "$CASE_SESSION" push origin topic >/dev/null
-  git -C "$CASE_INTEGRATOR" fetch origin >/dev/null 2>&1
-  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge newline directory" >/dev/null
-  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  land_topic_change "tracked directory whose name starts with a newline" "merge newline directory" "$newline_dir/kept"
   if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable "$newline_dir" 2>&1); then
     fail "a tracked directory whose name begins with a newline was accepted as regenerable"
   fi
