@@ -1647,6 +1647,34 @@ sweep_lock() { # sweep_lock <lock-dir|-> <home> <ssh-alias> [<ready> <keep>]
              while [ -e "$4" ]; do sleep 1; done' \
       _ "$TMP/sweep-lock.sh" "$3" "${4:-}" "${5:-}" )
 }
+# EVERY call into that imported helper goes through these two, so every one of them runs in the
+# background behind a deadline and is terminated when the deadline passes. `take_lab_lock` is
+# foreign code this suite does not control: a future sweep that reintroduced a blocking wait which
+# no longer observes LAB_LOCK_WAIT would otherwise hang this suite outright instead of reporting
+# the regression the cases below exist to report. Holding rather than returning is also what lets
+# a caller prove the lock is REAL, since the flock lives exactly as long as the shell that took it.
+sweep_hold_start() { # sweep_hold_start <lock-dir|-> <home> <ssh-alias> -- 0 iff it is now holding
+  rm -f "$TMP/sweep-ready"; : > "$TMP/sweep-keep"
+  sweep_lock "$1" "$2" "$3" "$TMP/sweep-ready" "$TMP/sweep-keep" >"$TMP/sweep-holder.log" 2>&1 &
+  sweep_holder=$!
+  local deadline=$((SECONDS + 30))
+  # `kill -0` as well as the clock: a helper that REFUSED the lock has already exited, and waiting
+  # the full deadline out for it would turn every negative case into a 30-second one.
+  while [ ! -e "$TMP/sweep-ready" ] && kill -0 "$sweep_holder" 2>/dev/null \
+        && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+  [ -e "$TMP/sweep-ready" ]
+}
+sweep_hold_stop() { # sweep_hold_stop -- let the holder go, and do not return until it is gone
+  local deadline=$((SECONDS + 15))
+  rm -f "$TMP/sweep-keep"
+  while kill -0 "$sweep_holder" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+  kill -KILL "$sweep_holder" 2>/dev/null
+  wait "$sweep_holder" 2>/dev/null
+  # The kernel closes a killed holder's descriptor a moment after the kill returns, and the next
+  # case takes the same lock, so do not hand it back until it is really free.
+  deadline=$((SECONDS + 15))
+  while ! lock_free rog && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+}
 if ! git -C "$STAGING" rev-parse --git-dir >/dev/null 2>&1; then
   skip "the cross-repository lock contract is UNCHECKED: no ocannl-staging git checkout at \
 $STAGING (set OCANNL_STAGING)"
@@ -1674,7 +1702,7 @@ its lock the way the cases below assume, so they would stop being about the live
       # A HOME of its own per box: the sweep derives its directory from $HOME, so this keeps the
       # run off this machine's real lab AND proves the path is derived rather than hard-coded.
       home="$TMP/sweep-home-$box"; mkdir -p "$home"
-      out=$(sweep_lock - "$home" "$sshalias" 2>&1); rc=$?
+      sweep_hold_start - "$home" "$sshalias"; rc=$?
       mine=$(env -u WAKE_LAB_LOCK_DIR HOME="$home" WAKE_LAB_HOSTS="$TMP/absent.sh" \
         "$WL" lock-path "$box" 2>&1)
       rel=".local/state/wake-lab/$box.lock"
@@ -1684,8 +1712,10 @@ its lock the way the cases below assume, so they would stop being about the live
       else
         ko "the two repositories disagree about $sshalias (rc=$rc): the sweep's own take_lab_lock \
 left [$(created "$home")] under its HOME, while wake-lab answers '$mine' for box $box -- the \
-interlock is off, and nothing else in either repository would say so. $out"
+interlock is off, and nothing else in either repository would say so. \
+$(cat "$TMP/sweep-holder.log" 2>/dev/null)"
       fi
+      sweep_hold_stop
     done
 
     # Both live cases below reserve rog under $LOCKS, so wait out any descriptor a case above left
@@ -1701,30 +1731,35 @@ interlock is off, and nothing else in either repository would say so. $out"
     # the flock taken by a perl that exits -- and require the sweep to take its lane lock anyway.
     # Behaviour rather than a text scan, because honouring it need not mention it: a wildcard over
     # `$box.*.lock`, or a suffix assembled at run time, would pass any scan for the literal.
+    # An exit status alone would not do it: a take_lab_lock that returned 0 WITHOUT the lane lock
+    # whenever the hold lock was contended would satisfy it, and the end-to-end case below runs
+    # with no hold lock held, so nothing else would expose that. Keep the helper alive and require
+    # a competing non-blocking flock on the LANE lock to be refused.
     : > "$LOCKS/rog.lock"
-    if ( exec 7>>"$LOCKS/rog.hold.lock"
-         perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7 \
-           && sweep_lock "$LOCKS" "$TMP/sweep-home-rog" rog-nv-wsl ) >/dev/null 2>&1; then
-      ok "the sweep still takes its lane lock while the box's HOLD lock is held, as #224 requires"
+    exec 7>>"$LOCKS/rog.hold.lock"
+    if ! perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7; then
+      ko "this suite could not take rog's HOLD lock, so the case below would prove nothing"
     else
-      ko "the sweep did not take rog's lane lock while rog.hold.lock was held: it is honouring the \
-hold lock, so a box the routine holds can no longer sweep itself and its lanes skip (ludics-lite#224)"
+      if sweep_hold_start "$LOCKS" "$TMP/sweep-home-rog" rog-nv-wsl \
+         && ! file_free "$LOCKS/rog.lock"; then
+        ok "the sweep still takes its lane lock while the box's HOLD lock is held, as #224 requires"
+      else
+        ko "the sweep does not hold rog's LANE lock while rog.hold.lock is held: it is honouring \
+the hold lock, so a box the routine holds can no longer sweep itself and its lanes skip \
+(ludics-lite#224). $(cat "$TMP/sweep-holder.log" 2>/dev/null)"
+      fi
+      sweep_hold_stop
     fi
+    exec 7>&-
 
     # ...and the whole interlock, end to end, each side running its own real code. The sweep's own
     # take_lab_lock holds the box in a live process; this script's own destroyer must then be
     # refused. A lock FILE at an agreed path proves nothing on its own -- what wake-lab is refused
     # by is a live flock -- so this is the case that makes the path comparisons above mean
     # something, and the one that would go red if either side stopped locking for real.
-    rm -f "$TMP/sweep-ready"; : > "$TMP/sweep-keep"
-    sweep_lock "$LOCKS" "$TMP/sweep-home-rog" rog-nv-wsl "$TMP/sweep-ready" "$TMP/sweep-keep" \
-      >/dev/null 2>&1 &
-    sweep_holder=$!
-    sweep_deadline=$((SECONDS + 30))
-    while [ ! -e "$TMP/sweep-ready" ] && [ "$SECONDS" -lt "$sweep_deadline" ]; do sleep 1; done
-    if [ ! -e "$TMP/sweep-ready" ]; then
-      ko "the sweep's take_lab_lock did not take rog's lane lock under $LOCKS within 30s, so the \
-interlock could not be exercised end to end"
+    if ! sweep_hold_start "$LOCKS" "$TMP/sweep-home-rog" rog-nv-wsl; then
+      ko "the sweep's take_lab_lock did not take rog's lane lock under $LOCKS within its deadline, \
+so the interlock could not be exercised end to end. $(cat "$TMP/sweep-holder.log" 2>/dev/null)"
     elif ! file_free "$LOCKS/rog.hold.lock"; then
       ko "rog's HOLD lock is held as well, so a refusal below would not be attributable to the \
 sweep's LANE lock -- the case would pass without proving anything"
@@ -1740,7 +1775,7 @@ the interlock the two repositories exist to keep is not working: $out $(cat "$SS
         && ok "...and the refusal names the sweep, so the operator knows what to wait for" \
         || ko "the refusal does not name the sweep as the holder -- $out"
     fi
-    rm -f "$TMP/sweep-keep"; wait "$sweep_holder" 2>/dev/null
+    sweep_hold_stop
   fi
 fi
 
