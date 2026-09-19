@@ -208,6 +208,19 @@ gh() {
       ;;
     esac
   fi
+  # ORDER IS LOAD-BEARING. `case` takes the FIRST arm that matches, and several arms below are
+  # globs that also match a more specific endpoint's path — so the specific arm must come before
+  # the glob it would otherwise fall into, or the endpoint is silently served the wrong canned
+  # answer (no arm fails; the `*)` bail only fires for a path nothing matches). The traps:
+  #   - "commits/$HEAD_SHA" (commit date) and "commits/$SAMPLE_SHA/check-runs?…" (sample checks)
+  #     must precede "commits/"* (the files of a range commit), which matches both.
+  #   - "contents/.github/workflows?ref=$BASE_SHA" (base's workflow dir) must precede
+  #     "contents/.github/workflows?ref="* (head's), and both must precede
+  #     "contents/"*"?ref=$BASE_SHA" (a workflow file at the base) and "contents/"* (at the
+  #     head): a directory listing matches every one of the file-content globs.
+  # Adding an arm: put an exact endpoint above every glob whose pattern it satisfies, and a new
+  # glob below every exact arm it would swallow. "actions/workflows?…" and "actions/workflows/"*
+  # do NOT overlap (the glob demands the slash), nor do "actions/runs?…" and "actions/runs/"*.
   case "$FIXTURE_ENDPOINT" in
   "repos/$REPO/pulls/7")
     fixture_head=$(next_of HEAD_SEQ)
@@ -233,7 +246,7 @@ gh() {
   "repos/$REPO/commits/$HEAD_SHA")
     response=$(jq -cn --arg at "$(iso_ago "$COMMIT_AGE")" '{commit:{committer:{date:$at}}}')
     ;;
-  # --- the recognition's feeds; the exact commit read above wins over the glob below ------------
+  # --- the recognition's feeds ---------------------------------------------------------------
   "repos/$REPO/actions/workflows?per_page=100")
     response=$(jq -c --arg t "$WORKFLOW_TOTAL" \
       '. + {total_count: (if $t == "" then (.workflows | length) else ($t | tonumber) end)}' \
