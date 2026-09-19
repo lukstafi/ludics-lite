@@ -702,11 +702,10 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   the gate), and only past that is `ABSENT` the verdict — with the evidence on the line. A head
   with **no run at all** skips that wait when no workflow of the repository can create one for it
   (ludics-lite#176). Every `pull_request` trigger's `paths-ignore` must cover every commit from the
-  PR's merge base up to the head; every `push` trigger must be out of reach of every ref that carries
-  this commit (a `branches:` list matched neither by the head's branch nor by any branch the commit
-  is the head of, and no tag filter at all), because a push event's files are computed between its
-  own before and after and after a force-push the before is not on that path, so no path filter
-  describes it; and every other trigger must be one whose run can NEVER carry this commit as
+  PR's merge base up to the head; a declared `push` trigger REFUSES, whatever it says, because nothing
+  about a push event is establishable from these feeds — its files are computed between its own
+  before and after, which a force-push puts off the walked path, and a tag or another branch
+  carries the same SHA; and every other trigger must be one whose run can NEVER carry this commit as
   its head — `merge_group`, created at the queue's own ref, and `workflow_call`, which produces no
   run of its own. Everything else refuses, `pull_request_target`, the review events, `schedule` and
   `workflow_dispatch` among them: each of those CAN put a run on this head, and an empty run list
@@ -726,9 +725,12 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   must have READ a green. The head SHA, the base SHA and the head ref are all re-read before the
   verdict is accepted: a retarget, or a base that advances, moves the evidence all of this rests on
   without moving the head, and `--match-head-commit` binds only the head. Anything less than certain — an unparseable workflow, a pattern the
-  translation does not carry, a trigger with no filter, a list longer than its page on either read,
-  a range past the cap, a base-side edit to the workflow, a second provider — refuses and costs the
-  grace, exactly as `base --wait` does. The same grace is what
+  translation does not carry, a trigger with no filter, a list longer than its page on any read, a
+  range past the cap, a base-side edit to the workflow, a second provider — refuses and costs the
+  grace, exactly as `base --wait` does. **The `push` refusal is most of that**: a repository whose
+  CI workflow declares `on: push` at all, which is most of them, gets no fast path here, and its
+  docs-only PR heads wait the grace out as they did before. What the recognition reaches is the
+  workflow triggered on `pull_request` alone. The same grace is what
   `base --wait`'s ceiling is sized against, and a `--wait` in the band between the grace and one
   poll interval past it draws a loud line: it reaches the settle only on the single round the
   ceiling cap schedules, and a tip that moves restamps the grace out from under it

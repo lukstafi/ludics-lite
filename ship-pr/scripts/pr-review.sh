@@ -4527,9 +4527,6 @@ workflow_body() {
 # for its own 300-file cap.
 CONTENTS_DIR_CAP=1000
 
-# How many branches the commit-to-branches endpoint reports before it stops; it documents a maximum
-# and offers no continuation past it, so a list at the cap is one this cannot complete.
-BRANCHES_AT_HEAD_CAP=100
 
 workflow_files_at() {
   local raw count
@@ -4779,15 +4776,22 @@ tip_within_paths_ignore() {
 # hold the same content, that content is what the merge produces, so the copy in hand IS the
 # merge context's. Any difference, or a copy that cannot be read on either side, refuses.
 #
-# `push` is the one a filter CANNOT explain, and this is the finding that matters most in the
-# round: a push event's changed files are computed between the push's own before and after, and
-# after a NON-fast-forward push the before is not on the path walked here at all. Force-pushing a
-# `src/` change away leaves a docs-only range whose push diff still carries that file — and
-# therefore still creates a run. The pre-push SHA is in no feed this reads, so the push trigger is
-# never explained by a filter. What can be established without it is whether the trigger is
-# REACHABLE: a `branches:` list the head's own branch matches none of means no push to this branch
-# reaches the workflow at all, whatever it changed. Anything else about `push` — no `branches:`, a
-# `branches-ignore:`, a pattern that does not translate, a list the branch matches — refuses.
+# `push` REFUSES, always, and four rounds of review are the argument. Nothing about a push event
+# can be established from the feeds this reads. Its changed files are computed between the push's
+# own before and after, and after a non-fast-forward push the before is not on the path walked here
+# (round 1), so no path filter describes it. Whether its `branches:` list can be reached is not
+# answerable either: a tag push carries the same SHA (round 9), so does a push to another branch,
+# and `branches-where-head` — the one lookup that could name those branches — describes where the
+# SHA is head NOW rather than where it was pushed, so a matching branch that has since advanced or
+# been deleted is invisible while its run is still being created (round 11). Each fix closed its
+# case and the next round found another, which is the signal to stop: the pre-push context is not
+# in any feed here, and a rule that cannot see it cannot be completed.
+#
+# What that costs is stated plainly, because it is most of this recognition's reach: a repository
+# whose CI workflow declares `on: push` at all — which is most of them — gets no fast path, and its
+# docs-only PR heads wait the absence grace out exactly as they did before ludics-lite#176. What
+# remains is the workflow triggered on `pull_request` alone, where the question is answerable, and
+# the grace carries every other head as it always has.
 #
 # `pull_request_target` refuses outright. GitHub runs it from the workflow file in the PR's BASE
 # context, not the head's, so the file read here is not the file that decides; a base-side edit
@@ -4872,60 +4876,6 @@ providers_are_actions_only() {
   [ "$seen" -gt 0 ]
 }
 
-# push_cannot_reach <workflow body> <head ref> <head sha>: true when NO push can reach the
-# workflow's `push` trigger with this commit — it declares a `branches:` list, declares no tag
-# filter, and no ref that carries this SHA as its head matches any of the branch patterns. False
-# for every other shape, including every shape this cannot read.
-#
-# The SHA half is review round 9's, and the finding was exact: proving that the PR's own branch
-# misses the list does not prove that no push run can be created for this commit. A `tags:` beside
-# the branches means a tag push at this SHA creates one, and a branch OTHER than the PR's that
-# carries this SHA as its head matches the list on its own account. Both are read rather than
-# assumed away: a tag filter of any kind refuses outright (there is no ref name to test a tag
-# pattern against — the PR has none), and the branch patterns are tested against every branch this
-# repository reports the commit at the head of, the PR's own ref included since a fork's branch is
-# in no listing of this repository's.
-push_cannot_reach() {
-  local body="$1" ref="$2" sha="$3" keys brs refs count pat ere r
-  [ -n "$ref" ] || return 1
-  # PRESENCE first, and by name. Asking the pattern reader for its exit status conflated "the key
-  # is not there" with "the key is there in a form I cannot read", so an unparseable `tags:` read
-  # as no tags at all (review round 10). A keys read that fails at all refuses.
-  keys=$(awk -v q="'" -v dq='"' -v want=push "$WORKFLOW_KEYS" <<<"$body") || return 1
-  # A branches-ignore: is a filter with the opposite sense, and the list above it does not describe
-  # the workflow. A tags:/tags-ignore: is a whole other ref namespace, and this has no candidate
-  # tag name to test a pattern against — the pull request has none. Either, in any form, refuses.
-  grep -qx -- 'branches-ignore' <<<"$keys" && return 1
-  grep -qx -- 'tags' <<<"$keys" && return 1
-  grep -qx -- 'tags-ignore' <<<"$keys" && return 1
-  grep -qx -- 'branches' <<<"$keys" || return 1
-  brs=$(awk -v q="'" -v dq='"' -v want=push -v seq=branches \
-    "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
-  [ -n "$brs" ] || return 1
-  # Every branch of THIS repository that the commit is the head of. A fork's branch is in none of
-  # them, which is why the PR's own ref is added rather than looked up. Paginated, because a page
-  # is not the answer (review round 10) — and refused at the endpoint's documented maximum, since
-  # past it there is no continuation to follow and the list is not an inventory. An unreadable
-  # answer is no answer, and refuses.
-  refs=$(gh_retry read api --paginate "repos/$REPO/commits/$sha/branches-where-head" \
-    --jq '.[].name') || return 1
-  count=$(printf '%s\n' "$refs" | grep -c .)
-  [ "$count" -lt "$BRANCHES_AT_HEAD_CAP" ] || return 1
-  refs="$ref"$'\n'"$refs"
-  # Branch patterns use the same glob vocabulary the path filters do, so the same translation
-  # reads them — and refuses, here as there, any pattern it does not carry: one read too narrowly
-  # would report "cannot reach" for a trigger some ref does match.
-  while IFS= read -r pat; do
-    [ -n "$pat" ] || continue
-    ere=$(glob_ere "$pat") || return 1
-    while IFS= read -r r; do
-      [ -n "$r" ] || continue
-      printf '%s' "$r" | grep -Eq -- "$ere" && return 1
-    done <<<"$refs"
-  done <<<"$brs"
-  return 0
-}
-
 # head_within_paths_ignore <pr> <head sha> <PR base sha> <PR head ref>: true when NO workflow of this
 # repository can produce a run for this PR head — every trigger of every one of them is either one
 # this change cannot fire, one this branch cannot reach, or one whose paths-ignore covers every
@@ -4950,6 +4900,9 @@ push_cannot_reach() {
 head_within_paths_ignore() {
   local pr="$1" head="$2" base="$3" ref="$4" mbase wf total rows wid wname wstate wpath body bbody
   local rfiles declared bdeclared listed="" f evs ev pats confirm why=""
+  # The head ref is not read for a filter any more — `push` refuses outright — but it is still
+  # evidence about WHICH pull request this is, and it is re-confirmed with the two SHAs below: a
+  # retarget that moved it would mean the round's reads were about another target.
   PATHS_IGNORE_WHY=""
   case "$head" in '' | *[!0-9a-f]*) return 1 ;; esac
   case "$base" in '' | *[!0-9a-f]*) return 1 ;; esac
@@ -5025,7 +4978,6 @@ head_within_paths_ignore() {
         [ -n "$pats" ] || return 1
         paths_ignore_covers "$pats" "$rfiles" || return 1
         ;;
-      push) push_cannot_reach "$body" "$ref" "$head" || return 1 ;;
       *) case " $HEAD_INERT_EVENTS " in *" $ev "*) ;; *) return 1 ;; esac ;;
       esac
     done <<<"$evs"

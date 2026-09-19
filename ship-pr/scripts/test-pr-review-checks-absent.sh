@@ -81,9 +81,6 @@ WORKFLOW_DIR_OTHER=""
 MERGED_PRS_JSON=""
 SAMPLE_CHECKS_JSON=""
 SAMPLE_CHECKS_TOTAL=""
-# Branches of THIS repository that the head is the head of. A push to any of them carries the same
-# SHA, so a `branches:` list one of them matches is a trigger in reach whatever the PR's own ref is.
-BRANCHES_AT_HEAD=""
 # What the PR read answers with from its SECOND call on: a retarget, or a base advance, which moves
 # the evidence the recognition rests on without moving the head.
 PR_BASE_NEXT=""
@@ -96,28 +93,20 @@ FILES_JSON=""
 UNFILTERED_YAML='name: ci
 on:
   pull_request:
-  push:
-    branches: [main]
 jobs:
   build:
     runs-on: ubuntu-latest
 '
 
-# One trigger the branch cannot reach, one the filter covers — the shape a repository that runs CI
-# on its default branch and on every pull request actually has.
 
-# The same workflow with docs filtered out of BOTH triggers a pull request fires. Both, because
-# one of them saying "no run for this diff" says nothing about the other: a repo whose push is
-# filtered and whose pull_request is not still gets a run for every PR head.
+# The one shape the recognition can answer for: a workflow triggered on `pull_request` alone, with
+# a filter covering the change. A declared `push` refuses whatever it says, so it is not here.
 DOCS_IGNORED_YAML='name: ci
 on:
   pull_request:
     paths-ignore:
       - "docs/**"
       - "**.md"
-  push:
-    branches: [main]
-    paths-ignore: ["docs/**", "**.md"]
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -195,7 +184,6 @@ reset_fixture() {
     '[{merged_at:"2026-09-18T00:00:00Z", head:{sha:$s}}]')
   SAMPLE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}}]')
   SAMPLE_CHECKS_TOTAL=""
-  BRANCHES_AT_HEAD='[]'
   PR_BASE_NEXT=""
   COMPARE_COMMITS=$(jq -cn --arg h "$HEAD_SHA" '[$h]')
   FILES_JSON='[{"filename":"docs/notes.md"}]'
@@ -278,9 +266,6 @@ gh() {
   "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
   "repos/$REPO/pulls?state=closed&sort=updated&direction=desc&per_page=20")
     response="$MERGED_PRS_JSON"
-    ;;
-  "repos/$REPO/commits/$HEAD_SHA/branches-where-head")
-    response=$(jq -cn --argjson b "$BRANCHES_AT_HEAD" '[$b[] | {name:.}]')
     ;;
   "repos/$REPO/commits/$SAMPLE_SHA/check-runs?filter=latest&per_page=100")
     response=$(jq -c --arg t "$SAMPLE_CHECKS_TOTAL" \
@@ -403,26 +388,45 @@ test_a_docs_only_head_is_absent_without_waiting_out_the_grace() {
     "the commits are read from the merge base up"
 }
 
-# The whole reason the trigger set is read before any filter is: one trigger's docs-only filter
-# says nothing about the trigger beside it. A repository whose push is filtered and whose
-# pull_request is not gets a run for every PR head, and settling this would be a green over an
-# unbuilt one.
+# One trigger's docs-only filter says nothing about the trigger beside it, so a `pull_request` with
+# no paths-ignore is a run this cannot rule out.
 test_a_trigger_without_a_filter_keeps_the_head_waiting() {
   reset_fixture
   COMMIT_AGE=5
-  WORKFLOW_YAML='name: ci
-on:
-  pull_request:
-  push:
-    branches: [main]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-'
+  WORKFLOW_YAML="$UNFILTERED_YAML"
   run_gate
   assert_eq "$GATE_RC" 4 "a trigger with no filter can still create the run"
   assert_contains "$GATE_OUTPUT" "creation grace" "so the clock is all that is left"
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and the absence is not yet a fact"
+}
+
+# A declared `push` trigger REFUSES, whatever it says. Nothing about a push event is establishable
+# from the feeds here: its changed files are computed between its own before and after, which a
+# force-push puts off the walked path; a tag or another branch carries the same SHA; and the one
+# lookup that could name those branches describes where the SHA is head NOW rather than where it
+# was pushed. Four review rounds each closed a case and found another, so the rule is that there
+# is no rule — which costs this recognition most of its reach and costs no head a wrong absence.
+test_any_push_trigger_keeps_the_head_waiting() {
+  local push
+  for push in 'push:' 'push:
+    branches: [main]' 'push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]'; do
+    reset_fixture
+    COMMIT_AGE=5
+    WORKFLOW_YAML="name: ci
+on:
+  pull_request:
+    paths-ignore: [\"docs/**\", \"**.md\"]
+  $push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+"
+    run_gate
+    assert_eq "$GATE_RC" 4 "a declared push trigger is never ruled out"
+    assert_contains "$GATE_OUTPUT" "creation grace" "so the grace answers, as it did before #176"
+  done
 }
 
 # A dispatched or scheduled run CAN carry this head, and an empty run list does not say one is not
@@ -503,65 +507,6 @@ test_a_head_without_a_base_sha_is_never_recognized() {
   assert_eq "$(grep -c "compare/" "$REQUEST_LOG")" 0 "and that too is settled before any read"
 }
 
-# --- review round 1: what the recognition must not read too widely ----------------------------
-# A push event's changed files are computed between the push's own before and after. After a
-# NON-fast-forward push the before is not on the path walked here at all — force-pushing a `src/`
-# change away leaves a docs-only range whose push diff still carries that file, and still creates a
-# run. The pre-push SHA is in no feed this reads, so a `push` trigger this branch REACHES is never
-# explained, whatever its paths-ignore says.
-test_a_push_trigger_this_branch_reaches_keeps_the_head_waiting() {
-  reset_fixture
-  COMMIT_AGE=5
-  WORKFLOW_YAML='name: ci
-on:
-  pull_request:
-    paths-ignore: ["docs/**", "**.md"]
-  push:
-    paths-ignore: ["docs/**", "**.md"]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-'
-  run_gate
-  assert_eq "$GATE_RC" 4 "a push trigger with no branches list can fire for this branch"
-  assert_contains "$GATE_OUTPUT" "creation grace" "so the grace is what answers"
-  # The same trigger, reachable by an explicit pattern rather than by the absence of one.
-  reset_fixture
-  COMMIT_AGE=5
-  WORKFLOW_YAML='name: ci
-on:
-  pull_request:
-    paths-ignore: ["docs/**", "**.md"]
-  push:
-    branches: ["claude/**"]
-    paths-ignore: ["docs/**", "**.md"]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-'
-  run_gate
-  assert_eq "$GATE_RC" 4 "a branches list this branch matches is a trigger in reach"
-}
-
-# A branches-ignore is a filter with the opposite sense, and the list above it does not describe
-# the workflow. Present at all refuses.
-test_a_branches_ignore_keeps_the_head_waiting() {
-  reset_fixture
-  COMMIT_AGE=5
-  WORKFLOW_YAML='name: ci
-on:
-  pull_request:
-    paths-ignore: ["docs/**", "**.md"]
-  push:
-    branches-ignore: ["gh-pages"]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-'
-  run_gate
-  assert_eq "$GATE_RC" 4 "a branches-ignore is a shape this does not read"
-}
-
 # An event is inert only when it is NAMED inert. Rounds 1 and 3 each arrived with a member of the
 # same class — merge_group wrongly counted, pull_request_review and pull_request_review_comment
 # wrongly ignored — so the rule is inverted rather than patched a third time, and anything nobody
@@ -621,8 +566,6 @@ test_a_workflow_added_by_the_range_keeps_the_head_waiting() {
 on:
   pull_request:
     paths-ignore: ["docs/**", "**.md", ".github/workflows/**"]
-  push:
-    branches: [main]
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -644,8 +587,6 @@ on:
   merge_group:
   pull_request:
     paths-ignore: ["docs/**", "**.md"]
-  push:
-    branches: [main]
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -717,83 +658,6 @@ test_a_base_side_workflow_edit_keeps_the_head_waiting() {
   assert_eq "$GATE_RC" 4 "the head's copy does not speak for the merge context"
   assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers"
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and nothing is settled on the stale copy"
-}
-
-# --- review round 10 --------------------------------------------------------------------------
-# A key that is PRESENT in a form the narrow pattern reader cannot parse is not an absent key. The
-# probes for a tag filter used to be that reader run for its exit status, which is 1 for both — so
-# an unparseable `tags:` read as no tags at all and a push a tag could reach was declared out of
-# reach. Presence is asked by name now, and only the values that are needed are parsed.
-test_an_unparseable_tag_filter_keeps_the_head_waiting() {
-  reset_fixture
-  COMMIT_AGE=5
-  # A flow sequence spread over two lines: valid YAML, and outside what this parser reads.
-  WORKFLOW_YAML='name: ci
-on:
-  pull_request:
-    paths-ignore: ["docs/**", "**.md"]
-  push:
-    branches: [main]
-    tags: [
-      "v*" ]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-'
-  run_gate
-  assert_eq "$GATE_RC" 4 "a tag filter this cannot read is still a tag filter"
-  assert_contains "$GATE_OUTPUT" "creation grace" "so the grace answers"
-}
-
-# The branches-at-head lookup is one page unless it is asked for more, and the endpoint documents
-# a maximum with no continuation past it: a list at the cap is one this cannot complete, and a
-# branch matching the filter could be the one left off it.
-test_a_capped_branches_at_head_list_keeps_the_head_waiting() {
-  reset_fixture
-  COMMIT_AGE=5
-  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
-  BRANCHES_AT_HEAD=$(jq -cn '[range(100) | "topic/\(.)"]')
-  run_gate
-  assert_eq "$GATE_RC" 4 "a branches list at the endpoint's maximum is not an inventory"
-  assert_contains "$(cat "$PAGINATE_LOG")" "branches-where-head" "and it is asked for every page"
-}
-
-# --- review round 9 ---------------------------------------------------------------------------
-# Proving that the PR's own branch misses a `branches:` list does not prove that no push run can be
-# created for this COMMIT. A tag push at the same SHA creates one, and there is no ref name here to
-# test a tag pattern against; and a branch other than the PR's that carries this SHA as its head
-# matches the list on its own account.
-test_a_push_reachable_through_another_ref_keeps_the_head_waiting() {
-  reset_fixture
-  COMMIT_AGE=5
-  WORKFLOW_YAML='name: ci
-on:
-  pull_request:
-    paths-ignore: ["docs/**", "**.md"]
-  push:
-    branches: [main]
-    tags: ["v*"]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-'
-  run_gate
-  assert_eq "$GATE_RC" 4 "a tag filter is a ref namespace with no candidate name to test"
-  assert_contains "$GATE_OUTPUT" "creation grace" "so the grace answers"
-  # No tag filter, but the commit is also the head of a branch the list DOES match.
-  reset_fixture
-  COMMIT_AGE=5
-  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
-  BRANCHES_AT_HEAD='["main"]'
-  run_gate
-  assert_eq "$GATE_RC" 4 "another branch at this SHA reaches the trigger on its own account"
-  # And the ordinary shape: the SHA is the head of the PR's branch alone.
-  reset_fixture
-  COMMIT_AGE=5
-  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
-  BRANCHES_AT_HEAD='["claude/topic"]'
-  run_gate
-  assert_eq "$GATE_RC" 0 "the PR's own branch is the one the filter was read against"
 }
 
 # The BASE is evidence here — the workflow bodies, the file inventory and the merge base all came
@@ -1481,12 +1345,11 @@ tests=(
   test_a_docs_only_head_is_absent_without_waiting_out_the_grace
   test_a_trigger_without_a_filter_keeps_the_head_waiting
   test_a_dispatchable_trigger_keeps_the_head_waiting
+  test_any_push_trigger_keeps_the_head_waiting
   test_a_source_file_in_the_range_keeps_the_head_waiting
   test_an_unreadable_workflow_file_keeps_the_head_waiting
   test_an_unreadable_workflow_list_keeps_the_head_waiting
   test_a_head_without_a_base_sha_is_never_recognized
-  test_a_push_trigger_this_branch_reaches_keeps_the_head_waiting
-  test_a_branches_ignore_keeps_the_head_waiting
   test_an_event_outside_the_inert_list_keeps_the_head_waiting
   test_the_named_inert_events_do_not_block_the_recognition
   test_a_workflow_added_by_the_range_keeps_the_head_waiting
@@ -1499,10 +1362,7 @@ tests=(
   test_a_workflow_the_list_calls_advisory_is_still_explained
   test_a_capped_workflow_directory_keeps_the_head_waiting
   test_a_deleted_workflow_still_in_the_merge_context_is_examined
-  test_a_push_reachable_through_another_ref_keeps_the_head_waiting
   test_a_base_that_moves_under_the_recognition_settles_nothing
-  test_an_unparseable_tag_filter_keeps_the_head_waiting
-  test_a_capped_branches_at_head_list_keeps_the_head_waiting
   test_a_second_check_provider_keeps_the_head_waiting
   test_an_advisory_provider_does_not_block_the_recognition
   test_a_sample_without_checks_keeps_the_head_waiting

@@ -556,9 +556,10 @@ Exit 1: a run that concluded red without producing a check to be red, over a gre
 stopped check alike. Exit 0: green over a finished, judged run list, and the absence itself once
 the grace is spent — or, for a head with no run at all, as soon as no workflow of
 the repository can create one for it (ludics-lite#176): every `pull_request` trigger's
-`paths-ignore` covers every commit from the PR's merge base up, every `push` trigger is out of the
-head branch's reach, and every other trigger is one whose run can never carry this
-commit as its head (`merge_group` and `workflow_call`, and nothing else). The cases pin the
+`paths-ignore` covers every commit from the PR's merge base up, every declared `push` trigger refuses outright — nothing about a
+push event is establishable from these feeds, which is most of the recognition's reach given away
+deliberately — and every other trigger is one whose run can never carry this commit as its head
+(`merge_group` and `workflow_call`, and nothing else). The cases pin the
 refusals as much as the recognition — a trigger with no filter, a source path in the range, a path
 under `.github/workflows/` anywhere in it (a filter that moved mid-range), a workflow file at
 either end of the merge that the repository's list does not carry (that list is built from the
@@ -566,9 +567,8 @@ default branch plus whatever has run, so it is no inventory of the merge context
 workflow-directory response at the Contents API's cap, a listed workflow the advisory NAME would
 once have skipped (those names have no ref, so they describe the default branch's copy and not the
 one that runs here), an unparseable workflow, an unreadable or truncated workflow list,
-a PR whose base SHA or branch did not come back, a push trigger that any ref carrying this commit
-reaches (whose filter cannot describe a force-push's own diff), a tag filter, a `branches-ignore`,
-a base that moved under the recognition (a retarget moves the evidence without moving the head), an event outside the inert list
+a PR whose base SHA or branch did not come back, a declared `push` trigger in any form, a base
+that moved under the recognition (a retarget moves the evidence without moving the head), an event outside the inert list
 (`pull_request_target`, the review events, `schedule` and `workflow_dispatch` among them), a base-side edit to the workflow (a
 `pull_request` run uses the merge context's copy, so the two sides must be identical), and a
 sampled merged PR whose check runs show a provider other than Actions, none at all, or more than
