@@ -966,7 +966,10 @@ hold_remote_gone() { # hold_remote_gone <windows-alias> <token>
   [ -n "${2:-}" ] && [ "$2" != '-' ] || return 2
   out=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" \
         'wsl.exe --list --running' 2>/dev/null); rc=$?
-  [ "$rc" = "$CAP_EXPIRED" ] && return 2
+  # 124 is `capped` cutting a wedge short; 255 is ssh's own "something went wrong", which it
+  # returns for a connection that dropped -- possibly after the far side had already sent a header.
+  # Neither is a reading of the VM, and the bytes that arrived before them are not one either.
+  case "$rc" in "$CAP_EXPIRED"|255) return 2 ;; esac
   # wsl.exe writes UTF-16LE, which arrives here as NUL-interleaved bytes.
   out=$(printf '%s' "$out" | tr -d '\000\r')
   [ -n "$out" ] || return 2
@@ -975,7 +978,7 @@ hold_remote_gone() { # hold_remote_gone <windows-alias> <token>
   # and nothing in this command may depend on surviving that. The PID header is the marker.
   out=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" \
         'wsl.exe -d Ubuntu -e ps -eo pid -o args' 2>/dev/null); rc=$?
-  [ "$rc" = "$CAP_EXPIRED" ] && return 2
+  case "$rc" in "$CAP_EXPIRED"|255) return 2 ;; esac
   out=$(printf '%s' "$out" | tr -d '\r')
   printf '%s\n' "$out" | grep -q 'PID' || return 2
   HOLD_REMOTE_PID=$(printf '%s\n' "$out" |
@@ -1060,17 +1063,15 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
         echo "  ANOMALY: the holder for $name answers its token from guest pid $gp, not the recorded $rgp; the record does not describe what is running"
         return 1
       fi
-      # A record whose handshake never completed carries guest pid 0 -- its `--hold` was
-      # interrupted between the spawn and the rewrite. This reuse just learned the real one, and
-      # it is the only thing a later `unhold` can check the VM against or end the tree by, so it
-      # goes into the record before this call reports the holder as observed.
-      if [ "$rgp" = 0 ] &&
-         ! hold_record_write "$f" "$rp" "$rd" "$rt" "$rsc" "$rtok" "$gp" "$rprot"; then
-        echo "  wsl holder for $name answered from guest shell $gp, but that pid could NOT be recorded at $f"
-        echo "    An unhold would then have no pid to check the VM against, which is the state this"
-        echo "    reuse exists to leave behind. Fix the state directory and take the hold again."
-        return 1
-      fi
+      # This deliberately does NOT write the recovered guest pid back into the record, though an
+      # earlier round of this change did. Writing here cannot be made safe: this path holds no lock
+      # (the holder it is reusing owns the box's), so an overlapping `unhold` can clear the record
+      # between the handshake and the rewrite, and the rewrite would then resurrect a released
+      # holder's record -- or land on the record of whichever run took the freed lock next, leaving
+      # THAT holder alive and unrecorded. The reason to write it has gone anyway: the cleanup probe
+      # asks the VM by TOKEN and not by recorded pid, so a record with guest pid 0 is as usable for
+      # ending a survivor as one without. The pid is reported here, where it is evidence, and not
+      # stored, where it would be a race.
       echo "  wsl holder observed on $name (guest shell $gp answered its token over $rd)"
       return 0
     fi
@@ -1242,15 +1243,16 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
     # record with guest pid 0 or a truncated one, and reporting the hold established over that
     # hands the lane a holder `unhold` cannot check the VM for or end by pid. An unusable record
     # is the unrecordable holder one step later, and it gets the same treatment.
-    if ! hold_record_write "$f" "$pid" "$dest" "$spawn_epoch" "$sidecar" "$token" "$gp" "$prot"; then
-      kill "$pid" "$sidecar" 2>/dev/null
-      rm -f "$f" "$fifo" "$out" 2>/dev/null
-      echo "  wsl holder on $name answered its token, but its record could NOT be completed at $f"
-      echo "    — holder (pid $pid) killed rather than left running with no pid to unhold it by"
-      return 1
+    if hold_record_write "$f" "$pid" "$dest" "$spawn_epoch" "$sidecar" "$token" "$gp" "$prot"; then
+      echo "  wsl holder observed on $name (guest shell $gp in the VM answered its token over $dest)"
+      return 0
     fi
-    echo "  wsl holder observed on $name (guest shell $gp in the VM answered its token over $dest)"
-    return 0
+    echo "  wsl holder on $name answered its token, but its record could NOT be completed at $f"
+    echo "    — the hold fails rather than reporting one the release cannot work with."
+    # ...and it falls through to the teardown below rather than deleting anything: the FIRST write
+    # landed, so the record on disk still carries this lane's token, which is the whole of what the
+    # cleanup probe needs. Deleting it here would do exactly what the failed-handshake path was
+    # fixed not to do -- kill the client and leave a confirmed guest shell with nothing naming it.
   fi
   # Only a holder THIS call spawned is cleaned up, and by construction that is the only kind that
   # reaches here: a holder we merely reused belongs to an earlier invocation that may still be

@@ -214,6 +214,15 @@ fi
 # and THEN stops -- so the cap fires over a command substitution that is holding real bytes. A
 # truncated `wsl --list` carries no "Ubuntu" and a truncated `ps` carries no process row, so both
 # read as good news to anything that looks at the output before the status.
+# $SSH_DROP is the same shape with a different ending: the connection breaks after the header,
+# and ssh reports its own 255 rather than the remote command's status.
+if [ -n "${SSH_DROP:-}" ] && grep -qE "$SSH_DROP" <<<"$line"; then
+  case "$cmd" in
+    *"--list --running"*) printf 'Windows Subsystem for Linux Distri' | perl -pe 's/(.)/$1\0/g' ;;
+    *) printf '  PID COMMAND\n' ;;
+  esac
+  exit 255
+fi
 if [ -n "${SSH_PARTIAL:-}" ] && grep -qE "$SSH_PARTIAL" <<<"$line"; then
   case "$cmd" in
     *"--list --running"*) printf 'Windows Subsystem for Linux Distri' | perl -pe 's/(.)/$1\0/g' ;;
@@ -884,14 +893,24 @@ real_guest=$(awk '{ print $6 }' "$TMP/state/hold-rog.pid")
 awk '{ $6 = 0; print }' "$TMP/state/hold-rog.pid" > "$TMP/state/hold-rog.pid.new"
 mv "$TMP/state/hold-rog.pid.new" "$TMP/state/hold-rog.pid"
 out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
-[ "$rc" -eq 0 ] && grep -q 'wsl holder already running for rog' <<<"$out" \
-  && [ "$(awk '{ print $6 }' "$TMP/state/hold-rog.pid")" = "$real_guest" ] \
-  && ok "a reuse writes back the guest pid an interrupted hold never recorded (rc=$rc)" \
-  || ko "the recovered guest pid was not recorded: $(cat "$TMP/state/hold-rog.pid") -- $out"
-out=$(unhold 2>&1)
-grep -q "guest shell (pid $real_guest) is gone from the VM" <<<"$out" \
-  && ok "...so the release can check the VM against it after all" \
-  || ko "the release still had no pid to check the VM with -- $out"
+[ "$rc" -eq 0 ] && grep -q "guest shell $real_guest answered its token" <<<"$out" \
+  && ok "a reuse recovers the guest pid of a record whose handshake never completed (rc=$rc)" \
+  || ko "the reuse did not re-prove the holder (rc=$rc) -- $out"
+# ...and REPORTS it without writing it back. This path holds no lock -- the holder it is reusing
+# owns the box's -- so a rewrite here can resurrect a record an overlapping unhold has just
+# cleared, or land on the record of whichever run took the freed lock next (review round 3->4).
+# It is safe to drop because the cleanup probe asks by TOKEN: a record with guest pid 0 names its
+# holder just as well as one without.
+[ "$(awk '{ print $6 }' "$TMP/state/hold-rog.pid")" = 0 ] \
+  && ok "...and does not write it back into a record it cannot hold a lock over" \
+  || ko "the reuse rewrote a record it is not serialized against: $(cat "$TMP/state/hold-rog.pid")"
+out=$(unhold 2>&1); rc=$?
+# No pid in the message, and that is the point: with none recorded and none found (the shell is
+# gone), there is no pid to name -- while the VERDICT still comes from the token probe, which is
+# what a record with guest pid 0 is now enough for.
+[ "$rc" -eq 0 ] && grep -q 'is gone from the VM, observed over rog-lan' <<<"$out" \
+  && ok "...and the release still confirms the VM by token, with no pid recorded (rc=$rc)" \
+  || ko "the release could not confirm without a recorded pid (rc=$rc) -- $out"
 reset_hold_state
 
 # Both record writes are CHECKED. The second one is not stageable from here -- it needs the state
@@ -1026,6 +1045,20 @@ out=$(unhold 2>&1); rc=$?
   && ! grep -q 'no wsl holder recorded' <<<"$out" \
   && ok "...and a later unhold names that survivor by token, rather than reporting no holder (rc=$rc)" \
   || ko "the retained token did not let the release find the survivor (rc=$rc) -- $out"
+reset_hold_state
+
+# ...and neither is a connection that DROPS after the header. ssh returns its own 255 for that,
+# which is not the remote command's status and says nothing about the VM -- but the header is
+# already in the command substitution, so anything reading output before status accepts it, finds
+# no token, and calls the holder gone (review round 4, P1).
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+      SSH_DROP='ps -eo pid' "$WL" unhold rog 2>&1); rc=$?
+[ "$rc" -eq 3 ] && grep -q 'did not answer, so this does NOT claim the VM is unheld' <<<"$out" \
+  && [ -f "$TMP/state/hold-rog.pid" ] \
+  && ok "a probe whose connection dropped after the header is unverified, not a release (rc=$rc)" \
+  || ko "an ssh error status was consumed as a complete probe (rc=$rc) -- $out"
 reset_hold_state
 
 # A holder taken with --force never held the box's hold lock, so nothing refused another session's
