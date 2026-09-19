@@ -4022,8 +4022,10 @@ function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
   # And schemeless ones. The boundary whitelist alone is not enough, because a URL can CONTAIN the
   # characters a human writes a reference after -- `www.example.com/?issues=foo,#2` puts a comma
   # in front of the hash (review round 8). A host is an alphanumeric run with a dotted two-letter
-  # or longer last label, and everything up to the next space belongs to it.
-  gsub(/(^|[ \t([{<"\047])[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z][a-zA-Z]+(\/[^ \t]*)?/, " ", rest)
+  # or longer last label, and everything up to the next space belongs to it -- the suffix starts
+  # at a slash, a question mark or a hash, since a query may follow a bare host with no path at
+  # all (review round 10).
+  gsub(/(^|[ \t([{<"\047])[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z][a-zA-Z]+([\/?#][^ \t]*)?/, " ", rest)
   out = ""; n = 0
   while (match(rest, /(^|[ \t([{<"\047`*_,;])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[1-9][0-9]*/)) {
     r = substr(rest, RSTART, RLENGTH)
@@ -4091,8 +4093,21 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
   # A blockquote or a fence nested in a LIST ITEM is still a blockquote or a fence: `- > Closes #1`
   # renders as one, and leaving the marker in front made the `>` test miss it entirely (review
   # round 3). Markers are peeled repeatedly, so a quote two list levels down is reached too.
-  while (!indented && match(trimmed, /^([-*+][ \t]+|[0-9]+[.)][ \t]+)/)) {
-    trimmed = substr(trimmed, RLENGTH + 1)
+  while (!indented) {
+    if (match(trimmed, /^[-*+][ \t]+/)) {
+      trimmed = substr(trimmed, RLENGTH + 1)
+    } else if (match(trimmed, /^[0-9]+[.)][ \t]+/)) {
+      # Markdown allows at most NINE digits in an ordered marker, so a longer run is ordinary text
+      # and peeling it turned a line into a list item it is not -- after which a `>` behind it read
+      # as a blockquote and warned about a single reference (review round 10). Counted rather than
+      # matched with an interval expression, which is not portable across the awks this fleet runs.
+      d = 0
+      while (substr(trimmed, d + 1, 1) ~ /[0-9]/) d++
+      if (d > 9) break
+      trimmed = substr(trimmed, RLENGTH + 1)
+    } else {
+      break
+    }
     sub(/^[ \t]+/, "", trimmed)
   }
   quoted = 0
@@ -4457,7 +4472,6 @@ cmd_merge() {
   # head's green run, and hands semantic drift to the post-merge integration loop. A 3 (unread)
   # has already said UNKNOWN loudly; neither outcome blocks the merge.
   warn_base_drift "$PR_NUM" || true
-  [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
   # The verdict above is about ONE head, the one gate_checks read — and a --wait is minutes to
   # hours long, during which a push can move the PR. `gh pr merge` merges whatever the head is at
   # the moment of the call; --match-head-commit makes it refuse unless that is still the gated
@@ -4478,6 +4492,12 @@ cmd_merge() {
     # ambiguous. Both cost more than the window is worth: it is bounded by the backoff (about 35s
     # over four attempts) and opens only during a GitHub gateway incident.
     warn_multi_close "$PR_NUM" again
+    # AFTER the scan, and inside the loop: the queue read has to be the last thing before the call,
+    # and the scan above makes three REST reads that a queue could be enabled during, or a retarget
+    # onto a queued base completed during (review round 10). It moved here from just before the
+    # loop, so the ordinary path still makes exactly one queue read -- only a retry adds another,
+    # which is a retry that has already waited for a mergeability recompute.
+    [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
     out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" --match-head-commit "$CHECK_SHA" \
       "${gh_args[@]}")
     rc=$?

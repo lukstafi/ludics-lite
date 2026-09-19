@@ -917,6 +917,53 @@ test_a_reference_needs_a_boundary_after_its_digits() {
   assert_contains "$MERGE_STDOUT" "2 issues: #676 #677" "punctuation and end of line are boundaries"
 }
 
+# Review round 10, P2. A query may follow a bare host with no path at all, so the schemeless-URL
+# suffix has to start at a slash, a question mark or a hash.
+test_a_query_only_schemeless_url_is_stripped() {
+  reset
+  PR_BODY='Closes #678; see www.example.com?issues=foo,#679 for details.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "a query with no path is still part of the URL"
+}
+
+# Review round 10, P2. Markdown allows at most nine digits in an ordered marker, so a longer run is
+# ordinary text -- and peeling it made a line a list item it is not, after which a `>` behind it
+# read as a blockquote.
+test_an_over_long_numeric_prefix_is_not_a_list_marker() {
+  reset
+  PR_BODY='1234567890. > Closes #680
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "a ten-digit prefix is text, not an ordered marker"
+  # A marker of a length Markdown does accept still peels, so the round-3 fix survives.
+  PR_BODY='123456789. > Closes #681
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #681" \
+    "a nine-digit marker is still a list marker"
+}
+
+# Review round 10, P2. The close-out queue refusal has to be the LAST thing before the merge call:
+# the body scan makes three REST reads, and a queue enabled during them would turn the call into an
+# enqueue that --require-green exists to refuse.
+test_the_queue_is_read_after_the_body_scan() {
+  reset
+  PR_BODY='Closes #682 and #683
+'
+  run_merge --require-green
+  assert_eq "$MERGE_RC" 0 "a close-out merge still lands ($MERGE_OUTPUT)"
+  # The queue read is made twice as before, and the LAST one now follows the scan.
+  assert_eq "$(grep -c 'mergeQueue(branch:' "$CALLS_FILE")" 2 "still two queue reads on the happy path"
+  local order
+  order=$(grep -n 'mergeQueue\|pr merge' "$CALLS_FILE" | cut -d: -f2- | cut -c1-14 | tr '\n' ',')
+  assert_eq "$order" "CALL api graph,CALL api graph,CALL pr merge ," "both reads still precede the merge"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -963,6 +1010,9 @@ tests=(
   test_a_non_ascii_word_is_not_a_keyword
   test_a_reference_style_link_does_not_join_two_sentences
   test_a_reference_needs_a_boundary_after_its_digits
+  test_a_query_only_schemeless_url_is_stripped
+  test_an_over_long_numeric_prefix_is_not_a_list_marker
+  test_the_queue_is_read_after_the_body_scan
 )
 
 run_tests "${tests[@]}"
