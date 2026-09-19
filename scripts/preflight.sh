@@ -4,7 +4,7 @@
 # rather than by restating it -- so what a push is judged by and what the local loop runs are one
 # command, and a change to either is a change to both (ludics-lite#221, #123).
 #
-# Usage: preflight.sh [--root DIR] [--require-tools] [STEP...]
+# Usage: preflight.sh [--root DIR] [--require-tools] [--as-ci] [STEP...]
 #        preflight.sh steps | globs | files
 #
 # With no STEP it runs them all, each one whether or not an earlier one failed -- the workflow's
@@ -36,6 +36,13 @@
 #
 # --root DIR judges DIR instead of this script's own checkout. It is how scripts/test-preflight.sh
 # puts a defective tree in front of each assertion; nothing else needs it.
+#
+# --as-ci exports GITHUB_ACTIONS=true for the run, so a refusal takes the `::error file=` annotation
+# form the lint job prints instead of the sentence, and every step script inherits the variable
+# the way it does on a hosted runner. It exists because a control can read that variable by
+# accident and pass everywhere but CI: PR #275's `preflight fixtures` step went red on exactly
+# that, and no local run could reproduce it until the fixture was rewritten. It does not imply
+# --require-tools; pass both to run what CI runs.
 #
 # `steps` prints "name<TAB>command<TAB>tool" per step (`-` for one implemented here, an empty tool
 # for one that needs nothing beyond this shell), `globs` the file-list
@@ -362,6 +369,7 @@ run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped
 
 ROOT=
 REQUIRE_TOOLS=
+AS_CI=
 WANTED=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -376,6 +384,10 @@ while [ "$#" -gt 0 ]; do
     ;;
   --require-tools)
     REQUIRE_TOOLS=1
+    shift
+    ;;
+  --as-ci)
+    AS_CI=1
     shift
     ;;
   -*) die "unknown option: $1" ;;
@@ -395,6 +407,10 @@ fi
 # Every glob, every step's script and every annotation path is relative to the checkout, so the
 # expansion and the run happen there and nowhere else.
 CDPATH= cd "$ROOT" || die "cannot enter $ROOT"
+
+# Exported, not merely set: the annotation branch of fail_file reads it here, and the step
+# scripts run as children read it in their own environment, as they do under Actions.
+[ -z "$AS_CI" ] || export GITHUB_ACTIONS=true
 
 validate_table
 
