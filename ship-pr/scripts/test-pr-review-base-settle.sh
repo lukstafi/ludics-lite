@@ -292,6 +292,20 @@ test_a_wait_of_one_round_over_the_grace_is_accepted() {
   assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" "and it waits as any other does"
 }
 
+# A ZERO grace is outside the band entirely: with nothing to outlive, the absence is eligible to
+# settle on the first round, so every positive ceiling reaches it (review round 1). Refusing a
+# short wait there would take away the bounded read that `SHIP_PR_BASE_ABSENT_GRACE=0` exists for.
+test_a_zero_grace_admits_any_positive_wait() {
+  reset_fixture
+  retune ABSENT_GRACE=0 CHECKS_INTERVAL=60
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5091}]')")
+  FILES_DEFAULT='[{"filename":"src/main.ml"}]' # unrecognized: the zero grace is what settles it
+  run_base --wait=30
+  assert_eq "$BASE_RC" 0 "a wait shorter than one interval is fine when there is no grace to outlive"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" "and it settles at once"
+  assert_not_contains "$BASE_OUTPUT" "cannot outlive" "and is certainly not a usage error"
+}
+
 # A ceiling at or BELOW the grace is not the #175 mistake: it is a bounded peek — "tell me what
 # you have within N seconds" — which cannot settle an absence and says so, exit 4. Refusing it
 # would take away the only way to ask this command a time-boxed question, and every case in this
@@ -403,6 +417,7 @@ tests=(
   test_a_wait_that_cannot_outlive_its_grace_is_refused
   test_a_wait_of_one_round_over_the_grace_is_accepted
   test_a_wait_inside_the_grace_is_a_bounded_peek_not_a_refusal
+  test_a_zero_grace_admits_any_positive_wait
   test_a_workflow_with_no_run_history_holds_the_fast_settle
   test_a_run_in_flight_at_the_tip_keeps_the_refusal
   test_a_stopped_run_at_the_tip_is_no_verdict_not_an_absence

@@ -694,12 +694,17 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   the fresher of the head's commit date and the PR's own `updated_at` — each validated on its own,
   so a long-local commit pushed just now counts as fresh and a future commit date does not blind
   the gate), and only past that is `ABSENT` the verdict — with the evidence on the line. A head
-  with **no run at all** skips that wait when the workflows' own `paths-ignore` says outright that
-  none can be created for it: every commit from the PR's merge base up to the head changes only
-  ignored paths, under every trigger a push or a pull request fires, and every workflow the
-  repository lists. Anything less than certain — an unparseable workflow, a pattern the
-  translation does not carry, a trigger with no filter, a range past the cap — refuses and costs
-  the grace, exactly as `base --wait` does (ludics-lite#176). The same grace is what
+  with **no run at all** skips that wait when no workflow the repository lists can create one for
+  it: every `pull_request` trigger's `paths-ignore` covers every commit from the PR's merge base
+  up to the head, and every `push` trigger is out of this branch's reach (a `branches:` list the
+  head's branch matches none of). A push trigger the branch DOES reach is never explained by its
+  filter — a push event's files are computed between its own before and after, and after a
+  force-push the before is not on that path — and `pull_request_target`, which GitHub runs from
+  the base's copy of the workflow, is not explained by the head's. `merge_group` and every other
+  event are inert: their runs are not created by this change. Anything less than certain — an
+  unparseable workflow, a pattern the translation does not carry, a trigger with no filter, a
+  workflow list longer than its page, a range past the cap — refuses and costs the grace, exactly
+  as `base --wait` does (ludics-lite#176). The same grace is what
   `base --wait`'s ceiling is sized against, and a `--wait` in the band between the grace and one
   poll interval past it is refused: it cannot reach the round that settles (ludics-lite#175).
 

@@ -517,13 +517,16 @@ fresher of the commit date and the PR's `updated_at` (each validated on its own,
 commit pushed a moment ago counts as fresh and a future commit date does not blind the gate).
 Exit 1: a run that concluded red without producing a check to be red, over a green, pending or
 stopped check alike. Exit 0: green over a finished, judged run list, and the absence itself once
-the grace is spent — or, for a head with no run at all, as soon as the workflows' own
-`paths-ignore` says none can be created for it (ludics-lite#176): every commit from the PR's merge
-base up changes only ignored paths, under every trigger a push or a pull request fires, across
-every workflow the repository lists. The cases pin the refusals as much as the recognition — a
-trigger with no filter, a source path in the range, an unparseable workflow, an unreadable
-workflow list, a PR whose base SHA did not come back — each of which leaves the grace to answer
-as it did before; and that the question costs no read at all where it cannot change the answer
+the grace is spent — or, for a head with no run at all, as soon as no workflow the
+repository lists can create one for it (ludics-lite#176): every `pull_request` trigger's
+`paths-ignore` covers every commit from the PR's merge base up, and every `push` trigger is out of
+the head branch's reach. The cases pin the refusals as much as the recognition — a trigger with no
+filter, a source path in the range, an unparseable workflow, an unreadable or truncated workflow
+list, a PR whose base SHA or branch did not come back, a push trigger the branch reaches (whose
+filter cannot describe a force-push's own diff), a `branches-ignore`, a `pull_request_target`
+(which GitHub runs from the base's copy of the file) — each of which leaves the grace to answer
+as it did before, and an unfiltered `merge_group`, which does not block the recognition because
+its runs are never created at this head; and that the question costs no read at all where it cannot change the answer
 (a head that already has a run, or one already past the grace). A read that fails is exit 3, never a reassuring 0. Only finished runs are
 folded away as superseded, per workflow and event, so a re-triggered invocation does not park the
 gate on its cancelled predecessor while one file's `push` and `pull_request` runs still count
