@@ -133,11 +133,45 @@ exit "$?"
 EOF
 )"
 
-# A fork above the `{` is a command that has already run when the rest of the file is read.
-expect "a fork above the group is refused" 1 "$NOT_FIRST" -- \
-  "$CP" "$(probe bad_fork_above <<'EOF'
+# A command above the `{` that is not preamble has already run when the rest of the file is read.
+expect "a command above the group is refused" 1 "$NOT_FIRST" -- \
+  "$CP" "$(probe bad_command_above <<'EOF'
 #!/usr/bin/env bash
 set -uo pipefail
+echo "this line has already run when the rest of the file is parsed"
+{
+echo body
+exit "$?"
+}
+EOF
+)"
+
+# --- the preamble --------------------------------------------------------------------------
+# A suite that sources a sibling library must do it above the group; see the guard's header, and
+# the declare -F controls below, for what happens when it does it inside. So the shapes the source
+# needs are let through, and only those.
+expect "a preamble that loads a library may stand above the group" 0 "$PASSED" -- \
+  "$CP" "$(probe good_preamble <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
+export SHIP_PR_STALE_BASE=20 # a builtin, and read when the library is sourced
+# shellcheck source=fixture-lib.sh
+source "$SCRIPT_DIR/fixture-lib.sh"
+
+{
+echo body
+exit "$?"
+}
+EOF
+)"
+
+# A directory resolved and nothing sourced under it is a fork the file is read after for nothing.
+expect "a preamble that sources nothing is refused" 1 "does not end in a \`source\`" -- \
+  "$CP" "$(probe bad_preamble_no_source <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd -P)
 {
 echo "$HERE"
@@ -145,6 +179,26 @@ exit "$?"
 }
 EOF
 )"
+
+# The shape the preamble exists to avoid: the library sourced from inside the group. The probe's
+# source line is spelled through a placeholder, because the guard reads LINES and a heredoc's are
+# lines too -- written out verbatim here, it would refuse this file (the guard's header says so).
+BAD_INSIDE=$(probe bad_source_inside <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+{
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
+source "$SCRIPT_DIR/@LIBRARY@"
+newest() { echo "a suite helper that shadows the library"; }
+exit "$?"
+}
+EOF
+)
+sed 's|@LIBRARY@|test-pr-review-lib.sh|' "$BAD_INSIDE" >"$BAD_INSIDE.filled" && mv "$BAD_INSIDE.filled" "$BAD_INSIDE"
+grep -q '^source "\$SCRIPT_DIR/test-' "$BAD_INSIDE" ||
+  ko "the placeholder in the bad_source_inside probe was never filled in, so the case below proves nothing"
+expect "a sibling library sourced inside the group is refused" 1 "sources a sibling test library from INSIDE" -- \
+  "$CP" "$BAD_INSIDE"
 
 # Rule 3, and the reason rules 1 and 2 are not enough between them: this file opens with `{` and
 # ends with the required foot, and the group is closed halfway down all the same. Only deleting
@@ -264,6 +318,59 @@ if ! grep -qF "the caller survived the source" <<<"$out"; then
   ok "a library with no dispatch exits its caller at the foot, which is what the dispatch prevents"
 else
   ko "the negative control survived the source, so the dispatch is not what the case above tests -- $out"
+fi
+
+# --- why the sources go above the group ---------------------------------------------------------
+# Bash binds the location `declare -F` reports for a function when it PARSES the definition. Inside
+# a group that also holds the sources, every definition in the file is parsed before the library is
+# read, so the library's binding lands last and the ludics-lite#46 shadow guard reads the suite's
+# function as still the library's -- it refuses a declared `stub` (which is how
+# test-pr-review-merge.sh and test-pr-review-watch.sh went red while this guard was written) and
+# accepts an undeclared shadow in silence.
+#
+# What is asserted here is the invariant the rule delivers and not the defect it avoids: with the
+# source above the group, the attribution is the same as with no group at all. The third probe's
+# answer is printed rather than asserted, because a bash that binds at execution time instead would
+# give it the suite's file and the rule would merely be unnecessary, not wrong. On the fleet's bash
+# 3.2 and on this run it is the library's.
+cat >"$TMP/attrib_lib.sh" <<'EOF'
+#!/usr/bin/env bash
+newest() { echo "the library's newest"; }
+EOF
+attrib() { # <name>: the file declare -F attributes `newest` to, after the probe redefines it
+  bash "$TMP/$1.sh" 2>&1
+}
+cat >"$TMP/attrib_plain.sh" <<EOF
+#!/usr/bin/env bash
+source "$TMP/attrib_lib.sh"
+newest() { echo "the suite's newest"; }
+(shopt -s extdebug && declare -F newest) | awk '{ print \$3 }'
+EOF
+cat >"$TMP/attrib_preamble.sh" <<EOF
+#!/usr/bin/env bash
+source "$TMP/attrib_lib.sh"
+{
+newest() { echo "the suite's newest"; }
+(shopt -s extdebug && declare -F newest) | awk '{ print \$3 }'
+exit "\$?"
+}
+EOF
+cat >"$TMP/attrib_inside.sh" <<EOF
+#!/usr/bin/env bash
+{
+source "$TMP/attrib_lib.sh"
+newest() { echo "the suite's newest"; }
+(shopt -s extdebug && declare -F newest) | awk '{ print \$3 }'
+exit "\$?"
+}
+EOF
+plain_at=$(attrib attrib_plain)
+preamble_at=$(attrib attrib_preamble)
+inside_at=$(attrib attrib_inside)
+if [ "$plain_at" = "$TMP/attrib_plain.sh" ] && [ "$preamble_at" = "$TMP/attrib_preamble.sh" ]; then
+  ok "with the source above the group, a redefinition is attributed to the file that redefines it, exactly as with no group at all (inside the group, this bash answers $(basename "$inside_at"))"
+else
+  ko "the source above the group changed the attribution: plain=$plain_at preamble=$preamble_at inside=$inside_at"
 fi
 
 # --- the default sweep's scope -------------------------------------------------------------------

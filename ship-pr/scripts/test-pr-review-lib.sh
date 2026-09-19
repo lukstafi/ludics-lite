@@ -867,7 +867,10 @@ if (length $old) {
 die "mutation_copy: expected exactly one patch target, found $count\n" if $count != 1;
 substr($text, index($preamble, $old), length($old)) = $new;
 die "mutation_copy: invalid case\n" unless $case =~ /^test_[a-z0-9_]+$/;
-$text =~ s/\nrun_tests "\$\{tests\[\@\]\}"\n\z/\nrun_tests $case\n/
+# The final case runner sits above this file's brace-group foot (`exit "$?"` and `}`,
+# ludics-lite#10, #247), which the copy must keep: a copy that ended at the runner would be a
+# file whose group never closes, and bash would refuse to parse it.
+$text =~ s/\nrun_tests "\$\{tests\[\@\]\}"\nexit "\$\?"\n\}\n\z/\nrun_tests $case\nexit "\$?"\n}\n/
   or die "mutation_copy: missing final case runner\n";
 open my $out, '>', $dest or die "$dest: $!\n";
 print {$out} $text or die "$dest: $!\n";

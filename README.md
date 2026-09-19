@@ -277,12 +277,25 @@ and the shape was chosen over a `main() { … }` with `main "$@"` at the foot pr
 one hands the shell back to the file after the minutes the run took. A suite that is also SOURCED
 by a sibling takes the same shape: the `[ "${BASH_SOURCE[0]}" = "$0" ] || return 0` dispatch in
 `test-pr-review-lib.sh` and `test-pr-review-base-lib.sh` ends the sourcing inside the group, before
-the foot is reached, so the caller survives with the definitions it came for. What the check
-establishes is the two line shapes plus one thing a line shape cannot say: with the wrapper lines
-deleted the body still parses, so a `{` that some `}` midway already closed is refused rather than
-certified by a second group carrying the required foot. It is still a scan — another arrangement of
-braces contrived to satisfy all three says nothing — and the `.py` and `.ps1` suites are outside it,
-since python and pwsh read a script whole before running any of it.
+the foot is reached, so the caller survives with the definitions it came for.
+
+A suite that SOURCES a sibling library does it in a preamble ABOVE the `{`, and that is the one
+thing about the shape that is not free. Bash binds the location `declare -F` reports for a function
+when it PARSES the definition, so with the sources inside the group every definition in the suite is
+parsed before the libraries are read, the libraries' bindings land last, and the ludics-lite#46
+shadow guard — which compares each protected function against the file and line its owner recorded
+— reads every suite function as still the library's: it refuses a declared `stub`, and it accepts an
+undeclared shadow in silence, which is the case that guard exists for. Above the group the
+definitions are back where they were. What may stand up there is what forks nothing (`set` lines, an
+`export NAME=value` with no substitution) plus what the sources need — one
+`DIR=$(cd "$(dirname "$0")" && pwd -P)` and the `source "$DIR/…"` lines — with a source last; the
+window it costs is those few commands, and the file is whole before the first case runs. What the
+check establishes is those line shapes plus one thing a line shape cannot say: with the wrapper
+lines deleted the body still parses, so a `{` that some `}` midway already closed is refused rather
+than certified by a second group carrying the required foot. It is still a scan — another
+arrangement of braces contrived to satisfy all of it says nothing, and a `source "$DIR/test-x.sh"`
+quoted inside a heredoc is refused though it runs nothing — and the `.py` and `.ps1` suites are
+outside it, since python and pwsh read a script whole before running any of it.
 
 **Scratch directories have one house shape:** `VAR=$(mktemp -d …)`, then directly under it
 `VAR=$(CDPATH= cd "$VAR" && pwd -P)`, and the cleanup `trap` under that. What

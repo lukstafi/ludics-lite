@@ -32,17 +32,39 @@
 # reached, so the caller survives (checked on bash 3.2, and by the suites themselves) while the
 # sourcing shell has still parsed the file whole.
 #
+# THE PREAMBLE, and why the group is allowed to open below one. A suite that sources a sibling
+# library must do it ABOVE the group, not inside it. Bash binds the location `declare -F` reports
+# for a function when it PARSES the definition, so in a group that also holds the sources every
+# definition in the suite is parsed before the libraries are read, the libraries' bindings land
+# last, and the ludics-lite#46 shadow guard — which compares each protected function against the
+# file and line its owner recorded — reads every suite function as still the library's. It then
+# refuses a declared `stub` (test-pr-review-merge.sh and test-pr-review-watch.sh both went red
+# that way while this guard was being written) and, the half that says nothing, ACCEPTS an
+# undeclared shadow: the case ludics-lite#46 exists for. Sourcing above the group puts the
+# definitions back after the libraries, which is where they were before any of this.
+#
+# What a preamble costs is the window between the first line and the `{`: those commands run
+# before the rest of the file is parsed. It is a `cd` and a `source` or two, and it is bounded —
+# the file is whole before the first CASE runs, which is where the minutes are.
+#
 # THE RULES, per file. Line shapes where a line shape says it, bash's own parser where it does not:
 #   1. the last two lines are exactly `exit "$?"` and `}`;
-#   2. the first COMMAND in the file is `{` on a line of its own — only the shebang, comments,
-#      blank lines and `set` lines may stand above it, `set` being a builtin that forks nothing,
-#      so no line of the file is read after any of it has executed;
-#   3. the file parses, and the body parses on its own with those two wrapper lines deleted.
-# Rule 3 is what makes rules 1 and 2 mean something together. A `{` at the top that some `}`
+#   2. the first COMMAND in the file is `{` on a line of its own, or the first below a preamble.
+#      What may stand above it is what forks nothing — the shebang, comments, blank lines, `set`
+#      lines and an `export NAME=<value>` with no substitution in it, all builtins the shell
+#      cannot be interrupted in — plus what the sources need: a
+#      `DIR=$(cd "$(dirname "$0")" && pwd -P)` resolution and the `source "$DIR/<file>"` lines,
+#      the last preamble line being one of those sources;
+#   3. no `source "$DIR/test-*.sh"` at top level BELOW the `{` — the shape the paragraph above is
+#      about, and the one that fails in silence;
+#   4. the file parses, and the body parses on its own with those two wrapper lines deleted.
+# Rule 4 is what makes rules 1 and 2 mean something together. A `{` at the top that some `}`
 # midway already closed, with a second group carrying the required foot, satisfies both line
 # shapes; with the wrapper lines removed the orphaned `}` is then a syntax error, and the file is
 # refused. What it does not establish is that no OTHER pair of braces could be arranged to satisfy
-# it — this is a scan, not a proof (README's Tests section, ludics-lite#75).
+# it — this is a scan, not a proof (README's Tests section, ludics-lite#75). Rule 3 reads lines and
+# not shell, so a `source "$DIR/test-x.sh"` quoted inside a heredoc counts: a refusal of a file
+# that is fine, which is the direction for a scan to be wrong in.
 #
 # Scope: every `test-*.sh` under `scripts/`, `*/scripts/` and `*/hooks/` — the globs
 # `check-prompts.sh` walks for the register, so a suite added to any skill is judged without a line
@@ -129,25 +151,52 @@ for f in "${files[@]}"; do
     continue
   fi
 
-  # Rule 2: the head. The first command, with only the shebang, comments, blanks and `set` above.
+  # Rule 2: the head. The `{` is the first command, or the first below a preamble that loads
+  # libraries. The character classes stand in for backslash escapes so that every awk that reads
+  # this -- BSD awk on macOS, mawk or gawk on the runners -- reads the same regex.
   head_line=$(awk '
     NR == 1 && /^#!/ { next }
     /^[[:space:]]*#/ { next }
     /^[[:space:]]*$/ { next }
     /^set [-+][A-Za-z]/ { next }
-    { printf "%d\t%s", NR, $0; exit }
+    /^export [A-Za-z_][A-Za-z0-9_]*=[^$()`]*$/ { next }
+    $0 == "{" { printf "%d\t%s\t%s", NR, last, $0; exit }
+    /^[A-Za-z_][A-Za-z0-9_]*=[$][(]cd "[$][(]dirname "[$]0"[)]" && pwd( -P)?[)]$/ { last = "dir"; next }
+    /^(source|[.]) "[$][A-Za-z_][A-Za-z0-9_]*\/[^"]*"$/ { last = "source"; next }
+    { printf "%d\t%s\t%s", NR, last, $0; exit }
   ' "$f")
   # Never empty: rule 1 has already found `exit "$?"` on the second-to-last line, and awk skips
-  # only the shebang, comments, blanks and `set` lines, so there is always a command below.
+  # only the shebang, comments, blanks, `set` lines and preamble lines, so a command is always
+  # reached below.
   head_no=${head_line%%	*}
-  head_txt=${head_line#*	}
+  head_rest=${head_line#*	}
+  head_last=${head_rest%%	*}
+  head_txt=${head_rest#*	}
   if [ "$head_txt" != "{" ]; then
-    printf '::error file=%s,line=%d::%s:%d: the brace group must open as this file'\''s first command, on a line of its own, above the first fork -- found `%s` instead. Only the shebang, comments, blank lines and `set` lines may stand above the `{` (ludics-lite#10, #247)\n' "$display" "$head_no" "$display" "$head_no" "$head_txt"
+    printf '::error file=%s,line=%d::%s:%d: the brace group must open as this file'\''s first command, or as the first below a preamble -- found `%s` instead. Above the `{` may stand what forks nothing -- the shebang, comments, blank lines, `set` lines, an `export NAME=value` with no substitution -- and what the sources need: one `DIR=$(cd "$(dirname "$0")" && pwd -P)` and the `source "$DIR/..."` lines (ludics-lite#10, #247)\n' "$display" "$head_no" "$display" "$head_no" "$head_txt"
+    rc=1
+    continue
+  fi
+  if [ -n "$head_last" ] && [ "$head_last" != source ]; then
+    printf '::error file=%s,line=%d::%s:%d: the preamble above the brace group does not end in a `source`: a preamble is there to load a library the suite cannot source from inside the group, and a directory resolution with nothing sourced under it is one more command the file is read after (ludics-lite#247)\n' "$display" "$head_no" "$display" "$head_no"
     rc=1
     continue
   fi
 
-  # Rule 3: the file parses, and the two wrapper lines are only a wrapper. A `{` closed by some `}`
+  # Rule 3: no sibling test library sourced from INSIDE the group. This is the shape that made two
+  # suites refuse their own declared stubs, and that would have let an undeclared shadow through in
+  # silence; the header says why.
+  inside=$(awk -v open="$head_no" '
+    NR > open && /^(source|[.]) "[$][A-Za-z_][A-Za-z0-9_]*\/test-[^"]*"$/ { printf "%d\t%s", NR, $0; exit }
+  ' "$f")
+  if [ -n "$inside" ]; then
+    inside_no=${inside%%	*}
+    printf '::error file=%s,line=%d::%s:%d: `%s` sources a sibling test library from INSIDE the brace group: bash binds the location `declare -F` reports when it PARSES a definition, so every function below is parsed before the library is read, and the ludics-lite#46 shadow guard then reads each of them as still the library'\''s -- it refuses a declared `stub`, and accepts an undeclared shadow in silence. Move the source into the preamble, above the `{` (ludics-lite#247)\n' "$display" "$inside_no" "$display" "$inside_no" "${inside#*	}"
+    rc=1
+    continue
+  fi
+
+  # Rule 4: the file parses, and the two wrapper lines are only a wrapper. A `{` closed by some `}`
   # midway leaves that `}` orphaned once the wrapper is deleted, and bash says so.
   if ! parse_err=$(bash -n "$f" 2>&1); then
     printf '::error file=%s::%s does not parse: %s\n' "$display" "$display" "$(printf '%s' "$parse_err" | tr '\n' ' ')"
