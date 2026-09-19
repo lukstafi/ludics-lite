@@ -82,10 +82,12 @@ boxes against itself.
 `--hold` is what keeps each GPU lane's VM alive for the whole lane. A WSL VM is held up by a
 `wsl.exe` process on the WINDOWS side and by nothing else; the sweep's ssh sessions inside the
 guest do not hold it, and the owner's console shell — the process that usually does — is removed by
-a Windows Update restart. `--hold` spawns `wsl.exe -d Ubuntu -e sleep infinity` on each box's
-Windows side, reports it, and declares the VM up only once that process is observed there. It is
-never sized with a fixed `sleep N`: a lane is hip then multidev_cc, each with its own cap, plus
-preparation outside them, so a sized holder expires under the last unit. **You must end it
+a Windows Update restart. `--hold` spawns `wsl.exe -d Ubuntu -e sh -s <token>` on each box's
+Windows side — a shell reading its commands off the ssh channel — reports it, and declares the VM
+up only once that holder has said its token back from inside the guest. It is never sized with a
+fixed `sleep N`: a lane is hip then multidev_cc, each with its own cap, plus preparation outside
+them, so a sized holder expires under the last unit, and a shell waiting for input cannot expire
+at all. **You must end it
 explicitly** once the sweep has finished (step 2), for every box you held:
 
     ~/bin/wake-lab.sh unhold rog minix
@@ -100,8 +102,11 @@ one the lane LOST — the box slept or rebooted under it, the network dropped, s
 descriptor and was released the moment it died — from then on the box was not reserved, and another
 session's `restart-wsl` was free to shut its VM down mid-unit, the 2026-09-16 failure the interlock
 exists to prevent. The VM itself usually survives, because a dying holder orphans its `wsl.exe` on
-the Windows side instead of taking it down; that orphan is unowned and invisible, and only a
-`restart-wsl` or a reboot ends it. Treat it as a failed lane for that box: report it, quote the line
+the Windows side instead of taking it down. That orphan is no longer unowned: the holder carries a
+token, so this same `unhold` asks the VM whether that guest shell is still there and ends it by pid
+if it is, and its output says which happened. Read those lines before reaching for anything else —
+`restart-wsl` is host-global and destroys every other session on the box, so it is for an orphan
+the release reported it could NOT end (exit 3), never for one it has already cleaned up. Treat it as a failed lane for that box: report it, quote the line
 (it carries the pid and how long the holder lived), and do not call the run clean on the strength of
 green units. Note the interlock only covers wake-lab's own `sleep`/`down` verbs, which are refused
 while a box is held — a box slept by hand or from Windows takes its holder with it and nothing
@@ -303,9 +308,13 @@ took:
 
     ~/bin/wake-lab.sh unhold rog minix
 
-Nothing else ends them: the holder is `sleep infinity` precisely so that it cannot expire under the
-last unit, so a lane that is never unheld leaves a `wsl.exe` pinning the VM (and an ssh connection
-from this Mac) until the box reboots. Do it before the retry budget's rerun too, or take the rerun's
+Nothing else ends them deliberately: the holder cannot expire under the last unit, so a lane that
+is never unheld leaves a `wsl.exe` pinning the VM (and an ssh connection from this Mac) until the
+box reboots or that connection dies. `unhold` exits 2 if a holder had already died under the lane
+(treat that box's results as suspect) and 3 if the release could not leave the box demonstrably
+free — a holder survived both its channel and a kill by pid, or the box never answered. That box
+needs a human, though the lane's results are fine; on the "never answered" case, run `unhold` again
+once it is reachable and the release finishes the job off the record it kept. Do it before the retry budget's rerun too, or take the rerun's
 own `kick-wsl --hold` over the still-held box — `kick-wsl --hold` reuses a live holder rather than
 stacking a second one.
 
