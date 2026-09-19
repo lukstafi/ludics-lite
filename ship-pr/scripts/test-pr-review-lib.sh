@@ -264,7 +264,15 @@ test_tmpdir() {
     bail "test_tmpdir: refusing to write the path into \$$1 — test_tmpdir uses that name itself; name the variable something else"
     ;;
   esac
-  __test_tmpdir_path=$(mktemp -d "${TMPDIR:-/tmp}/pr-review-$2.XXXXXX") || bail "mktemp -d failed for $2"
+  # `pr-review-test.<pid>.<label>.XXXXXX`, not `pr-review-<label>.XXXXXX`: the label alone names
+  # no owner, so a directory a killed suite left behind was uncollectable by construction — the
+  # `pr-review-cwd-checkout.VLoj1M` that sat in this box's TMPDIR from 09-10 is one, and it is
+  # what put test_tmpdir in ludics-lite#219 alongside pr-review.sh's own temporaries. With the pid
+  # in it, pr-review.sh's tmp_sweep_stale collects it on the same owner-gone test as everything
+  # else. The label stays in the name, after the pid, because it is what makes a leftover
+  # identifiable at a glance, and it may carry a space (`lib space`), which the quoting here and
+  # the sweep's own quoting both survive.
+  __test_tmpdir_path=$(mktemp -d "${TMPDIR:-/tmp}/pr-review-test.$$.$2.XXXXXX") || bail "mktemp -d failed for $2"
   # Physically resolved before anyone sees it, and here rather than in each suite: on macOS
   # $TMPDIR sits under /var, a symlink to /private/var, while pr-review.sh computes its own
   # paths with `pwd -P`. Unresolved, the two spellings of one directory differ, so a suite's
@@ -1485,6 +1493,32 @@ test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason() {
   assert_eq "$CONTROL_OUT" "" "nothing may run"
 }
 
+# The probe writes the source's stderr to `pr-review-probe.<pid>.err` in TMPDIR and removes it on
+# both of its paths — and neither removal was there at first. The debris is still on this box: a
+# 0-byte file from 09-10 19:17, three minutes before the SUCCESS path learned to remove it
+# (6de6cff), and four carrying this file's own "frobnicator" line from 09-12 19:07, four minutes
+# before `mutant` gave a broken probe a TMPDIR of its own (ced18ba). Both leaks are fixed and
+# nothing held them fixed; this case is what does. pr-review.sh's tmp_sweep_stale is the backstop
+# behind it, for the one path no removal here can cover — a suite killed while the probe runs.
+test_a_refused_probe_leaves_no_diagnostics_in_tmpdir() {
+  local root
+  test_tmpdir root probe-leak
+  cp "$TEST_LIB_FILE" "$root/"
+  printf '#!/usr/bin/env bash\necho "missing dependency: frobnicator not found" >&2\nreturn 1\n' \
+    >"$root/pr-review.sh"
+  # A TMPDIR of this case's own, so what is asserted empty is only what the refused probe put
+  # there: control_in writes its throwaway suite in $root and control_run its capture files in
+  # CONTROL_ROOT, and neither is under this one. The assignment prefix is the idiom `mutant`
+  # already uses to point a control's temporaries somewhere registered.
+  mkdir "$root/tmpdir"
+  TMPDIR="$root/tmpdir" control_in "$root"
+  assert_eq "$CONTROL_RC" 2 "the refusal is what this case provokes ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "missing dependency: frobnicator not found" \
+    "the refusal must still carry what the source said"
+  assert_eq "$(find "$root/tmpdir" -mindepth 1 -print | tr '\n' ' ')" "" \
+    "a refused probe must leave nothing in TMPDIR"
+}
+
 # The guard has to survive the PATH it is checked out under. `declare -F` prints "<name> <line>
 # <file>", and a directory with a space in it — a scratch clone at `/tmp/ludics review.XXXX` —
 # splits that file across the fields of anything reading it positionally. Comparing a field rather
@@ -1535,6 +1569,19 @@ test_probe_status_mutation_is_caught() {
     ')" || lib_probe_rc=$?' ')"' \
     "a probe that cannot read the constants is a refusal, not a suite failure ("
   assert_contains "$CONTROL_ERR" "got '1', expected '2'" "the probe must expose the lost status capture"
+}
+
+# And the other half of that probe: the diagnostics it writes. Reverting the refusal path's
+# removal is a one-line change that leaves every existing case green — which is exactly how it
+# went missing in the first place, and why the emptiness assertion needs a mutant of its own
+# rather than the reader's trust (ludics-lite#219).
+test_probe_diagnostics_mutation_is_caught() {
+  mutant test_a_refused_probe_leaves_no_diagnostics_in_tmpdir \
+    'rm -f "$lib_probe_err"
+  exit 2' 'exit 2' \
+    "a refused probe must leave nothing in TMPDIR (got '"
+  assert_contains "$CONTROL_ERR" "pr-review-probe." \
+    "the mutant must name the diagnostics file it left behind"
 }
 
 # The route the whole file depends on: to SHOW a guard can fail you copy this file and pr-review.sh
@@ -1623,11 +1670,13 @@ tests=(
   test_retune_is_undone_when_the_case_ends # must stay directly after the case above
   test_retune_of_a_name_the_script_does_not_set_is_refused
   test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason
+  test_a_refused_probe_leaves_no_diagnostics_in_tmpdir
   test_the_guard_survives_a_path_with_spaces
   test_the_self_test_runs_from_a_renamed_copy
   test_mutation_copy_refuses_missing_or_ambiguous_targets
   test_snapshot_path_mutation_is_caught
   test_probe_status_mutation_is_caught
+  test_probe_diagnostics_mutation_is_caught
 )
 
 run_tests "${tests[@]}"
