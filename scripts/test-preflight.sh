@@ -335,8 +335,13 @@ expect "...and a failing step does not stop the ones after it, as CI's if:!cance
 
 tree annotation
 chmod -x "$T/scripts/ok.sh"
+# `env -u`, not a bare call: this suite runs IN GitHub Actions as one of the lint job's steps, so
+# GITHUB_ACTIONS is set in its own environment and a bare call there produced the annotation and
+# failed this control -- the one thing a green local run could not catch, since the variable is
+# absent on every box the preflight is run from. Both spellings are now asserted against an
+# environment this file controls rather than against the one it happens to run in.
 expect "a refusal reads as a sentence outside CI" 1 'preflight: scripts/ok.sh: scripts/ok.sh is not executable' \
-  -- "$PF" --root "$T" modes
+  -- env -u GITHUB_ACTIONS "$PF" --root "$T" modes
 expect "...and as an annotation on the file's line under GitHub Actions" \
   1 '::error file=scripts/ok.sh::' -- env GITHUB_ACTIONS=true "$PF" --root "$T" modes
 
