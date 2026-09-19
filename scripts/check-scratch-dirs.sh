@@ -74,8 +74,10 @@ case "${1:-}" in
   ;;
 esac
 
-# THE SCOPE, and the exclusions, both as check-jq-shapes.sh has them: the two globs are the lint
-# job's own file list in .github/workflows/skill-scripts.yml, ship-pr/hooks included: the first cut
+# THE SCOPE, and the exclusions, both as check-jq-shapes.sh has them: the three globs restate the
+# lint job's file list, which since ludics-lite#221 is spelled once in scripts/preflight.sh and
+# readable as `preflight.sh globs` (restating it here rather than reading it is ludics-lite#246),
+# ship-pr/hooks included: the first cut
 # left the hooks out because none of them shells out to mktemp today, which is exactly the manual
 # scope update this guard exists to make unnecessary -- the first one added there would have been
 # read as clean (round 4). Two files are excluded by name because both carry text that

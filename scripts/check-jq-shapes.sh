@@ -69,9 +69,11 @@ esac
 # THE SCOPE. Every script the skills and the toolbox carry, not the one file this guard was
 # written for. The trap is a property of jq, not of pr-review.sh: a bare `capture` in any of
 # these fails the same silent way, and a default that reads one file certifies two dozen others
-# it never opened -- the summary line says "every capture(" either way. The two globs are
-# the lint job's own file list in .github/workflows/skill-scripts.yml, less ship-pr/hooks, whose
-# shell shells out to no jq today; add it here the day it does.
+# it never opened -- the summary line says "every capture(" either way. The two globs restate the
+# lint job's file list, which since ludics-lite#221 is spelled once in scripts/preflight.sh and
+# readable as `preflight.sh globs`, less ship-pr/hooks, whose shell shells out to no jq today;
+# add it here the day it does. That this sweep restates the list rather than reading it is
+# ludics-lite#246, where the omission is recorded as drift rather than as a decision.
 #
 # Two files are excluded, named one path at a time. Both deliberately carry strings that READ as
 # jq source and are not: this guard's grammar comments above quote the shapes it refuses, and

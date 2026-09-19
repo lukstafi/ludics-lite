@@ -65,98 +65,28 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      # THE FIVE ASSERTIONS BELOW LIVE IN scripts/preflight.sh (ludics-lite#123, #221). They were
+      # inline `run:` blocks here, which made this job the one part of the repo held to neither of
+      # the conventions it polices -- no fixture could reach them, the shell in them was the only
+      # shell nothing lints, and the list of files they sweep was spelled three times on this
+      # screen and a fourth time in the scratch buffer of whoever was pre-flighting a push by
+      # hand. The script is that same list once and those same assertions; CI and the local loop
+      # are now one command, and the reasoning each block carried travelled with its code -- read
+      # the script rather than restating it here.
+      #
+      # --require-tools is what keeps this side fail-closed. Locally a missing shellcheck or pwsh
+      # is a named SKIP, so the preflight stays runnable on a fleet mac; here it is a red step, so
+      # an image that stops shipping one cannot pass as green.
       - name: Check shell syntax
-        run: |
-          set -e
-          for f in */scripts/*.sh ship-pr/hooks/*.sh scripts/*.sh; do bash -n "$f"; done
+        run: scripts/preflight.sh --require-tools syntax
       - name: Check the mode bit
-        # The same list as the syntax check above, under a two-way rule: a script must be
-        # executable, and an `*.example.sh` must NOT be. A `> tmp && mv` rewrite of a script drops
-        # its mode bit and git tracks the mode, so the drop commits; without this the first
-        # symptom is an `exit 126` from a suite in some other job, which reads as that suite
-        # failing rather than as a lost mode bit. The suffix names the sourced template: an
-        # `*.example.sh` is `.`-ed by the script that reads it (scripts/wake-lab-hosts.example.sh,
-        # sourced by wake-lab.sh) and is never executed, so it is tracked 100644 on purpose. That
-        # half is asserted rather than merely exempted, because the pass the suffix buys is sound
-        # only while the class really is the sourced one: a future `*.example.sh` written to be
-        # run would otherwise skip the mode check in silence, and a stray `chmod +x` on a template
-        # would void the convention this comment claims. The PowerShell scripts are outside the
-        # glob entirely -- they are `.ps1`, and `Check PowerShell syntax` parses them rather than
-        # running them.
-        run: |
-          set -e
-          rc=0
-          for f in */scripts/*.sh ship-pr/hooks/*.sh scripts/*.sh; do
-            case "$f" in
-              *.example.sh)
-                if [ -x "$f" ]; then
-                  echo "::error file=$f::$f is an .example.sh: it is sourced, never executed, so it must NOT be executable (the mode check gives the suffix a pass on that assertion, and the pass is only sound if the class is really the sourced one); run 'chmod -x $f' and commit it"
-                  rc=1
-                fi
-                ;;
-              *)
-                if [ ! -x "$f" ]; then
-                  echo "::error file=$f::$f is not executable; restore the mode bit with 'chmod +x $f' and commit it"
-                  rc=1
-                fi
-                ;;
-            esac
-          done
-          exit "$rc"
+        run: scripts/preflight.sh --require-tools modes
       - name: Shellcheck
-        # Errors only: the warning tier is style and a few false positives on deliberately
-        # unquoted globs; the error tier is what breaks a script.
-        run: shellcheck --severity=error --external-sources */scripts/*.sh ship-pr/hooks/*.sh scripts/*.sh
+        run: scripts/preflight.sh --require-tools shellcheck
       - name: Check PowerShell syntax
-        # pwsh is preinstalled on the hosted Ubuntu and macOS images. Parse the Windows repair
-        # scripts without executing their Windows-only networking and registry commands. The glob
-        # is what keeps this honest: enable-active-hours-windows.ps1 joined enable-wol-windows.ps1
-        # here, and a third repair script must not need an edit to this step to be judged. Only
-        # `scripts/*.ps1` -- the PowerShell under a skill directory
-        # (issue-wave/scripts/test-windows-driver.ps1) is really EXECUTED by the windows-driver
-        # job below, which is a stronger check than parsing it twice.
-        run: |
-          pwsh -NoProfile -Command '
-            $rc = 0
-            $files = @(Get-ChildItem -Path "scripts" -Filter "*.ps1" | Sort-Object Name)
-            if ($files.Count -eq 0) {
-              Write-Error "no scripts/*.ps1 found: the parse check is judging nothing"
-              exit 1
-            }
-            foreach ($f in $files) {
-              $tokens = $null
-              $errors = $null
-              [System.Management.Automation.Language.Parser]::ParseFile(
-                $f.FullName,
-                [ref] $tokens,
-                [ref] $errors
-              ) > $null
-              if ($errors.Count -ne 0) {
-                $errors | ForEach-Object { Write-Error "$($f.Name): $_" }
-                $rc = 1
-              } else {
-                Write-Host "$($f.Name): parsed"
-              }
-            }
-            exit $rc
-          '
+        run: scripts/preflight.sh --require-tools powershell
       - name: Parse guard
-        # post-merge-cleanup.sh and test-post-merge-cleanup.sh are each one brace group ending
-        # in `exit "$?"` and `}` (ludics-lite#10), so a mid-run rewrite cannot resume the shell
-        # at a shifted offset. The cost is that a command appended past the closing brace is
-        # never read, and that failure is silent; this is the guard on the guard.
-        run: |
-          set -e
-          for f in ship-pr/scripts/post-merge-cleanup.sh ship-pr/scripts/test-post-merge-cleanup.sh; do
-            if [ "$(tail -n 2 "$f")" != "$(printf 'exit "$?"\n}')" ]; then
-              echo "::error file=$f::$f must end in 'exit \"\$?\"' and '}' (the parse guard); anything past them is never read"
-              exit 1
-            fi
-            if ! awk '/^set -[a-z]*o pipefail$/ { s = NR; next } s && !/^#/ && !/^$/ { seen = 1; exit ($0 == "{") ? 0 : 1 } END { if (!seen) exit 1 }' "$f"; then
-              echo "::error file=$f::$f must open its brace group as the first command after 'set -o pipefail', above the first fork"
-              exit 1
-            fi
-          done
+        run: scripts/preflight.sh --require-tools parse-guard
       - name: jq shape guard
         # jq's `capture` yields ZERO outputs when it does not match, and a zero-output
         # sub-expression deletes the value around it rather than defaulting -- silently, with no
@@ -165,9 +95,11 @@ jobs:
         # only in prose. The guard refuses a `capture(` that is not `[capture(...)] | first`; its own
         # fixtures run beside it, since a scan that cannot fail would prove nothing. Both are in
         # the lint job so they judge every head, including a prompt-only one. With no argument it
-        # sweeps the same `*/scripts/*.sh` and `scripts/*.sh` this job's other steps read, less two
-        # files it excludes by name (itself and its fixtures, which quote the refused shapes on
-        # purpose) -- so a script added to any skill is scanned without a line here.
+        # sweeps `*/scripts/*.sh` and `scripts/*.sh` -- its own restatement of the file list the
+        # steps above take from scripts/preflight.sh, less ship-pr/hooks and two files it excludes
+        # by name (itself and its fixtures, which quote the refused shapes on purpose). That
+        # restatement is ludics-lite#246; a script added to any skill is scanned without a line
+        # here either way.
         run: scripts/check-jq-shapes.sh
       - name: jq shape guard fixtures
         run: scripts/test-check-jq-shapes.sh
@@ -184,6 +116,10 @@ jobs:
         run: scripts/check-scratch-dirs.sh
       - name: scratch directory guard fixtures
         run: scripts/test-check-scratch-dirs.sh
+      - name: preflight fixtures
+        # The controls for the five steps above, and the pin that keeps this job and the script
+        # the same set of checks: a step added here and not to the script's table fails it.
+        run: scripts/test-preflight.sh
 
   sync-routines:
     name: sync-routines (ubuntu)
@@ -515,6 +451,11 @@ jobs:
         # real on this leg.
         if: ${{ !cancelled() }}
         run: scripts/test-check-scratch-dirs.sh || { echo '::error title=macOS suite failed::test-check-scratch-dirs.sh'; exit 1; }
+      - name: preflight fixtures
+        # bash 3.2 is the fleet's shell and the preflight's home ground: it is run locally on
+        # these macs far more often than in CI.
+        if: ${{ !cancelled() }}
+        run: scripts/test-preflight.sh || { echo '::error title=macOS suite failed::test-preflight.sh'; exit 1; }
       - name: execution reservations
         if: ${{ !cancelled() }}
         run: python3 issue-wave/scripts/test-fleet-execution.py || { echo '::error title=macOS suite failed::test-fleet-execution.py'; exit 1; }
