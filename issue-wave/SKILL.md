@@ -381,6 +381,19 @@ requirements for every transport with transport-specific setup and identity, and
   it failed to see. `pr-review.sh status` recognizes the comment-shaped verdict since
   ludics-lite 254facf; the brief still says: read the full feed first, re-request only
   when it truly holds nothing for the current head.
+- **A scan boundary, for an issue whose natural implementation reads free text.** When the task
+  is a rule over a PR body, a commit message, a workflow file or Markdown, the brief says which
+  reading the issue's requirement actually needs. Where a best-effort reading satisfies it (a
+  warning, a lint), the brief prescribes a line-shaped scan in the README's ludics-lite#75
+  convention and states the boundary up front - what it reads, and what it deliberately does not -
+  and every finding is then classified against that boundary: an in-scope form the scanner misses
+  is a silent defect and stays must-fix under the convergence policy (Supervise: *Converge long
+  reviews*), while a corner outside the declared boundary is deferred to one follow-up issue, not
+  fixed. Where the requirement needs structure (a nested key hierarchy, a block grammar), say so
+  and do not substitute a scan; a reduction of the requirement is a decision-gate item, never the
+  brief's alone. Left to the review, an unbounded reader draws one corner per round for as long as
+  it exists (2026-09-19: PR #274 went 17 rounds and 1,800 lines for a warning, and the reduction
+  had to be filed afterwards as ludics-lite#295).
 - Encouragement. It is cheap and the user asked for it: name why the issue matters and
   express confidence. Workers visibly do their best work when the brief treats them as
   trusted colleagues.
