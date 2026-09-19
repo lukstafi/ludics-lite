@@ -4392,14 +4392,23 @@ END {
   for (i = 1; i <= n; i++) print pat[i]
 }'
 
-# WORKFLOW_ON_EVENTS: the trigger events a workflow file DECLARES, one per line, or exit 1 when
-# they cannot be established. Reading a filter is not enough on a PR head: what has to be shown is
-# that NO trigger of this workflow can produce a run for this head, so the set of triggers has to
-# be known before any of their filters is read (ludics-lite#176). Same narrowness as the filter
-# above — the mapping form, the one-scalar form (`on: push`) and the flow form (`on: [push,
-# pull_request]`), and a refusal for everything else, an event name that is not a plain identifier
-# included.
-WORKFLOW_ON_EVENTS='
+# WORKFLOW_KEYS: the keys a workflow file DECLARES at one level of its `on:` block — the trigger
+# events themselves with `-v want=`, or the keys under one named event with `-v want=push` — one
+# per line, or exit 1 when they cannot be established.
+#
+# PRESENCE, separately from parsing, and round 10 is why that distinction has to exist. The probes
+# that ask "does this trigger carry a tag filter" used to be the pattern reader run for its exit
+# status, which is 1 both when the key is absent and when it is present in a form this narrow
+# parser cannot read — so an unparseable `tags:` read as no tags at all, and a push that a tag
+# could reach was declared unreachable. A key is now found by name, and only the keys whose VALUES
+# are needed are parsed.
+#
+# Same narrowness as the pattern reader: the mapping form, the one-scalar form (`on: push`) and the
+# flow form (`on: [push, pull_request]`), and a refusal for everything else, a key that is not a
+# plain identifier included. Under a named event, no keys at all is an answer (exit 0, nothing
+# printed); at the `on:` level it is not, since a workflow with no trigger is a file this has
+# misread.
+WORKFLOW_KEYS='
 function ind_of(s,   n) { n = match(s, /[^ ]/); return n ? n - 1 : -1 }
 function unquote(s,   c) {
   sub(/^[ ]+/, "", s); sub(/[ ]+$/, "", s)
@@ -4410,8 +4419,8 @@ function unquote(s,   c) {
 }
 function emit(s) {
   s = unquote(s)
-  if (s !~ /^[A-Za-z_][A-Za-z0-9_]*$/) { bad = 1; exit }
-  n++; ev[n] = s
+  if (s !~ /^[A-Za-z_][A-Za-z0-9_-]*$/) { bad = 1; exit }
+  n++; key_of[n] = s
 }
 function flow(s,   i, m, parts) {
   s = substr(s, 2, length(s) - 2)
@@ -4419,7 +4428,7 @@ function flow(s,   i, m, parts) {
   for (i = 1; i <= m; i++) emit(parts[i])
   ok = 1
 }
-BEGIN { ev_ind = -1 }
+BEGIN { ev_ind = -1; kw_ind = -1 }
 /\t/ { bad = 1; exit }
 {
   line = $0
@@ -4437,30 +4446,51 @@ state == 0 {
   if (ind == 0 && key ~ /^(on|"on")[ ]*:/) {
     on_ind = ind
     if (rest == "") { state = 1; next }
-    if (rest ~ /^\[.*\]$/) { flow(rest); exit }
-    emit(rest); ok = 1; exit
+    # `on: push` and `on: [push, ...]` declare events and NOTHING under them, so a caller asking
+    # for one event finds no keys — which is not the same as finding the file unreadable, and the
+    # END below tells them apart by the state.
+    if (rest ~ /^\[.*\]$/) { if (want == "") flow(rest); else ok = 1; exit }
+    if (want == "") { emit(rest); ok = 1; exit }
+    ok = 1; exit
   }
   next
 }
 state == 1 {
-  # The on: block ended, and every event key in it has been seen.
   if (ind <= on_ind) { ok = 1; exit }
   # The events are the keys at the FIRST level under `on:`; anything deeper is one event own
-  # mapping (`branches:`, `types:`, the filters themselves) and anything shallower than that
-  # level but still inside the block is a file this parser will not claim to have read.
+  # mapping, and anything shallower than that level but still inside the block is a file this
+  # parser will not claim to have read.
   if (ev_ind < 0) ev_ind = ind
   if (ind < ev_ind) { bad = 1; exit }
   if (ind > ev_ind) next
-  if (key !~ /^[A-Za-z_][A-Za-z0-9_]*[ ]*:/) { bad = 1; exit }
+  if (key !~ /^[A-Za-z_][A-Za-z0-9_-]*[ ]*:/) { bad = 1; exit }
+  k = key
+  sub(/[ ]*:.*$/, "", k)
+  if (want == "") { emit(k); next }
+  if (k == want) { state = 2; want_ind = ind }
+  next
+}
+state == 2 {
+  if (ind <= want_ind) { ok = 1; exit }
+  if (kw_ind < 0) kw_ind = ind
+  if (ind < kw_ind) { bad = 1; exit }
+  if (ind > kw_ind) next
+  if (key !~ /^[A-Za-z_][A-Za-z0-9_-]*[ ]*:/) { bad = 1; exit }
   k = key
   sub(/[ ]*:.*$/, "", k)
   emit(k)
   next
 }
 END {
-  if (state == 1 && !bad) ok = 1
-  if (bad || !ok || n == 0) exit 1
-  for (i = 1; i <= n; i++) print ev[i]
+  if (!bad && (state == 1 || state == 2)) ok = 1
+  if (bad || !ok) exit 1
+  # An `on:` MAPPING that never reached the named event did not declare it, and that is not an
+  # answer about its keys. (State 0 here is the scalar or flow form, where the event is declared
+  # with no keys at all, which IS an answer.)
+  if (want != "" && state == 1) exit 1
+  # At the on: level, a file declaring no trigger at all is one this has misread.
+  if (want == "" && n == 0) exit 1
+  for (i = 1; i <= n; i++) print key_of[i]
 }'
 
 # workflow_path <workflow id>: where that workflow's file lives, or nothing (exit 1).
@@ -4496,6 +4526,10 @@ workflow_body() {
 # is a refusal rather than a shorter inventory (review round 6) — the same shape commit_files uses
 # for its own 300-file cap.
 CONTENTS_DIR_CAP=1000
+
+# How many branches the commit-to-branches endpoint reports before it stops; it documents a maximum
+# and offers no continuation past it, so a list at the cap is one this cannot complete.
+BRANCHES_AT_HEAD_CAP=100
 
 workflow_files_at() {
   local raw count
@@ -4852,25 +4886,31 @@ providers_are_actions_only() {
 # repository reports the commit at the head of, the PR's own ref included since a fork's branch is
 # in no listing of this repository's.
 push_cannot_reach() {
-  local body="$1" ref="$2" sha="$3" brs refs pat ere r
+  local body="$1" ref="$2" sha="$3" keys brs refs count pat ere r
   [ -n "$ref" ] || return 1
-  # A branches-ignore: is a different filter with the opposite sense, and a workflow carrying one
-  # is not described by the list above it. A tags:/tags-ignore: is a whole other ref namespace
-  # this has no candidate name for. Either present at all is a refusal.
-  awk -v q="'" -v dq='"' -v want=push -v seq=branches-ignore \
-    "$WORKFLOW_YAML_FILTER" <<<"$body" >/dev/null 2>&1 && return 1
-  awk -v q="'" -v dq='"' -v want=push -v seq=tags \
-    "$WORKFLOW_YAML_FILTER" <<<"$body" >/dev/null 2>&1 && return 1
-  awk -v q="'" -v dq='"' -v want=push -v seq=tags-ignore \
-    "$WORKFLOW_YAML_FILTER" <<<"$body" >/dev/null 2>&1 && return 1
+  # PRESENCE first, and by name. Asking the pattern reader for its exit status conflated "the key
+  # is not there" with "the key is there in a form I cannot read", so an unparseable `tags:` read
+  # as no tags at all (review round 10). A keys read that fails at all refuses.
+  keys=$(awk -v q="'" -v dq='"' -v want=push "$WORKFLOW_KEYS" <<<"$body") || return 1
+  # A branches-ignore: is a filter with the opposite sense, and the list above it does not describe
+  # the workflow. A tags:/tags-ignore: is a whole other ref namespace, and this has no candidate
+  # tag name to test a pattern against — the pull request has none. Either, in any form, refuses.
+  grep -qx -- 'branches-ignore' <<<"$keys" && return 1
+  grep -qx -- 'tags' <<<"$keys" && return 1
+  grep -qx -- 'tags-ignore' <<<"$keys" && return 1
+  grep -qx -- 'branches' <<<"$keys" || return 1
   brs=$(awk -v q="'" -v dq='"' -v want=push -v seq=branches \
     "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
   [ -n "$brs" ] || return 1
   # Every branch of THIS repository that the commit is the head of. A fork's branch is in none of
-  # them, which is why the PR's own ref is added rather than looked up. An unreadable answer is no
-  # answer, and refuses.
-  refs=$(gh_retry read api "repos/$REPO/commits/$sha/branches-where-head" --jq '.[].name') ||
-    return 1
+  # them, which is why the PR's own ref is added rather than looked up. Paginated, because a page
+  # is not the answer (review round 10) — and refused at the endpoint's documented maximum, since
+  # past it there is no continuation to follow and the list is not an inventory. An unreadable
+  # answer is no answer, and refuses.
+  refs=$(gh_retry read api --paginate "repos/$REPO/commits/$sha/branches-where-head" \
+    --jq '.[].name') || return 1
+  count=$(printf '%s\n' "$refs" | grep -c .)
+  [ "$count" -lt "$BRANCHES_AT_HEAD_CAP" ] || return 1
   refs="$ref"$'\n'"$refs"
   # Branch patterns use the same glob vocabulary the path filters do, so the same translation
   # reads them — and refuses, here as there, any pattern it does not carry: one read too narrowly
@@ -4974,7 +5014,7 @@ head_within_paths_ignore() {
     body=$(workflow_body "$wpath" "$head") || return 1
     bbody=$(workflow_body "$wpath" "$base") || return 1
     [ "$body" = "$bbody" ] || return 1
-    evs=$(awk -v q="'" -v dq='"' "$WORKFLOW_ON_EVENTS" <<<"$body") || return 1
+    evs=$(awk -v q="'" -v dq='"' -v want= "$WORKFLOW_KEYS" <<<"$body") || return 1
     [ -n "$evs" ] || return 1
     while IFS= read -r ev; do
       [ -n "$ev" ] || continue

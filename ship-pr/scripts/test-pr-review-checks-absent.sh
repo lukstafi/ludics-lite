@@ -719,6 +719,45 @@ test_a_base_side_workflow_edit_keeps_the_head_waiting() {
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and nothing is settled on the stale copy"
 }
 
+# --- review round 10 --------------------------------------------------------------------------
+# A key that is PRESENT in a form the narrow pattern reader cannot parse is not an absent key. The
+# probes for a tag filter used to be that reader run for its exit status, which is 1 for both — so
+# an unparseable `tags:` read as no tags at all and a push a tag could reach was declared out of
+# reach. Presence is asked by name now, and only the values that are needed are parsed.
+test_an_unparseable_tag_filter_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  # A flow sequence spread over two lines: valid YAML, and outside what this parser reads.
+  WORKFLOW_YAML='name: ci
+on:
+  pull_request:
+    paths-ignore: ["docs/**", "**.md"]
+  push:
+    branches: [main]
+    tags: [
+      "v*" ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a tag filter this cannot read is still a tag filter"
+  assert_contains "$GATE_OUTPUT" "creation grace" "so the grace answers"
+}
+
+# The branches-at-head lookup is one page unless it is asked for more, and the endpoint documents
+# a maximum with no continuation past it: a list at the cap is one this cannot complete, and a
+# branch matching the filter could be the one left off it.
+test_a_capped_branches_at_head_list_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  BRANCHES_AT_HEAD=$(jq -cn '[range(100) | "topic/\(.)"]')
+  run_gate
+  assert_eq "$GATE_RC" 4 "a branches list at the endpoint's maximum is not an inventory"
+  assert_contains "$(cat "$PAGINATE_LOG")" "branches-where-head" "and it is asked for every page"
+}
+
 # --- review round 9 ---------------------------------------------------------------------------
 # Proving that the PR's own branch misses a `branches:` list does not prove that no push run can be
 # created for this COMMIT. A tag push at the same SHA creates one, and there is no ref name here to
@@ -1462,6 +1501,8 @@ tests=(
   test_a_deleted_workflow_still_in_the_merge_context_is_examined
   test_a_push_reachable_through_another_ref_keeps_the_head_waiting
   test_a_base_that_moves_under_the_recognition_settles_nothing
+  test_an_unparseable_tag_filter_keeps_the_head_waiting
+  test_a_capped_branches_at_head_list_keeps_the_head_waiting
   test_a_second_check_provider_keeps_the_head_waiting
   test_an_advisory_provider_does_not_block_the_recognition
   test_a_sample_without_checks_keeps_the_head_waiting
