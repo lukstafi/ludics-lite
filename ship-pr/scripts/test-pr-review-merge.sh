@@ -34,7 +34,11 @@ RUN_REASON="every run for the head finished and was judged" # what the run list 
 MERGE_STATE="merged=true state=MERGED" # what REST says after the merge call
 MERGE_QUEUE=""                         # nonempty = the base has a merge queue
 PR_BODY="A body with nothing to close."  # what the body read answers with
+PR_BODY_LATER=""                       # nonempty = what the SECOND body read on answers with
 BODY_FAIL=""                           # nonempty = the body read answers with a 404
+# The read counter travels in a FILE: gh_retry calls the fixture inside a command substitution,
+# so a variable it increments dies with that subshell -- as CALLS_FILE already exists for.
+READS_FILE="$TEST_ROOT/body-reads"
 
 # The three library functions this suite replaces, declared so the shadow guard lets them through:
 # the build signal is not under test here. gate_checks calls them inside command substitutions;
@@ -65,11 +69,16 @@ gh() {
     *'.head.sha'*) printf '%s\tbase-sha\tclaude/topic\n' "$CURRENT_HEAD" ;;
     *'.base.ref'*) echo main ;;
     *'.body'*)
+      printf 'read\n' >>"$READS_FILE"
       if [ -n "$BODY_FAIL" ]; then
         printf 'gh: Not Found (HTTP 404)\n' >&2
         return 1
       fi
-      printf '%s\n' "$PR_BODY"
+      if [ -n "$PR_BODY_LATER" ] && [ "$(wc -l <"$READS_FILE" | tr -d ' ')" -ge 2 ]; then
+        printf '%s\n' "$PR_BODY_LATER"
+      else
+        printf '%s\n' "$PR_BODY"
+      fi
       ;;
     *merged=*) echo "$MERGE_STATE" ;;
     *) bail "unexpected pulls read: $*" ;;
@@ -93,6 +102,7 @@ gh() {
 # to the other. MERGE_OUTPUT stays the pair, which is what every older case asserts against.
 run_merge() {
   local rc
+  : >"$READS_FILE"
   : >"$CALLS_FILE"
   set +e
   (cmd_merge "$REPO#7" "$@") >"$OUT_FILE" 2>"$ERR_FILE"
@@ -117,6 +127,7 @@ reset() {
   MERGE_STATE="merged=true state=MERGED"
   MERGE_QUEUE=""
   PR_BODY="A body with nothing to close."
+  PR_BODY_LATER=""
   BODY_FAIL=""
 }
 
@@ -308,6 +319,101 @@ test_an_unread_body_is_not_a_clean_body() {
     "the silence is announced as unread, not as clean"
 }
 
+# Review round 1, P2. A fence closes only on its own delimiter at its own length: a four-backtick
+# fence exists so it can CONTAIN a three-backtick one, and an unconditional toggle reads the inner
+# fence as the close -- after which the keyword inside the example reads as ordinary prose and the
+# scan, whose whole subject is that example, says nothing.
+test_a_longer_fence_is_not_closed_by_an_inner_one() {
+  reset
+  PR_BODY='How a body should NOT be written:
+
+````markdown
+```
+Closes #410
+```
+````
+
+Closes #411
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #410" \
+    "the inner fence must not close the four-backtick one"
+  assert_not_contains "$MERGE_STDOUT" "411" "the plain line after the real fence close is silent"
+}
+
+# Review round 1, P2. A period that ends an abbreviation is not a sentence boundary: splitting at
+# `e.g.` puts one reference on each side of the cut and loses the finding entirely.
+test_an_abbreviation_does_not_split_the_sentence() {
+  reset
+  PR_BODY='Closes #412 and, e.g. #413
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #412 #413" \
+    "e.g. must not end the sentence"
+  assert_contains "$MERGE_STDOUT" "Closes #412 and, e.g. #413" "the abbreviation is restored"
+  # A real full stop still splits, or the unit would be the whole line again.
+  PR_BODY='Closes #414. See also #415
+'
+  run_merge
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" "a real sentence end still splits"
+}
+
+# Review round 1, P2. A reference is reported as the body spells it, and `owner/tracker#123` names
+# an issue this repository does not have: a remediation hardcoding the PR's own repo would reopen a
+# same-numbered issue here, or fail.
+test_the_reopen_remedy_does_not_hardcode_this_repo() {
+  reset
+  PR_BODY='Closes other/tracker#416 and other/tracker#417
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "other/tracker#416 other/tracker#417" \
+    "the cross-repository form is reported whole"
+  assert_contains "$MERGE_STDOUT" "in the repository its own reference names" \
+    "the remedy sends the reader to the reference's own repository"
+  assert_not_contains "$MERGE_STDOUT" "gh issue reopen <n> --repo $REPO" \
+    "and never hardcodes this PR's repository"
+}
+
+# Review round 1, P2. A PR body stays editable through a --wait that can run two hours, and editing
+# it does not move the head, so --match-head-commit cannot see it. The scan that matters is the one
+# taken last; the early one is lead time.
+test_the_body_is_scanned_again_before_the_merge() {
+  reset
+  PR_BODY='Nothing to see here.
+'
+  PR_BODY_LATER='Closes #418 and #419
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "was EDITED since the scan above" "the re-scan says what moved"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #418 #419" \
+    "and reports the body that actually lands"
+}
+
+# The other side of the re-scan: an unchanged body is not the whole block printed twice.
+test_an_unchanged_body_is_not_reported_twice() {
+  reset
+  PR_BODY='Closes #420 and #421
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_eq "$(grep -c 'ONE sentence, 2 issues: #420 #421' "$OUT_FILE")" 1 \
+    "the findings block is printed once, by the scan that had lead time"
+  assert_contains "$MERGE_STDOUT" "is UNCHANGED since the scan above" \
+    "and the re-scan confirms the body that lands is that one"
+  # And an edit that REMOVES the sentence retracts the warning rather than leaving it standing.
+  reset
+  PR_BODY='Closes #422 and #423
+'
+  PR_BODY_LATER='Closes #422
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "WARNING WITHDRAWN" "a fixed body retracts the earlier finding"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -321,6 +427,11 @@ tests=(
   test_a_closing_keyword_in_a_quoted_or_fenced_line_warns
   test_the_prescribed_shape_stays_silent
   test_an_unread_body_is_not_a_clean_body
+  test_a_longer_fence_is_not_closed_by_an_inner_one
+  test_an_abbreviation_does_not_split_the_sentence
+  test_the_reopen_remedy_does_not_hardcode_this_repo
+  test_the_body_is_scanned_again_before_the_merge
+  test_an_unchanged_body_is_not_reported_twice
 )
 
 run_tests "${tests[@]}"

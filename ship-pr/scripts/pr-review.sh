@@ -4013,19 +4013,51 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
   cls = quoted ? "quoted" : "sentence"
   print cls "\t" cnt "\t" refs "\t" shown
 }
+# A period that ends an ABBREVIATION is not a sentence boundary. Marked out before the split and
+# put back after it, because the split below would otherwise cut "Closes #1 and, e.g. #2" in two
+# and leave one reference on each side of the cut -- a silent miss of exactly the shape the scan
+# exists for (review round 1). The rule is the one that covers the class without a dictionary: a
+# period whose preceding alphanumeric run is a SINGLE character (e.g., i.e., initials, "§1."),
+# plus the handful of two- and three-letter forms that carry one. Splitting can only ever LOSE a
+# warning, so where the two readings differ this takes the one that splits LESS.
+function protect_abbrev(s,   out) {
+  out = ""
+  while (match(s, /(^|[^a-zA-Z0-9])([a-zA-Z0-9]|cf|vs|al|no|eq|ch|fig|etc|resp)\./)) {
+    out = out substr(s, 1, RSTART + RLENGTH - 2) "\002"
+    s = substr(s, RSTART + RLENGTH)
+  }
+  return out s
+}
 {
   line = $0
   sub(/\r$/, "", line)
   trimmed = line
   sub(/^[ \t]+/, "", trimmed)
   quoted = 0
-  if (trimmed ~ /^(```|~~~)/) { fence = 1 - fence; quoted = 1 }
+  # A fence closes only on its OWN delimiter, at least as long as the one that opened it. A
+  # four-backtick fence exists precisely so that it can CONTAIN a three-backtick one, and an
+  # unconditional toggle reads that inner fence as the close -- after which the closing keyword
+  # inside the example is read as ordinary prose and the scan says nothing (review round 1). The run
+  # is counted rather than matched, because an interval expression is not portable across the
+  # awks this fleet runs.
+  if (substr(trimmed, 1, 3) == "```" || substr(trimmed, 1, 3) == "~~~") {
+    fch = substr(trimmed, 1, 1)
+    flen = 0
+    while (substr(trimmed, flen + 1, 1) == fch) flen++
+    if (fence == 0) { fence = 1; fence_ch = fch; fence_len = flen }
+    else if (fch == fence_ch && flen >= fence_len) { fence = 0 }
+    quoted = 1
+  }
   if (fence) quoted = 1
   if (trimmed ~ /^>/) quoted = 1
-  s = line
+  s = protect_abbrev(line)
   gsub(/[.!?][ \t]+/, "&\001", s)
   n = split(s, parts, "\001")
-  for (i = 1; i <= n; i++) scan(parts[i], quoted)
+  for (i = 1; i <= n; i++) {
+    unit = parts[i]
+    gsub(/\002/, ".", unit)
+    scan(unit, quoted)
+  }
 }'
 
 # One line of the warning on BOTH streams: stdout is the transcript a later reader scrolls back
@@ -4036,25 +4068,56 @@ multi_close_say() { # <line...>; joined like warn's, so a continued line stays o
   warn "$*"
 }
 
-warn_multi_close() { # <pr>; always 0 -- a warning that can refuse a merge is a gate
-  local body scan rc class cnt refs sent n=0
+# The previous scan of this run, so that the re-scan below can tell a REPEAT from a body that
+# moved. MULTI_CLOSE_HAVE is separate from the text because "the scan found nothing" and "the scan
+# did not run" must not compare equal -- the same distinction the read failure above is written for.
+MULTI_CLOSE_LAST=""
+MULTI_CLOSE_HAVE=""
+
+warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a merge is a gate
+  local body scan rc class cnt refs sent n=0 again="${2:-}"
   body=$(gh_retry read api "repos/$REPO/pulls/$1" --jq '.body // ""')
   rc=$?
   # A read that FAILED is not a body with nothing in it. Say so, or the silence below is read as a
   # scan that found nothing -- the same false negative the approval read is written against.
   if [ "$rc" -ne 0 ]; then
+    MULTI_CLOSE_HAVE=""
     warn "could not read $REPO#$1's body ($(gh_err_line)); the closing-keyword scan did NOT run," \
       "so nothing here says this merge closes only what it means to."
     return 0
   fi
-  [ -n "$body" ] || return 0
-  scan=$(awk "$MULTI_CLOSE_FILTER" <<<"$body")
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    warn "the closing-keyword scan of $REPO#$1's body did not run (awk exit $rc); its silence is" \
-      "not a clean body."
-    return 0
+  scan=""
+  if [ -n "$body" ]; then
+    scan=$(awk "$MULTI_CLOSE_FILTER" <<<"$body")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      MULTI_CLOSE_HAVE=""
+      warn "the closing-keyword scan of $REPO#$1's body did not run (awk exit $rc); its silence" \
+        "is not a clean body."
+      return 0
+    fi
   fi
+  # The re-scan is the one whose findings actually land, so it reports what CHANGED rather than
+  # repeating a block the caller has already read. An unchanged body gets one line; a body that
+  # was edited during the gate gets the new findings in full, or, when the edit removed them, a
+  # line retracting the ones printed earlier.
+  if [ -n "$again" ] && [ -n "$MULTI_CLOSE_HAVE" ]; then
+    if [ "$scan" = "$MULTI_CLOSE_LAST" ]; then
+      [ -z "$scan" ] || multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body is UNCHANGED" \
+        "since the scan above, so the merge closes what it listed."
+      return 0
+    fi
+    if [ -z "$scan" ]; then
+      multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1's body was edited since the" \
+        "scan above and now binds no keyword to more than it names."
+      MULTI_CLOSE_LAST=""
+      return 0
+    fi
+    multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body was EDITED since the scan above;" \
+      "what this merge closes is below, not there."
+  fi
+  MULTI_CLOSE_LAST="$scan"
+  MULTI_CLOSE_HAVE=1
   [ -n "$scan" ] || return 0
   # The body is data from the PR, so every line of it is written through printf and never echoed.
   while IFS=$'\t' read -r class cnt refs sent; do
@@ -4075,8 +4138,13 @@ warn_multi_close() { # <pr>; always 0 -- a warning that can refuse a merge is a 
     "fenced copy of an example binds the same way:"
   multi_close_say "  ludics-lite#205 was closed twice over exactly that, by a phase reference" \
     "in #210 and then by #226 quoting it back."
-  multi_close_say "  If an issue listed above must stay OPEN, reopen it now (gh issue reopen" \
-    "<n> --repo $REPO) and fix the body."
+  # NOT `--repo $REPO`: a reference is reported as the body spells it, and the cross-repository
+  # form `owner/tracker#123` names an issue this PR's repository does not have. Following a
+  # hardcoded --repo would reopen a same-numbered issue HERE, or fail (review round 1).
+  multi_close_say "  If an issue listed above must stay OPEN, reopen it now in the repository its" \
+    "own reference names"
+  multi_close_say "  (gh issue reopen <n> --repo <owner>/<name>; a bare #<n> is $REPO), and fix" \
+    "the body."
   multi_close_say "  This is a WARNING and not a gate: one sentence closing two issues is" \
     "sometimes exactly what was meant,"
   multi_close_say "  and nothing readable from here tells that apart from the accident."
@@ -4218,12 +4286,18 @@ cmd_merge() {
       "the record; a close-out merge is never made by dropping --require-green."
   fi
   # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
-  # verdict is the final thing on screen before the merge itself. A loud WARNING, not a gate: the
+  # verdict is read late, with only the closing-keyword re-scan below it. A loud WARNING, not a gate: the
   # roll-forward policy (ahrefs/ocannl#861, see warn_base_drift) lets a clean merge proceed on the
   # head's green run, and hands semantic drift to the post-merge integration loop. A 3 (unread)
   # has already said UNKNOWN loudly; neither outcome blocks the merge.
   warn_base_drift "$PR_NUM" || true
   [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
+  # Read the body ONE more time, last of all. The scan after pr_arg above is for lead time; this is
+  # the one whose findings land. A PR body stays editable throughout a --wait that can run two
+  # hours, and editing it does not move the head, so --match-head-commit does not see the change
+  # and the early scan alone would let a multi-close sentence added during the wait through
+  # unannounced (review round 1). It reports only what moved: one line when the body is unchanged.
+  warn_multi_close "$PR_NUM" again
   # The verdict above is about ONE head, the one gate_checks read — and a --wait is minutes to
   # hours long, during which a push can move the PR. `gh pr merge` merges whatever the head is at
   # the moment of the call; --match-head-commit makes it refuse unless that is still the gated

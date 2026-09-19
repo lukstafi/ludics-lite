@@ -186,7 +186,8 @@ the final PR that completes the issue. A closing keyword binds to every `#N` in 
 sentence, so "Resolves #194 and #205 §1" closed #205 too (PR #210, 2026-09-17; #205 had to be
 reopened). A PR that only partially addresses a second issue references it in a separate
 sentence with no keyword: "Addresses part 1 of #205". `pr-review.sh merge` reads the body
-before it merges and warns on both streams, naming the sentence and every issue, when one
+twice — once up front for lead time and once more immediately before the merge call, since a
+body stays editable through a `--wait` and editing it moves no head — and warns on both streams, naming the sentence and every issue, when one
 sentence carries a closing keyword and more than one `#N` or when a closing keyword sits in a
 quoted (`> …`) or fenced line, where an example closes exactly as a statement does (that is how
 #226's own body closed #205 a second time) — a warning and not a refusal, because one sentence
