@@ -4024,8 +4024,8 @@ function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
   # in front of the hash (review round 8). A host is an alphanumeric run with a dotted two-letter
   # or longer last label, and everything up to the next space belongs to it -- the suffix starts
   # at a slash, a question mark or a hash, since a query may follow a bare host with no path at
-  # all (review round 10).
-  gsub(/(^|[ \t([{<"\047])[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z][a-zA-Z]+([\/?#][^ \t]*)?/, " ", rest)
+  # all (review round 10), and a PORT may stand between the two (round 11).
+  gsub(/(^|[ \t([{<"\047])[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z][a-zA-Z]+(:[0-9]+)?([\/?#][^ \t]*)?/, " ", rest)
   out = ""; n = 0
   while (match(rest, /(^|[ \t([{<"\047`*_,;])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[1-9][0-9]*/)) {
     r = substr(rest, RSTART, RLENGTH)
@@ -4094,9 +4094,9 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
   # renders as one, and leaving the marker in front made the `>` test miss it entirely (review
   # round 3). Markers are peeled repeatedly, so a quote two list levels down is reached too.
   while (!indented) {
-    if (match(trimmed, /^[-*+][ \t]+/)) {
-      trimmed = substr(trimmed, RLENGTH + 1)
-    } else if (match(trimmed, /^[0-9]+[.)][ \t]+/)) {
+    if (match(trimmed, /^[-*+][ \t]/)) {
+      trimmed = substr(trimmed, 3)
+    } else if (match(trimmed, /^[0-9]+[.)][ \t]/)) {
       # Markdown allows at most NINE digits in an ordered marker, so a longer run is ordinary text
       # and peeling it turned a line into a list item it is not -- after which a `>` behind it read
       # as a blockquote and warned about a single reference (review round 10). Counted rather than
@@ -4104,8 +4104,22 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
       d = 0
       while (substr(trimmed, d + 1, 1) ~ /[0-9]/) d++
       if (d > 9) break
-      trimmed = substr(trimmed, RLENGTH + 1)
+      trimmed = substr(trimmed, d + 3)
     } else {
+      break
+    }
+    # A marker takes ONE space of padding; four columns BEYOND it open an indented code block
+    # inside the list item, so stripping the whole run made code look like a blockquote (review
+    # round 11). The same column arithmetic as the line indentation above.
+    pcol = 0
+    for (pi = 1; pi <= length(trimmed); pi++) {
+      pc = substr(trimmed, pi, 1)
+      if (pc == " ") pcol++
+      else if (pc == "\t") pcol += 4 - (pcol % 4)
+      else break
+    }
+    if (pcol >= 4) {
+      indented = 1
       break
     }
     sub(/^[ \t]+/, "", trimmed)
@@ -4141,6 +4155,12 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
   }
   if (fence) quoted = 1
   if (!indented && trimmed ~ /^>/) quoted = 1
+  # SKILL.md says an indented code block is a shape this scanner does not read, and that has to
+  # mean not SCANNED -- suppressing only the quote and fence tests still had `    Closes #1 and #2`
+  # warned about as an ordinary sentence, which contradicted the documentation in the one direction
+  # that matters (review round 11). Inside an already-open fence indentation is content, so the
+  # line is still read there.
+  if (indented && !fence) next
   s = line
   # Terminal punctuation ends a unit, with no abbreviation rule in front of it. One stood here for
   # three rounds and was narrowed twice; each revision traded one error for another, and both of
@@ -4272,13 +4292,28 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
   # line retracting the ones printed earlier.
   if [ -n "$again" ] && [ -n "$MULTI_CLOSE_HAVE" ]; then
     if [ "$body" = "$MULTI_CLOSE_BODY" ]; then
-      [ -z "$scan" ] || multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body is UNCHANGED" \
-        "since the scan above, so the merge closes what it listed."
+      if [ -n "$scan" ]; then
+        multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body is UNCHANGED since the scan" \
+          "above, so the merge closes what it listed."
+        # An unchanged BODY is not an unchanged answer: the base or the default branch can have
+        # moved during the gate, and a lookup that now fails leaves it unknown whether those
+        # keywords bind at all. Saying so here is owed, because this line is the last word on a
+        # finding the caller has already read (review round 11).
+        if [ "$MULTI_CLOSE_BINDS" = unknown ]; then
+          multi_close_say "  ...though whether they bind could NOT be re-read: $MULTI_CLOSE_ERR." \
+            "Unread is not inert."
+        fi
+      fi
       return 0
     fi
     if [ -z "$scan" ]; then
-      multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1's body was edited since the" \
-        "scan above and now binds no keyword to more than it names."
+      # Only a warning that was PRINTED can be withdrawn. A clean body edited to another clean body
+      # was producing a loud retraction of nothing at all, immediately before an ordinary merge
+      # (review round 11); the saved body is updated silently instead.
+      if [ -n "$MULTI_CLOSE_LAST" ]; then
+        multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1's body was edited since the" \
+          "scan above and now binds no keyword to more than it names."
+      fi
       MULTI_CLOSE_LAST=""
       MULTI_CLOSE_BODY="$body"
       return 0

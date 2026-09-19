@@ -38,6 +38,7 @@ PR_BASE=main                           # the branch this PR targets
 BASE_LATER=""                          # nonempty = the base read answers with this from the 2nd on
 DEFAULT_BRANCH=main                    # the repository default branch
 DEFAULT_BRANCH_FAIL=""                 # nonempty = the default-branch read answers with a 404
+DEFAULT_BRANCH_FAIL_LATER=""           # nonempty = it answers with a 404 from the SECOND read on
 PR_BODY="A body with nothing to close."  # what the body read answers with
 PR_BODY_LATER=""                       # nonempty = what the SECOND body read on answers with
 BODY_FAIL=""                           # nonempty = the body read answers with a 404
@@ -45,6 +46,7 @@ BODY_FAIL=""                           # nonempty = the body read answers with a
 # so a variable it increments dies with that subshell -- as CALLS_FILE already exists for.
 READS_FILE="$TEST_ROOT/body-reads"
 BASE_READS_FILE="$TEST_ROOT/base-reads"
+DEF_READS_FILE="$TEST_ROOT/def-reads"
 
 # The three library functions this suite replaces, declared so the shadow guard lets them through:
 # the build signal is not under test here. gate_checks calls them inside command substitutions;
@@ -99,6 +101,11 @@ gh() {
     esac
     ;;
   "api repos/$REPO")
+    printf 'def\n' >>"$DEF_READS_FILE"
+    if [ -n "$DEFAULT_BRANCH_FAIL_LATER" ] && [ "$(wc -l <"$DEF_READS_FILE" | tr -d ' ')" -ge 2 ]; then
+      printf 'gh: Not Found (HTTP 404)\n' >&2
+      return 1
+    fi
     if [ -n "$DEFAULT_BRANCH_FAIL" ]; then
       printf 'gh: Not Found (HTTP 404)\n' >&2
       return 1
@@ -134,6 +141,7 @@ run_merge() {
   local rc
   : >"$READS_FILE"
   : >"$BASE_READS_FILE"
+  : >"$DEF_READS_FILE"
   : >"$CALLS_FILE"
   set +e
   (cmd_merge "$REPO#7" "$@") >"$OUT_FILE" 2>"$ERR_FILE"
@@ -162,6 +170,7 @@ reset() {
   BASE_LATER=""
   DEFAULT_BRANCH=main
   DEFAULT_BRANCH_FAIL=""
+  DEFAULT_BRANCH_FAIL_LATER=""
   rm -f "$TEST_ROOT/merge-failed-once"
   PR_BODY="A body with nothing to close."
   PR_BODY_LATER=""
@@ -964,6 +973,75 @@ test_the_queue_is_read_after_the_body_scan() {
   assert_eq "$order" "CALL api graph,CALL api graph,CALL pr merge ," "both reads still precede the merge"
 }
 
+# Review round 11, P2. The documentation says an indented code block is a shape this scanner does
+# not read; suppressing only the quote and fence tests still had an indented ordinary sentence
+# warned about, which contradicted it in the one direction that matters.
+test_an_indented_code_line_is_not_scanned_at_all() {
+  reset
+  PR_BODY='An indented example:
+
+    Closes #684 and #685
+
+Closes #686 and #687
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_STDOUT" "684" "an indented sentence is code, and code is not read"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #686 #687" "the ordinary line still is"
+}
+
+# Review round 11, P2. A list marker takes ONE space of padding; four columns beyond it open an
+# indented code block inside the item, so stripping the whole run made code look like a blockquote.
+test_a_list_marker_does_not_swallow_code_indentation() {
+  reset
+  PR_BODY='-     > Closes #688
+- > Closes #689
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_STDOUT" "688" "four columns past the padding is code"
+  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #689" \
+    "one space of padding is still a list item with a quote in it"
+}
+
+# Review round 11, P2. A port stands between a schemeless host and its suffix.
+test_a_port_in_a_schemeless_url_is_stripped() {
+  reset
+  PR_BODY='Closes #690; see www.example.com:8080/?issues=foo,#691 for details.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" "a port does not end the URL"
+}
+
+# Review round 11, P2. Only a warning that was PRINTED can be withdrawn: a clean body edited to
+# another clean body was producing a loud retraction of nothing at all.
+test_a_clean_body_edited_to_another_clean_body_is_silent() {
+  reset
+  PR_BODY='Nothing here.
+'
+  PR_BODY_LATER='Still nothing here.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge still lands ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "WITHDRAWN" "nothing was warned, so nothing is withdrawn"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "and the merge is silent throughout"
+}
+
+# Review round 11, P2. An unchanged BODY is not an unchanged answer: if the comparison can no
+# longer be read, the last word on a finding the caller has already read must say so.
+test_an_unchanged_body_still_reports_a_lost_comparison() {
+  reset
+  PR_BODY='Closes #692 and #693
+'
+  DEFAULT_BRANCH_FAIL_LATER=1
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge still lands ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "is UNCHANGED since the scan above" "the body did not move"
+  assert_contains "$MERGE_STDOUT" "whether they bind could NOT be re-read" \
+    "but whether the keywords bind is no longer known"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -1013,6 +1091,11 @@ tests=(
   test_a_query_only_schemeless_url_is_stripped
   test_an_over_long_numeric_prefix_is_not_a_list_marker
   test_the_queue_is_read_after_the_body_scan
+  test_an_indented_code_line_is_not_scanned_at_all
+  test_a_list_marker_does_not_swallow_code_indentation
+  test_a_port_in_a_schemeless_url_is_stripped
+  test_a_clean_body_edited_to_another_clean_body_is_silent
+  test_an_unchanged_body_still_reports_a_lost_comparison
 )
 
 run_tests "${tests[@]}"
