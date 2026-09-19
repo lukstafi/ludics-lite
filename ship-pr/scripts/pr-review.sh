@@ -4008,7 +4008,12 @@ refuse_merge_queue() {
 # separator a human writes stands on each side of it. `_` is NOT one of them, whatever Markdown
 # does with it between words: an intraword underscore is not an emphasis boundary, and admitting it
 # made the identifier `auto_closes_items` a closing directive (review round 13). Losing
-# underscore-italic around a keyword is the price, and `*` still carries emphasis.
+# underscore-italic around a keyword is the price, and `*` still carries emphasis. Nor is `.`:
+# `fixes.md` and `fixes.co` are a filename and a hostname, and admitting the dot made both
+# directives (round 14). A full stop is a boundary only when an alphanumeric does NOT follow it,
+# which is the distinction between a sentence ending in "are now fixed." -- whose references stand
+# before the keyword in the same unit, so dropping the dot outright would have silenced it -- and a
+# dotted token. The suite caught that overreach before it left the worktree.
 MULTI_CLOSE_FILTER='
 function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
   # URLs go first. A body here is full of run links, and a fragment in one is not an issue: a
@@ -4067,7 +4072,7 @@ function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
   return out
 }
 function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
-  if (tolower(unit) !~ /(^|[ \t([{<"\047`*,;:>])(close[sd]?|fix(e[sd])?|resolve[sd]?)([ \t)\]}>"\047`*,;:.!?]|$)/) return
+  if (tolower(unit) !~ /(^|[ \t([{<"\047`*,;:>])(close[sd]?|fix(e[sd])?|resolve[sd]?)([ \t)\]}>"\047`*,;:!?]|\.[^a-z0-9]|\.$|$)/) return
   refs = refs_of(unit, repo)
   if (refs == "") return
   cnt = split(refs, parts, " ")
@@ -4313,6 +4318,12 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
       return 0
     fi
   fi
+  # Counted before anything speaks about the scan: three lines pick their register from this, and
+  # the EDITED banner below was the third of them to be found announcing a quoted-only finding as
+  # a WARNING that says what the merge closes (review rounds 13 and 14).
+  local n_sentence n_quoted
+  n_sentence=$(grep -c "^sentence$(printf '\t')" <<<"$scan") || n_sentence=0
+  n_quoted=$(grep -c "^quoted$(printf '\t')" <<<"$scan") || n_quoted=0
   # The re-scan is the one whose findings actually land, so it reports what CHANGED rather than
   # repeating a block the caller has already read. An unchanged body gets one line; a body that
   # was edited during the gate gets the new findings in full, or, when the edit removed them, a
@@ -4356,12 +4367,14 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
       MULTI_CLOSE_BODY="$body"
       return 0
     fi
-    multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body was EDITED since the scan above;" \
-      "what this merge closes is below, not there."
+    if [ "$n_sentence" -gt 0 ]; then
+      multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body was EDITED since the scan above;" \
+        "what this merge closes is below, not there."
+    else
+      multi_close_say "CLOSING-KEYWORD NOTICE: $REPO#$1's body was EDITED since the scan above;" \
+        "the line to read is below, not there."
+    fi
   fi
-  local n_sentence n_quoted
-  n_sentence=$(grep -c "^sentence$(printf '\t')" <<<"$scan") || n_sentence=0
-  n_quoted=$(grep -c "^quoted$(printf '\t')" <<<"$scan") || n_quoted=0
   MULTI_CLOSE_LAST="$scan"
   MULTI_CLOSE_BODY="$body"
   MULTI_CLOSE_HAVE=1

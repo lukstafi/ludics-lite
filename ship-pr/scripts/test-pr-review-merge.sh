@@ -1140,6 +1140,61 @@ test_control_bytes_in_the_body_cannot_forge_the_warning() {
   assert_contains "$MERGE_STDOUT" "?[2K?FORGED LINE" "the control bytes are shown, not executed"
 }
 
+# Review round 14, P2 and BLOCKING. The third of three lines that speak about a finding the caller
+# has already read, and the last one still announcing a quoted-only finding as a WARNING that says
+# what the merge closes -- directly against the guarantee the quoted class was given.
+test_an_edited_body_with_a_quoted_only_finding_keeps_notice_wording() {
+  reset
+  PR_BODY='Nothing here.
+'
+  PR_BODY_LATER='> Closes #711
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD NOTICE" "the edited-body banner is a notice"
+  assert_not_contains "$MERGE_STDOUT" "CLOSING-KEYWORD WARNING" "and never a warning"
+  assert_not_contains "$MERGE_STDOUT" "what this merge closes is below" "nor a claim about closing"
+  assert_contains "$MERGE_STDOUT" "reads as a QUOTED or FENCED example, 1 reference(s): #711" \
+    "the finding itself still reports"
+  # A body edited to carry a SENTENCE finding still gets the strong banner.
+  reset
+  PR_BODY='Nothing here.
+'
+  PR_BODY_LATER='Closes #712 and #713
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "what this merge closes is below, not there" \
+    "a sentence finding keeps the strong banner"
+}
+
+# Review round 14, P2. A dot after a keyword makes a dotted TOKEN, not a boundary: a filename and a
+# hostname were both being read as closing directives, with the strong warning and reopen guidance
+# on prose carrying no directive at all.
+test_a_dotted_token_containing_a_keyword_is_not_a_keyword() {
+  reset
+  PR_BODY='The fixes.md file covers #714 and #715.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "a filename is not a directive"
+  PR_BODY='See fixes.co for #716 and #717.
+'
+  run_merge
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "nor is a hostname"
+  # The boundaries a real directive uses are untouched -- including a full stop that ENDS the
+  # sentence, whose references stand before the keyword, which dropping the dot outright would
+  # have silenced. The suite caught that overreach.
+  PR_BODY='Closes: #718, #719
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #718 #719" "a colon still bounds a keyword"
+  PR_BODY='Issues #720 and #721 are now fixed.
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #720 #721" \
+    "a keyword ending the sentence still binds the references before it"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -1199,6 +1254,8 @@ tests=(
   test_an_unchanged_quoted_only_body_keeps_notice_wording
   test_an_identifier_containing_a_keyword_is_not_a_keyword
   test_control_bytes_in_the_body_cannot_forge_the_warning
+  test_an_edited_body_with_a_quoted_only_finding_keeps_notice_wording
+  test_a_dotted_token_containing_a_keyword_is_not_a_keyword
 )
 
 run_tests "${tests[@]}"
