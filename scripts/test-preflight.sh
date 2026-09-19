@@ -321,15 +321,38 @@ workflow_bare_commands() {
     # invocation would pass over a prompt hygiene step that can no longer go red (round 5). The
     # one tail accepted is the `|| { echo ...; exit 1; }` this workflow uses; another spelling that
     # propagates is a line here, deliberately, rather than an attempt to read shell semantics.
-    function bare(cmd, first, tail) {
-      if (first == "") return cmd
-      if (first == "||" && tail ~ /exit 1[ \t]*[;}]/) return cmd
+    # The tail is matched WHOLE, not searched for a substring: `<cmd> || { ...; exit 1; } || true`
+    # contains the accepted handler and still cannot go red, so an unanchored match let the very
+    # shape this rule refuses through one operator later (round 6).
+    function tail_from(start,   i, t) {
+      t = ""
+      for (i = start; i <= NF; i++) t = t (t == "" ? "" : " ") $i
+      return t
+    }
+    function bare(cmd, tail) {
+      if (tail == "") return cmd
+      if (tail ~ /^\|\| \{ .*exit 1 *;? *\}$/) return cmd
       return ""
     }
-    $1 == "run:" { c = bare($2, (NF >= 3 ? $3 : ""), $0); if (c != "") print c }
-    $1 == "-" && $2 == "run:" { c = bare($3, (NF >= 4 ? $4 : ""), $0); if (c != "") print c }
+    $1 == "run:" { c = bare($2, tail_from(3)); if (c != "") print c }
+    $1 == "-" && $2 == "run:" { c = bare($3, tail_from(4)); if (c != "") print c }
   ' "$WORKFLOW"
 }
+# The command word of every lint `run:` whose step carries a condition other than `!cancelled()`.
+# GitHub skips a step whose `if:` is false and reports the job green, so a pinned check can be
+# turned off without touching its run line at all (round 6). `!cancelled()` is the one condition
+# known to preserve execution -- it skips only a cancelled run, which is the macOS legs' spelling
+# for "run this step even after an earlier one failed" -- and anything else is a line here.
+lint_conditional_runs() {
+  awk -v want="  lint:" '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_job = ($0 == want); next }
+    !in_job { next }
+    /^      - / { cond = "" }
+    $1 == "if:" { cond = $0; sub(/^[[:space:]]*if:[[:space:]]*/, "", cond) }
+    $1 == "run:" && cond != "" && cond !~ /^\$\{\{[ ]*![ ]*cancelled\(\)[ ]*\}\}$/ { print $2 }
+  ' "$WORKFLOW"
+}
+
 # The steps the lint job invokes WITHOUT --require-tools. A step with an interpreter that CI does
 # not demand is one a runner losing that interpreter turns into a SKIP and a green job -- the
 # fail-closed half of this PR's own promise, dropped by deleting one word from a run line.
@@ -420,6 +443,11 @@ EOF
 [ -n "$bare_run_commands" ] && ok "the workflow's bare invocations can be read" \
   || ko "no bare run: invocation found in the workflow -- the pin above would pass over nothing"
 
+conditional=$(lint_conditional_runs)
+[ -z "$conditional" ] \
+  && ok "...and no pinned check is behind a condition that could skip it" \
+  || ko "a lint step the pin reads is behind a condition:$conditional"
+
 # The same validation on the flag CI's own fail-closed promise rests on.
 unguarded=$(lint_preflight_unguarded)
 ungated=
@@ -503,7 +531,9 @@ probe_workflow_swap() { # probe_workflow_swap <exact old line> <new line>
     { print }
   ' "$ROOT/.github/workflows/skill-scripts.yml" >"$TMP/probe/.github/workflows/skill-scripts.yml"
   WORKFLOW="$TMP/probe/.github/workflows/skill-scripts.yml"
-  grep -Fqx -- "$2" "$WORKFLOW" && ! grep -Fqx -- "$1" "$WORKFLOW"
+  # The swap is asserted by the file having CHANGED, which covers a probe that puts several lines
+  # in place of one and keeps the original line among them (a condition above a run line).
+  [ -s "$WORKFLOW" ] && ! cmp -s "$ROOT/.github/workflows/skill-scripts.yml" "$WORKFLOW"
 }
 
 probe_workflow '      - name: A new check
@@ -608,6 +638,36 @@ if probe_workflow_swap '        run: scripts/check-prompts.sh' \
     || ok "...nor does a pipe, whose status is the last command's"
 else
   ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
+fi
+
+# A handler that propagates, followed by one that does not, is not a run either.
+if probe_workflow_swap '        run: scripts/check-prompts.sh' \
+  "        run: scripts/check-prompts.sh || { echo 'failed'; exit 1; } || true"; then
+  grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+    && ko "an accepted handler followed by '|| true' still read as a bare invocation" \
+    || ok "...and the accepted handler must be the WHOLE tail, so a trailing '|| true' still trips it"
+else
+  ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
+fi
+
+# A condition is the other way to stop a step running without touching its run line.
+if probe_workflow_swap '        run: scripts/preflight.sh --require-tools modes' \
+  '        if: ${{ false }}
+        run: scripts/preflight.sh --require-tools modes'; then
+  [ "$(lint_conditional_runs)" = scripts/preflight.sh ] \
+    && ok "...and a pinned step behind a false condition is reported" \
+    || ko "a lint step behind 'if: false' was not reported (verdict:$(lint_conditional_runs))"
+else
+  ko "the swap probe rewrote nothing: the lint job no longer spells the mode step as this file expects"
+fi
+if probe_workflow_swap '        run: scripts/check-jq-shapes.sh' \
+  '        if: ${{ !cancelled() }}
+        run: scripts/check-jq-shapes.sh'; then
+  [ -z "$(lint_conditional_runs)" ] \
+    && ok "...while !cancelled(), which skips only a cancelled run, is not refused" \
+    || ko "the !cancelled() condition was read as one that could skip the step"
+else
+  ko "the swap probe rewrote nothing: the lint job no longer spells the jq guard step as this file expects"
 fi
 
 # Dropping --require-tools is one word, and it turns CI's fail-closed step into a SKIP.

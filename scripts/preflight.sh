@@ -122,6 +122,12 @@ collect_files() { # fills FILES with the paths the globs expand to, relative to 
   # in a worktree is not something CI will ever open, and going red over it would make the local
   # command and the CI command disagree in the one direction that matters: a red the push does not
   # have is what teaches the reader to stop running the preflight (round 5).
+  # The scope is which PATHS are judged; the bytes judged are the ones on disk, which is what a
+  # commit of this tree will carry and what every other check in this repository reads. Staging a
+  # file and then editing it without staging the edit is therefore judged as the edit, not as the
+  # index -- reading index bytes would mean judging content no path holds, leaving the
+  # diagnostics of bash and of the linter pointing at lines the reader cannot open (round 6,
+  # rebutted).
   # issue-wave/scripts/test-fleet-worker.sh's coverage guard reads tracked paths for this reason
   # and said so first. Outside a work tree -- the scratch checkouts scripts/test-preflight.sh
   # builds, and any unpacked copy -- the filesystem is the list, which is also the fixtures' way
