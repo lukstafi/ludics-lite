@@ -188,6 +188,22 @@ mid-sweep destroyed both GPU boxes' VMs and cost that run both GPU units. The sp
 came later, on 2026-09-18: while one lock said both things, the sweep routine's own `--hold` in
 step 1 reserved the boxes against its own sweep in step 2, and three backends went uncovered.
 
+That interlock spans two repositories with nothing enforcing it: the sweep takes the lane lock
+itself and neither side reads anything from the other, so four facts stay equal by hand — the
+directory, the `<box>.lock` name, the box name the sweep derives from an ssh alias, and a negative
+one, that the sweep must never take or honour the **hold** lock. The first three fail open (the two
+sides quietly stop meeting and the interlock is gone) and the fourth fails closed (a held box can
+no longer sweep itself). `test-wake-lab.sh` compares all four against the sweep's own code. It
+reads the revision the sweep routine actually runs — `origin/master` of
+`${OCANNL_STAGING:-$HOME/ocannl-staging}`, since that checkout is often on a WIP branch — and it
+runs the sweep's own `take_lab_lock` under a HOME of its own rather than rebuilding the path,
+so the comparison is against the lock file that really appears. It then holds each side's real
+lock and checks the other side's real behaviour, since a lock file without a live `flock` stops
+nothing: a restart is refused while the sweep's own `take_lab_lock` holds the box, and the sweep
+still takes its lane lock while that box's hold lock is held. The checkout is read strictly
+read-only. Where it is absent, as in CI, the case prints a named `SKIP:` line that the summary
+counts, so a green run says what it did not check. The staging side has no matching check.
+
 `WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the verified lab
 lore in the header comment (wake-on-LAN over Ethernet only, waking from a full shutdown, what
 `router-active=1` means, the cold-boot kicked-VM trap, the `exit 0` vs `true` probe trap), the router
@@ -487,7 +503,9 @@ holds a kicked WSL VM up, which is a `wsl.exe` on the Windows side and nothing e
 spawns that holder as an unsized `sleep infinity`, never inside the guest, and the VM counts as up
 only once `tasklist` shows the process on the Windows side, while `unhold` kills it and says so;
 and it pins the Windows Update active-hours warning together with its quiet path, since a check
-that warned under the 6-to-0 window the boxes pin is one nobody would read.
+that warned under the 6-to-0 window the boxes pin is one nobody would read. Finally it compares
+the lab lock contract against the ocannl sweep's code where that checkout is present, as described
+under [The lab script](#the-lab-script), and prints a counted `SKIP:` line where it is not.
 
 `test-sync-routines.sh` runs `scripts/sync-routines.sh` against scratch trees, with
 `CLAUDE_SCHEDULED_TASKS_DIR` pointed at them and over a byte-identical copy of the script inside a
