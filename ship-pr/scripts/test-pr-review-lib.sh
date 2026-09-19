@@ -1024,7 +1024,7 @@ test_definitions_before_sourcing_are_refused() {
 # the silent half of the trap is covered too: the caller's stale value must not survive, and the
 # path that comes back must be the one registered for removal, in the caller's shell.
 test_tmpdir_writes_to_a_target_named_dir() {
-  local path
+  local path pid
   control 'dir=stale' \
     'test_tmpdir dir tmpdir-target' \
     'printf "target=%s\n" "$dir"' \
@@ -1033,7 +1033,16 @@ test_tmpdir_writes_to_a_target_named_dir() {
   assert_eq "$CONTROL_RC" 0 "a caller's variable named dir is written ($CONTROL_ERR)"
   path=$(sed -n 's/^target=//p' <<<"$CONTROL_OUT")
   assert_not_contains "$path" stale "the caller's prior value must not survive the call"
-  assert_contains "$path" "/pr-review-tmpdir-target." "the fresh directory should reach the caller"
+  assert_contains "$path" ".tmpdir-target." "the label should still reach the caller's directory name"
+  # And the owning pid, read back with the very parse pr-review.sh's tmp_sweep_stale uses on it:
+  # a scratch directory whose name does not carry a pid cannot be told from a live sibling's, and
+  # so is collectable by nothing at all once the suite that made it is killed (ludics-lite#219).
+  # Pinning the SHAPE here rather than in prose is what stops the label-only spelling coming back.
+  pid=${path##*/pr-review-test.}
+  pid=${pid%%.*}
+  case "$pid" in '' | *[!0-9]*)
+    bail "the scratch directory should be keyed by the owning pid, so a killed suite's is swept: $path" ;;
+  esac
   [ ! -d "$path" ] || bail "the control left $path behind: the registration did not reach its shell"
 }
 
@@ -1056,17 +1065,24 @@ test_tmpdir_refuses_a_name_it_uses() {
 # created in a registered root, so the case cannot itself leak whichever way it goes, and both
 # must be gone once the suite that made them has exited.
 test_the_exit_trap_removes_what_pr_review_sh_s_trap_removes() {
-  local root snap err
+  local root snap err gh
   test_tmpdir root trap-removes
+  # All THREE paths pr_review_cleanup removes. GH_TMP_FILE is gh_retry's per-attempt capture, and
+  # it is here for the reason the other two are: what this trap removes is read off the script's
+  # function rather than restated, so a path added there has to show up here or nothing proves the
+  # addition runs (ludics-lite#219, the same shape as #191's snapshot directory).
   control "SNAP_DIR=\$(mktemp -d \"$root/snap.XXXXXX\")" \
     "GH_ERR_FILE=\$(mktemp \"$root/err.XXXXXX\")" \
-    'printf "snap=%s\nerr=%s\n" "$SNAP_DIR" "$GH_ERR_FILE"'
+    "GH_TMP_FILE=\$(mktemp \"$root/gh.XXXXXX\")" \
+    'printf "snap=%s\nerr=%s\ngh=%s\n" "$SNAP_DIR" "$GH_ERR_FILE" "$GH_TMP_FILE"'
   assert_eq "$CONTROL_RC" 0 "the probe suite must run ($CONTROL_ERR)"
   snap=$(sed -n 's/^snap=//p' <<<"$CONTROL_OUT")
   err=$(sed -n 's/^err=//p' <<<"$CONTROL_OUT")
+  gh=$(sed -n 's/^gh=//p' <<<"$CONTROL_OUT")
   assert_contains "$snap" "$root/snap." "the probe should report the directory it made"
   [ ! -e "$snap" ] || bail "the snapshot directory survived the suite's exit: $snap (ludics-lite#191)"
   [ ! -e "$err" ] || bail "the error file survived the suite's exit: $err"
+  [ ! -e "$gh" ] || bail "gh_retry's capture survived the suite's exit: $gh"
 }
 
 # And the guard that keeps the above true as the script's trap grows. Three ways the wiring can
