@@ -1083,6 +1083,63 @@ test_a_quoted_finding_claims_nothing_about_closing() {
   assert_contains "$MERGE_STDOUT" "EDIT THE BODY now" "and still carries the remedy"
 }
 
+# Review round 13, P2 and BLOCKING: this path undid the guarantee round 12 established. An
+# unchanged quoted-only body reached the re-scan shortcut and was reported with a WARNING saying
+# the merge closes what it listed -- the exact claim the quoted class was stripped of.
+test_an_unchanged_quoted_only_body_keeps_notice_wording() {
+  reset
+  PR_BODY='> Closes #702
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD NOTICE" "the lead-time scan is a notice"
+  assert_not_contains "$MERGE_STDOUT" "CLOSING-KEYWORD WARNING" \
+    "and the re-scan of the unchanged body must not promote it to a warning"
+  assert_not_contains "$MERGE_STDOUT" "closes what it listed" "nor claim what the merge closes"
+  assert_contains "$MERGE_STDOUT" "the line flagged there is the line that lands" \
+    "it says the body did not move, in the register it said the rest in"
+  # A body that DOES carry a sentence finding still gets the strong register on the re-scan.
+  reset
+  PR_BODY='Closes #703 and #704
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "is UNCHANGED since the scan above, so the merge closes what it listed" \
+    "a sentence finding keeps the strong wording"
+}
+
+# Review round 13, P2. An intraword underscore is not an emphasis boundary, so admitting `_` as a
+# keyword boundary made an ordinary identifier a closing directive -- a strong warning with reopen
+# guidance on a sentence carrying no directive at all.
+test_an_identifier_containing_a_keyword_is_not_a_keyword() {
+  reset
+  PR_BODY='The auto_closes_items helper covers #705 and #706.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "an identifier is not a directive"
+  # Asterisk emphasis around a real keyword still is one.
+  PR_BODY='*Closes #707 and #708*
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #707 #708" "emphasis still bounds a keyword"
+}
+
+# Review round 13, P2. The sentence is contributor-controlled text on its way to a terminal, and
+# this warning is the whole product of the scan: an ESC or a carriage return could erase or forge
+# it. printf stops format-string expansion; it does not neutralize terminal control bytes.
+test_control_bytes_in_the_body_cannot_forge_the_warning() {
+  reset
+  PR_BODY=$(printf 'Closes #709 and #710\033[2K\rFORGED LINE\n')
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #709 #710" "the finding still reports"
+  case "$MERGE_OUTPUT" in
+  *$'\033'*) bail "an escape byte reached the output" ;;
+  *$'\r'*) bail "a carriage return reached the output" ;;
+  esac
+  assert_contains "$MERGE_STDOUT" "?[2K?FORGED LINE" "the control bytes are shown, not executed"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -1139,6 +1196,9 @@ tests=(
   test_an_unchanged_body_still_reports_a_lost_comparison
   test_an_indented_delimiter_closes_an_open_fence
   test_a_quoted_finding_claims_nothing_about_closing
+  test_an_unchanged_quoted_only_body_keeps_notice_wording
+  test_an_identifier_containing_a_keyword_is_not_a_keyword
+  test_control_bytes_in_the_body_cannot_forge_the_warning
 )
 
 run_tests "${tests[@]}"

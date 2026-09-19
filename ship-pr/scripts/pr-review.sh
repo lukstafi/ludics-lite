@@ -4005,7 +4005,10 @@ refuse_merge_queue() {
 # Both are WHITELISTS rather than exclusions, which is what makes them finite: an excluding class
 # is ASCII-shaped, so the first byte of a non-ASCII letter reads as punctuation to it and `fixés`
 # in French prose matched as a keyword (review round 8). A keyword is one only where an ASCII
-# separator a human writes stands on each side of it.
+# separator a human writes stands on each side of it. `_` is NOT one of them, whatever Markdown
+# does with it between words: an intraword underscore is not an emphasis boundary, and admitting it
+# made the identifier `auto_closes_items` a closing directive (review round 13). Losing
+# underscore-italic around a keyword is the price, and `*` still carries emphasis.
 MULTI_CLOSE_FILTER='
 function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
   # URLs go first. A body here is full of run links, and a fragment in one is not an issue: a
@@ -4064,7 +4067,7 @@ function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
   return out
 }
 function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
-  if (tolower(unit) !~ /(^|[ \t([{<"\047`*_,;:>])(close[sd]?|fix(e[sd])?|resolve[sd]?)([ \t)\]}>"\047`*_,;:.!?]|$)/) return
+  if (tolower(unit) !~ /(^|[ \t([{<"\047`*,;:>])(close[sd]?|fix(e[sd])?|resolve[sd]?)([ \t)\]}>"\047`*,;:.!?]|$)/) return
   refs = refs_of(unit, repo)
   if (refs == "") return
   cnt = split(refs, parts, " ")
@@ -4072,6 +4075,12 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
   shown = unit
   sub(/^[ \t>*+-]+/, "", shown)
   sub(/[ \t]+$/, "", shown)
+  # The sentence is contributor-controlled text on its way to a terminal. printf stops it being
+  # read as a format string; it does not stop an ESC or a carriage return from erasing or
+  # rewriting the warning it appears in, and this warning is the whole product of the scan
+  # (review round 13). Control bytes are replaced before the line is built; they would also
+  # collide with the separators this filter uses.
+  gsub(/[\001-\010\013-\037\177]/, "?", shown)
   if (length(shown) > 200) shown = substr(shown, 1, 197) "..."
   cls = quoted ? "quoted" : "sentence"
   print cls "\t" cnt "\t" refs "\t" shown
@@ -4214,6 +4223,11 @@ MULTI_CLOSE_HAVE=""
 # no finding -- so the re-scan confirmed the merge closed what it had listed while it was about to
 # close one more (review round 7). The findings are what is PRINTED; the body is what is compared.
 MULTI_CLOSE_BODY=""
+# Whether the last scan's findings included a SENTENCE one. The re-scan lines below speak about
+# findings the caller has already read, so they have to speak in the same register: a quoted-only
+# body that is unchanged must not be reported with a WARNING saying the merge closes what it
+# listed, which is the very claim the quoted class was stripped of (review round 13).
+MULTI_CLOSE_STRONG=""
 
 # GitHub applies a body keyword when the PR merges into the repository DEFAULT branch, and not
 # otherwise. A PR landing on a release or staging branch closes nothing, so a warning there names
@@ -4273,6 +4287,7 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
       multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1 no longer targets the default" \
         "branch, so the keywords above bind nothing on this merge."
       MULTI_CLOSE_LAST=""
+      MULTI_CLOSE_STRONG=""
       MULTI_CLOSE_HAVE=""
     fi
     return 0
@@ -4305,8 +4320,13 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
   if [ -n "$again" ] && [ -n "$MULTI_CLOSE_HAVE" ]; then
     if [ "$body" = "$MULTI_CLOSE_BODY" ]; then
       if [ -n "$scan" ]; then
-        multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body is UNCHANGED since the scan" \
-          "above, so the merge closes what it listed."
+        if [ -n "$MULTI_CLOSE_STRONG" ]; then
+          multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body is UNCHANGED since the scan" \
+            "above, so the merge closes what it listed."
+        else
+          multi_close_say "CLOSING-KEYWORD NOTICE: $REPO#$1's body is UNCHANGED since the scan" \
+            "above; the line flagged there is the line that lands."
+        fi
         # An unchanged BODY is not an unchanged answer: the base or the default branch can have
         # moved during the gate, and a lookup that now fails leaves it unknown whether those
         # keywords bind at all. Saying so here is owed, because this line is the last word on a
@@ -4323,19 +4343,30 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
       # was producing a loud retraction of nothing at all, immediately before an ordinary merge
       # (review round 11); the saved body is updated silently instead.
       if [ -n "$MULTI_CLOSE_LAST" ]; then
-        multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1's body was edited since the" \
-          "scan above and now binds no keyword to more than it names."
+        if [ -n "$MULTI_CLOSE_STRONG" ]; then
+          multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1's body was edited since" \
+            "the scan above and now binds no keyword to more than it names."
+        else
+          multi_close_say "CLOSING-KEYWORD NOTICE WITHDRAWN: $REPO#$1's body was edited since the" \
+            "scan above and no longer carries a keyword in what reads as an example."
+        fi
       fi
       MULTI_CLOSE_LAST=""
+      MULTI_CLOSE_STRONG=""
       MULTI_CLOSE_BODY="$body"
       return 0
     fi
     multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body was EDITED since the scan above;" \
       "what this merge closes is below, not there."
   fi
+  local n_sentence n_quoted
+  n_sentence=$(grep -c "^sentence$(printf '\t')" <<<"$scan") || n_sentence=0
+  n_quoted=$(grep -c "^quoted$(printf '\t')" <<<"$scan") || n_quoted=0
   MULTI_CLOSE_LAST="$scan"
   MULTI_CLOSE_BODY="$body"
   MULTI_CLOSE_HAVE=1
+  MULTI_CLOSE_STRONG=""
+  [ "$n_sentence" -eq 0 ] || MULTI_CLOSE_STRONG=1
   [ -n "$scan" ] || return 0
   # The two classes make DIFFERENT claims, and only one of them rests on the block classifier.
   #
@@ -4350,9 +4381,6 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
   # closes and no longer offers to reopen an issue: it flags a line to look at, which is a claim
   # the classifier can support even when it is wrong. That is what stops a parsing corner from
   # producing a false statement about what a merge did (review round 12).
-  local n_sentence n_quoted
-  n_sentence=$(grep -c "^sentence$(printf '\t')" <<<"$scan") || n_sentence=0
-  n_quoted=$(grep -c "^quoted$(printf '\t')" <<<"$scan") || n_quoted=0
   # The body is data from the PR, so every line of it is written through printf and never echoed.
   while IFS=$'\t' read -r class cnt refs sent; do
     [ -n "$class" ] || continue
