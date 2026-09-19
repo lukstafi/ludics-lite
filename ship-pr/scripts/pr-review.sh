@@ -4328,10 +4328,16 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
         multi_close_say "CLOSING-KEYWORD NOTICE WITHDRAWN: $REPO#$1 no longer targets the default" \
           "branch, so the keyword flagged above binds nothing on this merge."
       fi
-      MULTI_CLOSE_LAST=""
-      MULTI_CLOSE_STRONG=""
-      MULTI_CLOSE_HAVE=""
     fi
+    # The body is NOT read on this path, so whatever an earlier scan established is stale from here
+    # on -- including a CLEAN earlier scan, which leaves no withdrawal to print and used to leave
+    # the status standing, so the deferred-merge note claimed a scan had spoken for the body as it
+    # is now (review round 17). The withdrawal message is gated on there having been a finding; the
+    # status is cleared either way.
+    MULTI_CLOSE_LAST=""
+    MULTI_CLOSE_STRONG=""
+    MULTI_CLOSE_BODY=""
+    MULTI_CLOSE_HAVE=""
     return 0
   fi
   body=$(gh_retry read api "repos/$REPO/pulls/$1" --jq '.body // ""')

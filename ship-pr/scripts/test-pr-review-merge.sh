@@ -1318,6 +1318,25 @@ test_the_deferred_merge_note_does_not_claim_an_unread_scan() {
   assert_contains "$MERGE_OUTPUT" "spoke for the body as it is NOW" "a read body keeps the claim"
 }
 
+# Review round 17, P2. The no-bind path returns without reading the body, so an earlier scan's
+# status is stale from there on -- including a CLEAN earlier scan, which leaves no withdrawal to
+# print and so used to slip past the clearing, after which the deferred-merge note claimed a scan
+# had spoken for the body as it is now.
+test_a_retarget_skip_clears_a_clean_earlier_scan() {
+  reset
+  PR_BODY='Nothing to close here.
+'
+  PR_BASE=main
+  BASE_LATER=release-1.2
+  MERGE_STATE="merged=false state=OPEN"
+  run_merge
+  assert_eq "$MERGE_RC" 1 "a deferred merge is exit 1"
+  assert_contains "$MERGE_OUTPUT" "scan did NOT read the body for this attempt" \
+    "the skipped authoritative scan leaves no claim standing"
+  assert_not_contains "$MERGE_OUTPUT" "spoke for the body as it is NOW" \
+    "the lead-time scan does not speak for the landing body"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -1386,6 +1405,7 @@ tests=(
   test_an_indented_delimiter_inside_a_fence_is_content
   test_a_keyword_inside_a_url_path_is_not_a_directive
   test_the_deferred_merge_note_does_not_claim_an_unread_scan
+  test_a_retarget_skip_clears_a_clean_earlier_scan
 )
 
 run_tests "${tests[@]}"
