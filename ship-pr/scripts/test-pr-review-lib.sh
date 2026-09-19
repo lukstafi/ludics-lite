@@ -455,6 +455,15 @@ gh_fixture_answer() {
 # appends of one short line are atomic where a read-modify-write is not, and the fixture runs in
 # whatever order gh_retry and the shell fork it, so a rewritten total could lose a call.
 #
+# EVERY filesystem step in both helpers is `|| bail`: the mkdir, the append, the count, and each
+# removal. A count runs inside a command substitution, which does not inherit errexit, so a step
+# whose status is dropped there answers with a stale or empty total under a clean status — and a
+# caller's `reads=$(fixture_call_count x) || return 1` then sees nothing wrong. `bail` exits the
+# substitution's shell with 1, which is what that caller's `||` catches; from a reset, called at
+# the top of a case, it ends the suite, which is what a reset that left stale counters deserves
+# (review rounds 1 and 2 of ludics-lite#301 found two of these one at a time; the rule closes
+# the class).
+#
 # A name is ONE path component, and a plain one: it is joined to the directory as a filename, so
 # `../victim` would count — and `fixture_call_reset ../victim` would remove — a file outside the
 # root the EXIT trap owns. Refused by shape rather than resolved: a slash either way, `.` and
@@ -467,14 +476,15 @@ fixture_call_name_ok() {
 }
 
 fixture_call_count() {
-  local dir
+  local dir total
   [ $# -eq 1 ] || bail "fixture_call_count: one counter name expected, got $# argument(s): $*"
   fixture_call_name_ok "$1" || bail "fixture_call_count: a counter name is one plain path component, not '$1'"
   [ -n "${TEST_ROOT:-}" ] || bail "fixture_call_count $1: TEST_ROOT is unset — ask test_tmpdir for one before the fixture runs"
   dir="$TEST_ROOT/fixture-calls"
   mkdir -p "$dir" || bail "fixture_call_count $1: cannot create $dir"
-  printf 'x\n' >>"$dir/$1"
-  wc -l <"$dir/$1" | tr -d ' '
+  printf 'x\n' >>"$dir/$1" || bail "fixture_call_count $1: cannot append to $dir/$1"
+  total=$(wc -l <"$dir/$1") || bail "fixture_call_count $1: cannot read $dir/$1"
+  printf '%s\n' "${total// /}"
 }
 
 # fixture_call_reset [<name>...]: the named counters back to zero, or every counter with no name.
@@ -484,14 +494,14 @@ fixture_call_reset() {
   [ -n "${TEST_ROOT:-}" ] || bail "fixture_call_reset: TEST_ROOT is unset — ask test_tmpdir for one before the fixture runs"
   dir="$TEST_ROOT/fixture-calls"
   if [ $# -eq 0 ]; then
-    rm -rf "$dir"
+    rm -rf "$dir" || bail "fixture_call_reset: cannot remove $dir — the next case would count on from this one's total"
     return 0
   fi
   for name in "$@"; do
     fixture_call_name_ok "$name" || bail "fixture_call_reset: a counter name is one plain path component, not '$name'"
   done
   for name in "$@"; do
-    rm -f "$dir/$name"
+    rm -f "$dir/$name" || bail "fixture_call_reset: cannot remove $dir/$name — the next case would count on from this one's total"
   done
 }
 
@@ -1667,6 +1677,26 @@ test_fixture_call_count_survives_a_command_substitution() {
     'test_traversal() { fixture_call_reset ../victim; }' 'run_tests test_traversal'
   assert_eq "$CONTROL_RC" 1 "a traversal reset is refused ($CONTROL_ERR)"
   [ -f "$root/victim" ] || bail "the refusal came after the removal: the planted file is gone"
+  # A step that fails is a failed CALL, never a stale total (round 2): an unwritable counter file
+  # makes the count refuse — through the substitution, which is where the caller reads it — and an
+  # unremovable directory makes the reset refuse instead of leaving the next case to count on.
+  # Skipped where the caller is root, whom permission bits do not stop.
+  if [ "$(id -u)" != 0 ]; then
+    mkdir -p "$root/ro/fixture-calls"
+    printf 'x\n' >"$root/ro/fixture-calls/body"
+    chmod 0444 "$root/ro/fixture-calls/body"
+    control "TEST_ROOT=$(printf '%q' "$root/ro")" \
+      'test_ro() { local n; n=$(fixture_call_count body) || return 1; bail "stale total $n under a clean status"; }' \
+      'run_tests test_ro'
+    assert_eq "$CONTROL_RC" 1 "an append that fails is a failed count ($CONTROL_ERR)"
+    assert_contains "$CONTROL_ERR" "cannot append" "and says so"
+    assert_not_contains "$CONTROL_ERR" "stale total" "the caller's \`|| return 1\` must see the failure"
+    chmod 0555 "$root/ro/fixture-calls"
+    control "TEST_ROOT=$(printf '%q' "$root/ro")" 'test_reset() { fixture_call_reset; }' 'run_tests test_reset'
+    assert_eq "$CONTROL_RC" 1 "a reset that cannot remove the counters refuses ($CONTROL_ERR)"
+    assert_contains "$CONTROL_ERR" "cannot remove" "and says so"
+    chmod -R u+w "$root/ro"
+  fi
 }
 
 test_the_guard_survives_a_path_with_spaces() {
