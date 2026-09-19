@@ -103,13 +103,20 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 #   NOT hold it: the 2026-09-15 sweep's hip unit died 76 s in on an unheld VM that had powered off
 #   18 s after its kick.
 # * Hence `--hold`: `kick-wsl --hold` / `restart-wsl --hold` spawns the holder this script owns —
-#   `ssh -o ServerAliveInterval=15 <box>-win 'wsl.exe -d Ubuntu -e sleep infinity'`, backgrounded
-#   here, its pid under $WAKE_LAB_STATE_DIR — and declares the VM up only once a wsl.exe is
-#   OBSERVED on the Windows side (`tasklist`), because a holder that failed to start is exactly the
-#   state the flag exists to rule out. `unhold <box>` ends it. Never size the holder with a fixed
-#   `sleep N`: a lane is several units with their own caps plus preparation, and a 3-hour holder
-#   expires under the last one — `sleep infinity` killed explicitly is the contract, so a lane ends
-#   by unhold, not by expiry. A holder inside the guest would die with the VM, which is the failure
+#   `ssh -o ServerAliveInterval=15 <box>-win 'wsl.exe -d Ubuntu -e sh -s <token>'`, backgrounded
+#   here with a fifo for its stdin, its record under $WAKE_LAB_STATE_DIR — and declares the VM up
+#   only once that holder has SAID ITS TOKEN BACK from inside the guest, because a holder that
+#   failed to start is exactly the state the flag exists to rule out, and because a wsl.exe in
+#   `tasklist` (what this observed until 2026-09-19) is true of the owner's console shell as well
+#   as of ours. `unhold <box>` ends it, and says what it observed rather than what it intended:
+#   the local client is killed, then the VM is asked whether that guest shell is gone, and if it
+#   is not, it is ended by pid (ludics-lite#192, #184).
+#   The holder is a SHELL READING ITS CHANNEL, which is what makes it end when the channel does:
+#   Windows sshd does not reap the command tree when the client dies, so a holder that never reads
+#   its stdin is orphaned on the Windows side by every single unhold. Never size it with a fixed
+#   `sleep N` either: a lane is several units with their own caps plus preparation, and a 3-hour
+#   holder expires under the last one — a shell waiting for input cannot expire, so a lane ends by
+#   unhold, not by expiry. A holder inside the guest would die with the VM, which is the failure
 #   being fixed. `kick-wsl` re-kicks a box whose Windows side is up, so `kick-wsl --hold` is also
 #   how a lane takes a holder over a VM that is already running. The holder also carries that box's
 #   HOLD LOCK: it inherits the descriptor the lock is held on, so the flock lives exactly as long
@@ -383,21 +390,27 @@ do_status() {
 WAIT_SECONDS=${WAKE_LAB_WAIT_SECONDS:-240}
 WSL_WAIT_SECONDS=${WAKE_LAB_WSL_WAIT_SECONDS:-180}
 DOWN_WAIT_SECONDS=${WAKE_LAB_DOWN_WAIT_SECONDS:-120}
-# How long to wait for the spawned holder to show up as a wsl.exe on the Windows side, and where
-# its pid is recorded so that `unhold` — possibly in a later shell, since a lane is a sequence of
-# commands — can end it.
+# How long to wait for the spawned holder to answer its token from inside the VM, and where its
+# record is kept so that `unhold` — possibly in a later shell, since a lane is a sequence of
+# commands — can end it. It used to be how long to wait for a wsl.exe to appear in `tasklist`,
+# which is not the same question and was answered `true` by processes that were never ours.
 HOLD_WAIT_SECONDS=${WAKE_LAB_HOLD_WAIT_SECONDS:-60}
-# How long our holder must have been alive, counted FROM ITS SPAWN, before the VM is called held.
-# The bound is not arbitrary: it exceeds the holder's own ConnectTimeout (15s), and ssh exits both
-# when it cannot connect and when its remote command ends. A client still alive past that is
-# therefore one that connected AND whose `sleep infinity` is running — which a `tasklist` reading
-# on its own cannot say, since the wsl.exe it sees may be the owner's console shell.
-HOLD_SETTLE_SECONDS=${WAKE_LAB_HOLD_SETTLE_SECONDS:-20}
+# How long, after the local client has been killed, the guest shell is given to notice its channel
+# closed and exit, before `unhold` calls the holder a leak and ends it by pid. EOF crosses a dead
+# TCP connection, a Windows sshd, cmd.exe and wsl.exe before the guest reads it, so this is a grace
+# period and not a probe interval; it bounds only the failing case, since a holder that went at
+# once is observed gone on the first ask.
+HOLD_TEARDOWN_SECONDS=${WAKE_LAB_HOLD_TEARDOWN_SECONDS:-20}
 HOLD_STATE_DIR=${WAKE_LAB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wake-lab}
 # Set when a holder was found already dead at unhold: a lane that lost its box without anyone
 # noticing. It is a FAULT and not a cleanup detail, so it leaves the command non-zero -- see
 # release_hold for why a holder can only be gone by having died under the lane.
 HOLD_ANOMALY=0
+# Set when a holder was still running in the VM after its channel died AND after unhold tried to
+# end it by pid: the box is still pinned by something of ours and no command here can free it. A
+# different fault from the one above and reported as a different exit status, because it says the
+# opposite thing about the lane -- the results are fine, the BOX is not.
+HOLD_LEAK=0
 # The local-time hours on the Windows box that the unattended sweep occupies: the routine's 07:20
 # launch plus its longest lane. Written `<start>-<end>`, end exclusive, and it may wrap midnight.
 SWEEP_HOURS=${WAKE_LAB_SWEEP_HOURS:-7-11}
@@ -748,62 +761,176 @@ KICK_PHASE=""
 KICK_DEST=""   # the Windows alias that carried the last successful kick; the holder rides the same
 
 # ---------------------------------------------------------------- the Windows-side holder
-# A VM is held up by a wsl.exe on the Windows side and by nothing else (see the lore). These three
-# own that process: spawn it, observe it, kill it. The holder is `sleep infinity` on purpose — a
-# lane is several units with their own caps plus preparation and diagnostics outside them, so a
-# holder sized to the expected run expires under the last unit, silently, exactly when nobody is
-# watching. It ends by unhold.
-# One spelling of the holder, used to spawn it and to recognize it again.
-HOLD_CMD='wsl.exe -d Ubuntu -e sleep infinity'
+# A VM is held up by a wsl.exe on the Windows side and by nothing else (see the lore). These own
+# that process: spawn it, prove it is ours, kill it, and prove it is gone.
+#
+# The holder is a SHELL READING ITS COMMANDS FROM THE CHANNEL, and each half of that sentence is
+# there for a measured reason.
+#
+# It READS, so it ends when the channel does. `release_hold` used to reason that "killing the local
+# client closes the channel and sshd ends the command it was running". On Windows OpenSSH that is
+# false: sshd runs the remote command under `cmd.exe` and its session process exits WITHOUT taking
+# its children, so every hold/unhold cycle left an orphaned `cmd.exe` + two `wsl.exe` + a guest
+# `sleep infinity` behind, reparented and unreachable from this side -- measured on both lab boxes
+# on 2026-09-17 (ludics-lite#192). Nothing in the guest noticed either, because `sleep infinity`
+# never touches its stdio and a dead channel produces no EPIPE for a process that never reads. A
+# holder that READS is the portable version of the guarantee the old comment assumed: when the
+# client dies the channel closes, the remote end of that pipe goes to EOF, `sh` runs out of input
+# and exits, and the tree unwinds from the inside, on the far side of the boundary this script
+# cannot reach across. That is why the payload is a shell and not a `sleep`: the holder has to be a
+# process with a reason to notice.
+#
+# It is still UNSIZED -- `sh` waits for input, it does not expire. A lane is several units with
+# their own caps plus preparation and diagnostics outside them, so a holder sized to the expected
+# run expires under the last unit, silently, exactly when nobody is watching. It ends by `unhold`,
+# or with its channel, and by nothing else.
+#
+# And it IDENTIFIES itself, which is what lets everything below claim something about OUR holder
+# rather than about the box. `sh -s <token>` puts a token this run generated into `$1` in the guest
+# and into the command line on all three sides (the local ssh client, the Windows-side wsl.exe, the
+# guest shell), and the handshake asks the holder to say it back down its own stdout along with its
+# guest pid. Before this there was no identity at all: the observation read `tasklist` and counted
+# ANY wsl.exe, which on both lab boxes was already true with nothing of ours running -- the Codex
+# app-server's own console wsl.exe -- so that half of the handshake certified nothing and the whole
+# claim rested on the local ssh client still being connected (ludics-lite#184 (a), measured in
+# #155's acceptance run). A token that came back through the VM is the opposite kind of evidence:
+# it cannot be true unless our command is running in that guest.
+#
+# Nothing in the payload quotes, and that is the other half of the design. It reaches the guest
+# through `cmd.exe /c` and then through `wsl.exe`, both of which parse Windows-style: cmd.exe's /c
+# strips the outer quotes only under a rule that counts quote characters, and wsl.exe's own argv
+# splitting has never heard of single quotes. `sh -c "echo <token>; exec sleep infinity"` -- the
+# shape ludics-lite#184 (a) proposed -- has to survive both hops with its quoting intact, and #155
+# confirmed the hops are real by reading the holder's Windows command line. Reading the script off
+# stdin instead makes the payload `wsl.exe -d Ubuntu -e sh -s <token>`: one space-separated list of
+# bare words, the same quoting profile as the `sleep infinity` it replaces, with the interesting
+# part travelling as DATA inside the channel, where no Windows parser looks at it.
+HOLD_PAYLOAD='wsl.exe -d Ubuntu -e sh -s'
+# The holder every version before this one spawned. A hold outlives the shell that took it -- a
+# lane is a sequence of commands and this script is updated between them -- so an `unhold` from the
+# new script can meet a record the old one wrote. That holder has no token, cannot be handshaken
+# and does not read its stdin; it is recognized, ended and reported as what it is, rather than read
+# as a stale record naming somebody else's process.
+HOLD_CMD_LEGACY='wsl.exe -d Ubuntu -e sleep infinity'
 
-# The record is "<pid> <destination> <spawn epoch> <lock sidecar pid>". The destination is part of
-# the holder's identity (every box's holder runs the same payload), the epoch is how a LATER
-# invocation that reuses this holder knows whether it is past its settle, and the sidecar is the
-# process that keeps the box's HOLD lock open for as long as the holder lives (see hold_wsl).
-hold_pid_read() { # hold_pid_read <pidfile> — echo "<pid> <dest> <epoch> <sidecar>", fail if unusable
-  local line p d t sc
+# The channel the holder reads and the file its stdout lands in. Both live beside the record, are
+# named after the box, and are removed by the release that ends the holder.
+# The fifo is mode 600 on purpose: anything that can write to it runs shell commands inside that
+# VM, which is a narrower door than the state directory's own, and worth keeping shut.
+hold_fifo_path() { printf '%s\n' "$HOLD_STATE_DIR/hold-$1.in"; }
+hold_out_path()  { printf '%s\n' "$HOLD_STATE_DIR/hold-$1.out"; }
+
+# The record is "<pid> <dest> <epoch> <sidecar> <token> <guest pid> <protected>". The destination is
+# part of the holder's identity and is the alias every later observation of THIS holder goes out
+# on; the epoch is when it was spawned; the sidecar is the process that keeps the box's HOLD lock
+# open for as long as the holder lives (see hold_wsl); the token is this lane's identity, the thing
+# that makes "our holder" a decidable question on both sides of the channel; the guest pid is the
+# shell the handshake found in the VM, which is what `unhold` looks for afterwards; and the last
+# field says whether this holder ever carried the hold lock -- a `--force` holder did not, so the
+# box was never protected from another session's `restart-wsl` while it ran, and a release that
+# stayed silent about that would let a lane believe in an interlock it never had (#184 (b)).
+# A record written before those three fields existed is a legacy record: it reads with token "-",
+# guest pid 0 and protection "unknown", which every caller here handles as the holder it is.
+hold_pid_read() { # hold_pid_read <pidfile> — echo the seven fields, fail if unusable
+  local line p d t sc tok gp prot
   [ -r "$1" ] || return 1
   line=$(cat "$1" 2>/dev/null)
-  read -r p d t sc <<<"$line"
+  read -r p d t sc tok gp prot <<<"$line"
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
   [ -n "$d" ] && [ "$d" != "$p" ] || return 1
   case "$t" in ''|*[!0-9]*) t=0 ;; esac
   case "$sc" in ''|*[!0-9]*) sc=0 ;; esac
-  printf '%s %s %s %s\n' "$p" "$d" "$t" "$sc"
+  # A token is bare word characters by construction (it is spelled into a Windows command line and
+  # then into a grep pattern); anything else in that field is a record this script did not write,
+  # and it is read as the legacy shape rather than trusted into either use.
+  case "$tok" in ''|*[!A-Za-z0-9-]*) tok='-' ;; esac
+  case "$gp" in ''|*[!0-9]*) gp=0 ;; esac
+  case "$prot" in protected|unprotected) ;; *) prot=unknown ;; esac
+  printf '%s %s %s %s %s %s %s\n' "$p" "$d" "$t" "$sc" "$tok" "$gp" "$prot"
 }
 
 hold_pid_live() { # hold_pid_live <pidfile> — is the recorded holder still OUR holder, still running
-  local rec p d t sc
+  local rec p d t sc tok gp prot
   rec=$(hold_pid_read "$1") || return 1
-  read -r p d t sc <<<"$rec"; : "$t" "$sc"
+  read -r p d t sc tok gp prot <<<"$rec"; : "$t" "$sc" "$gp" "$prot"
   kill -0 "$p" 2>/dev/null || return 1
   # A zombie answers `kill -0` and, on Linux, still prints its old command line — so an exited
   # holder whose parent has not reaped it would read as live.
   case "$(ps -o state= -p "$p" 2>/dev/null)" in *Z*) return 1 ;; esac
   # Pids are reused, and this file outlives the shell that wrote it — so an `unhold` run tomorrow
   # over a stale file must never kill whatever inherited the number. The signature is the holder's
-  # whole command line INCLUDING its destination: every box's holder runs the same payload, so a
-  # signature without the alias would let one box's stale file kill another box's live holder and
-  # drop that lane.
+  # whole command line INCLUDING its destination and its token: a signature without the alias would
+  # let one box's stale file kill another box's live holder, and one without the token would let a
+  # stale file kill the holder of another LANE on the same box, which is the same accident one
+  # level down (#184 (b)). A legacy holder has no token to match, so it is matched on the payload
+  # every version before this one used — the most that record supports.
   # -ww: macOS ps truncates args to the output width otherwise, and this command line is long —
   # a truncated one matches nothing, and every live holder would read as somebody else's process.
-  ps -ww -o args= -p "$p" 2>/dev/null | grep -q -- "$d $HOLD_CMD"
+  if [ "$tok" = '-' ]; then
+    ps -ww -o args= -p "$p" 2>/dev/null | grep -q -- "$d $HOLD_CMD_LEGACY"
+  else
+    ps -ww -o args= -p "$p" 2>/dev/null | grep -q -- "$d $HOLD_PAYLOAD $tok"
+  fi
 }
 
-win_holder_seen() { # win_holder_seen <windows-alias> — true iff a wsl.exe runs on the Windows side
-  # `tasklist` answers a filter that matches nothing with "INFO: No tasks are running which match
-  # ...", so the image name in the output IS the signal. Any wsl.exe counts: the claim being made
-  # is that something on the Windows side holds the VM, and the owner's console shell holds it
-  # every bit as well as ours. Local `kill -0` on our own pid is not that claim — an ssh client
-  # can outlive the command it ran.
-  # Capped like every other remote command here: ConnectTimeout bounds the connect, not the
-  # remote command, and an accepted session whose `tasklist` never returns would stop the hold's
-  # own deadline from advancing — the 2026-09-16 wedge, reintroduced behind a new probe. A cap
-  # that fires is simply "not observed this round"; the loop asks again until HOLD_WAIT_SECONDS.
+# The handshake: ask the holder, down its own channel, to say who it is. It answers with its token
+# and its guest pid, so a round trip proves three things at once that no local check can — the
+# channel is open, OUR command is the one running on the far side of it, and it is running IN that
+# VM. The nonce is what makes it a fresh answer rather than a line the holder printed an hour ago:
+# the reply has to carry the nonce THIS call just sent.
+hold_handshake() { # hold_handshake <box> <token> <seconds> — echo the holder's guest pid
+  local name=$1 tok=$2 secs=$3 fifo out nonce gp deadline
+  fifo=$(hold_fifo_path "$name"); out=$(hold_out_path "$name")
+  [ -p "$fifo" ] && [ -r "$out" ] || return 1
+  nonce=n$$x${RANDOM:-0}x$(date +%s)
+  # `<>` and not `>`: opening a fifo for writing ALONE blocks until a reader turns up, and a holder
+  # that has died is precisely the case this has to answer rather than hang in. Read-write never
+  # blocks, reader or no reader, so a dead holder produces silence and a timeout — a negative
+  # answer, reached in bounded time. Descriptor 3 is below LOCK_FD_BASE, so it can never be a lock's.
+  exec 3<>"$fifo" || return 1
+  # Single-quoted: `$1` and `$$` are for the guest shell to expand, not this one.
+  printf 'echo $1 $$ %s\n' "$nonce" >&3 2>/dev/null
+  exec 3>&-
+  deadline=$((SECONDS + secs))
+  while :; do
+    # Fields, not a substring: a reply is our token in the FIRST field and this call's nonce in the
+    # third, so neither a token that appears inside some other text nor an earlier handshake's line
+    # can be read as this one's answer.
+    gp=$(awk -v t="$tok" -v n="$nonce" '$1 == t && $3 == n { print $2; exit }' "$out" 2>/dev/null)
+    case "$gp" in ''|*[!0-9]*) ;; *) printf '%s\n' "$gp"; return 0 ;; esac
+    [ "$SECONDS" -ge "$deadline" ] && return 1
+    sleep 1
+  done
+}
+
+# Is the holder's guest shell gone from the VM? Asked over the holder's OWN recorded alias, after
+# the local client has been killed, because #192 is exactly the case where the local half of the
+# teardown is complete and the remote half is not. rc 0 gone, 1 still there, 2 could not tell.
+#
+# Neither probe can START anything. `wsl.exe -e <cmd>` BOOTS a stopped distro, so asking the guest
+# first would let an `unhold` bring up the VM it just released; the running-distro question is
+# asked first and answers the whole thing when the distro is down — a guest shell cannot outlive
+# the guest. Both read their answer out of the OUTPUT and not out of the exit status, because ssh
+# hands back the remote command's status and `wsl --list --running` with nothing running, `ps` with
+# no such pid, and an ssh that never connected are all "non-zero" — only the output tells them
+# apart. Silence is therefore never read as good news: it is rc 2, and the caller says so.
+hold_remote_gone() { # hold_remote_gone <windows-alias> <guest pid> <token>
   local out
   out=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" \
-        'tasklist /FI "IMAGENAME eq wsl.exe" /NH' 2>/dev/null) || return 1
-  printf '%s' "$out" | tr -d '\r' | grep -qi 'wsl[.]exe'
+        'wsl.exe --list --running' 2>/dev/null)
+  # wsl.exe writes UTF-16LE, which arrives here as NUL-interleaved bytes.
+  out=$(printf '%s' "$out" | tr -d '\000\r')
+  [ -n "$out" ] || return 2
+  printf '%s\n' "$out" | grep -qi '^Ubuntu' || return 0
+  # `-o args` and not `args=`: the header is printed whether or not the pid exists, so a non-empty
+  # reply is proof the probe RAN in the guest, which is what separates "no such process" from "no
+  # answer". No `=` or `,` reaches cmd.exe either, both of which it treats as argument delimiters.
+  out=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" \
+        "wsl.exe -d Ubuntu -e ps -o args -p $2" 2>/dev/null)
+  out=$(printf '%s' "$out" | tr -d '\r')
+  [ -n "$out" ] || return 2
+  printf '%s\n' "$out" | grep -q -- "$3" && return 1
+  return 0
 }
 
 # A VM this run started fresh and then could not hold is worse than no VM: the sweep's lanes probe
@@ -839,8 +966,9 @@ shutdown_unheld_vm() { # shutdown_unheld_vm <box> <windows-alias> — rc 0 only 
 # slot, for the reason spelled out beside LOCK_FD_BASE.
 LANE_FD=8
 HOLD_FD=9      # the descriptor the box's HOLD lock lives on; the holder inherits exactly this one
-hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait until Windows shows one
-  local name=$1 dest=$2 pid f deadline rec spawn_epoch spawned=0 sidecar=0 now own theirs _
+hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it is ours, in that VM
+  local name=$1 dest=$2 pid f fifo out token spawn_epoch spawned=0 sidecar=0 gp prot=protected
+  local rec rp rd rt rsc rtok rgp rprot own theirs
   # The box's HOLD lock — "do not destroy this VM" — and the holder is what carries it. A restart
   # path already holds it on HOLD_FD (its reservation took both of that box's locks before the
   # kick, and set HOLD_LOCKED to say so); a plain `kick-wsl --hold` does not, so it takes it here,
@@ -852,148 +980,184 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
   # What it deliberately does NOT take is the LANE lock: a sweep lane on this very box — the one
   # the holder exists to serve — must be able to reserve it (ludics-lite#224).
   f=$HOLD_STATE_DIR/hold-$name.pid
+  fifo=$(hold_fifo_path "$name"); out=$(hold_out_path "$name")
   mkdir -p "$HOLD_STATE_DIR" 2>/dev/null
   if hold_pid_live "$f"; then
     # Reuse: the live holder already carries this box's lock, and taking it again from here would
-    # fail against our own holder.
-    rec=$(hold_pid_read "$f"); read -r pid _ spawn_epoch _ <<<"$rec"
-    # A clock corrected backwards would leave an epoch in the future and park the settle loop
-    # there for as long as the correction; a holder cannot have been spawned after now.
-    now=$(date +%s); [ "$spawn_epoch" -gt "$now" ] && spawn_epoch=$now
-    echo "  wsl holder already running for $name (pid $pid)"
-  else
-    if [ "${HOLD_LOCKED:-0}" != 1 ] &&
-       ! lock_take_fd "$(hold_lock_path "$name")" "--hold" "$HOLD_FD"; then
-      if [ "$FORCE" = 1 ]; then
-        echo "  wsl holder on $name proceeds WITHOUT the hold lock (--force): $(lock_holder "$(hold_lock_path "$name")")"
-      else
-        echo "  wsl holder NOT started on $name: $(lock_holder "$(hold_lock_path "$name")") — that box's VM is already spoken for; wait for the holder, or --force"
+    # fail against our own holder. Everything this branch says about it is said over the alias the
+    # RECORD names, never the one this invocation happens to be kicking on: the holder's channel
+    # is the holder's channel, and an observation sent down some other alias would be evidence
+    # about a different connection to the same box (#184 (b)).
+    rec=$(hold_pid_read "$f"); read -r rp rd rt rsc rtok rgp rprot <<<"$rec"; : "$rt"; : "$rsc"
+    echo "  wsl holder already running for $name (pid $rp, via $rd)"
+    [ "$rprot" = unprotected ] &&
+      echo "    ...taken with --force: it never held $name's hold lock, so the VM is NOT protected from another session's restart-wsl"
+    if [ "$rtok" = '-' ]; then
+      # A holder from before the handshake. It is running and it is recognizably the old payload,
+      # but it does not read its stdin and carries no token, so there is no way to ask it anything
+      # and no way to end its Windows-side tree cleanly (ludics-lite#192). Saying "held" here
+      # would be the unobserved claim this whole change is about, so it says what it has instead.
+      echo "  wsl holder for $name predates the token handshake: it cannot be asked to prove it is"
+      echo "    still holding that VM, and its tree will outlive its channel. End it with"
+      echo "    'wake-lab.sh unhold $name' and take the hold again."
+      return 1
+    fi
+    if gp=$(hold_handshake "$name" "$rtok" "$HOLD_WAIT_SECONDS"); then
+      if [ "$rgp" != 0 ] && [ "$gp" != "$rgp" ]; then
+        # Only the holder recorded here knows this token, so a DIFFERENT guest pid answering with
+        # it is a record that no longer describes what is running. Refuse rather than adopt it.
+        echo "  ANOMALY: the holder for $name answers its token from guest pid $gp, not the recorded $rgp; the record does not describe what is running"
         return 1
       fi
+      echo "  wsl holder observed on $name (guest shell $gp answered its token over $rd)"
+      return 0
     fi
-    # An EMPTY record is another run's claim, between its noclobber create and its pid write —
-    # removing it as stale would let both runs spawn a holder with only one pid recorded, which is
-    # the race this claim exists to prevent. Only an empty claim old enough to be abandoned (its
-    # creator died in that one fork) is cleared; a record with a pid in it has already been judged
-    # by hold_pid_live above.
-    if [ -e "$f" ] && [ ! -s "$f" ] && [ -z "$(find "$f" -mmin +1 2>/dev/null)" ]; then
-      echo "  wsl holder for $name is being created by another run ($f is claimed); nothing was started"
-      return 1
-    fi
-    # Claim the record BEFORE spawning, with noclobber. Two `--hold` runs for one box would
-    # otherwise both spawn a holder and the second write would erase the first pid, leaving a
-    # holder nobody can unhold and a VM pinned until the box reboots.
-    # ...and a marker from some earlier release goes with it: left in place it would mask the loss
-    # of the holder about to be spawned, which is the one thing this reporting exists to catch.
-    rm -f "$f" "${f%.pid}.releasing" 2>/dev/null
-    if ! ( set -C; : > "$f" ) 2>/dev/null; then
-      if [ -e "$f" ]; then
-        echo "  wsl holder for $name is already being created by another run ($f is claimed); nothing was started"
-      else
-        echo "  wsl holder on $name could NOT be recorded at $f; nothing was started"
-      fi
-      return 1
-    fi
-    # NOT capped, and that is deliberate: every other remote command here is a finite probe, and
-    # this one is meant to run until `unhold` kills it. A cap on the holder would be a timer on
-    # the lane — the sized `sleep N` this design exists to avoid, wearing a different hat.
-    # `-n` and </dev/null: an ssh backgrounded from a terminal otherwise reads the caller's stdin
-    # and can be stopped by SIGTTIN — and a STOPPED holder answers `kill -0` exactly like a live
-    # one, so the lane would believe in a holder that is not running.
-    #
-    # `8>&-` — LANE_FD, spelled as the literal bash 3.2 requires in a redirection — is the whole
-    # reason a held box can still be swept. This runs inside start_wsl's per-box subshell on the
-    # restart path, and that subshell holds the box's LANE lock for the length of the restart; a
-    # holder that inherited it would carry it for the life of the lane instead, and the sweep that
-    # holder exists to serve would then wait out its LAB_LOCK_WAIT against it and skip every unit
-    # on that box (ludics-lite#224). Only the HOLD lock may travel to the holder. The rule for
-    # anything added here later: a LONG-LIVED child of this function closes fd 8 and keeps fd 9.
-    ssh -n -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-        "$dest" "$HOLD_CMD" >/dev/null 2>&1 </dev/null 8>&- &
-    pid=$!
-    # The lock must not depend on what the ssh client does with descriptors it inherited: OpenSSH
-    # may close everything above stderr at startup, and then nothing would hold the flock once
-    # this subshell exits. So a sidecar process holds the hold lock instead — it inherits the very
-    # descriptor the flock lives on, so there is no window in which the VM is unprotected — and it
-    # exits as soon as the holder does, by `unhold` or otherwise, taking the lock with it.
-    #
-    # It is an EXEC'd process, not a brace group: a forked bash keeps every descriptor bash holds
-    # internally, including its copy of a caller's pipe, and a background child holding that pipe
-    # hangs `wake-lab.sh kick-wsl --hold rog | tee log` — or any caller reading the command's
-    # output — for the whole life of the lane. Those descriptors are close-on-exec, so exec'ing
-    # anything sheds them; HOLD_FD — opened by the take above, or by the reservation this subshell
-    # inherited it from — is not, so the lock survives. perl is already the lab lock's own
-    # dependency.
-    # `8>&-` for the same reason as the holder above, and it matters more here: this process
-    # exists to keep a descriptor alive, so an inherited lane lock would be kept alive exactly as
-    # deliberately as the hold lock it is for.
-    perl -e 'my $tag = "wake-lab-hold-lock"; my $p = shift; while (kill 0, $p) { sleep 1 }' \
-      "$pid" >/dev/null 2>&1 </dev/null 8>&- &
-    sidecar=$!
-    spawn_epoch=$(date +%s); spawned=1
-    # An unrecordable holder is a leaked one: nothing would ever unhold it. Kill it rather than
-    # leave it running unowned.
-    if ! printf '%s %s %s %s\n' "$pid" "$dest" "$spawn_epoch" "$sidecar" > "$f" 2>/dev/null; then
-      kill "$pid" "$sidecar" 2>/dev/null
-      rm -f "$f" 2>/dev/null
-      echo "  wsl holder on $name could NOT be recorded at $f — holder (pid $pid) killed rather than leaked"
-      return 1
-    fi
-    # The lock this holder now carries says whatever the take that opened the descriptor said, and
-    # on the restart path that is `wake-lab restart` with the restarter's pid — a line that outlives
-    # the restart by the whole length of the lane and names a process that has already exited, in
-    # every refusal message here and in every `skip (box ... reserved by ...)` the sweep publishes.
-    # So relabel it for the holder that is actually there.
-    lock_label "$(hold_lock_path "$name")" "--hold" "$pid"
-    echo "  wsl holder started on $name (via $dest, pid $pid)"
-    # Between `&` and the exec, the child is still a copy of THIS shell and its command line does
-    # not carry the holder's signature yet — so a signature check run straight away can read a
-    # perfectly good holder as dead, tear the record down, and leave the child to exec into an
-    # infinite holder nobody records. Give the fork a bounded moment to become the ssh.
-    for _ in 1 2 3 4 5; do
-      hold_pid_live "$f" && break
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 1
-    done
+    echo "  wsl holder for $name (pid $rp) did not answer its token within ${HOLD_WAIT_SECONDS}s"
+    echo "    over $rd: the client is alive, so this is not a holder that exited — but nothing"
+    echo "    proves it still holds that VM. It belongs to an earlier run and is left running and"
+    echo "    recorded; end it with 'wake-lab.sh unhold $name' if this lane needs the box."
+    return 1
   fi
-  # Both halves, in this order. The local pid alone is not the claim: an ssh client can outlive
-  # the command it ran, and `tasklist` is what says a wsl.exe is really there. A wsl.exe alone is
-  # not it either: the owner's console shell is one, and it would certify a holder of ours that
-  # never started — with a log-off or an update restart then taking away the only thing holding
-  # the VM. A holder whose ssh has already died cannot start being seen later, so that ends the
-  # wait rather than burning the budget.
-  deadline=$((SECONDS + HOLD_WAIT_SECONDS))
-  while hold_pid_live "$f"; do
-    if win_holder_seen "$dest"; then
-      # ...and our own holder still connected, at least HOLD_SETTLE_SECONDS after it was SPAWNED —
-      # past its ConnectTimeout, so it is not one still negotiating beside somebody else's
-      # wsl.exe, and not one whose remote command has already ended (ssh would have exited). The
-      # bound is on the holder's age, not on this invocation's, so a run that REUSES a holder
-      # another run started a second ago waits out the rest of that holder's settle too.
-      while [ $(( $(date +%s) - spawn_epoch )) -lt "$HOLD_SETTLE_SECONDS" ]; do
-        # The settle waits on the holder, so it ends when the holder does — and never outlives the
-        # step's own deadline, whatever the recorded epoch says.
-        hold_pid_live "$f" || break
-        [ "$SECONDS" -ge "$deadline" ] && break
-        sleep 1
-      done
-      # The settle must have been SERVED, not merely attempted: the loop above also ends on the
-      # step's deadline, and a settle cut short by it is a holder that has not shown it outlived
-      # its own ConnectTimeout. Reporting that as observed would be the claim this whole check
-      # exists to make, made without the evidence.
-      if [ $(( $(date +%s) - spawn_epoch )) -ge "$HOLD_SETTLE_SECONDS" ] && hold_pid_live "$f"; then
-        echo "  wsl holder observed on $name (wsl.exe on the Windows side, holder connected past its ${HOLD_SETTLE_SECONDS}s settle)"
-        return 0
-      fi
-      break
+  if [ "${HOLD_LOCKED:-0}" != 1 ] &&
+     ! lock_take_fd "$(hold_lock_path "$name")" "--hold" "$HOLD_FD"; then
+    if [ "$FORCE" = 1 ]; then
+      # Recorded, not just printed: the line below scrolls past, while the record is what `unhold`
+      # reads at the end of the lane -- and "this box was never protected" is exactly what a lane
+      # whose results depend on the VM surviving needs told, however long afterwards (#184 (b)).
+      prot=unprotected
+      echo "  wsl holder on $name proceeds WITHOUT the hold lock (--force): $(lock_holder "$(hold_lock_path "$name")")"
+    else
+      echo "  wsl holder NOT started on $name: $(lock_holder "$(hold_lock_path "$name")") — that box's VM is already spoken for; wait for the holder, or --force"
+      return 1
     fi
-    [ "$SECONDS" -ge "$deadline" ] && break
-    sleep 5
-  done
-  # Only a holder THIS call spawned is cleaned up. One we merely reused belongs to an earlier
-  # invocation that may still be protecting a running lane, and killing it over a failed probe of
-  # ours would unhold that lane's VM — the failure this whole flag exists to prevent, caused by a
-  # retry.
+  fi
+  # An EMPTY record is another run's claim, between its noclobber create and its pid write —
+  # removing it as stale would let both runs spawn a holder with only one pid recorded, which is
+  # the race this claim exists to prevent. Only an empty claim old enough to be abandoned (its
+  # creator died in that one fork) is cleared; a record with a pid in it has already been judged
+  # by hold_pid_live above.
+  if [ -e "$f" ] && [ ! -s "$f" ] && [ -z "$(find "$f" -mmin +1 2>/dev/null)" ]; then
+    echo "  wsl holder for $name is being created by another run ($f is claimed); nothing was started"
+    return 1
+  fi
+  # Claim the record BEFORE spawning, with noclobber. Two `--hold` runs for one box would
+  # otherwise both spawn a holder and the second write would erase the first pid, leaving a
+  # holder nobody can unhold and a VM pinned until the box reboots.
+  # ...and a marker from some earlier release goes with it: left in place it would mask the loss
+  # of the holder about to be spawned, which is the one thing this reporting exists to catch.
+  rm -f "$f" "${f%.pid}.releasing" 2>/dev/null
+  if ! ( set -C; : > "$f" ) 2>/dev/null; then
+    if [ -e "$f" ]; then
+      echo "  wsl holder for $name is already being created by another run ($f is claimed); nothing was started"
+    else
+      echo "  wsl holder on $name could NOT be recorded at $f; nothing was started"
+    fi
+    return 1
+  fi
+  # This lane's identity, and the only thing about the holder that is not the same on every box and
+  # in every run. Bare word characters: it is spelled into a Windows command line, into the guest's
+  # argv, and into a grep pattern over `ps` output, and it must mean the same thing in all three.
+  token=wlh-$$-$(date +%s)-${RANDOM:-0}
+  # The channel. It is a fifo and not a pipe because a pipe cannot be reopened, and the handshake
+  # -- including a LATER invocation's handshake against this same holder -- has to be able to write
+  # to the holder's stdin again long after this shell is gone.
+  rm -f "$fifo" "$out" 2>/dev/null
+  if ! mkfifo -m 600 "$fifo" 2>/dev/null || ! : > "$out" 2>/dev/null; then
+    echo "  wsl holder on $name could NOT be given a channel at $fifo; nothing was started"
+    rm -f "$f" "$fifo" "$out" 2>/dev/null
+    return 1
+  fi
+  # READ-WRITE, and that is the whole teardown contract on this side. The holder must not see EOF
+  # while its client lives -- an ssh whose stdin is already at EOF (`-n`, or `</dev/null`, which is
+  # what this used to pass) makes the remote shell exit the moment it starts. Opening the fifo
+  # `<>` gives the descriptor a writer of its own, so it never reaches EOF while it is open, and
+  # the holder inherits THAT descriptor as its stdin: the only thing that can end it is the channel
+  # closing, which is what happens when the client dies, by `unhold` or otherwise. Descriptor 3 is
+  # below LOCK_FD_BASE and cannot collide with a lock's.
+  # `-n` is gone with it. It was there so that a backgrounded ssh reading the caller's terminal
+  # could not be stopped by SIGTTIN -- and a STOPPED holder answers `kill -0` exactly like a live
+  # one. A fifo is not a terminal, so there is no SIGTTIN to take; what replaces `-n` is that this
+  # holder's stdin is never the caller's.
+  if ! exec 3<>"$fifo"; then
+    echo "  wsl holder on $name could NOT open its channel at $fifo; nothing was started"
+    rm -f "$f" "$fifo" "$out" 2>/dev/null
+    return 1
+  fi
+  # NOT capped, and that is deliberate: every other remote command here is a finite probe, and
+  # this one is meant to run until `unhold` kills it. A cap on the holder would be a timer on
+  # the lane — the sized `sleep N` this design exists to avoid, wearing a different hat.
+  #
+  # `8>&-` — LANE_FD, spelled as the literal bash 3.2 requires in a redirection — is the whole
+  # reason a held box can still be swept. This runs inside start_wsl's per-box subshell on the
+  # restart path, and that subshell holds the box's LANE lock for the length of the restart; a
+  # holder that inherited it would carry it for the life of the lane instead, and the sweep that
+  # holder exists to serve would then wait out its LAB_LOCK_WAIT against it and skip every unit
+  # on that box (ludics-lite#224). Only the HOLD lock may travel to the holder. The rule for
+  # anything added here later: a LONG-LIVED child of this function closes fd 8 and keeps fd 9.
+  # `3<&-` after the dup: the holder needs the channel as its stdin, not as a second descriptor it
+  # could never reach anyway.
+  ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+      "$dest" "$HOLD_PAYLOAD $token" >"$out" 2>/dev/null 0<&3 3<&- 8>&- &
+  pid=$!
+  # This shell's own handle on the channel goes now: the holder has its copy, and a descriptor left
+  # open here would be inherited by everything spawned after it -- including the sidecar, which
+  # outlives this function and would then be a second writer keeping a dead holder's channel from
+  # ever reaching EOF.
+  exec 3>&-
+  # The lock must not depend on what the ssh client does with descriptors it inherited: OpenSSH
+  # may close everything above stderr at startup, and then nothing would hold the flock once
+  # this subshell exits. So a sidecar process holds the hold lock instead — it inherits the very
+  # descriptor the flock lives on, so there is no window in which the VM is unprotected — and it
+  # exits as soon as the holder does, by `unhold` or otherwise, taking the lock with it.
+  #
+  # It is an EXEC'd process, not a brace group: a forked bash keeps every descriptor bash holds
+  # internally, including its copy of a caller's pipe, and a background child holding that pipe
+  # hangs `wake-lab.sh kick-wsl --hold rog | tee log` — or any caller reading the command's
+  # output — for the whole life of the lane. Those descriptors are close-on-exec, so exec'ing
+  # anything sheds them; HOLD_FD — opened by the take above, or by the reservation this subshell
+  # inherited it from — is not, so the lock survives. perl is already the lab lock's own
+  # dependency.
+  # `8>&-` for the same reason as the holder above, and it matters more here: this process
+  # exists to keep a descriptor alive, so an inherited lane lock would be kept alive exactly as
+  # deliberately as the hold lock it is for.
+  # The holder's pid is its LAST argument, which is what ties this sidecar to this holder: the tag
+  # alone names every sidecar on this machine, and `release_hold` must be able to tell its own from
+  # the one belonging to another box's lane before it signals anything (#184 (b)).
+  perl -e 'my $tag = "wake-lab-hold-lock"; my $p = shift; while (kill 0, $p) { sleep 1 }' \
+    "$pid" >/dev/null 2>&1 </dev/null 8>&- &
+  sidecar=$!
+  spawn_epoch=$(date +%s); spawned=1
+  # An unrecordable holder is a leaked one: nothing would ever unhold it. Kill it rather than
+  # leave it running unowned. The guest pid is 0 until the handshake answers with it.
+  if ! printf '%s %s %s %s %s %s %s\n' \
+       "$pid" "$dest" "$spawn_epoch" "$sidecar" "$token" 0 "$prot" > "$f" 2>/dev/null; then
+    kill "$pid" "$sidecar" 2>/dev/null
+    rm -f "$f" "$fifo" "$out" 2>/dev/null
+    echo "  wsl holder on $name could NOT be recorded at $f — holder (pid $pid) killed rather than leaked"
+    return 1
+  fi
+  # The lock this holder now carries says whatever the take that opened the descriptor said, and
+  # on the restart path that is `wake-lab restart` with the restarter's pid — a line that outlives
+  # the restart by the whole length of the lane and names a process that has already exited, in
+  # every refusal message here and in every `skip (box ... reserved by ...)` the sweep publishes.
+  # So relabel it for the holder that is actually there.
+  lock_label "$(hold_lock_path "$name")" "--hold" "$pid"
+  echo "  wsl holder started on $name (via $dest, pid $pid, token $token)"
+  # The observation, and the only one made: the token comes back THROUGH the VM or the hold failed.
+  # There is no local half to combine it with any more. `kill -0` on our own pid was never the
+  # claim (an ssh client can outlive the command it ran), a wsl.exe in `tasklist` was not either
+  # (the owner's console shell is one, and on both lab boxes it certified a holder of ours that did
+  # not exist), and the 20-second settle those two needed between them was a proxy for exactly what
+  # the handshake now measures directly -- so it is gone, along with the wait it cost every hold.
+  if gp=$(hold_handshake "$name" "$token" "$HOLD_WAIT_SECONDS"); then
+    printf '%s %s %s %s %s %s %s\n' \
+      "$pid" "$dest" "$spawn_epoch" "$sidecar" "$token" "$gp" "$prot" > "$f" 2>/dev/null
+    echo "  wsl holder observed on $name (guest shell $gp in the VM answered its token over $dest)"
+    return 0
+  fi
+  # Only a holder THIS call spawned is cleaned up, and by construction that is the only kind that
+  # reaches here: a holder we merely reused belongs to an earlier invocation that may still be
+  # protecting a running lane, and the reuse branch above returns without touching it.
   if [ "$spawned" = 1 ] && [ "$(hold_pid_read "$f" 2>/dev/null | cut -d' ' -f1)" = "$pid" ]; then
     # Our own record, so kill the pid we spawned WITHOUT asking for the signature again: a child
     # still between fork and exec carries none, and release_hold would then drop the record and
@@ -1007,25 +1171,62 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and wait unti
        { own=$(ps -ww -o args= -p $$ 2>/dev/null); theirs=$(ps -ww -o args= -p "$pid" 2>/dev/null)
          [ -n "$theirs" ] && [ "$theirs" = "$own" ]; }; then
       kill "$pid" "$sidecar" 2>/dev/null
-      echo "  wsl holder on $name stopped (pid $pid): nothing holds that VM"
+      echo "  wsl holder on $name stopped (pid $pid): nothing of ours holds that VM"
     else
-      echo "  wsl holder on $name is gone (pid $pid no longer names it): nothing holds that VM"
+      echo "  wsl holder on $name is gone (pid $pid no longer names it): nothing of ours holds that VM"
     fi
-    rm -f "$f" 2>/dev/null
-  elif [ "$spawned" = 1 ]; then
+    rm -f "$f" "$fifo" "$out" 2>/dev/null
+  else
     # We spawned a holder, but the record no longer names it: a concurrent run replaced it after
     # ours exited. Killing what the file names now would unhold THAT run's lane.
     echo "  wsl holder for $name was not observed; the record now names another run's holder, left alone"
-  else
-    echo "  wsl holder for $name was not observed, but it belongs to an earlier run: left running and recorded"
   fi
   return 1
 }
 
+# The other end of the teardown, and the one #192 is about: the local kill is not the claim. This
+# asks the VM whether the guest shell is still there, and if it is, ends it BY PID -- which is a
+# thing this script can only do at all because the holder carries a token: without one, every
+# `wsl.exe` on that Windows side looks alike and the only cure documented for an orphan was a
+# host-global `restart-wsl`, which destroys every other session's work on the box.
+hold_confirm_gone() { # hold_confirm_gone <box> <alias> <guest pid> <token> <what ended it>
+  local name=$1 dest=$2 gp=$3 tok=$4 what=$5 obs deadline
+  deadline=$((SECONDS + HOLD_TEARDOWN_SECONDS))
+  while :; do
+    hold_remote_gone "$dest" "$gp" "$tok"; obs=$?
+    # Only "still there" is worth asking again: EOF has to cross a channel, a Windows sshd and
+    # wsl.exe before the guest shell reads it, and none of that is instant. "Gone" and "no answer"
+    # are both final.
+    [ "$obs" = 1 ] || break
+    [ "$SECONDS" -ge "$deadline" ] && break
+    sleep 2
+  done
+  case "$obs" in
+    0) echo "    ...and its guest shell (pid $gp) is gone from the VM, observed over $dest" ;;
+    2) echo "    ...but $dest did not answer, so this does NOT claim the VM is unheld: the holder's"
+       echo "    tree may still be running there. Check the box when it is reachable." ;;
+    1) echo "    ...but its guest shell (pid $gp) is STILL RUNNING in the VM ${HOLD_TEARDOWN_SECONDS}s after $what:"
+       echo "    the holder outlived its channel, which is ludics-lite#192 happening on this box."
+       echo "    Ending it by pid over $dest, which is what the token makes possible:"
+       capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=15 "$dest" \
+         "wsl.exe -d Ubuntu -e kill $gp" >/dev/null 2>&1
+       hold_remote_gone "$dest" "$gp" "$tok"; obs=$?
+       case "$obs" in
+         0) echo "    ...ended: the guest shell is gone. Nothing of ours is left on $name, but note"
+            echo "    that the channel did not end it -- report that, it is the contract this holder is built on." ;;
+         *) HOLD_LEAK=1
+            echo "    ...and it SURVIVED that too. $name is still pinned by a holder of ours: guest"
+            echo "    pid $gp, token $tok. Nothing short of ending that process or a restart-wsl"
+            echo "    (which destroys every other session on the box) will free it." ;;
+       esac ;;
+  esac
+}
+
 release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (an already-dead
-                 # holder is reported by setting HOLD_ANOMALY, which the caller turns into rc 2),
-                 # always says what it did
-  local f=$HOLD_STATE_DIR/hold-$1.pid rec p d t sc rel
+                 # holder is reported by setting HOLD_ANOMALY, which the caller turns into rc 2,
+                 # and a holder that outlived its channel by setting HOLD_LEAK, which becomes
+                 # rc 3), always says what it did and never claims more than it observed
+  local f=$HOLD_STATE_DIR/hold-$1.pid rec p d t sc tok gp prot rel fifo out sargs i
   # An unhold is not atomic: it kills the holder and then removes the record, and between those
   # two it can be interrupted (or a second unhold can overlap it -- which the routine now invites,
   # since it tells a run whose unhold has not come back to chase it). The record left behind then
@@ -1033,24 +1234,43 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
   # a holder the lane lost and call valid results suspect. So intent is written down BEFORE the
   # kill: whoever finds the record next can tell "an unhold ended this" from "this died".
   rel=${f%.pid}.releasing
-  if [ ! -r "$f" ]; then rm -f "$rel"; echo "  no wsl holder recorded for $1"; return 0; fi
+  fifo=$(hold_fifo_path "$1"); out=$(hold_out_path "$1")
+  if [ ! -r "$f" ]; then rm -f "$rel" "$fifo" "$out"; echo "  no wsl holder recorded for $1"; return 0; fi
   rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
-  read -r p d t sc <<<"${rec:-}"; : "$d" "$t"
+  read -r p d t sc tok gp prot <<<"${rec:-}"; : "$t"
   # The hold-lock sidecar goes with the holder: it exits on its own once the holder is gone, and
   # killing it here is what makes the box destroyable again immediately rather than a poll later.
   # Its pid is checked the way the holder's is — a record outlives both processes, and by the time
-  # anyone runs `unhold` the number may belong to something else entirely.
-  if [ -n "${sc:-}" ] && [ "${sc:-0}" != 0 ] &&
-     ps -ww -o args= -p "$sc" 2>/dev/null | grep -q 'wake-lab-hold-lock'; then
-    kill "$sc" 2>/dev/null
+  # anyone runs `unhold` the number may belong to something else entirely — and the check is for
+  # THIS holder's sidecar, not for any sidecar: the tag is the same in every lane on this machine,
+  # so a stale record whose number has been recycled onto a sibling box's sidecar would otherwise
+  # release that box's hold lock and leave its VM unprotected (#184 (b)).
+  if [ -n "${sc:-}" ] && [ "${sc:-0}" != 0 ]; then
+    sargs=$(ps -ww -o args= -p "$sc" 2>/dev/null)
+    case "$sargs" in
+      *wake-lab-hold-lock*" $p") kill "$sc" 2>/dev/null ;;
+    esac
   fi
   if hold_pid_live "$f"; then
-    # Killing the local client closes the channel and sshd ends the command it was running. If a
-    # wsl.exe is ever orphaned on the Windows side despite that, `restart-wsl` clears it: the
-    # `wsl --shutdown` it issues takes every holder with the VM.
     : > "$rel" 2>/dev/null
     kill "$p" 2>/dev/null
-    echo "  wsl holder released on $1 (pid $p killed; the VM is unheld from now on)"
+    # The kill is where this used to stop, on the reasoning that "killing the local client closes
+    # the channel and sshd ends the command it was running". It does not on Windows (#192), so the
+    # client is first waited out -- a signalled process is not a dead one, and the EOF the holder
+    # ends on cannot cross a channel that is still open -- and then the VM itself is asked.
+    for i in 1 2 3 4 5; do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+    echo "  wsl holder released on $1 (pid $p killed)"
+    [ "$prot" = unprotected ] &&
+      echo "    It was taken with --force and never held $1's hold lock, so the box was NOT protected from another session's restart-wsl while it ran"
+    if [ "$tok" = '-' ] || [ "${gp:-0}" = 0 ]; then
+      # A legacy record, or one whose handshake never answered: there is no pid in that VM to ask
+      # about, so the one thing this must not do is repeat the old sentence and call it unheld.
+      echo "    Its holder carries no token (a record from before the handshake), so nothing here"
+      echo "    can say whether its Windows-side tree ended with it -- on Windows it usually does"
+      echo "    NOT (ludics-lite#192). Treat $1 as possibly still pinned."
+    else
+      hold_confirm_gone "$1" "$d" "$gp" "$tok" "its client was killed"
+    fi
   elif [ -e "$rel" ]; then
     # The holder is gone and an unhold is on record as having ended it. That is a completed
     # release whose record outlived it, not a loss: say so, clear up, and leave rc 0.
@@ -1092,11 +1312,17 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     esac
     echo "    This unhold did not end it. The lab lock died with it, so $1 stopped being RESERVED"
     echo "    at that moment and another session's restart-wsl was free to shut the VM down under"
-    echo "    the lane. The VM may well have stayed up regardless -- a dying holder orphans its"
-    echo "    wsl.exe rather than taking it down -- but nothing owns that orphan and nothing short"
-    echo "    of restart-wsl or a reboot ends it. Treat this lane's results on $1 as suspect."
+    echo "    the lane. Treat this lane's results on $1 as suspect."
+    # The orphan this used to be able to say nothing about. A holder that died without being
+    # unheld leaves its Windows-side tree running -- that is measured, not feared -- and until the
+    # holder carried a token there was no way to name that tree, so the only documented cure was a
+    # restart-wsl that destroys every other session on the box. With a token there is: the guest
+    # shell has a pid, the pid can be checked, and if it is still there it can be ended alone.
+    if [ "$tok" != '-' ] && [ "${gp:-0}" != 0 ]; then
+      hold_confirm_gone "$1" "$d" "$gp" "$tok" "the holder died"
+    fi
   fi
-  rm -f "$f" "$rel"
+  rm -f "$f" "$rel" "$fifo" "$out"
   return 0
 }
 
@@ -1475,10 +1701,19 @@ fi
 if [ "$VERB" = unhold ]; then
   for t in "${TARGETS[@]}"; do release_hold "$t"; done
   # rc 2, not 1: a lane's cleanup must be able to tell "the holder died under me" (the lane's
-  # results are suspect) from an ordinary failure of the unhold command itself. Nothing was left
-  # un-cleaned either way -- the record is gone and the box is free -- so a caller that only
-  # cares about cleanup can ignore it, while the sweep can fail the lane on it.
+  # results are suspect) from an ordinary failure of the unhold command itself. The record is gone
+  # either way, so a caller that only cares about cleanup can ignore it, while the sweep can fail
+  # the lane on it.
+  #
+  # rc 3 is the opposite fault and is deliberately not folded into it: the holder did its job and
+  # the lane's results are fine, but the box is still pinned by a process of ours that survived
+  # both its channel dying and being ended by pid. That needs a human on that box, and it needs
+  # them for a reason that has nothing to do with the lane's results -- reporting both as rc 2
+  # would make the sweep discard good work over a box it should instead be complaining about.
+  # The anomaly is checked first: of the two, it is the one that says the results cannot be
+  # trusted, and a caller reacting to only one status should react to that one.
   [ "$HOLD_ANOMALY" = 1 ] && exit 2
+  [ "$HOLD_LEAK" = 1 ] && exit 3
   exit 0
 fi
 
