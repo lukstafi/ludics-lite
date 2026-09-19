@@ -8,6 +8,17 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 # shellcheck source=test-pr-review-lib.sh
 source "$SCRIPT_DIR/test-pr-review-lib.sh"
 
+# One brace group over everything below the preamble, so bash parses the rest of this file WHOLE
+# before the first case runs and an edit landing mid-run cannot resume the shell at a shifted
+# offset; the `exit` at the foot means it never comes back to the file for a next command
+# (ludics-lite#10, #247). The `{` opens BELOW the sources, not above them: bash binds a function's
+# `declare -F` location when it PARSES the definition, so inside a group that also holds the
+# sources every definition here is parsed first and the libraries' bindings land last -- and the
+# shadow guard (ludics-lite#46) then reads every suite function as still the library's, refusing a
+# declared stub and accepting an undeclared shadow in silence. scripts/check-parse-guards.sh
+# checks the shape, and says what may stand above the `{`.
+{
+
 REPO=example/repo
 REVIEWS_JSON='[]'
 COMMENTS_JSON='[]'
@@ -372,3 +383,5 @@ tests=(
 )
 
 run_tests "${tests[@]}"
+exit "$?"
+}
