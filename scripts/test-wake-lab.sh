@@ -1121,6 +1121,35 @@ out=$(unhold 2>&1)
 grep -q 'taken with --force and never held' <<<"$out" \
   && ok "...and the release says it too, which is where a lane's cleanup reads it" \
   || ko "the release did not report an unprotected hold -- $out"
+
+# ...and a later --hold over that unprotected holder does not merely warn about it. Returning
+# success there would have start_wsl report the VM as held while another session's restart-wsl can
+# still take it mid-lane, which is the one claim --hold exists to make truthfully. The lock the
+# forced run could not get is often free by later, and a live holder can be given a new
+# lock-carrying sidecar over its existing pid (review round 7, P1).
+reset_hold_state
+printf 'wake-lab --hold (pid 999, since 20260919T000000Z)\n' > "$WAKE_LAB_LOCK_DIR/rog.hold.lock"
+perl -e 'use Fcntl ":flock"; open(F, "+<", $ARGV[0]) or die; flock(F, LOCK_EX | LOCK_NB) or die;
+         print "held\n"; sleep 300' "$WAKE_LAB_LOCK_DIR/rog.hold.lock" > "$TMP/extlock2.out" 2>&1 &
+extlock2=$!
+for _ in 1 2 3 4 5; do grep -q held "$TMP/extlock2.out" 2>/dev/null && break; sleep 1; done
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+    WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
+    "$WL" kick-wsl --hold --force rog >/dev/null 2>&1
+# The lock's owner goes away, as the run that held it would at the end of its own lane.
+kill "$extlock2" 2>/dev/null; wait "$extlock2" 2>/dev/null
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'has now taken rog.s hold lock for it' <<<"$out" \
+  && [ "$(awk '{ print $7 }' "$TMP/state/hold-rog.pid")" = protected ] \
+  && ok "a reuse takes the lock a --force holder never had, and records that it is protected (rc=$rc)" \
+  || ko "an unprotected holder was reused as a protected one (rc=$rc) -- $out; $(cat "$TMP/state/hold-rog.pid")"
+# ...and the protection is real, not a word in a file: the box is now refused to a destroyer.
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_STATE_DIR="$TMP/state" \
+      SSH_UP="rog-lan rog-nv-wsl" "$WL" restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'REFUSED' <<<"$out" \
+  && ok "...so another session's restart-wsl is refused over a holder that used to be unprotected" \
+  || ko "the newly taken hold lock refuses nothing (rc=$rc) -- $out"
+unhold >/dev/null 2>&1
 kill "$extlock" 2>/dev/null; wait "$extlock" 2>/dev/null
 rm -f "$WAKE_LAB_LOCK_DIR"/*.lock
 

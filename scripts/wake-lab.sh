@@ -516,13 +516,25 @@ hold_lock_path() { # hold_lock_path <box> — where that box's HOLD lock lives
 # own: a destroyer holds two per box, and `power_phase` reserves every box it is about to act on
 # and must keep all of them for as long as it acts. bash 3.2 has no `exec {fd}>`, hence the eval
 # over an explicitly chosen number.
-lock_take_fd() { # lock_take_fd <path> <what> <fd> — 0 taken and held, 1 someone else holds it
+lock_take_fd_strict() { # lock_take_fd_strict <path> <what> <fd>
+                        # 0 taken and held, 1 someone else holds it, 2 could not even be attempted
   local path=$1
-  mkdir -p "$LOCK_DIR" 2>/dev/null || return 0
-  eval "exec $3>>\"\$path\"" 2>/dev/null || return 0
+  mkdir -p "$LOCK_DIR" 2>/dev/null || return 2
+  eval "exec $3>>\"\$path\"" 2>/dev/null || return 2
   perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&"$3" || return 1
   lock_label "$path" "$2" "$$"
   return 0
+}
+
+# The fail-OPEN wrapper, and the contract every caller but the release wants: a lab whose lock
+# directory cannot be created or written must not stop the boxes being used, so "could not be
+# attempted" reads as "proceed". That is exactly the wrong answer for a caller asking whether it
+# is SERIALIZED, though -- proceeding and being serialized are different facts, and reading the
+# first as the second is how an unlocked cleanup came to believe it held the box. Callers that
+# need the difference use the strict form.
+lock_take_fd() { # lock_take_fd <path> <what> <fd> — 0 taken or unavailable, 1 someone else holds it
+  lock_take_fd_strict "$@"
+  case $? in 1) return 1 ;; *) return 0 ;; esac
 }
 
 # The advisory line, written by whoever holds the lock. Separate from the take because the hold
@@ -1050,8 +1062,30 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
     # about a different connection to the same box (#184 (b)).
     rec=$(hold_pid_read "$f"); read -r rp rd rt rsc rtok rgp rprot <<<"$rec"; : "$rt"; : "$rsc"
     echo "  wsl holder already running for $name (pid $rp, via $rd)"
-    [ "$rprot" = unprotected ] &&
-      echo "    ...taken with --force: it never held $name's hold lock, so the VM is NOT protected from another session's restart-wsl"
+    if [ "$rprot" = unprotected ]; then
+      # A --force holder carries no flock: its sidecar inherited a descriptor that was never
+      # locked, and it will never acquire one. Reusing it and returning success would have
+      # start_wsl report the VM as held when another session's restart-wsl can still take it
+      # mid-lane -- which is the one claim this whole flag exists to make truthfully.
+      # So try to make it true instead of warning about it. The lock the earlier run could not get
+      # may well be free by now, and a holder can be given a NEW sidecar over its existing pid: the
+      # sidecar is only a process that holds the descriptor and outlives this shell.
+      if lock_take_fd_strict "$(hold_lock_path "$name")" "--hold" "$HOLD_FD"; then
+        perl -e 'my $tag = "wake-lab-hold-lock"; my $p = shift; while (kill 0, $p) { sleep 1 }' \
+          "$rp" >/dev/null 2>&1 </dev/null 8>&- &
+        # Recorded so the release ends this sidecar rather than the dead one, and so the box stops
+        # reading as unprotected. Safe to rewrite here for once: we hold the box's lock, so no
+        # other hold can be writing this record.
+        if hold_record_write "$f" "$rp" "$rd" "$rt" "$!" "$rtok" "$rgp" protected; then
+          echo "    ...was taken with --force and held no lock; this run has now taken $name's hold lock for it"
+        else
+          echo "    ...was taken with --force; this run took $name's hold lock for it, but could not record that"
+        fi
+      else
+        echo "    ...taken with --force: it never held $name's hold lock, and this run cannot take it either,"
+        echo "    so $name's VM is NOT protected from another session's restart-wsl for the rest of this lane"
+      fi
+    fi
     if [ "$rtok" = '-' ]; then
       # A holder from before the handshake. It is running and it is recognizably the old payload,
       # but it does not read its stdin and carries no token, so there is no way to ask it anything
@@ -1243,7 +1277,13 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
     hold_confirm_gone "$name" "$dest" 0 "$token" "its unrecordable hold killed the client"
     [ "$HOLD_CONFIRM" = gone ] ||
       echo "    That holder cannot be recorded, so nothing will name it later: its token is $token."
-    hold_state_clear "$name" "$pid" "$token" >/dev/null
+    # Not through hold_state_clear: `$f` is still this invocation's zero-length claim -- the write
+    # that would have filled it is what just failed -- and that function categorically reads an
+    # empty record as another run's claim in progress, which is what it must do for records it did
+    # not create. These three paths were created by THIS call, seconds ago and under that claim, so
+    # they are removable here and nowhere else. Leaving them would refuse the next hold until the
+    # claim went stale and make every unhold until then report a lost holder that never existed.
+    rm -f "$f" "$fifo" "$out" 2>/dev/null
     return 1
   fi
   # The lock this holder now carries says whatever the take that opened the descriptor said, and
@@ -1486,7 +1526,11 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
   # refuses us instead -- the honest outcome, with the identity check keeping this release off its
   # state.
   for i in 1 2 3 4 5; do
-    lock_take_fd "$(hold_lock_path "$1")" "unhold" "$HOLD_FD" && { cleanup_locked=1; break; }
+    lock_take_fd_strict "$(hold_lock_path "$1")" "unhold" "$HOLD_FD"
+    case $? in
+      0) cleanup_locked=1; break ;;
+      2) break ;;   # no lock to be had here at all: waiting cannot change that
+    esac
     sleep 1
   done
   [ "$cleanup_locked" = 1 ] ||
