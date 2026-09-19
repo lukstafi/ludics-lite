@@ -2501,21 +2501,17 @@ test_concurrent_commit_message_archive() {
     COMMIT_DONE="$done" RELEASE_MARKER="$TEST_ROOT/concurrent-commit-message.released" \
     HANDSHAKE_LIMIT="$limit" HANDSHAKE_STALL="$stall" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null; then
-    # Read the stall marker BEFORE waiting on the commit. The marker means the fake git had
-    # already released the commit and then watched it miss its commit-msg hook for the whole
-    # budget, so that commit is wedged rather than slow -- and waiting on a wedged process is
-    # waiting until the harness kills the case at its deadline and reports a generic timeout,
-    # which buries this diagnosis and holds a -j slot for the full deadline. End it, then report.
-    # Its hooks need no killing of their own: the release marker the fake git wrote is already
-    # there, so the paused pre-commit hook leaves its poll, and the commit-msg hook only touches
-    # a file and exits.
+    # Read the stall marker BEFORE joining the commit. Waiting first would block the diagnosis
+    # behind the stall it describes, until the harness killed the case at its deadline and
+    # reported a generic timeout -- burying the diagnosis and holding a -j slot for the full
+    # deadline.
     if [ -e "$stall" ]; then
-      # Best effort, and non-fatal: the commit may have resumed and been reaped between the fake
-      # git writing the marker and this branch running, and under `set -e` a kill that loses that
-      # race would exit the case before the stall is reported -- leaving exactly the misleading
-      # helper error this change exists to replace.
-      kill "$commit_pid" 2>/dev/null || true
-      wait "$commit_pid" >/dev/null 2>&1 || true
+      # Report without touching that commit at all -- neither joining it nor signalling it.
+      # The marker is written only AFTER the fake git has touched COMMIT_RELEASE, so a stall
+      # records a commit that was released and is merely slow, never one that is wedged: it
+      # finishes on its own, and there is nothing here to clean up. Joining it would block the
+      # diagnosis behind the very stall it describes, and signalling its PID is unsafe once Bash
+      # may have reaped the job, because the number can by then belong to another case's process.
       fail "fixture stall, not a helper failure: the released commit did not reach its commit-msg hook within $((limit / 10))s ($(cat "$stall") polls), so the fake git failed the helper's worktree removal"
     fi
     # Not a stall: the commit may still be paused in its pre-commit hook, so release it and reap.
