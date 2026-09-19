@@ -1145,6 +1145,25 @@ printf '\nPass `--dry-run` to rehearse.\n\n```bash\n~/x/post-merge-cleanup.sh a 
 expect "a flag option consumes no value, so the word after it is read" 1 \
   "passes '--keep-branch'" -- "$CP" "$R"
 
+# Round 4, P2 x2: the segment is lexed as the shell lexes it, so a separator inside a quoted or
+# escaped value ends nothing -- the shape that let an option past the register -- and an unquoted
+# `#` starts a comment the shell passes nothing from.
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --force-integrated "confirmed; by GitHub" --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a separator inside a double-quoted value ends nothing" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --force-integrated '"'"'a | b'"'"' --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...nor inside a single-quoted one" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --force-integrated confirmed\; --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...nor an escaped one" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --base main # never pass --keep-branch here\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a trailing shell comment passes nothing" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --force-integrated "not # a comment" --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...while a # inside a quoted value is text" 1 "passes '--keep-branch'" -- "$CP" "$R"
+
 # The listing side is a mention, verbatim, anywhere in the prompt: the option's command lines
 # deleted and its prose kept still names it. That is the residue this check states rather than
 # hides -- a name present says nothing about whether the prose around it is true.

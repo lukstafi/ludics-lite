@@ -916,8 +916,9 @@ check_drift_guard() {
 # helper is one usage() lists. What is an option OF the helper, on the prompt's side, is a line
 # shape and not a judgement: the helper's command lines -- a line inside a backtick fence naming
 # `post-merge-cleanup.sh`, from that name to the first shell separator, and every line a trailing
-# backslash continues it onto, read a WORD at a time. The shell's grammar is modelled only as far
-# as `invocation_options` states, and its residue errs toward refusal. A `--flag` in
+# backslash continues it onto, lexed as the shell lexes a simple command. The shell's grammar is
+# modelled only as far as `invocation_options` states, which also says how each residue errs. A
+# `--flag` in
 # prose, or on some other command's line (`gh pr merge --delete-branch`, the test runner's
 # `--list`), is attributed to nothing, so an option the prompt explains but never passes is not
 # held to the register from that side. And a name present is a name present: whether the prose
@@ -958,23 +959,55 @@ usage_options() {
 }
 
 # invocation_options <prompt> <valued>: every `--option` the prompt's helper command lines pass,
-# one per line. A command line is a line inside a backtick fence on which `post-merge-cleanup.sh`
-# stands as a whole name -- preceded by nothing that could extend it leftward into a longer name,
-# so a `/`, a blank, a quote, a `(` or the line's start all serve, and `test-post-merge-cleanup.sh`
-# is another file -- from that name to the first shell separator (`;`, `&&`, `||`, `|`, `&`, or the
-# `)` that closes a subshell or substitution), plus each line a trailing
-# backslash continues it onto; what follows a separator is searched again for a second invocation.
-# Within that, the shell is modelled at the WORD: the segment is split on blanks, a word wrapped
-# whole in one kind of quote is unquoted, a word opening with `--` is an option, and the word after
+# one per line. A command line is a line inside a backtick fence lexed as the shell lexes a simple
+# command, on which some word's last path component is `post-merge-cleanup.sh` -- a quoted path,
+# a `(` or an `out=$(` prefix all carry it, and `test-post-merge-cleanup.sh` is another file --
+# from that word to the first shell separator (`;`, `&&`, `||`, `|`, `&`, or the `)` that closes a
+# subshell or substitution) outside quotes, plus each line a trailing backslash continues it onto;
+# what follows a separator is lexed again for a second invocation. The lexing: words split on unquoted blanks,
+# single quotes literal, double quotes with the four escapes, a backslash escaping the next
+# character, an unquoted `#` opening a word starting a comment, and a redirection (`2>&1`, `>&2`,
+# `<&0`, `&>log`) carrying no separator. A word opening with `--` is an option, and the word after
 # an option in <valued> (the register's arity-1 names, blank-separated) is that option's value
 # whatever it looks like, since the helper takes it so. A fence is a run of three or more
-# backticks up to three blanks in, closed only by a run at least as long with nothing after it,
-# as CommonMark reads them. What is NOT modelled: a quoted argument holding a blank is several
-# words here, so a separator or a `--word` inside one is read as if unquoted, which drops options
-# or reports one the shell never passed -- both refusals, never an acceptance -- and a `~~~`
-# fence is prose.
+# backticks up to three blanks in, closed only by a run at least as long with nothing after it, as
+# CommonMark reads them. What is NOT modelled, and how it errs: a quoted argument that spans lines
+# is read to its line's end and the next line as unquoted, which can report a `--word` the shell
+# never passed (a refusal); an unquoted `$var` is a word and not its expansion, so options held in a variable are
+# unread (an acceptance, and the one shape that stays open by design -- the prompt spells its
+# commands out); and a `~~~` fence is prose.
 invocation_options() {
   awk -v valued=" $2 " '
+    # lex <line>: the words of one simple command into W[1..NW]; TERM and REST when a separator
+    # ended it, CONT when an unquoted backslash ends the line.
+    function lex(line,   i, n, c, q, word, have) {
+      NW = 0; REST = ""; TERM = 0; CONT = 0; q = ""; word = ""; have = 0
+      n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (q == "") {
+          if (c ~ /[[:space:]]/) { if (have) { W[++NW] = word; word = ""; have = 0 }; continue }
+          if (c == "\\") {
+            if (i == n) { CONT = 1; break }
+            word = word substr(line, ++i, 1); have = 1; continue
+          }
+          if (c == "\"" || c == "\047") { q = c; have = 1; continue }
+          if (c == "#" && !have) break
+          if (c == ";" || c == "|" || c == ")" || (c == "&" && substr(line, i + 1, 1) != ">")) {
+            TERM = 1; REST = substr(line, i + 1); break
+          }
+          if (c == "&") { i++; if (substr(line, i + 1, 1) == ">") i++; continue }
+          if ((c == ">" || c == "<") && substr(line, i + 1, 1) == "&") {
+            i++; while (substr(line, i + 1, 1) ~ /[0-9-]/) i++; continue
+          }
+          word = word c; have = 1; continue
+        }
+        if (c == q) { q = ""; continue }
+        if (q == "\"" && c == "\\" && substr(line, i + 1, 1) ~ /["\\$`]/) { word = word substr(line, ++i, 1); continue }
+        word = word c
+      }
+      if (have) W[++NW] = word
+    }
     match($0, /^ {0,3}`{3,}/) {
       run = RLENGTH - index($0, "`") + 1
       if (!fence) { fence = 1; flen = run; cont = 0; skip = 0; next }
@@ -983,30 +1016,27 @@ invocation_options() {
     !fence { cont = 0; next }
     {
       line = $0
-      # A redirection is not a separator: `2>&1`, `>&2`, `<&0`, `&>log` carry an `&` that ends no
-      # command, so they are blanked before the separators are read.
-      gsub(/[0-9]*[<>]&[0-9-]*/, " ", line); gsub(/&>>?/, " ", line)
       while (1) {
+        lex(line)
+        start = 1
         if (!cont) {
-          if (!match(line, /(^|[^A-Za-z0-9_.-])post-merge-cleanup\.sh([^A-Za-z0-9_.-]|$)/)) break
-          line = substr(line, RSTART); sub(/^[^p]/, "", line); skip = 0
+          # The helper is a WORD whose last path component is its name, once the lexer has
+          # unquoted it -- so a quoted path, a `(` or an `out=$(` prefix all carry it, and
+          # `test-post-merge-cleanup.sh` does not.
+          start = 0
+          for (i = 1; i <= NW; i++)
+            if (W[i] ~ /(^|[^A-Za-z0-9_.-])post-merge-cleanup\.sh$/) { start = i + 1; skip = 0; break }
+          if (!start) { if (!TERM) break; line = REST; continue }
         }
-        cont = (line ~ /\\[[:space:]]*$/)
-        rest = ""
-        # A `)` ends the command as a separator does: a subshell or a substitution closes there.
-        if (match(line, /[;&|)]/)) { rest = substr(line, RSTART + 1); line = substr(line, 1, RSTART - 1); cont = 0 }
-        sub(/\\[[:space:]]*$/, "", line)
-        n = split(line, w, /[[:space:]]+/)
-        for (i = 1; i <= n; i++) {
-          if (w[i] == "") continue
+        for (i = start; i <= NW; i++) {
           if (skip) { skip = 0; continue }
-          if (w[i] ~ /^"[^"]*"$/ || w[i] ~ /^'"'"'[^'"'"']*'"'"'$/) w[i] = substr(w[i], 2, length(w[i]) - 2)
-          if (w[i] !~ /^--./) continue
-          print w[i]
-          if (index(valued, " " w[i] " ") > 0) skip = 1
+          if (W[i] !~ /^--./) continue
+          print W[i]
+          if (index(valued, " " W[i] " ") > 0) skip = 1
         }
-        if (rest == "") break
-        line = rest; cont = 0
+        cont = CONT
+        if (!TERM) break
+        line = REST; cont = 0
       }
     }
   ' "$1"
