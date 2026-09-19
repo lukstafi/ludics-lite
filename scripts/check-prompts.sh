@@ -926,13 +926,18 @@ CLEANUP_PROMPT=ship-pr/SKILL.md
 # usage_options <script>: the options usage()'s heredoc lists, one per line -- each line of the
 # body, between the `usage() {` line and its closing `}`, that opens with two blanks and a
 # `--name`, which is the listing's own shape (`  --base <branch>  Base branch …`). The delimiter is
-# whatever the `<<` names, quoted or not, so the reader is not tied to `EOF`; the prose below the
-# listing, which mentions an option mid-sentence, is at no such indent and is not read.
+# whatever the `<<` names, quoted or not and with or without a blank after the operator, so the
+# reader is not tied to `EOF`; a `}` inside the heredoc is text and does not close the function;
+# the prose below the listing, which mentions an option mid-sentence, is at no such indent and
+# is not read.
 usage_options() {
   awk '
     !infn && /^usage\(\) \{/ { infn = 1; next }
-    infn && /^\}/ { exit }
-    infn && !inhd && match($0, /<<-?["'"'"']?[A-Za-z_][A-Za-z_0-9]*["'"'"']?[[:space:]]*$/) {
+    # The closing brace ends the function only OUTSIDE the heredoc: a `}` in the usage text is
+    # data, and exiting on it would drop every option listed below it while the register stayed
+    # nonempty -- an agreement over half the list.
+    infn && !inhd && /^\}/ { exit }
+    infn && !inhd && match($0, /<<-?[[:space:]]*["'"'"']?[A-Za-z_][A-Za-z_0-9]*["'"'"']?[[:space:]]*$/) {
       d = substr($0, RSTART, RLENGTH); sub(/^<<-?/, "", d); gsub(/["'"'"'[:space:]]/, "", d)
       inhd = 1; next
     }
@@ -946,16 +951,27 @@ usage_options() {
 # invocation_options <prompt>: every `--option` token on the helper's command lines in the prompt,
 # one per line. A command line is a line inside a backtick fence that names `post-merge-cleanup.sh`
 # as a path component or a word -- `test-post-merge-cleanup.sh` is another file -- plus each line
-# a trailing backslash continues it onto. Fences are the block scope here, unlike the link check:
-# the shape being read is a command, and a command the prompt tells the agent to run is fenced.
+# a trailing backslash continues it onto, up to the first shell separator after the name. Fences
+# are the block scope here, unlike the link check: the shape being read is a command, and a
+# command the prompt tells the agent to run is fenced.
 invocation_options() {
   awk '
     /^```/ { fence = !fence; cont = 0; next }
     !fence { cont = 0; next }
     {
       line = $0
-      if (!cont && line !~ /(^|[\/[:space:]])post-merge-cleanup\.sh([[:space:]]|$)/) next
+      if (!cont) {
+        # The helper'"'"'s own simple command starts at its name, so a command chained BEFORE it
+        # on the line contributes nothing.
+        if (!match(line, /(^|[\/[:space:]])post-merge-cleanup\.sh([[:space:]]|$)/)) next
+        line = substr(line, RSTART)
+      }
       cont = (line ~ /\\[[:space:]]*$/)
+      # ...and it ends at the first shell separator -- `;`, `&&`, `||`, `|`, `&` -- after which
+      # the `--json` of a chained `gh` is that command'"'"'s, and no continuation is the helper'"'"'s
+      # either. Quoting is not modelled: a separator inside a quoted argument ends the read
+      # early, which drops options rather than inventing them.
+      if (match(line, /[;&|]/)) { line = substr(line, 1, RSTART - 1); cont = 0 }
       while (match(line, /(^|[[:space:]])--[A-Za-z0-9][A-Za-z0-9-]*/)) {
         tok = substr(line, RSTART, RLENGTH); sub(/^[[:space:]]/, "", tok); print tok
         line = substr(line, RSTART + RLENGTH)

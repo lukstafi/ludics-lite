@@ -1058,6 +1058,17 @@ cleanup_edit "$CLEANUP_PROMPT" "$((CLEANUP_LINE - 1))s/ \\\\\$//"
 cleanup_edit "$CLEANUP_PROMPT" "${CLEANUP_LINE}s/\$/ --keep-branch/"
 expect "a line the backslash no longer continues passes nothing" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
 
+# The helper's command ends at the first shell separator: the `--json` of a `gh` chained after
+# it is that command's, and a command chained before it contributes nothing (round 1, P2).
+cleanup_tree
+printf '\n```bash\ngit fetch origin && ~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh a b c --base main; gh pr view --json number\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "an option of a command chained after the helper on its line is that command's" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh a b c --base main | tee log.txt \\\n  --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...and a continuation past a separator is not the helper's either" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+
 # The listing side is a mention, verbatim, anywhere in the prompt: the option's command lines
 # deleted and its prose kept still names it. That is the residue this check states rather than
 # hides -- a name present says nothing about whether the prose around it is true.
@@ -1075,6 +1086,18 @@ expect "a usage() listing no options is refused, not passed" 1 \
 cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" "s/<<'EOF'/<<\"USAGE\"/; s/^EOF\$/USAGE/"
 expect "a heredoc under another delimiter is still the listing" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" "s/<<'EOF'/<< 'EOF'/"
+expect "...and with a blank between the operator and the delimiter (round 1, P2)" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+# A `}` inside the usage text is text: reading it as the function's close would end the register
+# at that line, and an option listed below it could leave the prompt unnoticed (round 1, P2).
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^\(  --base .*\)$/\1\
+}\
+  --dry-run             Report what cleanup would do and change nothing/'
+expect "a brace inside the heredoc does not end the listing" 1 \
+  "$CLEANUP_PROMPT: names no '--dry-run'" -- "$CP" "$R"
 
 # A helper with no prompt to document it is refused; a root with no helper carries no obligation,
 # as with the sync script and the worker.
