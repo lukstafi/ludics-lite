@@ -21,7 +21,7 @@
 # directory carrying a SKILL.md is named, in backticks, in the first cell of a row there, so a new
 # prompt cannot land unindexed. That is a lookup, not a rendering claim: see `indexed` below for
 # what it stopped asserting when the table scanner went (ludics-lite#75).
-# Four cross-file agreements ride along, each pinning a fact the prompts only restate: every test
+# Five cross-file agreements ride along, each pinning a fact the prompts only restate: every test
 # fixture has a command in the README's register and a run line on each CI platform it needs, and
 # every file that quotes the mac-studio correctness-slot count quotes the one fleet-worker.sh
 # actually defaults to (ludics-lite#160) -- which files those are is discovered, not listed.
@@ -29,6 +29,11 @@
 # requires each of their prompts to RUN that script -- the command line, not a mention of the
 # name -- so the step 0 that makes an installed copy's drift visible cannot be edited away in
 # silence (ludics-lite#199).
+#
+# A fifth compares ship-pr/SKILL.md with post-merge-cleanup.sh's usage(): every option the
+# heredoc lists is named in the prompt, and every `--option` the prompt's fenced command lines
+# pass to the helper is one usage() lists -- the two files ludics-lite#276 found edited apart
+# (see `check_cleanup_options` for what "of the helper" means on the prompt's side).
 #
 # A fourth reads the relative Markdown links in those prompts, their reference files and the two
 # READMEs: the path a `](….md)` link spells exists relative to the linking file, and an anchor on
@@ -901,6 +906,186 @@ check_drift_guard() {
   [ "$bad" -ne 0 ] || ok "every routine $SYNC_SCRIPT installs runs it to read its own drift"
 }
 
+# --- the post-merge-cleanup option register ----------------------------------------------------
+# ship-pr/SKILL.md is where an operator learns what post-merge-cleanup.sh takes, and the two are
+# edited apart: ludics-lite#276 added `--regenerable` to the helper's usage() and documented it in
+# the prompt by hand, in the same PR that found the prompt's prose about the base-owner gate had
+# been false through at least two earlier PRs. Nothing but a reader compares the two files, so
+# this pins the one fact a lookup can see, in both directions: every option usage()'s heredoc
+# LISTS is named, verbatim, somewhere in the prompt, and every `--option` the prompt PASSES to the
+# helper is one usage() lists. What is an option OF the helper, on the prompt's side, is a line
+# shape and not a judgement: the helper's command lines -- a line inside a backtick fence naming
+# `post-merge-cleanup.sh`, from that name to the first shell separator, and every line a trailing
+# backslash continues it onto, lexed as the shell lexes a simple command. The shell's grammar is
+# modelled only as far as `invocation_options` states, which also says how each residue errs. A
+# `--flag` in
+# prose, or on some other command's line (`gh pr merge --delete-branch`, the test runner's
+# `--list`), is attributed to nothing, so an option the prompt explains but never passes is not
+# held to the register from that side. And a name present is a name present: whether the prose
+# around it is still true is the review question ludics-lite#276 was, which no scan settles.
+CLEANUP_HELPER=ship-pr/scripts/post-merge-cleanup.sh
+CLEANUP_PROMPT=ship-pr/SKILL.md
+
+# usage_options <script>: the options usage()'s heredoc lists, one per line as `--name<TAB>arity`
+# -- each line of the body, between the `usage() {` line and its closing `}`, that opens with two
+# blanks and a `--name`, which is the listing's own shape (`  --base <branch>  Base branch …`), and
+# the arity is 1 when a `<value>` placeholder follows the name, else 0. The delimiter is whatever
+# word the `<<` names, quoted or not, with or without a blank after the operator and whatever
+# else the line carries after it (a `>&2`, a comment), and under `<<-`
+# the body's leading tabs are stripped as the shell strips them; a `}` inside the heredoc is text
+# and does not close the function; the prose below the listing, which mentions an option
+# mid-sentence, is at no such indent and is not read.
+usage_options() {
+  awk '
+    !infn && /^usage\(\) \{/ { infn = 1; next }
+    # The closing brace ends the function only OUTSIDE the heredoc: a `}` in the usage text is
+    # data, and exiting on it would drop every option listed below it while the register stayed
+    # nonempty -- an agreement over half the list.
+    infn && !inhd && /^\}/ { exit }
+    infn && !inhd && match($0, /<<-?[[:space:]]*("[^"]+"|'"'"'[^'"'"']+'"'"'|[^[:space:]"'"'"'<>|&;()]+)/) {
+      d = substr($0, RSTART, RLENGTH); dash = (d ~ /^<<-/)
+      sub(/^<<-?[[:space:]]*/, "", d); gsub(/["'"'"']/, "", d)
+      inhd = 1; next
+    }
+    inhd {
+      l = $0
+      if (dash) sub("^\t+", "", l)
+      if (l == d) { inhd = 0; next }
+      if (match(l, /^  --[A-Za-z0-9][A-Za-z0-9-]*([[:space:]]|$)/)) {
+        o = substr(l, 3, RLENGTH - 2); sub(/[[:space:]]$/, "", o)
+        print o "\t" (substr(l, RLENGTH + 1) ~ /^[[:space:]]*</ ? 1 : 0)
+      }
+    }
+  ' "$1"
+}
+
+# invocation_options <prompt> <valued>: every `--option` the prompt's helper command lines pass,
+# one per line. A command line is a line inside a backtick fence lexed as the shell lexes a simple
+# command, on which some word's last path component is `post-merge-cleanup.sh` -- a quoted path,
+# a `(` or an `out=$(` prefix all carry it, and `test-post-merge-cleanup.sh` is another file --
+# from that word to the first shell separator (`;`, `&&`, `||`, `|`, `&`, or the `)` that closes a
+# subshell or substitution) outside quotes, plus each line a trailing backslash continues it onto;
+# what follows a separator is lexed again for a second invocation. The lexing: words split on unquoted blanks,
+# single quotes literal, double quotes with the four escapes, a backslash escaping the next
+# character, an unquoted `#` opening a word starting a comment, and a redirection (`2>&1`, `>&2`,
+# `<&0`, `&>log`) carrying no separator. A word opening with `--` is an option, and the word after
+# an option in <valued> (the register's arity-1 names, blank-separated) is that option's value
+# whatever it looks like, since the helper takes it so. A fence is a run of three or more
+# backticks up to three blanks in, closed only by a run at least as long with nothing after it, as
+# CommonMark reads them.
+# That grammar is the reader's boundary, and it is the boundary every scanner in this file has
+# (README, Tests: a scanner reads line shapes, and text crafted to carry the shape without the
+# substance, or the substance in another shape, is outside it -- ludics-lite#75). What this
+# establishes is that the options the prompt's commands SPELL agree with usage(); it does not
+# establish that every shell-valid encoding of an invocation is read. Encodings outside the
+# grammar are unread, not misread, and the prompt writes none of them: a quoted argument spanning
+# lines, a `$(…)` substitution standing as an argument, a redirection glued to the command word, a
+# word split by a backslash continuation, options held in a `$var`, a `~~~` fence. Each could be
+# added as a shape; none is, because the check reads the prompt's commands and not the shell's
+# language, and the list of encodings a shell accepts has no end that a scan would reach.
+invocation_options() {
+  awk -v valued=" $2 " '
+    # lex <line>: the words of one simple command into W[1..NW]; TERM and REST when a separator
+    # ended it, CONT when an unquoted backslash ends the line.
+    function lex(line,   i, n, c, q, word, have) {
+      NW = 0; REST = ""; TERM = 0; CONT = 0; q = ""; word = ""; have = 0
+      n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (q == "") {
+          if (c ~ /[[:space:]]/) { if (have) { W[++NW] = word; word = ""; have = 0 }; continue }
+          if (c == "\\") {
+            if (i == n) { CONT = 1; break }
+            word = word substr(line, ++i, 1); have = 1; continue
+          }
+          if (c == "\"" || c == "\047") { q = c; have = 1; continue }
+          if (c == "#" && !have) break
+          if (c == ";" || c == "|" || c == ")" || (c == "&" && substr(line, i + 1, 1) != ">")) {
+            TERM = 1; REST = substr(line, i + 1); break
+          }
+          if (c == "&") { i++; if (substr(line, i + 1, 1) == ">") i++; continue }
+          if ((c == ">" || c == "<") && substr(line, i + 1, 1) == "&") {
+            i++; while (substr(line, i + 1, 1) ~ /[0-9-]/) i++; continue
+          }
+          word = word c; have = 1; continue
+        }
+        if (c == q) { q = ""; continue }
+        if (q == "\"" && c == "\\" && substr(line, i + 1, 1) ~ /["\\$`]/) { word = word substr(line, ++i, 1); continue }
+        word = word c
+      }
+      if (have) W[++NW] = word
+    }
+    match($0, /^ {0,3}`{3,}/) {
+      run = RLENGTH - index($0, "`") + 1
+      if (!fence) { fence = 1; flen = run; cont = 0; skip = 0; next }
+      if (run >= flen && substr($0, RLENGTH + 1) ~ /^[[:space:]]*$/) { fence = 0; cont = 0; next }
+    }
+    !fence { cont = 0; next }
+    {
+      line = $0
+      while (1) {
+        lex(line)
+        start = 1
+        if (!cont) {
+          # The helper is a WORD whose last path component is its name, once the lexer has
+          # unquoted it -- so a quoted path, a `(` or an `out=$(` prefix all carry it, and
+          # `test-post-merge-cleanup.sh` does not.
+          start = 0
+          for (i = 1; i <= NW; i++)
+            if (W[i] ~ /(^|[^A-Za-z0-9_.-])post-merge-cleanup\.sh$/) { start = i + 1; skip = 0; break }
+          if (!start) { if (!TERM) break; line = REST; continue }
+        }
+        for (i = start; i <= NW; i++) {
+          if (skip) { skip = 0; continue }
+          if (W[i] !~ /^--./) continue
+          print W[i]
+          if (index(valued, " " W[i] " ") > 0) skip = 1
+        }
+        cont = CONT
+        if (!TERM) break
+        line = REST; cont = 0
+      }
+    }
+  ' "$1"
+}
+
+check_cleanup_options() {
+  local listed valued passed o n nl bad=0
+  nl=$'\n'
+  # A root without the helper documents no helper, so it carries no obligation -- the same rule as
+  # the drift guard's sync script and the slot count's worker.
+  [ -f "$ROOT/$CLEANUP_HELPER" ] || return 0
+  if [ ! -f "$ROOT/$CLEANUP_PROMPT" ]; then
+    ko "$CLEANUP_HELPER" "has no $CLEANUP_PROMPT to document its options in"
+    return 0
+  fi
+  listed=$(usage_options "$ROOT/$CLEANUP_HELPER")
+  if [ -z "$listed" ]; then
+    # Not a pass: an empty register would hold the prompt to nothing, in silence.
+    ko "$CLEANUP_HELPER" "usage() lists no options this reader can see: a heredoc line opening with two blanks and a --name"
+    return 0
+  fi
+  valued=$(printf '%s\n' "$listed" | awk -F'\t' '$2 == 1 { printf "%s ", $1 }')
+  listed=$(printf '%s\n' "$listed" | cut -f1)
+  n=$(printf '%s\n' "$listed" | grep -c .)
+  passed=$(invocation_options "$ROOT/$CLEANUP_PROMPT" "$valued" | sort -u)
+  while IFS= read -r o; do
+    [ -n "$o" ] || continue
+    # The token whole, and in the token grammar the invocation side uses: `--base` is not found
+    # inside `--base-branch` or `--base_branch`, and `.` is a literal.
+    matches "(^|[^A-Za-z0-9_.-])$(printf '%s' "$o" | sed 's/[.]/[.]/g')([^A-Za-z0-9_.-]|\$)" "$(cat "$ROOT/$CLEANUP_PROMPT")" \
+      || { ko "$CLEANUP_PROMPT" "names no '$o', which $CLEANUP_HELPER's usage() lists: the prompt is where the option is learned of (ludics-lite#276)"; bad=1; }
+  done <<<"$listed"
+  while IFS= read -r o; do
+    [ -n "$o" ] || continue
+    case "$nl$listed$nl" in *"$nl$o$nl"*) ;; *)
+      ko "$CLEANUP_PROMPT" "passes '$o' to $CLEANUP_HELPER, whose usage() lists no such option"; bad=1 ;;
+    esac
+  done <<<"$passed"
+  [ "$bad" -ne 0 ] \
+    || ok "$CLEANUP_PROMPT and $CLEANUP_HELPER's usage() agree on the helper's options ($n listed)"
+}
+
 # --- relative links and anchors ----------------------------------------------------------------
 # A prompt that points at another prompt points at a PATH, and since ludics-lite#260 often at a
 # HEADING inside it: that PR cut `issue-wave/SKILL.md` and its references into sections addressed
@@ -1479,6 +1664,7 @@ check_index routines/README.md routines/ routine
 check_fixtures
 check_slots
 check_drift_guard
+check_cleanup_options
 check_links
 
 echo

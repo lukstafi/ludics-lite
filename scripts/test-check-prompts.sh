@@ -980,6 +980,241 @@ out=$("$CP" "$R" 2>&1)
 grep -q 'drift' <<<"$out" && ko "a root without scripts/sync-routines.sh is held to a drift step" \
   || ok "...and a root without the sync script carries no drift obligation"
 
+# --- the post-merge-cleanup option register ---------------------------------------------------
+# ludics-lite#276 added `--regenerable` to post-merge-cleanup.sh's usage() and to ship-pr/SKILL.md
+# by hand, in the PR that found the prompt's prose about the base-owner gate had been false for
+# two PRs already. The tree is the REAL prompt and the REAL helper, copied, for the reason the
+# slot and drift probes give: the checker's shapes are the ones the real files use, and invented
+# ones would keep passing while the two drifted. Both READMEs come along for the index lookup and
+# $LINK_TARGETS for the link check; no fixture, no worker, no sync script.
+CLEANUP_HELPER=ship-pr/scripts/post-merge-cleanup.sh
+CLEANUP_PROMPT=ship-pr/SKILL.md
+CLEANUP_AGREE="$CLEANUP_PROMPT and $CLEANUP_HELPER's usage() agree"
+cleanup_tree() {
+  rm -rf "$R"
+  mkdir -p "$R/ship-pr/scripts"
+  # shellcheck disable=SC2086
+  copy_prompts "$R" README.md routines/README.md "$CLEANUP_PROMPT" $LINK_TARGETS
+  cp "$SRC/$CLEANUP_HELPER" "$R/$CLEANUP_HELPER"
+}
+# cleanup_edit <file> <sed-expression>: rewrites one copy, and says so if it matched nothing.
+cleanup_edit() {
+  sed "$2" "$R/$1" > "$R/cleanup.tmp" || { ko "cleanup_edit: sed failed on $1"; return 1; }
+  cmp -s "$R/cleanup.tmp" "$R/$1" && { ko "cleanup_edit: '$2' matched nothing in $1"; return 1; }
+  mv "$R/cleanup.tmp" "$R/$1"
+}
+# The one invocation line the mutations below rewrite, spelled the way the prompt spells it: a
+# continuation line carrying two options. Read off the prompt rather than restated, so a probe
+# goes stale at the edit that moves it instead of asserting over a line that is no longer there.
+CLEANUP_LINE=$(grep -n -- '^  --base [^ ]* --regenerable [^ ]*$' "$SRC/$CLEANUP_PROMPT" | sed 's/:.*//')
+CLEANUP_LINE=${CLEANUP_LINE%%$'\n'*}
+[ -n "$CLEANUP_LINE" ] \
+  || ko "the cleanup probes need a '  --base <b> --regenerable <d>' continuation line in $CLEANUP_PROMPT"
+
+cleanup_tree
+expect "the real prompt and the helper's usage() list the same options" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+
+# The drift ludics-lite#276 was: an option the helper gains that the prompt never names.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^\(  --base .*\)$/\1\
+  --dry-run             Report what cleanup would do and change nothing/'
+expect "an option usage() lists that the prompt never names is refused" 1 \
+  "$CLEANUP_PROMPT: names no '--dry-run'" -- "$CP" "$R"
+
+# ...and the other direction: an option the prompt passes that the helper does not take. On a
+# CONTINUATION line, which is where the real prompt keeps its options, so this also proves the
+# backslash is followed.
+cleanup_tree
+cleanup_edit "$CLEANUP_PROMPT" "${CLEANUP_LINE}s/\$/ --keep-branch/"
+expect "an option the prompt passes that usage() does not list is refused" 1 \
+  "$CLEANUP_PROMPT: passes '--keep-branch' to $CLEANUP_HELPER" -- "$CP" "$R"
+
+# A renamed option fails both ways at once: the listed name is gone from the prompt, and the name
+# the prompt now passes is one the helper does not take.
+cleanup_tree
+cleanup_edit "$CLEANUP_PROMPT" 's/--force-integrated/--force-merged/g'
+expect "a renamed option is refused as missing" 1 "names no '--force-integrated'" -- "$CP" "$R"
+grep -qF "passes '--force-merged'" <<<"$out" && ok "...and as passed unlisted" \
+  || ko "a renamed option is not also refused as passed unlisted -- $out"
+
+# The token whole: the prompt naming `--base-branch` does not name `--base`.
+cleanup_tree
+cleanup_edit "$CLEANUP_PROMPT" 's/--base\([^-]\)/--base-branch\1/g'
+expect "a longer option carrying the listed one as a prefix does not name it" 1 \
+  "names no '--base'" -- "$CP" "$R"
+
+# What is attributed to the helper is its own command line. The same `--flag` on another
+# command's line in a fence, or in prose, is not, so the register does not grow to cover every
+# tool the prompt mentions -- `gh pr merge --delete-branch` is already there in prose.
+cleanup_tree
+printf '\n```bash\ngh pr merge --delete-branch --squash\n```\n\nOr pass `--no-such-flag` to nothing.\n' >> "$R/$CLEANUP_PROMPT"
+expect "an option on another command's fenced line, or in prose, is nobody's" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/.claude/skills/ship-pr/scripts/test-post-merge-cleanup.sh --list\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...and the test runner, whose name ends in the helper's, is another command" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+# A command line outside a fence is prose quoting one.
+cleanup_tree
+printf '\nSome run `post-merge-cleanup.sh a b c --keep-branch` and regret it.\n' >> "$R/$CLEANUP_PROMPT"
+expect "an invocation quoted in prose is not a command line" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+# ...and a continuation is a trailing backslash: without it the next line is its own line, which
+# names no helper and so passes nothing.
+cleanup_tree
+cleanup_edit "$CLEANUP_PROMPT" "$((CLEANUP_LINE - 1))s/ \\\\\$//"
+cleanup_edit "$CLEANUP_PROMPT" "${CLEANUP_LINE}s/\$/ --keep-branch/"
+expect "a line the backslash no longer continues passes nothing" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+
+# The helper's command ends at the first shell separator: the `--json` of a `gh` chained after
+# it is that command's, and a command chained before it contributes nothing (round 1, P2).
+cleanup_tree
+printf '\n```bash\ngit fetch origin && ~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh a b c --base main; gh pr view --json number\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "an option of a command chained after the helper on its line is that command's" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh a b c --base main | tee log.txt \\\n  --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...and a continuation past a separator is not the helper's either" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+
+# Round 2, P2 x6: the shell's word boundaries, as far as the reader models them. Each is a shape
+# that let an unlisted option through (or refused a valid helper), and each is a line the prompt
+# could plausibly come to hold.
+# A second invocation after the separator is searched for too.
+cleanup_tree
+printf '\n```bash\ngh pr view; ~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh a b c --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "an invocation chained AFTER another command is still read" 1 \
+  "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --base main && ~/x/post-merge-cleanup.sh a b c --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...and a second invocation of the helper on one line" 1 "passes '--keep-branch'" -- "$CP" "$R"
+# A redirection's ampersand ends no command.
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c 2>&1 --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "an option after a redirection is still the helper's" 1 "passes '--keep-branch'" -- "$CP" "$R"
+# A quoted command word is the command.
+cleanup_tree
+printf '\n```bash\n"$HOME/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh" a b c --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a quoted helper path is still the helper" 1 "passes '--keep-branch'" -- "$CP" "$R"
+# A fence indented up to three blanks is a fence.
+cleanup_tree
+printf '\n   ```bash\n   ~/x/post-merge-cleanup.sh a b c --keep-branch\n   ```\n' >> "$R/$CLEANUP_PROMPT"
+expect "an indented fence is a fence" 1 "passes '--keep-branch'" -- "$CP" "$R"
+# The token is the whole word: a suffix the helper's parser refuses is not the listed prefix.
+cleanup_tree
+cleanup_edit "$CLEANUP_PROMPT" "${CLEANUP_LINE}s/--base main/--base_branch main/"
+expect "a misspelled option is reported whole, not truncated to its listed prefix" 1 \
+  "passes '--base_branch'" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_PROMPT" "${CLEANUP_LINE}s/--base main/--base=main/"
+expect "...and so is the = spelling, which the helper does not take" 1 "passes '--base=main'" -- "$CP" "$R"
+# `<<-` strips leading tabs from the body and the delimiter, and so does the reader.
+cleanup_tree
+TAB=$(printf '\t')
+cleanup_edit "$CLEANUP_HELPER" "/<<'EOF'/,/^EOF\$/{ s/<<'EOF'/<<-'EOF'/; /<<-'EOF'/!s/^/${TAB}/; }"
+expect "a <<- heredoc with a tab-indented body and delimiter is still the listing" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+
+# Round 3, P2 x6: the word model. A quoted word is unquoted; the helper's name is whole whatever
+# operator precedes it; a heredoc delimiter is any word; the listing side uses the same token
+# grammar as the invocation side; a fence closes only on a run as long as its opener; and the
+# word after a valued option is its value whatever it looks like.
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c "--keep-branch"\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a quoted option word is the option" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n(post-merge-cleanup.sh a b c --keep-branch)\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a bare invocation after a shell operator is the helper" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\nout=$(~/x/post-merge-cleanup.sh a b c --keep-branch)\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...and one inside a command substitution" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" "s/<<'EOF'/<<'USAGE-END'/; s/^EOF\$/USAGE-END/"
+expect "a heredoc delimiter that is not an identifier is still the delimiter" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_PROMPT" 's/--base\([^-A-Za-z0-9_]\)/--base_branch\1/g'
+expect "a misspelling in prose does not name the listed option" 1 "names no '--base'" -- "$CP" "$R"
+cleanup_tree
+printf '\n````bash\ncat <<X\n```\nX\n~/x/post-merge-cleanup.sh a b c --keep-branch\n````\n' >> "$R/$CLEANUP_PROMPT"
+expect "a three-backtick line inside a four-backtick fence does not close it" 1 \
+  "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --force-integrated --confirmed-by-GitHub --regenerable --cache\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a valued option's value is its value, however it is spelled" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --base \\\n  --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...across a continuation too" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+# ...while an option usage() lists with no <value> placeholder consumes nothing.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^\(  --base .*\)$/\1\
+  --dry-run             Report what cleanup would do and change nothing/'
+printf '\nPass `--dry-run` to rehearse.\n\n```bash\n~/x/post-merge-cleanup.sh a b c --dry-run --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a flag option consumes no value, so the word after it is read" 1 \
+  "passes '--keep-branch'" -- "$CP" "$R"
+
+# Round 4, P2 x2: the segment is lexed as the shell lexes it, so a separator inside a quoted or
+# escaped value ends nothing -- the shape that let an option past the register -- and an unquoted
+# `#` starts a comment the shell passes nothing from.
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --force-integrated "confirmed; by GitHub" --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a separator inside a double-quoted value ends nothing" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --force-integrated '"'"'a | b'"'"' --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...nor inside a single-quoted one" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --force-integrated confirmed\; --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...nor an escaped one" 1 "passes '--keep-branch'" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --base main # never pass --keep-branch here\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a trailing shell comment passes nothing" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --force-integrated "not # a comment" --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "...while a # inside a quoted value is text" 1 "passes '--keep-branch'" -- "$CP" "$R"
+
+# The listing side is a mention, verbatim, anywhere in the prompt: the option's command lines
+# deleted and its prose kept still names it. That is the residue this check states rather than
+# hides -- a name present says nothing about whether the prose around it is true.
+cleanup_tree
+cleanup_edit "$CLEANUP_PROMPT" '/^  --base [^ ]* --regenerable /d'
+expect "an option named only in prose is still named" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+
+# The register is read off usage()'s heredoc, and a usage() this reader sees no options in is
+# refused rather than holding the prompt to nothing.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --[a-z]/d'
+expect "a usage() listing no options is refused, not passed" 1 \
+  "$CLEANUP_HELPER: usage() lists no options" -- "$CP" "$R"
+# ...whatever the heredoc's delimiter is spelled as.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" "s/<<'EOF'/<<\"USAGE\"/; s/^EOF\$/USAGE/"
+expect "a heredoc under another delimiter is still the listing" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" "s/<<'EOF'/<< 'EOF'/"
+expect "...and with a blank between the operator and the delimiter (round 1, P2)" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" "s/cat >&2 <<'EOF'/cat <<'EOF' >\&2 # the usage text/"
+expect "...and with shell syntax after the delimiter (round 5, P2)" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+# A `}` inside the usage text is text: reading it as the function's close would end the register
+# at that line, and an option listed below it could leave the prompt unnoticed (round 1, P2).
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^\(  --base .*\)$/\1\
+}\
+  --dry-run             Report what cleanup would do and change nothing/'
+expect "a brace inside the heredoc does not end the listing" 1 \
+  "$CLEANUP_PROMPT: names no '--dry-run'" -- "$CP" "$R"
+
+# A helper with no prompt to document it is refused; a root with no helper carries no obligation,
+# as with the sync script and the worker.
+cleanup_tree
+rm "$R/$CLEANUP_PROMPT"
+expect "a helper without its prompt is refused" 1 "has no $CLEANUP_PROMPT" -- "$CP" "$R"
+fresh "$R"
+out=$("$CP" "$R" 2>&1)
+grep -q 'post-merge-cleanup' <<<"$out" && ko "a root without the helper is held to its option register" \
+  || ok "...and a root without the helper carries no option obligation"
+
 # --- relative links and anchors ---------------------------------------------------------------
 # ludics-lite#260 cut the wave prompt and its references into sections addressed by anchor, and
 # every one of those links was verified by hand, once; this is what re-verifies them. Two trees,
