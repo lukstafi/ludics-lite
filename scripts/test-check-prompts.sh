@@ -15,6 +15,13 @@ set -uo pipefail
 # foot, with the body's own indentation untouched (ludics-lite#10, #247); scripts/check-parse-guards.sh
 # checks the shape.
 {
+# This suite runs IN GitHub Actions as one of the lint job's steps, so GITHUB_ACTIONS is ambient
+# there and absent on every box it is run from at a prompt. The checker reads that variable to
+# pick the refusal's form (a sentence, or a ::error annotation), so a control that lets it through
+# passes locally and goes red only in CI (PR #303 closed the same class in test-preflight.sh).
+# Dropped once here, for every control below: the annotation form is asserted only where a
+# control sets the variable itself.
+unset GITHUB_ACTIONS
 HERE=$(cd "$(dirname "$0")" && pwd)
 CP="$HERE/check-prompts.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/check-prompts-test.XXXXXX") || exit 1
@@ -332,8 +339,9 @@ else ko "a second defective file went unreported -- $out"; fi
 # Under Actions each failure is also an annotation on the file.
 fresh "$R"; skill "$R" alpha 'name: alpah' 'description: x'
 expect "GitHub annotations name the file" 1 '::error file=alpha/SKILL.md::' -- env GITHUB_ACTIONS=true "$CP" "$R"
+# The bare call reads the suite-level `unset GITHUB_ACTIONS` at the top of the brace group.
 fresh "$R"; skill "$R" alpha 'name: alpah' 'description: x'
-out=$(env -u GITHUB_ACTIONS "$CP" "$R" 2>&1)
+out=$("$CP" "$R" 2>&1)
 grep -q '::error' <<<"$out" && ko "annotations leak outside Actions" \
   || ok "...and only under Actions"
 
