@@ -137,7 +137,14 @@ collect_files() { # fills FILES with the paths the globs expand to, relative to 
   # of judging trees git knows nothing about.
   TRACKED_FILES=()
   TRACKED_SCOPE=
-  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # The judged root must BE the work tree root, not merely sit inside one: a scratch tree created
+  # under a checkout (`--root ./tmp-fixture`, or a TMPDIR that lives there) is inside a work tree
+  # that tracks none of it, so asking git about it would filter every file away and refuse a tree
+  # the filesystem mode judges perfectly well (round 9).
+  local toplevel
+  toplevel=$(git rev-parse --show-toplevel 2>/dev/null) &&
+    toplevel=$(CDPATH= cd "$toplevel" 2>/dev/null && pwd -P)
+  if [ -n "${toplevel:-}" ] && [ "$toplevel" = "$ROOT" ]; then
     TRACKED_SCOPE=1
     # NUL-delimited, since a tracked path may hold anything but a NUL. The pathspec's `*` crosses
     # `/`, so one pattern reaches every depth.

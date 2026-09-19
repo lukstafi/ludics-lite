@@ -205,6 +205,17 @@ if git -C "$T" init -q >/dev/null 2>&1 && git -C "$T" add -A >/dev/null 2>&1; th
     1 'scripts/agent-scratch.sh does not parse' -- "$PF" --root "$T" syntax
   expect "...while outside a work tree the filesystem is the list, as the trees above rely on" \
     1 'does not parse' -- "$PF" --root "$TMP/syntax_broken" syntax
+  # A scratch tree INSIDE a work tree that tracks none of it is a filesystem scope, not an empty
+  # tracked one: asking git about it would filter every file away and refuse a judgeable tree.
+  mkdir -p "$T/nested/scripts"
+  printf '#!/usr/bin/env bash\nif [ ; then\n' >"$T/nested/scripts/inner.sh"
+  chmod +x "$T/nested/scripts/inner.sh"
+  mkdir -p "$T/nested/ship-pr/hooks" "$T/nested/askill/scripts"
+  printf '#!/usr/bin/env bash\ntrue\n' >"$T/nested/ship-pr/hooks/hook.sh"
+  printf '#!/usr/bin/env bash\ntrue\n' >"$T/nested/askill/scripts/s.sh"
+  chmod +x "$T/nested/ship-pr/hooks/hook.sh" "$T/nested/askill/scripts/s.sh"
+  expect "...and a scratch tree UNDER a work tree is judged, not filtered away by the repo above it" \
+    1 'scripts/inner.sh does not parse' -- "$PF" --root "$T/nested" syntax
 else
   ko "could not build a scratch git repository: the tracked-scope controls below would prove nothing"
 fi
@@ -302,13 +313,11 @@ expect "...and as an annotation on the file's line under GitHub Actions" \
 
 # Every `run:` command word in the lint job, and every one in the whole workflow.
 job_run_commands() { # job_run_commands <job>
-  awk -v want="  $1:" '
-    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_job = ($0 == want); next }
-    in_job && $1 == "run:" { print $2 }
+  awk -v want="  $1:" "$WORKFLOW_AWK"'
+    { i = cmd_at(); if (i && job == want) print $i }
   ' "$WORKFLOW"
 }
-# The command word of every `run:` line that is a LIVE, BARE invocation of that command: nothing
-# at all after the command word, and a step carrying no attribute that stops it failing the job.
+# THE BARE-INVOCATION RULE.
 #
 # The tail rule was three rounds of grammar before it was one line. Round 4 accepted any operator
 # tail, round 5 accepted `|| { ...; exit 1; }` by substring, round 6 anchored the match -- and
@@ -324,19 +333,34 @@ job_run_commands() { # job_run_commands <job>
 # an external command be satisfied by a step in ANY job -- check-prompts.sh is satisfied by the
 # prompt hygiene job, the only check a prompt-only head gets -- so a `continue-on-error: true` or
 # an `if: ${{ false }}` there would otherwise be invisible. A disabled step is not an invocation.
+# THE READER these four share. A run line is `run: <cmd> …` or the compact `- run: <cmd> …`, both
+# valid and both used in this workflow, so the command is at a field index rather than at field 2
+# (round 9). A step is live only when NOTHING above it can stop it: a JOB-level condition counts
+# as well as a step-level one, read apart from it because the first step of the job would
+# otherwise clear it and a whole pinned job could be switched off unseen (round 9). The only
+# condition accepted is `${{ !cancelled() }}`, which skips a cancelled run and nothing else.
+WORKFLOW_AWK='
+  function cmd_at(   ) {
+    if ($1 == "run:") return 2
+    if ($1 == "-" && $2 == "run:") return 3
+    return 0
+  }
+  function open_cond(c) {
+    return (c == "" || c ~ /^\$\{\{[ ]*![ ]*cancelled\(\)[ ]*\}\}$/)
+  }
+  function live() { return (!soft && open_cond(jcond) && open_cond(scond)) }
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job = $0; jcond = ""; scond = ""; soft = ""; next }
+  /^    if:/ { jcond = $0; sub(/^[[:space:]]*if:[[:space:]]*/, "", jcond); next }
+  /^      - / { scond = ""; soft = "" }
+  /^ +if:/ { scond = $0; sub(/^[[:space:]]*if:[[:space:]]*/, "", scond) }
+  /^ +continue-on-error:/ { soft = ($2 != "false") }
+'
+
+# The command word of every `run:` line that is a LIVE, BARE invocation: nothing at all after the
+# command word, in a step and a job that carry nothing able to stop it failing.
 workflow_bare_commands() {
-  awk '
-    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { cond = ""; soft = "" }
-    /^      - / { cond = ""; soft = "" }
-    $1 == "if:" { cond = $0; sub(/^[[:space:]]*if:[[:space:]]*/, "", cond) }
-    $1 == "continue-on-error:" { soft = ($2 != "false") }
-    function live() {
-      if (soft) return 0
-      if (cond != "" && cond !~ /^\$\{\{[ ]*![ ]*cancelled\(\)[ ]*\}\}$/) return 0
-      return 1
-    }
-    $1 == "run:" && NF == 2 && live() { print $2 }
-    $1 == "-" && $2 == "run:" && NF == 3 && live() { print $3 }
+  awk "$WORKFLOW_AWK"'
+    { i = cmd_at(); if (i && NF == i && live()) print $i }
   ' "$WORKFLOW"
 }
 
@@ -348,16 +372,8 @@ workflow_bare_commands() {
 # `${{ !cancelled() }}` this workflow uses for "run even after an earlier step failed", which
 # skips only a cancelled run.
 lint_disabled_runs() {
-  awk -v want="  lint:" '
-    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_job = ($0 == want); next }
-    !in_job { next }
-    /^      - / { cond = ""; soft = "" }
-    $1 == "if:" { cond = $0; sub(/^[[:space:]]*if:[[:space:]]*/, "", cond) }
-    $1 == "continue-on-error:" { soft = ($2 != "false") }
-    $1 == "run:" {
-      if (soft) { print $2; next }
-      if (cond != "" && cond !~ /^\$\{\{[ ]*![ ]*cancelled\(\)[ ]*\}\}$/) print $2
-    }
+  awk "$WORKFLOW_AWK"'
+    { i = cmd_at(); if (i && job == "  lint:" && !live()) print $i }
   ' "$WORKFLOW"
 }
 
@@ -365,15 +381,16 @@ lint_disabled_runs() {
 # not demand is one a runner losing that interpreter turns into a SKIP and a green job -- the
 # fail-closed half of this PR's own promise, dropped by deleting one word from a run line.
 lint_preflight_unguarded() {
-  awk -v want="  lint:" '
-    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_job = ($0 == want); next }
-    in_job && $1 == "run:" && $2 == "scripts/preflight.sh" {
-      for (i = 3; i <= NF; i++) if ($i == "-h" || $i == "--help") next
-      for (i = 3; i <= NF; i++) if ($i == "--require-tools") next
+  awk -v want="  lint:" "$WORKFLOW_AWK"'
+    {
+      i = cmd_at()
+      if (!i || job != want || $i != "scripts/preflight.sh") next
+      for (k = i + 1; k <= NF; k++) if ($k == "-h" || $k == "--help") next
+      for (k = i + 1; k <= NF; k++) if ($k == "--require-tools") next
       named = 0
-      for (i = 3; i <= NF; i++) {
-        if ($i ~ /^-/) { if ($i == "--root") i++; continue }
-        print $i
+      for (k = i + 1; k <= NF; k++) {
+        if ($k ~ /^-/) { if ($k == "--root") k++; continue }
+        print $k
         named = 1
       }
       if (!named) print "*"
@@ -385,17 +402,18 @@ lint_preflight_unguarded() {
 # a mode-bit step rewritten to a second `syntax` invocation would leave the mode rule unrun in CI
 # while the pin below stayed green, which is the drift this pin exists to catch (round 1).
 lint_preflight_steps() {
-  awk -v want="  lint:" '
-    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_job = ($0 == want); next }
-    in_job && $1 == "run:" && $2 == "scripts/preflight.sh" {
+  awk -v want="  lint:" "$WORKFLOW_AWK"'
+    {
+      i = cmd_at()
+      if (!i || job != want || $i != "scripts/preflight.sh") next
       # A help flag is not a run: `preflight.sh --help syntax` prints the manual and exits 0
       # without asserting anything, so the line covers NO step and the pin must say so rather
       # than read `syntax` off it (round 2).
-      for (i = 3; i <= NF; i++) if ($i == "-h" || $i == "--help") next
+      for (k = i + 1; k <= NF; k++) if ($k == "-h" || $k == "--help") next
       named = 0
-      for (i = 3; i <= NF; i++) {
-        if ($i ~ /^-/) { if ($i == "--root") i++; continue }
-        print $i
+      for (k = i + 1; k <= NF; k++) {
+        if ($k ~ /^-/) { if ($k == "--root") k++; continue }
+        print $k
         named = 1
       }
       if (!named) print "*"
@@ -662,6 +680,32 @@ if probe_workflow_swap '        run: scripts/check-scratch-dirs.sh' \
     || ko "continue-on-error on a lint step was not reported (verdict:$(lint_disabled_runs))"
 else
   ko "the swap probe rewrote nothing: the lint job no longer spells the scratch guard step as this file expects"
+fi
+
+# A JOB-level condition is the one above all of them, and the first step must not clear it.
+if probe_workflow_swap '  prompts:' \
+  '  prompts:
+    if: ${{ false }}'; then
+  grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+    && ko "a job-level 'if: false' left the job's steps counting as live" \
+    || ok "...nor is any step of a job whose own condition can skip the whole job"
+else
+  ko "the swap probe rewrote nothing: the workflow no longer opens the prompts job as this file expects"
+fi
+
+# The compact step form is valid YAML and is used in this workflow, so every reader must see it.
+if probe_workflow_swap '        run: scripts/check-jq-shapes.sh' \
+  '        run: scripts/check-something-compact.sh
+      - run: scripts/check-jq-shapes.sh'; then
+  compact=$(job_run_commands lint)
+  grep -Fqx -- scripts/check-jq-shapes.sh <<<"$compact" \
+    && ok "a compact '- run:' lint step reaches the table pin like any other" \
+    || ko "the compact '- run:' form was invisible to the lint reader (verdict:$compact)"
+  grep -Fqx -- scripts/check-something-compact.sh <<<"$compact" \
+    && ok "...and the step beside it is read too, so neither hides the other" \
+    || ko "a plain run line next to a compact one was not read"
+else
+  ko "the swap probe rewrote nothing: the lint job no longer spells the jq guard step as this file expects"
 fi
 
 # A condition is the other way to stop a step running without touching its run line.
