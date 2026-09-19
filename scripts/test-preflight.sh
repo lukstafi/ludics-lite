@@ -22,6 +22,12 @@ set -uo pipefail
 # foot, with the body's own indentation untouched (ludics-lite#10, #247); scripts/check-parse-guards.sh
 # checks the shape.
 {
+# This suite runs IN GitHub Actions as one of the lint job's steps, so GITHUB_ACTIONS is ambient
+# there and absent on every box it is run from at a prompt. Preflight reads that variable to pick
+# the refusal's form (a sentence, or a ::error annotation), so a control that lets it through
+# passes locally and goes red only in CI (PR #275). Dropped once here, for every control below: the
+# annotation form is asserted only where a control sets the variable itself, or passes --as-ci.
+unset GITHUB_ACTIONS
 HERE=$(cd "$(dirname "$0")" && pwd -P)
 ROOT=$(cd "$HERE/.." && pwd -P)
 PF="$HERE/preflight.sh"
@@ -335,22 +341,19 @@ expect "...and a failing step does not stop the ones after it, as CI's if:!cance
 
 tree annotation
 chmod -x "$T/scripts/ok.sh"
-# `env -u`, not a bare call: this suite runs IN GitHub Actions as one of the lint job's steps, so
-# GITHUB_ACTIONS is set in its own environment and a bare call there produced the annotation and
-# failed this control -- the one thing a green local run could not catch, since the variable is
-# absent on every box the preflight is run from. Both spellings are now asserted against an
-# environment this file controls rather than against the one it happens to run in.
+# The bare calls here see GITHUB_ACTIONS absent because the suite unsets it at the top of the
+# brace group (this control read the ambient variable in PR #275 and went red only in CI). The
+# annotation form is asserted twice: once with the variable set by the control itself, and once
+# through --as-ci, the local spelling of that environment, so it is the flag and not the box that
+# flips the form.
 expect "a refusal reads as a sentence outside CI" 1 'preflight: scripts/ok.sh: scripts/ok.sh is not executable' \
-  -- env -u GITHUB_ACTIONS "$PF" --root "$T" modes
+  -- "$PF" --root "$T" modes
 expect "...and as an annotation on the file's line under GitHub Actions" \
   1 '::error file=scripts/ok.sh::' -- env GITHUB_ACTIONS=true "$PF" --root "$T" modes
-# --as-ci is the local spelling of that environment (PR #275: the control above read the ambient
-# variable, went red only in CI, and cost a CI round and a review round before anyone could see
-# it at a prompt). Asserted under `env -u`, so it is the flag and not the box that flips the form.
 expect "...and --as-ci flips it to the annotation with the variable absent from the environment" \
-  1 '::error file=scripts/ok.sh::' -- env -u GITHUB_ACTIONS "$PF" --as-ci --root "$T" modes
+  1 '::error file=scripts/ok.sh::' -- "$PF" --as-ci --root "$T" modes
 expect "...without changing the verdict, which is still the failing step" \
-  1 '0 passed, 1 failed' -- env -u GITHUB_ACTIONS "$PF" --as-ci --root "$T" modes
+  1 '0 passed, 1 failed' -- "$PF" --as-ci --root "$T" modes
 
 # --- the pin: the lint job and the step table are one set of checks ---------------------------
 #
