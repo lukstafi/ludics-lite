@@ -260,6 +260,52 @@ test_the_grace_runs_from_the_first_read_of_the_tip() {
   assert_contains "$BASE_OUTPUT" "no run for the tip appeared" "the note should say what was waited for"
 }
 
+# --- the ceiling's own arithmetic (ludics-lite#175) --------------------------------------------
+# The grace is tested ONCE PER ROUND, after that round's own API calls, and rounds are one poll
+# interval apart. So between the last round before the grace expires and the first one after it
+# lies a whole interval — and a ceiling landing inside that interval ends the wait at NO VERDICT
+# for a tip the next round would have settled. `--wait=301` over a 300s grace was exactly that
+# number, and it is what the wave gate spelled until #175. The refusal is arithmetic over the two
+# knobs, not a blocklist of 301, so it holds wherever either of them is moved to.
+test_a_wait_that_cannot_outlive_its_grace_is_refused() {
+  reset_fixture
+  retune ABSENT_GRACE=300 CHECKS_INTERVAL=60
+  run_base --wait=301
+  assert_eq "$BASE_RC" 2 "a ceiling one second over the grace is a usage error, not a wait"
+  assert_contains "$BASE_OUTPUT" "--wait=301 cannot outlive the 300s absence grace" \
+    "the refusal should name the ceiling and the grace it was sized against"
+  assert_contains "$BASE_OUTPUT" "at least 360" "and the smallest ceiling that does reach the settle"
+  assert_contains "$BASE_OUTPUT" "at most 300" "and the bounded peek that is still allowed"
+  assert_eq "$(grep -c . "$REQUEST_LOG")" 0 \
+    "the refusal is arithmetic over two knobs and must cost no API read at all"
+}
+
+# The other end of the same band: one whole round of margin is enough, and a wait sized that way
+# is an ordinary wait — here it settles on the recognition, as any --wait would.
+test_a_wait_of_one_round_over_the_grace_is_accepted() {
+  reset_fixture
+  retune ABSENT_GRACE=300 CHECKS_INTERVAL=60
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5071}]')")
+  FILES_DEFAULT='[{"filename":"docs/notes.md"}]'
+  run_base --wait=360
+  assert_eq "$BASE_RC" 0 "grace plus one round is the derived ceiling and is a valid wait"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" "and it waits as any other does"
+}
+
+# A ceiling at or BELOW the grace is not the #175 mistake: it is a bounded peek — "tell me what
+# you have within N seconds" — which cannot settle an absence and says so, exit 4. Refusing it
+# would take away the only way to ask this command a time-boxed question, and every case in this
+# suite that reads a refusal at the ceiling asks exactly that.
+test_a_wait_inside_the_grace_is_a_bounded_peek_not_a_refusal() {
+  reset_fixture
+  retune ABSENT_GRACE=300 CHECKS_INTERVAL=60
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5081}]')")
+  FILES_DEFAULT='[{"filename":"src/main.ml"}]' # unrecognized: only the clock could settle this
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "a wait shorter than the grace reports no verdict, it is not refused"
+  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" "and it says so about the tip"
+}
+
 # A listed workflow with NO push run on this branch at all is not in the fold, so no filter of its
 # was read: it may be dispatch- or schedule-only, or a workflow the tip itself just added whose
 # first run is on its way. One workflow's docs-only diff cannot speak for it, so the FAST settle
@@ -354,6 +400,9 @@ tests=(
   test_a_workflow_file_without_a_filter_refuses_the_recognition
   test_a_run_in_flight_on_the_branch_keeps_the_wait
   test_the_grace_runs_from_the_first_read_of_the_tip
+  test_a_wait_that_cannot_outlive_its_grace_is_refused
+  test_a_wait_of_one_round_over_the_grace_is_accepted
+  test_a_wait_inside_the_grace_is_a_bounded_peek_not_a_refusal
   test_a_workflow_with_no_run_history_holds_the_fast_settle
   test_a_run_in_flight_at_the_tip_keeps_the_refusal
   test_a_stopped_run_at_the_tip_is_no_verdict_not_an_absence

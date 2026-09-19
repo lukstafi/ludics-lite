@@ -131,7 +131,7 @@ FW="$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
 export BASE_CALL_LOG="$TMP/base-calls"
 cat > "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$* grace=${SHIP_PR_BASE_ABSENT_GRACE:-unset}" >> "$BASE_CALL_LOG"
+printf '%s\n' "$* grace=${SHIP_PR_BASE_ABSENT_GRACE:-unset} interval=${SHIP_PR_CHECKS_INTERVAL:-unset}" >> "$BASE_CALL_LOG"
 if [ "$3" = retry ]; then
   [ -z "${SHIM_BASE_TIP_FAIL:-}" ] || exit 3
   ref="${6##*/}"
@@ -145,12 +145,18 @@ fi
 # Fail if the dispatch contract drifts; ambient REPO must not select this read.
 [ "$1" = --repo ] && [ "$2" = example/project ] && [ "$3" = base ] || exit 2
 [ "${SHIP_PR_BASE_ABSENT_GRACE:-}" = 300 ] || exit 3
-for knob in SHIP_PR_ADVISORY_CHECKS SHIP_PR_TEST_SOURCE_ONLY SHIP_PR_CHECKS_INTERVAL SHIP_PR_CHECKS_WAIT SHIP_PR_CHECKS_HEARTBEAT SHIP_PR_API_ATTEMPTS SHIP_PR_API_BACKOFF; do
+# Pinned, not cleared: the ceiling below is arithmetic over the grace AND this interval, so the
+# gate has to put both in force rather than leave one to the checker's default (ludics-lite#175).
+[ "${SHIP_PR_CHECKS_INTERVAL:-}" = 60 ] || exit 3
+for knob in SHIP_PR_ADVISORY_CHECKS SHIP_PR_TEST_SOURCE_ONLY SHIP_PR_CHECKS_WAIT SHIP_PR_CHECKS_HEARTBEAT SHIP_PR_API_ATTEMPTS SHIP_PR_API_BACKOFF; do
   [ -z "${!knob}" ] || exit 3
 done
 # The gate's one base read is the bounded --wait one: `base --wait` settles a path-filtered tip
 # for the older verdict itself (ludics-lite#156), so the gate has no second, plain read to make.
-case " $* " in *" --wait=301 "*) ;; *) exit 4 ;; esac
+# Its ceiling is DERIVED from the two knobs above — the grace plus one round of the checker's
+# wait — and is checked here as that arithmetic rather than against a literal, so a gate that
+# moved either knob and left the ceiling behind fails here (ludics-lite#175).
+case " $* " in *" --wait=$((SHIP_PR_BASE_ABSENT_GRACE + SHIP_PR_CHECKS_INTERVAL)) "*) ;; *) exit 4 ;; esac
 if [ -n "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] && [ ! -e "$SHIM_BASE_REQUIRE_PREFLIGHT" ]; then
   echo 'base read occurred before preflight'; exit 3
 fi
@@ -536,8 +542,13 @@ for verdict in 3 4; do
   expect "triage cannot override unknown $verdict" 1 "dispatch blocked" -- env SHIM_BASE_RC="$verdict" "$FW" gate --target-repo example/project --force --allow-red-base fix
 done
 expect "missing helper refuses with unknown diagnostic" 1 "checker missing" -- env SHIM_BASE_RC=0 bash -c 'mv "$1" "$1.saved"; "$2" gate --target-repo example/project; rc=$?; mv "$1.saved" "$1"; exit "$rc"' _ "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" "$FW"
-grep -Fxq -- '--repo example/project base topic --wait=301 grace=300' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
-grep -Fxq -- '--repo example/project base master --wait=301 grace=300' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
+grep -Fxq -- '--repo example/project base topic --wait=360 grace=300 interval=60' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
+grep -Fxq -- '--repo example/project base master --wait=360 grace=300 interval=60' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
+# The value itself, and the relation behind it: 360 is 300 + 60, a whole round of margin over the
+# grace. `--wait=301` left a one-second margin that one round's API latency swallowed, so the gate
+# reached its ceiling and refused dispatch for a docs-only tip the next round would have settled
+# (ludics-lite#175); the checker now refuses that band outright, and nothing here may spell it.
+grep -q -- '--wait=301 ' "$BASE_CALL_LOG" && ko "the hand-spelled 301 ceiling is back" || ok "no base read carries a ceiling inside the grace's own round"
 original_base=$(git -C "$proj" rev-parse origin/master)
 later_base=$(git -C "$proj" commit-tree 'HEAD^{tree}' -p HEAD -m later)
 expect "new worktree uses confirmed SHA despite later ref movement" 0 "LAUNCHED testbox/pinned-base" -- env SHIM_MOVE_REF_AFTER_CONFIRM="$later_base" "$FW" launch testbox pinned-base --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/pinned-base

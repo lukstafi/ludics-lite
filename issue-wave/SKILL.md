@@ -269,8 +269,12 @@ creates the worktree from it; a mismatch or an unreadable confirmation blocks di
 retry is explicit, after reconciling the branch. For an existing worktree and for native
 dispatch the recorded startup SHA stays the coordinator's responsibility.
 
-The read runs after the worker-box freshness preflight and uses the checker's `--wait=301`
-mode with its absence grace pinned to 300 seconds: a covered green exits at once, a pending base
+The read runs after the worker-box freshness preflight and uses the checker's bounded `--wait`
+mode with both of its clocks pinned: the absence grace at 300 seconds and the poll interval at 60.
+The ceiling is DERIVED from those two, `--wait=360`, and never spelled beside them: the grace is
+tested once per round, so a ceiling less than a whole round past it arrives first and refuses a
+tip that was about to settle - which is what the hand-spelled `--wait=301` did, and what the
+checker now refuses outright (ludics-lite#175). A covered green exits at once, a pending base
 blocks at the ceiling, and a tip with no run of its own settles for the older verdict - at once
 when the checker recognizes the tip's diff as entirely within the workflow's `paths-ignore`,
 otherwise once that absence outlives the grace (ludics-lite#156). A run in flight or stopped at

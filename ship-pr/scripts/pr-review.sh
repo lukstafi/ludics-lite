@@ -253,8 +253,12 @@
 #      SETTLES for the older verdict the plain read settles for, once nothing is in flight on the
 #      branch and no run for the tip exists to judge it. It settles at once, without the grace,
 #      when every commit on the first-parent path from the judged one up to the tip changes only
-#      paths within the workflow's own paths-ignore (ludics-lite#156). `checks`/`merge` apply it to the
-#      head before calling a build signal ABSENT rather than not-created-yet (ludics-lite#24),
+#      paths within the workflow's own paths-ignore (ludics-lite#156). A `base --wait=N` in the
+#      band (grace, grace+SHIP_PR_CHECKS_INTERVAL) is REFUSED: it is sized to outlive the grace
+#      and cannot reach the round that settles it (ludics-lite#175). `checks`/`merge` apply the
+#      grace to the head before calling a build signal ABSENT rather than not-created-yet
+#      (ludics-lite#24), and settle a run-less head at once on the same paths-ignore recognition,
+#      walking the PR's own commits from its merge base (ludics-lite#176),
 #      SHIP_PR_STALE_BASE=commits behind the base at which `merge` warns loudly (20; `off`
 #      silences the commit-count warning). A nonempty file overlap still warns at any count; no
 #      base-drift warning blocks the merge. SHIP_PR_ROUND_THRESHOLD=review rounds with findings
@@ -4480,6 +4484,28 @@ cmd_base() {
     shift
   done
   case "$wait_for" in '' | *[!0-9]*) die "base: --wait takes seconds, got '$wait_for'" ;; esac
+  # A --wait sized to outlive the absence grace, but not by a whole round, cannot reach the round
+  # that settles (ludics-lite#175). The grace is only ever tested once per round, after that
+  # round's own API calls, and rounds are one CHECKS_INTERVAL apart — so between the round before
+  # the grace expires and the one after it lies a whole interval, and a ceiling landing inside
+  # that interval ends the wait at NO VERDICT for a tip whose absence the next round would have
+  # settled. `--wait=301` over a 300s grace was exactly that, and read as a red-adjacent refusal
+  # by every caller of the wave gate.
+  #
+  # A --wait at or BELOW the grace is not that mistake and is not refused: it is a bounded peek —
+  # "tell me what you have within N seconds" — which cannot settle an absence and says so, exit 4.
+  # Only the band between the grace and one round past it is a number that means to outlive the
+  # grace and cannot.
+  if [ "$wait_for" -gt "$ABSENT_GRACE" ] &&
+    [ "$wait_for" -lt $((ABSENT_GRACE + CHECKS_INTERVAL)) ]; then
+    die "base: --wait=$wait_for cannot outlive the ${ABSENT_GRACE}s absence grace it is sized" \
+      "against. The absence of a run for the tip is only settled on the round AFTER the grace" \
+      "expires, and a round is one ${CHECKS_INTERVAL}s poll interval, so a ceiling in" \
+      "($ABSENT_GRACE, $((ABSENT_GRACE + CHECKS_INTERVAL))) always arrives first and reports NO" \
+      "VERDICT for a tip that was about to settle (ludics-lite#175). Use --wait of at least" \
+      "$((ABSENT_GRACE + CHECKS_INTERVAL)) (SHIP_PR_BASE_ABSENT_GRACE + SHIP_PR_CHECKS_INTERVAL)," \
+      "or --wait of at most $ABSENT_GRACE for a bounded peek that does not claim to settle one."
+  fi
   [ -n "$REPO" ] || REPO=$(repo_from_cwd) || true
   [ -n "$REPO" ] || die "base: name the repo — \`base owner/name [branch]\`, --repo, or REPO=." \
     "cwd inference only works from a checkout, and not from a background shell."

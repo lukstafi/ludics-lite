@@ -693,7 +693,15 @@ checks leave nothing to wait for (green as well as absent), the gate reads
 - a **checkless** head holds while it is inside `SHIP_PR_BASE_ABSENT_GRACE` (300s, measured from
   the fresher of the head's commit date and the PR's own `updated_at` — each validated on its own,
   so a long-local commit pushed just now counts as fresh and a future commit date does not blind
-  the gate), and only past that is `ABSENT` the verdict — with the evidence on the line.
+  the gate), and only past that is `ABSENT` the verdict — with the evidence on the line. A head
+  with **no run at all** skips that wait when the workflows' own `paths-ignore` says outright that
+  none can be created for it: every commit from the PR's merge base up to the head changes only
+  ignored paths, under every trigger a push or a pull request fires, and every workflow the
+  repository lists. Anything less than certain — an unparseable workflow, a pattern the
+  translation does not carry, a trigger with no filter, a range past the cap — refuses and costs
+  the grace, exactly as `base --wait` does (ludics-lite#176). The same grace is what
+  `base --wait`'s ceiling is sized against, and a `--wait` in the band between the grace and one
+  poll interval past it is refused: it cannot reach the round that settles (ludics-lite#175).
 
 Only the newest **completed** run of each workflow and event is judged, the same `filter=latest`
 semantics the check lookup asks for: a re-triggered invocation supersedes its own cancelled
