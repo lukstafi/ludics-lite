@@ -2492,15 +2492,25 @@ test_concurrent_commit_message_archive() {
     COMMIT_DONE="$done" RELEASE_MARKER="$TEST_ROOT/concurrent-commit-message.released" \
     HANDSHAKE_LIMIT="$limit" HANDSHAKE_STALL="$stall" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null; then
-    touch "$release"
-    wait "$commit_pid" >/dev/null 2>&1 || true
-    # The bounded wait above is still a wait, so a genuine hang still fails the case rather than
-    # being waited on forever -- but it must not be read as the helper's. Failing that removal is
-    # indistinguishable at the helper from a registration it could not unlock, and the helper's
-    # message is what four sightings in ludics-lite#216 were filed as.
+    # Read the stall marker BEFORE waiting on the commit. The marker means the fake git had
+    # already released the commit and then watched it miss its commit-msg hook for the whole
+    # budget, so that commit is wedged rather than slow -- and waiting on a wedged process is
+    # waiting until the harness kills the case at its deadline and reports a generic timeout,
+    # which buries this diagnosis and holds a -j slot for the full deadline. End it, then report.
+    # Its hooks need no killing of their own: the release marker the fake git wrote is already
+    # there, so the paused pre-commit hook leaves its poll, and the commit-msg hook only touches
+    # a file and exits.
     if [ -e "$stall" ]; then
+      kill "$commit_pid" 2>/dev/null
+      wait "$commit_pid" >/dev/null 2>&1 || true
       fail "fixture stall, not a helper failure: the released commit did not reach its commit-msg hook within $((limit / 10))s ($(cat "$stall") polls), so the fake git failed the helper's worktree removal"
     fi
+    # Not a stall: the commit may still be paused in its pre-commit hook, so release it and reap.
+    # The helper's own failure is the finding here -- a genuine registration it could not unlock
+    # is indistinguishable at the helper from the stall above, which is what four sightings in
+    # ludics-lite#216 were filed as.
+    touch "$release"
+    wait "$commit_pid" >/dev/null 2>&1 || true
     fail "cleanup failed while retaining a concurrent rejected commit message"
   fi
   if wait "$commit_pid"; then
