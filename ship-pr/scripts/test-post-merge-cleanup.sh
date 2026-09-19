@@ -210,20 +210,27 @@ setup_case() {
   esac
 }
 
-# Add tracked content to the topic after `setup_case` and land it in the base branch through the
-# integrator, the way a follow-up commit on a merged topic would reach `origin/master`. Stages the
-# given session paths, commits them with the first message, and merges the pushed topic under the
-# second. Refreshes `CASE_TOPIC_OID`, which `assert_cleaned` reads for the recovery ref.
-land_topic_change() {
-  local commit_message="$1" merge_message="$2"
-  shift 2
-  git -C "$CASE_SESSION" add -- "$@"
-  git -C "$CASE_SESSION" commit -m "$commit_message" >/dev/null
+# Land the session's current topic head in the base branch through the integrator, the way a
+# follow-up commit on a merged topic would reach `origin/master`: pushes the topic, merges it under
+# the given message, and pushes the base branch. Refreshes `CASE_TOPIC_OID`, which `assert_cleaned`
+# reads for the recovery ref. For a commit the test made itself; `land_topic_change` makes one.
+land_topic_head() {
+  local merge_message="$1"
   git -C "$CASE_SESSION" push origin topic >/dev/null
   git -C "$CASE_INTEGRATOR" fetch origin >/dev/null 2>&1
   git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "$merge_message" >/dev/null
   git -C "$CASE_INTEGRATOR" push origin "$CASE_BASE_BRANCH" >/dev/null
   CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
+}
+
+# Add tracked content to the topic after `setup_case` and land it through `land_topic_head`.
+# Stages the given session paths, commits them with the first message, and merges under the second.
+land_topic_change() {
+  local commit_message="$1" merge_message="$2"
+  shift 2
+  git -C "$CASE_SESSION" add -- "$@"
+  git -C "$CASE_SESSION" commit -m "$commit_message" >/dev/null
+  land_topic_head "$merge_message"
 }
 
 test_unchecked_out_master() {
@@ -1688,11 +1695,7 @@ test_ignored_data_during_topic_detach() {
   echo /value >"$CASE_SESSION/.gitignore"
   git -C "$CASE_SESSION" add .gitignore
   git -C "$CASE_SESSION" commit -m "ignore the tracked topic path" >/dev/null
-  git -C "$CASE_SESSION" push origin topic >/dev/null
-  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
-  git -C "$CASE_INTEGRATOR" fetch origin topic >/dev/null
-  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge topic ignore rule" >/dev/null
-  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  land_topic_head "merge topic ignore rule"
   fake_bin="$TEST_ROOT/ignored-data-during-topic-detach-bin"
   real_git=$(command -v git)
   log="$TEST_ROOT/ignored-data-during-topic-detach.log"
@@ -1869,11 +1872,7 @@ test_initialized_session_submodule_refusal() {
   git -c protocol.file.allow=always -C "$CASE_SESSION" submodule add \
     "$sub_remote" nested >/dev/null
   git -C "$CASE_SESSION" commit -m "add initialized submodule" >/dev/null
-  git -C "$CASE_SESSION" push origin topic >/dev/null
-  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
-  git -C "$CASE_INTEGRATOR" fetch origin topic >/dev/null
-  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge initialized submodule" >/dev/null
-  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  land_topic_head "merge initialized submodule"
   git_config "$CASE_SESSION/nested"
   git -C "$CASE_SESSION" config submodule.nested.ignore all
   echo unique >>"$CASE_SESSION/nested/payload"
@@ -1925,11 +1924,7 @@ test_escape_named_session_submodule_refusal() {
   git -C "$CASE_SESSION" update-index --add --cacheinfo "160000,$submodule_oid,$name"
   git -C "$CASE_SESSION" add .gitmodules
   git -C "$CASE_SESSION" commit -m "add escape-named submodule" >/dev/null
-  git -C "$CASE_SESSION" push origin topic >/dev/null
-  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
-  git -C "$CASE_INTEGRATOR" fetch origin topic >/dev/null
-  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge escape-named submodule" >/dev/null
-  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  land_topic_head "merge escape-named submodule"
   git -C "$CASE_SESSION" config submodule.nested.url "$sub_remote"
   git -C "$CASE_SESSION" config submodule.nested.active true
   git -C "$CASE_SESSION" config submodule.nested.ignore all
@@ -1984,11 +1979,7 @@ test_deinitialized_session_submodule_refusal() {
   git -c protocol.file.allow=always -C "$CASE_SESSION" submodule add \
     "$sub_remote" nested >/dev/null
   git -C "$CASE_SESSION" commit -m "add deinitialized submodule" >/dev/null
-  git -C "$CASE_SESSION" push origin topic >/dev/null
-  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
-  git -C "$CASE_INTEGRATOR" fetch origin topic >/dev/null
-  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge deinitialized submodule" >/dev/null
-  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  land_topic_head "merge deinitialized submodule"
   git_config "$CASE_SESSION/nested"
   echo unique >>"$CASE_SESSION/nested/payload"
   git -C "$CASE_SESSION/nested" add payload
