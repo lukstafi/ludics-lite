@@ -4071,9 +4071,21 @@ function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
   }
   return out
 }
-function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
-  if (tolower(unit) !~ /(^|[ \t([{<"\047`*,;:>])(close[sd]?|fix(e[sd])?|resolve[sd]?)([ \t)\]}>"\047`*,;:!?]|\.[^a-z0-9]|\.$|$)/) return
-  refs = refs_of(unit, repo)
+function scan(unit, quoted,   refs, cnt, parts, shown, cls, after) {
+
+  # FORWARD from the keyword, not across the whole unit. GitHub closing syntax is the keyword
+  # followed by the reference, so "Issues #1 and #2 are now fixed." closes neither -- and reporting
+  # it as closing both, with advice to reopen them, is the false claim this scan exists to avoid
+  # making (review round 15). Every reference in the incident this feature was built for stood
+  # AFTER its keyword, so nothing observed is lost. The match position is taken from the lowercased
+  # copy, whose byte offsets are the unit own; the boundary character the match consumed belongs to
+  # the keyword and not to what follows it.
+  # ONE match, which both decides that a keyword is present and says where it ends. A regex literal
+  # cannot be hoisted into a variable in awk -- `V = /re/` assigns the RESULT of matching $0 -- and
+  # a second copy of this expression would be a copy that has to stay in step with the first.
+  if (match(tolower(unit), /(^|[ \t([{<"\047`*,;:>])(close[sd]?|fix(e[sd])?|resolve[sd]?)([ \t)\]}>"\047`*,;:!?]|\.[^a-z0-9_]|\.$|$)/) == 0) return
+  after = substr(unit, RSTART + RLENGTH)
+  refs = refs_of(after, repo)
   if (refs == "") return
   cnt = split(refs, parts, " ")
   if (cnt < 2 && !quoted) return
@@ -4289,8 +4301,13 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
     # are about to close (review round 8) -- the same stale finding the WITHDRAWN line below exists
     # to prevent, reached by a different route.
     if [ -n "$again" ] && [ -n "$MULTI_CLOSE_HAVE" ] && [ -n "$MULTI_CLOSE_LAST" ]; then
-      multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1 no longer targets the default" \
-        "branch, so the keywords above bind nothing on this merge."
+      if [ -n "$MULTI_CLOSE_STRONG" ]; then
+        multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1 no longer targets the" \
+          "default branch, so the keywords above bind nothing on this merge."
+      else
+        multi_close_say "CLOSING-KEYWORD NOTICE WITHDRAWN: $REPO#$1 no longer targets the default" \
+          "branch, so the keyword flagged above binds nothing on this merge."
+      fi
       MULTI_CLOSE_LAST=""
       MULTI_CLOSE_STRONG=""
       MULTI_CLOSE_HAVE=""
@@ -4331,7 +4348,13 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
   if [ -n "$again" ] && [ -n "$MULTI_CLOSE_HAVE" ]; then
     if [ "$body" = "$MULTI_CLOSE_BODY" ]; then
       if [ -n "$scan" ]; then
-        if [ -n "$MULTI_CLOSE_STRONG" ]; then
+        if [ -n "$MULTI_CLOSE_STRONG" ] && [ "$n_quoted" -gt 0 ]; then
+          # Mixed: "what it listed" would sweep the quoted entry into a closing claim the scan
+          # refuses to make about it (review round 15). Each class is confirmed in its own terms.
+          multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body is UNCHANGED since the scan" \
+            "above, so the merge closes the issues its WARNING listed;"
+          multi_close_say "  the line its NOTICE flagged is still there, and still claims nothing."
+        elif [ -n "$MULTI_CLOSE_STRONG" ]; then
           multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body is UNCHANGED since the scan" \
             "above, so the merge closes what it listed."
         else

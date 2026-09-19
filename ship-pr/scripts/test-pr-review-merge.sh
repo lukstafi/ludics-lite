@@ -564,7 +564,8 @@ test_the_same_issue_named_twice_is_one_issue() {
   assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
     "a repeated reference is not a second issue"
   # Two distinct ones in the same shape still warn, so the dedupe did not disarm the rule.
-  PR_BODY='The request in #610 is complete, so this closes #611.
+  # #610 stands BEFORE the keyword, so only #611 is bound -- see the forward-binding case below.
+  PR_BODY='This closes #610 and #611.
 '
   run_merge
   assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #610 #611" "two distinct ones still warn"
@@ -876,13 +877,13 @@ test_a_schemeless_url_containing_a_delimiter_is_stripped() {
 # letter read as punctuation and a French past participle matched as a closing keyword.
 test_a_non_ascii_word_is_not_a_keyword() {
   reset
-  PR_BODY='Les problemes #665 et #666 sont fixes.
+  PR_BODY='Ceci fixes #665 et #666.
 '
   run_merge
   assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #665 #666" \
     "the ASCII spelling really is a keyword, so the case has something to distinguish"
   reset
-  PR_BODY=$(printf 'Les probl\303\250mes #665 et #666 sont fix\303\251s.\n')
+  PR_BODY=$(printf 'Ceci fix\303\251s #665 et #666.\n')
   run_merge
   assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
   assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
@@ -1188,11 +1189,77 @@ test_a_dotted_token_containing_a_keyword_is_not_a_keyword() {
 '
   run_merge
   assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #718 #719" "a colon still bounds a keyword"
+  # Round 15 corrected this: a keyword ENDING the sentence binds nothing, because GitHub closing
+  # syntax is the keyword followed by the reference. Round 14 asserted the opposite here, on my
+  # reasoning about the dot rather than about GitHub.
   PR_BODY='Issues #720 and #721 are now fixed.
 '
   run_merge
-  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #720 #721" \
-    "a keyword ending the sentence still binds the references before it"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" \
+    "references standing before the keyword are not bound by it"
+}
+
+# Review round 15, P2. GitHub closing syntax is the keyword FOLLOWED BY the reference, so a
+# reference standing before the keyword is not bound -- and reporting one as closed, with advice to
+# reopen it, is the false claim this scan exists to avoid making.
+test_references_before_the_keyword_are_not_bound() {
+  reset
+  PR_BODY='Issues #722 and #723 are now fixed.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "neither reference follows the keyword"
+  # One before and one after binds only the one after, which is one issue and so silent.
+  PR_BODY='#724 is done, and this closes #725.
+'
+  run_merge
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "only the reference after the keyword binds"
+  # The incident this feature was built for had both references after the keyword.
+  PR_BODY='Resolves #726 and #727 for the phase
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #726 #727" "forward binding still warns"
+}
+
+# Review round 15, P2. The fourth register path: a retarget off the default branch retracted a
+# quoted-only finding with WARNING WITHDRAWN.
+test_a_retarget_withdrawal_keeps_the_finding_register() {
+  reset
+  PR_BODY='> Closes #728
+'
+  PR_BASE=main
+  BASE_LATER=release-1.2
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge still lands ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD NOTICE WITHDRAWN" "a notice is withdrawn as one"
+  assert_not_contains "$MERGE_STDOUT" "WARNING WITHDRAWN" "and never promoted to a warning"
+}
+
+# Review round 15, P2. A mixed body: "closes what it listed" swept the quoted entry into a claim
+# the scan refuses to make about it.
+test_a_mixed_unchanged_body_confirms_each_class_in_its_own_terms() {
+  reset
+  PR_BODY='Closes #729 and #730
+
+> Closes #731
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "closes the issues its WARNING listed" \
+    "the confirmation is scoped to the sentence finding"
+  assert_contains "$MERGE_STDOUT" "still claims nothing" "and the quoted entry keeps its register"
+  assert_not_contains "$MERGE_STDOUT" "so the merge closes what it listed" \
+    "the unscoped wording is gone on a mixed body"
+}
+
+# Review round 15, P2. A dot followed by an identifier continuation is not a boundary either.
+test_a_dot_underscore_token_is_not_a_keyword() {
+  reset
+  PR_BODY='#801 and #802 use fix._config
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "a dotted identifier is not a directive"
 }
 
 tests=(
@@ -1256,6 +1323,10 @@ tests=(
   test_control_bytes_in_the_body_cannot_forge_the_warning
   test_an_edited_body_with_a_quoted_only_finding_keeps_notice_wording
   test_a_dotted_token_containing_a_keyword_is_not_a_keyword
+  test_references_before_the_keyword_are_not_bound
+  test_a_retarget_withdrawal_keeps_the_finding_register
+  test_a_mixed_unchanged_body_confirms_each_class_in_its_own_terms
+  test_a_dot_underscore_token_is_not_a_keyword
 )
 
 run_tests "${tests[@]}"

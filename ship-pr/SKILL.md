@@ -192,8 +192,10 @@ sentence carries a closing keyword and more than one `#N` or when a closing keyw
 quoted (`> …`) or fenced line, where an example closes exactly as a statement does (that is how
 #226's own body closed #205 a second time) — a warning and not a refusal, because one sentence
 closing two issues is sometimes what was meant. Its two findings carry different weight on
-purpose. A sentence binding two or more `#N` is read off the text alone and says outright what the
-merge closes; a quoted or fenced line is flagged to be READ and claims nothing about closing,
+purpose. A sentence where two or more `#N` FOLLOW the keyword is read off the text alone and says
+outright what the merge closes — GitHub binds a keyword forward, to the references after it, so
+"Issues #1 and #2 are now fixed." closes neither, while the advice above to keep any other
+reference out of that sentence is the conservative form of the same rule; a quoted or fenced line is flagged to be READ and claims nothing about closing,
 because telling an example from prose means classifying Markdown blocks and this is a best-effort
 reading rather than a CommonMark parser — a list-relative fence, lazy blockquote continuation or an
 unusual list marker can be misread in either direction. Its silence is likewise not a clean body:
