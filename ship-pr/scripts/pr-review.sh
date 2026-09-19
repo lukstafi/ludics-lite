@@ -3980,9 +3980,17 @@ refuse_merge_queue() {
 # callers are told to write. What that costs is a sentence WRAPPED across a line break with its
 # references split over it, which this scanner does not see. More shapes it does not read: an
 # issue closed through a full issue URL, and a four-space-indented code block (a fenced one it does
-# read), a blockquote or fence on a CONTINUATION line of a list item, whose indentation is relative
-# to a container this scanner does not model, and a sentence split at an abbreviation period. All
-# of them are named in SKILL.md, so the silence is not mistaken for a clean body.
+# read) and a sentence split at an abbreviation period, all named in SKILL.md so the silence is not
+# mistaken for a clean body.
+#
+# The BLOCK classification -- which lines are quoted or fenced -- is a best-effort reading and not
+# a CommonMark parser. Twelve review rounds established that a correct one is exactly that parser:
+# fence delimiters closing at list-relative indentation, list padding measured in tab-expanded
+# columns from the marker's own column, lazy blockquote continuation lines, ordered markers that
+# cannot interrupt a paragraph. Rather than approximate those one round at a time, the quoted class
+# was made to claim nothing about closing (see the emit loop below), so a misreading costs a line
+# flagged for a look and never a false statement about what a merge did. ludics-lite#283 carries
+# the residue.
 #
 # One offending unit per line on stdout: "<class><TAB><count><TAB><refs><TAB><the sentence>", where
 # <class> is `sentence` (a closing keyword binding two or more references) or `quoted` (a keyword
@@ -4133,7 +4141,11 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
   # awks this fleet runs. A CLOSING fence also carries no info string -- only spaces or tabs may
   # follow its run -- so a content line that merely STARTS with the delimiter does not end the
   # block (review round 2); an opening fence may carry one, which is what ````markdown is.
-  if (!indented && (substr(trimmed, 1, 3) == "```" || substr(trimmed, 1, 3) == "~~~")) {
+  # Opening a fence needs the line not to be indented code; CLOSING one does not. A fence opened
+  # on a list-marker line has its delimiter indented as a continuation of that item, and refusing
+  # to read it left the fence open over the whole rest of the body (review round 12). Closing early
+  # is also the conservative error: what follows reads as ordinary prose rather than as an example.
+  if ((fence || !indented) && (substr(trimmed, 1, 3) == "```" || substr(trimmed, 1, 3) == "~~~")) {
     fch = substr(trimmed, 1, 1)
     flen = 0
     while (substr(trimmed, flen + 1, 1) == fch) flen++
@@ -4325,16 +4337,37 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
   MULTI_CLOSE_BODY="$body"
   MULTI_CLOSE_HAVE=1
   [ -n "$scan" ] || return 0
+  # The two classes make DIFFERENT claims, and only one of them rests on the block classifier.
+  #
+  # A multi-reference sentence is a fact about the text: a keyword and two references in one
+  # sentence, no Markdown structure consulted. It says outright that the merge closes both.
+  #
+  # A quoted-or-fenced line is a claim that the line is an EXAMPLE, and telling an example from
+  # prose means classifying Markdown blocks. Nine review rounds established that doing that
+  # correctly is a CommonMark block parser -- list-relative fence delimiters, tab-expanded list
+  # padding, lazy blockquote continuation, markers that cannot interrupt a paragraph -- and that
+  # every approximation short of one has corners. So this class no longer asserts that anything
+  # closes and no longer offers to reopen an issue: it flags a line to look at, which is a claim
+  # the classifier can support even when it is wrong. That is what stops a parsing corner from
+  # producing a false statement about what a merge did (review round 12).
+  local n_sentence n_quoted
+  n_sentence=$(grep -c "^sentence$(printf '\t')" <<<"$scan") || n_sentence=0
+  n_quoted=$(grep -c "^quoted$(printf '\t')" <<<"$scan") || n_quoted=0
   # The body is data from the PR, so every line of it is written through printf and never echoed.
   while IFS=$'\t' read -r class cnt refs sent; do
     [ -n "$class" ] || continue
     n=$((n + 1))
     if [ "$n" -eq 1 ]; then
-      multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body closes issues it does not look" \
-        "like it closes:"
+      if [ "$n_sentence" -gt 0 ]; then
+        multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body closes issues it does not look" \
+          "like it closes:"
+      else
+        multi_close_say "CLOSING-KEYWORD NOTICE: $REPO#$1's body carries a closing keyword in what" \
+          "reads as an example:"
+      fi
     fi
     case "$class" in
-    quoted) multi_close_say "  a QUOTED or FENCED line, which closes just the same -- $cnt: $refs" ;;
+    quoted) multi_close_say "  reads as a QUOTED or FENCED example, $cnt reference(s): $refs" ;;
     *) multi_close_say "  ONE sentence, $cnt issues: $refs" ;;
     esac
     multi_close_say "      $sent"
@@ -4344,6 +4377,14 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
     "fenced copy of an example binds the same way:"
   multi_close_say "  ludics-lite#205 was closed twice over exactly that, by a phase reference" \
     "in #210 and then by #226 quoting it back."
+  if [ "$n_quoted" -gt 0 ]; then
+    multi_close_say "  A line is judged an example by a best-effort reading of the Markdown, not" \
+      "by a parser, so one flagged above"
+    multi_close_say "  may be ordinary prose. Read it; nothing is claimed about what it closes."
+  fi
+  if [ "$n_sentence" -eq 0 ]; then
+    return 0
+  fi
   # EDIT first, reopen only after. Every scan prints BEFORE its merge attempt -- the lead-time one
   # before a wait that may end in a refusal, the authoritative one moments before the call -- so at
   # the point these lines are read nothing has closed yet, and "reopen it now" was advice that

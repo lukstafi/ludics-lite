@@ -326,9 +326,9 @@ Closes #403
   run_merge
   assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
   assert_contains "$MERGE_CALLS" "pr merge" "the merge call is still made"
-  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #205" \
+  assert_contains "$MERGE_STDOUT" "reads as a QUOTED or FENCED example, 1 reference(s): #205" \
     "a quoted keyword is reported at ONE reference"
-  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #206" \
+  assert_contains "$MERGE_STDOUT" "reads as a QUOTED or FENCED example, 1 reference(s): #206" \
     "a fenced one too"
   assert_contains "$MERGE_STDERR" "#205" "the quoted finding reaches stderr as well"
   assert_not_contains "$MERGE_STDOUT" "403" "the plain single-issue Closes line is not reported"
@@ -383,7 +383,7 @@ Closes #411
 '
   run_merge
   assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
-  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #410" \
+  assert_contains "$MERGE_STDOUT" "reads as a QUOTED or FENCED example, 1 reference(s): #410" \
     "the inner fence must not close the four-backtick one"
   assert_not_contains "$MERGE_STDOUT" "411" "the plain line after the real fence close is silent"
 }
@@ -502,7 +502,7 @@ Closes #427
 '
   run_merge
   assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
-  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #426" \
+  assert_contains "$MERGE_STDOUT" "reads as a QUOTED or FENCED example, 1 reference(s): #426" \
     "a delimiter with a suffix does not close the block"
   assert_not_contains "$MERGE_STDOUT" "427" "the line after the real close is outside the block"
 }
@@ -521,9 +521,9 @@ Closes #603
 '
   run_merge
   assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
-  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #601" \
+  assert_contains "$MERGE_STDOUT" "reads as a QUOTED or FENCED example, 1 reference(s): #601" \
     "a quote behind a list marker is quoted"
-  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #602" \
+  assert_contains "$MERGE_STDOUT" "reads as a QUOTED or FENCED example, 1 reference(s): #602" \
     "and behind an ordered one too"
   assert_not_contains "$MERGE_STDOUT" "603" "the plain line is still silent"
 }
@@ -747,7 +747,7 @@ Closes #643
 ```
 '
   run_merge
-  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #643" \
+  assert_contains "$MERGE_STDOUT" "reads as a QUOTED or FENCED example, 1 reference(s): #643" \
     "a valid info string still opens a fence"
 }
 
@@ -947,13 +947,13 @@ test_an_over_long_numeric_prefix_is_not_a_list_marker() {
 '
   run_merge
   assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
-  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" \
     "a ten-digit prefix is text, not an ordered marker"
   # A marker of a length Markdown does accept still peels, so the round-3 fix survives.
   PR_BODY='123456789. > Closes #681
 '
   run_merge
-  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #681" \
+  assert_contains "$MERGE_STDOUT" "reads as a QUOTED or FENCED example, 1 reference(s): #681" \
     "a nine-digit marker is still a list marker"
 }
 
@@ -1000,7 +1000,7 @@ test_a_list_marker_does_not_swallow_code_indentation() {
   run_merge
   assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
   assert_not_contains "$MERGE_STDOUT" "688" "four columns past the padding is code"
-  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #689" \
+  assert_contains "$MERGE_STDOUT" "reads as a QUOTED or FENCED example, 1 reference(s): #689" \
     "one space of padding is still a list item with a quote in it"
 }
 
@@ -1040,6 +1040,47 @@ test_an_unchanged_body_still_reports_a_lost_comparison() {
   assert_contains "$MERGE_STDOUT" "is UNCHANGED since the scan above" "the body did not move"
   assert_contains "$MERGE_STDOUT" "whether they bind could NOT be re-read" \
     "but whether the keywords bind is no longer known"
+}
+
+# Review round 12, P2. A fence opened on a list-marker line has its closing delimiter indented as a
+# continuation of that item; refusing to read an indented delimiter left the fence open over the
+# rest of the body. An OPEN fence now closes on a matching delimiter whatever its indentation.
+test_an_indented_delimiter_closes_an_open_fence() {
+  reset
+  PR_BODY='- ```
+      example
+      ```
+
+Closes #694
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" \
+    "the fence closed, so the plain line after it is not an example"
+}
+
+# Review round 12, convergence. The two findings make different claims, and only one of them rests
+# on the block classifier: a quoted or fenced line is flagged to be READ, and says nothing about
+# what closes, so a misreading of the Markdown cannot produce a false statement about a merge.
+test_a_quoted_finding_claims_nothing_about_closing() {
+  reset
+  PR_BODY='> Closes #695
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD NOTICE" "a quoted-only body is a notice"
+  assert_contains "$MERGE_STDOUT" "reads as a QUOTED or FENCED example, 1 reference(s): #695" \
+    "and names the line"
+  assert_contains "$MERGE_STDOUT" "may be ordinary prose" "and says the reading is best-effort"
+  assert_not_contains "$MERGE_STDOUT" "EDIT THE BODY now" "no reopen remedy for a flagged line"
+  assert_not_contains "$MERGE_STDOUT" "gh issue reopen" "and no reopen command"
+  # A multi-reference sentence still makes the strong claim, because it consults no Markdown.
+  reset
+  PR_BODY='Closes #696 and #697
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD WARNING" "a sentence finding is still a warning"
+  assert_contains "$MERGE_STDOUT" "EDIT THE BODY now" "and still carries the remedy"
 }
 
 tests=(
@@ -1096,6 +1137,8 @@ tests=(
   test_a_port_in_a_schemeless_url_is_stripped
   test_a_clean_body_edited_to_another_clean_body_is_silent
   test_an_unchanged_body_still_reports_a_lost_comparison
+  test_an_indented_delimiter_closes_an_open_fence
+  test_a_quoted_finding_claims_nothing_about_closing
 )
 
 run_tests "${tests[@]}"
