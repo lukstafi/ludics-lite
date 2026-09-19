@@ -447,7 +447,16 @@ still contributes an anchor, which can accept a link GitHub would not resolve bu
 from its source — inline link syntax, an HTML tag, a character entity — or which carries a letter
 past ASCII, is one whose anchor it will not spell: it reports no slug and says so, rather than
 answering with the source reading, which would refuse the right anchor and accept one GitHub never
-creates. `test-check-prompts.sh` runs it against scratch trees,
+creates. It also holds `ship-pr/SKILL.md` to `post-merge-cleanup.sh`'s own option register: every
+option the helper's `usage()` heredoc lists is named, verbatim, somewhere in the prompt, and every
+`--option` the prompt's fenced command lines pass to the helper is one the heredoc lists. Which
+`--flag` in the prompt is the helper's is a line shape — a fenced line naming
+`post-merge-cleanup.sh`, plus the lines a trailing backslash continues it onto — so a flag of `gh`
+or of the test runner is attributed to nothing, and an option the prompt only discusses is held
+from the listing side alone. ludics-lite#276 added `--regenerable` to the helper and to the prompt
+by hand, in the PR that found the prompt's prose about the base-owner gate had been false through
+two earlier PRs; the name being present is what this pins, and whether the prose around it is true
+stays the review question it was. `test-check-prompts.sh` runs it against scratch trees,
 one per defect, with the well-formed tree as the control, and ends by running it on this checkout.
 
 `check-jq-shapes.sh` is the jq shape guard, run in the lint job on every head over every

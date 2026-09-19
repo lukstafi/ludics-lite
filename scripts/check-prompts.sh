@@ -21,7 +21,7 @@
 # directory carrying a SKILL.md is named, in backticks, in the first cell of a row there, so a new
 # prompt cannot land unindexed. That is a lookup, not a rendering claim: see `indexed` below for
 # what it stopped asserting when the table scanner went (ludics-lite#75).
-# Four cross-file agreements ride along, each pinning a fact the prompts only restate: every test
+# Five cross-file agreements ride along, each pinning a fact the prompts only restate: every test
 # fixture has a command in the README's register and a run line on each CI platform it needs, and
 # every file that quotes the mac-studio correctness-slot count quotes the one fleet-worker.sh
 # actually defaults to (ludics-lite#160) -- which files those are is discovered, not listed.
@@ -29,6 +29,11 @@
 # requires each of their prompts to RUN that script -- the command line, not a mention of the
 # name -- so the step 0 that makes an installed copy's drift visible cannot be edited away in
 # silence (ludics-lite#199).
+#
+# A fifth compares ship-pr/SKILL.md with post-merge-cleanup.sh's usage(): every option the
+# heredoc lists is named in the prompt, and every `--option` the prompt's fenced command lines
+# pass to the helper is one usage() lists -- the two files ludics-lite#276 found edited apart
+# (see `check_cleanup_options` for what "of the helper" means on the prompt's side).
 #
 # A fourth reads the relative Markdown links in those prompts, their reference files and the two
 # READMEs: the path a `](….md)` link spells exists relative to the linking file, and an anchor on
@@ -901,6 +906,98 @@ check_drift_guard() {
   [ "$bad" -ne 0 ] || ok "every routine $SYNC_SCRIPT installs runs it to read its own drift"
 }
 
+# --- the post-merge-cleanup option register ----------------------------------------------------
+# ship-pr/SKILL.md is where an operator learns what post-merge-cleanup.sh takes, and the two are
+# edited apart: ludics-lite#276 added `--regenerable` to the helper's usage() and documented it in
+# the prompt by hand, in the same PR that found the prompt's prose about the base-owner gate had
+# been false through at least two earlier PRs. Nothing but a reader compares the two files, so
+# this pins the one fact a lookup can see, in both directions: every option usage()'s heredoc
+# LISTS is named, verbatim, somewhere in the prompt, and every `--option` the prompt PASSES to the
+# helper is one usage() lists. What is an option OF the helper, on the prompt's side, is a line
+# shape and not a judgement: the helper's command lines -- a line inside a backtick fence naming
+# `post-merge-cleanup.sh`, and every line a trailing backslash continues it onto. A `--flag` in
+# prose, or on some other command's line (`gh pr merge --delete-branch`, the test runner's
+# `--list`), is attributed to nothing, so an option the prompt explains but never passes is not
+# held to the register from that side. And a name present is a name present: whether the prose
+# around it is still true is the review question ludics-lite#276 was, which no scan settles.
+CLEANUP_HELPER=ship-pr/scripts/post-merge-cleanup.sh
+CLEANUP_PROMPT=ship-pr/SKILL.md
+
+# usage_options <script>: the options usage()'s heredoc lists, one per line -- each line of the
+# body, between the `usage() {` line and its closing `}`, that opens with two blanks and a
+# `--name`, which is the listing's own shape (`  --base <branch>  Base branch …`). The delimiter is
+# whatever the `<<` names, quoted or not, so the reader is not tied to `EOF`; the prose below the
+# listing, which mentions an option mid-sentence, is at no such indent and is not read.
+usage_options() {
+  awk '
+    !infn && /^usage\(\) \{/ { infn = 1; next }
+    infn && /^\}/ { exit }
+    infn && !inhd && match($0, /<<-?["'"'"']?[A-Za-z_][A-Za-z_0-9]*["'"'"']?[[:space:]]*$/) {
+      d = substr($0, RSTART, RLENGTH); sub(/^<<-?/, "", d); gsub(/["'"'"'[:space:]]/, "", d)
+      inhd = 1; next
+    }
+    inhd && $0 == d { inhd = 0; next }
+    inhd && match($0, /^  --[A-Za-z0-9][A-Za-z0-9-]*([[:space:]]|$)/) {
+      o = substr($0, 3, RLENGTH - 2); sub(/[[:space:]]$/, "", o); print o
+    }
+  ' "$1"
+}
+
+# invocation_options <prompt>: every `--option` token on the helper's command lines in the prompt,
+# one per line. A command line is a line inside a backtick fence that names `post-merge-cleanup.sh`
+# as a path component or a word -- `test-post-merge-cleanup.sh` is another file -- plus each line
+# a trailing backslash continues it onto. Fences are the block scope here, unlike the link check:
+# the shape being read is a command, and a command the prompt tells the agent to run is fenced.
+invocation_options() {
+  awk '
+    /^```/ { fence = !fence; cont = 0; next }
+    !fence { cont = 0; next }
+    {
+      line = $0
+      if (!cont && line !~ /(^|[\/[:space:]])post-merge-cleanup\.sh([[:space:]]|$)/) next
+      cont = (line ~ /\\[[:space:]]*$/)
+      while (match(line, /(^|[[:space:]])--[A-Za-z0-9][A-Za-z0-9-]*/)) {
+        tok = substr(line, RSTART, RLENGTH); sub(/^[[:space:]]/, "", tok); print tok
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }
+  ' "$1"
+}
+
+check_cleanup_options() {
+  local listed passed o n nl bad=0
+  nl=$'\n'
+  # A root without the helper documents no helper, so it carries no obligation -- the same rule as
+  # the drift guard's sync script and the slot count's worker.
+  [ -f "$ROOT/$CLEANUP_HELPER" ] || return 0
+  if [ ! -f "$ROOT/$CLEANUP_PROMPT" ]; then
+    ko "$CLEANUP_HELPER" "has no $CLEANUP_PROMPT to document its options in"
+    return 0
+  fi
+  listed=$(usage_options "$ROOT/$CLEANUP_HELPER")
+  if [ -z "$listed" ]; then
+    # Not a pass: an empty register would hold the prompt to nothing, in silence.
+    ko "$CLEANUP_HELPER" "usage() lists no options this reader can see: a heredoc line opening with two blanks and a --name"
+    return 0
+  fi
+  n=$(printf '%s\n' "$listed" | grep -c .)
+  passed=$(invocation_options "$ROOT/$CLEANUP_PROMPT" | sort -u)
+  while IFS= read -r o; do
+    [ -n "$o" ] || continue
+    # The token whole: `--base` is not found inside `--base-branch`, and `.` is a literal.
+    matches "(^|[^A-Za-z0-9-])$(printf '%s' "$o" | sed 's/[.]/[.]/g')([^A-Za-z0-9-]|\$)" "$(cat "$ROOT/$CLEANUP_PROMPT")" \
+      || { ko "$CLEANUP_PROMPT" "names no '$o', which $CLEANUP_HELPER's usage() lists: the prompt is where the option is learned of (ludics-lite#276)"; bad=1; }
+  done <<<"$listed"
+  while IFS= read -r o; do
+    [ -n "$o" ] || continue
+    case "$nl$listed$nl" in *"$nl$o$nl"*) ;; *)
+      ko "$CLEANUP_PROMPT" "passes '$o' to $CLEANUP_HELPER, whose usage() lists no such option"; bad=1 ;;
+    esac
+  done <<<"$passed"
+  [ "$bad" -ne 0 ] \
+    || ok "$CLEANUP_PROMPT and $CLEANUP_HELPER's usage() agree on the helper's options ($n listed)"
+}
+
 # --- relative links and anchors ----------------------------------------------------------------
 # A prompt that points at another prompt points at a PATH, and since ludics-lite#260 often at a
 # HEADING inside it: that PR cut `issue-wave/SKILL.md` and its references into sections addressed
@@ -1479,6 +1576,7 @@ check_index routines/README.md routines/ routine
 check_fixtures
 check_slots
 check_drift_guard
+check_cleanup_options
 check_links
 
 echo
