@@ -1058,6 +1058,93 @@ test_regenerable_refusals() {
   echo "PASS: a regenerable name that is not an untracked top-level directory is refused"
 }
 
+# Review round 1 on the pull request that added the flag. All three findings are about the same
+# thing: a guard that decides an `rm -rf` must agree with the FILESYSTEM about which entry the
+# operator named, and with the INDEX about whether that entry is repository content. These three
+# legs fail against round 1's code.
+test_regenerable_name_resolution_refusals() {
+  local newline_dir refusal survivors
+  # P2: `\` is a path separator under Git Bash, so a check that looked only for `/` let a nested
+  # value through to the filesystem, where it named a path below the worktree root.
+  setup_case regenerable-backslash-name merge main-off
+  mkdir -p "$CASE_SESSION/nested/cache"
+  echo irreplaceable >"$CASE_SESSION/nested/cache/data"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable 'nested\cache' 2>&1); then
+    fail "a backslash-separated regenerable name was accepted"
+  fi
+  case "$refusal" in
+  *'nested'*) ;;
+  *) fail "the refusal did not name the rejected value: $refusal" ;;
+  esac
+  assert_eq "$(sed -n '1p' "$CASE_SESSION/nested/cache/data")" irreplaceable \
+    "a backslash-separated name must remove nothing"
+  assert_topic_preserved
+
+  # P1: a filesystem that folds names resolves `SRC` to a tracked `src`, while Git's pathspec
+  # matching is byte-exact and reports that `SRC` holds nothing tracked -- so the tracked-path
+  # guard cleared an `rm -rf` of the source tree. The worktree root must hold an entry spelled
+  # exactly as given, which is checked here on whichever kind of volume the suite is running on:
+  # where the fold happens the alias is REFUSED, and where it does not the name is simply absent
+  # and the documented no-op applies. Either way the tracked source tree survives, which is the
+  # property the finding is about.
+  setup_case regenerable-case-alias merge main-off
+  mkdir -p "$CASE_SESSION/src"
+  echo 'let () = ()' >"$CASE_SESSION/src/main.ml"
+  git -C "$CASE_SESSION" add src/main.ml
+  git -C "$CASE_SESSION" commit -m "tracked source directory" >/dev/null
+  git -C "$CASE_SESSION" push origin topic >/dev/null
+  git -C "$CASE_INTEGRATOR" fetch origin >/dev/null 2>&1
+  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge tracked source" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
+  if [ -d "$CASE_SESSION/SRC" ]; then
+    # A name-folding volume: the alias resolves, and must be refused before the tracked-path guard
+    # is asked about a spelling the index does not hold.
+    if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable SRC 2>&1); then
+      fail "a case-folded alias of a tracked directory was accepted as regenerable"
+    fi
+    case "$refusal" in
+    *SRC*) ;;
+    *) fail "the alias refusal did not name the value: $refusal" ;;
+    esac
+    assert_topic_preserved
+    assert_eq "$(sed -n '1p' "$CASE_SESSION/src/main.ml")" 'let () = ()' \
+      "the tracked source tree must survive the refused alias"
+  else
+    # A byte-exact volume: nothing is named `SRC`, so this is the absent-name no-op, and the
+    # tracked source tree reaches the session archive rather than being removed.
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable SRC >/dev/null
+    assert_cleaned
+    assert_eq "$(sed -n '1p' "$CASE_ARCHIVE/worktree/src/main.ml")" 'let () = ()' \
+      "the tracked source tree must reach the archive intact"
+  fi
+
+  # P1: the tracked-path guard read its NUL-delimited stream as lines and took the first one, so a
+  # tracked directory whose name begins with a NEWLINE looked untracked -- the first line of that
+  # rendering is empty -- and `rm -rf` would have run over repository content.
+  setup_case regenerable-newline-tracked merge main-off
+  newline_dir=$(printf '\nbuild')
+  mkdir -p "$CASE_SESSION/$newline_dir"
+  echo 'tracked output' >"$CASE_SESSION/$newline_dir/kept"
+  git -C "$CASE_SESSION" add -- "$newline_dir/kept"
+  git -C "$CASE_SESSION" commit -m "tracked directory whose name starts with a newline" >/dev/null
+  git -C "$CASE_SESSION" push origin topic >/dev/null
+  git -C "$CASE_INTEGRATOR" fetch origin >/dev/null 2>&1
+  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge newline directory" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable "$newline_dir" 2>&1); then
+    fail "a tracked directory whose name begins with a newline was accepted as regenerable"
+  fi
+  case "$refusal" in
+  *tracked*) ;;
+  *) fail "the refusal did not say the path is tracked: $refusal" ;;
+  esac
+  survivors=$(sed -n '1p' "$CASE_SESSION/$newline_dir/kept")
+  assert_eq "$survivors" 'tracked output' "the tracked newline-named directory must survive"
+  assert_topic_preserved
+  echo "PASS: a regenerable name the filesystem or the index resolves differently is refused"
+}
+
 test_master_reservation() {
   local fake_bin real_git candidate remote_master checkout_status
   setup_case master-owner-switch merge other
@@ -4572,6 +4659,7 @@ TESTS=(
   test_session_ignored_directory_unreadable_subtree_refusal
   test_regenerable_directory_clears_the_session_gate
   test_regenerable_refusals
+  test_regenerable_name_resolution_refusals
   test_session_ignored_path_control_characters_are_escaped
   test_master_reservation
   test_unowned_master_reservation

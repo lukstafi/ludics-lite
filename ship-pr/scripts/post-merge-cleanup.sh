@@ -312,10 +312,13 @@ scan_base_owner_local_data() {
 # REMOVES instead. The helper stays build-system-agnostic: it learns no `dune`, and the flag names
 # a class of paths rather than a command to run inside a checkout it is about to judge.
 #
-# The value is ONE top-level directory of the session worktree. A value carrying a slash is
-# refused rather than resolved, which is what keeps an absolute path, a nested path and every `..`
-# traversal out without a containment check to get wrong; `.` and `..` are refused by name. A
-# symbolic link is never followed -- `rm -rf` through one removes a tree the worktree does not
+# The value is ONE top-level directory of the session worktree. A value carrying a separator --
+# `/`, and `\` too, which is one under Git Bash -- is refused rather than resolved, which is what
+# keeps an absolute path, a nested path and every `..` traversal out without a containment check
+# to get wrong; `.` and `..` are refused by name; and a value the filesystem FOLDS onto a
+# different entry (`SRC` for `src` on a case-insensitive volume) is refused rather than resolved,
+# because Git's pathspecs are byte-exact and the tracked-path guard would otherwise be asking
+# about a path the index does not hold. A symbolic link is never followed -- `rm -rf` through one removes a tree the worktree does not
 # hold -- and a tracked path is repository content whatever the operator typed. An absent name is
 # a no-op, because a worktree that never built has no `_build` and the operator's command line
 # does not change between one cleanup and the next.
@@ -323,11 +326,62 @@ scan_base_owner_local_data() {
 # This runs before either gate reads the worktree, and so before the merge-ancestry proof: a later
 # refusal still leaves the named directories removed. That is the contract the flag's name states
 # -- what it removes costs CPU to rebuild and nothing else.
+# regenerable_entry_is_spelled_exactly <name>: true when the session worktree's ROOT really holds
+# a directory entry spelled exactly like this value (review round 1, P1). A filesystem that folds
+# names -- macOS and Windows both, by case and on macOS by Unicode normalization as well --
+# resolves `SRC` to an entry named `src`, so `[ -d "$SESSION/SRC" ]` passes; Git's pathspec
+# matching is byte-exact and `ls-files -- ':(literal)SRC'` then reports NOTHING, including under
+# `core.ignoreCase=true` (verified on macOS). The tracked-path guard below would therefore look up
+# a path the index does not hold and clear an `rm -rf` of the operator's SOURCE tree.
+#
+# Comparing the value against the directory's own entries closes the whole class rather than the
+# case instance of it: every alias a filesystem resolves -- case folding, NFC/NFD folding, an 8.3
+# short name -- differs from the real entry byte for byte, and only the real spelling gets through
+# to a pathspec that means the same thing to Git. `find` is asked for the entries themselves and
+# not for a `-name` match, whose pattern would glob: a value holding `*` must be compared, never
+# matched. A listing that could not be read clears nothing.
+regenerable_entry_is_spelled_exactly() {
+  local name="$1" entry found=1
+  REGENERABLE_SCAN_FILE=$(mktemp "$TEMP_ROOT/ship-pr-regenerable-entries.XXXXXX") ||
+    fail "could not allocate the --regenerable directory listing"
+  find "$SESSION" -mindepth 1 -maxdepth 1 -print0 >"$REGENERABLE_SCAN_FILE" ||
+    fail "could not list the session worktree root while resolving --regenerable"
+  while IFS= read -r -d '' entry; do
+    [ "${entry##*/}" = "$name" ] || continue
+    found=0
+    break
+  done <"$REGENERABLE_SCAN_FILE"
+  unlink "$REGENERABLE_SCAN_FILE" || fail "could not remove the --regenerable directory listing"
+  REGENERABLE_SCAN_FILE=""
+  return "$found"
+}
+
+# regenerable_path_is_untracked <name>: true when the index holds nothing under that path. The
+# NUL-delimited stream is tested for emptiness AS BYTES (review round 1, P1): rendering it to
+# lines and reading the first one reported "untracked" for a tracked path whose name begins with a
+# newline, because that first line is empty -- and the caller would then have run `rm -rf` over
+# tracked content. Any byte at all here means the pathspec matched.
+regenerable_path_is_untracked() {
+  local name="$1" tracked
+  REGENERABLE_SCAN_FILE=$(mktemp "$TEMP_ROOT/ship-pr-regenerable-tracked.XXXXXX") ||
+    fail "could not allocate the --regenerable tracked-path snapshot"
+  git -C "$SESSION" ls-files -z -- ":(literal)$name" >"$REGENERABLE_SCAN_FILE" ||
+    fail "could not inspect whether the --regenerable path is tracked: $(printf '%q' "$name")"
+  if [ -s "$REGENERABLE_SCAN_FILE" ]; then tracked=1; else tracked=0; fi
+  unlink "$REGENERABLE_SCAN_FILE" || fail "could not remove the --regenerable tracked-path snapshot"
+  REGENERABLE_SCAN_FILE=""
+  [ "$tracked" -eq 0 ]
+}
+
 remove_regenerable_directories() {
-  local name target tracked
+  local name target
   for name in ${REGENERABLE_NAMES[@]+"${REGENERABLE_NAMES[@]}"}; do
+    # Both separators, not only the POSIX one (review round 1, P2): this helper is meant to run
+    # under Git Bash, where a backslash reaches the Win32 API as a path separator too, so a value
+    # such as `nested\cache` would otherwise have described a nested path to the filesystem while
+    # passing a check that looked only for `/`.
     case "$name" in
-    */*)
+    */* | *\\*)
       fail "--regenerable names one top-level directory, not a path: $(printf '%q' "$name")"
       ;;
     . | ..)
@@ -336,13 +390,13 @@ remove_regenerable_directories() {
     esac
     target="$SESSION/$name"
     { [ ! -e "$target" ] && [ ! -L "$target" ]; } && continue
+    regenerable_entry_is_spelled_exactly "$name" ||
+      fail "--regenerable names no entry spelled exactly that way in the session worktree root, so the filesystem resolved it to a different one: $(printf '%q' "$name")"
     [ ! -L "$target" ] ||
       fail "--regenerable path is a symbolic link, which is never followed; remove it yourself before cleanup: $(printf '%q' "$name")"
     [ -d "$target" ] ||
       fail "--regenerable path is not a directory: $(printf '%q' "$name")"
-    tracked=$(git -C "$SESSION" ls-files -z -- ":(literal)$name" | tr -d '\0' | sed -n '1p') ||
-      fail "could not inspect whether the --regenerable path is tracked: $(printf '%q' "$name")"
-    [ -z "$tracked" ] ||
+    regenerable_path_is_untracked "$name" ||
       fail "--regenerable path is tracked by the repository and is not regenerable: $(printf '%q' "$name")"
     rm -rf -- "$target" ||
       fail "could not remove the --regenerable directory: $(printf '%q' "$name")"
@@ -1150,6 +1204,9 @@ cleanup_reservations() {
   if [ -n "${MASTER_STATUS_FILE:-}" ] && [ -f "$MASTER_STATUS_FILE" ]; then
     unlink "$MASTER_STATUS_FILE" >/dev/null 2>&1 || true
   fi
+  if [ -n "${REGENERABLE_SCAN_FILE:-}" ] && [ -f "$REGENERABLE_SCAN_FILE" ]; then
+    unlink "$REGENERABLE_SCAN_FILE" >/dev/null 2>&1 || true
+  fi
   if [ -n "${SESSION_IGNORED_WALK_FILE:-}" ] && [ -f "$SESSION_IGNORED_WALK_FILE" ]; then
     unlink "$SESSION_IGNORED_WALK_FILE" >/dev/null 2>&1 || true
   fi
@@ -1243,6 +1300,7 @@ CONFIG_LOCK_OWNED=0
 CHANGED_PATHS_FILE=""
 SESSION_STATUS_FILE=""
 MASTER_STATUS_FILE=""
+REGENERABLE_SCAN_FILE=""
 SESSION_IGNORED_WALK_FILE=""
 WORKTREE_LIST_FILE=""
 MASTER_INDEX_PROBE=""

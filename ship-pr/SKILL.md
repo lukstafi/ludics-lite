@@ -924,10 +924,14 @@ cleanup removes it rather than refusing over it:
 The OCANNL notes pass `--regenerable _build`; `_opam` and `node_modules` are the same shape. The
 flag is repeatable and has no default, and the helper learns no build system from it — it names a
 class of paths, not a command to run inside a checkout it is about to judge. Each value must be
-ONE top-level directory of the SESSION worktree: a value carrying a slash is refused rather than
-resolved, which is what keeps an absolute path, a nested path and every `..` out; `.` and `..` are
-refused by name; a symbolic link is never followed, since `rm -rf` through one would remove a tree
-the worktree does not hold; and a tracked path is repository content whatever was typed. A name
+ONE top-level directory of the SESSION worktree: a value carrying a separator — `/`, and `\` too,
+which is one under Git Bash — is refused rather than resolved, which is what keeps an absolute
+path, a nested path and every `..` out; `.` and `..` are refused by name; the worktree root must
+hold an entry spelled exactly that way, so a value a case-folding or Unicode-normalizing
+filesystem resolves to a *different* entry (`SRC` for `src`) is refused rather than removed, since
+Git's pathspecs are byte-exact and would report that alias as holding nothing tracked; a symbolic
+link is never followed, since `rm -rf` through one would remove a tree the worktree does not hold;
+and a tracked path is repository content whatever was typed. A name
 the worktree does not carry is a no-op, so the same command line works for a worktree that never
 built. The removal happens before either gate reads the worktree and therefore before the
 merge-ancestry proof: a cleanup that then refuses still leaves the named directories gone, which
