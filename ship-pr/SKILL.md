@@ -185,7 +185,23 @@ use a non-closing reference (`Refs #N` or `Refs owner/repo#N`); reserve the clos
 the final PR that completes the issue. A closing keyword binds to every `#N` in the same
 sentence, so "Resolves #194 and #205 §1" closed #205 too (PR #210, 2026-09-17; #205 had to be
 reopened). A PR that only partially addresses a second issue references it in a separate
-sentence with no keyword: "Addresses part 1 of #205".
+sentence with no keyword: "Addresses part 1 of #205". `pr-review.sh merge` reads the body
+twice — once up front for lead time and once more immediately before the merge call, since a
+body stays editable through a `--wait` and editing it moves no head — and warns on both streams, naming the sentence and every issue, when one
+sentence carries a closing keyword and more than one `#N` or when a closing keyword sits in a
+quoted (`> …`) or fenced line, where an example closes exactly as a statement does (that is how
+#226's own body closed #205 a second time) — a warning and not a refusal, because one sentence
+closing two issues is sometimes what was meant. Its two findings carry different weight on
+purpose. A sentence where two or more `#N` FOLLOW the keyword is read off the text alone and says
+outright what the merge closes — GitHub binds a keyword forward, to the references after it, so
+"Issues #1 and #2 are now fixed." closes neither, while the advice above to keep any other
+reference out of that sentence is the conservative form of the same rule; a quoted or fenced line is flagged to be READ and claims nothing about closing,
+because telling an example from prose means classifying Markdown blocks and this is a best-effort
+reading rather than a CommonMark parser — a list-relative fence, lazy blockquote continuation or an
+unusual list marker can be misread in either direction. Its silence is likewise not a clean body:
+an issue closed through a full URL, a four-space-indented code block, a sentence wrapped across a
+line break with its references split over it, and a sentence split at an abbreviation period such
+as `e.g.` are all unread by design.
 
 Report the URL on its own line, wrapped as below. The Claude Desktop client renders a live status
 card from the tag; other harnesses ignore it:

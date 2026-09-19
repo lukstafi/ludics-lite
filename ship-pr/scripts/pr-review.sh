@@ -3950,6 +3950,554 @@ refuse_merge_queue() {
     "with the record on the PR."
 }
 
+# --- the PR body's closing keywords ------------------------------------------------------------
+# GitHub closes issues from a PR body by KEYWORD, and the keyword binds to every `#N` in the same
+# SENTENCE rather than to the one reference that follows it. "Resolves #194 and #205 §1" in
+# ludics-lite#210 closed #205 -- a phase reference, not a completion -- and #205 had to be reopened.
+# The doc line ship-pr/SKILL.md *Open* grew afterwards (#226) was already in front of the author who
+# wrote that sentence, and #226's own body then closed #205 a SECOND time, out of a QUOTED copy of
+# the example it was warning about: a `> ...` line closes exactly as a statement does. So the trap
+# is not that the rule is unknown. It is that the rule is applied at the moment the body is written
+# and read back by nothing, while the body itself is machine-read on the landing path three times
+# over. `merge` is where that read is worth spending: the last moment the body can still be edited
+# before the issues close.
+#
+# It WARNS and does not refuse, and that is not softness. `Closes #3 and #4` is a correct body; the
+# deliberate pair and the accidental one differ in INTENT and not in text, and nothing readable from
+# here tells them apart. A refusal would therefore be a FALSE refusal on a shape that is common, and
+# its escape hatch would be a flag one keystroke wide -- the failure mode --override's REASON
+# argument exists in this same file to avoid, and the one that would retire this check permanently
+# the first time an agent learned to type the flag. What the warning does instead, a refusal cannot
+# do better: name the sentence and every issue it binds, so a wrong close is undone in the minute
+# after the merge (`gh issue reopen`) instead of at the next audit.
+#
+# The unit is a SENTENCE WITHIN A LINE and not a Markdown paragraph, which is the one deliberate
+# under-approximation here. Markdown joins wrapped lines, so a paragraph unit would read the shape
+# this skill PRESCRIBES --
+#     Closes #1
+#     Closes #2
+# -- as one sentence closing two issues, and the loudest warning in the file would be the shape
+# callers are told to write. What that costs is a sentence WRAPPED across a line break with its
+# references split over it, which this scanner does not see. More shapes it does not read: an
+# issue closed through a full issue URL, and a four-space-indented code block (a fenced one it does
+# read) and a sentence split at an abbreviation period, all named in SKILL.md so the silence is not
+# mistaken for a clean body.
+#
+# The BLOCK classification -- which lines are quoted or fenced -- is a best-effort reading and not
+# a CommonMark parser. Twelve review rounds established that a correct one is exactly that parser:
+# fence delimiters closing at list-relative indentation, list padding measured in tab-expanded
+# columns from the marker's own column, lazy blockquote continuation lines, ordered markers that
+# cannot interrupt a paragraph. Rather than approximate those one round at a time, the quoted class
+# was made to claim nothing about closing (see the emit loop below), so a misreading costs a line
+# flagged for a look and never a false statement about what a merge did. ludics-lite#283 carries
+# the residue.
+#
+# One offending unit per line on stdout: "<class><TAB><count><TAB><refs><TAB><the sentence>", where
+# <class> is `sentence` (a closing keyword binding two or more references) or `quoted` (a keyword
+# inside a `>` quote or a fenced block, where even ONE reference is one nobody meant to close).
+# The OWNER of a cross-repository reference must lead with an alphanumeric, as GitHub logins do,
+# but the repository NAME need not: `github/.github` is a real repository, and requiring one there
+# made a body naming two of them produce no warning at all (review round 2).
+# The keyword boundaries exclude `-` on both sides on purpose: this repo's own vocabulary is full of
+# `close-out`, `closed-loop` and `fixed-point`, and a body saying "a close-out merge of #3 and #4"
+# is not closing anything; and `/` for the same reason, since an owner or a repository may be NAMED
+# `closed` and `see closed/tracker#10 and closed/tracker#11` carries no directive at all (round 6).
+# Both are WHITELISTS rather than exclusions, which is what makes them finite: an excluding class
+# is ASCII-shaped, so the first byte of a non-ASCII letter reads as punctuation to it and `fixés`
+# in French prose matched as a keyword (review round 8). A keyword is one only where an ASCII
+# separator a human writes stands on each side of it. `_` is NOT one of them, whatever Markdown
+# does with it between words: an intraword underscore is not an emphasis boundary, and admitting it
+# made the identifier `auto_closes_items` a closing directive (review round 13). Losing
+# underscore-italic around a keyword is the price, and `*` still carries emphasis. Nor is `.`:
+# `fixes.md` and `fixes.co` are a filename and a hostname, and admitting the dot made both
+# directives (round 14). A full stop is a boundary only when an alphanumeric does NOT follow it,
+# which is the distinction between a sentence ending in "are now fixed." -- whose references stand
+# before the keyword in the same unit, so dropping the dot outright would have silenced it -- and a
+# dotted token. The suite caught that overreach before it left the worktree.
+MULTI_CLOSE_FILTER='
+function scrub_urls(text,   rest) {
+  # URLs go first. A body here is full of run links, and a fragment in one is not an issue: a
+  # trailing /#703 was counted as an issue, and a page#705 was even reported as a cross-repository
+  # reference to a HOST (review round 3). An issue bound through its full URL is a shape this
+  # scanner does not read and SKILL.md says so, so blanking them keeps that boundary exact rather
+  # than half-reading it. The owner is tightened for the same reason: a GitHub login carries only
+  # alphanumerics and hyphens, never the dots that let example.com pass as one.
+  rest = text
+  gsub(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^ \t]*/, " ", rest)
+  gsub(/(^|[ \t([{<"\047])[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z][a-zA-Z]+(:[0-9]+)?([\/?#][^ \t]*)?/, " ", rest)
+  return rest
+}
+function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
+  # The boundary before a reference is a WHITELIST, and that is the point. Two rounds were spent
+  # excluding what a URL puts in front of a hash -- first the scheme, then a dot or a slash -- and
+  # a query string answered each time with another character (`=`, `&`; review rounds 5 and 7). A
+  # blacklist of punctuation cannot be finished, because the next URL shape brings the next
+  # character. So a reference is one only after the start of the unit, whitespace, an OPENING
+  # bracket or quote, or Markdown emphasis -- the places a human writes one. Anything else in
+  # front of a hash, whatever it is, is not an issue reference here. What that costs is a shape
+  # nobody writes (`see:#1`), and what it buys is a rule no further URL can outflank. A number starts at
+  # 1, so `#0` is prose -- "step #0 initializes the state" was a second issue, and a nonexistent
+  # one at that (review round 4).
+  rest = unit
+  out = ""; n = 0
+  while (match(rest, /(^|[ \t([{<"\047`*_,;])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[1-9][0-9]*/)) {
+    r = substr(rest, RSTART, RLENGTH)
+    rest = substr(rest, RSTART + RLENGTH)
+    sub(/^[^a-zA-Z0-9#]/, "", r)
+    # A boundary is owed on BOTH sides. The numeric run simply stopped where the digits did, so the
+    # CSS colour `#123abc` was read as issue 123 and carried reopen advice for it (review round 9).
+    # `rest` already stands just past the match, so its first character is the one that follows.
+    nxt = substr(rest, 1, 1)
+    if (nxt ~ /[0-9a-zA-Z_-]/) continue
+    # `example/repo#1` and `#1` are ONE issue when the repo is this PR own -- and that is knowable
+    # here, because the caller passes it in. Normalizing before the dedupe is what makes the mixed
+    # spelling in one sentence stop counting twice (review round 5). A reference to any OTHER
+    # repository stays as written: it is a different issue.
+    if (repo != "" && index(tolower(r), tolower(repo) "#") == 1) r = substr(r, length(repo) + 1)
+    # Keyed on the lowercased spelling, displayed as written: GitHub owner and repository names are
+    # case-insensitive, so `Other/Tracker#10` and `other/tracker#10` are one issue (review round 6).
+    key = tolower(r)
+    # DISTINCT issues, not occurrences: "the request in #701 is done, so this closes #701" names
+    # one issue twice, and reporting it as two made the count, the list and the reopen advice all
+    # false (review round 3). A bare #N and an owner/repo#N are left distinct, since which
+    # repository a bare one means is not knowable from here.
+    if (key in seen) continue
+    seen[key] = 1
+    n++
+    out = (n == 1 ? r : out " " r)
+  }
+  return out
+}
+function scan(unit, quoted,   refs, cnt, parts, shown, cls, after) {
+
+  # FORWARD from the keyword, not across the whole unit. GitHub closing syntax is the keyword
+  # followed by the reference, so "Issues #1 and #2 are now fixed." closes neither -- and reporting
+  # it as closing both, with advice to reopen them, is the false claim this scan exists to avoid
+  # making (review round 15). Every reference in the incident this feature was built for stood
+  # AFTER its keyword, so nothing observed is lost. The match position is taken from the lowercased
+  # copy, whose byte offsets are the unit own; the boundary character the match consumed belongs to
+  # the keyword and not to what follows it.
+  # URLs are removed BEFORE the keyword is located, so the keyword test and the reference scan read
+  # the SAME text. Scrubbing inside refs_of meant the keyword could match a word in a URL path --
+  # `…/path,closes,details` -- and the forward slice then handed refs_of a fragment with the
+  # scheme and host already cut away, so it could no longer recognise what was left as a URL
+  # (review round 16). One scrub, one text, and the question cannot come back.
+  unit = scrub_urls(unit)
+  # ONE match, which both decides that a keyword is present and says where it ends. A regex literal
+  # cannot be hoisted into a variable in awk -- `V = /re/` assigns the RESULT of matching $0 -- and
+  # a second copy of this expression would be a copy that has to stay in step with the first.
+  if (match(tolower(unit), /(^|[ \t([{<"\047`*,;:>])(close[sd]?|fix(e[sd])?|resolve[sd]?)([ \t)\]}>"\047`*,;:!?]|\.[^a-z0-9_]|\.$|$)/) == 0) return
+  after = substr(unit, RSTART + RLENGTH)
+  refs = refs_of(after, repo)
+  if (refs == "") return
+  cnt = split(refs, parts, " ")
+  if (cnt < 2 && !quoted) return
+  shown = unit
+  sub(/^[ \t>*+-]+/, "", shown)
+  sub(/[ \t]+$/, "", shown)
+  # The sentence is contributor-controlled text on its way to a terminal. printf stops it being
+  # read as a format string; it does not stop an ESC or a carriage return from erasing or
+  # rewriting the warning it appears in, and this warning is the whole product of the scan
+  # (review round 13). Control bytes are replaced before the line is built; they would also
+  # collide with the separators this filter uses.
+  gsub(/[\001-\010\013-\037\177]/, "?", shown)
+  if (length(shown) > 200) shown = substr(shown, 1, 197) "..."
+  cls = quoted ? "quoted" : "sentence"
+  print cls "\t" cnt "\t" refs "\t" shown
+}
+{
+  line = $0
+  sub(/\r$/, "", line)
+  # Markdown keeps up to THREE leading columns as ordinary indentation and makes four an
+  # indented CODE block. Stripping all of it turned `    > Closes #1` into a blockquote and warned
+  # about an example SKILL.md says this scanner does not read, and let an indented fence open a
+  # phantom block that swallowed the ordinary text after it (review round 4). An indented line is
+  # therefore neither quote nor fence; inside an already-open fence it is content, which the fence
+  # test below still catches. Indentation is COLUMNS and not characters, because a tab advances to
+  # the next stop and one to three spaces before it still reach column four (review round 6).
+  # It is counted from the LINE, not relative to a list item is
+  # container -- modelling that is a Markdown parser, and its absence can only lose a fence.
+  col = 0
+  for (i = 1; i <= length(line); i++) {
+    c = substr(line, i, 1)
+    if (c == " ") col++
+    else if (c == "\t") col += 4 - (col % 4)
+    else break
+  }
+  indented = (col >= 4)
+  trimmed = line
+  sub(/^[ \t]+/, "", trimmed)
+  # A blockquote or a fence nested in a LIST ITEM is still a blockquote or a fence: `- > Closes #1`
+  # renders as one, and leaving the marker in front made the `>` test miss it entirely (review
+  # round 3). Markers are peeled repeatedly, so a quote two list levels down is reached too.
+  while (!indented) {
+    if (match(trimmed, /^[-*+][ \t]/)) {
+      trimmed = substr(trimmed, 3)
+    } else if (match(trimmed, /^[0-9]+[.)][ \t]/)) {
+      # Markdown allows at most NINE digits in an ordered marker, so a longer run is ordinary text
+      # and peeling it turned a line into a list item it is not -- after which a `>` behind it read
+      # as a blockquote and warned about a single reference (review round 10). Counted rather than
+      # matched with an interval expression, which is not portable across the awks this fleet runs.
+      d = 0
+      while (substr(trimmed, d + 1, 1) ~ /[0-9]/) d++
+      if (d > 9) break
+      trimmed = substr(trimmed, d + 3)
+    } else {
+      break
+    }
+    # A marker takes ONE space of padding; four columns BEYOND it open an indented code block
+    # inside the list item, so stripping the whole run made code look like a blockquote (review
+    # round 11). The same column arithmetic as the line indentation above.
+    pcol = 0
+    for (pi = 1; pi <= length(trimmed); pi++) {
+      pc = substr(trimmed, pi, 1)
+      if (pc == " ") pcol++
+      else if (pc == "\t") pcol += 4 - (pcol % 4)
+      else break
+    }
+    if (pcol >= 4) {
+      indented = 1
+      break
+    }
+    sub(/^[ \t]+/, "", trimmed)
+  }
+  quoted = 0
+  # A fence closes only on its OWN delimiter, at least as long as the one that opened it. A
+  # four-backtick fence exists precisely so that it can CONTAIN a three-backtick one, and an
+  # unconditional toggle reads that inner fence as the close -- after which the closing keyword
+  # inside the example is read as ordinary prose and the scan says nothing (review round 1). The run
+  # is counted rather than matched, because an interval expression is not portable across the
+  # awks this fleet runs. A CLOSING fence also carries no info string -- only spaces or tabs may
+  # follow its run -- so a content line that merely STARTS with the delimiter does not end the
+  # block (review round 2); an opening fence may carry one, which is what ````markdown is.
+  # An indented line opens NO fence and closes none either. Round 12 let an open fence close at any
+  # indentation, to reach a delimiter indented as a list-item continuation, on the reasoning that
+  # closing early was the conservative error. That reasoning was backwards, and round 16 showed it:
+  # inside a top-level fence an indented delimiter is CONTENT, so closing there turns the fenced
+  # lines after it into ordinary prose -- which promotes a NOTICE, claiming nothing, into a strong
+  # WARNING that says issues close. Leaving a fence OPEN is the safe error in exactly the same
+  # sense, because everything it swallows becomes a notice. What that costs is the round-12 shape:
+  # a fence opened inside a list item stays open, and the rest of the body reads as an example.
+  # ludics-lite#283 carries it with the other container-relative cases.
+  if (!indented && (substr(trimmed, 1, 3) == "```" || substr(trimmed, 1, 3) == "~~~")) {
+    fch = substr(trimmed, 1, 1)
+    flen = 0
+    while (substr(trimmed, flen + 1, 1) == fch) flen++
+    frest = substr(trimmed, flen + 1)
+    if (fence == 0) {
+      # A BACKTICK opener carries no backtick in its info string. Such a line opens nothing, so
+      # treating it as an opener left the rest of the body in a phantom block and reported ordinary
+      # prose as fenced (review round 6). A tilde fence has no such rule.
+      if (fch != "`" || index(frest, "`") == 0) {
+        fence = 1
+        fence_ch = fch
+        fence_len = flen
+        quoted = 1
+      }
+    } else if (fch == fence_ch && flen >= fence_len && frest ~ /^[ \t]*$/) {
+      fence = 0
+      quoted = 1
+    }
+  }
+  if (fence) quoted = 1
+  if (!indented && trimmed ~ /^>/) quoted = 1
+  # SKILL.md says an indented code block is a shape this scanner does not read, and that has to
+  # mean not SCANNED -- suppressing only the quote and fence tests still had `    Closes #1 and #2`
+  # warned about as an ordinary sentence, which contradicted the documentation in the one direction
+  # that matters (review round 11). Inside an already-open fence indentation is content, so the
+  # line is still read there.
+  if (indented && !fence) next
+  s = line
+  # Terminal punctuation ends a unit, with no abbreviation rule in front of it. One stood here for
+  # three rounds and was narrowed twice; each revision traded one error for another, and both of
+  # its errors were FALSE POSITIVES -- "in version 2. See #3" and "in appendix A. See #2" each had
+  # the scan name a reference belonging to the next sentence and offer to reopen a live issue. Its
+  # removal costs a false NEGATIVE instead: a reference on each side of an "e.g." is now two units
+  # and goes unreported, which is the fourth documented limitation in SKILL.md. That is the right
+  # side of the trade for a warning -- silence is the status quo this PR improves on, while advice
+  # to reopen the wrong issue is what teaches a reader to stop reading the warning at all.
+  # What may sit BETWEEN the terminator and the space is not enumerated at all. Four rounds were
+  # spent adding members to a list of closers -- a closing quote (review round 3), an inline link
+  # destination (7), a link TITLE inside the same parens (8), a reference-style `][label]` suffix
+  # (9) -- and Markdown has more link forms than any list will hold. So the rule is: a full stop
+  # ends the unit when whitespace follows it, or when anything that does NOT begin with an
+  # alphanumeric follows it up to the next whitespace. Every closer, bracket, destination and
+  # label satisfies that by construction, and no Markdown spelling can add a member.
+  # The alphanumeric condition is the whole of what it excludes, and it is what keeps a version
+  # number ("3.5") from splitting -- a digit or letter straight after the stop continues the word.
+  gsub(/[.!?]([^ \ta-zA-Z0-9][^ \t]*)?[ \t]+/, "&\001", s)
+  n = split(s, parts, "\001")
+  for (i = 1; i <= n; i++) scan(parts[i], quoted)
+}'
+
+# What the deferred-merge refusal may say about the scan. It used to say outright that the scan
+# "spoke for the body as it is NOW", which is a claim about a read that may not have happened: when
+# the body read failed, warn_multi_close has already said the scan did NOT run, and on a long wait
+# the only successful scan may be the stale lead-time one (review round 16).
+multi_close_deferred_note() {
+  if [ -n "$MULTI_CLOSE_HAVE" ]; then
+    printf '%s' "The closing-keyword scan above spoke for the body as it is NOW: a deferred merge lands whatever the body says at that later moment, and nothing here will be running to re-read it."
+  else
+    printf '%s' "And the closing-keyword scan did NOT read the body for this attempt, so nothing here says what a deferred merge will close when it lands."
+  fi
+}
+
+# One line of the warning on BOTH streams: stdout is the transcript a later reader scrolls back
+# through, and stderr is what a caller that kept only the merge's error output still sees. The
+# OVERRIDE and ALLOW-NO-VERDICT announcements in cmd_merge are written the same way.
+multi_close_say() { # <line...>; joined like warn's, so a continued line stays one line
+  printf '%s\n' "$*"
+  warn "$*"
+}
+
+# The previous scan of this run, so that the re-scan below can tell a REPEAT from a body that
+# moved. MULTI_CLOSE_HAVE is separate from the text because "the scan found nothing" and "the scan
+# did not run" must not compare equal -- the same distinction the read failure above is written for.
+MULTI_CLOSE_LAST=""
+MULTI_CLOSE_HAVE=""
+# The BODY the last scan read, not its findings. Comparing findings said "unchanged" about a body
+# that had gained a separate `Closes #3` line, because an ordinary single-reference line produces
+# no finding -- so the re-scan confirmed the merge closed what it had listed while it was about to
+# close one more (review round 7). The findings are what is PRINTED; the body is what is compared.
+MULTI_CLOSE_BODY=""
+# Whether the last scan's findings included a SENTENCE one. The re-scan lines below speak about
+# findings the caller has already read, so they have to speak in the same register: a quoted-only
+# body that is unchanged must not be reported with a WARNING saying the merge closes what it
+# listed, which is the very claim the quoted class was stripped of (review round 13).
+MULTI_CLOSE_STRONG=""
+
+# GitHub applies a body keyword when the PR merges into the repository DEFAULT branch, and not
+# otherwise. A PR landing on a release or staging branch closes nothing, so a warning there names
+# issues this merge leaves open and offers to reopen issues that were never closed (review round 6)
+# -- which is the one thing this scan may never do. Read once per merge and cached, because the
+# authoritative scan now runs before every merge attempt.
+#
+# yes / no / unknown. UNKNOWN is not "no": an unread comparison cannot say the keyword is inert, so
+# the findings are still printed, with the doubt on the line. That is the same rule the body read
+# itself follows -- a read that failed is not a clean body.
+#
+# Read EVERY time, with no cache. A cache stood here for one round and was wrong for the same
+# reason the merge-queue check is made twice: a PR can be RETARGETED during a wait that runs two
+# hours, and a cached comparison would then skip the scan on a PR moved onto the default branch,
+# or advise reopening on one moved off it (review round 7). Two reads per scan is the price of an
+# answer about the base this merge will actually use, and it is the same price cmd_merge already
+# pays for the queue.
+MULTI_CLOSE_BINDS=""
+# The reason for an `unknown`, kept HERE rather than read back from gh_err_line: the successful
+# body read that follows clears the shared error file, so the message printed `failed ()` with the
+# cause gone -- the diagnostic that says whether a retry is worth making (review round 7).
+MULTI_CLOSE_ERR=""
+multi_close_binds() { # <pr>; sets MULTI_CLOSE_BINDS and MULTI_CLOSE_ERR
+  local base def rc
+  MULTI_CLOSE_ERR=""
+  base=$(gh_retry read api "repos/$REPO/pulls/$1" --jq '.base.ref // ""')
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$base" ]; then
+    MULTI_CLOSE_BINDS=unknown
+    MULTI_CLOSE_ERR="the PR base could not be read: $(gh_err_line)"
+    return 0
+  fi
+  def=$(gh_retry read api "repos/$REPO" --jq '.default_branch // ""')
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$def" ]; then
+    MULTI_CLOSE_BINDS=unknown
+    MULTI_CLOSE_ERR="the default branch could not be read: $(gh_err_line)"
+    return 0
+  fi
+  if [ "$base" = "$def" ]; then MULTI_CLOSE_BINDS=yes; else MULTI_CLOSE_BINDS=no; fi
+  return 0
+}
+
+warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a merge is a gate
+  local body scan rc class cnt refs sent n=0 again="${2:-}"
+  # Nothing to say when nothing can close: on a PR that does not target the default branch the
+  # body's keywords are inert, and saying otherwise would be the false positive this scan exists
+  # to avoid making. Silent rather than one-line-noisy, because a base that never closes anything
+  # has nothing about it worth repeating on every merge.
+  multi_close_binds "$1"
+  if [ "$MULTI_CLOSE_BINDS" = no ]; then
+    # A retarget during the gate can make a keyword inert AFTER the lead-time scan warned about it.
+    # Returning silently would leave that warning standing in the transcript, still saying issues
+    # are about to close (review round 8) -- the same stale finding the WITHDRAWN line below exists
+    # to prevent, reached by a different route.
+    if [ -n "$again" ] && [ -n "$MULTI_CLOSE_HAVE" ] && [ -n "$MULTI_CLOSE_LAST" ]; then
+      if [ -n "$MULTI_CLOSE_STRONG" ]; then
+        multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1 no longer targets the" \
+          "default branch, so the keywords above bind nothing on this merge."
+      else
+        multi_close_say "CLOSING-KEYWORD NOTICE WITHDRAWN: $REPO#$1 no longer targets the default" \
+          "branch, so the keyword flagged above binds nothing on this merge."
+      fi
+    fi
+    # The body is NOT read on this path, so whatever an earlier scan established is stale from here
+    # on -- including a CLEAN earlier scan, which leaves no withdrawal to print and used to leave
+    # the status standing, so the deferred-merge note claimed a scan had spoken for the body as it
+    # is now (review round 17). The withdrawal message is gated on there having been a finding; the
+    # status is cleared either way.
+    MULTI_CLOSE_LAST=""
+    MULTI_CLOSE_STRONG=""
+    MULTI_CLOSE_BODY=""
+    MULTI_CLOSE_HAVE=""
+    return 0
+  fi
+  body=$(gh_retry read api "repos/$REPO/pulls/$1" --jq '.body // ""')
+  rc=$?
+  # A read that FAILED is not a body with nothing in it. Say so, or the silence below is read as a
+  # scan that found nothing -- the same false negative the approval read is written against.
+  if [ "$rc" -ne 0 ]; then
+    MULTI_CLOSE_HAVE=""
+    warn "could not read $REPO#$1's body ($(gh_err_line)); the closing-keyword scan did NOT run," \
+      "so nothing here says this merge closes only what it means to."
+    return 0
+  fi
+  scan=""
+  if [ -n "$body" ]; then
+    scan=$(awk -v repo="$REPO" "$MULTI_CLOSE_FILTER" <<<"$body")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      MULTI_CLOSE_HAVE=""
+      warn "the closing-keyword scan of $REPO#$1's body did not run (awk exit $rc); its silence" \
+        "is not a clean body."
+      return 0
+    fi
+  fi
+  # Counted before anything speaks about the scan: three lines pick their register from this, and
+  # the EDITED banner below was the third of them to be found announcing a quoted-only finding as
+  # a WARNING that says what the merge closes (review rounds 13 and 14).
+  local n_sentence n_quoted
+  n_sentence=$(grep -c "^sentence$(printf '\t')" <<<"$scan") || n_sentence=0
+  n_quoted=$(grep -c "^quoted$(printf '\t')" <<<"$scan") || n_quoted=0
+  # The re-scan is the one whose findings actually land, so it reports what CHANGED rather than
+  # repeating a block the caller has already read. An unchanged body gets one line; a body that
+  # was edited during the gate gets the new findings in full, or, when the edit removed them, a
+  # line retracting the ones printed earlier.
+  if [ -n "$again" ] && [ -n "$MULTI_CLOSE_HAVE" ]; then
+    if [ "$body" = "$MULTI_CLOSE_BODY" ]; then
+      if [ -n "$scan" ]; then
+        if [ -n "$MULTI_CLOSE_STRONG" ] && [ "$n_quoted" -gt 0 ]; then
+          # Mixed: "what it listed" would sweep the quoted entry into a closing claim the scan
+          # refuses to make about it (review round 15). Each class is confirmed in its own terms.
+          multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body is UNCHANGED since the scan" \
+            "above, so the merge closes the issues its WARNING listed;"
+          multi_close_say "  the line its NOTICE flagged is still there, and still claims nothing."
+        elif [ -n "$MULTI_CLOSE_STRONG" ]; then
+          multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body is UNCHANGED since the scan" \
+            "above, so the merge closes what it listed."
+        else
+          multi_close_say "CLOSING-KEYWORD NOTICE: $REPO#$1's body is UNCHANGED since the scan" \
+            "above; the line flagged there is the line that lands."
+        fi
+        # An unchanged BODY is not an unchanged answer: the base or the default branch can have
+        # moved during the gate, and a lookup that now fails leaves it unknown whether those
+        # keywords bind at all. Saying so here is owed, because this line is the last word on a
+        # finding the caller has already read (review round 11).
+        if [ "$MULTI_CLOSE_BINDS" = unknown ]; then
+          multi_close_say "  ...though whether they bind could NOT be re-read: $MULTI_CLOSE_ERR." \
+            "Unread is not inert."
+        fi
+      fi
+      return 0
+    fi
+    if [ -z "$scan" ]; then
+      # Only a warning that was PRINTED can be withdrawn. A clean body edited to another clean body
+      # was producing a loud retraction of nothing at all, immediately before an ordinary merge
+      # (review round 11); the saved body is updated silently instead.
+      if [ -n "$MULTI_CLOSE_LAST" ]; then
+        if [ -n "$MULTI_CLOSE_STRONG" ]; then
+          multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1's body was edited since" \
+            "the scan above and now binds no keyword to more than it names."
+        else
+          multi_close_say "CLOSING-KEYWORD NOTICE WITHDRAWN: $REPO#$1's body was edited since the" \
+            "scan above and no longer carries a keyword in what reads as an example."
+        fi
+      fi
+      MULTI_CLOSE_LAST=""
+      MULTI_CLOSE_STRONG=""
+      MULTI_CLOSE_BODY="$body"
+      return 0
+    fi
+    if [ "$n_sentence" -gt 0 ]; then
+      multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body was EDITED since the scan above;" \
+        "what this merge closes is below, not there."
+    else
+      multi_close_say "CLOSING-KEYWORD NOTICE: $REPO#$1's body was EDITED since the scan above;" \
+        "the line to read is below, not there."
+    fi
+  fi
+  MULTI_CLOSE_LAST="$scan"
+  MULTI_CLOSE_BODY="$body"
+  MULTI_CLOSE_HAVE=1
+  MULTI_CLOSE_STRONG=""
+  [ "$n_sentence" -eq 0 ] || MULTI_CLOSE_STRONG=1
+  [ -n "$scan" ] || return 0
+  # The two classes make DIFFERENT claims, and only one of them rests on the block classifier.
+  #
+  # A multi-reference sentence is a fact about the text: a keyword and two references in one
+  # sentence, no Markdown structure consulted. It says outright that the merge closes both.
+  #
+  # A quoted-or-fenced line is a claim that the line is an EXAMPLE, and telling an example from
+  # prose means classifying Markdown blocks. Nine review rounds established that doing that
+  # correctly is a CommonMark block parser -- list-relative fence delimiters, tab-expanded list
+  # padding, lazy blockquote continuation, markers that cannot interrupt a paragraph -- and that
+  # every approximation short of one has corners. So this class no longer asserts that anything
+  # closes and no longer offers to reopen an issue: it flags a line to look at, which is a claim
+  # the classifier can support even when it is wrong. That is what stops a parsing corner from
+  # producing a false statement about what a merge did (review round 12).
+  # The body is data from the PR, so every line of it is written through printf and never echoed.
+  while IFS=$'\t' read -r class cnt refs sent; do
+    [ -n "$class" ] || continue
+    n=$((n + 1))
+    if [ "$n" -eq 1 ]; then
+      if [ "$n_sentence" -gt 0 ]; then
+        multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's body closes issues it does not look" \
+          "like it closes:"
+      else
+        multi_close_say "CLOSING-KEYWORD NOTICE: $REPO#$1's body carries a closing keyword in what" \
+          "reads as an example:"
+      fi
+    fi
+    case "$class" in
+    quoted) multi_close_say "  reads as a QUOTED or FENCED example, $cnt reference(s): $refs" ;;
+    *) multi_close_say "  ONE sentence, $cnt issues: $refs" ;;
+    esac
+    multi_close_say "      $sent"
+  done <<<"$scan"
+  [ "$n" -gt 0 ] || return 0
+  multi_close_say "  A closing keyword binds to EVERY #N in its sentence, and a quoted or" \
+    "fenced copy of an example binds the same way:"
+  multi_close_say "  ludics-lite#205 was closed twice over exactly that, by a phase reference" \
+    "in #210 and then by #226 quoting it back."
+  if [ "$n_quoted" -gt 0 ]; then
+    multi_close_say "  A line is judged an example by a best-effort reading of the Markdown, not" \
+      "by a parser, so one flagged above"
+    multi_close_say "  may be ordinary prose. Read it; nothing is claimed about what it closes."
+  fi
+  if [ "$n_sentence" -eq 0 ]; then
+    return 0
+  fi
+  # EDIT first, reopen only after. Every scan prints BEFORE its merge attempt -- the lead-time one
+  # before a wait that may end in a refusal, the authoritative one moments before the call -- so at
+  # the point these lines are read nothing has closed yet, and "reopen it now" was advice that
+  # could not work and left the body to close the issue again on the next attempt (review round 7).
+  # The repository is NOT `$REPO`: a reference is reported as the body spells it, and the
+  # cross-repository form names an issue this PR own repository does not have, so a hardcoded
+  # --repo would act on a same-numbered issue HERE, or fail (review round 1).
+  multi_close_say "  If an issue listed above must stay OPEN, EDIT THE BODY now -- nothing has" \
+    "closed yet, and this scan runs before the merge."
+  multi_close_say "  If the merge has already landed by the time you read this, reopen it in the" \
+    "repository its own reference names"
+  multi_close_say "  (gh issue reopen <n> --repo <owner>/<name>; a bare #<n> is $REPO)."
+  if [ "$MULTI_CLOSE_BINDS" = unknown ]; then
+    multi_close_say "  Whether these bind at all could NOT be read: a body keyword closes only on a" \
+      "merge into the repository default"
+    multi_close_say "  branch, and $MULTI_CLOSE_ERR. Unread is not inert."
+  fi
+  multi_close_say "  This is a WARNING and not a gate: one sentence closing two issues is" \
+    "sometimes exactly what was meant,"
+  multi_close_say "  and nothing readable from here tells that apart from the accident."
+  return 0
+}
+
 cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
@@ -4018,6 +4566,14 @@ cmd_merge() {
       "same red on master before this branch existed'."
   fi
   pr_arg "$pr"
+  # Read the body FIRST, before the merge-queue refusal and before a --wait that can run two hours.
+  # Two reasons for the position. It is a fact about the PR and not about the build signal, so it is
+  # owed to the refusal paths too -- a merge stopped by a red gate is a merge that will be re-run,
+  # and the body is fixable in between, which it is not once the issues are closed. And under a long
+  # --wait an operator watching the run gets the whole wait as lead time. What it costs is being the
+  # FIRST thing on screen rather than the last: warn_base_drift keeps the position just before the
+  # merge call, where its comment says it belongs.
+  warn_multi_close "$PR_NUM"
   # A merge queue turns `gh pr merge` into an ENQUEUE — the PR lands later, on whatever head it
   # has then, and --disable-auto does not take an entry out of a queue. A close-out merge lands
   # the gated head now or refuses, so on a queued base it refuses before calling merge at all:
@@ -4077,18 +4633,37 @@ cmd_merge() {
       "the record; a close-out merge is never made by dropping --require-green."
   fi
   # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
-  # verdict is the final thing on screen before the merge itself. A loud WARNING, not a gate: the
+  # verdict is read late, with only the closing-keyword re-scan below it. A loud WARNING, not a gate: the
   # roll-forward policy (ahrefs/ocannl#861, see warn_base_drift) lets a clean merge proceed on the
   # head's green run, and hands semantic drift to the post-merge integration loop. A 3 (unread)
   # has already said UNKNOWN loudly; neither outcome blocks the merge.
   warn_base_drift "$PR_NUM" || true
-  [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
   # The verdict above is about ONE head, the one gate_checks read — and a --wait is minutes to
   # hours long, during which a push can move the PR. `gh pr merge` merges whatever the head is at
   # the moment of the call; --match-head-commit makes it refuse unless that is still the gated
   # SHA, so a close-out merge cannot land a head with neither a read green nor a 👍 (review of
   # ludics-lite#39). The refusal is final, not retried: re-run merge, which re-reads the gate.
   while :; do
+    # Read the body ONE more time, immediately before EVERY merge attempt. The scan after pr_arg is
+    # for lead time; this is the one whose findings land. A body stays editable throughout a --wait
+    # that can run two hours, and editing it moves no head, so --match-head-commit cannot see the
+    # change (review round 1) -- and the same holds inside this loop, where await_mergeable can
+    # hold for tens of seconds before a retry (review round 5). It reports only what MOVED, so a
+    # body that has not changed costs one line however many attempts are made.
+    #
+    # What this does NOT cover is gh_retry own retries of the call below: a gateway refusal makes
+    # it wait and re-issue, and a body edited inside that backoff lands unscanned (review round 9).
+    # Closing it would mean handing a per-feature callback to a generic transport helper, or
+    # dropping the write retry that exists so a merge refused before it ran is not reported as
+    # ambiguous. Both cost more than the window is worth: it is bounded by the backoff (about 35s
+    # over four attempts) and opens only during a GitHub gateway incident.
+    warn_multi_close "$PR_NUM" again
+    # AFTER the scan, and inside the loop: the queue read has to be the last thing before the call,
+    # and the scan above makes three REST reads that a queue could be enabled during, or a retarget
+    # onto a queued base completed during (review round 10). It moved here from just before the
+    # loop, so the ordinary path still makes exactly one queue read -- only a retry adds another,
+    # which is a retry that has already waited for a mergeability recompute.
+    [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
     out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" --match-head-commit "$CHECK_SHA" \
       "${gh_args[@]}")
     rc=$?
@@ -4148,7 +4723,8 @@ cmd_merge() {
       "--disable-auto) before anything else."
   fi
   fail 1 "$REPO#$PR_NUM is not merged ($state) — \`gh pr merge\` returned having only enabled" \
-    "auto-merge. It will land when the base's required checks pass; do not treat it as landed."
+    "auto-merge. It will land when the base's required checks pass; do not treat it as landed." \
+    "$(multi_close_deferred_note)"
 }
 
 # A branch name is data, not URL structure: `release#1` and `release&one` are valid refs, but
