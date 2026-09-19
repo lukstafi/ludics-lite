@@ -1328,7 +1328,7 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
     # not create. These three paths were created by THIS call, seconds ago and under that claim, so
     # they are removable here and nowhere else. Leaving them would refuse the next hold until the
     # claim went stale and make every unhold until then report a lost holder that never existed.
-    rm -f "$f" "$fifo" "$out" 2>/dev/null
+    rm -f "$fifo" "$out" "$f" 2>/dev/null
     return 1
   fi
   # The lock this holder now carries says whatever the take that opened the descriptor said, and
@@ -1549,19 +1549,6 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
   # From here the release can hold the box's lock, and every return below goes through the unlock.
   rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
   read -r p d t sc tok gp prot <<<"${rec:-}"; : "$t"
-  # The hold-lock sidecar goes with the holder: it exits on its own once the holder is gone, and
-  # killing it here is what makes the box destroyable again immediately rather than a poll later.
-  # Its pid is checked the way the holder's is — a record outlives both processes, and by the time
-  # anyone runs `unhold` the number may belong to something else entirely — and the check is for
-  # THIS holder's sidecar, not for any sidecar: the tag is the same in every lane on this machine,
-  # so a stale record whose number has been recycled onto a sibling box's sidecar would otherwise
-  # release that box's hold lock and leave its VM unprotected (#184 (b)).
-  if [ -n "${sc:-}" ] && [ "${sc:-0}" != 0 ]; then
-    sargs=$(ps -ww -o args= -p "$sc" 2>/dev/null)
-    case "$sargs" in
-      *wake-lab-hold-lock*" $p") kill "$sc" 2>/dev/null ;;
-    esac
-  fi
   if hold_pid_live "$f"; then
     was_live=1
     : > "$rel" 2>/dev/null
@@ -1571,6 +1558,23 @@ release_hold() { # release_hold <box> — end the recorded holder; always rc 0 (
     # client is first waited out -- a signalled process is not a dead one, and the EOF the holder
     # ends on cannot cross a channel that is still open -- and then the VM itself is asked.
     for i in 1 2 3 4 5; do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+  fi
+  # The hold-lock sidecar goes with the holder, and only AFTER it. It carries the box's ONLY flock
+  # -- the client merely inherited a copy of the descriptor -- so ending it first unlocks the box
+  # while that client is still alive and still recorded: an overlapping `kick-wsl --hold` then
+  # reuses the holder, handshakes it, takes no lock of its own and returns SUCCESS, and this
+  # release goes on to kill the very client it was just told to rely on. Leaving the sidecar until
+  # the client is dead keeps the box refused for the whole release, which is the true state of it.
+  # Killing it explicitly rather than waiting for its poll is what makes the box destroyable again
+  # immediately instead of a second later. Its pid is checked the way the holder's is -- a record
+  # outlives both processes -- and for THIS holder's sidecar, not any sidecar: the tag is the same
+  # in every lane on this machine, so a stale record whose number has been recycled onto a sibling
+  # box's sidecar would otherwise release that box's hold lock and leave its VM unprotected.
+  if [ -n "${sc:-}" ] && [ "${sc:-0}" != 0 ]; then
+    sargs=$(ps -ww -o args= -p "$sc" 2>/dev/null)
+    case "$sargs" in
+      *wake-lab-hold-lock*" $p") kill "$sc" 2>/dev/null ;;
+    esac
   fi
   # ...and only NOW can the release take the box's hold lock, which is why this sits below the kill
   # rather than beside the sidecar's. The lock lives on a descriptor the HOLDER inherits -- that is
