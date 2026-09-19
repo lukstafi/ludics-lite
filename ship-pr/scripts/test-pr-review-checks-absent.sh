@@ -23,6 +23,8 @@ MERGE_BASE=1111111111111111111111111111111111111111
 # can be established about a push event here (review round 1): a push's changed files are computed
 # between its own before and after, and after a force-push the before is not on the walked path.
 HEAD_REF=claude/topic
+# The head of the newest merged pull request, which is what the provider question is sampled from.
+SAMPLE_SHA=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
 REQUEST_LOG="$TEST_ROOT/requests"
 PAGINATE_LOG="$TEST_ROOT/paginated"
 
@@ -53,9 +55,12 @@ WORKFLOW_YAML=""
 # context, so the head's copy only speaks for it when the base's copy is identical; a case that
 # sets this differently stands for a base-side edit made after the branch diverged.
 WORKFLOW_YAML_BASE=""
-# The base tip's check runs, which is where "does this repository have a provider other than
-# Actions" is read: the recognition reads workflows, so it can answer for nothing else.
-BASE_CHECKS_JSON=""
+# The newest merged pull request of this repository, and its head's check runs: where "does this
+# repository have a provider other than Actions" is read. The recognition reads workflows, so it
+# can answer for nothing else — and a merged PR's head is the population the question is about,
+# where the base tip (round 2's sample) was not.
+MERGED_PRS_JSON=""
+SAMPLE_CHECKS_JSON=""
 COMPARE_COMMITS=""
 FILES_JSON=""
 
@@ -143,7 +148,9 @@ reset_fixture() {
   WORKFLOW_PATH=".github/workflows/ci.yml"
   WORKFLOW_YAML="$UNFILTERED_YAML"
   WORKFLOW_YAML_BASE=""
-  BASE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}}]')
+  MERGED_PRS_JSON=$(jq -cn --arg s "$SAMPLE_SHA" \
+    '[{merged_at:"2026-09-18T00:00:00Z", head:{sha:$s}}]')
+  SAMPLE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}}]')
   COMPARE_COMMITS=$(jq -cn --arg h "$HEAD_SHA" '[$h]')
   FILES_JSON='[{"filename":"docs/notes.md"}]'
   rm -f "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls" "$TEST_ROOT/HEAD_SEQ.calls"
@@ -206,8 +213,11 @@ gh() {
     response="${WORKFLOW_YAML_BASE:-$WORKFLOW_YAML}"
     ;;
   "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
-  "repos/$REPO/commits/$BASE_SHA/check-runs?filter=latest&per_page=100")
-    response="$BASE_CHECKS_JSON"
+  "repos/$REPO/pulls?state=closed&sort=updated&direction=desc&per_page=20")
+    response="$MERGED_PRS_JSON"
+    ;;
+  "repos/$REPO/commits/$SAMPLE_SHA/check-runs?filter=latest&per_page=100")
+    response="$SAMPLE_CHECKS_JSON"
     ;;
   # One answer for both compares the recognition makes: `base...head`, read for the merge base
   # alone, and `merge_base...head`, read for the commits. Oldest first, each commit the first
@@ -483,24 +493,76 @@ jobs:
   assert_eq "$GATE_RC" 4 "a branches-ignore is a shape this does not read"
 }
 
-# GitHub runs a pull_request_target workflow from the file in the PR's BASE context, not the
-# head's — so the file read here is not the file that decides, and a base-side edit removing a
-# paths-ignore is outside the walked range entirely.
-test_a_pull_request_target_trigger_keeps_the_head_waiting() {
+# An event is inert only when it is NAMED inert. Rounds 1 and 3 each arrived with a member of the
+# same class — merge_group wrongly counted, pull_request_review and pull_request_review_comment
+# wrongly ignored — so the rule is inverted rather than patched a third time, and anything nobody
+# reasoned about costs the grace instead of a wrong absence.
+test_an_event_outside_the_inert_list_keeps_the_head_waiting() {
+  local ev
+  for ev in pull_request_target pull_request_review pull_request_review_comment release; do
+    reset_fixture
+    COMMIT_AGE=5
+    WORKFLOW_YAML="name: ci
+on:
+  pull_request:
+    paths-ignore: [\"docs/**\", \"**.md\"]
+  $ev:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+"
+    run_gate
+    assert_eq "$GATE_RC" 4 "an unreasoned trigger ($ev) is not inert"
+    assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers instead ($ev)"
+  done
+}
+
+# The short list itself, all of it at once: a clock, a person, a caller, another run, and a queue.
+test_the_named_inert_events_do_not_block_the_recognition() {
   reset_fixture
   COMMIT_AGE=5
   WORKFLOW_YAML='name: ci
 on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+  workflow_call:
+  workflow_run:
+  merge_group:
   pull_request:
-    paths-ignore: ["docs/**", "**.md"]
-  pull_request_target:
     paths-ignore: ["docs/**", "**.md"]
 jobs:
   build:
     runs-on: ubuntu-latest
 '
   run_gate
-  assert_eq "$GATE_RC" 4 "the head-side file does not decide a pull_request_target run"
+  assert_eq "$GATE_RC" 0 "none of the named inert events can create a run for this head"
+  assert_contains "$GATE_OUTPUT" ": ABSENT" "so the pull_request filter answers alone"
+}
+
+# The repository's workflow list is not an inventory of the files on a non-default branch: a
+# workflow the head ADDS is absent from it, so every listed workflow can pass while the newcomer's
+# first run is on its way. Any path under the workflow directory anywhere in the range refuses,
+# which closes that and the filter-that-moved-mid-range case with one rule and no extra read.
+test_a_workflow_added_by_the_range_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  # A filter that ignores the workflow directory too, so nothing but the guard can refuse this.
+  WORKFLOW_YAML='name: ci
+on:
+  pull_request:
+    paths-ignore: ["docs/**", "**.md", ".github/workflows/**"]
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+'
+  FILES_JSON='[{"filename":"docs/notes.md"},{"filename":".github/workflows/new.yml"}]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a workflow the repository list cannot carry was never examined"
+  assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers instead"
 }
 
 # A merge-group run is created only after the PR enters a merge queue, and its head is the queue's
@@ -535,7 +597,7 @@ test_a_second_check_provider_keeps_the_head_waiting() {
   reset_fixture
   COMMIT_AGE=5
   WORKFLOW_YAML="$DOCS_IGNORED_YAML"
-  BASE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}},
+  SAMPLE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}},
                                        {"name":"buildkite","app":{"slug":"buildkite"}}]')
   run_gate
   assert_eq "$GATE_RC" 4 "a provider the workflows do not describe keeps the creation window open"
@@ -548,22 +610,29 @@ test_an_advisory_provider_does_not_block_the_recognition() {
   reset_fixture
   COMMIT_AGE=5
   WORKFLOW_YAML="$DOCS_IGNORED_YAML"
-  BASE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}},
+  SAMPLE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}},
                                        {"name":"claude","app":{"slug":"claude"}}]')
   run_gate
   assert_eq "$GATE_RC" 0 "the review app is advisory in this direction too"
   assert_contains "$GATE_OUTPUT" ": ABSENT" "and the recognition still answers"
 }
 
-# No non-advisory check run on the base tip at all is no evidence about this repository's
-# providers, so it is not evidence that Actions is the only one.
-test_a_base_tip_without_checks_keeps_the_head_waiting() {
+# No non-advisory check run on the sampled pull request at all is no evidence about this
+# repository's providers, so it is not evidence that Actions is the only one. Neither is a
+# repository with no merged pull request to sample.
+test_a_sample_without_checks_keeps_the_head_waiting() {
   reset_fixture
   COMMIT_AGE=5
   WORKFLOW_YAML="$DOCS_IGNORED_YAML"
-  BASE_CHECKS_JSON=$(check_runs_json '[]')
+  SAMPLE_CHECKS_JSON=$(check_runs_json '[]')
   run_gate
-  assert_eq "$GATE_RC" 4 "an empty base-tip check list says nothing about providers"
+  assert_eq "$GATE_RC" 4 "an empty check list on the sample says nothing about providers"
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  MERGED_PRS_JSON=$(jq -cn '[{merged_at:null, head:{sha:"0000000000000000000000000000000000000000"}}]')
+  run_gate
+  assert_eq "$GATE_RC" 4 "a repository with no merged pull request has nothing to sample"
 }
 
 # A `pull_request` run uses the workflow from the MERGE context, base merged with head, so a
@@ -1129,12 +1198,14 @@ tests=(
   test_a_head_without_a_base_sha_is_never_recognized
   test_a_push_trigger_this_branch_reaches_keeps_the_head_waiting
   test_a_branches_ignore_keeps_the_head_waiting
-  test_a_pull_request_target_trigger_keeps_the_head_waiting
+  test_an_event_outside_the_inert_list_keeps_the_head_waiting
+  test_the_named_inert_events_do_not_block_the_recognition
+  test_a_workflow_added_by_the_range_keeps_the_head_waiting
   test_an_unfiltered_merge_group_does_not_block_the_recognition
   test_a_truncated_workflow_list_keeps_the_head_waiting
   test_a_second_check_provider_keeps_the_head_waiting
   test_an_advisory_provider_does_not_block_the_recognition
-  test_a_base_tip_without_checks_keeps_the_head_waiting
+  test_a_sample_without_checks_keeps_the_head_waiting
   test_a_base_side_workflow_edit_keeps_the_head_waiting
   test_a_head_with_a_run_never_consults_the_filter
   test_a_head_past_the_grace_never_consults_the_filter

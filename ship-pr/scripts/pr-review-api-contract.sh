@@ -472,7 +472,7 @@ else
 # `.status` is not pinned here either, for the same reason as on jobs[]: build_checks projects
 # `.name`, `.conclusion` and `.html_url`, and the pending/finished distinction it needs it reads
 # off the null conclusion, never off the status. `.app.slug` is pinned because the correlation
-# below selects on it — and because checks_are_actions_only now decides a GATE on it: it answers
+# below selects on it — and because providers_are_actions_only now decides a GATE on it: it answers
 # "does this repository have a check provider the workflow filters cannot speak for", and a slug
 # for Actions that moved would make every check look like a third party's and cost the
 # paths-ignore recognition its fast path (ludics-lite#176, review round 2).
@@ -483,10 +483,10 @@ pin "check-run conclusions are in the vocabulary conclusion_class classifies" \
   "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$checks"
 pin "every check run carries a check_suite.id (build_checks reads by name across every suite and provider)" \
   'all(.[]; .check_suite.id | type == "number")' "$checks"
-# The literal checks_are_actions_only compares against. This repository's own checks are Actions'
+# The literal providers_are_actions_only compares against. This repository's own checks are Actions'
 # alone, so at least one row must carry it; a slug that moved shows up here rather than as a
 # recognition that silently stopped firing.
-pin "GitHub Actions' own check runs carry app.slug == \"github-actions\" (checks_are_actions_only's literal)" \
+pin "GitHub Actions' own check runs carry app.slug == \"github-actions\" (providers_are_actions_only's literal)" \
   'any(.[]; .app.slug == "github-actions")' "$checks"
 # What build_checks asks of filter=latest is not uniqueness — two jobs may legally share a name,
 # and it emits one row per check run — but that a re-run's superseded attempt is DROPPED, since

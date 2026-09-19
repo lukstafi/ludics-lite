@@ -4374,24 +4374,17 @@ workflow_source() {
   printf '%s\n%s\n' "$wpath" "$body"
 }
 
-# workflow_paths_ignore <workflow id> <ref>: the workflow FILE's path, then its
-# `on: push: paths-ignore` patterns one per line, or nothing (exit 1) when they cannot be
-# established. cmd_base's reader: it queries one event, `push`, because that is the only event
-# whose runs it folds.
+# workflow_paths_ignore <workflow id> <ref>: a workflow's `on: push: paths-ignore` patterns, one
+# per line, or nothing (exit 1) when they cannot be established. cmd_base's reader: it queries one
+# event, `push`, because that is the only event whose runs it folds.
 workflow_paths_ignore() {
-  local wid="$1" ref="$2" src wpath body pats
+  local wid="$1" ref="$2" src body pats
   src=$(workflow_source "$wid" "$ref") || return 1
-  wpath="${src%%$'\n'*}"
   body="${src#*$'\n'}"
   pats=$(awk -v q="'" -v dq='"' -v want=push -v seq=paths-ignore \
     "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
   [ -n "$pats" ] || return 1
-  # WHICH file these patterns came out of leads the answer, because the range walk has to know
-  # whether any commit in it changed that file — a filter that moved mid-range is not one filter.
-  # It travels in the OUTPUT and not in a variable: every caller here reads through a command
-  # substitution, where an assignment dies with the subshell (the same trap base_red_detail's
-  # cache documents).
-  printf '%s\n%s\n' "$wpath" "$pats"
+  printf '%s\n' "$pats"
 }
 
 # glob_ere <pattern>: one GitHub path filter as an ERE anchored at both ends, or nothing (exit 1)
@@ -4483,7 +4476,7 @@ commit_files() {
   printf '%s' "$raw" | tr '\t' '\n' | grep .
 }
 
-# commits_ignored <patterns> <workflow file> <judged sha> <tip>: true when every commit on the
+# commits_ignored <patterns> <judged sha> <tip>: true when every commit on the
 # FIRST-PARENT path from the judged commit up to the tip changed only ignored paths.
 #
 # Per COMMIT, and not the cumulative diff of the range, because a path filter is evaluated per
@@ -4507,7 +4500,7 @@ commit_files() {
 # 1000 commits, above which a push runs whatever the filter says). A `total_commits` the returned
 # list does not match is a truncated answer and settles nothing.
 commits_ignored() {
-  local pats="$1" wfile="$2" vsha="$3" tip="$4" cmp count behind rows sha parent files steps nl=$'\n'
+  local pats="$1" vsha="$2" tip="$3" cmp count behind rows sha parent files steps nl=$'\n'
   cmp=$(gh_retry read api "repos/$REPO/compare/$vsha...$tip?per_page=$IGNORE_MAX_COMMITS" \
     --jq '(.total_commits // 0 | tostring), ((.behind_by // -1) | tostring),
           ((.commits // [])[] | [.sha, ((.parents // [])[0].sha // "-")] | @tsv)') || return 1
@@ -4532,7 +4525,13 @@ commits_ignored() {
     # diffs do not describe it.
     case "$parent" in '' | -) return 1 ;; esac
     files=$(commit_files "$sha") || return 1
-    [ -z "$wfile" ] || ! grep -qxF -- "$wfile" <<<"$files" || return 1
+    # ANY file under the workflow directory, not just the one workflow whose filter is being
+    # applied (review round 3). A range that edits a workflow is a range across two different
+    # filters — and a range that ADDS one adds a workflow the repository's own list does not
+    # carry, since that list is not an inventory of the files on a non-default branch: every
+    # listed workflow can pass this loop while the newcomer, whose first run is on its way, was
+    # never examined. Refusing on the directory closes both, and needs no extra read.
+    ! grep -q '^\.github/workflows/' <<<"$files" || return 1
     paths_ignore_covers "$pats" "$files" || return 1
     sha="$parent"
   done
@@ -4545,7 +4544,7 @@ commits_ignored() {
 # EVERY one of them is explained by its own filter — one workflow's docs-only diff says nothing
 # about the workflow beside it — and the reason goes into PATHS_IGNORE_WHY for the settle line.
 tip_within_paths_ignore() {
-  local rows="$1" tip="$2" wfid name vsha key hit pats read_pats wfile why=""
+  local rows="$1" tip="$2" wfid name vsha key hit pats why=""
   PATHS_IGNORE_WHY=""
   [ -n "$rows" ] || return 1
   while IFS=$'\t' read -r wfid name vsha; do
@@ -4558,11 +4557,8 @@ tip_within_paths_ignore() {
     if [ -z "$hit" ]; then
       hit=no
       # The file's path leads the answer; the patterns are the rest of it.
-      read_pats=$(workflow_paths_ignore "$wfid" "$tip") || read_pats=""
-      wfile="${read_pats%%$'\n'*}"
-      pats="${read_pats#*$'\n'}"
-      if [ -n "$read_pats" ] && [ -n "$wfile" ] && [ -n "$pats" ] &&
-        commits_ignored "$pats" "$wfile" "$vsha" "$tip"; then
+      pats=$(workflow_paths_ignore "$wfid" "$tip") || pats=""
+      if [ -n "$pats" ] && commits_ignored "$pats" "$vsha" "$tip"; then
         hit=yes
       fi
       BASE_IGNORE_CACHE="${BASE_IGNORE_CACHE}${key}"$'\t'"${hit}"$'\n'
@@ -4606,33 +4602,56 @@ tip_within_paths_ignore() {
 # would not see it. It is rare enough that reading a second copy of the file is not worth the
 # branch.
 #
-# `merge_group` is INERT here, and was wrong to include: a merge-group run is created only after
-# the PR enters a merge queue, and its head is the queue's own temporary ref, never this one. An
-# unfiltered `merge_group` beside a filtered `pull_request` is an ordinary shape, and counting it
-# would have made every docs-only PR wait the grace out. Every other event — `schedule`,
-# `workflow_dispatch`, `workflow_run`, the issue and release events — is inert for the same reason
-# it always was: nothing about this change fires it, and a run created by any other means would
-# already have been in the run list this question is only asked about because it came back empty.
-
-# checks_are_actions_only <sha>: true when every non-advisory check run on that commit was created
-# by GitHub Actions. The recognition below reads WORKFLOWS, so it can only ever answer for Actions
-# — and `build_checks` deliberately accepts every provider's check runs, so a repository with a
-# third-party CI app has a second way to grow a check on a fresh head that no workflow filter
-# describes (review round 2). That is the mirror of the rule ludics-lite#38 round 3 already holds
-# in the other direction: an early Codecov green over an empty run list does not shortcut the
-# grace either, because it proves nothing about Actions.
+# EVERY OTHER EVENT REFUSES unless it is on the short list below. Rounds 1 and 3 each arrived with
+# a member of the same class — `merge_group` wrongly counted, `pull_request_review` and
+# `pull_request_review_comment` wrongly ignored — so the rule is inverted rather than patched a
+# third time: an event is inert only when it is named here, and an event nobody reasoned about
+# costs the grace instead of a wrong absence. `pull_request_target` is inert in no sense and is
+# refused by the same default.
 #
-# The evidence is read off the PR's BASE BRANCH TIP rather than the head: the head is the commit
-# whose checks have not appeared yet, which is the whole question, while the base tip is an
-# ordinary commit of this repository carrying whatever set of providers it is configured with. No
-# non-advisory check run there at all is no evidence, and refuses — as does a read that fails.
-# Advisory names are dropped first, for the reason the list exists: the review app posts a check
-# run of its own from a non-Actions app, and counting it would refuse on every repository this
-# skill is used in.
-checks_are_actions_only() {
-  local sha="$1" raw name slug seen=0
-  case "$sha" in '' | *[!0-9a-f]*) return 1 ;; esac
-  raw=$(gh_retry read api "repos/$REPO/commits/$sha/check-runs?filter=latest&per_page=100" \
+# What earns a place: the event cannot produce a run whose head is THIS commit, whatever the
+# change. `schedule`, `workflow_dispatch` and `repository_dispatch` are fired by a clock or a
+# person, not by this push — and a run either of them had already created would have been in the
+# head's run list, which is empty, since that emptiness is the only reason this question is asked.
+# `workflow_call` produces no run of its own; its jobs appear inside the caller's. `workflow_run`
+# fires on another run's completion, and there is no run here to complete. `merge_group` is created
+# only after the PR enters a merge queue, at the queue's own temporary ref, never this head — and
+# an unfiltered `merge_group` beside a filtered `pull_request` is an ordinary shape, so counting it
+# would have cost the fast path its common case.
+HEAD_INERT_EVENTS='schedule workflow_dispatch repository_dispatch workflow_call workflow_run merge_group'
+
+# providers_are_actions_only: true when the newest MERGED pull request of this repository carries
+# non-advisory check runs and every one of them was created by GitHub Actions. The recognition
+# below reads WORKFLOWS, so it can only ever answer for Actions — and `build_checks` deliberately
+# accepts every provider's check runs, so a repository with a third-party CI app has a second way
+# to grow a check on a fresh head that no workflow filter describes (review round 2). That is the
+# mirror of the rule ludics-lite#38 round 3 already holds in the other direction: an early Codecov
+# green over an empty run list does not shortcut the grace either, because it proves nothing about
+# Actions.
+#
+# It is a FILTER, not an inventory, and says so here because that is the honest description: no
+# endpoint enumerates the check providers configured for a repository, so no read at any cost
+# proves the negative. What it does is rule out the case that actually happens — a provider the
+# repository is configured with, which therefore leaves check runs on its pull requests.
+#
+# A MERGED pull request's head is the population the question is about, and round 3 is why: a base
+# branch tip, which this sampled first, is exactly where a provider that runs only on pull requests
+# does not appear, and where a freshly pushed commit may not have its checks yet either. A merged
+# PR's head is settled and is a pull request. No non-advisory row on it is no evidence and refuses,
+# as does a read that fails, or a repository with no merged pull request to sample. Advisory names
+# are dropped first, for the reason the list exists: the review app posts a check run of its own
+# from a non-Actions app, and counting it would refuse on every repository this skill is used in.
+#
+# The residual is a provider configured but absent from that sample. It is named in ship-pr's
+# SKILL.md beside the verdict, and `--require-green` — which refuses ABSENT outright — is the hatch
+# for a merge that must have READ a green rather than found nothing.
+providers_are_actions_only() {
+  local sample raw name slug seen=0
+  sample=$(gh_retry read api \
+    "repos/$REPO/pulls?state=closed&sort=updated&direction=desc&per_page=20" \
+    --jq '[.[] | select(.merged_at != null) | .head.sha] | (.[0] // "")') || return 1
+  case "$sample" in '' | *[!0-9a-f]*) return 1 ;; esac
+  raw=$(gh_retry read api "repos/$REPO/commits/$sample/check-runs?filter=latest&per_page=100" \
     --jq '.check_runs[] | [(.name // "-"), (.app.slug // "-")] | @tsv') || return 1
   [ -n "$raw" ] || return 1
   while IFS=$'\t' read -r name slug; do
@@ -4690,7 +4709,7 @@ push_cannot_reach() {
 # one workflow file. Nothing here is memoized, because run_signal is called from inside a command
 # substitution where an assignment dies with the subshell (the trap BASE_RED_DETAIL documents).
 head_within_paths_ignore() {
-  local head="$1" base="$2" ref="$3" mbase wf total rows wid wname wstate src bsrc wpath body
+  local head="$1" base="$2" ref="$3" mbase wf total rows wid wname wstate src bsrc body
   local evs ev pats why=""
   PATHS_IGNORE_WHY=""
   case "$head" in '' | *[!0-9a-f]*) return 1 ;; esac
@@ -4704,7 +4723,7 @@ head_within_paths_ignore() {
   [ "$mbase" != "$head" ] || return 1
   # Everything below reads WORKFLOWS, so it can only answer for Actions. If this repository has a
   # second check provider, no filter here describes what it may still create.
-  checks_are_actions_only "$base" || return 1
+  providers_are_actions_only || return 1
   # The count leads the rows, and they have to agree: this endpoint serves one page, and a
   # repository with more workflows than fit it would have the later ones silently left out — the
   # ones that CAN run for this head, while the ones read say they cannot (review round 1). A
@@ -4726,7 +4745,6 @@ head_within_paths_ignore() {
     src=$(workflow_source "$wid" "$head") || return 1
     bsrc=$(workflow_source "$wid" "$base") || return 1
     [ "$src" = "$bsrc" ] || return 1
-    wpath="${src%%$'\n'*}"
     body="${src#*$'\n'}"
     evs=$(awk -v q="'" -v dq='"' "$WORKFLOW_ON_EVENTS" <<<"$body") || return 1
     [ -n "$evs" ] || return 1
@@ -4737,11 +4755,10 @@ head_within_paths_ignore() {
         pats=$(awk -v q="'" -v dq='"' -v want=pull_request -v seq=paths-ignore \
           "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
         [ -n "$pats" ] || return 1
-        commits_ignored "$pats" "$wpath" "$mbase" "$head" || return 1
+        commits_ignored "$pats" "$mbase" "$head" || return 1
         ;;
       push) push_cannot_reach "$body" "$ref" || return 1 ;;
-      pull_request_target) return 1 ;;
-      *) ;; # inert for this head: see the note above
+      *) case " $HEAD_INERT_EVENTS " in *" $ev "*) ;; *) return 1 ;; esac ;;
       esac
     done <<<"$evs"
     why="${why:+$why, }$wname"
