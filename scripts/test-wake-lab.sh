@@ -54,9 +54,14 @@ lock_dir_state() { # lock_dir_state <dir> -- a printable fingerprint of what tha
 }
 REAL_LOCK_BEFORE=$(lock_dir_state "$REAL_LOCK_DIR")
 
-pass=0; fail=0
+pass=0; fail=0; skipped=0
 ok() { pass=$((pass + 1)); echo "PASS: $*"; }
 ko() { fail=$((fail + 1)); echo "FAIL: $*"; }
+# A case that cannot run here says so on its own line, and is counted in the summary. The
+# cross-repository lock case below needs the ocannl-staging checkout, which CI does not have and
+# never will -- and a check that is absent is indistinguishable from a check that passed unless
+# the run says which. So an all-green run states what it did not look at.
+skip() { skipped=$((skipped + 1)); printf 'SKIP: %s\n' "$*"; }
 # expect <label> <want-rc> <want-substring> -- <cmd...>; leaves the output in $out.
 expect() {
   local label="$1" want_rc="$2" want="$3"; shift 3; [ "$1" = -- ] && shift
@@ -1578,6 +1583,85 @@ out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_LOCK_DIR="$LOCKS" "$WL" lock-
   && ok "lock-path answers without the site file, at the path the holder must take (rc=$rc)" \
   || ko "lock-path did not answer the contract path without hosts.sh (rc=$rc) -- $out"
 
+# --- the lock contract with the ocannl sweep, compared across the two repositories ---------------
+# Every case above pins this side against a literal; none of them compares the two sides, and the
+# interlock is an agreement between two repositories that nothing enforces. This script refuses to
+# destroy a box whose lock is held, ocannl-staging's `tools/sweep.sh` takes that lock, and neither
+# reads anything from the other -- deliberately, so that a sweep checkout on a box with no
+# `~/bin/wake-lab.sh` still reserves correctly. Three facts therefore have to stay equal by hand:
+# the directory, the `<box>.lock` filename, and the box NAME the sweep derives from an ssh alias in
+# its own `lab_box_of`. Every way they drift is silent in the safe-looking direction -- the two
+# sides simply stop meeting, this script finds no lock, and a restart destroys a VM mid-sweep. That
+# is the 2026-09-16 incident, which was read as a GPU fault for two days (ludics-lite#170).
+#
+# So this case reads the sweep's CODE, not its prose: three snippets are lifted out by anchors that
+# a comment cannot match (a `#` would have to come first), each REQUIRED to appear exactly once,
+# and then run in a subshell under a HOME that is not this machine's -- so a side that hard-codes a
+# path rather than deriving it from $HOME is caught instead of agreeing by accident. Requiring the
+# count is what keeps the check from going quietly vacuous when something is renamed: discovery
+# that finds nothing must fail, never pass (ludics-lite#188). The sweep is read-only here; it is a
+# shared checkout.
+SWEEP=${OCANNL_STAGING:-$HOME/ocannl-staging}/tools/sweep.sh
+if [ ! -f "$SWEEP" ]; then
+  skip "the cross-repository lock contract is UNCHECKED: no sweep at $SWEEP (set OCANNL_STAGING)"
+else
+  anchors=1
+  for anchor in '^LAB_LOCK_DIR=' '^lab_box_of() {' '^[[:space:]]*path=\$LAB_LOCK_DIR/'; do
+    n=$(grep -c -- "$anchor" "$SWEEP")
+    [ "$n" -eq 1 ] || { anchors=0
+      ko "the sweep has $n lines matching /$anchor/, not 1 -- the comparison below would be \
+checking a snippet that is no longer the sweep's lock path"; }
+  done
+  if [ "$anchors" -eq 1 ]; then
+    { grep '^LAB_LOCK_DIR=' "$SWEEP"
+      sed -n '/^lab_box_of() {/,/^}/p' "$SWEEP"
+      printf '%s\n' 'sweep_lane_lock() { local box path' '  box=$(lab_box_of "$1")'
+      grep '^[[:space:]]*path=\$LAB_LOCK_DIR/' "$SWEEP"
+      printf '%s\n' '  printf "%s" "$path"' '}'
+    } >"$TMP/sweep-lock.sh"
+    fakehome="$TMP/not-this-machines-home"
+    for pair in rog-nv-wsl:rog minix-amd-wsl:minix; do
+      sshalias=${pair%%:*}; box=${pair##*:}
+      swept=$(env -u WAKE_LAB_LOCK_DIR HOME="$fakehome" \
+        bash -c '. "$1" && sweep_lane_lock "$2"' _ "$TMP/sweep-lock.sh" "$sshalias" 2>&1)
+      mine=$(env -u WAKE_LAB_LOCK_DIR HOME="$fakehome" WAKE_LAB_HOSTS="$TMP/absent.sh" \
+        "$WL" lock-path "$box" 2>&1)
+      if [ "$swept" = "$fakehome/.local/state/wake-lab/$box.lock" ] && [ "$mine" = "$swept" ]; then
+        ok "the lane lock the sweep takes for $sshalias is the one lock-path answers for $box"
+      else
+        ko "the two repositories disagree about $sshalias: the sweep takes '$swept' while wake-lab \
+answers '$mine' for box $box -- the interlock is off, and nothing else in either repository says so"
+      fi
+    done
+    # ...and both sides spell the override the same, which is the only reason redirecting one
+    # (this suite does, at the top) redirects the other.
+    swept=$(env WAKE_LAB_LOCK_DIR="$LOCKS" HOME="$fakehome" \
+      bash -c '. "$1" && sweep_lane_lock "$2"' _ "$TMP/sweep-lock.sh" rog-nv-wsl 2>&1)
+    [ "$swept" = "$LOCKS/rog.lock" ] \
+      && ok "...and WAKE_LAB_LOCK_DIR moves the sweep's lock where it moves wake-lab's" \
+      || ko "the sweep does not honour WAKE_LAB_LOCK_DIR as wake-lab does -- $swept"
+  fi
+  # The fourth fact, added when the lock split in two (ludics-lite#224), and the only one that
+  # fails CLOSED: the sweep must NOT take or honour `<box>.hold.lock`. Adding that is the natural
+  # thing for a future reader to do -- a lock file sitting in a directory the sweep already reads,
+  # named for the box it is about to use -- and it re-creates #224 exactly, as a coverage hole
+  # rather than as a lock bug. The sweep may only NAME the hold lock, in a comment, to say it must
+  # not take it; so require that it still says so, and that it says it nowhere else. Judging a
+  # mention by "its line is a comment" can only ever be wrong in the loud direction: a lock-taking
+  # line that begins with `#` does not run.
+  hold_code=$(grep 'hold[._]lock' "$SWEEP" | grep -v '^[[:space:]]*#')
+  hold_n=$(grep -c 'hold[._]lock' "$SWEEP")
+  if [ -n "$hold_code" ]; then
+    ko "the sweep names the hold lock outside a comment -- if it takes or honours it, a held box \
+can no longer sweep itself and its lanes skip (ludics-lite#224): $hold_code"
+  elif [ "$hold_n" -eq 0 ]; then
+    ko "the sweep no longer states anywhere that it must not take the hold lock: the one warning \
+against re-creating ludics-lite#224 has gone, and this case now guards nothing"
+  else
+    ok "the sweep names the hold lock only in comments ($hold_n), never in a lock-taking position"
+  fi
+fi
+
 # Everything above this line is what reserves: every `restart-wsl`, every power command, every
 # lock case. Check here as well as at the end, so an escape is attributed to that region.
 lab_untouched "the restart, power and lock cases"
@@ -1711,7 +1795,7 @@ else ko "MAC-shaped literals in tracked files:"; printf '%s\n' "$leaks"; fi
 lab_untouched "the suite as a whole"
 
 echo
-echo "$pass passed, $fail failed"
+echo "$pass passed, $fail failed, $skipped skipped"
 [ "$fail" -eq 0 ]
 exit "$?"
 }
