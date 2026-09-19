@@ -1594,22 +1594,29 @@ out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_LOCK_DIR="$LOCKS" "$WL" lock-
 # sides simply stop meeting, this script finds no lock, and a restart destroys a VM mid-sweep. That
 # is the 2026-09-16 incident, which was read as a GPU fault for two days (ludics-lite#170).
 #
-# Two things make this a check and not a restatement.
+# Three things make this a check and not a restatement.
 #
 # It reads the revision the sweep routine RUNS, which is `origin/master`: that routine extracts
 # `tools` and `benchmarks` from it with `git archive` precisely because the checkout is often on a
-# WIP branch (routines/ocannl-cross-machine-sweep/SKILL.md, "Always use origin/master's copy"). A
-# check reading the working tree would let a correct WIP copy vouch for a drifted master, which is
-# the very silence this case exists to break.
+# WIP branch (routines/ocannl-cross-machine-sweep/SKILL.md, "Always use origin/master's copy"). So
+# the checkout is located as a GIT REPOSITORY and `git show` decides whether the file exists -- a
+# WIP branch that moved or deleted `tools/sweep.sh` must not read as "no sweep here".
 #
-# And it does not rebuild the sweep's lock path out of snippets. It runs the sweep's own
-# `take_lab_lock` under a HOME of its own and looks at WHICH FILE APPEARED. A reconstruction agrees
-# with itself even when the sweep's real call site has moved on -- a stale assignment nothing uses
-# would satisfy it -- whereas the file on disk is the lock the sweep would actually hold. The file
-# set is compared WHOLE, so the sweep taking anything besides the lane lock fails here too.
+# It RUNS the sweep's own `take_lab_lock` rather than rebuilding its path from snippets, under a
+# HOME of its own, and looks at which file appeared. A reconstruction agrees with itself even when
+# the real code has moved on -- a stale assignment nothing uses would satisfy it. The file set is
+# compared WHOLE, so the sweep taking anything besides the lane lock fails here too.
 #
-# The extraction anchors are REQUIRED to match exactly once, so a rename fails loudly instead of
-# leaving the check quietly examining nothing (ludics-lite#188). The staging checkout is read
+# And it pins the SYNCHRONISATION, not just the path: a lock file without a live flock stops
+# nothing. The last two cases hold each side's real lock for real and check the other side's real
+# behaviour against it -- which is the only form in which the contract is actually true, and which
+# also covers `WAKE_LAB_LOCK_DIR` meaning the same thing to both (they redirect the sweep and read
+# the result through this script).
+#
+# The anchors are REQUIRED to match exactly once, so a rename fails loudly instead of leaving the
+# check quietly examining nothing (ludics-lite#188). Two of them are the lane's call site: nothing
+# short of running a sweep can execute it, so that it still composes `lab_box_of` with
+# `take_lab_lock` is held as a required core rather than proven. The staging checkout is read
 # strictly read-only: `git show` of a ref, never a branch, a fetch or a write.
 STAGING=${OCANNL_STAGING:-$HOME/ocannl-staging}
 created() { # created <dir> -- every regular file under it, relative and shell-quoted, one line
@@ -1618,21 +1625,44 @@ created() { # created <dir> -- every regular file under it, relative and shell-q
     < <(find "$1" -type f -print0 2>/dev/null)
   printf '%s' "${out# }"
 }
-if [ ! -f "$STAGING/tools/sweep.sh" ]; then
-  skip "the cross-repository lock contract is UNCHECKED: no sweep at $STAGING/tools/sweep.sh \
-(set OCANNL_STAGING)"
+# take_lab_lock's own wait is LAB_LOCK_WAIT, which is not among the lines extracted below; give it
+# a small explicit value rather than letting it be unset, so a contended case fails in seconds and
+# nothing depends on how the shell reads an empty arithmetic operand. A subshell rather than an
+# `env` argument list, because the lock directory has to be genuinely UNSET for the default-path
+# cases and an empty array expansion is an error under `set -u` on bash 3.2.
+# With <ready> and <keep>, the lock is HELD until <keep> is removed, and the waiting happens inside
+# the very shell that took it: take_lab_lock's flock belongs to the open file description behind
+# its fd 8, so it dies with that shell. A wait wrapped AROUND this function holds nothing -- which
+# is not a hypothetical, it is what the first draft of the end-to-end case below did, and it failed
+# against a correct sweep because the lock was already gone by the time wake-lab looked.
+sweep_lock() { # sweep_lock <lock-dir|-> <home> <ssh-alias> [<ready> <keep>]
+  ( if [ "$1" = - ]; then unset WAKE_LAB_LOCK_DIR
+    else WAKE_LAB_LOCK_DIR=$1; export WAKE_LAB_LOCK_DIR; fi
+    HOME=$2; export HOME
+    LAB_LOCK_WAIT=2; export LAB_LOCK_WAIT
+    bash -c '. "$1" || exit 2
+             take_lab_lock "$(lab_box_of "$2")" || exit 1
+             [ -n "$3" ] || exit 0
+             : > "$3"
+             while [ -e "$4" ]; do sleep 1; done' \
+      _ "$TMP/sweep-lock.sh" "$3" "${4:-}" "${5:-}" )
+}
+if ! git -C "$STAGING" rev-parse --git-dir >/dev/null 2>&1; then
+  skip "the cross-repository lock contract is UNCHECKED: no ocannl-staging git checkout at \
+$STAGING (set OCANNL_STAGING)"
 elif ! git -C "$STAGING" show origin/master:tools/sweep.sh >"$TMP/sweep-master.sh" \
      2>"$TMP/sweep-master.err"; then
   ko "cannot read origin/master:tools/sweep.sh out of $STAGING, which is the revision the sweep \
-routine runs -- $(tr -d '\000-\037' <"$TMP/sweep-master.err")"
+routine archives and runs -- $(tr -d '\000-\037' <"$TMP/sweep-master.err")"
 else
   SWEEP=$TMP/sweep-master.sh
   anchors=1
-  for anchor in '^LAB_LOCK_DIR=' '^lab_box_of() {' '^take_lab_lock() {'; do
+  for anchor in '^LAB_LOCK_DIR=' '^lab_box_of() {' '^take_lab_lock() {' \
+                '^[[:space:]]*lab_box=\$(lab_box_of ' '^[[:space:]]*take_lab_lock "\$lab_box"'; do
     n=$(grep -c -- "$anchor" "$SWEEP")
     [ "$n" -eq 1 ] || { anchors=0
-      ko "origin/master's sweep has $n lines matching /$anchor/, not 1 -- the comparison below \
-would no longer be about the code that takes the lock"; }
+      ko "origin/master's sweep has $n lines matching /$anchor/, not 1 -- the lane no longer takes \
+its lock the way the cases below assume, so they would stop being about the live sweep"; }
   done
   if [ "$anchors" -eq 1 ]; then
     { grep '^LAB_LOCK_DIR=' "$SWEEP"
@@ -1644,8 +1674,7 @@ would no longer be about the code that takes the lock"; }
       # A HOME of its own per box: the sweep derives its directory from $HOME, so this keeps the
       # run off this machine's real lab AND proves the path is derived rather than hard-coded.
       home="$TMP/sweep-home-$box"; mkdir -p "$home"
-      out=$(env -u WAKE_LAB_LOCK_DIR HOME="$home" bash -c '. "$1" && take_lab_lock "$(lab_box_of "$2")"' \
-        _ "$TMP/sweep-lock.sh" "$sshalias" 2>&1); rc=$?
+      out=$(sweep_lock - "$home" "$sshalias" 2>&1); rc=$?
       mine=$(env -u WAKE_LAB_LOCK_DIR HOME="$home" WAKE_LAB_HOSTS="$TMP/absent.sh" \
         "$WL" lock-path "$box" 2>&1)
       rel=".local/state/wake-lab/$box.lock"
@@ -1658,38 +1687,60 @@ left [$(created "$home")] under its HOME, while wake-lab answers '$mine' for box
 interlock is off, and nothing else in either repository would say so. $out"
       fi
     done
-    # ...and both sides spell the override the same, which is the only reason redirecting one of
-    # them (this suite redirects wake-lab, at the top) redirects the other.
-    odir="$TMP/sweep-override"; mkdir -p "$odir"
-    out=$(env WAKE_LAB_LOCK_DIR="$odir" HOME="$TMP/sweep-home-rog" \
-      bash -c '. "$1" && take_lab_lock "$(lab_box_of "$2")"' \
-      _ "$TMP/sweep-lock.sh" rog-nv-wsl 2>&1); rc=$?
-    mine=$(env WAKE_LAB_LOCK_DIR="$odir" WAKE_LAB_HOSTS="$TMP/absent.sh" "$WL" lock-path rog 2>&1)
-    [ "$rc" -eq 0 ] && [ "$(created "$odir")" = "$(printf '%q' rog.lock)" ] \
-      && [ "$mine" = "$odir/rog.lock" ] \
-      && ok "...and WAKE_LAB_LOCK_DIR moves the sweep's lock where it moves wake-lab's" \
-      || ko "WAKE_LAB_LOCK_DIR does not move the sweep's lock where it moves wake-lab's (rc=$rc): \
-[$(created "$odir")] against '$mine'. $out"
-  fi
-  # The fourth fact, added when the lock split in two (ludics-lite#224), and the only one that
-  # fails CLOSED: the sweep must NOT take or honour `<box>.hold.lock`. Adding that is the natural
-  # thing for a future reader to do -- a lock file sitting in a directory the sweep already reads,
-  # named for the box it is about to use -- and it re-creates #224 exactly, as a coverage hole
-  # rather than as a lock bug. The file-set comparison above already refuses a `take_lab_lock` that
-  # takes it; this covers the rest of the file, where "honour" could also be written. The sweep may
-  # only NAME the hold lock in a comment, to say it must not take it, so require that it still says
-  # so and that it says it nowhere else. Judging a mention by "its line is a comment" can only ever
-  # be wrong in the loud direction: a lock-taking line that begins with `#` does not run.
-  hold_code=$(grep 'hold[._]lock' "$SWEEP" | grep -v '^[[:space:]]*#')
-  hold_n=$(grep -c 'hold[._]lock' "$SWEEP")
-  if [ -n "$hold_code" ]; then
-    ko "origin/master's sweep names the hold lock outside a comment -- if it takes or honours it, \
-a held box can no longer sweep itself and its lanes skip (ludics-lite#224): $hold_code"
-  elif [ "$hold_n" -eq 0 ]; then
-    ko "origin/master's sweep no longer states anywhere that it must not take the hold lock: the \
-one warning against re-creating ludics-lite#224 has gone, and this case now guards nothing"
-  else
-    ok "the sweep names the hold lock only in comments ($hold_n), never in a lock-taking position"
+
+    # Both live cases below reserve rog under $LOCKS, so wait out any descriptor a case above left
+    # orphaned rather than racing it: a lock this suite still holds would make either one lie.
+    sweep_deadline=$((SECONDS + 20))
+    while ! lock_free rog && [ "$SECONDS" -lt "$sweep_deadline" ]; do sleep 1; done
+
+    # The negative fact, added when the lock split in two (ludics-lite#224), checked as BEHAVIOUR.
+    # The sweep must not honour `<box>.hold.lock`: the cross-machine routine holds both GPU boxes
+    # with `--hold` and then sweeps them, so a sweep that waited for the hold lock would wait out
+    # its own caller. That is #224, and it presented as three backends with zero coverage rather
+    # than as a lock bug. Hold the hold lock exactly as a holder does -- a descriptor kept open,
+    # the flock taken by a perl that exits -- and require the sweep to take its lane lock anyway.
+    # Behaviour rather than a text scan, because honouring it need not mention it: a wildcard over
+    # `$box.*.lock`, or a suffix assembled at run time, would pass any scan for the literal.
+    : > "$LOCKS/rog.lock"
+    if ( exec 7>>"$LOCKS/rog.hold.lock"
+         perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7 \
+           && sweep_lock "$LOCKS" "$TMP/sweep-home-rog" rog-nv-wsl ) >/dev/null 2>&1; then
+      ok "the sweep still takes its lane lock while the box's HOLD lock is held, as #224 requires"
+    else
+      ko "the sweep did not take rog's lane lock while rog.hold.lock was held: it is honouring the \
+hold lock, so a box the routine holds can no longer sweep itself and its lanes skip (ludics-lite#224)"
+    fi
+
+    # ...and the whole interlock, end to end, each side running its own real code. The sweep's own
+    # take_lab_lock holds the box in a live process; this script's own destroyer must then be
+    # refused. A lock FILE at an agreed path proves nothing on its own -- what wake-lab is refused
+    # by is a live flock -- so this is the case that makes the path comparisons above mean
+    # something, and the one that would go red if either side stopped locking for real.
+    rm -f "$TMP/sweep-ready"; : > "$TMP/sweep-keep"
+    sweep_lock "$LOCKS" "$TMP/sweep-home-rog" rog-nv-wsl "$TMP/sweep-ready" "$TMP/sweep-keep" \
+      >/dev/null 2>&1 &
+    sweep_holder=$!
+    sweep_deadline=$((SECONDS + 30))
+    while [ ! -e "$TMP/sweep-ready" ] && [ "$SECONDS" -lt "$sweep_deadline" ]; do sleep 1; done
+    if [ ! -e "$TMP/sweep-ready" ]; then
+      ko "the sweep's take_lab_lock did not take rog's lane lock under $LOCKS within 30s, so the \
+interlock could not be exercised end to end"
+    elif ! file_free "$LOCKS/rog.hold.lock"; then
+      ko "rog's HOLD lock is held as well, so a refusal below would not be attributable to the \
+sweep's LANE lock -- the case would pass without proving anything"
+    else
+      : > "$SSH_LOG"
+      out=$(wl_locked restart-wsl rog); rc=$?
+      [ "$rc" -ne 0 ] && grep -q 'REFUSED on: rog' <<<"$out" \
+        && ! grep -q '^rog-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+        && ok "a restart is refused while the SWEEP'S OWN take_lab_lock holds the box (rc=$rc)" \
+        || ko "the sweep held rog's lane lock and this script destroyed the VM anyway (rc=$rc) -- \
+the interlock the two repositories exist to keep is not working: $out $(cat "$SSH_LOG")"
+      grep -q 'ocannl sweep' <<<"$out" \
+        && ok "...and the refusal names the sweep, so the operator knows what to wait for" \
+        || ko "the refusal does not name the sweep as the holder -- $out"
+    fi
+    rm -f "$TMP/sweep-keep"; wait "$sweep_holder" 2>/dev/null
   fi
 fi
 

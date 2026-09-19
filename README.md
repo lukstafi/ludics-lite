@@ -197,7 +197,10 @@ no longer sweep itself). `test-wake-lab.sh` compares all four against the sweep'
 reads the revision the sweep routine actually runs — `origin/master` of
 `${OCANNL_STAGING:-$HOME/ocannl-staging}`, since that checkout is often on a WIP branch — and it
 runs the sweep's own `take_lab_lock` under a HOME of its own rather than rebuilding the path,
-so the comparison is against the lock file that really appears. The checkout is read strictly
+so the comparison is against the lock file that really appears. It then holds each side's real
+lock and checks the other side's real behaviour, since a lock file without a live `flock` stops
+nothing: a restart is refused while the sweep's own `take_lab_lock` holds the box, and the sweep
+still takes its lane lock while that box's hold lock is held. The checkout is read strictly
 read-only. Where it is absent, as in CI, the case prints a named `SKIP:` line that the summary
 counts, so a green run says what it did not check. The staging side has no matching check.
 
