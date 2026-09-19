@@ -3985,13 +3985,16 @@ refuse_merge_queue() {
 # One offending unit per line on stdout: "<class><TAB><count><TAB><refs><TAB><the sentence>", where
 # <class> is `sentence` (a closing keyword binding two or more references) or `quoted` (a keyword
 # inside a `>` quote or a fenced block, where even ONE reference is one nobody meant to close).
+# The OWNER of a cross-repository reference must lead with an alphanumeric, as GitHub logins do,
+# but the repository NAME need not: `github/.github` is a real repository, and requiring one there
+# made a body naming two of them produce no warning at all (review round 2).
 # The keyword boundaries exclude `-` on both sides on purpose: this repo's own vocabulary is full of
 # `close-out`, `closed-loop` and `fixed-point`, and a body saying "a close-out merge of #3 and #4"
 # is not closing anything.
 MULTI_CLOSE_FILTER='
 function refs_of(unit,   rest, r, out, n) {
   rest = unit; out = ""; n = 0
-  while (match(rest, /(^|[^a-zA-Z0-9_])([a-zA-Z0-9][-a-zA-Z0-9._]*\/[a-zA-Z0-9][-a-zA-Z0-9._]*)?#[0-9]+/)) {
+  while (match(rest, /(^|[^a-zA-Z0-9_])([a-zA-Z0-9][-a-zA-Z0-9._]*\/[-a-zA-Z0-9._]+)?#[0-9]+/)) {
     r = substr(rest, RSTART, RLENGTH)
     rest = substr(rest, RSTART + RLENGTH)
     sub(/^[^a-zA-Z0-9#]/, "", r)
@@ -4039,13 +4042,16 @@ function protect_abbrev(s,   out) {
   # unconditional toggle reads that inner fence as the close -- after which the closing keyword
   # inside the example is read as ordinary prose and the scan says nothing (review round 1). The run
   # is counted rather than matched, because an interval expression is not portable across the
-  # awks this fleet runs.
+  # awks this fleet runs. A CLOSING fence also carries no info string -- only spaces or tabs may
+  # follow its run -- so a content line that merely STARTS with the delimiter does not end the
+  # block (review round 2); an opening fence may carry one, which is what ````markdown is.
   if (substr(trimmed, 1, 3) == "```" || substr(trimmed, 1, 3) == "~~~") {
     fch = substr(trimmed, 1, 1)
     flen = 0
     while (substr(trimmed, flen + 1, 1) == fch) flen++
+    frest = substr(trimmed, flen + 1)
     if (fence == 0) { fence = 1; fence_ch = fch; fence_len = flen }
-    else if (fch == fence_ch && flen >= fence_len) { fence = 0 }
+    else if (fch == fence_ch && flen >= fence_len && frest ~ /^[ \t]*$/) { fence = 0 }
     quoted = 1
   }
   if (fence) quoted = 1

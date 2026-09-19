@@ -414,6 +414,40 @@ test_an_unchanged_body_is_not_reported_twice() {
   assert_contains "$MERGE_STDOUT" "WARNING WITHDRAWN" "a fixed body retracts the earlier finding"
 }
 
+# Review round 2, P2. A repository NAME may lead with punctuation -- `github/.github` is real --
+# while an owner, like a GitHub login, may not. Requiring an alphanumeric on both sides made a body
+# naming two such references produce no warning at all.
+test_a_repository_name_may_lead_with_punctuation() {
+  reset
+  PR_BODY='Closes github/.github#424 and github/.github#425
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: github/.github#424 github/.github#425" \
+    "a dot-leading repository name is still a reference"
+}
+
+# Review round 2, P2. A CLOSING fence carries no info string: only spaces or tabs may follow its
+# run. A content line that merely starts with the delimiter was ending the block, after which the
+# rest of the example read as ordinary prose.
+test_a_closing_fence_takes_no_info_string() {
+  reset
+  PR_BODY='An example of what not to write:
+
+````markdown
+````not-a-close
+Closes #426
+````
+
+Closes #427
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "QUOTED or FENCED line, which closes just the same -- 1: #426" \
+    "a delimiter with a suffix does not close the block"
+  assert_not_contains "$MERGE_STDOUT" "427" "the line after the real close is outside the block"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -432,6 +466,8 @@ tests=(
   test_the_reopen_remedy_does_not_hardcode_this_repo
   test_the_body_is_scanned_again_before_the_merge
   test_an_unchanged_body_is_not_reported_twice
+  test_a_repository_name_may_lead_with_punctuation
+  test_a_closing_fence_takes_no_info_string
 )
 
 run_tests "${tests[@]}"
