@@ -2818,16 +2818,18 @@ test_commit_message_archive() {
 # so the fixture always reports its own stall before the runner kills the case group and reports a
 # generic timeout instead.
 handshake_deadline() {
-  local budget="${CASE_TIMEOUT:-300}" deadline now
+  local budget="${CASE_TIMEOUT:-300}"
   case "$budget" in
   '' | 0 | *[!0-9]*) budget=300 ;;
   esac
-  now=$(date +%s)
   # Reserve a few seconds of the case's deadline so the stall REPORT still runs before the
-  # runner's kill, and never sit tighter than the 5 s this replaced.
-  deadline=$(($1 + budget - 5))
-  [ "$deadline" -ge $((now + 5)) ] || deadline=$((now + 5))
-  printf '%s\n' "$deadline"
+  # runner's kill. Deliberately unfloored: a deadline already in the past makes the waits give up
+  # at once, which is right. Flooring it at `now + 5` would push it PAST the runner's own deadline
+  # whenever the case has less than that left -- `SHIP_PR_TEST_CASE_TIMEOUT=2` is a supported
+  # value, and the suite's own deadline self-test uses it -- and the runner's generic timeout
+  # would then replace this fixture's diagnosis again. Honouring a short deadline beats honouring
+  # the 5 s this replaced.
+  printf '%s\n' "$(($1 + budget - 5))"
 }
 
 test_concurrent_commit_message_archive() {
@@ -2856,8 +2858,12 @@ test_concurrent_commit_message_archive() {
     sleep 0.1
   done
   if [ ! -e "$ready" ]; then
+    # Report without joining, for the reason the stall branch below gives: a commit that never
+    # reached its pre-commit hook is not unblocked by the release marker, so waiting on it would
+    # block until the runner killed the case and printed its generic timeout over this message.
+    # Touch the marker anyway -- it costs nothing and frees the hook if it starts late -- and
+    # leave the outstanding commit to the runner's process-group cleanup.
     touch "$release"
-    wait "$commit_pid" >/dev/null 2>&1 || true
     fail "concurrent commit did not pause in its pre-commit hook within $(($(date +%s) - case_started))s"
   fi
 
