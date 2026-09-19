@@ -680,6 +680,43 @@ test_a_base_side_workflow_edit_keeps_the_head_waiting() {
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and nothing is settled on the stale copy"
 }
 
+# --- review round 6 ---------------------------------------------------------------------------
+# The name in the repository's workflow list has no ref: it describes the DEFAULT branch's copy,
+# while what runs for this PR is the copy at the head and the base. A workflow the list calls
+# advisory is therefore not evidence that the file running here is, so every listed workflow is
+# explained now — and one whose own filter cannot explain it costs the grace.
+test_a_workflow_the_list_calls_advisory_is_still_explained() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  WORKFLOWS_JSON=$(jq -cn '{workflows:[{id:1,name:"ci",state:"active"},
+                                       {id:2,name:"claude",state:"active"}]}')
+  # Both ids answer with the same path and the same filtered body here, so the advisory-named one
+  # is explained on its own terms and the settle stands.
+  run_gate
+  assert_eq "$GATE_RC" 0 "an advisory-named workflow whose filter explains it settles like any other"
+  # The same list, with the file at that path unable to explain itself: no name skips it now.
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$UNFILTERED_YAML"
+  WORKFLOWS_JSON=$(jq -cn '{workflows:[{id:2,name:"claude",state:"active"}]}')
+  run_gate
+  assert_eq "$GATE_RC" 4 "a name from the default branch does not excuse the file that runs here"
+  assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers instead"
+}
+
+# The Contents API caps a directory response and offers no pagination past it, so a directory at
+# the cap is one this cannot read — and a workflow beyond it would be in neither inventory.
+test_a_capped_workflow_directory_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  WORKFLOW_DIR_HEAD=$(jq -cn '[range(1000) | ".github/workflows/w\(.).yml"]')
+  run_gate
+  assert_eq "$GATE_RC" 4 "a directory response at the endpoint cap is not an inventory"
+  assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers instead"
+}
+
 # --- review round 5: the list is not the file set, and the range is read once ------------------
 # The repository's workflow list is built from the default branch plus whatever has run, so it is
 # not an inventory of the files the merge context will hold. A workflow only the BASE carries —
@@ -1296,6 +1333,8 @@ tests=(
   test_a_workflow_only_on_the_base_keeps_the_head_waiting
   test_a_workflow_only_on_the_head_keeps_the_head_waiting
   test_the_range_is_read_once_for_every_workflow
+  test_a_workflow_the_list_calls_advisory_is_still_explained
+  test_a_capped_workflow_directory_keeps_the_head_waiting
   test_a_second_check_provider_keeps_the_head_waiting
   test_an_advisory_provider_does_not_block_the_recognition
   test_a_sample_without_checks_keeps_the_head_waiting

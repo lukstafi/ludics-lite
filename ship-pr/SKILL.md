@@ -714,7 +714,10 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   the merge context's copy; any path under `.github/workflows/` anywhere in the range refuses; and
   every workflow file at *either* end of the merge must be one the repository's list carries,
   because that list is built from the default branch plus whatever has run and so is not an
-  inventory of the files a `pull_request` run will see. The recognition is admitted at all only where the
+  inventory of the files a `pull_request` run will see (a directory response at the Contents API's
+  cap is not one either, and refuses). Every listed workflow is explained, the advisory ones
+  included: the list's names have no ref, so they describe the default branch's copies rather than
+  the ones that run here. The recognition is admitted at all only where the
   newest merged PR's head shows non-advisory check runs from Actions alone: it reads workflows, so
   it cannot speak for a third-party provider. That last one is a filter and not an inventory — no
   endpoint enumerates a repository's providers — so the residual is a provider absent from that

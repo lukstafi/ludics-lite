@@ -4473,12 +4473,20 @@ workflow_body() {
 # base branch, or only on its head, is simply absent from it — and the loop below would then pass
 # every workflow it knows about while the one it does not know about creates the run (review
 # rounds 3 and 5). Read at both ends of the merge, since a `pull_request` run sees the union.
+# How many entries the Contents API serves for a directory before it truncates. It offers no
+# pagination past this, so a directory at the cap is a directory this cannot read, and the answer
+# is a refusal rather than a shorter inventory (review round 6) — the same shape commit_files uses
+# for its own 300-file cap.
+CONTENTS_DIR_CAP=1000
+
 workflow_files_at() {
-  local raw
+  local raw count
   raw=$(gh_retry read api "repos/$REPO/contents/.github/workflows?ref=$1" \
     --jq 'if type == "array" then (.[] | select(.type == "file") | .path) else empty end') ||
     return 1
   [ -n "$raw" ] || return 1
+  count=$(printf '%s\n' "$raw" | grep -c .)
+  [ "$count" -lt "$CONTENTS_DIR_CAP" ] || return 1
   printf '%s\n' "$raw" | grep -E '\.ya?ml$'
 }
 
@@ -4887,14 +4895,23 @@ head_within_paths_ignore() {
   # absent from the base.
   declared=$(workflow_files_at "$head") || return 1
   bdeclared=$(workflow_files_at "$base") || return 1
+  # EVERY listed workflow is explained, the advisory ones included. The shortcut that skipped them
+  # was mine and it rested on the wrong reading of the wrong file: the name in this list has no
+  # ref, so it describes the DEFAULT branch's copy, while what runs for this PR is the copy at the
+  # head and the base. A file whose default-branch copy is named `github pages docs` and whose
+  # target-context copy is an ordinary `ci` would have been skipped while its run was being
+  # created (review round 6). Reading the name out of the body instead would mean one more YAML
+  # reader and one more thing to get wrong, for a saving of a few reads — so the shortcut is gone
+  # instead. What it costs is a repository carrying an advisory workflow whose own filter cannot
+  # explain it: that head now waits the grace out, which is the safe direction and where it was
+  # before any of this. `wname` survives only to name the workflows in the settle line.
   while IFS=$'\t' read -r wid wname wstate; do
     [ -n "$wid" ] || continue
-    # The path is read for EVERY listed workflow, advisory and disabled included, because what it
-    # is collected for is the completeness check below: a file the list does not carry is the
-    # danger, and an advisory workflow's file is carried just as much as any other's.
+    # The path is read for EVERY listed workflow, disabled ones included, because what it is
+    # collected for is the completeness check below: what matters there is only whether the list
+    # carries the file at all.
     wpath=$(workflow_path "$wid") || return 1
     listed="${listed}${wpath}"$'\n'
-    is_advisory "$wname" && continue
     # Only an `active` workflow creates runs: one disabled, or listed after its file was deleted,
     # has no filter to read at this head and no run to wait for either.
     [ "$wstate" = active ] || continue

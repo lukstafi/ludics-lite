@@ -562,7 +562,10 @@ commit as its head (`merge_group` and `workflow_call`, and nothing else). The ca
 refusals as much as the recognition — a trigger with no filter, a source path in the range, a path
 under `.github/workflows/` anywhere in it (a filter that moved mid-range), a workflow file at
 either end of the merge that the repository's list does not carry (that list is built from the
-default branch plus whatever has run, so it is no inventory of the merge context's files), an unparseable workflow, an unreadable or truncated workflow list,
+default branch plus whatever has run, so it is no inventory of the merge context's files), a
+workflow-directory response at the Contents API's cap, a listed workflow the advisory NAME would
+once have skipped (those names have no ref, so they describe the default branch's copy and not the
+one that runs here), an unparseable workflow, an unreadable or truncated workflow list,
 a PR whose base SHA or branch did not come back, a push trigger the branch reaches (whose filter
 cannot describe a force-push's own diff), a `branches-ignore`, an event outside the inert list
 (`pull_request_target`, the review events, `schedule` and `workflow_dispatch` among them), a base-side edit to the workflow (a
