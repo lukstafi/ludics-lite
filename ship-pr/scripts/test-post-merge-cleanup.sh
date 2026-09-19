@@ -364,6 +364,62 @@ test_invalid_path_refusal() {
   echo "PASS: invalid checkout path refusal"
 }
 
+test_git_windows_drive_path_is_absolute() {
+  local drive_path fake_bin real_git refusal
+  # ludics-lite#147. Under Git Bash, Git reports a path it read from a `.git` file's gitdir line --
+  # `--git-common-dir` here, and the whole `--git-path` family the helper calls nineteen times --
+  # in NATIVE Windows form (`C:/Users/...`), even though its own other outputs on that platform
+  # are `/c/...`. The helper recognized only a leading slash as absolute, so it joined the drive
+  # path to the checkout it came from and refused a clean, merged session with a path that cannot
+  # exist anywhere:
+  #   directory does not exist: /c/.../ocannl-staging-worktrees/wave0913-974/C:/Users/.../.git
+  # A drive-rooted path does not resolve on this platform either, so what this case pins is the
+  # CLASSIFICATION rather than the outcome: the refusal must name the drive path as it stands and
+  # never the concatenation. The native Git Bash leg is recorded in the pull request.
+  setup_case windows-drive-common-dir merge main-off
+  drive_path='C:/Users/ship-pr/GitHub/repo/.git'
+  fake_bin="$TEST_ROOT/windows-drive-common-dir-bin"
+  real_git=$(command -v git)
+  mkdir -p "$fake_bin"
+  # Only the SESSION's own `--git-common-dir` is answered the Windows way; every other call, the
+  # main checkout's included, goes to the real Git. `$1`/`$2` are the helper's own `-C <path>`.
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$#" -eq 4 ] && [ "$1" = -C ] && [ "$2" = "$WINDOWS_SESSION" ] &&' \
+    '  [ "$3" = rev-parse ] && [ "$4" = --git-common-dir ]; then' \
+    '  printf "%s\n" "$WINDOWS_COMMON_DIR"' \
+    '  exit 0' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+
+  if refusal=$(PATH="$fake_bin:$PATH" REAL_GIT="$real_git" WINDOWS_SESSION="$CASE_SESSION" \
+    WINDOWS_COMMON_DIR="$drive_path" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "a session whose common directory cannot be resolved was accepted for cleanup"
+  fi
+  case "$refusal" in
+  *"$CASE_SESSION/$drive_path"*)
+    fail "the drive-rooted path was joined to the session checkout: $refusal"
+    ;;
+  esac
+  case "$refusal" in
+  *"$drive_path"*) ;;
+  *) fail "the refusal did not name the drive-rooted path: $refusal" ;;
+  esac
+  assert_topic_preserved
+
+  # The other side of the classification: a genuinely relative path -- what Git reports for a
+  # primary checkout -- is still joined to the checkout it was read from.
+  setup_case windows-drive-relative-common-dir merge main-off
+  case "$(git -C "$CASE_MAIN" rev-parse --git-common-dir)" in
+  /* | ?:/*) fail "the fixture must reproduce a relative common directory" ;;
+  esac
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  echo "PASS: a Git for Windows drive-rooted path is not joined to the checkout"
+}
+
 test_git_local_environment_is_cleared() {
   local foreign_index
   setup_case git-local-environment merge main-off
@@ -866,6 +922,140 @@ test_session_ignored_directory_unreadable_subtree_refusal() {
   echo "PASS: an ignored directory with an unreadable subtree keeps its refusal"
 }
 
+# ludics-lite#205 §2. A build tree slips between both session-gate exemptions by construction: it
+# is not harness-owned `.claude/`, and it is dune (or npm, or opam) output, so being different
+# from the base checkout's copy is the whole point of it. That refused every ocannl-staging
+# worktree that had ever been built -- 92M on the sighting recorded in ludics-lite#215 -- and
+# archiving it would be worse than refusing, since the archive is exactly the "out of sight" the
+# gate guards against and one would accumulate per landed PR. `--regenerable` lets the operator
+# name such a directory as one the helper may REMOVE rather than archive. These two cases fail
+# against the pre-flag helper, which refused the flag itself.
+test_regenerable_directory_clears_the_session_gate() {
+  local refusal
+  setup_case regenerable-ignored-session merge main-off
+  echo '_build/' >>"$CASE_MAIN/.git/info/exclude"
+  mkdir -p "$CASE_SESSION/_build/default"
+  echo 'dune output' >"$CASE_SESSION/_build/default/value.exe"
+  # Shown first without the flag: the gate refuses and names the path.
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "a session holding a build tree was accepted for destructive cleanup"
+  fi
+  case "$refusal" in
+  *_build*) ;;
+  *) fail "the refusal did not name the build tree: $refusal" ;;
+  esac
+  [ -d "$CASE_SESSION/_build" ] || fail "the build tree must survive a refused cleanup"
+  assert_topic_preserved
+
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable _build >/dev/null
+  assert_cleaned
+  [ ! -e "$CASE_ARCHIVE/worktree/_build" ] ||
+    fail "a regenerable directory must be removed, not archived out of sight"
+
+  # Untracked rather than ignored -- a repository that never excluded its build tree. The removal
+  # happens before either gate reads the worktree, so this is the dirty-session refusal, not the
+  # ignored-data one, and the same flag clears it.
+  setup_case regenerable-untracked-session merge main-off
+  mkdir -p "$CASE_SESSION/_build"
+  echo 'dune output' >"$CASE_SESSION/_build/value.exe"
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "a session holding an untracked build tree was accepted for destructive cleanup"
+  fi
+  assert_topic_preserved
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable _build >/dev/null
+  assert_cleaned
+
+  # A name the worktree does not carry is a no-op: a worktree that never built has no `_build`,
+  # and the operator's command line does not change between one cleanup and the next.
+  setup_case regenerable-absent-session merge main-off
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable _build --regenerable node_modules \
+    >/dev/null
+  assert_cleaned
+  echo "PASS: --regenerable removes a named build tree instead of refusing over it"
+}
+
+test_regenerable_refusals() {
+  local candidate refusal rc
+  # The flag names ONE top-level directory of the session worktree, so a value carrying a slash
+  # is refused rather than resolved: that is what keeps `..`, an absolute path and a nested path
+  # out without a traversal check.
+  setup_case regenerable-nested-name merge main-off
+  mkdir -p "$CASE_SESSION/nested/inside"
+  echo irreplaceable >"$CASE_SESSION/nested/inside/data"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable nested/inside 2>&1); then
+    fail "a nested regenerable name was accepted"
+  fi
+  case "$refusal" in
+  *'nested/inside'*) ;;
+  *) fail "the refusal did not name the rejected value: $refusal" ;;
+  esac
+  [ -d "$CASE_SESSION/nested/inside" ] || fail "a refused name must remove nothing"
+  assert_topic_preserved
+  for candidate in .. . /etc "$CASE_SESSION/_build"; do
+    if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable "$candidate" >/dev/null 2>&1; then
+      fail "a regenerable name outside the worktree root was accepted: $candidate"
+    fi
+  done
+  assert_topic_preserved
+  rc=0
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable >/dev/null 2>&1 || rc=$?
+  assert_eq "$rc" 2 "a --regenerable without a value must be a usage error"
+  rc=0
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable '' >/dev/null 2>&1 || rc=$?
+  assert_eq "$rc" 2 "an empty --regenerable value must be a usage error"
+
+  # A symbolic link names a target rather than holding content, and `rm -rf` through one would
+  # remove a tree the worktree does not hold. It is refused at the leaf, with its target intact.
+  setup_case regenerable-symlink merge main-off
+  mkdir -p "$CASE_ROOT/elsewhere"
+  echo irreplaceable >"$CASE_ROOT/elsewhere/data"
+  ln -s "$CASE_ROOT/elsewhere" "$CASE_SESSION/_build"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable _build 2>&1); then
+    fail "a symbolic regenerable directory was accepted"
+  fi
+  case "$refusal" in
+  *_build*) ;;
+  *) fail "the symlink refusal did not name the path: $refusal" ;;
+  esac
+  assert_eq "$(sed -n '1p' "$CASE_ROOT/elsewhere/data")" irreplaceable \
+    "the symlink's target must survive"
+  [ -L "$CASE_SESSION/_build" ] || fail "the symlink itself must survive"
+  assert_topic_preserved
+
+  # A regular file of that name is not the build tree either.
+  setup_case regenerable-regular-file merge main-off
+  echo irreplaceable >"$CASE_SESSION/_build"
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable _build >/dev/null 2>&1; then
+    fail "a regular file was accepted as a regenerable directory"
+  fi
+  assert_eq "$(sed -n '1p' "$CASE_SESSION/_build")" irreplaceable \
+    "a refused regular file must survive"
+  assert_topic_preserved
+
+  # And a TRACKED directory is repository content: `--regenerable src` must never be the operator
+  # deleting their own source tree, whatever they typed.
+  setup_case regenerable-tracked merge main-off
+  mkdir -p "$CASE_SESSION/src"
+  echo 'let () = ()' >"$CASE_SESSION/src/main.ml"
+  git -C "$CASE_SESSION" add src/main.ml
+  git -C "$CASE_SESSION" commit -m "tracked source directory" >/dev/null
+  git -C "$CASE_SESSION" push origin topic >/dev/null
+  git -C "$CASE_INTEGRATOR" fetch origin >/dev/null 2>&1
+  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge tracked source" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --regenerable src 2>&1); then
+    fail "a tracked directory was accepted as regenerable"
+  fi
+  case "$refusal" in
+  *src*) ;;
+  *) fail "the tracked refusal did not name the path: $refusal" ;;
+  esac
+  assert_eq "$(sed -n '1p' "$CASE_SESSION/src/main.ml")" 'let () = ()' \
+    "a tracked directory must survive"
+  assert_topic_preserved
+  echo "PASS: a regenerable name that is not an untracked top-level directory is refused"
+}
+
 test_master_reservation() {
   local fake_bin real_git candidate remote_master checkout_status
   setup_case master-owner-switch merge other
@@ -1008,6 +1198,110 @@ test_preexisting_ignored_master_data() {
   assert_eq "$(sed -n '1p' "$CASE_MASTER_OWNER/unrelated.log")" local-data \
     "ignored master data on untouched paths must survive the fast-forward"
   echo "PASS: ignored master data on untouched paths passes cleanup intact"
+}
+
+# ludics-lite#215. The base-owner gate reads UNTRACKED files -- ignored data deliberately passes
+# it, as the case above records. The agent harness writes `.claude/` into every checkout it opens,
+# so in a repository whose ignore rules do not carry that name the primary checkout, which is
+# where the desktop harness most often sits and which owns the base on the standard layout,
+# refused cleanup unconditionally. The session gate's allow-list applies here too: harness-owned
+# `.claude/`, a real directory, no symbolic link at any component. #240's `git ls-files` fix for
+# the fleet-worker layout guard does NOT transfer -- this gate judges a checkout's contents, and
+# reading the index would defeat it rather than fix it. These two fail against the pre-fix gate.
+test_master_owner_harness_untracked_data_passes() {
+  setup_case harness-untracked-master merge main
+  mkdir -p "$CASE_MAIN/.claude"
+  echo '{"sessionId":"other-session","pid":1}' >"$CASE_MAIN/.claude/scheduled_tasks.lock"
+  assert_eq "$(git -C "$CASE_MAIN" status --porcelain --untracked-files=normal)" '?? .claude/' \
+    "the fixture must reproduce an untracked, unignored harness directory"
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(sed -n '1p' "$CASE_MAIN/.claude/scheduled_tasks.lock")" \
+    '{"sessionId":"other-session","pid":1}' \
+    "the base owner's harness directory must be left exactly as it was"
+
+  # And as individual entries, which is what Git reports once the repository tracks anything under
+  # `.claude/`. Here the incoming base does: the entry is collapsed at the preflight gate and
+  # spelled out at the recheck after the locked refresh, so this leg covers both readings and the
+  # post-refresh site, where a refusal would abandon a fast-forward that had already landed.
+  setup_case harness-untracked-master-files merge main
+  mkdir -p "$CASE_SESSION/.claude"
+  echo 'tracked by the repository' >"$CASE_SESSION/.claude/tracked"
+  git -C "$CASE_SESSION" add .claude/tracked
+  git -C "$CASE_SESSION" commit -m "repository content under .claude" >/dev/null
+  git -C "$CASE_SESSION" push origin topic >/dev/null
+  git -C "$CASE_INTEGRATOR" fetch origin >/dev/null 2>&1
+  git -C "$CASE_INTEGRATOR" merge --no-ff origin/topic -m "merge .claude content" >/dev/null
+  git -C "$CASE_INTEGRATOR" push origin master >/dev/null
+  CASE_TOPIC_OID=$(git -C "$CASE_SESSION" rev-parse HEAD)
+  mkdir -p "$CASE_MAIN/.claude"
+  echo lock >"$CASE_MAIN/.claude/scheduled_tasks.lock"
+  assert_eq "$(git -C "$CASE_MAIN" status --porcelain --untracked-files=normal)" '?? .claude/' \
+    "the fixture must start from the collapsed entry"
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  assert_eq "$(git -C "$CASE_MAIN" status --porcelain --untracked-files=normal)" \
+    '?? .claude/scheduled_tasks.lock' \
+    "the refreshed base owner must spell the harness entry out"
+  assert_eq "$(sed -n '1p' "$CASE_MAIN/.claude/scheduled_tasks.lock")" lock \
+    "the base owner's harness file must be left exactly as it was"
+  echo "PASS: harness-owned untracked .claude data passes the base-owner gate"
+}
+
+test_master_owner_untracked_data_refusal() {
+  local refusal
+  # Everything the allow-list does not clear keeps its refusal, and the refusal names the paths it
+  # tripped on rather than only the checkout, since the operator's decision for `.claude/` is
+  # nothing like the one for a forgotten edit.
+  setup_case untracked-master merge main
+  echo irreplaceable >"$CASE_MAIN/notes.txt"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "an untracked file in the base owner was accepted for cleanup"
+  fi
+  case "$refusal" in
+  *notes.txt*) ;;
+  *) fail "the refusal did not name the untracked path: $refusal" ;;
+  esac
+  assert_eq "$(sed -n '1p' "$CASE_MAIN/notes.txt")" irreplaceable \
+    "untracked base-owner data must survive refused cleanup"
+  assert_topic_preserved
+
+  # A tracked change is not untracked data and keeps the refusal it always had.
+  setup_case dirty-master merge main
+  echo edited >"$CASE_MAIN/value"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "a tracked edit in the base owner was accepted for cleanup"
+  fi
+  case "$refusal" in
+  *value*) ;;
+  *) fail "the refusal did not name the edited path: $refusal" ;;
+  esac
+  assert_topic_preserved
+
+  # `.claude` as a regular file is not the harness directory, and Git reports it as `?? .claude`.
+  setup_case bare-claude-file-master merge main
+  echo irreplaceable >"$CASE_MAIN/.claude"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "an untracked regular file named .claude was accepted for cleanup"
+  fi
+  case "$refusal" in
+  *.claude*) ;;
+  *) fail "the refusal did not name the bare .claude path: $refusal" ;;
+  esac
+  assert_eq "$(cat "$CASE_MAIN/.claude")" irreplaceable \
+    "a bare .claude file must survive refused cleanup"
+  assert_topic_preserved
+
+  # And as a symbolic link, whose target the gate would otherwise be judging instead.
+  setup_case bare-claude-symlink-master merge main
+  mkdir -p "$CASE_ROOT/elsewhere"
+  ln -s "$CASE_ROOT/elsewhere" "$CASE_MAIN/.claude"
+  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
+    fail "an untracked symlink named .claude was accepted for cleanup"
+  fi
+  [ -L "$CASE_MAIN/.claude" ] || fail "the symlink must survive refused cleanup"
+  assert_topic_preserved
+  echo "PASS: base-owner data the allow-list does not clear is refused and named"
 }
 
 test_master_owner_switch_refusal() {
@@ -4250,6 +4544,7 @@ TESTS=(
   test_newer_remote_tip_refusal
   test_ls_remote_failure_refusal
   test_invalid_path_refusal
+  test_git_windows_drive_path_is_absolute
   test_git_local_environment_is_cleared
   test_non_files_ref_backend_refusal
   test_replacement_refs_disabled
@@ -4273,12 +4568,16 @@ TESTS=(
   test_session_ignored_quoted_path_passes
   test_session_ignored_directory_of_base_copies
   test_session_ignored_directory_unreadable_subtree_refusal
+  test_regenerable_directory_clears_the_session_gate
+  test_regenerable_refusals
   test_session_ignored_path_control_characters_are_escaped
   test_master_reservation
   test_unowned_master_reservation
   test_concurrent_master_edit_refusal
   test_concurrent_ignored_master_collision
   test_preexisting_ignored_master_data
+  test_master_owner_harness_untracked_data_passes
+  test_master_owner_untracked_data_refusal
   test_master_owner_switch_refusal
   test_master_initial_detach_compare_and_swap
   test_master_update_failure_reattaches_owner
