@@ -3,6 +3,12 @@
 
 set -euo pipefail
 
+# One brace group, so bash parses this file WHOLE before its first line runs and an edit landing
+# while a run is in flight cannot resume the shell at a shifted offset; the `exit` at the foot
+# means the shell never comes back to the file for a next command. Two lines here and two at the
+# foot, with the body's own indentation untouched (ludics-lite#10, #247); scripts/check-parse-guards.sh
+# checks the shape.
+{
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 export SHIP_PR_STALE_BASE=20 # read when pr-review.sh is sourced, so before the preamble
 # shellcheck source=test-pr-review-lib.sh
@@ -431,3 +437,5 @@ tests=(
 )
 
 run_tests "${tests[@]}"
+exit "$?"
+}

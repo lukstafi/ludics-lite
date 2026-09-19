@@ -95,6 +95,13 @@
 # which that control passes, is the only argument this file takes — exactly, with no trailing
 # word, since a marker that could be typed past would skip that control in silence.
 
+# One brace group, so bash parses this file WHOLE before its first line runs and an edit landing
+# while a run is in flight cannot resume the shell at a shifted offset; the `exit` at the foot
+# means the shell never comes back to the file for a next command. Two lines here and two at the
+# foot, with the body's own indentation untouched (ludics-lite#10, #247); scripts/check-parse-guards.sh
+# checks the shape. Sourced by a sibling suite, the `|| return 0` dispatch below ends the source
+# inside the group, before the foot's `exit` is reached, so the caller survives.
+{
 TEST_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 TEST_LIB_FILE="$TEST_LIB_DIR/$(basename "${BASH_SOURCE[0]}")"
 HELPER="$TEST_LIB_DIR/pr-review.sh"
@@ -1631,3 +1638,5 @@ tests=(
 )
 
 run_tests "${tests[@]}"
+exit "$?"
+}
