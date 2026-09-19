@@ -21,6 +21,12 @@ set -uo pipefail
 # ownership-race assertion into a flake (the gh-ocannl-949 mechanism). Matches read from files or
 # here-strings, which bash backs with a file.
 
+# One brace group, so bash parses this file WHOLE before its first line runs and an edit landing
+# while a run is in flight cannot resume the shell at a shifted offset; the `exit` at the foot
+# means the shell never comes back to the file for a next command. Two lines here and two at the
+# foot, with the body's own indentation untouched (ludics-lite#10, #247); scripts/check-parse-guards.sh
+# checks the shape.
+{
 HERE=$(cd "$(dirname "$0")" && pwd)
 FW="$HERE/fleet-worker.sh"
 
@@ -1154,3 +1160,5 @@ else
   echo "$pass passed, $fail failed"
 fi
 [ "$fail" -eq 0 ]
+exit "$?"
+}

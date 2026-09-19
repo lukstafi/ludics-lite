@@ -10,6 +10,12 @@
 set -uo pipefail
 # Feed captured assertions with here-strings: early-exiting grep must not SIGPIPE a writer.
 
+# One brace group, so bash parses this file WHOLE before its first line runs and an edit landing
+# while a run is in flight cannot resume the shell at a shifted offset; the `exit` at the foot
+# means the shell never comes back to the file for a next command. Two lines here and two at the
+# foot, with the body's own indentation untouched (ludics-lite#10, #247); scripts/check-parse-guards.sh
+# checks the shape.
+{
 HERE=$(cd "$(dirname "$0")" && pwd)
 WL="$HERE/wake-lab.sh"
 EXAMPLE="$HERE/wake-lab-hosts.example.sh"
@@ -1707,3 +1713,5 @@ lab_untouched "the suite as a whole"
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
+exit "$?"
+}

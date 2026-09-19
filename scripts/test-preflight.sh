@@ -16,6 +16,12 @@
 
 set -uo pipefail
 
+# One brace group, so bash parses this file WHOLE before its first line runs and an edit landing
+# while a run is in flight cannot resume the shell at a shifted offset; the `exit` at the foot
+# means the shell never comes back to the file for a next command. Two lines here and two at the
+# foot, with the body's own indentation untouched (ludics-lite#10, #247); scripts/check-parse-guards.sh
+# checks the shape.
+{
 HERE=$(cd "$(dirname "$0")" && pwd -P)
 ROOT=$(cd "$HERE/.." && pwd -P)
 PF="$HERE/preflight.sh"
@@ -53,36 +59,17 @@ expect() {
 }
 
 # tree NAME: sets T to a fresh scratch checkout that passes every assertion, for a case to break
-# one thing in. It carries a file under each of the three globs, the two files the parse guard
-# names, and one PowerShell script. A function rather than a `$(...)` so the heredocs below are
+# one thing in. It carries a file under each of the three globs and one PowerShell script. A function rather than a `$(...)` so the heredocs below are
 # not read inside a command substitution, where a `$(` in a body loses bash's parser.
 T=
 tree() {
   T="$TMP/$1"
-  mkdir -p "$T/scripts" "$T/ship-pr/hooks" "$T/ship-pr/scripts" "$T/askill/scripts"
+  mkdir -p "$T/scripts" "$T/ship-pr/hooks" "$T/askill/scripts"
   printf '#!/usr/bin/env bash\ntrue\n' >"$T/scripts/ok.sh"
   printf '#!/usr/bin/env bash\ntrue\n' >"$T/ship-pr/hooks/hook.sh"
   printf '#!/usr/bin/env bash\ntrue\n' >"$T/askill/scripts/s.sh"
   printf 'Write-Host "ok"\n' >"$T/scripts/repair.ps1"
-  cleanup_script "$T/ship-pr/scripts/post-merge-cleanup.sh"
-  cleanup_script "$T/ship-pr/scripts/test-post-merge-cleanup.sh"
-  chmod +x "$T/scripts/ok.sh" "$T/ship-pr/hooks/hook.sh" "$T/askill/scripts/s.sh" \
-    "$T/ship-pr/scripts/post-merge-cleanup.sh" "$T/ship-pr/scripts/test-post-merge-cleanup.sh"
-}
-
-# The shape the parse guard demands: one brace group opened as the first command after
-# `set -o pipefail` and closed by `exit "$?"` and `}` on the last two lines, at column zero.
-cleanup_script() {
-  cat >"$1" <<'CLEANUP'
-#!/usr/bin/env bash
-set -uo pipefail
-
-# A comment and a blank line may stand between the set and the brace group.
-{
-  true
-exit "$?"
-}
-CLEANUP
+  chmod +x "$T/scripts/ok.sh" "$T/ship-pr/hooks/hook.sh" "$T/askill/scripts/s.sh"
 }
 
 # --- the file list is the scope, and an empty one is a refusal --------------------------------
@@ -184,31 +171,6 @@ if command -v shellcheck >/dev/null 2>&1; then
 else
   ok "SKIP: shellcheck is not installed, so its controls do not run here (CI runs them)"
 fi
-
-# --- the parse guard ------------------------------------------------------------------------
-
-tree pg_clean
-expect "the house brace group passes the parse guard" 0 'parse-guard: PASS' -- "$PF" --root "$T" parse-guard
-tree pg_tail
-printf 'echo "past the brace"\n' >>"$T/ship-pr/scripts/post-merge-cleanup.sh"
-expect "...a command appended past the closing brace fails it" 1 "must end in 'exit" -- "$PF" --root "$T" parse-guard
-tree pg_open
-cat >"$T/ship-pr/scripts/test-post-merge-cleanup.sh" <<'LATE'
-#!/usr/bin/env bash
-set -uo pipefail
-echo "a fork above the brace group"
-{
-  true
-exit "$?"
-}
-LATE
-chmod +x "$T/ship-pr/scripts/test-post-merge-cleanup.sh"
-expect "...and a brace group that is not the first command after the set fails it" \
-  1 'must open its brace group' -- "$PF" --root "$T" parse-guard
-tree pg_missing
-rm "$T/ship-pr/scripts/post-merge-cleanup.sh"
-expect "...and a file the guard names but the checkout does not hold is a failure, not a skip" \
-  1 'is missing: the parse guard names it' -- "$PF" --root "$T" parse-guard
 
 # --- a step whose script is not there ---------------------------------------------------------
 
@@ -318,8 +280,8 @@ fi
 # --- the run: every step runs, and the summary counts them ------------------------------------
 
 tree summary_clean
-expect "a multi-step run reports every step" 0 '3 passed, 0 failed, 0 skipped' \
-  -- "$PF" --root "$T" syntax modes parse-guard
+expect "a multi-step run reports every step" 0 '2 passed, 0 failed, 0 skipped' \
+  -- "$PF" --root "$T" syntax modes
 tree summary_two_bad
 printf '#!/usr/bin/env bash\nif [ ; then\n' >"$T/scripts/broken.sh"
 chmod +x "$T/scripts/broken.sh"
@@ -677,3 +639,5 @@ expect "this checkout's file list holds the script itself" 0 'scripts/preflight.
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
+exit "$?"
+}

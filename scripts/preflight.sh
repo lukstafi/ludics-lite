@@ -16,7 +16,8 @@
 #   - modes            the two-way mode rule: a script is executable, an *.example.sh is not
 #   - shellcheck       shellcheck --severity=error --external-sources over the same list
 #   - powershell       pwsh parses scripts/*.ps1, and refuses to judge zero of them
-#   - parse-guard      the two cleanup scripts still open and close their one brace group
+#   - parse-guard      scripts/check-parse-guards.sh (every suite's brace group, ludics-lite#247)
+#   - parse-fixtures   scripts/test-check-parse-guards.sh
 #   - prompts          scripts/check-prompts.sh (the prompt-hygiene job's check, not lint's:
 #                      a missing register line for a new suite is the other thing a push goes red
 #                      for, and it is free to run here)
@@ -64,17 +65,14 @@ STEPS=(
   'modes:-'
   'shellcheck:-'
   'powershell:-'
-  'parse-guard:-'
+  'parse-guard:scripts/check-parse-guards.sh'
+  'parse-fixtures:scripts/test-check-parse-guards.sh'
   'prompts:scripts/check-prompts.sh'
   'jq-shapes:scripts/check-jq-shapes.sh'
   'jq-fixtures:scripts/test-check-jq-shapes.sh'
   'scratch-dirs:scripts/check-scratch-dirs.sh'
   'scratch-fixtures:scripts/test-check-scratch-dirs.sh'
 )
-
-# The two files the parse guard judges, named rather than globbed: the guard is about these two
-# scripts' one brace group (ludics-lite#10), and a third file would be a decision, not a match.
-PARSE_GUARD_FILES=(ship-pr/scripts/post-merge-cleanup.sh ship-pr/scripts/test-post-merge-cleanup.sh)
 
 usage() { # the leading comment block, which is this script's manual
   awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
@@ -252,31 +250,6 @@ step_powershell() {
   '
 }
 
-# post-merge-cleanup.sh and test-post-merge-cleanup.sh are each one brace group ending in
-# `exit "$?"` and `}` (ludics-lite#10), so a mid-run rewrite cannot resume the shell at a shifted
-# offset. The cost is that a command appended past the closing brace is never read, and that
-# failure is silent; this is the guard on the guard. A file that is not there is refused rather
-# than skipped -- a rename would otherwise take the guard with it in silence.
-step_parse_guard() {
-  local f rc=0
-  for f in "${PARSE_GUARD_FILES[@]}"; do
-    if [ ! -f "$f" ]; then
-      fail_file "$f" "$f is missing: the parse guard names it, so a rename is a change to this script too"
-      rc=1
-      continue
-    fi
-    if [ "$(tail -n 2 "$f")" != "$(printf 'exit "$?"\n}')" ]; then
-      fail_file "$f" "$f must end in 'exit \"\$?\"' and '}' (the parse guard); anything past them is never read"
-      rc=1
-    fi
-    if ! awk '/^set -[a-z]*o pipefail$/ { s = NR; next } s && !/^#/ && !/^$/ { seen = 1; exit ($0 == "{") ? 0 : 1 } END { if (!seen) exit 1 }' "$f"; then
-      fail_file "$f" "$f must open its brace group as the first command after 'set -o pipefail', above the first fork"
-      rc=1
-    fi
-  done
-  return "$rc"
-}
-
 # --- running them ----------------------------------------------------------------------------
 
 # The interpreter each step needs, empty when it needs nothing beyond this shell.
@@ -314,7 +287,6 @@ run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped
     modes) step_modes ;;
     shellcheck) step_shellcheck ;;
     powershell) step_powershell ;;
-    parse-guard) step_parse_guard ;;
     # A `case` that matches nothing exits 0, so an entry added to the table as `name:-` whose arm
     # was never written would print PASS having run nothing -- a claim that cannot fail, and
     # exactly the registration drift this file exists to refuse (round 3). The table is the

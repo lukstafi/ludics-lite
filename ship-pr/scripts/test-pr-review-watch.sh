@@ -20,6 +20,17 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 # shellcheck source=test-pr-review-lib.sh
 source "$SCRIPT_DIR/test-pr-review-lib.sh"
+
+# One brace group over everything below the preamble, so bash parses the rest of this file WHOLE
+# before the first case runs and an edit landing mid-run cannot resume the shell at a shifted
+# offset; the `exit` at the foot means it never comes back to the file for a next command
+# (ludics-lite#10, #247). The `{` opens BELOW the sources, not above them: bash binds a function's
+# `declare -F` location when it PARSES the definition, so inside a group that also holds the
+# sources every definition here is parsed first and the libraries' bindings land last -- and the
+# shadow guard (ludics-lite#46) then reads every suite function as still the library's, refusing a
+# declared stub and accepting an undeclared shadow in silence. scripts/check-parse-guards.sh
+# checks the shape, and says what may stand above the `{`.
+{
 test_tmpdir TEST_ROOT watch-test
 
 # The two clock/outage controls are scoped by each test's locals; ordinary cases
@@ -144,15 +155,24 @@ occurrences() { # <haystack> <needle>
   grep -c -F -- "$2" <<<"$1" || true
 }
 
+# How many DISTINCT places a round's inline entries print, the id field aside. The claim of #113
+# is not that some anchor token appears somewhere: it is that two entries the fold KEPT APART
+# cannot read as one finding posted twice, and only the whole header minus the ids can say that.
+# An assertion per token would pass on a rendering that printed the same line for both.
+distinct_inline_headers() { # <haystack>
+  { grep -F -- '--- inline ' <<<"$1" || true; } | sed 's/ id=[^ ]*//' | sort -u | wc -l | tr -d '[:space:]'
+}
+
 # A row as the PER-REVIEW comments endpoint serves it, which is not the shape the flat feed has:
 # no `line` and no `original_line` at all — verified against this repository's live API on
 # 2026-09-10 — with the location carried by position/original_position instead. poll renders such
 # a row by the field it actually has, `:@<position>`, so two of them at different places in one
 # file are told apart by the eye as well as by the fold key.
-positional_comment() { # <id> <original commit> <body> <position>
-  jq -cn --argjson id "$1" --arg orig "$2" --arg b "$3" --argjson pos "$4" --arg rev "$REVIEWER" \
+positional_comment() { # <id> <original commit> <body> <position> [original position]
+  jq -cn --argjson id "$1" --arg orig "$2" --arg b "$3" --argjson pos "$4" \
+    --argjson opos "${5:-$4}" --arg rev "$REVIEWER" \
     '{id:$id, user:{login:($rev + "[bot]")}, path:"a.sh", body:$b, position:$pos,
-      original_position:$pos, original_commit_id:$orig, commit_id:$orig}'
+      original_position:$opos, original_commit_id:$orig, commit_id:$orig}'
 }
 
 summary_comment() { # <id> <created_at> <body>
@@ -720,7 +740,7 @@ test_an_unrecognized_field_keeps_two_threads_apart() {
   local same="the same text at two anchors"
   schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"side":"LEFT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"side":"RIGHT"}')]"
   run_watch 0,0,0
-  assert_not_contains "$WATCH_OUT" "id=900+901" "a side the rendering never shows still separates"
+  assert_not_contains "$WATCH_OUT" "id=900+901" "a deletion and an addition at one line separate"
   reset_fixture
   schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"start_line":3}')]"
   run_watch 0,0,0
@@ -738,6 +758,93 @@ test_an_unrecognized_field_keeps_two_threads_apart() {
   assert_contains "$WATCH_OUT" "--- inline id=900+901 a.sh:3" \
     "ids, urls, timestamps, reactions, links and the per-comment review id are not the finding"
   assert_contains "$WATCH_OUT" "(2 identical threads" "and the pair is one finding"
+}
+
+# The loud half of that same key (#113). Every field above keeps two rows apart, and until this
+# case the header named none of them: a deletion commented on the LEFT and an addition on the
+# RIGHT at line 3 of one file printed two headers byte-identical apart from the id, and correctly
+# did NOT fold. What the reader sees is the reviewer posting one finding twice and the fold
+# failing to catch it, with nothing on the page to say otherwise — the mirror of the `:0` defect
+# of #105, where two places looked like one. So each anchor field the row carries is on the line,
+# in the `k=v` grammar the rest of the header already speaks, and the oracle is the whole header
+# rather than the presence of a token: two unfolded entries must read as two places.
+test_the_anchor_fields_that_keep_two_rows_apart_are_on_the_line() {
+  local same="the same text at two anchors"
+  # A deletion and an addition at one line. RIGHT is where every other row is and prints nothing.
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"side":"LEFT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"side":"RIGHT"}')]"
+  run_watch 0,0,0
+  assert_not_contains "$WATCH_OUT" "id=900+901" "two sides are two findings, as the key already had it"
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:3 side=LEFT commit=${H2:0:7}" \
+    "the one on the deletion side says so"
+  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:3 commit=${H2:0:7}" \
+    "and the default side prints nothing: RIGHT on every row would be noise"
+  assert_eq "$(distinct_inline_headers "$WATCH_OUT")" 2 \
+    "two entries the fold kept apart read as two places, the id aside"
+  # A multi-line anchor and a single line at its end: two places, two renderings.
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1,"start_side":"RIGHT","side":"RIGHT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"side":"RIGHT"}')]"
+  run_watch 0,0,0
+  assert_not_contains "$WATCH_OUT" "id=900+901" "a range and a line are two findings"
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:1-3 commit=${H2:0:7}" \
+    "a multi-line anchor renders the range it covers"
+  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:3 commit=${H2:0:7}" \
+    "and the line at its end is its own place"
+  assert_eq "$(distinct_inline_headers "$WATCH_OUT")" 2 "so the two entries read as two"
+  # A range whose ends are on different sides. The end's side is the default and says nothing, so
+  # the start's is named: `start_side` prints exactly when it differs from the side of the end.
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1,"start_side":"LEFT","side":"RIGHT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1,"start_side":"LEFT","side":"LEFT"}')]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:1-3 start_side=LEFT commit=${H2:0:7}" \
+    "a range from the deletion side to the addition side names the end that is not the default"
+  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:1-3 side=LEFT commit=${H2:0:7}" \
+    "and a range wholly on the deletion side names it once"
+  assert_eq "$(distinct_inline_headers "$WATCH_OUT")" 2 "which is what keeps the two apart"
+  # An anchor that has MOVED since it was written: GitHub migrates `line`/`start_line` forward as
+  # the branch advances while the `original_*` pair stays where the reviewer wrote it, and the
+  # key holds both — so two findings written at different places can sit at one place today.
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 40 '{"start_line":36,"original_line":34,"original_start_line":30}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 40 '{"start_line":36,"original_line":34,"original_start_line":32}')]"
+  run_watch 0,0,0
+  assert_not_contains "$WATCH_OUT" "id=900+901" "two anchors as written are two findings"
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:36-40 was=30-34 commit=${H2:0:7}" \
+    "where the finding sits now, and where it was written"
+  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:36-40 was=32-34 commit=${H2:0:7}" \
+    "which is the only thing telling this one from the last"
+  assert_eq "$(distinct_inline_headers "$WATCH_OUT")" 2 "two places, however alike they sit today"
+  # A positional row migrates too, in the unit it has: the per-review endpoint serves no line at
+  # all, and `position`/`original_position` are both in the key, so two rows at one current
+  # position written at different ones are two findings (review of #272, round 1).
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
+  schedule review_comments 1 "[$(positional_comment 900 "$H2" "$same" 12 5),$(positional_comment 901 "$H2" "$same" 12 9)]"
+  run_watch 0,0,0
+  assert_not_contains "$WATCH_OUT" "id=900+901" "two original positions are two findings"
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:@12 was=@5 commit=${H2:0:7}" \
+    "a position that has moved prints the one it was written at"
+  assert_contains "$WATCH_OUT" "--- inline id=901 a.sh:@12 was=@9 commit=${H2:0:7}" \
+    "which is the only thing telling these two apart"
+  assert_eq "$(distinct_inline_headers "$WATCH_OUT")" 2 "so they read as the two places they are"
+  # And a row that has NOT moved prints no token at all, in either unit: `was=` on every row
+  # would be the `side=RIGHT` noise one column over.
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
+  schedule review_comments 1 "[$(positional_comment 900 "$H2" "$same" 12)]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:@12 commit=${H2:0:7}" \
+    "an unmigrated position is the position, and nothing else"
+  assert_not_contains "$WATCH_OUT" "was=" "with no token for a move that did not happen"
+  # And the control the whole rendering rests on: rows agreeing on every anchor field still fold,
+  # and the folded entry prints that anchor once. Without it these cases would pass on a header
+  # that had simply started printing the id of every thread separately.
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1,"start_side":"LEFT","side":"LEFT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1,"start_side":"LEFT","side":"LEFT"}')]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_OUT" "--- inline id=900+901 a.sh:1-3 side=LEFT commit=${H2:0:7}" \
+    "one anchor in every field is one finding and one reply"
+  assert_eq "$(distinct_inline_headers "$WATCH_OUT")" 1 "and one place on the page"
+  assert_eq "$(occurrences "$WATCH_OUT" "$same")" 1 "with the body printed once"
 }
 
 # The commit stamp is in the fold key because it is what `watch` classifies an item BY: folding a
@@ -1302,6 +1409,7 @@ tests=(
   test_threads_at_one_anchor_fold_with_every_body_shown
   test_threads_at_different_places_are_not_folded
   test_an_unrecognized_field_keeps_two_threads_apart
+  test_the_anchor_fields_that_keep_two_rows_apart_are_on_the_line
   test_the_same_body_against_two_heads_is_not_folded
   test_rows_with_no_line_are_folded_only_when_their_positions_agree
   test_a_row_with_no_location_at_all_says_so
@@ -1324,3 +1432,5 @@ tests=(
 )
 
 run_tests "${tests[@]}"
+exit "$?"
+}
