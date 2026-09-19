@@ -307,37 +307,39 @@ job_run_commands() { # job_run_commands <job>
     in_job && $1 == "run:" { print $2 }
   ' "$WORKFLOW"
 }
-# The command word of every `run:` line whose invocation carries NO ARGUMENTS -- nothing between
-# the command and the end of the line or the shell operator that follows it (the macOS legs spell
-# every suite `<suite> || { echo ...; exit 1; }`, which is a bare invocation of the suite). An
-# argument is what turns a run into something other than the check the table names: `--help` exits
-# 0 having asserted nothing, and a path narrows a guard's sweep from the checkout to that file,
-# either of which would satisfy a pin that read the command word alone (round 4). The prompt
-# hygiene job is the case that matters most: it is the only check a prompt-only head gets.
+# The command word of every `run:` line that is a LIVE, BARE invocation of that command: nothing
+# at all after the command word, and a step carrying no attribute that stops it failing the job.
+#
+# The tail rule was three rounds of grammar before it was one line. Round 4 accepted any operator
+# tail, round 5 accepted `|| { ...; exit 1; }` by substring, round 6 anchored the match -- and
+# round 8 showed `|| { echo exit 1; }` satisfying the anchored pattern, because a text rule cannot
+# say whether a handler FAILS. The tolerance is gone rather than hardened a fourth time: every
+# command in the step table already has an invocation with no tail at all (the lint job runs each
+# of them bare, and the prompt hygiene job runs check-prompts.sh bare), so accepting a tail bought
+# nothing and cost four rounds. A macOS-style `<suite> || { echo ...; exit 1; }` line is simply
+# not the invocation this pin reads; the command needs one plain line somewhere, which is what the
+# refusal asks for.
+#
+# The attributes are read here and not only in the lint job (round 8): the table deliberately lets
+# an external command be satisfied by a step in ANY job -- check-prompts.sh is satisfied by the
+# prompt hygiene job, the only check a prompt-only head gets -- so a `continue-on-error: true` or
+# an `if: ${{ false }}` there would otherwise be invisible. A disabled step is not an invocation.
 workflow_bare_commands() {
   awk '
-    # An operator tail counts only when the line still FAILS if the command does. `|| true`,
-    # `; true` and `| cat` each swallow the status, and a pin that took any operator for a bare
-    # invocation would pass over a prompt hygiene step that can no longer go red (round 5). The
-    # one tail accepted is the `|| { echo ...; exit 1; }` this workflow uses; another spelling that
-    # propagates is a line here, deliberately, rather than an attempt to read shell semantics.
-    # The tail is matched WHOLE, not searched for a substring: `<cmd> || { ...; exit 1; } || true`
-    # contains the accepted handler and still cannot go red, so an unanchored match let the very
-    # shape this rule refuses through one operator later (round 6).
-    function tail_from(start,   i, t) {
-      t = ""
-      for (i = start; i <= NF; i++) t = t (t == "" ? "" : " ") $i
-      return t
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { cond = ""; soft = "" }
+    /^      - / { cond = ""; soft = "" }
+    $1 == "if:" { cond = $0; sub(/^[[:space:]]*if:[[:space:]]*/, "", cond) }
+    $1 == "continue-on-error:" { soft = ($2 != "false") }
+    function live() {
+      if (soft) return 0
+      if (cond != "" && cond !~ /^\$\{\{[ ]*![ ]*cancelled\(\)[ ]*\}\}$/) return 0
+      return 1
     }
-    function bare(cmd, tail) {
-      if (tail == "") return cmd
-      if (tail ~ /^\|\| \{ .*exit 1 *;? *\}$/) return cmd
-      return ""
-    }
-    $1 == "run:" { c = bare($2, tail_from(3)); if (c != "") print c }
-    $1 == "-" && $2 == "run:" { c = bare($3, tail_from(4)); if (c != "") print c }
+    $1 == "run:" && NF == 2 && live() { print $2 }
+    $1 == "-" && $2 == "run:" && NF == 3 && live() { print $3 }
   ' "$WORKFLOW"
 }
+
 # The command word of every lint `run:` whose STEP carries an attribute that stops it failing the
 # job. Two of them exist: an `if:` decides whether the step runs at all, and `continue-on-error`
 # decides whether its failure counts -- either turns a pinned check off without touching the run
@@ -612,40 +614,41 @@ if probe_workflow_swap '        run: scripts/check-prompts.sh' \
 else
   ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
 fi
-# ...while the macOS spelling, which is an operator and not an argument, must NOT be refused.
-if probe_workflow_swap '        run: scripts/check-prompts.sh' \
-  "        run: scripts/check-prompts.sh || { echo 'failed'; exit 1; }"; then
-  grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
-    && ok "...while a shell operator after the command is not an argument, and is not refused" \
-    || ko "the macOS '<suite> || { ... }' spelling was read as an argument"
-else
-  ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
-fi
+# ...and so does every tail, the failure handler included: the pin reads a plain line, because no
+# text rule can say whether a handler fails (rounds 4-8). Each of these must stop counting.
+for probe_tail in \
+  "|| { echo 'failed'; exit 1; }" \
+  "|| { echo exit 1; }" \
+  "|| true" \
+  "| cat" \
+  "|| { echo 'failed'; exit 1; } || true"; do
+  if probe_workflow_swap '        run: scripts/check-prompts.sh' \
+    "        run: scripts/check-prompts.sh $probe_tail"; then
+    grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
+      && ko "a tail counted as an invocation of the check: $probe_tail" \
+      || ok "...and a tail is not the invocation this pin reads: $probe_tail"
+  else
+    ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
+  fi
+done
 
-# ...and a tail that swallows the command's status is not a run of it either.
+# A step disabled in ANOTHER job is not an invocation either: check-prompts.sh is satisfied by the
+# prompt hygiene job, and a prompt-only head is judged by nothing else.
 if probe_workflow_swap '        run: scripts/check-prompts.sh' \
-  '        run: scripts/check-prompts.sh || true'; then
+  '        continue-on-error: true
+        run: scripts/check-prompts.sh'; then
   grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
-    && ko "'|| true' after the prompt hygiene step still read as a bare invocation" \
-    || ok "...and a '|| true' tail, which cannot go red, does not count as running the check"
+    && ko "a continue-on-error step outside the lint job still counted as running the check" \
+    || ok "...nor is a step whose failure cannot fail its job, in whatever job it stands"
 else
   ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
 fi
 if probe_workflow_swap '        run: scripts/check-prompts.sh' \
-  '        run: scripts/check-prompts.sh | cat'; then
+  '        if: ${{ false }}
+        run: scripts/check-prompts.sh'; then
   grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
-    && ko "a pipe after the prompt hygiene step still read as a bare invocation" \
-    || ok "...nor does a pipe, whose status is the last command's"
-else
-  ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
-fi
-
-# A handler that propagates, followed by one that does not, is not a run either.
-if probe_workflow_swap '        run: scripts/check-prompts.sh' \
-  "        run: scripts/check-prompts.sh || { echo 'failed'; exit 1; } || true"; then
-  grep -Fqx -- scripts/check-prompts.sh <<<"$(workflow_bare_commands)" \
-    && ko "an accepted handler followed by '|| true' still read as a bare invocation" \
-    || ok "...and the accepted handler must be the WHOLE tail, so a trailing '|| true' still trips it"
+    && ko "a step behind 'if: false' outside the lint job still counted as running the check" \
+    || ok "...nor one behind a condition that skips it, in whatever job it stands"
 else
   ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
 fi
