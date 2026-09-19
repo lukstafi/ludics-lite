@@ -1081,13 +1081,22 @@ env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAI
 kill "$(awk '{ print $1 }' "$TMP/state/hold-rog.pid")" 2>/dev/null
 for _ in 1 2 3 4 5; do alive "$(awk '{ print $1 }' "$TMP/state/hold-rog.pid")" || break; sleep 1; done
 rm -f "$TMP/state/hold-rog.releasing"
-# The hold lock goes with the holder, but its sidecar only notices on its next poll -- so wait for
-# the box to be free before taking it, or this case measures that one-second refusal instead.
+# The hold lock goes with the holder, but its sidecar only notices on its next poll -- and it looks
+# with `kill -0`, which a ZOMBIE answers, so where PID 1 does not reap promptly it never lets go.
+# Ending it explicitly is what makes this case behave the same in a container as on a Mac, and the
+# loop has a postcondition so a lock that never frees fails the case instead of quietly turning it
+# into a test of a stale refusal (review round 8, P2, reproduced by the reviewer).
+kill "$(awk '{ print $4 }' "$TMP/state/hold-rog.pid" 2>/dev/null)" 2>/dev/null
+lock_free=0
 for _ in $(seq 1 15); do
-  ( exec 7>>"$WAKE_LAB_LOCK_DIR/rog.hold.lock"
-    perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7 ) && break
+  if ( exec 7>>"$WAKE_LAB_LOCK_DIR/rog.hold.lock"
+       perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7 ); then
+    lock_free=1; break
+  fi
   sleep 1
 done
+[ "$lock_free" = 1 ] \
+  || ko "the dead holder's sidecar never released rog's hold lock, so the case below tests a stale refusal"
 : > "$SSH_LOG"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
       WAKE_LAB_HOLD_TEARDOWN_SECONDS=4 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \

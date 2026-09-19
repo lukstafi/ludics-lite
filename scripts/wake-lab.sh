@@ -1040,7 +1040,7 @@ LANE_FD=8
 HOLD_FD=9      # the descriptor the box's HOLD lock lives on; the holder inherits exactly this one
 hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it is ours, in that VM
   local name=$1 dest=$2 pid f fifo out token spawn_epoch spawned=0 sidecar=0 gp prot=protected
-  local rec rp rd rt rsc rtok rgp rprot own theirs
+  local rec rec_seen rp rd rt rsc rtok rgp rprot own theirs
   # The box's HOLD lock — "do not destroy this VM" — and the holder is what carries it. A restart
   # path already holds it on HOLD_FD (its reservation took both of that box's locks before the
   # kick, and set HOLD_LOCKED to say so); a plain `kick-wsl --hold` does not, so it takes it here,
@@ -1163,6 +1163,8 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   # loses the pending cleanup it was the only sign of, and a holder that died WITHOUT an unhold --
   # the ludics-lite#237 shape, whose orphan the lore says nothing can name -- is confirmed here
   # too, where before this it was simply deleted.
+  # The record exactly as this call saw it, which is what the unlink below is allowed to remove.
+  rec_seen=$(cat "$f" 2>/dev/null)
   rec=$(hold_pid_read "$f" 2>/dev/null) || rec=""
   if [ -n "$rec" ]; then
     read -r rp rd rt rsc rtok rgp rprot <<<"$rec"; : "$rp" "$rt" "$rsc" "$rprot"
@@ -1181,7 +1183,19 @@ hold_wsl() { # hold_wsl <box> <windows-alias> — spawn the holder and prove it 
   fi
   # ...and a marker from some earlier release goes with it: left in place it would mask the loss
   # of the holder about to be spawned, which is the one thing this reporting exists to catch.
-  rm -f "$f" "${f%.pid}.releasing" 2>/dev/null
+  #
+  # Conditionally, though: this unlink used to take whatever occupied the path. Two --force holds
+  # racing -- or two holds where the lock could not be attempted at all -- are neither of them
+  # serialized, so both can pass the checks above, and the second would then remove the FIRST's
+  # freshly created noclobber claim and let both spawn a holder over one record. The claim exists
+  # precisely to make that impossible, so what is removed here is the record this call INSPECTED
+  # and nothing else; a record that changed underneath is another run's, and its claim stands.
+  if [ "$(cat "$f" 2>/dev/null)" = "${rec_seen:-}" ]; then
+    rm -f "$f" "${f%.pid}.releasing" 2>/dev/null
+  else
+    echo "  wsl holder for $name is being created by another run ($f changed underneath); nothing was started"
+    return 1
+  fi
   if ! ( set -C; : > "$f" ) 2>/dev/null; then
     if [ -e "$f" ]; then
       echo "  wsl holder for $name is already being created by another run ($f is claimed); nothing was started"
