@@ -350,22 +350,16 @@ linked_skills=$(find "$real_home/.claude/skills" -mindepth 1 -maxdepth 1 -type l
   && ok "the README's Claude loop links exactly the skills the tree declares" \
   || ko "the README's Claude loop and tree disagree (tree: $tree_skills; links: $linked_skills)"
 
-# Extract each lint step's patterns from the workflow: restating them here would let the test and
-# workflow drift together. Every shell file must be covered by BOTH the syntax and shellcheck step.
-workflow_globs() { # workflow_globs <checkout> <step name>
-  awk -v want="$2" '
-    /^[[:space:]]*- name: / {
-      if (in_step) exit
-      if (index($0, "- name: " want) != 0) in_step = 1
-      next
-    }
-    in_step && /[.]sh/ {
-      line = $0
-      gsub(/[;|]/, " ", line)
-      n = split(line, field, /[[:space:]]+/)
-      for (i = 1; i <= n; i++) if (field[i] ~ /[*].*[.]sh$/) print field[i]
-    }
-  ' "$1/.github/workflows/skill-scripts.yml"
+# Read the lint steps' patterns from the checkout rather than restating them: restating them here
+# would let the test and workflow drift together. Until ludics-lite#221 that meant slicing them out
+# of the workflow's own `run:` blocks; the list now lives once in scripts/preflight.sh, which the
+# lint job calls, and `preflight.sh globs` is the reading of it. What this guard no longer sees on
+# its own is a lint step rewritten to sweep something ELSE inline -- the globs would still be read
+# from the script while CI ran the inline copy. That is scripts/test-preflight.sh's pin (every
+# lint `run:` is preflight.sh or a command in its step table), and the two are the whole claim.
+# Every shell file must be covered by BOTH the syntax and shellcheck step, which is one list today.
+lint_globs() { # lint_globs <checkout>
+  "$1/scripts/preflight.sh" globs
 }
 workflow_matches() { # workflow_matches <checkout> <newline-separated patterns>: the paths they cover
   # Expand the patterns the way the workflow's own shell does, over a tree holding exactly what the
@@ -412,8 +406,11 @@ tracked_shell_files() { # <checkout>: the shell scripts the repository tracks, o
 }
 uncovered_shell_files() { # <checkout>: "<step>:<path>" for every tracked script a lint step misses
   local syntax_files shellcheck_files uncovered="" f
-  syntax_files=$(workflow_matches "$1" "$(workflow_globs "$1" 'Check shell syntax')")
-  shellcheck_files=$(workflow_matches "$1" "$(workflow_globs "$1" 'Shellcheck')")
+  # Both steps sweep the one list, so these two are the same set today; they stay separate
+  # because the claim the verdict makes is per step, and a step given a narrower list of its own
+  # would be read here without another edit.
+  syntax_files=$(workflow_matches "$1" "$(lint_globs "$1")")
+  shellcheck_files=$(workflow_matches "$1" "$(lint_globs "$1")")
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     grep -Fqx -- "$f" <<<"$syntax_files" || uncovered="$uncovered bash-n:$f"
@@ -423,12 +420,12 @@ $(tracked_shell_files "$1")
 EOF
   printf '%s' "$uncovered"
 }
-syntax_globs=$(workflow_globs "$real_top" 'Check shell syntax')
-shellcheck_globs=$(workflow_globs "$real_top" 'Shellcheck')
+syntax_globs=$(lint_globs "$real_top")
+shellcheck_globs=$syntax_globs
 uncovered=$(uncovered_shell_files "$real_top")
 [ -n "$syntax_globs" ] && [ -n "$shellcheck_globs" ] && [ -z "$uncovered" ] \
-  && ok "the workflow's own syntax and shellcheck globs cover every shell script in the tree" \
-  || ko "workflow shell globs are missing or leave files uncovered:$uncovered (bash -n: $syntax_globs; shellcheck: $shellcheck_globs)"
+  && ok "the lint job's own syntax and shellcheck globs cover every shell script in the tree" \
+  || ko "lint shell globs are missing or leave files uncovered:$uncovered (bash -n: $syntax_globs; shellcheck: $shellcheck_globs)"
 
 # Both halves of that reading, on the layout guard's clone: the scratch script an agent drops in a
 # worktree stays invisible, and the same path once the tree TRACKS it -- at the root, where none of
