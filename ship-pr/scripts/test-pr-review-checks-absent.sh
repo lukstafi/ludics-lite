@@ -66,6 +66,11 @@ WORKFLOW_YAML=""
 # context, so the head's copy only speaks for it when the base's copy is identical; a case that
 # sets this differently stands for a base-side edit made after the branch diverged.
 WORKFLOW_YAML_BASE=""
+# What `.github/workflows/` holds at each end of the merge. The repository's workflow LIST is not
+# that set — it is built from the default branch plus whatever has run — so a file only one side
+# carries is a workflow nothing examines while its first run is on its way.
+WORKFLOW_DIR_HEAD=""
+WORKFLOW_DIR_BASE=""
 # The newest merged pull request of this repository, and its head's check runs: where "does this
 # repository have a provider other than Actions" is read. The recognition reads workflows, so it
 # can answer for nothing else — and a merged PR's head is the population the question is about,
@@ -160,6 +165,8 @@ reset_fixture() {
   WORKFLOW_PATH=".github/workflows/ci.yml"
   WORKFLOW_YAML="$UNFILTERED_YAML"
   WORKFLOW_YAML_BASE=""
+  WORKFLOW_DIR_HEAD='[".github/workflows/ci.yml"]'
+  WORKFLOW_DIR_BASE=""
   MERGED_PRS_JSON=$(jq -cn --arg s "$SAMPLE_SHA" \
     '[{merged_at:"2026-09-18T00:00:00Z", head:{sha:$s}}]')
   SAMPLE_CHECKS_JSON=$(check_runs_json '[{"name":"ci","app":{"slug":"github-actions"}}]')
@@ -222,6 +229,13 @@ gh() {
   # library asks for it — the base64 JSON envelope's decoder is spelled differently on this
   # fleet's two platforms.
   "repos/$REPO/actions/workflows/"*) response=$(jq -cn --arg p "$WORKFLOW_PATH" '{path:$p}') ;;
+  "repos/$REPO/contents/.github/workflows?ref=$BASE_SHA")
+    response=$(jq -cn --argjson f "${WORKFLOW_DIR_BASE:-$WORKFLOW_DIR_HEAD}" \
+      '[$f[] | {type:"file", path:.}]')
+    ;;
+  "repos/$REPO/contents/.github/workflows?ref="*)
+    response=$(jq -cn --argjson f "$WORKFLOW_DIR_HEAD" '[$f[] | {type:"file", path:.}]')
+    ;;
   "repos/$REPO/contents/"*"?ref=$BASE_SHA")
     response="${WORKFLOW_YAML_BASE:-$WORKFLOW_YAML}"
     ;;
@@ -664,6 +678,53 @@ test_a_base_side_workflow_edit_keeps_the_head_waiting() {
   assert_eq "$GATE_RC" 4 "the head's copy does not speak for the merge context"
   assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers"
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and nothing is settled on the stale copy"
+}
+
+# --- review round 5: the list is not the file set, and the range is read once ------------------
+# The repository's workflow list is built from the default branch plus whatever has run, so it is
+# not an inventory of the files the merge context will hold. A workflow only the BASE carries —
+# added there after the branch forked — is absent from the head and from the list, and the
+# `.github/workflows/` guard over the range cannot see it either, since that range is head-side.
+test_a_workflow_only_on_the_base_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  WORKFLOW_DIR_BASE='[".github/workflows/ci.yml", ".github/workflows/added-on-main.yml"]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a workflow the list does not carry was never examined"
+  assert_contains "$GATE_OUTPUT" "creation grace" "the grace answers instead"
+}
+
+# The same the other way: a file only the head carries. The range guard already refuses this when
+# the range shows it, and this is the belt to that brace — the range is capped, and a file added
+# before the cap's window is still a file nothing examined.
+test_a_workflow_only_on_the_head_keeps_the_head_waiting() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  WORKFLOW_DIR_HEAD='[".github/workflows/ci.yml", ".github/workflows/added-on-branch.yml"]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a file at the head that the list does not carry was never examined"
+}
+
+# Every workflow asks its own filter about the SAME range, so the range is read once and not once
+# per workflow. At the supported limits the old shape was ~2100 requests per attempt, repeated
+# every polling round inside the grace — which could turn the gate UNKNOWN on rate limits for
+# exactly the heads this is meant to settle.
+test_the_range_is_read_once_for_every_workflow() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  WORKFLOWS_JSON=$(jq -cn '{workflows:[{id:1,name:"ci",state:"active"},
+                                       {id:2,name:"docs",state:"active"}]}')
+  COMPARE_COMMITS=$(jq -cn --arg h "$HEAD_SHA" '["2222222222222222222222222222222222222222", $h]')
+  run_gate
+  assert_eq "$GATE_RC" 0 "two workflows, both filtered, still settle"
+  # One compare for the merge base, one for the range, and one read per commit in it — whatever
+  # the number of workflows.
+  assert_eq "$(grep -c "compare/" "$REQUEST_LOG")" 2 "the range is compared once, not once per workflow"
+  assert_eq "$(grep -cE "/commits/[0-9a-f]+\\?per_page=100$" "$REQUEST_LOG")" 2 \
+    "each commit's files are read once, whatever the number of workflows"
 }
 
 # One page of 100 on the provider sample too: a large Actions matrix can fill it while the
@@ -1232,6 +1293,9 @@ tests=(
   test_an_unfiltered_merge_group_does_not_block_the_recognition
   test_a_truncated_workflow_list_keeps_the_head_waiting
   test_a_truncated_provider_sample_keeps_the_head_waiting
+  test_a_workflow_only_on_the_base_keeps_the_head_waiting
+  test_a_workflow_only_on_the_head_keeps_the_head_waiting
+  test_the_range_is_read_once_for_every_workflow
   test_a_second_check_provider_keeps_the_head_waiting
   test_an_advisory_provider_does_not_block_the_recognition
   test_a_sample_without_checks_keeps_the_head_waiting

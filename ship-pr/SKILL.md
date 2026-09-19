@@ -711,9 +711,10 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   `workflow_dispatch` among them: each of those CAN put a run on this head, and an empty run list
   is the not-created-yet window rather than evidence that none is coming. The workflow file is read
   at the head *and* at the base tip and the two must be identical, since a `pull_request` run uses
-  the merge context's copy; and any path under `.github/workflows/` anywhere in the range refuses,
-  which covers both a filter that moved mid-range and a workflow the head ADDS, which the
-  repository's workflow list does not carry. The recognition is admitted at all only where the
+  the merge context's copy; any path under `.github/workflows/` anywhere in the range refuses; and
+  every workflow file at *either* end of the merge must be one the repository's list carries,
+  because that list is built from the default branch plus whatever has run and so is not an
+  inventory of the files a `pull_request` run will see. The recognition is admitted at all only where the
   newest merged PR's head shows non-advisory check runs from Actions alone: it reads workflows, so
   it cannot speak for a third-party provider. That last one is a filter and not an inventory — no
   endpoint enumerates a repository's providers — so the residual is a provider absent from that

@@ -4445,32 +4445,50 @@ END {
   for (i = 1; i <= n; i++) print ev[i]
 }'
 
-# workflow_source <workflow id> <ref>: the workflow FILE's path, then the file's own text, or
-# nothing (exit 1) when either cannot be read. The file is read AT THE REF being judged, because
-# the filter that decides whether that commit gets a run is the one that commit carries. Both
-# readers above run over the text this returns, so a workflow whose several triggers are all
-# examined still costs the two calls once.
-workflow_source() {
-  local wid="$1" ref="$2" wpath body
-  wpath=$(gh_retry read api "repos/$REPO/actions/workflows/$wid" --jq '.path // ""') || return 1
+# workflow_path <workflow id>: where that workflow's file lives, or nothing (exit 1).
+workflow_path() {
+  local wpath
+  wpath=$(gh_retry read api "repos/$REPO/actions/workflows/$1" --jq '.path // ""') || return 1
   # One path, and one that stays inside the repository: the value is interpolated into a REST
   # path, so a newline or a traversal in it is a different request, not a workflow file.
   case "$wpath" in '' | *$'\n'* | */../* | ../* | /*) return 1 ;; esac
+  printf '%s\n' "$wpath"
+}
+
+# workflow_body <path> <ref>: the file's own text at that ref, or nothing (exit 1). The ref
+# matters: the filter that decides whether a commit gets a run is the one that commit carries.
+workflow_body() {
+  local body
   # The raw media type, so the file arrives as itself: the JSON form is base64 whose decoder is
   # spelled `-d` on one of this fleet's two platforms and `-D` on the other.
   body=$(gh_retry read api -H "Accept: application/vnd.github.raw" \
-    "repos/$REPO/contents/$(encode_ref "$wpath")?ref=$ref") || return 1
+    "repos/$REPO/contents/$(encode_ref "$1")?ref=$2") || return 1
   [ -n "$body" ] || return 1
-  printf '%s\n%s\n' "$wpath" "$body"
+  printf '%s\n' "$body"
+}
+
+# workflow_files_at <ref>: every YAML file directly under `.github/workflows/` at that ref, one
+# path per line, or nothing (exit 1). What the repository's workflow LIST is not: that list is
+# built from the default branch plus whatever has run, so a workflow file living only on a PR's
+# base branch, or only on its head, is simply absent from it — and the loop below would then pass
+# every workflow it knows about while the one it does not know about creates the run (review
+# rounds 3 and 5). Read at both ends of the merge, since a `pull_request` run sees the union.
+workflow_files_at() {
+  local raw
+  raw=$(gh_retry read api "repos/$REPO/contents/.github/workflows?ref=$1" \
+    --jq 'if type == "array" then (.[] | select(.type == "file") | .path) else empty end') ||
+    return 1
+  [ -n "$raw" ] || return 1
+  printf '%s\n' "$raw" | grep -E '\.ya?ml$'
 }
 
 # workflow_paths_ignore <workflow id> <ref>: a workflow's `on: push: paths-ignore` patterns, one
 # per line, or nothing (exit 1) when they cannot be established. cmd_base's reader: it queries one
 # event, `push`, because that is the only event whose runs it folds.
 workflow_paths_ignore() {
-  local wid="$1" ref="$2" src body pats
-  src=$(workflow_source "$wid" "$ref") || return 1
-  body="${src#*$'\n'}"
+  local wid="$1" ref="$2" wpath body pats
+  wpath=$(workflow_path "$wid") || return 1
+  body=$(workflow_body "$wpath" "$ref") || return 1
   pats=$(awk -v q="'" -v dq='"' -v want=push -v seq=paths-ignore \
     "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
   [ -n "$pats" ] || return 1
@@ -4589,8 +4607,18 @@ commit_files() {
 # longer than the cap goes to the grace rather than to a read per commit (GitHub's own rule is
 # 1000 commits, above which a push runs whatever the filter says). A `total_commits` the returned
 # list does not match is a truncated answer and settles nothing.
-commits_ignored() {
-  local pats="$1" vsha="$2" tip="$3" cmp count behind rows sha parent files steps nl=$'\n'
+# range_files <judged sha> <tip>: every path changed anywhere on the first-parent path from the
+# judged commit up to the tip, one per line, or nothing (exit 1) when the range is not evidence.
+#
+# The UNION rather than a list per commit, and that is not a weakening: "every commit's files are
+# ignored" and "the union of the files is ignored" are the same claim, because a path is covered
+# or it is not. Making it the union is what lets a caller with several workflows read the range
+# ONCE and then ask each filter about the same lines — at the supported limits that is the
+# difference between ~2100 requests and ~21, and the old shape spent them again every polling
+# round inside the grace, which could turn the gate UNKNOWN on rate limits for exactly the heads
+# the fast path exists to settle (review round 5).
+range_files() {
+  local vsha="$1" tip="$2" cmp count behind rows sha parent files steps out="" nl=$'\n'
   cmp=$(gh_retry read api "repos/$REPO/compare/$vsha...$tip?per_page=$IGNORE_MAX_COMMITS" \
     --jq '(.total_commits // 0 | tostring), ((.behind_by // -1) | tostring),
           ((.commits // [])[] | [.sha, ((.parents // [])[0].sha // "-")] | @tsv)') || return 1
@@ -4617,16 +4645,23 @@ commits_ignored() {
     files=$(commit_files "$sha") || return 1
     # ANY file under the workflow directory, not just the one workflow whose filter is being
     # applied (review round 3). A range that edits a workflow is a range across two different
-    # filters — and a range that ADDS one adds a workflow the repository's own list does not
-    # carry, since that list is not an inventory of the files on a non-default branch: every
-    # listed workflow can pass this loop while the newcomer, whose first run is on its way, was
-    # never examined. Refusing on the directory closes both, and needs no extra read.
+    # filters, and a range that ADDS one adds a workflow the repository's own list does not carry.
     ! grep -q '^\.github/workflows/' <<<"$files" || return 1
-    paths_ignore_covers "$pats" "$files" || return 1
+    out="${out}${files}"$'\n'
     sha="$parent"
   done
   [ "$steps" -gt 0 ] || return 1
-  return 0
+  [ -n "$out" ] || return 1
+  printf '%s' "$out" | grep .
+}
+
+# commits_ignored <patterns> <judged sha> <tip>: the range, read and then covered. cmd_base's
+# caller, where each workflow brings its OWN judged commit and so its own range; the PR head's
+# caller reads the one range itself and applies each filter to it.
+commits_ignored() {
+  local files
+  files=$(range_files "$2" "$3") || return 1
+  paths_ignore_covers "$1" "$files"
 }
 
 # tip_within_paths_ignore <rows> <tip>: rows are "<workflow id><TAB><name><TAB><judged sha>", one
@@ -4815,8 +4850,8 @@ push_cannot_reach() {
 # one workflow file. Nothing here is memoized, because run_signal is called from inside a command
 # substitution where an assignment dies with the subshell (the trap BASE_RED_DETAIL documents).
 head_within_paths_ignore() {
-  local head="$1" base="$2" ref="$3" mbase wf total rows wid wname wstate src bsrc body
-  local evs ev pats why=""
+  local head="$1" base="$2" ref="$3" mbase wf total rows wid wname wstate wpath body bbody
+  local rfiles declared bdeclared listed="" f evs ev pats why=""
   PATHS_IGNORE_WHY=""
   case "$head" in '' | *[!0-9a-f]*) return 1 ;; esac
   case "$base" in '' | *[!0-9a-f]*) return 1 ;; esac
@@ -4842,16 +4877,30 @@ head_within_paths_ignore() {
   case "$total" in '' | *[!0-9]*) return 1 ;; esac
   [ "$total" -gt 0 ] || return 1
   [ "$(printf '%s\n' "$rows" | grep -c '^[0-9][0-9]*	')" -eq "$total" ] || return 1
+  # The range, ONCE: every workflow below asks its own filter about the same lines.
+  rfiles=$(range_files "$mbase" "$head") || return 1
+  # Every workflow FILE that the merge context will hold — the union of the two ends, since a
+  # `pull_request` run sees the merge — has to be one the repository's list carries, or it is a
+  # workflow nothing below examines while its first run is on its way (review round 5). The
+  # head's set and the base's set are read separately because neither contains the other: a
+  # workflow the base added after the fork is absent from the head, and one the head adds is
+  # absent from the base.
+  declared=$(workflow_files_at "$head") || return 1
+  bdeclared=$(workflow_files_at "$base") || return 1
   while IFS=$'\t' read -r wid wname wstate; do
     [ -n "$wid" ] || continue
+    # The path is read for EVERY listed workflow, advisory and disabled included, because what it
+    # is collected for is the completeness check below: a file the list does not carry is the
+    # danger, and an advisory workflow's file is carried just as much as any other's.
+    wpath=$(workflow_path "$wid") || return 1
+    listed="${listed}${wpath}"$'\n'
     is_advisory "$wname" && continue
     # Only an `active` workflow creates runs: one disabled, or listed after its file was deleted,
     # has no filter to read at this head and no run to wait for either.
     [ "$wstate" = active ] || continue
-    src=$(workflow_source "$wid" "$head") || return 1
-    bsrc=$(workflow_source "$wid" "$base") || return 1
-    [ "$src" = "$bsrc" ] || return 1
-    body="${src#*$'\n'}"
+    body=$(workflow_body "$wpath" "$head") || return 1
+    bbody=$(workflow_body "$wpath" "$base") || return 1
+    [ "$body" = "$bbody" ] || return 1
     evs=$(awk -v q="'" -v dq='"' "$WORKFLOW_ON_EVENTS" <<<"$body") || return 1
     [ -n "$evs" ] || return 1
     while IFS= read -r ev; do
@@ -4861,7 +4910,7 @@ head_within_paths_ignore() {
         pats=$(awk -v q="'" -v dq='"' -v want=pull_request -v seq=paths-ignore \
           "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
         [ -n "$pats" ] || return 1
-        commits_ignored "$pats" "$mbase" "$head" || return 1
+        paths_ignore_covers "$pats" "$rfiles" || return 1
         ;;
       push) push_cannot_reach "$body" "$ref" || return 1 ;;
       *) case " $HEAD_INERT_EVENTS " in *" $ev "*) ;; *) return 1 ;; esac ;;
@@ -4872,6 +4921,12 @@ head_within_paths_ignore() {
   # Nothing was examined — every workflow advisory, disabled, or the list a single empty row —
   # so nothing has been explained.
   [ -n "$why" ] || return 1
+  # And nothing was MISSED: every workflow file at either end of the merge is one the list carried,
+  # so the loop above spoke for all of them.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    grep -qxF -- "$f" <<<"$listed" || return 1
+  done <<<"$declared"$'\n'"$bdeclared"
   PATHS_IGNORE_WHY="$why"
   return 0
 }
