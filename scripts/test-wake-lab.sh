@@ -25,7 +25,10 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/wake-lab-test.XXXXXX") || exit 1
 # same directory are spelled differently and a comparison quietly stops matching
 # (ludics-lite#208).
 TMP=$(CDPATH= cd "$TMP" && pwd -P) || exit 1
-trap 'rm -rf "$TMP"' EXIT
+# The holders this suite spawns outlive the cases that spawn them -- a holder that ended on its own
+# would not be a holder -- so the cleanup ends them before it removes the directory they record
+# themselves in. The guard is for the cases that fail before the shim exists.
+trap 'declare -F kill_stub_holders >/dev/null 2>&1 && kill_stub_holders; rm -rf "$TMP"' EXIT
 
 # The lab lock directory, for the WHOLE suite and not merely the cases that are about locking.
 # Every `restart-wsl` here reserves its box for real, so without this the suite takes flocks under
@@ -170,13 +173,27 @@ EOF
 # need to wedge one box's Windows aliases while leaving its guest and its neighbour answering. It
 # is an `exec sleep`, not a `sleep`, so that the cap's SIGALRM lands on the sleeping process itself
 # rather than on a shell waiting for a foreground child.
-# Three commands also have OUTPUT the script reads, and only a reachable destination produces it:
-# $SSH_TASKLIST is what `tasklist` prints (empty -- the default -- is a Windows side holding no
-# wsl.exe at all), $SSH_REG is what `reg query` prints, and $SSH_HOLD_LIFE is how many seconds the
-# `sleep infinity` holder stays alive here, so that `unhold` can be shown killing a LIVE process
-# rather than reaping one the shim had already let exit. That sleep runs as a background job with
-# a TERM trap, because a non-interactive bash defers a signal until its FOREGROUND child returns
-# -- which would make every holder here outlive the kill a real ssh client obeys at once.
+# Commands that have OUTPUT the script reads, and only a reachable destination produces it:
+# $SSH_TASKLIST is what `tasklist` prints, $SSH_REG is what `reg query` prints, and
+# $SSH_WSL_STOPPED makes `wsl.exe --list --running` report no running distribution.
+#
+# The HOLDER is modelled as two processes, and that is the whole point of this shim since
+# ludics-lite#192. A real hold has a local ssh client and a remote process tree, the channel
+# between them is the only thing that connects the two, and the defect was that killing the client
+# did NOT end the tree: Windows sshd exits without reaping its children, and a holder that never
+# reads its stdin never learns the channel is gone. A shim that answered the holder command in one
+# process could not express that -- killing it ended everything -- which is exactly why the suite
+# passed while both boxes leaked a tree per lane.
+#
+# So: the shim `ssh` is the CLIENT. It starts $SSH_REMOTE_HOLDER as a separate process whose stdin
+# is a fifo of its own (the channel), pumps its own stdin into that fifo, and then does nothing but
+# wait for the remote -- the way a real ssh exits when its remote command does. The client's TERM
+# trap kills the PUMP and never the remote, because a real client has no reach into the remote tree
+# either; the remote then sees EOF and ends itself, which is the contract the new holder is built
+# on. $SSH_REMOTE_LEAKS=1 makes the remote ignore that EOF and keep running, which is Windows as
+# measured on 2026-09-17, and is how the cases below get a leak to detect. $SSH_HOLD_LIFE makes the
+# remote exit on its own after N seconds -- a holder that DIES under the lane, which is a different
+# fault from one that outlives it.
 cat > "$TMP/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 dest=""; cmd=""
@@ -204,6 +221,26 @@ if [ -n "${LOCK_PROBE:-}" ]; then
 fi
 [ -n "${SSH_DELAY:-}" ] && sleep "$SSH_DELAY"
 [ -n "${SSH_HANG:-}" ] && grep -qE "$SSH_HANG" <<<"$line" && exec sleep 900
+# $SSH_PARTIAL is the nastier half of a wedge: the far side answers, gets part of its output out,
+# and THEN stops -- so the cap fires over a command substitution that is holding real bytes. A
+# truncated `wsl --list` carries no "Ubuntu" and a truncated `ps` carries no process row, so both
+# read as good news to anything that looks at the output before the status.
+# $SSH_DROP is the same shape with a different ending: the connection breaks after the header,
+# and ssh reports its own 255 rather than the remote command's status.
+if [ -n "${SSH_DROP:-}" ] && grep -qE "$SSH_DROP" <<<"$line"; then
+  case "$cmd" in
+    *"--list --running"*) printf 'Windows Subsystem for Linux Distri' | perl -pe 's/(.)/$1\0/g' ;;
+    *) printf '  PID COMMAND\n' ;;
+  esac
+  exit 255
+fi
+if [ -n "${SSH_PARTIAL:-}" ] && grep -qE "$SSH_PARTIAL" <<<"$line"; then
+  case "$cmd" in
+    *"--list --running"*) printf 'Windows Subsystem for Linux Distri' | perl -pe 's/(.)/$1\0/g' ;;
+    *) printf '  PID COMMAND\n' ;;
+  esac
+  exec sleep 900
+fi
 # $SSH_DOWN_AFTER is "<regex>|<dest>": once a line matching the regex has been handled, that
 # destination is unreachable for every later command -- an alias that dies mid-run, which is how a
 # cleanup ends up on an endpoint the start went out on and nothing answers any more.
@@ -221,20 +258,134 @@ if [ "$up" = 0 ]; then
   case "$cmd" in
     *tasklist*)          printf '%s\n' "${SSH_TASKLIST:-}" ;;
     *"reg query"*)       printf '%s\n' "${SSH_REG:-}" ;;
-    # The trap takes the NAP with it, the way wake-lab's own `capped` watchdog does: a shim holder
-    # that exits leaving its sleep behind leaves a child holding every descriptor it inherited --
-    # including the box's lab lock, which would then outlive the `unhold` that killed the holder.
+    # wsl.exe writes UTF-16LE, which is why this is piped through perl rather than printf'd: the
+    # NUL-interleaved bytes are what the script's `tr -d` has to survive, and a shim that answered
+    # in plain ASCII would pass a probe that cannot read a word the real one says.
+    *"--list --running"*)
+      if [ "${SSH_WSL_STOPPED:-0}" = 1 ]; then
+        printf 'There are no running distributions.\r\n' | perl -pe 's/(.)/$1\0/g'
+      else
+        printf 'Windows Subsystem for Linux Distributions:\r\nUbuntu (Default)\r\n' \
+          | perl -pe 's/(.)/$1\0/g'
+      fi ;;
+    # `ps` inside the guest, asked about one pid. The header is printed whether or not that pid
+    # exists, because the real one does: it is how the script tells "no such process" from "no
+    # answer at all", and a shim that printed nothing for a dead pid would let silence pass as
+    # evidence.
+    *"-e ps -eo pid -o args"*)
+      # The guest's process list. Every remote holder records itself as guest.<pid> and clears that
+      # on the way out, so the directory IS the list -- and the header is printed either way,
+      # because the real one is: it is how the script tells "no such process" from "no answer".
+      printf '  PID COMMAND\n'
+      for g in "$SSH_HOLD_DIR"/guest.*; do
+        [ -e "$g" ] || continue
+        printf '%s %s\n' "${g##*.}" "$(cat "$g")"
+      done ;;
+    # ...and ending that guest process, which is what `unhold` falls back to. It goes by the
+    # holder's command shape and not by pid, so that the match and the signal are one operation in
+    # the guest: the shim reads the same guest.<pid> files, which record that shape.
+    *"-e pkill -x -f "*)
+      pat=${cmd##* }
+      for g in "$SSH_HOLD_DIR"/guest.*; do
+        [ -e "$g" ] || continue
+        [ "$(cat "$g" | tr ' ' '.')" = "$pat" ] && kill "${g##*.}" 2>/dev/null
+      done ;;
+    *"-e sh -s "*)
+      # The client. It owns the channel and the pump, and NOT the remote.
+      chan="$SSH_HOLD_DIR/chan.$$"
+      mkfifo "$chan" 2>/dev/null
+      # `9>&- 8>&-`: the remote runs on ANOTHER MACHINE, so it cannot be holding this one's lab
+      # locks. Here it is a local child of the client and would inherit them -- and the hold lock
+      # rides fd 9 into the client deliberately, so a remote that kept a copy would hold that box
+      # locked for as long as it ran, which for the leak cases is forever. That is a property of
+      # the shim, not of the design, and it would make a release unable to take a lock the real one
+      # would find free.
+      "$SSH_REMOTE_HOLDER" "${cmd##* }" "$chan" 9>&- 8>&- & remote=$!
+      # A pump and not an `exec`: the client has to outlive its own stdin copy so that it can be
+      # signalled, and killing the pump is the only way a client can close the channel.
+      # `<&0` is not redundant. bash redirects an ASYNCHRONOUS command's stdin from /dev/null
+      # unless it is explicitly redirected, so a bare `cat > "$chan" &` pumps /dev/null: the
+      # channel reaches EOF the instant it opens, the remote holder ends immediately, and the whole
+      # suite reads as "the holder died the moment it started" with nothing wrong in the script.
+      cat <&0 > "$chan" 9>&- 8>&- & pump=$!
+      # The trap kills the PUMP alone. Killing the remote here would be the shim doing what
+      # Windows sshd does not, and every case below that asks whether the tree ended would be
+      # asking the shim instead of the script.
+      trap 'printf "HOLDER-TERMED %s\n" "$$" >> "$SSH_LOG"; kill "$pump" 2>/dev/null; rm -f "$chan"; exit 143' TERM
+      wait "$remote"
+      kill "$pump" 2>/dev/null; rm -f "$chan" ;;
+    # The holder every version before 2026-09-19 spawned, kept so that the cases about meeting one
+    # can spawn a real one. It does not read its stdin, so nothing but a signal ends it -- which is
+    # the defect, expressed as a shim.
     *"sleep infinity"*)  trap 'printf "HOLDER-TERMED %s\n" "$$" >> "$SSH_LOG"; kill -KILL $(jobs -p) 2>/dev/null; exit 143' TERM
-                         sleep "${SSH_HOLD_LIFE:-0}" & wait ;;
+                         sleep 86400 & wait ;;
   esac
 fi
 exit "$up"
 EOF
+# The remote holder: the guest shell `wsl.exe -d Ubuntu -e sh -s <token>` starts inside the VM.
+# It is a separate process from the client on purpose (see the shim's own note) and nothing the
+# client does can reach it -- it ends because its CHANNEL ended, which is the contract the holder
+# is built on, or it does not end, which is ludics-lite#192.
+cat > "$TMP/remote-holder.sh" <<'EOF'
+#!/usr/bin/env bash
+tok=$1; chan=$2
+guest="$SSH_HOLD_DIR/guest.$$"
+# What `ps -o args` in the guest would show. The token is in its argv on every side of the channel,
+# which is the whole of the lane identity: without it every wsl.exe on that box looks alike.
+printf 'sh -s %s\n' "$tok" > "$guest"
+trap 'rm -f "$guest"; printf "HOLDER-KILLED %s\n" "$$" >> "$SSH_LOG"; exit 143' TERM
+# A holder that ignores even a kill by pid: the leak nothing short of a restart-wsl can clear.
+[ "${SSH_REMOTE_LEAKS:-0}" = 2 ] && trap '' TERM
+# A holder that DIES under the lane, on demand -- the other fault, and not this one.
+if [ "${SSH_HOLD_LIFE:-0}" != 0 ]; then
+  ( sleep "$SSH_HOLD_LIFE"; kill -TERM "$$" 2>/dev/null ) &
+fi
+# `sh -s` reads its script off stdin and exits at EOF. The handshake is the only command it is ever
+# sent: `echo $1 $$ <nonce>`, which the guest shell expands to its token, its own pid, and the
+# nonce that call just made up -- so the reply cannot be an older reply, and cannot come from a
+# holder that does not have our token.
+while IFS= read -r line; do
+  case "$line" in
+    # SSH_HOLD_ANSWERS=0 is a guest shell that is running and says nothing back -- a hold that
+    # fails on its observation rather than on its connection. The mute FILE is the same thing for a
+    # holder that is already running: its environment was fixed when it was spawned, so a case that
+    # needs a live holder to go quiet partway through -- a reuse whose handshake fails -- has to be
+    # able to say so from outside it.
+    echo*) [ "${SSH_HOLD_ANSWERS:-1}" = 0 ] && continue
+           [ -e "$SSH_HOLD_DIR/mute" ] && continue
+           set -- $line; printf '%s %s %s\n' "$tok" "$$" "$4" ;;
+  esac
+done < "$chan"
+# EOF: the channel is gone. A real `sh` exits here.
+if [ "${SSH_REMOTE_LEAKS:-0}" != 0 ]; then
+  printf 'HOLDER-LEAKED %s\n' "$$" >> "$SSH_LOG"
+  while :; do sleep 1; done
+fi
+printf 'HOLDER-EOF %s\n' "$$" >> "$SSH_LOG"
+rm -f "$guest"
+EOF
+chmod +x "$TMP/remote-holder.sh"
 chmod +x "$TMP/bin/curl" "$TMP/bin/python3" "$TMP/bin/ssh"
 PATH="$TMP/bin:$PATH"; export PATH
 CURL_LOG="$TMP/curl.log"; export CURL_LOG
 SSH_LOG="$TMP/ssh.log"; export SSH_LOG
 SSH_DOWN_LIST="$TMP/ssh-down.list"; export SSH_DOWN_LIST
+SSH_REMOTE_HOLDER="$TMP/remote-holder.sh"; export SSH_REMOTE_HOLDER
+SSH_HOLD_DIR="$TMP/holders"; export SSH_HOLD_DIR
+mkdir -p "$SSH_HOLD_DIR"
+# Holders no longer expire on their own -- that is the point of them -- so the suite has to end the
+# ones its cases leave behind, or they outlive the run. Every remote holder records itself as
+# guest.<pid> and clears it on the way out, so the file list IS the list of what is still running.
+# SIGKILL because one of the cases deliberately runs a holder that ignores TERM.
+kill_stub_holders() {
+  local g
+  for g in "$SSH_HOLD_DIR"/guest.*; do
+    [ -e "$g" ] || continue
+    kill -KILL "${g##*.}" 2>/dev/null
+    rm -f "$g"
+  done
+}
 # Every run in this suite gets a scratch lab-lock directory, exported once here rather than passed
 # case by case. A case that forgot it would take the REAL lock under ~/.local/state/wake-lab --
 # and a `--hold` case leaves a holder carrying that lock, which would then refuse every later
@@ -442,30 +593,55 @@ out=$(kick "rog-nv-wsl" 2>&1); rc=$?
 # A kick returns at once and the VM then shuts down under whatever runs inside it: the 2026-09-15
 # sweep's hip unit died 76 s into an unheld VM that had powered off 18 s after its kick
 # (ludics-lite#155). An ssh session INSIDE the guest does not hold it, so the holder is a
-# Windows-side `wsl.exe -d Ubuntu -e sleep infinity`, and the VM counts as up only once such a
-# process is OBSERVED there -- a holder that failed to start is the exact state the flag exists to
-# rule out.
+# Windows-side `wsl.exe -d Ubuntu -e sh -s <token>`, and the VM counts as up only once that holder
+# has SAID ITS TOKEN BACK from inside the guest -- a holder that failed to start is the exact state
+# the flag exists to rule out, and counting wsl.exe in `tasklist`, which is what this observed
+# until 2026-09-19, was true of the owner's console shell too (ludics-lite#184 (a)).
 # A holder carries its box's lab lock for as long as it lives (that is the point: another
 # session's restart is then refused rather than destroying the lane). In this suite that means a
 # case which leaves a holder running would refuse every later case on that box, so each case that
 # does not continue from a previous holder starts from a clean state AND a free lock. Unlinking
 # the lock file is enough: the flock belongs to the inode, so the next take creates a new one.
 reset_hold_state() {
+  local rec
+  # The recorded LOCAL processes go too, and by record rather than by pattern: a holder's sidecar
+  # carries its box's hold lock for as long as it lives, so one left running by a case refuses
+  # every reservation in the cases after it -- which reads as a restart being refused by a lock
+  # nobody took, in a block that has nothing to do with holds. Fields 1 and 4 are the client and
+  # its sidecar. By record and not by a scan of the process table, because that table is shared
+  # with whatever else runs on this machine, including another copy of this suite.
+  # Each field is checked for being a real pid before it is signalled, and `0` is the reason why:
+  # a legacy record carries `0` in the sidecar field, and `kill 0` signals the caller's whole
+  # PROCESS GROUP -- which is this suite. It killed the run outright, silently, three cases later
+  # than the record that caused it.
+  local p sc
+  for rec in "$TMP/state"/hold-*.pid; do
+    [ -e "$rec" ] || continue
+    p=$(awk '{ print $1 }' "$rec"); sc=$(awk '{ print $4 }' "$rec")
+    case "$p" in ''|0|*[!0-9]*) ;; *) kill "$p" 2>/dev/null ;; esac
+    case "$sc" in ''|0|*[!0-9]*) ;; *) kill "$sc" 2>/dev/null ;; esac
+  done
+  kill_stub_holders
   rm -rf "$TMP/state"
   rm -f "$WAKE_LAB_LOCK_DIR"/*.lock
 }
 
-held_kick() { # held_kick <ssh-up> <tasklist output> [reg output] [holder lifetime] -- kick-wsl --hold rog
-  # The default lifetime is not 0: the script requires its own holder to still be running when it
-  # sees a wsl.exe on the Windows side, so a shim holder that exits instantly is an already-dead
-  # one, not a held VM.
-  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
-      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="$1" \
-      SSH_TASKLIST="$2" SSH_REG="${3:-}" SSH_HOLD_LIFE="${4:-20}" "$WL" kick-wsl --hold rog
+held_kick() { # held_kick <ssh-up> <answers?> [reg output] [holder lifetime] -- kick-wsl --hold rog
+  # The default lifetime is 0, which here means "does not expire": the holder ends when its channel
+  # does and at no other time, so a case that wants one dying under the lane asks for it.
+  # WAKE_LAB_HOLD_WAIT_SECONDS is the handshake's wait and not a settle any more -- there is
+  # nothing left to settle, because the token cannot come back before the holder is running.
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=3 \
+      WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="$1" \
+      SSH_HOLD_ANSWERS="$2" SSH_REG="${3:-}" SSH_HOLD_LIFE="${4:-0}" "$WL" kick-wsl --hold rog
 }
-unhold() { env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog; }
-# `tasklist /FI "IMAGENAME eq wsl.exe" /NH` prints one row per match and an INFO line when nothing
-# matches, so the image name in the output is the whole signal.
+# The release has remote work of its own now -- it asks the VM whether the guest shell is gone --
+# so the box has to be reachable for an unhold to be able to observe anything. The case that wants
+# an unreachable one says so.
+unhold() {
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="${1:-rog-lan}" \
+      "$WL" unhold rog
+}
 # `kill -0` alone is not a liveness test: a killed orphan whose init does not reap it promptly --
 # a container's PID 1, typically -- stays a zombie and answers it, which would read as "unhold did
 # not kill the holder" when it did.
@@ -477,42 +653,62 @@ alive() { # alive <pid>
   case "$st" in ''|*Z*) return 1 ;; esac
   return 0
 }
-TASKLIST_HELD='wsl.exe                       6412 Services                   0     12,345 K'
-TASKLIST_EMPTY='INFO: No tasks are running which match the specified criteria.'
+# What the second argument of held_kick means now. It used to be a `tasklist` reading, which was
+# the observation until 2026-09-19 and which #155's acceptance run showed certifying nothing: both
+# lab boxes already had a wsl.exe on the Windows side with no holder of ours running. The
+# observation is the token now, so the interesting axis is whether the holder answers it.
+HOLDER_ANSWERS=1        # the guest shell starts and says its token back
+HOLDER_SILENT=0         # ...and here it does not, which is a hold that failed
 
 reset_hold_state; : > "$SSH_LOG"
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" 2>&1); rc=$?
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'wsl holder started on rog (via rog-lan' <<<"$out" \
   && grep -q 'wsl holder observed on rog' <<<"$out" && grep -q 'wsl up' <<<"$out" \
   && ok "kick-wsl --hold spawns a Windows-side holder, observes it, and only then is the VM up (rc=$rc)" \
   || ko "kick-wsl --hold did not spawn and observe a holder (rc=$rc) -- $out"
-grep -q '^rog-lan :: wsl.exe -d Ubuntu -e sleep infinity$' "$SSH_LOG" \
-  && ok "...as sleep infinity over the alias that carried the kick" \
-  || ko "the holder command is not a sleep infinity over rog-lan: $(cat "$SSH_LOG")"
+grep -qE '^rog-lan :: wsl\.exe -d Ubuntu -e sh -s wlh-[A-Za-z0-9-]+$' "$SSH_LOG" \
+  && ok "...as a shell reading the channel, over the alias that carried the kick" \
+  || ko "the holder command is not a tokened sh -s over rog-lan: $(cat "$SSH_LOG")"
 # Never a sized sleep: a lane is several units with their own caps plus preparation outside them,
 # so a holder sized to the expected run expires under the last unit, silently (issue comment of
-# 2026-09-15). A lane ends by unhold.
+# 2026-09-15). A lane ends by unhold. A shell waiting for input cannot expire at all, which is a
+# stronger version of the same property -- but the scan stays, because the payload is one edit away
+# from being a sleep again.
 grep -qE 'sleep [0-9]' "$SSH_LOG" \
   && ko "the holder was sized with a fixed sleep, which expires under the last unit: $(cat "$SSH_LOG")" \
   || ok "...never a fixed sleep N"
-grep -qE '^rog-nv-wsl :: .*(sleep infinity|tasklist)' "$SSH_LOG" \
+grep -qE '^rog-nv-wsl :: .*(sh -s|ps -o args|--list --running)' "$SSH_LOG" \
   && ko "a holder command reached the -wsl guest, where it would die with the VM it holds: $(cat "$SSH_LOG")" \
   || ok "...and never inside the guest, which would die with the VM it is meant to hold"
-grep -q '^rog-lan :: tasklist' "$SSH_LOG" \
-  && ok "...with the observation read from the Windows side" \
-  || ko "no tasklist query went to the Windows side: $(cat "$SSH_LOG")"
-[ -s "$TMP/state/hold-rog.pid" ] \
-  && ok "...and the holder's pid is recorded, so a later shell can end it" \
-  || ko "no pid recorded under $TMP/state"
+# The observation is the token and nothing else. `tasklist` is not merely unnecessary now, it is
+# WRONG: #155's acceptance run found both lab boxes already showing a wsl.exe with no holder of
+# ours running, so a hold that consulted it would still be reading a probe that cannot fail.
+grep -q 'tasklist' "$SSH_LOG" \
+  && ko "the hold still reads tasklist, which was true on both boxes with nothing of ours running: $(cat "$SSH_LOG")" \
+  || ok "...with no tasklist reading anywhere in the hold"
+grep -qE 'wsl holder observed on rog \(guest shell [0-9]+ in the VM answered its token' <<<"$out" \
+  && ok "...and what the hold reports is a token that came back THROUGH the VM, with the pid that sent it" \
+  || ko "the hold did not report a token answered from inside the guest -- $out"
+# The token is this lane's identity, so it has to be in the record as well as in the payload: it is
+# what lets a later `unhold`, in another shell, tell our holder from any other wsl.exe on that box.
+rec=$(cat "$TMP/state/hold-rog.pid" 2>/dev/null)
+tok=$(awk '{ print $5 }' <<<"$rec"); gpid=$(awk '{ print $6 }' <<<"$rec")
+case "$rec" in
+  *"wlh-"*) ok "...and the record carries the lane's token ($tok) and its guest pid ($gpid)" ;;
+  *) ko "the record does not carry the lane's identity: $rec" ;;
+esac
+grep -q -- "$tok" "$SSH_LOG" \
+  && ok "...the same token the holder was spawned with, so the record names THAT holder" \
+  || ko "the recorded token is not the one in the payload: $rec; $(cat "$SSH_LOG")"
 # The control that makes the case above mean something: a plain kick holds nothing.
 : > "$SSH_LOG"; kick "rog-lan rog-nv-wsl" >/dev/null 2>&1
-grep -q 'sleep infinity' "$SSH_LOG" && ko "a kick without --hold spawned a holder: $(cat "$SSH_LOG")" \
+grep -q -- '-e sh -s' "$SSH_LOG" && ko "a kick without --hold spawned a holder: $(cat "$SSH_LOG")" \
   || ok "a kick without --hold spawns no holder"
 
 # The whole point of observing: with the guest answering but NO wsl.exe on the Windows side, the
 # old code's `wsl up` would hand the sweep a VM nothing holds.
 reset_hold_state; : > "$SSH_LOG"
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_EMPTY" 2>&1); rc=$?
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_SILENT" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ! grep -q 'wsl up' <<<"$out" \
   && grep -q 'wsl HOLD FAILED on: rog' <<<"${out##*$'\n'}" \
   && ok "a VM whose holder is not observed on the Windows side is never 'wsl up', and says so last (rc=$rc)" \
@@ -525,8 +721,8 @@ out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_EMPTY" 2>&1); rc=$?
 # fixed. A VM THIS run created is shut down again, so the unit records honest non-coverage.
 reset_hold_state; : > "$SSH_LOG"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
-      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
-      SSH_TASKLIST="$TASKLIST_EMPTY" "$WL" restart-wsl --hold rog 2>&1); rc=$?
+ WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+      SSH_HOLD_ANSWERS="$HOLDER_SILENT" "$WL" restart-wsl --hold rog 2>&1); rc=$?
 [ "$rc" -ne 0 ] && grep -q 'wsl shut down on rog (via rog-lan): a fresh VM that cannot be held' <<<"$out" \
   && awk '/^rog-lan :: wsl.exe -d Ubuntu -e true$/ { t = NR } /^rog-lan :: wsl.exe --shutdown$/ { s = NR } END { exit !(t && s && t < s) }' "$SSH_LOG" \
   && ok "a fresh VM whose hold failed is shut down again rather than left for the sweep (rc=$rc)" \
@@ -539,8 +735,8 @@ grep -q 'so it was shut down again: those units record no coverage' <<<"${out##*
 # unheld VM up. Here the LAN side dies the moment the observation runs.
 reset_hold_state; : > "$SSH_LOG"; : > "$SSH_DOWN_LIST"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
-      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-win" \
-      SSH_TASKLIST="$TASKLIST_EMPTY" SSH_DOWN_AFTER='tasklist|rog-lan' SSH_HOLD_LIFE=20 \
+ WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-win" \
+      SSH_HOLD_ANSWERS="$HOLDER_SILENT" SSH_DOWN_AFTER='sh -s|rog-lan' \
       "$WL" restart-wsl --hold rog 2>&1); rc=$?
 [ "$rc" -ne 0 ] && grep -q 'wsl shut down on rog (via rog-nv-win)' <<<"$out" \
   && grep -q 'so it was shut down again' <<<"${out##*$'\n'}" \
@@ -551,7 +747,7 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HO
 # But never a VM that was already there: on a plain kick the guest may be the owner's, and taking
 # it away over a failed hold of ours would be a nasty surprise.
 reset_hold_state; : > "$SSH_LOG"
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_EMPTY" 2>&1); rc=$?
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_SILENT" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ! grep -q -- '--shutdown' "$SSH_LOG" \
   && ok "...while a plain kick-wsl --hold never shuts down a VM it did not create (rc=$rc)" \
   || ko "a failed hold shut down a VM this run did not create (rc=$rc) -- $(cat "$SSH_LOG")"
@@ -565,7 +761,7 @@ grep -q 'the VM is up and UNHELD and was not shut down: do not sweep that box' <
 
 # unhold ends the holder explicitly, which is the only way a lane ends.
 reset_hold_state; : > "$SSH_LOG"
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1)
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1)
 hold_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
 if [ -n "$hold_pid" ] && alive "$hold_pid"; then
   ok "the holder is a live process while the lane runs (pid $hold_pid)"
@@ -581,15 +777,525 @@ alive "$hold_pid" \
   || ok "...and the holder really is gone"
 [ ! -f "$TMP/state/hold-rog.pid" ] && ok "...leaving no pid file behind" \
   || ko "unhold left the pid file in place"
+
+# --- the teardown: the holder ends with its CHANNEL, and unhold claims only what it observed -----
+# ludics-lite#192. Windows sshd does not reap the command tree when the client is killed: its
+# session process exits without taking its children, and the old holder -- a `sleep infinity` that
+# never touched its stdio -- had no way to notice, so a dead channel produced no EPIPE and no exit.
+# Every unhold on live hardware left one cmd.exe + two wsl.exe + a guest sleep behind, while
+# saying "the VM is unheld from now on". These fixtures could not have caught it: a shim that
+# answers the holder command in ONE process ends everything when it is killed. This one models the
+# client and the remote separately and gives the client no reach into the remote, so what ends the
+# remote here is what has to end it on the box -- EOF on a channel nobody writes to any more.
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+guest=$(awk '{ print $6 }' "$TMP/state/hold-rog.pid" 2>/dev/null)
+: > "$SSH_LOG"
+out=$(unhold 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q "its guest shell (pid $guest) is gone from the VM, observed over rog-lan" <<<"$out" \
+  && ok "unhold observes the guest shell gone from the VM before it claims anything (rc=$rc)" \
+  || ko "unhold claimed a release it did not observe (rc=$rc) -- $out"
+grep -q "HOLDER-EOF $guest" "$SSH_LOG" \
+  && ok "...and what ended the remote was its CHANNEL reaching EOF, not anything that reached it" \
+  || ko "the remote holder did not end on EOF: $(cat "$SSH_LOG")"
+# By OUR guest pid, over the alias the RECORD names. "No wsl.exe on that box" was never available
+# as evidence -- on both lab boxes it was false with nothing of ours running -- so the question the
+# release asks is about this lane's process and no other.
+grep -q "^rog-lan :: wsl.exe -d Ubuntu -e ps -eo pid -o args$" "$SSH_LOG" \
+  && ok "...asked of the VM itself, over the alias the record names" \
+  || ko "the release did not ask the VM for its process list: $(cat "$SSH_LOG")"
+# By TOKEN, not by the recorded pid: a hold whose handshake never answered has a token in its
+# payload and no guest pid to have recorded, and that is the holder most in need of being found.
+grep -q 'ps -eo pid -o args' "$SSH_LOG" && ! grep -q -- '-p [0-9]' "$SSH_LOG" \
+  && ok "...for the whole list, which a holder with no recorded guest pid can still be found in" \
+  || ko "the release can only ask about a pid it recorded: $(cat "$SSH_LOG")"
+
+# ...and asking must never START the VM. `wsl.exe -e` boots a stopped distro, so a release that
+# went straight to the guest would bring up the box it had just let go -- and a distro that is not
+# running has already answered the question, because a guest shell cannot outlive its guest.
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+      SSH_WSL_STOPPED=1 "$WL" unhold rog 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'is gone from the VM, observed over rog-lan' <<<"$out" \
+  && ok "a stopped distro answers the whole question, and the release says so (rc=$rc)" \
+  || ko "a stopped distro was not read as a holder gone (rc=$rc) -- $out"
+grep -q -- 'wsl.exe -d Ubuntu -e' "$SSH_LOG" \
+  && ko "the release ran a command inside a stopped VM, which boots it: $(cat "$SSH_LOG")" \
+  || ok "...without running anything in the guest, which would have booted the VM it just released"
+
+# A holder that OUTLIVES its channel is the defect itself, reproduced: SSH_REMOTE_LEAKS makes the
+# remote ignore EOF exactly as the Windows tree did. The release must not repeat the old sentence
+# over it. It has a pid in that VM and a token to recognize it by -- which is what #184 (b) is for,
+# and which is the whole difference from 2026-09-17, when the only cure on record was a
+# host-global restart-wsl that destroys every other session on the box.
+reset_hold_state
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+    WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
+    SSH_REMOTE_LEAKS=1 "$WL" kick-wsl --hold rog >/dev/null 2>&1
+guest=$(awk '{ print $6 }' "$TMP/state/hold-rog.pid" 2>/dev/null)
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+      WAKE_LAB_HOLD_TEARDOWN_SECONDS=4 "$WL" unhold rog 2>&1); rc=$?
+grep -q "guest shell (pid $guest) is STILL RUNNING in the VM" <<<"$out" \
+  && ok "a holder that outlived its channel is caught rather than reported as a release" \
+  || ko "a leaked holder was reported as a clean release (rc=$rc) -- $out"
+[ "$rc" -eq 0 ] && grep -q 'ended: the guest shell is gone' <<<"$out" \
+  && ok "...and ended by pid over the recorded alias, which the token is what makes possible (rc=$rc)" \
+  || ko "the leaked holder was not ended (rc=$rc) -- $out"
+ls "$SSH_HOLD_DIR"/guest.* >/dev/null 2>&1 \
+  && ko "the guest shell is still running after unhold: $(cat "$SSH_HOLD_DIR"/guest.* 2>/dev/null)" \
+  || ok "...leaving nothing of ours in the VM"
+
+# ...and when even that does not end it, the box IS still pinned, and the one thing the release
+# must not do is say otherwise. rc 3 and not rc 2: the lane's results are fine, the BOX is not,
+# and a sweep told rc 2 would discard good work over a box it should be complaining about.
+reset_hold_state
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+    WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
+    SSH_REMOTE_LEAKS=2 "$WL" kick-wsl --hold rog >/dev/null 2>&1
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+      WAKE_LAB_HOLD_TEARDOWN_SECONDS=4 "$WL" unhold rog 2>&1); rc=$?
+[ "$rc" -eq 3 ] && grep -q 'is still pinned by a holder of ours' <<<"$out" \
+  && ok "a holder that survives even the kill leaves rc 3 and says the box is still pinned (rc=$rc)" \
+  || ko "a pinned box was not reported as one (rc=$rc) -- $out"
+grep -q 'the VM is unheld from now on' <<<"$out" \
+  && ko "the release still claims the VM is unheld while a holder of ours runs in it -- $out" \
+  || ok "...and never says the VM is unheld, which is the sentence #192 was filed about"
+reset_hold_state
+
+# An unverified teardown keeps its record, and says so in its exit status. The box going quiet
+# between the kill and the probe is exactly when the guest pid and token matter most: they are the
+# only things that could ever end that tree short of a restart-wsl, and a release that deleted them
+# while printing a warning would leave a retry with nothing to work from (review round 1, P1).
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+guest=$(awk '{ print $6 }' "$TMP/state/hold-rog.pid" 2>/dev/null)
+tok=$(awk '{ print $5 }' "$TMP/state/hold-rog.pid" 2>/dev/null)
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog 2>&1); rc=$?
+[ "$rc" -eq 3 ] && grep -q 'did not answer, so this does NOT claim the VM is unheld' <<<"$out" \
+  && ok "a release that could not reach the box leaves rc 3, not a clean 0 (rc=$rc)" \
+  || ko "an unverified teardown reported success (rc=$rc) -- $out"
+grep -q "$tok" "$TMP/state/hold-rog.pid" 2>/dev/null && grep -q " $guest " "$TMP/state/hold-rog.pid" 2>/dev/null \
+  && ok "...and KEEPS the guest pid and token, which are what a retry would need" \
+  || ko "the unverified release threw away the identity that could end the tree: $(cat "$TMP/state/hold-rog.pid" 2>/dev/null)"
+# ...and the retry, once the box answers, finishes the job off that record rather than reading the
+# leftover as a completed release and clearing it.
+out=$(unhold 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q "guest shell (pid $guest) is gone from the VM" <<<"$out" \
+  && ok "...so a later unhold picks the job up and confirms the VM over the record it kept (rc=$rc)" \
+  || ko "the retry did not finish the unverified teardown (rc=$rc) -- $out"
+[ ! -f "$TMP/state/hold-rog.pid" ] \
+  && ok "...and only then is the record cleared" \
+  || ko "a confirmed release left its record behind"
+
+# A release must remove only ITS OWN state. Between the kill and the cleanup it now asks the VM a
+# question that takes time, and the hold lock went with the sidecar at the top -- so another
+# session's --hold can take the box and write its record, fifo and stdout file at those very paths
+# inside that window. Unlinking them would leave that holder running, locked and UNRECORDED, with
+# an open fifo that does not even notice (review round 1, P1).
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+( env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" SSH_DELAY=3 \
+      "$WL" unhold rog > "$TMP/slow-unhold.out" 2>&1 ) &
+slow=$!
+sleep 2
+# The competing run: its record names a different holder and a different token.
+printf '777777 rog-lan %s 0 wlh-other-0-0 424242 protected\n' "$(date +%s)" > "$TMP/state/hold-rog.pid"
+: > "$TMP/state/hold-rog.out"; rm -f "$TMP/state/hold-rog.in"; mkfifo "$TMP/state/hold-rog.in"
+if alive "$slow"; then
+  wait "$slow"
+  [ -f "$TMP/state/hold-rog.pid" ] && grep -q 'wlh-other-0-0' "$TMP/state/hold-rog.pid" \
+    && ok "a release leaves alone a record that has come to name another run's holder" \
+    || ko "the release deleted the next run's record: $(cat "$TMP/slow-unhold.out")"
+  [ -p "$TMP/state/hold-rog.in" ] \
+    && ok "...and its channel with it, which an open fifo would not have survived losing" \
+    || ko "the release unlinked the next run's channel: $(cat "$TMP/slow-unhold.out")"
+  grep -q "now names another run's holder" "$TMP/slow-unhold.out" \
+    && ok "...and says so rather than leaving the swap unremarked" \
+    || ko "the release said nothing about the record it declined to remove: $(cat "$TMP/slow-unhold.out")"
+else
+  wait "$slow"
+  ko "the case did not stage its window: the unhold finished before the competing record was written"
+fi
+rm -f "$TMP/state/hold-rog.pid" "$TMP/state/hold-rog.in" "$TMP/state/hold-rog.out"
+
+# A reuse that recovers a guest pid the original --hold never got to record must write it back: the
+# interrupted run left a record with pid 0, and without the write-back the eventual unhold takes
+# the no-pid path and cannot check the VM or end a survivor by pid (review round 1, P2).
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+real_guest=$(awk '{ print $6 }' "$TMP/state/hold-rog.pid")
+awk '{ $6 = 0; print }' "$TMP/state/hold-rog.pid" > "$TMP/state/hold-rog.pid.new"
+mv "$TMP/state/hold-rog.pid.new" "$TMP/state/hold-rog.pid"
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q "guest shell $real_guest answered its token" <<<"$out" \
+  && ok "a reuse recovers the guest pid of a record whose handshake never completed (rc=$rc)" \
+  || ko "the reuse did not re-prove the holder (rc=$rc) -- $out"
+# ...and REPORTS it without writing it back. This path holds no lock -- the holder it is reusing
+# owns the box's -- so a rewrite here can resurrect a record an overlapping unhold has just
+# cleared, or land on the record of whichever run took the freed lock next (review round 3->4).
+# It is safe to drop because the cleanup probe asks by TOKEN: a record with guest pid 0 names its
+# holder just as well as one without.
+[ "$(awk '{ print $6 }' "$TMP/state/hold-rog.pid")" = 0 ] \
+  && ok "...and does not write it back into a record it cannot hold a lock over" \
+  || ko "the reuse rewrote a record it is not serialized against: $(cat "$TMP/state/hold-rog.pid")"
+out=$(unhold 2>&1); rc=$?
+# No pid in the message, and that is the point: with none recorded and none found (the shell is
+# gone), there is no pid to name -- while the VERDICT still comes from the token probe, which is
+# what a record with guest pid 0 is now enough for.
+[ "$rc" -eq 0 ] && grep -q 'is gone from the VM, observed over rog-lan' <<<"$out" \
+  && ok "...and the release still confirms the VM by token, with no pid recorded (rc=$rc)" \
+  || ko "the release could not confirm without a recorded pid (rc=$rc) -- $out"
+reset_hold_state
+
+# Both record writes are CHECKED. The second one is not stageable from here -- it needs the state
+# directory to stop being writable between the claim and the handshake -- so the guard is on the
+# invocation, the way the ps -ww one is: an unchecked write would report a hold established over a
+# record with no guest pid in it, which is the one thing the release cannot work without (review
+# round 1, P2). Continuations are joined first, since the redirection sits on a later line.
+unchecked=$(sed -e :a -e '/\\$/N; s/\\\n//; ta' "$WL" | grep -n 'printf .*> "\$f"' | grep -v '!  *printf\|! printf')
+[ -z "$unchecked" ] \
+  && ok "every write of the holder's record is checked, so no hold is reported over an unusable one" \
+  || ko "a record write goes unchecked: $unchecked"
+
+# A CAPPED probe establishes nothing, whatever it printed first. `capped` kills the wedged command
+# and the substitution keeps the bytes that arrived before it did: a `wsl --list` cut off before
+# "Ubuntu" and a `ps` cut off before its process row both look exactly like "gone" to anything that
+# reads the output without the status. Reporting that as a verified release would delete the guest
+# pid and token over a holder that may still be running (review round 2, P1).
+for probe in 'list --running' 'ps -eo pid'; do
+  reset_hold_state
+  held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+  out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+        WAKE_LAB_PROBE_CAP=2 SSH_PARTIAL="$probe" "$WL" unhold rog 2>&1); rc=$?
+  [ "$rc" -eq 3 ] && grep -q 'did not answer, so this does NOT claim the VM is unheld' <<<"$out" \
+    && [ -f "$TMP/state/hold-rog.pid" ] \
+    && ok "a '$probe' probe that printed and then wedged is unverified, not a release (rc=$rc)" \
+    || ko "partial output from a capped '$probe' was read as a verified release (rc=$rc) -- $out"
+done
+reset_hold_state
+
+# ...and the same rule after the by-pid kill: if the box goes quiet there, whether the kill landed
+# is unknown, which is not the same as a holder confirmed still running and is certainly not a
+# release. Both keep the record; only one of them is a fact (review round 2, P1).
+reset_hold_state
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+    WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
+    SSH_REMOTE_LEAKS=1 "$WL" kick-wsl --hold rog >/dev/null 2>&1
+guest=$(awk '{ print $6 }' "$TMP/state/hold-rog.pid" 2>/dev/null)
+: > "$SSH_DOWN_LIST"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+      WAKE_LAB_HOLD_TEARDOWN_SECONDS=4 SSH_DOWN_AFTER='-e pkill|rog-lan' "$WL" unhold rog 2>&1); rc=$?
+[ "$rc" -eq 3 ] && grep -q 'stopped answering, so whether that kill landed is unknown' <<<"$out" \
+  && ok "a post-kill probe that cannot reach the box is unknown, not a confirmed survivor (rc=$rc)" \
+  || ko "an unreachable post-kill probe was classified as a confirmed leak (rc=$rc) -- $out"
+[ -f "$TMP/state/hold-rog.pid" ] && grep -q " $guest " "$TMP/state/hold-rog.pid" \
+  && ok "...and it keeps the record, which is what a retry would finish the job from" \
+  || ko "the record was deleted after an unknown kill: $(ls "$TMP/state")"
+: > "$SSH_DOWN_LIST"; reset_hold_state
+
+# The compare-and-delete is SERIALIZED, not merely careful: the identity check and the unlink are
+# two operations, so the release takes the box's hold lock for the whole stretch -- the same lock a
+# holder carries, and the one the sidecar has just dropped. A `--hold` arriving mid-release is then
+# refused by the interlock instead of racing it (review round 2, P1).
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+slow_sidecar=$(awk '{ print $4 }' "$TMP/state/hold-rog.pid" 2>/dev/null)
+( env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" SSH_DELAY=3 \
+      "$WL" unhold rog > "$TMP/slow-unhold2.out" 2>&1 ) &
+slow=$!
+# Synchronize on the LOCK, not on the clock: the release cannot take it until the holder it killed
+# is really gone, and `kill -0` can keep answering past a fixed sleep -- so a timed wait can launch
+# the competitor into a window that has not opened, where winning the lock is legitimate and the
+# case fails for the wrong reason (review round 3, P2, reproduced by the reviewer).
+# The sidecar holds that lock until it sees its holder go, and it looks with `kill -0` -- which a
+# ZOMBIE answers. The holder here is orphaned when wake-lab exits, so on a system whose PID 1 does
+# not reap promptly (a container) it stays a zombie, the sidecar never lets go, and the competing
+# hold below would be refused by a stale lock rather than by the release. The reviewer hit exactly
+# that. So the fixture ends the sidecar itself if the lock has not come free (review round 6, P2).
+locked=0
+for i in $(seq 1 20); do
+  grep -q '^wake-lab unhold (pid' "$WAKE_LAB_LOCK_DIR/rog.hold.lock" 2>/dev/null && { locked=1; break; }
+  [ "$i" = 5 ] && [ -n "$slow_sidecar" ] && kill "$slow_sidecar" 2>/dev/null
+  sleep 1
+done
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+if [ "$locked" = 1 ] && alive "$slow"; then
+  wait "$slow"
+  [ "$rc" -ne 0 ] && grep -q 'already spoken for' <<<"$out" && grep -q 'unhold (pid' <<<"$out" \
+    && ok "a --hold arriving mid-release is refused by the lock the release holds (rc=$rc)" \
+    || ko "a --hold raced a release instead of being refused by it (rc=$rc) -- $out"
+else
+  wait "$slow"
+  ko "the case did not stage its window: the release never held the lock while the hold ran"
+fi
+reset_hold_state
+
+# A release that could not confirm keeps its record AND its marker, so the next --hold meets an
+# unfinished release rather than stale state. It must not simply delete them and start a second
+# holder: the first one would be untracked, still pinning the VM, and would outlive the release of
+# the one about to be spawned. It finishes the old job first (review round 2, P1).
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+old_guest=$(awk '{ print $6 }' "$TMP/state/hold-rog.pid" 2>/dev/null)
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+[ -f "$TMP/state/hold-rog.pid" ] && [ -f "$TMP/state/hold-rog.releasing" ] \
+  && ok "an unconfirmed release leaves both its record and its marker for the next run to find" \
+  || ko "the unconfirmed release did not leave its pending state behind"
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'confirming the VM is free of it before taking the box' <<<"$out" \
+  && grep -q "guest shell (pid $old_guest) is gone from the VM" <<<"$out" \
+  && ok "...and the next --hold finishes it before taking the box (rc=$rc)" \
+  || ko "a new hold ignored the pending release (rc=$rc) -- $out"
+grep -q 'wsl holder observed on rog' <<<"$out" \
+  && ok "...then takes the box normally once the VM says the old holder is gone" \
+  || ko "the hold did not proceed after finishing the pending release -- $out"
+unhold >/dev/null 2>&1; reset_hold_state
+
+# ...and when the old holder is NOT gone, the new hold is refused rather than stacking a second
+# one over a survivor nothing records.
+reset_hold_state
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+    WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
+    SSH_REMOTE_LEAKS=2 "$WL" kick-wsl --hold rog >/dev/null 2>&1
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+: > "$SSH_LOG"
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'may still be running in the VM' <<<"$out" \
+  && ! grep -q -- '-e sh -s' "$SSH_LOG" \
+  && ok "a hold over a survivor of an unfinished release is refused, and spawns nothing (rc=$rc)" \
+  || ko "a second holder was stacked over an untracked survivor (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+reset_hold_state
+
+# A hold whose handshake never answered is the holder most in need of an identity, not least: the
+# guest shell may have started anyway, and if it survives its channel -- the #192 shape -- killing
+# the client and deleting the record leaves it pinning the VM with nothing naming it, while every
+# later unhold reports no holder recorded. So the failed path asks the VM by token before it
+# discards anything (review round 3, P1).
+reset_hold_state
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=2 \
+      WAKE_LAB_HOLD_TEARDOWN_SECONDS=4 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+      SSH_HOLD_ANSWERS="$HOLDER_SILENT" SSH_REMOTE_LEAKS=2 "$WL" kick-wsl --hold rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'Its record is KEPT' <<<"$out" \
+  && grep -q 'wlh-' "$TMP/state/hold-rog.pid" 2>/dev/null \
+  && ok "a failed hold whose guest shell survived keeps the token that names it (rc=$rc)" \
+  || ko "a failed hold discarded the identity of a survivor (rc=$rc) -- $out"
+# ...and that retained token is usable: the release finds the process by it, with no guest pid ever
+# having been recorded, where the old code would have said there was no holder at all.
+out=$(unhold 2>&1); rc=$?
+[ "$rc" -eq 3 ] && grep -q 'still pinned by a holder of ours' <<<"$out" \
+  && ! grep -q 'no wsl holder recorded' <<<"$out" \
+  && ok "...and a later unhold names that survivor by token, rather than reporting no holder (rc=$rc)" \
+  || ko "the retained token did not let the release find the survivor (rc=$rc) -- $out"
+reset_hold_state
+
+# ...and neither is a connection that DROPS after the header. ssh returns its own 255 for that,
+# which is not the remote command's status and says nothing about the VM -- but the header is
+# already in the command substitution, so anything reading output before status accepts it, finds
+# no token, and calls the holder gone (review round 4, P1).
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+      SSH_DROP='ps -eo pid' "$WL" unhold rog 2>&1); rc=$?
+[ "$rc" -eq 3 ] && grep -q 'did not answer, so this does NOT claim the VM is unheld' <<<"$out" \
+  && [ -f "$TMP/state/hold-rog.pid" ] \
+  && ok "a probe whose connection dropped after the header is unverified, not a release (rc=$rc)" \
+  || ko "an ssh error status was consumed as a complete probe (rc=$rc) -- $out"
+reset_hold_state
+
+# ...and the confirmation is gated on the RECORD, not on the release marker beside it. The marker
+# can fail to be written (a state filesystem briefly full) and it is absent entirely when a holder
+# DIED rather than being released -- the #237 shape, whose orphan the lore says nothing can name.
+# Either way a record carrying a token could mean a holder of ours is still in that VM, and that is
+# the only question a new hold has to answer before discarding it (review round 5, P1).
+reset_hold_state
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+    WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
+    SSH_REMOTE_LEAKS=2 "$WL" kick-wsl --hold rog >/dev/null 2>&1
+# The holder dies with no unhold at all, so nothing writes a marker -- and its remote survives.
+kill "$(awk '{ print $1 }' "$TMP/state/hold-rog.pid")" 2>/dev/null
+for _ in 1 2 3 4 5; do alive "$(awk '{ print $1 }' "$TMP/state/hold-rog.pid")" || break; sleep 1; done
+rm -f "$TMP/state/hold-rog.releasing"
+# The hold lock goes with the holder, but its sidecar only notices on its next poll -- and it looks
+# with `kill -0`, which a ZOMBIE answers, so where PID 1 does not reap promptly it never lets go.
+# Ending it explicitly is what makes this case behave the same in a container as on a Mac, and the
+# loop has a postcondition so a lock that never frees fails the case instead of quietly turning it
+# into a test of a stale refusal (review round 8, P2, reproduced by the reviewer).
+kill "$(awk '{ print $4 }' "$TMP/state/hold-rog.pid" 2>/dev/null)" 2>/dev/null
+lock_free=0
+for _ in $(seq 1 15); do
+  if ( exec 7>>"$WAKE_LAB_LOCK_DIR/rog.hold.lock"
+       perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7 ); then
+    lock_free=1; break
+  fi
+  sleep 1
+done
+[ "$lock_free" = 1 ] \
+  || ko "the dead holder's sidecar never released rog's hold lock, so the case below tests a stale refusal"
+: > "$SSH_LOG"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+      WAKE_LAB_HOLD_TEARDOWN_SECONDS=4 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+      SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" "$WL" kick-wsl --hold rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'has a holder on record whose client is gone' <<<"$out" \
+  && grep -q 'may still be running in the VM' <<<"$out" \
+  && ! grep -q -- '-e sh -s' "$SSH_LOG" \
+  && ok "a tokened record with NO marker still blocks a new hold over a survivor (rc=$rc)" \
+  || ko "a hold discarded a tokened record without confirming the VM (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+reset_hold_state
+
+# A live holder with a release marker beside it is one being ended right now: `unhold` writes that
+# marker before it signals the client. Reusing it hands the lane a holder that disappears under it
+# moments later, and returns 0 while doing so (review round 15, P1).
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+: > "$TMP/state/hold-rog.releasing"
+: > "$SSH_LOG"
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'being released right now' <<<"$out" \
+  && ! grep -q -- '-e sh -s' "$SSH_LOG" \
+  && ok "a hold over a holder being released is refused, not reused (rc=$rc)" \
+  || ko "a hold reused a holder an unhold was about to kill (rc=$rc) -- $out"
+rm -f "$TMP/state/hold-rog.releasing"
+unhold >/dev/null 2>&1; reset_hold_state
+
+# A holder taken with --force never held the box's hold lock, so nothing refused another session's
+# restart-wsl while it ran. That is a property of the LANE, read long afterwards by whoever cleans
+# it up, so it goes in the record and not only in the line that scrolled past at the time (#184 b).
+reset_hold_state
+printf 'wake-lab --hold (pid 999, since 20260919T000000Z)\n' > "$WAKE_LAB_LOCK_DIR/rog.hold.lock"
+perl -e 'use Fcntl ":flock"; open(F, "+<", $ARGV[0]) or die; flock(F, LOCK_EX | LOCK_NB) or die;
+         print "held\n"; sleep 300' "$WAKE_LAB_LOCK_DIR/rog.hold.lock" > "$TMP/extlock.out" 2>&1 &
+extlock=$!
+for _ in 1 2 3 4 5; do grep -q held "$TMP/extlock.out" 2>/dev/null && break; sleep 1; done
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+      WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
+      "$WL" kick-wsl --hold --force rog 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'proceeds WITHOUT the hold lock (--force)' <<<"$out" \
+  && ok "--force takes a hold over another session's lock, and says so (rc=$rc)" \
+  || ko "--force did not take the hold over a held lock (rc=$rc) -- $out; $(cat "$TMP/extlock.out")"
+awk '{ print $7 }' "$TMP/state/hold-rog.pid" 2>/dev/null | grep -qx unprotected \
+  && ok "...and the record says the box was never protected, for whoever reads it later" \
+  || ko "a --force holder is recorded as protected: $(cat "$TMP/state/hold-rog.pid" 2>/dev/null)"
+out=$(unhold 2>&1)
+grep -q 'taken with --force and never held' <<<"$out" \
+  && ok "...and the release says it too, which is where a lane's cleanup reads it" \
+  || ko "the release did not report an unprotected hold -- $out"
+
+# ...and a later --hold over that unprotected holder does not merely warn about it. Returning
+# success there would have start_wsl report the VM as held while another session's restart-wsl can
+# still take it mid-lane, which is the one claim --hold exists to make truthfully. The lock the
+# forced run could not get is often free by later, and a live holder can be given a new
+# lock-carrying sidecar over its existing pid (review round 7, P1).
+reset_hold_state
+printf 'wake-lab --hold (pid 999, since 20260919T000000Z)\n' > "$WAKE_LAB_LOCK_DIR/rog.hold.lock"
+perl -e 'use Fcntl ":flock"; open(F, "+<", $ARGV[0]) or die; flock(F, LOCK_EX | LOCK_NB) or die;
+         print "held\n"; sleep 300' "$WAKE_LAB_LOCK_DIR/rog.hold.lock" > "$TMP/extlock2.out" 2>&1 &
+extlock2=$!
+for _ in 1 2 3 4 5; do grep -q held "$TMP/extlock2.out" 2>/dev/null && break; sleep 1; done
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+    WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
+    "$WL" kick-wsl --hold --force rog >/dev/null 2>&1
+# ...and while that lock is STILL held, an ordinary --hold over the unprotected holder is refused
+# rather than reported as a successful hold: `wsl up` is read as "the VM is held", and this one can
+# still be destroyed mid-lane by another session's restart-wsl (review round 9, P1).
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'carries no' <<<"$out" && ! grep -q '^wsl up$' <<<"$out" \
+  && ok "a reuse that cannot repair a --force holder's protection is refused, not reported up (rc=$rc)" \
+  || ko "an unprotected holder was reported as a held VM (rc=$rc) -- $out"
+# ...unless this run says --force too, which is how a caller accepts an unprotected box.
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=5 \
+      WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
+      "$WL" kick-wsl --hold --force rog 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'NOT protected' <<<"$out" \
+  && ok "...while --force accepts it and says what it is accepting (rc=$rc)" \
+  || ko "--force did not carry the unprotected reuse (rc=$rc) -- $out"
+# The lock's owner goes away, as the run that held it would at the end of its own lane.
+kill "$extlock2" 2>/dev/null; wait "$extlock2" 2>/dev/null
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'has now taken rog.s hold lock for it' <<<"$out" \
+  && [ "$(awk '{ print $7 }' "$TMP/state/hold-rog.pid")" = protected ] \
+  && ok "a reuse takes the lock a --force holder never had, and records that it is protected (rc=$rc)" \
+  || ko "an unprotected holder was reused as a protected one (rc=$rc) -- $out; $(cat "$TMP/state/hold-rog.pid")"
+# ...and the protection is real, not a word in a file: the box is now refused to a destroyer.
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_STATE_DIR="$TMP/state" \
+      SSH_UP="rog-lan rog-nv-wsl" "$WL" restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'REFUSED' <<<"$out" \
+  && ok "...so another session's restart-wsl is refused over a holder that used to be unprotected" \
+  || ko "the newly taken hold lock refuses nothing (rc=$rc) -- $out"
+unhold >/dev/null 2>&1
+kill "$extlock" 2>/dev/null; wait "$extlock" 2>/dev/null
+rm -f "$WAKE_LAB_LOCK_DIR"/*.lock
+
+# The hold-lock sidecar is identified by ITS OWN holder, not by the tag every lane on this machine
+# shares. A stale record whose sidecar number has been recycled onto a SIBLING box's sidecar would
+# otherwise release that box's hold lock, leaving a live lane's VM open to another session's
+# restart-wsl -- the 2026-09-16 failure, reached through a cleanup (#184 b).
+reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+rog_sidecar=$(awk '{ print $4 }' "$TMP/state/hold-rog.pid" 2>/dev/null)
+printf '999999 minix-lan %s %s wlh-stale-0-0 0 protected\n' "$(date +%s)" "$rog_sidecar" \
+  > "$TMP/state/hold-minix.pid"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold minix >/dev/null 2>&1
+alive "$rog_sidecar" \
+  && ok "one box's stale record does not kill another box's sidecar, which carries its hold lock" \
+  || ko "unhold minix killed rog's sidecar (pid $rog_sidecar) and unlocked a live lane's box"
+if ( exec 7>>"$WAKE_LAB_LOCK_DIR/rog.hold.lock"
+     perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7 ); then
+  ko "...and rog's hold lock went with it: another session's restart-wsl would now take that VM"
+else
+  ok "...so rog's hold lock is still held and its VM is still protected"
+fi
+unhold >/dev/null 2>&1
+
+# A hold taken by an OLDER version of this script: no token, a payload that does not read its
+# stdin, and therefore a tree that will outlive its channel whatever this run does. A lane is a
+# sequence of commands and the script is updated between them, so this record is a shape that will
+# actually turn up -- and the one thing that must not happen is for it to be treated as a stale
+# record naming somebody else's process, or as a holder this script can speak for.
+reset_hold_state
+mkdir -p "$TMP/state"
+SSH_UP="rog-lan" ssh -o BatchMode=yes rog-lan wsl.exe -d Ubuntu -e sleep infinity &
+legacy=$!
+sleep 1
+# Four fields: the record shape before the token, the guest pid and the protection flag existed.
+printf '%s rog-lan %s 0\n' "$legacy" "$(date +%s)" > "$TMP/state/hold-rog.pid"
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'predates the token handshake' <<<"$out" \
+  && ok "a holder from before the handshake is not claimed as observed (rc=$rc)" \
+  || ko "a legacy holder was reported as proved (rc=$rc) -- $out"
+alive "$legacy" \
+  && ok "...and it is left running, not killed as a record naming something else" \
+  || ko "the legacy holder was killed as an unrecognized process"
+out=$(unhold 2>&1); rc=$?
+# rc 3, not 0: the release ended the client it could reach and cannot say the box is free, and a
+# caller reading 0 there treats a possibly pinned VM as clean -- which the runbook now does
+# explicitly (review round 11, P1).
+[ "$rc" -eq 3 ] && grep -q 'carries no token' <<<"$out" \
+  && ! grep -q 'is gone from the VM' <<<"$out" \
+  && ok "...and its release ends it, says it cannot tell whether the tree went, and exits 3 (rc=$rc)" \
+  || ko "the legacy release claimed an observation it cannot make (rc=$rc) -- $out"
+for _ in 1 2 3 4 5; do alive "$legacy" || break; sleep 1; done
+alive "$legacy" && ko "the legacy holder survived its unhold" \
+  || ok "...having really ended the client it could reach"
+# Reaped, not merely killed: this is a background job of the SUITE's shell, and the concurrency
+# cases below `wait` for every one of them. A legacy holder left unreaped is a `sleep 86400` that
+# the next bare `wait` blocks on for the rest of the run.
+kill "$legacy" 2>/dev/null; wait "$legacy" 2>/dev/null
+reset_hold_state
 # A lane's cleanup runs on the way out of a FAILED lane too, so unhold over nothing is not an error.
 expect "unhold with no holder recorded says so and still succeeds" 0 "no wsl holder recorded for rog" -- \
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
 # Cleanup must not be blocked by configuration: the holder is a local pid, and a site file that
 # went missing after the lane started would otherwise strand the one process that pins the VM.
 reset_hold_state
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1)
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1)
 stranded=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
-out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog 2>&1); rc=$?
+# SSH_UP because the claim is about the missing TABLE: the release's own observation goes to the
+# alias the record names, which it reads from that record and not from the site file, so a box that
+# answers is what lets this case fail for the reason it is about.
+out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+      "$WL" unhold rog 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'wsl holder released on rog' <<<"$out" \
   && ok "unhold releases the holder even with no host table, which it needs nothing from (rc=$rc)" \
   || ko "a missing site file stranded the holder (rc=$rc) -- $out"
@@ -613,10 +1319,15 @@ grep -q 'stopped being RESERVED' <<<"$out" \
 # telling a run whose unhold has not come back to chase it) leaves a record naming a pid that
 # unhold itself deliberately ended. Reporting that as a lost holder would mark valid lane results
 # suspect, so the release writes its intent down BEFORE the kill and a retry reads it.
-mkdir -p "$TMP/state"; printf '999999 rog-lan 1 0\n' > "$TMP/state/hold-rog.pid"
+# A TOKENED leftover, which is what a modern interrupted release leaves: the retry re-probes the
+# VM over that token, finds nothing of ours (no such guest here), and only then calls it complete.
+# A tokenless leftover is a different answer now -- nothing can check it, so it stays unverified --
+# and that is the legacy shape, tested with the legacy holder further down.
+mkdir -p "$TMP/state"
+printf '999999 rog-lan 1 0 wlh-gone-0-0 4242 protected\n' > "$TMP/state/hold-rog.pid"
 : > "$TMP/state/hold-rog.releasing"
 expect "an interrupted unhold's leftover record is a completed release, not a lost holder" 0 "was already ended by an earlier unhold" -- \
-  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
+  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog
 grep -q 'ANOMALY' <<<"$out" \
   && ko "a deliberate release was reported as a lost holder -- $out" \
   || ok "...and raises no anomaly, so the lane's results are not called suspect"
@@ -626,11 +1337,11 @@ grep -q 'ANOMALY' <<<"$out" \
 # holder, which is the one thing this reporting exists to catch.
 reset_hold_state
 mkdir -p "$TMP/state"; : > "$TMP/state/hold-rog.releasing"
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1)
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1)
 [ ! -f "$TMP/state/hold-rog.releasing" ] \
   && ok "a fresh hold clears a stale release marker, so the next lost holder is still reported" \
   || ko "a stale release marker survived a fresh hold -- it would mask the next loss -- $out"
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 # Two unholds racing over one box must never report an intentional release as a loss. The marker
 # alone does not close this: the record can vanish between one run's entry and its own checks,
 # which is why an absent record is read as "a release completed" rather than as evidence. Note what
@@ -641,11 +1352,11 @@ env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold 
 race_bad=0
 for i in 1 2 3; do
   reset_hold_state
-  held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
-  ( env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog \
-      > "$TMP/race-a" 2>&1; echo $? > "$TMP/race-a.rc" ) &
-  ( env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog \
-      > "$TMP/race-b" 2>&1; echo $? > "$TMP/race-b.rc" ) &
+  held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+  ( env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+      "$WL" unhold rog > "$TMP/race-a" 2>&1; echo $? > "$TMP/race-a.rc" ) &
+  ( env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+      "$WL" unhold rog > "$TMP/race-b" 2>&1; echo $? > "$TMP/race-b.rc" ) &
   wait
   if grep -q 'ANOMALY' "$TMP/race-a" "$TMP/race-b" 2>/dev/null; then
     race_bad=$((race_bad + 1)); echo "  race $i raised an anomaly: $(cat "$TMP/race-a" "$TMP/race-b")"
@@ -669,14 +1380,14 @@ fi
 # Every box's holder runs the same payload, so a signature that did not include the destination
 # would let one box's stale file kill another box's LIVE holder -- dropping that lane silently.
 reset_hold_state
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1)
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1)
 rog_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
 printf '%s minix-lan\n' "$rog_pid" > "$TMP/state/hold-minix.pid"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold minix 2>&1)
 grep -q 'had already exited' <<<"$out" && alive "$rog_pid" \
   && ok "a stale file for one box does not kill another box's live holder" \
   || ko "unhold minix killed rog's holder, or claimed it as its own -- $out"
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 # The pid file outlives the shell that wrote it, and pids are reused: a stale one whose number has
 # been taken over by something else must not get that process killed.
 sleep 30 & innocent=$!
@@ -708,8 +1419,8 @@ expect "...and --restart-wsl --hold without --wait" 1 "hold needs a WSL start" -
 reset_hold_state; : > "$TMP/notadir"
 : > "$SSH_LOG"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
-      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/notadir/state" \
-      SSH_UP="rog-lan rog-nv-wsl" SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=20 \
+ WAKE_LAB_STATE_DIR="$TMP/notadir/state" \
+      SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" \
       "$WL" kick-wsl --hold rog 2>&1); rc=$?
 [ "$rc" -ne 0 ] && grep -q 'wsl HOLD FAILED on: rog' <<<"$out" \
   && grep -q 'could NOT be recorded at .*; nothing was started' <<<"$out" \
@@ -718,21 +1429,21 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HO
 # The wording is the evidence for the ordering: the record is claimed (noclobber) BEFORE the ssh
 # exists, so there is no window in which a holder runs that nothing can unhold. Spawning first and
 # killing on a failed write leaves that window, and says "killed rather than leaked" instead.
-grep -q 'sleep infinity' "$SSH_LOG" \
+grep -q -- '-e sh -s' "$SSH_LOG" \
   && ko "a holder was spawned before its record was claimed: $(cat "$SSH_LOG")" \
   || ok "...with no holder command issued at all"
 rm -f "$TMP/notadir"
 # The same claim serializes two --hold runs for one box: the second reuses the live holder rather
 # than spawning a second one whose pid the first would never see.
 reset_hold_state
-held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
 : > "$SSH_LOG"
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1); rc=$?
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'wsl holder already running for rog' <<<"$out" \
-  && ! grep -q 'sleep infinity' "$SSH_LOG" \
+  && ! grep -q -- '-e sh -s' "$SSH_LOG" \
   && ok "a second --hold over a live holder reuses it and spawns no second one (rc=$rc)" \
   || ko "a second --hold spawned another holder (rc=$rc) -- $out; $(cat "$SSH_LOG")"
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 
 # `wsl --shutdown` is HOST-GLOBAL, so a restart on a held box destroys the VM the holder is keeping
 # alive, and the holder with it -- the 2026-09-16 loss, from inside the flag meant to prevent it.
@@ -741,12 +1452,12 @@ env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold 
 # protects every other tool. A plain kick stays available because it has no shutdown to refuse and
 # is the recovery command for a box with no VM.
 reset_hold_state
-held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
 lane_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
 : > "$SSH_LOG"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
-      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
-      SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=30 "$WL" restart-wsl --hold rog 2>&1); rc=$?
+ WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+      SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" "$WL" restart-wsl --hold rog 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ! grep -q -- '--shutdown' "$SSH_LOG" \
   && grep -q "wsl restart REFUSED on: rog (a lab lock is held" <<<"${out##*$'\n'}" \
   && grep -q 'wake-lab --hold' <<<"$out" && alive "$lane_pid" \
@@ -785,13 +1496,13 @@ alive "$lane_pid" \
   && ok "...with the holder still running, so the VM it protects is not the price of that" \
   || ko "the holder died while the lane lock was being taken"
 : > "$SSH_LOG"
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1); rc=$?
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'wsl holder already running for rog' <<<"$out" && ! grep -q -- '--shutdown' "$SSH_LOG" \
   && ok "...while a plain kick-wsl --hold on the same box is still allowed and reuses the holder (rc=$rc)" \
   || ko "the refusal also blocked the recovery kick (rc=$rc) -- $out"
 # ...and unhold gives the box back: the kill releases the flock with it, so the restart that was
 # refused a moment ago goes through with nothing to reclaim.
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 : > "$SSH_LOG"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_STATE_DIR="$TMP/state" \
       SSH_UP="rog-lan rog-nv-wsl" "$WL" restart-wsl rog 2>&1); rc=$?
@@ -806,56 +1517,73 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_ST
 # one (older than a minute: its creator died inside a single fork) is cleared.
 reset_hold_state; mkdir -p "$TMP/state"; : > "$TMP/state/hold-rog.pid"
 : > "$SSH_LOG"
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" 2>&1); rc=$?
-[ "$rc" -ne 0 ] && grep -q 'is being created by another run' <<<"$out" && ! grep -q 'sleep infinity' "$SSH_LOG" \
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'is being created by another run' <<<"$out" && ! grep -q -- '-e sh -s' "$SSH_LOG" \
   && ok "a claim another run is still filling in is not cleared, and no second holder is spawned (rc=$rc)" \
   || ko "an in-progress claim was taken over (rc=$rc) -- $out; $(cat "$SSH_LOG")"
 touch -t 202001010000 "$TMP/state/hold-rog.pid"
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 2>&1); rc=$?
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'wsl holder started on rog' <<<"$out" \
   && ok "...while an abandoned claim is taken over rather than blocking the hold forever (rc=$rc)" \
   || ko "an abandoned claim blocked the hold (rc=$rc) -- $out"
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 
 # A holder this call merely REUSED belongs to an earlier invocation that may still be protecting a
 # running lane. A failed probe here must not kill it: that would unhold that lane's VM, which is
 # the failure the flag exists to prevent, caused by a retry.
 reset_hold_state
-held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
 other_pid=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_EMPTY" 2>&1); rc=$?
+# The earlier run's holder goes quiet -- a guest that is running and not answering, which is what
+# a reuse's failed handshake looks like from here. Muting it is the only way to fail the RETRY's
+# probe: SSH_HOLD_ANSWERS is fixed in the holder's environment when it is spawned, and this holder
+# was spawned answering.
+: > "$SSH_HOLD_DIR/mute"
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1); rc=$?
+rm -f "$SSH_HOLD_DIR/mute"
 [ "$rc" -ne 0 ] && grep -q 'belongs to an earlier run: left running and recorded' <<<"$out" \
   && alive "$other_pid" && [ -s "$TMP/state/hold-rog.pid" ] \
   && ok "a failed hold does not kill a holder it reused from an earlier run (rc=$rc)" \
   || ko "a failed retry unheld the earlier run's VM (rc=$rc) -- $out"
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 
-# The settle belongs to the HOLDER, not to the invocation: a run that reuses a holder another run
-# started a moment ago has to wait out the rest of that holder's settle, or it certifies an ssh
-# that may still be inside its ConnectTimeout.
+# A REUSED holder is observed over the alias the RECORD names, not over the one this invocation
+# happens to be kicking on (ludics-lite#184 (b)). The two come apart whenever the first alias stops
+# answering mid-lane, which is the case that matters: the holder's channel is the holder's channel,
+# and a probe sent down some other route is evidence about a different connection to the same box.
+# Here the hold is taken over rog-lan, rog-lan then goes dark, and the second --hold rides
+# rog-nv-win -- and still has to prove THAT holder is alive, down the channel it already has.
 reset_hold_state
-held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 30 >/dev/null 2>&1
-started=$SECONDS
-# The step's own deadline bounds the settle too (a settle that outlived HOLD_WAIT_SECONDS would
-# be a hold with no bound at all), so this case gives the step room and lets the settle bind.
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
+first_guest=$(awk '{ print $6 }' "$TMP/state/hold-rog.pid" 2>/dev/null)
+: > "$SSH_LOG"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=30 \
-      WAKE_LAB_HOLD_SETTLE_SECONDS=6 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
-      SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=30 "$WL" kick-wsl --hold rog 2>&1); rc=$?
-elapsed=$((SECONDS - started))
-[ "$rc" -eq 0 ] && grep -q 'wsl holder already running for rog' <<<"$out" && [ "$elapsed" -ge 4 ] \
-  && ok "a reused holder still has to clear its own settle (${elapsed}s against a 6s settle)" \
-  || ko "reusing a holder skipped the settle (rc=$rc, ${elapsed}s) -- $out"
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+ WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-nv-win rog-nv-wsl" \
+      SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" "$WL" kick-wsl --hold rog 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'wsl holder already running for rog (pid .*, via rog-lan)' <<<"$out" \
+  && grep -q "answered its token over rog-lan" <<<"$out" \
+  && ok "a reused holder is observed over the alias its record names, not the one this kick rode (rc=$rc)" \
+  || ko "the reuse path observed over the wrong alias (rc=$rc) -- $out"
+# ...and it is the same holder, proved fresh: the reply carries a nonce this invocation made up, so
+# a holder that had died would fail here rather than pass on the line it printed when it started.
+grep -q "answered its token over rog-lan" <<<"$out" \
+  && grep -q "guest shell $first_guest answered" <<<"$out" \
+  && ok "...and the answer comes from the same guest shell ($first_guest) that the record names" \
+  || ko "the reuse path did not re-prove the recorded holder -- $out"
+grep -q -- '-e sh -s' "$SSH_LOG" \
+  && ko "the reuse path spawned a second holder: $(cat "$SSH_LOG")" \
+  || ok "...with no second holder spawned"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 
 # The wake path carries the hold too, and its final verdict is the hold's as well.
-wake_hold() { # wake_hold <tasklist output>
+wake_hold() { # wake_hold <answers?>
   env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WAIT_SECONDS=1 \
-      WAKE_LAB_HOLD_WAIT_SECONDS=1 WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" \
-      SSH_UP="rog-lan rog-nv-wsl" SSH_TASKLIST="$1" SSH_HOLD_LIFE=20 \
+      WAKE_LAB_HOLD_WAIT_SECONDS=1 WAKE_LAB_STATE_DIR="$TMP/state" \
+      SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$1" \
       "$WL" --wait --restart-wsl --hold rog
 }
 reset_hold_state
-out=$(wake_hold "$TASKLIST_HELD" 2>&1); rc=$?
+out=$(wake_hold "$HOLDER_ANSWERS" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'wsl holder observed on rog' <<<"$out" && grep -q '^all up$' <<<"${out##*$'\n'}" \
   && ok "--wait --restart-wsl --hold ends in all up with the holder observed (rc=$rc)" \
   || ko "the wake path did not hold the fresh VM (rc=$rc) -- $out"
@@ -878,9 +1606,9 @@ if ( exec 7>>"$WAKE_LAB_LOCK_DIR/rog.hold.lock"
 else
   ok "...while the hold lock IS held, so another session's restart-wsl is still refused"
 fi
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 reset_hold_state
-out=$(wake_hold "$TASKLIST_EMPTY" 2>&1); rc=$?
+out=$(wake_hold "$HOLDER_SILENT" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ! grep -q '^all up$' <<<"$out" && grep -q 'NOT all up: wsl HOLD FAILED on: rog' <<<"${out##*$'\n'}" \
   && ok "...and is NOT all up when nothing holds the VM it just started (rc=$rc)" \
   || ko "the wake path said all up over an unheld VM (rc=$rc) -- $out"
@@ -899,7 +1627,7 @@ reg_out() { # reg_out <start> <end> <smart> -- as `reg query` prints the key, CR
   printf '    SmartActiveHoursState    REG_DWORD    %s\r\n' "$3"
 }
 reset_hold_state; : > "$SSH_LOG"
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0xa 0x1 0x0)" 2>&1)
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" "$(reg_out 0xa 0x1 0x0)" 2>&1)
 grep -q 'ACTIVE HOURS WARNING on rog: sweep window 7-11 falls outside active hours 10-1' <<<"$out" \
   && grep -q 'uncovered hours: 7 8 9' <<<"$out" \
   && ok "the preflight warns when the sweep window falls outside active hours, naming the hours" \
@@ -919,7 +1647,7 @@ grep -q 'repair with scripts/enable-active-hours-windows.ps1 on the box (elevate
 # drift. Every warning about the BOX's own values carries it, whichever branch printed it.
 for fixture in '0x18 0x18 0x0' '0x6 0x6 0x0' '0x6 0x0 0x1'; do
   # shellcheck disable=SC2086 # the fixture is three fields, deliberately split
-  branch=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out $fixture)" 2>&1)
+  branch=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" "$(reg_out $fixture)" 2>&1)
   grep -q 'ACTIVE HOURS WARNING' <<<"$branch" \
     && grep -q 'repair with scripts/enable-active-hours-windows.ps1 on the box (elevated PowerShell)' <<<"$branch" \
     && ok "...on every branch that warns about the box's values ($fixture)" \
@@ -934,28 +1662,28 @@ grep -q "WAKE_LAB_SWEEP_HOURS='morning' is not" <<<"$out" \
   && ! grep -q 'enable-active-hours-windows.ps1' <<<"$out" \
   && ok "...but a sweep-window misconfiguration on this side does not point at the box's script" \
   || ko "the WAKE_LAB_SWEEP_HOURS warning names a repair on the box -- $out"
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 2>&1)
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" "" 2>&1)
 grep -q 'could not read ActiveHoursStart/End' <<<"$out" \
   && ! grep -q 'enable-active-hours-windows.ps1' <<<"$out" \
   && ok "...and an unreadable registry names no repair, knowing of no setting to fix" \
   || ko "the unreadable-registry warning claimed a repair -- $out"
 # The quiet path: the 6-to-0 maximum the boxes now pin covers a morning sweep, and a check that
 # warned there too would be one nobody reads.
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x6 0x0 0x0)" 2>&1); rc=$?
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" "$(reg_out 0x6 0x0 0x0)" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'active hours on rog: 6-0 cover the sweep window 7-11 (smart=0)' <<<"$out" \
   && ! grep -q 'ACTIVE HOURS WARNING' <<<"$out" \
   && ok "...and is quiet under the 6-to-0 maximum the boxes pin, reporting what it read (rc=$rc)" \
   || ko "the covered case warned, or said nothing about what it read (rc=$rc) -- $out"
 # Smart active hours means Windows moves the window itself, so the pinned values are not in force.
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x6 0x0 0x1)" 2>&1)
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" "$(reg_out 0x6 0x0 0x1)" 2>&1)
 grep -q 'SmartActiveHoursState=1 lets Windows move them' <<<"$out" \
   && ok "...but warns when SmartActiveHoursState is on, whatever the values say" \
   || ko "a covered window with smart active hours on went unremarked -- $out"
 # A window that wraps midnight is read on both sides of it.
 out=$(env WAKE_LAB_SWEEP_HOURS=23-2 WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 \
-      WAKE_LAB_HOLD_WAIT_SECONDS=1 WAKE_LAB_HOLD_SETTLE_SECONDS=0 \
+      WAKE_LAB_HOLD_WAIT_SECONDS=1 \
       WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
-      SSH_TASKLIST="$TASKLIST_HELD" SSH_REG="$(reg_out 0x6 0x0 0x0)" SSH_HOLD_LIFE=20 \
+      SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" SSH_REG="$(reg_out 0x6 0x0 0x0)" \
       "$WL" kick-wsl --hold rog 2>&1)
 grep -q 'uncovered hours: 0 1' <<<"$out" && ! grep -q 'uncovered hours:.*23' <<<"$out" \
   && ok "...and a sweep window that wraps midnight is judged hour by hour across it" \
@@ -963,9 +1691,9 @@ grep -q 'uncovered hours: 0 1' <<<"$out" && ! grep -q 'uncovered hours:.*23' <<<
 # `08-11` is the natural way to write a morning window, and bash reads a leading zero as octal:
 # the arithmetic would die on the 8 and abort a check that promises only to warn.
 out=$(env WAKE_LAB_SWEEP_HOURS=08-11 WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 \
-      WAKE_LAB_HOLD_WAIT_SECONDS=1 WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" \
-      SSH_UP="rog-lan rog-nv-wsl" SSH_TASKLIST="$TASKLIST_HELD" SSH_REG="$(reg_out 0xa 0x1 0x0)" \
-      SSH_HOLD_LIFE=20 "$WL" kick-wsl --hold rog 2>&1); rc=$?
+      WAKE_LAB_HOLD_WAIT_SECONDS=1 WAKE_LAB_STATE_DIR="$TMP/state" \
+      SSH_UP="rog-lan rog-nv-wsl" SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" SSH_REG="$(reg_out 0xa 0x1 0x0)" \
+ "$WL" kick-wsl --hold rog 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'uncovered hours: 8 9' <<<"$out" && ! grep -qi 'value too great\|base' <<<"$out" \
   && ok "...and a zero-padded sweep window is read as decimal, not as octal (rc=$rc)" \
   || ko "a zero-padded window aborted the warn-only check (rc=$rc) -- $out"
@@ -989,31 +1717,31 @@ done
 # Equal endpoints are not a 24-hour window: Windows allows at most 18 hours, so 6-6 is a reset or
 # malformed setting, and reading it as "every hour protected" would print the quiet line over a box
 # with no protection at all.
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x6 0x6 0x0)" 2>&1); rc=$?
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" "$(reg_out 0x6 0x6 0x0)" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'a span Windows cannot mean' <<<"$out" && ! grep -q 'cover the sweep window' <<<"$out" \
   && ok "equal active-hours endpoints are a warning, not a day-long window (rc=$rc)" \
   || ko "6-6 was read as full coverage (rc=$rc) -- $out"
 # The same bound from the other side: Windows allows at most 18 hours, so 1-23 is as impossible as
 # 6-6, and it covers the sweep window on paper -- which is how an invalid setting would stay quiet.
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x1 0x17 0x0)" 2>&1); rc=$?
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" "$(reg_out 0x1 0x17 0x0)" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'active hours read as 1-23, a span Windows cannot mean' <<<"$out" \
   && ! grep -q 'cover the sweep window' <<<"$out" \
   && ok "...and so is a span longer than the 18 h Windows maximum (rc=$rc)" \
   || ko "a 22-hour active window was read as coverage (rc=$rc) -- $out"
 # The pinned maximum itself must stay quiet: 6-0 is exactly 18 h.
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x6 0x0 0x0)" 2>&1)
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" "$(reg_out 0x6 0x0 0x0)" 2>&1)
 grep -q 'active hours on rog: 6-0 cover the sweep window' <<<"$out" && ! grep -q 'cannot mean' <<<"$out" \
   && ok "...while the 18 h maximum the boxes pin is still the quiet path" \
   || ko "the 6-to-0 window the boxes pin was rejected -- $out"
 # Numeric is not valid: 24-24 reaches the equal-endpoint branch, which would call every hour
 # covered and print the quiet line over a box whose update protection is nonsense.
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "$(reg_out 0x18 0x18 0x0)" 2>&1); rc=$?
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" "$(reg_out 0x18 0x18 0x0)" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'active hours read as 24-24, which are not clock hours' <<<"$out" \
   && ! grep -q 'cover the sweep window' <<<"$out" \
   && ok "...and registry values that are not clock hours are a warning, not a covered window (rc=$rc)" \
   || ko "24-24 was read as a covered window (rc=$rc) -- $out"
 # Unreadable is its own answer: the box may still be swept, but nothing is known about its updates.
-out=$(held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 2>&1); rc=$?
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" "" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && grep -q 'ACTIVE HOURS WARNING on rog: could not read ActiveHoursStart/End' <<<"$out" \
   && ok "an unreadable registry warns without failing the hold (rc=$rc)" \
   || ko "an unreadable registry was silent, or failed the hold (rc=$rc) -- $out"
@@ -1036,29 +1764,36 @@ grep -q 'active hours on rog: not read (no Windows endpoint answered)' <<<"$out"
 # whose start actually went out.
 reset_hold_state; : > "$SSH_LOG"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
-      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_WSL_START_CAP=2 WAKE_LAB_PROBE_CAP=3 \
+ WAKE_LAB_WSL_START_CAP=2 WAKE_LAB_PROBE_CAP=3 \
       WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" SSH_HANG='rog-lan :: wsl\.exe -d Ubuntu -e true' \
-      SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=30 "$WL" kick-wsl --hold rog 2>&1); rc=$?
-grep -q '^rog-lan :: wsl.exe -d Ubuntu -e sleep infinity$' "$SSH_LOG" \
+      SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" "$WL" kick-wsl --hold rog 2>&1); rc=$?
+grep -qE '^rog-lan :: wsl\.exe -d Ubuntu -e sh -s wlh-' "$SSH_LOG" \
   && ok "the holder rides the alias whose start went out, not the one that answered nothing" \
   || ko "the holder was put on the wrong alias after a capped start (rc=$rc) -- $out; $(cat "$SSH_LOG")"
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 
-# Every remote command the hold adds is capped, for the reason the kick's are: ConnectTimeout
-# bounds the connect, not the remote command, so an accepted session whose `tasklist` never
-# returns would stop the hold's own deadline from advancing and hang the sweep behind it. The shim
-# wedges with `exec sleep 900`, so a run that FINISHES at all proves the cap fired.
+# Every remote command the RELEASE adds is capped, for the reason the kick's are: ConnectTimeout
+# bounds the connect, not the remote command, so an accepted session whose `wsl.exe --list` never
+# returns would hang the one command that has to work when everything else is wedged -- unhold is
+# how a lane ends, and a lane that cannot end leaves the box held. The shim wedges with
+# `exec sleep 900`, so a run that FINISHES at all proves the cap fired.
+# The hold itself no longer has a capped probe to test: its observation is the handshake, which
+# travels down a channel that already exists and asks the network for nothing.
 reset_hold_state
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
 started=$SECONDS
-out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
-      WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_PROBE_CAP=2 WAKE_LAB_STATE_DIR="$TMP/state" \
-      SSH_UP="rog-lan rog-nv-wsl" SSH_HANG='tasklist' SSH_TASKLIST="$TASKLIST_HELD" \
-      SSH_HOLD_LIFE=30 "$WL" kick-wsl --hold rog 2>&1); rc=$?
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_PROBE_CAP=2 WAKE_LAB_STATE_DIR="$TMP/state" \
+      SSH_UP="rog-lan" SSH_HANG='list --running' "$WL" unhold rog 2>&1); rc=$?
 elapsed=$((SECONDS - started))
-[ "$rc" -ne 0 ] && [ "$elapsed" -lt 90 ] && grep -q 'wsl HOLD FAILED on: rog' <<<"$out" \
-  && ok "a wedged tasklist is cut short rather than hanging the hold (${elapsed}s)" \
-  || ko "the holder observation was not capped (rc=$rc, ${elapsed}s) -- $out"
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+[ "$rc" -eq 3 ] && [ "$elapsed" -lt 90 ] && grep -q 'wsl holder released on rog' <<<"$out" \
+  && ok "a wedged wsl --list is cut short rather than hanging the unhold (${elapsed}s, rc=$rc)" \
+  || ko "the release's observation was not capped (rc=$rc, ${elapsed}s) -- $out"
+# ...and a cap that fired is NOT evidence. The release ran, the box said nothing, and the one thing
+# it must not do is fill that silence in with the sentence #192 was filed about.
+grep -q 'did not answer, so this does NOT claim the VM is unheld' <<<"$out" \
+  && ok "...and a probe that told it nothing is reported as nothing, not as an unheld VM" \
+  || ko "a wedged observation was read as a released VM -- $out"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 
 # A caller that READS the command's output must not wait for the lane. The holder and the process
 # that keeps its lab lock both outlive the command by design, so anything of theirs still holding
@@ -1069,34 +1804,44 @@ env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold 
 reset_hold_state
 started=$SECONDS
 env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
-    WAKE_LAB_HOLD_SETTLE_SECONDS=0 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
-    SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=45 "$WL" kick-wsl --hold rog 2>&1 | cat >/dev/null
+ WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+    SSH_HOLD_ANSWERS="$HOLDER_ANSWERS" "$WL" kick-wsl --hold rog 2>&1 | cat >/dev/null
 elapsed=$((SECONDS - started))
 [ "$elapsed" -lt 20 ] \
   && ok "a held lane does not hold its caller's pipe open behind it (${elapsed}s against a 45s holder)" \
   || ko "reading the command's output waited for the holder (${elapsed}s): something of the lane's holds the pipe"
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 
-# A settle cut short by the step's own deadline is not a settle served: the holder has not shown
-# it outlived its own ConnectTimeout, so the hold must fail rather than report it observed.
+# A handshake the wait cuts short is not a handshake served: nothing has come back through the VM,
+# so the hold must fail rather than report a holder observed -- and, because that failed hold
+# SPAWNED something, it must leave nothing of it behind. A failed hold that leaks a guest process
+# is the same defect as ludics-lite#192 one step earlier: a VM pinned by a process no record names.
 reset_hold_state
-out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=1 \
-      WAKE_LAB_HOLD_SETTLE_SECONDS=30 WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
-      SSH_TASKLIST="$TASKLIST_HELD" SSH_HOLD_LIFE=45 "$WL" kick-wsl --hold rog 2>&1); rc=$?
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 WAKE_LAB_HOLD_WAIT_SECONDS=2 \
+ WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan rog-nv-wsl" \
+      SSH_HOLD_ANSWERS="$HOLDER_SILENT" "$WL" kick-wsl --hold rog 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ! grep -q 'holder observed on rog' <<<"$out" \
   && grep -q 'wsl HOLD FAILED on: rog' <<<"$out" \
-  && ok "a settle the step's deadline cut short is not reported as a holder observed (rc=$rc)" \
-  || ko "an unserved settle read as success (rc=$rc) -- $out"
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+  && ok "a handshake the wait cut short is not reported as a holder observed (rc=$rc)" \
+  || ko "an unanswered handshake read as success (rc=$rc) -- $out"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -z "$(echo "$SSH_HOLD_DIR"/guest.*)" ] && break
+  ls "$SSH_HOLD_DIR"/guest.* >/dev/null 2>&1 || break
+  sleep 1
+done
+ls "$SSH_HOLD_DIR"/guest.* >/dev/null 2>&1 \
+  && ko "a failed hold left a guest shell running in the VM: $(cat "$SSH_HOLD_DIR"/guest.* 2>/dev/null)" \
+  || ok "...and the guest shell it spawned ended with the channel it was reached over"
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 # ...and the lock process is identified before it is signalled, exactly as the holder is: a record
 # outlives both, and by the time anyone runs `unhold` the number may belong to something else.
 reset_hold_state
-held_kick "rog-lan rog-nv-wsl" "$TASKLIST_HELD" "" 45 >/dev/null 2>&1
+held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" >/dev/null 2>&1
 sc_pid=$(cut -d' ' -f4 "$TMP/state/hold-rog.pid" 2>/dev/null)
 sleep 30 & bystander=$!
 printf '%s rog-lan %s %s\n' "$(cut -d' ' -f1 "$TMP/state/hold-rog.pid")" "$(date +%s)" "$bystander" \
   > "$TMP/state/hold-rog.pid"
-env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog >/dev/null 2>&1
+env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" "$WL" unhold rog >/dev/null 2>&1
 alive "$bystander" \
   && ok "a recorded lock pid that is not the lock process is left alone by unhold" \
   || ko "unhold killed an unrelated process recorded as the lock"

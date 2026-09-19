@@ -282,7 +282,11 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 12, not 5: the suite grew from 211 assertions to 259 with ludics-lite#192, and a good part
+    # of the new time is deliberate -- a teardown grace, capped probes that have to be allowed to
+    # fire, and a release slowed on purpose so a competing hold can race it. At 5 it was cancelled
+    # mid-run, which reads as a failing suite and is not one.
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - name: Exercise the host-table split and the --help range
