@@ -4015,14 +4015,19 @@ refuse_merge_queue() {
 # before the keyword in the same unit, so dropping the dot outright would have silenced it -- and a
 # dotted token. The suite caught that overreach before it left the worktree.
 MULTI_CLOSE_FILTER='
-function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
+function scrub_urls(text,   rest) {
   # URLs go first. A body here is full of run links, and a fragment in one is not an issue: a
   # trailing /#703 was counted as an issue, and a page#705 was even reported as a cross-repository
   # reference to a HOST (review round 3). An issue bound through its full URL is a shape this
   # scanner does not read and SKILL.md says so, so blanking them keeps that boundary exact rather
   # than half-reading it. The owner is tightened for the same reason: a GitHub login carries only
   # alphanumerics and hyphens, never the dots that let example.com pass as one.
-  #
+  rest = text
+  gsub(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^ \t]*/, " ", rest)
+  gsub(/(^|[ \t([{<"\047])[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z][a-zA-Z]+(:[0-9]+)?([\/?#][^ \t]*)?/, " ", rest)
+  return rest
+}
+function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
   # The boundary before a reference is a WHITELIST, and that is the point. Two rounds were spent
   # excluding what a URL puts in front of a hash -- first the scheme, then a dot or a slash -- and
   # a query string answered each time with another character (`=`, `&`; review rounds 5 and 7). A
@@ -4034,14 +4039,6 @@ function refs_of(unit, repo,   rest, r, out, n, seen, key, nxt) {
   # 1, so `#0` is prose -- "step #0 initializes the state" was a second issue, and a nonexistent
   # one at that (review round 4).
   rest = unit
-  gsub(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^ \t]*/, " ", rest)
-  # And schemeless ones. The boundary whitelist alone is not enough, because a URL can CONTAIN the
-  # characters a human writes a reference after -- `www.example.com/?issues=foo,#2` puts a comma
-  # in front of the hash (review round 8). A host is an alphanumeric run with a dotted two-letter
-  # or longer last label, and everything up to the next space belongs to it -- the suffix starts
-  # at a slash, a question mark or a hash, since a query may follow a bare host with no path at
-  # all (review round 10), and a PORT may stand between the two (round 11).
-  gsub(/(^|[ \t([{<"\047])[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z][a-zA-Z]+(:[0-9]+)?([\/?#][^ \t]*)?/, " ", rest)
   out = ""; n = 0
   while (match(rest, /(^|[ \t([{<"\047`*_,;])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[1-9][0-9]*/)) {
     r = substr(rest, RSTART, RLENGTH)
@@ -4080,6 +4077,12 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls, after) {
   # AFTER its keyword, so nothing observed is lost. The match position is taken from the lowercased
   # copy, whose byte offsets are the unit own; the boundary character the match consumed belongs to
   # the keyword and not to what follows it.
+  # URLs are removed BEFORE the keyword is located, so the keyword test and the reference scan read
+  # the SAME text. Scrubbing inside refs_of meant the keyword could match a word in a URL path --
+  # `…/path,closes,details` -- and the forward slice then handed refs_of a fragment with the
+  # scheme and host already cut away, so it could no longer recognise what was left as a URL
+  # (review round 16). One scrub, one text, and the question cannot come back.
+  unit = scrub_urls(unit)
   # ONE match, which both decides that a keyword is present and says where it ends. A regex literal
   # cannot be hoisted into a variable in awk -- `V = /re/` assigns the RESULT of matching $0 -- and
   # a second copy of this expression would be a copy that has to stay in step with the first.
@@ -4167,11 +4170,16 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls, after) {
   # awks this fleet runs. A CLOSING fence also carries no info string -- only spaces or tabs may
   # follow its run -- so a content line that merely STARTS with the delimiter does not end the
   # block (review round 2); an opening fence may carry one, which is what ````markdown is.
-  # Opening a fence needs the line not to be indented code; CLOSING one does not. A fence opened
-  # on a list-marker line has its delimiter indented as a continuation of that item, and refusing
-  # to read it left the fence open over the whole rest of the body (review round 12). Closing early
-  # is also the conservative error: what follows reads as ordinary prose rather than as an example.
-  if ((fence || !indented) && (substr(trimmed, 1, 3) == "```" || substr(trimmed, 1, 3) == "~~~")) {
+  # An indented line opens NO fence and closes none either. Round 12 let an open fence close at any
+  # indentation, to reach a delimiter indented as a list-item continuation, on the reasoning that
+  # closing early was the conservative error. That reasoning was backwards, and round 16 showed it:
+  # inside a top-level fence an indented delimiter is CONTENT, so closing there turns the fenced
+  # lines after it into ordinary prose -- which promotes a NOTICE, claiming nothing, into a strong
+  # WARNING that says issues close. Leaving a fence OPEN is the safe error in exactly the same
+  # sense, because everything it swallows becomes a notice. What that costs is the round-12 shape:
+  # a fence opened inside a list item stays open, and the rest of the body reads as an example.
+  # ludics-lite#283 carries it with the other container-relative cases.
+  if (!indented && (substr(trimmed, 1, 3) == "```" || substr(trimmed, 1, 3) == "~~~")) {
     fch = substr(trimmed, 1, 1)
     flen = 0
     while (substr(trimmed, flen + 1, 1) == fch) flen++
@@ -4221,6 +4229,18 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls, after) {
   n = split(s, parts, "\001")
   for (i = 1; i <= n; i++) scan(parts[i], quoted)
 }'
+
+# What the deferred-merge refusal may say about the scan. It used to say outright that the scan
+# "spoke for the body as it is NOW", which is a claim about a read that may not have happened: when
+# the body read failed, warn_multi_close has already said the scan did NOT run, and on a long wait
+# the only successful scan may be the stale lead-time one (review round 16).
+multi_close_deferred_note() {
+  if [ -n "$MULTI_CLOSE_HAVE" ]; then
+    printf '%s' "The closing-keyword scan above spoke for the body as it is NOW: a deferred merge lands whatever the body says at that later moment, and nothing here will be running to re-read it."
+  else
+    printf '%s' "And the closing-keyword scan did NOT read the body for this attempt, so nothing here says what a deferred merge will close when it lands."
+  fi
+}
 
 # One line of the warning on BOTH streams: stdout is the transcript a later reader scrolls back
 # through, and stderr is what a caller that kept only the merge's error output still sees. The
@@ -4698,8 +4718,7 @@ cmd_merge() {
   fi
   fail 1 "$REPO#$PR_NUM is not merged ($state) — \`gh pr merge\` returned having only enabled" \
     "auto-merge. It will land when the base's required checks pass; do not treat it as landed." \
-    "The closing-keyword scan above spoke for the body as it is NOW: a deferred merge lands" \
-    "whatever the body says at that later moment, and nothing here will be running to re-read it."
+    "$(multi_close_deferred_note)"
 }
 
 # A branch name is data, not URL structure: `release#1` and `release&one` are valid refs, but

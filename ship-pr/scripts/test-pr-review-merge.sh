@@ -1043,21 +1043,25 @@ test_an_unchanged_body_still_reports_a_lost_comparison() {
     "but whether the keywords bind is no longer known"
 }
 
-# Review round 12, P2. A fence opened on a list-marker line has its closing delimiter indented as a
-# continuation of that item; refusing to read an indented delimiter left the fence open over the
-# rest of the body. An OPEN fence now closes on a matching delimiter whatever its indentation.
-test_an_indented_delimiter_closes_an_open_fence() {
+# Review rounds 12 and 16 on one rule. Round 12 let an open fence close at any indentation, to
+# reach a delimiter indented as a list-item continuation; round 16 showed that errs in the UNSAFE
+# direction, because closing early turns fenced lines into ordinary prose and promotes a notice
+# into a warning that says issues close. Leaving the fence OPEN is the safe error: what it swallows
+# becomes a notice, which claims nothing. The round-12 shape is the documented cost.
+test_an_indented_delimiter_leaves_the_fence_open() {
   reset
   PR_BODY='- ```
       example
       ```
 
-Closes #694
+Closes #694 and #695
 '
   run_merge
   assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
-  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" \
-    "the fence closed, so the plain line after it is not an example"
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD NOTICE" \
+    "the fence stays open, so what follows is read as an example"
+  assert_not_contains "$MERGE_STDOUT" "CLOSING-KEYWORD WARNING" \
+    "and is never promoted to a claim that issues close"
 }
 
 # Review round 12, convergence. The two findings make different claims, and only one of them rests
@@ -1262,6 +1266,58 @@ test_a_dot_underscore_token_is_not_a_keyword() {
   assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "a dotted identifier is not a directive"
 }
 
+# Review round 16, P2. Inside a top-level fence an indented delimiter is CONTENT, so closing there
+# would turn the fenced lines after it into ordinary prose -- promoting a notice that claims
+# nothing into a warning that says issues close.
+test_an_indented_delimiter_inside_a_fence_is_content() {
+  reset
+  PR_BODY='```
+    ```
+Closes #802 and #803
+```
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD NOTICE" "the line stays inside the fence"
+  assert_not_contains "$MERGE_STDOUT" "CLOSING-KEYWORD WARNING" "and is not a closing claim"
+}
+
+# Review round 16, P2. The keyword must be located in the SAME text the references are read from:
+# scrubbing inside refs_of let a keyword match a word in a URL path, after which the forward slice
+# handed refs_of a fragment with the scheme and host already cut away.
+test_a_keyword_inside_a_url_path_is_not_a_directive() {
+  reset
+  PR_BODY='See https://example.com/path,closes,details for issues #804 and #805.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "a word in a URL path is not a directive"
+  # A real directive alongside a URL still reports.
+  PR_BODY='Closes #806 and #807; see https://example.com/path,closes,details.
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #806 #807" "the real directive still binds"
+}
+
+# Review round 16, P2. When the body could not be read, the deferred-merge refusal may not claim
+# the scan spoke for the body.
+test_the_deferred_merge_note_does_not_claim_an_unread_scan() {
+  reset
+  BODY_FAIL=1
+  MERGE_STATE="merged=false state=OPEN"
+  run_merge
+  assert_eq "$MERGE_RC" 1 "a deferred merge is exit 1"
+  assert_contains "$MERGE_OUTPUT" "scan did NOT read the body for this attempt" \
+    "the refusal says the scan did not run"
+  assert_not_contains "$MERGE_OUTPUT" "spoke for the body as it is NOW" \
+    "and never claims it did"
+  # With a readable body the original wording stands.
+  reset
+  MERGE_STATE="merged=false state=OPEN"
+  run_merge
+  assert_contains "$MERGE_OUTPUT" "spoke for the body as it is NOW" "a read body keeps the claim"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -1316,7 +1372,7 @@ tests=(
   test_a_port_in_a_schemeless_url_is_stripped
   test_a_clean_body_edited_to_another_clean_body_is_silent
   test_an_unchanged_body_still_reports_a_lost_comparison
-  test_an_indented_delimiter_closes_an_open_fence
+  test_an_indented_delimiter_leaves_the_fence_open
   test_a_quoted_finding_claims_nothing_about_closing
   test_an_unchanged_quoted_only_body_keeps_notice_wording
   test_an_identifier_containing_a_keyword_is_not_a_keyword
@@ -1327,6 +1383,9 @@ tests=(
   test_a_retarget_withdrawal_keeps_the_finding_register
   test_a_mixed_unchanged_body_confirms_each_class_in_its_own_terms
   test_a_dot_underscore_token_is_not_a_keyword
+  test_an_indented_delimiter_inside_a_fence_is_content
+  test_a_keyword_inside_a_url_path_is_not_a_directive
+  test_the_deferred_merge_note_does_not_claim_an_unread_scan
 )
 
 run_tests "${tests[@]}"
