@@ -909,6 +909,33 @@ when the repository uses a different base:
   --base main
 ```
 
+A build tree is neither of the session gate's two exempt classes: it is not harness-owned
+`.claude/`, and it is build output, so never matching the base checkout's copy is the whole point
+of it. It therefore refused every OCaml worktree that had ever built — 92M on one sighting — and
+archiving it would be worse than refusing, since the sibling archive is the "out of sight" the
+gate exists to prevent and one would accumulate per landed PR. Name such a directory instead, and
+cleanup removes it rather than refusing over it:
+
+```bash
+~/.claude/skills/ship-pr/scripts/post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> \
+  --base main --regenerable _build
+```
+
+The OCANNL notes pass `--regenerable _build`; `_opam` and `node_modules` are the same shape. The
+flag is repeatable and has no default, and the helper learns no build system from it — it names a
+class of paths, not a command to run inside a checkout it is about to judge. Each value must be
+ONE top-level directory of the SESSION worktree: a value carrying a slash is refused rather than
+resolved, which is what keeps an absolute path, a nested path and every `..` out; `.` and `..` are
+refused by name; a symbolic link is never followed, since `rm -rf` through one would remove a tree
+the worktree does not hold; and a tracked path is repository content whatever was typed. A name
+the worktree does not carry is a no-op, so the same command line works for a worktree that never
+built. The removal happens before either gate reads the worktree and therefore before the
+merge-ancestry proof: a cleanup that then refuses still leaves the named directories gone, which
+is exactly what the flag asserts about them. The base owner is never touched this way. Its build tree is
+ordinarily ignored data, which already passes its gate; an unignored one is refused there by name,
+and the remedy for that is an ignore rule rather than this helper deleting a tree in the operator's
+primary checkout to clean up an unrelated topic branch.
+
 It fetches and proves the ordinary topic is an ancestor of `origin/<base>` before deleting
 anything, deletes the remote branch, advances the local base according to which worktree owns it,
 detaches and unregisters the session worktree into a sibling recovery archive, rechecks ancestry
@@ -951,6 +978,13 @@ make the exception explicit and leave its reason in the transcript:
   --force-integrated "GitHub reports the PR squash-merged at <sha>"
 ```
 
+Every path the helper reads back from Git is classified before it is joined to the checkout it
+came from: a leading slash, and a Windows drive root (`C:/Users/...`), count as already rooted.
+Git for Windows reports a path it read from a `.git` file's gitdir line, from `core.worktree` or
+from `--git-common-dir` in that native form even under Git Bash, whose own other outputs are
+`/c/...`, and joining one to the checkout refused a clean, merged session with a path that cannot
+exist anywhere.
+
 The helper requires Git's transactional `update-ref` symbolic-ref commands, Perl for an atomic
 filesystem rename, the exact session-worktree root, a clean and unlocked session, and one shared
 fetch/push endpoint for `origin`. The session must also carry no ignored local data, since cleanup
@@ -979,7 +1013,18 @@ validated tip also remains reachable under a direct `refs/ship-pr/recovery/` ref
 remote read can rule out a later base rollback; a divergent remote-tracking tip is retained
 separately under `refs/ship-pr/tracking-recovery/` before pruning. The base-owner refresh uses a non-destructive porcelain
 fast-forward through a helper-only reservation and a conditional named-ref update. A checked-out
-base owner must contain no local data, including ignored files; after the update it is prepared
+base owner must contain no tracked change and no untracked file, with one exemption and one
+deliberate omission. IGNORED data passes: the primary checkout owns the base on the standard
+layout and always carries build caches and ignored config, and ignored data is only at risk on
+the paths the fast-forward touches, which the changed-path collision scan refuses and
+`--no-overwrite-ignore` protects. UNTRACKED harness-owned state under a top-level `.claude/`
+directory passes too, on the same terms as the session gate — a real directory, no symbolic link
+at any component — because the agent harness writes it into every checkout it opens, the primary
+one included, and a repository whose ignore rules do not carry the name met it here rather than at
+the session gate and refused cleanup unconditionally. The read is NUL-delimited and the refusal
+names the shell-quoted paths, and the two rechecks after the locked refresh use the same scanner,
+so a `.claude/` that passed the preflight cannot come back as data the owner "gained" once the
+fast-forward has already landed. After the update the owner is prepared
 at the new tree and reattached with a detached-HEAD compare-and-swap before the reservation is
 removed. The helper probes that compare-and-swap capability before any branch mutation and refuses
 older Git versions cleanly. The helper also checks ignored descendants when a directory is
