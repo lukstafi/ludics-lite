@@ -3992,9 +3992,12 @@ refuse_merge_queue() {
 # made a body naming two of them produce no warning at all (review round 2).
 # The keyword boundaries exclude `-` on both sides on purpose: this repo's own vocabulary is full of
 # `close-out`, `closed-loop` and `fixed-point`, and a body saying "a close-out merge of #3 and #4"
-# is not closing anything. `/` is excluded on both sides for the same reason: an owner or a
-# repository may be NAMED `closed`, and `see closed/tracker#10 and closed/tracker#11` carries no
-# closing directive at all (review round 6).
+# is not closing anything; and `/` for the same reason, since an owner or a repository may be NAMED
+# `closed` and `see closed/tracker#10 and closed/tracker#11` carries no directive at all (round 6).
+# Both are WHITELISTS rather than exclusions, which is what makes them finite: an excluding class
+# is ASCII-shaped, so the first byte of a non-ASCII letter reads as punctuation to it and `fixés`
+# in French prose matched as a keyword (review round 8). A keyword is one only where an ASCII
+# separator a human writes stands on each side of it.
 MULTI_CLOSE_FILTER='
 function refs_of(unit, repo,   rest, r, out, n, seen, key) {
   # URLs go first. A body here is full of run links, and a fragment in one is not an issue: a
@@ -4016,6 +4019,11 @@ function refs_of(unit, repo,   rest, r, out, n, seen, key) {
   # one at that (review round 4).
   rest = unit
   gsub(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^ \t]*/, " ", rest)
+  # And schemeless ones. The boundary whitelist alone is not enough, because a URL can CONTAIN the
+  # characters a human writes a reference after -- `www.example.com/?issues=foo,#2` puts a comma
+  # in front of the hash (review round 8). A host is an alphanumeric run with a dotted two-letter
+  # or longer last label, and everything up to the next space belongs to it.
+  gsub(/(^|[ \t([{<"\047])[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z][a-zA-Z]+(\/[^ \t]*)?/, " ", rest)
   out = ""; n = 0
   while (match(rest, /(^|[ \t([{<"\047`*_,;])([a-zA-Z0-9][-a-zA-Z0-9]*\/[-a-zA-Z0-9._]+)?#[1-9][0-9]*/)) {
     r = substr(rest, RSTART, RLENGTH)
@@ -4041,7 +4049,7 @@ function refs_of(unit, repo,   rest, r, out, n, seen, key) {
   return out
 }
 function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
-  if (tolower(unit) !~ /(^|[^a-z0-9_\/-])(close[sd]?|fix(e[sd])?|resolve[sd]?)([^a-z0-9_\/-]|$)/) return
+  if (tolower(unit) !~ /(^|[ \t([{<"\047`*_,;:>])(close[sd]?|fix(e[sd])?|resolve[sd]?)([ \t)\]}>"\047`*_,;:.!?]|$)/) return
   refs = refs_of(unit, repo)
   if (refs == "") return
   cnt = split(refs, parts, " ")
@@ -4126,9 +4134,11 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls) {
   # quote was the first thing found there (review round 3), a Markdown link destination the second
   # (round 7), and a list of closers would have grown a member per round. Any run of
   # non-alphanumerics ends the unit, plus one parenthesized group for `](https://…)`, which is the
-  # only shape that legitimately carries alphanumerics after a full stop. Requiring an alphanumeric
+  # only shape that legitimately carries alphanumerics after a full stop. That group runs to its
+  # closing paren rather than to the next space, because a Markdown destination may be followed by
+  # a quoted TITLE inside the same parentheses (review round 8). Requiring an alphanumeric
   # NOT to follow immediately is what keeps a version number ("3.5") from splitting.
-  gsub(/[.!?][^ \ta-zA-Z0-9]*(\([^ \t]*\))?[^ \ta-zA-Z0-9]*[ \t]+/, "&\001", s)
+  gsub(/[.!?][^ \ta-zA-Z0-9]*(\([^)]*\))?[^ \ta-zA-Z0-9]*[ \t]+/, "&\001", s)
   n = split(s, parts, "\001")
   for (i = 1; i <= n; i++) scan(parts[i], quoted)
 }'
@@ -4201,7 +4211,19 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
   # to avoid making. Silent rather than one-line-noisy, because a base that never closes anything
   # has nothing about it worth repeating on every merge.
   multi_close_binds "$1"
-  [ "$MULTI_CLOSE_BINDS" != no ] || return 0
+  if [ "$MULTI_CLOSE_BINDS" = no ]; then
+    # A retarget during the gate can make a keyword inert AFTER the lead-time scan warned about it.
+    # Returning silently would leave that warning standing in the transcript, still saying issues
+    # are about to close (review round 8) -- the same stale finding the WITHDRAWN line below exists
+    # to prevent, reached by a different route.
+    if [ -n "$again" ] && [ -n "$MULTI_CLOSE_HAVE" ] && [ -n "$MULTI_CLOSE_LAST" ]; then
+      multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1 no longer targets the default" \
+        "branch, so the keywords above bind nothing on this merge."
+      MULTI_CLOSE_LAST=""
+      MULTI_CLOSE_HAVE=""
+    fi
+    return 0
+  fi
   body=$(gh_retry read api "repos/$REPO/pulls/$1" --jq '.body // ""')
   rc=$?
   # A read that FAILED is not a body with nothing in it. Say so, or the silence below is read as a

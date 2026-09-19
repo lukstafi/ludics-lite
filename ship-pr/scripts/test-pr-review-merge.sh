@@ -823,6 +823,63 @@ test_a_query_string_hash_is_not_an_issue_reference() {
   assert_contains "$MERGE_STDOUT" "2 issues: #657 #658" "brackets and inline code still open a reference"
 }
 
+# Review round 8, P2. The mirror of the retarget case: when the lead-time scan warned and the PR is
+# then moved OFF the default branch, returning silently leaves that warning standing in the
+# transcript still saying issues are about to close.
+test_a_retarget_off_the_default_branch_withdraws_the_warning() {
+  reset
+  PR_BODY='Closes #659 and #660
+'
+  PR_BASE=main
+  BASE_LATER=release-1.2
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge still lands ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #659 #660" "the lead-time scan warned"
+  assert_contains "$MERGE_STDOUT" "no longer targets the default branch" \
+    "and the authoritative scan retracts it"
+}
+
+# Review round 8, P2. A Markdown destination may be followed by a quoted title inside the same
+# parentheses, so the group has to run to its closing paren and not to the next space.
+test_a_titled_link_does_not_join_two_sentences() {
+  reset
+  PR_BODY='[Closes #661.](https://example.test/x "the title") See #662 for context.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "a titled link does not hold two sentences together"
+}
+
+# Review round 8, P2. A URL can CONTAIN the characters a human writes a reference after, so the
+# boundary whitelist alone was not enough: schemeless hosts are stripped as well.
+test_a_schemeless_url_containing_a_delimiter_is_stripped() {
+  reset
+  PR_BODY='Closes #663; see www.example.com/?issues=foo,#664 for details.
+'
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "a comma inside a URL does not open a reference"
+}
+
+# Review round 8, P2. An EXCLUDING character class is ASCII-shaped, so the first byte of a non-ASCII
+# letter read as punctuation and a French past participle matched as a closing keyword.
+test_a_non_ascii_word_is_not_a_keyword() {
+  reset
+  PR_BODY='Les problemes #665 et #666 sont fixes.
+'
+  run_merge
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #665 #666" \
+    "the ASCII spelling really is a keyword, so the case has something to distinguish"
+  reset
+  PR_BODY=$(printf 'Les probl\303\250mes #665 et #666 sont fix\303\251s.\n')
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD WARNING" \
+    "a keyword followed by a non-ASCII letter is part of another word"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -863,6 +920,10 @@ tests=(
   test_a_link_destination_does_not_join_two_sentences
   test_an_added_plain_closes_line_is_not_an_unchanged_body
   test_a_query_string_hash_is_not_an_issue_reference
+  test_a_retarget_off_the_default_branch_withdraws_the_warning
+  test_a_titled_link_does_not_join_two_sentences
+  test_a_schemeless_url_containing_a_delimiter_is_stripped
+  test_a_non_ascii_word_is_not_a_keyword
 )
 
 run_tests "${tests[@]}"
