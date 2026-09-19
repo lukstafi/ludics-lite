@@ -34,6 +34,14 @@
 # direction), so its own controls could not otherwise run. Sourced by a suite that skipped the
 # preamble it refuses instead, rather than sourcing it from under the suite — a suite's
 # definitions belong below both files, and the preamble is the one that can say so.
+
+# One brace group, so bash parses this file WHOLE before its first line runs and an edit landing
+# while a run is in flight cannot resume the shell at a shifted offset; the `exit` at the foot
+# means the shell never comes back to the file for a next command. Two lines here and two at the
+# foot, with the body's own indentation untouched (ludics-lite#10, #247); scripts/check-parse-guards.sh
+# checks the shape. Sourced by a sibling suite, the `|| return 0` dispatch below ends the source
+# inside the group, before the foot's `exit` is reached, so the caller survives.
+{
 BASE_LIB_BASENAME=$(basename "${BASH_SOURCE[0]}")
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   set -euo pipefail
@@ -498,3 +506,5 @@ tests=(
 )
 
 run_tests "${tests[@]}"
+exit "$?"
+}

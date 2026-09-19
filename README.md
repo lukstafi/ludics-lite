@@ -234,10 +234,11 @@ scripts/test-wake-lab.sh
 scripts/test-check-prompts.sh
 scripts/test-check-jq-shapes.sh
 scripts/test-check-scratch-dirs.sh
+scripts/test-check-parse-guards.sh
 scripts/test-sync-routines.sh
 ```
 
-Three conventions travel with that list. Each is held by a scanner that reads line shapes — a
+Four conventions travel with that list. Each is held by a scanner that reads line shapes — a
 register lookup, a line regex — and not by a parser, so a green check says a line of the required
 shape is present and never that the thing it stands for is true: text crafted to carry the shape
 without the substance passes every one of them. That is the design (ludics-lite#75, where a table
@@ -259,6 +260,42 @@ ludics-lite#212 (executed rather than sourced, it proves the round counter, the 
 move straight off the fixture rather than through a `base` run, and the refusals it owes its three
 callers), or it must not be named `test-*`. The third option, a register line and two CI steps for a
 file nothing executes, is a green step that tests nothing.
+
+**Every `test-*.sh` suite is one brace group.** Bash reads a script by OFFSET while it runs: it
+parses one command, runs it, and comes back to the file for the next one — so a file rewritten
+while a run of it is in flight resumes the shell in the middle of whatever text now sits at the
+offset it left off at. The suites here take minutes and an agent iterating on one edits it during
+exactly that window; it has cost two runs of `test-post-merge-cleanup.sh`, which removed the
+scratch root under live cases (ludics-lite#10), and four minutes on `test-fleet-worker.sh`, which
+died at a line whose text was fine (ludics-lite#247). So every suite's body is wrapped in one brace
+group — two lines at the top, `exit "$?"` and `}` at the foot, the body's own indentation
+untouched — and `scripts/check-parse-guards.sh` refuses one that is not, over the same
+`scripts/`, `*/scripts/` and `*/hooks/` globs the fixture check above walks, plus the non-test
+scripts named in its `ALSO_GUARDED` list. The group is parsed whole before its first line runs, and
+the `exit` means the shell never returns to the file for a next command; both halves are needed,
+and the shape was chosen over a `main() { … }` with `main "$@"` at the foot precisely because that
+one hands the shell back to the file after the minutes the run took. A suite that is also SOURCED
+by a sibling takes the same shape: the `[ "${BASH_SOURCE[0]}" = "$0" ] || return 0` dispatch in
+`test-pr-review-lib.sh` and `test-pr-review-base-lib.sh` ends the sourcing inside the group, before
+the foot is reached, so the caller survives with the definitions it came for.
+
+A suite that SOURCES a sibling library does it in a preamble ABOVE the `{`, and that is the one
+thing about the shape that is not free. Bash binds the location `declare -F` reports for a function
+when it PARSES the definition, so with the sources inside the group every definition in the suite is
+parsed before the libraries are read, the libraries' bindings land last, and the ludics-lite#46
+shadow guard — which compares each protected function against the file and line its owner recorded
+— reads every suite function as still the library's: it refuses a declared `stub`, and it accepts an
+undeclared shadow in silence, which is the case that guard exists for. Above the group the
+definitions are back where they were. What may stand up there is what forks nothing (`set` lines, an
+`export NAME=value` with no substitution) plus what the sources need — one
+`DIR=$(cd "$(dirname "$0")" && pwd -P)` and the `source "$DIR/…"` lines — with a source last; the
+window it costs is those few commands, and the file is whole before the first case runs. What the
+check establishes is those line shapes plus one thing a line shape cannot say: with the wrapper
+lines deleted the body still parses, so a `{` that some `}` midway already closed is refused rather
+than certified by a second group carrying the required foot. It is still a scan — another
+arrangement of braces contrived to satisfy all of it says nothing, and a `source "$DIR/test-x.sh"`
+quoted inside a heredoc is refused though it runs nothing — and the `.py` and `.ps1` suites are
+outside it, since python and pwsh read a script whole before running any of it.
 
 **Scratch directories have one house shape:** `VAR=$(mktemp -d …)`, then directly under it
 `VAR=$(CDPATH= cd "$VAR" && pwd -P)`, and the cleanup `trap` under that. What
@@ -592,7 +629,12 @@ entry, each difference with its own case, because a fold that collapsed unrelate
 pass every other case here. The anchor is rendered as the field the feed actually served — a line
 number, else the diff `position` as `@12`, else `?` — so a row from the per-review endpoint, which
 carries no line at all, no longer prints the unknown place as `:0` and no longer reads like two
-findings at one line. Every verdict that
+findings at one line. The rest of that anchor is on the line too (ludics-lite#113), since the key
+separates on fields the header used to omit: the range of a multi-line comment (`a.sh:36-40`),
+`side=LEFT` on the deletion side, `start_side=` when a range ends on the other side, and `was=`
+when GitHub has migrated the anchor forward since it was written — the sibling case asserts that
+two entries the fold kept apart render as two distinct headers, the id aside, and that rows
+agreeing on every anchor field still fold and print that anchor once. Every verdict that
 says nothing came polls once more first, and re-reads the state behind that poll: a 👍 landing in
 the same gap is reported as the approval it is rather than answered with the nudge that would
 clear it, a state that moved otherwise makes the window quiet, and a read that did not answer

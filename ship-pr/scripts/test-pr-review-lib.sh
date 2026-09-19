@@ -95,6 +95,13 @@
 # which that control passes, is the only argument this file takes — exactly, with no trailing
 # word, since a marker that could be typed past would skip that control in silence.
 
+# One brace group, so bash parses this file WHOLE before its first line runs and an edit landing
+# while a run is in flight cannot resume the shell at a shifted offset; the `exit` at the foot
+# means the shell never comes back to the file for a next command. Two lines here and two at the
+# foot, with the body's own indentation untouched (ludics-lite#10, #247); scripts/check-parse-guards.sh
+# checks the shape. Sourced by a sibling suite, the `|| return 0` dispatch below ends the source
+# inside the group, before the foot's `exit` is reached, so the caller survives.
+{
 TEST_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 TEST_LIB_FILE="$TEST_LIB_DIR/$(basename "${BASH_SOURCE[0]}")"
 HELPER="$TEST_LIB_DIR/pr-review.sh"
@@ -264,7 +271,15 @@ test_tmpdir() {
     bail "test_tmpdir: refusing to write the path into \$$1 — test_tmpdir uses that name itself; name the variable something else"
     ;;
   esac
-  __test_tmpdir_path=$(mktemp -d "${TMPDIR:-/tmp}/pr-review-$2.XXXXXX") || bail "mktemp -d failed for $2"
+  # `pr-review-test.<pid>.<label>.XXXXXX`, not `pr-review-<label>.XXXXXX`: the label alone names
+  # no owner, so a directory a killed suite left behind was uncollectable by construction — the
+  # `pr-review-cwd-checkout.VLoj1M` that sat in this box's TMPDIR from 09-10 is one, and it is
+  # what put test_tmpdir in ludics-lite#219 alongside pr-review.sh's own temporaries. With the pid
+  # in it, pr-review.sh's tmp_sweep_stale collects it on the same owner-gone test as everything
+  # else. The label stays in the name, after the pid, because it is what makes a leftover
+  # identifiable at a glance, and it may carry a space (`lib space`), which the quoting here and
+  # the sweep's own quoting both survive.
+  __test_tmpdir_path=$(mktemp -d "${TMPDIR:-/tmp}/pr-review-test.$$.$2.XXXXXX") || bail "mktemp -d failed for $2"
   # Physically resolved before anyone sees it, and here rather than in each suite: on macOS
   # $TMPDIR sits under /var, a symlink to /private/var, while pr-review.sh computes its own
   # paths with `pwd -P`. Unresolved, the two spellings of one directory differ, so a suite's
@@ -860,7 +875,10 @@ if (length $old) {
 die "mutation_copy: expected exactly one patch target, found $count\n" if $count != 1;
 substr($text, index($preamble, $old), length($old)) = $new;
 die "mutation_copy: invalid case\n" unless $case =~ /^test_[a-z0-9_]+$/;
-$text =~ s/\nrun_tests "\$\{tests\[\@\]\}"\n\z/\nrun_tests $case\n/
+# The final case runner sits above this file's brace-group foot (`exit "$?"` and `}`,
+# ludics-lite#10, #247), which the copy must keep: a copy that ended at the runner would be a
+# file whose group never closes, and bash would refuse to parse it.
+$text =~ s/\nrun_tests "\$\{tests\[\@\]\}"\nexit "\$\?"\n\}\n\z/\nrun_tests $case\nexit "\$?"\n}\n/
   or die "mutation_copy: missing final case runner\n";
 open my $out, '>', $dest or die "$dest: $!\n";
 print {$out} $text or die "$dest: $!\n";
@@ -1016,7 +1034,7 @@ test_definitions_before_sourcing_are_refused() {
 # the silent half of the trap is covered too: the caller's stale value must not survive, and the
 # path that comes back must be the one registered for removal, in the caller's shell.
 test_tmpdir_writes_to_a_target_named_dir() {
-  local path
+  local path pid
   control 'dir=stale' \
     'test_tmpdir dir tmpdir-target' \
     'printf "target=%s\n" "$dir"' \
@@ -1025,7 +1043,16 @@ test_tmpdir_writes_to_a_target_named_dir() {
   assert_eq "$CONTROL_RC" 0 "a caller's variable named dir is written ($CONTROL_ERR)"
   path=$(sed -n 's/^target=//p' <<<"$CONTROL_OUT")
   assert_not_contains "$path" stale "the caller's prior value must not survive the call"
-  assert_contains "$path" "/pr-review-tmpdir-target." "the fresh directory should reach the caller"
+  assert_contains "$path" ".tmpdir-target." "the label should still reach the caller's directory name"
+  # And the owning pid, read back with the very parse pr-review.sh's tmp_sweep_stale uses on it:
+  # a scratch directory whose name does not carry a pid cannot be told from a live sibling's, and
+  # so is collectable by nothing at all once the suite that made it is killed (ludics-lite#219).
+  # Pinning the SHAPE here rather than in prose is what stops the label-only spelling coming back.
+  pid=${path##*/pr-review-test.}
+  pid=${pid%%.*}
+  case "$pid" in '' | *[!0-9]*)
+    bail "the scratch directory should be keyed by the owning pid, so a killed suite's is swept: $path" ;;
+  esac
   [ ! -d "$path" ] || bail "the control left $path behind: the registration did not reach its shell"
 }
 
@@ -1048,17 +1075,24 @@ test_tmpdir_refuses_a_name_it_uses() {
 # created in a registered root, so the case cannot itself leak whichever way it goes, and both
 # must be gone once the suite that made them has exited.
 test_the_exit_trap_removes_what_pr_review_sh_s_trap_removes() {
-  local root snap err
+  local root snap err gh
   test_tmpdir root trap-removes
+  # All THREE paths pr_review_cleanup removes. GH_TMP_FILE is gh_retry's per-attempt capture, and
+  # it is here for the reason the other two are: what this trap removes is read off the script's
+  # function rather than restated, so a path added there has to show up here or nothing proves the
+  # addition runs (ludics-lite#219, the same shape as #191's snapshot directory).
   control "SNAP_DIR=\$(mktemp -d \"$root/snap.XXXXXX\")" \
     "GH_ERR_FILE=\$(mktemp \"$root/err.XXXXXX\")" \
-    'printf "snap=%s\nerr=%s\n" "$SNAP_DIR" "$GH_ERR_FILE"'
+    "GH_TMP_FILE=\$(mktemp \"$root/gh.XXXXXX\")" \
+    'printf "snap=%s\nerr=%s\ngh=%s\n" "$SNAP_DIR" "$GH_ERR_FILE" "$GH_TMP_FILE"'
   assert_eq "$CONTROL_RC" 0 "the probe suite must run ($CONTROL_ERR)"
   snap=$(sed -n 's/^snap=//p' <<<"$CONTROL_OUT")
   err=$(sed -n 's/^err=//p' <<<"$CONTROL_OUT")
+  gh=$(sed -n 's/^gh=//p' <<<"$CONTROL_OUT")
   assert_contains "$snap" "$root/snap." "the probe should report the directory it made"
   [ ! -e "$snap" ] || bail "the snapshot directory survived the suite's exit: $snap (ludics-lite#191)"
   [ ! -e "$err" ] || bail "the error file survived the suite's exit: $err"
+  [ ! -e "$gh" ] || bail "gh_retry's capture survived the suite's exit: $gh"
 }
 
 # And the guard that keeps the above true as the script's trap grows. Three ways the wiring can
@@ -1485,6 +1519,32 @@ test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason() {
   assert_eq "$CONTROL_OUT" "" "nothing may run"
 }
 
+# The probe writes the source's stderr to `pr-review-probe.<pid>.err` in TMPDIR and removes it on
+# both of its paths — and neither removal was there at first. The debris is still on this box: a
+# 0-byte file from 09-10 19:17, three minutes before the SUCCESS path learned to remove it
+# (6de6cff), and four carrying this file's own "frobnicator" line from 09-12 19:07, four minutes
+# before `mutant` gave a broken probe a TMPDIR of its own (ced18ba). Both leaks are fixed and
+# nothing held them fixed; this case is what does. pr-review.sh's tmp_sweep_stale is the backstop
+# behind it, for the one path no removal here can cover — a suite killed while the probe runs.
+test_a_refused_probe_leaves_no_diagnostics_in_tmpdir() {
+  local root
+  test_tmpdir root probe-leak
+  cp "$TEST_LIB_FILE" "$root/"
+  printf '#!/usr/bin/env bash\necho "missing dependency: frobnicator not found" >&2\nreturn 1\n' \
+    >"$root/pr-review.sh"
+  # A TMPDIR of this case's own, so what is asserted empty is only what the refused probe put
+  # there: control_in writes its throwaway suite in $root and control_run its capture files in
+  # CONTROL_ROOT, and neither is under this one. The assignment prefix is the idiom `mutant`
+  # already uses to point a control's temporaries somewhere registered.
+  mkdir "$root/tmpdir"
+  TMPDIR="$root/tmpdir" control_in "$root"
+  assert_eq "$CONTROL_RC" 2 "the refusal is what this case provokes ($CONTROL_ERR)"
+  assert_contains "$CONTROL_ERR" "missing dependency: frobnicator not found" \
+    "the refusal must still carry what the source said"
+  assert_eq "$(find "$root/tmpdir" -mindepth 1 -print | tr '\n' ' ')" "" \
+    "a refused probe must leave nothing in TMPDIR"
+}
+
 # The guard has to survive the PATH it is checked out under. `declare -F` prints "<name> <line>
 # <file>", and a directory with a space in it — a scratch clone at `/tmp/ludics review.XXXX` —
 # splits that file across the fields of anything reading it positionally. Comparing a field rather
@@ -1535,6 +1595,19 @@ test_probe_status_mutation_is_caught() {
     ')" || lib_probe_rc=$?' ')"' \
     "a probe that cannot read the constants is a refusal, not a suite failure ("
   assert_contains "$CONTROL_ERR" "got '1', expected '2'" "the probe must expose the lost status capture"
+}
+
+# And the other half of that probe: the diagnostics it writes. Reverting the refusal path's
+# removal is a one-line change that leaves every existing case green — which is exactly how it
+# went missing in the first place, and why the emptiness assertion needs a mutant of its own
+# rather than the reader's trust (ludics-lite#219).
+test_probe_diagnostics_mutation_is_caught() {
+  mutant test_a_refused_probe_leaves_no_diagnostics_in_tmpdir \
+    'rm -f "$lib_probe_err"
+  exit 2' 'exit 2' \
+    "a refused probe must leave nothing in TMPDIR (got '"
+  assert_contains "$CONTROL_ERR" "pr-review-probe." \
+    "the mutant must name the diagnostics file it left behind"
 }
 
 # The route the whole file depends on: to SHOW a guard can fail you copy this file and pr-review.sh
@@ -1623,11 +1696,15 @@ tests=(
   test_retune_is_undone_when_the_case_ends # must stay directly after the case above
   test_retune_of_a_name_the_script_does_not_set_is_refused
   test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason
+  test_a_refused_probe_leaves_no_diagnostics_in_tmpdir
   test_the_guard_survives_a_path_with_spaces
   test_the_self_test_runs_from_a_renamed_copy
   test_mutation_copy_refuses_missing_or_ambiguous_targets
   test_snapshot_path_mutation_is_caught
   test_probe_status_mutation_is_caught
+  test_probe_diagnostics_mutation_is_caught
 )
 
 run_tests "${tests[@]}"
+exit "$?"
+}

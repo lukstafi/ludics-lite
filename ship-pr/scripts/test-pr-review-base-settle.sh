@@ -24,6 +24,17 @@ source "$SCRIPT_DIR/test-pr-review-lib.sh"
 # shellcheck source=test-pr-review-base-lib.sh
 source "$SCRIPT_DIR/test-pr-review-base-lib.sh"
 
+# One brace group over everything below the preamble, so bash parses the rest of this file WHOLE
+# before the first case runs and an edit landing mid-run cannot resume the shell at a shifted
+# offset; the `exit` at the foot means it never comes back to the file for a next command
+# (ludics-lite#10, #247). The `{` opens BELOW the sources, not above them: bash binds a function's
+# `declare -F` location when it PARSES the definition, so inside a group that also holds the
+# sources every definition here is parsed first and the libraries' bindings land last -- and the
+# shadow guard (ludics-lite#46) then reads every suite function as still the library's, refusing a
+# declared stub and accepting an undeclared shadow in silence. scripts/check-parse-guards.sh
+# checks the shape, and says what may stand above the `{`.
+{
+
 # --- the tip's own absence, and the one absence that is not a race (ludics-lite#156) -----------
 # The shape that blocked a wave's dispatch on 2026-09-15: the default branch's tip was a docs-only
 # push, `ci` carries `paths-ignore: docs/**`, so no run for the tip was ever going to exist —
@@ -425,3 +436,5 @@ tests=(
 )
 
 run_tests "${tests[@]}"
+exit "$?"
+}

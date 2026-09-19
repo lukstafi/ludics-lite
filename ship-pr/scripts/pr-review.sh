@@ -325,6 +325,13 @@ warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 # blank.
 GH_ERR=""
 GH_ERR_FILE="${TMPDIR:-/tmp}/pr-review-err.$$"
+# gh_retry's per-attempt stderr capture, tracked here so the EXIT trap removes one a call died
+# holding. It is only ever the CURRENT shell's: every feed read happens inside a command
+# substitution, and that subshell does not run this trap — which is the same fact gh_err_line
+# relies on, since a trap that ran there would blank GH_ERR_FILE before the parent could read it.
+# A capture a killed subshell left behind is collected by tmp_sweep_stale instead, which is what
+# the pid in its name is for.
+GH_TMP_FILE=""
 # The round snapshot's files live in the same directory as GH_ERR_FILE, for the same subshell
 # reason; see "the round snapshot" below for what is in them. They share ONE directory per process, created on the first
 # arm and removed by this trap, rather than a spray of `$$`-keyed files: a watch killed with
@@ -347,6 +354,7 @@ SNAP=""
 # preamble refuses to run if its trap no longer reaches whatever this one installs.
 pr_review_cleanup() {
   rm -f "$GH_ERR_FILE"
+  [ -z "$GH_TMP_FILE" ] || rm -f "$GH_TMP_FILE"
   [ -z "$SNAP_DIR" ] || rm -rf "$SNAP_DIR"
 }
 trap pr_review_cleanup EXIT
@@ -386,14 +394,19 @@ gh_retry() {
   local mode="$1"
   shift
   local attempt=1 rc out tmp retryable delay="$API_BACKOFF"
-  tmp=$(mktemp "${TMPDIR:-/tmp}/pr-review.XXXXXX" 2>/dev/null) || tmp=/dev/null
+  # Keyed by the owning pid, like every other temporary path this script makes. The template was
+  # `pr-review.XXXXXX`, and mktemp's suffix alone names no owner: a capture a killed call left
+  # behind could not be told from a live sibling's by any later run, so nothing could ever collect
+  # it, and one sat in this box's TMPDIR from 09-14 until ludics-lite#219 was opened over it.
+  tmp=$(mktemp "${TMPDIR:-/tmp}/pr-review-gh.$$.XXXXXX" 2>/dev/null) || tmp=/dev/null
+  if [ "$tmp" = /dev/null ]; then GH_TMP_FILE=""; else GH_TMP_FILE="$tmp"; fi
   GH_ERR=""
   while :; do
     out=$(gh "$@" 2>"$tmp")
     rc=$?
     [ "$tmp" = /dev/null ] || GH_ERR=$(cat "$tmp" 2>/dev/null)
     if [ "$rc" -eq 0 ]; then
-      [ "$tmp" = /dev/null ] || rm -f "$tmp"
+      [ "$tmp" = /dev/null ] || { rm -f "$tmp"; GH_TMP_FILE=""; }
       : >"$GH_ERR_FILE" 2>/dev/null # a later message must not quote an error this call outlived
       [ -n "$out" ] && printf '%s\n' "$out"
       return 0
@@ -406,7 +419,7 @@ gh_retry() {
     fi
     retryable=$?
     if [ "$retryable" -ne 0 ] || [ "$attempt" -ge "$API_ATTEMPTS" ]; then
-      [ "$tmp" = /dev/null ] || rm -f "$tmp"
+      [ "$tmp" = /dev/null ] || { rm -f "$tmp"; GH_TMP_FILE=""; }
       [ "$retryable" -eq 0 ] && return 3
       return 1
     fi
@@ -629,27 +642,48 @@ snapshot_dir_ensure() {
   SNAP="$SNAP_DIR/round"
 }
 
-# A watch killed with SIGKILL never reaches its EXIT trap, so its snapshot directory outlives it.
-# The owning pid is in the name, which is how a later watch tells a dead owner's leftovers from a
-# CONCURRENT watch's live ones — several watches share a TMPDIR routinely, one per PR in flight,
-# and sweeping a live one would pull the feeds out from under its round. Only directories this
-# user owns are considered, since /tmp is shared where TMPDIR is unset. A pid reused by an
-# unrelated live process leaves its directory behind for the next sweep to find; that is the safe
-# way round.
-snapshot_sweep_stale() {
-  local dir pid
+# A process killed with SIGKILL never reaches its EXIT trap, so whatever it had in TMPDIR outlives
+# it. The snapshot directory was the first of those to be noticed and for a while the only one
+# collected — and the families beside it accumulated in silence, which is what ludics-lite#219 was
+# opened over: this box's real TMPDIR held seven of them, dated 09-10 to 09-14, from four
+# different families.
+#
+# THE FAMILIES, every temporary path this script and its fixture suites put in TMPDIR:
+#
+#   pr-review-snap.<pid>.XXXXXX/  the round snapshot directory (and, from its first cut, loose
+#                                 `pr-review-snap.<pid>.<kind>.<pr>` files beside it)
+#   pr-review-err.<pid>           GH_ERR_FILE, the last attempt's error for gh_err_line
+#   pr-review-gh.<pid>.XXXXXX     gh_retry's per-attempt stderr capture
+#   pr-review-probe.<pid>.err     test-pr-review-lib.sh's constants probe, whose own two removals
+#                                 cover its documented paths but not a suite killed mid-probe
+#   pr-review-test.<pid>.<label>.XXXXXX/  a fixture suite's scratch directory (test_tmpdir)
+#
+# WHAT MAKES THIS A SWEEP AND NOT A DELETE. The owning pid is in every one of those names, and
+# that is the whole safeguard: a dead owner's leftovers are told from a CONCURRENT run's live ones
+# by asking the kernel, never by age. Several watches share a TMPDIR routinely, one per PR in
+# flight, and ten fixture suites share one on a wave day; sweeping a live one would pull the feeds
+# out from under a round, or the fixtures out from under a suite. Nothing here is aged out, and a
+# name whose pid field is not a number — which is what the two unkeyed templates used to produce —
+# names no owner, so it is left exactly where it is rather than guessed about. That is why the fix
+# for those two was to put the pid IN the name rather than to widen this test.
+#
+# Only paths this user owns are considered, since /tmp is shared where TMPDIR is unset. A pid
+# reused by an unrelated live process leaves its path behind for the next sweep to find; that is
+# the safe way round.
+tmp_sweep_stale() {
+  local path pid family
   [ -d "$SNAP_ROOT" ] || return 0
-  for dir in "$SNAP_ROOT"/pr-review-snap.*; do
-    # The unmatched glob itself when there is nothing to sweep. The loose `$$`-keyed FILES the
-    # first cut of the snapshot left in TMPDIR are keyed the same way and are swept on the same
-    # test, so a machine that ran that revision is cleaned up rather than left with its debris.
-    [ -e "$dir" ] || continue
-    [ -O "$dir" ] || continue
-    pid=${dir##*/pr-review-snap.}
-    pid=${pid%%.*}
-    case "$pid" in '' | *[!0-9]*) continue ;; esac
-    if kill -0 "$pid" 2>/dev/null; then continue; fi
-    rm -rf "$dir"
+  for family in snap err gh probe test; do
+    for path in "$SNAP_ROOT/pr-review-$family".*; do
+      # The unmatched glob itself when a family has nothing in it.
+      [ -e "$path" ] || continue
+      [ -O "$path" ] || continue
+      pid=${path##*/pr-review-$family.}
+      pid=${pid%%.*}
+      case "$pid" in '' | *[!0-9]*) continue ;; esac
+      if kill -0 "$pid" 2>/dev/null; then continue; fi
+      rm -rf "$path"
+    done
   done
 }
 
@@ -824,6 +858,9 @@ review_comments() { # <pr> <review id>
 # and no `original_line` at all, carrying `position`/`original_position` instead — every such row
 # renders `:@<position>`, so an enumerating key collapsed two findings in one file (#86 round 1)
 # — and `side`/`start_line` do the same for a LEFT-vs-RIGHT or multi-line anchor (#86 round 2).
+# The RENDERING names them even so (`item_side`, `item_was` below, #113): the key and the header
+# have different jobs, and a key that must separate on a field nobody has heard of leaves the
+# header owing the reader every separation it CAN explain.
 #
 # `pull_request_review_id` is in the deny-list for a measured reason, not a tidy one: the reviewer
 # posts a separate COMMENTED review per inline comment (46 comments over 36 reviews on #39), so
@@ -841,6 +878,11 @@ POLL_ITEM_DEFS='
   def inline_commit: (.original_commit_id // .commit_id) | short;
   def review_commit: .commit_id | short;
   def item_path: .path // "?";
+  # The line half of an anchor: the range when the row carries a start, the line alone otherwise.
+  # A start equal to the end still renders as a range — GitHub refuses `start_line == line`, so
+  # the shape does not arise from the API, and collapsing it to a bare line would print a row the
+  # key separates on identically to one with no start at all.
+  def anchor($s; $l): if $s != null then "\($s)-\($l)" else "\($l)" end;
   # A row from the per-review comments endpoint (what poll reads while the flat feed lags a new
   # review) carries no `line` and no `original_line` at all, only `position`/`original_position`.
   # Rendering that as `0` printed an unknown location in the shape of a known one, and two rows
@@ -848,9 +890,55 @@ POLL_ITEM_DEFS='
   # round 1 of #86 from the eye. An unknown line says so (`?`), and a position says which field it is
   # (`@12`), so nothing downstream reads a location that was never served as a line number.
   def item_line: (.line // .original_line) as $l
-    | if $l != null then ($l | tostring)
+    | if $l != null then anchor((.start_line // .original_start_line); $l)
       else ((.position // .original_position) as $p
             | if $p != null then "@\($p)" else "?" end)
+      end;
+  # The rest of the anchor, in the `k=v` grammar the rest of the header already speaks
+  # (ludics-lite#113). The key above separates on `side`, `start_line`, `start_side` and
+  # `original_start_line` — #86 round 2 put them there because a LEFT-vs-RIGHT or multi-line
+  # anchor was folding two distinct findings into one — while the header named none of them, so a
+  # deletion commented on the left and an addition on the right at line 40 of one file printed two
+  # rows byte-identical apart from the id and correctly did not fold. That reads as the reviewer
+  # posting one finding twice and the fold failing to catch it, which is the mirror of the `:0`
+  # defect of #105 and costs the reader the same round: either the anchors are re-derived from the
+  # API by hand, or the fold stops being trusted, which is what the fold note exists to prevent.
+  #
+  # Only what is NOT the default prints. RIGHT is the side of every row that is not about a
+  # deleted line, and a `side=RIGHT` on every entry would be noise bought at the price of the one
+  # row where the side matters; `start_side` prints when it differs from the side of the end,
+  # the only case where naming one side reads a range wrong. A header cannot be a
+  # total discriminator for a deny-list key — the next field GitHub invents is in the key and not
+  # on this line, which is the direction the key is deliberately wrong in — so what this owes the
+  # reader is every anchor field the row actually carries, not a proof of distinctness.
+  def item_side:
+    (if (.side // "") == "LEFT" then " side=LEFT" else "" end)
+    + (if .start_side != null and .start_side != (.side // "RIGHT") then " start_side=\(.start_side)"
+       else "" end);
+  # Where the finding was WRITTEN, when that is not where it sits now. GitHub migrates `line` and
+  # `start_line` forward as the branch advances while the `original_*` pair stays put, and both
+  # pairs are in the key, so two findings written at different places can sit at one place today
+  # and print one header between them. The same rule as the side fields: it prints only when the
+  # row carries an original that differs from what was rendered.
+  #
+  # In whichever unit the row is anchored by. A row from the per-review endpoint has no line at
+  # all and migrates in `position`/`original_position` instead, both of them in the key, so it
+  # has the same defect one field over and gets the same token (review of #272, round 1). The two
+  # units are never mixed on one line: a position is a second name for a place a row with lines
+  # has already named, and the API computes it from the same diff, so a pair of rows agreeing on
+  # both line fields cannot disagree on it.
+  def item_was: (.line // .original_line) as $l
+    | if $l != null then
+        (.start_line // .original_start_line) as $s
+        | if (.original_line != null and .original_line != $l)
+            or (.original_start_line != null and .original_start_line != $s) then
+            " was=\(anchor(.original_start_line; (.original_line // $l)))"
+          else "" end
+      else
+        (.position // .original_position) as $p
+        | if $p != null and .original_position != null and .original_position != $p then
+            " was=@\(.original_position)"
+          else "" end
       end;
   def fold_key: del(.id, .node_id, .url, .html_url, .pull_request_url, .pull_request_review_id,
                     .created_at, .updated_at, .reactions, ._links, .body);
@@ -968,7 +1056,7 @@ cmd_poll() {
 
   jq -r "$POLL_ITEM_DEFS"'
     if length == 0 then "(no new inline comments)"
-    else .[] | "--- inline id=\(thread_list) \(item_path):\(item_line) commit=\(inline_commit) by \(.user.login)\(dupe_note)\n\(body_block)"
+    else .[] | "--- inline id=\(thread_list) \(item_path):\(item_line)\(item_side)\(item_was) commit=\(inline_commit) by \(.user.login)\(dupe_note)\n\(body_block)"
     end' <<<"$new_inline" || return 4
 
   # The connector's "Review Summary" placeholder is machine-tagged with an HTML comment and posted
@@ -2222,11 +2310,13 @@ watch_grace_deadline() {
 # arms a snapshot on every round, and the arming must not outlive the watch. Its locals stay in
 # watch_loop, which is the scope watch_note_past and pr_head_read reach into.
 #
-# The sweep is here for the same reason: a watch is the only thing that makes snapshot
-# directories, so the start of one is where a directory a SIGKILLed watch left behind is noticed.
+# The sweep is here for a related reason: a watch is the longest-lived command this script has and
+# the one that runs on a box routinely, so the start of one is the natural place to notice what a
+# SIGKILLed run — a watch, a gh call, a fixture suite — left in TMPDIR. It sweeps every family,
+# not just the snapshot's (ludics-lite#219); see tmp_sweep_stale for why that is safe.
 cmd_watch() {
   local rc=0
-  snapshot_sweep_stale
+  tmp_sweep_stale
   watch_loop "$@" || rc=$?
   snapshot_off
   return "$rc"

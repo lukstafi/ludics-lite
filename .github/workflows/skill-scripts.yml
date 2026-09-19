@@ -141,22 +141,18 @@ jobs:
             exit $rc
           '
       - name: Parse guard
-        # post-merge-cleanup.sh and test-post-merge-cleanup.sh are each one brace group ending
-        # in `exit "$?"` and `}` (ludics-lite#10), so a mid-run rewrite cannot resume the shell
-        # at a shifted offset. The cost is that a command appended past the closing brace is
-        # never read, and that failure is silent; this is the guard on the guard.
-        run: |
-          set -e
-          for f in ship-pr/scripts/post-merge-cleanup.sh ship-pr/scripts/test-post-merge-cleanup.sh; do
-            if [ "$(tail -n 2 "$f")" != "$(printf 'exit "$?"\n}')" ]; then
-              echo "::error file=$f::$f must end in 'exit \"\$?\"' and '}' (the parse guard); anything past them is never read"
-              exit 1
-            fi
-            if ! awk '/^set -[a-z]*o pipefail$/ { s = NR; next } s && !/^#/ && !/^$/ { seen = 1; exit ($0 == "{") ? 0 : 1 } END { if (!seen) exit 1 }' "$f"; then
-              echo "::error file=$f::$f must open its brace group as the first command after 'set -o pipefail', above the first fork"
-              exit 1
-            fi
-          done
+        # Every `test-*.sh` suite is one brace group ending in `exit "$?"` and `}`
+        # (ludics-lite#10, #247), so a mid-run rewrite cannot resume the shell at a shifted
+        # offset. This step was two files named inline; the scan reads the same globs
+        # check-prompts.sh walks for the register, so a suite added to any skill is judged
+        # without a line here, and post-merge-cleanup.sh -- the one non-test script #10 armored
+        # -- is named in the script's own ALSO_GUARDED list. The cost of the shape is that a
+        # command appended past the closing brace is never read, and that failure is silent;
+        # this is the guard on the guard. In the lint job, like the two below, so it judges
+        # every head including a prompt-only one.
+        run: scripts/check-parse-guards.sh
+      - name: Parse guard fixtures
+        run: scripts/test-check-parse-guards.sh
       - name: jq shape guard
         # jq's `capture` yields ZERO outputs when it does not match, and a zero-output
         # sub-expression deletes the value around it rather than defaulting -- silently, with no
@@ -515,6 +511,12 @@ jobs:
         # real on this leg.
         if: ${{ !cancelled() }}
         run: scripts/test-check-scratch-dirs.sh || { echo '::error title=macOS suite failed::test-check-scratch-dirs.sh'; exit 1; }
+      - name: parse guard fixtures
+        # bash 3.2: the `|| return 0` dispatch that keeps a sourced library's caller alive inside
+        # the brace group, and the offset the appended-line controls turn on, are both read by the
+        # shell the fleet actually runs.
+        if: ${{ !cancelled() }}
+        run: scripts/test-check-parse-guards.sh || { echo '::error title=macOS suite failed::test-check-parse-guards.sh'; exit 1; }
       - name: execution reservations
         if: ${{ !cancelled() }}
         run: python3 issue-wave/scripts/test-fleet-execution.py || { echo '::error title=macOS suite failed::test-fleet-execution.py'; exit 1; }
