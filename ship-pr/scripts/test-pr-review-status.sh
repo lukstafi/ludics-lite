@@ -12,6 +12,17 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 # shellcheck source=test-pr-review-lib.sh
 source "$SCRIPT_DIR/test-pr-review-lib.sh"
+
+# One brace group over everything below the preamble, so bash parses the rest of this file WHOLE
+# before the first case runs and an edit landing mid-run cannot resume the shell at a shifted
+# offset; the `exit` at the foot means it never comes back to the file for a next command
+# (ludics-lite#10, #247). The `{` opens BELOW the sources, not above them: bash binds a function's
+# `declare -F` location when it PARSES the definition, so inside a group that also holds the
+# sources every definition here is parsed first and the libraries' bindings land last -- and the
+# shadow guard (ludics-lite#46) then reads every suite function as still the library's, refusing a
+# declared stub and accepting an undeclared shadow in silence. scripts/check-parse-guards.sh
+# checks the shape, and says what may stand above the `{`.
+{
 test_tmpdir TEST_ROOT status-test
 
 REPO=example/repo
@@ -589,6 +600,70 @@ test_a_dead_watch_s_snapshot_directory_is_swept() {
   rm -rf "$root"
 }
 
+test_every_other_family_a_dead_process_leaves_is_swept_too() {
+  # The snapshot directory was never the only thing a killed run leaves in TMPDIR, and until
+  # ludics-lite#219 it was the only thing anything collected. GH_ERR_FILE, gh_retry's per-attempt
+  # capture, the constants probe's stderr in test-pr-review-lib.sh and a fixture suite's scratch
+  # directory all outlive an owner that never reached its trap, and the sweep did not know their
+  # names: seven of them sat in this box's real TMPDIR, dated 09-10 to 09-14.
+  #
+  # The live half is the half that matters. Ten fixture suites and several watches share one
+  # TMPDIR on a wave day, so a sweep that went by age rather than by owner would delete a sibling's
+  # fixtures mid-run — which is why every family carries the owning pid, and why a name whose pid
+  # field is not a number is left alone instead of being guessed about.
+  idle_fixture
+  local root live dead f
+  root="$TEST_ROOT/tmp-root"
+  mkdir -p "$root"
+  # A pid that is certainly gone: a child that has already exited and been reaped.
+  (exit 0) &
+  dead=$!
+  wait "$dead" 2>/dev/null || true
+  # And one that is certainly alive for the length of this case.
+  sleep 30 &
+  live=$!
+  for f in "err.$dead" "gh.$dead.AAAAAA" "probe.$dead.err" \
+    "err.$live" "gh.$live.BBBBBB" "probe.$live.err"; do
+    : >"$root/pr-review-$f"
+  done
+  # test_tmpdir's directories, which are swept whole rather than file by file.
+  mkdir -p "$root/pr-review-test.$dead.cwd-checkout.AAAAAA" \
+    "$root/pr-review-test.$live.cwd-checkout.BBBBBB"
+  : >"$root/pr-review-test.$dead.cwd-checkout.AAAAAA/fixture"
+  # The shape the two unkeyed templates used to make: a suffix where the pid should be. It names
+  # no owner, so this sweep has nothing to decide about it and must leave it exactly where it is.
+  : >"$root/pr-review-gh.vswQwU"
+
+  local saved_root="$SNAP_ROOT" saved_dir="$SNAP_DIR" saved_snap="$SNAP"
+  SNAP_ROOT="$root" SNAP_DIR="" SNAP=""
+  run_watch 0,0,0
+  SNAP_ROOT="$saved_root" SNAP_DIR="$saved_dir" SNAP="$saved_snap"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+
+  assert_eq "$WATCH_RC" 0 "the round still lands; the sweep is not part of what a watch reports"
+  for f in "err.$dead" "gh.$dead.AAAAAA" "probe.$dead.err"; do
+    if [ -e "$root/pr-review-$f" ]; then
+      bail "pr-review-$f: a file whose owning pid is gone should be swept at watch start"
+    fi
+  done
+  if [ -d "$root/pr-review-test.$dead.cwd-checkout.AAAAAA" ]; then
+    bail "a dead suite's scratch directory should be swept whole, fixtures and all"
+  fi
+  for f in "err.$live" "gh.$live.BBBBBB" "probe.$live.err"; do
+    if [ ! -e "$root/pr-review-$f" ]; then
+      bail "pr-review-$f: a LIVE sibling's file must survive another run's sweep"
+    fi
+  done
+  if [ ! -d "$root/pr-review-test.$live.cwd-checkout.BBBBBB" ]; then
+    bail "a live suite's scratch directory must survive another run's sweep"
+  fi
+  if [ ! -e "$root/pr-review-gh.vswQwU" ]; then
+    bail "a name with no pid in it names no owner, and must be left alone rather than aged out"
+  fi
+  rm -rf "$root"
+}
+
 # --- the reviewer that never started (ludics-lite#78) ------------------------------------------
 # The head is the SHA the first ocannl-staging#677 failure named, so "the ref it could not fetch"
 # and "the PR's head" are the same string, as they were there.
@@ -958,6 +1033,7 @@ tests=(
   test_a_failed_round_hands_the_state_nothing
   test_status_after_a_watch_reads_for_itself
   test_a_dead_watch_s_snapshot_directory_is_swept
+  test_every_other_family_a_dead_process_leaves_is_swept_too
   test_initialization_failure_is_its_own_state
   test_a_failure_naming_no_ref_is_not_attributed
   test_a_differently_worded_failure_is_missed_not_guessed
@@ -977,3 +1053,5 @@ tests=(
 )
 
 run_tests "${tests[@]}"
+exit "$?"
+}

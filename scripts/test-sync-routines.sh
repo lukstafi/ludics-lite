@@ -57,6 +57,12 @@
 
 set -uo pipefail
 
+# One brace group, so bash parses this file WHOLE before its first line runs and an edit landing
+# while a run is in flight cannot resume the shell at a shifted offset; the `exit` at the foot
+# means the shell never comes back to the file for a next command. Two lines here and two at the
+# foot, with the body's own indentation untouched (ludics-lite#10, #247); scripts/check-parse-guards.sh
+# checks the shape.
+{
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 SYNC="$HERE/sync-routines.sh"
@@ -1396,3 +1402,5 @@ out=$(env CLAUDE_SCHEDULED_TASKS_DIR="$TMP/empty-dest" "$SYNC" 2>&1); rc=$?
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
+exit "$?"
+}
