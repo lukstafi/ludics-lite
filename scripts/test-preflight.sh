@@ -338,18 +338,24 @@ workflow_bare_commands() {
     $1 == "-" && $2 == "run:" { c = bare($3, tail_from(4)); if (c != "") print c }
   ' "$WORKFLOW"
 }
-# The command word of every lint `run:` whose step carries a condition other than `!cancelled()`.
-# GitHub skips a step whose `if:` is false and reports the job green, so a pinned check can be
-# turned off without touching its run line at all (round 6). `!cancelled()` is the one condition
-# known to preserve execution -- it skips only a cancelled run, which is the macOS legs' spelling
-# for "run this step even after an earlier one failed" -- and anything else is a line here.
-lint_conditional_runs() {
+# The command word of every lint `run:` whose STEP carries an attribute that stops it failing the
+# job. Two of them exist: an `if:` decides whether the step runs at all, and `continue-on-error`
+# decides whether its failure counts -- either turns a pinned check off without touching the run
+# line the pins read, and GitHub reports the job green (rounds 6 and 7). Read as the genre rather
+# than the two instances: a pinned step carries neither, with one exception spelled out, the
+# `${{ !cancelled() }}` this workflow uses for "run even after an earlier step failed", which
+# skips only a cancelled run.
+lint_disabled_runs() {
   awk -v want="  lint:" '
     /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_job = ($0 == want); next }
     !in_job { next }
-    /^      - / { cond = "" }
+    /^      - / { cond = ""; soft = "" }
     $1 == "if:" { cond = $0; sub(/^[[:space:]]*if:[[:space:]]*/, "", cond) }
-    $1 == "run:" && cond != "" && cond !~ /^\$\{\{[ ]*![ ]*cancelled\(\)[ ]*\}\}$/ { print $2 }
+    $1 == "continue-on-error:" { soft = ($2 != "false") }
+    $1 == "run:" {
+      if (soft) { print $2; next }
+      if (cond != "" && cond !~ /^\$\{\{[ ]*![ ]*cancelled\(\)[ ]*\}\}$/) print $2
+    }
   ' "$WORKFLOW"
 }
 
@@ -395,12 +401,9 @@ lint_preflight_steps() {
   ' "$WORKFLOW"
 }
 
-# The one exemption, and it is named rather than glob-shaped: this suite runs preflight, so
-# preflight running this suite would recurse. Asserted to exist, since an exemption naming nothing
-# is a line that reads as though it still covered something.
-SELF=scripts/test-preflight.sh
-[ -f "$ROOT/$SELF" ] && ok "the pin's one exemption names a file that is there" \
-  || ko "the pin exempts $SELF, which is not in the checkout"
+# No exemption: this suite is a table entry of its own since round 7, so the pin below reads it
+# like any other check. What keeps preflight running this suite from starting a third copy is the
+# recursion guard in run_step, probed below.
 
 table_commands=$("$PF" steps | awk -F'\t' '$2 != "-" { print $2 }')
 # The steps preflight implements itself: these have no script for the reader above to find, so
@@ -421,7 +424,6 @@ unpinned=
 while IFS= read -r cmd; do
   [ -n "$cmd" ] || continue
   [ "$cmd" = scripts/preflight.sh ] && continue
-  [ "$cmd" = "$SELF" ] && continue
   grep -Fqx -- "$cmd" <<<"$table_commands" || unpinned="$unpinned $cmd"
 done <<EOF
 $lint_commands
@@ -443,10 +445,10 @@ EOF
 [ -n "$bare_run_commands" ] && ok "the workflow's bare invocations can be read" \
   || ko "no bare run: invocation found in the workflow -- the pin above would pass over nothing"
 
-conditional=$(lint_conditional_runs)
-[ -z "$conditional" ] \
-  && ok "...and no pinned check is behind a condition that could skip it" \
-  || ko "a lint step the pin reads is behind a condition:$conditional"
+disabled=$(lint_disabled_runs)
+[ -z "$disabled" ] \
+  && ok "...and no pinned check carries an attribute that stops it failing the job" \
+  || ko "a lint step the pin reads is skippable or non-blocking:$disabled"
 
 # The same validation on the flag CI's own fail-closed promise rests on.
 unguarded=$(lint_preflight_unguarded)
@@ -542,7 +544,6 @@ probe_unpinned=
 while IFS= read -r cmd; do
   [ -n "$cmd" ] || continue
   [ "$cmd" = scripts/preflight.sh ] && continue
-  [ "$cmd" = "$SELF" ] && continue
   grep -Fqx -- "$cmd" <<<"$table_commands" || probe_unpinned="$probe_unpinned $cmd"
 done <<EOF
 $(job_run_commands lint)
@@ -559,7 +560,6 @@ probe_inline=
 while IFS= read -r cmd; do
   [ -n "$cmd" ] || continue
   [ "$cmd" = scripts/preflight.sh ] && continue
-  [ "$cmd" = "$SELF" ] && continue
   grep -Fqx -- "$cmd" <<<"$table_commands" || probe_inline="$probe_inline $cmd"
 done <<EOF
 $(job_run_commands lint)
@@ -650,20 +650,31 @@ else
   ko "the swap probe rewrote nothing: the prompts job no longer spells its step as this file expects"
 fi
 
+# continue-on-error is the other attribute that makes a pinned check non-blocking.
+if probe_workflow_swap '        run: scripts/check-scratch-dirs.sh' \
+  '        continue-on-error: true
+        run: scripts/check-scratch-dirs.sh'; then
+  [ "$(lint_disabled_runs)" = scripts/check-scratch-dirs.sh ] \
+    && ok "...and a pinned step marked continue-on-error is reported" \
+    || ko "continue-on-error on a lint step was not reported (verdict:$(lint_disabled_runs))"
+else
+  ko "the swap probe rewrote nothing: the lint job no longer spells the scratch guard step as this file expects"
+fi
+
 # A condition is the other way to stop a step running without touching its run line.
 if probe_workflow_swap '        run: scripts/preflight.sh --require-tools modes' \
   '        if: ${{ false }}
         run: scripts/preflight.sh --require-tools modes'; then
-  [ "$(lint_conditional_runs)" = scripts/preflight.sh ] \
+  [ "$(lint_disabled_runs)" = scripts/preflight.sh ] \
     && ok "...and a pinned step behind a false condition is reported" \
-    || ko "a lint step behind 'if: false' was not reported (verdict:$(lint_conditional_runs))"
+    || ko "a lint step behind 'if: false' was not reported (verdict:$(lint_disabled_runs))"
 else
   ko "the swap probe rewrote nothing: the lint job no longer spells the mode step as this file expects"
 fi
 if probe_workflow_swap '        run: scripts/check-jq-shapes.sh' \
   '        if: ${{ !cancelled() }}
         run: scripts/check-jq-shapes.sh'; then
-  [ -z "$(lint_conditional_runs)" ] \
+  [ -z "$(lint_disabled_runs)" ] \
     && ok "...while !cancelled(), which skips only a cancelled run, is not refused" \
     || ko "the !cancelled() condition was read as one that could skip the step"
 else
@@ -691,6 +702,17 @@ else
   ko "the swap probe rewrote nothing: the lint job no longer spells the mode step as this file expects"
 fi
 WORKFLOW="$ROOT/.github/workflows/skill-scripts.yml"
+
+# --- the recursion guard on this very suite ---------------------------------------------------
+#
+# preflight runs this file as its `preflight-fixtures` step, and this file runs preflight. The
+# loop cannot form today -- every call here is a query or a named step, never the bare all-run --
+# and the guard is what keeps that true of a call some later round adds.
+
+expect "preflight refuses to run this suite from inside a run of this suite" \
+  1 'must not be run by it again' -- env PREFLIGHT_IN_FIXTURES=1 "$PF" preflight-fixtures
+expect "...and the step is in the table, so the pin reads it like any other check" \
+  0 'preflight-fixtures	scripts/test-preflight.sh' -- "$PF" steps
 
 # --- the checkout this suite runs in ------------------------------------------------------------
 

@@ -25,6 +25,8 @@
 #   - jq-fixtures      scripts/test-check-jq-shapes.sh
 #   - scratch-dirs     scripts/check-scratch-dirs.sh
 #   - scratch-fixtures scripts/test-check-scratch-dirs.sh
+#   - preflight-fixtures scripts/test-preflight.sh (this script's own controls; the lint job runs
+#                      them too, so leaving them out here made the local command a subset of CI)
 #
 # MISSING TOOLS. Without --require-tools a step whose interpreter is absent is SKIPped by name and
 # does not fail the run: pwsh is on neither fleet mac, and a preflight that goes red for a tool
@@ -72,6 +74,7 @@ STEPS=(
   'jq-fixtures:scripts/test-check-jq-shapes.sh'
   'scratch-dirs:scripts/check-scratch-dirs.sh'
   'scratch-fixtures:scripts/test-check-scratch-dirs.sh'
+  'preflight-fixtures:scripts/test-preflight.sh'
 )
 
 usage() { # the leading comment block, which is this script's manual
@@ -279,6 +282,15 @@ run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped
     printf 'preflight: %s: SKIP (%s not found; CI runs this step with --require-tools)\n' "$name" "$tool"
     return 3
   fi
+  # The fixture suite runs this script, so this script running it must not start a third copy.
+  # The suite calls preflight only by query or by named step today, so the loop cannot form; the
+  # guard is here because that is a property of the suite, and a bare call added to it later would
+  # otherwise fork until the box gave out (round 7).
+  if [ "$name" = preflight-fixtures ] && [ -n "${PREFLIGHT_IN_FIXTURES:-}" ]; then
+    printf 'preflight: %s: FAIL (already running inside %s; a suite that runs this script must not be run by it again)\n' \
+      "$name" "$cmd"
+    return 1
+  fi
   if [ "$cmd" != '-' ]; then
     # Fail closed on a step whose script is not there: CI's own step would be a red `No such file`,
     # and a local pass over a check that did not run is the failure this script exists to end.
@@ -286,7 +298,11 @@ run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped
       printf 'preflight: %s: FAIL (%s is not there or not executable)\n' "$name" "$cmd"
       return 1
     fi
-    "./$cmd"
+    if [ "$name" = preflight-fixtures ]; then
+      PREFLIGHT_IN_FIXTURES=1 "./$cmd"
+    else
+      "./$cmd"
+    fi
   else
     case "$name" in
     syntax) step_syntax ;;
