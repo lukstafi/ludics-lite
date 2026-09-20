@@ -514,7 +514,8 @@ controlled through the tools in your coordinator's file, never through those com
   ludics-lite#12): a round rebutted in full ends the loop, and from the thirteenth round with
   findings (`pr-review.sh rounds` reads the count off the PR) only BLOCKING findings are fixed
   under ship-pr's narrow criteria: a consequential defect introduced or materially worsened by
-  the PR, an invalidated central claim or its evidence, or failed required build checks.
+  the PR, an invalidated central claim or its evidence, or failed build-relevant checks
+  (every non-advisory check, as the merge gate defines them).
   A severe pre-existing defect merely exposed by the PR gets an appropriately prioritized bug
   report, not a merge block; correcting a central claim does not require fixing that defect here.
   The rest are deferred to one follow-up issue, linking existing reports, so the loop ends on

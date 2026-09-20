@@ -612,14 +612,16 @@ merge is still the build gate's to allow.
 
 - The PR introduces or materially worsens a defect that materially prevents the intended use,
   causes a consequential regression in supported behavior, or creates a substantial risk of data
-  loss, corruption or unauthorized access during intended use or reasonably foreseeable mistakes.
+  loss, corruption or unauthorized access during intended use, reasonably foreseeable mistakes
+  or abuse, including adversarial inputs.
 - The finding invalidates the PR's central claim or its supporting evidence. Correct the claim
   or evidence before merging; fixing an underlying pre-existing defect can remain separate. A
   minor discrepancy with the description normally calls for correcting the description, not
   expanding the implementation. Do not relabel failure to deliver the agreed goal as a minor
   discrepancy.
-- Required build checks on the final head fail. The build gate still applies independently of
-  which change caused the failure.
+- Build-relevant checks on the final head fail: the merge gate includes every non-advisory
+  check, not just checks required by branch protection. That gate still applies independently
+  of which change caused the failure.
 
 Severity alone is insufficient: a high-priority pre-existing defect that the PR merely exposes
 gets a bug report with the appropriate urgency, not a merge block. Record it in the consolidated
