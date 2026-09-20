@@ -155,7 +155,18 @@ def main():
             validate_record(record, path)
             records[path.stem] = record
     if action == "list":
-        print(json.dumps(list(records.values()), indent=2))
+        options = json.loads(raw)
+        if (not isinstance(options, dict) or set(options) - {"active", "compact"}
+                or any(type(value) is not bool for value in options.values())):
+            refuse("list options must be active/compact booleans")
+        # Validate the entire ledger above before filtering: a compact view must not hide
+        # corrupt ownership evidence, including a malformed terminal record.
+        selected = [record for record in records.values()
+                    if not options.get("active") or record["state"] != "concluded"]
+        if options.get("compact"):
+            selected = [{key: value for key, value in record.items()
+                         if key not in {"history", "lease_token"}} for record in selected]
+        print(json.dumps(selected, indent=None if options.get("compact") else 2))
         return
     data = json.loads(raw)
     if not isinstance(data, dict):

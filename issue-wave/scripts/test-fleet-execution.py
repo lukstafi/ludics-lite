@@ -51,6 +51,7 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     change('reserve', mixed_case)
     change('conclude', dict(request_id='CaseJob', verdict='not-launched',
                            log='/logs/case-check', evidence='fixture never dispatched'))
+    assert json.loads(run('execution', 'list', '--active', '--compact')) == []
     # Host-local CLI and remote native requests contend for the same box, regardless of
     # transport/residence. The same issue can independently reserve another box.
     competitors = {
@@ -103,6 +104,28 @@ with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     change('reserve', competitors[identity])
     assert records()[identity] == first
     assert len(records()) == 3 and first['state'] == 'reserved'
+    # Routine supervision needs outstanding ownership, not an ever-growing history dump.
+    # Exercise the public shell path and retain default list's full audit records.
+    ledger_before = {p.name: p.read_bytes() for p in (root / 'executions').glob('*.json')}
+    full = json.loads(run('execution', 'list', owner='reader'))
+    active = json.loads(run('execution', 'list', '--active', owner='reader'))
+    assert {r['request_id'] for r in active} == {identity, 'minix'}
+    compact = json.loads(run('execution', 'list', '--compact', owner='reader'))
+    assert compact == [{k: v for k, v in r.items() if k not in {'history', 'lease_token'}}
+                       for r in full]
+    active_compact = json.loads(run('execution', 'list', '--active', '--compact'))
+    assert active_compact == [r for r in compact if r['state'] != 'concluded']
+    assert json.loads(run('execution', 'list', '--compact', '--active')) == active_compact
+    assert all('history' in r and 'lease_token' in r for r in full)
+    run('execution', 'list', '--actve', expected=2)
+    assert ledger_before == {p.name: p.read_bytes() for p in (root / 'executions').glob('*.json')}
+    # Filtering a terminal record must not hide corruption from the reader.
+    terminal_path = root / 'executions' / 'CaseJob.json'
+    broken = json.loads(terminal_path.read_bytes())
+    del broken['history']
+    terminal_path.write_text(json.dumps(broken))
+    run('execution', 'list', '--active', '--compact', expected=1)
+    terminal_path.write_bytes(ledger_before['CaseJob.json'])
     change('reserve', {**request(identity), 'purpose': 'different'}, expected=1)
     change('dispatch', dict(request_id=identity, evidence='about to invoke runner'))
     change('dispatch', dict(request_id=identity, evidence='blind retry'), expected=1)

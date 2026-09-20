@@ -48,7 +48,7 @@
 #   fleet-worker.sh unstick <box> <name> --message <file> [--kill] [-- <extra CLI args>]
 #   fleet-worker.sh ls [<box> ...]
 #   fleet-worker.sh load
-#   fleet-worker.sh execution list
+#   fleet-worker.sh execution list [--active] [--compact]
 #   fleet-worker.sh execution slot [--wait <seconds>] -- <command...>   # hold one of THIS box's
 #                          # run-time correctness slots around a suite or batch (no lease needed)
 #   fleet-worker.sh execution reserve|dispatch|record|reconcile|conclude <json-file>
@@ -1345,7 +1345,18 @@ cmd_execution_slot() {
 cmd_execution() {
   local action="${1:-}" payload='{}'
   case "$action" in
-    list) [ "$#" -eq 1 ] || die "execution list: no arguments" ;;
+    list)
+      shift
+      local active=false compact=false
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --active) active=true ;;
+          --compact) compact=true ;;
+          *) die "execution list: expected --active or --compact" ;;
+        esac
+        shift
+      done
+      payload="{\"active\":$active,\"compact\":$compact}" ;;
     # The run-time slot lock: no registry mutation, no lease, and the command runs from here.
     slot) shift; cmd_execution_slot "$@" ;;
     conclude)

@@ -95,7 +95,11 @@ conflicting request reports its current owner and changes nothing. Retrying iden
 identity and fields returns the existing reservation, including terminal state; a changed
 request with that ID is refused. IDs that differ only by case collide and are refused,
 including on case-sensitive hosts. Use a new ID for a genuinely new execution. `execution list`
-prints all records, including history; it requires no coordinator identity. The creating
+prints all records, including history; it requires no coordinator identity. For routine
+supervision use `execution list --active --compact`: `--active` excludes concluded records,
+and `--compact` omits history and the lease token while retaining current ownership, request
+and execution evidence fields. Both options are read-only and validate the entire ledger before
+filtering; use the default full listing for history and reconciliation. The creating
 coordinator and wave remain recorded after adoption. Transport is `subagent`, `app`, `cli` or
 `coordinator`. Transport and `agent_host` are provenance; exclusivity depends on
 `execution_host`, whether the agent is local or remote. Provider is not an ownership key. The
@@ -103,15 +107,22 @@ same issue may hold separate reservations on different boxes. Planned placement 
 for iteration; agent capacity and issue dependency readiness remain coordinator decisions
 outside this API.
 
-Immediately before invoking the existing bounded project runner - which the worker invokes
-through `execution slot`, so the box's run-time cap holds for assigned runs too - use
-`execution dispatch` with
+For a reservation created with `reserve`, immediately before invoking the existing bounded
+project runner use `execution dispatch` with
 `{"request_id":"wave-issue123-cuda-1","evidence":"about to invoke project verifier"}`.
 This rechecks the lease and halt under lock and changes `reserved` to `launching`. Nonzero means
 no dispatch. This is a point-in-time gate, not atomic with the subsequent ssh or tool call.
 Record the pending launch before making the call, and never repeat a launch because the
 connection dropped. If adoption or halt occurs in that gap, reconciliation must account for the
 possible execution.
+
+`execution run` already performs dispatch; do not dispatch that reservation again. The assignment
+must name its workload kind and command: **correctness** wraps the bounded project runner in
+`execution slot`; an exclusively reserved **measurement** invokes the runner directly, without
+that wrapper (ludics-lite#309). The slot intentionally refuses every outstanding measurement,
+including the assigned measurement itself. Keep that refusal: it protects the measurement from
+concurrent correctness batches. Direct invocation still uses the project's time limits, logs and
+process ownership; it does not skip the reservation, dispatch or external-activity check.
 
 Use `execution record` with the request ID, `state` (`running` or `uncertain`), and nonempty
 `evidence`. This requires a dispatched reservation (`launching`, `running` or `uncertain`); use
