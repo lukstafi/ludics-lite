@@ -390,6 +390,15 @@ component is *not* responsible for) is worth defending in the thread, in the ter
 round you answer entirely with reasoning needs no push: reply, then merge — that is one of the
 loop's two exits (*When the loop ends*, below).
 
+Before a review fix broadens the design or removes supported behavior, reread the original
+issue's acceptance goal. Separate defects the change introduces or exposes from independent,
+pre-existing limitations. Do not turn a bounded correction into a promise of complete coverage,
+then disable working paths to make that stronger promise true. Preserve the requested behavior,
+narrow an overstated contract, and record a justified out-of-scope limitation in a focused
+follow-up with a reply linking the evidence. This is not a way to defer a defect that makes the
+requested change wrong; those findings still need fixing. In a wave, surface the scope decision
+to the coordinator before implementing it, rather than waiting for the late-round threshold.
+
 **When findings arrive in a family, fix the genre, not the instance.** This is the single biggest
 lever on how long the loop runs. If round N says "pin knob X" and round N+1 says "pin knob Y", a
 third knob exists; close the whole class instead — sweep the ambient variables categorically,

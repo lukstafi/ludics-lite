@@ -20,6 +20,23 @@ directory, observed SHA and exit in its reply, which `execution conclude --from-
 / `EXECUTION_RESULT` blocks of [native-claude.md](native-claude.md#worker-channel); what
 differs is only that it may wait instead of yielding.
 
+Name the workload kind in that assignment and use the wrapper specified in
+[executions.md](executions.md#reserve-launch-observe-conclude): correctness takes a run-time
+slot; an exclusively reserved measurement runs the bounded project runner directly.
+
+## Coordinator supervision
+
+Keep a current snapshot at the top of the board (worker, PR/head, gate, runner handle and
+outstanding reservation), with the historical log below it. Routine registry reads use
+`execution list --active --compact`; full records remain available for reconciliation.
+
+Let each worker's tracked review/CI watcher own its polling loop. The coordinator independently
+checks launches, reported gate changes and merges, and investigates a stale report or failed
+watcher; it need not duplicate every unchanged poll. When only a coordinator-owned integration
+run remains, wait on that runner's tracked handle rather than on completed agents. Retain live
+handles across context compaction and retrieve their actual terminal verdicts. Relay useful
+milestones and keep any harness-required progress updates brief.
+
 ## What a returned turn means
 
 The rule is SKILL.md's (Supervise: *A returned turn means the turn ended*); on this runtime the
