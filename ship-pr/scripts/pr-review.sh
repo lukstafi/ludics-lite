@@ -1943,8 +1943,10 @@ rounds_line() {
   esac
   if [ "$count" -gt "$ROUND_THRESHOLD" ]; then
     echo "review rounds with findings: $count, PAST the $ROUND_THRESHOLD-round threshold —" \
-      "blocking-only from here: fix what would make the PR wrong (a bug as such does not" \
-      "qualify), defer the rest to ONE follow-up issue, and merge on the first round with" \
+      "blocking-only from here: use ship-pr's narrow criteria — consequential defects" \
+      "introduced or materially worsened by the PR, invalidated central claims or evidence," \
+      "or failed build-relevant checks (all non-advisory checks). Merely exposing a severe" \
+      "pre-existing defect does not block. Defer the rest to ONE follow-up issue, and merge on the first round with" \
       "nothing to push ($detail)"
     return 1
   fi

@@ -391,13 +391,14 @@ round you answer entirely with reasoning needs no push: reply, then merge — th
 loop's two exits (*When the loop ends*, below).
 
 Before a review fix broadens the design or removes supported behavior, reread the original
-issue's acceptance goal. Separate defects the change introduces or exposes from independent,
-pre-existing limitations. Do not turn a bounded correction into a promise of complete coverage,
-then disable working paths to make that stronger promise true. Preserve the requested behavior,
+issue's acceptance goal. Separate defects the change introduces or materially worsens from
+pre-existing defects the work merely exposes. Do not turn a bounded correction into a promise of
+complete coverage, then disable working paths to make that stronger promise true. Preserve the requested behavior,
 narrow an overstated contract, and record a justified out-of-scope limitation in a focused
-follow-up with a reply linking the evidence. This is not a way to defer a defect that makes the
-requested change wrong; those findings still need fixing. In a wave, surface the scope decision
-to the coordinator before implementing it, rather than waiting for the late-round threshold.
+follow-up with a reply linking the evidence. Apply the blocking criteria in *When the loop ends*
+after round twelve; discovering a severe existing defect does not itself meet them. In a wave,
+surface the scope decision to the coordinator before implementing it, rather than waiting for
+the late-round threshold.
 
 **When findings arrive in a family, fix the genre, not the instance.** This is the single biggest
 lever on how long the loop runs. If round N says "pin knob X" and round N+1 says "pin knob Y", a
@@ -575,7 +576,10 @@ rollback windows, backup ordering, lock-holder identity. Each was a real silent-
 was cheap, and each spawned one or two successors in the next round. The reviewer approved at
 round 23, four hours in, most of them spent hardening concurrency paths a single coordinator per
 fleet never exercises. A long review is welcome when it makes the code better, and the loop has
-no round limit. What it has is two exits, and a round past which most findings stop being work.
+no round limit. The first twelve rounds give worthwhile improvements a generous exploration
+budget, not an obligation to implement every suggestion or proof that all defects have been found.
+After that, distinguish work worth doing from work required before this PR lands. The loop has
+two exits, and deferred improvements remain recorded for follow-up.
 
 **A round rebutted in full ends the loop.** Judging on the merits (above) already means some
 findings are wrong, and a wrong one is answered with reasoning, not a compliance edit. A finding
@@ -604,23 +608,38 @@ previous review, so a re-requested round on the same head counts on its own. It 
 threshold (`SHIP_PR_ROUND_THRESHOLD`, 12) and enforces nothing: the threshold is a policy, and the
 merge is still the build gate's to allow.
 
-*Blocking* is read narrowly, and informally: there is no checklist, and a bug does not qualify by
-being a bug. A finding blocks when merging over it would make the PR wrong — the change does not
-do what its description claims, it loses or corrupts data on a path the PR's own use takes, it
-leaves `master` red, or it invalidates a result the PR reports. A real defect that is none of
-those is deferred: a silent one included, and one on machinery an earlier round asked for
-included. That narrows the silent-vs-loud policy (issue-wave), whose "silent is must-fix at any
-round count" governs the first twelve rounds; past them the axis is whether the PR is wrong, not
-whether the defect is quiet. The findings that arrive past the threshold have a recognisable
-shape: their subject exists only because an earlier round asked for it — the lock added in round
+*Blocking* after round twelve requires one of these conditions:
+
+- The PR introduces or materially worsens a defect that materially prevents the intended use,
+  causes a consequential regression in supported behavior, or creates a substantial risk of data
+  loss, corruption or unauthorized access during intended use, reasonably foreseeable mistakes
+  or abuse, including adversarial inputs.
+- The finding invalidates the PR's central claim or its supporting evidence. Correct the claim
+  or evidence before merging; fixing an underlying pre-existing defect can remain separate. A
+  minor discrepancy with the description normally calls for correcting the description, not
+  expanding the implementation. Do not relabel failure to deliver the agreed goal as a minor
+  discrepancy.
+- Build-relevant checks on the final head fail: the merge gate includes every non-advisory
+  check, not just checks required by branch protection. That gate still applies independently
+  of which change caused the failure.
+
+Severity alone is insufficient: a high-priority pre-existing defect that the PR merely exposes
+gets a bug report with the appropriate urgency, not a merge block. Record it in the consolidated
+residual issue or link its existing report there, and explain the disposition in the thread.
+Other valid findings are deferred too, including silent defects and defects in machinery an earlier review round added,
+unless they meet the conditions above. This narrows issue-wave's silent-vs-loud policy after the
+first twelve rounds; being quiet or review-requested does not itself make a defect blocking.
+
+The findings that arrive past the threshold have a recognisable shape: their subject exists
+only because an earlier round asked for it — the lock added in round
 3, the rollback added in round 5 — and each spawns a successor. When one of those does block,
 removing the machinery is as good an answer as fixing it, and the one a loop never takes on its
 own: a lock with three rounds of races is often better answered by no lock and a documented
 single-writer assumption; a rollback with a window, by no rollback and an idempotent retry.
 Simpler and correct beats elaborate and nearly correct, and a reviewer accepts the removal when
 the reply names the invariant that now carries the load. Blocking findings in the PR's own
-substance that keep arriving past the threshold are a different signal: that is a wrong PR, not a
-long review — stop and raise it with the user.
+substance that keep arriving past the threshold are a different signal: the approach may need
+reconsidering — stop and raise it with the user.
 
 **Closing out** at either exit is the same act, and the record it leaves is what makes a merge
 the reviewer never 👍'd defensible:
@@ -647,9 +666,9 @@ not done and why, instead of finding it in the next PR's review.
 Both exits have an incentive problem: past the threshold, deferring is cheaper than fixing, and
 rebutting is cheaper than either at any round. The threads and the record paragraph are the only
 check on that in a standalone session, which is why a rebuttal cites its evidence and a deferral
-names why the PR is not wrong without the fix — a reviewer who was right and got argued with is
-visible there. Under a wave coordinator none of this changes; the coordinator's pre-authorization
-(issue-wave's convergence policy) can only move close-out earlier, never later.
+names why the finding does not meet the blocking criteria — a reviewer who was right and got
+argued with is visible there. Under a wave coordinator none of this changes; the coordinator's
+pre-authorization (issue-wave's convergence policy) can only move close-out earlier, never later.
 
 ### The approval is one gate; the build is the other
 

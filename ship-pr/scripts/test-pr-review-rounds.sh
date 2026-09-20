@@ -292,7 +292,10 @@ test_threshold() {
   assert_eq "$ROUNDS_RC" 1 "past the threshold should exit 1"
   assert_contains "$ROUNDS_OUTPUT" "3, PAST the 2-round threshold" "should say it is past"
   assert_contains "$ROUNDS_OUTPUT" "blocking-only from here" "should carry the triage rule"
-  assert_contains "$ROUNDS_OUTPUT" "a bug as such does not" "should say a bug is not blocking"
+  assert_contains "$ROUNDS_OUTPUT" "introduced or materially worsened by the PR" "should require attribution for defect blockers"
+  assert_contains "$ROUNDS_OUTPUT" "invalidated central claims or evidence" "should retain the claim gate"
+  assert_contains "$ROUNDS_OUTPUT" "all non-advisory checks" "should match the build gate"
+  assert_contains "$ROUNDS_OUTPUT" "pre-existing defect does not block" "should distinguish discovery from introduction"
   assert_not_contains "$ROUNDS_OUTPUT" "of 2" "past the threshold is not 'N of M'"
 }
 
