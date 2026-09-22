@@ -7,16 +7,15 @@
 #   chmod 600 ~/.config/wake-lab/hosts.sh && $EDITOR ~/.config/wake-lab/hosts.sh
 #
 # This is the only part of the lab's wiring that is site data rather than reviewable logic: the
-# fleet's MAC addresses and LAN IPs. Everything else — the lore, the router endpoints, the ssh
+# fleet's MAC addresses, LAN IPs, and booted operating-system kinds. Everything else — the lore, the router endpoints, the ssh
 # aliases, the logic — is tracked in ludics-lite, so an in-place edit shows up in `git status`
 # (ludics-lite#31). The MACs below are 00:00:00 placeholders on purpose; a real one in this file
 # is a leak, and scripts/test-wake-lab.sh fails the repository if one appears. The IPs are
 # likewise fictitious, from RFC 5737's documentation range (192.0.2.0/24) rather than from any
 # real LAN: a template carrying the author's leases would be site data by another name.
 #
-# The box names must be the ones the script knows: rog, minix, asus (lan_of/ts_of/wsl_of in
-# wake-lab.sh are the tracked half of the same table). Each function echoes the value(s) for a
-# known box and returns 1 for anything else; wake-lab.sh refuses to run unless all three exist.
+# The box names must be the ones the script knows: rog, minix, tuf, asus. Each function echoes
+# the value(s) for a known box and returns 1 for anything else; all four are required.
 # Sourced by a `set -u` script under bash 3.2: no associative arrays.
 
 # Every MAC of a box, Wi-Fi and Ethernet. wake() sends a magic packet to each — the Wi-Fi ones
@@ -25,6 +24,7 @@
 mac_of() { case "$1" in
   rog)   echo 00:00:00:00:00:01 00:00:00:00:00:02 ;;  # Wi-Fi, Ethernet
   minix) echo 00:00:00:00:00:03 00:00:00:00:00:04 ;;  # Wi-Fi, Ethernet
+  tuf)   echo 00:00:00:00:00:06 ;;                    # Wi-Fi only: manual wake
   asus)  echo 00:00:00:00:00:05 ;;                    # Wi-Fi only
   *) return 1 ;; esac; }
 
@@ -43,5 +43,15 @@ eth_mac_of() { case "$1" in
 ip_of() { case "$1" in
   rog)   echo 192.0.2.30 ;;  # Ethernet; its Wi-Fi lease is a different address
   minix) echo 192.0.2.31 ;;  # Ethernet
+  tuf)   echo 192.0.2.32 ;;  # Wi-Fi; no Ethernet WoL
   asus)  echo 192.0.2.29 ;;  # Wi-Fi
+  *) return 1 ;; esac; }
+
+# The OS reached after a magic packet depends on the box's boot selection. Set this to the
+# currently booted OS before operating a dual-boot box; status also probes and reports what
+# actually answered. A native Ubuntu box needs no Windows-side WSL kick or holder.
+kind_of() { case "$1" in
+  rog|minix) echo linux ;;  # set to wsl if the box boots Windows/WSL instead
+  tuf)       echo linux ;;
+  asus)      echo wsl ;;
   *) return 1 ;; esac; }

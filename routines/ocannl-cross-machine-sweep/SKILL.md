@@ -41,20 +41,27 @@ Carry on with the sweep either way — a drifted prompt still runs a useful swee
 
 ## 1. Wake the GPU boxes
 
-The sweep talks to the WSL sides (`rog-nv-wsl`, `minix-amd-wsl`); waking and liveness go through
-the Windows sides. A box can be fully awake on `-win` while `-wsl` is still absent, so "the machine
-is up" and "the backend is testable" are different claims.
+Read the site file's `kind_of` for each GPU box, then wake each kind through its own path:
 
-One command does the whole thing, and is safe to run unconditionally — packets to an
-already-running box are a no-op, and the WSL restart is wanted either way (below):
+    . ~/.config/wake-lab/hosts.sh
+    linux_boxes=(); wsl_boxes=()
+    for box in rog minix; do
+      case "$(kind_of "$box")" in
+        linux) linux_boxes+=("$box") ;;
+        wsl) wsl_boxes+=("$box") ;;
+        *) echo "unknown kind for $box" >&2; exit 1 ;;
+      esac
+    done
+    [ ${#linux_boxes[@]} -eq 0 ] || ~/bin/wake-lab.sh --wait "${linux_boxes[@]}"
+    [ ${#wsl_boxes[@]} -eq 0 ] || ~/bin/wake-lab.sh --wait --restart-wsl --hold "${wsl_boxes[@]}"
+    ~/bin/wake-lab.sh status rog minix
 
-    ~/bin/wake-lab.sh --wait --restart-wsl --hold rog minix
-
-It sends the wake-on-LAN packets (router-side and direct), polls for up to 4 minutes, then restarts
-WSL on whichever boxes came up — WSL never autostarts at boot, so starting it is not optional — and
-waits up to 3 minutes for `tailscaled` inside the VM to register. Do not hand-roll the
-probe-then-branch logic it replaces; a partial wake (one box up, one dead) is handled — the live
-box still gets its WSL kick.
+The native Linux path waits for sshd after boot and needs no holder. For WSL, the wake path
+restarts the guest on each host that answered and establishes a Windows-side holder before
+declaring it ready. A partial wake is handled per box. Read `status`'s `os=` field: a dual-boot
+box can boot a different OS from the one the site file expected. Do not sweep a box whose
+configured OS did not answer. The WSL-specific holder and restart diagnostics below apply only
+to the boxes in `wsl_boxes`.
 
 `--hold` also takes that box's **hold lock** (one of the two interlocks `--restart-wsl` consults)
 and leaves it with the holder, so while a box is held another session's `restart-wsl` is REFUSED —

@@ -409,6 +409,9 @@ ip_of() { case "$1" in
   rog)   echo 10.0.0.1 ;;
   minix) echo 10.0.0.2 ;;
   *) return 1 ;; esac; }
+kind_of() { case "$1" in
+  rog|minix) echo wsl ;;
+  *) return 1 ;; esac; }
 EOF
 
 # --- the site file is required, and is the only source of hardware addresses -------------------
@@ -425,6 +428,9 @@ expect "a host table missing eth_mac_of refuses, naming the function" 1 "defines
 printf 'mac_of() { echo x; }\neth_mac_of() { echo x; }\n' > "$TMP/no-ip.sh"
 expect "...and so does one missing ip_of" 1 "defines no ip_of" -- \
   env WAKE_LAB_HOSTS="$TMP/no-ip.sh" "$WL" status rog
+sed '/^kind_of()/,$d' "$TMP/hosts.sh" > "$TMP/no-kind.sh"
+expect "...and one missing kind_of" 1 "defines no kind_of" -- \
+  env WAKE_LAB_HOSTS="$TMP/no-kind.sh" "$WL" status rog
 printf 'mac_of() { case in esac; }\n' > "$TMP/broken.sh"
 expect "a host table that will not parse refuses too" 1 "wake-lab.sh:" -- \
   env WAKE_LAB_HOSTS="$TMP/broken.sh" "$WL" status rog
@@ -1852,7 +1858,7 @@ kill "$bystander" 2>/dev/null; kill "$sc_pid" 2>/dev/null; reset_hold_state
 # truncated reading matches nothing and every live holder would look like somebody else's process
 # -- a false negative that fails the hold and deletes the record without killing the holder. The
 # fixture cannot make a pipe narrow, so the guard is on the invocation itself.
-grep -q 'ps -ww -o args=' "$WL" \
+grep -q 'ps -ww -o args=' "$HERE/wake-lab-wsl.sh" \
   && ok "the holder signature is read with ps -ww, which macOS does not truncate" \
   || ko "ps is called without -ww: on macOS the signature is cut off and no holder is ever recognized"
 # Leave no holder running into the cases below: a live holder carries its box's lab lock, which is
@@ -2294,6 +2300,9 @@ ip_of() { case "$1" in
   rog)   echo 10.0.0.1 ;;
   minix) echo 10.0.0.2 ;;
   asus)  echo 10.0.0.3 ;;
+  *) return 1 ;; esac; }
+kind_of() { case "$1" in
+  rog|minix|asus) echo wsl ;;
   *) return 1 ;; esac; }
 HOSTS3
 env WAKE_LAB_HOSTS="$TMP/hosts3.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=60 \

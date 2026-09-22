@@ -134,10 +134,10 @@ ludics-lite#157, #160) - a count `execution slot` takes around each batch, so a 
 standing reservation never gates another worker's start ([executions.md](references/executions.md)).
 
 A box that is asleep or unreachable is a placement fact, not a blocker: wake it through
-flotilla (`curl -X POST http://mac-studio:7799/api/wake -d '{"machine":"rog"}'`; WSL then needs
-the kick the OCANNL agent-notes describe - `ssh <box>-win 'wsl.exe -d Ubuntu -e true'` and a
-re-probe - and a freshly powered-on VM can terminate again within minutes if nothing connects,
-so kick right before launching), or defer that box's items with the gate recorded. Wake with
+`wake-lab.sh --wait <box>` or flotilla (`curl -X POST http://mac-studio:7799/api/wake -d '{"machine":"rog"}'`),
+then check `wake-lab.sh status <box>` for the OS reached. For a WSL box only, follow
+[wsl-boxes.md](references/wsl-boxes.md) before launching; native Ubuntu needs no guest kick.
+Or defer that box's items with the gate recorded. Wake with
 care not to interrupt sessions already running there, especially if the box re-hibernates.
 
 **Dependency gating, including out-of-scope dependencies.** For each candidate, walk the
@@ -317,10 +317,9 @@ requirements for every transport with transport-specific setup and identity, and
   for the machine and each worktree links its own copies of every test exe, so N parallel full
   suites queue N x ~200 fresh binaries behind it and every worker's run freezes (2026-08-22: 34
   exes parked in dlopen, logs frozen, load 2.5); `dune -j 4` when more than ~4 workers share
-  the box. **On rog/minix (WSL)**: the CUDA/HIP PATH prefix `tools/sweep.sh` uses for non-login
-  shells, the backend to select and how to prove the run executed on it (a backend-uniform
-  golden proves nothing - the OCANNL notes on `OCANNL_BACKEND` and self-announcing legs), and
-  still one dune per _build.
+  the box. **On GPU boxes**: name the backend and how to prove the run executed on it (a
+  backend-uniform golden proves nothing), and keep one dune per _build. For `wsl` kind only,
+  add the [WSL traps](references/wsl-boxes.md) to the brief.
 - Execution handoff: the worker's own targeted correctness batches on its agent host run under
   the [standing reservation](references/executions.md#standing-iteration-reservation) the
   coordinator took at launch - name its request id, the bounded aliases and `-j` width it

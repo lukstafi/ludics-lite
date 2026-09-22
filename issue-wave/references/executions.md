@@ -20,8 +20,9 @@ host with other correctness reservations up to the box's slots - `FLEET_BOX_CORR
 `<box>=<n>` pairs, `mac-studio=6` with the default roster and one slot for any box it does not
 name (ludics-lite#157: the exclusivity was written for measurement noise and for XProtect
 serializing fresh test binaries, and three workers' targeted `-j 4` batches ran side by side on
-the Mac without a stall once the Developer Tools exemption was in place; the WSL boxes keep one
-slot because the dxg bridge is the limit there).
+the Mac without a stall once the Developer Tools exemption was in place). Keep one slot for
+WSL boxes because of the measured dxg bridge limit; configure native Linux boxes per their
+measured capacity. The kind does not silently change the configured slot count.
 
 The slot count is a RUN-TIME count, and `execution slot` is the single run-time mechanism
 (ludics-lite#160): every correctness run on a box, assigned or standing, is wrapped in
