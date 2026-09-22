@@ -25,6 +25,7 @@ case "$*" in
 esac
 case " $* " in
   *' tuf-amd-linux '*) [ "${SSH_UP:-0}" = 1 ] ;;
+  *' tuf-amd-win '*) [ "${SSH_UP:-0}" = tuf-amd-win ] ;;
   *' rog-nv-linux '*) [ "${SSH_UP:-0}" = rog-nv-linux ] ;;
   *' rog-nv-win '*) [ "${SSH_UP:-0}" = rog-nv-win ] ;;
   *' rog-nv-wsl '*) [ "${SSH_UP:-0}" = rog-nv-wsl ] ;;
@@ -78,16 +79,19 @@ out=$(WAKE_LAB_HOSTS="$tmp/rog-hosts.sh" SSH_NO_MARKER=1 SSH_UP=rog-nv-win WAKE_
 check 'a Linux-configured box booted into Windows cannot report successful sleep' '[ "$rc" = 1 ] && [[ "$out" == *"before the remote power command started"* ]]'
 cp "$here/wake-lab-wsl.sh" "$tmp/wake-lab-wsl.sh"
 sed 's/echo linux/echo wsl/' "$tmp/hosts.sh" >"$tmp/tuf-wsl.sh"
-out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
-check 'a kind with no matching endpoint is refused' '[ "$rc" = 1 ] && [[ "$out" == *"no Windows ssh endpoint for tuf"* ]]'
-cat >"$tmp/asus-linux.sh" <<'HOSTS'
-mac_of() { [ "$1" = asus ] && echo aa:bb:cc:00:00:05; }
+out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" SSH_UP=tuf-amd-win "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'the renamed TUF keeps its Windows endpoint when configured for WSL' '[ "$rc" = 0 ] && [[ "$out" == *"win=UP"* ]] && [[ "$out" == *"os=windows"* ]]'
+cat >"$tmp/other-linux.sh" <<'HOSTS'
+mac_of() { [ "$1" = other ] && echo aa:bb:cc:00:00:05; }
 eth_mac_of() { return 1; }
-ip_of() { [ "$1" = asus ] && echo 192.0.2.29; }
-kind_of() { [ "$1" = asus ] && echo linux; }
+ip_of() { [ "$1" = other ] && echo 192.0.2.29; }
+kind_of() { [ "$1" = other ] && echo linux; }
 HOSTS
-out=$(WAKE_LAB_HOSTS="$tmp/asus-linux.sh" "$tmp/wake-lab.sh" status asus 2>&1); rc=$?
-check 'Linux kind without a native ssh endpoint is refused' '[ "$rc" = 1 ] && [[ "$out" == *"no linux ssh endpoint for asus"* ]]'
+out=$(WAKE_LAB_HOSTS="$tmp/other-linux.sh" "$tmp/wake-lab.sh" status other 2>&1); rc=$?
+check 'Linux kind without a native ssh endpoint is refused' '[ "$rc" = 1 ] && [[ "$out" == *"no linux ssh endpoint for other"* ]]'
+sed 's/echo linux/echo wsl/' "$tmp/other-linux.sh" >"$tmp/other-wsl.sh"
+out=$(WAKE_LAB_HOSTS="$tmp/other-wsl.sh" "$tmp/wake-lab.sh" status other 2>&1); rc=$?
+check 'WSL kind without a Windows ssh endpoint is refused' '[ "$rc" = 1 ] && [[ "$out" == *"no Windows ssh endpoint for other"* ]]'
 sed 's/echo linux/echo unknown/' "$tmp/hosts.sh" >"$tmp/bad.sh"
 out=$(WAKE_LAB_HOSTS="$tmp/bad.sh" "$tmp/wake-lab.sh" tuf 2>&1); rc=$?
 check 'invalid kind refuses before WoL' '[ "$rc" = 1 ] && [[ "$out" == *"invalid kind for tuf"* ]]'

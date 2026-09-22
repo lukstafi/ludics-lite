@@ -111,7 +111,7 @@ lan_of() { case "$1" in
 ts_of() { case "$1" in
   rog) echo rog-nv-win ;;
   minix) echo minix-amd-win ;;
-  asus) echo asus-amd-win ;;
+  tuf) echo tuf-amd-win ;;
   *) return 1 ;; esac; }
 wsl_of() { case "$1" in
   rog) echo rog-nv-wsl ;;

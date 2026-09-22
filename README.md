@@ -222,7 +222,7 @@ counts, so a green run says what it did not check. The staging side has no match
 lore in `wake-lab.sh` and the Windows/WSL lessons in `wake-lab-wsl.sh`, the router endpoints, the
 ssh aliases and all of the logic. `wake-lab.sh --help` prints the common header, and
 `--help` and `--list` are the two commands that work before the host table exists. The box names
-(`rog`, `minix`, `tuf`, `asus`) and the ssh aliases are the author's and are edited in place.
+(`rog`, `minix`, `tuf`) and the ssh aliases are the author's and are edited in place.
 
 To repair the Windows-side NIC settings, copy `scripts/enable-wol-windows.ps1` to the Windows box
 and run it from an elevated PowerShell (`powershell -ExecutionPolicy Bypass -File

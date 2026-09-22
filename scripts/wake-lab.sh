@@ -7,7 +7,7 @@
 #   2. A magic packet sent directly from this Mac (broadcast, UDP ports 7 and 9).
 #
 # Usage:
-#   wake-lab.sh [rog|minix|tuf|asus|all]  wake (default: rog minix; all: rog minix asus)
+#   wake-lab.sh [rog|minix|tuf|all]       wake (default: rog minix; all: rog minix tuf)
 #   wake-lab.sh --wait [--wsl] rog        wake, then poll until configured OS answers
 #   wake-lab.sh --wait --restart-wsl rog  ...and start WSL from a FRESH VM (wsl --shutdown first)
 #   wake-lab.sh status [box...]           per-box reachability and reached OS
@@ -53,9 +53,8 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 # * WoL works over Ethernet only, never over Wi-Fi: a magic packet cannot reach the Wi-Fi NIC of
 #   a powered-off machine. Both MACs are in the host table and packets go to both, but the
 #   Ethernet one does the waking. rog and minix are both CABLED (rog Ethernet .30, minix
-#   Ethernet .31; minix's old .27 Wi-Fi lease is inactive). asus is Wi-Fi only and therefore
-#   cannot be woken at all. The new tuf box is Wi-Fi-only too (flotilla PR #3): it needs manual
-#   wake, though its native Linux ssh can be checked after it resumes.
+#   Ethernet .31; minix's old .27 Wi-Fi lease is inactive). tuf (formerly asus-amd) is Wi-Fi
+#   only and needs manual wake (flotilla PR #3), though native Linux SSH can be checked after it resumes.
 # * Both boxes wake from a full shutdown (S5), not just from sleep — verified 2026-08-15 on both,
 #   after enabling the `Wake Up` item on minix's BIOS SECOND setup screen (not under Advanced).
 #   "Powered off" is a normal starting state for a wake, not a reason to expect failure.
@@ -667,7 +666,7 @@ for arg in "$@"; do
     --restart-wsl) WANT_WSL=1; FRESH_WSL=fresh ;;
     --force) FORCE=1 ;;
     -h|--help) usage; exit 0 ;;
-    all) TARGETS+=(rog minix asus) ;;
+    all) TARGETS+=(rog minix tuf) ;;
     *) TARGETS+=("$arg") ;;
   esac
 done
@@ -781,7 +780,7 @@ case "$VERB" in
           echo "Check BIOS Wake-on-LAN / 'Power Up' (minix needed the SECOND setup screen, not"
           echo "Advanced), then run scripts/enable-wol-windows.ps1 from an elevated Windows"
           echo "PowerShell to disable Fast Startup and re-arm the NIC. Check '$0 status' after the"
-          echo "router lease settles; Wi-Fi-only asus and tuf need manual wake."
+          echo "router lease settles; Wi-Fi-only tuf needs manual wake."
         fi
         [ "$wsl_rc" != 0 ] && echo "NOT all up: $WSL_FAILED (see above)"
         exit 1

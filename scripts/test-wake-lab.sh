@@ -2334,31 +2334,35 @@ cat > "$TMP/hosts3.sh" <<'HOSTS3'
 mac_of() { case "$1" in
   rog)   echo aa:bb:cc:00:00:01 ;;
   minix) echo aa:bb:cc:00:00:03 ;;
-  asus)  echo aa:bb:cc:00:00:05 ;;
+  tuf)  echo aa:bb:cc:00:00:05 ;;
   *) return 1 ;; esac; }
 eth_mac_of() { mac_of "$1"; }
 ip_of() { case "$1" in
   rog)   echo 10.0.0.1 ;;
   minix) echo 10.0.0.2 ;;
-  asus)  echo 10.0.0.3 ;;
+  tuf)  echo 10.0.0.3 ;;
   *) return 1 ;; esac; }
 kind_of() { case "$1" in
-  rog|minix|asus) echo wsl ;;
+  rog|minix|tuf) echo wsl ;;
   *) return 1 ;; esac; }
 HOSTS3
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts3.sh" "$WL" status all 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q '^tuf:' <<<"$out" && ! grep -q '^asus:' <<<"$out" \
+  && ok "all expands to the renamed TUF box, with no separate ASUS target" \
+  || ko "all still uses a stale laptop name (rc=$rc) -- $out"
 env WAKE_LAB_HOSTS="$TMP/hosts3.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=60 \
-    SSH_UP="rog-lan rog-nv-win minix-lan minix-amd-win asus-amd-win" \
-    "$WL" hibernate rog minix asus >"$TMP/phase3.out" 2>&1 8>&- &
+    SSH_UP="rog-lan rog-nv-win minix-lan minix-amd-win tuf-amd-win" \
+    "$WL" hibernate rog minix tuf >"$TMP/phase3.out" 2>&1 8>&- &
 phase3_pid=$!
 phase3_deadline=$((SECONDS + 20))
-while lock_free rog || lock_free minix || lock_free asus; do
+while lock_free rog || lock_free minix || lock_free tuf; do
   [ "$SECONDS" -ge "$phase3_deadline" ] && break
   sleep 1
 done
-if ! lock_free rog && ! lock_free minix && ! lock_free asus; then
+if ! lock_free rog && ! lock_free minix && ! lock_free tuf; then
   ok "all three boxes of the host table are reserved by one command, both locks each"
 else
-  ko "a third box could not be reserved -- the descriptors ran into bash's save slot (rog=$(lock_free rog && echo free || echo held), minix=$(lock_free minix && echo free || echo held), asus=$(lock_free asus && echo free || echo held))"
+  ko "a third box could not be reserved -- the descriptors ran into bash's save slot (rog=$(lock_free rog && echo free || echo held), minix=$(lock_free minix && echo free || echo held), tuf=$(lock_free tuf && echo free || echo held))"
 fi
 grep -q 'REFUSED' "$TMP/phase3.out" \
   && ko "a box of the table was refused for want of a descriptor: $(grep REFUSED "$TMP/phase3.out")" \
@@ -2366,7 +2370,7 @@ grep -q 'REFUSED' "$TMP/phase3.out" \
 kill "$phase3_pid" 2>/dev/null
 wait "$phase3_pid" 2>/dev/null
 kill3_deadline=$((SECONDS + 20))
-while ! lock_free rog || ! lock_free minix || ! lock_free asus; do
+while ! lock_free rog || ! lock_free minix || ! lock_free tuf; do
   [ "$SECONDS" -ge "$kill3_deadline" ] && break
   sleep 1
 done

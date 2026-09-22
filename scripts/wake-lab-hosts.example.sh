@@ -14,7 +14,7 @@
 # likewise fictitious, from RFC 5737's documentation range (192.0.2.0/24) rather than from any
 # real LAN: a template carrying the author's leases would be site data by another name.
 #
-# The box names must be the ones the script knows: rog, minix, tuf, asus. Each function echoes
+# The box names must be the ones the script knows: rog, minix, tuf. Each function echoes
 # the value(s) for a known box and returns 1 for anything else; all four are required.
 # Sourced by a `set -u` script under bash 3.2: no associative arrays.
 
@@ -24,8 +24,7 @@
 mac_of() { case "$1" in
   rog)   echo 00:00:00:00:00:01 00:00:00:00:00:02 ;;  # Wi-Fi, Ethernet
   minix) echo 00:00:00:00:00:03 00:00:00:00:00:04 ;;  # Wi-Fi, Ethernet
-  tuf)   echo 00:00:00:00:00:06 ;;                    # Wi-Fi only: manual wake
-  asus)  echo 00:00:00:00:00:05 ;;                    # Wi-Fi only
+  tuf)   echo 00:00:00:00:00:05 ;;                    # Wi-Fi only: manual wake
   *) return 1 ;; esac; }
 
 # The Ethernet MAC alone — the one whose lease says anything about the wake path. router_active()
@@ -43,8 +42,7 @@ eth_mac_of() { case "$1" in
 ip_of() { case "$1" in
   rog)   echo 192.0.2.30 ;;  # Ethernet; its Wi-Fi lease is a different address
   minix) echo 192.0.2.31 ;;  # Ethernet
-  tuf)   echo 192.0.2.32 ;;  # Wi-Fi; no Ethernet WoL
-  asus)  echo 192.0.2.29 ;;  # Wi-Fi
+  tuf)   echo 192.0.2.29 ;;  # Wi-Fi; no Ethernet WoL
   *) return 1 ;; esac; }
 
 # The OS reached after a magic packet depends on the box's boot selection. Set this to the
@@ -53,5 +51,4 @@ ip_of() { case "$1" in
 kind_of() { case "$1" in
   rog|minix) echo linux ;;  # set to wsl if the box boots Windows/WSL instead
   tuf)       echo linux ;;
-  asus)      echo wsl ;;
   *) return 1 ;; esac; }
