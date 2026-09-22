@@ -54,7 +54,15 @@ Read the site file's `kind_of` for each GPU box, then wake each kind through its
       esac
     done
     [ ${#linux_boxes[@]} -eq 0 ] || ~/bin/wake-lab.sh --wait "${linux_boxes[@]}"
-    [ ${#wsl_boxes[@]} -eq 0 ] || ~/bin/wake-lab.sh --wait --restart-wsl --hold "${wsl_boxes[@]}"
+    held_file=$(mktemp "${TMPDIR:-/tmp}/ocannl-held-wsl.XXXXXX")
+    if [ ${#wsl_boxes[@]} -gt 0 ]; then
+      wsl_out=$(~/bin/wake-lab.sh --wait --restart-wsl --hold "${wsl_boxes[@]}" 2>&1)
+      printf '%s\n' "$wsl_out"
+      for box in "${wsl_boxes[@]}"; do
+        grep -Fq "wsl holder observed on $box (" <<<"$wsl_out" && printf '%s\n' "$box" >>"$held_file"
+      done
+    fi
+    printf 'holder list: %s\n' "$held_file"
     ~/bin/wake-lab.sh status rog minix
 
 The native Linux path waits for sshd after boot and needs no holder. For WSL, the wake path
@@ -96,15 +104,14 @@ up only once that holder has said its token back from inside the guest. It is ne
 fixed `sleep N`: a lane is hip then multidev_cc, each with its own cap, plus preparation outside
 them, so a sized holder expires under the last unit, and a shell waiting for input cannot expire
 at all. **You must end it
-explicitly** once the sweep has finished (step 2), for every box you held:
+explicitly** once the sweep has finished (step 2), for every box in this run's holder list.
 
-    ~/bin/wake-lab.sh unhold rog minix
-
-Name only the boxes THIS run held — the ones whose `wsl holder observed on <box>` line you read in
-step 1. The record is per box and global to the machine, so `unhold` on a box you did not hold
+Keep the `holder list:` path printed in step 1 for both cleanup sites in step 2. It contains only
+boxes whose holder acknowledged its token in this run, including partial WSL wakes. The record
+is per box and global to the machine, so `unhold` on a box you did not hold
 would release whatever holder is there, and if another run put it there you would unhold its lane.
-Run that even when the sweep failed or a box never woke — `unhold` over a box with no holder says
-so and exits 0. But `ANOMALY: wsl holder on <box> had already exited`, with **exit 2**, is the
+Run cleanup even when the sweep failed; an empty holder list needs no `unhold` call. But
+`ANOMALY: wsl holder on <box> had already exited`, with **exit 2**, is the
 opposite of a clean cleanup: nothing but `unhold` ENDS a holder deliberately, so one already gone is
 one the lane LOST — the box slept or rebooted under it, the network dropped, something killed it. What that costs is the **lab lock**, which lives on the holder's
 descriptor and was released the moment it died — from then on the box was not reserved, and another
@@ -265,9 +272,16 @@ notify-worthy (step 6):
 
 If that fires, DO NOT launch the sweep. An empty `OCANNL_TOOL_SWEEP_LOCAL_BOX` is not "let the
 script decide": it dies with the same exit 2 as any other unusable environment, which reads like
-something the corrected relaunch below could fix and is not. Release step 1's holders first
-(`~/bin/wake-lab.sh unhold rog minix`) — they are already running by then, nothing else ends them,
-and this path never reaches the cleanup below — then go straight to step 5 and report the missing
+something the corrected relaunch below could fix and is not. Release only step 1's recorded
+holders first — they are already running by then, nothing else ends them, and this path never
+reaches the cleanup below:
+
+    # Restore held_file from the "holder list:" path printed in step 1 if using a new shell.
+    held_boxes=()
+    while IFS= read -r held_box; do [ -z "$held_box" ] || held_boxes+=("$held_box"); done < "$held_file"
+    [ ${#held_boxes[@]} -eq 0 ] || ~/bin/wake-lab.sh unhold "${held_boxes[@]}"
+
+Then go straight to step 5 and report the missing
 site configuration as the finding, and notify in step 6. The same goes for any other exit from
 this step that never launches the sweep: unhold before you leave it.
 
@@ -312,10 +326,13 @@ skip-coverage report was written. Do not relaunch for it: an unwritable state di
 finding, and it is notify-worthy.
 
 When you leave this step — however that happens: the run finished, it died at startup, or one of
-the refusals above sent you to step 5 without launching anything — release the holders step 1
-took:
+the refusals above sent you to step 5 without launching anything — release only the holders
+recorded in step 1 (unless the earlier missing-box path already released them):
 
-    ~/bin/wake-lab.sh unhold rog minix
+    # Restore held_file from the "holder list:" path printed in step 1 if using a new shell.
+    held_boxes=()
+    while IFS= read -r held_box; do [ -z "$held_box" ] || held_boxes+=("$held_box"); done < "$held_file"
+    [ ${#held_boxes[@]} -eq 0 ] || ~/bin/wake-lab.sh unhold "${held_boxes[@]}"
 
 Nothing else ends them deliberately: the holder cannot expire under the last unit, so a lane that
 is never unheld leaves a `wsl.exe` pinning the VM (and an ssh connection from this Mac) until the
