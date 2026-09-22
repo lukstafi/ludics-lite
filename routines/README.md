@@ -231,7 +231,7 @@ Like the skills, these prompts name the author's setup in prose and are edited i
 `~/self-improve/ClaudeDesktop/sequencing_plan.md` and the repository list in
 `daily-issue-planning`; `~/ludics-lite`, the checkout both prompts run their step-0 drift check in
 (the clone path the top-level README installs); `~/ocannl-staging`, `~/.ocannl-sweep`, `~/bin/wake-lab.sh` and the box
-names `rog`/`minix` (`rog-nv-wsl`, `minix-amd-wsl`) in the cross-machine sweep; the two OCANNL
+names `rog`/`minix` (native Linux or WSL aliases, selected by `kind_of`) in the cross-machine sweep; the two OCANNL
 repositories in the triage routine. `~/bin/wake-lab.sh` is a symlink to `scripts/wake-lab.sh` in
 this checkout, so the cross-machine sweep's lab lore is reviewable here rather than living only on
 `mac-studio` (ludics-lite#31); the fleet's MAC and IP addresses are the one part that stays out of

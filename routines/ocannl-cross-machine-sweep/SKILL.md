@@ -10,15 +10,16 @@ HIP — and multidev_cc, which needs no hardware but is deliberately kept off CI
 matrix fast (gh-ocannl-756; the decision is recorded at the runtest step in `.github/workflows/ci.yml`) —
 have no automated coverage except this sweep, so this routine is the ONLY gate for all five of
 those backends. The sweep places them on three boxes: cc and metal on this Mac (`m4-max`), cuda on
-`rog-nv-wsl`, and hip then multidev_cc on `minix-amd-wsl` — the CPU pair is split across macOS and
+rog, and hip then multidev_cc on minix. Use the destination that `kind_of` selects for each box
+(`rog-nv-linux`/`minix-amd-linux` for Linux, or the corresponding `-wsl` alias for WSL). The CPU pair is split across macOS and
 Linux on purpose (load balance, and cross-OS coverage of the CPU backends). So minix carries TWO
 backends: a minix that stays down leaves both hip and multidev_cc uncovered. Throughout this
 routine, "the box's backends" means all of them — rog: cuda; minix: hip AND multidev_cc — and every
-outcome step 1 reports BEFORE the sweep (no wake, no WSL, a failed restart) is reported for each
+outcome step 1 reports BEFORE the sweep (no wake, configured OS unreachable, a failed WSL restart) is reported for each
 backend on that box. What happens DURING the sweep is per unit instead: minix runs hip and then
-multidev_cc, so a VM can vanish after hip recorded a real result; judge each backend by its own row,
-and only a unit that recorded `skip (unreachable)` is uncovered. The CUDA box (rog-nv-wsl) and HIP box
-(minix-amd-wsl) are often hibernated, and sometimes powered off; step 1 tries to wake them, but if that fails,
+multidev_cc, so an endpoint can vanish after hip recorded a real result; judge each backend by its own row,
+and only a unit that recorded `skip (unreachable)` is uncovered. The CUDA and HIP boxes
+are often sleeping, and sometimes powered off; step 1 tries to wake them, but if that fails,
 "skip (unreachable)" is a normal outcome, not an error. CI's Windows OS target is likewise off the per-PR path: it runs only on the
 twice-weekly scheduled CI sweep, and on demand via `workflow_dispatch`, because at 62-74min it
 set the latency of the whole per-PR matrix.
@@ -148,18 +149,19 @@ are restarted concurrently, so it cannot sit on a wedged `wsl.exe` the way it di
 entirely. If it has not returned in about a quarter of an hour, that is a bug in the script and
 not a slow box.
 
-Read its last lines:
+Read its last lines. Interpret WSL lines only for boxes in `wsl_boxes`; for Linux boxes use
+`os=` and `linux=` from `status` to tell whether the native system answered:
 
 - `did NOT wake: <box>` is **not** an error: that box's backends (rog: cuda; minix: hip and
   multidev_cc) simply go uncovered today, surfacing through the staleness thresholds in step 4. Do not send the wake command again.
-- `wsl still down after 3 min` on a box that woke means the machine is up but that box's backends (minix: both) are
+- `wsl still down after 3 min` on a WSL box that woke means the machine is up but that box's backends (minix: both) are
   untestable — say so explicitly in the report, since it is a different finding from a box that
   never woke.
 - `no host table at ~/.config/wake-lab/hosts.sh`: nothing was woken and nothing will be. That
   file is this box's untracked site configuration for the script (the top-level README of
   ludics-lite says how to install it); report the missing setup as the finding rather than the
   boxes as unreachable.
-- `all up`, `wsl up` and `wsl holder observed on <box>`: start the sweep promptly. A VM kicked on a
+- `all up`, `wsl up` and `wsl holder observed on <box>` for a WSL box: start the sweep promptly. A VM kicked on a
   cold-booted box does not stay up on its own, and a session inside it does not hold it — the
   holder `--hold` spawned does, until you `unhold`.
 - `ACTIVE HOURS WARNING on <box>`: the box's Windows Update active hours do not cover the sweep
@@ -190,10 +192,11 @@ Read its last lines:
   the run started late and why. One holder it can never name is this run's own: the command that
   prints this line is the one that would have taken the locks, and it took none.
 
-`~/bin/wake-lab.sh status` prints the per-box picture (router-active, `-lan`, `-win`, `-wsl`) if you need to
+`~/bin/wake-lab.sh status` prints the per-box picture (router-active, reached OS, native Linux,
+`-lan`, `-win`, `-wsl`) if you need to
 say precisely what happened.
 
-The sweep takes each WSL box's lane lock for the length of that box's lane, and `wake-lab.sh`
+The sweep takes each GPU box's lane lock for the length of that box's lane, and `wake-lab.sh`
 refuses to destroy a box either of whose locks is held, so the 2026-09-16 collision cannot repeat
 silently. Two consequences to know. A unit recorded as `skip (box <box> reserved by ...)` is a box
 ANOTHER run's lane held for longer than the sweep was willing to wait: nothing was tested and
@@ -204,8 +207,8 @@ window whose verdict is
 says nothing about the code, it gets the serial rerun automatically, and the thing to investigate
 is who restarted the box, not the backend.
 
-The retry budget is exactly one re-kick and one rerun. If the sweep records cuda, hip or multidev_cc as
-`skip (unreachable)` while `status` shows that box `win=UP`, the VM was up and vanished: run
+For WSL boxes, the retry budget is exactly one re-kick and one rerun. If the sweep records cuda,
+hip or multidev_cc as `skip (unreachable)` while `status` shows that box `win=UP`, the VM was up and vanished: run
 `~/bin/wake-lab.sh kick-wsl --hold <box>` once — **with `--hold`**, or the rerun runs an unheld VM
 the way the 2026-09-15 recovery rerun did, and it died 76 s in — then rerun the sweep once (reruns
 are incremental and cheap) and `~/bin/wake-lab.sh unhold <box>` when it finishes. The re-kick takes
@@ -213,14 +216,13 @@ only that box's hold lock, so the rerun's own lane still reserves the box normal
 ludics-lite#224 this recovery reproduced the skip exactly, taking the same lock the lane then
 waited on, which is why a rerun that skips for `reserved by wake-lab --hold` means the fix has
 regressed rather than that the box is busy. If the unit still skips, report it as "woken but
-`-wsl` gone" (step 4 names this outcome) and do not kick or rerun again.
+`-wsl` gone" (step 4 names this outcome) and do not kick or rerun again. For native Linux,
+inspect `os=` and `linux=` instead; a Windows boot or lost sshd cannot be repaired by `kick-wsl`.
 
-Everything else about these boxes — WoL over Ethernet only, waking from a full shutdown, what
-`router-active=1` means, what actually holds a kicked VM up (a Windows-side `wsl.exe`, which is
-what `--hold` supplies), Tailscale unattended mode, the `exit 0` vs `true`
-probe trap — is verified and recorded in the header comment of `scripts/wake-lab.sh` in
-ludics-lite, which is what `~/bin/wake-lab.sh` links to and what `~/bin/wake-lab.sh --help`
-prints; do not spend the run rediscovering it.
+Everything else about these boxes — WoL over Ethernet only, waking from a full shutdown, and
+what `router-active=1` means — is recorded in the header comment of `scripts/wake-lab.sh` in
+ludics-lite. WSL holder and Windows details are in `scripts/wake-lab-wsl.sh`. The installed
+`~/bin/wake-lab.sh` links to that core script; do not spend the run rediscovering this setup.
 
 Do not power the boxes back down afterwards — the user may want them for the day's work, and the
 next sweep can always wake them again.
@@ -389,16 +391,16 @@ are different claims:
   missed week) — incremental greens in between may be cache hits and cannot stand in for it.
 
 For each of the FIVE backends (cc, multidev_cc, metal, cuda, hip) find the most recent qualifying
-liveness row. Flag backends with no pass in more than 2 days. For cuda, hip or multidev_cc (the
-backends on the WSL boxes), say which of the three step-1 outcomes applied: woken
-  and swept; woken but `-wsl` never appeared or was gone again by the time the unit probed it
-  (machine up, that unit untestable — only the units whose row says `skip (unreachable)`, while a
-  unit that ran before the VM vanished keeps its result — step 1's holder is what prevents this,
-  so a vanished VM also means either the hold failed or it was never asked for; a re-kick with
-  `--hold` plus an incremental rerun usually recovers it); or the wake itself failed. A failed wake with settled `router-active=1` means the NIC was
-  powered and listening, so the magic packet was ignored: the WoL option itself (BIOS, or the
-  Windows NIC driver's wake settings) has been lost. With settled `router-active=0` the NIC is not powered while the
-  box is off: the cable, the box's power, or the BIOS setting that keeps the NIC powered in S5.
+liveness row. Flag backends with no pass in more than 2 days. For cuda, hip or multidev_cc,
+report the step-1 outcome for its box: woken and swept; machine reachable but the configured
+guest or native Linux endpoint unreachable when the unit probed it; or wake failed. Only units
+whose own row says `skip (unreachable)` are uncovered; a unit that ran before an endpoint vanished
+keeps its result. For WSL boxes, a vanished guest also means the holder failed or was never asked
+for; a re-kick with `--hold` plus an incremental rerun usually recovers it. For native Linux,
+check the booted OS and sshd instead. A failed wake with settled `router-active=1` means the NIC
+was powered and listening but ignored the magic packet; check the OS-specific WoL settings.
+With settled `router-active=0`, check the cable, box power, and BIOS setting that keeps the NIC
+powered while off.
 
 ## 5. Report
 
@@ -418,16 +420,20 @@ Outcomes are `pass`, `incremental-pass`, `legacy-pass`, `fail`, `skip`, `timeout
 put that machine's worktree on the commit under test, so NOTHING was tested there — report it as
 non-coverage rather than as a test failure, and treat it as notify-worthy. For an `error` (or a
 `skip (unreachable)`) on a GPU box, check whether the box restarted under it before diagnosing the
-harness: System event 1074 on the `-win` side inside the unit's window, from `MoUsoCoreWorker.exe`
-or `TrustedInstaller.exe`, is a Windows Update restart, which takes the VM and its holder with it.
+harness. For a native Linux box, inspect its boot history and journal when reachable (for example,
+`journalctl --list-boots` and `journalctl -b -1`) and report whether a reboot or suspend interrupted
+the lane. For a WSL box, System event 1074 on the `-win` side inside the unit's window, from
+`MoUsoCoreWorker.exe` or `TrustedInstaller.exe`, is a Windows Update restart, which takes the VM
+and its holder with it:
 
     ssh rog-nv-win "powershell -NoProfile -Command \"Get-WinEvent -FilterHashtable @{LogName='System';Id=1074;StartTime=(Get-Date).AddHours(-12)} | Format-List TimeCreated,Message\""
 
 (`minix-amd-win` for minix — those two, and the `-lan` aliases, are the Windows destinations;
 `wake-lab.sh` names the one that answered when it kicked the box.)
 
-Report that as an update restart, name the active-hours values step 1 read, and file the fix as
-re-pinning active hours on that box — not as a backend regression. If the script itself
+Report a WSL update restart as such, name the active-hours values step 1 read, and file the fix as
+re-pinning active hours on that box. For native Linux, report the corresponding journal evidence
+and the cause it supports. If the script itself
 exits 2 at startup, no sweep happened at all: report that as the finding and do not read the history
 file as though the run had completed. A lane-stopped exit 2 (step 2) is the exception: report every row the run
 recorded — the stopped lane's own included, since it may have finished a unit (minix's hip) before

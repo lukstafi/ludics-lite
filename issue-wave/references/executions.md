@@ -50,7 +50,7 @@ is each coordinator's own directory, and slots kept there would let two workers 
 coordinators each take slot 1 on one machine. The command after `--` is exec'd, not
 interpreted, so a pipeline or a shell builtin goes as `sh -c '...'`.
 
-Use one canonical box name from the site's roster consistently (for example `rog-nv-wsl`, not
+Use one canonical box name from the site's roster consistently (for example `rog-nv-linux`, not
 an alternating ssh alias and app host ID). New reservations and dispatch require exact
 `FLEET_BOXES` entries; aliases and case variants are refused. Configure one canonical entry per
 physical box. Outstanding records outside a changed roster block dispatch until reconciled;
@@ -80,7 +80,7 @@ must exist before launch. For example `reserve.json`:
   "issue": "owner/repo#123",
   "purpose": "bounded CUDA correctness verification",
   "agent_host": "mac-studio",
-  "execution_host": "rog-nv-wsl",
+  "execution_host": "rog-nv-linux",
   "repository": "owner/repo",
   "requested_revision": "<pushed-ref-or-exact-sha>",
   "kind": "correctness"

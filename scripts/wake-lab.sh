@@ -66,8 +66,8 @@ HOSTS_SVC=urn:dslforum-org:service:Hosts:1
 #   DHCP lease aging out, and diagnosing the wake path from it is a misdiagnosis (2026-09-01);
 #   wait for it to settle first. Once settled after a full shutdown, router-active=1 means the
 #   NIC still holds Ethernet link while powered off: the WoL-armed state that makes the wake
-#   possible. A failed wake then means the magic packet was ignored: the WoL option itself (BIOS,
-#   or the Windows NIC driver's wake settings) has been lost. With settled router-active=0 after
+#   possible. A failed wake then means the magic packet was ignored: check the BIOS WoL option
+#   and the NIC wake settings of the OS last running on the box. With settled router-active=0 after
 #   a full shutdown, check the cable, the box's power, and the BIOS setting that keeps the NIC
 #   powered in S5.
 # mac_of (every MAC of a box), eth_mac_of (the Ethernet one alone, whose lease is what
@@ -104,7 +104,14 @@ check_targets() {
   for t in "$@"; do
     mac_of "$t" >/dev/null 2>&1 || { bad="$bad $t"; continue; }
     kind=$(kind_of "$t") || kind=""
-    case "$kind" in wsl|linux) ;; *) echo "wake-lab.sh: invalid kind for $t: ${kind:-(none)} (expected wsl or linux)" >&2; exit 1 ;; esac
+    case "$kind" in
+      linux)
+        linux_of "$t" >/dev/null || { echo "wake-lab.sh: no linux ssh endpoint for $t" >&2; exit 1; } ;;
+      wsl)
+        load_wsl_adapter || exit 1
+        ts_of "$t" >/dev/null || { echo "wake-lab.sh: no Windows ssh endpoint for $t" >&2; exit 1; } ;;
+      *) echo "wake-lab.sh: invalid kind for $t: ${kind:-(none)} (expected wsl or linux)" >&2; exit 1 ;;
+    esac
   done
   [ -z "$bad" ] && return 0
   echo "wake-lab.sh: not in the host table ($HOSTS_FILE):$bad" >&2
@@ -572,7 +579,13 @@ power_action() {
   [ -z "$output" ] || printf '  %s\n' "$(printf '%s\n' "$output" | tail -1)"
   case "$action_rc" in
     0) return 0 ;;
-    255|124) echo "  $1 on $2 unconfirmed (connection dropped or timed out); checking reachability"; return 0 ;;
+    255|124)
+      if grep -Fxq 'WAKE_LAB_POWER_STARTED' <<<"$output"; then
+        echo "  $1 on $2 unconfirmed (connection dropped or timed out); checking reachability"
+        return 0
+      fi
+      echo "  $1 FAILED on $2 (connection failed before the remote power command started)"
+      return 1 ;;
     *) echo "  $1 FAILED on $2 (command exited $action_rc)"; return 1 ;;
   esac
 }
@@ -674,7 +687,9 @@ if [ "$VERB" = unhold ]; then
   # no-op and need not even read the WSL adapter.
   [ ! -r "$HOSTS_FILE" ] || . "$HOSTS_FILE"
   for t in "${TARGETS[@]}"; do
-    if declare -F kind_of >/dev/null && [ "$(kind_of "$t")" = linux ]; then
+    state_dir=${WAKE_LAB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wake-lab}
+    if declare -F kind_of >/dev/null && [ "$(kind_of "$t")" = linux ] &&
+       [ ! -e "$state_dir/hold-$t.pid" ] && [ ! -e "$state_dir/hold-$t.releasing" ]; then
       echo "no holder needed for linux box $t"
     else
       load_wsl_adapter || exit 1

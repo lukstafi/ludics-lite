@@ -20,6 +20,7 @@ printf '%s\n' "$*" >>"$SSH_LOG"
 case "$*" in
   *systemctl*)
     [ "${SSH_POWER_FAIL:-0}" = 1 ] && { echo 'Access denied' >&2; exit 2; }
+    [ "${SSH_NO_MARKER:-0}" = 1 ] || echo WAKE_LAB_POWER_STARTED
     exit 255 ;; # SSH drops when the machine suspends or shuts down.
 esac
 case " $* " in
@@ -71,6 +72,22 @@ out=$(SSH_UP=0 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" down tuf 2>&1); r
 check 'Linux shutdown uses systemctl' '[ "$rc" = 0 ] && grep -q "systemctl --no-ask-password poweroff" "$SSH_LOG"'
 out=$(SSH_POWER_FAIL=1 SSH_UP=1 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" sleep tuf 2>&1); rc=$?
 check 'definite Linux power refusal is visible and fails immediately' '[ "$rc" = 1 ] && [[ "$out" == *"sleep FAILED on tuf"* ]] && [[ "$out" != *"confirming..."* ]]'
+out=$(SSH_NO_MARKER=1 SSH_UP=1 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" sleep tuf 2>&1); rc=$?
+check 'SSH disconnect before the command marker is a failure' '[ "$rc" = 1 ] && [[ "$out" == *"before the remote power command started"* ]] && [[ "$out" != *"confirming..."* ]]'
+out=$(WAKE_LAB_HOSTS="$tmp/rog-hosts.sh" SSH_NO_MARKER=1 SSH_UP=rog-nv-win WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" sleep rog 2>&1); rc=$?
+check 'a Linux-configured box booted into Windows cannot report successful sleep' '[ "$rc" = 1 ] && [[ "$out" == *"before the remote power command started"* ]]'
+cp "$here/wake-lab-wsl.sh" "$tmp/wake-lab-wsl.sh"
+sed 's/echo linux/echo wsl/' "$tmp/hosts.sh" >"$tmp/tuf-wsl.sh"
+out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'a kind with no matching endpoint is refused' '[ "$rc" = 1 ] && [[ "$out" == *"no Windows ssh endpoint for tuf"* ]]'
+cat >"$tmp/asus-linux.sh" <<'HOSTS'
+mac_of() { [ "$1" = asus ] && echo aa:bb:cc:00:00:05; }
+eth_mac_of() { return 1; }
+ip_of() { [ "$1" = asus ] && echo 192.0.2.29; }
+kind_of() { [ "$1" = asus ] && echo linux; }
+HOSTS
+out=$(WAKE_LAB_HOSTS="$tmp/asus-linux.sh" "$tmp/wake-lab.sh" status asus 2>&1); rc=$?
+check 'Linux kind without a native ssh endpoint is refused' '[ "$rc" = 1 ] && [[ "$out" == *"no linux ssh endpoint for asus"* ]]'
 sed 's/echo linux/echo unknown/' "$tmp/hosts.sh" >"$tmp/bad.sh"
 out=$(WAKE_LAB_HOSTS="$tmp/bad.sh" "$tmp/wake-lab.sh" tuf 2>&1); rc=$?
 check 'invalid kind refuses before WoL' '[ "$rc" = 1 ] && [[ "$out" == *"invalid kind for tuf"* ]]'

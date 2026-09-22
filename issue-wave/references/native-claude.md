@@ -34,7 +34,7 @@ and a release through five PRs on 2026-09-15 with no stranded worker.
 
    ```
    EXECUTION_REQUEST
-   {"request_id":"<wave>-<issue>-<host>-<n>","execution_host":"rog-nv-wsl","kind":"measurement",
+   {"request_id":"<wave>-<issue>-<host>-<n>","execution_host":"rog-nv-linux","kind":"measurement",
     "requested_revision":"<pushed sha>","checkout":"<absolute path on the execution host>",
     "command":"<one bounded runner command>","log":"<intended log path, or ->"}
    END_EXECUTION_REQUEST

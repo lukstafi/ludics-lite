@@ -1307,6 +1307,18 @@ out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP
   || ko "a missing site file stranded the holder (rc=$rc) -- $out"
 for _ in 1 2 3 4 5; do alive "$stranded" || break; sleep 1; done
 alive "$stranded" && ko "...but the holder survived" || ok "...and the holder is gone"
+# The site kind can change after a WSL lane began. Its recorded holder still belongs to that
+# lane, regardless of which OS the next boot selects.
+sed 's/rog|minix) echo wsl/rog|minix) echo linux/' "$TMP/hosts.sh" > "$TMP/hosts-linux.sh"
+reset_hold_state
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1)
+stranded=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts-linux.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+      "$WL" unhold rog 2>&1); rc=$?
+for _ in 1 2 3 4 5; do alive "$stranded" || break; sleep 1; done
+[ "$rc" -eq 0 ] && grep -q 'wsl holder released on rog' <<<"$out" && ! alive "$stranded" \
+  && ok "unhold releases a recorded WSL holder after the box kind changes to linux (rc=$rc)" \
+  || ko "a linux kind stranded its earlier WSL holder (rc=$rc) -- $out"
 mkdir -p "$TMP/state"; printf '999999\n' > "$TMP/state/hold-rog.pid"
 # A holder found already dead is a lane that lost its box with nobody noticing -- the very failure
 # --hold exists to prevent -- so it is reported as a FAULT and leaves rc 2, never as a release. On
@@ -1314,7 +1326,7 @@ mkdir -p "$TMP/state"; printf '999999\n' > "$TMP/state/hold-rog.pid"
 # as clean; the boxes stayed up by luck. rc 2 and not 1 so a cleanup can tell this from an ordinary
 # failure of the unhold command.
 expect "...and a holder that had already died is reported as an ANOMALY, not as a release" 2 "ANOMALY: wsl holder on rog had already exited" -- \
-  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
+  env WAKE_LAB_HOSTS="$TMP/hosts-linux.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
 grep -q 'stopped being RESERVED' <<<"$out" \
   && ok "...and says what it cost the lane -- the lab lock -- not merely that a pid was gone" \
   || ko "the anomaly does not say the box stopped being reserved when the holder died -- $out"
