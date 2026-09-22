@@ -62,7 +62,7 @@
 # while halted (`--force` admits the one triage worker) and runs the preflight on the box first.
 # Lease and halt live on FLEET_ANCHOR.
 #
-# <box> is an ssh destination (rog-nv-wsl, minix-amd-wsl), or `local` / this machine's own fleet
+# <box> is an ssh destination (rog-nv-linux, minix-amd-linux, tuf-amd-linux), or `local` / this machine's own fleet
 # name (detected from the hostname through FLEET_HOSTNAME_MAP; FLEET_LOCAL_BOX overrides) for the
 # coordinator's own machine.
 #
@@ -79,7 +79,7 @@
 #   FLEET_BASE_REF: ref from which `launch` starts a worktree when --base is absent; origin/master.
 #   FLEET_ANCHOR: box where lease and halt live; mac-studio.
 #   FLEET_ANCHOR_STATE: anchor state dir; defaults to ISSUE_WAVE_STATE.
-#   FLEET_BOXES: whole fleet; "mac-studio rog-nv-wsl minix-amd-wsl". `ls` sweeps it minus local.
+#   FLEET_BOXES: whole fleet; "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux". `ls` sweeps it minus local.
 #   FLEET_BOX_CORRECTNESS_SLOTS: `<box>=<n>` pairs, how many correctness executions may share a
 #     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" with the default roster,
 #     empty (one slot everywhere) with a custom FLEET_BOXES. Measurement stays exclusive.
@@ -109,7 +109,7 @@ set -uo pipefail
 # model, not after the ssh alias), so it is listed beside the alias-shaped spelling: without it
 # the coordinator on the anchor box itself ssh'd to `mac-studio` and read its own lease and
 # halt files as unreachable (2026-09-04, the first fleet-wide wave).
-HOSTNAME_MAP="${FLEET_HOSTNAME_MAP:-*mac-studio*=mac-studio lukaszsacstudio*=mac-studio rog-nv*=rog-nv-wsl rog=rog-nv-wsl minix*=minix-amd-wsl}"
+HOSTNAME_MAP="${FLEET_HOSTNAME_MAP:-*mac-studio*=mac-studio lukaszsacstudio*=mac-studio rog-nv*=rog-nv-linux rog=rog-nv-linux minix*=minix-amd-linux tuf*=tuf-amd-linux}"
 detect_local_box() {
   local host pair
   local -a hostname_pairs=()
@@ -125,7 +125,7 @@ detect_local_box() {
 LOCAL_BOX="${FLEET_LOCAL_BOX-$(detect_local_box)}"
 BASE_REF="${FLEET_BASE_REF:-origin/master}"
 ANCHOR="${FLEET_ANCHOR:-mac-studio}"
-BOXES="${FLEET_BOXES:-mac-studio rog-nv-wsl minix-amd-wsl}"
+BOXES="${FLEET_BOXES:-mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux}"
 # Correctness slots per box: the site default only fits the site's roster.
 SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ -n "${FLEET_BOXES:-}" ] || echo mac-studio=6)}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"

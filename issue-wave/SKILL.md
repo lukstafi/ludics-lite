@@ -88,8 +88,14 @@ script; they are what the coordinator tells its workers.
   copy; it turns over fast. It supplies difficulty classes (D1/D2/D3), a dependency graph,
   a parallelism analysis, machine placement, and a ready-now first wave. If it has a design
   questions section (see Decision gate), that too.
-- **The fleet**: `mac-studio` (Metal + cc, the reference dev box), `rog-nv-wsl` (CUDA, 24
-  cores), `minix-amd-wsl` (HIP, 32 cores). Placement is a lookup, never a re-derivation of
+- **The fleet**: `mac-studio` (Metal + cc, the reference dev box), `rog-nv-linux` (CUDA, 24
+  cores), `minix-amd-linux` (HIP, 32 cores), and `tuf-amd-linux` (AMD, manual wake).
+  The site's `FLEET_BOXES` and `FLEET_HOSTNAME_MAP` must use the OS endpoint that `kind_of` and
+  `wake-lab.sh status` report. The daily plan may still spell the same physical ROG or Minix
+  box with its former `-wsl` suffix: translate only that suffix to the current `-linux` alias
+  in the roster before dispatch, and record the translation in the wave board. Never translate
+  to an endpoint that `status` did not reach. A WSL boot uses the `-wsl` alias and the
+  [WSL setup](references/wsl-boxes.md). Placement is a lookup, never a re-derivation of
   hardware needs from issue bodies: where the plan's first-wave list carries a box per item,
   that column is the **dispatch table**. Where it still places by prose - the Machine-placement
   paragraphs, one per box, listing *legs* of issues rather than issues (ludics-lite#13) - derive
@@ -129,15 +135,16 @@ that adds test stanzas sequences after one that reshapes the affected goldens or
 boxes serialize per box for measurement work (the plan's Parallelism section orders each box's
 queue). Three limits are separate and none bounds another: agent capacity (the runtime's), the
 execution registry (a measurement reservation is exclusive on its box), and the correctness
-slots a box's batches share at run time (six on mac-studio, one on the WSL boxes;
+slots a box's batches share at run time (six on mac-studio, one by default on other boxes;
+WSL's measured dxg limit is one, while native Linux may be configured higher after measurement;
 ludics-lite#157, #160) - a count `execution slot` takes around each batch, so a worker's
 standing reservation never gates another worker's start ([executions.md](references/executions.md)).
 
 A box that is asleep or unreachable is a placement fact, not a blocker: wake it through
-flotilla (`curl -X POST http://mac-studio:7799/api/wake -d '{"machine":"rog"}'`; WSL then needs
-the kick the OCANNL agent-notes describe - `ssh <box>-win 'wsl.exe -d Ubuntu -e true'` and a
-re-probe - and a freshly powered-on VM can terminate again within minutes if nothing connects,
-so kick right before launching), or defer that box's items with the gate recorded. Wake with
+`wake-lab.sh --wait <box>` or flotilla (`curl -X POST http://mac-studio:7799/api/wake -d '{"machine":"rog"}'`),
+then check `wake-lab.sh status <box>` for the OS reached. For a WSL box only, follow
+[wsl-boxes.md](references/wsl-boxes.md) before launching; native Ubuntu needs no guest kick.
+Or defer that box's items with the gate recorded. Wake with
 care not to interrupt sessions already running there, especially if the box re-hibernates.
 
 **Dependency gating, including out-of-scope dependencies.** For each candidate, walk the
@@ -223,7 +230,7 @@ rog and the CUDA arm of ahrefs/ocannl#892 went unmeasured, lukstafi/ludics-lite#
 2026-09-08 every box reaches the other two non-interactively: each has its own
 `~/.ssh/id_ed25519` (rog's existing one, minix's minted for this), its public key sits in the
 other boxes' `authorized_keys` (the Mac's included, Remote Login being on), and `~/.ssh/config`
-on the boxes carries `rog-nv-wsl` / `minix-amd-wsl` / `mac-studio` aliases over Tailscale
+on the boxes carries the site's canonical GPU aliases over Tailscale
 MagicDNS with that key, so the same names work from every box. `fleet-worker.sh preflight`
 probes it on every launch: `ssh -o BatchMode=yes <sibling> exit 0` from the box to each fleet
 sibling (the `FLEET_BOXES` roster minus the box itself), refusing on a missing credential
@@ -317,10 +324,9 @@ requirements for every transport with transport-specific setup and identity, and
   for the machine and each worktree links its own copies of every test exe, so N parallel full
   suites queue N x ~200 fresh binaries behind it and every worker's run freezes (2026-08-22: 34
   exes parked in dlopen, logs frozen, load 2.5); `dune -j 4` when more than ~4 workers share
-  the box. **On rog/minix (WSL)**: the CUDA/HIP PATH prefix `tools/sweep.sh` uses for non-login
-  shells, the backend to select and how to prove the run executed on it (a backend-uniform
-  golden proves nothing - the OCANNL notes on `OCANNL_BACKEND` and self-announcing legs), and
-  still one dune per _build.
+  the box. **On GPU boxes**: name the backend and how to prove the run executed on it (a
+  backend-uniform golden proves nothing), and keep one dune per _build. For `wsl` kind only,
+  add the [WSL traps](references/wsl-boxes.md) to the brief.
 - Execution handoff: the worker's own targeted correctness batches on its agent host run under
   the [standing reservation](references/executions.md#standing-iteration-reservation) the
   coordinator took at launch - name its request id, the bounded aliases and `-j` width it

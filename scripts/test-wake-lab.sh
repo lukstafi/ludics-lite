@@ -256,6 +256,12 @@ up=1
 for u in ${SSH_UP:-}; do [ "$u" = "$dest" ] && up=0; done
 if [ "$up" = 0 ]; then
   case "$cmd" in
+    *WAKE_LAB_POWER_STARTED*)
+      printf 'WAKE_LAB_POWER_STARTED\r\n'
+      [ "${SSH_POWER_FAIL:-0}" = 1 ] && { echo 'Power request denied' >&2; exit 2; }
+      [ "${SSH_POWER_DROP_AFTER_MARKER:-0}" = 1 ] && exit 255 ;;
+  esac
+  case "$cmd" in
     *tasklist*)          printf '%s\n' "${SSH_TASKLIST:-}" ;;
     *"reg query"*)       printf '%s\n' "${SSH_REG:-}" ;;
     # wsl.exe writes UTF-16LE, which is why this is piped through perl rather than printf'd: the
@@ -409,6 +415,9 @@ ip_of() { case "$1" in
   rog)   echo 10.0.0.1 ;;
   minix) echo 10.0.0.2 ;;
   *) return 1 ;; esac; }
+kind_of() { case "$1" in
+  rog|minix) echo wsl ;;
+  *) return 1 ;; esac; }
 EOF
 
 # --- the site file is required, and is the only source of hardware addresses -------------------
@@ -425,6 +434,9 @@ expect "a host table missing eth_mac_of refuses, naming the function" 1 "defines
 printf 'mac_of() { echo x; }\neth_mac_of() { echo x; }\n' > "$TMP/no-ip.sh"
 expect "...and so does one missing ip_of" 1 "defines no ip_of" -- \
   env WAKE_LAB_HOSTS="$TMP/no-ip.sh" "$WL" status rog
+sed '/^kind_of()/,$d' "$TMP/hosts.sh" > "$TMP/no-kind.sh"
+expect "...and one missing kind_of" 1 "defines no kind_of" -- \
+  env WAKE_LAB_HOSTS="$TMP/no-kind.sh" "$WL" status rog
 printf 'mac_of() { case in esac; }\n' > "$TMP/broken.sh"
 expect "a host table that will not parse refuses too" 1 "wake-lab.sh:" -- \
   env WAKE_LAB_HOSTS="$TMP/broken.sh" "$WL" status rog
@@ -1301,6 +1313,18 @@ out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP
   || ko "a missing site file stranded the holder (rc=$rc) -- $out"
 for _ in 1 2 3 4 5; do alive "$stranded" || break; sleep 1; done
 alive "$stranded" && ko "...but the holder survived" || ok "...and the holder is gone"
+# The site kind can change after a WSL lane began. Its recorded holder still belongs to that
+# lane, regardless of which OS the next boot selects.
+sed 's/rog|minix) echo wsl/rog|minix) echo linux/' "$TMP/hosts.sh" > "$TMP/hosts-linux.sh"
+reset_hold_state
+out=$(held_kick "rog-lan rog-nv-wsl" "$HOLDER_ANSWERS" 2>&1)
+stranded=$(cut -d' ' -f1 "$TMP/state/hold-rog.pid" 2>/dev/null)
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts-linux.sh" WAKE_LAB_STATE_DIR="$TMP/state" SSH_UP="rog-lan" \
+      "$WL" unhold rog 2>&1); rc=$?
+for _ in 1 2 3 4 5; do alive "$stranded" || break; sleep 1; done
+[ "$rc" -eq 0 ] && grep -q 'wsl holder released on rog' <<<"$out" && ! alive "$stranded" \
+  && ok "unhold releases a recorded WSL holder after the box kind changes to linux (rc=$rc)" \
+  || ko "a linux kind stranded its earlier WSL holder (rc=$rc) -- $out"
 mkdir -p "$TMP/state"; printf '999999\n' > "$TMP/state/hold-rog.pid"
 # A holder found already dead is a lane that lost its box with nobody noticing -- the very failure
 # --hold exists to prevent -- so it is reported as a FAULT and leaves rc 2, never as a release. On
@@ -1308,7 +1332,7 @@ mkdir -p "$TMP/state"; printf '999999\n' > "$TMP/state/hold-rog.pid"
 # as clean; the boxes stayed up by luck. rc 2 and not 1 so a cleanup can tell this from an ordinary
 # failure of the unhold command.
 expect "...and a holder that had already died is reported as an ANOMALY, not as a release" 2 "ANOMALY: wsl holder on rog had already exited" -- \
-  env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
+  env WAKE_LAB_HOSTS="$TMP/hosts-linux.sh" WAKE_LAB_STATE_DIR="$TMP/state" "$WL" unhold rog
 grep -q 'stopped being RESERVED' <<<"$out" \
   && ok "...and says what it cost the lane -- the lab lock -- not merely that a pid was gone" \
   || ko "the anomaly does not say the box stopped being reserved when the holder died -- $out"
@@ -1852,7 +1876,7 @@ kill "$bystander" 2>/dev/null; kill "$sc_pid" 2>/dev/null; reset_hold_state
 # truncated reading matches nothing and every live holder would look like somebody else's process
 # -- a false negative that fails the hold and deletes the record without killing the holder. The
 # fixture cannot make a pipe narrow, so the guard is on the invocation itself.
-grep -q 'ps -ww -o args=' "$WL" \
+grep -q 'ps -ww -o args=' "$HERE/wake-lab-wsl.sh" \
   && ok "the holder signature is read with ps -ww, which macOS does not truncate" \
   || ko "ps is called without -ww: on macOS the signature is cut off and no holder is ever recognized"
 # Leave no holder running into the cases below: a live holder carries its box's lab lock, which is
@@ -2180,6 +2204,29 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOW
 grep -q 'shutdown /h' "$SSH_LOG" && grep -q 'confirming' <<<"$out" \
   && ok "a box whose lock is free hibernates exactly as before (rc=$rc)" \
   || ko "the lock broke the ordinary power action (rc=$rc) -- $out $(cat "$SSH_LOG")"
+# A site table still naming WSL can outlive a boot into native Linux. The Windows SSH alias
+# then fails before the command starts; probing only Windows afterward must not call that sleep.
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="rog-nv-linux" "$WL" sleep rog 2>&1 8>&-); rc=$?
+[ "$rc" -eq 1 ] && grep -q 'Windows power command did not start' <<<"$out" \
+  && ! grep -q 'confirming' <<<"$out" \
+  && ok "a WSL-configured box booted into native Linux cannot report a successful sleep" \
+  || ko "a missing Windows endpoint was treated as a power transition (rc=$rc) -- $out"
+rm -f "$TMP/power-down.list"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="rog-nv-win" SSH_POWER_DROP_AFTER_MARKER=1 \
+    SSH_DOWN_LIST="$TMP/power-down.list" SSH_DOWN_AFTER='WAKE_LAB_POWER_STARTED|rog-nv-win' \
+    "$WL" sleep rog 2>&1 8>&-); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'unconfirmed (connection dropped or timed out)' <<<"$out" \
+  && grep -q 'confirming' <<<"$out" \
+  && ok "a dropped Windows power connection is provisional only after its start marker" \
+  || ko "a started Windows sleep was lost on SSH disconnect (rc=$rc) -- $out"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="rog-lan rog-nv-win" SSH_POWER_FAIL=1 "$WL" hibernate rog 2>&1 8>&-); rc=$?
+[ "$rc" -eq 1 ] && grep -q 'hibernate FAILED on rog (command exited 2)' <<<"$out" \
+  && ! grep -q 'confirming' <<<"$out" \
+  && ok "a definite Windows power refusal fails even after its start marker" \
+  || ko "a refused Windows power command looked successful (rc=$rc) -- $out"
 exec 8>&-
 
 # The reservation spans the EFFECT, not the command. A dropped ssh means the suspend was
@@ -2287,28 +2334,35 @@ cat > "$TMP/hosts3.sh" <<'HOSTS3'
 mac_of() { case "$1" in
   rog)   echo aa:bb:cc:00:00:01 ;;
   minix) echo aa:bb:cc:00:00:03 ;;
-  asus)  echo aa:bb:cc:00:00:05 ;;
+  tuf)  echo aa:bb:cc:00:00:05 ;;
   *) return 1 ;; esac; }
 eth_mac_of() { mac_of "$1"; }
 ip_of() { case "$1" in
   rog)   echo 10.0.0.1 ;;
   minix) echo 10.0.0.2 ;;
-  asus)  echo 10.0.0.3 ;;
+  tuf)  echo 10.0.0.3 ;;
+  *) return 1 ;; esac; }
+kind_of() { case "$1" in
+  rog|minix|tuf) echo wsl ;;
   *) return 1 ;; esac; }
 HOSTS3
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts3.sh" "$WL" status all 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -Eq '^tuf[[:space:]]' <<<"$out" && ! grep -Eq '^asus[[:space:]]' <<<"$out" \
+  && ok "all expands to the renamed TUF box, with no separate ASUS target" \
+  || ko "all still uses a stale laptop name (rc=$rc) -- $out"
 env WAKE_LAB_HOSTS="$TMP/hosts3.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=60 \
-    SSH_UP="rog-lan rog-nv-win minix-lan minix-amd-win asus-amd-win" \
-    "$WL" hibernate rog minix asus >"$TMP/phase3.out" 2>&1 8>&- &
+    SSH_UP="rog-lan rog-nv-win minix-lan minix-amd-win tuf-amd-win" \
+    "$WL" hibernate rog minix tuf >"$TMP/phase3.out" 2>&1 8>&- &
 phase3_pid=$!
 phase3_deadline=$((SECONDS + 20))
-while lock_free rog || lock_free minix || lock_free asus; do
+while lock_free rog || lock_free minix || lock_free tuf; do
   [ "$SECONDS" -ge "$phase3_deadline" ] && break
   sleep 1
 done
-if ! lock_free rog && ! lock_free minix && ! lock_free asus; then
+if ! lock_free rog && ! lock_free minix && ! lock_free tuf; then
   ok "all three boxes of the host table are reserved by one command, both locks each"
 else
-  ko "a third box could not be reserved -- the descriptors ran into bash's save slot (rog=$(lock_free rog && echo free || echo held), minix=$(lock_free minix && echo free || echo held), asus=$(lock_free asus && echo free || echo held))"
+  ko "a third box could not be reserved -- the descriptors ran into bash's save slot (rog=$(lock_free rog && echo free || echo held), minix=$(lock_free minix && echo free || echo held), tuf=$(lock_free tuf && echo free || echo held))"
 fi
 grep -q 'REFUSED' "$TMP/phase3.out" \
   && ko "a box of the table was refused for want of a descriptor: $(grep REFUSED "$TMP/phase3.out")" \
@@ -2316,7 +2370,7 @@ grep -q 'REFUSED' "$TMP/phase3.out" \
 kill "$phase3_pid" 2>/dev/null
 wait "$phase3_pid" 2>/dev/null
 kill3_deadline=$((SECONDS + 20))
-while ! lock_free rog || ! lock_free minix || ! lock_free asus; do
+while ! lock_free rog || ! lock_free minix || ! lock_free tuf; do
   [ "$SECONDS" -ge "$kill3_deadline" ] && break
   sleep 1
 done

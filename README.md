@@ -159,14 +159,15 @@ mkdir -p "$HOME/bin"
 ln -sfn "$HOME/ludics-lite/scripts/wake-lab.sh" "$HOME/bin/wake-lab.sh"
 ```
 
-The fleet's MAC and LAN IP addresses are the one part that is not tracked. They live in a file the
+The fleet's MAC and LAN IP addresses and each box's current `kind_of` are the site facts that are
+not tracked. They live in a file the
 script sources at startup and refuses to run without, so a box that has not been configured says
 so instead of reporting every machine as unknown:
 
 ```sh
 mkdir -p "$HOME/.config/wake-lab"
 cp "$HOME/ludics-lite/scripts/wake-lab-hosts.example.sh" "$HOME/.config/wake-lab/hosts.sh"
-chmod 600 "$HOME/.config/wake-lab/hosts.sh"   # then fill in mac_of, eth_mac_of and ip_of
+chmod 600 "$HOME/.config/wake-lab/hosts.sh"   # then fill in mac_of, eth_mac_of, ip_of and kind_of
 ```
 
 The WSL boxes are shared, and `wsl.exe --shutdown` is host-global — it destroys the whole VM, so
@@ -217,12 +218,11 @@ still takes its lane lock while that box's hold lock is held. The checkout is re
 read-only. Where it is absent, as in CI, the case prints a named `SKIP:` line that the summary
 counts, so a green run says what it did not check. The staging side has no matching check.
 
-`WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the verified lab
-lore in the header comment (wake-on-LAN over Ethernet only, waking from a full shutdown, what
-`router-active=1` means, the cold-boot kicked-VM trap, the `exit 0` vs `true` probe trap), the router
-endpoints, the ssh aliases and all of the logic. `wake-lab.sh --help` prints that header, and
+`WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the common lab
+lore in `wake-lab.sh` and the Windows/WSL lessons in `wake-lab-wsl.sh`, the router endpoints, the
+ssh aliases and all of the logic. `wake-lab.sh --help` prints the common header, and
 `--help` and `--list` are the two commands that work before the host table exists. The box names
-(`rog`, `minix`, `asus`) and the ssh aliases are the author's and are edited in place.
+(`rog`, `minix`, `tuf`) and the ssh aliases are the author's and are edited in place.
 
 To repair the Windows-side NIC settings, copy `scripts/enable-wol-windows.ps1` to the Windows box
 and run it from an elevated PowerShell (`powershell -ExecutionPolicy Bypass -File
@@ -273,6 +273,7 @@ ship-pr/scripts/test-pr-review-watch.sh
 ship-pr/scripts/test-pr-review-reply.sh
 ship-pr/scripts/test-pr-review-run-watch.sh
 scripts/test-wake-lab.sh
+scripts/test-wake-lab-linux.sh
 scripts/test-check-prompts.sh
 scripts/test-check-jq-shapes.sh
 scripts/test-check-scratch-dirs.sh
@@ -529,7 +530,8 @@ sections share (the shim CLIs, the scratch skills checkout, the scratch project 
 is selected, and a section that needs more than that, such as the coordinator lease or a finished
 worker to read, takes it itself, so every section also passes when it is the only one selected.
 
-`test-wake-lab.sh` runs the lab script against shim `curl`, `python3` and `ssh` on PATH, so it
+`test-wake-lab-linux.sh` exercises native Ubuntu status, wake and power handling with the WSL
+adapter absent. `test-wake-lab.sh` runs the WSL path against shim `curl`, `python3` and `ssh` on PATH, so it
 touches neither the router nor the network. It pins the split above from both sides: that every
 MAC the script sends comes from the sourced host table and that a missing, incomplete or
 short-a-target one is refused before any router traffic, and that no MAC-shaped literal is tracked

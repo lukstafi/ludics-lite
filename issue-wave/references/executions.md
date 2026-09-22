@@ -20,8 +20,9 @@ host with other correctness reservations up to the box's slots - `FLEET_BOX_CORR
 `<box>=<n>` pairs, `mac-studio=6` with the default roster and one slot for any box it does not
 name (ludics-lite#157: the exclusivity was written for measurement noise and for XProtect
 serializing fresh test binaries, and three workers' targeted `-j 4` batches ran side by side on
-the Mac without a stall once the Developer Tools exemption was in place; the WSL boxes keep one
-slot because the dxg bridge is the limit there).
+the Mac without a stall once the Developer Tools exemption was in place). Keep one slot for
+WSL boxes because of the measured dxg bridge limit; configure native Linux boxes per their
+measured capacity. The kind does not silently change the configured slot count.
 
 The slot count is a RUN-TIME count, and `execution slot` is the single run-time mechanism
 (ludics-lite#160): every correctness run on a box, assigned or standing, is wrapped in
@@ -49,7 +50,7 @@ is each coordinator's own directory, and slots kept there would let two workers 
 coordinators each take slot 1 on one machine. The command after `--` is exec'd, not
 interpreted, so a pipeline or a shell builtin goes as `sh -c '...'`.
 
-Use one canonical box name from the site's roster consistently (for example `rog-nv-wsl`, not
+Use one canonical box name from the site's roster consistently (for example `rog-nv-linux`, not
 an alternating ssh alias and app host ID). New reservations and dispatch require exact
 `FLEET_BOXES` entries; aliases and case variants are refused. Configure one canonical entry per
 physical box. Outstanding records outside a changed roster block dispatch until reconciled;
@@ -79,7 +80,7 @@ must exist before launch. For example `reserve.json`:
   "issue": "owner/repo#123",
   "purpose": "bounded CUDA correctness verification",
   "agent_host": "mac-studio",
-  "execution_host": "rog-nv-wsl",
+  "execution_host": "rog-nv-linux",
   "repository": "owner/repo",
   "requested_revision": "<pushed-ref-or-exact-sha>",
   "kind": "correctness"

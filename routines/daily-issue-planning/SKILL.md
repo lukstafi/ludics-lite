@@ -33,7 +33,10 @@ Arrange the material without unhelpful redundancy, the following are needs, not 
 - Categorize into three classes: (D1) straightforward ones; (D2) requiring logical problem solving, but limited code impact (e.g. debugging); (D3) requiring design taste and tricky conceptual thinking.
 - Pick the issues that can be implemented or solved first.
   - Present them as the first-wave list, with an explicit home-box field on every item: exactly one of
-    `mac-studio`, `rog-nv-wsl`, or `minix-amd-wsl`. This is the issue-wave coordinator's dispatch
+    `mac-studio`, `rog-nv-linux`, `minix-amd-linux`, or `tuf-amd-linux` when those boxes are running
+    native Linux. Check the current site's `kind_of` and fleet roster before writing the plan; use
+    the corresponding `-wsl` alias for a box booted into WSL, and include only boxes in the roster.
+    This is the issue-wave coordinator's dispatch
     lookup, so never leave it to inference from the machine-placement prose. When an issue has useful
     legs on other boxes, name the box where its primary iteration happens as home and list the other
     boxes separately as legs. If one list item groups issues with different homes, label each issue's
