@@ -1345,11 +1345,11 @@ win_dest() { # win_dest <box> — the first Windows alias that answers, empty if
   echo ""
 }
 
-# `SetSuspendState` drops the connection mid-command; without ServerAlive* the ssh client can hang
-# for minutes instead of returning. The drop IS the success signature — do not treat it as an error,
-# and do not wrap the command as `start /b ... & exit` (the detached child dies with the session).
+# `SetSuspendState` can drop the connection mid-command. A drop is provisional success only
+# after Windows echoed the start marker: a dual-boot box may have no Windows SSH endpoint at all.
+# Keep the command attached to this session; a detached child dies with it.
 wsl_power_action() { # power_action <verb> <box>
-  local verb=$1 name=$2 ts cmd
+  local verb=$1 name=$2 ts cmd output action_rc
   ts=$(ts_of "$name") || { echo "unknown machine: $name" >&2; return 1; }
   case "$verb" in
     sleep)     cmd='rundll32.exe powrprof.dll,SetSuspendState 0,1,0' ;;
@@ -1357,10 +1357,20 @@ wsl_power_action() { # power_action <verb> <box>
     down)      cmd='shutdown /s /f /t 0' ;;
     *) echo "unknown power verb: $verb" >&2; return 1 ;;
   esac
+  cmd='cmd.exe /d /s /c "echo WAKE_LAB_POWER_STARTED & '"$cmd"'"'
   echo "$name: $verb"
-  ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
-      "$ts" "$cmd" 2>&1 | tail -1
-  echo "  (a dropped/timed-out connection here is the expected success signature)"
+  output=$(capped 30 ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+      "$ts" "$cmd" 2>&1); action_rc=$?
+  [ -z "$output" ] || printf '  %s\n' "$(printf '%s\n' "$output" | tail -1)"
+  if ! tr -d '\r' <<<"$output" | grep -Fxq 'WAKE_LAB_POWER_STARTED'; then
+    echo "  $verb FAILED on $name (Windows power command did not start)"
+    return 1
+  fi
+  case "$action_rc" in
+    0) return 0 ;;
+    255|124) echo "  $verb on $name unconfirmed (connection dropped or timed out); checking reachability"; return 0 ;;
+    *) echo "  $verb FAILED on $name (command exited $action_rc)"; return 1 ;;
+  esac
 }
 
 # start_wsl <box...> — kick (or, with FRESH_WSL, restart) WSL on each box, then poll only the boxes

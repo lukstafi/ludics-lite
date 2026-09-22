@@ -256,6 +256,12 @@ up=1
 for u in ${SSH_UP:-}; do [ "$u" = "$dest" ] && up=0; done
 if [ "$up" = 0 ]; then
   case "$cmd" in
+    *WAKE_LAB_POWER_STARTED*)
+      printf 'WAKE_LAB_POWER_STARTED\r\n'
+      [ "${SSH_POWER_FAIL:-0}" = 1 ] && { echo 'Power request denied' >&2; exit 2; }
+      [ "${SSH_POWER_DROP_AFTER_MARKER:-0}" = 1 ] && exit 255 ;;
+  esac
+  case "$cmd" in
     *tasklist*)          printf '%s\n' "${SSH_TASKLIST:-}" ;;
     *"reg query"*)       printf '%s\n' "${SSH_REG:-}" ;;
     # wsl.exe writes UTF-16LE, which is why this is piped through perl rather than printf'd: the
@@ -2198,6 +2204,29 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOW
 grep -q 'shutdown /h' "$SSH_LOG" && grep -q 'confirming' <<<"$out" \
   && ok "a box whose lock is free hibernates exactly as before (rc=$rc)" \
   || ko "the lock broke the ordinary power action (rc=$rc) -- $out $(cat "$SSH_LOG")"
+# A site table still naming WSL can outlive a boot into native Linux. The Windows SSH alias
+# then fails before the command starts; probing only Windows afterward must not call that sleep.
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="rog-nv-linux" "$WL" sleep rog 2>&1 8>&-); rc=$?
+[ "$rc" -eq 1 ] && grep -q 'Windows power command did not start' <<<"$out" \
+  && ! grep -q 'confirming' <<<"$out" \
+  && ok "a WSL-configured box booted into native Linux cannot report a successful sleep" \
+  || ko "a missing Windows endpoint was treated as a power transition (rc=$rc) -- $out"
+rm -f "$TMP/power-down.list"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="rog-nv-win" SSH_POWER_DROP_AFTER_MARKER=1 \
+    SSH_DOWN_LIST="$TMP/power-down.list" SSH_DOWN_AFTER='WAKE_LAB_POWER_STARTED|rog-nv-win' \
+    "$WL" sleep rog 2>&1 8>&-); rc=$?
+[ "$rc" -eq 0 ] && grep -q 'unconfirmed (connection dropped or timed out)' <<<"$out" \
+  && grep -q 'confirming' <<<"$out" \
+  && ok "a dropped Windows power connection is provisional only after its start marker" \
+  || ko "a started Windows sleep was lost on SSH disconnect (rc=$rc) -- $out"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="rog-lan rog-nv-win" SSH_POWER_FAIL=1 "$WL" hibernate rog 2>&1 8>&-); rc=$?
+[ "$rc" -eq 1 ] && grep -q 'hibernate FAILED on rog (command exited 2)' <<<"$out" \
+  && ! grep -q 'confirming' <<<"$out" \
+  && ok "a definite Windows power refusal fails even after its start marker" \
+  || ko "a refused Windows power command looked successful (rc=$rc) -- $out"
 exec 8>&-
 
 # The reservation spans the EFFECT, not the command. A dropped ssh means the suspend was
