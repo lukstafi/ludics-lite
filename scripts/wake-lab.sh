@@ -99,7 +99,7 @@ load_hosts() {
 # through the operation -- and the dispatch loop's exit status hides that, so the run reads as a
 # success. Refusing the whole run is what "refuse rather than run half-configured" means here.
 check_targets() {
-  local t bad="" kind
+  local t bad="" kind guest
   for t in "$@"; do
     mac_of "$t" >/dev/null 2>&1 || { bad="$bad $t"; continue; }
     kind=$(kind_of "$t") || kind=""
@@ -108,7 +108,9 @@ check_targets() {
         linux_of "$t" >/dev/null || { echo "wake-lab.sh: no linux ssh endpoint for $t" >&2; exit 1; } ;;
       wsl)
         load_wsl_adapter || exit 1
-        ts_of "$t" >/dev/null || { echo "wake-lab.sh: no Windows ssh endpoint for $t" >&2; exit 1; } ;;
+        ts_of "$t" >/dev/null || { echo "wake-lab.sh: no Windows ssh endpoint for $t" >&2; exit 1; }
+        guest=$(wsl_of "$t") || guest=""
+        [ -n "$guest" ] || { echo "wake-lab.sh: no WSL guest ssh endpoint for $t" >&2; exit 1; } ;;
       *) echo "wake-lab.sh: invalid kind for $t: ${kind:-(none)} (expected wsl or linux)" >&2; exit 1 ;;
     esac
   done
@@ -270,7 +272,7 @@ status_one() { # status_one <box>
       # suffixes are only liveness probes for status; the Windows commands remain in the WSL
       # adapter and are never read on this path.
       case "$1" in
-        rog|minix)
+        rog|minix|tuf)
           win=${host%-linux}-win; guest=${host%-linux}-wsl
           if ssh_probe "$guest"; then printf '  os=wsl  linux=--  wsl=UP'
           elif ssh_probe "$win"; then printf '  os=windows  linux=--  win=UP'

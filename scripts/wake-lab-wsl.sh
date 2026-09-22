@@ -116,6 +116,7 @@ ts_of() { case "$1" in
 wsl_of() { case "$1" in
   rog) echo rog-nv-wsl ;;
   minix) echo minix-amd-wsl ;;
+  tuf) echo tuf-amd-wsl ;;
   *) echo "" ;; esac; }
 
 wsl_box_live() {

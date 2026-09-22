@@ -26,6 +26,7 @@ esac
 case " $* " in
   *' tuf-amd-linux '*) [ "${SSH_UP:-0}" = 1 ] ;;
   *' tuf-amd-win '*) [ "${SSH_UP:-0}" = tuf-amd-win ] ;;
+  *' tuf-amd-wsl '*) [ "${SSH_UP:-0}" = tuf-amd-wsl ] ;;
   *' rog-nv-linux '*) [ "${SSH_UP:-0}" = rog-nv-linux ] ;;
   *' rog-nv-win '*) [ "${SSH_UP:-0}" = rog-nv-win ] ;;
   *' rog-nv-wsl '*) [ "${SSH_UP:-0}" = rog-nv-wsl ] ;;
@@ -47,6 +48,10 @@ fail=0
 check() { if eval "$2"; then echo "PASS: $1"; else echo "FAIL: $1"; fail=$((fail+1)); fi; }
 out=$(SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
 check 'Linux status reports the reached OS without loading the adapter' '[ "$rc" = 0 ] && [[ "$out" == *"os=linux  linux=UP"* ]] && [[ "$out" != *"Windows Update"* ]]'
+out=$(SSH_UP=tuf-amd-win "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'Linux-configured TUF reports an alternate Windows boot' '[ "$rc" = 0 ] && [[ "$out" == *"os=windows"* ]]'
+out=$(SSH_UP=tuf-amd-wsl "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'Linux-configured TUF reports an alternate WSL guest' '[ "$rc" = 0 ] && [[ "$out" == *"os=wsl"* ]]'
 cat >"$tmp/rog-hosts.sh" <<'HOSTS'
 mac_of() { [ "$1" = rog ] && echo aa:bb:cc:00:00:02; }
 eth_mac_of() { mac_of "$1"; }
@@ -80,7 +85,16 @@ check 'a Linux-configured box booted into Windows cannot report successful sleep
 cp "$here/wake-lab-wsl.sh" "$tmp/wake-lab-wsl.sh"
 sed 's/echo linux/echo wsl/' "$tmp/hosts.sh" >"$tmp/tuf-wsl.sh"
 out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" SSH_UP=tuf-amd-win "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
-check 'the renamed TUF keeps its Windows endpoint when configured for WSL' '[ "$rc" = 0 ] && [[ "$out" == *"win=UP"* ]] && [[ "$out" == *"os=windows"* ]]'
+check 'the renamed TUF keeps its Windows endpoint when configured for WSL' '[ "$rc" = 0 ] && [[ "$out" == *"win=UP"* ]] && [[ "$out" == *"wsl=--"* ]] && [[ "$out" == *"os=windows"* ]]'
+out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" SSH_UP=tuf-amd-wsl "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'TUF WSL status requires a responding guest' '[ "$rc" = 0 ] && [[ "$out" == *"wsl=UP"* ]] && [[ "$out" == *"os=wsl"* ]]'
+out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" SSH_UP=tuf-amd-win WAKE_LAB_WSL_WAIT_SECONDS=0 "$tmp/wake-lab.sh" kick-wsl tuf 2>&1); rc=$?
+check 'TUF kick cannot report WSL up without its guest endpoint answering' '[ "$rc" != 0 ] && [[ "$out" == *"wsl still down"* ]] && [[ "$out" != *"wsl up"* ]]'
+mkdir "$tmp/no-guest"
+cp "$tmp/wake-lab.sh" "$tmp/no-guest/wake-lab.sh"
+sed '/tuf) echo tuf-amd-wsl ;;/d' "$tmp/wake-lab-wsl.sh" >"$tmp/no-guest/wake-lab-wsl.sh"
+out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" SSH_UP=tuf-amd-win "$tmp/no-guest/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'WSL kind refuses an adapter without a guest endpoint' '[ "$rc" = 1 ] && [[ "$out" == *"no WSL guest ssh endpoint for tuf"* ]]'
 cat >"$tmp/other-linux.sh" <<'HOSTS'
 mac_of() { [ "$1" = other ] && echo aa:bb:cc:00:00:05; }
 eth_mac_of() { return 1; }
