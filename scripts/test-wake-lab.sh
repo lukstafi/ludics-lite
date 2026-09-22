@@ -2347,7 +2347,7 @@ kind_of() { case "$1" in
   *) return 1 ;; esac; }
 HOSTS3
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts3.sh" "$WL" status all 2>&1); rc=$?
-[ "$rc" -eq 0 ] && grep -q '^tuf:' <<<"$out" && ! grep -q '^asus:' <<<"$out" \
+[ "$rc" -eq 0 ] && grep -Eq '^tuf[[:space:]]' <<<"$out" && ! grep -Eq '^asus[[:space:]]' <<<"$out" \
   && ok "all expands to the renamed TUF box, with no separate ASUS target" \
   || ko "all still uses a stale laptop name (rc=$rc) -- $out"
 env WAKE_LAB_HOSTS="$TMP/hosts3.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=60 \
