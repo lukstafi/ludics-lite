@@ -298,8 +298,9 @@ state what each check establishes rather than enumerate the shapes that would fo
 requires a line in this Tests section that is that path once an optional `python3` or `./` prefix is
 stripped — the two forms the register itself uses — and an inline `run:` line in
 `.github/workflows/skill-scripts.yml` on each platform that file needs — both Ubuntu and macOS for a
-shell suite, and for one under `ship-pr/scripts/` a run line in the `git-bash` job itself (not
-merely on a Windows runner, which the PowerShell job shares), while a `.ps1` goes to Windows on its extension and the two Ubuntu-only Python fixtures are the
+shell suite, and for one under `ship-pr/scripts/` a run line in the `git-bash` job of
+`.github/workflows/windows-git-bash.yml` (not merely on a Windows runner, which the PowerShell job
+shares), while a `.ps1` goes to Windows on its extension and the two Ubuntu-only Python fixtures are the
 ones named by path in the checker. The lookup is the section and not the block — any such
 line anywhere under `## Tests` satisfies it, so the register above is where those lines are kept by
 convention rather than by enforcement. The glob asks the filename, not the file, so it cannot tell a
@@ -419,7 +420,11 @@ is broken by exactly the all-Markdown PR the classification calls prompt-only.
 The reporter and hostile-runner Python controls run on Ubuntu; the driver fixture runs on Windows.
 ship-pr's shell suites run a third time under Git Bash, in the `git-bash` job on `windows-latest`
 (ludics-lite#318): Windows is a supported platform for those scripts, and since the fleet's GPU
-boxes boot native Ubuntu a fleet leg there costs a reboot. Its first step proves the platform from
+boxes boot native Ubuntu a fleet leg there costs a reboot. That job is its own workflow,
+`windows-git-bash.yml`, run nightly and on dispatch rather than per push, since it takes close to
+an hour (ludics-lite#339); a branch that needs Windows evidence dispatches it,
+`gh workflow run windows-git-bash.yml --ref <branch> [-f suite=<test-*.sh>]`, and cites the run.
+A red scheduled run opens an issue. Its first step proves the platform from
 inside the shell the suites run in (`uname -s` is `MINGW*`/`MSYS*` and `git --version` carries
 `.windows.`), every suite is gated on that proof, and the job's header names what it does not
 cover and why. `check-prompts.sh` checks each fixture file against this command register and the

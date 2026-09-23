@@ -1,0 +1,176 @@
+name: windows git bash
+
+# ship-pr's shell suites under Git for Windows' MINGW64 bash on windows-latest (ludics-lite#318),
+# nightly and on demand. Not per push (ludics-lite#339): the job runs close to an hour, and neither
+# a pull request's checks nor main's verdict (`pr-review.sh base` folds push runs only) waits on it.
+# A dispatched run does put check runs on the head it ran at, so `checks`/`merge` judge it there.
+#
+# Windows evidence for a branch: `gh workflow run windows-git-bash.yml --ref <branch>`, or
+# `-f suite=test-pr-review-watch.sh` for one suite; cite the run. A scheduled red opens (or
+# comments on) one issue.
+#
+# The first step proves the shell from inside it (`uname -s` MINGW*/MSYS*, `git --version`
+# `.windows.`, the criterion ludics-lite#288 states for a Windows leg) and every suite is gated on
+# it. Every `ship-pr/scripts/test-*.sh` has a run line in the `git-bash` job here, which
+# `scripts/check-prompts.sh` holds. KNOWN RED steps (`continue-on-error: true`) still run, fail
+# and annotate, with the issue that removes the line named at the step. Not run here: the Python
+# fixtures (the hostile pass is Ubuntu-only by design) and the repo and fleet suites, which are
+# not ship-pr code (the fleet launcher needs tmux, which Git for Windows does not ship).
+
+on:
+  schedule:
+    # Away from api-contract.yml (05:23) and base-watch.yml (06:47).
+    - cron: '11 3 * * *'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: One ship-pr suite by file name (e.g. test-pr-review-watch.sh); empty runs all
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  git-bash:
+    name: Git Bash suites, ship-pr (windows)
+    runs-on: windows-latest
+    # The cleanup step is capped at 20 below; ludics-lite#337 owns the job's runtime.
+    timeout-minutes: 60
+    defaults:
+      run:
+        # On a Windows runner `bash` is Git for Windows' bash (C:\Program Files\Git\bin\bash.exe),
+        # not WSL's. The proof step below is what holds that, not this comment.
+        shell: bash
+    steps:
+      # The image's Git carries core.autocrlf=true, and before .gitattributes pinned `eol=lf` this
+      # checkout was CRLF; the proof step prints the setting and pr-review.sh's first line in bytes.
+      - uses: actions/checkout@v4
+      - name: Prove the platform from inside the suites' shell
+        id: platform
+        env:
+          SUITE: ${{ inputs.suite }}
+        run: |
+          os=$(uname -s)
+          gv=$(git --version)
+          echo "uname -s:      $os"
+          echo "git --version: $gv"
+          echo "bash:          ${BASH_VERSION:-?} at ${BASH:-?}"
+          echo "core.autocrlf: $(git config --show-origin --get core.autocrlf || echo unset)"
+          head -n 1 ship-pr/scripts/pr-review.sh | od -c | head -n 2
+          case "$os" in
+          MINGW* | MSYS*) ;;
+          *) echo "::error title=Git Bash platform proof failed::uname -s is '$os', not MINGW*/MSYS*"; exit 1 ;;
+          esac
+          case "$gv" in
+          *.windows.*) ;;
+          *) echo "::error title=Git Bash platform proof failed::git --version is '$gv', not a Git for Windows build (.windows.)"; exit 1 ;;
+          esac
+          command -v jq || { echo '::error title=Git Bash platform proof failed::no jq on PATH'; exit 1; }
+          # The runner's jq is a native jq.exe, which ends its lines CRLF, and a `$(jq -r ...)`
+          # keeps the \r (ludics-lite#335); recorded here, so the day it changes is on the record.
+          echo "jq:            $(jq --version), and jq -r ends a line with: $(printf '"x"' | jq -r . | od -An -c | tr -s ' ')"
+          # A suite name that matches no step would skip them all and read green.
+          case "$SUITE" in
+          '') ;;
+          test-*.sh) [ -f "ship-pr/scripts/$SUITE" ] || { echo "::error title=No such suite::ship-pr/scripts/$SUITE does not exist"; exit 1; } ;;
+          *) echo "::error title=No such suite::suite takes a ship-pr/scripts/test-*.sh file name, got '$SUITE'"; exit 1 ;;
+          esac
+      # Every suite step below runs whether or not an earlier suite failed, but only once the
+      # proof passed, and only the named suite when one was dispatched; a failure names its suite
+      # in the run's annotations.
+      - name: post-merge cleanup
+        # KNOWN RED until ludics-lite#287 lands: its update-ref transaction over mkfifo is a no-op
+        # under Git Bash. #287's PR removes this line, so its own run here is its Windows evidence.
+        # Do not exclude the failing cases by name instead.
+        id: cleanup
+        continue-on-error: true
+        # The suite's per-case deadline does not fire under Git Bash (ludics-lite#337); this cap is
+        # the backstop that keeps the pr-review suites below a verdict.
+        timeout-minutes: 20
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-post-merge-cleanup.sh') }}
+        env:
+          SHIP_PR_TEST_LOG_DIR: ${{ runner.temp }}/cleanup-logs
+        run: ship-pr/scripts/test-post-merge-cleanup.sh || { echo '::error title=Git Bash suite failed::test-post-merge-cleanup.sh'; exit 1; }
+      - name: pr-review fixtures, shared preamble and shadow guard
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-lib.sh') }}
+        run: ship-pr/scripts/test-pr-review-lib.sh || { echo '::error title=Git Bash suite failed::test-pr-review-lib.sh'; exit 1; }
+      - name: pr-review fixtures, the base suites' shared fixture transport
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-base-lib.sh') }}
+        run: ship-pr/scripts/test-pr-review-base-lib.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-lib.sh'; exit 1; }
+      - name: pr-review fixtures, base drift
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-base-drift.sh') }}
+        run: ship-pr/scripts/test-pr-review-base-drift.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-drift.sh'; exit 1; }
+      - name: pr-review fixtures, the base command's red report
+        # KNOWN RED until ludics-lite#335: the runner's jq.exe ends lines CRLF.
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-base-red.sh') }}
+        run: ship-pr/scripts/test-pr-review-base-red.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-red.sh'; exit 1; }
+      - name: pr-review fixtures, the paths-ignore settle
+        # KNOWN RED until ludics-lite#335: the runner's jq.exe ends lines CRLF.
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-base-settle.sh') }}
+        run: ship-pr/scripts/test-pr-review-base-settle.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-settle.sh'; exit 1; }
+      - name: pr-review fixtures, what the base wait loop decides
+        # KNOWN RED until ludics-lite#335: the runner's jq.exe ends lines CRLF.
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-base-verdict.sh') }}
+        run: ship-pr/scripts/test-pr-review-base-verdict.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-verdict.sh'; exit 1; }
+      - name: pr-review fixtures, absent vs not yet
+        # KNOWN RED until ludics-lite#335: the runner's jq.exe ends lines CRLF.
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-checks-absent.sh') }}
+        run: ship-pr/scripts/test-pr-review-checks-absent.sh || { echo '::error title=Git Bash suite failed::test-pr-review-checks-absent.sh'; exit 1; }
+      - name: pr-review fixtures, review rounds
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-rounds.sh') }}
+        run: ship-pr/scripts/test-pr-review-rounds.sh || { echo '::error title=Git Bash suite failed::test-pr-review-rounds.sh'; exit 1; }
+      - name: pr-review fixtures, merge
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-merge.sh') }}
+        run: ship-pr/scripts/test-pr-review-merge.sh || { echo '::error title=Git Bash suite failed::test-pr-review-merge.sh'; exit 1; }
+      - name: pr-review fixtures, status and watch
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-status.sh') }}
+        run: ship-pr/scripts/test-pr-review-status.sh || { echo '::error title=Git Bash suite failed::test-pr-review-status.sh'; exit 1; }
+      - name: pr-review fixtures, what ends a watch
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-watch.sh') }}
+        run: ship-pr/scripts/test-pr-review-watch.sh || { echo '::error title=Git Bash suite failed::test-pr-review-watch.sh'; exit 1; }
+      - name: pr-review fixtures, the folded reply and resolve
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-reply.sh') }}
+        run: ship-pr/scripts/test-pr-review-reply.sh || { echo '::error title=Git Bash suite failed::test-pr-review-reply.sh'; exit 1; }
+      - name: pr-review fixtures, the run await
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-run-watch.sh') }}
+        run: ship-pr/scripts/test-pr-review-run-watch.sh || { echo '::error title=Git Bash suite failed::test-pr-review-run-watch.sh'; exit 1; }
+      - name: Keep the cleanup suite's per-case logs
+        if: failure() || cancelled() || steps.cleanup.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-logs-git-bash
+          path: ${{ runner.temp }}/cleanup-logs
+          if-no-files-found: ignore
+
+  report:
+    name: report a red nightly run
+    # A scheduled run nobody watches fails silently. One open issue, not one per night: a later red
+    # comments on it. No checkout, since this job's token can write. Known-red steps do not turn
+    # the job red, so this fires on a new failure or a job that did not finish.
+    needs: git-bash
+    if: ${{ !cancelled() && github.event_name == 'schedule' && needs.git-bash.result != 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or extend the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ needs.git-bash.result }}
+        run: |
+          set -e
+          title="windows git bash: the nightly run of ship-pr's suites under Git Bash is red"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Still red on $(date -u +%Y-%m-%d) ($RESULT): $run_url"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body "The scheduled \`windows-git-bash.yml\` run on main concluded $RESULT at $GITHUB_SHA: $run_url. Its annotations name each failed suite."
+          fi

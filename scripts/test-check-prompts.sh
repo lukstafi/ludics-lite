@@ -385,6 +385,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - run: ./issue-wave/scripts/test-windows-driver.ps1
+EOF
+  cat > "$R/.github/workflows/windows-git-bash.yml" <<'EOF'
+jobs:
   git-bash:
     runs-on: windows-latest
     defaults:
@@ -409,6 +412,8 @@ done
 for platform in ubuntu macos git-bash; do
   suites="ship-pr/scripts/test-shell.sh"
   [ "$platform" = git-bash ] || suites="alpha/scripts/test-shell.sh alpha/scripts/test-python.py alpha/hooks/test-hook.py $suites"
+  wf="$R/.github/workflows/skill-scripts.yml"
+  [ "$platform" != git-bash ] || wf="$R/.github/workflows/windows-git-bash.yml"
   for suite in $suites; do
     fixture_tree
     CP_REMOVE="$suite" CP_OS="$platform" awk '
@@ -422,18 +427,18 @@ for platform in ubuntu macos git-bash; do
         next
       }
       { print }
-    ' "$R/.github/workflows/skill-scripts.yml" > "$R/workflow.tmp"
-    mv "$R/workflow.tmp" "$R/.github/workflows/skill-scripts.yml"
+    ' "$wf" > "$R/workflow.tmp"
+    mv "$R/workflow.tmp" "$wf"
     expect "$platform refuses missing $suite execution" 1 "fixture '$suite' has no inline run command on $platform" -- "$CP" "$R"
   done
 done
-# The Git Bash leg is the git-bash JOB, not any Windows runner: the same run line moved into the
-# PowerShell windows-driver job shares the runner and is still refused (PR #321, review round 2),
-# and so is a job keyed git-bash that runs somewhere other than Windows.
+# The Git Bash leg is windows-git-bash.yml's git-bash JOB, not any Windows runner: the same run
+# line moved into the PowerShell windows-driver job shares the runner and is still refused (PR
+# #321, review round 2), and so is a job keyed git-bash that runs somewhere other than Windows, or
+# one back in skill-scripts.yml, the per-push file it moved out of (ludics-lite#339).
 fixture_tree
+: > "$R/.github/workflows/windows-git-bash.yml"
 awk '
-  /^  git-bash:/ { skip = 1 }
-  skip { next }
   { print }
   /- run: \.\/issue-wave\/scripts\/test-windows-driver\.ps1/ { print "      - run: ship-pr/scripts/test-shell.sh" }
 ' "$R/.github/workflows/skill-scripts.yml" > "$R/workflow.tmp"
@@ -442,10 +447,15 @@ expect "a ship-pr suite run by another Windows job is no Git Bash leg" 1 \
   "fixture 'ship-pr/scripts/test-shell.sh' has no inline run command on git-bash" -- "$CP" "$R"
 fixture_tree
 awk '/^  git-bash:/ { gb = 1 } gb && /runs-on:/ { sub(/windows-latest/, "ubuntu-latest"); gb = 0 } { print }' \
-  "$R/.github/workflows/skill-scripts.yml" > "$R/workflow.tmp"
-mv "$R/workflow.tmp" "$R/.github/workflows/skill-scripts.yml"
+  "$R/.github/workflows/windows-git-bash.yml" > "$R/workflow.tmp"
+mv "$R/workflow.tmp" "$R/.github/workflows/windows-git-bash.yml"
 expect "...nor is a job keyed git-bash on another runner" 1 \
   "fixture 'ship-pr/scripts/test-shell.sh' has no inline run command on git-bash" -- "$CP" "$R"
+fixture_tree
+sed 1d "$R/.github/workflows/windows-git-bash.yml" >> "$R/.github/workflows/skill-scripts.yml"
+rm "$R/.github/workflows/windows-git-bash.yml"
+expect "...nor is the git-bash job back in skill-scripts.yml" 1 \
+  "windows-git-bash.yml: fixture 'ship-pr/scripts/test-shell.sh' has no inline run command on git-bash" -- "$CP" "$R"
 for suite in scripts/test-workflow-reporters.py ship-pr/scripts/test-pr-review-hostile.py issue-wave/scripts/test-windows-driver.ps1; do
   fixture_tree
   CP_REMOVE="$suite" awk 'index($0, ENVIRON["CP_REMOVE"]) == 0' "$R/.github/workflows/skill-scripts.yml" > "$R/workflow.tmp"
