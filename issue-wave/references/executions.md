@@ -76,35 +76,29 @@ greeter's power plugin on a box woken by WoL with nobody logged in.
 `wake-lab.sh status` lists a native box's live sleep blocks (`sleep-blocks=<n>`, then one
 `block:` line per holder), and a `sleep` refused by one names the holder and says `REFUSED`.
 
-**One-time setup per native box.** An ssh session is a REMOTE subject to polkit, so
+**Setup per native box.** An ssh session is a REMOTE subject to polkit, so
 `org.freedesktop.login1.inhibit-block-sleep` falls under the action's `allow_any`, which stock
-Ubuntu sets to `auth_admin_keep` (`allow_active` = yes covers only a local console session).
-Unprivileged, the request is denied ("Failed to inhibit: Access denied as the requested
-operation requires interactive authentication"), measured on rog-nv-linux, minix-amd-linux and
-tuf-amd-linux on 2026-09-23. `inhibit-block-idle` and `suspend` are already granted there (the
-latter by flotilla's `50-flotilla-suspend.rules`). Grant the block once, as the fleet user, with
-sudo:
+Ubuntu sets to `auth_admin_keep` (`allow_active` = yes covers only a local console session):
+without a grant the request is denied ("Failed to inhibit: Access denied"), as it was on all
+three boxes on 2026-09-23. The grant is `/etc/polkit-1/rules.d/50-fleet-inhibit.rules`, installed
+by the Linux bootstrap, `~/self-improve/scripts/install-linux.md`. Check it from an ssh session:
+`pkcheck --action-id org.freedesktop.login1.inhibit-block-sleep --process $$; echo $?` prints 0.
+On a box without it `hold` does not refuse the run - that would stop every batch there over a
+setup step - but prints `EXECUTION HOLD <box>: WARNING: running WITHOUT a sleep inhibitor` with
+the denial, and the run is unguarded.
 
-```
-printf '%s\n' '// Fleet: the fleet user may hold a sleep block inhibitor around a run (ludics-lite#317).' \
-  'polkit.addRule(function(action, subject) {' \
-  "    if (subject.user == \"$(id -un)\" && action.id == \"org.freedesktop.login1.inhibit-block-sleep\") {" \
-  '        return polkit.Result.YES;' '    }' '});' \
-  | sudo tee /etc/polkit-1/rules.d/50-fleet-inhibit.rules >/dev/null
-```
-
-Check it from an ssh session: `pkcheck --action-id org.freedesktop.login1.inhibit-block-sleep
---process $$; echo $?` prints 0, and `systemd-inhibit --what=sleep:idle --mode=block true`
-exits 0. Until the grant is installed `hold` does not refuse the run - that would stop every
-batch on the box over a setup step - but prints `EXECUTION HOLD <box>: WARNING: running WITHOUT
-a sleep inhibitor` with the denial, and the run is unguarded exactly as before.
+Verified live on rog-nv-linux on 2026-09-23 (PR #323): with a `hold` running, `wake-lab.sh
+status rog` showed `sleep-blocks=1` naming it, `wake-lab.sh sleep rog` printed `Operation
+inhibited by "fleet-worker" ...` and `sleep REFUSED on rog by a block inhibitor` with exit 1,
+the box stayed up, and `sleep-blocks` returned to 0 when the hold ended.
 
 Idle suspend is off on the fleet's Ubuntu desktops without any site setting: Ubuntu's
 `10_ubuntu-settings.gschema.override` sets `sleep-inactive-ac-timeout = 0` in a section with no
 desktop qualifier, so it governs the GDM greeter as well as the logged-in session (upstream's
 default is 900 seconds); `/etc/gdm3/greeter.dconf-defaults` leaves the power keys commented,
 the greeter's dconf database carries none, and logind's `IdleAction` is `ignore`. Checked on
-rog-nv-linux and minix-amd-linux on 2026-09-23 (both chassis `desktop`, on AC). Recheck after a
+rog-nv-linux and minix-amd-linux on 2026-09-23 (both mini PCs without a battery; tuf, the one
+laptop, adds battery and lid residue, in [linux-boxes.md](linux-boxes.md)). Recheck after a
 release upgrade with `DCONF_PROFILE=/dev/null gsettings get
 org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout` (0 is never); the inhibitor
 is the guard either way, since logind refuses the greeter's suspend while it is held.
