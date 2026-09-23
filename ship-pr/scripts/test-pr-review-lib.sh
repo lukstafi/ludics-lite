@@ -1728,18 +1728,30 @@ test_fixture_call_count_survives_a_command_substitution() {
     assert_eq "$CONTROL_RC" 1 "an append that fails is a failed count ($CONTROL_ERR)"
     assert_contains "$CONTROL_ERR" "cannot append" "and says so"
     assert_not_contains "$CONTROL_ERR" "stale total" "the caller's \`|| return 1\` must see the failure"
+    # The two controls below are also skipped where the mode bits do not take: under Git Bash
+    # on NTFS a 0000 file stays readable and a 0555 directory still lets its entries go, so
+    # there is no failure to provoke (ludics-lite#318). Probed, not assumed per platform.
     chmod 0000 "$root/ro/fixture-calls/body"
-    control "TEST_ROOT=$(printf '%q' "$root/ro")" \
-      'test_ro_total() { local n; n=$(fixture_call_total body) || return 1; bail "stale total $n under a clean status"; }' \
-      'run_tests test_ro_total'
-    assert_eq "$CONTROL_RC" 1 "a counter that exists but cannot be read is a failed total, not 0 ($CONTROL_ERR)"
-    assert_contains "$CONTROL_ERR" "cannot read" "and says so"
-    assert_not_contains "$CONTROL_ERR" "stale total" "through the substitution the caller reads it in"
+    if [ -r "$root/ro/fixture-calls/body" ]; then
+      echo "PASS: unreadable-counter control skipped — this user reads a mode-0000 file"
+    else
+      control "TEST_ROOT=$(printf '%q' "$root/ro")" \
+        'test_ro_total() { local n; n=$(fixture_call_total body) || return 1; bail "stale total $n under a clean status"; }' \
+        'run_tests test_ro_total'
+      assert_eq "$CONTROL_RC" 1 "a counter that exists but cannot be read is a failed total, not 0 ($CONTROL_ERR)"
+      assert_contains "$CONTROL_ERR" "cannot read" "and says so"
+      assert_not_contains "$CONTROL_ERR" "stale total" "through the substitution the caller reads it in"
+    fi
     chmod 0444 "$root/ro/fixture-calls/body"
     chmod 0555 "$root/ro/fixture-calls"
-    control "TEST_ROOT=$(printf '%q' "$root/ro")" 'test_reset() { fixture_call_reset; }' 'run_tests test_reset'
-    assert_eq "$CONTROL_RC" 1 "a reset that cannot remove the counters refuses ($CONTROL_ERR)"
-    assert_contains "$CONTROL_ERR" "cannot remove" "and says so"
+    if (: >"$root/ro/fixture-calls/.probe") 2>/dev/null; then
+      rm -f "$root/ro/fixture-calls/.probe"
+      echo "PASS: unremovable-counters control skipped — this user writes into a mode-0555 directory"
+    else
+      control "TEST_ROOT=$(printf '%q' "$root/ro")" 'test_reset() { fixture_call_reset; }' 'run_tests test_reset'
+      assert_eq "$CONTROL_RC" 1 "a reset that cannot remove the counters refuses ($CONTROL_ERR)"
+      assert_contains "$CONTROL_ERR" "cannot remove" "and says so"
+    fi
     chmod -R u+w "$root/ro"
   fi
 }

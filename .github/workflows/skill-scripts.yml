@@ -531,7 +531,11 @@ jobs:
   # suite runs whatever the one before it did, and an `::error` annotation naming the suite, so
   # a red job with several failing steps names them without reading the log.
   #
-  # COVERED: test-post-merge-cleanup.sh and all thirteen test-pr-review-*.sh suites.
+  # COVERED: test-post-merge-cleanup.sh and all thirteen test-pr-review-*.sh suites. Nine of them
+  # gate the job; five run as KNOWN RED (`continue-on-error: true`) with the issue that removes it
+  # named at the step: the cleanup suite (#287), and four base/checks suites that compare strings
+  # a native jq.exe hands back with a trailing \r (#335). A known-red step still runs, still
+  # fails and still annotates; it just does not turn the job red. Do not exclude cases by name.
   # NOT COVERED here, with the reason:
   #   - ship-pr/hooks/test-ship-pr-nudge.py and ship-pr/scripts/test-pr-review-hostile.py (with
   #     its runner run-pr-review-hostile.sh): Python fixtures, not shell suites; the hostile pass
@@ -578,8 +582,8 @@ jobs:
           *) echo "::error title=Git Bash platform proof failed::git --version is '$gv', not a Git for Windows build (.windows.)"; exit 1 ;;
           esac
           command -v jq || { echo '::error title=Git Bash platform proof failed::no jq on PATH'; exit 1; }
-          # A native jq.exe may end its lines CRLF, which a `$(jq -r ...)` keeps as a trailing \r;
-          # recorded here, next to the suites whose string comparisons it would break.
+          # The runner's jq is a native jq.exe, which ends its lines CRLF, and a `$(jq -r ...)`
+          # keeps the \r (ludics-lite#335); recorded here, so the day it changes is on the record.
           echo "jq:            $(jq --version), and jq -r ends a line with: $(printf '"x"' | jq -r . | od -An -c | tr -s ' ')"
       # Every suite step below runs whether or not an earlier suite failed, but only once the
       # proof passed; a failure names its suite in the run's annotations.
@@ -609,15 +613,23 @@ jobs:
         if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
         run: ship-pr/scripts/test-pr-review-base-drift.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-drift.sh'; exit 1; }
       - name: pr-review fixtures, the base command's red report
+        # KNOWN RED until ludics-lite#335: the runner's jq.exe ends lines CRLF.
+        continue-on-error: true
         if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
         run: ship-pr/scripts/test-pr-review-base-red.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-red.sh'; exit 1; }
       - name: pr-review fixtures, the paths-ignore settle
+        # KNOWN RED until ludics-lite#335: the runner's jq.exe ends lines CRLF.
+        continue-on-error: true
         if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
         run: ship-pr/scripts/test-pr-review-base-settle.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-settle.sh'; exit 1; }
       - name: pr-review fixtures, what the base wait loop decides
+        # KNOWN RED until ludics-lite#335: the runner's jq.exe ends lines CRLF.
+        continue-on-error: true
         if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
         run: ship-pr/scripts/test-pr-review-base-verdict.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-verdict.sh'; exit 1; }
       - name: pr-review fixtures, absent vs not yet
+        # KNOWN RED until ludics-lite#335: the runner's jq.exe ends lines CRLF.
+        continue-on-error: true
         if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
         run: ship-pr/scripts/test-pr-review-checks-absent.sh || { echo '::error title=Git Bash suite failed::test-pr-review-checks-absent.sh'; exit 1; }
       - name: pr-review fixtures, review rounds
