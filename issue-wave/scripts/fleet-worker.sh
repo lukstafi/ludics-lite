@@ -51,6 +51,9 @@
 #   fleet-worker.sh execution list [--active] [--compact]
 #   fleet-worker.sh execution slot [--wait <seconds>] -- <command...>   # hold one of THIS box's
 #                          # run-time correctness slots around a suite or batch (no lease needed)
+#   fleet-worker.sh execution hold [--why <text>] -- <command...>   # run under THIS box's OS-level
+#                          # sleep guard alone (a systemd-inhibit block lock; bare where none):
+#                          # the wrapper for an exclusive measurement, and what `slot` runs inside
 #   fleet-worker.sh execution reserve|dispatch|record|reconcile|conclude <json-file>
 #   fleet-worker.sh execution run <json-file>          # reserve + dispatch in one step
 #   fleet-worker.sh execution conclude --from-run <run-dir> --request <id> --sha <sha>
@@ -92,6 +95,9 @@
 #     ~/.local/state/fleet-execution-slots. Deliberately NOT under ISSUE_WAVE_STATE, which is
 #     per-coordinator: the cap is the box's, so every agent on the box must resolve this to the
 #     same directory (as every coordinator must resolve FLEET_ANCHOR_STATE to the same one).
+#   FLEET_SYSTEMD_INHIBIT: the systemd-inhibit that `execution hold` (and so `execution slot`)
+#     wraps a run in; systemd-inhibit on PATH. A name that resolves to no executable runs the
+#     command bare, as on macOS; the suites pin it to a stub or to nothing, never to the runner's.
 #   FLEET_TMUX_SOCKET: tmux -L name; tests isolate with it.
 #   FLEET_FLOTILLA: status service; http://mac-studio:7799.
 #   FLEET_LOCK_WAIT: seconds a lease mutation waits for a concurrent one; 10.
@@ -135,6 +141,7 @@ STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 # on one host under different coordinators would then lock different files and each take slot 1,
 # leaving the cap bounding nothing. Every agent on a box must resolve this to one directory.
 SLOT_STATE="${FLEET_SLOT_STATE:-\$HOME/.local/state/fleet-execution-slots}"
+INHIBIT="${FLEET_SYSTEMD_INHIBIT:-systemd-inhibit}"
 ANCHOR_STATE="${FLEET_ANCHOR_STATE:-$STATE}"
 TMUX_SOCKET="${FLEET_TMUX_SOCKET:-}"
 FLOTILLA="${FLEET_FLOTILLA:-http://mac-studio:7799}"
@@ -1327,15 +1334,21 @@ box_correctness_slots() {
 # assignments may be QUEUED there. Subtracting outstanding assignments from the cap here would
 # re-introduce the very thing #160 removes - a run refused because of a record that is not
 # running, its own included.
+#
+# Inside the slot the command runs under `execution hold` (ludics-lite#317), so a correctness
+# batch on a native Linux box carries the same OS-level sleep guard a measurement does, for
+# exactly as long as the batch runs; the slot execs this script's own `hold` rather than
+# spelling systemd-inhibit a second time. The slot flock is on a descriptor, so it survives
+# that exec and the one inside `hold`, and the batch inherits it as before.
 # Exit: the wrapped command's own status; 1 with a line beginning `EXECUTION SLOT REFUSED` (no
 # free slot before the deadline, an outstanding measurement, a malformed slots spec); 4 when the
 # anchor's registry could not be read; 127 when the command itself could not be run. The command
 # is exec'd and not interpreted, so a pipeline or a builtin goes as `sh -c '...'`.
 slot_lock_py() {
   cat <<'SLOT_PY'
-import fcntl, os, signal, sys, time
-box, directory, cap, wait = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-command = sys.argv[5:]
+import fcntl, os, shutil, signal, sys, time
+box, directory, cap, wait, script = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+command = sys.argv[6:]
 deadline = time.monotonic() + wait
 while True:
     for index in range(1, cap + 1):
@@ -1351,12 +1364,18 @@ while True:
         sys.stderr.write("EXECUTION SLOT %s: slot %d of %d held for: %s\n"
                          % (box, index, cap, " ".join(command)))
         sys.stderr.flush()
+        # Resolved HERE, before the hand-off to `hold`: a command that cannot be run is this
+        # call's refusal, with this call's prefix and status, whatever wraps it afterwards.
+        if shutil.which(command[0]) is None:
+            print("EXECUTION SLOT REFUSED %s: cannot run %s: no such executable" % (box, command[0]))
+            sys.exit(127)
+        why = "%s slot %d of %d: %s" % (box, index, cap, " ".join(command))
         try:
             # Python ignores SIGPIPE, and an IGNORED disposition survives exec: without this the
             # wrapped batch would see `yes | head -n1` exit 1 with a "Broken pipe" diagnostic
             # where the same script run directly exits 141. A wrapper must not change verdicts.
             signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-            os.execvp(command[0], command)
+            os.execvp("bash", ["bash", script, "execution", "hold", "--why", why, "--"] + command)
         except OSError as exc:
             print("EXECUTION SLOT REFUSED %s: cannot run %s: %s" % (box, command[0], exc))
             sys.exit(127)
@@ -1401,7 +1420,69 @@ cmd_execution_slot() {
   [ -z "$measuring" ] || { echo "EXECUTION SLOT REFUSED $box: a measurement holds the box exclusively ($measuring)"; exit 1; }
   dir="$(local_path "$SLOT_STATE")/$box"
   mkdir -p "$dir" || die "execution slot: cannot create the slot directory $dir"
-  exec python3 -c "$(slot_lock_py)" "$box" "$dir" "$cap" "$wait" "$@"
+  exec python3 -c "$(slot_lock_py)" "$box" "$dir" "$cap" "$wait" "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$@"
+}
+
+# `execution hold [--why <text>] -- <command...>`: run the command under THIS box's OS-level
+# guard against sleep, and nothing else -- no slot, no registry read, no lease (ludics-lite#317).
+#
+# Under WSL the Windows-side holder kept a lane's box alive; on native Ubuntu nothing at the OS
+# level stopped another session's `wake-lab.sh sleep`, or an idle suspend, from taking a box out
+# from under a running worker, because the lab locks are advisory and bind only sessions that go
+# through wake-lab.sh. A logind BLOCK inhibitor on sleep:idle is the OS-side answer: systemd
+# 259's `systemctl --check-inhibitors=yes suspend` (wake-lab.sh's path) refuses on any `block`
+# inhibitor covering sleep, the caller's own uid included -- only `block-weak` exempts the same
+# user, which is why the mode here is `block` -- and logind itself refuses a suspend request from
+# anyone without `suspend-ignore-inhibit`, a GDM greeter's included. The inhibitor lives exactly
+# as long as systemd-inhibit does, and systemd-inhibit as long as the command.
+#
+# It is the wrapper for an exclusive measurement, which runs the runner directly because
+# `execution slot` refuses while a measurement is outstanding, and it is what `slot` runs inside,
+# so both kinds of run carry the same guard through one implementation.
+#
+# Fail-open, and loudly. An unprivileged ssh session is a REMOTE subject to polkit, so
+# `org.freedesktop.login1.inhibit-block-sleep` falls under its `allow_any`, which stock Ubuntu
+# sets to auth_admin_keep: until the box's one-time polkit grant is installed (executions.md,
+# "The OS-level sleep guard") the request is denied. A run refused for that would stop every
+# batch on the box over a setup step, so a denied probe prints a WARNING naming the refusal and
+# runs the command bare -- exactly as it runs on macOS, or on a Linux host with no systemd.
+# The probe takes and drops the same inhibitor around `true`: its status is the only check that
+# does not guess at polkit, and a denial after it (a rule removed in between) fails the run at
+# systemd-inhibit's own "Failed to inhibit", which is loud as well.
+#
+# What systemd-inhibit changes about the run, measured on rog-nv-linux (systemd 259): the exit
+# status passes through, 141 of a SIGPIPE'd pipeline included, but a command killed by a signal
+# exits 1 rather than 128+n, and a nonzero exit adds one `<cmd> failed with exit status <n>.`
+# line to stderr. The verdict -- pass or fail -- never changes. A command that cannot be run is
+# refused here, before the inhibitor, with 127, as `slot` refuses it.
+# Exit: the command's own status (above); 127 when it cannot be run; 2 for usage.
+cmd_execution_hold() {
+  local why="" box inhibitor probe
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --why)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die "execution hold: expected text for --why"
+        why="$2"; shift ;;
+      --) shift; break ;;
+      *) die "execution hold [--why <text>] -- <command> [args...]" ;;
+    esac
+    shift
+  done
+  [ "$#" -ge 1 ] || die "execution hold: a command to hold the box around is required, after --"
+  box="${LOCAL_BOX:-$(hostname -s 2>/dev/null)}"
+  [ -n "$why" ] || why="$box hold: $*"
+  # One line of `systemd-inhibit --list` (and of `wake-lab.sh status`) per holder, not a batch's
+  # whole command line.
+  [ "${#why}" -le 160 ] || why="${why:0:157}..."
+  type -P -- "$1" >/dev/null 2>&1 || { echo "EXECUTION HOLD REFUSED $box: cannot run $1: no such executable"; exit 127; }
+  inhibitor=$(type -P -- "$INHIBIT" 2>/dev/null) || exec "$@"
+  if probe=$("$inhibitor" --no-ask-password --what=sleep:idle --mode=block --who=fleet-worker \
+               --why="$why (probe)" true 2>&1); then
+    echo "EXECUTION HOLD $box: sleep:idle block inhibitor held for: $why" >&2
+    exec "$inhibitor" --no-ask-password --what=sleep:idle --mode=block --who=fleet-worker --why="$why" -- "$@"
+  fi
+  echo "EXECUTION HOLD $box: WARNING: running WITHOUT a sleep inhibitor, so nothing at the OS level stops a suspend under it -- $INHIBIT refused: $(printf '%s' "$probe" | tr '\n' ' ' | cut -c1-200) (the one-time polkit grant: issue-wave/references/executions.md, \"The OS-level sleep guard\")" >&2
+  exec "$@"
 }
 
 cmd_execution() {
@@ -1421,6 +1502,8 @@ cmd_execution() {
       payload="{\"active\":$active,\"compact\":$compact}" ;;
     # The run-time slot lock: no registry mutation, no lease, and the command runs from here.
     slot) shift; cmd_execution_slot "$@" ;;
+    # The OS-level sleep guard alone: no slot, no registry, no lease.
+    hold) shift; cmd_execution_hold "$@" ;;
     conclude)
       if [ "${2:-}" = --from-run ]; then
         local dir="${3:-}" request="" box="" sha="" evidence="" rc
@@ -1455,7 +1538,7 @@ cmd_execution() {
       [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
       payload=$(cat "$2") || die "execution: cannot read payload"
       check_identity ;;
-    *) die "execution: list, slot -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run <run-dir> --request <id>" ;;
+    *) die "execution: list, slot -- <command>, hold -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run <run-dir> --request <id>" ;;
   esac
   local helper; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
