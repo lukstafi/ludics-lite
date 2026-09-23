@@ -325,8 +325,9 @@ requirements for every transport with transport-specific setup and identity, and
   suites queue N x ~200 fresh binaries behind it and every worker's run freezes (2026-08-22: 34
   exes parked in dlopen, logs frozen, load 2.5); `dune -j 4` when more than ~4 workers share
   the box. **On GPU boxes**: name the backend and how to prove the run executed on it (a
-  backend-uniform golden proves nothing), and keep one dune per _build. For `wsl` kind only,
-  add the [WSL traps](references/wsl-boxes.md) to the brief.
+  backend-uniform golden proves nothing), and keep one dune per _build. Add the box kind's
+  traps to the brief: [native traps](references/linux-boxes.md) for `linux`, [WSL
+  traps](references/wsl-boxes.md) for `wsl`.
 - Execution handoff: the worker's own targeted correctness batches on its agent host run under
   the [standing reservation](references/executions.md#standing-iteration-reservation) the
   coordinator took at launch - name its request id, the bounded aliases and `-j` width it
