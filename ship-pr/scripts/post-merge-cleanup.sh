@@ -795,21 +795,11 @@ retain_session_reflog_sides() {
 }
 
 retain_private_session_refs() {
-  local private_refs line ref oid response namespace probe blocker blocker_parent blocker_temp
+  local private_refs line ref oid namespace probe blocker blocker_parent blocker_temp
   private_refs=$(git -C "$SESSION_ARCHIVED_WORKTREE" for-each-ref \
     --format='%(refname) %(objectname)' refs/worktree refs/bisect refs/rewritten) ||
     fail "could not recheck session-private refs before unregistering"
-  REF_TRANSACTION_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-ref-transaction.XXXXXX") ||
-    fail "could not allocate the session-private namespace transaction"
-  REF_TRANSACTION_IN="$REF_TRANSACTION_DIR/input"
-  REF_TRANSACTION_OUT="$REF_TRANSACTION_DIR/output"
-  mkfifo "$REF_TRANSACTION_IN" "$REF_TRANSACTION_OUT" ||
-    fail "could not create the session-private namespace transaction channels"
-  git -C "$SESSION_ARCHIVED_WORKTREE" update-ref --stdin \
-    <"$REF_TRANSACTION_IN" >"$REF_TRANSACTION_OUT" &
-  REF_TRANSACTION_PID=$!
-  exec 7>"$REF_TRANSACTION_IN" || fail "could not open the private namespace transaction input"
-  exec 8<"$REF_TRANSACTION_OUT" || fail "could not open the private namespace transaction output"
+  open_ref_transaction "$SESSION_ARCHIVED_WORKTREE" "session-private namespace"
   printf 'start\noption no-deref\n' >&7 || fail "could not start the private namespace transaction"
   while IFS= read -r line; do
     ref=${line%% *}
@@ -823,10 +813,10 @@ retain_private_session_refs() {
       fail "could not queue session-private ref retention: $ref"
   done <<<"$private_refs"
   printf 'prepare\n' >&7 || fail "could not prepare session-private namespace retention"
-  IFS= read -r response <&8 || fail "session-private namespace transaction stopped before start"
-  [ "$response" = "start: ok" ] || fail "session-private namespace transaction did not start"
-  IFS= read -r response <&8 || fail "session-private namespace transaction stopped before preparation"
-  [ "$response" = "prepare: ok" ] || fail "session-private refs changed before retention"
+  read_ref_transaction_response || fail "session-private namespace transaction stopped before start"
+  [ "$REF_TRANSACTION_RESPONSE" = "start: ok" ] || fail "session-private namespace transaction did not start"
+  read_ref_transaction_response || fail "session-private namespace transaction stopped before preparation"
+  [ "$REF_TRANSACTION_RESPONSE" = "prepare: ok" ] || fail "session-private refs changed before retention"
   while IFS= read -r line; do
     ref=${line%% *}
     oid=${line#* }
@@ -838,17 +828,9 @@ retain_private_session_refs() {
     retain_session_reflog_sides "$ref"
   done <<<"$private_refs"
   printf 'commit\n' >&7 || fail "could not commit session-private namespace retention"
-  IFS= read -r response <&8 || fail "session-private namespace transaction stopped before commit"
-  [ "$response" = "commit: ok" ] || fail "session-private namespace transaction did not commit"
-  exec 7>&- 8<&-
-  wait "$REF_TRANSACTION_PID" || fail "session-private namespace transaction failed"
-  REF_TRANSACTION_PID=""
-  unlink "$REF_TRANSACTION_IN" || fail "could not remove the private namespace transaction input"
-  unlink "$REF_TRANSACTION_OUT" || fail "could not remove the private namespace transaction output"
-  REF_TRANSACTION_IN=""
-  REF_TRANSACTION_OUT=""
-  rmdir "$REF_TRANSACTION_DIR" || fail "could not remove the private namespace transaction directory"
-  REF_TRANSACTION_DIR=""
+  read_ref_transaction_response || fail "session-private namespace transaction stopped before commit"
+  [ "$REF_TRANSACTION_RESPONSE" = "commit: ok" ] || fail "session-private namespace transaction did not commit"
+  finish_ref_transaction "session-private namespace"
 
   # These namespace roots are special: the root ref itself is shared, while every child is private
   # to the worktree. Reserve the actual per-worktree filesystem directory with a regular blocker
@@ -887,42 +869,114 @@ release_private_namespace_locks() {
   PRIVATE_NAMESPACE_BLOCKERS=()
 }
 
-discard_ref_transaction() {
-  exec 7>&- 8<&-
+# Every `git update-ref --stdin` transaction here is driven interactively: prepare takes the ref
+# and reflog locks, this shell retains what the reflog reaches while they are held, and only then
+# sends commit. The commands go down an anonymous pipe (a process substitution) and the responses
+# land in a regular file that read_ref_transaction_response polls. Not a pair of FIFOs, which is
+# what this was: a native Git for Windows opens an MSYS2 emulated FIFO, reads nothing from it and
+# exits 0 having done nothing (ludics-lite#287), while an anonymous pipe and a regular file are
+# plain Win32 handles to it. Both were probed on windows-latest under Git Bash, with the ref lock
+# seen held between prepare and commit, so this is the one transport on every platform: no probe,
+# no platform branch, and no batch fallback that would give up the locked retention window.
+open_ref_transaction() {
+  local checkout="$1" what="$2"
+  REF_TRANSACTION_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-ref-transaction.XXXXXX") ||
+    fail "could not allocate the $what transaction"
+  REF_TRANSACTION_OUT="$REF_TRANSACTION_DIR/output"
+  REF_TRANSACTION_STATUS="$REF_TRANSACTION_DIR/status"
+  : >"$REF_TRANSACTION_OUT" || fail "could not create the $what transaction output"
+  exec 8<"$REF_TRANSACTION_OUT" || fail "could not open the $what transaction output"
+  # The status line is written only after Git has exited, so its presence means every response
+  # Git will ever give is already in the output file. Appending never truncates under the reader.
+  exec 7> >(
+    git -C "$checkout" update-ref --stdin >>"$REF_TRANSACTION_OUT"
+    printf '%s\n' "$?" >"$REF_TRANSACTION_STATUS"
+  ) || fail "could not start the $what transaction"
+  # bash 3.2 sets $! to the process substitution's subshell too; it is used only as a liveness
+  # check, so a subshell that dies without writing its status cannot leave a poll spinning.
+  REF_TRANSACTION_PID=$!
+}
+
+ref_transaction_exited() {
+  [ -s "$REF_TRANSACTION_STATUS" ] || ! kill -0 "$REF_TRANSACTION_PID" >/dev/null 2>&1
+}
+
+# Sets REF_TRANSACTION_RESPONSE to Git's next complete response line. Fails once Git has exited
+# without one; a partial line is kept across polls, since Git may be caught mid-write.
+read_ref_transaction_response() {
+  local partial="" chunk=""
+  REF_TRANSACTION_RESPONSE=""
+  while :; do
+    if IFS= read -r chunk <&8; then
+      REF_TRANSACTION_RESPONSE="$partial$chunk"
+      return 0
+    fi
+    partial="$partial$chunk"
+    chunk=""
+    if ref_transaction_exited; then
+      if IFS= read -r chunk <&8; then
+        REF_TRANSACTION_RESPONSE="$partial$chunk"
+        return 0
+      fi
+      REF_TRANSACTION_RESPONSE="$partial$chunk"
+      return 1
+    fi
+    sleep 0.02
+  done
+}
+
+# Closing the input ends the transaction: after commit Git exits, and before it Git reads EOF and
+# aborts, releasing every lock prepare took. Either way wait for it, so no lock outlives the call.
+end_ref_transaction() {
+  exec 7>&-
   if [ -n "${REF_TRANSACTION_PID:-}" ]; then
-    wait "$REF_TRANSACTION_PID" >/dev/null 2>&1 || true
+    while ! ref_transaction_exited; do
+      sleep 0.02
+    done
   fi
+  exec 8<&-
+}
+
+forget_ref_transaction() {
   REF_TRANSACTION_PID=""
-  [ -z "${REF_TRANSACTION_IN:-}" ] || unlink "$REF_TRANSACTION_IN" >/dev/null 2>&1 || true
-  [ -z "${REF_TRANSACTION_OUT:-}" ] || unlink "$REF_TRANSACTION_OUT" >/dev/null 2>&1 || true
-  REF_TRANSACTION_IN=""
   REF_TRANSACTION_OUT=""
-  [ -z "${REF_TRANSACTION_DIR:-}" ] || rmdir "$REF_TRANSACTION_DIR" >/dev/null 2>&1 || true
+  REF_TRANSACTION_STATUS=""
   REF_TRANSACTION_DIR=""
 }
 
+discard_ref_transaction() {
+  end_ref_transaction
+  [ -z "${REF_TRANSACTION_OUT:-}" ] || unlink "$REF_TRANSACTION_OUT" >/dev/null 2>&1 || true
+  [ -z "${REF_TRANSACTION_STATUS:-}" ] || unlink "$REF_TRANSACTION_STATUS" >/dev/null 2>&1 || true
+  [ -z "${REF_TRANSACTION_DIR:-}" ] || rmdir "$REF_TRANSACTION_DIR" >/dev/null 2>&1 || true
+  forget_ref_transaction
+}
+
+finish_ref_transaction() {
+  local what="$1" status=""
+  end_ref_transaction
+  [ -s "$REF_TRANSACTION_STATUS" ] || fail "the $what transaction exited without a status"
+  IFS= read -r status <"$REF_TRANSACTION_STATUS" || fail "could not read the $what transaction status"
+  [ "$status" = 0 ] || fail "the $what transaction failed (git exit $status)"
+  unlink "$REF_TRANSACTION_OUT" || fail "could not remove the $what transaction output"
+  unlink "$REF_TRANSACTION_STATUS" || fail "could not remove the $what transaction status"
+  rmdir "$REF_TRANSACTION_DIR" || fail "could not remove the $what transaction directory"
+  forget_ref_transaction
+}
+
 delete_ref_with_locked_reflog() {
-  local ref="$1" expected_oid="$2" kind="$3" response=""
-  REF_TRANSACTION_DIR=$(mktemp -d "$TEMP_ROOT/ship-pr-ref-transaction.XXXXXX") ||
-    fail "could not allocate the ref deletion transaction: $ref"
-  REF_TRANSACTION_IN="$REF_TRANSACTION_DIR/input"
-  REF_TRANSACTION_OUT="$REF_TRANSACTION_DIR/output"
-  mkfifo "$REF_TRANSACTION_IN" "$REF_TRANSACTION_OUT" ||
-    fail "could not create the ref deletion transaction channels: $ref"
-  git -C "$MAIN" update-ref --stdin <"$REF_TRANSACTION_IN" >"$REF_TRANSACTION_OUT" &
-  REF_TRANSACTION_PID=$!
-  exec 7>"$REF_TRANSACTION_IN" || fail "could not open the ref transaction input: $ref"
-  exec 8<"$REF_TRANSACTION_OUT" || fail "could not open the ref transaction output: $ref"
+  local ref="$1" expected_oid="$2" kind="$3" status=0
+  open_ref_transaction "$MAIN" "ref deletion ($ref)"
 
   printf 'start\noption no-deref\ndelete %s %s\nprepare\n' "$ref" "$expected_oid" >&7 ||
     fail "could not prepare the ref deletion: $ref"
-  if ! IFS= read -r response <&8 || [ "$response" != "start: ok" ]; then
-    printf '%s\n' "post-merge-cleanup.sh: ref deletion transaction did not start: $ref: $response" >&2
+  if ! read_ref_transaction_response || [ "$REF_TRANSACTION_RESPONSE" != "start: ok" ]; then
+    printf '%s\n' "post-merge-cleanup.sh: ref deletion transaction did not start: $ref: $REF_TRANSACTION_RESPONSE" >&2
     discard_ref_transaction
     return 1
   fi
-  if ! IFS= read -r response <&8 || [ "$response" != "prepare: ok" ]; then
-    printf '%s\n' "post-merge-cleanup.sh: ref deletion transaction was not prepared: $ref: $response" >&2
+  if ! read_ref_transaction_response || [ "$REF_TRANSACTION_RESPONSE" != "prepare: ok" ]; then
+    printf '%s\n' "post-merge-cleanup.sh: ref deletion transaction was not prepared: $ref: $REF_TRANSACTION_RESPONSE" >&2
     discard_ref_transaction
     return 1
   fi
@@ -931,17 +985,15 @@ delete_ref_with_locked_reflog() {
   # change, then commit the already-validated deletion without an ABA window between those steps.
   retain_topic_reflog_sides "$ref" "$kind"
   printf 'commit\n' >&7 || fail "could not commit the ref deletion: $ref"
-  IFS= read -r response <&8 || fail "ref deletion transaction stopped before commit: $ref"
-  [ "$response" = "commit: ok" ] || fail "ref deletion transaction did not commit: $ref: $response"
-  exec 7>&- 8<&-
-  wait "$REF_TRANSACTION_PID" || fail "ref deletion transaction failed: $ref"
-  REF_TRANSACTION_PID=""
-  unlink "$REF_TRANSACTION_IN" || fail "could not remove the ref transaction input: $ref"
-  unlink "$REF_TRANSACTION_OUT" || fail "could not remove the ref transaction output: $ref"
-  REF_TRANSACTION_IN=""
-  REF_TRANSACTION_OUT=""
-  rmdir "$REF_TRANSACTION_DIR" || fail "could not remove the ref transaction directory: $ref"
-  REF_TRANSACTION_DIR=""
+  read_ref_transaction_response || fail "ref deletion transaction stopped before commit: $ref"
+  [ "$REF_TRANSACTION_RESPONSE" = "commit: ok" ] ||
+    fail "ref deletion transaction did not commit: $ref: $REF_TRANSACTION_RESPONSE"
+  finish_ref_transaction "ref deletion ($ref)"
+
+  # Read the deletion back rather than trusting the channel: a transaction that reads nothing
+  # also exits 0, and the caller deletes the remote topic only on this function's success.
+  git -C "$MAIN" show-ref --exists "$ref" >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 2 ] || fail "ref deletion committed but $ref is not absent on read-back (show-ref exit $status)"
 }
 
 lock_and_retain_session_metadata() {
@@ -1165,6 +1217,50 @@ scan_branch_owner() {
   WORKTREE_LIST_FILE=""
 }
 
+# Nothing holds the local topic name once its deletion has committed: the reservation worktree
+# does not stop a branch being created, and update-ref never asks. So the remote steps are
+# bracketed by two reads of it instead of a lock: one before the push, and one as the helper's
+# very last read, after every network call. A creation after that last read is indistinguishable
+# from a branch made after cleanup finished, and no further read would change that.
+# Succeeds when the name is present, or cannot be proved absent, and sets CURRENT_TOPIC_OID to
+# the tip to publish: the name's own when it resolves, else the retained original tip (a
+# dangling symbolic ref, an unreadable one). It never exits, so its caller can still restore.
+local_topic_reappeared() {
+  local status=0
+  CURRENT_TOPIC_OID=""
+  git -C "$MAIN" show-ref --exists "refs/heads/$BRANCH" >/dev/null 2>&1 || status=$?
+  [ "$status" -ne 2 ] || return 1
+  CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$BRANCH^{commit}" 2>/dev/null) ||
+    CURRENT_TOPIC_OID="$LOCAL_BRANCH_OID"
+  [ -n "$CURRENT_TOPIC_OID" ] || CURRENT_TOPIC_OID="$LOCAL_BRANCH_OID"
+  return 0
+}
+
+# Is the remote base still the validated REMOTE_MASTER or a verified fast-forward of it? Read
+# twice: before any topic deletion, so an already-diverged base dismantles nothing, and after the
+# remote deletion, for a base that moved while the cleanup ran. On failure REMOTE_BASE_PROBLEM
+# says what was wrong; on success it is empty.
+remote_base_still_integrates() {
+  local line status oid
+  REMOTE_BASE_PROBLEM=""
+  line=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "$BASE_LOCAL_REF")
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    REMOTE_BASE_PROBLEM="remote $BASE_BRANCH became unreadable"
+    return 1
+  fi
+  oid=${line%%[[:space:]]*}
+  [ "$oid" != "$REMOTE_MASTER" ] || return 0
+  # A sibling merge preserves the containment already proved against REMOTE_MASTER. Fetch
+  # the exact advertised object without advancing tracking refs or the prepared local base;
+  # fetching the branch name could instead validate a different tip after another remote move.
+  if ! git -C "$MAIN" fetch --no-tags --no-write-fetch-head "$ORIGIN_PUSH_URL" "$oid" ||
+    ! git -C "$MAIN" merge-base --is-ancestor "$REMOTE_MASTER" "$oid"; then
+    REMOTE_BASE_PROBLEM="remote $BASE_BRANCH changed from $REMOTE_MASTER to $oid without a verified fast-forward"
+    return 1
+  fi
+}
+
 restore_remote_topic() {
   local recovery_oid="$1"
   if git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:" \
@@ -1179,15 +1275,9 @@ restore_remote_topic() {
 
 cleanup_reservations() {
   local lock
-  if [ -n "${REF_TRANSACTION_PID:-}" ]; then
-    kill "$REF_TRANSACTION_PID" >/dev/null 2>&1 || true
-    exec 7>&- 8<&-
-    wait "$REF_TRANSACTION_PID" >/dev/null 2>&1 || true
-    REF_TRANSACTION_PID=""
-  fi
-  [ -z "${REF_TRANSACTION_IN:-}" ] || unlink "$REF_TRANSACTION_IN" >/dev/null 2>&1 || true
-  [ -z "${REF_TRANSACTION_OUT:-}" ] || unlink "$REF_TRANSACTION_OUT" >/dev/null 2>&1 || true
-  [ -z "${REF_TRANSACTION_DIR:-}" ] || rmdir "$REF_TRANSACTION_DIR" >/dev/null 2>&1 || true
+  # An open transaction is aborted by closing its input, never by killing: the signal would reach
+  # only the process substitution's subshell, while Git itself releases its locks on EOF.
+  [ -z "${REF_TRANSACTION_DIR:-}" ] || discard_ref_transaction
   if [ "${#PRIVATE_NAMESPACE_BLOCKERS[@]}" -gt 0 ]; then
     for lock in "${PRIVATE_NAMESPACE_BLOCKERS[@]}"; do
       [ ! -f "$lock" ] || unlink "$lock" >/dev/null 2>&1 || true
@@ -1292,9 +1382,10 @@ SESSION_PSEUDOREF_LOCKS=()
 SESSION_WORKTREE_LOCK_OWNED=0
 TOPIC_RESERVATION=""
 REF_TRANSACTION_DIR=""
-REF_TRANSACTION_IN=""
 REF_TRANSACTION_OUT=""
+REF_TRANSACTION_STATUS=""
 REF_TRANSACTION_PID=""
+REF_TRANSACTION_RESPONSE=""
 PRIVATE_NAMESPACE_BLOCKERS=()
 CONFIG_LOCK=""
 CONFIG_LOCK_OWNED=0
@@ -1699,53 +1790,30 @@ if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
   retain_topic_reflog_sides "refs/remotes/origin/$BRANCH" tracking-reflog
 fi
 
+# Observe the remote topic before any local topic mutation, but delete it only as the very last
+# step, once the local branch's deletion has committed and been read back (ludics-lite#287). Every
+# refusal in between leaves origin/$BRANCH exactly as observed, so none of them needs a remote
+# restore, and a cleanup that stops half-way can no longer have deleted the public branch while
+# keeping the local one. The deletion at the end is leased against the OID observed here.
 REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
 REMOTE_BRANCH_STATUS=$?
+REMOTE_BRANCH_OID=""
 case "$REMOTE_BRANCH_STATUS" in
 0)
   REMOTE_BRANCH_OID=${REMOTE_BRANCH_LINE%%[[:space:]]*}
   [ "$REMOTE_BRANCH_OID" = "$LOCAL_BRANCH_OID" ] ||
     fail "origin/$BRANCH moved from local $LOCAL_BRANCH_OID to $REMOTE_BRANCH_OID; refusing to delete its newer tip"
-  git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" \
-    "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH" ||
-    fail "could not lease-delete origin/$BRANCH at $REMOTE_BRANCH_OID"
   ;;
-2)
-  # An empty force-with-lease can still delete a ref created after push advertisement. Absence is
-  # already the desired state, so do not send a deletion at all; a concurrent creation survives.
-  printf '%s\n' "post-merge-cleanup.sh: origin/$BRANCH was already absent (no deletion sent)" >&2
-  ;;
+2) ;; # Absent: a safe retry state. Nothing is sent at the end, so a concurrent creation survives.
 *) fail "could not determine whether origin/$BRANCH exists (ls-remote exit $REMOTE_BRANCH_STATUS)" ;;
 esac
+remote_base_still_integrates ||
+  fail "$REMOTE_BASE_PROBLEM before any topic deletion; local and remote $BRANCH were preserved"
 
-MASTER_AFTER_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads \
-  "$ORIGIN_PUSH_URL" "$BASE_LOCAL_REF")
-MASTER_AFTER_STATUS=$?
-if [ "$MASTER_AFTER_STATUS" -ne 0 ]; then
-  restore_remote_topic "$LOCAL_BRANCH_OID" ||
-    fail "remote $BASE_BRANCH became unreadable after topic deletion, and the topic could not be restored"
-  fail "remote $BASE_BRANCH became unreadable after topic deletion; origin/$BRANCH was restored"
-fi
-MASTER_AFTER_OID=${MASTER_AFTER_LINE%%[[:space:]]*}
-if [ "$MASTER_AFTER_OID" != "$REMOTE_MASTER" ]; then
-  # A sibling merge preserves the containment already proved against REMOTE_MASTER. Fetch
-  # the exact advertised object without advancing tracking refs or the prepared local base;
-  # fetching the branch name could instead validate a different tip after another remote move.
-  if ! git -C "$MAIN" fetch --no-tags --no-write-fetch-head "$ORIGIN_PUSH_URL" "$MASTER_AFTER_OID" ||
-    ! git -C "$MAIN" merge-base --is-ancestor "$REMOTE_MASTER" "$MASTER_AFTER_OID"; then
-    restore_remote_topic "$LOCAL_BRANCH_OID" ||
-      fail "remote $BASE_BRANCH changed to $MASTER_AFTER_OID without a verified fast-forward, and the topic could not be restored"
-    fail "remote $BASE_BRANCH changed from $REMOTE_MASTER to $MASTER_AFTER_OID without a verified fast-forward; origin/$BRANCH was restored"
-  fi
-fi
-
-CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
-if [ "$CURRENT_TOPIC_OID" != "$LOCAL_BRANCH_OID" ]; then
-  restore_remote_topic "$CURRENT_TOPIC_OID" ||
-    fail "local $BRANCH moved after remote deletion, and its new tip could not be restored remotely"
-  fail "local $BRANCH moved after remote deletion; its new tip was restored remotely"
-fi
-
+# The remote-tracking ref is only a local cache of that branch: it is pruned here, ahead of the
+# topic, so that its movement refusal still precedes every other mutation. A refusal after this
+# point leaves it absent while origin/$BRANCH stays; its tip is retained above, and a fetch
+# recreates it.
 if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
   CURRENT_TRACKING_BRANCH_OID=$(git -C "$MAIN" rev-parse "refs/remotes/origin/$BRANCH") ||
     fail "cannot read origin/$BRANCH tracking ref"
@@ -1791,27 +1859,18 @@ rmdir "$TOPIC_RESERVATION" || fail "could not prepare the temporary topic reserv
 git -C "$MAIN" worktree add --detach "$TOPIC_RESERVATION" "$LOCAL_BRANCH_OID" >/dev/null ||
   fail "could not prepare a temporary topic reservation"
 TOPIC_RESERVATION=$(canonical_dir "$TOPIC_RESERVATION") || exit $?
-if ! lock_session_head_for_archive; then
-  CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH" 2>/dev/null || true)
-  [ -n "$CURRENT_TOPIC_OID" ] && restore_remote_topic "$CURRENT_TOPIC_OID" ||
-    fail "session HEAD changed, and its current topic tip could not be restored remotely"
-  fail "session HEAD changed after preflight; its remote ref was restored"
-fi
+lock_session_head_for_archive ||
+  fail "session HEAD changed after preflight; local and remote $BRANCH were preserved"
 if ! git -C "$TOPIC_RESERVATION" switch -- "$BRANCH" >/dev/null 2>&1; then
   git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
   TOPIC_RESERVATION=""
-  CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH" 2>/dev/null || true)
-  [ -n "$CURRENT_TOPIC_OID" ] && restore_remote_topic "$CURRENT_TOPIC_OID" ||
-    fail "topic reservation failed, and its remote recovery ref could not be restored"
-  fail "could not reserve local $BRANCH for deletion; its remote ref was restored"
+  fail "could not reserve local $BRANCH for deletion; local and remote $BRANCH were preserved"
 fi
 CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") || fail "cannot reread local $BRANCH"
 if [ "$CURRENT_TOPIC_OID" != "$LOCAL_BRANCH_OID" ]; then
   git -C "$TOPIC_RESERVATION" checkout --detach "$LOCAL_BRANCH_OID" >/dev/null 2>&1 || true
   git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" >/dev/null 2>&1 || true
   TOPIC_RESERVATION=""
-  restore_remote_topic "$CURRENT_TOPIC_OID" ||
-    fail "local $BRANCH moved during ownership handoff, and its new tip could not be restored remotely"
   fail "local $BRANCH moved during ownership handoff; its session and remote tip were preserved"
 fi
 
@@ -1878,24 +1937,56 @@ SESSION_HEAD_LOCK=""
 SESSION_PSEUDOREF_LOCKS=()
 [ -d "$SESSION_ARCHIVED_WORKTREE" ] || fail "session recovery archive disappeared: $SESSION_ARCHIVED_WORKTREE"
 
-if ! delete_ref_with_locked_reflog "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" topic-reflog; then
-  CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH" 2>/dev/null || true)
-  [ -n "$CURRENT_TOPIC_OID" ] || CURRENT_TOPIC_OID="$LOCAL_BRANCH_OID"
-  restore_remote_topic "$CURRENT_TOPIC_OID" ||
-    fail "local $BRANCH changed before final deletion, and its current tip could not be restored remotely"
-  fail "local $BRANCH changed before final deletion; its current tip was restored remotely"
-fi
+delete_ref_with_locked_reflog "refs/heads/$BRANCH" "$LOCAL_BRANCH_OID" topic-reflog ||
+  fail "local $BRANCH changed before final deletion; it and origin/$BRANCH were preserved; session archived at $SESSION_ARCHIVED_WORKTREE"
 atomic_rename "$CONFIG_LOCK" "$MAIN_COMMON/config" ||
-  fail "local $BRANCH was deleted but its cleaned repository configuration could not be installed"
+  fail "local $BRANCH was deleted but its cleaned repository configuration could not be installed; origin/$BRANCH was left in place"
 CONFIG_LOCK_OWNED=0
 CONFIG_LOCK=""
 git -C "$MAIN" worktree remove --force "$TOPIC_RESERVATION" ||
-  fail "local $BRANCH was deleted but its temporary reservation could not be removed"
+  fail "local $BRANCH was deleted but its temporary reservation could not be removed; origin/$BRANCH was left in place"
 TOPIC_RESERVATION=""
 
 if [ -n "$LATE_SESSION_ARCHIVE" ]; then
   printf '%s\n' "post-merge-cleanup.sh: data appearing at the former session path was archived at $LATE_SESSION_ARCHIVE" >&2
 fi
+
+# The local side is complete and read back; from here a refusal leaves only the public branch, whose
+# tip RECOVERY_REF still holds locally, so every message below says where the local state went.
+LOCAL_DONE="local $BRANCH was deleted and its session archived at $SESSION_ARCHIVED_WORKTREE; recovery retained at $RECOVERY_REF"
+if [ -n "$REMOTE_BRANCH_OID" ]; then
+  ! local_topic_reappeared ||
+    fail "$LOCAL_DONE; but local $BRANCH reappeared (at or over $CURRENT_TOPIC_OID) before the remote deletion, so origin/$BRANCH was left in place"
+  if ! git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" \
+    "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH"; then
+    REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
+    REMOTE_BRANCH_STATUS=$?
+    case "$REMOTE_BRANCH_STATUS" in
+    2) printf '%s\n' "post-merge-cleanup.sh: origin/$BRANCH disappeared before its leased deletion (nothing left to delete)" >&2 ;;
+    0) fail "$LOCAL_DONE; but origin/$BRANCH moved to ${REMOTE_BRANCH_LINE%%[[:space:]]*} before its leased deletion, and its newer tip was left in place" ;;
+    *) fail "$LOCAL_DONE; but origin/$BRANCH could not be lease-deleted at $REMOTE_BRANCH_OID and was left in place" ;;
+    esac
+  fi
+else
+  printf '%s\n' "post-merge-cleanup.sh: origin/$BRANCH was already absent (no deletion sent)" >&2
+fi
+
+# The same read after the deletion, for a base that moved while it ran.
+remote_base_still_integrates ||
+  restore_remote_topic "$LOCAL_BRANCH_OID" ||
+  fail "$LOCAL_DONE; but $REMOTE_BASE_PROBLEM after topic deletion, and the topic could not be restored"
+[ -z "$REMOTE_BASE_PROBLEM" ] ||
+  fail "$LOCAL_DONE; but $REMOTE_BASE_PROBLEM after topic deletion; origin/$BRANCH was restored"
+
+# The last read, after every network call: a local topic recreated while the remote steps ran
+# would otherwise outlive its public branch, the same half-done state the other way round.
+# Publish it again, as the branch now is, before refusing.
+if [ -n "$REMOTE_BRANCH_OID" ] && local_topic_reappeared; then
+  restore_remote_topic "$CURRENT_TOPIC_OID" ||
+    fail "$LOCAL_DONE; but local $BRANCH reappeared (publishing $CURRENT_TOPIC_OID) during the remote deletion, and origin/$BRANCH could not be restored"
+  fail "$LOCAL_DONE; but local $BRANCH reappeared (publishing $CURRENT_TOPIC_OID) during the remote deletion; origin/$BRANCH was restored at that tip"
+fi
+
 printf '%s\n' "post-merge-cleanup.sh: cleaned $BRANCH and unregistered $SESSION_ORIGINAL; session archived at $SESSION_ARCHIVED_WORKTREE; recovery retained at $RECOVERY_REF and $SESSION_RECOVERY_REF"
 exit "$?"
 }

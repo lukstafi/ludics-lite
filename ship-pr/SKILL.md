@@ -1032,10 +1032,11 @@ and the remedy for that is an ignore rule rather than this helper deleting a tre
 primary checkout to clean up an unrelated topic branch.
 
 It fetches and proves the ordinary topic is an ancestor of `origin/<base>` before deleting
-anything, deletes the remote branch, advances the local base according to which worktree owns it,
-detaches and unregisters the session worktree into a sibling recovery archive, rechecks ancestry
-against the updated local base, and
-deletes the local branch independently of its configured upstream. Its scratch-repository test
+anything, advances the local base according to which worktree owns it, detaches and unregisters
+the session worktree into a sibling recovery archive, rechecks ancestry against the updated local
+base, deletes the local branch independently of its configured upstream, and deletes the remote
+branch last: only once the local deletion has committed and been read back, so a cleanup that
+stops part-way leaves the public branch in place rather than gone beside a surviving local one. Its scratch-repository test
 covers an unchecked-out base, a base owned by the primary checkout, a base owned by another
 worktree, safe deletion while the primary checkout is off the base, an explicit `main` base, and
 refusal of an unmerged topic:
@@ -1078,7 +1079,9 @@ came from: a leading slash, and a Windows drive root (`C:/Users/...`), count as 
 Git for Windows reports a path it read from a `.git` file's gitdir line, from `core.worktree` or
 from `--git-common-dir` in that native form even under Git Bash, whose own other outputs are
 `/c/...`, and joining one to the checkout refused a clean, merged session with a path that cannot
-exist anywhere.
+exist anywhere. Its interactive `update-ref --stdin` transactions reach Git through an
+anonymous pipe and a regular response file rather than a pair of FIFOs, for the same platform: a
+native Git for Windows reads nothing from an MSYS2 FIFO and exits 0 having done nothing.
 
 The helper requires Git's transactional `update-ref` symbolic-ref commands, Perl for an atomic
 filesystem rename, the exact session-worktree root, a clean and unlocked session, and one shared
@@ -1099,11 +1102,12 @@ exact-OID leases. It also fetches the selected base
 explicitly, independent of the remote's configured fetch map, and proves the local ref can
 fast-forward before any remote deletion. A clean worktree keeps the base continuously reserved
 while the named ref is conditionally updated and its tree refreshed; when no worktree owns it, the
-helper creates a temporary owner for that same critical section. Remote topic deletion is leased
-on the observed topic OID and followed by fresh base and local-topic reads. A changed base is
+helper creates a temporary owner for that same critical section. The remote topic is observed
+before any topic mutation and deleted last, leased on that observed OID, so every earlier refusal
+leaves it untouched; a fresh base read precedes the first topic deletion and follows the remote one. A changed base is
 fetched by its exact advertised OID and accepted only if it descends from the validated base;
-local and tracking base refs retain their already prepared tip. If that verification fails, the
-topic changes, or the base becomes unreadable, the topic is restored before refusal. The
+local and tracking base refs retain their already prepared tip. If that verification fails or
+the base becomes unreadable, the remote topic is restored before refusal. The
 validated tip also remains reachable under a direct `refs/ship-pr/recovery/` ref because no finite
 remote read can rule out a later base rollback; a divergent remote-tracking tip is retained
 separately under `refs/ship-pr/tracking-recovery/` before pruning. The base-owner refresh uses a non-destructive porcelain

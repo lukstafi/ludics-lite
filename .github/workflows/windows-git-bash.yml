@@ -80,9 +80,10 @@ jobs:
       # proof passed, and only the named suite when one was dispatched; a failure names its suite
       # in the run's annotations.
       - name: post-merge cleanup
-        # KNOWN RED until ludics-lite#287 lands: its update-ref transaction over mkfifo is a no-op
-        # under Git Bash. #287's PR removes this line, so its own run here is its Windows evidence.
-        # Do not exclude the failing cases by name instead.
+        # KNOWN RED until ludics-lite#338 (the cases still failing under Git Bash for reasons other
+        # than #287's transaction, which no longer uses a FIFO) and #337 (the runner self-tests
+        # whose per-case deadline does not fire under MSYS) land. Whichever of the two lands last
+        # removes this line. Do not exclude cases by name instead.
         id: cleanup
         continue-on-error: true
         # The suite's per-case deadline does not fire under Git Bash (ludics-lite#337); this cap is

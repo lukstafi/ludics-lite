@@ -125,6 +125,18 @@ assert_cleaned() {
   [ -f "$CASE_ARCHIVE/worktree/value" ] || fail "session archive did not retain tracked worktree files"
 }
 
+# A refusal the post-deletion base check makes: the remote topic deletion is the helper's last step
+# (ludics-lite#287), so a base that changes under it is caught with the local side already cleaned
+# exactly as on success, and the remote topic is put back at the cleaned tip.
+assert_remote_restored_after_local_cleanup() {
+  assert_ref_absent "refs/heads/$CASE_BRANCH"
+  assert_absent "$CASE_SESSION"
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse "refs/ship-pr/recovery/$CASE_BRANCH/$CASE_TOPIC_OID")" \
+    "$CASE_TOPIC_OID" "topic recovery ref must retain the cleaned tip"
+  assert_eq "$(git -C "$CASE_MAIN" ls-remote origin "refs/heads/$CASE_BRANCH" | awk '{print $1}')" \
+    "$CASE_TOPIC_OID" "remote topic must be restored at the cleaned tip"
+}
+
 git_config() {
   git -C "$1" config user.name "Cleanup Test"
   git -C "$1" config user.email cleanup-test@example.invalid
@@ -1721,12 +1733,15 @@ test_ignored_data_during_topic_detach() {
     fail "topic detach race was not injected"
   assert_eq "$(sed -n '1p' "$CASE_SESSION/value")" irreplaceable \
     "ignored data created during topic detach must survive"
+  # The remote deletion is the helper's last step (ludics-lite#287), so this refusal never reached
+  # it: origin keeps the landed tip, and the concurrent advance stays local.
   new_topic_oid=$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)
+  [ "$new_topic_oid" != "$CASE_TOPIC_OID" ] || fail "topic detach race did not advance the local topic"
   remote_topic_oid=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
-  assert_eq "$remote_topic_oid" "$new_topic_oid" \
-    "topic detach refusal must restore the concurrently advanced tip remotely"
+  assert_eq "$remote_topic_oid" "$CASE_TOPIC_OID" \
+    "topic detach refusal must leave the remote topic untouched"
   assert_topic_preserved
-  echo "PASS: topic detach refuses ignored data and restores the current remote tip"
+  echo "PASS: topic detach refuses ignored data and leaves the remote tip untouched"
 }
 
 test_ignored_data_during_topic_reattach() {
@@ -1770,9 +1785,12 @@ test_ignored_data_during_topic_reattach() {
     fail "topic reattachment race was not injected"
   assert_eq "$(sed -n '1p' "$CASE_SESSION/ignored-collision")" "irreplaceable local bytes" \
     "topic reattachment must not overwrite ignored session data"
+  # As in the detach case: the refusal precedes the remote deletion, so origin is untouched.
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)" "$new_topic_oid" \
+    "the concurrently advanced topic must stay local"
   remote_topic_oid=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
-  assert_eq "$remote_topic_oid" "$new_topic_oid" \
-    "topic reattachment refusal must restore the concurrently advanced tip remotely"
+  assert_eq "$remote_topic_oid" "$CASE_TOPIC_OID" \
+    "topic reattachment refusal must leave the remote topic untouched"
   assert_topic_preserved
   echo "PASS: topic reattachment refuses to overwrite ignored session data"
 }
@@ -3310,7 +3328,7 @@ test_remote_base_advance() {
         fail "cleanup did not fetch the newly advertised base commit"
     else
       [ "$mode" = fetch-failure ] || { cat "$log"; fail "cleanup refused a sibling fast-forward"; }
-      assert_topic_preserved
+      assert_remote_restored_after_local_cleanup
       grep 'without a verified fast-forward' "$log" >/dev/null ||
         fail "cleanup did not refuse at the post-deletion ancestry guard"
     fi
@@ -3318,6 +3336,44 @@ test_remote_base_advance() {
       "$advanced_oid" "cleanup must preserve the sibling base advance"
   done
   echo "PASS: sibling base advances are accepted only after a successful exact-tip fetch"
+}
+
+# A base rewritten after the initial fetch but before any topic deletion is caught by the
+# pre-deletion read: nothing about the topic is touched, the session included.
+test_remote_base_rewrite_before_deletion() {
+  local fake_bin real_git remote_base log
+  setup_case remote-base-rewrite-before-deletion merge main-off
+  remote_base=$(git -C "$CASE_INTEGRATOR" rev-list --max-parents=0 HEAD)
+  real_git=$(command -v git)
+  fake_bin="$CASE_ROOT/bin"
+  log="$CASE_ROOT/cleanup.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'is_ls_remote=0' \
+    'is_topic=0' \
+    'for arg in "$@"; do' \
+    '  [ "$arg" = ls-remote ] && is_ls_remote=1' \
+    '  [ "$arg" = refs/heads/topic ] && is_topic=1' \
+    'done' \
+    'if [ "$is_ls_remote" -eq 1 ] && [ "$is_topic" -eq 1 ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '  : >"$RACE_MARKER"' \
+    '  "$REAL_GIT" -C "$RACE_INTEGRATOR" push --force origin "$RACE_BASE:refs/heads/master" >/dev/null 2>&1' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_INTEGRATOR="$CASE_INTEGRATOR" \
+    RACE_BASE="$remote_base" RACE_MARKER="$CASE_ROOT/rewrite.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "cleanup accepted a base rewritten before topic deletion"
+  fi
+  [ -e "$CASE_ROOT/rewrite.injected" ] || fail "base rewrite was not injected"
+  grep 'without a verified fast-forward before any topic deletion' "$log" >/dev/null ||
+    { cat "$log" >&2; fail "the refusal was not the pre-deletion base read"; }
+  assert_topic_preserved
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/topic)" "$CASE_TOPIC_OID" \
+    "the tracking ref must survive a pre-deletion base refusal"
+  echo "PASS: a base rewritten before topic deletion is refused with the topic intact"
 }
 
 test_remote_master_lease() {
@@ -3337,7 +3393,7 @@ test_remote_master_lease() {
     RACE_BASE="$remote_base" "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
     fail "topic deletion ignored a concurrent remote master rewrite"
   fi
-  assert_topic_preserved
+  assert_remote_restored_after_local_cleanup
   assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/master | awk '{print $1}')" \
     "$remote_base" "remote master rewrite must remain visible after atomic refusal"
   echo "PASS: post-advertisement master rewrite restores the topic"
@@ -3359,7 +3415,9 @@ test_stale_master_response_retains_recovery() {
     '  [ "$arg" = ls-remote ] && is_ls_remote=1' \
     '  [ "$arg" = refs/heads/master ] && is_master=1' \
     'done' \
-    'if [ "$is_ls_remote" -eq 1 ] && [ "$is_master" -eq 1 ]; then' \
+    '# Only the final read, once local topic is gone: the pre-deletion read must see the real base.' \
+    'if [ "$is_ls_remote" -eq 1 ] && [ "$is_master" -eq 1 ] &&' \
+    '  ! "$REAL_GIT" -C "$RACE_MAIN" show-ref --verify --quiet refs/heads/topic; then' \
     '  output=$("$REAL_GIT" "$@")' \
     '  status=$?' \
     '  "$REAL_GIT" -C "$RACE_INTEGRATOR" push --force origin "$RACE_BASE:refs/heads/master" >/dev/null' \
@@ -3370,7 +3428,8 @@ test_stale_master_response_retains_recovery() {
   chmod +x "$fake_bin/git"
 
   PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_INTEGRATOR="$CASE_INTEGRATOR" \
-    RACE_BASE="$remote_base" "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1
+    RACE_MAIN="$CASE_MAIN" RACE_BASE="$remote_base" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1
   assert_cleaned
   assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/master | awk '{print $1}')" \
     "$remote_base" "test must roll remote master back after returning its stale integrated OID"
@@ -3429,7 +3488,7 @@ test_topic_reservation() {
   echo "PASS: topic reservation blocks checkout through local deletion"
 }
 
-test_topic_reservation_failure_restores_remote() {
+test_topic_reservation_failure_keeps_remote() {
   local candidate fake_bin real_git log
   setup_case topic-reservation-failure merge main-off
   candidate="$CASE_ROOT/topic-acquisition-candidate"
@@ -3456,9 +3515,9 @@ test_topic_reservation_failure_restores_remote() {
   fi
   git -C "$CASE_MAIN" show-ref --verify --quiet refs/heads/topic || fail "local topic was lost"
   git -C "$CASE_MAIN" ls-remote --exit-code --heads origin refs/heads/topic >/dev/null 2>&1 ||
-    fail "remote topic was not restored after reservation failure"
+    fail "remote topic was deleted after reservation failure"
   [ -d "$CASE_SESSION" ] || fail "original session path was removed after reservation failure"
-  echo "PASS: topic reservation failure restores the remote recovery branch"
+  echo "PASS: topic reservation failure leaves the remote branch untouched"
 }
 
 test_ignored_write_at_session_removal() {
@@ -3919,7 +3978,7 @@ test_topic_reflog_locked_through_deletion() {
   echo "PASS: topic ref and reflog stay locked together through final deletion"
 }
 
-test_final_topic_lease_restores_remote() {
+test_final_topic_lease_keeps_remote() {
   local archive archive_count fake_bin new_oid old_oid race_main real_git remote_oid
   setup_case final-topic-lease merge main-off
   race_main=$(cd "$CASE_MAIN" && pwd -P)
@@ -3947,8 +4006,10 @@ test_final_topic_lease_restores_remote() {
   [ -e "$TEST_ROOT/final-topic-lease.injected" ] || fail "final topic lease race was not injected"
   assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)" "$new_oid" \
     "late local topic advance must remain local"
+  # The remote deletion comes only after the local one commits (ludics-lite#287), so a refused
+  # final lease never reached it: origin keeps the tip it had, rather than a restored one.
   remote_oid=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
-  assert_eq "$remote_oid" "$new_oid" "late local topic advance must be restored remotely"
+  assert_eq "$remote_oid" "$old_oid" "remote topic must be untouched by a refused final lease"
   [ ! -d "$CASE_SESSION" ] || fail "session should already be archived at the final lease"
   archive_count=0
   for archive in "$CASE_ROOT"/.session.ship-pr-recovery.*; do
@@ -3956,7 +4017,173 @@ test_final_topic_lease_restores_remote() {
     archive_count=$((archive_count + 1))
   done
   assert_eq "$archive_count" 1 "final lease refusal must retain one session archive"
-  echo "PASS: final topic lease races restore the current local tip remotely"
+  echo "PASS: final topic lease races keep the local advance and leave the remote untouched"
+}
+
+# install_push_log_hook: record every push the helper sends from the case's main checkout, each
+# line prefixed with whether local refs/heads/topic still existed when the push was sent. Restores
+# are pushes too, so an empty log proves the remote topic was never deleted and put back.
+install_push_log_hook() {
+  CASE_PUSH_LOG="$CASE_ROOT/pushes.log"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if "$REAL_GIT" -C "$RACE_MAIN" show-ref --verify --quiet refs/heads/topic; then state=local-present; else state=local-absent; fi' \
+    'while read -r local_ref local_oid remote_ref remote_oid; do' \
+    '  printf "%s %s %s %s %s\n" "$state" "$local_ref" "$local_oid" "$remote_ref" "$remote_oid" >>"$PUSH_LOG"' \
+    'done' \
+    'exit 0' >"$CASE_MAIN/.git/hooks/pre-push"
+  chmod +x "$CASE_MAIN/.git/hooks/pre-push"
+}
+
+test_remote_deletion_follows_local_deletion() {
+  local real_git zero
+  setup_case remote-deletion-last merge main-off
+  real_git=$(command -v git)
+  install_push_log_hook
+  REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" PUSH_LOG="$CASE_PUSH_LOG" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  zero=$(printf '%s' "$CASE_TOPIC_OID" | tr '0-9a-f' '0')
+  assert_eq "$(cat "$CASE_PUSH_LOG")" "local-absent (delete) $zero refs/heads/topic $CASE_TOPIC_OID" \
+    "the only push must be the remote topic deletion, sent after the local topic was gone"
+  echo "PASS: the remote topic is deleted last, after the local deletion has committed"
+}
+
+# A local topic recreated while the remote steps run must not outlive its public branch. Each mode
+# recreates it at a different moment, in a different shape: `push` from the pre-push hook as a
+# direct ref, `base` during the final base read as a dangling symbolic ref (which resolves to no
+# tip, so the retained original is published). Either way the helper's last read catches it.
+test_local_topic_recreated_during_remote_deletion() {
+  local fake_bin hook log mode real_git
+  for mode in push base; do
+    setup_case "local-topic-recreated-$mode" merge main-off
+    real_git=$(command -v git)
+    log="$CASE_ROOT/cleanup.log"
+    case "$mode" in
+    push)
+      hook="$CASE_MAIN/.git/hooks/pre-push"
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'if [ ! -e "$RACE_MARKER" ]; then' \
+        '  : >"$RACE_MARKER"' \
+        '  "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/topic "$RACE_OID" ""' \
+        'fi' \
+        'exit 0' >"$hook"
+      chmod +x "$hook"
+      ;;
+    base)
+      fake_bin="$CASE_ROOT/bin"
+      mkdir -p "$fake_bin"
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'is_ls_remote=0' \
+        'is_master=0' \
+        'for arg in "$@"; do' \
+        '  [ "$arg" = ls-remote ] && is_ls_remote=1' \
+        '  [ "$arg" = refs/heads/master ] && is_master=1' \
+        'done' \
+        'if [ "$is_ls_remote" -eq 1 ] && [ "$is_master" -eq 1 ] && [ ! -e "$RACE_MARKER" ] &&' \
+        '  ! "$REAL_GIT" -C "$RACE_MAIN" show-ref --verify --quiet refs/heads/topic; then' \
+        '  : >"$RACE_MARKER"' \
+        '  "$REAL_GIT" -C "$RACE_MAIN" symbolic-ref refs/heads/topic refs/heads/missing-topic-target' \
+        'fi' \
+        'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+      chmod +x "$fake_bin/git"
+      ;;
+    esac
+    if PATH="${fake_bin:+$fake_bin:}$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+      RACE_OID="$CASE_TOPIC_OID" RACE_MARKER="$CASE_ROOT/recreated.injected" \
+      "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+      fail "cleanup completed although local topic reappeared during its remote deletion ($mode)"
+    fi
+    [ -e "$CASE_ROOT/recreated.injected" ] || fail "local topic recreation was not injected ($mode)"
+    grep 'reappeared (publishing .*) during the remote deletion; origin/topic was restored' "$log" >/dev/null ||
+      { cat "$log" >&2; fail "the $mode refusal was not the final recreation check"; }
+    case "$mode" in
+    push)
+      assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)" "$CASE_TOPIC_OID" \
+        "the recreated local topic must be left alone"
+      ;;
+    base)
+      assert_eq "$(git -C "$CASE_MAIN" symbolic-ref refs/heads/topic)" refs/heads/missing-topic-target \
+        "the recreated symbolic topic must be left alone"
+      ;;
+    esac
+    assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')" \
+      "$CASE_TOPIC_OID" "the remote topic must be republished ($mode)"
+    fake_bin=""
+  done
+  echo "PASS: a local topic recreated during the remote steps is published again"
+}
+
+# The Git for Windows shape of ludics-lite#287 at each local deletion in turn: the transaction's Git
+# reads nothing and exits 0 having done nothing. The fixture keeps the real input open on fd 9, so
+# the helper's writes still land in a pipe and the refusal is its own, not a SIGPIPE.
+test_failed_local_deletion_keeps_remote() {
+  local fake_bin mode real_git race_main
+  for mode in tracking topic; do
+    setup_case "failed-local-deletion-$mode" merge main-off
+    race_main=$(cd "$CASE_MAIN" && pwd -P)
+    real_git=$(command -v git)
+    install_push_log_hook
+    fake_bin="$CASE_ROOT/bin"
+    mkdir -p "$fake_bin"
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'if [ "$2" = "$RACE_MAIN" ] && [ "$3" = update-ref ] && [ "$4" = --stdin ] && [ -f /dev/stdout ]; then' \
+      '  case "$RACE_MODE" in' \
+      '  tracking) exec 9<&0 </dev/null ;;' \
+      '  topic) [ -d "$RACE_SESSION" ] || exec 9<&0 </dev/null ;;' \
+      '  esac' \
+      'fi' \
+      'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+    chmod +x "$fake_bin/git"
+
+    if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$race_main" RACE_MODE="$mode" \
+      RACE_SESSION="$CASE_SESSION" PUSH_LOG="$CASE_PUSH_LOG" \
+      "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$CASE_ROOT/cleanup.log" 2>&1; then
+      fail "cleanup succeeded although its $mode deletion transaction read nothing"
+    fi
+    grep 'ref deletion transaction did not start' "$CASE_ROOT/cleanup.log" >/dev/null ||
+      { cat "$CASE_ROOT/cleanup.log" >&2; fail "the $mode refusal was not the unstarted transaction"; }
+    [ ! -s "$CASE_PUSH_LOG" ] || fail "a failed $mode deletion still pushed: $(cat "$CASE_PUSH_LOG")"
+    assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')" \
+      "$CASE_TOPIC_OID" "remote topic must be untouched by a failed $mode deletion"
+    assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)" "$CASE_TOPIC_OID" \
+      "local topic must survive a failed $mode deletion"
+    case "$mode" in
+    tracking)
+      [ -d "$CASE_SESSION" ] || fail "session was archived although the tracking deletion failed first"
+      assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/topic)" "$CASE_TOPIC_OID" \
+        "tracking ref must survive its failed deletion"
+      ;;
+    topic) [ ! -d "$CASE_SESSION" ] || fail "session should already be archived at the final deletion" ;;
+    esac
+  done
+  echo "PASS: a local deletion that does nothing never reaches the remote topic"
+}
+
+# Git for Windows cannot use an MSYS2 FIFO (ludics-lite#287), and this fixture cannot tell a FIFO
+# from an anonymous pipe, so it breaks every transaction whose responses go to either: its Git then
+# reads nothing and answers nothing. The helper's transactions answer into a regular file, so the
+# whole cleanup still completes.
+test_ref_transactions_answer_into_a_regular_file() {
+  local fake_bin real_git
+  setup_case transactions-without-fifos merge main-off
+  real_git=$(command -v git)
+  fake_bin="$CASE_ROOT/bin"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ "$3" = update-ref ] && [ "$4" = --stdin ] && [ -p /dev/stdout ]; then' \
+    '  exec 9<&0 </dev/null >/dev/null' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+  PATH="$fake_bin:$PATH" REAL_GIT="$real_git" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+  echo "PASS: ref transactions complete without a FIFO or pipe on their response channel"
 }
 
 test_branch_config_locked_through_deletion() {
@@ -4770,11 +4997,12 @@ TESTS=(
   test_late_session_module_refusal
   test_symbolic_ref_refusal
   test_remote_base_advance
+  test_remote_base_rewrite_before_deletion
   test_remote_master_lease
   test_stale_master_response_retains_recovery
   test_symbolic_recovery_ref_refusal
   test_topic_reservation
-  test_topic_reservation_failure_restores_remote
+  test_topic_reservation_failure_keeps_remote
   test_ignored_write_at_session_removal
   test_dangling_link_at_session_removal
   test_detached_session_head_recovery
@@ -4792,7 +5020,11 @@ TESTS=(
   test_tracking_reflog_locked_through_deletion
   test_topic_reflog_recovery
   test_topic_reflog_locked_through_deletion
-  test_final_topic_lease_restores_remote
+  test_final_topic_lease_keeps_remote
+  test_remote_deletion_follows_local_deletion
+  test_local_topic_recreated_during_remote_deletion
+  test_failed_local_deletion_keeps_remote
+  test_ref_transactions_answer_into_a_regular_file
   test_branch_config_locked_through_deletion
   test_symref_capability_preflight
   test_dangling_capability_ref_refusal
