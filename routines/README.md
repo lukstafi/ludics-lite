@@ -12,11 +12,14 @@ Two kinds live here, and they are kept in sync differently.
 
 | Routine | Kind | Fires | Runs in | Model | Feeds |
 | --- | --- | --- | --- | --- | --- |
-| `ocannl-cross-machine-sweep` | local scheduled task | daily 07:20 local (`20 7 * * *`) | `~/ocannl-staging` | Opus | `tools/sweep.sh` in OCANNL, `scripts/wake-lab.sh` |
-| `daily-issue-planning` | local scheduled task | daily 07:05 local (`5 7 * * *`) | `~/ocannl-staging` | Fable | the sequencing plan `issue-wave` reads |
+| `ocannl-cross-machine-sweep` | local scheduled task | daily 07:05 local (`5 7 * * *`), up to 699 s jitter, so 07:05–07:17 | `~/ocannl-staging` | Opus | `tools/sweep.sh` in OCANNL, `scripts/wake-lab.sh` |
+| `daily-issue-planning` | local scheduled task | daily 06:45 local (`45 6 * * *`), up to 333 s jitter | `~/ocannl-staging` | Fable | the sequencing plan `issue-wave` reads |
 | `ocannl-ci-red-triage` | cloud routine | on any non-PR master red, fired by `ci.yml`; backstop daily 05:17 UTC (`17 5 * * *`) | Anthropic cloud, sources `lukstafi/ocannl-staging` and `ahrefs/ocannl` | Sonnet | the claiming issues OCANNL's mergers defer to |
 
-The local scheduler adds a per-task jitter of a few minutes to the times above. Cron in the
+The local scheduler adds a per-task jitter of a few minutes to the times above. The sweep's
+times are the registry's (read with the scheduled-tasks list, 2026-09-23), and something outside
+the Mac keys on them: tuf-amd-linux's RTC wake timer (`fleet-sweep-wake.timer`, from self-improve's
+Linux bootstrap) fires at 06:55 so the gated tuf lane finds the laptop up. Move both together. Cron in the
 local registry is the box's local time; the cloud routine's cron is UTC.
 
 The cross-machine sweep starts after the planning run, which is light, so the two never contend

@@ -1,6 +1,6 @@
 ---
 name: ocannl-cross-machine-sweep
-description: Daily OCANNL test sweep, one concurrent lane per box - cc/metal locally, cuda on rog-nv, hip/multidev_cc on minix
+description: Daily OCANNL test sweep, one concurrent lane per box - cc/metal locally, cuda on rog-nv, hip/multidev_cc on minix, discrete-memory hip on tuf when it is up
 ---
 
 Run the OCANNL cross-machine test sweep and report failures, especially what changed since the previous sweep.
@@ -20,7 +20,22 @@ backend on that box. What happens DURING the sweep is per unit instead: minix ru
 multidev_cc, so an endpoint can vanish after hip recorded a real result; judge each backend by its own row,
 and only a unit that recorded `skip (unreachable)` is uncovered. The CUDA and HIP boxes
 are often sleeping, and sometimes powered off; step 1 tries to wake them, but if that fails,
-"skip (unreachable)" is a normal outcome, not an error. CI's Windows OS target is likewise off the per-PR path: it runs only on the
+"skip (unreachable)" is a normal outcome, not an error.
+
+A fourth box, **tuf** (`tuf-amd-linux`, native Ubuntu only), runs hip AGAIN, and that is the point of
+it: its RX 7700S (gfx1102) is the fleet's one DISCRETE-memory AMD GPU, where a missing or misplaced
+host↔device transfer reads stale memory, while minix's gfx1151 is an iGPU whose device memory is
+host memory and can read the right bytes anyway (ludics-lite#320, gh-ocannl-1035). tuf is a Wi-Fi
+laptop, so Wake-on-LAN cannot reach it and this routine never wakes it: its own RTC timer does, a
+few minutes before this routine fires (a `WakeSystem=true` systemd timer, the optional laptop step
+of self-improve's Linux bootstrap), or a person does. Its lane is therefore **gated**: the sweep asks
+`wake-lab.sh status tuf` itself, runs the unit only when that reaches tuf's Linux, and otherwise
+records the unit as `gate` — nothing tested, nothing failed, and nothing for this routine to repair.
+When the lane did reach tuf it ends by putting the box back to sleep (`wake-lab.sh sleep tuf`, which
+is inhibitor-aware), so a timer-woken laptop does not stay up all day. tuf is NOT one of the five
+backends' gates: hip's gate stays minix, and tuf/hip is an additional unit reported on its own line.
+
+CI's Windows OS target is likewise off the per-PR path: it runs only on the
 twice-weekly scheduled CI sweep, and on demand via `workflow_dispatch`, because at 62-74min it
 set the latency of the whole per-PR matrix.
 
@@ -63,7 +78,14 @@ Read the site file's `kind_of` for each GPU box, then wake each kind through its
       done
     fi
     printf 'holder list: %s\n' "$held_file"
-    ~/bin/wake-lab.sh status rog minix
+    ~/bin/wake-lab.sh status rog minix tuf
+
+tuf appears in `status` only, never in the wake commands: it is Wi-Fi only (a wake sent to it is
+refused as `no wired NIC`), and it is woken by its own RTC timer or by hand. Read its `os=`/`linux=`
+fields for the report — `linux=UP` means today's run will cover discrete-memory hip; anything else
+means its unit will record `gate`, which is not a failure and needs nothing from you — and do not
+`--hold` it (it is native Linux). `sleep-blocks=N` on tuf, as on any native box, counts other
+sessions' sleep inhibitors: the sweep's own units hold one each while they run.
 
 The native Linux path waits for sshd after boot and needs no holder. For WSL, the wake path
 restarts the guest on each host that answered and establishes a Windows-side holder before
@@ -232,7 +254,12 @@ ludics-lite. WSL holder and Windows details are in `scripts/wake-lab-wsl.sh`. Th
 `~/bin/wake-lab.sh` links to that core script; do not spend the run rediscovering this setup.
 
 Do not power the boxes back down afterwards — the user may want them for the day's work, and the
-next sweep can always wake them again.
+next sweep can always wake them again. The one exception is tuf, and it is the sweep's, not
+yours: its lane ends with `wake-lab.sh sleep tuf` and says how that went on a summary line of its
+own — `tuf: put back to sleep`, or `tuf: left awake, not a failure -- … REFUSED …` (another run holds
+the box: a block inhibitor or a lab lock, named on the line), or `tuf: WARNING -- wake-lab.sh sleep
+tuf exited N: …`. Quote that line in the report; only the WARNING is worth a task chip. Do not sleep
+tuf yourself.
 
 ## 2. Run the sweep
 
@@ -297,7 +324,7 @@ not refresh execution coverage. The raised cap is for the forced runs only: a co
 `@slow` legitimately exceeds the default 90-minute unit cap, and cutting it short would file lost
 coverage as `timeout`.
 Run it in the background and wait for it to finish — a cold unit can take tens of minutes.
-Each box's units run as one lane, and the three lanes run concurrently (gh-ocannl-976): the remote
+Each box's units run as one lane, and the four lanes (three when a run selects no tuf unit) run concurrently (gh-ocannl-976): the remote
 units start within seconds of launch, and the run lasts as long as its longest lane — normally this Mac's, which carries metal's suite. The stdout header's `lanes:` line names each
 box's units. Units on different boxes finish in any order, so their summary blocks and their
 history rows appear in completion order, not in the order this routine lists them.
@@ -356,8 +383,11 @@ same unit's most recent PREVIOUS non-pass run. Only a DIFFERENCE is news.
 
 The `machine` column holds the measurement-box ID, so rows and filenames from before 2026-09-05
 spell the same units `local` (now `m4-max`) and `rog` (now `rog-nv`); `minix` is unchanged. When
-looking for a unit's previous non-pass run, match on `backend` and accept the old machine spelling
-of its fingerprint filename.
+looking for a unit's previous non-pass run, match on machine AND backend, accepting only those old
+machine spellings of its fingerprint filename. Never match on backend alone: hip runs on two boxes
+of different memory models (minix unified, tuf discrete), so the other box's hip fingerprint is a
+different experiment, and matching it would invent news or hide a repeat. The one cross-machine
+match is multidev_cc's move below.
 
 multidev_cc also MOVED, from this Mac to minix (gh-ocannl-976): its older rows and fingerprints say
 `m4-max`/`local`, its newer ones `minix`. Match it on `backend` across both, but read the first
@@ -382,6 +412,28 @@ stdout also quotes the `result:` line and each `FAIL:`/`POTENTIAL:` finding, ind
 `*-skip-coverage.txt`, the same way fingerprints are diffed: a claim appearing or escalating
 (POTENTIAL → FAIL) is news. A weekday incremental run writes no report and says
 `skip coverage: not aggregated` — that is normal, not a finding.
+
+The per-run record `~/.ocannl-sweep/logs/<stamp>-run.tsv` (its path is the sweep's `run:` line) is
+the machine-readable form of the same run; read it rather than re-deriving facts from the summary
+prose. Its first line is `schema 5`. Each `unit` row is: machine, backend, outcome (or `no-row`), a
+lane-stopped flag, the log path, the kernel window's start and end, its COUNT, the window's KIND, and
+the unit's MEMORY model. The count means what the kind says (gh-ocannl-1034):
+
+- `dxg` — a WSL boot (`-wsl`): the count is `vmbus_sendpacket failed` bursts on the dxg bridge.
+- `native` — a native-Ubuntu boot (`-linux`): the count is refused GPU queues and driver faults —
+  amdgpu's `DQM create queue type <n> failed` (one per refused queue; `No more SDMA queue to allocate`
+  is its reason, counted only where no DQM line was logged) and NVIDIA's `NVRM: Xid` events. On minix
+  that is the SDMA queue pool running dry, the signature `unit_jobs` caps against; ROCr's
+  `GpuAgent::ReleaseQueueMainScratch` assertion in the log is its userspace half.
+- `-` — no window: a local unit, a CPU unit, one that never ran (`skip`, `gate`).
+
+A count is `-` (no window), a number (a window that was read; only this is a finding about the
+device), `unavailable` (the collection failed — not "the device was fine"), or `vm-replaced` (the
+WSL guest was destroyed and recreated mid-window). A positive count on a `fail` buys the unit its
+serial rerun, whose `still red:` / `all clean` lines are the verdict; quote the kind with the count
+so a reader knows which device it is about. The memory field is `discrete/<arch>`, `unified/<arch>`
+or `-` (CPU): it is how you tell tuf/hip's discrete coverage from minix/hip's unified one without
+knowing the fleet's hardware.
 
 ## 4. Staleness
 
@@ -408,7 +460,14 @@ are different claims:
   missed week) — incremental greens in between may be cache hits and cannot stand in for it.
 
 For each of the FIVE backends (cc, multidev_cc, metal, cuda, hip) find the most recent qualifying
-liveness row. Flag backends with no pass in more than 2 days. For cuda, hip or multidev_cc,
+liveness row. hip's is minix's: `lanes:` lists hip under both `minix(...)` and `tuf(hip)`, and the
+backend rows of the run record carry hip twice, once per box — age each unit by its own box's rows,
+and gate hip on minix's as before. Age tuf/hip separately, as its own line ("hip on tuf, discrete
+memory: last full-scope pass <age>, last forced pass <age>"): flag its liveness only when that pass
+is more than 7 days old, since a week of gates means the RTC wake is not waking it and
+discrete-memory hip has quietly lost its only coverage; and flag its EXECUTION coverage by its own
+forced pass on the same 14-day rule as the five backends — hip's forced pass on minix does not
+stand in for it, and weekday `incremental-pass` rows on tuf cannot either. Flag backends with no pass in more than 2 days. For cuda, hip or multidev_cc,
 report the step-1 outcome for its box: woken and swept; machine reachable but the configured
 guest or native Linux endpoint unreachable when the unit probed it; or wake failed. Only units
 whose own row says `skip (unreachable)` are uncovered; a unit that ran before an endpoint vanished
@@ -432,7 +491,10 @@ quote a few lines, do not paste the whole thing). On a forced run, also include 
 `result:` line and every `FAIL:`/`POTENTIAL:` claim from today's report, plus the report path —
 these are the zero-coverage findings this routine is the only channel for.
 
-Outcomes are `pass`, `incremental-pass`, `legacy-pass`, `fail`, `skip`, `timeout` and `error`.
+Outcomes are `pass`, `incremental-pass`, `legacy-pass`, `fail`, `skip`, `gate`, `timeout` and
+`error`. `gate` is tuf's alone: the box was not up (`gate (tuf not up: <its status fields>)`), or
+answered its status and then not the unit (`gate (unreachable)`). It is non-coverage of that one
+unit and never notify-worthy by itself; report it on tuf/hip's line with the status fields.
 `error` means the harness could not
 put that machine's worktree on the commit under test, so NOTHING was tested there — report it as
 non-coverage rather than as a test failure, and treat it as notify-worthy. For an `error` (or a
