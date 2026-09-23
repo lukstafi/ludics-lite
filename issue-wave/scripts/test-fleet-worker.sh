@@ -164,6 +164,9 @@ done
 # wait — and is checked here as that arithmetic rather than against a literal, so a gate that
 # moved either knob and left the ceiling behind fails here (ludics-lite#175).
 case " $* " in *" --wait=$((SHIP_PR_BASE_ABSENT_GRACE + SHIP_PR_CHECKS_INTERVAL)) "*) ;; *) exit 4 ;; esac
+# SHIM_BASE_TOUCH: a marker this read leaves behind, so a test can change the world between the
+# preflight and the launch's far side (the tmux shim's SHIM_TMUX_GENV_WHEN reads it).
+[ -z "${SHIM_BASE_TOUCH:-}" ] || touch "$SHIM_BASE_TOUCH"
 if [ -n "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] && [ ! -e "$SHIM_BASE_REQUIRE_PREFLIGHT" ]; then
   echo 'base read occurred before preflight'; exit 3
 fi
@@ -253,9 +256,10 @@ cat > "$TMP/bin/tmux" <<EOF
 if [ -n "\${SHIM_TMUX_FAIL_NEW:-}" ]; then case " \$* " in *" new-session "*) echo "shim: tmux refuses new-session" >&2; exit 1 ;; esac; fi
 # The server the preflight's environment check reads (ludics-lite#327): SHIM_TMUX_GENV names a
 # file holding \`show-environment -g\` output, or \`none\` for no server running; SHIM_TMUX_SESSIONS
-# lists its session names and SHIM_TMUX_UPDATE_ENV its update-environment option. Unset, the real
+# lists its session names and SHIM_TMUX_UPDATE_ENV its update-environment option; with
+# SHIM_TMUX_GENV_WHEN it plays that server only once the named file exists. Unset, the real
 # server on the test socket answers.
-if [ -n "\${SHIM_TMUX_GENV:-}" ]; then
+if [ -n "\${SHIM_TMUX_GENV:-}" ] && { [ -z "\${SHIM_TMUX_GENV_WHEN:-}" ] || [ -e "\$SHIM_TMUX_GENV_WHEN" ]; }; then
   case " \$* " in
     *" list-sessions "*|*" show-environment "*|*" show-options "*)
       [ "\$SHIM_TMUX_GENV" != none ] || { echo "no server running on /tmp/shim/\${FLEET_TMUX_SOCKET:-default}" >&2; exit 1; }
@@ -748,7 +752,7 @@ expect "a server still exporting a dropped ROCM_PATH refuses, naming it, and say
 grep -q 'restart it with' <<<"$out" && ko "kill-server offered as the fix while a worker session is live -- $out" \
   || ok "no restart is offered while a worker session is live"
 expect "with no live worker session, the refusal names the socket's kill-server" 1 \
-  "ROCM_PATH is /usr in the server .*no worker session is live on it, so restart it with \`tmux -L $FLEET_TMUX_SOCKET kill-server\` and launch again" -- \
+  "ROCM_PATH is /usr in the server .*no worker session is live on it, so restart it with \`tmux -L $FLEET_TMUX_SOCKET kill-server\` and try again" -- \
   "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" "$FW" preflight testbox --no-probe
 expect "...and warns which non-worker sessions a kill-server would end" 1 "kill-server also ends its non-worker session(s): notes)" -- \
   "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" SHIM_TMUX_SESSIONS="notes" "$FW" preflight testbox --no-probe
@@ -824,6 +828,15 @@ echo x >> "$repo/ship-pr/SKILL.md"
 expect "launch runs the preflight on the box and refuses a dirty served tree" 1 "LAUNCH REFUSED testbox/w1: PREFLIGHT REFUSED testbox: 1 local change(s) in the served tree" -- \
   "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 git -C "$repo" checkout -q -- .
+# The launch's far side re-reads the tmux server just before new-session (ludics-lite#327): the
+# base gate between it and the preflight can take minutes. Here the server turns stale during it.
+printf 'PATH=%s\nROCM_PATH=/usr\n' "$PATH" > "$TMP/genv-late"; rm -f "$TMP/stale-now"
+expect "a tmux server that turns stale after the preflight still refuses the launch" 1 "LAUNCH REFUSED testbox/wz: stale tmux server environment (ROCM_PATH is /usr in the server" -- \
+  env -u ROCM_PATH -u HIP_PATH -u OPAM_SWITCH_PREFIX SHIM_TMUX_GENV="$TMP/genv-late" SHIM_TMUX_GENV_WHEN="$TMP/stale-now" SHIM_BASE_TOUCH="$TMP/stale-now" \
+  "$FW" launch testbox wz --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
+grep -q 'PREFLIGHT REFUSED' <<<"$out" && ko "the stale server was caught by the preflight, not the late re-read -- $out" || ok "the late re-read, not the preflight, caught it"
+[ -e "$ISSUE_WAVE_STATE/workers/wz" ] && ko "a stale-server refusal left a record behind" || ok "a stale-server refusal leaves no record"
+rm -f "$TMP/stale-now"
 expect "launch creates the worktree and reports the session" 0 "LAUNCHED testbox/w1 kind=claude session=[0-9a-f-]\{36\} cwd=$proj-worktrees/w1" -- \
   "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 -- --model opus
 [ -d "$proj-worktrees/w1" ] && [ "$(git -C "$proj-worktrees/w1" rev-parse --abbrev-ref HEAD)" = claude/w1 ] && ok "worktree on the requested branch" || ko "worktree missing or wrong branch"
@@ -938,6 +951,12 @@ expect "a diagnostic process on the record does not block a plain unstick" 0 "RE
 cp "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before"
 expect "a tmux failure during unstick restores exit and meta" 1 "tmux failed (previous exit record and meta kept)" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" unstick testbox wo --message "$TMP/msg.md"
 cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "meta and exit are as before the failed resume" || ko "meta or exit changed by a failed resume"
+# A resume creates a tmux session with no preflight in front of it, so it runs the stale-server
+# check itself (ludics-lite#327), before it touches the record.
+printf 'PATH=%s\nROCM_PATH=/usr\n' "$PATH" > "$TMP/genv-stale"
+expect "a resume refuses against a stale tmux server" 1 "UNSTICK REFUSED testbox/wo: stale tmux server environment (ROCM_PATH is /usr in the server but unset in a fresh shell)" -- \
+  env -u ROCM_PATH -u HIP_PATH -u OPAM_SWITCH_PREFIX SHIM_TMUX_GENV="$TMP/genv-stale" "$FW" unstick testbox wo --message "$TMP/msg.md"
+cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "a resume refused over a stale server leaves meta and exit as they were" || ko "meta or exit changed by a stale-server refusal"
 expect "...and the worker still reads as its previous successful turn" 0 "DONE testbox/wo exit=0" -- "$FW" attach testbox wo --interval 1
 echo 99 > "$ISSUE_WAVE_STATE/workers/wo/exit.prev"; echo "kind=stale" > "$ISSUE_WAVE_STATE/workers/wo/meta.prev"; cp "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/wo.meta"
 mv "$proj" "$proj.moved"
