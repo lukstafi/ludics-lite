@@ -1,6 +1,7 @@
 name: skill scripts
 
-# The prompts and the shell behind the skills, on the two platforms the fleet runs. Every push to
+# The prompts and the shell behind the skills, on the platforms the fleet runs: Ubuntu, macOS, and
+# Windows (PowerShell for the bounded driver, Git Bash for ship-pr's suites). Every push to
 # main and every pull request runs it. One job per concern, so a new one (a scheduled contract
 # check, say) is one more entry below and no edit to the others.
 #
@@ -21,9 +22,11 @@ name: skill scripts
 # macOS suite is one step of ONE macOS job, which installs the shared dependencies once; each
 # step still runs after an earlier one fails (`if: !cancelled()`), still names its suite when it
 # fails (the `::error` annotation), and the job is red if any step is. Those annotations are a
-# macOS-jobs-only device, and that `if:` is the whole reason for them: with every suite running
-# whatever the suite before it did, one red macOS job can hold several failures spread across its
-# steps, and the annotation is what names them without reading the log. It is NOT that Ubuntu is
+# device of the macOS jobs and of the `git-bash` job, which takes the same shape (one Windows
+# runner, every ship-pr suite a step of it), and that `if:` is the whole reason for them: with
+# every suite running whatever the suite before it did, one red job of that shape can hold several
+# failures spread across its steps, and the annotation is what names them without reading the
+# log. It is NOT that Ubuntu is
 # one suite per job -- `pr-review` runs fifteen suites as steps, `lint` nine -- but that an Ubuntu
 # suite that fails stops the job it is in, leaving a single red step to find. The two `pr-review`
 # steps that do carry `if: !cancelled()` are unannotated exceptions to that; ludics-lite#266 is
@@ -506,3 +509,126 @@ jobs:
         if: ${{ !cancelled() }}
         shell: pwsh
         run: ./issue-wave/scripts/test-windows-driver.ps1
+
+  # ---- ship-pr's shell suites under Git Bash ------------------------------------------------
+  #
+  # git-bash: ship-pr's shell suites run by Git for Windows' MINGW64 bash on windows-latest, behind
+  # a first step that proves that shell from inside it (ludics-lite#318).
+  #
+  # Windows is a supported platform for ship-pr's scripts, and since the fleet's GPU boxes boot
+  # native Ubuntu (ludics-lite#284) a fleet leg there costs a reboot and a boot-menu choice. This
+  # job is what keeps that support tested without one. The gap it closes is real: #287's
+  # half-done cleanup -- `update-ref --stdin` over `mkfifo` is a no-op under Git Bash, and it
+  # fails only after the remote topic branch is gone -- sat undetected for the helper's whole
+  # life, because nothing ran the helper's suite under Git Bash.
+  #
+  # THE PROOF STEP comes first and every suite is gated on it (`steps.platform.outcome`): a suite
+  # that passes under some other shell is coverage this job would be claiming falsely. It asks the
+  # shell the suites run in -- not the runner's labels -- for `uname -s` (MINGW*/MSYS*) and
+  # `git --version` (`.windows.`), the criterion ludics-lite#288 states for a Windows leg.
+  #
+  # The steps follow the macOS jobs' shape and for the same reason: `if: !cancelled()` so every
+  # suite runs whatever the one before it did, and an `::error` annotation naming the suite, so
+  # a red job with several failing steps names them without reading the log.
+  #
+  # COVERED: test-post-merge-cleanup.sh and all thirteen test-pr-review-*.sh suites.
+  # NOT COVERED here, with the reason:
+  #   - ship-pr/hooks/test-ship-pr-nudge.py and ship-pr/scripts/test-pr-review-hostile.py (with
+  #     its runner run-pr-review-hostile.sh): Python fixtures, not shell suites; the hostile pass
+  #     is Ubuntu-only by design (it needs a non-C locale and python3 under that name).
+  #   - The repo and fleet suites (scripts/test-*, issue-wave/scripts/test-*): not ship-pr code.
+  #     The fleet launcher needs tmux, which Git for Windows does not ship; the others guard this
+  #     repository's own files and run on the Mac controller or on CI.
+  git-bash:
+    name: Git Bash suites, ship-pr (windows)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: windows-latest
+    # Unmeasured on this runner yet: forking is several times slower under MSYS than on Linux,
+    # and the same suites take ~510s on macOS. Re-read once main has run it.
+    timeout-minutes: 60
+    defaults:
+      run:
+        # On a Windows runner `bash` is Git for Windows' bash (C:\Program Files\Git\bin\bash.exe),
+        # not WSL's. The proof step below is what holds that, not this comment.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove the platform from inside the suites' shell
+        id: platform
+        run: |
+          os=$(uname -s)
+          gv=$(git --version)
+          echo "uname -s:      $os"
+          echo "git --version: $gv"
+          echo "bash:          ${BASH_VERSION:-?} at ${BASH:-?}"
+          echo "core.autocrlf: $(git config --show-origin --get core.autocrlf || echo unset)"
+          head -n 1 ship-pr/scripts/pr-review.sh | od -c | head -n 2
+          case "$os" in
+          MINGW* | MSYS*) ;;
+          *) echo "::error title=Git Bash platform proof failed::uname -s is '$os', not MINGW*/MSYS*"; exit 1 ;;
+          esac
+          case "$gv" in
+          *.windows.*) ;;
+          *) echo "::error title=Git Bash platform proof failed::git --version is '$gv', not a Git for Windows build (.windows.)"; exit 1 ;;
+          esac
+          command -v jq || { echo '::error title=Git Bash platform proof failed::no jq on PATH'; exit 1; }
+      # Every suite step below runs whether or not an earlier suite failed, but only once the
+      # proof passed; a failure names its suite in the run's annotations.
+      - name: post-merge cleanup
+        # KNOWN RED until ludics-lite#287 lands: its update-ref transaction over mkfifo is a no-op
+        # under Git Bash. continue-on-error keeps the rest of this job a verdict meanwhile; the
+        # step still runs, still fails and still annotates. #287's PR removes this line, so its
+        # own run here is its Windows evidence. Do not exclude the failing cases by name instead.
+        id: cleanup
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        env:
+          SHIP_PR_TEST_LOG_DIR: ${{ runner.temp }}/cleanup-logs
+        run: ship-pr/scripts/test-post-merge-cleanup.sh || { echo '::error title=Git Bash suite failed::test-post-merge-cleanup.sh'; exit 1; }
+      - name: pr-review fixtures, shared preamble and shadow guard
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-lib.sh || { echo '::error title=Git Bash suite failed::test-pr-review-lib.sh'; exit 1; }
+      - name: pr-review fixtures, the base suites' shared fixture transport
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-base-lib.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-lib.sh'; exit 1; }
+      - name: pr-review fixtures, base drift
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-base-drift.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-drift.sh'; exit 1; }
+      - name: pr-review fixtures, the base command's red report
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-base-red.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-red.sh'; exit 1; }
+      - name: pr-review fixtures, the paths-ignore settle
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-base-settle.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-settle.sh'; exit 1; }
+      - name: pr-review fixtures, what the base wait loop decides
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-base-verdict.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-verdict.sh'; exit 1; }
+      - name: pr-review fixtures, absent vs not yet
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-checks-absent.sh || { echo '::error title=Git Bash suite failed::test-pr-review-checks-absent.sh'; exit 1; }
+      - name: pr-review fixtures, review rounds
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-rounds.sh || { echo '::error title=Git Bash suite failed::test-pr-review-rounds.sh'; exit 1; }
+      - name: pr-review fixtures, merge
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-merge.sh || { echo '::error title=Git Bash suite failed::test-pr-review-merge.sh'; exit 1; }
+      - name: pr-review fixtures, status and watch
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-status.sh || { echo '::error title=Git Bash suite failed::test-pr-review-status.sh'; exit 1; }
+      - name: pr-review fixtures, what ends a watch
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-watch.sh || { echo '::error title=Git Bash suite failed::test-pr-review-watch.sh'; exit 1; }
+      - name: pr-review fixtures, the folded reply and resolve
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-reply.sh || { echo '::error title=Git Bash suite failed::test-pr-review-reply.sh'; exit 1; }
+      - name: pr-review fixtures, the run await
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: ship-pr/scripts/test-pr-review-run-watch.sh || { echo '::error title=Git Bash suite failed::test-pr-review-run-watch.sh'; exit 1; }
+      - name: Keep the cleanup suite's per-case logs
+        if: failure() || cancelled() || steps.cleanup.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-logs-git-bash
+          path: ${{ runner.temp }}/cleanup-logs
+          if-no-files-found: ignore

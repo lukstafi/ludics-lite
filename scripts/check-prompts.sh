@@ -22,7 +22,8 @@
 # prompt cannot land unindexed. That is a lookup, not a rendering claim: see `indexed` below for
 # what it stopped asserting when the table scanner went (ludics-lite#75).
 # Five cross-file agreements ride along, each pinning a fact the prompts only restate: every test
-# fixture has a command in the README's register and a run line on each CI platform it needs, and
+# fixture has a command in the README's register and a run line on each CI platform it needs
+# (Windows too, for ship-pr's shell suites and the PowerShell fixtures), and
 # every file that quotes the mac-studio correctness-slot count quotes the one fleet-worker.sh
 # actually defaults to (ludics-lite#160) -- which files those are is discovered, not listed.
 # A third reads the routines sync-routines.sh installs off its own LOCAL_ROUTINES line and
@@ -357,6 +358,9 @@ check_fixtures() {
       *.ps1) platforms=windows ;;
       # These probe Ubuntu production reporters and the Ubuntu-only hostile runner.
       scripts/test-workflow-reporters.py|ship-pr/scripts/test-pr-review-hostile.py) platforms=ubuntu ;;
+      # ship-pr's shell suites run under Git Bash too, in the git-bash job on windows-latest
+      # (ludics-lite#318), so a new one cannot land with its Windows leg quietly left out.
+      ship-pr/scripts/test-*.sh) platforms="ubuntu macos windows" ;;
       *) platforms="ubuntu macos" ;;
     esac
     if [ ! -f "$ROOT/README.md" ] || ! fixture_command "$ROOT/README.md" "$suite"; then
