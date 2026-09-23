@@ -1206,6 +1206,51 @@ cleanup_edit "$CLEANUP_HELPER" 's/^\(  --base .*\)$/\1\
 expect "a brace inside the heredoc does not end the listing" 1 \
   "$CLEANUP_PROMPT: names no '--dry-run'" -- "$CP" "$R"
 
+# usage()'s arity is held to the helper's own parser: ludics-lite#302 found `--force-integrated`
+# listed with no placeholder while its arm did `shift 2`, and the prompt's side skips a value by
+# that arity. The real pair agrees, arm by arm.
+cleanup_tree
+expect "the real usage() and the real parser agree on every option's arity" 0 \
+  "usage() agrees with its parser on each one's arity" -- "$CP" "$R"
+# #302's own shape: a placeholder dropped from the listing while the arm still takes a value.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^  --base <branch>  /  --base           /'
+expect "a listing that lost its placeholder over a 'shift 2' arm is refused" 1 \
+  "usage() lists '--base' with no <value> placeholder, but its parser arm does 'shift 2'" -- "$CP" "$R"
+# ...and the other way: a placeholder listed over an arm that is flag-shaped.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/shift 2/shift/'
+expect "a placeholder listed over a flag-shaped 'shift' arm is refused" 1 \
+  "usage() lists '--regenerable' with a <value> placeholder, but its parser arm does 'shift' and takes none" \
+  -- "$CP" "$R"
+# An arm usage() never lists is an option the operator cannot learn of.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^  --base)$/  --dry-run)\
+    DRY_RUN=1\
+    shift\
+    ;;\
+  --base)/'
+expect "a parser arm with no usage() listing is refused" 1 \
+  "the option parser takes '--dry-run', which usage() does not list" -- "$CP" "$R"
+# ...and a listing with no arm is an option the helper refuses as usage.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/d'
+expect "a usage() listing with no parser arm is refused" 1 \
+  "usage() lists '--regenerable', for which the option parser has no '--regenerable)' arm" -- "$CP" "$R"
+# A one-line arm is an arm, read to its own `;;`, and a `shift 2` in a comment is not its shift.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^  --base <branch>  /  --base           /'
+cleanup_edit "$CLEANUP_HELPER" '/^  --base)$/,/;;/d'
+cleanup_edit "$CLEANUP_HELPER" 's/^  --force-integrated)$/  --base) BASE_BRANCH=main; shift ;; # not shift 2\
+  --force-integrated)/'
+expect "a one-line flag arm agrees with a bare listing, whatever its comment says" 0 \
+  "usage() agrees with its parser on each one's arity" -- "$CP" "$R"
+# A parser this reader cannot find is refused, not read as agreeing with nothing.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^while \[ "\$#" -gt 0 \]; do$/while (( $# )); do/'
+expect "a helper whose option parser is not in the read shape is refused" 1 \
+  "has no option parser this reader can see" -- "$CP" "$R"
+
 # A helper with no prompt to document it is refused; a root with no helper carries no obligation,
 # as with the sync script and the worker.
 cleanup_tree
