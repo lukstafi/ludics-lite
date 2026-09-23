@@ -36,12 +36,7 @@ name. Check: `rocminfo | grep -E "Marketing|gfx"`, or `nvidia-smi -L` on rog.
 **Only a run that takes the sleep guard holds its box awake.** `execution slot` and `execution
 hold` hold a logind block inhibitor on `sleep:idle` for as long as a run lives, and the OS refuses
 `wake-lab.sh sleep` while it is held ([executions.md](executions.md#the-os-level-sleep-guard),
-ludics-lite#317). A run started any other way, such as a bare `ssh <box> cmd` or a sweep lane,
-holds nothing. tuf is the only laptop (DMI chassis 10, `BAT0`, a lid); rog is an ASUS
-NUC15JNKU9X7 and minix an Elite ER939-AI, both chassis 35 (mini PC) with no battery. On battery,
-GNOME suspends tuf after 900 s idle, and ssh traffic is not user input; a held inhibitor should
-refuse that request, but this was not observed on battery. Closing tuf's lid suspends it even
-with an inhibitor held, because logind's `LidSwitchIgnoreInhibited` defaults to yes. Idle suspend
-on AC is off on all three: Ubuntu's gschema override sets the timeout to 0, and that override
-also governs the GDM greeter. Check: `wake-lab.sh status <box>`, where `sleep-blocks=<n>` counts
-the live holders.
+ludics-lite#317); a run started any other way holds nothing. tuf is the only laptop: on external
+power it ignores its lid (the setup's logind drop-in), and on battery closing the lid suspends it
+whatever is held. Check: `wake-lab.sh status <box>`, where `sleep-blocks=<n>` counts the live
+holders.
