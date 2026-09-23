@@ -1954,17 +1954,23 @@ fi
 # The local side is complete and read back; from here a refusal leaves only the public branch, whose
 # tip RECOVERY_REF still holds locally, so every message below says where the local state went.
 LOCAL_DONE="local $BRANCH was deleted and its session archived at $SESSION_ARCHIVED_WORKTREE; recovery retained at $RECOVERY_REF"
+# A refusal that leaves origin/$BRANCH in place ends with the one command that finishes the job,
+# leased at the tip it names: the session is archived by now, so this helper cannot be re-run.
+finish_remote_deletion() {
+  printf 'to finish, run: git -C %q push %q %q %q' "$MAIN" \
+    "--force-with-lease=refs/heads/$BRANCH:$1" "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH"
+}
 if [ -n "$REMOTE_BRANCH_OID" ]; then
   ! local_topic_reappeared ||
-    fail "$LOCAL_DONE; but local $BRANCH reappeared (at or over $CURRENT_TOPIC_OID) before the remote deletion, so origin/$BRANCH was left in place"
+    fail "$LOCAL_DONE; but local $BRANCH reappeared (at or over $CURRENT_TOPIC_OID) before the remote deletion, so origin/$BRANCH was left in place; $(finish_remote_deletion "$REMOTE_BRANCH_OID")"
   if ! git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" \
     "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH"; then
     REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
     REMOTE_BRANCH_STATUS=$?
     case "$REMOTE_BRANCH_STATUS" in
     2) printf '%s\n' "post-merge-cleanup.sh: origin/$BRANCH disappeared before its leased deletion (nothing left to delete)" >&2 ;;
-    0) fail "$LOCAL_DONE; but origin/$BRANCH moved to ${REMOTE_BRANCH_LINE%%[[:space:]]*} before its leased deletion, and its newer tip was left in place" ;;
-    *) fail "$LOCAL_DONE; but origin/$BRANCH could not be lease-deleted at $REMOTE_BRANCH_OID and was left in place" ;;
+    0) fail "$LOCAL_DONE; but origin/$BRANCH moved to ${REMOTE_BRANCH_LINE%%[[:space:]]*} before its leased deletion, and its newer tip was left in place; $(finish_remote_deletion "${REMOTE_BRANCH_LINE%%[[:space:]]*}")" ;;
+    *) fail "$LOCAL_DONE; but origin/$BRANCH could not be lease-deleted at $REMOTE_BRANCH_OID and was left in place; $(finish_remote_deletion "$REMOTE_BRANCH_OID")" ;;
     esac
   fi
 else
