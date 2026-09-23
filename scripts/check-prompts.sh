@@ -22,7 +22,8 @@
 # prompt cannot land unindexed. That is a lookup, not a rendering claim: see `indexed` below for
 # what it stopped asserting when the table scanner went (ludics-lite#75).
 # Five cross-file agreements ride along, each pinning a fact the prompts only restate: every test
-# fixture has a command in the README's register and a run line on each CI platform it needs, and
+# fixture has a command in the README's register and a run line on each CI platform it needs
+# (Windows too, for ship-pr's shell suites and the PowerShell fixtures), and
 # every file that quotes the mac-studio correctness-slot count quotes the one fleet-worker.sh
 # actually defaults to (ludics-lite#160) -- which files those are is discovered, not listed.
 # A third reads the routines sync-routines.sh installs off its own LOCAL_ROUTINES line and
@@ -321,11 +322,17 @@ check_index() {
 # an inline run command on each required platform. This deliberately checks the workflow's
 # current simple shape (literal runs-on and run), not arbitrary YAML or shell execution.
 # Comments, names, echo arguments and longer filenames cannot stand in for a command.
+# A required platform is a runner (`ubuntu`, `macos`, `windows`: the job's `runs-on`, less
+# `-latest`), or `git-bash`: a run line in the job whose key is `git-bash` on a windows runner.
+# Every Windows job shares the runner, so a ship-pr suite run by `windows-driver`, whose steps are
+# PowerShell, must not count as its Git Bash leg (PR #321, review round 2). The job key is as far
+# as this reads: that the job's shell really is Git Bash is held by the job's own first step,
+# which proves it from inside that shell, and not by this scan.
 fixture_command() {
   CP_SUITE="$2" CP_PLATFORM="${3:-}" awk '
     BEGIN { want = ENVIRON["CP_SUITE"]; required = ENVIRON["CP_PLATFORM"] }
     /^## / { tests = ($0 == "## Tests") }
-    /^  [A-Za-z0-9_-]+:/ { platform = "" }
+    /^  [A-Za-z0-9_-]+:/ { platform = ""; job = $1; sub(/:$/, "", job) }
     /^[[:space:]]*runs-on: / {
       platform = $2; sub(/-latest$/, "", platform)
     }
@@ -334,7 +341,9 @@ fixture_command() {
       line = $0
       sub(/^[[:space:]]*/, "", line)
       if (required != "") {
-        if (platform != required || line !~ /^(- )?run: /) next
+        if (required == "git-bash") { if (job != "git-bash" || platform != "windows") next }
+        else if (platform != required) next
+        if (line !~ /^(- )?run: /) next
         sub(/^(- )?run: /, "", line)
       }
       sub(/^python3[[:space:]]+/, "", line)
@@ -359,6 +368,9 @@ check_fixtures() {
       *.ps1) platforms=windows ;;
       # These probe Ubuntu production reporters and the Ubuntu-only hostile runner.
       scripts/test-workflow-reporters.py|ship-pr/scripts/test-pr-review-hostile.py) platforms=ubuntu ;;
+      # ship-pr's shell suites run under Git Bash too, in the git-bash job on windows-latest
+      # (ludics-lite#318), so a new one cannot land with its Windows leg quietly left out.
+      ship-pr/scripts/test-*.sh) platforms="ubuntu macos git-bash" ;;
       *) platforms="ubuntu macos" ;;
     esac
     if [ ! -f "$ROOT/README.md" ] || ! fixture_command "$ROOT/README.md" "$suite"; then

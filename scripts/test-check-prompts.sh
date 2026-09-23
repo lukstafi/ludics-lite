@@ -351,7 +351,7 @@ fixture_tree() {
   mkdir -p "$R/alpha/scripts" "$R/alpha/hooks" "$R/issue-wave/scripts" "$R/ship-pr/scripts" "$R/.github/workflows"
   touch "$R/alpha/scripts/test-shell.sh" "$R/alpha/scripts/test-python.py" "$R/alpha/hooks/test-hook.py" \
     "$R/scripts/test-workflow-reporters.py" "$R/ship-pr/scripts/test-pr-review-hostile.py" \
-    "$R/issue-wave/scripts/test-windows-driver.ps1"
+    "$R/issue-wave/scripts/test-windows-driver.ps1" "$R/ship-pr/scripts/test-shell.sh"
   cat >> "$R/README.md" <<'EOF'
 ## Tests
 
@@ -361,6 +361,7 @@ python3 alpha/hooks/test-hook.py
 python3 scripts/test-workflow-reporters.py
 python3 ship-pr/scripts/test-pr-review-hostile.py
 ./issue-wave/scripts/test-windows-driver.ps1
+ship-pr/scripts/test-shell.sh
 EOF
   cat > "$R/.github/workflows/skill-scripts.yml" <<'EOF'
 jobs:
@@ -372,21 +373,30 @@ jobs:
       - run: python3 alpha/hooks/test-hook.py
       - run: python3 scripts/test-workflow-reporters.py
       - run: python3 ship-pr/scripts/test-pr-review-hostile.py
+      - run: ship-pr/scripts/test-shell.sh
   macos:
     runs-on: macos-latest
     steps:
       - run: alpha/scripts/test-shell.sh || { echo failed; exit 1; }
       - run: python3 alpha/scripts/test-python.py
       - run: python3 alpha/hooks/test-hook.py
+      - run: ship-pr/scripts/test-shell.sh || { echo failed; exit 1; }
   windows:
     runs-on: windows-latest
     steps:
       - run: ./issue-wave/scripts/test-windows-driver.ps1
+  git-bash:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: ship-pr/scripts/test-shell.sh || { echo '::error title=Git Bash suite failed::test-shell.sh'; exit 1; }
 EOF
 }
 fixture_tree
 expect "shell, Python, hook and platform-specific register passes" 0 'required CI platforms agree' -- "$CP" "$R"
-for suite in alpha/scripts/test-shell.sh alpha/scripts/test-python.py alpha/hooks/test-hook.py scripts/test-workflow-reporters.py issue-wave/scripts/test-windows-driver.ps1; do
+for suite in alpha/scripts/test-shell.sh alpha/scripts/test-python.py alpha/hooks/test-hook.py scripts/test-workflow-reporters.py issue-wave/scripts/test-windows-driver.ps1 ship-pr/scripts/test-shell.sh; do
   fixture_tree
   # Keep prose and a longer filename: neither substitutes for a registered command.
   CP_REMOVE="$suite" awk 'index($0, ENVIRON["CP_REMOVE"]) { print "Mention: " $0; print $0 ".extra"; next } { print }' \
@@ -394,11 +404,16 @@ for suite in alpha/scripts/test-shell.sh alpha/scripts/test-python.py alpha/hook
   mv "$R/register.tmp" "$R/README.md"
   expect "README refuses missing $suite command" 1 "fixture '$suite' has no command line" -- "$CP" "$R"
 done
-for platform in ubuntu macos; do
-  for suite in alpha/scripts/test-shell.sh alpha/scripts/test-python.py alpha/hooks/test-hook.py; do
+# ship-pr's shell suites owe a Git Bash leg on Windows as well (ludics-lite#318); the other shell
+# suites do not, which the passing tree above already shows for alpha/scripts/test-shell.sh.
+for platform in ubuntu macos git-bash; do
+  suites="ship-pr/scripts/test-shell.sh"
+  [ "$platform" = git-bash ] || suites="alpha/scripts/test-shell.sh alpha/scripts/test-python.py alpha/hooks/test-hook.py $suites"
+  for suite in $suites; do
     fixture_tree
     CP_REMOVE="$suite" CP_OS="$platform" awk '
-      /runs-on:/ { os=$2; sub(/-latest$/, "", os) }
+      /^  [A-Za-z0-9_-]+:/ { job=$1; sub(/:$/, "", job) }
+      /runs-on:/ { os=$2; sub(/-latest$/, "", os); if (job == "git-bash") os = "git-bash" }
       os == ENVIRON["CP_OS"] && index($0, ENVIRON["CP_REMOVE"]) {
         print "      # run: " ENVIRON["CP_REMOVE"]
         print "      - name: " ENVIRON["CP_REMOVE"]
@@ -412,6 +427,25 @@ for platform in ubuntu macos; do
     expect "$platform refuses missing $suite execution" 1 "fixture '$suite' has no inline run command on $platform" -- "$CP" "$R"
   done
 done
+# The Git Bash leg is the git-bash JOB, not any Windows runner: the same run line moved into the
+# PowerShell windows-driver job shares the runner and is still refused (PR #321, review round 2),
+# and so is a job keyed git-bash that runs somewhere other than Windows.
+fixture_tree
+awk '
+  /^  git-bash:/ { skip = 1 }
+  skip { next }
+  { print }
+  /- run: \.\/issue-wave\/scripts\/test-windows-driver\.ps1/ { print "      - run: ship-pr/scripts/test-shell.sh" }
+' "$R/.github/workflows/skill-scripts.yml" > "$R/workflow.tmp"
+mv "$R/workflow.tmp" "$R/.github/workflows/skill-scripts.yml"
+expect "a ship-pr suite run by another Windows job is no Git Bash leg" 1 \
+  "fixture 'ship-pr/scripts/test-shell.sh' has no inline run command on git-bash" -- "$CP" "$R"
+fixture_tree
+awk '/^  git-bash:/ { gb = 1 } gb && /runs-on:/ { sub(/windows-latest/, "ubuntu-latest"); gb = 0 } { print }' \
+  "$R/.github/workflows/skill-scripts.yml" > "$R/workflow.tmp"
+mv "$R/workflow.tmp" "$R/.github/workflows/skill-scripts.yml"
+expect "...nor is a job keyed git-bash on another runner" 1 \
+  "fixture 'ship-pr/scripts/test-shell.sh' has no inline run command on git-bash" -- "$CP" "$R"
 for suite in scripts/test-workflow-reporters.py ship-pr/scripts/test-pr-review-hostile.py issue-wave/scripts/test-windows-driver.ps1; do
   fixture_tree
   CP_REMOVE="$suite" awk 'index($0, ENVIRON["CP_REMOVE"]) == 0' "$R/.github/workflows/skill-scripts.yml" > "$R/workflow.tmp"

@@ -298,8 +298,9 @@ state what each check establishes rather than enumerate the shapes that would fo
 requires a line in this Tests section that is that path once an optional `python3` or `./` prefix is
 stripped — the two forms the register itself uses — and an inline `run:` line in
 `.github/workflows/skill-scripts.yml` on each platform that file needs — both Ubuntu and macOS for a
-shell suite, while a `.ps1` goes to Windows on its extension and the two Ubuntu-only Python fixtures
-are the ones named by path in the checker. The lookup is the section and not the block — any such
+shell suite, and for one under `ship-pr/scripts/` a run line in the `git-bash` job itself (not
+merely on a Windows runner, which the PowerShell job shares), while a `.ps1` goes to Windows on its extension and the two Ubuntu-only Python fixtures are the
+ones named by path in the checker. The lookup is the section and not the block — any such
 line anywhere under `## Tests` satisfies it, so the register above is where those lines are kept by
 convention rather than by enforcement. The glob asks the filename, not the file, so it cannot tell a
 suite from a helper that is only ever sourced: such a helper either earns the name by carrying its
@@ -416,9 +417,15 @@ PR included. The third is unconditional for a reason of its own: the routines-ta
 is broken by exactly the all-Markdown PR the classification calls prompt-only.
 
 The reporter and hostile-runner Python controls run on Ubuntu; the driver fixture runs on Windows.
-`check-prompts.sh` checks each fixture file against this command register and the inline CI run
-commands on its required platforms, so a new shell or Python suite cannot silently miss either
-Unix platform. Platform-specific fixtures have explicit exceptions in the checker.
+ship-pr's shell suites run a third time under Git Bash, in the `git-bash` job on `windows-latest`
+(ludics-lite#318): Windows is a supported platform for those scripts, and since the fleet's GPU
+boxes boot native Ubuntu a fleet leg there costs a reboot. Its first step proves the platform from
+inside the shell the suites run in (`uname -s` is `MINGW*`/`MSYS*` and `git --version` carries
+`.windows.`), every suite is gated on that proof, and the job's header names what it does not
+cover and why. `check-prompts.sh` checks each fixture file against this command register and the
+inline CI run commands on its required platforms, so a new shell or Python suite cannot silently
+miss either Unix platform, nor a new `ship-pr/scripts/test-*.sh` its Git Bash leg.
+Platform-specific fixtures have explicit exceptions in the checker.
 
 `check-prompts.sh` is the prompt hygiene check itself: every skill and routine `SKILL.md` opens
 with YAML frontmatter carrying one `name`, equal to its directory, and one single-line
