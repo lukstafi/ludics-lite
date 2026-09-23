@@ -323,7 +323,9 @@ check_index() {
 # current simple shape (literal runs-on and run), not arbitrary YAML or shell execution.
 # Comments, names, echo arguments and longer filenames cannot stand in for a command.
 # A required platform is a runner (`ubuntu`, `macos`, `windows`: the job's `runs-on`, less
-# `-latest`), or `git-bash`: a run line in the job whose key is `git-bash` on a windows runner.
+# `-latest`) in skill-scripts.yml, or `git-bash`: a run line in the job whose key is `git-bash` on
+# a windows runner in windows-git-bash.yml, which runs nightly and on dispatch rather than per push
+# (ludics-lite#339), so a leg anywhere else is not the one that runs.
 # Every Windows job shares the runner, so a ship-pr suite run by `windows-driver`, whose steps are
 # PowerShell, must not count as its Git Bash leg (PR #321, review round 2). The job key is as far
 # as this reads: that the job's shell really is Git Bash is held by the job's own first step,
@@ -356,8 +358,7 @@ fixture_command() {
 }
 
 check_fixtures() {
-  local suite platforms platform bad=0 count=0
-  local workflow=.github/workflows/skill-scripts.yml
+  local suite platforms platform workflow bad=0 count=0
   # Include root scripts, skill scripts and hook fixtures; PowerShell belongs to Windows.
   for suite in "$ROOT"/scripts/test-* "$ROOT"/*/scripts/test-* "$ROOT"/*/hooks/test-*; do
     [ -f "$suite" ] || continue
@@ -368,7 +369,7 @@ check_fixtures() {
       *.ps1) platforms=windows ;;
       # These probe Ubuntu production reporters and the Ubuntu-only hostile runner.
       scripts/test-workflow-reporters.py|ship-pr/scripts/test-pr-review-hostile.py) platforms=ubuntu ;;
-      # ship-pr's shell suites run under Git Bash too, in the git-bash job on windows-latest
+      # ship-pr's shell suites run under Git Bash too, in windows-git-bash.yml's git-bash job
       # (ludics-lite#318), so a new one cannot land with its Windows leg quietly left out.
       ship-pr/scripts/test-*.sh) platforms="ubuntu macos git-bash" ;;
       *) platforms="ubuntu macos" ;;
@@ -377,6 +378,8 @@ check_fixtures() {
       ko README.md "fixture '$suite' has no command line in the test register"; bad=1
     fi
     for platform in $platforms; do
+      workflow=.github/workflows/skill-scripts.yml
+      [ "$platform" != git-bash ] || workflow=.github/workflows/windows-git-bash.yml
       if [ ! -f "$ROOT/$workflow" ] || ! fixture_command "$ROOT/$workflow" "$suite" "$platform"; then
         ko "$workflow" "fixture '$suite' has no inline run command on $platform"; bad=1
       fi

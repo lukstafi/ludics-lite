@@ -137,7 +137,8 @@ the newest verdict legitimately trails the tip by a commit or several — that i
 not a stale reading, and the printed SHA is what lets you tell them apart.
 
 For OCANNL, “full matrix” means the ordinary Linux/macOS PR matrix. Needed Windows evidence
-comes from CI: the `git-bash` job for ship-pr's scripts, and for OCANNL a `windows_only: true`
+comes from CI: for ship-pr's scripts the Git Bash workflow, dispatched on the branch
+(`gh workflow run windows-git-bash.yml --ref <branch>`), and for OCANNL a `windows_only: true`
 dispatch with the full `expected_sha`, verified on its head and both Windows jobs' executed
 results; never wait on the scheduled sweep. Use `rog-nv-win` or `minix-amd-win` only when it is
 booted into Windows or the check needs its hardware: invoke `"C:\Program Files\Git\bin\bash.exe"`
