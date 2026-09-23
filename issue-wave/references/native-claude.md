@@ -19,8 +19,9 @@ woken. What holds a turn is a foreground Bash call, capped at 600 s. So:
   on exit 124 until the run's own status comes back;
 - anything that can outlast the cap, ship-pr's `pr-review.sh watch` and `merge --wait` included
   (never run in the foreground: a live 👀 can stretch a watch to its 20-minute grace), runs as a
-  background task that keeps its status out of its output, in a directory of its own (`d`,
-  under the scratchpad with the issue prefix):
+  background task that keeps its status out of its output, in a fresh directory of its own per
+  run (`d`, under the scratchpad with the issue prefix; a `pid` or `rc` left by an earlier run
+  would be read as this one's):
 
   ```bash
   echo $$ > "$d/pid"; <cmd> > "$d/log" 2>&1; echo $? > "$d/rc"
@@ -29,12 +30,15 @@ woken. What holds a turn is a foreground Bash call, capped at 600 s. So:
   and the worker blocks on it with a foreground call that ends before the cap by itself:
 
   ```bash
-  for _ in {1..108}; do [ -s "$d/rc" ] && break; kill -0 "$(cat "$d/pid")" 2>/dev/null || break; sleep 5; done
-  if [ -s "$d/rc" ]; then echo "rc=$(cat "$d/rc")"; elif kill -0 "$(cat "$d/pid")" 2>/dev/null; then echo RUNNING; else echo DIED; fi
+  for _ in {1..108}; do [ -s "$d/rc" ] && break; [ -s "$d/pid" ] && ! kill -0 "$(cat "$d/pid")" 2>/dev/null && break; sleep 5; done
+  if [ -s "$d/rc" ]; then echo "rc=$(cat "$d/rc")"; elif [ ! -s "$d/pid" ]; then echo STARTING
+  elif kill -0 "$(cat "$d/pid")" 2>/dev/null; then echo RUNNING; else echo DIED; fi
   ```
 
   `rc=` is the command's exit status, read from a file its output cannot write, so a review
-  body quoting `rc=` cannot end the wait. `RUNNING` is re-issued. `DIED` means the harness
+  body quoting `rc=` cannot end the wait. `RUNNING` is re-issued. A task that has not yet
+  written its pid is starting, not dead: `STARTING` is re-issued once, and a second one means the
+  launch itself failed, so start it again. `DIED` means the harness
   killed the task before it finished (observed at ~40 min for a backgrounded `merge --wait`),
   and says nothing about what the command was reading: re-arm it, and for `merge --wait` first
   re-read the merge state as ship-pr's *The approval is one gate* says.
