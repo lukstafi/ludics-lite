@@ -294,8 +294,8 @@ state what each check establishes rather than enumerate the shapes that would fo
 requires a line in this Tests section that is that path once an optional `python3` or `./` prefix is
 stripped — the two forms the register itself uses — and an inline `run:` line in
 `.github/workflows/skill-scripts.yml` on each platform that file needs — both Ubuntu and macOS for a
-shell suite, and Windows as well for one under `ship-pr/scripts/`, which the `git-bash` job runs,
-while a `.ps1` goes to Windows on its extension and the two Ubuntu-only Python fixtures are the
+shell suite, and for one under `ship-pr/scripts/` a run line in the `git-bash` job itself (not
+merely on a Windows runner, which the PowerShell job shares), while a `.ps1` goes to Windows on its extension and the two Ubuntu-only Python fixtures are the
 ones named by path in the checker. The lookup is the section and not the block — any such
 line anywhere under `## Tests` satisfies it, so the register above is where those lines are kept by
 convention rather than by enforcement. The glob asks the filename, not the file, so it cannot tell a
