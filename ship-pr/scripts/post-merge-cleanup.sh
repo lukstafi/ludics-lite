@@ -1980,9 +1980,16 @@ if [ -n "$REMOTE_BRANCH_OID" ]; then
     "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH"; then
     REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
     REMOTE_BRANCH_STATUS=$?
+    REMOTE_BRANCH_TIP=${REMOTE_BRANCH_LINE%%[[:space:]]*}
+    # A push refused with the branch unmoved (a pre-push hook, a permission or protected-branch
+    # rejection, a dropped connection) is not a race: the tip is still the validated one.
     case "$REMOTE_BRANCH_STATUS" in
     2) printf '%s\n' "post-merge-cleanup.sh: origin/$BRANCH disappeared before its leased deletion (nothing left to delete)" >&2 ;;
-    0) fail "$LOCAL_DONE; but origin/$BRANCH moved to ${REMOTE_BRANCH_LINE%%[[:space:]]*} before its leased deletion, and its newer tip was left in place; that tip was never validated, so only once it is confirmed integrated into origin/$BASE_BRANCH, $(finish_remote_deletion "${REMOTE_BRANCH_LINE%%[[:space:]]*}")" ;;
+    0)
+      [ "$REMOTE_BRANCH_TIP" != "$REMOTE_BRANCH_OID" ] ||
+        fail "$LOCAL_DONE; but the leased deletion of origin/$BRANCH was refused while it was still at the validated tip $REMOTE_BRANCH_OID (git's own output above names why), and it was left in place; once that cause is resolved, $(finish_remote_deletion "$REMOTE_BRANCH_OID")"
+      fail "$LOCAL_DONE; but origin/$BRANCH moved to $REMOTE_BRANCH_TIP before its leased deletion, and its newer tip was left in place; that tip was never validated, so only once it is confirmed integrated into origin/$BASE_BRANCH, $(finish_remote_deletion "$REMOTE_BRANCH_TIP")"
+      ;;
     *) fail "$LOCAL_DONE; but origin/$BRANCH could not be lease-deleted at $REMOTE_BRANCH_OID and was left in place; $(finish_remote_deletion "$REMOTE_BRANCH_OID")" ;;
     esac
   fi
