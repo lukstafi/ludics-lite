@@ -256,6 +256,62 @@ live_pat() {
 orphaned() { ! alive "$1" && pgrep -f -- "$(live_pat "$1")" >/dev/null 2>&1; }
 running() { alive "$1" || orphaned "$1"; }
 state_of() { if alive "$1"; then echo RUNNING; elif orphaned "$1"; then echo ORPHANED; elif [ -f "$WORKERS/$1/exit" ]; then echo "EXITED($(cat "$WORKERS/$1/exit"))"; else echo VANISHED; fi; }
+# A stale tmux server environment (ludics-lite#327). A CLI worker's `bash run.sh` reads no startup
+# file, and a new tmux session takes the SERVER's environment, not the asking shell's, so an
+# env.sh or gpu.sh edit reaches no CLI worker on a box whose server predates it -- silently: a
+# server started before gpu.sh dropped ROCM_PATH=/usr (2026-09-22) would have gone on handing
+# workers the value that broke hipcc's bitcode discovery. The reference is what a server started
+# NOW would get, which is this script's own environment: on a remote box it runs under
+# `ssh <box> "bash -s"`, the fresh non-login ssh shell whose ~/.bashrc sources env.sh (the
+# launch that starts a server runs under the same one), and on the local box under a `bash -s`
+# that reads no startup file, as that launch does. The coordinator's own environment never
+# enters a remote comparison. No server running passes: the next launch starts a fresh one.
+# Prints the refusal and returns 1 on a stale server. The preflight reports it early, and every
+# far-side script that creates a worker session (launch, unstick) repeats it just before
+# `new-session`: the launch's fetch and base gate can take minutes, and a resume creates a
+# session with no preflight at all.
+TMUX_ENV_VARS="PATH ROCM_PATH HIP_PATH OPAM_SWITCH_PREFIX"
+tmux_env_check() {
+  local sessions genv refreshed v line skip sset sval fset fval diff="" workers="" others="" tmx
+  genv=$(tm show-environment -g 2>/dev/null) || return 0   # no server running
+  # `exit-empty off` keeps a server alive with no session at all, so the server is found by its
+  # environment, never by its session list; an unreadable list is an empty one.
+  sessions=$(tm list-sessions -F '#{session_name}' 2>/dev/null) || sessions=""
+  # A variable named in `update-environment` is copied from the launching client into every new
+  # session (removed there when the client lacks it), so the worker gets the fresh shell's value
+  # whatever the global one says: comparing it would refuse a safe launch.
+  refreshed=$(tm show-options -gv update-environment 2>/dev/null)
+  for v in $TMUX_ENV_VARS; do
+    skip=0
+    while IFS= read -r line; do [ "$line" = "$v" ] && skip=1; done <<< "$refreshed"
+    [ "$skip" = 0 ] || continue
+    # `VAR=value` is set, `-VAR` is removed from the global environment, no line is never set.
+    sset=0; sval=""
+    while IFS= read -r line; do
+      case "$line" in "$v="*) sset=1; sval=${line#"$v="} ;; "-$v") sset=0; sval="" ;; esac
+    done <<< "$genv"
+    fset=0; fval=""; if [ -n "${!v+x}" ]; then fset=1; fval=${!v}; fi
+    [ "$sset" = "$fset" ] && [ "$sval" = "$fval" ] && continue
+    [ "$sset" = 1 ] || sval="unset"; [ "$fset" = 1 ] || fval="unset"
+    diff="$diff, $v is $sval in the server but $fval in a fresh shell"
+  done
+  [ -n "$diff" ] || return 0
+  # Every live worker is an iw-<name> session on this socket (`ls` reads RUNNING from the same
+  # sessions), and kill-server ends every session the server holds.
+  while IFS= read -r line; do
+    case "$line" in iw-*) workers="$workers $line" ;; ?*) others="$others $line" ;; esac
+  done <<< "$sessions"
+  if [ -n "$TMUX_SOCKET" ]; then tmx="tmux -L $(printf '%q' "$TMUX_SOCKET")"; else tmx=tmux; fi
+  # Whichever branch names kill-server also names what else it would end: on the default socket
+  # those are the user's own sessions.
+  others=${others:+ (kill-server also ends its non-worker session(s):$others)}
+  if [ -n "$workers" ]; then
+    echo "stale tmux server environment (${diff#, }): a CLI worker started now would inherit the server's values; wait for its live worker session(s) (${workers# }; \`fleet-worker.sh ls $BOX\`) to finish, then \`$tmx kill-server\` if it outlives them$others"
+  else
+    echo "stale tmux server environment (${diff#, }): a CLI worker started now would inherit the server's values; no worker session is live on it, so restart it with \`$tmx kill-server\`$others and try again"
+  fi
+  return 1
+}
 EOF
 }
 
@@ -458,7 +514,10 @@ elif [ "$codex" = 0 ]; then
     fi
   fi
 fi
-case "$codex" in native|native-claude) ;; *) command -v tmux >/dev/null 2>&1 || note "no tmux" ;; esac
+case "$codex" in
+  native|native-claude) ;;
+  *) if command -v tmux >/dev/null 2>&1; then msg=$(tmux_env_check) || note "$msg"; else note "no tmux"; fi ;;
+esac
 command -v jq >/dev/null 2>&1 || note "no jq"
 # Every correctness batch on this box now runs under `execution slot`, whose N-holder lock is a
 # real flock taken by python3 (ludics-lite#160), so Python is no longer an anchor-only need.
@@ -802,6 +861,7 @@ mv -f "$incoming" "$d/brief.md" 2>/dev/null && [ -f "$d/brief.md" ] || refuse "c
   echo "launched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "resumes=0"; echo "turn_offset=0"
   if [ -n "$sid" ]; then echo "session=$sid"; fi
 } > "$d/meta" || refuse "cannot write $d/meta"
+msg=$(tmux_env_check) || refuse "$msg"   # the preflight's read may be minutes old
 tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || refuse "tmux failed"
 started=1
 # Ownership is now visible as a live session; the box-wide lock can go.
@@ -1041,6 +1101,8 @@ done
 if pgrep -f -- "$pat" >/dev/null 2>&1; then
   echo "UNSTICK REFUSED $BOX/$name: a process still carries session $sid after TERM: $(pgrep -fl -- "$pat" | head -n 3 | tr '\n' ';')"; exit 1
 fi
+# A resume creates a session too, with no preflight in front of it.
+msg=$(tmux_env_check) || { echo "UNSTICK REFUSED $BOX/$name: $msg"; exit 1; }
 {
   printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
   case "$kind" in

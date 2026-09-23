@@ -164,6 +164,9 @@ done
 # wait — and is checked here as that arithmetic rather than against a literal, so a gate that
 # moved either knob and left the ceiling behind fails here (ludics-lite#175).
 case " $* " in *" --wait=$((SHIP_PR_BASE_ABSENT_GRACE + SHIP_PR_CHECKS_INTERVAL)) "*) ;; *) exit 4 ;; esac
+# SHIM_BASE_TOUCH: a marker this read leaves behind, so a test can change the world between the
+# preflight and the launch's far side (the tmux shim's SHIM_TMUX_GENV_WHEN reads it).
+[ -z "${SHIM_BASE_TOUCH:-}" ] || touch "$SHIM_BASE_TOUCH"
 if [ -n "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] && [ ! -e "$SHIM_BASE_REQUIRE_PREFLIGHT" ]; then
   echo 'base read occurred before preflight'; exit 3
 fi
@@ -251,6 +254,23 @@ REAL_TMUX=$(command -v tmux)
 cat > "$TMP/bin/tmux" <<EOF
 #!/usr/bin/env bash
 if [ -n "\${SHIM_TMUX_FAIL_NEW:-}" ]; then case " \$* " in *" new-session "*) echo "shim: tmux refuses new-session" >&2; exit 1 ;; esac; fi
+# The server the preflight's environment check reads (ludics-lite#327): SHIM_TMUX_GENV names a
+# file holding \`show-environment -g\` output, or \`none\` for no server running; SHIM_TMUX_SESSIONS
+# lists its session names and SHIM_TMUX_UPDATE_ENV its update-environment option; with
+# SHIM_TMUX_GENV_WHEN it plays that server only once the named file exists. Unset, the real
+# server on the test socket answers.
+if [ -n "\${SHIM_TMUX_GENV:-}" ] && { [ -z "\${SHIM_TMUX_GENV_WHEN:-}" ] || [ -e "\$SHIM_TMUX_GENV_WHEN" ]; }; then
+  case " \$* " in
+    *" list-sessions "*|*" show-environment "*|*" show-options "*)
+      [ "\$SHIM_TMUX_GENV" != none ] || { echo "no server running on /tmp/shim/\${FLEET_TMUX_SOCKET:-default}" >&2; exit 1; }
+      case " \$* " in
+        *" list-sessions "*) for s in \${SHIM_TMUX_SESSIONS:-}; do echo "\$s"; done ;;
+        *" show-options "*) for s in DISPLAY SSH_AUTH_SOCK \${SHIM_TMUX_UPDATE_ENV:-}; do echo "\$s"; done ;;
+        *) cat "\$SHIM_TMUX_GENV" ;;
+      esac
+      exit 0 ;;
+  esac
+fi
 exec "$REAL_TMUX" "\$@"
 EOF
 # ssh: the preflight's cross-box reach probe (ludics-lite#57) -- the one ssh shape these tests
@@ -714,6 +734,65 @@ expect "a real directory in place of the link refuses" 1 "skills/ship-pr -> miss
 rm -rf "$HOME/.claude/skills/ship-pr"; ln -sfn "$repo/wait-and-proceed" "$HOME/.claude/skills/ship-pr"
 expect "a link swapped to a sibling skill refuses" 1 "skills/ship-pr -> .*/wait-and-proceed (not " -- "$FW" preflight testbox --no-probe
 ln -sfn "$repo/ship-pr" "$HOME/.claude/skills/ship-pr"
+# A stale tmux server environment (ludics-lite#327): a new session takes the server's
+# environment, so a server started before an env.sh/gpu.sh edit hands CLI workers the old values.
+# The shim plays the server; `fresh` pins the three GPU/OCaml variables of the far-side shell, the
+# reference a server started now would inherit.
+fresh=(env -u ROCM_PATH -u HIP_PATH -u OPAM_SWITCH_PREFIX)
+printf 'PATH=%s\n-ROCM_PATH\nTERM=screen\n' "$PATH" > "$TMP/genv-match"
+printf 'PATH=%s\nROCM_PATH=/usr\n' "$PATH" > "$TMP/genv-rocm"
+printf 'PATH=/old/bin:%s\n' "$PATH" > "$TMP/genv-path"
+expect "a tmux server whose environment matches a fresh shell passes" 0 "PREFLIGHT OK" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-match" SHIM_TMUX_SESSIONS="iw-live" "$FW" preflight testbox --no-probe
+expect "no tmux server running passes (the next launch starts a fresh one)" 0 "PREFLIGHT OK" -- \
+  "${fresh[@]}" HIP_PATH=/usr SHIM_TMUX_GENV=none "$FW" preflight testbox --no-probe
+expect "a server still exporting a dropped ROCM_PATH refuses, naming it, and says to wait for its live worker" 1 \
+  "stale tmux server environment (ROCM_PATH is /usr in the server but unset in a fresh shell): .*wait for its live worker session(s) (iw-w7 iw-w8; \`fleet-worker.sh ls testbox\`) to finish" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" SHIM_TMUX_SESSIONS="iw-w7 iw-w8" "$FW" preflight testbox --no-probe
+grep -q 'restart it with' <<<"$out" && ko "kill-server offered as the fix while a worker session is live -- $out" \
+  || ok "no restart is offered while a worker session is live"
+expect "with no live worker session, the refusal names the socket's kill-server" 1 \
+  "ROCM_PATH is /usr in the server .*no worker session is live on it, so restart it with \`tmux -L $FLEET_TMUX_SOCKET kill-server\` and try again" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" "$FW" preflight testbox --no-probe
+expect "...and warns which non-worker sessions a kill-server would end" 1 "kill-server also ends its non-worker session(s): notes)" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" SHIM_TMUX_SESSIONS="notes" "$FW" preflight testbox --no-probe
+expect "...and warns of them too when the advice is to wait for live workers first" 1 "to finish, then .*kill-server.* if it outlives them (kill-server also ends its non-worker session(s): notes)" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" SHIM_TMUX_SESSIONS="iw-w7 notes" "$FW" preflight testbox --no-probe
+expect "a variable tmux refreshes from the client (update-environment) is not compared" 0 "PREFLIGHT OK" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" SHIM_TMUX_UPDATE_ENV="ROCM_PATH" "$FW" preflight testbox --no-probe
+expect "...while the variables it does not refresh still are" 1 "PATH is /old/bin:.* in the server" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-path" SHIM_TMUX_UPDATE_ENV="ROCM_PATH" "$FW" preflight testbox --no-probe
+expect "a variable the fresh shell gained since the server started refuses too" 1 "HIP_PATH is unset in the server but /usr in a fresh shell" -- \
+  "${fresh[@]}" HIP_PATH=/usr SHIM_TMUX_GENV="$TMP/genv-match" "$FW" preflight testbox --no-probe
+expect "a PATH that moved since the server started refuses" 1 "PATH is /old/bin:.* in the server but .* in a fresh shell" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-path" "$FW" preflight testbox --no-probe
+expect "every stale variable is named in one refusal" 1 "(ROCM_PATH is /usr in the server but unset in a fresh shell, OPAM_SWITCH_PREFIX is unset in the server but /o in a fresh shell)" -- \
+  "${fresh[@]}" OPAM_SWITCH_PREFIX=/o SHIM_TMUX_GENV="$TMP/genv-rocm" "$FW" preflight testbox --no-probe
+expect "native workers never run under tmux, so a stale server does not refuse them" 0 "PREFLIGHT OK" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" "$FW" preflight testbox --native-claude
+# The same fact against a real tmux server, on a socket of its own: the shim above must not be the
+# only thing that knows the output shape of show-environment.
+envsock="fwtest-env-$$"
+"${fresh[@]}" ROCM_PATH=/usr "$REAL_TMUX" -L "$envsock" new-session -d -s iw-real 'sleep 60'
+expect "a real server started with ROCM_PATH=/usr refuses a fresh shell without it" 1 \
+  "ROCM_PATH is /usr in the server but unset in a fresh shell): .*wait for its live worker session(s) (iw-real;" -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe
+# update-environment, on the real server: tmux copies ROCM_PATH from the launching client into
+# each new session, so the stale global value reaches no worker and the launch is safe.
+"$REAL_TMUX" -L "$envsock" set-option -ga update-environment ROCM_PATH
+expect "a real server that refreshes ROCM_PATH from the client passes despite its stale global value" 0 "PREFLIGHT OK" -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe
+"$REAL_TMUX" -L "$envsock" set-option -gu update-environment
+# exit-empty off: the server outlives its last session and a new one would still inherit from it.
+"$REAL_TMUX" -L "$envsock" set-option -g exit-empty off
+"$REAL_TMUX" -L "$envsock" kill-session -t iw-real
+expect "a real server left with no session (exit-empty off) is still checked" 1 "ROCM_PATH is /usr in the server .*no worker session is live on it, so restart it with \`tmux -L $envsock kill-server\`" -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe
+"$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
+"${fresh[@]}" "$REAL_TMUX" -L "$envsock" new-session -d -s iw-real 'sleep 60'
+expect "...and a real server started from the same environment passes" 0 "PREFLIGHT OK" -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe
+"$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
 }
 
 # --- load: an asleep box is a row, not a failure ------------------------------------------------
@@ -749,6 +828,15 @@ echo x >> "$repo/ship-pr/SKILL.md"
 expect "launch runs the preflight on the box and refuses a dirty served tree" 1 "LAUNCH REFUSED testbox/w1: PREFLIGHT REFUSED testbox: 1 local change(s) in the served tree" -- \
   "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 git -C "$repo" checkout -q -- .
+# The launch's far side re-reads the tmux server just before new-session (ludics-lite#327): the
+# base gate between it and the preflight can take minutes. Here the server turns stale during it.
+printf 'PATH=%s\nROCM_PATH=/usr\n' "$PATH" > "$TMP/genv-late"; rm -f "$TMP/stale-now"
+expect "a tmux server that turns stale after the preflight still refuses the launch" 1 "LAUNCH REFUSED testbox/wz: stale tmux server environment (ROCM_PATH is /usr in the server" -- \
+  env -u ROCM_PATH -u HIP_PATH -u OPAM_SWITCH_PREFIX SHIM_TMUX_GENV="$TMP/genv-late" SHIM_TMUX_GENV_WHEN="$TMP/stale-now" SHIM_BASE_TOUCH="$TMP/stale-now" \
+  "$FW" launch testbox wz --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
+grep -q 'PREFLIGHT REFUSED' <<<"$out" && ko "the stale server was caught by the preflight, not the late re-read -- $out" || ok "the late re-read, not the preflight, caught it"
+[ -e "$ISSUE_WAVE_STATE/workers/wz" ] && ko "a stale-server refusal left a record behind" || ok "a stale-server refusal leaves no record"
+rm -f "$TMP/stale-now"
 expect "launch creates the worktree and reports the session" 0 "LAUNCHED testbox/w1 kind=claude session=[0-9a-f-]\{36\} cwd=$proj-worktrees/w1" -- \
   "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 -- --model opus
 [ -d "$proj-worktrees/w1" ] && [ "$(git -C "$proj-worktrees/w1" rev-parse --abbrev-ref HEAD)" = claude/w1 ] && ok "worktree on the requested branch" || ko "worktree missing or wrong branch"
@@ -863,6 +951,12 @@ expect "a diagnostic process on the record does not block a plain unstick" 0 "RE
 cp "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before"
 expect "a tmux failure during unstick restores exit and meta" 1 "tmux failed (previous exit record and meta kept)" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" unstick testbox wo --message "$TMP/msg.md"
 cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "meta and exit are as before the failed resume" || ko "meta or exit changed by a failed resume"
+# A resume creates a tmux session with no preflight in front of it, so it runs the stale-server
+# check itself (ludics-lite#327), before it touches the record.
+printf 'PATH=%s\nROCM_PATH=/usr\n' "$PATH" > "$TMP/genv-stale"
+expect "a resume refuses against a stale tmux server" 1 "UNSTICK REFUSED testbox/wo: stale tmux server environment (ROCM_PATH is /usr in the server but unset in a fresh shell)" -- \
+  env -u ROCM_PATH -u HIP_PATH -u OPAM_SWITCH_PREFIX SHIM_TMUX_GENV="$TMP/genv-stale" "$FW" unstick testbox wo --message "$TMP/msg.md"
+cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "a resume refused over a stale server leaves meta and exit as they were" || ko "meta or exit changed by a stale-server refusal"
 expect "...and the worker still reads as its previous successful turn" 0 "DONE testbox/wo exit=0" -- "$FW" attach testbox wo --interval 1
 echo 99 > "$ISSUE_WAVE_STATE/workers/wo/exit.prev"; echo "kind=stale" > "$ISSUE_WAVE_STATE/workers/wo/meta.prev"; cp "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/wo.meta"
 mv "$proj" "$proj.moved"
