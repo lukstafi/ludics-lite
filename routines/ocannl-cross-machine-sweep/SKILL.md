@@ -324,7 +324,7 @@ not refresh execution coverage. The raised cap is for the forced runs only: a co
 `@slow` legitimately exceeds the default 90-minute unit cap, and cutting it short would file lost
 coverage as `timeout`.
 Run it in the background and wait for it to finish — a cold unit can take tens of minutes.
-Each box's units run as one lane, and the three lanes run concurrently (gh-ocannl-976): the remote
+Each box's units run as one lane, and the four lanes (three when a run selects no tuf unit) run concurrently (gh-ocannl-976): the remote
 units start within seconds of launch, and the run lasts as long as its longest lane — normally this Mac's, which carries metal's suite. The stdout header's `lanes:` line names each
 box's units. Units on different boxes finish in any order, so their summary blocks and their
 history rows appear in completion order, not in the order this routine lists them.
@@ -383,8 +383,11 @@ same unit's most recent PREVIOUS non-pass run. Only a DIFFERENCE is news.
 
 The `machine` column holds the measurement-box ID, so rows and filenames from before 2026-09-05
 spell the same units `local` (now `m4-max`) and `rog` (now `rog-nv`); `minix` is unchanged. When
-looking for a unit's previous non-pass run, match on `backend` and accept the old machine spelling
-of its fingerprint filename.
+looking for a unit's previous non-pass run, match on machine AND backend, accepting only those old
+machine spellings of its fingerprint filename. Never match on backend alone: hip runs on two boxes
+of different memory models (minix unified, tuf discrete), so the other box's hip fingerprint is a
+different experiment, and matching it would invent news or hide a repeat. The one cross-machine
+match is multidev_cc's move below.
 
 multidev_cc also MOVED, from this Mac to minix (gh-ocannl-976): its older rows and fingerprints say
 `m4-max`/`local`, its newer ones `minix`. Match it on `backend` across both, but read the first
@@ -460,9 +463,11 @@ For each of the FIVE backends (cc, multidev_cc, metal, cuda, hip) find the most 
 liveness row. hip's is minix's: `lanes:` lists hip under both `minix(...)` and `tuf(hip)`, and the
 backend rows of the run record carry hip twice, once per box — age each unit by its own box's rows,
 and gate hip on minix's as before. Age tuf/hip separately, as its own line ("hip on tuf, discrete
-memory: last full-scope pass <age>"): flag it only when that pass is more than 7 days old, since a
-week of gates means the RTC wake is not waking it and discrete-memory hip has quietly lost its only
-coverage. Flag backends with no pass in more than 2 days. For cuda, hip or multidev_cc,
+memory: last full-scope pass <age>, last forced pass <age>"): flag its liveness only when that pass
+is more than 7 days old, since a week of gates means the RTC wake is not waking it and
+discrete-memory hip has quietly lost its only coverage; and flag its EXECUTION coverage by its own
+forced pass on the same 14-day rule as the five backends — hip's forced pass on minix does not
+stand in for it, and weekday `incremental-pass` rows on tuf cannot either. Flag backends with no pass in more than 2 days. For cuda, hip or multidev_cc,
 report the step-1 outcome for its box: woken and swept; machine reachable but the configured
 guest or native Linux endpoint unreachable when the unit probed it; or wake failed. Only units
 whose own row says `skip (unreachable)` are uncovered; a unit that ran before an endpoint vanished
