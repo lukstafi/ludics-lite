@@ -1954,38 +1954,35 @@ fi
 # The local side is complete and read back; from here a refusal leaves only the public branch, whose
 # tip RECOVERY_REF still holds locally, so every message below says where the local state went.
 LOCAL_DONE="local $BRANCH was deleted and its session archived at $SESSION_ARCHIVED_WORKTREE; recovery retained at $RECOVERY_REF"
-# A refusal that leaves origin/$BRANCH in place ends with the command that finishes the job,
-# leased at the tip it names: the session is archived by now, so this helper cannot be re-run. The
-# command keeps the helper's own invariants rather than trusting the reader to: it stops while any
-# local $BRANCH exists (show-ref --exists says 2 only for a missing ref), and a tip other than the
-# validated one is fetched, proven integrated into $BASE_REMOTE_REF and retained under the recovery
-# namespace before it may go. A push URL carrying HTTP credentials is named as `origin` instead,
-# which the helper already required to be that one URL, so no secret reaches the diagnostic.
+# A refusal that leaves origin/$BRANCH in place ends with the command that finishes the job, leased
+# at the tip it names: the session is archived by now, so this helper cannot be re-run. The command
+# is the operator's to run, not a second validator: where the helper could not validate what it
+# would delete, the refusal says what must hold first. The push URL is the validated one with any
+# HTTP userinfo removed, so no credential reaches the diagnostic and the endpoint stays the same.
 finish_remote_deletion() {
-  local main oid=$1 url=$ORIGIN_PUSH_URL
+  local url=$ORIGIN_PUSH_URL rest authority
   case "$url" in
-  http://*@* | https://*@*) url=origin ;;
+  http://* | https://*)
+    rest=${url#*://}
+    authority=${rest%%/*}
+    case "$authority" in
+    *@*) url="${url%%://*}://${authority##*@}${rest#"$authority"}" ;;
+    esac
+    ;;
   esac
-  main=$(printf '%q' "$MAIN")
-  printf 'to finish, run: git -C %s show-ref --exists %q; [ $? = 2 ] && ' "$main" "refs/heads/$BRANCH"
-  if [ "$oid" != "$REMOTE_BRANCH_OID" ]; then
-    printf 'git -C %s fetch --no-tags --no-write-fetch-head %q %q && ' "$main" "$url" "$oid"
-    printf 'git -C %s merge-base --is-ancestor %q %q && ' "$main" "$oid" "$BASE_REMOTE_REF"
-    printf 'git -C %s update-ref %q %q && ' "$main" "refs/ship-pr/recovery/$BRANCH/$oid" "$oid"
-  fi
-  printf 'git -C %s push %q %q %q' "$main" \
-    "--force-with-lease=refs/heads/$BRANCH:$oid" "$url" ":refs/heads/$BRANCH"
+  printf 'finish with: git -C %q push %q %q %q' "$MAIN" \
+    "--force-with-lease=refs/heads/$BRANCH:$1" "$url" ":refs/heads/$BRANCH"
 }
 if [ -n "$REMOTE_BRANCH_OID" ]; then
   ! local_topic_reappeared ||
-    fail "$LOCAL_DONE; but local $BRANCH reappeared (at or over $CURRENT_TOPIC_OID) before the remote deletion, so origin/$BRANCH was left in place; $(finish_remote_deletion "$REMOTE_BRANCH_OID")"
+    fail "$LOCAL_DONE; but local $BRANCH reappeared (at or over $CURRENT_TOPIC_OID) before the remote deletion, so origin/$BRANCH was left in place; once that local $BRANCH is resolved and gone, $(finish_remote_deletion "$REMOTE_BRANCH_OID")"
   if ! git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" \
     "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH"; then
     REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
     REMOTE_BRANCH_STATUS=$?
     case "$REMOTE_BRANCH_STATUS" in
     2) printf '%s\n' "post-merge-cleanup.sh: origin/$BRANCH disappeared before its leased deletion (nothing left to delete)" >&2 ;;
-    0) fail "$LOCAL_DONE; but origin/$BRANCH moved to ${REMOTE_BRANCH_LINE%%[[:space:]]*} before its leased deletion, and its newer tip was left in place; $(finish_remote_deletion "${REMOTE_BRANCH_LINE%%[[:space:]]*}")" ;;
+    0) fail "$LOCAL_DONE; but origin/$BRANCH moved to ${REMOTE_BRANCH_LINE%%[[:space:]]*} before its leased deletion, and its newer tip was left in place; that tip was never validated, so only once it is confirmed integrated into origin/$BASE_BRANCH, $(finish_remote_deletion "${REMOTE_BRANCH_LINE%%[[:space:]]*}")" ;;
     *) fail "$LOCAL_DONE; but origin/$BRANCH could not be lease-deleted at $REMOTE_BRANCH_OID and was left in place; $(finish_remote_deletion "$REMOTE_BRANCH_OID")" ;;
     esac
   fi
