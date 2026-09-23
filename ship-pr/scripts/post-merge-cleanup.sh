@@ -1232,6 +1232,31 @@ local_topic_reappeared() {
   esac
 }
 
+# Is the remote base still the validated REMOTE_MASTER or a verified fast-forward of it? Read
+# twice: before any topic deletion, so an already-diverged base dismantles nothing, and after the
+# remote deletion, for a base that moved while the cleanup ran. On failure REMOTE_BASE_PROBLEM
+# says what was wrong; on success it is empty.
+remote_base_still_integrates() {
+  local line status oid
+  REMOTE_BASE_PROBLEM=""
+  line=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "$BASE_LOCAL_REF")
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    REMOTE_BASE_PROBLEM="remote $BASE_BRANCH became unreadable"
+    return 1
+  fi
+  oid=${line%%[[:space:]]*}
+  [ "$oid" != "$REMOTE_MASTER" ] || return 0
+  # A sibling merge preserves the containment already proved against REMOTE_MASTER. Fetch
+  # the exact advertised object without advancing tracking refs or the prepared local base;
+  # fetching the branch name could instead validate a different tip after another remote move.
+  if ! git -C "$MAIN" fetch --no-tags --no-write-fetch-head "$ORIGIN_PUSH_URL" "$oid" ||
+    ! git -C "$MAIN" merge-base --is-ancestor "$REMOTE_MASTER" "$oid"; then
+    REMOTE_BASE_PROBLEM="remote $BASE_BRANCH changed from $REMOTE_MASTER to $oid without a verified fast-forward"
+    return 1
+  fi
+}
+
 restore_remote_topic() {
   local recovery_oid="$1"
   if git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:" \
@@ -1778,6 +1803,8 @@ case "$REMOTE_BRANCH_STATUS" in
 2) ;; # Absent: a safe retry state. Nothing is sent at the end, so a concurrent creation survives.
 *) fail "could not determine whether origin/$BRANCH exists (ls-remote exit $REMOTE_BRANCH_STATUS)" ;;
 esac
+remote_base_still_integrates ||
+  fail "$REMOTE_BASE_PROBLEM before any topic deletion; local and remote $BRANCH were preserved"
 
 # The remote-tracking ref is only a local cache of that branch: it is pruned here, ahead of the
 # topic, so that its movement refusal still precedes every other mutation. A refusal after this
@@ -1948,26 +1975,12 @@ else
   printf '%s\n' "post-merge-cleanup.sh: origin/$BRANCH was already absent (no deletion sent)" >&2
 fi
 
-MASTER_AFTER_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads \
-  "$ORIGIN_PUSH_URL" "$BASE_LOCAL_REF")
-MASTER_AFTER_STATUS=$?
-if [ "$MASTER_AFTER_STATUS" -ne 0 ]; then
+# The same read after the deletion, for a base that moved while it ran.
+remote_base_still_integrates ||
   restore_remote_topic "$LOCAL_BRANCH_OID" ||
-    fail "$LOCAL_DONE; but remote $BASE_BRANCH became unreadable after topic deletion, and the topic could not be restored"
-  fail "$LOCAL_DONE; but remote $BASE_BRANCH became unreadable after topic deletion; origin/$BRANCH was restored"
-fi
-MASTER_AFTER_OID=${MASTER_AFTER_LINE%%[[:space:]]*}
-if [ "$MASTER_AFTER_OID" != "$REMOTE_MASTER" ]; then
-  # A sibling merge preserves the containment already proved against REMOTE_MASTER. Fetch
-  # the exact advertised object without advancing tracking refs or the prepared local base;
-  # fetching the branch name could instead validate a different tip after another remote move.
-  if ! git -C "$MAIN" fetch --no-tags --no-write-fetch-head "$ORIGIN_PUSH_URL" "$MASTER_AFTER_OID" ||
-    ! git -C "$MAIN" merge-base --is-ancestor "$REMOTE_MASTER" "$MASTER_AFTER_OID"; then
-    restore_remote_topic "$LOCAL_BRANCH_OID" ||
-      fail "$LOCAL_DONE; but remote $BASE_BRANCH changed to $MASTER_AFTER_OID without a verified fast-forward, and the topic could not be restored"
-    fail "$LOCAL_DONE; but remote $BASE_BRANCH changed from $REMOTE_MASTER to $MASTER_AFTER_OID without a verified fast-forward; origin/$BRANCH was restored"
-  fi
-fi
+  fail "$LOCAL_DONE; but $REMOTE_BASE_PROBLEM after topic deletion, and the topic could not be restored"
+[ -z "$REMOTE_BASE_PROBLEM" ] ||
+  fail "$LOCAL_DONE; but $REMOTE_BASE_PROBLEM after topic deletion; origin/$BRANCH was restored"
 
 printf '%s\n' "post-merge-cleanup.sh: cleaned $BRANCH and unregistered $SESSION_ORIGINAL; session archived at $SESSION_ARCHIVED_WORKTREE; recovery retained at $RECOVERY_REF and $SESSION_RECOVERY_REF"
 exit "$?"

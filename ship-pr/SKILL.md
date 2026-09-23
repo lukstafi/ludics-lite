@@ -1103,7 +1103,7 @@ fast-forward before any remote deletion. A clean worktree keeps the base continu
 while the named ref is conditionally updated and its tree refreshed; when no worktree owns it, the
 helper creates a temporary owner for that same critical section. The remote topic is observed
 before any topic mutation and deleted last, leased on that observed OID, so every earlier refusal
-leaves it untouched; the deletion is followed by a fresh base read. A changed base is
+leaves it untouched; a fresh base read precedes the first topic deletion and follows the remote one. A changed base is
 fetched by its exact advertised OID and accepted only if it descends from the validated base;
 local and tracking base refs retain their already prepared tip. If that verification fails or
 the base becomes unreadable, the remote topic is restored before refusal. The

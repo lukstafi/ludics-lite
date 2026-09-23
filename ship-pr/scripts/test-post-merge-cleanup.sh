@@ -3338,6 +3338,44 @@ test_remote_base_advance() {
   echo "PASS: sibling base advances are accepted only after a successful exact-tip fetch"
 }
 
+# A base rewritten after the initial fetch but before any topic deletion is caught by the
+# pre-deletion read: nothing about the topic is touched, the session included.
+test_remote_base_rewrite_before_deletion() {
+  local fake_bin real_git remote_base log
+  setup_case remote-base-rewrite-before-deletion merge main-off
+  remote_base=$(git -C "$CASE_INTEGRATOR" rev-list --max-parents=0 HEAD)
+  real_git=$(command -v git)
+  fake_bin="$CASE_ROOT/bin"
+  log="$CASE_ROOT/cleanup.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'is_ls_remote=0' \
+    'is_topic=0' \
+    'for arg in "$@"; do' \
+    '  [ "$arg" = ls-remote ] && is_ls_remote=1' \
+    '  [ "$arg" = refs/heads/topic ] && is_topic=1' \
+    'done' \
+    'if [ "$is_ls_remote" -eq 1 ] && [ "$is_topic" -eq 1 ] && [ ! -e "$RACE_MARKER" ]; then' \
+    '  : >"$RACE_MARKER"' \
+    '  "$REAL_GIT" -C "$RACE_INTEGRATOR" push --force origin "$RACE_BASE:refs/heads/master" >/dev/null 2>&1' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_INTEGRATOR="$CASE_INTEGRATOR" \
+    RACE_BASE="$remote_base" RACE_MARKER="$CASE_ROOT/rewrite.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "cleanup accepted a base rewritten before topic deletion"
+  fi
+  [ -e "$CASE_ROOT/rewrite.injected" ] || fail "base rewrite was not injected"
+  grep 'without a verified fast-forward before any topic deletion' "$log" >/dev/null ||
+    { cat "$log" >&2; fail "the refusal was not the pre-deletion base read"; }
+  assert_topic_preserved
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/topic)" "$CASE_TOPIC_OID" \
+    "the tracking ref must survive a pre-deletion base refusal"
+  echo "PASS: a base rewritten before topic deletion is refused with the topic intact"
+}
+
 test_remote_master_lease() {
   local real_git remote_base hook log
   setup_case remote-master-lease merge main-off
@@ -3377,7 +3415,9 @@ test_stale_master_response_retains_recovery() {
     '  [ "$arg" = ls-remote ] && is_ls_remote=1' \
     '  [ "$arg" = refs/heads/master ] && is_master=1' \
     'done' \
-    'if [ "$is_ls_remote" -eq 1 ] && [ "$is_master" -eq 1 ]; then' \
+    '# Only the final read, once local topic is gone: the pre-deletion read must see the real base.' \
+    'if [ "$is_ls_remote" -eq 1 ] && [ "$is_master" -eq 1 ] &&' \
+    '  ! "$REAL_GIT" -C "$RACE_MAIN" show-ref --verify --quiet refs/heads/topic; then' \
     '  output=$("$REAL_GIT" "$@")' \
     '  status=$?' \
     '  "$REAL_GIT" -C "$RACE_INTEGRATOR" push --force origin "$RACE_BASE:refs/heads/master" >/dev/null' \
@@ -3388,7 +3428,8 @@ test_stale_master_response_retains_recovery() {
   chmod +x "$fake_bin/git"
 
   PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_INTEGRATOR="$CASE_INTEGRATOR" \
-    RACE_BASE="$remote_base" "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1
+    RACE_MAIN="$CASE_MAIN" RACE_BASE="$remote_base" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1
   assert_cleaned
   assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/master | awk '{print $1}')" \
     "$remote_base" "test must roll remote master back after returning its stale integrated OID"
@@ -4921,6 +4962,7 @@ TESTS=(
   test_late_session_module_refusal
   test_symbolic_ref_refusal
   test_remote_base_advance
+  test_remote_base_rewrite_before_deletion
   test_remote_master_lease
   test_stale_master_response_retains_recovery
   test_symbolic_recovery_ref_refusal
