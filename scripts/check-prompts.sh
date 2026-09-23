@@ -1063,8 +1063,9 @@ invocation_options() {
 # `while [ "$#" -gt 0 ]; do` line opens, from the `case "$1" in` after it to the `esac` at that
 # `case`'s own indent. In it an arm is a line whose first word is `--name)`, and the arm is that
 # line through the first line carrying `;;`, a one-line arm included. Its arity is N-1 for the
-# `shift N` it carries (`shift 2` is 1, a bare `shift` is 0), read with `#` comments dropped; an
-# arm with no shift, or with two that disagree, prints `?`, which the caller refuses. That is the
+# `shift N` it carries (`shift 2` is 1, a bare `shift` is 0), read with quoted spans and `#`
+# comments dropped; an arm with no shift, or with more than one -- repeated shifts add up, and no
+# scan can prove two exclusive -- prints `?`, which the caller refuses. That is the
 # reader's boundary, the same line-shape boundary as the rest of this file (README, Tests;
 # ludics-lite#75): it establishes that each arm's SHIFT agrees with its listing, not that the arm
 # reads `$2` or that the parser is the one the script runs. Outside the shape and unread: an arm
@@ -1080,17 +1081,22 @@ parser_options() {
     $0 ~ ("^" ind "esac[[:space:]]*(;|#|$)") { exit }
     !arm && match($0, /^[[:space:]]*--[A-Za-z0-9][A-Za-z0-9-]*\)/) {
       name = substr($0, RSTART, RLENGTH - 1); sub(/^[[:space:]]*/, "", name)
-      arm = 1; ar = ""; $0 = substr($0, RSTART + RLENGTH)
+      arm = 1; ar = ""; ns = 0; $0 = substr($0, RSTART + RLENGTH)
     }
     arm {
-      l = $0; sub(/(^|[[:space:]])#.*/, "", l)
+      # Quoted spans are text, and a `#` opening a word -- after a blank, a `;` or an operator,
+      # `;;# shift 2` included -- starts a comment: neither carries a command (round 1, P2).
+      l = $0
+      gsub(/\047[^\047]*\047/, "\047\047", l); gsub(/"([^"\\]|\\.)*"/, "\"\"", l)
+      if (match(l, /(^|[[:space:];&|()])#/)) l = substr(l, 1, RSTART + RLENGTH - 2)
       s = l
       while (match(s, /(^|[;[:space:]])shift([[:space:]]+[0-9]+)?([;[:space:]]|$)/)) {
         t = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
-        n = (match(t, /[0-9]+/) ? substr(t, RSTART, RLENGTH) : 1) - 1
-        ar = (ar == "" ? n : (ar == n ? ar : "?"))
+        ar = (match(t, /[0-9]+/) ? substr(t, RSTART, RLENGTH) : 1) - 1; ns++
       }
-      if (index(l, ";;")) { print name "\t" (ar == "" ? "?" : ar); arm = 0 }
+      # Every shift in the arm runs in sequence as far as a scan knows, so a second one -- equal or
+      # not -- consumes more than either says: the arity of an arm is read off exactly one.
+      if (index(l, ";;")) { print name "\t" (ns == 1 ? ar : "?"); arm = 0 }
     }
   ' "$1"
 }
@@ -1125,7 +1131,7 @@ check_cleanup_options() {
     if [ -z "$p" ]; then
       ko "$CLEANUP_HELPER" "usage() lists '$o', for which the option parser has no '$o)' arm"; bad=1
     elif [ "$p" = "?" ]; then
-      ko "$CLEANUP_HELPER" "the parser's '$o)' arm has no single 'shift' or 'shift N' this reader can see, so its arity is unread"; bad=1
+      ko "$CLEANUP_HELPER" "the parser's '$o)' arm carries no shift, or more than one, where this reader needs exactly one 'shift' or 'shift N' to read its arity"; bad=1
     elif [ "$p" != "$a" ]; then
       sh=shift; [ "$p" -eq 0 ] || sh="shift $((p + 1))"
       if [ "$a" = 1 ]; then

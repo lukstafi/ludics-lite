@@ -1245,6 +1245,25 @@ cleanup_edit "$CLEANUP_HELPER" 's/^  --force-integrated)$/  --base) BASE_BRANCH=
   --force-integrated)/'
 expect "a one-line flag arm agrees with a bare listing, whatever its comment says" 0 \
   "usage() agrees with its parser on each one's arity" -- "$CP" "$R"
+# Round 1, P2 x2: which `shift` text is the arm's shift. Two shifts add up whatever each says, so
+# an arm carrying two is unread rather than read as one; and a shift in a comment or in quoted
+# text is no command, so an arm whose only `shift 2` is text is a flag arm.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    shift 2\
+    shift 2/'
+expect "an arm carrying two shifts is refused, even two that each match the listing" 1 \
+  "the parser's '--regenerable)' arm carries no shift, or more than one" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/{ s/^    shift 2$/    shift/; s/^    ;;$/    ;;# shift 2/; }'
+expect "a shift in a comment glued to the ;; is not the arm's" 1 \
+  "usage() lists '--regenerable' with a <value> placeholder, but its parser arm does 'shift' and takes none" \
+  -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    printf '"'%s\\\\n'"' "cannot shift 2 here" '"'nor shift 2 here'"' >\&2; shift/'
+expect "...nor is one in quoted text" 1 \
+  "usage() lists '--regenerable' with a <value> placeholder, but its parser arm does 'shift' and takes none" \
+  -- "$CP" "$R"
+
 # A parser this reader cannot find is refused, not read as agreeing with nothing.
 cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" 's/^while \[ "\$#" -gt 0 \]; do$/while (( $# )); do/'
