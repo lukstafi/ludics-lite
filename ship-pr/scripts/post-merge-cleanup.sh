@@ -1218,18 +1218,22 @@ scan_branch_owner() {
 }
 
 # Nothing holds the local topic name once its deletion has committed: the reservation worktree
-# does not stop a branch being created, and update-ref never asks. So the remote deletion is
-# bracketed by two reads of it instead of a lock. Sets CURRENT_TOPIC_OID when the ref exists.
+# does not stop a branch being created, and update-ref never asks. So the remote steps are
+# bracketed by two reads of it instead of a lock: one before the push, and one as the helper's
+# very last read, after every network call. A creation after that last read is indistinguishable
+# from a branch made after cleanup finished, and no further read would change that.
+# Succeeds when the name is present, or cannot be proved absent, and sets CURRENT_TOPIC_OID to
+# the tip to publish: the name's own when it resolves, else the retained original tip (a
+# dangling symbolic ref, an unreadable one). It never exits, so its caller can still restore.
 local_topic_reappeared() {
   local status=0
   CURRENT_TOPIC_OID=""
   git -C "$MAIN" show-ref --exists "refs/heads/$BRANCH" >/dev/null 2>&1 || status=$?
-  case "$status" in
-  2) return 1 ;;
-  0) CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH") ||
-    fail "local $BRANCH reappeared but could not be read" ;;
-  *) fail "could not inspect local $BRANCH around its remote deletion (show-ref exit $status)" ;;
-  esac
+  [ "$status" -ne 2 ] || return 1
+  CURRENT_TOPIC_OID=$(git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$BRANCH^{commit}" 2>/dev/null) ||
+    CURRENT_TOPIC_OID="$LOCAL_BRANCH_OID"
+  [ -n "$CURRENT_TOPIC_OID" ] || CURRENT_TOPIC_OID="$LOCAL_BRANCH_OID"
+  return 0
 }
 
 # Is the remote base still the validated REMOTE_MASTER or a verified fast-forward of it? Read
@@ -1952,7 +1956,7 @@ fi
 LOCAL_DONE="local $BRANCH was deleted and its session archived at $SESSION_ARCHIVED_WORKTREE; recovery retained at $RECOVERY_REF"
 if [ -n "$REMOTE_BRANCH_OID" ]; then
   ! local_topic_reappeared ||
-    fail "$LOCAL_DONE; but local $BRANCH reappeared at $CURRENT_TOPIC_OID before the remote deletion, so origin/$BRANCH was left in place"
+    fail "$LOCAL_DONE; but local $BRANCH reappeared (at or over $CURRENT_TOPIC_OID) before the remote deletion, so origin/$BRANCH was left in place"
   if ! git -C "$MAIN" push --force-with-lease="refs/heads/$BRANCH:$REMOTE_BRANCH_OID" \
     "$ORIGIN_PUSH_URL" ":refs/heads/$BRANCH"; then
     REMOTE_BRANCH_LINE=$(git -C "$MAIN" ls-remote --exit-code --heads "$ORIGIN_PUSH_URL" "refs/heads/$BRANCH")
@@ -1962,14 +1966,6 @@ if [ -n "$REMOTE_BRANCH_OID" ]; then
     0) fail "$LOCAL_DONE; but origin/$BRANCH moved to ${REMOTE_BRANCH_LINE%%[[:space:]]*} before its leased deletion, and its newer tip was left in place" ;;
     *) fail "$LOCAL_DONE; but origin/$BRANCH could not be lease-deleted at $REMOTE_BRANCH_OID and was left in place" ;;
     esac
-  fi
-  # A local topic recreated while the push was in flight would otherwise outlive its public
-  # branch: the same half-done state as before, the other way round. Publish it again, as the
-  # branch now is, before refusing.
-  if local_topic_reappeared; then
-    restore_remote_topic "$CURRENT_TOPIC_OID" ||
-      fail "$LOCAL_DONE; but local $BRANCH reappeared at $CURRENT_TOPIC_OID during the remote deletion, and origin/$BRANCH could not be restored"
-    fail "$LOCAL_DONE; but local $BRANCH reappeared at $CURRENT_TOPIC_OID during the remote deletion; origin/$BRANCH was restored at that tip"
   fi
 else
   printf '%s\n' "post-merge-cleanup.sh: origin/$BRANCH was already absent (no deletion sent)" >&2
@@ -1981,6 +1977,15 @@ remote_base_still_integrates ||
   fail "$LOCAL_DONE; but $REMOTE_BASE_PROBLEM after topic deletion, and the topic could not be restored"
 [ -z "$REMOTE_BASE_PROBLEM" ] ||
   fail "$LOCAL_DONE; but $REMOTE_BASE_PROBLEM after topic deletion; origin/$BRANCH was restored"
+
+# The last read, after every network call: a local topic recreated while the remote steps ran
+# would otherwise outlive its public branch, the same half-done state the other way round.
+# Publish it again, as the branch now is, before refusing.
+if [ -n "$REMOTE_BRANCH_OID" ] && local_topic_reappeared; then
+  restore_remote_topic "$CURRENT_TOPIC_OID" ||
+    fail "$LOCAL_DONE; but local $BRANCH reappeared (publishing $CURRENT_TOPIC_OID) during the remote deletion, and origin/$BRANCH could not be restored"
+  fail "$LOCAL_DONE; but local $BRANCH reappeared (publishing $CURRENT_TOPIC_OID) during the remote deletion; origin/$BRANCH was restored at that tip"
+fi
 
 printf '%s\n' "post-merge-cleanup.sh: cleaned $BRANCH and unregistered $SESSION_ORIGINAL; session archived at $SESSION_ARCHIVED_WORKTREE; recovery retained at $RECOVERY_REF and $SESSION_RECOVERY_REF"
 exit "$?"

@@ -4049,36 +4049,71 @@ test_remote_deletion_follows_local_deletion() {
   echo "PASS: the remote topic is deleted last, after the local deletion has committed"
 }
 
-# A local topic recreated while the remote deletion is in flight (from a pre-push hook, the last
-# moment before the remote ref changes) must not outlive its public branch: the helper publishes
-# it again at the recreated tip and refuses.
+# A local topic recreated while the remote steps run must not outlive its public branch. Each mode
+# recreates it at a different moment, in a different shape: `push` from the pre-push hook as a
+# direct ref, `base` during the final base read as a dangling symbolic ref (which resolves to no
+# tip, so the retained original is published). Either way the helper's last read catches it.
 test_local_topic_recreated_during_remote_deletion() {
-  local hook log real_git
-  setup_case local-topic-recreated merge main-off
-  real_git=$(command -v git)
-  hook="$CASE_MAIN/.git/hooks/pre-push"
-  log="$CASE_ROOT/cleanup.log"
-  printf '%s\n' \
-    '#!/usr/bin/env bash' \
-    'if [ ! -e "$RACE_MARKER" ]; then' \
-    '  : >"$RACE_MARKER"' \
-    '  "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/topic "$RACE_OID" ""' \
-    'fi' \
-    'exit 0' >"$hook"
-  chmod +x "$hook"
-  if REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" RACE_OID="$CASE_TOPIC_OID" \
-    RACE_MARKER="$CASE_ROOT/recreated.injected" \
-    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
-    fail "cleanup completed although local topic reappeared during its remote deletion"
-  fi
-  [ -e "$CASE_ROOT/recreated.injected" ] || fail "local topic recreation was not injected"
-  grep 'reappeared at .* during the remote deletion; origin/topic was restored' "$log" >/dev/null ||
-    { cat "$log" >&2; fail "the refusal was not the post-deletion recreation check"; }
-  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)" "$CASE_TOPIC_OID" \
-    "the recreated local topic must be left alone"
-  assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')" \
-    "$CASE_TOPIC_OID" "the remote topic must be republished at the recreated tip"
-  echo "PASS: a local topic recreated during the remote deletion is published again"
+  local fake_bin hook log mode real_git
+  for mode in push base; do
+    setup_case "local-topic-recreated-$mode" merge main-off
+    real_git=$(command -v git)
+    log="$CASE_ROOT/cleanup.log"
+    case "$mode" in
+    push)
+      hook="$CASE_MAIN/.git/hooks/pre-push"
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'if [ ! -e "$RACE_MARKER" ]; then' \
+        '  : >"$RACE_MARKER"' \
+        '  "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/topic "$RACE_OID" ""' \
+        'fi' \
+        'exit 0' >"$hook"
+      chmod +x "$hook"
+      ;;
+    base)
+      fake_bin="$CASE_ROOT/bin"
+      mkdir -p "$fake_bin"
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'is_ls_remote=0' \
+        'is_master=0' \
+        'for arg in "$@"; do' \
+        '  [ "$arg" = ls-remote ] && is_ls_remote=1' \
+        '  [ "$arg" = refs/heads/master ] && is_master=1' \
+        'done' \
+        'if [ "$is_ls_remote" -eq 1 ] && [ "$is_master" -eq 1 ] && [ ! -e "$RACE_MARKER" ] &&' \
+        '  ! "$REAL_GIT" -C "$RACE_MAIN" show-ref --verify --quiet refs/heads/topic; then' \
+        '  : >"$RACE_MARKER"' \
+        '  "$REAL_GIT" -C "$RACE_MAIN" symbolic-ref refs/heads/topic refs/heads/missing-topic-target' \
+        'fi' \
+        'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+      chmod +x "$fake_bin/git"
+      ;;
+    esac
+    if PATH="${fake_bin:+$fake_bin:}$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" \
+      RACE_OID="$CASE_TOPIC_OID" RACE_MARKER="$CASE_ROOT/recreated.injected" \
+      "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+      fail "cleanup completed although local topic reappeared during its remote deletion ($mode)"
+    fi
+    [ -e "$CASE_ROOT/recreated.injected" ] || fail "local topic recreation was not injected ($mode)"
+    grep 'reappeared (publishing .*) during the remote deletion; origin/topic was restored' "$log" >/dev/null ||
+      { cat "$log" >&2; fail "the $mode refusal was not the final recreation check"; }
+    case "$mode" in
+    push)
+      assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)" "$CASE_TOPIC_OID" \
+        "the recreated local topic must be left alone"
+      ;;
+    base)
+      assert_eq "$(git -C "$CASE_MAIN" symbolic-ref refs/heads/topic)" refs/heads/missing-topic-target \
+        "the recreated symbolic topic must be left alone"
+      ;;
+    esac
+    assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')" \
+      "$CASE_TOPIC_OID" "the remote topic must be republished ($mode)"
+    fake_bin=""
+  done
+  echo "PASS: a local topic recreated during the remote steps is published again"
 }
 
 # The Git for Windows shape of ludics-lite#287 at each local deletion in turn: the transaction's Git
