@@ -4008,6 +4008,38 @@ test_remote_deletion_follows_local_deletion() {
   echo "PASS: the remote topic is deleted last, after the local deletion has committed"
 }
 
+# A local topic recreated while the remote deletion is in flight (from a pre-push hook, the last
+# moment before the remote ref changes) must not outlive its public branch: the helper publishes
+# it again at the recreated tip and refuses.
+test_local_topic_recreated_during_remote_deletion() {
+  local hook log real_git
+  setup_case local-topic-recreated merge main-off
+  real_git=$(command -v git)
+  hook="$CASE_MAIN/.git/hooks/pre-push"
+  log="$CASE_ROOT/cleanup.log"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [ ! -e "$RACE_MARKER" ]; then' \
+    '  : >"$RACE_MARKER"' \
+    '  "$REAL_GIT" -C "$RACE_MAIN" update-ref refs/heads/topic "$RACE_OID" ""' \
+    'fi' \
+    'exit 0' >"$hook"
+  chmod +x "$hook"
+  if REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" RACE_OID="$CASE_TOPIC_OID" \
+    RACE_MARKER="$CASE_ROOT/recreated.injected" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "cleanup completed although local topic reappeared during its remote deletion"
+  fi
+  [ -e "$CASE_ROOT/recreated.injected" ] || fail "local topic recreation was not injected"
+  grep 'reappeared at .* during the remote deletion; origin/topic was restored' "$log" >/dev/null ||
+    { cat "$log" >&2; fail "the refusal was not the post-deletion recreation check"; }
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)" "$CASE_TOPIC_OID" \
+    "the recreated local topic must be left alone"
+  assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')" \
+    "$CASE_TOPIC_OID" "the remote topic must be republished at the recreated tip"
+  echo "PASS: a local topic recreated during the remote deletion is published again"
+}
+
 # The Git for Windows shape of ludics-lite#287 at each local deletion in turn: the transaction's Git
 # reads nothing and exits 0 having done nothing. The fixture keeps the real input open on fd 9, so
 # the helper's writes still land in a pipe and the refusal is its own, not a SIGPIPE.
@@ -4913,6 +4945,7 @@ TESTS=(
   test_topic_reflog_locked_through_deletion
   test_final_topic_lease_keeps_remote
   test_remote_deletion_follows_local_deletion
+  test_local_topic_recreated_during_remote_deletion
   test_failed_local_deletion_keeps_remote
   test_ref_transactions_answer_into_a_regular_file
   test_branch_config_locked_through_deletion
