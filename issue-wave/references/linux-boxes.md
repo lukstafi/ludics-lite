@@ -6,6 +6,12 @@ Use this note when a placement's `kind_of` is `linux`; for `wsl`, see
 and its evidence. Every claim was checked by read-only probes on rog-nv-linux,
 minix-amd-linux and tuf-amd-linux on 2026-09-23, except where a line says otherwise.
 
+A trap here is a durable property of a box or platform that a worker must live with. A defect
+in the fleet's own tooling or setup that has, or deserves, an issue does not belong here: it is
+a priority fix that gates the wave items on its path ([Decision
+gate](../SKILL.md#decision-gate-before-launch-batched-fatigue-aware)). An entry whose fix is in
+flight leaves with that fix's PR.
+
 **The environment comes from bash startup, which only some processes run.** Line 1 of
 `~/.bashrc`, before Ubuntu's interactive guard, sources `~/.config/fleet/env.sh`. That file
 adds the CUDA and tool dirs to `PATH`, then sources `gpu.sh` and opam's `init.sh`. So a
@@ -46,9 +52,3 @@ three boxes. On battery, the laptops rog and tuf suspend after 900 s idle, and s
 not user input. No process holds a sleep or idle block inhibitor, so an explicit sleep or power
 verb also lands mid-run. Check: `systemd-inhibit --list --no-pager`, and `wake-lab.sh status
 <box>` when a run's log stops. The fix belongs to lukstafi/ludics-lite#317.
-
-**`tools/sweep.sh` still targets the WSL boots.** Its GPU destinations are `rog-nv-wsl` and
-`minix-amd-wsl` (ahrefs/ocannl master da72fac4). On a native boot a sweep therefore records
-those units as skipped (unreachable), not as results; ahrefs/ocannl#1030 reports and fixes
-that. Its CUDA `PATH` prefix (`/usr/local/cuda/bin:/usr/lib/wsl/lib`) adds nothing on native:
-`env.sh` already provides the first, and the second does not exist.

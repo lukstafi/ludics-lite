@@ -180,6 +180,16 @@ decision they own:
 Most waves should have an empty tier 3. If every question keeps landing in tier 3, the
 triage is wrong, not the backlog.
 
+**A known defect is a fix, not a trap.** The user's rule (2026-09-23): skills do not burden
+agents with problems that should instead be priority fixes. When a scoped item's path runs
+through a defect in the fleet's own tooling or setup that has, or deserves, an issue, that
+defect gates the items it is on (Scope and sequencing: *Dependency gating*), or the
+coordinator sequences its fix first. File the issue if there is none. Either way the brief carries no workaround: a worker
+told to route around a bug spends its attention on a bug nobody is fixing, and the note is
+false the day the fix lands (ludics-lite#326: a brief told the ahrefs/ocannl#1029 worker not
+to drive its measurement through `sweep.sh` while #1030 was open, instead of gating that step
+on #1030).
+
 ## Launch
 
 Choose **provider and model**, **transport and agent host**, and **execution placement**
@@ -327,7 +337,10 @@ requirements for every transport with transport-specific setup and identity, and
   the box. **On GPU boxes**: name the backend and how to prove the run executed on it (a
   backend-uniform golden proves nothing), and keep one dune per _build. Add the box kind's
   traps to the brief: [native traps](references/linux-boxes.md) for `linux`, [WSL
-  traps](references/wsl-boxes.md) for `wsl`.
+  traps](references/wsl-boxes.md) for `wsl`. A trap is a durable property of a box or platform
+  that the worker must live with (XProtect, the GDM greeter's power policy, a unified-memory
+  GPU). A defect in the fleet's own tooling or setup is not a trap, and the brief never carries
+  a workaround for it: it belongs in the decision gate (*A known defect is a fix, not a trap*).
 - Execution handoff: the worker's own targeted correctness batches on its agent host run under
   the [standing reservation](references/executions.md#standing-iteration-reservation) the
   coordinator took at launch - name its request id, the bounded aliases and `-j` width it

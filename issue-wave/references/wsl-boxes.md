@@ -3,6 +3,10 @@
 Use this note only when a placement's `kind_of` is `wsl`. Native Ubuntu starts sshd at boot,
 needs no Windows-side holder, and has no dxg bridge cap.
 
+What follows are properties of WSL on these boxes that a worker lives with. A defect in the
+fleet's own tooling is not one of them: it gates the wave items on its path ([Decision
+gate](../SKILL.md#decision-gate-before-launch-batched-fatigue-aware)).
+
 After WoL, the Windows host may answer while the WSL guest is absent. Start WSL just before
 launching the worker: `wake-lab.sh --wait --wsl --hold <box>` (or use
 `--restart-wsl` in place of `--wsl` when a fresh VM is required). The holder remains until
