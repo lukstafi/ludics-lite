@@ -26,9 +26,9 @@ name: skill scripts
 # runner, every ship-pr suite a step of it), and that `if:` is the whole reason for them: with
 # every suite running whatever the suite before it did, one red job of that shape can hold several
 # failures spread across its steps, and the annotation is what names them without reading the
-# log. It is NOT that Ubuntu is
-# one suite per job -- `pr-review` runs fifteen suites as steps, `lint` nine -- but that an Ubuntu
-# suite that fails stops the job it is in, leaving a single red step to find. The two `pr-review`
+# log. It is NOT that Ubuntu is one suite per job -- `pr-review` runs fifteen suites as steps,
+# `lint` nine -- but that an Ubuntu suite that fails stops the job it is in, leaving a single red
+# step to find. The two `pr-review`
 # steps that do carry `if: !cancelled()` are unannotated exceptions to that; ludics-lite#266 is
 # about holding the `!cancelled()`/annotation pairing mechanically rather than by reading this
 # paragraph.
@@ -544,8 +544,8 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: windows-latest
-    # Unmeasured on this runner yet: forking is several times slower under MSYS than on Linux,
-    # and the same suites take ~510s on macOS. Re-read once main has run it.
+    # The cleanup step is capped at 20 below; the rest is sized loosely until main has measured
+    # it (forking is several times slower under MSYS than on Linux).
     timeout-minutes: 60
     defaults:
       run:
@@ -553,6 +553,10 @@ jobs:
         # not WSL's. The proof step below is what holds that, not this comment.
         shell: bash
     steps:
+      # The image's Git carries core.autocrlf=true (C:/Program Files/Git/etc/gitconfig), so the
+      # suites run from a CRLF checkout -- what a default Git for Windows clone gets. The proof
+      # step prints the setting and the first line of pr-review.sh in bytes, so a change to either
+      # is on the record.
       - uses: actions/checkout@v4
       - name: Prove the platform from inside the suites' shell
         id: platform
@@ -582,6 +586,11 @@ jobs:
         # own run here is its Windows evidence. Do not exclude the failing cases by name instead.
         id: cleanup
         continue-on-error: true
+        # The suite's own per-case deadline (SHIP_PR_TEST_CASE_TIMEOUT) does not fire under Git
+        # Bash: on the first run here 144 of 147 cases finished in 12 minutes and three runner
+        # self-tests then held the step until the job's timeout cancelled every suite after it.
+        # This step-level timeout is the backstop that keeps the pr-review suites below a verdict.
+        timeout-minutes: 20
         if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
         env:
           SHIP_PR_TEST_LOG_DIR: ${{ runner.temp }}/cleanup-logs
