@@ -249,7 +249,9 @@ fleet-worker.sh execution slot -- tools/test-run.sh run <alias> -j 4
 ```
 
 which blocks until one of the box's slots is free (`--wait`, default 600 seconds, then a
-refusal), runs the batch under it, and returns the batch's own status. The bare suites of a
+refusal), runs the batch under it, and returns the batch's own status. The `-j 4` is mac-studio's
+width. On a native GPU box, omit it for a GPU batch: an explicit `-j` wins over the per-slot
+width `tools/test-run.sh` injects there (ahrefs/ocannl#1033), so `-j 4` would halve rog's `-j 8`. The bare suites of a
 repository whose runner is a plain script go through it the same way, one batch per call
 (2026-09-15: the coordinator ended up granting this by message after sixteen
 request/assign/report round-trips parked three workers idle between review rounds).
