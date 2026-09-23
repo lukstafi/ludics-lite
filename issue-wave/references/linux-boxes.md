@@ -4,13 +4,8 @@ Use this note when a placement's `kind_of` is `linux`; for `wsl`, see
 [wsl-boxes.md](wsl-boxes.md). The boxes run Ubuntu 26.04.1, kernel 7.0.0-31, set up by
 `~/self-improve/scripts/install-linux.md`. Each trap below gives its symptom, the check to run,
 and its evidence. Every claim was checked by read-only probes on rog-nv-linux,
-minix-amd-linux and tuf-amd-linux on 2026-09-23, except where a line says otherwise.
-
-A trap here is a durable property of a box or platform that a worker must live with. A defect
-in the fleet's own tooling or setup that has, or deserves, an issue does not belong here: it is
-a priority fix that gates the wave items on its path ([Decision
-gate](../SKILL.md#decision-gate-before-launch-batched-fatigue-aware)). An entry whose fix is in
-flight leaves with that fix's PR.
+minix-amd-linux and tuf-amd-linux on 2026-09-23, except where a line says otherwise. Entries
+are durable properties of the box; a problem that can be fixed is fixed, not recorded here.
 
 **The environment comes from bash startup, which only some processes run.** Line 1 of
 `~/.bashrc`, before Ubuntu's interactive guard, sources `~/.config/fleet/env.sh`. That file
