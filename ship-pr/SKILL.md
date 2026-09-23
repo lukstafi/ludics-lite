@@ -1031,10 +1031,11 @@ and the remedy for that is an ignore rule rather than this helper deleting a tre
 primary checkout to clean up an unrelated topic branch.
 
 It fetches and proves the ordinary topic is an ancestor of `origin/<base>` before deleting
-anything, deletes the remote branch, advances the local base according to which worktree owns it,
-detaches and unregisters the session worktree into a sibling recovery archive, rechecks ancestry
-against the updated local base, and
-deletes the local branch independently of its configured upstream. Its scratch-repository test
+anything, advances the local base according to which worktree owns it, detaches and unregisters
+the session worktree into a sibling recovery archive, rechecks ancestry against the updated local
+base, deletes the local branch independently of its configured upstream, and deletes the remote
+branch last: only once the local deletion has committed and been read back, so a cleanup that
+stops part-way leaves the public branch in place rather than gone beside a surviving local one. Its scratch-repository test
 covers an unchecked-out base, a base owned by the primary checkout, a base owned by another
 worktree, safe deletion while the primary checkout is off the base, an explicit `main` base, and
 refusal of an unmerged topic:
