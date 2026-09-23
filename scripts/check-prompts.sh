@@ -1064,12 +1064,16 @@ invocation_options() {
 # `case`'s own indent. In it an arm is a line whose first word is `--name)`, and the arm is that
 # line through the first line ENDING in `;;`, a one-line arm included. A pattern line that names a
 # `--` option in any other spelling (`--a|--b)`, `"--a")`, `-h|--help)`) prints the pattern with
-# arity `?`, so an option the reader cannot name is refused as unlisted rather than skipped.
+# arity `?`, so an option the reader cannot name is refused as unlisted rather than skipped; any
+# other pattern opens an arm skipped to its `;;`, and a glob among them (`*)`, `-*)`) shadows every
+# `--name)` arm after it, which prints `shadowed:<pattern>` and is refused -- case runs the FIRST
+# arm that matches, and the helper keeps its catch-all last.
 #
 # An arm is READ only when it is straight-line in the helper's own grammar: with quoted spans and
 # `#` comments dropped, every `;`-separated statement in it is one of `shift`/`shift N`, a single
 # assignment word (`NAME=word`, `NAME+=(word)`, no operator or blank outside quotes), or a
-# `[ … ] || usage` guard, whose `usage` exits -- and exactly one of them is a shift. Its arity is
+# `[ … ] || usage` guard, whose `usage` exits -- and exactly one of them is a shift, with no quote
+# left open and no backslash, since the per-line split models neither. Its arity is
 # then N-1 for that `shift N` (`shift 2` is 1, a bare `shift` is 0). Any other statement makes the
 # arm UNREAD, printed as `?` and refused by the caller: a heredoc, a `continue` or `break`, a
 # conditional or pipeline, a subshell or brace group, a nested case, a line a trailing operator or
@@ -1093,18 +1097,26 @@ parser_options() {
       name = substr($0, RSTART, RLENGTH - 1); sub(/^[[:space:]]*/, "", name)
       arm = 1; ar = ""; ns = 0; amb = 0; $0 = substr($0, RSTART + RLENGTH)
     }
-    # A pattern naming an option in a spelling other than one bare `--name` is an option this
-    # reader cannot name: reported whole and unread, never skipped (round 4, P2).
-    !arm && match($0, /^[[:space:]]*[^[:space:]#()]*--[^)]*\)/) {
+    # Any other pattern opens an arm whose body is skipped to its `;;`. One naming an option in a
+    # spelling other than one bare `--name` is an option this reader cannot name: reported whole
+    # and unread, never skipped (round 4, P2). A glob matches the long options too, and case takes
+    # the FIRST arm that matches, so every `--name)` arm after one is shadowed (round 5, P2).
+    !arm && match($0, /^[[:space:]]*[^[:space:]#)][^)]*\)/) {
       p = substr($0, RSTART, RLENGTH - 1); sub(/^[[:space:]]*/, "", p)
-      print p "\t?"; next
+      if (p ~ /--/) print p "\t?"
+      if (p ~ /[*?[]/ && glob == "") glob = p
+      arm = 1; name = ""; $0 = substr($0, RSTART + RLENGTH)
     }
     arm {
-      # Quoted spans are text, and a `#` opening a word -- after a blank, a `;` or an operator,
+      # Quoted spans are text, each standing as one plain word Q, and a `#` opening a word -- after a blank, a `;` or an operator,
       # `;;# shift 2` included -- starts a comment: neither carries a command (round 1, P2).
       l = $0
-      gsub(/\047[^\047]*\047/, "\047\047", l); gsub(/"([^"\\]|\\.)*"/, "\"\"", l)
+      gsub(/\047[^\047]*\047/, "Q", l); gsub(/"([^"\\]|\\.)*"/, "Q", l)
       if (match(l, /(^|[[:space:];&|()])#/)) l = substr(l, 1, RSTART + RLENGTH - 2)
+      # A quote left open runs onto the next line and a backslash escapes what follows it, a `;`
+      # included: the line-by-line split below models neither, so either leaves the arm unread
+      # (round 5, P2).
+      if (l ~ /["\047\\`]/) amb = 1
       closes = sub(/;;[[:space:]]*$/, "", l)
       nseg = split(l, seg, ";")
       for (k = 1; k <= nseg; k++) {
@@ -1118,7 +1130,9 @@ parser_options() {
       }
       # Every shift in the arm runs in sequence, so a second one -- equal or not -- consumes more
       # than either says: the arity of an arm is read off exactly one.
-      if (closes) { print name "\t" (ns == 1 && !amb ? ar : "?"); arm = 0 }
+      if (closes && name != "")
+        print name "\t" (glob != "" ? "shadowed:" glob : (ns == 1 && !amb ? ar : "?"))
+      if (closes) arm = 0
     }
   ' "$1"
 }
@@ -1152,6 +1166,8 @@ check_cleanup_options() {
     p=$(printf '%s\n' "$parsed" | awk -F'\t' -v o="$o" '$1 == o { print $2; exit }')
     if [ -z "$p" ]; then
       ko "$CLEANUP_HELPER" "usage() lists '$o', for which the option parser has no '$o)' arm"; bad=1
+    elif [ "${p#shadowed:}" != "$p" ]; then
+      ko "$CLEANUP_HELPER" "the parser's '$o)' arm follows the pattern '${p#shadowed:})', which case matches first, so it never runs"; bad=1
     elif [ "$p" = "?" ]; then
       ko "$CLEANUP_HELPER" "the parser's '$o)' arm is not one this reader can read: it needs exactly one 'shift' or 'shift N' among straight-line statements -- single assignment words and '[ … ] || usage' guards (see parser_options)"; bad=1
     elif [ "$p" != "$a" ]; then

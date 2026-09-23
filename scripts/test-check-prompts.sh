@@ -1345,6 +1345,25 @@ cleanup_edit "$CLEANUP_HELPER" 's/^  --base)$/  --hidden|--secret)\
 expect "an alternation arm is an option the reader cannot name, refused as unlisted" 1 \
   "the option parser takes '--hidden|--secret', which usage() does not list" -- "$CP" "$R"
 
+# Round 5, P2 x3: the split is per line and per `;`, so a quote left open across lines and a
+# backslash-escaped `;` -- both of which carry a `shift 2` as data -- leave the arm unread; and case
+# runs the first arm that matches, so a glob ahead of the `--name)` arms shadows them.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    NOTE="\
+    shift 2\
+    TAIL="/'
+expect "a shift inside a quote spanning lines is not the arm's" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    NOTE=x\\;shift 2/'
+expect "...nor one behind an escaped semicolon" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
+for glob in '*) usage ;;' '-*) shift ;;'; do
+  cleanup_tree
+  cleanup_edit "$CLEANUP_HELPER" "s/^  --base)\$/  $glob\\
+  --base)/"
+  expect "an arm behind a '${glob%%)*})' pattern, which matches it first, is refused" 1 \
+    "the parser's '--base)' arm follows the pattern '${glob%%)*})'" -- "$CP" "$R"
+done
+
 # A parser this reader cannot find is refused, not read as agreeing with nothing.
 cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" 's/^while \[ "\$#" -gt 0 \]; do$/while (( $# )); do/'
