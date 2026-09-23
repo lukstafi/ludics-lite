@@ -360,8 +360,9 @@ requirements for every transport with transport-specific setup and identity, and
   [CLI reservation handoff](references/executions.md#cli-reservation-handoff). A resumed worker
   runs only the assigned command, reports runner evidence and yields again; neither the
   returned turn nor its report releases the box.
-- **Block on every run before yielding**: `TaskOutput` on the harness's background task, or
-  `tools/test-run.sh wait last`, because a returned turn says only that the turn ended
+- **Block on every run before yielding**, the review watch and the merge wait included: a
+  Claude worker as [Blocking on a run](references/native-claude.md#blocking-on-a-run) says, a
+  Codex worker by keeping its turn open, because a returned turn says only that the turn ended
   (Supervise: *A returned turn means the turn ended*).
 - Model-agnostic text: the commit trailer says "credit your own model" (the project's
   `Co-Authored-By` shape with the worker's own model name), never a model the coordinator
@@ -398,7 +399,7 @@ requirements for every transport with transport-specific setup and identity, and
 - Process discipline, stated explicitly because workers re-derive it badly under load: never
   end a turn with only an unobserved detached process outstanding - use the harness's tracked
   wait mechanism (Codex keeps the turn open or schedules an authorized heartbeat; a Claude
-  worker blocks with `TaskOutput` or the runner's own `wait`); if a review watch goes quiet
+  worker blocks as [Blocking on a run](references/native-claude.md#blocking-on-a-run) says); if a review watch goes quiet
   suspiciously long, read the PR feed directly (`gh pr view --comments`) rather than re-arming
   the watch (reactions persist across rounds and strand it); commit early and often - commits
   are what survives every failure mode below.

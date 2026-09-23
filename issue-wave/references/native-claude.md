@@ -4,9 +4,24 @@ The Claude-specific half of a native wave; the shared body - placement, launch, 
 supervision, recovery, close-out, the two-worker smoke - is [native-workers.md](native-workers.md).
 The tools are what this runtime exposes: `Agent` spawns a worker (it returns the agent's name
 or ID, which is the address for everything after), `SendMessage` continues a spawned agent
-with its context intact, `ListAgents` lists the ones currently running, `TaskOutput` blocks on
-a background task, `TaskStop` ends one. Read their current schemas; a deferred tool is loaded
-with `ToolSearch` first.
+with its context intact, `ListAgents` lists the ones currently running, `TaskStop` ends a
+background task. Read their current schemas; a deferred tool is loaded with `ToolSearch` first.
+
+## Blocking on a run
+
+A native worker has no tool that holds its turn on a background task. `TaskOutput` is absent
+from its runtime (2026-09-23: three workers, `ToolSearch select:TaskOutput` matched nothing), so
+name it only where the runtime lists it. `Monitor` and background-completion notifications are
+not waits either: they arrive after the turn has ended, and a worker that yields on one may not be
+woken. What holds a turn is a foreground Bash call, capped at 600 s. So:
+
+- a project-runner batch blocks with `tools/test-run.sh wait last --timeout 540`, re-issued
+  on exit 124 until the run's own status comes back;
+- anything that can outlast the cap is backgrounded with its exit status appended to its log
+  (`<cmd> > <log> 2>&1; echo "rc=$?" >> <log>`), and the worker blocks with a foreground
+  `until grep -q '^rc=' <log>; do sleep 5; done` under a timeout below the cap, re-issued until
+  it returns. That includes ship-pr's `pr-review.sh watch` and `merge --wait`, which are never
+  run in the foreground: a live 👀 can stretch a watch to its 20-minute grace.
 
 ## Worker channel
 
@@ -53,8 +68,8 @@ and a release through five PRs on 2026-09-15 with no stranded worker.
    concurrent load. An exclusively reserved measurement runs the bounded project runner directly,
    without `execution slot`, as [executions.md](executions.md#reserve-launch-observe-conclude)
    specifies: under `fleet-worker.sh execution hold -- <command>`, the OS-level sleep guard
-   alone. The worker blocks on either kind to completion within the turn (`TaskOutput` on the harness's
-   background task, or `tools/test-run.sh wait last`), and ends that turn with one fixed line,
+   alone. The worker blocks on either kind to completion within the turn ([Blocking on a
+   run](#blocking-on-a-run)), and ends that turn with one fixed line,
    so the coordinator concludes without grepping run ids out of prose:
 
    ```
