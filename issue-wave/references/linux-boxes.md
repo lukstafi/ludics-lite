@@ -38,7 +38,7 @@ not re-run here.
 **A HIP result on one AMD box does not stand for the other.** minix is a Radeon 8060S, gfx1151,
 an APU whose VRAM is carved out of system memory (amdgpu reports 64 GiB). tuf is a discrete RX
 7700S, gfx1102, with 8 GiB of VRAM. rog is an RTX 5070 Ti Laptop GPU with 12 GiB. Each box's role
-is under [Inputs](../SKILL.md#inputs). Take the device from the run log, not from the box's
+is under *Inputs* in `issue-wave/SKILL.md`. Take the device from the run log, not from the box's
 name. Check: `rocminfo | grep -E "Marketing|gfx"`, or `nvidia-smi -L` on rog.
 
 **Nothing holds a box awake under a run.** GNOME's idle suspend on AC is off (timeout 0) on all
