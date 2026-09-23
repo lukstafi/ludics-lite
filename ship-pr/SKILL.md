@@ -136,15 +136,6 @@ ocannl-staging `ci` carries `paths-ignore: docs/**`, so a docs-only push produce
 the newest verdict legitimately trails the tip by a commit or several — that is a gap in coverage,
 not a stale reading, and the printed SHA is what lets you tell them apart.
 
-For OCANNL, “full matrix” means the ordinary Linux/macOS PR matrix. Needed Windows evidence
-comes from CI: for ship-pr's scripts the Git Bash workflow, dispatched on the branch
-(`gh workflow run windows-git-bash.yml --ref <branch>`), and for OCANNL a `windows_only: true`
-dispatch with the full `expected_sha`, verified on its head and both Windows jobs' executed
-results; never wait on the scheduled sweep. Use `rog-nv-win` or `minix-amd-win` only when it is
-booted into Windows or the check needs its hardware: invoke `"C:\Program Files\Git\bin\bash.exe"`
-(over ssh a bare `bash` is WSL's), have the script under test print `uname -s` (`MINGW*`/`MSYS*`)
-and `git --version` (`.windows.`), and keep `tools/test-run.sh`'s record.
-
 ## Open
 
 Look at the working tree first: commit what belongs to this goal, and say explicitly what you did
@@ -850,6 +841,9 @@ the cwd stopped being a source (ludics-lite#74 — a background shell that had s
 project's worktree awaited a run id from this one, and the 404 came back as a verdict about the
 run). A bare id is accepted only with `-R owner/name` or `REPO=`, and refused with exit 2
 otherwise; a run/repo pair the API rejects is exit 2 too, never the exit 1 that reads as red.
+
+Evidence from a platform the PR matrix skips comes from dispatching that workflow on the head
+and citing the run, never from waiting on a scheduled sweep.
 
 ### How stale the base has grown
 

@@ -318,6 +318,11 @@ of success. The bounded two-worker transport smoke is in [native-workers.md](nat
 
 ## Bounded native Windows verification
 
+Over ssh a `-win` box lands in cmd.exe, where `git --version` prints `.windows.` but a bare `bash`
+is WSL's. Invoke Git Bash by path, as the driver below does, and have the script under test print
+`uname -s` (`MINGW*`/`MSYS*`) and `git --version` (`.windows.`); for OCANNL keep
+`tools/test-run.sh`'s record.
+
 Use `issue-wave/scripts/windows-driver.ps1` for a foreground Git Bash verifier on native
 Windows. It extracts the corrected driver from the #671 verification evidence. For example:
 
