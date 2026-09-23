@@ -367,6 +367,45 @@ preflight_script() {
 codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4" cross="$5" cross_timeout="$6"
 refuse=""
 note() { refuse="$refuse; $*"; }
+# A stale tmux server environment (ludics-lite#327). A CLI worker's `bash run.sh` reads no startup
+# file, and a new tmux session takes the SERVER's environment, not the asking shell's, so an
+# env.sh or gpu.sh edit reaches no CLI worker on a box whose server predates it -- silently: a
+# server started before gpu.sh dropped ROCM_PATH=/usr (2026-09-22) would have gone on handing
+# workers the value that broke hipcc's bitcode discovery. The reference is what a server started
+# NOW would get, which is this script's own environment: on a remote box it runs under
+# `ssh <box> "bash -s"`, the fresh non-login ssh shell whose ~/.bashrc sources env.sh (the
+# launch that starts a server runs under the same one), and on the local box under a `bash -s`
+# that reads no startup file, as that launch does. The coordinator's own environment never
+# enters a remote comparison. No server running passes: the next launch starts a fresh one.
+TMUX_ENV_VARS="PATH ROCM_PATH HIP_PATH OPAM_SWITCH_PREFIX"
+tmux_env_check() {
+  local sessions genv v line sset sval fset fval diff="" workers="" others="" tmx
+  sessions=$(tm list-sessions -F '#{session_name}' 2>/dev/null) || return 0   # no server
+  genv=$(tm show-environment -g 2>/dev/null) || return 0                      # it exited since
+  for v in $TMUX_ENV_VARS; do
+    # `VAR=value` is set, `-VAR` is removed from the global environment, no line is never set.
+    sset=0; sval=""
+    while IFS= read -r line; do
+      case "$line" in "$v="*) sset=1; sval=${line#"$v="} ;; "-$v") sset=0; sval="" ;; esac
+    done <<< "$genv"
+    fset=0; fval=""; if [ -n "${!v+x}" ]; then fset=1; fval=${!v}; fi
+    [ "$sset" = "$fset" ] && [ "$sval" = "$fval" ] && continue
+    [ "$sset" = 1 ] || sval="unset"; [ "$fset" = 1 ] || fval="unset"
+    diff="$diff, $v is $sval in the server but $fval in a fresh shell"
+  done
+  [ -n "$diff" ] || return 0
+  # Every live worker is an iw-<name> session on this socket (`ls` reads RUNNING from the same
+  # sessions), and kill-server ends every session the server holds.
+  while IFS= read -r line; do
+    case "$line" in iw-*) workers="$workers $line" ;; ?*) others="$others $line" ;; esac
+  done <<< "$sessions"
+  if [ -n "$TMUX_SOCKET" ]; then tmx="tmux -L $(printf '%q' "$TMUX_SOCKET")"; else tmx=tmux; fi
+  if [ -n "$workers" ]; then
+    note "stale tmux server environment (${diff#, }): a CLI worker launched now would inherit the server's values; wait for its live worker session(s) (${workers# }; \`fleet-worker.sh ls $BOX\`) to finish, then \`$tmx kill-server\` if it outlives them"
+  else
+    note "stale tmux server environment (${diff#, }): a CLI worker launched now would inherit the server's values; no worker session is live on it, so restart it with \`$tmx kill-server\`${others:+ (this also ends its non-worker session(s):$others)} and launch again"
+  fi
+}
 # One preflight per box at a time: a parallel group launched together would otherwise race
 # `git fetch`/`merge` in the same checkout and refuse on git's own lock files. Idempotent, so
 # waiting for the other preflight is the right thing; the bound covers a hung live probe.
@@ -458,7 +497,10 @@ elif [ "$codex" = 0 ]; then
     fi
   fi
 fi
-case "$codex" in native|native-claude) ;; *) command -v tmux >/dev/null 2>&1 || note "no tmux" ;; esac
+case "$codex" in
+  native|native-claude) ;;
+  *) if command -v tmux >/dev/null 2>&1; then tmux_env_check; else note "no tmux"; fi ;;
+esac
 command -v jq >/dev/null 2>&1 || note "no jq"
 # Every correctness batch on this box now runs under `execution slot`, whose N-holder lock is a
 # real flock taken by python3 (ludics-lite#160), so Python is no longer an anchor-only need.

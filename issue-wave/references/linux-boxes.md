@@ -16,15 +16,6 @@ bash on the box gets only its parent's environment. Symptom: `nvcc: not found`, 
 `hipcc: not found`, or another OCaml. Check:
 `ssh <box> 'command -v nvcc hipcc dune; ocaml -version; echo "ROCM_PATH=${ROCM_PATH-unset} HIP_PATH=${HIP_PATH-unset}"'`.
 
-**A tmux server keeps the environment it started with.** A CLI worker runs `bash run.sh` in a
-tmux session (`fleet-worker.sh launch`), and `bash run.sh` reads no startup file. A new
-session takes the server's environment, not the environment of the shell that asked for it.
-So an edit to `env.sh` or `gpu.sh`, such as the `ROCM_PATH` fix below, reaches no worker until
-that tmux server restarts. Check: `ssh <box> 'tmux show-environment -g | grep -E "^(PATH|ROCM_PATH|HIP_PATH)="'`.
-An `error connecting` reply means no server is running, and the next launch starts a fresh one.
-Evidence: tmux 3.6 on minix, on an isolated socket. A variable changed after the server started
-kept its old value in the next session.
-
 **HIP: `HIP_PATH=/usr` and `ROCM_PATH` unset.** Ubuntu's HIP 7.1 (`hipcc` over Ubuntu clang 21)
 installs under `/usr`, with its device-library bitcode in `/usr/lib/llvm-21/lib/clang/21/amdgcn`.
 `/opt/rocm` does not exist on any box. `gpu.sh` sets `HIP_PATH=/usr`, which OCANNL's HIP include
