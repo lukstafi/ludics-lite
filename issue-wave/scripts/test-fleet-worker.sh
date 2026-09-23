@@ -253,12 +253,17 @@ cat > "$TMP/bin/tmux" <<EOF
 if [ -n "\${SHIM_TMUX_FAIL_NEW:-}" ]; then case " \$* " in *" new-session "*) echo "shim: tmux refuses new-session" >&2; exit 1 ;; esac; fi
 # The server the preflight's environment check reads (ludics-lite#327): SHIM_TMUX_GENV names a
 # file holding \`show-environment -g\` output, or \`none\` for no server running; SHIM_TMUX_SESSIONS
-# lists its session names. Unset, the real server on the test socket answers.
+# lists its session names and SHIM_TMUX_UPDATE_ENV its update-environment option. Unset, the real
+# server on the test socket answers.
 if [ -n "\${SHIM_TMUX_GENV:-}" ]; then
   case " \$* " in
-    *" list-sessions "*|*" show-environment "*)
+    *" list-sessions "*|*" show-environment "*|*" show-options "*)
       [ "\$SHIM_TMUX_GENV" != none ] || { echo "no server running on /tmp/shim/\${FLEET_TMUX_SOCKET:-default}" >&2; exit 1; }
-      case " \$* " in *" list-sessions "*) for s in \${SHIM_TMUX_SESSIONS:-}; do echo "\$s"; done ;; *) cat "\$SHIM_TMUX_GENV" ;; esac
+      case " \$* " in
+        *" list-sessions "*) for s in \${SHIM_TMUX_SESSIONS:-}; do echo "\$s"; done ;;
+        *" show-options "*) for s in DISPLAY SSH_AUTH_SOCK \${SHIM_TMUX_UPDATE_ENV:-}; do echo "\$s"; done ;;
+        *) cat "\$SHIM_TMUX_GENV" ;;
+      esac
       exit 0 ;;
   esac
 fi
@@ -745,8 +750,14 @@ grep -q 'restart it with' <<<"$out" && ko "kill-server offered as the fix while 
 expect "with no live worker session, the refusal names the socket's kill-server" 1 \
   "ROCM_PATH is /usr in the server .*no worker session is live on it, so restart it with \`tmux -L $FLEET_TMUX_SOCKET kill-server\` and launch again" -- \
   "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" "$FW" preflight testbox --no-probe
-expect "...and warns which non-worker sessions a kill-server would end" 1 "this also ends its non-worker session(s): notes)" -- \
+expect "...and warns which non-worker sessions a kill-server would end" 1 "kill-server also ends its non-worker session(s): notes)" -- \
   "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" SHIM_TMUX_SESSIONS="notes" "$FW" preflight testbox --no-probe
+expect "...and warns of them too when the advice is to wait for live workers first" 1 "to finish, then .*kill-server.* if it outlives them (kill-server also ends its non-worker session(s): notes)" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" SHIM_TMUX_SESSIONS="iw-w7 notes" "$FW" preflight testbox --no-probe
+expect "a variable tmux refreshes from the client (update-environment) is not compared" 0 "PREFLIGHT OK" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" SHIM_TMUX_UPDATE_ENV="ROCM_PATH" "$FW" preflight testbox --no-probe
+expect "...while the variables it does not refresh still are" 1 "PATH is /old/bin:.* in the server" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-path" SHIM_TMUX_UPDATE_ENV="ROCM_PATH" "$FW" preflight testbox --no-probe
 expect "a variable the fresh shell gained since the server started refuses too" 1 "HIP_PATH is unset in the server but /usr in a fresh shell" -- \
   "${fresh[@]}" HIP_PATH=/usr SHIM_TMUX_GENV="$TMP/genv-match" "$FW" preflight testbox --no-probe
 expect "a PATH that moved since the server started refuses" 1 "PATH is /old/bin:.* in the server but .* in a fresh shell" -- \
@@ -761,6 +772,17 @@ envsock="fwtest-env-$$"
 "${fresh[@]}" ROCM_PATH=/usr "$REAL_TMUX" -L "$envsock" new-session -d -s iw-real 'sleep 60'
 expect "a real server started with ROCM_PATH=/usr refuses a fresh shell without it" 1 \
   "ROCM_PATH is /usr in the server but unset in a fresh shell): .*wait for its live worker session(s) (iw-real;" -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe
+# update-environment, on the real server: tmux copies ROCM_PATH from the launching client into
+# each new session, so the stale global value reaches no worker and the launch is safe.
+"$REAL_TMUX" -L "$envsock" set-option -ga update-environment ROCM_PATH
+expect "a real server that refreshes ROCM_PATH from the client passes despite its stale global value" 0 "PREFLIGHT OK" -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe
+"$REAL_TMUX" -L "$envsock" set-option -gu update-environment
+# exit-empty off: the server outlives its last session and a new one would still inherit from it.
+"$REAL_TMUX" -L "$envsock" set-option -g exit-empty off
+"$REAL_TMUX" -L "$envsock" kill-session -t iw-real
+expect "a real server left with no session (exit-empty off) is still checked" 1 "ROCM_PATH is /usr in the server .*no worker session is live on it, so restart it with \`tmux -L $envsock kill-server\`" -- \
   "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe
 "$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
 "${fresh[@]}" "$REAL_TMUX" -L "$envsock" new-session -d -s iw-real 'sleep 60'

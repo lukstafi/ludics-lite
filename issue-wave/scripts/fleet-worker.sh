@@ -379,10 +379,19 @@ note() { refuse="$refuse; $*"; }
 # enters a remote comparison. No server running passes: the next launch starts a fresh one.
 TMUX_ENV_VARS="PATH ROCM_PATH HIP_PATH OPAM_SWITCH_PREFIX"
 tmux_env_check() {
-  local sessions genv v line sset sval fset fval diff="" workers="" others="" tmx
-  sessions=$(tm list-sessions -F '#{session_name}' 2>/dev/null) || return 0   # no server
-  genv=$(tm show-environment -g 2>/dev/null) || return 0                      # it exited since
+  local sessions genv refreshed v line skip sset sval fset fval diff="" workers="" others="" tmx
+  genv=$(tm show-environment -g 2>/dev/null) || return 0   # no server running
+  # `exit-empty off` keeps a server alive with no session at all, so the server is found by its
+  # environment, never by its session list; an unreadable list is an empty one.
+  sessions=$(tm list-sessions -F '#{session_name}' 2>/dev/null) || sessions=""
+  # A variable named in `update-environment` is copied from the launching client into every new
+  # session (removed there when the client lacks it), so the worker gets the fresh shell's value
+  # whatever the global one says: comparing it would refuse a safe launch.
+  refreshed=$(tm show-options -gv update-environment 2>/dev/null)
   for v in $TMUX_ENV_VARS; do
+    skip=0
+    while IFS= read -r line; do [ "$line" = "$v" ] && skip=1; done <<< "$refreshed"
+    [ "$skip" = 0 ] || continue
     # `VAR=value` is set, `-VAR` is removed from the global environment, no line is never set.
     sset=0; sval=""
     while IFS= read -r line; do
@@ -400,10 +409,13 @@ tmux_env_check() {
     case "$line" in iw-*) workers="$workers $line" ;; ?*) others="$others $line" ;; esac
   done <<< "$sessions"
   if [ -n "$TMUX_SOCKET" ]; then tmx="tmux -L $(printf '%q' "$TMUX_SOCKET")"; else tmx=tmux; fi
+  # Whichever branch names kill-server also names what else it would end: on the default socket
+  # those are the user's own sessions.
+  others=${others:+ (kill-server also ends its non-worker session(s):$others)}
   if [ -n "$workers" ]; then
-    note "stale tmux server environment (${diff#, }): a CLI worker launched now would inherit the server's values; wait for its live worker session(s) (${workers# }; \`fleet-worker.sh ls $BOX\`) to finish, then \`$tmx kill-server\` if it outlives them"
+    note "stale tmux server environment (${diff#, }): a CLI worker launched now would inherit the server's values; wait for its live worker session(s) (${workers# }; \`fleet-worker.sh ls $BOX\`) to finish, then \`$tmx kill-server\` if it outlives them$others"
   else
-    note "stale tmux server environment (${diff#, }): a CLI worker launched now would inherit the server's values; no worker session is live on it, so restart it with \`$tmx kill-server\`${others:+ (this also ends its non-worker session(s):$others)} and launch again"
+    note "stale tmux server environment (${diff#, }): a CLI worker launched now would inherit the server's values; no worker session is live on it, so restart it with \`$tmx kill-server\`$others and launch again"
   fi
 }
 # One preflight per box at a time: a parallel group launched together would otherwise race
