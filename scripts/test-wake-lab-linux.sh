@@ -62,6 +62,25 @@ out=$(WAKE_LAB_HOSTS="$tmp/rog-hosts.sh" SSH_UP=rog-nv-win "$tmp/wake-lab.sh" st
 check 'Linux-configured dual boot reports Windows when Windows answered' '[ "$rc" = 0 ] && [[ "$out" == *"os=windows"* ]]'
 out=$(WAKE_LAB_HOSTS="$tmp/rog-hosts.sh" SSH_UP=rog-nv-wsl "$tmp/wake-lab.sh" status rog 2>&1); rc=$?
 check 'Linux-configured dual boot reports WSL when its guest answered' '[ "$rc" = 0 ] && [[ "$out" == *"os=wsl"* ]]'
+# ludics-lite#320: a bare `status` is a read of the whole lab, so it shows tuf -- Wi-Fi only and
+# woken by hand, often the one box awake -- beside rog and minix. The bare WAKE keeps `rog minix`:
+# tuf cannot be woken over Wi-Fi, so defaulting a wake to it would only print manual-wake guidance.
+cat >"$tmp/lab-hosts.sh" <<'HOSTS'
+mac_of() { case "$1" in rog) echo aa:bb:cc:00:00:02 ;; minix) echo aa:bb:cc:00:00:03 ;; tuf) echo aa:bb:cc:00:00:06 ;; *) return 1 ;; esac; }
+eth_mac_of() { case "$1" in rog|minix) mac_of "$1" ;; *) return 1 ;; esac; }
+ip_of() { case "$1" in rog) echo 192.0.2.30 ;; minix) echo 192.0.2.31 ;; tuf) echo 192.0.2.32 ;; *) return 1 ;; esac; }
+kind_of() { case "$1" in rog|minix|tuf) echo linux ;; *) return 1 ;; esac; }
+HOSTS
+out=$(WAKE_LAB_HOSTS="$tmp/lab-hosts.sh" SSH_UP=1 "$tmp/wake-lab.sh" status 2>&1); rc=$?
+check 'bare status reads all three boxes, tuf included' '[ "$rc" = 0 ] && [[ "$out" == *"
+rog "*"os=--"* ]] && [[ "$out" == *"
+minix "*"os=--"* ]] && [[ "$out" == *"
+tuf "*"os=linux  linux=UP"* ]]'
+: >"$SSH_LOG"
+out=$(WAKE_LAB_HOSTS="$tmp/lab-hosts.sh" "$tmp/wake-lab.sh" 2>&1); rc=$?
+check 'bare wake still defaults to rog minix, never the manual-wake tuf' '[ "$rc" = 0 ] && [[ "$out" == *"rog:"* ]] && [[ "$out" == *"minix:"* ]] && [[ "$out" != *"tuf:"* ]] && [[ "$out" != *"wake it manually"* ]]'
+out=$("$tmp/wake-lab.sh" status 2>&1); rc=$?
+check 'bare status over a table that does not know rog and minix refuses rather than shrinking' '[ "$rc" = 1 ] && [[ "$out" == *"not in the host table"*"rog minix"* ]]'
 out=$("$tmp/wake-lab.sh" unhold tuf 2>&1); rc=$?
 check 'Linux unhold is a no-op without the adapter' '[ "$rc" = 0 ] && [[ "$out" == *"no holder needed"* ]]'
 out=$("$tmp/wake-lab.sh" tuf 2>&1); rc=$?

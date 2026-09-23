@@ -89,7 +89,8 @@ script; they are what the coordinator tells its workers.
   a parallelism analysis, machine placement, and a ready-now first wave. If it has a design
   questions section (see Decision gate), that too.
 - **The fleet**: `mac-studio` (Metal + cc, the reference dev box), `rog-nv-linux` (CUDA, 24
-  cores), `minix-amd-linux` (HIP, 32 cores), and `tuf-amd-linux` (AMD, manual wake).
+  cores), `minix-amd-linux` (HIP, 32 cores; Radeon 8060S `gfx1151`, unified memory), and
+  `tuf-amd-linux` (HIP, 16 threads; discrete RX 7700S `gfx1102`; Wi-Fi, manual wake).
   The site's `FLEET_BOXES` and `FLEET_HOSTNAME_MAP` must use the OS endpoint that `kind_of` and
   `wake-lab.sh status` report. The daily plan may still spell the same physical ROG or Minix
   box with its former `-wsl` suffix: translate only that suffix to the current `-linux` alias
@@ -109,6 +110,23 @@ script; they are what the coordinator tells its workers.
   wrong box. `fleet-worker.sh load` (flotilla, `http://mac-studio:7799/api/fleet`) gives
   reachability and current load per box; `fleet-worker.sh ls` lists CLI workers; the board
   lists the rest.
+- **`tuf-amd-linux` is the discrete-memory AMD box** (role set by the user on 2026-09-23). An ASUS
+  TUF laptop: AMD Radeon RX 7700S (Navi 33, `gfx1102`, discrete RDNA3, 8 GiB of its own VRAM),
+  Ryzen 7 7435HS (16 threads), 30 GB RAM, Ubuntu 26.04.1. It exists in the plan to develop and
+  benchmark HIP against discrete device memory: minix's `gfx1151` shares system memory with the
+  CPU, which can mask host↔device transfer, buffer-placement and pinned/zero-copy bugs that a
+  discrete card exposes. So the daily plan homes HIP work whose behaviour depends on the memory
+  model on TUF, or gives it a TUF leg beside minix's (the placement stays a lookup in the plan),
+  and a HIP measurement says which memory model it ran on. It is
+  on Wi-Fi only, so neither `wake-lab.sh` nor flotilla's wake can reach it: a person wakes it by
+  hand. **Placement consequence:** a TUF-homed item, or a TUF leg, is gated on the box being up.
+  When `wake-lab.sh status` shows it down, ask the user to wake it, or defer the item with the
+  gate recorded on the board. Asleep is a placement fact, never a failure of the item, and never a
+  reason to move a memory-model leg to minix, where the bug it exists to catch can hide. A silent
+  TUF does not stop other launches either: `fleet-worker.sh preflight` notes it on the OK line
+  (`cross-box unreachable, asleep or off the network: tuf-amd-linux`) and `load` shows it as an
+  `ok=false` row. Never suspend or power it off from a wave, because nothing brings it back over
+  the network.
 - **Project conventions**: the repo's CLAUDE.md and agent-notes govern how workers work
   (worktree location, test discipline, commit style). The plan governs what and in which order.
 
@@ -140,7 +158,8 @@ WSL's measured dxg limit is one, while native Linux may be configured higher aft
 ludics-lite#157, #160) - a count `execution slot` takes around each batch, so a worker's
 standing reservation never gates another worker's start ([executions.md](references/executions.md)).
 
-A box that is asleep or unreachable is a placement fact, not a blocker: wake it through
+A box that is asleep or unreachable is a placement fact, not a blocker: wake it (all but
+`tuf-amd-linux`, which only a person can wake: see Inputs) through
 `wake-lab.sh --wait <box>` or flotilla (`curl -X POST http://mac-studio:7799/api/wake -d '{"machine":"rog"}'`),
 then check `wake-lab.sh status <box>` for the OS reached. For a WSL box only, follow
 [wsl-boxes.md](references/wsl-boxes.md) before launching; native Ubuntu needs no guest kick.
