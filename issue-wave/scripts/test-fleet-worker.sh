@@ -689,6 +689,9 @@ expect "...as is an explicitly empty spec" 0 "PREFLIGHT SLOTS WARNING: .* does n
 expect "a spec naming mac-studio at one slot is a choice, printed without a warning" 0 "^PREFLIGHT SLOTS mac-studio[=]1 .*(FLEET_BOX_CORRECTNESS_SLOTS)$" -- \
   env FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=1" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
 grep -q "WARNING" <<<"$out" && ko "a spec naming mac-studio at one slot drew a collapse warning -- $out" || ok "...and no warning"
+expect "a roster over several lines prints every box" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=1 minix-amd-linux=1 tuf-amd-linux=1 (site default)$" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="mac-studio rog-nv-linux
+minix-amd-linux tuf-amd-linux" "${PFM[@]}"
 expect "a custom roster prints one slot each, without a warning" 0 "^PREFLIGHT SLOTS testbox=1 otherbox=1 (custom roster: one slot each)$" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="testbox otherbox" "$FW" preflight testbox --no-probe --no-cross
 grep -q "WARNING" <<<"$out" && ko "a custom roster drew a collapse warning -- $out" || ok "...and no warning"
@@ -1295,6 +1298,14 @@ expect "...and so does an exported roster equal to the default (the 2026-09-22 s
   env -u FLEET_BOX_CORRECTNESS_SLOTS "${FWM[@]}" FLEET_BOXES="$DEFROSTER" "$FW" execution slot --wait 0 -- echo exported-default
 expect "...or the default boxes in another order and spacing (a word set, not a string)" 0 "slot 1 of 6" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS "${FWM[@]}" FLEET_BOXES="  tuf-amd-linux mac-studio   minix-amd-linux rog-nv-linux " "$FW" execution slot --wait 0 -- echo reordered-default
+expect "...or the default boxes over several lines (every line is read, not the first)" 0 "slot 1 of 6" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS "${FWM[@]}" FLEET_BOXES="mac-studio rog-nv-linux
+minix-amd-linux
+tuf-amd-linux" "$FW" execution slot --wait 0 -- echo multiline-default
+expect "a box on a later line of the roster is in it, and a spec may name it" 0 "slot 1 of 2" -- \
+  env FLEET_LOCAL_BOX=testbox FLEET_BOXES="other
+testbox" FLEET_BOX_CORRECTNESS_SLOTS="other=1
+testbox=2" "$FW" execution slot --wait 0 -- echo multiline-roster
 expect "a custom roster still gives mac-studio one slot" 0 "slot 1 of 1" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS "${FWM[@]}" FLEET_BOXES="mac-studio rog-nv-linux" "$FW" execution slot --wait 0 -- echo custom-roster
 expect "an explicit spec overrides the default under an unset roster" 0 "slot 1 of 2" -- \

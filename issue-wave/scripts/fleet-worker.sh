@@ -117,7 +117,7 @@ detect_local_box() {
   local host pair
   local -a hostname_pairs=()
   host=$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')
-  read -r -a hostname_pairs <<< "$HOSTNAME_MAP"
+  read -r -d "" -a hostname_pairs <<< "$HOSTNAME_MAP" || :
   for pair in "${hostname_pairs[@]}"; do
     case "$pair" in *=*) ;; *) continue ;; esac
     # shellcheck disable=SC2254  # the glob is the point
@@ -132,9 +132,12 @@ DEFAULT_BOXES="mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
 BOXES="${FLEET_BOXES:-$DEFAULT_BOXES}"
 # A roster as a normalised word list: whitespace-separated, order and repeats ignored, so an
 # exported roster naming the default boxes reads as the default roster (ludics-lite#329).
+# Every configured word list here (roster, slot spec, hostname map) is read with `read -d ""`,
+# i.e. across ALL its lines: a plain `read -a` stops at the first newline, and a roster written
+# over two lines would read as a custom one and drop the Mac back to one slot (PR #333 review).
 roster_words() {
   local -a words=()
-  read -r -a words <<< "$1"
+  read -r -d "" -a words <<< "$1" || :
   [ "${#words[@]}" -gt 0 ] || return 0
   printf '%s\n' "${words[@]}" | LC_ALL=C sort -u | tr '\n' ' '
 }
@@ -617,8 +620,8 @@ cmd_preflight() {
 slots_report() {
   local b n named=0 out="" src
   local -a roster=() spec=()
-  read -r -a roster <<< "$BOXES"
-  read -r -a spec <<< "$SLOTS"
+  read -r -d "" -a roster <<< "$BOXES" || :
+  read -r -d "" -a spec <<< "$SLOTS" || :
   for b in ${roster[@]+"${roster[@]}"}; do
     n=$(box_correctness_slots "$b") || { echo "PREFLIGHT SLOTS WARNING: $n; every \`execution slot\` and reservation under it refuses" >&2; return 0; }
     out="$out $b=$n"
@@ -1321,7 +1324,7 @@ conclude_from_run() {
 in_roster() {
   local name="$1" entry
   local -a roster=()
-  read -r -a roster <<< "$BOXES"
+  read -r -d "" -a roster <<< "$BOXES" || :
   for entry in ${roster[@]+"${roster[@]}"}; do [ "$entry" = "$name" ] && return 0; done
   return 1
 }
@@ -1334,7 +1337,7 @@ in_roster() {
 box_correctness_slots() {
   local box="$1" pair count found=1
   local -a pairs=()
-  read -r -a pairs <<< "$SLOTS"
+  read -r -d "" -a pairs <<< "$SLOTS" || :
   for pair in ${pairs[@]+"${pairs[@]}"}; do
     count="${pair#*=}"
     case "$pair" in *=*) ;; *) count="" ;; esac
