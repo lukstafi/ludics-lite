@@ -337,10 +337,11 @@ test_squash_rebase_override() {
 
 # `early` pushes the newer tip before the cleanup starts, so nothing is dismantled. `late` pushes
 # it from the helper's own pre-push hook, after the local side is gone: the leased deletion fails,
-# and the refusal must end with the command that finishes the job -- run here as printed, which
-# also proves its quoting.
+# and the refusal must end with the command that finishes the job. Run as printed, which also
+# proves its quoting, it must stop while that unvalidated tip is outside the base, and delete it
+# (retaining it first) once the base has integrated it.
 test_newer_remote_tip_refusal() {
-  local after_tip finish hook log mode real_git remote_tip
+  local after_tip finish hook log main mode q_remote real_git recovery remote_tip
   for mode in early late; do
     setup_case "newer-remote-tip-$mode" merge main-off
     real_git=$(command -v git)
@@ -374,12 +375,27 @@ test_newer_remote_tip_refusal() {
       grep "origin/topic moved to $remote_tip before its leased deletion" "$log" >/dev/null ||
         { cat "$log" >&2; fail "the late refusal was not the leased deletion"; }
       finish=$(sed -n 's/.*; to finish, run: //p' "$log")
-      assert_eq "$finish" "git -C $(printf '%q' "$CASE_MAIN") push $(printf '%q' "--force-with-lease=refs/heads/topic:$remote_tip") $(printf '%q' "$CASE_REMOTE") :refs/heads/topic" \
-        "the late refusal must end with the leased finishing command"
+      main="git -C $(printf '%q' "$CASE_MAIN")"
+      q_remote=$(printf '%q' "$CASE_REMOTE")
+      recovery="refs/ship-pr/recovery/topic/$remote_tip"
+      assert_eq "$finish" "$main show-ref --exists refs/heads/topic; [ \$? = 2 ] && $main fetch --no-tags --no-write-fetch-head $q_remote $remote_tip && $main merge-base --is-ancestor $remote_tip refs/remotes/origin/master && $main update-ref $recovery $remote_tip && $main push --force-with-lease=refs/heads/topic:$remote_tip $q_remote :refs/heads/topic" \
+        "the late refusal must end with the guarded, leased finishing command"
       rm "$hook"
-      eval "$finish" >/dev/null 2>&1 || fail "the printed finishing command failed"
+      if eval "$finish" >/dev/null 2>&1; then
+        fail "the printed finishing command accepted a newer tip outside the base"
+      fi
+      assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')" \
+        "$remote_tip" "the printed finishing command must keep an unintegrated newer tip"
+      git -C "$CASE_INTEGRATOR" fetch -q origin
+      git -C "$CASE_INTEGRATOR" checkout -q -B late-integration origin/master
+      git -C "$CASE_INTEGRATOR" merge -q --no-edit topic
+      git -C "$CASE_INTEGRATOR" push -q origin HEAD:master
+      git -C "$CASE_MAIN" fetch -q origin
+      eval "$finish" >/dev/null 2>&1 || fail "the printed finishing command failed on an integrated tip"
       assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic)" "" \
-        "the printed finishing command must delete the newer remote tip"
+        "the printed finishing command must delete the integrated newer tip"
+      assert_eq "$(git -C "$CASE_MAIN" rev-parse "$recovery")" "$remote_tip" \
+        "the printed finishing command must retain the tip it deletes"
       ;;
     esac
   done
