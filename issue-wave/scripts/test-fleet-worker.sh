@@ -112,6 +112,15 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/fleet-worker-test.XXXXXX")
 TMP=$(cd "$TMP" && pwd -P)   # canonical: macOS mktemp answers under /var, which resolves to /private/var
 export HOME="$TMP/home"
 mkdir -p "$HOME/.claude/skills" "$HOME/.codex/skills" "$TMP/bin"
+# Hermetic: every ambient FLEET_* and ISSUE_WAVE_* knob is cleared before the suite sets its own. A
+# fleet box's ~/.config/fleet/env.sh exports the roster and, on the hub, a slot spec: an inherited
+# `mac-studio=6` beside a `testbox other` roster refused every execution case as naming a box
+# outside it (ludics-lite#329), and an inherited FLEET_SLOT_STATE would point the slot cases at the
+# box's real locks. By prefix, so a knob added later cannot leak either. Every case that depends on
+# the roster or the slot spec sets or unsets it itself.
+while IFS= read -r v; do
+  case "$v" in FLEET_*|ISSUE_WAVE_*) unset "$v" ;; esac
+done < <(compgen -e)
 # Paths with spaces on purpose: every far-side line that forgets to quote shows up here.
 export ISSUE_WAVE_STATE="$TMP/st ate"
 export FLEET_TMUX_SOCKET="fwtest-$$"
@@ -665,6 +674,35 @@ expect "a sibling whose login never returns is bounded and noted, not hung" 0 "P
 expect "mac-studio with the default roster notes a sleeping TUF and still passes" 0 "PREFLIGHT OK mac-studio skills=[0-9a-f]* (cross-box unreachable, asleep or off the network: tuf-amd-linux)$" -- \
   env -u FLEET_BOXES FLEET_LOCAL_BOX=mac-studio SHIM_SSH_DOWN=tuf-amd-linux "$FW" preflight mac-studio --no-probe
 [ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded reach probe" || ok "preflight lock released after the bounded reach probe"
+# The slot count per roster box is on the preflight's output (ludics-lite#329): it showed nowhere
+# but in a batch's own slot line, so a day of one-slot Mac batches passed every preflight. Each
+# case sets or unsets both variables itself.
+# A one-slot count is matched as `mac-studio[=]1`: check-prompts reads the bare pair anywhere in
+# this file as a statement of the site default, and this is a count the fixture configured.
+PFROSTER="mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
+PFM=(env FLEET_LOCAL_BOX=mac-studio "$FW" preflight mac-studio --no-probe --no-cross)
+expect "preflight prints the site default's slot counts under an exported default roster" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=1 minix-amd-linux=1 tuf-amd-linux=1 (site default)$" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="$PFROSTER" "${PFM[@]}"
+grep -q "WARNING" <<<"$out" && ko "...and warns about a configuration that is the site default -- $out" || ok "...and warns about nothing"
+expect "...the same under an unset roster" 0 "^PREFLIGHT SLOTS mac-studio=6 .*(site default)$" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES "${PFM[@]}"
+expect "a spec that leaves mac-studio out under the default roster is a loud warning, not a refusal" 0 "PREFLIGHT SLOTS WARNING: the default roster, but FLEET_BOX_CORRECTNESS_SLOTS=\"rog-nv-linux=2\" does not name mac-studio, which falls to one slot" -- \
+  env FLEET_BOX_CORRECTNESS_SLOTS="rog-nv-linux=2" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
+grep -q "^PREFLIGHT OK mac-studio" <<<"$out" && grep -q "^PREFLIGHT SLOTS mac-studio[=]1 rog-nv-linux=2 minix-amd-linux=1 tuf-amd-linux=1 (FLEET_BOX_CORRECTNESS_SLOTS)$" <<<"$out" \
+  && ok "...beside the OK line and the counts it names" || ko "the collapse warning lost the OK line or the counts -- $out"
+expect "...as is an explicitly empty spec" 0 "PREFLIGHT SLOTS WARNING: .* does not name mac-studio" -- \
+  env FLEET_BOX_CORRECTNESS_SLOTS="" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
+expect "a spec naming mac-studio at one slot is a choice, printed without a warning" 0 "^PREFLIGHT SLOTS mac-studio[=]1 .*(FLEET_BOX_CORRECTNESS_SLOTS)$" -- \
+  env FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=1" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
+grep -q "WARNING" <<<"$out" && ko "a spec naming mac-studio at one slot drew a collapse warning -- $out" || ok "...and no warning"
+expect "a roster over several lines prints every box" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=1 minix-amd-linux=1 tuf-amd-linux=1 (site default)$" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="mac-studio rog-nv-linux
+minix-amd-linux tuf-amd-linux" "${PFM[@]}"
+expect "a custom roster prints one slot each, without a warning" 0 "^PREFLIGHT SLOTS testbox=1 otherbox=1 (custom roster: one slot each)$" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="testbox otherbox" "$FW" preflight testbox --no-probe --no-cross
+grep -q "WARNING" <<<"$out" && ko "a custom roster drew a collapse warning -- $out" || ok "...and no warning"
+expect "a malformed spec is a warning on the preflight, which still passes" 0 "PREFLIGHT SLOTS WARNING: FLEET_BOX_CORRECTNESS_SLOTS names stale-box, which is not in FLEET_BOXES" -- \
+  env FLEET_BOX_CORRECTNESS_SLOTS="stale-box=2" FLEET_BOXES="testbox otherbox" "$FW" preflight testbox --no-probe --no-cross
 # The probe must not read the far-side program off stdin: a sibling that swallows its stdin would
 # otherwise end the preflight early with status 0 over an earlier refusal (Codex P1 on #67).
 echo x >> "$repo/ship-pr/SKILL.md"
@@ -1254,8 +1292,36 @@ expect "a pipeline under the slot dies of SIGPIPE exactly as it does unwrapped" 
 grep -q "Broken pipe" <<<"$out" && ko "the wrapped pipeline reported a broken pipe the bare one does not" || ok "...and without the diagnostic the bare pipeline never prints"
 # The site default, the number the references quote: six on mac-studio (ludics-lite#160), and
 # one anywhere the spec does not name -- which is every box under a custom FLEET_BOXES.
+# The default applies whenever the roster IS the default one (ludics-lite#329): on 2026-09-22 every
+# box's env.sh began exporting FLEET_BOXES with exactly the default boxes, and a test on the
+# variable's presence dropped mac-studio to one slot for a day. Each case sets or unsets both
+# variables itself.
+DEFROSTER="mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
+FWM=(env FLEET_LOCAL_BOX=mac-studio FLEET_ANCHOR=mac-studio)
 expect "the site default gives mac-studio six run-time slots" 0 "slot 1 of 6" -- \
-  env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES FLEET_LOCAL_BOX=mac-studio FLEET_ANCHOR=mac-studio "$FW" execution slot --wait 0 -- echo default-cap
+  env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES "${FWM[@]}" "$FW" execution slot --wait 0 -- echo default-cap
+expect "...and so does an exported roster equal to the default (the 2026-09-22 shape)" 0 "slot 1 of 6" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS "${FWM[@]}" FLEET_BOXES="$DEFROSTER" "$FW" execution slot --wait 0 -- echo exported-default
+expect "...or the default boxes in another order and spacing (a word set, not a string)" 0 "slot 1 of 6" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS "${FWM[@]}" FLEET_BOXES="  tuf-amd-linux mac-studio   minix-amd-linux rog-nv-linux " "$FW" execution slot --wait 0 -- echo reordered-default
+expect "...or the default boxes over several lines (every line is read, not the first)" 0 "slot 1 of 6" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS "${FWM[@]}" FLEET_BOXES="mac-studio rog-nv-linux
+minix-amd-linux
+tuf-amd-linux" "$FW" execution slot --wait 0 -- echo multiline-default
+expect "a box on a later line of the roster is in it, and a spec may name it" 0 "slot 1 of 2" -- \
+  env FLEET_LOCAL_BOX=testbox FLEET_BOXES="other
+testbox" FLEET_BOX_CORRECTNESS_SLOTS="other=1
+testbox=2" "$FW" execution slot --wait 0 -- echo multiline-roster
+expect "a custom roster still gives mac-studio one slot" 0 "slot 1 of 1" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS "${FWM[@]}" FLEET_BOXES="mac-studio rog-nv-linux" "$FW" execution slot --wait 0 -- echo custom-roster
+expect "an explicit spec overrides the default under an unset roster" 0 "slot 1 of 2" -- \
+  env -u FLEET_BOXES "${FWM[@]}" FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=2" "$FW" execution slot --wait 0 -- echo explicit-unset-roster
+expect "...and under an exported default roster" 0 "slot 1 of 3" -- \
+  "${FWM[@]}" FLEET_BOXES="$DEFROSTER" FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=3" "$FW" execution slot --wait 0 -- echo explicit-default-roster
+expect "...where an explicitly empty spec is one slot everywhere" 0 "slot 1 of 1" -- \
+  "${FWM[@]}" FLEET_BOXES="$DEFROSTER" FLEET_BOX_CORRECTNESS_SLOTS="" "$FW" execution slot --wait 0 -- echo explicit-empty
+expect "...and under a custom roster" 0 "slot 1 of 4" -- \
+  "${FWM[@]}" FLEET_BOXES="mac-studio rog-nv-linux" FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=4" "$FW" execution slot --wait 0 -- echo explicit-custom
 expect "...and a box the spec does not name has one" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo unnamed-box
 # The OS-level sleep guard (ludics-lite#317). The stub logs its arguments and its pid and, like
 # the real systemd-inhibit, runs the command after its options -- the helper that holds the
