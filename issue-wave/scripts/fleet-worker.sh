@@ -85,13 +85,23 @@
 #   FLEET_BOXES: whole fleet; "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux". `ls` sweeps it minus local.
 #   FLEET_BOX_CORRECTNESS_SLOTS: `<box>=<n>` pairs, how many correctness executions may share a
 #     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" whenever the roster is the
-#     default one, whether FLEET_BOXES is unset or exports those same boxes (compared as a word
-#     set, ludics-lite#329); empty (one slot everywhere) with a custom FLEET_BOXES. Set, even to
+#     default one, beside "rog-nv-linux=2 minix-amd-linux=2" in the same value, whether
+#     FLEET_BOXES is unset or exports those same boxes (compared as a word set,
+#     ludics-lite#329); empty (one slot everywhere) with a custom FLEET_BOXES. Set, even to
 #     empty, it overrides the default either way. `preflight` prints the count per roster box.
 #     Measurement stays exclusive.
 #     Six, not three (ludics-lite#160): three `-j 4` batches ran side by side on the Mac without
 #     a stall on 2026-09-15 and the Developer Tools exemption removed the XProtect tax, and the
 #     cap exists to bound concurrent load, never to bound how many agents may be in flight.
+#     Two on each native GPU box (ludics-lite#316, measured 2026-09-23 with targeted batches at
+#     ahrefs/ocannl#1029's widths): rog's two `-j 8` cuda batches were green, and its first
+#     rung of three all-cuda batches (21 GPU processes) had one CUDA_ERROR_OUT_OF_MEMORY that
+#     the repeat did not reproduce, so three is not yet a measured-safe count. Two test-only
+#     cuda batches also contend (107 s together against 80 s back to back, while a cc batch
+#     beside them costs nothing). The second slot is kept for overlapping one batch's compile
+#     with another's tests, which those cache-restored batches did not measure. minix's two
+#     `-j 4` hip batches were green and are its ceiling: the gfx1151's SDMA pool is 8 queues
+#     for the whole device, so slots x width must stay at or under 8. tuf is not measured.
 #   FLEET_SKILLS_REPO: skills checkout on each box; ~/ludics-lite.
 #   ISSUE_WAVE_STATE: local worker-state directory; ~/.local/state/issue-wave.
 #   FLEET_SLOT_STATE: where `execution slot` keeps a box's run-time slot locks;
@@ -152,7 +162,7 @@ roster_words() {
 # every box's ~/.config/fleet/env.sh exported the default roster verbatim, and a test on the
 # variable's presence silently dropped mac-studio to one slot for a day (ludics-lite#329).
 if [ "$(roster_words "$BOXES")" = "$(roster_words "$DEFAULT_BOXES")" ]; then DEFAULT_ROSTER=1; else DEFAULT_ROSTER=0; fi
-SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ "$DEFAULT_ROSTER" = 0 ] || echo mac-studio=6)}"
+SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ "$DEFAULT_ROSTER" = 0 ] || echo mac-studio=6 rog-nv-linux=2 minix-amd-linux=2)}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 # Run-time correctness slots (`execution slot`) are a property of the BOX, so their lock files
@@ -619,14 +629,16 @@ cmd_preflight() {
 # `execution slot` takes on this machine; a remote box's own batches read that box's environment. The
 # count showed nowhere but in a batch's own slot line, so when an exported default roster dropped
 # mac-studio to one slot, nine workers serialized on one flock with every preflight passing
-# (ludics-lite#329). Under the default roster, a spec that does not name mac-studio -- the box the
-# SLOTS default above widens, and the anchor where the Mac batches run -- is that collapse, and is
-# a warning on stderr; a spec naming it explicitly, even at one slot, is someone's choice and is
-# not. The box is spelled here as well as in the default, and the preflight fixture's no-warning
-# case under the default roster fails if the two ever part. Never changes the preflight's verdict.
+# (ludics-lite#329). Under the default roster, a spec that does not name a box the SLOTS default
+# above widens -- mac-studio, where the Mac batches run, and the native GPU boxes rog-nv-linux and
+# minix-amd-linux (ludics-lite#316) -- is that collapse for that box, and is one warning on stderr
+# per box; a spec naming the box explicitly, even at one slot, is someone's choice and is not. The
+# boxes are spelled here as well as in the default, and the preflight fixture checks both
+# directions: the site default draws no warning, and an empty spec warns about exactly the boxes
+# the site default gives more than one slot. Never changes the preflight's verdict.
 slots_report() {
-  local b n named=0 out="" src
-  local -a roster=() spec=()
+  local b n named out="" src
+  local -a roster=() spec=() widened=(mac-studio rog-nv-linux minix-amd-linux)
   read -r -d "" -a roster <<< "$BOXES" || :
   read -r -d "" -a spec <<< "$SLOTS" || :
   for b in ${roster[@]+"${roster[@]}"}; do
@@ -638,8 +650,11 @@ slots_report() {
   else src="custom roster: one slot each"; fi
   echo "PREFLIGHT SLOTS${out} ($src)"
   [ "$DEFAULT_ROSTER" = 1 ] || return 0
-  for n in ${spec[@]+"${spec[@]}"}; do [ "${n%%=*}" = mac-studio ] && named=1; done
-  [ "$named" = 1 ] || echo "PREFLIGHT SLOTS WARNING: the default roster, but FLEET_BOX_CORRECTNESS_SLOTS=\"$SLOTS\" does not name mac-studio, which falls to one slot (the site default gives it more); every correctness batch there serializes" >&2
+  for b in "${widened[@]}"; do
+    named=0
+    for n in ${spec[@]+"${spec[@]}"}; do [ "${n%%=*}" = "$b" ] && named=1; done
+    [ "$named" = 1 ] || echo "PREFLIGHT SLOTS WARNING: the default roster, but FLEET_BOX_CORRECTNESS_SLOTS=\"$SLOTS\" does not name $b, which falls to one slot (the site default gives it more); every correctness batch there serializes" >&2
+  done
 }
 
 # ---------------------------------------------------------------------------------------------
