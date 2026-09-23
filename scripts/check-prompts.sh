@@ -1079,6 +1079,8 @@ invocation_options() {
 #    `shift N`, a single assignment word (`NAME=word`, `NAME+=(word)`, no operator or blank outside
 #    quotes), or a `[ … ] || usage` guard, whose `usage` exits; with no quote left open and no
 #    backslash, since the split is per line and per `;` and models neither.
+#  - a byte: printable ASCII or a tab, in every line from the `case` line to `done` -- a CR that a
+#    trim would drop is part of the word to the shell.
 # A `--name)` arm is read when all its statements are in that grammar and exactly one is a shift,
 # whose arity is N-1 (`shift 2` is 1, a bare `shift` is 0); otherwise it prints `?`, which the
 # caller refuses as unread. Any other departure is the whole parser's. The cost is stated: a
@@ -1089,7 +1091,7 @@ invocation_options() {
 # arm reads `$2` or that the parser is the one the script runs, and it takes `usage` to exit and `[`
 # to be the test builtin.
 parser_options() {
-  awk '
+  LC_ALL=C awk '
     function bad(why) { print "!\t" why; over = 1; exit }
     function trim(t) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", t); return t }
     !inp && /^[[:space:]]*while \[ "\$#" -gt 0 \]; do[[:space:]]*$/ { want = 1; next }
@@ -1097,6 +1099,10 @@ parser_options() {
       ind = substr($0, 1, index($0, "c") - 1); inp = 1; want = 0; next
     }
     !inp { want = 0; next }
+    # A carriage return, or any other byte that is neither printable nor a tab, is a character the
+    # trim below would drop and the shell keeps: `shift 2` before a CR is `shift` refusing "2\r"
+    # (round 7, P2). The block is read in the C locale, so a non-ASCII byte is refused too.
+    /[^[:print:]\t]/ { bad("a byte that is neither printable ASCII nor a tab, such as a CRLF line end") }
     # Between `esac` and `done` the loop runs every iteration: a statement there consumes
     # arguments no arm accounts for (round 6, P2).
     post {

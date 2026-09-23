@@ -1390,6 +1390,13 @@ cleanup_edit "$CLEANUP_HELPER" 's/^  \*) usage ;;$/  *) echo "unknown: $1" >\&2;
 expect "a catch-all doing more than usage is refused" 1 \
   "$CLEANUP_PARSER: a catch-all *) arm doing more than usage" -- "$CP" "$R"
 
+# Round 7, P2: a CRLF line end keeps its CR in the shell's word, so `shift 2` before one shifts
+# nothing; a byte the trim would drop and the shell keeps is outside the grammar.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" "/^  --regenerable)\$/,/;;/s/^    shift 2\$/    shift 2$(printf '\r')/"
+expect "a carriage return in the parser block is refused" 1 \
+  "$CLEANUP_PARSER: a byte that is neither printable ASCII nor a tab" -- "$CP" "$R"
+
 # A parser this reader cannot find is refused, not read as agreeing with nothing.
 cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" 's/^while \[ "\$#" -gt 0 \]; do$/while (( $# )); do/'
