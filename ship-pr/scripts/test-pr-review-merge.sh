@@ -80,7 +80,7 @@ gh() {
     # the base and the head ref alone. The revalidation is the one that can answer with a
     # successor, so the two are told apart by `updated_at` rather than by field count.
     *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
-    *'--jq .head.sha') printf '%s\n' "${HEAD_AFTER_MERGE:-$CURRENT_HEAD}" ;;
+    *'--jq .head.sha // "-"') printf '%s\n' "${HEAD_AFTER_MERGE:-$CURRENT_HEAD}" ;;
     *'.head.sha'*) printf '%s\tbase-sha\tclaude/topic\n' "$CURRENT_HEAD" ;;
     *'.base.ref'*)
       reads=$(fixture_call_count base) || return 1
@@ -689,6 +689,22 @@ test_a_base_moved_during_the_call_is_not_a_head_move() {
   run_merge
   assert_eq "$MERGE_RC" 1 "a head that moved as well is refused ($MERGE_OUTPUT)"
   assert_contains "$MERGE_OUTPUT" "head is no longer head-sha" "a real head move keeps its message"
+  assert_eq "$(grep -c 'pr merge' <<<"$MERGE_CALLS")" 1 "and is not retried"
+  # Review round 1: a head the read did not name is unread, not moved.
+  reset
+  MERGE_BASE_MODIFIED=1
+  HEAD_AFTER_MERGE=-
+  run_merge
+  assert_eq "$MERGE_RC" 3 "an unnamed head is unread ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "head is no longer" "and claims no push"
+  # Review round 1: ABSENT was recognized against the base that just moved, so it is not retried.
+  reset
+  MERGE_BASE_MODIFIED=1
+  NO_CHECKS=1
+  run_merge
+  assert_eq "$MERGE_RC" 1 "an ABSENT verdict is refused after a base move ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "ABSENT verdict was recognized against the old base" \
+    "the refusal names the base as the reason"
   assert_eq "$(grep -c 'pr merge' <<<"$MERGE_CALLS")" 1 "and is not retried"
 }
 

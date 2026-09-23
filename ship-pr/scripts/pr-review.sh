@@ -4674,13 +4674,18 @@ cmd_merge() {
     err=$(gh_err_line)
     # A moved BASE fails with the same "was modified" as a moved head: on ludics-lite#348, #347
     # landed during the call with the head still the gated SHA. Only the head tells them apart. A
-    # base move leaves the verdict standing (roll-forward, see warn_base_drift), so the retry
-    # re-reads the drift alone; a conflict the move made fails it as "not mergeable", below.
+    # base move leaves a verdict about the head standing (roll-forward, see warn_base_drift), so the
+    # retry re-reads the drift alone; a conflict the move made fails it as "not mergeable", below.
+    # ABSENT is the exception: its recognition read the base, so it is refused to be read again.
     if [[ "$err" == *"Base branch was modified"* ]]; then
-      out=$(gh_retry read api "repos/$REPO/pulls/$PR_NUM" --jq .head.sha) ||
+      out=$(gh_retry read api "repos/$REPO/pulls/$PR_NUM" --jq '.head.sha // "-"') &&
+        [ -n "$out" ] && [ "$out" != - ] ||
         fail 3 "NOT merged: $REPO#$PR_NUM's base moved during the call ($err) and its head could" \
           "not be re-read ($(gh_err_line)); re-run merge."
       if [ "$out" = "$CHECK_SHA" ]; then
+        [ "$VERDICT" = absent ] && fail 1 "NOT merged: $REPO#$PR_NUM's base moved during the call," \
+          "and its ABSENT verdict was recognized against the old base. Re-run merge so the gate" \
+          "reads the new one."
         [ "$attempt" -ge 3 ] && fail 1 "NOT merged: $REPO#$PR_NUM's base moved during each of" \
           "$attempt merge calls; its head is still ${CHECK_SHA:0:8}. Re-run merge."
         warn "$REPO#$PR_NUM's BASE moved during the merge call, not its head (still" \
