@@ -1094,6 +1094,24 @@ parser_options() {
   LC_ALL=C awk '
     function bad(why) { print "!\t" why; over = 1; exit }
     function trim(t) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", t); return t }
+    # unq <line>: the line with each quoted span a plain word Q, read LEFT TO RIGHT in one pass as
+    # the shell reads it, so a delimiter of one kind inside a span of the other is text and cannot
+    # pair with one further on (round 8, P2); a backslash in a double-quoted span escapes the next
+    # byte. OPEN is set when a span is left unclosed at the end of the line.
+    function unq(t,   out, i, n, c, q) {
+      out = ""; q = ""; n = length(t)
+      for (i = 1; i <= n; i++) {
+        c = substr(t, i, 1)
+        if (q == "") {
+          if (c == "\047" || c == "\"") { q = c; out = out "Q"; continue }
+          out = out c; continue
+        }
+        if (q == "\"" && c == "\\") { i++; continue }
+        if (c == q) q = ""
+      }
+      OPEN = (q != "")
+      return out
+    }
     !inp && /^[[:space:]]*while \[ "\$#" -gt 0 \]; do[[:space:]]*$/ { want = 1; next }
     want && !inp && match($0, /^[[:space:]]*case "\$1" in[[:space:]]*$/) {
       ind = substr($0, 1, index($0, "c") - 1); inp = 1; want = 0; next
@@ -1127,12 +1145,11 @@ parser_options() {
     arm {
       # Quoted spans are text, each standing as one plain word Q, and a `#` opening a word -- after
       # a blank, a `;` or an operator, `;;# shift 2` included -- starts a comment (round 1, P2).
-      l = $0
-      gsub(/\047[^\047]*\047/, "Q", l); gsub(/"([^"\\]|\\.)*"/, "Q", l)
+      l = unq($0)
       if (match(l, /(^|[[:space:];&|()])#/)) l = substr(l, 1, RSTART + RLENGTH - 2)
       # A quote left open runs onto the next line and a backslash escapes what follows it, a `;`
       # included: the per-line, per-`;` split models neither (round 5, P2).
-      if (l ~ /["\047\\`]/) amb = 1
+      if (OPEN || l ~ /[\\`]/) amb = 1
       closes = sub(/;;[[:space:]]*$/, "", l)
       if (index(l, ";;")) bad("a ;; that does not end its line, which makes it two clauses: " trim($0))
       nseg = split(l, seg, ";")

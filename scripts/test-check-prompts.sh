@@ -1397,6 +1397,14 @@ cleanup_edit "$CLEANUP_HELPER" "/^  --regenerable)\$/,/;;/s/^    shift 2\$/    s
 expect "a carriage return in the parser block is refused" 1 \
   "$CLEANUP_PARSER: a byte that is neither printable ASCII nor a tab" -- "$CP" "$R"
 
+# Round 8, P2: quotes are read left to right in one pass, so an apostrophe inside a double-quoted
+# value is text -- two of them cannot pair across the `continue` between them and hide it.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    X="a'"'"'b"; continue; Y="'"'"'c"\
+    shift 2/'
+expect "an apostrophe in a double-quoted value does not pair with one further on" 1 \
+  "$CLEANUP_UNREAD" -- "$CP" "$R"
+
 # A parser this reader cannot find is refused, not read as agreeing with nothing.
 cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" 's/^while \[ "\$#" -gt 0 \]; do$/while (( $# )); do/'
