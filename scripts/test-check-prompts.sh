@@ -1411,6 +1411,24 @@ cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    shift 2 # don'"'"'t consume only the option/'
 expect "an apostrophe in a comment opens no quote" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
 
+# Round 10, P2 x3: an assignment word is the helper's plain shape only, so an expansion left open
+# across lines cannot make a `shift 2` line its data, and a `#` after a paren is part of a word
+# rather than a comment hiding the `continue` behind it; and the catch-all is required, since
+# without it an unknown option loops forever.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    NOTE=${UNSET:-\
+    shift 2\
+    TAIL=}/'
+expect "a shift inside an expansion spanning lines is not the arm's" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    NOTE=(x)#junk; continue\
+    shift 2/'
+expect "...nor one behind a # that a paren does not make a comment" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  \*) usage ;;$/d'
+expect "a parser with no catch-all arm is refused" 1 \
+  "$CLEANUP_PARSER: no final *) usage arm" -- "$CP" "$R"
+
 # A parser this reader cannot find is refused, not read as agreeing with nothing.
 cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" 's/^while \[ "\$#" -gt 0 \]; do$/while (( $# )); do/'

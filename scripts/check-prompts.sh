@@ -1071,14 +1071,17 @@ invocation_options() {
 #  - the block: a `while [ "$#" -gt 0 ]; do` line, `case "$1" in` on the next, the arms, `esac` at
 #    the `case` line's indent, then `done`, with only blank and comment lines between the two --
 #    so nothing else in the loop consumes an argument;
-#  - a pattern: one bare `--name)` opening a line, or one `*)` that is the LAST arm and whose body
-#    is `usage` alone -- so no pattern can match a long option ahead of its own arm;
+#  - a pattern: one bare `--name)` opening a line, and one `*)` that is the LAST arm and whose body
+#    is `usage` alone -- so no pattern can match a long option ahead of its own arm, and an unknown
+#    option exits rather than looping;
 #  - an arm: its pattern line through the line ENDING in `;;`, with no other `;;` in it -- so one
 #    line is never two clauses;
 #  - a statement, once each quoted span is a plain word and `#` comments are dropped: `shift` or
-#    `shift N`, a single assignment word (`NAME=word`, `NAME+=(word)`, no operator or blank outside
-#    quotes), or a `[ … ] || usage` guard, whose `usage` exits; with no quote left open and no
-#    backslash, since the split is per line and per `;` and models neither.
+#    `shift N`, a single assignment word in one of the helper's two forms, `NAME=value` or
+#    `NAME+=(value)`, whose value is quoted spans and plain characters only -- no `$`, brace, paren,
+#    `#`, operator or blank outside quotes, so no expansion can run on past the line or hide a
+#    comment (round 10) -- or a `[ … ] || usage` guard, whose `usage` exits; with no quote left open
+#    and no backslash, since the split is per line and per `;` and models neither.
 #  - a byte: printable ASCII or a tab, in every line from the `case` line to `done` -- a CR that a
 #    trim would drop is part of the word to the shell.
 # A `--name)` arm is read when all its statements are in that grammar and exactly one is a shift,
@@ -1100,15 +1103,17 @@ parser_options() {
     # unq <line>: the line with each quoted span a plain word Q and its comment dropped, read LEFT
     # TO RIGHT in one pass as the shell reads it, so a delimiter of one kind inside a span of the
     # other is text and cannot pair with one further on (round 8, P2), and an unquoted `#` opening a
-    # word -- at the start, after a blank, a `;` or an operator, `;;# shift 2` included -- ends the
-    # line there, quotes in the comment and all (rounds 1 and 9, P2). A backslash in a
+    # word -- at the start, after a blank, a `;`, `&` or `|`, `;;# shift 2` included -- ends the
+    # line there, quotes in the comment and all (rounds 1 and 9, P2). A `#` after a paren is not
+    # read as a comment: in `NOTE=(x)#junk` it is part of the word (round 10, P2), and the
+    # assignment grammar below refuses the word instead. A backslash in a
     # double-quoted span escapes the next byte. OPEN is set when a span is left unclosed.
     function unq(t,   out, i, n, c, q) {
       out = ""; q = ""; n = length(t)
       for (i = 1; i <= n; i++) {
         c = substr(t, i, 1)
         if (q == "") {
-          if (c == "#" && (out == "" || out ~ /[[:space:];&|()]$/)) break
+          if (c == "#" && (out == "" || out ~ /[[:space:];&|]$/)) break
           if (c == "\047" || c == "\"") { q = c; out = out "Q"; continue }
           out = out c; continue
         }
@@ -1134,7 +1139,12 @@ parser_options() {
       if ($0 ~ /^[[:space:]]*done[[:space:]]*(#.*)?$/) { closed = 1; exit }
       bad("a statement between esac and done: " trim($0))
     }
-    !arm && $0 ~ ("^" ind "esac[[:space:]]*(#.*)?$") { post = 1; next }
+    # With no catch-all an unknown option matches no arm, consumes nothing, and the loop never
+    # ends: the `*) usage` arm is required, not only confined to the end (round 10, P2).
+    !arm && $0 ~ ("^" ind "esac[[:space:]]*(#.*)?$") {
+      if (!star) bad("no final *) usage arm, so an unknown option would loop forever")
+      post = 1; next
+    }
     !arm && $0 ~ /^[[:space:]]*(#.*)?$/ { next }
     # case runs the FIRST arm that matches, so a pattern that can match a long option ahead of its
     # own arm -- a glob, an alternation, an escaped or quoted spelling -- decides the arity the arm
@@ -1162,7 +1172,8 @@ parser_options() {
         if (star) { if (g != "usage") amb = 1; continue }
         if (g ~ /^shift([[:space:]]+[0-9]+)?$/) {
           ar = (match(g, /[0-9]+/) ? substr(g, RSTART, RLENGTH) : 1) - 1; ns++
-        } else if (g ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=([^[:space:]&|<>()`]*|\([^[:space:]&|<>()`]*\))$/) {
+        } else if (g ~ /^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_.\/:@%+,=Q-]*$/ ||
+                   g ~ /^[A-Za-z_][A-Za-z0-9_]*\+=\([A-Za-z0-9_.\/:@%+,=Q-]+\)$/) {
         } else if (g ~ /^\[ [^][&|<>()`]* \] \|\| usage$/) {
         } else amb = 1
       }
@@ -1211,7 +1222,7 @@ check_cleanup_options() {
     if [ -z "$p" ]; then
       ko "$CLEANUP_HELPER" "usage() lists '$o', for which the option parser has no '$o)' arm"; bad=1
     elif [ "$p" = "?" ]; then
-      ko "$CLEANUP_HELPER" "the parser's '$o)' arm is not one this reader can read: it needs exactly one 'shift' or 'shift N' among straight-line statements -- single assignment words and '[ … ] || usage' guards (see parser_options)"; bad=1
+      ko "$CLEANUP_HELPER" "the parser's '$o)' arm is not one this reader can read: it needs exactly one 'shift' or 'shift N' among straight-line statements -- plain assignment words and '[ … ] || usage' guards (see parser_options)"; bad=1
     elif [ "$p" != "$a" ]; then
       sh=shift; [ "$p" -eq 0 ] || sh="shift $((p + 1))"
       if [ "$a" = 1 ]; then
