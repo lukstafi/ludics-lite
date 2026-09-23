@@ -34,6 +34,8 @@ RUN_REASON="every run for the head finished and was judged" # what the run list 
 MERGE_STATE="merged=true state=MERGED" # what REST says after the merge call
 MERGE_QUEUE=""                         # nonempty = the base has a merge queue
 MERGE_NOT_MERGEABLE=""                 # nonempty = the FIRST pr merge call fails as not mergeable
+MERGE_BASE_MODIFIED=""                 # nonempty = the FIRST pr merge call loses a race to the base
+HEAD_AFTER_MERGE=""                    # nonempty = what the head re-read after a refusal answers
 PR_BASE=main                           # the branch this PR targets
 BASE_LATER=""                          # nonempty = the base read answers with this from the 2nd on
 DEFAULT_BRANCH=main                    # the repository default branch
@@ -66,7 +68,7 @@ build_checks() {
   return 0
 }
 run_signal() { printf '0\t%s\n' "$RUN_REASON"; return 0; }
-warn_base_drift() { return 0; }
+warn_base_drift() { printf 'CALL warn_base_drift\n' >>"$CALLS_FILE"; }
 
 gh() {
   local reads
@@ -78,6 +80,7 @@ gh() {
     # the base and the head ref alone. The revalidation is the one that can answer with a
     # successor, so the two are told apart by `updated_at` rather than by field count.
     *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
+    *'--jq .head.sha') printf '%s\n' "${HEAD_AFTER_MERGE:-$CURRENT_HEAD}" ;;
     *'.head.sha'*) printf '%s\tbase-sha\tclaude/topic\n' "$CURRENT_HEAD" ;;
     *'.base.ref'*)
       reads=$(fixture_call_count base) || return 1
@@ -131,6 +134,11 @@ gh() {
       printf 'gh: Pull request is not mergeable\n' >&2
       return 1
     fi
+    if [ -n "$MERGE_BASE_MODIFIED" ] && [ ! -f "$TEST_ROOT/merge-failed-once" ]; then
+      : >"$TEST_ROOT/merge-failed-once"
+      printf 'GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)\n' >&2
+      return 1
+    fi
     ;;
   *) bail "unexpected fixture gh call: $*" ;;
   esac
@@ -168,6 +176,8 @@ reset() {
   MERGE_STATE="merged=true state=MERGED"
   MERGE_QUEUE=""
   MERGE_NOT_MERGEABLE=""
+  MERGE_BASE_MODIFIED=""
+  HEAD_AFTER_MERGE=""
   PR_BASE=main
   BASE_LATER=""
   DEFAULT_BRANCH=main
@@ -658,6 +668,28 @@ test_the_body_is_rescanned_before_a_retried_merge() {
   assert_eq "$MERGE_RC" 0 "the retry still merges ($MERGE_OUTPUT)"
   assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #630 #631" \
     "the body added during the mergeability wait is reported"
+}
+
+# GitHub refuses a merge whose BASE moved during the call with the same "was modified" as a moved
+# head. On ludics-lite#348 the script told the caller a push had moved the head, which was still the
+# gated SHA. The head re-read tells the two apart: an unchanged head re-reads the drift and retries.
+test_a_base_moved_during_the_call_is_not_a_head_move() {
+  reset
+  MERGE_BASE_MODIFIED=1
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the retry onto the moved base merges ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDERR" "BASE moved during the merge call, not its head (still head-sha)" \
+    "the base move is named as a base move"
+  assert_not_contains "$MERGE_OUTPUT" "head is no longer" "no push is claimed"
+  assert_eq "$(grep -c 'pr merge' <<<"$MERGE_CALLS")" 2 "one retry"
+  assert_eq "$(grep -c 'warn_base_drift' <<<"$MERGE_CALLS")" 2 "the drift is re-read for the new base"
+  reset
+  MERGE_BASE_MODIFIED=1
+  HEAD_AFTER_MERGE=pushed-sha
+  run_merge
+  assert_eq "$MERGE_RC" 1 "a head that moved as well is refused ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "head is no longer head-sha" "a real head move keeps its message"
+  assert_eq "$(grep -c 'pr merge' <<<"$MERGE_CALLS")" 1 "and is not retried"
 }
 
 # Review round 6, P2. A body keyword binds only on a merge into the repository DEFAULT branch. On a
@@ -1368,6 +1400,7 @@ tests=(
   test_a_schemeless_link_is_not_an_issue_reference
   test_the_local_qualified_spelling_is_the_same_issue
   test_the_body_is_rescanned_before_a_retried_merge
+  test_a_base_moved_during_the_call_is_not_a_head_move
   test_no_warning_when_the_base_is_not_the_default_branch
   test_an_unread_default_branch_is_not_an_inert_keyword
   test_a_repository_named_like_a_keyword_is_not_a_keyword

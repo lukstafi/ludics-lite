@@ -4503,7 +4503,7 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
 cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
-  local override="" wait_for=0 allow_no_verdict="" require_green="" gate out rc attempt=1 mergeable state arg
+  local override="" wait_for=0 allow_no_verdict="" require_green="" gate out rc err attempt=1 mergeable state arg
   local -a gh_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -4671,11 +4671,29 @@ cmd_merge() {
     rc=$?
     [ -n "$out" ] && printf '%s\n' "$out"
     [ "$rc" -eq 0 ] && break
-    case "$(gh_err_line)" in
+    err=$(gh_err_line)
+    # A moved BASE fails with the same "was modified" as a moved head: on ludics-lite#348, #347
+    # landed during the call with the head still the gated SHA. Only the head tells them apart. A
+    # base move leaves the verdict standing (roll-forward, see warn_base_drift), so the retry
+    # re-reads the drift alone; a conflict the move made fails it as "not mergeable", below.
+    if [[ "$err" == *"Base branch was modified"* ]]; then
+      out=$(gh_retry read api "repos/$REPO/pulls/$PR_NUM" --jq .head.sha) ||
+        fail 3 "NOT merged: $REPO#$PR_NUM's base moved during the call ($err) and its head could" \
+          "not be re-read ($(gh_err_line)); re-run merge."
+      if [ "$out" = "$CHECK_SHA" ]; then
+        [ "$attempt" -ge 3 ] && fail 1 "NOT merged: $REPO#$PR_NUM's base moved during each of" \
+          "$attempt merge calls; its head is still ${CHECK_SHA:0:8}. Re-run merge."
+        warn "$REPO#$PR_NUM's BASE moved during the merge call, not its head (still" \
+          "${CHECK_SHA:0:8}); re-reading the drift and retrying"
+        warn_base_drift "$PR_NUM" || true
+        attempt=$((attempt + 1))
+        continue
+      fi
+    fi
+    case "$err" in
     *"was modified"* | *"does not match"* | *"head commit"* | *"expected head"*)
       fail 1 "NOT merged: $REPO#$PR_NUM's head is no longer ${CHECK_SHA:0:8}, the commit the build" \
-        "signal was read for ($(gh_err_line)). A push moved it; re-run merge so the gate reads" \
-        "the new head."
+        "signal was read for ($err). A push moved it; re-run merge so the gate reads the new head."
       ;;
     *"not mergeable"* | *"cannot be cleanly created"*)
       [ "$attempt" -ge 3 ] && fail 1 "merge of $REPO#$PR_NUM keeps failing as not mergeable" \
@@ -4694,8 +4712,8 @@ cmd_merge() {
       esac
       ;;
     esac
-    api_rejection "$(gh_err_line)" && fail 1 "gh pr merge was rejected: $(gh_err_line)"
-    fail 3 "gh pr merge failed AMBIGUOUSLY: $(gh_err_line). It may have LANDED — confirm over" \
+    api_rejection "$err" && fail 1 "gh pr merge was rejected: $err"
+    fail 3 "gh pr merge failed AMBIGUOUSLY: $err. It may have LANDED — confirm over" \
       "REST (api repos/$REPO/pulls/$PR_NUM --jq .merged) before retrying."
   done
   # `gh pr merge` returns 0 having only ENABLED auto-merge when the base carries required checks or
