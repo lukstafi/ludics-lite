@@ -120,8 +120,11 @@ for either transport, including host-local CLI work, and coordinator integration
 does not confer ownership, and an issue may reserve checks on several boxes. Measurement is
 exclusive per box; correctness runs share a box up to its `FLEET_BOX_CORRECTNESS_SLOTS` (six on
 mac-studio), a run-time count a worker takes around each batch with `execution slot -- <batch>`,
-so a standing iteration record gates no agent's start (ludics-lite#160). The native GPU boxes
-rog-nv-linux and minix-amd-linux take two each, as measured (ludics-lite#316). The
+so a standing iteration record gates no agent's start (ludics-lite#160). Every run on a native
+Linux box also holds a logind block inhibitor on sleep for as long as it runs - `execution hold --
+<command>`, which `execution slot` runs inside and an exclusive measurement uses alone - so another
+session's `wake-lab.sh sleep` is refused by the OS (ludics-lite#317). The native GPU boxes
+rog-nv-linux and minix-amd-linux take two correctness slots each, as measured (ludics-lite#316). The
 usual coordinator shape is two calls per execution: `execution run <reserve.json>` (reserve and
 dispatch) and `execution conclude --from-run <run-dir> --request <id> --sha <sha>` (verdict, log and
 checkout read off a `test-run.sh` record on the reserved box). The reservation helper requires Python 3 on the anchor, and `execution slot` requires it on every

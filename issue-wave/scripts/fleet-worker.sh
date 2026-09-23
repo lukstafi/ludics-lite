@@ -51,6 +51,9 @@
 #   fleet-worker.sh execution list [--active] [--compact]
 #   fleet-worker.sh execution slot [--wait <seconds>] -- <command...>   # hold one of THIS box's
 #                          # run-time correctness slots around a suite or batch (no lease needed)
+#   fleet-worker.sh execution hold [--why <text>] -- <command...>   # run under THIS box's OS-level
+#                          # sleep guard alone (a systemd-inhibit block lock; bare where none):
+#                          # the wrapper for an exclusive measurement, and what `slot` runs inside
 #   fleet-worker.sh execution reserve|dispatch|record|reconcile|conclude <json-file>
 #   fleet-worker.sh execution run <json-file>          # reserve + dispatch in one step
 #   fleet-worker.sh execution conclude --from-run <run-dir> --request <id> --sha <sha>
@@ -81,9 +84,12 @@
 #   FLEET_ANCHOR_STATE: anchor state dir; defaults to ISSUE_WAVE_STATE.
 #   FLEET_BOXES: whole fleet; "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux". `ls` sweeps it minus local.
 #   FLEET_BOX_CORRECTNESS_SLOTS: `<box>=<n>` pairs, how many correctness executions may share a
-#     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" with the default roster,
-#     beside "rog-nv-linux=2 minix-amd-linux=2" in the same value; empty (one slot everywhere)
-#     with a custom FLEET_BOXES. Measurement stays exclusive.
+#     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" whenever the roster is the
+#     default one, beside "rog-nv-linux=2 minix-amd-linux=2" in the same value, whether
+#     FLEET_BOXES is unset or exports those same boxes (compared as a word set,
+#     ludics-lite#329); empty (one slot everywhere) with a custom FLEET_BOXES. Set, even to
+#     empty, it overrides the default either way. `preflight` prints the count per roster box.
+#     Measurement stays exclusive.
 #     Six, not three (ludics-lite#160): three `-j 4` batches ran side by side on the Mac without
 #     a stall on 2026-09-15 and the Developer Tools exemption removed the XProtect tax, and the
 #     cap exists to bound concurrent load, never to bound how many agents may be in flight.
@@ -102,6 +108,9 @@
 #     ~/.local/state/fleet-execution-slots. Deliberately NOT under ISSUE_WAVE_STATE, which is
 #     per-coordinator: the cap is the box's, so every agent on the box must resolve this to the
 #     same directory (as every coordinator must resolve FLEET_ANCHOR_STATE to the same one).
+#   FLEET_SYSTEMD_INHIBIT: the systemd-inhibit that `execution hold` (and so `execution slot`)
+#     wraps a run in; systemd-inhibit on PATH. A name that resolves to no executable runs the
+#     command bare, as on macOS; the suites pin it to a stub or to nothing, never to the runner's.
 #   FLEET_TMUX_SOCKET: tmux -L name; tests isolate with it.
 #   FLEET_FLOTILLA: status service; http://mac-studio:7799.
 #   FLEET_LOCK_WAIT: seconds a lease mutation waits for a concurrent one; 10.
@@ -124,7 +133,7 @@ detect_local_box() {
   local host pair
   local -a hostname_pairs=()
   host=$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')
-  read -r -a hostname_pairs <<< "$HOSTNAME_MAP"
+  read -r -d "" -a hostname_pairs <<< "$HOSTNAME_MAP" || :
   for pair in "${hostname_pairs[@]}"; do
     case "$pair" in *=*) ;; *) continue ;; esac
     # shellcheck disable=SC2254  # the glob is the point
@@ -135,9 +144,25 @@ detect_local_box() {
 LOCAL_BOX="${FLEET_LOCAL_BOX-$(detect_local_box)}"
 BASE_REF="${FLEET_BASE_REF:-origin/master}"
 ANCHOR="${FLEET_ANCHOR:-mac-studio}"
-BOXES="${FLEET_BOXES:-mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux}"
-# Correctness slots per box: the site default only fits the site's roster.
-SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ -n "${FLEET_BOXES:-}" ] || echo mac-studio=6 rog-nv-linux=2 minix-amd-linux=2)}"
+DEFAULT_BOXES="mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
+BOXES="${FLEET_BOXES:-$DEFAULT_BOXES}"
+# A roster as a normalised word list: whitespace-separated, order and repeats ignored, so an
+# exported roster naming the default boxes reads as the default roster (ludics-lite#329).
+# Every configured word list here (roster, slot spec, hostname map) is read with `read -d ""`,
+# i.e. across ALL its lines: a plain `read -a` stops at the first newline, and a roster written
+# over two lines would read as a custom one and drop the Mac back to one slot (PR #333 review).
+roster_words() {
+  local -a words=()
+  read -r -d "" -a words <<< "$1" || :
+  [ "${#words[@]}" -gt 0 ] || return 0
+  printf '%s\n' "${words[@]}" | LC_ALL=C sort -u | tr '\n' ' '
+}
+# Correctness slots per box: the site default only fits the site's roster, so it applies whenever
+# the effective roster IS the default one -- not only when FLEET_BOXES is absent. From 2026-09-22
+# every box's ~/.config/fleet/env.sh exported the default roster verbatim, and a test on the
+# variable's presence silently dropped mac-studio to one slot for a day (ludics-lite#329).
+if [ "$(roster_words "$BOXES")" = "$(roster_words "$DEFAULT_BOXES")" ]; then DEFAULT_ROSTER=1; else DEFAULT_ROSTER=0; fi
+SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ "$DEFAULT_ROSTER" = 0 ] || echo mac-studio=6 rog-nv-linux=2 minix-amd-linux=2)}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 # Run-time correctness slots (`execution slot`) are a property of the BOX, so their lock files
@@ -145,6 +170,7 @@ STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 # on one host under different coordinators would then lock different files and each take slot 1,
 # leaving the cap bounding nothing. Every agent on a box must resolve this to one directory.
 SLOT_STATE="${FLEET_SLOT_STATE:-\$HOME/.local/state/fleet-execution-slots}"
+INHIBIT="${FLEET_SYSTEMD_INHIBIT:-systemd-inhibit}"
 ANCHOR_STATE="${FLEET_ANCHOR_STATE:-$STATE}"
 TMUX_SOCKET="${FLEET_TMUX_SOCKET:-}"
 FLOTILLA="${FLEET_FLOTILLA:-http://mac-studio:7799}"
@@ -593,8 +619,37 @@ cmd_preflight() {
   done
   { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$cross" "${FLEET_CROSS_TIMEOUT:-20}"
   local rc=$?
-  if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; exit 4; fi
+  if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; slots_report; exit 4; fi
+  slots_report
   exit "$rc"
+}
+
+# slots_report: one PREFLIGHT SLOTS line with the correctness slot count this shell's configuration
+# gives every roster box -- what the registry admits (every reservation carries this spec) and what
+# `execution slot` takes on this machine; a remote box's own batches read that box's environment. The
+# count showed nowhere but in a batch's own slot line, so when an exported default roster dropped
+# mac-studio to one slot, nine workers serialized on one flock with every preflight passing
+# (ludics-lite#329). Under the default roster, a spec that does not name mac-studio -- the box the
+# SLOTS default above widens, and the anchor where the Mac batches run -- is that collapse, and is
+# a warning on stderr; a spec naming it explicitly, even at one slot, is someone's choice and is
+# not. The box is spelled here as well as in the default, and the preflight fixture's no-warning
+# case under the default roster fails if the two ever part. Never changes the preflight's verdict.
+slots_report() {
+  local b n named=0 out="" src
+  local -a roster=() spec=()
+  read -r -d "" -a roster <<< "$BOXES" || :
+  read -r -d "" -a spec <<< "$SLOTS" || :
+  for b in ${roster[@]+"${roster[@]}"}; do
+    n=$(box_correctness_slots "$b") || { echo "PREFLIGHT SLOTS WARNING: $n; every \`execution slot\` and reservation under it refuses" >&2; return 0; }
+    out="$out $b=$n"
+  done
+  if [ -n "${FLEET_BOX_CORRECTNESS_SLOTS+x}" ]; then src="FLEET_BOX_CORRECTNESS_SLOTS"
+  elif [ "$DEFAULT_ROSTER" = 1 ]; then src="site default"
+  else src="custom roster: one slot each"; fi
+  echo "PREFLIGHT SLOTS${out} ($src)"
+  [ "$DEFAULT_ROSTER" = 1 ] || return 0
+  for n in ${spec[@]+"${spec[@]}"}; do [ "${n%%=*}" = mac-studio ] && named=1; done
+  [ "$named" = 1 ] || echo "PREFLIGHT SLOTS WARNING: the default roster, but FLEET_BOX_CORRECTNESS_SLOTS=\"$SLOTS\" does not name mac-studio, which falls to one slot (the site default gives it more); every correctness batch there serializes" >&2
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1286,7 +1341,7 @@ conclude_from_run() {
 in_roster() {
   local name="$1" entry
   local -a roster=()
-  read -r -a roster <<< "$BOXES"
+  read -r -d "" -a roster <<< "$BOXES" || :
   for entry in ${roster[@]+"${roster[@]}"}; do [ "$entry" = "$name" ] && return 0; done
   return 1
 }
@@ -1299,7 +1354,7 @@ in_roster() {
 box_correctness_slots() {
   local box="$1" pair count found=1
   local -a pairs=()
-  read -r -a pairs <<< "$SLOTS"
+  read -r -d "" -a pairs <<< "$SLOTS" || :
   for pair in ${pairs[@]+"${pairs[@]}"}; do
     count="${pair#*=}"
     case "$pair" in *=*) ;; *) count="" ;; esac
@@ -1337,15 +1392,146 @@ box_correctness_slots() {
 # assignments may be QUEUED there. Subtracting outstanding assignments from the cap here would
 # re-introduce the very thing #160 removes - a run refused because of a record that is not
 # running, its own included.
+#
+# Inside the slot the command runs under the OS-level sleep guard `execution hold` takes
+# (ludics-lite#317, below), so a correctness batch on a native Linux box carries the guard a
+# measurement does, for exactly as long as the batch runs. One Python program serves both
+# subcommands; `slot` is `hold` plus the flock.
 # Exit: the wrapped command's own status; 1 with a line beginning `EXECUTION SLOT REFUSED` (no
 # free slot before the deadline, an outstanding measurement, a malformed slots spec); 4 when the
 # anchor's registry could not be read; 127 when the command itself could not be run. The command
 # is exec'd and not interpreted, so a pipeline or a builtin goes as `sh -c '...'`.
-slot_lock_py() {
-  cat <<'SLOT_PY'
-import fcntl, os, signal, sys, time
-box, directory, cap, wait = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-command = sys.argv[5:]
+#
+# THE GUARD (ludics-lite#317). Under WSL the Windows-side holder kept a lane's box alive; on
+# native Ubuntu nothing at the OS level stopped another session's `wake-lab.sh sleep`, or an idle
+# suspend, from taking a box out from under a running worker, because the lab locks are advisory
+# and bind only sessions that go through wake-lab.sh. A logind BLOCK inhibitor on sleep:idle is
+# the OS-side answer: systemd 259's `systemctl --check-inhibitors=yes suspend` (wake-lab.sh's
+# path) refuses on any `block` inhibitor covering sleep, the caller's own uid included -- only
+# `block-weak` exempts the same user, which is why the mode here is `block` -- and logind itself
+# refuses a suspend request from anyone without `suspend-ignore-inhibit`, a GDM greeter's
+# included.
+#
+# The inhibitor is held by a HELPER beside the command, never by a wrapper around it, and that
+# shape is forced by what systemd-inhibit does to the process it runs (measured on rog-nv-linux,
+# systemd 259): it closes every descriptor above 2 in its child, so a batch run UNDER it would
+# no longer inherit the slot's flock; it SIGTERMs that child when it dies itself; and it turns a
+# command killed by a signal into exit 1 and adds a "<cmd> failed with exit status <n>." line --
+# a wrapper that changes verdicts, and a PID that is not the workload's, so killing `$!` would
+# kill systemd-inhibit and not the batch (PR #323 review, round 1). So the helper is
+# `systemd-inhibit ... -- sh -c 'echo HELD; exec cat'`, reading a LIFETIME PIPE whose write end
+# the command inherits, and the command is exec'd exactly as before, on this PID, with the flock:
+# the inhibitor then lives as long as anything in the command's process tree holds that pipe --
+# the same lifetime as the flock, ended by the kernel however the tree ends, including a kill -9
+# of the command alone. The helper is double-forked so it is never the command's child: a
+# workload that waits for all of its children would otherwise wait on it forever. It reports
+# through a readiness pipe -- HELD once the inhibitor is taken, or systemd-inhibit's own refusal
+# and EOF -- and the command starts only after that answer, so there is no window in which the
+# run has started and the box is not yet held.
+#
+# Fail-open, and loudly. An unprivileged ssh session is a REMOTE subject to polkit, so
+# `org.freedesktop.login1.inhibit-block-sleep` falls under its `allow_any`, which stock Ubuntu
+# sets to auth_admin_keep: until the box's one-time polkit grant is installed (executions.md,
+# "The OS-level sleep guard") the request is denied. A run refused for that would stop every
+# batch on the box over a setup step, so a denial prints a WARNING naming it and runs the command
+# bare -- exactly as it runs on macOS, or on a Linux host with no systemd-inhibit at all.
+# No `--no-ask-password`: systemd-inhibit gained it in v257, so 255 (Ubuntu 24.04) and 256 reject
+# it as an unknown option, which would turn every hold there into the unguarded path (PR #323
+# review, round 1). It is not needed either: the helper's stdio are pipes, so systemd-inhibit has
+# no terminal to start a polkit agent on, and a denial comes back at once.
+run_py() {
+  cat <<'RUN_PY'
+import fcntl, os, select, shutil, signal, sys, time
+mode, box = sys.argv[1], sys.argv[2]
+if mode == "slot":
+    directory, cap, wait, inhibitor = sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
+    why, command = "", sys.argv[7:]
+    prefix = "EXECUTION SLOT"
+else:
+    inhibitor, why, command = sys.argv[3], sys.argv[4], sys.argv[5:]
+    prefix = "EXECUTION HOLD"
+HOLD_WAIT = 30  # seconds for systemd-inhibit to answer HELD or refuse; it answers at once
+
+def refuse_unrunnable(exc):
+    print("%s REFUSED %s: cannot run %s: %s" % (prefix, box, command[0], exc))
+    sys.exit(127)
+
+def start_guard(why):
+    """Take the sleep:idle block inhibitor in a helper; return the lifetime pipe's write end, or None."""
+    sys.stdout.flush(); sys.stderr.flush()  # nothing buffered may be written twice by a fork
+    if len(why) > 160:  # one line of `systemd-inhibit --list` and of `wake-lab.sh status`
+        why = why[:157] + "..."
+    life_r, life_w = os.pipe()
+    ready_r, ready_w = os.pipe()
+    middle = os.fork()
+    if middle == 0:
+        helper = os.fork()
+        if helper == 0:
+            try:
+                os.dup2(life_r, 0); os.dup2(ready_w, 1); os.dup2(ready_w, 2)
+                os.closerange(3, 65536)  # the slot flock, the lifetime pipe's write end, all of it
+                signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+                os.execv(inhibitor, [inhibitor, "--what=sleep:idle", "--mode=block", "--who=fleet-worker",
+                                     "--why=" + why, "--", "sh", "-c", "echo HELD; exec cat >/dev/null"])
+            finally:
+                os._exit(127)
+        os.write(ready_w, ("PID %d\n" % helper).encode())
+        os._exit(0)
+    os.waitpid(middle, 0)
+    os.close(life_r); os.close(ready_w)
+    text, helper, held = b"", None, False
+    deadline = time.monotonic() + HOLD_WAIT
+    while not held:
+        left = deadline - time.monotonic()
+        if left <= 0 or not select.select([ready_r], [], [], left)[0]:
+            text += b"no answer from systemd-inhibit after %ds" % HOLD_WAIT
+            break
+        chunk = os.read(ready_r, 4096)
+        if not chunk:
+            break
+        text += chunk
+        lines = text.split(b"\n")
+        held = b"HELD" in lines
+        for line in lines:
+            if line.startswith(b"PID "):
+                helper = int(line[4:])
+    os.close(ready_r)
+    if held:
+        sys.stderr.write("EXECUTION HOLD %s: sleep:idle block inhibitor held for: %s\n" % (box, why))
+        os.set_inheritable(life_w, True)
+        return life_w
+    if helper is not None:
+        try:
+            os.kill(helper, signal.SIGTERM)
+        except OSError:
+            pass
+    os.close(life_w)
+    detail = b" ".join(l for l in text.split(b"\n") if l and not l.startswith(b"PID ")).decode("utf-8", "replace")
+    sys.stderr.write("EXECUTION HOLD %s: WARNING: running WITHOUT a sleep inhibitor, so nothing at the OS level"
+                     " stops a suspend under it -- %s refused: %s (the one-time polkit grant:"
+                     " issue-wave/references/executions.md, \"The OS-level sleep guard\")\n"
+                     % (box, inhibitor, detail[:200]))
+    return None
+
+def run(why):
+    # Resolved before the guard: a command that cannot be found takes no inhibitor.
+    if shutil.which(command[0]) is None:
+        refuse_unrunnable("no such executable")
+    if inhibitor:
+        start_guard(why)
+    sys.stderr.flush()
+    try:
+        # Python ignores SIGPIPE, and an IGNORED disposition survives exec: without this the
+        # wrapped batch would see `yes | head -n1` exit 1 with a "Broken pipe" diagnostic
+        # where the same script run directly exits 141. A wrapper must not change verdicts.
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        os.execvp(command[0], command)
+    except OSError as exc:
+        # A script whose interpreter is missing passes the lookup above and fails here.
+        refuse_unrunnable(exc)
+
+if mode == "hold":
+    run(why)
 deadline = time.monotonic() + wait
 while True:
     for index in range(1, cap + 1):
@@ -1360,23 +1546,17 @@ while True:
         os.set_inheritable(descriptor, True)
         sys.stderr.write("EXECUTION SLOT %s: slot %d of %d held for: %s\n"
                          % (box, index, cap, " ".join(command)))
-        sys.stderr.flush()
-        try:
-            # Python ignores SIGPIPE, and an IGNORED disposition survives exec: without this the
-            # wrapped batch would see `yes | head -n1` exit 1 with a "Broken pipe" diagnostic
-            # where the same script run directly exits 141. A wrapper must not change verdicts.
-            signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-            os.execvp(command[0], command)
-        except OSError as exc:
-            print("EXECUTION SLOT REFUSED %s: cannot run %s: %s" % (box, command[0], exc))
-            sys.exit(127)
+        run("%s slot %d of %d: %s" % (box, index, cap, " ".join(command)))
     if time.monotonic() >= deadline:
         print("EXECUTION SLOT REFUSED %s: all %d run-time correctness slots busy after %ds"
               % (box, cap, wait))
         sys.exit(1)
     time.sleep(1)
-SLOT_PY
+RUN_PY
 }
+
+# inhibitor_path: the systemd-inhibit this box would take the guard with, or empty for none.
+inhibitor_path() { type -P -- "$INHIBIT" 2>/dev/null || true; }
 
 cmd_execution_slot() {
   local wait=600 box cap listing rc measuring dir helper
@@ -1411,7 +1591,33 @@ cmd_execution_slot() {
   [ -z "$measuring" ] || { echo "EXECUTION SLOT REFUSED $box: a measurement holds the box exclusively ($measuring)"; exit 1; }
   dir="$(local_path "$SLOT_STATE")/$box"
   mkdir -p "$dir" || die "execution slot: cannot create the slot directory $dir"
-  exec python3 -c "$(slot_lock_py)" "$box" "$dir" "$cap" "$wait" "$@"
+  exec python3 -c "$(run_py)" slot "$box" "$dir" "$cap" "$wait" "$(inhibitor_path)" "$@"
+}
+
+# `execution hold [--why <text>] -- <command...>`: run the command under THIS box's OS-level
+# guard against sleep and nothing else -- no slot, no registry read, no lease (ludics-lite#317;
+# the guard itself is described above `run_py`). It is the wrapper for an exclusive measurement,
+# which runs the runner directly because `execution slot` refuses while a measurement is
+# outstanding, and `slot` takes the same guard inside the flock, so both kinds of run carry it
+# through one implementation. Where no systemd-inhibit resolves it runs the command bare and
+# says nothing. Needs python3, as `slot` does (the per-box preflight checks it).
+# Exit: the command's own status; 127 with `EXECUTION HOLD REFUSED` when it cannot be run; 2 usage.
+cmd_execution_hold() {
+  local why="" box
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --why)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die "execution hold: expected text for --why"
+        why="$2"; shift ;;
+      --) shift; break ;;
+      *) die "execution hold [--why <text>] -- <command> [args...]" ;;
+    esac
+    shift
+  done
+  [ "$#" -ge 1 ] || die "execution hold: a command to hold the box around is required, after --"
+  box="${LOCAL_BOX:-$(hostname -s 2>/dev/null)}"
+  [ -n "$why" ] || why="$box hold: $*"
+  exec python3 -c "$(run_py)" hold "$box" "$(inhibitor_path)" "$why" "$@"
 }
 
 cmd_execution() {
@@ -1431,6 +1637,8 @@ cmd_execution() {
       payload="{\"active\":$active,\"compact\":$compact}" ;;
     # The run-time slot lock: no registry mutation, no lease, and the command runs from here.
     slot) shift; cmd_execution_slot "$@" ;;
+    # The OS-level sleep guard alone: no slot, no registry, no lease.
+    hold) shift; cmd_execution_hold "$@" ;;
     conclude)
       if [ "${2:-}" = --from-run ]; then
         local dir="${3:-}" request="" box="" sha="" evidence="" rc
@@ -1465,7 +1673,7 @@ cmd_execution() {
       [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
       payload=$(cat "$2") || die "execution: cannot read payload"
       check_identity ;;
-    *) die "execution: list, slot -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run <run-dir> --request <id>" ;;
+    *) die "execution: list, slot -- <command>, hold -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run <run-dir> --request <id>" ;;
   esac
   local helper; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"

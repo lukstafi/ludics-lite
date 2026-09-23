@@ -257,8 +257,25 @@ is_up() { # is_up <box>
   esac
 }
 
+# The box's live logind BLOCK inhibitors on sleep, one per line, from `systemd-inhibit --list`
+# (ludics-lite#317). They are what refuses `sleep` (and `hibernate`) from the OS side -- a
+# `fleet-worker.sh execution slot` or `execution hold` run holds one for as long as it runs --
+# so a coordinator sees who is holding a box before it tries a power verb, rather than after the
+# refusal. Only `block` entries covering `sleep` are kept: GNOME's own handle-*-key and
+# lid-switch blocks, on every logged-in desktop, refuse no verb here and would bury the one
+# that does. The filter reads the listing's WHAT and MODE columns as tokens; a WHY that happens
+# to say "sleep" between spaces is kept too, which over-reports and never hides a holder.
+# Returns nonzero when the listing could not be read at all.
+sleep_blocks() { # sleep_blocks <ssh-host>
+  local listing
+  listing=$(capped "$PROBE_CAP" ssh -o BatchMode=yes -o ConnectTimeout=5 "$1" \
+    'systemd-inhibit --list --mode=block --no-legend --no-pager' 2>/dev/null) || return 1
+  printf '%s\n' "$listing" | grep -E '(^|[ :])sleep([ :]|$)' | grep -E '[[:space:]]block[[:space:]]*$' | tr -s ' '
+  return 0
+}
+
 status_one() { # status_one <box>
-  local l host win guest
+  local l host win guest blocks="" n
   l=$(router_active "$1")
   printf '%-6s router-active=%-1s' "$1" "$l"
   if [ "$(kind_of "$1")" = wsl ]; then
@@ -267,6 +284,12 @@ status_one() { # status_one <box>
     host=$(linux_of "$1") || return 1
     if ssh_probe "$host"; then
       printf '  os=linux  linux=UP'
+      if blocks=$(sleep_blocks "$host"); then
+        n=0; [ -z "$blocks" ] || n=$(printf '%s\n' "$blocks" | wc -l | tr -d ' ')
+        printf '  sleep-blocks=%s' "$n"
+      else
+        printf '  sleep-blocks=?'
+      fi
     else
       # A dual-boot box may have booted Windows despite its configured Linux kind. The
       # suffixes are only liveness probes for status; the Windows commands remain in the WSL
@@ -282,6 +305,7 @@ status_one() { # status_one <box>
     fi
   fi
   printf '\n'
+  [ -z "$blocks" ] || printf '%s\n' "$blocks" | sed 's/^/         block: /'
 }
 
 do_status() {
@@ -291,6 +315,8 @@ do_status() {
   echo
   for n in "$@"; do [ "$(kind_of "$n")" = wsl ] && wsl_boxes+=("$n"); done
   [ ${#wsl_boxes[@]} -gt 0 ] && wsl_status_extra "${wsl_boxes[@]}"
+  echo "sleep-blocks counts a native Linux box's logind block inhibitors on sleep (listed under it):"
+  echo "while one is held, 'sleep' and 'hibernate' there are refused by the OS, whatever the lab locks say."
   echo "router-active is the router's NewActive bit for the Ethernet MAC, not the NIC's link state:"
   echo "minutes after a shutdown or hibernate, 1 is a stale DHCP lease still aging out; once settled,"
   echo "1 on a powered-off box means the NIC holds link and is WoL-armed."
@@ -587,7 +613,16 @@ power_action() {
       fi
       echo "  $1 FAILED on $2 (connection failed before the remote power command started)"
       return 1 ;;
-    *) echo "  $1 FAILED on $2 (command exited $action_rc)"; return 1 ;;
+    *)
+      # systemctl's inhibitor refusal is several lines, and the one naming the holder is not the
+      # last, so the tail printed above would say "ignore inhibitors with -i" and not who. Name
+      # the holders, and call it a refusal: the OS-side guard did its job (ludics-lite#317).
+      if grep -q 'Operation inhibited by' <<<"$output"; then
+        grep 'Operation inhibited by' <<<"$output" | sed 's/^/  /'
+        echo "  $1 REFUSED on $2 by a block inhibitor (a run there holds it; see 'status')"
+        return 1
+      fi
+      echo "  $1 FAILED on $2 (command exited $action_rc)"; return 1 ;;
   esac
 }
 
