@@ -910,7 +910,10 @@ naming the workflow, the failing job and where the red starts, from a second job
 red EPISODE, not per day: while it is open the next run comments on it, so closing it once main is
 green is what lets the next red open a fresh one. On a pull request it reads and reports without
 filing, and a red main does not redden the pull request: that verdict is about main, and a PR
-carrying it as a failed check could not merge the fix.
+carrying it as a failed check could not merge the fix. The two jobs live in
+`base-watch-reusable.yml`, a `workflow_call` workflow that base-watch.yml calls with `branch: main`
+and that another repository calls the same way from its own triggers, running ludics-lite's
+`pr-review.sh` against its own branch and filing in its own tracker (ludics-lite#349).
 
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and

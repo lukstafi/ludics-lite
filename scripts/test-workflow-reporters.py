@@ -17,11 +17,11 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 GUARDS = {
     "api-contract": "${{ !cancelled() && github.event_name == 'schedule' && needs.contract.outputs.rc != '0' && needs.contract.outputs.rc != '3' }}",
-    "base-watch": "${{ !cancelled() && needs.read.result != 'skipped' && (github.event_name == 'schedule' || github.event_name == 'workflow_run') && needs.read.outputs.rc != '0' && needs.read.outputs.rc != '3' }}",
+    "base-watch-reusable": "${{ !cancelled() && needs.read.result != 'skipped' && (github.event_name == 'schedule' || github.event_name == 'workflow_run') && needs.read.outputs.rc != '0' && needs.read.outputs.rc != '3' }}",
 }
 VOCABULARY = {
     "api-contract": {"1": "found a belief", "4": "got a 4xx", "5": "was refused a read"},
-    "base-watch": {"1": "found main RED", "4": "reached no verdict for main"},
+    "base-watch-reusable": {"1": "found main RED", "4": "reached no verdict for main"},
 }
 
 
@@ -52,7 +52,8 @@ if sys.argv[1:3] == ["issue", "list"]:
                    CALL_LOG=str(root / "calls"), EXISTING=existing, RC=rc,
                    REPORT="fixture report: workflow X failed", GH_TOKEN="fixture-only",
                    GITHUB_SERVER_URL="https://example.invalid",
-                   GITHUB_REPOSITORY="fixture/repository", GITHUB_RUN_ID="42")
+                   GITHUB_REPOSITORY="fixture/repository", GITHUB_RUN_ID="42",
+                   BRANCH="main")
         subprocess.run(["bash", "-eu", "-o", "pipefail", "-c", shell], env=env,
                        cwd=tmp, capture_output=True, text=True, check=True, timeout=10)
         return [json.loads(line) for line in (root / "calls").read_text().splitlines()]
@@ -71,7 +72,7 @@ def assert_report(test, name, shell, rc, existing):
         test.assertIn(f"exit {rc or 'none'}", body)
     if not existing:
         test.assertIn(VOCABULARY[name].get(rc, "did not run to a verdict"), body)
-    if name == "base-watch":
+    if name == "base-watch-reusable":
         test.assertIn("fixture report: workflow X failed", body)
 
 
