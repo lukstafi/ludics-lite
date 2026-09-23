@@ -90,7 +90,10 @@
 #     Two on each native GPU box (ludics-lite#316, measured 2026-09-23 with targeted batches at
 #     ahrefs/ocannl#1029's widths): rog's two `-j 8` cuda batches were green, and its first
 #     rung of three all-cuda batches (21 GPU processes) had one CUDA_ERROR_OUT_OF_MEMORY that
-#     the repeat did not reproduce, so three is not yet a measured-safe count. minix's two
+#     the repeat did not reproduce, so three is not yet a measured-safe count. Two test-only
+#     cuda batches also contend (107 s together against 80 s back to back, while a cc batch
+#     beside them costs nothing). The second slot is kept for overlapping one batch's compile
+#     with another's tests, which those cache-restored batches did not measure. minix's two
 #     `-j 4` hip batches were green and are its ceiling: the gfx1151's SDMA pool is 8 queues
 #     for the whole device, so slots x width must stay at or under 8. tuf is not measured.
 #   FLEET_SKILLS_REPO: skills checkout on each box; ~/ludics-lite.
