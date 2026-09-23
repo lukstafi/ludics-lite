@@ -33,21 +33,6 @@ an APU whose VRAM is carved out of system memory (amdgpu reports 64 GiB). tuf is
 is under *Inputs* in `issue-wave/SKILL.md`. Take the device from the run log, not from the box's
 name. Check: `rocminfo | grep -E "Marketing|gfx"`, or `nvidia-smi -L` on rog.
 
-**A native GPU box's two correctness slots assume a batch width.** The default roster gives
-rog-nv-linux and minix-amd-linux two `execution slot` slots each (ludics-lite#316), measured
-with targeted batches at `-j 8` on rog and `-j 4` on minix. Pass that `-j` explicitly:
-`tools/test-run.sh` caps a local run only where it finds `/dev/dxg`, so on a native boot a
-batch runs as wide as the box, 24 or 32. minix's bound is hard. The gfx1151 has one SDMA engine
-with 8 queues for the whole device, each HIP process that copies takes one, so slots x width
-must stay at or under 8 across the whole box. Symptom: a stanza aborts in ROCr
-(`GpuAgent::ReleaseQueueMainScratch` assertion), and the kernel logs `No more SDMA queue to
-allocate (8 total queues)`. On rog, the first rung of three concurrent `-j 8` cuda batches
-(21 GPU processes) hit one `CUDA_ERROR_OUT_OF_MEMORY` in `fused_classifier`, while the samples
-showed at most 6366 MiB of 12 GiB in use. The repeat was green, so the count stays at two. Check:
-`journalctl _TRANSPORT=kernel --since <start> --until <end> | grep -E "SDMA|DQM|NVRM|Xid"`
-(not `-k`, which reads the current boot only). Evidence: the ahrefs/ocannl#1029 width ladder,
-and on each box `~/ocannl-staging-worktrees/316-slots-{cuda,hip}-20260923T1112*/summary.tsv`.
-
 **Only a run that takes the sleep guard holds its box awake.** `execution slot` and `execution
 hold` hold a logind block inhibitor on `sleep:idle` for as long as a run lives, and the OS refuses
 `wake-lab.sh sleep` while it is held ([executions.md](executions.md#the-os-level-sleep-guard),
