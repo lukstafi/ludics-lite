@@ -553,10 +553,11 @@ jobs:
         # not WSL's. The proof step below is what holds that, not this comment.
         shell: bash
     steps:
-      # The image's Git carries core.autocrlf=true (C:/Program Files/Git/etc/gitconfig), so the
-      # suites run from a CRLF checkout -- what a default Git for Windows clone gets. The proof
-      # step prints the setting and the first line of pr-review.sh in bytes, so a change to either
-      # is on the record.
+      # The image's Git carries core.autocrlf=true (C:/Program Files/Git/etc/gitconfig), as a
+      # default Git for Windows install does, and before .gitattributes pinned `eol=lf` this
+      # checkout was CRLF: the second run here failed test-pr-review-lib.sh on a fixture that
+      # patches a checked-out file expecting `\n`. The proof step prints the setting and the first
+      # line of pr-review.sh in bytes, so the checkout's line endings are on the record.
       - uses: actions/checkout@v4
       - name: Prove the platform from inside the suites' shell
         id: platform
@@ -577,6 +578,9 @@ jobs:
           *) echo "::error title=Git Bash platform proof failed::git --version is '$gv', not a Git for Windows build (.windows.)"; exit 1 ;;
           esac
           command -v jq || { echo '::error title=Git Bash platform proof failed::no jq on PATH'; exit 1; }
+          # A native jq.exe may end its lines CRLF, which a `$(jq -r ...)` keeps as a trailing \r;
+          # recorded here, next to the suites whose string comparisons it would break.
+          echo "jq:            $(jq --version), and jq -r ends a line with: $(printf '"x"' | jq -r . | od -An -c | tr -s ' ')"
       # Every suite step below runs whether or not an earlier suite failed, but only once the
       # proof passed; a failure names its suite in the run's annotations.
       - name: post-merge cleanup

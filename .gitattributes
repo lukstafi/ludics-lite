@@ -1,0 +1,5 @@
+# Text files are LF in every checkout, Windows included. Git for Windows installs with
+# core.autocrlf=true, so without this a default clone there -- and the windows-latest runner the
+# git-bash CI job uses -- checks the scripts out CRLF, and every fixture that patches or matches a
+# checked-out file line by line reads a `\r` it never wrote (ludics-lite#318).
+* text=auto eol=lf
