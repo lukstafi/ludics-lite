@@ -341,7 +341,7 @@ test_squash_rebase_override() {
 # helper could not check -- run here as printed, which also proves its quoting.
 test_newer_remote_tip_refusal() {
   local after_tip finish hook log mode real_git remote_tip
-  for mode in early late; do
+  for mode in early late rejected; do
     setup_case "newer-remote-tip-$mode" merge main-off
     real_git=$(command -v git)
     log="$CASE_ROOT/cleanup.log"
@@ -358,6 +358,13 @@ test_newer_remote_tip_refusal() {
         '#!/usr/bin/env bash' \
         '"$REAL_GIT" -C "$RACE_INTEGRATOR" push origin topic >/dev/null 2>&1' \
         'exit 0' >"$hook"
+      chmod +x "$hook"
+      ;;
+    rejected)
+      # A push refused with the branch unmoved: the tip stays the validated one, not a race.
+      remote_tip=$CASE_TOPIC_OID
+      hook="$CASE_MAIN/.git/hooks/pre-push"
+      printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$hook"
       chmod +x "$hook"
       ;;
     esac
@@ -383,9 +390,24 @@ test_newer_remote_tip_refusal() {
       assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic)" "" \
         "the printed finishing command must delete the newer remote tip"
       ;;
+    rejected)
+      grep "the leased deletion of origin/topic was refused while it was still at the validated tip $CASE_TOPIC_OID" \
+        "$log" >/dev/null || { cat "$log" >&2; fail "the unmoved refusal did not name the validated tip"; }
+      ! grep "moved to" "$log" >/dev/null ||
+        { cat "$log" >&2; fail "the unmoved refusal claimed the branch moved"; }
+      grep "once that cause is resolved, finish with: " "$log" >/dev/null ||
+        { cat "$log" >&2; fail "the unmoved refusal did not end with its finishing command"; }
+      finish=$(sed -n 's/.*, finish with: //p' "$log")
+      assert_eq "$finish" "git -C $(printf '%q' "$CASE_MAIN") push --force-with-lease=refs/heads/topic:$CASE_TOPIC_OID $(printf '%q' "$CASE_REMOTE") :refs/heads/topic" \
+        "the unmoved refusal must lease the finishing command at the validated tip"
+      rm "$hook"
+      eval "$finish" >/dev/null 2>&1 || fail "the printed finishing command failed (rejected)"
+      assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic)" "" \
+        "the printed finishing command must delete the validated remote tip"
+      ;;
     esac
   done
-  echo "PASS: newer remote topic tip refusal, before the cleanup and during its leased deletion"
+  echo "PASS: newer remote topic tip refusal, before the cleanup and during its leased deletion; unmoved refused deletion"
 }
 
 test_ls_remote_failure_refusal() {
