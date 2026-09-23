@@ -61,6 +61,10 @@ as it runs (ludics-lite#317): `execution slot` runs its command inside
 which cannot take a slot, is invoked as `fleet-worker.sh execution hold -- <runner command>`.
 `hold` takes nothing else - no slot, no registry read, no lease - and where there is no
 `systemd-inhibit` (macOS, a Linux host without systemd) it runs the command bare and silently.
+The inhibitor is held by a helper BESIDE the command, not by systemd-inhibit wrapped around it:
+the command is exec'd on the caller's pid with its exit status and the slot flock unchanged,
+and the inhibitor lives exactly as long as the flock does - until the last process of the
+command's tree exits, however it ends, a `kill -9` of the command alone included.
 `FLEET_SYSTEMD_INHIBIT` names the binary; the suites point it at a stub.
 
 The mode is `block`, not `block-weak`: systemd 259's `systemctl --check-inhibitors=yes suspend`,

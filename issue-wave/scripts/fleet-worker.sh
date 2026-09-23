@@ -1335,20 +1335,145 @@ box_correctness_slots() {
 # re-introduce the very thing #160 removes - a run refused because of a record that is not
 # running, its own included.
 #
-# Inside the slot the command runs under `execution hold` (ludics-lite#317), so a correctness
-# batch on a native Linux box carries the same OS-level sleep guard a measurement does, for
-# exactly as long as the batch runs; the slot execs this script's own `hold` rather than
-# spelling systemd-inhibit a second time. The slot flock is on a descriptor, so it survives
-# that exec and the one inside `hold`, and the batch inherits it as before.
+# Inside the slot the command runs under the OS-level sleep guard `execution hold` takes
+# (ludics-lite#317, below), so a correctness batch on a native Linux box carries the guard a
+# measurement does, for exactly as long as the batch runs. One Python program serves both
+# subcommands; `slot` is `hold` plus the flock.
 # Exit: the wrapped command's own status; 1 with a line beginning `EXECUTION SLOT REFUSED` (no
 # free slot before the deadline, an outstanding measurement, a malformed slots spec); 4 when the
 # anchor's registry could not be read; 127 when the command itself could not be run. The command
 # is exec'd and not interpreted, so a pipeline or a builtin goes as `sh -c '...'`.
-slot_lock_py() {
-  cat <<'SLOT_PY'
-import fcntl, os, shutil, signal, sys, time
-box, directory, cap, wait, script = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
-command = sys.argv[6:]
+#
+# THE GUARD (ludics-lite#317). Under WSL the Windows-side holder kept a lane's box alive; on
+# native Ubuntu nothing at the OS level stopped another session's `wake-lab.sh sleep`, or an idle
+# suspend, from taking a box out from under a running worker, because the lab locks are advisory
+# and bind only sessions that go through wake-lab.sh. A logind BLOCK inhibitor on sleep:idle is
+# the OS-side answer: systemd 259's `systemctl --check-inhibitors=yes suspend` (wake-lab.sh's
+# path) refuses on any `block` inhibitor covering sleep, the caller's own uid included -- only
+# `block-weak` exempts the same user, which is why the mode here is `block` -- and logind itself
+# refuses a suspend request from anyone without `suspend-ignore-inhibit`, a GDM greeter's
+# included.
+#
+# The inhibitor is held by a HELPER beside the command, never by a wrapper around it, and that
+# shape is forced by what systemd-inhibit does to the process it runs (measured on rog-nv-linux,
+# systemd 259): it closes every descriptor above 2 in its child, so a batch run UNDER it would
+# no longer inherit the slot's flock; it SIGTERMs that child when it dies itself; and it turns a
+# command killed by a signal into exit 1 and adds a "<cmd> failed with exit status <n>." line --
+# a wrapper that changes verdicts, and a PID that is not the workload's, so killing `$!` would
+# kill systemd-inhibit and not the batch (PR #323 review, round 1). So the helper is
+# `systemd-inhibit ... -- sh -c 'echo HELD; exec cat'`, reading a LIFETIME PIPE whose write end
+# the command inherits, and the command is exec'd exactly as before, on this PID, with the flock:
+# the inhibitor then lives as long as anything in the command's process tree holds that pipe --
+# the same lifetime as the flock, ended by the kernel however the tree ends, including a kill -9
+# of the command alone. The helper is double-forked so it is never the command's child: a
+# workload that waits for all of its children would otherwise wait on it forever. It reports
+# through a readiness pipe -- HELD once the inhibitor is taken, or systemd-inhibit's own refusal
+# and EOF -- and the command starts only after that answer, so there is no window in which the
+# run has started and the box is not yet held.
+#
+# Fail-open, and loudly. An unprivileged ssh session is a REMOTE subject to polkit, so
+# `org.freedesktop.login1.inhibit-block-sleep` falls under its `allow_any`, which stock Ubuntu
+# sets to auth_admin_keep: until the box's one-time polkit grant is installed (executions.md,
+# "The OS-level sleep guard") the request is denied. A run refused for that would stop every
+# batch on the box over a setup step, so a denial prints a WARNING naming it and runs the command
+# bare -- exactly as it runs on macOS, or on a Linux host with no systemd-inhibit at all.
+# No `--no-ask-password`: systemd-inhibit gained it in v257, so 255 (Ubuntu 24.04) and 256 reject
+# it as an unknown option, which would turn every hold there into the unguarded path (PR #323
+# review, round 1). It is not needed either: the helper's stdio are pipes, so systemd-inhibit has
+# no terminal to start a polkit agent on, and a denial comes back at once.
+run_py() {
+  cat <<'RUN_PY'
+import fcntl, os, select, shutil, signal, sys, time
+mode, box = sys.argv[1], sys.argv[2]
+if mode == "slot":
+    directory, cap, wait, inhibitor = sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
+    why, command = "", sys.argv[7:]
+    prefix = "EXECUTION SLOT"
+else:
+    inhibitor, why, command = sys.argv[3], sys.argv[4], sys.argv[5:]
+    prefix = "EXECUTION HOLD"
+HOLD_WAIT = 30  # seconds for systemd-inhibit to answer HELD or refuse; it answers at once
+
+def refuse_unrunnable(exc):
+    print("%s REFUSED %s: cannot run %s: %s" % (prefix, box, command[0], exc))
+    sys.exit(127)
+
+def start_guard(why):
+    """Take the sleep:idle block inhibitor in a helper; return the lifetime pipe's write end, or None."""
+    sys.stdout.flush(); sys.stderr.flush()  # nothing buffered may be written twice by a fork
+    if len(why) > 160:  # one line of `systemd-inhibit --list` and of `wake-lab.sh status`
+        why = why[:157] + "..."
+    life_r, life_w = os.pipe()
+    ready_r, ready_w = os.pipe()
+    middle = os.fork()
+    if middle == 0:
+        helper = os.fork()
+        if helper == 0:
+            try:
+                os.dup2(life_r, 0); os.dup2(ready_w, 1); os.dup2(ready_w, 2)
+                os.closerange(3, 65536)  # the slot flock, the lifetime pipe's write end, all of it
+                signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+                os.execv(inhibitor, [inhibitor, "--what=sleep:idle", "--mode=block", "--who=fleet-worker",
+                                     "--why=" + why, "--", "sh", "-c", "echo HELD; exec cat >/dev/null"])
+            finally:
+                os._exit(127)
+        os.write(ready_w, ("PID %d\n" % helper).encode())
+        os._exit(0)
+    os.waitpid(middle, 0)
+    os.close(life_r); os.close(ready_w)
+    text, helper, held = b"", None, False
+    deadline = time.monotonic() + HOLD_WAIT
+    while not held:
+        left = deadline - time.monotonic()
+        if left <= 0 or not select.select([ready_r], [], [], left)[0]:
+            text += b"no answer from systemd-inhibit after %ds" % HOLD_WAIT
+            break
+        chunk = os.read(ready_r, 4096)
+        if not chunk:
+            break
+        text += chunk
+        lines = text.split(b"\n")
+        held = b"HELD" in lines
+        for line in lines:
+            if line.startswith(b"PID "):
+                helper = int(line[4:])
+    os.close(ready_r)
+    if held:
+        sys.stderr.write("EXECUTION HOLD %s: sleep:idle block inhibitor held for: %s\n" % (box, why))
+        os.set_inheritable(life_w, True)
+        return life_w
+    if helper is not None:
+        try:
+            os.kill(helper, signal.SIGTERM)
+        except OSError:
+            pass
+    os.close(life_w)
+    detail = b" ".join(l for l in text.split(b"\n") if l and not l.startswith(b"PID ")).decode("utf-8", "replace")
+    sys.stderr.write("EXECUTION HOLD %s: WARNING: running WITHOUT a sleep inhibitor, so nothing at the OS level"
+                     " stops a suspend under it -- %s refused: %s (the one-time polkit grant:"
+                     " issue-wave/references/executions.md, \"The OS-level sleep guard\")\n"
+                     % (box, inhibitor, detail[:200]))
+    return None
+
+def run(why):
+    # Resolved before the guard: a command that cannot be found takes no inhibitor.
+    if shutil.which(command[0]) is None:
+        refuse_unrunnable("no such executable")
+    if inhibitor:
+        start_guard(why)
+    sys.stderr.flush()
+    try:
+        # Python ignores SIGPIPE, and an IGNORED disposition survives exec: without this the
+        # wrapped batch would see `yes | head -n1` exit 1 with a "Broken pipe" diagnostic
+        # where the same script run directly exits 141. A wrapper must not change verdicts.
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        os.execvp(command[0], command)
+    except OSError as exc:
+        # A script whose interpreter is missing passes the lookup above and fails here.
+        refuse_unrunnable(exc)
+
+if mode == "hold":
+    run(why)
 deadline = time.monotonic() + wait
 while True:
     for index in range(1, cap + 1):
@@ -1363,29 +1488,17 @@ while True:
         os.set_inheritable(descriptor, True)
         sys.stderr.write("EXECUTION SLOT %s: slot %d of %d held for: %s\n"
                          % (box, index, cap, " ".join(command)))
-        sys.stderr.flush()
-        # Resolved HERE, before the hand-off to `hold`: a command that cannot be run is this
-        # call's refusal, with this call's prefix and status, whatever wraps it afterwards.
-        if shutil.which(command[0]) is None:
-            print("EXECUTION SLOT REFUSED %s: cannot run %s: no such executable" % (box, command[0]))
-            sys.exit(127)
-        why = "%s slot %d of %d: %s" % (box, index, cap, " ".join(command))
-        try:
-            # Python ignores SIGPIPE, and an IGNORED disposition survives exec: without this the
-            # wrapped batch would see `yes | head -n1` exit 1 with a "Broken pipe" diagnostic
-            # where the same script run directly exits 141. A wrapper must not change verdicts.
-            signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-            os.execvp("bash", ["bash", script, "execution", "hold", "--why", why, "--"] + command)
-        except OSError as exc:
-            print("EXECUTION SLOT REFUSED %s: cannot run %s: %s" % (box, command[0], exc))
-            sys.exit(127)
+        run("%s slot %d of %d: %s" % (box, index, cap, " ".join(command)))
     if time.monotonic() >= deadline:
         print("EXECUTION SLOT REFUSED %s: all %d run-time correctness slots busy after %ds"
               % (box, cap, wait))
         sys.exit(1)
     time.sleep(1)
-SLOT_PY
+RUN_PY
 }
+
+# inhibitor_path: the systemd-inhibit this box would take the guard with, or empty for none.
+inhibitor_path() { type -P -- "$INHIBIT" 2>/dev/null || true; }
 
 cmd_execution_slot() {
   local wait=600 box cap listing rc measuring dir helper
@@ -1420,44 +1533,19 @@ cmd_execution_slot() {
   [ -z "$measuring" ] || { echo "EXECUTION SLOT REFUSED $box: a measurement holds the box exclusively ($measuring)"; exit 1; }
   dir="$(local_path "$SLOT_STATE")/$box"
   mkdir -p "$dir" || die "execution slot: cannot create the slot directory $dir"
-  exec python3 -c "$(slot_lock_py)" "$box" "$dir" "$cap" "$wait" "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" "$@"
+  exec python3 -c "$(run_py)" slot "$box" "$dir" "$cap" "$wait" "$(inhibitor_path)" "$@"
 }
 
 # `execution hold [--why <text>] -- <command...>`: run the command under THIS box's OS-level
-# guard against sleep, and nothing else -- no slot, no registry read, no lease (ludics-lite#317).
-#
-# Under WSL the Windows-side holder kept a lane's box alive; on native Ubuntu nothing at the OS
-# level stopped another session's `wake-lab.sh sleep`, or an idle suspend, from taking a box out
-# from under a running worker, because the lab locks are advisory and bind only sessions that go
-# through wake-lab.sh. A logind BLOCK inhibitor on sleep:idle is the OS-side answer: systemd
-# 259's `systemctl --check-inhibitors=yes suspend` (wake-lab.sh's path) refuses on any `block`
-# inhibitor covering sleep, the caller's own uid included -- only `block-weak` exempts the same
-# user, which is why the mode here is `block` -- and logind itself refuses a suspend request from
-# anyone without `suspend-ignore-inhibit`, a GDM greeter's included. The inhibitor lives exactly
-# as long as systemd-inhibit does, and systemd-inhibit as long as the command.
-#
-# It is the wrapper for an exclusive measurement, which runs the runner directly because
-# `execution slot` refuses while a measurement is outstanding, and it is what `slot` runs inside,
-# so both kinds of run carry the same guard through one implementation.
-#
-# Fail-open, and loudly. An unprivileged ssh session is a REMOTE subject to polkit, so
-# `org.freedesktop.login1.inhibit-block-sleep` falls under its `allow_any`, which stock Ubuntu
-# sets to auth_admin_keep: until the box's one-time polkit grant is installed (executions.md,
-# "The OS-level sleep guard") the request is denied. A run refused for that would stop every
-# batch on the box over a setup step, so a denied probe prints a WARNING naming the refusal and
-# runs the command bare -- exactly as it runs on macOS, or on a Linux host with no systemd.
-# The probe takes and drops the same inhibitor around `true`: its status is the only check that
-# does not guess at polkit, and a denial after it (a rule removed in between) fails the run at
-# systemd-inhibit's own "Failed to inhibit", which is loud as well.
-#
-# What systemd-inhibit changes about the run, measured on rog-nv-linux (systemd 259): the exit
-# status passes through, 141 of a SIGPIPE'd pipeline included, but a command killed by a signal
-# exits 1 rather than 128+n, and a nonzero exit adds one `<cmd> failed with exit status <n>.`
-# line to stderr. The verdict -- pass or fail -- never changes. A command that cannot be run is
-# refused here, before the inhibitor, with 127, as `slot` refuses it.
-# Exit: the command's own status (above); 127 when it cannot be run; 2 for usage.
+# guard against sleep and nothing else -- no slot, no registry read, no lease (ludics-lite#317;
+# the guard itself is described above `run_py`). It is the wrapper for an exclusive measurement,
+# which runs the runner directly because `execution slot` refuses while a measurement is
+# outstanding, and `slot` takes the same guard inside the flock, so both kinds of run carry it
+# through one implementation. Where no systemd-inhibit resolves it runs the command bare and
+# says nothing. Needs python3, as `slot` does (the per-box preflight checks it).
+# Exit: the command's own status; 127 with `EXECUTION HOLD REFUSED` when it cannot be run; 2 usage.
 cmd_execution_hold() {
-  local why="" box inhibitor probe
+  local why="" box
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --why)
@@ -1471,18 +1559,7 @@ cmd_execution_hold() {
   [ "$#" -ge 1 ] || die "execution hold: a command to hold the box around is required, after --"
   box="${LOCAL_BOX:-$(hostname -s 2>/dev/null)}"
   [ -n "$why" ] || why="$box hold: $*"
-  # One line of `systemd-inhibit --list` (and of `wake-lab.sh status`) per holder, not a batch's
-  # whole command line.
-  [ "${#why}" -le 160 ] || why="${why:0:157}..."
-  type -P -- "$1" >/dev/null 2>&1 || { echo "EXECUTION HOLD REFUSED $box: cannot run $1: no such executable"; exit 127; }
-  inhibitor=$(type -P -- "$INHIBIT" 2>/dev/null) || exec "$@"
-  if probe=$("$inhibitor" --no-ask-password --what=sleep:idle --mode=block --who=fleet-worker \
-               --why="$why (probe)" true 2>&1); then
-    echo "EXECUTION HOLD $box: sleep:idle block inhibitor held for: $why" >&2
-    exec "$inhibitor" --no-ask-password --what=sleep:idle --mode=block --who=fleet-worker --why="$why" -- "$@"
-  fi
-  echo "EXECUTION HOLD $box: WARNING: running WITHOUT a sleep inhibitor, so nothing at the OS level stops a suspend under it -- $INHIBIT refused: $(printf '%s' "$probe" | tr '\n' ' ' | cut -c1-200) (the one-time polkit grant: issue-wave/references/executions.md, \"The OS-level sleep guard\")" >&2
-  exec "$@"
+  exec python3 -c "$(run_py)" hold "$box" "$(inhibitor_path)" "$why" "$@"
 }
 
 cmd_execution() {
