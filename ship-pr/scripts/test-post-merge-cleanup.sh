@@ -335,23 +335,57 @@ test_squash_rebase_override() {
   echo "PASS: explicit squash/rebase override"
 }
 
+# `early` pushes the newer tip before the cleanup starts, so nothing is dismantled. `late` pushes
+# it from the helper's own pre-push hook, after the local side is gone: the leased deletion fails,
+# and the refusal must end with the command that finishes the job, after the precondition the
+# helper could not check -- run here as printed, which also proves its quoting.
 test_newer_remote_tip_refusal() {
-  local remote_tip after_tip
-  setup_case newer-remote-tip merge main-off
-  git -C "$CASE_INTEGRATOR" checkout -b topic origin/topic >/dev/null
-  echo newer >"$CASE_INTEGRATOR/newer"
-  git -C "$CASE_INTEGRATOR" add newer
-  git -C "$CASE_INTEGRATOR" commit -m "newer remote topic work" >/dev/null
-  git -C "$CASE_INTEGRATOR" push origin topic >/dev/null
-  remote_tip=$(git -C "$CASE_INTEGRATOR" rev-parse HEAD)
+  local after_tip finish hook log mode real_git remote_tip
+  for mode in early late; do
+    setup_case "newer-remote-tip-$mode" merge main-off
+    real_git=$(command -v git)
+    log="$CASE_ROOT/cleanup.log"
+    git -C "$CASE_INTEGRATOR" checkout -b topic origin/topic >/dev/null
+    echo newer >"$CASE_INTEGRATOR/newer"
+    git -C "$CASE_INTEGRATOR" add newer
+    git -C "$CASE_INTEGRATOR" commit -m "newer remote topic work" >/dev/null
+    remote_tip=$(git -C "$CASE_INTEGRATOR" rev-parse HEAD)
+    case "$mode" in
+    early) git -C "$CASE_INTEGRATOR" push origin topic >/dev/null ;;
+    late)
+      hook="$CASE_MAIN/.git/hooks/pre-push"
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        '"$REAL_GIT" -C "$RACE_INTEGRATOR" push origin topic >/dev/null 2>&1' \
+        'exit 0' >"$hook"
+      chmod +x "$hook"
+      ;;
+    esac
 
-  if "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
-    fail "cleanup deleted a newer remote topic tip"
-  fi
-  after_tip=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
-  assert_eq "$after_tip" "$remote_tip" "newer remote topic tip must be preserved"
-  assert_topic_preserved
-  echo "PASS: newer remote topic tip refusal"
+    if REAL_GIT="$real_git" RACE_INTEGRATOR="$CASE_INTEGRATOR" \
+      "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+      fail "cleanup deleted a newer remote topic tip ($mode)"
+    fi
+    after_tip=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
+    assert_eq "$after_tip" "$remote_tip" "newer remote topic tip must be preserved ($mode)"
+    case "$mode" in
+    early) assert_topic_preserved ;;
+    late)
+      grep "origin/topic moved to $remote_tip before its leased deletion" "$log" >/dev/null ||
+        { cat "$log" >&2; fail "the late refusal was not the leased deletion"; }
+      grep "that tip was never validated, so only once it is confirmed integrated into origin/master, finish with: " \
+        "$log" >/dev/null || { cat "$log" >&2; fail "the late refusal did not state its precondition"; }
+      finish=$(sed -n 's/.*, finish with: //p' "$log")
+      assert_eq "$finish" "git -C $(printf '%q' "$CASE_MAIN") push --force-with-lease=refs/heads/topic:$remote_tip $(printf '%q' "$CASE_REMOTE") :refs/heads/topic" \
+        "the late refusal must end with the leased finishing command"
+      rm "$hook"
+      eval "$finish" >/dev/null 2>&1 || fail "the printed finishing command failed"
+      assert_eq "$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic)" "" \
+        "the printed finishing command must delete the newer remote tip"
+      ;;
+    esac
+  done
+  echo "PASS: newer remote topic tip refusal, before the cleanup and during its leased deletion"
 }
 
 test_ls_remote_failure_refusal() {
