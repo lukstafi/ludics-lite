@@ -82,10 +82,17 @@
 #   FLEET_BOXES: whole fleet; "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux". `ls` sweeps it minus local.
 #   FLEET_BOX_CORRECTNESS_SLOTS: `<box>=<n>` pairs, how many correctness executions may share a
 #     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" with the default roster,
-#     empty (one slot everywhere) with a custom FLEET_BOXES. Measurement stays exclusive.
+#     beside "rog-nv-linux=2 minix-amd-linux=2" in the same value; empty (one slot everywhere)
+#     with a custom FLEET_BOXES. Measurement stays exclusive.
 #     Six, not three (ludics-lite#160): three `-j 4` batches ran side by side on the Mac without
 #     a stall on 2026-09-15 and the Developer Tools exemption removed the XProtect tax, and the
 #     cap exists to bound concurrent load, never to bound how many agents may be in flight.
+#     Two on each native GPU box (ludics-lite#316, measured 2026-09-23 with targeted batches at
+#     ahrefs/ocannl#1029's widths): rog's two `-j 8` cuda batches were green, and its first
+#     rung of three all-cuda batches (21 GPU processes) had one CUDA_ERROR_OUT_OF_MEMORY that
+#     the repeat did not reproduce, so three is not yet a measured-safe count. minix's two
+#     `-j 4` hip batches were green and are its ceiling: the gfx1151's SDMA pool is 8 queues
+#     for the whole device, so slots x width must stay at or under 8. tuf is not measured.
 #   FLEET_SKILLS_REPO: skills checkout on each box; ~/ludics-lite.
 #   ISSUE_WAVE_STATE: local worker-state directory; ~/.local/state/issue-wave.
 #   FLEET_SLOT_STATE: where `execution slot` keeps a box's run-time slot locks;
@@ -127,7 +134,7 @@ BASE_REF="${FLEET_BASE_REF:-origin/master}"
 ANCHOR="${FLEET_ANCHOR:-mac-studio}"
 BOXES="${FLEET_BOXES:-mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux}"
 # Correctness slots per box: the site default only fits the site's roster.
-SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ -n "${FLEET_BOXES:-}" ] || echo mac-studio=6)}"
+SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ -n "${FLEET_BOXES:-}" ] || echo mac-studio=6 rog-nv-linux=2 minix-amd-linux=2)}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 # Run-time correctness slots (`execution slot`) are a property of the BOX, so their lock files

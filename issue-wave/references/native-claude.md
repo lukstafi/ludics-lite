@@ -26,9 +26,9 @@ and a release through five PRs on 2026-09-15 with no stranded worker.
    correctness slot, so a box holds as many as it has workers and a worker never waits on a
    sibling's brief-reading to start. The brief tells the worker to wrap each batch in the
    run-time lock instead - `fleet-worker.sh execution slot -- <batch>`, which takes one of the
-   box's slots for exactly as long as the batch runs (six on mac-studio, one on a box the spec
-   does not name) and refuses while a measurement is outstanding there; a measurement still
-   needs the box to itself through the registry.
+   box's slots for exactly as long as the batch runs (six on mac-studio, two each on rog-nv-linux
+   and minix-amd-linux, one on a box the spec does not name) and refuses while a measurement is
+   outstanding there; a measurement still needs the box to itself through the registry.
 2. **Request, for everything else.** A measurement, a cross-box leg, a full suite: the worker
    ends its turn with its final message carrying one block and nothing after it:
 

@@ -1246,10 +1246,18 @@ expect "...and a spec naming a box outside the roster, as the registry refuses i
 expect "a pipeline under the slot dies of SIGPIPE exactly as it does unwrapped" 141 "slot 1 of 1" -- \
   "${FWS[@]}" execution slot -- bash -c 'set -o pipefail; yes | head -n1 >/dev/null'
 grep -q "Broken pipe" <<<"$out" && ko "the wrapped pipeline reported a broken pipe the bare one does not" || ok "...and without the diagnostic the bare pipeline never prints"
-# The site default, the number the references quote: six on mac-studio (ludics-lite#160), and
-# one anywhere the spec does not name -- which is every box under a custom FLEET_BOXES.
+# The site default, the number the references quote: six on mac-studio (ludics-lite#160), two
+# on each native GPU box (ludics-lite#316), and one anywhere the spec does not name -- tuf-amd-linux
+# in the default roster, and every box under a custom FLEET_BOXES. Each box is its own anchor
+# here, so the registry read stays local.
 expect "the site default gives mac-studio six run-time slots" 0 "slot 1 of 6" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES FLEET_LOCAL_BOX=mac-studio FLEET_ANCHOR=mac-studio "$FW" execution slot --wait 0 -- echo default-cap
+for box in rog-nv-linux minix-amd-linux; do
+  expect "...and $box two" 0 "slot 1 of 2" -- \
+    env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES FLEET_LOCAL_BOX=$box FLEET_ANCHOR=$box "$FW" execution slot --wait 0 -- echo default-cap
+done
+expect "...and tuf-amd-linux, which the default does not name, one" 0 "slot 1 of 1" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES FLEET_LOCAL_BOX=tuf-amd-linux FLEET_ANCHOR=tuf-amd-linux "$FW" execution slot --wait 0 -- echo default-cap
 expect "...and a box the spec does not name has one" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo unnamed-box
 expect "execution slot needs a command after --" 2 "a command to hold the slot around is required" -- "${FWS[@]}" execution slot --
 expect "execution slot refuses a non-numeric --wait" 2 "whole number of seconds" -- "${FWS[@]}" execution slot --wait soon -- echo x

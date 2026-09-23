@@ -17,12 +17,15 @@ command.
 A `measurement` reservation is exclusive: it is refused while anything is outstanding on its
 host, and everything is refused while it is outstanding. A `correctness` reservation shares its
 host with other correctness reservations up to the box's slots - `FLEET_BOX_CORRECTNESS_SLOTS`,
-`<box>=<n>` pairs, `mac-studio=6` with the default roster and one slot for any box it does not
-name (ludics-lite#157: the exclusivity was written for measurement noise and for XProtect
-serializing fresh test binaries, and three workers' targeted `-j 4` batches ran side by side on
-the Mac without a stall once the Developer Tools exemption was in place). Keep one slot for
-WSL boxes because of the measured dxg bridge limit; configure native Linux boxes per their
-measured capacity. The kind does not silently change the configured slot count.
+`<box>=<n>` pairs, `mac-studio=6 rog-nv-linux=2 minix-amd-linux=2` with the default roster and
+one slot for any box it does not name (ludics-lite#157: the exclusivity was written for
+measurement noise and for XProtect serializing fresh test binaries, and three workers' targeted
+`-j 4` batches ran side by side on the Mac without a stall once the Developer Tools exemption was
+in place). Keep one slot for WSL boxes because of the measured dxg bridge limit. The native GPU
+boxes' two slots were measured with targeted batches at ahrefs/ocannl#1029's widths
+(ludics-lite#316): `-j 8` on rog-nv-linux, `-j 4` on minix-amd-linux, where slots x width must
+stay at or under 8 ([linux-boxes.md](linux-boxes.md)). tuf-amd-linux keeps one slot until it is
+measured. The kind does not silently change the configured slot count.
 
 The slot count is a RUN-TIME count, and `execution slot` is the single run-time mechanism
 (ludics-lite#160): every correctness run on a box, assigned or standing, is wrapped in

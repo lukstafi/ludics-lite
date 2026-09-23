@@ -72,7 +72,7 @@ author's fleet (the header of `scripts/fleet-worker.sh` is the authoritative lis
 | Local state directory for each coordinator | `ISSUE_WAVE_STATE` |
 | State directory on the anchor for the lease and fleet-wide halt | `FLEET_ANCHOR_STATE`; every coordinator must resolve it to the same directory on the anchor |
 | Where a box keeps its run-time correctness slot locks (`execution slot`) | `FLEET_SLOT_STATE`; box-wide, deliberately not under the per-coordinator `ISSUE_WAVE_STATE`, and every agent on the box must resolve it to the same directory |
-| How many correctness executions may share a box AT RUN TIME (measurement is always exclusive) | `FLEET_BOX_CORRECTNESS_SLOTS` (`<box>=<n>` pairs; `mac-studio=6` with the default roster, one slot otherwise) |
+| How many correctness executions may share a box AT RUN TIME (measurement is always exclusive) | `FLEET_BOX_CORRECTNESS_SLOTS` (`<box>=<n>` pairs; `mac-studio=6 rog-nv-linux=2 minix-amd-linux=2` with the default roster, one slot otherwise) |
 
 The rest is prose in this file and is edited in place: the **sequencing plan** path and the
 task that maintains it (Inputs, just below), the **fleet roster** with its hardware and the
@@ -153,10 +153,11 @@ that adds test stanzas sequences after one that reshapes the affected goldens or
 boxes serialize per box for measurement work (the plan's Parallelism section orders each box's
 queue). Three limits are separate and none bounds another: agent capacity (the runtime's), the
 execution registry (a measurement reservation is exclusive on its box), and the correctness
-slots a box's batches share at run time (six on mac-studio, one by default on other boxes;
-WSL's measured dxg limit is one, while native Linux may be configured higher after measurement;
-ludics-lite#157, #160) - a count `execution slot` takes around each batch, so a worker's
-standing reservation never gates another worker's start ([executions.md](references/executions.md)).
+slots a box's batches share at run time (six on mac-studio, two each on the native
+rog-nv-linux and minix-amd-linux as measured, one on tuf-amd-linux and on any box the spec does
+not name, which includes WSL's measured dxg limit; ludics-lite#157, #160, #316) - a count
+`execution slot` takes around each batch, so a worker's standing reservation never gates another
+worker's start ([executions.md](references/executions.md)).
 
 A box that is asleep or unreachable is a placement fact, not a blocker: wake it (all but
 `tuf-amd-linux`, which only a person can wake: see Inputs) through
