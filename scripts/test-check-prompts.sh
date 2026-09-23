@@ -1287,6 +1287,24 @@ cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    printf %s shift; shift 2/'
 expect "...and the word beside a real shift still leaves the arm unread" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
 
+# Round 3, P2: a line the one before it left open is part of that command, however it is
+# indented -- `false &&` over a lone `shift 2` is a conditional shift. The same for each way a
+# line can leave its command open, and the control that a finished line still hands on the shift.
+for tail in 'false \&\&' 'false ||' 'printf x |' '!' 'true \\' '{' 'if false; then'; do
+  cleanup_tree
+  cleanup_edit "$CLEANUP_HELPER" "/^  --regenerable)\$/,/;;/s/^    shift 2\$/    $tail\\
+    shift 2/"
+  # The label spells the line as the helper would carry it, without the sed escapes.
+  expect "a shift on a line continuing '$(printf '%s' "$tail" | sed 's/\\\(.\)/\1/g')' is not a top-level statement" 1 \
+    "$CLEANUP_UNREAD" \
+    -- "$CP" "$R"
+done
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    false || true\
+    shift 2/'
+expect "...while a line that finished its command hands the shift on untouched" 0 \
+  "$CLEANUP_AGREE" -- "$CP" "$R"
+
 # A parser this reader cannot find is refused, not read as agreeing with nothing.
 cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" 's/^while \[ "\$#" -gt 0 \]; do$/while (( $# )); do/'
