@@ -5,9 +5,9 @@ name: windows git bash
 # a pull request's checks nor main's verdict (`pr-review.sh base` folds push runs only) waits on it.
 # A dispatched run does put check runs on the head it ran at, so `checks`/`merge` judge it there.
 #
-# Windows evidence for a branch: `gh workflow run windows-git-bash.yml --ref <branch>`, or
-# `-f suite=test-pr-review-watch.sh` for one suite; cite the run. A scheduled red opens (or
-# comments on) one issue.
+# Windows evidence for a branch whose change needs it, not for every scripts PR: `gh workflow run
+# windows-git-bash.yml --ref <branch>`, or `-f suite=test-pr-review-watch.sh` for one suite; cite
+# the run. A scheduled red opens (or comments on) one issue.
 #
 # The first step proves the shell from inside it (`uname -s` MINGW*/MSYS*, `git --version`
 # `.windows.`, the criterion ludics-lite#288 states for a Windows leg) and every suite is gated on

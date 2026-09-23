@@ -422,7 +422,8 @@ ship-pr's shell suites run a third time under Git Bash, in the `git-bash` job on
 (ludics-lite#318): Windows is a supported platform for those scripts, and since the fleet's GPU
 boxes boot native Ubuntu a fleet leg there costs a reboot. That job is its own workflow,
 `windows-git-bash.yml`, run nightly and on dispatch rather than per push, since it takes close to
-an hour (ludics-lite#339); a branch that needs Windows evidence dispatches it,
+an hour (ludics-lite#339). A PR does not dispatch it by default; one whose change needs Windows
+evidence (it fixes a Windows failure, or changes behavior only Windows exercises) dispatches it,
 `gh workflow run windows-git-bash.yml --ref <branch> [-f suite=<test-*.sh>]`, and cites the run.
 A red scheduled run opens an issue. Its first step proves the platform from
 inside the shell the suites run in (`uname -s` is `MINGW*`/`MSYS*` and `git --version` carries
