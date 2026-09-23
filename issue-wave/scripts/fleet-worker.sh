@@ -629,14 +629,16 @@ cmd_preflight() {
 # `execution slot` takes on this machine; a remote box's own batches read that box's environment. The
 # count showed nowhere but in a batch's own slot line, so when an exported default roster dropped
 # mac-studio to one slot, nine workers serialized on one flock with every preflight passing
-# (ludics-lite#329). Under the default roster, a spec that does not name mac-studio -- the box the
-# SLOTS default above widens, and the anchor where the Mac batches run -- is that collapse, and is
-# a warning on stderr; a spec naming it explicitly, even at one slot, is someone's choice and is
-# not. The box is spelled here as well as in the default, and the preflight fixture's no-warning
-# case under the default roster fails if the two ever part. Never changes the preflight's verdict.
+# (ludics-lite#329). Under the default roster, a spec that does not name a box the SLOTS default
+# above widens -- mac-studio, where the Mac batches run, and the native GPU boxes rog-nv-linux and
+# minix-amd-linux (ludics-lite#316) -- is that collapse for that box, and is one warning on stderr
+# per box; a spec naming the box explicitly, even at one slot, is someone's choice and is not. The
+# boxes are spelled here as well as in the default, and the preflight fixture checks both
+# directions: the site default draws no warning, and an empty spec warns about exactly the boxes
+# the site default gives more than one slot. Never changes the preflight's verdict.
 slots_report() {
-  local b n named=0 out="" src
-  local -a roster=() spec=()
+  local b n named out="" src
+  local -a roster=() spec=() widened=(mac-studio rog-nv-linux minix-amd-linux)
   read -r -d "" -a roster <<< "$BOXES" || :
   read -r -d "" -a spec <<< "$SLOTS" || :
   for b in ${roster[@]+"${roster[@]}"}; do
@@ -648,8 +650,11 @@ slots_report() {
   else src="custom roster: one slot each"; fi
   echo "PREFLIGHT SLOTS${out} ($src)"
   [ "$DEFAULT_ROSTER" = 1 ] || return 0
-  for n in ${spec[@]+"${spec[@]}"}; do [ "${n%%=*}" = mac-studio ] && named=1; done
-  [ "$named" = 1 ] || echo "PREFLIGHT SLOTS WARNING: the default roster, but FLEET_BOX_CORRECTNESS_SLOTS=\"$SLOTS\" does not name mac-studio, which falls to one slot (the site default gives it more); every correctness batch there serializes" >&2
+  for b in "${widened[@]}"; do
+    named=0
+    for n in ${spec[@]+"${spec[@]}"}; do [ "${n%%=*}" = "$b" ] && named=1; done
+    [ "$named" = 1 ] || echo "PREFLIGHT SLOTS WARNING: the default roster, but FLEET_BOX_CORRECTNESS_SLOTS=\"$SLOTS\" does not name $b, which falls to one slot (the site default gives it more); every correctness batch there serializes" >&2
+  done
 }
 
 # ---------------------------------------------------------------------------------------------

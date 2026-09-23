@@ -684,6 +684,15 @@ PFM=(env FLEET_LOCAL_BOX=mac-studio "$FW" preflight mac-studio --no-probe --no-c
 expect "preflight prints the site default's slot counts under an exported default roster" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=2 minix-amd-linux=2 tuf-amd-linux=1 (site default)$" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="$PFROSTER" "${PFM[@]}"
 grep -q "WARNING" <<<"$out" && ko "...and warns about a configuration that is the site default -- $out" || ok "...and warns about nothing"
+# The other direction of that pairing: the boxes the site default widens, read off its own line,
+# are exactly the boxes an empty spec warns about -- so a box added to the default and not to the
+# warning's list (or the reverse) fails here.
+pf_widened=$(sed -n 's/^PREFLIGHT SLOTS \(.*\) (site default)$/\1/p' <<<"$out" | tr ' ' '\n' | awk -F= '$2 > 1 {print $1}' | sort | tr '\n' ' ')
+expect "an empty spec under the default roster warns, box by box" 0 "does not name" -- \
+  env FLEET_BOX_CORRECTNESS_SLOTS="" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
+pf_warned=$(sed -n 's/^PREFLIGHT SLOTS WARNING: .* does not name \([^,]*\), which falls.*/\1/p' <<<"$out" | sort | tr '\n' ' ')
+[ -n "$pf_widened" ] && [ "$pf_widened" = "$pf_warned" ] && ok "...about exactly the boxes the site default widens: $pf_warned" \
+  || ko "the collapse warning names '$pf_warned', the site default widens '$pf_widened'"
 expect "...the same under an unset roster" 0 "^PREFLIGHT SLOTS mac-studio=6 .*(site default)$" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES "${PFM[@]}"
 expect "a spec that leaves mac-studio out under the default roster is a loud warning, not a refusal" 0 "PREFLIGHT SLOTS WARNING: the default roster, but FLEET_BOX_CORRECTNESS_SLOTS=\"rog-nv-linux=2\" does not name mac-studio, which falls to one slot" -- \
@@ -692,9 +701,15 @@ grep -q "^PREFLIGHT OK mac-studio" <<<"$out" && grep -q "^PREFLIGHT SLOTS mac-st
   && ok "...beside the OK line and the counts it names" || ko "the collapse warning lost the OK line or the counts -- $out"
 expect "...as is an explicitly empty spec" 0 "PREFLIGHT SLOTS WARNING: .* does not name mac-studio" -- \
   env FLEET_BOX_CORRECTNESS_SLOTS="" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
-expect "a spec naming mac-studio at one slot is a choice, printed without a warning" 0 "^PREFLIGHT SLOTS mac-studio[=]1 .*(FLEET_BOX_CORRECTNESS_SLOTS)$" -- \
-  env FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=1" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
-grep -q "WARNING" <<<"$out" && ko "a spec naming mac-studio at one slot drew a collapse warning -- $out" || ok "...and no warning"
+expect "a spec naming every widened box at one slot is a choice, printed without a warning" 0 "^PREFLIGHT SLOTS mac-studio[=]1 rog-nv-linux[=]1 minix-amd-linux[=]1 .*(FLEET_BOX_CORRECTNESS_SLOTS)$" -- \
+  env FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=1 rog-nv-linux=1 minix-amd-linux=1" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
+grep -q "WARNING" <<<"$out" && ko "a spec naming every widened box at one slot drew a collapse warning -- $out" || ok "...and no warning"
+# The hub's 2026-09-23 mitigation shape: a spec naming only the Mac collapses the native GPU boxes
+# (ludics-lite#316), so it warns about each of them and not about mac-studio.
+expect "a spec naming only mac-studio warns about each native GPU box it leaves at one slot" 0 "does not name rog-nv-linux, which falls to one slot" -- \
+  env FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=4" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
+grep -q "does not name minix-amd-linux, which falls" <<<"$out" && ! grep -q "does not name mac-studio" <<<"$out" \
+  && ok "...minix-amd-linux too, and not the Mac it names" || ko "the per-box collapse warnings are wrong -- $out"
 expect "a roster over several lines prints every box" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=2 minix-amd-linux=2 tuf-amd-linux=1 (site default)$" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="mac-studio rog-nv-linux
 minix-amd-linux tuf-amd-linux" "${PFM[@]}"
