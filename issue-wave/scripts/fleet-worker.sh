@@ -81,8 +81,11 @@
 #   FLEET_ANCHOR_STATE: anchor state dir; defaults to ISSUE_WAVE_STATE.
 #   FLEET_BOXES: whole fleet; "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux". `ls` sweeps it minus local.
 #   FLEET_BOX_CORRECTNESS_SLOTS: `<box>=<n>` pairs, how many correctness executions may share a
-#     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" with the default roster,
-#     empty (one slot everywhere) with a custom FLEET_BOXES. Measurement stays exclusive.
+#     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" whenever the roster is the
+#     default one, whether FLEET_BOXES is unset or exports those same boxes (compared as a word
+#     set, ludics-lite#329); empty (one slot everywhere) with a custom FLEET_BOXES. Set, even to
+#     empty, it overrides the default either way. `preflight` prints the count per roster box.
+#     Measurement stays exclusive.
 #     Six, not three (ludics-lite#160): three `-j 4` batches ran side by side on the Mac without
 #     a stall on 2026-09-15 and the Developer Tools exemption removed the XProtect tax, and the
 #     cap exists to bound concurrent load, never to bound how many agents may be in flight.
@@ -125,9 +128,22 @@ detect_local_box() {
 LOCAL_BOX="${FLEET_LOCAL_BOX-$(detect_local_box)}"
 BASE_REF="${FLEET_BASE_REF:-origin/master}"
 ANCHOR="${FLEET_ANCHOR:-mac-studio}"
-BOXES="${FLEET_BOXES:-mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux}"
-# Correctness slots per box: the site default only fits the site's roster.
-SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ -n "${FLEET_BOXES:-}" ] || echo mac-studio=6)}"
+DEFAULT_BOXES="mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
+BOXES="${FLEET_BOXES:-$DEFAULT_BOXES}"
+# A roster as a normalised word list: whitespace-separated, order and repeats ignored, so an
+# exported roster naming the default boxes reads as the default roster (ludics-lite#329).
+roster_words() {
+  local -a words=()
+  read -r -a words <<< "$1"
+  [ "${#words[@]}" -gt 0 ] || return 0
+  printf '%s\n' "${words[@]}" | LC_ALL=C sort -u | tr '\n' ' '
+}
+# Correctness slots per box: the site default only fits the site's roster, so it applies whenever
+# the effective roster IS the default one -- not only when FLEET_BOXES is absent. From 2026-09-22
+# every box's ~/.config/fleet/env.sh exported the default roster verbatim, and a test on the
+# variable's presence silently dropped mac-studio to one slot for a day (ludics-lite#329).
+if [ "$(roster_words "$BOXES")" = "$(roster_words "$DEFAULT_BOXES")" ]; then DEFAULT_ROSTER=1; else DEFAULT_ROSTER=0; fi
+SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ "$DEFAULT_ROSTER" = 0 ] || echo mac-studio=6)}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 # Run-time correctness slots (`execution slot`) are a property of the BOX, so their lock files
@@ -583,8 +599,37 @@ cmd_preflight() {
   done
   { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$cross" "${FLEET_CROSS_TIMEOUT:-20}"
   local rc=$?
-  if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; exit 4; fi
+  if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; slots_report; exit 4; fi
+  slots_report
   exit "$rc"
+}
+
+# slots_report: one PREFLIGHT SLOTS line with the correctness slot count this shell's configuration
+# gives every roster box -- what the registry admits (every reservation carries this spec) and what
+# `execution slot` takes on this machine; a remote box's own batches read that box's environment. The
+# count showed nowhere but in a batch's own slot line, so when an exported default roster dropped
+# mac-studio to one slot, nine workers serialized on one flock with every preflight passing
+# (ludics-lite#329). Under the default roster, a spec that does not name mac-studio -- the box the
+# SLOTS default above widens, and the anchor where the Mac batches run -- is that collapse, and is
+# a warning on stderr; a spec naming it explicitly, even at one slot, is someone's choice and is
+# not. The box is spelled here as well as in the default, and the preflight fixture's no-warning
+# case under the default roster fails if the two ever part. Never changes the preflight's verdict.
+slots_report() {
+  local b n named=0 out="" src
+  local -a roster=() spec=()
+  read -r -a roster <<< "$BOXES"
+  read -r -a spec <<< "$SLOTS"
+  for b in ${roster[@]+"${roster[@]}"}; do
+    n=$(box_correctness_slots "$b") || { echo "PREFLIGHT SLOTS WARNING: $n; every \`execution slot\` and reservation under it refuses" >&2; return 0; }
+    out="$out $b=$n"
+  done
+  if [ -n "${FLEET_BOX_CORRECTNESS_SLOTS+x}" ]; then src="FLEET_BOX_CORRECTNESS_SLOTS"
+  elif [ "$DEFAULT_ROSTER" = 1 ]; then src="site default"
+  else src="custom roster: one slot each"; fi
+  echo "PREFLIGHT SLOTS${out} ($src)"
+  [ "$DEFAULT_ROSTER" = 1 ] || return 0
+  for n in ${spec[@]+"${spec[@]}"}; do [ "${n%%=*}" = mac-studio ] && named=1; done
+  [ "$named" = 1 ] || echo "PREFLIGHT SLOTS WARNING: the default roster, but FLEET_BOX_CORRECTNESS_SLOTS=\"$SLOTS\" does not name mac-studio, which falls to one slot (the site default gives it more); every correctness batch there serializes" >&2
 }
 
 # ---------------------------------------------------------------------------------------------
