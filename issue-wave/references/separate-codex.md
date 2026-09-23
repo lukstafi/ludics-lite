@@ -167,15 +167,9 @@ bytes and ANSI control sequences: keep the raw log in a file and make a sanitize
 text inspection rather than placing raw output in shell variables or command substitutions.
 Continue to gate on the exact-head workflow and required jobs.
 
-For OCANNL, use `rog-nv-win` or `minix-amd-win` first for development Windows verification
-under native Windows Git Bash. Record the host, tested commit, relevant command and exit sentinel
-through `tools/test-run.sh`; WSL does not establish native Windows coverage.
-Remote Windows CI is an opt-in fallback when neither host can provide the needed check.
-Dispatch `ci.yml` with `windows_only: true` and the full `expected_sha`, then verify the run's
-head and both Windows jobs' executed results before counting the evidence. This can check an
-existing commit without a new push. Correct inherited briefs that routinely demand extended
-Windows CI to use the fleet first. Scheduled Windows coverage remains independent; do not wait
-for its sweep as a PR gate. Ordinary current-head PR checks remain required.
+Windows evidence follows the Windows paragraph of ship-pr's *Read the base before you branch*;
+its `windows_only: true` dispatch can check an existing commit without a new push.
+Ordinary current-head PR checks remain required.
 
 If sibling fixes become mutually gated on red branches, freeze both writers and confirm their
 remote SHAs, unpushed commits, and staged, unstaged and untracked state before changing ownership.

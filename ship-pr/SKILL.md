@@ -136,13 +136,13 @@ ocannl-staging `ci` carries `paths-ignore: docs/**`, so a docs-only push produce
 the newest verdict legitimately trails the tip by a commit or several — that is a gap in coverage,
 not a stale reading, and the printed SHA is what lets you tell them apart.
 
-For OCANNL, “full matrix” means the ordinary Linux/macOS PR matrix. Use `rog-nv-win`
-or `minix-amd-win` first for Windows development checks, with native Windows Git Bash and
-`tools/test-run.sh`; retain host, commit, command and exit sentinel. Remote Windows CI is an
-opt-in fallback when neither host can provide the needed check: dispatch `windows_only: true`
-with the full `expected_sha`, and verify the run's head and both Windows jobs' executed results.
-Do not routinely add remote Windows to PR verification or wait for the independent scheduled
-sweep to merge. Required Windows evidence can come from the fleet or this fallback.
+For OCANNL, “full matrix” means the ordinary Linux/macOS PR matrix. Needed Windows evidence
+comes from CI: the `git-bash` job for ship-pr's scripts, and for OCANNL a `windows_only: true`
+dispatch with the full `expected_sha`, verified on its head and both Windows jobs' executed
+results; never wait on the scheduled sweep. Use `rog-nv-win` or `minix-amd-win` only when it is
+booted into Windows or the check needs its hardware: invoke `"C:\Program Files\Git\bin\bash.exe"`
+(over ssh a bare `bash` is WSL's), have the script under test print `uname -s` (`MINGW*`/`MSYS*`)
+and `git --version` (`.windows.`), and keep `tools/test-run.sh`'s record.
 
 ## Open
 
