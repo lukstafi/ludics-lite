@@ -17,11 +17,27 @@ woken. What holds a turn is a foreground Bash call, capped at 600 s. So:
 
 - a project-runner batch blocks with `tools/test-run.sh wait last --timeout 540`, re-issued
   on exit 124 until the run's own status comes back;
-- anything that can outlast the cap is backgrounded with its exit status appended to its log
-  (`<cmd> > <log> 2>&1; echo "rc=$?" >> <log>`), and the worker blocks with a foreground
-  `until grep -q '^rc=' <log>; do sleep 5; done` under a timeout below the cap, re-issued until
-  it returns. That includes ship-pr's `pr-review.sh watch` and `merge --wait`, which are never
-  run in the foreground: a live 👀 can stretch a watch to its 20-minute grace.
+- anything that can outlast the cap, ship-pr's `pr-review.sh watch` and `merge --wait` included
+  (never run in the foreground: a live 👀 can stretch a watch to its 20-minute grace), runs as a
+  background task that keeps its status out of its output, in a directory of its own (`d`,
+  under the scratchpad with the issue prefix):
+
+  ```bash
+  echo $$ > "$d/pid"; <cmd> > "$d/log" 2>&1; echo $? > "$d/rc"
+  ```
+
+  and the worker blocks on it with a foreground call that ends before the cap by itself:
+
+  ```bash
+  for _ in {1..108}; do [ -s "$d/rc" ] && break; kill -0 "$(cat "$d/pid")" 2>/dev/null || break; sleep 5; done
+  if [ -s "$d/rc" ]; then echo "rc=$(cat "$d/rc")"; elif kill -0 "$(cat "$d/pid")" 2>/dev/null; then echo RUNNING; else echo DIED; fi
+  ```
+
+  `rc=` is the command's exit status, read from a file its output cannot write, so a review
+  body quoting `rc=` cannot end the wait. `RUNNING` is re-issued. `DIED` means the harness
+  killed the task before it finished (observed at ~40 min for a backgrounded `merge --wait`),
+  and says nothing about what the command was reading: re-arm it, and for `merge --wait` first
+  re-read the merge state as ship-pr's *The approval is one gate* says.
 
 ## Worker channel
 
