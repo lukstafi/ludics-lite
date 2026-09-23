@@ -1246,6 +1246,7 @@ cleanup_edit "$CLEANUP_HELPER" 's/^  --force-integrated)$/  --base) BASE_BRANCH=
 expect "a one-line flag arm agrees with a bare listing, whatever its comment says" 0 \
   "usage() agrees with its parser on each one's arity" -- "$CP" "$R"
 CLEANUP_UNREAD="the parser's '--regenerable)' arm is not one this reader can read"
+CLEANUP_PARSER="the option parser is not one this reader can read"
 # Round 1, P2 x2: which `shift` text is the arm's shift. Two shifts add up whatever each says, so
 # an arm carrying two is unread rather than read as one; and a shift in a comment or in quoted
 # text is no command, so an arm whose only `shift 2` is text is a flag arm.
@@ -1334,7 +1335,7 @@ cleanup_edit "$CLEANUP_HELPER" '/^  --base)$/,/;;/s/^    shift 2$/    shift\
     case x in x) : ;; esac\
     shift/'
 expect "a nested case's terminator does not close the arm it sits in" 1 \
-  "the parser's '--base)' arm is not one this reader can read" -- "$CP" "$R"
+  "$CLEANUP_PARSER: a ;; that does not end its line" -- "$CP" "$R"
 # A pattern naming options in another spelling is reported, not skipped: the helper would take
 # two options nobody can learn of.
 cleanup_tree
@@ -1342,8 +1343,9 @@ cleanup_edit "$CLEANUP_HELPER" 's/^  --base)$/  --hidden|--secret)\
     shift\
     ;;\
   --base)/'
-expect "an alternation arm is an option the reader cannot name, refused as unlisted" 1 \
-  "the option parser takes '--hidden|--secret', which usage() does not list" -- "$CP" "$R"
+expect "an alternation arm is a pattern outside the grammar, refused with the parser" 1 \
+  "$CLEANUP_PARSER: a case pattern other than one bare --name) or a final *): --hidden|--secret)" \
+  -- "$CP" "$R"
 
 # Round 5, P2 x3: the split is per line and per `;`, so a quote left open across lines and a
 # backslash-escaped `;` -- both of which carry a `shift 2` as data -- leave the arm unread; and case
@@ -1361,8 +1363,32 @@ for glob in '*) usage ;;' '-*) shift ;;'; do
   cleanup_edit "$CLEANUP_HELPER" "s/^  --base)\$/  $glob\\
   --base)/"
   expect "an arm behind a '${glob%%)*})' pattern, which matches it first, is refused" 1 \
-    "the parser's '--base)' arm follows the pattern '${glob%%)*})'" -- "$CP" "$R"
+    "$CLEANUP_PARSER" -- "$CP" "$R"
 done
+
+# Round 6, P2 x3: the grammar reaches the whole block, not only the arms. A pattern is one bare
+# `--name)` or a final `*)` whose body is `usage`, so an escaped spelling that matches `--base`
+# ahead of its arm is outside it; a `;;` ends its line, so one line is never two clauses; and only
+# `done` follows `esac`, so no statement in the loop consumes an argument no arm accounts for.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^  --base)$/  -\\-base) shift ;;\
+  --base)/'
+expect "an escaped spelling of an option ahead of its arm is refused" 1 \
+  "$CLEANUP_PARSER: a case pattern other than one bare --name) or a final *): -\\-base)" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^  --base)$/  --dry-run) shift ;; --base) shift ;;\
+  --base)/'
+expect "two clauses on one line are refused" 1 \
+  "$CLEANUP_PARSER: a ;; that does not end its line" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  \*) usage ;;$/,/^done$/s/^  esac$/  esac\
+  shift/'
+expect "a statement between esac and done is refused" 1 \
+  "$CLEANUP_PARSER: a statement between esac and done: shift" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^  \*) usage ;;$/  *) echo "unknown: $1" >\&2; usage ;;/'
+expect "a catch-all doing more than usage is refused" 1 \
+  "$CLEANUP_PARSER: a catch-all *) arm doing more than usage" -- "$CP" "$R"
 
 # A parser this reader cannot find is refused, not read as agreeing with nothing.
 cleanup_tree
