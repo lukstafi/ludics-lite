@@ -1088,21 +1088,27 @@ invocation_options() {
 # which is a false refusal on a line the operator can see and not a false agreement nobody reads.
 # That is the reader's boundary, the same line-shape boundary as the rest of this file (README,
 # Tests; ludics-lite#75): it establishes that each arm's shift agrees with its listing, not that the
-# arm reads `$2` or that the parser is the one the script runs, and it takes `usage` to exit and `[`
-# to be the test builtin.
+# arm reads `$2` or that the parser is the one the script runs. It reads the helper as written, not
+# as an adversary could rewrite the shell under it: `shift` is taken to be the builtin, `usage` to
+# exit and `[` to be the test builtin, since a function, alias or `enable -n` redefining one is not
+# the drift between a listing and an arm that this pins (ludics-lite#302), and no scan of names
+# reaches every way a shell can be told a word means something else.
 parser_options() {
   LC_ALL=C awk '
     function bad(why) { print "!\t" why; over = 1; exit }
     function trim(t) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", t); return t }
-    # unq <line>: the line with each quoted span a plain word Q, read LEFT TO RIGHT in one pass as
-    # the shell reads it, so a delimiter of one kind inside a span of the other is text and cannot
-    # pair with one further on (round 8, P2); a backslash in a double-quoted span escapes the next
-    # byte. OPEN is set when a span is left unclosed at the end of the line.
+    # unq <line>: the line with each quoted span a plain word Q and its comment dropped, read LEFT
+    # TO RIGHT in one pass as the shell reads it, so a delimiter of one kind inside a span of the
+    # other is text and cannot pair with one further on (round 8, P2), and an unquoted `#` opening a
+    # word -- at the start, after a blank, a `;` or an operator, `;;# shift 2` included -- ends the
+    # line there, quotes in the comment and all (rounds 1 and 9, P2). A backslash in a
+    # double-quoted span escapes the next byte. OPEN is set when a span is left unclosed.
     function unq(t,   out, i, n, c, q) {
       out = ""; q = ""; n = length(t)
       for (i = 1; i <= n; i++) {
         c = substr(t, i, 1)
         if (q == "") {
+          if (c == "#" && (out == "" || out ~ /[[:space:];&|()]$/)) break
           if (c == "\047" || c == "\"") { q = c; out = out "Q"; continue }
           out = out c; continue
         }
@@ -1143,10 +1149,7 @@ parser_options() {
       arm = 1; ar = ""; ns = 0; amb = 0; $0 = substr($0, RSTART + RLENGTH)
     }
     arm {
-      # Quoted spans are text, each standing as one plain word Q, and a `#` opening a word -- after
-      # a blank, a `;` or an operator, `;;# shift 2` included -- starts a comment (round 1, P2).
       l = unq($0)
-      if (match(l, /(^|[[:space:];&|()])#/)) l = substr(l, 1, RSTART + RLENGTH - 2)
       # A quote left open runs onto the next line and a backslash escapes what follows it, a `;`
       # included: the per-line, per-`;` split models neither (round 5, P2).
       if (OPEN || l ~ /[\\`]/) amb = 1

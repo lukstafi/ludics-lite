@@ -1405,6 +1405,12 @@ cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    X="
 expect "an apostrophe in a double-quoted value does not pair with one further on" 1 \
   "$CLEANUP_UNREAD" -- "$CP" "$R"
 
+# Round 9, P2: a comment ends the line in the same pass that reads quotes, so an apostrophe in a
+# comment opens no quote and a sound arm is still read.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    shift 2 # don'"'"'t consume only the option/'
+expect "an apostrophe in a comment opens no quote" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+
 # A parser this reader cannot find is refused, not read as agreeing with nothing.
 cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" 's/^while \[ "\$#" -gt 0 \]; do$/while (( $# )); do/'
