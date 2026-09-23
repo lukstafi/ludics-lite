@@ -558,6 +558,11 @@ command -v jq >/dev/null 2>&1 || note "no jq"
 # Every correctness batch on this box now runs under `execution slot`, whose N-holder lock is a
 # real flock taken by python3 (ludics-lite#160), so Python is no longer an anchor-only need.
 python3 -c 'import fcntl' >/dev/null 2>&1 || note "no python3 with fcntl (execution slot's run-time lock)"
+sleep_guard=""
+if command -v "${FLEET_SYSTEMD_INHIBIT:-systemd-inhibit}" >/dev/null 2>&1 \
+  && ! pkcheck --action-id org.freedesktop.login1.inhibit-block-sleep --process $$ >/dev/null 2>&1; then
+  sleep_guard="no polkit grant for the sleep guard (runs unguarded; see issue-wave/references/executions.md#the-os-level-sleep-guard)"
+fi
 # Cross-box reach (ludics-lite#57): a worker's brief may drive a fleet sibling over ssh for a
 # one-off leg, and on 2026-09-04 the first such leg found no credential mid-task. A refused
 # credential (permission denied, an unverifiable host key) refuses here; a sibling that does not
@@ -586,7 +591,7 @@ if [ -n "$refuse" ]; then
   echo "PREFLIGHT REFUSED $BOX: ${refuse#; }${other:+ (changes outside the served tree, ignored: $other)}"
   exit 1
 fi
-echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (changes outside the served tree, ignored: $other)}${cross_down:+ (cross-box unreachable, asleep or off the network:$cross_down)}"
+echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (changes outside the served tree, ignored: $other)}${cross_down:+ (cross-box unreachable, asleep or off the network:$cross_down)}${sleep_guard:+ ($sleep_guard)}"
 EOF
 }
 
