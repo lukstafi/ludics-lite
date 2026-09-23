@@ -842,8 +842,11 @@ project's worktree awaited a run id from this one, and the 404 came back as a ve
 run). A bare id is accepted only with `-R owner/name` or `REPO=`, and refused with exit 2
 otherwise; a run/repo pair the API rejects is exit 2 too, never the exit 1 that reads as red.
 
-Evidence from a platform the PR matrix skips comes from dispatching that workflow on the head
-and citing the run, never from waiting on a scheduled sweep.
+A platform the PR matrix skips is its scheduled run's to cover: a PR neither waits on that run
+nor dispatches it by default. Dispatch it on the head, and cite the run, only when the change
+needs that platform's evidence — it fixes a failure the platform reported, or changes behavior
+only that platform exercises. A dispatched run puts its check runs on the head, so `checks` and
+`merge` then wait on it: close to an hour for a Windows leg (ludics-lite#337).
 
 ### How stale the base has grown
 
