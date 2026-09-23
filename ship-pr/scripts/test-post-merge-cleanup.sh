@@ -1733,12 +1733,15 @@ test_ignored_data_during_topic_detach() {
     fail "topic detach race was not injected"
   assert_eq "$(sed -n '1p' "$CASE_SESSION/value")" irreplaceable \
     "ignored data created during topic detach must survive"
+  # The remote deletion is the helper's last step (ludics-lite#287), so this refusal never reached
+  # it: origin keeps the landed tip, and the concurrent advance stays local.
   new_topic_oid=$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)
+  [ "$new_topic_oid" != "$CASE_TOPIC_OID" ] || fail "topic detach race did not advance the local topic"
   remote_topic_oid=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
-  assert_eq "$remote_topic_oid" "$new_topic_oid" \
-    "topic detach refusal must restore the concurrently advanced tip remotely"
+  assert_eq "$remote_topic_oid" "$CASE_TOPIC_OID" \
+    "topic detach refusal must leave the remote topic untouched"
   assert_topic_preserved
-  echo "PASS: topic detach refuses ignored data and restores the current remote tip"
+  echo "PASS: topic detach refuses ignored data and leaves the remote tip untouched"
 }
 
 test_ignored_data_during_topic_reattach() {
@@ -1782,9 +1785,12 @@ test_ignored_data_during_topic_reattach() {
     fail "topic reattachment race was not injected"
   assert_eq "$(sed -n '1p' "$CASE_SESSION/ignored-collision")" "irreplaceable local bytes" \
     "topic reattachment must not overwrite ignored session data"
+  # As in the detach case: the refusal precedes the remote deletion, so origin is untouched.
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/topic)" "$new_topic_oid" \
+    "the concurrently advanced topic must stay local"
   remote_topic_oid=$(git -C "$CASE_MAIN" ls-remote origin refs/heads/topic | awk '{print $1}')
-  assert_eq "$remote_topic_oid" "$new_topic_oid" \
-    "topic reattachment refusal must restore the concurrently advanced tip remotely"
+  assert_eq "$remote_topic_oid" "$CASE_TOPIC_OID" \
+    "topic reattachment refusal must leave the remote topic untouched"
   assert_topic_preserved
   echo "PASS: topic reattachment refuses to overwrite ignored session data"
 }
