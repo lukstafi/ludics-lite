@@ -38,6 +38,7 @@ SECTIONS=(
   "coordinator lease"
   "base gate"
   "preflight"
+  "load"
   "launch / attach / status / log with a project repo and --repo/--branch"
   "failure verdicts"
   "unstick"
@@ -632,6 +633,11 @@ expect "a sibling that does not answer is noted on the OK line" 0 "PREFLIGHT OK.
 expect "a reachable sibling adds nothing to the OK line" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- env FLEET_BOXES="testbox otherbox" "$FW" preflight testbox --no-probe
 expect "--no-cross skips the reach probe" 0 "PREFLIGHT OK" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_DENY=otherbox "$FW" preflight testbox --no-probe --no-cross
 expect "a sibling whose login never returns is bounded and noted, not hung" 0 "PREFLIGHT OK.*otherbox(no answer in 2s)" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_HANG=otherbox FLEET_CROSS_TIMEOUT=2 "$FW" preflight testbox --no-probe
+# The same through the DEFAULT roster (ludics-lite#320): tuf-amd-linux is Wi-Fi only and woken by
+# hand, so from mac-studio it is often the one sibling asleep. Its silence is a note naming it
+# alone, never a refusal, and rog and minix answering add nothing (the `$` anchor says so).
+expect "mac-studio with the default roster notes a sleeping TUF and still passes" 0 "PREFLIGHT OK mac-studio skills=[0-9a-f]* (cross-box unreachable, asleep or off the network: tuf-amd-linux)$" -- \
+  env -u FLEET_BOXES FLEET_LOCAL_BOX=mac-studio SHIM_SSH_DOWN=tuf-amd-linux "$FW" preflight mac-studio --no-probe
 [ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded reach probe" || ok "preflight lock released after the bounded reach probe"
 # The probe must not read the far-side program off stdin: a sibling that swallows its stdin would
 # otherwise end the preflight early with status 0 over an earlier refusal (Codex P1 on #67).
@@ -708,6 +714,28 @@ expect "a real directory in place of the link refuses" 1 "skills/ship-pr -> miss
 rm -rf "$HOME/.claude/skills/ship-pr"; ln -sfn "$repo/wait-and-proceed" "$HOME/.claude/skills/ship-pr"
 expect "a link swapped to a sibling skill refuses" 1 "skills/ship-pr -> .*/wait-and-proceed (not " -- "$FW" preflight testbox --no-probe
 ln -sfn "$repo/ship-pr" "$HOME/.claude/skills/ship-pr"
+}
+
+# --- load: an asleep box is a row, not a failure ------------------------------------------------
+# `load` is placement input, and the box it most often reports asleep is tuf-amd-linux (Wi-Fi only,
+# manual wake; ludics-lite#320). The payload below is flotilla's own shape for an endpoint that did
+# not answer, copied from http://mac-studio:7799/api/fleet on 2026-09-23 (`data` null, null
+# averages, an ssh error). curl is shimmed on this case's PATH only.
+section "load" && {
+mkdir -p "$TMP/loadbin"
+printf '#!/usr/bin/env bash\ncat "$SHIM_FLEET_JSON"\n' > "$TMP/loadbin/curl"; chmod +x "$TMP/loadbin/curl"
+cat > "$TMP/fleet-asleep.json" <<'JSON'
+{"machines":[
+ {"name":"mac-studio","endpoints":{"local":{"kind":"unix","host":"local","ok":true,"data":{"counts":{"dune":0},"sessions":{"claude":[1],"codex":[]},"gpu":{"name":"Apple M4 Max"}},"avg":{"m5":{"cpu_pct":12.7,"gpu_util_pct":0}}}}},
+ {"name":"tuf","sleep_status":null,"wol":false,"endpoints":{"linux":{"kind":"unix","host":"tuf-amd-linux","ok":false,"data":null,"error":"exit 255: ssh: connect to host tuf-amd-linux port 22: Operation timed out","fetched_at":null,"avg":{"m1":{"cpu_pct":null,"gpu_util_pct":null,"samples":0},"m5":{"cpu_pct":null,"gpu_util_pct":null,"samples":0},"m15":{"cpu_pct":null,"gpu_util_pct":null,"samples":0}}},"win":{"kind":"windows","host":"tuf-amd-win","ok":false,"data":null}}}
+]}
+JSON
+tab=$'\t'
+out=$(env PATH="$TMP/loadbin:$PATH" SHIM_FLEET_JSON="$TMP/fleet-asleep.json" "$FW" load 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && grep -q "^tuf${tab}tuf-amd-linux${tab}ok=false${tab}cpu5=?%" <<<"$out" &&
+   grep -q "^mac-studio${tab}local${tab}ok=true" <<<"$out"; then
+  ok "load reports a sleeping TUF as an ok=false row beside the live boxes, exit 0"
+else ko "load over a sleeping TUF (rc=$rc) -- $out"; fi
 }
 
 section "launch / attach / status / log with a project repo and --repo/--branch" && {

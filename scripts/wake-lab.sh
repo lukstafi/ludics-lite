@@ -10,7 +10,7 @@
 #   wake-lab.sh [rog|minix|tuf|all]       wake (default: rog minix; all: rog minix tuf)
 #   wake-lab.sh --wait [--wsl] rog        wake, then poll until configured OS answers
 #   wake-lab.sh --wait --restart-wsl rog  ...and start WSL from a FRESH VM (wsl --shutdown first)
-#   wake-lab.sh status [box...]           per-box reachability and reached OS
+#   wake-lab.sh status [box...]           per-box reachability and reached OS (default: all three)
 #   wake-lab.sh sleep|hibernate|down box  suspend / hibernate / full shutdown
 #   wake-lab.sh kick-wsl box              start the WSL VM (it never autostarts at boot)
 #   wake-lab.sh restart-wsl box           shut the WSL VM down and start it again
@@ -672,7 +672,16 @@ for arg in "$@"; do
     *) TARGETS+=("$arg") ;;
   esac
 done
-[ ${#TARGETS[@]} -eq 0 ] && TARGETS=(rog minix)
+# The no-argument defaults differ by verb on purpose (ludics-lite#320). `status` is a read -- a
+# router query and ssh probes, nothing that changes a box's state -- so it covers the whole lab, tuf
+# included: tuf is Wi-Fi only and woken by hand, so it is often the one box awake, and a first look
+# that leaves it out reads that box as absent. Every verb that ACTS keeps `rog minix`: waking tuf
+# cannot work over Wi-Fi, and sleeping it leaves it down until someone wakes it by hand. Like
+# `status all`, the default is checked against the site table whole, so a table that does not know
+# tuf refuses a bare `status` rather than silently shrinking it; name the boxes there instead.
+if [ ${#TARGETS[@]} -eq 0 ]; then
+  if [ "$VERB" = status ]; then TARGETS=(rog minix tuf); else TARGETS=(rog minix); fi
+fi
 
 # A --hold that holds nothing is a lane that believes it is held and is not, which is the exact
 # failure this flag exists to prevent — so refuse it rather than ignore it. On the wake path that
