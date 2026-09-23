@@ -50,6 +50,59 @@ is each coordinator's own directory, and slots kept there would let two workers 
 coordinators each take slot 1 on one machine. The command after `--` is exec'd, not
 interpreted, so a pipeline or a shell builtin goes as `sh -c '...'`.
 
+## The OS-level sleep guard
+
+On native Linux the lab locks are advisory: they bind sessions that go through `wake-lab.sh`,
+and nothing at the OS level stopped another session's `wake-lab.sh sleep`, or an idle suspend,
+from taking a box out from under a running worker (under WSL the Windows-side holder did that).
+So every run on a box carries a logind **block** inhibitor on `sleep:idle` for exactly as long
+as it runs (ludics-lite#317): `execution slot` runs its command inside
+`fleet-worker.sh execution hold [--why <text>] -- <command>`, and an exclusive measurement,
+which cannot take a slot, is invoked as `fleet-worker.sh execution hold -- <runner command>`.
+`hold` takes nothing else - no slot, no registry read, no lease - and where there is no
+`systemd-inhibit` (macOS, a Linux host without systemd) it runs the command bare and silently.
+The inhibitor is held by a helper BESIDE the command, not by systemd-inhibit wrapped around it:
+the command is exec'd on the caller's pid with its exit status and the slot flock unchanged,
+and the inhibitor lives exactly as long as the flock does - until the last process of the
+command's tree exits, however it ends, a `kill -9` of the command alone included.
+`FLEET_SYSTEMD_INHIBIT` names the binary; the suites point it at a stub.
+
+The mode is `block`, not `block-weak`: systemd 259's `systemctl --check-inhibitors=yes suspend`,
+which is what `wake-lab.sh sleep` runs, refuses on any `block` inhibitor covering sleep, the
+caller's own user included, while `block-weak` exempts the same user and so would not stop the
+fleet's own `wake-lab.sh sleep` at all. logind itself also refuses a suspend request from anyone
+without `suspend-ignore-inhibit` (auth_admin_keep on stock Ubuntu), which covers the GDM
+greeter's power plugin on a box woken by WoL with nobody logged in.
+`wake-lab.sh status` lists a native box's live sleep blocks (`sleep-blocks=<n>`, then one
+`block:` line per holder), and a `sleep` refused by one names the holder and says `REFUSED`.
+
+**Setup per native box.** An ssh session is a REMOTE subject to polkit, so
+`org.freedesktop.login1.inhibit-block-sleep` falls under the action's `allow_any`, which stock
+Ubuntu sets to `auth_admin_keep` (`allow_active` = yes covers only a local console session):
+without a grant the request is denied ("Failed to inhibit: Access denied"), as it was on all
+three boxes on 2026-09-23. The grant is `/etc/polkit-1/rules.d/50-fleet-inhibit.rules`, installed
+by the Linux bootstrap, `~/self-improve/scripts/install-linux.md`. Check it from an ssh session:
+`pkcheck --action-id org.freedesktop.login1.inhibit-block-sleep --process $$; echo $?` prints 0.
+On a box without it `hold` does not refuse the run - that would stop every batch there over a
+setup step - but prints `EXECUTION HOLD <box>: WARNING: running WITHOUT a sleep inhibitor` with
+the denial, and the run is unguarded.
+
+Verified live on rog-nv-linux on 2026-09-23 (PR #323): with a `hold` running, `wake-lab.sh
+status rog` showed `sleep-blocks=1` naming it, `wake-lab.sh sleep rog` printed `Operation
+inhibited by "fleet-worker" ...` and `sleep REFUSED on rog by a block inhibitor` with exit 1,
+the box stayed up, and `sleep-blocks` returned to 0 when the hold ended.
+
+Idle suspend is off on the fleet's Ubuntu desktops without any site setting: Ubuntu's
+`10_ubuntu-settings.gschema.override` sets `sleep-inactive-ac-timeout = 0` in a section with no
+desktop qualifier, so it governs the GDM greeter as well as the logged-in session (upstream's
+default is 900 seconds); `/etc/gdm3/greeter.dconf-defaults` leaves the power keys commented,
+the greeter's dconf database carries none, and logind's `IdleAction` is `ignore`. Checked on
+rog-nv-linux and minix-amd-linux on 2026-09-23 (both mini PCs without a battery; tuf, the one
+laptop, adds battery and lid residue, in [linux-boxes.md](linux-boxes.md)). Recheck after a
+release upgrade with `DCONF_PROFILE=/dev/null gsettings get
+org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout` (0 is never); the inhibitor
+is the guard either way, since logind refuses the greeter's suspend while it is held.
+
 Use one canonical box name from the site's roster consistently (for example `rog-nv-linux`, not
 an alternating ssh alias and app host ID). New reservations and dispatch require exact
 `FLEET_BOXES` entries; aliases and case variants are refused. Configure one canonical entry per
@@ -120,7 +173,9 @@ possible execution.
 `execution run` already performs dispatch; do not dispatch that reservation again. The assignment
 must name its workload kind and command: **correctness** wraps the bounded project runner in
 `execution slot`; an exclusively reserved **measurement** invokes the runner directly, without
-that wrapper (ludics-lite#309). The slot intentionally refuses every outstanding measurement,
+that wrapper (ludics-lite#309), under `fleet-worker.sh execution hold -- <runner command>` alone,
+the OS-level sleep guard `slot` also runs inside (ludics-lite#317, [below](#the-os-level-sleep-guard)).
+The slot intentionally refuses every outstanding measurement,
 including the assigned measurement itself. Keep that refusal: it protects the measurement from
 concurrent correctness batches. Direct invocation still uses the project's time limits, logs and
 process ownership; it does not skip the reservation, dispatch or external-activity check.

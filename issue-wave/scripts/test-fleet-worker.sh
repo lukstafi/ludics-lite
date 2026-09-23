@@ -123,6 +123,12 @@ export FLEET_ANCHOR="testbox"
 export FLEET_COORDINATOR="test-coordinator"
 unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
 export PATH="$TMP/bin:$PATH"
+# `execution slot` runs its command under `execution hold`, which wraps it in systemd-inhibit when
+# one resolves (ludics-lite#317). The CI runner is Ubuntu, whose real systemd-inhibit would make
+# every slot case below a probe of that runner's polkit, so the suite pins it to a name that
+# resolves to nothing -- the bare arm, as on macOS -- and the cases that exercise the inhibitor
+# point it at a stub instead.
+export FLEET_SYSTEMD_INHIBIT="fleet-test-no-systemd-inhibit"
 # A scratch git identity, so worktree/commit steps work on a bare runner.
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
@@ -1251,6 +1257,89 @@ grep -q "Broken pipe" <<<"$out" && ko "the wrapped pipeline reported a broken pi
 expect "the site default gives mac-studio six run-time slots" 0 "slot 1 of 6" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES FLEET_LOCAL_BOX=mac-studio FLEET_ANCHOR=mac-studio "$FW" execution slot --wait 0 -- echo default-cap
 expect "...and a box the spec does not name has one" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo unnamed-box
+# The OS-level sleep guard (ludics-lite#317). The stub logs its arguments and its pid and, like
+# the real systemd-inhibit, runs the command after its options -- the helper that holds the
+# inhibitor for as long as the batch's lifetime pipe is open; INHIBIT_DENY is polkit refusing
+# the block, which the real one reports as "Failed to inhibit: Access denied" and exit 1.
+mkdir -p "$TMP/inhibit"
+cat > "$TMP/inhibit/systemd-inhibit" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$INHIBIT_LOG"
+printf '%s\n' "$$" > "$INHIBIT_PID"
+[ -z "${INHIBIT_DENY:-}" ] || { echo "Failed to inhibit: Access denied (stub)" >&2; exit 1; }
+while [ "$#" -gt 0 ]; do case "$1" in --) shift; break ;; --*) shift ;; *) break ;; esac; done
+exec "$@"
+EOF
+chmod +x "$TMP/inhibit/systemd-inhibit"
+export INHIBIT_LOG="$TMP/inhibit.log" INHIBIT_PID="$TMP/inhibit.pid"
+HELPER_ARGV="-- sh -c echo HELD; exec cat >/dev/null"
+# gone <pidfile>: the helper recorded there has exited (the inhibitor is released), within 10s.
+gone() {
+  local i pid; pid=$(cat "$1" 2>/dev/null) || return 1
+  for i in $(seq 20); do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.5; done
+  return 1
+}
+FWI=(env FLEET_SYSTEMD_INHIBIT="$TMP/inhibit/systemd-inhibit" FLEET_BOXES="testbox other" "$FW")
+: > "$INHIBIT_LOG"
+expect "on a host with systemd-inhibit a slot's batch runs under a sleep:idle block inhibitor" 3 "EXECUTION HOLD testbox: sleep:idle block inhibitor held for: testbox slot 1 of 1: sh -c exit 3" -- \
+  "${FWI[@]}" execution slot -- sh -c 'exit 3'
+grep -Fxq -- "--what=sleep:idle --mode=block --who=fleet-worker --why=testbox slot 1 of 1: sh -c exit 3 $HELPER_ARGV" "$INHIBIT_LOG" &&
+  ok "...as systemd-inhibit --mode=block, never block-weak, which the caller's own uid would ignore" || ko "the batch did not run under the block inhibitor: $(cat "$INHIBIT_LOG")"
+grep -q "slot 1 of 1 held for: sh -c exit 3" <<<"$out" && ok "...inside the slot, which it still holds" || ko "the inhibited batch lost its slot line: $out"
+gone "$INHIBIT_PID" && ok "...and the inhibitor is released when the batch ends" || ko "the inhibitor helper outlived the batch"
+# The inhibitor is held BESIDE the batch, so the pid a caller holds is the batch's own: killing it
+# ends the batch, frees the slot and releases the inhibitor, with no process group to find (PR
+# #323 review, round 1: under a systemd-inhibit wrapper that pid was systemd-inhibit's).
+"${FWI[@]}" execution slot -- sleep 30 > "$TMP/slot-i0.log" 2>&1 &
+ipid=$!
+if held "$TMP/slot-i0.log" "block inhibitor held"; then
+  kill -0 "$(cat "$INHIBIT_PID")" 2>/dev/null && ok "an inhibited batch's helper is alive while the batch runs" || ko "the helper was not running under a live batch"
+  [ "$(ps -o comm= -p "$ipid" | sed 's|.*/||')" = sleep ] && ok "...and the pid the caller holds is the batch itself" || ko "the caller's pid is $(ps -o comm= -p "$ipid"), not the batch"
+  kill -KILL "$ipid"; wait "$ipid" 2>/dev/null
+  gone "$INHIBIT_PID" && ok "...killing that pid releases the inhibitor" || ko "the inhibitor outlived its killed batch"
+  expect "...and frees the slot" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo after-inhibited-kill
+fi
+# The batch still inherits the slot flock, as it did unwrapped: a descendant that outlives the
+# batch's top process keeps both the slot and the inhibitor, since it is still using the box.
+: > "$INHIBIT_LOG"
+"${FWI[@]}" execution slot -- sh -c 'sleep 30 & echo "child $!"' > "$TMP/slot-i1.log" 2>&1
+child=$(sed -n 's/^child //p' "$TMP/slot-i1.log")
+if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
+  expect "a descendant outliving its batch still holds the slot" 1 "slots busy" -- "${FWS[@]}" execution slot --wait 0 -- echo while-child
+  kill -0 "$(cat "$INHIBIT_PID")" 2>/dev/null && ok "...and the inhibitor" || ko "the inhibitor was released under a still-running descendant"
+  kill "$child"
+  gone "$INHIBIT_PID" && ok "...until it exits" || ko "the inhibitor outlived the last descendant"
+else ko "no surviving descendant to test with: $(cat "$TMP/slot-i1.log")"; fi
+: > "$INHIBIT_LOG"
+expect "without systemd-inhibit (macOS) the batch runs bare, and says nothing about it" 0 "slot 1 of 1 held for: echo bare" -- "${FWS[@]}" execution slot -- echo bare
+grep -q "EXECUTION HOLD" <<<"$out" && ko "the bare arm announced an inhibitor: $out" || ok "...with no hold line"
+[ -s "$INHIBIT_LOG" ] && ko "the bare arm called systemd-inhibit: $(cat "$INHIBIT_LOG")" || ok "...and no systemd-inhibit call"
+expect "a polkit refusal of the block runs the batch anyway, under a WARNING" 0 "WARNING: running WITHOUT a sleep inhibitor" -- \
+  env INHIBIT_DENY=1 "${FWI[@]}" execution slot -- echo denied-but-ran
+grep -q "^denied-but-ran$" <<<"$out" && grep -q "Access denied (stub)" <<<"$out" && ok "...naming the refusal, and the batch ran" || ko "a refused inhibitor stopped the batch or hid why: $out"
+: > "$INHIBIT_LOG"
+expect "a command that cannot be run is still the slot's own refusal under the inhibitor" 127 "EXECUTION SLOT REFUSED testbox: cannot run /nonexistent/runner" -- \
+  "${FWI[@]}" execution slot -- /nonexistent/runner
+[ -s "$INHIBIT_LOG" ] && ko "an unrunnable command took an inhibitor: $(cat "$INHIBIT_LOG")" || ok "...refused before any inhibitor is taken"
+# `hold` is the measurement's wrapper: the slot refuses while a measurement is outstanding, the
+# measurement's own included, so the guard has to come without the slot.
+"${FWS[@]}" execution run "$(slotreq hold-measure measurement)" >/dev/null || ko "could not reserve the measurement (setup)"
+: > "$INHIBIT_LOG"
+expect "execution hold runs a measurement's runner under the inhibitor while the slot refuses it" 0 "sleep:idle block inhibitor held for: testbox hold: echo measured" -- \
+  "${FWI[@]}" execution hold -- echo measured
+grep -Fxq -- "--what=sleep:idle --mode=block --who=fleet-worker --why=testbox hold: echo measured $HELPER_ARGV" "$INHIBIT_LOG" && ok "...the same block inhibitor the slot takes" || ko "hold did not take the block inhibitor: $(cat "$INHIBIT_LOG")"
+expect "...beside a slot that is refused for that very measurement" 1 "a measurement holds the box exclusively (hold-measure)" -- "${FWI[@]}" execution slot -- echo during
+slotdone hold-measure
+expect "execution hold --why names the holder in the inhibitor" 0 "held for: rog run 7" -- "${FWI[@]}" execution hold --why "rog run 7" -- true
+expect "execution hold passes the command's own status through" 5 "held for" -- "${FWI[@]}" execution hold -- sh -c 'exit 5'
+expect "...a signal death's too, which a systemd-inhibit wrapper would have turned into 1" 143 "held for" -- "${FWI[@]}" execution hold -- sh -c 'kill -TERM $$'
+printf '#!/nonexistent/interpreter\n' > "$TMP/no-interp.sh"; chmod +x "$TMP/no-interp.sh"
+expect "execution hold refuses a script whose interpreter is missing with 127, not the run's 1" 127 "EXECUTION HOLD REFUSED testbox: cannot run $TMP/no-interp.sh" -- "${FWI[@]}" execution hold -- "$TMP/no-interp.sh"
+expect "...and so does the slot" 127 "EXECUTION SLOT REFUSED testbox: cannot run $TMP/no-interp.sh" -- "${FWI[@]}" execution slot -- "$TMP/no-interp.sh"
+expect "execution hold runs bare where there is no systemd-inhibit" 0 "^bare-hold$" -- "${FWS[@]}" execution hold -- echo bare-hold
+expect "execution hold refuses a command that cannot be run" 127 "EXECUTION HOLD REFUSED testbox: cannot run /nonexistent/runner" -- "${FWS[@]}" execution hold -- /nonexistent/runner
+expect "execution hold needs a command after --" 2 "a command to hold the box around is required" -- "${FWS[@]}" execution hold --
+expect "execution hold takes no slot options" 2 "execution hold .--why <text>. -- <command>" -- "${FWS[@]}" execution hold --wait 5 -- true
 expect "execution slot needs a command after --" 2 "a command to hold the slot around is required" -- "${FWS[@]}" execution slot --
 expect "execution slot refuses a non-numeric --wait" 2 "whole number of seconds" -- "${FWS[@]}" execution slot --wait soon -- echo x
 expect "execution slot takes no --box: the slot is this box's own" 2 "execution slot .--wait <seconds>. -- <command>" -- "${FWS[@]}" execution slot --box other -- echo x
