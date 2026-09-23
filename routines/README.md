@@ -1,8 +1,8 @@
 # Routines
 
 The prompts behind the scheduled runs that feed the skills: the daily plan `issue-wave` reads,
-the sweep that keeps OCANNL's non-CI backends honest, and the CI-red triage that
-`ship-pr` hands master's trailing failures to. Each directory holds one `SKILL.md` in the shape
+the sweep that keeps OCANNL's non-CI backends honest, and the CI-red triage that owns
+OCANNL master's trailing failures (ship-pr's post-merge owner there). Each directory holds one `SKILL.md` in the shape
 Claude Code's scheduled tasks use: a `name` and `description` in the frontmatter, then the prompt.
 CI's prompt hygiene job (`scripts/check-prompts.sh`) checks that shape, that `name` matches the
 directory, and that each of these directories is named, in backticks, in the first cell of a row
@@ -14,7 +14,7 @@ Two kinds live here, and they are kept in sync differently.
 | --- | --- | --- | --- | --- | --- |
 | `ocannl-cross-machine-sweep` | local scheduled task | daily 07:20 local (`20 7 * * *`) | `~/ocannl-staging` | Opus | `tools/sweep.sh` in OCANNL, `scripts/wake-lab.sh` |
 | `daily-issue-planning` | local scheduled task | daily 07:05 local (`5 7 * * *`) | `~/ocannl-staging` | Fable | the sequencing plan `issue-wave` reads |
-| `ocannl-ci-red-triage` | cloud routine | on any non-PR master red, fired by `ci.yml`; backstop daily 05:17 UTC (`17 5 * * *`) | Anthropic cloud, sources `lukstafi/ocannl-staging` and `ahrefs/ocannl` | Sonnet | the claiming issues `ship-pr` defers to |
+| `ocannl-ci-red-triage` | cloud routine | on any non-PR master red, fired by `ci.yml`; backstop daily 05:17 UTC (`17 5 * * *`) | Anthropic cloud, sources `lukstafi/ocannl-staging` and `ahrefs/ocannl` | Sonnet | the claiming issues OCANNL's mergers defer to |
 
 The local scheduler adds a per-task jitter of a few minutes to the times above. Cron in the
 local registry is the box's local time; the cloud routine's cron is UTC.

@@ -122,19 +122,21 @@ landing (fix that first — it is one commit and it unblocks everyone), or nobod
 is the case that costs the most, and reporting it is worth more than the task you were about to
 start). What you must not do is spend the session bisecting a break you inherited.
 
-On this repository that third case has an owner: `.github/workflows/base-watch.yml` runs this same
-read against `main` after its push CI completes and daily as a backstop. It opens (or extends)
-one issue per red episode, so a red found here is often already filed — check the open issues
-before writing it up, and add what you know to the one that exists.
+A repository can give that third case an owner: a post-merge watch or triage routine that turns
+a red into one claimed issue, named in the repository's agent notes. ludics-lite's
+`.github/workflows/base-watch.yml` is one, running this same read after the base's push CI
+completes and daily as a backstop, and other repositories call it as `base-watch-reusable.yml`.
+Where an owner exists, a red found here is often already filed — check the open issues before
+writing it up, and add what you know to the one that exists.
 
 If this skill fires at the *end* of a task, as it usually does, this section is the one part of it
 to have run at the beginning. A session that did not is still better off running `base` before it
 branches for the follow-up work.
 
-The verdict is about the last **completed** run, and `base` prints which commit that run tested. On
-ocannl-staging `ci` carries `paths-ignore: docs/**`, so a docs-only push produces no run at all and
-the newest verdict legitimately trails the tip by a commit or several — that is a gap in coverage,
-not a stale reading, and the printed SHA is what lets you tell them apart.
+The verdict is about the last **completed** run, and `base` prints which commit that run tested. A
+push a path filter skips produces no run at all, so the newest verdict can legitimately trail the
+tip by several commits — a gap in coverage, not a stale reading, and the printed SHA tells them
+apart.
 
 ## Open
 
@@ -879,7 +881,7 @@ concurrent sibling merges "the current tip" is a moving target and the wait neve
 or had to be killed). If a wave worker checks anything post-merge, it is the single run for its
 OWN merge commit, read once — a run superseded or cancelled by a later sibling merge is the
 integration loop's business. In standalone use — no coordinator, no loop — trailing CI is
-likewise not the merger's to watch: it belongs to the CI-red triage routine (below).
+likewise not the merger's to watch: it belongs to the repository's post-merge owner (below).
 
 **Still read the intersection before letting the merge stand.** On staging#488 (2026-08-28) sixteen review
 rounds ran against a base that had gone 136 commits stale, `master` had meanwhile edited the very
@@ -903,22 +905,19 @@ for its own green run, conflicts or not; otherwise a clean merge on a green head
 not a corner cut. A count the compare API could not answer prints `UNKNOWN`, which is not "not
 behind": check it by hand.
 
-**Standalone use does not watch CI at all** (since 2026-08-31): trailing failures on merged
-master belong to the **"ocannl-staging CI-red triage" cloud routine** — fired by `ci.yml`'s own
-`notify-triage-routine` job through the routine fire API on any non-PR master red, with a daily
-backstop sweep behind it. On a master red it checks for an existing claim, claims the failure
-with an issue on **ahrefs/ocannl** (`CI red on master@<short-sha>: <workflow>` — issues are
-disabled on the staging repo), and either opens a `ci-fix/*` PR on staging (it never merges its
-own PRs) or posts its diagnosis to the claiming issue. So after `merge` confirms `merged`, this
-session's verification is over: do not run `base --wait`, do not watch master's subsequent
-workflows. (Briefly that day the rule was the opposite — every merger blocked on its own
-`base --wait` — which stacked N sessions on the same remote CI cycle; the routine is the
-single owner that replaced it.)
+**Standalone use does not watch CI at all** (since 2026-08-31): trailing failures on the merged
+base belong to the repository's **post-merge owner**, the watch or triage routine its agent notes
+name, which claims a red with one issue and may open a fix PR. So after `merge` confirms
+`merged`, this session's verification is over: do not run `base --wait`, do not watch the base's
+subsequent workflows. (Briefly that day the rule was the opposite — every merger blocked on its
+own `base --wait` — which stacked N sessions on the same remote CI cycle; a single owner
+replaced it.) A repository with no owner is no exception: its trailing red is the next session's
+pre-branch `base` read, above.
 
-Two local touchpoints remain. A red you happen to see — in the pre-branch `base` read, or
-anywhere else — is presumptively CLAIMED work: find the routine's claiming issue and any
-linked PR before touching anything, and take over only when the issue shows triage stopped
-short and nobody else picked it up (say so there first). And a `ci-fix/*` PR the routine
+Two local touchpoints remain. Where the repository has an owner, a red you happen to see — in
+the pre-branch `base` read, or anywhere else — is presumptively CLAIMED work: find the claiming
+issue and any linked PR before touching anything, and take over only when the issue shows
+triage stopped short and nobody else picked it up (say so there first). And a fix PR the owner
 opened is finished work like any other: land it through this skill.
 
 ### The override
@@ -1151,7 +1150,7 @@ After merging: run the `after-merge` brainstorm FIRST, while the session's frict
 context. Then refresh the base for the next branch (`git fetch origin`, then branch off
 the selected `origin/<base>` again) and tear down any scratch worktrees the work created on remote
 machines.
-Nothing further is owed: trailing CI on the new tip is the CI-red triage routine's business
+Nothing further is owed: trailing CI on the new tip is the repository's post-merge owner's business
 (the stale-base section owns the division of responsibilities and the takeover protocol) — and
 a plain `base` read seconds after a merge would only report the previous tip's green anyway,
 so do not treat one as a post-merge verdict.
