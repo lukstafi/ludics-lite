@@ -1064,13 +1064,18 @@ invocation_options() {
 # `case`'s own indent. In it an arm is a line whose first word is `--name)`, and the arm is that
 # line through the first line carrying `;;`, a one-line arm included. Its arity is N-1 for the
 # `shift N` it carries (`shift 2` is 1, a bare `shift` is 0), read with quoted spans and `#`
-# comments dropped; an arm with no shift, or with more than one -- repeated shifts add up, and no
-# scan can prove two exclusive -- prints `?`, which the caller refuses. That is the
+# comments dropped. That shift must be a STATEMENT at the arm's top level: a whole `;`-separated
+# segment reading exactly `shift` or `shift N`, on the pattern line's rest or a body line at the
+# indent of the first. An arm with no such shift, with more than one -- repeated shifts add up, and
+# no scan can prove two exclusive -- or with the word `shift` anywhere else, where it may be an
+# argument, conditional, in a subshell or nested, prints `?`, which the caller refuses: a shift the
+# scan cannot prove runs in the loop's own shell is not read as one. That is the
 # reader's boundary, the same line-shape boundary as the rest of this file (README, Tests;
 # ludics-lite#75): it establishes that each arm's SHIFT agrees with its listing, not that the arm
 # reads `$2` or that the parser is the one the script runs. Outside the shape and unread: an arm
 # spelled `--a | --b)`, a `;;` inside a nested case, a shift held in a function the arm calls,
-# a `--name=value` split -- none of which the helper writes.
+# a `--name=value` split, a `continue` or `return` that skips a top-level shift, and an indent
+# that lies about nesting -- none of which the helper writes.
 parser_options() {
   awk '
     !inp && /^[[:space:]]*while \[ "\$#" -gt 0 \]; do[[:space:]]*$/ { want = 1; next }
@@ -1081,7 +1086,7 @@ parser_options() {
     $0 ~ ("^" ind "esac[[:space:]]*(;|#|$)") { exit }
     !arm && match($0, /^[[:space:]]*--[A-Za-z0-9][A-Za-z0-9-]*\)/) {
       name = substr($0, RSTART, RLENGTH - 1); sub(/^[[:space:]]*/, "", name)
-      arm = 1; ar = ""; ns = 0; $0 = substr($0, RSTART + RLENGTH)
+      arm = 1; ar = ""; ns = 0; amb = 0; bind = ""; $0 = substr($0, RSTART + RLENGTH); top = 1
     }
     arm {
       # Quoted spans are text, and a `#` opening a word -- after a blank, a `;` or an operator,
@@ -1089,14 +1094,28 @@ parser_options() {
       l = $0
       gsub(/\047[^\047]*\047/, "\047\047", l); gsub(/"([^"\\]|\\.)*"/, "\"\"", l)
       if (match(l, /(^|[[:space:];&|()])#/)) l = substr(l, 1, RSTART + RLENGTH - 2)
-      s = l
-      while (match(s, /(^|[;[:space:]])shift([[:space:]]+[0-9]+)?([;[:space:]]|$)/)) {
-        t = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
-        ar = (match(t, /[0-9]+/) ? substr(t, RSTART, RLENGTH) : 1) - 1; ns++
+      # The top level of an arm is the rest of the pattern line, and every body line at the indent of
+      # the first one: a line indented deeper sits inside some compound command (round 2, P2).
+      if (!top && l ~ /[^[:space:]]/) {
+        match($0, /^[[:space:]]*/); ind1 = substr($0, 1, RLENGTH)
+        if (bind == "") bind = ind1
+        top = (ind1 == bind)
       }
+      # A shift is a STATEMENT: a `;`-separated segment reading exactly `shift` or `shift N`, at
+      # the top level. The word anywhere else -- an argument, after `&&`, `then` or `{`, in a
+      # `( … )`, piped or backgrounded, nested deeper -- may not run or may not move the loop,
+      # so it makes the arm unread rather than read (round 2, P2).
+      nseg = split(l, seg, ";")
+      for (k = 1; k <= nseg; k++) {
+        g = seg[k]; gsub(/^[[:space:]]+|[[:space:]]+$/, "", g)
+        if (top && g ~ /^shift([[:space:]]+[0-9]+)?$/) {
+          ar = (match(g, /[0-9]+/) ? substr(g, RSTART, RLENGTH) : 1) - 1; ns++
+        } else if (g ~ /(^|[^A-Za-z0-9_-])shift([^A-Za-z0-9_-]|$)/) amb = 1
+      }
+      top = 0
       # Every shift in the arm runs in sequence as far as a scan knows, so a second one -- equal or
       # not -- consumes more than either says: the arity of an arm is read off exactly one.
-      if (index(l, ";;")) { print name "\t" (ns == 1 ? ar : "?"); arm = 0 }
+      if (index(l, ";;")) { print name "\t" (ns == 1 && !amb ? ar : "?"); arm = 0 }
     }
   ' "$1"
 }
@@ -1131,7 +1150,7 @@ check_cleanup_options() {
     if [ -z "$p" ]; then
       ko "$CLEANUP_HELPER" "usage() lists '$o', for which the option parser has no '$o)' arm"; bad=1
     elif [ "$p" = "?" ]; then
-      ko "$CLEANUP_HELPER" "the parser's '$o)' arm carries no shift, or more than one, where this reader needs exactly one 'shift' or 'shift N' to read its arity"; bad=1
+      ko "$CLEANUP_HELPER" "the parser's '$o)' arm has no single 'shift' or 'shift N' standing as its own statement at the arm's top level, or names shift elsewhere, so its arity is unread"; bad=1
     elif [ "$p" != "$a" ]; then
       sh=shift; [ "$p" -eq 0 ] || sh="shift $((p + 1))"
       if [ "$a" = 1 ]; then

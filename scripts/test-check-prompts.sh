@@ -1245,6 +1245,7 @@ cleanup_edit "$CLEANUP_HELPER" 's/^  --force-integrated)$/  --base) BASE_BRANCH=
   --force-integrated)/'
 expect "a one-line flag arm agrees with a bare listing, whatever its comment says" 0 \
   "usage() agrees with its parser on each one's arity" -- "$CP" "$R"
+CLEANUP_UNREAD="the parser's '--regenerable)' arm has no single 'shift' or 'shift N' standing as its own statement"
 # Round 1, P2 x2: which `shift` text is the arm's shift. Two shifts add up whatever each says, so
 # an arm carrying two is unread rather than read as one; and a shift in a comment or in quoted
 # text is no command, so an arm whose only `shift 2` is text is a flag arm.
@@ -1252,7 +1253,7 @@ cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    shift 2\
     shift 2/'
 expect "an arm carrying two shifts is refused, even two that each match the listing" 1 \
-  "the parser's '--regenerable)' arm carries no shift, or more than one" -- "$CP" "$R"
+  "$CLEANUP_UNREAD" -- "$CP" "$R"
 cleanup_tree
 cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/{ s/^    shift 2$/    shift/; s/^    ;;$/    ;;# shift 2/; }'
 expect "a shift in a comment glued to the ;; is not the arm's" 1 \
@@ -1263,6 +1264,28 @@ cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    pri
 expect "...nor is one in quoted text" 1 \
   "usage() lists '--regenerable' with a <value> placeholder, but its parser arm does 'shift' and takes none" \
   -- "$CP" "$R"
+
+# Round 2, P2 x2: a shift is a statement at the arm's top level, and the word anywhere else makes
+# the arm unread. Each of these carries its only `shift 2` where it is an argument, may not run, or
+# moves a subshell's parameters and not the loop's -- so the arm consumes nothing, loops forever,
+# and must not agree with the listing's placeholder.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    printf %s shift 2/'
+expect "a shift that is another command's argument is not the arm's" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    false \&\& shift 2/'
+expect "...nor one under a && that may not run" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    ( shift 2 )/'
+expect "...nor one in a subshell, which moves no parameter of the loop" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    if false; then\
+      shift 2\
+    fi/'
+expect "...nor one standing alone but nested in a compound command" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    printf %s shift; shift 2/'
+expect "...and the word beside a real shift still leaves the arm unread" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
 
 # A parser this reader cannot find is refused, not read as agreeing with nothing.
 cleanup_tree
