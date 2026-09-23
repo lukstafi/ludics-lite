@@ -152,8 +152,8 @@ plan's dependency arrows. A prerequisite that is itself in the wave makes the de
 later-wave member (launch on the prerequisite's merge). A prerequisite that is NOT in scope -
 another session's work, an external blocker - does not silently drop the dependent: gate it.
 Record the gate in the wave summary, poll the blocking issue's state during supervision
-(`gh issue view N --json state`), and launch the gated task when it closes. For a gate expected
-to clear mid-session, the `wait-and-proceed` skill is the per-task shape; for one that may
+(`gh issue view N --repo O/R --json state`: the blocker may live in another tracker), and
+launch the gated task when it closes. For a gate expected to clear mid-session, the `wait-and-proceed` skill is the per-task shape; for one that may
 outlast the session, note it in the wave's close-out so the next invocation picks it up. Never
 launch a dependent early on the theory that rebasing will sort it out.
 
@@ -184,11 +184,12 @@ triage is wrong, not the backlog.
 agents with problems that should instead be priority fixes. When a scoped item's path runs
 through a defect in the fleet's own tooling or setup that has, or deserves, an issue, that
 defect gates the items it is on (Scope and sequencing: *Dependency gating*), or the
-coordinator sequences its fix first. File the issue if there is none. Either way the brief carries no workaround: a worker
-told to route around a bug spends its attention on a bug nobody is fixing, and the note is
-false the day the fix lands (ludics-lite#326: a brief told the ahrefs/ocannl#1029 worker not
-to drive its measurement through `sweep.sh` while #1030 was open, instead of gating that step
-on #1030).
+coordinator sequences its fix first. Find such defects in the trackers, not in the reference
+notes: the open issues against the scripts and setup each item will run. File the issue if
+there is none. Either way the brief carries no workaround: a worker told to route around a
+bug spends its attention on a bug nobody is fixing, and the note is false the day the fix
+lands (ludics-lite#326: a brief told the ahrefs/ocannl#1029 worker not to drive its
+measurement through `sweep.sh` while #1030 was open, instead of gating that step on #1030).
 
 ## Launch
 
@@ -336,11 +337,12 @@ requirements for every transport with transport-specific setup and identity, and
   exes parked in dlopen, logs frozen, load 2.5); `dune -j 4` when more than ~4 workers share
   the box. **On GPU boxes**: name the backend and how to prove the run executed on it (a
   backend-uniform golden proves nothing), and keep one dune per _build. Add the box kind's
-  traps to the brief: [native traps](references/linux-boxes.md) for `linux`, [WSL
+  durable traps to the brief: [native traps](references/linux-boxes.md) for `linux`, [WSL
   traps](references/wsl-boxes.md) for `wsl`. A trap is a durable property of a box or platform
   that the worker must live with (XProtect, the GDM greeter's power policy, a unified-memory
   GPU). A defect in the fleet's own tooling or setup is not a trap, and the brief never carries
-  a workaround for it: it belongs in the decision gate (*A known defect is a fix, not a trap*).
+  a workaround for it: it belongs in the decision gate (*A known defect is a fix, not a trap*),
+  and so does an entry there that names its own open fix.
 - Execution handoff: the worker's own targeted correctness batches on its agent host run under
   the [standing reservation](references/executions.md#standing-iteration-reservation) the
   coordinator took at launch - name its request id, the bounded aliases and `-j` width it
