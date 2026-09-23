@@ -26,8 +26,9 @@ measurement noise and for XProtect serializing fresh test binaries, and three wo
 in place). Keep one slot for WSL boxes because of the measured dxg bridge limit. The native GPU
 boxes' two slots were measured with targeted batches at ahrefs/ocannl#1029's widths
 (ludics-lite#316): `-j 8` on rog-nv-linux, and `-j 4` on minix-amd-linux, whose gfx1151 alone
-bounds slots x width at 8, its device-wide SDMA queue pool ([linux-boxes.md](linux-boxes.md)).
-tuf-amd-linux keeps one slot until it is measured. The kind does not silently change the
+bounds slots x width at 8, its device-wide SDMA queue pool. OCANNL's `tools/test-run.sh` injects
+those widths into a native batch that names none (ahrefs/ocannl#1033), so a worker passes no `-j`
+for them. tuf-amd-linux keeps one slot until it is measured. The kind does not silently change the
 configured slot count.
 
 The slot count is a RUN-TIME count, and `execution slot` is the single run-time mechanism
