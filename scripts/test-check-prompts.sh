@@ -1245,7 +1245,7 @@ cleanup_edit "$CLEANUP_HELPER" 's/^  --force-integrated)$/  --base) BASE_BRANCH=
   --force-integrated)/'
 expect "a one-line flag arm agrees with a bare listing, whatever its comment says" 0 \
   "usage() agrees with its parser on each one's arity" -- "$CP" "$R"
-CLEANUP_UNREAD="the parser's '--regenerable)' arm has no single 'shift' or 'shift N' standing as its own statement"
+CLEANUP_UNREAD="the parser's '--regenerable)' arm is not one this reader can read"
 # Round 1, P2 x2: which `shift` text is the arm's shift. Two shifts add up whatever each says, so
 # an arm carrying two is unread rather than read as one; and a shift in a comment or in quoted
 # text is no command, so an arm whose only `shift 2` is text is a flag arm.
@@ -1260,7 +1260,7 @@ expect "a shift in a comment glued to the ;; is not the arm's" 1 \
   "usage() lists '--regenerable' with a <value> placeholder, but its parser arm does 'shift' and takes none" \
   -- "$CP" "$R"
 cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    printf '"'%s\\\\n'"' "cannot shift 2 here" '"'nor shift 2 here'"' >\&2; shift/'
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    NOTE="cannot shift 2 here"; WHY='"'nor shift 2 here'"'; shift/'
 expect "...nor is one in quoted text" 1 \
   "usage() lists '--regenerable' with a <value> placeholder, but its parser arm does 'shift' and takes none" \
   -- "$CP" "$R"
@@ -1299,11 +1299,51 @@ for tail in 'false \&\&' 'false ||' 'printf x |' '!' 'true \\' '{' 'if false; th
     "$CLEANUP_UNREAD" \
     -- "$CP" "$R"
 done
+
+# Round 4, P2 x4: the arm is read only in the grammar the helper writes -- shifts, one-word
+# assignments and `[ … ] || usage` guards -- so every other statement leaves it unread, and the
+# rounds' list of shapes that hide a shift ends here instead of growing. A guard in the grammar
+# hands the shift on; a harmless statement outside it is refused, which is the stated cost.
 cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    false || true\
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    [ -z "$FORCE_REASON" ] || usage\
     shift 2/'
-expect "...while a line that finished its command hands the shift on untouched" 0 \
-  "$CLEANUP_AGREE" -- "$CP" "$R"
+expect "a guard in the arm grammar leaves the shift read" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    echo "taking $2"\
+    shift 2/'
+expect "...while a statement outside it leaves the arm unread, sound shift or not" 1 \
+  "$CLEANUP_UNREAD" -- "$CP" "$R"
+# A heredoc body is data: its `shift 2` line runs nothing.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    cat <<X\
+    shift 2\
+X/'
+expect "a shift in a heredoc body is not the arm's" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
+# Loop control before the shift restarts or leaves the loop with the option unconsumed.
+for ctl in continue break; do
+  cleanup_tree
+  cleanup_edit "$CLEANUP_HELPER" "/^  --regenerable)\$/,/;;/s/^    shift 2\$/    $ctl\\
+    shift 2/"
+  expect "a shift behind a '$ctl' is not read" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
+done
+# A nested case's `;;` does not end the outer arm: a bare listing over `shift`, a nested case and a
+# second `shift` is not a flag.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^  --base <branch>  /  --base           /'
+cleanup_edit "$CLEANUP_HELPER" '/^  --base)$/,/;;/s/^    shift 2$/    shift\
+    case x in x) : ;; esac\
+    shift/'
+expect "a nested case's terminator does not close the arm it sits in" 1 \
+  "the parser's '--base)' arm is not one this reader can read" -- "$CP" "$R"
+# A pattern naming options in another spelling is reported, not skipped: the helper would take
+# two options nobody can learn of.
+cleanup_tree
+cleanup_edit "$CLEANUP_HELPER" 's/^  --base)$/  --hidden|--secret)\
+    shift\
+    ;;\
+  --base)/'
+expect "an alternation arm is an option the reader cannot name, refused as unlisted" 1 \
+  "the option parser takes '--hidden|--secret', which usage() does not list" -- "$CP" "$R"
 
 # A parser this reader cannot find is refused, not read as agreeing with nothing.
 cleanup_tree

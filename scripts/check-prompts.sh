@@ -1062,21 +1062,25 @@ invocation_options() {
 # found `--force-integrated` listed bare while its arm did `shift 2`). The parser is the block a
 # `while [ "$#" -gt 0 ]; do` line opens, from the `case "$1" in` after it to the `esac` at that
 # `case`'s own indent. In it an arm is a line whose first word is `--name)`, and the arm is that
-# line through the first line carrying `;;`, a one-line arm included. Its arity is N-1 for the
-# `shift N` it carries (`shift 2` is 1, a bare `shift` is 0), read with quoted spans and `#`
-# comments dropped. That shift must be a STATEMENT at the arm's top level: a whole `;`-separated
-# segment reading exactly `shift` or `shift N`, on the pattern line's rest or a body line at the
-# indent of the first, which the line before it finished -- one ending in `&&`, `||`, `|`, `!`, a
-# backslash, `{`, `(`, `then`, `do` or `else` continues onto it. An arm with no such shift, with
-# more than one -- repeated shifts add up, and no scan can prove two exclusive -- or with the word
-# `shift` anywhere else, where it may be an argument, conditional, in a subshell or nested, prints
-# `?`, which the caller refuses: a shift the scan cannot prove runs in the loop's own shell is not
-# read as one. That is the reader's boundary, the same line-shape boundary as the rest of this file (README, Tests;
-# ludics-lite#75): it establishes that each arm's SHIFT agrees with its listing, not that the arm
-# reads `$2` or that the parser is the one the script runs. Outside the shape and unread: an arm
-# spelled `--a | --b)`, a `;;` inside a nested case, a shift held in a function the arm calls,
-# a `--name=value` split, a `continue` or `return` that skips a top-level shift, and an indent
-# that lies about nesting -- none of which the helper writes.
+# line through the first line ENDING in `;;`, a one-line arm included. A pattern line that names a
+# `--` option in any other spelling (`--a|--b)`, `"--a")`, `-h|--help)`) prints the pattern with
+# arity `?`, so an option the reader cannot name is refused as unlisted rather than skipped.
+#
+# An arm is READ only when it is straight-line in the helper's own grammar: with quoted spans and
+# `#` comments dropped, every `;`-separated statement in it is one of `shift`/`shift N`, a single
+# assignment word (`NAME=word`, `NAME+=(word)`, no operator or blank outside quotes), or a
+# `[ … ] || usage` guard, whose `usage` exits -- and exactly one of them is a shift. Its arity is
+# then N-1 for that `shift N` (`shift 2` is 1, a bare `shift` is 0). Any other statement makes the
+# arm UNREAD, printed as `?` and refused by the caller: a heredoc, a `continue` or `break`, a
+# conditional or pipeline, a subshell or brace group, a nested case, a line a trailing operator or
+# backslash continues -- the rounds of PR review this reader went through were each one more such
+# shape, and an allowlist of the shapes the helper writes is what ends that list rather than
+# extending it (round 4). The cost is stated: an arm that grows a harmless `echo` is refused until
+# the grammar here grows with it, which is a false refusal on a line the operator can see and not a
+# false agreement nobody reads. That is the reader's boundary, the same line-shape boundary as the
+# rest of this file (README, Tests; ludics-lite#75): it establishes that each arm's shift agrees
+# with its listing, not that the arm reads `$2` or that the parser is the one the script runs, and
+# it takes `usage` to exit and `[` to be the test builtin.
 parser_options() {
   awk '
     !inp && /^[[:space:]]*while \[ "\$#" -gt 0 \]; do[[:space:]]*$/ { want = 1; next }
@@ -1087,7 +1091,13 @@ parser_options() {
     $0 ~ ("^" ind "esac[[:space:]]*(;|#|$)") { exit }
     !arm && match($0, /^[[:space:]]*--[A-Za-z0-9][A-Za-z0-9-]*\)/) {
       name = substr($0, RSTART, RLENGTH - 1); sub(/^[[:space:]]*/, "", name)
-      arm = 1; ar = ""; ns = 0; amb = 0; bind = ""; cont = 0; $0 = substr($0, RSTART + RLENGTH); top = 1
+      arm = 1; ar = ""; ns = 0; amb = 0; $0 = substr($0, RSTART + RLENGTH)
+    }
+    # A pattern naming an option in a spelling other than one bare `--name` is an option this
+    # reader cannot name: reported whole and unread, never skipped (round 4, P2).
+    !arm && match($0, /^[[:space:]]*[^[:space:]#()]*--[^)]*\)/) {
+      p = substr($0, RSTART, RLENGTH - 1); sub(/^[[:space:]]*/, "", p)
+      print p "\t?"; next
     }
     arm {
       # Quoted spans are text, and a `#` opening a word -- after a blank, a `;` or an operator,
@@ -1095,33 +1105,20 @@ parser_options() {
       l = $0
       gsub(/\047[^\047]*\047/, "\047\047", l); gsub(/"([^"\\]|\\.)*"/, "\"\"", l)
       if (match(l, /(^|[[:space:];&|()])#/)) l = substr(l, 1, RSTART + RLENGTH - 2)
-      # The top level of an arm is the rest of the pattern line, and every body line at the indent of
-      # the first one: a line indented deeper sits inside some compound command (round 2, P2).
-      if (!top && l ~ /[^[:space:]]/) {
-        match($0, /^[[:space:]]*/); ind1 = substr($0, 1, RLENGTH)
-        if (bind == "") bind = ind1
-        top = (ind1 == bind)
-      }
-      # A line the one before it did not finish is part of that command, whatever its indent: after
-      # `false &&` a lone `shift 2` is the right-hand side of the conditional (round 3, P2).
-      if (cont) top = 0
-      # A shift is a STATEMENT: a `;`-separated segment reading exactly `shift` or `shift N`, at
-      # the top level. The word anywhere else -- an argument, after `&&`, `then` or `{`, in a
-      # `( … )`, piped or backgrounded, nested deeper -- may not run or may not move the loop,
-      # so it makes the arm unread rather than read (round 2, P2).
+      closes = sub(/;;[[:space:]]*$/, "", l)
       nseg = split(l, seg, ";")
       for (k = 1; k <= nseg; k++) {
         g = seg[k]; gsub(/^[[:space:]]+|[[:space:]]+$/, "", g)
-        if (top && g ~ /^shift([[:space:]]+[0-9]+)?$/) {
+        if (g == "") continue
+        if (g ~ /^shift([[:space:]]+[0-9]+)?$/) {
           ar = (match(g, /[0-9]+/) ? substr(g, RSTART, RLENGTH) : 1) - 1; ns++
-        } else if (g ~ /(^|[^A-Za-z0-9_-])shift([^A-Za-z0-9_-]|$)/) amb = 1
+        } else if (g ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=([^[:space:]&|<>()`]*|\([^[:space:]&|<>()`]*\))$/) {
+        } else if (g ~ /^\[ [^][&|<>()`]* \] \|\| usage$/) {
+        } else amb = 1
       }
-      if (l ~ /[^[:space:]]/)
-        cont = (l ~ /(&&|\|\||\||!|\\|\(|\{)[[:space:]]*$/ || l ~ /(^|[[:space:];])(then|do|else)[[:space:]]*$/)
-      top = 0
-      # Every shift in the arm runs in sequence as far as a scan knows, so a second one -- equal or
-      # not -- consumes more than either says: the arity of an arm is read off exactly one.
-      if (index(l, ";;")) { print name "\t" (ns == 1 && !amb ? ar : "?"); arm = 0 }
+      # Every shift in the arm runs in sequence, so a second one -- equal or not -- consumes more
+      # than either says: the arity of an arm is read off exactly one.
+      if (closes) { print name "\t" (ns == 1 && !amb ? ar : "?"); arm = 0 }
     }
   ' "$1"
 }
@@ -1156,7 +1153,7 @@ check_cleanup_options() {
     if [ -z "$p" ]; then
       ko "$CLEANUP_HELPER" "usage() lists '$o', for which the option parser has no '$o)' arm"; bad=1
     elif [ "$p" = "?" ]; then
-      ko "$CLEANUP_HELPER" "the parser's '$o)' arm has no single 'shift' or 'shift N' standing as its own statement at the arm's top level, or names shift elsewhere, so its arity is unread"; bad=1
+      ko "$CLEANUP_HELPER" "the parser's '$o)' arm is not one this reader can read: it needs exactly one 'shift' or 'shift N' among straight-line statements -- single assignment words and '[ … ] || usage' guards (see parser_options)"; bad=1
     elif [ "$p" != "$a" ]; then
       sh=shift; [ "$p" -eq 0 ] || sh="shift $((p + 1))"
       if [ "$a" = 1 ]; then
