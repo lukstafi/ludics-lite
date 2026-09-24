@@ -106,6 +106,8 @@ def collect(host, use_default, apply):
                     raise RuntimeError(f'Missing private key {private}; create/repair it manually')
                 run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(private),
                      '-C', f'{host}-fleet'])
+            if use_default and private.stat().st_mode & 0o077:
+                raise RuntimeError(f'{private} is readable by others, and OpenSSH refuses such a key: chmod 600 {private}')
             if use_default and not public.exists():
                 raise RuntimeError(f'Missing public key {public}; recreate it: ssh-keygen -y -f {private} > {public}')
             if use_default and private_fingerprint(private) != run(['ssh-keygen', '-l', '-f', str(public)]).split()[1]:

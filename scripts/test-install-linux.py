@@ -264,7 +264,7 @@ class BootstrapSafety(unittest.TestCase):
         self.assertNotIn('preferences.d', calls)
 
     def test_endpoint_names_exclude_the_local_sentinel(self):
-        self.run_shell('valid_endpoint rog-nv-linux && ! valid_endpoint local && ! valid_endpoint user@host')
+        self.run_shell('valid_endpoint rog-nv-linux && ! valid_endpoint local && ! valid_endpoint macbook-air && ! valid_endpoint user@host')
 
     def test_unknown_option(self):
         result = subprocess.run(['bash', str(SCRIPT), '--bogus'], capture_output=True)

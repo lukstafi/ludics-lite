@@ -205,6 +205,8 @@ emit_var() {
 prelude() {
   emit_var STATE "$STATE"; emit_var SKILLS_REPO "$SKILLS_REPO"; emit_var ANCHOR_STATE "$ANCHOR_STATE"
   printf 'TMUX_SOCKET=%q\nBOX=%q\n' "$TMUX_SOCKET" "$1"
+  # Whether run_on runs this as a local child: `local` and the anchor's own name alike (is_local).
+  if is_local "$1"; then printf 'BOX_IS_LOCAL=1\n'; else printf 'BOX_IS_LOCAL=0\n'; fi
   cat <<'EOF'
 set -uo pipefail
 expand_tilde() { case "$1" in '~/'*) printf '%s' "$HOME/${1#\~/}" ;; '~') printf '%s' "$HOME" ;; *) printf '%s' "$1" ;; esac; }
@@ -653,7 +655,7 @@ gh_down=""
 # the one it exports (sourced in a subshell only once it passed; no value is printed). Each
 # repair replaces the file with a fresh regular one or names the startup line to fix.
 tokf="$HOME/.config/fleet/gh-token.sh"; tokbad=""; qbox=$(printf '%q' "$BOX")
-case "$BOX" in local) tokcopy="replace it here with a regular 0600 file holding the fleet PAT (export GH_TOKEN=ghp_...)" ;;
+case "$BOX_IS_LOCAL" in 1) tokcopy="replace it here with a regular 0600 file holding the fleet PAT (export GH_TOKEN=ghp_...)" ;;
   *) tokcopy="replace it from the anchor: ssh $qbox 'f=~/.config/fleet/gh-token.sh; umask 077; cat > \"\$f.new\" && chmod 600 \"\$f.new\" && mv \"\$f.new\" \"\$f\"' < ~/.config/fleet/gh-token.sh" ;; esac
 if [ -e "$tokf" ] || [ -L "$tokf" ]; then
   tokbad=1; tls=$(ls -lnd "$tokf" 2>/dev/null)
@@ -676,8 +678,8 @@ if [ -e "$tokf" ] || [ -L "$tokf" ]; then
       tokbad=1
       # The anchor's preflight is a child of the invoking shell, which rereads no startup file:
       # there a mismatch is as likely a shell that predates the file's rotation.
-      case "$BOX" in
-        local) note "this shell's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports -- repair: run . ~/.config/fleet/gh-token.sh (or open a new shell) and rerun; if a new shell still differs, a later startup line overrides it (grep -Hnos GH_TOKEN ~/.zshrc ~/.zprofile ~/.bashrc ~/.profile ~/.bash_profile ~/.config/fleet/env.sh lists the lines without their values)" ;;
+      case "$BOX_IS_LOCAL" in
+        1) note "this shell's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports -- repair: run . ~/.config/fleet/gh-token.sh (or open a new shell) and rerun; if a new shell still differs, a later startup line overrides it (grep -Hnos GH_TOKEN ~/.zshrc ~/.zprofile ~/.bashrc ~/.profile ~/.bash_profile ~/.config/fleet/env.sh lists the lines without their values)" ;;
         *) note "this session's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports on $BOX: a later line of its shell startup overrides it -- repair: remove that line (ssh $qbox 'grep -Hnos GH_TOKEN ~/.bashrc ~/.profile ~/.bash_profile ~/.config/fleet/env.sh' lists the lines without their values), then restart any tmux server that inherited it" ;;
       esac
     fi
@@ -700,7 +702,7 @@ else
         if [ -n "$tokbad" ]; then repair="fix the token file first (above), then rerun the preflight"
         elif [ -e "$tokf" ]; then repair="the PAT in ~/.config/fleet/gh-token.sh is dead: $tokcopy; then restart any tmux server that inherited the old value"
         else
-          case "$BOX" in local) repair="in a terminal on this box: gh auth login -h github.com -p https -w && gh auth setup-git" ;;
+          case "$BOX_IS_LOCAL" in 1) repair="in a terminal on this box: gh auth login -h github.com -p https -w && gh auth setup-git" ;;
             *) repair="ssh -t $qbox 'gh auth login -h github.com -p https -w && gh auth setup-git'" ;; esac
           [ -z "$envtok" ] || repair="remove the $envtok this session exports (it outranks gh's stored login and blocks gh auth login) from $BOX's shell startup, then restart any tmux server that inherited it; for the stored login: $repair"
         fi

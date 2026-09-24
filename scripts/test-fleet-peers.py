@@ -67,8 +67,18 @@ class MeshSafety(unittest.TestCase):
         home = Path(self.tmp.name) / 'home'
         (home / '.ssh').mkdir(parents=True)
         (home / '.ssh/id_ed25519').write_text('private')
+        (home / '.ssh/id_ed25519').chmod(0o600)
         with patch.object(peers.Path, 'home', return_value=home):
             with self.assertRaisesRegex(RuntimeError, 'Missing public key'):
+                peers.collect('hub', True, True)
+
+    def test_default_key_readable_by_others_refused(self):
+        home = Path(self.tmp.name) / 'home'
+        (home / '.ssh').mkdir(parents=True)
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(home / '.ssh/id_ed25519')], check=True)
+        (home / '.ssh/id_ed25519').chmod(0o644)
+        with patch.object(peers.Path, 'home', return_value=home):
+            with self.assertRaisesRegex(RuntimeError, 'readable by others'):
                 peers.collect('hub', True, True)
 
     def test_default_key_with_a_stale_public_half_refused(self):
