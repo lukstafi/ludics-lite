@@ -4916,12 +4916,11 @@ test_runner_kills_a_case_past_its_deadline() {
   grep -q "^FAIL: 1 of 1 post-merge cleanup states failed" "$out" || fail "no failing summary: $(cat "$out")"
   [ -s "$pidfile" ] || fail "the planted descendant never wrote its pid, so nothing here checks it: $(cat "$out")"
   stall_pid=$(cat "$pidfile")
-  # A settle, not a deadline: a descendant the runner never escalated to sleeps for an hour.
+  # A settle, not a deadline: a descendant the runner never escalated to sleeps for an hour. The
+  # case only reads the pid and never signals it, since by now the pid may name another process.
   while pid_alive "$stall_pid"; do
-    [ "$tries" -lt 20 ] || {
-      kill -KILL "$stall_pid" 2>/dev/null || true
+    [ "$tries" -lt 20 ] ||
       fail "the TERM-ignoring descendant (pid $stall_pid) survived the deadline: the runner stopped escalating at the leader"
-    }
     sleep 0.1
     tries=$((tries + 1))
   done
