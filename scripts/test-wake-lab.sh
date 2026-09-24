@@ -40,6 +40,9 @@ trap 'declare -F kill_stub_holders >/dev/null 2>&1 && kill_stub_holders; rm -rf 
 # `env`.
 LOCKS="$TMP/locks"; mkdir -p "$LOCKS"
 WAKE_LAB_LOCK_DIR="$LOCKS"; export WAKE_LAB_LOCK_DIR
+# ...and the execution registry `status` counts reservations from (ludics-lite#359): a reader that
+# is not there, so no status case reads the real registry or asks the anchor box over ssh.
+WAKE_LAB_FLEET_WORKER="$TMP/absent-fleet-worker.sh"; export WAKE_LAB_FLEET_WORKER
 
 # ...and the control that the export above is really doing it. The redirection is one variable
 # deep: a case that builds its own environment with `env -i`, or an explicit `env` list that drops

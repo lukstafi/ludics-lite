@@ -200,7 +200,15 @@ unverified release keeps its record, because the guest pid and token in it are t
 later `unhold` could finish the job with; run it again when the box answers.
 
 `restart-wsl` and the power verbs take **both** and refuse the box if either is held, until the
-holder lets go or `--force` takes it anyway. The OCANNL cross-machine sweep reserves each box's
+holder lets go or `--force` takes it anyway. A lock file's line outlives its holder (the kernel
+drops the flock when the holder dies, and nothing rewrites the line), so reading the files cannot
+say whether anything is using a box. `wake-lab.sh status` asks the flocks instead
+(ludics-lite#359): `lane-lock=` and `hold-lock=` read `held` when a destroyer would be refused
+now, with the holder's line and its age under the box, or `free`, with any leftover line shown as
+stale text. The probe is a non-blocking shared take on a descriptor of its own, gone as it exits,
+so it creates and writes nothing and is safe beside a running sweep. `reservations=` counts the
+active `fleet-worker.sh execution list` records naming the box and lists them; it reads `?`, never
+0, when that registry could not be read. The OCANNL cross-machine sweep reserves each box's
 lane lock for the length of its lane — on 2026-09-16, before any of this existed, a restart issued
 mid-sweep destroyed both GPU boxes' VMs and cost that run both GPU units. The split into two locks
 came later, on 2026-09-18: while one lock said both things, the sweep routine's own `--hold` in
@@ -551,7 +559,9 @@ is selected, and a section that needs more than that, such as the coordinator le
 worker to read, takes it itself, so every section also passes when it is the only one selected.
 
 `test-wake-lab-linux.sh` exercises native Ubuntu status, wake and power handling with the WSL
-adapter absent. `test-wake-lab.sh` runs the WSL path against shim `curl`, `python3` and `ssh` on PATH, so it
+adapter absent, including the lab-lock columns (a held lock, a free one with a stale line, and no
+file at all, with status leaving every file and holder as it found them) and the reservation count
+from a stub registry reader. `test-wake-lab.sh` runs the WSL path against shim `curl`, `python3` and `ssh` on PATH, so it
 touches neither the router nor the network. It pins the split above from both sides: that every
 MAC the script sends comes from the sourced host table and that a missing, incomplete or
 short-a-target one is refused before any router traffic, and that no MAC-shaped literal is tracked
