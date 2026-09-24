@@ -1004,10 +1004,33 @@ EOF
 # ---------------------------------------------------------------------------------------------
 # The verdict of a finished worker, from its files. Prints one line; exit 0 clean, 1 failed,
 # 3 no exit record (the session is gone but nothing wrote the code: killed, or never started).
+#
+# A DONE line gains `| PROBABLE STRAND: ...` when the turn's final message announces a wait still
+# pending. A headless turn's end kills the background tasks it started, so a worker that ended
+# on "the watch will wake me" will never be woken (ludics-lite#361). This is a free-text reader,
+# and its boundary is a fail-closed allowlist: it reads ONLY the turn's final message (a Claude
+# turn's `result`, a Codex turn's last agent message), whole, case-insensitively, for the fixed
+# substrings strand_mark lists, and flags on the first one present. It does not read
+# earlier messages, the tool calls, or the processes the turn left, so a paraphrase outside the
+# list is not flagged, and a phrase quoted or negated ("no watch will wake me") is flagged anyway.
+# The mark is a prompt to read the final message, never a verdict: it changes neither the DONE
+# nor the exit code.
 verdict_script() {
   cat <<'EOF'
+strand_mark() {
+  local text p
+  text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  for p in 'will wake me' 'wakes me' 'wake me up' 'wake me when' 'watch is armed' 'watch armed' \
+           'armed the watch' 'armed a watch' 'while the watch runs' 'waiting in the background' \
+           'running in the background'; do
+    case "$text" in *"$p"*)
+      printf ' | PROBABLE STRAND: the final message says "%s"; a CLI turn'"'"'s background tasks end with it' "$p"
+      return 0 ;;
+    esac
+  done
+}
 verdict() {
-  local name="$1" d="$WORKERS/$1" kind rc summary
+  local name="$1" d="$WORKERS/$1" kind rc summary final
   kind=$(meta_get "$d" kind)
   if [ ! -f "$d/exit" ]; then
     echo "VANISHED $BOX/$name: no exit record (killed, or the CLI never started; an orphaned CLI ran on past tmux if the stream moved -- see $d/stderr.log)"; return 3
@@ -1028,7 +1051,11 @@ verdict() {
   esac
   [ -n "$summary" ] || summary="no terminal event in the stream"
   if [ "$rc" = 0 ] && [ "${ok_event:-0}" -gt 0 ]; then
-    echo "DONE $BOX/$name exit=0 $summary"; return 0
+    case "$kind" in
+      claude) final=$(turn | jq -Rrn '[inputs | fromjson? | select(.type=="result") | (.result // "" | tostring)] | last // ""' 2>/dev/null) ;;
+      codex)  final=$(turn | jq -Rrn '[inputs | fromjson? | select(.type=="item.completed" and .item.type=="agent_message") | (.item.text // "" | tostring)] | last // ""' 2>/dev/null) ;;
+    esac
+    echo "DONE $BOX/$name exit=0 $summary$(strand_mark "${final:-}")"; return 0
   fi
   echo "FAILED $BOX/$name exit=$rc $summary $(tail -n 2 "$d/stderr.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"; return 1
 }
