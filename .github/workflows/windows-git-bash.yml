@@ -1,7 +1,7 @@
 name: windows git bash
 
 # ship-pr's shell suites under Git for Windows' MINGW64 bash on windows-latest (ludics-lite#318),
-# nightly and on demand. Not per push (ludics-lite#339): the job runs close to an hour, and neither
+# nightly and on demand. Not per push (ludics-lite#339): the job runs over an hour, and neither
 # a pull request's checks nor main's verdict (`pr-review.sh base` folds push runs only) waits on it.
 # A dispatched run does put check runs on the head it ran at, so `checks`/`merge` judge it there.
 #
@@ -35,8 +35,11 @@ jobs:
   git-bash:
     name: Git Bash suites, ship-pr (windows)
     runs-on: windows-latest
-    # The cleanup step is capped at 20 below.
-    timeout-minutes: 60
+    # The cleanup step is capped at 20 below. Since ludics-lite#335 the jq-reading suites run their
+    # whole case lists here instead of stopping at a CRLF read (base-settle 10s -> 115s,
+    # checks-absent 39s -> 350s) and the lib's CRLF controls add about 3 minutes; 60 minutes cut
+    # run 36031359850 off inside the watch suite, at 60 of an estimated ~68.
+    timeout-minutes: 90
     defaults:
       run:
         # On a Windows runner `bash` is Git for Windows' bash (C:\Program Files\Git\bin\bash.exe),
