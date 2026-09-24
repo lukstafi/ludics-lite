@@ -4895,9 +4895,9 @@ test_runner_kills_a_case_past_its_deadline() {
   # deadline together with its log, and the run still ends with its root removed.
   # The stall is a descendant that ignores TERM under a case shell that dies on it: the leader
   # vanishes at the first signal, and only a runner that watches the whole group escalates to
-  # KILL for what is left. The descendant writes its own pid before it execs, and the case asks
-  # that pid with kill -0, not pgrep: Git for Windows ships no pgrep, where the check passed while
-  # checking nothing (ludics-lite#337).
+  # KILL for what is left. The descendant writes its own pid before it execs, and the case reads
+  # that pid with pid_alive, the way the runner reads its groups, not with pgrep: Git for Windows
+  # ships no pgrep, where the check passed while checking nothing (ludics-lite#337).
   local tag="dl$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" rc marker patched
   local pidfile="$copy/stall.pid" stall_pid tries=0
   marker="sh -c 'trap \"\" TERM; echo \$\$ >\"$pidfile\"; exec sleep 3571'"
@@ -4916,9 +4916,8 @@ test_runner_kills_a_case_past_its_deadline() {
   grep -q "^FAIL: 1 of 1 post-merge cleanup states failed" "$out" || fail "no failing summary: $(cat "$out")"
   [ -s "$pidfile" ] || fail "the planted descendant never wrote its pid, so nothing here checks it: $(cat "$out")"
   stall_pid=$(cat "$pidfile")
-  # A settle, not a deadline: a KILLed process can still answer kill -0 until it is reaped, and a
-  # descendant the runner never escalated to sleeps for an hour.
-  while kill -0 "$stall_pid" 2>/dev/null; do
+  # A settle, not a deadline: a descendant the runner never escalated to sleeps for an hour.
+  while pid_alive "$stall_pid"; do
     [ "$tries" -lt 20 ] || {
       kill -KILL "$stall_pid" 2>/dev/null || true
       fail "the TERM-ignoring descendant (pid $stall_pid) survived the deadline: the runner stopped escalating at the leader"
@@ -5565,6 +5564,18 @@ group_alive() {
     return
   fi
   [ "$(ps -A -o pgid=,stat= 2>/dev/null | awk -v g="$1" '$1 == g && $2 !~ /^Z/ { n++ } END { print n + 0 }')" -gt 0 ]
+}
+
+# pid_alive <pid>: the process is still running, zombies excluded — a killed orphan stays a
+# zombie for as long as PID 1 does not reap it, which in some containers is forever.
+pid_alive() {
+  if [ "$PROC_READING" = kill ]; then
+    kill -0 "$1" 2>/dev/null
+    return
+  fi
+  case "$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')" in
+  '' | Z*) return 1 ;;
+  esac
 }
 
 # case_pgid <pid>: the process's group, or nothing once it is gone.
