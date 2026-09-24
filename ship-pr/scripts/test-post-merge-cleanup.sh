@@ -5232,6 +5232,29 @@ off) CASE_TIMEOUT=0 ;;
 *) CASE_TIMEOUT=$((10#$CASE_TIMEOUT)) ;;
 esac
 
+# How the runner reads a case's processes (ludics-lite#337). Two readings, chosen by platform:
+# - ps: `ps -o`, everywhere but the Cygwin family. A zombie still answers `kill -0` there, so only
+#   ps's state column tells a finished case from a running one, and a killed leader is a zombie
+#   until reaped and would otherwise keep its group looking alive.
+# - kill: Git for Windows' MSYS2 bash and Cygwin (uname MINGW*, MSYS*, CYGWIN*), whose ps has no
+#   -o. There every ps reading below came back empty: reap_one took each running case for one
+#   already gone and blocked in `wait` on it, so no deadline was ever checked and a stalled case
+#   held the job to its step cap. Cygwin's kill() skips a process that has exited, reaped or
+#   not, so `kill -0 PID` and `kill -0 -- -PGID` answer for live processes only; /proc/PID/pgid
+#   is Cygwin's own file naming a process's group.
+# Any other host whose ps cannot print fields is refused before a case starts, rather than read as
+# one where every case has already finished.
+case "$(uname -s 2>/dev/null)" in
+MINGW* | MSYS* | CYGWIN*) PROC_READING=kill ;;
+*)
+  PROC_READING=ps
+  ps -o pgid=,stat= -p "$$" >/dev/null 2>&1 || {
+    echo "FAIL: the runner reads its cases' processes with ps -o, which this host's ps refuses" >&2
+    exit 1
+  }
+  ;;
+esac
+
 # Every case builds its scratch repositories under $TEST_ROOT and reads nothing outside them, so
 # each one runs in a background subshell with a private root named after the case. The subshell
 # reports its exit status through a file: a zombie still answers `kill -0`, and bash 3.2 has no
@@ -5293,17 +5316,44 @@ start_case() {
   # caller or its children, and any helper process this runner starts is the case's sibling),
   # and the deadline and cleanup guarantees rest on the group: the case is ended now and
   # reported as a runner failure, rather than run with descendants nothing can terminate.
-  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || pgid=""
+  pgid=$(case_pgid "$pid")
   if [ -n "$pgid" ] && [ "$pgid" != "$pid" ]; then
     kill_case_group "$pid"
     report_case "$i" " — the runner could not place it in its own process group (it ran in $pgid), so its descendants could not have been terminated as a unit; the case was ended, not run"
   fi
 }
 
-# group_live_count <pgid>: processes still running in the group, zombies excluded. A killed
-# leader is a zombie until reaped and would otherwise keep the group looking alive.
-group_live_count() {
-  ps -A -o pgid=,stat= 2>/dev/null | awk -v g="$1" '$1 == g && $2 !~ /^Z/ { n++ } END { print n + 0 }'
+# case_running <pid>: the case's leader is still running (a zombie, or a pid already gone, is not).
+case_running() {
+  local state
+  if [ "$PROC_READING" = kill ]; then
+    kill -0 "$1" 2>/dev/null
+    return
+  fi
+  state=$(ps -o stat= -p "$1" 2>/dev/null) || state=""
+  case "$state" in
+  '' | Z*) return 1 ;;
+  esac
+}
+
+# group_alive <pgid>: anything in the group is still running, zombies excluded.
+group_alive() {
+  if [ "$PROC_READING" = kill ]; then
+    kill -0 -- "-$1" 2>/dev/null
+    return
+  fi
+  [ "$(ps -A -o pgid=,stat= 2>/dev/null | awk -v g="$1" '$1 == g && $2 !~ /^Z/ { n++ } END { print n + 0 }')" -gt 0 ]
+}
+
+# case_pgid <pid>: the process's group, or nothing once it is gone.
+case_pgid() {
+  local pgid
+  if [ "$PROC_READING" = kill ]; then
+    pgid=$(cat "/proc/$1/pgid" 2>/dev/null) || pgid=""
+  else
+    pgid=$(ps -o pgid= -p "$1" 2>/dev/null) || pgid=""
+  fi
+  printf '%s\n' "$pgid" | tr -d ' '
 }
 
 # kill_case_group <pid>: terminate a case's process group and its leader, escalating to KILL
@@ -5315,7 +5365,7 @@ kill_case_group() {
   kill -TERM -- "-$pid" >/dev/null 2>&1 || true
   kill -TERM "$pid" >/dev/null 2>&1 || true
   while [ "$tries" -lt 25 ]; do
-    [ "$(group_live_count "$pid")" -gt 0 ] || return 0
+    group_alive "$pid" || return 0
     sleep 0.2
     tries=$((tries + 1))
   done
@@ -5355,7 +5405,10 @@ report_case() {
     if [ "$VERBOSE" -eq 1 ]; then
       cat "$log"
     else
-      grep '^PASS:' "$log" || echo "PASS: $name (printed no PASS line)"
+      # Each PASS line names its case, so a log cut off mid-run shows which cases never reported
+      # without finding them by elimination (ludics-lite#337).
+      awk -v n="$name" 'sub(/^PASS:/, "PASS " n ":") { print; found = 1 } END { exit !found }' "$log" ||
+        echo "PASS $name: (printed no PASS line)"
     fi
     rm -rf "$TEST_ROOT/$name"
   else
@@ -5370,7 +5423,7 @@ report_case() {
 }
 
 reap_one() {
-  local i state
+  local i
   while :; do
     stop_if_interrupted
     for i in ${RUNNING_PIDS[@]+"${!RUNNING_PIDS[@]}"}; do
@@ -5380,13 +5433,10 @@ reap_one() {
       fi
       # A subshell that exited without its status file must still be reaped, or the suite would
       # wait on it forever: a zombie (or a pid already gone) is finished, whatever it reported.
-      state=$(ps -o stat= -p "${RUNNING_PIDS[$i]}" 2>/dev/null) || state=""
-      case "$state" in
-      '' | Z*)
+      if ! case_running "${RUNNING_PIDS[$i]}"; then
         report_case "$i"
         return 0
-        ;;
-      esac
+      fi
       # The deadline (ludics-lite#14): a case that stalls — one sat silent for the six hours of a
       # CI job's default timeout — is killed as a group and reported, naming the deadline, rather
       # than polled for as long as the job lasts.
