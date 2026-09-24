@@ -69,7 +69,9 @@
 #                                       the snapshot below could not see
 #   run_tests <case>...                 the guard below, then each case with a PASS line — and,
 #                                       after each case, the refusal of a BREAK_JQ left standing,
-#                                       which would break a jq program for every case after it
+#                                       which would break a jq program for every case after it.
+#                                       SHIP_PR_TEST_CASES="<case> <case>" runs only those, and
+#                                       says so on a closing `SUBSET: n of m cases` line
 #
 # The guard is why the file exists. pr-review.sh defines some sixty top-level functions, every
 # one in scope in every suite the moment it is sourced, and a suite helper that happens to share
@@ -850,16 +852,45 @@ check_shadows() {
 # trips it is the hand-rolled set/clear pair the helper replaced, whose clearing line is skipped
 # by any command that fails under `set -e`. So it is refused rather than silently restored: the
 # case that leaked is named, and the cases after it do not run under it.
+#
+# SHIP_PR_TEST_CASES, a space-separated list of case names, runs only those — in the suite's order,
+# not the list's, since some cases lean on the one before them — and ends the run with
+# `SUBSET: <n> of <m> cases`, a line a full run never prints, so a partial run cannot pass for a
+# full one. A name the suite does not run is refused rather than skipped, since a typo would run
+# nothing and report green; so is any subset under GITHUB_ACTIONS=true, so CI never runs part of
+# a suite. The variable is read once and unset before the first case: a case that runs a
+# throwaway suite of its own must not hand it a list naming the outer suite's cases.
 run_tests() {
-  local test_name
+  local test_name wanted=() selected=() missing=""
   check_shadows
   [ $# -gt 0 ] || bail "run_tests: no cases named"
-  for test_name in "$@"; do
+  read -r -d '' -a wanted <<<"${SHIP_PR_TEST_CASES:-}" || true
+  unset SHIP_PR_TEST_CASES
+  if [ "${#wanted[@]}" -eq 0 ]; then
+    selected=("$@")
+  else
+    [ "${GITHUB_ACTIONS:-}" != true ] || {
+      echo "$LIB_BASENAME: REFUSING to run: SHIP_PR_TEST_CASES asks for a subset (${wanted[*]}) under GITHUB_ACTIONS=true — CI runs every case of a suite, never a part of one" >&2
+      exit 2
+    }
+    for test_name in "${wanted[@]}"; do
+      case " $* " in *" $test_name "*) ;; *) missing="$missing $test_name" ;; esac
+    done
+    [ -z "$missing" ] || {
+      echo "$LIB_BASENAME: REFUSING to run: SHIP_PR_TEST_CASES names what this suite does not run:$missing — a name that selects nothing would run nothing and report green" >&2
+      exit 2
+    }
+    for test_name in "$@"; do
+      case " ${wanted[*]} " in *" $test_name "*) selected+=("$test_name") ;; esac
+    done
+  fi
+  for test_name in "${selected[@]}"; do
     "$test_name"
     [ -z "$BREAK_JQ" ] || bail "$test_name left BREAK_JQ set to '$BREAK_JQ': every case after it would run with the jq programs matching that marker refusing, and report PASS anyway — break a program with \`with_broken_jq $BREAK_JQ <command>...\`, which clears the marker whichever way the command goes"
     restore_tuning
     echo "PASS: $test_name"
   done
+  [ "${#wanted[@]}" -eq 0 ] || echo "SUBSET: ${#selected[@]} of $# cases"
 }
 
 # protect_library <file>: extend the guard over a SECOND library, sourced after this one — the
@@ -1585,6 +1616,56 @@ test_a_leaked_marker_fails_the_case_that_leaked_it() {
     "the cleared case passes, the leaking case does not, and nothing after it runs"
 }
 
+# --- SHIP_PR_TEST_CASES: a subset, and only ever a visible one -------------------------------
+# subset_suite <line>...: a throwaway suite of three cases, with the given lines above its
+# `run_tests`, run through control_run. Each case asserts the variable is gone by the time it
+# runs, which is what keeps a case's own throwaway suites from inheriting the outer list. The
+# lines unset GITHUB_ACTIONS themselves where they need to: CI runs this file with it set.
+subset_suite() {
+  local file="$CONTROL_ROOT/subset-$((CONTROL_N += 1)).sh" name
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    printf 'source %s\n' "\"$TEST_LIB_FILE\""
+    for name in test_one test_two test_three; do
+      echo "$name() { assert_eq \"\${SHIP_PR_TEST_CASES-unset}\" unset 'the list is consumed before a case runs'; }"
+    done
+    printf '%s\n' "$@"
+    echo 'run_tests test_one test_two test_three'
+  } >"$file"
+  control_run "$file"
+}
+
+test_a_subset_runs_the_cases_it_names_and_says_so() {
+  subset_suite 'unset GITHUB_ACTIONS' 'SHIP_PR_TEST_CASES=" test_three   test_one "'
+  assert_eq "$CONTROL_RC" 0 "a subset of known names runs ($CONTROL_ERR)"
+  # The suite's order, not the list's; and the closing line a full run never prints.
+  assert_eq "$CONTROL_OUT" "PASS: test_one
+PASS: test_three
+SUBSET: 2 of 3 cases" "only the named cases run, in the suite's order, and the run says it was partial"
+  subset_suite 'unset GITHUB_ACTIONS' 'SHIP_PR_TEST_CASES=" "'
+  assert_eq "$CONTROL_OUT" "PASS: test_one
+PASS: test_two
+PASS: test_three" "a list naming nothing is a full run, with no SUBSET line ($CONTROL_ERR)"
+}
+
+test_a_subset_naming_a_case_the_suite_lacks_is_refused() {
+  subset_suite 'unset GITHUB_ACTIONS' 'SHIP_PR_TEST_CASES="test_one test_tow"'
+  assert_refused "a misspelt case"
+  assert_contains "$CONTROL_ERR" "does not run: test_tow —" "the unknown name should be named, alone"
+}
+
+test_a_subset_under_ci_is_refused() {
+  subset_suite 'GITHUB_ACTIONS=true' 'SHIP_PR_TEST_CASES=test_one'
+  assert_refused "a subset in CI"
+  assert_contains "$CONTROL_ERR" "under GITHUB_ACTIONS=true" "the refusal should say why"
+  # And CI's full run is untouched by the refusal: no list, no SUBSET line, every case.
+  subset_suite 'GITHUB_ACTIONS=true'
+  assert_eq "$CONTROL_OUT" "PASS: test_one
+PASS: test_two
+PASS: test_three" "a full run in CI runs every case ($CONTROL_ERR)"
+}
+
 # --- a jq that writes CRLF (ludics-lite#335) ---------------------------------------------------
 # A native jq.exe's text mode ends every line CRLF, and four suites went red under Git Bash on the
 # \r. These hold pr-review.sh's `jq_lf` to reading any jq back LF, on every platform, through the
@@ -2082,6 +2163,9 @@ tests=(
   test_a_leaked_marker_fails_the_case_that_leaked_it
   test_a_crlf_jq_is_read_back_lf
   test_the_crlf_knob_runs_a_suite_over_the_stub
+  test_a_subset_runs_the_cases_it_names_and_says_so
+  test_a_subset_naming_a_case_the_suite_lacks_is_refused
+  test_a_subset_under_ci_is_refused
   test_a_second_library_is_protected_once_it_says_so
   test_protect_library_refuses_a_file_that_defines_nothing
   test_retune_moves_a_constant
