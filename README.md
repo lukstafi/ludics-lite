@@ -741,7 +741,11 @@ withholds the verdict for a transport exit instead of claiming the reviewer said
 when that changes nothing, so the extra poll is not proved by the hit alone — and the round it
 finds beats the nudge it would have recommended. The `expected` clock is here too: it starts no
 earlier than the PR's own creation, still runs from the head's committer date on an older PR, and
-survives a committer date in the future.
+survives a committer date in the future. The connector's "About Codex in GitHub" block at the tail
+of a review or comment body renders as one line (ludics-lite#358), with the findings above it
+intact; each way out of its exact-text boundary (a near-miss opener, an unterminated block, text
+after it, a second `</details>`, an inline finding, an opener quoted above the real block) has its
+own case rendering the body as-is.
 
 `test-pr-review-reply.sh` covers the two WRITING commands, which had no fixture coverage at all
 until it (ludics-lite#76): every other suite drives a read path, and a double-posted reply is not

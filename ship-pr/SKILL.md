@@ -347,6 +347,8 @@ that way, both times dropping real findings. After any exit 0, enumerate the rou
 yourself from the feeds, by id above the watermark you PASSED IN — `watch` prints the advanced one
 back, and ids above that are the next round's (`status`, or the comment APIs) — and address
 THAT list; cross-check the count against what the watch claimed before replying/resolving.
+`poll` folds the connector's fixed "About Codex in GitHub" block at a body's tail into one
+`[Codex "About Codex in GitHub" boilerplate folded]` line; nothing else is folded.
 
 On every exit 0 but an approval, `watch` also prints (on stderr, so a round's stdout stays
 poll's) the base-drift read that `merge` otherwise makes last: how many commits behind its base
