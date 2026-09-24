@@ -307,12 +307,11 @@ state_of() { if alive "$1"; then echo RUNNING; elif orphaned "$1"; then echo ORP
 # far-side script that creates a worker session (launch, unstick) repeats it just before
 # `new-session`: the launch's fetch and base gate can take minutes, and a resume creates a
 # session with no preflight at all.
-# The GitHub variables are here for ludics-lite#360: the preflight's `gh api user` proves the
-# credential a fresh shell reads, and a server whose environment points gh at another host or
-# config directory (`gh help environment`: GH_CONFIG_DIR, else $XDG_CONFIG_HOME/gh) would hand the
-# worker another one. The token is compared below as gh picks it for github.com, GH_TOKEN over
-# GITHUB_TOKEN over the stored credential, and its value is never printed.
-TMUX_ENV_VARS="PATH ROCM_PATH HIP_PATH OPAM_SWITCH_PREFIX GH_HOST GH_CONFIG_DIR XDG_CONFIG_HOME"
+# GH_HOST is here for ludics-lite#360: the preflight's `gh api user` proves the credential a
+# fresh shell reads, and a server pointing gh at another host would hand the worker another one.
+# The two things gh derives from several variables, its token and its config directory, are
+# compared below as gh resolves them, never variable by variable.
+TMUX_ENV_VARS="PATH ROCM_PATH HIP_PATH OPAM_SWITCH_PREFIX GH_HOST"
 tmux_env_check() {
   local sessions genv refreshed v line sset sval fset fval stok ftok diff="" workers="" others="" tmx
   genv=$(tm show-environment -g 2>/dev/null) || return 0   # no server running
@@ -339,17 +338,30 @@ tmux_env_check() {
     [ "$sset" = 1 ] || sval="unset"; [ "$fset" = 1 ] || fval="unset"
     diff="$diff, $v is $sval in the server but $fval in a fresh shell"
   done
-  # The effective token, "-" for none (the stored credential then decides, as the probe saw).
-  stok=-; ftok=-
-  for v in GITHUB_TOKEN GH_TOKEN; do
-    sides "$v"
-    [ "$sset" = 1 ] && stok="$v=$sval"; [ "$fset" = 1 ] && ftok="$v=$fval"
-  done
+  # effective <var>...: the first variable gh would read (it takes a non-empty value), as
+  # `<var>=<value>` on each side in stok/ftok, or "-" when none is set.
+  effective() {
+    stok=-; ftok=-
+    for v in "$@"; do
+      sides "$v"
+      [ "$stok" = - ] && [ -n "$sval" ] && stok="$v=$sval"; [ "$ftok" = - ] && [ -n "$fval" ] && ftok="$v=$fval"
+    done
+  }
+  # The token (`gh help environment`): GH_TOKEN, else GITHUB_TOKEN, else the stored login the
+  # probe proved ("-"). Only which variable each side uses is printed, never a value.
+  effective GH_TOKEN GITHUB_TOKEN
   if [ "$stok" != "$ftok" ]; then
-    case "$stok" in -) sval="none" ;; *) sval="${stok%%=*}" ;; esac
-    case "$ftok" in -) fval="none" ;; *) fval="${ftok%%=*}" ;; esac
+    sval=${stok%%=*}; fval=${ftok%%=*}; [ "$sval" != - ] || sval=none; [ "$fval" != - ] || fval=none
     diff="$diff, the GitHub token gh would use differs (server: $sval, fresh shell: $fval; values not shown)"
   fi
+  # The config directory holding the stored login: GH_CONFIG_DIR, else $XDG_CONFIG_HOME/gh,
+  # else $HOME/.config/gh.
+  effective GH_CONFIG_DIR XDG_CONFIG_HOME HOME
+  for v in stok ftok; do
+    case "${!v}" in GH_CONFIG_DIR=*) printf -v "$v" '%s' "${!v#*=}" ;; XDG_CONFIG_HOME=*) printf -v "$v" '%s/gh' "${!v#*=}" ;;
+      HOME=*) printf -v "$v" '%s/.config/gh' "${!v#*=}" ;; *) printf -v "$v" 'unknown (no HOME)' ;; esac
+  done
+  [ "$stok" = "$ftok" ] || diff="$diff, gh's config directory is $stok in the server but $ftok in a fresh shell"
   [ -n "$diff" ] || return 0
   # Every live worker is an iw-<name> session on this socket (`ls` reads RUNNING from the same
   # sessions), and kill-server ends every session the server holds.
