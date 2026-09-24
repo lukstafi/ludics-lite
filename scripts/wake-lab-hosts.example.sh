@@ -14,8 +14,10 @@
 # likewise fictitious, from RFC 5737's documentation range (192.0.2.0/24) rather than from any
 # real LAN: a template carrying the author's leases would be site data by another name.
 #
-# The box names must be the ones the script knows: rog, minix, tuf. Each function echoes
-# the value(s) for a known box and returns 1 for anything else; all four are required.
+# The box names must be the ones the script knows: rog, minix, tuf -- each needs a row in the
+# endpoint map (endpoints_of in wake-lab.sh), which holds the box's ssh aliases, so this file
+# never names one. Each function echoes the value(s) for a known box and returns 1 for anything
+# else; all four are required.
 # Sourced by a `set -u` script under bash 3.2: no associative arrays.
 
 # Every MAC of a box, Wi-Fi and Ethernet. wake() sends a magic packet to each — the Wi-Fi ones

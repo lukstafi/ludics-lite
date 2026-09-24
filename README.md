@@ -226,7 +226,12 @@ counts, so a green run says what it did not check. The staging side has no match
 lore in `wake-lab.sh` and the Windows/WSL lessons in `wake-lab-wsl.sh`, the router endpoints, the
 ssh aliases and all of the logic. `wake-lab.sh --help` prints the common header, and
 `--help` and `--list` are the two commands that work before the host table exists. The box names
-(`rog`, `minix`, `tuf`) and the ssh aliases are the author's and are edited in place.
+(`rog`, `minix`, `tuf`) and the ssh aliases are the author's and are edited in place. The aliases
+live in one endpoint map, `endpoints_of` in `wake-lab.sh`: one row per box, listing each OS it can
+boot (`linux`, `win`, `wsl`, and a `lan` route to Windows). Validation, `status`, the waits and the
+WSL adapter all read that row, and a row that is incomplete (a Windows endpoint with no guest, a
+half-renamed alias, a misspelt key) is refused before anything is sent (ludics-lite#314). So
+adding or renaming a box is one row there plus its entries in the site file.
 
 To repair the Windows-side NIC settings, copy `scripts/enable-wol-windows.ps1` to the Windows box
 and run it from an elevated PowerShell (`powershell -ExecutionPolicy Bypass -File
@@ -548,7 +553,8 @@ is selected, and a section that needs more than that, such as the coordinator le
 worker to read, takes it itself, so every section also passes when it is the only one selected.
 
 `test-wake-lab-linux.sh` exercises native Ubuntu status, wake and power handling with the WSL
-adapter absent. `test-wake-lab.sh` runs the WSL path against shim `curl`, `python3` and `ssh` on PATH, so it
+adapter absent, and the endpoint map: a fixture box added to a copy of the script is probed from its
+row alone, and each incomplete shape of that row is refused with nothing sent. `test-wake-lab.sh` runs the WSL path against shim `curl`, `python3` and `ssh` on PATH, so it
 touches neither the router nor the network. It pins the split above from both sides: that every
 MAC the script sends comes from the sourced host table and that a missing, incomplete or
 short-a-target one is refused before any router traffic, and that no MAC-shaped literal is tracked
