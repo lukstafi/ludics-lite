@@ -94,11 +94,12 @@ assert_eq() {
 
 # skip_boundary <reason>: what follows in this case cannot be expressed on this platform, and is
 # not run (ludics-lite#338). The caller returns or skips the leg; this only states it. The reason
-# names the platform mechanism, not the symptom. The runner prints each `SKIP:` line under the
-# case's name and counts the case in the summary line, so a boundary is on the record in every run
+# names the platform mechanism, not the symptom. The line carries the case's name (`CASE_NAME`,
+# set by the runner), so it reads the same in a verbose log as in the quiet output; the runner
+# prints it and counts the case in the summary line, so a boundary is on the record in every run
 # and is never read as a pass of the property it did not test.
 skip_boundary() {
-  printf '%s\n' "SKIP: $*"
+  printf '%s\n' "SKIP ${CASE_NAME:-?}: $*"
 }
 
 # The boundary every case that names a file with a control character states under MSYS. Windows
@@ -5483,6 +5484,7 @@ run_case() {
   CASE_STATUS_FILE="$LOG_DIR/$name.status"
   trap 'echo "$?" >"$CASE_STATUS_FILE"' EXIT
   TEST_ROOT="$TEST_ROOT/$2"
+  CASE_NAME="$name" # skip_boundary names its line with it
   mkdir -p "$TEST_ROOT" || exit 1
   "$name"
 }
@@ -5598,20 +5600,18 @@ report_case() {
   RUNNING=$((RUNNING - 1))
   if [ "$status" -eq 0 ]; then
     PASSED_COUNT=$((PASSED_COUNT + 1))
-    if grep '^SKIP:' "$log" >/dev/null 2>&1; then
+    if awk -v p="SKIP $name: " 'index($0, p) == 1 { found = 1 } END { exit !found }' "$log"; then
       BOUNDARY_COUNT=$((BOUNDARY_COUNT + 1))
       BOUNDARY+=("$name")
     fi
     if [ "$VERBOSE" -eq 1 ]; then
-      # The whole log, with each SKIP line named as below: concurrent cases' boundaries would
-      # otherwise read as one another's.
-      awk -v n="$name" '{ sub(/^SKIP:/, "SKIP " n ":") } 1' "$log"
+      cat "$log"
     else
       # Each PASS and SKIP line names its case, so a log cut off mid-run shows which cases never
       # reported without finding them by elimination (ludics-lite#337). A case that states a
       # boundary for all of itself prints only its SKIP line.
-      awk -v n="$name" '
-        sub(/^SKIP:/, "SKIP " n ":") { print; found = 1; next }
+      awk -v n="$name" -v p="SKIP $name: " '
+        index($0, p) == 1 { print; found = 1; next }
         sub(/^PASS:/, "PASS " n ":") { print; found = 1 }
         END { exit !found }' "$log" ||
         echo "PASS $name: (printed no PASS line)"
