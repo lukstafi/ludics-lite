@@ -307,13 +307,9 @@ state_of() { if alive "$1"; then echo RUNNING; elif orphaned "$1"; then echo ORP
 # far-side script that creates a worker session (launch, unstick) repeats it just before
 # `new-session`: the launch's fetch and base gate can take minutes, and a resume creates a
 # session with no preflight at all.
-# GH_HOST is here for ludics-lite#360: the preflight's `gh api user` proves the credential a
-# fresh shell reads, and a server pointing gh at another host would hand the worker another one.
-# The two things gh derives from several variables, its token and its config directory, are
-# compared below as gh resolves them, never variable by variable.
-TMUX_ENV_VARS="PATH ROCM_PATH HIP_PATH OPAM_SWITCH_PREFIX GH_HOST"
+TMUX_ENV_VARS="PATH ROCM_PATH HIP_PATH OPAM_SWITCH_PREFIX"
 tmux_env_check() {
-  local sessions genv refreshed v line sset sval fset fval stok ftok diff="" workers="" others="" tmx
+  local sessions genv refreshed v line skip sset sval fset fval diff="" workers="" others="" tmx
   genv=$(tm show-environment -g 2>/dev/null) || return 0   # no server running
   # `exit-empty off` keeps a server alive with no session at all, so the server is found by its
   # environment, never by its session list; an unreadable list is an empty one.
@@ -322,46 +318,20 @@ tmux_env_check() {
   # session (removed there when the client lacks it), so the worker gets the fresh shell's value
   # whatever the global one says: comparing it would refuse a safe launch.
   refreshed=$(tm show-options -gv update-environment 2>/dev/null)
-  # sides <var>: fset/fval from this (fresh) shell, sset/sval what a new session gets.
-  sides() {
-    fset=0; fval=""; if [ -n "${!1+x}" ]; then fset=1; fval=${!1}; fi
-    while IFS= read -r line; do [ "$line" = "$1" ] && { sset=$fset; sval=$fval; return; }; done <<< "$refreshed"
+  for v in $TMUX_ENV_VARS; do
+    skip=0
+    while IFS= read -r line; do [ "$line" = "$v" ] && skip=1; done <<< "$refreshed"
+    [ "$skip" = 0 ] || continue
     # `VAR=value` is set, `-VAR` is removed from the global environment, no line is never set.
     sset=0; sval=""
     while IFS= read -r line; do
-      case "$line" in "$1="*) sset=1; sval=${line#"$1="} ;; "-$1") sset=0; sval="" ;; esac
+      case "$line" in "$v="*) sset=1; sval=${line#"$v="} ;; "-$v") sset=0; sval="" ;; esac
     done <<< "$genv"
-  }
-  for v in $TMUX_ENV_VARS; do
-    sides "$v"
+    fset=0; fval=""; if [ -n "${!v+x}" ]; then fset=1; fval=${!v}; fi
     [ "$sset" = "$fset" ] && [ "$sval" = "$fval" ] && continue
     [ "$sset" = 1 ] || sval="unset"; [ "$fset" = 1 ] || fval="unset"
     diff="$diff, $v is $sval in the server but $fval in a fresh shell"
   done
-  # effective <var>...: the first variable gh would read (it takes a non-empty value), as
-  # `<var>=<value>` on each side in stok/ftok, or "-" when none is set.
-  effective() {
-    stok=-; ftok=-
-    for v in "$@"; do
-      sides "$v"
-      [ "$stok" = - ] && [ -n "$sval" ] && stok="$v=$sval"; [ "$ftok" = - ] && [ -n "$fval" ] && ftok="$v=$fval"
-    done
-  }
-  # The token (`gh help environment`): GH_TOKEN, else GITHUB_TOKEN, else the stored login the
-  # probe proved ("-"). Only which variable each side uses is printed, never a value.
-  effective GH_TOKEN GITHUB_TOKEN
-  if [ "$stok" != "$ftok" ]; then
-    sval=${stok%%=*}; fval=${ftok%%=*}; [ "$sval" != - ] || sval=none; [ "$fval" != - ] || fval=none
-    diff="$diff, the GitHub token gh would use differs (server: $sval, fresh shell: $fval; values not shown)"
-  fi
-  # The config directory holding the stored login: GH_CONFIG_DIR, else $XDG_CONFIG_HOME/gh,
-  # else $HOME/.config/gh.
-  effective GH_CONFIG_DIR XDG_CONFIG_HOME HOME
-  for v in stok ftok; do
-    case "${!v}" in GH_CONFIG_DIR=*) printf -v "$v" '%s' "${!v#*=}" ;; XDG_CONFIG_HOME=*) printf -v "$v" '%s/gh' "${!v#*=}" ;;
-      HOME=*) printf -v "$v" '%s/.config/gh' "${!v#*=}" ;; *) printf -v "$v" 'unknown (no HOME)' ;; esac
-  done
-  [ "$stok" = "$ftok" ] || diff="$diff, gh's config directory is $stok in the server but $ftok in a fresh shell"
   [ -n "$diff" ] || return 0
   # Every live worker is an iw-<name> session on this socket (`ls` reads RUNNING from the same
   # sessions), and kill-server ends every session the server holds.
@@ -631,6 +601,11 @@ done
 # GitHub did not answer, which is noted on the OK line like a sleeping sibling (git fetch above
 # already refuses a box that cannot reach GitHub at all); everything else - a 401, gh's "gh auth
 # login" hint, any output this list does not name - refuses with the user-side repair.
+# Boundary: it proves what `gh api --hostname github.com user` answers in this session - the
+# session a native worker, a leg and a NEW tmux server get. It does not read a running tmux
+# server's environment (a CLI worker inherits that; tmux_env_check compares its build variables
+# only), the git credential helper a push uses, or a token /user does not accept (an app
+# installation token): those are ludics-lite#374, not this check.
 gh_down=""
 if ! command -v gh >/dev/null 2>&1; then
   note "no gh on PATH in a non-interactive session on $BOX (a worker here cannot open its PR)"

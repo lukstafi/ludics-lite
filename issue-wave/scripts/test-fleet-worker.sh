@@ -131,9 +131,9 @@ export FLEET_ANCHOR="testbox"
 # session identity.
 export FLEET_COORDINATOR="test-coordinator"
 unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
-# The preflight's tmux check compares GitHub's variables too (ludics-lite#360), so the runner's own
-# must not leak into the fresh-shell side of it.
-unset GH_TOKEN GITHUB_TOKEN GH_HOST GH_CONFIG_DIR XDG_CONFIG_HOME
+# An exported GitHub token changes the preflight's credential repair text (ludics-lite#360), so the
+# runner's own must not reach it.
+unset GH_TOKEN GITHUB_TOKEN
 export PATH="$TMP/bin:$PATH"
 # `execution slot` runs its command under `execution hold`, which wraps it in systemd-inhibit when
 # one resolves (ludics-lite#317). The CI runner is Ubuntu, whose real systemd-inhibit would make
@@ -838,11 +838,9 @@ ln -sfn "$repo/ship-pr" "$HOME/.claude/skills/ship-pr"
 # The shim plays the server; `fresh` pins the three GPU/OCaml variables of the far-side shell, the
 # reference a server started now would inherit.
 fresh=(env -u ROCM_PATH -u HIP_PATH -u OPAM_SWITCH_PREFIX)
-# Each carries HOME, as every real server's global environment does: gh's config directory is
-# derived from it (ludics-lite#360).
-printf 'PATH=%s\n-ROCM_PATH\nTERM=screen\nHOME=%s\n' "$PATH" "$HOME" > "$TMP/genv-match"
-printf 'PATH=%s\nROCM_PATH=/usr\nHOME=%s\n' "$PATH" "$HOME" > "$TMP/genv-rocm"
-printf 'PATH=/old/bin:%s\nHOME=%s\n' "$PATH" "$HOME" > "$TMP/genv-path"
+printf 'PATH=%s\n-ROCM_PATH\nTERM=screen\n' "$PATH" > "$TMP/genv-match"
+printf 'PATH=%s\nROCM_PATH=/usr\n' "$PATH" > "$TMP/genv-rocm"
+printf 'PATH=/old/bin:%s\n' "$PATH" > "$TMP/genv-path"
 expect "a tmux server whose environment matches a fresh shell passes" 0 "PREFLIGHT OK" -- \
   "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-match" SHIM_TMUX_SESSIONS="iw-live" "$FW" preflight testbox --no-probe
 expect "no tmux server running passes (the next launch starts a fresh one)" 0 "PREFLIGHT OK" -- \
@@ -871,27 +869,6 @@ expect "every stale variable is named in one refusal" 1 "(ROCM_PATH is /usr in t
   "${fresh[@]}" OPAM_SWITCH_PREFIX=/o SHIM_TMUX_GENV="$TMP/genv-rocm" "$FW" preflight testbox --no-probe
 expect "native workers never run under tmux, so a stale server does not refuse them" 0 "PREFLIGHT OK" -- \
   "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" "$FW" preflight testbox --native-claude
-# GitHub's variables (ludics-lite#360): the preflight's `gh api user` proves the credential a fresh
-# shell reads, so a server handing the worker another token or host refuses -- and a token's value
-# never reaches the refusal.
-printf 'PATH=%s\nGH_TOKEN=gho_servertokensecret\nHOME=%s\n' "$PATH" "$HOME" > "$TMP/genv-ghtoken"
-expect "a server exporting a GH_TOKEN the fresh shell lacks refuses, naming it" 1 "the GitHub token gh would use differs (server: GH_TOKEN, fresh shell: none; values not shown)" -- \
-  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-ghtoken" "$FW" preflight testbox --no-probe
-grep -q 'servertokensecret' <<<"$out" && ko "the refusal printed the server's token -- $out" || ok "...without printing the token"
-expect "a server whose GH_TOKEN differs from the fresh shell's refuses without either value" 1 "the GitHub token gh would use differs (server: GH_TOKEN, fresh shell: GH_TOKEN; values not shown)" -- \
-  "${fresh[@]}" GH_TOKEN=gho_freshtokensecret SHIM_TMUX_GENV="$TMP/genv-ghtoken" "$FW" preflight testbox --no-probe
-grep -q 'tokensecret' <<<"$out" && ko "the refusal printed a token -- $out" || ok "...and prints neither token"
-expect "a GITHUB_TOKEN that GH_TOKEN outranks on both sides is not compared" 0 "PREFLIGHT OK" -- \
-  "${fresh[@]}" GH_TOKEN=gho_servertokensecret GITHUB_TOKEN=ghp_other SHIM_TMUX_GENV="$TMP/genv-ghtoken" "$FW" preflight testbox --no-probe
-expect "an XDG_CONFIG_HOME that moved gh's config since the server started refuses" 1 "gh's config directory is $HOME/.config/gh in the server but /x/gh in a fresh shell" -- \
-  "${fresh[@]}" XDG_CONFIG_HOME=/x SHIM_TMUX_GENV="$TMP/genv-match" "$FW" preflight testbox --no-probe
-expect "an XDG_CONFIG_HOME that GH_CONFIG_DIR outranks on both sides is not compared" 0 "PREFLIGHT OK" -- \
-  "${fresh[@]}" GH_CONFIG_DIR=/c XDG_CONFIG_HOME=/x SHIM_TMUX_GENV="$TMP/genv-match" SHIM_TMUX_UPDATE_ENV="GH_CONFIG_DIR" "$FW" preflight testbox --no-probe
-printf 'PATH=%s\nHOME=/elsewhere\n' "$PATH" > "$TMP/genv-otherhome"
-expect "a server whose HOME puts gh's config elsewhere refuses" 1 "gh's config directory is /elsewhere/.config/gh in the server but $HOME/.config/gh in a fresh shell" -- \
-  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-otherhome" "$FW" preflight testbox --no-probe
-expect "a GH_HOST the fresh shell gained since the server started refuses" 1 "GH_HOST is unset in the server but github.example.com in a fresh shell" -- \
-  "${fresh[@]}" GH_HOST=github.example.com SHIM_TMUX_GENV="$TMP/genv-match" "$FW" preflight testbox --no-probe
 # The same fact against a real tmux server, on a socket of its own: the shim above must not be the
 # only thing that knows the output shape of show-environment.
 envsock="fwtest-env-$$"
@@ -952,7 +929,7 @@ expect "launch runs the preflight on the box and refuses a dirty served tree" 1 
 git -C "$repo" checkout -q -- .
 # The launch's far side re-reads the tmux server just before new-session (ludics-lite#327): the
 # base gate between it and the preflight can take minutes. Here the server turns stale during it.
-printf 'PATH=%s\nROCM_PATH=/usr\nHOME=%s\n' "$PATH" "$HOME" > "$TMP/genv-late"; rm -f "$TMP/stale-now"
+printf 'PATH=%s\nROCM_PATH=/usr\n' "$PATH" > "$TMP/genv-late"; rm -f "$TMP/stale-now"
 expect "a tmux server that turns stale after the preflight still refuses the launch" 1 "LAUNCH REFUSED testbox/wz: stale tmux server environment (ROCM_PATH is /usr in the server" -- \
   env -u ROCM_PATH -u HIP_PATH -u OPAM_SWITCH_PREFIX SHIM_TMUX_GENV="$TMP/genv-late" SHIM_TMUX_GENV_WHEN="$TMP/stale-now" SHIM_BASE_TOUCH="$TMP/stale-now" \
   "$FW" launch testbox wz --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
@@ -1075,7 +1052,7 @@ expect "a tmux failure during unstick restores exit and meta" 1 "tmux failed (pr
 cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "meta and exit are as before the failed resume" || ko "meta or exit changed by a failed resume"
 # A resume creates a tmux session with no preflight in front of it, so it runs the stale-server
 # check itself (ludics-lite#327), before it touches the record.
-printf 'PATH=%s\nROCM_PATH=/usr\nHOME=%s\n' "$PATH" "$HOME" > "$TMP/genv-stale"
+printf 'PATH=%s\nROCM_PATH=/usr\n' "$PATH" > "$TMP/genv-stale"
 expect "a resume refuses against a stale tmux server" 1 "UNSTICK REFUSED testbox/wo: stale tmux server environment (ROCM_PATH is /usr in the server but unset in a fresh shell)" -- \
   env -u ROCM_PATH -u HIP_PATH -u OPAM_SWITCH_PREFIX SHIM_TMUX_GENV="$TMP/genv-stale" "$FW" unstick testbox wo --message "$TMP/msg.md"
 cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "a resume refused over a stale server leaves meta and exit as they were" || ko "meta or exit changed by a stale-server refusal"
