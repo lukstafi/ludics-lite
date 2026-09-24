@@ -28,6 +28,16 @@ def run(args, timeout=60, **kwargs):
                           check=True, **kwargs).stdout.strip()
 
 
+def private_fingerprint(private):
+    # ssh-keygen -l on a private key reads the .pub beside it when there is one, so fingerprint a
+    # lone copy; OpenSSH keys carry their public half unencrypted, so no passphrase is asked.
+    with tempfile.TemporaryDirectory() as scratch:
+        copy = Path(scratch) / 'key'
+        shutil.copyfile(private, copy)
+        os.chmod(copy, 0o600)
+        return run(['ssh-keygen', '-l', '-f', str(copy)], stdin=subprocess.DEVNULL).split()[1]
+
+
 def regular(path):
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise RuntimeError(f'Refusing nonregular file: {path}')
@@ -98,6 +108,8 @@ def collect(host, use_default, apply):
                      '-C', f'{host}-fleet'])
             if use_default and not public.exists():
                 raise RuntimeError(f'Missing public key {public}; recreate it: ssh-keygen -y -f {private} > {public}')
+            if use_default and private_fingerprint(private) != run(['ssh-keygen', '-l', '-f', str(public)]).split()[1]:
+                raise RuntimeError(f'Public/private key mismatch: {private}')
             if not use_default:
                 derived = run(['ssh-keygen', '-y', '-P', '', '-f', str(private)])
                 if public.exists():
@@ -246,6 +258,8 @@ def main():
         if host == coordinator and len(parts) == 2 and parts[0] != getpass.getuser():
             parser.error('Local member must use the current coordinator user')
         targets.append((host, None if host == coordinator else target))
+    if not any(host == coordinator for host, _ in targets):
+        parser.error(f'The mesh must include the coordinator, {coordinator}')
     if len(targets) < 2:
         parser.error('At least two mesh members are required')
     print('Coordinator:', coordinator, flush=True)

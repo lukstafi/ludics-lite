@@ -628,7 +628,12 @@ else
         if [ -e "$HOME/.config/fleet/gh-token.sh" ]; then
           case "$BOX" in local) repair="put a live PAT in ~/.config/fleet/gh-token.sh here (export GH_TOKEN=ghp_...), then copy it to the other boxes" ;;
             *) repair="replace the PAT in ~/.config/fleet/gh-token.sh on $BOX, e.g. from the anchor: ssh $qbox 'f=~/.config/fleet/gh-token.sh; umask 077; cat > \"\$f.new\" && chmod 600 \"\$f.new\" && mv \"\$f.new\" \"\$f\"' < ~/.config/fleet/gh-token.sh" ;; esac
-          if [ -n "$envtok" ]; then repair="$repair; then restart any tmux server that inherited the old value"
+          # Whether the exported GH_TOKEN IS the file's, read in a subshell (nothing printed): a
+          # later startup line exporting another one overrides the file, and replacing the file
+          # would not reach it.
+          ftok=$(unset GH_TOKEN; . "$HOME/.config/fleet/gh-token.sh" >/dev/null 2>&1; printf '%s' "${GH_TOKEN-}")
+          if [ -n "${GH_TOKEN+x}" ] && [ "$GH_TOKEN" != "$ftok" ]; then repair="this session's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports: a later line of $BOX's shell startup overrides it (ssh $qbox 'grep -n GH_TOKEN ~/.bashrc ~/.profile ~/.bash_profile ~/.config/fleet/env.sh'); remove that line, then restart any tmux server that inherited it"
+          elif [ -n "${GH_TOKEN+x}" ]; then repair="$repair; then restart any tmux server that inherited the old value"
           else repair="this session does not export the token in ~/.config/fleet/gh-token.sh: end $BOX's ~/.config/fleet/env.sh with [ ! -r \"\$HOME/.config/fleet/gh-token.sh\" ] || . \"\$HOME/.config/fleet/gh-token.sh\" (scripts/install-linux.sh adds it)"; fi
         else
           case "$BOX" in local) repair="in a terminal on this box: gh auth login -h github.com -p https -w && gh auth setup-git" ;;

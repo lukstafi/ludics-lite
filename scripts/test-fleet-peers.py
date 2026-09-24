@@ -71,6 +71,16 @@ class MeshSafety(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Missing public key'):
                 peers.collect('hub', True, True)
 
+    def test_default_key_with_a_stale_public_half_refused(self):
+        home = Path(self.tmp.name) / 'home'
+        (home / '.ssh').mkdir(parents=True)
+        for name in ('id_ed25519', 'other'):
+            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', 'pw', '-f', str(home / '.ssh' / name)], check=True)
+        (home / '.ssh/other.pub').replace(home / '.ssh/id_ed25519.pub')
+        with patch.object(peers.Path, 'home', return_value=home):
+            with self.assertRaisesRegex(RuntimeError, 'Public/private key mismatch'):
+                peers.collect('hub', True, True)
+
     def test_restricted_existing_key_not_broadened(self):
         original = 'restrict,from="100.0.0.1" ' + self.keys[2]
         self.assertEqual(peers.add_authorized(original, [self.keys[2]]), original)
@@ -138,6 +148,15 @@ class MeshSafety(unittest.TestCase):
             with self.assertRaises(SystemExit) as error:
                 peers.main()
         self.assertEqual(error.exception.code, 2)
+
+    def test_custom_roster_must_include_the_coordinator(self):
+        with patch('sys.argv', ['fleet-peers.py', '--peer', 'rog-nv-linux', '--peer', 'minix-amd-linux']), \
+             patch.object(peers, 'run', return_value='{"Self":{"DNSName":"mac-studio.example.ts.net."}}'), \
+             patch.object(peers, 'invoke') as invoke:
+            with self.assertRaises(SystemExit) as error:
+                peers.main()
+        self.assertEqual(error.exception.code, 2)
+        invoke.assert_not_called()
 
 
 if __name__ == '__main__':
