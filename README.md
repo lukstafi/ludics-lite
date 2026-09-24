@@ -250,6 +250,38 @@ half-renamed alias, a misspelt key) is refused before anything is sent (ludics-l
 and a bare `status` expand to the map's rows, so adding or renaming a box is one row there plus
 its entries in the site file (and `ACT_DEFAULT`, beside it, for a box a bare wake should reach).
 
+`wake-lab.sh boot-windows <box>` reboots a dual-boot box into Windows for one boot, with nobody at
+the keyboard, and waits until its native Git Bash answers (`uname -s` `MINGW*`, `git --version`
+`.windows.`); `boot-linux <box>` restarts it back into Ubuntu, or wakes a dark box into it
+(ludics-lite#353). The selection is UEFI BootNext, from the one `Windows Boot Manager` entry in
+`efibootmgr`'s listing: the firmware boots it once and deletes the variable, so BootOrder (Ubuntu
+first) and GRUB are never written, and coming back needs no selection at all. Both verbs reserve the
+box's lane and hold locks for the whole switch and refuse either held, as the power verbs do
+(`--force` skips them). Both also run only under the caller's own exclusive `fleet-worker.sh execution`
+reservation, named with `--as=<request_id>`. It must be an active `measurement` reservation on one
+of the box's endpoints, which the registry keeps any later reservation on that host from joining.
+Any other active reservation naming any endpoint of the box refuses them, since a native Windows
+run holds no inhibitor and need not take a lock, and an unreadable registry refuses too. `boot-windows` also refuses a box with a run's sleep block
+inhibitor, which the lab locks do not see. Each is a real reboot, so whatever is open in the box's desktop session closes with it: the
+live witness on rog closed its Firefox and VS Code windows. They take exactly one box, and refuse one with no wired NIC (tuf), since
+what cannot be woken remotely cannot be recovered remotely. The wait prints a line per poll for up
+to 15 minutes in all (`WAKE_LAB_BOOT_WAIT_SECONDS`, one deadline for the old OS going down, which
+takes two dark polls in a row, the new one answering and its Git Bash) and ends in 0 (reached), 1 (refused, or back in a
+known OS: the firmware ignored BootNext, or Windows came back) or 3, `NEEDS A PERSON`: nothing
+answers, or the old OS still answers at the deadline after accepting the reboot, and only someone at
+the box can tell Windows updates from a BitLocker prompt or a hang. The locks are held until then.
+The Linux side needs root for exactly this, installed once per box as
+`/etc/sudoers.d/50-fleet-boot` (mode 0440, checked with `visudo -cf`), with that box's entry number
+and user:
+
+```
+lukstafi ALL=(root) NOPASSWD: /usr/bin/efibootmgr "", /usr/bin/efibootmgr --bootnext 0000, /usr/bin/efibootmgr --delete-bootnext, /usr/bin/systemctl reboot
+```
+
+The bare listing is for a box whose EFI variables are not world-readable, and `--delete-bootnext`
+takes the selection back when the reboot then fails, so the box's next unrelated reboot does not
+land in Windows.
+
 To repair the Windows-side NIC settings, copy `scripts/enable-wol-windows.ps1` to the Windows box
 and run it from an elevated PowerShell (`powershell -ExecutionPolicy Bypass -File
 .\enable-wol-windows.ps1`); BIOS/UEFI Wake-on-LAN still has to be enabled separately.
@@ -579,7 +611,12 @@ worker to read, takes it itself, so every section also passes when it is the onl
 adapter absent, including the lab-lock columns (a held lock, a free one with a stale line, and no
 file at all, with status leaving every file and holder as it found them) and the reservation count
 from a stub registry reader, and the endpoint map: a fixture box added to a copy of the script is
-probed from its row alone, and each incomplete shape of that row is refused with nothing sent. `test-wake-lab.sh` runs the WSL path against shim `curl`, `python3` and `ssh` on PATH, so it
+probed from its row alone, and each incomplete shape of that row is refused with nothing sent. It
+also drives `boot-windows` and `boot-linux` against a stub box whose booted OS the stub's reboot
+rewrites: the single BootNext selection read from the listing (never BootOrder or GRUB), both lab
+locks held at the moment of the reboot, the refusal on a held lane or hold lock and none on a stale
+one, the sudoers, inhibitor, ambiguous-entry and wired-NIC refusals, and a Windows that never
+answers ending in `NEEDS A PERSON`. `test-wake-lab.sh` runs the WSL path against shim `curl`, `python3` and `ssh` on PATH, so it
 touches neither the router nor the network. It pins the split above from both sides: that every
 MAC the script sends comes from the sourced host table and that a missing, incomplete or
 short-a-target one is refused before any router traffic, and that no MAC-shaped literal is tracked
