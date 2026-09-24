@@ -4752,17 +4752,20 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
 # direction, on a method this repository does not use. A --squash --body text is itself a landing
 # message this scan does not read either.
 #
-# Read ONCE per merge, AFTER the gate and any --wait, for the head the merge is bound to and the base
-# the PR has then. A lead-time read before the wait stood here for a round, and it was about a series
-# that a push or a retarget during the wait could replace: it needed a second read, a withdrawal of
-# what the first had printed, and a base comparison on top (review rounds 1 and 2). One late read is
-# about what lands, and every attempt after it is bound to that head by --match-head-commit; the one
-# retry that follows a BASE move reads it again, since the series is relative to the base. What
-# it gives up is lead time, which for this finding is small: its fix is a push, and a push restarts
-# the gate whenever it is made. The window it leaves is a retarget between this read and the merge
-# call, the same seconds-wide window the body re-scan leaves around the call.
+# Read AFTER the gate and any --wait, immediately before EVERY merge attempt, beside the body
+# re-scan and for the same reason: --match-head-commit binds the head, while the series is relative
+# to the BASE, and a retarget or a rewound base during a wait or between attempts changes it without
+# moving the head (review rounds 2, 4 and 5 each found one more path to such a move; reading before
+# every attempt closes the class). A lead-time read before the wait stood here for a round and was
+# removed: it was about a series the wait could replace. What that gives up is lead time, which for
+# this finding is small -- its fix is a push, and a push restarts the gate whenever it is made. The
+# window left is a move between this read and the call, the seconds-wide window the body re-scan
+# leaves too. An attempt whose findings REPEAT the last ones printed prints nothing, and one whose
+# series has lost them withdraws them, so a retry costs a line only when something moved.
 # The head whose series the last scan read whole, for the deferred-merge refusal; empty when none.
 SERIES_READ=""
+# The findings the last completed scan printed, for the repeat and the withdrawal above.
+SERIES_LAST=""
 warn_series_close() { # <pr> <gated head>; always 0 -- a warning that can refuse a merge is a gate
   local meta count head last rows n=0 row sha msg scan rc class cnt refs sent findings=""
   SERIES_READ=""
@@ -4831,7 +4834,14 @@ warn_series_close() { # <pr> <gated head>; always 0 -- a warning that can refuse
     done <<<"$scan"
   done <<<"$rows"
   SERIES_READ="$head"
-  [ -n "$findings" ] || return 0
+  if [ -z "$findings" ]; then
+    [ -z "$SERIES_LAST" ] || multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1's commit" \
+      "series, read again for this attempt, no longer carries the finding above."
+    SERIES_LAST=""
+    return 0
+  fi
+  [ "$findings" != "$SERIES_LAST" ] || return 0
+  SERIES_LAST="$findings"
   multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's commit series closes issues it does not look" \
     "like it closes:"
   while IFS= read -r row; do
@@ -4988,8 +4998,6 @@ cmd_merge() {
   # head's green run, and hands semantic drift to the post-merge integration loop. A 3 (unread)
   # has already said UNKNOWN loudly; neither outcome blocks the merge.
   warn_base_drift "$PR_NUM" || true
-  # The commit series, ONCE per merge, for the gated head (ludics-lite#296; see warn_series_close).
-  warn_series_close "$PR_NUM" "$CHECK_SHA"
   # The verdict above is about ONE head, the one gate_checks read — and a --wait is minutes to
   # hours long, during which a push can move the PR. `gh pr merge` merges whatever the head is at
   # the moment of the call; --match-head-commit makes it refuse unless that is still the gated
@@ -5010,6 +5018,9 @@ cmd_merge() {
     # ambiguous. Both cost more than the window is worth: it is bounded by the backoff (about 35s
     # over four attempts) and opens only during a GitHub gateway incident.
     warn_multi_close "$PR_NUM" again
+    # The commit series, for the gated head and the base as it is now (ludics-lite#296; see
+    # warn_series_close): before EVERY attempt, since a base can move between attempts.
+    warn_series_close "$PR_NUM" "$CHECK_SHA"
     # Open review threads refuse the merge, whatever head they cite and whatever else passed
     # (ludics-lite#289; see approval_gate). Read here, before EVERY attempt, for the body's
     # reason: a thread opened during a --wait or between attempts moves no head, so
@@ -5047,9 +5058,6 @@ cmd_merge() {
         warn "$REPO#$PR_NUM's BASE moved during the merge call, not its head (still" \
           "${CHECK_SHA:0:8}); re-reading the drift and retrying"
         warn_base_drift "$PR_NUM" || true
-        # The series is relative to the base, which is what just moved: a retarget, or a base
-        # rewound, can bring commits into it that nothing has read (review round 4).
-        warn_series_close "$PR_NUM" "$CHECK_SHA"
         attempt=$((attempt + 1))
         continue
       fi

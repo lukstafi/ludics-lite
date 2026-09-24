@@ -221,7 +221,8 @@ The same holds for COMMIT MESSAGES: this repository merges with `--merge`, so th
 the default branch, and a keyword in a message closes exactly as one in the body does — PR #274's
 first commit quoted the incident sentence above as an illustration and would have closed both
 issues again. Never quote a closing keyword with an issue number in a commit message. `merge` reads
-the series once, after the build gate and for the head the merge is bound to (the commits endpoint,
+the series after the build gate and before every merge attempt, for the head the merge is bound
+to, since the series is relative to a base that can move without moving the head (the commits endpoint,
 whole or not at all: over its 250-commit cap, or with rows that disagree with the PR's stated count
 and head, it says the scan did NOT run), and applies the
 body's rule to each message, naming the commit and the line. A message is not Markdown but plain

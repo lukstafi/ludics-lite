@@ -49,6 +49,7 @@ THREADS_JSON='[]'                      # the PR's review threads (review_thread 
 THREADS_JSON_LATER=""                  # nonempty = what the SECOND threads read on answers with
 FAIL_GRAPHQL=""                        # nonempty = the review-threads read gets a 503
 SERIES_JSON=""                         # the PR's commits as the endpoint serves them (see reset)
+SERIES_JSON_LATER=""                   # nonempty = what the SECOND series read on answers with
 SERIES_COUNT=""                        # nonempty = the commit count the PR states, over the rows'
 SERIES_FAIL=""                         # nonempty = the commits read answers with a 503
 # The "from the SECOND read on" switches above are counted by the lib's fixture_call_count, under
@@ -90,8 +91,9 @@ gh() {
     # commits read serves, so the two agree unless a case says otherwise.
     *'.commits|tostring'*)
       printf 'CALL commits-count\n' >>"$CALLS_FILE"
+      reads=$(fixture_call_count series-count) || return 1
       gh_fixture_parse "$@"
-      gh_fixture_answer "$(printf '%s\n' "$SERIES_JSON" |
+      gh_fixture_answer "$(series_answer "$reads" |
         jq -c --arg c "$SERIES_COUNT" '{commits: (if $c == "" then length else ($c | tonumber) end), head: {sha: .[-1].sha}}')"
       ;;
     *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
@@ -138,12 +140,13 @@ gh() {
     case "$*" in
     *"repos/$REPO/pulls/7/commits"*)
       printf 'CALL commits\n' >>"$CALLS_FILE"
+      reads=$(fixture_call_count series) || return 1
       if [ -n "$SERIES_FAIL" ]; then
         printf 'gh: 503 No server is currently available to service your request\n' >&2
         return 1
       fi
       gh_fixture_parse "$@"
-      gh_fixture_answer "$SERIES_JSON"
+      gh_fixture_answer "$(series_answer "$reads")"
       ;;
     *) bail "unexpected paginated read: $*" ;;
     esac
@@ -185,6 +188,15 @@ gh() {
     ;;
   *) bail "unexpected fixture gh call: $*" ;;
   esac
+}
+
+# The series the <n>th read of it answers with: SERIES_JSON_LATER from the second on, when set.
+series_answer() { # <n>
+  if [ -n "$SERIES_JSON_LATER" ] && [ "$1" -ge 2 ]; then
+    printf '%s\n' "$SERIES_JSON_LATER"
+  else
+    printf '%s\n' "$SERIES_JSON"
+  fi
 }
 
 # One commit of a series, as the commits endpoint serves it.
@@ -239,6 +251,7 @@ reset() {
   THREADS_JSON_LATER=""
   FAIL_GRAPHQL=""
   SERIES_JSON="[$(commit_row head-sha 'A commit with nothing to close.')]"
+  SERIES_JSON_LATER=""
   SERIES_COUNT=""
   SERIES_FAIL=""
 }
@@ -1605,24 +1618,38 @@ test_a_commit_message_is_read_as_written() {
   assert_contains "$MERGE_STDOUT" 'C:\new\table stay;' "and a backslash in it is shown as written"
 }
 
-# The head binds every attempt, so a retry does not read the series again.
-test_the_series_is_read_once_across_merge_attempts() {
-  reset
-  MERGE_NOT_MERGEABLE=1
-  run_merge
-  assert_eq "$MERGE_RC" 0 "the retry lands ($MERGE_OUTPUT)"
-  assert_eq "$(grep -c '^CALL pr merge' "$CALLS_FILE")" 2 "two attempts were made"
-  assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 1 "on one series read"
-}
-
-# Review round 4. The series is relative to the base, so the retry after a BASE move -- a retarget
-# or a rewound base leaves the head where it was -- reads it again; an ordinary retry does not.
-test_a_base_move_during_the_call_rereads_the_series() {
+# Review rounds 4 and 5. The series is relative to the BASE, which --match-head-commit does not
+# bind, so it is read before every attempt, as the body is -- and a retry whose findings repeat the
+# last ones costs no line, while one whose series lost them withdraws them.
+test_the_series_is_read_before_every_merge_attempt() {
+  local form
+  for form in MERGE_NOT_MERGEABLE MERGE_BASE_MODIFIED; do
+    reset
+    printf -v "$form" 1
+    SERIES_JSON="[$(commit_row head-sha 'Resolves #45 and #46')]"
+    run_merge
+    assert_eq "$MERGE_RC" 0 "the retry lands ($form: $MERGE_OUTPUT)"
+    assert_eq "$(grep -c '^CALL pr merge' "$CALLS_FILE")" 2 "two attempts were made ($form)"
+    assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 2 "one series read per attempt ($form)"
+    assert_eq "$(grep -c 'ONE sentence, 2 issues: #45 #46' "$OUT_FILE")" 1 \
+      "and an unchanged finding is printed once ($form)"
+  done
+  # A base moved between attempts changes the series without moving the head: new findings are
+  # printed, and findings the series lost are withdrawn.
   reset
   MERGE_BASE_MODIFIED=1
+  SERIES_JSON="[$(commit_row head-sha 'Nothing to close')]"
+  SERIES_JSON_LATER="[$(commit_row base-commit 'Resolves #47 and #48'),$(commit_row head-sha 'Nothing to close')]"
   run_merge
-  assert_eq "$MERGE_RC" 0 "the retry lands ($MERGE_OUTPUT)"
-  assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 2 "the series is read again after the base moved"
+  assert_contains "$MERGE_STDOUT" "commit base-com: ONE sentence, 2 issues: #47 #48" \
+    "a commit the base move brought into the series is read before the retry"
+  reset
+  MERGE_BASE_MODIFIED=1
+  SERIES_JSON="[$(commit_row base-commit 'Resolves #47 and #48'),$(commit_row head-sha 'Nothing to close')]"
+  SERIES_JSON_LATER="[$(commit_row head-sha 'Nothing to close')]"
+  run_merge
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#7's commit series, read again for this attempt" \
+    "and a finding the series lost is withdrawn"
 }
 
 # The series is read AFTER the gate, for the head the merge is bound to: a PR whose head is no longer
@@ -1746,9 +1773,8 @@ tests=(
   test_a_quoted_closing_sentence_in_a_commit_body_warns
   test_a_commit_closing_the_pr_own_issue_is_silent
   test_a_commit_message_is_read_as_written
-  test_the_series_is_read_once_across_merge_attempts
+  test_the_series_is_read_before_every_merge_attempt
   test_the_series_is_read_for_the_gated_head
-  test_a_base_move_during_the_call_rereads_the_series
   test_an_unread_or_partial_series_says_the_scan_did_not_run
   test_the_series_is_scanned_whatever_the_base
   test_the_series_is_scanned_whatever_the_merge_method
