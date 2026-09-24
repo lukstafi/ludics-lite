@@ -1153,13 +1153,13 @@ boot_windows() { # boot_windows <box>
              BOOT_DEADLINE=$((SECONDS + BOOT_WAIT_SECONDS)); boot_git_bash_wait "$box"; return ;;
     "") echo "$box: answers in neither OS; waking it into Ubuntu (first in its BootOrder) first"
         wake "$box"
-        BOOT_DEADLINE=$((SECONDS + WAIT_SECONDS))
+        BOOT_DEADLINE=$((SECONDS + BOOT_WAIT_SECONDS))   # a cold boot gets the boot budget, as boot-linux's
         boot_wait "$box" linux; rc=$?
         case "$rc" in
           0) ;;
           2) echo "$box: woke into Windows, not Ubuntu; no reboot"
              BOOT_DEADLINE=$((SECONDS + BOOT_WAIT_SECONDS)); boot_git_bash_wait "$box"; return ;;
-          *) echo "boot-windows FAILED on $box: it did not wake within $((WAIT_SECONDS / 60)) min"; return 1 ;;
+          *) echo "boot-windows FAILED on $box: it did not wake within $((BOOT_WAIT_SECONDS / 60)) min"; return 1 ;;
         esac ;;
   esac
   if [ "$FORCE" != 1 ]; then
