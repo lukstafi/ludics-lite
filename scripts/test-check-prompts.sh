@@ -490,7 +490,7 @@ copy_prompts() {
   done
 }
 # LINK_TARGETS: the Markdown that README.md, issue-wave/SKILL.md and each other reach by relative
-# link -- the wave's reference files, shipping prompt and hook README. The two
+# link -- the wave's reference files, shipping prompt, hook README and the Linux bootstrap's notes. The two
 # real-file trees below carry them because the link check reads every such link in the prompts they
 # copy, and a tree holding a linking file without its target would fail on a defect its probes are
 # not about. Listed rather than discovered: discovering them means running the extraction under
@@ -501,7 +501,7 @@ LINK_TARGETS="issue-wave/references/cli-claude.md issue-wave/references/executio
   issue-wave/references/native-claude.md issue-wave/references/native-codex.md
   issue-wave/references/native-workers.md issue-wave/references/separate-codex.md
   issue-wave/references/linux-boxes.md issue-wave/references/wsl-boxes.md
-  ship-pr/SKILL.md ship-pr/hooks/README.md"
+  ship-pr/SKILL.md ship-pr/hooks/README.md scripts/install-linux.md"
 # The default as the checker reads it, and a number that is not it: the probes state no literal
 # count, so raising the default again leaves them testing the same thing.
 # The LAST such assignment, as the shell and the checker both take it: reading every match would
