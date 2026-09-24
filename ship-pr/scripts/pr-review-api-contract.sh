@@ -574,6 +574,12 @@ if [ -n "$STALE_BASE_PR" ]; then
   base_sha=$(jq -r '.base.sha // empty' <<<"$pr")
   merge_sha=$(jq -r '.merge_commit_sha // empty' <<<"$pr")
   head_sha=$(jq -r '.head.sha // empty' <<<"$pr")
+  # warn_series_close's reading (ludics-lite#296): the PR's stated count leads the rows, and the
+  # last row is the head -- a count that stopped agreeing would make every scan say it did not run.
+  series=$(api "repos/$REPO/pulls/$STALE_BASE_PR/commits?per_page=100")
+  pin "pulls/<n>/commits serves as many rows as the PR's .commits, oldest first, each with a sha and a string commit.message, the last one the PR's head (warn_series_close's shape)" \
+    '(length == $n) and all(.[]; (.sha | test($hex)) and (.commit.message | type == "string")) and (.[-1].sha == $head)' \
+    "$series" --argjson n "$(jq '.commits // -1' <<<"$pr")" --arg hex "$HEX40" --arg head "$head_sha"
   parent1=""
   if is_sha "$base_sha" && is_sha "$merge_sha" && is_sha "$head_sha"; then
     merge_commit=$(api "repos/$REPO/commits/$merge_sha")

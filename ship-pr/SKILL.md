@@ -217,6 +217,18 @@ an issue closed through a full URL, a four-space-indented code block, a sentence
 line break with its references split over it, and a sentence split at an abbreviation period such
 as `e.g.` are all unread by design.
 
+The same holds for COMMIT MESSAGES: this repository merges with `--merge`, so the series lands on
+the default branch, and a keyword in a message closes exactly as one in the body does — PR #274's
+first commit quoted the incident sentence above as an illustration and would have closed both
+issues again. Never quote a closing keyword with an issue number in a commit message. `merge` reads
+the series once (the commits endpoint, whole or not at all: over its 250-commit cap, or with rows
+that disagree with the PR's stated count and head, it says the scan did NOT run) and applies the
+body's rule to each message, naming the commit and the line. A message is not Markdown, so an
+indented line is read there, as an example; a lone `Closes #N` stays silent, since that is how a
+commit really closes the PR's own issue. It warns and does not refuse: the fix is rewording the
+commit and force-pushing, which moves the head, and a refusal would charge that on every
+deliberate close too.
+
 Report the URL on its own line, wrapped as below. The Claude Desktop client renders a live status
 card from the tag; other harnesses ignore it:
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Focused fixture tests for pr-review.sh's `merge`: the binding of the merge to the head the build
 # signal was read for, the refusals of a --require-green (close-out) merge (ludics-lite#39), and the
-# closing-keyword scan of the PR body that runs before the merge is issued (ludics-lite#227).
+# closing-keyword scan of the PR body that runs before the merge is issued (ludics-lite#227), and
+# the same scan over the messages of the PR's commit series (ludics-lite#296).
 # The build signal itself is stubbed; the gate's own behaviour is test-pr-review-checks-absent.sh's.
 
 set -euo pipefail
@@ -47,6 +48,10 @@ BODY_FAIL=""                           # nonempty = the body read answers with a
 THREADS_JSON='[]'                      # the PR's review threads (review_thread rows)
 THREADS_JSON_LATER=""                  # nonempty = what the SECOND threads read on answers with
 FAIL_GRAPHQL=""                        # nonempty = the review-threads read gets a 503
+SERIES_JSON=""                         # the PR's commits as the endpoint serves them (see reset)
+SERIES_JSON_FIRST=""                   # nonempty = what the FIRST series read answers with instead
+SERIES_COUNT=""                        # nonempty = the commit count the PR states, over the rows'
+SERIES_FAIL=""                         # nonempty = the commits read answers with a 503
 # The "from the SECOND read on" switches above are counted by the lib's fixture_call_count, under
 # the names body, base and default-branch: gh_retry calls the fixture inside a command
 # substitution, so a variable it increments dies with that subshell, and the count has to travel
@@ -82,6 +87,15 @@ gh() {
     # first, which binds the head, and the revalidation at the end of the round asks for the head,
     # the base and the head ref alone. The revalidation is the one that can answer with a
     # successor, so the two are told apart by `updated_at` rather than by field count.
+    # The series scan's count read: the count and the head, derived from the rows the matching
+    # commits read serves, so the two agree unless a case says otherwise.
+    *'.commits|tostring'*)
+      printf 'CALL commits-count\n' >>"$CALLS_FILE"
+      reads=$(fixture_call_count series-count) || return 1
+      gh_fixture_parse "$@"
+      gh_fixture_answer "$(series_answer "$reads" |
+        jq -c --arg c "$SERIES_COUNT" '{commits: (if $c == "" then length else ($c | tonumber) end), head: {sha: .[-1].sha}}')"
+      ;;
     *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
     *'--jq .head.sha // "-"') printf '%s\n' "${HEAD_AFTER_MERGE:-$CURRENT_HEAD}" ;;
     *'.head.sha'*) printf '%s\tbase-sha\tclaude/topic\n' "$CURRENT_HEAD" ;;
@@ -122,6 +136,21 @@ gh() {
     fi
     printf '%s\n' "$DEFAULT_BRANCH"
     ;;
+  "api --paginate")
+    case "$*" in
+    *"repos/$REPO/pulls/7/commits"*)
+      printf 'CALL commits\n' >>"$CALLS_FILE"
+      reads=$(fixture_call_count series) || return 1
+      if [ -n "$SERIES_FAIL" ]; then
+        printf 'gh: 503 No server is currently available to service your request\n' >&2
+        return 1
+      fi
+      gh_fixture_parse "$@"
+      gh_fixture_answer "$(series_answer "$reads")"
+      ;;
+    *) bail "unexpected paginated read: $*" ;;
+    esac
+    ;;
   "api graphql")
     case "$*" in
     *reviewThreads*)
@@ -159,6 +188,20 @@ gh() {
     ;;
   *) bail "unexpected fixture gh call: $*" ;;
   esac
+}
+
+# The series the <n>th read of it answers with: SERIES_JSON_FIRST on the first when a case sets it.
+series_answer() { # <n>
+  if [ -n "$SERIES_JSON_FIRST" ] && [ "$1" -eq 1 ]; then
+    printf '%s\n' "$SERIES_JSON_FIRST"
+  else
+    printf '%s\n' "$SERIES_JSON"
+  fi
+}
+
+# One commit of a series, as the commits endpoint serves it.
+commit_row() { # <sha> <message>
+  jq -cn --arg s "$1" --arg m "$2" '{sha: $s, commit: {message: $m}}'
 }
 
 # In a subshell: cmd_merge's refusals are `fail`, which exits the shell it runs in. The calls
@@ -207,6 +250,10 @@ reset() {
   THREADS_JSON='[]'
   THREADS_JSON_LATER=""
   FAIL_GRAPHQL=""
+  SERIES_JSON="[$(commit_row head-sha 'A commit with nothing to close.')]"
+  SERIES_JSON_FIRST=""
+  SERIES_COUNT=""
+  SERIES_FAIL=""
 }
 
 # The merge is bound to the head the gate read: a push during a long --wait must not land a head
@@ -1460,6 +1507,115 @@ test_an_unread_thread_connection_refuses_as_transport() {
   assert_no_merge_call
 }
 
+# ludics-lite#296. This repository merges with --merge, so every commit message lands on the
+# default branch, where GitHub applies its closing keywords as it does a body's. PR #274's first
+# commit quoted the #210 incident sentence as an illustration, in its BODY; the scan reads each
+# message with the body's own filter and names the commit and the line, on both streams.
+test_a_quoted_closing_sentence_in_a_commit_body_warns() {
+  reset
+  SERIES_JSON="[$(commit_row c0ffee0000000001 'ship-pr: a closing keyword binds to every #N
+
+The #210 body said "Resolves #194 and #205 §1" and closed #205 with it.'),$(commit_row head-sha 'Review fixes round 1')]"
+  run_merge
+  assert_eq "$MERGE_RC" 0 "a commit finding is not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD WARNING: $REPO#7's commit series closes issues" \
+    "the series finding is announced"
+  assert_contains "$MERGE_STDOUT" "commit c0ffee00: ONE sentence, 2 issues: #194 #205" \
+    "naming the commit and every issue the sentence binds"
+  assert_contains "$MERGE_STDOUT" 'The #210 body said "Resolves #194 and #205 §1" and closed #205 with it.' \
+    "and the line itself"
+  assert_contains "$MERGE_STDERR" "commit c0ffee00: ONE sentence, 2 issues" "on stderr as well"
+  assert_contains "$MERGE_STDOUT" "reword the commit" "with the remedy a commit needs"
+  assert_contains "$MERGE_CALLS" "--match-head-commit head-sha " "and the merge still lands"
+  # A message is not Markdown: an INDENTED quotation of the sentence is read, and flagged as one.
+  reset
+  SERIES_JSON="[$(commit_row head-sha 'Quote the incident
+
+    Resolves #194 and #205 §1
+')]"
+  run_merge
+  assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD NOTICE: $REPO#7's commit series carries" \
+    "an indented line is an example, and claims nothing"
+  assert_contains "$MERGE_STDOUT" "commit head-sha: a QUOTED, FENCED or INDENTED line, 2 reference(s): #194 #205" \
+    "naming the commit and the line's references"
+  assert_not_contains "$MERGE_STDOUT" "reword the commit" "no closing claim, so no remedy for one"
+}
+
+# The legitimate shape: a commit that really closes the PR's own issue is silent, as a body's lone
+# `Closes #N` is -- and the series is read once, on two calls.
+test_a_commit_closing_the_pr_own_issue_is_silent() {
+  reset
+  SERIES_JSON="[$(commit_row c0ffee0000000002 'merge: read the series
+
+Closes #296'),$(commit_row head-sha 'Fixes #296 for good')]"
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge lands ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "a lone closing keyword is what was meant"
+  assert_not_contains "$MERGE_OUTPUT" "did NOT run" "and the scan did run"
+  assert_eq "$(grep -c -x 'CALL commits-count' "$CALLS_FILE")" 1 "one count read per merge"
+  assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 1 "one series read per merge"
+}
+
+# A message is restored byte for byte from the @tsv the read asks for: a backslash is not an
+# escape, and a tab does not split the row.
+test_a_commit_message_is_read_as_written() {
+  reset
+  SERIES_JSON="[$(commit_row head-sha "$(printf 'Paths like C:\\new\\table stay;\tCloses #11 and #12')")]"
+  run_merge
+  assert_contains "$MERGE_STDOUT" 'ONE sentence, 2 issues: #11 #12' "the finding is read off the message"
+  assert_contains "$MERGE_STDOUT" 'C:\new\table stay;' "and a backslash in it is shown as written"
+}
+
+# The head binds every attempt, so a retry does not read the series again.
+test_the_series_is_read_once_across_merge_attempts() {
+  reset
+  MERGE_NOT_MERGEABLE=1
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the retry lands ($MERGE_OUTPUT)"
+  assert_eq "$(grep -c '^CALL pr merge' "$CALLS_FILE")" 2 "two attempts were made"
+  assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 1 "on one series read"
+}
+
+# A push before the gate bound its head: the lead-time scan read a series that will not land, so the
+# series is read again for the head the merge is bound to, and that read's findings are the ones
+# printed after it.
+test_a_head_moved_before_the_gate_rereads_the_series() {
+  reset
+  SERIES_JSON_FIRST="[$(commit_row old-sha 'Nothing here')]"
+  SERIES_JSON="[$(commit_row old-sha 'Nothing here'),$(commit_row head-sha 'Resolves #31 and #32')]"
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge lands ($MERGE_OUTPUT)"
+  assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 2 "the series is read again for the gated head"
+  assert_contains "$MERGE_STDOUT" "commit head-sha: ONE sentence, 2 issues: #31 #32" \
+    "and the new commit's finding is reported"
+}
+
+# The series is read WHOLE or not at all, and a scan that did not run says so rather than going
+# quiet -- without refusing the merge, which a warning never does.
+test_an_unread_or_partial_series_says_the_scan_did_not_run() {
+  reset
+  SERIES_COUNT=251
+  run_merge
+  assert_eq "$MERGE_RC" 0 "a capped series is not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "has 251 commits and the commits endpoint serves at most 250" \
+    "past the endpoint's cap the scan refuses"
+  assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 0 "without reading a part as the whole"
+  reset
+  SERIES_COUNT=3
+  run_merge
+  assert_eq "$MERGE_RC" 0 "a short read is not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "answered 1 row(s) ending at head-sha, while the PR states 3" \
+    "a row count below the stated count is not the series"
+  assert_contains "$MERGE_OUTPUT" "closing-keyword scan did NOT run" "and says the scan did not run"
+  reset
+  SERIES_FAIL=1
+  run_merge
+  assert_eq "$MERGE_RC" 0 "an unread series is not a gate ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "could not read $REPO#7's commits" "an unread series is named"
+  assert_contains "$MERGE_OUTPUT" "scan did NOT run" "and is not a clean one"
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -1533,6 +1689,12 @@ tests=(
   test_an_open_review_thread_refuses_the_merge
   test_an_unread_thread_connection_refuses_as_transport
   test_a_thread_opened_between_merge_attempts_refuses_the_retry
+  test_a_quoted_closing_sentence_in_a_commit_body_warns
+  test_a_commit_closing_the_pr_own_issue_is_silent
+  test_a_commit_message_is_read_as_written
+  test_the_series_is_read_once_across_merge_attempts
+  test_a_head_moved_before_the_gate_rereads_the_series
+  test_an_unread_or_partial_series_says_the_scan_did_not_run
 )
 
 run_tests "${tests[@]}"
