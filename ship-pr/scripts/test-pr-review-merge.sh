@@ -44,6 +44,8 @@ DEFAULT_BRANCH_FAIL_LATER=""           # nonempty = it answers with a 404 from t
 PR_BODY="A body with nothing to close."  # what the body read answers with
 PR_BODY_LATER=""                       # nonempty = what the SECOND body read on answers with
 BODY_FAIL=""                           # nonempty = the body read answers with a 404
+THREADS_JSON='[]'                      # the PR's review threads (review_thread rows)
+FAIL_GRAPHQL=""                        # nonempty = the review-threads read gets a 503
 # The "from the SECOND read on" switches above are counted by the lib's fixture_call_count, under
 # the names body, base and default-branch: gh_retry calls the fixture inside a command
 # substitution, so a variable it increments dies with that subshell, and the count has to travel
@@ -121,6 +123,15 @@ gh() {
     ;;
   "api graphql")
     case "$*" in
+    *reviewThreads*)
+      printf 'CALL reviewThreads\n' >>"$CALLS_FILE"
+      if [ -n "$FAIL_GRAPHQL" ]; then
+        printf 'gh: 503 No server is currently available to service your request\n' >&2
+        return 1
+      fi
+      gh_fixture_parse "$@"
+      gh_fixture_answer "$(review_threads_answer "$THREADS_JSON" "$@")"
+      ;;
     *mergeQueue*) printf 'CALL %s\n' "$*" >>"$CALLS_FILE"; echo "$MERGE_QUEUE" ;;
     *) bail "unexpected graphql call: $*" ;;
     esac
@@ -187,6 +198,8 @@ reset() {
   PR_BODY="A body with nothing to close."
   PR_BODY_LATER=""
   BODY_FAIL=""
+  THREADS_JSON='[]'
+  FAIL_GRAPHQL=""
 }
 
 # The merge is bound to the head the gate read: a push during a long --wait must not land a head
@@ -1387,6 +1400,39 @@ test_a_retarget_skip_clears_a_clean_earlier_scan() {
     "the lead-time scan does not speak for the landing body"
 }
 
+# ludics-lite#289: an open review thread refuses the merge, whatever head it cites and whatever the
+# build gate said — PR #277's round 6 had two, written against the previous head, under a 👍.
+test_an_open_review_thread_refuses_the_merge() {
+  reset
+  THREADS_JSON="[$(review_thread 4053098120 false),$(review_thread 4053098001 true)]"
+  run_merge
+  assert_eq "$MERGE_RC" 1 "an open thread refuses the merge ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "REFUSING to merge $REPO#7: 1 review thread(s) still UNRESOLVED — 4053098120 by codex[bot] on a.sh" \
+    "the refusal names the open thread by the id resolve takes"
+  assert_not_contains "$MERGE_OUTPUT" 4053098001 "a resolved thread is not named"
+  assert_contains "$MERGE_OUTPUT" "pr-review.sh resolve $REPO#7 <id>" "and says what clears it"
+  assert_no_merge_call
+  # No flag bypasses it: an override is about a red build, not about an open finding.
+  run_merge --override 'unrelated red on the base' --allow-no-verdict
+  assert_eq "$MERGE_RC" 1 "the build overrides do not reach it"
+  assert_no_merge_call
+  # The control: every thread resolved, the merge lands, on ONE read of the threads.
+  THREADS_JSON="[$(review_thread 4053098120 true),$(review_thread 4053098001 true)]"
+  run_merge
+  assert_eq "$MERGE_RC" 0 "with every thread resolved the merge lands ($MERGE_OUTPUT)"
+  assert_eq "$(grep -c -x 'CALL reviewThreads' "$CALLS_FILE")" 1 "one read of the threads per merge"
+}
+
+test_an_unread_thread_connection_refuses_as_transport() {
+  reset
+  FAIL_GRAPHQL=1
+  run_merge
+  assert_eq "$MERGE_RC" 3 "a thread read that did not answer is exit 3"
+  assert_contains "$MERGE_OUTPUT" "whether review threads are still open is UNKNOWN" \
+    "and is not 'none are open'"
+  assert_no_merge_call
+}
+
 tests=(
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
@@ -1457,6 +1503,8 @@ tests=(
   test_a_keyword_inside_a_url_path_is_not_a_directive
   test_the_deferred_merge_note_does_not_claim_an_unread_scan
   test_a_retarget_skip_clears_a_clean_earlier_scan
+  test_an_open_review_thread_refuses_the_merge
+  test_an_unread_thread_connection_refuses_as_transport
 )
 
 run_tests "${tests[@]}"
