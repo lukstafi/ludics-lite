@@ -49,7 +49,7 @@ check passing:
 ~/.claude/skills/wait-and-proceed/scripts/wait-for.sh cmd 'gh issue view 601 --json state --jq .state | grep -q CLOSED'
 ```
 
-Options: `--base` (default `origin/master`), `--timeout` (default 4h), `--interval` (default 60s),
+Options: `--base` (default `origin/master`), `--timeout` seconds (default 14400, i.e. 4h), `--interval` seconds (default 60),
 `--repo`, `--label`. The script does not detect the base branch: on a repository whose base is
 `main`, pass `--base origin/main`, or a branch merged there reads as unlanded until the timeout.
 
