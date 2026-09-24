@@ -186,6 +186,9 @@ install_lid_dropin() {
 # Europe/Zurich), so the default wakes at 06:55. Change both together.
 DEFAULT_WAKE_TIME=06:55
 
+# An endpoint is a hostname, and never `local`: fleet-worker.sh reads that as the box it runs on.
+valid_endpoint() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ && $1 != local ]]; }
+
 valid_wake_time() { [[ $1 =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
 
 wake_timer() {
@@ -340,7 +343,7 @@ main() {
   if [[ " $default_boxes " != *" $box "* ]]; then default_boxes+=" $box"; fi
   prompt 'Fleet endpoints, space separated (same roster on every coordinator)' "$default_boxes"
   local boxes=$REPLY peer
-  for peer in $boxes; do [[ $peer =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || fail "Invalid endpoint: $peer"; done
+  for peer in $boxes; do valid_endpoint "$peer" || fail "Invalid endpoint: $peer (a hostname; 'local' is fleet-worker.sh's name for the coordinator's own box)"; done
   [[ " $boxes " == *" $box "* && " $boxes " == *' mac-studio '* ]] || fail 'Roster must include this endpoint and mac-studio.'
   printf '\nWill install apt packages, user-local CLIs, ~/ludics-lite, skill links, and shell environment.\n'
   ask 'Proceed with the shared setup?' || return 0

@@ -649,17 +649,18 @@ done
 gh_down=""
 # The fleet's PAT file (2026-09-24), checked whatever `gh api user` answers, since a live token
 # that is not the file's is a per-box credential again: it must be a regular file this user owns,
-# mode 0600/0400 (`ls -ln` reads that alike on GNU and BSD), and the session's GH_TOKEN must be
+# mode 0600/0400 (`ls -lnd` reads that alike on GNU and BSD), and the session's GH_TOKEN must be
 # the one it exports (sourced in a subshell only once it passed; no value is printed). Each
 # repair replaces the file with a fresh regular one or names the startup line to fix.
 tokf="$HOME/.config/fleet/gh-token.sh"; tokbad=""; qbox=$(printf '%q' "$BOX")
 case "$BOX" in local) tokcopy="replace it here with a regular 0600 file holding the fleet PAT (export GH_TOKEN=ghp_...)" ;;
   *) tokcopy="replace it from the anchor: ssh $qbox 'f=~/.config/fleet/gh-token.sh; umask 077; cat > \"\$f.new\" && chmod 600 \"\$f.new\" && mv \"\$f.new\" \"\$f\"' < ~/.config/fleet/gh-token.sh" ;; esac
 if [ -e "$tokf" ] || [ -L "$tokf" ]; then
-  tokbad=1; tls=$(ls -ln "$tokf" 2>/dev/null)
+  tokbad=1; tls=$(ls -lnd "$tokf" 2>/dev/null)
   case "$tls" in "-rw------- "*|"-r-------- "*) [ "$(printf '%s' "$tls" | awk '{print $3}')" != "$(id -u)" ] || tokbad="" ;; esac
   if [ -n "$tokbad" ]; then
-    note "~/.config/fleet/gh-token.sh on $BOX is not a regular mode-0600 file this user owns ($(printf '%s' "$tls" | awk '{print $1, "uid", $3}')): the PAT in it may be readable by others -- repair: $tokcopy"
+    tokfix=$tokcopy; [ ! -d "$tokf" ] || [ -L "$tokf" ] || tokfix="remove the directory there first (mv would move the new file into it), then $tokcopy"
+    note "~/.config/fleet/gh-token.sh on $BOX is not a regular mode-0600 file this user owns ($(printf '%s' "$tls" | awk '{print $1, "uid", $3}')): the PAT in it may be readable by others -- repair: $tokfix"
   else
     # An empty GH_TOKEN is no token to gh: it falls back to GITHUB_TOKEN or a stored login.
     ftok=$(unset GH_TOKEN; . "$tokf" >/dev/null 2>&1; printf '%s' "${GH_TOKEN-}")

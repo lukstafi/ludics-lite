@@ -792,7 +792,10 @@ printf 'export GH_TOKEN=ghp_dead\n' > "$HOME/.config/fleet/gh-token.sh"
 chmod 644 "$HOME/.config/fleet/gh-token.sh"
 expect "a group-readable gh-token.sh refuses even with a live token, with the replace-the-file repair" 1 "gh-token.sh on testbox is not a regular mode-0600 file this user owns (-rw-r--r-- uid [0-9]*).*repair: replace it from the anchor" -- \
   env GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross
-rm "$HOME/.config/fleet/gh-token.sh"; ln -s /dev/null "$HOME/.config/fleet/gh-token.sh"
+rm "$HOME/.config/fleet/gh-token.sh"; mkdir "$HOME/.config/fleet/gh-token.sh"
+expect "...and a directory, whose repair removes it before the copy" 1 "gh-token.sh on testbox is not a regular mode-0600 file this user owns (d.*repair: remove the directory there first" -- \
+  env GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross
+rmdir "$HOME/.config/fleet/gh-token.sh"; ln -s /dev/null "$HOME/.config/fleet/gh-token.sh"
 expect "...and so does a symlink" 1 "gh-token.sh on testbox is not a regular mode-0600 file this user owns (l" -- \
   env GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross
 rm "$HOME/.config/fleet/gh-token.sh"
