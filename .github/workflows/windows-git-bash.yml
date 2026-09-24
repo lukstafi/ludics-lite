@@ -35,7 +35,7 @@ jobs:
   git-bash:
     name: Git Bash suites, ship-pr (windows)
     runs-on: windows-latest
-    # The cleanup step is capped at 20 below; ludics-lite#337 owns the job's runtime.
+    # The cleanup step is capped at 20 below.
     timeout-minutes: 60
     defaults:
       run:
@@ -81,13 +81,13 @@ jobs:
       # in the run's annotations.
       - name: post-merge cleanup
         # KNOWN RED until ludics-lite#338 (the cases still failing under Git Bash for reasons other
-        # than #287's transaction, which no longer uses a FIFO) and #337 (the runner self-tests
-        # whose per-case deadline does not fire under MSYS) land. Whichever of the two lands last
-        # removes this line. Do not exclude cases by name instead.
+        # than #287's transaction, which no longer uses a FIFO) lands; that change removes this
+        # line. Do not exclude cases by name instead.
         id: cleanup
         continue-on-error: true
-        # The suite's per-case deadline does not fire under Git Bash (ludics-lite#337); this cap is
-        # the backstop that keeps the pr-review suites below a verdict.
+        # The suite ends on its own here since ludics-lite#337 (its per-case deadline fires under
+        # MSYS, and it prints its summary): 846s at -j 4 on the run that landed that fix. The cap
+        # is the backstop for a runner that stops making progress, not the suite's end.
         timeout-minutes: 20
         if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-post-merge-cleanup.sh') }}
         env:

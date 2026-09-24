@@ -105,7 +105,11 @@ upstream main and refuses on a dirty or diverged checkout. That pull-side step i
 propagates merged skill edits to boxes that slept through the merge. A headless worker also
 needs the box's CLI logged in: `claude auth login` for Claude workers (an expired OAuth session
 cannot refresh headless, and `claude auth status` does not notice) and `codex login` for Codex
-CLI ones. The CLI preflight proves both with a live call, not a status read.
+CLI ones. The CLI preflight proves both with a live call, not a status read. Every worker, native
+or CLI, also needs the box's `gh` authenticated for a non-interactive ssh session (it pushes and
+opens the PR with it): the preflight calls `gh api user` from that session kind and refuses a
+rejected token with the repair, `ssh -t <box> 'gh auth login -h github.com -p https -w && gh auth
+setup-git'`.
 Provider/model, launch transport and execution placement are separate choices. Both Codex and
 Claude Code support their own native subagents in coordinator-created external worktrees, or
 CLI workers launched with `--kind codex` or `--kind claude`. Only the CLI route provides
@@ -200,7 +204,15 @@ unverified release keeps its record, because the guest pid and token in it are t
 later `unhold` could finish the job with; run it again when the box answers.
 
 `restart-wsl` and the power verbs take **both** and refuse the box if either is held, until the
-holder lets go or `--force` takes it anyway. The OCANNL cross-machine sweep reserves each box's
+holder lets go or `--force` takes it anyway. A lock file's line outlives its holder (the kernel
+drops the flock when the holder dies, and nothing rewrites the line), so reading the files cannot
+say whether anything is using a box. `wake-lab.sh status` asks the flocks instead
+(ludics-lite#359): `lane-lock=` and `hold-lock=` read `held` when a destroyer would be refused
+now, with the holder's line and its age under the box, or `free`, with any leftover line shown as
+stale text. The probe is a non-blocking shared take on a descriptor of its own, gone as it exits,
+so it creates and writes nothing and is safe beside a running sweep. `reservations=` counts the
+active `fleet-worker.sh execution list` records naming the box and lists them; it reads `?`, never
+0, when that registry could not be read. The OCANNL cross-machine sweep reserves each box's
 lane lock for the length of its lane — on 2026-09-16, before any of this existed, a restart issued
 mid-sweep destroyed both GPU boxes' VMs and cost that run both GPU units. The split into two locks
 came later, on 2026-09-18: while one lock said both things, the sweep routine's own `--hold` in
@@ -227,7 +239,7 @@ lore in `wake-lab.sh` and the Windows/WSL lessons in `wake-lab-wsl.sh`, the rout
 ssh aliases and all of the logic. `wake-lab.sh --help` prints the common header, and
 `--help` and `--list` are the two commands that work before the host table exists. The box names
 (`rog`, `minix`, `tuf`) and the ssh aliases are the author's and are edited in place. The aliases
-live in one endpoint map, `endpoints_of` in `wake-lab.sh`: one row per box, listing each OS it can
+live in one endpoint map, `ENDPOINT_MAP` in `wake-lab.sh`: one row per box, listing each OS it can
 boot (`linux`, `win`, `wsl`, and a `lan` route to Windows). Validation, `status`, the waits and the
 WSL adapter all read that row, and a row that is incomplete (a Windows endpoint with no guest, a
 half-renamed alias, a misspelt key) is refused before anything is sent (ludics-lite#314). `all`
@@ -475,8 +487,11 @@ from its source — inline link syntax, an HTML tag, a character entity — or w
 past ASCII, is one whose anchor it will not spell: it reports no slug and says so, rather than
 answering with the source reading, which would refuse the right anchor and accept one GitHub never
 creates. It also holds `ship-pr/SKILL.md` to `post-merge-cleanup.sh`'s own option register: every
-option the helper's `usage()` heredoc lists is named, verbatim, somewhere in the prompt, and every
-`--option` the prompt's fenced command lines pass to the helper is one the heredoc lists. Which
+option the helper's usage text lists is named, verbatim, somewhere in the prompt, and every
+`--option` the prompt's fenced command lines pass to the helper is one that text lists. The text is
+read by running the helper with no arguments, its usage error; the helper prints its listing from
+the same one option table its parse loop reads, so a listing and a parser that disagree on an
+option's value (ludics-lite#302) have no second copy to drift in (ludics-lite#332). Which
 `--flag` in the prompt is the helper's is a line shape — a fenced line naming
 `post-merge-cleanup.sh`, plus the lines a trailing backslash continues it onto — so a flag of `gh`
 or of the test runner is attributed to nothing, and an option the prompt only discusses is held
@@ -554,8 +569,10 @@ is selected, and a section that needs more than that, such as the coordinator le
 worker to read, takes it itself, so every section also passes when it is the only one selected.
 
 `test-wake-lab-linux.sh` exercises native Ubuntu status, wake and power handling with the WSL
-adapter absent, and the endpoint map: a fixture box added to a copy of the script is probed from its
-row alone, and each incomplete shape of that row is refused with nothing sent. `test-wake-lab.sh` runs the WSL path against shim `curl`, `python3` and `ssh` on PATH, so it
+adapter absent, including the lab-lock columns (a held lock, a free one with a stale line, and no
+file at all, with status leaving every file and holder as it found them) and the reservation count
+from a stub registry reader, and the endpoint map: a fixture box added to a copy of the script is
+probed from its row alone, and each incomplete shape of that row is refused with nothing sent. `test-wake-lab.sh` runs the WSL path against shim `curl`, `python3` and `ssh` on PATH, so it
 touches neither the router nor the network. It pins the split above from both sides: that every
 MAC the script sends comes from the sourced host table and that a missing, incomplete or
 short-a-target one is refused before any router traffic, and that no MAC-shaped literal is tracked
@@ -702,7 +719,16 @@ classified against the new head rather than matched to the one it named (the lud
 ordering, now a property of the round); a push landing AFTER the round's head read cannot
 re-anchor the state to a head the round classified nothing against (the P2 rebutted in the review
 of ludics-lite#84); and a round that did not answer publishes nothing, so the state read after it
-reads the feeds itself, as does a `status` asked after the watch has ended.
+reads the feeds itself, as does a `status` asked after the watch has ended. And an approval is
+reported only over closed threads (ludics-lite#289): one with an open review thread under it is
+`unresolved`, naming each thread, on the one GraphQL `reviewThreads` read that only an approval
+costs; that read pages to the end, and a connection whose stated count leads its rows, one still
+paging at the cap, a row that did not parse and a GraphQL outage are each `unknown` (exit 3),
+never a clean approval. `test-pr-review-watch.sh` runs PR #277's two-head shape through a watch
+(findings on the previous head scrolled past as NOT about head, the 👍 on the head above it), and
+`test-pr-review-merge.sh` pins `merge` refusing on an open thread (exit 1, no flag bypassing it)
+and on an unread connection (exit 3), with one read per merge attempt, so a thread opened
+between attempts refuses the retry.
 `test-pr-review-base-drift.sh` pins the other half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
 which stands still on a conflicted PR.
 
@@ -740,7 +766,11 @@ withholds the verdict for a transport exit instead of claiming the reviewer said
 when that changes nothing, so the extra poll is not proved by the hit alone — and the round it
 finds beats the nudge it would have recommended. The `expected` clock is here too: it starts no
 earlier than the PR's own creation, still runs from the head's committer date on an older PR, and
-survives a committer date in the future.
+survives a committer date in the future. The connector's "About Codex in GitHub" block at the tail
+of a review or comment body renders as one line (ludics-lite#358), with the findings above it
+intact; each way out of its exact-text boundary (a near-miss opener, an unterminated block, text
+after it, a second `</details>`, an inline finding, an opener quoted above the real block) has its
+own case rendering the body as-is.
 
 `test-pr-review-reply.sh` covers the two WRITING commands, which had no fixture coverage at all
 until it (ludics-lite#76): every other suite drives a read path, and a double-posted reply is not

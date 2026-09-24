@@ -331,7 +331,9 @@ Reviewer activity about some other commit is a *previous* round scrolling past a
 watermark: it is printed on stderr for the record, the watermark advances past it so it never
 comes back, and the window keeps waiting. That is the shape this repository hit — one window
 exited on a round's inline findings, the reviewer's separate summary review landed seconds later
-with a higher id, and the next window woke on it at once with nothing to do.
+with a higher id, and the next window woke on it at once with nothing to do. Moving past a finding
+is not closing it, though: a scrolled-past finding whose thread is still open keeps an approval
+from reading clean (`unresolved`, below) and keeps `merge` refusing.
 
 So read the line each exit ends on, which now says what it ended *on*: the item's own descriptor
 (`ending the wait on review id=… state=… commit=… by …`) when a round ended it, and the head the
@@ -345,6 +347,8 @@ that way, both times dropping real findings. After any exit 0, enumerate the rou
 yourself from the feeds, by id above the watermark you PASSED IN — `watch` prints the advanced one
 back, and ids above that are the next round's (`status`, or the comment APIs) — and address
 THAT list; cross-check the count against what the watch claimed before replying/resolving.
+`poll` folds the connector's fixed "About Codex in GitHub" block at a body's tail into one
+`[Codex "About Codex in GitHub" boilerplate folded]` line; nothing else is folded.
 
 On every exit 0 but an approval, `watch` also prints (on stderr, so a round's stdout stays
 poll's) the base-drift read that `merge` otherwise makes last: how many commits behind its base
@@ -514,17 +518,29 @@ The 👀 reaction is the one signal you cannot read on its own. It is a level, n
 app does not reliably take it back: on #364 a 👀 outlived the review it announced by an hour, and
 three consecutive 15-minute windows reported "reviewing — wait it out" over a PR nothing was
 reading. So `status` crosses the reactions with what the reviewer has actually posted and with the
-head SHA, and answers with one of seven:
+head SHA, and answers with one of eight:
 
 | state | means | what to do |
 | --- | --- | --- |
-| `approved` | 👍 is on the PR, with no newer current-head running review or findings | merge |
+| `approved` | 👍 is on the PR, with no newer current-head running review or findings, and no review thread left unresolved | merge |
+| `unresolved` | that same 👍, over review threads still open — whatever head they cite | answer each thread and `resolve` it; `merge` refuses until none is open |
 | `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
 | `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
 | `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) |
 | `expected` | no live 👀, and no review of the head SHA: a round is due and has not started | wait out the grace, then `@codex review` |
 | `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push — or, at one of the loop's exits (below), close out and merge |
 | `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
+
+`unresolved` is the approval over findings nobody closed (ludics-lite#289). On PR #277's round 6
+the reviewer left two findings on the previous head and put its 👍 on the base-merge commit above
+it; `watch` printed the findings as NOT about head, moved past them, and reported `approved`. The
+merge had changed neither line, so both were live in the head about to be merged. An open thread
+is therefore read as a live finding whatever head it cites — `status`, and `watch` when an
+approval ends its wait, read every review thread (GraphQL, paged to the end) before reporting the
+👍, and `merge` refuses while any is open, with no flag to bypass it. Clearing it needs no push:
+answer each thread named on the line (a fix or a rebuttal, `reply`) and close it (`resolve`). A
+thread read that fails is `unknown`, never a clean approval. Whether the head changed a finding's
+lines is not checked: every open thread counts, an outdated one or a human's included.
 
 `failed` is the reviewer telling you its own clone is behind: the ref it says does not exist is
 one the PR's `head.sha` and `git ls-remote` both serve, so nothing about your push is wrong and
@@ -547,7 +563,7 @@ applies. This structural check does not classify plain, unstamped setup messages
 
 Every one of those lines also says **`CONFLICTS with the base (mergeable_state=dirty)`** when
 GitHub cannot build the PR's merge commit, and on `idle` that replaces "the next move is yours".
-It is not a seventh state — the reviewer keeps reviewing a conflicted PR — but it changes what a
+It is not another state — the reviewer keeps reviewing a conflicted PR — but it changes what a
 round is worth: GitHub creates no `pull_request` workflow run for a head whose merge commit it
 cannot build, so every push made after the conflict is one CI does not test against the base (a
 run that completed before the base moved still stands, but it tested an older merge). On
@@ -575,9 +591,10 @@ before your next push is a round that is genuinely running, and #358 had exactly
 20:34:13Z, head committed 20:35:01Z) twenty minutes after #364 had the stale one.
 
 The whole polling and merge-gate path is REST: GitHub's GraphQL endpoint 503s independently of REST,
-and a GraphQL-borne silence is indistinguishable from a reviewer's. Thread resolution is the one
-GraphQL-only operation left, and it reports a transport failure as a retry rather than as a missing
-thread.
+and a GraphQL-borne silence is indistinguishable from a reviewer's. Review threads are the one
+GraphQL-only subject left, having no REST field for resolution: `resolve` reports a transport
+failure as a retry rather than as a missing thread, and the open-thread read an approval and
+`merge` make (above) reports it as `unknown` and exit 3, never as "none are open".
 
 ### When the loop ends
 
@@ -674,7 +691,8 @@ Then merge:
 ~/.claude/skills/ship-pr/scripts/pr-review.sh merge <owner>/<repo>#<pr> --require-green --wait
 ```
 
-`merge` (below) reads the build signal, not the 👍. The maintainer reads in the record what was
+`merge` (below) reads the build signal and the open review threads, not the 👍 — so the
+"resolved" in the second bullet is one it checks. The maintainer reads in the record what was
 not done and why, instead of finding it in the next PR's review. Under Claude Code's auto mode,
 ask for this merge in the message carrying the record, not after trying it (*PR or direct commit?*).
 
@@ -712,6 +730,12 @@ open the run, fix the build, push, merge.
 It refuses on an unreadable signal too (exit 3). An unread check list is not a green one — that
 distinction is why these reads are REST while `gh pr checks` is GraphQL, which 503s independently
 and answers an outage with an empty list indistinguishable from a PR whose CI never ran.
+
+**It refuses while any review thread is unresolved** (exit 1, naming each by the id `resolve`
+takes; exit 3 when the threads could not be read), whatever head the thread cites and whatever
+the build says — the `unresolved` state above, read before every merge attempt (after any
+`--wait`), since a thread opened meanwhile moves no head for `--match-head-commit` to catch. No flag bypasses it:
+answer and resolve the threads, then re-run `merge`.
 
 The other verdicts are not refusals, and none of them is a green light either:
 
@@ -1073,7 +1097,7 @@ The cases are independent, so they run concurrently, one per processor by defaul
 `SHIP_PR_TEST_JOBS` changes that; `-j 1` is serial): the full suite finishes in about a minute and
 a half on a 4-core CI runner, where the serial run took eight, and in well under a minute on a
 desktop. Each case's output is buffered and printed whole when it completes, so a failure report
-never interleaves with another case; passing cases print only their `PASS:` line unless `-v` asks
+never interleaves with another case; passing cases print only their `PASS <case>:` line unless `-v` asks
 for everything. Failures do not stop the other cases — the closing `FAIL:` line names every case
 that failed. Each case runs in its own process group under a deadline
 (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a case still running at its deadline is

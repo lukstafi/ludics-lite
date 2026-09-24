@@ -226,6 +226,12 @@ gh() {
     response=$(jq -cn --arg d "$HEAD_AT" '{sha:"head-sha", commit:{committer:{date:$d}}}')
     ;;
   "repos/$REPO/commits/main") response='{"sha":"base-sha"}' ;;
+  # The open-thread read an approval is checked with (ludics-lite#289), answered per round like
+  # the feeds: `schedule threads <round> <review_thread rows>`, none by default.
+  graphql)
+    case "$*" in *reviewThreads*) ;; *) bail "unexpected graphql call: $*" ;; esac
+    response=$(review_threads_answer "$(feed_answer threads)" "$@")
+    ;;
   "repos/$REPO/compare/base-sha...$H1?per_page=1" | "repos/$REPO/compare/base-sha...$H2?per_page=1")
     response=$(compare_json 1 2 pr.txt)
     ;;
@@ -1380,7 +1386,215 @@ watermark: 9000,9000,9000')]"
     "a failed round keeps the caller's watermark; a quoted line is not a watermark"
 }
 
+# --- the connector's "About Codex in GitHub" block (ludics-lite#358) -----------------------------
+# The block as the connector serves it, byte for byte from a review of ludics-lite#354 (read
+# through the reviews API on 2026-09-24): LF line ends, U+2139 U+FE0F in the summary, and the
+# whitespace-only lines on either side of the text. Written with printf escapes so the emoji
+# bytes are visible here rather than trusted to an editor.
+CODEX_ABOUT_OPEN=$(printf '<details> <summary>\xe2\x84\xb9\xef\xb8\x8f About Codex in GitHub</summary>')
+codex_about_block() {
+  printf '%s\n<br/>\n\n%s\n%s\n%s\n%s\n\n%s\n\n\n\n\n%s\n            \n</details>' \
+    "$CODEX_ABOUT_OPEN" \
+    '[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you' \
+    '- Open a pull request for review' '- Mark a draft as ready' '- Comment "@codex review".' \
+    "$(printf 'If Codex has suggestions, it will comment; otherwise it will react with \xf0\x9f\x91\x8d.')" \
+    'Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".'
+}
+# A review body in the connector's shape: its header, the text before the block, the stamp, then
+# the block. <before-block> is what a case puts between the stamp and the opener.
+codex_review_body() { # <commit> <before-block> <block>
+  printf '\n### \xf0\x9f\x92\xa1 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `%s`\n    \n%s\n\n%s' \
+    "${1:0:10}" "$2" "$3"
+}
+CODEX_FOLDED='[Codex "About Codex in GitHub" boilerplate folded]'
+CODEX_BOILERPLATE='Your team has set up Codex'
+
+# The shape the issue was filed on, in both bodies the connector writes it into: a review, and a
+# comment. The comment carries the block with other text inside (the connector writes such a
+# variant too, which is why the interior is not read). The findings above the block stay whole, and
+# the block is one line.
+test_the_about_codex_block_is_folded_to_one_line() {
+  reset_fixture
+  local finding variant
+  finding=$(printf 'P1: the sweep deletes a live run directory.\nIt reads the lock after the rm.')
+  schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z \
+    "$(codex_review_body "$H2" "$finding" "$(codex_about_block)")")]"
+  variant=$(printf '%s\n<br/>\n\nCodex reacts with \xf0\x9f\x91\x80 while any review is running.\n\n</details>' \
+    "$CODEX_ABOUT_OPEN")
+  # The verdict comment's shape (ludics-lite#136): the stamp, then the block.
+  schedule comments 1 "[$(summary_comment 700 2026-09-01T10:00:00Z \
+    "$(printf 'Codex Review: Didn'"'"'t find any major issues.\n\n**Reviewed commit:** `%s`\n\n%s' \
+      "${H2:0:10}" "$variant")")]"
+  run_poll
+  assert_eq "$POLL_RC" 0 "the round succeeds"
+  assert_contains "$POLL_OUT" "$finding" "the findings above the block are rendered intact"
+  assert_contains "$POLL_OUT" "**Reviewed commit:** \`${H2:0:10}\`" "and so is the stamp"
+  assert_eq "$(occurrences "$POLL_OUT" "$CODEX_FOLDED")" 2 "each body's block is ONE line"
+  assert_not_contains "$POLL_OUT" "$CODEX_BOILERPLATE" "the review's block text is gone"
+  assert_not_contains "$POLL_OUT" "while any review is running" "and so is the comment's variant"
+  assert_not_contains "$POLL_OUT" "About Codex in GitHub</summary>" "opener included"
+  assert_not_contains "$POLL_OUT" "</details>" "closer included"
+  # Rendering only: the stamp, the index and the watermark are what they were.
+  assert_contains "$POLL_OUT" "--- summary id=700 commit=${H2:0:7}" "the summary keeps its stamp"
+  assert_contains "$POLL_OUT" "items:  summary:700:${H2:0:7}" "the index is untouched"
+  assert_contains "$POLL_OUT" "review:800:${H2:0:7}" "for the review too"
+  assert_contains "$POLL_OUT" "watermark: 0,700,800" "and so is the watermark"
+}
+
+# The boundary is one exact shape, and each way out of it renders the body byte for byte: the
+# opener without the emoji, without its variation selector, with other spacing, or with another
+# summary; an unterminated block; a block with text after it; and a block holding a second
+# `</details>`. And an inline finding is never folded, whatever it carries.
+test_what_is_not_the_about_codex_block_renders_as_is() {
+  local body case_name
+  local -a cases=(
+    'no emoji' '<details> <summary>About Codex in GitHub</summary>'
+    'no variation selector' "$(printf '<details> <summary>\xe2\x84\xb9 About Codex in GitHub</summary>')"
+    'no space' "$(printf '<details><summary>\xe2\x84\xb9\xef\xb8\x8f About Codex in GitHub</summary>')"
+    'another summary' "$(printf '<details> <summary>\xe2\x84\xb9\xef\xb8\x8f About Codex in GitLab</summary>')"
+  )
+  local i=0
+  while [ "$i" -lt "${#cases[@]}" ]; do
+    case_name="${cases[$i]}"
+    body=$(codex_review_body "$H2" "a finding" \
+      "$(codex_about_block | sed "1s|.*|${cases[$((i + 1))]}|")")
+    reset_fixture
+    schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z "$body")]"
+    run_poll
+    assert_eq "$POLL_RC" 0 "$case_name: the round succeeds"
+    assert_contains "$POLL_OUT" "$body" "$case_name: a near-miss opener renders the body as-is"
+    assert_not_contains "$POLL_OUT" "$CODEX_FOLDED" "$case_name: and folds nothing"
+    i=$((i + 2))
+  done
+
+  # The sed above must have produced the near-misses, not the real opener: the control is the same
+  # construction with the real opener, which folds.
+  reset_fixture
+  body=$(codex_review_body "$H2" "a finding" \
+    "$(codex_about_block | sed "1s|.*|${CODEX_ABOUT_OPEN}|")")
+  schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z "$body")]"
+  run_poll
+  assert_contains "$POLL_OUT" "$CODEX_FOLDED" "control: the same construction with the real opener folds"
+
+  local block unterminated
+  block=$(codex_about_block)
+  unterminated="${block%</details>}"
+  local -a shapes=(
+    'unterminated' "$(codex_review_body "$H2" "a finding" "$unterminated")"
+    'text after the block' "$(codex_review_body "$H2" "a finding" "$block")
+P2: a finding the connector wrote below the block."
+    'a second closer' "$(codex_review_body "$H2" "a finding" "$block
+</details>")"
+  )
+  i=0
+  while [ "$i" -lt "${#shapes[@]}" ]; do
+    case_name="${shapes[$i]}"
+    body="${shapes[$((i + 1))]}"
+    reset_fixture
+    schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z "$body")]"
+    run_poll
+    assert_eq "$POLL_RC" 0 "$case_name: the round succeeds"
+    assert_contains "$POLL_OUT" "$body" "$case_name: renders the body as-is"
+    assert_not_contains "$POLL_OUT" "$CODEX_FOLDED" "$case_name: and folds nothing"
+    i=$((i + 2))
+  done
+
+  reset_fixture
+  body=$(printf 'a finding\n\n%s' "$block")
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$body")]"
+  run_poll
+  assert_contains "$POLL_OUT" "$body" "an inline finding renders as-is, block and all"
+  assert_not_contains "$POLL_OUT" "$CODEX_FOLDED" "and is never folded"
+}
+
+# A finding that QUOTES the opener sits above the real block. Only the block that ends the body is
+# folded: the quoted opener, and every finding between it and the real block, render intact.
+test_a_quoted_opener_above_the_block_keeps_the_findings() {
+  reset_fixture
+  local finding
+  finding=$(printf 'P2: poll matches `%s` too loosely.\n\nP3: and a second finding after the quote.' \
+    "$CODEX_ABOUT_OPEN")
+  schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z \
+    "$(codex_review_body "$H2" "$finding" "$(codex_about_block)")")]"
+  run_poll
+  assert_eq "$POLL_RC" 0 "the round succeeds"
+  assert_contains "$POLL_OUT" "$finding" "the findings, quoted opener and all, are intact"
+  assert_eq "$(occurrences "$POLL_OUT" "$CODEX_FOLDED")" 1 "the real block is folded"
+  assert_not_contains "$POLL_OUT" "$CODEX_BOILERPLATE" "and its text is gone"
+}
+
+# --- an approval over the findings the watch scrolled past (ludics-lite#289) ---------------------
+# PR #277, round 6, as it was: two inline findings written against the previous head, the 👍 on the
+# base-merge commit above it. The round classifies the findings NOT about head and moves past them
+# — correctly, they are not this head's round — and the approval then ends the wait. What it must
+# not do is end it as a clean `approved`: the merge changed neither line, so both findings were live
+# in the head about to be merged, and the threads carrying them were still open.
+two_head_fixture() { # <resolved: true|false>
+  reset_fixture
+  schedule reviews 1 "[$(review 4053090000 "$H1" 2026-09-01T00:01:00Z)]"
+  schedule inline 1 "[$(inline_comment 4053098120 "$H1" "$H2" 'P2: a live defect'),$(inline_comment 4053098122 "$H1" "$H2" 'P2: another' b.sh 9)]"
+  schedule reactions 1 "[$(reaction +1 2026-09-01T00:05:00Z)]"
+  schedule threads 1 "[$(review_thread 4053098120 "$1"),$(review_thread 4053098122 "$1" b.sh)]"
+}
+
+test_an_approval_over_findings_scrolled_past_is_not_clean() {
+  two_head_fixture false
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "an approval ends the wait"
+  assert_contains "$WATCH_ERR" "item(s) NOT about head ${H2:0:7}" \
+    "the findings on the previous head are still classified as not this head's round"
+  assert_contains "$WATCH_ERR" "a thread among them left unresolved still holds an approval back" \
+    "and the record of them says an open one still counts"
+  local last
+  last=$(grep -v '^watermark: ' <<<"$WATCH_OUT" | tail -1)
+  assert_contains "$last" "BUT 2 review thread(s) still UNRESOLVED — NOT a clean approval" \
+    "the approval is reported over the open threads, not as a clean approval"
+  assert_contains "$last" "4053098120 by codex[bot] on a.sh, 4053098122 by codex[bot] on b.sh" \
+    "naming both findings the watch moved past"
+  assert_eq "$(grep -c -x graphql "$REQUEST_LOG" || true)" 1 \
+    "one thread read, on the round the approval ends"
+  # The control: the same two heads with both threads answered and closed is a clean approval.
+  two_head_fixture true
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "the approval ends the wait"
+  last=$(grep -v '^watermark: ' <<<"$WATCH_OUT" | tail -1)
+  assert_eq "$last" "approved (👍 from $REVIEWER)" "with every thread resolved it is clean"
+}
+
+test_an_approval_landing_in_the_final_poll_is_checked_too() {
+  # watch_end's approval: the 👍 landing while a no-review verdict was being read. It ends the wait
+  # as any approval does, so it is checked for open threads the same way.
+  reset_fixture
+  retune GRACE=1
+  schedule reactions 2 "[$(reaction +1 2026-09-01T00:02:00Z)]"
+  schedule threads 1 "[$(review_thread 4053098120 false)]"
+  run_watch 0,0,0 5 1
+  assert_eq "$WATCH_RC" 0 "an approval is something to act on"
+  assert_contains "$WATCH_OUT" "the 👍 landed while it was being read" "the verdict is dropped for it"
+  assert_contains "$WATCH_OUT" "BUT 1 review thread(s) still UNRESOLVED" \
+    "and the approval is reported over its open thread"
+}
+
+test_an_approval_beside_a_final_poll_round_is_checked_too() {
+  # watch_end's other exit: the final poll finds a round about the head, and the 👍 is newer than
+  # it, so the state printed beside that round is an approval — checked like any other (review of
+  # #370, round 1), never a clean `status: approved` over an older open thread.
+  reset_fixture
+  retune GRACE=1
+  schedule inline 2 "[$(inline_comment 4095735684 "$H2" "$H2" 'a finding on this head')]"
+  schedule reactions 2 "[$(reaction +1 2026-09-01T00:02:00Z)]"
+  schedule threads 1 "[$(review_thread 4053098120 false)]"
+  run_watch 0,0,0 5 1
+  assert_eq "$WATCH_RC" 0 "the round the final poll found is the exit"
+  assert_contains "$WATCH_OUT" "--- inline id=4095735684" "and it is printed as the round"
+  assert_contains "$WATCH_ERR" "status: approved (👍 from $REVIEWER) BUT 1 review thread(s) still UNRESOLVED" \
+    "the approval beside it is reported over the open thread"
+}
+
 tests=(
+  test_the_about_codex_block_is_folded_to_one_line
+  test_what_is_not_the_about_codex_block_renders_as_is
+  test_a_quoted_opener_above_the_block_keeps_the_findings
   test_a_broken_jq_program_fails_the_poll_round
   test_a_failed_round_takes_no_watermark_from_a_quoted_line
   test_current_head_evidence_handles_unknown_age_footer_and_large_feeds
@@ -1429,6 +1643,9 @@ tests=(
   test_the_review_clock_starts_no_earlier_than_the_pr
   test_a_future_commit_date_does_not_blind_the_clock
   test_a_clockless_expected_state_says_so_rather_than_guessing
+  test_an_approval_over_findings_scrolled_past_is_not_clean
+  test_an_approval_landing_in_the_final_poll_is_checked_too
+  test_an_approval_beside_a_final_poll_round_is_checked_too
 )
 
 run_tests "${tests[@]}"

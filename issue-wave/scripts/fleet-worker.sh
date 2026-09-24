@@ -117,6 +117,7 @@
 #   FLEET_PROBE_TIMEOUT: wall-clock bound on the live headless preflight turn; 120.
 #   FLEET_CROSS_TIMEOUT: wall-clock bound on each cross-box ssh reach probe of the preflight; 20.
 #   FLEET_FETCH_TIMEOUT: wall-clock bound on skills-checkout and project fetches; 300.
+#   FLEET_GH_TIMEOUT: wall-clock bound on the preflight's `gh api user` credential call; 30.
 
 set -uo pipefail
 
@@ -456,7 +457,7 @@ anchor_gate() {
 # the per-launch refusal the skill promises is enforced here rather than remembered.
 preflight_script() {
   cat <<'EOF'
-codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4" cross="$5" cross_timeout="$6"
+codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4" cross="$5" cross_timeout="$6" gh_timeout="$7"
 refuse=""
 note() { refuse="$refuse; $*"; }
 # One preflight per box at a time: a parallel group launched together would otherwise race
@@ -466,7 +467,7 @@ mkdir -p "$STATE" 2>/dev/null; plock="$STATE/preflight.lock"
 # The wait covers everything a holder may legitimately spend: the fetch, the live probe, and one
 # cross-box timeout per sibling, since the reach probes run serially under this lock.
 nsib=0; for _s in $cross; do nsib=$((nsib + 1)); done
-msg=$(take_lock "$plock" $((fetch_timeout + probe_timeout + 60 + cross_timeout * nsib)) "PREFLIGHT REFUSED $BOX") || { echo "$msg"; exit 1; }
+msg=$(take_lock "$plock" $((fetch_timeout + probe_timeout + gh_timeout + 60 + cross_timeout * nsib)) "PREFLIGHT REFUSED $BOX") || { echo "$msg"; exit 1; }
 trap 'release_lock "$plock"' EXIT
 repo=$(expand_tilde "$SKILLS_REPO")
 if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
@@ -587,11 +588,51 @@ for sibling in $cross; do
     *) cross_down="$cross_down $sibling" ;;
   esac
 done
+# GitHub credential (ludics-lite#360): a worker on this box pushes and opens its PR with this
+# box's `gh` (git's credential helper here too), and on 2026-09-23 a dead keyring token surfaced
+# an hour into a worker's task, and another worker routed around it with a copied token. So the
+# preflight makes the call a worker makes, `gh api user`, from the same kind of session: this
+# script runs as a non-interactive `ssh <box> bash -s` (or a local child on the anchor), which is
+# NOT the box's desktop console. On 2026-09-24 minix's `gh auth status` was reported green at the
+# desktop while its token answered HTTP 401 over non-interactive ssh, and rog's gh 2.46 exited 0
+# from `auth status` over "The token in keyring is invalid", so neither a console nor a status
+# read is the proof. Classification is a fail-closed allowlist: a login on stdout with exit 0 passes; a
+# call with no answer in time, gh's "error connecting to" (DNS, TCP, TLS) or an HTTP 5xx means
+# GitHub did not answer, which is noted on the OK line like a sleeping sibling (git fetch above
+# already refuses a box that cannot reach GitHub at all); everything else - a 401, gh's "gh auth
+# login" hint, any output this list does not name - refuses with the user-side repair.
+# Boundary: it proves what `gh api --hostname github.com user` answers in this session - the
+# session a native worker, a leg and a NEW tmux server get. It does not read a running tmux
+# server's environment (a CLI worker inherits that; tmux_env_check compares its build variables
+# only), the git credential helper a push uses, or a token /user does not accept (an app
+# installation token): those are ludics-lite#374, not this check.
+gh_down=""
+if ! command -v gh >/dev/null 2>&1; then
+  note "no gh on PATH in a non-interactive session on $BOX (a worker here cannot open its PR)"
+else
+  ghout=$(GH_PROMPT_DISABLED=1 bounded "$gh_timeout" gh api --hostname github.com user -q .login); ghrc=$?
+  ghlast=$(printf '%s\n' "$ghout" | sed '/^[[:space:]]*$/d' | tail -n1 | sed 's/^.*}gh: /gh: /' | cut -c1-120)
+  if [ "$ghrc" -eq 0 ] && [ -n "$ghlast" ]; then :
+  elif [ "$ghrc" -eq 124 ]; then gh_down="no answer from gh api user in ${gh_timeout}s"
+  else
+    case "$ghout" in
+      *"error connecting to "*|*"(HTTP 5"[0-9][0-9]")"*) gh_down="gh api user: $ghlast" ;;
+      *)
+        case "$BOX" in local) repair="in a terminal on this box: gh auth login -h github.com -p https -w && gh auth setup-git" ;;
+          *) repair="ssh -t $(printf '%q' "$BOX") 'gh auth login -h github.com -p https -w && gh auth setup-git'" ;; esac
+        # An exported token outranks the stored login, and `gh auth login` refuses while one is
+        # set, so the stored-login repair alone would never take.
+        envtok=""; for v in GH_TOKEN GITHUB_TOKEN; do [ -z "${!v+x}" ] || envtok="${envtok:+$envtok and }$v"; done
+        [ -z "$envtok" ] || repair="remove the $envtok this session exports (it outranks gh's stored login and blocks gh auth login) from $BOX's shell startup, then restart any tmux server that inherited it; for the stored login: $repair"
+        note "GitHub credential refused in a non-interactive session on $BOX (gh api user: ${ghlast:-exit $ghrc, no output}); a green \`gh auth status\` at the box's desktop console does not prove the token a worker's ssh session reads -- repair: $repair" ;;
+    esac
+  fi
+fi
 if [ -n "$refuse" ]; then
   echo "PREFLIGHT REFUSED $BOX: ${refuse#; }${other:+ (changes outside the served tree, ignored: $other)}"
   exit 1
 fi
-echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (changes outside the served tree, ignored: $other)}${cross_down:+ (cross-box unreachable, asleep or off the network:$cross_down)}${sleep_guard:+ ($sleep_guard)}"
+echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (changes outside the served tree, ignored: $other)}${cross_down:+ (cross-box unreachable, asleep or off the network:$cross_down)}${gh_down:+ (GitHub unreachable from $BOX: $gh_down)}${sleep_guard:+ ($sleep_guard)}"
 EOF
 }
 
@@ -622,7 +663,7 @@ cmd_preflight() {
     esac
     shift
   done
-  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$cross" "${FLEET_CROSS_TIMEOUT:-20}"
+  { prelude "$box"; preflight_script; } | run_on "$box" "$codex" "$probe" "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$cross" "${FLEET_CROSS_TIMEOUT:-20}" "${FLEET_GH_TIMEOUT:-30}"
   local rc=$?
   if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; slots_report; exit 4; fi
   slots_report
@@ -789,14 +830,14 @@ cmd_launch() {
       *) die "launch: --base-branch required for a non-origin --base" ;; esac
   fi
   local codex=0 pf; [ "$kind" = codex ] && codex=1
-  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$(siblings_of "$box")" "${FLEET_CROSS_TIMEOUT:-20}" )
+  pf=$( { prelude "$box"; preflight_script; } | run_on "$box" "$codex" 1 "${FLEET_PROBE_TIMEOUT:-120}" "${FLEET_FETCH_TIMEOUT:-300}" "$(siblings_of "$box")" "${FLEET_CROSS_TIMEOUT:-20}" "${FLEET_GH_TIMEOUT:-30}" )
   local prc=$?
   if unreachable "$prc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: $pf"; exit 1; }
   # A passing preflight can still carry a note the coordinator must see before briefing a
   # cross-box leg: a sibling that did not answer. Said on stderr, so the LAUNCHED line stays
   # the one thing on stdout.
-  case "$pf" in *"cross-box unreachable"*) echo "preflight note for $box/$name: ${pf#*skills=* }" >&2 ;; esac
+  case "$pf" in *"cross-box unreachable"*|*"GitHub unreachable"*) echo "preflight note for $box/$name: ${pf#*skills=* }" >&2 ;; esac
   local pinned=""
   if [ -z "$cwd" ]; then
     # Fetch before reading CI and carry an immutable object into worktree add.
