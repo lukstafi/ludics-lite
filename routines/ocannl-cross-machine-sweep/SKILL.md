@@ -87,11 +87,18 @@ means its unit will record `gate`, which is not a failure and needs nothing from
 `--hold` it (it is native Linux). `sleep-blocks=N` on tuf, as on any native box, counts other
 sessions' sleep inhibitors: the sweep's own units hold one each while they run.
 
-Then refresh the skills checkout on each native box (ludics-lite#362). A box the fleet only
-executes on never hosts a worker launch, the one other place its `~/ludics-lite` is fast-forwarded,
-so this daily wake is where it is kept current (tuf was found without `execution hold`):
+Then refresh the skills checkout on each GPU box (ludics-lite#362), at the endpoint `kind_of`
+selects, since that is the system the lanes run on (`ENDPOINT_MAP` in `wake-lab.sh` names them). A
+box the fleet only executes on never hosts a worker launch, the one other place its
+`~/ludics-lite` is fast-forwarded, so this daily wake is where it is kept current (tuf was found
+without `execution hold`):
 
-    ~/ludics-lite/issue-wave/scripts/fleet-worker.sh refresh rog-nv-linux minix-amd-linux tuf-amd-linux
+    refresh_targets=()
+    for box in rog minix tuf; do
+      case "$box" in rog) stem=rog-nv ;; minix) stem=minix-amd ;; tuf) stem=tuf-amd ;; esac
+      refresh_targets+=("$stem-$(kind_of "$box")")
+    done
+    ~/ludics-lite/issue-wave/scripts/fleet-worker.sh refresh "${refresh_targets[@]}"
 
 One line per box, and its exit status does not change anything below. `REFRESH OK` (already current,
 or fast-forwarded) needs nothing.
