@@ -576,7 +576,10 @@ if [ -n "$STALE_BASE_PR" ]; then
   head_sha=$(jq -r '.head.sha // empty' <<<"$pr")
   # warn_series_close's reading (ludics-lite#296): the PR's stated count leads the rows, and the
   # last row is the head -- a count that stopped agreeing would make every scan say it did not run.
-  series=$(api "repos/$REPO/pulls/$STALE_BASE_PR/commits?per_page=100")
+  # Paginated as the reader is, and the pages' arrays joined, so an anchor of 101-250 commits is
+  # judged on its whole series rather than on its first page (review round 1).
+  series=$(api --paginate "repos/$REPO/pulls/$STALE_BASE_PR/commits?per_page=100" |
+    jq -cs 'if length > 0 and all(.[]; type == "array") then add else null end')
   pin "pulls/<n>/commits serves as many rows as the PR's .commits, oldest first, each with a sha and a string commit.message, the last one the PR's head (warn_series_close's shape)" \
     '(length == $n) and all(.[]; (.sha | test($hex)) and (.commit.message | type == "string")) and (.[-1].sha == $head)' \
     "$series" --argjson n "$(jq '.commits // -1' <<<"$pr")" --arg hex "$HEX40" --arg head "$head_sha"

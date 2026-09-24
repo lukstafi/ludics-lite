@@ -1526,20 +1526,92 @@ The #210 body said "Resolves #194 and #205 §1" and closed #205 with it.'),$(com
     "and the line itself"
   assert_contains "$MERGE_STDERR" "commit c0ffee00: ONE sentence, 2 issues" "on stderr as well"
   assert_contains "$MERGE_STDOUT" "reword the commit" "with the remedy a commit needs"
+  assert_contains "$MERGE_STDOUT" "If the commit has already reached the default branch, reopen" \
+    "and the reopen advice keyed to the default branch, not to this merge"
   assert_contains "$MERGE_CALLS" "--match-head-commit head-sha " "and the merge still lands"
-  # A message is not Markdown: an INDENTED quotation of the sentence is read, and flagged as one.
+  # A message is plain text GitHub reads whole: an INDENTED or `>` quotation closes as surely as a
+  # statement, so it is read and reported as closing, with the remedy (review round 1).
   reset
   SERIES_JSON="[$(commit_row head-sha 'Quote the incident
 
     Resolves #194 and #205 §1
+> Fixes #206
 ')]"
   run_merge
   assert_eq "$MERGE_RC" 0 "still not a gate ($MERGE_OUTPUT)"
-  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD NOTICE: $REPO#7's commit series carries" \
-    "an indented line is an example, and claims nothing"
-  assert_contains "$MERGE_STDOUT" "commit head-sha: a QUOTED, FENCED or INDENTED line, 2 reference(s): #194 #205" \
-    "naming the commit and the line's references"
-  assert_not_contains "$MERGE_STDOUT" "reword the commit" "no closing claim, so no remedy for one"
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD WARNING: $REPO#7's commit series closes issues" \
+    "a quoted line in a message is a closing claim"
+  assert_contains "$MERGE_STDOUT" "commit head-sha: a QUOTED, FENCED or INDENTED line, and it closes all the same, 2 issue(s): #194 #205" \
+    "the indented copy, naming the commit and the issues"
+  assert_contains "$MERGE_STDOUT" "and it closes all the same, 1 issue(s): #206" "and the > copy, even with one"
+  assert_contains "$MERGE_STDOUT" "reword the commit" "with the remedy"
+  assert_not_contains "$MERGE_STDOUT" "NOTICE" "never in the register that claims nothing"
+}
+
+# Review round 1. A body keyword binds only on its own merge into the default branch, so the body
+# scan is silent on another base; a commit keyword binds whenever the commit REACHES the default
+# branch, and a merge into a staging branch is the last cheap point to reword it -- so the series
+# is scanned whatever the base.
+test_the_series_is_scanned_whatever_the_base() {
+  reset
+  PR_BASE=release-1.2
+  SERIES_JSON="[$(commit_row head-sha 'Resolves #41 and #42')]"
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge lands ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "commit head-sha: ONE sentence, 2 issues: #41 #42" \
+    "a staging base does not make a commit keyword inert"
+}
+
+# Review round 1. A --squash given its own --body replaces every message of the series, so the
+# series is not read; a --squash whose message GitHub composes quotes the series, so it is.
+test_a_squash_with_its_own_body_does_not_read_the_series() {
+  local form
+  for form in "--body=Squashed." "-b Squashed." "--body-file /dev/null" "-F /dev/null"; do
+    reset
+    SERIES_JSON="[$(commit_row head-sha 'Resolves #43 and #44')]"
+    # shellcheck disable=SC2086 # the form is two words on purpose
+    run_merge -- --squash $form
+    assert_eq "$MERGE_RC" 0 "the squash merge lands ($form: $MERGE_OUTPUT)"
+    assert_not_contains "$MERGE_OUTPUT" "#43" "no message of the series lands ($form)"
+    assert_eq "$(grep -c -x 'CALL commits-count' "$CALLS_FILE")" 0 "and nothing is read for it ($form)"
+  done
+  reset
+  SERIES_JSON="[$(commit_row head-sha 'Resolves #43 and #44')]"
+  run_merge -- --squash
+  assert_contains "$MERGE_STDOUT" "commit head-sha: ONE sentence, 2 issues: #43 #44" \
+    "a squash message GitHub composes quotes the series"
+  reset
+  SERIES_JSON="[$(commit_row head-sha 'Resolves #43 and #44')]"
+  run_merge -- --merge --body=Merged.
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #43 #44" "a --body without --squash replaces nothing"
+}
+
+# Review round 1. The lead-time scan's findings are about the head it read; when the gate settles on
+# another, the second read withdraws them or says the new ones supersede them, rather than leaving
+# a warning about commits that no longer land standing in the transcript.
+test_a_moved_head_withdraws_or_supersedes_the_lead_time_findings() {
+  reset
+  SERIES_JSON_FIRST="[$(commit_row old-sha 'Resolves #51 and #52')]"
+  SERIES_JSON="[$(commit_row head-sha 'Reworded, nothing to close')]"
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the merge lands ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDOUT" "commit old-sha: ONE sentence, 2 issues: #51 #52" "the lead-time finding"
+  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#7's head moved before the gate bound it" \
+    "is withdrawn when the series that lands is clean"
+  reset
+  SERIES_JSON_FIRST="[$(commit_row old-sha 'Resolves #51 and #52')]"
+  SERIES_JSON="[$(commit_row head-sha 'Resolves #53 and #54')]"
+  run_merge
+  assert_contains "$MERGE_STDOUT" "what the series that lands closes is below, not above" \
+    "and superseded when it carries findings of its own"
+  assert_contains "$MERGE_STDOUT" "commit head-sha: ONE sentence, 2 issues: #53 #54" "which are printed"
+  assert_not_contains "$MERGE_STDOUT" "WITHDRAWN" "without a withdrawal"
+  # Nothing said, nothing withdrawn: a clean lead-time read stays silent when the head moves.
+  reset
+  SERIES_JSON_FIRST="[$(commit_row old-sha 'Nothing')]"
+  SERIES_JSON="[$(commit_row head-sha 'Still nothing')]"
+  run_merge
+  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "a clean series moved to a clean series is silent"
 }
 
 # The legitimate shape: a commit that really closes the PR's own issue is silent, as a body's lone
@@ -1695,6 +1767,9 @@ tests=(
   test_the_series_is_read_once_across_merge_attempts
   test_a_head_moved_before_the_gate_rereads_the_series
   test_an_unread_or_partial_series_says_the_scan_did_not_run
+  test_the_series_is_scanned_whatever_the_base
+  test_a_squash_with_its_own_body_does_not_read_the_series
+  test_a_moved_head_withdraws_or_supersedes_the_lead_time_findings
 )
 
 run_tests "${tests[@]}"
