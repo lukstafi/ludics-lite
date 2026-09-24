@@ -311,6 +311,54 @@ esac
 
 warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 
+# --- jq's line ending (ludics-lite#335) -------------------------------------------------------
+# A native jq.exe on Windows (winget, Chocolatey, Scoop; Git for Windows ships no jq) writes its
+# stdout in text mode and ends every line CRLF. Every line but a `$(...)`'s last keeps its \r, so
+# a conclusion read off a list is `failure\r`, not red, and a decision takes the wrong branch, at
+# any of this script's ~100 jq calls. So every call goes through `jq` below, and the line
+# ending is decided ONCE, here, by asking the jq on PATH:
+#   lf      it writes LF already (every Unix jq, an MSYS2 jq): called as is, no cost;
+#   binary  it writes CRLF and `-b` (jq 1.7+ on Windows) turns that off: called with `-b`, which
+#           costs no process, where a filter would cost a fork per call on the slowest-forking
+#           platform there is;
+#   strip   it writes CRLF and refuses `-b` (jq 1.6): its output goes through `tr -d '\r'`. That
+#           takes a CRLF inside a raw string (a comment body's line ends) to LF as well, which
+#           nothing here reads as data. It is not `sed 's/\r$//'`, which keeps that CRLF on Unix
+#           but lost it on the Git Bash leg all the same, where MSYS sed read the \r away: the
+#           one platform that takes this path gets the same answer either way, and tr says so.
+# `jq_lf` is the call and `jq` names it, so the fixtures' jq shim (test-pr-review-lib.sh), which
+# replaces `jq`, forwards to `jq_lf` and keeps the line ending. A jq that is missing or broken
+# probes as `lf`, and the first real call then fails as it did before this.
+JQ_EOL=lf
+# The probe counts the bytes of `"x"` through a pipe (3 is x\r\n) rather than comparing a
+# `$(...)`: Git Bash's command substitution drops a trailing \r with the \n, so `$(jq -rn '"x"')`
+# reads `x` from the very jq.exe that writes x\r\n. There a single value read back clean all
+# along; a multi-line read, a `while read` and a pipe did not.
+jq_eol_probe() {
+  local n
+  JQ_EOL=lf
+  n=$(command jq -rn '"x"' 2>/dev/null | wc -c) || return 0
+  [ "$((n))" -eq 3 ] || return 0
+  n=$(command jq -b -rn '"x"' 2>/dev/null | wc -c) || n=0
+  if [ "$((n))" -eq 2 ]; then JQ_EOL=binary; else JQ_EOL=strip; fi
+}
+jq_lf() {
+  case "$JQ_EOL" in
+  lf) command jq "$@" ;;
+  binary) command jq -b "$@" ;;
+  *) jq_lf_strip "$@" ;;
+  esac
+}
+# A subshell with its own `pipefail`, so jq's failure is the call's status whatever options the
+# caller runs under. Not PIPESTATUS: a PIPESTATUS the environment exports shadows bash's own, and
+# it then never moves (run-pr-review-hostile.sh exports one, and every read here saw `hostile`).
+jq_lf_strip() (
+  set -o pipefail
+  command jq "$@" | tr -d '\r'
+)
+jq() { jq_lf "$@"; }
+jq_eol_probe
+
 # --- transport retries ----------------------------------------------------------------------
 # Only TRANSPORT failures are retried. A 4xx is the API ANSWERING — no such comment, no such PR,
 # no permission — and retrying it spends the backoff to print the same thing.
