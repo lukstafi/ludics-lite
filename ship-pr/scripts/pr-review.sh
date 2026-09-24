@@ -321,9 +321,11 @@ warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 #   binary  it writes CRLF and `-b` (jq 1.7+ on Windows) turns that off: called with `-b`, which
 #           costs no process, where a filter would cost a fork per call on the slowest-forking
 #           platform there is;
-#   strip   it writes CRLF and refuses `-b` (jq 1.6): its output goes through `sed 's/\r$//'`,
-#           one \r per line, which is exactly what text mode added — a CRLF inside a raw string
-#           (a comment body) came out \r\r\n and goes back to \r\n, where `tr -d '\r'` would not.
+#   strip   it writes CRLF and refuses `-b` (jq 1.6): its output goes through `tr -d '\r'`. That
+#           takes a CRLF inside a raw string (a comment body's line ends) to LF as well, which
+#           nothing here reads as data. It is not `sed 's/\r$//'`, which keeps that CRLF on Unix
+#           but lost it on the Git Bash leg all the same, where MSYS sed read the \r away: the
+#           one platform that takes this path gets the same answer either way, and tr says so.
 # `jq_lf` is the call and `jq` names it, so the fixtures' jq shim (test-pr-review-lib.sh), which
 # replaces `jq`, forwards to `jq_lf` and keeps the line ending. A jq that is missing or broken
 # probes as `lf`, and the first real call then fails as it did before this.
@@ -352,7 +354,7 @@ jq_lf() {
 # it then never moves (run-pr-review-hostile.sh exports one, and every read here saw `hostile`).
 jq_lf_strip() (
   set -o pipefail
-  command jq "$@" | sed $'s/\r$//'
+  command jq "$@" | tr -d '\r'
 )
 jq() { jq_lf "$@"; }
 jq_eol_probe

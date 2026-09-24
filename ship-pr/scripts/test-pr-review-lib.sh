@@ -1624,9 +1624,12 @@ test_a_crlf_jq_is_read_back_lf() {
       "$mode: a conclusion should read back without its \\r, or it is not red"
     assert_eq "$(jq_under_stub "$dir" -r '.[]' <<<'["a","b"]' | od_bytes)" 'a\nb\n' \
       "$mode: every line should lose its \\r, not only the last"
-    # One \r per line comes off, not every \r: a comment body's own CRLF is data.
-    assert_eq "$(jq_under_stub "$dir" -r .b <<<'{"b":"one\r\ntwo"}' | od_bytes)" 'one\r\ntwo\n' \
-      "$mode: a CRLF inside a raw string should survive"
+    # A CRLF inside a raw string: `-b` keeps it as the data it is, and the strip takes it to LF
+    # with the rest (pr-review.sh says why that is the price of the strip path).
+    want='one\r\ntwo\n'
+    [ "$mode" = binary ] || want='one\ntwo\n'
+    assert_eq "$(jq_under_stub "$dir" -r .b <<<'{"b":"one\r\ntwo"}' | od_bytes)" "$want" \
+      "$mode: a CRLF inside a raw string"
     rc=0
     (jq_under_stub "$dir" -e .c <<<'{"c":false}' >/dev/null) || rc=$?
     assert_eq "$rc" 1 "$mode: jq's own status should reach the caller"
