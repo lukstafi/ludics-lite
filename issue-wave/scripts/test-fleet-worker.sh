@@ -777,6 +777,14 @@ expect "...and a dead one points at that, not at the file" 1 "repair: fix the to
   env SHIM_GH=401 GH_TOKEN=ghp_other "$FW" preflight testbox --native-claude --no-cross
 expect "a gh-token.sh the session does not source names the env.sh line" 1 "this session does not export the token in ~/.config/fleet/gh-token.sh on testbox -- repair: end its ~/.config/fleet/env.sh with .*gh-token.sh.*install-linux.sh adds it)" -- \
   env -u GH_TOKEN -u GITHUB_TOKEN "$FW" preflight testbox --native-claude --no-cross
+expect "an empty GH_TOKEN is not an export of the file's" 1 "this session does not export the token in ~/.config/fleet/gh-token.sh on testbox" -- \
+  env GH_TOKEN= "$FW" preflight testbox --native-claude --no-cross
+expect "on the anchor, a mismatch says to re-source the file or open a new shell, with no ssh" 1 "this shell's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports -- repair: run \\. ~/.config/fleet/gh-token.sh (or open a new shell)" -- \
+  env GH_TOKEN=ghp_other "$FW" preflight local --native-claude --no-cross
+printf 'export GH_TOKEN=\n' > "$HOME/.config/fleet/gh-token.sh"
+expect "a gh-token.sh exporting an empty GH_TOKEN is replaced" 1 "gh-token.sh on testbox exports no GH_TOKEN -- repair: replace it from the anchor" -- \
+  env GH_TOKEN= "$FW" preflight testbox --native-claude --no-cross
+printf 'export GH_TOKEN=ghp_dead\n' > "$HOME/.config/fleet/gh-token.sh"
 chmod 644 "$HOME/.config/fleet/gh-token.sh"
 expect "a group-readable gh-token.sh refuses even with a live token, with the replace-the-file repair" 1 "gh-token.sh on testbox is not a regular mode-0600 file this user owns (-rw-r--r-- uid [0-9]*).*repair: replace it from the anchor" -- \
   env GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross

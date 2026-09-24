@@ -623,10 +623,22 @@ if [ -e "$tokf" ] || [ -L "$tokf" ]; then
   case "$tls" in "-rw------- "*|"-r-------- "*) [ "$(printf '%s' "$tls" | awk '{print $3}')" != "$(id -u)" ] || tokbad="" ;; esac
   if [ -n "$tokbad" ]; then
     note "~/.config/fleet/gh-token.sh on $BOX is not a regular mode-0600 file this user owns ($(printf '%s' "$tls" | awk '{print $1, "uid", $3}')): the PAT in it may be readable by others -- repair: $tokcopy"
-  elif [ -z "${GH_TOKEN+x}" ]; then
-    tokbad=1; note "this session does not export the token in ~/.config/fleet/gh-token.sh on $BOX -- repair: end its ~/.config/fleet/env.sh with [ ! -r \"\$HOME/.config/fleet/gh-token.sh\" ] || . \"\$HOME/.config/fleet/gh-token.sh\" (scripts/install-linux.sh adds it)"
-  elif [ "$GH_TOKEN" != "$(unset GH_TOKEN; . "$tokf" >/dev/null 2>&1; printf '%s' "${GH_TOKEN-}")" ]; then
-    tokbad=1; note "this session's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports on $BOX: a later line of its shell startup overrides it -- repair: remove that line (ssh $qbox 'grep -Hnos GH_TOKEN ~/.bashrc ~/.profile ~/.bash_profile ~/.config/fleet/env.sh' lists the lines without their values), then restart any tmux server that inherited it"
+  else
+    # An empty GH_TOKEN is no token to gh: it falls back to GITHUB_TOKEN or a stored login.
+    ftok=$(unset GH_TOKEN; . "$tokf" >/dev/null 2>&1; printf '%s' "${GH_TOKEN-}")
+    if [ -z "$ftok" ]; then
+      tokbad=1; note "~/.config/fleet/gh-token.sh on $BOX exports no GH_TOKEN -- repair: $tokcopy"
+    elif [ -z "${GH_TOKEN-}" ]; then
+      tokbad=1; note "this session does not export the token in ~/.config/fleet/gh-token.sh on $BOX -- repair: end its ~/.config/fleet/env.sh with [ ! -r \"\$HOME/.config/fleet/gh-token.sh\" ] || . \"\$HOME/.config/fleet/gh-token.sh\" (scripts/install-linux.sh adds it)"
+    elif [ "$GH_TOKEN" != "$ftok" ]; then
+      tokbad=1
+      # The anchor's preflight is a child of the invoking shell, which rereads no startup file:
+      # there a mismatch is as likely a shell that predates the file's rotation.
+      case "$BOX" in
+        local) note "this shell's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports -- repair: run . ~/.config/fleet/gh-token.sh (or open a new shell) and rerun; if a new shell still differs, a later startup line overrides it (grep -Hnos GH_TOKEN ~/.zshrc ~/.zprofile ~/.bashrc ~/.profile ~/.bash_profile ~/.config/fleet/env.sh lists the lines without their values)" ;;
+        *) note "this session's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports on $BOX: a later line of its shell startup overrides it -- repair: remove that line (ssh $qbox 'grep -Hnos GH_TOKEN ~/.bashrc ~/.profile ~/.bash_profile ~/.config/fleet/env.sh' lists the lines without their values), then restart any tmux server that inherited it" ;;
+      esac
+    fi
   fi
 fi
 if ! command -v gh >/dev/null 2>&1; then

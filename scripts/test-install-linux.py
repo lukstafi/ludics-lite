@@ -175,10 +175,11 @@ class BootstrapSafety(unittest.TestCase):
         self.run_shell('mkdir -p lid/LID0; FLEET_LID_GLOB="$PWD/lid/*" has_lid')
         self.run_shell('FLEET_LID_GLOB="$PWD/nolid/*" has_lid', False)
 
-    def test_lid_dropin_installs_and_reloads_only_on_difference(self):
+    def test_lid_dropin_installs_on_difference_and_reloads_every_run(self):
         stub = 'scratch=$PWD; sudo() { echo "$*" >> calls; [ "$1" != cmp ] || return "$CMP_RC"; }; '
         self.run_shell(stub + 'CMP_RC=0 install_lid_dropin')
-        self.assertNotIn('reload', (self.root / 'calls').read_text())
+        self.assertNotIn('install -D', (self.root / 'calls').read_text())
+        self.assertIn('systemctl reload systemd-logind', (self.root / 'calls').read_text())
         self.run_shell(stub + 'CMP_RC=1 install_lid_dropin')
         calls = (self.root / 'calls').read_text()
         self.assertIn('install -D -m 644', calls)
@@ -198,13 +199,12 @@ class BootstrapSafety(unittest.TestCase):
         service = self.run_shell('wake_service').stdout
         self.assertIn('[Service]\nType=oneshot\nExecStart=/bin/true\n', service)
 
-    def test_wake_timer_installs_and_reloads_only_on_difference(self):
+    def test_wake_timer_installs_on_difference_and_reloads_every_run(self):
         stub = 'scratch=$PWD; sudo() { echo "$*" >> calls; [ "$1" != cmp ] || return "$CMP_RC"; }; '
         self.run_shell(stub + 'CMP_RC=0 install_wake_timer 06:58')
         calls = (self.root / 'calls').read_text()
         self.assertNotIn('install -D', calls)
-        self.assertNotIn('daemon-reload', calls)
-        self.assertIn('systemctl enable --now fleet-sweep-wake.timer', calls)
+        self.assertLess(calls.index('daemon-reload'), calls.index('enable --now fleet-sweep-wake.timer'))
         (self.root / 'calls').unlink()
         self.run_shell(stub + 'CMP_RC=1 install_wake_timer 06:58')
         calls = (self.root / 'calls').read_text()

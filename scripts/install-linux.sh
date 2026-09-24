@@ -171,8 +171,10 @@ install_lid_dropin() {
   lid_dropin > "$scratch/lid.conf"
   if ! sudo cmp -s "$scratch/lid.conf" "$conf"; then
     sudo install -D -m 644 "$scratch/lid.conf" "$conf"
-    sudo systemctl reload systemd-logind
   fi
+  # Every run, not only on a change: a run interrupted between the install and the reload must
+  # still converge on rerun, and the reload is idempotent.
+  sudo systemctl reload systemd-logind
 }
 
 # A laptop cannot be woken over Wi-Fi, so a fleet laptop that sleeps overnight is woken for the
@@ -202,16 +204,15 @@ wake_service() {
 }
 
 install_wake_timer() {
-  local dir=/etc/systemd/system unit changed=0
+  local dir=/etc/systemd/system unit
   wake_timer "$1" > "$scratch/fleet-sweep-wake.timer"
   wake_service > "$scratch/fleet-sweep-wake.service"
   for unit in fleet-sweep-wake.service fleet-sweep-wake.timer; do
     if ! sudo cmp -s "$scratch/$unit" "$dir/$unit"; then
       sudo install -D -m 644 "$scratch/$unit" "$dir/$unit"
-      changed=1
     fi
   done
-  if [[ $changed == 1 ]]; then sudo systemctl daemon-reload; fi
+  sudo systemctl daemon-reload  # every run, as the lid drop-in's reload: a rerun converges
   sudo systemctl enable --now fleet-sweep-wake.timer
 }
 
