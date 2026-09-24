@@ -4895,9 +4895,12 @@ test_runner_kills_a_case_past_its_deadline() {
   # deadline together with its log, and the run still ends with its root removed.
   # The stall is a descendant that ignores TERM under a case shell that dies on it: the leader
   # vanishes at the first signal, and only a runner that watches the whole group escalates to
-  # KILL for what is left (a duration no other process on the box is sleeping for).
+  # KILL for what is left. The descendant writes its own pid before it execs, and the case asks
+  # that pid with kill -0, not pgrep: Git for Windows ships no pgrep, where the check passed while
+  # checking nothing (ludics-lite#337).
   local tag="dl$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" rc marker patched
-  marker="sh -c 'trap \"\" TERM; exec sleep 3571.$$'"
+  local pidfile="$copy/stall.pid" stall_pid tries=0
+  marker="sh -c 'trap \"\" TERM; echo \$\$ >\"$pidfile\"; exec sleep 3571'"
   copy_runner "$copy" "$tag"
   patched=$(sed "s|^$SELF_CASE() {\$|$SELF_CASE() { $marker;|" "$copy/test-post-merge-cleanup.sh")
   printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
@@ -4911,8 +4914,18 @@ test_runner_kills_a_case_past_its_deadline() {
   grep -q "timed out after 2s (SHIP_PR_TEST_CASE_TIMEOUT); its process group was killed" "$out" ||
     fail "the stalled case was not reported against its deadline: $(cat "$out")"
   grep -q "^FAIL: 1 of 1 post-merge cleanup states failed" "$out" || fail "no failing summary: $(cat "$out")"
-  sleep 0.5
-  ! pgrep -f "sleep 3571\\.$$" >/dev/null 2>&1 || fail "the TERM-ignoring descendant survived the deadline: the runner stopped escalating at the leader"
+  [ -s "$pidfile" ] || fail "the planted descendant never wrote its pid, so nothing here checks it: $(cat "$out")"
+  stall_pid=$(cat "$pidfile")
+  # A settle, not a deadline: a KILLed process can still answer kill -0 until it is reaped, and a
+  # descendant the runner never escalated to sleeps for an hour.
+  while kill -0 "$stall_pid" 2>/dev/null; do
+    [ "$tries" -lt 20 ] || {
+      kill -KILL "$stall_pid" 2>/dev/null || true
+      fail "the TERM-ignoring descendant (pid $stall_pid) survived the deadline: the runner stopped escalating at the leader"
+    }
+    sleep 0.1
+    tries=$((tries + 1))
+  done
   assert_copy_root_gone "$tag"
   echo "PASS: a case past its deadline is killed with its process group and reported"
 }
