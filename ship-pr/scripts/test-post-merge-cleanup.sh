@@ -5118,7 +5118,26 @@ test_runner_counts_a_stated_boundary() {
   grep -q "^PASS: 1 selected post-merge cleanup states (.*); 1 of them stated a platform boundary (SKIP): $SELF_CASE\$" "$out" ||
     fail "the summary did not count the boundary: $(cat "$out")"
   assert_copy_root_gone "$tag"
-  echo "PASS: a stated boundary is printed under its case and counted in the summary"
+
+  # Verbose, beside a failing case: the whole log still names its SKIP line, and the FAIL line
+  # names the boundary case too, ahead of the failed cases it keeps last.
+  patched=$(sed "s|^test_unchecked_out_master() {\$|test_unchecked_out_master() { fail 'runner self-case failure';|" "$copy/test-post-merge-cleanup.sh")
+  printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
+  grep -qF -- "test_unchecked_out_master() { fail 'runner self-case failure';" "$copy/test-post-merge-cleanup.sh" ||
+    fail "could not plant a failure in the copy"
+  if run_copy env SHIP_PR_TEST_CASE_TIMEOUT="$SELF_CASE_TIMEOUT" "$copy/test-post-merge-cleanup.sh" -v -j 1 \
+    "$SELF_CASE" test_unchecked_out_master >"$out" 2>&1 </dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 1 ] || fail "the copy exited $rc with a failing case, expected 1: $(cat "$out")"
+  grep -Fqx "SKIP $SELF_CASE: runner self-case boundary" "$out" ||
+    fail "the verbose log did not name the boundary's case: $(cat "$out")"
+  grep -q "^FAIL: 1 of 2 post-merge cleanup states failed in .*; of those that passed, 1 of them stated a platform boundary (SKIP): $SELF_CASE): test_unchecked_out_master\$" "$out" ||
+    fail "the failing summary did not name the boundary case: $(cat "$out")"
+  assert_copy_root_gone "$tag"
+  echo "PASS: a stated boundary is printed under its case and counted in the summary, verbose or failing"
 }
 
 TESTS=(
@@ -5584,7 +5603,9 @@ report_case() {
       BOUNDARY+=("$name")
     fi
     if [ "$VERBOSE" -eq 1 ]; then
-      cat "$log"
+      # The whole log, with each SKIP line named as below: concurrent cases' boundaries would
+      # otherwise read as one another's.
+      awk -v n="$name" '{ sub(/^SKIP:/, "SKIP " n ":") } 1' "$log"
     else
       # Each PASS and SKIP line names its case, so a log cut off mid-run shows which cases never
       # reported without finding them by elimination (ludics-lite#337). A case that states a
@@ -5666,11 +5687,12 @@ stop_if_interrupted
 
 # A passing case that stated a platform boundary passed only what it ran, so the summary counts
 # and names those cases every time (ludics-lite#338): a boundary is never silently green.
+# The FAIL line keeps the failed cases last, after its final colon, where readers of it look.
 BOUNDARY_NOTE=""
 [ "$BOUNDARY_COUNT" -eq 0 ] ||
   BOUNDARY_NOTE="$BOUNDARY_COUNT of them stated a platform boundary (SKIP): ${BOUNDARY[*]}"
 if [ "$FAILED_COUNT" -gt 0 ]; then
-  echo "FAIL: $FAILED_COUNT of $SELECTED_COUNT post-merge cleanup states failed in ${SECONDS}s (-j $JOBS${BOUNDARY_NOTE:+; $BOUNDARY_COUNT passing cases stated a platform boundary}): ${FAILED[*]}" >&2
+  echo "FAIL: $FAILED_COUNT of $SELECTED_COUNT post-merge cleanup states failed in ${SECONDS}s (-j $JOBS${BOUNDARY_NOTE:+; of those that passed, $BOUNDARY_NOTE}): ${FAILED[*]}" >&2
   exit 1
 fi
 if [ "$NAMED" -eq 0 ]; then
