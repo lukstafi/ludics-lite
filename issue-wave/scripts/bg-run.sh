@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# bg-run.sh -- run one command as a background task and block on it in bounded foreground calls.
+#
+# A native worker has nothing that holds its turn on a background task except a foreground Bash
+# call, and that call is capped at 600 s. So a command that can outlast the cap (ship-pr's
+# `pr-review.sh watch`, `merge --wait`) runs in the background under `start`, and the worker
+# re-issues `wait` in the foreground until it reports the command's exit status
+# (issue-wave/references/native-claude.md, *Blocking on a run*). This replaces the two lines of
+# hand-copied shell that took three review rounds of races (ludics-lite#354, #357):
+#
+#   bg-run.sh start <dir> -- <cmd> [arg...]    # run it with Bash run_in_background: true
+#   bg-run.sh wait  <dir> [--within <s>]       # run it in the foreground; default 540
+#
+# <dir> is absolute and FRESH for every run: `start` creates it and refuses one that already holds
+# anything. It writes three files there and nothing else:
+#   pid  -- this script's own pid, published before the command starts;
+#   log  -- the command's stdout and stderr, and the only file the command's output reaches;
+#   rc   -- the command's exit status, published (by rename) after the command returns.
+# A refused start writes a fourth, `refused`, into the directory it refused, so a wait on it says
+# REFUSED instead of reading the earlier run's status as this one's.
+#
+# `wait` polls every 5 s (BG_RUN_POLL, whole seconds) and returns the first settled verdict, or
+# the current one once --within seconds are spent. It prints one line and exits with its code:
+#   rc=<n>     0  the command finished; <n> is its exit status (also in <dir>/rc). Exit 0 means
+#                 FINISHED, not succeeded: a command may exit with any status, so no exit code
+#                 of this script can both carry it and stay distinct from the verdicts below.
+#   RUNNING    3  the pid is alive and there is no rc yet: re-issue the wait.
+#   STARTING   4  no pid yet. A background task that has not published its pid is starting, not
+#                 dead. Returned at the --within deadline, or once no pid has appeared for 60 s
+#                 of this wait (BG_RUN_START_GRACE): re-issue once, and a second STARTING means
+#                 the launch itself failed, so start again in a NEW directory.
+#   DIED       5  a pid was published, it is gone, and it wrote no rc: the task was killed
+#                 before the command returned (the harness does this, ~40 min into a
+#                 backgrounded `merge --wait`). It says nothing about what the command saw:
+#                 re-arm it in a new directory.
+#   REFUSED    6  `start` refused this directory (the reason follows): start again in a NEW one.
+# Usage errors exit 2, from either subcommand.
+#
+# The races this closes, each pinned by test-bg-run.sh:
+#   1. a killed task never writes rc: `wait` reads the dead pid as DIED instead of polling forever;
+#   2. rc is a file of its own, not a line of the log, so output that quotes `rc=` (a review body
+#      does) cannot end a wait;
+#   3. a wait that runs before the task has published its pid reads STARTING, not DIED;
+#   and a stale directory, whose rc belongs to an earlier run, is refused rather than reused.
+#   A run that finishes between the rc read and the pid probe is read as finished: a dead pid is
+#   followed by a second read of rc before DIED is concluded.
+# What it does not close: a `wait` that runs before `start` has run AT ALL, on a directory an
+# earlier run left behind, reads that run's status; `start`'s refusal catches the reuse only once
+# it has run. A fresh name per run is the caller's half, and this script cannot check it.
+#
+# Portable to bash 3.2 (macOS /bin/bash) and GNU bash; the Bash tool's zsh only passes argv.
+
+set -u
+
+usage() {
+  printf '%s\n' 'usage: bg-run.sh start <dir> -- <cmd> [arg...]' \
+    '       bg-run.sh wait <dir> [--within <seconds>]' >&2
+  exit 2
+}
+
+say() { printf 'bg-run: %s\n' "$*" >&2; }
+
+# An absolute directory, so a background shell that did not start in the caller's cwd (ship-pr's
+# SKILL.md records that it need not) and the foreground waiter name the same place.
+need_absolute() {
+  case $1 in
+    /*) ;;
+    *) say "the run directory must be an absolute path, got $(printf '%q' "$1")"; exit 2 ;;
+  esac
+}
+
+cmd_start() {
+  [ $# -ge 3 ] || usage
+  dir=$1; shift
+  [ "$1" = -- ] || usage
+  shift
+  need_absolute "$dir"
+  mkdir -p -- "$dir" || { say "cannot create $(printf '%q' "$dir")"; exit 2; }
+  if [ -n "$(ls -A -- "$dir")" ]; then
+    reason="$(printf '%q' "$dir") already holds a run; start again in a new directory"
+    printf '%s\n' "$reason" > "$dir/refused"
+    say "refused: $reason"
+    exit 2
+  fi
+  printf '%s\n' "$$" > "$dir/.pid.tmp" && mv -f -- "$dir/.pid.tmp" "$dir/pid" \
+    || { say "cannot publish the pid in $(printf '%q' "$dir")"; exit 2; }
+  "$@" < /dev/null > "$dir/log" 2>&1
+  rc=$?
+  printf '%s\n' "$rc" > "$dir/.rc.tmp" && mv -f -- "$dir/.rc.tmp" "$dir/rc" \
+    || say "cannot publish the exit status $rc in $(printf '%q' "$dir")"
+  exit "$rc"
+}
+
+# verdict <dir>: sets V to rc | REFUSED | STARTING | RUNNING | DIED.
+verdict() {
+  if [ -s "$1/refused" ]; then V=REFUSED
+  elif [ -s "$1/rc" ]; then V=rc
+  elif [ ! -s "$1/pid" ]; then V=STARTING
+  elif kill -0 "$(cat "$1/pid")" 2>/dev/null; then V=RUNNING
+  elif [ -s "$1/rc" ]; then V=rc   # it finished between the rc read and the probe
+  else V=DIED
+  fi
+}
+
+cmd_wait() {
+  [ $# -ge 1 ] || usage
+  dir=$1; shift
+  within=540
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --within) [ $# -ge 2 ] || usage; within=$2; shift 2 ;;
+      --within=*) within=${1#--within=}; shift ;;
+      *) usage ;;
+    esac
+  done
+  interval=${BG_RUN_POLL:-5}
+  grace=${BG_RUN_START_GRACE:-60}
+  for n in "$within" "$interval" "$grace"; do
+    case $n in ''|*[!0-9]*) say "not a whole number of seconds: $(printf '%q' "$n")"; exit 2 ;; esac
+  done
+  [ "$interval" -ge 1 ] || { say 'BG_RUN_POLL must be at least 1'; exit 2; }
+  need_absolute "$dir"
+  t0=$SECONDS
+  while :; do
+    verdict "$dir"
+    elapsed=$((SECONDS - t0))
+    case $V in
+      RUNNING) ;;
+      STARTING) [ "$elapsed" -lt "$grace" ] || break ;;
+      *) break ;;
+    esac
+    [ $((elapsed + interval)) -le "$within" ] || break
+    sleep "$interval"
+  done
+  case $V in
+    rc) printf 'rc=%s\n' "$(cat "$dir/rc")"; exit 0 ;;
+    RUNNING) echo RUNNING; exit 3 ;;
+    STARTING) echo STARTING; exit 4 ;;
+    DIED) echo DIED; exit 5 ;;
+    REFUSED) printf 'REFUSED: %s\n' "$(cat "$dir/refused")"; exit 6 ;;
+  esac
+}
+
+[ $# -ge 1 ] || usage
+sub=$1; shift
+case $sub in
+  start) cmd_start "$@" ;;
+  wait) cmd_wait "$@" ;;
+  -h|--help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
+  *) usage ;;
+esac

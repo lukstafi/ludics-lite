@@ -222,7 +222,10 @@ with Bash `run_in_background: true` and yield; the completion notification is th
 a finished background command does not resume the agent: keep the turn open and poll the command
 session until `watch` exits, or, for a wait too long to hold open, schedule a heartbeat that
 re-runs both `status` and watermark-aware `poll` (or a bounded `watch`). A backgrounded shell
-nobody is polling is not an observer.
+nobody is polling is not an observer. A Claude Code session that the notification does not wake
+(a native issue-wave worker, whose turn must stay open) runs `watch` and `merge --wait` under
+issue-wave's `bg-run.sh start` and blocks on `bg-run.sh wait`, as
+[Blocking on a run](../issue-wave/references/native-claude.md#blocking-on-a-run) says.
 
 `watch` *is* the polling loop — don't hand-roll a sleep loop around `poll`, which is what a long
 review otherwise turns into. It returns the moment a round lands (printing exactly what `poll`
@@ -794,8 +797,8 @@ No hand re-check, and no `--wait` needed for any of it: without one the same win
 The trap that remains is at the other end of the hold: **the harness can kill a backgrounded
 `merge --wait` well before its ceiling** (observed twice at ~40 min). The correct response is to
 re-read merge state over REST (`gh pr view --json state,mergedAt,headRefOid`) and re-arm the wait
-— never to conclude the merge failed, and never to reach for `--allow-no-verdict` because the
-waiter died.
+(`bg-run.sh wait` reads that kill as `DIED`) — never to conclude the merge failed, and never to
+reach for `--allow-no-verdict` because the waiter died.
 
 `--allow-no-verdict` merges unread, loudly on stdout and stderr. It is acceptable only when the
 verdict could tell you nothing you have not established yourself: a doc-only diff, or a shell-only

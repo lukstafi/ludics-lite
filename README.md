@@ -258,6 +258,7 @@ The scripts carry their own test suites (Python fixtures use `python3`; PowerShe
 ```sh
 issue-wave/scripts/test-fleet-worker.sh
 python3 issue-wave/scripts/test-fleet-execution.py
+issue-wave/scripts/test-bg-run.sh
 ./issue-wave/scripts/test-windows-driver.ps1
 python3 ship-pr/hooks/test-ship-pr-nudge.py
 python3 ship-pr/scripts/test-pr-review-hostile.py
