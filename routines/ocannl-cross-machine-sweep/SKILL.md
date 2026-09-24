@@ -87,6 +87,19 @@ means its unit will record `gate`, which is not a failure and needs nothing from
 `--hold` it (it is native Linux). `sleep-blocks=N` on tuf, as on any native box, counts other
 sessions' sleep inhibitors: the sweep's own units hold one each while they run.
 
+Then refresh the skills checkout on each native box (ludics-lite#362). A box the fleet only
+executes on never hosts a worker launch, the one other place its `~/ludics-lite` is fast-forwarded,
+so this daily wake is where it is kept current (tuf was found without `execution hold`):
+
+    ~/ludics-lite/issue-wave/scripts/fleet-worker.sh refresh rog-nv-linux minix-amd-linux tuf-amd-linux
+
+One line per box, and its exit status does not change anything below. `REFRESH OK` (already current,
+or fast-forwarded) and `REFRESH SKIPPED` (a preflight there is doing it) need nothing.
+`REFRESH UNREACHABLE` is a box `status` already shows down or booted into Windows. `REFRESH FAILED`
+is a finding for step 5, quoted: the checkout is divergent (a local change, another branch, an
+unpushed commit) or could not fetch, and it is left exactly as it is. Never reset it from here: a
+divergent local edit may be a fix worth keeping.
+
 The native Linux path waits for sshd after boot and needs no holder. For WSL, the wake path
 restarts the guest on each host that answered and establishes a Windows-side holder before
 declaring it ready. A partial wake is handled per box. Read `status`'s `os=` field: a dual-boot
@@ -481,7 +494,7 @@ powered while off.
 ## 5. Report
 
 Print a short summary: one line per unit (machine/backend, outcome, duration), preceded by a line
-on what step 1 did if any box needed waking. Open with step 0's drift verdict, in one line when
+on what step 1 did if any box needed waking, and by each `REFRESH FAILED` line step 1 printed. Open with step 0's drift verdict, in one line when
 everything is in sync and with the diff when it is not (plus the branch, the `rev-list` counts and every path the
 `status --porcelain` line printed when the checkout is not canonical — the sync script's own path
 included, which no sync diff would show — or the fetch's error if that comparison could not be made,
