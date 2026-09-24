@@ -284,8 +284,15 @@ nova linux=-V-linux win=-V-win wsl=-V-wsl|row|linux=-V-linux is not a plain ssh 
 nova linux=tuf-amd-linux win=tuf-amd-win wsl=tuf-amd-wsl|map|the alias tuf-amd-linux is on both tuf and nova
 tuf linux=nova-x-linux|map|tuf has two rows
 -nova linux=nova-x-linux|map|the box name -nova is not a plain name
+down linux=down-x-linux|map|the box name down is a command word
 ROWS
-check 'every incomplete-row fixture ran' '[ "$n" = 13 ]'
+check 'every incomplete-row fixture ran' '[ "$n" = 14 ]'
+# The command words check_map refuses are the ones the argument parser takes: every verb in the
+# parser's case arms, and `all`. Read off the script, so a verb added there without adding it to
+# check_map goes red here.
+parsed=$(sed -n '/^case "\${1:-}" in$/,/^esac$/p' "$here/wake-lab.sh" | sed -n 's/^  \([a-z|-]*\)).*/\1/p' | tr '|' '\n' | sort -u)
+refused=$(sed -n '/^check_map() {/,/^}/p' "$here/wake-lab.sh" | sed -n 's/^      \([a-z|-]*\))$/\1/p' | tr '|' '\n' | grep -vx all | sort -u)
+check 'check_map refuses every verb the argument parser takes' '[ -n "$parsed" ] && [ "$parsed" = "$refused" ]'
 # A RENAMED box is its row renamed and nothing else: `all` and a bare status expand to the map's
 # rows, so no other list in the script still names the old box and refuses it as unknown.
 mkdir "$tmp/renamed"

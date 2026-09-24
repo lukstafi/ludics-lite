@@ -183,6 +183,8 @@ endpoint_of() { # endpoint_of <box> linux|win|wsl|lan -- that OS's ssh alias; 1 
 #  * Each box name has one row, and is a plain name (a letter or digit, then letters, digits, `_`
 #    and `-`), since it also names the box's lock files. endpoints_of reads a name's first row
 #    while `all` expands to every row, so a second row would be acted on twice and validated never.
+#    Nor may it be a word the argument parser takes (a verb, or `all`): `wake-lab.sh down` would
+#    power off the default boxes instead of waking a box called down.
 #  * Each alias belongs to one box. A row copied from another box and never edited is complete by
 #    every per-row rule, and would reach that other box under this one's locks: `sleep nova` would
 #    suspend tuf without seeing a lane or hold lock taken on tuf.
@@ -192,6 +194,10 @@ check_map() {
     read -r name rest <<<"$r"
     case "$name" in
       ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_-]*) bad="$bad the box name $(printf %q "$name") is not a plain name;"; continue ;;
+    esac
+    case "$name" in
+      status|sleep|hibernate|down|kick-wsl|restart-wsl|unhold|lock-path|all)
+        bad="$bad the box name $name is a command word;"; continue ;;
     esac
     case "$boxes" in *" $name "*) bad="$bad $name has two rows;"; continue ;; esac
     boxes="$boxes$name "
@@ -965,6 +971,7 @@ HOLD_LOCKED=0  # set in a box's subshell once its reservation holds that box's H
 VERB=wake
 TARGETS=()
 
+# Every word taken here, and `all` below, is a name check_map refuses for a box.
 case "${1:-}" in
   status|sleep|hibernate|down|kick-wsl|unhold) VERB=$1; shift ;;
   restart-wsl) VERB=kick-wsl; FRESH_WSL=fresh; shift ;;
