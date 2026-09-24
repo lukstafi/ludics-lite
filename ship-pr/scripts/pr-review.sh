@@ -2077,21 +2077,33 @@ cmd_rounds() {
 # pages at 100; the read follows it to the end, and is taken as whole only when the rows read
 # reach the totalCount its last page states (a count that leads the rows is a partial read, not a
 # smaller PR). One still paging at THREADS_PAGE_CAP pages is refused as unread rather than judged
-# on its prefix. `find_thread` (what `resolve` looks a thread up with) pages to the same cap, so
-# every thread this read can name is one the advertised `resolve` can reach (review of #370). Reads: one call per 100 threads, made only where an approval is about to be
+# on its prefix. Reads: one call per 100 threads, made only where an approval is about to be
 # reported or acted on — never on a watch round that is not ending on one.
+#
+# `find_thread` (what `resolve` looks a thread up with) reads the same connection, and both go
+# through `threads_walk`: one query, one paging loop, one cap. Every thread this read can name is
+# then one the advertised `resolve` can reach, by the same id — the two once paged to different
+# caps (review of #370, round 1), and a lookup matching only `databaseId` would miss a thread the
+# gate named by its `fullDatabaseId`.
 THREADS_PAGE_CAP=50
 THREADS_QUERY='query($owner:String!, $name:String!, $pr:Int!, $after:String) {
   repository(owner:$owner, name:$name) { pullRequest(number:$pr) {
     reviewThreads(first:100, after:$after) {
       totalCount pageInfo { hasNextPage endCursor }
-      nodes { isResolved path
+      nodes { id isResolved path
         comments(first:1) { nodes { fullDatabaseId databaseId author { login } } } } } } } }'
+# A thread's name: its first comment's id, full width first (the jq filter both readers apply).
+THREAD_ID_JQ='((.comments.nodes[0] | .fullDatabaseId // .databaseId // "-") | tostring)'
 
-# One "<first comment id>\t<author>\t<path>" row per open thread, exit 0, when the whole connection
-# was read; otherwise ONE line saying why it was not, exit 3.
-unresolved_threads() { # <pr>
-  local pr="$1" page cursor="" resp meta page_rows rows="" total n next read_n=0 rc
+# Pages PR <pr>'s reviewThreads with THREADS_QUERY and hands each page's connection to
+# `<fn> <page json>`, which returns 0 to read on, 1 to stop here (it has what it wanted), or 2 when
+# the page did not parse. <fn> runs in THIS shell, so what it collects lands in its caller's locals.
+# Exit 0 when <fn> stopped the walk or the whole connection was read — the rows read reaching the
+# totalCount the last page states; otherwise ONE line on stdout saying why not, and exit 4 when
+# GraphQL rejected the query, 3 for everything else (no answer, a malformed or short answer, the
+# cap), none of which is evidence about any thread.
+threads_walk() { # <pr> <fn>
+  local pr="$1" fn="$2" page cursor="" resp meta total n next read_n=0 rc
   local -a after=()
   for ((page = 1; page <= THREADS_PAGE_CAP; page++)); do
     after=()
@@ -2104,13 +2116,15 @@ unresolved_threads() { # <pr>
     0) ;;
     1)
       printf '%s\n' "GraphQL REJECTED the review-threads read ($(gh_err_line))"
-      return 3
+      return 4
       ;;
     *)
       printf '%s\n' "GraphQL did not answer the review-threads read after $API_ATTEMPTS attempts ($(gh_err_line))"
       return 3
       ;;
     esac
+    # A `data.repository.pullRequest` of null (GraphQL's way of erroring inside a 200) prints
+    # nothing, and is refused here with every other answer that is not a connection.
     meta=$(jq -r 'select(type == "object" and (.nodes | type == "array")
         and (.totalCount | type == "number") and (.pageInfo.hasNextPage | type == "boolean"))
       | "\(.totalCount)\t\(.nodes | length)\t\(.pageInfo.hasNextPage)\t\(.pageInfo.endCursor // "")"' \
@@ -2121,21 +2135,21 @@ unresolved_threads() { # <pr>
       return 3
       ;;
     esac
-    page_rows=$(jq -r '.nodes[] | select(.isResolved != true)
-        | [((.comments.nodes[0] | .fullDatabaseId // .databaseId // "-") | tostring),
-           ((.comments.nodes[0].author.login // "-") | tostring), ((.path // "-") | tostring)]
-        | @tsv' <<<"$resp" 2>/dev/null) || {
+    "$fn" "$resp"
+    case "$?" in
+    0) ;;
+    1) return 0 ;;
+    *)
       printf '%s\n' "the review-threads read answered page $page with threads that did not parse"
       return 3
-    }
-    [ -z "$page_rows" ] || rows="$rows$page_rows"$'\n'
+      ;;
+    esac
     read_n=$((read_n + n))
     if [ "$next" != true ]; then
       if [ "$read_n" -lt "$total" ]; then
         printf '%s\n' "the review-threads read ended at $read_n thread(s) while the PR states $total"
         return 3
       fi
-      printf '%s' "$rows"
       return 0
     fi
     [ -n "$cursor" ] || {
@@ -2145,6 +2159,22 @@ unresolved_threads() { # <pr>
   done
   printf '%s\n' "the review-threads read was still paging after $THREADS_PAGE_CAP pages of 100, so it is refused rather than judged on its first $read_n thread(s)"
   return 3
+}
+
+# One "<first comment id>\t<author>\t<path>" row per open thread, exit 0, when the whole connection
+# was read; otherwise ONE line saying why it was not, exit 3.
+unresolved_threads() { # <pr>
+  local rows=""
+  threads_walk "$1" unresolved_page || return 3
+  printf '%s' "$rows"
+}
+
+unresolved_page() { # <page json>: appends the page's open threads to unresolved_threads' rows
+  local page_rows
+  page_rows=$(jq -r ".nodes[] | select(.isResolved != true)
+      | [$THREAD_ID_JQ, ((.comments.nodes[0].author.login // \"-\") | tostring),
+         ((.path // \"-\") | tostring)] | @tsv" <<<"$1" 2>/dev/null) || return 2
+  [ -z "$page_rows" ] || rows="$rows$page_rows"$'\n'
 }
 
 # "<count>|<the first ten, named>" of unresolved_threads' rows. The path is repository-controlled,
@@ -3004,48 +3034,34 @@ _🤖 Addressed by an automated coding agent_" --jq .html_url
 }
 
 # Threads are addressed by node id, which is only reachable by matching a thread's FIRST comment.
-# Prints "<node-id> <isResolved>" for the thread starting at comment $2. Exits 1 when the PR
-# genuinely has no such thread, 2 when GraphQL never answered, and 4 when GraphQL rejected the
-# query (a 4xx: bad repo, bad auth) — the caller must not report either of the last two as a
-# missing thread and send the user hunting for a comment id that is fine. reviewThreads
-# is itself a 100-item page: a PR that ran to many rounds keeps its LATEST threads — the ones
-# actually being addressed — past the first page, so page until the id is found or the pages run
-# out. The page cap only bounds a cursor that stops advancing; it is far above any real PR.
+# Prints "<node-id> <isResolved>" for the thread starting at comment $2, matched by the same id the
+# gate names it by (THREAD_ID_JQ). Exits 1 when the PR genuinely has no such thread, 3 when the
+# read did not complete, and 4 when GraphQL rejected the query (a 4xx: bad repo, bad auth) — on
+# either of the last two it prints threads_walk's line saying why, and the caller must not report
+# it as a missing thread and send the user hunting for a comment id that is fine. reviewThreads is
+# itself a 100-item page: a PR that ran to many rounds keeps its LATEST threads — the ones actually
+# being addressed — past the first page, so the walk goes on until the id is found or the
+# connection is read whole.
 #
-# "Not found" is only concluded when EVERY page came back: one 503'd page is a hole the id could be
-# hiding in, and reporting that as a missing thread is the false finding this whole file guards
-# against. Each page therefore retries, and an unanswered page aborts the search as transport.
-find_thread() {
-  local pr="$1" id="$2" cursor="" after page resp hit rc
-  for ((page = 1; page <= THREADS_PAGE_CAP; page++)); do
-    [ -z "$cursor" ] && after="" || after=", after:\"$cursor\""
-    resp=$(gh_retry read api graphql -f query="
-      query(\$owner:String!, \$name:String!, \$pr:Int!) {
-        repository(owner:\$owner, name:\$name) { pullRequest(number:\$pr) {
-          reviewThreads(first:100$after) {
-            pageInfo { hasNextPage endCursor }
-            nodes { id isResolved comments(first:1) { nodes { databaseId } } } } } } }" \
-      -F owner="${REPO%%/*}" -F name="${REPO##*/}" -F pr="$pr" \
-      --jq .data.repository.pullRequest.reviewThreads)
-    rc=$?
-    [ "$rc" -eq 1 ] && return 4
-    [ "$rc" -eq 0 ] || return 2
-    # A `data.repository.pullRequest` of null (GraphQL's way of erroring inside a 200) prints
-    # nothing: the query did not run, so it is not evidence about the thread either.
-    [ -n "$resp" ] || return 2
+# "Not found" is only concluded when EVERY page came back and they add up to the PR's totalCount:
+# one 503'd page is a hole the id could be hiding in, and reporting that as a missing thread is the
+# false finding this whole file guards against.
+find_thread() { # <pr> <comment id>
+  local id hit="" rc
+  # split_ids admits leading zeros, and the id is matched as the string GitHub serves.
+  id=$(jq -rn --arg id "$2" '$id | sub("^0+(?=.)"; "")')
+  threads_walk "$1" thread_page
+  rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  [ -n "$hit" ] || return 1
+  printf '%s\n' "$hit"
+}
 
-    hit=$(jq -r --argjson id "$id" '.nodes[]
-      | select(.comments.nodes[0].databaseId == $id) | "\(.id) \(.isResolved)"' <<<"$resp") || return 2
-    if [ -n "$hit" ]; then
-      echo "$hit"
-      return 0
-    fi
-
-    [ "$(jq -r '.pageInfo.hasNextPage' <<<"$resp")" = true ] || return 1
-    cursor=$(jq -r '.pageInfo.endCursor // ""' <<<"$resp")
-    [ -n "$cursor" ] || return 1
-  done
-  return 1
+thread_page() { # <page json>: stops the walk on the thread find_thread's id starts
+  hit=$(jq -r --arg id "$id" ".nodes[] | select($THREAD_ID_JQ == \$id)
+      | \"\\(.id) \\(.isResolved)\"" <<<"$1" 2>/dev/null) || return 2
+  hit="${hit%%$'\n'*}"
+  [ -z "$hit" ] || return 1
 }
 
 # One thread, closed. <label> is nonempty when the invocation carries several ids, and then each
@@ -3062,10 +3078,10 @@ idempotent, so the whole token is safe to repeat."
   rc=$?
   case "$rc" in
   0) ;;
-  2) fail 3 "GraphQL did not answer for PR $REPO#$pr after $API_ATTEMPTS attempts per page" \
-    "($(gh_err_line)) — thread resolution has no REST equivalent, so this is a RETRY, not a" \
-    "missing thread: the threads are probably all there, and the reply (REST) may well have gone" \
-    "through. Do NOT read this as someone else having resolved it or as a wrong comment id.$progress" ;;
+  3) fail 3 "the thread lookup on PR $REPO#$pr did not complete: $hit — thread resolution has no" \
+    "REST equivalent, so this is a RETRY, not a missing thread: the threads are probably all" \
+    "there, and the reply (REST) may well have gone through. Do NOT read this as someone else" \
+    "having resolved it or as a wrong comment id.$progress" ;;
   4) fail 2 "GraphQL REJECTED the thread lookup for PR $REPO#$pr: $(gh_err_line)." \
     "The search never ran, so this says nothing about comment $id — check the repo, the PR" \
     "number and \`gh auth status\` rather than the comment id.$progress" ;;

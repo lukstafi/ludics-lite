@@ -56,6 +56,8 @@ FAIL_MSG=""
 # The threads the PR has, as "<comment id>:<resolved>" pairs; a comment id absent from this list
 # is a thread that does not exist, which is `resolve`'s one exit-1 answer.
 THREADS="900:false 901:false 902:false 903:true"
+# The totalCount the connection states, when a case needs one other than the rows it serves.
+THREADS_TOTAL=""
 
 reset_fixture() {
   : >"$REQUEST_LOG"
@@ -67,18 +69,23 @@ reset_fixture() {
   CWD_REPO=""
   REPO="$TARGET_REPO"
   THREADS="900:false 901:false 902:false 903:true"
+  THREADS_TOTAL=""
 }
 
+# One page, served as GitHub serves the connection: the id `fullDatabaseId` names first as a
+# BigInt string, `databaseId` beside it as the 32-bit Int it is typed as — absent past 2^31, which
+# review comment ids already run beyond — and a totalCount the lookup checks its read against.
 threads_json() {
   local pair nodes=""
   for pair in $THREADS; do
-    nodes="$nodes,$(jq -cn --arg id "T${pair%%:*}" --argjson res "${pair##*:}" \
-      --argjson db "${pair%%:*}" \
-      '{id:$id, isResolved:$res, comments:{nodes:[{databaseId:$db}]}}')"
+    nodes="$nodes,$(jq -cn --arg id "${pair%%:*}" --argjson res "${pair##*:}" \
+      '{id:("T" + $id), isResolved:$res,
+        comments:{nodes:[{fullDatabaseId:$id,
+          databaseId:(($id | tonumber) as $n | if $n < 2147483648 then $n else null end)}]}}')"
   done
-  jq -cn --argjson nodes "[${nodes#,}]" \
+  jq -cn --argjson nodes "[${nodes#,}]" --argjson total "${THREADS_TOTAL:-null}" \
     '{data:{repository:{pullRequest:{reviewThreads:
-      {pageInfo:{hasNextPage:false, endCursor:null}, nodes:$nodes}}}}}'
+      {totalCount:($total // ($nodes | length)), pageInfo:{hasNextPage:false, endCursor:null}, nodes:$nodes}}}}}'
 }
 
 # The body of a write is read off the raw arguments rather than out of the shared parser: the
@@ -434,6 +441,39 @@ test_a_missing_thread_names_where_the_batch_stopped() {
     "nothing was closed, so nothing may be claimed"
 }
 
+# `resolve` finds a thread by the id the open-thread gate names it by: `fullDatabaseId`, the BigInt
+# string, since `databaseId` is a 32-bit Int and review comment ids already run past 2^31. A lookup
+# matching `databaseId` alone answered "no review thread starts at comment N" for a thread `merge`
+# had just refused over by that very N.
+test_resolve_finds_a_thread_by_its_full_width_id() {
+  reset_fixture
+  THREADS="900:false 4095735684:false"
+  run_cmd cmd_resolve 4095735684
+  assert_eq "$RC" 0 "a thread past 2^31 is found"
+  assert_contains "$(cat "$BODIES/mutations")" '"T4095735684"' "and it is that thread that is closed"
+  # The id is matched as GitHub serves it, so a zero-padded token still names the same thread.
+  reset_fixture
+  run_cmd cmd_resolve 0900
+  assert_eq "$RC" 0 "leading zeros do not make a thread missing"
+  assert_contains "$(cat "$BODIES/mutations")" '"T900"' "the thread 900 starts"
+}
+
+# "No such thread" is a claim about the WHOLE connection, so a read that came up short of the
+# totalCount it states is a retry, not an answer — the thread could be in the part never served.
+test_a_short_read_is_a_retry_not_a_missing_thread() {
+  reset_fixture
+  THREADS_TOTAL=9
+  run_cmd cmd_resolve 999
+  assert_eq "$RC" 3 "an incomplete lookup is transport"
+  assert_contains "$ERR" "ended at 4 thread(s) while the PR states 9" "and says how it was short"
+  assert_not_contains "$ERR" "no review thread starts" "never a missing thread"
+  # The control: a thread that IS on the part served is found all the same.
+  reset_fixture
+  THREADS_TOTAL=9
+  run_cmd cmd_resolve 900
+  assert_eq "$RC" 0 "a hit needs no count"
+}
+
 # --- the repo a write lands on is NAMED, never inferred from the cwd (ludics-lite#92) -----------
 
 # `resolve_repo` verified a CACHED repo against repos/<repo>/pulls/<n> before trusting it — its
@@ -563,6 +603,8 @@ tests=(
   test_resolve_closes_every_thread_the_token_names
   test_an_already_resolved_thread_costs_no_write
   test_a_missing_thread_names_where_the_batch_stopped
+  test_resolve_finds_a_thread_by_its_full_width_id
+  test_a_short_read_is_a_retry_not_a_missing_thread
   test_a_reply_never_takes_its_repo_from_the_cwd
   test_the_refusal_holds_when_the_cwd_repo_has_that_pr_number
   test_a_resolve_never_takes_its_repo_from_the_cwd
