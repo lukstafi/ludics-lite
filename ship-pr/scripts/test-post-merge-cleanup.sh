@@ -97,7 +97,8 @@ assert_remote_topic_absent() {
 # `assert_remote_restored_after_local_cleanup` instead. Fail-closed: a case that replaced the
 # logging hook has no record, and is refused rather than passed on an empty log. So is a
 # `core.hooksPath` -- global, or set in the environment -- that sends Git to another hooks
-# directory: the hook is compared at the path Git resolves, not at the one it was written to.
+# directory: the hook is compared at the path Git resolves, not at the one it was written to, and
+# must still be executable, since Git skips a hook that is not.
 assert_topic_preserved() {
   local hook
   git -C "$CASE_MAIN" show-ref --verify --quiet "refs/heads/$CASE_BRANCH" || fail "local topic was deleted"
@@ -105,7 +106,7 @@ assert_topic_preserved() {
     fail "remote $CASE_BRANCH was deleted"
   [ -d "$CASE_SESSION" ] || fail "topic worktree was removed"
   hook=$(git_path_of "$CASE_MAIN" hooks/pre-push) || fail "could not locate the effective pre-push hook"
-  cmp -s "$CASE_PUSH_LOG_HOOK" "$hook" ||
+  [ -x "$hook" ] && cmp -s "$CASE_PUSH_LOG_HOOK" "$hook" ||
     fail "the pre-push hook Git runs is not the push logger, so whether the remote was touched is unrecorded"
   [ ! -s "$CASE_PUSH_LOG" ] || fail "the remote was pushed to by a refusal that must not touch it: $(cat "$CASE_PUSH_LOG")"
 }
@@ -181,8 +182,10 @@ keep_last_reflog_entry() {
 }
 
 # install_push_log_hook: record every push sent from the case's repository -- its main checkout
-# and every worktree of it, which share its hooks -- one line per ref, prefixed with whether local
-# refs/heads/topic still existed when the push was sent. Restores are pushes too, so an empty log
+# and every worktree of it, which share its hooks -- as an `invoked` line, then one line per ref it
+# proposes, each prefixed with whether local refs/heads/topic still existed when the push was sent.
+# The `invoked` line is there for a push that proposes no ref update: an up-to-date push still
+# reaches the remote and runs the hook, with nothing on its input. Restores are pushes too, so an empty log
 # proves the remote was never deleted and put back. Its boundary: a pre-push hook sees only pushes
 # Git runs hooks for, so a push from another repository, or one sent with --no-verify, is not
 # recorded; the helper sends neither. A case's own push from this repository before an
@@ -200,6 +203,7 @@ install_push_log_hook() {
     printf 'real_git=%q main=%q log=%q\n' "$(command -v git)" "$CASE_MAIN" "$CASE_PUSH_LOG"
     printf '%s\n' \
       'if "$real_git" -C "$main" show-ref --verify --quiet refs/heads/topic; then state=local-present; else state=local-absent; fi' \
+      'printf "%s invoked\n" "$state" >>"$log"' \
       'while read -r local_ref local_oid remote_ref remote_oid; do' \
       '  printf "%s %s %s %s %s\n" "$state" "$local_ref" "$local_oid" "$remote_ref" "$remote_oid" >>"$log"' \
       'done' \
@@ -4131,7 +4135,8 @@ test_remote_deletion_follows_local_deletion() {
   "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
   assert_cleaned
   zero=$(printf '%s' "$CASE_TOPIC_OID" | tr '0-9a-f' '0')
-  assert_eq "$(cat "$CASE_PUSH_LOG")" "local-absent (delete) $zero refs/heads/topic $CASE_TOPIC_OID" \
+  assert_eq "$(cat "$CASE_PUSH_LOG")" "local-absent invoked
+local-absent (delete) $zero refs/heads/topic $CASE_TOPIC_OID" \
     "the only push must be the remote topic deletion, sent after the local topic was gone"
   echo "PASS: the remote topic is deleted last, after the local deletion has committed"
 }
@@ -4140,11 +4145,12 @@ test_remote_deletion_follows_local_deletion() {
 # topic and pushes it back at the same tip: every ref and the session end exactly as they began, so
 # only the push log can tell, and the assertion must go red on it. `unhooked` replaces the logging
 # hook and pushes nothing: the empty log then records nothing, and the assertion must refuse it
-# rather than pass. `redirected` leaves the hook in place but points core.hooksPath elsewhere, so
-# Git would never run it: refused for the same reason.
+# rather than pass. `redirected` leaves the hook in place but points core.hooksPath elsewhere, and
+# `unexecutable` clears its executable bit: Git would never run it, so both are refused the same
+# way. `up-to-date` sends a push that proposes no ref update, which still reaches the remote.
 test_topic_preserved_negative_controls() {
   local mode out
-  for mode in deleted unhooked redirected; do
+  for mode in deleted unhooked redirected unexecutable up-to-date; do
     setup_case "topic-preserved-control-$mode" merge main-off
     case "$mode" in
     deleted)
@@ -4160,6 +4166,20 @@ test_topic_preserved_negative_controls() {
       mkdir "$CASE_ROOT/other-hooks"
       git -C "$CASE_MAIN" config core.hooksPath "$CASE_ROOT/other-hooks"
       ;;
+    unexecutable)
+      chmod -x "$CASE_MAIN/.git/hooks/pre-push"
+      # Git Bash reads executability off a `#!` line, not a mode bit, and so does Git for Windows:
+      # there the hook is still one Git runs, and there is nothing for the assertion to refuse.
+      if [ -x "$CASE_MAIN/.git/hooks/pre-push" ]; then
+        echo "note: this platform keeps a #! file executable without its mode bit; unexecutable skipped"
+        continue
+      fi
+      ;;
+    up-to-date)
+      git -C "$CASE_MAIN" push origin "$CASE_TOPIC_OID:refs/heads/topic" >/dev/null 2>&1
+      assert_eq "$(cat "$CASE_PUSH_LOG")" "local-present invoked" \
+        "an up-to-date push must be recorded although it proposes no ref update"
+      ;;
     esac
     if out=$(assert_topic_preserved 2>&1); then
       fail "assert_topic_preserved passed a topic it cannot vouch for ($mode)"
@@ -4168,10 +4188,12 @@ test_topic_preserved_negative_controls() {
     "deleted:FAIL: the remote was pushed to by a refusal that must not touch it: "*) ;;
     "unhooked:FAIL: the pre-push hook Git runs is not the push logger, so whether the remote was touched is unrecorded") ;;
     "redirected:FAIL: the pre-push hook Git runs is not the push logger, so whether the remote was touched is unrecorded") ;;
+    "unexecutable:FAIL: the pre-push hook Git runs is not the push logger, so whether the remote was touched is unrecorded") ;;
+    "up-to-date:FAIL: the remote was pushed to by a refusal that must not touch it: "*) ;;
     *) fail "assert_topic_preserved went red for another reason ($mode): $out" ;;
     esac
   done
-  echo "PASS: assert_topic_preserved refuses a delete-then-restore, a replaced push-log hook and a relocated hooks directory"
+  echo "PASS: assert_topic_preserved refuses a delete-then-restore, an up-to-date push, and a push logger Git would not run"
 }
 
 # A local topic recreated while the remote steps run must not outlive its public branch. Each mode
