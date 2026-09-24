@@ -45,6 +45,7 @@ SECTIONS=(
   "codex workers"
   "halt"
   "execution run and conclude --from-run"
+  "refresh (execution-only boxes)"
   "execution slot"
   "usage"
 )
@@ -295,12 +296,15 @@ EOF
 # answer, `ssh <opts> <host> exit 0`. `SHIM_SSH_DENY=<host>` answers a missing credential,
 # `SHIM_SSH_DOWN=<host>` a box that does not answer; every other probed host is reachable. Any
 # other invocation (run_on's `bash -s` to a box the tests never map as local) is unresolvable, as
-# it would be for real: nothing in these tests reaches a real box.
+# it would be for real: nothing in these tests reaches a real box. The one exception is
+# `SHIM_SSH_LOCAL=<host>`, which runs whatever reaches that host here, as its remote shell would:
+# the stand-in for a second box, so a cross-box path is exercised through run_on's real quoting.
 cat > "$TMP/bin/ssh" <<'SHIMEOF'
 #!/usr/bin/env bash
 host=""
 while [ $# -gt 0 ]; do case "$1" in -o) shift ;; -*) ;; *) host="$1"; break ;; esac; shift; done
 shift
+[ -n "${SHIM_SSH_LOCAL:-}" ] && [ "$host" = "$SHIM_SSH_LOCAL" ] && exec bash -c "$*"
 [ "$*" = "exit 0" ] || { echo "ssh: Could not resolve hostname $host: nodename nor servname provided" >&2; exit 255; }
 [ "$host" = "${SHIM_SSH_HANG:-}" ] && sleep 30
 [ "$host" = "${SHIM_SSH_SLURP:-}" ] && cat > /dev/null
@@ -693,7 +697,7 @@ expect "a sibling whose login never returns is bounded and noted, not hung" 0 "P
 # alone, never a refusal, and rog and minix answering add nothing (the `$` anchor says so).
 expect "mac-studio with the default roster notes a sleeping TUF and still passes" 0 "PREFLIGHT OK mac-studio skills=[0-9a-f]* (cross-box unreachable, asleep or off the network: tuf-amd-linux)$" -- \
   env -u FLEET_BOXES FLEET_LOCAL_BOX=mac-studio SHIM_SSH_DOWN=tuf-amd-linux "$FW" preflight mac-studio --no-probe
-[ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded reach probe" || ok "preflight lock released after the bounded reach probe"
+[ -d "$repo/.git/fleet-checkout.lock" ] && ko "preflight lock left after the bounded reach probe" || ok "preflight lock released after the bounded reach probe"
 # The slot count per roster box is on the preflight's output (ludics-lite#329): it showed nowhere
 # but in a batch's own slot line, so a day of one-slot Mac batches passed every preflight. Each
 # case sets or unsets both variables itself.
@@ -743,7 +747,7 @@ expect "a malformed spec is a warning on the preflight, which still passes" 0 "P
 echo x >> "$repo/ship-pr/SKILL.md"
 expect "a reachable sibling does not swallow the refusal that follows the probe" 1 "1 local change(s) in the served tree" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_SLURP=otherbox "$FW" preflight testbox --no-probe
 git -C "$repo" checkout -q -- ship-pr/SKILL.md
-[ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
+[ -d "$repo/.git/fleet-checkout.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
 # `execution slot` runs a python3 flock on the box that runs the batches, so Python is no longer
 # an anchor-only requirement and the preflight is where a box missing it must say so.
 mkdir -p "$TMP/nopy"; printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/nopy/python3"; chmod +x "$TMP/nopy/python3"
@@ -1035,6 +1039,15 @@ expect "ls reports it as ORPHANED too" 0 "testbox/wv ORPHANED" -- "$FW" ls testb
 t0=$(date +%s)
 expect "attach waits for the orphan to exit and then reports VANISHED" 3 "VANISHED testbox/wv" -- "$FW" attach testbox wv --interval 1
 [ $(( $(date +%s) - t0 )) -ge 2 ] && ok "attach held while the orphan lived" || ko "attach returned before the orphan exited"
+# ludics-lite#361: a DONE turn that ended announcing a pending wait is marked, not failed.
+printf 'The watch is ARMED; it will wake me\n' > "$TMP/strand.md"
+"$FW" launch testbox wst --target-repo example/project --kind claude --brief "$TMP/strand.md" --cwd "$proj" >/dev/null
+expect "a final message announcing a pending wait marks DONE as a PROBABLE STRAND, exit still 0" 0 \
+  'DONE testbox/wst exit=0 .* | PROBABLE STRAND: the final message says "will wake me"' -- "$FW" attach testbox wst --interval 1
+printf 'The watch returned rc=0 and it merged\n' > "$TMP/nostrand.md"
+"$FW" launch testbox wns --target-repo example/project --kind claude --brief "$TMP/nostrand.md" --cwd "$proj" >/dev/null
+out=$("$FW" attach testbox wns --interval 1 2>&1)
+grep -q '^DONE testbox/wns ' <<<"$out" && ! grep -q 'PROBABLE STRAND' <<<"$out" && ok "a final message with no listed phrase is a plain DONE" || ko "unlisted final message: $out"
 }
 
 section "unstick" && {
@@ -1192,6 +1205,10 @@ expect "a resumed turn that emits nothing is FAILED even though the first turn s
   env SHIM_CODEX_SILENT_RESUME=1 bash -c '"$0" unstick testbox c1 --message "$1" && "$0" attach testbox c1 --interval 1' "$FW" "$TMP/msg.md"
 "$FW" unstick testbox c1 --message "$TMP/msg.md" >/dev/null
 expect "the resumed codex turn's verdict carries the NEW message, from the stream" 0 "DONE testbox/c1 exit=0 turn.completed .*| codex did: Stop and answer now" -- "$FW" attach testbox c1 --interval 1
+printf 'Watch armed; it wakes me later\n' > "$TMP/cstrand.md"
+"$FW" launch testbox cst --target-repo example/project --kind codex --brief "$TMP/cstrand.md" --cwd "$proj" >/dev/null
+expect "a codex turn's last agent message is read for the strand mark too" 0 \
+  'DONE testbox/cst exit=0 turn.completed .* | PROBABLE STRAND: the final message says "wakes me"' -- "$FW" attach testbox cst --interval 1
 }
 
 section "halt" && {
@@ -1280,6 +1297,106 @@ grep -Fq "\"observed_sha\": \"$ran\"" <<<"$out" && ok "...with the reported revi
 jq -n '{request_id:"run-other", verdict:"not-launched", log:"/dev/null", evidence:"fixture never invoked a runner on other"}' > "$TMP/run-other-done.json"
 "${FWX[@]}" execution conclude "$TMP/run-other-done.json" >/dev/null || ko "could not conclude the off-box fixture (setup)"
 expect "a run of a request outside the roster is refused" 1 "canonical FLEET_BOXES" -- "$FW" execution run "$(reqjson run-e)"
+}
+
+section "refresh (execution-only boxes)" && {
+need_lease
+# ludics-lite#362: only launch and preflight fast-forwarded a box's skills checkout, so a box the
+# fleet only EXECUTES on kept a stale one (tuf lacked `execution hold`). `refresh` is the
+# preflight's own freshness function alone, and a cross-box `execution run`/`dispatch` runs it on
+# the execution host after the dispatch. `other` is the second box: SHIM_SSH_LOCAL runs its far
+# side here, against the same scratch checkout.
+git -C "$repo" fetch -q origin && git -C "$repo" merge --ff-only -q origin/main || ko "could not bring the scratch checkout current (setup)"
+upstream() { # <line>: advance the scratch origin by one commit, from a clone of its own
+  [ -d "$TMP/refresh-up" ] || git clone --no-local -q -b main "$origin" "$TMP/refresh-up"
+  git -C "$TMP/refresh-up" pull -q --ff-only origin main && echo "$1" >> "$TMP/refresh-up/ship-pr/SKILL.md" \
+    && git -C "$TMP/refresh-up" commit -q -am "$1" && git -C "$TMP/refresh-up" push -q origin main \
+    || ko "could not advance the scratch origin (setup)"
+}
+rreq() { # <id> [execution host] -> a reservation payload, on `other` unless named
+  jq -n --arg id "$1" --arg host "${2:-other}" '{request_id:$id, wave:"w", worker:$id, transport:"subagent", issue:"o/r#362", purpose:"refresh fixture",
+    agent_host:"testbox", execution_host:$host, repository:"o/r", requested_revision:"origin/main", kind:"correctness"}' > "$TMP/refresh-$1.json"
+  printf '%s' "$TMP/refresh-$1.json"
+}
+rdone() { # <id>: conclude it, so its box is free for the next case
+  jq -n --arg id "$1" '{request_id:$id, verdict:"not-launched", log:"/dev/null", evidence:"refresh fixture never ran a runner"}' > "$TMP/refresh-$1-done.json"
+  "${FWR[@]}" execution conclude "$TMP/refresh-$1-done.json" >/dev/null || ko "could not conclude $1 (setup)"
+}
+FWR=(env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other "$FW")
+cur=$(git -C "$repo" rev-parse HEAD)
+expect "a current checkout reports already current" 0 "^REFRESH OK testbox skills=${cur:0:9} (already current)$" -- "$FW" refresh testbox
+upstream stale-1
+expect "a stale checkout is fast-forwarded, and says from where" 0 "^REFRESH OK testbox skills=[0-9a-f]* (fast-forwarded from ${cur:0:9})$" -- "$FW" refresh testbox
+[ "$(git -C "$repo" rev-parse HEAD)" = "$(git -C "$TMP/refresh-up" rev-parse HEAD)" ] && ok "...to origin/main" || ko "refresh did not bring the checkout to origin/main"
+upstream stale-2; cur=$(git -C "$repo" rev-parse HEAD)
+echo local-fix >> "$repo/issue-wave/SKILL.md"
+expect "a divergent checkout is reported, not refreshed" 1 "^REFRESH FAILED testbox: 1 local change(s) in the served tree -- left as it is, never reset" -- "$FW" refresh testbox
+[ "$(git -C "$repo" rev-parse HEAD)" = "$cur" ] && grep -q local-fix "$repo/issue-wave/SKILL.md" && ok "...and left exactly as it was: HEAD and the local edit" || ko "a divergent checkout was moved or reset"
+git -C "$repo" checkout -q -- issue-wave/SKILL.md
+expect "a stalling fetch is bounded by FLEET_REFRESH_TIMEOUT and reported" 1 "REFRESH FAILED testbox: git fetch in .* timed out after 2s" -- env SHIM_GIT_HANG_FETCH=1 FLEET_REFRESH_TIMEOUT=2 "$FW" refresh testbox
+[ -d "$repo/.git/fleet-checkout.lock" ] && ko "refresh left the checkout's lock behind" || ok "...and releases the lock it shares with the preflight"
+# The lock is the checkout's own, in its git directory, so a caller under another ISSUE_WAVE_STATE
+# (the sweep beside a wave) meets it too. A holder may yet fail, so a busy lock is waited out and
+# the checkout then checked here; one never freed in time is a failure, not a pass.
+hold_checkout_lock() { # <seconds>: a live holder of the checkout's lock, as take_lock records one
+  sleep "$1" & lockholder=$!
+  mkdir "$repo/.git/fleet-checkout.lock" && ps -o lstart= -p "$lockholder" | tr -s ' ' > "$repo/.git/fleet-checkout.lock/start" \
+    && echo "$lockholder" > "$repo/.git/fleet-checkout.lock/pid" || ko "could not plant the lock holder (setup)"
+}
+upstream stale-lock; cur=$(git -C "$repo" rev-parse HEAD)
+hold_checkout_lock 3
+expect "a refresh waits out a holder that finishes, then checks the checkout itself" 0 "^REFRESH OK testbox skills=[0-9a-f]* (fast-forwarded from ${cur:0:9})$" -- \
+  env ISSUE_WAVE_STATE="$TMP/sweep-state" FLEET_REFRESH_TIMEOUT=15 "$FW" refresh testbox
+wait "$lockholder" 2>/dev/null
+hold_checkout_lock 60
+expect "a holder that outlasts the bound fails the refresh, whatever the caller's state directory" 1 "^REFRESH FAILED testbox: lock .*fleet-checkout.lock held by pid $lockholder for 2s" -- \
+  env ISSUE_WAVE_STATE="$TMP/sweep-state" FLEET_REFRESH_TIMEOUT=2 "$FW" refresh testbox
+kill "$lockholder" 2>/dev/null; wait "$lockholder" 2>/dev/null; rm -rf "$repo/.git/fleet-checkout.lock"
+expect "a box that does not answer is unreachable (exit 4), not failed" 4 "^REFRESH UNREACHABLE other: its skills checkout was not checked" -- env FLEET_BOXES="testbox other" "$FW" refresh other
+expect "several boxes: one line each, and a failure outranks an unreachable box" 1 "REFRESH UNREACHABLE other" -- env FLEET_BOXES="testbox other" SHIM_GIT_HANG_FETCH=1 FLEET_REFRESH_TIMEOUT=1 "$FW" refresh other testbox
+grep -q "^REFRESH FAILED testbox" <<<"$out" && ok "...with the failed box's own line" || ko "multi-box refresh lost a line: $out"
+expect "refresh needs a box" 2 "refresh: which box" -- "$FW" refresh
+# The execution path. The checkout is stale again; a dispatch to `other` refreshes it, on stderr,
+# with the record alone on stdout and the dispatch's own status.
+upstream stale-3; cur=$(git -C "$repo" rev-parse HEAD)
+"${FWR[@]}" execution run "$(rreq rf-a)" > "$TMP/rf-a.out" 2> "$TMP/rf-a.err"; rc=$?
+[ "$rc" -eq 0 ] && jq -e '.state == "launching"' "$TMP/rf-a.out" >/dev/null && ok "a cross-box execution run dispatches, with only the record on stdout" || ko "cross-box run: rc=$rc $(cat "$TMP/rf-a.out" "$TMP/rf-a.err")"
+grep -q "^REFRESH OK other skills=[0-9a-f]* (fast-forwarded from ${cur:0:9})$" "$TMP/rf-a.err" && ok "...and fast-forwards the execution host's skills checkout, reported on stderr" || ko "cross-box run did not refresh: $(cat "$TMP/rf-a.err")"
+rdone rf-a
+expect "a refused dispatch never touches the execution host" 1 "already dispatched" -- "${FWR[@]}" execution run "$(rreq rf-a)"
+grep -q REFRESH <<<"$out" && ko "a refused run refreshed the box: $out" || ok "...(no refresh line)"
+upstream stale-4; cur=$(git -C "$repo" rev-parse HEAD)
+expect "a run on the anchor and local box refreshes it too (no launch need have preflighted it)" 0 "REFRESH OK testbox skills=[0-9a-f]* (fast-forwarded from ${cur:0:9})" -- "${FWR[@]}" execution run "$(rreq rf-b testbox)"
+upstream stale-4b; cur=$(git -C "$repo" rev-parse HEAD)
+rdone rf-b
+echo local-fix >> "$repo/issue-wave/SKILL.md"
+expect "a divergent execution host is reported and the dispatch still stands" 0 "REFRESH FAILED other: 1 local change(s) in the served tree -- left as it is, never reset" -- "${FWR[@]}" execution run "$(rreq rf-c)"
+[ "$(git -C "$repo" rev-parse HEAD)" = "$cur" ] && grep -q local-fix "$repo/issue-wave/SKILL.md" && ok "...with the checkout left as it was" || ko "a divergent execution host was moved or reset"
+git -C "$repo" checkout -q -- issue-wave/SKILL.md; rdone rf-c
+# A dispatch whose record cannot be read says so, rather than skipping the refresh silently.
+mkdir -p "$TMP/nojq"; printf '#!/bin/sh\necho "jq: not here" >&2; exit 127\n' > "$TMP/nojq/jq"; chmod +x "$TMP/nojq/jq"
+expect "an unreadable dispatched record is a loud refresh failure, the dispatch standing" 0 "REFRESH FAILED: cannot read the execution host from the dispatched record (jq: not here)" -- \
+  env PATH="$TMP/nojq:$PATH" "${FWR[@]}" execution run "$(rreq rf-g)"
+rdone rf-g
+# The reserve + dispatch pair refreshes at the dispatch, which is where the box is about to be used.
+"${FWR[@]}" execution reserve "$(rreq rf-d)" 2>&1 | grep -q REFRESH && ko "a bare reserve refreshed the box" || ok "a bare reserve does not refresh"
+jq -n '{request_id:"rf-d", evidence:"fixture dispatch"}' > "$TMP/refresh-rf-d-dispatch.json"
+expect "...its dispatch does" 0 "REFRESH OK other skills=[0-9a-f]* (fast-forwarded from ${cur:0:9})" -- "${FWR[@]}" execution dispatch "$TMP/refresh-rf-d-dispatch.json"
+rdone rf-d
+# The refresh runs after the registry's lock is released: a fetch that hangs on the execution host
+# must not keep other coordinator mutations out. While it hangs, a mutation with no lock wait at
+# all goes through (a record on the same request, so no slot is in question).
+upstream stale-5
+env SHIM_GIT_HANG_FETCH=1 FLEET_REFRESH_TIMEOUT=6 "${FWR[@]}" execution run "$(rreq rf-e)" > "$TMP/rf-e.out" 2> "$TMP/rf-e.err" &
+hung=$!
+for _ in $(seq 40); do grep -q '"state": "launching"' "$TMP/rf-e.out" 2>/dev/null && break; sleep 0.25; done
+jq -n '{request_id:"rf-e", state:"running", evidence:"fixture: recorded while the refresh hangs"}' > "$TMP/refresh-rf-e-record.json"
+expect "while the refresh's fetch hangs, the registry lock is free" 0 '"state": "running"' -- env FLEET_LOCK_WAIT=0 "${FWR[@]}" execution record "$TMP/refresh-rf-e-record.json"
+kill -0 "$hung" 2>/dev/null && ok "...(the refresh was still running)" || ko "the hanging refresh had already ended; the lock check proved nothing"
+wait "$hung"; rc=$?
+[ "$rc" -eq 0 ] && grep -q "REFRESH FAILED other: git fetch in .* timed out after 6s" "$TMP/rf-e.err" && ok "...and the bounded fetch is reported, the dispatch standing" || ko "hung refresh: rc=$rc $(cat "$TMP/rf-e.err")"
+rdone rf-e
+git -C "$repo" fetch -q origin && git -C "$repo" merge --ff-only -q origin/main || ko "could not leave the scratch checkout current (teardown)"
 }
 
 section "execution slot" && {

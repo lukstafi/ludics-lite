@@ -37,6 +37,9 @@
 #   fleet-worker.sh claim [--take]         # take the fleet's coordinator lease (--take adopts)
 #   fleet-worker.sh coordinator | release  # who holds it (exit 0 me, 1 other, 3 nobody) / give it up
 #   fleet-worker.sh preflight <box> [--codex|--native-codex|--native-claude] [--no-probe] [--no-cross]   # launch runs this itself, too
+#   fleet-worker.sh refresh <box> [<box> ...]   # fast-forward each box's skills checkout alone, or
+#                          # report why not (never resets); `execution run`/`dispatch` run it
+#                          # on the execution host
 #   fleet-worker.sh gate --target-repo <owner/repo> [--base-branch <branch>] [--force --allow-red-base <reason>] # lease + halt read before native dispatch (not a reservation)
 #   fleet-worker.sh launch <box> <name> --target-repo <owner/repo> --kind claude|codex --brief <file>
 #                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
@@ -118,6 +121,8 @@
 #   FLEET_CROSS_TIMEOUT: wall-clock bound on each cross-box ssh reach probe of the preflight; 20.
 #   FLEET_FETCH_TIMEOUT: wall-clock bound on skills-checkout and project fetches; 300.
 #   FLEET_GH_TIMEOUT: wall-clock bound on the preflight's `gh api user` credential call; 30.
+#   FLEET_REFRESH_TIMEOUT: wall-clock bound on `refresh`'s skills fetch (and so on the refresh
+#     after a cross-box `execution run`/`dispatch`); 30.
 
 set -uo pipefail
 
@@ -452,10 +457,77 @@ anchor_gate() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# The skills checkout's freshness, shared by the preflight and `refresh` (ludics-lite#362) so the
+# two can never disagree about what "current" means. Far side, after the prelude; the caller
+# defines note() (it appends to $refuse) and runs this before any note of its own, since the
+# fast-forward is attempted only when this function has noted nothing. Brings a clean main to
+# origin/main and never resets anything: a divergent checkout is noted, not repaired. Arg: the
+# fetch's wall-clock bound. Sets repo, before (HEAD on entry), head, up (origin/main) and other
+# (changes outside the served tree). Returns 2 when there is no checkout at all, else 0.
+# checkout_lock <wait> <label> goes first: the lock that serializes everything that fetches or
+# fast-forwards the checkout. It lives in the checkout's own git directory, so every caller on the
+# box meets the same lock whatever its ISSUE_WAVE_STATE (per coordinator; the daily sweep may run
+# under another), which a lock under that state directory did not give (PR #379 review). Sets repo
+# and plock and arms the release; prints the refusal and returns 1 on timeout, 2 with no checkout.
+freshness_fn() {
+  cat <<'EOF'
+checkout_lock() {
+  local gitdir
+  repo=$(expand_tilde "$SKILLS_REPO")
+  gitdir=$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null) || return 2
+  plock="$gitdir/fleet-checkout.lock"
+  take_lock "$plock" "$1" "$2" || return 1
+  trap 'release_lock "$plock"' EXIT
+}
+skills_freshness() {
+  local prior="$refuse" frc served statusz hidden entry st path from branch
+  repo=$(expand_tilde "$SKILLS_REPO")
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || return 2
+  before=$(git -C "$repo" rev-parse HEAD 2>/dev/null)
+  bounded "$1" git -C "$repo" fetch -q origin >/dev/null; frc=$?
+  if [ "$frc" -eq 124 ]; then note "git fetch in $repo timed out after ${1}s"; elif [ "$frc" -ne 0 ]; then note "fetch failed (offline?)"; fi
+  # The whole checkout is the served tree: every skill directory sits at its root, so any local
+  # change - tracked, untracked, even ignored - is divergence to surface, since the deployed
+  # symlinks would serve it. The one exception is a stray .claude/ (settings.local.json appears
+  # wherever claude was run inside the checkout): not skill text, so reported rather than refused.
+  # The fast-forward below still fails, and refuses, if such a change collides with what upstream brings.
+  # NUL-delimited, so a path git would otherwise quote (a space, a quote, a non-ASCII byte) is
+  # still classified by its directory rather than falling through as "outside the served tree".
+  served=0; other=""
+  statusz=$(mktemp "${TMPDIR:-/tmp}/fw-status.XXXXXX")
+  if ! git -C "$repo" status --porcelain -z --untracked-files=all --ignored=matching > "$statusz" 2>/dev/null; then
+    rm -f "$statusz"; note "git status failed in $repo (cannot scan the served tree)"; statusz=/dev/null
+  fi
+  # Index-hidden entries (skip-worktree / assume-unchanged) never show in status: refuse them
+  # under the served tree outright, since the symlinks serve the working-tree bytes.
+  hidden=$(git -C "$repo" ls-files -v 2>/dev/null | grep -c '^[Sh]' || true)
+  [ "${hidden:-0}" -eq 0 ] || note "$hidden index-hidden (skip-worktree/assume-unchanged) file(s) in the served tree"
+  while IFS= read -r -d '' entry; do
+    st=${entry:0:2}; path=${entry:3}; from=""
+    case "$st" in R*|C*) IFS= read -r -d '' from ;; esac   # a rename's second record is the source
+    # Both sides of a rename count: a file moved OUT of the served tree is a served file gone.
+    case "$path" in .claude/*) case "$from" in ""|.claude/*) other="$other$path " ;; *) served=$((served + 1)) ;; esac ;; *) served=$((served + 1)) ;; esac
+  done < "$statusz"
+  [ "$statusz" = /dev/null ] || rm -f "$statusz"
+  [ "$served" -eq 0 ] || note "$served local change(s) in the served tree"
+  branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ "$branch" = main ] || note "checked out $branch, not main"
+  if [ "$refuse" = "$prior" ]; then
+    git -C "$repo" merge --ff-only -q origin/main >/dev/null 2>&1 || note "main does not fast-forward to origin/main"
+  fi
+  head=$(git -C "$repo" rev-parse HEAD 2>/dev/null); up=$(git -C "$repo" rev-parse origin/main 2>/dev/null)
+  # Only after a fast-forward that went through: one that was never tried leaves a stale HEAD by
+  # design, and the note that stopped it already says why.
+  [ "$refuse" != "$prior" ] || [ "$head" = "$up" ] || note "HEAD $(echo "$head" | cut -c1-9) != origin/main $(echo "$up" | cut -c1-9) (ahead, or offline)"
+}
+EOF
+}
+
 # Far-side skill-freshness preflight (ludics-lite#3). Args: codex probe. Exit 0 with a
 # PREFLIGHT OK line, 1 with the refusal. `launch` runs it on the box before every worker, so
 # the per-launch refusal the skill promises is enforced here rather than remembered.
 preflight_script() {
+  freshness_fn
   cat <<'EOF'
 codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4" cross="$5" cross_timeout="$6" gh_timeout="$7"
 refuse=""
@@ -463,49 +535,14 @@ note() { refuse="$refuse; $*"; }
 # One preflight per box at a time: a parallel group launched together would otherwise race
 # `git fetch`/`merge` in the same checkout and refuse on git's own lock files. Idempotent, so
 # waiting for the other preflight is the right thing; the bound covers a hung live probe.
-mkdir -p "$STATE" 2>/dev/null; plock="$STATE/preflight.lock"
 # The wait covers everything a holder may legitimately spend: the fetch, the live probe, and one
 # cross-box timeout per sibling, since the reach probes run serially under this lock.
 nsib=0; for _s in $cross; do nsib=$((nsib + 1)); done
-msg=$(take_lock "$plock" $((fetch_timeout + probe_timeout + gh_timeout + 60 + cross_timeout * nsib)) "PREFLIGHT REFUSED $BOX") || { echo "$msg"; exit 1; }
-trap 'release_lock "$plock"' EXIT
-repo=$(expand_tilde "$SKILLS_REPO")
-if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
-  echo "PREFLIGHT REFUSED $BOX: no skills checkout at $repo"; exit 1
-fi
-bounded "$fetch_timeout" git -C "$repo" fetch -q origin >/dev/null; frc=$?
-if [ "$frc" -eq 124 ]; then note "git fetch in $repo timed out after ${fetch_timeout}s"; elif [ "$frc" -ne 0 ]; then note "fetch failed (offline?)"; fi
-# The whole checkout is the served tree: every skill directory sits at its root, so any local
-# change - tracked, untracked, even ignored - is divergence to surface, since the deployed
-# symlinks would serve it. The one exception is a stray .claude/ (settings.local.json appears
-# wherever claude was run inside the checkout): not skill text, so reported rather than refused.
-# The fast-forward below still fails, and refuses, if such a change collides with what upstream brings.
-# NUL-delimited, so a path git would otherwise quote (a space, a quote, a non-ASCII byte) is
-# still classified by its directory rather than falling through as "outside the served tree".
-served=0; other=""
-statusz=$(mktemp "${TMPDIR:-/tmp}/fw-status.XXXXXX")
-if ! git -C "$repo" status --porcelain -z --untracked-files=all --ignored=matching > "$statusz" 2>/dev/null; then
-  rm -f "$statusz"; note "git status failed in $repo (cannot scan the served tree)"; statusz=/dev/null
-fi
-# Index-hidden entries (skip-worktree / assume-unchanged) never show in status: refuse them
-# under the served tree outright, since the symlinks serve the working-tree bytes.
-hidden=$(git -C "$repo" ls-files -v 2>/dev/null | grep -c '^[Sh]' || true)
-[ "${hidden:-0}" -eq 0 ] || note "$hidden index-hidden (skip-worktree/assume-unchanged) file(s) in the served tree"
-while IFS= read -r -d '' entry; do
-  st=${entry:0:2}; path=${entry:3}; from=""
-  case "$st" in R*|C*) IFS= read -r -d '' from ;; esac   # a rename's second record is the source
-  # Both sides of a rename count: a file moved OUT of the served tree is a served file gone.
-  case "$path" in .claude/*) case "$from" in ""|.claude/*) other="$other$path " ;; *) served=$((served + 1)) ;; esac ;; *) served=$((served + 1)) ;; esac
-done < "$statusz"
-[ "$statusz" = /dev/null ] || rm -f "$statusz"
-[ "$served" -eq 0 ] || note "$served local change(s) in the served tree"
-branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
-[ "$branch" = main ] || note "checked out $branch, not main"
-if [ -z "$refuse" ]; then
-  git -C "$repo" merge --ff-only -q origin/main >/dev/null 2>&1 || note "main does not fast-forward to origin/main"
-fi
-head=$(git -C "$repo" rev-parse HEAD 2>/dev/null); up=$(git -C "$repo" rev-parse origin/main 2>/dev/null)
-[ "$head" = "$up" ] || note "HEAD $(echo "$head" | cut -c1-9) != origin/main $(echo "$up" | cut -c1-9) (ahead, or offline)"
+checkout_lock $((fetch_timeout + probe_timeout + gh_timeout + 60 + cross_timeout * nsib)) "PREFLIGHT REFUSED $BOX"; lrc=$?
+if [ "$lrc" -eq 2 ]; then echo "PREFLIGHT REFUSED $BOX: no skills checkout at $repo"; exit 1; fi
+[ "$lrc" -eq 0 ] || exit 1
+skills_freshness "$fetch_timeout"
+if [ $? -eq 2 ]; then echo "PREFLIGHT REFUSED $BOX: no skills checkout at $repo"; exit 1; fi
 # Every skill the checkout declares must be one of the symlinks the README installs, into ITS OWN
 # directory of THIS checkout - compared as resolved paths, so neither a link through `..` nor two
 # links swapped within the checkout can pass. Deriving this set from SKILL.md keeps a new skill
@@ -674,6 +711,35 @@ echo "PREFLIGHT OK $BOX skills=$(echo "$head" | cut -c1-9)${other:+ (changes out
 EOF
 }
 
+# Far-side refresh of a box's skills checkout alone (ludics-lite#362): the freshness half of the
+# preflight, for a box the fleet reaches for work without launching a worker there. Only `launch`
+# and `preflight` ever fast-forwarded a checkout, so a box that only EXECUTES kept a stale one
+# indefinitely (tuf-amd-linux sat at 0f7de3d, without `execution hold`, until a hand-run
+# preflight). Arg: the fetch bound, which also bounds the wait for the checkout's lock: a holder
+# (a preflight, another refresh) may still fail, so a busy lock is waited out and the checkout then
+# checked here, never read as refreshed by someone else (PR #379 review).
+# Exit 0 current or fast-forwarded, 1 not refreshed (divergent, fetch failed, lock never free): the
+# checkout is reported and left exactly as it is, never reset.
+refresh_script() {
+  freshness_fn
+  cat <<'EOF'
+fetch_timeout="$1"
+refuse=""
+note() { refuse="$refuse; $*"; }
+checkout_lock "$fetch_timeout" "REFRESH FAILED $BOX"; lrc=$?
+if [ "$lrc" -eq 2 ]; then echo "REFRESH FAILED $BOX: no skills checkout at $repo"; exit 1; fi
+[ "$lrc" -eq 0 ] || exit 1
+skills_freshness "$fetch_timeout"
+if [ $? -eq 2 ]; then echo "REFRESH FAILED $BOX: no skills checkout at $repo"; exit 1; fi
+if [ -n "$refuse" ]; then
+  echo "REFRESH FAILED $BOX: ${refuse#; } -- left as it is, never reset; repair it by hand, then run fleet-worker.sh preflight $BOX"
+  exit 1
+fi
+if [ "$before" = "$head" ]; then echo "REFRESH OK $BOX skills=$(echo "$head" | cut -c1-9) (already current)"
+else echo "REFRESH OK $BOX skills=$(echo "$head" | cut -c1-9) (fast-forwarded from $(echo "$before" | cut -c1-9))"; fi
+EOF
+}
+
 # The fleet minus one box: what that box's preflight probes ssh to. `local` and the coordinator's
 # own name both stand for the box running this script, so neither is a sibling of itself.
 siblings_of() {
@@ -706,6 +772,30 @@ cmd_preflight() {
   if unreachable "$rc"; then echo "PREFLIGHT UNREACHABLE $box"; slots_report; exit 4; fi
   slots_report
   exit "$rc"
+}
+
+# refresh_box <box>: the far-side refresh on one box; its line on stdout, exit 0/1, or 4 with a
+# REFRESH UNREACHABLE line when the box did not answer (asleep, off the network: not checked).
+# The fetch has its own bound, FLEET_REFRESH_TIMEOUT, shorter than the preflight's: this runs on
+# every `execution run`, where a coordinator is waiting on it.
+refresh_box() {
+  { prelude "$1"; refresh_script; } | run_on "$1" "${FLEET_REFRESH_TIMEOUT:-30}"
+  local rc=$?
+  if unreachable "$rc"; then echo "REFRESH UNREACHABLE $1: its skills checkout was not checked"; return 4; fi
+  return "$rc"
+}
+
+# `refresh <box>...`: bring each box's skills checkout to origin/main, or report why not.
+# Exit 1 when any box was not refreshed, else 4 when any did not answer, else 0.
+cmd_refresh() {
+  [ "$#" -ge 1 ] || die "refresh: which box(es)?"
+  local box rc worst=0
+  for box in "$@"; do case "$box" in -*) die "refresh: unknown option $box" ;; esac; done
+  for box in "$@"; do
+    refresh_box "$box"; rc=$?
+    if [ "$rc" -eq 1 ] || { [ "$rc" -ne 0 ] && [ "$worst" -eq 0 ]; }; then worst="$rc"; fi
+  done
+  exit "$worst"
 }
 
 # slots_report: one PREFLIGHT SLOTS line with the correctness slot count this shell's configuration
@@ -1042,10 +1132,33 @@ EOF
 # ---------------------------------------------------------------------------------------------
 # The verdict of a finished worker, from its files. Prints one line; exit 0 clean, 1 failed,
 # 3 no exit record (the session is gone but nothing wrote the code: killed, or never started).
+#
+# A DONE line gains `| PROBABLE STRAND: ...` when the turn's final message announces a wait still
+# pending. A headless turn's end kills the background tasks it started, so a worker that ended
+# on "the watch will wake me" will never be woken (ludics-lite#361). This is a free-text reader,
+# and its boundary is a fail-closed allowlist: it reads ONLY the turn's final message (a Claude
+# turn's `result`, a Codex turn's last agent message), whole, case-insensitively, for the fixed
+# substrings strand_mark lists, and flags on the first one present. It does not read
+# earlier messages, the tool calls, or the processes the turn left, so a paraphrase outside the
+# list is not flagged, and a phrase quoted or negated ("no watch will wake me") is flagged anyway.
+# The mark is a prompt to read the final message, never a verdict: it changes neither the DONE
+# nor the exit code.
 verdict_script() {
   cat <<'EOF'
+strand_mark() {
+  local text p
+  text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  for p in 'will wake me' 'wakes me' 'wake me up' 'wake me when' 'watch is armed' 'watch armed' \
+           'armed the watch' 'armed a watch' 'while the watch runs' 'waiting in the background' \
+           'running in the background'; do
+    case "$text" in *"$p"*)
+      printf ' | PROBABLE STRAND: the final message says "%s"; a CLI turn'"'"'s background tasks end with it' "$p"
+      return 0 ;;
+    esac
+  done
+}
 verdict() {
-  local name="$1" d="$WORKERS/$1" kind rc summary
+  local name="$1" d="$WORKERS/$1" kind rc summary final
   kind=$(meta_get "$d" kind)
   if [ ! -f "$d/exit" ]; then
     echo "VANISHED $BOX/$name: no exit record (killed, or the CLI never started; an orphaned CLI ran on past tmux if the stream moved -- see $d/stderr.log)"; return 3
@@ -1066,7 +1179,11 @@ verdict() {
   esac
   [ -n "$summary" ] || summary="no terminal event in the stream"
   if [ "$rc" = 0 ] && [ "${ok_event:-0}" -gt 0 ]; then
-    echo "DONE $BOX/$name exit=0 $summary"; return 0
+    case "$kind" in
+      claude) final=$(turn | jq -Rrn '[inputs | fromjson? | select(.type=="result") | (.result // "" | tostring)] | last // ""' 2>/dev/null) ;;
+      codex)  final=$(turn | jq -Rrn '[inputs | fromjson? | select(.type=="item.completed" and .item.type=="agent_message") | (.item.text // "" | tostring)] | last // ""' 2>/dev/null) ;;
+    esac
+    echo "DONE $BOX/$name exit=0 $summary$(strand_mark "${final:-}")"; return 0
   fi
   echo "FAILED $BOX/$name exit=$rc $summary $(tail -n 2 "$d/stderr.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"; return 1
 }
@@ -1764,9 +1881,9 @@ cmd_execution() {
       check_identity ;;
     *) die "execution: list, slot -- <command>, hold -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run <run-dir> --request <id>" ;;
   esac
-  local helper; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
+  local helper out rc; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
-  {
+  out=$({
     prelude "$ANCHOR"
     if [ "$action" != list ]; then lease_mutation_prelude; else printf 'shift 3\n'; fi
     cat <<'EXECUTION_COMMAND'
@@ -1774,9 +1891,28 @@ python3 - "$ANCHOR_STATE" "$@" <<'FLEET_EXECUTION_PY'
 EXECUTION_COMMAND
     cat "$helper"
     printf '\nFLEET_EXECUTION_PY\n'
-  } | run_on "$ANCHOR" EXECUTION "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$action" "$(coordinator_id)" "$(my_token)" "$payload" "$BOXES" "$SLOTS"
-  local rc=$?; if unreachable "$rc"; then echo "EXECUTION UNREACHABLE $ANCHOR: outcome unknown; reconcile before retrying dispatch"; exit 4; fi
+  } | run_on "$ANCHOR" EXECUTION "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$action" "$(coordinator_id)" "$(my_token)" "$payload" "$BOXES" "$SLOTS"); rc=$?
+  [ -z "$out" ] || printf '%s\n' "$out"
+  if unreachable "$rc"; then echo "EXECUTION UNREACHABLE $ANCHOR: outcome unknown; reconcile before retrying dispatch"; exit 4; fi
+  if [ "$rc" -eq 0 ]; then case "$action" in run|dispatch) execution_refresh "$out" >&2 ;; esac; fi
   exit "$rc"
+}
+
+# execution_refresh <record-json>: after a dispatch, refresh the execution host's skills checkout
+# (ludics-lite#362), since that box's own `execution slot`/`hold` and skill text are what the
+# assigned command runs next. AFTER the dispatch, never before it: the registry lock is released by
+# then, so a fetch that hangs cannot hold it, and a refused reservation - the box measuring for
+# someone else - never has its checkout touched. Every host, this box and the anchor included: no
+# launch preflight need have run on the box the coordinator itself runs from (PR #379 review). On
+# stderr, so stdout stays the record; the dispatch's exit status stands whatever the refresh
+# reports, and a record it cannot read is said so rather than skipped silently.
+execution_refresh() {
+  local host
+  host=$(jq -r '.request.execution_host // empty' <<<"$1" 2>&1) && [ -n "$host" ] || {
+    printf '%s\n' "REFRESH FAILED: cannot read the execution host from the dispatched record (${host:-empty}); run fleet-worker.sh refresh <host> by hand"
+    return 1
+  }
+  refresh_box "$host"
 }
 
 cmd_halt() {
@@ -1914,6 +2050,7 @@ cmd="${1:-}"; [ -n "$cmd" ] && shift
 case "$cmd" in
   gate) cmd_gate "$@" ;;
   preflight) cmd_preflight "$@" ;;
+  refresh) cmd_refresh "$@" ;;
   launch) cmd_launch "$@" ;;
   attach) cmd_attach "$@" ;;
   status) cmd_status "$@" ;;

@@ -252,7 +252,10 @@ class; two consecutive merge cycles once stranded three boxes). Three refusals a
 repairs: an expired Claude login on a box needs an interactive `claude auth login` there, a
 refused GitHub token needs the fleet PAT in the box's `~/.config/fleet/gh-token.sh` replaced from
 the anchor's (the refusal prints the command), and missing `~/.codex/skills` links need the README loop
-run once on that box.
+run once on that box. A box the fleet only executes on hosts no launch, so it is refreshed where
+the fleet reaches it for work instead: every `execution run`/`dispatch` and the daily sweep's
+wake step run `fleet-worker.sh refresh <box>...`, this same freshness check alone, and report a
+divergent checkout without resetting it (ludics-lite#362, [executions.md](references/executions.md)).
 
 **Cross-box legs need cross-box ssh, and the fleet has it.** The brief tells a GPU-box worker
 to drive the other GPU box over ssh for a one-off leg (2026-09-04: minix had no credential for
@@ -413,8 +416,9 @@ requirements for every transport with transport-specific setup and identity, and
   merges.
 - Process discipline, stated explicitly because workers re-derive it badly under load: never
   end a turn with only an unobserved detached process outstanding - use the harness's tracked
-  wait mechanism (Codex keeps the turn open or schedules an authorized heartbeat; a Claude
-  worker blocks as [Blocking on a run](references/native-claude.md#blocking-on-a-run) says); if a review watch goes quiet
+  wait mechanism (a native Codex worker keeps the turn open or schedules an authorized
+  heartbeat; a native Claude worker blocks as [Blocking on a run](references/native-claude.md#blocking-on-a-run) says; a CLI
+  worker, whose turn's end kills its background tasks, as [Blocking in a headless turn](references/cli-claude.md#blocking-in-a-headless-turn) says); if a review watch goes quiet
   suspiciously long, read the PR feed directly (`gh pr view --comments`) rather than re-arming
   the watch (reactions persist across rounds and strand it); commit early and often - commits
   are what survives every failure mode below.
