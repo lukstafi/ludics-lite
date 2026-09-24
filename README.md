@@ -248,7 +248,9 @@ boot (`linux`, `win`, `wsl`, and a `lan` route to Windows). Validation, `status`
 WSL adapter all read that row, and a row that is incomplete (a Windows endpoint with no guest, a
 half-renamed alias, a misspelt key) is refused before anything is sent (ludics-lite#314). `all`
 and a bare `status` expand to the map's rows, so adding or renaming a box is one row there plus
-its entries in the site file (and `ACT_DEFAULT`, beside it, for a box a bare wake should reach).
+its entries in the site file. `status` is the only verb with a no-box default: every other verb,
+wake included, prints the usage and exits 2 when no box is named, so a bare `wake-lab.sh` never
+wakes anything; name the boxes, or `all`.
 
 `wake-lab.sh boot-windows <box>` reboots a dual-boot box into Windows for one boot, with nobody at
 the keyboard, and waits until its native Git Bash answers (`uname -s` `MINGW*`, `git --version`
@@ -616,7 +618,8 @@ also drives `boot-windows` and `boot-linux` against a stub box whose booted OS t
 rewrites: the single BootNext selection read from the listing (never BootOrder or GRUB), both lab
 locks held at the moment of the reboot, the refusal on a held lane or hold lock and none on a stale
 one, the sudoers, inhibitor, ambiguous-entry and wired-NIC refusals, and a Windows that never
-answers ending in `NEEDS A PERSON`. `test-wake-lab.sh` runs the WSL path against shim `curl`, `python3` and `ssh` on PATH, so it
+answers ending in `NEEDS A PERSON`. It pins the no-box refusal too: a bare invocation and each
+acting verb given no box print the usage, exit 2 and send nothing. `test-wake-lab.sh` runs the WSL path against shim `curl`, `python3` and `ssh` on PATH, so it
 touches neither the router nor the network. It pins the split above from both sides: that every
 MAC the script sends comes from the sourced host table and that a missing, incomplete or
 short-a-target one is refused before any router traffic, and that no MAC-shaped literal is tracked

@@ -153,8 +153,8 @@ check 'Linux-configured dual boot reports Windows when Windows answered' '[ "$rc
 out=$(WAKE_LAB_HOSTS="$tmp/rog-hosts.sh" SSH_UP=rog-nv-wsl "$tmp/wake-lab.sh" status rog 2>&1); rc=$?
 check 'Linux-configured dual boot reports WSL when its guest answered' '[ "$rc" = 0 ] && [[ "$out" == *"os=wsl"* ]]'
 # ludics-lite#320: a bare `status` is a read of the whole lab, so it shows tuf -- Wi-Fi only and
-# woken by hand, often the one box awake -- beside rog and minix. The bare WAKE keeps `rog minix`:
-# tuf cannot be woken over Wi-Fi, so defaulting a wake to it would only print manual-wake guidance.
+# woken by hand, often the one box awake -- beside rog and minix. Nothing else has a default: a bare
+# `wake-lab.sh`, typed to see the usage, woke rog and minix on 2026-09-24.
 cat >"$tmp/lab-hosts.sh" <<'HOSTS'
 mac_of() { case "$1" in rog) echo aa:bb:cc:00:00:02 ;; minix) echo aa:bb:cc:00:00:03 ;; tuf) echo aa:bb:cc:00:00:06 ;; *) return 1 ;; esac; }
 eth_mac_of() { case "$1" in rog|minix) mac_of "$1" ;; *) return 1 ;; esac; }
@@ -166,9 +166,23 @@ check 'bare status reads all three boxes, tuf included' '[ "$rc" = 0 ] && [[ "$o
 rog "*"os=--"* ]] && [[ "$out" == *"
 minix "*"os=--"* ]] && [[ "$out" == *"
 tuf "*"os=linux  linux=UP"* ]]'
+# Every verb but status, given no box, prints the usage and exits 2 with nothing sent: no router
+# query, no packet, no ssh, no lock. '' is the bare invocation; `--wait --wsl` is a wake with flags
+# and still no box. The box-free unhold and lock-path are refused too, before they read anything.
+for verb in '' '--wait --wsl' sleep hibernate down kick-wsl restart-wsl 'kick-wsl --hold' unhold lock-path; do
+  : >"$SSH_LOG"; rm -f "$WAKE_LAB_LOCK_DIR"/*.lock
+  # shellcheck disable=SC2086 # the flag forms split on purpose
+  out=$(WAKE_LAB_HOSTS="$tmp/lab-hosts.sh" SSH_UP=1 WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    "$tmp/wake-lab.sh" $verb 2>&1); rc=$?
+  check "${verb:-a bare wake-lab.sh} with no box prints the usage, exits 2 and sends nothing" \
+    '[ "$rc" = 2 ] && [[ "$out" == *"nothing was sent"* ]] && [[ "$out" == *"# Usage:"* ]] && [ ! -s "$SSH_LOG" ] && ! ls "$WAKE_LAB_LOCK_DIR" 2>/dev/null | grep -q .'
+done
+check '...and the refusal names the verb as typed' '[[ "$out" == *"lock-path needs a box"* ]]'
+out=$(WAKE_LAB_HOSTS="$tmp/lab-hosts.sh" "$tmp/wake-lab.sh" restart-wsl 2>&1)
+check '...restart-wsl included, which runs as kick-wsl' '[[ "$out" == *"restart-wsl needs a box"* ]]'
 : >"$SSH_LOG"
-out=$(WAKE_LAB_HOSTS="$tmp/lab-hosts.sh" "$tmp/wake-lab.sh" 2>&1); rc=$?
-check 'bare wake still defaults to rog minix, never the manual-wake tuf' '[ "$rc" = 0 ] && [[ "$out" == *"rog:"* ]] && [[ "$out" == *"minix:"* ]] && [[ "$out" != *"tuf:"* ]] && [[ "$out" != *"wake it manually"* ]]'
+out=$(WAKE_LAB_HOSTS="$tmp/lab-hosts.sh" "$tmp/wake-lab.sh" rog minix 2>&1); rc=$?
+check 'control: naming rog and minix wakes both, the same run that refused bare' '[ "$rc" = 0 ] && [[ "$out" == *"rog:"* ]] && [[ "$out" == *"minix:"* ]] && [[ "$out" != *"tuf:"* ]] && grep -q aa:bb:cc:00:00:02 "$SSH_LOG" && grep -q aa:bb:cc:00:00:03 "$SSH_LOG"'
 out=$("$tmp/wake-lab.sh" status 2>&1); rc=$?
 check 'bare status over a table that does not know rog and minix refuses rather than shrinking' '[ "$rc" = 1 ] && [[ "$out" == *"not in the host table"*"rog minix"* ]]'
 out=$("$tmp/wake-lab.sh" unhold tuf 2>&1); rc=$?
@@ -542,7 +556,7 @@ check 'control: that selection had been set before the TERM' 'grep -qx "rog-nv-l
 BOOT_HOSTS="$tmp/hosts.sh" boot_run linux boot-windows tuf
 check 'tuf, with no wired NIC, is refused with the reason and nothing sent' '[ "$rc" = 1 ] && [[ "$out" == *"boot-windows REFUSED on tuf: it has no wired NIC"* ]] && [ ! -s "$SSH_LOG" ]'
 boot_run linux boot-windows
-check 'boot-windows with no box reboots no default' '[ "$rc" = 1 ] && [[ "$out" == *"takes exactly one box (got 0)"* ]] && [ ! -s "$SSH_LOG" ]'
+check 'boot-windows with no box reboots no default' '[ "$rc" = 2 ] && [[ "$out" == *"boot-windows needs a box"* ]] && [ ! -s "$SSH_LOG" ]'
 BOOT_HOSTS="$tmp/lab-hosts.sh" boot_run linux boot-windows rog minix
 check '...and two boxes are refused too' '[ "$rc" = 1 ] && [[ "$out" == *"takes exactly one box (got 2)"* ]] && [ ! -s "$SSH_LOG" ]'
 [ "$fail" -eq 0 ]

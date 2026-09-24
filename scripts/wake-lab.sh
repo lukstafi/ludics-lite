@@ -7,7 +7,7 @@
 #   2. A magic packet sent directly from this Mac (broadcast, UDP ports 7 and 9).
 #
 # Usage:
-#   wake-lab.sh [rog|minix|tuf|all]       wake (default: rog minix; all: every box in the endpoint map)
+#   wake-lab.sh rog|minix|tuf|all ...     wake the named boxes (all: every box in the endpoint map)
 #   wake-lab.sh --wait [--wsl] rog        wake, then poll until configured OS answers
 #   wake-lab.sh --wait --restart-wsl rog  ...and start WSL from a FRESH VM (wsl --shutdown first)
 #   wake-lab.sh status [box...]           per-box reachability and reached OS, whether each lab lock
@@ -26,6 +26,9 @@
 #   wake-lab.sh boot-linux --as=ID box    ...and back: reboot it (or wake it) into Ubuntu; both are
 #                                         reboots, so a desktop session's open apps close with them
 #   wake-lab.sh --list                    dump the router's host table
+# Every verb but `status` needs a box (or `all`): with none, wake-lab.sh prints this and exits 2,
+# sending nothing. A bare invocation is what you type to see the usage, so it must never wake,
+# sleep or restart anything.
 # WSL and Windows hardware notes live with the adapter in scripts/wake-lab-wsl.sh.
 #
 # Every path that takes a box away from whatever is running on it -- `restart-wsl` and
@@ -152,18 +155,13 @@ box_kind() {
 # site's current setting (hosts.sh), this is which endpoints exist, and status probes the others so
 # that a dual-boot box which booted the other OS says so. The short box names, first on each row,
 # are the WoL and lock identities, and the rows in order are the lab: `all` and a bare `status`
-# expand to them. Adding or renaming a box is one row here plus its hosts.sh entries (and, for a
-# box a bare wake or power verb should reach, ACT_DEFAULT below), and check_endpoints refuses an
-# incomplete row before anything is sent.
+# expand to them. Adding or renaming a box is one row here plus its hosts.sh entries, and
+# check_endpoints refuses an incomplete row before anything is sent.
 ENDPOINT_MAP=(
   "rog   linux=rog-nv-linux    win=rog-nv-win    wsl=rog-nv-wsl    lan=rog-lan"
   "minix linux=minix-amd-linux win=minix-amd-win wsl=minix-amd-wsl lan=minix-lan"
   "tuf   linux=tuf-amd-linux   win=tuf-amd-win   wsl=tuf-amd-wsl"    # Wi-Fi only: no LAN route
 )
-# The default for a verb that ACTS -- wake, sleep, hibernate, down, kick-wsl -- given no box: the
-# boxes with Ethernet WoL. Not derived from the site's eth_mac_of, because a table missing a box
-# would then shrink the default silently instead of refusing it (ludics-lite#320).
-ACT_DEFAULT=(rog minix)
 
 endpoints_of() { # endpoints_of <box> -- that box's row, less its name; 1 when the map has none
   local r name rest
@@ -1368,6 +1366,7 @@ BOOT_AS=""     # --as=<request_id>: the caller's own execution reservation, whic
 FORCE=0        # --force: destroy the VM even while a lab lock is held (see the lab lock lore)
 HOLD_LOCKED=0  # set in a box's subshell once its reservation holds that box's HOLD lock on HOLD_FD
 VERB=wake
+VERB_WORD=${1:-}   # as typed: restart-wsl runs as kick-wsl
 TARGETS=()
 
 # Every word taken here, and `all` below, is a name check_map refuses for a box.
@@ -1391,14 +1390,25 @@ for arg in "$@"; do
     *) TARGETS+=("$arg") ;;
   esac
 done
-# The no-argument defaults differ by verb on purpose (ludics-lite#320). `status` is a read -- a
-# router query and ssh probes, nothing that changes a box's state -- so it covers the whole lab, tuf
-# included: tuf is Wi-Fi only and woken by hand, so it is often the one box awake, and a first look
-# that leaves it out reads that box as absent. Every verb that ACTS keeps `rog minix`: waking tuf
-# cannot work over Wi-Fi, and sleeping it leaves it down until someone wakes it by hand. Like
-# `status all`, the default is checked against the site table whole, so a table that does not know
-# tuf refuses a bare `status` rather than silently shrinking it; name the boxes there instead.
-# A reboot takes one named box, never a default: `boot-windows` alone must not reboot two boxes.
+# Only `status` has a no-box default. It is a read -- a router query and ssh probes, nothing that
+# changes a box's state -- so it covers the whole lab, tuf included (ludics-lite#320): tuf is Wi-Fi
+# only and woken by hand, so it is often the one box awake, and a first look that leaves it out
+# reads that box as absent. Like `status all`, the default is checked against the site table whole,
+# so a table that does not know tuf refuses a bare `status` rather than silently shrinking it.
+# Every other verb, the bare wake first, takes no default at all: it prints the usage, exits 2 and
+# sends nothing. A bare `wake-lab.sh` is what anyone types to see the usage, and on 2026-09-24 one
+# expecting that woke rog and minix instead; a bare `sleep` or `restart-wsl` would have taken them
+# away from whatever was running there. A reboot takes exactly one box: two are refused too.
+if [ ${#TARGETS[@]} -eq 0 ]; then
+  if [ "$VERB" = status ]; then
+    while IFS= read -r t; do TARGETS+=("$t"); done < <(lab_boxes)
+  else
+    if [ "$VERB" = wake ]; then echo "wake-lab.sh: no box named; nothing was sent." >&2
+    else echo "wake-lab.sh: $VERB_WORD needs a box (or all); nothing was sent." >&2; fi
+    usage >&2
+    exit 2
+  fi
+fi
 case "$VERB" in
   boot-windows|boot-linux)
     if [ ${#TARGETS[@]} -ne 1 ]; then
@@ -1406,10 +1416,6 @@ case "$VERB" in
       exit 1
     fi ;;
 esac
-if [ ${#TARGETS[@]} -eq 0 ]; then
-  if [ "$VERB" = status ]; then while IFS= read -r t; do TARGETS+=("$t"); done < <(lab_boxes)
-  else TARGETS=("${ACT_DEFAULT[@]}"); fi
-fi
 
 # A --hold that holds nothing is a lane that believes it is held and is not, which is the exact
 # failure this flag exists to prevent — so refuse it rather than ignore it. On the wake path that
