@@ -103,35 +103,22 @@
 #   guest answering after one is always the fresh VM.
 #
 
-# Direct LAN and Windows Tailscale aliases reach the host; the WSL alias reaches its guest.
-lan_of() { case "$1" in
-  rog) echo rog-lan ;;
-  minix) echo minix-lan ;;
-  *) echo "" ;; esac; }
-ts_of() { case "$1" in
-  rog) echo rog-nv-win ;;
-  minix) echo minix-amd-win ;;
-  tuf) echo tuf-amd-win ;;
-  *) return 1 ;; esac; }
-wsl_of() { case "$1" in
-  rog) echo rog-nv-wsl ;;
-  minix) echo minix-amd-wsl ;;
-  tuf) echo tuf-amd-wsl ;;
-  *) echo "" ;; esac; }
+# Every ssh alias here comes from wake-lab.sh's endpoint map (endpoint_of, ludics-lite#314): `lan`
+# and `win` reach the Windows host directly and over Tailscale, and `wsl` reaches its guest.
 
 wsl_box_live() {
-  ssh_probe "$(lan_of "$1")" && return 0
-  ssh_probe "$(ts_of "$1")" && return 0
+  ssh_probe "$(endpoint_of "$1" lan)" && return 0
+  ssh_probe "$(endpoint_of "$1" win)" && return 0
   return 1
 }
 
 wsl_status_fields() {
   local lan ts guest native win=0 vm=0
-  lan=$(lan_of "$1"); ts=$(ts_of "$1"); guest=$(wsl_of "$1")
+  lan=$(endpoint_of "$1" lan); ts=$(endpoint_of "$1" win); guest=$(endpoint_of "$1" wsl)
   if [ -n "$lan" ]; then ssh_probe "$lan" && { printf '  lan=UP'; win=1; } || printf '  lan=--'; else printf '  lan=n/a'; fi
   if [ -n "$ts" ]; then ssh_probe "$ts" && { printf '  win=UP'; win=1; } || printf '  win=--'; else printf '  win=n/a'; fi
   if [ -n "$guest" ]; then ssh_probe "$guest" && { printf '  wsl=UP'; vm=1; } || printf '  wsl=--'; else printf '  wsl=n/a'; fi
-  native=$(linux_of "$1") || native=""
+  native=$(endpoint_of "$1" linux) || native=""
   if [ -n "$native" ] && ssh_probe "$native"; then printf '  linux=UP  os=linux'
   elif [ "$vm" = 1 ]; then printf '  os=wsl'
   elif [ "$win" = 1 ]; then printf '  os=windows'
@@ -209,8 +196,8 @@ kick_wsl() { # kick_wsl <box> [fresh] — WSL never autostarts at boot, and hibe
   # there is no VM at all until a kick succeeds; `kick` — the plain kick's start failed.
   local name=$1 fresh=${2:-} dest what=kick shut=0 capped_start=0 capped_dest="" guest rc
   [ "$fresh" = fresh ] && what=restart
-  guest=$(wsl_of "$name")
-  for dest in $(lan_of "$name") $(ts_of "$name"); do
+  guest=$(endpoint_of "$name" wsl)
+  for dest in $(endpoint_of "$name" lan) $(endpoint_of "$name" win); do
     [ -n "$dest" ] || continue
     # An ssh network logon is session enough: this works with nobody logged in at the console.
     if [ "$fresh" = fresh ]; then
@@ -538,7 +525,7 @@ shutdown_unheld_vm() { # shutdown_unheld_vm <box> <windows-alias> — rc 0 only 
   # wrong. The kick tries both for the same reason; leaving a reachable unheld VM up because one
   # endpoint stopped answering is the outcome this whole function exists to avoid.
   local d tried=""
-  for d in "$2" $(lan_of "$1") $(ts_of "$1"); do
+  for d in "$2" $(endpoint_of "$1" lan) $(endpoint_of "$1" win); do
     [ -n "$d" ] || continue
     case " $tried " in *" $d "*) continue ;; esac
     tried="$tried $d"
@@ -1339,7 +1326,7 @@ check_active_hours() { # check_active_hours <box> <windows-alias> — one line, 
 
 win_dest() { # win_dest <box> — the first Windows alias that answers, empty if none does
   local d
-  for d in $(lan_of "$1") $(ts_of "$1"); do
+  for d in $(endpoint_of "$1" lan) $(endpoint_of "$1" win); do
     [ -n "$d" ] || continue
     ssh_probe "$d" && { echo "$d"; return 0; }
   done
@@ -1351,7 +1338,7 @@ win_dest() { # win_dest <box> — the first Windows alias that answers, empty if
 # Keep the command attached to this session; a detached child dies with it.
 wsl_power_action() { # power_action <verb> <box>
   local verb=$1 name=$2 ts cmd output action_rc
-  ts=$(ts_of "$name") || { echo "unknown machine: $name" >&2; return 1; }
+  ts=$(endpoint_of "$name" win) || { echo "unknown machine: $name" >&2; return 1; }
   case "$verb" in
     sleep)     cmd='rundll32.exe powrprof.dll,SetSuspendState 0,1,0' ;;
     hibernate) cmd='shutdown /h' ;;
@@ -1473,7 +1460,7 @@ start_wsl() {
   if [ ${#started[@]} -gt 0 ]; then
     if wait_for_wsl "${started[@]}"; then up=("${started[@]}")
     else for n in "${started[@]}"; do
-      if ssh_probe "$(wsl_of "$n")"; then up+=("$n"); else down+=("$n"); fi
+      if ssh_probe "$(endpoint_of "$n" wsl)"; then up+=("$n"); else down+=("$n"); fi
     done; fi
   fi
   WSL_FAILED=""
@@ -1522,7 +1509,7 @@ wait_for_wsl() { # wait_for_wsl <box...> — tailscaled inside WSL can take >2 m
   while :; do
     all=1
     for n in "${names[@]}"; do
-      w=$(wsl_of "$n")
+      w=$(endpoint_of "$n" wsl)
       if [ -z "$w" ]; then printf '%s=n/a ' "$n"; continue; fi
       if ssh_probe "$w"; then printf '%s-wsl=UP ' "$n"; else printf '%s-wsl=down ' "$n"; all=0; fi
     done

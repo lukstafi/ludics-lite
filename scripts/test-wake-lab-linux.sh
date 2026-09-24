@@ -41,15 +41,18 @@ case " $* " in
   *' rog-nv-linux '*) [ "${SSH_UP:-0}" = rog-nv-linux ] ;;
   *' rog-nv-win '*) [ "${SSH_UP:-0}" = rog-nv-win ] ;;
   *' rog-nv-wsl '*) [ "${SSH_UP:-0}" = rog-nv-wsl ] ;;
-  *) exit 1 ;;
+  *) for a in "$@"; do [ "$a" = "${SSH_UP:-}" ] && exit 0; done; exit 1 ;;
 esac
 SSH
+# The router and the magic packet log to the same file as ssh, so an empty log is "nothing sent".
 cat >"$tmp/bin/curl" <<'CURL'
 #!/usr/bin/env bash
+printf 'curl %s\n' "$*" >>"$SSH_LOG"
 printf '<NewActive>1</NewActive>\n'
 CURL
 cat >"$tmp/bin/python3" <<'PYTHON'
 #!/usr/bin/env bash
+printf 'python3 %s\n' "$*" >>"$SSH_LOG"
 exit 0
 PYTHON
 chmod +x "$tmp/bin"/*
@@ -200,13 +203,110 @@ listing='[{"request_id":"w-359-guest","request":{"execution_host":"tuf-amd-wsl"}
 {"request_id":"w-359-native","request":{"execution_host":"tuf-amd-linux"},"state":"launching"}]'
 out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING="$listing" SSH_UP=tuf-amd-wsl "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
 check 'a WSL box counts reservations naming its guest as well as its native endpoint' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=2"* ]] && [[ "$out" == *"reservation: w-359-guest (launching)"* ]]'
+# ...and so does a Linux-configured box, on every endpoint its row of the map lists (#314), since
+# the booted OS is not always the configured one; another box's endpoint is never counted.
+listing='[{"request_id":"w-314-guest","request":{"execution_host":"tuf-amd-wsl"},"state":"launching"},
+{"request_id":"w-314-win","request":{"execution_host":"tuf-amd-win"},"state":"launching"},
+{"request_id":"w-314-native","request":{"execution_host":"tuf-amd-linux"},"state":"launching"},
+{"request_id":"w-314-rog","request":{"execution_host":"rog-nv-wsl"},"state":"launching"}]'
+out=$(WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING="$listing" SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'a Linux box counts reservations on every endpoint of its row, and no other box'"'"'s' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=3"* ]] && [[ "$out" == *"reservation: w-314-win (launching)"* ]] && [[ "$out" != *"w-314-rog"* ]]'
 out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" SSH_UP=tuf-amd-win WAKE_LAB_WSL_WAIT_SECONDS=0 "$tmp/wake-lab.sh" kick-wsl tuf 2>&1); rc=$?
 check 'TUF kick cannot report WSL up without its guest endpoint answering' '[ "$rc" != 0 ] && [[ "$out" == *"wsl still down"* ]] && [[ "$out" != *"wsl up"* ]]'
+# ludics-lite#314: every alias comes from ONE endpoint map, and an incomplete row is refused before
+# anything is sent -- whatever the box's kind, since a Linux-configured dual-boot box still probes
+# its Windows endpoints in status. tuf's row without its guest alias is the first review finding on
+# the asus -> tuf rename (PR #313): its Windows endpoint then passed WSL validation with no guest.
 mkdir "$tmp/no-guest"
-cp "$tmp/wake-lab.sh" "$tmp/no-guest/wake-lab.sh"
-sed '/tuf) echo tuf-amd-wsl ;;/d' "$tmp/wake-lab-wsl.sh" >"$tmp/no-guest/wake-lab-wsl.sh"
+cp "$tmp/wake-lab-wsl.sh" "$tmp/no-guest/wake-lab-wsl.sh"
+sed 's/ wsl=tuf-amd-wsl//' "$tmp/wake-lab.sh" >"$tmp/no-guest/wake-lab.sh"; chmod +x "$tmp/no-guest/wake-lab.sh"
+check 'the fixture really took the guest alias out of the map' '! cmp -s "$tmp/wake-lab.sh" "$tmp/no-guest/wake-lab.sh"'
 out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" SSH_UP=tuf-amd-win "$tmp/no-guest/wake-lab.sh" status tuf 2>&1); rc=$?
-check 'WSL kind refuses an adapter without a guest endpoint' '[ "$rc" = 1 ] && [[ "$out" == *"no WSL guest ssh endpoint for tuf"* ]]'
+check 'WSL kind refuses a map row without a guest endpoint' '[ "$rc" = 1 ] && [[ "$out" == *"a Windows endpoint (tuf-amd-win) with no WSL guest alias"* ]]'
+: >"$SSH_LOG"; rm -f "$WAKE_LAB_LOCK_DIR/tuf.lock" "$WAKE_LAB_LOCK_DIR/tuf.hold.lock"
+out=$(SSH_UP=1 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/no-guest/wake-lab.sh" sleep tuf 2>&1); rc=$?
+check '...and so does Linux kind, before any power operation or lock' '[ "$rc" = 1 ] && [[ "$out" == *"no WSL guest alias"*"nothing was sent"* ]] && [ ! -s "$SSH_LOG" ] && [ ! -e "$WAKE_LAB_LOCK_DIR/tuf.lock" ]'
+# A NEWLY ADDED dual-boot box, `nova`, is one row in the map plus its site entries. With a complete
+# row, status finds its alternate boots from that row alone -- the second #313 finding was a status
+# whose Windows probe listed the box names by hand, and so skipped the renamed box.
+cat >"$tmp/nova-hosts.sh" <<'HOSTS'
+mac_of() { [ "$1" = nova ] && echo aa:bb:cc:00:00:07; }
+eth_mac_of() { mac_of "$1"; }
+ip_of() { [ "$1" = nova ] && echo 192.0.2.33; }
+kind_of() { [ "$1" = nova ] && echo linux; }
+HOSTS
+nova_map() { # nova_map <dir> <row> -- a copy of the scripts whose endpoint map gains <row>
+  mkdir -p "$tmp/$1"
+  cp "$tmp/wake-lab-wsl.sh" "$tmp/$1/wake-lab-wsl.sh"
+  awk -v row="  \"$2\"" '{ print } /^  "tuf +linux=/ { print row }' \
+    "$tmp/wake-lab.sh" >"$tmp/$1/wake-lab.sh"
+  chmod +x "$tmp/$1/wake-lab.sh"
+  grep -qxF "  \"$2\"" "$tmp/$1/wake-lab.sh"
+}
+check 'the added-box fixture inserts its row into the map' 'nova_map nova "nova linux=nova-x-linux win=nova-x-win wsl=nova-x-wsl lan=nova-lan"'
+out=$(WAKE_LAB_HOSTS="$tmp/nova-hosts.sh" SSH_UP=nova-x-linux "$tmp/nova/wake-lab.sh" status nova 2>&1); rc=$?
+check 'an added box answers on the Linux endpoint of its row' '[ "$rc" = 0 ] && [[ "$out" == *"nova "*"os=linux  linux=UP"* ]]'
+out=$(WAKE_LAB_HOSTS="$tmp/nova-hosts.sh" SSH_UP=nova-x-win "$tmp/nova/wake-lab.sh" status nova 2>&1); rc=$?
+check '...and status probes its alternate Windows boot from the row' '[ "$rc" = 0 ] && [[ "$out" == *"os=windows  linux=--  win=UP"* ]]'
+out=$(WAKE_LAB_HOSTS="$tmp/nova-hosts.sh" SSH_UP=nova-x-wsl "$tmp/nova/wake-lab.sh" status nova 2>&1); rc=$?
+check '...and its alternate WSL guest' '[ "$rc" = 0 ] && [[ "$out" == *"os=wsl  linux=--  wsl=UP"* ]]'
+sed 's/echo linux/echo wsl/' "$tmp/nova-hosts.sh" >"$tmp/nova-wsl.sh"
+out=$(WAKE_LAB_HOSTS="$tmp/nova-wsl.sh" SSH_UP=nova-lan "$tmp/nova/wake-lab.sh" status nova 2>&1); rc=$?
+check '...and, set to WSL, its LAN route' '[ "$rc" = 0 ] && [[ "$out" == *"lan=UP  win=--  wsl=--"*"os=windows"* ]]'
+# Each way the addition can be wrong, as a new row or a half-done rename leaves it: first the row
+# alone, then the map as a whole. Every one is refused, says what is wrong, and sends nothing: no
+# router query, no packet, no ssh, no lock.
+row_bad='incomplete ssh endpoints for nova'
+map_bad='the endpoint map is inconsistent'
+n=0
+while IFS='|' read -r row head want; do
+  n=$((n + 1))
+  if ! nova_map "nova-bad-$n" "$row"; then check "incomplete-row fixture $n was inserted" false; continue; fi
+  case "$head" in row) head=$row_bad ;; map) head=$map_bad ;; esac
+  for verb in '' sleep; do   # '' is the bare wake, which has no verb word
+    : >"$SSH_LOG"; rm -f "$WAKE_LAB_LOCK_DIR"/*.lock
+    out=$(WAKE_LAB_HOSTS="$tmp/nova-hosts.sh" SSH_UP=nova-x-linux WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+      "$tmp/nova-bad-$n/wake-lab.sh" ${verb:+"$verb"} nova 2>&1); rc=$?
+    check "an added row with $want is refused before ${verb:-wake} sends anything" \
+      '[ "$rc" = 1 ] && [[ "$out" == *"$head"*"$want"*"nothing was sent"* ]] && [ ! -s "$SSH_LOG" ] && ! ls "$WAKE_LAB_LOCK_DIR" | grep -q .'
+  done
+done <<'ROWS'
+nova linux=nova-x-linux win=nova-x-win|row|a Windows endpoint (nova-x-win) with no WSL guest alias
+nova linux=nova-x-linux wsl=nova-x-wsl|row|a WSL guest (nova-x-wsl) with no Windows host
+nova linux=nova-x-linux lan=nova-lan|row|a LAN route (nova-lan) with no Windows endpoint
+nova linux=nova-x-linux win=nova-x-win wsl=nova-x-wsl lan=nova-x-lan|row|the LAN route nova-x-lan is not nova-lan
+nova linux=nova-x-linux win=nova-y-win wsl=nova-x-wsl|row|nova-y-win does not share the stem nova-x
+nova linux=nova-x-linux win=nova-x-win wsl=nova-x-guest|row|nova-x-guest does not end in -wsl
+nova linux=nova-x-linux wn=nova-x-win|row|unknown endpoint wn
+nova linux=nova-x-linux linux=nova-y-linux|row|linux is listed twice
+nova win=nova-x-win wsl=nova-x-wsl|row|no linux ssh endpoint for a linux box
+nova linux=-V-linux win=-V-win wsl=-V-wsl|row|linux=-V-linux is not a plain ssh alias
+nova linux=tuf-amd-linux win=tuf-amd-win wsl=tuf-amd-wsl|map|the alias tuf-amd-linux is on both tuf and nova
+tuf linux=nova-x-linux|map|tuf has two rows
+-nova linux=nova-x-linux|map|the box name -nova is not a plain name
+down linux=down-x-linux|map|the box name down is a command word
+ROWS
+check 'every incomplete-row fixture ran' '[ "$n" = 14 ]'
+# The command words check_map refuses are the ones the argument parser takes: every verb in the
+# parser's case arms, and `all`. Read off the script, so a verb added there without adding it to
+# check_map goes red here.
+parsed=$(sed -n '/^case "\${1:-}" in$/,/^esac$/p' "$here/wake-lab.sh" | sed -n 's/^  \([a-z|-]*\)).*/\1/p' | tr '|' '\n' | sort -u)
+refused=$(sed -n '/^check_map() {/,/^}/p' "$here/wake-lab.sh" | sed -n 's/^      \([a-z|-]*\))$/\1/p' | tr '|' '\n' | grep -vx all | sort -u)
+check 'check_map refuses every verb the argument parser takes' '[ -n "$parsed" ] && [ "$parsed" = "$refused" ]'
+# A RENAMED box is its row renamed and nothing else: `all` and a bare status expand to the map's
+# rows, so no other list in the script still names the old box and refuses it as unknown.
+mkdir "$tmp/renamed"
+cp "$tmp/wake-lab-wsl.sh" "$tmp/renamed/wake-lab-wsl.sh"
+sed 's/^  "tuf   linux=tuf-amd-linux   win=tuf-amd-win   wsl=tuf-amd-wsl"/  "puf   linux=puf-amd-linux   win=puf-amd-win   wsl=puf-amd-wsl"/' \
+  "$tmp/wake-lab.sh" >"$tmp/renamed/wake-lab.sh"; chmod +x "$tmp/renamed/wake-lab.sh"
+sed 's/tuf/puf/g' "$tmp/lab-hosts.sh" >"$tmp/renamed-hosts.sh"
+check 'the rename fixture renamed the row' 'grep -q "\"puf   linux=puf-amd-linux" "$tmp/renamed/wake-lab.sh" && ! grep -q "\"tuf " "$tmp/renamed/wake-lab.sh"'
+for form in '' all; do
+  out=$(WAKE_LAB_HOSTS="$tmp/renamed-hosts.sh" SSH_UP=puf-amd-linux "$tmp/renamed/wake-lab.sh" status ${form:+"$form"} 2>&1); rc=$?
+  check "status ${form:-(bare)} reads the renamed box from its row" '[ "$rc" = 0 ] && [[ "$out" == *"
+puf "*"os=linux  linux=UP"* ]] && [[ "$out" == *"
+rog "* ]] && [[ "$out" != *"tuf"* ]]'
+done
 cat >"$tmp/other-linux.sh" <<'HOSTS'
 mac_of() { [ "$1" = other ] && echo aa:bb:cc:00:00:05; }
 eth_mac_of() { return 1; }
@@ -214,10 +314,10 @@ ip_of() { [ "$1" = other ] && echo 192.0.2.29; }
 kind_of() { [ "$1" = other ] && echo linux; }
 HOSTS
 out=$(WAKE_LAB_HOSTS="$tmp/other-linux.sh" "$tmp/wake-lab.sh" status other 2>&1); rc=$?
-check 'Linux kind without a native ssh endpoint is refused' '[ "$rc" = 1 ] && [[ "$out" == *"no linux ssh endpoint for other"* ]]'
+check 'a box the site table knows and the endpoint map does not is refused' '[ "$rc" = 1 ] && [[ "$out" == *"no ssh endpoints for other"* ]]'
 sed 's/echo linux/echo wsl/' "$tmp/other-linux.sh" >"$tmp/other-wsl.sh"
 out=$(WAKE_LAB_HOSTS="$tmp/other-wsl.sh" "$tmp/wake-lab.sh" status other 2>&1); rc=$?
-check 'WSL kind without a Windows ssh endpoint is refused' '[ "$rc" = 1 ] && [[ "$out" == *"no Windows ssh endpoint for other"* ]]'
+check '...whatever its kind' '[ "$rc" = 1 ] && [[ "$out" == *"no ssh endpoints for other"* ]]'
 sed 's/echo linux/echo unknown/' "$tmp/hosts.sh" >"$tmp/bad.sh"
 out=$(WAKE_LAB_HOSTS="$tmp/bad.sh" "$tmp/wake-lab.sh" tuf 2>&1); rc=$?
 check 'invalid kind refuses before WoL' '[ "$rc" = 1 ] && [[ "$out" == *"invalid kind for tuf"* ]]'
