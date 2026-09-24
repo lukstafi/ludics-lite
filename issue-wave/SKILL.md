@@ -252,7 +252,10 @@ class; two consecutive merge cycles once stranded three boxes). Three refusals a
 repairs: an expired Claude login on a box needs an interactive `claude auth login` there, a
 refused GitHub token needs `ssh -t <box> 'gh auth login -h github.com -p https -w && gh auth
 setup-git'` (the refusal prints it), and missing `~/.codex/skills` links need the README loop
-run once on that box.
+run once on that box. A box the fleet only executes on hosts no launch, so it is refreshed where
+the fleet reaches it for work instead: every `execution run`/`dispatch` and the daily sweep's
+wake step run `fleet-worker.sh refresh <box>...`, this same freshness check alone, and report a
+divergent checkout without resetting it (ludics-lite#362, [executions.md](references/executions.md)).
 
 **Cross-box legs need cross-box ssh, and the fleet has it.** The brief tells a GPU-box worker
 to drive the other GPU box over ssh for a one-off leg (2026-09-04: minix had no credential for
