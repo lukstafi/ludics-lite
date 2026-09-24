@@ -16,7 +16,8 @@
 #     absent directory and on an empty one -- gives up on it after the start grace rather than
 #     the whole window, and a wait already polling when `start` runs picks the run up;
 #   - a wrapper killed alone while its command runs on reads RUNNING, not DIED, through cpid; and
-#     a command that exited unreaped (a zombie, which still answers kill -0) reads DIED;
+#     a command that exited unreaped (a zombie, which still answers kill -0) reads DIED, and so
+#     does a pid the system has reused for a process with another start time;
 #   - a stale directory: `start` refuses one whose run has ended (finished or died), runs
 #     nothing, leaves the earlier status untouched, and a wait on it reads REFUSED, not the
 #     earlier run's rc; over a live run it is refused too, runs nothing, and marks nothing, so a
@@ -111,7 +112,7 @@ fi
 d="$TMP/orphan"
 bg_start "$d" sleep 60
 if until_file "$d/pid" 10 && until_file "$d/cpid" 10; then
-  child=$(cat "$d/cpid"); BGPIDS="$BGPIDS $child"
+  child=$(head -n 1 "$d/cpid"); BGPIDS="$BGPIDS $child"
   kill -9 "$S" 2>/dev/null
   { wait "$S"; } 2>/dev/null
   expect "a wrapper killed alone, its command still running, reads RUNNING, not DIED" 3 RUNNING -- \
@@ -131,7 +132,7 @@ zp=$!; BGPIDS="$BGPIDS $zp"
 printf '99999999\n' > "$d/pid"
 zombie_seen=false
 if until_file "$d/cpid" 10; then
-  z=$(cat "$d/cpid")
+  z=$(head -n 1 "$d/cpid")
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     case $(ps -o stat= -p "$z" 2>/dev/null | tr -d ' ') in Z*) zombie_seen=true; break ;; esac
     sleep 0.2
@@ -144,6 +145,29 @@ else
   ko "the zombie fixture did not produce a zombie that answers kill -0"
 fi
 kill -9 "$zp" 2>/dev/null; { wait "$zp"; } 2>/dev/null
+
+# A pid the system has reused: the file names a live process, but one that started at another time
+# than the run recorded. A live sleep stands in for the unrelated process; the controls are the
+# same pid with its own start time recorded, and with none recorded (where ps could not say).
+sleep 30 &
+sp=$!; BGPIDS="$BGPIDS $sp"
+sp_start=$(TZ=UTC LC_ALL=C ps -o lstart= -p "$sp" 2>/dev/null | tr -d ' ')
+if [ -n "$sp_start" ]; then
+  d="$TMP/reused"; mkdir -p "$d"
+  printf '%s\n%s\n' "$sp" 'ThuJan100:00:001970' > "$d/pid"
+  expect "a reused pid (live, but started at another time) reads DIED, not RUNNING" 5 DIED -- \
+    "$BG" wait "$d" --within 0
+  d="$TMP/same-start"; mkdir -p "$d"
+  printf '%s\n%s\n' "$sp" "$sp_start" > "$d/pid"
+  expect "control: the same pid with its own start time reads RUNNING" 3 RUNNING -- "$BG" wait "$d" --within 0
+else
+  ko "ps -o lstart= gave nothing for a live process here, so the reuse case cannot be built"
+fi
+d="$TMP/no-start"; mkdir -p "$d"
+printf '%s\n' "$sp" > "$d/pid"
+expect "control: a pid with no start time recorded falls back to kill -0 (RUNNING)" 3 RUNNING -- \
+  "$BG" wait "$d" --within 0
+kill -9 "$sp" 2>/dev/null; { wait "$sp"; } 2>/dev/null
 
 # --- race 2: the command's output quotes the verdicts --------------------------------------------
 d="$TMP/quoting"
@@ -204,7 +228,7 @@ else
   ko "stale: the live fixture never published its pid"
 fi
 kill -9 "$live" 2>/dev/null; { wait "$live"; } 2>/dev/null
-[ -s "$d/cpid" ] && kill -9 "$(cat "$d/cpid")" 2>/dev/null
+[ -s "$d/cpid" ] && kill -9 "$(head -n 1 "$d/cpid")" 2>/dev/null
 d="$TMP/stale-dead"; mkdir -p "$d"
 printf '99999999\n' > "$d/pid"
 expect "stale: start refuses a directory whose run died" 2 'has ended' -- "$BG" start "$d" -- true

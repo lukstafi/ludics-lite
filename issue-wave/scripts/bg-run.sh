@@ -18,6 +18,9 @@
 #           runs its command;
 #   cpid -- the command's own pid, published by the command's process before it execs the
 #           command, so a command that outlives a killed wrapper is still seen running;
+#           Each pid file carries a second line, the process's start time as `ps -o lstart=`
+#           gives it, so a pid the system has since reused for another process is not read as
+#           the run's (where ps cannot say, the line is empty and the bare pid stands);
 #   log  -- the command's stdout and stderr, and the only file the command's output reaches;
 #   rc   -- the command's exit status, published (by rename) after the command returns.
 # A start refused over an earlier run that has ENDED (finished, or died) writes `refused` into
@@ -116,7 +119,7 @@ cmd_start() {
   # The claim is the pid itself, published by a hard link, which fails when `pid` exists: of two
   # starts that both found the directory empty, exactly one gets it and the other is refused
   # before its command runs. The content is complete before the link makes it visible.
-  printf '%s\n' "$$" > "$dir/.pid.$$" || { say "cannot write in $(printf '%q' "$dir")"; exit 2; }
+  printf '%s\n%s\n' "$$" "$(started $$)" > "$dir/.pid.$$" || { say "cannot write in $(printf '%q' "$dir")"; exit 2; }
   if ! ln -- "$dir/.pid.$$" "$dir/pid" 2>/dev/null; then
     rm -f -- "$dir/.pid.$$"
     refuse_start "$dir"
@@ -125,7 +128,8 @@ cmd_start() {
   # The command's process publishes its own pid before it execs the command, so there is no moment
   # at which the command runs untracked.
   # shellcheck disable=SC2016 # expanded by the inner sh
-  sh -c 'printf "%s\n" "$$" > "$0.$$" && mv -f "$0.$$" "$0" && exec "$@"' "$dir/cpid" "$@" \
+  sh -c 'printf "%s\n%s\n" "$$" "$(TZ=UTC LC_ALL=C ps -o lstart= -p "$$" 2>/dev/null | tr -d " ")" > "$0.$$" \
+    && mv -f "$0.$$" "$0" && exec "$@"' "$dir/cpid" "$@" \
     < /dev/null > "$dir/log" 2>&1 &
   wait "$!"
   rc=$?
@@ -134,15 +138,25 @@ cmd_start() {
   exit "$rc"
 }
 
-# alive <pid-file>: whether the process it names is running. `kill -0` alone answers yes for a
-# zombie -- an orphaned command that exited under a parent that never reaps it (a minimal
-# container's PID 1) -- so a process `ps` reports in state Z (or X, dead) is not alive. Where ps
-# cannot say, kill -0 stands.
+# started <pid>: the process's start time, blanks removed, in one fixed locale and zone so the
+# start and the wait spell it alike; empty where ps cannot say. (The inner sh in cmd_start spells
+# the same pipeline out, since it cannot call this function.)
+started() { TZ=UTC LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | tr -d ' '; }
+
+# alive <pid-file>: whether the process it names is still the run's, and running. `kill -0` alone
+# answers yes for two processes that are not: a zombie -- an orphaned command that exited under a
+# parent that never reaps it (a minimal container's PID 1) -- which ps reports in state Z (or X),
+# and an unrelated process the system has since given the same pid, whose start time differs from
+# the one recorded. Where ps cannot say, kill -0 stands.
 alive() {
   [ -s "$1" ] || return 1
-  p=$(cat "$1")
+  { IFS= read -r p; IFS= read -r t; } < "$1"
   kill -0 "$p" 2>/dev/null || return 1
   case $(ps -o stat= -p "$p" 2>/dev/null | tr -d ' ') in Z*|X*) return 1 ;; esac
+  if [ -n "${t:-}" ]; then
+    now=$(started "$p")
+    [ -z "$now" ] || [ "$now" = "$t" ] || return 1
+  fi
   return 0
 }
 
