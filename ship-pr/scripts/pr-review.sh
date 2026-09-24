@@ -340,15 +340,16 @@ jq_lf() {
   case "$JQ_EOL" in
   lf) command jq "$@" ;;
   binary) command jq -b "$@" ;;
-  *)
-    local st
-    command jq "$@" | sed $'s/\r$//'
-    st=("${PIPESTATUS[@]}")
-    if [ "${st[0]}" -ne 0 ]; then return "${st[0]}"; fi
-    return "${st[1]}"
-    ;;
+  *) jq_lf_strip "$@" ;;
   esac
 }
+# A subshell with its own `pipefail`, so jq's failure is the call's status whatever options the
+# caller runs under. Not PIPESTATUS: a PIPESTATUS the environment exports shadows bash's own, and
+# it then never moves (run-pr-review-hostile.sh exports one, and every read here saw `hostile`).
+jq_lf_strip() (
+  set -o pipefail
+  command jq "$@" | sed $'s/\r$//'
+)
 jq() { jq_lf "$@"; }
 jq_eol_probe
 
