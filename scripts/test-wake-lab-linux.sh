@@ -323,7 +323,8 @@ out=$(WAKE_LAB_HOSTS="$tmp/bad.sh" "$tmp/wake-lab.sh" tuf 2>&1); rc=$?
 check 'invalid kind refuses before WoL' '[ "$rc" = 1 ] && [[ "$out" == *"invalid kind for tuf"* ]]'
 # ludics-lite#353: boot-windows / boot-linux. The fixture box is rog, whose booted OS lives in a
 # state file the ssh stub reads and the stub's reboot rewrites: `linux`, `windows` or `dark`. A
-# reboot leaves the box dark for BOOT_DARK probes (one by default) before its target answers, as a real one does, and the
+# reboot leaves the box dark for BOOT_DARK probes (four by default: two polls of both Windows routes,
+# enough for the sustained outage the boot verbs wait for) before its target answers, as a real one does, and the
 # stub records at each reboot whether the box's two lab locks were held at that moment.
 mkdir -p "$tmp/bootbin"
 cat >"$tmp/bootbin/ssh" <<'SSH'
@@ -336,10 +337,12 @@ locks() { printf 'locks lane=%s hold=%s\n' "$(held "$WAKE_LAB_LOCK_DIR/rog.lock"
 reboot_to() { echo dark >"$BOOT_STATE"; echo "$1" >"$BOOT_STATE.pending"; }
 if [ -e "$BOOT_STATE.pending" ]; then   # BOOT_DARK dark probes (default 1), then the reboot's target
   echo x >>"$BOOT_STATE.dark-seen"
-  if [ "$(wc -l <"$BOOT_STATE.dark-seen")" -gt "${BOOT_DARK:-1}" ]; then
+  if [ "$(wc -l <"$BOOT_STATE.dark-seen")" -gt "${BOOT_DARK:-4}" ]; then
     mv "$BOOT_STATE.pending" "$BOOT_STATE"; rm -f "$BOOT_STATE.dark-seen"
   fi
 fi
+# BOOT_FLAKE: one Linux probe after the reboot command fails, as a flaky ssh does, box still up
+if [ "$alias" = rog-nv-linux ] && [ -e "$BOOT_STATE.flake" ]; then rm -f "$BOOT_STATE.flake"; exit 255; fi
 case "$alias:$(cat "$BOOT_STATE")" in
   rog-nv-linux:linux|rog-nv-win:windows|rog-lan:windows) ;;
   *) exit 255 ;;
@@ -354,7 +357,8 @@ case "$cmd" in
     sudo_ok noreboot; echo "${cmd##* }" >"$BOOT_STATE.next"
     [ "${BOOT_NEXT_DROP:-0}" = 1 ] && exit 255   # written, and the answer lost on the way back
     printf 'BootNext: %s\n' "${BOOT_READBACK:-${cmd##* }}"; printf '%s\n' "$BOOT_LISTING"; exit 0 ;;
-  'sudo -n efibootmgr --delete-bootnext'*) rm -f "$BOOT_STATE.next"; exit 0 ;;   # ...and the read-back finds none
+  'sudo -n efibootmgr --delete-bootnext'*)   # ...and the read-back finds none, unless BOOT_UNDO=fail
+    [ "${BOOT_UNDO:-ok}" = fail ] && exit 1; rm -f "$BOOT_STATE.next"; exit 0 ;;
   *'echo WAKE_LAB_POWER_STARTED; exec sudo -n systemctl reboot')
     [ "${BOOT_FIRMWARE:-}" = wedge ] && { echo reboot-wedged >>"$SSH_LOG"; sleep 20; exit 255; }   # never returns in time
     locks; echo WAKE_LAB_POWER_STARTED; sudo_ok nobootnext
@@ -362,7 +366,7 @@ case "$cmd" in
       honor) if [ -e "$BOOT_STATE.next" ]; then reboot_to windows; else reboot_to linux; fi ;;
       ignore) reboot_to linux ;;
       hang) reboot_to dark ;;
-      noop) exit 0 ;;   # the command returned and nothing happened
+      noop) [ "${BOOT_FLAKE:-0}" = 1 ] && : >"$BOOT_STATE.flake"; exit 0 ;;   # returned, and nothing happened
     esac
     rm -f "$BOOT_STATE.next"; exit 255 ;;
   *'echo WAKE_LAB_POWER_STARTED& shutdown /r /f /t 0'*)
@@ -396,14 +400,19 @@ BootOrder: 0001,0003,0002
 Boot0001* ubuntu${tab}HD(1,GPT,aaaa)/File(\\EFI\\ubuntu\\shimx64.efi)
 Boot0002* Windows Boot Manager (old disk)${tab}HD(1,GPT,bbbb)/File(\\EFI\\Microsoft\\Boot\\bootmgfw.efi)
 Boot0003* Windows Boot Manager${tab}HD(1,GPT,cccc)/File(\\EFI\\Microsoft\\Boot\\bootmgfw.efi)"
+# Every run is under the caller's own exclusive reservation, w-own, unless BOOT_AS_ID says otherwise
+# (empty: no --as at all); FW_LISTING is the registry, by default that reservation alone.
+OWN='{"request_id":"w-own","request":{"execution_host":"rog-nv-linux","kind":"measurement"},"state":"running"}'
 boot_run() { # boot_run <initial state> <wake-lab args...> -- sets out, rc and took; the log starts empty
-  local st=$1; shift
+  local st=$1 verb=$2; shift 2
+  local as=${BOOT_AS_ID-w-own}
+  set -- "$verb" ${as:+"--as=$as"} "$@"
   : >"$SSH_LOG"; rm -f "$tmp/boot.state".*; echo "$st" >"$tmp/boot.state"
   local started=$SECONDS
   out=$(PATH="$tmp/bootbin:$PATH" BOOT_STATE="$tmp/boot.state" WAKE_LAB_LOCK_DIR="$bl" \
     WAKE_LAB_HOSTS="${BOOT_HOSTS:-$tmp/rog-hosts.sh}" BOOT_LISTING="${BOOT_LISTING-$BOOT_LISTING_DEFAULT}" \
-    WAKE_LAB_BOOT_WAIT_SECONDS="${BOOT_WAIT:-0}" WAKE_LAB_WAIT_SECONDS=0 WAKE_LAB_DOWN_WAIT_SECONDS=0 \
-    WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING="${FW_LISTING-[]}" \
+    WAKE_LAB_BOOT_WAIT_SECONDS="${BOOT_WAIT:-3}" WAKE_LAB_BOOT_POLL_SECONDS=0 WAKE_LAB_WAIT_SECONDS=0 \
+    WAKE_LAB_DOWN_WAIT_SECONDS=0 WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING="${FW_LISTING-[$OWN]}" \
     "$tmp/wake-lab.sh" "$@" 7>&- 2>&1); rc=$?
   took=$((SECONDS - started))
 }
@@ -423,6 +432,10 @@ BOOT_FIRMWARE=ignore boot_run linux boot-windows rog
 check 'a box that comes back in Ubuntu reads as firmware that ignored BootNext' '[ "$rc" = 1 ] && [[ "$out" == *"came back in Ubuntu, so the firmware ignored BootNext"* ]]'
 BOOT_FIRMWARE=noop boot_run linux boot-windows rog
 check 'an accepted reboot after which Ubuntu still answers is NEEDS A PERSON, with the selection taken back' '[ "$rc" = 3 ] && [[ "$out" == *"NEEDS A PERSON: rog accepted its reboot but Ubuntu still answers"* ]] && grep -q -- "--delete-bootnext" "$SSH_LOG" && [ ! -e "$tmp/boot.state.next" ] && [[ "$out" == *"no BootNext left set"* ]]'
+BOOT_FIRMWARE=noop BOOT_FLAKE=1 boot_run linux boot-windows rog
+check 'one failed probe after the reboot is not the reboot: a box that never went down is NEEDS A PERSON, not firmware that ignored BootNext' '[ "$rc" = 3 ] && [[ "$out" == *"rog=DOWN"*"rog=up"* ]] && [[ "$out" == *"accepted its reboot but Ubuntu still answers"* ]] && [[ "$out" != *"firmware ignored"* ]] && [ ! -e "$tmp/boot.state.next" ]'
+BOOT_UNDO=fail BOOT_READBACK=0001 boot_run linux boot-windows rog
+check 'a selection that cannot be verified gone is NEEDS A PERSON, not an ordinary refusal' '[ "$rc" = 3 ] && [[ "$out" == *"BootNext could NOT be verified gone"* ]] && [[ "$out" == *"NEEDS A PERSON: rog may still carry a BootNext into Windows"* ]] && [ "$(grep -c -- "--delete-bootnext" "$SSH_LOG")" -ge 2 ]'
 BOOT_NEXT_DROP=1 boot_run linux boot-windows rog
 check 'a BootNext write whose answer was lost is taken back, and nothing reboots' '[ "$rc" = 1 ] && grep -q -- "--delete-bootnext" "$SSH_LOG" && [ ! -e "$tmp/boot.state.next" ] && ! grep -q "exec sudo -n systemctl reboot" "$SSH_LOG"'
 BOOT_READBACK=0001 boot_run linux boot-windows rog
@@ -467,8 +480,7 @@ BOOT_WIN_RESTART=dark boot_run windows boot-linux rog
 check 'a restart after which nothing answers is NEEDS A PERSON' '[ "$rc" = 3 ] && [[ "$out" == *"NEEDS A PERSON"*"restart into Ubuntu"* ]]'
 BOOT_WIN_RESTART=noop boot_run windows boot-linux rog
 check 'an accepted restart after which Windows still answers is NEEDS A PERSON, never a release over a pending restart' '[ "$rc" = 3 ] && [[ "$out" == *"NEEDS A PERSON: rog accepted its restart but Windows still answers"* ]]'
-# Both Windows routes are dark while it restarts, so the stub holds the box dark for two probes.
-BOOT_DARK=2 BOOT_WIN_RESTART=windows boot_run windows boot-linux rog
+BOOT_WIN_RESTART=windows boot_run windows boot-linux rog
 check 'a restart that comes back in Windows says so' '[ "$rc" = 1 ] && [[ "$out" == *"came back in Windows"* ]]'
 boot_run dark boot-linux rog
 check 'boot-linux on a dark box wakes it into Ubuntu' '[ "$rc" = 0 ] && grep -q "^python3 " "$SSH_LOG" && ! grep -q shutdown "$SSH_LOG"'
@@ -479,33 +491,38 @@ check 'boot-linux on a box already in Ubuntu restarts nothing' '[ "$rc" = 0 ] &&
 sed 's/echo linux/echo wsl/' "$tmp/rog-hosts.sh" >"$tmp/rog-wsl.sh"
 BOOT_HOSTS="$tmp/rog-wsl.sh" boot_run windows boot-linux rog
 check 'a site kind of wsl is overridden by what the probe found' '[ "$rc" = 0 ] && [[ "$out" == *"rog: in Ubuntu"* ]] && ! grep -q "^rog-nv-wsl " "$SSH_LOG"'
+BOOT_GITBASH=late BOOT_WAIT=30 boot_run windows boot-windows rog
+check 'on a box already in Windows, Git Bash is polled within the boot budget too' '[ "$rc" = 0 ] && [[ "$out" == *"already in Windows"*"but its Git Bash did not"*"native Git Bash answers"* ]]'
 BOOT_GITBASH=late BOOT_WAIT=30 boot_run linux boot-windows rog
 check 'a Git Bash not yet up when sshd first answers is polled again, not failed' '[ "$rc" = 0 ] && [[ "$out" == *"but its Git Bash did not"*"native Git Bash answers on rog-lan"* ]] && [ "$took" -lt 25 ]'
 # The execution registry covers both OSes: a native Windows run holds no logind inhibitor and need
-# not take a lab lock, so a reservation naming any endpoint of the box refuses both verbs -- all
-# but the caller's own, named with --as.
-res='[{"request_id":"w-9-win","request":{"execution_host":"rog-nv-win"},"state":"running"}]'
+# not take a lab lock. So a reboot runs under the caller's own exclusive (measurement) reservation,
+# named with --as, and any other reservation naming any endpoint of the box refuses both verbs.
+res="[$OWN,"'{"request_id":"w-9-win","request":{"execution_host":"rog-nv-win","kind":"correctness"},"state":"running"}]'
 FW_LISTING="$res" boot_run windows boot-linux rog
-check 'a reservation on the box'"'"'s Windows endpoint refuses boot-linux, naming it, with nothing sent' '[ "$rc" = 1 ] && [[ "$out" == *"reservation: w-9-win (running)"*"boot-linux REFUSED on rog: an active execution reservation names it"* ]] && [ ! -s "$SSH_LOG" ]'
+check 'another reservation on the box'"'"'s Windows endpoint refuses boot-linux, naming it, with nothing sent' '[ "$rc" = 1 ] && [[ "$out" == *"reservation: w-9-win (running)"*"boot-linux REFUSED on rog: an active execution reservation besides w-own names it"* ]] && [[ "$out" != *"reservation: w-own"* ]] && [ ! -s "$SSH_LOG" ]'
 FW_LISTING="$res" boot_run linux boot-windows rog
-check '...and boot-windows too' '[ "$rc" = 1 ] && [[ "$out" == *"boot-windows REFUSED on rog: an active execution reservation"* ]] && [ ! -s "$SSH_LOG" ]'
-FW_LISTING="$res" boot_run windows boot-linux --as=w-9-win rog
-check 'the caller'"'"'s own reservation, named with --as, does not refuse' '[ "$rc" = 0 ] && [[ "$out" == *"rog: in Ubuntu"* ]]'
-FW_LISTING='[{"request_id":"w-9-win","request":{"execution_host":"rog-nv-win"},"state":"running"},{"request_id":"w-10","request":{"execution_host":"rog-nv-linux"},"state":"launching"}]' \
-  boot_run linux boot-windows --as=w-9-win rog
-check '...while any other one still does' '[ "$rc" = 1 ] && [[ "$out" == *"reservation: w-10 (launching)"*"besides w-9-win"* ]] && [[ "$out" != *"reservation: w-9-win"* ]] && [ ! -s "$SSH_LOG" ]'
-FW_LISTING='[{"request_id":"w-11","request":{"execution_host":"minix-amd-linux"},"state":"running"}]' boot_run linux boot-windows rog
+check '...and boot-windows too' '[ "$rc" = 1 ] && [[ "$out" == *"boot-windows REFUSED on rog: an active execution reservation besides w-own"* ]] && [ ! -s "$SSH_LOG" ]'
+BOOT_AS_ID= boot_run linux boot-windows rog
+check 'with no --as the reboot is refused: it runs only under the caller'"'"'s own reservation' '[ "$rc" = 1 ] && [[ "$out" == *"pass --as=<request_id> of the active measurement reservation you hold on it"* ]] && [ ! -s "$SSH_LOG" ]'
+FW_LISTING="$res" BOOT_AS_ID=w-9-win boot_run windows boot-linux rog
+check '--as naming a correctness (shared) reservation is refused' '[ "$rc" = 1 ] && [[ "$out" == *"--as=w-9-win is not an active measurement reservation"* ]] && [ ! -s "$SSH_LOG" ]'
+FW_LISTING='[{"request_id":"w-own","request":{"execution_host":"minix-amd-linux","kind":"measurement"},"state":"running"}]' boot_run linux boot-windows rog
+check '...and so is one on another box'"'"'s endpoint' '[ "$rc" = 1 ] && [[ "$out" == *"--as=w-own is not an active measurement reservation"* ]] && [ ! -s "$SSH_LOG" ]'
+FW_LISTING='[]' boot_run linux boot-windows rog
+check '...and one the registry does not list as active' '[ "$rc" = 1 ] && [[ "$out" == *"not an active measurement reservation"* ]] && [ ! -s "$SSH_LOG" ]'
+FW_LISTING="[$OWN,"'{"request_id":"w-11","request":{"execution_host":"minix-amd-linux","kind":"correctness"},"state":"running"}]' boot_run linux boot-windows rog
 check 'another box'"'"'s reservation does not refuse' '[ "$rc" = 0 ]'
 FW_LISTING='not json' boot_run linux boot-windows rog
 check 'an unreadable registry refuses the reboot' '[ "$rc" = 1 ] && [[ "$out" == *"execution registry could not be read"* ]] && [ ! -s "$SSH_LOG" ]'
-FW_LISTING='not json' boot_run linux boot-windows --force rog
+FW_LISTING='not json' BOOT_AS_ID= boot_run linux boot-windows --force rog
 check '...and --force takes the box anyway, saying so' '[ "$rc" = 0 ] && [[ "$out" == *"WITHOUT the lab locks or the reservation check (--force)"* ]]'
 # An interrupt between the selection and the reboot takes the selection back: the stub's reboot
 # command wedges, and the suite TERMs the command while it waits on it.
 : >"$SSH_LOG"; rm -f "$tmp/boot.state".*; echo linux >"$tmp/boot.state"
 ( PATH="$tmp/bootbin:$PATH" BOOT_STATE="$tmp/boot.state" WAKE_LAB_LOCK_DIR="$bl" WAKE_LAB_HOSTS="$tmp/rog-hosts.sh" \
-  BOOT_LISTING="$BOOT_LISTING_DEFAULT" BOOT_FIRMWARE=wedge WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING='[]' \
-  exec "$tmp/wake-lab.sh" boot-windows rog >"$tmp/boot-term.out" 2>&1 7>&- ) &
+  BOOT_LISTING="$BOOT_LISTING_DEFAULT" BOOT_FIRMWARE=wedge WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING="[$OWN]" \
+  exec "$tmp/wake-lab.sh" boot-windows --as=w-own rog >"$tmp/boot-term.out" 2>&1 7>&- ) &
 bpid=$!
 for _ in $(seq 1 100); do grep -q reboot-wedged "$SSH_LOG" && break; sleep 0.1; done
 kill -TERM "$bpid" 2>/dev/null; wait "$bpid"; rc=$?

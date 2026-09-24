@@ -19,11 +19,11 @@
 #   wake-lab.sh kick-wsl --hold box       ...and leave a Windows-side holder keeping the VM alive
 #   wake-lab.sh unhold box                end that holder (a lane ends by unhold, never by expiry)
 #   wake-lab.sh lock-path box             where that box's LANE lock lives, for a harness taking one
-#   wake-lab.sh boot-windows [--as=ID] box  reboot a dual-boot box into Windows for ONE boot,
-#                                         unattended, and wait until its Git Bash answers; refused
-#                                         while an execution reservation other than ID names the box
-#                                         (see "dual boot" below)
-#   wake-lab.sh boot-linux box            ...and back: reboot it (or wake it) into Ubuntu; both are
+#   wake-lab.sh boot-windows --as=ID box  reboot a dual-boot box into Windows for ONE boot,
+#                                         unattended, and wait until its Git Bash answers; ID is the
+#                                         caller's active measurement reservation on the box, and any
+#                                         other reservation there refuses it (see "dual boot" below)
+#   wake-lab.sh boot-linux --as=ID box    ...and back: reboot it (or wake it) into Ubuntu; both are
 #                                         reboots, so a desktop session's open apps close with them
 #   wake-lab.sh --list                    dump the router's host table
 # WSL and Windows hardware notes live with the adapter in scripts/wake-lab-wsl.sh.
@@ -732,18 +732,20 @@ capped_tree() { # capped_tree <seconds> <cmd...>
     alarm 0; kill "KILL", -$pid;
     exit(($st & 127) ? 128 + ($st & 127) : $st >> 8);' "$1" "$CAP_EXPIRED" "${@:2}"
 }
-# box_reservations <box> [except-id] -- "<id> (<state>)" per active reservation naming the box on any
-# endpoint of its row, less the one whose request_id is <except-id>; 1 when the registry was unread.
+# box_reservations <box> [except-id] [only-id] -- "<id> (<state>)" per active reservation naming the
+# box on any endpoint of its row, less the one whose request_id is <except-id>; with <only-id>, just
+# that one, and only if it is a `measurement` (exclusive) reservation. 1 when the registry was unread.
 box_reservations() {
   local os e names=""
   for os in linux wsl win lan; do
     e=$(endpoint_of "$1" "$os") && names="$names$e"$'\n'
   done
   [ -n "$RESERVATIONS" ] && [ -n "$names" ] || return 1
-  jq -r --arg names "$names" --arg except "${2:-}" \
+  jq -r --arg names "$names" --arg except "${2:-}" --arg only "${3:-}" \
      '($names | split("\n") | map(select(. != ""))) as $ns
       | if type == "array" then .[] | .request.execution_host as $h
         | select($ns | index([$h])) | select(($except == "") or (.request_id != $except))
+        | select(($only == "") or (.request_id == $only and .request.kind == "measurement"))
         | "\(.request_id) (\(.state))" else error("not a list") end' <<<"$RESERVATIONS" 2>/dev/null
 }
 reservations_fields() { # reservations_fields <box>
@@ -979,8 +981,8 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 # A reboot kills everything on the box, so both verbs RESERVE its lane and hold locks as
 # power_phase does, from before the first command until the other OS answers or the deadline
 # passes, and refuse while either is held; `--force` skips them with the same caveats. Both also
-# refuse while an active execution reservation other than the caller's own names the box
-# (boot_reservations_clear). boot-windows also refuses a box whose logind lists a sleep BLOCK inhibitor (sleep_blocks): that is a
+# run only under the caller's own exclusive execution reservation, named with --as, and refuse
+# while any other names the box (boot_reservations_clear). boot-windows also refuses a box whose logind lists a sleep BLOCK inhibitor (sleep_blocks): that is a
 # `fleet-worker.sh execution slot` or `hold` run in progress, which the lab locks do not see and a
 # root `systemctl reboot` does not honour, since it inhibits sleep and not shutdown.
 #
@@ -994,8 +996,11 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 # A box with no wired NIC in the site file (tuf) is refused: what cannot be woken remotely cannot
 # be recovered remotely either.
 BOOT_WAIT_SECONDS=${WAKE_LAB_BOOT_WAIT_SECONDS:-900}
+BOOT_POLL_SECONDS=${WAKE_LAB_BOOT_POLL_SECONDS:-5}   # between probes of the boot waits
 BOOT_CAP=30            # the cap on one remote command of the boot path
+BOOT_DOWN_POLLS=2      # consecutive dark polls that count as "went down"
 GIT_BASH='C:\Program Files\Git\bin\bash.exe'   # the launcher that sets MSYSTEM, so uname says MINGW*
+BOOT_DEADLINE=0        # the switch's one deadline: every wait after the reboot is accepted shares it
 
 win_alias() { # win_alias <box> -- the first of the box's Windows routes that answers; 1 when none
   local os a
@@ -1017,10 +1022,31 @@ boot_probe() { # boot_probe <box> -- set BOOT_KIND to the OS that answers now: l
   elif win_alias "$1" >/dev/null; then BOOT_KIND=windows; fi
 }
 
-# Poll both OSes until <want> answers (0), the OTHER one does (2) -- which after a confirmed reboot
-# means the box came back in the OS it left, and waiting longer cannot change that -- or the
-# deadline passes (1). Every poll prints a line: a long wait is never a silent one.
-boot_wait() { # boot_wait <box> linux|windows <seconds>
+boot_left() { # seconds left before BOOT_DEADLINE, never negative
+  local l=$((BOOT_DEADLINE - SECONDS))
+  [ "$l" -gt 0 ] || l=0
+  printf '%s\n' "$l"
+}
+
+# The old OS going down, as a SUSTAINED outage: BOOT_DOWN_POLLS dark polls in a row. One failed
+# probe is a flaky ssh as often as a reboot, and reading it as the reboot would end the wait for
+# the old OS -- so a box that then answers again would read as having come BACK, and the locks
+# would be released over a reboot still pending. Waits until BOOT_DEADLINE.
+boot_down() { # boot_down <box>
+  local n=0
+  while :; do
+    if is_up "$1"; then n=0; printf '%s=up ' "$1"; else n=$((n + 1)); printf '%s=DOWN ' "$1"; fi
+    printf '(%s)\n' "$(date +%H:%M:%S)"
+    [ "$n" -ge "$BOOT_DOWN_POLLS" ] && return 0
+    [ "$(boot_left)" = 0 ] && return 1
+    sleep "$BOOT_POLL_SECONDS"
+  done
+}
+
+# Poll both OSes until <want> answers (0), the OTHER one does (2) -- which after a sustained outage
+# means the box came back in the OS it left, and waiting longer cannot change that -- or
+# BOOT_DEADLINE passes (1). Every poll prints a line: a long wait is never a silent one.
+boot_wait() { # boot_wait <box> linux|windows
   local box=$1 want=$2 start=$SECONDS l w
   while :; do
     if ssh_probe "$(endpoint_of "$box" linux)"; then l=UP; else l=down; fi
@@ -1031,8 +1057,8 @@ boot_wait() { # boot_wait <box> linux|windows <seconds>
       linux:*:UP) BOOT_KIND=windows; return 2 ;;
       windows:UP:*) BOOT_KIND=linux; return 2 ;;
     esac
-    [ $((SECONDS - start)) -ge "$3" ] && return 1
-    sleep 5
+    [ "$(boot_left)" = 0 ] && return 1
+    sleep "$BOOT_POLL_SECONDS"
   done
 }
 
@@ -1051,9 +1077,10 @@ needs_a_person_pending() { # needs_a_person_pending <box> <OS still answering> <
 # The one read of efibootmgr's listing, and its boundary: a line `Boot<4 hex>` (with or without the
 # active `*`), spaces, then exactly the label `Windows Boot Manager`, ended by the tab efibootmgr
 # puts before an entry's device path or by the end of the line -- so `Windows Boot Manager (old
-# disk)` is another label, not a match. Everything else in the listing -- BootCurrent, BootOrder, every other entry, the device
-# paths -- is deliberately not read. Exactly one such line is required: none is a box with no
-# Windows to select, and two are an ambiguity a guess would turn into a boot of the wrong disk.
+# disk)` is another label, not a match. Everything else in the listing -- BootCurrent, BootOrder,
+# every other entry, the device paths -- is deliberately not read. Exactly one such line is
+# required: none is a box with no Windows to select, and two are an ambiguity a guess would turn
+# into a boot of the wrong disk.
 windows_boot_entry() { # windows_boot_entry <listing> -- the entry's 4 hex digits; 1 unless exactly one
   local hits
   hits=$(printf '%s\n' "$1" | tr -d '\r' | grep -E '^Boot[0-9A-Fa-f]{4}\*? +Windows Boot Manager('$'\t''|$)' | cut -c5-8)
@@ -1076,14 +1103,45 @@ boot_git_bash() { # boot_git_bash <box> -- the reached Windows' native Git Bash,
   return 1
 }
 
-# The Git Bash check, repeated every 5 s until it passes or <seconds> have gone: sshd can answer
-# before a freshly booted Windows can start Git Bash, and one early miss is not a verdict.
-boot_git_bash_wait() { # boot_git_bash_wait <box> <seconds>
-  local start=$SECONDS
+# The Git Bash check, repeated until it passes or BOOT_DEADLINE: sshd can answer before a freshly
+# booted Windows can start Git Bash, and one early miss is not a verdict.
+boot_git_bash_wait() { # boot_git_bash_wait <box>
   until boot_git_bash "$1"; do
-    [ $((SECONDS - start)) -ge "$2" ] && return 1
-    sleep 5
+    [ "$(boot_left)" = 0 ] && return 1
+    sleep "$BOOT_POLL_SECONDS"
   done
+}
+
+# The BootNext this run set, until the destination OS is SEEN: while BOOT_NEXT_HOST names the Linux
+# alias it was set on, any way out of this process takes it back -- an explicit failure through
+# boot_undo_next, anything else (an interrupt, a closed terminal, a TERM) through the traps armed
+# before the write. SIGKILL cannot be caught; nothing here can cover it.
+BOOT_NEXT_HOST=""
+boot_next_trap() {
+  [ -n "$BOOT_NEXT_HOST" ] || return 0
+  boot_undo_next "$BOOT_BOX" "$BOOT_NEXT_HOST" || true
+}
+# Success is VERIFIED absence, not the delete's status: the listing is read back and must carry no
+# BootNext line, so the same call is right whether this run's write landed, never landed, or was
+# lost in transit. The marker is cleared only then, so an unverified undo leaves the EXIT trap one
+# more try, and the caller turns it into NEEDS A PERSON.
+boot_undo_next() { # boot_undo_next <box> <linux alias> -- 1 when absence could not be verified
+  if boot_ssh "$2" 'sudo -n efibootmgr --delete-bootnext >/dev/null 2>&1; l=$(efibootmgr 2>/dev/null || sudo -n efibootmgr) || exit 1; ! printf "%s\n" "$l" | grep -q "^BootNext:"' >/dev/null 2>&1; then
+    BOOT_NEXT_HOST=""
+    echo "  $1: no BootNext left set; its next boot is Ubuntu"; return 0
+  fi
+  echo "  $1: BootNext could NOT be verified gone, so its next reboot may start Windows ('sudo efibootmgr --delete-bootnext' there)"
+  return 1
+}
+# boot_fail <box> <host> <rc> <message> -- take the selection back, then fail with <rc>; an undo that
+# could not be verified makes it NEEDS A PERSON (3) whatever <rc> was.
+boot_fail() {
+  local ok=0
+  boot_undo_next "$1" "$2" || ok=1
+  printf '%s\n' "$4"
+  [ "$ok" = 0 ] && return "$3"
+  echo "NEEDS A PERSON: $1 may still carry a BootNext into Windows; check 'efibootmgr' there before anything reboots it."
+  return 3
 }
 
 boot_windows() { # boot_windows <box>
@@ -1091,13 +1149,16 @@ boot_windows() { # boot_windows <box>
   host=$(endpoint_of "$box" linux)
   boot_probe "$box"
   case "$BOOT_KIND" in
-    windows) echo "$box: already in Windows; no reboot"; boot_git_bash_wait "$box" "$WAIT_SECONDS"; return ;;
+    windows) echo "$box: already in Windows; no reboot"
+             BOOT_DEADLINE=$((SECONDS + BOOT_WAIT_SECONDS)); boot_git_bash_wait "$box"; return ;;
     "") echo "$box: answers in neither OS; waking it into Ubuntu (first in its BootOrder) first"
         wake "$box"
-        boot_wait "$box" linux "$WAIT_SECONDS"; rc=$?
+        BOOT_DEADLINE=$((SECONDS + WAIT_SECONDS))
+        boot_wait "$box" linux; rc=$?
         case "$rc" in
           0) ;;
-          2) echo "$box: woke into Windows, not Ubuntu; no reboot"; boot_git_bash_wait "$box" "$WAIT_SECONDS"; return ;;
+          2) echo "$box: woke into Windows, not Ubuntu; no reboot"
+             BOOT_DEADLINE=$((SECONDS + BOOT_WAIT_SECONDS)); boot_git_bash_wait "$box"; return ;;
           *) echo "boot-windows FAILED on $box: it did not wake within $((WAIT_SECONDS / 60)) min"; return 1 ;;
         esac ;;
   esac
@@ -1124,24 +1185,18 @@ boot_windows() { # boot_windows <box>
     echo "boot-windows REFUSED on $box: 'sudo -n systemctl reboot' is not granted there (install /etc/sudoers.d/50-fleet-boot; see README)"
     return 1
   fi
-  # Armed BEFORE the write: from here until the reboot is seen to happen, any way out of this
-  # process takes the selection back -- an explicit failure below through boot_undo_next, anything
-  # else (an interrupt, a closed terminal, a TERM) through the trap. A write whose answer was lost
-  # may still have landed, so it is undone like any other. SIGKILL cannot be caught; nothing here
-  # can cover it.
+  # Armed BEFORE the write, since a write whose answer was lost may still have landed.
   BOOT_NEXT_HOST=$host
   trap 'boot_next_trap' EXIT
   trap 'boot_next_trap; exit 130' INT TERM HUP
   out=$(boot_ssh "$host" "sudo -n efibootmgr --bootnext $entry" 2>&1); rc=$?
   if [ "$rc" != 0 ]; then
     printf '  %s\n' "$(printf '%s\n' "$out" | tail -1)"
-    boot_undo_next "$box" "$host"
-    echo "boot-windows REFUSED on $box: BootNext=$entry could not be set (install /etc/sudoers.d/50-fleet-boot; see README)"
-    return 1
+    boot_fail "$box" "$host" 1 "boot-windows REFUSED on $box: BootNext=$entry could not be set (install /etc/sudoers.d/50-fleet-boot; see README)"
+    return
   fi
   if ! printf '%s\n' "$out" | tr -d '\r' | grep -qx "BootNext: $entry"; then
-    boot_undo_next "$box" "$host"
-    echo "boot-windows FAILED on $box: efibootmgr did not read BootNext back as $entry"; return 1
+    boot_fail "$box" "$host" 1 "boot-windows FAILED on $box: efibootmgr did not read BootNext back as $entry"; return
   fi
   echo "  $box: BootNext=$entry (Windows Boot Manager) for one boot; BootOrder untouched"
   echo "$box: reboot"
@@ -1153,45 +1208,30 @@ boot_windows() { # boot_windows <box>
   esac
   if [ "$rc" = 1 ]; then
     printf '  %s\n' "$(printf '%s\n' "$out" | tail -1)"
-    boot_undo_next "$box" "$host"
-    echo "boot-windows FAILED on $box: the reboot command failed"; return 1
+    boot_fail "$box" "$host" 1 "boot-windows FAILED on $box: the reboot command failed"; return
   fi
-  # The down is awaited for the whole boot budget, not DOWN_WAIT_SECONDS: an accepted reboot can be
-  # held up (a unit slow to stop), and giving up early would release the locks over a reboot still
-  # pending. Past the budget the box's fate is unknown, which is a person's to settle.
-  start=$SECONDS
-  if ! DOWN_WAIT_SECONDS=$BOOT_WAIT_SECONDS confirm_down "$box"; then
-    boot_undo_next "$box" "$host"
-    needs_a_person_pending "$box" Ubuntu "its reboot"; return 3
+  # One deadline for the rest of the switch: the down, the wait for Windows and its Git Bash share
+  # it, so the documented budget bounds how long the locks are held. The down is awaited for all of
+  # it, not DOWN_WAIT_SECONDS: an accepted reboot can be held up (a unit slow to stop), and giving
+  # up early would release the locks over a reboot still pending.
+  start=$SECONDS; BOOT_DEADLINE=$((SECONDS + BOOT_WAIT_SECONDS))
+  if ! boot_down "$box"; then
+    boot_fail "$box" "$host" 3 "$(needs_a_person_pending "$box" Ubuntu "its reboot")"; return
   fi
-  BOOT_NEXT_HOST=""   # the reboot happened, and the firmware consumes the selection itself
-  echo "waiting for Windows (up to $((BOOT_WAIT_SECONDS / 60)) min)..."
-  boot_wait "$box" windows "$BOOT_WAIT_SECONDS"; rc=$?
+  echo "waiting for Windows (up to $((BOOT_WAIT_SECONDS / 60)) min in all)..."
+  boot_wait "$box" windows; rc=$?
   case "$rc" in
-    0) echo "$box: Windows answers $((SECONDS - start))s after the reboot"
-       boot_git_bash_wait "$box" $((BOOT_WAIT_SECONDS - (SECONDS - start))); return ;;
-    2) echo "boot-windows FAILED on $box: it came back in Ubuntu, so the firmware ignored BootNext"; return 1 ;;
+    0) BOOT_NEXT_HOST=""   # Windows is up: the firmware took the selection
+       echo "$box: Windows answers $((SECONDS - start))s after the reboot"
+       boot_git_bash_wait "$box"; return ;;
+    2) boot_fail "$box" "$host" 1 "boot-windows FAILED on $box: it came back in Ubuntu, so the firmware ignored BootNext"; return ;;
   esac
-  needs_a_person "$box" "its reboot into Windows"; return 3
-}
-
-# Take back a BootNext this run set and could not follow with a reboot: left in place, it would
-# send the box's NEXT reboot -- a kernel update, a power cut -- into Windows with no one expecting it.
-BOOT_NEXT_HOST=""   # the Linux alias carrying a BootNext this run set and has not yet seen used
-boot_next_trap() {
-  [ -n "$BOOT_NEXT_HOST" ] || return 0
-  boot_undo_next "$BOOT_BOX" "$BOOT_NEXT_HOST"
-}
-# Success is VERIFIED absence, not the delete's status: the listing is read back and must carry no
-# BootNext line, so the same call is right whether this run's write landed, never landed, or was
-# lost in transit.
-boot_undo_next() { # boot_undo_next <box> <linux alias>
+  # Dark at the deadline: the box went down with the selection set and has not answered since, so
+  # there is nothing to reach to take it back; the message says where to look.
   BOOT_NEXT_HOST=""
-  if boot_ssh "$2" 'sudo -n efibootmgr --delete-bootnext >/dev/null 2>&1; l=$(efibootmgr 2>/dev/null || sudo -n efibootmgr) || exit 1; ! printf "%s\n" "$l" | grep -q "^BootNext:"' >/dev/null 2>&1; then
-    echo "  $1: no BootNext left set; its next boot is Ubuntu"
-  else
-    echo "  $1: WARNING: BootNext could NOT be taken back, so its next reboot starts Windows ('sudo efibootmgr --delete-bootnext' there)"
-  fi
+  needs_a_person "$box" "its reboot into Windows"
+  echo "  If it comes back in Ubuntu, check 'efibootmgr' there for a leftover BootNext."
+  return 3
 }
 
 boot_linux() { # boot_linux <box>
@@ -1212,16 +1252,16 @@ boot_linux() { # boot_linux <box>
         printf '  %s\n' "$(printf '%s\n' "$out" | tr -d '\r' | tail -1)"
         echo "boot-linux FAILED on $box: the Windows restart command did not start (exit $rc)"; return 1
       fi
-      start=$SECONDS
-      if ! DOWN_WAIT_SECONDS=$BOOT_WAIT_SECONDS confirm_down "$box"; then   # as boot-windows' down
+      start=$SECONDS; BOOT_DEADLINE=$((SECONDS + BOOT_WAIT_SECONDS))   # one deadline, as boot-windows'
+      if ! boot_down "$box"; then
         needs_a_person_pending "$box" Windows "its restart"; return 3
       fi ;;
     "") echo "$box: answers in neither OS; waking it (it boots Ubuntu, first in its BootOrder)"
-        start=$SECONDS
+        start=$SECONDS; BOOT_DEADLINE=$((SECONDS + BOOT_WAIT_SECONDS))
         wake "$box" ;;
   esac
-  echo "waiting for Ubuntu (up to $((BOOT_WAIT_SECONDS / 60)) min)..."
-  boot_wait "$box" linux "$BOOT_WAIT_SECONDS"; rc=$?
+  echo "waiting for Ubuntu (up to $((BOOT_WAIT_SECONDS / 60)) min in all)..."
+  boot_wait "$box" linux; rc=$?
   case "$rc" in
     0) echo "$box: in Ubuntu, $((SECONDS - start))s after the restart"; return 0 ;;
     2) echo "boot-linux FAILED on $box: it came back in Windows (a Windows update restart, or a BootOrder that does not start Ubuntu first)"; return 1 ;;
@@ -1230,21 +1270,31 @@ boot_linux() { # boot_linux <box>
 }
 
 # The fleet's execution registry is the one record of work on a box that covers BOTH of its OSes:
-# a native Windows run holds no logind inhibitor and need not take a lab lock, so without this a
-# `boot-linux` would restart Windows under it. Any active reservation naming one of the box's
-# endpoints refuses the reboot, except the caller's own, named with --as=<request_id> -- the
-# exclusive reservation a reboot is run under. A registry that cannot be read refuses as well,
-# since "nothing reserved" and "could not look" call for opposite answers here.
+# a native Windows run holds no logind inhibitor and need not take a lab lock. A reboot therefore
+# runs under the caller's own EXCLUSIVE reservation, named with --as=<request_id>: it must be an
+# active `measurement` reservation on one of the box's endpoints, which the registry itself keeps
+# every later reservation on that host from joining -- so there is no window between this check and
+# the reboot for new work on that host to start in. Any OTHER active reservation naming one of the
+# box's endpoints refuses too (the registry knows hosts, not boxes, so the box's other endpoints
+# are checked here), and so does a registry that cannot be read.
 boot_reservations_clear() { # boot_reservations_clear <verb> <box>
-  local others
+  local own others
+  if [ -z "$BOOT_AS" ]; then
+    echo "$1 REFUSED on $2: a reboot runs under your own exclusive reservation; pass --as=<request_id> of the active measurement reservation you hold on it (or --force)"
+    return 1
+  fi
   reservations_read
-  if ! others=$(box_reservations "$2" "$BOOT_AS"); then
+  if ! own=$(box_reservations "$2" "" "$BOOT_AS") || ! others=$(box_reservations "$2" "$BOOT_AS"); then
     echo "$1 REFUSED on $2: the fleet's execution registry could not be read, so a run there cannot be ruled out (--force reboots anyway)"
+    return 1
+  fi
+  if [ -z "$own" ]; then
+    echo "$1 REFUSED on $2: --as=$BOOT_AS is not an active measurement reservation on any of its endpoints"
     return 1
   fi
   [ -z "$others" ] && return 0
   printf '%s\n' "$others" | sed 's/^/  reservation: /'
-  echo "$1 REFUSED on $2: an active execution reservation names it${BOOT_AS:+ besides $BOOT_AS} (run under your own exclusive reservation and pass --as=<its request_id>, or --force)"
+  echo "$1 REFUSED on $2: an active execution reservation besides $BOOT_AS names it (wait for it to conclude, or --force)"
   return 1
 }
 
