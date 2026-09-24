@@ -17,19 +17,21 @@ command.
 A `measurement` reservation is exclusive: it is refused while anything is outstanding on its
 host, and everything is refused while it is outstanding. A `correctness` reservation shares its
 host with other correctness reservations up to the box's slots - `FLEET_BOX_CORRECTNESS_SLOTS`,
-`<box>=<n>` pairs, `mac-studio=6 rog-nv-linux=2 minix-amd-linux=2` with the default roster and
-one slot for any box it does not name. The default roster is the default set of boxes, whether
+`<box>=<n>` pairs, `mac-studio=6 rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3` with the
+default roster and one slot for any box it does not name. The default roster is the default set of boxes, whether
 `FLEET_BOXES` is unset or exports those same boxes (ludics-lite#329), and `fleet-worker.sh
 preflight` prints the count for every roster box (ludics-lite#157: the exclusivity was written for
 measurement noise and for XProtect serializing fresh test binaries, and three workers' targeted
 `-j 4` batches ran side by side on the Mac without a stall once the Developer Tools exemption was
 in place). Keep one slot for WSL boxes because of the measured dxg bridge limit. The native GPU
-boxes' two slots were measured with targeted batches at ahrefs/ocannl#1029's widths
-(ludics-lite#316): `-j 8` on rog-nv-linux, and `-j 4` on minix-amd-linux, whose gfx1151 alone
-bounds slots x width at 8, its device-wide SDMA queue pool. OCANNL's `tools/test-run.sh` injects
-those widths into a native batch that names none (ahrefs/ocannl#1033), so a worker passes no `-j`
-for them. tuf-amd-linux keeps one slot until it is measured. The kind does not silently change the
-configured slot count.
+boxes' counts were measured with 1-4 concurrent compile-inclusive targeted batches, each box under
+an exclusive reservation (ludics-lite#316, #344), at the width each batch runs at: four `-j 4`
+batches on minix-amd-linux (16 hip-width at once was green three ways; only dune's default 32 has
+drained its device-wide SDMA queue pool), three `-j 8` on tuf-amd-linux, and two `-j 8` on
+rog-nv-linux, where three or more concurrent cuda batches hit `CUDA_ERROR_OUT_OF_MEMORY` in 2 of 6
+rungs. OCANNL's `tools/test-run.sh` injects those widths into a native batch that names none
+(ahrefs/ocannl#1033; `tools/box-jobs.sh` restates the counts, so the two change together), so a
+worker passes no `-j` for them. The kind does not silently change the configured slot count.
 
 The slot count is a RUN-TIME count, and `execution slot` is the single run-time mechanism
 (ludics-lite#160): every correctness run on a box, assigned or standing, is wrapped in
