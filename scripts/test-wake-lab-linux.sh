@@ -352,8 +352,9 @@ case "$cmd" in
   'sudo -n -l systemctl reboot') sudo_ok nobootnext; echo /usr/bin/systemctl reboot; exit 0 ;;
   'sudo -n efibootmgr --bootnext '*)
     sudo_ok noreboot; echo "${cmd##* }" >"$BOOT_STATE.next"
+    [ "${BOOT_NEXT_DROP:-0}" = 1 ] && exit 255   # written, and the answer lost on the way back
     printf 'BootNext: %s\n' "${BOOT_READBACK:-${cmd##* }}"; printf '%s\n' "$BOOT_LISTING"; exit 0 ;;
-  'sudo -n efibootmgr --delete-bootnext') rm -f "$BOOT_STATE.next"; exit 0 ;;
+  'sudo -n efibootmgr --delete-bootnext'*) rm -f "$BOOT_STATE.next"; exit 0 ;;   # ...and the read-back finds none
   *'echo WAKE_LAB_POWER_STARTED; exec sudo -n systemctl reboot')
     [ "${BOOT_FIRMWARE:-}" = wedge ] && { echo reboot-wedged >>"$SSH_LOG"; sleep 20; exit 255; }   # never returns in time
     locks; echo WAKE_LAB_POWER_STARTED; sudo_ok nobootnext
@@ -366,7 +367,8 @@ case "$cmd" in
     rm -f "$BOOT_STATE.next"; exit 255 ;;
   *'echo WAKE_LAB_POWER_STARTED& shutdown /r /f /t 0'*)
     # With the blank rog's cmd.exe returned when the command had one before its `&` (2026-09-24).
-    locks; printf 'WAKE_LAB_POWER_STARTED \r\n'; reboot_to "${BOOT_WIN_RESTART:-linux}"; exit 0 ;;
+    locks; printf 'WAKE_LAB_POWER_STARTED \r\n'
+    [ "${BOOT_WIN_RESTART:-linux}" = noop ] || reboot_to "${BOOT_WIN_RESTART:-linux}"; exit 0 ;;
   *'bash.exe'*)
     gb=${BOOT_GITBASH:-native}
     # late: not yet on the first call after Windows answers, as a Git Bash still starting would be
@@ -420,7 +422,9 @@ check 'a Windows endpoint that never answers is a loud NEEDS A PERSON (exit 3), 
 BOOT_FIRMWARE=ignore boot_run linux boot-windows rog
 check 'a box that comes back in Ubuntu reads as firmware that ignored BootNext' '[ "$rc" = 1 ] && [[ "$out" == *"came back in Ubuntu, so the firmware ignored BootNext"* ]]'
 BOOT_FIRMWARE=noop boot_run linux boot-windows rog
-check 'a reboot that never took fails and takes the selection back' '[ "$rc" = 1 ] && [[ "$out" == *"the reboot did not take"* ]] && grep -q -- "--delete-bootnext" "$SSH_LOG" && [ ! -e "$tmp/boot.state.next" ] && [[ "$out" == *"BootNext taken back"* ]]'
+check 'an accepted reboot after which Ubuntu still answers is NEEDS A PERSON, with the selection taken back' '[ "$rc" = 3 ] && [[ "$out" == *"NEEDS A PERSON: rog accepted its reboot but Ubuntu still answers"* ]] && grep -q -- "--delete-bootnext" "$SSH_LOG" && [ ! -e "$tmp/boot.state.next" ] && [[ "$out" == *"no BootNext left set"* ]]'
+BOOT_NEXT_DROP=1 boot_run linux boot-windows rog
+check 'a BootNext write whose answer was lost is taken back, and nothing reboots' '[ "$rc" = 1 ] && grep -q -- "--delete-bootnext" "$SSH_LOG" && [ ! -e "$tmp/boot.state.next" ] && ! grep -q "exec sudo -n systemctl reboot" "$SSH_LOG"'
 BOOT_READBACK=0001 boot_run linux boot-windows rog
 check 'a BootNext that does not read back as the entry is taken back and nothing reboots' '[ "$rc" = 1 ] && [[ "$out" == *"did not read BootNext back as 0003"* ]] && grep -q -- "--delete-bootnext" "$SSH_LOG" && ! grep -q "exec sudo -n systemctl reboot" "$SSH_LOG"'
 BOOT_SUDO=deny boot_run linux boot-windows rog
@@ -461,6 +465,8 @@ check 'boot-linux restarts Windows into Ubuntu over the LAN route, under both la
 check '...and never touches the EFI selection' '! grep -q efibootmgr "$SSH_LOG"'
 BOOT_WIN_RESTART=dark boot_run windows boot-linux rog
 check 'a restart after which nothing answers is NEEDS A PERSON' '[ "$rc" = 3 ] && [[ "$out" == *"NEEDS A PERSON"*"restart into Ubuntu"* ]]'
+BOOT_WIN_RESTART=noop boot_run windows boot-linux rog
+check 'an accepted restart after which Windows still answers is NEEDS A PERSON, never a release over a pending restart' '[ "$rc" = 3 ] && [[ "$out" == *"NEEDS A PERSON: rog accepted its restart but Windows still answers"* ]]'
 # Both Windows routes are dark while it restarts, so the stub holds the box dark for two probes.
 BOOT_DARK=2 BOOT_WIN_RESTART=windows boot_run windows boot-linux rog
 check 'a restart that comes back in Windows says so' '[ "$rc" = 1 ] && [[ "$out" == *"came back in Windows"* ]]'
@@ -503,7 +509,7 @@ check '...and --force takes the box anyway, saying so' '[ "$rc" = 0 ] && [[ "$ou
 bpid=$!
 for _ in $(seq 1 100); do grep -q reboot-wedged "$SSH_LOG" && break; sleep 0.1; done
 kill -TERM "$bpid" 2>/dev/null; wait "$bpid"; rc=$?
-check 'a TERM after BootNext was set, before the reboot happened, takes the selection back' '[ "$rc" = 130 ] && grep -q -- "--delete-bootnext" "$SSH_LOG" && [ ! -e "$tmp/boot.state.next" ] && grep -q "BootNext taken back" "$tmp/boot-term.out"'
+check 'a TERM after BootNext was set, before the reboot happened, takes the selection back' '[ "$rc" = 130 ] && grep -q -- "--delete-bootnext" "$SSH_LOG" && [ ! -e "$tmp/boot.state.next" ] && grep -q "no BootNext left set" "$tmp/boot-term.out"'
 check 'control: that selection had been set before the TERM' 'grep -qx "rog-nv-linux sudo -n efibootmgr --bootnext 0003" "$SSH_LOG" && grep -q reboot-wedged "$SSH_LOG"'
 BOOT_HOSTS="$tmp/hosts.sh" boot_run linux boot-windows tuf
 check 'tuf, with no wired NIC, is refused with the reason and nothing sent' '[ "$rc" = 1 ] && [[ "$out" == *"boot-windows REFUSED on tuf: it has no wired NIC"* ]] && [ ! -s "$SSH_LOG" ]'

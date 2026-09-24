@@ -986,9 +986,10 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 #
 # The wait prints a line per poll with both OSes' state, and ends in a verdict:
 #   exit 0  the requested OS answers (for Windows, its Git Bash as well)
-#   exit 1  refused, or failed with the box reachable in a known OS: the reboot never took (and the
-#           selection was taken back), or the box came back in the OS it left
-#   exit 3  NEEDS A PERSON: nothing answers after the reboot. Only someone at the box can tell
+#   exit 1  refused, or failed with the box reachable in a known OS: the box came back in the OS it
+#           left, or a command failed before any reboot was accepted
+#   exit 3  NEEDS A PERSON: nothing answers after the reboot, or the reboot was accepted and the old
+#           OS still answers at the deadline (it may yet go down). Only someone at the box can tell
 #           Windows updates from a BitLocker recovery prompt or a hang, so this never retries.
 # A box with no wired NIC in the site file (tuf) is refused: what cannot be woken remotely cannot
 # be recovered remotely either.
@@ -1039,6 +1040,12 @@ needs_a_person() { # needs_a_person <box> <what was waited for>
   printf '%s\n' "NEEDS A PERSON: $1 answers in NEITHER OS $(( BOOT_WAIT_SECONDS / 60 )) min after $2." \
     "  Only someone at the box can tell Windows updates from a BitLocker recovery prompt, a firmware" \
     "  menu or a hang, so nothing here retries. Look at its screen; '$0 status $1' shows when it answers."
+}
+
+needs_a_person_pending() { # needs_a_person_pending <box> <OS still answering> <what was accepted>
+  printf '%s\n' "NEEDS A PERSON: $1 accepted $3 but $2 still answers $(( BOOT_WAIT_SECONDS / 60 )) min later." \
+    "  It may still go down at any moment, so nothing should be started there until someone has looked;" \
+    "  '$0 status $1' shows what answers."
 }
 
 # The one read of efibootmgr's listing, and its boundary: a line `Boot<4 hex>` (with or without the
@@ -1117,9 +1124,18 @@ boot_windows() { # boot_windows <box>
     echo "boot-windows REFUSED on $box: 'sudo -n systemctl reboot' is not granted there (install /etc/sudoers.d/50-fleet-boot; see README)"
     return 1
   fi
+  # Armed BEFORE the write: from here until the reboot is seen to happen, any way out of this
+  # process takes the selection back -- an explicit failure below through boot_undo_next, anything
+  # else (an interrupt, a closed terminal, a TERM) through the trap. A write whose answer was lost
+  # may still have landed, so it is undone like any other. SIGKILL cannot be caught; nothing here
+  # can cover it.
+  BOOT_NEXT_HOST=$host
+  trap 'boot_next_trap' EXIT
+  trap 'boot_next_trap; exit 130' INT TERM HUP
   out=$(boot_ssh "$host" "sudo -n efibootmgr --bootnext $entry" 2>&1); rc=$?
   if [ "$rc" != 0 ]; then
     printf '  %s\n' "$(printf '%s\n' "$out" | tail -1)"
+    boot_undo_next "$box" "$host"
     echo "boot-windows REFUSED on $box: BootNext=$entry could not be set (install /etc/sudoers.d/50-fleet-boot; see README)"
     return 1
   fi
@@ -1127,12 +1143,6 @@ boot_windows() { # boot_windows <box>
     boot_undo_next "$box" "$host"
     echo "boot-windows FAILED on $box: efibootmgr did not read BootNext back as $entry"; return 1
   fi
-  # From here until the reboot is seen to happen, any way out of this process takes the selection
-  # back: an explicit failure below through boot_undo_next, anything else -- an interrupt, a closed
-  # terminal, a TERM -- through the trap. (A SIGKILL cannot be caught; nothing here can cover it.)
-  BOOT_NEXT_HOST=$host
-  trap 'boot_next_trap' EXIT
-  trap 'boot_next_trap; exit 130' INT TERM HUP
   echo "  $box: BootNext=$entry (Windows Boot Manager) for one boot; BootOrder untouched"
   echo "$box: reboot"
   out=$(boot_ssh "$host" "$NATIVE_LINUX_GUARD; echo WAKE_LAB_POWER_STARTED; exec sudo -n systemctl reboot" 2>&1); rc=$?
@@ -1146,10 +1156,13 @@ boot_windows() { # boot_windows <box>
     boot_undo_next "$box" "$host"
     echo "boot-windows FAILED on $box: the reboot command failed"; return 1
   fi
+  # The down is awaited for the whole boot budget, not DOWN_WAIT_SECONDS: an accepted reboot can be
+  # held up (a unit slow to stop), and giving up early would release the locks over a reboot still
+  # pending. Past the budget the box's fate is unknown, which is a person's to settle.
   start=$SECONDS
-  if ! confirm_down "$box"; then
+  if ! DOWN_WAIT_SECONDS=$BOOT_WAIT_SECONDS confirm_down "$box"; then
     boot_undo_next "$box" "$host"
-    echo "boot-windows FAILED on $box: Ubuntu still answers, so the reboot did not take"; return 1
+    needs_a_person_pending "$box" Ubuntu "its reboot"; return 3
   fi
   BOOT_NEXT_HOST=""   # the reboot happened, and the firmware consumes the selection itself
   echo "waiting for Windows (up to $((BOOT_WAIT_SECONDS / 60)) min)..."
@@ -1169,10 +1182,13 @@ boot_next_trap() {
   [ -n "$BOOT_NEXT_HOST" ] || return 0
   boot_undo_next "$BOOT_BOX" "$BOOT_NEXT_HOST"
 }
+# Success is VERIFIED absence, not the delete's status: the listing is read back and must carry no
+# BootNext line, so the same call is right whether this run's write landed, never landed, or was
+# lost in transit.
 boot_undo_next() { # boot_undo_next <box> <linux alias>
   BOOT_NEXT_HOST=""
-  if boot_ssh "$2" 'sudo -n efibootmgr --delete-bootnext' >/dev/null 2>&1; then
-    echo "  $1: BootNext taken back; its next boot is Ubuntu again"
+  if boot_ssh "$2" 'sudo -n efibootmgr --delete-bootnext >/dev/null 2>&1; l=$(efibootmgr 2>/dev/null || sudo -n efibootmgr) || exit 1; ! printf "%s\n" "$l" | grep -q "^BootNext:"' >/dev/null 2>&1; then
+    echo "  $1: no BootNext left set; its next boot is Ubuntu"
   else
     echo "  $1: WARNING: BootNext could NOT be taken back, so its next reboot starts Windows ('sudo efibootmgr --delete-bootnext' there)"
   fi
@@ -1197,8 +1213,8 @@ boot_linux() { # boot_linux <box>
         echo "boot-linux FAILED on $box: the Windows restart command did not start (exit $rc)"; return 1
       fi
       start=$SECONDS
-      if ! confirm_down "$box"; then
-        echo "boot-linux FAILED on $box: Windows still answers, so the restart did not take"; return 1
+      if ! DOWN_WAIT_SECONDS=$BOOT_WAIT_SECONDS confirm_down "$box"; then   # as boot-windows' down
+        needs_a_person_pending "$box" Windows "its restart"; return 3
       fi ;;
     "") echo "$box: answers in neither OS; waking it (it boots Ubuntu, first in its BootOrder)"
         start=$SECONDS

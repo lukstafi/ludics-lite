@@ -262,8 +262,9 @@ inhibitor, which the lab locks do not see. Each is a real reboot, so whatever is
 live witness on rog closed its Firefox and VS Code windows. They take exactly one box, and refuse one with no wired NIC (tuf), since
 what cannot be woken remotely cannot be recovered remotely. The wait prints a line per poll for up
 to 15 minutes (`WAKE_LAB_BOOT_WAIT_SECONDS`) and ends in 0 (reached), 1 (refused, or back in a
-known OS: the reboot never took, or the firmware ignored BootNext) or 3, `NEEDS A PERSON`: nothing
-answers, and only someone at the box can tell Windows updates from a BitLocker prompt or a hang.
+known OS: the firmware ignored BootNext, or Windows came back) or 3, `NEEDS A PERSON`: nothing
+answers, or the old OS still answers at the deadline after accepting the reboot, and only someone at
+the box can tell Windows updates from a BitLocker prompt or a hang. The locks are held until then.
 The Linux side needs root for exactly this, installed once per box as
 `/etc/sudoers.d/50-fleet-boot` (mode 0440, checked with `visudo -cf`), with that box's entry number
 and user:
