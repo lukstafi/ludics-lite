@@ -54,6 +54,9 @@ gate. It stays quiet on the default branch, detached HEAD, clean integrated topi
 branches, and branches with **any** PR, including closed or merged PRs. A closed
 PR can represent a deliberately abandoned experiment; opening a PR transfers
 responsibility to the skill/coordinator rather than starting another monitor.
+A PR counts when its head branch has the local branch's name or, for work pushed
+under another name (`git push origin HEAD:<name>`), when it contains the local
+HEAD commit. Local commits beyond such a PR's head are in no PR and still nudge.
 
 A nudge is claimed at most once per session, worktree, branch, HEAD and porcelain
 status. File contents are deliberately not hashed: editing the same dirty files
@@ -63,7 +66,7 @@ continuation loop. Claims live in `${TMPDIR:-/tmp}/ship-pr-nudge` and are tempor
 
 GitHub failures, missing dependencies, and unreadable Git state are unknown and
 stay quiet without claiming the state. A successful empty `gh pr list --state all`
-is required before saying there is no PR. There is no fetch; the local
+answer to every lookup is required before saying there is no PR. There is no fetch; the local
 `origin/HEAD` determines the base, falling back to `master` when absent.
 
 Claude's recent unfinished task files defer the reminder without stamping. Codex

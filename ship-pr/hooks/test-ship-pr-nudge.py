@@ -26,13 +26,16 @@ class NudgeTests(unittest.TestCase):
             if path:
                 (self.bin / name).symlink_to(path)
         gh = self.bin / "gh"
+        # N_PR answers the lookup by branch name, N_SHA the lookup by commit.
         gh.write_text('#!/bin/bash\n'
-                      'echo called >> "$TMPDIR/gh-calls"\n'
+                      'echo "$*" >> "$TMPDIR/gh-calls"\n'
                       '[ "$1 $2" = "pr list" ] || exit 9\n'
-                      '[ "$N_PR" = error ] && exit 1\n'
-                      'printf "%s\\n" "$N_PR"\n')
+                      'answer=$N_PR\n'
+                      'case " $* " in *" --search "*) answer=$N_SHA ;; esac\n'
+                      '[ "$answer" = error ] && exit 1\n'
+                      'printf "%s\\n" "$answer"\n')
         gh.chmod(0o755)
-        self.env = dict(os.environ, PATH=str(self.bin), TMPDIR=str(self.root), N_PR="0",
+        self.env = dict(os.environ, PATH=str(self.bin), TMPDIR=str(self.root), N_PR="0", N_SHA="0",
                         GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                         GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@example.org",
                         GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@example.org")
@@ -92,6 +95,29 @@ class NudgeTests(unittest.TestCase):
         self.run_hook(0)
         self.env["N_PR"] = "0"
         self.run_hook(2)
+
+    def test_pr_found_by_commit_under_another_branch_name(self):
+        # Pushed as `git push origin HEAD:<other>`: no PR has this branch's name, one has HEAD.
+        self.git("commit", "-qam", "work")
+        self.env["N_SHA"] = "1"
+        self.run_hook(0)
+        self.assertIn("--search " + self.git("rev-parse", "HEAD"),
+                      (self.root / "gh-calls").read_text())
+        self.env["N_SHA"] = "0"
+        self.run_hook(0)  # The same repository state remains stamped.
+
+    def test_commit_lookup_failure_does_not_claim_absence_or_stamp(self):
+        self.git("commit", "-qam", "work")
+        self.env["N_SHA"] = "error"
+        self.run_hook(0)
+        self.env["N_SHA"] = "0"
+        self.run_hook(2)
+
+    def test_dirty_work_on_a_landed_head_is_not_looked_up_by_commit(self):
+        # With nothing ahead, HEAD would match the PR that landed it on the default branch.
+        self.env["N_SHA"] = "1"
+        self.run_hook(2)
+        self.assertNotIn("--search", (self.root / "gh-calls").read_text())
 
     def test_missing_gh_does_not_stamp(self):
         gh = self.bin / "gh"

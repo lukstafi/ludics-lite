@@ -105,12 +105,22 @@ stamp="$stamp_dir/$state"
 # Keep ALL PR states exempt: closed PRs may be deliberately abandoned experiments.
 # A successful empty list proves absence; auth/network errors and missing gh do not.
 command -v gh >/dev/null 2>&1 || exit 0
-pr_count=$(gh pr list --head "$branch" --state all --limit 1 --json number --jq length 2>/dev/null) || exit 0
-case "$pr_count" in
-  0) ;;
-  1) mkdir "$stamp" 2>/dev/null; exit 0 ;;
-  *) exit 0 ;;
-esac
+pr_exempt() {
+  local pr_count
+  pr_count=$(gh pr list "$@" --state all --limit 1 --json number --jq length 2>/dev/null) || exit 0
+  case "$pr_count" in
+    0) return 1 ;;
+    1) mkdir "$stamp" 2>/dev/null; exit 0 ;;
+    *) exit 0 ;;
+  esac
+}
+pr_exempt --head "$branch"
+# The work may have been pushed under another name (`git push origin HEAD:<name>`), so also look
+# for a PR by HEAD's SHA. GitHub's SHA search matches ANY commit of a PR, so a HEAD that is an
+# ancestor of a PR's head counts too, at no extra cost. A HEAD with commits beyond a PR's head
+# does not: those commits are in no PR, and a branch stacked on another PR looks the same.
+# With nothing ahead, HEAD is already on the default branch and would match the PR that landed it.
+[ "$ahead" != "0" ] && pr_exempt --search "$(git rev-parse HEAD)"
 
 mkdir "$stamp" 2>/dev/null || exit 0
 {
