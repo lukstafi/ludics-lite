@@ -307,7 +307,12 @@ state_of() { if alive "$1"; then echo RUNNING; elif orphaned "$1"; then echo ORP
 # far-side script that creates a worker session (launch, unstick) repeats it just before
 # `new-session`: the launch's fetch and base gate can take minutes, and a resume creates a
 # session with no preflight at all.
-TMUX_ENV_VARS="PATH ROCM_PATH HIP_PATH OPAM_SWITCH_PREFIX"
+# The GitHub variables are here for ludics-lite#360: the preflight's `gh api user` proves the
+# credential a fresh shell reads, and a server carrying a different GH_TOKEN (which outranks the
+# keyring), GH_HOST or GH_CONFIG_DIR would hand the worker another one. A token's value is never
+# printed, only whether each side sets it.
+TMUX_ENV_VARS="PATH ROCM_PATH HIP_PATH OPAM_SWITCH_PREFIX GH_HOST GH_CONFIG_DIR"
+TMUX_ENV_SECRET_VARS="GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN"
 tmux_env_check() {
   local sessions genv refreshed v line skip sset sval fset fval diff="" workers="" others="" tmx
   genv=$(tm show-environment -g 2>/dev/null) || return 0   # no server running
@@ -318,7 +323,7 @@ tmux_env_check() {
   # session (removed there when the client lacks it), so the worker gets the fresh shell's value
   # whatever the global one says: comparing it would refuse a safe launch.
   refreshed=$(tm show-options -gv update-environment 2>/dev/null)
-  for v in $TMUX_ENV_VARS; do
+  for v in $TMUX_ENV_VARS $TMUX_ENV_SECRET_VARS; do
     skip=0
     while IFS= read -r line; do [ "$line" = "$v" ] && skip=1; done <<< "$refreshed"
     [ "$skip" = 0 ] || continue
@@ -329,6 +334,11 @@ tmux_env_check() {
     done <<< "$genv"
     fset=0; fval=""; if [ -n "${!v+x}" ]; then fset=1; fval=${!v}; fi
     [ "$sset" = "$fset" ] && [ "$sval" = "$fval" ] && continue
+    case " $TMUX_ENV_SECRET_VARS " in
+      *" $v "*)
+        if [ "$sset" = 1 ] && [ "$fset" = 1 ]; then diff="$diff, $v differs between the server and a fresh shell (values not shown)"; continue; fi
+        sval="set"; fval="set" ;;
+    esac
     [ "$sset" = 1 ] || sval="unset"; [ "$fset" = 1 ] || fval="unset"
     diff="$diff, $v is $sval in the server but $fval in a fresh shell"
   done
@@ -605,7 +615,7 @@ gh_down=""
 if ! command -v gh >/dev/null 2>&1; then
   note "no gh on PATH in a non-interactive session on $BOX (a worker here cannot open its PR)"
 else
-  ghout=$(GH_PROMPT_DISABLED=1 bounded "$gh_timeout" gh api user -q .login); ghrc=$?
+  ghout=$(GH_PROMPT_DISABLED=1 bounded "$gh_timeout" gh api --hostname github.com user -q .login); ghrc=$?
   ghlast=$(printf '%s\n' "$ghout" | sed '/^[[:space:]]*$/d' | tail -n1 | sed 's/^.*}gh: /gh: /' | cut -c1-120)
   if [ "$ghrc" -eq 0 ] && [ -n "$ghlast" ]; then :
   elif [ "$ghrc" -eq 124 ]; then gh_down="no answer from gh api user in ${gh_timeout}s"

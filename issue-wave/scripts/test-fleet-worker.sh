@@ -131,6 +131,9 @@ export FLEET_ANCHOR="testbox"
 # session identity.
 export FLEET_COORDINATOR="test-coordinator"
 unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
+# The preflight's tmux check compares GitHub's variables too (ludics-lite#360), so the runner's own
+# must not leak into the fresh-shell side of it.
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_HOST GH_CONFIG_DIR
 export PATH="$TMP/bin:$PATH"
 # `execution slot` runs its command under `execution hold`, which wraps it in systemd-inhibit when
 # one resolves (ludics-lite#317). The CI runner is Ubuntu, whose real systemd-inhibit would make
@@ -312,7 +315,7 @@ SHIMEOF
 # `5xx` a GitHub outage, `hang` a call that never returns. Unset, it answers a login.
 cat > "$TMP/bin/gh" <<'SHIMEOF'
 #!/usr/bin/env bash
-[ "$*" = "api user -q .login" ] || { echo "gh shim: unexpected call: $*" >&2; exit 2; }
+[ "$*" = "api --hostname github.com user -q .login" ] || { echo "gh shim: unexpected call: $*" >&2; exit 2; }
 case "${SHIM_GH:-}" in
   401) printf '{\n  "message": "Bad credentials",\n  "status": "401"\n}'; echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
   noauth) printf 'To get started with GitHub CLI, please run:  gh auth login\n' >&2; exit 4 ;;
@@ -864,6 +867,18 @@ expect "every stale variable is named in one refusal" 1 "(ROCM_PATH is /usr in t
   "${fresh[@]}" OPAM_SWITCH_PREFIX=/o SHIM_TMUX_GENV="$TMP/genv-rocm" "$FW" preflight testbox --no-probe
 expect "native workers never run under tmux, so a stale server does not refuse them" 0 "PREFLIGHT OK" -- \
   "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-rocm" "$FW" preflight testbox --native-claude
+# GitHub's variables (ludics-lite#360): the preflight's `gh api user` proves the credential a fresh
+# shell reads, so a server handing the worker another token or host refuses -- and a token's value
+# never reaches the refusal.
+printf 'PATH=%s\nGH_TOKEN=gho_servertokensecret\n' "$PATH" > "$TMP/genv-ghtoken"
+expect "a server exporting a GH_TOKEN the fresh shell lacks refuses, naming it" 1 "GH_TOKEN is set in the server but unset in a fresh shell" -- \
+  "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-ghtoken" "$FW" preflight testbox --no-probe
+grep -q 'servertokensecret' <<<"$out" && ko "the refusal printed the server's token -- $out" || ok "...without printing the token"
+expect "a server whose GH_TOKEN differs from the fresh shell's refuses without either value" 1 "GH_TOKEN differs between the server and a fresh shell (values not shown)" -- \
+  "${fresh[@]}" GH_TOKEN=gho_freshtokensecret SHIM_TMUX_GENV="$TMP/genv-ghtoken" "$FW" preflight testbox --no-probe
+grep -q 'tokensecret' <<<"$out" && ko "the refusal printed a token -- $out" || ok "...and prints neither token"
+expect "a GH_HOST the fresh shell gained since the server started refuses" 1 "GH_HOST is unset in the server but github.example.com in a fresh shell" -- \
+  "${fresh[@]}" GH_HOST=github.example.com SHIM_TMUX_GENV="$TMP/genv-match" "$FW" preflight testbox --no-probe
 # The same fact against a real tmux server, on a socket of its own: the shim above must not be the
 # only thing that knows the output shape of show-environment.
 envsock="fwtest-env-$$"
