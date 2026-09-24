@@ -39,7 +39,7 @@
 #   fleet-worker.sh preflight <box> [--codex|--native-codex|--native-claude] [--no-probe] [--no-cross]   # launch runs this itself, too
 #   fleet-worker.sh refresh <box> [<box> ...]   # fast-forward each box's skills checkout alone, or
 #                          # report why not (never resets); `execution run`/`dispatch` run it
-#                          # on a cross-box execution host
+#                          # on the execution host
 #   fleet-worker.sh gate --target-repo <owner/repo> [--base-branch <branch>] [--force --allow-red-base <reason>] # lease + halt read before native dispatch (not a reservation)
 #   fleet-worker.sh launch <box> <name> --target-repo <owner/repo> --kind claude|codex --brief <file>
 #                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
@@ -464,8 +464,21 @@ anchor_gate() {
 # origin/main and never resets anything: a divergent checkout is noted, not repaired. Arg: the
 # fetch's wall-clock bound. Sets repo, before (HEAD on entry), head, up (origin/main) and other
 # (changes outside the served tree). Returns 2 when there is no checkout at all, else 0.
+# checkout_lock <wait> <label> goes first: the lock that serializes everything that fetches or
+# fast-forwards the checkout. It lives in the checkout's own git directory, so every caller on the
+# box meets the same lock whatever its ISSUE_WAVE_STATE (per coordinator; the daily sweep may run
+# under another), which a lock under that state directory did not give (PR #379 review). Sets repo
+# and plock and arms the release; prints the refusal and returns 1 on timeout, 2 with no checkout.
 freshness_fn() {
   cat <<'EOF'
+checkout_lock() {
+  local gitdir
+  repo=$(expand_tilde "$SKILLS_REPO")
+  gitdir=$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null) || return 2
+  plock="$gitdir/fleet-checkout.lock"
+  take_lock "$plock" "$1" "$2" || return 1
+  trap 'release_lock "$plock"' EXIT
+}
 skills_freshness() {
   local prior="$refuse" frc served statusz hidden entry st path from branch
   repo=$(expand_tilde "$SKILLS_REPO")
@@ -522,12 +535,12 @@ note() { refuse="$refuse; $*"; }
 # One preflight per box at a time: a parallel group launched together would otherwise race
 # `git fetch`/`merge` in the same checkout and refuse on git's own lock files. Idempotent, so
 # waiting for the other preflight is the right thing; the bound covers a hung live probe.
-mkdir -p "$STATE" 2>/dev/null; plock="$STATE/preflight.lock"
 # The wait covers everything a holder may legitimately spend: the fetch, the live probe, and one
 # cross-box timeout per sibling, since the reach probes run serially under this lock.
 nsib=0; for _s in $cross; do nsib=$((nsib + 1)); done
-msg=$(take_lock "$plock" $((fetch_timeout + probe_timeout + gh_timeout + 60 + cross_timeout * nsib)) "PREFLIGHT REFUSED $BOX") || { echo "$msg"; exit 1; }
-trap 'release_lock "$plock"' EXIT
+checkout_lock $((fetch_timeout + probe_timeout + gh_timeout + 60 + cross_timeout * nsib)) "PREFLIGHT REFUSED $BOX"; lrc=$?
+if [ "$lrc" -eq 2 ]; then echo "PREFLIGHT REFUSED $BOX: no skills checkout at $repo"; exit 1; fi
+[ "$lrc" -eq 0 ] || exit 1
 skills_freshness "$fetch_timeout"
 if [ $? -eq 2 ]; then echo "PREFLIGHT REFUSED $BOX: no skills checkout at $repo"; exit 1; fi
 # Every skill the checkout declares must be one of the symlinks the README installs, into ITS OWN
@@ -664,25 +677,20 @@ EOF
 # preflight, for a box the fleet reaches for work without launching a worker there. Only `launch`
 # and `preflight` ever fast-forwarded a checkout, so a box that only EXECUTES kept a stale one
 # indefinitely (tuf-amd-linux sat at 0f7de3d, without `execution hold`, until a hand-run
-# preflight). Args: fetch bound, lock wait. It shares the preflight's lock, since the two would
-# race git's own lock files, but waits only briefly for it: a preflight holding it is doing this
-# very fast-forward, so that box reads as refreshed by someone else rather than as a failure.
-# Exit 0 current or fast-forwarded, 1 not refreshed (divergent, fetch failed): the checkout is
-# reported and left exactly as it is, never reset.
+# preflight). Arg: the fetch bound, which also bounds the wait for the checkout's lock: a holder
+# (a preflight, another refresh) may still fail, so a busy lock is waited out and the checkout then
+# checked here, never read as refreshed by someone else (PR #379 review).
+# Exit 0 current or fast-forwarded, 1 not refreshed (divergent, fetch failed, lock never free): the
+# checkout is reported and left exactly as it is, never reset.
 refresh_script() {
   freshness_fn
   cat <<'EOF'
-fetch_timeout="$1" lock_wait="$2"
+fetch_timeout="$1"
 refuse=""
 note() { refuse="$refuse; $*"; }
-mkdir -p "$STATE" 2>/dev/null; plock="$STATE/preflight.lock"
-if ! msg=$(take_lock "$plock" "$lock_wait" "REFRESH FAILED $BOX"); then
-  case "$msg" in
-    *"cannot create lock"*) echo "$msg"; exit 1 ;;
-    *) echo "REFRESH SKIPPED $BOX: a preflight holds $plock (it fast-forwards the checkout itself)"; exit 0 ;;
-  esac
-fi
-trap 'release_lock "$plock"' EXIT
+checkout_lock "$fetch_timeout" "REFRESH FAILED $BOX"; lrc=$?
+if [ "$lrc" -eq 2 ]; then echo "REFRESH FAILED $BOX: no skills checkout at $repo"; exit 1; fi
+[ "$lrc" -eq 0 ] || exit 1
 skills_freshness "$fetch_timeout"
 if [ $? -eq 2 ]; then echo "REFRESH FAILED $BOX: no skills checkout at $repo"; exit 1; fi
 if [ -n "$refuse" ]; then
@@ -731,9 +739,9 @@ cmd_preflight() {
 # refresh_box <box>: the far-side refresh on one box; its line on stdout, exit 0/1, or 4 with a
 # REFRESH UNREACHABLE line when the box did not answer (asleep, off the network: not checked).
 # The fetch has its own bound, FLEET_REFRESH_TIMEOUT, shorter than the preflight's: this runs on
-# every cross-box `execution run`, where a coordinator is waiting on it.
+# every `execution run`, where a coordinator is waiting on it.
 refresh_box() {
-  { prelude "$1"; refresh_script; } | run_on "$1" "${FLEET_REFRESH_TIMEOUT:-30}" 5
+  { prelude "$1"; refresh_script; } | run_on "$1" "${FLEET_REFRESH_TIMEOUT:-30}"
   local rc=$?
   if unreachable "$rc"; then echo "REFRESH UNREACHABLE $1: its skills checkout was not checked"; return 4; fi
   return "$rc"
@@ -1829,14 +1837,16 @@ EXECUTION_COMMAND
 # (ludics-lite#362), since that box's own `execution slot`/`hold` and skill text are what the
 # assigned command runs next. AFTER the dispatch, never before it: the registry lock is released by
 # then, so a fetch that hangs cannot hold it, and a refused reservation - the box measuring for
-# someone else - never has its checkout touched. The anchor and this box are skipped: every
-# launch's preflight refreshes them. On stderr, so stdout stays the record; the dispatch's exit
-# status stands whatever the refresh reports.
+# someone else - never has its checkout touched. Every host, this box and the anchor included: no
+# launch preflight need have run on the box the coordinator itself runs from (PR #379 review). On
+# stderr, so stdout stays the record; the dispatch's exit status stands whatever the refresh
+# reports, and a record it cannot read is said so rather than skipped silently.
 execution_refresh() {
   local host
-  host=$(jq -r 'select(.state == "launching") | .request.execution_host // empty' <<<"$1" 2>/dev/null)
-  [ -n "$host" ] || return 0
-  if is_local "$host" || [ "$host" = "$ANCHOR" ]; then return 0; fi
+  host=$(jq -r '.request.execution_host // empty' <<<"$1" 2>&1) && [ -n "$host" ] || {
+    printf '%s\n' "REFRESH FAILED: cannot read the execution host from the dispatched record (${host:-empty}); run fleet-worker.sh refresh <host> by hand"
+    return 1
+  }
   refresh_box "$host"
 }
 

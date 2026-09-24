@@ -697,7 +697,7 @@ expect "a sibling whose login never returns is bounded and noted, not hung" 0 "P
 # alone, never a refusal, and rog and minix answering add nothing (the `$` anchor says so).
 expect "mac-studio with the default roster notes a sleeping TUF and still passes" 0 "PREFLIGHT OK mac-studio skills=[0-9a-f]* (cross-box unreachable, asleep or off the network: tuf-amd-linux)$" -- \
   env -u FLEET_BOXES FLEET_LOCAL_BOX=mac-studio SHIM_SSH_DOWN=tuf-amd-linux "$FW" preflight mac-studio --no-probe
-[ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded reach probe" || ok "preflight lock released after the bounded reach probe"
+[ -d "$repo/.git/fleet-checkout.lock" ] && ko "preflight lock left after the bounded reach probe" || ok "preflight lock released after the bounded reach probe"
 # The slot count per roster box is on the preflight's output (ludics-lite#329): it showed nowhere
 # but in a batch's own slot line, so a day of one-slot Mac batches passed every preflight. Each
 # case sets or unsets both variables itself.
@@ -747,7 +747,7 @@ expect "a malformed spec is a warning on the preflight, which still passes" 0 "P
 echo x >> "$repo/ship-pr/SKILL.md"
 expect "a reachable sibling does not swallow the refusal that follows the probe" 1 "1 local change(s) in the served tree" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_SLURP=otherbox "$FW" preflight testbox --no-probe
 git -C "$repo" checkout -q -- ship-pr/SKILL.md
-[ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
+[ -d "$repo/.git/fleet-checkout.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
 # `execution slot` runs a python3 flock on the box that runs the batches, so Python is no longer
 # an anchor-only requirement and the preflight is where a box missing it must say so.
 mkdir -p "$TMP/nopy"; printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/nopy/python3"; chmod +x "$TMP/nopy/python3"
@@ -1294,13 +1294,24 @@ expect "a divergent checkout is reported, not refreshed" 1 "^REFRESH FAILED test
 [ "$(git -C "$repo" rev-parse HEAD)" = "$cur" ] && grep -q local-fix "$repo/issue-wave/SKILL.md" && ok "...and left exactly as it was: HEAD and the local edit" || ko "a divergent checkout was moved or reset"
 git -C "$repo" checkout -q -- issue-wave/SKILL.md
 expect "a stalling fetch is bounded by FLEET_REFRESH_TIMEOUT and reported" 1 "REFRESH FAILED testbox: git fetch in .* timed out after 2s" -- env SHIM_GIT_HANG_FETCH=1 FLEET_REFRESH_TIMEOUT=2 "$FW" refresh testbox
-[ -d "$ISSUE_WAVE_STATE/preflight.lock" ] && ko "refresh left the preflight lock behind" || ok "...and releases the lock it shares with the preflight"
-# A preflight holding that lock is fast-forwarding the same checkout: a refresh waits briefly, then
-# reads the box as someone else's to refresh rather than failing it.
-sleep 60 & lockholder=$!
-mkdir "$ISSUE_WAVE_STATE/preflight.lock" && ps -o lstart= -p "$lockholder" | tr -s ' ' > "$ISSUE_WAVE_STATE/preflight.lock/start" && echo "$lockholder" > "$ISSUE_WAVE_STATE/preflight.lock/pid"
-expect "a refresh beside a running preflight skips, not fails" 0 "^REFRESH SKIPPED testbox: a preflight holds" -- "$FW" refresh testbox
-kill "$lockholder" 2>/dev/null; wait "$lockholder" 2>/dev/null; rm -rf "$ISSUE_WAVE_STATE/preflight.lock"
+[ -d "$repo/.git/fleet-checkout.lock" ] && ko "refresh left the checkout's lock behind" || ok "...and releases the lock it shares with the preflight"
+# The lock is the checkout's own, in its git directory, so a caller under another ISSUE_WAVE_STATE
+# (the sweep beside a wave) meets it too. A holder may yet fail, so a busy lock is waited out and
+# the checkout then checked here; one never freed in time is a failure, not a pass.
+hold_checkout_lock() { # <seconds>: a live holder of the checkout's lock, as take_lock records one
+  sleep "$1" & lockholder=$!
+  mkdir "$repo/.git/fleet-checkout.lock" && ps -o lstart= -p "$lockholder" | tr -s ' ' > "$repo/.git/fleet-checkout.lock/start" \
+    && echo "$lockholder" > "$repo/.git/fleet-checkout.lock/pid" || ko "could not plant the lock holder (setup)"
+}
+upstream stale-lock; cur=$(git -C "$repo" rev-parse HEAD)
+hold_checkout_lock 3
+expect "a refresh waits out a holder that finishes, then checks the checkout itself" 0 "^REFRESH OK testbox skills=[0-9a-f]* (fast-forwarded from ${cur:0:9})$" -- \
+  env ISSUE_WAVE_STATE="$TMP/sweep-state" FLEET_REFRESH_TIMEOUT=15 "$FW" refresh testbox
+wait "$lockholder" 2>/dev/null
+hold_checkout_lock 60
+expect "a holder that outlasts the bound fails the refresh, whatever the caller's state directory" 1 "^REFRESH FAILED testbox: lock .*fleet-checkout.lock held by pid $lockholder for 2s" -- \
+  env ISSUE_WAVE_STATE="$TMP/sweep-state" FLEET_REFRESH_TIMEOUT=2 "$FW" refresh testbox
+kill "$lockholder" 2>/dev/null; wait "$lockholder" 2>/dev/null; rm -rf "$repo/.git/fleet-checkout.lock"
 expect "a box that does not answer is unreachable (exit 4), not failed" 4 "^REFRESH UNREACHABLE other: its skills checkout was not checked" -- env FLEET_BOXES="testbox other" "$FW" refresh other
 expect "several boxes: one line each, and a failure outranks an unreachable box" 1 "REFRESH UNREACHABLE other" -- env FLEET_BOXES="testbox other" SHIM_GIT_HANG_FETCH=1 FLEET_REFRESH_TIMEOUT=1 "$FW" refresh other testbox
 grep -q "^REFRESH FAILED testbox" <<<"$out" && ok "...with the failed box's own line" || ko "multi-box refresh lost a line: $out"
@@ -1315,13 +1326,18 @@ rdone rf-a
 expect "a refused dispatch never touches the execution host" 1 "already dispatched" -- "${FWR[@]}" execution run "$(rreq rf-a)"
 grep -q REFRESH <<<"$out" && ko "a refused run refreshed the box: $out" || ok "...(no refresh line)"
 upstream stale-4; cur=$(git -C "$repo" rev-parse HEAD)
-expect "a run on the anchor itself does not refresh (every launch's preflight does)" 0 '"state": "launching"' -- "${FWR[@]}" execution run "$(rreq rf-b testbox)"
-grep -q REFRESH <<<"$out" && ko "a run on the anchor refreshed: $out" || ok "...(no refresh line, checkout left for the preflight)"
+expect "a run on the anchor and local box refreshes it too (no launch need have preflighted it)" 0 "REFRESH OK testbox skills=[0-9a-f]* (fast-forwarded from ${cur:0:9})" -- "${FWR[@]}" execution run "$(rreq rf-b testbox)"
+upstream stale-4b; cur=$(git -C "$repo" rev-parse HEAD)
 rdone rf-b
 echo local-fix >> "$repo/issue-wave/SKILL.md"
 expect "a divergent execution host is reported and the dispatch still stands" 0 "REFRESH FAILED other: 1 local change(s) in the served tree -- left as it is, never reset" -- "${FWR[@]}" execution run "$(rreq rf-c)"
 [ "$(git -C "$repo" rev-parse HEAD)" = "$cur" ] && grep -q local-fix "$repo/issue-wave/SKILL.md" && ok "...with the checkout left as it was" || ko "a divergent execution host was moved or reset"
 git -C "$repo" checkout -q -- issue-wave/SKILL.md; rdone rf-c
+# A dispatch whose record cannot be read says so, rather than skipping the refresh silently.
+mkdir -p "$TMP/nojq"; printf '#!/bin/sh\necho "jq: not here" >&2; exit 127\n' > "$TMP/nojq/jq"; chmod +x "$TMP/nojq/jq"
+expect "an unreadable dispatched record is a loud refresh failure, the dispatch standing" 0 "REFRESH FAILED: cannot read the execution host from the dispatched record (jq: not here)" -- \
+  env PATH="$TMP/nojq:$PATH" "${FWR[@]}" execution run "$(rreq rf-g)"
+rdone rf-g
 # The reserve + dispatch pair refreshes at the dispatch, which is where the box is about to be used.
 "${FWR[@]}" execution reserve "$(rreq rf-d)" 2>&1 | grep -q REFRESH && ko "a bare reserve refreshed the box" || ok "a bare reserve does not refresh"
 jq -n '{request_id:"rf-d", evidence:"fixture dispatch"}' > "$TMP/refresh-rf-d-dispatch.json"

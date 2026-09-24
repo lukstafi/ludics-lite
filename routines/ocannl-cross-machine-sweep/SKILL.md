@@ -94,7 +94,7 @@ so this daily wake is where it is kept current (tuf was found without `execution
     ~/ludics-lite/issue-wave/scripts/fleet-worker.sh refresh rog-nv-linux minix-amd-linux tuf-amd-linux
 
 One line per box, and its exit status does not change anything below. `REFRESH OK` (already current,
-or fast-forwarded) and `REFRESH SKIPPED` (a preflight there is doing it) need nothing.
+or fast-forwarded) needs nothing.
 `REFRESH UNREACHABLE` is a box `status` already shows down or booted into Windows. `REFRESH FAILED`
 is a finding for step 5, quoted: the checkout is divergent (a local change, another branch, an
 unpushed commit) or could not fetch, and it is left exactly as it is. Never reset it from here: a

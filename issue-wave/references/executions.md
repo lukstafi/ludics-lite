@@ -190,14 +190,13 @@ process ownership; it does not skip the reservation, dispatch or external-activi
 **The execution host's skills checkout** (ludics-lite#362). Only `launch` and `preflight` ever
 fast-forwarded a box's `~/ludics-lite`, so a box the fleet only executes on kept a stale one:
 tuf-amd-linux sat at `0f7de3d`, without `execution hold`, where a lane wrapped in it would have
-exited 2. So a successful `run` or `dispatch` whose execution host is neither the anchor nor the
-calling box (launch preflights keep those two current) ends with `fleet-worker.sh refresh <host>`, the
-preflight's own freshness check alone, and prints its one line on stderr: `REFRESH OK <box>
-skills=<sha> (already current)` or `(fast-forwarded from <sha>)`; `REFRESH FAILED` with the reason
-(a divergent checkout is reported and left as it is, never reset; the fetch is capped by
-`FLEET_REFRESH_TIMEOUT`, 30 s); `REFRESH SKIPPED` while a preflight there holds the checkout's lock;
-or `REFRESH UNREACHABLE` for a box that did not answer (wake it, then run `fleet-worker.sh refresh
-<box>`). It runs after the dispatch, outside the registry lock, so a hanging fetch holds no lock and
+exited 2. So every successful `run` or `dispatch` ends with `fleet-worker.sh refresh <execution
+host>`, the preflight's own freshness check alone, and prints its one line on stderr: `REFRESH OK
+<box> skills=<sha> (already current)` or `(fast-forwarded from <sha>)`; `REFRESH FAILED` with the
+reason (a divergent checkout is reported and left as it is, never reset; the fetch, and the wait for
+a preflight or another refresh holding the checkout's lock, are each capped by
+`FLEET_REFRESH_TIMEOUT`, 30 s); or `REFRESH UNREACHABLE` for a box that did not answer (wake it,
+then run `fleet-worker.sh refresh <box>`). It runs after the dispatch, outside the registry lock, so a hanging fetch holds no lock and
 a refused reservation never touches a box that is measuring for someone else. The record on stdout
 and the exit status are the dispatch's, whatever the refresh reports; read its line before sending
 the assignment, since a FAILED or UNREACHABLE host runs whatever skill text it already has.
