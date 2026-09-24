@@ -4999,8 +4999,12 @@ test_runner_cleans_up_after_a_closed_pipe() {
   # only state this outer case inspects. Bash 3.2 reports the closed external writer as SIGPIPE
   # (141), while Bash 5 can surface the failed builtin write as 1; both are nonzero closed-pipe
   # exits, and the cleanup contract is the same.
+  # The copy then runs a second time with SIGPIPE ignored, as the macOS CI runner starts it: there
+  # no writer dies of the signal, and each sees EPIPE and exits with its own status, which is how
+  # a -v path through BSD awk (exit 2) passed a local run and went red in CI (ludics-lite#338). A
+  # signal ignored when a shell starts stays ignored in it, so the only closed-pipe exit there is 1.
   local tag="pipe$$" copy="$TEST_ROOT/copy" err="$TEST_ROOT/copy.err" out="$TEST_ROOT/copy.out" patched
-  local copy_rc head_rc pipeline_statuses
+  local copy_rc head_rc pipeline_statuses sigpipe
   copy_runner "$copy" "$tag"
   patched=$(awk -v target="$SELF_CASE() {" '{
     print
@@ -5013,24 +5017,31 @@ test_runner_cleans_up_after_a_closed_pipe() {
   grep -q '^  echo RUNNER_CLOSED_PIPE_HEAD$' "$copy/test-post-merge-cleanup.sh" ||
     fail "could not give the copy enough verbose output to close its pipe"
 
-  set +e
-  # A plain `runner -v | head -1` pipes stdout only. Keep stderr separate too: macOS Bash's known
-  # job-control diagnostic is written before the case redirections exist, but it is not output
-  # whose reader closed and must not race the deterministic stdout payload for head's one line.
-  run_copy "$copy/test-post-merge-cleanup.sh" -j 1 -v "$SELF_CASE" 2>"$err" | head -n 1 >"$out"
-  pipeline_statuses=("${PIPESTATUS[@]}")
-  set -e
-  copy_rc="${pipeline_statuses[0]}"
-  head_rc="${pipeline_statuses[1]}"
-  case "$copy_rc" in
-  1 | 141) ;;
-  *) fail "the copy exited $copy_rc after its pipe closed, expected 1 or 141" ;;
-  esac
-  [ "$head_rc" -eq 0 ] || fail "head exited $head_rc while closing the copy's pipe"
-  grep -Fqx RUNNER_CLOSED_PIPE_HEAD "$out" ||
-    fail "the closed-pipe run did not yield its deterministic first line: $(cat "$out")"
-  assert_copy_root_gone "$tag"
-  echo "PASS: -v piped to head -1 exits on the closed pipe and removes the scratch root"
+  for sigpipe in inherited ignored; do
+    rm -f "$err" "$out"
+    set +e
+    # A plain `runner -v | head -1` pipes stdout only. Keep stderr separate too: macOS Bash's known
+    # job-control diagnostic is written before the case redirections exist, but it is not output
+    # whose reader closed and must not race the deterministic stdout payload for head's one line.
+    {
+      [ "$sigpipe" = inherited ] || trap '' PIPE
+      run_copy "$copy/test-post-merge-cleanup.sh" -j 1 -v "$SELF_CASE"
+    } 2>"$err" | head -n 1 >"$out"
+    pipeline_statuses=("${PIPESTATUS[@]}")
+    set -e
+    copy_rc="${pipeline_statuses[0]}"
+    head_rc="${pipeline_statuses[1]}"
+    case "$sigpipe:$copy_rc" in
+    inherited:1 | inherited:141 | ignored:1) ;;
+    inherited:*) fail "the copy exited $copy_rc after its pipe closed, expected 1 or 141" ;;
+    *) fail "with SIGPIPE ignored the copy exited $copy_rc after its pipe closed, expected 1: $(cat "$err")" ;;
+    esac
+    [ "$head_rc" -eq 0 ] || fail "head exited $head_rc while closing the copy's pipe (SIGPIPE $sigpipe)"
+    grep -Fqx RUNNER_CLOSED_PIPE_HEAD "$out" ||
+      fail "the closed-pipe run (SIGPIPE $sigpipe) did not yield its deterministic first line: $(cat "$out")"
+    assert_copy_root_gone "$tag"
+  done
+  echo "PASS: -v piped to head -1 exits on the closed pipe and removes the scratch root, with SIGPIPE inherited and ignored"
 }
 
 test_runner_term_midrun_exits_130() {
