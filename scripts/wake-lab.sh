@@ -1151,9 +1151,13 @@ boot_linux() { # boot_linux <box>
     windows)
       a=$(win_alias "$box") || { echo "boot-linux FAILED on $box: its Windows route stopped answering"; return 1; }
       echo "$box: restart from Windows ($a)"
-      # /f as the adapter's `down` has it: nobody is at the keyboard to answer an app that asks.
-      out=$(boot_ssh "$a" 'cmd.exe /d /s /c "echo WAKE_LAB_POWER_STARTED & shutdown /r /f /t 0"' 2>&1); rc=$?
-      if ! tr -d '\r' <<<"$out" | grep -Fxq WAKE_LAB_POWER_STARTED || { [ "$rc" != 0 ] && [ "$rc" != 255 ] && [ "$rc" != 124 ]; }; then
+      # /f as the adapter's `down` has it: nobody is at the keyboard to answer an app that asks. No
+      # space before `&`: cmd.exe's echo keeps it, and on rog (2026-09-24) `echo X & ...` came back
+      # as `X ` and failed an exact match over a restart that had in fact started. Trailing blanks
+      # are stripped before the match as well, so the marker is read the same whichever way it comes.
+      out=$(boot_ssh "$a" 'cmd.exe /d /s /c "echo WAKE_LAB_POWER_STARTED& shutdown /r /f /t 0"' 2>&1); rc=$?
+      if ! tr -d '\r' <<<"$out" | sed 's/[[:space:]]*$//' | grep -Fxq WAKE_LAB_POWER_STARTED ||
+         { [ "$rc" != 0 ] && [ "$rc" != 255 ] && [ "$rc" != 124 ]; }; then
         printf '  %s\n' "$(printf '%s\n' "$out" | tr -d '\r' | tail -1)"
         echo "boot-linux FAILED on $box: the Windows restart command did not start (exit $rc)"; return 1
       fi

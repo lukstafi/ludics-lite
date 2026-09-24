@@ -363,8 +363,9 @@ case "$cmd" in
       noop) exit 0 ;;   # the command returned and nothing happened
     esac
     rm -f "$BOOT_STATE.next"; exit 255 ;;
-  *'echo WAKE_LAB_POWER_STARTED & shutdown /r /f /t 0'*)
-    locks; printf 'WAKE_LAB_POWER_STARTED\r\n'; reboot_to "${BOOT_WIN_RESTART:-linux}"; exit 255 ;;
+  *'echo WAKE_LAB_POWER_STARTED& shutdown /r /f /t 0'*)
+    # With the blank rog's cmd.exe returned when the command had one before its `&` (2026-09-24).
+    locks; printf 'WAKE_LAB_POWER_STARTED \r\n'; reboot_to "${BOOT_WIN_RESTART:-linux}"; exit 0 ;;
   *'bash.exe'*)
     case "${BOOT_GITBASH:-native}" in
       native) printf 'MINGW64_NT-10.0-26100\r\ngit version 2.51.0.windows.1\r\n' ;;
