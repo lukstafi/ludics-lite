@@ -158,7 +158,8 @@
 #                                          # watched; 0 = act, 1 = quiet. Reviewer activity about
 #                                          # another commit is printed on stderr for the record and
 #                                          # the wait continues; every exit names what it ends on
-#   pr-review.sh status <pr>               # merge gate + who owes what: approved / reviewing /
+#   pr-review.sh status <pr>               # merge gate + who owes what: approved / unresolved
+#                                          # (approved over open review threads) / reviewing /
 #                                          # stalled / failed / expected / idle / unknown — and
 #                                          # the round count against the threshold (see `rounds`);
 #                                          # says CONFLICTS when GitHub cannot build the merge
@@ -171,7 +172,8 @@
 #                                          # no verdict yet / absent
 #   pr-review.sh merge <pr> [--override "<why this red is unrelated>"] [--wait]
 #                           [--allow-no-verdict] [--require-green]
-#                                          # checks, then merge; refuses on red without --override,
+#                                          # checks, then merge; refuses on an open review thread
+#                                          # (no flag bypasses that), on red without --override,
 #                                          # on NO verdict without --allow-no-verdict, and — with
 #                                          # --require-green (a close-out merge) — on ABSENT, on
 #                                          # green-by-skips-only, on --auto, on a base with a
@@ -1791,6 +1793,13 @@ status_line() {
   conflict=$(conflict_note "$merge")
   case "$tok" in
   approved) echo "approved ($detail)${conflict:+; $conflict}" ;;
+  # An approval with open threads under it (approval_gate). "approved" leads the line on purpose —
+  # the 👍 is real — and what follows it is what makes it not a merge.
+  unresolved)
+    frest="${detail#*|}"
+    echo "approved (${frest%%|*}) BUT ${detail%%|*} review thread(s) still UNRESOLVED — NOT a" \
+      "clean approval, and \`merge\` refuses it: ${frest#*|}. $(threads_advice)${conflict:+; $conflict}"
+    ;;
   reviewing) echo "reviewing — $detail, running $(fmt_age "$age") — wait it out${conflict:+; $conflict}" ;;
   stalled) echo "STALLED — $detail for $(fmt_age "$age"), longer than a round takes. FIRST read" \
     "the PR feed yourself (retry --read pr view <pr> --comments): a verdict may have landed as" \
@@ -1964,10 +1973,163 @@ cmd_rounds() {
   rounds_line "$(review_rounds "$PR_NUM")"
 }
 
+# --- open review threads under an approval (ludics-lite#289) ----------------------------------
+# An approval is about the head it landed on; an open thread is a finding nobody has closed, and
+# the two are different facts. On PR #277's round 6 the reviewer left two findings on the previous
+# head and its 👍 landed on the base-merge commit above it: `watch` classified the findings NOT
+# about head, advanced its watermark past them and reported `approved`. The merge had touched
+# neither line, so both were live in the head about to be merged, and only the worker's own read
+# of the feed caught it. Whether a finding written against another head still holds is a question
+# about LINES (did this head change them?) that nothing here tries to answer; whether the thread is
+# still OPEN is answered exactly. So an approval with any unresolved review thread is not a clean
+# approval: `status` and `watch` report it as `unresolved`, and `merge` refuses. Clearing it is
+# what the loop already does with every thread — answer it (`reply`, a fix or a rebuttal), then
+# close it (`resolve`) — and needs no push, which is why no flag bypasses it.
+#
+# Boundary, as an allowlist: the ONE field read is each thread's `isResolved`, and a thread counts
+# as closed only when that field is literally true — absent or null is open. The first comment's
+# id, author and path are read to NAME a thread, never to judge it. Not read: whether a thread is
+# outdated, which head its comments cite, who wrote it, or what its last reply says — an open
+# outdated thread, or one a human opened, refuses like any other (fail closed), and a resolved one
+# passes whatever its replies say.
+#
+# GraphQL, because resolution has no REST field — the one read on the gate path that rides it (see
+# "REST vs GraphQL" above), and a failed read is UNKNOWN, never "no open threads". The connection
+# pages at 100; the read follows it to the end, and is taken as whole only when the rows read
+# reach the totalCount its last page states (a count that leads the rows is a partial read, not a
+# smaller PR). One still paging at THREADS_PAGE_CAP pages is refused as unread rather than judged
+# on its prefix. Reads: one call per 100 threads, made only where an approval is about to be
+# reported or acted on — never on a watch round that is not ending on one.
+THREADS_PAGE_CAP=50
+THREADS_QUERY='query($owner:String!, $name:String!, $pr:Int!, $after:String) {
+  repository(owner:$owner, name:$name) { pullRequest(number:$pr) {
+    reviewThreads(first:100, after:$after) {
+      totalCount pageInfo { hasNextPage endCursor }
+      nodes { isResolved path comments(first:1) { nodes { databaseId author { login } } } } } } } }'
+
+# One "<first comment id>\t<author>\t<path>" row per open thread, exit 0, when the whole connection
+# was read; otherwise ONE line saying why it was not, exit 3.
+unresolved_threads() { # <pr>
+  local pr="$1" page cursor="" resp meta page_rows rows="" total n next read_n=0 rc
+  local -a after=()
+  for ((page = 1; page <= THREADS_PAGE_CAP; page++)); do
+    after=()
+    [ -z "$cursor" ] || after=(-f "after=$cursor")
+    resp=$(gh_retry read api graphql -f query="$THREADS_QUERY" -F owner="${REPO%%/*}" \
+      -F name="${REPO##*/}" -F pr="$pr" ${after[@]+"${after[@]}"} \
+      --jq .data.repository.pullRequest.reviewThreads)
+    rc=$?
+    case "$rc" in
+    0) ;;
+    1)
+      printf '%s\n' "GraphQL REJECTED the review-threads read ($(gh_err_line))"
+      return 3
+      ;;
+    *)
+      printf '%s\n' "GraphQL did not answer the review-threads read after $API_ATTEMPTS attempts ($(gh_err_line))"
+      return 3
+      ;;
+    esac
+    meta=$(jq -r 'select(type == "object" and (.nodes | type == "array")
+        and (.totalCount | type == "number") and (.pageInfo.hasNextPage | type == "boolean"))
+      | "\(.totalCount)\t\(.nodes | length)\t\(.pageInfo.hasNextPage)\t\(.pageInfo.endCursor // "")"' \
+      <<<"$resp" 2>/dev/null) || meta=""
+    IFS=$'\t' read -r total n next cursor <<<"$meta"
+    case "${total:-x}${n:-x}" in *[!0-9]*)
+      printf '%s\n' "the review-threads read answered page $page without a thread connection"
+      return 3
+      ;;
+    esac
+    page_rows=$(jq -r '.nodes[] | select(.isResolved != true)
+        | [((.comments.nodes[0].databaseId // "-") | tostring),
+           ((.comments.nodes[0].author.login // "-") | tostring), ((.path // "-") | tostring)]
+        | @tsv' <<<"$resp" 2>/dev/null) || {
+      printf '%s\n' "the review-threads read answered page $page with threads that did not parse"
+      return 3
+    }
+    [ -z "$page_rows" ] || rows="$rows$page_rows"$'\n'
+    read_n=$((read_n + n))
+    if [ "$next" != true ]; then
+      if [ "$read_n" -lt "$total" ]; then
+        printf '%s\n' "the review-threads read ended at $read_n thread(s) while the PR states $total"
+        return 3
+      fi
+      printf '%s' "$rows"
+      return 0
+    fi
+    [ -n "$cursor" ] || {
+      printf '%s\n' "the review-threads read said page $page has a successor and gave no cursor to it"
+      return 3
+    }
+  done
+  printf '%s\n' "the review-threads read was still paging after $THREADS_PAGE_CAP pages of 100, so it is refused rather than judged on its first $read_n thread(s)"
+  return 3
+}
+
+# "<count>|<the first ten, named>" of unresolved_threads' rows. The path is repository-controlled,
+# so it is shell-quoted; the id is what `reply` and `resolve` take.
+threads_named() { # <rows>
+  local id login path n=0 shown=""
+  while IFS=$'\t' read -r id login path; do
+    [ -n "$id" ] || continue
+    n=$((n + 1))
+    [ "$n" -le 10 ] || continue
+    shown="$shown${shown:+, }$id by $login on $(printf '%q' "$path")"
+  done <<<"$1"
+  [ "$n" -le 10 ] || shown="$shown, and $((n - 10)) more"
+  printf '%s|%s' "$n" "$shown"
+}
+
+# The clearing instruction, shared by the `unresolved` state line and `merge`'s refusal.
+threads_advice() {
+  printf '%s' "An open thread is a finding nobody closed, whatever head it cites: one written" \
+    " against an earlier head is live if this head did not change its lines, and \`watch\` prints" \
+    " such findings as NOT about head and moves past them (ludics-lite#289). Read each one, answer" \
+    " it with a fix or a rebuttal (pr-review.sh reply $REPO#${PR_NUM:-<pr>} <id> '<answer>'), then" \
+    " close it (pr-review.sh resolve $REPO#${PR_NUM:-<pr>} <id>); clearing this needs no push"
+}
+
+# An `approved` state line, checked for open threads: unchanged when there are none, `unresolved`
+# when there are, `unknown` when the read did not answer. Any other state passes through unread.
+# Line: unresolved|-|<merge>|<count>|<the approval's own detail>|<the threads, named>.
+approval_gate() { # <pr> <state line>
+  local rows named
+  [ "$(state_tok "$2")" = approved ] || {
+    printf '%s\n' "$2"
+    return 0
+  }
+  rows=$(unresolved_threads "$1") || {
+    printf '%s\n' "unknown|-|$(state_merge "$2")|$rows, so whether open review threads stand under this approval ($(state_detail "$2")) is unknown"
+    return 0
+  }
+  [ -n "$rows" ] || {
+    printf '%s\n' "$2"
+    return 0
+  }
+  named=$(threads_named "$rows")
+  printf '%s\n' "unresolved|-|$(state_merge "$2")|${named%%|*}|$(state_detail "$2")|${named#*|}"
+}
+
+# `merge`'s read of the same question: open threads refuse (1), an unread connection refuses as
+# transport (3) — neither is "none are open".
+merge_threads_gate() { # <pr>
+  local rows named
+  rows=$(unresolved_threads "$1") ||
+    fail 3 "NOT merging $REPO#$1: $rows — whether review threads are still open is UNKNOWN, which" \
+      "is not 'none are'; retry."
+  [ -n "$rows" ] || return 0
+  named=$(threads_named "$rows")
+  fail 1 "REFUSING to merge $REPO#$1: ${named%%|*} review thread(s) still UNRESOLVED —" \
+    "${named#*|}. $(threads_advice)."
+}
+
 cmd_status() {
   pr_arg "${1:?usage: status <pr>}"
   local state
   state=$(status_state "$PR_NUM")
+  # An approval is reported only after the open-thread read (ludics-lite#289): `unresolved` exits
+  # 0 like every other state the reads answered — `merge` is the gate that refuses it.
+  state=$(approval_gate "$PR_NUM" "$state")
   status_line "$state"
   # The round count rides along so the convergence policy is always in view; it never changes
   # this command's exit code — the merge gate is the state, and an unread count is reported as
@@ -2103,7 +2265,8 @@ watch_note_past() { # <pr>
   past_seen=$((past_seen + POLLED_PAST_N))
   past_last="$POLLED_PAST"
   warn "PR $REPO#$1: $POLLED_PAST_N item(s) NOT about head ${POLLED_HEAD:0:7} (first: $POLLED_PAST)" \
-    "— printed below for the record; the watermark advances past them and the wait continues"
+    "— printed below for the record; the watermark advances past them and the wait continues," \
+    "but a thread among them left unresolved still holds an approval back from \`merge\`"
   sed -e '/^watermark: /d' -e '/^items: /d' <<<"$POLLED_OUT" >&2
 }
 
@@ -2243,15 +2406,18 @@ watch_end() { # <pr> <the state token the verdict is about> <message, empty for 
     return 3
   fi
   state=$(status_state "$1")
-  tok=$(state_tok "$state")
   watch_preserve_unarmed_nudge "$before_settle" "$before_state" "$state"
+  # The 👍 landing in this gap ends the wait like any approval, so it is checked for open threads
+  # the same way (ludics-lite#289); an unread check withholds the verdict below.
+  state=$(approval_gate "$1" "$state")
+  tok=$(state_tok "$state")
   if [ "$tok" = unknown ]; then
     echo "the state could not be re-read after the final poll on PR $REPO#$1, so the '$2' verdict" \
       "is WITHHELD — $(state_detail "$state"); this is NOT 'the reviewer stayed quiet', re-arm"
     echo "watermark: $mark"
     return 3
   fi
-  if [ "$tok" = approved ] && [ "$2" != approved ]; then
+  if { [ "$tok" = approved ] || [ "$tok" = unresolved ]; } && [ "$2" != approved ]; then
     echo "the '$2' verdict on PR $REPO#$1 was dropped: the 👍 landed while it was being read —" \
       "$(status_line "$state")"
     echo "watermark: $mark"
@@ -2352,6 +2518,9 @@ watch_loop() {
     fi
 
     state=$(status_state "$pr")
+    # An approval ends the wait, so it is the one state a round checks for open threads before
+    # reporting it (ludics-lite#289) — the read is made on the round that ends, never on the rest.
+    [ "$(state_tok "$state")" != approved ] || state=$(approval_gate "$pr" "$state")
     tok=$(state_tok "$state")
     age=$(state_age "$state")
     if [ "$tok" != unknown ]; then
@@ -2382,10 +2551,12 @@ watch_loop() {
       # previous state and keep polling.
       warn "state unreadable this round on PR $REPO#$pr; holding '$was'"
       ;;
-    approved)
+    approved | unresolved)
       # The one exit that does not poll again first: the merge gate is open, and a round arriving
       # beside an approval is not what the caller is waiting for. (Findings do not make an
-      # approval — status_state ranks the 👍 above them on purpose.)
+      # approval — status_state ranks the 👍 above them on purpose.) `unresolved` is that same
+      # approval over threads still open, whatever head they cite — including the ones this
+      # watch printed as NOT about head and moved past — and its line says what clears it.
       status_line "$state"
       echo "watermark: $mark"
       return 0
@@ -4634,6 +4805,11 @@ cmd_merge() {
       "filters), get one onto it (gh workflow run) or hand the merge to the maintainer with" \
       "the record; a close-out merge is never made by dropping --require-green."
   fi
+  # Open review threads refuse the merge, whatever head they cite and whatever else passed
+  # (ludics-lite#289; see approval_gate). After the build gate so that it is read after a --wait,
+  # when the last round's threads have had the whole wait to be answered; one read, and no flag
+  # bypasses it, because what clears it is a `resolve`, not a push.
+  merge_threads_gate "$PR_NUM"
   # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
   # verdict is read late, with only the closing-keyword re-scan below it. A loud WARNING, not a gate: the
   # roll-forward policy (ahrefs/ocannl#861, see warn_base_drift) lets a clean merge proceed on the

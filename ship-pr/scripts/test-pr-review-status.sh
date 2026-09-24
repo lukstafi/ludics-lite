@@ -47,6 +47,12 @@ PUSH_AFTER_PULLS_READ=""
 # The flat inline feed refusing to answer: the shape that fails a poll ROUND, so a case can ask what
 # a round that did not answer leaves behind for the state read after it.
 FAIL_INLINE_FEED=""
+# The PR's review threads (review_thread rows), how the connection pages them, and GraphQL
+# refusing to answer — the open-thread read an approval is checked with (ludics-lite#289).
+THREADS_JSON='[]'
+THREADS_FIXTURE_PAGE=""
+THREADS_FIXTURE_TOTAL=""
+FAIL_GRAPHQL=""
 # The base's tip, and the head PUSH_ON_REVIEWS_READ swaps in. With HEAD_SHA these are the only
 # SHAs the transport below spells out, so a case that needs a new head just sets HEAD_SHA.
 BASE_SHA=base-sha
@@ -71,6 +77,10 @@ reset_fixture() {
   PUSH_ON_REVIEWS_READ=""
   PUSH_AFTER_PULLS_READ=""
   FAIL_INLINE_FEED=""
+  THREADS_JSON='[]'
+  THREADS_FIXTURE_PAGE=""
+  THREADS_FIXTURE_TOTAL=""
+  FAIL_GRAPHQL=""
   rm -f "$TEST_ROOT/pushed" "$TEST_ROOT"/nth.*
   : >"$REQUEST_LOG"
 }
@@ -200,6 +210,14 @@ gh() {
     else
       bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT"
     fi
+    ;;
+  graphql)
+    case "$*" in *reviewThreads*) ;; *) bail "unexpected graphql call: $*" ;; esac
+    if [ -n "$FAIL_GRAPHQL" ]; then
+      echo "gh: 503 No server is currently available to service your request" >&2
+      return 1
+    fi
+    response=$(review_threads_answer "$THREADS_JSON" "$@")
     ;;
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
@@ -1011,6 +1029,121 @@ test_a_running_row_the_stamp_pattern_misses_is_unknown() {
     "the detail should name the two patterns that stopped agreeing"
 }
 
+# --- an approval over open review threads (ludics-lite#289) -----------------------------------
+# PR #277, round 6: two findings written against the previous head, the 👍 on the base-merge commit
+# above it, and a `status` that said `approved` over both. An open thread is a finding nobody
+# closed, whatever head it cites, so an approval with one under it is reported as `unresolved`,
+# naming each thread by the id `reply` and `resolve` take and saying what clears it.
+
+graphql_reads() { grep -c -x graphql "$REQUEST_LOG" || true; }
+
+approved_fixture() {
+  reset_fixture
+  REACTIONS_JSON="[$(reaction +1 "$PAST")]"
+}
+
+test_an_approval_over_open_threads_is_unresolved() {
+  approved_fixture
+  THREADS_JSON="[$(review_thread 4053098120 false),$(review_thread 4053098122 false b.sh),$(review_thread 4053098001 true)]"
+  run_cmd_status
+  assert_eq "$CMD_RC" 0 "a state the reads answered exits 0; merge is the gate that refuses it"
+  assert_contains "$CMD_OUT" "approved (👍 from $REVIEWER) BUT 2 review thread(s) still UNRESOLVED" \
+    "the approval is named and so are the open threads under it"
+  assert_contains "$CMD_OUT" "4053098120 by codex[bot] on a.sh, 4053098122 by codex[bot] on b.sh" \
+    "each open thread by the id reply and resolve take"
+  assert_not_contains "$CMD_OUT" 4053098001 "a resolved thread is not open"
+  assert_contains "$CMD_OUT" "pr-review.sh resolve $REPO#7 <id>" "and the line says what clears it"
+  assert_eq "$(graphql_reads)" 1 "one read of the threads, for the one approval reported"
+}
+
+test_an_approval_with_every_thread_resolved_stays_approved() {
+  approved_fixture
+  THREADS_JSON="[$(review_thread 4053098001 true)]"
+  run_cmd_status
+  assert_eq "$CMD_RC" 0 "a clean approval"
+  assert_contains "$CMD_OUT" "approved (👍 from $REVIEWER)" "reads as it always did"
+  assert_not_contains "$CMD_OUT" UNRESOLVED "with nothing open under it"
+}
+
+test_only_an_approval_reads_the_threads() {
+  # The read budget: every other state is reported without the GraphQL read, so a status (and a
+  # watch round, which gates the same way) that is not about to report an approval costs nothing.
+  idle_fixture
+  THREADS_JSON="[$(review_thread 4053098120 false)]"
+  run_cmd_status
+  assert_contains "$CMD_OUT" "the next move is yours" "an idle head is reported as idle"
+  assert_eq "$(graphql_reads)" 0 "and the threads are never read for it"
+}
+
+test_an_unread_thread_connection_is_unknown_not_approved() {
+  approved_fixture
+  FAIL_GRAPHQL=1
+  run_cmd_status
+  assert_eq "$CMD_RC" 3 "a thread read that did not answer is exit 3"
+  assert_contains "$CMD_OUT" "UNKNOWN — GraphQL did not answer the review-threads read" \
+    "and says it is transport, not an approval"
+  assert_not_contains "$CMD_OUT" "approved (" "the approval is withheld, never granted on a failed read"
+}
+
+test_the_thread_read_pages_to_the_end() {
+  approved_fixture
+  THREADS_FIXTURE_PAGE=2
+  THREADS_JSON="[$(review_thread 1 true),$(review_thread 2 true),$(review_thread 3 true),$(review_thread 4 true),$(review_thread 5 false)]"
+  run_cmd_status
+  assert_contains "$CMD_OUT" "BUT 1 review thread(s) still UNRESOLVED — NOT a clean approval, and \`merge\` refuses it: 5 by" \
+    "an open thread on the third page is found"
+  assert_eq "$(graphql_reads)" 3 "one read per page, and no more"
+}
+
+test_a_count_that_leads_the_rows_is_unread() {
+  # #293's lesson: a connection that states more threads than it served is a partial read, and
+  # the missing ones are exactly where an open thread could be.
+  approved_fixture
+  THREADS_FIXTURE_TOTAL=9
+  THREADS_JSON="[$(review_thread 1 true),$(review_thread 2 true),$(review_thread 3 true)]"
+  run_cmd_status
+  assert_eq "$CMD_RC" 3 "a partial read is unread"
+  assert_contains "$CMD_OUT" "ended at 3 thread(s) while the PR states 9" "and says how it was short"
+}
+
+test_a_read_still_paging_at_the_cap_is_unread() {
+  approved_fixture
+  retune THREADS_PAGE_CAP=2
+  THREADS_FIXTURE_PAGE=2
+  THREADS_JSON="[$(review_thread 1 true),$(review_thread 2 true),$(review_thread 3 true),$(review_thread 4 true),$(review_thread 5 true)]"
+  run_cmd_status
+  assert_eq "$CMD_RC" 3 "a prefix is not the connection"
+  assert_contains "$CMD_OUT" "still paging after 2 pages of 100" "the cap refuses rather than judging a prefix"
+  assert_eq "$(graphql_reads)" 2 "and stops at the cap"
+}
+
+test_a_thread_with_no_resolution_field_is_open() {
+  approved_fixture
+  THREADS_JSON="[$(review_thread 77 false | jq -c 'del(.isResolved)')]"
+  run_cmd_status
+  assert_contains "$CMD_OUT" "BUT 1 review thread(s) still UNRESOLVED" \
+    "only an isResolved of true closes a thread"
+}
+
+test_a_thread_path_is_shell_quoted() {
+  approved_fixture
+  THREADS_JSON="[$(review_thread 77 false 'dir/a b;c.sh')]"
+  run_cmd_status
+  assert_contains "$CMD_OUT" "77 by codex[bot] on $(printf '%q' 'dir/a b;c.sh')" \
+    "a repository-controlled path is quoted in the line"
+}
+
+test_a_broken_jq_program_is_unknown_on_the_thread_read() {
+  approved_fixture
+  THREADS_JSON="[$(review_thread 77 false)]"
+  set +e
+  CMD_OUT=$(with_broken_jq 'select(.isResolved != true)' cmd_status 7 2>&1)
+  CMD_RC=$?
+  set -e
+  assert_eq "$CMD_RC" 3 "open threads that did not parse are not 'none are open'"
+  assert_contains "$CMD_OUT" "threads that did not parse" "the site says so"
+}
+
 tests=(
   test_empty_reviews_need_their_own_findings
   test_idle_clean_says_next_move_is_yours
@@ -1050,6 +1183,16 @@ tests=(
   test_a_broken_jq_program_is_unknown_on_the_pending_request_read
   test_a_broken_jq_program_is_unknown_on_the_current_head_evidence
   test_a_running_row_the_stamp_pattern_misses_is_unknown
+  test_an_approval_over_open_threads_is_unresolved
+  test_an_approval_with_every_thread_resolved_stays_approved
+  test_only_an_approval_reads_the_threads
+  test_an_unread_thread_connection_is_unknown_not_approved
+  test_the_thread_read_pages_to_the_end
+  test_a_count_that_leads_the_rows_is_unread
+  test_a_read_still_paging_at_the_cap_is_unread
+  test_a_thread_with_no_resolution_field_is_open
+  test_a_thread_path_is_shell_quoted
+  test_a_broken_jq_program_is_unknown_on_the_thread_read
 )
 
 run_tests "${tests[@]}"
