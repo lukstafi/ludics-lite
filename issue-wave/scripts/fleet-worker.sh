@@ -610,6 +610,14 @@ done
 # only), the git credential helper a push uses, or a token /user does not accept (an app
 # installation token): those are ludics-lite#374, not this check.
 gh_down=""
+# The PAT file holds a classic token: it must be a regular file this user owns, mode 0600 (or
+# 0400), whether or not the token it holds is live. `ls -ln` reads that the same on GNU and BSD.
+tokf="$HOME/.config/fleet/gh-token.sh"; tokbad=""; qbox=$(printf '%q' "$BOX")
+if [ -e "$tokf" ] || [ -L "$tokf" ]; then
+  tls=$(ls -ln "$tokf" 2>/dev/null)
+  case "$tls" in "-rw------- "*|"-r-------- "*) [ "$(printf '%s' "$tls" | awk '{print $3}')" = "$(id -u)" ] || tokbad=1 ;; *) tokbad=1 ;; esac
+  [ -z "$tokbad" ] || note "~/.config/fleet/gh-token.sh on $BOX is not a regular mode-0600 file this user owns ($(printf '%s' "$tls" | awk '{print $1, "uid", $3}')): the PAT in it may be readable by others -- repair: make it one, e.g. ssh $qbox 'chmod 600 ~/.config/fleet/gh-token.sh'"
+fi
 if ! command -v gh >/dev/null 2>&1; then
   note "no gh on PATH in a non-interactive session on $BOX (a worker here cannot open its PR)"
 else
@@ -624,15 +632,15 @@ else
         # An exported token outranks the stored login, and `gh auth login` refuses while one is
         # set, so the stored-login repair applies only to a box without the fleet's token file.
         envtok=""; for v in GH_TOKEN GITHUB_TOKEN; do [ -z "${!v+x}" ] || envtok="${envtok:+$envtok and }$v"; done
-        qbox=$(printf '%q' "$BOX")
-        if [ -e "$HOME/.config/fleet/gh-token.sh" ]; then
+        if [ -n "$tokbad" ]; then repair="repair the token file first (above), then rerun the preflight"
+        elif [ -e "$tokf" ]; then
           case "$BOX" in local) repair="put a live PAT in ~/.config/fleet/gh-token.sh here (export GH_TOKEN=ghp_...), then copy it to the other boxes" ;;
             *) repair="replace the PAT in ~/.config/fleet/gh-token.sh on $BOX, e.g. from the anchor: ssh $qbox 'f=~/.config/fleet/gh-token.sh; umask 077; cat > \"\$f.new\" && chmod 600 \"\$f.new\" && mv \"\$f.new\" \"\$f\"' < ~/.config/fleet/gh-token.sh" ;; esac
           # Whether the exported GH_TOKEN IS the file's, read in a subshell (nothing printed): a
           # later startup line exporting another one overrides the file, and replacing the file
           # would not reach it.
           ftok=$(unset GH_TOKEN; . "$HOME/.config/fleet/gh-token.sh" >/dev/null 2>&1; printf '%s' "${GH_TOKEN-}")
-          if [ -n "${GH_TOKEN+x}" ] && [ "$GH_TOKEN" != "$ftok" ]; then repair="this session's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports: a later line of $BOX's shell startup overrides it (ssh $qbox 'grep -n GH_TOKEN ~/.bashrc ~/.profile ~/.bash_profile ~/.config/fleet/env.sh'); remove that line, then restart any tmux server that inherited it"
+          if [ -n "${GH_TOKEN+x}" ] && [ "$GH_TOKEN" != "$ftok" ]; then repair="this session's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports: a later line of $BOX's shell startup overrides it (ssh $qbox 'grep -Hnos GH_TOKEN ~/.bashrc ~/.profile ~/.bash_profile ~/.config/fleet/env.sh' lists the lines without their values); remove that line, then restart any tmux server that inherited it"
           elif [ -n "${GH_TOKEN+x}" ]; then repair="$repair; then restart any tmux server that inherited the old value"
           else repair="this session does not export the token in ~/.config/fleet/gh-token.sh: end $BOX's ~/.config/fleet/env.sh with [ ! -r \"\$HOME/.config/fleet/gh-token.sh\" ] || . \"\$HOME/.config/fleet/gh-token.sh\" (scripts/install-linux.sh adds it)"; fi
         else

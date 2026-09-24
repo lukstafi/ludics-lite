@@ -30,12 +30,16 @@ prompt() {
   REPLY=${reply:-$2}
 }
 # Prepend the source before Ubuntu's noninteractive .bashrc early return.
+# A file's lines minus one exact line; a read error (grep's 2) fails rather than reading as empty.
+without_line() { grep -Fxv -- "$1" "$2" || [[ $? -eq 1 ]]; }
+
 source_at_start() {
   local target=$1 line=$2 tmp
+  # Already first is done, through a symlink too; present anywhere else (say below an early
+  # `return`) is moved up.
+  if [[ -f $target && $(head -n1 "$target") == "$line" ]]; then return; fi
   [[ ! -L $target ]] || fail "Refusing to rewrite symlink $target; add this manually: $line"
   [[ ! -e $target || -f $target ]] || fail "Not a regular file: $target"
-  # Already first is done; present anywhere else (say below an early `return`) is moved up.
-  if [[ -f $target && $(head -n1 "$target") == "$line" ]]; then return; fi
   tmp=$(mktemp "${target}.XXXXXX")
   if [[ -f $target ]]; then
     cp -p "$target" "$target.fleet-backup.$(date +%s).$$"
@@ -43,20 +47,32 @@ source_at_start() {
   else
     chmod 644 "$tmp"
   fi
-  { printf '%s\n' "$line"; if [[ -f $target ]]; then grep -Fxv -- "$line" "$target" || true; fi; } > "$tmp"
+  printf '%s\n' "$line" > "$tmp"
+  if [[ -f $target ]] && ! without_line "$line" "$target" >> "$tmp"; then rm -f -- "$tmp"; fail "Cannot read $target"; fi
   mv "$tmp" "$target"
 }
 # Idempotently make a line a file's LAST line, so nothing after it can override what it sets;
 # an earlier copy is moved down. Never creates the file, and never follows a symlink.
 append_line() {
   local target=$1 line=$2 tmp
+  if [[ -f $target && $(tail -n1 "$target") == "$line" ]]; then return; fi
   [[ ! -L $target ]] || { printf 'Not rewriting symlink %s; add this line yourself: %s\n' "$target" "$line"; return; }
   [[ -f $target ]] || fail "Missing $target"
-  if [[ $(tail -n1 "$target") == "$line" ]]; then return; fi
   tmp=$(mktemp "${target}.XXXXXX")
-  { grep -Fxv -- "$line" "$target" || true; printf '%s\n' "$line"; } > "$tmp"
+  without_line "$line" "$target" > "$tmp" || { rm -f -- "$tmp"; fail "Cannot read $target"; }
+  printf '%s\n' "$line" >> "$tmp"
   cat "$tmp" > "$target"  # Rewrite in place: keeps the file's mode and owner.
   rm -f -- "$tmp"
+}
+
+# ssh-keygen -l on a private key reads the .pub beside it, so fingerprint a lone copy under
+# $scratch; OpenSSH keys carry their public half unencrypted, so no passphrase is asked.
+private_fingerprint() {
+  local copy=$scratch/lone-key fp
+  (umask 077; cp -- "$1" "$copy")
+  fp=$(ssh-keygen -l -f "$copy" < /dev/null | awk '{print $2}') || fp=""
+  rm -f -- "$copy"
+  printf '%s' "$fp"
 }
 
 clone_if_missing() {
@@ -406,7 +422,9 @@ main() {
     if [[ ! -e $HOME/.ssh/id_ed25519 && ! -e $HOME/.ssh/id_ed25519.pub ]]; then
       ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519" -C "$(id -un)@$box"
     fi
-    [[ -f $HOME/.ssh/id_ed25519.pub ]] || fail 'Missing ~/.ssh/id_ed25519.pub; configure your existing key manually.'
+    [[ -f $HOME/.ssh/id_ed25519 && -f $HOME/.ssh/id_ed25519.pub ]] || fail 'Need both halves of ~/.ssh/id_ed25519; configure your existing key manually.'
+    [[ $(private_fingerprint "$HOME/.ssh/id_ed25519") == "$(ssh-keygen -l -f "$HOME/.ssh/id_ed25519.pub" | awk '{print $2}')" ]] ||
+      fail 'The public key ~/.ssh/id_ed25519.pub does not match its private key; configure your existing key manually.'
     printf 'For a passphrase-protected key, load ssh-agent before running unattended workers.\n'
     for peer in $boxes; do
       [[ $peer != "$box" ]] || continue

@@ -766,13 +766,18 @@ expect "...and the Codex CLI preflight" 1 "GitHub credential refused" -- env SHI
 expect "a rejected token exported in the session names it in the repair" 1 "repair: remove the GH_TOKEN this session exports (it outranks gh's stored login and blocks gh auth login) from testbox's shell startup, then restart any tmux server that inherited it; for the stored login: ssh -t testbox" -- \
   env SHIM_GH=401 GH_TOKEN=gho_dead "$FW" preflight testbox --native-claude --no-cross
 # The fleet's PAT file (2026-09-24): a rejected PAT is replaced in the file, never by gh auth login.
-mkdir -p "$HOME/.config/fleet"; printf 'export GH_TOKEN=ghp_dead\n' > "$HOME/.config/fleet/gh-token.sh"
+mkdir -p "$HOME/.config/fleet"; printf 'export GH_TOKEN=ghp_dead\n' > "$HOME/.config/fleet/gh-token.sh"; chmod 600 "$HOME/.config/fleet/gh-token.sh"
 expect "a rejected PAT from gh-token.sh is replaced from the anchor's file" 1 "repair: replace the PAT in ~/.config/fleet/gh-token.sh on testbox, e.g. from the anchor: ssh testbox 'f=~/.config/fleet/gh-token.sh; umask 077; cat > .*f.new.* && chmod 600 .*f.new.* && mv .*f.new.*' < ~/.config/fleet/gh-token.sh; then restart any tmux server that inherited the old value$" -- \
   env SHIM_GH=401 GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross
 expect "...and a GH_TOKEN a later startup line exports is named as the override, not the file" 1 "repair: this session's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports: a later line of testbox's shell startup overrides it" -- \
   env SHIM_GH=401 GH_TOKEN=ghp_stale "$FW" preflight testbox --native-claude --no-cross
 expect "...and a gh-token.sh the session does not source names the env.sh line" 1 "repair: this session does not export the token in ~/.config/fleet/gh-token.sh: end testbox's ~/.config/fleet/env.sh with .*gh-token.sh.*install-linux.sh adds it)$" -- \
   env -u GH_TOKEN -u GITHUB_TOKEN SHIM_GH=401 "$FW" preflight testbox --native-claude --no-cross
+chmod 644 "$HOME/.config/fleet/gh-token.sh"
+expect "a group-readable gh-token.sh refuses even with a live token" 1 "gh-token.sh on testbox is not a regular mode-0600 file this user owns (-rw-r--r-- uid [0-9]*).*chmod 600" -- \
+  env GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross
+expect "...and a refused token then points at the file, not at env.sh" 1 "repair: repair the token file first (above)" -- \
+  env -u GH_TOKEN SHIM_GH=401 "$FW" preflight testbox --native-claude --no-cross
 rm "$HOME/.config/fleet/gh-token.sh"
 expect "a box never logged in to gh refuses (an unnamed failure fails closed)" 1 "GitHub credential refused.*gh auth login" -- env SHIM_GH=noauth "$FW" preflight testbox --no-probe --no-cross
 expect "a GitHub that cannot be reached is noted on the OK line" 0 "PREFLIGHT OK testbox .*(GitHub unreachable from testbox: gh api user: check your internet connection" -- env SHIM_GH=down "$FW" preflight testbox --no-probe --no-cross

@@ -74,6 +74,22 @@ class BootstrapSafety(unittest.TestCase):
         self.run_shell("source_at_start rc 'source env'")
         self.assertEqual((self.root / 'rc').read_text(), 'source env\nreturn\n')
 
+    def test_append_line_refuses_an_unreadable_file_without_truncating_it(self):
+        (self.root / 'env.sh').write_text('export FLEET_LOCAL_BOX=rog\n')
+        (self.root / 'env.sh').chmod(0o200)
+        self.run_shell("append_line env.sh '. token'", False)
+        (self.root / 'env.sh').chmod(0o600)
+        self.assertEqual((self.root / 'env.sh').read_text(), 'export FLEET_LOCAL_BOX=rog\n')
+
+    def test_startup_symlink_already_first_is_accepted(self):
+        self.run_shell("printf 'source env\\nreturn\\n' > real; ln -s real rc; source_at_start rc 'source env'")
+        self.assertEqual((self.root / 'real').read_text(), 'source env\nreturn\n')
+
+    def test_private_fingerprint_ignores_the_sibling_public_key(self):
+        self.run_shell("scratch=$PWD; ssh-keygen -q -t ed25519 -N pw -f a; ssh-keygen -q -t ed25519 -N '' -f b; "
+                       "mv b.pub a.pub; test \"$(private_fingerprint a)\" != \"$(ssh-keygen -l -f a.pub | awk '{print $2}')\"; "
+                       "rm b; ssh-keygen -q -t ed25519 -N '' -f c; test \"$(private_fingerprint c)\" = \"$(ssh-keygen -l -f c.pub | awk '{print $2}')\"")
+
     def test_append_line_never_follows_a_symlink_or_creates(self):
         self.run_shell("echo KEEP > real; ln -s real env.sh; append_line env.sh '. token'")
         self.assertEqual((self.root / 'real').read_text(), 'KEEP\n')
