@@ -964,6 +964,34 @@ POLL_ITEM_DEFS='
       elif $k <= 1 then " (\($n) identical threads, one reply answers all)"
       else " (\($n) threads at one location, \($k) findings as written; one reply answers all)"
       end;
+  # The connector ends every review body it writes with a fixed "About Codex in GitHub" block
+  # (ludics-lite#358): some fifteen lines of trigger instructions, 18 of the 44 lines one round of
+  # #354 printed. It sits at the TAIL, the part of a long round the Bash display keeps, so it
+  # pushes the findings above it toward the part the display cuts. The rendering folds it into one
+  # line. The boundary is a fail-closed ALLOWLIST of one exact shape, and anything outside it
+  # renders as-is:
+  #   - the opener is the literal bytes `<details> <summary>` U+2139 U+FE0F ` About Codex in
+  #     GitHub</summary>` (the text the connector writes, as served in the reviews of #354), so
+  #     another summary, a missing variation selector or a different spacing is not the block;
+  #   - the block is the text after the LAST such opener, and it must hold exactly one
+  #     `</details>` with nothing but whitespace after it: the block ends the body. An unterminated
+  #     block, a block followed by more text, or a second `</details>` renders as-is, and an
+  #     earlier opener (a finding QUOTING the line) can never swallow the findings after it;
+  #   - the interior is not read, since its wording differs between the variants the connector
+  #     writes.
+  # It is applied to the summary and review bodies only, where the connector writes the block;
+  # an inline finding is never folded. It is RENDERING only: the stamp `item_stamp` reads, the
+  # `items:` line and the watermark all read the raw body or the ids, never this output.
+  def fold_codex_about:
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>" as $open
+    | (. // "") as $body
+    | ($body | split($open)) as $p
+    | if ($p | length) < 2 then $body
+      else ($p[-1] | split("</details>")) as $q
+        | if ($q | length) == 2 and ($q[1] | test("[^[:space:]]") | not) then
+            ($p[:-1] | join($open)) + "[Codex \"About Codex in GitHub\" boilerplate folded]"
+          else $body end
+      end;
 '
 
 # Exits 3, and prints no watermark, when any feed failed to read: an unwritten watermark keeps the
@@ -1073,11 +1101,11 @@ cmd_poll() {
   # A comment's only head association is the stamp POLL_ITEM_DEFS describes; one carrying none
   # renders `commit=-`, and nothing downstream may read that as "another commit".
   jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
-    .[] | "--- summary id=\(.id) commit=\(item_stamp($rc)) by \(.user.login)\n\(.body)"' <<<"$new_issue" ||
+    .[] | "--- summary id=\(.id) commit=\(item_stamp($rc)) by \(.user.login)\n\(.body | fold_codex_about)"' <<<"$new_issue" ||
     return 4
 
   jq -r "$POLL_ITEM_DEFS"'
-    .[] | "--- review id=\(.id) state=\(.state) commit=\(review_commit) by \(.user.login)\n\(.body // "")"' <<<"$new_reviews" ||
+    .[] | "--- review id=\(.id) state=\(.state) commit=\(review_commit) by \(.user.login)\n\(.body | fold_codex_about)"' <<<"$new_reviews" ||
     return 4
 
   # The items above, as one machine-readable line, for a caller that has to decide something about
