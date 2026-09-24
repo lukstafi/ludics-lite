@@ -469,8 +469,11 @@ from its source — inline link syntax, an HTML tag, a character entity — or w
 past ASCII, is one whose anchor it will not spell: it reports no slug and says so, rather than
 answering with the source reading, which would refuse the right anchor and accept one GitHub never
 creates. It also holds `ship-pr/SKILL.md` to `post-merge-cleanup.sh`'s own option register: every
-option the helper's `usage()` heredoc lists is named, verbatim, somewhere in the prompt, and every
-`--option` the prompt's fenced command lines pass to the helper is one the heredoc lists. Which
+option the helper's usage text lists is named, verbatim, somewhere in the prompt, and every
+`--option` the prompt's fenced command lines pass to the helper is one that text lists. The text is
+read by running the helper with no arguments, its usage error; the helper prints its listing from
+the same one option table its parse loop reads, so a listing and a parser that disagree on an
+option's value (ludics-lite#302) have no second copy to drift in (ludics-lite#332). Which
 `--flag` in the prompt is the helper's is a line shape — a fenced line naming
 `post-merge-cleanup.sh`, plus the lines a trailing backslash continues it onto — so a flag of `gh`
 or of the test runner is attributed to nothing, and an option the prompt only discusses is held

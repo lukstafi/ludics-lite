@@ -1048,6 +1048,12 @@ cleanup_edit() {
   cmp -s "$R/cleanup.tmp" "$R/$1" && { ko "cleanup_edit: '$2' matched nothing in $1"; return 1; }
   mv "$R/cleanup.tmp" "$R/$1"
 }
+# cleanup_add_dry_run: declares a `--dry-run` flag in the helper's option table, ahead of `--base`,
+# so its usage text lists the option bare -- the one row shape the real table does not carry.
+cleanup_add_dry_run() {
+  cleanup_edit "$CLEANUP_HELPER" "s/^option --base /option --dry-run '' DRY_RUN 'Report what cleanup would do and change nothing'\\
+option --base /"
+}
 # The one invocation line the mutations below rewrite, spelled the way the prompt spells it: a
 # continuation line carrying two options. Read off the prompt rather than restated, so a probe
 # goes stale at the edit that moves it instead of asserting over a line that is no longer there.
@@ -1062,8 +1068,7 @@ expect "the real prompt and the helper's usage() list the same options" 0 \
 
 # The drift ludics-lite#276 was: an option the helper gains that the prompt never names.
 cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^\(  --base .*\)$/\1\
-  --dry-run             Report what cleanup would do and change nothing/'
+cleanup_add_dry_run
 expect "an option usage() lists that the prompt never names is refused" 1 \
   "$CLEANUP_PROMPT: names no '--dry-run'" -- "$CP" "$R"
 
@@ -1153,15 +1158,8 @@ expect "a misspelled option is reported whole, not truncated to its listed prefi
 cleanup_tree
 cleanup_edit "$CLEANUP_PROMPT" "${CLEANUP_LINE}s/--base main/--base=main/"
 expect "...and so is the = spelling, which the helper does not take" 1 "passes '--base=main'" -- "$CP" "$R"
-# `<<-` strips leading tabs from the body and the delimiter, and so does the reader.
-cleanup_tree
-TAB=$(printf '\t')
-cleanup_edit "$CLEANUP_HELPER" "/<<'EOF'/,/^EOF\$/{ s/<<'EOF'/<<-'EOF'/; /<<-'EOF'/!s/^/${TAB}/; }"
-expect "a <<- heredoc with a tab-indented body and delimiter is still the listing" 0 \
-  "$CLEANUP_AGREE" -- "$CP" "$R"
-
 # Round 3, P2 x6: the word model. A quoted word is unquoted; the helper's name is whole whatever
-# operator precedes it; a heredoc delimiter is any word; the listing side uses the same token
+# operator precedes it; the listing side uses the same token
 # grammar as the invocation side; a fence closes only on a run as long as its opener; and the
 # word after a valued option is its value whatever it looks like.
 cleanup_tree
@@ -1173,10 +1171,6 @@ expect "a bare invocation after a shell operator is the helper" 1 "passes '--kee
 cleanup_tree
 printf '\n```bash\nout=$(~/x/post-merge-cleanup.sh a b c --keep-branch)\n```\n' >> "$R/$CLEANUP_PROMPT"
 expect "...and one inside a command substitution" 1 "passes '--keep-branch'" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" "s/<<'EOF'/<<'USAGE-END'/; s/^EOF\$/USAGE-END/"
-expect "a heredoc delimiter that is not an identifier is still the delimiter" 0 \
-  "$CLEANUP_AGREE" -- "$CP" "$R"
 cleanup_tree
 cleanup_edit "$CLEANUP_PROMPT" 's/--base\([^-A-Za-z0-9_]\)/--base_branch\1/g'
 expect "a misspelling in prose does not name the listed option" 1 "names no '--base'" -- "$CP" "$R"
@@ -1192,8 +1186,7 @@ printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --base \\\n  --keep-branch\n`
 expect "...across a continuation too" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
 # ...while an option usage() lists with no <value> placeholder consumes nothing.
 cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^\(  --base .*\)$/\1\
-  --dry-run             Report what cleanup would do and change nothing/'
+cleanup_add_dry_run
 printf '\nPass `--dry-run` to rehearse.\n\n```bash\n~/x/post-merge-cleanup.sh a b c --dry-run --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
 expect "a flag option consumes no value, so the word after it is read" 1 \
   "passes '--keep-branch'" -- "$CP" "$R"
@@ -1224,260 +1217,27 @@ cleanup_tree
 cleanup_edit "$CLEANUP_PROMPT" '/^  --base [^ ]* --regenerable /d'
 expect "an option named only in prose is still named" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
 
-# The register is read off usage()'s heredoc, and a usage() this reader sees no options in is
-# refused rather than holding the prompt to nothing.
+# The register is read off the helper's printed usage text, which it renders from the option
+# table its parse loop reads (ludics-lite#332), and a text this reader sees no options in is refused
+# rather than holding the prompt to nothing.
 cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --[a-z]/d'
+cleanup_edit "$CLEANUP_HELPER" '/^option --base /,/^$/d'
 expect "a usage() listing no options is refused, not passed" 1 \
   "$CLEANUP_HELPER: usage() lists no options" -- "$CP" "$R"
-# ...whatever the heredoc's delimiter is spelled as.
+# ...and a run that is not the usage error is no listing at all: a crash's output is not read as
+# an empty register, nor as a register.
 cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" "s/<<'EOF'/<<\"USAGE\"/; s/^EOF\$/USAGE/"
-expect "a heredoc under another delimiter is still the listing" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
+cleanup_edit "$CLEANUP_HELPER" 's/^  exit 2$/  exit 1/'
+expect "a helper whose usage error does not exit 2 is refused" 1 \
+  "$CLEANUP_HELPER: run with no arguments, it printed no usage text" -- "$CP" "$R"
+# The listing is the table's: a row's placeholder is both what the text prints and what the
+# parser consumes, so a flag row is listed bare -- and the word after it on the prompt's command
+# line is read as the next option rather than skipped as a value.
 cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" "s/<<'EOF'/<< 'EOF'/"
-expect "...and with a blank between the operator and the delimiter (round 1, P2)" 0 \
-  "$CLEANUP_AGREE" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" "s/cat >&2 <<'EOF'/cat <<'EOF' >\&2 # the usage text/"
-expect "...and with shell syntax after the delimiter (round 5, P2)" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
-# A `}` inside the usage text is text: reading it as the function's close would end the register
-# at that line, and an option listed below it could leave the prompt unnoticed (round 1, P2).
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^\(  --base .*\)$/\1\
-}\
-  --dry-run             Report what cleanup would do and change nothing/'
-expect "a brace inside the heredoc does not end the listing" 1 \
-  "$CLEANUP_PROMPT: names no '--dry-run'" -- "$CP" "$R"
-
-# usage()'s arity is held to the helper's own parser: ludics-lite#302 found `--force-integrated`
-# listed with no placeholder while its arm did `shift 2`, and the prompt's side skips a value by
-# that arity. The real pair agrees, arm by arm.
-cleanup_tree
-expect "the real usage() and the real parser agree on every option's arity" 0 \
-  "usage() agrees with its parser on each one's arity" -- "$CP" "$R"
-# #302's own shape: a placeholder dropped from the listing while the arm still takes a value.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^  --base <branch>  /  --base           /'
-expect "a listing that lost its placeholder over a 'shift 2' arm is refused" 1 \
-  "usage() lists '--base' with no <value> placeholder, but its parser arm does 'shift 2'" -- "$CP" "$R"
-# ...and the other way: a placeholder listed over an arm that is flag-shaped.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/shift 2/shift/'
-expect "a placeholder listed over a flag-shaped 'shift' arm is refused" 1 \
-  "usage() lists '--regenerable' with a <value> placeholder, but its parser arm does 'shift' and takes none" \
-  -- "$CP" "$R"
-# An arm usage() never lists is an option the operator cannot learn of.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^  --base)$/  --dry-run)\
-    DRY_RUN=1\
-    shift\
-    ;;\
-  --base)/'
-expect "a parser arm with no usage() listing is refused" 1 \
-  "the option parser takes '--dry-run', which usage() does not list" -- "$CP" "$R"
-# ...and a listing with no arm is an option the helper refuses as usage.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/d'
-expect "a usage() listing with no parser arm is refused" 1 \
-  "usage() lists '--regenerable', for which the option parser has no '--regenerable)' arm" -- "$CP" "$R"
-# A one-line arm is an arm, read to its own `;;`, and a `shift 2` in a comment is not its shift.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^  --base <branch>  /  --base           /'
-cleanup_edit "$CLEANUP_HELPER" '/^  --base)$/,/;;/d'
-cleanup_edit "$CLEANUP_HELPER" 's/^  --force-integrated)$/  --base) BASE_BRANCH=main; shift ;; # not shift 2\
-  --force-integrated)/'
-expect "a one-line flag arm agrees with a bare listing, whatever its comment says" 0 \
-  "usage() agrees with its parser on each one's arity" -- "$CP" "$R"
-CLEANUP_UNREAD="the parser's '--regenerable)' arm is not one this reader can read"
-CLEANUP_PARSER="the option parser is not one this reader can read"
-# Round 1, P2 x2: which `shift` text is the arm's shift. Two shifts add up whatever each says, so
-# an arm carrying two is unread rather than read as one; and a shift in a comment or in quoted
-# text is no command, so an arm whose only `shift 2` is text is a flag arm.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    shift 2\
-    shift 2/'
-expect "an arm carrying two shifts is refused, even two that each match the listing" 1 \
-  "$CLEANUP_UNREAD" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/{ s/^    shift 2$/    shift/; s/^    ;;$/    ;;# shift 2/; }'
-expect "a shift in a comment glued to the ;; is not the arm's" 1 \
-  "usage() lists '--regenerable' with a <value> placeholder, but its parser arm does 'shift' and takes none" \
-  -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    NOTE="cannot shift 2 here"; WHY='"'nor shift 2 here'"'; shift/'
-expect "...nor is one in quoted text" 1 \
-  "usage() lists '--regenerable' with a <value> placeholder, but its parser arm does 'shift' and takes none" \
-  -- "$CP" "$R"
-
-# Round 2, P2 x2: a shift is a statement at the arm's top level, and the word anywhere else makes
-# the arm unread. Each of these carries its only `shift 2` where it is an argument, may not run, or
-# moves a subshell's parameters and not the loop's -- so the arm consumes nothing, loops forever,
-# and must not agree with the listing's placeholder.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    printf %s shift 2/'
-expect "a shift that is another command's argument is not the arm's" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    false \&\& shift 2/'
-expect "...nor one under a && that may not run" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    ( shift 2 )/'
-expect "...nor one in a subshell, which moves no parameter of the loop" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    if false; then\
-      shift 2\
-    fi/'
-expect "...nor one standing alone but nested in a compound command" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    printf %s shift; shift 2/'
-expect "...and the word beside a real shift still leaves the arm unread" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
-
-# Round 3, P2: a line the one before it left open is part of that command, however it is
-# indented -- `false &&` over a lone `shift 2` is a conditional shift. The same for each way a
-# line can leave its command open, and the control that a finished line still hands on the shift.
-for tail in 'false \&\&' 'false ||' 'printf x |' '!' 'true \\' '{' 'if false; then'; do
-  cleanup_tree
-  cleanup_edit "$CLEANUP_HELPER" "/^  --regenerable)\$/,/;;/s/^    shift 2\$/    $tail\\
-    shift 2/"
-  # The label spells the line as the helper would carry it, without the sed escapes.
-  expect "a shift on a line continuing '$(printf '%s' "$tail" | sed 's/\\\(.\)/\1/g')' is not a top-level statement" 1 \
-    "$CLEANUP_UNREAD" \
-    -- "$CP" "$R"
-done
-
-# Round 4, P2 x4: the arm is read only in the grammar the helper writes -- shifts, one-word
-# assignments and `[ … ] || usage` guards -- so every other statement leaves it unread, and the
-# rounds' list of shapes that hide a shift ends here instead of growing. A guard in the grammar
-# hands the shift on; a harmless statement outside it is refused, which is the stated cost.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    [ -z "$FORCE_REASON" ] || usage\
-    shift 2/'
-expect "a guard in the arm grammar leaves the shift read" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    echo "taking $2"\
-    shift 2/'
-expect "...while a statement outside it leaves the arm unread, sound shift or not" 1 \
-  "$CLEANUP_UNREAD" -- "$CP" "$R"
-# A heredoc body is data: its `shift 2` line runs nothing.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    cat <<X\
-    shift 2\
-X/'
-expect "a shift in a heredoc body is not the arm's" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
-# Loop control before the shift restarts or leaves the loop with the option unconsumed.
-for ctl in continue break; do
-  cleanup_tree
-  cleanup_edit "$CLEANUP_HELPER" "/^  --regenerable)\$/,/;;/s/^    shift 2\$/    $ctl\\
-    shift 2/"
-  expect "a shift behind a '$ctl' is not read" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
-done
-# A nested case's `;;` does not end the outer arm: a bare listing over `shift`, a nested case and a
-# second `shift` is not a flag.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^  --base <branch>  /  --base           /'
-cleanup_edit "$CLEANUP_HELPER" '/^  --base)$/,/;;/s/^    shift 2$/    shift\
-    case x in x) : ;; esac\
-    shift/'
-expect "a nested case's terminator does not close the arm it sits in" 1 \
-  "$CLEANUP_PARSER: a ;; that does not end its line" -- "$CP" "$R"
-# A pattern naming options in another spelling is reported, not skipped: the helper would take
-# two options nobody can learn of.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^  --base)$/  --hidden|--secret)\
-    shift\
-    ;;\
-  --base)/'
-expect "an alternation arm is a pattern outside the grammar, refused with the parser" 1 \
-  "$CLEANUP_PARSER: a case pattern other than one bare --name) or a final *): --hidden|--secret)" \
-  -- "$CP" "$R"
-
-# Round 5, P2 x3: the split is per line and per `;`, so a quote left open across lines and a
-# backslash-escaped `;` -- both of which carry a `shift 2` as data -- leave the arm unread; and case
-# runs the first arm that matches, so a glob ahead of the `--name)` arms shadows them.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    NOTE="\
-    shift 2\
-    TAIL="/'
-expect "a shift inside a quote spanning lines is not the arm's" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    NOTE=x\\;shift 2/'
-expect "...nor one behind an escaped semicolon" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
-for glob in '*) usage ;;' '-*) shift ;;'; do
-  cleanup_tree
-  cleanup_edit "$CLEANUP_HELPER" "s/^  --base)\$/  $glob\\
-  --base)/"
-  expect "an arm behind a '${glob%%)*})' pattern, which matches it first, is refused" 1 \
-    "$CLEANUP_PARSER" -- "$CP" "$R"
-done
-
-# Round 6, P2 x3: the grammar reaches the whole block, not only the arms. A pattern is one bare
-# `--name)` or a final `*)` whose body is `usage`, so an escaped spelling that matches `--base`
-# ahead of its arm is outside it; a `;;` ends its line, so one line is never two clauses; and only
-# `done` follows `esac`, so no statement in the loop consumes an argument no arm accounts for.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^  --base)$/  -\\-base) shift ;;\
-  --base)/'
-expect "an escaped spelling of an option ahead of its arm is refused" 1 \
-  "$CLEANUP_PARSER: a case pattern other than one bare --name) or a final *): -\\-base)" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^  --base)$/  --dry-run) shift ;; --base) shift ;;\
-  --base)/'
-expect "two clauses on one line are refused" 1 \
-  "$CLEANUP_PARSER: a ;; that does not end its line" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  \*) usage ;;$/,/^done$/s/^  esac$/  esac\
-  shift/'
-expect "a statement between esac and done is refused" 1 \
-  "$CLEANUP_PARSER: a statement between esac and done: shift" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^  \*) usage ;;$/  *) echo "unknown: $1" >\&2; usage ;;/'
-expect "a catch-all doing more than usage is refused" 1 \
-  "$CLEANUP_PARSER: a catch-all *) arm doing more than usage" -- "$CP" "$R"
-
-# Round 7, P2: a CRLF line end keeps its CR in the shell's word, so `shift 2` before one shifts
-# nothing; a byte the trim would drop and the shell keeps is outside the grammar.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" "/^  --regenerable)\$/,/;;/s/^    shift 2\$/    shift 2$(printf '\r')/"
-expect "a carriage return in the parser block is refused" 1 \
-  "$CLEANUP_PARSER: a byte that is neither printable ASCII nor a tab" -- "$CP" "$R"
-
-# Round 8, P2: quotes are read left to right in one pass, so an apostrophe inside a double-quoted
-# value is text -- two of them cannot pair across the `continue` between them and hide it.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    X="a'"'"'b"; continue; Y="'"'"'c"\
-    shift 2/'
-expect "an apostrophe in a double-quoted value does not pair with one further on" 1 \
-  "$CLEANUP_UNREAD" -- "$CP" "$R"
-
-# Round 9, P2: a comment ends the line in the same pass that reads quotes, so an apostrophe in a
-# comment opens no quote and a sound arm is still read.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    shift 2 # don'"'"'t consume only the option/'
-expect "an apostrophe in a comment opens no quote" 0 "$CLEANUP_AGREE" -- "$CP" "$R"
-
-# Round 10, P2 x3: an assignment word is the helper's plain shape only, so an expansion left open
-# across lines cannot make a `shift 2` line its data, and a `#` after a paren is part of a word
-# rather than a comment hiding the `continue` behind it; and the catch-all is required, since
-# without it an unknown option loops forever.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    NOTE=${UNSET:-\
-    shift 2\
-    TAIL=}/'
-expect "a shift inside an expansion spanning lines is not the arm's" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  --regenerable)$/,/;;/s/^    shift 2$/    NOTE=(x)#junk; continue\
-    shift 2/'
-expect "...nor one behind a # that a paren does not make a comment" 1 "$CLEANUP_UNREAD" -- "$CP" "$R"
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^  \*) usage ;;$/d'
-expect "a parser with no catch-all arm is refused" 1 \
-  "$CLEANUP_PARSER: no final *) usage arm" -- "$CP" "$R"
-
-# A parser this reader cannot find is refused, not read as agreeing with nothing.
-cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^while \[ "\$#" -gt 0 \]; do$/while (( $# )); do/'
-expect "a helper whose option parser is not in the read shape is refused" 1 \
-  "has no option parser this reader can see" -- "$CP" "$R"
+cleanup_edit "$CLEANUP_HELPER" "s/^option --regenerable '<name>' /option --regenerable '' /"
+printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --regenerable --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
+expect "a flag row in the table is listed bare, so the word after it is an option" 1 \
+  "passes '--keep-branch'" -- "$CP" "$R"
 
 # A helper with no prompt to document it is refused; a root with no helper carries no obligation,
 # as with the sync script and the worker.

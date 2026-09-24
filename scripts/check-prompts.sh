@@ -31,12 +31,11 @@
 # name -- so the step 0 that makes an installed copy's drift visible cannot be edited away in
 # silence (ludics-lite#199).
 #
-# A fifth compares ship-pr/SKILL.md with post-merge-cleanup.sh's usage(): every option the
-# heredoc lists is named in the prompt, and every `--option` the prompt's fenced command lines
-# pass to the helper is one usage() lists -- the two files ludics-lite#276 found edited apart
-# (see `check_cleanup_options` for what "of the helper" means on the prompt's side) -- and
-# usage()'s <value> placeholders agree with the `shift` of each option's arm in the helper's own
-# parser, since that arity is what the prompt's values are skipped by (ludics-lite#302).
+# A fifth compares ship-pr/SKILL.md with post-merge-cleanup.sh's usage text, which the helper
+# prints from the one option table its parser also reads (ludics-lite#332): every option the text
+# lists is named in the prompt, and every `--option` the prompt's fenced command lines pass to the
+# helper is one the text lists -- the two files ludics-lite#276 found edited apart (see
+# `check_cleanup_options` for what "of the helper" means on the prompt's side).
 #
 # A fourth reads the relative Markdown links in those prompts, their reference files and the two
 # READMEs: the path a `](….md)` link spells exists relative to the linking file, and an anchor on
@@ -928,7 +927,7 @@ check_drift_guard() {
 # edited apart: ludics-lite#276 added `--regenerable` to the helper's usage() and documented it in
 # the prompt by hand, in the same PR that found the prompt's prose about the base-owner gate had
 # been false through at least two earlier PRs. Nothing but a reader compares the two files, so
-# this pins the one fact a lookup can see, in both directions: every option usage()'s heredoc
+# this pins the one fact a lookup can see, in both directions: every option usage()'s text
 # LISTS is named, verbatim, somewhere in the prompt, and every `--option` the prompt PASSES to the
 # helper is one usage() lists. What is an option OF the helper, on the prompt's side, is a line
 # shape and not a judgement: the helper's command lines -- a line inside a backtick fence naming
@@ -940,45 +939,36 @@ check_drift_guard() {
 # `--list`), is attributed to nothing, so an option the prompt explains but never passes is not
 # held to the register from that side. And a name present is a name present: whether the prose
 # around it is still true is the review question ludics-lite#276 was, which no scan settles.
-# The arity usage() gives each option -- whether a `<value>` placeholder follows it -- is what the
-# prompt's side skips a value by, so it is held to the helper's own parser too: each listed option
-# has a `--name)` arm whose `shift` consumes what the listing says, and each arm is listed
-# (ludics-lite#302 found `--force-integrated` listed bare over a `shift 2`; `parser_options` says
-# what of the parser is read).
+# The arity the listing gives each option -- whether a `<value>` placeholder follows it -- is
+# what the prompt's side skips a value by. It is not compared with the helper's parser, because
+# there is no second copy to compare: the helper declares each option once, in its option table,
+# and both usage() and the parse loop are driven by that table (ludics-lite#332, which retired the
+# parser reader that ludics-lite#302's `--force-integrated` drift had called for). So the listing
+# is read where the table is rendered -- the helper's printed usage text -- and not off its source.
 CLEANUP_HELPER=ship-pr/scripts/post-merge-cleanup.sh
 CLEANUP_PROMPT=ship-pr/SKILL.md
 
-# usage_options <script>: the options usage()'s heredoc lists, one per line as `--name<TAB>arity`
-# -- each line of the body, between the `usage() {` line and its closing `}`, that opens with two
-# blanks and a `--name`, which is the listing's own shape (`  --base <branch>  Base branch …`), and
-# the arity is 1 when a `<value>` placeholder follows the name, else 0. The delimiter is whatever
-# word the `<<` names, quoted or not, with or without a blank after the operator and whatever
-# else the line carries after it (a `>&2`, a comment), and under `<<-`
-# the body's leading tabs are stripped as the shell strips them; a `}` inside the heredoc is text
-# and does not close the function; the prose below the listing, which mentions an option
-# mid-sentence, is at no such indent and is not read.
+# usage_options <script>: the options the helper's usage text lists, one per line as
+# `--name<TAB>arity`. The helper is RUN, with no arguments, which is its usage error: it prints the
+# text on stderr and exits 2 without touching any repository (it has no checkout arguments to
+# touch). An exit other than 2, or a stderr not opening with `usage: `, is not a usage text and
+# fails the function, since reading a crash's output as an empty listing would hold the prompt to
+# nothing. Of the text, each line opening with two blanks and a `--name` is a listing line, the
+# shape usage() prints a table row in (`  --base <branch>  Base branch …`), and the arity is 1 when
+# a `<value>` placeholder follows the name, else 0. The prose below the listing mentions an option
+# mid-sentence, at no such indent, and is not read; nor is the source, whose table is the helper's
+# business.
 usage_options() {
+  local text rc=0
+  text=$(bash "$1" </dev/null 2>&1 >/dev/null) || rc=$?
+  [ "$rc" -eq 2 ] || return 1
+  case "$text" in 'usage: '*) ;; *) return 1 ;; esac
   awk '
-    !infn && /^usage\(\) \{/ { infn = 1; next }
-    # The closing brace ends the function only OUTSIDE the heredoc: a `}` in the usage text is
-    # data, and exiting on it would drop every option listed below it while the register stayed
-    # nonempty -- an agreement over half the list.
-    infn && !inhd && /^\}/ { exit }
-    infn && !inhd && match($0, /<<-?[[:space:]]*("[^"]+"|'"'"'[^'"'"']+'"'"'|[^[:space:]"'"'"'<>|&;()]+)/) {
-      d = substr($0, RSTART, RLENGTH); dash = (d ~ /^<<-/)
-      sub(/^<<-?[[:space:]]*/, "", d); gsub(/["'"'"']/, "", d)
-      inhd = 1; next
+    match($0, /^  --[A-Za-z0-9][A-Za-z0-9-]*([[:space:]]|$)/) {
+      o = substr($0, 3, RLENGTH - 2); sub(/[[:space:]]$/, "", o)
+      print o "\t" (substr($0, RLENGTH + 1) ~ /^[[:space:]]*</ ? 1 : 0)
     }
-    inhd {
-      l = $0
-      if (dash) sub("^\t+", "", l)
-      if (l == d) { inhd = 0; next }
-      if (match(l, /^  --[A-Za-z0-9][A-Za-z0-9-]*([[:space:]]|$)/)) {
-        o = substr(l, 3, RLENGTH - 2); sub(/[[:space:]]$/, "", o)
-        print o "\t" (substr(l, RLENGTH + 1) ~ /^[[:space:]]*</ ? 1 : 0)
-      }
-    }
-  ' "$1"
+  ' <<<"$text"
 }
 
 # invocation_options <prompt> <valued>: every `--option` the prompt's helper command lines pass,
@@ -1071,140 +1061,8 @@ invocation_options() {
   ' "$1"
 }
 
-# parser_options <script>: the options the helper's own parser takes, one per line as
-# `--name<TAB>arity`, so usage()'s arity -- which is what `invocation_options` skips a value on --
-# is pinned to what the parser consumes rather than to a placeholder typed by hand (ludics-lite#302
-# found `--force-integrated` listed bare while its arm did `shift 2`). A parser outside the grammar
-# below prints one `!<TAB><why>` line instead, and the caller refuses it whole.
-#
-# The parser is READ only in the shape the helper writes, and every level of it is an allowlist:
-# review rounds kept finding shapes in which text the reader took for the parser does not run as
-# one -- a repeated shift, a shift in a comment, quote, argument, conditional, subshell, heredoc or
-# nested case, behind a `continue`, split by an escape, an arm shadowed by an earlier pattern or
-# sharing a line with another, a shift after the `esac` -- and a denylist of such shapes has no end
-# (rounds 1-6). What is read:
-#  - the block: a `while [ "$#" -gt 0 ]; do` line, `case "$1" in` on the next, the arms, `esac` at
-#    the `case` line's indent, then `done`, with only blank and comment lines between the two --
-#    so nothing else in the loop consumes an argument;
-#  - a pattern: one bare `--name)` opening a line, and one `*)` that is the LAST arm and whose body
-#    is `usage` alone -- so no pattern can match a long option ahead of its own arm, and an unknown
-#    option exits rather than looping;
-#  - an arm: its pattern line through the line ENDING in `;;`, with no other `;;` in it -- so one
-#    line is never two clauses;
-#  - a statement, once each quoted span is a plain word and `#` comments are dropped: `shift` or
-#    `shift N`, a single assignment word in one of the helper's two forms, `NAME=value` or
-#    `NAME+=(value)`, whose value is quoted spans and plain characters only -- no `$`, brace, paren,
-#    `#`, operator or blank outside quotes, so no expansion can run on past the line or hide a
-#    comment (round 10) -- or a `[ … ] || usage` guard, whose `usage` exits; with no quote left open
-#    and no backslash, since the split is per line and per `;` and models neither.
-#  - a byte: printable ASCII or a tab, in every line from the `case` line to `done` -- a CR that a
-#    trim would drop is part of the word to the shell.
-# A `--name)` arm is read when all its statements are in that grammar and exactly one is a shift,
-# whose arity is N-1 (`shift 2` is 1, a bare `shift` is 0); otherwise it prints `?`, which the
-# caller refuses as unread. Any other departure is the whole parser's. The cost is stated: a
-# harmless statement outside the grammar (an `echo`) is refused until the grammar grows with it,
-# which is a false refusal on a line the operator can see and not a false agreement nobody reads.
-# That is the reader's boundary, the same line-shape boundary as the rest of this file (README,
-# Tests; ludics-lite#75): it establishes that each arm's shift agrees with its listing, not that the
-# arm reads `$2` or that the parser is the one the script runs. It reads the helper as written, not
-# as an adversary could rewrite the shell under it: `shift` is taken to be the builtin, `usage` to
-# exit and `[` to be the test builtin, since a function, alias or `enable -n` redefining one is not
-# the drift between a listing and an arm that this pins (ludics-lite#302), and no scan of names
-# reaches every way a shell can be told a word means something else.
-parser_options() {
-  LC_ALL=C awk '
-    function bad(why) { print "!\t" why; over = 1; exit }
-    function trim(t) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", t); return t }
-    # unq <line>: the line with each quoted span a plain word Q and its comment dropped, read LEFT
-    # TO RIGHT in one pass as the shell reads it, so a delimiter of one kind inside a span of the
-    # other is text and cannot pair with one further on (round 8, P2), and an unquoted `#` opening a
-    # word -- at the start, after a blank, a `;`, `&` or `|`, `;;# shift 2` included -- ends the
-    # line there, quotes in the comment and all (rounds 1 and 9, P2). A `#` after a paren is not
-    # read as a comment: in `NOTE=(x)#junk` it is part of the word (round 10, P2), and the
-    # assignment grammar below refuses the word instead. A backslash in a
-    # double-quoted span escapes the next byte. OPEN is set when a span is left unclosed.
-    function unq(t,   out, i, n, c, q) {
-      out = ""; q = ""; n = length(t)
-      for (i = 1; i <= n; i++) {
-        c = substr(t, i, 1)
-        if (q == "") {
-          if (c == "#" && (out == "" || out ~ /[[:space:];&|]$/)) break
-          if (c == "\047" || c == "\"") { q = c; out = out "Q"; continue }
-          out = out c; continue
-        }
-        if (q == "\"" && c == "\\") { i++; continue }
-        if (c == q) q = ""
-      }
-      OPEN = (q != "")
-      return out
-    }
-    !inp && /^[[:space:]]*while \[ "\$#" -gt 0 \]; do[[:space:]]*$/ { want = 1; next }
-    want && !inp && match($0, /^[[:space:]]*case "\$1" in[[:space:]]*$/) {
-      ind = substr($0, 1, index($0, "c") - 1); inp = 1; want = 0; next
-    }
-    !inp { want = 0; next }
-    # A carriage return, or any other byte that is neither printable nor a tab, is a character the
-    # trim below would drop and the shell keeps: `shift 2` before a CR is `shift` refusing "2\r"
-    # (round 7, P2). The block is read in the C locale, so a non-ASCII byte is refused too.
-    /[^[:print:]\t]/ { bad("a byte that is neither printable ASCII nor a tab, such as a CRLF line end") }
-    # Between `esac` and `done` the loop runs every iteration: a statement there consumes
-    # arguments no arm accounts for (round 6, P2).
-    post {
-      if ($0 ~ /^[[:space:]]*(#.*)?$/) next
-      if ($0 ~ /^[[:space:]]*done[[:space:]]*(#.*)?$/) { closed = 1; exit }
-      bad("a statement between esac and done: " trim($0))
-    }
-    # With no catch-all an unknown option matches no arm, consumes nothing, and the loop never
-    # ends: the `*) usage` arm is required, not only confined to the end (round 10, P2).
-    !arm && $0 ~ ("^" ind "esac[[:space:]]*(#.*)?$") {
-      if (!star) bad("no final *) usage arm, so an unknown option would loop forever")
-      post = 1; next
-    }
-    !arm && $0 ~ /^[[:space:]]*(#.*)?$/ { next }
-    # case runs the FIRST arm that matches, so a pattern that can match a long option ahead of its
-    # own arm -- a glob, an alternation, an escaped or quoted spelling -- decides the arity the arm
-    # below it only claims (rounds 4-6, P2).
-    !arm {
-      if (star) bad("a line after the catch-all *) arm, which matches first: " trim($0))
-      if (match($0, /^[[:space:]]*--[A-Za-z0-9][A-Za-z0-9-]*\)/)) {
-        name = trim(substr($0, RSTART, RLENGTH - 1))
-      } else if (match($0, /^[[:space:]]*\*\)/)) {
-        name = ""; star = 1
-      } else bad("a case pattern other than one bare --name) or a final *): " trim($0))
-      arm = 1; ar = ""; ns = 0; amb = 0; $0 = substr($0, RSTART + RLENGTH)
-    }
-    arm {
-      l = unq($0)
-      # A quote left open runs onto the next line and a backslash escapes what follows it, a `;`
-      # included: the per-line, per-`;` split models neither (round 5, P2).
-      if (OPEN || l ~ /[\\`]/) amb = 1
-      closes = sub(/;;[[:space:]]*$/, "", l)
-      if (index(l, ";;")) bad("a ;; that does not end its line, which makes it two clauses: " trim($0))
-      nseg = split(l, seg, ";")
-      for (k = 1; k <= nseg; k++) {
-        g = trim(seg[k])
-        if (g == "") continue
-        if (star) { if (g != "usage") amb = 1; continue }
-        if (g ~ /^shift([[:space:]]+[0-9]+)?$/) {
-          ar = (match(g, /[0-9]+/) ? substr(g, RSTART, RLENGTH) : 1) - 1; ns++
-        } else if (g ~ /^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_.\/:@%+,=Q-]*$/ ||
-                   g ~ /^[A-Za-z_][A-Za-z0-9_]*\+=\([A-Za-z0-9_.\/:@%+,=Q-]+\)$/) {
-        } else if (g ~ /^\[ [^][&|<>()`]* \] \|\| usage$/) {
-        } else amb = 1
-      }
-      if (!closes) next
-      # Every shift in the arm runs in sequence, so a second one -- equal or not -- consumes more
-      # than either says: the arity of an arm is read off exactly one.
-      if (star && amb) bad("a catch-all *) arm doing more than usage")
-      if (!star) print name "\t" (ns == 1 && !amb ? ar : "?")
-      arm = 0
-    }
-    END { if (inp && !over && !closed) print "!\tno esac at the case line indent followed by done" }
-  ' "$1"
-}
-
 check_cleanup_options() {
-  local listed parsed valued passed o a p sh n nl bad=0
+  local listed valued passed o n nl bad=0
   nl=$'\n'
   # A root without the helper documents no helper, so it carries no obligation -- the same rule as
   # the drift guard's sync script and the slot count's worker.
@@ -1213,46 +1071,15 @@ check_cleanup_options() {
     ko "$CLEANUP_HELPER" "has no $CLEANUP_PROMPT to document its options in"
     return 0
   fi
-  listed=$(usage_options "$ROOT/$CLEANUP_HELPER")
-  if [ -z "$listed" ]; then
-    # Not a pass: an empty register would hold the prompt to nothing, in silence.
-    ko "$CLEANUP_HELPER" "usage() lists no options this reader can see: a heredoc line opening with two blanks and a --name"
+  if ! listed=$(usage_options "$ROOT/$CLEANUP_HELPER"); then
+    ko "$CLEANUP_HELPER" "run with no arguments, it printed no usage text: it must exit 2 with a stderr opening 'usage: ' (see usage_options)"
     return 0
   fi
-  # usage()'s arity against the parser's, both ways by name: the arity is what the prompt's
-  # values are skipped by, so a placeholder the parser does not back is a register that lies.
-  parsed=$(parser_options "$ROOT/$CLEANUP_HELPER")
-  case "$parsed" in *'!'$'\t'*)
-    # A parser outside the grammar is not compared arm by arm: which arm runs is what is unread.
-    ko "$CLEANUP_HELPER" "the option parser is not one this reader can read: ${parsed##*!$'\t'} (see parser_options)"
-    bad=1; parsed="" ;;
-  "")
-    ko "$CLEANUP_HELPER" "has no option parser this reader can see: a 'while [ \"\$#\" -gt 0 ]; do' line, then 'case \"\$1\" in' and '--name)' arms"
-    bad=1 ;;
-  esac
-  while IFS=$'\t' read -r o a; do
-    [ -n "$o" ] || continue
-    [ -n "$parsed" ] || break
-    p=$(printf '%s\n' "$parsed" | awk -F'\t' -v o="$o" '$1 == o { print $2; exit }')
-    if [ -z "$p" ]; then
-      ko "$CLEANUP_HELPER" "usage() lists '$o', for which the option parser has no '$o)' arm"; bad=1
-    elif [ "$p" = "?" ]; then
-      ko "$CLEANUP_HELPER" "the parser's '$o)' arm is not one this reader can read: it needs exactly one 'shift' or 'shift N' among straight-line statements -- plain assignment words and '[ … ] || usage' guards (see parser_options)"; bad=1
-    elif [ "$p" != "$a" ]; then
-      sh=shift; [ "$p" -eq 0 ] || sh="shift $((p + 1))"
-      if [ "$a" = 1 ]; then
-        ko "$CLEANUP_HELPER" "usage() lists '$o' with a <value> placeholder, but its parser arm does '$sh' and takes none: the placeholder is what the prompt's values are skipped by (ludics-lite#302)"
-      else
-        ko "$CLEANUP_HELPER" "usage() lists '$o' with no <value> placeholder, but its parser arm does '$sh' and takes a value (ludics-lite#302)"
-      fi
-      bad=1
-    fi
-  done <<<"$listed"
-  while IFS=$'\t' read -r o a; do
-    [ -n "$o" ] || continue
-    printf '%s\n' "$listed" | awk -F'\t' -v o="$o" '$1 == o { f = 1 } END { exit !f }' \
-      || { ko "$CLEANUP_HELPER" "the option parser takes '$o', which usage() does not list"; bad=1; }
-  done <<<"$parsed"
+  if [ -z "$listed" ]; then
+    # Not a pass: an empty register would hold the prompt to nothing, in silence.
+    ko "$CLEANUP_HELPER" "usage() lists no options this reader can see: a usage line opening with two blanks and a --name"
+    return 0
+  fi
   valued=$(printf '%s\n' "$listed" | awk -F'\t' '$2 == 1 { printf "%s ", $1 }')
   listed=$(printf '%s\n' "$listed" | cut -f1)
   n=$(printf '%s\n' "$listed" | grep -c .)
@@ -1271,7 +1098,7 @@ check_cleanup_options() {
     esac
   done <<<"$passed"
   [ "$bad" -ne 0 ] \
-    || ok "$CLEANUP_PROMPT and $CLEANUP_HELPER's usage() agree on the helper's options ($n listed), and usage() agrees with its parser on each one's arity"
+    || ok "$CLEANUP_PROMPT and $CLEANUP_HELPER's usage() agree on the helper's options ($n listed)"
 }
 
 # --- relative links and anchors ----------------------------------------------------------------
