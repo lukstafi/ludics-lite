@@ -695,7 +695,15 @@ classified against the new head rather than matched to the one it named (the lud
 ordering, now a property of the round); a push landing AFTER the round's head read cannot
 re-anchor the state to a head the round classified nothing against (the P2 rebutted in the review
 of ludics-lite#84); and a round that did not answer publishes nothing, so the state read after it
-reads the feeds itself, as does a `status` asked after the watch has ended.
+reads the feeds itself, as does a `status` asked after the watch has ended. And an approval is
+reported only over closed threads (ludics-lite#289): one with an open review thread under it is
+`unresolved`, naming each thread, on the one GraphQL `reviewThreads` read that only an approval
+costs; that read pages to the end, and a connection whose stated count leads its rows, one still
+paging at the cap, a row that did not parse and a GraphQL outage are each `unknown` (exit 3),
+never a clean approval. `test-pr-review-watch.sh` runs PR #277's two-head shape through a watch
+(findings on the previous head scrolled past as NOT about head, the 👍 on the head above it), and
+`test-pr-review-merge.sh` pins `merge` refusing on an open thread (exit 1, no flag bypassing it)
+and on an unread connection (exit 3), with one read per merge.
 `test-pr-review-base-drift.sh` pins the other half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
 which stands still on a conflicted PR.
 
