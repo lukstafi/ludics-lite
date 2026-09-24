@@ -37,6 +37,28 @@ the wait-and-proceed shape. A `DONE` line is a returned turn and nothing more (S
 Supervise: *A returned turn means the turn ended*): read the final output for a request or a
 result before calling the issue finished.
 
+## Blocking in a headless turn
+
+A CLI worker's turn ending is its process ending: `claude -p` or `codex exec` exits, and every
+background task it started dies with it, so no watch survives to wake it, no notification or
+heartbeat reaches it, and only the coordinator's `unstick` runs it again (2026-09-23: the
+ocannl#1032 worker armed `pr-review.sh watch` and a CI wait in the background, ended its turn on
+"the watch will wake me", and left an exited session with no watch running; ludics-lite#361).
+The brief of every CLI worker carries this, and tells it to block inside the turn on every watch,
+wait and suite until the command returns - bounded calls re-issued, never an `until`/`sleep`
+loop:
+
+- a Claude worker runs anything that can outlast the 600 s foreground cap under `bg-run.sh`, as
+  [native-claude.md, *Blocking on a run*](native-claude.md#blocking-on-a-run) says: `start` as a
+  background task, then foreground `wait` calls re-issued in the SAME turn until one prints
+  `rc=`. The backgrounded `start` holds the command only while the turn lasts;
+- a Codex worker keeps the command in the foreground of its turn, as
+  [native-codex.md](native-codex.md#what-a-returned-turn-means) says.
+
+`attach` marks a `DONE` line `PROBABLE STRAND` when the turn's final message announces a wait
+still pending (its header lists the phrases it reads); treat it as a returned turn whose watch
+is gone, and `unstick` the session with the wait to run in the foreground.
+
 ## Supervising
 
 - **The stall test is `fleet-worker.sh status <box> <name>`**: one line with the session's

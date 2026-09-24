@@ -1008,6 +1008,15 @@ expect "ls reports it as ORPHANED too" 0 "testbox/wv ORPHANED" -- "$FW" ls testb
 t0=$(date +%s)
 expect "attach waits for the orphan to exit and then reports VANISHED" 3 "VANISHED testbox/wv" -- "$FW" attach testbox wv --interval 1
 [ $(( $(date +%s) - t0 )) -ge 2 ] && ok "attach held while the orphan lived" || ko "attach returned before the orphan exited"
+# ludics-lite#361: a DONE turn that ended announcing a pending wait is marked, not failed.
+printf 'The watch is ARMED; it will wake me\n' > "$TMP/strand.md"
+"$FW" launch testbox wst --target-repo example/project --kind claude --brief "$TMP/strand.md" --cwd "$proj" >/dev/null
+expect "a final message announcing a pending wait marks DONE as a PROBABLE STRAND, exit still 0" 0 \
+  'DONE testbox/wst exit=0 .* | PROBABLE STRAND: the final message says "will wake me"' -- "$FW" attach testbox wst --interval 1
+printf 'The watch returned rc=0 and it merged\n' > "$TMP/nostrand.md"
+"$FW" launch testbox wns --target-repo example/project --kind claude --brief "$TMP/nostrand.md" --cwd "$proj" >/dev/null
+out=$("$FW" attach testbox wns --interval 1 2>&1)
+grep -q '^DONE testbox/wns ' <<<"$out" && ! grep -q 'PROBABLE STRAND' <<<"$out" && ok "a final message with no listed phrase is a plain DONE" || ko "unlisted final message: $out"
 }
 
 section "unstick" && {
@@ -1165,6 +1174,10 @@ expect "a resumed turn that emits nothing is FAILED even though the first turn s
   env SHIM_CODEX_SILENT_RESUME=1 bash -c '"$0" unstick testbox c1 --message "$1" && "$0" attach testbox c1 --interval 1' "$FW" "$TMP/msg.md"
 "$FW" unstick testbox c1 --message "$TMP/msg.md" >/dev/null
 expect "the resumed codex turn's verdict carries the NEW message, from the stream" 0 "DONE testbox/c1 exit=0 turn.completed .*| codex did: Stop and answer now" -- "$FW" attach testbox c1 --interval 1
+printf 'Watch armed; it wakes me later\n' > "$TMP/cstrand.md"
+"$FW" launch testbox cst --target-repo example/project --kind codex --brief "$TMP/cstrand.md" --cwd "$proj" >/dev/null
+expect "a codex turn's last agent message is read for the strand mark too" 0 \
+  'DONE testbox/cst exit=0 turn.completed .* | PROBABLE STRAND: the final message says "wakes me"' -- "$FW" attach testbox cst --interval 1
 }
 
 section "halt" && {
