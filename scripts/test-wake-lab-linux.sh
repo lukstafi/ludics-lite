@@ -53,7 +53,9 @@ cat >"$tmp/bin/python3" <<'PYTHON'
 exit 0
 PYTHON
 chmod +x "$tmp/bin"/*
-export PATH="$tmp/bin:$PATH" SSH_LOG="$tmp/ssh.log" WAKE_LAB_HOSTS="$tmp/hosts.sh" WAKE_LAB_LOCK_DIR="$tmp/locks"
+# WAKE_LAB_FLEET_WORKER: status reads the execution registry, and this suite must not read the real one.
+export PATH="$tmp/bin:$PATH" SSH_LOG="$tmp/ssh.log" WAKE_LAB_HOSTS="$tmp/hosts.sh" WAKE_LAB_LOCK_DIR="$tmp/locks" \
+  WAKE_LAB_FLEET_WORKER="$tmp/absent-fleet-worker.sh"
 mkdir -p "$WAKE_LAB_LOCK_DIR"
 fail=0
 check() { if eval "$2"; then echo "PASS: $1"; else echo "FAIL: $1"; fail=$((fail+1)); fi; }
@@ -71,6 +73,50 @@ check 'Linux status shows the live sleep block inhibitor and who holds it' '[ "$
 check '...and leaves out the desktop key and lid blocks that refuse no verb' '[[ "$out" != *"gsd-media-keys"* ]] && [[ "$out" != *"gsd-power"* ]]'
 out=$(SSH_UP=1 SSH_INHIBIT_FAIL=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
 check 'an unreadable inhibitor listing is unknown, not none' '[ "$rc" = 0 ] && [[ "$out" == *"sleep-blocks=?"* ]]'
+# ludics-lite#359: status asks each lab lock's flock, because the text outlives the holder. The
+# lane lock is held the way the sweep holds it (a descriptor kept open, flock taken by a perl that
+# exits), and `7>&-` keeps status from inheriting it. The hold lock's line names a dead holder.
+sl="$tmp/status-locks"; mkdir -p "$sl"
+printf 'ocannl sweep 20260924T051741Z (pid 76065, since 20260924T051742Z)\n' >"$sl/tuf.lock"
+printf 'wake-lab sleep (pid 63477, since 20260923T220025Z)\n' >"$sl/tuf.hold.lock"
+perl -e 'utime time - 93784, time - 93784, $ARGV[0]' "$sl/tuf.hold.lock"
+lock_sums=$(cksum "$sl/tuf.lock" "$sl/tuf.hold.lock")
+lock_free() { perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <"$1"; }
+exec 7>>"$sl/tuf.lock"
+perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <&7; took=$?
+check 'control: the suite holds the lane lock' '[ "$took" = 0 ] && ! lock_free "$sl/tuf.lock"'
+out=$(WAKE_LAB_LOCK_DIR="$sl" SSH_UP=1 "$tmp/wake-lab.sh" status tuf 7>&- 2>&1); rc=$?
+check 'a held lane lock reads held, with its holder line and the age of that line' '[ "$rc" = 0 ] && [[ "$out" == *"lane-lock=held"* ]] && [[ "$out" == *"lane lock: held by ocannl sweep 20260924T051741Z (pid 76065, since 20260924T051742Z) (line written "[0-9]*"s ago)"* ]]'
+check 'a free lock with a leftover line reads free, showing the line as stale text with its age' '[[ "$out" == *"hold-lock=free"* ]] && [[ "$out" == *"hold lock: free, stale text (written 1d02h ago): wake-lab sleep (pid 63477, since 20260923T220025Z)"* ]]'
+check '...and status left both files as it found them' '[ "$(cksum "$sl/tuf.lock" "$sl/tuf.hold.lock")" = "$lock_sums" ]'
+check '...and the lane lock still held by its holder' '! lock_free "$sl/tuf.lock"'
+exec 7>&-
+out=$(WAKE_LAB_LOCK_DIR="$sl" SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'once its holder lets go, the same lane lock reads free with its line as stale text' '[ "$rc" = 0 ] && [[ "$out" == *"lane-lock=free"* ]] && [[ "$out" == *"lane lock: free, stale text (written "*"ocannl sweep 20260924T051741Z"* ]]'
+rm -f "$sl/tuf.lock" "$sl/tuf.hold.lock"
+out=$(WAKE_LAB_LOCK_DIR="$sl" SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'with no lock files both locks read free, with no detail line' '[ "$rc" = 0 ] && [[ "$out" == *"lane-lock=free  hold-lock=free"* ]] && [[ "$out" != *" lock: "* ]]'
+check '...and status created no lock file' '[ -z "$(ls -A "$sl")" ]'
+# The reservations column, from a stub registry reader; `?` whenever the registry was not read.
+cat >"$tmp/fleet-worker.sh" <<'FW'
+#!/usr/bin/env bash
+[ "$*" = "execution list --active --compact" ] || exit 9
+printf '%s' "${FW_LISTING-}"; exit "${FW_RC:-0}"
+FW
+chmod +x "$tmp/fleet-worker.sh"
+listing='[{"request_id":"w-359-tuf-1","request":{"execution_host":"tuf-amd-linux"},"state":"launching"},
+{"request_id":"w-359-mac","request":{"execution_host":"mac-studio"},"state":"running"},
+{"request_id":"w-360-tuf-2","request":{"execution_host":"tuf-amd-linux"},"state":"dispatched"}]'
+out=$(WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING="$listing" SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'status counts the active reservations naming the box, and lists them' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=2"* ]] && [[ "$out" == *"reservation: w-359-tuf-1 (launching)"* ]] && [[ "$out" == *"reservation: w-360-tuf-2 (dispatched)"* ]] && [[ "$out" != *"w-359-mac"* ]]'
+out=$(WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING='[]' SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'an empty registry is zero reservations' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=0"* ]] && [[ "$out" != *"reservation: "* ]]'
+out=$(WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING='[]' FW_RC=4 SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'an unreachable registry is unknown, not zero' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=?"* ]]'
+out=$(WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING='EXECUTION REFUSED' SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'a registry listing that is not a JSON list is unknown, not zero' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=?"* ]]'
+out=$(SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'a missing registry reader is unknown, not zero' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=?"* ]]'
 out=$(SSH_UP=tuf-amd-win "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
 check 'Linux-configured TUF reports an alternate Windows boot' '[ "$rc" = 0 ] && [[ "$out" == *"os=windows"* ]]'
 out=$(SSH_UP=tuf-amd-wsl "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?

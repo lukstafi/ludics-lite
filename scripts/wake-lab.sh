@@ -10,7 +10,9 @@
 #   wake-lab.sh [rog|minix|tuf|all]       wake (default: rog minix; all: rog minix tuf)
 #   wake-lab.sh --wait [--wsl] rog        wake, then poll until configured OS answers
 #   wake-lab.sh --wait --restart-wsl rog  ...and start WSL from a FRESH VM (wsl --shutdown first)
-#   wake-lab.sh status [box...]           per-box reachability and reached OS (default: all three)
+#   wake-lab.sh status [box...]           per-box reachability and reached OS, whether each lab lock
+#                                         is really held, and the box's execution reservations
+#                                         (default: all three)
 #   wake-lab.sh sleep|hibernate|down box  suspend / hibernate / full shutdown
 #   wake-lab.sh kick-wsl box              start the WSL VM (it never autostarts at boot)
 #   wake-lab.sh restart-wsl box           shut the WSL VM down and start it again
@@ -304,19 +306,26 @@ status_one() { # status_one <box>
       esac
     fi
   fi
+  lab_locks_fields "$1"
+  reservations_fields "$1"
   printf '\n'
   [ -z "$blocks" ] || printf '%s\n' "$blocks" | sed 's/^/         block: /'
+  printf '%s' "$LOCK_DETAILS" "$RES_DETAILS"
 }
 
 do_status() {
   local n wsl_boxes=()
-  echo "box    router-active   reached OS and ssh endpoint"
+  reservations_read
+  echo "box    router-active   reached OS and ssh endpoint, lab locks, execution reservations"
   for n in "$@"; do status_one "$n"; done
   echo
   for n in "$@"; do [ "$(kind_of "$n")" = wsl ] && wsl_boxes+=("$n"); done
   [ ${#wsl_boxes[@]} -gt 0 ] && wsl_status_extra "${wsl_boxes[@]}"
   echo "sleep-blocks counts a native Linux box's logind block inhibitors on sleep (listed under it):"
   echo "while one is held, 'sleep' and 'hibernate' there are refused by the OS, whatever the lab locks say."
+  echo "lane-lock and hold-lock ask each lab lock's flock on THIS machine, not its text: 'held' means a"
+  echo "destroyer would be refused now; a 'free' lock's leftover line is shown as stale text. reservations"
+  echo "counts the active 'fleet-worker.sh execution list' records naming the box (? = registry unread)."
   echo "router-active is the router's NewActive bit for the Ethernet MAC, not the NIC's link state:"
   echo "minutes after a shutdown or hibernate, 1 is a stale DHCP lease still aging out; once settled,"
   echo "1 on a powered-off box means the NIC holds link and is WoL-armed."
@@ -457,6 +466,97 @@ lock_holder() { # lock_holder <path>
   local line
   line=$(head -1 "$1" 2>/dev/null | tr -d '\000-\037')
   printf '%s' "${line:-held by an unnamed holder}"
+}
+
+# What `status` says about a box's lab locks (ludics-lite#359). A lock file's line outlives its
+# holder -- the kernel drops the flock when the holder dies, however it dies, and nothing rewrites
+# the line -- so the text alone cannot say whether anything is using the box; on 2026-09-24 all six
+# lock files named holders and none of the four pids was alive. The flock can say it, so this asks
+# the flock: a non-blocking SHARED take on a read-only descriptor of the probe's own, dropped as the
+# probe exits. Every taker here and in the sweep takes these locks EXCLUSIVE, so a refused shared
+# take is exactly "a destroyer would be refused right now". The probe creates no file, writes no
+# line and holds nothing past its own instant; the one effect it can have is that a destroyer's
+# non-blocking take landing in that instant is refused, which fails closed.
+# What it reads, and nothing else: whether the file exists, its flock, its mtime (when a holder last
+# wrote the line, which is when it took the lock), and its first line. The line is SHOWN, stripped of
+# control characters, and never parsed: no pid in it is looked up and no state is taken from it.
+lock_probe() { # lock_probe <path> — "held|free|unknown <age-seconds|?> <first line>", or "absent"
+  perl -e '
+    use Fcntl ":flock";
+    my $p = shift;
+    -e $p or do { print "absent\n"; exit 0 };
+    open(my $fh, "<", $p) or do { print "unknown ?\n"; exit 0 };
+    my $age = time - (stat $fh)[9]; $age = 0 if $age < 0;
+    my $line = <$fh>; $line = "" unless defined $line; $line =~ s/[\x00-\x1f\x7f]//g;
+    my $st = flock($fh, LOCK_SH | LOCK_NB) ? "free" : ($!{EWOULDBLOCK} ? "held" : "unknown");
+    print "$st $age $line\n";' "$1" 2>/dev/null || printf 'unknown ?\n'
+}
+
+fmt_age() { # fmt_age <seconds> — 45s, 12m, 2h13m, 3d04h
+  local s=$1
+  case "$s" in ''|*[!0-9]*) printf '?'; return ;; esac
+  if [ "$s" -lt 60 ]; then printf '%ds' "$s"
+  elif [ "$s" -lt 3600 ]; then printf '%dm' $((s / 60))
+  elif [ "$s" -lt 86400 ]; then printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+  else printf '%dd%02dh' $((s / 86400)) $((s % 86400 / 3600)); fi
+}
+
+# The lane-lock= and hold-lock= columns of a box's status line, printed; the lines that name each
+# lock's text go to LOCK_DETAILS for the caller to print under the status line. `free` with no
+# detail line is a lock with no file or an empty one: nothing has ever claimed it, or nothing said who.
+LOCK_DETAILS=""
+lab_locks_fields() { # lab_locks_fields <box>
+  local which path st age text
+  LOCK_DETAILS=""
+  for which in lane hold; do
+    if [ "$which" = lane ]; then path=$(lab_lock_path "$1"); else path=$(hold_lock_path "$1"); fi
+    read -r st age text <<<"$(lock_probe "$path")"
+    case "$st" in
+      absent) printf '  %s-lock=free' "$which"; continue ;;
+      held|free) printf '  %s-lock=%s' "$which" "$st" ;;
+      *) printf '  %s-lock=?' "$which"
+         LOCK_DETAILS+=$(printf '         %s lock: could not be probed: %s' "$which" "$path")$'\n'
+         continue ;;
+    esac
+    if [ "$st" = held ]; then
+      LOCK_DETAILS+=$(printf '         %s lock: held by %s (line written %s ago)' "$which" \
+        "${text:-an unnamed holder}" "$(fmt_age "$age")")$'\n'
+    elif [ -n "$text" ]; then
+      LOCK_DETAILS+=$(printf '         %s lock: free, stale text (written %s ago): %s' "$which" \
+        "$(fmt_age "$age")" "$text")$'\n'
+    fi
+  done
+}
+
+# The reservations= column: how many of the fleet's active execution reservations name this box as
+# their execution host, with each one's id and state listed under the line. Read once per `status`
+# from `fleet-worker.sh execution list --active`, the issue-wave skill's own registry reader in this
+# checkout (WAKE_LAB_FLEET_WORKER overrides the path), under the probe cap, because that reader
+# asks the anchor box over ssh from anywhere else. A registry that cannot be read or does not parse
+# is `?`, never 0: "nothing reserved" and "could not look" call for opposite conclusions.
+RESERVATIONS=""   # the listing as JSON; empty means it could not be read
+RES_DETAILS=""
+reservations_read() {
+  local dir fw
+  RESERVATIONS=""
+  if [ -n "${WAKE_LAB_FLEET_WORKER:-}" ]; then fw=$WAKE_LAB_FLEET_WORKER
+  else dir=$(script_dir) || return 0; fw=$dir/../issue-wave/scripts/fleet-worker.sh; fi
+  [ -x "$fw" ] || return 0
+  RESERVATIONS=$(capped "$PROBE_CAP" "$fw" execution list --active --compact 2>/dev/null </dev/null) \
+    || RESERVATIONS=""
+}
+reservations_fields() { # reservations_fields <box>
+  local host ids n
+  RES_DETAILS=""
+  host=$(linux_of "$1") || host=""
+  if [ -z "$RESERVATIONS" ] || [ -z "$host" ] || ! ids=$(jq -r --arg h "$host" \
+       'if type == "array" then .[] | select(.request.execution_host == $h)
+          | "\(.request_id) (\(.state))" else error("not a list") end' <<<"$RESERVATIONS" 2>/dev/null); then
+    printf '  reservations=?'; return 0
+  fi
+  n=0; [ -z "$ids" ] || n=$(printf '%s\n' "$ids" | wc -l | tr -d ' ')
+  printf '  reservations=%s' "$n"
+  [ -z "$ids" ] || RES_DETAILS=$(printf '%s\n' "$ids" | sed 's/^/         reservation: /')$'\n'
 }
 
 # Every lock descriptor in this script stays BELOW 10, and that is not a style choice. bash 3.2
@@ -658,15 +758,21 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 }
 
 # ---------------------------------------------------------------- dispatch
-load_wsl_adapter() {
-  [ "${WSL_ADAPTER_LOADED:-0}" = 1 ] && return 0
+script_dir() { # the directory this script really lives in, through the ~/bin symlink
   local path=$0 link
   while [ -L "$path" ]; do
     link=$(readlink "$path") || return 1
     case "$link" in /*) path=$link ;; *) path=$(dirname "$path")/$link ;; esac
   done
+  dirname "$path"
+}
+
+load_wsl_adapter() {
+  [ "${WSL_ADAPTER_LOADED:-0}" = 1 ] && return 0
+  local dir
+  dir=$(script_dir) || return 1
   # shellcheck source=scripts/wake-lab-wsl.sh
-  . "$(dirname "$path")/wake-lab-wsl.sh" || return 1
+  . "$dir/wake-lab-wsl.sh" || return 1
   WSL_ADAPTER_LOADED=1
 }
 
