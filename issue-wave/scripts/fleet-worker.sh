@@ -85,23 +85,25 @@
 #   FLEET_BOXES: whole fleet; "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux". `ls` sweeps it minus local.
 #   FLEET_BOX_CORRECTNESS_SLOTS: `<box>=<n>` pairs, how many correctness executions may share a
 #     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" whenever the roster is the
-#     default one, beside "rog-nv-linux=2 minix-amd-linux=2" in the same value, whether
-#     FLEET_BOXES is unset or exports those same boxes (compared as a word set,
+#     default one, beside "rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3" in the same
+#     value, whether FLEET_BOXES is unset or exports those same boxes (compared as a word set,
 #     ludics-lite#329); empty (one slot everywhere) with a custom FLEET_BOXES. Set, even to
 #     empty, it overrides the default either way. `preflight` prints the count per roster box.
 #     Measurement stays exclusive.
 #     Six, not three (ludics-lite#160): three `-j 4` batches ran side by side on the Mac without
 #     a stall on 2026-09-15 and the Developer Tools exemption removed the XProtect tax, and the
 #     cap exists to bound concurrent load, never to bound how many agents may be in flight.
-#     Two on each native GPU box (ludics-lite#316, measured 2026-09-23 with targeted batches at
-#     ahrefs/ocannl#1029's widths): rog's two `-j 8` cuda batches were green, and its first
-#     rung of three all-cuda batches (21 GPU processes) had one CUDA_ERROR_OUT_OF_MEMORY that
-#     the repeat did not reproduce, so three is not yet a measured-safe count. Two test-only
-#     cuda batches also contend (107 s together against 80 s back to back, while a cc batch
-#     beside them costs nothing). The second slot is kept for overlapping one batch's compile
-#     with another's tests, which those cache-restored batches did not measure. minix's two
-#     `-j 4` hip batches were green and are its ceiling: the gfx1151's SDMA pool is 8 queues
-#     for the whole device, so slots x width must stay at or under 8. tuf is not measured.
+#     The native GPU boxes' counts were measured with 1-4 concurrent targeted batches, each box
+#     under an exclusive reservation (ludics-lite#316 on 2026-09-23, #344 on 2026-09-24), and
+#     every batch compiled the tree (dune's cache restored nothing). OCANNL's tools/box-jobs.sh
+#     restates each count and injects the width it was measured at (ahrefs/ocannl#1033), so
+#     a change here goes there too. minix-amd-linux four, at `-j 4`: 16 hip-width at once was
+#     green three ways (four `-j 4` batches, two `-j 8`, a full unit at `-j 16`) and 12 twice,
+#     and only dune's default 32 has drained its device-wide SDMA pool. tuf-amd-linux three, at
+#     `-j 8`: three `-j 8` hip batches were green on its discrete gfx1102. rog-nv-linux two, at
+#     `-j 8`: rungs of three or more concurrent cuda batches hit CUDA_ERROR_OUT_OF_MEMORY in 2
+#     of 6 (10 of its 12 GiB in use), while two cuda batches beside one or two cc batches were
+#     green -- so what could raise it is a count per GPU kind, which slots do not express.
 #   FLEET_SKILLS_REPO: skills checkout on each box; ~/ludics-lite.
 #   ISSUE_WAVE_STATE: local worker-state directory; ~/.local/state/issue-wave.
 #   FLEET_SLOT_STATE: where `execution slot` keeps a box's run-time slot locks;
@@ -163,7 +165,7 @@ roster_words() {
 # every box's ~/.config/fleet/env.sh exported the default roster verbatim, and a test on the
 # variable's presence silently dropped mac-studio to one slot for a day (ludics-lite#329).
 if [ "$(roster_words "$BOXES")" = "$(roster_words "$DEFAULT_BOXES")" ]; then DEFAULT_ROSTER=1; else DEFAULT_ROSTER=0; fi
-SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ "$DEFAULT_ROSTER" = 0 ] || echo mac-studio=6 rog-nv-linux=2 minix-amd-linux=2)}"
+SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ "$DEFAULT_ROSTER" = 0 ] || echo mac-studio=6 rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3)}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 # Run-time correctness slots (`execution slot`) are a property of the BOX, so their lock files
@@ -684,7 +686,7 @@ cmd_preflight() {
 # the site default gives more than one slot. Never changes the preflight's verdict.
 slots_report() {
   local b n named out="" src
-  local -a roster=() spec=() widened=(mac-studio rog-nv-linux minix-amd-linux)
+  local -a roster=() spec=() widened=(mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux)
   read -r -d "" -a roster <<< "$BOXES" || :
   read -r -d "" -a spec <<< "$SLOTS" || :
   for b in ${roster[@]+"${roster[@]}"}; do

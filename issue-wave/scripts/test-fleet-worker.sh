@@ -701,7 +701,7 @@ expect "mac-studio with the default roster notes a sleeping TUF and still passes
 # this file as a statement of the site default, and this is a count the fixture configured.
 PFROSTER="mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
 PFM=(env FLEET_LOCAL_BOX=mac-studio "$FW" preflight mac-studio --no-probe --no-cross)
-expect "preflight prints the site default's slot counts under an exported default roster" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=2 minix-amd-linux=2 tuf-amd-linux=1 (site default)$" -- \
+expect "preflight prints the site default's slot counts under an exported default roster" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3 (site default)$" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="$PFROSTER" "${PFM[@]}"
 grep -q "WARNING" <<<"$out" && ko "...and warns about a configuration that is the site default -- $out" || ok "...and warns about nothing"
 # The other direction of that pairing: the boxes the site default widens, read off its own line,
@@ -721,16 +721,17 @@ grep -q "^PREFLIGHT OK mac-studio" <<<"$out" && grep -q "^PREFLIGHT SLOTS mac-st
   && ok "...beside the OK line and the counts it names" || ko "the collapse warning lost the OK line or the counts -- $out"
 expect "...as is an explicitly empty spec" 0 "PREFLIGHT SLOTS WARNING: .* does not name mac-studio" -- \
   env FLEET_BOX_CORRECTNESS_SLOTS="" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
-expect "a spec naming every widened box at one slot is a choice, printed without a warning" 0 "^PREFLIGHT SLOTS mac-studio[=]1 rog-nv-linux[=]1 minix-amd-linux[=]1 .*(FLEET_BOX_CORRECTNESS_SLOTS)$" -- \
-  env FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=1 rog-nv-linux=1 minix-amd-linux=1" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
+expect "a spec naming every widened box at one slot is a choice, printed without a warning" 0 "^PREFLIGHT SLOTS mac-studio[=]1 rog-nv-linux[=]1 minix-amd-linux[=]1 tuf-amd-linux[=]1 (FLEET_BOX_CORRECTNESS_SLOTS)$" -- \
+  env FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=1 rog-nv-linux=1 minix-amd-linux=1 tuf-amd-linux=1" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
 grep -q "WARNING" <<<"$out" && ko "a spec naming every widened box at one slot drew a collapse warning -- $out" || ok "...and no warning"
 # The hub's 2026-09-23 mitigation shape: a spec naming only the Mac collapses the native GPU boxes
 # (ludics-lite#316), so it warns about each of them and not about mac-studio.
 expect "a spec naming only mac-studio warns about each native GPU box it leaves at one slot" 0 "does not name rog-nv-linux, which falls to one slot" -- \
   env FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=4" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
-grep -q "does not name minix-amd-linux, which falls" <<<"$out" && ! grep -q "does not name mac-studio" <<<"$out" \
-  && ok "...minix-amd-linux too, and not the Mac it names" || ko "the per-box collapse warnings are wrong -- $out"
-expect "a roster over several lines prints every box" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=2 minix-amd-linux=2 tuf-amd-linux=1 (site default)$" -- \
+grep -q "does not name minix-amd-linux, which falls" <<<"$out" && grep -q "does not name tuf-amd-linux, which falls" <<<"$out" \
+  && ! grep -q "does not name mac-studio" <<<"$out" \
+  && ok "...minix-amd-linux and tuf-amd-linux too, and not the Mac it names" || ko "the per-box collapse warnings are wrong -- $out"
+expect "a roster over several lines prints every box" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3 (site default)$" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="mac-studio rog-nv-linux
 minix-amd-linux tuf-amd-linux" "${PFM[@]}"
 expect "a custom roster prints one slot each, without a warning" 0 "^PREFLIGHT SLOTS testbox=1 otherbox=1 (custom roster: one slot each)$" -- \
@@ -1358,8 +1359,8 @@ expect "...and a spec naming a box outside the roster, as the registry refuses i
 expect "a pipeline under the slot dies of SIGPIPE exactly as it does unwrapped" 141 "slot 1 of 1" -- \
   "${FWS[@]}" execution slot -- bash -c 'set -o pipefail; yes | head -n1 >/dev/null'
 grep -q "Broken pipe" <<<"$out" && ko "the wrapped pipeline reported a broken pipe the bare one does not" || ok "...and without the diagnostic the bare pipeline never prints"
-# The site default, the number the references quote: six on mac-studio (ludics-lite#160), two
-# on each native GPU box (ludics-lite#316), and one anywhere the spec does not name -- which is every box under a custom FLEET_BOXES.
+# The site default, the number the references quote: six on mac-studio (ludics-lite#160), the
+# measured counts on the native GPU boxes (ludics-lite#316, #344), and one anywhere the spec does not name -- which is every box under a custom FLEET_BOXES.
 # The default applies whenever the roster IS the default one (ludics-lite#329): on 2026-09-22 every
 # box's env.sh began exporting FLEET_BOXES with exactly the default boxes, and a test on the
 # variable's presence dropped mac-studio to one slot for a day. Each case sets or unsets both
@@ -1368,14 +1369,14 @@ DEFROSTER="mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
 FWM=(env FLEET_LOCAL_BOX=mac-studio FLEET_ANCHOR=mac-studio)
 expect "the site default gives mac-studio six run-time slots" 0 "slot 1 of 6" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES "${FWM[@]}" "$FW" execution slot --wait 0 -- echo default-cap
-# Two on each native GPU box (ludics-lite#316), and one on tuf-amd-linux, which the default does
-# not name. Each box is its own anchor here, so the registry read stays local.
-for box in rog-nv-linux minix-amd-linux; do
-  expect "...and $box two" 0 "slot 1 of 2" -- \
+# The native GPU boxes' measured counts (ludics-lite#316, #344): two on rog-nv-linux, four on
+# minix-amd-linux, three on tuf-amd-linux. Each box is its own anchor here, so the registry read
+# stays local.
+for pair in rog-nv-linux:2 minix-amd-linux:4 tuf-amd-linux:3; do
+  box=${pair%%:*} n=${pair#*:}
+  expect "...and $box $n" 0 "slot 1 of $n" -- \
     env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES FLEET_LOCAL_BOX=$box FLEET_ANCHOR=$box "$FW" execution slot --wait 0 -- echo default-cap
 done
-expect "...and tuf-amd-linux, which the default does not name, one" 0 "slot 1 of 1" -- \
-  env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES FLEET_LOCAL_BOX=tuf-amd-linux FLEET_ANCHOR=tuf-amd-linux "$FW" execution slot --wait 0 -- echo default-cap
 expect "...and so does an exported roster equal to the default (the 2026-09-22 shape)" 0 "slot 1 of 6" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS "${FWM[@]}" FLEET_BOXES="$DEFROSTER" "$FW" execution slot --wait 0 -- echo exported-default
 expect "...or the default boxes in another order and spacing (a word set, not a string)" 0 "slot 1 of 6" -- \
