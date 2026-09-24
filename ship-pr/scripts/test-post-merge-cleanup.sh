@@ -4895,9 +4895,12 @@ test_runner_kills_a_case_past_its_deadline() {
   # deadline together with its log, and the run still ends with its root removed.
   # The stall is a descendant that ignores TERM under a case shell that dies on it: the leader
   # vanishes at the first signal, and only a runner that watches the whole group escalates to
-  # KILL for what is left (a duration no other process on the box is sleeping for).
+  # KILL for what is left. The descendant writes its own pid before it execs, and the case reads
+  # that pid with pid_alive, the way the runner reads its groups, not with pgrep: Git for Windows
+  # ships no pgrep, where the check passed while checking nothing (ludics-lite#337).
   local tag="dl$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" rc marker patched
-  marker="sh -c 'trap \"\" TERM; exec sleep 3571.$$'"
+  local pidfile="$copy/stall.pid" stall_pid tries=0
+  marker="sh -c 'trap \"\" TERM; echo \$\$ >\"$pidfile\"; exec sleep 3571'"
   copy_runner "$copy" "$tag"
   patched=$(sed "s|^$SELF_CASE() {\$|$SELF_CASE() { $marker;|" "$copy/test-post-merge-cleanup.sh")
   printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
@@ -4911,8 +4914,16 @@ test_runner_kills_a_case_past_its_deadline() {
   grep -q "timed out after 2s (SHIP_PR_TEST_CASE_TIMEOUT); its process group was killed" "$out" ||
     fail "the stalled case was not reported against its deadline: $(cat "$out")"
   grep -q "^FAIL: 1 of 1 post-merge cleanup states failed" "$out" || fail "no failing summary: $(cat "$out")"
-  sleep 0.5
-  ! pgrep -f "sleep 3571\\.$$" >/dev/null 2>&1 || fail "the TERM-ignoring descendant survived the deadline: the runner stopped escalating at the leader"
+  [ -s "$pidfile" ] || fail "the planted descendant never wrote its pid, so nothing here checks it: $(cat "$out")"
+  stall_pid=$(cat "$pidfile")
+  # A settle, not a deadline: a descendant the runner never escalated to sleeps for an hour. The
+  # case only reads the pid and never signals it, since by now the pid may name another process.
+  while pid_alive "$stall_pid"; do
+    [ "$tries" -lt 20 ] ||
+      fail "the TERM-ignoring descendant (pid $stall_pid) survived the deadline: the runner stopped escalating at the leader"
+    sleep 0.1
+    tries=$((tries + 1))
+  done
   assert_copy_root_gone "$tag"
   echo "PASS: a case past its deadline is killed with its process group and reported"
 }
@@ -4986,8 +4997,12 @@ test_runner_cleans_up_after_a_closed_pipe() {
   # only state this outer case inspects. Bash 3.2 reports the closed external writer as SIGPIPE
   # (141), while Bash 5 can surface the failed builtin write as 1; both are nonzero closed-pipe
   # exits, and the cleanup contract is the same.
+  # The copy then runs a second time with SIGPIPE ignored, as the macOS CI runner starts it: there
+  # no writer dies of the signal, and each sees EPIPE and exits with its own status, which is how
+  # a -v path through BSD awk (exit 2) passed a local run and went red in CI (ludics-lite#338). A
+  # signal ignored when a shell starts stays ignored in it, so the only closed-pipe exit there is 1.
   local tag="pipe$$" copy="$TEST_ROOT/copy" err="$TEST_ROOT/copy.err" out="$TEST_ROOT/copy.out" patched
-  local copy_rc head_rc pipeline_statuses
+  local copy_rc head_rc pipeline_statuses sigpipe
   copy_runner "$copy" "$tag"
   patched=$(awk -v target="$SELF_CASE() {" '{
     print
@@ -5000,24 +5015,31 @@ test_runner_cleans_up_after_a_closed_pipe() {
   grep -q '^  echo RUNNER_CLOSED_PIPE_HEAD$' "$copy/test-post-merge-cleanup.sh" ||
     fail "could not give the copy enough verbose output to close its pipe"
 
-  set +e
-  # A plain `runner -v | head -1` pipes stdout only. Keep stderr separate too: macOS Bash's known
-  # job-control diagnostic is written before the case redirections exist, but it is not output
-  # whose reader closed and must not race the deterministic stdout payload for head's one line.
-  run_copy "$copy/test-post-merge-cleanup.sh" -j 1 -v "$SELF_CASE" 2>"$err" | head -n 1 >"$out"
-  pipeline_statuses=("${PIPESTATUS[@]}")
-  set -e
-  copy_rc="${pipeline_statuses[0]}"
-  head_rc="${pipeline_statuses[1]}"
-  case "$copy_rc" in
-  1 | 141) ;;
-  *) fail "the copy exited $copy_rc after its pipe closed, expected 1 or 141" ;;
-  esac
-  [ "$head_rc" -eq 0 ] || fail "head exited $head_rc while closing the copy's pipe"
-  grep -Fqx RUNNER_CLOSED_PIPE_HEAD "$out" ||
-    fail "the closed-pipe run did not yield its deterministic first line: $(cat "$out")"
-  assert_copy_root_gone "$tag"
-  echo "PASS: -v piped to head -1 exits on the closed pipe and removes the scratch root"
+  for sigpipe in inherited ignored; do
+    rm -f "$err" "$out"
+    set +e
+    # A plain `runner -v | head -1` pipes stdout only. Keep stderr separate too: macOS Bash's known
+    # job-control diagnostic is written before the case redirections exist, but it is not output
+    # whose reader closed and must not race the deterministic stdout payload for head's one line.
+    {
+      [ "$sigpipe" = inherited ] || trap '' PIPE
+      run_copy "$copy/test-post-merge-cleanup.sh" -j 1 -v "$SELF_CASE"
+    } 2>"$err" | head -n 1 >"$out"
+    pipeline_statuses=("${PIPESTATUS[@]}")
+    set -e
+    copy_rc="${pipeline_statuses[0]}"
+    head_rc="${pipeline_statuses[1]}"
+    case "$sigpipe:$copy_rc" in
+    inherited:1 | inherited:141 | ignored:1) ;;
+    inherited:*) fail "the copy exited $copy_rc after its pipe closed, expected 1 or 141" ;;
+    *) fail "with SIGPIPE ignored the copy exited $copy_rc after its pipe closed, expected 1: $(cat "$err")" ;;
+    esac
+    [ "$head_rc" -eq 0 ] || fail "head exited $head_rc while closing the copy's pipe (SIGPIPE $sigpipe)"
+    grep -Fqx RUNNER_CLOSED_PIPE_HEAD "$out" ||
+      fail "the closed-pipe run (SIGPIPE $sigpipe) did not yield its deterministic first line: $(cat "$out")"
+    assert_copy_root_gone "$tag"
+  done
+  echo "PASS: -v piped to head -1 exits on the closed pipe and removes the scratch root, with SIGPIPE inherited and ignored"
 }
 
 test_runner_term_midrun_exits_130() {
@@ -5541,6 +5563,18 @@ group_alive() {
     return
   fi
   [ "$(ps -A -o pgid=,stat= 2>/dev/null | awk -v g="$1" '$1 == g && $2 !~ /^Z/ { n++ } END { print n + 0 }')" -gt 0 ]
+}
+
+# pid_alive <pid>: the process is still running, zombies excluded — a killed orphan stays a
+# zombie for as long as PID 1 does not reap it, which in some containers is forever.
+pid_alive() {
+  if [ "$PROC_READING" = kill ]; then
+    kill -0 "$1" 2>/dev/null
+    return
+  fi
+  case "$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')" in
+  '' | Z*) return 1 ;;
+  esac
 }
 
 # case_pgid <pid>: the process's group, or nothing once it is gone.
