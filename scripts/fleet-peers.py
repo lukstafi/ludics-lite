@@ -251,6 +251,8 @@ def main():
         if len(parts) > 2 or not NAME.fullmatch(parts[-1]) or (len(parts) == 2 and not USER.fullmatch(parts[0])):
             parser.error(f'Invalid peer: {target}')
         host = parts[-1]
+        if host == 'local':
+            parser.error("'local' is fleet-worker.sh's name for the box it runs on, not a mesh member")
         if host == 'macbook-air':
             parser.error('macbook-air is a console, not a mesh member; no incoming fleet access is granted')
         if any(name == host for name, _ in targets):

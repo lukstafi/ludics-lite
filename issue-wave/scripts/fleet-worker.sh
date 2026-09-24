@@ -662,8 +662,10 @@ if [ -e "$tokf" ] || [ -L "$tokf" ]; then
     tokfix=$tokcopy; [ ! -d "$tokf" ] || [ -L "$tokf" ] || tokfix="remove the directory there first (mv would move the new file into it), then $tokcopy"
     note "~/.config/fleet/gh-token.sh on $BOX is not a regular mode-0600 file this user owns ($(printf '%s' "$tls" | awk '{print $1, "uid", $3}')): the PAT in it may be readable by others -- repair: $tokfix"
   else
-    # An empty GH_TOKEN is no token to gh: it falls back to GITHUB_TOKEN or a stored login.
-    ftok=$(unset GH_TOKEN; . "$tokf" >/dev/null 2>&1; printf '%s' "${GH_TOKEN-}")
+    # An empty GH_TOKEN is no token to gh: it falls back to GITHUB_TOKEN or a stored login. And
+    # an assignment without `export` never reaches gh, so the file's token is read through the
+    # environment (printenv), not as a shell variable.
+    ftok=$(unset GH_TOKEN; . "$tokf" >/dev/null 2>&1; printenv GH_TOKEN)
     if [ -z "$ftok" ]; then
       tokbad=1; note "~/.config/fleet/gh-token.sh on $BOX exports no GH_TOKEN -- repair: $tokcopy"
     elif [ -z "${GH_TOKEN-}" ]; then

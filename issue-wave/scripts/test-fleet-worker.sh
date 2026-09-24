@@ -788,6 +788,9 @@ expect "on the anchor, a mismatch says to re-source the file or open a new shell
 printf 'export GH_TOKEN=\n' > "$HOME/.config/fleet/gh-token.sh"
 expect "a gh-token.sh exporting an empty GH_TOKEN is replaced" 1 "gh-token.sh on testbox exports no GH_TOKEN -- repair: replace it from the anchor" -- \
   env GH_TOKEN= "$FW" preflight testbox --native-claude --no-cross
+printf 'GH_TOKEN=ghp_dead\n' > "$HOME/.config/fleet/gh-token.sh"
+expect "...and so is one that assigns GH_TOKEN without exporting it" 1 "gh-token.sh on testbox exports no GH_TOKEN" -- \
+  env GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross
 printf 'export GH_TOKEN=ghp_dead\n' > "$HOME/.config/fleet/gh-token.sh"
 chmod 644 "$HOME/.config/fleet/gh-token.sh"
 expect "a group-readable gh-token.sh refuses even with a live token, with the replace-the-file repair" 1 "gh-token.sh on testbox is not a regular mode-0600 file this user owns (-rw-r--r-- uid [0-9]*).*repair: replace it from the anchor" -- \

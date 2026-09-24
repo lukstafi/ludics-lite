@@ -149,6 +149,15 @@ class MeshSafety(unittest.TestCase):
                 peers.main()
         self.assertEqual(error.exception.code, 2)
 
+    def test_local_sentinel_cannot_be_a_peer(self):
+        with patch('sys.argv', ['fleet-peers.py', '--peer', 'mac-studio', '--peer', 'local']), \
+             patch.object(peers, 'run', return_value='{"Self":{"DNSName":"mac-studio.example.ts.net."}}'), \
+             patch.object(peers, 'invoke') as invoke:
+            with self.assertRaises(SystemExit) as error:
+                peers.main()
+        self.assertEqual(error.exception.code, 2)
+        invoke.assert_not_called()
+
     def test_custom_roster_must_include_the_coordinator(self):
         with patch('sys.argv', ['fleet-peers.py', '--peer', 'rog-nv-linux', '--peer', 'minix-amd-linux']), \
              patch.object(peers, 'run', return_value='{"Self":{"DNSName":"mac-studio.example.ts.net."}}'), \

@@ -310,6 +310,8 @@ setup_gpu() {
 main() {
   if [[ ${1:-} == --setup-peers ]]; then
     shift
+    # As root the helper would configure root's ~/.ssh and authorize root's key on every member.
+    [[ $EUID -ne 0 ]] || fail 'Run as your normal user, not with sudo.'
     local helper
     helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fleet-peers.py"
     [[ -f $helper ]] || fail 'Keep fleet-peers.py alongside this script for --setup-peers.'
