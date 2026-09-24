@@ -1176,6 +1176,12 @@ boot_windows() { # boot_windows <box>
   list=$(boot_ssh "$host" "$NATIVE_LINUX_GUARD; efibootmgr 2>/dev/null || sudo -n efibootmgr" 2>&1) || {
     printf '  %s\n' "$(printf '%s\n' "$list" | tail -1)"
     echo "boot-windows REFUSED on $box: its EFI boot entries could not be read"; return 1; }
+  # A BootNext already set is someone else's selection -- a firmware or diagnostic boot -- and this
+  # run's cleanup can only delete, never restore, so it is refused rather than replaced.
+  if printf '%s\n' "$list" | tr -d '\r' | grep -q '^BootNext:'; then
+    echo "boot-windows REFUSED on $box: a BootNext is already set there ($(printf '%s\n' "$list" | tr -d '\r' | grep '^BootNext:' | head -1)); not replacing someone else's selection ('sudo efibootmgr --delete-bootnext' there if it is stale)"
+    return 1
+  fi
   entry=$(windows_boot_entry "$list") || {
     echo "boot-windows REFUSED on $box: its EFI listing has $(printf '%s\n' "$list" | grep -c 'Windows Boot Manager') 'Windows Boot Manager' entries, and exactly one is needed"
     return 1; }
@@ -1247,6 +1253,13 @@ boot_linux() { # boot_linux <box>
       # as `X ` and failed an exact match over a restart that had in fact started. Trailing blanks
       # are stripped before the match as well, so the marker is read the same whichever way it comes.
       out=$(boot_ssh "$a" 'cmd.exe /d /s /c "echo WAKE_LAB_POWER_STARTED& shutdown /r /f /t 0"' 2>&1); rc=$?
+      # Error 1190, ERROR_SHUTDOWN_IS_SCHEDULED: a restart was already pending, and it will still
+      # happen. That is an accepted restart as far as the locks are concerned, so it is waited out
+      # like one rather than reported as a failure that releases them.
+      if grep -q '(1190)' <<<"$out"; then
+        echo "  $box: a shutdown was already scheduled there (1190); waiting on that one"
+        rc=0
+      fi
       if ! tr -d '\r' <<<"$out" | sed 's/[[:space:]]*$//' | grep -Fxq WAKE_LAB_POWER_STARTED ||
          { [ "$rc" != 0 ] && [ "$rc" != 255 ] && [ "$rc" != 124 ]; }; then
         printf '  %s\n' "$(printf '%s\n' "$out" | tr -d '\r' | tail -1)"

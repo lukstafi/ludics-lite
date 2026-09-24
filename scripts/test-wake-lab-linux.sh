@@ -372,6 +372,10 @@ case "$cmd" in
   *'echo WAKE_LAB_POWER_STARTED& shutdown /r /f /t 0'*)
     # With the blank rog's cmd.exe returned when the command had one before its `&` (2026-09-24).
     locks; printf 'WAKE_LAB_POWER_STARTED \r\n'
+    if [ "${BOOT_WIN_SCHEDULED:-0}" = 1 ]; then   # a restart already pending: this one is refused, that one happens
+      printf 'A system shutdown has already been scheduled.(1190)\r\n' >&2
+      [ "${BOOT_WIN_RESTART:-linux}" = noop ] || reboot_to "${BOOT_WIN_RESTART:-linux}"; exit 1
+    fi
     [ "${BOOT_WIN_RESTART:-linux}" = noop ] || reboot_to "${BOOT_WIN_RESTART:-linux}"; exit 0 ;;
   *'bash.exe'*)
     gb=${BOOT_GITBASH:-native}
@@ -447,6 +451,9 @@ check 'a refused selection reboots nothing' '[ "$rc" = 1 ] && [[ "$out" == *"Boo
 BOOT_LISTING="$BOOT_LISTING_DEFAULT
 Boot0004  Windows Boot Manager${tab}HD(2,GPT,dddd)" boot_run linux boot-windows rog
 check 'two Windows Boot Manager entries are an ambiguity, refused with nothing selected' '[ "$rc" = 1 ] && [[ "$out" == *"exactly one is needed"* ]] && [ "$(nsel)" = 0 ]'
+BOOT_LISTING="BootNext: 0005
+$BOOT_LISTING_DEFAULT" boot_run linux boot-windows rog
+check 'a BootNext someone else set is refused, never replaced or deleted' '[ "$rc" = 1 ] && [[ "$out" == *"a BootNext is already set there (BootNext: 0005)"* ]] && [ "$(nsel)" = 0 ] && ! grep -q -- "--delete-bootnext" "$SSH_LOG"'
 BOOT_LISTING="BootOrder: 0001
 Boot0001* ubuntu${tab}HD(1,GPT,aaaa)" boot_run linux boot-windows rog
 check 'a listing with no Windows Boot Manager entry is refused' '[ "$rc" = 1 ] && [[ "$out" == *"exactly one is needed"* ]] && [ "$(nsel)" = 0 ]'
@@ -478,6 +485,10 @@ check 'boot-linux restarts Windows into Ubuntu over the LAN route, under both la
 check '...and never touches the EFI selection' '! grep -q efibootmgr "$SSH_LOG"'
 BOOT_WIN_RESTART=dark boot_run windows boot-linux rog
 check 'a restart after which nothing answers is NEEDS A PERSON' '[ "$rc" = 3 ] && [[ "$out" == *"NEEDS A PERSON"*"restart into Ubuntu"* ]]'
+BOOT_WIN_SCHEDULED=1 boot_run windows boot-linux rog
+check 'a restart already scheduled (1190) is waited out as the restart it is, not a failure that releases the locks' '[ "$rc" = 0 ] && [[ "$out" == *"already scheduled there (1190)"* ]] && [[ "$out" == *"rog: in Ubuntu"* ]] && grep -qx "locks lane=held hold=held" "$SSH_LOG"'
+BOOT_WIN_SCHEDULED=1 BOOT_WIN_RESTART=noop boot_run windows boot-linux rog
+check '...and one that then never happens is NEEDS A PERSON' '[ "$rc" = 3 ] && [[ "$out" == *"accepted its restart but Windows still answers"* ]]'
 BOOT_WIN_RESTART=noop boot_run windows boot-linux rog
 check 'an accepted restart after which Windows still answers is NEEDS A PERSON, never a release over a pending restart' '[ "$rc" = 3 ] && [[ "$out" == *"NEEDS A PERSON: rog accepted its restart but Windows still answers"* ]]'
 BOOT_WIN_RESTART=windows boot_run windows boot-linux rog
