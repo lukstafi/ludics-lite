@@ -118,11 +118,14 @@ cmd_start() {
   fi
   # The claim is the pid itself, published by a hard link, which fails when `pid` exists: of two
   # starts that both found the directory empty, exactly one gets it and the other is refused
-  # before its command runs. The content is complete before the link makes it visible.
+  # before its command runs. The content is complete before the link makes it visible. A lost
+  # claim marks nothing, whatever state the winner has reached by now: the winner's run, finished
+  # or not, is the one a wait there should report.
   printf '%s\n%s\n' "$$" "$(started $$)" > "$dir/.pid.$$" || { say "cannot write in $(printf '%q' "$dir")"; exit 2; }
   if ! ln -- "$dir/.pid.$$" "$dir/pid" 2>/dev/null; then
     rm -f -- "$dir/.pid.$$"
-    refuse_start "$dir"
+    say "refused: another start claimed $(printf '%q' "$dir") first; a wait there reports that run, and this start ran nothing"
+    exit 2
   fi
   rm -f -- "$dir/.pid.$$"
   # The command's process publishes its own pid before it execs the command, so there is no moment
@@ -198,8 +201,11 @@ cmd_wait() {
       STARTING) [ "$elapsed" -lt "$grace" ] || break ;;
       *) break ;;
     esac
-    [ $((elapsed + interval)) -le "$within" ] || break
-    sleep "$interval"
+    # The last nap is only what is left of the window, so a --within shorter than the poll, or
+    # not a multiple of it, is still spent in full.
+    left=$((within - elapsed))
+    [ "$left" -gt 0 ] || break
+    if [ "$left" -lt "$interval" ]; then sleep "$left"; else sleep "$interval"; fi
   done
   case $V in
     rc) printf 'rc=%s\n' "$(cat "$dir/rc")"; exit 0 ;;

@@ -23,7 +23,9 @@
 #     earlier run's rc; over a live run it is refused too, runs nothing, and marks nothing, so a
 #     wait there still reports the live run;
 #   - two starts racing on one fresh directory: exactly one runs its command, the other is refused
-#     and leaves the winner's verdict alone;
+#     and leaves the winner's verdict alone -- also when the winner has already finished by the
+#     time the loser's claim fails;
+#   - a --within shorter than the poll interval is spent in full rather than answered at once;
 #   - the finish-between-reads order: a dead pid beside an rc reads rc, not DIED;
 #   - the usage errors (relative directory, missing `--`, a --within that is not a number);
 #   - when zsh is installed, a start issued through `zsh -c` the way the Bash tool issues it,
@@ -65,10 +67,15 @@ expect() {
   if [ "$rc" -eq "$want_rc" ] && contains "$out" "$want"; then ok "$label"
   else ko "$label (rc=$rc want $want_rc; want /$want/) -- $out"; fi
 }
-# until_file <path> <seconds>: poll for a nonempty file; 0 once it is there.
+# until_file <path> <seconds>: poll for a nonempty file; 0 once it is there. until_exists: any file.
 until_file() {
   local i=0
   while [ "$i" -lt $(($2 * 5)) ]; do [ -s "$1" ] && return 0; sleep 0.2; i=$((i + 1)); done
+  return 1
+}
+until_exists() {
+  local i=0
+  while [ "$i" -lt $(($2 * 5)) ]; do [ -e "$1" ] && return 0; sleep 0.2; i=$((i + 1)); done
   return 1
 }
 # bg_start <dir> <cmd...>: `start` in the background, the way the Bash tool runs it; its pid in S.
@@ -264,6 +271,24 @@ twin_starts "$BG" "$TMP/twin"
   || ko "twin starts: the command ran $TWIN_RAN time(s); the starts exited $TWIN_RCS"
 expect "...and the losing start left the winner's verdict alone (rc=0, not REFUSED)" 0 'rc=0' -- \
   "$BG" wait "$TMP/twin" --within 0
+# A start that loses the claim to a winner that has already FINISHED: the start is held past the
+# emptiness check, a finished run is put in place under it, and then it is let go. It must mark
+# nothing, so the winner's rc is what a wait reads.
+d="$TMP/lost-to-finished"
+BG_RUN_CLAIM_GATE="$d.gate" "$BG" start "$d" -- sh -c 'touch "$0"' "$TMP/lost.ran" > "$TMP/lost.out" 2>&1 &
+L=$!; BGPIDS="$BGPIDS $L"
+if until_exists "$d.gate.$L" 10; then
+  printf '%s\n' 99999999 > "$d/pid"; printf '0\n' > "$d/rc"; : > "$d/log"
+  : > "$d.gate"
+  wait "$L"; lrc=$?
+  [ "$lrc" -eq 2 ] && contains "$(cat "$TMP/lost.out")" 'claimed' && [ ! -e "$TMP/lost.ran" ] \
+    && ok "a start that loses the claim to a finished run is refused and runs nothing" \
+    || ko "the losing start exited $lrc, ran=$([ -e "$TMP/lost.ran" ] && echo yes || echo no) -- $(cat "$TMP/lost.out")"
+  expect "...and marks nothing: a wait reads the winner's rc=0, not REFUSED" 0 'rc=0' -- "$BG" wait "$d" --within 0
+else
+  ko "the gated start never reached the gate"
+fi
+
 sed 's|ln -- "$dir/.pid.$$" "$dir/pid"|mv -f -- "$dir/.pid.$$" "$dir/pid"|' "$BG" > "$TMP/unclaimed.sh"
 chmod +x "$TMP/unclaimed.sh"
 if cmp -s "$BG" "$TMP/unclaimed.sh"; then
@@ -273,6 +298,23 @@ else
   [ "$TWIN_RAN" -eq 2 ] && ok "control: with an overwriting rename for the claim, both starts run the command" \
     || ko "control: the unclaimed copy ran the command $TWIN_RAN time(s), so the case above proves nothing"
 fi
+
+# The window is spent in full when it is shorter than the poll: a running command with --within 3
+# and a 10 s poll holds the call ~3 s rather than answering at once.
+d="$TMP/short-window"
+bg_start "$d" sleep 30
+if until_file "$d/pid" 10; then
+  t0=$(date +%s)
+  expect "a --within shorter than the poll still reads RUNNING" 3 RUNNING -- \
+    env BG_RUN_POLL=10 "$BG" wait "$d" --within 3
+  took=$(( $(date +%s) - t0 ))
+  [ "$took" -ge 2 ] && [ "$took" -le 6 ] && ok "...after the 3 s window (took ${took} s), not at once" \
+    || ko "a 3 s window with a 10 s poll took ${took} s"
+  [ -s "$d/cpid" ] && kill -9 "$(head -n 1 "$d/cpid")" 2>/dev/null
+else
+  ko "the short-window fixture never published its pid"
+fi
+kill -9 "$S" 2>/dev/null; { wait "$S"; } 2>/dev/null
 
 # --- the finish-between-reads order ------------------------------------------------------------------
 d="$TMP/dead-with-rc"; mkdir -p "$d"
