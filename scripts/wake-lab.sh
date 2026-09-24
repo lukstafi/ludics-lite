@@ -21,7 +21,8 @@
 #   wake-lab.sh lock-path box             where that box's LANE lock lives, for a harness taking one
 #   wake-lab.sh boot-windows box          reboot a dual-boot box into Windows for ONE boot, unattended,
 #                                         and wait until its Git Bash answers (see "dual boot" below)
-#   wake-lab.sh boot-linux box            ...and back: reboot it (or wake it) into Ubuntu
+#   wake-lab.sh boot-linux box            ...and back: reboot it (or wake it) into Ubuntu; both are
+#                                         reboots, so a desktop session's open apps close with them
 #   wake-lab.sh --list                    dump the router's host table
 # WSL and Windows hardware notes live with the adapter in scripts/wake-lab-wsl.sh.
 #

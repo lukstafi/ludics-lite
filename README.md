@@ -255,7 +255,8 @@ the keyboard, and waits until its native Git Bash answers (`uname -s` `MINGW*`, 
 first) and GRUB are never written, and coming back needs no selection at all. Both verbs reserve the
 box's lane and hold locks for the whole switch and refuse either held, as the power verbs do
 (`--force` skips them); `boot-windows` also refuses a box with a run's sleep block inhibitor, which
-the lab locks do not see. They take exactly one box, and refuse one with no wired NIC (tuf), since
+the lab locks do not see. Each is a real reboot, so whatever is open in the box's desktop session closes with it: the
+live witness on rog closed its Firefox and VS Code windows. They take exactly one box, and refuse one with no wired NIC (tuf), since
 what cannot be woken remotely cannot be recovered remotely. The wait prints a line per poll for up
 to 15 minutes (`WAKE_LAB_BOOT_WAIT_SECONDS`) and ends in 0 (reached), 1 (refused, or back in a
 known OS: the reboot never took, or the firmware ignored BootNext) or 3, `NEEDS A PERSON`: nothing
