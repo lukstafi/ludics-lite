@@ -226,6 +226,12 @@ gh() {
     response=$(jq -cn --arg d "$HEAD_AT" '{sha:"head-sha", commit:{committer:{date:$d}}}')
     ;;
   "repos/$REPO/commits/main") response='{"sha":"base-sha"}' ;;
+  # The open-thread read an approval is checked with (ludics-lite#289), answered per round like
+  # the feeds: `schedule threads <round> <review_thread rows>`, none by default.
+  graphql)
+    case "$*" in *reviewThreads*) ;; *) bail "unexpected graphql call: $*" ;; esac
+    response=$(review_threads_answer "$(feed_answer threads)" "$@")
+    ;;
   "repos/$REPO/compare/base-sha...$H1?per_page=1" | "repos/$REPO/compare/base-sha...$H2?per_page=1")
     response=$(compare_json 1 2 pr.txt)
     ;;
@@ -1380,6 +1386,58 @@ watermark: 9000,9000,9000')]"
     "a failed round keeps the caller's watermark; a quoted line is not a watermark"
 }
 
+# --- an approval over the findings the watch scrolled past (ludics-lite#289) ---------------------
+# PR #277, round 6, as it was: two inline findings written against the previous head, the 👍 on the
+# base-merge commit above it. The round classifies the findings NOT about head and moves past them
+# — correctly, they are not this head's round — and the approval then ends the wait. What it must
+# not do is end it as a clean `approved`: the merge changed neither line, so both findings were live
+# in the head about to be merged, and the threads carrying them were still open.
+two_head_fixture() { # <resolved: true|false>
+  reset_fixture
+  schedule reviews 1 "[$(review 4053090000 "$H1" 2026-09-01T00:01:00Z)]"
+  schedule inline 1 "[$(inline_comment 4053098120 "$H1" "$H2" 'P2: a live defect'),$(inline_comment 4053098122 "$H1" "$H2" 'P2: another' b.sh 9)]"
+  schedule reactions 1 "[$(reaction +1 2026-09-01T00:05:00Z)]"
+  schedule threads 1 "[$(review_thread 4053098120 "$1"),$(review_thread 4053098122 "$1" b.sh)]"
+}
+
+test_an_approval_over_findings_scrolled_past_is_not_clean() {
+  two_head_fixture false
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "an approval ends the wait"
+  assert_contains "$WATCH_ERR" "item(s) NOT about head ${H2:0:7}" \
+    "the findings on the previous head are still classified as not this head's round"
+  assert_contains "$WATCH_ERR" "a thread among them left unresolved still holds an approval back" \
+    "and the record of them says an open one still counts"
+  local last
+  last=$(grep -v '^watermark: ' <<<"$WATCH_OUT" | tail -1)
+  assert_contains "$last" "BUT 2 review thread(s) still UNRESOLVED — NOT a clean approval" \
+    "the approval is reported over the open threads, not as a clean approval"
+  assert_contains "$last" "4053098120 by codex[bot] on a.sh, 4053098122 by codex[bot] on b.sh" \
+    "naming both findings the watch moved past"
+  assert_eq "$(grep -c -x graphql "$REQUEST_LOG" || true)" 1 \
+    "one thread read, on the round the approval ends"
+  # The control: the same two heads with both threads answered and closed is a clean approval.
+  two_head_fixture true
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "the approval ends the wait"
+  last=$(grep -v '^watermark: ' <<<"$WATCH_OUT" | tail -1)
+  assert_eq "$last" "approved (👍 from $REVIEWER)" "with every thread resolved it is clean"
+}
+
+test_an_approval_landing_in_the_final_poll_is_checked_too() {
+  # watch_end's approval: the 👍 landing while a no-review verdict was being read. It ends the wait
+  # as any approval does, so it is checked for open threads the same way.
+  reset_fixture
+  retune GRACE=1
+  schedule reactions 2 "[$(reaction +1 2026-09-01T00:02:00Z)]"
+  schedule threads 1 "[$(review_thread 4053098120 false)]"
+  run_watch 0,0,0 5 1
+  assert_eq "$WATCH_RC" 0 "an approval is something to act on"
+  assert_contains "$WATCH_OUT" "the 👍 landed while it was being read" "the verdict is dropped for it"
+  assert_contains "$WATCH_OUT" "BUT 1 review thread(s) still UNRESOLVED" \
+    "and the approval is reported over its open thread"
+}
+
 tests=(
   test_a_broken_jq_program_fails_the_poll_round
   test_a_failed_round_takes_no_watermark_from_a_quoted_line
@@ -1429,6 +1487,8 @@ tests=(
   test_the_review_clock_starts_no_earlier_than_the_pr
   test_a_future_commit_date_does_not_blind_the_clock
   test_a_clockless_expected_state_says_so_rather_than_guessing
+  test_an_approval_over_findings_scrolled_past_is_not_clean
+  test_an_approval_landing_in_the_final_poll_is_checked_too
 )
 
 run_tests "${tests[@]}"
