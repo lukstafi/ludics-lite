@@ -35,10 +35,11 @@ redirect. Shipping is for work you would defend; a wrong path is a conversation.
 ## PR or direct commit?
 
 Every PR here draws an automated review, so opening one and then skipping the monitor forfeits a
-review rather than saving time — a PR is never the "light" option. The light option is landing on
-master directly, and it is the right one when there is nothing to review: a typo, a comment,
-re-promoting a golden. It waits for the user no more than a PR does — merging a PR into master is
-the larger act of the two, however much the merge commit makes it the more visible one:
+review rather than saving time — a PR opened for its review is never the "light" option. The light
+option is landing on master directly, where the harness permits it (auto mode, below, does not),
+and it is the right one when there is nothing to review: a typo, a comment, re-promoting a golden.
+It waits for the user no more than a PR does — merging a PR into master is the larger act of the
+two, however much the merge commit makes it the more visible one:
 
 ```bash
 git fetch origin && git rebase origin/master   # a direct push has to fast-forward
@@ -59,6 +60,25 @@ takes the current HEAD, which from a stale checkout drops the commits just lande
 
 The trade is explicit: a direct commit gets no review at all. Anything carrying a design decision
 goes through the full loop below.
+
+**Under Claude Code's auto permission mode, no landing is the agent's alone.** The classifier's
+default `Merge Without Review` rule blocks "merging a PR before any human has approved it", and it
+has refused every landing this skill makes: the direct push above (ludics-lite#312), a
+merge on the reviewer's 👍 with CI green, since a bot is not a human (ludics-lite#187), and the
+close-out merge of *When the loop ends* (ludics-lite#352). Its refusal tells the session to stop
+and ask, so an attempt made first is dead time. What clears it is the user's go-ahead naming the
+merge of this PR (or this push), or an `autoMode.allow` entry in their settings that covers the
+repository. So under auto mode ask once, in the message that proposes the landing, never after a
+refusal. For a change with nothing to review the cheapest form is a PR that merges on CI alone,
+with no `watch` round: open it, propose the merge without review in the same message, and on the
+user's "yes" run, backgrounded,
+
+```bash
+~/.claude/skills/ship-pr/scripts/pr-review.sh merge <owner>/<repo>#<pr> --wait
+```
+
+It reads the build signal and never the 👍, and CI runs while the question waits. It keeps the
+build gate the direct push skips; the push stays the lighter act where the user names that instead.
 
 The `gh` recipes below are packaged as `~/.claude/skills/ship-pr/scripts/pr-review.sh` (`poll`,
 `watch`, `status`, `checks`, `merge`, `base`, `reply`, `resolve`, `comment`, `retry`), which
@@ -655,7 +675,8 @@ Then merge:
 ```
 
 `merge` (below) reads the build signal, not the 👍. The maintainer reads in the record what was
-not done and why, instead of finding it in the next PR's review.
+not done and why, instead of finding it in the next PR's review. Under Claude Code's auto mode,
+ask for this merge in the message carrying the record, not after trying it (*PR or direct commit?*).
 
 Both exits have an incentive problem: past the threshold, deferring is cheaper than fixing, and
 rebutting is cheaper than either at any round. The threads and the record paragraph are the only
@@ -1144,7 +1165,8 @@ replace the ancestry guard with `git branch -d`: `-d` may test a configured upst
 the base, making deletion either tautological or a false refusal after the worktree is already gone.
 
 If the harness blocks the merge itself, that is a permission gate, not a failure: explain what you
-were doing, give the command, and let the user decide. Never work around it.
+were doing, give the command, and let the user decide. Never work around it. Under Claude Code's
+auto mode it is the expected answer, so ask before the attempt (*PR or direct commit?*).
 
 After merging: run the `after-merge` brainstorm FIRST, while the session's friction is still in
 context. Then refresh the base for the next branch (`git fetch origin`, then branch off
