@@ -28,7 +28,7 @@ host↔device transfer reads stale memory, while minix's gfx1151 is an iGPU whos
 host memory and can read the right bytes anyway (ludics-lite#320, gh-ocannl-1035). tuf is a Wi-Fi
 laptop, so Wake-on-LAN cannot reach it and this routine never wakes it: its own RTC timer does, a
 few minutes before this routine fires (a `WakeSystem=true` systemd timer, the optional laptop step
-of self-improve's Linux bootstrap), or a person does. Its lane is therefore **gated**: the sweep asks
+of the Linux bootstrap, `scripts/install-linux.sh`), or a person does. Its lane is therefore **gated**: the sweep asks
 `wake-lab.sh status tuf` itself, runs the unit only when that reaches tuf's Linux, and otherwise
 records the unit as `gate` — nothing tested, nothing failed, and nothing for this routine to repair.
 When the lane did reach tuf it ends by putting the box back to sleep (`wake-lab.sh sleep tuf`, which

@@ -590,7 +590,10 @@ for sibling in $cross; do
 done
 # GitHub credential (ludics-lite#360): a worker on this box pushes and opens its PR with this
 # box's `gh` (git's credential helper here too), and on 2026-09-23 a dead keyring token surfaced
-# an hour into a worker's task, and another worker routed around it with a copied token. So the
+# an hour into a worker's task, and another worker routed around it with a copied token. Since
+# 2026-09-24 every box instead exports one PAT as GH_TOKEN from ~/.config/fleet/gh-token.sh, which
+# env.sh sources (per-box keyring logins revoked each other: GitHub keeps 10 OAuth tokens per
+# user and app). So the
 # preflight makes the call a worker makes, `gh api user`, from the same kind of session: this
 # script runs as a non-interactive `ssh <box> bash -s` (or a local child on the anchor), which is
 # NOT the box's desktop console. On 2026-09-24 minix's `gh auth status` was reported green at the
@@ -618,12 +621,20 @@ else
     case "$ghout" in
       *"error connecting to "*|*"(HTTP 5"[0-9][0-9]")"*) gh_down="gh api user: $ghlast" ;;
       *)
-        case "$BOX" in local) repair="in a terminal on this box: gh auth login -h github.com -p https -w && gh auth setup-git" ;;
-          *) repair="ssh -t $(printf '%q' "$BOX") 'gh auth login -h github.com -p https -w && gh auth setup-git'" ;; esac
         # An exported token outranks the stored login, and `gh auth login` refuses while one is
-        # set, so the stored-login repair alone would never take.
+        # set, so the stored-login repair applies only to a box without the fleet's token file.
         envtok=""; for v in GH_TOKEN GITHUB_TOKEN; do [ -z "${!v+x}" ] || envtok="${envtok:+$envtok and }$v"; done
-        [ -z "$envtok" ] || repair="remove the $envtok this session exports (it outranks gh's stored login and blocks gh auth login) from $BOX's shell startup, then restart any tmux server that inherited it; for the stored login: $repair"
+        qbox=$(printf '%q' "$BOX")
+        if [ -e "$HOME/.config/fleet/gh-token.sh" ]; then
+          case "$BOX" in local) repair="put a live PAT in ~/.config/fleet/gh-token.sh here (export GH_TOKEN=ghp_...), then copy it to the other boxes" ;;
+            *) repair="replace the PAT in ~/.config/fleet/gh-token.sh on $BOX, e.g. from the anchor: ssh $qbox 'umask 077; cat > ~/.config/fleet/gh-token.sh' < ~/.config/fleet/gh-token.sh" ;; esac
+          if [ -n "$envtok" ]; then repair="$repair; then restart any tmux server that inherited the old value"
+          else repair="this session does not export the token in ~/.config/fleet/gh-token.sh: end $BOX's ~/.config/fleet/env.sh with [ ! -r \"\$HOME/.config/fleet/gh-token.sh\" ] || . \"\$HOME/.config/fleet/gh-token.sh\" (scripts/install-linux.sh adds it)"; fi
+        else
+          case "$BOX" in local) repair="in a terminal on this box: gh auth login -h github.com -p https -w && gh auth setup-git" ;;
+            *) repair="ssh -t $qbox 'gh auth login -h github.com -p https -w && gh auth setup-git'" ;; esac
+          [ -z "$envtok" ] || repair="remove the $envtok this session exports (it outranks gh's stored login and blocks gh auth login) from $BOX's shell startup, then restart any tmux server that inherited it; for the stored login: $repair"
+        fi
         note "GitHub credential refused in a non-interactive session on $BOX (gh api user: ${ghlast:-exit $ghrc, no output}); a green \`gh auth status\` at the box's desktop console does not prove the token a worker's ssh session reads -- repair: $repair" ;;
     esac
   fi

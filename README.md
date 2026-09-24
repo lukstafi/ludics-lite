@@ -37,8 +37,9 @@ done
 ```
 
 The loop skips `routines/`, whose contents are scheduled-task prompts rather than skills, and
-`scripts/`, which holds the lab script; both are installed separately, see the Routines and Lab
-script sections. Rerun the loop after adding a skill. Replace any pre-existing real directory in
+`scripts/`, which holds the lab script and the native-Linux bootstrap
+([scripts/install-linux.md](scripts/install-linux.md)); both are installed separately, see the
+Routines and Lab script sections. Rerun the loop after adding a skill. Replace any pre-existing real directory in
 `~/.claude/skills/` by hand first, and diff it against this copy, since a divergent local edit
 may be a fix worth keeping.
 
@@ -107,9 +108,11 @@ needs the box's CLI logged in: `claude auth login` for Claude workers (an expire
 cannot refresh headless, and `claude auth status` does not notice) and `codex login` for Codex
 CLI ones. The CLI preflight proves both with a live call, not a status read. Every worker, native
 or CLI, also needs the box's `gh` authenticated for a non-interactive ssh session (it pushes and
-opens the PR with it): the preflight calls `gh api user` from that session kind and refuses a
-rejected token with the repair, `ssh -t <box> 'gh auth login -h github.com -p https -w && gh auth
-setup-git'`.
+opens the PR with it): every box exports one fleet PAT as `GH_TOKEN` from
+`~/.config/fleet/gh-token.sh` (per-box `gh auth login` tokens revoked each other). The preflight
+calls `gh api user` from that session kind and refuses a rejected token with the repair: replace
+the box's file from the anchor's, `ssh <box> 'umask 077; cat > ~/.config/fleet/gh-token.sh' <
+~/.config/fleet/gh-token.sh`, and restart any tmux server that inherited the old value.
 Provider/model, launch transport and execution placement are separate choices. Both Codex and
 Claude Code support their own native subagents in coordinator-created external worktrees, or
 CLI workers launched with `--kind codex` or `--kind claude`. Only the CLI route provides
@@ -275,6 +278,8 @@ issue-wave/scripts/test-bg-run.sh
 python3 ship-pr/hooks/test-ship-pr-nudge.py
 python3 ship-pr/scripts/test-pr-review-hostile.py
 python3 scripts/test-workflow-reporters.py
+python3 scripts/test-install-linux.py
+python3 scripts/test-fleet-peers.py
 ship-pr/scripts/test-post-merge-cleanup.sh
 ship-pr/scripts/test-pr-review-lib.sh
 ship-pr/scripts/test-pr-review-base-lib.sh

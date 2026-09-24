@@ -88,7 +88,7 @@ greeter's power plugin on a box woken by WoL with nobody logged in.
 Ubuntu sets to `auth_admin_keep` (`allow_active` = yes covers only a local console session):
 without a grant the request is denied ("Failed to inhibit: Access denied"), as it was on all
 three boxes on 2026-09-23. The grant is `/etc/polkit-1/rules.d/50-fleet-inhibit.rules`, installed
-by the Linux bootstrap, `~/self-improve/scripts/install-linux.md`. Check it from an ssh session:
+by the Linux bootstrap, [`scripts/install-linux.md`](../../scripts/install-linux.md). Check it from an ssh session:
 `pkcheck --action-id org.freedesktop.login1.inhibit-block-sleep --process $$; echo $?` prints 0.
 On a box without it `hold` does not refuse the run - that would stop every batch there over a
 setup step - but prints `EXECUTION HOLD <box>: WARNING: running WITHOUT a sleep inhibitor` with

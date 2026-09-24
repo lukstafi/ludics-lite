@@ -765,6 +765,13 @@ expect "...and the native Codex preflight" 1 "GitHub credential refused in a non
 expect "...and the Codex CLI preflight" 1 "GitHub credential refused" -- env SHIM_GH=401 "$FW" preflight testbox --codex --no-probe --no-cross
 expect "a rejected token exported in the session names it in the repair" 1 "repair: remove the GH_TOKEN this session exports (it outranks gh's stored login and blocks gh auth login) from testbox's shell startup, then restart any tmux server that inherited it; for the stored login: ssh -t testbox" -- \
   env SHIM_GH=401 GH_TOKEN=gho_dead "$FW" preflight testbox --native-claude --no-cross
+# The fleet's PAT file (2026-09-24): a rejected PAT is replaced in the file, never by gh auth login.
+mkdir -p "$HOME/.config/fleet"; printf 'export GH_TOKEN=ghp_dead\n' > "$HOME/.config/fleet/gh-token.sh"
+expect "a rejected PAT from gh-token.sh is replaced from the anchor's file" 1 "repair: replace the PAT in ~/.config/fleet/gh-token.sh on testbox, e.g. from the anchor: ssh testbox 'umask 077; cat > ~/.config/fleet/gh-token.sh' < ~/.config/fleet/gh-token.sh; then restart any tmux server that inherited the old value$" -- \
+  env SHIM_GH=401 GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross
+expect "...and a gh-token.sh the session does not source names the env.sh line" 1 "repair: this session does not export the token in ~/.config/fleet/gh-token.sh: end testbox's ~/.config/fleet/env.sh with .*gh-token.sh.*install-linux.sh adds it)$" -- \
+  env -u GH_TOKEN -u GITHUB_TOKEN SHIM_GH=401 "$FW" preflight testbox --native-claude --no-cross
+rm "$HOME/.config/fleet/gh-token.sh"
 expect "a box never logged in to gh refuses (an unnamed failure fails closed)" 1 "GitHub credential refused.*gh auth login" -- env SHIM_GH=noauth "$FW" preflight testbox --no-probe --no-cross
 expect "a GitHub that cannot be reached is noted on the OK line" 0 "PREFLIGHT OK testbox .*(GitHub unreachable from testbox: gh api user: check your internet connection" -- env SHIM_GH=down "$FW" preflight testbox --no-probe --no-cross
 expect "a GitHub outage (HTTP 5xx) is noted, not refused" 0 "PREFLIGHT OK.*GitHub unreachable from testbox: gh api user: gh: Server Error (HTTP 502)" -- env SHIM_GH=5xx "$FW" preflight testbox --no-probe --no-cross
