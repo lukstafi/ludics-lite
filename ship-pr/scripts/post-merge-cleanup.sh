@@ -37,23 +37,79 @@ fail() {
   exit 1
 }
 
-usage() {
-  cat >&2 <<'EOF'
-usage: post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> [options]
+# The option table: the ONE declaration of what this helper takes (ludics-lite#332). usage()
+# prints its option lines from it and the parse loop looks each argument up in it, so the listing
+# and the parser cannot disagree on an option's name or on whether it takes a value. That drift
+# was ludics-lite#302 (`--force-integrated` listed bare over an arm that consumed a value), and
+# it needed a second hand-written copy to happen in; there is none. scripts/check-prompts.sh holds
+# ship-pr/SKILL.md to the PRINTED listing, so it reads what the operator reads.
+#
+# option <--name> <placeholder> <variable> <help line>...
+#   <placeholder>: `<word>` for an option that takes a value, empty for a flag. The value is the
+#     next argument, and a missing or empty one is a usage error, exit 2; a flag consumes nothing
+#     and sets <variable> to 1.
+#   <variable>: what the value is assigned to, so the last occurrence wins; spelled `NAME[]`, the
+#     value is appended to the array NAME instead, which makes the option repeatable. The name is
+#     this file's own constant text, never input, and it is what the parse loop assigns through.
+#   <help line>...: the listing's text, one argument per printed line.
+NL=$'\n'
+OPTION_NAMES=()
+OPTION_PLACEHOLDERS=()
+OPTION_VARIABLES=()
+OPTION_HELPS=()
+option() {
+  local help="$4"
+  OPTION_NAMES+=("$1")
+  OPTION_PLACEHOLDERS+=("$2")
+  OPTION_VARIABLES+=("$3")
+  shift 4
+  while [ "$#" -gt 0 ]; do
+    help="$help$NL$1"
+    shift
+  done
+  OPTION_HELPS+=("$help")
+}
+option --base '<branch>' BASE_BRANCH \
+  'Base branch to refresh and verify (default: master)'
+option --force-integrated '<reason>' FORCE_REASON \
+  'Why this squash/rebase merge is confirmed'
+option --regenerable '<name>' 'REGENERABLE_NAMES[]' \
+  'A top-level directory of the session worktree that cleanup may' \
+  'REMOVE rather than refuse over or archive, such as a build tree.' \
+  'Repeatable, no default; the name must be one untracked directory' \
+  'of the worktree root and is never followed through a symlink.'
 
-Options:
-  --base <branch>       Base branch to refresh and verify (default: master)
-  --force-integrated <reason>
-                        Why this squash/rebase merge is confirmed
-  --regenerable <name>  A top-level directory of the session worktree that cleanup may
-                        REMOVE rather than refuse over or archive, such as a build tree.
-                        Repeatable, no default; the name must be one untracked directory
-                        of the worktree root and is never followed through a symlink.
+# An option's name and placeholder fill a 21-column field ahead of its help; a longer pair takes a
+# line of its own and its help starts on the next, at the same column.
+usage() {
+  local i line rest text
+  {
+    printf '%s\n' "usage: post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> [options]" \
+      "" "Options:"
+    i=0
+    while [ "$i" -lt "${#OPTION_NAMES[@]}" ]; do
+      line="${OPTION_NAMES[$i]}${OPTION_PLACEHOLDERS[$i]:+ ${OPTION_PLACEHOLDERS[$i]}}"
+      if [ "${#line}" -gt 21 ]; then
+        printf '  %s\n' "$line"
+        line=""
+      fi
+      rest="${OPTION_HELPS[$i]}"
+      while :; do
+        text="${rest%%"$NL"*}"
+        printf '  %-21s %s\n' "$line" "$text"
+        line=""
+        [ "$text" != "$rest" ] || break
+        rest="${rest#*"$NL"}"
+      done
+      i=$((i + 1))
+    done
+    cat <<'EOF'
 
 The ordinary path requires the topic branch to be an ancestor of origin/<base>. Use
 --force-integrated only after independently confirming a squash or rebase merge; its
 non-empty reason is printed in the cleanup record.
 EOF
+  } >&2
   exit 2
 }
 
@@ -1413,28 +1469,26 @@ shift 3
 BASE_BRANCH="master"
 FORCE_REASON=""
 REGENERABLE_NAMES=()
+# Every argument is looked up in the option table (see `option`), and an argument the table does
+# not name, in exactly that spelling, is a usage error.
 while [ "$#" -gt 0 ]; do
-  case "$1" in
-  --base)
-    [ "$#" -ge 2 ] || usage
-    BASE_BRANCH="$2"
-    [ -n "$BASE_BRANCH" ] || usage
-    shift 2
-    ;;
-  --force-integrated)
-    [ "$#" -ge 2 ] || usage
-    FORCE_REASON="$2"
-    [ -n "$FORCE_REASON" ] || usage
-    shift 2
-    ;;
-  --regenerable)
-    [ "$#" -ge 2 ] || usage
-    [ -n "$2" ] || usage
-    REGENERABLE_NAMES+=("$2")
-    shift 2
-    ;;
-  *) usage ;;
+  OPTION_INDEX=0
+  while [ "$OPTION_INDEX" -lt "${#OPTION_NAMES[@]}" ] && [ "${OPTION_NAMES[$OPTION_INDEX]}" != "$1" ]; do
+    OPTION_INDEX=$((OPTION_INDEX + 1))
+  done
+  [ "$OPTION_INDEX" -lt "${#OPTION_NAMES[@]}" ] || usage
+  OPTION_VARIABLE="${OPTION_VARIABLES[$OPTION_INDEX]}"
+  if [ -z "${OPTION_PLACEHOLDERS[$OPTION_INDEX]}" ]; then
+    printf -v "$OPTION_VARIABLE" '%s' 1
+    shift
+    continue
+  fi
+  { [ "$#" -ge 2 ] && [ -n "$2" ]; } || usage
+  case "$OPTION_VARIABLE" in
+  *'[]') eval "${OPTION_VARIABLE%'[]'}"'+=("$2")' ;;
+  *) printf -v "$OPTION_VARIABLE" '%s' "$2" ;;
   esac
+  shift 2
 done
 
 git check-ref-format "refs/heads/$BRANCH" >/dev/null 2>&1 || fail "invalid branch name: $BRANCH"
