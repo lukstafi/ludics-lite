@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# bg-run.sh -- run one command as a background task and block on it in bounded foreground calls.
+#
+# A native worker has nothing that holds its turn on a background task except a foreground Bash
+# call, and that call is capped at 600 s. So a command that can outlast the cap (ship-pr's
+# `pr-review.sh watch`, `merge --wait`) runs in the background under `start`, and the worker
+# re-issues `wait` in the foreground until it reports the command's exit status
+# (issue-wave/references/native-claude.md, *Blocking on a run*). This replaces the two lines of
+# hand-copied shell that took three review rounds of races (ludics-lite#354, #357):
+#
+#   bg-run.sh start <dir> -- <cmd> [arg...]    # run it with Bash run_in_background: true
+#   bg-run.sh wait  <dir> [--within <s>]       # run it in the foreground; default 540
+#
+# <dir> is absolute and FRESH for every run: `start` creates it and refuses one that already holds
+# anything. It writes four files there and nothing else:
+#   pid  -- this script's own pid, published before the command starts. Publishing it is the
+#           claim: it is created exclusively, so of two starts racing on one directory exactly one
+#           runs its command;
+#   cpid -- the command's own pid, published by the command's process before it execs the
+#           command, so a command that outlives a killed wrapper is still seen running;
+#           Each pid file carries a second line, the process's start time as `ps -o lstart=`
+#           gives it, so a pid the system has since reused for another process is not read as
+#           the run's (where ps cannot say, the line is empty and the bare pid stands);
+#   log  -- the command's stdout and stderr, and the only file the command's output reaches;
+#   rc   -- the command's exit status, published (by rename) after the command returns.
+# A start refused over an earlier run that has ENDED (finished, or died) writes `refused` into
+# that directory, so a wait there says REFUSED instead of reading the earlier status as this
+# run's. A start refused over a run that is still live, or still being claimed, marks nothing:
+# that is the run a wait there should report, since the likeliest way to reach it is a duplicated
+# or retried `start` of the same command -- marking it would send the caller off to run it again.
+# A duplicate that arrives only after its twin has ENDED cannot be told from the reuse of an old
+# directory, and is refused the same way: that costs a second run, loudly, where the other
+# reading would report an earlier run's status as this one's, silently. The commands this is for
+# (a review watch, a merge wait) are reads that a second run repeats harmlessly.
+#
+# `wait` polls every 5 s (BG_RUN_POLL, whole seconds) and returns the first settled verdict, or
+# the current one once --within seconds are spent. It prints one line and exits with its code:
+#   rc=<n>     0  the command finished; <n> is its exit status (also in <dir>/rc). Exit 0 means
+#                 FINISHED, not succeeded: a command may exit with any status, so no exit code
+#                 of this script can both carry it and stay distinct from the verdicts below.
+#   RUNNING    3  the pid or the cpid is alive and there is no rc yet: re-issue the wait.
+#   STARTING   4  no pid yet. A background task that has not published its pid is starting, not
+#                 dead. Returned at the --within deadline, or once no pid has appeared for 60 s
+#                 of this wait (BG_RUN_START_GRACE): re-issue once, and a second STARTING means
+#                 the launch itself failed, so start again in a NEW directory.
+#   DIED       5  a pid was published, it and the command are both gone, and no rc was
+#                 written: the task was killed before the command returned (the harness does this, ~40 min into a
+#                 backgrounded `merge --wait`). It says nothing about what the command saw:
+#                 re-arm it in a new directory.
+#   REFUSED    6  `start` refused this directory (the reason follows): start again in a NEW one.
+# Usage errors exit 2, from either subcommand.
+#
+# The races this closes, each pinned by test-bg-run.sh:
+#   1. a killed task never writes rc: `wait` reads the dead pid as DIED instead of polling forever;
+#   2. rc is a file of its own, not a line of the log, so output that quotes `rc=` (a review body
+#      does) cannot end a wait;
+#   3. a wait that runs before the task has published its pid reads STARTING, not DIED;
+#   and a stale directory, whose rc belongs to an earlier run, is refused rather than reused.
+#   A run that finishes between the rc read and the pid probe is read as finished: a dead pid is
+#   followed by a second read of rc before DIED is concluded.
+# And a wrapper killed on its own (not with its process group, as the harness does) leaves the
+# command running: its cpid keeps the verdict RUNNING rather than a DIED that would re-arm a
+# duplicate beside it.
+# What it does not close: a `wait` that runs before `start` has run AT ALL, on a directory an
+# earlier run left behind, reads that run's status; `start`'s refusal catches the reuse only once
+# it has run. A fresh name per run is the caller's half, and this script cannot check it. Nor a
+# wrapper killed alone in the instant between forking the command's process and that process
+# publishing cpid: a wait in that instant reads DIED.
+#
+# Portable to bash 3.2 (macOS /bin/bash) and GNU bash; the Bash tool's zsh only passes argv.
+
+set -u
+
+usage() {
+  printf '%s\n' 'usage: bg-run.sh start <dir> -- <cmd> [arg...]' \
+    '       bg-run.sh wait <dir> [--within <seconds>]' >&2
+  exit 2
+}
+
+say() { printf 'bg-run: %s\n' "$*" >&2; }
+
+# An absolute directory, so a background shell that did not start in the caller's cwd (ship-pr's
+# SKILL.md records that it need not) and the foreground waiter name the same place.
+need_absolute() {
+  case $1 in
+    /*) ;;
+    *) say "the run directory must be an absolute path, got $(printf '%q' "$1")"; exit 2 ;;
+  esac
+}
+
+# refuse_start <dir>: refuse a directory that already holds a run, and exit. One that has ended is
+# marked, so a wait on it reads REFUSED rather than its status; a live one is left alone.
+refuse_start() {
+  verdict "$1"
+  case $V in
+    RUNNING|STARTING)
+      say "refused: $(printf '%q' "$1") holds a run that is live or still being claimed; a wait there reports that run, and this start ran nothing" ;;
+    REFUSED)
+      say "refused: $(printf '%q' "$1") was already refused; start again in a new directory" ;;
+    *)
+      reason="$(printf '%q' "$1") already holds a run that has ended; start again in a new directory"
+      printf '%s\n' "$reason" > "$1/refused"
+      say "refused: $reason" ;;
+  esac
+  exit 2
+}
+
+cmd_start() {
+  [ $# -ge 3 ] || usage
+  dir=$1; shift
+  [ "$1" = -- ] || usage
+  shift
+  need_absolute "$dir"
+  mkdir -p -- "$dir" || { say "cannot create $(printf '%q' "$dir")"; exit 2; }
+  [ -z "$(ls -A -- "$dir")" ] || refuse_start "$dir"
+  # A test seam, unset in use: test-bg-run.sh holds two starts here, past the emptiness check,
+  # until both have reached it (each drops <gate>.<pid>; the suite then creates <gate>), so the
+  # claim below is what decides between them.
+  if [ -n "${BG_RUN_CLAIM_GATE:-}" ]; then
+    : > "$BG_RUN_CLAIM_GATE.$$"
+    while [ ! -e "$BG_RUN_CLAIM_GATE" ]; do sleep 0.1; done
+  fi
+  # The claim is the pid itself, published by a hard link, which fails when `pid` exists: of two
+  # starts that both found the directory empty, exactly one gets it and the other is refused
+  # before its command runs. The content is complete before the link makes it visible. A lost
+  # claim marks nothing, whatever state the winner has reached by now: the winner's run, finished
+  # or not, is the one a wait there should report.
+  printf '%s\n%s\n' "$$" "$(started $$)" > "$dir/.pid.$$" || { say "cannot write in $(printf '%q' "$dir")"; exit 2; }
+  if ! ln -- "$dir/.pid.$$" "$dir/pid" 2>/dev/null; then
+    rm -f -- "$dir/.pid.$$"
+    say "refused: another start claimed $(printf '%q' "$dir") first; a wait there reports that run, and this start ran nothing"
+    exit 2
+  fi
+  rm -f -- "$dir/.pid.$$"
+  # The command's process publishes its own pid before it execs the command, so there is no moment
+  # at which the command runs untracked.
+  # shellcheck disable=SC2016 # expanded by the inner sh
+  sh -c 'printf "%s\n%s\n" "$$" "$(TZ=UTC LC_ALL=C ps -o lstart= -p "$$" 2>/dev/null | tr -d " ")" > "$0.$$" \
+    && mv -f "$0.$$" "$0" && exec "$@"' "$dir/cpid" "$@" \
+    < /dev/null > "$dir/log" 2>&1 &
+  wait "$!"
+  rc=$?
+  printf '%s\n' "$rc" > "$dir/.rc.tmp" && mv -f -- "$dir/.rc.tmp" "$dir/rc" \
+    || say "cannot publish the exit status $rc in $(printf '%q' "$dir")"
+  exit "$rc"
+}
+
+# started <pid>: the process's start time, blanks removed, in one fixed locale and zone so the
+# start and the wait spell it alike; empty where ps cannot say. (The inner sh in cmd_start spells
+# the same pipeline out, since it cannot call this function.)
+started() { TZ=UTC LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | tr -d ' '; }
+
+# alive <pid-file>: whether the process it names is still the run's, and running. `kill -0` alone
+# answers yes for two processes that are not: a zombie -- an orphaned command that exited under a
+# parent that never reaps it (a minimal container's PID 1) -- which ps reports in state Z (or X),
+# and an unrelated process the system has since given the same pid, whose start time differs from
+# the one recorded. Where ps cannot say, kill -0 stands.
+alive() {
+  [ -s "$1" ] || return 1
+  { IFS= read -r p; IFS= read -r t; } < "$1"
+  kill -0 "$p" 2>/dev/null || return 1
+  case $(ps -o stat= -p "$p" 2>/dev/null | tr -d ' ') in Z*|X*) return 1 ;; esac
+  if [ -n "${t:-}" ]; then
+    now=$(started "$p")
+    [ -z "$now" ] || [ "$now" = "$t" ] || return 1
+  fi
+  return 0
+}
+
+# verdict <dir>: sets V to rc | REFUSED | STARTING | RUNNING | DIED.
+verdict() {
+  if [ -s "$1/refused" ]; then V=REFUSED
+  elif [ -s "$1/rc" ]; then V=rc
+  elif [ ! -s "$1/pid" ]; then V=STARTING
+  elif alive "$1/pid" || alive "$1/cpid"; then V=RUNNING
+  elif [ -s "$1/rc" ]; then V=rc   # it finished between the rc read and the probe
+  else V=DIED
+  fi
+}
+
+cmd_wait() {
+  [ $# -ge 1 ] || usage
+  dir=$1; shift
+  within=540
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --within) [ $# -ge 2 ] || usage; within=$2; shift 2 ;;
+      --within=*) within=${1#--within=}; shift ;;
+      *) usage ;;
+    esac
+  done
+  interval=${BG_RUN_POLL:-5}
+  grace=${BG_RUN_START_GRACE:-60}
+  for n in "$within" "$interval" "$grace"; do
+    case $n in ''|*[!0-9]*) say "not a whole number of seconds: $(printf '%q' "$n")"; exit 2 ;; esac
+  done
+  # Decimal, whatever the padding: bash arithmetic reads a leading 0 as octal (08 is an error).
+  within=$((10#$within)); interval=$((10#$interval)); grace=$((10#$grace))
+  [ "$interval" -ge 1 ] || { say 'BG_RUN_POLL must be at least 1'; exit 2; }
+  need_absolute "$dir"
+  t0=$SECONDS
+  while :; do
+    verdict "$dir"
+    elapsed=$((SECONDS - t0))
+    case $V in
+      RUNNING) ;;
+      STARTING) [ "$elapsed" -lt "$grace" ] || break ;;
+      *) break ;;
+    esac
+    # The last nap is only what is left of the window, so a --within shorter than the poll, or
+    # not a multiple of it, is still spent in full.
+    left=$((within - elapsed))
+    [ "$left" -gt 0 ] || break
+    if [ "$left" -lt "$interval" ]; then sleep "$left"; else sleep "$interval"; fi
+  done
+  case $V in
+    rc) printf 'rc=%s\n' "$(cat "$dir/rc")"; exit 0 ;;
+    RUNNING) echo RUNNING; exit 3 ;;
+    STARTING) echo STARTING; exit 4 ;;
+    DIED) echo DIED; exit 5 ;;
+    REFUSED) printf 'REFUSED: %s\n' "$(cat "$dir/refused")"; exit 6 ;;
+  esac
+}
+
+[ $# -ge 1 ] || usage
+sub=$1; shift
+case $sub in
+  start) cmd_start "$@" ;;
+  wait) cmd_wait "$@" ;;
+  -h|--help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
+  *) usage ;;
+esac

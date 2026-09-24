@@ -329,6 +329,8 @@ jobs:
         run: python3 issue-wave/scripts/test-fleet-execution.py
       - name: Exercise the fleet launcher against the local box
         run: issue-wave/scripts/test-fleet-worker.sh
+      - name: Exercise the background-run waiter
+        run: issue-wave/scripts/test-bg-run.sh
 
   # ---- every script suite on macOS, two jobs, two runner assignments -----------------------
   #
@@ -493,6 +495,9 @@ jobs:
       - name: fleet launcher
         if: ${{ !cancelled() }}
         run: issue-wave/scripts/test-fleet-worker.sh || { echo '::error title=macOS suite failed::test-fleet-worker.sh'; exit 1; }
+      - name: background-run waiter
+        if: ${{ !cancelled() }}
+        run: issue-wave/scripts/test-bg-run.sh || { echo '::error title=macOS suite failed::test-bg-run.sh'; exit 1; }
 
   windows-driver:
     needs: changes

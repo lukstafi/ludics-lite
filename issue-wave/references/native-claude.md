@@ -18,30 +18,30 @@ woken. What holds a turn is a foreground Bash call, capped at 600 s. So:
 - a project-runner batch blocks with `tools/test-run.sh wait last --timeout 540`, re-issued
   on exit 124 until the run's own status comes back;
 - anything that can outlast the cap, ship-pr's `pr-review.sh watch` and `merge --wait` included
-  (never run in the foreground: a live 👀 can stretch a watch to its 20-minute grace), runs as a
-  background task that keeps its status out of its output, in a fresh directory of its own per
-  run (`d`, under the scratchpad with the issue prefix; a `pid` or `rc` left by an earlier run
-  would be read as this one's):
+  (never run in the foreground: a live 👀 can stretch a watch to its 20-minute grace), runs under
+  [`scripts/bg-run.sh`](../scripts/bg-run.sh), in a fresh directory of its own per run (`<dir>`,
+  absolute, under the scratchpad with the issue prefix, a new name every time). Two calls, each
+  spelling `<dir>` out, since a Bash call's variables do not reach the next one:
 
   ```bash
-  echo $$ > "$d/pid"; <cmd> > "$d/log" 2>&1; echo $? > "$d/rc"
+  # Bash run_in_background: true
+  ~/.claude/skills/issue-wave/scripts/bg-run.sh start <dir> -- <cmd> [arg...]
+  # foreground, re-issued until it prints rc=
+  ~/.claude/skills/issue-wave/scripts/bg-run.sh wait <dir>
   ```
 
-  and the worker blocks on it with a foreground call that ends before the cap by itself:
-
-  ```bash
-  for _ in {1..108}; do [ -s "$d/rc" ] && break; [ -s "$d/pid" ] && ! kill -0 "$(cat "$d/pid")" 2>/dev/null && break; sleep 5; done
-  if [ -s "$d/rc" ]; then echo "rc=$(cat "$d/rc")"; elif [ ! -s "$d/pid" ]; then echo STARTING
-  elif kill -0 "$(cat "$d/pid")" 2>/dev/null; then echo RUNNING; else echo DIED; fi
-  ```
-
-  `rc=` is the command's exit status, read from a file its output cannot write, so a review
-  body quoting `rc=` cannot end the wait. `RUNNING` is re-issued. A task that has not yet
-  written its pid is starting, not dead: `STARTING` is re-issued once, and a second one means the
-  launch itself failed, so start it again. `DIED` means the harness
-  killed the task before it finished (observed at ~40 min for a backgrounded `merge --wait`),
-  and says nothing about what the command was reading: re-arm it, and for `merge --wait` first
-  re-read the merge state as ship-pr's *The approval is one gate* says.
+  `wait` ends before the cap by itself (`--within`, default 540 s) and prints one verdict; its
+  exit code says the same. `rc=<n>` (exit 0): the command finished with status `<n>`, and its
+  output is `<dir>/log`. The status is a file of its own, so a review body quoting `rc=` cannot
+  end the wait. `RUNNING` (3): re-issue it. `STARTING` (4): no pid within a minute of the wait,
+  which a task that has only just launched is, not dead: re-issue it once, and a second one means the launch itself
+  failed, so start again. `DIED` (5): the harness killed the task before the command returned
+  (observed at ~40 min for a backgrounded `merge --wait`), which says nothing about what the
+  command was reading: re-arm it, and for `merge --wait` first re-read the merge state as
+  ship-pr's *The approval is one gate* says. `REFUSED` (6): `start` found the directory holding a
+  run that had ended, whose status would otherwise have been read as this one's. Every re-arm and
+  restart takes a new directory. The script's header is the full contract, and
+  `test-bg-run.sh` beside it pins the races each verdict closes (ludics-lite#357).
 
 ## Worker channel
 
