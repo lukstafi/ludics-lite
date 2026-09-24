@@ -1590,11 +1590,16 @@ test_a_leaked_marker_fails_the_case_that_leaked_it() {
 }
 
 # --- a jq that writes CRLF (ludics-lite#335) ---------------------------------------------------
-# `$(jq -r ...)` over a native jq.exe kept the \r its text mode wrote, and four suites went red
-# under Git Bash on it. These hold pr-review.sh's `jq_lf` to reading any jq back LF, on every
-# platform, through the CRLF stub in both of its modes; the Git Bash leg adds the real jq.exe as
-# the jq on PATH. Each read is taken in a `$(...)`, the shape of every call site, and re-probes in
-# that subshell, so neither the stub's PATH nor its JQ_EOL outlives the read.
+# A native jq.exe's text mode ends every line CRLF, and four suites went red under Git Bash on the
+# \r. These hold pr-review.sh's `jq_lf` to reading any jq back LF, on every platform, through the
+# CRLF stub in both of its modes; the Git Bash leg adds the real jq.exe as the jq on PATH.
+#
+# Every read is judged in BYTES, through a pipe into `od`, never by comparing a `$(...)`: Git
+# Bash's command substitution drops a trailing \r with the \n, so there a `$(...)` of a CRLF jq's
+# one-line answer reads clean, and an assertion shaped that way passes over the defect it is for.
+# Each read re-probes in its own subshell, so neither the stub's PATH nor its JQ_EOL outlives it.
+od_bytes() { od -An -c | tr -d ' \n'; } # stdin as od -c spells it, `x\r\n` for x CR LF
+
 jq_under_stub() { # <stub dir> <jq args...>: pr-review.sh's jq, re-probed with the stub first
   local dir="$1"
   shift
@@ -1605,35 +1610,34 @@ jq_under_stub() { # <stub dir> <jq args...>: pr-review.sh's jq, re-probed with t
 
 test_a_crlf_jq_is_read_back_lf() {
   local mode want dir out rc
-  assert_eq "$(jq -rn '"x"')" x "the jq on PATH should read back LF as sourced (JQ_EOL=$JQ_EOL)"
+  assert_eq "$(jq -rn '"x"' | od_bytes)" 'x\n' "the jq on PATH should read back LF as sourced (JQ_EOL=$JQ_EOL)"
   for mode in binary no-binary; do
     test_tmpdir dir "jq-$mode"
     jq_crlf_stub "$dir" "$mode"
     # The control's own control: a stub that writes LF would make every assertion below vacuous.
-    assert_eq "$(PATH="$dir:$PATH" command jq -rn '"x"')" $'x\r' "the $mode stub should write CRLF"
+    assert_eq "$(PATH="$dir:$PATH" command jq -rn '"x"' | od_bytes)" 'x\r\n' "the $mode stub should write CRLF"
     want=binary
     [ "$mode" = binary ] || want=strip
     assert_eq "$(PATH="$dir:$PATH" && jq_eol_probe && printf '%s' "$JQ_EOL")" "$want" \
       "a CRLF jq in $mode mode should probe as $want"
-    assert_eq "$(jq_under_stub "$dir" -r .c <<<'{"c":"failure"}')" failure \
+    assert_eq "$(jq_under_stub "$dir" -r .c <<<'{"c":"failure"}' | od_bytes)" 'failure\n' \
       "$mode: a conclusion should read back without its \\r, or it is not red"
-    assert_eq "$(jq_under_stub "$dir" -r '.[]' <<<'["a","b"]')" $'a\nb' \
+    assert_eq "$(jq_under_stub "$dir" -r '.[]' <<<'["a","b"]' | od_bytes)" 'a\nb\n' \
       "$mode: every line should lose its \\r, not only the last"
     # One \r per line comes off, not every \r: a comment body's own CRLF is data.
-    assert_eq "$(jq_under_stub "$dir" -r .b <<<'{"b":"one\r\ntwo"}')" $'one\r\ntwo' \
+    assert_eq "$(jq_under_stub "$dir" -r .b <<<'{"b":"one\r\ntwo"}' | od_bytes)" 'one\r\ntwo\n' \
       "$mode: a CRLF inside a raw string should survive"
     rc=0
-    out=$(jq_under_stub "$dir" -e .c <<<'{"c":false}') || rc=$?
-    assert_eq "$rc" 1 "$mode: jq's own status should reach the caller through the read"
-    assert_eq "$out" false "$mode: and so should its output"
+    (jq_under_stub "$dir" -e .c <<<'{"c":false}' >/dev/null) || rc=$?
+    assert_eq "$rc" 1 "$mode: jq's own status should reach the caller"
     # pr-review.sh's own `jq`, which the shim replaces in every suite: sourced alone, under the
     # stub from the start, as a Windows user runs it.
-    out=$(PATH="$dir:$PATH" SHIP_PR_TEST_SOURCE_ONLY=1 bash -c '. "$1" && jq -r .c' _ "$HELPER" <<<'{"c":"failure"}')
-    assert_eq "$out" failure "$mode: pr-review.sh's own jq, unshimmed, should read back LF"
+    out=$(PATH="$dir:$PATH" SHIP_PR_TEST_SOURCE_ONLY=1 bash -c '. "$1" && jq -r .c' _ "$HELPER" <<<'{"c":"failure"}' | od_bytes)
+    assert_eq "$out" 'failure\n' "$mode: pr-review.sh's own jq, unshimmed, should read back LF"
     # Through the fixtures' shim as well, both ways: it forwards to jq_lf, so an unbroken
     # program reads back LF, and a broken one still refuses.
-    out=$(PATH="$dir:$PATH" && jq_eol_probe && probe_jq mine && printf '%s' "$PROBE_OUT")
-    assert_eq "$out" '{"marked":"mine"}' "$mode: the jq shim should forward to jq_lf, not to the CRLF jq"
+    out=$(jq_under_stub "$dir" -cn --arg tag mine '{marked: $tag}' | od_bytes)
+    assert_eq "$out" '{"marked":"mine"}\n' "$mode: the jq shim should forward to jq_lf, not to the CRLF jq"
     rc=0
     (PATH="$dir:$PATH" && jq_eol_probe && with_broken_jq marked probe_jq mine) || rc=$?
     assert_eq "$rc" 3 "$mode: and a marked program should still refuse under it"
@@ -1642,14 +1646,15 @@ test_a_crlf_jq_is_read_back_lf() {
 
 # The knob CI runs whole suites under: each mode probes as the jq it stands for, and the suite's
 # own reads come back LF; a value it does not know is refused rather than run as an LF suite.
+# Byte counts, for the reason above: 3 is x CR LF, 2 is x LF.
 test_the_crlf_knob_runs_a_suite_over_the_stub() {
   local knob want
   for knob in crlf crlf-no-binary; do
     want=binary
     [ "$knob" = crlf ] || want=strip
     SHIP_PR_TEST_JQ_EOL="$knob" control 'printf "eol=%s\n" "$JQ_EOL"' \
-      '[ "$(command jq -rn "\"x\"")" = "$(printf "x\r")" ] || bail "the stub is not the jq on PATH"' \
-      '[ "$(jq -rn "\"x\"")" = x ] || bail "a read came back with its CR"'
+      '[ "$(($(command jq -rn "\"x\"" | wc -c)))" = 3 ] || bail "the stub is not the jq on PATH"' \
+      '[ "$(($(jq -rn "\"x\"" | wc -c)))" = 2 ] || bail "a read came back with its CR"'
     assert_eq "$CONTROL_RC" 0 "SHIP_PR_TEST_JQ_EOL=$knob should run the suite ($CONTROL_ERR)"
     assert_contains "$CONTROL_OUT" "eol=$want" "SHIP_PR_TEST_JQ_EOL=$knob should probe as $want"
     assert_contains "$CONTROL_OUT" "PASS: test_a_case" "and the case should run"

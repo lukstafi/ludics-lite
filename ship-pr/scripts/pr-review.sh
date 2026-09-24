@@ -313,9 +313,9 @@ warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 
 # --- jq's line ending (ludics-lite#335) -------------------------------------------------------
 # A native jq.exe on Windows (winget, Chocolatey, Scoop; Git for Windows ships no jq) writes its
-# stdout in text mode and ends every line CRLF. `$(jq -r ...)` strips the \n and keeps the \r, so
-# a conclusion read back as `failure\r` is not red and `[ "$n" = 0 ]` takes the wrong branch, at
-# every one of this script's ~100 jq calls. So every call goes through `jq` below, and the line
+# stdout in text mode and ends every line CRLF. Every line but a `$(...)`'s last keeps its \r, so
+# a conclusion read off a list is `failure\r`, not red, and a decision takes the wrong branch, at
+# any of this script's ~100 jq calls. So every call goes through `jq` below, and the line
 # ending is decided ONCE, here, by asking the jq on PATH:
 #   lf      it writes LF already (every Unix jq, an MSYS2 jq): called as is, no cost;
 #   binary  it writes CRLF and `-b` (jq 1.7+ on Windows) turns that off: called with `-b`, which
@@ -328,13 +328,17 @@ warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 # replaces `jq`, forwards to `jq_lf` and keeps the line ending. A jq that is missing or broken
 # probes as `lf`, and the first real call then fails as it did before this.
 JQ_EOL=lf
+# The probe counts the bytes of `"x"` through a pipe (3 is x\r\n) rather than comparing a
+# `$(...)`: Git Bash's command substitution drops a trailing \r with the \n, so `$(jq -rn '"x"')`
+# reads `x` from the very jq.exe that writes x\r\n. There a single value read back clean all
+# along; a multi-line read, a `while read` and a pipe did not.
 jq_eol_probe() {
-  local out
+  local n
   JQ_EOL=lf
-  out=$(command jq -rn '"x"' 2>/dev/null) || return 0
-  [ "$out" = $'x\r' ] || return 0
-  out=$(command jq -b -rn '"x"' 2>/dev/null) || out=""
-  if [ "$out" = x ]; then JQ_EOL=binary; else JQ_EOL=strip; fi
+  n=$(command jq -rn '"x"' 2>/dev/null | wc -c) || return 0
+  [ "$((n))" -eq 3 ] || return 0
+  n=$(command jq -b -rn '"x"' 2>/dev/null | wc -c) || n=0
+  if [ "$((n))" -eq 2 ]; then JQ_EOL=binary; else JQ_EOL=strip; fi
 }
 jq_lf() {
   case "$JQ_EOL" in
