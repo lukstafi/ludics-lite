@@ -733,7 +733,8 @@ and answers an outage with an empty list indistinguishable from a PR whose CI ne
 
 **It refuses while any review thread is unresolved** (exit 1, naming each by the id `resolve`
 takes; exit 3 when the threads could not be read), whatever head the thread cites and whatever
-the build says — the `unresolved` state above, read once after any `--wait`. No flag bypasses it:
+the build says — the `unresolved` state above, read before every merge attempt (after any
+`--wait`), since a thread opened meanwhile moves no head for `--match-head-commit` to catch. No flag bypasses it:
 answer and resolve the threads, then re-run `merge`.
 
 The other verdicts are not refusals, and none of them is a green light either:

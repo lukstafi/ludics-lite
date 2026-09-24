@@ -4843,11 +4843,6 @@ cmd_merge() {
       "filters), get one onto it (gh workflow run) or hand the merge to the maintainer with" \
       "the record; a close-out merge is never made by dropping --require-green."
   fi
-  # Open review threads refuse the merge, whatever head they cite and whatever else passed
-  # (ludics-lite#289; see approval_gate). After the build gate so that it is read after a --wait,
-  # when the last round's threads have had the whole wait to be answered; one read, and no flag
-  # bypasses it, because what clears it is a `resolve`, not a push.
-  merge_threads_gate "$PR_NUM"
   # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
   # verdict is read late, with only the closing-keyword re-scan below it. A loud WARNING, not a gate: the
   # roll-forward policy (ahrefs/ocannl#861, see warn_base_drift) lets a clean merge proceed on the
@@ -4874,6 +4869,12 @@ cmd_merge() {
     # ambiguous. Both cost more than the window is worth: it is bounded by the backoff (about 35s
     # over four attempts) and opens only during a GitHub gateway incident.
     warn_multi_close "$PR_NUM" again
+    # Open review threads refuse the merge, whatever head they cite and whatever else passed
+    # (ludics-lite#289; see approval_gate). Read here, before EVERY attempt, for the body's
+    # reason: a thread opened during a --wait or between attempts moves no head, so
+    # --match-head-commit cannot see it (review of #370, round 2). The ordinary path makes one
+    # read; only a retry adds another. No flag bypasses it — what clears it is a `resolve`.
+    merge_threads_gate "$PR_NUM"
     # AFTER the scan, and inside the loop: the queue read has to be the last thing before the call,
     # and the scan above makes three REST reads that a queue could be enabled during, or a retarget
     # onto a queued base completed during (review round 10). It moved here from just before the

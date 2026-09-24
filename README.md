@@ -703,7 +703,8 @@ paging at the cap, a row that did not parse and a GraphQL outage are each `unkno
 never a clean approval. `test-pr-review-watch.sh` runs PR #277's two-head shape through a watch
 (findings on the previous head scrolled past as NOT about head, the 👍 on the head above it), and
 `test-pr-review-merge.sh` pins `merge` refusing on an open thread (exit 1, no flag bypassing it)
-and on an unread connection (exit 3), with one read per merge.
+and on an unread connection (exit 3), with one read per merge attempt, so a thread opened
+between attempts refuses the retry.
 `test-pr-review-base-drift.sh` pins the other half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
 which stands still on a conflicted PR.
 

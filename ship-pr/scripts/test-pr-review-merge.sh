@@ -45,6 +45,7 @@ PR_BODY="A body with nothing to close."  # what the body read answers with
 PR_BODY_LATER=""                       # nonempty = what the SECOND body read on answers with
 BODY_FAIL=""                           # nonempty = the body read answers with a 404
 THREADS_JSON='[]'                      # the PR's review threads (review_thread rows)
+THREADS_JSON_LATER=""                  # nonempty = what the SECOND threads read on answers with
 FAIL_GRAPHQL=""                        # nonempty = the review-threads read gets a 503
 # The "from the SECOND read on" switches above are counted by the lib's fixture_call_count, under
 # the names body, base and default-branch: gh_retry calls the fixture inside a command
@@ -125,12 +126,17 @@ gh() {
     case "$*" in
     *reviewThreads*)
       printf 'CALL reviewThreads\n' >>"$CALLS_FILE"
+      reads=$(fixture_call_count threads) || return 1
       if [ -n "$FAIL_GRAPHQL" ]; then
         printf 'gh: 503 No server is currently available to service your request\n' >&2
         return 1
       fi
       gh_fixture_parse "$@"
-      gh_fixture_answer "$(review_threads_answer "$THREADS_JSON" "$@")"
+      if [ -n "$THREADS_JSON_LATER" ] && [ "$reads" -ge 2 ]; then
+        gh_fixture_answer "$(review_threads_answer "$THREADS_JSON_LATER" "$@")"
+      else
+        gh_fixture_answer "$(review_threads_answer "$THREADS_JSON" "$@")"
+      fi
       ;;
     *mergeQueue*) printf 'CALL %s\n' "$*" >>"$CALLS_FILE"; echo "$MERGE_QUEUE" ;;
     *) bail "unexpected graphql call: $*" ;;
@@ -199,6 +205,7 @@ reset() {
   PR_BODY_LATER=""
   BODY_FAIL=""
   THREADS_JSON='[]'
+  THREADS_JSON_LATER=""
   FAIL_GRAPHQL=""
 }
 
@@ -1423,6 +1430,26 @@ test_an_open_review_thread_refuses_the_merge() {
   assert_eq "$(grep -c -x 'CALL reviewThreads' "$CALLS_FILE")" 1 "one read of the threads per merge"
 }
 
+test_a_thread_opened_between_merge_attempts_refuses_the_retry() {
+  # The threads are read before EVERY attempt (review of #370, round 2): a thread opened while the
+  # first attempt was refused as not mergeable moves no head, so --match-head-commit would let the
+  # retry land over it.
+  reset
+  MERGE_NOT_MERGEABLE=1
+  THREADS_JSON_LATER="[$(review_thread 4095865442 false)]"
+  run_merge
+  assert_eq "$MERGE_RC" 1 "the retry is refused on the thread opened since the first attempt ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "1 review thread(s) still UNRESOLVED — 4095865442" "naming it"
+  assert_eq "$(grep -c -x 'CALL reviewThreads' "$CALLS_FILE")" 2 "one read per attempt"
+  assert_eq "$(grep -c '^CALL pr merge' "$CALLS_FILE")" 1 "and only the first attempt was made"
+  # The control: nothing opens in between, and the retry lands on its own read.
+  THREADS_JSON_LATER=""
+  rm -f "$TEST_ROOT/merge-failed-once"
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the retry lands ($MERGE_OUTPUT)"
+  assert_eq "$(grep -c -x 'CALL reviewThreads' "$CALLS_FILE")" 2 "one read per attempt"
+}
+
 test_an_unread_thread_connection_refuses_as_transport() {
   reset
   FAIL_GRAPHQL=1
@@ -1505,6 +1532,7 @@ tests=(
   test_a_retarget_skip_clears_a_clean_earlier_scan
   test_an_open_review_thread_refuses_the_merge
   test_an_unread_thread_connection_refuses_as_transport
+  test_a_thread_opened_between_merge_attempts_refuses_the_retry
 )
 
 run_tests "${tests[@]}"
