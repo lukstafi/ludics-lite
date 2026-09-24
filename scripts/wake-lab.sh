@@ -7,12 +7,12 @@
 #   2. A magic packet sent directly from this Mac (broadcast, UDP ports 7 and 9).
 #
 # Usage:
-#   wake-lab.sh [rog|minix|tuf|all]       wake (default: rog minix; all: rog minix tuf)
+#   wake-lab.sh [rog|minix|tuf|all]       wake (default: rog minix; all: every box in the endpoint map)
 #   wake-lab.sh --wait [--wsl] rog        wake, then poll until configured OS answers
 #   wake-lab.sh --wait --restart-wsl rog  ...and start WSL from a FRESH VM (wsl --shutdown first)
 #   wake-lab.sh status [box...]           per-box reachability and reached OS, whether each lab lock
 #                                         is really held, and the box's execution reservations
-#                                         (default: all three)
+#                                         (default: every box)
 #   wake-lab.sh sleep|hibernate|down box  suspend / hibernate / full shutdown
 #   wake-lab.sh kick-wsl box              start the WSL VM (it never autostarts at boot)
 #   wake-lab.sh restart-wsl box           shut the WSL VM down and start it again
@@ -99,22 +99,20 @@ load_hosts() {
 # The table's box list is mac_of's, and every target must be in it BEFORE anything is sent. A table
 # that knows rog but not minix would otherwise wake rog, then report minix as a typo halfway
 # through the operation -- and the dispatch loop's exit status hides that, so the run reads as a
-# success. Refusing the whole run is what "refuse rather than run half-configured" means here.
+# success. Refusing the whole run is what "refuse rather than run half-configured" means here. The
+# same holds for the endpoint map below: the map is checked whole, and then every target's row,
+# whatever its kind.
 check_targets() {
-  local t bad="" kind guest
+  local t bad="" kind
+  check_map || exit 1
   for t in "$@"; do
     mac_of "$t" >/dev/null 2>&1 || { bad="$bad $t"; continue; }
-    kind=$(kind_of "$t") || kind=""
+    kind=$(box_kind "$t") || kind=""
     case "$kind" in
-      linux)
-        linux_of "$t" >/dev/null || { echo "wake-lab.sh: no linux ssh endpoint for $t" >&2; exit 1; } ;;
-      wsl)
-        load_wsl_adapter || exit 1
-        ts_of "$t" >/dev/null || { echo "wake-lab.sh: no Windows ssh endpoint for $t" >&2; exit 1; }
-        guest=$(wsl_of "$t") || guest=""
-        [ -n "$guest" ] || { echo "wake-lab.sh: no WSL guest ssh endpoint for $t" >&2; exit 1; } ;;
+      linux|wsl) ;;
       *) echo "wake-lab.sh: invalid kind for $t: ${kind:-(none)} (expected wsl or linux)" >&2; exit 1 ;;
     esac
+    check_endpoints "$t" "$kind" || exit 1
   done
   [ -z "$bad" ] && return 0
   echo "wake-lab.sh: not in the host table ($HOSTS_FILE):$bad" >&2
@@ -122,13 +120,167 @@ check_targets() {
   exit 1
 }
 
-# Native Ubuntu ssh aliases. The short box names are the WoL/lock identities; the ssh names
-# identify the OS reached after the boot selection. More site facts remain in hosts.sh.
-linux_of() { case "$1" in
-  rog) echo rog-nv-linux ;;
-  minix) echo minix-amd-linux ;;
-  tuf) echo tuf-amd-linux ;;
-  *) return 1 ;; esac; }
+# The kind a box is operated as this run. Today that is the site's static kind_of, and every
+# dispatch reads it through here rather than calling kind_of itself, so that a probe of what a
+# dual-boot box really booted (ludics-lite#353's boot-windows / boot-linux) overrides it for the
+# session in this one place; the endpoint each verb then uses follows from endpoint_of.
+box_kind() { kind_of "$1"; }
+
+# ---------------------------------------------------------------- the endpoint map
+# The ONE box -> ssh endpoint mapping (ludics-lite#314). Validation, status, the waits and the WSL
+# adapter all read it through endpoint_of, and nothing else in either file names an ssh alias: while
+# the aliases were restated in four places, the review of the asus -> tuf rename (PR #313) twice
+# found one that had been missed -- a Windows endpoint that passed WSL validation with no guest
+# alias, and a status that never probed the renamed box's Windows boot. An endpoint names the OS it
+# reaches:
+#   linux  native Ubuntu                  win  the Windows host's sshd, over Tailscale
+#   wsl    the WSL guest on that host     lan  the same Windows sshd over the direct LAN route,
+#                                              which answers seconds after a cold boot
+# A row lists every OS the box can boot, whatever kind_of says it is set to today: kind_of is the
+# site's current setting (hosts.sh), this is which endpoints exist, and status probes the others so
+# that a dual-boot box which booted the other OS says so. The short box names, first on each row,
+# are the WoL and lock identities, and the rows in order are the lab: `all` and a bare `status`
+# expand to them. Adding or renaming a box is one row here plus its hosts.sh entries (and, for a
+# box a bare wake or power verb should reach, ACT_DEFAULT below), and check_endpoints refuses an
+# incomplete row before anything is sent.
+ENDPOINT_MAP=(
+  "rog   linux=rog-nv-linux    win=rog-nv-win    wsl=rog-nv-wsl    lan=rog-lan"
+  "minix linux=minix-amd-linux win=minix-amd-win wsl=minix-amd-wsl lan=minix-lan"
+  "tuf   linux=tuf-amd-linux   win=tuf-amd-win   wsl=tuf-amd-wsl"    # Wi-Fi only: no LAN route
+)
+# The default for a verb that ACTS -- wake, sleep, hibernate, down, kick-wsl -- given no box: the
+# boxes with Ethernet WoL. Not derived from the site's eth_mac_of, because a table missing a box
+# would then shrink the default silently instead of refusing it (ludics-lite#320).
+ACT_DEFAULT=(rog minix)
+
+endpoints_of() { # endpoints_of <box> -- that box's row, less its name; 1 when the map has none
+  local r name rest
+  for r in "${ENDPOINT_MAP[@]}"; do
+    read -r name rest <<<"$r"
+    [ "$name" = "$1" ] && { printf '%s\n' "$rest"; return 0; }
+  done
+  return 1
+}
+
+lab_boxes() { # the map's box names, in row order, one per line
+  local r name rest
+  for r in "${ENDPOINT_MAP[@]}"; do read -r name rest <<<"$r"; printf '%s\n' "$name"; done
+}
+
+endpoint_of() { # endpoint_of <box> linux|win|wsl|lan -- that OS's ssh alias; 1 when the box has none
+  local row w ws
+  row=$(endpoints_of "$1") || return 1
+  # An array, not an unquoted $row, so that no glob can expand in the split; the count guard is for
+  # bash 3.2, which calls an empty array unbound under set -u.
+  read -r -a ws <<<"$row"; [ ${#ws[@]} -gt 0 ] || return 1
+  for w in "${ws[@]}"; do
+    case "$w" in "$2"=?*) printf '%s\n' "${w#*=}"; return 0 ;; esac
+  done
+  return 1
+}
+
+# check_map -- the rules no single row can check, or say what is wrong and return 1.
+#  * Each box name has one row, and is a plain name (a letter or digit, then letters, digits, `_`
+#    and `-`), since it also names the box's lock files. endpoints_of reads a name's first row
+#    while `all` expands to every row, so a second row would be acted on twice and validated never.
+#    Nor may it be a word the argument parser takes (a verb, or `all`): `wake-lab.sh down` would
+#    power off the default boxes instead of waking a box called down.
+#  * Each alias belongs to one box. A row copied from another box and never edited is complete by
+#    every per-row rule, and would reach that other box under this one's locks: `sleep nova` would
+#    suspend tuf without seeing a lane or hold lock taken on tuf.
+check_map() {
+  local r name rest w ws owner boxes=" " aliases=" " bad=""
+  for r in "${ENDPOINT_MAP[@]}"; do
+    read -r name rest <<<"$r"
+    case "$name" in
+      ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_-]*) bad="$bad the box name $(printf %q "$name") is not a plain name;"; continue ;;
+    esac
+    case "$name" in
+      status|sleep|hibernate|down|kick-wsl|restart-wsl|unhold|lock-path|all)
+        bad="$bad the box name $name is a command word;"; continue ;;
+    esac
+    case "$boxes" in *" $name "*) bad="$bad $name has two rows;"; continue ;; esac
+    boxes="$boxes$name "
+    read -r -a ws <<<"$rest"
+    for w in ${ws[@]+"${ws[@]}"}; do
+      case "$w" in *=?*) ;; *) continue ;; esac   # a malformed entry is check_endpoints' to name
+      w=${w#*=}
+      case "$aliases" in
+        *" $w@"*) owner=${aliases#*" $w@"}; owner=${owner%% *}
+                  bad="$bad the alias $(printf %q "$w") is on both $owner and $name;" ;;
+        *) aliases="$aliases$w@$name " ;;
+      esac
+    done
+  done
+  [ -z "$bad" ] && return 0
+  printf '%s\n' "wake-lab.sh: the endpoint map is inconsistent:${bad%;}" \
+    "  fix ENDPOINT_MAP in wake-lab.sh; nothing was sent." >&2
+  return 1
+}
+
+# check_endpoints <box> <kind> -- the box's row is complete, or say what is wrong and return 1.
+# A fail-closed allowlist: the row is refused unless every rule holds, and each rule is an omission
+# a review once had to find by hand.
+#  * The box has a row. A box hosts.sh knows and this map does not reaches nothing.
+#  * Every entry is `<os>=<alias>`, with one of the four keys above and an alias that starts with a
+#    letter or digit and goes on in letters, digits, `.`, `_` and `-`. A misspelt key is an OS that
+#    status would silently never probe, and an alias with a leading `-` is an ssh OPTION: `ssh
+#    -V-linux 'exit 0'` prints the version and exits 0, so the probe reads the box as UP.
+#  * win and wsl come as a pair. A Windows host with no guest alias passed WSL validation (tuf, PR
+#    #313), and a guest with no host has nothing to start its VM.
+#  * lan only beside win: it is a second route to that same Windows sshd.
+#  * linux, win and wsl share one stem (`<stem>-linux`, `<stem>-win`, `<stem>-wsl`), and lan is
+#    `<box>-lan`. A half-renamed row would go on probing the old box's name for one of its OSes.
+#  * The configured kind's own endpoints are there.
+check_endpoints() {
+  local box=$1 kind=$2 row w ws key alias stem="" linux="" win="" wsl="" lan="" bad="" seen=""
+  if ! row=$(endpoints_of "$box"); then
+    printf '%s\n' "wake-lab.sh: no ssh endpoints for $box in wake-lab.sh's endpoint map" \
+      "  add its row to ENDPOINT_MAP; nothing was sent." >&2
+    return 1
+  fi
+  read -r -a ws <<<"$row"
+  [ ${#ws[@]} -gt 0 ] || ws=("(empty row)")
+  for w in "${ws[@]}"; do
+    case "$w" in *=*) ;; *) bad="$bad $(printf %q "$w") is not <os>=<alias>;"; continue ;; esac
+    key=${w%%=*}; alias=${w#*=}
+    case "$alias" in
+      ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) bad="$bad $(printf %q "$w") is not a plain ssh alias;"; continue ;;
+    esac
+    # Twice is refused rather than resolved: endpoint_of reads the first and this the last.
+    case " $seen " in *" $key "*) bad="$bad $(printf %q "$key") is listed twice;"; continue ;; esac
+    seen="$seen $key"
+    case "$key" in
+      linux) linux=$alias ;;
+      win)   win=$alias ;;
+      wsl)   wsl=$alias ;;
+      lan)   lan=$alias ;;
+      *) bad="$bad unknown endpoint $(printf %q "$key") (expected linux, win, wsl or lan);" ;;
+    esac
+  done
+  [ -n "$win" ] && [ -z "$wsl" ] && bad="$bad a Windows endpoint ($win) with no WSL guest alias;"
+  [ -n "$wsl" ] && [ -z "$win" ] && bad="$bad a WSL guest ($wsl) with no Windows host to start it;"
+  [ -n "$lan" ] && [ -z "$win" ] && bad="$bad a LAN route ($lan) with no Windows endpoint;"
+  [ -n "$lan" ] && [ "$lan" != "${box}-lan" ] && bad="$bad the LAN route $lan is not $box-lan;"
+  for w in "${linux}:-linux" "${win}:-win" "${wsl}:-wsl"; do
+    alias=${w%%:*}; key=${w#*:}
+    [ -n "$alias" ] || continue
+    case "$alias" in
+      ?*"$key") [ -n "$stem" ] || stem=${alias%"$key"}
+                [ "${alias%"$key"}" = "$stem" ] || bad="$bad $alias does not share the stem $stem;" ;;
+      *) bad="$bad $alias does not end in $key;" ;;
+    esac
+  done
+  case "$kind" in
+    linux) [ -n "$linux" ] || bad="$bad no linux ssh endpoint for a linux box;" ;;
+    wsl)   [ -n "$win" ] || bad="$bad no Windows ssh endpoint for a wsl box;"
+           [ -n "$wsl" ] || bad="$bad no WSL guest ssh endpoint for a wsl box;" ;;
+  esac
+  [ -z "$bad" ] && return 0
+  printf '%s\n' "wake-lab.sh: incomplete ssh endpoints for $box:${bad%;}" \
+    "  fix its row in ENDPOINT_MAP; nothing was sent." >&2
+  return 1
+}
 
 # ---------------------------------------------------------------- plumbing
 # The header block, line 2 through the last line before the first non-comment line. The range was
@@ -253,9 +405,9 @@ router_active() { # router_active <box> — echo 1/0/? for the router's NewActiv
 # "Up" means the configured OS answers ssh. A dual-boot box can answer through the other OS;
 # status reports both probes so a wake never claims to know what GRUB selected.
 is_up() { # is_up <box>
-  case "$(kind_of "$1")" in
+  case "$(box_kind "$1")" in
     wsl) wsl_box_live "$1" ;;
-    linux) ssh_probe "$(linux_of "$1")" ;;
+    linux) ssh_probe "$(endpoint_of "$1" linux)" ;;
   esac
 }
 
@@ -280,10 +432,10 @@ status_one() { # status_one <box>
   local l host win guest blocks="" n
   l=$(router_active "$1")
   printf '%-6s router-active=%-1s' "$1" "$l"
-  if [ "$(kind_of "$1")" = wsl ]; then
+  if [ "$(box_kind "$1")" = wsl ]; then
     wsl_status_fields "$1"
   else
-    host=$(linux_of "$1") || return 1
+    host=$(endpoint_of "$1" linux) || return 1
     if ssh_probe "$host"; then
       printf '  os=linux  linux=UP'
       if blocks=$(sleep_blocks "$host"); then
@@ -293,17 +445,14 @@ status_one() { # status_one <box>
         printf '  sleep-blocks=?'
       fi
     else
-      # A dual-boot box may have booted Windows despite its configured Linux kind. The
-      # suffixes are only liveness probes for status; the Windows commands remain in the WSL
-      # adapter and are never read on this path.
-      case "$1" in
-        rog|minix|tuf)
-          win=${host%-linux}-win; guest=${host%-linux}-wsl
-          if ssh_probe "$guest"; then printf '  os=wsl  linux=--  wsl=UP'
-          elif ssh_probe "$win"; then printf '  os=windows  linux=--  win=UP'
-          else printf '  os=--  linux=--'; fi ;;
-        *) printf '  os=--  linux=--' ;;
-      esac
+      # A dual-boot box may have booted Windows despite its configured Linux kind, so every
+      # other OS the endpoint map lists for it is probed -- a box with none reads os=--. These
+      # are liveness probes only; the Windows commands stay in the WSL adapter, never read here.
+      guest=$(endpoint_of "$1" wsl) || guest=""
+      win=$(endpoint_of "$1" win) || win=""
+      if ssh_probe "$guest"; then printf '  os=wsl  linux=--  wsl=UP'
+      elif ssh_probe "$win"; then printf '  os=windows  linux=--  win=UP'
+      else printf '  os=--  linux=--'; fi
     fi
   fi
   lab_locks_fields "$1"
@@ -319,7 +468,7 @@ do_status() {
   echo "box    router-active   reached OS and ssh endpoint, lab locks, execution reservations"
   for n in "$@"; do status_one "$n"; done
   echo
-  for n in "$@"; do [ "$(kind_of "$n")" = wsl ] && wsl_boxes+=("$n"); done
+  for n in "$@"; do [ "$(box_kind "$n")" = wsl ] && wsl_boxes+=("$n"); done
   [ ${#wsl_boxes[@]} -gt 0 ] && wsl_status_extra "${wsl_boxes[@]}"
   echo "sleep-blocks counts a native Linux box's logind block inhibitors on sleep (listed under it):"
   echo "while one is held, 'sleep' and 'hibernate' there are refused by the OS, whatever the lab locks say."
@@ -534,8 +683,9 @@ lab_locks_fields() { # lab_locks_fields <box>
 # checkout (WAKE_LAB_FLEET_WORKER overrides the path), under the probe cap, because that reader
 # asks the anchor box over ssh from anywhere else. A registry that cannot be read or does not parse
 # is `?`, never 0: "nothing reserved" and "could not look" call for opposite conclusions.
-# A record names its box by an ssh identity, and a box has two: its native Linux endpoint
-# (`linux_of`) and, where the WSL adapter is loaded, its WSL guest (`wsl_of`). Either one counts.
+# A record names its box by an ssh identity, and a box has one per endpoint in its row of the
+# endpoint map -- native Linux, the WSL guest, the Windows host and its LAN route. Any one counts,
+# whatever the box's configured kind: a reservation on a box's guest holds that box.
 RESERVATIONS=""   # the listing as JSON; empty means it could not be read
 RES_DETAILS=""
 reservations_read() {
@@ -569,14 +719,15 @@ capped_tree() { # capped_tree <seconds> <cmd...>
     exit(($st & 127) ? 128 + ($st & 127) : $st >> 8);' "$1" "$CAP_EXPIRED" "${@:2}"
 }
 reservations_fields() { # reservations_fields <box>
-  local linux wsl="" ids n
+  local os e names="" ids n
   RES_DETAILS=""
-  linux=$(linux_of "$1") || linux=""
-  if declare -F wsl_of >/dev/null; then wsl=$(wsl_of "$1") || wsl=""; fi
-  if [ -z "$RESERVATIONS" ] || { [ -z "$linux" ] && [ -z "$wsl" ]; } || ! ids=$(jq -r \
-       --arg l "$linux" --arg w "$wsl" \
-       'if type == "array" then .[] | .request.execution_host as $h
-          | select(($l != "" and $h == $l) or ($w != "" and $h == $w))
+  for os in linux wsl win lan; do
+    e=$(endpoint_of "$1" "$os") && names="$names$e"$'\n'
+  done
+  if [ -z "$RESERVATIONS" ] || [ -z "$names" ] || ! ids=$(jq -r --arg names "$names" \
+       '($names | split("\n") | map(select(. != ""))) as $ns
+        | if type == "array" then .[] | .request.execution_host as $h
+          | select($ns | index([$h]))
           | "\(.request_id) (\(.state))" else error("not a list") end' <<<"$RESERVATIONS" 2>/dev/null); then
     printf '  reservations=?'; return 0
   fi
@@ -712,12 +863,12 @@ wake() { # wake <box>
 }
 
 power_action() {
-  if [ "$(kind_of "$2")" = wsl ]; then
+  if [ "$(box_kind "$2")" = wsl ]; then
     wsl_power_action "$@"
     return
   fi
   local cmd host output action_rc
-  host=$(linux_of "$2") || return 1
+  host=$(endpoint_of "$2" linux) || return 1
   case "$1" in
     sleep) cmd="systemctl --no-ask-password --check-inhibitors=yes suspend" ;;
     hibernate) cmd="systemctl --no-ask-password hibernate" ;;
@@ -805,7 +956,7 @@ load_wsl_adapter() {
 prepare_boxes() { # WSL gets its existing concurrent kick; Linux needs nothing after sshd boots.
   local n wsl_boxes=()
   for n in "$@"; do
-    if [ "$(kind_of "$n")" = wsl ]; then wsl_boxes+=("$n");
+    if [ "$(box_kind "$n")" = wsl ]; then wsl_boxes+=("$n");
     else echo "linux ready on $n (sshd starts at boot; no holder needed)"; fi
   done
   if [ ${#wsl_boxes[@]} -gt 0 ]; then start_wsl "${wsl_boxes[@]}"; fi
@@ -820,6 +971,7 @@ HOLD_LOCKED=0  # set in a box's subshell once its reservation holds that box's H
 VERB=wake
 TARGETS=()
 
+# Every word taken here, and `all` below, is a name check_map refuses for a box.
 case "${1:-}" in
   status|sleep|hibernate|down|kick-wsl|unhold) VERB=$1; shift ;;
   restart-wsl) VERB=kick-wsl; FRESH_WSL=fresh; shift ;;
@@ -835,7 +987,7 @@ for arg in "$@"; do
     --restart-wsl) WANT_WSL=1; FRESH_WSL=fresh ;;
     --force) FORCE=1 ;;
     -h|--help) usage; exit 0 ;;
-    all) TARGETS+=(rog minix tuf) ;;
+    all) while IFS= read -r t; do TARGETS+=("$t"); done < <(lab_boxes) ;;
     *) TARGETS+=("$arg") ;;
   esac
 done
@@ -847,7 +999,8 @@ done
 # `status all`, the default is checked against the site table whole, so a table that does not know
 # tuf refuses a bare `status` rather than silently shrinking it; name the boxes there instead.
 if [ ${#TARGETS[@]} -eq 0 ]; then
-  if [ "$VERB" = status ]; then TARGETS=(rog minix tuf); else TARGETS=(rog minix); fi
+  if [ "$VERB" = status ]; then while IFS= read -r t; do TARGETS+=("$t"); done < <(lab_boxes)
+  else TARGETS=("${ACT_DEFAULT[@]}"); fi
 fi
 
 # A --hold that holds nothing is a lane that believes it is held and is not, which is the exact
@@ -865,7 +1018,7 @@ if [ "$VERB" = unhold ]; then
   [ ! -r "$HOSTS_FILE" ] || . "$HOSTS_FILE"
   for t in "${TARGETS[@]}"; do
     state_dir=${WAKE_LAB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/wake-lab}
-    if declare -F kind_of >/dev/null && [ "$(kind_of "$t")" = linux ] &&
+    if declare -F kind_of >/dev/null && [ "$(box_kind "$t")" = linux ] &&
        [ ! -e "$state_dir/hold-$t.pid" ] && [ ! -e "$state_dir/hold-$t.releasing" ]; then
       echo "no holder needed for linux box $t"
     else
@@ -909,7 +1062,7 @@ load_hosts
 check_targets "${TARGETS[@]}"
 any_wsl=0
 for t in "${TARGETS[@]}"; do
-  if [ "$(kind_of "$t")" = wsl ]; then any_wsl=1; load_wsl_adapter || exit 1; break; fi
+  if [ "$(box_kind "$t")" = wsl ]; then any_wsl=1; load_wsl_adapter || exit 1; break; fi
 done
 if [ "$HOLD" = 1 ] && [ "$any_wsl" = 1 ] && [ "$VERB" != kick-wsl ] &&
    { [ "$VERB" != wake ] || [ "$WANT_WSL" != 1 ] || [ "$WAIT" != 1 ]; }; then
