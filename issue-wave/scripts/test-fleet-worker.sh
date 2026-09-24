@@ -133,7 +133,7 @@ export FLEET_COORDINATOR="test-coordinator"
 unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
 # The preflight's tmux check compares GitHub's variables too (ludics-lite#360), so the runner's own
 # must not leak into the fresh-shell side of it.
-unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_HOST GH_CONFIG_DIR
+unset GH_TOKEN GITHUB_TOKEN GH_HOST GH_CONFIG_DIR XDG_CONFIG_HOME
 export PATH="$TMP/bin:$PATH"
 # `execution slot` runs its command under `execution hold`, which wraps it in systemd-inhibit when
 # one resolves (ludics-lite#317). The CI runner is Ubuntu, whose real systemd-inhibit would make
@@ -763,6 +763,8 @@ expect "a gh token answering HTTP 401 refuses with the repair" 1 "PREFLIGHT REFU
 expect "...and refuses the native Claude preflight too" 1 "GitHub credential refused in a non-interactive session on testbox" -- env SHIM_GH=401 "$FW" preflight testbox --native-claude --no-cross
 expect "...and the native Codex preflight" 1 "GitHub credential refused in a non-interactive session on testbox" -- env SHIM_GH=401 "$FW" preflight testbox --native-codex --no-cross
 expect "...and the Codex CLI preflight" 1 "GitHub credential refused" -- env SHIM_GH=401 "$FW" preflight testbox --codex --no-probe --no-cross
+expect "a rejected token exported in the session names it in the repair" 1 "repair: remove the GH_TOKEN this session exports (it outranks gh's stored login and blocks gh auth login) from testbox's shell startup, then restart any tmux server that inherited it; for the stored login: ssh -t testbox" -- \
+  env SHIM_GH=401 GH_TOKEN=gho_dead "$FW" preflight testbox --native-claude --no-cross
 expect "a box never logged in to gh refuses (an unnamed failure fails closed)" 1 "GitHub credential refused.*gh auth login" -- env SHIM_GH=noauth "$FW" preflight testbox --no-probe --no-cross
 expect "a GitHub that cannot be reached is noted on the OK line" 0 "PREFLIGHT OK testbox .*(GitHub unreachable from testbox: gh api user: check your internet connection" -- env SHIM_GH=down "$FW" preflight testbox --no-probe --no-cross
 expect "a GitHub outage (HTTP 5xx) is noted, not refused" 0 "PREFLIGHT OK.*GitHub unreachable from testbox: gh api user: gh: Server Error (HTTP 502)" -- env SHIM_GH=5xx "$FW" preflight testbox --no-probe --no-cross
@@ -871,12 +873,16 @@ expect "native workers never run under tmux, so a stale server does not refuse t
 # shell reads, so a server handing the worker another token or host refuses -- and a token's value
 # never reaches the refusal.
 printf 'PATH=%s\nGH_TOKEN=gho_servertokensecret\n' "$PATH" > "$TMP/genv-ghtoken"
-expect "a server exporting a GH_TOKEN the fresh shell lacks refuses, naming it" 1 "GH_TOKEN is set in the server but unset in a fresh shell" -- \
+expect "a server exporting a GH_TOKEN the fresh shell lacks refuses, naming it" 1 "the GitHub token gh would use differs (server: GH_TOKEN, fresh shell: none; values not shown)" -- \
   "${fresh[@]}" SHIM_TMUX_GENV="$TMP/genv-ghtoken" "$FW" preflight testbox --no-probe
 grep -q 'servertokensecret' <<<"$out" && ko "the refusal printed the server's token -- $out" || ok "...without printing the token"
-expect "a server whose GH_TOKEN differs from the fresh shell's refuses without either value" 1 "GH_TOKEN differs between the server and a fresh shell (values not shown)" -- \
+expect "a server whose GH_TOKEN differs from the fresh shell's refuses without either value" 1 "the GitHub token gh would use differs (server: GH_TOKEN, fresh shell: GH_TOKEN; values not shown)" -- \
   "${fresh[@]}" GH_TOKEN=gho_freshtokensecret SHIM_TMUX_GENV="$TMP/genv-ghtoken" "$FW" preflight testbox --no-probe
 grep -q 'tokensecret' <<<"$out" && ko "the refusal printed a token -- $out" || ok "...and prints neither token"
+expect "a GITHUB_TOKEN that GH_TOKEN outranks on both sides is not compared" 0 "PREFLIGHT OK" -- \
+  "${fresh[@]}" GH_TOKEN=gho_servertokensecret GITHUB_TOKEN=ghp_other SHIM_TMUX_GENV="$TMP/genv-ghtoken" "$FW" preflight testbox --no-probe
+expect "an XDG_CONFIG_HOME that moved gh's config since the server started refuses" 1 "XDG_CONFIG_HOME is unset in the server but /x in a fresh shell" -- \
+  "${fresh[@]}" XDG_CONFIG_HOME=/x SHIM_TMUX_GENV="$TMP/genv-match" "$FW" preflight testbox --no-probe
 expect "a GH_HOST the fresh shell gained since the server started refuses" 1 "GH_HOST is unset in the server but github.example.com in a fresh shell" -- \
   "${fresh[@]}" GH_HOST=github.example.com SHIM_TMUX_GENV="$TMP/genv-match" "$FW" preflight testbox --no-probe
 # The same fact against a real tmux server, on a socket of its own: the shim above must not be the

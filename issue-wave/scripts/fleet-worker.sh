@@ -308,13 +308,13 @@ state_of() { if alive "$1"; then echo RUNNING; elif orphaned "$1"; then echo ORP
 # `new-session`: the launch's fetch and base gate can take minutes, and a resume creates a
 # session with no preflight at all.
 # The GitHub variables are here for ludics-lite#360: the preflight's `gh api user` proves the
-# credential a fresh shell reads, and a server carrying a different GH_TOKEN (which outranks the
-# keyring), GH_HOST or GH_CONFIG_DIR would hand the worker another one. A token's value is never
-# printed, only whether each side sets it.
-TMUX_ENV_VARS="PATH ROCM_PATH HIP_PATH OPAM_SWITCH_PREFIX GH_HOST GH_CONFIG_DIR"
-TMUX_ENV_SECRET_VARS="GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN"
+# credential a fresh shell reads, and a server whose environment points gh at another host or
+# config directory (`gh help environment`: GH_CONFIG_DIR, else $XDG_CONFIG_HOME/gh) would hand the
+# worker another one. The token is compared below as gh picks it for github.com, GH_TOKEN over
+# GITHUB_TOKEN over the stored credential, and its value is never printed.
+TMUX_ENV_VARS="PATH ROCM_PATH HIP_PATH OPAM_SWITCH_PREFIX GH_HOST GH_CONFIG_DIR XDG_CONFIG_HOME"
 tmux_env_check() {
-  local sessions genv refreshed v line skip sset sval fset fval diff="" workers="" others="" tmx
+  local sessions genv refreshed v line sset sval fset fval stok ftok diff="" workers="" others="" tmx
   genv=$(tm show-environment -g 2>/dev/null) || return 0   # no server running
   # `exit-empty off` keeps a server alive with no session at all, so the server is found by its
   # environment, never by its session list; an unreadable list is an empty one.
@@ -323,25 +323,33 @@ tmux_env_check() {
   # session (removed there when the client lacks it), so the worker gets the fresh shell's value
   # whatever the global one says: comparing it would refuse a safe launch.
   refreshed=$(tm show-options -gv update-environment 2>/dev/null)
-  for v in $TMUX_ENV_VARS $TMUX_ENV_SECRET_VARS; do
-    skip=0
-    while IFS= read -r line; do [ "$line" = "$v" ] && skip=1; done <<< "$refreshed"
-    [ "$skip" = 0 ] || continue
+  # sides <var>: fset/fval from this (fresh) shell, sset/sval what a new session gets.
+  sides() {
+    fset=0; fval=""; if [ -n "${!1+x}" ]; then fset=1; fval=${!1}; fi
+    while IFS= read -r line; do [ "$line" = "$1" ] && { sset=$fset; sval=$fval; return; }; done <<< "$refreshed"
     # `VAR=value` is set, `-VAR` is removed from the global environment, no line is never set.
     sset=0; sval=""
     while IFS= read -r line; do
-      case "$line" in "$v="*) sset=1; sval=${line#"$v="} ;; "-$v") sset=0; sval="" ;; esac
+      case "$line" in "$1="*) sset=1; sval=${line#"$1="} ;; "-$1") sset=0; sval="" ;; esac
     done <<< "$genv"
-    fset=0; fval=""; if [ -n "${!v+x}" ]; then fset=1; fval=${!v}; fi
+  }
+  for v in $TMUX_ENV_VARS; do
+    sides "$v"
     [ "$sset" = "$fset" ] && [ "$sval" = "$fval" ] && continue
-    case " $TMUX_ENV_SECRET_VARS " in
-      *" $v "*)
-        if [ "$sset" = 1 ] && [ "$fset" = 1 ]; then diff="$diff, $v differs between the server and a fresh shell (values not shown)"; continue; fi
-        sval="set"; fval="set" ;;
-    esac
     [ "$sset" = 1 ] || sval="unset"; [ "$fset" = 1 ] || fval="unset"
     diff="$diff, $v is $sval in the server but $fval in a fresh shell"
   done
+  # The effective token, "-" for none (the stored credential then decides, as the probe saw).
+  stok=-; ftok=-
+  for v in GITHUB_TOKEN GH_TOKEN; do
+    sides "$v"
+    [ "$sset" = 1 ] && stok="$v=$sval"; [ "$fset" = 1 ] && ftok="$v=$fval"
+  done
+  if [ "$stok" != "$ftok" ]; then
+    case "$stok" in -) sval="none" ;; *) sval="${stok%%=*}" ;; esac
+    case "$ftok" in -) fval="none" ;; *) fval="${ftok%%=*}" ;; esac
+    diff="$diff, the GitHub token gh would use differs (server: $sval, fresh shell: $fval; values not shown)"
+  fi
   [ -n "$diff" ] || return 0
   # Every live worker is an iw-<name> session on this socket (`ls` reads RUNNING from the same
   # sessions), and kill-server ends every session the server holds.
@@ -625,6 +633,10 @@ else
       *)
         case "$BOX" in local) repair="in a terminal on this box: gh auth login -h github.com -p https -w && gh auth setup-git" ;;
           *) repair="ssh -t $(printf '%q' "$BOX") 'gh auth login -h github.com -p https -w && gh auth setup-git'" ;; esac
+        # An exported token outranks the stored login, and `gh auth login` refuses while one is
+        # set, so the stored-login repair alone would never take.
+        envtok=""; for v in GH_TOKEN GITHUB_TOKEN; do [ -z "${!v+x}" ] || envtok="${envtok:+$envtok and }$v"; done
+        [ -z "$envtok" ] || repair="remove the $envtok this session exports (it outranks gh's stored login and blocks gh auth login) from $BOX's shell startup, then restart any tmux server that inherited it; for the stored login: $repair"
         note "GitHub credential refused in a non-interactive session on $BOX (gh api user: ${ghlast:-exit $ghrc, no output}); a green \`gh auth status\` at the box's desktop console does not prove the token a worker's ssh session reads -- repair: $repair" ;;
     esac
   fi
