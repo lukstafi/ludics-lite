@@ -250,8 +250,8 @@ after-merge's push-side fast-forward is best-effort, and the deployed skills are
 that checkout, so a stale checkout runs stale skill text silently (the ludics gh-609 failure
 class; two consecutive merge cycles once stranded three boxes). Three refusals are user-side
 repairs: an expired Claude login on a box needs an interactive `claude auth login` there, a
-refused GitHub token needs `ssh -t <box> 'gh auth login -h github.com -p https -w && gh auth
-setup-git'` (the refusal prints it), and missing `~/.codex/skills` links need the README loop
+refused GitHub token needs the fleet PAT in the box's `~/.config/fleet/gh-token.sh` replaced from
+the anchor's (the refusal prints the command), and missing `~/.codex/skills` links need the README loop
 run once on that box. A box the fleet only executes on hosts no launch, so it is refreshed where
 the fleet reaches it for work instead: every `execution run`/`dispatch` and the daily sweep's
 wake step run `fleet-worker.sh refresh <box>...`, this same freshness check alone, and report a

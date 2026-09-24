@@ -760,16 +760,57 @@ expect "a box with systemd-inhibit and the polkit grant adds nothing to the OK l
   env PATH="$TMP/pk-yes:$PATH" FLEET_SYSTEMD_INHIBIT=fleet-test-inhibit "$FW" preflight testbox --no-probe --no-cross
 expect "...and without the grant notes the unguarded sleep guard on the OK line" 0 "PREFLIGHT OK testbox skills=[0-9a-f]* (no polkit grant for the sleep guard (runs unguarded; see issue-wave/references/executions.md#the-os-level-sleep-guard))$" -- \
   env PATH="$TMP/pk-no:$TMP/pk-yes:$PATH" FLEET_SYSTEMD_INHIBIT=fleet-test-inhibit "$FW" preflight testbox --no-probe --no-cross
+# The repairs that differ by box are read from `other`, a second box the ssh shim maps here, so
+# they go through run_on's real ssh path; `testbox` is this suite's LOCAL box.
+FWO=(env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other "$FW")
 # The GitHub credential call (ludics-lite#360): a refused token refuses in every mode with the
 # user-side repair, a GitHub that does not answer is a note, as a sleeping sibling is.
 expect "a live GitHub credential passes and adds nothing to the OK line" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- "$FW" preflight testbox --no-probe --no-cross
-expect "a gh token answering HTTP 401 refuses with the repair" 1 "PREFLIGHT REFUSED testbox: GitHub credential refused in a non-interactive session on testbox (gh api user: gh: Bad credentials (HTTP 401)).*desktop console.*repair: ssh -t testbox 'gh auth login -h github.com -p https -w && gh auth setup-git'" -- \
-  env SHIM_GH=401 "$FW" preflight testbox --no-probe --no-cross
+expect "a gh token answering HTTP 401 refuses with the repair" 1 "PREFLIGHT REFUSED other: GitHub credential refused in a non-interactive session on other (gh api user: gh: Bad credentials (HTTP 401)).*desktop console.*repair: ssh -t other 'gh auth login -h github.com -p https -w && gh auth setup-git'" -- \
+  env SHIM_GH=401 "${FWO[@]}" preflight other --no-probe --no-cross
 expect "...and refuses the native Claude preflight too" 1 "GitHub credential refused in a non-interactive session on testbox" -- env SHIM_GH=401 "$FW" preflight testbox --native-claude --no-cross
 expect "...and the native Codex preflight" 1 "GitHub credential refused in a non-interactive session on testbox" -- env SHIM_GH=401 "$FW" preflight testbox --native-codex --no-cross
 expect "...and the Codex CLI preflight" 1 "GitHub credential refused" -- env SHIM_GH=401 "$FW" preflight testbox --codex --no-probe --no-cross
-expect "a rejected token exported in the session names it in the repair" 1 "repair: remove the GH_TOKEN this session exports (it outranks gh's stored login and blocks gh auth login) from testbox's shell startup, then restart any tmux server that inherited it; for the stored login: ssh -t testbox" -- \
-  env SHIM_GH=401 GH_TOKEN=gho_dead "$FW" preflight testbox --native-claude --no-cross
+expect "a rejected token exported in the session names it in the repair" 1 "repair: remove the GH_TOKEN this session exports (it outranks gh's stored login and blocks gh auth login) from other's shell startup, then restart any tmux server that inherited it; for the stored login: ssh -t other" -- \
+  env SHIM_GH=401 GH_TOKEN=gho_dead "${FWO[@]}" preflight other --native-claude --no-cross
+# The fleet's PAT file (2026-09-24): its contract is checked whatever gh answers, and a dead PAT
+# is replaced in the file, never by gh auth login.
+mkdir -p "$HOME/.config/fleet"; printf 'export GH_TOKEN=ghp_dead\n' > "$HOME/.config/fleet/gh-token.sh"; chmod 600 "$HOME/.config/fleet/gh-token.sh"
+expect "the file's own PAT, live, passes" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- env GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross
+expect "a dead PAT from gh-token.sh is replaced from the anchor's file" 1 "repair: the PAT in ~/.config/fleet/gh-token.sh is dead: replace it from the anchor: ssh other 'f=~/.config/fleet/gh-token.sh; umask 077; cat > .*f.new.* && chmod 600 .*f.new.* && mv .*f.new.*' < ~/.config/fleet/gh-token.sh; then restart any tmux server that inherited the old value$" -- \
+  env SHIM_GH=401 GH_TOKEN=ghp_dead "${FWO[@]}" preflight other --native-claude --no-cross
+expect "a LIVE token a later startup line exports is refused as the override" 1 "PREFLIGHT REFUSED other: this session's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports on other: a later line of its shell startup overrides it.*grep -Hnos GH_TOKEN" -- \
+  env GH_TOKEN=ghp_other "${FWO[@]}" preflight other --native-claude --no-cross
+expect "...and a dead one points at that, not at the file" 1 "repair: fix the token file first (above)" -- \
+  env SHIM_GH=401 GH_TOKEN=ghp_other "$FW" preflight testbox --native-claude --no-cross
+expect "a gh-token.sh the session does not source names the env.sh line" 1 "this session does not export the token in ~/.config/fleet/gh-token.sh on testbox -- repair: end its ~/.config/fleet/env.sh with .*gh-token.sh.*install-linux.sh adds it)" -- \
+  env -u GH_TOKEN -u GITHUB_TOKEN "$FW" preflight testbox --native-claude --no-cross
+expect "an empty GH_TOKEN is not an export of the file's" 1 "this session does not export the token in ~/.config/fleet/gh-token.sh on testbox" -- \
+  env GH_TOKEN= "$FW" preflight testbox --native-claude --no-cross
+expect "on the anchor, a mismatch says to re-source the file or open a new shell, with no ssh" 1 "this shell's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports -- repair: run \\. ~/.config/fleet/gh-token.sh (or open a new shell)" -- \
+  env GH_TOKEN=ghp_other "$FW" preflight local --native-claude --no-cross
+expect "...and so does the anchor addressed by its own name" 1 "this shell's GH_TOKEN is not the one ~/.config/fleet/gh-token.sh exports -- repair: run \\. ~/.config/fleet/gh-token.sh" -- \
+  env GH_TOKEN=ghp_other FLEET_LOCAL_BOX=anchorbox "$FW" preflight anchorbox --native-claude --no-cross
+printf 'export GH_TOKEN=\n' > "$HOME/.config/fleet/gh-token.sh"
+expect "a gh-token.sh exporting an empty GH_TOKEN is replaced" 1 "gh-token.sh on other exports no GH_TOKEN -- repair: replace it from the anchor" -- \
+  env GH_TOKEN= "${FWO[@]}" preflight other --native-claude --no-cross
+printf 'GH_TOKEN=ghp_dead\n' > "$HOME/.config/fleet/gh-token.sh"
+expect "...and so is one that assigns GH_TOKEN without exporting it" 1 "gh-token.sh on testbox exports no GH_TOKEN" -- \
+  env GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross
+printf 'export GH_TOKEN=ghp_dead\n' > "$HOME/.config/fleet/gh-token.sh"
+chmod 644 "$HOME/.config/fleet/gh-token.sh"
+expect "a group-readable gh-token.sh refuses even with a live token, with the replace-the-file repair" 1 "gh-token.sh on other is not a regular mode-0600 file this user owns (-rw-r--r-- uid [0-9]*).*repair: replace it from the anchor" -- \
+  env GH_TOKEN=ghp_dead "${FWO[@]}" preflight other --native-claude --no-cross
+rm "$HOME/.config/fleet/gh-token.sh"; mkdir "$HOME/.config/fleet/gh-token.sh"
+expect "...and a directory, whose repair removes it before the copy" 1 "gh-token.sh on other is not a regular mode-0600 file this user owns (d.*repair: move the path aside first (ssh other 'mv ~/.config/fleet/gh-token.sh ~/.config/fleet/gh-token.sh.aside'" -- \
+  env GH_TOKEN=ghp_dead "${FWO[@]}" preflight other --native-claude --no-cross
+rmdir "$HOME/.config/fleet/gh-token.sh"; ln -s "$TMP" "$HOME/.config/fleet/gh-token.sh"
+expect "...and a symlink to a directory, the same" 1 "gh-token.sh on other is not a regular mode-0600 file this user owns (l.*repair: move the path aside first (ssh other 'mv ~/.config/fleet/gh-token.sh ~/.config/fleet/gh-token.sh.aside'" -- \
+  env GH_TOKEN=ghp_dead "${FWO[@]}" preflight other --native-claude --no-cross
+rm "$HOME/.config/fleet/gh-token.sh"; ln -s /dev/null "$HOME/.config/fleet/gh-token.sh"
+expect "...and so does a symlink" 1 "gh-token.sh on testbox is not a regular mode-0600 file this user owns (l" -- \
+  env GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross
+rm "$HOME/.config/fleet/gh-token.sh"
 expect "a box never logged in to gh refuses (an unnamed failure fails closed)" 1 "GitHub credential refused.*gh auth login" -- env SHIM_GH=noauth "$FW" preflight testbox --no-probe --no-cross
 expect "a GitHub that cannot be reached is noted on the OK line" 0 "PREFLIGHT OK testbox .*(GitHub unreachable from testbox: gh api user: check your internet connection" -- env SHIM_GH=down "$FW" preflight testbox --no-probe --no-cross
 expect "a GitHub outage (HTTP 5xx) is noted, not refused" 0 "PREFLIGHT OK.*GitHub unreachable from testbox: gh api user: gh: Server Error (HTTP 502)" -- env SHIM_GH=5xx "$FW" preflight testbox --no-probe --no-cross

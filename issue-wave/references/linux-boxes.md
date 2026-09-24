@@ -2,7 +2,7 @@
 
 Use this note when a placement's `kind_of` is `linux`; for `wsl`, see
 [wsl-boxes.md](wsl-boxes.md). The boxes run Ubuntu 26.04.1, kernel 7.0.0-31, set up by
-`~/self-improve/scripts/install-linux.md`. Each trap below gives its symptom, the check to run,
+[`scripts/install-linux.md`](../../scripts/install-linux.md). Each trap below gives its symptom, the check to run,
 and its evidence. Every claim was checked by read-only probes on rog-nv-linux,
 minix-amd-linux and tuf-amd-linux on 2026-09-23, except where a line says otherwise. Entries
 are durable properties of the box; a problem that can be fixed is fixed, not recorded here.
@@ -23,7 +23,7 @@ installs under `/usr`, with its device-library bitcode in `/usr/lib/llvm-21/lib/
 lookup reads (`arrayjit/lib/hip_backend.ml`), and it leaves `ROCM_PATH` unset. Setting
 `ROCM_PATH=/usr` stopped `hipcc` finding the bitcode on minix gfx1151, so never export it in a
 brief, run script or ssh leg. Check: the probe above prints `ROCM_PATH=unset`, and a sweep log
-records a `discovery input: ROCM_PATH=... HIP_PATH=...` line. Evidence: `~/self-improve`
+records a `discovery input: ROCM_PATH=... HIP_PATH=...` line. Evidence: self-improve commit
 4e9f26906 and the `gpu.sh.before-rocm-path-fix` left on minix and tuf. The failure itself was
 not re-run here.
 

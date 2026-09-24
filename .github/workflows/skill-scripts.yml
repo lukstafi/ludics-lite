@@ -307,6 +307,10 @@ jobs:
         run: scripts/test-wake-lab.sh
       - name: Exercise native Linux without the WSL adapter
         run: scripts/test-wake-lab-linux.sh
+      - name: Exercise the Linux bootstrap's helpers
+        run: python3 scripts/test-install-linux.py
+      - name: Exercise the fleet ssh mesh helper
+        run: python3 scripts/test-fleet-peers.py
 
   prompt-checker:
     name: prompt checker fixtures (ubuntu)
@@ -474,6 +478,12 @@ jobs:
       - name: wake-lab linux
         if: ${{ !cancelled() }}
         run: scripts/test-wake-lab-linux.sh || { echo '::error title=macOS suite failed::test-wake-lab-linux.sh'; exit 1; }
+      - name: Linux bootstrap helpers
+        if: ${{ !cancelled() }}
+        run: python3 scripts/test-install-linux.py || { echo '::error title=macOS suite failed::test-install-linux.py'; exit 1; }
+      - name: fleet ssh mesh helper
+        if: ${{ !cancelled() }}
+        run: python3 scripts/test-fleet-peers.py || { echo '::error title=macOS suite failed::test-fleet-peers.py'; exit 1; }
       - name: sync-routines
         if: ${{ !cancelled() }}
         run: scripts/test-sync-routines.sh || { echo '::error title=macOS suite failed::test-sync-routines.sh'; exit 1; }

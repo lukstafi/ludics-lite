@@ -18,7 +18,7 @@ Two kinds live here, and they are kept in sync differently.
 
 The local scheduler adds a per-task jitter of a few minutes to the times above. The sweep's
 times are the registry's (read with the scheduled-tasks list, 2026-09-23), and something outside
-the Mac keys on them: tuf-amd-linux's RTC wake timer (`fleet-sweep-wake.timer`, from self-improve's
+the Mac keys on them: tuf-amd-linux's RTC wake timer (`fleet-sweep-wake.timer`, from the
 Linux bootstrap) fires at 06:55 so the gated tuf lane finds the laptop up. Move both together. Cron in the
 local registry is the box's local time; the cloud routine's cron is UTC.
 
