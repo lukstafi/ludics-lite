@@ -187,9 +187,10 @@ It then configures:
   The mesh's explicit settings take precedence for those host names.
 
 Files changed by the helper receive timestamped backups. Repeating the command
-reuses keys and avoids duplicate entries. Concurrent invocations refuse on a
-`.ssh/.fleet-peers.lock`; after an interrupted process, inspect that lock before
-removing it. This is a rerunnable bootstrap, not an atomic distributed transaction:
+reuses keys and avoids duplicate entries. Concurrent writes to one machine's `~/.ssh`
+refuse on its `.ssh/.fleet-peers.lock`; the lock is per machine, not per run, so run
+one `--setup-peers --apply` at a time (it is a by-hand step on the coordinator). After
+an interrupted process, inspect that lock before removing it. This is a rerunnable bootstrap, not an atomic distributed transaction:
 if a member drops offline during application, earlier members retain their updates;
 fix connectivity and rerun. It does not rotate/revoke keys or enroll a machine
 that the coordinator cannot already access.
