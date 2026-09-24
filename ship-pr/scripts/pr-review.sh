@@ -311,6 +311,47 @@ esac
 
 warn() { printf 'pr-review.sh: %s\n' "$*" >&2; }
 
+# --- jq's line ending (ludics-lite#335) -------------------------------------------------------
+# A native jq.exe on Windows (winget, Chocolatey, Scoop; Git for Windows ships no jq) writes its
+# stdout in text mode and ends every line CRLF. `$(jq -r ...)` strips the \n and keeps the \r, so
+# a conclusion read back as `failure\r` is not red and `[ "$n" = 0 ]` takes the wrong branch, at
+# every one of this script's ~100 jq calls. So every call goes through `jq` below, and the line
+# ending is decided ONCE, here, by asking the jq on PATH:
+#   lf      it writes LF already (every Unix jq, an MSYS2 jq): called as is, no cost;
+#   binary  it writes CRLF and `-b` (jq 1.7+ on Windows) turns that off: called with `-b`, which
+#           costs no process, where a filter would cost a fork per call on the slowest-forking
+#           platform there is;
+#   strip   it writes CRLF and refuses `-b` (jq 1.6): its output goes through `sed 's/\r$//'`,
+#           one \r per line, which is exactly what text mode added — a CRLF inside a raw string
+#           (a comment body) came out \r\r\n and goes back to \r\n, where `tr -d '\r'` would not.
+# `jq_lf` is the call and `jq` names it, so the fixtures' jq shim (test-pr-review-lib.sh), which
+# replaces `jq`, forwards to `jq_lf` and keeps the line ending. A jq that is missing or broken
+# probes as `lf`, and the first real call then fails as it did before this.
+JQ_EOL=lf
+jq_eol_probe() {
+  local out
+  JQ_EOL=lf
+  out=$(command jq -rn '"x"' 2>/dev/null) || return 0
+  [ "$out" = $'x\r' ] || return 0
+  out=$(command jq -b -rn '"x"' 2>/dev/null) || out=""
+  if [ "$out" = x ]; then JQ_EOL=binary; else JQ_EOL=strip; fi
+}
+jq_lf() {
+  case "$JQ_EOL" in
+  lf) command jq "$@" ;;
+  binary) command jq -b "$@" ;;
+  *)
+    local st
+    command jq "$@" | sed $'s/\r$//'
+    st=("${PIPESTATUS[@]}")
+    if [ "${st[0]}" -ne 0 ]; then return "${st[0]}"; fi
+    return "${st[1]}"
+    ;;
+  esac
+}
+jq() { jq_lf "$@"; }
+jq_eol_probe
+
 # --- transport retries ----------------------------------------------------------------------
 # Only TRANSPORT failures are retried. A 4xx is the API ANSWERING — no such comment, no such PR,
 # no permission — and retrying it spends the backoff to print the same thing.

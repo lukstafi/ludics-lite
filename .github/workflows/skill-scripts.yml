@@ -237,6 +237,17 @@ jobs:
         run: ship-pr/scripts/test-pr-review-base-verdict.sh
       - name: Exercise the build gate's absent-vs-not-yet split
         run: ship-pr/scripts/test-pr-review-checks-absent.sh
+      - name: Repeat the four suites a CRLF jq turned red, over a stub jq.exe
+        # A native jq.exe ends its lines CRLF, and these four went red on it under Git Bash
+        # (ludics-lite#335). The stub is one that refuses `-b`, the strip path no runner's real jq
+        # takes; the Git Bash leg covers `-b` with the real jq.exe.
+        env:
+          SHIP_PR_TEST_JQ_EOL: crlf-no-binary
+        run: |
+          ship-pr/scripts/test-pr-review-base-red.sh
+          ship-pr/scripts/test-pr-review-base-settle.sh
+          ship-pr/scripts/test-pr-review-base-verdict.sh
+          ship-pr/scripts/test-pr-review-checks-absent.sh
       - name: Exercise the review-round count
         run: ship-pr/scripts/test-pr-review-rounds.sh
       - name: Exercise the merge command's head binding and close-out refusals

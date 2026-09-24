@@ -60,6 +60,10 @@
 #                                       the marked program and nothing else — is pinned by this
 #                                       file's own controls, so a suite needs only the baseline
 #                                       its broken runs are measured against
+#   jq_crlf_stub <dir> <mode>           a jq that ends its lines CRLF the way a native jq.exe
+#   SHIP_PR_TEST_JQ_EOL=crlf|           does, in <dir>; with the variable set the whole suite
+#     crlf-no-binary                    runs over one, which is how Ubuntu and macOS hold
+#                                       pr-review.sh's `jq_lf` without Windows (ludics-lite#335)
 #   protect_library <file>              extends the guard over a second library sourced after
 #                                       this one (test-pr-review-base-lib.sh), whose functions
 #                                       the snapshot below could not see
@@ -573,8 +577,10 @@ fixture_call_reset() {
 # Every jq program pr-review.sh runs is a literal inside the tracked script, so the way to make
 # one of them — and only that one — fail is to shim `jq` itself: the shim refuses exactly the
 # invocation whose command line carries the marker (nonzero status, nothing on stdout, which is
-# what a rebinding error or a typo'd `$var` produces) and forwards every other call to the real
-# jq through `command jq`, so it never calls itself. Like a suite's fixture `gh` it shadows a
+# what a rebinding error or a typo'd `$var` produces) and forwards every other call to
+# pr-review.sh's `jq_lf`, the call `jq` names there, so it never calls itself and keeps the line
+# ending that script decided for the jq on PATH (ludics-lite#335; `command jq` here would hand a
+# jq.exe's CRLF straight back to the script under test). Like a suite's fixture `gh` it shadows a
 # COMMAND rather than a library function — but it is defined HERE, above the snapshot, so it is a
 # protected name like any other: a suite that wants its own jq declares `stub jq` and says why.
 #
@@ -604,7 +610,7 @@ jq() {
       esac
     done
   fi
-  command jq "$@"
+  jq_lf "$@"
 }
 
 # with_broken_jq <marker> <command> [arg...]: run <command> with the marker standing, and clear it
@@ -627,6 +633,73 @@ with_broken_jq() {
   BREAK_JQ=""
   return "$rc"
 }
+
+# --- a jq that writes CRLF, on every platform (ludics-lite#335) --------------------------------
+# A native jq.exe (what Windows users and the Git Bash CI leg have) ends every output line CRLF,
+# and pr-review.sh reads it through `jq_lf`, which it decides once at source time. This is that jq
+# where there is none: a stub that runs the jq on PATH and adds one \r before every \n it writes,
+# which is what text mode does (a CRLF inside a raw string comes out \r\r\n). <mode> says what it
+# does with a leading `-b`: `binary` drops it and writes LF (jq 1.7+ on Windows), `no-binary`
+# refuses it the way jq 1.6 refuses an option it does not know.
+#
+# The jq it wraps is read LF first, through pr-review.sh's own probe of it, so the stub adds
+# exactly one \r wherever it runs — over the Git Bash leg's jq.exe as over a Unix jq — and over
+# another stub. `type -P`, not `command -v`: the shim above makes `jq` a function, which
+# `command -v` would name.
+jq_crlf_stub() { # <dir> <binary|no-binary>
+  local real real_eol saved="$JQ_EOL"
+  real=$(type -P jq) || bail "jq_crlf_stub: no jq on PATH to wrap"
+  jq_eol_probe
+  real_eol="$JQ_EOL"
+  JQ_EOL="$saved"
+  {
+    echo '#!/usr/bin/env bash'
+    echo "# A jq.exe stand-in written by $LIB_BASENAME (ludics-lite#335)."
+    echo 'set -o pipefail'
+    printf 'real=%q\n' "$real"
+    # shellcheck disable=SC2016 # the stub's own words, expanded when the stub runs
+    case "$real_eol" in
+    lf) echo 'lf() { "$real" "$@"; }' ;;
+    binary) echo 'lf() { "$real" -b "$@"; }' ;;
+    *) echo 'lf() { "$real" "$@" | sed $'"'"'s/\r$//'"'"'; }' ;;
+    esac
+    # shellcheck disable=SC2016
+    case "$2" in
+    binary) echo 'if [ "${1:-}" = -b ]; then shift; lf "$@"; exit; fi' ;;
+    no-binary) echo 'if [ "${1:-}" = -b ]; then echo "jq: Unknown arguments: -b" >&2; exit 2; fi' ;;
+    *) bail "jq_crlf_stub: mode is binary or no-binary, not '$2'" ;;
+    esac
+    # shellcheck disable=SC2016
+    echo 'lf "$@" | sed $'"'"'s/$/\r/'"'"
+  } >"$1/jq" || bail "jq_crlf_stub: cannot write $1/jq"
+  chmod +x "$1/jq" || bail "jq_crlf_stub: cannot make $1/jq executable"
+}
+
+# SHIP_PR_TEST_JQ_EOL=crlf (a jq.exe that takes -b) or crlf-no-binary (one that does not) runs the
+# whole suite with that stub first on PATH, and pr-review.sh's probe re-asked under it: how CI on
+# Ubuntu and macOS holds the four suites ludics-lite#335 found red under Git Bash, without Windows.
+# The probe's answer is checked, not assumed: a stub that stopped writing CRLF would otherwise run
+# the suite as an ordinary LF one and pass it, proving nothing.
+case "${SHIP_PR_TEST_JQ_EOL:-}" in
+'') ;;
+crlf | crlf-no-binary)
+  lib_jq_mode=binary lib_jq_want=binary
+  [ "$SHIP_PR_TEST_JQ_EOL" = crlf ] || lib_jq_mode=no-binary lib_jq_want=strip
+  test_tmpdir lib_jq_dir jq-crlf
+  jq_crlf_stub "$lib_jq_dir" "$lib_jq_mode"
+  PATH="$lib_jq_dir:$PATH"
+  jq_eol_probe
+  if [ "$JQ_EOL" != "$lib_jq_want" ]; then
+    echo "$LIB_BASENAME: REFUSING to run: SHIP_PR_TEST_JQ_EOL=$SHIP_PR_TEST_JQ_EOL should make pr-review.sh read jq as '$lib_jq_want', and it probed '$JQ_EOL' — the suite would run over a jq that is not the one it was asked for" >&2
+    exit 2
+  fi
+  unset lib_jq_mode lib_jq_want lib_jq_dir
+  ;;
+*)
+  echo "$LIB_BASENAME: REFUSING to run: SHIP_PR_TEST_JQ_EOL is crlf, crlf-no-binary or empty, not '$SHIP_PR_TEST_JQ_EOL'" >&2
+  exit 2
+  ;;
+esac
 
 # --- retuning pr-review.sh's source-time constants --------------------------------------------
 # GRACE, STALL, ROUND_GAP, ABSENT_GRACE, CHECKS_INTERVAL and the rest are read from the
@@ -1516,6 +1589,76 @@ test_a_leaked_marker_fails_the_case_that_leaked_it() {
     "the cleared case passes, the leaking case does not, and nothing after it runs"
 }
 
+# --- a jq that writes CRLF (ludics-lite#335) ---------------------------------------------------
+# `$(jq -r ...)` over a native jq.exe kept the \r its text mode wrote, and four suites went red
+# under Git Bash on it. These hold pr-review.sh's `jq_lf` to reading any jq back LF, on every
+# platform, through the CRLF stub in both of its modes; the Git Bash leg adds the real jq.exe as
+# the jq on PATH. Each read is taken in a `$(...)`, the shape of every call site, and re-probes in
+# that subshell, so neither the stub's PATH nor its JQ_EOL outlives the read.
+jq_under_stub() { # <stub dir> <jq args...>: pr-review.sh's jq, re-probed with the stub first
+  local dir="$1"
+  shift
+  PATH="$dir:$PATH"
+  jq_eol_probe
+  jq "$@"
+}
+
+test_a_crlf_jq_is_read_back_lf() {
+  local mode want dir out rc
+  assert_eq "$(jq -rn '"x"')" x "the jq on PATH should read back LF as sourced (JQ_EOL=$JQ_EOL)"
+  for mode in binary no-binary; do
+    test_tmpdir dir "jq-$mode"
+    jq_crlf_stub "$dir" "$mode"
+    # The control's own control: a stub that writes LF would make every assertion below vacuous.
+    assert_eq "$(PATH="$dir:$PATH" command jq -rn '"x"')" $'x\r' "the $mode stub should write CRLF"
+    want=binary
+    [ "$mode" = binary ] || want=strip
+    assert_eq "$(PATH="$dir:$PATH" && jq_eol_probe && printf '%s' "$JQ_EOL")" "$want" \
+      "a CRLF jq in $mode mode should probe as $want"
+    assert_eq "$(jq_under_stub "$dir" -r .c <<<'{"c":"failure"}')" failure \
+      "$mode: a conclusion should read back without its \\r, or it is not red"
+    assert_eq "$(jq_under_stub "$dir" -r '.[]' <<<'["a","b"]')" $'a\nb' \
+      "$mode: every line should lose its \\r, not only the last"
+    # One \r per line comes off, not every \r: a comment body's own CRLF is data.
+    assert_eq "$(jq_under_stub "$dir" -r .b <<<'{"b":"one\r\ntwo"}')" $'one\r\ntwo' \
+      "$mode: a CRLF inside a raw string should survive"
+    rc=0
+    out=$(jq_under_stub "$dir" -e .c <<<'{"c":false}') || rc=$?
+    assert_eq "$rc" 1 "$mode: jq's own status should reach the caller through the read"
+    assert_eq "$out" false "$mode: and so should its output"
+    # pr-review.sh's own `jq`, which the shim replaces in every suite: sourced alone, under the
+    # stub from the start, as a Windows user runs it.
+    out=$(PATH="$dir:$PATH" SHIP_PR_TEST_SOURCE_ONLY=1 bash -c '. "$1" && jq -r .c' _ "$HELPER" <<<'{"c":"failure"}')
+    assert_eq "$out" failure "$mode: pr-review.sh's own jq, unshimmed, should read back LF"
+    # Through the fixtures' shim as well, both ways: it forwards to jq_lf, so an unbroken
+    # program reads back LF, and a broken one still refuses.
+    out=$(PATH="$dir:$PATH" && jq_eol_probe && probe_jq mine && printf '%s' "$PROBE_OUT")
+    assert_eq "$out" '{"marked":"mine"}' "$mode: the jq shim should forward to jq_lf, not to the CRLF jq"
+    rc=0
+    (PATH="$dir:$PATH" && jq_eol_probe && with_broken_jq marked probe_jq mine) || rc=$?
+    assert_eq "$rc" 3 "$mode: and a marked program should still refuse under it"
+  done
+}
+
+# The knob CI runs whole suites under: each mode probes as the jq it stands for, and the suite's
+# own reads come back LF; a value it does not know is refused rather than run as an LF suite.
+test_the_crlf_knob_runs_a_suite_over_the_stub() {
+  local knob want
+  for knob in crlf crlf-no-binary; do
+    want=binary
+    [ "$knob" = crlf ] || want=strip
+    SHIP_PR_TEST_JQ_EOL="$knob" control 'printf "eol=%s\n" "$JQ_EOL"' \
+      '[ "$(command jq -rn "\"x\"")" = "$(printf "x\r")" ] || bail "the stub is not the jq on PATH"' \
+      '[ "$(jq -rn "\"x\"")" = x ] || bail "a read came back with its CR"'
+    assert_eq "$CONTROL_RC" 0 "SHIP_PR_TEST_JQ_EOL=$knob should run the suite ($CONTROL_ERR)"
+    assert_contains "$CONTROL_OUT" "eol=$want" "SHIP_PR_TEST_JQ_EOL=$knob should probe as $want"
+    assert_contains "$CONTROL_OUT" "PASS: test_a_case" "and the case should run"
+  done
+  SHIP_PR_TEST_JQ_EOL=crlf-typo control
+  assert_refused "an unknown SHIP_PR_TEST_JQ_EOL"
+  assert_contains "$CONTROL_ERR" "not 'crlf-typo'" "the value should be named"
+}
+
 # --- protecting a second library ---------------------------------------------------------------
 # The guard's snapshot is taken while this file is sourced, so a library sourced AFTER it — the
 # base suites' shared fixture transport — is outside it until `protect_library` says otherwise.
@@ -1933,6 +2076,8 @@ tests=(
   test_the_jq_shim_leaves_every_other_program_alone
   test_with_broken_jq_clears_the_marker_whichever_way_the_command_goes
   test_a_leaked_marker_fails_the_case_that_leaked_it
+  test_a_crlf_jq_is_read_back_lf
+  test_the_crlf_knob_runs_a_suite_over_the_stub
   test_a_second_library_is_protected_once_it_says_so
   test_protect_library_refuses_a_file_that_defines_nothing
   test_retune_moves_a_constant
