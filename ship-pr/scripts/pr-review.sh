@@ -2016,7 +2016,10 @@ cmd_rounds() {
 #
 # Boundary, as an allowlist: the ONE field read is each thread's `isResolved`, and a thread counts
 # as closed only when that field is literally true — absent or null is open. The first comment's
-# id, author and path are read to NAME a thread, never to judge it. Not read: whether a thread is
+# id, author and path are read to NAME a thread, never to judge it; the id is `fullDatabaseId`
+# (a BigInt string) ahead of `databaseId`, which the schema types as a 32-bit Int while review
+# comment ids already run past 2^31 — GitHub serves them whole today (4095735684 on #370), and the
+# BigInt field is the one that is typed to keep doing so. Not read: whether a thread is
 # outdated, which head its comments cite, who wrote it, or what its last reply says — an open
 # outdated thread, or one a human opened, refuses like any other (fail closed), and a resolved one
 # passes whatever its replies say.
@@ -2026,14 +2029,16 @@ cmd_rounds() {
 # pages at 100; the read follows it to the end, and is taken as whole only when the rows read
 # reach the totalCount its last page states (a count that leads the rows is a partial read, not a
 # smaller PR). One still paging at THREADS_PAGE_CAP pages is refused as unread rather than judged
-# on its prefix. Reads: one call per 100 threads, made only where an approval is about to be
+# on its prefix. `find_thread` (what `resolve` looks a thread up with) pages to the same cap, so
+# every thread this read can name is one the advertised `resolve` can reach (review of #370). Reads: one call per 100 threads, made only where an approval is about to be
 # reported or acted on — never on a watch round that is not ending on one.
 THREADS_PAGE_CAP=50
 THREADS_QUERY='query($owner:String!, $name:String!, $pr:Int!, $after:String) {
   repository(owner:$owner, name:$name) { pullRequest(number:$pr) {
     reviewThreads(first:100, after:$after) {
       totalCount pageInfo { hasNextPage endCursor }
-      nodes { isResolved path comments(first:1) { nodes { databaseId author { login } } } } } } } }'
+      nodes { isResolved path
+        comments(first:1) { nodes { fullDatabaseId databaseId author { login } } } } } } } }'
 
 # One "<first comment id>\t<author>\t<path>" row per open thread, exit 0, when the whole connection
 # was read; otherwise ONE line saying why it was not, exit 3.
@@ -2069,7 +2074,7 @@ unresolved_threads() { # <pr>
       ;;
     esac
     page_rows=$(jq -r '.nodes[] | select(.isResolved != true)
-        | [((.comments.nodes[0].databaseId // "-") | tostring),
+        | [((.comments.nodes[0] | .fullDatabaseId // .databaseId // "-") | tostring),
            ((.comments.nodes[0].author.login // "-") | tostring), ((.path // "-") | tostring)]
         | @tsv' <<<"$resp" 2>/dev/null) || {
       printf '%s\n' "the review-threads read answered page $page with threads that did not parse"
@@ -2138,6 +2143,13 @@ approval_gate() { # <pr> <state line>
   printf '%s\n' "unresolved|-|$(state_merge "$2")|${named%%|*}|$(state_detail "$2")|${named#*|}"
 }
 
+# The state as `status` and every `watch` exit report it: status_state, then the open-thread check
+# on an approval. The watch's opening line and its nudge bookkeeping take status_state bare — they
+# report nothing a caller acts on as an approval.
+gated_state() { # <pr>
+  approval_gate "$1" "$(status_state "$1")"
+}
+
 # `merge`'s read of the same question: open threads refuse (1), an unread connection refuses as
 # transport (3) — neither is "none are open".
 merge_threads_gate() { # <pr>
@@ -2154,10 +2166,9 @@ merge_threads_gate() { # <pr>
 cmd_status() {
   pr_arg "${1:?usage: status <pr>}"
   local state
-  state=$(status_state "$PR_NUM")
   # An approval is reported only after the open-thread read (ludics-lite#289): `unresolved` exits
   # 0 like every other state the reads answered — `merge` is the gate that refuses it.
-  state=$(approval_gate "$PR_NUM" "$state")
+  state=$(gated_state "$PR_NUM")
   status_line "$state"
   # The round count rides along so the convergence policy is always in view; it never changes
   # this command's exit code — the merge gate is the state, and an unread count is reported as
@@ -2423,7 +2434,7 @@ watch_end() { # <pr> <the state token the verdict is about> <message, empty for 
   if [ "$rc" -eq 1 ]; then
     # The state beside a round is re-read too: the verdict's own state ("nothing in flight", "no
     # review of the head") is exactly the reading that round has just falsified.
-    watch_act "$1" "$(status_state "$1")"
+    watch_act "$1" "$(gated_state "$1")"
     return 0
   fi
   if [ "$rc" -eq 3 ]; then
@@ -2545,10 +2556,9 @@ watch_loop() {
       blind=$((blind + 1))
     fi
 
-    state=$(status_state "$pr")
     # An approval ends the wait, so it is the one state a round checks for open threads before
     # reporting it (ludics-lite#289) — the read is made on the round that ends, never on the rest.
-    [ "$(state_tok "$state")" != approved ] || state=$(approval_gate "$pr" "$state")
+    state=$(gated_state "$pr")
     tok=$(state_tok "$state")
     age=$(state_age "$state")
     if [ "$tok" != unknown ]; then
@@ -2675,7 +2685,7 @@ watch_loop() {
   # tail of the window was not observed — the same fact, in the report that window is owed.
   watch_settle "$pr"
   if [ $? -eq 1 ]; then
-    watch_act "$pr" "$(status_state "$pr")"
+    watch_act "$pr" "$(gated_state "$pr")"
     return 0
   fi
 
@@ -2959,7 +2969,7 @@ _🤖 Addressed by an automated coding agent_" --jq .html_url
 # against. Each page therefore retries, and an unanswered page aborts the search as transport.
 find_thread() {
   local pr="$1" id="$2" cursor="" after page resp hit rc
-  for page in $(seq 1 20); do
+  for ((page = 1; page <= THREADS_PAGE_CAP; page++)); do
     [ -z "$cursor" ] && after="" || after=", after:\"$cursor\""
     resp=$(gh_retry read api graphql -f query="
       query(\$owner:String!, \$name:String!, \$pr:Int!) {

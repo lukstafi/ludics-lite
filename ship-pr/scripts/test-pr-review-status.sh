@@ -1144,6 +1144,30 @@ test_a_broken_jq_program_is_unknown_on_the_thread_read() {
   assert_contains "$CMD_OUT" "threads that did not parse" "the site says so"
 }
 
+test_a_thread_is_named_by_its_full_width_id() {
+  # databaseId is a 32-bit Int in the schema and review comment ids already run past 2^31, so the
+  # BigInt string is the id the line names, and databaseId is only its fallback (review of #370).
+  approved_fixture
+  THREADS_JSON="[$(review_thread 4095735704 false | jq -c '.comments.nodes[0].databaseId = null'),$(review_thread 4095735696 false | jq -c 'del(.comments.nodes[0].fullDatabaseId)')]"
+  run_cmd_status
+  assert_contains "$CMD_OUT" "4095735704 by codex[bot] on a.sh, 4095735696 by codex[bot] on a.sh" \
+    "the full-width id first, and the Int one where it is all the row carries"
+}
+
+test_resolve_reaches_every_thread_the_gate_can_name() {
+  # The gate pages to THREADS_PAGE_CAP; `resolve` looks threads up with find_thread, which used to
+  # stop at twenty pages. A thread the gate names past that, with no flag to bypass the gate, could
+  # then never be cleared (review of #370, round 1): both reads now share the cap.
+  approved_fixture
+  THREADS_FIXTURE_PAGE=1
+  local i nodes=""
+  for i in $(seq 1 25); do nodes="$nodes,$(review_thread "$((9000 + i))" true)"; done
+  THREADS_JSON="[${nodes#,}]"
+  local rc=0
+  find_thread 7 9025 >/dev/null || rc=$?
+  assert_eq "$rc" 0 "a thread on page 25 is found by the lookup resolve makes"
+}
+
 tests=(
   test_empty_reviews_need_their_own_findings
   test_idle_clean_says_next_move_is_yours
@@ -1193,6 +1217,8 @@ tests=(
   test_a_thread_with_no_resolution_field_is_open
   test_a_thread_path_is_shell_quoted
   test_a_broken_jq_program_is_unknown_on_the_thread_read
+  test_a_thread_is_named_by_its_full_width_id
+  test_resolve_reaches_every_thread_the_gate_can_name
 )
 
 run_tests "${tests[@]}"

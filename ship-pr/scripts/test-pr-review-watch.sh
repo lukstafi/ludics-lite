@@ -1575,6 +1575,22 @@ test_an_approval_landing_in_the_final_poll_is_checked_too() {
     "and the approval is reported over its open thread"
 }
 
+test_an_approval_beside_a_final_poll_round_is_checked_too() {
+  # watch_end's other exit: the final poll finds a round about the head, and the 👍 is newer than
+  # it, so the state printed beside that round is an approval — checked like any other (review of
+  # #370, round 1), never a clean `status: approved` over an older open thread.
+  reset_fixture
+  retune GRACE=1
+  schedule inline 2 "[$(inline_comment 4095735684 "$H2" "$H2" 'a finding on this head')]"
+  schedule reactions 2 "[$(reaction +1 2026-09-01T00:02:00Z)]"
+  schedule threads 1 "[$(review_thread 4053098120 false)]"
+  run_watch 0,0,0 5 1
+  assert_eq "$WATCH_RC" 0 "the round the final poll found is the exit"
+  assert_contains "$WATCH_OUT" "--- inline id=4095735684" "and it is printed as the round"
+  assert_contains "$WATCH_ERR" "status: approved (👍 from $REVIEWER) BUT 1 review thread(s) still UNRESOLVED" \
+    "the approval beside it is reported over the open thread"
+}
+
 tests=(
   test_the_about_codex_block_is_folded_to_one_line
   test_what_is_not_the_about_codex_block_renders_as_is
@@ -1629,6 +1645,7 @@ tests=(
   test_a_clockless_expected_state_says_so_rather_than_guessing
   test_an_approval_over_findings_scrolled_past_is_not_clean
   test_an_approval_landing_in_the_final_poll_is_checked_too
+  test_an_approval_beside_a_final_poll_round_is_checked_too
 )
 
 run_tests "${tests[@]}"

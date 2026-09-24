@@ -449,22 +449,33 @@ gh_fixture_answer() {
 
 # --- review threads (ludics-lite#289) --------------------------------------------------------
 # One thread as the reviewThreads connection serves it: isResolved, the path, and the first
-# comment's id and author — the fields pr-review.sh's open-thread read asks for.
+# comment's ids and author — the fields pr-review.sh's open-thread read asks for. Both ids, as
+# GitHub serves them: fullDatabaseId a BigInt STRING, databaseId the same value as a number.
 review_thread() { # <first comment id> <true|false> [path] [author]
   jq -cn --argjson id "$1" --argjson r "$2" --arg p "${3:-a.sh}" --arg a "${4:-codex[bot]}" \
-    '{isResolved:$r, path:$p, comments:{nodes:[{databaseId:$id, author:{login:$a}}]}}'
+    '{isResolved:$r, path:$p,
+      comments:{nodes:[{fullDatabaseId:($id | tostring), databaseId:$id, author:{login:$a}}]}}'
 }
 
 # The GraphQL answer to the open-thread query over <nodes> (a JSON array of review_thread rows),
 # paged as GitHub pages it: THREADS_FIXTURE_PAGE rows a page (100), the cursor `c<offset>`, read
-# back from the call's own `after=` field, and a totalCount of the whole array unless
+# back from the call's own `after=` field — or from an `after:"c<offset>"` spelled into the query
+# text, which is how `find_thread` pages — and a totalCount of the whole array unless
 # THREADS_FIXTURE_TOTAL states another (a count that leads the rows). Pass the fixture's "$@"
 # after the nodes, and send the result through gh_fixture_answer for the call's --jq.
 review_threads_answer() { # <nodes json> <the gh call's args...>
   local nodes="$1" arg start=0
   shift
   for arg in "$@"; do
-    case "$arg" in after=c*) start="${arg#after=c}" ;; after=*) bail "review_threads_answer: a cursor this fixture never served: $arg" ;; esac
+    case "$arg" in
+    after=c*) start="${arg#after=c}" ;;
+    after=*) bail "review_threads_answer: a cursor this fixture never served: $arg" ;;
+    query=*'after:"c'*)
+      start="${arg#*after:\"c}"
+      start="${start%%\"*}"
+      ;;
+    esac
+    case "$start" in '' | *[!0-9]*) bail "review_threads_answer: a cursor this fixture never served: $arg" ;; esac
   done
   jq -cn --argjson nodes "$nodes" --argjson start "$start" \
     --argjson size "${THREADS_FIXTURE_PAGE:-100}" --argjson total "${THREADS_FIXTURE_TOTAL:-null}" '
