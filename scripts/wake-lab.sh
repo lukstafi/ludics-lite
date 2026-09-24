@@ -98,9 +98,11 @@ load_hosts() {
 # that knows rog but not minix would otherwise wake rog, then report minix as a typo halfway
 # through the operation -- and the dispatch loop's exit status hides that, so the run reads as a
 # success. Refusing the whole run is what "refuse rather than run half-configured" means here. The
-# same holds for the endpoint map below: every target's row is checked whole, whatever its kind.
+# same holds for the endpoint map below: the map is checked whole, and then every target's row,
+# whatever its kind.
 check_targets() {
   local t bad="" kind
+  check_map || exit 1
   for t in "$@"; do
     mac_of "$t" >/dev/null 2>&1 || { bad="$bad $t"; continue; }
     kind=$(box_kind "$t") || kind=""
@@ -175,12 +177,47 @@ endpoint_of() { # endpoint_of <box> linux|win|wsl|lan -- that OS's ssh alias; 1 
   return 1
 }
 
+# check_map -- the rules no single row can check, or say what is wrong and return 1.
+#  * Each box name has one row, and is a plain name (a letter or digit, then letters, digits, `_`
+#    and `-`), since it also names the box's lock files. endpoints_of reads a name's first row
+#    while `all` expands to every row, so a second row would be acted on twice and validated never.
+#  * Each alias belongs to one box. A row copied from another box and never edited is complete by
+#    every per-row rule, and would reach that other box under this one's locks: `sleep nova` would
+#    suspend tuf without seeing a lane or hold lock taken on tuf.
+check_map() {
+  local r name rest w ws owner boxes=" " aliases=" " bad=""
+  for r in "${ENDPOINT_MAP[@]}"; do
+    read -r name rest <<<"$r"
+    case "$name" in
+      ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_-]*) bad="$bad the box name $(printf %q "$name") is not a plain name;"; continue ;;
+    esac
+    case "$boxes" in *" $name "*) bad="$bad $name has two rows;"; continue ;; esac
+    boxes="$boxes$name "
+    read -r -a ws <<<"$rest"
+    for w in ${ws[@]+"${ws[@]}"}; do
+      case "$w" in *=?*) ;; *) continue ;; esac   # a malformed entry is check_endpoints' to name
+      w=${w#*=}
+      case "$aliases" in
+        *" $w@"*) owner=${aliases#*" $w@"}; owner=${owner%% *}
+                  bad="$bad the alias $(printf %q "$w") is on both $owner and $name;" ;;
+        *) aliases="$aliases$w@$name " ;;
+      esac
+    done
+  done
+  [ -z "$bad" ] && return 0
+  printf '%s\n' "wake-lab.sh: the endpoint map is inconsistent:${bad%;}" \
+    "  fix ENDPOINT_MAP in wake-lab.sh; nothing was sent." >&2
+  return 1
+}
+
 # check_endpoints <box> <kind> -- the box's row is complete, or say what is wrong and return 1.
 # A fail-closed allowlist: the row is refused unless every rule holds, and each rule is an omission
 # a review once had to find by hand.
 #  * The box has a row. A box hosts.sh knows and this map does not reaches nothing.
-#  * Every entry is `<os>=<alias>`, with one of the four keys above and an alias made of letters,
-#    digits, `.`, `_` and `-`. A misspelt key is an OS that status would silently never probe.
+#  * Every entry is `<os>=<alias>`, with one of the four keys above and an alias that starts with a
+#    letter or digit and goes on in letters, digits, `.`, `_` and `-`. A misspelt key is an OS that
+#    status would silently never probe, and an alias with a leading `-` is an ssh OPTION: `ssh
+#    -V-linux 'exit 0'` prints the version and exits 0, so the probe reads the box as UP.
 #  * win and wsl come as a pair. A Windows host with no guest alias passed WSL validation (tuf, PR
 #    #313), and a guest with no host has nothing to start its VM.
 #  * lan only beside win: it is a second route to that same Windows sshd.
@@ -200,7 +237,7 @@ check_endpoints() {
     case "$w" in *=*) ;; *) bad="$bad $(printf %q "$w") is not <os>=<alias>;"; continue ;; esac
     key=${w%%=*}; alias=${w#*=}
     case "$alias" in
-      ''|*[!A-Za-z0-9._-]*) bad="$bad $(printf %q "$w") is not a plain ssh alias;"; continue ;;
+      ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) bad="$bad $(printf %q "$w") is not a plain ssh alias;"; continue ;;
     esac
     # Twice is refused rather than resolved: endpoint_of reads the first and this the last.
     case " $seen " in *" $key "*) bad="$bad $(printf %q "$key") is listed twice;"; continue ;; esac

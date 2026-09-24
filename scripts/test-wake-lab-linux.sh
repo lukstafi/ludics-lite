@@ -159,15 +159,15 @@ eth_mac_of() { mac_of "$1"; }
 ip_of() { [ "$1" = nova ] && echo 192.0.2.33; }
 kind_of() { [ "$1" = nova ] && echo linux; }
 HOSTS
-nova_map() { # nova_map <dir> <row> -- a copy of the scripts whose endpoint map also lists nova
+nova_map() { # nova_map <dir> <row> -- a copy of the scripts whose endpoint map gains <row>
   mkdir -p "$tmp/$1"
   cp "$tmp/wake-lab-wsl.sh" "$tmp/$1/wake-lab-wsl.sh"
-  awk -v row="  \"nova $2\"" '{ print } /^  "tuf +linux=/ { print row }' \
+  awk -v row="  \"$2\"" '{ print } /^  "tuf +linux=/ { print row }' \
     "$tmp/wake-lab.sh" >"$tmp/$1/wake-lab.sh"
   chmod +x "$tmp/$1/wake-lab.sh"
-  grep -qxF "  \"nova $2\"" "$tmp/$1/wake-lab.sh"
+  grep -qxF "  \"$2\"" "$tmp/$1/wake-lab.sh"
 }
-check 'the added-box fixture inserts its row into the map' 'nova_map nova "linux=nova-x-linux win=nova-x-win wsl=nova-x-wsl lan=nova-lan"'
+check 'the added-box fixture inserts its row into the map' 'nova_map nova "nova linux=nova-x-linux win=nova-x-win wsl=nova-x-wsl lan=nova-lan"'
 out=$(WAKE_LAB_HOSTS="$tmp/nova-hosts.sh" SSH_UP=nova-x-linux "$tmp/nova/wake-lab.sh" status nova 2>&1); rc=$?
 check 'an added box answers on the Linux endpoint of its row' '[ "$rc" = 0 ] && [[ "$out" == *"nova "*"os=linux  linux=UP"* ]]'
 out=$(WAKE_LAB_HOSTS="$tmp/nova-hosts.sh" SSH_UP=nova-x-win "$tmp/nova/wake-lab.sh" status nova 2>&1); rc=$?
@@ -177,31 +177,39 @@ check '...and its alternate WSL guest' '[ "$rc" = 0 ] && [[ "$out" == *"os=wsl  
 sed 's/echo linux/echo wsl/' "$tmp/nova-hosts.sh" >"$tmp/nova-wsl.sh"
 out=$(WAKE_LAB_HOSTS="$tmp/nova-wsl.sh" SSH_UP=nova-lan "$tmp/nova/wake-lab.sh" status nova 2>&1); rc=$?
 check '...and, set to WSL, its LAN route' '[ "$rc" = 0 ] && [[ "$out" == *"lan=UP  win=--  wsl=--"*"os=windows"* ]]'
-# Each way the row can be incomplete, as an addition or a half-done rename leaves it. Every one is
-# refused, says what is wrong, and sends nothing: no router query, no packet, no ssh, no lock.
+# Each way the addition can be wrong, as a new row or a half-done rename leaves it: first the row
+# alone, then the map as a whole. Every one is refused, says what is wrong, and sends nothing: no
+# router query, no packet, no ssh, no lock.
+row_bad='incomplete ssh endpoints for nova'
+map_bad='the endpoint map is inconsistent'
 n=0
-while IFS='|' read -r row want; do
+while IFS='|' read -r row head want; do
   n=$((n + 1))
   if ! nova_map "nova-bad-$n" "$row"; then check "incomplete-row fixture $n was inserted" false; continue; fi
+  case "$head" in row) head=$row_bad ;; map) head=$map_bad ;; esac
   for verb in '' sleep; do   # '' is the bare wake, which has no verb word
-    : >"$SSH_LOG"; rm -f "$WAKE_LAB_LOCK_DIR/nova.lock" "$WAKE_LAB_LOCK_DIR/nova.hold.lock"
+    : >"$SSH_LOG"; rm -f "$WAKE_LAB_LOCK_DIR"/*.lock
     out=$(WAKE_LAB_HOSTS="$tmp/nova-hosts.sh" SSH_UP=nova-x-linux WAKE_LAB_DOWN_WAIT_SECONDS=0 \
       "$tmp/nova-bad-$n/wake-lab.sh" ${verb:+"$verb"} nova 2>&1); rc=$?
-    check "an added box whose row has $want is refused before ${verb:-wake} sends anything" \
-      '[ "$rc" = 1 ] && [[ "$out" == *"incomplete ssh endpoints for nova"*"$want"*"nothing was sent"* ]] && [ ! -s "$SSH_LOG" ] && [ ! -e "$WAKE_LAB_LOCK_DIR/nova.lock" ]'
+    check "an added row with $want is refused before ${verb:-wake} sends anything" \
+      '[ "$rc" = 1 ] && [[ "$out" == *"$head"*"$want"*"nothing was sent"* ]] && [ ! -s "$SSH_LOG" ] && ! ls "$WAKE_LAB_LOCK_DIR" | grep -q .'
   done
 done <<'ROWS'
-linux=nova-x-linux win=nova-x-win|a Windows endpoint (nova-x-win) with no WSL guest alias
-linux=nova-x-linux wsl=nova-x-wsl|a WSL guest (nova-x-wsl) with no Windows host
-linux=nova-x-linux lan=nova-lan|a LAN route (nova-lan) with no Windows endpoint
-linux=nova-x-linux win=nova-x-win wsl=nova-x-wsl lan=tuf-lan|the LAN route tuf-lan is not nova-lan
-linux=nova-x-linux win=tuf-amd-win wsl=nova-x-wsl|tuf-amd-win does not share the stem nova-x
-linux=nova-x-linux win=nova-x-win wsl=nova-x-guest|nova-x-guest does not end in -wsl
-linux=nova-x-linux wn=nova-x-win|unknown endpoint wn
-linux=nova-x-linux linux=nova-y-linux|linux is listed twice
-win=nova-x-win wsl=nova-x-wsl|no linux ssh endpoint for a linux box
+nova linux=nova-x-linux win=nova-x-win|row|a Windows endpoint (nova-x-win) with no WSL guest alias
+nova linux=nova-x-linux wsl=nova-x-wsl|row|a WSL guest (nova-x-wsl) with no Windows host
+nova linux=nova-x-linux lan=nova-lan|row|a LAN route (nova-lan) with no Windows endpoint
+nova linux=nova-x-linux win=nova-x-win wsl=nova-x-wsl lan=nova-x-lan|row|the LAN route nova-x-lan is not nova-lan
+nova linux=nova-x-linux win=nova-y-win wsl=nova-x-wsl|row|nova-y-win does not share the stem nova-x
+nova linux=nova-x-linux win=nova-x-win wsl=nova-x-guest|row|nova-x-guest does not end in -wsl
+nova linux=nova-x-linux wn=nova-x-win|row|unknown endpoint wn
+nova linux=nova-x-linux linux=nova-y-linux|row|linux is listed twice
+nova win=nova-x-win wsl=nova-x-wsl|row|no linux ssh endpoint for a linux box
+nova linux=-V-linux win=-V-win wsl=-V-wsl|row|linux=-V-linux is not a plain ssh alias
+nova linux=tuf-amd-linux win=tuf-amd-win wsl=tuf-amd-wsl|map|the alias tuf-amd-linux is on both tuf and nova
+tuf linux=nova-x-linux|map|tuf has two rows
+-nova linux=nova-x-linux|map|the box name -nova is not a plain name
 ROWS
-check 'every incomplete-row fixture ran' '[ "$n" = 9 ]'
+check 'every incomplete-row fixture ran' '[ "$n" = 13 ]'
 # A RENAMED box is its row renamed and nothing else: `all` and a bare status expand to the map's
 # rows, so no other list in the script still names the old box and refuses it as unknown.
 mkdir "$tmp/renamed"
