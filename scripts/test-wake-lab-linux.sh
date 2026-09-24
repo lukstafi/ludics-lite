@@ -162,10 +162,10 @@ HOSTS
 nova_map() { # nova_map <dir> <row> -- a copy of the scripts whose endpoint map also lists nova
   mkdir -p "$tmp/$1"
   cp "$tmp/wake-lab-wsl.sh" "$tmp/$1/wake-lab-wsl.sh"
-  awk -v row="  nova) echo $2 ;;" '{ print } /^  tuf\) +echo linux=/ { print row }' \
+  awk -v row="  \"nova $2\"" '{ print } /^  "tuf +linux=/ { print row }' \
     "$tmp/wake-lab.sh" >"$tmp/$1/wake-lab.sh"
   chmod +x "$tmp/$1/wake-lab.sh"
-  grep -qF "  nova) echo $2 ;;" "$tmp/$1/wake-lab.sh"
+  grep -qxF "  \"nova $2\"" "$tmp/$1/wake-lab.sh"
 }
 check 'the added-box fixture inserts its row into the map' 'nova_map nova "linux=nova-x-linux win=nova-x-win wsl=nova-x-wsl lan=nova-lan"'
 out=$(WAKE_LAB_HOSTS="$tmp/nova-hosts.sh" SSH_UP=nova-x-linux "$tmp/nova/wake-lab.sh" status nova 2>&1); rc=$?
@@ -202,6 +202,20 @@ linux=nova-x-linux linux=nova-y-linux|linux is listed twice
 win=nova-x-win wsl=nova-x-wsl|no linux ssh endpoint for a linux box
 ROWS
 check 'every incomplete-row fixture ran' '[ "$n" = 9 ]'
+# A RENAMED box is its row renamed and nothing else: `all` and a bare status expand to the map's
+# rows, so no other list in the script still names the old box and refuses it as unknown.
+mkdir "$tmp/renamed"
+cp "$tmp/wake-lab-wsl.sh" "$tmp/renamed/wake-lab-wsl.sh"
+sed 's/^  "tuf   linux=tuf-amd-linux   win=tuf-amd-win   wsl=tuf-amd-wsl"/  "puf   linux=puf-amd-linux   win=puf-amd-win   wsl=puf-amd-wsl"/' \
+  "$tmp/wake-lab.sh" >"$tmp/renamed/wake-lab.sh"; chmod +x "$tmp/renamed/wake-lab.sh"
+sed 's/tuf/puf/g' "$tmp/lab-hosts.sh" >"$tmp/renamed-hosts.sh"
+check 'the rename fixture renamed the row' 'grep -q "\"puf   linux=puf-amd-linux" "$tmp/renamed/wake-lab.sh" && ! grep -q "\"tuf " "$tmp/renamed/wake-lab.sh"'
+for form in '' all; do
+  out=$(WAKE_LAB_HOSTS="$tmp/renamed-hosts.sh" SSH_UP=puf-amd-linux "$tmp/renamed/wake-lab.sh" status ${form:+"$form"} 2>&1); rc=$?
+  check "status ${form:-(bare)} reads the renamed box from its row" '[ "$rc" = 0 ] && [[ "$out" == *"
+puf "*"os=linux  linux=UP"* ]] && [[ "$out" == *"
+rog "* ]] && [[ "$out" != *"tuf"* ]]'
+done
 cat >"$tmp/other-linux.sh" <<'HOSTS'
 mac_of() { [ "$1" = other ] && echo aa:bb:cc:00:00:05; }
 eth_mac_of() { return 1; }

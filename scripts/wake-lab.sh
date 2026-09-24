@@ -7,10 +7,10 @@
 #   2. A magic packet sent directly from this Mac (broadcast, UDP ports 7 and 9).
 #
 # Usage:
-#   wake-lab.sh [rog|minix|tuf|all]       wake (default: rog minix; all: rog minix tuf)
+#   wake-lab.sh [rog|minix|tuf|all]       wake (default: rog minix; all: every box in the endpoint map)
 #   wake-lab.sh --wait [--wsl] rog        wake, then poll until configured OS answers
 #   wake-lab.sh --wait --restart-wsl rog  ...and start WSL from a FRESH VM (wsl --shutdown first)
-#   wake-lab.sh status [box...]           per-box reachability and reached OS (default: all three)
+#   wake-lab.sh status [box...]           per-box reachability and reached OS (default: every box)
 #   wake-lab.sh sleep|hibernate|down box  suspend / hibernate / full shutdown
 #   wake-lab.sh kick-wsl box              start the WSL VM (it never autostarts at boot)
 #   wake-lab.sh restart-wsl box           shut the WSL VM down and start it again
@@ -134,14 +134,34 @@ box_kind() { kind_of "$1"; }
 #                                              which answers seconds after a cold boot
 # A row lists every OS the box can boot, whatever kind_of says it is set to today: kind_of is the
 # site's current setting (hosts.sh), this is which endpoints exist, and status probes the others so
-# that a dual-boot box which booted the other OS says so. The short box names are the WoL and lock
-# identities. Adding or renaming a box is one row here plus its hosts.sh entries, and
-# check_endpoints refuses an incomplete row before anything is sent.
-endpoints_of() { case "$1" in
-  rog)   echo linux=rog-nv-linux win=rog-nv-win wsl=rog-nv-wsl lan=rog-lan ;;
-  minix) echo linux=minix-amd-linux win=minix-amd-win wsl=minix-amd-wsl lan=minix-lan ;;
-  tuf)   echo linux=tuf-amd-linux win=tuf-amd-win wsl=tuf-amd-wsl ;;  # Wi-Fi only: no LAN route
-  *) return 1 ;; esac; }
+# that a dual-boot box which booted the other OS says so. The short box names, first on each row,
+# are the WoL and lock identities, and the rows in order are the lab: `all` and a bare `status`
+# expand to them. Adding or renaming a box is one row here plus its hosts.sh entries (and, for a
+# box a bare wake or power verb should reach, ACT_DEFAULT below), and check_endpoints refuses an
+# incomplete row before anything is sent.
+ENDPOINT_MAP=(
+  "rog   linux=rog-nv-linux    win=rog-nv-win    wsl=rog-nv-wsl    lan=rog-lan"
+  "minix linux=minix-amd-linux win=minix-amd-win wsl=minix-amd-wsl lan=minix-lan"
+  "tuf   linux=tuf-amd-linux   win=tuf-amd-win   wsl=tuf-amd-wsl"    # Wi-Fi only: no LAN route
+)
+# The default for a verb that ACTS -- wake, sleep, hibernate, down, kick-wsl -- given no box: the
+# boxes with Ethernet WoL. Not derived from the site's eth_mac_of, because a table missing a box
+# would then shrink the default silently instead of refusing it (ludics-lite#320).
+ACT_DEFAULT=(rog minix)
+
+endpoints_of() { # endpoints_of <box> -- that box's row, less its name; 1 when the map has none
+  local r name rest
+  for r in "${ENDPOINT_MAP[@]}"; do
+    read -r name rest <<<"$r"
+    [ "$name" = "$1" ] && { printf '%s\n' "$rest"; return 0; }
+  done
+  return 1
+}
+
+lab_boxes() { # the map's box names, in row order, one per line
+  local r name rest
+  for r in "${ENDPOINT_MAP[@]}"; do read -r name rest <<<"$r"; printf '%s\n' "$name"; done
+}
 
 endpoint_of() { # endpoint_of <box> linux|win|wsl|lan -- that OS's ssh alias; 1 when the box has none
   local row w ws
@@ -789,7 +809,7 @@ for arg in "$@"; do
     --restart-wsl) WANT_WSL=1; FRESH_WSL=fresh ;;
     --force) FORCE=1 ;;
     -h|--help) usage; exit 0 ;;
-    all) TARGETS+=(rog minix tuf) ;;
+    all) while IFS= read -r t; do TARGETS+=("$t"); done < <(lab_boxes) ;;
     *) TARGETS+=("$arg") ;;
   esac
 done
@@ -801,7 +821,8 @@ done
 # `status all`, the default is checked against the site table whole, so a table that does not know
 # tuf refuses a bare `status` rather than silently shrinking it; name the boxes there instead.
 if [ ${#TARGETS[@]} -eq 0 ]; then
-  if [ "$VERB" = status ]; then TARGETS=(rog minix tuf); else TARGETS=(rog minix); fi
+  if [ "$VERB" = status ]; then while IFS= read -r t; do TARGETS+=("$t"); done < <(lab_boxes)
+  else TARGETS=("${ACT_DEFAULT[@]}"); fi
 fi
 
 # A --hold that holds nothing is a lane that believes it is held and is not, which is the exact

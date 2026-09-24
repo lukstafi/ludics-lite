@@ -230,8 +230,9 @@ ssh aliases and all of the logic. `wake-lab.sh --help` prints the common header,
 live in one endpoint map, `endpoints_of` in `wake-lab.sh`: one row per box, listing each OS it can
 boot (`linux`, `win`, `wsl`, and a `lan` route to Windows). Validation, `status`, the waits and the
 WSL adapter all read that row, and a row that is incomplete (a Windows endpoint with no guest, a
-half-renamed alias, a misspelt key) is refused before anything is sent (ludics-lite#314). So
-adding or renaming a box is one row there plus its entries in the site file.
+half-renamed alias, a misspelt key) is refused before anything is sent (ludics-lite#314). `all`
+and a bare `status` expand to the map's rows, so adding or renaming a box is one row there plus
+its entries in the site file (and `ACT_DEFAULT`, beside it, for a box a bare wake should reach).
 
 To repair the Windows-side NIC settings, copy `scripts/enable-wol-windows.ps1` to the Windows box
 and run it from an elevated PowerShell (`powershell -ExecutionPolicy Bypass -File
