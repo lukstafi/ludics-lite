@@ -1073,7 +1073,7 @@ The cases are independent, so they run concurrently, one per processor by defaul
 `SHIP_PR_TEST_JOBS` changes that; `-j 1` is serial): the full suite finishes in about a minute and
 a half on a 4-core CI runner, where the serial run took eight, and in well under a minute on a
 desktop. Each case's output is buffered and printed whole when it completes, so a failure report
-never interleaves with another case; passing cases print only their `PASS:` line unless `-v` asks
+never interleaves with another case; passing cases print only their `PASS <case>:` line unless `-v` asks
 for everything. Failures do not stop the other cases — the closing `FAIL:` line names every case
 that failed. Each case runs in its own process group under a deadline
 (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a case still running at its deadline is
