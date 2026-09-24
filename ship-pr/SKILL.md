@@ -689,7 +689,8 @@ Then merge:
 ~/.claude/skills/ship-pr/scripts/pr-review.sh merge <owner>/<repo>#<pr> --require-green --wait
 ```
 
-`merge` (below) reads the build signal, not the 👍. The maintainer reads in the record what was
+`merge` (below) reads the build signal and the open review threads, not the 👍 — so the
+"resolved" in the second bullet is one it checks. The maintainer reads in the record what was
 not done and why, instead of finding it in the next PR's review. Under Claude Code's auto mode,
 ask for this merge in the message carrying the record, not after trying it (*PR or direct commit?*).
 
@@ -727,6 +728,11 @@ open the run, fix the build, push, merge.
 It refuses on an unreadable signal too (exit 3). An unread check list is not a green one — that
 distinction is why these reads are REST while `gh pr checks` is GraphQL, which 503s independently
 and answers an outage with an empty list indistinguishable from a PR whose CI never ran.
+
+**It refuses while any review thread is unresolved** (exit 1, naming each by the id `resolve`
+takes; exit 3 when the threads could not be read), whatever head the thread cites and whatever
+the build says — the `unresolved` state above, read once after any `--wait`. No flag bypasses it:
+answer and resolve the threads, then re-run `merge`.
 
 The other verdicts are not refusals, and none of them is a green light either:
 
