@@ -131,6 +131,9 @@ export FLEET_ANCHOR="testbox"
 # session identity.
 export FLEET_COORDINATOR="test-coordinator"
 unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
+# An exported GitHub token changes the preflight's credential repair text (ludics-lite#360), so the
+# runner's own must not reach it.
+unset GH_TOKEN GITHUB_TOKEN
 export PATH="$TMP/bin:$PATH"
 # `execution slot` runs its command under `execution hold`, which wraps it in systemd-inhibit when
 # one resolves (ludics-lite#317). The CI runner is Ubuntu, whose real systemd-inhibit would make
@@ -305,7 +308,24 @@ shift
 [ "$host" = "${SHIM_SSH_DOWN:-}" ] && { echo "ssh: connect to host $host port 22: Connection timed out" >&2; exit 255; }
 exit 0
 SHIMEOF
-chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux" "$TMP/bin/ssh"
+# gh: the preflight's GitHub credential call (ludics-lite#360), `gh api user -q .login`, in the
+# shapes a real gh answers with: SHIM_GH=401 is gh 2.46 over a dead keyring token (the JSON body
+# on stdout with no newline, then the error on stderr, exit 1; rog-nv-linux, 2026-09-24),
+# `noauth` a box never logged in (exit 4), `down` a network that cannot reach api.github.com,
+# `5xx` a GitHub outage, `hang` a call that never returns. Unset, it answers a login.
+cat > "$TMP/bin/gh" <<'SHIMEOF'
+#!/usr/bin/env bash
+[ "$*" = "api --hostname github.com user -q .login" ] || { echo "gh shim: unexpected call: $*" >&2; exit 2; }
+case "${SHIM_GH:-}" in
+  401) printf '{\n  "message": "Bad credentials",\n  "status": "401"\n}'; echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
+  noauth) printf 'To get started with GitHub CLI, please run:  gh auth login\n' >&2; exit 4 ;;
+  down) printf 'error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com\n' >&2; exit 1 ;;
+  5xx) echo "gh: Server Error (HTTP 502)" >&2; exit 1 ;;
+  hang) sleep 30 ;;
+esac
+echo shim-user
+SHIMEOF
+chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux" "$TMP/bin/ssh" "$TMP/bin/gh"
 
 # --- the real checkout, installed by the README's own loops, must pass the preflight ---------
 # The scratch checkout further down is built to the layout the preflight expects, so the two
@@ -735,6 +755,20 @@ expect "a box with systemd-inhibit and the polkit grant adds nothing to the OK l
   env PATH="$TMP/pk-yes:$PATH" FLEET_SYSTEMD_INHIBIT=fleet-test-inhibit "$FW" preflight testbox --no-probe --no-cross
 expect "...and without the grant notes the unguarded sleep guard on the OK line" 0 "PREFLIGHT OK testbox skills=[0-9a-f]* (no polkit grant for the sleep guard (runs unguarded; see issue-wave/references/executions.md#the-os-level-sleep-guard))$" -- \
   env PATH="$TMP/pk-no:$TMP/pk-yes:$PATH" FLEET_SYSTEMD_INHIBIT=fleet-test-inhibit "$FW" preflight testbox --no-probe --no-cross
+# The GitHub credential call (ludics-lite#360): a refused token refuses in every mode with the
+# user-side repair, a GitHub that does not answer is a note, as a sleeping sibling is.
+expect "a live GitHub credential passes and adds nothing to the OK line" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- "$FW" preflight testbox --no-probe --no-cross
+expect "a gh token answering HTTP 401 refuses with the repair" 1 "PREFLIGHT REFUSED testbox: GitHub credential refused in a non-interactive session on testbox (gh api user: gh: Bad credentials (HTTP 401)).*desktop console.*repair: ssh -t testbox 'gh auth login -h github.com -p https -w && gh auth setup-git'" -- \
+  env SHIM_GH=401 "$FW" preflight testbox --no-probe --no-cross
+expect "...and refuses the native Claude preflight too" 1 "GitHub credential refused in a non-interactive session on testbox" -- env SHIM_GH=401 "$FW" preflight testbox --native-claude --no-cross
+expect "...and the native Codex preflight" 1 "GitHub credential refused in a non-interactive session on testbox" -- env SHIM_GH=401 "$FW" preflight testbox --native-codex --no-cross
+expect "...and the Codex CLI preflight" 1 "GitHub credential refused" -- env SHIM_GH=401 "$FW" preflight testbox --codex --no-probe --no-cross
+expect "a rejected token exported in the session names it in the repair" 1 "repair: remove the GH_TOKEN this session exports (it outranks gh's stored login and blocks gh auth login) from testbox's shell startup, then restart any tmux server that inherited it; for the stored login: ssh -t testbox" -- \
+  env SHIM_GH=401 GH_TOKEN=gho_dead "$FW" preflight testbox --native-claude --no-cross
+expect "a box never logged in to gh refuses (an unnamed failure fails closed)" 1 "GitHub credential refused.*gh auth login" -- env SHIM_GH=noauth "$FW" preflight testbox --no-probe --no-cross
+expect "a GitHub that cannot be reached is noted on the OK line" 0 "PREFLIGHT OK testbox .*(GitHub unreachable from testbox: gh api user: check your internet connection" -- env SHIM_GH=down "$FW" preflight testbox --no-probe --no-cross
+expect "a GitHub outage (HTTP 5xx) is noted, not refused" 0 "PREFLIGHT OK.*GitHub unreachable from testbox: gh api user: gh: Server Error (HTTP 502)" -- env SHIM_GH=5xx "$FW" preflight testbox --no-probe --no-cross
+expect "a gh call that never returns is bounded and noted" 0 "PREFLIGHT OK.*GitHub unreachable from testbox: no answer from gh api user in 2s" -- env SHIM_GH=hang FLEET_GH_TIMEOUT=2 "$FW" preflight testbox --no-probe --no-cross
 expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
 expect "native preflight needs neither CLI login nor a model probe" 0 "PREFLIGHT OK" -- env SHIM_CODEX_LOGIN_DOWN=1 SHIM_CODEX_DOWN=1 SHIM_CLAUDE_DOWN=1 "$FW" preflight testbox --native-codex
 expect "native Claude needs no CLI model probe" 0 "PREFLIGHT OK" -- env SHIM_CLAUDE_DOWN=1 SHIM_CODEX_LOGIN_DOWN=1 "$FW" preflight testbox --native-claude

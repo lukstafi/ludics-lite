@@ -236,14 +236,23 @@ to deploy), a deployed skill symlink that does not point into the checkout (and,
 three `~/.codex/skills` links the README's Codex loop installs), and, for CLI workers only, a
 live one-word headless turn. `claude auth status` cannot stand in for that probe (2026-09-02:
 it reported `loggedIn:true` on minix while every `claude -p` there failed with an expired,
-unrefreshable OAuth session). A refusal names its reason; surface it rather than launching
+unrefreshable OAuth session). Every mode also makes the box's GitHub call, `gh api user`, in the
+session kind a worker or leg uses, a non-interactive ssh (a local shell on the anchor), and
+refuses a token that call rejects (ludics-lite#360: on 2026-09-23 a dead keyring token surfaced
+an hour into a worker's task, and on 2026-09-24 minix's token answered HTTP 401 over ssh while
+`gh auth status` at its desktop console was green - the console and the status read prove
+nothing about the worker's session). A GitHub that does not answer (no reply within
+`FLEET_GH_TIMEOUT`, 30 s; a connection error; an HTTP 5xx) is noted on the OK line, not refused,
+as a sleeping sibling is. A refusal names its reason; surface it rather than launching
 stale, and never reset a dirty checkout silently - a divergent local edit may be a fix worth
 keeping. Every launch, not just the first: upstream main advancing mid-wave is normal,
 after-merge's push-side fast-forward is best-effort, and the deployed skills are symlinks into
 that checkout, so a stale checkout runs stale skill text silently (the ludics gh-609 failure
-class; two consecutive merge cycles once stranded three boxes). Two refusals are user-side
-repairs: an expired Claude login on a box needs an interactive `claude auth login` there, and
-missing `~/.codex/skills` links need the README loop run once on that box.
+class; two consecutive merge cycles once stranded three boxes). Three refusals are user-side
+repairs: an expired Claude login on a box needs an interactive `claude auth login` there, a
+refused GitHub token needs `ssh -t <box> 'gh auth login -h github.com -p https -w && gh auth
+setup-git'` (the refusal prints it), and missing `~/.codex/skills` links need the README loop
+run once on that box.
 
 **Cross-box legs need cross-box ssh, and the fleet has it.** The brief tells a GPU-box worker
 to drive the other GPU box over ssh for a one-off leg (2026-09-04: minix had no credential for
@@ -377,6 +386,12 @@ requirements for every transport with transport-specific setup and identity, and
   workers share the coordinator's scratchpad, so scratch files carry the issue number as a
   prefix and never sit inside the worktree ([native-workers.md](references/native-workers.md)
   states the rule).
+- Credentials, one line the brief carries verbatim: never borrow, copy or export a credential
+  from another box, file or account to get past an authentication failure; a failed `gh`, push
+  or login is a gate to report and stop on (2026-09-23: a worker on minix, whose `gh` token was
+  dead, pushed with a token it copied off tuf; ludics-lite#360). The preflight's `gh api user`
+  call now catches the dead token before launch, so this line covers what it cannot: a token
+  that dies mid-task, and a leg's box.
 - Landing: the ship-pr skill through review to merge; for a PR that fully resolves the issue,
   include `Closes #N` in its body (`Closes owner/repo#N` for a separate upstream tracker), per
   ship-pr's *Open*. Then close out the tracked issue with a summary comment - `gh issue comment
