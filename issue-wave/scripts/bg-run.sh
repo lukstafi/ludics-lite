@@ -12,27 +12,32 @@
 #   bg-run.sh wait  <dir> [--within <s>]       # run it in the foreground; default 540
 #
 # <dir> is absolute and FRESH for every run: `start` creates it and refuses one that already holds
-# anything. It writes three files there and nothing else:
+# anything. It writes four files there and nothing else:
 #   pid  -- this script's own pid, published before the command starts. Publishing it is the
 #           claim: it is created exclusively, so of two starts racing on one directory exactly one
 #           runs its command;
+#   cpid -- the command's own pid, published by the command's process before it execs the
+#           command, so a command that outlives a killed wrapper is still seen running;
 #   log  -- the command's stdout and stderr, and the only file the command's output reaches;
 #   rc   -- the command's exit status, published (by rename) after the command returns.
-# A refused start writes a fourth, `refused`, into the directory it refused, so a wait on it says
-# REFUSED instead of reading the earlier run's status as this one's.
+# A start refused over an earlier run that has ENDED (finished, or died) writes `refused` into
+# that directory, so a wait there says REFUSED instead of reading the earlier status as this
+# run's. A start refused over a run that is still live, or still being claimed, marks nothing:
+# that is the run a wait there should report, since the likeliest way to reach it is a duplicated
+# or retried `start` of the same command -- marking it would send the caller off to run it again.
 #
 # `wait` polls every 5 s (BG_RUN_POLL, whole seconds) and returns the first settled verdict, or
 # the current one once --within seconds are spent. It prints one line and exits with its code:
 #   rc=<n>     0  the command finished; <n> is its exit status (also in <dir>/rc). Exit 0 means
 #                 FINISHED, not succeeded: a command may exit with any status, so no exit code
 #                 of this script can both carry it and stay distinct from the verdicts below.
-#   RUNNING    3  the pid is alive and there is no rc yet: re-issue the wait.
+#   RUNNING    3  the pid or the cpid is alive and there is no rc yet: re-issue the wait.
 #   STARTING   4  no pid yet. A background task that has not published its pid is starting, not
 #                 dead. Returned at the --within deadline, or once no pid has appeared for 60 s
 #                 of this wait (BG_RUN_START_GRACE): re-issue once, and a second STARTING means
 #                 the launch itself failed, so start again in a NEW directory.
-#   DIED       5  a pid was published, it is gone, and it wrote no rc: the task was killed
-#                 before the command returned (the harness does this, ~40 min into a
+#   DIED       5  a pid was published, it and the command are both gone, and no rc was
+#                 written: the task was killed before the command returned (the harness does this, ~40 min into a
 #                 backgrounded `merge --wait`). It says nothing about what the command saw:
 #                 re-arm it in a new directory.
 #   REFUSED    6  `start` refused this directory (the reason follows): start again in a NEW one.
@@ -46,9 +51,14 @@
 #   and a stale directory, whose rc belongs to an earlier run, is refused rather than reused.
 #   A run that finishes between the rc read and the pid probe is read as finished: a dead pid is
 #   followed by a second read of rc before DIED is concluded.
+# And a wrapper killed on its own (not with its process group, as the harness does) leaves the
+# command running: its cpid keeps the verdict RUNNING rather than a DIED that would re-arm a
+# duplicate beside it.
 # What it does not close: a `wait` that runs before `start` has run AT ALL, on a directory an
 # earlier run left behind, reads that run's status; `start`'s refusal catches the reuse only once
-# it has run. A fresh name per run is the caller's half, and this script cannot check it.
+# it has run. A fresh name per run is the caller's half, and this script cannot check it. Nor a
+# wrapper killed alone in the instant between forking the command's process and that process
+# publishing cpid: a wait in that instant reads DIED.
 #
 # Portable to bash 3.2 (macOS /bin/bash) and GNU bash; the Bash tool's zsh only passes argv.
 
@@ -71,12 +81,20 @@ need_absolute() {
   esac
 }
 
-# refuse_start <dir>: mark the directory so a wait on it reads REFUSED rather than the status of
-# the run already there, and exit.
+# refuse_start <dir>: refuse a directory that already holds a run, and exit. One that has ended is
+# marked, so a wait on it reads REFUSED rather than its status; a live one is left alone.
 refuse_start() {
-  reason="$(printf '%q' "$1") already holds a run; start again in a new directory"
-  printf '%s\n' "$reason" > "$1/refused"
-  say "refused: $reason"
+  verdict "$1"
+  case $V in
+    RUNNING|STARTING)
+      say "refused: $(printf '%q' "$1") holds a run that is live or still being claimed; a wait there reports that run, and this start ran nothing" ;;
+    REFUSED)
+      say "refused: $(printf '%q' "$1") was already refused; start again in a new directory" ;;
+    *)
+      reason="$(printf '%q' "$1") already holds a run that has ended; start again in a new directory"
+      printf '%s\n' "$reason" > "$1/refused"
+      say "refused: $reason" ;;
+  esac
   exit 2
 }
 
@@ -100,7 +118,12 @@ cmd_start() {
     refuse_start "$dir"
   fi
   rm -f -- "$dir/.pid.$$"
-  "$@" < /dev/null > "$dir/log" 2>&1
+  # The command's process publishes its own pid before it execs the command, so there is no moment
+  # at which the command runs untracked.
+  # shellcheck disable=SC2016 # expanded by the inner sh
+  sh -c 'printf "%s\n" "$$" > "$0.tmp" && mv -f "$0.tmp" "$0" && exec "$@"' "$dir/cpid" "$@" \
+    < /dev/null > "$dir/log" 2>&1 &
+  wait "$!"
   rc=$?
   printf '%s\n' "$rc" > "$dir/.rc.tmp" && mv -f -- "$dir/.rc.tmp" "$dir/rc" \
     || say "cannot publish the exit status $rc in $(printf '%q' "$dir")"
@@ -113,6 +136,7 @@ verdict() {
   elif [ -s "$1/rc" ]; then V=rc
   elif [ ! -s "$1/pid" ]; then V=STARTING
   elif kill -0 "$(cat "$1/pid")" 2>/dev/null; then V=RUNNING
+  elif [ -s "$1/cpid" ] && kill -0 "$(cat "$1/cpid")" 2>/dev/null; then V=RUNNING
   elif [ -s "$1/rc" ]; then V=rc   # it finished between the rc read and the probe
   else V=DIED
   fi

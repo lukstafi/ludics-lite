@@ -15,10 +15,13 @@
 #   - race 3: a wait that runs before the pid is published reads STARTING, never DIED -- on an
 #     absent directory and on an empty one -- gives up on it after the start grace rather than
 #     the whole window, and a wait already polling when `start` runs picks the run up;
-#   - a stale directory: `start` refuses one that already holds a run, finished or live, runs
+#   - a wrapper killed alone while its command runs on reads RUNNING, not DIED, through cpid;
+#   - a stale directory: `start` refuses one whose run has ended (finished or died), runs
 #     nothing, leaves the earlier status untouched, and a wait on it reads REFUSED, not the
-#     earlier run's rc;
-#   - two starts racing on one fresh directory: exactly one runs its command, the other is refused;
+#     earlier run's rc; over a live run it is refused too, runs nothing, and marks nothing, so a
+#     wait there still reports the live run;
+#   - two starts racing on one fresh directory: exactly one runs its command, the other is refused
+#     and leaves the winner's verdict alone;
 #   - the finish-between-reads order: a dead pid beside an rc reads rc, not DIED;
 #   - the usage errors (relative directory, missing `--`, a --within that is not a number);
 #   - when zsh is installed, a start issued through `zsh -c` the way the Bash tool issues it,
@@ -82,7 +85,7 @@ wait "$S"; src=$?
   || ko "the background start exited $src, want 7"
 [ "$(cat "$d/log")" = hello ] && ok "...and the command's output is in log" \
   || ko "log holds: $(cat "$d/log")"
-[ "$(ls -A "$d" | tr '\n' ' ')" = "log pid rc " ] && ok "...and the directory holds log, pid, rc and nothing else" \
+[ "$(ls -A "$d" | tr '\n' ' ')" = "cpid log pid rc " ] && ok "...and the directory holds cpid, log, pid, rc and nothing else" \
   || ko "the directory holds: $(ls -A "$d" | tr '\n' ' ')"
 d="$TMP/finished0"
 bg_start "$d" true
@@ -103,6 +106,19 @@ if until_file "$d/pid" 10 && until_file "$TMP/killed.child" 10; then
   [ ! -e "$d/rc" ] && ok "...and no rc was invented for it" || ko "an rc appeared: $(cat "$d/rc")"
 else
   ko "race 1: the fixture task never published its pid"
+fi
+d="$TMP/orphan"
+bg_start "$d" sleep 60
+if until_file "$d/pid" 10 && until_file "$d/cpid" 10; then
+  child=$(cat "$d/cpid"); BGPIDS="$BGPIDS $child"
+  kill -9 "$S" 2>/dev/null
+  { wait "$S"; } 2>/dev/null
+  expect "a wrapper killed alone, its command still running, reads RUNNING, not DIED" 3 RUNNING -- \
+    "$BG" wait "$d" --within 0
+  kill -9 "$child" 2>/dev/null
+  expect "...and DIED once the command is gone too" 5 DIED -- "$BG" wait "$d" --within 5
+else
+  ko "the orphan fixture never published its pid and cpid"
 fi
 
 # --- race 2: the command's output quotes the verdicts --------------------------------------------
@@ -145,7 +161,7 @@ wait "$W"; wrc=$?
 # --- a stale directory -----------------------------------------------------------------------------
 d="$TMP/stale"; mkdir -p "$d"
 printf '99999999\n' > "$d/pid"; printf 'old log\n' > "$d/log"; printf '0\n' > "$d/rc"
-expect "stale: start refuses a directory that holds a finished run (exit 2)" 2 'already holds a run' -- \
+expect "stale: start refuses a directory that holds a finished run (exit 2)" 2 'has ended' -- \
   "$BG" start "$d" -- sh -c 'touch "$0"; exit 9' "$TMP/stale.ran"
 [ ! -e "$TMP/stale.ran" ] && ok "...and runs nothing" || ko "the refused start ran its command"
 [ "$(cat "$d/rc")" = 0 ] && [ "$(cat "$d/log")" = 'old log' ] \
@@ -155,13 +171,20 @@ d="$TMP/stale-live"
 bg_start "$d" sleep 30
 live=$S
 if until_file "$d/pid" 10; then
-  expect "stale: start refuses a directory whose run is still live" 2 'already holds a run' -- \
-    "$BG" start "$d" -- true
-  expect "...and a wait on it reads REFUSED" 6 'REFUSED:' -- "$BG" wait "$d" --within 0
+  expect "a start over a live run is refused and runs nothing" 2 'is live' -- \
+    "$BG" start "$d" -- sh -c 'touch "$0"' "$TMP/live.ran"
+  [ ! -e "$TMP/live.ran" ] && ok "...its command did not run" || ko "the refused start ran its command"
+  expect "...and leaves the live run's verdict alone (RUNNING, not REFUSED)" 3 RUNNING -- \
+    "$BG" wait "$d" --within 0
 else
   ko "stale: the live fixture never published its pid"
 fi
 kill -9 "$live" 2>/dev/null; { wait "$live"; } 2>/dev/null
+[ -s "$d/cpid" ] && kill -9 "$(cat "$d/cpid")" 2>/dev/null
+d="$TMP/stale-dead"; mkdir -p "$d"
+printf '99999999\n' > "$d/pid"
+expect "stale: start refuses a directory whose run died" 2 'has ended' -- "$BG" start "$d" -- true
+expect "...and a wait on it reads REFUSED, not DIED" 6 'REFUSED:' -- "$BG" wait "$d" --within 0
 
 # Two starts racing on one fresh directory (a duplicated tool call, a retry): exactly one may run
 # its command. BG_RUN_CLAIM_PAUSE holds both past the emptiness check, so the claim is what decides
@@ -184,6 +207,8 @@ twin_starts "$BG" "$TMP/twin"
 [ "$TWIN_RAN" -eq 1 ] && [ "$TWIN_RCS" = "0 2 " ] \
   && ok "twin starts on one directory: the command ran once and the other start was refused" \
   || ko "twin starts: the command ran $TWIN_RAN time(s); the starts exited $TWIN_RCS"
+expect "...and the losing start left the winner's verdict alone (rc=0, not REFUSED)" 0 'rc=0' -- \
+  "$BG" wait "$TMP/twin" --within 0
 sed 's|ln -- "$dir/.pid.$$" "$dir/pid"|mv -f -- "$dir/.pid.$$" "$dir/pid"|' "$BG" > "$TMP/unclaimed.sh"
 chmod +x "$TMP/unclaimed.sh"
 if cmp -s "$BG" "$TMP/unclaimed.sh"; then

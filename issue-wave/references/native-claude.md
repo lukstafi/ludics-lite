@@ -38,8 +38,8 @@ woken. What holds a turn is a foreground Bash call, capped at 600 s. So:
   failed, so start again. `DIED` (5): the harness killed the task before the command returned
   (observed at ~40 min for a backgrounded `merge --wait`), which says nothing about what the
   command was reading: re-arm it, and for `merge --wait` first re-read the merge state as
-  ship-pr's *The approval is one gate* says. `REFUSED` (6): `start` found the directory already
-  holding a run, whose status would otherwise have been read as this one's. Every re-arm and
+  ship-pr's *The approval is one gate* says. `REFUSED` (6): `start` found the directory holding a
+  run that had ended, whose status would otherwise have been read as this one's. Every re-arm and
   restart takes a new directory. The script's header is the full contract, and
   `test-bg-run.sh` beside it pins the races each verdict closes (ludics-lite#357).
 
