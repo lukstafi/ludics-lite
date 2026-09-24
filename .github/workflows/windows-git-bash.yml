@@ -35,10 +35,11 @@ jobs:
   git-bash:
     name: Git Bash suites, ship-pr (windows)
     runs-on: windows-latest
-    # The cleanup step is capped at 20 below. Since ludics-lite#335 the jq-reading suites run their
+    # The cleanup step is capped at 30 below. Since ludics-lite#335 the jq-reading suites run their
     # whole case lists here instead of stopping at a CRLF read (base-settle 10s -> 115s,
     # checks-absent 39s -> 350s) and the lib's CRLF controls add about 3 minutes; 60 minutes cut
-    # run 36031359850 off inside the watch suite, at 60 of an estimated ~68.
+    # run 36031359850 off inside the watch suite, at 60 of an estimated ~68. Since ludics-lite#338
+    # the cleanup suite runs every case whole, about 5 minutes more (~73).
     timeout-minutes: 90
     defaults:
       run:
@@ -84,15 +85,18 @@ jobs:
       # proof passed, and only the named suite when one was dispatched; a failure names its suite
       # in the run's annotations.
       - name: post-merge cleanup
-        # KNOWN RED until ludics-lite#338 (the cases still failing under Git Bash for reasons other
-        # than #287's transaction, which no longer uses a FIFO) lands; that change removes this
-        # line. Do not exclude cases by name instead.
+        # Green here since ludics-lite#338. What this platform cannot express is a stated boundary,
+        # never an excluded case: a case prints `SKIP <case>: <the MSYS mechanism>` and the summary
+        # line counts and names those cases (7 on the run that landed it: control characters in
+        # file names, a directory held as a live process's working directory, a mode bit MSYS does
+        # not keep). The suite sets MSYS=winsymlinks:nativestrict itself, so its symlink cases
+        # test native links here.
         id: cleanup
-        continue-on-error: true
         # The suite ends on its own here since ludics-lite#337 (its per-case deadline fires under
-        # MSYS, and it prints its summary): 846s at -j 4 on the run that landed that fix. The cap
-        # is the backstop for a runner that stops making progress, not the suite's end.
-        timeout-minutes: 20
+        # MSYS, and it prints its summary). 846s at -j 4 while 21 cases failed early; 1146s once
+        # #338 let them run whole. The cap is the backstop for a runner that stops making
+        # progress, not the suite's end.
+        timeout-minutes: 30
         if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-post-merge-cleanup.sh') }}
         env:
           SHIP_PR_TEST_LOG_DIR: ${{ runner.temp }}/cleanup-logs

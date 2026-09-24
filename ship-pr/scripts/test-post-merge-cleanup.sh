@@ -17,6 +17,21 @@ set -euo pipefail
 {
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 HELPER="$SCRIPT_DIR/post-merge-cleanup.sh"
+# Git for Windows' MSYS2 bash, and Cygwin: the one platform family whose shell is not the one Git
+# itself runs on (ludics-lite#318). The runner reads its processes differently there, and a few
+# cases state a boundary there instead of running (`skip_boundary`, ludics-lite#338).
+case "$(uname -s 2>/dev/null)" in
+MINGW* | MSYS* | CYGWIN*) ON_MSYS=1 ;;
+*) ON_MSYS=0 ;;
+esac
+# MSYS2's `ln -s` copies its target unless told to link (its default is `winsymlinks:deepcopy`),
+# and refuses a target that does not exist, so every symlink case would test a copy or nothing.
+# Native Windows symlinks are what Git for Windows itself reads as links. `nativestrict` fails
+# loudly where the account may not create one (no Developer Mode, not elevated) instead of falling
+# back to a copy. Cygwin reads CYGWIN, not MSYS, and is not a platform this suite is run on.
+case "$(uname -s 2>/dev/null)" in
+MINGW* | MSYS*) export MSYS="${MSYS:+$MSYS }winsymlinks:nativestrict" ;;
+esac
 # The physical spelling of the template's own parent, whatever /tmp is a link to on this host --
 # /private/tmp on macOS, itself on Linux, and neither is hardcoded: the removal guard below
 # compares against THIS, so a host where /tmp points somewhere else neither leaks its scratch tree
@@ -76,6 +91,22 @@ fail() {
 assert_eq() {
   [ "$1" = "$2" ] || fail "$3 (got $1, expected $2)"
 }
+
+# skip_boundary <reason>: what follows in this case cannot be expressed on this platform, and is
+# not run (ludics-lite#338). The caller returns or skips the leg; this only states it. The reason
+# names the platform mechanism, not the symptom. The line carries the case's name (`CASE_NAME`,
+# set by the runner), so it reads the same in a verbose log as in the quiet output; the runner
+# prints it and counts the case in the summary line, so a boundary is on the record in every run
+# and is never read as a pass of the property it did not test.
+skip_boundary() {
+  printf '%s\n' "SKIP ${CASE_NAME:-?}: $*"
+}
+
+# The boundary every case that names a file with a control character states under MSYS. Windows
+# file names cannot hold characters 1-31, so MSYS stores each as the private-use character
+# U+F000 plus its code, and maps it back only for MSYS programs: Git for Windows reads, lists and
+# is handed the private-use name, so the name the case built is not the one Git sees.
+MSYS_CONTROL_NAME_BOUNDARY="a file name with a control character: MSYS stores it as U+F0xx on disk (Windows names cannot hold characters 1-31), and Git for Windows sees that private-use name, not the one this case built"
 
 assert_absent() {
   [ ! -e "$1" ] || fail "expected path to be absent: $1"
@@ -392,8 +423,11 @@ test_squash_rebase_override() {
 # it from the helper's own pre-push hook, after the local side is gone: the leased deletion fails,
 # and the refusal must end with the command that finishes the job, after the precondition the
 # helper could not check -- run here as printed, which also proves its quoting.
+# The finishing command names the push URL as Git reports it, which is not always the spelling
+# the fixture configured: under Git Bash, MSYS rewrites the `/c/...` argument of `remote add` to
+# `C:/...` before Git for Windows stores it (ludics-lite#338). Either spelling reaches the remote.
 test_newer_remote_tip_refusal() {
-  local after_tip finish hook log mode real_git remote_tip
+  local after_tip finish hook log mode push_url real_git remote_tip
   for mode in early late rejected; do
     setup_case "newer-remote-tip-$mode" merge main-off
     real_git=$(command -v git)
@@ -436,7 +470,9 @@ test_newer_remote_tip_refusal() {
       grep "that tip was never validated, so only once it is confirmed integrated into origin/master, finish with: " \
         "$log" >/dev/null || { cat "$log" >&2; fail "the late refusal did not state its precondition"; }
       finish=$(sed -n 's/.*, finish with: //p' "$log")
-      assert_eq "$finish" "git -C $(printf '%q' "$CASE_MAIN") push --force-with-lease=refs/heads/topic:$remote_tip $(printf '%q' "$CASE_REMOTE") :refs/heads/topic" \
+      push_url=$(git -C "$CASE_MAIN" remote get-url --push origin)
+      [ "$ON_MSYS" -eq 1 ] || assert_eq "$push_url" "$CASE_REMOTE" "origin must push to the case's remote"
+      assert_eq "$finish" "git -C $(printf '%q' "$CASE_MAIN") push --force-with-lease=refs/heads/topic:$remote_tip $(printf '%q' "$push_url") :refs/heads/topic" \
         "the late refusal must end with the leased finishing command"
       rm "$hook"
       eval "$finish" >/dev/null 2>&1 || fail "the printed finishing command failed"
@@ -451,7 +487,8 @@ test_newer_remote_tip_refusal() {
       grep "once that cause is resolved, finish with: " "$log" >/dev/null ||
         { cat "$log" >&2; fail "the unmoved refusal did not end with its finishing command"; }
       finish=$(sed -n 's/.*, finish with: //p' "$log")
-      assert_eq "$finish" "git -C $(printf '%q' "$CASE_MAIN") push --force-with-lease=refs/heads/topic:$CASE_TOPIC_OID $(printf '%q' "$CASE_REMOTE") :refs/heads/topic" \
+      push_url=$(git -C "$CASE_MAIN" remote get-url --push origin)
+      assert_eq "$finish" "git -C $(printf '%q' "$CASE_MAIN") push --force-with-lease=refs/heads/topic:$CASE_TOPIC_OID $(printf '%q' "$push_url") :refs/heads/topic" \
         "the unmoved refusal must lease the finishing command at the validated tip"
       rm "$hook"
       eval "$finish" >/dev/null 2>&1 || fail "the printed finishing command failed (rejected)"
@@ -1041,7 +1078,7 @@ test_session_ignored_directory_unreadable_subtree_refusal() {
   chmod 000 "$CASE_SESSION/cache/locked"
   if [ -r "$CASE_SESSION/cache/locked" ]; then
     chmod 755 "$CASE_SESSION/cache/locked"
-    echo "PASS: unreadable-subtree case skipped — this user reads a 000 directory (root?)"
+    skip_boundary "an unreadable subtree: this account reads a directory whose mode is 000 (root, or an MSYS mode bit Windows does not enforce)"
     return 0
   fi
   if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
@@ -1255,6 +1292,11 @@ test_regenerable_name_resolution_refusals() {
   # P1: the tracked-path guard read its NUL-delimited stream as lines and took the first one, so a
   # tracked directory whose name begins with a NEWLINE looked untracked -- the first line of that
   # rendering is empty -- and `rm -rf` would have run over repository content.
+  if [ "$ON_MSYS" -eq 1 ]; then
+    skip_boundary "the newline-named tracked directory leg: $MSYS_CONTROL_NAME_BOUNDARY"
+    echo "PASS: a regenerable name the filesystem resolves differently is refused"
+    return 0
+  fi
   setup_case regenerable-newline-tracked merge main-off
   newline_dir=$(printf '\nbuild')
   mkdir -p "$CASE_SESSION/$newline_dir"
@@ -2017,6 +2059,10 @@ test_initialized_session_submodule_refusal() {
 
 test_escape_named_session_submodule_refusal() {
   local entry local_master name refusal sub_remote sub_seed submodule_oid
+  if [ "$ON_MSYS" -eq 1 ]; then
+    skip_boundary "the escape-named submodule checkout: $MSYS_CONTROL_NAME_BOUNDARY (its clone refuses the name outright)"
+    return 0
+  fi
   setup_case escape-named-session-submodule merge main-off
   local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
   sub_remote="$CASE_ROOT/submodule.git"
@@ -2450,6 +2496,10 @@ test_skip_worktree_deleted_master_refusal() {
 # and the checked-out master owner live at newline-bearing paths here.
 test_newline_worktree_paths() {
   local root remote main session owner integrator archive archive_count
+  if [ "$ON_MSYS" -eq 1 ]; then
+    skip_boundary "newline-bearing worktree paths: $MSYS_CONTROL_NAME_BOUNDARY (its worktree add refuses the path outright)"
+    return 0
+  fi
   root="$TEST_ROOT/newline-worktree-paths"
   remote="$root/remote.git"
   main="$root/main"
@@ -2947,6 +2997,13 @@ handshake_deadline() {
 test_concurrent_commit_message_archive() {
   local case_started commit_pid deadline done fake_bin file late_message message_count
   local message_snapshot pre_commit ready real_git release stall
+  if [ "$ON_MSYS" -eq 1 ]; then
+    # Not a hook that fails to fire: the commit does pause in its hook, and the helper then fails
+    # loudly ("could not archive session worktree atomically"), as it would for any process whose
+    # working directory is the session -- a Windows limit of the helper, not of this fixture.
+    skip_boundary "a commit paused inside the session worktree: Windows will not rename a directory that a live process holds as its working directory (EBUSY), and Git runs hooks from the worktree root, so the helper's atomic archive refuses rather than races the commit"
+    return 0
+  fi
   case_started=$(date +%s)
   setup_case concurrent-commit-message-archive merge main-off
   ready="$TEST_ROOT/concurrent-commit-message.ready"
@@ -3114,11 +3171,7 @@ test_sparse_checkout_archive() {
   setup_case sparse-checkout-archive merge main-off
   git -C "$CASE_SESSION" sparse-checkout init --no-cone
   git -C "$CASE_SESSION" sparse-checkout set --no-cone value
-  sparse_path=$(git -C "$CASE_SESSION" rev-parse --git-path info/sparse-checkout)
-  case "$sparse_path" in
-  /*) ;;
-  *) sparse_path="$CASE_SESSION/$sparse_path" ;;
-  esac
+  sparse_path=$(git_path_of "$CASE_SESSION" info/sparse-checkout) || fail "could not locate the sparse-checkout file"
   [ -f "$sparse_path" ] || fail "test created no sparse-checkout pattern file"
   patterns=$(cat "$sparse_path")
 
@@ -4171,7 +4224,7 @@ test_topic_preserved_negative_controls() {
       # Git Bash reads executability off a `#!` line, not a mode bit, and so does Git for Windows:
       # there the hook is still one Git runs, and there is nothing for the assertion to refuse.
       if [ -x "$CASE_MAIN/.git/hooks/pre-push" ]; then
-        echo "note: this platform keeps a #! file executable without its mode bit; unexecutable skipped"
+        skip_boundary "the unexecutable push logger: this platform reads a file executable from its #! line, not a mode bit, so chmod -x leaves a hook Git still runs"
         continue
       fi
       ;;
@@ -4495,11 +4548,7 @@ test_symbolic_worktree_config_preflight() {
   setup_case symbolic-worktree-config merge main-off
   local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
   git -C "$CASE_MAIN" config extensions.worktreeConfig true
-  config_path=$(git -C "$CASE_SESSION" rev-parse --git-path config.worktree)
-  case "$config_path" in
-  /*) ;;
-  *) config_path="$CASE_SESSION/$config_path" ;;
-  esac
+  config_path=$(git_path_of "$CASE_SESSION" config.worktree) || fail "could not locate config.worktree"
   target="$TEST_ROOT/symbolic-worktree-config.target"
   : >"$target"
   { [ ! -e "$config_path" ] && [ ! -L "$config_path" ]; } || unlink "$config_path"
@@ -4603,6 +4652,13 @@ test_ignored_master_descendant_newline_name_refusal() {
   fi
   assert_eq "$(cat "$collision/$descendant")" local-data \
     "the newline-named ignored descendant must survive"
+  if [ "$ON_MSYS" -eq 1 ]; then
+    # The refusal and the survival above hold here too; the spelling is what cannot be compared.
+    skip_boundary "how the refusal spells the newline name: $MSYS_CONTROL_NAME_BOUNDARY"
+    assert_topic_preserved
+    echo "PASS: a newline-named ignored descendant is refused"
+    return 0
+  fi
   # The name the file has, shell-quoted -- not the `"collision/lo\ncal.log"` Git would print.
   case "$refusal" in
   *"$(printf '%q' "$collision/$descendant")"*) ;;
@@ -5043,6 +5099,48 @@ test_runner_help_ignores_inherited_pids() {
   echo "PASS: --help with an inherited RUNNING_PIDS signals nothing"
 }
 
+test_runner_counts_a_stated_boundary() {
+  # ludics-lite#338: a case that states a platform boundary still passes, but its SKIP line is
+  # printed under its name and the summary counts and names it, so the boundary is on the record.
+  local tag="bd$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" patched rc
+  copy_runner "$copy" "$tag"
+  patched=$(sed "s|^$SELF_CASE() {\$|$SELF_CASE() { skip_boundary 'runner self-case boundary';|" "$copy/test-post-merge-cleanup.sh")
+  printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
+  grep -qF -- "$SELF_CASE() { skip_boundary 'runner self-case boundary';" "$copy/test-post-merge-cleanup.sh" ||
+    fail "could not plant a boundary in the copy"
+  if run_copy env SHIP_PR_TEST_CASE_TIMEOUT="$SELF_CASE_TIMEOUT" "$copy/test-post-merge-cleanup.sh" -j 1 "$SELF_CASE" >"$out" 2>&1 </dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 0 ] || fail "the copy exited $rc with a stated boundary, expected 0: $(cat "$out")"
+  grep -Fqx "SKIP $SELF_CASE: runner self-case boundary" "$out" ||
+    fail "the boundary was not printed under the case's name: $(cat "$out")"
+  grep -q "^PASS: 1 selected post-merge cleanup states (.*); 1 of them stated a platform boundary (SKIP): $SELF_CASE\$" "$out" ||
+    fail "the summary did not count the boundary: $(cat "$out")"
+  assert_copy_root_gone "$tag"
+
+  # Verbose, beside a failing case: the whole log still names its SKIP line, and the FAIL line
+  # names the boundary case too, ahead of the failed cases it keeps last.
+  patched=$(sed "s|^test_unchecked_out_master() {\$|test_unchecked_out_master() { fail 'runner self-case failure';|" "$copy/test-post-merge-cleanup.sh")
+  printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
+  grep -qF -- "test_unchecked_out_master() { fail 'runner self-case failure';" "$copy/test-post-merge-cleanup.sh" ||
+    fail "could not plant a failure in the copy"
+  if run_copy env SHIP_PR_TEST_CASE_TIMEOUT="$SELF_CASE_TIMEOUT" "$copy/test-post-merge-cleanup.sh" -v -j 1 \
+    "$SELF_CASE" test_unchecked_out_master >"$out" 2>&1 </dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 1 ] || fail "the copy exited $rc with a failing case, expected 1: $(cat "$out")"
+  grep -Fqx "SKIP $SELF_CASE: runner self-case boundary" "$out" ||
+    fail "the verbose log did not name the boundary's case: $(cat "$out")"
+  grep -q "^FAIL: 1 of 2 post-merge cleanup states failed in .*; of those that passed, 1 of them stated a platform boundary (SKIP): $SELF_CASE): test_unchecked_out_master\$" "$out" ||
+    fail "the failing summary did not name the boundary case: $(cat "$out")"
+  assert_copy_root_gone "$tag"
+  echo "PASS: a stated boundary is printed under its case and counted in the summary, verbose or failing"
+}
+
 TESTS=(
   test_unchecked_out_master
   test_master_owned_by_main
@@ -5197,6 +5295,7 @@ TESTS=(
   test_runner_kills_a_case_past_its_deadline
   test_runner_refuses_bad_arguments
   test_runner_help_ignores_inherited_pids
+  test_runner_counts_a_stated_boundary
 )
 
 usage() {
@@ -5335,8 +5434,8 @@ esac
 #   is Cygwin's own file naming a process's group.
 # Any other host whose ps cannot print fields is refused before a case starts, rather than read as
 # one where every case has already finished.
-case "$(uname -s 2>/dev/null)" in
-MINGW* | MSYS* | CYGWIN*) PROC_READING=kill ;;
+case "$ON_MSYS" in
+1) PROC_READING=kill ;;
 *)
   PROC_READING=ps
   ps -o pgid=,stat= -p "$$" >/dev/null 2>&1 || {
@@ -5369,7 +5468,14 @@ mkdir -p "$LOG_DIR" || {
 PASSED_COUNT=0
 FAILED_COUNT=0
 FAILED=()
+BOUNDARY_COUNT=0 # passing cases that stated a platform boundary (skip_boundary)
+BOUNDARY=()
 
+# run_case <name> <slot>: the case's scratch root is named after its spawn slot, not the case, so
+# the path every fixture builds under it stays short. Windows' 260-character MAX_PATH bounds a
+# Git for Windows path without core.longpaths, and the case name on top of the case's own slug and
+# a session-recovery ref pushed four cases just past it (ludics-lite#338). The log and
+# status files carry the name.
 run_case() {
   local name="$1"
   # The trap body is evaluated when the subshell exits, under whatever scope is live then. Every
@@ -5377,7 +5483,8 @@ run_case() {
   # the scratch slug and write a status file the parent never looks for. Resolve the path now.
   CASE_STATUS_FILE="$LOG_DIR/$name.status"
   trap 'echo "$?" >"$CASE_STATUS_FILE"' EXIT
-  TEST_ROOT="$TEST_ROOT/$name"
+  TEST_ROOT="$TEST_ROOT/$2"
+  CASE_NAME="$name" # skip_boundary names its line with it
   mkdir -p "$TEST_ROOT" || exit 1
   "$name"
 }
@@ -5389,9 +5496,9 @@ start_case() {
   # A kept log directory may hold a status file from a previous run; reap_one would take it for
   # this case's verdict before the case had run.
   rm -f "$LOG_DIR/$name.status"
-  (run_case "$name") >"$LOG_DIR/$name.log" 2>&1 </dev/null &
-  pid=$!
   i=$SPAWNED
+  (run_case "$name" "$i") >"$LOG_DIR/$name.log" 2>&1 </dev/null &
+  pid=$!
   SPAWNED=$((SPAWNED + 1))
   RUNNING_PIDS[$i]="$pid"
   RUNNING_NAMES[$i]="$name"
@@ -5493,15 +5600,23 @@ report_case() {
   RUNNING=$((RUNNING - 1))
   if [ "$status" -eq 0 ]; then
     PASSED_COUNT=$((PASSED_COUNT + 1))
+    if awk -v p="SKIP $name: " 'index($0, p) == 1 { found = 1 } END { exit !found }' "$log"; then
+      BOUNDARY_COUNT=$((BOUNDARY_COUNT + 1))
+      BOUNDARY+=("$name")
+    fi
     if [ "$VERBOSE" -eq 1 ]; then
       cat "$log"
     else
-      # Each PASS line names its case, so a log cut off mid-run shows which cases never reported
-      # without finding them by elimination (ludics-lite#337).
-      awk -v n="$name" 'sub(/^PASS:/, "PASS " n ":") { print; found = 1 } END { exit !found }' "$log" ||
+      # Each PASS and SKIP line names its case, so a log cut off mid-run shows which cases never
+      # reported without finding them by elimination (ludics-lite#337). A case that states a
+      # boundary for all of itself prints only its SKIP line.
+      awk -v n="$name" -v p="SKIP $name: " '
+        index($0, p) == 1 { print; found = 1; next }
+        sub(/^PASS:/, "PASS " n ":") { print; found = 1 }
+        END { exit !found }' "$log" ||
         echo "PASS $name: (printed no PASS line)"
     fi
-    rm -rf "$TEST_ROOT/$name"
+    rm -rf "${TEST_ROOT:?}/$i"
   else
     FAILED_COUNT=$((FAILED_COUNT + 1))
     FAILED+=("$name")
@@ -5570,14 +5685,20 @@ while [ "$RUNNING" -gt 0 ]; do
 done
 stop_if_interrupted
 
+# A passing case that stated a platform boundary passed only what it ran, so the summary counts
+# and names those cases every time (ludics-lite#338): a boundary is never silently green.
+# The FAIL line keeps the failed cases last, after its final colon, where readers of it look.
+BOUNDARY_NOTE=""
+[ "$BOUNDARY_COUNT" -eq 0 ] ||
+  BOUNDARY_NOTE="$BOUNDARY_COUNT of them stated a platform boundary (SKIP): ${BOUNDARY[*]}"
 if [ "$FAILED_COUNT" -gt 0 ]; then
-  echo "FAIL: $FAILED_COUNT of $SELECTED_COUNT post-merge cleanup states failed in ${SECONDS}s (-j $JOBS): ${FAILED[*]}" >&2
+  echo "FAIL: $FAILED_COUNT of $SELECTED_COUNT post-merge cleanup states failed in ${SECONDS}s (-j $JOBS${BOUNDARY_NOTE:+; of those that passed, $BOUNDARY_NOTE}): ${FAILED[*]}" >&2
   exit 1
 fi
 if [ "$NAMED" -eq 0 ]; then
-  echo "PASS: all post-merge cleanup states ($SELECTED_COUNT cases in ${SECONDS}s, -j $JOBS)"
+  echo "PASS: all post-merge cleanup states ($SELECTED_COUNT cases in ${SECONDS}s, -j $JOBS)${BOUNDARY_NOTE:+; $BOUNDARY_NOTE}"
 else
-  echo "PASS: $SELECTED_COUNT selected post-merge cleanup states (${SECONDS}s, -j $JOBS)"
+  echo "PASS: $SELECTED_COUNT selected post-merge cleanup states (${SECONDS}s, -j $JOBS)${BOUNDARY_NOTE:+; $BOUNDARY_NOTE}"
 fi
 exit "$?"
 }

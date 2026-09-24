@@ -1120,7 +1120,10 @@ a half on a 4-core CI runner, where the serial run took eight, and in well under
 desktop. Each case's output is buffered and printed whole when it completes, so a failure report
 never interleaves with another case; passing cases print only their `PASS <case>:` line unless `-v` asks
 for everything. Failures do not stop the other cases — the closing `FAIL:` line names every case
-that failed. Each case runs in its own process group under a deadline
+that failed. A case that cannot be expressed on the platform it runs on states that as a `SKIP
+<case>:` line naming the mechanism (under Git Bash: a control character in a file name, a
+directory held as a live process's working directory), and the closing line counts and names
+those cases, so a boundary is never read as a pass. Each case runs in its own process group under a deadline
 (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a case still running at its deadline is
 killed as a group and reported with its log, so one stalled case cannot hold a CI job to the
 job's own timeout, which one did for six hours. The runner tests itself as well, from patched
