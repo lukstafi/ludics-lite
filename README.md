@@ -254,8 +254,11 @@ the keyboard, and waits until its native Git Bash answers (`uname -s` `MINGW*`, 
 `efibootmgr`'s listing: the firmware boots it once and deletes the variable, so BootOrder (Ubuntu
 first) and GRUB are never written, and coming back needs no selection at all. Both verbs reserve the
 box's lane and hold locks for the whole switch and refuse either held, as the power verbs do
-(`--force` skips them); `boot-windows` also refuses a box with a run's sleep block inhibitor, which
-the lab locks do not see. Each is a real reboot, so whatever is open in the box's desktop session closes with it: the
+(`--force` skips them). Both also refuse while an active `fleet-worker.sh execution` reservation
+names any endpoint of the box, since a native Windows run holds no inhibitor and need not take a
+lock: the one exception is the caller's own reservation, named with `--as=<request_id>`, and an
+unreadable registry refuses too. `boot-windows` also refuses a box with a run's sleep block
+inhibitor, which the lab locks do not see. Each is a real reboot, so whatever is open in the box's desktop session closes with it: the
 live witness on rog closed its Firefox and VS Code windows. They take exactly one box, and refuse one with no wired NIC (tuf), since
 what cannot be woken remotely cannot be recovered remotely. The wait prints a line per poll for up
 to 15 minutes (`WAKE_LAB_BOOT_WAIT_SECONDS`) and ends in 0 (reached), 1 (refused, or back in a

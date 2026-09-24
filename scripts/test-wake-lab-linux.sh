@@ -355,6 +355,7 @@ case "$cmd" in
     printf 'BootNext: %s\n' "${BOOT_READBACK:-${cmd##* }}"; printf '%s\n' "$BOOT_LISTING"; exit 0 ;;
   'sudo -n efibootmgr --delete-bootnext') rm -f "$BOOT_STATE.next"; exit 0 ;;
   *'echo WAKE_LAB_POWER_STARTED; exec sudo -n systemctl reboot')
+    [ "${BOOT_FIRMWARE:-}" = wedge ] && { echo reboot-wedged >>"$SSH_LOG"; sleep 20; exit 255; }   # never returns in time
     locks; echo WAKE_LAB_POWER_STARTED; sudo_ok nobootnext
     case "${BOOT_FIRMWARE:-honor}" in
       honor) if [ -e "$BOOT_STATE.next" ]; then reboot_to windows; else reboot_to linux; fi ;;
@@ -367,7 +368,10 @@ case "$cmd" in
     # With the blank rog's cmd.exe returned when the command had one before its `&` (2026-09-24).
     locks; printf 'WAKE_LAB_POWER_STARTED \r\n'; reboot_to "${BOOT_WIN_RESTART:-linux}"; exit 0 ;;
   *'bash.exe'*)
-    case "${BOOT_GITBASH:-native}" in
+    gb=${BOOT_GITBASH:-native}
+    # late: not yet on the first call after Windows answers, as a Git Bash still starting would be
+    if [ "$gb" = late ]; then echo x >>"$BOOT_STATE.gb"; [ "$(wc -l <"$BOOT_STATE.gb")" -gt 1 ] && gb=native; fi
+    case "$gb" in
       native) printf 'MINGW64_NT-10.0-26100\r\ngit version 2.51.0.windows.1\r\n' ;;
       *) printf 'Linux\r\ngit version 2.43.0\r\n' ;;
     esac; exit 0 ;;
@@ -396,7 +400,8 @@ boot_run() { # boot_run <initial state> <wake-lab args...> -- sets out, rc and t
   local started=$SECONDS
   out=$(PATH="$tmp/bootbin:$PATH" BOOT_STATE="$tmp/boot.state" WAKE_LAB_LOCK_DIR="$bl" \
     WAKE_LAB_HOSTS="${BOOT_HOSTS:-$tmp/rog-hosts.sh}" BOOT_LISTING="${BOOT_LISTING-$BOOT_LISTING_DEFAULT}" \
-    WAKE_LAB_BOOT_WAIT_SECONDS=0 WAKE_LAB_WAIT_SECONDS=0 WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    WAKE_LAB_BOOT_WAIT_SECONDS="${BOOT_WAIT:-0}" WAKE_LAB_WAIT_SECONDS=0 WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING="${FW_LISTING-[]}" \
     "$tmp/wake-lab.sh" "$@" 7>&- 2>&1); rc=$?
   took=$((SECONDS - started))
 }
@@ -446,7 +451,7 @@ for which in lane hold; do
     check "$verb is refused while the $which lock is held, naming its holder, with nothing sent" '[ "$rc" = 1 ] && [[ "$out" == *"$verb REFUSED on rog: ocannl sweep 20260924T0517Z"*"--force"* ]] && [ ! -s "$SSH_LOG" ]'
   done
   boot_run linux boot-windows --force rog
-  check "--force takes the box while the $which lock is held, and says so" '[ "$rc" = 0 ] && [[ "$out" == *"WITHOUT the lab locks (--force)"* ]] && [ "$(nsel)" = 1 ]'
+  check "--force takes the box while the $which lock is held, and says so" '[ "$rc" = 0 ] && [[ "$out" == *"WITHOUT the lab locks or the reservation check (--force)"* ]] && [ "$(nsel)" = 1 ]'
   exec 7>&-
   boot_run linux boot-windows rog
   check "a stale $which lock line whose holder is gone does not refuse" '[ "$rc" = 0 ] && lock_free "$f" && [ "$(nsel)" = 1 ]'
@@ -468,6 +473,38 @@ check 'boot-linux on a box already in Ubuntu restarts nothing' '[ "$rc" = 0 ] &&
 sed 's/echo linux/echo wsl/' "$tmp/rog-hosts.sh" >"$tmp/rog-wsl.sh"
 BOOT_HOSTS="$tmp/rog-wsl.sh" boot_run windows boot-linux rog
 check 'a site kind of wsl is overridden by what the probe found' '[ "$rc" = 0 ] && [[ "$out" == *"rog: in Ubuntu"* ]] && ! grep -q "^rog-nv-wsl " "$SSH_LOG"'
+BOOT_GITBASH=late BOOT_WAIT=30 boot_run linux boot-windows rog
+check 'a Git Bash not yet up when sshd first answers is polled again, not failed' '[ "$rc" = 0 ] && [[ "$out" == *"but its Git Bash did not"*"native Git Bash answers on rog-lan"* ]] && [ "$took" -lt 25 ]'
+# The execution registry covers both OSes: a native Windows run holds no logind inhibitor and need
+# not take a lab lock, so a reservation naming any endpoint of the box refuses both verbs -- all
+# but the caller's own, named with --as.
+res='[{"request_id":"w-9-win","request":{"execution_host":"rog-nv-win"},"state":"running"}]'
+FW_LISTING="$res" boot_run windows boot-linux rog
+check 'a reservation on the box'"'"'s Windows endpoint refuses boot-linux, naming it, with nothing sent' '[ "$rc" = 1 ] && [[ "$out" == *"reservation: w-9-win (running)"*"boot-linux REFUSED on rog: an active execution reservation names it"* ]] && [ ! -s "$SSH_LOG" ]'
+FW_LISTING="$res" boot_run linux boot-windows rog
+check '...and boot-windows too' '[ "$rc" = 1 ] && [[ "$out" == *"boot-windows REFUSED on rog: an active execution reservation"* ]] && [ ! -s "$SSH_LOG" ]'
+FW_LISTING="$res" boot_run windows boot-linux --as=w-9-win rog
+check 'the caller'"'"'s own reservation, named with --as, does not refuse' '[ "$rc" = 0 ] && [[ "$out" == *"rog: in Ubuntu"* ]]'
+FW_LISTING='[{"request_id":"w-9-win","request":{"execution_host":"rog-nv-win"},"state":"running"},{"request_id":"w-10","request":{"execution_host":"rog-nv-linux"},"state":"launching"}]' \
+  boot_run linux boot-windows --as=w-9-win rog
+check '...while any other one still does' '[ "$rc" = 1 ] && [[ "$out" == *"reservation: w-10 (launching)"*"besides w-9-win"* ]] && [[ "$out" != *"reservation: w-9-win"* ]] && [ ! -s "$SSH_LOG" ]'
+FW_LISTING='[{"request_id":"w-11","request":{"execution_host":"minix-amd-linux"},"state":"running"}]' boot_run linux boot-windows rog
+check 'another box'"'"'s reservation does not refuse' '[ "$rc" = 0 ]'
+FW_LISTING='not json' boot_run linux boot-windows rog
+check 'an unreadable registry refuses the reboot' '[ "$rc" = 1 ] && [[ "$out" == *"execution registry could not be read"* ]] && [ ! -s "$SSH_LOG" ]'
+FW_LISTING='not json' boot_run linux boot-windows --force rog
+check '...and --force takes the box anyway, saying so' '[ "$rc" = 0 ] && [[ "$out" == *"WITHOUT the lab locks or the reservation check (--force)"* ]]'
+# An interrupt between the selection and the reboot takes the selection back: the stub's reboot
+# command wedges, and the suite TERMs the command while it waits on it.
+: >"$SSH_LOG"; rm -f "$tmp/boot.state".*; echo linux >"$tmp/boot.state"
+( PATH="$tmp/bootbin:$PATH" BOOT_STATE="$tmp/boot.state" WAKE_LAB_LOCK_DIR="$bl" WAKE_LAB_HOSTS="$tmp/rog-hosts.sh" \
+  BOOT_LISTING="$BOOT_LISTING_DEFAULT" BOOT_FIRMWARE=wedge WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING='[]' \
+  exec "$tmp/wake-lab.sh" boot-windows rog >"$tmp/boot-term.out" 2>&1 7>&- ) &
+bpid=$!
+for _ in $(seq 1 100); do grep -q reboot-wedged "$SSH_LOG" && break; sleep 0.1; done
+kill -TERM "$bpid" 2>/dev/null; wait "$bpid"; rc=$?
+check 'a TERM after BootNext was set, before the reboot happened, takes the selection back' '[ "$rc" = 130 ] && grep -q -- "--delete-bootnext" "$SSH_LOG" && [ ! -e "$tmp/boot.state.next" ] && grep -q "BootNext taken back" "$tmp/boot-term.out"'
+check 'control: that selection had been set before the TERM' 'grep -qx "rog-nv-linux sudo -n efibootmgr --bootnext 0003" "$SSH_LOG" && grep -q reboot-wedged "$SSH_LOG"'
 BOOT_HOSTS="$tmp/hosts.sh" boot_run linux boot-windows tuf
 check 'tuf, with no wired NIC, is refused with the reason and nothing sent' '[ "$rc" = 1 ] && [[ "$out" == *"boot-windows REFUSED on tuf: it has no wired NIC"* ]] && [ ! -s "$SSH_LOG" ]'
 boot_run linux boot-windows

@@ -19,8 +19,10 @@
 #   wake-lab.sh kick-wsl --hold box       ...and leave a Windows-side holder keeping the VM alive
 #   wake-lab.sh unhold box                end that holder (a lane ends by unhold, never by expiry)
 #   wake-lab.sh lock-path box             where that box's LANE lock lives, for a harness taking one
-#   wake-lab.sh boot-windows box          reboot a dual-boot box into Windows for ONE boot, unattended,
-#                                         and wait until its Git Bash answers (see "dual boot" below)
+#   wake-lab.sh boot-windows [--as=ID] box  reboot a dual-boot box into Windows for ONE boot,
+#                                         unattended, and wait until its Git Bash answers; refused
+#                                         while an execution reservation other than ID names the box
+#                                         (see "dual boot" below)
 #   wake-lab.sh boot-linux box            ...and back: reboot it (or wake it) into Ubuntu; both are
 #                                         reboots, so a desktop session's open apps close with them
 #   wake-lab.sh --list                    dump the router's host table
@@ -730,17 +732,24 @@ capped_tree() { # capped_tree <seconds> <cmd...>
     alarm 0; kill "KILL", -$pid;
     exit(($st & 127) ? 128 + ($st & 127) : $st >> 8);' "$1" "$CAP_EXPIRED" "${@:2}"
 }
-reservations_fields() { # reservations_fields <box>
-  local os e names="" ids n
-  RES_DETAILS=""
+# box_reservations <box> [except-id] -- "<id> (<state>)" per active reservation naming the box on any
+# endpoint of its row, less the one whose request_id is <except-id>; 1 when the registry was unread.
+box_reservations() {
+  local os e names=""
   for os in linux wsl win lan; do
     e=$(endpoint_of "$1" "$os") && names="$names$e"$'\n'
   done
-  if [ -z "$RESERVATIONS" ] || [ -z "$names" ] || ! ids=$(jq -r --arg names "$names" \
-       '($names | split("\n") | map(select(. != ""))) as $ns
-        | if type == "array" then .[] | .request.execution_host as $h
-          | select($ns | index([$h]))
-          | "\(.request_id) (\(.state))" else error("not a list") end' <<<"$RESERVATIONS" 2>/dev/null); then
+  [ -n "$RESERVATIONS" ] && [ -n "$names" ] || return 1
+  jq -r --arg names "$names" --arg except "${2:-}" \
+     '($names | split("\n") | map(select(. != ""))) as $ns
+      | if type == "array" then .[] | .request.execution_host as $h
+        | select($ns | index([$h])) | select(($except == "") or (.request_id != $except))
+        | "\(.request_id) (\(.state))" else error("not a list") end' <<<"$RESERVATIONS" 2>/dev/null
+}
+reservations_fields() { # reservations_fields <box>
+  local ids n
+  RES_DETAILS=""
+  if ! ids=$(box_reservations "$1"); then
     printf '  reservations=?'; return 0
   fi
   n=0; [ -z "$ids" ] || n=$(printf '%s\n' "$ids" | wc -l | tr -d ' ')
@@ -969,8 +978,9 @@ wait_for() { # wait_for <box...> — poll until every box answers, for up to WAI
 #
 # A reboot kills everything on the box, so both verbs RESERVE its lane and hold locks as
 # power_phase does, from before the first command until the other OS answers or the deadline
-# passes, and refuse while either is held; `--force` skips them with the same caveats. boot-windows
-# also refuses a box whose logind lists a sleep BLOCK inhibitor (sleep_blocks): that is a
+# passes, and refuse while either is held; `--force` skips them with the same caveats. Both also
+# refuse while an active execution reservation other than the caller's own names the box
+# (boot_reservations_clear). boot-windows also refuses a box whose logind lists a sleep BLOCK inhibitor (sleep_blocks): that is a
 # `fleet-worker.sh execution slot` or `hold` run in progress, which the lab locks do not see and a
 # root `systemctl reboot` does not honour, since it inhibits sleep and not shutdown.
 #
@@ -1059,18 +1069,28 @@ boot_git_bash() { # boot_git_bash <box> -- the reached Windows' native Git Bash,
   return 1
 }
 
+# The Git Bash check, repeated every 5 s until it passes or <seconds> have gone: sshd can answer
+# before a freshly booted Windows can start Git Bash, and one early miss is not a verdict.
+boot_git_bash_wait() { # boot_git_bash_wait <box> <seconds>
+  local start=$SECONDS
+  until boot_git_bash "$1"; do
+    [ $((SECONDS - start)) -ge "$2" ] && return 1
+    sleep 5
+  done
+}
+
 boot_windows() { # boot_windows <box>
   local box=$1 host list entry out rc blocks start
   host=$(endpoint_of "$box" linux)
   boot_probe "$box"
   case "$BOOT_KIND" in
-    windows) echo "$box: already in Windows; no reboot"; boot_git_bash "$box"; return ;;
+    windows) echo "$box: already in Windows; no reboot"; boot_git_bash_wait "$box" "$WAIT_SECONDS"; return ;;
     "") echo "$box: answers in neither OS; waking it into Ubuntu (first in its BootOrder) first"
         wake "$box"
         boot_wait "$box" linux "$WAIT_SECONDS"; rc=$?
         case "$rc" in
           0) ;;
-          2) echo "$box: woke into Windows, not Ubuntu; no reboot"; boot_git_bash "$box"; return ;;
+          2) echo "$box: woke into Windows, not Ubuntu; no reboot"; boot_git_bash_wait "$box" "$WAIT_SECONDS"; return ;;
           *) echo "boot-windows FAILED on $box: it did not wake within $((WAIT_SECONDS / 60)) min"; return 1 ;;
         esac ;;
   esac
@@ -1107,6 +1127,12 @@ boot_windows() { # boot_windows <box>
     boot_undo_next "$box" "$host"
     echo "boot-windows FAILED on $box: efibootmgr did not read BootNext back as $entry"; return 1
   fi
+  # From here until the reboot is seen to happen, any way out of this process takes the selection
+  # back: an explicit failure below through boot_undo_next, anything else -- an interrupt, a closed
+  # terminal, a TERM -- through the trap. (A SIGKILL cannot be caught; nothing here can cover it.)
+  BOOT_NEXT_HOST=$host
+  trap 'boot_next_trap' EXIT
+  trap 'boot_next_trap; exit 130' INT TERM HUP
   echo "  $box: BootNext=$entry (Windows Boot Manager) for one boot; BootOrder untouched"
   echo "$box: reboot"
   out=$(boot_ssh "$host" "$NATIVE_LINUX_GUARD; echo WAKE_LAB_POWER_STARTED; exec sudo -n systemctl reboot" 2>&1); rc=$?
@@ -1125,10 +1151,12 @@ boot_windows() { # boot_windows <box>
     boot_undo_next "$box" "$host"
     echo "boot-windows FAILED on $box: Ubuntu still answers, so the reboot did not take"; return 1
   fi
+  BOOT_NEXT_HOST=""   # the reboot happened, and the firmware consumes the selection itself
   echo "waiting for Windows (up to $((BOOT_WAIT_SECONDS / 60)) min)..."
   boot_wait "$box" windows "$BOOT_WAIT_SECONDS"; rc=$?
   case "$rc" in
-    0) echo "$box: Windows answers $((SECONDS - start))s after the reboot"; boot_git_bash "$box"; return ;;
+    0) echo "$box: Windows answers $((SECONDS - start))s after the reboot"
+       boot_git_bash_wait "$box" $((BOOT_WAIT_SECONDS - (SECONDS - start))); return ;;
     2) echo "boot-windows FAILED on $box: it came back in Ubuntu, so the firmware ignored BootNext"; return 1 ;;
   esac
   needs_a_person "$box" "its reboot into Windows"; return 3
@@ -1136,7 +1164,13 @@ boot_windows() { # boot_windows <box>
 
 # Take back a BootNext this run set and could not follow with a reboot: left in place, it would
 # send the box's NEXT reboot -- a kernel update, a power cut -- into Windows with no one expecting it.
+BOOT_NEXT_HOST=""   # the Linux alias carrying a BootNext this run set and has not yet seen used
+boot_next_trap() {
+  [ -n "$BOOT_NEXT_HOST" ] || return 0
+  boot_undo_next "$BOOT_BOX" "$BOOT_NEXT_HOST"
+}
 boot_undo_next() { # boot_undo_next <box> <linux alias>
+  BOOT_NEXT_HOST=""
   if boot_ssh "$2" 'sudo -n efibootmgr --delete-bootnext' >/dev/null 2>&1; then
     echo "  $1: BootNext taken back; its next boot is Ubuntu again"
   else
@@ -1179,6 +1213,25 @@ boot_linux() { # boot_linux <box>
   needs_a_person "$box" "its restart into Ubuntu"; return 3
 }
 
+# The fleet's execution registry is the one record of work on a box that covers BOTH of its OSes:
+# a native Windows run holds no logind inhibitor and need not take a lab lock, so without this a
+# `boot-linux` would restart Windows under it. Any active reservation naming one of the box's
+# endpoints refuses the reboot, except the caller's own, named with --as=<request_id> -- the
+# exclusive reservation a reboot is run under. A registry that cannot be read refuses as well,
+# since "nothing reserved" and "could not look" call for opposite answers here.
+boot_reservations_clear() { # boot_reservations_clear <verb> <box>
+  local others
+  reservations_read
+  if ! others=$(box_reservations "$2" "$BOOT_AS"); then
+    echo "$1 REFUSED on $2: the fleet's execution registry could not be read, so a run there cannot be ruled out (--force reboots anyway)"
+    return 1
+  fi
+  [ -z "$others" ] && return 0
+  printf '%s\n' "$others" | sed 's/^/  reservation: /'
+  echo "$1 REFUSED on $2: an active execution reservation names it${BOOT_AS:+ besides $BOOT_AS} (run under your own exclusive reservation and pass --as=<its request_id>, or --force)"
+  return 1
+}
+
 boot_phase() { # boot_phase boot-windows|boot-linux <box> -- the box reserved across the whole switch
   local verb=$1 box=$2
   if ! eth_mac_of "$box" >/dev/null 2>&1; then
@@ -1190,10 +1243,12 @@ boot_phase() { # boot_phase boot-windows|boot-linux <box> -- the box reserved ac
     return 1
   fi
   if [ "$FORCE" = 1 ]; then
-    echo "$verb on $box WITHOUT the lab locks (--force): whatever runs there dies with the reboot"
+    echo "$verb on $box WITHOUT the lab locks or the reservation check (--force): whatever runs there dies with the reboot"
   elif ! lab_reserve "$box" "$verb" "$LOCK_FD_BASE"; then
     echo "$verb REFUSED on $box: $RESERVE_REFUSED_BY (a lab lock is held; wait for the holder, or --force to take the box anyway)"
     return 1
+  else
+    boot_reservations_clear "$verb" "$box" || return 1
   fi
   if [ "$verb" = boot-windows ]; then boot_windows "$box"; else boot_linux "$box"; fi
 }
@@ -1230,6 +1285,7 @@ WAIT=0
 WANT_WSL=0
 HOLD=0
 FRESH_WSL=""   # "fresh" makes kick_wsl shut the VM down first; --wsl alone never kills a live VM
+BOOT_AS=""     # --as=<request_id>: the caller's own execution reservation, which a boot verb does not refuse
 FORCE=0        # --force: destroy the VM even while a lab lock is held (see the lab lock lore)
 HOLD_LOCKED=0  # set in a box's subshell once its reservation holds that box's HOLD lock on HOLD_FD
 VERB=wake
@@ -1250,6 +1306,7 @@ for arg in "$@"; do
     --hold) HOLD=1 ;;
     --restart-wsl) WANT_WSL=1; FRESH_WSL=fresh ;;
     --force) FORCE=1 ;;
+    --as=?*) BOOT_AS=${arg#--as=} ;;
     -h|--help) usage; exit 0 ;;
     all) while IFS= read -r t; do TARGETS+=("$t"); done < <(lab_boxes) ;;
     *) TARGETS+=("$arg") ;;
