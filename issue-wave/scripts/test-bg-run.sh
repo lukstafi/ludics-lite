@@ -15,7 +15,8 @@
 #   - race 3: a wait that runs before the pid is published reads STARTING, never DIED -- on an
 #     absent directory and on an empty one -- gives up on it after the start grace rather than
 #     the whole window, and a wait already polling when `start` runs picks the run up;
-#   - a wrapper killed alone while its command runs on reads RUNNING, not DIED, through cpid;
+#   - a wrapper killed alone while its command runs on reads RUNNING, not DIED, through cpid; and
+#     a command that exited unreaped (a zombie, which still answers kill -0) reads DIED;
 #   - a stale directory: `start` refuses one whose run has ended (finished or died), runs
 #     nothing, leaves the earlier status untouched, and a wait on it reads REFUSED, not the
 #     earlier run's rc; over a live run it is refused too, runs nothing, and marks nothing, so a
@@ -121,6 +122,29 @@ else
   ko "the orphan fixture never published its pid and cpid"
 fi
 
+# A command that exited as an orphan under a parent that never reaps it is a zombie, which still
+# answers kill -0. Made here by a shell that backgrounds an exiting child and then execs a sleep,
+# which never waits for it.
+d="$TMP/zombie"; mkdir -p "$d"
+sh -c 'sleep 0 & echo "$!" > "$0"; exec sleep 30' "$d/cpid" &
+zp=$!; BGPIDS="$BGPIDS $zp"
+printf '99999999\n' > "$d/pid"
+zombie_seen=false
+if until_file "$d/cpid" 10; then
+  z=$(cat "$d/cpid")
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    case $(ps -o stat= -p "$z" 2>/dev/null | tr -d ' ') in Z*) zombie_seen=true; break ;; esac
+    sleep 0.2
+  done
+fi
+if $zombie_seen && kill -0 "$z" 2>/dev/null; then
+  ok "control: the fixture command is a zombie that still answers kill -0"
+  expect "a zombie command beside a dead wrapper reads DIED, not RUNNING" 5 DIED -- "$BG" wait "$d" --within 0
+else
+  ko "the zombie fixture did not produce a zombie that answers kill -0"
+fi
+kill -9 "$zp" 2>/dev/null; { wait "$zp"; } 2>/dev/null
+
 # --- race 2: the command's output quotes the verdicts --------------------------------------------
 d="$TMP/quoting"
 bg_start "$d" sh -c 'printf "rc=0\nDIED\nREFUSED: no\n"; sleep 3; exit 7'
@@ -187,18 +211,25 @@ expect "stale: start refuses a directory whose run died" 2 'has ended' -- "$BG" 
 expect "...and a wait on it reads REFUSED, not DIED" 6 'REFUSED:' -- "$BG" wait "$d" --within 0
 
 # Two starts racing on one fresh directory (a duplicated tool call, a retry): exactly one may run
-# its command. BG_RUN_CLAIM_PAUSE holds both past the emptiness check, so the claim is what decides
-# and the race is lost every time rather than by luck; the control is a copy whose exclusive link
+# its command. BG_RUN_CLAIM_GATE holds both past the emptiness check until both are there, so the
+# claim is what decides and the race is lost every time rather than by luck; the control is a copy whose exclusive link
 # is patched into an overwriting rename, which must then run the command twice.
 # twin_starts <script> <dir>: launch two starts at once; sets TWIN_RAN (times the command ran) and
 # TWIN_RCS (the two start exits).
 twin_starts() {
-  local ran="$2.ran" a b ra rb
-  BG_RUN_CLAIM_PAUSE=1 "$1" start "$2" -- sh -c 'echo x >> "$0"; sleep 1' "$ran" > /dev/null 2>&1 &
+  local ran="$2.ran" gate="$2.gate" a b ra rb i=0
+  BG_RUN_CLAIM_GATE=$gate "$1" start "$2" -- sh -c 'echo x >> "$0"; sleep 1' "$ran" > /dev/null 2>&1 &
   a=$!
-  BG_RUN_CLAIM_PAUSE=1 "$1" start "$2" -- sh -c 'echo x >> "$0"; sleep 1' "$ran" > /dev/null 2>&1 &
+  BG_RUN_CLAIM_GATE=$gate "$1" start "$2" -- sh -c 'echo x >> "$0"; sleep 1' "$ran" > /dev/null 2>&1 &
   b=$!
   BGPIDS="$BGPIDS $a $b"
+  # Open the gate once both starts stand at it (or after 10 s, when the counts below say why).
+  while [ -z "$(find "$TMP" -maxdepth 1 -name "${gate##*/}.$a")" ] \
+    || [ -z "$(find "$TMP" -maxdepth 1 -name "${gate##*/}.$b")" ]; do
+    [ "$i" -lt 100 ] || break
+    sleep 0.1; i=$((i + 1))
+  done
+  : > "$gate"
   wait "$a"; ra=$?; wait "$b"; rb=$?
   TWIN_RAN=$(grep -c x "$ran" 2>/dev/null); TWIN_RAN=${TWIN_RAN:-0}
   TWIN_RCS=$(printf '%s\n' "$ra" "$rb" | sort | tr '\n' ' ')

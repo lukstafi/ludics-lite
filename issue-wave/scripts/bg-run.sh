@@ -107,8 +107,12 @@ cmd_start() {
   mkdir -p -- "$dir" || { say "cannot create $(printf '%q' "$dir")"; exit 2; }
   [ -z "$(ls -A -- "$dir")" ] || refuse_start "$dir"
   # A test seam, unset in use: test-bg-run.sh holds two starts here, past the emptiness check,
-  # so the claim below is what decides between them.
-  [ -z "${BG_RUN_CLAIM_PAUSE:-}" ] || sleep "$BG_RUN_CLAIM_PAUSE"
+  # until both have reached it (each drops <gate>.<pid>; the suite then creates <gate>), so the
+  # claim below is what decides between them.
+  if [ -n "${BG_RUN_CLAIM_GATE:-}" ]; then
+    : > "$BG_RUN_CLAIM_GATE.$$"
+    while [ ! -e "$BG_RUN_CLAIM_GATE" ]; do sleep 0.1; done
+  fi
   # The claim is the pid itself, published by a hard link, which fails when `pid` exists: of two
   # starts that both found the directory empty, exactly one gets it and the other is refused
   # before its command runs. The content is complete before the link makes it visible.
@@ -121,7 +125,7 @@ cmd_start() {
   # The command's process publishes its own pid before it execs the command, so there is no moment
   # at which the command runs untracked.
   # shellcheck disable=SC2016 # expanded by the inner sh
-  sh -c 'printf "%s\n" "$$" > "$0.tmp" && mv -f "$0.tmp" "$0" && exec "$@"' "$dir/cpid" "$@" \
+  sh -c 'printf "%s\n" "$$" > "$0.$$" && mv -f "$0.$$" "$0" && exec "$@"' "$dir/cpid" "$@" \
     < /dev/null > "$dir/log" 2>&1 &
   wait "$!"
   rc=$?
@@ -130,13 +134,24 @@ cmd_start() {
   exit "$rc"
 }
 
+# alive <pid-file>: whether the process it names is running. `kill -0` alone answers yes for a
+# zombie -- an orphaned command that exited under a parent that never reaps it (a minimal
+# container's PID 1) -- so a process `ps` reports in state Z (or X, dead) is not alive. Where ps
+# cannot say, kill -0 stands.
+alive() {
+  [ -s "$1" ] || return 1
+  p=$(cat "$1")
+  kill -0 "$p" 2>/dev/null || return 1
+  case $(ps -o stat= -p "$p" 2>/dev/null | tr -d ' ') in Z*|X*) return 1 ;; esac
+  return 0
+}
+
 # verdict <dir>: sets V to rc | REFUSED | STARTING | RUNNING | DIED.
 verdict() {
   if [ -s "$1/refused" ]; then V=REFUSED
   elif [ -s "$1/rc" ]; then V=rc
   elif [ ! -s "$1/pid" ]; then V=STARTING
-  elif kill -0 "$(cat "$1/pid")" 2>/dev/null; then V=RUNNING
-  elif [ -s "$1/cpid" ] && kill -0 "$(cat "$1/cpid")" 2>/dev/null; then V=RUNNING
+  elif alive "$1/pid" || alive "$1/cpid"; then V=RUNNING
   elif [ -s "$1/rc" ]; then V=rc   # it finished between the rc read and the probe
   else V=DIED
   fi
