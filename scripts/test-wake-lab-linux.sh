@@ -98,9 +98,16 @@ out=$(WAKE_LAB_LOCK_DIR="$sl" SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$
 check 'with no lock files both locks read free, with no detail line' '[ "$rc" = 0 ] && [[ "$out" == *"lane-lock=free  hold-lock=free"* ]] && [[ "$out" != *" lock: "* ]]'
 check '...and status created no lock file' '[ -z "$(ls -A "$sl")" ]'
 # The reservations column, from a stub registry reader; `?` whenever the registry was not read.
+# FW_HANG=leader wedges the reader itself; FW_HANG=orphan leaves a descendant holding its stdout
+# after it exits, the shape of an ssh stuck inside the real reader's pipeline. Either way the
+# descendant's pid goes to FW_PIDFILE so the case can see that status reaped it.
 cat >"$tmp/fleet-worker.sh" <<'FW'
 #!/usr/bin/env bash
 [ "$*" = "execution list --active --compact" ] || exit 9
+case "${FW_HANG:-}" in
+  leader) sleep 60 & echo $! >"$FW_PIDFILE"; wait ;;
+  orphan) sleep 60 & echo $! >"$FW_PIDFILE" ;;
+esac
 printf '%s' "${FW_LISTING-}"; exit "${FW_RC:-0}"
 FW
 chmod +x "$tmp/fleet-worker.sh"
@@ -117,6 +124,17 @@ out=$(WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING='EXECUTION REFUSED
 check 'a registry listing that is not a JSON list is unknown, not zero' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=?"* ]]'
 out=$(SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
 check 'a missing registry reader is unknown, not zero' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=?"* ]]'
+# A wedged leader is cut short, so its registry is unread (`?`); a leader that finished gave its
+# answer ('[]', so 0) and only its straggler is reaped.
+for hang in leader:? orphan:0; do
+  want=${hang#*:}; hang=${hang%%:*}
+  rm -f "$tmp/fw.pid"; started=$SECONDS
+  out=$(WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING='[]' FW_HANG=$hang FW_PIDFILE="$tmp/fw.pid" \
+    WAKE_LAB_PROBE_CAP=2 SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?; took=$((SECONDS - started))
+  fw_pid=$(cat "$tmp/fw.pid" 2>/dev/null)
+  check "a registry reader whose $hang wedges is cut at the cap, its whole tree with it" '[ "$rc" = 0 ] && [ "$took" -lt 20 ] && [ -n "$fw_pid" ] && ! kill -0 "$fw_pid" 2>/dev/null && [[ "$out" == *"reservations=$want"* ]]'
+  [ -z "$fw_pid" ] || kill "$fw_pid" 2>/dev/null
+done
 out=$(SSH_UP=tuf-amd-win "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
 check 'Linux-configured TUF reports an alternate Windows boot' '[ "$rc" = 0 ] && [[ "$out" == *"os=windows"* ]]'
 out=$(SSH_UP=tuf-amd-wsl "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
@@ -178,6 +196,10 @@ out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" SSH_UP=tuf-amd-win "$tmp/wake-lab.sh" sta
 check 'the renamed TUF keeps its Windows endpoint when configured for WSL' '[ "$rc" = 0 ] && [[ "$out" == *"win=UP"* ]] && [[ "$out" == *"wsl=--"* ]] && [[ "$out" == *"os=windows"* ]]'
 out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" SSH_UP=tuf-amd-wsl "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
 check 'TUF WSL status requires a responding guest' '[ "$rc" = 0 ] && [[ "$out" == *"wsl=UP"* ]] && [[ "$out" == *"os=wsl"* ]]'
+listing='[{"request_id":"w-359-guest","request":{"execution_host":"tuf-amd-wsl"},"state":"launching"},
+{"request_id":"w-359-native","request":{"execution_host":"tuf-amd-linux"},"state":"launching"}]'
+out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING="$listing" SSH_UP=tuf-amd-wsl "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+check 'a WSL box counts reservations naming its guest as well as its native endpoint' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=2"* ]] && [[ "$out" == *"reservation: w-359-guest (launching)"* ]]'
 out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" SSH_UP=tuf-amd-win WAKE_LAB_WSL_WAIT_SECONDS=0 "$tmp/wake-lab.sh" kick-wsl tuf 2>&1); rc=$?
 check 'TUF kick cannot report WSL up without its guest endpoint answering' '[ "$rc" != 0 ] && [[ "$out" == *"wsl still down"* ]] && [[ "$out" != *"wsl up"* ]]'
 mkdir "$tmp/no-guest"

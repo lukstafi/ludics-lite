@@ -534,6 +534,8 @@ lab_locks_fields() { # lab_locks_fields <box>
 # checkout (WAKE_LAB_FLEET_WORKER overrides the path), under the probe cap, because that reader
 # asks the anchor box over ssh from anywhere else. A registry that cannot be read or does not parse
 # is `?`, never 0: "nothing reserved" and "could not look" call for opposite conclusions.
+# A record names its box by an ssh identity, and a box has two: its native Linux endpoint
+# (`linux_of`) and, where the WSL adapter is loaded, its WSL guest (`wsl_of`). Either one counts.
 RESERVATIONS=""   # the listing as JSON; empty means it could not be read
 RES_DETAILS=""
 reservations_read() {
@@ -542,15 +544,39 @@ reservations_read() {
   if [ -n "${WAKE_LAB_FLEET_WORKER:-}" ]; then fw=$WAKE_LAB_FLEET_WORKER
   else dir=$(script_dir) || return 0; fw=$dir/../issue-wave/scripts/fleet-worker.sh; fi
   [ -x "$fw" ] || return 0
-  RESERVATIONS=$(capped "$PROBE_CAP" "$fw" execution list --active --compact 2>/dev/null </dev/null) \
+  RESERVATIONS=$(capped_tree "$PROBE_CAP" "$fw" execution list --active --compact 2>/dev/null </dev/null) \
     || RESERVATIONS=""
 }
+
+# `capped` for a command that is a process TREE writing into a command substitution. `capped`
+# signals the one pid it started, and that is enough for a bare ssh; but the registry reader is a
+# script that runs its ssh inside a pipeline, so a wedged remote command would leave that ssh
+# alive, holding the substitution's pipe open, and `status` would hang behind it with the reader
+# itself already dead. So the reader runs as the leader of a process group of its own, and the
+# whole group is killed at the deadline -- and again once the leader exits, for a straggler that
+# outlived it. Returns CAP_EXPIRED when the deadline cut the command short.
+capped_tree() { # capped_tree <seconds> <cmd...>
+  perl -e '
+    use POSIX ();
+    my $secs = shift; my $expired = shift;
+    my $pid = fork; defined $pid or exit 1;
+    if ($pid == 0) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; exit 127 }
+    POSIX::setpgid($pid, $pid);
+    $SIG{ALRM} = sub { kill "KILL", -$pid; waitpid($pid, 0); exit $expired };
+    alarm $secs;
+    waitpid($pid, 0); my $st = $?;
+    alarm 0; kill "KILL", -$pid;
+    exit(($st & 127) ? 128 + ($st & 127) : $st >> 8);' "$1" "$CAP_EXPIRED" "${@:2}"
+}
 reservations_fields() { # reservations_fields <box>
-  local host ids n
+  local linux wsl="" ids n
   RES_DETAILS=""
-  host=$(linux_of "$1") || host=""
-  if [ -z "$RESERVATIONS" ] || [ -z "$host" ] || ! ids=$(jq -r --arg h "$host" \
-       'if type == "array" then .[] | select(.request.execution_host == $h)
+  linux=$(linux_of "$1") || linux=""
+  if declare -F wsl_of >/dev/null; then wsl=$(wsl_of "$1") || wsl=""; fi
+  if [ -z "$RESERVATIONS" ] || { [ -z "$linux" ] && [ -z "$wsl" ]; } || ! ids=$(jq -r \
+       --arg l "$linux" --arg w "$wsl" \
+       'if type == "array" then .[] | .request.execution_host as $h
+          | select(($l != "" and $h == $l) or ($w != "" and $h == $w))
           | "\(.request_id) (\(.state))" else error("not a list") end' <<<"$RESERVATIONS" 2>/dev/null); then
     printf '  reservations=?'; return 0
   fi
