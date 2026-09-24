@@ -79,6 +79,15 @@ private_fingerprint() {
 # copy cannot see the original's mode, so it is read here (`ls -ln`, GNU and BSD alike).
 private_key_mode_ok() { case "$(ls -ln "$1" 2>/dev/null)" in "-rw------- "*|"-r-------- "*) ;; *) return 1 ;; esac; }
 
+# Both halves fingerprint, and to the same key: two failed reads are two empty strings, which
+# would otherwise compare equal.
+key_pair_matches() {
+  local priv pub
+  priv=$(private_fingerprint "$1")
+  pub=$(ssh-keygen -l -f "$2" 2>/dev/null | awk '{print $2}')
+  [[ -n $priv && $priv == "$pub" ]]
+}
+
 clone_if_missing() {
   local repo=$1 dest=$2
   if [[ -e $dest || -L $dest ]]; then
@@ -436,7 +445,7 @@ main() {
     [[ -f $HOME/.ssh/id_ed25519 && -f $HOME/.ssh/id_ed25519.pub ]] || fail 'Need both halves of ~/.ssh/id_ed25519; configure your existing key manually.'
     private_key_mode_ok "$HOME/.ssh/id_ed25519" ||
       fail 'OpenSSH ignores a private key others can read: chmod 600 ~/.ssh/id_ed25519, then rerun.'
-    [[ $(private_fingerprint "$HOME/.ssh/id_ed25519") == "$(ssh-keygen -l -f "$HOME/.ssh/id_ed25519.pub" | awk '{print $2}')" ]] ||
+    key_pair_matches "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ed25519.pub" ||
       fail 'The public key ~/.ssh/id_ed25519.pub does not match its private key; configure your existing key manually.'
     printf 'For a passphrase-protected key, load ssh-agent before running unattended workers.\n'
     for peer in $boxes; do

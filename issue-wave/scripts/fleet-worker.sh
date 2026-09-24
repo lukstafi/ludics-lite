@@ -662,8 +662,9 @@ if [ -e "$tokf" ] || [ -L "$tokf" ]; then
   case "$tls" in "-rw------- "*|"-r-------- "*) [ "$(printf '%s' "$tls" | awk '{print $3}')" != "$(id -u)" ] || tokbad="" ;; esac
   if [ -n "$tokbad" ]; then
     # mv replaces only a regular file: onto a directory, or a symlink to one, it moves the new
-    # file INTO it. So any path that is not a plain regular file is removed first.
-    tokfix=$tokcopy; [ -f "$tokf" ] && [ ! -L "$tokf" ] || tokfix="remove the path first (rm -r ~/.config/fleet/gh-token.sh; for a symlink that removes the link only), then $tokcopy"
+    # file INTO it. So any path that is not a plain regular file is moved aside first (never
+    # deleted: nothing here says its contents are disposable).
+    tokfix=$tokcopy; [ -f "$tokf" ] && [ ! -L "$tokf" ] || tokfix="move the path aside first (mv ~/.config/fleet/gh-token.sh ~/.config/fleet/gh-token.sh.aside; a symlink moves as the link), then $tokcopy"
     note "~/.config/fleet/gh-token.sh on $BOX is not a regular mode-0600 file this user owns ($(printf '%s' "$tls" | awk '{print $1, "uid", $3}')): the PAT in it may be readable by others -- repair: $tokfix"
   else
     # An empty GH_TOKEN is no token to gh: it falls back to GITHUB_TOKEN or a stored login. And

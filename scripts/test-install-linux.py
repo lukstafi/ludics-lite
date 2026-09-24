@@ -85,6 +85,11 @@ class BootstrapSafety(unittest.TestCase):
         self.run_shell("printf 'source env\\nreturn\\n' > real; ln -s real rc; source_at_start rc 'source env'")
         self.assertEqual((self.root / 'real').read_text(), 'source env\nreturn\n')
 
+    def test_key_pair_matches_needs_two_readable_matching_halves(self):
+        self.run_shell("scratch=$PWD; ssh-keygen -q -t ed25519 -N '' -f good; key_pair_matches good good.pub; "
+                       "echo junk > bad; echo junk > bad.pub; ! key_pair_matches bad bad.pub; "
+                       "ssh-keygen -q -t ed25519 -N '' -f other; ! key_pair_matches good other.pub")
+
     def test_private_key_mode_ok_refuses_a_key_others_can_read(self):
         self.run_shell("touch k; chmod 600 k; private_key_mode_ok k; chmod 400 k; private_key_mode_ok k; "
                        "chmod 644 k; ! private_key_mode_ok k; chmod 640 k; ! private_key_mode_ok k")
