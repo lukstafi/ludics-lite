@@ -105,7 +105,11 @@ upstream main and refuses on a dirty or diverged checkout. That pull-side step i
 propagates merged skill edits to boxes that slept through the merge. A headless worker also
 needs the box's CLI logged in: `claude auth login` for Claude workers (an expired OAuth session
 cannot refresh headless, and `claude auth status` does not notice) and `codex login` for Codex
-CLI ones. The CLI preflight proves both with a live call, not a status read.
+CLI ones. The CLI preflight proves both with a live call, not a status read. Every worker, native
+or CLI, also needs the box's `gh` authenticated for a non-interactive ssh session (it pushes and
+opens the PR with it): the preflight calls `gh api user` from that session kind and refuses a
+rejected token with the repair, `ssh -t <box> 'gh auth login -h github.com -p https -w && gh auth
+setup-git'`.
 Provider/model, launch transport and execution placement are separate choices. Both Codex and
 Claude Code support their own native subagents in coordinator-created external worktrees, or
 CLI workers launched with `--kind codex` or `--kind claude`. Only the CLI route provides
