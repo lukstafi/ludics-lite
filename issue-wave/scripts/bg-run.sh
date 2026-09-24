@@ -28,6 +28,10 @@
 # run's. A start refused over a run that is still live, or still being claimed, marks nothing:
 # that is the run a wait there should report, since the likeliest way to reach it is a duplicated
 # or retried `start` of the same command -- marking it would send the caller off to run it again.
+# A duplicate that arrives only after its twin has ENDED cannot be told from the reuse of an old
+# directory, and is refused the same way: that costs a second run, loudly, where the other
+# reading would report an earlier run's status as this one's, silently. The commands this is for
+# (a review watch, a merge wait) are reads that a second run repeats harmlessly.
 #
 # `wait` polls every 5 s (BG_RUN_POLL, whole seconds) and returns the first settled verdict, or
 # the current one once --within seconds are spent. It prints one line and exits with its code:
@@ -190,6 +194,8 @@ cmd_wait() {
   for n in "$within" "$interval" "$grace"; do
     case $n in ''|*[!0-9]*) say "not a whole number of seconds: $(printf '%q' "$n")"; exit 2 ;; esac
   done
+  # Decimal, whatever the padding: bash arithmetic reads a leading 0 as octal (08 is an error).
+  within=$((10#$within)); interval=$((10#$interval)); grace=$((10#$grace))
   [ "$interval" -ge 1 ] || { say 'BG_RUN_POLL must be at least 1'; exit 2; }
   need_absolute "$dir"
   t0=$SECONDS

@@ -27,7 +27,8 @@
 #     time the loser's claim fails;
 #   - a --within shorter than the poll interval is spent in full rather than answered at once;
 #   - the finish-between-reads order: a dead pid beside an rc reads rc, not DIED;
-#   - the usage errors (relative directory, missing `--`, a --within that is not a number);
+#   - the usage errors (relative directory, missing `--`, a --within that is not a number), and
+#     that a zero-padded number is read as decimal;
 #   - when zsh is installed, a start issued through `zsh -c` the way the Bash tool issues it,
 #     with its arguments passed through intact.
 #
@@ -332,6 +333,10 @@ expect "usage: start without -- is refused" 2 'usage:' -- "$BG" start "$TMP/u1" 
 [ ! -e "$TMP/u1" ] && ok "...and creates nothing" || ko "a start without -- created its directory"
 expect "usage: start with no command is refused" 2 'usage:' -- "$BG" start "$TMP/u2" --
 expect "usage: a --within that is not a number is refused" 2 'whole number' -- "$BG" wait "$TMP/u3" --within soon
+expect "a zero-padded --within is decimal, not octal (08 is no arithmetic error)" 0 'rc=0' -- \
+  "$BG" wait "$TMP/finished0" --within 08
+expect "...and so are zero-padded BG_RUN_POLL and BG_RUN_START_GRACE" 4 STARTING -- \
+  env BG_RUN_POLL=01 BG_RUN_START_GRACE=09 "$BG" wait "$TMP/padded" --within 02
 expect "usage: no subcommand is refused" 2 'usage:' -- "$BG"
 expect "usage: --help prints the synopsis" 0 'bg-run.sh start <dir> --' -- "$BG" --help
 
