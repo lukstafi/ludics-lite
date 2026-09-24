@@ -4756,7 +4756,8 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
 # the PR has then. A lead-time read before the wait stood here for a round, and it was about a series
 # that a push or a retarget during the wait could replace: it needed a second read, a withdrawal of
 # what the first had printed, and a base comparison on top (review rounds 1 and 2). One late read is
-# about what lands, and every attempt after it is bound to that head by --match-head-commit. What
+# about what lands, and every attempt after it is bound to that head by --match-head-commit; the one
+# retry that follows a BASE move reads it again, since the series is relative to the base. What
 # it gives up is lead time, which for this finding is small: its fix is a push, and a push restarts
 # the gate whenever it is made. The window it leaves is a retarget between this read and the merge
 # call, the same seconds-wide window the body re-scan leaves around the call.
@@ -5046,6 +5047,9 @@ cmd_merge() {
         warn "$REPO#$PR_NUM's BASE moved during the merge call, not its head (still" \
           "${CHECK_SHA:0:8}); re-reading the drift and retrying"
         warn_base_drift "$PR_NUM" || true
+        # The series is relative to the base, which is what just moved: a retarget, or a base
+        # rewound, can bring commits into it that nothing has read (review round 4).
+        warn_series_close "$PR_NUM" "$CHECK_SHA"
         attempt=$((attempt + 1))
         continue
       fi

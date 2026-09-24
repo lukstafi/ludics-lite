@@ -1615,6 +1615,16 @@ test_the_series_is_read_once_across_merge_attempts() {
   assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 1 "on one series read"
 }
 
+# Review round 4. The series is relative to the base, so the retry after a BASE move -- a retarget
+# or a rewound base leaves the head where it was -- reads it again; an ordinary retry does not.
+test_a_base_move_during_the_call_rereads_the_series() {
+  reset
+  MERGE_BASE_MODIFIED=1
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the retry lands ($MERGE_OUTPUT)"
+  assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 2 "the series is read again after the base moved"
+}
+
 # The series is read AFTER the gate, for the head the merge is bound to: a PR whose head is no longer
 # the gated one is a series that will not land, and the merge's head binding refuses it anyway, so
 # the scan says it did not run rather than reading it (review round 2 moved the read here).
@@ -1738,6 +1748,7 @@ tests=(
   test_a_commit_message_is_read_as_written
   test_the_series_is_read_once_across_merge_attempts
   test_the_series_is_read_for_the_gated_head
+  test_a_base_move_during_the_call_rereads_the_series
   test_an_unread_or_partial_series_says_the_scan_did_not_run
   test_the_series_is_scanned_whatever_the_base
   test_the_series_is_scanned_whatever_the_merge_method
