@@ -13,7 +13,9 @@
 #
 # <dir> is absolute and FRESH for every run: `start` creates it and refuses one that already holds
 # anything. It writes three files there and nothing else:
-#   pid  -- this script's own pid, published before the command starts;
+#   pid  -- this script's own pid, published before the command starts. Publishing it is the
+#           claim: it is created exclusively, so of two starts racing on one directory exactly one
+#           runs its command;
 #   log  -- the command's stdout and stderr, and the only file the command's output reaches;
 #   rc   -- the command's exit status, published (by rename) after the command returns.
 # A refused start writes a fourth, `refused`, into the directory it refused, so a wait on it says
@@ -69,6 +71,15 @@ need_absolute() {
   esac
 }
 
+# refuse_start <dir>: mark the directory so a wait on it reads REFUSED rather than the status of
+# the run already there, and exit.
+refuse_start() {
+  reason="$(printf '%q' "$1") already holds a run; start again in a new directory"
+  printf '%s\n' "$reason" > "$1/refused"
+  say "refused: $reason"
+  exit 2
+}
+
 cmd_start() {
   [ $# -ge 3 ] || usage
   dir=$1; shift
@@ -76,14 +87,19 @@ cmd_start() {
   shift
   need_absolute "$dir"
   mkdir -p -- "$dir" || { say "cannot create $(printf '%q' "$dir")"; exit 2; }
-  if [ -n "$(ls -A -- "$dir")" ]; then
-    reason="$(printf '%q' "$dir") already holds a run; start again in a new directory"
-    printf '%s\n' "$reason" > "$dir/refused"
-    say "refused: $reason"
-    exit 2
+  [ -z "$(ls -A -- "$dir")" ] || refuse_start "$dir"
+  # A test seam, unset in use: test-bg-run.sh holds two starts here, past the emptiness check,
+  # so the claim below is what decides between them.
+  [ -z "${BG_RUN_CLAIM_PAUSE:-}" ] || sleep "$BG_RUN_CLAIM_PAUSE"
+  # The claim is the pid itself, published by a hard link, which fails when `pid` exists: of two
+  # starts that both found the directory empty, exactly one gets it and the other is refused
+  # before its command runs. The content is complete before the link makes it visible.
+  printf '%s\n' "$$" > "$dir/.pid.$$" || { say "cannot write in $(printf '%q' "$dir")"; exit 2; }
+  if ! ln -- "$dir/.pid.$$" "$dir/pid" 2>/dev/null; then
+    rm -f -- "$dir/.pid.$$"
+    refuse_start "$dir"
   fi
-  printf '%s\n' "$$" > "$dir/.pid.tmp" && mv -f -- "$dir/.pid.tmp" "$dir/pid" \
-    || { say "cannot publish the pid in $(printf '%q' "$dir")"; exit 2; }
+  rm -f -- "$dir/.pid.$$"
   "$@" < /dev/null > "$dir/log" 2>&1
   rc=$?
   printf '%s\n' "$rc" > "$dir/.rc.tmp" && mv -f -- "$dir/.rc.tmp" "$dir/rc" \

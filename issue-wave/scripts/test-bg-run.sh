@@ -18,6 +18,7 @@
 #   - a stale directory: `start` refuses one that already holds a run, finished or live, runs
 #     nothing, leaves the earlier status untouched, and a wait on it reads REFUSED, not the
 #     earlier run's rc;
+#   - two starts racing on one fresh directory: exactly one runs its command, the other is refused;
 #   - the finish-between-reads order: a dead pid beside an rc reads rc, not DIED;
 #   - the usage errors (relative directory, missing `--`, a --within that is not a number);
 #   - when zsh is installed, a start issued through `zsh -c` the way the Bash tool issues it,
@@ -161,6 +162,37 @@ else
   ko "stale: the live fixture never published its pid"
 fi
 kill -9 "$live" 2>/dev/null; { wait "$live"; } 2>/dev/null
+
+# Two starts racing on one fresh directory (a duplicated tool call, a retry): exactly one may run
+# its command. BG_RUN_CLAIM_PAUSE holds both past the emptiness check, so the claim is what decides
+# and the race is lost every time rather than by luck; the control is a copy whose exclusive link
+# is patched into an overwriting rename, which must then run the command twice.
+# twin_starts <script> <dir>: launch two starts at once; sets TWIN_RAN (times the command ran) and
+# TWIN_RCS (the two start exits).
+twin_starts() {
+  local ran="$2.ran" a b ra rb
+  BG_RUN_CLAIM_PAUSE=1 "$1" start "$2" -- sh -c 'echo x >> "$0"; sleep 1' "$ran" > /dev/null 2>&1 &
+  a=$!
+  BG_RUN_CLAIM_PAUSE=1 "$1" start "$2" -- sh -c 'echo x >> "$0"; sleep 1' "$ran" > /dev/null 2>&1 &
+  b=$!
+  BGPIDS="$BGPIDS $a $b"
+  wait "$a"; ra=$?; wait "$b"; rb=$?
+  TWIN_RAN=$(grep -c x "$ran" 2>/dev/null); TWIN_RAN=${TWIN_RAN:-0}
+  TWIN_RCS=$(printf '%s\n' "$ra" "$rb" | sort | tr '\n' ' ')
+}
+twin_starts "$BG" "$TMP/twin"
+[ "$TWIN_RAN" -eq 1 ] && [ "$TWIN_RCS" = "0 2 " ] \
+  && ok "twin starts on one directory: the command ran once and the other start was refused" \
+  || ko "twin starts: the command ran $TWIN_RAN time(s); the starts exited $TWIN_RCS"
+sed 's|ln -- "$dir/.pid.$$" "$dir/pid"|mv -f -- "$dir/.pid.$$" "$dir/pid"|' "$BG" > "$TMP/unclaimed.sh"
+chmod +x "$TMP/unclaimed.sh"
+if cmp -s "$BG" "$TMP/unclaimed.sh"; then
+  ko "control: the patch found no exclusive link to replace in $BG"
+else
+  twin_starts "$TMP/unclaimed.sh" "$TMP/twin-control"
+  [ "$TWIN_RAN" -eq 2 ] && ok "control: with an overwriting rename for the claim, both starts run the command" \
+    || ko "control: the unclaimed copy ran the command $TWIN_RAN time(s), so the case above proves nothing"
+fi
 
 # --- the finish-between-reads order ------------------------------------------------------------------
 d="$TMP/dead-with-rc"; mkdir -p "$d"
