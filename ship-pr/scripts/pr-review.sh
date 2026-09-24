@@ -4273,6 +4273,9 @@ refuse_merge_queue() {
 # which is the distinction between a sentence ending in "are now fixed." -- whose references stand
 # before the keyword in the same unit, so dropping the dot outright would have silenced it -- and a
 # dotted token. The suite caught that overreach before it left the worktree.
+#
+# The same filter reads each COMMIT MESSAGE of the series (warn_series_close), with `-v plain=1`,
+# whose one difference is that an indented line is read, as quoted, rather than skipped as code.
 MULTI_CLOSE_FILTER='
 function scrub_urls(text,   rest) {
   # URLs go first. A body here is full of run links, and a fragment in one is not an issue: a
@@ -4465,7 +4468,11 @@ function scan(unit, quoted,   refs, cnt, parts, shown, cls, after) {
   # warned about as an ordinary sentence, which contradicted the documentation in the one direction
   # that matters (review round 11). Inside an already-open fence indentation is content, so the
   # line is still read there.
-  if (indented && !fence) next
+  # A COMMIT MESSAGE (`-v plain=1`, ludics-lite#296) is not Markdown: GitHub reads its keywords off
+  # the plain text, so indentation hides nothing there, and an indented line is how a message
+  # quotes. It is read, as quoted, which warn_series_close reports as closing all the same.
+  if (indented && !fence && plain == "") next
+  if (indented && !fence) quoted = 1
   s = line
   # Terminal punctuation ends a unit, with no abbreviation rule in front of it. One stood here for
   # three rounds and was narrowed twice; each revision traded one error for another, and both of
@@ -4757,6 +4764,148 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
   return 0
 }
 
+# --- the commit series' closing keywords (ludics-lite#296) --------------------------------------
+# This repository merges with --merge, so every commit MESSAGE of the series lands on the default
+# branch, and GitHub applies closing keywords there exactly as it does a body's. PR #274's first
+# commit quoted the #210 incident sentence verbatim as an illustration and would have closed #194
+# and #205 again; its author caught it by rereading, and nothing on the landing path read the series.
+#
+# BOUNDARY. What is read: every message of the PR's series, through the commits endpoint, each with
+# the body's own filter above (one classifier, `-v plain=1`), so a finding here is a body finding --
+# a keyword binding two or more references in one sentence, or a keyword with any reference in a
+# quoted, fenced or (here) indented line. What the second class CLAIMS differs, and on purpose: in
+# a body it rests on a best-effort Markdown reading and claims nothing, but a message is plain text
+# that GitHub reads whole, so a quoted copy closes as surely as a statement and both classes say so
+# (review round 1). What is deliberately NOT read: a lone `Closes #N` in plain prose, which is
+# silent in a commit as in a body, because it is how a commit really closes the PR's own issue and
+# nothing readable tells it from a lone close of another one; and every shape the body scan
+# documents as unread. The series is read WHOLE or not at all: the endpoint serves at most 250
+# commits, so the PR's own commit count leads the rows, and a count over the cap, a row count that
+# disagrees with it, or a last row that is not the head the count was read with all say the scan did
+# NOT run instead of scanning a part as the whole.
+#
+# It WARNS and does not refuse, for the body scan's reason and one more: the fix is a history
+# rewrite and a force-push, which moves the head and costs a CI cycle -- a price a refusal would
+# charge on every deliberate close as well, with nothing here able to tell the two apart. It is not
+# skipped on a base that is not the default branch, where the body scan is: a body keyword binds
+# only on its own merge, while a commit keyword binds whenever that commit reaches the default
+# branch, and a merge into a staging branch is the last point at which rewording it is cheap.
+#
+# The merge METHOD is not read, and that is a boundary, not an oversight. --merge and --rebase land
+# the series as it is, and a --squash lands it or not depending on its --body and the repository's
+# squash default. Two rounds (2 and 3) spent on telling those apart from the forwarded flags met
+# gh's option table: a value-taking option whose operand spells `--squash` reads as the strategy,
+# and doing it right is parsing gh's flags. So every merge is scanned, and a --squash that replaces
+# the messages draws a warning about messages that will not land -- a false warning, the loud
+# direction, on a method this repository does not use. A --squash --body text is itself a landing
+# message this scan does not read either.
+#
+# Read AFTER the gate and any --wait, immediately before EVERY merge attempt, beside the body
+# re-scan and for the same reason: --match-head-commit binds the head, while the series is relative
+# to the BASE, and a retarget or a rewound base during a wait or between attempts changes it without
+# moving the head (review rounds 2, 4 and 5 each found one more path to such a move; reading before
+# every attempt closes the class). A lead-time read before the wait stood here for a round and was
+# removed: it was about a series the wait could replace. What that gives up is lead time, which for
+# this finding is small -- its fix is a push, and a push restarts the gate whenever it is made. The
+# window left is a move between this read and the call, the seconds-wide window the body re-scan
+# leaves too. An attempt whose findings REPEAT the last ones printed prints nothing, and one whose
+# series has lost them withdraws them, so a retry costs a line only when something moved.
+# The head whose series the last scan read whole, for the deferred-merge refusal; empty when none.
+SERIES_READ=""
+# The findings the last completed scan printed, for the repeat and the withdrawal above.
+SERIES_LAST=""
+warn_series_close() { # <pr> <gated head>; always 0 -- a warning that can refuse a merge is a gate
+  local meta count head last rows n=0 row sha msg scan rc class cnt refs sent findings=""
+  SERIES_READ=""
+  meta=$(gh_retry read api "repos/$REPO/pulls/$1" --jq '[(.commits|tostring), (.head.sha // "")] | @tsv') || {
+    warn "could not read $REPO#$1's commit count ($(gh_err_line)); the commit-series closing-keyword" \
+      "scan did NOT run, so nothing here says what the series' messages close."
+    return 0
+  }
+  count="${meta%%$'\t'*}"
+  head="${meta#*$'\t'}"
+  case "$count" in '' | *[!0-9]*) count="" ;; esac
+  case "$head" in '' | *[!0-9a-zA-Z-]*) head="" ;; esac
+  if [ -z "$count" ] || [ -z "$head" ] || [ "$count" -eq 0 ]; then
+    warn "$REPO#$1's commit count and head did not parse ('$(printf '%q' "$meta")'); the" \
+      "commit-series closing-keyword scan did NOT run."
+    return 0
+  fi
+  if [ "$head" != "$2" ]; then
+    warn "$REPO#$1's head is now ${head:0:8}, not ${2:0:8}, the head the build signal was read for;" \
+      "the commit-series closing-keyword scan did NOT run, and the merge's head binding refuses."
+    return 0
+  fi
+  if [ "$count" -gt 250 ]; then
+    warn "$REPO#$1 has $count commits and the commits endpoint serves at most 250; the" \
+      "commit-series closing-keyword scan did NOT run rather than read a part as the whole."
+    return 0
+  fi
+  # @tsv escapes exactly four things in a message -- tab, newline, carriage return and backslash --
+  # and doubles every backslash it was given, so `printf %b` below meets no escape but those four
+  # and restores the message byte for byte.
+  rows=$(gh_retry read api --paginate "repos/$REPO/pulls/$1/commits?per_page=100" \
+    --jq '.[] | [.sha, .commit.message] | if all(type == "string") then @tsv
+          else error("a commit row without a string sha and message") end') || {
+    warn "could not read $REPO#$1's commits ($(gh_err_line)); the commit-series closing-keyword" \
+      "scan did NOT run."
+    return 0
+  }
+  n=$(printf '%s' "$rows" | grep -c .) || n=0
+  last="${rows##*$'\n'}"
+  last="${last%%$'\t'*}"
+  if [ "$n" -ne "$count" ] || [ "$last" != "$head" ]; then
+    warn "$REPO#$1's commits read answered $n row(s) ending at ${last:0:8}, while the PR states" \
+      "$count ending at ${head:0:8}; a page is missing or the series moved between the reads, and" \
+      "the commit-series closing-keyword scan did NOT run."
+    return 0
+  fi
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    sha="${row%%$'\t'*}"
+    printf -v msg '%b' "${row#*$'\t'}"
+    scan=$(awk -v repo="$REPO" -v plain=1 "$MULTI_CLOSE_FILTER" <<<"$msg")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      warn "the closing-keyword scan of commit ${sha:0:8} did not run (awk exit $rc); the" \
+        "series' silence is not a clean series."
+      return 0
+    fi
+    while IFS=$'\t' read -r class cnt refs sent; do
+      [ -n "$class" ] || continue
+      if [ "$class" = quoted ]; then
+        findings="$findings  commit ${sha:0:8}: a QUOTED, FENCED or INDENTED line, and it closes all the same, $cnt issue(s): $refs"$'\n'
+      else
+        findings="$findings  commit ${sha:0:8}: ONE sentence, $cnt issues: $refs"$'\n'
+      fi
+      findings="$findings      $sent"$'\n'
+    done <<<"$scan"
+  done <<<"$rows"
+  SERIES_READ="$head"
+  if [ -z "$findings" ]; then
+    [ -z "$SERIES_LAST" ] || multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1's commit" \
+      "series, read again for this attempt, no longer carries the finding above."
+    SERIES_LAST=""
+    return 0
+  fi
+  [ "$findings" != "$SERIES_LAST" ] || return 0
+  SERIES_LAST="$findings"
+  multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's commit series closes issues it does not look" \
+    "like it closes:"
+  while IFS= read -r row; do
+    [ -n "$row" ] && multi_close_say "$row"
+  done <<<"$findings"
+  multi_close_say "  A commit message is plain text: GitHub applies every keyword in it, a quoted or" \
+    "indented copy included, once the commit reaches the default branch, and editing the PR body" \
+    "does not change it."
+  multi_close_say "  To keep an issue listed above OPEN, reword the commit (git rebase -i, then" \
+    "git push --force-with-lease) before merging; that moves the head, so the gate reads it again."
+  multi_close_say "  If the commit has already reached the default branch, reopen the issue in the" \
+    "repository its own reference names (gh issue reopen <n> --repo <owner>/<name>; a bare #<n> is $REPO)."
+  multi_close_say "  This is a WARNING and not a gate: a commit may close exactly what it names."
+  return 0
+}
+
 cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
@@ -4917,6 +5066,9 @@ cmd_merge() {
     # ambiguous. Both cost more than the window is worth: it is bounded by the backoff (about 35s
     # over four attempts) and opens only during a GitHub gateway incident.
     warn_multi_close "$PR_NUM" again
+    # The commit series, for the gated head and the base as it is now (ludics-lite#296; see
+    # warn_series_close): before EVERY attempt, since a base can move between attempts.
+    warn_series_close "$PR_NUM" "$CHECK_SHA"
     # Open review threads refuse the merge, whatever head they cite and whatever else passed
     # (ludics-lite#289; see approval_gate). Read here, before EVERY attempt, for the body's
     # reason: a thread opened during a --wait or between attempts moves no head, so
@@ -5012,7 +5164,17 @@ cmd_merge() {
   fi
   fail 1 "$REPO#$PR_NUM is not merged ($state) — \`gh pr merge\` returned having only enabled" \
     "auto-merge. It will land when the base's required checks pass; do not treat it as landed." \
-    "$(multi_close_deferred_note)"
+    "$(multi_close_deferred_note) $(series_deferred_note)"
+}
+
+# The series half of the deferred-merge refusal (review round 2): --match-head-commit binds only the
+# ENABLE of an auto-merge, so a push before it fires lands a series this scan never read.
+series_deferred_note() {
+  if [ -n "$SERIES_READ" ]; then
+    printf '%s' "The commit-series scan read the series up to ${SERIES_READ:0:8}; a push before the auto-merge fires lands messages nothing here reads."
+  else
+    printf '%s' "And the commit-series scan did NOT read the series, so nothing here says what its messages close when it lands."
+  fi
 }
 
 # A branch name is data, not URL structure: `release#1` and `release&one` are valid refs, but

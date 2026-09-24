@@ -729,7 +729,12 @@ never a clean approval. `test-pr-review-watch.sh` runs PR #277's two-head shape 
 (findings on the previous head scrolled past as NOT about head, the 👍 on the head above it), and
 `test-pr-review-merge.sh` pins `merge` refusing on an open thread (exit 1, no flag bypassing it)
 and on an unread connection (exit 3), with one read per merge attempt, so a thread opened
-between attempts refuses the retry.
+between attempts refuses the retry. It also pins the commit-series scan (ludics-lite#296): each
+commit message read with the body's filter, a quoted closing sentence warned about by commit and
+line, a commit closing the PR's own issue silent, the series read after the gate and before every
+merge attempt for the gated head (a base can move between attempts), a repeated finding printed
+once and a lost one withdrawn, whatever the base and the merge method, and a capped, short or
+unread series saying the scan did not run.
 `test-pr-review-base-drift.sh` pins the other half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
 which stands still on a conflicted PR.
 
