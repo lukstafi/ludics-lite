@@ -4741,11 +4741,16 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
 # charge on every deliberate close as well, with nothing here able to tell the two apart. It is not
 # skipped on a base that is not the default branch, where the body scan is: a body keyword binds
 # only on its own merge, while a commit keyword binds whenever that commit reaches the default
-# branch, and a merge into a staging branch is the last point at which rewording it is cheap. Nor
-# does the merge method switch it off, except where cmd_merge knows the messages do not land:
-# --rebase lands the series as it is, and a --squash message GitHub composes quotes it when the
-# repository's squash default is COMMIT_MESSAGES, but a --squash given its own --body, or on a
-# repository whose default is the PR body or blank, replaces every message.
+# branch, and a merge into a staging branch is the last point at which rewording it is cheap.
+#
+# The merge METHOD is not read, and that is a boundary, not an oversight. --merge and --rebase land
+# the series as it is, and a --squash lands it or not depending on its --body and the repository's
+# squash default. Two rounds (2 and 3) spent on telling those apart from the forwarded flags met
+# gh's option table: a value-taking option whose operand spells `--squash` reads as the strategy,
+# and doing it right is parsing gh's flags. So every merge is scanned, and a --squash that replaces
+# the messages draws a warning about messages that will not land -- a false warning, the loud
+# direction, on a method this repository does not use. A --squash --body text is itself a landing
+# message this scan does not read either.
 #
 # Read ONCE per merge, AFTER the gate and any --wait, for the head the merge is bound to and the base
 # the PR has then. A lead-time read before the wait stood here for a round, and it was about a series
@@ -4842,31 +4847,10 @@ warn_series_close() { # <pr> <gated head>; always 0 -- a warning that can refuse
   return 0
 }
 
-# Whether the merge lands the series' messages, from the forwarded `gh pr merge` flags: not under a
-# --squash given its own body, nor under a --squash left to a repository default of the PR body or
-# blank. A default that cannot be read is taken as the one that lands the messages, so the unread
-# case costs a warning about messages that may not land, never a missed one; so does a combined
-# short form (`-sb`), which is not recognized.
-series_lands() { # <gh pr merge args...>
-  local arg squash="" body="" def
-  for arg in "$@"; do
-    case "$arg" in
-    --squash | -s) squash=1 ;;
-    --body | --body=* | -b | -b?* | --body-file | --body-file=* | -F | -F?*) body=1 ;;
-    esac
-  done
-  [ -n "$squash" ] || return 0
-  [ -z "$body" ] || return 1
-  def=$(gh_retry read api "repos/$REPO" --jq '.squash_merge_commit_message // ""') || return 0
-  case "$def" in PR_BODY | BLANK) return 1 ;; esac
-  return 0
-}
-
 cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
   local override="" wait_for=0 allow_no_verdict="" require_green="" gate out rc err attempt=1 mergeable state arg
-  local series=""
   local -a gh_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -5003,12 +4987,8 @@ cmd_merge() {
   # head's green run, and hands semantic drift to the post-merge integration loop. A 3 (unread)
   # has already said UNKNOWN loudly; neither outcome blocks the merge.
   warn_base_drift "$PR_NUM" || true
-  # The commit series, ONCE per merge, for the gated head (ludics-lite#296; see warn_series_close),
-  # unless the merge method replaces every message.
-  if series_lands "${gh_args[@]}"; then
-    series=1
-    warn_series_close "$PR_NUM" "$CHECK_SHA"
-  fi
+  # The commit series, ONCE per merge, for the gated head (ludics-lite#296; see warn_series_close).
+  warn_series_close "$PR_NUM" "$CHECK_SHA"
   # The verdict above is about ONE head, the one gate_checks read — and a --wait is minutes to
   # hours long, during which a push can move the PR. `gh pr merge` merges whatever the head is at
   # the moment of the call; --match-head-commit makes it refuse unless that is still the gated
@@ -5124,7 +5104,7 @@ cmd_merge() {
   fi
   fail 1 "$REPO#$PR_NUM is not merged ($state) — \`gh pr merge\` returned having only enabled" \
     "auto-merge. It will land when the base's required checks pass; do not treat it as landed." \
-    "$(multi_close_deferred_note)${series:+ $(series_deferred_note)}"
+    "$(multi_close_deferred_note) $(series_deferred_note)"
 }
 
 # The series half of the deferred-merge refusal (review round 2): --match-head-commit binds only the

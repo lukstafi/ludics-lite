@@ -732,8 +732,8 @@ and on an unread connection (exit 3), with one read per merge attempt, so a thre
 between attempts refuses the retry. It also pins the commit-series scan (ludics-lite#296): each
 commit message read with the body's filter, a quoted closing sentence warned about by commit and
 line, a commit closing the PR's own issue silent, one series read per merge, after the gate and for
-the gated head, the merge methods that land no message skipping it, and a capped, short or unread
-series saying the scan did not run.
+the gated head, whatever the base and the merge method, and a capped, short or unread series
+saying the scan did not run.
 `test-pr-review-base-drift.sh` pins the other half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
 which stands still on a conflicted PR.
 

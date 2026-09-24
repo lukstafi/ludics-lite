@@ -49,7 +49,6 @@ THREADS_JSON='[]'                      # the PR's review threads (review_thread 
 THREADS_JSON_LATER=""                  # nonempty = what the SECOND threads read on answers with
 FAIL_GRAPHQL=""                        # nonempty = the review-threads read gets a 503
 SERIES_JSON=""                         # the PR's commits as the endpoint serves them (see reset)
-SQUASH_DEFAULT=COMMIT_MESSAGES         # the repository's squash_merge_commit_message ("-" = 404)
 SERIES_COUNT=""                        # nonempty = the commit count the PR states, over the rows'
 SERIES_FAIL=""                         # nonempty = the commits read answers with a 503
 # The "from the SECOND read on" switches above are counted by the lib's fixture_call_count, under
@@ -124,17 +123,6 @@ gh() {
     esac
     ;;
   "api repos/$REPO")
-    case "$*" in
-    *squash_merge_commit_message*)
-      printf 'CALL squash-default\n' >>"$CALLS_FILE"
-      if [ "$SQUASH_DEFAULT" = - ]; then
-        printf 'gh: Not Found (HTTP 404)\n' >&2
-        return 1
-      fi
-      printf '%s\n' "$SQUASH_DEFAULT"
-      return 0
-      ;;
-    esac
     reads=$(fixture_call_count default-branch) || return 1
     if [ -n "$DEFAULT_BRANCH_FAIL_LATER" ] && [ "$reads" -ge 2 ]; then
       printf 'gh: Not Found (HTTP 404)\n' >&2
@@ -251,7 +239,6 @@ reset() {
   THREADS_JSON_LATER=""
   FAIL_GRAPHQL=""
   SERIES_JSON="[$(commit_row head-sha 'A commit with nothing to close.')]"
-  SQUASH_DEFAULT=COMMIT_MESSAGES
   SERIES_COUNT=""
   SERIES_FAIL=""
 }
@@ -1562,40 +1549,19 @@ test_the_series_is_scanned_whatever_the_base() {
     "a staging base does not make a commit keyword inert"
 }
 
-# Review round 1. A --squash given its own --body replaces every message of the series, so the
-# series is not read; a --squash whose message GitHub composes quotes the series, so it is.
-test_a_squash_with_its_own_body_does_not_read_the_series() {
+# Review round 3. The merge method is not read: telling a --squash that replaces the messages from
+# one that lands them met gh's option table (`--merge --body --squash` is a body text), so every
+# merge is scanned and a replacing --squash draws a warning -- the loud direction.
+test_the_series_is_scanned_whatever_the_merge_method() {
   local form
-  for form in "--body=Squashed." "-b Squashed." "--body-file /dev/null" "-F /dev/null"; do
+  for form in "--merge --body --squash" "--squash --body=Squashed." "--rebase"; do
     reset
     SERIES_JSON="[$(commit_row head-sha 'Resolves #43 and #44')]"
-    # shellcheck disable=SC2086 # the form is two words on purpose
-    run_merge -- --squash $form
-    assert_eq "$MERGE_RC" 0 "the squash merge lands ($form: $MERGE_OUTPUT)"
-    assert_not_contains "$MERGE_OUTPUT" "#43" "no message of the series lands ($form)"
-    assert_eq "$(grep -c -x 'CALL commits-count' "$CALLS_FILE")" 0 "and nothing is read for it ($form)"
+    # shellcheck disable=SC2086 # the form is several words on purpose
+    run_merge -- $form
+    assert_eq "$MERGE_RC" 0 "the merge lands ($form: $MERGE_OUTPUT)"
+    assert_contains "$MERGE_STDOUT" "commit head-sha: ONE sentence, 2 issues: #43 #44" "scanned under $form"
   done
-  reset
-  SERIES_JSON="[$(commit_row head-sha 'Resolves #43 and #44')]"
-  run_merge -- --squash
-  assert_contains "$MERGE_STDOUT" "commit head-sha: ONE sentence, 2 issues: #43 #44" \
-    "a squash message GitHub composes from the commit messages quotes the series"
-  # Review round 2: the composed message is the repository's default, and two of its three values
-  # carry no commit message at all. One that cannot be read is taken as the one that does.
-  for SQUASH_DEFAULT in PR_BODY BLANK; do
-    run_merge -- --squash
-    assert_not_contains "$MERGE_OUTPUT" "#43" "a $SQUASH_DEFAULT squash default lands no message"
-    assert_eq "$(grep -c -x 'CALL commits-count' "$CALLS_FILE")" 0 "and nothing is read for it"
-  done
-  SQUASH_DEFAULT=-
-  run_merge -- --squash
-  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #43 #44" "an unread default is scanned"
-  run_merge
-  assert_eq "$(grep -c -x 'CALL squash-default' "$CALLS_FILE")" 0 "a --merge never reads the default"
-  reset
-  SERIES_JSON="[$(commit_row head-sha 'Resolves #43 and #44')]"
-  run_merge -- --merge --body=Merged.
-  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #43 #44" "a --body without --squash replaces nothing"
 }
 
 # Review round 2. `gh pr merge` can return having only ENABLED auto-merge, which
@@ -1774,7 +1740,7 @@ tests=(
   test_the_series_is_read_for_the_gated_head
   test_an_unread_or_partial_series_says_the_scan_did_not_run
   test_the_series_is_scanned_whatever_the_base
-  test_a_squash_with_its_own_body_does_not_read_the_series
+  test_the_series_is_scanned_whatever_the_merge_method
   test_a_deferred_merge_says_the_series_is_unbound
 )
 

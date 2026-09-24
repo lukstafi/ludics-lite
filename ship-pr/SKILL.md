@@ -228,9 +228,9 @@ body's rule to each message, naming the commit and the line. A message is not Ma
 text GitHub reads whole, so a quoted, fenced or indented line is read there too and is reported as
 closing, not as an example; a lone `Closes #N` stays silent, since that is how a commit really
 closes the PR's own issue. It runs whatever the PR's base, because a commit keyword binds whenever
-the commit reaches the default branch, and is skipped only where the messages do not land: a
-`--squash` given its own `--body`, or one on a repository whose squash default is the PR body or
-blank. It warns and does not refuse: the fix is rewording the commit and
+the commit reaches the default branch, and whatever the merge method: a `--squash` that replaces
+the messages draws a warning about messages that will not land, since reading which squash does is
+parsing `gh`'s flags. It warns and does not refuse: the fix is rewording the commit and
 force-pushing, which moves the head, and a refusal would charge that on every deliberate close too.
 
 Report the URL on its own line, wrapped as below. The Claude Desktop client renders a live status
