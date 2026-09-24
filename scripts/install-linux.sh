@@ -75,6 +75,10 @@ private_fingerprint() {
   printf '%s' "$fp"
 }
 
+# OpenSSH ignores a private key with any group or other permission; private_fingerprint's 0600
+# copy cannot see the original's mode, so it is read here (`ls -ln`, GNU and BSD alike).
+private_key_mode_ok() { case "$(ls -ln "$1" 2>/dev/null)" in "-rw------- "*|"-r-------- "*) ;; *) return 1 ;; esac; }
+
 clone_if_missing() {
   local repo=$1 dest=$2
   if [[ -e $dest || -L $dest ]]; then
@@ -430,6 +434,8 @@ main() {
       ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519" -C "$(id -un)@$box"
     fi
     [[ -f $HOME/.ssh/id_ed25519 && -f $HOME/.ssh/id_ed25519.pub ]] || fail 'Need both halves of ~/.ssh/id_ed25519; configure your existing key manually.'
+    private_key_mode_ok "$HOME/.ssh/id_ed25519" ||
+      fail 'OpenSSH ignores a private key others can read: chmod 600 ~/.ssh/id_ed25519, then rerun.'
     [[ $(private_fingerprint "$HOME/.ssh/id_ed25519") == "$(ssh-keygen -l -f "$HOME/.ssh/id_ed25519.pub" | awk '{print $2}')" ]] ||
       fail 'The public key ~/.ssh/id_ed25519.pub does not match its private key; configure your existing key manually.'
     printf 'For a passphrase-protected key, load ssh-agent before running unattended workers.\n'

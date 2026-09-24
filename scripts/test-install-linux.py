@@ -85,6 +85,10 @@ class BootstrapSafety(unittest.TestCase):
         self.run_shell("printf 'source env\\nreturn\\n' > real; ln -s real rc; source_at_start rc 'source env'")
         self.assertEqual((self.root / 'real').read_text(), 'source env\nreturn\n')
 
+    def test_private_key_mode_ok_refuses_a_key_others_can_read(self):
+        self.run_shell("touch k; chmod 600 k; private_key_mode_ok k; chmod 400 k; private_key_mode_ok k; "
+                       "chmod 644 k; ! private_key_mode_ok k; chmod 640 k; ! private_key_mode_ok k")
+
     def test_private_fingerprint_ignores_the_sibling_public_key(self):
         self.run_shell("scratch=$PWD; ssh-keygen -q -t ed25519 -N pw -f a; ssh-keygen -q -t ed25519 -N '' -f b; "
                        "mv b.pub a.pub; test \"$(private_fingerprint a)\" != \"$(ssh-keygen -l -f a.pub | awk '{print $2}')\"; "
