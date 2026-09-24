@@ -175,8 +175,9 @@ keep_last_reflog_entry() {
 # refs/heads/topic still existed when the push was sent. Restores are pushes too, so an empty log
 # proves the remote was never deleted and put back. Its boundary: a pre-push hook sees only pushes
 # Git runs hooks for, so a push from another repository, or one sent with --no-verify, is not
-# recorded; the helper sends neither, and the fixture pushes after `setup_case` use --no-verify so
-# the log holds the helper's pushes alone. The paths are written into the hook, so the helper needs
+# recorded; the helper sends neither. A case's own push from this repository before an
+# `assert_topic_preserved` uses --no-verify, so the log holds the helper's pushes alone; one that
+# does not goes red on the assertion, not green. The paths are written into the hook, so the helper needs
 # no environment of the case's to run it, and `CASE_PUSH_LOG_HOOK` keeps the installed text for
 # `assert_topic_preserved` to check it was not replaced.
 install_push_log_hook() {
@@ -2217,7 +2218,7 @@ test_initialized_master_submodule_refusal() {
   git -c protocol.file.allow=always -C "$CASE_MASTER_OWNER" submodule add \
     "$sub_remote" nested >/dev/null
   git -C "$CASE_MASTER_OWNER" commit -m "add initialized master submodule" >/dev/null
-  git -C "$CASE_MASTER_OWNER" push origin master >/dev/null
+  git -C "$CASE_MASTER_OWNER" push --no-verify origin master >/dev/null
   local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
   git -C "$CASE_INTEGRATOR" pull --ff-only origin master >/dev/null
   echo next >>"$sub_seed/payload"
