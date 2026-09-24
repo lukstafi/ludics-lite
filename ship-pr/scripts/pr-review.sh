@@ -4742,21 +4742,24 @@ warn_multi_close() { # <pr> [again]; always 0 -- a warning that can refuse a mer
 # skipped on a base that is not the default branch, where the body scan is: a body keyword binds
 # only on its own merge, while a commit keyword binds whenever that commit reaches the default
 # branch, and a merge into a staging branch is the last point at which rewording it is cheap. Nor
-# does the merge method switch it off, with ONE exception cmd_merge makes: --rebase lands the series
-# as it is, and a --squash message GitHub composes quotes it, but a --squash given its own --body
-# replaces every message.
+# does the merge method switch it off, except where cmd_merge knows the messages do not land:
+# --rebase lands the series as it is, and a --squash message GitHub composes quotes it when the
+# repository's squash default is COMMIT_MESSAGES, but a --squash given its own --body, or on a
+# repository whose default is the PR body or blank, replaces every message.
 #
-# Read ONCE per merge, up front for lead time -- a finding is fixed by a push, which is better made
-# before a --wait than after it. A merge attempt is bound to the gated head, so the series cannot
-# change between attempts; cmd_merge reads it again (`again`) only when the head it was read for is
-# not the head the gate settled on, and that read withdraws or supersedes whatever the first one
-# printed. SERIES_HEAD is the head read, empty when the read did not complete; SERIES_SAID is
-# nonempty when the last completed read printed findings.
-SERIES_HEAD=""
-SERIES_SAID=""
-warn_series_close() { # <pr> [again]; always 0 -- a warning that can refuse a merge is a gate
-  local meta count head last rows n=0 row sha msg scan rc class cnt refs sent findings="" again="${2:-}"
-  SERIES_HEAD=""
+# Read ONCE per merge, AFTER the gate and any --wait, for the head the merge is bound to and the base
+# the PR has then. A lead-time read before the wait stood here for a round, and it was about a series
+# that a push or a retarget during the wait could replace: it needed a second read, a withdrawal of
+# what the first had printed, and a base comparison on top (review rounds 1 and 2). One late read is
+# about what lands, and every attempt after it is bound to that head by --match-head-commit. What
+# it gives up is lead time, which for this finding is small: its fix is a push, and a push restarts
+# the gate whenever it is made. The window it leaves is a retarget between this read and the merge
+# call, the same seconds-wide window the body re-scan leaves around the call.
+# The head whose series the last scan read whole, for the deferred-merge refusal; empty when none.
+SERIES_READ=""
+warn_series_close() { # <pr> <gated head>; always 0 -- a warning that can refuse a merge is a gate
+  local meta count head last rows n=0 row sha msg scan rc class cnt refs sent findings=""
+  SERIES_READ=""
   meta=$(gh_retry read api "repos/$REPO/pulls/$1" --jq '[(.commits|tostring), (.head.sha // "")] | @tsv') || {
     warn "could not read $REPO#$1's commit count ($(gh_err_line)); the commit-series closing-keyword" \
       "scan did NOT run, so nothing here says what the series' messages close."
@@ -4769,6 +4772,11 @@ warn_series_close() { # <pr> [again]; always 0 -- a warning that can refuse a me
   if [ -z "$count" ] || [ -z "$head" ] || [ "$count" -eq 0 ]; then
     warn "$REPO#$1's commit count and head did not parse ('$(printf '%q' "$meta")'); the" \
       "commit-series closing-keyword scan did NOT run."
+    return 0
+  fi
+  if [ "$head" != "$2" ]; then
+    warn "$REPO#$1's head is now ${head:0:8}, not ${2:0:8}, the head the build signal was read for;" \
+      "the commit-series closing-keyword scan did NOT run, and the merge's head binding refuses."
     return 0
   fi
   if [ "$count" -gt 250 ]; then
@@ -4816,20 +4824,8 @@ warn_series_close() { # <pr> [again]; always 0 -- a warning that can refuse a me
       findings="$findings      $sent"$'\n'
     done <<<"$scan"
   done <<<"$rows"
-  SERIES_HEAD="$head"
-  if [ -n "$again" ] && [ -n "$SERIES_SAID" ]; then
-    if [ -z "$findings" ]; then
-      multi_close_say "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#$1's head moved before the gate" \
-        "bound it, and the series that lands (up to ${head:0:8}) carries no finding."
-      SERIES_SAID=""
-      return 0
-    fi
-    multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's head moved before the gate bound it;" \
-      "what the series that lands closes is below, not above."
-  fi
-  SERIES_SAID=""
+  SERIES_READ="$head"
   [ -n "$findings" ] || return 0
-  SERIES_SAID=1
   multi_close_say "CLOSING-KEYWORD WARNING: $REPO#$1's commit series closes issues it does not look" \
     "like it closes:"
   while IFS= read -r row; do
@@ -4846,10 +4842,31 @@ warn_series_close() { # <pr> [again]; always 0 -- a warning that can refuse a me
   return 0
 }
 
+# Whether the merge lands the series' messages, from the forwarded `gh pr merge` flags: not under a
+# --squash given its own body, nor under a --squash left to a repository default of the PR body or
+# blank. A default that cannot be read is taken as the one that lands the messages, so the unread
+# case costs a warning about messages that may not land, never a missed one; so does a combined
+# short form (`-sb`), which is not recognized.
+series_lands() { # <gh pr merge args...>
+  local arg squash="" body="" def
+  for arg in "$@"; do
+    case "$arg" in
+    --squash | -s) squash=1 ;;
+    --body | --body=* | -b | -b?* | --body-file | --body-file=* | -F | -F?*) body=1 ;;
+    esac
+  done
+  [ -n "$squash" ] || return 0
+  [ -z "$body" ] || return 1
+  def=$(gh_retry read api "repos/$REPO" --jq '.squash_merge_commit_message // ""') || return 0
+  case "$def" in PR_BODY | BLANK) return 1 ;; esac
+  return 0
+}
+
 cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
   local override="" wait_for=0 allow_no_verdict="" require_green="" gate out rc err attempt=1 mergeable state arg
+  local series=""
   local -a gh_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -4922,20 +4939,6 @@ cmd_merge() {
   # FIRST thing on screen rather than the last: warn_base_drift keeps the position just before the
   # merge call, where its comment says it belongs.
   warn_multi_close "$PR_NUM"
-  # The commit series, once per merge and up front for the same lead time (ludics-lite#296; see
-  # warn_series_close). Read again below only if the gate settles on another head. Not read at all
-  # when a --squash is given its own --body: that body replaces every message of the series. The
-  # flags are matched as gh spells them singly; a combined short form (`-sb`) is not recognized,
-  # which costs a warning about messages that will not land, never a missed one.
-  local squash="" squash_body="" series_lands=1
-  for arg in "${gh_args[@]}"; do
-    case "$arg" in
-    --squash | -s) squash=1 ;;
-    --body | --body=* | -b | -b?* | --body-file | --body-file=* | -F | -F?*) squash_body=1 ;;
-    esac
-  done
-  [ -z "$squash" ] || [ -z "$squash_body" ] || series_lands=""
-  [ -z "$series_lands" ] || warn_series_close "$PR_NUM"
   # A merge queue turns `gh pr merge` into an ENQUEUE — the PR lands later, on whatever head it
   # has then, and --disable-auto does not take an entry out of a queue. A close-out merge lands
   # the gated head now or refuses, so on a queued base it refuses before calling merge at all:
@@ -4994,15 +4997,18 @@ cmd_merge() {
       "filters), get one onto it (gh workflow run) or hand the merge to the maintainer with" \
       "the record; a close-out merge is never made by dropping --require-green."
   fi
-  # A push before the gate bound its head leaves the scan above about a series that will not land.
-  # --match-head-commit keeps every attempt below on CHECK_SHA, so this is the last read it needs.
-  [ -z "$series_lands" ] || [ "$SERIES_HEAD" = "$CHECK_SHA" ] || warn_series_close "$PR_NUM" again
   # Last, so that it is read AFTER a --wait (the base keeps moving during one) and so that its
   # verdict is read late, with only the closing-keyword re-scan below it. A loud WARNING, not a gate: the
   # roll-forward policy (ahrefs/ocannl#861, see warn_base_drift) lets a clean merge proceed on the
   # head's green run, and hands semantic drift to the post-merge integration loop. A 3 (unread)
   # has already said UNKNOWN loudly; neither outcome blocks the merge.
   warn_base_drift "$PR_NUM" || true
+  # The commit series, ONCE per merge, for the gated head (ludics-lite#296; see warn_series_close),
+  # unless the merge method replaces every message.
+  if series_lands "${gh_args[@]}"; then
+    series=1
+    warn_series_close "$PR_NUM" "$CHECK_SHA"
+  fi
   # The verdict above is about ONE head, the one gate_checks read — and a --wait is minutes to
   # hours long, during which a push can move the PR. `gh pr merge` merges whatever the head is at
   # the moment of the call; --match-head-commit makes it refuse unless that is still the gated
@@ -5118,7 +5124,17 @@ cmd_merge() {
   fi
   fail 1 "$REPO#$PR_NUM is not merged ($state) — \`gh pr merge\` returned having only enabled" \
     "auto-merge. It will land when the base's required checks pass; do not treat it as landed." \
-    "$(multi_close_deferred_note)"
+    "$(multi_close_deferred_note)${series:+ $(series_deferred_note)}"
+}
+
+# The series half of the deferred-merge refusal (review round 2): --match-head-commit binds only the
+# ENABLE of an auto-merge, so a push before it fires lands a series this scan never read.
+series_deferred_note() {
+  if [ -n "$SERIES_READ" ]; then
+    printf '%s' "The commit-series scan read the series up to ${SERIES_READ:0:8}; a push before the auto-merge fires lands messages nothing here reads."
+  else
+    printf '%s' "And the commit-series scan did NOT read the series, so nothing here says what its messages close when it lands."
+  fi
 }
 
 # A branch name is data, not URL structure: `release#1` and `release&one` are valid refs, but

@@ -49,7 +49,7 @@ THREADS_JSON='[]'                      # the PR's review threads (review_thread 
 THREADS_JSON_LATER=""                  # nonempty = what the SECOND threads read on answers with
 FAIL_GRAPHQL=""                        # nonempty = the review-threads read gets a 503
 SERIES_JSON=""                         # the PR's commits as the endpoint serves them (see reset)
-SERIES_JSON_FIRST=""                   # nonempty = what the FIRST series read answers with instead
+SQUASH_DEFAULT=COMMIT_MESSAGES         # the repository's squash_merge_commit_message ("-" = 404)
 SERIES_COUNT=""                        # nonempty = the commit count the PR states, over the rows'
 SERIES_FAIL=""                         # nonempty = the commits read answers with a 503
 # The "from the SECOND read on" switches above are counted by the lib's fixture_call_count, under
@@ -91,9 +91,8 @@ gh() {
     # commits read serves, so the two agree unless a case says otherwise.
     *'.commits|tostring'*)
       printf 'CALL commits-count\n' >>"$CALLS_FILE"
-      reads=$(fixture_call_count series-count) || return 1
       gh_fixture_parse "$@"
-      gh_fixture_answer "$(series_answer "$reads" |
+      gh_fixture_answer "$(printf '%s\n' "$SERIES_JSON" |
         jq -c --arg c "$SERIES_COUNT" '{commits: (if $c == "" then length else ($c | tonumber) end), head: {sha: .[-1].sha}}')"
       ;;
     *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
@@ -125,6 +124,17 @@ gh() {
     esac
     ;;
   "api repos/$REPO")
+    case "$*" in
+    *squash_merge_commit_message*)
+      printf 'CALL squash-default\n' >>"$CALLS_FILE"
+      if [ "$SQUASH_DEFAULT" = - ]; then
+        printf 'gh: Not Found (HTTP 404)\n' >&2
+        return 1
+      fi
+      printf '%s\n' "$SQUASH_DEFAULT"
+      return 0
+      ;;
+    esac
     reads=$(fixture_call_count default-branch) || return 1
     if [ -n "$DEFAULT_BRANCH_FAIL_LATER" ] && [ "$reads" -ge 2 ]; then
       printf 'gh: Not Found (HTTP 404)\n' >&2
@@ -140,13 +150,12 @@ gh() {
     case "$*" in
     *"repos/$REPO/pulls/7/commits"*)
       printf 'CALL commits\n' >>"$CALLS_FILE"
-      reads=$(fixture_call_count series) || return 1
       if [ -n "$SERIES_FAIL" ]; then
         printf 'gh: 503 No server is currently available to service your request\n' >&2
         return 1
       fi
       gh_fixture_parse "$@"
-      gh_fixture_answer "$(series_answer "$reads")"
+      gh_fixture_answer "$SERIES_JSON"
       ;;
     *) bail "unexpected paginated read: $*" ;;
     esac
@@ -188,15 +197,6 @@ gh() {
     ;;
   *) bail "unexpected fixture gh call: $*" ;;
   esac
-}
-
-# The series the <n>th read of it answers with: SERIES_JSON_FIRST on the first when a case sets it.
-series_answer() { # <n>
-  if [ -n "$SERIES_JSON_FIRST" ] && [ "$1" -eq 1 ]; then
-    printf '%s\n' "$SERIES_JSON_FIRST"
-  else
-    printf '%s\n' "$SERIES_JSON"
-  fi
 }
 
 # One commit of a series, as the commits endpoint serves it.
@@ -251,7 +251,7 @@ reset() {
   THREADS_JSON_LATER=""
   FAIL_GRAPHQL=""
   SERIES_JSON="[$(commit_row head-sha 'A commit with nothing to close.')]"
-  SERIES_JSON_FIRST=""
+  SQUASH_DEFAULT=COMMIT_MESSAGES
   SERIES_COUNT=""
   SERIES_FAIL=""
 }
@@ -1579,39 +1579,39 @@ test_a_squash_with_its_own_body_does_not_read_the_series() {
   SERIES_JSON="[$(commit_row head-sha 'Resolves #43 and #44')]"
   run_merge -- --squash
   assert_contains "$MERGE_STDOUT" "commit head-sha: ONE sentence, 2 issues: #43 #44" \
-    "a squash message GitHub composes quotes the series"
+    "a squash message GitHub composes from the commit messages quotes the series"
+  # Review round 2: the composed message is the repository's default, and two of its three values
+  # carry no commit message at all. One that cannot be read is taken as the one that does.
+  for SQUASH_DEFAULT in PR_BODY BLANK; do
+    run_merge -- --squash
+    assert_not_contains "$MERGE_OUTPUT" "#43" "a $SQUASH_DEFAULT squash default lands no message"
+    assert_eq "$(grep -c -x 'CALL commits-count' "$CALLS_FILE")" 0 "and nothing is read for it"
+  done
+  SQUASH_DEFAULT=-
+  run_merge -- --squash
+  assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #43 #44" "an unread default is scanned"
+  run_merge
+  assert_eq "$(grep -c -x 'CALL squash-default' "$CALLS_FILE")" 0 "a --merge never reads the default"
   reset
   SERIES_JSON="[$(commit_row head-sha 'Resolves #43 and #44')]"
   run_merge -- --merge --body=Merged.
   assert_contains "$MERGE_STDOUT" "ONE sentence, 2 issues: #43 #44" "a --body without --squash replaces nothing"
 }
 
-# Review round 1. The lead-time scan's findings are about the head it read; when the gate settles on
-# another, the second read withdraws them or says the new ones supersede them, rather than leaving
-# a warning about commits that no longer land standing in the transcript.
-test_a_moved_head_withdraws_or_supersedes_the_lead_time_findings() {
+# Review round 2. `gh pr merge` can return having only ENABLED auto-merge, which
+# --match-head-commit binds at enable time only: a push before it fires lands a series nothing read.
+test_a_deferred_merge_says_the_series_is_unbound() {
   reset
-  SERIES_JSON_FIRST="[$(commit_row old-sha 'Resolves #51 and #52')]"
-  SERIES_JSON="[$(commit_row head-sha 'Reworded, nothing to close')]"
+  MERGE_STATE="merged=false state=OPEN"
   run_merge
-  assert_eq "$MERGE_RC" 0 "the merge lands ($MERGE_OUTPUT)"
-  assert_contains "$MERGE_STDOUT" "commit old-sha: ONE sentence, 2 issues: #51 #52" "the lead-time finding"
-  assert_contains "$MERGE_STDOUT" "CLOSING-KEYWORD WARNING WITHDRAWN: $REPO#7's head moved before the gate bound it" \
-    "is withdrawn when the series that lands is clean"
+  assert_eq "$MERGE_RC" 1 "a deferred merge is exit 1"
+  assert_contains "$MERGE_OUTPUT" "read the series up to head-sha; a push before the auto-merge fires lands messages nothing here reads" \
+    "the refusal says the series scan does not bind the landing head"
   reset
-  SERIES_JSON_FIRST="[$(commit_row old-sha 'Resolves #51 and #52')]"
-  SERIES_JSON="[$(commit_row head-sha 'Resolves #53 and #54')]"
+  MERGE_STATE="merged=false state=OPEN"
+  SERIES_FAIL=1
   run_merge
-  assert_contains "$MERGE_STDOUT" "what the series that lands closes is below, not above" \
-    "and superseded when it carries findings of its own"
-  assert_contains "$MERGE_STDOUT" "commit head-sha: ONE sentence, 2 issues: #53 #54" "which are printed"
-  assert_not_contains "$MERGE_STDOUT" "WITHDRAWN" "without a withdrawal"
-  # Nothing said, nothing withdrawn: a clean lead-time read stays silent when the head moves.
-  reset
-  SERIES_JSON_FIRST="[$(commit_row old-sha 'Nothing')]"
-  SERIES_JSON="[$(commit_row head-sha 'Still nothing')]"
-  run_merge
-  assert_not_contains "$MERGE_OUTPUT" "CLOSING-KEYWORD" "a clean series moved to a clean series is silent"
+  assert_contains "$MERGE_OUTPUT" "commit-series scan did NOT read the series" "and never claims a read that failed"
 }
 
 # The legitimate shape: a commit that really closes the PR's own issue is silent, as a body's lone
@@ -1649,18 +1649,24 @@ test_the_series_is_read_once_across_merge_attempts() {
   assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 1 "on one series read"
 }
 
-# A push before the gate bound its head: the lead-time scan read a series that will not land, so the
-# series is read again for the head the merge is bound to, and that read's findings are the ones
-# printed after it.
-test_a_head_moved_before_the_gate_rereads_the_series() {
+# The series is read AFTER the gate, for the head the merge is bound to: a PR whose head is no longer
+# the gated one is a series that will not land, and the merge's head binding refuses it anyway, so
+# the scan says it did not run rather than reading it (review round 2 moved the read here).
+test_the_series_is_read_for_the_gated_head() {
   reset
-  SERIES_JSON_FIRST="[$(commit_row old-sha 'Nothing here')]"
-  SERIES_JSON="[$(commit_row old-sha 'Nothing here'),$(commit_row head-sha 'Resolves #31 and #32')]"
+  SERIES_JSON="[$(commit_row head-sha 'Nothing'),$(commit_row pushed-sha 'Resolves #31 and #32')]"
   run_merge
-  assert_eq "$MERGE_RC" 0 "the merge lands ($MERGE_OUTPUT)"
-  assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 2 "the series is read again for the gated head"
-  assert_contains "$MERGE_STDOUT" "commit head-sha: ONE sentence, 2 issues: #31 #32" \
-    "and the new commit's finding is reported"
+  assert_contains "$MERGE_OUTPUT" "head is now pushed-s, not head-sha, the head the build signal was read for" \
+    "a series past the gated head is not scanned"
+  assert_contains "$MERGE_OUTPUT" "scan did NOT run" "and says so"
+  assert_not_contains "$MERGE_OUTPUT" "#31" "without reporting a series that will not land"
+  assert_eq "$(grep -c -x 'CALL commits' "$CALLS_FILE")" 0 "nor reading its rows"
+  # The read follows the gate: its count read comes after warn_base_drift, the gate's last word.
+  reset
+  run_merge
+  local order
+  order=$(grep -n 'warn_base_drift\|commits-count' "$CALLS_FILE" | cut -d: -f2 | tr '\n' ',')
+  assert_eq "$order" "CALL warn_base_drift,CALL commits-count," "the series is read after the gate"
 }
 
 # The series is read WHOLE or not at all, and a scan that did not run says so rather than going
@@ -1765,11 +1771,11 @@ tests=(
   test_a_commit_closing_the_pr_own_issue_is_silent
   test_a_commit_message_is_read_as_written
   test_the_series_is_read_once_across_merge_attempts
-  test_a_head_moved_before_the_gate_rereads_the_series
+  test_the_series_is_read_for_the_gated_head
   test_an_unread_or_partial_series_says_the_scan_did_not_run
   test_the_series_is_scanned_whatever_the_base
   test_a_squash_with_its_own_body_does_not_read_the_series
-  test_a_moved_head_withdraws_or_supersedes_the_lead_time_findings
+  test_a_deferred_merge_says_the_series_is_unbound
 )
 
 run_tests "${tests[@]}"

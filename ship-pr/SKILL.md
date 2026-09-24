@@ -221,14 +221,16 @@ The same holds for COMMIT MESSAGES: this repository merges with `--merge`, so th
 the default branch, and a keyword in a message closes exactly as one in the body does — PR #274's
 first commit quoted the incident sentence above as an illustration and would have closed both
 issues again. Never quote a closing keyword with an issue number in a commit message. `merge` reads
-the series once (the commits endpoint, whole or not at all: over its 250-commit cap, or with rows
-that disagree with the PR's stated count and head, it says the scan did NOT run) and applies the
+the series once, after the build gate and for the head the merge is bound to (the commits endpoint,
+whole or not at all: over its 250-commit cap, or with rows that disagree with the PR's stated count
+and head, it says the scan did NOT run), and applies the
 body's rule to each message, naming the commit and the line. A message is not Markdown but plain
 text GitHub reads whole, so a quoted, fenced or indented line is read there too and is reported as
 closing, not as an example; a lone `Closes #N` stays silent, since that is how a commit really
 closes the PR's own issue. It runs whatever the PR's base, because a commit keyword binds whenever
-the commit reaches the default branch, and is skipped only for a `--squash` given its own `--body`,
-which replaces every message. It warns and does not refuse: the fix is rewording the commit and
+the commit reaches the default branch, and is skipped only where the messages do not land: a
+`--squash` given its own `--body`, or one on a repository whose squash default is the PR body or
+blank. It warns and does not refuse: the fix is rewording the commit and
 force-pushing, which moves the head, and a refusal would charge that on every deliberate close too.
 
 Report the URL on its own line, wrapped as below. The Claude Desktop client renders a live status

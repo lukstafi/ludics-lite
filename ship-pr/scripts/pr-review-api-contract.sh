@@ -577,12 +577,18 @@ if [ -n "$STALE_BASE_PR" ]; then
   # warn_series_close's reading (ludics-lite#296): the PR's stated count leads the rows, and the
   # last row is the head -- a count that stopped agreeing would make every scan say it did not run.
   # Paginated as the reader is, and the pages' arrays joined, so an anchor of 101-250 commits is
-  # judged on its whole series rather than on its first page (review round 1).
-  series=$(api --paginate "repos/$REPO/pulls/$STALE_BASE_PR/commits?per_page=100" |
-    jq -cs 'if length > 0 and all(.[]; type == "array") then add else null end')
-  pin "pulls/<n>/commits serves as many rows as the PR's .commits, oldest first, each with a sha and a string commit.message, the last one the PR's head (warn_series_close's shape)" \
-    '(length == $n) and all(.[]; (.sha | test($hex)) and (.commit.message | type == "string")) and (.[-1].sha == $head)' \
-    "$series" --argjson n "$(jq '.commits // -1' <<<"$pr")" --arg hex "$HEX40" --arg head "$head_sha"
+  # judged on its whole series rather than on its first page (review round 1). Past the endpoint's
+  # 250 cap the reader refuses to scan, so the claim is not made there either (round 2).
+  series_n=$(jq '.commits // -1' <<<"$pr")
+  if [ "$series_n" -gt 250 ] 2>/dev/null; then
+    skip "pulls/<n>/commits agrees with the PR's .commits" "#$STALE_BASE_PR has $series_n commits, past the endpoint's 250 cap, where warn_series_close refuses to scan; an anchor under the cap pins this claim"
+  else
+    series=$(api --paginate "repos/$REPO/pulls/$STALE_BASE_PR/commits?per_page=100" |
+      jq -cs 'if length > 0 and all(.[]; type == "array") then add else null end')
+    pin "pulls/<n>/commits serves as many rows as the PR's .commits, oldest first, each with a sha and a string commit.message, the last one the PR's head (warn_series_close's shape)" \
+      '(length == $n) and all(.[]; (.sha | test($hex)) and (.commit.message | type == "string")) and (.[-1].sha == $head)' \
+      "$series" --argjson n "$series_n" --arg hex "$HEX40" --arg head "$head_sha"
+  fi
   parent1=""
   if is_sha "$base_sha" && is_sha "$merge_sha" && is_sha "$head_sha"; then
     merge_commit=$(api "repos/$REPO/commits/$merge_sha")
