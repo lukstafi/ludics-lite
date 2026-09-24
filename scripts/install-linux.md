@@ -67,8 +67,8 @@ does not tell us the target Unix username.
 - A line ending `env.sh` that sources `~/.config/fleet/gh-token.sh` (`export GH_TOKEN=ghp_...`,
   mode 0600): the fleet's one GitHub PAT, copied from the anchor by hand, never written by the
   installer. Per-box `gh auth login` tokens revoked each other (GitHub keeps 10 OAuth tokens
-  per user and app). Copy it with `ssh <box> 'umask 077; cat > ~/.config/fleet/gh-token.sh' <
-  ~/.config/fleet/gh-token.sh`; the login step then runs `gh auth setup-git`.
+  per user and app). Copy it with `ssh <box> 'mkdir -p ~/.config/fleet; f=~/.config/fleet/gh-token.sh; umask 077; cat > "$f.new" && chmod 600 "$f.new" && mv "$f.new" "$f"'
+  < ~/.config/fleet/gh-token.sh`; the login step then runs `gh auth setup-git`.
 - Optional interactive Codex/Claude login, git routed through the PAT, and SSH key provisioning.
   If Codex login cannot open a callback over SSH, use `codex login --device-auth`.
 - Optional `~/ocannl-staging`, upstream `ahrefs/ocannl`, a named OCaml **5.5.1**

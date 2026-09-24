@@ -57,6 +57,20 @@ class MeshSafety(unittest.TestCase):
         self.assertIn('User bob', (self.sshdir / 'fleet.conf').read_text())
         self.assertTrue((self.sshdir / 'fleet.conf').read_text().endswith('Host *\n'))
 
+    def test_rerun_tightens_a_loosened_mode_on_unchanged_content(self):
+        self.apply()
+        (self.sshdir / 'config').chmod(0o664)
+        self.apply()
+        self.assertEqual((self.sshdir / 'config').stat().st_mode & 0o777, 0o600)
+
+    def test_default_key_without_public_half_refused(self):
+        home = Path(self.tmp.name) / 'home'
+        (home / '.ssh').mkdir(parents=True)
+        (home / '.ssh/id_ed25519').write_text('private')
+        with patch.object(peers.Path, 'home', return_value=home):
+            with self.assertRaisesRegex(RuntimeError, 'Missing public key'):
+                peers.collect('hub', True, True)
+
     def test_restricted_existing_key_not_broadened(self):
         original = 'restrict,from="100.0.0.1" ' + self.keys[2]
         self.assertEqual(peers.add_authorized(original, [self.keys[2]]), original)

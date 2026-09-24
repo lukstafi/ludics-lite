@@ -62,6 +62,7 @@ def locked(sshdir):
 def save(path, content):
     regular(path)
     if path.exists() and path.read_text() == content:
+        os.chmod(path, 0o600)  # OpenSSH refuses a loose ~/.ssh/config even when its text is right.
         return
     if path.exists():
         backup = path.with_name(f'{path.name}.fleet-backup.{time.time_ns()}')
@@ -95,6 +96,8 @@ def collect(host, use_default, apply):
                     raise RuntimeError(f'Missing private key {private}; create/repair it manually')
                 run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(private),
                      '-C', f'{host}-fleet'])
+            if use_default and not public.exists():
+                raise RuntimeError(f'Missing public key {public}; recreate it: ssh-keygen -y -f {private} > {public}')
             if not use_default:
                 derived = run(['ssh-keygen', '-y', '-P', '', '-f', str(private)])
                 if public.exists():
@@ -257,6 +260,9 @@ def main():
     if not args.apply:
         print('Read-only plan complete. Run again with --apply to exchange keys and verify every direction.')
         return
+    missing = [item['host'] for item in roster if not item['key']]
+    if missing:
+        raise RuntimeError('No public key collected for ' + ', '.join(missing) + '; nothing was installed')
     for item, (_, target) in zip(roster, targets):
         invoke(target, 'install_mesh', dict(own=item, roster=roster))
         print('Configured:', item['host'], flush=True)

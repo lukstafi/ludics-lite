@@ -62,6 +62,18 @@ class BootstrapSafety(unittest.TestCase):
         self.run_shell("append_line env.sh '. token'; append_line env.sh '. token'")
         self.assertEqual((self.root / 'env.sh').read_text(), 'export A=1\n. token\n')
 
+    def test_append_line_moves_an_earlier_copy_last(self):
+        (self.root / 'env.sh').write_text('. token\nexport GH_TOKEN=stale\n')
+        (self.root / 'env.sh').chmod(0o640)
+        self.run_shell("append_line env.sh '. token'")
+        self.assertEqual((self.root / 'env.sh').read_text(), 'export GH_TOKEN=stale\n. token\n')
+        self.assertEqual((self.root / 'env.sh').stat().st_mode & 0o777, 0o640)
+
+    def test_startup_line_below_an_early_return_moves_first(self):
+        (self.root / 'rc').write_text('return\nsource env\n')
+        self.run_shell("source_at_start rc 'source env'")
+        self.assertEqual((self.root / 'rc').read_text(), 'source env\nreturn\n')
+
     def test_append_line_never_follows_a_symlink_or_creates(self):
         self.run_shell("echo KEEP > real; ln -s real env.sh; append_line env.sh '. token'")
         self.assertEqual((self.root / 'real').read_text(), 'KEEP\n')

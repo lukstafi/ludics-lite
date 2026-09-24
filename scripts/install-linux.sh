@@ -34,7 +34,8 @@ source_at_start() {
   local target=$1 line=$2 tmp
   [[ ! -L $target ]] || fail "Refusing to rewrite symlink $target; add this manually: $line"
   [[ ! -e $target || -f $target ]] || fail "Not a regular file: $target"
-  if [[ -f $target ]] && grep -Fxq "$line" "$target"; then return; fi
+  # Already first is done; present anywhere else (say below an early `return`) is moved up.
+  if [[ -f $target && $(head -n1 "$target") == "$line" ]]; then return; fi
   tmp=$(mktemp "${target}.XXXXXX")
   if [[ -f $target ]]; then
     cp -p "$target" "$target.fleet-backup.$(date +%s).$$"
@@ -42,17 +43,20 @@ source_at_start() {
   else
     chmod 644 "$tmp"
   fi
-  { printf '%s\n' "$line"; if [[ -f $target ]]; then cat "$target"; fi; } > "$tmp"
+  { printf '%s\n' "$line"; if [[ -f $target ]]; then grep -Fxv -- "$line" "$target" || true; fi; } > "$tmp"
   mv "$tmp" "$target"
 }
-# Idempotently end a file with a line. Never creates the file, and never follows a symlink.
+# Idempotently make a line a file's LAST line, so nothing after it can override what it sets;
+# an earlier copy is moved down. Never creates the file, and never follows a symlink.
 append_line() {
-  local target=$1 line=$2
+  local target=$1 line=$2 tmp
   [[ ! -L $target ]] || { printf 'Not rewriting symlink %s; add this line yourself: %s\n' "$target" "$line"; return; }
   [[ -f $target ]] || fail "Missing $target"
-  if grep -Fxq "$line" "$target"; then return; fi
-  if [[ -s $target && -n $(tail -c1 "$target") ]]; then printf '\n' >> "$target"; fi
-  printf '%s\n' "$line" >> "$target"
+  if [[ $(tail -n1 "$target") == "$line" ]]; then return; fi
+  tmp=$(mktemp "${target}.XXXXXX")
+  { grep -Fxv -- "$line" "$target" || true; printf '%s\n' "$line"; } > "$tmp"
+  cat "$tmp" > "$target"  # Rewrite in place: keeps the file's mode and owner.
+  rm -f -- "$tmp"
 }
 
 clone_if_missing() {
@@ -420,7 +424,7 @@ main() {
       . "$HOME/.config/fleet/gh-token.sh"
       gh auth setup-git
     else
-      printf 'No ~/.config/fleet/gh-token.sh. From the anchor: ssh %q '\''umask 077; mkdir -p ~/.config/fleet; cat > ~/.config/fleet/gh-token.sh'\'' < ~/.config/fleet/gh-token.sh\n' "$box"
+      printf 'No ~/.config/fleet/gh-token.sh. From the anchor: ssh %q '\''mkdir -p ~/.config/fleet; f=~/.config/fleet/gh-token.sh; umask 077; cat > "$f.new" && chmod 600 "$f.new" && mv "$f.new" "$f"'\'' < ~/.config/fleet/gh-token.sh\n' "$box"
       printf 'then here: . ~/.config/fleet/gh-token.sh && gh auth setup-git\n'
     fi
     codex login

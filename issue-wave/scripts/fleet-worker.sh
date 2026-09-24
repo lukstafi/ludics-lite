@@ -627,7 +627,7 @@ else
         qbox=$(printf '%q' "$BOX")
         if [ -e "$HOME/.config/fleet/gh-token.sh" ]; then
           case "$BOX" in local) repair="put a live PAT in ~/.config/fleet/gh-token.sh here (export GH_TOKEN=ghp_...), then copy it to the other boxes" ;;
-            *) repair="replace the PAT in ~/.config/fleet/gh-token.sh on $BOX, e.g. from the anchor: ssh $qbox 'umask 077; cat > ~/.config/fleet/gh-token.sh' < ~/.config/fleet/gh-token.sh" ;; esac
+            *) repair="replace the PAT in ~/.config/fleet/gh-token.sh on $BOX, e.g. from the anchor: ssh $qbox 'f=~/.config/fleet/gh-token.sh; umask 077; cat > \"\$f.new\" && chmod 600 \"\$f.new\" && mv \"\$f.new\" \"\$f\"' < ~/.config/fleet/gh-token.sh" ;; esac
           if [ -n "$envtok" ]; then repair="$repair; then restart any tmux server that inherited the old value"
           else repair="this session does not export the token in ~/.config/fleet/gh-token.sh: end $BOX's ~/.config/fleet/env.sh with [ ! -r \"\$HOME/.config/fleet/gh-token.sh\" ] || . \"\$HOME/.config/fleet/gh-token.sh\" (scripts/install-linux.sh adds it)"; fi
         else

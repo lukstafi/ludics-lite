@@ -767,7 +767,7 @@ expect "a rejected token exported in the session names it in the repair" 1 "repa
   env SHIM_GH=401 GH_TOKEN=gho_dead "$FW" preflight testbox --native-claude --no-cross
 # The fleet's PAT file (2026-09-24): a rejected PAT is replaced in the file, never by gh auth login.
 mkdir -p "$HOME/.config/fleet"; printf 'export GH_TOKEN=ghp_dead\n' > "$HOME/.config/fleet/gh-token.sh"
-expect "a rejected PAT from gh-token.sh is replaced from the anchor's file" 1 "repair: replace the PAT in ~/.config/fleet/gh-token.sh on testbox, e.g. from the anchor: ssh testbox 'umask 077; cat > ~/.config/fleet/gh-token.sh' < ~/.config/fleet/gh-token.sh; then restart any tmux server that inherited the old value$" -- \
+expect "a rejected PAT from gh-token.sh is replaced from the anchor's file" 1 "repair: replace the PAT in ~/.config/fleet/gh-token.sh on testbox, e.g. from the anchor: ssh testbox 'f=~/.config/fleet/gh-token.sh; umask 077; cat > .*f.new.* && chmod 600 .*f.new.* && mv .*f.new.*' < ~/.config/fleet/gh-token.sh; then restart any tmux server that inherited the old value$" -- \
   env SHIM_GH=401 GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross
 expect "...and a gh-token.sh the session does not source names the env.sh line" 1 "repair: this session does not export the token in ~/.config/fleet/gh-token.sh: end testbox's ~/.config/fleet/env.sh with .*gh-token.sh.*install-linux.sh adds it)$" -- \
   env -u GH_TOKEN -u GITHUB_TOKEN SHIM_GH=401 "$FW" preflight testbox --native-claude --no-cross
