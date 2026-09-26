@@ -6516,8 +6516,8 @@ cmd_base() {
   local started now beat waited_note="" no_tip_verdict=""
   local records="" rsha rverdict rid rwhen pushless="" pushless_ids=() src_pending=0 src_none=0
   local trig_note interim="" fly tipfly=0 tipfly_ids=() tipfly_names="" uncov_nofly=0 pend_fly=0
-  local interim_green="" interim_name="" interim_why="" pushless_name="" norun_ids=() reround=""
-  local hold_why want rid rstatus
+  local interim_green="" interim_name="" interim_why="" pushless_name="" norun_ids=() rerounds=0
+  local hold_why moved want rid rstatus
   while [ $# -gt 0 ]; do
     case "$1" in
     # Opt in to an INTERIM verdict for a tip whose own push run is still in flight (ludics-lite
@@ -6866,14 +6866,18 @@ cmd_base() {
     # PR head red or not built) adds a line saying why and leaves the tip pending: a PR head's red
     # is not the tip's while the tip's own run is going.
     #
-    # Two checks stand between a green source and the interim (review round 1). A workflow with
-    # no push run on the branch at all (norun) is outside the fold, so the tip may have just ADDED
-    # it and its first run be on its way: each must be shown unable to run on push (its file at
-    # the tip names no push trigger, base_push_trigger), or the tip must have outlived that
-    # workflow's creation window (SHIP_PR_BASE_ABSENT_GRACE, from the tip's own run's creation, the
-    # covered break's clock). And the tip's runs are read again AFTER the source, each by its id:
-    # one that finished meanwhile is the tip's own verdict, and the interim is refused for it —
-    # a --wait folds it next round, and a plain read goes round once more to fold it now.
+    # Two checks stand between a green source and the interim (review round 1), and they hold
+    # back only that green: the source is asked first, so a failed record at the tip is RED
+    # whatever they would say (round 3). A workflow with no push run on the branch at all (norun)
+    # is outside the fold, so the tip may have just ADDED it and its first run be on its way: each
+    # must be shown unable to run on push (its file at the tip names no push trigger,
+    # base_push_trigger), or the tip must have outlived that workflow's creation window
+    # (SHIP_PR_BASE_ABSENT_GRACE, from the tip's own run's creation, the covered break's clock).
+    # And the tip's runs are read again AFTER the source, each by its id: one that finished
+    # meanwhile is the tip's own verdict, and the interim is refused for it. The round is then
+    # taken again AT ONCE, plain read and --wait alike, so the fold reads what finished before any
+    # ceiling can be applied to a stale count (round 3); so is a tip that moved. At most twice
+    # per call, so a runs feed lagging the run it lists cannot spin the loop.
     #
     # Boundary, what it deliberately does not read: a workflow still owed a verdict with no run at
     # the tip (paths-ignore, not created yet) keeps the settle rules below, and so does a run in
@@ -6885,29 +6889,7 @@ cmd_base() {
     if [ -n "$interim" ] && [ "$red" -eq 0 ] && [ "$src_pending" -eq 0 ] && [ "$src_none" -eq 0 ] &&
       [ "$tipfly" -gt 0 ] && [ "$inflight" -eq "$tipfly" ] && [ "$uncov_nofly" -eq 0 ] &&
       { [ "$wait_for" -gt 0 ] || [ "$pend" -gt 0 ]; }; then
-      hold_why=""
-      for want in ${norun_ids[@]+"${norun_ids[@]}"}; do
-        if ! base_push_trigger "${want%%:*}" "$tip"; then
-          hold_why="whether ${want#*:}, which has no push run on $branch, runs on push could not be read ($(gh_err_line))"
-          break
-        fi
-        [ "$BASE_TRIGGER" != pushless ] || continue
-        tip_seen_at=$(awk -F'\t' -v t="$tip" '$5 == t && $6 > best { best=$6 } END { print best }' <<<"$allruns")
-        tip_age=$(age_of "$tip_seen_at")
-        case "$tip_age" in
-        '' | *[!0-9]*)
-          hold_why="${want#*:} may run on push and has no run on $branch, and the tip's age could not be read"
-          break
-          ;;
-        esac
-        if [ "$tip_age" -lt "$ABSENT_GRACE" ]; then
-          hold_why="${want#*:} may run on push and has no run on $branch yet, and the tip is ${tip_age}s old, inside the ${ABSENT_GRACE}s window its first run may still appear in"
-          break
-        fi
-      done
-      if [ -n "$hold_why" ]; then
-        out="${out}           (no interim verdict for $tipfly_names: $hold_why)"$'\n'
-      elif ! tip_named_source "$branch" "$tip" "${tipfly_ids[@]}"; then
+      if ! tip_named_source "$branch" "$tip" "${tipfly_ids[@]}"; then
         out="${out}           (no interim verdict for $tipfly_names: a verdict source could not be read ($(gh_err_line)))"$'\n'
       elif [ "$SRC_VERDICT" = red ] && [ "$SRC_KIND" = b ]; then
         red=$((red + 1))
@@ -6916,34 +6898,55 @@ cmd_base() {
       elif [ "$SRC_VERDICT" != green ]; then
         out="${out}           (no interim verdict for $tipfly_names: $SRC_WHY)"$'\n'
       else
-        hold_why=""
-        for want in "${tipfly_ids[@]}"; do
-          rid=$(awk -F'\t' -v w="${want%%:*}" '$1 == w { print $8; exit }' <<<"$allruns")
-          rstatus=""
-          case "$rid" in '' | *[!0-9]*) ;; *)
-            rstatus=$(gh_retry read api "repos/$REPO/actions/runs/$rid" --jq '.status // "-"') || rstatus=""
-            ;;
-          esac
-          if [ -z "$rstatus" ]; then
-            hold_why="the tip's run of ${want#*:} could not be read again after the source ($(gh_err_line))"
+        interim_name="$SRC_NAME" interim_why="$SRC_WHY" hold_why="" moved=""
+        for want in ${norun_ids[@]+"${norun_ids[@]}"}; do
+          if ! base_push_trigger "${want%%:*}" "$tip"; then
+            hold_why="whether ${want#*:}, which has no push run on $branch, runs on push could not be read ($(gh_err_line))"
             break
           fi
-          if [ "$rstatus" = completed ]; then
-            hold_why="the tip's run of ${want#*:} finished while the source was read, so it is the tip's verdict"
+          [ "$BASE_TRIGGER" != pushless ] || continue
+          tip_seen_at=$(awk -F'\t' -v t="$tip" '$5 == t && $6 > best { best=$6 } END { print best }' <<<"$allruns")
+          tip_age=$(age_of "$tip_seen_at")
+          case "$tip_age" in
+          '' | *[!0-9]*)
+            hold_why="${want#*:} may run on push and has no run on $branch, and the tip's age could not be read"
+            break
+            ;;
+          esac
+          if [ "$tip_age" -lt "$ABSENT_GRACE" ]; then
+            hold_why="${want#*:} may run on push and has no run on $branch yet, and the tip is ${tip_age}s old, inside the ${ABSENT_GRACE}s window its first run may still appear in"
             break
           fi
         done
+        if [ -z "$hold_why" ]; then
+          for want in "${tipfly_ids[@]}"; do
+            rid=$(awk -F'\t' -v w="${want%%:*}" '$1 == w { print $8; exit }' <<<"$allruns")
+            rstatus=""
+            case "$rid" in '' | *[!0-9]*) ;; *)
+              rstatus=$(gh_retry read api "repos/$REPO/actions/runs/$rid" --jq '.status // "-"') || rstatus=""
+              ;;
+            esac
+            if [ -z "$rstatus" ]; then
+              hold_why="the tip's run of ${want#*:} could not be read again after the source ($(gh_err_line))"
+              break
+            fi
+            if [ "$rstatus" = completed ]; then
+              hold_why="the tip's run of ${want#*:} finished while the source was read, so it is the tip's verdict"
+              moved=1
+              break
+            fi
+          done
+        fi
         # The TOCTOU the covered break answers: a merge landing between the round's tip read
         # and here makes this a green for a tip the branch has left.
         if [ -z "$hold_why" ]; then
           confirm=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || confirm=""
-          [ "$confirm" = "$tip" ] || hold_why="the tip moved while the source was read"
+          [ "$confirm" = "$tip" ] || { hold_why="the tip moved while the source was read"; moved=1; }
         fi
         if [ -z "$hold_why" ]; then
-          interim_green=1 interim_name="$SRC_NAME" interim_why="$SRC_WHY"
-        elif [ "$wait_for" -eq 0 ] && [ -z "$reround" ]; then
-          # A plain read has no next round of its own: it takes one, to fold what moved.
-          reround=1
+          interim_green=1
+        elif [ -n "$moved" ] && [ "$rerounds" -lt 2 ]; then
+          rerounds=$((rerounds + 1))
           continue
         else
           out="${out}           (no interim verdict for $tipfly_names: $hold_why)"$'\n'

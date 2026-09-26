@@ -569,7 +569,10 @@ test_interim_waits_out_a_workflow_the_tip_may_have_added() {
   assert_eq "$BASE_RC" 4 "a fresh tip with a workflow that may run on push and has no run is pending"
   assert_contains "$BASE_OUTPUT" "(no interim verdict for ci: nightly may run on push and has no run on $BRANCH yet, and the tip is" \
     "and says which workflow it is waiting out"
-  assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "no source is asked while the window is open"
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "no green while the window is open"
+  # The window holds back only a green: a failed record at the tip is its red regardless (round 3).
+  run_base --interim --integration-records "$(records "$SHA_C	fail	w-integration-7	2026-09-26T09:00:00+00:00")"
+  assert_eq "$BASE_RC" 1 "a failed record at the tip is red even inside a newcomer's window"
   # Its file at the tip names no push: it cannot be the newcomer, and the interim answers.
   WORKFLOW_PATH_2=".github/workflows/nightly.yml"
   YAML_OF_nightly="$PUSHLESS_YAML"
@@ -585,8 +588,9 @@ test_interim_waits_out_a_workflow_the_tip_may_have_added() {
 }
 
 # The tip's runs are read again after the source, each by its id: one that finished meanwhile is
-# the tip's own verdict, never "still running" under an interim green (review round 1). A plain
-# read goes round once more to fold it; a wait folds it on its next round.
+# the tip's own verdict, never "still running" under an interim green (review round 1). Either
+# read takes the round again at once to fold it (round 3), at most twice: this fixture's runs feed
+# never shows the run finish, which is the lagging feed that bound is for.
 test_interim_rereads_the_tips_run_after_the_source() {
   local wait
   for wait in "" --wait=2; do
@@ -600,7 +604,7 @@ test_interim_rereads_the_tips_run_after_the_source() {
   burst_fixture "$BURST_RUNS"
   RUN_7301='{"id":7301,"status":"completed","conclusion":"failure"}'
   run_base --interim
-  assert_eq "$(rounds_polled)" 2 "the plain read went round once more to fold what finished"
+  assert_eq "$(rounds_polled)" 3 "the read went round again at once, and no more than twice"
 }
 
 # An integration record at the tip judged the tip's own tree: under --interim a failed one is the
