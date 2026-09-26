@@ -310,7 +310,8 @@ if is_num "$wid"; then
   pin "workflow_id resolves to a workflow FILE whose name is the run's name (the fold keys on the file, not the display name)" \
     '(.path | startswith(".github/workflows/")) and .name == $wname' "$wf" --arg wname "$wname"
   # The file's own text, which is what `base --wait` reads to decide whether a tip with no run is
-  # one the workflow's paths-ignore excludes (workflow_paths_ignore). It asks for the RAW media
+  # one the workflow's paths-ignore excludes, and whether the workflow still runs on push at all
+  # (base_push_trigger, ludics-lite#401). It asks for the RAW media
   # type, because the JSON envelope's base64 body wants a decoder spelled `-d` on one of this
   # fleet's platforms and `-D` on the other. What can move is the media type being ignored and the
   # envelope arriving anyway: the parser would see one long line of base64, refuse it, and every

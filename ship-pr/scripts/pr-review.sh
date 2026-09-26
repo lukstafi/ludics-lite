@@ -188,7 +188,11 @@
 #                                          # runs go, so the report is an owner's starting point
 #                                          # and not just a workflow name (see base_red_detail);
 #                                          # `.github/workflows/base-watch.yml` runs it daily on
-#                                          # this repository's own main and files what it finds
+#                                          # this repository's own main and files what it finds.
+#                                          # A workflow that no longer runs on push is judged at
+#                                          # the tip by a NAMED source or not at all (ludics-lite
+#                                          # #401): the merged PR's head run, or a coordinator's
+#                                          # [--integration-records <file>] (fleet-worker gate)
 #   pr-review.sh reply <pr> <comment-id>[+<comment-id>...] <body>
 #                                          # the id token poll rendered. A FOLDED entry names
 #                                          # several: the body goes to the first thread and each
@@ -5535,24 +5539,27 @@ END {
   for (i = 1; i <= n; i++) print key_of[i]
 }'
 
-# workflow_path <workflow id>: where that workflow's file lives, or nothing (exit 1).
+# workflow_path <workflow id>: where that workflow's file lives, or nothing — exit 1 when the API
+# answered no or the path is not one to read, 3 when the read itself outlived its retries
+# (gh_retry's own split, which base_push_trigger reads to tell UNKNOWN from an answer).
 workflow_path() {
   local wpath
-  wpath=$(gh_retry read api "repos/$REPO/actions/workflows/$1" --jq '.path // ""') || return 1
+  wpath=$(gh_retry read api "repos/$REPO/actions/workflows/$1" --jq '.path // ""') || return $?
   # One path, and one that stays inside the repository: the value is interpolated into a REST
   # path, so a newline or a traversal in it is a different request, not a workflow file.
   case "$wpath" in '' | *$'\n'* | */../* | ../* | /*) return 1 ;; esac
   printf '%s\n' "$wpath"
 }
 
-# workflow_body <path> <ref>: the file's own text at that ref, or nothing (exit 1). The ref
-# matters: the filter that decides whether a commit gets a run is the one that commit carries.
+# workflow_body <path> <ref>: the file's own text at that ref, or nothing — exit 1 or 3 as
+# workflow_path's. The ref matters: the filter that decides whether a commit gets a run is the one
+# that commit carries.
 workflow_body() {
   local body
   # The raw media type, so the file arrives as itself: the JSON form is base64 whose decoder is
   # spelled `-d` on one of this fleet's two platforms and `-D` on the other.
   body=$(gh_retry read api -H "Accept: application/vnd.github.raw" \
-    "repos/$REPO/contents/$(encode_ref "$1")?ref=$2") || return 1
+    "repos/$REPO/contents/$(encode_ref "$1")?ref=$2") || return $?
   [ -n "$body" ] || return 1
   printf '%s\n' "$body"
 }
@@ -5589,17 +5596,53 @@ workflow_files_at() {
   printf '%s\n' "$raw" | grep -E '\.ya?ml$'
 }
 
-# workflow_paths_ignore <workflow id> <ref>: a workflow's `on: push: paths-ignore` patterns, one
-# per line, or nothing (exit 1) when they cannot be established. cmd_base's reader: it queries one
-# event, `push`, because that is the only event whose runs it folds.
-workflow_paths_ignore() {
-  local wid="$1" ref="$2" wpath body pats
-  wpath=$(workflow_path "$wid") || return 1
-  body=$(workflow_body "$wpath" "$ref") || return 1
-  pats=$(awk -v q="'" -v dq='"' -v want=push -v seq=paths-ignore \
-    "$WORKFLOW_YAML_FILTER" <<<"$body") || return 1
-  [ -n "$pats" ] || return 1
-  printf '%s\n' "$pats"
+# base_push_trigger <workflow id> <tip>: does this workflow's file AT THE TIP declare a `push`
+# trigger at all (ludics-lite#401)? BASE_TRIGGER answers `push`, `pushless` (the file was read,
+# parsed, and names no push event), or `unread` (the API answered that there is no such file, or
+# the narrow WORKFLOW_KEYS reader refused it); BASE_TRIGGER_BODY keeps the file's text for the
+# paths-ignore settle, so one read of the file serves both. Exit 3 when the read outlived its
+# retries: that is UNKNOWN, and it is not remembered.
+#
+# BOUNDARY, as a fail-closed allowlist: `pushless` is claimed only for a file that was read whole
+# and whose `on:` block this reader parsed and found without `push` in any of its three forms
+# (mapping, scalar, flow). Everything else is read as a push workflow, exactly as before #401 —
+# including a `push` whose `branches:` filter does not reach this branch, which this does not
+# evaluate (#176 is why: what a push filter reaches is not answerable from these feeds). So the
+# direction every doubt takes is the old reading, never a new "no verdict" on a push repository.
+#
+# Remembered per <workflow>/<tip> in the current shell, so it must be called outside a command
+# substitution to save the next round its reads.
+BASE_TRIGGER_CACHE=""
+BASE_TRIGGER=""
+BASE_TRIGGER_BODY=""
+base_push_trigger() {
+  local wid="$1" tip="$2" key row wpath body rc evs class
+  key="$wid/$tip"
+  row=$(awk -F'\t' -v k="$key" '$1 == k { print; exit }' <<<"$BASE_TRIGGER_CACHE")
+  if [ -n "$row" ]; then
+    row="${row#*$'\t'}"
+    BASE_TRIGGER="${row%%$'\t'*}"
+    BASE_TRIGGER_BODY=$(jq -r '. // ""' <<<"${row#*$'\t'}")
+    return 0
+  fi
+  body=""
+  class=unread
+  wpath=$(workflow_path "$wid")
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    body=$(workflow_body "$wpath" "$tip")
+    rc=$?
+  fi
+  [ "$rc" -ne 3 ] || return 3
+  [ "$rc" -eq 0 ] || body=""
+  if [ -n "$body" ] && evs=$(awk -v q="'" -v dq='"' -v want= "$WORKFLOW_KEYS" <<<"$body"); then
+    if grep -qx push <<<"$evs"; then class=push; else class=pushless; fi
+  fi
+  BASE_TRIGGER="$class"
+  BASE_TRIGGER_BODY="$body"
+  # The body rides as ONE JSON string, so its newlines and tabs cannot break the row.
+  BASE_TRIGGER_CACHE="${BASE_TRIGGER_CACHE}${key}"$'\t'"${class}"$'\t'"$(jq -Rsc . <<<"$body")"$'\n'
+  return 0
 }
 
 # glob_ere <pattern>: one GitHub path filter as an ERE anchored at both ends, or nothing (exit 1)
@@ -5788,8 +5831,13 @@ tip_within_paths_ignore() {
     hit=$(awk -F'\t' -v k="$key" '$1 == k { print $2; exit }' <<<"$BASE_IGNORE_CACHE")
     if [ -z "$hit" ]; then
       hit=no
-      # The file's path leads the answer; the patterns are the rest of it.
-      pats=$(workflow_paths_ignore "$wfid" "$tip") || pats=""
+      # The file as base_push_trigger read it at the tip (its fold already asked, so this is no
+      # second read); a file it could not read has no filter to offer.
+      pats=""
+      if base_push_trigger "$wfid" "$tip" && [ -n "$BASE_TRIGGER_BODY" ]; then
+        pats=$(awk -v q="'" -v dq='"' -v want=push -v seq=paths-ignore \
+          "$WORKFLOW_YAML_FILTER" <<<"$BASE_TRIGGER_BODY") || pats=""
+      fi
       if [ -n "$pats" ] && commits_ignored "$pats" "$vsha" "$tip"; then
         hit=yes
       fi
@@ -6048,6 +6096,144 @@ head_within_paths_ignore() {
   return 0
 }
 
+# --- a default branch without push CI: the tip's verdict from NAMED sources (ludics-lite#401) --
+# A workflow that used to run on pushes to this branch and whose file at the tip no longer
+# declares `push` (ahrefs/ocannl#1057 drops it from `ci`) leaves its push runs standing forever:
+# `event=push` pages never age out, so the fold would keep presenting the last push run's verdict
+# — days or months old — as the base's. A stale green is worse than none. So such a workflow's
+# push rows are not read as a verdict at all, and the tip's verdict for it comes only from a
+# source this file can NAME, in this order:
+#
+#   (b) an INTEGRATION RECORD: a wave coordinator's own run concluded at exactly the tip, handed
+#       in by `fleet-worker.sh gate` as `--integration-records <file>` (the execution registry is
+#       the anchor's, and this file does not read it). About the tip's own tree, so it goes first,
+#       and a failed one is RED.
+#   (a) the MERGED PR'S HEAD RUN under the roll-forward rule: the tip is GitHub's own merge
+#       commit of one merged pull request into this branch, its second parent is that PR's head,
+#       and the head's build signal — the one `merge` gated on — is green (or red).
+#
+# Anything else is "no verdict", never an older green. Source (c) of the issue, the latest daily
+# sweep record at or after the tip, has no machine-readable form on this side and is not read.
+#
+# Which workflows this applies to is base_push_trigger's allowlist: only one whose push rows
+# exist AND whose file at the tip was read and declares no push. A workflow that never ran on
+# push to this branch is outside it (the fold's `norun`, as before), and a repository whose
+# workflows still run on push reads exactly as it did — every doubt about a file falls that way.
+
+# tip_pr_head_verdict <branch> <tip sha>: source (a), callable on its own (ludics-lite#308 reads a
+# push repository's pending tip through it). Sets TIP_PR_VERDICT to green | red | pending | none,
+# TIP_PR_WHY to the sentence naming the source or saying why there is none, and TIP_PR_NUM /
+# TIP_PR_HEAD when a PR was found. Exit 3 when a read failed — UNKNOWN, which is not "none".
+#
+# "Clean merge" is established from the commit, not assumed: exactly two parents, committed by
+# GitHub itself (`noreply@github.com`) with a signature GitHub verified. GitHub creates a merge
+# commit only for a pull request it can merge without conflict, so its own merge commit carries
+# nothing the head did not; a merge made elsewhere and pushed can carry a conflict resolution the
+# head's run never saw, and so can a squash or a rebase, which keep no head in the history at all.
+# Those three read "none". The PR is the one merged pull request whose merge_commit_sha IS the
+# tip, into THIS branch, whose head is the merge's second parent; more than one, or none, is none.
+TIP_PR_VERDICT=""
+TIP_PR_WHY=""
+TIP_PR_NUM=""
+TIP_PR_HEAD=""
+tip_pr_head_verdict() {
+  local branch="$1" sha="$2" c rc n p1 email verified prs num head bref res line v
+  TIP_PR_VERDICT=none TIP_PR_WHY="" TIP_PR_NUM="" TIP_PR_HEAD=""
+  case "$sha" in '' | *[!0-9a-f]*)
+    TIP_PR_WHY="there is no tip SHA to judge"
+    return 0
+    ;;
+  esac
+  c=$(gh_retry read api "repos/$REPO/commits/$sha" \
+    --jq '[((.parents // []) | length | tostring), (.parents[1].sha // "-"),
+           (.commit.committer.email // "-"), ((.commit.verification.verified // false) | tostring)]
+          | map(if type == "string" and length > 0 then . else "-" end) | @tsv')
+  rc=$?
+  [ "$rc" -eq 0 ] || return 3
+  IFS=$'\t' read -r n p1 email verified <<<"$c"
+  if [ "$n" != 2 ]; then
+    TIP_PR_WHY="the tip ${sha:0:8} is not a merge commit ($n parent(s)), so no PR head's run speaks for it"
+    return 0
+  fi
+  if [ "$email" != noreply@github.com ] || [ "$verified" != true ]; then
+    TIP_PR_WHY="the tip ${sha:0:8} is a merge commit GitHub did not make (committer $email, verified $verified), so it may carry a resolution no PR head's run saw"
+    return 0
+  fi
+  prs=$(gh_retry read api "repos/$REPO/commits/$sha/pulls?per_page=100" \
+    --jq ".[] | select(.merged_at != null and .merge_commit_sha == \"$sha\")
+          | [(.number | tostring), (.head.sha // \"-\"), (.base.ref // \"-\")]
+          | map(if type == \"string\" and length > 0 then . else \"-\" end) | @tsv")
+  rc=$?
+  [ "$rc" -eq 0 ] || return 3
+  if [ "$(printf '%s\n' "$prs" | grep -c .)" -ne 1 ]; then
+    TIP_PR_WHY="no single merged pull request has the tip ${sha:0:8} as its merge commit"
+    return 0
+  fi
+  IFS=$'\t' read -r num head bref <<<"$prs"
+  case "$num" in '' | *[!0-9]*) return 3 ;; esac
+  if [ "$head" != "$p1" ] || [ "$bref" != "$branch" ]; then
+    TIP_PR_WHY="PR #$num merged as the tip ${sha:0:8}, but its head ${head:0:8} is not the merge's second parent or it was merged into '$bref', not '$branch'"
+    return 0
+  fi
+  TIP_PR_NUM="$num"
+  TIP_PR_HEAD="$head"
+  # The head's build signal exactly as `checks`/`merge` judge it. In a command substitution, so
+  # the verdict it sets rides out on the last line, after its status.
+  res=$(gate_checks "$num" 0 2>/dev/null; printf '\n%s\t%s' "$?" "${VERDICT:-}")
+  v="${res##*$'\n'}"
+  line=$(printf '%s\n' "$res" | grep -m1 '^build signal ') || line=""
+  line="${line#build signal }"
+  case "${v#*$'\t'}" in
+  green) TIP_PR_VERDICT=green ;;
+  red | runred) TIP_PR_VERDICT=red ;;
+  pending | unjudged) TIP_PR_VERDICT=pending ;;
+  mixed | absent) TIP_PR_VERDICT=none ;;
+  *) return 3 ;;
+  esac
+  TIP_PR_WHY="PR #$num's head ${head:0:8}, which GitHub merged cleanly as the tip ${sha:0:8} (roll-forward rule): $line"
+}
+
+# The integration records `--integration-records` handed in: "<sha>\t<pass|fail>\t<request
+# id>\t<concluded at>" rows, validated as they were loaded.
+BASE_INTEGRATION_ROWS=""
+
+# tip_named_source <branch> <tip sha>: the tip's verdict from the named sources, (b) then (a).
+# Sets SRC_VERDICT (green | red | pending | none), SRC_WHY, and SRC_NAME (the source in a few words,
+# for the verdict line); exit 3 on UNKNOWN. A settled answer
+# is remembered for its tip, since neither source changes its mind about a commit; a pending one
+# is asked again next round.
+SRC_VERDICT=""
+SRC_WHY=""
+SRC_NAME=""
+SRC_TIP=""
+tip_named_source() {
+  local branch="$1" sha="$2" row rsha verdict rid when
+  if [ -n "$SRC_TIP" ] && [ "$SRC_TIP" = "$sha" ]; then return 0; fi
+  SRC_TIP=""
+  # The newest record at the tip, by its conclusion time (ISO 8601 from one clock, so it sorts
+  # as text): a re-run that passed after a flaky failure is the answer, and so is the reverse.
+  row=$(awk -F'\t' -v s="$sha" '$1 == s' <<<"$BASE_INTEGRATION_ROWS" |
+    LC_ALL=C sort -t$'\t' -k4,4r | head -n1)
+  if [ -n "$row" ]; then
+    IFS=$'\t' read -r rsha verdict rid when <<<"$row"
+    if [ "$verdict" = pass ]; then SRC_VERDICT=green; else SRC_VERDICT=red; fi
+    SRC_WHY="source (b): integration record $rid ran the tip ${rsha:0:8} and concluded $verdict ($when)"
+    SRC_NAME="integration record $rid"
+    SRC_TIP="$sha"
+    return 0
+  fi
+  tip_pr_head_verdict "$branch" "$sha" || return 3
+  SRC_VERDICT="$TIP_PR_VERDICT"
+  SRC_NAME="PR #$TIP_PR_NUM's head run (roll-forward rule)"
+  if [ "$SRC_VERDICT" = none ]; then
+    SRC_WHY="no integration record ran the tip ${sha:0:8}, and $TIP_PR_WHY"
+  else
+    SRC_WHY="source (a): $TIP_PR_WHY"
+  fi
+  [ "$SRC_VERDICT" = pending ] || SRC_TIP="$sha"
+  return 0
+}
+
 cmd_base() {
   local branch="""" tip raw rc line name status sha concl csha cwhen curl red=0 pend=0 out=""
   local allruns="" wfid
@@ -6056,8 +6242,17 @@ cmd_base() {
   local norun=0 tip_seen_at tip_age hold ebranch
   local tip_unjudged=0 unrun_rows="" settle_why
   local started now beat waited_note="" no_tip_verdict=""
+  local records="" rrow rsha rverdict rid rwhen pushless="" src_pending=0 src_none=0 trig_note
   while [ $# -gt 0 ]; do
     case "$1" in
+    # The integration records `fleet-worker.sh gate` hands in (source (b) above). Matched before
+    # the slashed-argument case below, since its value is an absolute path.
+    --integration-records)
+      [ $# -ge 2 ] || die "base: --integration-records takes a file"
+      records="$2"
+      shift
+      ;;
+    --integration-records=*) records="${1#--integration-records=}" ;;
     # First slashed arg is the repo UNLESS one is already named (--repo, REPO=, or an earlier
     # positional): branches carry slashes too (claude/...), and reading one as the repo turns
     # `base --repo owner/name claude/topic` into a 404 on repo "claude/topic".
@@ -6070,6 +6265,20 @@ cmd_base() {
     shift
   done
   case "$wait_for" in '' | *[!0-9]*) die "base: --wait takes seconds, got '$wait_for'" ;; esac
+  # Every row is validated before any of them is believed: a row this cannot read is a caller
+  # that changed shape, and a verdict source that half-parses is refused whole (exit 2), never
+  # skipped — a skipped red would leave an older source to answer for the tip.
+  BASE_INTEGRATION_ROWS="" SRC_TIP="" BASE_TRIGGER_CACHE=""
+  if [ -n "$records" ]; then
+    [ -f "$records" ] && [ -r "$records" ] || die "base: --integration-records: cannot read '$records'"
+    while IFS=$'\t' read -r rsha rverdict rid rwhen || [ -n "$rsha" ]; do
+      [ -n "$rsha$rverdict$rid$rwhen" ] || continue
+      [[ "$rsha" =~ ^[0-9a-f]{40}$ ]] && [[ "$rverdict" =~ ^(pass|fail)$ ]] &&
+        [[ "$rid" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$rwhen" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+Z-]+$ ]] ||
+        die "base: --integration-records: a row is not <sha> <pass|fail> <request id> <concluded at>, tab-separated: $(printf '%q' "$rsha	$rverdict	$rid	$rwhen")"
+      BASE_INTEGRATION_ROWS="${BASE_INTEGRATION_ROWS}${rsha}"$'\t'"${rverdict}"$'\t'"${rid}"$'\t'"${rwhen}"$'\n'
+    done <"$records"
+  fi
   # A --wait sized to outlive the absence grace, but not by a whole round, gets exactly ONE chance
   # at the settle, and a WARNING says so (ludics-lite#175). It is not a refusal, and round 8 is why
   # the first draft's was wrong: the sleep is capped at the remaining ceiling, so the last round is
@@ -6108,7 +6317,7 @@ cmd_base() {
   grace_from=$started
   while :; do
     red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0 norun=0
-    tip_unjudged=0 unrun_rows=""
+    tip_unjudged=0 unrun_rows="" pushless="" src_pending=0 src_none=0
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
     tip=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || tip=""
@@ -6216,6 +6425,25 @@ cmd_base() {
       while IFS=$'\t' read -r name status sha concl csha cwhen curl vconcl vsha vwhen vurl wfid; do
         [ -n "$name" ] || continue
         is_advisory "$name" && continue
+        # A workflow whose newest judged run is NOT about the tip is asked whether its file at
+        # the tip still runs on push (base_push_trigger). One that does not is set aside before
+        # anything is counted: its push rows, even one still running, are about commits from
+        # before the trigger went, and the tip's verdict for it comes from a named source below
+        # (ludics-lite#401). A covered workflow is never asked, so a push repository whose tip
+        # has its run pays nothing for this.
+        trig_note=""
+        if [ -n "$tip" ] && [ "$vsha" != "$tip" ]; then
+          base_push_trigger "$wfid" "$tip" ||
+            fail 3 "could not read $REPO's '$name' workflow file at the tip ${tip:0:8}" \
+              "($(gh_err_line)): whether it still runs on push is UNKNOWN, which is NOT 'green'."
+          if [ "$BASE_TRIGGER" = pushless ]; then
+            pushless="${pushless:+$pushless, }$name"
+            out="${out}  retired  $name — no push trigger at the tip, so its newest judged push run ($vconcl at ${vsha:0:8}) is history, not the tip's verdict"$'\n'
+            continue
+          fi
+          [ "$BASE_TRIGGER" = push ] ||
+            trig_note="           ($name's file at the tip could not be read for its triggers, so it is read as a push workflow)"$'\n'
+        fi
         [ "$status" = completed ] || inflight=$((inflight + 1))
         if [ -n "$tip" ] && [ "$vsha" = "$tip" ]; then
           : # this workflow's newest judged run is about the tip: covered
@@ -6268,7 +6496,7 @@ cmd_base() {
           out="${out}  no verdict  $name — $concl at ${csha:0:8} (stopped, not judged; no earlier judged run in the window)  $curl"$'\n'
           ;;
         esac
-        out="${out}${stopped_note}"
+        out="${out}${stopped_note}${trig_note}"
         # A run whose head is behind the tip is normal here (ci carries paths-ignore: docs/**),
         # but it means the verdict is about an older tree than the one you are about to branch
         # from.
@@ -6279,6 +6507,31 @@ cmd_base() {
           out="${out}           (that verdict is about ${csha:0:8}, not the tip ${tip:0:8})"$'\n'
         fi
       done <<<"$raw"
+      # The workflows set aside above get the tip's verdict from a NAMED source, once for all of
+      # them: both sources judge the tip's tree as a whole, not one workflow of it.
+      if [ -n "$pushless" ]; then
+        tip_named_source "$branch" "$tip" ||
+          fail 3 "could not read a verdict source for $REPO $branch's tip ${tip:0:8}" \
+            "($(gh_err_line)): the tip's verdict is UNKNOWN, which is NOT 'green'."
+        case "$SRC_VERDICT" in
+        green) out="${out}  green    $pushless — $SRC_WHY"$'\n' ;;
+        red)
+          red=$((red + 1))
+          red_at_tip=$((red_at_tip + 1))
+          out="${out}  RED      $pushless — $SRC_WHY"$'\n'
+          ;;
+        pending)
+          pend=$((pend + 1))
+          src_pending=1
+          out="${out}  no verdict  $pushless — not yet: $SRC_WHY"$'\n'
+          ;;
+        *)
+          pend=$((pend + 1))
+          src_none=1
+          out="${out}  no verdict  $pushless — no named source judges the tip: $SRC_WHY"$'\n'
+          ;;
+        esac
+      fi
     fi
     [ "$wait_for" -gt 0 ] || break
     # Only a red AT THE TIP ends the wait early — it is the tip's own verdict. An older tip's red
@@ -6305,7 +6558,10 @@ cmd_base() {
       [ -z "$last_tip" ] || grace_from=$now
       last_tip="$tip"
     fi
-    if [ "$inflight" -eq 0 ] && [ "$uncovered" -eq 0 ]; then
+    # A named source still judging the tip (the merged PR's head run has not concluded) holds the
+    # wait exactly as a run in flight does; one that found NO source does not, since nothing this
+    # wait can receive will supply one, and the report below says so at once.
+    if [ "$inflight" -eq 0 ] && [ "$uncovered" -eq 0 ] && [ "$src_pending" -eq 0 ]; then
       # A listed workflow with NO push runs on the branch (norun) is ambiguous: dispatch- or
       # schedule-only (never coming — staging carries two such smoke workflows, and counting
       # them as uncovered would park EVERY wait on the full grace), or a push workflow the tip
@@ -6359,7 +6615,8 @@ cmd_base() {
     # tip itself just added whose first run is on its way. The FAST settle cannot speak for it —
     # a docs-only diff under one workflow's filter says nothing about a filter nobody read — so
     # only the grace, which is that newcomer's creation window, may settle a repo carrying one.
-    elif [ "$uncovered" -gt 0 ] && [ "$tip_unjudged" -eq 0 ] && [ "$inflight" -eq 0 ]; then
+    elif [ "$uncovered" -gt 0 ] && [ "$tip_unjudged" -eq 0 ] && [ "$inflight" -eq 0 ] &&
+      [ "$src_pending" -eq 0 ]; then
       settle_why=""
       if [ "$norun" -eq 0 ] && tip_within_paths_ignore "$unrun_rows" "$tip"; then
         settle_why="(every commit on the first-parent path from the judged commit up to the tip changes only paths within the paths-ignore of $PATHS_IGNORE_WHY, so no run for it is coming — the verdicts above are about the commit each line names)"
@@ -6423,12 +6680,23 @@ cmd_base() {
     echo "$REPO $branch: no build workflow has run on it (nothing to read, not a green light)"
     return 4
   fi
+  if [ "$src_none" -gt 0 ] || [ "$src_pending" -gt 0 ]; then
+    echo "$REPO $branch: NO VERDICT (tip ${tip:0:8}) — $pushless no longer run(s) on push, and no named source has judged the tip; an older verdict is not the tip's (see above)"
+    printf '%s' "$out"
+    return 4
+  fi
   if [ "$pend" -gt 0 ]; then
     echo "$REPO $branch: NO VERDICT${tip:+ (tip ${tip:0:8})} — some workflow was never judged here; not green, not red"
     printf '%s' "$out"
     return 4
   fi
-  echo "$REPO $branch: green${tip:+ (tip ${tip:0:8})}"
+  # The source rides on the verdict line itself when one was used: "green" over a tip no push run
+  # judged is only as good as what judged it instead (ludics-lite#401).
+  if [ -n "$pushless" ]; then
+    echo "$REPO $branch: green (tip ${tip:0:8}; $pushless judged by $SRC_NAME)"
+  else
+    echo "$REPO $branch: green${tip:+ (tip ${tip:0:8})}"
+  fi
   printf '%s' "$out"
   return 0
 }
@@ -6455,7 +6723,8 @@ main() {
   *) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|rounds|checks|merge|reply|resolve} <pr> ...
   pr-review.sh comment <pr> <body>           # a plain PR comment (a summary round, a review nudge)
   pr-review.sh base [owner/name] [branch] [--wait]  # is the base branch's CI green? (start of
-                                             # work; --wait = post-merge integration read)
+                                             # work; --wait = post-merge integration read;
+                                             # --integration-records <file>: fleet-worker gate's)
   pr-review.sh retry [--read] <gh args...>   # any other gh call, same retry policy
   pr-review.sh retry run watch owner/name#<run-id>  # quiet await of ONE run (never forwarded
                                              # to gh); for a PR prefer: checks <pr> --wait
