@@ -785,7 +785,10 @@ reported only over closed threads (ludics-lite#289): one with an open review thr
 `unresolved`, naming each thread, on the one GraphQL `reviewThreads` read that only an approval
 costs; that read pages to the end, and a connection whose stated count leads its rows, one still
 paging at the cap, a row that did not parse and a GraphQL outage are each `unknown` (exit 3),
-never a clean approval. `test-pr-review-watch.sh` runs PR #277's two-head shape through a watch
+never a clean approval. A 👍 from before the head arrived is not an approval of it (ludics-lite#418):
+one the reviewer's summary row gives another commit, or, with no row read, one older than the head
+commit's date, reads `expected` (or a live 👀's `reviewing`) with no feed read twice, and `watch`
+does not end on it. `test-pr-review-watch.sh` runs PR #277's two-head shape through a watch
 (findings on the previous head scrolled past as NOT about head, the 👍 on the head above it), and
 `test-pr-review-merge.sh` pins `merge` refusing on an open thread (exit 1, no flag bypassing it)
 and on an unread connection (exit 3), with one read per merge attempt, so a thread opened

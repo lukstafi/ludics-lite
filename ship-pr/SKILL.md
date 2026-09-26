@@ -553,12 +553,12 @@ head SHA, and answers with one of eight:
 
 | state | means | what to do |
 | --- | --- | --- |
-| `approved` | 👍 is on the PR, with no newer current-head running review or findings, and no review thread left unresolved | merge |
+| `approved` | 👍 is on the PR and was given for this head, with no newer current-head running review or findings, and no review thread left unresolved | merge |
 | `unresolved` | that same 👍, over review threads still open — whatever head they cite | answer each thread and `resolve` it; `merge` refuses until none is open |
 | `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
 | `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
 | `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) |
-| `expected` | no live 👀, and no review of the head SHA: a round is due and has not started | wait out the grace, then `@codex review` |
+| `expected` | no live 👀, and no review of the head SHA: a round is due and has not started — including a 👍 left from before a push, until the app takes it down | wait out the grace, then `@codex review` |
 | `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push — or, at one of the loop's exits (below), close out and merge |
 | `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
 
@@ -619,7 +619,13 @@ the head is a SHA equality (each review records the `commit_id` it was submitted
 time comparison — a commit's date can long predate the push that delivered it. Whether a 👀 is live
 is judged against the reviewer's own last word, never against the head commit: a 👀 raised just
 before your next push is a round that is genuinely running, and #358 had exactly that shape (👀 at
-20:34:13Z, head committed 20:35:01Z) twenty minutes after #364 had the stale one.
+20:34:13Z, head committed 20:35:01Z) twenty minutes after #364 had the stale one. A 👍 carries no
+commit at all, and the app takes it down only when it raises the 👀 for the next head, minutes after
+the push, so it is matched to the head through the reviewer's summary comment, whose newest Code
+Review row names the commit the app last took up: a 👍 under a row naming another commit is a
+previous head's, and the head reads `expected` (ludics-lite#418). Only where no row is read does a
+clock stand in, and only in the direction a clock can prove: a 👍 older than the head's commit
+date cannot be about it.
 
 The whole polling and merge-gate path is REST: GitHub's GraphQL endpoint 503s independently of REST,
 and a GraphQL-borne silence is indistinguishable from a reviewer's. Review threads are the one

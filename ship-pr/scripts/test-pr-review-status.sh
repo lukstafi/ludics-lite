@@ -1168,6 +1168,112 @@ test_resolve_reaches_every_thread_the_gate_can_name() {
   assert_eq "$rc" 0 "a thread on page 25 is found by the lookup resolve makes"
 }
 
+# --- a 👍 from before the head arrived (ludics-lite#418) --------------------------------------
+# PR #411: the 👍 at 09:49 on the previous head, a push, and `watch` returning `approved` at once for
+# a head nobody had reviewed, until the app's 👀 for it took the 👍 down four minutes later. A 👍
+# older than the head's arrival is that head's `expected`, and the ordinary grace and nudge apply.
+
+# The reviewer's summary comment as the app writes it, one Code Review row naming a commit.
+summary_row() { # <id> <status> <short sha> <datetime>
+  plain_comment "$1" "$4" "<!-- codex-pull-request-review-summary -->
+| Review | Status | Commit | Review trigger |
+| --- | --- | --- | --- |
+| 📝 **Code Review** | ✅ **$2** <relative-time datetime=\"${4%Z}.510504Z\">$4</relative-time> | \`$3\` | New commits |"
+}
+
+# How many times this case read <endpoint>, which is logged without its host.
+endpoint_reads() { # <endpoint below repos/$REPO/>
+  grep -c -x -F "repos/$REPO/$1" "$REQUEST_LOG" || true
+}
+
+test_a_thumbs_up_the_summary_gives_another_head_is_not_an_approval() {
+  reset_fixture
+  HEAD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  # Committed BEFORE the 👍 and pushed after it (#415's head sat nine minutes between the two), so
+  # the commit's date cannot tell; the row, which still names the previous head, does.
+  HEAD_AT=2026-09-01T00:05:00Z
+  REACTIONS_JSON="[$(reaction +1 2026-09-01T00:10:03Z)]"
+  COMMENTS_JSON="[$(summary_row 1 Completed aaaaaaa 2026-09-01T00:10:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a 👍 the summary gives another head does not approve this one"
+  assert_contains "$LINE" "review EXPECTED but not started" "the round for this head is due"
+  assert_contains "$(state_detail "$STATE")" "the 👍 at 2026-09-01T00:10:03Z is for aaaaaaa, per" \
+    "the line says whose 👍 it is"
+  # The fall-through repeats none of the reads the 👍 path made; the commit read is the expected
+  # clock's own.
+  assert_eq "$(endpoint_reads "issues/7/comments?per_page=100")" 1 "one comments read"
+  assert_eq "$(endpoint_reads "pulls/7/reviews?per_page=100")" 1 "one reviews read"
+  assert_eq "$(endpoint_reads pulls/7)" 1 "one PR read"
+  assert_eq "$(endpoint_reads "commits/$HEAD_SHA")" 1 "one commit read"
+  # The control: the row naming this head is its approval, and costs no commit read.
+  COMMENTS_JSON="[$(summary_row 1 Completed bbbbbbb 2026-09-01T00:10:00Z)]"
+  : >"$REQUEST_LOG"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "a 👍 the summary gives this head approves it"
+  assert_eq "$(endpoint_reads "commits/$HEAD_SHA")" 0 "the row decided, so the clock is not read"
+}
+
+test_a_thumbs_up_older_than_the_head_commit_is_not_an_approval() {
+  reset_fixture
+  # No summary row to read, so the head commit's date decides: #411's timeline, the 👍 at 09:49
+  # and the head committed at 10:02.
+  REACTIONS_JSON="[$(reaction +1 2026-09-01T09:49:00Z)]"
+  HEAD_AT=2026-09-01T10:02:11Z
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a 👍 older than the head's commit does not approve it"
+  assert_contains "$(state_detail "$STATE")" "predates head head-sh's commit date 2026-09-01T10:02:11Z" \
+    "the line says why the 👍 was not taken"
+  assert_eq "$(endpoint_reads commits/head-sha)" 1 "the commit is read once, for both uses"
+  # The control: a 👍 newer than the head's commit is its approval.
+  HEAD_AT=2026-09-01T09:40:00Z
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "a 👍 newer than the head's commit approves it"
+}
+
+# Review of #420, round 1: a commit date in the future proves nothing (the review clock refuses it
+# too), and a newest summary the stamp cannot read hands the decision to the clock rather than to
+# an older summary's row.
+test_a_thumbs_up_is_judged_only_on_evidence_that_can_prove_it_stale() {
+  reset_fixture
+  REACTIONS_JSON="[$(reaction +1 "$(jq -rn '(now - 60) | todate')")]"
+  HEAD_AT=$(jq -rn '(now + 3600) | todate')
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "a commit dated in the future cannot prove a 👍 stale"
+  # The older summary's row names another head; the newest summary's row is one the stamp cannot
+  # read. The 👍 is newer than the head's commit, so the clock approves.
+  HEAD_AT=2026-09-01T00:05:00Z
+  REACTIONS_JSON="[$(reaction +1 2026-09-01T00:10:03Z)]"
+  COMMENTS_JSON="[$(summary_row 1 Completed aaaaaaa 2026-09-01T00:01:00Z),$(plain_comment 2 2026-09-01T00:10:00Z '<!-- codex-pull-request-review-summary -->
+| 📝 **Code Review** | ✅ **Completed** just now | `head-sh` | New commits |')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "an unreadable newest summary hands the 👍 to the clock, not to an older row"
+  # The same unreadable summary over a 👍 older than the head's commit: the clock still decides.
+  HEAD_AT=2026-09-01T00:20:00Z
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "and the clock demotes a 👍 older than the head's commit"
+}
+
+test_a_stale_thumbs_up_leaves_the_ordinary_states() {
+  reset_fixture
+  REACTIONS_JSON="[$(reaction eyes 2026-09-01T09:40:00Z),$(reaction +1 2026-09-01T09:49:00Z)]"
+  HEAD_AT=2026-09-01T10:02:11Z
+  run_status
+  # The 👀 of the round that ended in the 👍 is spent by it, not a round in flight.
+  assert_eq "$(state_tok "$STATE")" expected "the 👀 under a stale 👍 is that round's, and spent"
+  # The new head's 👀 lands before the app takes the old 👍 down: that round is in flight. Dated
+  # from now, so the 👀 is young enough to be `reviewing` rather than `stalled`.
+  HEAD_AT=$(jq -rn '(now - 120) | todate')
+  REACTIONS_JSON="[$(reaction +1 "$(jq -rn '(now - 600) | todate')"),$(reaction eyes "$(jq -rn '(now - 60) | todate')")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" reviewing "a 👀 newer than the stale 👍 is the new head's round"
+  HEAD_AT=2026-09-01T10:02:11Z
+  # And `watch` does not end its wait on it.
+  REACTIONS_JSON="[$(reaction +1 2026-09-01T09:49:00Z)]"
+  run_watch 0,0,0
+  assert_not_contains "$WATCH_OUT$WATCH_ERR" "approved" "watch does not read the stale 👍 as an approval"
+  assert_contains "$WATCH_OUT$WATCH_ERR" "review EXPECTED but not started" "it reads the due round"
+}
+
 tests=(
   test_empty_reviews_need_their_own_findings
   test_idle_clean_says_next_move_is_yours
@@ -1219,6 +1325,10 @@ tests=(
   test_a_broken_jq_program_is_unknown_on_the_thread_read
   test_a_thread_is_named_by_its_full_width_id
   test_resolve_reaches_every_thread_the_gate_can_name
+  test_a_thumbs_up_the_summary_gives_another_head_is_not_an_approval
+  test_a_thumbs_up_older_than_the_head_commit_is_not_an_approval
+  test_a_stale_thumbs_up_leaves_the_ordinary_states
+  test_a_thumbs_up_is_judged_only_on_evidence_that_can_prove_it_stale
 )
 
 run_tests "${tests[@]}"
