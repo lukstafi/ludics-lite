@@ -197,8 +197,8 @@ If the branch already has a PR, push to it and reuse it — never open a second 
 branch.
 
 Before **every** push that touches code, run the gates the repository's CI judges the head by:
-the formatter check if it has one — its AGENTS.md or CLAUDE.md names it (OCANNL: `dune build
-@fmt`) — and in this repository, the skills repo, `scripts/preflight.sh`, which *is* CI's `lint`
+the formatter check if it has one — its AGENTS.md or CLAUDE.md names it (OCANNL:
+`tools/fmt-check.sh`) — and in this repository, the skills repo, `scripts/preflight.sh`, which *is* CI's `lint`
 job rather than a reconstruction of it (shell syntax, the mode bits, shellcheck at error
 severity, the PowerShell parse, the parse guard and the prompt, jq-shape and scratch-directory
 guards). A push that CI reds on a syntax error or a lost mode bit costs a CI round and, since
