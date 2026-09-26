@@ -8,11 +8,21 @@
 # (issue-wave/references/native-claude.md, *Blocking on a run*). This replaces the two lines of
 # hand-copied shell that took three review rounds of races (ludics-lite#354, #357):
 #
+#   bg-run.sh new   <parent>                   # foreground; prints <dir>, a fresh directory
 #   bg-run.sh start <dir> -- <cmd> [arg...]    # run it with Bash run_in_background: true
 #   bg-run.sh wait  <dir> [--within <s>]       # run it in the foreground; default 540
 #
-# <dir> is absolute and FRESH for every run: `start` creates it and refuses one that already holds
-# anything. It writes four files there and nothing else:
+# `new` allocates the run directory, so no caller has to keep a fresh name by hand: it creates
+# <parent> if need be (absolute), then <parent>/run-<N> with one exclusive `mkdir`, N one past the
+# highest run-<N> already there, and prints that path and nothing else. A `mkdir` lost to a
+# racing `new` moves on to the next N, so every `new` gets a directory of its own, created empty
+# by that call. A directory from `new` has never held a run, so a `wait` on it, even one issued
+# before `start`, can only read this run or STARTING.
+#
+# <dir> is absolute and FRESH for every run. `new` is the way to get one; a caller may still name
+# its own (`start` creates a directory that does not exist yet), and then keeping the name fresh
+# is its own half. `start` refuses a directory that already holds anything. It writes four files
+# there and nothing else:
 #   pid  -- this script's own pid, published before the command starts. Publishing it is the
 #           claim: it is created exclusively, so of two starts racing on one directory exactly one
 #           runs its command;
@@ -25,8 +35,10 @@
 #   rc   -- the command's exit status, published (by rename) after the command returns.
 # A start refused over an earlier run that has ENDED (finished, or died) writes `refused` into
 # that directory, so a wait there says REFUSED instead of reading the earlier status as this
-# run's. A start refused over a run that is still live, or still being claimed, marks nothing:
-# that is the run a wait there should report, since the likeliest way to reach it is a duplicated
+# run's. A directory from `new` never gets one unless the caller hands it to a second `start`;
+# the marker stays for the caller that names its own directory and reuses a name. A start
+# refused over a run that is still live, or still being claimed, marks nothing: that is the run
+# a wait there should report, since the likeliest way to reach it is a duplicated
 # or retried `start` of the same command -- marking it would send the caller off to run it again.
 # A duplicate that arrives only after its twin has ENDED cannot be told from the reuse of an old
 # directory, and is refused the same way: that costs a second run, loudly, where the other
@@ -48,7 +60,9 @@
 #                 backgrounded `merge --wait`). It says nothing about what the command saw:
 #                 re-arm it in a new directory.
 #   REFUSED    6  `start` refused this directory (the reason follows): start again in a NEW one.
-# Usage errors exit 2, from either subcommand.
+# `new` exits 0 having printed the directory, and 2 when it cannot create one (a parent that is a
+# file, or one it cannot write in: an error, never a search through ever higher N). Usage errors
+# exit 2, from any subcommand.
 #
 # The races this closes, each pinned by test-bg-run.sh:
 #   1. a killed task never writes rc: `wait` reads the dead pid as DIED instead of polling forever;
@@ -61,18 +75,28 @@
 # And a wrapper killed on its own (not with its process group, as the harness does) leaves the
 # command running: its cpid keeps the verdict RUNNING rather than a DIED that would re-arm a
 # duplicate beside it.
-# What it does not close: a `wait` that runs before `start` has run AT ALL, on a directory an
-# earlier run left behind, reads that run's status; `start`'s refusal catches the reuse only once
-# it has run. A fresh name per run is the caller's half, and this script cannot check it. Nor a
-# wrapper killed alone in the instant between forking the command's process and that process
-# publishing cpid: a wait in that instant reads DIED.
+# What it does not close: on a directory the caller named itself and an earlier run left behind,
+# a `wait` that runs before `start` has run AT ALL reads that run's status; `start`'s refusal
+# catches the reuse only once it has run. `new` closes this by construction for the directories
+# it allocates. Nor a wrapper killed alone in the instant between forking the command's process
+# and that process publishing cpid: a wait in that instant reads DIED.
+#
+# The directory layout is a contract a reader may rely on without going through `wait`
+# (ludics-lite#405's `execution conclude --from-bg-run` reads it): `rc` holds one line, the decimal
+# exit status, and appears only once complete (rename); `log` is the command's whole output;
+# `refused`, when present, says `start` refused the directory, and an `rc` beside it may be an
+# earlier run's, so it is never read as the caller's. So a reader checks `refused` first, then `rc`,
+# in `wait`'s own order; `pid` and `cpid` are the liveness evidence behind RUNNING and DIED.
+# Dot-files are in-flight temporaries, never a reader's. `wait <dir> --within 0` gives the same
+# verdict in one call.
 #
 # Portable to bash 3.2 (macOS /bin/bash) and GNU bash; the Bash tool's zsh only passes argv.
 
 set -u
 
 usage() {
-  printf '%s\n' 'usage: bg-run.sh start <dir> -- <cmd> [arg...]' \
+  printf '%s\n' 'usage: bg-run.sh new <parent>' \
+    '       bg-run.sh start <dir> -- <cmd> [arg...]' \
     '       bg-run.sh wait <dir> [--within <seconds>]' >&2
   exit 2
 }
@@ -102,6 +126,51 @@ refuse_start() {
       printf '%s\n' "$reason" > "$1/refused"
       say "refused: $reason" ;;
   esac
+  exit 2
+}
+
+cmd_new() {
+  [ $# -eq 1 ] || usage
+  parent=$1
+  need_absolute "$parent"
+  # Trailing slashes off, so the path printed has one spelling (and / stays /).
+  while [ "$parent" != / ]; do
+    case $parent in */) parent=${parent%/} ;; *) break ;; esac
+  done
+  mkdir -p -- "$parent" 2>/dev/null && [ -d "$parent" ] \
+    || { say "cannot create $(printf '%q' "$parent")"; exit 2; }
+  base=${parent%/}
+  # The highest run-<N> already there; any other name, and a run-<N> too long to be a number
+  # bash arithmetic can hold, is not counted.
+  top=0
+  for e in "$base"/run-*; do
+    n=${e##*/run-}
+    case $n in ''|*[!0-9]*) continue ;; esac
+    [ "${#n}" -le 9 ] || continue
+    n=$((10#$n))
+    [ "$n" -le "$top" ] || top=$n
+  done
+  # A test seam, unset in use: test-bg-run.sh holds two `new`s here, past the scan, until both
+  # have reached it (each drops <gate>.<pid>; the suite then creates <gate>), so both try the same
+  # N and the exclusive mkdir below is what decides between them.
+  if [ -n "${BG_RUN_NEW_GATE:-}" ]; then
+    : > "$BG_RUN_NEW_GATE.$$"
+    while [ ! -e "$BG_RUN_NEW_GATE" ]; do sleep 0.1; done
+  fi
+  # `mkdir` without -p fails when the name exists, so exactly one caller creates each run-<N>. A
+  # failure with the name still absent is not a race lost but a parent that refuses the write:
+  # that is an error, not a reason to try the next N. The bound only stops a pathological loop.
+  n=$((top + 1)); tries=0
+  while [ "$tries" -lt 1000 ]; do
+    if mkdir -- "$base/run-$n" 2>/dev/null; then
+      printf '%s\n' "$base/run-$n"
+      exit 0
+    fi
+    [ -e "$base/run-$n" ] || [ -L "$base/run-$n" ] \
+      || { say "cannot create a run directory in $(printf '%q' "$parent")"; exit 2; }
+    n=$((n + 1)); tries=$((tries + 1))
+  done
+  say "no free run directory in $(printf '%q' "$parent") after $tries tries"
   exit 2
 }
 
@@ -225,6 +294,7 @@ cmd_wait() {
 [ $# -ge 1 ] || usage
 sub=$1; shift
 case $sub in
+  new) cmd_new "$@" ;;
   start) cmd_start "$@" ;;
   wait) cmd_wait "$@" ;;
   -h|--help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
