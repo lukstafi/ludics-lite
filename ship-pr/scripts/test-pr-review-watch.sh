@@ -133,6 +133,12 @@ reaction() { # <content> <created_at>
     '{user:{login:($rev + "[bot]")}, content:$c, created_at:$at}'
 }
 
+# A 👍 given for the fixture's head: dated after reset_fixture's HEAD_AT (a minute ago), because a
+# 👍 older than the head's commit is a previous head's and approves nothing (#418).
+head_thumb() {
+  reaction +1 "$(jq -rn '(now - 30) | todate')"
+}
+
 review() { # <id> <commit> <submitted_at> [body]
   jq -cn --argjson id "$1" --arg sha "$2" --arg at "$3" --arg b "${4:-findings}" --arg rev "$REVIEWER" \
     '{id:$id, user:{login:($rev + "[bot]")}, state:"COMMENTED", commit_id:$sha,
@@ -513,7 +519,7 @@ test_a_final_poll_that_did_not_answer_withholds_the_verdict() {
 test_an_approval_landing_during_the_final_poll_drops_the_verdict() {
   reset_fixture
   retune GRACE=1
-  schedule reactions 2 "[$(reaction +1 2026-09-01T00:02:00Z)]"
+  schedule reactions 2 "[$(head_thumb)]"
   run_watch 0,0,0 5 1
   assert_eq "$WATCH_RC" 0 "an approved PR is something to act on"
   assert_contains "$WATCH_OUT" "the 👍 landed while it was being read" "and the line says why"
@@ -1258,13 +1264,16 @@ test_current_head_running_blocks_older_approval_until_completion() {
   run_status
   assert_eq "$(state_tok "$STATE")" approved "newer current-head no-findings verdict settles the review"
 
-  # Controls: neither another head nor a completed row contradicts this reaction.
+  # The reviewer's newest row naming ANOTHER head says which head it last took up, and it is not
+  # this one: the 👍 is that head's, left standing (#418), and this head's round is due. (Before
+  # #418 this was a control that another head's activity leaves the approval alone.)
   reset_fixture
   echo 1 >"$FEEDS/round"
   schedule reactions 1 "[$(reaction +1 "$earlier")]"
   schedule comments 1 "[$(activity_summary "${H1:0:7}" Running "$started")]"
   run_status
-  assert_eq "$(state_tok "$STATE")" approved "another head's activity cannot block this approval"
+  assert_eq "$(state_tok "$STATE")" expected "a 👍 under a row naming another head is not this head's approval"
+  # Controls: a completed row naming this head does not contradict the reaction.
   schedule comments 1 "[$(activity_summary "${H2:0:7}" Completed "$started")]"
   run_status
   assert_eq "$(state_tok "$STATE")" approved "completed activity preserves reaction-only approval"
@@ -1533,7 +1542,7 @@ two_head_fixture() { # <resolved: true|false>
   reset_fixture
   schedule reviews 1 "[$(review 4053090000 "$H1" 2026-09-01T00:01:00Z)]"
   schedule inline 1 "[$(inline_comment 4053098120 "$H1" "$H2" 'P2: a live defect'),$(inline_comment 4053098122 "$H1" "$H2" 'P2: another' b.sh 9)]"
-  schedule reactions 1 "[$(reaction +1 2026-09-01T00:05:00Z)]"
+  schedule reactions 1 "[$(head_thumb)]"
   schedule threads 1 "[$(review_thread 4053098120 "$1"),$(review_thread 4053098122 "$1" b.sh)]"
 }
 
@@ -1566,7 +1575,7 @@ test_an_approval_landing_in_the_final_poll_is_checked_too() {
   # as any approval does, so it is checked for open threads the same way.
   reset_fixture
   retune GRACE=1
-  schedule reactions 2 "[$(reaction +1 2026-09-01T00:02:00Z)]"
+  schedule reactions 2 "[$(head_thumb)]"
   schedule threads 1 "[$(review_thread 4053098120 false)]"
   run_watch 0,0,0 5 1
   assert_eq "$WATCH_RC" 0 "an approval is something to act on"
@@ -1582,7 +1591,7 @@ test_an_approval_beside_a_final_poll_round_is_checked_too() {
   reset_fixture
   retune GRACE=1
   schedule inline 2 "[$(inline_comment 4095735684 "$H2" "$H2" 'a finding on this head')]"
-  schedule reactions 2 "[$(reaction +1 2026-09-01T00:02:00Z)]"
+  schedule reactions 2 "[$(head_thumb)]"
   schedule threads 1 "[$(review_thread 4053098120 false)]"
   run_watch 0,0,0 5 1
   assert_eq "$WATCH_RC" 0 "the round the final poll found is the exit"

@@ -553,12 +553,12 @@ head SHA, and answers with one of eight:
 
 | state | means | what to do |
 | --- | --- | --- |
-| `approved` | 👍 is on the PR, with no newer current-head running review or findings, and no review thread left unresolved | merge |
+| `approved` | 👍 is on the PR and was given for this head, with no newer current-head running review or findings, and no review thread left unresolved | merge |
 | `unresolved` | that same 👍, over review threads still open — whatever head they cite | answer each thread and `resolve` it; `merge` refuses until none is open |
 | `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
 | `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
 | `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) |
-| `expected` | no live 👀, and no review of the head SHA: a round is due and has not started | wait out the grace, then `@codex review` |
+| `expected` | no live 👀, and no review of the head SHA: a round is due and has not started — including a 👍 left from before a push, until the app takes it down | wait out the grace, then `@codex review` |
 | `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push — or, at one of the loop's exits (below), close out and merge |
 | `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
 

@@ -1313,11 +1313,12 @@ fmt_age() {
 
 # Prints ONE line, "<token>|<seconds>|<mergeability>|<detail>", and always exits 0 — the token
 # carries the failure:
-#   approved  👍 is on the PR: the merge gate is open.
+#   approved  👍 is on the PR and is not older than the head (#418, below): the merge gate is open.
 #   reviewing 👀 is newer than the reviewer's last word, so a round really is in flight.
 #   stalled   ... and it has been in flight longer than any round takes; nothing is coming.
 #   failed    the reviewer's newest word is the INITIALIZATION failure above: the round never ran.
-#   expected  no live 👀 and no review of the head SHA: a round is due and has not started.
+#   expected  no live 👀 and no review of the head SHA: a round is due and has not started. A 👍
+#             left from before the head arrived is such a head's state too, not an approval.
 #   idle      the reviewer has reviewed this exact head and left no 👍, so the next move is yours.
 #   nudged    watch-only: a fresh nudge owns one creation-time grace window.
 #   unknown   a read failed. NOT a state of the PR — hold the previous one and retry.
@@ -1418,6 +1419,7 @@ status_state() {
   local pr="$1" raw line age plus plus_at eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local running_at evidence evidence_kind evidence_at running_unread vline verd_at verd_sha mstate="-" head_err="" pr_created=""
   local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at="" nudge_age nudge_id="" nudge_line comments_loaded=false
+  local reviews_loaded=false head_loaded=false head_at_read=false row_sha stale_plus_at="" stale_note=""
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -1464,16 +1466,19 @@ status_state() {
   # supplemental reads fail, but do not accept an older 👍 over a known current-head
   # Code Review Running row (#146). Read comments before the head, as below.
   # Completion removes the contradiction; it is not itself a no-findings verdict.
-  [ "$plus" = true ] && review_after_nudge "$plus_at" "$nudge_at" && {
+  # Nor a 👍 left from before the head arrived (#418, below), which falls through to the
+  # ordinary states — so the reads made here are kept, and the path below does not repeat them.
+  if [ "$plus" = true ] && review_after_nudge "$plus_at" "$nudge_at"; then
     if [ "$comments_loaded" != true ]; then
-      comments_raw=$(state_comments "$pr") || comments_raw='[]'
+      if comments_raw=$(state_comments "$pr"); then comments_loaded=true; else comments_raw='[]'; fi
     fi
-    reviews_raw=$(state_reviews "$pr") || reviews_raw='[]'
+    if reviews_raw=$(state_reviews "$pr"); then reviews_loaded=true; else reviews_raw='[]'; fi
     reviews_raw=$(substantive_reviews "$pr" <<<"$reviews_raw") || {
       echo "unknown|-|$mstate|the review comments API did not establish substantive reviews"
       return 0
     }
     state_head_read "$pr"
+    head_loaded=true
     evidence=$(jq -rs --arg rev "$REVIEWER" --arg head "$head_sha" --arg rc "$REVIEWED_COMMIT_RE" '
       .[0] as $comments | .[1] as $reviews |
       def reviewer: select((.user.login // "") | startswith($rev));
@@ -1491,6 +1496,16 @@ status_state() {
          | select(test("^\\|[^|]*Code Review[^|]*\\|[^|]*Running"))
          | ([capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")] | first)]
         as $running |
+      # Every Code Review row the stamp pattern reads, whatever its status: the newest one names
+      # the commit the reviewer last took up, which is the fourth field (#418, below). A row the
+      # pattern cannot read is left out here and the clock below answers instead.
+      ([$comments[] | reviewer
+         | select((.body // "") | contains("codex-pull-request-review-summary"))
+         | (.body // "") | split("\n")[]
+         | select(test("^\\|[^|]*Code Review[^|]*\\|"))
+         | [capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")] | first
+         | select(. != null) | .at |= sub("\\.[0-9]+Z$"; "Z")]
+       | max_by(.at) | .sha // "") as $row_sha |
       [($running[] | select(. != null) | . + {kind:"running"}),
        ($reviews[] | reviewer | select(.submitted_at != null)
          | {sha:(.commit_id // ""), at:.submitted_at, kind:"findings"}),
@@ -1502,15 +1517,13 @@ status_state() {
       | map(current | .at |= sub("\\.[0-9]+Z$"; "Z"))
       | max_by(.at)
       | (if . == null then "|" else "\(.kind)|\(.at)" end)
-        + "|" + (($running | map(select(. == null)) | length) | tostring)' \
+        + "|" + (($running | map(select(. == null)) | length) | tostring)
+        + "|" + $row_sha' \
       <<<"$comments_raw"$'\n'"$reviews_raw" 2>/dev/null) || {
       echo "unknown|-|$mstate|the current-head review evidence did not parse"
       return 0
     }
-    evidence_kind="${evidence%%|*}"
-    running_unread="${evidence##*|}"
-    evidence_at="${evidence#*|}"
-    evidence_at="${evidence_at%|*}"
+    IFS='|' read -r evidence_kind evidence_at running_unread row_sha <<<"$evidence"
     # The two Running patterns disagreed on a row. Neither "a round is running" nor "none is"
     # is readable from a table this script can only half parse, so neither is claimed.
     case "$running_unread" in
@@ -1544,18 +1557,62 @@ status_state() {
         ;;
       esac
     fi
-    echo "approved|-|$mstate|👍 from $REVIEWER"
-    return 0
-  }
+    # A 👍 is about the head the reviewer last took up, and a push moves the head without taking
+    # the 👍 back: the app removes it only when it puts up the 👀 for the new head, minutes later.
+    # In that window an unreviewed head read as approved (#418: on #411 for four minutes, on #415
+    # for a push 67 minutes after the 👍). The rule: a 👍 older than the head's arrival is not an
+    # approval of that head. The arrival is no API field, so two pieces of evidence stand in:
+    #   - the newest Code Review row of the reviewer's summary comment (the fourth field above).
+    #     The app rewrites that row when it takes a head up and again when the round completes,
+    #     each time naming the commit — so while a 👍 stands, the row names the head it was
+    #     given for (#411: "Completed ... `7e2aca6`" three seconds before its 👍). A row naming
+    #     any other commit is a head nobody has reviewed, and this is exact, with no clock;
+    #   - with no such row read, the head commit's committer date, the review clock's own lower
+    #     bound on the push (below): a 👍 older than the commit cannot be about it. It misses a
+    #     commit made BEFORE the 👍 and pushed after (#415's head sat nine minutes between commit
+    #     and push); that miss is the one the row closes, and the only one left without it.
+    # Not the PR's `updated_at`, which the checks grace pairs with the commit date: it moves on
+    # every comment and thread reply, and the `unresolved` flow (reply to and resolve threads
+    # under a standing 👍) would then demote a real approval to `expected` and invite the
+    # `@codex review` that clears it. The commit read is the one the `expected` clock below makes,
+    # taken earlier and only when the row is missing; neither test runs without a head, where the
+    # 👍 stands as before (a failed PR read must not hide it). A stale 👍 falls through to the
+    # ordinary states as the reviewer's last word, which also spends any 👀 older than it.
+    if [ -n "$head_sha" ]; then
+      if [ -n "$row_sha" ]; then
+        case "$head_sha" in
+        "$row_sha"*) ;;
+        *) stale_note="the 👍 at $plus_at is for ${row_sha:0:7}, per $REVIEWER's summary" ;;
+        esac
+      else
+        head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
+          head_at=""
+        head_at_read=true
+        if [ -n "$head_at" ] && [[ "$plus_at" < "$head_at" ]]; then
+          stale_note="the 👍 at $plus_at predates head ${head_sha:0:7}'s commit date $head_at"
+        fi
+      fi
+    fi
+    if [ -z "$stale_note" ]; then
+      echo "approved|-|$mstate|👍 from $REVIEWER"
+      return 0
+    fi
+    stale_plus_at="$plus_at"
+  fi
 
-  raw=$(state_reviews "$pr") || {
-    echo "unknown|-|$mstate|the reviews API did not answer ($(gh_err_line))"
-    return 0
-  }
-  raw=$(substantive_reviews "$pr" <<<"$raw") || {
-    echo "unknown|-|$mstate|the review comments API did not establish substantive reviews"
-    return 0
-  }
+  if [ "$reviews_loaded" = true ]; then
+    # The stale-👍 path's read, already through substantive_reviews.
+    raw="$reviews_raw"
+  else
+    raw=$(state_reviews "$pr") || {
+      echo "unknown|-|$mstate|the reviews API did not answer ($(gh_err_line))"
+      return 0
+    }
+    raw=$(substantive_reviews "$pr" <<<"$raw") || {
+      echo "unknown|-|$mstate|the review comments API did not establish substantive reviews"
+      return 0
+    }
+  fi
   # Kept whole for the `failed` branch, which asks whether any review is of the CURRENT head — a
   # question this point in the function cannot yet ask, the head being read after the feeds.
   reviews_raw="$raw"
@@ -1651,7 +1708,8 @@ status_state() {
   review_after_nudge "$com_at" "$nudge_at" || com_at=""
   if ! review_after_nudge "$verd_at" "$nudge_at"; then verd_at=""; verd_sha=""; fi
   if ! review_after_nudge "$fail_at" "$nudge_at"; then fail_at=""; fail_ref=""; fi
-  last_spoke=$(newest "$rev_at" "$com_at")
+  # A stale 👍 (above) is the reviewer's last word about the head it was given for.
+  last_spoke=$(newest "$rev_at" "$com_at" "$stale_plus_at")
 
   # The head SHA and the mergeability, in ONE read of the PR, made AFTER the feeds: every review
   # in those feeds is then about a head no newer than the one read, so "the review's commit_id
@@ -1662,8 +1720,9 @@ status_state() {
   # verdict check and the post-round states, which used to read it separately. Inside a watch round
   # it is the round's own head read, taken from the snapshot: that read was made after the feeds
   # this function is holding, so the ordering is the same one — and the state cannot then be
-  # anchored on a head the round classified nothing against (ludics-lite#95).
-  state_head_read "$pr"
+  # anchored on a head the round classified nothing against (ludics-lite#95). The stale-👍 path
+  # made this read already, after the same feeds.
+  [ "$head_loaded" = true ] || state_head_read "$pr"
 
   # A no-findings verdict naming the CURRENT head outranks a live-looking 👀, and must be checked
   # BEFORE the in-flight return below: with the placeholder off the comment clock, a verdict
@@ -1790,8 +1849,10 @@ status_state() {
   # the future cannot blind the clock either.
   #
   # A failed commit read costs precision, not the state: the PR's own timestamps remain.
-  head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
-    head_at=""
+  if [ "$head_at_read" != true ]; then
+    head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
+      head_at=""
+  fi
   if [ -n "$nudge_at" ]; then
     # An earlier request must not shorten a newly committed head or newly opened
     # PR's pickup grace. Reuse the same validated clocks as ordinary expected.
@@ -1800,7 +1861,7 @@ status_state() {
     return 0
   fi
   echo "expected|$(freshest_age "$head_at" "$pr_created" "$last_spoke" "$eyes_at" "$nudge_at")|$mstate|no 👀" \
-    "in flight and no review of head ${head_sha:0:7}${rev_sha:+; $REVIEWER last reviewed ${rev_sha:0:7} at $rev_at}"
+    "in flight and no review of head ${head_sha:0:7}${rev_sha:+; $REVIEWER last reviewed ${rev_sha:0:7} at $rev_at}${stale_note:+; $stale_note}"
 }
 
 state_tok() { printf '%s' "${1%%|*}"; }
