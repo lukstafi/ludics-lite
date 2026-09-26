@@ -102,6 +102,7 @@
 #
 #   cp ship-pr/scripts/{test-pr-review-lib.sh,pr-review.sh} "$d"/ && mv "$d"/test-pr-review-lib.sh "$d"/lib-reverted.sh
 #   $EDITOR "$d"/lib-reverted.sh && bash "$d"/lib-reverted.sh   # the control you added must fail
+#   SHIP_PR_TEST_CASES=<the control> bash "$d"/lib-reverted.sh   # or just that control
 #
 # The tracked file is never touched, so a session that dies mid-way leaves the repo clean; the
 # alternative — mutating the tracked file in place and restoring it — does not have that property.
@@ -1089,15 +1090,15 @@ control_run() {
   CONTROL_ERR=$(cat "$CONTROL_ROOT/err")
 }
 
-# mutation_copy <destination> <case> <old> <new>: patch exactly one literal occurrence
-# in the sourced preamble, then run only the named existing case. Restricting the patch to the
-# sourced section keeps the mutation's own quoted recipe out of its match count. The tracked
-# file is read only; a missing/ambiguous target refuses before any output file is written.
+# mutation_copy <destination> <old> <new>: patch exactly one literal occurrence in the sourced
+# preamble. Restricting the patch to the sourced section keeps the mutation's own quoted recipe
+# out of its match count. The tracked file is read only; a missing/ambiguous target refuses
+# before any output file is written.
 mutation_copy() {
   perl - "$TEST_LIB_FILE" "$@" <<'PERL'
 use strict;
 use warnings;
-my ($source, $dest, $case, $old, $new) = @ARGV;
+my ($source, $dest, $old, $new) = @ARGV;
 open my $in, '<', $source or die "$source: $!\n";
 local $/;
 my $text = <$in>;
@@ -1111,12 +1112,6 @@ if (length $old) {
 }
 die "mutation_copy: expected exactly one patch target, found $count\n" if $count != 1;
 substr($text, index($preamble, $old), length($old)) = $new;
-die "mutation_copy: invalid case\n" unless $case =~ /^test_[a-z0-9_]+$/;
-# The final case runner sits above this file's brace-group foot (`exit "$?"` and `}`,
-# ludics-lite#10, #247), which the copy must keep: a copy that ended at the runner would be a
-# file whose group never closes, and bash would refuse to parse it.
-$text =~ s/\nrun_tests "\$\{tests\[\@\]\}"\nexit "\$\?"\n\}\n\z/\nrun_tests $case\nexit "\$?"\n}\n/
-  or die "mutation_copy: missing final case runner\n";
 open my $out, '>', $dest or die "$dest: $!\n";
 print {$out} $text or die "$dest: $!\n";
 close $out or die "$dest: $!\n";
@@ -1124,7 +1119,11 @@ PERL
 }
 
 # mutant <case> <old> <new> <failure>: prove the unmodified case passes first, then
-# require its assertion failure, not a syntax/load failure or an unrelated earlier case.
+# require its assertion failure, not a syntax/load failure or an unrelated earlier case. The
+# copy runs <case> alone through SHIP_PR_TEST_CASES, with GITHUB_ACTIONS emptied for that one
+# call: CI runs this file with it set to true, and run_tests refuses any subset under it. An
+# assignment prefix can empty it but not unset it, and run_tests reads empty as not-CI; a prefix
+# is what keeps the outer suite's own value intact for the cases after this one.
 mutant() {
   local root copy
   # The field-splitting mutant must load before the target case puts it in a spaced path.
@@ -1133,13 +1132,14 @@ mutant() {
   TMPDIR=/tmp test_tmpdir root mutation
   copy="$root/$LIB_BASENAME"
   cp "$HELPER" "$root/"
-  mutation_copy "$copy" "$1" "$2" "$2"
-  TMPDIR="$root" control_run "$copy"
+  mutation_copy "$copy" "$2" "$2"
+  GITHUB_ACTIONS='' SHIP_PR_TEST_CASES="$1" TMPDIR="$root" control_run "$copy"
   assert_eq "$CONTROL_RC" 0 "mutation baseline for $1 ($CONTROL_ERR)"
-  assert_eq "$CONTROL_OUT" "PASS: $1" "the selected baseline case must run"
+  assert_eq "$CONTROL_OUT" "PASS: $1
+SUBSET: 1 of ${#tests[@]} cases" "the selected baseline case must run, alone"
   assert_eq "$CONTROL_ERR" "" "the baseline must be clean"
-  mutation_copy "$copy" "$1" "$2" "$3"
-  TMPDIR="$root" control_run "$copy"
+  mutation_copy "$copy" "$2" "$3"
+  GITHUB_ACTIONS='' SHIP_PR_TEST_CASES="$1" TMPDIR="$root" control_run "$copy"
   assert_eq "$CONTROL_RC" 1 "mutant must fail the assertion in $1 ($CONTROL_ERR)"
   assert_eq "$CONTROL_OUT" "" "the mutated case must not report a pass"
   assert_contains "$CONTROL_ERR" "FAIL: $4" "the named case must fail for the intended reason"
@@ -2045,7 +2045,7 @@ test_mutation_copy_refuses_missing_or_ambiguous_targets() {
   test_tmpdir root mutation-target
   for old in 'no such preamble text' 'local'; do
     rc=0
-    mutation_copy "$root/copy.sh" test_own_functions_pass "$old" broken 2>"$root/err" || rc=$?
+    mutation_copy "$root/copy.sh" "$old" broken 2>"$root/err" || rc=$?
     err=$(cat "$root/err")
     [ "$rc" -ne 0 ] || bail "a missing or ambiguous mutation target must fail"
     assert_contains "$err" 'mutation_copy: expected exactly one patch target, found' \
