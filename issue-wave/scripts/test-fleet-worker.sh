@@ -1283,6 +1283,15 @@ grep -q -- "tail -n +2 -f " "$ISSUE_WAVE_STATE/workers/wr/run.sh" && ok "...resu
 expect "...and the resumed process answers both, the new one last" 0 "IDLE testbox/wr .*did: Now the next step" -- "$FW" attach testbox wr --interval 1
 grep -q '"text":"did: Stop and answer now' "$ISSUE_WAVE_STATE/workers/wr/stream.jsonl" && ok "...the queued message had its own turn" || ko "queued message lost across the resume"
 settle wr
+# A partial last line (an append that failed) is never appended onto, and a resume drops it.
+"$FW" launch testbox wp --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" >/dev/null
+"$FW" attach testbox wp --interval 1 >/dev/null
+printf '{"type":"user","uuid":"par' >> "$ISSUE_WAVE_STATE/workers/wp/input.jsonl"
+expect "an append onto a partial input line is refused and names --kill" 1 "UNSTICK REFUSED testbox/wp: .*input.jsonl ends in a partial line" -- "$FW" unstick testbox wp --message "$TMP/msg.md"
+expect "...unstick --kill resumes" 0 "RESUMED testbox/wp " -- "$FW" unstick testbox wp --message "$TMP/msg.md" --kill
+[ "$(grep -c '' "$ISSUE_WAVE_STATE/workers/wp/input.jsonl")" -eq 2 ] && ! grep -q '"par$' "$ISSUE_WAVE_STATE/workers/wp/input.jsonl" && ok "...with the partial line dropped and the message on its own line" || ko "input after the repair: $(cat "$ISSUE_WAVE_STATE/workers/wp/input.jsonl")"
+expect "...and the message is answered" 0 "IDLE testbox/wp .*did: Stop and answer now" -- "$FW" attach testbox wp --interval 1
+settle wp
 # A feeder whose pid cannot be recorded could never be closed: the worker stops before its CLI.
 mkdir "$ISSUE_WAVE_STATE/workers/wr/feeder.pid"
 "$FW" unstick testbox wr --message "$TMP/msg.md" >/dev/null

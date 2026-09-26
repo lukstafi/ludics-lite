@@ -1615,6 +1615,9 @@ if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name
   [ "$#" -eq 0 ] || { echo "UNSTICK REFUSED $BOX/$name: extra CLI arguments ($*) cannot reach a live process -- pass --kill to resume the session with them, or drop them to append"; exit 1; }
   feeder_of "$name" >/dev/null || { echo "UNSTICK REFUSED $BOX/$name: the CLI's session is up but its input channel is not (no live feeder on $d/input.jsonl) -- pass --kill to resume the session instead"; exit 1; }
   line=$(user_line "$d/messages/$stamp.md" "$mid") && [ -n "$line" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot encode the message as an input line"; exit 1; }
+  # A line appended onto a partial one (a failed earlier append) would reach the CLI as garbage.
+  [ ! -s "$d/input.jsonl" ] || [ -z "$(tail -c 1 "$d/input.jsonl")" ] ||
+    { echo "UNSTICK REFUSED $BOX/$name: $d/input.jsonl ends in a partial line (an append that failed) -- \`unstick --kill\` resumes the session and drops it"; exit 1; }
   was=$(state_of "$name")
   # attach waits for the reply to THIS message: meta names it before the line lands, so a reply
   # that beats the next command is still read as its reply.
@@ -1628,7 +1631,7 @@ if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name
     mv -f "$d/meta.prev" "$d/meta"
     # No truncation: the live feeder may already have forwarded a partial write, and a file
     # truncated under `tail -f` is re-read or skipped by platform. Said, not repaired.
-    echo "UNSTICK REFUSED $BOX/$name: cannot append to $d/input.jsonl (disk full?); it may now end in a partial line the CLI has already read -- free space, then \`close\` or \`unstick --kill\` it rather than appending again"; exit 1
+    echo "UNSTICK REFUSED $BOX/$name: cannot append to $d/input.jsonl (disk full?); it may now end in a partial line the CLI has already read -- free space, then \`unstick --kill\` it (the resume drops a partial line) rather than appending again"; exit 1
   fi
   rm -f "$d/meta.prev"; trap 'exit 143' TERM HUP INT
   waited=0
@@ -1694,6 +1697,12 @@ msg=$(tmux_env_check) || { echo "UNSTICK REFUSED $BOX/$name: $msg"; exit 1; }
 # never echoed -- a message still queued when it died -- or else from the message's own line.
 if [ "$kind" = claude ]; then
   line=$(user_line "$d/messages/$stamp.md" "$mid") && [ -n "$line" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot encode the message as an input line"; exit 1; }
+  # A partial last line (an append that failed) is dropped: no process reads the file now, the
+  # message stays under messages/, and the next line must start on a record boundary.
+  if [ -s "$d/input.jsonl" ] && [ -n "$(tail -c 1 "$d/input.jsonl")" ]; then
+    sed '$d' "$d/input.jsonl" > "$d/input.jsonl.new" 2>/dev/null && mv -f "$d/input.jsonl.new" "$d/input.jsonl" ||
+      { rm -f "$d/input.jsonl.new"; echo "UNSTICK REFUSED $BOX/$name: cannot drop the partial last line of $d/input.jsonl (disk full?)"; exit 1; }
+  fi
   il=$(grep -c '' "$d/input.jsonl" 2>/dev/null); il=${il:-0}
   if is_stream "$name"; then from=$(first_unread "$name" "$il"); else from=$((il + 1)); fi
   stream_run "$d" "$cwd" "$from" --resume "$sid" "$@" > "$d/run.sh" 2>/dev/null
