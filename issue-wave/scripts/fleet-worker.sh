@@ -18,8 +18,8 @@
 #   - claude: ONE long-lived `claude -p --input-format stream-json --output-format stream-json
 #     --replay-user-messages` process (meta `channel=stream-json`) whose stdin is fed from the
 #     append-only file input.jsonl, one JSON user message per line, the brief first. A `tail -f`
-#     feeder (its pid in feeder.pid) copies that file into a private FIFO the CLI reads, so stdin
-#     stays open between turns; `unstick` appends a line, which the CLI picks up at its next tool
+#     feeder (its pid in feeder.pid) pipes that file into the CLI, so stdin stays open between
+#     turns; `unstick` appends a line, which the CLI picks up at its next tool
 #     or turn boundary (a message sent mid-turn reaches the model mid-turn: Claude Code 2.1.282,
 #     probed 2026-09-26), and `close` kills the feeder, the CLI reads EOF and exits, and run.sh
 #     writes `exit`. input.jsonl is the durable log of every message the coordinator sent.
@@ -405,21 +405,25 @@ feeder_of() {
 # so no message text is ever a shell word; the uuid comes back in the CLI's replay of it.
 user_line() { jq -cRs --arg u "$2" '{type: "user", uuid: $u, message: {role: "user", content: .}}' "$1" 2>/dev/null; }
 # stream_run <dir> <cwd> <from-line> --session-id|--resume <sid> [extra CLI args]: the run.sh of
-# a claude worker. The feeder copies input.jsonl from <from-line> on (a resume starts past the
-# lines an earlier process read) into a private FIFO the CLI reads, so the CLI's stdin stays open
-# until the feeder dies; the wrapper waits for the CLI alone, then ends the feeder and records the
-# exit. The FIFO is private to the record, never the channel: writers append to the file.
+# a claude worker. The feeder -- a `tail -f` of input.jsonl from <from-line> on (a resume starts
+# past the lines an earlier process read), its pid in feeder.pid -- writes into a PIPE the CLI
+# reads, so the CLI's stdin stays open until the feeder dies; its subshell waits for it, so killing
+# the tail closes the pipe's last write end and the CLI reads EOF. A pipe, not a FIFO: with a FIFO
+# on stdin, Claude Code 2.1.282 on macOS never saw EOF after its writer died (probed 2026-09-26),
+# where a pipe ends it at once. The CLI's side ends the feeder when the CLI ends on its own (a
+# crash), so the pipeline, and with it run.sh, always finishes and records the CLI's exit code.
+# No `&` pipeline: bash 3.2 gives an asynchronous command /dev/null for stdin even in a pipeline.
 stream_run() {
   local d="$1" cwd="$2" from="$3" flag="$4" sid="$5" a; shift 5
   printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
-  printf 'rm -f %q && mkfifo %q || { echo 96 > %q; exit 96; }\n' "$d/stdin.fifo" "$d/stdin.fifo" "$d/exit"
-  printf 'tail -n +%d -f %q > %q &\n' "$from" "$d/input.jsonl" "$d/stdin.fifo"
-  printf 'feeder=$!; echo "$feeder" > %q\n' "$d/feeder.pid"
-  printf 'claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --dangerously-skip-permissions %s %q' "$flag" "$sid"
+  printf 'rm -f %q\n' "$d/feeder.pid"
+  printf '{ tail -n +%d -f %q & echo $! > %q; wait; } | {\n' "$from" "$d/input.jsonl" "$d/feeder.pid"
+  printf '  claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --dangerously-skip-permissions %s %q' "$flag" "$sid"
   for a in "$@"; do printf ' %q' "$a"; done
-  printf ' < %q >> %q 2>> %q\n' "$d/stdin.fifo" "$d/stream.jsonl" "$d/stderr.log"
-  printf 'rc=$?; kill "$feeder" 2>/dev/null; rm -f %q %q\n' "$d/stdin.fifo" "$d/feeder.pid"
-  printf 'echo "$rc" > %q\n' "$d/exit"
+  printf ' >> %q 2>> %q; rc=$?\n' "$d/stream.jsonl" "$d/stderr.log"
+  printf '  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s %q ] && break; sleep 1; done\n' "$d/feeder.pid"
+  printf '  kill "$(cat %q 2>/dev/null)" 2>/dev/null; exit "$rc"\n}\n' "$d/feeder.pid"
+  printf 'rc=$?; rm -f %q; echo "$rc" > %q\n' "$d/feeder.pid" "$d/exit"
 }
 state_of() {
   if alive "$1"; then

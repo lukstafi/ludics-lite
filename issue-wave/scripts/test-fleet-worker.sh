@@ -1076,7 +1076,7 @@ expect "launch creates the worktree and reports the session" 0 "LAUNCHED testbox
 [ -d "$proj-worktrees/w1" ] && [ "$(git -C "$proj-worktrees/w1" rev-parse --abbrev-ref HEAD)" = claude/w1 ] && ok "worktree on the requested branch" || ko "worktree missing or wrong branch"
 grep -q -- "--model opus" "$ISSUE_WAVE_STATE/workers/w1/run.sh" && ok "extra CLI args reach the command line" || ko "extra args lost"
 # ludics-lite#259: a claude worker is one stream-json process fed from input.jsonl, the brief first.
-grep -q -- "tail -n +1 -f .*input.jsonl" "$ISSUE_WAVE_STATE/workers/w1/run.sh" && grep -q -- "claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages " "$ISSUE_WAVE_STATE/workers/w1/run.sh" &&
+grep -q -- "{ tail -n +1 -f .*input.jsonl .* | {" "$ISSUE_WAVE_STATE/workers/w1/run.sh" && grep -q -- "claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages " "$ISSUE_WAVE_STATE/workers/w1/run.sh" &&
   ok "a claude worker runs one stream-json process fed from its input channel" || ko "claude command: $(cat "$ISSUE_WAVE_STATE/workers/w1/run.sh")"
 [ "$(jq -j '.message.content' "$ISSUE_WAVE_STATE/workers/w1/input.jsonl")" = "$(cat "$brief")" ] && [ "$(grep -c '' "$ISSUE_WAVE_STATE/workers/w1/input.jsonl")" -eq 1 ] &&
   ok "the brief is the channel's first line, byte for byte" || ko "input.jsonl: $(cat "$ISSUE_WAVE_STATE/workers/w1/input.jsonl")"
@@ -1085,7 +1085,7 @@ expect "...ls reads it as IDLE" 0 "testbox/w1 IDLE kind=claude" -- "$FW" ls test
 expect "...status names the turn state and no unread input" 0 "IDLE testbox/w1 kind=claude .* | turn=ended background_tasks=0 unread=0 | " -- "$FW" status testbox w1
 expect "...and attach re-armed on an IDLE worker answers at once" 0 "IDLE testbox/w1 " -- "$FW" attach testbox w1 --interval 30
 expect "close ends an IDLE worker and prints the final verdict" 0 "DONE testbox/w1 exit=0 success is_error=false" -- "$FW" close testbox w1
-[ ! -e "$ISSUE_WAVE_STATE/workers/w1/feeder.pid" ] && [ ! -e "$ISSUE_WAVE_STATE/workers/w1/stdin.fifo" ] && ok "the process's end removes its feeder pid and FIFO" || ko "feeder or FIFO left behind"
+[ ! -e "$ISSUE_WAVE_STATE/workers/w1/feeder.pid" ] && ok "the process's end removes its feeder pid" || ko "feeder pid left behind"
 expect "close of an ended worker prints its verdict as it stands" 0 "DONE testbox/w1 exit=0" -- "$FW" close testbox w1
 git -C "$proj" branch -q -f alt-base master && echo b > "$proj/b" && git -C "$proj" add b && git -C "$proj" commit -q -m b && git -C "$proj" push -q origin master alt-base
 expect "FLEET_BASE_REF sets the worktree's start point when --base is not given" 0 "LAUNCHED testbox/wb " -- \
