@@ -285,7 +285,10 @@ session_of() {
 re_lit() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g'; }
 # `=` forces an exact session name: without it tmux falls back to prefix matching, and with
 # iw-repo-1 gone, -t iw-repo-1 would resolve to iw-repo-12 - reading, or killing, a sibling.
-alive() { tm has-session -t "=iw-$1" 2>/dev/null; }
+# tmux turns a `.` in a session name into `_`, so a dotted worker's session was never found by its
+# own name (and `a.b` would share `a_b`'s): names map `.` to `+`, which no worker name contains.
+sess() { printf 'iw-%s' "${1//./+}"; }
+alive() { tm has-session -t "=$(sess "$1")" 2>/dev/null; }
 WORKERS="$STATE/workers"
 # take_lock <dir> <wait-seconds> <label>: a mkdir lock that records its holder's pid, so a lock
 # left by a killed shell or a rebooted box is reclaimed instead of wedging the name forever.
@@ -1264,7 +1267,7 @@ fi
   if [ "$kind" = claude ]; then echo "channel=stream-json"; echo "proc_offset=0"; echo "input_from=1"; echo "awaiting=$bid"; fi
 } > "$d/meta" || refuse "cannot write $d/meta"
 msg=$(tmux_env_check) || refuse "$msg"   # the preflight's read may be minutes old
-tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || refuse "tmux failed"
+tm new-session -d -s "$(sess "$name")" "bash $(printf '%q' "$d/run.sh")" || refuse "tmux failed"
 started=1
 # Ownership is now visible as a live session; the box-wide lock can go.
 release_lock "$blaunch"; blaunch=""
@@ -1594,7 +1597,7 @@ if alive "$name"; then
   if [ "$kill" != 1 ]; then
     echo "UNSTICK REFUSED $BOX/$name: still running -- a resume beside a live exec gives the branch two writers; pass --kill to stop it first"; exit 1
   fi
-  tm kill-session -t "=iw-$name"
+  tm kill-session -t "=$(sess "$name")"
   for i in $(seq 1 30); do alive "$name" || break; sleep 1; done
 fi
 # The tmux session is gone; make sure the CLI it ran is too (it could have been reparented).
@@ -1653,7 +1656,7 @@ if [ "$kind" = claude ]; then
   ilines=$il
   printf '%s\n' "$line" >> "$d/input.jsonl" 2>/dev/null || { echo "UNSTICK REFUSED $BOX/$name: cannot append to $d/input.jsonl"; exit 1; }
 fi
-if ! tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")"; then
+if ! tm new-session -d -s "$(sess "$name")" "bash $(printf '%q' "$d/run.sh")"; then
   [ -e "$d/exit.prev" ] && mv -f "$d/exit.prev" "$d/exit"
   mv -f "$d/meta.prev" "$d/meta"
   echo "UNSTICK REFUSED $BOX/$name: tmux failed (previous exit record and meta kept)"; exit 1

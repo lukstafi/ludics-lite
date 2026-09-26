@@ -1228,6 +1228,8 @@ settle wq
 printf 'SLEEP 60\n' > "$TMP/slow.md"
 "$FW" launch testbox a.b --target-repo example/project --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1
 expect "a dotted name is killed by a literal match, not a regex" 0 "RESUMED testbox/a.b" -- "$FW" unstick testbox a.b --message "$TMP/msg.md" --kill
+# tmux turns a `.` in a session name into `_`: the session must still be found by the worker's name.
+expect "...and its session is found by its own name, not read as an orphan" 0 "^\(RUNNING\|IDLE\) testbox/a.b " -- "$FW" status testbox a.b
 settle a.b
 mkdir -p "$TMP/nouuid"; printf '#!/bin/sh\nexit 1\n' > "$TMP/nouuid/uuidgen"; chmod +x "$TMP/nouuid/uuidgen"
 expect "no uuidgen: a fallback still yields a session id" 0 "LAUNCHED testbox/nu kind=claude session=[0-9a-f-]\{36\}" -- \
