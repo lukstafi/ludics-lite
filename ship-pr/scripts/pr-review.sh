@@ -6113,7 +6113,8 @@ head_within_paths_ignore() {
 #       and the head's build signal — the one `merge` gated on — is green (or red).
 #
 # Anything else is "no verdict", never an older green. Source (c) of the issue, the latest daily
-# sweep record at or after the tip, has no machine-readable form on this side and is not read.
+# sweep record at or after the tip, has no machine-readable form on this side and is not read
+# (ludics-lite#414, with the docs-only merge whose PR head no run judged).
 #
 # Which workflows this applies to is base_push_trigger's allowlist: only one whose push rows
 # exist AND whose file at the tip was read and declares no push. A workflow that never ran on
@@ -6275,7 +6276,7 @@ cmd_base() {
       [ -n "$rsha$rverdict$rid$rwhen" ] || continue
       [[ "$rsha" =~ ^[0-9a-f]{40}$ ]] && [[ "$rverdict" =~ ^(pass|fail)$ ]] &&
         [[ "$rid" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$rwhen" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+Z-]+$ ]] ||
-        die "base: --integration-records: a row is not <sha> <pass|fail> <request id> <concluded at>, tab-separated: $(printf '%q' "$rsha	$rverdict	$rid	$rwhen")"
+        die "base: --integration-records: a row is not <sha> <pass|fail> <request id> <concluded at>, tab-separated: $(printf '%q' "$rsha"$'\t'"$rverdict"$'\t'"$rid"$'\t'"$rwhen")"
       BASE_INTEGRATION_ROWS="${BASE_INTEGRATION_ROWS}${rsha}"$'\t'"${rverdict}"$'\t'"${rid}"$'\t'"${rwhen}"$'\n'
     done <"$records"
   fi
