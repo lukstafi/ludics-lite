@@ -5539,27 +5539,24 @@ END {
   for (i = 1; i <= n; i++) print key_of[i]
 }'
 
-# workflow_path <workflow id>: where that workflow's file lives, or nothing — exit 1 when the API
-# answered no or the path is not one to read, 3 when the read itself outlived its retries
-# (gh_retry's own split, which base_push_trigger reads to tell UNKNOWN from an answer).
+# workflow_path <workflow id>: where that workflow's file lives, or nothing (exit 1).
 workflow_path() {
   local wpath
-  wpath=$(gh_retry read api "repos/$REPO/actions/workflows/$1" --jq '.path // ""') || return $?
+  wpath=$(gh_retry read api "repos/$REPO/actions/workflows/$1" --jq '.path // ""') || return 1
   # One path, and one that stays inside the repository: the value is interpolated into a REST
   # path, so a newline or a traversal in it is a different request, not a workflow file.
   case "$wpath" in '' | *$'\n'* | */../* | ../* | /*) return 1 ;; esac
   printf '%s\n' "$wpath"
 }
 
-# workflow_body <path> <ref>: the file's own text at that ref, or nothing — exit 1 or 3 as
-# workflow_path's. The ref matters: the filter that decides whether a commit gets a run is the one
-# that commit carries.
+# workflow_body <path> <ref>: the file's own text at that ref, or nothing (exit 1). The ref
+# matters: the filter that decides whether a commit gets a run is the one that commit carries.
 workflow_body() {
   local body
   # The raw media type, so the file arrives as itself: the JSON form is base64 whose decoder is
   # spelled `-d` on one of this fleet's two platforms and `-D` on the other.
   body=$(gh_retry read api -H "Accept: application/vnd.github.raw" \
-    "repos/$REPO/contents/$(encode_ref "$1")?ref=$2") || return $?
+    "repos/$REPO/contents/$(encode_ref "$1")?ref=$2") || return 1
   [ -n "$body" ] || return 1
   printf '%s\n' "$body"
 }
@@ -5598,17 +5595,23 @@ workflow_files_at() {
 
 # base_push_trigger <workflow id> <tip>: does this workflow's file AT THE TIP declare a `push`
 # trigger at all (ludics-lite#401)? BASE_TRIGGER answers `push`, `pushless` (the file was read,
-# parsed, and names no push event), or `unread` (the API answered that there is no such file, or
-# the narrow WORKFLOW_KEYS reader refused it); BASE_TRIGGER_BODY keeps the file's text for the
-# paths-ignore settle, so one read of the file serves both. Exit 3 when the read outlived its
-# retries: that is UNKNOWN, and it is not remembered.
+# parsed, and names no push event), `unparsed` (the file was read and the narrow WORKFLOW_KEYS
+# reader refused it) or `absent` (the file is established NOT to be at the tip);
+# BASE_TRIGGER_BODY keeps the file's text for the paths-ignore settle, so one read of the file
+# serves both. Exit 3 — UNKNOWN, not remembered — whenever a read failed without establishing
+# anything: a transport failure, and any refusal of the API's (403, 401, or a 404 the directory
+# listing does not confirm), since a token that may read Actions but not the file would otherwise
+# pass for a file with no trigger to read (review round 1).
 #
 # BOUNDARY, as a fail-closed allowlist: `pushless` is claimed only for a file that was read whole
 # and whose `on:` block this reader parsed and found without `push` in any of its three forms
-# (mapping, scalar, flow). Everything else is read as a push workflow, exactly as before #401 —
-# including a `push` whose `branches:` filter does not reach this branch, which this does not
-# evaluate (#176 is why: what a push filter reaches is not answerable from these feeds). So the
-# direction every doubt takes is the old reading, never a new "no verdict" on a push repository.
+# (mapping, scalar, flow). `unparsed` and `absent` are read as a push workflow, exactly as before
+# #401, and so is a `push` whose `branches:` filter does not reach this branch, which this does not
+# evaluate (#176 is why: what a push filter reaches is not answerable from these feeds). So a
+# file read in full takes the old reading only when this reader cannot say what it declares, and
+# an ABSENT file only when the directory at the tip was read and does not hold it: a workflow the
+# tip deleted (or a dynamic one, like Pages' `dynamic/pages/...`, which has no file) keeps the
+# reading it had before #401, which is not this change's to alter.
 #
 # Remembered per <workflow>/<tip> in the current shell, so it must be called outside a command
 # substitution to save the next round its reads.
@@ -5625,17 +5628,21 @@ base_push_trigger() {
     BASE_TRIGGER_BODY=$(jq -r '. // ""' <<<"${row#*$'\t'}")
     return 0
   fi
-  body=""
-  class=unread
-  wpath=$(workflow_path "$wid")
+  class=unparsed
+  wpath=$(workflow_path "$wid") || return 3
+  body=$(workflow_body "$wpath" "$tip")
   rc=$?
-  if [ "$rc" -eq 0 ]; then
-    body=$(workflow_body "$wpath" "$tip")
-    rc=$?
-  fi
-  [ "$rc" -ne 3 ] || return 3
-  [ "$rc" -eq 0 ] || body=""
-  if [ -n "$body" ] && evs=$(awk -v q="'" -v dq='"' -v want= "$WORKFLOW_KEYS" <<<"$body"); then
+  if [ "$rc" -ne 0 ]; then
+    # Only a 404 can mean "not at the tip", and only the directory at the tip can say that it
+    # does: its own listing read, whole, without the file.
+    # The error file itself, not gh_err_line: that falls back to this shell's GH_ERR, which may
+    # be an older call's, when the read failed only because the body came back empty.
+    case "$(cat "$GH_ERR_FILE" 2>/dev/null)" in *"HTTP 404"*) ;; *) return 3 ;; esac
+    evs=$(workflow_files_at "$tip") || return 3
+    ! grep -qxF -- "$wpath" <<<"$evs" || return 3
+    class=absent
+    body=""
+  elif evs=$(awk -v q="'" -v dq='"' -v want= "$WORKFLOW_KEYS" <<<"$body"); then
     if grep -qx push <<<"$evs"; then class=push; else class=pushless; fi
   fi
   BASE_TRIGGER="$class"
@@ -6121,10 +6128,17 @@ head_within_paths_ignore() {
 # push to this branch is outside it (the fold's `norun`, as before), and a repository whose
 # workflows still run on push reads exactly as it did — every doubt about a file falls that way.
 
-# tip_pr_head_verdict <branch> <tip sha>: source (a), callable on its own (ludics-lite#308 reads a
-# push repository's pending tip through it). Sets TIP_PR_VERDICT to green | red | pending | none,
-# TIP_PR_WHY to the sentence naming the source or saying why there is none, and TIP_PR_NUM /
-# TIP_PR_HEAD when a PR was found. Exit 3 when a read failed — UNKNOWN, which is not "none".
+# tip_pr_head_verdict <branch> <tip sha> [<workflow id>:<name>...]: source (a), callable on its own
+# (ludics-lite#308 reads a push repository's pending tip through it). Sets TIP_PR_VERDICT to green |
+# red | pending | none, TIP_PR_WHY to the sentence naming the source or saying why there is none,
+# and TIP_PR_NUM / TIP_PR_HEAD when a PR was found. Exit 3 when a read failed — UNKNOWN, which is
+# not "none".
+#
+# The workflows named are the ones the verdict is FOR, and each must have a run of its own at the
+# head that concluded `success` — or the answer is none. The head's build signal is an aggregate:
+# on a docs-only PR the retired `ci` is filtered out by its `pull_request` paths-ignore while some
+# other workflow passes, and that green says nothing about `ci` (review round 1). A run that was
+# skipped, neutral or stopped built nothing either.
 #
 # "Clean merge" is established from the commit, not assumed: exactly two parents, committed by
 # GitHub itself (`noreply@github.com`) with a signature GitHub verified. GitHub creates a merge
@@ -6138,7 +6152,9 @@ TIP_PR_WHY=""
 TIP_PR_NUM=""
 TIP_PR_HEAD=""
 tip_pr_head_verdict() {
-  local branch="$1" sha="$2" c rc n p1 email verified prs num head bref res line v
+  local branch="$1" sha="$2" c rc n p1 email verified prs num head bref res line v runs want
+  local wid wname concl unbuilt=""
+  shift 2
   TIP_PR_VERDICT=none TIP_PR_WHY="" TIP_PR_NUM="" TIP_PR_HEAD=""
   case "$sha" in '' | *[!0-9a-f]*)
     TIP_PR_WHY="there is no tip SHA to judge"
@@ -6192,13 +6208,33 @@ tip_pr_head_verdict() {
   *) return 3 ;;
   esac
   TIP_PR_WHY="PR #$num's head ${head:0:8}, which GitHub merged cleanly as the tip ${sha:0:8} (roll-forward rule): $line"
+  [ "$TIP_PR_VERDICT" = green ] && [ $# -gt 0 ] || return 0
+  runs=$(gh_retry read api --paginate "repos/$REPO/actions/runs?head_sha=$head&per_page=100" \
+    --jq '.workflow_runs[] | [(.created_at // "-"), ((.id // 0) | tostring),
+          ((.workflow_id // 0) | tostring), (.status // "-"), (.conclusion // "pending")] | @tsv')
+  rc=$?
+  [ "$rc" -eq 0 ] || return 3
+  runs=$(newest_first 1 2 <<<"$runs")
+  for want in "$@"; do
+    wid="${want%%:*}"
+    wname="${want#*:}"
+    # The newest COMPLETED run of that workflow at the head: the green above already says nothing
+    # is in flight there.
+    concl=$(awk -F'\t' -v w="$wid" '$3 == w && $4 == "completed" { print $5; exit }' <<<"$runs")
+    [ "$concl" = success ] || unbuilt="${unbuilt:+$unbuilt, }$wname (${concl:-no run})"
+  done
+  if [ -n "$unbuilt" ]; then
+    TIP_PR_VERDICT=none
+    TIP_PR_WHY="PR #$num's head ${head:0:8}, which GitHub merged cleanly as the tip ${sha:0:8}, has no successful run of $unbuilt: its green is about other workflows"
+  fi
 }
 
 # The integration records `--integration-records` handed in: "<sha>\t<pass|fail>\t<request
 # id>\t<concluded at>" rows, validated as they were loaded.
 BASE_INTEGRATION_ROWS=""
 
-# tip_named_source <branch> <tip sha>: the tip's verdict from the named sources, (b) then (a).
+# tip_named_source <branch> <tip sha> <workflow id>:<name>...: the tip's verdict for those
+# workflows from the named sources, (b) then (a).
 # Sets SRC_VERDICT (green | red | pending | none), SRC_WHY, and SRC_NAME (the source in a few words,
 # for the verdict line); exit 3 on UNKNOWN. A settled answer
 # is remembered for its tip, since neither source changes its mind about a commit; a pending one
@@ -6208,8 +6244,9 @@ SRC_WHY=""
 SRC_NAME=""
 SRC_TIP=""
 tip_named_source() {
-  local branch="$1" sha="$2" row rsha verdict rid when
-  if [ -n "$SRC_TIP" ] && [ "$SRC_TIP" = "$sha" ]; then return 0; fi
+  local branch="$1" sha="$2" key="$*" row rsha verdict rid when
+  # Keyed by the tip AND the workflows asked about: a later round can set aside another one.
+  if [ -n "$SRC_TIP" ] && [ "$SRC_TIP" = "$key" ]; then return 0; fi
   SRC_TIP=""
   # The newest record at the tip, by its conclusion time (ISO 8601 from one clock, so it sorts
   # as text): a re-run that passed after a flaky failure is the answer, and so is the reverse.
@@ -6220,10 +6257,11 @@ tip_named_source() {
     if [ "$verdict" = pass ]; then SRC_VERDICT=green; else SRC_VERDICT=red; fi
     SRC_WHY="source (b): integration record $rid ran the tip ${rsha:0:8} and concluded $verdict ($when)"
     SRC_NAME="integration record $rid"
-    SRC_TIP="$sha"
+    SRC_TIP="$key"
     return 0
   fi
-  tip_pr_head_verdict "$branch" "$sha" || return 3
+  shift 2
+  tip_pr_head_verdict "$branch" "$sha" "$@" || return 3
   SRC_VERDICT="$TIP_PR_VERDICT"
   SRC_NAME="PR #$TIP_PR_NUM's head run (roll-forward rule)"
   if [ "$SRC_VERDICT" = none ]; then
@@ -6231,7 +6269,7 @@ tip_named_source() {
   else
     SRC_WHY="source (a): $TIP_PR_WHY"
   fi
-  [ "$SRC_VERDICT" = pending ] || SRC_TIP="$sha"
+  [ "$SRC_VERDICT" = pending ] || SRC_TIP="$key"
   return 0
 }
 
@@ -6243,7 +6281,8 @@ cmd_base() {
   local norun=0 tip_seen_at tip_age hold ebranch
   local tip_unjudged=0 unrun_rows="" settle_why
   local started now beat waited_note="" no_tip_verdict=""
-  local records="" rrow rsha rverdict rid rwhen pushless="" src_pending=0 src_none=0 trig_note
+  local records="" rsha rverdict rid rwhen pushless="" pushless_ids=() src_pending=0 src_none=0
+  local trig_note
   while [ $# -gt 0 ]; do
     case "$1" in
     # The integration records `fleet-worker.sh gate` hands in (source (b) above). Matched before
@@ -6318,7 +6357,7 @@ cmd_base() {
   grace_from=$started
   while :; do
     red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0 norun=0
-    tip_unjudged=0 unrun_rows="" pushless="" src_pending=0 src_none=0
+    tip_unjudged=0 unrun_rows="" pushless="" pushless_ids=() src_pending=0 src_none=0
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
     tip=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || tip=""
@@ -6439,11 +6478,14 @@ cmd_base() {
               "($(gh_err_line)): whether it still runs on push is UNKNOWN, which is NOT 'green'."
           if [ "$BASE_TRIGGER" = pushless ]; then
             pushless="${pushless:+$pushless, }$name"
+            pushless_ids+=("$wfid:$name")
             out="${out}  retired  $name — no push trigger at the tip, so its newest judged push run ($vconcl at ${vsha:0:8}) is history, not the tip's verdict"$'\n'
             continue
           fi
-          [ "$BASE_TRIGGER" = push ] ||
-            trig_note="           ($name's file at the tip could not be read for its triggers, so it is read as a push workflow)"$'\n'
+          case "$BASE_TRIGGER" in
+          unparsed) trig_note="           ($name's file at the tip could not be parsed for its triggers, so it is read as a push workflow)"$'\n' ;;
+          absent) trig_note="           ($name's file is not at the tip, so its standing verdict is read as it was before ludics-lite#401)"$'\n' ;;
+          esac
         fi
         [ "$status" = completed ] || inflight=$((inflight + 1))
         if [ -n "$tip" ] && [ "$vsha" = "$tip" ]; then
@@ -6511,7 +6553,7 @@ cmd_base() {
       # The workflows set aside above get the tip's verdict from a NAMED source, once for all of
       # them: both sources judge the tip's tree as a whole, not one workflow of it.
       if [ -n "$pushless" ]; then
-        tip_named_source "$branch" "$tip" ||
+        tip_named_source "$branch" "$tip" ${pushless_ids[@]+"${pushless_ids[@]}"} ||
           fail 3 "could not read a verdict source for $REPO $branch's tip ${tip:0:8}" \
             "($(gh_err_line)): the tip's verdict is UNKNOWN, which is NOT 'green'."
         case "$SRC_VERDICT" in

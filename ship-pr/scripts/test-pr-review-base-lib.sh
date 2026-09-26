@@ -80,6 +80,10 @@ TIP=""
 WORKFLOWS_JSON=""
 JOBS_DEFAULT=""
 FAIL_ENDPOINT=""
+# The HTTP status a failed read reports: a 5xx is transport, which gh_retry retries, while a 4xx is
+# the API's answer — a 404 or a 403 on the workflow file is how base_push_trigger meets a missing
+# file and a token that may not read it (ludics-lite#401).
+FAIL_STATUS=""
 # The settle path's three reads (ludics-lite#156): the workflow FILE (its path, then its body at
 # the tip, served raw as the library asks for it) and the compare from the judged commit to the
 # tip. One body and one file list for every workflow here: the cases that care which compare was
@@ -106,6 +110,9 @@ FILES_DEFAULT=""
 # `checks` reads it — the PR itself (HEAD_PR), its check runs (HEAD_CHECKS) and its workflow runs
 # (HEAD_RUNS).
 COMMIT_META=""
+# The `.github/workflows` directory at a ref, as the Contents API lists it: what confirms that a
+# workflow file answering 404 is really absent there.
+WORKFLOW_DIR=""
 TIP_PULLS=""
 HEAD_PR=""
 HEAD_CHECKS=""
@@ -193,6 +200,7 @@ reset_fixture() {
   done
   JOBS_DEFAULT=$(jobs_json '[]')
   FAIL_ENDPOINT=""
+  FAIL_STATUS=500
   BASE_JOBS_CACHE=""
   BASE_RED_DETAIL=""
   BASE_IGNORE_CACHE=""
@@ -204,6 +212,7 @@ reset_fixture() {
   COMPARE_BEHIND=""
   FILES_DEFAULT='[]'
   COMMIT_META='{}'
+  WORKFLOW_DIR='[{"type":"file","path":".github/workflows/ci.yml"}]'
   TIP_PULLS='[]'
   HEAD_PR='{}'
   HEAD_CHECKS='{"check_runs":[]}'
@@ -236,7 +245,7 @@ gh() {
     # shellcheck disable=SC2254
     case "$FIXTURE_ENDPOINT" in
     $FAIL_ENDPOINT)
-      echo "gh: $FIXTURE_ENDPOINT unavailable (HTTP 500)" >&2
+      echo "gh: $FIXTURE_ENDPOINT unavailable (HTTP $FAIL_STATUS)" >&2
       return 1
       ;;
     esac
@@ -272,6 +281,7 @@ gh() {
   # verbatim — the library asks for the raw media type rather than the base64 JSON, whose decoder
   # is spelled differently on this fleet's two platforms.
   "repos/$REPO/actions/workflows/"*) response=$(jq -cn --arg p "$WORKFLOW_PATH" '{path: $p}') ;;
+  "repos/$REPO/contents/.github/workflows?ref="*) response="$WORKFLOW_DIR" ;;
   "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
   "repos/$REPO/compare/"*)
     # Oldest first, so each commit's first parent is the one before it and the first commit's is

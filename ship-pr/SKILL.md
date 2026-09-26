@@ -162,7 +162,7 @@ ahrefs/ocannl#1057). Its last push run stands forever, so its verdict would be a
 `base` prints it as `retired` history instead. The tip's verdict for such a workflow comes only
 from a source the report names: an integration record concluded at exactly the tip (the wave gate
 hands those in), or the head run of the PR the tip merged, under the roll-forward rule, when the
-tip is GitHub's own merge commit of that head. A direct push, a squash or rebase merge, or a merge
+tip is GitHub's own merge commit of that head and the workflow itself ran green on it. A direct push, a squash or rebase merge, or a merge
 made outside GitHub has neither, and reads **no verdict** (exit 4), never an older green. What
 counts as "no longer runs on push" is narrow on purpose: its file at the tip was read and names no
 `push` trigger. A workflow that still declares `push`, or whose file the reader refuses, reads as

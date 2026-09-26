@@ -188,6 +188,25 @@ test_a_red_head_is_a_red_tip() {
   assert_eq "$(rounds_polled)" 1 "a red at the tip ends the wait on the round that saw it"
 }
 
+# The head's build signal is an AGGREGATE, and the tip's verdict is for the retired workflow: a
+# docs-only PR whose `ci` its own pull_request paths-ignore filtered out, with some other workflow
+# green, has a green head that says nothing about `ci` (review round 1). So the retired workflow
+# needs a run of its own at the head that concluded success — a skipped one built nothing either.
+test_a_green_head_without_a_run_of_the_retired_workflow_is_no_source() {
+  local runs
+  for runs in \
+    '[{"created_at":"2026-09-26T07:41:00Z","id":8002,"workflow_id":2,"event":"pull_request","name":"lint","status":"completed","conclusion":"success"}]' \
+    '[{"created_at":"2026-09-26T07:41:00Z","id":8003,"workflow_id":1,"event":"pull_request","name":"ci","status":"completed","conclusion":"skipped"},
+      {"created_at":"2026-09-26T07:41:00Z","id":8004,"workflow_id":2,"event":"pull_request","name":"lint","status":"completed","conclusion":"success"}]'; do
+    pushless_fixture
+    HEAD_RUNS=$(jq -cn --argjson r "$runs" '{workflow_runs: $r}')
+    run_base
+    assert_eq "$BASE_RC" 4 "a green head is no source for a workflow that did not build on it"
+    assert_contains "$BASE_OUTPUT" "has no successful run of ci (" "the line names the workflow the head never built"
+    assert_not_contains "$BASE_OUTPUT" ": green (tip" "no green is handed out"
+  done
+}
+
 # A head whose run is still going is a source not yet in: the plain read says no verdict, and
 # --wait keeps waiting for it (to its ceiling here), exactly as it would for a run in flight.
 test_a_head_still_running_holds_the_wait() {
@@ -280,19 +299,52 @@ test_a_file_the_reader_refuses_is_read_as_a_push_workflow() {
   assert_eq "$BASE_RC" 0 "an unreadable file keeps the old reading"
   assert_contains "$BASE_OUTPUT" "(that verdict is about ${SHA_A:0:8}, not the tip ${SHA_C:0:8})" \
     "the old verdict line, as before"
-  assert_contains "$BASE_OUTPUT" "(ci's file at the tip could not be read for its triggers, so it is read as a push workflow)" \
-    "and a note that it was not read"
+  assert_contains "$BASE_OUTPUT" "(ci's file at the tip could not be parsed for its triggers, so it is read as a push workflow)" \
+    "and a note that it was not parsed"
   assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "no named source is consulted"
 }
 
-# A read of the file that outlives its retries is UNKNOWN, not a guess in either direction.
+# A read of the file that fails without establishing anything is UNKNOWN, not a guess in either
+# direction: transport that outlived its retries, and just as much the API REFUSING the read — a
+# token that may read Actions but not the repository's contents would otherwise pass for a file
+# with no trigger to read, and the old push green would stand (review round 1). A 404 is only an
+# absent file when the directory listing at the tip, read whole, does not hold it.
 test_a_file_read_that_fails_is_unknown() {
+  local status
+  for status in 500 403 401; do
+    pushless_fixture
+    retune API_ATTEMPTS=1
+    FAIL_ENDPOINT="repos/$REPO/contents/.github/workflows/ci.yml*"
+    FAIL_STATUS="$status"
+    run_base
+    assert_eq "$BASE_RC" 3 "an unread trigger is UNKNOWN (HTTP $status)"
+    assert_contains "$BASE_OUTPUT" "whether it still runs on push is UNKNOWN" "and says what is unknown"
+  done
   pushless_fixture
-  retune API_ATTEMPTS=1
-  FAIL_ENDPOINT="repos/$REPO/contents/*"
+  FAIL_ENDPOINT="repos/$REPO/contents/.github/workflows/ci.yml*"
+  FAIL_STATUS=404
   run_base
-  assert_eq "$BASE_RC" 3 "an unread trigger is UNKNOWN"
-  assert_contains "$BASE_OUTPUT" "whether it still runs on push is UNKNOWN" "and says what is unknown"
+  assert_eq "$BASE_RC" 3 "a 404 for a file the directory at the tip still lists is UNKNOWN"
+  pushless_fixture
+  FAIL_ENDPOINT="repos/$REPO/contents/.github/workflows*"
+  FAIL_STATUS=404
+  run_base
+  assert_eq "$BASE_RC" 3 "and so is a 404 the directory listing cannot confirm"
+}
+
+# A 404 the directory listing at the tip confirms is a file the tip does not hold — a workflow the
+# tip deleted, or a dynamic one with no file at all. That is outside #401: its standing verdict
+# reads as it did before, with a note, rather than turning a push repository's base UNKNOWN.
+test_a_file_confirmed_absent_at_the_tip_reads_as_before() {
+  pushless_fixture
+  FAIL_ENDPOINT="repos/$REPO/contents/.github/workflows/ci.yml*"
+  FAIL_STATUS=404
+  WORKFLOW_DIR='[{"type":"file","path":".github/workflows/other.yml"}]'
+  run_base
+  assert_eq "$BASE_RC" 0 "an absent file keeps the reading it had"
+  assert_contains "$BASE_OUTPUT" "(ci's file is not at the tip, so its standing verdict is read as it was before ludics-lite#401)" \
+    "and says why"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "no named source is consulted"
 }
 
 # Mixed, as ocannl will be: its gh-pages deploy keeps its push trigger while `ci` drops it. The
@@ -321,6 +373,7 @@ tests=(
   test_a_merge_commit_github_did_not_make_is_not_a_clean_merge
   test_the_pr_must_be_the_one_the_tip_merged
   test_a_red_head_is_a_red_tip
+  test_a_green_head_without_a_run_of_the_retired_workflow_is_no_source
   test_a_head_still_running_holds_the_wait
   test_an_integration_record_at_the_tip_is_the_first_source
   test_a_record_at_another_commit_is_not_the_tips
@@ -328,6 +381,7 @@ tests=(
   test_a_workflow_that_still_runs_on_push_reads_as_before
   test_a_file_the_reader_refuses_is_read_as_a_push_workflow
   test_a_file_read_that_fails_is_unknown
+  test_a_file_confirmed_absent_at_the_tip_reads_as_before
   test_a_push_workflow_green_at_the_tip_does_not_speak_for_a_retired_one
 )
 
