@@ -899,7 +899,7 @@ integration_records() {
 
 base_gate() {
   local target="$1" branch="$2" force="$3" reason="$4" expected="${5:-}" helper rc tip encoded
-  local rows records="" args
+  local rows later records="" args
   [[ "$target" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "base gate: --target-repo <owner/repo> required"
   [ -z "$reason" ] || [ "$force" -eq 1 ] || die "base gate: --allow-red-base requires --force for a triage worker"
   case "$branch" in -*|*$'\n'*) die "base gate: invalid --base-branch" ;; esac
@@ -936,6 +936,19 @@ base_gate() {
   base_checker "$helper" "${args[@]}" >&2
   rc=$?
   [ -z "$records" ] || rm -f "$records"
+  # The records were a snapshot, and the read can wait minutes; an integration run concluding
+  # meanwhile would outrank what the checker judged by (review round 6). So a green is taken only
+  # over the records it was given: any change sends the coordinator to read again.
+  if [ "$rc" -eq 0 ]; then
+    if ! later=$(integration_records "$target"); then
+      echo "BASE REFUSED: $target ${branch:-default branch}: the execution registry could not be re-read after the verdict; dispatch blocked" >&2
+      return 1
+    fi
+    if [ "$later" != "$rows" ]; then
+      echo "BASE REFUSED: $target ${branch:-default branch}: an integration record for it concluded during the read, which the verdict did not see; re-run the gate" >&2
+      return 1
+    fi
+  fi
   if [ "$rc" -eq 1 ] && [ "$force" -eq 1 ] && [ -n "$reason" ]; then
     echo "BASE TRIAGE OVERRIDE: $target ${branch:-default branch}: $reason" >&2
     rc=0

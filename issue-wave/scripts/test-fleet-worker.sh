@@ -155,6 +155,7 @@ cp "$FW" "$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
 cp "$HERE/fleet-execution.py" "$TMP/dispatcher/issue-wave/scripts/fleet-execution.py"
 FW="$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
 export BASE_CALL_LOG="$TMP/base-calls"
+export SHIM_FW="$FW"   # the dispatcher copy, for the shim's mid-read conclusion below
 cat > "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$* grace=${SHIP_PR_BASE_ABSENT_GRACE:-unset} interval=${SHIP_PR_CHECKS_INTERVAL:-unset}" >> "$BASE_CALL_LOG"
@@ -193,6 +194,9 @@ case " $* " in *" --wait=$((SHIP_PR_BASE_ABSENT_GRACE + SHIP_PR_CHECKS_INTERVAL)
 # SHIM_BASE_TOUCH: a marker this read leaves behind, so a test can change the world between the
 # preflight and the launch's far side (the tmux shim's SHIM_TMUX_GENV_WHEN reads it).
 [ -z "${SHIM_BASE_TOUCH:-}" ] || touch "$SHIM_BASE_TOUCH"
+# SHIM_BASE_CONCLUDE: an execution conclusion payload the read concludes while it "waits", as an
+# integration run finishing mid-gate would (ludics-lite#401, review round 6).
+[ -z "${SHIM_BASE_CONCLUDE:-}" ] || env FLEET_BOXES="testbox other" "$SHIM_FW" execution conclude "$SHIM_BASE_CONCLUDE" >/dev/null || exit 3
 if [ -n "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] && [ ! -e "$SHIM_BASE_REQUIRE_PREFLIGHT" ]; then
   echo 'base read occurred before preflight'; exit 3
 fi
@@ -1348,6 +1352,17 @@ grep -Fq -- '--repo example/project base --wait=360 --integration-records ' "$BA
 [ "$(grep -c '^records: ' "$BASE_CALL_LOG")" = 1 ] && grep -q "^records: $ran	pass	int-a	" "$BASE_CALL_LOG" && ok "...only the marked integration pass/fail for that repository" || ko "wrong records offered: $(cat "$BASE_CALL_LOG")"
 # (With no record for the target, the call carries no flag at all: the "base gate" section's
 # exact call lines above pin that, since its gates ran before any record existed.)
+# A record concluding while the checker reads is one its verdict did not see: the green is refused
+# and the coordinator reads again (review round 6 of #401). The shim concludes one mid-read.
+: > "$BASE_CALL_LOG"
+"${FWX[@]}" execution run "$(intreq int-e coordinator example/project true)" >/dev/null || ko "could not reserve int-e (setup)"
+jq -n --arg sha "$ran" --arg wt "$wt" '{request_id:"int-e", verdict:"fail", log:"/dev/null",
+  evidence:"fixture integration run", observed_sha:$sha, remote_checkout:$wt, handle:"fixture"}' > "$TMP/int-e-done.json"
+expect "a record concluded during the read refuses the green" 1 "concluded during the read" -- \
+  env SHIM_BASE_CONCLUDE="$TMP/int-e-done.json" "$FW" gate --target-repo example/project
+: > "$BASE_CALL_LOG"
+expect "...and the next read hands it over" 0 "BASE GREEN" -- "$FW" gate --target-repo example/project
+grep -q "^records: $ran	fail	int-e	" "$BASE_CALL_LOG" && ok "...with the failed record in the file" || ko "the concluded record was not offered: $(cat "$BASE_CALL_LOG")"
 # An unreadable registry refuses the gate rather than withholding the source: a failed record
 # there would outrank a green PR head (review round 3 of #401).
 printf 'not json\n' > "$ISSUE_WAVE_STATE/executions/zz-broken.json"

@@ -225,7 +225,19 @@ test_a_head_still_running_holds_the_wait() {
   assert_eq "$BASE_RC" 4 "a head still running is no verdict yet"
   assert_contains "$BASE_OUTPUT" "no verdict  ci — not yet: source (a): PR #7's head ${SHA_H:0:8}" \
     "the line names the source it is waiting on"
-  # A re-run of the retired workflow that started after the head's build signal was read is the
+  # Held to the CEILING, which is what the note says — a count of rounds would be on the clock,
+  # and a loaded runner spends a two-second ceiling inside the first round (review round 2). A
+  # wait the pending source did not hold ends on the round that read it, with no ceiling note.
+  pushless_fixture
+  head_signal null
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "at the ceiling a source still judging is no verdict"
+  assert_contains "$BASE_OUTPUT" "(--wait ceiling of 0 min reached" \
+    "the wait was held to its ceiling rather than ended on the round that read the pending source"
+  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" "and says so"
+}
+
+# A re-run of the retired workflow that started after the head's build signal was read is the
 # answer now, and it is still judging: the older completed success beneath it is not taken (review
 # round 5). Here the check list is already green; only the run list shows the re-run.
 test_a_rerun_behind_a_green_head_is_pending() {
@@ -236,18 +248,6 @@ test_a_rerun_behind_a_green_head_is_pending() {
   run_base
   assert_eq "$BASE_RC" 4 "a re-run in flight is no verdict yet"
   assert_contains "$BASE_OUTPUT" "is being re-run by ci" "and the line says which workflow"
-}
-
-# Held to the CEILING, which is what the note says — a count of rounds would be on the clock,
-  # and a loaded runner spends a two-second ceiling inside the first round (review round 2). A
-  # wait the pending source did not hold ends on the round that read it, with no ceiling note.
-  pushless_fixture
-  head_signal null
-  run_base --wait=2
-  assert_eq "$BASE_RC" 4 "at the ceiling a source still judging is no verdict"
-  assert_contains "$BASE_OUTPUT" "(--wait ceiling of 0 min reached" \
-    "the wait was held to its ceiling rather than ended on the round that read the pending source"
-  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" "and says so"
 }
 
 # A plain read tolerates a tip read that fails — its verdict comes from the runs, and the tip only
