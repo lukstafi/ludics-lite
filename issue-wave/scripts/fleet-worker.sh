@@ -34,8 +34,10 @@
 #              a kill), or tmux is gone with a CLI still running, or gone with no exit record.
 #   `exit` is still written only when the process ends, so "finished" means the hand-back turn
 #   ended AND the coordinator closed the input. `attach` returns on either: an IDLE worker whose
-#   latest `result` lies past turn_offset (the stream length when the last message was sent) is
-#   an IDLE verdict, and an ended process is the DONE/FAILED/VANISHED verdict as before.
+#   latest `result` follows the CLI's echo of the latest message sent (meta `awaiting`) is an
+#   IDLE verdict, and an ended process is the DONE/FAILED/VANISHED verdict as before.
+#   turn_offset moves only when a process starts (launch, resume): an append names its message
+#   in `awaiting` alone, so there is one key to write and nothing to reconcile if it is cut off.
 #   One thing IDLE cannot see: a ScheduleWakeup the worker armed is not in the stream, so an IDLE
 #   worker can start a turn on its own; the next `attach` or `status` reads it.
 #
@@ -1641,15 +1643,15 @@ if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name
   # that beats the next command is still read as its reply.
   off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
   # Meta and the input line change together: signals wait until both have (milliseconds), so an
-  # interruption never leaves meta naming a message the input never got, nor half a line.
+  # interruption never leaves meta naming a message the input never got, nor half a line. Only
+  # `awaiting` changes; a writer cut off anyway (SIGKILL) leaves an awaiting awaiting_of ignores.
   trap '' TERM HUP INT
-  # Both keys in one rename (meta_set), the previous values kept in the shell: no backup file.
-  prev_off=$(meta_get "$d" turn_offset); prev_awaiting=$(meta_get "$d" awaiting)
-  meta_set "$d" turn_offset "$off" awaiting "$mid" ||
+  prev_awaiting=$(meta_get "$d" awaiting)
+  meta_set "$d" awaiting "$mid" ||
     { echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta (disk full?); nothing was changed"; exit 1; }
   if ! printf '%s\n' "$line" >> "$d/input.jsonl" 2>/dev/null; then
-    meta_set "$d" turn_offset "$prev_off" awaiting "$prev_awaiting" ||
-      echo "UNSTICK: could not put back $d/meta's turn_offset=$prev_off awaiting=$prev_awaiting; attach waits on a message the input lacks until they are" >&2
+    meta_set "$d" awaiting "$prev_awaiting" ||
+      echo "UNSTICK: could not put back $d/meta's awaiting=$prev_awaiting (awaiting_of ignores the one it names, which the input lacks)" >&2
     # No truncation: the live feeder may already have forwarded a partial write, and a file
     # truncated under `tail -f` is re-read or skipped by platform. Said, not repaired.
     echo "UNSTICK REFUSED $BOX/$name: cannot append to $d/input.jsonl (disk full?); it may now end in a partial line the CLI has already read -- free space, then \`unstick --kill\` it (the resume drops a partial line) rather than appending again"; exit 1
