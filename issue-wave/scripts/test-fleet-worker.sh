@@ -239,7 +239,7 @@ expect() {
 # of its own; `SILENT` exits 0 with no events; `FAIL` answers with an error result and stays up.
 cat > "$TMP/bin/claude" <<'EOF'
 #!/usr/bin/env bash
-sid=""; fmt=text; resume=""; infmt=text; replay=0
+sid=""; fmt=text; resume=""; infmt=text; replay=0; probe=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --session-id) sid="$2"; shift ;;
@@ -247,10 +247,17 @@ while [ $# -gt 0 ]; do
     --output-format) fmt="$2"; shift ;;
     --input-format) infmt="$2"; shift ;;
     --replay-user-messages) replay=1 ;;
+    --no-session-persistence) probe=1 ;;   # the preflight's live probe
   esac
   shift
 done
 if [ "$infmt" = stream-json ]; then
+  # SHIM_CLAUDE_OLD: a CLI that predates the stream-json channel, as commander reports it.
+  [ -z "${SHIM_CLAUDE_OLD:-}" ] || { echo "error: unknown option '--input-format'" >&2; exit 1; }
+  if [ "$probe" = 1 ]; then
+    [ -z "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] || touch "$SHIM_BASE_REQUIRE_PREFLIGHT"
+    [ -n "${SHIM_CLAUDE_HANG:-}" ] && sleep 30
+  fi
   echo_line() { [ "$replay" = 0 ] || jq -c '. + {isReplay: true}' <<<"$1"; }
   say() { jq -cn --arg t "$1" '{type: "assistant", message: {content: [{type: "text", text: $t}]}}'; }
   result() { jq -cn --arg t "$1" --arg s "$sid" --argjson e "${2:-false}" '{type: "result", subtype: (if $e then "error_during_execution" else "success" end), is_error: $e, num_turns: 1, result: $t, session_id: $s}'; }
@@ -272,7 +279,7 @@ if [ "$infmt" = stream-json ]; then
     done
     text="did: $(printf '%s' "$msg" | tr '\n' ' ' | cut -c1-40)$extra"
     say "$text"
-    if grep -q '^FAIL' <<<"$msg"; then result boom true; continue; fi
+    if grep -q '^FAIL' <<<"$msg"; then result "boom: $text" true; continue; fi
     bg=$(sed -n '/^BG [0-9]/ { s/^BG \([0-9]*\).*/\1/; p; q; }' <<<"$msg")
     if [ -n "$bg" ]; then
       echo '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash"}]}'
@@ -908,6 +915,7 @@ expect "a GitHub that cannot be reached is noted on the OK line" 0 "PREFLIGHT OK
 expect "a GitHub outage (HTTP 5xx) is noted, not refused" 0 "PREFLIGHT OK.*GitHub unreachable from testbox: gh api user: gh: Server Error (HTTP 502)" -- env SHIM_GH=5xx "$FW" preflight testbox --no-probe --no-cross
 expect "a gh call that never returns is bounded and noted" 0 "PREFLIGHT OK.*GitHub unreachable from testbox: no answer from gh api user in 2s" -- env SHIM_GH=hang FLEET_GH_TIMEOUT=2 "$FW" preflight testbox --no-probe --no-cross
 expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
+expect "the live probe runs the worker's own stream-json mode: a CLI without it is refused" 1 "claude cannot run headless: error: unknown option '--input-format'" -- env SHIM_CLAUDE_OLD=1 "$FW" preflight testbox
 expect "native preflight needs neither CLI login nor a model probe" 0 "PREFLIGHT OK" -- env SHIM_CODEX_LOGIN_DOWN=1 SHIM_CODEX_DOWN=1 SHIM_CLAUDE_DOWN=1 "$FW" preflight testbox --native-codex
 expect "native Claude needs no CLI model probe" 0 "PREFLIGHT OK" -- env SHIM_CLAUDE_DOWN=1 SHIM_CODEX_LOGIN_DOWN=1 "$FW" preflight testbox --native-claude
 expect "legacy preflight still requires CLI login" 1 "codex not logged in" -- env SHIM_CODEX_LOGIN_DOWN=1 "$FW" preflight testbox --codex --no-probe
@@ -1139,7 +1147,8 @@ out=$(FLEET_BOXES="testbox" "$FW" ls 2>&1)
 
 section "failure verdicts" && {
 need_lease   # this section and every one below launch workers; see the shared setup above
-printf 'FAIL on purpose\n' > "$TMP/fail.md"
+# Its result text says `is_error=false`: the verdict reads the field, never the text.
+printf 'FAIL on purpose; is_error=false\n' > "$TMP/fail.md"
 "$FW" launch testbox wf --target-repo example/project --kind claude --brief "$TMP/fail.md" --cwd "$proj" >/dev/null
 expect "an erroring turn attaches as FAILED idle, exit 1: the process awaits input" 1 "FAILED testbox/wf idle error_during_execution is_error=true .* | awaiting input" -- "$FW" attach testbox wf --interval 1
 expect "...and its close reports the failed last turn" 1 "FAILED testbox/wf exit=0 error_during_execution is_error=true" -- "$FW" close testbox wf

@@ -733,14 +733,19 @@ if [ "$codex" = 1 ] || [ "$codex" = native ]; then
 elif [ "$codex" = 0 ]; then
   command -v claude >/dev/null 2>&1 || note "no claude on PATH"
   # `claude auth status` reports loggedIn:true over an expired, unrefreshable OAuth session
-  # (observed 2026-09-02 on minix); only a live turn proves the CLI can run headless here.
+  # (observed 2026-09-02 on minix); only a live turn proves the CLI can run headless here. The
+  # turn runs in the worker's own mode, the stream-json channel (ludics-lite#259): a CLI that
+  # predates those flags is refused here, not discovered as a worker that died at launch. One
+  # input line and then EOF: the CLI answers it and exits.
   if [ "$probe" = 1 ] && command -v claude >/dev/null 2>&1; then
-    prompt=$(mktemp "${TMPDIR:-/tmp}/fw-prompt.XXXXXX"); printf 'Reply with the single word ok.' > "$prompt"
-    out=$(cd / && bounded --stdin "$prompt" "$probe_timeout" claude -p --model haiku --output-format json --no-session-persistence); prc=$?
+    prompt=$(mktemp "${TMPDIR:-/tmp}/fw-prompt.XXXXXX")
+    printf '%s\n' '{"type":"user","message":{"role":"user","content":"Reply with the single word ok."}}' > "$prompt"
+    out=$(cd / && bounded --stdin "$prompt" "$probe_timeout" claude -p --model haiku --input-format stream-json --output-format stream-json --verbose --replay-user-messages --no-session-persistence); prc=$?
     rm -f "$prompt"
     if [ "$prc" -eq 124 ]; then note "claude headless probe timed out after ${probe_timeout}s"
     elif ! printf '%s' "$out" | grep -q '"is_error":false'; then
-      note "claude cannot run headless: $(printf '%s' "$out" | grep -o '"result":"[^"]*"' | head -n1 | cut -c1-120)"
+      why=$(printf '%s' "$out" | grep -o '"result":"[^"]*"' | head -n1 | cut -c1-120)
+      note "claude cannot run headless: ${why:-$(printf '%s\n' "$out" | head -n1 | cut -c1-120)}"
     fi
   fi
 fi
@@ -1382,7 +1387,9 @@ verdict() {
   turn() { tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null; }
   case "$kind" in
     claude) summary=$(turn | jq -Rr 'fromjson? | select(.type=="result") | "\(.subtype) is_error=\(.is_error) turns=\(.num_turns) " + ((.result // "")|tostring|.[0:200]|gsub("\n";" "))' 2>/dev/null | tail -n1)
-            ok_event=$(printf '%s' "$summary" | grep -c 'is_error=false') ;;
+            # From the last result's own field: the summary carries the result text, which can
+            # say anything, `is_error=false` included.
+            ok_event=$(turn | jq -Rrn '[inputs | fromjson? | select(.type=="result")] | last | if . != null and .is_error == false then 1 else 0 end' 2>/dev/null) ;;
     codex)  summary=$(turn | jq -Rr 'fromjson? | select(.type=="turn.completed" or .type=="turn.failed") | .type + " " + ((.error.message // "")|tostring|.[0:200])' 2>/dev/null | tail -n1)
             ok_event=$(printf '%s' "$summary" | grep -c '^turn.completed')
             last=$(turn | jq -Rr 'fromjson? | select(.type=="item.completed" and .item.type=="agent_message") | .item.text' 2>/dev/null | tail -n1 | cut -c1-200)
@@ -1583,7 +1590,10 @@ on_exit() {
   fi
   # An append interrupted between its meta update and its line: meta must not name a message
   # the input never got, or attach and close would wait on it forever.
-  if [ "$appending" = 1 ] && [ -e "$d/meta.prev" ]; then mv -f "$d/meta.prev" "$d/meta" 2>/dev/null; fi
+  # Whether the line landed is read from the file, not from a flag a signal can beat.
+  if [ "$appending" = 1 ] && [ -e "$d/meta.prev" ]; then
+    if grep -qF -- "\"uuid\":\"$mid\"" "$d/input.jsonl" 2>/dev/null; then rm -f "$d/meta.prev"; else mv -f "$d/meta.prev" "$d/meta" 2>/dev/null; fi
+  fi
   release_lock "$wlock"; [ -n "$blaunch" ] && release_lock "$blaunch"
 }
 trap on_exit EXIT; trap 'exit 143' TERM HUP INT
