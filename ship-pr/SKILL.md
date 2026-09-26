@@ -61,24 +61,22 @@ takes the current HEAD, which from a stale checkout drops the commits just lande
 The trade is explicit: a direct commit gets no review at all. Anything carrying a design decision
 goes through the full loop below.
 
-**Under Claude Code's auto permission mode, no landing is the agent's alone.** The classifier's
-default `Merge Without Review` rule blocks "merging a PR before any human has approved it", and it
-has refused every landing this skill makes: the direct push above (ludics-lite#312), a
-merge on the reviewer's 👍 with CI green, since a bot is not a human (ludics-lite#187), and the
-close-out merge of *When the loop ends* (ludics-lite#352). Its refusal tells the session to stop
-and ask, so an attempt made first is dead time. What clears it is the user's go-ahead naming the
-merge of this PR (or this push), or an `autoMode.allow` entry in their settings that covers the
-repository. So under auto mode ask once, in the message that proposes the landing, never after a
-refusal. For a change with nothing to review the cheapest form is a PR that merges on CI alone,
-with no `watch` round: open it, propose the merge without review in the same message, and on the
-user's "yes" run, backgrounded,
+**Under Claude Code's auto permission mode, a landing needs the user's cover.** The classifier's
+`Merge Without Review` rule blocks merging before a human has approved (a bot's 👍 is not one),
+and a refusal is dead time. The user's `autoMode.allow` settings cover one path, standing:
+`pr-review.sh merge` (bare, `--wait[=<s>]` or `--require-green`) in lukstafi/ludics-lite and
+lukstafi/ocannl-staging, for a PR whose head this session pushed — run it as in any mode.
+Anything else — a direct push, `--override` or `--allow-no-verdict`, a bare `gh pr merge`, any
+other repository — needs the user's go-ahead naming it: ask once, in the message that proposes
+the landing, never after a refusal. For a change with nothing to review the cheapest form under
+auto mode is a PR that merges on CI alone, with no `watch` round, run backgrounded:
 
 ```bash
 ~/.claude/skills/ship-pr/scripts/pr-review.sh merge <owner>/<repo>#<pr> --wait
 ```
 
-It reads the build signal and never the 👍, and CI runs while the question waits. It keeps the
-build gate the direct push skips; the push stays the lighter act where the user names that instead.
+It reads the build signal and never the 👍 (where a go-ahead is needed, CI runs while the question
+waits). It keeps the build gate the direct push skips; the push stays the lighter act where the user names that instead.
 
 The `gh` recipes below are packaged as `~/.claude/skills/ship-pr/scripts/pr-review.sh` (`poll`,
 `watch`, `status`, `checks`, `merge`, `base`, `reply`, `resolve`, `comment`, `retry`), which
@@ -714,8 +712,7 @@ Then merge:
 
 `merge` (below) reads the build signal and the open review threads, not the 👍 — so the
 "resolved" in the second bullet is one it checks. The maintainer reads in the record what was
-not done and why, instead of finding it in the next PR's review. Under Claude Code's auto mode,
-ask for this merge in the message carrying the record, not after trying it (*PR or direct commit?*).
+not done and why, instead of finding it in the next PR's review.
 
 Both exits have an incentive problem: past the threshold, deferring is cheaper than fixing, and
 rebutting is cheaper than either at any round. The threads and the record paragraph are the only
@@ -1213,8 +1210,7 @@ replace the ancestry guard with `git branch -d`: `-d` may test a configured upst
 the base, making deletion either tautological or a false refusal after the worktree is already gone.
 
 If the harness blocks the merge itself, that is a permission gate, not a failure: explain what you
-were doing, give the command, and let the user decide. Never work around it. Under Claude Code's
-auto mode it is the expected answer, so ask before the attempt (*PR or direct commit?*).
+were doing, give the command, and let the user decide. Never work around it.
 
 After merging: run the `after-merge` brainstorm FIRST, while the session's friction is still in
 context. Then refresh the base for the next branch (`git fetch origin`, then branch off
