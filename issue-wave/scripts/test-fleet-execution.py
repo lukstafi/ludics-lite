@@ -434,7 +434,13 @@ import io
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
+# Its own roster and payload: the module-level `env` and `request` belong to whichever block last
+# bound them, which a block added above this one changes (#412).
 with tempfile.TemporaryDirectory(prefix='fleet-durable-') as temporary:
+    roster = 'mac'
+    payload = dict(request_id='durable', wave='wave', worker='durable', transport='subagent',
+                   issue='repo#157', purpose='fixture', agent_host='mac', execution_host='mac',
+                   repository='owner/repo', requested_revision='origin/main', kind='correctness')
     events = []
     real_sync, real_replace = os.fsync, os.replace
 
@@ -446,14 +452,13 @@ with tempfile.TemporaryDirectory(prefix='fleet-durable-') as temporary:
         events.append('replace')
         return real_replace(source, target)
 
-    payload = request('durable')
-    with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload), env['FLEET_BOXES']]), \
+    with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload), roster]), \
             patch('os.fsync', side_effect=sync), patch('os.replace', side_effect=replace):
         with redirect_stdout(io.StringIO()):
             runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
     assert events == ['directory', 'file', 'replace', 'directory'], events
     events.clear()
-    with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload), env['FLEET_BOXES']]), \
+    with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload), roster]), \
             patch('os.fsync', side_effect=sync), redirect_stdout(io.StringIO()):
         runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
     assert events == ['directory', 'directory'], events
