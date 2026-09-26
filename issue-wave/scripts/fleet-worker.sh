@@ -881,7 +881,9 @@ base_checker() (
 # registry admits only on a coordinator's non-standing `correctness` request - whose verdict is
 # pass or fail at an exact observed SHA. A correctness run without the field is a targeted batch
 # as far as this is concerned, however it was meant (review round 2): the allowlist is the filter
-# below, and a record outside it is simply not a source. Exit 1 when the registry could not be read.
+# below, and a record outside it is simply not a source. The repository is compared without case,
+# as GitHub names it (review round 4): a record spelled `Owner/Repo` is the same repository's.
+# Exit 1 when the registry could not be read.
 integration_records() {
   local listing
   listing=$(execution_listing "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py") || return 1
@@ -889,7 +891,8 @@ integration_records() {
     | select(.state == "concluded" and (.verdict == "pass" or .verdict == "fail")
              and .request.integration == true and .request.transport == "coordinator"
              and .request.kind == "correctness"
-             and .request.repository == $repo and (.request.standing // false) == false
+             and (.request.repository | ascii_downcase) == ($repo | ascii_downcase)
+             and (.request.standing // false) == false
              and ((.observed_sha // "") | test("^[0-9a-f]{40}$")))
     | [.observed_sha, .verdict, .request_id, .updated_at] | @tsv' <<<"$listing"
 }
@@ -916,8 +919,14 @@ base_gate() {
   args+=("--wait=$BASE_WAIT")
   if rows=$(integration_records "$target"); then
     if [ -n "$rows" ]; then
-      records=$(mktemp "${TMPDIR:-/tmp}/fw-integration.XXXXXX") || { echo "BASE REFUSED: cannot stage the integration records" >&2; return 1; }
-      printf '%s\n' "$rows" > "$records"
+      # Staged whole or not at all: an empty or cut file is valid input to the checker, and a
+      # record lost in the write would let a green PR head stand for a failed tip (round 4).
+      records=$(mktemp "${TMPDIR:-/tmp}/fw-integration.XXXXXX") &&
+        printf '%s\n' "$rows" > "$records" || {
+        [ -z "$records" ] || rm -f "$records"
+        echo "BASE REFUSED: $target ${branch:-default branch}: cannot stage the integration records; dispatch blocked" >&2
+        return 1
+      }
       args+=(--integration-records "$records")
     fi
   else

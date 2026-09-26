@@ -1334,8 +1334,9 @@ intdone() { # <id> <verdict>: conclude it at $ran
   "${FWX[@]}" execution conclude "$TMP/$1-done.json" >/dev/null || ko "could not conclude $1 (setup)"
 }
 # The coordinator's own correctness run WITHOUT `"integration": true` is a targeted batch as far
-# as the gate is concerned (review round 2 of #401): only the explicit field makes a source.
-for spec in "int-a coordinator example/project pass true" "int-b coordinator example/project pass -" \
+# as the gate is concerned (review round 2 of #401): only the explicit field makes a source. And
+# int-a spells the repository in other letters, which is still the same GitHub repository (round 4).
+for spec in "int-a coordinator Example/Project pass true" "int-b coordinator example/project pass -" \
   "int-c coordinator o/r fail true" "int-d coordinator example/project timeout true"; do
   read -r int_id int_t int_repo int_v int_i <<<"$spec"
   "${FWX[@]}" execution run "$(intreq "$int_id" "$int_t" "$int_repo" "$int_i")" >/dev/null || ko "could not reserve $int_id (setup)"
