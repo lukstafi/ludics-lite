@@ -6681,7 +6681,7 @@ cmd_base() {
     return 4
   fi
   if [ "$src_none" -gt 0 ] || [ "$src_pending" -gt 0 ]; then
-    echo "$REPO $branch: NO VERDICT (tip ${tip:0:8}) — $pushless no longer run(s) on push, and no named source has judged the tip; an older verdict is not the tip's (see above)"
+    echo "$REPO $branch: NO VERDICT (tip ${tip:0:8}) — $pushless no longer run(s) on push, and no named source has judged the tip; an older verdict is not the tip's (see below)"
     printf '%s' "$out"
     return 4
   fi

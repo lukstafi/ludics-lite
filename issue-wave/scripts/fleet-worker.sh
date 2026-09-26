@@ -872,8 +872,30 @@ base_checker() (
   SHIP_PR_BASE_ABSENT_GRACE="$BASE_ABSENT_GRACE" SHIP_PR_CHECKS_INTERVAL="$BASE_POLL_INTERVAL" "$@"
 )
 
+# integration_records <owner/repo>: the execution registry's INTEGRATION RECORDS for that
+# repository, one "<observed sha>\t<pass|fail>\t<request id>\t<concluded at>" row each, for the
+# checker's `base --integration-records` (ludics-lite#401): on a default branch whose CI no longer
+# runs on push, a coordinator's run concluded at exactly the tip is a verdict source the checker
+# names, and the registry is the anchor's, which only this script reads. An integration record is
+# a CONCLUDED, non-standing `correctness` reservation of transport `coordinator` for that
+# repository, whose verdict is pass or fail at an exact observed SHA - the shape executions.md
+# gives a coordinator's integration run. Nothing else in the registry is offered (a worker's
+# batch, a standing iteration record, a timeout, a cancellation), so the allowlist is the filter
+# below and a record outside it is simply not a source. Exit 1 when the registry could not be read.
+integration_records() {
+  local listing
+  listing=$(execution_listing "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py") || return 1
+  jq -r --arg repo "$1" '.[]
+    | select(.state == "concluded" and (.verdict == "pass" or .verdict == "fail")
+             and .request.transport == "coordinator" and .request.kind == "correctness"
+             and .request.repository == $repo and (.request.standing // false) == false
+             and ((.observed_sha // "") | test("^[0-9a-f]{40}$")))
+    | [.observed_sha, .verdict, .request_id, .updated_at] | @tsv' <<<"$listing"
+}
+
 base_gate() {
   local target="$1" branch="$2" force="$3" reason="$4" expected="${5:-}" helper rc tip encoded
+  local rows records="" args
   [[ "$target" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "base gate: --target-repo <owner/repo> required"
   [ -z "$reason" ] || [ "$force" -eq 1 ] || die "base gate: --allow-red-base requires --force for a triage worker"
   case "$branch" in -*|*$'\n'*) die "base gate: invalid --base-branch" ;; esac
@@ -883,12 +905,25 @@ base_gate() {
   # Reuse its bounded integration mode; preserve the established absence grace
   # for path-filtered tips, independent of the coordinator's ambient settings.
   # The ceiling is BASE_WAIT, derived from the grace and the poll interval pinned above.
-  if [ -n "$branch" ]; then
-    base_checker "$helper" --repo "$target" base "$branch" "--wait=$BASE_WAIT" >&2
+  # The registry's integration records ride along only when there are any: they are a verdict
+  # source for a tip no push run judges, and a repository that still runs on push never asks.
+  # An unread registry withholds the source, never the gate: without it such a tip reads as no
+  # verdict, which refuses dispatch on its own.
+  args=(--repo "$target" base)
+  [ -z "$branch" ] || args+=("$branch")
+  args+=("--wait=$BASE_WAIT")
+  if rows=$(integration_records "$target"); then
+    if [ -n "$rows" ]; then
+      records=$(mktemp "${TMPDIR:-/tmp}/fw-integration.XXXXXX") || { echo "BASE REFUSED: cannot stage the integration records" >&2; return 1; }
+      printf '%s\n' "$rows" > "$records"
+      args+=(--integration-records "$records")
+    fi
   else
-    base_checker "$helper" --repo "$target" base "--wait=$BASE_WAIT" >&2
+    echo "BASE NOTE: the execution registry could not be read, so no integration record is offered as a verdict source" >&2
   fi
+  base_checker "$helper" "${args[@]}" >&2
   rc=$?
+  [ -z "$records" ] || rm -f "$records"
   if [ "$rc" -eq 1 ] && [ "$force" -eq 1 ] && [ -n "$reason" ]; then
     echo "BASE TRIAGE OVERRIDE: $target ${branch:-default branch}: $reason" >&2
     rc=0

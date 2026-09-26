@@ -9,7 +9,7 @@
 #   # shellcheck source=test-pr-review-base-lib.sh
 #   source "$SCRIPT_DIR/test-pr-review-base-lib.sh"
 #
-# The three suites over it, one subject each — `base` was one 900-line, 33-case file carrying all
+# The suites over it, one subject each — `base` was one 900-line, 33-case file carrying the first
 # three, where "which suite failed" said only "base":
 #
 #   test-pr-review-base-red.sh      the RED report: which job failed and where the red started
@@ -19,6 +19,8 @@
 #   test-pr-review-base-verdict.sh  what the WAIT LOOP decides: which break ends the wait, what
 #                                   each break re-confirms, where the absence clock starts
 #                                   (ludics-lite#93)
+#   test-pr-review-base-pushless.sh a workflow that no longer runs on push: the tip judged by a
+#                                   NAMED source or not at all (ludics-lite#401)
 #
 # What this file provides: the canned answers keyed the way `base` reads them (TIP, WORKFLOWS_JSON,
 # RUNS_<id>, JOBS_<run id>, FILES_<sha initial>, the compare and the workflow file), the fixture
@@ -98,6 +100,16 @@ COMPARE_PARENTS=""
 COMPARE_TOTAL=""
 COMPARE_BEHIND=""
 FILES_DEFAULT=""
+# Source (a) of a tip no push run judges (ludics-lite#401): what `commits/<sha>` says about the
+# commit beyond its files (COMMIT_META, merged into that answer: its parents, its committer, its
+# signature), the pull requests associated with it (TIP_PULLS), and the merged PR's head as
+# `checks` reads it — the PR itself (HEAD_PR), its check runs (HEAD_CHECKS) and its workflow runs
+# (HEAD_RUNS).
+COMMIT_META=""
+TIP_PULLS=""
+HEAD_PR=""
+HEAD_CHECKS=""
+HEAD_RUNS=""
 # The delay the wall-clock cases spend their grace with, in seconds; set through `spend_grace`
 # below, which is where the idiom is written down. DELAY_LOG records each delay actually taken,
 # so "once" is a fact the controls can read rather than a property of a marker file's existence.
@@ -191,6 +203,11 @@ reset_fixture() {
   COMPARE_TOTAL=""
   COMPARE_BEHIND=""
   FILES_DEFAULT='[]'
+  COMMIT_META='{}'
+  TIP_PULLS='[]'
+  HEAD_PR='{}'
+  HEAD_CHECKS='{"check_runs":[]}'
+  HEAD_RUNS='{"workflow_runs":[]}'
   FIRST_READ_DELAY=""
   for v in $(set | LC_ALL=C sed -n 's/^\(FILES_[0-9a-z]\)=.*/\1/p'); do unset "$v"; done
   : >"$DELAY_LOG"
@@ -270,10 +287,14 @@ gh() {
            parents: [{sha: (if $p != null then $p[.key]
                             else (if .key == 0 then $b else $c[.key - 1] end) end)}]}]}')
     ;;
+  "repos/$REPO/commits/"*"/pulls?per_page=100") response="$TIP_PULLS" ;;
+  "repos/$REPO/commits/"*"/check-runs?"*) response="$HEAD_CHECKS" ;;
+  "repos/$REPO/pulls/"*) response="$HEAD_PR" ;;
+  "repos/$REPO/actions/runs?head_sha="*) response="$HEAD_RUNS" ;;
   "repos/$REPO/commits/"*)
     sha=${FIXTURE_ENDPOINT#*/commits/}
     sha=${sha%%\?*}
-    response=$(jq -cn --argjson f "$(files_of "$sha")" '{files: $f}')
+    response=$(jq -cn --argjson f "$(files_of "$sha")" --argjson m "$COMMIT_META" '$m + {files: $f}')
     ;;
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
