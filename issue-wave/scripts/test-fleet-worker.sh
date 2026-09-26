@@ -98,13 +98,16 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+CURRENT_SECTION=""   # the selected section running now, for section_left
 # section <name>: print the header, and say whether this run includes the section. Every section
 # below is `section "..." && { ... }`, so an unselected one is skipped whole.
 section() {
   local s found=0
+  section_left
   [ "$NAMED" -eq 1 ] || found=1
   for s in ${SELECTED[@]+"${SELECTED[@]}"}; do [ "$s" = "$1" ] && found=1; done
   [ "$found" -eq 1 ] || return 1
+  CURRENT_SECTION="$1"
   echo "--- $1"
 }
 
@@ -240,6 +243,26 @@ expect() {
   out=$("$@" 2>&1); rc=$?
   if [ "$rc" -eq "$want_rc" ] && grep -q -- "$want" <<<"$out"; then ok "$label"
   else ko "$label (rc=$rc want $want_rc; want /$want/) -- $out"; fi
+}
+# fixture_done <id>: conclude a fixture reservation nothing ran under, so its box is free for the
+# cases after it. The one helper every section concludes its fixtures through.
+fixture_done() {
+  jq -n --arg id "$1" '{request_id:$id, verdict:"not-launched", log:"/dev/null", evidence:"fixture: nothing ran"}' > "$TMP/done-$1.json"
+  env FLEET_BOXES="testbox other" "$FW" execution conclude "$TMP/done-$1.json" >/dev/null || ko "could not conclude $1 (setup)"
+}
+# section_left: after each section (section() runs it for the one before, and the foot for the
+# last), fail THAT section by name for any record it left outstanding on testbox. A leftover
+# otherwise fails some later section's reservation, as a misleading "(setup)" (#417).
+section_left() {
+  local left
+  [ -n "$CURRENT_SECTION" ] || return 0
+  if left=$(env FLEET_BOXES="testbox other" "$FW" execution list --active 2>/dev/null |
+      jq -r '[.[] | select(.request.execution_host == "testbox") | "\(.request_id) (\(.state))"] | join(", ")' 2>/dev/null); then
+    [ -z "$left" ] || ko "section \"$CURRENT_SECTION\" left outstanding on testbox: $left"
+  else
+    ko "section \"$CURRENT_SECTION\": the registry could not be read after it"
+  fi
+  CURRENT_SECTION=""
 }
 
 # --- shim CLIs ------------------------------------------------------------------------------
@@ -700,6 +723,19 @@ for verdict in 3 4; do
   expect "triage cannot override unknown $verdict" 1 "dispatch blocked" -- env SHIM_BASE_RC="$verdict" "$FW" gate --target-repo example/project --force --allow-red-base fix
 done
 expect "missing helper refuses with unknown diagnostic" 1 "checker missing" -- env SHIM_BASE_RC=0 bash -c 'mv "$1" "$1.saved"; "$2" gate --target-repo example/project; rc=$?; mv "$1.saved" "$1"; exit "$rc"' _ "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" "$FW"
+# Installed, the script is reached through ~/.claude/skills/issue-wave, a symlink: ship-pr's helper
+# is found from the checkout the link points into, not beside the link, so a skills directory that
+# holds no ship-pr link of its own still reaches it. A plain `cd` passes that alone -- bash retries a
+# logical path that does not exist as a physical one -- so the decoy is what tells the two apart: a
+# ship-pr beside the link that is some other checkout's, which a collapsed `..` would find first.
+mkdir -p "$TMP/lone-skills" && ln -s "$TMP/dispatcher/issue-wave" "$TMP/lone-skills/issue-wave"
+expect "the gate finds ship-pr's helper through an issue-wave symlink alone" 0 "BASE GREEN" -- \
+  "$TMP/lone-skills/issue-wave/scripts/fleet-worker.sh" gate --target-repo example/project --base-branch topic
+mkdir -p "$TMP/lone-skills/ship-pr/scripts" && printf '#!/usr/bin/env bash\necho "DECOY CHECKER"; exit 1\n' > "$TMP/lone-skills/ship-pr/scripts/pr-review.sh" &&
+  chmod +x "$TMP/lone-skills/ship-pr/scripts/pr-review.sh" || ko "could not plant the decoy ship-pr (setup)"
+expect "...and from that checkout, not from a ship-pr beside the link" 0 "BASE GREEN" -- \
+  "$TMP/lone-skills/issue-wave/scripts/fleet-worker.sh" gate --target-repo example/project --base-branch topic
+grep -q "DECOY" <<<"$out" && ko "the gate read the decoy checker beside the link: $out" || ok "...and the decoy was never read"
 grep -Fxq -- '--repo example/project base topic --wait=360 --interim grace=300 interval=60' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
 grep -Fxq -- '--repo example/project base master --wait=360 --interim grace=300 interval=60' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
 # The value itself, and the relation behind it: 360 is 300 + 60, a whole round of margin over the
@@ -1320,8 +1356,10 @@ expect "...unstick --kill resumes" 0 "RESUMED testbox/wp " -- "$FW" unstick test
 expect "...and the message is answered" 0 "IDLE testbox/wp .*did: Stop and answer now" -- "$FW" attach testbox wp --interval 1
 settle wp
 # A feeder whose pid cannot be recorded could never be closed: the worker stops before its CLI.
+# FLEET_FEEDER_WAIT=1: a second of polling for the pid, not the default ten.
 mkdir "$ISSUE_WAVE_STATE/workers/wr/feeder.pid"
-"$FW" unstick testbox wr --message "$TMP/msg.md" >/dev/null
+FLEET_FEEDER_WAIT=1 "$FW" unstick testbox wr --message "$TMP/msg.md" >/dev/null
+grep -q -- '-lt 5 ]' "$ISSUE_WAVE_STATE/workers/wr/run.sh" && ok "...FLEET_FEEDER_WAIT=1 bounds run.sh's feeder wait at five polls" || ko "run.sh ignored FLEET_FEEDER_WAIT: $(cat "$ISSUE_WAVE_STATE/workers/wr/run.sh")"
 expect "an unwritable feeder pid file stops the worker before the CLI starts" 1 "FAILED testbox/wr exit=95" -- "$FW" attach testbox wr --interval 1
 rmdir "$ISSUE_WAVE_STATE/workers/wr/feeder.pid"
 
@@ -1560,8 +1598,7 @@ expect "conclude --from-run on an unknown request is refused before any box is r
 git -C "$wt" commit -q --allow-empty -m moved   # a guaranteed new head, whatever the clone holds
 expect "a moved checkout concludes on the reported revision and records the drift" 0 "checkout head is now $(git -C "$wt" rev-parse HEAD), revision $ran as reported" -- run_conclude run-d "$runs/20260915T201414Z-5"
 grep -Fq "\"observed_sha\": \"$ran\"" <<<"$out" && ok "...with the reported revision as observed_sha" || ko "wrong observed_sha: $out"
-jq -n '{request_id:"run-other", verdict:"not-launched", log:"/dev/null", evidence:"fixture never invoked a runner on other"}' > "$TMP/run-other-done.json"
-"${FWX[@]}" execution conclude "$TMP/run-other-done.json" >/dev/null || ko "could not conclude the off-box fixture (setup)"
+fixture_done run-other
 expect "a run of a request outside the roster is refused" 1 "canonical FLEET_BOXES" -- "$FW" execution run "$(reqjson run-e)"
 # The base gate offers the checker the registry's INTEGRATION RECORDS for its target (ludics-lite
 # #401): concluded records marked `"integration": true` for that repository, with a pass or fail at
@@ -1632,10 +1669,6 @@ bgreq() { # <id> -> a dispatched reservation on testbox
 }
 FWB=(env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other "$FW")
 sha=$(printf 'b%.0s' $(seq 40))
-bgdone() { # <id>: conclude it, so testbox's one slot is free for the next case
-  jq -n --arg id "$1" '{request_id:$id, verdict:"not-launched", log:"/dev/null", evidence:"bg-run fixture: nothing ran"}' > "$TMP/$1-done.json"
-  "${FWB[@]}" execution conclude "$TMP/$1-done.json" >/dev/null || ko "could not conclude $1 (setup)"
-}
 bgc() { # <id> <dir> [flags...]: dispatch <id>, then conclude it from <dir>
   local id="$1" dir="$2"; shift 2
   bgreq "$id" && "${FWB[@]}" execution conclude --from-bg-run "$dir" --request "$id" --sha "$sha" "$@"
@@ -1671,7 +1704,7 @@ expect "...and an explicit --checkout replaces it" 0 '"remote_checkout": "/named
 # Staged states: bg-run.sh's own verdicts, never re-derived here.
 d="$TMP/bg runs/died"; mkdir -p "$d"; sh -c 'exit 0' & gone=$!; wait "$gone"; printf '%s\n\n' "$gone" > "$d/pid"; : > "$d/log"
 expect "a task killed before the command returned (DIED) is refused, never concluded" 1 "FROM-BG-RUN REFUSED: bg-run.sh wait: DIED" -- bgc bg-died "$d"
-bgdone bg-died
+fixture_done bg-died
 d="$TMP/bg runs/live"; mkdir -p "$d"; printf '%s\n\n' "$$" > "$d/pid"
 expect "a live task (RUNNING) is refused" 1 "FROM-BG-RUN REFUSED: bg-run.sh wait: RUNNING" -- bgc bg-live "$d"
 d="$TMP/bg runs/never"; mkdir -p "$d"
@@ -1685,7 +1718,7 @@ expect "--from-bg-run needs the request id" 2 "--request <id> required" -- "${FW
 expect "--from-bg-run needs the revision that ran" 2 "--sha <full commit SHA> required" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live
 expect "--from-bg-run refuses a stray flag" 2 "conclude --from-bg-run <run-dir>" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live --sha "$sha" --oops
 "$FW" execution list | jq -e '[.[] | select(.request_id == "bg-live") | .state] == ["launching"]' >/dev/null && ok "every refusal left the assignment dispatched" || ko "a refusal changed bg-live"
-bgdone bg-live
+fixture_done bg-live
 }
 
 section "prs (the supervision read)" && {
@@ -1727,8 +1760,7 @@ env FLEET_BOXES="testbox other" "$FW" execution reserve "$TMP/prs-7.json" >/dev/
 expect "--wave keeps the PRs closing an issue its records name" 0 "^o/r#7 rounds=2" -- "$FW" prs o/r --wave wv
 grep -q "o/r#12" <<<"$out" && ko "a PR of no wave issue was listed: $out" || ok "...and drops the rest"
 expect "--wave with no records is refused, not read as an empty wave" 1 "no execution record names wave nowave" -- "$FW" prs o/r --wave nowave
-jq -n '{request_id:"prs-7", verdict:"not-launched", log:"/dev/null", evidence:"prs fixture: nothing ran"}' > "$TMP/prs-7-done.json"
-"$FW" execution conclude "$TMP/prs-7-done.json" >/dev/null || ko "could not conclude prs-7 (setup)"
+fixture_done prs-7
 unset SHIM_PRS
 }
 
@@ -1750,10 +1782,6 @@ rreq() { # <id> [execution host] -> a reservation payload, on `other` unless nam
   jq -n --arg id "$1" --arg host "${2:-other}" '{request_id:$id, wave:"w", worker:$id, transport:"subagent", issue:"o/r#362", purpose:"refresh fixture",
     agent_host:"testbox", execution_host:$host, repository:"o/r", requested_revision:"origin/main", kind:"correctness"}' > "$TMP/refresh-$1.json"
   printf '%s' "$TMP/refresh-$1.json"
-}
-rdone() { # <id>: conclude it, so its box is free for the next case
-  jq -n --arg id "$1" '{request_id:$id, verdict:"not-launched", log:"/dev/null", evidence:"refresh fixture never ran a runner"}' > "$TMP/refresh-$1-done.json"
-  "${FWR[@]}" execution conclude "$TMP/refresh-$1-done.json" >/dev/null || ko "could not conclude $1 (setup)"
 }
 FWR=(env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other "$FW")
 cur=$(git -C "$repo" rev-parse HEAD)
@@ -1795,27 +1823,27 @@ upstream stale-3; cur=$(git -C "$repo" rev-parse HEAD)
 "${FWR[@]}" execution run "$(rreq rf-a)" > "$TMP/rf-a.out" 2> "$TMP/rf-a.err"; rc=$?
 [ "$rc" -eq 0 ] && jq -e '.state == "launching"' "$TMP/rf-a.out" >/dev/null && ok "a cross-box execution run dispatches, with only the record on stdout" || ko "cross-box run: rc=$rc $(cat "$TMP/rf-a.out" "$TMP/rf-a.err")"
 grep -q "^REFRESH OK other skills=[0-9a-f]* (fast-forwarded from ${cur:0:9})$" "$TMP/rf-a.err" && ok "...and fast-forwards the execution host's skills checkout, reported on stderr" || ko "cross-box run did not refresh: $(cat "$TMP/rf-a.err")"
-rdone rf-a
+fixture_done rf-a
 expect "a refused dispatch never touches the execution host" 1 "already dispatched" -- "${FWR[@]}" execution run "$(rreq rf-a)"
 grep -q REFRESH <<<"$out" && ko "a refused run refreshed the box: $out" || ok "...(no refresh line)"
 upstream stale-4; cur=$(git -C "$repo" rev-parse HEAD)
 expect "a run on the anchor and local box refreshes it too (no launch need have preflighted it)" 0 "REFRESH OK testbox skills=[0-9a-f]* (fast-forwarded from ${cur:0:9})" -- "${FWR[@]}" execution run "$(rreq rf-b testbox)"
 upstream stale-4b; cur=$(git -C "$repo" rev-parse HEAD)
-rdone rf-b
+fixture_done rf-b
 echo local-fix >> "$repo/issue-wave/SKILL.md"
 expect "a divergent execution host is reported and the dispatch still stands" 0 "REFRESH FAILED other: 1 local change(s) in the served tree -- left as it is, never reset" -- "${FWR[@]}" execution run "$(rreq rf-c)"
 [ "$(git -C "$repo" rev-parse HEAD)" = "$cur" ] && grep -q local-fix "$repo/issue-wave/SKILL.md" && ok "...with the checkout left as it was" || ko "a divergent execution host was moved or reset"
-git -C "$repo" checkout -q -- issue-wave/SKILL.md; rdone rf-c
+git -C "$repo" checkout -q -- issue-wave/SKILL.md; fixture_done rf-c
 # A dispatch whose record cannot be read says so, rather than skipping the refresh silently.
 mkdir -p "$TMP/nojq"; printf '#!/bin/sh\necho "jq: not here" >&2; exit 127\n' > "$TMP/nojq/jq"; chmod +x "$TMP/nojq/jq"
 expect "an unreadable dispatched record is a loud refresh failure, the dispatch standing" 0 "REFRESH FAILED: cannot read the execution host from the dispatched record (jq: not here)" -- \
   env PATH="$TMP/nojq:$PATH" "${FWR[@]}" execution run "$(rreq rf-g)"
-rdone rf-g
+fixture_done rf-g
 # The reserve + dispatch pair refreshes at the dispatch, which is where the box is about to be used.
 "${FWR[@]}" execution reserve "$(rreq rf-d)" 2>&1 | grep -q REFRESH && ko "a bare reserve refreshed the box" || ok "a bare reserve does not refresh"
 jq -n '{request_id:"rf-d", evidence:"fixture dispatch"}' > "$TMP/refresh-rf-d-dispatch.json"
 expect "...its dispatch does" 0 "REFRESH OK other skills=[0-9a-f]* (fast-forwarded from ${cur:0:9})" -- "${FWR[@]}" execution dispatch "$TMP/refresh-rf-d-dispatch.json"
-rdone rf-d
+fixture_done rf-d
 # The refresh runs after the registry's lock is released: a fetch that hangs on the execution host
 # must not keep other coordinator mutations out. While it hangs, a mutation with no lock wait at
 # all goes through (a record on the same request, so no slot is in question).
@@ -1828,7 +1856,7 @@ expect "while the refresh's fetch hangs, the registry lock is free" 0 '"state": 
 kill -0 "$hung" 2>/dev/null && ok "...(the refresh was still running)" || ko "the hanging refresh had already ended; the lock check proved nothing"
 wait "$hung"; rc=$?
 [ "$rc" -eq 0 ] && grep -q "REFRESH FAILED other: git fetch in .* timed out after 6s" "$TMP/rf-e.err" && ok "...and the bounded fetch is reported, the dispatch standing" || ko "hung refresh: rc=$rc $(cat "$TMP/rf-e.err")"
-rdone rf-e
+fixture_done rf-e
 git -C "$repo" fetch -q origin && git -C "$repo" merge --ff-only -q origin/main || ko "could not leave the scratch checkout current (teardown)"
 }
 
@@ -1852,10 +1880,6 @@ slotreq() { # <id> <kind> [standing] -> a reservation payload file on testbox
       agent_host:"testbox", execution_host:"testbox", repository:"o/r", requested_revision:"origin/master",
       kind:$kind} + (if $standing then {standing:true} else {} end)' > "$TMP/slot-$1.json"
   printf '%s' "$TMP/slot-$1.json"
-}
-slotdone() { # <id>: free the box again for the cases below
-  jq -n --arg id "$1" '{request_id:$id, verdict:"not-launched", log:"/dev/null", evidence:"slot fixture never ran a runner"}' > "$TMP/slot-$1-done.json"
-  "${FWS[@]}" execution conclude "$TMP/slot-$1-done.json" >/dev/null || ko "could not conclude $1 (setup)"
 }
 expect "a batch runs under one of the box's run-time slots" 0 "EXECUTION SLOT testbox: slot 1 of 1 held for: echo batch-ran" -- "${FWS[@]}" execution slot -- echo batch-ran
 grep -q batch-ran <<<"$out" && ok "...and the command's own output came through" || ko "the wrapped command's output was lost: $out"
@@ -1883,7 +1907,7 @@ expect "the widened cap is read from FLEET_BOX_CORRECTNESS_SLOTS, not baked in" 
 # A measurement owns the box through the registry, and the run-time lock reads that before locking.
 "${FWS[@]}" execution run "$(slotreq slot-measure measurement)" >/dev/null || ko "could not reserve the measurement (setup)"
 expect "a batch is refused while a measurement is outstanding on the box" 1 "a measurement holds the box exclusively (slot-measure)" -- "${FWS[@]}" execution slot -- echo during-measurement
-slotdone slot-measure
+fixture_done slot-measure
 expect "...and admitted once the measurement is concluded" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo after-measurement
 # The standing iteration record is ownership and evidence for the worker's whole life, so it
 # does not consume the box's one correctness slot -- an agent start is never gated on it.
@@ -1892,7 +1916,7 @@ expect "...and leaves the box's correctness slot free for an ordinary reservatio
 expect "...which does fill it: the next ordinary reservation is refused" 1 "correctness slots 1/1 on testbox" -- "${FWS[@]}" execution run "$(slotreq slot-ordinary-2 correctness)"
 expect "...while another standing record is still admitted" 0 '"standing": true' -- "${FWS[@]}" execution run "$(slotreq slot-iterate-2 correctness true)"
 expect "a batch still takes a run-time slot beside them" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo beside-standing
-slotdone slot-iterate; slotdone slot-iterate-2; slotdone slot-ordinary
+fixture_done slot-iterate; fixture_done slot-iterate-2; fixture_done slot-ordinary
 # The cap is the BOX's, so the slot files must not hang off ISSUE_WAVE_STATE, which is each
 # coordinator's own directory: two workers on one host under different coordinators would each
 # take slot 1 and the cap would bound nothing (PR #166 review, round 1).
@@ -2081,7 +2105,7 @@ expect "execution hold runs a measurement's runner under the inhibitor while the
   "${FWI[@]}" execution hold -- echo measured
 grep -Fxq -- "--what=sleep:idle --mode=block --who=fleet-worker --why=testbox hold: echo measured $HELPER_ARGV" "$INHIBIT_LOG" && ok "...the same block inhibitor the slot takes" || ko "hold did not take the block inhibitor: $(cat "$INHIBIT_LOG")"
 expect "...beside a slot that is refused for that very measurement" 1 "a measurement holds the box exclusively (hold-measure)" -- "${FWI[@]}" execution slot -- echo during
-slotdone hold-measure
+fixture_done hold-measure
 expect "execution hold --why names the holder in the inhibitor" 0 "held for: rog run 7" -- "${FWI[@]}" execution hold --why "rog run 7" -- true
 expect "execution hold passes the command's own status through" 5 "held for" -- "${FWI[@]}" execution hold -- sh -c 'exit 5'
 expect "...a signal death's too, which a systemd-inhibit wrapper would have turned into 1" 143 "held for" -- "${FWI[@]}" execution hold -- sh -c 'kill -TERM $$'
@@ -2112,6 +2136,8 @@ expect "unstick validates the name before writing anything" 2 "unstick: name mus
 expect "status validates the name" 2 "status: name must be" -- "$FW" status testbox "a b"
 expect "close validates the name" 2 "close: name must be" -- "$FW" close testbox ../escape
 expect "close takes no options" 2 "close: unknown option" -- "$FW" close testbox w1 --kill
+expect "launch refuses a feeder wait that is not a positive number" 2 "launch: FLEET_FEEDER_WAIT must be a positive number" -- env FLEET_FEEDER_WAIT=0 "$FW" launch testbox fw0 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
+expect "...and so does unstick" 2 "unstick: FLEET_FEEDER_WAIT must be a positive number" -- env FLEET_FEEDER_WAIT=1s "$FW" unstick testbox w1 --message "$TMP/msg.md"
 expect "close is fenced by the lease" 1 "CLOSE REFUSED testbox/w1: coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" close testbox w1
 expect "without FLEET_LOCAL_BOX an unrecognized host is local only to 'local'" 0 "EXITED(0) local/w1" -- env -u FLEET_LOCAL_BOX "$FW" status local w1
 out=$(env -u FLEET_LOCAL_BOX "$FW" status testbox w1 2>&1); rc=$?
@@ -2130,6 +2156,7 @@ grep -q "^cwd=$proj\$" "$ISSUE_WAVE_STATE/workers/rel/meta" && ok "a relative --
 expect "a path with a newline refuses" 2 "must not contain newlines" -- "$FW" launch testbox nl --target-repo example/project --kind claude --brief "$brief" --cwd "$(printf '%s\nx' "$proj")"
 }
 
+section_left
 echo
 if [ "$NAMED" -eq 1 ]; then
   echo "$pass passed, $fail failed (${#SELECTED[@]} of ${#SECTIONS[@]} sections)"
