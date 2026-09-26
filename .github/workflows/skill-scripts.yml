@@ -462,10 +462,12 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: macos-latest
-    # 585-588s across the two most recent main runs (2026-09-18); the fleet launcher and
-    # wake-lab are the largest, at ~4 and ~3 minutes. The margin over a measured run is ~2x --
-    # re-read this figure before assuming the 20 is still generous.
-    timeout-minutes: 20
+    # 585-588s across the two most recent main runs (2026-09-18); by 2026-09-26 main's runs
+    # took 18m51s and 18m59s (36240807008, 36237967122: wake-lab ~6 min, the fleet launcher ~7),
+    # a minute under the old 20, and ludics-lite#259's stream-channel cases (a few seconds of
+    # real waiting each, for background tasks and mid-turn delivery) pushed the fleet launcher
+    # past it. 35 restores a margin near 2x -- re-read these figures before assuming it holds.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
