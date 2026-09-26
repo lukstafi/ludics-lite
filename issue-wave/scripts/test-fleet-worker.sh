@@ -1320,12 +1320,12 @@ jq -n '{request_id:"run-other", verdict:"not-launched", log:"/dev/null", evidenc
 "${FWX[@]}" execution conclude "$TMP/run-other-done.json" >/dev/null || ko "could not conclude the off-box fixture (setup)"
 expect "a run of a request outside the roster is refused" 1 "canonical FLEET_BOXES" -- "$FW" execution run "$(reqjson run-e)"
 # The base gate offers the checker the registry's INTEGRATION RECORDS for its target (ludics-lite
-# #401): concluded, non-standing coordinator correctness runs of that repository with a pass or
-# fail at an exact SHA. A worker's run, another repository's, and a timeout are not sources.
-intreq() { # <id> <transport> <repository> -> a reservation payload file
-  jq -n --arg id "$1" --arg t "$2" --arg repo "$3" '{request_id:$id, wave:"w", worker:"coordinator", transport:$t, issue:"o/r#1",
+# #401): concluded records marked `"integration": true` for that repository, with a pass or fail at
+# an exact SHA. An unmarked run, another repository's, and a timeout are not sources.
+intreq() { # <id> <transport> <repository> <integration: true|-> -> a reservation payload file
+  jq -n --arg id "$1" --arg t "$2" --arg repo "$3" --arg i "$4" '{request_id:$id, wave:"w", worker:"coordinator", transport:$t, issue:"o/r#1",
     purpose:"integration run at the merged tip", agent_host:"testbox", execution_host:"testbox", repository:$repo,
-    requested_revision:"origin/master", kind:"correctness"}' > "$TMP/$1.json"
+    requested_revision:"origin/master", kind:"correctness"} + (if $i == "true" then {integration: true} else {} end)' > "$TMP/$1.json"
   printf '%s' "$TMP/$1.json"
 }
 intdone() { # <id> <verdict>: conclude it at $ran
@@ -1333,16 +1333,18 @@ intdone() { # <id> <verdict>: conclude it at $ran
     evidence:"fixture integration run", observed_sha:$sha, remote_checkout:$wt, handle:"fixture"}' > "$TMP/$1-done.json"
   "${FWX[@]}" execution conclude "$TMP/$1-done.json" >/dev/null || ko "could not conclude $1 (setup)"
 }
-for spec in "int-a coordinator example/project pass" "int-b subagent example/project pass" \
-  "int-c coordinator o/r fail" "int-d coordinator example/project timeout"; do
-  read -r int_id int_t int_repo int_v <<<"$spec"
-  "${FWX[@]}" execution run "$(intreq "$int_id" "$int_t" "$int_repo")" >/dev/null || ko "could not reserve $int_id (setup)"
+# The coordinator's own correctness run WITHOUT `"integration": true` is a targeted batch as far
+# as the gate is concerned (review round 2 of #401): only the explicit field makes a source.
+for spec in "int-a coordinator example/project pass true" "int-b coordinator example/project pass -" \
+  "int-c coordinator o/r fail true" "int-d coordinator example/project timeout true"; do
+  read -r int_id int_t int_repo int_v int_i <<<"$spec"
+  "${FWX[@]}" execution run "$(intreq "$int_id" "$int_t" "$int_repo" "$int_i")" >/dev/null || ko "could not reserve $int_id (setup)"
   intdone "$int_id" "$int_v"
 done
 : > "$BASE_CALL_LOG"
 expect "the gate hands the checker its target's integration records" 0 "BASE GREEN" -- "$FW" gate --target-repo example/project
 grep -Fq -- '--repo example/project base --wait=360 --integration-records ' "$BASE_CALL_LOG" && ok "...after the wait, as a file" || ko "no records file handed over: $(cat "$BASE_CALL_LOG")"
-[ "$(grep -c '^records: ' "$BASE_CALL_LOG")" = 1 ] && grep -q "^records: $ran	pass	int-a	" "$BASE_CALL_LOG" && ok "...only the coordinator's concluded pass/fail for that repository" || ko "wrong records offered: $(cat "$BASE_CALL_LOG")"
+[ "$(grep -c '^records: ' "$BASE_CALL_LOG")" = 1 ] && grep -q "^records: $ran	pass	int-a	" "$BASE_CALL_LOG" && ok "...only the marked integration pass/fail for that repository" || ko "wrong records offered: $(cat "$BASE_CALL_LOG")"
 # (With no record for the target, the call carries no flag at all: the "base gate" section's
 # exact call lines above pin that, since its gates ran before any record existed.)
 }

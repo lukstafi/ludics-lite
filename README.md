@@ -935,17 +935,19 @@ to wait through; without `--wait` the same failure costs only the "not the tip" 
 (ludics-lite#401, for ahrefs/ocannl#1057). A workflow that ran on pushes and whose file at the tip
 no longer declares `push` keeps its last push runs forever, so the fold would present a months-old
 green as the base's. Such a workflow's push rows are now history, and the tip's verdict for it
-comes from a NAMED source or not at all: a coordinator's integration record concluded at exactly
-the tip (`fleet-worker.sh gate` hands them in as `--integration-records`), else the merged PR's
+comes from a NAMED source or not at all: a coordinator's integration record (a registry record
+marked `"integration": true`) concluded at exactly the tip (`fleet-worker.sh gate` hands them in
+as `--integration-records`), else the merged PR's
 head run under the roll-forward rule — the tip must be GitHub's own signed merge commit of one PR
 into this branch, with that PR's head as its second parent, and the retired workflow's OWN run at
-that head a success (the head's aggregate green can be another workflow's, on a PR the retired
-one filtered out). The cases pin each source and its refusals (a direct push, a merge made
+that head a success with at least one non-advisory job that succeeded (the head's aggregate green
+can be another workflow's, on a PR the retired one filtered out). The cases pin each source and its refusals (a direct push, a merge made
 elsewhere, a PR that did not make the tip, a head that never built the workflow, a malformed
 records file), the red and still-running heads, the verdict line naming its source, and the other
 direction: a workflow that still runs on push, whose file the trigger reader refuses, or whose file
 the directory at the tip confirms absent reads exactly as before, and a covered tip never reads its
-workflow file. A read of the file the API refuses (401, 403, an unconfirmed 404) is UNKNOWN.
+workflow file. A read of the file the API refuses (401, 403, an unconfirmed 404) is UNKNOWN, and
+so is a plain read whose tip read failed while a workflow is retired.
 
 Each workflow's page of runs is sorted on `(created_at desc, id desc)` before the fold
 (ludics-lite#90), as `run_signal`'s feed has been since #83: two pushes to the branch inside one

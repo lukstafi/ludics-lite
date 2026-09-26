@@ -80,6 +80,7 @@ head_signal() {
   HEAD_RUNS=$(jq -cn --argjson c "$concl" --arg s "$status" \
     '{workflow_runs: [{created_at: "2026-09-26T07:41:00Z", id: 8001, workflow_id: 1,
                        event: "pull_request", name: "ci", status: $s, conclusion: $c}]}')
+  JOBS_8001=$(jobs_json '[{"name":"build","conclusion":"success"},{"name":"claude","conclusion":"skipped"}]')
 }
 
 # records <row>...: an integration-records file, one tab-separated row per argument.
@@ -205,6 +206,14 @@ test_a_green_head_without_a_run_of_the_retired_workflow_is_no_source() {
     assert_contains "$BASE_OUTPUT" "has no successful run of ci (" "the line names the workflow the head never built"
     assert_not_contains "$BASE_OUTPUT" ": green (tip" "no green is handed out"
   done
+  # A run that concluded `success` with every build job skipped by a job-level `if:` built nothing
+  # either (review round 2): one of its non-advisory jobs must have succeeded. The advisory job's
+  # success here does not count.
+  pushless_fixture
+  JOBS_8001=$(jobs_json '[{"name":"build","conclusion":"skipped"},{"name":"claude","conclusion":"success"}]')
+  run_base
+  assert_eq "$BASE_RC" 4 "a successful run whose build jobs all skipped is no source"
+  assert_contains "$BASE_OUTPUT" "has no successful run of ci (no job succeeded)" "and says why"
 }
 
 # A head whose run is still going is a source not yet in: the plain read says no verdict, and
@@ -216,12 +225,34 @@ test_a_head_still_running_holds_the_wait() {
   assert_eq "$BASE_RC" 4 "a head still running is no verdict yet"
   assert_contains "$BASE_OUTPUT" "no verdict  ci — not yet: source (a): PR #7's head ${SHA_H:0:8}" \
     "the line names the source it is waiting on"
+  # Held to the CEILING, which is what the note says — a count of rounds would be on the clock,
+  # and a loaded runner spends a two-second ceiling inside the first round (review round 2). A
+  # wait the pending source did not hold ends on the round that read it, with no ceiling note.
   pushless_fixture
   head_signal null
   run_base --wait=2
   assert_eq "$BASE_RC" 4 "at the ceiling a source still judging is no verdict"
-  assert_contains "$BASE_OUTPUT" "NO VERDICT" "and says so"
-  [ "$(rounds_polled)" -ge 2 ] || bail "a source still judging should hold the wait past one round (polled $(rounds_polled))"
+  assert_contains "$BASE_OUTPUT" "(--wait ceiling of 0 min reached" \
+    "the wait was held to its ceiling rather than ended on the round that read the pending source"
+  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" "and says so"
+}
+
+# A plain read tolerates a tip read that fails — its verdict comes from the runs, and the tip only
+# decorates it. But a retired workflow's verdict IS about the tip, so the question is asked of the
+# branch's file instead of skipped, and a workflow found retired makes the read UNKNOWN rather
+# than letting its old push green through (review round 2). A push workflow keeps the old reading:
+# test-pr-review-base-verdict.sh pins that half.
+test_an_unreadable_tip_with_a_retired_workflow_is_unknown() {
+  pushless_fixture
+  retune API_ATTEMPTS=1
+  FAIL_ENDPOINT="repos/$REPO/commits/$BRANCH"
+  run_base
+  assert_eq "$BASE_RC" 3 "a retired workflow with no tip to judge is UNKNOWN"
+  assert_contains "$BASE_OUTPUT" "could not read $REPO $BRANCH's tip, and 'ci' no longer runs on push" \
+    "and says why"
+  assert_not_contains "$BASE_OUTPUT" ": green" "the old push green does not come through"
+  assert_contains "$(cat "$REQUEST_LOG")" "contents/.github/workflows/ci.yml?ref=$BRANCH" \
+    "the file was read at the branch, since the tip could not be named"
 }
 
 # --- source (b): an integration record handed in by the gate ----------------------------------
@@ -375,6 +406,7 @@ tests=(
   test_a_red_head_is_a_red_tip
   test_a_green_head_without_a_run_of_the_retired_workflow_is_no_source
   test_a_head_still_running_holds_the_wait
+  test_an_unreadable_tip_with_a_retired_workflow_is_unknown
   test_an_integration_record_at_the_tip_is_the_first_source
   test_a_record_at_another_commit_is_not_the_tips
   test_a_malformed_records_file_is_refused

@@ -261,6 +261,18 @@ with tempfile.TemporaryDirectory(prefix='fleet-slots-') as temporary:
     assert 'standing must be true when present' in out and 'standing-bad' not in records(), out
     out = change('run', {**request('standing-measure', 'minix', kind='measurement'), 'standing': True}, expected=1)
     assert 'only a correctness reservation can be standing' in out, out
+    # An integration run (ludics-lite#401) is a claim the base gate acts on: only `true`, and only
+    # on a coordinator's non-standing correctness request. (Its admission and the gate reading it
+    # are exercised end to end in test-fleet-worker.sh.)
+    coordinator = {**request('integ-bad'), 'transport': 'coordinator'}
+    out = change('run', {**coordinator, 'integration': 'yes'}, expected=1)
+    assert 'integration must be true when present' in out and 'integ-bad' not in records(), out
+    for bad in ({**request('integ-bad'), 'integration': True},
+                {**coordinator, 'kind': 'measurement', 'execution_host': 'minix', 'integration': True},
+                {**coordinator, 'standing': True, 'integration': True}):
+        out = change('run', bad, expected=1)
+        assert "only a coordinator's non-standing correctness reservation can be an integration run" in out, out
+        assert 'integ-bad' not in records(), out
     change('conclude', dict(request_id='iterate-4', verdict='not-launched', log='/logs/iterate-4',
                             evidence='fixture concluded the standing record at hand-back'))
     change('conclude', dict(request_id='iterate-5', verdict='not-launched', log='/logs/iterate-5',

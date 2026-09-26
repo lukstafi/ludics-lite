@@ -256,6 +256,12 @@ evidence and log are required in the conclusion. If reconciliation proves nothin
 conclusion retry is harmless. There is no expiry or automatic release. Never remove a checkout
 while an outstanding record refers to it, or while a pending reservation could still be using it.
 
+A coordinator's integration run (SKILL.md's integration loop) adds `"integration": true` to an
+ordinary non-standing `correctness` request of transport `coordinator`; the registry refuses the
+field on any other shape. Concluded `pass` or `fail` at an exact `observed_sha`, it is the verdict
+`fleet-worker.sh gate` hands `pr-review.sh base` for a default branch without push CI
+(ludics-lite#401); a correctness run without the field is a targeted batch and is never offered.
+
 ## Standing iteration reservation
 
 A worker's own targeted correctness batches on its agent host do not each need a request. The

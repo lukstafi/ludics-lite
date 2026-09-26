@@ -321,8 +321,8 @@ when the checker recognizes the tip's diff as entirely within the workflow's `pa
 otherwise once that absence outlives the grace (ludics-lite#156). A run in flight or stopped at
 the tip keeps the refusal. A workflow that no longer runs on push (its file at the tip names no
 `push`; OCANNL's `ci` after ahrefs/ocannl#1057) never settles for its old push verdict: the gate
-reads the execution registry's integration records for the target - concluded, non-standing
-coordinator `correctness` records with a pass or fail at an exact SHA - and hands them to the
+reads the execution registry's integration records for the target - concluded records marked
+`"integration": true`, with a pass or fail at an exact SHA - and hands them to the
 checker, which takes the tip's verdict from a record at the tip first, else from the PR the tip
 is GitHub's clean merge of, when that workflow ran green on its head (roll-forward), and names
 the source it used.
@@ -616,8 +616,8 @@ controlled through the tools in your coordinator's file, never through those com
   default branch has no push CI (OCANNL after ahrefs/ocannl#1057) there is no tip run to await:
   the integration run's own record, concluded at the merged SHA, is that tip's verdict, and it is
   what the base gate reads before the next launch. Reserve it as transport `coordinator`, kind
-  `correctness`, and conclude it with its `observed_sha` - a record in any other shape is not a
-  verdict source. Pick up each
+  `correctness`, with `"integration": true`, and conclude it with its `observed_sha` - a record
+  without the field is a targeted batch to the gate, not a verdict source. Pick up each
   merge as it lands; one run covering several merges is incidental batching, never deliberate
   accumulation.
 - **On a regression, stop the world - as a mechanism.** `fleet-worker.sh halt "<what

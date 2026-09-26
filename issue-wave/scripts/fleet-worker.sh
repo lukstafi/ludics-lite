@@ -877,17 +877,18 @@ base_checker() (
 # checker's `base --integration-records` (ludics-lite#401): on a default branch whose CI no longer
 # runs on push, a coordinator's run concluded at exactly the tip is a verdict source the checker
 # names, and the registry is the anchor's, which only this script reads. An integration record is
-# a CONCLUDED, non-standing `correctness` reservation of transport `coordinator` for that
-# repository, whose verdict is pass or fail at an exact observed SHA - the shape executions.md
-# gives a coordinator's integration run. Nothing else in the registry is offered (a worker's
-# batch, a standing iteration record, a timeout, a cancellation), so the allowlist is the filter
-# below and a record outside it is simply not a source. Exit 1 when the registry could not be read.
+# a CONCLUDED reservation for that repository that says so - `"integration": true`, which the
+# registry admits only on a coordinator's non-standing `correctness` request - whose verdict is
+# pass or fail at an exact observed SHA. A correctness run without the field is a targeted batch
+# as far as this is concerned, however it was meant (review round 2): the allowlist is the filter
+# below, and a record outside it is simply not a source. Exit 1 when the registry could not be read.
 integration_records() {
   local listing
   listing=$(execution_listing "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py") || return 1
   jq -r --arg repo "$1" '.[]
     | select(.state == "concluded" and (.verdict == "pass" or .verdict == "fail")
-             and .request.transport == "coordinator" and .request.kind == "correctness"
+             and .request.integration == true and .request.transport == "coordinator"
+             and .request.kind == "correctness"
              and .request.repository == $repo and (.request.standing // false) == false
              and ((.observed_sha // "") | test("^[0-9a-f]{40}$")))
     | [.observed_sha, .verdict, .request_id, .updated_at] | @tsv' <<<"$listing"
