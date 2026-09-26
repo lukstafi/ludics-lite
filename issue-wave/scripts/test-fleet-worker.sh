@@ -705,13 +705,13 @@ expect "mac-studio with the default roster notes a sleeping TUF and still passes
 # this file as a statement of the site default, and this is a count the fixture configured.
 PFROSTER="mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
 PFM=(env FLEET_LOCAL_BOX=mac-studio "$FW" preflight mac-studio --no-probe --no-cross)
-expect "preflight prints the site default's slot counts under an exported default roster" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3 (site default)$" -- \
+expect "preflight prints the site default's slot counts under an exported default roster" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=4(gpu=2) minix-amd-linux=4 tuf-amd-linux=3 (site default)$" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="$PFROSTER" "${PFM[@]}"
 grep -q "WARNING" <<<"$out" && ko "...and warns about a configuration that is the site default -- $out" || ok "...and warns about nothing"
 # The other direction of that pairing: the boxes the site default widens, read off its own line,
 # are exactly the boxes an empty spec warns about -- so a box added to the default and not to the
 # warning's list (or the reverse) fails here.
-pf_widened=$(sed -n 's/^PREFLIGHT SLOTS \(.*\) (site default)$/\1/p' <<<"$out" | tr ' ' '\n' | awk -F= '$2 > 1 {print $1}' | sort | tr '\n' ' ')
+pf_widened=$(sed -n 's/^PREFLIGHT SLOTS \(.*\) (site default)$/\1/p' <<<"$out" | tr ' ' '\n' | sed 's/(gpu=[0-9]*)$//' | awk -F= '$2 + 0 > 1 {print $1}' | sort | tr '\n' ' ')
 expect "an empty spec under the default roster warns, box by box" 0 "does not name" -- \
   env FLEET_BOX_CORRECTNESS_SLOTS="" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
 pf_warned=$(sed -n 's/^PREFLIGHT SLOTS WARNING: .* does not name \([^,]*\), which falls.*/\1/p' <<<"$out" | sort | tr '\n' ' ')
@@ -735,7 +735,7 @@ expect "a spec naming only mac-studio warns about each native GPU box it leaves 
 grep -q "does not name minix-amd-linux, which falls" <<<"$out" && grep -q "does not name tuf-amd-linux, which falls" <<<"$out" \
   && ! grep -q "does not name mac-studio" <<<"$out" \
   && ok "...minix-amd-linux and tuf-amd-linux too, and not the Mac it names" || ko "the per-box collapse warnings are wrong -- $out"
-expect "a roster over several lines prints every box" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3 (site default)$" -- \
+expect "a roster over several lines prints every box" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=4(gpu=2) minix-amd-linux=4 tuf-amd-linux=3 (site default)$" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="mac-studio rog-nv-linux
 minix-amd-linux tuf-amd-linux" "${PFM[@]}"
 expect "a custom roster prints one slot each, without a warning" 0 "^PREFLIGHT SLOTS testbox=1 otherbox=1 (custom roster: one slot each)$" -- \
@@ -743,6 +743,26 @@ expect "a custom roster prints one slot each, without a warning" 0 "^PREFLIGHT S
 grep -q "WARNING" <<<"$out" && ko "a custom roster drew a collapse warning -- $out" || ok "...and no warning"
 expect "a malformed spec is a warning on the preflight, which still passes" 0 "PREFLIGHT SLOTS WARNING: FLEET_BOX_CORRECTNESS_SLOTS names stale-box, which is not in FLEET_BOXES" -- \
   env FLEET_BOX_CORRECTNESS_SLOTS="stale-box=2" FLEET_BOXES="testbox otherbox" "$FW" preflight testbox --no-probe --no-cross
+# The GPU tokens (ludics-lite#391) show beside a box's slots where they are fewer, and a token
+# spec that leaves out a box the site default narrows is the same loud warning, paired the same
+# way: the boxes the default shows with `(gpu=` are exactly the ones an empty token spec names.
+env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOXES="$PFROSTER" "${PFM[@]}" > "$TMP/pf-tokens.out" 2>&1
+pf_tokened=$(sed -n 's/^PREFLIGHT SLOTS \(.*\) (site default)$/\1/p' "$TMP/pf-tokens.out" | tr ' ' '\n' | sed -n 's/=.*(gpu=.*//p' | sort | tr '\n' ' ')
+expect "an empty GPU-token spec under the default roster warns about the box it un-narrows" 0 "PREFLIGHT SLOTS WARNING: the default roster, but FLEET_BOX_GPU_TOKENS=\"\" does not name rog-nv-linux, so all 4 of its slots may hold its GPU at once (the site default allows 2)" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOX_GPU_TOKENS="" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
+pf_twarned=$(sed -n 's/^PREFLIGHT SLOTS WARNING: .*FLEET_BOX_GPU_TOKENS=.* does not name \([^,]*\), so all.*/\1/p' <<<"$out" | sort | tr '\n' ' ')
+[ -n "$pf_tokened" ] && [ "$pf_tokened" = "$pf_twarned" ] && ok "...about exactly the boxes the site default narrows: $pf_twarned" \
+  || ko "the token warning names '$pf_twarned', the site default narrows '$pf_tokened'"
+grep -q "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=4 minix-amd-linux=4 tuf-amd-linux=3 (site default; FLEET_BOX_GPU_TOKENS)$" <<<"$out" \
+  && ok "...beside a slots line with no tokens and the override named" || ko "the un-narrowed slots line is wrong -- $out"
+expect "a token spec naming rog-nv-linux at every slot is a choice, printed without a warning" 0 "^PREFLIGHT SLOTS mac-studio=6 rog-nv-linux=4 minix" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS FLEET_BOX_GPU_TOKENS="rog-nv-linux=4" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
+grep -q "WARNING" <<<"$out" && ko "a token spec naming rog-nv-linux drew a warning -- $out" || ok "...and no warning"
+expect "...and so is a slot spec that leaves rog-nv-linux no more slots than the token default" 0 "rog-nv-linux=2 minix" -- \
+  env FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=6 rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3" FLEET_BOX_GPU_TOKENS="" FLEET_BOXES="$PFROSTER" "${PFM[@]}"
+grep -q "WARNING" <<<"$out" && ko "a two-slot rog-nv-linux drew a token warning -- $out" || ok "...with no warning"
+expect "a malformed token spec is a warning on the preflight, which still passes" 0 "PREFLIGHT SLOTS WARNING: FLEET_BOX_GPU_TOKENS names stale-box, which is not in FLEET_BOXES" -- \
+  env FLEET_BOX_GPU_TOKENS="stale-box=1" FLEET_BOXES="testbox otherbox" "$FW" preflight testbox --no-probe --no-cross
 # The probe must not read the far-side program off stdin: a sibling that swallows its stdin would
 # otherwise end the preflight early with status 0 over an earlier refusal (Codex P1 on #67).
 echo x >> "$repo/ship-pr/SKILL.md"
@@ -1514,10 +1534,10 @@ DEFROSTER="mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
 FWM=(env FLEET_LOCAL_BOX=mac-studio FLEET_ANCHOR=mac-studio)
 expect "the site default gives mac-studio six run-time slots" 0 "slot 1 of 6" -- \
   env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES "${FWM[@]}" "$FW" execution slot --wait 0 -- echo default-cap
-# The native GPU boxes' measured counts (ludics-lite#316, #344): two on rog-nv-linux, four on
-# minix-amd-linux, three on tuf-amd-linux. Each box is its own anchor here, so the registry read
-# stays local.
-for pair in rog-nv-linux:2 minix-amd-linux:4 tuf-amd-linux:3; do
+# The native GPU boxes' measured counts (ludics-lite#316, #344, #391): four on rog-nv-linux, of
+# which two hold a GPU token, four on minix-amd-linux, three on tuf-amd-linux. Each box is its own
+# anchor here, so the registry read stays local.
+for pair in rog-nv-linux:4 minix-amd-linux:4 tuf-amd-linux:3; do
   box=${pair%%:*} n=${pair#*:}
   expect "...and $box $n" 0 "slot 1 of $n" -- \
     env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES FLEET_LOCAL_BOX=$box FLEET_ANCHOR=$box "$FW" execution slot --wait 0 -- echo default-cap
@@ -1545,6 +1565,52 @@ expect "...where an explicitly empty spec is one slot everywhere" 0 "slot 1 of 1
 expect "...and under a custom roster" 0 "slot 1 of 4" -- \
   "${FWM[@]}" FLEET_BOXES="mac-studio rog-nv-linux" FLEET_BOX_CORRECTNESS_SLOTS="mac-studio=4" "$FW" execution slot --wait 0 -- echo explicit-custom
 expect "...and a box the spec does not name has one" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo unnamed-box
+# The GPU tokens (ludics-lite#391): where a box has fewer than its slots, the first N slot files
+# are the tokens. Fail-closed: every batch is a GPU batch unless it declares --cpu.
+expect "the site default gives rog-nv-linux two GPU tokens among its four slots" 0 "slot 1 of 4, GPU token 1 of 2 held" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES FLEET_LOCAL_BOX=rog-nv-linux FLEET_ANCHOR=rog-nv-linux "$FW" execution slot --wait 0 -- echo default-tokens
+expect "...and a batch declared --cpu takes the highest free slot there, not a token" 0 "slot 4 of 4 held" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES FLEET_LOCAL_BOX=rog-nv-linux FLEET_ANCHOR=rog-nv-linux "$FW" execution slot --wait 0 --cpu -- echo default-cpu
+expect "a box with as many tokens as slots is unchanged (the tokens cannot bind there)" 0 "slot 1 of 6 held" -- \
+  env -u FLEET_BOX_CORRECTNESS_SLOTS -u FLEET_BOXES "${FWM[@]}" "$FW" execution slot --wait 0 --cpu -- echo mac-no-token
+grep -q "GPU token" <<<"$out" && ko "mac-studio named a GPU token -- $out" || ok "...(no token named)"
+FWT=(env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=3" FLEET_BOX_GPU_TOKENS="testbox=1" "$FW")
+"${FWT[@]}" execution slot -- sleep 30 > "$TMP/slot-g1.log" 2>&1 &
+g1=$!
+if held "$TMP/slot-g1.log" "slot 1 of 3, GPU token 1 of 1 held"; then
+  expect "an undeclared batch waits for the token though slots are free (fail-closed)" 1 "all 1 GPU tokens (slots 1-1 of 3) busy after 1s" -- "${FWT[@]}" execution slot --wait 1 -- echo undeclared
+  expect "...and so does one declared --gpu" 1 "all 1 GPU tokens" -- "${FWT[@]}" execution slot --wait 0 --gpu -- echo declared
+  # A GPU batch queued behind the token must not sit on a slot meanwhile: start one waiting, and
+  # the CPU batches still find both slots left beside the holder. It polls once a second, so two
+  # seconds put it well inside its loop first.
+  "${FWT[@]}" execution slot --wait 20 -- echo queued-gpu > "$TMP/slot-g2.log" 2>&1 &
+  g2=$!
+  sleep 2
+  "${FWT[@]}" execution slot --cpu -- sleep 30 > "$TMP/slot-c1.log" 2>&1 &
+  c1=$!
+  if held "$TMP/slot-c1.log" "slot 3 of 3 held"; then
+    expect "CPU batches run beside the token holder, and a queued GPU batch holds no slot" 0 "slot 2 of 3 held for: echo cpu-beside" -- "${FWT[@]}" execution slot --wait 0 --cpu -- echo cpu-beside
+  fi
+  kill -9 "$g1" 2>/dev/null; wait "$g1" 2>/dev/null
+  wait "$g2"; rc=$?
+  [ "$rc" -eq 0 ] && grep -q "GPU token 1 of 1 held for: echo queued-gpu" "$TMP/slot-g2.log" \
+    && ok "...and the queued GPU batch takes the token once it is released" || ko "the queued GPU batch did not run: rc=$rc $(cat "$TMP/slot-g2.log")"
+  kill -9 "$c1" 2>/dev/null; wait "$c1" 2>/dev/null
+fi
+kill -9 "$g1" 2>/dev/null; wait "$g1" 2>/dev/null
+# Safe across the switch: a batch started by the version before the tokens took the first free of
+# the box's slots, which is a token slot now, so it is counted without knowing it. Here the old
+# script's shape is a one-slot spec on the same directory.
+env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=1" "$FW" execution slot -- sleep 30 > "$TMP/slot-old.log" 2>&1 &
+o1=$!
+held "$TMP/slot-old.log" "slot 1 of 1 held" &&
+  expect "a batch holding slot 1 under the old count is a GPU token to the new one" 1 "all 1 GPU tokens" -- "${FWT[@]}" execution slot --wait 0 -- echo after-switch
+kill -9 "$o1" 2>/dev/null; wait "$o1" 2>/dev/null
+expect "--cpu and --gpu together are a usage error" 2 "exclusive" -- "${FWT[@]}" execution slot --cpu --gpu -- true
+expect "a token count below one is refused, as a slot count is" 1 "FLEET_BOX_GPU_TOKENS entry must be <box>=<positive n>: testbox=0" -- \
+  env FLEET_BOXES="testbox other" FLEET_BOX_GPU_TOKENS="testbox=0" "$FW" execution slot -- true
+expect "...and one naming a box outside the roster" 1 "FLEET_BOX_GPU_TOKENS names stale-box, which is not in FLEET_BOXES" -- \
+  env FLEET_BOXES="testbox other" FLEET_BOX_GPU_TOKENS="stale-box=1" "$FW" execution slot -- true
 # The OS-level sleep guard (ludics-lite#317). The stub logs its arguments and its pid and, like
 # the real systemd-inhibit, runs the command after its options -- the helper that holds the
 # inhibitor for as long as the batch's lifetime pipe is open; INHIBIT_DENY is polkit refusing
@@ -1630,7 +1696,7 @@ expect "execution hold needs a command after --" 2 "a command to hold the box ar
 expect "execution hold takes no slot options" 2 "execution hold .--why <text>. -- <command>" -- "${FWS[@]}" execution hold --wait 5 -- true
 expect "execution slot needs a command after --" 2 "a command to hold the slot around is required" -- "${FWS[@]}" execution slot --
 expect "execution slot refuses a non-numeric --wait" 2 "whole number of seconds" -- "${FWS[@]}" execution slot --wait soon -- echo x
-expect "execution slot takes no --box: the slot is this box's own" 2 "execution slot .--wait <seconds>. -- <command>" -- "${FWS[@]}" execution slot --box other -- echo x
+expect "execution slot takes no --box: the slot is this box's own" 2 "execution slot .--wait <seconds>. .--cpu|--gpu. -- <command>" -- "${FWS[@]}" execution slot --box other -- echo x
 expect "a malformed slots spec refuses before anything is locked" 1 "<box>=<positive n>" -- \
   env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=x" "$FW" execution slot -- echo x
 expect "a host with no fleet name has no slot to take" 2 "no fleet name" -- \
