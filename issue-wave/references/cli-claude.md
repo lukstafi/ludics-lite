@@ -49,9 +49,9 @@ wait and suite until the command returns - bounded calls re-issued, never an `un
 loop:
 
 - a Claude worker runs anything that can outlast the 600 s foreground cap under `bg-run.sh`, as
-  [native-claude.md, *Blocking on a run*](native-claude.md#blocking-on-a-run) says: `start` as a
-  background task, then foreground `wait` calls re-issued in the SAME turn until one prints
-  `rc=`. The backgrounded `start` holds the command only while the turn lasts;
+  [native-claude.md, *Blocking on a run*](native-claude.md#blocking-on-a-run) says: `new` for the
+  run directory, `start` as a background task, then foreground `wait` calls re-issued in the SAME
+  turn until one prints `rc=`. The backgrounded `start` holds the command only while the turn lasts;
 - a Codex worker keeps the command in the foreground of its turn, as
   [native-codex.md](native-codex.md#what-a-returned-turn-means) says.
 

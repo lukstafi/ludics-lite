@@ -5,7 +5,14 @@
 #
 # What it pins:
 #   - a finished run reads rc=<its exit status> with exit 0, whatever that status is, and the
-#     background `start` itself exits with it too;
+#     background `start` itself exits with it too -- on a directory `start` creates itself, the
+#     path every caller that names its own directory still takes;
+#   - `new` allocates: it creates the parent and prints <parent>/run-<N>, empty, one past the
+#     highest run-<N> there (other names not counted); two `new`s racing for the same N each get
+#     a directory of their own, and a copy without the exclusive mkdir is the control that
+#     hands both the same one; a parent it cannot write in, or that is a file, is an error, not an
+#     endless search; a wait on a `new` directory before `start` reads STARTING, and `start`
+#     there runs and reads rc;
 #   - race 1: a task killed before its command returned (so no rc is ever written) reads DIED,
 #     promptly, rather than RUNNING until the window is spent -- with RUNNING as the control
 #     while it was alive;
@@ -100,6 +107,72 @@ wait "$S"; src=$?
 d="$TMP/finished0"
 bg_start "$d" true
 expect "a run exiting 0 reads rc=0" 0 'rc=0' -- "$BG" wait "$d" --within 20
+
+# --- new: the run directory allocated for the caller ----------------------------------------------
+p="$TMP/runs"
+expect "new on an absent parent creates it and prints run-1" 0 "$p/run-1" -- "$BG" new "$p"
+[ "$out" = "$p/run-1" ] && ok "...and prints that path and nothing else" || ko "new printed: $out"
+[ -d "$p/run-1" ] && [ -z "$(ls -A "$p/run-1")" ] && ok "...an empty directory" \
+  || ko "run-1 is not an empty directory: $(ls -A "$p/run-1" 2>&1)"
+expect "a second new prints run-2" 0 "$p/run-2" -- "$BG" new "$p/"
+[ "$out" = "$p/run-2" ] && ok "...with the parent's trailing slash dropped" || ko "new printed: $out"
+mkdir "$p/run-7"; : > "$p/run-12x"; mkdir "$p/other"; : > "$p/run-"; mkdir "$p/run-0000000000099"
+expect "new counts past the highest run-<N>, not the other names beside it" 0 "$p/run-8" -- "$BG" new "$p"
+: > "$p/run-9"
+expect "a FILE named run-<N> is counted too, and never reused" 0 "$p/run-10" -- "$BG" new "$p"
+# The race: two `new`s held past the scan until both are there, so both try the same N and only
+# the exclusive mkdir can tell them apart. The control patches it into `mkdir -p`, which must then
+# hand both the same directory.
+# twin_news <script> <parent>: sets TWIN_OUT (the two printed paths, sorted) and TWIN_NRCS.
+twin_news() {
+  local gate="$2.gate" a b ra rb i=0
+  mkdir -p "$2"
+  BG_RUN_NEW_GATE=$gate "$1" new "$2" > "$2.a" 2>&1 &
+  a=$!
+  BG_RUN_NEW_GATE=$gate "$1" new "$2" > "$2.b" 2>&1 &
+  b=$!
+  BGPIDS="$BGPIDS $a $b"
+  while [ -z "$(find "$TMP" -maxdepth 1 -name "${gate##*/}.$a")" ] \
+    || [ -z "$(find "$TMP" -maxdepth 1 -name "${gate##*/}.$b")" ]; do
+    [ "$i" -lt 100 ] || break
+    sleep 0.1; i=$((i + 1))
+  done
+  : > "$gate"
+  wait "$a"; ra=$?; wait "$b"; rb=$?
+  TWIN_OUT=$(cat "$2.a" "$2.b" | sort | tr '\n' ' ')
+  TWIN_NRCS="$ra $rb"
+}
+twin_news "$BG" "$TMP/twin-new"
+[ "$TWIN_NRCS" = "0 0" ] && [ "$TWIN_OUT" = "$TMP/twin-new/run-1 $TMP/twin-new/run-2 " ] \
+  && ok "two news racing for one N each get a directory of their own (run-1, run-2)" \
+  || ko "twin news exited $TWIN_NRCS and printed: $TWIN_OUT"
+sed 's|if mkdir -- "$base/run-$n"|if mkdir -p -- "$base/run-$n"|' "$BG" > "$TMP/unexclusive.sh"
+chmod +x "$TMP/unexclusive.sh"
+if cmp -s "$BG" "$TMP/unexclusive.sh"; then
+  ko "control: the patch found no exclusive mkdir to replace in $BG"
+else
+  twin_news "$TMP/unexclusive.sh" "$TMP/twin-new-control"
+  [ "$TWIN_OUT" = "$TMP/twin-new-control/run-1 $TMP/twin-new-control/run-1 " ] \
+    && ok "control: with mkdir -p, both news print run-1" \
+    || ko "control: the copy without the exclusive mkdir printed $TWIN_OUT, so the case above proves nothing"
+fi
+: > "$TMP/a-file"
+expect "new under a parent that is a file is refused" 2 'cannot create' -- "$BG" new "$TMP/a-file"
+p="$TMP/locked"; mkdir -p "$p"; chmod 555 "$p"
+if [ -w "$p" ]; then
+  echo "SKIP: a mode-555 directory is still writable here (root, or no POSIX modes); the unwritable parent is not exercised"
+else
+  t0=$SECONDS
+  expect "new in a parent it cannot write in is refused" 2 'cannot create a run directory' -- "$BG" new "$p"
+  [ $((SECONDS - t0)) -le 3 ] && ok "...at once, not after a search" || ko "the refusal took $((SECONDS - t0)) s"
+fi
+chmod 755 "$p"
+d=$("$BG" new "$TMP/runs2")
+expect "a wait on a new directory before start reads STARTING" 4 STARTING -- \
+  env BG_RUN_START_GRACE=60 "$BG" wait "$d" --within 0
+bg_start "$d" sh -c 'echo from-new; exit 5'
+expect "...and start there runs and reads rc=5" 0 'rc=5' -- "$BG" wait "$d" --within 20
+[ "$(cat "$d/log")" = from-new ] && ok "...with its output in log" || ko "log holds: $(cat "$d/log")"
 
 # --- race 1: the task is killed before the command returns ---------------------------------------
 d="$TMP/killed"
@@ -339,6 +412,12 @@ expect "...and so are zero-padded BG_RUN_POLL and BG_RUN_START_GRACE" 4 STARTING
   env BG_RUN_POLL=01 BG_RUN_START_GRACE=09 "$BG" wait "$TMP/padded" --within 02
 expect "usage: no subcommand is refused" 2 'usage:' -- "$BG"
 expect "usage: --help prints the synopsis" 0 'bg-run.sh start <dir> --' -- "$BG" --help
+expect "...and names new" 0 'bg-run.sh new   <parent>' -- "$BG" --help
+expect "usage: new refuses a relative parent" 2 'absolute' -- "$BG" new rel/parent
+[ ! -e rel ] && ok "...and creates nothing" || ko "a relative new created ./rel"
+expect "usage: new with no parent is refused" 2 'usage:' -- "$BG" new
+expect "usage: new with a second argument is refused" 2 'usage:' -- "$BG" new "$TMP/u4" extra
+[ ! -e "$TMP/u4" ] && ok "...and creates nothing" || ko "a refused new created its parent"
 
 # --- through zsh, the way the Bash tool issues it ------------------------------------------------------
 if command -v zsh > /dev/null 2>&1; then
