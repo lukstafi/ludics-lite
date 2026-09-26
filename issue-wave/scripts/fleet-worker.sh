@@ -1625,8 +1625,11 @@ if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name
   # Meta and the input line change together: signals wait until both have (milliseconds), so an
   # interruption never leaves meta naming a message the input never got, nor half a line.
   trap '' TERM HUP INT
-  cp -p "$d/meta" "$d/meta.prev" 2>/dev/null && meta_set "$d" turn_offset "$off" && meta_set "$d" awaiting "$mid" ||
-    { [ -e "$d/meta.prev" ] && mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
+  # Only a backup whose copy completed is ever restored: a failed cp can leave a truncated one.
+  cp -p "$d/meta" "$d/meta.prev" 2>/dev/null ||
+    { rm -f "$d/meta.prev"; echo "UNSTICK REFUSED $BOX/$name: cannot back up $d/meta (disk full?); nothing was changed"; exit 1; }
+  meta_set "$d" turn_offset "$off" && meta_set "$d" awaiting "$mid" ||
+    { mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
   if ! printf '%s\n' "$line" >> "$d/input.jsonl" 2>/dev/null; then
     mv -f "$d/meta.prev" "$d/meta"
     # No truncation: the live feeder may already have forwarded a partial write, and a file
