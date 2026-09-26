@@ -27,8 +27,8 @@ One term per concept, used in this file and in every reference it links:
   own worktree.
 - **Transport**: how a worker runs. A **native worker** is a subagent of the coordinator's own
   runtime (Claude Code `Agent`, Codex `spawn_agent`); the runtimes say "subagent", this skill
-  says "native worker". A **CLI worker** is a headless `claude -p` or `codex exec` turn in a
-  detached tmux session on a fleet box, launched through `fleet-worker.sh`. An **app worker**
+  says "native worker". A **CLI worker** is a headless `claude -p` process or `codex exec` turn
+  in a detached tmux session on a fleet box, launched through `fleet-worker.sh`. An **app worker**
   is a separate Codex app conversation (an app thread) created with `create_thread`, used only
   on the user's explicit choice.
 - **Agent host**: the box the worker's process runs on. **Execution host**: the box a test or
@@ -438,7 +438,7 @@ requirements for every transport with transport-specific setup and identity, and
   end a turn with only an unobserved detached process outstanding - use the harness's tracked
   wait mechanism (a native Codex worker keeps the turn open or schedules an authorized
   heartbeat; a native Claude worker blocks as [Blocking on a run](references/native-claude.md#blocking-on-a-run) says; a CLI
-  worker, whose turn's end kills its background tasks, as [Blocking in a headless turn](references/cli-claude.md#blocking-in-a-headless-turn) says); if a review watch goes quiet
+  worker as [Blocking in a headless turn](references/cli-claude.md#blocking-in-a-headless-turn) says); if a review watch goes quiet
   suspiciously long, read the PR feed directly (`gh pr view --comments`) rather than re-arming
   the watch (reactions persist across rounds and strand it); commit early and often - commits
   are what survives every failure mode below.
