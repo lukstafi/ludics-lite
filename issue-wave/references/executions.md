@@ -270,8 +270,9 @@ its header requires, plus the runner's `exit:` sentinel when the log has one (a 
 N` or `<name>: exit: N`, the last one winning; OCANNL's `test-run.sh` and `machine-verify.sh`
 print one): the code is the sentinel when that is nonzero, else `rc`, so a pass needs both. Then
 0 is pass, 124 or 142 timeout, a signal code (129, 130, 137, 143) cancelled, anything else fail.
-A `DIED` task (killed before the command returned, nothing left alive) is cancelled; `RUNNING`,
-`STARTING` and `REFUSED` are refused. The directory is read on `--box`, by default the reservation's
+A `DIED` task (killed before the command returned, nothing left alive) is cancelled once a
+second read 5 s later still says DIED, which closes the one window bg-run.sh names where DIED is
+wrong; `RUNNING`, `STARTING` and `REFUSED` are refused. The directory is read on `--box`, by default the reservation's
 execution host. Name the box that drove the run when the leg went over ssh (a machine-verify trip
 started on the agent host leaves its directory there). Because that box is legitimately not the
 reserved one, this form carries no execution-host binding; the conclusion's `log` and `handle`

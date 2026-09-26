@@ -1708,12 +1708,20 @@ dir="$1"
 refuse() { echo "FROM-BG-RUN REFUSED: $*"; exit 1; }
 [ -d "$dir" ] || refuse "no run directory $dir on $BOX"
 tmp=$(mktemp "${TMPDIR:-/tmp}/fw-bg-run.XXXXXX") || refuse "cannot create a scratch file on $BOX"
-bash -s -- wait "$dir" --within 0 > "$tmp" 2>&1 <<'FLEET_BG_RUN_SH'
+bg_wait() {
+  bash -s -- wait "$dir" --within 0 > "$tmp" 2>&1 <<'FLEET_BG_RUN_SH'
 EOF
   cat "$1"
   cat <<'EOF'
 FLEET_BG_RUN_SH
-wrc=$?
+}
+bg_wait; wrc=$?
+# DIED is read twice, 5 s apart. bg-run.sh's header names the one window where DIED is wrong: a
+# wrapper killed alone between forking the command and the command publishing `cpid`, which a
+# wait in that instant reads as DIED while the command goes on to run. The command publishes its
+# cpid before it execs anything, so a second read after the pause sees it RUNNING; only a DIED
+# that holds across the pause becomes a conclusion.
+if [ "$wrc" -eq 5 ]; then sleep 5; bg_wait; wrc=$?; fi
 said=$(head -n1 "$tmp"); rm -f "$tmp"
 case "$wrc" in
   0) ;;
@@ -1741,7 +1749,8 @@ EOF
 #   - 0 pass; 124 (timeout(1), fleet-worker's `bounded`) and 142 (test-run.sh's cap) timeout;
 #     129/130/137/143 (a signal) cancelled; anything else fail;
 #   - bg-run's DIED (a published pid, it and the command both gone, no rc: the harness killed the
-#     task) is cancelled, since nothing of the command is left running and it never returned.
+#     task), read twice 5 s apart (from_bg_run_script says why), is cancelled, since nothing of the
+#     command is left running and it never returned.
 # The read box need not be the execution host: a trip driven over ssh (machine-verify from the
 # agent host) leaves its directory on the box that drove it, and 5 of the 09-25 wave's 8
 # bg-run conclusions were of that shape. So the payload carries no `execution_host` binding (the
@@ -1777,8 +1786,7 @@ conclude_from_bg_run() {
   [ "$box" = "$host" ] || evidence="$evidence; directory read on $box, which drove the run on $host"
   jq -cn --arg id "$request" --arg ev "$evidence" --arg sha "$sha" --arg co "$checkout" \
     --arg handle "bg-run:$box:$dir" --arg log "$box:$dir/log" --arg verdict "$verdict" \
-    '{request_id: $id, evidence: $ev, observed_sha: $sha, handle: $handle, log: $log, verdict: $verdict}
-     + (if $co == "" then {} else {remote_checkout: $co} end)'
+    '{request_id: $id, evidence: $ev, observed_sha: $sha, remote_checkout: $co, handle: $handle, log: $log, verdict: $verdict}'
 }
 
 # in_roster <name>: is that an exact FLEET_BOXES entry? The registry refuses an execution host
@@ -2189,10 +2197,11 @@ cmd_execution() {
         [ "$rc" -eq 0 ] || { printf '%s\n' "$listing"; echo "EXECUTION REFUSED: the anchor's registry could not be read"; exit 1; }
         host=$(jq -r --arg id "$request" '.[] | select(.request_id == $id) | .request.execution_host' <<<"$listing")
         [ -n "$host" ] || { echo "EXECUTION REFUSED: unknown request_id $request (no execution host to read the run for)"; exit 1; }
-        # A checkout already on the record stays; only a record with none gets the placeholder.
-        if [ -z "$checkout" ] && [ -z "$(jq -r --arg id "$request" '.[] | select(.request_id == $id) | .remote_checkout // empty' <<<"$listing")" ]; then
-          checkout="not recorded (bg-run keeps no checkout; the log names what ran)"
-        fi
+        # Without --checkout the record's own checkout is restated, or the placeholder when it has
+        # none -- always spelled out in the payload, so a retry of a conclusion whose answer was
+        # lost composes the same payload and meets the registry's identical-retry rule.
+        [ -n "$checkout" ] || checkout=$(jq -r --arg id "$request" '.[] | select(.request_id == $id) | .remote_checkout // empty' <<<"$listing")
+        [ -n "$checkout" ] || checkout="not recorded (bg-run keeps no checkout; the log names what ran)"
         payload=$(conclude_from_bg_run "$dir" "$request" "${box:-$host}" "$host" "$sha" "$checkout" "$evidence" "$bgrun"); rc=$?
         [ "$rc" -eq 0 ] || { printf '%s\n' "$payload"; exit "$rc"; }
       else

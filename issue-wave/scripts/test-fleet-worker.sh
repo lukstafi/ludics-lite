@@ -1377,6 +1377,10 @@ bgreq() { # <id> -> a dispatched reservation on testbox
 }
 FWB=(env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other "$FW")
 sha=$(printf 'b%.0s' $(seq 40))
+bgdone() { # <id>: conclude it, so testbox's one slot is free for the next case
+  jq -n --arg id "$1" '{request_id:$id, verdict:"not-launched", log:"/dev/null", evidence:"bg-run fixture: nothing ran"}' > "$TMP/$1-done.json"
+  "${FWB[@]}" execution conclude "$TMP/$1-done.json" >/dev/null || ko "could not conclude $1 (setup)"
+}
 bgc() { # <id> <dir> [flags...]: dispatch <id>, then conclude it from <dir>
   local id="$1" dir="$2"; shift 2
   bgreq "$id" && "${FWB[@]}" execution conclude --from-bg-run "$dir" --request "$id" --sha "$sha" "$@"
@@ -1388,6 +1392,8 @@ for want in "\"observed_sha\": \"$sha\"" "\"handle\": \"bg-run:testbox:$ok_dir\"
   grep -Fq -- "$want" <<<"$out" && ok "...recorded $want" || ko "missing $want in $out"
 done
 grep -q "runner sentinel" <<<"$out" && ko "a line outside the sentinel grammar was read as one: $out" || ok "...reading neither a sentinel with trailing text nor a transport line as the runner's"
+expect "a retry of that conclusion (its answer lost) composes the same payload, which the registry takes as a harmless retry" 0 '"state": "concluded"' -- \
+  "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-pass --sha "$sha"
 expect "the runner's nonzero sentinel wins over a 0 rc: fail" 0 "runner sentinel 'runner: exit: 1'" -- bgc bg-sent1 "$(bgdir sent1 sh -c 'echo "runner: exit: 1"; echo tail output')"
 grep -q '"verdict": "fail"' <<<"$out" && ok "...as fail" || ko "a failing sentinel under rc 0 did not read as fail: $out"
 expect "a zero sentinel does not rescue a nonzero rc: fail" 0 '"verdict": "fail"' -- bgc bg-sent0 "$(bgdir sent0 sh -c 'echo "exit: 0"; exit 1')"
@@ -1411,6 +1417,13 @@ expect "...and an explicit --checkout replaces it" 0 '"remote_checkout": "/named
 d="$TMP/bg runs/died"; mkdir -p "$d"; sh -c 'exit 0' & gone=$!; wait "$gone"; printf '%s\n\n' "$gone" > "$d/pid"; : > "$d/log"
 expect "a task killed before the command returned (DIED) concludes as cancelled" 0 '"verdict": "cancelled"' -- bgc bg-died "$d"
 grep -q "DIED" <<<"$out" && ok "...saying DIED" || ko "the DIED evidence is missing: $out"
+# The one window where DIED is wrong (bg-run.sh's header): the wrapper killed alone before the
+# command published cpid. The command publishes it a moment later, and the second read sees it.
+d="$TMP/bg runs/late-cpid"; mkdir -p "$d"; printf '%s\n\n' "$gone" > "$d/pid"
+( sleep 1; printf '%s\n\n' "$$" > "$d/cpid.tmp" && mv "$d/cpid.tmp" "$d/cpid" ) &
+expect "a DIED whose command publishes its cpid a moment later is re-read as RUNNING and refused" 1 "FROM-BG-RUN REFUSED: bg-run.sh wait: RUNNING" -- bgc bg-late "$d"
+wait
+bgdone bg-late
 d="$TMP/bg runs/live"; mkdir -p "$d"; printf '%s\n\n' "$$" > "$d/pid"
 expect "a live task (RUNNING) is refused" 1 "FROM-BG-RUN REFUSED: bg-run.sh wait: RUNNING" -- bgc bg-live "$d"
 d="$TMP/bg runs/never"; mkdir -p "$d"
@@ -1424,10 +1437,6 @@ expect "--from-bg-run needs the request id" 2 "--request <id> required" -- "${FW
 expect "--from-bg-run needs the revision that ran" 2 "--sha <full commit SHA> required" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live
 expect "--from-bg-run refuses a stray flag" 2 "conclude --from-bg-run <run-dir>" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live --sha "$sha" --oops
 "$FW" execution list | jq -e '[.[] | select(.request_id == "bg-live") | .state] == ["launching"]' >/dev/null && ok "every refusal left the assignment dispatched" || ko "a refusal changed bg-live"
-bgdone() { # <id>: conclude it, so the sections below find testbox free
-  jq -n --arg id "$1" '{request_id:$id, verdict:"not-launched", log:"/dev/null", evidence:"bg-run fixture: nothing ran"}' > "$TMP/$1-done.json"
-  "${FWB[@]}" execution conclude "$TMP/$1-done.json" >/dev/null || ko "could not conclude $1 (setup)"
-}
 bgdone bg-live
 }
 
