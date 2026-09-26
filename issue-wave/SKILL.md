@@ -366,9 +366,9 @@ requirements for every transport with transport-specific setup and identity, and
   coordinator took at launch - name its request id, the bounded aliases and `-j` width it
   covers, and that every batch goes through the project runner, wrapped in `fleet-worker.sh
   execution slot -- <batch>`, and is reported by run directory. Every other run - a
-  measurement (for a [timing-grade claim only](references/executions.md#exclusivity-and-the-run-time-slots),
-  a rule the brief carries), a cross-box leg, a full suite - needs a request first, in the
-  transport's shape:
+  measurement (only for a timing-grade claim or a run that needs the box to itself, a
+  [rule](references/executions.md#exclusivity-and-the-run-time-slots) the brief carries), a
+  cross-box leg, a full suite - needs a request first, in the transport's shape:
   the [Claude Code worker channel](references/native-claude.md#worker-channel), the
   [Codex worker channel](references/native-codex.md#worker-channel), or the
   [CLI reservation handoff](references/executions.md#cli-reservation-handoff). A resumed worker
@@ -591,12 +591,13 @@ controlled through the tools in your coordinator's file, never through those com
   not restart verification, and only a merge that needed a conflict-RESOLVING commit waits for
   green CI on that commit. `pr-review.sh merge` warns loudly on a stale base but no longer
   refuses. The complement is the coordinator's **integration loop**, whose value is a verdict
-  for every merge: a master CI that cancels superseded runs leaves most merges without one
-  (2026-09-25: 9 of 16 master pushes cancelled, no master tip with a verdict for 2.5 h). As
-  each merge lands, pick a quiet, strong box with the whole board in view (`fleet-worker.sh
-  load` - CPU/GPU five-minute averages, dune count, agent sessions per box; a box already
-  running this wave's GPU measurement is NOT quiet whatever its CPU says; the maintainer chose
-  minix-amd-linux over tuf-amd-linux), take an execution reservation there, and run the MERGED
+  that keeps pace with the merges: a master CI that cancels superseded runs leaves most merges
+  without one (2026-09-25: 9 of 16 master pushes cancelled, no master tip with a verdict for
+  2.5 h). As each merge lands, pick a quiet, strong box with the whole board in view
+  (`fleet-worker.sh load` - CPU/GPU five-minute averages, dune count, agent sessions per box; a
+  box already running this wave's GPU measurement is NOT quiet whatever its CPU says; the
+  maintainer chose minix-amd-linux over tuf-amd-linux), take an execution reservation there,
+  and run the MERGED
   repository's own full integration suite to completion in a checkout that owes the same proof
   as the launch preflight - clean porcelain, expected branch, HEAD equal to the remote master
   just merged - because a suite run atop local edits or the wrong branch verifies nothing. For
@@ -653,11 +654,12 @@ controlled through the tools in your coordinator's file, never through those com
 - **Experiment-only items** (the user says "measurement only, don't recommend") get a brief
   variant (2026-09-25: ahrefs/ocannl#719's was hand-edited into it): no fix direction,
   implemented or recommended; no standing reservation, which would refuse the item's own
-  exclusive measurement on its box; no ship-pr landing - the deliverable is an issue comment a
-  later session can act on, and the issue stays open. A harness PR, if the item needs one, lands
-  through ship-pr, and its review finds real instrument defects (#444: a device readback inside
-  the timed region, worth up to 1.7x) - worth its rounds; cap it with the convergence policy
-  after, not before.
+  exclusive measurement on its box, so every run, correctness batches included, goes through a
+  request; no ship-pr landing - the deliverable is an issue comment a later session can act on,
+  the issue stays open, and a hand-back linking that comment is completion. A harness PR, if the
+  item needs one, lands through ship-pr, and its review finds real instrument defects (#444: a
+  device readback inside the timed region, worth up to 1.7x) - worth its rounds; cap it with the
+  convergence policy after, not before.
 - **Gate later waves** on the merges and out-of-scope closures they wait for, and rebrief
   each next-wave worker with what its predecessors landed (new helpers, reshaped goldens,
   fresh conventions) so it builds on them instead of colliding.
