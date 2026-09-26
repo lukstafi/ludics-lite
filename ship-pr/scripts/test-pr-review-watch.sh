@@ -443,6 +443,17 @@ test_the_ending_line_names_the_round() (
   ROUND_THRESHOLD=off
   run_watch 0,0,500
   assert_contains "$WATCH_ERR" "— this window opened round 3 (no threshold set)" "and with none set, the count alone"
+  # A span that crosses the threshold says where blocking-only starts, not that all of it is past
+  # (review of #434, round 5): rounds 1–3 against a threshold of 2 keep rounds 1–2 in full.
+  ROUND_THRESHOLD=2
+  run_watch 0,0,0
+  assert_contains "$WATCH_ERR" \
+    "— this window opened rounds 1–3 of 2; from round 3 on PAST the threshold: blocking-only there, rounds 1–2 in full" \
+    "the rounds before the threshold are addressed in full"
+  ROUND_THRESHOLD=1
+  run_watch 0,0,400
+  assert_contains "$WATCH_ERR" "— this window opened rounds 2–3 of 1, PAST the threshold: blocking-only from here" \
+    "a span wholly past the threshold is past as a whole"
 )
 
 # The line claims only what the window's own items opened (review of #434, round 1). A first watch

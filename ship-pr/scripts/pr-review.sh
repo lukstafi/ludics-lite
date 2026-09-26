@@ -1257,14 +1257,17 @@ esac
 # as its first word on a round (ludics-lite#421: PR #420, 2026-09-26, while a sibling PR was
 # reviewed normally; one '@codex review' got a round). It names no ref, which is why status_state
 # attributes it by the clock rather than by the ref (see the `failed` branch there). Anchored and
-# taken through "this repo" for the reason above, and then BOUNDED: the whole link if there is
-# one, an optional full stop, and the end of the line — a finding opening "To use Codex here,
-# create an environment for this repository before …", or continuing after the link, is a
-# finding (review of #434, rounds 1 and 4). The link is optional, since only its text is the
+# anchored at BOTH ends: the sentence is the connector's whole comment, so the match is the whole
+# body — the link if there is one, an optional full stop, trailing whitespace, and nothing else.
+# Three review rounds of #434 (1, 4, 5) each found a way a finding could open with the words and
+# go on — "this repository …", text after the link, text on the next line — and each was a
+# suffix the matcher accepted; with the body's end required there is no suffix left to accept.
+# The trade is the canonical body's: should the connector ever append to this comment, it reads
+# `expected` and costs one grace, loudly. The link is optional, since only its text is the
 # reviewer's sentence. INIT_FAILURE_RE is the
 # union, so `rounds` drops both shapes.
 INIT_FAILURE_GIT_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong\.[ \t]*Try again later by commenting[^\n]{0,4}@codex review'
-INIT_FAILURE_ENV_RE='\A[ \t]*To use Codex here,[ \t]*\[?create an environment for this repo(?:\]\([^)[:space:]]*\))?\.?[ \t]*(?:\n|\z)'
+INIT_FAILURE_ENV_RE='\A[ \t]*To use Codex here,[ \t]*\[?create an environment for this repo(?:\]\([^)[:space:]]*\))?\.?[[:space:]]*\z'
 INIT_FAILURE_RE="(?:$INIT_FAILURE_GIT_RE)|(?:$INIT_FAILURE_ENV_RE)"
 # The ref the failure names — the head the reviewer could not fetch. GitHub serves lowercase hex,
 # as does the message. A failure that names none is not attributed to any head: see the branch in
@@ -2627,11 +2630,21 @@ watch_round_note() { # <pr>
     printf ' — round UNKNOWN (%s); read `rounds` before citing a round number' "$detail"
     return 0
   fi
+  # Past the threshold is said of the rounds that are past it: a span that CROSSES it (rounds
+  # 11–13 of 12) keeps its earlier rounds in full and names where blocking-only starts (review of
+  # #434, round 5).
   case "$ROUND_THRESHOLD" in
   '' | off | *[!0-9]*) of=" (no threshold set)" ;;
   *)
     of=" of $ROUND_THRESHOLD"
-    [ "$n" -le "$ROUND_THRESHOLD" ] || past=", PAST the threshold: blocking-only from here"
+    if [ "$n" -gt "$ROUND_THRESHOLD" ]; then
+      if [ "$n" -gt $((b + 1)) ] && [ "$((b + 1))" -le "$ROUND_THRESHOLD" ]; then
+        past="; from round $((ROUND_THRESHOLD + 1)) on PAST the threshold: blocking-only there,"
+        past="$past rounds $((b + 1))–$ROUND_THRESHOLD in full"
+      else
+        past=", PAST the threshold: blocking-only from here"
+      fi
+    fi
     ;;
   esac
   if [ "$n" -le "$b" ]; then
