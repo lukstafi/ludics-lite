@@ -1241,7 +1241,11 @@ expect "the resumed process answers the message and idles" 0 "IDLE testbox/ws .*
 grep -q '"resumed":true' "$wsd/stream.jsonl" && ok "stream appended, not truncated, across the resume" || ko "stream lost the resume"
 [ "$(tail -n +"$(( $(sed -n 's/^proc_offset=//p' "$wsd/meta") + 1 ))" "$wsd/stream.jsonl" | grep -c '"isReplay":true')" -eq 1 ] && ok "the resumed process read no line an earlier one had" || ko "the resume replayed old input"
 grep -q '^resumes=1$' "$wsd/meta" && ok "meta counts the resume" || ko "meta resumes not bumped"
+# A CLI that outlives its session (an orphan carrying this record's path) still holds close open.
+bash -c 'sleep 4; :' claude "$wsd/" >/dev/null 2>&1 & orphan=$!; t0=$(date +%s)
 expect "close ends it with the resumed turn's verdict" 0 "DONE testbox/ws exit=0 .*did: Stop and answer now" -- "$FW" close testbox ws
+[ $(( $(date +%s) - t0 )) -ge 3 ] && ! kill -0 "$orphan" 2>/dev/null && ok "...and waits out a CLI still running past its session" || ko "close returned while an orphaned CLI still ran"
+wait "$orphan" 2>/dev/null
 # Delivery is proven by the echo, not assumed: a CLI that has not read the line yet (here inside a
 # turn that reads nothing) leaves it queued and unread, and attach waits for its reply.
 printf 'BG 6\n' > "$TMP/bg4.md"
@@ -1261,6 +1265,11 @@ grep -q -- "tail -n +2 -f " "$ISSUE_WAVE_STATE/workers/wr/run.sh" && ok "...resu
 expect "...and the resumed process answers both, the new one last" 0 "IDLE testbox/wr .*did: Now the next step" -- "$FW" attach testbox wr --interval 1
 grep -q '"text":"did: Stop and answer now' "$ISSUE_WAVE_STATE/workers/wr/stream.jsonl" && ok "...the queued message had its own turn" || ko "queued message lost across the resume"
 settle wr
+# A feeder whose pid cannot be recorded could never be closed: the worker stops before its CLI.
+mkdir "$ISSUE_WAVE_STATE/workers/wr/feeder.pid"
+"$FW" unstick testbox wr --message "$TMP/msg.md" >/dev/null
+expect "an unwritable feeder pid file stops the worker before the CLI starts" 1 "FAILED testbox/wr exit=95" -- "$FW" attach testbox wr --interval 1
+rmdir "$ISSUE_WAVE_STATE/workers/wr/feeder.pid"
 
 printf 'SLEEP 60\n' > "$TMP/slow.md"
 "$FW" launch testbox a.b --target-repo example/project --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1

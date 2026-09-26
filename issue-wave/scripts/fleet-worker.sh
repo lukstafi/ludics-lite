@@ -435,8 +435,10 @@ user_line() { jq -cRs --arg u "$2" '{type: "user", uuid: $u, message: {role: "us
 stream_run() {
   local d="$1" cwd="$2" from="$3" flag="$4" sid="$5" a; shift 5
   printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
-  printf 'rm -f %q\n' "$d/feeder.pid"
-  printf '{ tail -n +%d -f %q & echo $! > %q; wait; } | {\n' "$from" "$d/input.jsonl" "$d/feeder.pid"
+  # Without its pid on record the feeder could never be closed or ended: an unwritable pid file
+  # stops the worker before the CLI starts, and a failed write ends the feeder it would name.
+  printf 'rm -f %q && : > %q || { echo 95 > %q; exit 95; }\n' "$d/feeder.pid" "$d/feeder.pid" "$d/exit"
+  printf '{ tail -n +%d -f %q & echo $! > %q || { kill $!; exit 95; }; wait; } | {\n' "$from" "$d/input.jsonl" "$d/feeder.pid"
   printf '  claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --dangerously-skip-permissions %s %q' "$flag" "$sid"
   for a in "$@"; do printf ' %q' "$a"; done
   printf ' >> %q 2>> %q; rc=$?\n' "$d/stream.jsonl" "$d/stderr.log"
@@ -1322,7 +1324,8 @@ EOF
 # The verdict of a finished worker, from its files. Prints one line; exit 0 clean, 1 failed,
 # 3 no exit record (the session is gone but nothing wrote the code: killed, or never started).
 # A claude worker whose process is up and idle (attach's stop condition, see the header) gets an
-# IDLE line instead of DONE, or a FAILED line saying `idle` when its turn ended in an error.
+# IDLE line instead of DONE, or a FAILED line saying `idle` when its turn ended in an error; when
+# it is up but no longer idle (a turn started meanwhile) it prints nothing and returns 5.
 #
 # A DONE or IDLE line gains `| PROBABLE STRAND: ...` when the turn's final message announces a
 # wait still pending. A one-shot turn's end kills the background tasks it started, so a worker
@@ -1387,6 +1390,9 @@ verdict() {
   esac
   [ -n "$summary" ] || summary="no terminal event in the stream"
   if [ "$idle" = 1 ]; then
+    # Re-read at the moment of the verdict: a turn a ScheduleWakeup (or a task) started since
+    # attach saw the worker idle is no IDLE; 5 tells attach to go on waiting.
+    case "$(turn_state "$name")" in "ended 0 1") ;; *) return 5 ;; esac
     local next='awaiting input: `unstick --message` continues it, `close` ends it'
     if [ "${ok_event:-0}" -gt 0 ]; then
       final=$(turn | jq -Rrn '[inputs | fromjson? | select(.type=="result") | (.result // "" | tostring)] | last // ""' 2>/dev/null)
@@ -1428,7 +1434,10 @@ while running "$name"; do
   # latest message in the stream (turn_state's `ended 0 1`), checked before each sleep so a
   # worker already idle answers at once.
   if alive "$name" && is_stream "$name"; then
-    case "$(turn_state "$name")" in "ended 0 1") break ;; esac
+    case "$(turn_state "$name")" in "ended 0 1")
+      v=$(verdict "$name"); vrc=$?
+      [ "$vrc" = 5 ] || { printf '%s\n' "$v"; exit "$vrc"; } ;;
+    esac
   fi
   sleep "$interval"
   t=$(now)
@@ -1746,9 +1755,10 @@ read -r t bg res <<< "$(turn_state "$name")"
 fpid=$(feeder_of "$name") || { echo "CLOSE REFUSED $BOX/$name: no live feeder on $d/input.jsonl, so its input is closed already or was never fed -- \`attach\` waits for the CLI, \`unstick --kill\` ends it"; exit 1; }
 kill "$fpid" 2>/dev/null
 # The session ends only after run.sh has written `exit`, so the verdict never reads it half-written.
+# `running`, not `alive`: a CLI that outlived its tmux session can still write and commit.
 waited=0
-while alive "$name" && [ "$waited" -lt "$cwait" ]; do sleep 1; waited=$((waited + 1)); done
-if alive "$name"; then echo "CLOSE PENDING $BOX/$name: its input closed ${cwait}s ago and the CLI still runs -- \`attach\` waits for its exit"; exit 1; fi
+while running "$name" && [ "$waited" -lt "$cwait" ]; do sleep 1; waited=$((waited + 1)); done
+if running "$name"; then echo "CLOSE PENDING $BOX/$name: its input closed ${cwait}s ago and the CLI still runs ($(state_of "$name")) -- \`attach\` waits for its exit"; exit 1; fi
 verdict "$name"
 EOF
   } | run_on "$box" "$name" "$cwait"
