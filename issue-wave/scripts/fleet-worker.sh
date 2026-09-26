@@ -1700,34 +1700,29 @@ conclude_from_run() {
 # (`exit: N`), machine-verify-far.sh (`machine-verify: exit: N`) and ci-compiler-test.sh print. The
 # LAST such line wins. Deliberately not read: a transport line with a second word
 # (`machine-verify: ssh exit: N`, which restates rc), a line with trailing text or a CR, and
-# anything else in the log. Prints `status=rc`, `rc=`, `sentinel=` lines, `status=DIED`, or one
-# FROM-BG-RUN REFUSED line.
+# anything else in the log. Prints `status=rc`, `rc=` and `sentinel=` lines, or one FROM-BG-RUN
+# REFUSED line.
 from_bg_run_script() {
   cat <<'EOF'
 dir="$1"
 refuse() { echo "FROM-BG-RUN REFUSED: $*"; exit 1; }
 [ -d "$dir" ] || refuse "no run directory $dir on $BOX"
 tmp=$(mktemp "${TMPDIR:-/tmp}/fw-bg-run.XXXXXX") || refuse "cannot create a scratch file on $BOX"
-bg_wait() {
-  bash -s -- wait "$dir" --within 0 > "$tmp" 2>&1 <<'FLEET_BG_RUN_SH'
+bash -s -- wait "$dir" --within 0 > "$tmp" 2>&1 <<'FLEET_BG_RUN_SH'
 EOF
   cat "$1"
   cat <<'EOF'
 FLEET_BG_RUN_SH
-}
-bg_wait; wrc=$?
-# DIED is read twice, 5 s apart. bg-run.sh's header names the one window where DIED is wrong: a
-# wrapper killed alone between forking the command and the command publishing `cpid`, which a
-# wait in that instant reads as DIED while the command goes on to run. The command publishes its
-# cpid before it execs anything, so a second read after the pause sees it RUNNING; only a DIED
-# that holds across the pause becomes a conclusion.
-if [ "$wrc" -eq 5 ]; then sleep 5; bg_wait; wrc=$?; fi
+wrc=$?
 said=$(head -n1 "$tmp"); rm -f "$tmp"
 case "$wrc" in
   0) ;;
   3) refuse "bg-run.sh wait: RUNNING -- $dir has no rc and its task or command is alive; conclude once it finishes" ;;
   4) refuse "bg-run.sh wait: STARTING -- no task has published a pid in $dir (never started, or not yet)" ;;
-  5) printf 'status=DIED\n'; exit 0 ;;
+  # DIED is never a conclusion: bg-run.sh's header names a window where it is wrong (a wrapper
+  # killed alone before its command published `cpid`), and no pause bounds how late the command
+  # may still publish and run. The coordinator checks for the run's processes itself.
+  5) refuse "bg-run.sh wait: DIED -- the task was killed before the command returned; bg-run cannot rule out a command that outlived it unpublished, so make sure no process of the run remains, then conclude it with a JSON payload (cancelled)" ;;
   6) refuse "bg-run.sh wait: $said -- start refused this directory, so an rc there may be an earlier run's" ;;
   *) refuse "bg-run.sh wait exit $wrc: $said" ;;
 esac
@@ -1748,9 +1743,8 @@ EOF
 #     (or a runner whose status a pipe or tee replaced) cannot conclude as pass;
 #   - 0 pass; 124 (timeout(1), fleet-worker's `bounded`) and 142 (test-run.sh's cap) timeout;
 #     129/130/137/143 (a signal) cancelled; anything else fail;
-#   - bg-run's DIED (a published pid, it and the command both gone, no rc: the harness killed the
-#     task), read twice 5 s apart (from_bg_run_script says why), is cancelled, since nothing of the
-#     command is left running and it never returned.
+#   - bg-run's DIED is refused, not mapped (from_bg_run_script says why), as are RUNNING,
+#     STARTING and REFUSED.
 # The read box need not be the execution host: a trip driven over ssh (machine-verify from the
 # agent host) leaves its directory on the box that drove it, and 5 of the 09-25 wave's 8
 # bg-run conclusions were of that shape. So the payload carries no `execution_host` binding (the
@@ -1766,9 +1760,6 @@ conclude_from_bg_run() {
   [ "$rc" -eq 0 ] || { printf '%s\n' "$facts"; return 1; }
   status=$(sed -n 's/^status=//p' <<<"$facts")
   case "$status" in
-    DIED)
-      verdict=cancelled
-      note="bg-run $dir on $box: DIED -- the task was killed before the command returned (no rc), and neither it nor the command is alive" ;;
     rc)
       code=$(sed -n 's/^rc=//p' <<<"$facts"); sentinel=$(sed -n 's/^sentinel=//p' <<<"$facts")
       [[ "$code" =~ ^[0-9]+$ ]] || { echo "FROM-BG-RUN REFUSED: unreadable run facts from $box: $facts"; return 1; }

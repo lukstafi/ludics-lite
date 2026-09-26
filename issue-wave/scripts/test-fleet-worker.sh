@@ -1415,15 +1415,8 @@ bgreq bg-rec2 && jq -n '{request_id:"bg-rec2", state:"running", evidence:"fixtur
 expect "...and an explicit --checkout replaces it" 0 '"remote_checkout": "/named/wt"' -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-rec2 --sha "$sha" --checkout /named/wt
 # Staged states: bg-run.sh's own verdicts, never re-derived here.
 d="$TMP/bg runs/died"; mkdir -p "$d"; sh -c 'exit 0' & gone=$!; wait "$gone"; printf '%s\n\n' "$gone" > "$d/pid"; : > "$d/log"
-expect "a task killed before the command returned (DIED) concludes as cancelled" 0 '"verdict": "cancelled"' -- bgc bg-died "$d"
-grep -q "DIED" <<<"$out" && ok "...saying DIED" || ko "the DIED evidence is missing: $out"
-# The one window where DIED is wrong (bg-run.sh's header): the wrapper killed alone before the
-# command published cpid. The command publishes it a moment later, and the second read sees it.
-d="$TMP/bg runs/late-cpid"; mkdir -p "$d"; printf '%s\n\n' "$gone" > "$d/pid"
-( sleep 1; printf '%s\n\n' "$$" > "$d/cpid.tmp" && mv "$d/cpid.tmp" "$d/cpid" ) &
-expect "a DIED whose command publishes its cpid a moment later is re-read as RUNNING and refused" 1 "FROM-BG-RUN REFUSED: bg-run.sh wait: RUNNING" -- bgc bg-late "$d"
-wait
-bgdone bg-late
+expect "a task killed before the command returned (DIED) is refused, never concluded" 1 "FROM-BG-RUN REFUSED: bg-run.sh wait: DIED" -- bgc bg-died "$d"
+bgdone bg-died
 d="$TMP/bg runs/live"; mkdir -p "$d"; printf '%s\n\n' "$$" > "$d/pid"
 expect "a live task (RUNNING) is refused" 1 "FROM-BG-RUN REFUSED: bg-run.sh wait: RUNNING" -- bgc bg-live "$d"
 d="$TMP/bg runs/never"; mkdir -p "$d"
