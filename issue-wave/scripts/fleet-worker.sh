@@ -63,6 +63,11 @@
 #   fleet-worker.sh execution conclude --from-run <run-dir> --request <id> --sha <sha>
 #                          [--box <box>] [--evidence <text>]   # verdict, log and checkout read from a
 #                                                     # test-run.sh record on the reserved box
+#   fleet-worker.sh execution conclude --from-bg-run <run-dir> --request <id> --sha <sha>
+#                          [--box <box>] [--checkout <text>] [--evidence <text>]   # verdict and log
+#                          # read from a bg-run.sh directory (see conclude_from_bg_run for the mapping)
+#   fleet-worker.sh prs <owner/repo> [--wave <id>] [--flag-at <n>]   # open PRs with review rounds,
+#                          # CI state and head age; flags <n> (5) or more rounds (read-only)
 #   fleet-worker.sh halt <reason> | resume-launches | halted
 #
 # `launch`, `unstick`, `halt` and `resume-launches` require the lease; `launch` also refuses
@@ -1499,6 +1504,95 @@ cmd_load() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# `prs <owner/repo> [--wave <id>] [--flag-at <n>]`: the coordinator's supervision read of open PRs
+# (ludics-lite#405). The skill sends the convergence policy "after ~5 rounds", but no view showed
+# the count: staging#783 reached round 10 before the coordinator noticed, and ended at 14. One line
+# per open PR -- `pr-review.sh rounds` (review rounds with findings), `pr-review.sh checks` (the
+# build signal on the head, never waited for) and the head's age -- and a CONVERGE note on a PR at
+# --flag-at rounds or more. Every read goes through ship-pr's pr-review.sh, for its retry and its
+# exit codes; its text is read only as far as the count on the `rounds` line and the ABSENT word
+# on the `checks` line. Read-only: no lease, nothing posted.
+# The head's age runs from the newer of the head commit's committer date and the PR's creation,
+# the floor pr-review.sh itself uses, since the push time is not an API field.
+# --wave keeps the PRs that close an issue some execution record of that wave names (every worker
+# takes a standing reservation at launch, so the registry lists the wave's issues); a PR whose
+# closing references name none of them -- no `Closes` line -- is not shown under --wave.
+# Exit: 0 read | 1 a PR is at the flag, or refused | 4 some read did not answer (a flag wins).
+cmd_prs() {
+  local repo="" wave="" flag=5 helper list rc issues=null rows n sha created draft branch title
+  local rounds_out rounds checks_out ci date age worst=0 shown=0 note
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --wave|--flag-at)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die "prs: expected value for $1"
+        if [ "$1" = --wave ]; then wave="$2"; else flag="$2"; fi
+        shift ;;
+      -*) die "prs <owner/repo> [--wave <id>] [--flag-at <n>]" ;;
+      *) [ -z "$repo" ] || die "prs: one <owner/repo>"; repo="$1" ;;
+    esac
+    shift
+  done
+  [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "prs: <owner/repo> required"
+  [[ "$flag" =~ ^[1-9][0-9]*$ ]] || die "prs: --flag-at takes a positive number of rounds"
+  helper="$(cd "$(dirname "$0")/../../ship-pr/scripts" 2>/dev/null && pwd)/pr-review.sh"
+  [ -x "$helper" ] || { echo "PRS REFUSED: ship-pr's pr-review.sh missing: $helper"; exit 1; }
+  if [ -n "$wave" ]; then
+    list=$(execution_listing "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"); rc=$?
+    if unreachable "$rc"; then echo "PRS UNREACHABLE $ANCHOR: the registry naming wave $wave's issues did not answer"; exit 4; fi
+    [ "$rc" -eq 0 ] || { printf '%s\n' "$list"; echo "PRS REFUSED: the anchor's registry could not be read"; exit 1; }
+    issues=$(jq -c --arg w "$wave" '[.[] | select(.request.wave == $w) | .request.issue] | unique' <<<"$list") ||
+      { echo "PRS REFUSED: the anchor's registry did not parse"; exit 1; }
+    [ "$issues" != "[]" ] || { echo "PRS REFUSED: no execution record names wave $wave, so its issues are unknown"; exit 1; }
+  fi
+  list=$("$helper" retry --read pr list --repo "$repo" --state open --limit 100 \
+    --json number,title,headRefName,headRefOid,createdAt,isDraft,closingIssuesReferences); rc=$?
+  if [ "$rc" -eq 3 ]; then echo "PRS UNREACHABLE: the open PRs of $repo did not answer"; exit 4; fi
+  [ "$rc" -eq 0 ] || { echo "PRS REFUSED: the open-PR list of $repo was refused (pr-review.sh exit $rc)"; exit 1; }
+  # Tab-separated with every field a nonempty placeholder, so no empty field collapses under the
+  # tab IFS below and shifts the rest; the title goes last, where a stray character harms nothing.
+  rows=$(jq -r --argjson issues "$issues" '
+      sort_by(.number)[]
+      | [.closingIssuesReferences[]? | "\(.repository.owner.login)/\(.repository.name)#\(.number)"] as $refs
+      | select($issues == null or ([$refs[] | select(. as $i | $issues | any(. == $i))] | length > 0))
+      | [.number, .headRefOid, .createdAt, (if .isDraft then "draft" else "-" end), .headRefName, .title]
+      | map(tostring | if length > 0 then . else "-" end) | @tsv' <<<"$list") ||
+    { echo "PRS REFUSED: the open-PR list of $repo did not parse"; exit 1; }
+  while IFS=$'\t' read -r n sha created draft branch title; do
+    [ -n "$n" ] || continue
+    shown=$((shown + 1))
+    rounds_out=$(SHIP_PR_ROUND_THRESHOLD=off "$helper" rounds "$repo#$n" 2>/dev/null)
+    rounds=$(sed -n 's/^review rounds with findings: \([0-9][0-9]*\) .*/\1/p' <<<"$rounds_out" | head -n 1)
+    [ -n "$rounds" ] || { rounds="?"; [ "$worst" -eq 1 ] || worst=4; }
+    checks_out=$("$helper" checks "$repo#$n" 2>/dev/null)
+    case "$?" in
+      0) case "$(head -n 1 <<<"$checks_out")" in *": ABSENT"*) ci=absent ;; *) ci=green ;; esac ;;
+      1) ci=red ;;
+      4) ci=pending ;;
+      5) ci=moved ;;
+      *) ci=unknown; [ "$worst" -eq 1 ] || worst=4 ;;
+    esac
+    date=$("$helper" retry --read api "repos/$repo/commits/$sha" --jq .commit.committer.date 2>/dev/null) || date=""
+    age=$(jq -rn --arg a "$date" --arg b "$created" \
+      '[$a, $b] | map(select(test("^[0-9]{4}-")) | fromdateiso8601) | if length == 0 then "?" else (now - max) | floor end' 2>/dev/null) || age="?"
+    case "$age" in
+      ''|*[!0-9]*) age="?" ;;
+      *) if [ "$age" -lt 3600 ]; then age="$((age / 60))m"
+         elif [ "$age" -lt 172800 ]; then age="$((age / 3600))h$((age % 3600 / 60))m"
+         else age="$((age / 86400))d$((age % 86400 / 3600))h"; fi ;;
+    esac
+    note=""
+    if [ "$rounds" != "?" ] && [ "$rounds" -ge "$flag" ]; then
+      note=" -- CONVERGE: $rounds review rounds with findings (flag at $flag): send the convergence policy"
+      worst=1
+    fi
+    [ "$draft" = draft ] || draft=""
+    printf '%s\n' "$repo#$n rounds=$rounds ci=$ci head=$age ${draft:+draft }$branch: $title$note"
+  done <<<"$rows"
+  [ "$shown" -gt 0 ] || printf '%s\n' "PRS $repo: no open PRs${wave:+ closing an issue of wave $wave}"
+  exit "$worst"
+}
+
+# ---------------------------------------------------------------------------------------------
 # Far-side: take the lease lock (shared with claim --take and release), verify the caller
 # still holds the lease, then run the mutation. Args: verb token lockwait, then the action's.
 lease_mutation_prelude() {
@@ -1583,6 +1677,97 @@ conclude_from_run() {
   jq -cn --arg id "$request" --arg ev "$evidence" --arg sha "$sha" --arg wt "$wt" --arg host "$box" \
     --arg handle "test-run:$(basename "$dir")" --arg log "$dir/log" --arg verdict "$verdict" \
     '{request_id: $id, evidence: $ev, observed_sha: $sha, remote_checkout: $wt, handle: $handle, log: $log, verdict: $verdict, execution_host: $host}'
+}
+
+# Far side of `conclude --from-bg-run`, on the box that holds the directory: bg-run.sh's own `wait
+# <dir> --within 0` gives the verdict, so the directory contract (bg-run.sh's header: `refused`
+# before `rc`, liveness from `pid`/`cpid`) keeps one reader. The coordinator's copy of bg-run.sh
+# travels in this script (arg 1 is its path here), so the far box's skills checkout, which only
+# `launch`/`preflight`/`execution run` refresh, cannot read the directory with another version.
+# The one thing read past `wait` is the runner's own exit sentinel in `log`. Its grammar is a
+# fail-closed allowlist: a whole line `exit: <status>` or `<name>: exit: <status>`, the name
+# [A-Za-z0-9._-]+ and the status 0-255 without leading zeros -- what OCANNL's tools/test-run.sh
+# (`exit: N`), machine-verify-far.sh (`machine-verify: exit: N`) and ci-compiler-test.sh print. The
+# LAST such line wins. Deliberately not read: a transport line with a second word
+# (`machine-verify: ssh exit: N`, which restates rc), a line with trailing text or a CR, and
+# anything else in the log. Prints `status=rc`, `rc=`, `sentinel=` lines, `status=DIED`, or one
+# FROM-BG-RUN REFUSED line.
+from_bg_run_script() {
+  cat <<'EOF'
+dir="$1"
+refuse() { echo "FROM-BG-RUN REFUSED: $*"; exit 1; }
+[ -d "$dir" ] || refuse "no run directory $dir on $BOX"
+tmp=$(mktemp "${TMPDIR:-/tmp}/fw-bg-run.XXXXXX") || refuse "cannot create a scratch file on $BOX"
+bash -s -- wait "$dir" --within 0 > "$tmp" 2>&1 <<'FLEET_BG_RUN_SH'
+EOF
+  cat "$1"
+  cat <<'EOF'
+FLEET_BG_RUN_SH
+wrc=$?
+said=$(head -n1 "$tmp"); rm -f "$tmp"
+case "$wrc" in
+  0) ;;
+  3) refuse "bg-run.sh wait: RUNNING -- $dir has no rc and its task or command is alive; conclude once it finishes" ;;
+  4) refuse "bg-run.sh wait: STARTING -- no task has published a pid in $dir (never started, or not yet)" ;;
+  5) printf 'status=DIED\n'; exit 0 ;;
+  6) refuse "bg-run.sh wait: $said -- start refused this directory, so an rc there may be an earlier run's" ;;
+  *) refuse "bg-run.sh wait exit $wrc: $said" ;;
+esac
+code=${said#rc=}
+case "$said" in rc=*) ;; *) refuse "bg-run.sh wait printed '$said', not rc=<status>" ;; esac
+case "$code" in ''|*[!0-9]*) refuse "$dir/rc holds '$code', not a status" ;; esac
+[ -f "$dir/log" ] || refuse "$dir has an rc but no log"
+sentinel=$(LC_ALL=C grep -a -E '^([A-Za-z0-9._-]+: )?exit: (0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$' "$dir/log" | tail -n 1)
+printf 'status=rc\nrc=%s\nsentinel=%s\n' "$code" "$sentinel"
+EOF
+}
+
+# conclude_from_bg_run <run-dir> <request-id> <read-box> <execution-host> <sha> <checkout> <evidence>
+# <bg-run.sh path>: the conclude payload (JSON on stdout) read off a bg-run.sh directory, or a
+# refusal line on stdout and exit 1/4. The verdict mapping, stated once here and in the help text:
+#   - the code is the runner's own sentinel when the log carries one and it is nonzero, else rc --
+#     so a pass needs BOTH rc 0 and no nonzero sentinel, and a wrapper that swallowed a failure
+#     (or a runner whose status a pipe or tee replaced) cannot conclude as pass;
+#   - 0 pass; 124 (timeout(1), fleet-worker's `bounded`) and 142 (test-run.sh's cap) timeout;
+#     129/130/137/143 (a signal) cancelled; anything else fail;
+#   - bg-run's DIED (a published pid, it and the command both gone, no rc: the harness killed the
+#     task) is cancelled, since nothing of the command is left running and it never returned.
+# The read box need not be the execution host: a trip driven over ssh (machine-verify from the
+# agent host) leaves its directory on the box that drove it, and 5 of the 09-25 wave's 8
+# bg-run conclusions were of that shape. So the payload carries no `execution_host` binding (the
+# registry would refuse the driving box), and the log and handle name the box read instead,
+# `<box>:<path>`. bg-run keeps no checkout: `--checkout` names one, a checkout already on the
+# record is kept, and otherwise the field says it was not recorded.
+conclude_from_bg_run() {
+  local dir="$1" request="$2" box="$3" host="$4" sha="$5" checkout="$6" evidence="$7" bgrun="$8"
+  local facts rc status code sentinel scode verdict note=""
+  facts=$({ prelude "$box"; from_bg_run_script "$bgrun"; } | run_on "$box" "$dir"); rc=$?
+  if unreachable "$rc"; then echo "FROM-BG-RUN UNREACHABLE $box: nothing concluded"; return 4; fi
+  [ "$rc" -eq 0 ] || { printf '%s\n' "$facts"; return 1; }
+  status=$(sed -n 's/^status=//p' <<<"$facts")
+  case "$status" in
+    DIED)
+      verdict=cancelled
+      note="bg-run $dir on $box: DIED -- the task was killed before the command returned (no rc), and neither it nor the command is alive" ;;
+    rc)
+      code=$(sed -n 's/^rc=//p' <<<"$facts"); sentinel=$(sed -n 's/^sentinel=//p' <<<"$facts")
+      [[ "$code" =~ ^[0-9]+$ ]] || { echo "FROM-BG-RUN REFUSED: unreadable run facts from $box: $facts"; return 1; }
+      note="bg-run $dir on $box: rc=$code"
+      if [ -n "$sentinel" ]; then
+        scode=${sentinel##*exit: }
+        note="$note, runner sentinel '$sentinel'"
+        [ "$scode" = 0 ] || code="$scode"
+      fi
+      case "$code" in 0) verdict=pass ;; 124|142) verdict=timeout ;; 129|130|137|143) verdict=cancelled ;; *) verdict=fail ;; esac
+      note="$note; the command returned" ;;
+    *) echo "FROM-BG-RUN REFUSED: unreadable run facts from $box: $facts"; return 1 ;;
+  esac
+  [ -n "$evidence" ] || evidence="$note; revision $sha as reported by the worker"
+  [ "$box" = "$host" ] || evidence="$evidence; directory read on $box, which drove the run on $host"
+  jq -cn --arg id "$request" --arg ev "$evidence" --arg sha "$sha" --arg co "$checkout" \
+    --arg handle "bg-run:$box:$dir" --arg log "$box:$dir/log" --arg verdict "$verdict" \
+    '{request_id: $id, evidence: $ev, observed_sha: $sha, handle: $handle, log: $log, verdict: $verdict}
+     + (if $co == "" then {} else {remote_checkout: $co} end)'
 }
 
 # in_roster <name>: is that an exact FLEET_BOXES entry? The registry refuses an execution host
@@ -1967,6 +2152,38 @@ cmd_execution() {
         fi
         payload=$(conclude_from_run "$dir" "$request" "$box" "$sha" "$evidence"); rc=$?
         [ "$rc" -eq 0 ] || { printf '%s\n' "$payload"; exit "$rc"; }
+      elif [ "${2:-}" = --from-bg-run ]; then
+        local dir="${3:-}" request="" box="" sha="" evidence="" checkout="" rc listing host bgrun
+        local usage="execution conclude --from-bg-run <run-dir> --request <id> --sha <sha> [--box <box>] [--checkout <text>] [--evidence <text>]"
+        [ -n "$dir" ] || die "execution conclude --from-bg-run: <run-dir> required"
+        case "$dir" in /*) ;; *) die "execution conclude --from-bg-run: the run directory must be absolute (it is read on the box that holds it)" ;; esac
+        shift 3
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --request|--box|--sha|--evidence|--checkout)
+              [ "$#" -ge 2 ] && [ -n "$2" ] || die "execution conclude: expected value for $1"
+              case "$1" in --request) request="$2" ;; --box) box="$2" ;; --sha) sha="$2" ;; --evidence) evidence="$2" ;; --checkout) checkout="$2" ;; esac
+              shift ;;
+            *) die "$usage" ;;
+          esac
+          shift
+        done
+        [ -n "$request" ] || die "execution conclude --from-bg-run: --request <id> required"
+        [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "execution conclude --from-bg-run: --sha <full commit SHA> required (a bg-run directory records none; the worker's result line names it)"
+        bgrun="$(cd "$(dirname "$0")" && pwd)/bg-run.sh"
+        [ -s "$bgrun" ] && [ -r "$bgrun" ] || die "execution conclude --from-bg-run: missing $bgrun"
+        check_identity
+        listing=$(execution_listing "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"); rc=$?
+        if unreachable "$rc"; then echo "EXECUTION UNREACHABLE $ANCHOR: cannot resolve the request's execution host"; exit 4; fi
+        [ "$rc" -eq 0 ] || { printf '%s\n' "$listing"; echo "EXECUTION REFUSED: the anchor's registry could not be read"; exit 1; }
+        host=$(jq -r --arg id "$request" '.[] | select(.request_id == $id) | .request.execution_host' <<<"$listing")
+        [ -n "$host" ] || { echo "EXECUTION REFUSED: unknown request_id $request (no execution host to read the run for)"; exit 1; }
+        # A checkout already on the record stays; only a record with none gets the placeholder.
+        if [ -z "$checkout" ] && [ -z "$(jq -r --arg id "$request" '.[] | select(.request_id == $id) | .remote_checkout // empty' <<<"$listing")" ]; then
+          checkout="not recorded (bg-run keeps no checkout; the log names what ran)"
+        fi
+        payload=$(conclude_from_bg_run "$dir" "$request" "${box:-$host}" "$host" "$sha" "$checkout" "$evidence" "$bgrun"); rc=$?
+        [ "$rc" -eq 0 ] || { printf '%s\n' "$payload"; exit "$rc"; }
       else
         [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
         payload=$(cat "$2") || die "execution: cannot read payload"
@@ -1976,7 +2193,7 @@ cmd_execution() {
       [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
       payload=$(cat "$2") || die "execution: cannot read payload"
       check_identity ;;
-    *) die "execution: list, slot -- <command>, hold -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run <run-dir> --request <id>" ;;
+    *) die "execution: list, slot -- <command>, hold -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run|--from-bg-run <run-dir> --request <id>" ;;
   esac
   local helper out rc map=""; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
@@ -2178,6 +2395,7 @@ case "$cmd" in
   unstick) cmd_unstick "$@" ;;
   ls) cmd_ls "$@" ;;
   load) cmd_load "$@" ;;
+  prs) cmd_prs "$@" ;;
   execution) cmd_execution "$@" ;;
   halt) cmd_halt "$@" ;;
   resume-launches) cmd_resume_launches "$@" ;;
