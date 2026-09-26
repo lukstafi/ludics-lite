@@ -214,6 +214,9 @@ done
 # wait — and is checked here as that arithmetic rather than against a literal, so a gate that
 # moved either knob and left the ceiling behind fails here (ludics-lite#175).
 case " $* " in *" --wait=$((SHIP_PR_BASE_ABSENT_GRACE + SHIP_PR_CHECKS_INTERVAL)) "*) ;; *) exit 4 ;; esac
+# And it opts in to the interim verdict (ludics-lite#308): a launch through a merge burst is not
+# waiting for the tip's own run, so every gate read carries --interim.
+case " $* " in *" --interim "*) ;; *) exit 4 ;; esac
 # SHIM_BASE_TOUCH: a marker this read leaves behind, so a test can change the world between the
 # preflight and the launch's far side (the tmux shim's SHIM_TMUX_GENV_WHEN reads it).
 [ -z "${SHIM_BASE_TOUCH:-}" ] || touch "$SHIM_BASE_TOUCH"
@@ -697,8 +700,8 @@ for verdict in 3 4; do
   expect "triage cannot override unknown $verdict" 1 "dispatch blocked" -- env SHIM_BASE_RC="$verdict" "$FW" gate --target-repo example/project --force --allow-red-base fix
 done
 expect "missing helper refuses with unknown diagnostic" 1 "checker missing" -- env SHIM_BASE_RC=0 bash -c 'mv "$1" "$1.saved"; "$2" gate --target-repo example/project; rc=$?; mv "$1.saved" "$1"; exit "$rc"' _ "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" "$FW"
-grep -Fxq -- '--repo example/project base topic --wait=360 grace=300 interval=60' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
-grep -Fxq -- '--repo example/project base master --wait=360 grace=300 interval=60' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
+grep -Fxq -- '--repo example/project base topic --wait=360 --interim grace=300 interval=60' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
+grep -Fxq -- '--repo example/project base master --wait=360 --interim grace=300 interval=60' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
 # The value itself, and the relation behind it: 360 is 300 + 60, a whole round of margin over the
 # grace. `--wait=301` left a one-second margin that one round's API latency swallowed, so the gate
 # reached its ceiling and refused dispatch for a docs-only tip the next round would have settled
@@ -1585,7 +1588,7 @@ for spec in "int-a coordinator Example/Project pass true" "int-b coordinator exa
 done
 : > "$BASE_CALL_LOG"
 expect "the gate hands the checker its target's integration records" 0 "BASE GREEN" -- "$FW" gate --target-repo example/project
-grep -Fq -- '--repo example/project base --wait=360 --integration-records ' "$BASE_CALL_LOG" && ok "...after the wait, as a file" || ko "no records file handed over: $(cat "$BASE_CALL_LOG")"
+grep -Fq -- '--repo example/project base --wait=360 --interim --integration-records ' "$BASE_CALL_LOG" && ok "...after the wait, as a file" || ko "no records file handed over: $(cat "$BASE_CALL_LOG")"
 [ "$(grep -c '^records: ' "$BASE_CALL_LOG")" = 1 ] && grep -q "^records: $ran	pass	int-a	" "$BASE_CALL_LOG" && ok "...only the marked integration pass/fail for that repository" || ko "wrong records offered: $(cat "$BASE_CALL_LOG")"
 # (With no record for the target, the call carries no flag at all: the "base gate" section's
 # exact call lines above pin that, since its gates ran before any record existed.)

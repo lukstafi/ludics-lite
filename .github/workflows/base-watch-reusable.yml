@@ -70,8 +70,19 @@ jobs:
           # nobody looked at, and the newest JUDGED run per workflow — what a worker branching off
           # the branch is told at session start — is exactly that reading. When it trails the tip the
           # report says which commit each verdict is about, and that goes into the issue.
+          # `--interim` for the same reason (ludics-lite#308): in a merge burst each tip's push run is
+          # cancelled by the next merge's, so the window can hold no judged run at all while the tip's
+          # own run is going. That is not a finding either, and when the tip is GitHub's clean merge
+          # of a PR whose head built green, the read is green meanwhile, naming that source. The
+          # tip's own run re-triggers this watch when it completes, and a red it finds is filed then.
+          # That source reads the merged PR, its head's check runs and its runs, with no
+          # `pull-requests` or `checks` permission here: GitHub serves those reads of a PUBLIC
+          # repository without them, and every caller is one. A job permission a caller does not
+          # grant fails that caller's watch at startup, so adding them here would break each caller
+          # until it was edited. In a private repository the read is refused, and the tip reads
+          # pending with a note saying so, exactly as it read before --interim existed.
           set +e
-          ship-pr/scripts/pr-review.sh base "$GITHUB_REPOSITORY" "$BRANCH" >"$out"
+          ship-pr/scripts/pr-review.sh base "$GITHUB_REPOSITORY" "$BRANCH" --interim >"$out"
           rc=$?
           set -e
           cat "$out"
@@ -143,7 +154,7 @@ jobs:
             ;;
           4)
             title="base watch: $BRANCH's tip has no CI verdict"
-            what="reached no verdict for $BRANCH at all: no workflow has ever completed a push run on it, or the runs that did were stopped without judging and nothing behind them ever judged the branch. That is neither green nor red, and nothing stands behind $BRANCH until it is one of them"
+            what="reached no verdict for $BRANCH: no workflow has ever completed a push run on it, or the runs that did were stopped without judging and nothing behind them ever judged the branch, or a run is in flight (pending) over such a window and the tip is not GitHub's clean merge of a PR whose head built green. That is neither green nor red, and nothing stands behind $BRANCH until it is one of them"
             again="Still without a verdict on $today"
             ;;
           *)
