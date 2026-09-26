@@ -1158,6 +1158,11 @@ tail -n +1 -f "$ISSUE_WAVE_STATE/workers/wf/input.jsonl" >/dev/null 2>&1 & stale
 expect "close of an ended worker still prints its verdict" 1 "FAILED testbox/wf exit=0" -- "$FW" close testbox wf
 sleep 0.5; kill -0 "$stale" 2>/dev/null && { ko "...but left a feeder that outlived its CLI running"; kill "$stale"; } || ok "...after ending a feeder that outlived its CLI"
 wait "$stale" 2>/dev/null
+# A CLI that outlived its session and finished its turn idles on its input forever: attach says so.
+bash -c 'sleep 6; :' claude "$ISSUE_WAVE_STATE/workers/wf/" >/dev/null 2>&1 & orphan=$!; t0=$(date +%s)
+expect "attach reports an orphaned CLI whose turn ended, rather than waiting on it" 1 "ORPHANED testbox/wf: its turn ended but the CLI outlived its tmux session" -- "$FW" attach testbox wf --interval 1
+[ $(( $(date +%s) - t0 )) -lt 5 ] && ok "...at once" || ko "attach waited out the orphan"
+kill "$orphan" 2>/dev/null; wait "$orphan" 2>/dev/null
 printf 'HALFTURN\n' > "$TMP/half.md"
 "$FW" launch testbox whalf --target-repo example/project --kind claude --brief "$TMP/half.md" --cwd "$proj" >/dev/null
 expect "a process that ended inside a later turn is FAILED, not DONE on the earlier result" 1 "FAILED testbox/whalf exit=0 success is_error=false .* | the process ended mid-turn (turn=working" -- "$FW" attach testbox whalf --interval 1
@@ -1238,10 +1243,18 @@ mv "$proj" "$proj.moved"
 expect "a live worker whose worktree is gone refuses the append too" 1 "UNSTICK REFUSED testbox/ws: recorded working directory .* is gone" -- "$FW" unstick testbox ws --message "$TMP/msg.md"
 mv "$proj.moved" "$proj"
 [ "$(grep -c '' "$wsd/input.jsonl")" -eq 3 ] && ok "...neither refusal touched the input channel" || ko "a refused append wrote input: $(cat "$wsd/input.jsonl")"
-# An appended line the CLI has not answered: close would drop it by closing the input under it.
+# meta naming a message input.jsonl never got (a writer killed between the two) strands nothing.
 cp "$wsd/meta" "$TMP/ws.meta"; sed -i.bak 's/^awaiting=.*/awaiting=never-sent/' "$wsd/meta" && rm -f "$wsd/meta.bak"
-expect "close refuses an IDLE worker whose latest message has no reply yet" 1 "CLOSE REFUSED testbox/ws: idle, but the latest message sent has no reply yet" -- "$FW" close testbox ws
+expect "an awaited message missing from the input is not waited on: attach answers IDLE" 0 "IDLE testbox/ws " -- "$FW" attach testbox ws --interval 1
 cp "$TMP/ws.meta" "$wsd/meta"
+# An appended line the CLI has not read (here: the CLI paused): close would drop it.
+cpid=$(pgrep -f -- "session-id $(sed -n 's/^session=//p' "$wsd/meta")" | head -n1)
+kill -STOP "$cpid"
+printf 'Third message.\n' > "$TMP/msg3.md"
+FLEET_DELIVERY_WAIT=0 "$FW" unstick testbox ws --message "$TMP/msg3.md" >/dev/null
+expect "close refuses an IDLE worker whose latest message has no reply yet" 1 "CLOSE REFUSED testbox/ws: idle, but the latest message sent has no reply yet" -- "$FW" close testbox ws
+kill -CONT "$cpid"
+expect "...which it answers once it reads it" 0 "IDLE testbox/ws .*did: Third message" -- "$FW" attach testbox ws --interval 1
 cp "$wsd/feeder.pid" "$TMP/feeder.saved"; echo $$ > "$wsd/feeder.pid"
 expect "a live session whose input feeder is gone refuses the append and names --kill" 1 "UNSTICK REFUSED testbox/ws: the CLI's session is up but its input channel is not" -- "$FW" unstick testbox ws --message "$TMP/msg.md"
 cp "$TMP/feeder.saved" "$wsd/feeder.pid"
@@ -1254,7 +1267,7 @@ echo "channel=stream-json" >> "$wsd/meta"
 expect "unstick --kill stops a live worker and resumes the same session" 0 "RESUMED testbox/ws kind=claude session=[0-9a-f-]\{36\} resume=1 .*(kill-and-resume: --kill stopped the live CLI)" -- \
   "$FW" unstick testbox ws --message "$TMP/msg.md" --kill
 sid=$(sed -n 's/^session=//p' "$wsd/meta")
-grep -q -- "--resume $sid" "$wsd/run.sh" && grep -q -- "tail -n +5 -f " "$wsd/run.sh" && ok "the resume addresses the recorded session and feeds from the message's own line" || ko "resume command wrong: $(cat "$wsd/run.sh")"
+grep -q -- "--resume $sid" "$wsd/run.sh" && grep -q -- "tail -n +6 -f " "$wsd/run.sh" && ok "the resume addresses the recorded session and feeds from the message's own line" || ko "resume command wrong: $(cat "$wsd/run.sh")"
 expect "the resumed process answers the message and idles" 0 "IDLE testbox/ws .*did: Stop and answer now" -- "$FW" attach testbox ws --interval 1
 grep -q '"resumed":true' "$wsd/stream.jsonl" && ok "stream appended, not truncated, across the resume" || ko "stream lost the resume"
 [ "$(tail -n +"$(( $(sed -n 's/^proc_offset=//p' "$wsd/meta") + 1 ))" "$wsd/stream.jsonl" | grep -c '"isReplay":true')" -eq 1 ] && ok "the resumed process read no line an earlier one had" || ko "the resume replayed old input"

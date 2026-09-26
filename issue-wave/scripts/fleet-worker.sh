@@ -386,11 +386,18 @@ meta_set() {
 # had its reply -- a `result` after the CLI's echo of that message (meta `awaiting`, its uuid), or,
 # for a record that names none, a `result` past turn_offset. An echo is the proof the CLI read
 # the message: a `result` between the append and the read answers something else.
+# awaiting_of <name>: meta `awaiting`, but only while input.jsonl carries that message: a writer
+# killed between the meta update and its line (SIGKILL holds for no trap) leaves meta naming a
+# message nobody sent, which would hold attach and close forever. Then turn_offset decides.
+awaiting_of() {
+  local d="$WORKERS/$1" u; u=$(meta_get "$d" awaiting)
+  [ -n "$u" ] && grep -qF -- "\"uuid\":\"$u\"" "$d/input.jsonl" 2>/dev/null && printf '%s' "$u"
+}
 turn_state() {
   local d="$WORKERS/$1" poff toff out
   poff=$(meta_num "$d" proc_offset); toff=$(meta_num "$d" turn_offset)
   [ "$toff" -ge "$poff" ] || toff=$poff
-  out=$(tail -n +"$((poff + 1))" "$d/stream.jsonl" 2>/dev/null | jq -Rrn --argjson rel "$((toff - poff))" --arg u "$(meta_get "$d" awaiting)" '
+  out=$(tail -n +"$((poff + 1))" "$d/stream.jsonl" 2>/dev/null | jq -Rrn --argjson rel "$((toff - poff))" --arg u "$(awaiting_of "$1")" '
     reduce inputs as $l ({n: 0, t: "none", bg: 0, res: 0, seen: ($u == "")};
       .n += 1 | (($l | fromjson?) // null) as $e
       | if ($e | type) != "object" then .
@@ -446,7 +453,7 @@ stream_run() {
   # pid write ends the feeder it would have named, so the pipeline still finishes.
   printf '{ tail -n +%d -f %q & echo $! > %q || { kill $!; exit 95; }; wait; } | {\n' "$from" "$d/input.jsonl" "$d/feeder.pid"
   feeder=$(printf 'case "$(ps -ww -o command= -p "$p" 2>/dev/null)" in *tail*%q*)' "$d/input.jsonl")
-  printf '  n=0; while p=$(cat %q 2>/dev/null); ! %s true ;; *) false ;; esac; do n=$((n + 1)); [ "$n" -lt 50 ] || exit 95; sleep 0.2; done\n' "$d/feeder.pid" "$feeder"
+  printf '  n=0; while p=$(cat %q 2>/dev/null); ! %s true ;; *) false ;; esac; do n=$((n + 1)); [ "$n" -lt 50 ] || { case "$p" in *[!0-9]*|"") ;; *) kill "$p" 2>/dev/null ;; esac; exit 95; }; sleep 0.2; done\n' "$d/feeder.pid" "$feeder"
   printf '  claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --dangerously-skip-permissions %s %q' "$flag" "$sid"
   for a in "$@"; do printf ' %q' "$a"; done
   printf ' >> %q 2>> %q; rc=$?\n' "$d/stream.jsonl" "$d/stderr.log"
@@ -1386,8 +1393,8 @@ verdict() {
   # A claude record that names the latest message (meta `awaiting`) counts only what follows the
   # CLI's echo of it, as attach does: a result between the append and the read answers something
   # else, and a message never echoed has had no turn at all.
-  if [ "$kind" = claude ] && [ -n "$(meta_get "$d" awaiting)" ]; then
-    local at; at=$(tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null | jq -Rrn --arg u "$(meta_get "$d" awaiting)" \
+  if [ "$kind" = claude ] && [ -n "$(awaiting_of "$name")" ]; then
+    local at; at=$(tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null | jq -Rrn --arg u "$(awaiting_of "$name")" \
       'first(foreach inputs as $l (0; . + 1; . as $n | ($l | fromjson? // null) | select(type == "object" and .type == "user" and .uuid == $u) | $n)) // empty' 2>/dev/null)
     if [ -n "$at" ]; then off=$((off + at)); else off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}; fi
   fi
@@ -1454,10 +1461,16 @@ while running "$name"; do
   # A claude worker's process outlives its turns: its turn's end is IDLE with the reply to the
   # latest message in the stream (turn_state's `ended 0 1`), checked before each sleep so a
   # worker already idle answers at once.
-  if alive "$name" && is_stream "$name"; then
+  if is_stream "$name"; then
     case "$(turn_state "$name")" in "ended 0 1")
-      v=$(verdict "$name"); vrc=$?
-      [ "$vrc" = 5 ] || { printf '%s\n' "$v"; exit "$vrc"; } ;;
+      if alive "$name"; then
+        v=$(verdict "$name"); vrc=$?
+        [ "$vrc" = 5 ] || { printf '%s\n' "$v"; exit "$vrc"; }
+      else
+        # Its turn is done, but its session is gone: no append reaches it (the append path needs
+        # the session), and it would idle on its input forever.
+        echo "ORPHANED $BOX/$name: its turn ended but the CLI outlived its tmux session and idles on its input -- read the turn with \`log\`, then \`unstick --kill\` resumes it in a new session"; exit 1
+      fi ;;
     esac
   fi
   sleep "$interval"
