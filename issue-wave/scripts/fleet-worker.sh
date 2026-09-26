@@ -422,7 +422,9 @@ stream_run() {
   for a in "$@"; do printf ' %q' "$a"; done
   printf ' >> %q 2>> %q; rc=$?\n' "$d/stream.jsonl" "$d/stderr.log"
   printf '  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s %q ] && break; sleep 1; done\n' "$d/feeder.pid"
-  printf '  kill "$(cat %q 2>/dev/null)" 2>/dev/null; exit "$rc"\n}\n' "$d/feeder.pid"
+  # Killed only while it is still this record's tail: `close` may have ended it already, and its
+  # pid could be anyone's by now.
+  printf '  p=$(cat %q 2>/dev/null); case "$(ps -o command= -p "$p" 2>/dev/null)" in *tail*%q*) kill "$p" 2>/dev/null ;; esac; exit "$rc"\n}\n' "$d/feeder.pid" "$d/input.jsonl"
   printf 'rc=$?; rm -f %q; echo "$rc" > %q\n' "$d/feeder.pid" "$d/exit"
 }
 state_of() {
