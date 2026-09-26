@@ -17,7 +17,7 @@ command.
 A `measurement` reservation is exclusive: it is refused while anything is outstanding on its
 host, and everything is refused while it is outstanding. A `correctness` reservation shares its
 host with other correctness reservations up to the box's slots - `FLEET_BOX_CORRECTNESS_SLOTS`,
-`<box>=<n>` pairs, `mac-studio=6 rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3` with the
+`<box>=<n>` pairs, `mac-studio=6 rog-nv-linux=4 minix-amd-linux=4 tuf-amd-linux=3` with the
 default roster and one slot for any box it does not name. The default roster is the default set of boxes, whether
 `FLEET_BOXES` is unset or exports those same boxes (ludics-lite#329), and `fleet-worker.sh
 preflight` prints the count for every roster box (ludics-lite#157: the exclusivity was written for
@@ -27,15 +27,27 @@ in place). Keep one slot for WSL boxes because of the measured dxg bridge limit.
 boxes' counts were measured with 1-4 concurrent compile-inclusive targeted batches, each box under
 an exclusive reservation (ludics-lite#316, #344), at the width each batch runs at: four `-j 4`
 batches on minix-amd-linux (16 hip-width at once was green three ways; only dune's default 32 has
-drained its device-wide SDMA queue pool), three `-j 8` on tuf-amd-linux, and two `-j 8` on
-rog-nv-linux, where three or more concurrent cuda batches hit `CUDA_ERROR_OUT_OF_MEMORY` in 2 of 6
-rungs. OCANNL's `tools/test-run.sh` injects those widths into a native batch that names none
-(ahrefs/ocannl#1033; `tools/box-jobs.sh` restates the counts, so the two change together), so a
-worker passes no `-j` for them. The kind does not silently change the configured slot count.
+drained its device-wide SDMA queue pool), three `-j 8` on tuf-amd-linux, and two `-j 8` cuda
+batches on rog-nv-linux, where three or more hit `CUDA_ERROR_OUT_OF_MEMORY` in 2 of 6 rungs while
+two ran clean beside two cc batches. OCANNL's `tools/test-run.sh` injects those widths into a
+native batch that names none (ahrefs/ocannl#1033; `tools/box-jobs.sh` restates the counts, so the
+two change together), so a worker passes no `-j` for them. The kind does not silently change the
+configured slot count.
+
+Where the bound is the GPU and not the box, some of the slots are GPU tokens (ludics-lite#391):
+`FLEET_BOX_GPU_TOKENS`, the same `<box>=<n>` grammar, `rog-nv-linux=2` with the default roster,
+and one per slot on any box it does not name. So rog-nv-linux runs four slots, and at most two
+batches hold its 12 GiB GPU. It is fail-closed: every batch is a GPU batch unless it declares
+`execution slot --cpu` (a CPU backend such as OCANNL's cc, or a repository with no GPU work;
+`--gpu` states the default), so a GPU batch whose caller forgot to say so is still counted, and
+a CPU batch that forgot only waits longer. The tokens are the first N slot files, not a second
+pool: a batch the script before #391 started holds one of rog's first two slots, so it counts as
+a token while a box's checkout moves between the versions. `preflight` shows the tokens beside
+the slots wherever they are fewer, as `rog-nv-linux=4(gpu=2)`.
 
 The slot count is a RUN-TIME count, and `execution slot` is the single run-time mechanism
 (ludics-lite#160): every correctness run on a box, assigned or standing, is wrapped in
-`fleet-worker.sh execution slot [--wait <seconds>] -- <command>` on that box, so the box never
+`fleet-worker.sh execution slot [--wait <seconds>] [--cpu|--gpu] -- <command>` on that box, so the box never
 carries more than its slots however the runs were authorized. A reservation carrying
 `"standing": true` - a correctness record held for a worker's whole life, review waits and idle
 included - consumes no slot; it stays outstanding for everything else, so a measurement still
@@ -47,11 +59,11 @@ mac-studio's slots were reading their briefs; six slots, not three, for the same
 cap bounds concurrent load, never how many agents may be in flight).
 
 `execution slot` runs on the worker's own box around one suite or batch: it refuses while a
-measurement is outstanding on that box, holds one of the box's N slots as a real flock for
-exactly as long as the command runs (the kernel drops it even when the batch is killed), and
+measurement is outstanding on that box, holds one of the box's N slots (a GPU token one, unless
+`--cpu`) as a real flock for exactly as long as the command runs (the kernel drops it even when the batch is killed), and
 returns the command's own status. It needs no coordinator lease, takes no `--box` (the slot is
 the local box's), and refuses with a line beginning `EXECUTION SLOT REFUSED` - exit 1 for no
-free slot, a measurement, a malformed spec or a local box name outside `FLEET_BOXES` (an alias
+free slot or token, a measurement, a malformed spec or a local box name outside `FLEET_BOXES` (an alias
 would lock and read measurements under a spelling of its own), 4 when the anchor's registry
 cannot be read. Its lock files live under `FLEET_SLOT_STATE`
 (`~/.local/state/fleet-execution-slots/<box>`), which is box-wide on purpose: `ISSUE_WAVE_STATE`
@@ -267,7 +279,9 @@ fleet-worker.sh execution slot -- tools/test-run.sh run <alias> -j 4
 which blocks until one of the box's slots is free (`--wait`, default 600 seconds, then a
 refusal), runs the batch under it, and returns the batch's own status. The `-j 4` is mac-studio's
 width. On a native GPU box, omit it for a GPU batch: an explicit `-j` wins over the per-slot
-width `tools/test-run.sh` injects there (ahrefs/ocannl#1033), so `-j 4` would halve rog's `-j 8`. The bare suites of a
+width `tools/test-run.sh` injects there (ahrefs/ocannl#1033), so `-j 4` would halve rog's `-j 8`.
+A batch that holds no GPU adds `--cpu` before the `--`, which on rog-nv-linux lets it run beside
+the two GPU batches instead of waiting for their tokens. The bare suites of a
 repository whose runner is a plain script go through it the same way, one batch per call
 (2026-09-15: the coordinator ended up granting this by message after sixteen
 request/assign/report round-trips parked three workers idle between review rounds).

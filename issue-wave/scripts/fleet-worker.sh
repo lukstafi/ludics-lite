@@ -52,8 +52,9 @@
 #   fleet-worker.sh ls [<box> ...]
 #   fleet-worker.sh load
 #   fleet-worker.sh execution list [--active] [--compact]
-#   fleet-worker.sh execution slot [--wait <seconds>] -- <command...>   # hold one of THIS box's
-#                          # run-time correctness slots around a suite or batch (no lease needed)
+#   fleet-worker.sh execution slot [--wait <seconds>] [--cpu|--gpu] -- <command...>   # hold one
+#                          # of THIS box's run-time correctness slots around a suite or batch
+#                          # (no lease needed), plus a GPU token unless it declares --cpu
 #   fleet-worker.sh execution hold [--why <text>] -- <command...>   # run under THIS box's OS-level
 #                          # sleep guard alone (a systemd-inhibit block lock; bare where none):
 #                          # the wrapper for an exclusive measurement, and what `slot` runs inside
@@ -88,7 +89,7 @@
 #   FLEET_BOXES: whole fleet; "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux". `ls` sweeps it minus local.
 #   FLEET_BOX_CORRECTNESS_SLOTS: `<box>=<n>` pairs, how many correctness executions may share a
 #     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" whenever the roster is the
-#     default one, beside "rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3" in the same
+#     default one, beside "rog-nv-linux=4 minix-amd-linux=4 tuf-amd-linux=3" in the same
 #     value, whether FLEET_BOXES is unset or exports those same boxes (compared as a word set,
 #     ludics-lite#329); empty (one slot everywhere) with a custom FLEET_BOXES. Set, even to
 #     empty, it overrides the default either way. `preflight` prints the count per roster box.
@@ -103,10 +104,17 @@
 #     a change here goes there too. minix-amd-linux four, at `-j 4`: 16 hip-width at once was
 #     green three ways (four `-j 4` batches, two `-j 8`, a full unit at `-j 16`) and 12 twice,
 #     and only dune's default 32 has drained its device-wide SDMA pool. tuf-amd-linux three, at
-#     `-j 8`: three `-j 8` hip batches were green on its discrete gfx1102. rog-nv-linux two, at
-#     `-j 8`: rungs of three or more concurrent cuda batches hit CUDA_ERROR_OUT_OF_MEMORY in 2
-#     of 6 (10 of its 12 GiB in use), while two cuda batches beside one or two cc batches were
-#     green -- so what could raise it is a count per GPU kind, which slots do not express.
+#     `-j 8`: three `-j 8` hip batches were green on its discrete gfx1102. rog-nv-linux four, of
+#     which two may hold its GPU (FLEET_BOX_GPU_TOKENS below): rungs of three or more concurrent
+#     `-j 8` cuda batches hit CUDA_ERROR_OUT_OF_MEMORY in 2 of 6 (10 of its 12 GiB in use),
+#     while two cuda batches beside one or two cc batches were green, so the bound there is
+#     GPU memory and not the box (ludics-lite#391).
+#   FLEET_BOX_GPU_TOKENS: `<box>=<n>` pairs, how many of a box's correctness slots may run a
+#     batch that holds its GPU at once (ludics-lite#391); an unnamed box has as many as it has
+#     slots, so the pool binds nowhere else. "rog-nv-linux=2" whenever the roster is the default
+#     one; set, even to empty, it overrides that. Fail-closed: every batch takes a token except
+#     one that declares `execution slot --cpu`, so a GPU batch whose caller forgot to say so is
+#     still counted. `preflight` prints the tokens beside the slots wherever they are fewer.
 #   FLEET_SKILLS_REPO: skills checkout on each box; ~/ludics-lite.
 #   ISSUE_WAVE_STATE: local worker-state directory; ~/.local/state/issue-wave.
 #   FLEET_SLOT_STATE: where `execution slot` keeps a box's run-time slot locks;
@@ -170,7 +178,11 @@ roster_words() {
 # every box's ~/.config/fleet/env.sh exported the default roster verbatim, and a test on the
 # variable's presence silently dropped mac-studio to one slot for a day (ludics-lite#329).
 if [ "$(roster_words "$BOXES")" = "$(roster_words "$DEFAULT_BOXES")" ]; then DEFAULT_ROSTER=1; else DEFAULT_ROSTER=0; fi
-SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ "$DEFAULT_ROSTER" = 0 ] || echo mac-studio=6 rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3)}"
+SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ "$DEFAULT_ROSTER" = 0 ] || echo mac-studio=6 rog-nv-linux=4 minix-amd-linux=4 tuf-amd-linux=3)}"
+# GPU tokens per box (ludics-lite#391), the same roster rule: rog-nv-linux's four slots admit only
+# two batches holding its 12 GiB GPU at once, the count its cuda batches were measured green at.
+GPU_TOKENS_DEFAULT="rog-nv-linux=2"
+GPU_TOKENS="${FLEET_BOX_GPU_TOKENS-$([ "$DEFAULT_ROSTER" = 0 ] || echo "$GPU_TOKENS_DEFAULT")}"
 SKILLS_REPO="${FLEET_SKILLS_REPO:-\$HOME/ludics-lite}"
 STATE="${ISSUE_WAVE_STATE:-\$HOME/.local/state/issue-wave}"
 # Run-time correctness slots (`execution slot`) are a property of the BOX, so their lock files
@@ -821,25 +833,42 @@ cmd_refresh() {
 # per box; a spec naming the box explicitly, even at one slot, is someone's choice and is not. The
 # boxes are spelled here as well as in the default, and the preflight fixture checks both
 # directions: the site default draws no warning, and an empty spec warns about exactly the boxes
-# the site default gives more than one slot. Never changes the preflight's verdict.
+# the site default gives more than one slot. A box whose GPU tokens are fewer than its slots
+# shows them as `<box>=<slots>(gpu=<tokens>)` (ludics-lite#391), and a token spec that leaves out a
+# box the site's token default narrows is the same kind of warning. Never changes the preflight's
+# verdict.
 slots_report() {
-  local b n named out="" src
-  local -a roster=() spec=() widened=(mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux)
+  local b n t named out="" src
+  local -a roster=() spec=() widened=(mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux) tokened=()
   read -r -d "" -a roster <<< "$BOXES" || :
   read -r -d "" -a spec <<< "$SLOTS" || :
   for b in ${roster[@]+"${roster[@]}"}; do
     n=$(box_correctness_slots "$b") || { echo "PREFLIGHT SLOTS WARNING: $n; every \`execution slot\` and reservation under it refuses" >&2; return 0; }
-    out="$out $b=$n"
+    t=$(box_gpu_tokens "$b") || { echo "PREFLIGHT SLOTS WARNING: $t; every \`execution slot\` refuses" >&2; return 0; }
+    # The GPU tokens only where they bind (ludics-lite#391): fewer than the slots.
+    if [ "$t" -lt "$n" ]; then out="$out $b=$n(gpu=$t)"; else out="$out $b=$n"; fi
   done
   if [ -n "${FLEET_BOX_CORRECTNESS_SLOTS+x}" ]; then src="FLEET_BOX_CORRECTNESS_SLOTS"
   elif [ "$DEFAULT_ROSTER" = 1 ]; then src="site default"
   else src="custom roster: one slot each"; fi
+  [ -z "${FLEET_BOX_GPU_TOKENS+x}" ] || src="$src; FLEET_BOX_GPU_TOKENS"
   echo "PREFLIGHT SLOTS${out} ($src)"
   [ "$DEFAULT_ROSTER" = 1 ] || return 0
   for b in "${widened[@]}"; do
     named=0
     for n in ${spec[@]+"${spec[@]}"}; do [ "${n%%=*}" = "$b" ] && named=1; done
     [ "$named" = 1 ] || echo "PREFLIGHT SLOTS WARNING: the default roster, but FLEET_BOX_CORRECTNESS_SLOTS=\"$SLOTS\" does not name $b, which falls to one slot (the site default gives it more); every correctness batch there serializes" >&2
+  done
+  # The mirror image for the token pool: a GPU-token spec that leaves out a box the site default
+  # holds to fewer GPU batches than slots lets every slot there hold the GPU -- rog-nv-linux's
+  # measured CUDA_ERROR_OUT_OF_MEMORY shape. Only when the box has more slots than that default.
+  read -r -d "" -a spec <<< "$GPU_TOKENS" || :
+  read -r -d "" -a tokened <<< "$GPU_TOKENS_DEFAULT" || :
+  for b in "${tokened[@]}"; do
+    t="${b#*=}" b="${b%%=*}" named=0
+    for n in ${spec[@]+"${spec[@]}"}; do [ "${n%%=*}" = "$b" ] && named=1; done
+    n=$(box_correctness_slots "$b")
+    [ "$named" = 1 ] || [ "$n" -le "$t" ] || echo "PREFLIGHT SLOTS WARNING: the default roster, but FLEET_BOX_GPU_TOKENS=\"$GPU_TOKENS\" does not name $b, so all $n of its slots may hold its GPU at once (the site default allows $t); GPU batches there can run out of device memory" >&2
   done
 }
 
@@ -1569,16 +1598,28 @@ in_roster() {
 # The same grammar the registry enforces, read here so the run-time lock and the registry agree --
 # including on a spec that names a box twice, where the registry's dict keeps the LAST value: a
 # first-match read here would have let six batches run against a registry admitting one.
-box_correctness_slots() {
-  local box="$1" pair count found=1
+box_correctness_slots() { box_spec_count FLEET_BOX_CORRECTNESS_SLOTS "$SLOTS" "$1" 1; }
+
+# box_gpu_tokens <box>: how many of that box's slots may hold its GPU at once, from $GPU_TOKENS
+# (ludics-lite#391) in the same grammar; a box the spec does not name has one per slot. Needs the
+# slot count to be valid, so a malformed slots spec refuses here too.
+box_gpu_tokens() {
+  local slots
+  slots=$(box_correctness_slots "$1") || { echo "$slots"; return 1; }
+  box_spec_count FLEET_BOX_GPU_TOKENS "$GPU_TOKENS" "$1" "$slots"
+}
+
+# box_spec_count <variable> <spec> <box> <default>: the shared reader of the two `<box>=<n>` specs.
+box_spec_count() {
+  local name="$1" spec="$2" box="$3" found="$4" pair count
   local -a pairs=()
-  read -r -d "" -a pairs <<< "$SLOTS" || :
+  read -r -d "" -a pairs <<< "$spec" || :
   for pair in ${pairs[@]+"${pairs[@]}"}; do
     count="${pair#*=}"
     case "$pair" in *=*) ;; *) count="" ;; esac
-    case "$count" in ''|*[!0-9]*) echo "FLEET_BOX_CORRECTNESS_SLOTS entry must be <box>=<positive n>: $pair"; return 1 ;; esac
-    [ "$count" -ge 1 ] || { echo "FLEET_BOX_CORRECTNESS_SLOTS entry must be <box>=<positive n>: $pair"; return 1; }
-    in_roster "${pair%%=*}" || { echo "FLEET_BOX_CORRECTNESS_SLOTS names ${pair%%=*}, which is not in FLEET_BOXES"; return 1; }
+    case "$count" in ''|*[!0-9]*) echo "$name entry must be <box>=<positive n>: $pair"; return 1 ;; esac
+    [ "$count" -ge 1 ] || { echo "$name entry must be <box>=<positive n>: $pair"; return 1; }
+    in_roster "${pair%%=*}" || { echo "$name names ${pair%%=*}, which is not in FLEET_BOXES"; return 1; }
     [ "${pair%%=*}" = "$box" ] && found="$count"
   done
   echo "$found"
@@ -1600,6 +1641,25 @@ box_correctness_slots() {
 # lock has to outlive the acquiring process's exec on THIS box. There is no --box for the same
 # reason: a slot on another machine would be a lock on the wrong disk.
 #
+# THE GPU TOKENS (ludics-lite#391). On rog-nv-linux the bound is the GPU's 12 GiB, not the box:
+# three concurrent cuda batches ran out of device memory, while two ran clean beside two cc
+# batches. So where FLEET_BOX_GPU_TOKENS gives a box T tokens, fewer than its slots, the first T
+# slot files are its GPU tokens: a GPU batch may take only slot.1..slot.T, and a batch declared
+# `--cpu` takes the highest free slot, reaching the GPU ones last. Two properties follow, and both
+# are why this is not a second lock pool beside the slots:
+#   - fail-closed: a batch is a GPU batch unless it declares `--cpu` (`--gpu` says the default),
+#     so one whose caller forgot to declare it is still held to T, and a CPU batch that forgot
+#     only waits longer;
+#   - safe across the switch: the script before #391 gave rog-nv-linux two slots and took the
+#     first free one, so a batch it started holds slot.1 or slot.2 -- which this version counts as
+#     a token. A separate token pool would have seen two free tokens beside two such batches and
+#     let four cuda batches onto the GPU while the box's checkout moved from one version to the
+#     other.
+# The cost is fragmentation: a CPU batch that fell back into a GPU slot keeps it until it ends,
+# even after a higher slot frees. A GPU batch waiting on a token holds no slot meanwhile. Where a
+# box has as many tokens as slots nothing binds, and every batch takes the first free slot as
+# before, so every box but the one the token spec narrows is unchanged.
+#
 # The measurement check is a point-in-time gate read from the anchor's registry, exactly as
 # `execution dispatch` is: it refuses to start a batch beside an outstanding measurement, and
 # a measurement reserved afterwards is the registry's exclusivity to enforce, not this lock's.
@@ -1616,7 +1676,7 @@ box_correctness_slots() {
 # measurement does, for exactly as long as the batch runs. One Python program serves both
 # subcommands; `slot` is `hold` plus the flock.
 # Exit: the wrapped command's own status; 1 with a line beginning `EXECUTION SLOT REFUSED` (no
-# free slot before the deadline, an outstanding measurement, a malformed slots spec); 4 when the
+# free slot or GPU token before the deadline, an outstanding measurement, a malformed spec); 4 when the
 # anchor's registry could not be read; 127 when the command itself could not be run. The command
 # is exec'd and not interpreted, so a pipeline or a builtin goes as `sh -c '...'`.
 #
@@ -1662,8 +1722,9 @@ run_py() {
 import fcntl, os, select, shutil, signal, sys, time
 mode, box = sys.argv[1], sys.argv[2]
 if mode == "slot":
-    directory, cap, wait, inhibitor = sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
-    why, command = "", sys.argv[7:]
+    directory, cap, tokens, cpu = sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == "cpu"
+    wait, inhibitor = int(sys.argv[7]), sys.argv[8]
+    why, command = "", sys.argv[9:]
     prefix = "EXECUTION SLOT"
 else:
     inhibitor, why, command = sys.argv[3], sys.argv[4], sys.argv[5:]
@@ -1750,9 +1811,19 @@ def run(why):
 
 if mode == "hold":
     run(why)
+
+# The candidate slots, in the order this batch tries them. Where the box has fewer GPU tokens
+# than slots, the tokens ARE the first <tokens> slot files: a GPU batch may take only those, and a
+# CPU batch takes the highest free slot, so it leaves the GPU ones for last (THE GPU TOKENS, above).
+if not tokens:
+    order = range(1, cap + 1)
+elif cpu:
+    order = range(cap, 0, -1)
+else:
+    order = range(1, tokens + 1)
 deadline = time.monotonic() + wait
 while True:
-    for index in range(1, cap + 1):
+    for index in order:
         descriptor = os.open(os.path.join(directory, "slot.%d" % index), os.O_CREAT | os.O_RDWR, 0o644)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1762,12 +1833,18 @@ while True:
         # The lock lives on this descriptor: it must survive the exec below, so it must not be
         # closed on it. Nothing releases it afterwards -- the kernel does, when the process ends.
         os.set_inheritable(descriptor, True)
-        sys.stderr.write("EXECUTION SLOT %s: slot %d of %d held for: %s\n"
-                         % (box, index, cap, " ".join(command)))
-        run("%s slot %d of %d: %s" % (box, index, cap, " ".join(command)))
+        held = "slot %d of %d" % (index, cap)
+        if tokens and index <= tokens:
+            held += ", GPU token %d of %d" % (index, tokens)
+        sys.stderr.write("EXECUTION SLOT %s: %s held for: %s\n" % (box, held, " ".join(command)))
+        run("%s %s: %s" % (box, held, " ".join(command)))
     if time.monotonic() >= deadline:
-        print("EXECUTION SLOT REFUSED %s: all %d run-time correctness slots busy after %ds"
-              % (box, cap, wait))
+        if tokens and not cpu:
+            print("EXECUTION SLOT REFUSED %s: all %d GPU tokens (slots 1-%d of %d) busy after %ds; a batch"
+                  " that holds no GPU declares --cpu" % (box, tokens, tokens, cap, wait))
+        else:
+            print("EXECUTION SLOT REFUSED %s: all %d run-time correctness slots busy after %ds"
+                  % (box, cap, wait))
         sys.exit(1)
     time.sleep(1)
 RUN_PY
@@ -1777,15 +1854,18 @@ RUN_PY
 inhibitor_path() { type -P -- "$INHIBIT" 2>/dev/null || true; }
 
 cmd_execution_slot() {
-  local wait=600 box cap listing rc measuring dir helper
+  local wait=600 kind="" box cap tokens listing rc measuring dir helper
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --wait)
         [ "$#" -ge 2 ] || die "execution slot: expected value for --wait"
         case "$2" in ''|*[!0-9]*) die "execution slot: --wait takes a whole number of seconds" ;; esac
         wait="$2"; shift ;;
+      --cpu|--gpu)
+        [ -z "$kind" ] || [ "$kind" = "$1" ] || die "execution slot: --cpu and --gpu are exclusive"
+        kind="$1" ;;
       --) shift; break ;;
-      *) die "execution slot [--wait <seconds>] -- <command> [args...]" ;;
+      *) die "execution slot [--wait <seconds>] [--cpu|--gpu] -- <command> [args...]" ;;
     esac
     shift
   done
@@ -1797,6 +1877,9 @@ cmd_execution_slot() {
   # The registry refuses a noncanonical execution_host for the same reason; this is that check.
   in_roster "$box" || { echo "EXECUTION SLOT REFUSED $box: not a canonical FLEET_BOXES entry ($BOXES)"; exit 1; }
   cap=$(box_correctness_slots "$box") || { echo "EXECUTION SLOT REFUSED $box: $cap"; exit 1; }
+  tokens=$(box_gpu_tokens "$box") || { echo "EXECUTION SLOT REFUSED $box: $tokens"; exit 1; }
+  # Where there are as many tokens as slots the tokens cannot bind, and every batch takes any slot.
+  [ "$tokens" -lt "$cap" ] || tokens=0
   helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
   listing=$(execution_listing "$helper"); rc=$?
@@ -1809,7 +1892,7 @@ cmd_execution_slot() {
   [ -z "$measuring" ] || { echo "EXECUTION SLOT REFUSED $box: a measurement holds the box exclusively ($measuring)"; exit 1; }
   dir="$(local_path "$SLOT_STATE")/$box"
   mkdir -p "$dir" || die "execution slot: cannot create the slot directory $dir"
-  exec python3 -c "$(run_py)" slot "$box" "$dir" "$cap" "$wait" "$(inhibitor_path)" "$@"
+  exec python3 -c "$(run_py)" slot "$box" "$dir" "$cap" "$tokens" "${kind#--}" "$wait" "$(inhibitor_path)" "$@"
 }
 
 # `execution hold [--why <text>] -- <command...>`: run the command under THIS box's OS-level
