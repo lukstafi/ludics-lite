@@ -933,7 +933,7 @@ merges on one green full-matrix run for its *last commit*; a clean merge does no
 verification; only a merge that needed a conflict-RESOLVING commit waits for green CI on that
 commit, which the checks gate reads naturally as the new head. What owns semantic drift instead is
 the wave coordinator's post-merge **integration loop** (issue-wave skill): the full `@runtest
-@train` suites on merged master, on whichever fleet machine has the least work, with
+@train` suites on merged master, on a quiet, strong fleet machine, with
 stop-the-world triage on a regression.
 
 **When a wave coordinator is actively running that integration loop**, the division is strict
