@@ -619,7 +619,13 @@ the head is a SHA equality (each review records the `commit_id` it was submitted
 time comparison — a commit's date can long predate the push that delivered it. Whether a 👀 is live
 is judged against the reviewer's own last word, never against the head commit: a 👀 raised just
 before your next push is a round that is genuinely running, and #358 had exactly that shape (👀 at
-20:34:13Z, head committed 20:35:01Z) twenty minutes after #364 had the stale one.
+20:34:13Z, head committed 20:35:01Z) twenty minutes after #364 had the stale one. A 👍 carries no
+commit at all, and the app takes it down only when it raises the 👀 for the next head, minutes after
+the push, so it is matched to the head through the reviewer's summary comment, whose newest Code
+Review row names the commit the app last took up: a 👍 under a row naming another commit is a
+previous head's, and the head reads `expected` (ludics-lite#418). Only where no row is read does a
+clock stand in, and only in the direction a clock can prove: a 👍 older than the head's commit
+date cannot be about it.
 
 The whole polling and merge-gate path is REST: GitHub's GraphQL endpoint 503s independently of REST,
 and a GraphQL-borne silence is indistinguishable from a reviewer's. Review threads are the one
