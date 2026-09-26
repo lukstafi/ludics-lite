@@ -90,6 +90,8 @@
 #                          # of THIS box's run-time correctness slots around a suite or batch
 #                          # (no lease needed), plus a GPU token unless it declares --cpu; inside
 #                          # a slot already held (FLEET_SLOT_HELD) it runs under that one
+#   fleet-worker.sh execution slot --probe             # `EXECUTION SLOT PROBE <box> <slots> <gpu
+#                          # tokens>` for this box, taking nothing (exit 2: not a fleet host)
 #   fleet-worker.sh execution hold [--why <text>] -- <command...>   # run under THIS box's OS-level
 #                          # sleep guard alone (a systemd-inhibit block lock; bare where none):
 #                          # the wrapper for an exclusive measurement, and what `slot` runs inside
@@ -2569,9 +2571,10 @@ RUN_PY
 inhibitor_path() { type -P -- "$INHIBIT" 2>/dev/null || true; }
 
 cmd_execution_slot() {
-  local wait=600 kind="" box cap tokens listing rc measuring dir helper
+  local wait=600 kind="" box cap tokens listing rc measuring dir helper probe=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --probe) probe=1 ;;
       --wait)
         [ "$#" -ge 2 ] || die "execution slot: expected value for --wait"
         case "$2" in ''|*[!0-9]*) die "execution slot: --wait takes a whole number of seconds" ;; esac
@@ -2580,11 +2583,11 @@ cmd_execution_slot() {
         [ -z "$kind" ] || [ "$kind" = "$1" ] || die "execution slot: --cpu and --gpu are exclusive"
         kind="$1" ;;
       --) shift; break ;;
-      *) die "execution slot [--wait <seconds>] [--cpu|--gpu] -- <command> [args...]" ;;
+      *) die "execution slot [--wait <seconds>] [--cpu|--gpu] -- <command> [args...] | execution slot --probe" ;;
     esac
     shift
   done
-  [ "$#" -ge 1 ] || die "execution slot: a command to hold the slot around is required, after --"
+  [ -n "$probe" ] || [ "$#" -ge 1 ] || die "execution slot: a command to hold the slot around is required, after --"
   box="$LOCAL_BOX"
   [ -n "$box" ] || die "execution slot: this host has no fleet name; set FLEET_LOCAL_BOX (the slot is this box's own)"
   # An alias or a typo would lock under a name of its own and read measurements under another,
@@ -2595,6 +2598,16 @@ cmd_execution_slot() {
   tokens=$(box_gpu_tokens "$box") || { echo "EXECUTION SLOT REFUSED $box: $tokens"; exit 1; }
   # Where there are as many tokens as slots the tokens cannot bind, and every batch takes any slot.
   [ "$tokens" -lt "$cap" ] || tokens=0
+  # THE PROBE: what a slot here would be, without taking one -- no lock, no registry read. A
+  # project runner that takes the slot itself asks this first (ahrefs/ocannl#1004): an answer
+  # means this is a fleet box, and that this fleet-worker.sh runs a nested slot inside an
+  # enclosing one, so a worker's own wrapper around the runner cannot cost two slots. Anything
+  # else -- a host with no fleet name (exit 2), a box outside the roster (1), a version without
+  # the probe (2, usage) -- tells the runner to run as it would without a fleet.
+  if [ -n "$probe" ]; then
+    echo "EXECUTION SLOT PROBE $box $cap $([ "$tokens" -eq 0 ] && echo "$cap" || echo "$tokens")"
+    exit 0
+  fi
   dir="$(local_path "$SLOT_STATE")/$box"
   # THE NESTED SLOT: inside a batch that already holds one of this box's slots, a second take
   # would hold two for one batch, and N enclosing batches could deadlock waiting on each other.

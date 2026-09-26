@@ -80,7 +80,10 @@ interpreted, so a pipeline or a shell builtin goes as `sh -c '...'`.
 its command, and an `execution slot` that finds it runs its command under the enclosing slot
 instead of taking a second one (ahrefs/ocannl#1004). That lets a project runner take the slot
 itself: OCANNL's `tools/test-run.sh` does, declaring `--cpu` when the backend it resolves is a
-CPU one. A worker's wrapper around such a runner is harmless, because the runner runs inside
+CPU one. It first asks `execution slot --probe`, which prints `EXECUTION SLOT PROBE <box> <slots>
+<gpu tokens>` and takes no lock and reads no registry. Any answer other than that line (a host
+with no fleet name, or a fleet-worker.sh too old to have the probe) makes the runner run
+without a slot, as it did before. A worker's wrapper around such a runner is harmless, because the runner runs inside
 it. Without this, two slots per batch would fill a box at half its count, and a full box would
 deadlock until the deadline. The marker is checked, not trusted: it has to name this box and a
 slot that is held now, or it is reported and ignored. The GPU check reads the current token

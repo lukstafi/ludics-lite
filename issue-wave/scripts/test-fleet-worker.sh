@@ -2028,6 +2028,20 @@ o1=$!
 held "$TMP/slot-old.log" "slot 1 of 1 held" &&
   expect "a batch holding slot 1 under the old count is a GPU token to the new one" 1 "all 1 GPU tokens" -- "${FWT[@]}" execution slot --wait 0 -- echo after-switch
 kill -9 "$o1" 2>/dev/null; wait "$o1" 2>/dev/null
+# THE PROBE (ahrefs/ocannl#1004): a project runner asks what a slot here would be before taking
+# one itself; it takes nothing and reads no registry.
+expect "the probe names the box, its slots and its GPU tokens" 0 "^EXECUTION SLOT PROBE testbox 3 1$" -- \
+  "${FWT[@]}" execution slot --probe
+expect "...and a box whose tokens do not bind has one per slot" 0 "^EXECUTION SLOT PROBE testbox 1 1$" -- \
+  "${FWS[@]}" execution slot --probe
+"${FWS[@]}" execution slot -- sleep 30 > "$TMP/slot-p1.log" 2>&1 &
+p1=$!
+held "$TMP/slot-p1.log" "slot 1 of 1 held" &&
+  expect "...and it answers while every slot is held (it takes none)" 0 "^EXECUTION SLOT PROBE testbox 1 1$" -- \
+    "${FWS[@]}" execution slot --probe
+kill -9 "$p1" 2>/dev/null; wait "$p1" 2>/dev/null
+expect "a host with no fleet name has no probe answer" 2 "this host has no fleet name" -- \
+  env FLEET_LOCAL_BOX= FLEET_BOXES="testbox other" "$FW" execution slot --probe
 # THE NESTED SLOT (ahrefs/ocannl#1004): a held slot exports its marker, and an `execution slot`
 # inside it runs under that slot instead of taking another -- a runner that takes its own slot
 # inside a worker's wrapper must not hold two, or deadlock a full box.
