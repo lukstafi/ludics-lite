@@ -75,17 +75,11 @@ reset_fixture() {
   THREADS_FIXTURE_TOTAL=""
 }
 
-# THREADS as review_thread rows. `databaseId` is a 32-bit Int, so past 2^31 — where review comment
-# ids already run — GitHub serves it null and only `fullDatabaseId` names the comment.
+# THREADS as review_thread rows (which serve `databaseId` null past 2^31, as GitHub does).
 thread_rows() {
-  local pair id nodes=""
+  local pair nodes=""
   for pair in $THREADS; do
-    id="${pair%%:*}"
-    if [ "$id" -lt 2147483648 ]; then
-      nodes="$nodes,$(review_thread "$id" "${pair##*:}")"
-    else
-      nodes="$nodes,$(review_thread "$id" "${pair##*:}" | jq -c '.comments.nodes[0].databaseId = null')"
-    fi
+    nodes="$nodes,$(review_thread "${pair%%:*}" "${pair##*:}")"
   done
   printf '[%s]\n' "${nodes#,}"
 }

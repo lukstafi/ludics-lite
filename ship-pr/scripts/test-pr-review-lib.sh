@@ -459,11 +459,15 @@ gh_fixture_answer() {
 # --- review threads (ludics-lite#289) --------------------------------------------------------
 # One thread as the reviewThreads connection serves it: isResolved, the path, and the first
 # comment's ids and author — the fields pr-review.sh's open-thread read asks for. Both ids, as
-# GitHub serves them: fullDatabaseId a BigInt STRING, databaseId the same value as a number.
+# GitHub serves them: fullDatabaseId a BigInt STRING, databaseId the same value as a number below
+# 2^31 and null from there on — the schema types it a 32-bit Int, and review comment ids already
+# run past that.
 review_thread() { # <first comment id> <true|false> [path] [author]
   jq -cn --argjson id "$1" --argjson r "$2" --arg p "${3:-a.sh}" --arg a "${4:-codex[bot]}" \
     '{id:("T" + ($id | tostring)), isResolved:$r, path:$p,
-      comments:{nodes:[{fullDatabaseId:($id | tostring), databaseId:$id, author:{login:$a}}]}}'
+      comments:{nodes:[{fullDatabaseId:($id | tostring),
+                        databaseId:(if $id < 2147483648 then $id else null end),
+                        author:{login:$a}}]}}'
 }
 
 # The GraphQL answer to the open-thread query over <nodes> (a JSON array of review_thread rows),
