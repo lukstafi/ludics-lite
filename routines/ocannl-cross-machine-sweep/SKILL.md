@@ -35,6 +35,12 @@ When the lane did reach tuf it ends by putting the box back to sleep (`wake-lab.
 is inhibitor-aware), so a timer-woken laptop does not stay up all day. tuf is NOT one of the five
 backends' gates: hip's gate stays minix, and tuf/hip is an additional unit reported on its own line.
 
+**TEMPORARILY, that sleep is disabled** (2026-09-26): once asleep, tuf stays down until a person
+wakes it, since nothing can reach it over Wi-Fi. Step 2 hands the sweep a `wake-lab.sh` wrapper
+that refuses `sleep tuf`, so the lane's line reads `tuf: left awake, not a failure -- REFUSED:
+tuf kept awake …`. That is expected, not a finding. Remove the wrapper once tuf is on
+WoL-capable wired Ethernet.
+
 CI's Windows OS target is likewise off the per-PR path: it runs only on the
 twice-weekly scheduled CI sweep, and on demand via `workflow_dispatch`, because at 62-74min it
 set the latency of the whole per-PR matrix.
@@ -293,6 +299,11 @@ directories together from master instead of copying one file:
     git -C ~/ocannl-staging fetch -q origin master
     rm -rf ~/.ocannl-sweep/tools ~/.ocannl-sweep/benchmarks
     git -C ~/ocannl-staging archive origin/master tools benchmarks | tar -x -C ~/.ocannl-sweep
+    # TEMPORARY (see the top of this routine): every wake-lab.sh verb but `sleep tuf`.
+    printf '%s\n' '#!/bin/bash' \
+      'if [ "$1" = sleep ] && [ "$2" = tuf ]; then echo "REFUSED: tuf kept awake by the sweep routine until it has wired Wake-on-LAN"; exit 3; fi' \
+      'exec "$HOME/bin/wake-lab.sh" "$@"' > ~/.ocannl-sweep/wake-lab-tuf-awake.sh
+    chmod +x ~/.ocannl-sweep/wake-lab-tuf-awake.sh
 
 The `mkdir` is not redundant on a box where the sweep has run before: `tar -C` requires the
 directory to exist, and `~/.ocannl-sweep` is also the script's state directory
@@ -336,8 +347,8 @@ A typo in the file is caught by the script itself: it checks that every declared
 unit, so a misspelled local ID dies with `declared measurement box 'm4-max' has no sweep unit`.
 
 Then, if today is Sunday, run the weekly full check
-`OCANNL_TOOL_SWEEP_LOCAL_BOX=$box OCANNL_TOOL_SWEEP_CAP=10800 ~/.ocannl-sweep/tools/sweep.sh --slow --force`;
-otherwise `OCANNL_TOOL_SWEEP_LOCAL_BOX=$box ~/.ocannl-sweep/tools/sweep.sh`. `--force` is what makes a unit record `pass` with `execution=forced`
+`OCANNL_TOOL_SWEEP_LOCAL_BOX=$box OCANNL_TOOL_SWEEP_WAKE_LAB=$HOME/.ocannl-sweep/wake-lab-tuf-awake.sh OCANNL_TOOL_SWEEP_CAP=10800 ~/.ocannl-sweep/tools/sweep.sh --slow --force`;
+otherwise `OCANNL_TOOL_SWEEP_LOCAL_BOX=$box OCANNL_TOOL_SWEEP_WAKE_LAB=$HOME/.ocannl-sweep/wake-lab-tuf-awake.sh ~/.ocannl-sweep/tools/sweep.sh`. `--force` is what makes a unit record `pass` with `execution=forced`
 (a `dune clean` plus alias `--force`, so every test action genuinely re-executes); a weekday run
 is incremental and records `incremental-pass`, which is evidence about the changed cone but does
 not refresh execution coverage. The raised cap is for the forced runs only: a cold rebuild plus
