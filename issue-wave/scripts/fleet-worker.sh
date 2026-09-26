@@ -433,19 +433,21 @@ user_line() { jq -cRs --arg u "$2" '{type: "user", uuid: $u, message: {role: "us
 # crash), so the pipeline, and with it run.sh, always finishes and records the CLI's exit code.
 # No `&` pipeline: bash 3.2 gives an asynchronous command /dev/null for stdin even in a pipeline.
 stream_run() {
-  local d="$1" cwd="$2" from="$3" flag="$4" sid="$5" a; shift 5
+  local d="$1" cwd="$2" from="$3" flag="$4" sid="$5" a feeder; shift 5
   printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
-  # Without its pid on record the feeder could never be closed or ended: an unwritable pid file
-  # stops the worker before the CLI starts, and a failed write ends the feeder it would name.
-  printf 'rm -f %q && : > %q || { echo 95 > %q; exit 95; }\n' "$d/feeder.pid" "$d/feeder.pid" "$d/exit"
+  printf 'rm -f %q\n' "$d/feeder.pid"
+  # Without its pid on record the feeder could never be closed or ended, so the CLI starts only
+  # once feeder.pid names this record's live tail (else exit 95, the CLI never started); a failed
+  # pid write ends the feeder it would have named, so the pipeline still finishes.
   printf '{ tail -n +%d -f %q & echo $! > %q || { kill $!; exit 95; }; wait; } | {\n' "$from" "$d/input.jsonl" "$d/feeder.pid"
+  feeder=$(printf 'case "$(ps -ww -o command= -p "$p" 2>/dev/null)" in *tail*%q*)' "$d/input.jsonl")
+  printf '  n=0; while p=$(cat %q 2>/dev/null); ! %s true ;; *) false ;; esac; do n=$((n + 1)); [ "$n" -lt 50 ] || exit 95; sleep 0.2; done\n' "$d/feeder.pid" "$feeder"
   printf '  claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --dangerously-skip-permissions %s %q' "$flag" "$sid"
   for a in "$@"; do printf ' %q' "$a"; done
   printf ' >> %q 2>> %q; rc=$?\n' "$d/stream.jsonl" "$d/stderr.log"
-  printf '  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s %q ] && break; sleep 1; done\n' "$d/feeder.pid"
   # Killed only while it is still this record's tail: `close` may have ended it already, and its
   # pid could be anyone's by now.
-  printf '  p=$(cat %q 2>/dev/null); case "$(ps -ww -o command= -p "$p" 2>/dev/null)" in *tail*%q*) kill "$p" 2>/dev/null ;; esac; exit "$rc"\n}\n' "$d/feeder.pid" "$d/input.jsonl"
+  printf '  %s kill "$p" 2>/dev/null ;; esac; exit "$rc"\n}\n' "$feeder"
   printf 'rc=$?; rm -f %q; echo "$rc" > %q\n' "$d/feeder.pid" "$d/exit"
 }
 state_of() {
@@ -1396,6 +1398,13 @@ verdict() {
             [ -n "$last" ] && summary="$summary | $last" ;;
   esac
   [ -n "$summary" ] || summary="no terminal event in the stream"
+  # An ended stream process whose last turn never ended (a turn a ScheduleWakeup or a task began,
+  # or tasks still listed) finished nothing, whatever an earlier result said.
+  if [ "$idle" = 0 ] && is_stream "$name"; then
+    local t bg
+    read -r t bg _ <<< "$(turn_state "$name")"
+    [ "$t $bg" = "ended 0" ] || { ok_event=0; summary="$summary | the process ended mid-turn (turn=$t, background_tasks=$bg)"; }
+  fi
   if [ "$idle" = 1 ]; then
     # Re-read at the moment of the verdict: a turn a ScheduleWakeup (or a task) started since
     # attach saw the worker idle is no IDLE; 5 tells attach to go on waiting.
@@ -1567,7 +1576,7 @@ d="$WORKERS/$name"; staged="$STATE/incoming/$name-$stamp.md"
 # Same critical section as launch: liveness checks through tmux creation, one at a time.
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
 msg=$(take_lock "$wlock" 0 "lock") || { rm -f "$staged"; echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress ($msg)"; exit 1; }
-started=0; blaunch=""; backed=0; ilines=""; appending=0
+started=0; blaunch=""; backed=0; ilines=""
 # A resume that never started takes its line back off the input channel: the file had $ilines.
 input_restore() {
   [ -n "$ilines" ] || return 0
@@ -1587,12 +1596,6 @@ on_exit() {
     else
       rm -f "$d/exit.prev" "$d/meta.prev"
     fi
-  fi
-  # An append interrupted between its meta update and its line: meta must not name a message
-  # the input never got, or attach and close would wait on it forever.
-  # Whether the line landed is read from the file, not from a flag a signal can beat.
-  if [ "$appending" = 1 ] && [ -e "$d/meta.prev" ]; then
-    if grep -qF -- "\"uuid\":\"$mid\"" "$d/input.jsonl" 2>/dev/null; then rm -f "$d/meta.prev"; else mv -f "$d/meta.prev" "$d/meta" 2>/dev/null; fi
   fi
   release_lock "$wlock"; [ -n "$blaunch" ] && release_lock "$blaunch"
 }
@@ -1616,14 +1619,16 @@ if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name
   # attach waits for the reply to THIS message: meta names it before the line lands, so a reply
   # that beats the next command is still read as its reply.
   off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
-  appending=1
+  # Meta and the input line change together: signals wait until both have (milliseconds), so an
+  # interruption never leaves meta naming a message the input never got, nor half a line.
+  trap '' TERM HUP INT
   cp -p "$d/meta" "$d/meta.prev" 2>/dev/null && meta_set "$d" turn_offset "$off" && meta_set "$d" awaiting "$mid" ||
     { [ -e "$d/meta.prev" ] && mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
   if ! printf '%s\n' "$line" >> "$d/input.jsonl" 2>/dev/null; then
     mv -f "$d/meta.prev" "$d/meta"
     echo "UNSTICK REFUSED $BOX/$name: cannot append to $d/input.jsonl"; exit 1
   fi
-  appending=2; rm -f "$d/meta.prev"
+  rm -f "$d/meta.prev"; trap 'exit 143' TERM HUP INT
   waited=0
   while :; do
     echoed=$(tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null | jq -Rrn --arg u "$mid" 'first(inputs | fromjson? | select(.type=="user" and .uuid==$u) | .uuid) // empty' 2>/dev/null)
@@ -1756,7 +1761,8 @@ name="$1" cwait="$2"; d="$WORKERS/$name"
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
 msg=$(take_lock "$wlock" 0 "lock") || { echo "CLOSE REFUSED $BOX/$name: another launch, unstick or close of this name is in progress ($msg)"; exit 1; }
 trap 'release_lock "$wlock"' EXIT; trap 'exit 143' TERM HUP INT
-running "$name" || { verdict "$name"; exit $?; }
+# An ended worker's verdict as it stands -- after ending a feeder that outlived its CLI.
+running "$name" || { if fpid=$(feeder_of "$name"); then kill "$fpid" 2>/dev/null; fi; verdict "$name"; exit $?; }
 state=$(state_of "$name")
 if ! alive "$name" || ! is_stream "$name"; then
   echo "CLOSE REFUSED $BOX/$name: $state, not a stream-json worker with its session up (a one-shot or orphaned CLI ends with its turn) -- wait for it, or \`unstick --kill\`"; exit 1

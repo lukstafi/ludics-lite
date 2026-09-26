@@ -266,6 +266,8 @@ if [ "$infmt" = stream-json ]; then
     msg=$(jq -r '.message.content // empty' <<<"$line" 2>/dev/null)
     init; echo_line "$line"
     grep -q '^SILENT' <<<"$msg" && exit 0
+    # HALFTURN: answers, then starts another turn (as a ScheduleWakeup would) and exits in it.
+    if grep -q '^HALFTURN' <<<"$msg"; then say "half"; result "half"; init; exit 0; fi
     extra=""
     n=$(sed -n '/^SLEEP [0-9]/ { s/^SLEEP \([0-9]*\).*/\1/; p; q; }' <<<"$msg")
     i=0
@@ -1152,6 +1154,13 @@ printf 'FAIL on purpose; is_error=false\n' > "$TMP/fail.md"
 "$FW" launch testbox wf --target-repo example/project --kind claude --brief "$TMP/fail.md" --cwd "$proj" >/dev/null
 expect "an erroring turn attaches as FAILED idle, exit 1: the process awaits input" 1 "FAILED testbox/wf idle error_during_execution is_error=true .* | awaiting input" -- "$FW" attach testbox wf --interval 1
 expect "...and its close reports the failed last turn" 1 "FAILED testbox/wf exit=0 error_during_execution is_error=true" -- "$FW" close testbox wf
+tail -n +1 -f "$ISSUE_WAVE_STATE/workers/wf/input.jsonl" >/dev/null 2>&1 & stale=$!; echo "$stale" > "$ISSUE_WAVE_STATE/workers/wf/feeder.pid"
+expect "close of an ended worker still prints its verdict" 1 "FAILED testbox/wf exit=0" -- "$FW" close testbox wf
+sleep 0.5; kill -0 "$stale" 2>/dev/null && { ko "...but left a feeder that outlived its CLI running"; kill "$stale"; } || ok "...after ending a feeder that outlived its CLI"
+wait "$stale" 2>/dev/null
+printf 'HALFTURN\n' > "$TMP/half.md"
+"$FW" launch testbox whalf --target-repo example/project --kind claude --brief "$TMP/half.md" --cwd "$proj" >/dev/null
+expect "a process that ended inside a later turn is FAILED, not DONE on the earlier result" 1 "FAILED testbox/whalf exit=0 success is_error=false .* | the process ended mid-turn (turn=working" -- "$FW" attach testbox whalf --interval 1
 printf 'SILENT\n' > "$TMP/silent.md"
 "$FW" launch testbox wsil --target-repo example/project --kind claude --brief "$TMP/silent.md" --cwd "$proj" >/dev/null
 expect "exit 0 with no terminal event is FAILED, not DONE" 1 "FAILED testbox/wsil exit=0 no terminal event" -- "$FW" attach testbox wsil --interval 1
