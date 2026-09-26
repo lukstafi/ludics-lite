@@ -85,10 +85,19 @@ unpushed=0
 
 # MERGED <sha> / CLOSED / OPEN, or empty when there is no PR, no gh, or no network. Empty is not
 # evidence of anything -- it just hands the decision to git.
+#
+# The PR is looked up in origin's repository by its URL: the branch is watched on origin, so that
+# is where its PR lives. Left to itself, gh without `gh repo set-default` resolves to a remote
+# named `upstream` when one exists, so a fork-shaped checkout (origin = a staging repo, upstream =
+# its parent) would ask the parent, read "no PR", and leave a squash merge to git, which cannot see
+# it (the same bug the ship-pr Stop hook had, ludics-lite#404). gh's default is the fallback only
+# for a checkout whose origin has no URL.
 check_pr_state() {
   command -v gh >/dev/null 2>&1 || return 0
+  local origin_url
+  origin_url=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null)
   (cd "$REPO_DIR" 2>/dev/null &&
-    gh pr view "$TARGET" --json state,mergeCommit \
+    gh pr view "$TARGET" ${origin_url:+--repo "$origin_url"} --json state,mergeCommit \
       --jq '.state + (if .mergeCommit then " " + .mergeCommit.oid[0:8] else "" end)' 2>/dev/null)
 }
 

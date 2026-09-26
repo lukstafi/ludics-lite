@@ -348,6 +348,8 @@ jobs:
         run: issue-wave/scripts/test-fleet-worker.sh
       - name: Exercise the background-run waiter
         run: issue-wave/scripts/test-bg-run.sh
+      - name: Exercise the branch waiter's PR lookup
+        run: wait-and-proceed/scripts/test-wait-for.sh
 
   # ---- every script suite on macOS, two jobs, two runner assignments -----------------------
   #
@@ -526,6 +528,9 @@ jobs:
       - name: background-run waiter
         if: ${{ !cancelled() }}
         run: issue-wave/scripts/test-bg-run.sh || { echo '::error title=macOS suite failed::test-bg-run.sh'; exit 1; }
+      - name: branch waiter
+        if: ${{ !cancelled() }}
+        run: wait-and-proceed/scripts/test-wait-for.sh || { echo '::error title=macOS suite failed::test-wait-for.sh'; exit 1; }
 
   windows-driver:
     needs: changes
