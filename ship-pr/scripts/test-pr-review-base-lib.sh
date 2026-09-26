@@ -9,7 +9,7 @@
 #   # shellcheck source=test-pr-review-base-lib.sh
 #   source "$SCRIPT_DIR/test-pr-review-base-lib.sh"
 #
-# The three suites over it, one subject each — `base` was one 900-line, 33-case file carrying all
+# The suites over it, one subject each — `base` was one 900-line, 33-case file carrying the first
 # three, where "which suite failed" said only "base":
 #
 #   test-pr-review-base-red.sh      the RED report: which job failed and where the red started
@@ -19,6 +19,8 @@
 #   test-pr-review-base-verdict.sh  what the WAIT LOOP decides: which break ends the wait, what
 #                                   each break re-confirms, where the absence clock starts
 #                                   (ludics-lite#93)
+#   test-pr-review-base-pushless.sh a workflow that no longer runs on push: the tip judged by a
+#                                   NAMED source or not at all (ludics-lite#401)
 #
 # What this file provides: the canned answers keyed the way `base` reads them (TIP, WORKFLOWS_JSON,
 # RUNS_<id>, JOBS_<run id>, FILES_<sha initial>, the compare and the workflow file), the fixture
@@ -78,6 +80,10 @@ TIP=""
 WORKFLOWS_JSON=""
 JOBS_DEFAULT=""
 FAIL_ENDPOINT=""
+# The HTTP status a failed read reports: a 5xx is transport, which gh_retry retries, while a 4xx is
+# the API's answer — a 404 or a 403 on the workflow file is how base_push_trigger meets a missing
+# file and a token that may not read it (ludics-lite#401).
+FAIL_STATUS=""
 # The settle path's three reads (ludics-lite#156): the workflow FILE (its path, then its body at
 # the tip, served raw as the library asks for it) and the compare from the judged commit to the
 # tip. One body and one file list for every workflow here: the cases that care which compare was
@@ -98,6 +104,22 @@ COMPARE_PARENTS=""
 COMPARE_TOTAL=""
 COMPARE_BEHIND=""
 FILES_DEFAULT=""
+# Source (a) of a tip no push run judges (ludics-lite#401): what `commits/<sha>` says about the
+# commit beyond its files (COMMIT_META, merged into that answer: its parents, its committer, its
+# signature), the pull requests associated with it (TIP_PULLS), and the merged PR's head as
+# `checks` reads it — the PR itself (HEAD_PR), its check runs (HEAD_CHECKS) and its workflow runs
+# (HEAD_RUNS).
+COMMIT_META=""
+# The `.github/workflows` directory at a ref, as the Contents API lists it: what confirms that a
+# workflow file answering 404 is really absent there.
+WORKFLOW_DIR=""
+TIP_PULLS=""
+HEAD_PR=""
+HEAD_CHECKS=""
+HEAD_RUNS=""
+# What the head's run list answers from its SECOND read on, when a case sets it: a re-run that
+# started between the build signal's read and the one after it.
+HEAD_RUNS_LATER=""
 # The delay the wall-clock cases spend their grace with, in seconds; set through `spend_grace`
 # below, which is where the idiom is written down. DELAY_LOG records each delay actually taken,
 # so "once" is a fact the controls can read rather than a property of a marker file's existence.
@@ -181,6 +203,7 @@ reset_fixture() {
   done
   JOBS_DEFAULT=$(jobs_json '[]')
   FAIL_ENDPOINT=""
+  FAIL_STATUS=500
   BASE_JOBS_CACHE=""
   BASE_RED_DETAIL=""
   BASE_IGNORE_CACHE=""
@@ -191,6 +214,14 @@ reset_fixture() {
   COMPARE_TOTAL=""
   COMPARE_BEHIND=""
   FILES_DEFAULT='[]'
+  COMMIT_META='{}'
+  WORKFLOW_DIR='[{"type":"file","path":".github/workflows/ci.yml"}]'
+  TIP_PULLS='[]'
+  HEAD_PR='{}'
+  HEAD_CHECKS='{"check_runs":[]}'
+  HEAD_RUNS='{"workflow_runs":[]}'
+  HEAD_RUNS_LATER=""
+  fixture_call_reset headruns
   FIRST_READ_DELAY=""
   for v in $(set | LC_ALL=C sed -n 's/^\(FILES_[0-9a-z]\)=.*/\1/p'); do unset "$v"; done
   : >"$DELAY_LOG"
@@ -205,7 +236,7 @@ reset_fixture() {
 }
 
 gh() {
-  local response="" rid wid sha base
+  local response="" rid wid sha base reads
   # The delay, once — on the FIRST read of the run, which is the round's tip read.
   if [ -n "$FIRST_READ_DELAY" ] && [ ! -s "$DELAY_LOG" ]; then
     printf 'x\n' >>"$DELAY_LOG"
@@ -219,7 +250,7 @@ gh() {
     # shellcheck disable=SC2254
     case "$FIXTURE_ENDPOINT" in
     $FAIL_ENDPOINT)
-      echo "gh: $FIXTURE_ENDPOINT unavailable (HTTP 500)" >&2
+      echo "gh: $FIXTURE_ENDPOINT unavailable (HTTP $FAIL_STATUS)" >&2
       return 1
       ;;
     esac
@@ -255,6 +286,7 @@ gh() {
   # verbatim — the library asks for the raw media type rather than the base64 JSON, whose decoder
   # is spelled differently on this fleet's two platforms.
   "repos/$REPO/actions/workflows/"*) response=$(jq -cn --arg p "$WORKFLOW_PATH" '{path: $p}') ;;
+  "repos/$REPO/contents/.github/workflows?ref="*) response="$WORKFLOW_DIR" ;;
   "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
   "repos/$REPO/compare/"*)
     # Oldest first, so each commit's first parent is the one before it and the first commit's is
@@ -270,10 +302,21 @@ gh() {
            parents: [{sha: (if $p != null then $p[.key]
                             else (if .key == 0 then $b else $c[.key - 1] end) end)}]}]}')
     ;;
+  "repos/$REPO/commits/"*"/pulls?per_page=100") response="$TIP_PULLS" ;;
+  "repos/$REPO/commits/"*"/check-runs?"*) response="$HEAD_CHECKS" ;;
+  "repos/$REPO/pulls/"*) response="$HEAD_PR" ;;
+  "repos/$REPO/actions/runs?head_sha="*)
+    response="$HEAD_RUNS"
+    if [ -n "$HEAD_RUNS_LATER" ]; then
+      # `|| return 1`, as the round counter's: this runs in a substitution without errexit.
+      reads=$(fixture_call_count headruns) || return 1
+      [ "$reads" -le 1 ] || response="$HEAD_RUNS_LATER"
+    fi
+    ;;
   "repos/$REPO/commits/"*)
     sha=${FIXTURE_ENDPOINT#*/commits/}
     sha=${sha%%\?*}
-    response=$(jq -cn --argjson f "$(files_of "$sha")" '{files: $f}')
+    response=$(jq -cn --argjson f "$(files_of "$sha")" --argjson m "$COMMIT_META" '$m + {files: $f}')
     ;;
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac

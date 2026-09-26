@@ -131,7 +131,8 @@ base actually lands, not in the ten hours it stays red. So read it before taking
 Exit **0** green, **1** RED (it says so in three shouted lines and names the run, the job that
 failed and how far back the red runs go — the first red commit when a green run stands under the
 streak, and otherwise that the red may start further back than the window shows), **3** the API did
-not answer — which is not "green" — and **4** no build workflow has ever completed on that branch.
+not answer — which is not "green" — and **4** no verdict: no build workflow has ever completed on
+that branch, or nothing has judged its tip (below).
 
 On a **1**, do not start by branching and hoping. Open the run it names and decide which you are in:
 the break is someone else's and already known (say so before you start, so the session's first
@@ -155,6 +156,17 @@ The verdict is about the last **completed** run, and `base` prints which commit 
 push a path filter skips produces no run at all, so the newest verdict can legitimately trail the
 tip by several commits — a gap in coverage, not a stale reading, and the printed SHA tells them
 apart.
+
+A workflow that **no longer runs on push** is the exception (ludics-lite#401; OCANNL's `ci` after
+ahrefs/ocannl#1057). Its last push run stands forever, so its verdict would be a stale reading, and
+`base` prints it as `retired` history instead. The tip's verdict for such a workflow comes only
+from a source the report names: an integration record concluded at exactly the tip (the wave gate
+hands those in), or the head run of the PR the tip merged, under the roll-forward rule, when the
+tip is GitHub's own merge commit of that head and the workflow itself ran green on it. A direct push, a squash or rebase merge, or a merge
+made outside GitHub has neither, and reads **no verdict** (exit 4), never an older green. What
+counts as "no longer runs on push" is narrow on purpose: its file at the tip was read and names no
+`push` trigger. A workflow that still declares `push`, or whose file the reader refuses, reads as
+it always did.
 
 ## Open
 

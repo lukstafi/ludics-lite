@@ -320,7 +320,14 @@ line (ludics-lite#175). A covered green exits at once, a pending base
 blocks at the ceiling, and a tip with no run of its own settles for the older verdict - at once
 when the checker recognizes the tip's diff as entirely within the workflow's `paths-ignore`,
 otherwise once that absence outlives the grace (ludics-lite#156). A run in flight or stopped at
-the tip keeps the refusal. This is a bounded pre-dispatch check, not another observer, and it is
+the tip keeps the refusal. A workflow that no longer runs on push (its file at the tip names no
+`push`; OCANNL's `ci` after ahrefs/ocannl#1057) never settles for its old push verdict: the gate
+reads the execution registry's integration records for the target - concluded records marked
+`"integration": true`, with a pass or fail at an exact SHA - and hands them to the checker,
+which takes the tip's verdict from a record at the tip first, else from the PR the tip is
+GitHub's clean merge of, when that workflow ran green on its head (roll-forward), and names the
+source it used. A tip with neither reads `NO VERDICT` at once, and dispatch waits; an unreadable
+registry refuses too, since a failed record there would outrank the PR head (ludics-lite#401). This is a bounded pre-dispatch check, not another observer, and it is
 point-in-time: not atomic with the spawn or launch that follows, so an adoption reconciles
 pending dispatches before replacing anything.
 
@@ -611,7 +618,12 @@ controlled through the tools in your coordinator's file, never through those com
   sentinel per the OCANNL agent-notes, and on a GPU box it also runs that box's backend, which
   GitHub CI never covers (a bonus, not the reason for the pick); for a repo whose CI already is
   its fullest suite (ludics, flotilla, this one), the merged tip's CI run is the verdict,
-  awaited with `pr-review.sh base owner/repo --wait` rather than re-run locally. Pick up each
+  awaited with `pr-review.sh base owner/repo --wait` rather than re-run locally. Where the
+  default branch has no push CI (OCANNL after ahrefs/ocannl#1057) there is no tip run to await:
+  the integration run's own record, concluded at the merged SHA, is that tip's verdict, and it is
+  what the base gate reads before the next launch. Reserve it as transport `coordinator`, kind
+  `correctness`, with `"integration": true`, and conclude it with its `observed_sha` - a record
+  without the field is a targeted batch to the gate, not a verdict source. Pick up each
   merge as it lands; one run covering several merges is incidental batching, never deliberate
   accumulation.
 - **On a regression, stop the world - as a mechanism.** `fleet-worker.sh halt "<what

@@ -908,8 +908,34 @@ base_checker() (
   SHIP_PR_BASE_ABSENT_GRACE="$BASE_ABSENT_GRACE" SHIP_PR_CHECKS_INTERVAL="$BASE_POLL_INTERVAL" "$@"
 )
 
+# integration_records <owner/repo>: the execution registry's INTEGRATION RECORDS for that
+# repository, one "<observed sha>\t<pass|fail>\t<request id>\t<concluded at>" row each, for the
+# checker's `base --integration-records` (ludics-lite#401): on a default branch whose CI no longer
+# runs on push, a coordinator's run concluded at exactly the tip is a verdict source the checker
+# names, and the registry is the anchor's, which only this script reads. An integration record is
+# a CONCLUDED reservation for that repository that says so - `"integration": true`, which the
+# registry admits only on a coordinator's non-standing `correctness` request - whose verdict is
+# pass or fail at an exact observed SHA. A correctness run without the field is a targeted batch
+# as far as this is concerned, however it was meant (review round 2): the allowlist is the filter
+# below, and a record outside it is simply not a source. The repository is compared without case,
+# as GitHub names it (review round 4): a record spelled `Owner/Repo` is the same repository's.
+# Exit 1 when the registry could not be read.
+integration_records() {
+  local listing
+  listing=$(execution_listing "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py") || return 1
+  jq -r --arg repo "$1" '.[]
+    | select(.state == "concluded" and (.verdict == "pass" or .verdict == "fail")
+             and .request.integration == true and .request.transport == "coordinator"
+             and .request.kind == "correctness"
+             and (.request.repository | ascii_downcase) == ($repo | ascii_downcase)
+             and (.request.standing // false) == false
+             and ((.observed_sha // "") | test("^[0-9a-f]{40}$")))
+    | [.observed_sha, .verdict, .request_id, .updated_at] | @tsv' <<<"$listing"
+}
+
 base_gate() {
   local target="$1" branch="$2" force="$3" reason="$4" expected="${5:-}" helper rc tip encoded
+  local rows later records="" args
   [[ "$target" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "base gate: --target-repo <owner/repo> required"
   [ -z "$reason" ] || [ "$force" -eq 1 ] || die "base gate: --allow-red-base requires --force for a triage worker"
   case "$branch" in -*|*$'\n'*) die "base gate: invalid --base-branch" ;; esac
@@ -919,12 +945,46 @@ base_gate() {
   # Reuse its bounded integration mode; preserve the established absence grace
   # for path-filtered tips, independent of the coordinator's ambient settings.
   # The ceiling is BASE_WAIT, derived from the grace and the poll interval pinned above.
-  if [ -n "$branch" ]; then
-    base_checker "$helper" --repo "$target" base "$branch" "--wait=$BASE_WAIT" >&2
+  # The registry's integration records ride along only when there are any: they are a verdict
+  # source for a tip no push run judges, and a repository that still runs on push never asks.
+  # An UNREAD registry refuses, though: a record there outranks the PR head's run, so reading
+  # none could hand a green head's verdict to a tip whose own integration run failed (review
+  # round 3). It is the anchor the lease read just came from, so this costs nothing but outages.
+  args=(--repo "$target" base)
+  [ -z "$branch" ] || args+=("$branch")
+  args+=("--wait=$BASE_WAIT")
+  if rows=$(integration_records "$target"); then
+    if [ -n "$rows" ]; then
+      # Staged whole or not at all: an empty or cut file is valid input to the checker, and a
+      # record lost in the write would let a green PR head stand for a failed tip (round 4).
+      records=$(mktemp "${TMPDIR:-/tmp}/fw-integration.XXXXXX") &&
+        printf '%s\n' "$rows" > "$records" || {
+        [ -z "$records" ] || rm -f "$records"
+        echo "BASE REFUSED: $target ${branch:-default branch}: cannot stage the integration records; dispatch blocked" >&2
+        return 1
+      }
+      args+=(--integration-records "$records")
+    fi
   else
-    base_checker "$helper" --repo "$target" base "--wait=$BASE_WAIT" >&2
+    echo "BASE REFUSED: $target ${branch:-default branch}: the execution registry could not be read, so whether an integration record judges its tip is unknown; dispatch blocked" >&2
+    return 1
   fi
+  base_checker "$helper" "${args[@]}" >&2
   rc=$?
+  [ -z "$records" ] || rm -f "$records"
+  # The records were a snapshot, and the read can wait minutes; an integration run concluding
+  # meanwhile would outrank what the checker judged by (review round 6). So a green is taken only
+  # over the records it was given: any change sends the coordinator to read again.
+  if [ "$rc" -eq 0 ]; then
+    if ! later=$(integration_records "$target"); then
+      echo "BASE REFUSED: $target ${branch:-default branch}: the execution registry could not be re-read after the verdict; dispatch blocked" >&2
+      return 1
+    fi
+    if [ "$later" != "$rows" ]; then
+      echo "BASE REFUSED: $target ${branch:-default branch}: an integration record for it concluded during the read, which the verdict did not see; re-run the gate" >&2
+      return 1
+    fi
+  fi
   if [ "$rc" -eq 1 ] && [ "$force" -eq 1 ] && [ -n "$reason" ]; then
     echo "BASE TRIAGE OVERRIDE: $target ${branch:-default branch}: $reason" >&2
     rc=0

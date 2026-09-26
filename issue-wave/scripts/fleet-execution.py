@@ -30,6 +30,12 @@ config; a map naming one alias on two rows is refused whole. It deliberately doe
 ~/.ssh/config: two `Host` stanzas pointing at one HostName outside the map are not detected. An
 empty or absent map argument keeps today's behaviour (each entry is its own box, up to case);
 fleet-worker passes one only when its checkout has no wake-lab.sh, and says so on stderr.
+
+A coordinator's correctness request may carry `"integration": true` (ludics-lite#401): the run is
+the repository's full integration suite at a merged tip, and once concluded pass or fail at an
+exact `observed_sha` it is the verdict source `fleet-worker.sh gate` offers `pr-review.sh base`
+for a default branch without push CI. The field is what tells it from a targeted batch, which is
+a correctness run too; the gate reads no record without it.
 """
 import json
 import os
@@ -56,7 +62,7 @@ STATES = {"reserved", "launching", "running", "uncertain", "concluded"}
 
 
 def validate_request(data):
-    if not isinstance(data, dict) or set(data) - REQUEST_FIELDS - {"triage_reason", "standing"}:
+    if not isinstance(data, dict) or set(data) - REQUEST_FIELDS - {"triage_reason", "standing", "integration"}:
         refuse("unknown reservation fields or invalid request")
     nonempty(data, REQUEST_FIELDS)
     if "triage_reason" in data:
@@ -72,6 +78,12 @@ def validate_request(data):
             refuse("only a correctness reservation can be standing")
     if data["transport"] not in {"subagent", "app", "cli", "coordinator"}:
         refuse("invalid transport")
+    if "integration" in data:
+        # A claim the base gate acts on, so only the shape an integration run has may make it.
+        if data["integration"] is not True:
+            refuse("integration must be true when present")
+        if data["kind"] != "correctness" or data["transport"] != "coordinator" or data.get("standing"):
+            refuse("only a coordinator's non-standing correctness reservation can be an integration run")
 
 
 def validate_record(record, path):

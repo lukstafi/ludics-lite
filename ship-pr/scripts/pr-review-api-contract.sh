@@ -310,7 +310,8 @@ if is_num "$wid"; then
   pin "workflow_id resolves to a workflow FILE whose name is the run's name (the fold keys on the file, not the display name)" \
     '(.path | startswith(".github/workflows/")) and .name == $wname' "$wf" --arg wname "$wname"
   # The file's own text, which is what `base --wait` reads to decide whether a tip with no run is
-  # one the workflow's paths-ignore excludes (workflow_paths_ignore). It asks for the RAW media
+  # one the workflow's paths-ignore excludes, and whether the workflow still runs on push at all
+  # (base_push_trigger, ludics-lite#401). It asks for the RAW media
   # type, because the JSON envelope's base64 body wants a decoder spelled `-d` on one of this
   # fleet's platforms and `-D` on the other. What can move is the media type being ignored and the
   # envelope arriving anyway: the parser would see one long line of base64, refuse it, and every
@@ -603,6 +604,15 @@ if [ -n "$STALE_BASE_PR" ]; then
     # every merge strategy has.
     if [ "$(jq '.parents | length' <<<"$merge_commit")" -ge 2 ]; then
       pin "the merge commit's second parent is the PR's head" '.parents[1].sha == $head' "$merge_commit" --arg head "$head_sha"
+      # What tip_pr_head_verdict reads to call a tip a CLEAN merge of a PR head (ludics-lite#401):
+      # GitHub's own merge commits are committed as noreply@github.com with a signature GitHub
+      # verified. If either moved, every pushless tip would quietly read "no verdict".
+      pin "GitHub's merge commit is committed by noreply@github.com with a verified signature (tip_pr_head_verdict's clean-merge test)" \
+        '.commit.committer.email == "noreply@github.com" and .commit.verification.verified == true' "$merge_commit"
+      tip_pulls=$(api "repos/$REPO/commits/$merge_sha/pulls?per_page=100")
+      pin "commits/<merge sha>/pulls lists the PR it merged, with merged_at, that merge_commit_sha, its head.sha and base.ref (tip_pr_head_verdict's lookup)" \
+        'any(.[]; .number == $n and .merged_at != null and .merge_commit_sha == $m and .head.sha == $h and (.base.ref | type == "string"))' \
+        "$tip_pulls" --argjson n "$STALE_BASE_PR" --arg m "$merge_sha" --arg h "$head_sha"
     else
       skip "the merge commit's second parent is the PR's head" "#$STALE_BASE_PR was squash- or rebase-merged: its merge_commit_sha has one parent and does not carry the head as a parent at all; a merge-commit anchor pins this claim"
     fi

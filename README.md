@@ -340,6 +340,7 @@ ship-pr/scripts/test-pr-review-base-drift.sh
 ship-pr/scripts/test-pr-review-base-red.sh
 ship-pr/scripts/test-pr-review-base-settle.sh
 ship-pr/scripts/test-pr-review-base-verdict.sh
+ship-pr/scripts/test-pr-review-base-pushless.sh
 ship-pr/scripts/test-pr-review-checks-absent.sh
 ship-pr/scripts/test-pr-review-rounds.sh
 ship-pr/scripts/test-pr-review-merge.sh
@@ -860,9 +861,9 @@ verification could not fail on, and so does a bare number following a call that 
 is the ambiguity the cache carried across checkouts and sessions. The control is a named repo
 writing from that same wrong cwd.
 
-Three suites cover the other `base` — the one that answers "is the branch I am about to work off
-green" — over one shared fixture transport, `test-pr-review-base-lib.sh`. They were one 900-line,
-33-case file until ludics-lite#179, where "which suite failed" said only "base".
+Four suites cover the other `base` — the one that answers "is the branch I am about to work off
+green" — over one shared fixture transport, `test-pr-review-base-lib.sh`. The first three were one
+900-line, 33-case file until ludics-lite#179, where "which suite failed" said only "base".
 
 `test-pr-review-base-red.sh` is the red REPORT: what the command says once the answer is no
 (ludics-lite#73). A red names the
@@ -932,6 +933,24 @@ so a red beneath a cancelled one still stands and a green beneath one still cove
 under `--wait` the tip is the question, so a tip read that failed is UNKNOWN rather than something
 to wait through; without `--wait` the same failure costs only the "not the tip" notes.
 
+`test-pr-review-base-pushless.sh` covers a default branch whose CI no longer runs on push
+(ludics-lite#401, for ahrefs/ocannl#1057). A workflow that ran on pushes and whose file at the tip
+no longer declares `push` keeps its last push runs forever, so the fold would present a months-old
+green as the base's. Such a workflow's push rows are now history, and the tip's verdict for it
+comes from a NAMED source or not at all: a coordinator's integration record (a registry record
+marked `"integration": true`) concluded at exactly the tip (`fleet-worker.sh gate` hands them in
+as `--integration-records`), else the merged PR's
+head run under the roll-forward rule — the tip must be GitHub's own signed merge commit of one PR
+into this branch, with that PR's head as its second parent, and the retired workflow's OWN run at
+that head a success with at least one non-advisory job that succeeded (the head's aggregate green
+can be another workflow's, on a PR the retired one filtered out). The cases pin each source and its refusals (a direct push, a merge made
+elsewhere, a PR that did not make the tip, a head that never built the workflow, a malformed
+records file), the red and still-running heads, the verdict line naming its source, and the other
+direction: a workflow that still runs on push, whose file the trigger reader refuses, or whose file
+the directory at the tip confirms absent reads exactly as before, and a covered tip never reads its
+workflow file. A read of the file the API refuses (401, 403, an unconfirmed 404) is UNKNOWN, and
+so is a plain read whose tip read failed while a workflow is retired.
+
 Each workflow's page of runs is sorted on `(created_at desc, id desc)` before the fold
 (ludics-lite#90), as `run_signal`'s feed has been since #83: two pushes to the branch inside one
 second give their runs the same `created_at`, GitHub documents no order between them, and the fold
@@ -982,7 +1001,7 @@ read, or `skip` with the reason it cannot be checked here), so a failure localiz
 that moved; its exit code separates a moved belief (1), an addressed endpoint answering 4xx (4) and
 a read the token was refused (5) from the API not answering or throttling (3), and the reporter
 files everything but the last, naming which: the fields `run_signal`, `build_checks`, `run_red_is_advisory_only`, `pr_head_read`,
-`warn_base_drift` and `status_state` index; the workflow file `workflow_paths_ignore` reads under
+`warn_base_drift` and `status_state` index; the workflow file `base_push_trigger` reads under
 the raw media type (the base64 envelope arriving instead would cost every paths-ignore recognition
 silently); the newest-first order of `actions/runs`; the two feeds `cmd_base` reads and nothing checked until
 ludics-lite#90 — the workflow list (`actions/workflows?per_page=100`: the id and name the fold

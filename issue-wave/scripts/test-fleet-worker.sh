@@ -158,6 +158,7 @@ cp "$HERE/fleet-execution.py" "$TMP/dispatcher/issue-wave/scripts/fleet-executio
 cp "$HERE/bg-run.sh" "$TMP/dispatcher/issue-wave/scripts/bg-run.sh"
 FW="$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
 export BASE_CALL_LOG="$TMP/base-calls"
+export SHIM_FW="$FW"   # the dispatcher copy, for the shim's mid-read conclusion below
 cat > "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$* grace=${SHIP_PR_BASE_ABSENT_GRACE:-unset} interval=${SHIP_PR_CHECKS_INTERVAL:-unset}" >> "$BASE_CALL_LOG"
@@ -181,6 +182,13 @@ if [ -n "${SHIM_PRS:-}" ]; then
   esac
   exit 2
 fi
+# The integration records the gate stages for the checker are logged by content: the file is
+# removed once the read returns (ludics-lite#401).
+prev=""
+for arg in "$@"; do
+  [ "$prev" != --integration-records ] || sed 's/^/records: /' "$arg" >> "$BASE_CALL_LOG"
+  prev="$arg"
+done
 if [ "$3" = retry ]; then
   [ -z "${SHIM_BASE_TIP_FAIL:-}" ] || exit 3
   ref="${6##*/}"
@@ -209,6 +217,9 @@ case " $* " in *" --wait=$((SHIP_PR_BASE_ABSENT_GRACE + SHIP_PR_CHECKS_INTERVAL)
 # SHIM_BASE_TOUCH: a marker this read leaves behind, so a test can change the world between the
 # preflight and the launch's far side (the tmux shim's SHIM_TMUX_GENV_WHEN reads it).
 [ -z "${SHIM_BASE_TOUCH:-}" ] || touch "$SHIM_BASE_TOUCH"
+# SHIM_BASE_CONCLUDE: an execution conclusion payload the read concludes while it "waits", as an
+# integration run finishing mid-gate would (ludics-lite#401, review round 6).
+[ -z "${SHIM_BASE_CONCLUDE:-}" ] || env FLEET_BOXES="testbox other" "$SHIM_FW" execution conclude "$SHIM_BASE_CONCLUDE" >/dev/null || exit 3
 if [ -n "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] && [ ! -e "$SHIM_BASE_REQUIRE_PREFLIGHT" ]; then
   echo 'base read occurred before preflight'; exit 3
 fi
@@ -1355,6 +1366,53 @@ grep -Fq "\"observed_sha\": \"$ran\"" <<<"$out" && ok "...with the reported revi
 jq -n '{request_id:"run-other", verdict:"not-launched", log:"/dev/null", evidence:"fixture never invoked a runner on other"}' > "$TMP/run-other-done.json"
 "${FWX[@]}" execution conclude "$TMP/run-other-done.json" >/dev/null || ko "could not conclude the off-box fixture (setup)"
 expect "a run of a request outside the roster is refused" 1 "canonical FLEET_BOXES" -- "$FW" execution run "$(reqjson run-e)"
+# The base gate offers the checker the registry's INTEGRATION RECORDS for its target (ludics-lite
+# #401): concluded records marked `"integration": true` for that repository, with a pass or fail at
+# an exact SHA. An unmarked run, another repository's, and a timeout are not sources.
+intreq() { # <id> <transport> <repository> <integration: true|-> -> a reservation payload file
+  jq -n --arg id "$1" --arg t "$2" --arg repo "$3" --arg i "$4" '{request_id:$id, wave:"w", worker:"coordinator", transport:$t, issue:"o/r#1",
+    purpose:"integration run at the merged tip", agent_host:"testbox", execution_host:"testbox", repository:$repo,
+    requested_revision:"origin/master", kind:"correctness"} + (if $i == "true" then {integration: true} else {} end)' > "$TMP/$1.json"
+  printf '%s' "$TMP/$1.json"
+}
+intdone() { # <id> <verdict>: conclude it at $ran
+  jq -n --arg id "$1" --arg v "$2" --arg sha "$ran" --arg wt "$wt" '{request_id:$id, verdict:$v, log:"/dev/null",
+    evidence:"fixture integration run", observed_sha:$sha, remote_checkout:$wt, handle:"fixture"}' > "$TMP/$1-done.json"
+  "${FWX[@]}" execution conclude "$TMP/$1-done.json" >/dev/null || ko "could not conclude $1 (setup)"
+}
+# The coordinator's own correctness run WITHOUT `"integration": true` is a targeted batch as far
+# as the gate is concerned (review round 2 of #401): only the explicit field makes a source. And
+# int-a spells the repository in other letters, which is still the same GitHub repository (round 4).
+for spec in "int-a coordinator Example/Project pass true" "int-b coordinator example/project pass -" \
+  "int-c coordinator o/r fail true" "int-d coordinator example/project timeout true"; do
+  read -r int_id int_t int_repo int_v int_i <<<"$spec"
+  "${FWX[@]}" execution run "$(intreq "$int_id" "$int_t" "$int_repo" "$int_i")" >/dev/null || ko "could not reserve $int_id (setup)"
+  intdone "$int_id" "$int_v"
+done
+: > "$BASE_CALL_LOG"
+expect "the gate hands the checker its target's integration records" 0 "BASE GREEN" -- "$FW" gate --target-repo example/project
+grep -Fq -- '--repo example/project base --wait=360 --integration-records ' "$BASE_CALL_LOG" && ok "...after the wait, as a file" || ko "no records file handed over: $(cat "$BASE_CALL_LOG")"
+[ "$(grep -c '^records: ' "$BASE_CALL_LOG")" = 1 ] && grep -q "^records: $ran	pass	int-a	" "$BASE_CALL_LOG" && ok "...only the marked integration pass/fail for that repository" || ko "wrong records offered: $(cat "$BASE_CALL_LOG")"
+# (With no record for the target, the call carries no flag at all: the "base gate" section's
+# exact call lines above pin that, since its gates ran before any record existed.)
+# A record concluding while the checker reads is one its verdict did not see: the green is refused
+# and the coordinator reads again (review round 6 of #401). The shim concludes one mid-read.
+: > "$BASE_CALL_LOG"
+"${FWX[@]}" execution run "$(intreq int-e coordinator example/project true)" >/dev/null || ko "could not reserve int-e (setup)"
+jq -n --arg sha "$ran" --arg wt "$wt" '{request_id:"int-e", verdict:"fail", log:"/dev/null",
+  evidence:"fixture integration run", observed_sha:$sha, remote_checkout:$wt, handle:"fixture"}' > "$TMP/int-e-done.json"
+expect "a record concluded during the read refuses the green" 1 "concluded during the read" -- \
+  env SHIM_BASE_CONCLUDE="$TMP/int-e-done.json" "$FW" gate --target-repo example/project
+: > "$BASE_CALL_LOG"
+expect "...and the next read hands it over" 0 "BASE GREEN" -- "$FW" gate --target-repo example/project
+grep -q "^records: $ran	fail	int-e	" "$BASE_CALL_LOG" && ok "...with the failed record in the file" || ko "the concluded record was not offered: $(cat "$BASE_CALL_LOG")"
+# An unreadable registry refuses the gate rather than withholding the source: a failed record
+# there would outrank a green PR head (review round 3 of #401).
+printf 'not json\n' > "$ISSUE_WAVE_STATE/executions/zz-broken.json"
+: > "$BASE_CALL_LOG"
+expect "an unreadable registry refuses the gate" 1 "the execution registry could not be read" -- "$FW" gate --target-repo example/project
+[ -s "$BASE_CALL_LOG" ] && ko "the checker ran over an unread registry: $(cat "$BASE_CALL_LOG")" || ok "...before the checker is asked anything"
+rm -f "$ISSUE_WAVE_STATE/executions/zz-broken.json"
 }
 
 section "execution conclude --from-bg-run" && {

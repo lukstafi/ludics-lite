@@ -125,6 +125,9 @@ jobs:
         continue-on-error: true
         if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-base-verdict.sh') }}
         run: ship-pr/scripts/test-pr-review-base-verdict.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-verdict.sh'; exit 1; }
+      - name: pr-review fixtures, the named sources of a tip no push run judges
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-base-pushless.sh') }}
+        run: ship-pr/scripts/test-pr-review-base-pushless.sh || { echo '::error title=Git Bash suite failed::test-pr-review-base-pushless.sh'; exit 1; }
       - name: pr-review fixtures, absent vs not yet
         if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-checks-absent.sh') }}
         run: ship-pr/scripts/test-pr-review-checks-absent.sh || { echo '::error title=Git Bash suite failed::test-pr-review-checks-absent.sh'; exit 1; }
