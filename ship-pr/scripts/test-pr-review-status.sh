@@ -1230,6 +1230,29 @@ test_a_thumbs_up_older_than_the_head_commit_is_not_an_approval() {
   assert_eq "$(state_tok "$STATE")" approved "a 👍 newer than the head's commit approves it"
 }
 
+# Review of #420, round 1: a commit date in the future proves nothing (the review clock refuses it
+# too), and a newest summary the stamp cannot read hands the decision to the clock rather than to
+# an older summary's row.
+test_a_thumbs_up_is_judged_only_on_evidence_that_can_prove_it_stale() {
+  reset_fixture
+  REACTIONS_JSON="[$(reaction +1 "$(jq -rn '(now - 60) | todate')")]"
+  HEAD_AT=$(jq -rn '(now + 3600) | todate')
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "a commit dated in the future cannot prove a 👍 stale"
+  # The older summary's row names another head; the newest summary's row is one the stamp cannot
+  # read. The 👍 is newer than the head's commit, so the clock approves.
+  HEAD_AT=2026-09-01T00:05:00Z
+  REACTIONS_JSON="[$(reaction +1 2026-09-01T00:10:03Z)]"
+  COMMENTS_JSON="[$(summary_row 1 Completed aaaaaaa 2026-09-01T00:01:00Z),$(plain_comment 2 2026-09-01T00:10:00Z '<!-- codex-pull-request-review-summary -->
+| 📝 **Code Review** | ✅ **Completed** just now | `head-sh` | New commits |')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "an unreadable newest summary hands the 👍 to the clock, not to an older row"
+  # The same unreadable summary over a 👍 older than the head's commit: the clock still decides.
+  HEAD_AT=2026-09-01T00:20:00Z
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "and the clock demotes a 👍 older than the head's commit"
+}
+
 test_a_stale_thumbs_up_leaves_the_ordinary_states() {
   reset_fixture
   REACTIONS_JSON="[$(reaction eyes 2026-09-01T09:40:00Z),$(reaction +1 2026-09-01T09:49:00Z)]"
@@ -1305,6 +1328,7 @@ tests=(
   test_a_thumbs_up_the_summary_gives_another_head_is_not_an_approval
   test_a_thumbs_up_older_than_the_head_commit_is_not_an_approval
   test_a_stale_thumbs_up_leaves_the_ordinary_states
+  test_a_thumbs_up_is_judged_only_on_evidence_that_can_prove_it_stale
 )
 
 run_tests "${tests[@]}"

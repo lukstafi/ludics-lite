@@ -1496,16 +1496,22 @@ status_state() {
          | select(test("^\\|[^|]*Code Review[^|]*\\|[^|]*Running"))
          | ([capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")] | first)]
         as $running |
-      # Every Code Review row the stamp pattern reads, whatever its status: the newest one names
-      # the commit the reviewer last took up, which is the fourth field (#418, below). A row the
-      # pattern cannot read is left out here and the clock below answers instead.
+      # The Code Review rows of the NEWEST summary comment (the app edits one in place, so that
+      # is its latest activity), whatever their status: the newest row names the commit the
+      # reviewer last took up, which is the fourth field (#418, below). Empty — and the clock
+      # below answers instead — when there is no such row, or when ANY of them is one the stamp
+      # pattern cannot read: its time is then unknown, so no readable row can be called the
+      # newest, and an older summary is never consulted in its place.
       ([$comments[] | reviewer
-         | select((.body // "") | contains("codex-pull-request-review-summary"))
-         | (.body // "") | split("\n")[]
-         | select(test("^\\|[^|]*Code Review[^|]*\\|"))
-         | [capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")] | first
-         | select(. != null) | .at |= sub("\\.[0-9]+Z$"; "Z")]
-       | max_by(.at) | .sha // "") as $row_sha |
+         | select((.body // "") | contains("codex-pull-request-review-summary"))]
+       | max_by(.updated_at // .created_at)
+       | if . == null then []
+         else [(.body // "") | split("\n")[]
+               | select(test("^\\|[^|]*Code Review[^|]*\\|"))
+               | [capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")] | first]
+         end) as $rows |
+      (if ($rows | length) == 0 or any($rows[]; . == null) then ""
+       else $rows | max_by(.at) | .sha end) as $row_sha |
       [($running[] | select(. != null) | . + {kind:"running"}),
        ($reviews[] | reviewer | select(.submitted_at != null)
          | {sha:(.commit_id // ""), at:.submitted_at, kind:"findings"}),
@@ -1570,7 +1576,10 @@ status_state() {
     #   - with no such row read, the head commit's committer date, the review clock's own lower
     #     bound on the push (below): a 👍 older than the commit cannot be about it. It misses a
     #     commit made BEFORE the 👍 and pushed after (#415's head sat nine minutes between commit
-    #     and push); that miss is the one the row closes, and the only one left without it.
+    #     and push); that miss is the one the row closes, and the only one left without it. A
+    #     date in the FUTURE (clock skew, an explicit GIT_COMMITTER_DATE) proves nothing and is
+    #     not used — age_of refuses it, as it does for the review clock — or every 👍 before
+    #     that date would be demoted and a nudge recommended over it.
     # Not the PR's `updated_at`, which the checks grace pairs with the commit date: it moves on
     # every comment and thread reply, and the `unresolved` flow (reply to and resolve threads
     # under a standing 👍) would then demote a real approval to `expected` and invite the
@@ -1588,7 +1597,8 @@ status_state() {
         head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
           head_at=""
         head_at_read=true
-        if [ -n "$head_at" ] && [[ "$plus_at" < "$head_at" ]]; then
+        age=$(age_of "$head_at")
+        if [ "$age" != - ] && [[ "$plus_at" < "$head_at" ]]; then
           stale_note="the 👍 at $plus_at predates head ${head_sha:0:7}'s commit date $head_at"
         fi
       fi
