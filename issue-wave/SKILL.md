@@ -72,7 +72,8 @@ author's fleet (the header of `scripts/fleet-worker.sh` is the authoritative lis
 | Local state directory for each coordinator | `ISSUE_WAVE_STATE` |
 | State directory on the anchor for the lease and fleet-wide halt | `FLEET_ANCHOR_STATE`; every coordinator must resolve it to the same directory on the anchor |
 | Where a box keeps its run-time correctness slot locks (`execution slot`) | `FLEET_SLOT_STATE`; box-wide, deliberately not under the per-coordinator `ISSUE_WAVE_STATE`, and every agent on the box must resolve it to the same directory |
-| How many correctness executions may share a box AT RUN TIME (measurement is always exclusive) | `FLEET_BOX_CORRECTNESS_SLOTS` (`<box>=<n>` pairs; `mac-studio=6 rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3` with the default roster, one slot otherwise) |
+| How many correctness executions may share a box AT RUN TIME (measurement is always exclusive) | `FLEET_BOX_CORRECTNESS_SLOTS` (`<box>=<n>` pairs; `mac-studio=6 rog-nv-linux=4 minix-amd-linux=4 tuf-amd-linux=3` with the default roster, one slot otherwise) |
+| How many of those may hold the box's GPU at once | `FLEET_BOX_GPU_TOKENS` (`<box>=<n>` pairs; `rog-nv-linux=2` with the default roster, one per slot otherwise; a batch declared `execution slot --cpu` takes none) |
 
 The rest is prose in this file and is edited in place: the **sequencing plan** path and the
 task that maintains it (Inputs, just below), the **fleet roster** with its hardware and the
@@ -154,9 +155,9 @@ boxes serialize per box for measurement work (the plan's Parallelism section ord
 queue). Three limits are separate and none bounds another: agent capacity (the runtime's), the
 execution registry (a measurement reservation is exclusive on its box), and the correctness
 slots a box's batches share at run time (six on mac-studio, and as measured on the native GPU
-boxes two on rog-nv-linux, four on minix-amd-linux and three on tuf-amd-linux; one on any box
-the spec does not name, which includes WSL's measured dxg limit; ludics-lite#157, #160, #316,
-#344) - a count `execution slot` takes around each batch, so a worker's standing reservation
+boxes four on rog-nv-linux, of which two may hold its GPU, four on minix-amd-linux and three on
+tuf-amd-linux; one on any box the spec does not name, which includes WSL's measured dxg limit;
+ludics-lite#157, #160, #316, #344, #391) - a count `execution slot` takes around each batch, so a worker's standing reservation
 never gates another worker's start ([executions.md](references/executions.md)).
 
 A box that is asleep or unreachable is a placement fact, not a blocker: wake it (all but
@@ -372,7 +373,8 @@ requirements for every transport with transport-specific setup and identity, and
   the [standing reservation](references/executions.md#standing-iteration-reservation) the
   coordinator took at launch - name its request id, the bounded aliases and `-j` width it
   covers, and that every batch goes through the project runner, wrapped in `fleet-worker.sh
-  execution slot -- <batch>`, and is reported by run directory. Every other run - a
+  execution slot -- <batch>` (`execution slot --cpu -- <batch>` for one that holds no GPU), and
+  is reported by run directory. Every other run - a
   measurement (only for a timing-grade claim or a run that needs the box to itself, a
   [rule](references/executions.md#exclusivity-and-the-run-time-slots) the brief carries), a
   cross-box leg, a full suite - needs a request first, in the transport's shape:
@@ -528,7 +530,9 @@ controlled through the tools in your coordinator's file, never through those com
   SAME worker is resumed with the assignment - by session for CLI, by agent ID for native;
   never a second writer. On a result, `execution conclude --from-run <run-dir> --request <id>
   --sha <sha>` reads verdict, log and checkout off the record on the reserved box and refuses an
-  unfinished run; then resume implementation or review. Formats and the per-transport sides:
+  unfinished run (`--from-bg-run <dir>` for a run blocked under `bg-run.sh`, see
+  [executions.md](references/executions.md#reserve-launch-observe-conclude)); then resume
+  implementation or review. Formats and the per-transport sides:
   [native Claude](references/native-claude.md#worker-channel),
   [native Codex](references/native-codex.md#worker-channel),
   [CLI](references/executions.md#cli-reservation-handoff).
@@ -556,7 +560,9 @@ controlled through the tools in your coordinator's file, never through those com
   exemption for the same red conflicted at the next integration run).
 - **Converge long reviews.** An automated reviewer keeps finding members of any open-ended
   artifact (a scanner, a property table) indefinitely (2026-08-22: two workers went 9 and 13
-  rounds; 2026-08-27: three went 11-18). After ~5 rounds send the policy, whose axis is
+  rounds; 2026-08-27: three went 11-18). At 5 rounds send the policy - `fleet-worker.sh prs
+  <owner/repo> [--wave <id>]` lists each open PR's round count, CI and head age and flags the
+  ones there (ludics-lite#405; one reached 10 unnoticed) - whose axis is
   **silent vs loud**: a silent defect (a claim that cannot fail, a sweep that deletes what it
   shouldn't, an oracle a scheduler accident satisfies) is must-fix through round twelve, while a
   loud one (a false refusal or error on valid-but-absent shapes) defers to ONE follow-up

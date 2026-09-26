@@ -131,11 +131,13 @@ so a standing iteration record gates no agent's start (ludics-lite#160). Every r
 Linux box also holds a logind block inhibitor on sleep for as long as it runs - `execution hold --
 <command>`, which `execution slot` runs inside and an exclusive measurement uses alone - so another
 session's `wake-lab.sh sleep` is refused by the OS (ludics-lite#317). The native GPU boxes take
-measured counts: two on rog-nv-linux, four on minix-amd-linux, three on tuf-amd-linux
-(ludics-lite#316, #344). The
+measured counts: four on rog-nv-linux, of which two may hold its GPU (`FLEET_BOX_GPU_TOKENS`; a
+batch declared `execution slot --cpu` takes a slot alone), four on minix-amd-linux, three on
+tuf-amd-linux (ludics-lite#316, #344, #391). The
 usual coordinator shape is two calls per execution: `execution run <reserve.json>` (reserve and
 dispatch) and `execution conclude --from-run <run-dir> --request <id> --sha <sha>` (verdict, log and
-checkout read off a `test-run.sh` record on the reserved box). The reservation helper requires Python 3 on the anchor, and `execution slot` requires it on every
+checkout read off a `test-run.sh` record on the reserved box; `--from-bg-run <dir>` reads a
+`bg-run.sh` directory instead). The reservation helper requires Python 3 on the anchor, and `execution slot` requires it on every
 box that runs batches (the per-box preflight checks it).
 
 ## Routines

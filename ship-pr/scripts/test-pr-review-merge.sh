@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Focused fixture tests for pr-review.sh's `merge`: the binding of the merge to the head the build
-# signal was read for, the refusals of a --require-green (close-out) merge (ludics-lite#39), and the
-# closing-keyword scan of the PR body that runs before the merge is issued (ludics-lite#227), and
-# the same scan over the messages of the PR's commit series (ludics-lite#296).
+# signal was read for, the refusals of a --require-green (close-out) merge (ludics-lite#39), what an
+# --override waives and what it leaves to --wait (ludics-lite#392), and the closing-keyword scan of
+# the PR body that runs before the merge is issued (ludics-lite#227), and the same scan over the
+# messages of the PR's commit series (ludics-lite#296).
 # The build signal itself is stubbed; the gate's own behaviour is test-pr-review-checks-absent.sh's.
 
 set -euo pipefail
@@ -30,6 +31,8 @@ CALLS_FILE="$TEST_ROOT/calls"
 
 CURRENT_HEAD=head-sha
 SKIPS_ONLY=""                          # the head's checks all skipped/neutral
+CHECK_ROWS=""                          # nonempty = build_checks' rows (class, name, conclusion, url)
+CHECK_ROWS_LATER=""                    # nonempty = the rows from the SECOND build_checks read on
 NO_CHECKS=""                           # the head carries no build check at all
 RUN_REASON="every run for the head finished and was judged" # what the run list settled on
 MERGE_STATE="merged=true state=MERGED" # what REST says after the merge call
@@ -66,7 +69,13 @@ SERIES_FAIL=""                         # nonempty = the commits read answers wit
 # they print, they do not set variables.
 stub build_checks run_signal warn_base_drift
 build_checks() {
-  if [ -n "$NO_CHECKS" ]; then
+  local reads
+  reads=$(fixture_call_count checks) || return 1
+  if [ -n "$CHECK_ROWS_LATER" ] && [ "$reads" -ge 2 ]; then
+    printf '%s\n' "$CHECK_ROWS_LATER"
+  elif [ -n "$CHECK_ROWS" ]; then
+    printf '%s\n' "$CHECK_ROWS"
+  elif [ -n "$NO_CHECKS" ]; then
     : # a head with no build check at all: the run list alone decides
   elif [ -n "$SKIPS_ONLY" ]; then
     printf 'green\tci\tskipped\thttps://example/run\ngreen\tdocs\tneutral\thttps://example/run2\n'
@@ -75,7 +84,7 @@ build_checks() {
   fi
   return 0
 }
-run_signal() { printf '0\t%s\n' "$RUN_REASON"; return 0; }
+run_signal() { printf '0\t\t%s\n' "$RUN_REASON"; return 0; }
 warn_base_drift() { printf 'CALL warn_base_drift\n' >>"$CALLS_FILE"; }
 
 gh() {
@@ -231,6 +240,8 @@ assert_no_merge_call() {
 reset() {
   CURRENT_HEAD=head-sha
   SKIPS_ONLY=""
+  CHECK_ROWS=""
+  CHECK_ROWS_LATER=""
   NO_CHECKS=""
   RUN_REASON="every run for the head finished and was judged"
   MERGE_STATE="merged=true state=MERGED"
@@ -362,6 +373,103 @@ test_superseded_head_never_merges() {
   run_merge --wait=30 --allow-no-verdict --override 'unrelated red on base'
   assert_eq "$MERGE_RC" 5 "superseded refuses even both verdict overrides"
   assert_contains "$MERGE_OUTPUT" "SUPERSEDED" "refusal names the transition"
+  assert_no_merge_call
+}
+
+# ludics-lite#392. An override waives the reds the gate read when it was given, and nothing else:
+# lukstafi/ocannl-staging#776 merged over an unrelated ubuntu red while its macOS leg was still
+# RUNNING. One red plus one in-flight check is the issue's own fixture.
+OVERRIDE_WHY='the ubuntu red is a pidfile race in an unrelated benchmark test'
+# One build_checks row: <class> <name> <concl> [<check suite id>, default 1].
+row() { printf '%s\t%s\t%s\thttps://example/%s\t%s' "$1" "$2" "$3" "$2" "${4:-1}"; }
+
+test_an_override_waits_for_a_check_still_running() {
+  reset
+  retune CHECKS_INTERVAL=1
+  CHECK_ROWS="$(row red ubuntu failure)"$'\n'"$(row pending macos pending)"
+  # The control: a red with nothing else outstanding is what the override is for.
+  CHECK_ROWS_LATER="$(row red ubuntu failure)"$'\n'"$(row green macos success)"
+  run_merge
+  assert_eq "$MERGE_RC" 1 "the red refuses without an override ($MERGE_OUTPUT)"
+  assert_no_merge_call
+  # Without --wait: the red is waived, the running leg is not, and it is named.
+  CHECK_ROWS_LATER=""
+  run_merge --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 4 "a check still running is no verdict, override or not ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "running  macos (no verdict yet)" "the refusal names the running check"
+  assert_contains "$MERGE_OUTPUT" "ubuntu (failure — WAIVED" "and marks the red it does waive"
+  assert_contains "$MERGE_OUTPUT" "no override covers it" "saying the override is not the flag for it"
+  assert_not_contains "$MERGE_OUTPUT" "OVERRIDE:" "nothing is announced as merged over"
+  assert_no_merge_call
+  # Under --wait: held until the leg has its verdict, then merged over the waived red alone.
+  CHECK_ROWS_LATER="$(row red ubuntu failure)"$'\n'"$(row green macos success)"
+  run_merge --wait=30 --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 0 "the leg went green, so the waived red is the only red ($MERGE_OUTPUT)"
+  assert_eq "$(fixture_call_total checks)" 2 "the gate read the checks again after the first read"
+  assert_contains "$MERGE_OUTPUT" "RED, WAIVED" "the verdict says the red was waived"
+  assert_contains "$MERGE_OUTPUT" "OVERRIDE: merging example/repo#7 over a RED build signal — $OVERRIDE_WHY" \
+    "the override is announced with its reason"
+  assert_contains "$MERGE_CALLS" "--match-head-commit head-sha " "and the merge is bound to the gated head"
+  # Both flags are both facts: merging unread over the running leg also announces the waived red.
+  CHECK_ROWS_LATER=""
+  run_merge --override "$OVERRIDE_WHY" --allow-no-verdict
+  assert_eq "$MERGE_RC" 0 "--allow-no-verdict is still the flag for a missing verdict ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "ALLOW-NO-VERDICT:" "the unread merge is announced"
+  assert_contains "$MERGE_OUTPUT" "OVERRIDE: merging" "and so is the red it goes over"
+  # ...in its own terms: with a red beside the unjudged leg, "nothing has failed" is false.
+  assert_not_contains "$MERGE_OUTPUT" "nothing has failed, nothing has passed" "the unread-merge line does not deny the red"
+  assert_contains "$MERGE_OUTPUT" "this is not 'nothing has failed'" "it says a red stands beside it"
+}
+
+# The waived set is the FIRST read's, not the one re-read after the wait: a check that turns red
+# during it is a red nobody gave the override for, and it refuses as a plain red does.
+test_a_check_that_turns_red_during_the_wait_is_not_waived() {
+  reset
+  retune CHECKS_INTERVAL=1
+  CHECK_ROWS="$(row red ubuntu failure)"$'\n'"$(row pending macos pending)"
+  CHECK_ROWS_LATER="$(row red ubuntu failure)"$'\n'"$(row red macos failure)"
+  run_merge --wait=30 --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 1 "a red after the first read is not waived ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "  RED      macos (failure)  " "the new red is listed as a plain red"
+  assert_contains "$MERGE_OUTPUT" "ubuntu (failure — WAIVED" "beside the one that was waived"
+  assert_contains "$MERGE_OUTPUT" "RED that --override did not" "the refusal says the override does not reach it"
+  assert_not_contains "$MERGE_OUTPUT" "OVERRIDE: merging" "nothing is announced as merged over"
+  assert_no_merge_call
+  # A waived check that is re-run is waited for while it runs, and stays waived by name.
+  CHECK_ROWS="$(row red ubuntu failure)"$'\n'"$(row green macos success)"
+  CHECK_ROWS_LATER="$(row pending ubuntu pending)"$'\n'"$(row green macos success)"
+  run_merge --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 0 "the first read's red alone is waived at once ($MERGE_OUTPUT)"
+  CHECK_ROWS="$(row pending ubuntu pending)"$'\n'"$(row green macos success)"
+  CHECK_ROWS_LATER="$(row red ubuntu failure)"$'\n'"$(row green macos success)"
+  run_merge --wait=30 --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 1 "a check with no verdict at the first read was never waived ($MERGE_OUTPUT)"
+  assert_no_merge_call
+  # A name is not an identity: two workflows can each run a job called `build`, and one's red
+  # must not waive the other's later failure (review round 1). The key is the suite AND the name.
+  CHECK_ROWS="$(row red build failure 1)"$'\n'"$(row pending build pending 2)"
+  CHECK_ROWS_LATER="$(row red build failure 1)"$'\n'"$(row red build failure 2)"
+  run_merge --wait=30 --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 1 "the other workflow's same-named check was not waived ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "  RED      build (failure)  " "it is listed as a plain red"
+  assert_contains "$MERGE_OUTPUT" "build (failure — WAIVED" "beside the one that was waived"
+  assert_no_merge_call
+  # Nor is suite-and-name always unique: two jobs of ONE workflow may share a name, and nothing
+  # tells which of the pair a re-run replaced (review rounds 3 and 4). A red under such a key is
+  # never waived: refused at the first read, before any wait.
+  CHECK_ROWS="$(row red build failure 1)"$'\n'"$(row pending build pending 1)"
+  CHECK_ROWS_LATER="$(row green build success 1)"$'\n'"$(row red build failure 1)"
+  run_merge --wait=30 --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 1 "a red with a same-named twin is not waived ($MERGE_OUTPUT)"
+  assert_eq "$(fixture_call_total checks)" 1 "refused at the first read, without waiting"
+  assert_not_contains "$MERGE_OUTPUT" "— WAIVED" "neither row of the ambiguous key is waived"
+  assert_no_merge_call
+  # And a waived key that comes to name two rows after the first read is waived no longer.
+  CHECK_ROWS="$(row red build failure 1)"$'\n'"$(row pending macos pending 1)"
+  CHECK_ROWS_LATER="$(row red build failure 1)"$'\n'"$(row red build failure 1)"$'\n'"$(row green macos success 1)"
+  run_merge --wait=30 --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 1 "a second row under a waived key un-waives it ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "— WAIVED" "neither row is waived"
   assert_no_merge_call
 }
 
@@ -1706,6 +1814,8 @@ tests=(
   test_require_green_disables_a_deferred_auto_merge
   test_require_green_refuses_a_merge_queue
   test_a_paths_ignored_head_merges_on_the_recognized_absence
+  test_an_override_waits_for_a_check_still_running
+  test_a_check_that_turns_red_during_the_wait_is_not_waived
   test_one_sentence_closing_two_issues_warns
   test_a_closing_keyword_in_a_quoted_or_fenced_line_warns
   test_the_prescribed_shape_stays_silent

@@ -304,7 +304,7 @@ gh() {
 run_gate() {
   local capture rc
   set +e
-  capture=$(gate_checks 7 "${1:-0}" 2>&1)
+  capture=$(gate_checks 7 "${1:-0}" ${2:+"$2"} 2>&1)
   rc=$?
   set -e
   GATE_OUTPUT="$capture"
@@ -1284,6 +1284,92 @@ test_non_advisory_job_failure_is_a_red_run() {
   assert_contains "$GATE_OUTPUT" "ci (failure)" "the red run should be named"
 }
 
+# ludics-lite#392: what merge --override hands the gate. A waived leg's run concludes `failure` once
+# its sibling finishes, and its job is the waived check by name, so the run's red is explained, as
+# an advisory job's is; the verdict is the waiver's, not a run-level red nobody named. The second
+# half is the control: the same leg with no waiver is a plain red at the first read.
+test_a_waived_leg_does_not_redden_its_run() {
+  local suite
+  # The job is joined to its check through the run's check suite, so the same job name in ANOTHER
+  # suite explains nothing: with the run in suite 22, its red stands (review round 1).
+  for suite in 11 22; do
+    reset_fixture
+    CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u","check_suite":{"id":11}},
+                                          {"name":"macos","conclusion":null,"html_url":"m","check_suite":{"id":11}}]')"
+      "$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u","check_suite":{"id":11}},
+                           {"name":"macos","conclusion":"success","html_url":"m","check_suite":{"id":11}}]')")
+    RUNS_SEQ=("$(runs_json "$(jq -cn --argjson s "$suite" '[{name:"ci",status:"in_progress",check_suite_id:$s}]')")"
+      "$(runs_json "$(jq -cn --argjson s "$suite" '[{name:"ci",status:"completed",conclusion:"failure",check_suite_id:$s}]')")")
+    JOBS_JSON=$(jobs_json '[{"name":"ubuntu","conclusion":"failure"},
+                            {"name":"macos","conclusion":"success"}]')
+    run_gate 30 waive
+    assert_eq "$GATE_RC" 1 "a waived red is still a red to the gate (run in suite $suite)"
+    assert_contains "$GATE_OUTPUT" "ubuntu (failure — WAIVED" "the waived check is marked (run in suite $suite)"
+    if [ "$suite" = 11 ]; then
+      assert_contains "$GATE_OUTPUT" ": RED, WAIVED" "the only red is the one waived at the first read"
+      assert_not_contains "$GATE_OUTPUT" "concluded red with no build check" "its run is not a red of its own"
+    else
+      assert_contains "$GATE_OUTPUT" "concluded red with no build check" "another suite's job name explains nothing"
+    fi
+  done
+  # A poll whose check list momentarily lacks the waived row still reads the run's red: it is a
+  # waived red, never a green (review round 5) — --require-green and the OVERRIDE record rest on it.
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u","check_suite":{"id":11}},
+                                        {"name":"macos","conclusion":null,"html_url":"m","check_suite":{"id":11}}]')"
+    "$(check_runs_json '[{"name":"macos","conclusion":"success","html_url":"m","check_suite":{"id":11}}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"in_progress","check_suite_id":11}]')"
+    "$(runs_json '[{"name":"ci","status":"completed","conclusion":"failure","check_suite_id":11}]')")
+  JOBS_JSON=$(jobs_json '[{"name":"ubuntu","conclusion":"failure"},
+                          {"name":"macos","conclusion":"success"}]')
+  run_gate 30 waive
+  assert_eq "$GATE_RC" 1 "the run is still red"
+  assert_contains "$GATE_OUTPUT" ": RED, WAIVED" "a waived red, not a green"
+  assert_contains "$GATE_OUTPUT" "workflow run ci (red through a check above that is WAIVED)" "naming the run"
+  assert_not_contains "$GATE_OUTPUT" ": green" "never a green"
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u"},
+                                        {"name":"macos","conclusion":null,"html_url":"m"}]')")
+  run_gate 30
+  assert_eq "$GATE_RC" 1 "without a waiver the red is a verdict at once"
+  assert_contains "$GATE_OUTPUT" ": RED — 1 of 2" "and it headlines as a plain red"
+}
+
+# A run-level red (no check to show for it) at the first read is waived by the run's name; one that
+# appears after it is not. Nothing here explains a run from its jobs: the job list is empty, the
+# startup_failure shape.
+test_a_run_level_red_is_waived_only_from_the_first_read() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"build","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"pages","status":"completed","conclusion":"startup_failure"},
+                           {"name":"ci","status":"completed","conclusion":"success"}]')")
+  run_gate 0 waive
+  assert_eq "$GATE_RC" 1 "a waived run-level red is still a red"
+  assert_contains "$GATE_OUTPUT" ": RED, WAIVED" "the waiver covers it"
+  assert_contains "$GATE_OUTPUT" "workflow run pages (no build check behind it — WAIVED" "and names it"
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"build","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"pages","status":"completed","conclusion":"startup_failure"},
+                           {"name":"ci","status":"in_progress"}]')"
+    "$(runs_json '[{"name":"pages","status":"completed","conclusion":"startup_failure"},
+                   {"name":"ci","status":"completed","conclusion":"failure"}]')")
+  run_gate 30 waive
+  assert_eq "$GATE_RC" 1 "a run that went red during the wait is a red"
+  assert_contains "$GATE_OUTPUT" ": RED — 1 workflow run(s)" "a plain run-level red, not a waived one"
+  assert_contains "$GATE_OUTPUT" "ci (failure)" "naming the run that was not waived"
+  # The waiver is the INVOCATION's, not its workflow's: a second dispatch of the same workflow and
+  # event, running at the first read and red after it, is a run nobody read (review round 2).
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"build","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"id":202,"workflow_id":7,"event":"workflow_dispatch","name":"pages","status":"in_progress"},
+                           {"id":201,"workflow_id":7,"event":"workflow_dispatch","name":"pages","status":"completed","conclusion":"startup_failure"}]')"
+    "$(runs_json '[{"id":202,"workflow_id":7,"event":"workflow_dispatch","name":"pages","status":"completed","conclusion":"startup_failure"},
+                   {"id":201,"workflow_id":7,"event":"workflow_dispatch","name":"pages","status":"completed","conclusion":"startup_failure"}]')")
+  run_gate 30 waive
+  assert_eq "$GATE_RC" 1 "the later dispatch's red is a red"
+  assert_contains "$GATE_OUTPUT" ": RED — 1 workflow run(s)" "not waived by the earlier dispatch's red"
+}
+
 # A red this cannot disprove stands: no jobs at all is the startup_failure shape, and an
 # unreadable job list is not evidence of innocence.
 test_unreadable_jobs_keep_the_red() {
@@ -1412,6 +1498,8 @@ tests=(
   test_completed_run_without_a_conclusion_is_unjudged
   test_advisory_job_failure_is_not_a_red_run
   test_non_advisory_job_failure_is_a_red_run
+  test_a_waived_leg_does_not_redden_its_run
+  test_a_run_level_red_is_waived_only_from_the_first_read
   test_unreadable_jobs_keep_the_red
   test_wait_holds_until_the_checks_appear
   test_wait_ceiling_with_a_queued_run_is_no_verdict
