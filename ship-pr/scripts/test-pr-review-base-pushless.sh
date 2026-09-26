@@ -553,6 +553,85 @@ test_interim_reconfirms_the_tip() {
   assert_not_contains "$BASE_OUTPUT" "no interim verdict" "so it is the re-confirm that refused it"
 }
 
+# A workflow with no push run on the branch at all is outside the fold, so the tip may have just
+# added it, its first run on the way — and the PR head need not have run a push-only workflow
+# (review round 1). The interim waits out that creation window, from the tip's own run's creation,
+# unless the workflow's file at the tip shows it cannot run on push.
+test_interim_waits_out_a_workflow_the_tip_may_have_added() {
+  local now_iso
+  now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  burst_fixture "$(jq -cn --arg c "$SHA_C" --arg n "$now_iso" \
+    '[{status:"in_progress", conclusion:null, head_sha:$c, id:7401, created_at:$n},
+      {conclusion:"cancelled", head_sha:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", id:7400}]')"
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"nightly"}]')
+  RUNS_2=$(runs_json 2 '[]')
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "a fresh tip with a workflow that may run on push and has no run is pending"
+  assert_contains "$BASE_OUTPUT" "(no interim verdict for ci: nightly may run on push and has no run on $BRANCH yet, and the tip is" \
+    "and says which workflow it is waiting out"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "no source is asked while the window is open"
+  # Its file at the tip names no push: it cannot be the newcomer, and the interim answers.
+  WORKFLOW_PATH_2=".github/workflows/nightly.yml"
+  YAML_OF_nightly="$PUSHLESS_YAML"
+  run_base --interim
+  assert_eq "$BASE_RC" 0 "a workflow that cannot run on push holds nothing"
+  assert_contains "$BASE_OUTPUT" "green, interim (tip ${SHA_C:0:8}; ci still running at the tip" "the interim answers"
+  # And a tip older than the window: whatever the newcomer is, its first run would be here by now.
+  burst_fixture "$BURST_RUNS"
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"nightly"}]')
+  RUNS_2=$(runs_json 2 '[]')
+  run_base --interim
+  assert_eq "$BASE_RC" 0 "a tip past the creation window is not waiting on a newcomer"
+}
+
+# The tip's runs are read again after the source, each by its id: one that finished meanwhile is
+# the tip's own verdict, never "still running" under an interim green (review round 1). A plain
+# read goes round once more to fold it; a wait folds it on its next round.
+test_interim_rereads_the_tips_run_after_the_source() {
+  local wait
+  for wait in "" --wait=2; do
+    burst_fixture "$BURST_RUNS"
+    RUN_7301='{"id":7301,"status":"completed","conclusion":"failure"}'
+    run_base --interim ${wait:+"$wait"}
+    assert_eq "$BASE_RC" 4 "a tip run that finished during the read gets no interim ($wait)"
+    assert_not_contains "$BASE_OUTPUT" "green, interim" "and no green says it is still running"
+    assert_contains "$BASE_OUTPUT" "the tip's run of ci finished while the source was read" "and says why"
+  done
+  burst_fixture "$BURST_RUNS"
+  RUN_7301='{"id":7301,"status":"completed","conclusion":"failure"}'
+  run_base --interim
+  assert_eq "$(rounds_polled)" 2 "the plain read went round once more to fold what finished"
+}
+
+# An integration record at the tip judged the tip's own tree: under --interim a failed one is the
+# tip's RED even while its push run is going, as it is everywhere else here (review round 1), and
+# a passed one is an interim green naming the record.
+test_interim_takes_a_record_at_the_tip() {
+  local file
+  burst_fixture "$BURST_RUNS"
+  file=$(records "$SHA_C	fail	w-integration-9	2026-09-26T09:00:00+00:00")
+  run_base --interim --integration-records "$file"
+  assert_eq "$BASE_RC" 1 "a failed record at the tip is its red"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH is RED" "headlined as red"
+  assert_contains "$BASE_OUTPUT" "RED      ci — its push run is still in flight, but source (b): integration record w-integration-9 ran the tip ${SHA_C:0:8} and concluded fail" \
+    "naming the record"
+  burst_fixture "$BURST_RUNS"
+  file=$(records "$SHA_C	fail	w-integration-9	2026-09-26T09:00:00+00:00")
+  run_base --interim --wait=4 --integration-records "$file"
+  assert_eq "$BASE_RC" 1 "and under --wait it ends the wait"
+  assert_eq "$(rounds_polled)" 1 "on the round that read it"
+  burst_fixture "$BURST_RUNS"
+  file=$(records "$SHA_C	pass	w-integration-8	2026-09-26T09:00:00+00:00")
+  run_base --interim --integration-records "$file"
+  assert_eq "$BASE_RC" 0 "a passed record at the tip is an interim green"
+  assert_contains "$BASE_OUTPUT" "judged meanwhile by integration record w-integration-8" "naming it"
+  # Without --interim the record is not read for a push workflow at all, as before.
+  burst_fixture "$BURST_RUNS"
+  file=$(records "$SHA_C	fail	w-integration-9	2026-09-26T09:00:00+00:00")
+  run_base --integration-records "$file"
+  assert_eq "$BASE_RC" 4 "without --interim a push tip in flight is pending"
+}
+
 tests=(
   test_a_clean_merge_of_a_green_head_is_green_by_the_named_source
   test_a_tip_no_source_covers_is_no_verdict_never_the_old_green
@@ -577,6 +656,9 @@ tests=(
   test_interim_without_a_green_source_stays_pending
   test_interim_is_not_asked_outside_its_shape
   test_interim_reconfirms_the_tip
+  test_interim_waits_out_a_workflow_the_tip_may_have_added
+  test_interim_rereads_the_tips_run_after_the_source
+  test_interim_takes_a_record_at_the_tip
 )
 
 run_tests "${tests[@]}"

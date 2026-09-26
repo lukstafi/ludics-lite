@@ -179,6 +179,19 @@ jobs_json() { jq -cn --argjson jobs "$1" '{jobs: $jobs}'; }
 # The canned answer for one key, empty when the case set none: `runs_of 2` reads RUNS_2, `jobs_of
 # 3003` reads JOBS_3003 and falls back to JOBS_DEFAULT.
 runs_of() { eval "printf '%s' \"\${RUNS_$1:-}\""; }
+# run_of <run id>: RUN_<id> when a case set one, else that run's row from every RUNS_<n> set.
+run_of() {
+  local v all=""
+  eval "v=\"\${RUN_$1:-}\""
+  if [ -n "$v" ]; then
+    printf '%s' "$v"
+    return 0
+  fi
+  for v in $(set | LC_ALL=C sed -n 's/^\(RUNS_[0-9][0-9]*\)=.*/\1/p'); do
+    all="$all${!v}"
+  done
+  jq -cs --argjson id "$1" '[.[].workflow_runs[] | select(.id == $id)] | first // {}' <<<"$all"
+}
 jobs_of() { eval "printf '%s' \"\${JOBS_$1:-\$JOBS_DEFAULT}\""; }
 # One commit's changed files: keyed by the first character of its sha, which is what tells this
 # suite's commits apart (SHA_A, SHA_B, SHA_C, SHA_0 are runs of one character), falling back to
@@ -200,7 +213,7 @@ reset_fixture() {
   # Every RUNS_<n>/JOBS_<n> a previous case set is cleared, or a case that names none would be
   # served the last case's answers and pass for its neighbour's reasons.
   # Shell values can contain non-text bytes; only the ASCII variable names are parsed.
-  for v in $(set | LC_ALL=C sed -n 's/^\(RUNS_[0-9][0-9]*\)=.*/\1/p;s/^\(JOBS_[0-9][0-9]*\)=.*/\1/p'); do
+  for v in $(set | LC_ALL=C sed -n 's/^\(RUNS_[0-9][0-9]*\)=.*/\1/p;s/^\(JOBS_[0-9][0-9]*\)=.*/\1/p;s/^\(RUN_[0-9][0-9]*\)=.*/\1/p;s/^\(WORKFLOW_PATH_[0-9][0-9]*\)=.*/\1/p;s/^\(YAML_OF_[A-Za-z0-9_]*\)=.*/\1/p'); do
     [ "$v" = RUNS_1 ] || unset "$v"
   done
   JOBS_DEFAULT=$(jobs_json '[]')
@@ -284,11 +297,36 @@ gh() {
     rid=${rid%%/*}
     response=$(jobs_of "$rid")
     ;;
+  # One run by its id, as the interim's re-read after its source asks for it (ludics-lite#308):
+  # RUN_<id> when a case sets it (a run that finished meanwhile), else that run's row as the
+  # workflow's runs feed serves it.
+  "repos/$REPO/actions/runs/"[0-9]*)
+    rid=${FIXTURE_ENDPOINT#*/actions/runs/}
+    response=$(run_of "$rid")
+    ;;
   # The workflow's own file: where it lives, then what it says at the tip. The body is served
   # verbatim — the library asks for the raw media type rather than the base64 JSON, whose decoder
   # is spelled differently on this fleet's two platforms.
-  "repos/$REPO/actions/workflows/"*) response=$(jq -cn --arg p "$WORKFLOW_PATH" '{path: $p}') ;;
+  "repos/$REPO/actions/workflows/"*)
+    wid=${FIXTURE_ENDPOINT#*/actions/workflows/}
+    wid=${wid%%[!0-9]*}
+    response=""
+    [ -z "$wid" ] || eval "response=\"\${WORKFLOW_PATH_$wid:-}\""
+    response=$(jq -cn --arg p "${response:-$WORKFLOW_PATH}" '{path: $p}')
+    ;;
   "repos/$REPO/contents/.github/workflows?ref="*) response="$WORKFLOW_DIR" ;;
+  # A workflow of its own file, when a case names one: WORKFLOW_PATH_<id> for where the list says
+  # it lives, and YAML_OF_<basename> for what it says there. Every other workflow shares
+  # WORKFLOW_PATH and WORKFLOW_YAML.
+  "repos/$REPO/contents/.github/workflows/"*)
+    base=${FIXTURE_ENDPOINT#*/contents/.github/workflows/}
+    base=${base%%\?*}
+    base=${base%.y*ml}
+    case "$base" in *[!A-Za-z0-9_]*) base="" ;; esac
+    response=""
+    [ -z "$base" ] || eval "response=\"\${YAML_OF_$base:-}\""
+    [ -n "$response" ] || response="$WORKFLOW_YAML"
+    ;;
   "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
   "repos/$REPO/compare/"*)
     # Oldest first, so each commit's first parent is the one before it and the first commit's is
