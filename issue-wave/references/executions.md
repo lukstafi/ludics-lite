@@ -340,20 +340,21 @@ exact bounded command/batch, checkout and intended log path to the request file,
 `EXECUTION_REQUEST <absolute-path>`, and ends its turn without starting that execution.
 
 The coordinator observes the tracked `attach` exit, reads the file (over ssh when needed), and
-confirms through `status` and process evidence that the CLI has stopped. Queue the request until
-the execution host is available. Reserve it with `transport: "cli"` and the actual `agent_host`,
-then call `execution dispatch`. Only after successful dispatch, resume that same session with
-`fleet-worker.sh unstick <agent-box> <worker> --message <brief-file>`. The continuation names the
+confirms through `status` that the turn has ended: a Claude worker `IDLE`, a Codex exec exited.
+Queue the request until the execution host is available. Reserve it with `transport: "cli"` and
+the actual `agent_host`, then call `execution dispatch`. Only after successful dispatch, send the
+continuation with `fleet-worker.sh unstick <agent-box> <worker> --message <brief-file>` (an
+append to the idle Claude process, a resume of the Codex thread). The continuation names the
 request ID, assigned command/batch, revision, checkout, log and result paths; it instructs the
 worker to run only that assignment and return its actual runner handle, observed SHA, log and
-terminal outcome in the result file, then exit again before additional fleet work. Start a new
-tracked `attach` waiter and record the resume/runner evidence on the board.
+terminal outcome in the result file, then end its turn again before additional fleet work.
+Start a new tracked `attach` waiter and record the unstick/runner evidence on the board.
 
-Dispatch preceding the resume is a point-in-time gate just as it precedes an ssh runner call.
-If resume fails or its outcome is unclear, retain ownership and reconcile whether anything
-started; never blindly dispatch or resume twice. When the result turn ends, verify actual runner
-termination and conclude with its evidence before resuming ordinary implementation/review. A
-`DONE` turn carrying a request or a result is a handoff, not issue completion (SKILL.md,
+Dispatch preceding the unstick is a point-in-time gate just as it precedes an ssh runner call.
+If the unstick fails or its outcome is unclear, retain ownership and reconcile whether anything
+started; never blindly dispatch or unstick twice. When the result turn ends, verify actual runner
+termination and conclude with its evidence before resuming ordinary implementation/review. An
+`IDLE` or `DONE` turn carrying a request or a result is a handoff, not issue completion (SKILL.md,
 Supervise: *A returned turn means the turn ended*). A new execution needs a new request and
 reservation. CLI workers never mutate the coordinator lease or reservation registry themselves.
 
