@@ -700,6 +700,19 @@ for verdict in 3 4; do
   expect "triage cannot override unknown $verdict" 1 "dispatch blocked" -- env SHIM_BASE_RC="$verdict" "$FW" gate --target-repo example/project --force --allow-red-base fix
 done
 expect "missing helper refuses with unknown diagnostic" 1 "checker missing" -- env SHIM_BASE_RC=0 bash -c 'mv "$1" "$1.saved"; "$2" gate --target-repo example/project; rc=$?; mv "$1.saved" "$1"; exit "$rc"' _ "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" "$FW"
+# Installed, the script is reached through ~/.claude/skills/issue-wave, a symlink: ship-pr's helper
+# is found from the checkout the link points into, not beside the link, so a skills directory that
+# holds no ship-pr link of its own still reaches it. A plain `cd` passes that alone -- bash retries a
+# logical path that does not exist as a physical one -- so the decoy is what tells the two apart: a
+# ship-pr beside the link that is some other checkout's, which a collapsed `..` would find first.
+mkdir -p "$TMP/lone-skills" && ln -s "$TMP/dispatcher/issue-wave" "$TMP/lone-skills/issue-wave"
+expect "the gate finds ship-pr's helper through an issue-wave symlink alone" 0 "BASE GREEN" -- \
+  "$TMP/lone-skills/issue-wave/scripts/fleet-worker.sh" gate --target-repo example/project --base-branch topic
+mkdir -p "$TMP/lone-skills/ship-pr/scripts" && printf '#!/usr/bin/env bash\necho "DECOY CHECKER"; exit 1\n' > "$TMP/lone-skills/ship-pr/scripts/pr-review.sh" &&
+  chmod +x "$TMP/lone-skills/ship-pr/scripts/pr-review.sh" || ko "could not plant the decoy ship-pr (setup)"
+expect "...and from that checkout, not from a ship-pr beside the link" 0 "BASE GREEN" -- \
+  "$TMP/lone-skills/issue-wave/scripts/fleet-worker.sh" gate --target-repo example/project --base-branch topic
+grep -q "DECOY" <<<"$out" && ko "the gate read the decoy checker beside the link: $out" || ok "...and the decoy was never read"
 grep -Fxq -- '--repo example/project base topic --wait=360 --interim grace=300 interval=60' "$BASE_CALL_LOG" && ok "explicit native branch passed to coordinator helper" || ko "native branch lost"
 grep -Fxq -- '--repo example/project base master --wait=360 --interim grace=300 interval=60' "$BASE_CALL_LOG" && ok "worktree base branch passed to coordinator helper" || ko "worktree base lost"
 # The value itself, and the relation behind it: 360 is 300 + 60, a whole round of margin over the

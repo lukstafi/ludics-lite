@@ -242,6 +242,11 @@ TMUX_SOCKET="${FLEET_TMUX_SOCKET:-}"
 FLOTILLA="${FLEET_FLOTILLA:-http://mac-studio:7799}"
 PRS_LIMIT="${FLEET_PRS_LIMIT:-1000}"
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
+# The skills checkout this script belongs to, by its physical path: the script is reached through
+# the ~/.claude/skills/issue-wave symlink, and a plain `cd ..` collapses the symlink's own path
+# rather than leaving its target, which finds a sibling skill only while that one is a symlink too.
+# Every lookup outside issue-wave/ (ship-pr's pr-review.sh, the lab's wake-lab.sh) starts here.
+CHECKOUT=$(CDPATH='' cd -P "$(dirname "$0")/../.." 2>/dev/null && pwd -P)
 
 die() { echo "fleet-worker.sh: $*" >&2; exit 2; }
 
@@ -1091,7 +1096,7 @@ base_gate() {
   [[ "$target" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "base gate: --target-repo <owner/repo> required"
   [ -z "$reason" ] || [ "$force" -eq 1 ] || die "base gate: --allow-red-base requires --force for a triage worker"
   case "$branch" in -*|*$'\n'*) die "base gate: invalid --base-branch" ;; esac
-  helper="$(cd "$(dirname "$0")/../../ship-pr/scripts" 2>/dev/null && pwd)/pr-review.sh"
+  helper="$CHECKOUT/ship-pr/scripts/pr-review.sh"
   [ -x "$helper" ] || { echo "BASE REFUSED: coordinator base checker missing: $helper" >&2; return 1; }
   # The ordinary base read may carry an older green while the tip is running.
   # Reuse its bounded integration mode; preserve the established absence grace
@@ -1959,7 +1964,7 @@ cmd_prs() {
   [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "prs: <owner/repo> required"
   [[ "$flag" =~ ^[1-9][0-9]*$ ]] || die "prs: --flag-at takes a positive number of rounds"
   [[ "$PRS_LIMIT" =~ ^[1-9][0-9]*$ ]] || die "prs: FLEET_PRS_LIMIT must be a positive number of PRs"
-  helper="$(cd "$(dirname "$0")/../../ship-pr/scripts" 2>/dev/null && pwd)/pr-review.sh"
+  helper="$CHECKOUT/ship-pr/scripts/pr-review.sh"
   [ -x "$helper" ] || { echo "PRS REFUSED: ship-pr's pr-review.sh missing: $helper"; exit 1; }
   if [ -n "$wave" ]; then
     list=$(execution_listing "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"); rc=$?
@@ -2655,8 +2660,7 @@ EXECUTION_COMMAND
 # that refuses its own map refuses the reservation: a map that is there and wrong is a defect to fix.
 endpoint_map() {
   local wake out
-  # cd -P: `..` must leave the skill symlink's TARGET, not collapse the symlink's own path.
-  wake="$(cd -P "$(dirname "$0")/../.." && pwd -P)/scripts/wake-lab.sh"
+  wake="$CHECKOUT/scripts/wake-lab.sh"
   if [ ! -f "$wake" ]; then
     printf '%s\n' "EXECUTION WARNING: no endpoint map ($wake is missing): FLEET_BOXES is not checked for two aliases of one box" >&2
     return 0
