@@ -1342,6 +1342,17 @@ test_a_run_level_red_is_waived_only_from_the_first_read() {
   assert_eq "$GATE_RC" 1 "a run that went red during the wait is a red"
   assert_contains "$GATE_OUTPUT" ": RED — 1 workflow run(s)" "a plain run-level red, not a waived one"
   assert_contains "$GATE_OUTPUT" "ci (failure)" "naming the run that was not waived"
+  # The waiver is the INVOCATION's, not its workflow's: a second dispatch of the same workflow and
+  # event, running at the first read and red after it, is a run nobody read (review round 2).
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"build","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"id":202,"workflow_id":7,"event":"workflow_dispatch","name":"pages","status":"in_progress"},
+                           {"id":201,"workflow_id":7,"event":"workflow_dispatch","name":"pages","status":"completed","conclusion":"startup_failure"}]')"
+    "$(runs_json '[{"id":202,"workflow_id":7,"event":"workflow_dispatch","name":"pages","status":"completed","conclusion":"startup_failure"},
+                   {"id":201,"workflow_id":7,"event":"workflow_dispatch","name":"pages","status":"completed","conclusion":"startup_failure"}]')")
+  run_gate 30 waive
+  assert_eq "$GATE_RC" 1 "the later dispatch's red is a red"
+  assert_contains "$GATE_OUTPUT" ": RED — 1 workflow run(s)" "not waived by the earlier dispatch's red"
 }
 
 # A red this cannot disprove stands: no jobs at all is the startup_failure shape, and an

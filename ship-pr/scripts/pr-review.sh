@@ -3390,9 +3390,11 @@ is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }
 #                 in its suite with the same name (pr-review-api-contract.sh pins filter=latest's
 #                 superseded attempt as a newer row of the same suite and name); were that ever
 #                 to move, the re-run would be refused, the loud direction.
-#   run:<workflow id>/<event>  a non-advisory workflow run that was red at the first read with no
-#                 check to show for it (run_signal's run-level red), by the key run_signal folds
-#                 runs on: the workflow file and the event that triggered it.
+#   run:<run id>  a non-advisory workflow run that was red at the first read with no check to show
+#                 for it (run_signal's run-level red), by the INVOCATION: a re-run keeps its run
+#                 id (run_attempt bumps), while another dispatch of the same workflow and event is
+#                 a new run nobody read. The fold's workflow-and-event key would have handed the
+#                 waiver on to that one when it finished red (review round 2).
 # A job of a completed red run is the check of the same name in that run's suite (the contract pins
 # that join too), so run_red_is_advisory_only reads a job whose `check:<suite>/<name>` is waived as
 # explained, exactly as it reads an advisory job: otherwise the waived leg's run concludes
@@ -3563,8 +3565,8 @@ summarize_checks() {
 #
 # Prints "<red count><TAB><waived runs><TAB><reason>" — a count, because gate_checks reports through
 # CHECK_RED and a command substitution cannot hand it back a variable; and the red runs an
-# override's waiver took out of that count (see is_waived), one "<workflow id>/<event> <name>" per
-# line and empty outside an override, because the recording read has to add them to WAIVED in gate_checks' own shell — and
+# override's waiver took out of that count (see is_waived), one "<run id> <name>" per line and empty
+# outside an override, because the recording read has to add them to WAIVED in gate_checks' own shell — and
 # returns
 #   1  RED at the run level: a non-advisory run for this head concluded red with no check behind
 #      it. A red is a verdict, so it ends a --wait like any other.
@@ -3628,7 +3630,7 @@ run_red_is_advisory_only() {
 run_signal() {
   local sha="$1" pr_at="${2:-}" checks="${3:-0}" base_sha="${4:-}" head_ref="${5:-}" pr="${6:-}"
   local raw rc rid wid event name status concl suite
-  local seen_ids=" " red_rows="" rname rconcl rwid revent rsuite created
+  local seen_ids=" " red_rows="" rname rconcl rsuite created
   local runs=0 inflight=0 nogo=0 red=0 red_note="" pushed_at age seen waived_runs=""
   raw=$(gh_retry read api --paginate \
     "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
@@ -3690,21 +3692,20 @@ run_signal() {
     seen_ids="$seen_ids$wid/$event "
     runs=$((runs + 1))
     case "$(conclusion_class "$concl")" in
-    red) red_rows="${red_rows}${rid}"$'\t'"${name}"$'\t'"${concl}"$'\t'"${wid}"$'\t'"${event}"$'\t'"${suite:--}"$'\n' ;;
+    red) red_rows="${red_rows}${rid}"$'\t'"${name}"$'\t'"${concl}"$'\t'"${suite:--}"$'\n' ;;
     nogo) nogo=$((nogo + 1)) ;;
     esac
   done <<<"$raw"
   # Each red run gets the advisory-job read before it counts — one call, only ever for a run that
   # is already red, and only when no check run reported that failure.
   if [ -n "$red_rows" ]; then
-    while IFS=$'\t' read -r rid rname rconcl rwid revent rsuite; do
+    while IFS=$'\t' read -r rid rname rconcl rsuite; do
       [ -n "$rid" ] || continue
       run_red_is_advisory_only "$rid" "$rsuite" && continue
       # Under an override, a run-level red it waives (or, on the recording read, every one there
-      # is) is handed back to gate_checks as "<workflow id>/<event> <name>" and not counted
-      # (ludics-lite#392). The key is the fold's own: one workflow file under one event.
-      if [ "$GATE_WAIVE" = record ] || { [ "$GATE_WAIVE" = apply ] && is_waived "run:$rwid/$revent"; }; then
-        waived_runs="${waived_runs}${rwid}/${revent} ${rname}"$'\n'
+      # is) is handed back to gate_checks as "<run id> <name>" and not counted (ludics-lite#392).
+      if [ "$GATE_WAIVE" = record ] || { [ "$GATE_WAIVE" = apply ] && is_waived "run:$rid"; }; then
+        waived_runs="${waived_runs}${rid} ${rname}"$'\n'
         continue
       fi
       red=$((red + 1))
