@@ -78,6 +78,10 @@ failure_body() { # <the ref the reviewer could not fetch>
     'Codex Review: Something went wrong. Try again later by commenting “@codex review”.' "$1"
 }
 
+# The connector's other way of not starting, verbatim from ludics-lite#420 (issuecomment-5846369911,
+# 2026-09-26): no ref, no findings, no "Codex Review:" prefix (ludics-lite#421).
+ENV_FAILURE_BODY='To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).'
+
 run_rounds() {
   local capture rc
   set +e
@@ -238,6 +242,64 @@ test_initialization_failures_are_not_rounds() {
     "a finding that mentions the wording is still a finding"
 }
 
+# #420's shape: the missing-environment answer is no more a round than the failed fetch. Before
+# ludics-lite#421 it counted as one comment-shaped round, over a PR the reviewer had not read.
+test_the_missing_environment_is_not_a_round() {
+  set_reviews
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z "$ENV_FAILURE_BODY")"
+  ROUND_THRESHOLD=12
+  run_rounds
+  assert_eq "$ROUNDS_RC" 0 "a count that was read is exit 0"
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 0 of 12" \
+    "a review that never started carries no findings"
+  # Beside the round the nudge got, it still adds nothing.
+  set_reviews "$(review "$REVIEWER" COMMENTED aaaa 2026-09-26T13:05:00Z)"
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z "$ENV_FAILURE_BODY")"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "the nudged round is the only round"
+  # The negative control: a comment-only round that QUOTES the sentence below its opening is a round.
+  set_reviews
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
+    "$(printf 'Codex Review: P2 — the connector answered\n\n> %s\n\nand this reads it as a round.' \
+      "$ENV_FAILURE_BODY")")"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "a finding that quotes the sentence is still a finding"
+  # The phrase is bounded (review of #434, round 1): a finding that CONTINUES it is a finding,
+  # while the sentence unlinked, alone on its line, is still the connector's.
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
+    'To use Codex here, create an environment for this repository before running the tests.')"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" "'repository' is not 'repo'"
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
+    'To use Codex here, create an environment for this repo. The tests assume one.')"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "a sentence that goes on past the full stop is a finding"
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
+    'To use Codex here, [create an environment for this repo](https://example.test/env) — the suite needs one.')"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "a finding that carries on past the link is a finding (review of #434, round 4)"
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
+    "$(printf '%s\n%s' 'To use Codex here, create an environment for this repo.' \
+      'The suite shells out to a sandbox that has none.')")"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "a finding that carries on on the next line is a finding (review of #434, round 5)"
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
+    "$(printf '%s\n\n' 'To use Codex here, create an environment for this repo.')")"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 0 of 12" \
+    "trailing whitespace is still the whole body"
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
+    'To use Codex here, create an environment for this repo.')"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 0 of 12" \
+    "the sentence unlinked, and nothing after it, is the connector's"
+}
+
 # The other side of that filter: a comment-only round whose finding QUOTES the ref error is a
 # round. This function has no head to check a quoted ref against, so it drops a comment only when
 # the body OPENS with the failure sentence itself — under the shape `status` uses, a round about
@@ -377,6 +439,7 @@ tests=(
   test_comment_only_rounds_count
   test_large_comment_feed_still_counts
   test_initialization_failures_are_not_rounds
+  test_the_missing_environment_is_not_a_round
   test_a_round_quoting_the_ref_error_still_counts
   test_no_rounds_yet
   test_threshold

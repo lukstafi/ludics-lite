@@ -889,6 +889,75 @@ test_watch_exits_on_the_initialization_failure() {
     "the context should name the state, not leave the caller to read the body"
 }
 
+# --- the missing environment (ludics-lite#421) -------------------------------------------------
+# The connector's other way of not starting, verbatim from PR #420 (issuecomment-5846369911). It
+# names no ref, so it is attributed by the clock: newer than the head's commit date (HEAD_AT).
+ENV_FAILURE_BODY='To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).'
+ENV_FAILED_AT=2026-09-01T00:05:00Z
+
+env_failed_fixture() { # [created_at]
+  reset_fixture
+  COMMENTS_JSON="[$(plain_comment 100 "${1:-$ENV_FAILED_AT}" "$ENV_FAILURE_BODY")]"
+}
+
+test_the_missing_environment_is_a_failed_state() {
+  env_failed_fixture
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed \
+    "the connector saying it has no environment is a round that never ran, not one that is due"
+  assert_contains "$LINE" "reviewer FAILED at initialization on head head-sh — " \
+    "the line should name the state and the head"
+  assert_contains "$LINE" "nudge it once with a '@codex review' comment" "the first move is the nudge"
+  assert_contains "$LINE" "create an environment for this repo" "the line says which failure it was"
+  assert_contains "$LINE" "the environment is the maintainer's to set up" \
+    "and whose the second move is, since no push reaches it"
+  assert_not_contains "$LINE" "clone is behind" "the git-ref diagnosis is not this failure's"
+  assert_not_contains "$LINE" "review EXPECTED" "and it must not read as a round yet to start"
+  run_cmd_status
+  assert_eq "$CMD_RC" 0 "a state that was READ is exit 0"
+  assert_contains "$CMD_OUT" "review rounds with findings: 0 of 12" \
+    "an attempt that never ran is not a round with findings"
+}
+
+# The clock is the only attribution this shape has, so both of its edges are pinned: an answer
+# older than the head's commit is about a head since replaced, and a commit date that cannot be
+# read, or lies in the future, attributes nothing — each costs the grace rather than a nudge.
+test_the_missing_environment_is_attributed_by_the_clock() {
+  env_failed_fixture 2026-08-31T23:55:00Z
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected \
+    "an answer from before the head's commit is not about this head"
+  assert_not_contains "$LINE" "FAILED at initialization" "and no failure is claimed from it"
+  env_failed_fixture
+  HEAD_AT=""
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "an unread commit date attributes nothing"
+  env_failed_fixture
+  HEAD_AT=2099-01-01T00:00:00Z
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "nor does a commit date in the future"
+  # And a round of this head after the answer is the newer truth, as for the git-ref shape.
+  env_failed_fixture
+  REVIEWS_JSON="[$(review 5 head-sha 2026-09-01T01:00:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "the round the nudge got supersedes the failure"
+}
+
+# Anchored like the git-ref shape: the sentence has to OPEN the body, so a finding that quotes it
+# is a finding.
+test_a_quoted_missing_environment_is_not_a_failure() {
+  reset_fixture
+  COMMENTS_JSON="[$(plain_comment 100 "$ENV_FAILED_AT" "$(printf 'Codex Review: P2 — the connector said\n\n> %s\n\nand this reads it as a round.' \
+    "$ENV_FAILURE_BODY")")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a quotation of the sentence is not the reviewer failing"
+  # Nor a finding that opens with the words and carries on (review of #434, round 1).
+  COMMENTS_JSON="[$(plain_comment 101 "$ENV_FAILED_AT" \
+    'To use Codex here, create an environment for this repository before running the tests.')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "'repository' is not the connector's 'repo'"
+}
+
 # The merge gate against a failure, both ways round — the deliberate part of the ranking. A round
 # that ANNOUNCED itself and then failed closes the gate; a re-request that never announced itself
 # does not withdraw the verdict this head already has, exactly as a 👍 would not be withdrawn.
@@ -1309,6 +1378,9 @@ tests=(
   test_a_newer_reviewer_word_supersedes_the_failure
   test_a_quoted_failure_is_not_a_failure
   test_watch_exits_on_the_initialization_failure
+  test_the_missing_environment_is_a_failed_state
+  test_the_missing_environment_is_attributed_by_the_clock
+  test_a_quoted_missing_environment_is_not_a_failure
   test_a_standing_verdict_survives_a_failed_re_request
   test_a_broken_jq_program_is_unknown_not_a_value
   test_a_broken_jq_program_is_unknown_on_the_failed_head_read

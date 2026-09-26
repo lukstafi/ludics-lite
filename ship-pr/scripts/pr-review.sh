@@ -91,7 +91,8 @@
 #     the push. Counted as the reviewer's last word it spends the 👀, and with no review of the
 #     head the state fell to `expected`, so three consecutive windows recommended waiting out a
 #     grace for a round that had already ended, while `rounds` counted the failed attempt as a
-#     round with findings. Hence the `failed` state below (ludics-lite#78);
+#     round with findings. Hence the `failed` state below (ludics-lite#78), which also covers
+#     the connector's "To use Codex here, create an environment for this repo" (ludics-lite#421);
 #   - and a round is only worth its cost on a head CI can test: GitHub creates no pull_request
 #     workflow run for a PR whose merge commit it cannot build (mergeable_state `dirty`), while
 #     the reviewer reviews it regardless. On ludics-lite#39 (2026-09-04) a sibling landed on main
@@ -1250,7 +1251,24 @@ esac
 # reads as `expected` and costs one grace, where the swallowed round would have cost a finding,
 # silently. (`^` is no use here in either direction: jq's regexes are Oniguruma in Perl mode,
 # where `^` is the start of the STRING and nothing else.)
-INIT_FAILURE_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong\.[ \t]*Try again later by commenting[^\n]{0,4}@codex review'
+#
+# The connector has a second way of not starting, and it is the same shape: "To use Codex here,
+# [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments)."
+# as its first word on a round (ludics-lite#421: PR #420, 2026-09-26, while a sibling PR was
+# reviewed normally; one '@codex review' got a round). It names no ref, which is why status_state
+# attributes it by the clock rather than by the ref (see the `failed` branch there). Anchored and
+# anchored at BOTH ends: the sentence is the connector's whole comment, so the match is the whole
+# body — the link if there is one, an optional full stop, trailing whitespace, and nothing else.
+# Three review rounds of #434 (1, 4, 5) each found a way a finding could open with the words and
+# go on — "this repository …", text after the link, text on the next line — and each was a
+# suffix the matcher accepted; with the body's end required there is no suffix left to accept.
+# The trade is the canonical body's: should the connector ever append to this comment, it reads
+# `expected` and costs one grace, loudly. The link is optional, since only its text is the
+# reviewer's sentence. INIT_FAILURE_RE is the
+# union, so `rounds` drops both shapes.
+INIT_FAILURE_GIT_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong\.[ \t]*Try again later by commenting[^\n]{0,4}@codex review'
+INIT_FAILURE_ENV_RE='\A[ \t]*To use Codex here,[ \t]*\[?create an environment for this repo(?:\]\([^)[:space:]]*\))?\.?[[:space:]]*\z'
+INIT_FAILURE_RE="(?:$INIT_FAILURE_GIT_RE)|(?:$INIT_FAILURE_ENV_RE)"
 # The ref the failure names — the head the reviewer could not fetch. GitHub serves lowercase hex,
 # as does the message. A failure that names none is not attributed to any head: see the branch in
 # status_state.
@@ -1422,7 +1440,7 @@ substantive_reviews() { # <pr>; reviews JSON on stdin
 status_state() {
   local pr="$1" raw line age plus plus_at eyes_at rev_at rev_sha com_at last_spoke head_sha head_at
   local running_at evidence evidence_kind evidence_at running_unread vline verd_at verd_sha mstate="-" head_err="" pr_created=""
-  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref rev_head_at nudge_at="" nudge_age nudge_id="" nudge_line comments_loaded=false
+  local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref fail_kind fail_head rev_head_at nudge_at="" nudge_age nudge_id="" nudge_line comments_loaded=false
   local reviews_loaded=false head_loaded=false head_at_read=false row_sha stale_plus_at="" stale_note=""
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
@@ -1702,18 +1720,24 @@ status_state() {
   # that word's, not this one's. `created_at`, not `updated_at`: this comment is posted fresh
   # (the placeholder that gets edited in place is filtered out here as everywhere), and taking
   # the same clock as com_at is what makes "the failure IS the reviewer's last word" exact.
-  fline=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" --arg refre "$INIT_FAILURE_REF_RE" '
+  # The third field is which of the two shapes it is: `env` (the missing-environment sentence,
+  # which names no ref) or `git` (the "Something went wrong" one).
+  fline=$(jq -r --arg rev "$REVIEWER" --arg re "$INIT_FAILURE_RE" --arg refre "$INIT_FAILURE_REF_RE" \
+    --arg envre "$INIT_FAILURE_ENV_RE" '
       [.[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | test("codex-pull-request-review-summary") | not)]
       | sort_by(.created_at) | last
-      | if . == null or ((.body // "") | test($re) | not) then "|"
+      | if . == null or ((.body // "") | test($re) | not) then "||"
         else "\(.created_at)|" + ([(.body // "") | capture($refre).s] | first // "")
+          + "|" + (if (.body // "") | test($envre) then "env" else "git" end)
         end' <<<"$raw" 2>/dev/null) || {
     echo "unknown|-|$mstate|the initialization-failure comments feed did not parse"
     return 0
   }
   fail_at="${fline%%|*}"
-  fail_ref="${fline#*|}"
+  fline="${fline#*|}"
+  fail_ref="${fline%%|*}"
+  fail_kind="${fline#*|}"
   # A new explicit request supersedes older evidence uniformly: neither an old
   # success, failure, idle review nor reaction can settle that requested round.
   # Newer events retain the established priority rules below.
@@ -1721,7 +1745,7 @@ status_state() {
   if ! review_after_nudge "$rev_at" "$nudge_at"; then rev_at=""; rev_sha=""; fi
   review_after_nudge "$com_at" "$nudge_at" || com_at=""
   if ! review_after_nudge "$verd_at" "$nudge_at"; then verd_at=""; verd_sha=""; fi
-  if ! review_after_nudge "$fail_at" "$nudge_at"; then fail_at=""; fail_ref=""; fi
+  if ! review_after_nudge "$fail_at" "$nudge_at"; then fail_at=""; fail_ref=""; fail_kind=""; fi
   # A stale 👍 (above) is the reviewer's last word about the head it was given for.
   last_spoke=$(newest "$rev_at" "$com_at" "$stale_plus_at")
 
@@ -1790,31 +1814,50 @@ status_state() {
   # a round still inside its grace. Every failure the connector has posted names its ref in the
   # fenced block, so what this gives up is a shape nobody has seen, and what it costs when that
   # shape appears is one grace — the state before this existed.
+  #
+  # The missing-environment shape (ludics-lite#421) is the exception, because it NEVER names a ref:
+  # left unattributed it could never be `failed`, and #420 read `expected` until a hand nudge
+  # while `watch` had already exited on it as a round. So it is attributed by that same clock,
+  # with the objection above priced differently: its miss — a head pushed after the failure whose
+  # commit date predates it — reports `failed` and recommends a nudge that requests exactly the
+  # round that head is due, a redundant request at worst; unattributed, it is the stall #421
+  # reported. Newer than the head's committer date AND the PR's creation, both read and neither in
+  # the future; an unread or future date attributes nothing and costs the grace, as before.
+  fail_head=""
   if [ -n "$fail_at" ] && [ -n "$fail_ref" ]; then
-    case "$head_sha" in
-    "$fail_ref"*)
-      rev_head_at=$(jq -r --arg rev "$REVIEWER" --arg sha "$head_sha" '
-          [.[] | select((.user.login // "") | startswith($rev))
-               | select(.submitted_at != null) | select((.commit_id // "") == $sha)
-               | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || {
-        echo "unknown|-|$mstate|the reviews feed did not parse for the failed head"
-        return 0
-      }
-      if [ -z "$rev_head_at" ] || [[ "$fail_at" > "$rev_head_at" ]]; then
-        # No recurrence count rides on this line. One was tried and removed (review of #82,
-        # rounds 1, 3, 4, 5 and 6): "has this head failed before?" has to be measured from the
-        # last time the reviewer GOT THROUGH on it, and that success is not always recorded —
-        # a clean round posts no review and only a 👍, and the very re-request that then fails
-        # CLEARS that reaction, leaving nothing behind to measure from. Every fix made the
-        # boundary wider and the next round found the next hole. So the line states both moves
-        # unconditionally, which is what the issue asked for and what a caller can act on
-        # without the script deciding which case it is in.
-        echo "failed|$(age_of "$fail_at")|$mstate|${head_sha:0:7}|$REVIEWER reported an" \
-          "initialization failure at $fail_at for ref ${fail_ref:0:7}"
-        return 0
-      fi
-      ;;
-    esac
+    case "$head_sha" in "$fail_ref"*) fail_head="for ref ${fail_ref:0:7}" ;; esac
+  elif [ -n "$fail_at" ] && [ "$fail_kind" = env ]; then
+    if [ "$head_at_read" != true ]; then
+      head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
+        head_at=""
+      head_at_read=true
+    fi
+    if [ "$(age_of "$head_at")" != - ] && [[ "$fail_at" > "$head_at" ]] &&
+      { [ -z "$pr_created" ] || { [ "$(age_of "$pr_created")" != - ] && [[ "$fail_at" > "$pr_created" ]]; }; }; then
+      fail_head="after head ${head_sha:0:7}'s commit date $head_at"
+    fi
+  fi
+  if [ -n "$fail_head" ]; then
+    rev_head_at=$(jq -r --arg rev "$REVIEWER" --arg sha "$head_sha" '
+        [.[] | select((.user.login // "") | startswith($rev))
+             | select(.submitted_at != null) | select((.commit_id // "") == $sha)
+             | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || {
+      echo "unknown|-|$mstate|the reviews feed did not parse for the failed head"
+      return 0
+    }
+    if [ -z "$rev_head_at" ] || [[ "$fail_at" > "$rev_head_at" ]]; then
+      # No recurrence count rides on this line. One was tried and removed (review of #82,
+      # rounds 1, 3, 4, 5 and 6): "has this head failed before?" has to be measured from the
+      # last time the reviewer GOT THROUGH on it, and that success is not always recorded —
+      # a clean round posts no review and only a 👍, and the very re-request that then fails
+      # CLEARS that reaction, leaving nothing behind to measure from. Every fix made the
+      # boundary wider and the next round found the next hole. So the line states both moves
+      # unconditionally, which is what the issue asked for and what a caller can act on
+      # without the script deciding which case it is in.
+      echo "failed|$(age_of "$fail_at")|$mstate|${head_sha:0:7}|$fail_kind|$REVIEWER reported an" \
+        "initialization failure at $fail_at $fail_head"
+      return 0
+    fi
   fi
 
   # A verdict comment naming the current head is an approval — without this arm it reads as
@@ -1945,7 +1988,7 @@ conflict_note() {
 # Takes a whole state line, not a token: the age and the detail are what make the difference between
 # "wait it out" and "nothing is coming" legible to whoever reads the log.
 status_line() {
-  local tok age detail merge conflict fsha frest
+  local tok age detail merge conflict fsha frest fkind
   tok=$(state_tok "$1")
   age=$(state_age "$1")
   detail=$(state_detail "$1")
@@ -1973,15 +2016,34 @@ status_line() {
   # only a new head gives the reviewer an object its clone can resolve. Both moves are stated,
   # in order, rather than the script deciding which one the caller is due — see status_state for
   # why counting the failures on a head cannot be done honestly.
+  #
+  # The missing-environment shape (ludics-lite#421) gets the same first move and a different
+  # second one: on #420 one nudge got a round, and if it does not, no push reaches a setting
+  # that lives on the connector's side.
   failed)
     fsha="${detail%%|*}"
     frest="${detail#*|}"
-    echo "reviewer FAILED at initialization on head $fsha — nudge it once with a '@codex review'" \
-      "comment (pr-review.sh comment $REPO#${PR_NUM:-<pr>} '@codex review'); if the SAME head" \
-      "fails again, push a new head instead (an amend suffices: git commit --amend --no-edit &&" \
-      "git push --force-with-lease), since the reviewer's clone is behind, not your push — the" \
-      "ref it could not fetch is one the PR and git ls-remote both serve. This is not a round —" \
-      "$frest, standing for $(fmt_age "$age")${conflict:+; $conflict}"
+    fkind="${frest%%|*}"
+    frest="${frest#*|}"
+    case "$fkind" in
+    env)
+      echo "reviewer FAILED at initialization on head $fsha — nudge it once with a '@codex review'" \
+        "comment (pr-review.sh comment $REPO#${PR_NUM:-<pr>} '@codex review'); the connector" \
+        "answered \"To use Codex here, create an environment for this repo\", which has cleared" \
+        "on one nudge before. If the nudge draws the same answer, the environment is the" \
+        "maintainer's to set up (https://chatgpt.com/codex/cloud/settings/environments) — no push" \
+        "of yours fixes it. This is not a round — $frest, standing for" \
+        "$(fmt_age "$age")${conflict:+; $conflict}"
+      ;;
+    *)
+      echo "reviewer FAILED at initialization on head $fsha — nudge it once with a '@codex review'" \
+        "comment (pr-review.sh comment $REPO#${PR_NUM:-<pr>} '@codex review'); if the SAME head" \
+        "fails again, push a new head instead (an amend suffices: git commit --amend --no-edit &&" \
+        "git push --force-with-lease), since the reviewer's clone is behind, not your push — the" \
+        "ref it could not fetch is one the PR and git ls-remote both serve. This is not a round —" \
+        "$frest, standing for $(fmt_age "$age")${conflict:+; $conflict}"
+      ;;
+    esac
     ;;
   expected | nudged) echo "review EXPECTED but not started — $detail; due for $(fmt_age "$age")${conflict:+; $conflict}" ;;
   # "The next move is yours" is exactly the line that sent #39 into seven untested rounds: on a
@@ -2015,9 +2077,14 @@ status_line() {
 # land in the same feed as COMMENTED reviews, hence the login filter; PENDING reviews have no
 # submitted_at and are not a round. Prints ONE line, "<count>|<detail>", and always exits 0:
 # a count of "unknown" carries the failure, and is NOT "no rounds yet".
-review_rounds() {
-  local pr="$1" raw comments line count heads
-  raw=$(api_list "pulls/$pr/reviews?per_page=100") || {
+#
+# The optional caps count only the comments and reviews at or below those ids — the count as it
+# stood at a watermark, which is how `watch` tells which rounds a window's items opened.
+review_rounds() { # <pr> [<issue comment id cap> <review id cap>]
+  local pr="$1" icap="${2:-null}" rcap="${3:-null}" raw comments line count heads
+  # Through the round snapshot when a watch round holds one (the same feeds the round was judged
+  # on, and no second read), and a read of its own otherwise — as status_state reads them.
+  raw=$(state_reviews "$pr") || {
     echo "unknown|the reviews API did not answer ($(gh_err_line))"
     return 0
   }
@@ -2027,7 +2094,8 @@ review_rounds() {
   }
   # A round can also arrive as an issue comment alone — the same shape status_state treats as
   # the reviewer speaking — so those count too, minus the round-started placeholder, the
-  # no-findings verdict, and the initialization failure: an attempt that never ran carries no
+  # no-findings verdict, and the initialization failure (either shape INIT_FAILURE_RE names, the
+  # missing environment of ludics-lite#421 included): an attempt that never ran carries no
   # findings, and counting it inflated ocannl-staging#677 to "1 round(s) of findings over 0
   # head(s)" — a threshold reading made of two failed fetches (ludics-lite#78). It is dropped
   # from the COMMENT feed alone, which is the only feed it has ever arrived in: a review carries
@@ -2037,20 +2105,23 @@ review_rounds() {
   # comment is a failure for both or a round for both. A comment-only round whose finding quotes
   # "Provided git ref <sha> does not exist" — a round about this very matcher — is a round here
   # and on the state line, and that is what the anchored expression buys (review of #82).
-  comments=$(api_list "issues/$pr/comments?per_page=100") || {
+  comments=$(state_comments "$pr") || {
     echo "unknown|the comments API did not answer ($(gh_err_line))"
     return 0
   }
   # Both feeds go in on stdin (slurped: reviews first, comments second), never as arguments —
   # a long PR's comment history outgrows the argument list (128 KB per argument on Linux).
   line=$(printf '%s\n%s\n' "$raw" "$comments" | jq -r -s --arg rev "$REVIEWER" \
-    --argjson gap "$ROUND_GAP" --arg fail "$INIT_FAILURE_RE" --arg rc "$REVIEWED_COMMIT_RE" '
+    --argjson gap "$ROUND_GAP" --arg fail "$INIT_FAILURE_RE" --arg rc "$REVIEWED_COMMIT_RE" \
+    --argjson icap "$icap" --argjson rcap "$rcap" '
       .[1] as $comments | .[0]
       | ([.[] | select((.user.login // "") | startswith($rev))
+           | select($rcap == null or (.id // 0) <= $rcap)
            | select(.submitted_at != null)
            | select(.state == "COMMENTED" or .state == "CHANGES_REQUESTED")
            | {sha: (.commit_id // ""), t: (.submitted_at | fromdateiso8601)}]
        + [$comments[] | select((.user.login // "") | startswith($rev))
+           | select($icap == null or (.id // 0) <= $icap)
            | select((.body // "") | test("codex-pull-request-review-summary") | not)
            | select((.body // "") | test("[Dd]idn.t find any major issues") | not)
            | select((.body // "") | test($fail) | not)
@@ -2526,8 +2597,63 @@ watch_act() { # <pr> <state line>
   fi
   echo "status: $(status_line "$2")" >&2
   watch_drift_note "$1"
-  warn "PR $REPO#$1: ending the wait on ${POLLED_ON:-reviewer activity}$extra"
+  warn "PR $REPO#$1: ending the wait on ${POLLED_ON:-reviewer activity}$extra$(watch_round_note "$1")"
   echo "$POLLED_OUT"
+}
+
+# Which round the wait ended on, by the count `rounds` reports and against its threshold
+# (ludics-lite#423, part 2): #259's worker numbered its round 12 as 13 from memory and posted a
+# threshold deferral it had to retract, because only `rounds` showed the count. Read here, off
+# the PR, so the caller never has to count. The count is taken twice — as it stood at the
+# watermark this window started from, and with the window's items — and the difference is what
+# the line claims: the rounds the WINDOW opened (none, one, or a span), never the round of the
+# item it names. That item is only the first one rendered, and the rendering groups by feed, not
+# by round, so in a batch holding an old round's tail and a new round it can be the tail (review
+# of #434, rounds 1 and 2). No state token is consulted, since an unattributed failure reads
+# `expected` and would otherwise be numbered as a round. The window is the whole watch: the count
+# is taken at the watermark the watch was STARTED with (watch_from, in watch_loop's scope), not at
+# the last poll's, which an earlier poll advances past another head's round (review of #434,
+# round 3) — so a backlog arriving over several polls reads the same span as one seen at once.
+#
+# Both counts cost no request inside a watch round: the feeds come from the round's snapshot, and
+# substantive_reviews's per-review reads from review_comments's per-round cache, which the
+# round's own poll and state read have already filled.
+watch_round_note() { # <pr>
+  local now before n b detail of past=""
+  now=$(review_rounds "$1")
+  before=$(review_rounds "$1" "$(mark_of "$watch_from" 2)" "$(mark_of "$watch_from" 3)")
+  n="${now%%|*}"
+  b="${before%%|*}"
+  if [ "$n" = unknown ] || [ "$b" = unknown ]; then
+    detail="${now#*|}"
+    [ "$n" != unknown ] && detail="${before#*|}"
+    printf ' — round UNKNOWN (%s); read `rounds` before citing a round number' "$detail"
+    return 0
+  fi
+  # Past the threshold is said of the rounds that are past it: a span that CROSSES it (rounds
+  # 11–13 of 12) keeps its earlier rounds in full and names where blocking-only starts (review of
+  # #434, round 5).
+  case "$ROUND_THRESHOLD" in
+  '' | off | *[!0-9]*) of=" (no threshold set)" ;;
+  *)
+    of=" of $ROUND_THRESHOLD"
+    if [ "$n" -gt "$ROUND_THRESHOLD" ]; then
+      if [ "$n" -gt $((b + 1)) ] && [ "$((b + 1))" -le "$ROUND_THRESHOLD" ]; then
+        past="; from round $((ROUND_THRESHOLD + 1)) on PAST the threshold: blocking-only there,"
+        past="$past rounds $((b + 1))–$ROUND_THRESHOLD in full"
+      else
+        past=", PAST the threshold: blocking-only from here"
+      fi
+    fi
+    ;;
+  esac
+  if [ "$n" -le "$b" ]; then
+    printf ' — this window opened no round; rounds with findings: %s%s%s' "$n" "$of" "$past"
+  elif [ "$n" -eq $((b + 1)) ]; then
+    printf ' — this window opened round %s%s%s' "$n" "$of" "$past"
+  else
+    printf ' — this window opened rounds %s–%s%s%s' "$((b + 1))" "$n" "$of" "$past"
+  fi
 }
 
 # One last poll before any verdict that says no round came (ludics-lite#72; the race is the one
@@ -2694,7 +2820,7 @@ cmd_watch() {
 }
 
 watch_loop() {
-  local pr="${1:?usage: watch <pr> [watermark]}" mark="${2:-}"
+  local pr="${1:?usage: watch <pr> [watermark]}" mark="${2:-}" watch_from="${2:-}"
   pr_arg "$pr"
   pr="$PR_NUM"
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"

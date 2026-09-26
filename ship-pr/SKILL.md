@@ -375,7 +375,9 @@ is not closing it, though: a scrolled-past finding whose thread is still open ke
 from reading clean (`unresolved`, below) and keeps `merge` refusing.
 
 So read the line each exit ends on, which now says what it ended *on*: the item's own descriptor
-(`ending the wait on review id=… state=… commit=… by …`) when a round ended it, and the head the
+(`ending the wait on review id=… state=… commit=… by … — this window opened round 3 of 12`,
+by the count `rounds` reports, so cite that number rather than one you kept) when a round ended
+it, and the head the
 silence was about plus how much scrolled past (`no reviewer activity about head abc1234 in 900s;
 2 item(s) about another commit scrolled past …`) when nothing did. "The reviewer answered this
 head" and "an old review went by" are different windows and read differently.
@@ -565,7 +567,7 @@ head SHA, and answers with one of eight:
 | `unresolved` | that same 👍, over review threads still open — whatever head they cite | answer each thread and `resolve` it; `merge` refuses until none is open |
 | `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
 | `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
-| `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) |
+| `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head, or "To use Codex here, create an environment for this repo" newer than the head's commit: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) — or, for the environment one, hand it to the maintainer, since no push reaches it |
 | `expected` | no live 👀, and no review of the head SHA: a round is due and has not started — including a 👍 left from before a push, until the app takes it down | wait out the grace, then `@codex review` |
 | `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push — or, at one of the loop's exits (below), close out and merge |
 | `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
@@ -588,11 +590,15 @@ and the third reviewed normally after one nudge). It ranks below the 👍 and be
 after it — a round that started later is a round to wait out — and above `idle` and `expected`,
 which is what it used to read as: three `watch` windows recommending the grace for a round that
 had already ended. A failure naming a head you have since replaced is not it; that is `expected`
-again, correctly — and so is one that names no ref at all, which is attributed to no head. Nudge
-once, and if the same head fails again, amend and push; the line states both moves in order,
-because no feed records a reaction-only success reliably enough for the script to say which of
-the two you are due. The failed attempt is not a round, so it does not count against the
-convergence threshold.
+again, correctly — and so is a "Something went wrong" that names no ref at all, which is
+attributed to no head. Nudge once, and if the same head fails again, amend and push; the line
+states both moves in order, because no feed records a reaction-only success reliably enough for
+the script to say which of the two you are due. The one ref-less exception is the connector's
+"To use Codex here, create an environment for this repo" (ludics-lite#421), which never names a
+ref: it is attributed to the head by the clock — newer than both the head's commit date and the
+PR's creation, neither unread nor in the future, else `expected` — and its second move is the
+maintainer's, since no push reaches it. The failed attempt is not a round, so it does not count
+against the convergence threshold.
 
 An empty `COMMENTED` review counts as no completed review unless its own inline-comments
 endpoint contains findings. This also excludes it from the convergence count; comments on another
