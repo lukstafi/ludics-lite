@@ -107,7 +107,8 @@ and a release through five PRs on 2026-09-15 with no stranded worker.
    The coordinator runs `fleet-worker.sh execution conclude --from-run <run> --request <id>
    --sha <observed_sha>`, which reads verdict, log and checkout off the record on the reserved
    box (the record carries no SHA, so the result line's is the revision of record; a checkout
-   that has moved on since is noted in the evidence) and refuses an unfinished run, and then
+   that has moved on since is noted in the evidence) and refuses an unfinished run - or
+   `--from-bg-run <run>` when the run is a `bg-run.sh` directory - and then
    resumes the worker with `EXECUTION_CONCLUDED <id> <verdict>` or its next assignment.
 
 The same request and result lines work for a Codex native worker that prefers them; what
