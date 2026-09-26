@@ -14,8 +14,13 @@ command.
 
 ## Exclusivity and the run-time slots
 
-A `measurement` reservation is exclusive: it is refused while anything is outstanding on its
-host, and everything is refused while it is outstanding. A `correctness` reservation shares its
+A `measurement` reservation is for timing-grade claims, and for a run that needs the box to
+itself (a [dual-boot reboot](#bounded-native-windows-verification) ends everything there). A
+behaviour check that happens to print timings is `correctness`, and its timings are reported as
+shared-box (2026-09-25: a warm-cache A/B whose claim was which arms replay asked for an exclusive
+mac-studio measurement, impossible while a wave shares the box, and was reclassified). A
+measurement is exclusive: it is refused while anything is outstanding on its host, and
+everything is refused while it is outstanding. A `correctness` reservation shares its
 host with other correctness reservations up to the box's slots - `FLEET_BOX_CORRECTNESS_SLOTS`,
 `<box>=<n>` pairs, `mac-studio=6 rog-nv-linux=4 minix-amd-linux=4 tuf-amd-linux=3` with the
 default roster and one slot for any box it does not name. The default roster is the default set of boxes, whether
