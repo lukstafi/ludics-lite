@@ -179,7 +179,13 @@
 #                                          # green-by-skips-only, on --auto, on a base with a
 #                                          # merge queue, and on a deferred auto-merge (which it
 #                                          # disables again); and WARNS
-#                                          # loudly when the branch is far behind its base
+#                                          # loudly when the branch is far behind its base.
+#                                          # --override waives exactly the reds of the gate's
+#                                          # FIRST read (by check suite and name), never a check
+#                                          # with no verdict yet: that one is waited for under
+#                                          # --wait and refused with 4 without it, and a check
+#                                          # that turns red during the wait was never waived, so
+#                                          # it refuses with 1 (ludics-lite#392)
 #   pr-review.sh base [owner/name] [branch] [--wait[=seconds]]
 #                                          # is the branch you are about to work off CI-green?
 #                                          # --wait holds until the CURRENT tip has its verdict —
@@ -3363,6 +3369,88 @@ esac
 
 is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }
 
+# --- what `merge --override` waives (ludics-lite#392) ------------------------------------------
+# An override is a sentence about a red the operator has READ, so it waives exactly the reds the
+# gate saw when it was given, and nothing else. It used to waive the whole verdict: a red fold
+# ended the read at once, so lukstafi/ocannl-staging#776 merged over an unrelated ubuntu red while
+# its macOS leg was still RUNNING, and nothing had read that leg at all. A check with no verdict is
+# not a red, and the override is not the flag for it (SKILL.md *The override*).
+#
+# THE WAIVED SET is the reds of the gate's FIRST read, the read made when the override was given —
+# not the set re-read after a --wait. The operator can only have meant what was red then; a check
+# that turns red DURING the wait is one nobody read, so it is a plain red and the merge refuses on
+# it (re-run merge to read it, and override it too if it is just as unrelated). Membership is by
+# IDENTITY, and the identity outlives a re-run: a waived check that is re-run is waited for while it
+# runs (it has no verdict) and stays waived if it concludes red again. Two kinds are recorded, and
+# they are all the gate reads:
+#   check:<suite>/<name>  a non-advisory check run (build_checks) that was red at the first read,
+#                 by its check_suite.id AND its name. The name alone is not an identity: two
+#                 workflows can each run a job named `build`, and keying on the name let one
+#                 workflow's red waive the other's later failure (review round 1). A re-run stays
+#                 in its suite with the same name (pr-review-api-contract.sh pins filter=latest's
+#                 superseded attempt as a newer row of the same suite and name); were that ever
+#                 to move, the re-run would be refused, the loud direction. Nor is suite-and-name
+#                 always unique — two jobs of one workflow may legally share a name (the contract
+#                 says so) — and no field tells which of two same-named rows a re-run replaced, so
+#                 no bookkeeping over such a pair can say which red is the one that was read
+#                 (review rounds 3 and 4: a count was defeated by a re-run swapping the twins). A
+#                 key is therefore waived only while it names exactly ONE row: at the first read
+#                 (a same-named pair there is not recorded, so its red refuses at once) and at
+#                 every read after it (a second row appearing under a waived key un-waives it).
+#                 Both are refusals, the loud direction, for a shape this repo's own CI does not
+#                 have.
+#   run:<run id>  a non-advisory workflow run that was red at the first read with no check to show
+#                 for it (run_signal's run-level red), by the INVOCATION: a re-run keeps its run
+#                 id (run_attempt bumps), while another dispatch of the same workflow and event is
+#                 a new run nobody read. The fold's workflow-and-event key would have handed the
+#                 waiver on to that one when it finished red (review round 2).
+# A job of a completed red run is the check of the same name in that run's suite (the contract pins
+# that join too), so run_red_is_advisory_only reads a job whose `check:<suite>/<name>` is waived as
+# explained, exactly as it reads an advisory job (and only while the run has one job of that
+# name): otherwise the waived leg's run concludes `failure` once its siblings finish and comes
+# back as a red run.
+#
+# GATE_WAIVE is "" outside an override, `record` for the first read, `apply` after it. It and
+# WAIVED are globals because run_signal reads them from inside a command substitution; gate_checks
+# resets both on entry, so a `checks` call never inherits a waiver. WAIVED is newline-framed
+# (`\n` + one key per line), which is safe because every name reaches here through `@tsv`, which
+# escapes a newline inside a name.
+GATE_WAIVE=""
+WAIVED=$'\n'
+is_waived() {
+  case "$WAIVED" in *$'\n'"$1"$'\n'*) return 0 ;; esac
+  return 1
+}
+
+# True when exactly one line of the newline-separated list <list> is <line>.
+one_line_is() { # <list> <line>
+  local l n=0
+  while IFS= read -r l; do
+    [ "$l" != "$2" ] || n=$((n + 1))
+  done <<<"$1"
+  [ "$n" -eq 1 ]
+}
+
+# Marks the waived red rows of a build_checks listing as class `waived`, recording every red one
+# first when this is the recording read. Sets WAIVER_ROWS rather than printing, because the record
+# has to land in THIS shell. Rows keep build_checks' shape and placeholders. Two passes, because a
+# key is waived only while it names ONE row (see is_waived), which takes every key read first.
+apply_waiver() {
+  local class name concl url suite keys=""
+  WAIVER_ROWS=""
+  while IFS=$'\t' read -r class name concl url suite; do
+    [ -n "$class" ] && keys="${keys}check:${suite}/${name}"$'\n'
+  done <<<"$1"
+  while IFS=$'\t' read -r class name concl url suite; do
+    [ -n "$class" ] || continue
+    if [ "$class" = red ] && one_line_is "$keys" "check:$suite/$name"; then
+      [ "$GATE_WAIVE" != record ] || WAIVED="${WAIVED}check:${suite}/${name}"$'\n'
+      is_waived "check:$suite/$name" && class=waived
+    fi
+    WAIVER_ROWS="${WAIVER_ROWS}${class}"$'\t'"${name}"$'\t'"${concl}"$'\t'"${url}"$'\t'"${suite}"$'\n'
+  done <<<"$1"
+}
+
 conclusion_class() {
   case "$1" in
   failure | timed_out | startup_failure) echo red ;;
@@ -3391,7 +3479,8 @@ newest_first() { # <created_at column> <id column>; rows on stdin
   LC_ALL=C sort -t$'\t' -k"$1,$1"r -k"$2,$2"nr
 }
 
-# Prints "class<TAB>name<TAB>conclusion<TAB>url" per non-advisory check-run of <sha>. Returns 3
+# Prints "class<TAB>name<TAB>conclusion<TAB>url<TAB>suite" per non-advisory check-run of <sha>, the
+# suite being its check_suite.id: the identity an override's waiver keys on beside the name. Returns 3
 # printing NOTHING when the read failed, so the caller can tell an outage from a commit with no
 # checks — collapsing those two is how a merge gate says "nothing is red" about a PR it never read.
 # filter=latest is explicit: a re-run adds a second check-run under the same name, and the older
@@ -3403,32 +3492,38 @@ newest_first() { # <created_at column> <id column>; rows on stdin
 # column and every pending job would be classified by the text of its own link. The placeholder
 # keeps the columns aligned.
 build_checks() {
-  local sha="$1" raw rc name concl url
+  local sha="$1" raw rc name concl url suite
   raw=$(gh_retry read api --paginate \
     "repos/$REPO/commits/$sha/check-runs?filter=latest&per_page=100" \
-    --jq '.check_runs[] | [.name, (.conclusion // "pending"), (.html_url // "-")] | @tsv')
+    --jq '.check_runs[] | [.name, (.conclusion // "pending"), (.html_url // "-"),
+          ((.check_suite.id // "-") | tostring)] | @tsv')
   rc=$?
   [ "$rc" -eq 0 ] || return 3
-  while IFS=$'\t' read -r name concl url; do
+  while IFS=$'\t' read -r name concl url suite; do
     [ -n "$name" ] || continue
     is_advisory "$name" && continue
-    printf '%s\t%s\t%s\t%s\n' "$(conclusion_class "$concl")" "$name" "$concl" "$url"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(conclusion_class "$concl")" "$name" "$concl" "$url" "${suite:--}"
   done <<<"$raw"
 }
 
 # Folds the per-check classes into VERDICT (red|pending|mixed|absent|green) and the report lines.
 # Runs in the current shell — a pipeline would put the loop in a subshell and lose both.
 summarize_checks() {
-  local class name concl url red=0 pending=0 nogo=0 green=0 passed=0
+  local class name concl url suite red=0 waived=0 pending=0 nogo=0 green=0 passed=0
   VERDICT=""
   CHECK_LINES=""
   CHECK_RED=0
-  while IFS=$'\t' read -r class name concl url; do
+  # `suite` is read so that `url` stays its own column; only the waiver keys on it.
+  while IFS=$'\t' read -r class name concl url suite; do
     [ -n "$class" ] || continue
     case "$class" in
     red)
       red=$((red + 1))
       CHECK_LINES="${CHECK_LINES}  RED      $name ($concl)  $url"$'\n'
+      ;;
+    waived)
+      waived=$((waived + 1))
+      CHECK_LINES="${CHECK_LINES}  RED      $name ($concl — WAIVED: red when --override was given)  $url"$'\n'
       ;;
     pending)
       pending=$((pending + 1))
@@ -3447,15 +3542,20 @@ summarize_checks() {
     esac
   done <<<"$1"
   CHECK_RED="$red"
+  CHECK_WAIVED="$waived"
   CHECK_PASSED="$passed"
   CHECK_PENDING="$pending"
-  CHECK_TOTAL=$((red + pending + nogo + green))
+  CHECK_TOTAL=$((red + waived + pending + nogo + green))
+  # A waived red ranks BELOW every fact still owed: it settles nothing about a check that is
+  # running or stopped, which keep their own verdicts (ludics-lite#392).
   if [ "$red" -gt 0 ]; then
     VERDICT=red
   elif [ "$pending" -gt 0 ]; then
     VERDICT=pending
   elif [ "$nogo" -gt 0 ]; then
     VERDICT=mixed
+  elif [ "$waived" -gt 0 ]; then
+    VERDICT=waived
   elif [ "$green" -eq 0 ]; then
     VERDICT=absent
   else
@@ -3486,8 +3586,12 @@ summarize_checks() {
 # carries the run-level conclusion the check list cannot. Paginated, because a head with a long
 # re-run history can push a queued run off the first page.
 #
-# Prints "<red count><TAB><reason>" — a count, because gate_checks reports through CHECK_RED and a
-# command substitution cannot hand it back a variable — and returns
+# Prints "<red count><TAB><waived runs><TAB><reason>" — a count, because gate_checks reports through
+# CHECK_RED and a command substitution cannot hand it back a variable; and the red runs an
+# override's waiver took out of that count (see is_waived), one "<run id> <run|job> <name>" per
+# line (`job`: red through a waived check; `run`: a checkless red waived as itself), empty outside
+# an override, because the recording read has to add them to WAIVED in gate_checks' own shell — and
+# returns
 #   1  RED at the run level: a non-advisory run for this head concluded red with no check behind
 #      it. A red is a verdict, so it ends a --wait like any other.
 #   4  no verdict YET — a run is queued or in flight, a run completed stopped-not-judged, or the
@@ -3513,11 +3617,11 @@ summarize_checks() {
 # printf reuses its format string for every argument, so "%s" over a fragmented message is the
 # concatenation the reason lines want — but the leading red count must be emitted ONCE, or every
 # fragment carries a copy of it (caught by the fixture suite the moment the messages grew a second
-# fragment). One printf for the count, one for the message.
+# fragment). One printf for the count and the waived names, one for the message.
 run_reason() {
-  local n="$1"
-  shift
-  printf '%s\t' "$n"
+  local n="$1" waived="$2"
+  shift 2
+  printf '%s\t%s\t' "$n" "$waived"
   printf '%s' "$@"
 }
 
@@ -3529,35 +3633,55 @@ run_reason() {
 # and none of the non-advisory ones is red, i.e. its red is entirely explained by jobs the gate
 # ignores. A run with NO jobs (the `startup_failure` case this red branch exists for) is not
 # explained, and neither is a jobs read that failed — a red this cannot disprove stands.
+# Returns 0 when advisory jobs alone explain the red, 2 when it is explained but a job an override
+# waived is part of the explanation, 1 when it is not explained. 2 is not 0 because a red waived is
+# still a red: dropping it like an advisory one let a poll whose check list momentarily lacked the
+# waived row read the head as GREEN, with no OVERRIDE record, and past --require-green (review
+# round 5). The caller reports it as a waived red instead.
 run_red_is_advisory_only() {
-  local id="$1" raw rc jname jconcl jobs=0 hard=0
+  local id="$1" suite="${2:--}" raw rc jname jconcl jobs=0 hard=0 waived=0 names=""
   raw=$(gh_retry read api --paginate "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
     --jq '.jobs[] | [(.name // "-"), (.conclusion // "pending")] | @tsv')
   rc=$?
   [ "$rc" -eq 0 ] || return 1
+  # The run's job names, read first: a job is waived only while it is the one job of its name
+  # (see is_waived).
+  while IFS=$'\t' read -r jname jconcl; do
+    [ -n "$jname" ] && names="${names}${jname}"$'\n'
+  done <<<"$raw"
   while IFS=$'\t' read -r jname jconcl; do
     [ -n "$jname" ] || continue
     jobs=$((jobs + 1))
     is_advisory "$jname" && continue
-    [ "$(conclusion_class "$jconcl")" = red ] && hard=$((hard + 1))
+    [ "$(conclusion_class "$jconcl")" = red ] || continue
+    # A job an override waived as its check explains its run's red the same way (ludics-lite#392,
+    # see is_waived). Outside an override WAIVED is empty and this never holds.
+    if one_line_is "$names" "$jname" && is_waived "check:$suite/$jname"; then
+      waived=$((waived + 1))
+      continue
+    fi
+    hard=$((hard + 1))
   done <<<"$raw"
-  [ "$jobs" -gt 0 ] && [ "$hard" -eq 0 ]
+  [ "$jobs" -gt 0 ] && [ "$hard" -eq 0 ] || return 1
+  [ "$waived" -eq 0 ] || return 2
+  return 0
 }
 
 run_signal() {
   local sha="$1" pr_at="${2:-}" checks="${3:-0}" base_sha="${4:-}" head_ref="${5:-}" pr="${6:-}"
-  local raw rc rid wid event name status concl
-  local seen_ids=" " red_rows="" rname rconcl created
-  local runs=0 inflight=0 nogo=0 red=0 red_note="" pushed_at age seen
+  local raw rc rid wid event name status concl suite
+  local seen_ids=" " red_rows="" rname rconcl rsuite created
+  local runs=0 inflight=0 nogo=0 red=0 red_note="" pushed_at age seen waived_runs=""
   raw=$(gh_retry read api --paginate \
     "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
     --jq '.workflow_runs[] | [(.created_at // "-"), ((.id // 0) | tostring),
           ((.workflow_id // 0) | tostring),
-          (.event // "-"), (.name // "-"), (.status // "unknown"), (.conclusion // "pending")]
+          (.event // "-"), (.name // "-"), (.status // "unknown"), (.conclusion // "pending"),
+          ((.check_suite_id // "-") | tostring)]
           | @tsv')
   rc=$?
   [ "$rc" -eq 0 ] || {
-    run_reason 0 "the workflow runs for this head could not be read ($(gh_err_line))"
+    run_reason 0 "$waived_runs" "the workflow runs for this head could not be read ($(gh_err_line))"
     return 3
   }
   # Ordered before the fold (see newest_first): two runs of one workflow-and-event key created in
@@ -3592,7 +3716,7 @@ run_signal() {
   # give: unfinished work is always work, and only finished rows compete to be the answer.
   # `created` is read to consume the sort key's column and nothing else: the ordering above is
   # the only thing this projection needs a timestamp for.
-  while IFS=$'\t' read -r created rid wid event name status concl; do
+  while IFS=$'\t' read -r created rid wid event name status concl suite; do
     [ -n "$rid" ] || continue
     is_advisory "$name" && continue
     # A run reported `completed` before its conclusion is populated is not judged either: the
@@ -3608,16 +3732,31 @@ run_signal() {
     seen_ids="$seen_ids$wid/$event "
     runs=$((runs + 1))
     case "$(conclusion_class "$concl")" in
-    red) red_rows="${red_rows}${rid}"$'\t'"${name}"$'\t'"${concl}"$'\n' ;;
+    red) red_rows="${red_rows}${rid}"$'\t'"${name}"$'\t'"${concl}"$'\t'"${suite:--}"$'\n' ;;
     nogo) nogo=$((nogo + 1)) ;;
     esac
   done <<<"$raw"
   # Each red run gets the advisory-job read before it counts — one call, only ever for a run that
   # is already red, and only when no check run reported that failure.
   if [ -n "$red_rows" ]; then
-    while IFS=$'\t' read -r rid rname rconcl; do
+    while IFS=$'\t' read -r rid rname rconcl rsuite; do
       [ -n "$rid" ] || continue
-      run_red_is_advisory_only "$rid" && continue
+      run_red_is_advisory_only "$rid" "$rsuite"
+      case "$?" in
+      0) continue ;;
+      # Red through a check the override waived: a waived red, handed back as one (kind `job`).
+      2)
+        waived_runs="${waived_runs}${rid} job ${rname}"$'\n'
+        continue
+        ;;
+      esac
+      # Under an override, a run-level red it waives (or, on the recording read, every one there
+      # is) is handed back to gate_checks as "<run id> run <name>" and not counted
+      # (ludics-lite#392).
+      if [ "$GATE_WAIVE" = record ] || { [ "$GATE_WAIVE" = apply ] && is_waived "run:$rid"; }; then
+        waived_runs="${waived_runs}${rid} run ${rname}"$'\n'
+        continue
+      fi
       red=$((red + 1))
       [ -n "$red_note" ] || red_note="$rname ($rconcl)"
     done <<<"$red_rows"
@@ -3626,18 +3765,18 @@ run_signal() {
   # fold found no red, so this run's failure is one no check run reported — the whole reason to
   # look at the run list rather than trusting the check list to carry every failure.
   if [ "$red" -gt 0 ]; then
-    run_reason "$red" "$red workflow run(s) for this head concluded red with no build check" \
+    run_reason "$red" "$waived_runs" "$red workflow run(s) for this head concluded red with no build check" \
       " to show for it — $red_note; a run that fails before its jobs start leaves nothing in the" \
       " check list"
     return 1
   fi
   if [ "$inflight" -gt 0 ]; then
-    run_reason 0 "$inflight workflow run(s) for this head have no conclusion yet (queued," \
+    run_reason 0 "$waived_runs" "$inflight workflow run(s) for this head have no conclusion yet (queued," \
       " running, or completed with none recorded) — their check runs may not exist yet"
     return 4
   fi
   if [ "$nogo" -gt 0 ]; then
-    run_reason 0 "$nogo workflow run(s) for this head completed stopped-not-judged (cancelled," \
+    run_reason 0 "$waived_runs" "$nogo workflow run(s) for this head completed stopped-not-judged (cancelled," \
       " stale or action_required) with no build check behind them — stopped is not absence and" \
       " not a verdict: re-run the workflow"
     return 4
@@ -3651,7 +3790,7 @@ run_signal() {
   # checkless head (ludics-lite#38, round 3).
   case "$checks" in '' | *[!0-9]*) checks=0 ;; esac
   if [ "$checks" -gt 0 ] && [ "$runs" -gt 0 ]; then
-    run_reason 0 "$runs workflow run(s) for this head are finished and judged"
+    run_reason 0 "$waived_runs" "$runs workflow run(s) for this head are finished and judged"
     return 0
   fi
   # Checkless: how long there has been to create a run. Two clocks, and the FRESHER wins, because
@@ -3674,7 +3813,7 @@ run_signal() {
   # freshest_age, which the review clock in status_state needs for the same reason.
   age=$(freshest_age "$pushed_at" "$pr_at")
   if [ "$age" = - ]; then
-    run_reason 0 "no usable clock for this head: neither its commit date nor the PR's updated_at" \
+    run_reason 0 "$waived_runs" "no usable clock for this head: neither its commit date nor the PR's updated_at" \
       " could be read ($(gh_err_line)), or both are in the future, so the run-creation window" \
       " is unknown"
     return 3
@@ -3691,19 +3830,19 @@ run_signal() {
   # (ludics-lite#176). The refusal costs exactly what it cost before: this grace.
   if [ "$runs" -eq 0 ] && [ "$age" -lt "$ABSENT_GRACE" ] &&
     head_within_paths_ignore "$pr" "$sha" "$base_sha" "$head_ref"; then
-    run_reason 0 "no workflow run exists for this head, and none can be created by" \
+    run_reason 0 "$waived_runs" "no workflow run exists for this head, and none can be created by" \
       " $PATHS_IGNORE_WHY: every trigger of theirs that this change fires is either filtered" \
       " out by its own paths-ignore — every commit from the merge base up changes only ignored" \
       " paths — or cannot reach this branch at all"
     return 0
   fi
   if [ "$age" -lt "$ABSENT_GRACE" ]; then
-    run_reason 0 "$seen, and the head has been in place at most $(fmt_age "$age") — inside the" \
+    run_reason 0 "$waived_runs" "$seen, and the head has been in place at most $(fmt_age "$age") — inside the" \
       " $(fmt_age "$ABSENT_GRACE") run-creation grace (SHIP_PR_BASE_ABSENT_GRACE), so a run" \
       " may still appear"
     return 4
   fi
-  run_reason 0 "$seen in the $(fmt_age "$age") since it appeared — past the" \
+  run_reason 0 "$waived_runs" "$seen in the $(fmt_age "$age") since it appeared — past the" \
     " $(fmt_age "$ABSENT_GRACE") run-creation grace"
   return 0
 }
@@ -3713,9 +3852,21 @@ run_signal() {
 # 0 = green, or an absence run_signal confirmed is the verdict (nothing is red), 1 = RED (a check
 # or a checkless run), 3 = the API did not answer, 4 = no verdict yet (still running, stopped
 # without a verdict, or a run for this head has yet to produce its checks), 5 = superseded head.
+# A third argument `waive` is merge --override's: the first read's reds are recorded as waived
+# (see is_waived), and a head whose every red is one of them, with every other check and run
+# judged, is VERDICT=waived — still exit 1, since it IS red, but the only red cmd_merge's
+# override takes. Anything still running under a waived red is 4 and held by --wait like any
+# other; a red that is not in the set is VERDICT red or runred, as it would be without one.
 gate_checks() {
   local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining
-  local run_why="" run_info note pr_at="" base_sha="" head_ref="" current_sha
+  local run_why="" run_info note pr_at="" base_sha="" head_ref="" current_sha waived_runs rname rid
+  WAIVED=$'\n'
+  RUN_WAIVED=0
+  CHECK_WAIVED=0
+  case "${3:-}" in
+  waive) GATE_WAIVE=record ;;
+  *) GATE_WAIVE="" ;;
+  esac
   # One read for both: the head to judge, and the PR's own last-updated stamp, which run_signal
   # uses as the push clock a stale committer date cannot provide. Tab-separated with a placeholder
   # for the same reason build_checks uses one — an empty field would collapse under tab-IFS.
@@ -3758,6 +3909,10 @@ gate_checks() {
         "the build signal is UNKNOWN, which is NOT 'nothing is red'."
       return 3
     fi
+    if [ -n "$GATE_WAIVE" ]; then
+      apply_waiver "$lines"
+      lines="$WAIVER_ROWS"
+    fi
     summarize_checks "$lines"
     # Every fold but a red one gets the run list's deciding read. Green can be green over a
     # sibling that has not judged the head; an absence can be a run whose checks do not exist yet;
@@ -3768,10 +3923,30 @@ gate_checks() {
     # strongest verdict, and a second read cannot add to it. This happens with no --wait too,
     # where the honest answer to "is there a signal here" is 4, not a 0 the merge gate would take
     # for "nothing is red".
+    RUN_WAIVED=0
     if [ "$VERDICT" != red ]; then
       run_info=$(run_signal "$sha" "$pr_at" "$CHECK_TOTAL" "$base_sha" "$head_ref" "$pr")
       rc=$?
       run_why="${run_info#*$'\t'}"
+      waived_runs="${run_why%%$'\t'*}"
+      run_why="${run_why#*$'\t'}"
+      # The run-level reds the waiver took out of run_signal's count: recorded when this is the
+      # recording read, and reported either way, since they are reds the merge goes over.
+      while IFS= read -r rname; do
+        [ -n "$rname" ] || continue
+        RUN_WAIVED=$((RUN_WAIVED + 1))
+        rid="${rname%% *}"
+        rname="${rname#* }"
+        case "${rname%% *}" in
+        job) CHECK_LINES="${CHECK_LINES}  RED      workflow run ${rname#* } (red through a check above that is WAIVED)"$'\n' ;;
+        *)
+          # Only a checkless red is waived by its run id; one red through a waived check is
+          # covered by that check's key, and recording its id would waive the run's later reds.
+          [ "$GATE_WAIVE" != record ] || WAIVED="${WAIVED}run:${rid}"$'\n'
+          CHECK_LINES="${CHECK_LINES}  RED      workflow run ${rname#* } (no build check behind it — WAIVED: red when --override was given)"$'\n'
+          ;;
+        esac
+      done <<<"$waived_runs"
       case "$rc" in
       1)
         VERDICT=runred
@@ -3790,8 +3965,12 @@ gate_checks() {
       # under a queued run used to break the loop at once, so `--wait` returned without waiting
       # for the run that was still coming (round 4). The stopped checks stay in the report below.
       4) case "$VERDICT" in pending) ;; *) VERDICT=unjudged ;; esac ;;
+      # Everything judged, and the only red a run-level one the override waived.
+      0) [ "$RUN_WAIVED" -eq 0 ] || case "$VERDICT" in green | absent) VERDICT=waived ;; esac ;;
       esac
     fi
+    # The first read is the one the override was given against; every later one applies it.
+    [ "$GATE_WAIVE" != record ] || GATE_WAIVE=apply
     # Revalidate every observation, including a terminal green or stopped old head. This
     # never follows the successor: the checks and merge binding remain about the original SHA.
     # The base and the head ref ride along, refreshed for the NEXT round: a retarget or a base
@@ -3844,6 +4023,7 @@ gate_checks() {
   [ "${CHECK_GREEN:-0}" -gt 0 ] && note=" ($CHECK_GREEN build check(s) have passed so far)"
   case "$VERDICT" in
   red) echo "build signal $REPO#$pr @${sha:0:8}: RED — $CHECK_RED of $CHECK_TOTAL build checks failed" ;;
+  waived) echo "build signal $REPO#$pr @${sha:0:8}: RED, WAIVED — every red ($((CHECK_WAIVED + RUN_WAIVED))) was red when --override was given; everything else has a verdict and none is red" ;;
   pending) echo "build signal $REPO#$pr @${sha:0:8}: NO VERDICT YET — still running" ;;
   mixed) echo "build signal $REPO#$pr @${sha:0:8}: INCOMPLETE — $CHECK_GREEN passed, the rest were stopped without a verdict" ;;
   runred) echo "build signal $REPO#$pr @${sha:0:8}: RED — $run_why" ;;
@@ -3853,7 +4033,7 @@ gate_checks() {
   esac
   [ -n "$CHECK_LINES" ] && printf '%s' "$CHECK_LINES"
   case "$VERDICT" in
-  red | runred) return 1 ;;
+  red | runred | waived) return 1 ;;
   pending | mixed | unjudged) return 4 ;;
   *) return 0 ;;
   esac
@@ -5004,13 +5184,24 @@ cmd_merge() {
   # once here, before a wait that can run two hours, and once more right before the call, since
   # the base can be retargeted or a queue enabled during the wait.
   [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
-  gate_checks "$PR_NUM" "$wait_for"
+  # An override waives the reds of the gate's first read and nothing else (ludics-lite#392, see
+  # is_waived): what is still running is waited for or refused as no verdict, and what turns red
+  # after that read is a red the override was never given for.
+  gate_checks "$PR_NUM" "$wait_for" ${override:+waive}
   gate=$?
   case "$gate" in
   1)
-    if [ -n "$override" ]; then
+    if [ -n "$override" ] && [ "$VERDICT" = waived ]; then
       echo "OVERRIDE: merging $REPO#$PR_NUM over a RED build signal — $override"
-      warn "OVERRIDE: merging $REPO#$PR_NUM over $CHECK_RED red build check(s) — $override"
+      warn "OVERRIDE: merging $REPO#$PR_NUM over $((CHECK_WAIVED + RUN_WAIVED)) red build" \
+        "check(s)/run(s), each red when the override was given (marked WAIVED above) — $override"
+    elif [ -n "$override" ]; then
+      fail 1 "REFUSING to merge $REPO#$PR_NUM: a build check or run is RED that --override did not" \
+        "waive (listed above without WAIVED). The override covers only what was red at the gate's" \
+        "first read, one check at a time: this red came after that read, so nobody has read it" \
+        "yet, or it shares its workflow and name with another check, which nothing tells apart." \
+        "Open it; if it came later and is just as unrelated, re-run merge with an --override" \
+        "whose reason covers it too (a new run records the reds it finds then)."
     else
       fail 1 "REFUSING to merge $REPO#$PR_NUM: $CHECK_RED build check(s) concluded failure on the" \
         "head commit (listed above). Fix it, or — only if that red is genuinely not about this" \
@@ -5025,10 +5216,24 @@ cmd_merge() {
     # the 30-minute wait, two PRs merged unread on the warning below, and master was red for two
     # hours (ahrefs/ocannl#745, fixed forward in lukstafi/ocannl-staging#456) — so the default
     # is now to refuse, and merging unread takes a flag, like merging over red takes a reason.
-    if [ -n "$allow_no_verdict" ]; then
+    if [ -n "$allow_no_verdict" ] && [ $((CHECK_WAIVED + RUN_WAIVED)) -gt 0 ]; then
+      # Both flags, both facts, each said in its own terms: "nothing has failed" would be false
+      # here, since the waived reds are failures the merge goes over (review round 1).
+      echo "ALLOW-NO-VERDICT: merging $REPO#$PR_NUM with NO verdict on the unfinished build signal (listed above)"
+      warn "ALLOW-NO-VERDICT: merging $REPO#$PR_NUM with checks or runs still unjudged (see" \
+        "above) — beside a red the override waives, so this is not 'nothing has failed'."
+      echo "OVERRIDE: merging $REPO#$PR_NUM over a RED build signal — $override"
+      warn "OVERRIDE: merging $REPO#$PR_NUM over $((CHECK_WAIVED + RUN_WAIVED)) red build" \
+        "check(s)/run(s), each red when the override was given (marked WAIVED above) — $override"
+    elif [ -n "$allow_no_verdict" ]; then
       echo "ALLOW-NO-VERDICT: merging $REPO#$PR_NUM with NO build verdict on the head commit"
       warn "ALLOW-NO-VERDICT: merging $REPO#$PR_NUM unread — nothing has failed, nothing has" \
         "passed either (see above)."
+    elif [ $((CHECK_WAIVED + RUN_WAIVED)) -gt 0 ]; then
+      fail 4 "REFUSING to merge $REPO#$PR_NUM: --override waives the red marked WAIVED above, but" \
+        "no verdict after $((wait_for / 60)) min on the rest (listed above) — a check still" \
+        "running, or stopped without a verdict, is not a red, and no override covers it. Wait" \
+        "for it (--wait holds up to $((CHECKS_WAIT / 60)) min, SHIP_PR_CHECKS_WAIT)."
     else
       fail 4 "REFUSING to merge $REPO#$PR_NUM: no verdict after $((wait_for / 60)) min —" \
         "re-run with --allow-no-verdict to merge unread, or wait (--wait holds up to" \
