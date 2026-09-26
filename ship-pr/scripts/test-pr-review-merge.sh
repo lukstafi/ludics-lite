@@ -454,6 +454,18 @@ test_a_check_that_turns_red_during_the_wait_is_not_waived() {
   assert_contains "$MERGE_OUTPUT" "  RED      build (failure)  " "it is listed as a plain red"
   assert_contains "$MERGE_OUTPUT" "build (failure — WAIVED" "beside the one that was waived"
   assert_no_merge_call
+  # Nor is suite-and-name: two jobs of ONE workflow may share a name. The waiver counts, so a
+  # second red under the key is one more than it recorded, and neither can be told apart from
+  # the new one — both are plain reds (review round 3). One red under it again is still waived.
+  CHECK_ROWS="$(row red build failure 1)"$'\n'"$(row pending build pending 1)"
+  CHECK_ROWS_LATER="$(row red build failure 1)"$'\n'"$(row red build failure 1)"
+  run_merge --wait=30 --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 1 "a same-named twin that went red is not waived ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "— WAIVED" "neither row of the over-full key is waived"
+  assert_no_merge_call
+  CHECK_ROWS_LATER="$(row red build failure 1)"$'\n'"$(row green build success 1)"
+  run_merge --wait=30 --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 0 "the twin went green: the one red is the one recorded ($MERGE_OUTPUT)"
 }
 
 # ludics-lite#227. A closing keyword binds to every `#N` in its sentence, so one sentence naming two

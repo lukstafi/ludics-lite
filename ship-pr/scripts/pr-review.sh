@@ -3389,7 +3389,13 @@ is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }
 #                 workflow's red waive the other's later failure (review round 1). A re-run stays
 #                 in its suite with the same name (pr-review-api-contract.sh pins filter=latest's
 #                 superseded attempt as a newer row of the same suite and name); were that ever
-#                 to move, the re-run would be refused, the loud direction.
+#                 to move, the re-run would be refused, the loud direction. Nor is suite-and-name
+#                 unique — two jobs of one workflow may legally share a name (the contract says
+#                 so) — and no field tells which of two same-named rows a re-run replaced. So the
+#                 waiver COUNTS: it records one entry per red row, and a key is waived only while
+#                 the reds now under it are no more than it recorded. One more (the pending twin
+#                 went red) un-waives every row of that key, since which of them is the new one
+#                 cannot be read — a refusal, the loud direction (review round 3).
 #   run:<run id>  a non-advisory workflow run that was red at the first read with no check to show
 #                 for it (run_signal's run-level red), by the INVOCATION: a re-run keeps its run
 #                 id (run_attempt bumps), while another dispatch of the same workflow and event is
@@ -3397,14 +3403,14 @@ is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }
 #                 waiver on to that one when it finished red (review round 2).
 # A job of a completed red run is the check of the same name in that run's suite (the contract pins
 # that join too), so run_red_is_advisory_only reads a job whose `check:<suite>/<name>` is waived as
-# explained, exactly as it reads an advisory job: otherwise the waived leg's run concludes
-# `failure` once its siblings finish and comes back as a red run.
+# explained, exactly as it reads an advisory job (and by the same count): otherwise the waived
+# leg's run concludes `failure` once its siblings finish and comes back as a red run.
 #
 # GATE_WAIVE is "" outside an override, `record` for the first read, `apply` after it. It and
 # WAIVED are globals because run_signal reads them from inside a command substitution; gate_checks
 # resets both on entry, so a `checks` call never inherits a waiver. WAIVED is newline-framed
-# (`\n` + one name per line), which is safe because every name reaches here through `@tsv`, which
-# escapes a newline inside a name.
+# (`\n` + one key per line, repeated once per red row it stands for), which is safe because every
+# name reaches here through `@tsv`, which escapes a newline inside a name.
 GATE_WAIVE=""
 WAIVED=$'\n'
 is_waived() {
@@ -3412,17 +3418,37 @@ is_waived() {
   return 1
 }
 
+# How many lines of the newline-separated list <list> are exactly <line>.
+count_line() { # <list> <line>
+  local l n=0
+  while IFS= read -r l; do
+    [ "$l" != "$2" ] || n=$((n + 1))
+  done <<<"$1"
+  printf '%s\n' "$n"
+}
+
+# True when <key> is waived for <n> red rows under it now: the record holds at least that many.
+waiver_covers() { # <key> <n>
+  [ "$(count_line "$WAIVED" "$1")" -ge "$2" ] && is_waived "$1"
+}
+
 # Marks the waived red rows of a build_checks listing as class `waived`, recording every red one
 # first when this is the recording read. Sets WAIVER_ROWS rather than printing, because the record
-# has to land in THIS shell. Rows keep build_checks' shape and placeholders.
+# has to land in THIS shell. Rows keep build_checks' shape and placeholders. Two passes, because a
+# key is waived by COUNT (see is_waived): the reds under each key are counted before any is marked.
 apply_waiver() {
-  local class name concl url suite
+  local class name concl url suite reds=""
   WAIVER_ROWS=""
   while IFS=$'\t' read -r class name concl url suite; do
+    [ "$class" = red ] || continue
+    reds="${reds}check:${suite}/${name}"$'\n'
+    [ "$GATE_WAIVE" != record ] || WAIVED="${WAIVED}check:${suite}/${name}"$'\n'
+  done <<<"$1"
+  while IFS=$'\t' read -r class name concl url suite; do
     [ -n "$class" ] || continue
-    if [ "$class" = red ]; then
-      [ "$GATE_WAIVE" != record ] || WAIVED="${WAIVED}check:${suite}/${name}"$'\n'
-      is_waived "check:$suite/$name" && class=waived
+    if [ "$class" = red ] &&
+      waiver_covers "check:$suite/$name" "$(count_line "$reds" "check:$suite/$name")"; then
+      class=waived
     fi
     WAIVER_ROWS="${WAIVER_ROWS}${class}"$'\t'"${name}"$'\t'"${concl}"$'\t'"${url}"$'\t'"${suite}"$'\n'
   done <<<"$1"
@@ -3610,19 +3636,25 @@ run_reason() {
 # ignores. A run with NO jobs (the `startup_failure` case this red branch exists for) is not
 # explained, and neither is a jobs read that failed — a red this cannot disprove stands.
 run_red_is_advisory_only() {
-  local id="$1" suite="${2:--}" raw rc jname jconcl jobs=0 hard=0
+  local id="$1" suite="${2:--}" raw rc jname jconcl jobs=0 hard=0 reds=""
   raw=$(gh_retry read api --paginate "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
     --jq '.jobs[] | [(.name // "-"), (.conclusion // "pending")] | @tsv')
   rc=$?
   [ "$rc" -eq 0 ] || return 1
+  # The run's red jobs by waiver key, counted first: a same-named pair is waived only as far as
+  # the record covers it (see is_waived).
+  while IFS=$'\t' read -r jname jconcl; do
+    [ "$(conclusion_class "$jconcl")" = red ] && reds="${reds}check:${suite}/${jname}"$'\n'
+  done <<<"$raw"
   while IFS=$'\t' read -r jname jconcl; do
     [ -n "$jname" ] || continue
     jobs=$((jobs + 1))
     is_advisory "$jname" && continue
-    # A job an override waived by its check's name explains its run's red the same way
-    # (ludics-lite#392, see is_waived). Outside an override WAIVED is empty and this never holds.
-    is_waived "check:$suite/$jname" && continue
-    [ "$(conclusion_class "$jconcl")" = red ] && hard=$((hard + 1))
+    [ "$(conclusion_class "$jconcl")" = red ] || continue
+    # A job an override waived as its check explains its run's red the same way (ludics-lite#392,
+    # see is_waived). Outside an override WAIVED is empty and this never holds.
+    waiver_covers "check:$suite/$jname" "$(count_line "$reds" "check:$suite/$jname")" && continue
+    hard=$((hard + 1))
   done <<<"$raw"
   [ "$jobs" -gt 0 ] && [ "$hard" -eq 0 ]
 }
