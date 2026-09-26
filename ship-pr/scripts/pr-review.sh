@@ -3390,12 +3390,15 @@ is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }
 #                 in its suite with the same name (pr-review-api-contract.sh pins filter=latest's
 #                 superseded attempt as a newer row of the same suite and name); were that ever
 #                 to move, the re-run would be refused, the loud direction. Nor is suite-and-name
-#                 unique — two jobs of one workflow may legally share a name (the contract says
-#                 so) — and no field tells which of two same-named rows a re-run replaced. So the
-#                 waiver COUNTS: it records one entry per red row, and a key is waived only while
-#                 the reds now under it are no more than it recorded. One more (the pending twin
-#                 went red) un-waives every row of that key, since which of them is the new one
-#                 cannot be read — a refusal, the loud direction (review round 3).
+#                 always unique — two jobs of one workflow may legally share a name (the contract
+#                 says so) — and no field tells which of two same-named rows a re-run replaced, so
+#                 no bookkeeping over such a pair can say which red is the one that was read
+#                 (review rounds 3 and 4: a count was defeated by a re-run swapping the twins). A
+#                 key is therefore waived only while it names exactly ONE row: at the first read
+#                 (a same-named pair there is not recorded, so its red refuses at once) and at
+#                 every read after it (a second row appearing under a waived key un-waives it).
+#                 Both are refusals, the loud direction, for a shape this repo's own CI does not
+#                 have.
 #   run:<run id>  a non-advisory workflow run that was red at the first read with no check to show
 #                 for it (run_signal's run-level red), by the INVOCATION: a re-run keeps its run
 #                 id (run_attempt bumps), while another dispatch of the same workflow and event is
@@ -3403,14 +3406,15 @@ is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }
 #                 waiver on to that one when it finished red (review round 2).
 # A job of a completed red run is the check of the same name in that run's suite (the contract pins
 # that join too), so run_red_is_advisory_only reads a job whose `check:<suite>/<name>` is waived as
-# explained, exactly as it reads an advisory job (and by the same count): otherwise the waived
-# leg's run concludes `failure` once its siblings finish and comes back as a red run.
+# explained, exactly as it reads an advisory job (and only while the run has one job of that
+# name): otherwise the waived leg's run concludes `failure` once its siblings finish and comes
+# back as a red run.
 #
 # GATE_WAIVE is "" outside an override, `record` for the first read, `apply` after it. It and
 # WAIVED are globals because run_signal reads them from inside a command substitution; gate_checks
 # resets both on entry, so a `checks` call never inherits a waiver. WAIVED is newline-framed
-# (`\n` + one key per line, repeated once per red row it stands for), which is safe because every
-# name reaches here through `@tsv`, which escapes a newline inside a name.
+# (`\n` + one key per line), which is safe because every name reaches here through `@tsv`, which
+# escapes a newline inside a name.
 GATE_WAIVE=""
 WAIVED=$'\n'
 is_waived() {
@@ -3418,37 +3422,30 @@ is_waived() {
   return 1
 }
 
-# How many lines of the newline-separated list <list> are exactly <line>.
-count_line() { # <list> <line>
+# True when exactly one line of the newline-separated list <list> is <line>.
+one_line_is() { # <list> <line>
   local l n=0
   while IFS= read -r l; do
     [ "$l" != "$2" ] || n=$((n + 1))
   done <<<"$1"
-  printf '%s\n' "$n"
-}
-
-# True when <key> is waived for <n> red rows under it now: the record holds at least that many.
-waiver_covers() { # <key> <n>
-  [ "$(count_line "$WAIVED" "$1")" -ge "$2" ] && is_waived "$1"
+  [ "$n" -eq 1 ]
 }
 
 # Marks the waived red rows of a build_checks listing as class `waived`, recording every red one
 # first when this is the recording read. Sets WAIVER_ROWS rather than printing, because the record
 # has to land in THIS shell. Rows keep build_checks' shape and placeholders. Two passes, because a
-# key is waived by COUNT (see is_waived): the reds under each key are counted before any is marked.
+# key is waived only while it names ONE row (see is_waived), which takes every key read first.
 apply_waiver() {
-  local class name concl url suite reds=""
+  local class name concl url suite keys=""
   WAIVER_ROWS=""
   while IFS=$'\t' read -r class name concl url suite; do
-    [ "$class" = red ] || continue
-    reds="${reds}check:${suite}/${name}"$'\n'
-    [ "$GATE_WAIVE" != record ] || WAIVED="${WAIVED}check:${suite}/${name}"$'\n'
+    [ -n "$class" ] && keys="${keys}check:${suite}/${name}"$'\n'
   done <<<"$1"
   while IFS=$'\t' read -r class name concl url suite; do
     [ -n "$class" ] || continue
-    if [ "$class" = red ] &&
-      waiver_covers "check:$suite/$name" "$(count_line "$reds" "check:$suite/$name")"; then
-      class=waived
+    if [ "$class" = red ] && one_line_is "$keys" "check:$suite/$name"; then
+      [ "$GATE_WAIVE" != record ] || WAIVED="${WAIVED}check:${suite}/${name}"$'\n'
+      is_waived "check:$suite/$name" && class=waived
     fi
     WAIVER_ROWS="${WAIVER_ROWS}${class}"$'\t'"${name}"$'\t'"${concl}"$'\t'"${url}"$'\t'"${suite}"$'\n'
   done <<<"$1"
@@ -3636,15 +3633,15 @@ run_reason() {
 # ignores. A run with NO jobs (the `startup_failure` case this red branch exists for) is not
 # explained, and neither is a jobs read that failed — a red this cannot disprove stands.
 run_red_is_advisory_only() {
-  local id="$1" suite="${2:--}" raw rc jname jconcl jobs=0 hard=0 reds=""
+  local id="$1" suite="${2:--}" raw rc jname jconcl jobs=0 hard=0 names=""
   raw=$(gh_retry read api --paginate "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
     --jq '.jobs[] | [(.name // "-"), (.conclusion // "pending")] | @tsv')
   rc=$?
   [ "$rc" -eq 0 ] || return 1
-  # The run's red jobs by waiver key, counted first: a same-named pair is waived only as far as
-  # the record covers it (see is_waived).
+  # The run's job names, read first: a job is waived only while it is the one job of its name
+  # (see is_waived).
   while IFS=$'\t' read -r jname jconcl; do
-    [ "$(conclusion_class "$jconcl")" = red ] && reds="${reds}check:${suite}/${jname}"$'\n'
+    [ -n "$jname" ] && names="${names}${jname}"$'\n'
   done <<<"$raw"
   while IFS=$'\t' read -r jname jconcl; do
     [ -n "$jname" ] || continue
@@ -3653,7 +3650,7 @@ run_red_is_advisory_only() {
     [ "$(conclusion_class "$jconcl")" = red ] || continue
     # A job an override waived as its check explains its run's red the same way (ludics-lite#392,
     # see is_waived). Outside an override WAIVED is empty and this never holds.
-    waiver_covers "check:$suite/$jname" "$(count_line "$reds" "check:$suite/$jname")" && continue
+    one_line_is "$names" "$jname" && is_waived "check:$suite/$jname" && continue
     hard=$((hard + 1))
   done <<<"$raw"
   [ "$jobs" -gt 0 ] && [ "$hard" -eq 0 ]
@@ -5172,9 +5169,10 @@ cmd_merge() {
     elif [ -n "$override" ]; then
       fail 1 "REFUSING to merge $REPO#$PR_NUM: a build check or run is RED that --override did not" \
         "waive (listed above without WAIVED). The override covers only what was red at the gate's" \
-        "first read; this red came after it, so nobody has read it yet. Open it; if it is just as" \
-        "unrelated, re-run merge with an --override whose reason covers it too (a new run" \
-        "records the reds it finds then)."
+        "first read, one check at a time: this red came after that read, so nobody has read it" \
+        "yet, or it shares its workflow and name with another check, which nothing tells apart." \
+        "Open it; if it came later and is just as unrelated, re-run merge with an --override" \
+        "whose reason covers it too (a new run records the reds it finds then)."
     else
       fail 1 "REFUSING to merge $REPO#$PR_NUM: $CHECK_RED build check(s) concluded failure on the" \
         "head commit (listed above). Fix it, or — only if that red is genuinely not about this" \

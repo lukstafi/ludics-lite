@@ -1002,8 +1002,8 @@ then merges.
 It waives **exactly the reds the gate read when it was given** — the checks (and checkless
 workflow runs) that were red at the gate's first read, marked `WAIVED` in the report, each keyed
 by its check suite and name (a run by its run id), so one workflow's red never waives a
-same-named job of another, nor one dispatch's red a later dispatch (and same-named jobs of one
-suite by count: one more red under the name than the override saw refuses) —
+same-named job of another, nor one dispatch's red a later dispatch (two same-named jobs of one
+suite are not told apart by anything, so a red among them is never waived) —
 and nothing else (ludics-lite#392: ocannl-staging#776 merged over an unrelated ubuntu red while
 its macOS leg was still running, and nothing had read that leg). A check with no verdict yet is
 not a red, so it keeps the ordinary semantics: `--wait` holds for it, and without `--wait` the
