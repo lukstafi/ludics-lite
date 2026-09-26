@@ -380,7 +380,8 @@ test_superseded_head_never_merges() {
 # lukstafi/ocannl-staging#776 merged over an unrelated ubuntu red while its macOS leg was still
 # RUNNING. One red plus one in-flight check is the issue's own fixture.
 OVERRIDE_WHY='the ubuntu red is a pidfile race in an unrelated benchmark test'
-row() { printf '%s\t%s\t%s\thttps://example/%s' "$1" "$2" "$3" "$2"; } # <class> <name> <concl>
+# One build_checks row: <class> <name> <concl> [<check suite id>, default 1].
+row() { printf '%s\t%s\t%s\thttps://example/%s\t%s' "$1" "$2" "$3" "$2" "${4:-1}"; }
 
 test_an_override_waits_for_a_check_still_running() {
   reset
@@ -415,6 +416,9 @@ test_an_override_waits_for_a_check_still_running() {
   assert_eq "$MERGE_RC" 0 "--allow-no-verdict is still the flag for a missing verdict ($MERGE_OUTPUT)"
   assert_contains "$MERGE_OUTPUT" "ALLOW-NO-VERDICT:" "the unread merge is announced"
   assert_contains "$MERGE_OUTPUT" "OVERRIDE: merging" "and so is the red it goes over"
+  # ...in its own terms: with a red beside the unjudged leg, "nothing has failed" is false.
+  assert_not_contains "$MERGE_OUTPUT" "nothing has failed, nothing has passed" "the unread-merge line does not deny the red"
+  assert_contains "$MERGE_OUTPUT" "this is not 'nothing has failed'" "it says a red stands beside it"
 }
 
 # The waived set is the FIRST read's, not the one re-read after the wait: a check that turns red
@@ -440,6 +444,15 @@ test_a_check_that_turns_red_during_the_wait_is_not_waived() {
   CHECK_ROWS_LATER="$(row red ubuntu failure)"$'\n'"$(row green macos success)"
   run_merge --wait=30 --override "$OVERRIDE_WHY"
   assert_eq "$MERGE_RC" 1 "a check with no verdict at the first read was never waived ($MERGE_OUTPUT)"
+  assert_no_merge_call
+  # A name is not an identity: two workflows can each run a job called `build`, and one's red
+  # must not waive the other's later failure (review round 1). The key is the suite AND the name.
+  CHECK_ROWS="$(row red build failure 1)"$'\n'"$(row pending build pending 2)"
+  CHECK_ROWS_LATER="$(row red build failure 1)"$'\n'"$(row red build failure 2)"
+  run_merge --wait=30 --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 1 "the other workflow's same-named check was not waived ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "  RED      build (failure)  " "it is listed as a plain red"
+  assert_contains "$MERGE_OUTPUT" "build (failure — WAIVED" "beside the one that was waived"
   assert_no_merge_call
 }
 

@@ -1289,20 +1289,29 @@ test_non_advisory_job_failure_is_a_red_run() {
 # an advisory job's is; the verdict is the waiver's, not a run-level red nobody named. The second
 # half is the control: the same leg with no waiver is a plain red at the first read.
 test_a_waived_leg_does_not_redden_its_run() {
-  reset_fixture
-  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u"},
-                                        {"name":"macos","conclusion":null,"html_url":"m"}]')"
-    "$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u"},
-                         {"name":"macos","conclusion":"success","html_url":"m"}]')")
-  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"in_progress"}]')"
-    "$(runs_json '[{"name":"ci","status":"completed","conclusion":"failure"}]')")
-  JOBS_JSON=$(jobs_json '[{"name":"ubuntu","conclusion":"failure"},
-                          {"name":"macos","conclusion":"success"}]')
-  run_gate 30 waive
-  assert_eq "$GATE_RC" 1 "a waived red is still a red to the gate"
-  assert_contains "$GATE_OUTPUT" ": RED, WAIVED" "the only red is the one waived at the first read"
-  assert_contains "$GATE_OUTPUT" "ubuntu (failure — WAIVED" "the waived check is marked"
-  assert_not_contains "$GATE_OUTPUT" "concluded red with no build check" "its run is not a red of its own"
+  local suite
+  # The job is joined to its check through the run's check suite, so the same job name in ANOTHER
+  # suite explains nothing: with the run in suite 22, its red stands (review round 1).
+  for suite in 11 22; do
+    reset_fixture
+    CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u","check_suite":{"id":11}},
+                                          {"name":"macos","conclusion":null,"html_url":"m","check_suite":{"id":11}}]')"
+      "$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u","check_suite":{"id":11}},
+                           {"name":"macos","conclusion":"success","html_url":"m","check_suite":{"id":11}}]')")
+    RUNS_SEQ=("$(runs_json "$(jq -cn --argjson s "$suite" '[{name:"ci",status:"in_progress",check_suite_id:$s}]')")"
+      "$(runs_json "$(jq -cn --argjson s "$suite" '[{name:"ci",status:"completed",conclusion:"failure",check_suite_id:$s}]')")")
+    JOBS_JSON=$(jobs_json '[{"name":"ubuntu","conclusion":"failure"},
+                            {"name":"macos","conclusion":"success"}]')
+    run_gate 30 waive
+    assert_eq "$GATE_RC" 1 "a waived red is still a red to the gate (run in suite $suite)"
+    assert_contains "$GATE_OUTPUT" "ubuntu (failure — WAIVED" "the waived check is marked (run in suite $suite)"
+    if [ "$suite" = 11 ]; then
+      assert_contains "$GATE_OUTPUT" ": RED, WAIVED" "the only red is the one waived at the first read"
+      assert_not_contains "$GATE_OUTPUT" "concluded red with no build check" "its run is not a red of its own"
+    else
+      assert_contains "$GATE_OUTPUT" "concluded red with no build check" "another suite's job name explains nothing"
+    fi
+  done
   reset_fixture
   CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u"},
                                         {"name":"macos","conclusion":null,"html_url":"m"}]')")

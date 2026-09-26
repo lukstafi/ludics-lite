@@ -1000,14 +1000,17 @@ sentence is what the next reader finds in the log. It prints on both stdout and 
 then merges.
 
 It waives **exactly the reds the gate read when it was given** — the checks (and checkless
-workflow runs) that were red at the gate's first read, by name, marked `WAIVED` in the report —
+workflow runs) that were red at the gate's first read, marked `WAIVED` in the report, each keyed
+by its check suite and name (a run by its workflow and event), so one workflow's red never waives
+a same-named job of another —
 and nothing else (ludics-lite#392: ocannl-staging#776 merged over an unrelated ubuntu red while
 its macOS leg was still running, and nothing had read that leg). A check with no verdict yet is
 not a red, so it keeps the ordinary semantics: `--wait` holds for it, and without `--wait` the
 merge refuses with exit 4 naming it. A check that turns red *during* the wait is a red nobody gave
 the override for, so the merge refuses on it with exit 1; open it, and if it is just as unrelated,
 run `merge` again with a reason that covers it (the new run's first read is the new set). A waived
-check that is re-run is waited for while it runs and stays waived if it fails again.
+check that is re-run is waited for while it runs and stays waived if it fails again (a re-run
+keeps its suite).
 
 It is legitimate when you have **established** that the failure is neither about your change nor
 about the tree you are merging into: the identical red is on `master` from before your branch
