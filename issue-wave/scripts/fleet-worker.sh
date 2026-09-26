@@ -86,6 +86,8 @@
 #   FLEET_ANCHOR: box where lease and halt live; mac-studio.
 #   FLEET_ANCHOR_STATE: anchor state dir; defaults to ISSUE_WAVE_STATE.
 #   FLEET_BOXES: whole fleet; "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux". `ls` sweeps it minus local.
+#     One entry per physical box: the registry refuses a reservation under a roster naming two
+#     aliases of one box, read from wake-lab.sh's endpoint map (ludics-lite#395; endpoint_map).
 #   FLEET_BOX_CORRECTNESS_SLOTS: `<box>=<n>` pairs, how many correctness executions may share a
 #     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" whenever the roster is the
 #     default one, beside "rog-nv-linux=2 minix-amd-linux=4 tuf-amd-linux=3" in the same
@@ -1893,8 +1895,9 @@ cmd_execution() {
       check_identity ;;
     *) die "execution: list, slot -- <command>, hold -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run <run-dir> --request <id>" ;;
   esac
-  local helper out rc; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
+  local helper out rc map=""; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
+  case "$action" in reserve|run|dispatch) map=$(endpoint_map) || exit 1 ;; esac
   out=$({
     prelude "$ANCHOR"
     if [ "$action" != list ]; then lease_mutation_prelude; else printf 'shift 3\n'; fi
@@ -1903,11 +1906,33 @@ python3 - "$ANCHOR_STATE" "$@" <<'FLEET_EXECUTION_PY'
 EXECUTION_COMMAND
     cat "$helper"
     printf '\nFLEET_EXECUTION_PY\n'
-  } | run_on "$ANCHOR" EXECUTION "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$action" "$(coordinator_id)" "$(my_token)" "$payload" "$BOXES" "$SLOTS"); rc=$?
+  } | run_on "$ANCHOR" EXECUTION "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$action" "$(coordinator_id)" "$(my_token)" "$payload" "$BOXES" "$SLOTS" "$map"); rc=$?
   [ -z "$out" ] || printf '%s\n' "$out"
   if unreachable "$rc"; then echo "EXECUTION UNREACHABLE $ANCHOR: outcome unknown; reconcile before retrying dispatch"; exit 4; fi
   if [ "$rc" -eq 0 ]; then case "$action" in run|dispatch) execution_refresh "$out" >&2 ;; esac; fi
   exit "$rc"
+}
+
+# endpoint_map: the lab's endpoint map as `wake-lab.sh endpoint-map` prints it, one `<box> <alias>...`
+# line per box, for the registry's one-entry-per-box roster check (ludics-lite#395; the grammar and
+# its boundary are fleet-execution.py's header). Read from THIS checkout's wake-lab.sh, found by the
+# physical path (the skill is reached through a ~/.claude/skills symlink), so the map is never
+# restated here. No wake-lab.sh in the checkout degrades loudly: one EXECUTION WARNING on stderr and
+# an empty map, which keeps the roster check to exact entries up to case, as before. A wake-lab.sh
+# that refuses its own map refuses the reservation: a map that is there and wrong is a defect to fix.
+endpoint_map() {
+  local wake out
+  # cd -P: `..` must leave the skill symlink's TARGET, not collapse the symlink's own path.
+  wake="$(cd -P "$(dirname "$0")/../.." && pwd -P)/scripts/wake-lab.sh"
+  if [ ! -f "$wake" ]; then
+    printf '%s\n' "EXECUTION WARNING: no endpoint map ($wake is missing): FLEET_BOXES is not checked for two aliases of one box" >&2
+    return 0
+  fi
+  out=$(bash "$wake" endpoint-map) || {
+    printf '%s\n' "EXECUTION REFUSED: $wake endpoint-map failed (above), so FLEET_BOXES cannot be checked for two aliases of one box" >&2
+    return 1
+  }
+  printf '%s\n' "$out"
 }
 
 # execution_refresh <record-json>: after a dispatch, refresh the execution host's skills checkout

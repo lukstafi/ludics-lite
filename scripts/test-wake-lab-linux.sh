@@ -307,6 +307,22 @@ check 'every incomplete-row fixture ran' '[ "$n" = 14 ]'
 parsed=$(sed -n '/^case "\${1:-}" in$/,/^esac$/p' "$here/wake-lab.sh" | sed -n 's/^  \([a-z|-]*\)).*/\1/p' | tr '|' '\n' | sort -u)
 refused=$(sed -n '/^check_map() {/,/^}/p' "$here/wake-lab.sh" | sed -n 's/^      \([a-z|-]*\))$/\1/p' | tr '|' '\n' | grep -vx all | sort -u)
 check 'check_map refuses every verb the argument parser takes' '[ -n "$parsed" ] && [ "$parsed" = "$refused" ]'
+# `endpoint-map` (ludics-lite#395) is the map as data for fleet-worker.sh's roster check: each row
+# as the box and its aliases, with no site table and no box, and only for a map every rule passes.
+: >"$SSH_LOG"
+out=$(WAKE_LAB_HOSTS="$tmp/absent.sh" "$tmp/wake-lab.sh" endpoint-map 2>&1); rc=$?
+check 'endpoint-map prints each row as the box and its aliases, with no site table and nothing sent' \
+  '[ "$rc" = 0 ] && [ "$out" = "rog rog-nv-linux rog-nv-win rog-nv-wsl rog-lan
+minix minix-amd-linux minix-amd-win minix-amd-wsl minix-lan
+tuf tuf-amd-linux tuf-amd-win tuf-amd-wsl" ] && [ ! -s "$SSH_LOG" ]'
+out=$(WAKE_LAB_HOSTS="$tmp/absent.sh" "$tmp/wake-lab.sh" endpoint-map rog 2>&1); rc=$?
+check '...takes no box' '[ "$rc" = 2 ] && [[ "$out" == *"endpoint-map takes no arguments"* ]]'
+out=$(WAKE_LAB_HOSTS="$tmp/absent.sh" "$tmp/nova-bad-11/wake-lab.sh" endpoint-map 2>/dev/null); rc=$?
+err=$(WAKE_LAB_HOSTS="$tmp/absent.sh" "$tmp/nova-bad-11/wake-lab.sh" endpoint-map 2>&1 >/dev/null)
+check '...and answers nothing for a map with one alias on two boxes' '[ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *"$map_bad"*"tuf-amd-linux is on both tuf and nova"* ]]'
+out=$(WAKE_LAB_HOSTS="$tmp/absent.sh" "$tmp/nova-bad-1/wake-lab.sh" endpoint-map 2>/dev/null); rc=$?
+err=$(WAKE_LAB_HOSTS="$tmp/absent.sh" "$tmp/nova-bad-1/wake-lab.sh" endpoint-map 2>&1 >/dev/null)
+check '...or for an incomplete row' '[ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *"$row_bad"*"no WSL guest alias"* ]]'
 # A RENAMED box is its row renamed and nothing else: `all` and a bare status expand to the map's
 # rows, so no other list in the script still names the old box and refuses it as unknown.
 mkdir "$tmp/renamed"

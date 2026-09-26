@@ -120,8 +120,14 @@ is the guard either way, since logind refuses the greeter's suspend while it is 
 Use one canonical box name from the site's roster consistently (for example `rog-nv-linux`, not
 an alternating ssh alias and app host ID). New reservations and dispatch require exact
 `FLEET_BOXES` entries; aliases and case variants are refused. Configure one canonical entry per
-physical box. Outstanding records outside a changed roster block dispatch until reconciled;
-reads and evidence/conclusion remain available. No ssh alias discovery is performed. Choose
+physical box: ownership is keyed by the entry, so two aliases of one box would let a measurement
+on one sit beside a run on the other. Reserve, run and dispatch refuse such a roster, naming both
+entries and the box they share (ludics-lite#395). Which aliases are one box comes from
+`wake-lab.sh endpoint-map`, the lab's `ENDPOINT_MAP` read as data, plus entries differing only by
+case; ssh config aliases outside that map are not discovered. A checkout with no `wake-lab.sh`
+prints an `EXECUTION WARNING` and checks exact entries only; one whose map is inconsistent refuses.
+Outstanding records outside a changed roster block dispatch until reconciled; reads and
+evidence/conclusion remain available under either refusal. Choose
 placement using required hardware, current load, outstanding reservations and available warm
 checkouts. Record the checkout actually used; this does not introduce persistent verifier
 worktrees, sync, scheduling or remote agent launch.

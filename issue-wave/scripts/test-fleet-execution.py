@@ -308,6 +308,113 @@ with tempfile.TemporaryDirectory(prefix='fleet-slots-') as temporary:
     run('resume-launches')
     print('PASS: execution run, correctness slots, standing records, exclusive measurement, halt')
 
+# One roster entry per physical box (ludics-lite#395): wake-lab.sh's endpoint map says which ssh
+# aliases are one box, and a roster naming two of them is refused before it can split a
+# measurement's exclusivity. Reads and conclusions stay available under such a roster.
+import shutil
+
+
+def one_entry_per_box():
+    # A function, so its env and request helpers do not replace the module-level ones below.
+    with tempfile.TemporaryDirectory(prefix='fleet-one-box-') as temporary:
+        root = Path(temporary)
+        env = {**os.environ, 'FLEET_ANCHOR': 'local', 'FLEET_LOCAL_BOX': 'fixture',
+               'ISSUE_WAVE_STATE': str(root), 'FLEET_ANCHOR_STATE': str(root),
+               'FLEET_COORDINATOR': 'first', 'FLEET_LOCK_WAIT': '10'}
+        env.pop('FLEET_BOXES', None)
+        env.pop('FLEET_BOX_CORRECTNESS_SLOTS', None)
+
+        def run(*args, expected=0, script=SCRIPT, **extra):
+            result = subprocess.run(['bash', str(script), *args], env={**env, **extra},
+                                    text=True, capture_output=True, timeout=20)
+            assert result.returncode == expected, (args, result.returncode, result.stdout, result.stderr)
+            return result.stdout, result.stderr
+
+        def change(action, data, expected=0, script=SCRIPT, **extra):
+            with tempfile.NamedTemporaryFile(mode='w', dir=root, suffix='.input') as stream:
+                json.dump(data, stream)
+                stream.flush()
+                return run('execution', action, stream.name, expected=expected, script=script, **extra)
+
+        def request(identity, host, kind='measurement'):
+            return dict(request_id=identity, wave='wave', worker=identity, transport='subagent',
+                        issue='repo#395', purpose='fixture', agent_host='mac', execution_host=host,
+                        repository='owner/repo', requested_revision='origin/main', kind=kind)
+
+        def records():
+            return {r['request_id']: r for r in json.loads(run('execution', 'list')[0])}
+
+        run('claim')
+        # The default roster, unset and exported alike, keeps passing, with no warning.
+        out, err = change('reserve', request('measure-rog', 'rog-nv-linux'))
+        assert 'WARNING' not in err, err
+        out, err = change('reserve', request('measure-minix', 'minix-amd-linux'),
+                          FLEET_BOXES='mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux')
+        assert 'WARNING' not in err, err
+        # Two aliases of rog: the refusal names both entries and the box, whichever alias is asked for,
+        # for reserve, run and dispatch alike, and nothing is written.
+        split = 'mac-studio rog-nv-linux rog-nv-wsl minix-amd-linux'
+        want = 'FLEET_BOXES lists rog-nv-linux and rog-nv-wsl, two aliases of the one box rog'
+        for action, host in [('reserve', 'rog-nv-wsl'), ('run', 'rog-nv-wsl'), ('reserve', 'mac-studio')]:
+            out, err = change(action, request('split-' + action + '-' + host, host), expected=1, FLEET_BOXES=split)
+            assert want in err, err
+        change('reserve', request('check-mac', 'mac-studio', 'correctness'))
+        out, err = change('dispatch', dict(request_id='check-mac', evidence='fixture dispatch'),
+                          expected=1, FLEET_BOXES=split)
+        assert want in err, err
+        # The Windows host and its LAN route, the box's own name, and a case variant are one box too.
+        for roster, pair in [('mac-studio minix-amd-win minix-lan', 'minix-amd-win and minix-lan, two aliases of the one box minix'),
+                             ('mac-studio tuf tuf-amd-linux', 'tuf and tuf-amd-linux, two aliases of the one box tuf'),
+                             ('mac-studio ROG-NV-WSL rog-nv-linux', 'ROG-NV-WSL and rog-nv-linux, two aliases of the one box rog'),
+                             ('mac-studio Mac-Studio', 'mac-studio and Mac-Studio, two aliases of the one box mac-studio')]:
+            out, err = change('reserve', request('split-case', 'mac-studio', 'correctness'), expected=1, FLEET_BOXES=roster)
+            assert pair in err, (roster, err)
+        assert not [identity for identity in records() if identity.startswith('split-')], records()
+        # A repeated identical entry is the same entry, not two aliases.
+        change('reserve', request('check-mac', 'mac-studio', 'correctness'), FLEET_BOXES='mac-studio mac-studio rog-nv-linux minix-amd-linux')
+        # Reads and conclusions stay available under the split roster.
+        run('execution', 'list', FLEET_BOXES=split)
+        change('conclude', dict(request_id='measure-rog', verdict='not-launched', log='/logs/rog',
+                                evidence='fixture never dispatched'), FLEET_BOXES=split)
+        assert records()['measure-rog']['state'] == 'concluded'
+        # Reached through a skills symlink, as installed (~/.claude/skills/issue-wave -> the
+        # checkout's issue-wave), the map is still found: `..` must leave the symlink's target.
+        skills = root / 'skills'
+        skills.mkdir()
+        (skills / 'issue-wave').symlink_to(SCRIPT.resolve().parent.parent)
+        out, err = change('reserve', request('linked-split', 'rog-nv-wsl'), expected=1, FLEET_BOXES=split,
+                          script=skills / 'issue-wave' / 'scripts' / 'fleet-worker.sh')
+        assert want in err and 'WARNING' not in err, err
+        # A checkout with no wake-lab.sh degrades loudly: one warning, and the roster check keeps to
+        # exact entries up to case, so the split roster is admitted as it was before #395.
+        bare = root / 'bare'
+        (bare / 'issue-wave' / 'scripts').mkdir(parents=True)
+        for name in ['fleet-worker.sh', 'fleet-execution.py']:
+            shutil.copy(SCRIPT.with_name(name), bare / 'issue-wave' / 'scripts' / name)
+        copied = bare / 'issue-wave' / 'scripts' / 'fleet-worker.sh'
+        with tempfile.NamedTemporaryFile(mode='w', dir=root, suffix='.input') as stream:
+            json.dump(request('bare-wsl', 'rog-nv-wsl'), stream)
+            stream.flush()
+            out, err = run('execution', 'reserve', stream.name, script=copied, FLEET_BOXES=split)
+            assert 'EXECUTION WARNING: no endpoint map' in err and 'wake-lab.sh is missing' in err, err
+            # A wake-lab.sh that refuses its own map refuses the reservation instead.
+            (bare / 'scripts').mkdir()
+            (bare / 'scripts' / 'wake-lab.sh').write_text('echo "wake-lab.sh: the endpoint map is inconsistent" >&2; exit 1\n')
+            out, err = run('execution', 'reserve', stream.name, script=copied, expected=1,
+                           FLEET_BOXES='mac-studio')
+            assert 'the endpoint map is inconsistent' in err and 'endpoint-map failed' in err, err
+        assert 'bare-wsl' in records()
+        # The helper refuses a map naming one alias on two rows, rather than picking a box.
+        with tempfile.TemporaryDirectory(prefix='fleet-map-') as state:
+            result = subprocess.run(['python3', str(SCRIPT.with_name('fleet-execution.py')), state, 'reserve',
+                                     'owner', 'token', json.dumps(request('bad-map', 'mac-studio')), 'mac-studio',
+                                     '', 'rog rog-nv-linux\nnova rog-nv-linux'], text=True, capture_output=True)
+            assert result.returncode == 1 and 'puts rog-nv-linux on both rog and nova' in result.stderr, result
+        print('PASS: one roster entry per physical box, from the endpoint map; a missing map degrades loudly')
+
+
+one_entry_per_box()
+
 # Exercise real fsync calls and their publication order, including first directory creation.
 import runpy
 import stat
