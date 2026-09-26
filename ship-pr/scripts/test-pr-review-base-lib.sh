@@ -57,6 +57,13 @@ elif [ -z "${LIB_BASENAME:-}" ]; then
   exit 2
 fi
 
+# Every variable name in scope before this file defines anything: pr-review.sh's, the preamble's
+# and the environment's. `reset_fixture` clears the per-key answers by NAME PATTERN, and a pattern
+# that also matches one of these is refused rather than obeyed: in PR #419 a new prefix,
+# WORKFLOW_YAML_, matched pr-review.sh's own WORKFLOW_YAML_FILTER, the first reset unset it, and
+# the settle suite went red for a reason with nothing to do with what it tests.
+FIXTURE_NAMES_AS_SOURCED=" $(compgen -v | tr '\n' ' ') "
+
 test_tmpdir TEST_ROOT base-fixture
 
 REPO=example/repo
@@ -78,6 +85,13 @@ SHA_0=0000000000000000000000000000000000000000
 # a red — that run's jobs. So the canned answers are keyed the same way: one per workflow id, one
 # per run id. bash 3.2 has no associative arrays; the per-key answers are plain variables reached
 # through `eval`, as the other suites' sequence pops are.
+#
+# The name patterns (EREs, anchored whole) of those per-key answers, which is what `reset_fixture`
+# clears: RUNS_<workflow id>, JOBS_<run id>, RUN_<run id>, WORKFLOW_PATH_<workflow id>,
+# YAML_OF_<file basename> and FILES_<sha initial>. A pattern must match only names the cases
+# create, and `reset_fixture` refuses one that matches a name in FIXTURE_NAMES_AS_SOURCED.
+FIXTURE_KEYS=('RUNS_[0-9]+' 'JOBS_[0-9]+' 'RUN_[0-9]+' 'WORKFLOW_PATH_[0-9]+' 'YAML_OF_[A-Za-z0-9_]*'
+  'FILES_[0-9a-z]')
 TIP=""
 WORKFLOWS_JSON=""
 JOBS_DEFAULT=""
@@ -206,16 +220,29 @@ first_wid() {
 }
 
 reset_fixture() {
-  local v
+  local v re keys="" taken=""
+  # Every per-key answer a previous case set is cleared, or a case that names none would be served
+  # the last case's answers and pass for its neighbour's reasons. The names come from `compgen -v`,
+  # which lists names alone, rather than from parsing `set`, whose values can span lines.
+  re="^($(
+    IFS='|'
+    printf '%s' "${FIXTURE_KEYS[*]}"
+  ))\$"
+  for v in $(compgen -v); do
+    [[ $v =~ $re ]] || continue
+    case "$FIXTURE_NAMES_AS_SOURCED" in
+    *" $v "*) taken="$taken $v" ;;
+    *) keys="$keys $v" ;;
+    esac
+  done
+  [ -z "$taken" ] || {
+    echo "$BASE_LIB_BASENAME: REFUSING to run: reset_fixture's FIXTURE_KEYS match names that were in scope before any case ran:$taken — those are pr-review.sh's, the preamble's or the environment's, not answers a case set, and unsetting them would break the script under test (PR #419: WORKFLOW_YAML_ matched WORKFLOW_YAML_FILTER); narrow the pattern or rename the fixture key" >&2
+    exit 2
+  }
+  for v in $keys; do unset "$v"; done
   TIP="$SHA_C"
   WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"}]')
   RUNS_1=$(runs_json 1 '[]')
-  # Every RUNS_<n>/JOBS_<n> a previous case set is cleared, or a case that names none would be
-  # served the last case's answers and pass for its neighbour's reasons.
-  # Shell values can contain non-text bytes; only the ASCII variable names are parsed.
-  for v in $(set | LC_ALL=C sed -n 's/^\(RUNS_[0-9][0-9]*\)=.*/\1/p;s/^\(JOBS_[0-9][0-9]*\)=.*/\1/p;s/^\(RUN_[0-9][0-9]*\)=.*/\1/p;s/^\(WORKFLOW_PATH_[0-9][0-9]*\)=.*/\1/p;s/^\(YAML_OF_[A-Za-z0-9_]*\)=.*/\1/p'); do
-    [ "$v" = RUNS_1 ] || unset "$v"
-  done
   JOBS_DEFAULT=$(jobs_json '[]')
   FAIL_ENDPOINT=""
   FAIL_STATUS=500
@@ -238,7 +265,6 @@ reset_fixture() {
   HEAD_RUNS_LATER=""
   fixture_call_reset headruns
   FIRST_READ_DELAY=""
-  for v in $(set | LC_ALL=C sed -n 's/^\(FILES_[0-9a-z]\)=.*/\1/p'); do unset "$v"; done
   : >"$DELAY_LOG"
   : >"$PAGINATE_LOG"
   TIP_AT_ROUND=""
@@ -582,6 +608,31 @@ test_a_suite_that_shadows_the_transport_is_refused() {
   assert_not_contains "$out" "PASS:" "no case may run under a refusal"
 }
 
+# The PR #419 shape: a fixture key pattern that also matches a name pr-review.sh defines. The old
+# reset unset WORKFLOW_YAML_FILTER in silence and a suite went red somewhere else; the reset now
+# refuses, naming it. The control: names a case creates under the same patterns are still cleared.
+test_reset_fixture_refuses_to_unset_a_name_it_did_not_create() {
+  local rc v
+  reset_fixture
+  [ -n "${WORKFLOW_YAML_FILTER:-}" ] || bail "pr-review.sh should define WORKFLOW_YAML_FILTER"
+  set +e
+  (
+    FIXTURE_KEYS+=('WORKFLOW_YAML_[A-Za-z0-9_]*')
+    reset_fixture
+  ) 2>"$TEST_ROOT/refusal"
+  rc=$?
+  set -e
+  assert_eq "$rc" 2 "a key pattern over a library name is refused ($(cat "$TEST_ROOT/refusal"))"
+  assert_contains "$(cat "$TEST_ROOT/refusal")" "in scope before any case ran: WORKFLOW_YAML_FILTER —" \
+    "the refusal should name the library variable the pattern matched, alone"
+  RUNS_7=x JOBS_7003=x RUN_7003=x WORKFLOW_PATH_7=x YAML_OF_nightly=x FILES_d=x
+  reset_fixture
+  for v in RUNS_7 JOBS_7003 RUN_7003 WORKFLOW_PATH_7 YAML_OF_nightly FILES_d; do
+    assert_eq "${!v-unset}" unset "reset_fixture should clear the per-key answer $v"
+  done
+  assert_eq "$(jq -c '.workflow_runs' <<<"$RUNS_1")" '[]' "and set RUNS_1 afresh"
+}
+
 tests=(
   test_the_round_counter_counts_rounds_and_not_reads
   test_the_grace_is_spent_once_on_the_first_read
@@ -589,6 +640,7 @@ tests=(
   test_the_wall_clock_setters_refuse_what_they_cannot_mean
   test_a_suite_that_skips_the_preamble_is_refused
   test_a_suite_that_shadows_the_transport_is_refused
+  test_reset_fixture_refuses_to_unset_a_name_it_did_not_create
 )
 
 run_tests "${tests[@]}"

@@ -868,7 +868,11 @@ writing from that same wrong cwd.
 
 Four suites cover the other `base` — the one that answers "is the branch I am about to work off
 green" — over one shared fixture transport, `test-pr-review-base-lib.sh`. The first three were one
-900-line, 33-case file until ludics-lite#179, where "which suite failed" said only "base".
+900-line, 33-case file until ludics-lite#179, where "which suite failed" said only "base". Its
+`reset_fixture` clears the per-key answers by name pattern (`FIXTURE_KEYS`) and refuses a pattern
+that matches a name in scope before any case ran: in PR #419 the prefix `WORKFLOW_YAML_` matched
+`pr-review.sh`'s own `WORKFLOW_YAML_FILTER`, and the settle suite went red for a reason it does not
+test.
 
 `test-pr-review-base-red.sh` is the red REPORT: what the command says once the answer is no
 (ludics-lite#73). A red names the
