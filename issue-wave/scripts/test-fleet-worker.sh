@@ -1373,7 +1373,7 @@ bgdir() { # <name> <command...>: a finished bg-run.sh directory, its path on std
 bgreq() { # <id> -> a dispatched reservation on testbox
   jq -n --arg id "$1" '{request_id:$id, wave:"w", worker:$id, transport:"subagent", issue:"o/r#405", purpose:"bg-run fixture",
     agent_host:"testbox", execution_host:"testbox", repository:"o/r", requested_revision:"origin/main", kind:"correctness"}' > "$TMP/$1.json"
-  "${FWB[@]}" execution run "$TMP/$1.json" >/dev/null || ko "could not dispatch $1 (setup)"
+  "${FWB[@]}" execution run "$TMP/$1.json" >/dev/null 2>&1 || ko "could not dispatch $1 (setup)"
 }
 FWB=(env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other "$FW")
 sha=$(printf 'b%.0s' $(seq 40))
@@ -1400,6 +1400,13 @@ grep -q '"verdict": "fail"' <<<"$out" && grep -Fq '"remote_checkout": "testbox:/
 # The box that drove the run over ssh holds the directory; the conclusion names it.
 expect "a directory read on the box that drove the run concludes, naming that box" 0 "read on other, which drove the run on testbox" -- bgc bg-drove "$ok_dir" --box other
 grep -Fq "\"log\": \"other:$ok_dir/log\"" <<<"$out" && ok "...in the log it cites" || ko "the driving box is missing from the log: $out"
+# A checkout already on the record is kept when --checkout is absent, and replaced when it is given.
+bgreq bg-rec && jq -n '{request_id:"bg-rec", state:"running", evidence:"fixture", remote_checkout:"/rec/wt"}' > "$TMP/bg-rec-rec.json" &&
+  "${FWB[@]}" execution record "$TMP/bg-rec-rec.json" >/dev/null || ko "could not record bg-rec's checkout (setup)"
+expect "a checkout the record already carries is kept" 0 '"remote_checkout": "/rec/wt"' -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-rec --sha "$sha"
+bgreq bg-rec2 && jq -n '{request_id:"bg-rec2", state:"running", evidence:"fixture", remote_checkout:"/rec/wt"}' > "$TMP/bg-rec2-rec.json" &&
+  "${FWB[@]}" execution record "$TMP/bg-rec2-rec.json" >/dev/null || ko "could not record bg-rec2's checkout (setup)"
+expect "...and an explicit --checkout replaces it" 0 '"remote_checkout": "/named/wt"' -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-rec2 --sha "$sha" --checkout /named/wt
 # Staged states: bg-run.sh's own verdicts, never re-derived here.
 d="$TMP/bg runs/died"; mkdir -p "$d"; sh -c 'exit 0' & gone=$!; wait "$gone"; printf '%s\n\n' "$gone" > "$d/pid"; : > "$d/log"
 expect "a task killed before the command returned (DIED) concludes as cancelled" 0 '"verdict": "cancelled"' -- bgc bg-died "$d"
@@ -1445,6 +1452,8 @@ grep -q "^o/r#9 rounds=? ci=absent head=[01]m claude/issue-9: -$" <<<"$out" && o
 grep -q "rounds o/r#12 threshold=off" "$P/calls" && grep -q "^retry --read pr list --repo o/r --state open" "$P/calls" && ok "...through pr-review.sh, the repo spelled out in every read" || ko "calls: $(cat "$P/calls")"
 expect "--flag-at raises the flag; an unread count alone exits 4" 4 "o/r#9 rounds=?" -- "$FW" prs o/r --flag-at 7
 grep -q CONVERGE <<<"$out" && ko "a PR under --flag-at was flagged: $out" || ok "...and nothing is flagged under it"
+expect "a list that reaches its cap says PRs past it are not shown, exit 4" 4 "PRS INCOMPLETE o/r: the list reached its cap of 3 open PRs" -- env FLEET_PRS_LIMIT=3 "$FW" prs o/r --flag-at 7
+grep -q "^o/r#12 rounds=6" <<<"$out" && ok "...and still lists what it read" || ko "a capped list dropped its rows: $out"
 rm "$P/list.json"
 expect "an open-PR list that never answered is UNREACHABLE, exit 4" 4 "PRS UNREACHABLE: the open PRs of o/r did not answer" -- "$FW" prs o/r
 expect "prs needs an owner/repo" 2 "prs: <owner/repo> required" -- "$FW" prs

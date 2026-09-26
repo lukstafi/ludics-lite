@@ -276,8 +276,8 @@ execution host. Name the box that drove the run when the leg went over ssh (a ma
 started on the agent host leaves its directory there). Because that box is legitimately not the
 reserved one, this form carries no execution-host binding; the conclusion's `log` and `handle`
 name the box read (`<box>:<path>`), and its evidence says which box drove the run. bg-run keeps no
-checkout: `--checkout` names one, one already on the record is kept, and otherwise the field says
-it was not recorded.
+checkout: `--checkout` names one and replaces any the record carries; without it, one already on
+the record is kept, and otherwise the field says it was not recorded.
 
 A run that died before it fetched any source (a self-ssh refusal, a trip whose far side never
 started) ran no revision. It is not a verdict about one, so there is no `fail` without

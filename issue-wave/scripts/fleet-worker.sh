@@ -133,6 +133,7 @@
 #     command bare, as on macOS; the suites pin it to a stub or to nothing, never to the runner's.
 #   FLEET_TMUX_SOCKET: tmux -L name; tests isolate with it.
 #   FLEET_FLOTILLA: status service; http://mac-studio:7799.
+#   FLEET_PRS_LIMIT: how many open PRs `prs` fetches; 1000. A list that reaches it says so.
 #   FLEET_LOCK_WAIT: seconds a lease mutation waits for a concurrent one; 10.
 #   FLEET_PROBE_TIMEOUT: wall-clock bound on the live headless preflight turn; 120.
 #   FLEET_CROSS_TIMEOUT: wall-clock bound on each cross-box ssh reach probe of the preflight; 20.
@@ -201,6 +202,7 @@ INHIBIT="${FLEET_SYSTEMD_INHIBIT:-systemd-inhibit}"
 ANCHOR_STATE="${FLEET_ANCHOR_STATE:-$STATE}"
 TMUX_SOCKET="${FLEET_TMUX_SOCKET:-}"
 FLOTILLA="${FLEET_FLOTILLA:-http://mac-studio:7799}"
+PRS_LIMIT="${FLEET_PRS_LIMIT:-1000}"
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
 
 die() { echo "fleet-worker.sh: $*" >&2; exit 2; }
@@ -1534,6 +1536,7 @@ cmd_prs() {
   done
   [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "prs: <owner/repo> required"
   [[ "$flag" =~ ^[1-9][0-9]*$ ]] || die "prs: --flag-at takes a positive number of rounds"
+  [[ "$PRS_LIMIT" =~ ^[1-9][0-9]*$ ]] || die "prs: FLEET_PRS_LIMIT must be a positive number of PRs"
   helper="$(cd "$(dirname "$0")/../../ship-pr/scripts" 2>/dev/null && pwd)/pr-review.sh"
   [ -x "$helper" ] || { echo "PRS REFUSED: ship-pr's pr-review.sh missing: $helper"; exit 1; }
   if [ -n "$wave" ]; then
@@ -1544,10 +1547,17 @@ cmd_prs() {
       { echo "PRS REFUSED: the anchor's registry did not parse"; exit 1; }
     [ "$issues" != "[]" ] || { echo "PRS REFUSED: no execution record names wave $wave, so its issues are unknown"; exit 1; }
   fi
-  list=$("$helper" retry --read pr list --repo "$repo" --state open --limit 100 \
+  # `--limit` is a cap on what gh fetches, not a page size (it pages internally up to it), so a
+  # list that reaches it may have lost PRs past it: said on its own line and read as exit 4.
+  list=$("$helper" retry --read pr list --repo "$repo" --state open --limit "$PRS_LIMIT" \
     --json number,title,headRefName,headRefOid,createdAt,isDraft,closingIssuesReferences); rc=$?
   if [ "$rc" -eq 3 ]; then echo "PRS UNREACHABLE: the open PRs of $repo did not answer"; exit 4; fi
   [ "$rc" -eq 0 ] || { echo "PRS REFUSED: the open-PR list of $repo was refused (pr-review.sh exit $rc)"; exit 1; }
+  n=$(jq 'length' <<<"$list") || { echo "PRS REFUSED: the open-PR list of $repo did not parse"; exit 1; }
+  if [ "$n" -ge "$PRS_LIMIT" ]; then
+    printf '%s\n' "PRS INCOMPLETE $repo: the list reached its cap of $PRS_LIMIT open PRs (FLEET_PRS_LIMIT), so PRs past it are not shown"
+    worst=4
+  fi
   # Tab-separated with every field a nonempty placeholder, so no empty field collapses under the
   # tab IFS below and shifts the rest; the title goes last, where a stray character harms nothing.
   rows=$(jq -r --argjson issues "$issues" '
@@ -1736,8 +1746,9 @@ EOF
 # agent host) leaves its directory on the box that drove it, and 5 of the 09-25 wave's 8
 # bg-run conclusions were of that shape. So the payload carries no `execution_host` binding (the
 # registry would refuse the driving box), and the log and handle name the box read instead,
-# `<box>:<path>`. bg-run keeps no checkout: `--checkout` names one, a checkout already on the
-# record is kept, and otherwise the field says it was not recorded.
+# `<box>:<path>`. bg-run keeps no checkout: `--checkout` names one, and as the caller's explicit
+# statement it replaces any the record carries; without it a checkout already on the record is
+# kept, and otherwise the field says it was not recorded.
 conclude_from_bg_run() {
   local dir="$1" request="$2" box="$3" host="$4" sha="$5" checkout="$6" evidence="$7" bgrun="$8"
   local facts rc status code sentinel scode verdict note=""
