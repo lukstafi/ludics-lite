@@ -7,11 +7,37 @@
 # freshness preflight and point-in-time gate. Their board is coordinator-maintained (see
 # references/native-workers.md); ls/status/attach/unstick below only handle CLI workers.
 #
-# A CLI worker is a detached tmux session on its box running one headless CLI turn --
-# `claude -p --output-format stream-json` or `codex exec --json` -- with its brief on stdin and
-# its event stream on disk under the box's ~/.local/state/issue-wave/workers/<name>/. Everything
-# the coordinator needs later is a file there: the JSONL stream, stderr, the exit code, and a
-# meta file naming the kind, the cwd and the session id that addresses every intervention.
+# A CLI worker is a detached tmux session on its box running a headless CLI, with its event
+# stream on disk under the box's ~/.local/state/issue-wave/workers/<name>/. Everything the
+# coordinator needs later is a file there: the JSONL stream, stderr, the exit code, and a meta
+# file naming the kind, the cwd and the session id that addresses every intervention.
+#
+# The two kinds differ in their input channel (ludics-lite#259):
+#   - codex: one `codex exec --json` turn per process, brief on stdin; the process ends with the
+#     turn, and `unstick` resumes the thread in a new process (kill-and-resume);
+#   - claude: ONE long-lived `claude -p --input-format stream-json --output-format stream-json
+#     --replay-user-messages` process (meta `channel=stream-json`) whose stdin is fed from the
+#     append-only file input.jsonl, one JSON user message per line, the brief first. A `tail -f`
+#     feeder (its pid in feeder.pid) copies that file into a private FIFO the CLI reads, so stdin
+#     stays open between turns; `unstick` appends a line, which the CLI picks up at its next tool
+#     or turn boundary (a message sent mid-turn reaches the model mid-turn: Claude Code 2.1.282,
+#     probed 2026-09-26), and `close` kills the feeder, the CLI reads EOF and exits, and run.sh
+#     writes `exit`. input.jsonl is the durable log of every message the coordinator sent.
+#     `--replay-user-messages` echoes each message into the stream under the uuid it was sent
+#     with, which is how `unstick` and `status` prove delivery.
+#   A claude worker's states, from its stream past the current process's start (proc_offset):
+#     RUNNING  process up, a turn in progress (the last turn event is not a `result`), or the
+#              turn ended with background tasks still listed (their completion starts a turn);
+#     IDLE     process up, the last turn event is a `result` and no background task is listed:
+#              the turn ended and the worker awaits input;
+#     EXITED(n), ORPHANED, VANISHED as for codex: the process is gone (after `close`, a crash or
+#              a kill), or tmux is gone with a CLI still running, or gone with no exit record.
+#   `exit` is still written only when the process ends, so "finished" means the hand-back turn
+#   ended AND the coordinator closed the input. `attach` returns on either: an IDLE worker whose
+#   latest `result` lies past turn_offset (the stream length when the last message was sent) is
+#   an IDLE verdict, and an ended process is the DONE/FAILED/VANISHED verdict as before.
+#   One thing IDLE cannot see: a ScheduleWakeup the worker armed is not in the stream, so an IDLE
+#   worker can start a turn on its own; the next `attach` or `status` reads it.
 #
 # Why the shape is what it is, kept in code rather than skill prose:
 #   - the worker's process tree hangs off tmux on ITS box, never off the coordinator's ssh or
@@ -26,7 +52,10 @@
 #     because that box's ~/.claude/skills symlinks serve whatever its checkout holds;
 #   - `unstick` refuses to resume a session whose exec is still alive: a resume beside a live exec
 #     gives the branch two writers, and the quiet stream that prompted the unstick does not prove
-#     the exec cannot still act;
+#     the exec cannot still act. A live claude worker with its input channel up takes the message
+#     by append instead, which is the same process and so no second writer; kill-and-resume
+#     (`--kill`, or a process already gone) is the fallback for a wedged or exited one, and the
+#     output line says which path ran (APPENDED or RESUMED);
 #   - fleet-wide state -- the coordinator LEASE and the stop-the-world HALT -- lives on one anchor
 #     box (mac-studio, the always-on controller), never on whichever box the coordinator happens
 #     to run on: `claim` takes the lease atomically, every `launch` proves it holds it, and `halt`
@@ -49,6 +78,9 @@
 #   fleet-worker.sh status <box> <name>
 #   fleet-worker.sh log <box> <name> [-n <lines>]
 #   fleet-worker.sh unstick <box> <name> --message <file> [--kill] [-- <extra CLI args>]
+#                          # a live claude worker: append (APPENDED); else kill-and-resume (RESUMED)
+#   fleet-worker.sh close <box> <name>     # end an IDLE claude worker (close its input), then
+#                          # print its final verdict; an ended worker's verdict as it stands
 #   fleet-worker.sh ls [<box> ...]
 #   fleet-worker.sh load
 #   fleet-worker.sh execution list [--active] [--compact]
@@ -70,7 +102,7 @@
 #                          # CI state and head age; flags <n> (5) or more rounds (read-only)
 #   fleet-worker.sh halt <reason> | resume-launches | halted
 #
-# `launch`, `unstick`, `halt` and `resume-launches` require the lease; `launch` also refuses
+# `launch`, `unstick`, `close`, `halt` and `resume-launches` require the lease; `launch` also refuses
 # while halted (`--force` admits the one triage worker) and runs the preflight on the box first.
 # Lease and halt live on FLEET_ANCHOR.
 #
@@ -141,6 +173,10 @@
 #   FLEET_GH_TIMEOUT: wall-clock bound on the preflight's `gh api user` credential call; 30.
 #   FLEET_REFRESH_TIMEOUT: wall-clock bound on `refresh`'s skills fetch (and so on the refresh
 #     after a cross-box `execution run`/`dispatch`); 30.
+#   FLEET_DELIVERY_WAIT: seconds an appending `unstick` waits for the CLI to echo the message; 20.
+#     Past it the message is reported queued, not lost: a worker inside a long tool call reads it
+#     when the call returns.
+#   FLEET_CLOSE_WAIT: seconds `close` waits for the CLI to exit after its input closes; 60.
 
 set -uo pipefail
 
@@ -322,7 +358,72 @@ live_pat() {
 # tmux gone but the CLI reparented and still running: a live writer, not a finished worker.
 orphaned() { ! alive "$1" && pgrep -f -- "$(live_pat "$1")" >/dev/null 2>&1; }
 running() { alive "$1" || orphaned "$1"; }
-state_of() { if alive "$1"; then echo RUNNING; elif orphaned "$1"; then echo ORPHANED; elif [ -f "$WORKERS/$1/exit" ]; then echo "EXITED($(cat "$WORKERS/$1/exit"))"; else echo VANISHED; fi; }
+# A claude worker on the stream-json input channel (see the header); a record from before it, and
+# every codex worker, runs one process per turn.
+is_stream() { [ "$(meta_get "$WORKERS/$1" channel)" = stream-json ]; }
+meta_num() { local v; v=$(meta_get "$1" "$2"); case "$v" in ''|*[!0-9]*) echo "${3:-0}" ;; *) echo "$v" ;; esac; }
+# meta_set <dir> <key> <value>: replace or add one meta line, verified by reading it back.
+meta_set() {
+  { grep -v "^$2=" "$1/meta"; printf '%s=%s\n' "$2" "$3"; } > "$1/meta.new" 2>/dev/null &&
+    mv -f "$1/meta.new" "$1/meta" 2>/dev/null && [ "$(meta_get "$1" "$2")" = "$3" ]
+}
+# turn_state <name>: "<turn> <bg> <res>", read from the stream past the current process's start
+# (proc_offset). turn: `ended` when the last turn event is a `result`, `working` when it is a
+# system init, a user or an assistant event, `none` before the first; bg: how many background
+# tasks the last background_tasks_changed event listed; res: 1 when the latest message sent has
+# had its reply -- a `result` after the CLI's echo of that message (meta `awaiting`, its uuid), or,
+# for a record that names none, a `result` past turn_offset. An echo is the proof the CLI read
+# the message: a `result` between the append and the read answers something else.
+turn_state() {
+  local d="$WORKERS/$1" poff toff out
+  poff=$(meta_num "$d" proc_offset); toff=$(meta_num "$d" turn_offset)
+  [ "$toff" -ge "$poff" ] || toff=$poff
+  out=$(tail -n +"$((poff + 1))" "$d/stream.jsonl" 2>/dev/null | jq -Rrn --argjson rel "$((toff - poff))" --arg u "$(meta_get "$d" awaiting)" '
+    reduce inputs as $l ({n: 0, t: "none", bg: 0, res: 0, seen: ($u == "")};
+      .n += 1 | (($l | fromjson?) // null) as $e
+      | if ($e | type) != "object" then .
+        elif $e.type == "result" then .t = "ended" | (if .seen and .n > $rel then .res = 1 else . end)
+        elif $u != "" and $e.type == "user" and $e.uuid == $u then .t = "working" | .seen = true
+        elif $e.type == "assistant" or $e.type == "user" or ($e.type == "system" and $e.subtype == "init") then .t = "working"
+        elif $e.type == "system" and $e.subtype == "background_tasks_changed" then .bg = (($e.tasks // []) | length)
+        else . end)
+    | "\(.t) \(.bg) \(.res)"' 2>/dev/null)
+  printf '%s' "${out:-none 0 0}"
+}
+# The pid of a stream worker's live feeder, or nothing (status 1): a pid file alone could name a
+# reused pid, so the process must still be a tail on this record's input.jsonl.
+feeder_of() {
+  local d="$WORKERS/$1" p c; p=$(cat "$d/feeder.pid" 2>/dev/null)
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  c=$(ps -o command= -p "$p" 2>/dev/null)
+  case "$c" in *tail*"$d/input.jsonl"*) printf '%s' "$p" ;; *) return 1 ;; esac
+}
+# user_line <file> <uuid>: one stream-json user message carrying the file's bytes, built by jq,
+# so no message text is ever a shell word; the uuid comes back in the CLI's replay of it.
+user_line() { jq -cRs --arg u "$2" '{type: "user", uuid: $u, message: {role: "user", content: .}}' "$1" 2>/dev/null; }
+# stream_run <dir> <cwd> <from-line> --session-id|--resume <sid> [extra CLI args]: the run.sh of
+# a claude worker. The feeder copies input.jsonl from <from-line> on (a resume starts past the
+# lines an earlier process read) into a private FIFO the CLI reads, so the CLI's stdin stays open
+# until the feeder dies; the wrapper waits for the CLI alone, then ends the feeder and records the
+# exit. The FIFO is private to the record, never the channel: writers append to the file.
+stream_run() {
+  local d="$1" cwd="$2" from="$3" flag="$4" sid="$5" a; shift 5
+  printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
+  printf 'rm -f %q && mkfifo %q || { echo 96 > %q; exit 96; }\n' "$d/stdin.fifo" "$d/stdin.fifo" "$d/exit"
+  printf 'tail -n +%d -f %q > %q &\n' "$from" "$d/input.jsonl" "$d/stdin.fifo"
+  printf 'feeder=$!; echo "$feeder" > %q\n' "$d/feeder.pid"
+  printf 'claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --dangerously-skip-permissions %s %q' "$flag" "$sid"
+  for a in "$@"; do printf ' %q' "$a"; done
+  printf ' < %q >> %q 2>> %q\n' "$d/stdin.fifo" "$d/stream.jsonl" "$d/stderr.log"
+  printf 'rc=$?; kill "$feeder" 2>/dev/null; rm -f %q %q\n' "$d/stdin.fifo" "$d/feeder.pid"
+  printf 'echo "$rc" > %q\n' "$d/exit"
+}
+state_of() {
+  if alive "$1"; then
+    if is_stream "$1"; then case "$(turn_state "$1")" in "ended 0 "*) echo IDLE; return ;; esac; fi
+    echo RUNNING
+  elif orphaned "$1"; then echo ORPHANED; elif [ -f "$WORKERS/$1/exit" ]; then echo "EXITED($(cat "$WORKERS/$1/exit"))"; else echo VANISHED; fi
+}
 # A stale tmux server environment (ludics-lite#327). A CLI worker's `bash run.sh` reads no startup
 # file, and a new tmux session takes the SERVER's environment, not the asking shell's, so an
 # env.sh or gpu.sh edit reaches no CLI worker on a box whose server predates it -- silently: a
@@ -1037,9 +1138,10 @@ EOF
   # The preflight and base read may take minutes; a halt or adoption during that window
   # must still fence this launch, so the gate is read again right before anything is written.
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
-  local sid=""
+  local sid="" bid=""
   if [ "$kind" = claude ]; then
-    sid=$(gen_uuid) || { echo "LAUNCH REFUSED $box/$name: cannot generate a session id here (no uuidgen, /proc uuid, or python3)"; exit 1; }
+    # The session id, and the uuid the brief's input line carries (its replay proves delivery).
+    { sid=$(gen_uuid) && bid=$(gen_uuid); } || { echo "LAUNCH REFUSED $box/$name: cannot generate a session id here (no uuidgen, /proc uuid, or python3)"; exit 1; }
   fi
   # The brief lands beside the record, not on it: the far side moves it into place only after
   # the guards pass, so a refused launch leaves a finished worker's brief untouched.
@@ -1049,7 +1151,7 @@ EOF
   if unreachable "$prc2"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc2" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: cannot stage the brief under the worker state dir on $box (unwritable, or a file in the way)"; exit 1; }
   { prelude "$box"; cat <<'EOF'
-name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8" replace="$9" stamp="${10}" fetch_timeout="${11}"; shift 11
+name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8" replace="$9" stamp="${10}" fetch_timeout="${11}" bid="${12}"; shift 12
 d="$WORKERS/$name"; incoming="$STATE/incoming/$name-$stamp.md"
 # Until the lock is held nothing here is ours but the staged brief; `fresh` (this launch
 # creates the record, so a refusal removes it whole) is decided under the lock.
@@ -1139,21 +1241,27 @@ mv -f "$incoming" "$d/brief.md" 2>/dev/null && [ -f "$d/brief.md" ] || refuse "c
 { : > "$d/stream.jsonl" && : > "$d/stderr.log" && rm -f "$d/exit" && [ ! -e "$d/exit" ]; } 2>/dev/null ||
   refuse "cannot initialize the worker record under $d"
 # The CLI line itself, written to a file tmux runs: nothing from the brief is ever a shell word.
-{
-  printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
-  case "$kind" in
-    claude) printf 'claude -p --output-format stream-json --verbose --dangerously-skip-permissions --session-id %q' "$sid" ;;
-    codex)  printf 'codex exec --json --yolo -C %q -o %q' "$cwd" "$d/last-message.md" ;;
-  esac
-  for a in "$@"; do printf ' %q' "$a"; done
-  [ "$kind" = codex ] && printf ' -'
-  printf ' < %q >> %q 2>> %q\n' "$d/brief.md" "$d/stream.jsonl" "$d/stderr.log"
-  printf 'echo $? > %q\n' "$d/exit"
-} > "$d/run.sh" || refuse "cannot write $d/run.sh"
+# A claude worker's brief is the first line of its input channel (see the header).
+if [ "$kind" = claude ]; then
+  line=$(user_line "$d/brief.md" "$bid") && [ -n "$line" ] && printf '%s\n' "$line" > "$d/input.jsonl" 2>/dev/null ||
+    refuse "cannot write the brief to the input channel $d/input.jsonl"
+  stream_run "$d" "$cwd" 1 --session-id "$sid" "$@" > "$d/run.sh" || refuse "cannot write $d/run.sh"
+else
+  {
+    printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
+    printf 'codex exec --json --yolo -C %q -o %q' "$cwd" "$d/last-message.md"
+    for a in "$@"; do printf ' %q' "$a"; done
+    printf ' - < %q >> %q 2>> %q\n' "$d/brief.md" "$d/stream.jsonl" "$d/stderr.log"
+    printf 'echo $? > %q\n' "$d/exit"
+  } > "$d/run.sh" || refuse "cannot write $d/run.sh"
+fi
 {
   echo "kind=$kind"; echo "cwd=$cwd"; echo "box=$(hostname -s)"; echo "coordinator=$coord"
   echo "launched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "resumes=0"; echo "turn_offset=0"
   if [ -n "$sid" ]; then echo "session=$sid"; fi
+  # proc_offset: where the current process's events start; input_from: its first input line.
+  # awaiting: the uuid of the latest message sent, whose reply attach waits for.
+  if [ "$kind" = claude ]; then echo "channel=stream-json"; echo "proc_offset=0"; echo "input_from=1"; echo "awaiting=$bid"; fi
 } > "$d/meta" || refuse "cannot write $d/meta"
 msg=$(tmux_env_check) || refuse "$msg"   # the preflight's read may be minutes old
 tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")" || refuse "tmux failed"
@@ -1173,7 +1281,7 @@ if [ "$kind" = codex ]; then
 fi
 echo "LAUNCHED $BOX/$name kind=$kind session=${sid:-unknown} cwd=$cwd stream=$d/stream.jsonl${archive:+ replaced=$archive}"
 EOF
-  } | run_on "$box" "$name" "$kind" "$cwd" "$repo" "$branch" "$base" "$sid" "$(hostname -s)" "$replace" "$stamp" "${FLEET_FETCH_TIMEOUT:-300}" "$@"
+  } | run_on "$box" "$name" "$kind" "$cwd" "$repo" "$branch" "$base" "$sid" "$(hostname -s)" "$replace" "$stamp" "${FLEET_FETCH_TIMEOUT:-300}" "$bid" "$@"
   local rc=$?
   if unreachable "$rc"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   exit "$rc"
@@ -1182,10 +1290,14 @@ EOF
 # ---------------------------------------------------------------------------------------------
 # The verdict of a finished worker, from its files. Prints one line; exit 0 clean, 1 failed,
 # 3 no exit record (the session is gone but nothing wrote the code: killed, or never started).
+# A claude worker whose process is up and idle (attach's stop condition, see the header) gets an
+# IDLE line instead of DONE, or a FAILED line saying `idle` when its turn ended in an error.
 #
-# A DONE line gains `| PROBABLE STRAND: ...` when the turn's final message announces a wait still
-# pending. A headless turn's end kills the background tasks it started, so a worker that ended
-# on "the watch will wake me" will never be woken (ludics-lite#361). This is a free-text reader,
+# A DONE or IDLE line gains `| PROBABLE STRAND: ...` when the turn's final message announces a
+# wait still pending. A one-shot turn's end kills the background tasks it started, so a worker
+# that ended on "the watch will wake me" will never be woken (ludics-lite#361); an IDLE worker's
+# tasks outlive its turn, but attach reports IDLE only with none listed, so the wait it announces
+# is not a background task (a ScheduleWakeup, or nothing). This is a free-text reader,
 # and its boundary is a fail-closed allowlist: it reads ONLY the turn's final message (a Claude
 # turn's `result`, a Codex turn's last agent message), whole, case-insensitively, for the fixed
 # substrings strand_mark lists, and flags on the first one present. It does not read
@@ -1202,18 +1314,25 @@ strand_mark() {
            'armed the watch' 'armed a watch' 'while the watch runs' 'waiting in the background' \
            'running in the background'; do
     case "$text" in *"$p"*)
-      printf ' | PROBABLE STRAND: the final message says "%s"; a CLI turn'"'"'s background tasks end with it' "$p"
+      if [ "${2:-}" = idle ]; then
+        printf ' | PROBABLE STRAND: the final message says "%s"; no background task of the worker is pending' "$p"
+      else
+        printf ' | PROBABLE STRAND: the final message says "%s"; a CLI turn'"'"'s background tasks end with it' "$p"
+      fi
       return 0 ;;
     esac
   done
 }
 verdict() {
-  local name="$1" d="$WORKERS/$1" kind rc summary final
+  local name="$1" d="$WORKERS/$1" kind rc="" summary final idle=0
   kind=$(meta_get "$d" kind)
   if [ ! -f "$d/exit" ]; then
-    echo "VANISHED $BOX/$name: no exit record (killed, or the CLI never started; an orphaned CLI ran on past tmux if the stream moved -- see $d/stderr.log)"; return 3
+    if alive "$name" && is_stream "$name"; then idle=1
+    else
+      echo "VANISHED $BOX/$name: no exit record (killed, or the CLI never started; an orphaned CLI ran on past tmux if the stream moved -- see $d/stderr.log)"; return 3
+    fi
   fi
-  rc=$(cat "$d/exit")
+  [ "$idle" = 1 ] || rc=$(cat "$d/exit")
   # Only THIS turn's events count: the stream is append-only across resumes, so the verdict
   # reads past the turn_offset the launch/unstick recorded; a turn with no terminal event of
   # its own is not a success whatever the exit code said.
@@ -1228,6 +1347,14 @@ verdict() {
             [ -n "$last" ] && summary="$summary | $last" ;;
   esac
   [ -n "$summary" ] || summary="no terminal event in the stream"
+  if [ "$idle" = 1 ]; then
+    local next='awaiting input: `unstick --message` continues it, `close` ends it'
+    if [ "${ok_event:-0}" -gt 0 ]; then
+      final=$(turn | jq -Rrn '[inputs | fromjson? | select(.type=="result") | (.result // "" | tostring)] | last // ""' 2>/dev/null)
+      echo "IDLE $BOX/$name $summary | $next$(strand_mark "${final:-}" idle)"; return 0
+    fi
+    echo "FAILED $BOX/$name idle $summary | $next"; return 1
+  fi
   if [ "$rc" = 0 ] && [ "${ok_event:-0}" -gt 0 ]; then
     case "$kind" in
       claude) final=$(turn | jq -Rrn '[inputs | fromjson? | select(.type=="result") | (.result // "" | tostring)] | last // ""' 2>/dev/null) ;;
@@ -1258,6 +1385,12 @@ name="$1" interval="$2"; d="$WORKERS/$name"
 [ -f "$d/meta" ] || { echo "UNKNOWN $BOX/$name: never launched here"; exit 3; }
 started=$(now); last=$started
 while running "$name"; do
+  # A claude worker's process outlives its turns: its turn's end is IDLE with the reply to the
+  # latest message in the stream (turn_state's `ended 0 1`), checked before each sleep so a
+  # worker already idle answers at once.
+  if alive "$name" && is_stream "$name"; then
+    case "$(turn_state "$name")" in "ended 0 1") break ;; esac
+  fi
   sleep "$interval"
   t=$(now)
   if [ $((t - last)) -ge 900 ]; then
@@ -1300,7 +1433,20 @@ if git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
 else
   wt="cwd not a git repo (or gone)"
 fi
-echo "$state $BOX/$name kind=$kind session=$(session_of "$d") stream: ${events} events, ${quiet}s quiet, last=${last:-none} | $wt | resumes=$(meta_get "$d" resumes) stderr=$(wc -c < "$d/stderr.log" 2>/dev/null | tr -d ' ')B"
+# A stream worker's turn and input: the turn state and listed background tasks (see turn_state),
+# and how many messages the current process has been sent but has not echoed yet.
+chan=""
+if is_stream "$name"; then
+  read -r t bg _ <<< "$(turn_state "$name")"
+  seen=$(tail -n +"$(( $(meta_num "$d" proc_offset) + 1 ))" "$d/stream.jsonl" 2>/dev/null | jq -Rr 'fromjson? | select(.type=="user" and .isReplay==true) | .uuid // empty' 2>/dev/null)
+  unread=0
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    grep -qxF -- "$u" <<< "$seen" || unread=$((unread + 1))
+  done <<< "$(tail -n +"$(meta_num "$d" input_from 1)" "$d/input.jsonl" 2>/dev/null | jq -r '.uuid // empty' 2>/dev/null)"
+  chan=" | turn=$t background_tasks=$bg unread=$unread"
+fi
+echo "$state $BOX/$name kind=$kind session=$(session_of "$d") stream: ${events} events, ${quiet}s quiet, last=${last:-none}$chan | $wt | resumes=$(meta_get "$d" resumes) stderr=$(wc -c < "$d/stderr.log" 2>/dev/null | tr -d ' ')B"
 EOF
   } | run_on "$box" "$name"
   local rc=$?
@@ -1346,6 +1492,10 @@ cmd_unstick() {
     shift
   done
   [ -n "$msg" ] && [ -r "$msg" ] || die "unstick: --message <readable file>"
+  local dwait="${FLEET_DELIVERY_WAIT:-20}"
+  case "$dwait" in ''|*[!0-9]*) die "unstick: FLEET_DELIVERY_WAIT must be a number of seconds" ;; esac
+  # The uuid the message's input line carries: its replay in the stream proves delivery.
+  local mid; mid=$(gen_uuid) || { echo "UNSTICK REFUSED $box/$name: cannot generate a message id here (no uuidgen, /proc uuid, or python3)"; exit 1; }
   anchor_gate UNSTICK "$box/$name" 1 || exit $?
   local stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   put_file "$box" "$msg" "$STATE/incoming/$name-$stamp.md"
@@ -1356,13 +1506,19 @@ cmd_unstick() {
   # completed meanwhile fences this intervention (residual window: one ssh round trip).
   anchor_gate UNSTICK "$box/$name" 1 || exit $?
   { prelude "$box"; cat <<'EOF'
-name="$1" kill="$2" stamp="$3"; shift 3
+name="$1" kill="$2" stamp="$3" mid="$4" dwait="$5"; shift 5
 d="$WORKERS/$name"; staged="$STATE/incoming/$name-$stamp.md"
 [ -f "$d/meta" ] || { rm -f "$staged"; echo "UNSTICK REFUSED $BOX/$name: never launched here"; exit 1; }
 # Same critical section as launch: liveness checks through tmux creation, one at a time.
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
 msg=$(take_lock "$wlock" 0 "lock") || { rm -f "$staged"; echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress ($msg)"; exit 1; }
-started=0; blaunch=""; backed=0
+started=0; blaunch=""; backed=0; ilines=""
+# A resume that never started takes its line back off the input channel: the file had $ilines.
+input_restore() {
+  [ -n "$ilines" ] || return 0
+  if [ "$ilines" = 0 ]; then rm -f "$d/input.jsonl"
+  else head -n "$ilines" "$d/input.jsonl" > "$d/input.jsonl.new" 2>/dev/null && mv -f "$d/input.jsonl.new" "$d/input.jsonl"; fi
+}
 on_exit() {
   # Only backups THIS invocation made are ever restored, and only when the session does not
   # exist (the session is the truth); when it does, the backups are stale and are removed
@@ -1371,6 +1527,7 @@ on_exit() {
     if [ "$started" != 1 ] && ! alive "$name"; then
       [ -e "$d/exit.prev" ] && mv -f "$d/exit.prev" "$d/exit" 2>/dev/null
       [ -e "$d/meta.prev" ] && mv -f "$d/meta.prev" "$d/meta" 2>/dev/null
+      input_restore
       rm -f "$staged"
     else
       rm -f "$d/exit.prev" "$d/meta.prev"
@@ -1385,6 +1542,36 @@ mkdir -p "$d/messages" && mv -f "$staged" "$d/messages/$stamp.md" 2>/dev/null &&
   { echo "UNSTICK REFUSED $BOX/$name: cannot place the message under $d/messages"; exit 1; }
 kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd); sid=$(session_of "$d")
 [ -n "$sid" ] || { echo "UNSTICK REFUSED $BOX/$name: no session id in meta or stream"; exit 1; }
+# The append path (see the header): a live claude worker whose input channel is up takes the
+# message as one more input line -- the same process, so no second writer, no resume and no
+# transcript replay, whether it is IDLE or mid-turn. --kill skips it for kill-and-resume.
+if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name"; then
+  feeder_of "$name" >/dev/null || { echo "UNSTICK REFUSED $BOX/$name: the CLI's session is up but its input channel is not (no live feeder on $d/input.jsonl) -- pass --kill to resume the session instead"; exit 1; }
+  line=$(user_line "$d/messages/$stamp.md" "$mid") && [ -n "$line" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot encode the message as an input line"; exit 1; }
+  was=$(state_of "$name")
+  # attach waits for the reply to THIS message: meta names it before the line lands, so a reply
+  # that beats the next command is still read as its reply.
+  off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
+  cp -p "$d/meta" "$d/meta.prev" 2>/dev/null && meta_set "$d" turn_offset "$off" && meta_set "$d" awaiting "$mid" ||
+    { [ -e "$d/meta.prev" ] && mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
+  if ! printf '%s\n' "$line" >> "$d/input.jsonl" 2>/dev/null; then
+    mv -f "$d/meta.prev" "$d/meta"
+    echo "UNSTICK REFUSED $BOX/$name: cannot append to $d/input.jsonl"; exit 1
+  fi
+  rm -f "$d/meta.prev"
+  waited=0
+  while :; do
+    echoed=$(tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null | jq -Rrn --arg u "$mid" 'first(inputs | fromjson? | select(.type=="user" and .uuid==$u) | .uuid) // empty' 2>/dev/null)
+    [ -z "$echoed" ] && [ "$waited" -lt "$dwait" ] && alive "$name" || break
+    sleep 1; waited=$((waited + 1))
+  done
+  if [ -n "$echoed" ]; then how="delivered (echoed by the CLI)"
+  elif alive "$name"; then how="queued: not echoed within ${dwait}s -- the CLI reads it at its next tool or turn boundary, and \`status\` counts it unread until then"
+  else
+    echo "APPENDED $BOX/$name kind=claude session=$sid to=$was message=$d/messages/$stamp.md uuid=$mid NOT delivered: the process ended before echoing it -- \`attach\` for its verdict, then unstick again to resume"; exit 1
+  fi
+  echo "APPENDED $BOX/$name kind=claude session=$sid to=$was message=$d/messages/$stamp.md uuid=$mid $how"; exit 0
+fi
 [ -d "$cwd" ] || { echo "UNSTICK REFUSED $BOX/$name: recorded working directory $cwd is gone (worktree removed or renamed); nothing was changed"; exit 1; }
 # The same one-live-worker-per-worktree rule as launch, under the same box-wide lock: a
 # resume must not start beside another worker that took this worktree meanwhile.
@@ -1399,6 +1586,10 @@ for om in "$WORKERS"/*/meta; do
   running "$oname" && { echo "UNSTICK REFUSED $BOX/$name: worktree $cwd is now owned by live worker $oname on this box"; exit 1; }
 done
 grep -q '^session=' "$d/meta" || echo "session=$sid" >> "$d/meta"
+# Why this unstick resumes rather than appends, for the RESUMED line.
+if [ "$kind" = codex ]; then why="codex: one process per turn"
+elif running "$name"; then why="kill-and-resume: --kill stopped the live CLI"
+else why="resume: the CLI had ended"; fi
 if alive "$name"; then
   if [ "$kill" != 1 ]; then
     echo "UNSTICK REFUSED $BOX/$name: still running -- a resume beside a live exec gives the branch two writers; pass --kill to stop it first"; exit 1
@@ -1414,6 +1605,9 @@ pat=$(live_pat "$name")
 if [ "$kill" != 1 ] && pgrep -f -- "$pat" >/dev/null 2>&1; then
   echo "UNSTICK REFUSED $BOX/$name: tmux is gone but a CLI still runs ($(pgrep -fl -- "$pat" | head -n 2 | tr '\n' ';')); pass --kill to stop it first"; exit 1
 fi
+# A stream worker's feeder is no CLI and no writer (live_pat never matches it), and its session is
+# gone: a feeder that outlived it is ended by its pid file rather than left behind.
+if fpid=$(feeder_of "$name"); then kill "$fpid" 2>/dev/null; fi
 for i in $(seq 1 30); do
   pgrep -f -- "$pat" >/dev/null 2>&1 || break
   [ "$i" -eq 1 ] && pkill -TERM -f -- "$pat" 2>/dev/null
@@ -1424,17 +1618,21 @@ if pgrep -f -- "$pat" >/dev/null 2>&1; then
 fi
 # A resume creates a session too, with no preflight in front of it.
 msg=$(tmux_env_check) || { echo "UNSTICK REFUSED $BOX/$name: $msg"; exit 1; }
-{
-  printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
-  case "$kind" in
-    claude) printf 'claude -p --output-format stream-json --verbose --dangerously-skip-permissions --resume %q' "$sid" ;;
-    codex)  printf 'codex exec resume %q --yolo --json' "$sid" ;;
-  esac
-  for a in "$@"; do printf ' %q' "$a"; done
-  [ "$kind" = codex ] && printf ' -'
-  printf ' < %q >> %q 2>> %q\n' "$d/messages/$stamp.md" "$d/stream.jsonl" "$d/stderr.log"
-  printf 'echo $? > %q\n' "$d/exit"
-} > "$d/run.sh" 2>/dev/null && [ -s "$d/run.sh" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot write $d/run.sh (a directory in its place, or unwritable)"; exit 1; }
+# A claude session resumes onto the stream-json channel whatever it ran before (a record from
+# before it has no input.jsonl): the new process reads input.jsonl from the message's own line.
+if [ "$kind" = claude ]; then
+  line=$(user_line "$d/messages/$stamp.md" "$mid") && [ -n "$line" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot encode the message as an input line"; exit 1; }
+  il=$(grep -c '' "$d/input.jsonl" 2>/dev/null); il=${il:-0}
+  stream_run "$d" "$cwd" "$((il + 1))" --resume "$sid" "$@" > "$d/run.sh" 2>/dev/null
+else
+  {
+    printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
+    printf 'codex exec resume %q --yolo --json' "$sid"
+    for a in "$@"; do printf ' %q' "$a"; done
+    printf ' - < %q >> %q 2>> %q\n' "$d/messages/$stamp.md" "$d/stream.jsonl" "$d/stderr.log"
+    printf 'echo $? > %q\n' "$d/exit"
+  } > "$d/run.sh" 2>/dev/null
+fi && [ -f "$d/run.sh" ] && [ -s "$d/run.sh" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot write $d/run.sh (a directory in its place, or unwritable)"; exit 1; }
 n=$(meta_get "$d" resumes); n=$(( ${n:-0} + 1 ))
 # meta is set aside with exit below and restored together with it if tmux refuses.
 rm -f "$d/exit.prev" "$d/meta.prev"   # leftovers from an interrupted earlier run are not ours to restore
@@ -1444,11 +1642,17 @@ backed=1
 # previous turn's terminal event: record where the new turn's output starts.
 off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
 grep -q '^turn_offset=' "$d/meta" || echo "turn_offset=0" >> "$d/meta"
-sed -i.bak "s/^resumes=.*/resumes=$n/; s/^turn_offset=.*/turn_offset=$off/" "$d/meta" 2>/dev/null && rm -f "$d/meta.bak" && grep -q "^resumes=$n\$" "$d/meta" && grep -q "^turn_offset=$off\$" "$d/meta" ||
+sed -i.bak "s/^resumes=.*/resumes=$n/; s/^turn_offset=.*/turn_offset=$off/" "$d/meta" 2>/dev/null && rm -f "$d/meta.bak" && grep -q "^resumes=$n\$" "$d/meta" && grep -q "^turn_offset=$off\$" "$d/meta" &&
+  { [ "$kind" != claude ] || { meta_set "$d" channel stream-json && meta_set "$d" proc_offset "$off" && meta_set "$d" input_from "$((il + 1))" && meta_set "$d" awaiting "$mid"; }; } ||
   { mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
 # The previous terminal state is evidence until the resume has really started: set it aside,
 # and put it back (with the previous meta) if tmux refuses.
 if [ -e "$d/exit" ]; then mv -f "$d/exit" "$d/exit.prev" 2>/dev/null && [ ! -e "$d/exit" ] || { mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot set aside $d/exit"; exit 1; }; fi
+# The message is the resumed process's first input line; on_exit takes it back if tmux refuses.
+if [ "$kind" = claude ]; then
+  ilines=$il
+  printf '%s\n' "$line" >> "$d/input.jsonl" 2>/dev/null || { echo "UNSTICK REFUSED $BOX/$name: cannot append to $d/input.jsonl"; exit 1; }
+fi
 if ! tm new-session -d -s "iw-$name" "bash $(printf '%q' "$d/run.sh")"; then
   [ -e "$d/exit.prev" ] && mv -f "$d/exit.prev" "$d/exit"
   mv -f "$d/meta.prev" "$d/meta"
@@ -1457,11 +1661,51 @@ fi
 started=1
 release_lock "$blaunch"; blaunch=""
 rm -f "$d/exit.prev" "$d/meta.prev"
-echo "RESUMED $BOX/$name kind=$kind session=$sid resume=$n message=$d/messages/$stamp.md"
+echo "RESUMED $BOX/$name kind=$kind session=$sid resume=$n message=$d/messages/$stamp.md ($why)"
 EOF
-  } | run_on "$box" "$name" "$kill" "$stamp" "$@"
+  } | run_on "$box" "$name" "$kill" "$stamp" "$mid" "$dwait" "$@"
   local rc=$?
   if unreachable "$rc"; then echo "UNSTICK UNREACHABLE $box/$name"; exit 4; fi
+  exit "$rc"
+}
+
+# ---------------------------------------------------------------------------------------------
+# close: the end of a claude worker's life. Its process outlives every turn, so "finished" is the
+# hand-back turn ended (IDLE) AND the input closed: killing the feeder closes the CLI's stdin, the
+# CLI exits, run.sh records `exit`, and the verdict of the last turn is printed as attach would
+# (DONE/FAILED, exit 0/1). A worker mid-turn, or with background tasks listed, is refused: close
+# is never an interrupt (that is `unstick --kill`). A worker already ended prints its verdict as it
+# stands, so a close-out can run close over every worker it finished.
+cmd_close() {
+  local box="${1:-}" name="${2:-}"; [ -n "$box" ] && [ -n "$name" ] || die "close: <box> <name> required"
+  valid_name "$name" || die "close: name must be [A-Za-z0-9._-]+"
+  shift 2; [ $# -eq 0 ] || die "close: unknown option $1"
+  local cwait="${FLEET_CLOSE_WAIT:-60}"
+  case "$cwait" in ''|*[!0-9]*) die "close: FLEET_CLOSE_WAIT must be a number of seconds" ;; esac
+  anchor_gate CLOSE "$box/$name" 1 || exit $?
+  { prelude "$box"; verdict_script; cat <<'EOF'
+name="$1" cwait="$2"; d="$WORKERS/$name"
+[ -f "$d/meta" ] || { echo "CLOSE REFUSED $BOX/$name: never launched here"; exit 1; }
+mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
+msg=$(take_lock "$wlock" 0 "lock") || { echo "CLOSE REFUSED $BOX/$name: another launch, unstick or close of this name is in progress ($msg)"; exit 1; }
+trap 'release_lock "$wlock"' EXIT; trap 'exit 143' TERM HUP INT
+running "$name" || { verdict "$name"; exit $?; }
+state=$(state_of "$name")
+if ! alive "$name" || ! is_stream "$name"; then
+  echo "CLOSE REFUSED $BOX/$name: $state, not a stream-json worker with its session up (a one-shot or orphaned CLI ends with its turn) -- wait for it, or \`unstick --kill\`"; exit 1
+fi
+[ "$state" = IDLE ] || { read -r t bg _ <<< "$(turn_state "$name")"; echo "CLOSE REFUSED $BOX/$name: not idle (turn=$t, background_tasks=$bg) -- wait for attach's IDLE, or \`unstick --kill\` to interrupt"; exit 1; }
+fpid=$(feeder_of "$name") || { echo "CLOSE REFUSED $BOX/$name: no live feeder on $d/input.jsonl, so its input is closed already or was never fed -- \`attach\` waits for the CLI, \`unstick --kill\` ends it"; exit 1; }
+kill "$fpid" 2>/dev/null
+# The session ends only after run.sh has written `exit`, so the verdict never reads it half-written.
+waited=0
+while alive "$name" && [ "$waited" -lt "$cwait" ]; do sleep 1; waited=$((waited + 1)); done
+if alive "$name"; then echo "CLOSE PENDING $BOX/$name: its input closed ${cwait}s ago and the CLI still runs -- \`attach\` waits for its exit"; exit 1; fi
+verdict "$name"
+EOF
+  } | run_on "$box" "$name" "$cwait"
+  local rc=$?
+  if unreachable "$rc"; then echo "CLOSE UNREACHABLE $box/$name"; exit 4; fi
   exit "$rc"
 }
 
@@ -2404,6 +2648,7 @@ case "$cmd" in
   status) cmd_status "$@" ;;
   log) cmd_log "$@" ;;
   unstick) cmd_unstick "$@" ;;
+  close) cmd_close "$@" ;;
   ls) cmd_ls "$@" ;;
   load) cmd_load "$@" ;;
   prs) cmd_prs "$@" ;;

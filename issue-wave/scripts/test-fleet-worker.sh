@@ -231,17 +231,59 @@ expect() {
 # --- shim CLIs ------------------------------------------------------------------------------
 # claude: honours -p/--output-format/--session-id/--resume; the brief on stdin drives it: a line
 # `SLEEP <n>` sleeps (a live worker to unstick), `FAIL` makes the result an error.
+# With --input-format stream-json (a worker's channel, ludics-lite#259) it is the long-lived
+# process the real CLI is: one turn per input line, alive until stdin closes, each message echoed
+# under its uuid with --replay-user-messages. A line arriving during a SLEEP is taken mid-turn,
+# as Claude Code 2.1.282 takes one at its next tool boundary, and its text joins the reply; `BG
+# <n>` ends the turn with a background task listed that finishes <n> s later and starts a turn
+# of its own; `SILENT` exits 0 with no events; `FAIL` answers with an error result and stays up.
 cat > "$TMP/bin/claude" <<'EOF'
 #!/usr/bin/env bash
-sid=""; fmt=text; resume=""
+sid=""; fmt=text; resume=""; infmt=text; replay=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --session-id) sid="$2"; shift ;;
     --resume) resume="$2"; sid="$2"; shift ;;
     --output-format) fmt="$2"; shift ;;
+    --input-format) infmt="$2"; shift ;;
+    --replay-user-messages) replay=1 ;;
   esac
   shift
 done
+if [ "$infmt" = stream-json ]; then
+  echo_line() { [ "$replay" = 0 ] || jq -c '. + {isReplay: true}' <<<"$1"; }
+  say() { jq -cn --arg t "$1" '{type: "assistant", message: {content: [{type: "text", text: $t}]}}'; }
+  result() { jq -cn --arg t "$1" --arg s "$sid" --argjson e "${2:-false}" '{type: "result", subtype: (if $e then "error_during_execution" else "success" end), is_error: $e, num_turns: 1, result: $t, session_id: $s}'; }
+  init() { printf '{"type":"system","subtype":"init","session_id":"%s","resumed":%s}\n' "$sid" "$([ -n "$resume" ] && echo true || echo false)"; }
+  while IFS= read -r line; do
+    msg=$(jq -r '.message.content // empty' <<<"$line" 2>/dev/null)
+    init; echo_line "$line"
+    grep -q '^SILENT' <<<"$msg" && exit 0
+    extra=""
+    n=$(sed -n '/^SLEEP [0-9]/ { s/^SLEEP \([0-9]*\).*/\1/; p; q; }' <<<"$msg")
+    i=0
+    while [ -n "$n" ] && [ "$i" -lt "$n" ]; do
+      if IFS= read -r -t 1 more; then
+        echo_line "$more"; extra="$extra +msg: $(jq -r '.message.content // empty' <<<"$more" | tr '\n' ' ' | cut -c1-30)"
+      else
+        rs=$?; [ "$rs" -gt 128 ] || sleep 1   # >128 is the timeout, which already waited
+      fi
+      i=$((i + 1))
+    done
+    text="did: $(printf '%s' "$msg" | tr '\n' ' ' | cut -c1-40)$extra"
+    say "$text"
+    if grep -q '^FAIL' <<<"$msg"; then result boom true; continue; fi
+    bg=$(sed -n '/^BG [0-9]/ { s/^BG \([0-9]*\).*/\1/; p; q; }' <<<"$msg")
+    if [ -n "$bg" ]; then
+      echo '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash"}]}'
+      result "$text"; sleep "$bg"
+      echo '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+      init; text="background task done"; say "$text"
+    fi
+    result "$text"
+  done
+  exit 0
+fi
 brief=$(cat)
 # The real CLI refuses an empty stdin prompt; the shim must too, or a probe whose prompt was lost
 # on the way (bash 3.2 backgrounding, the mac-studio preflight failure) passes here and fails live.
@@ -600,13 +642,17 @@ B=(env ISSUE_WAVE_STATE="$TMP/state-b" FLEET_ANCHOR_STATE="$ISSUE_WAVE_STATE" "$
 # The lease section leaves it unheld and the launch section claims it, and a claim by the holder is
 # idempotent, so this is a no-op in a full run.
 need_lease() { "$FW" claim >/dev/null || ko "could not claim the coordinator lease (setup, not the launcher)"; }
+# settle <name>: wait for the worker's turn to end, then end the worker. A claude worker's process
+# outlives its turns (ludics-lite#259) and an IDLE one still owns its worktree, so a case that
+# needs it finished closes it; for a worker that already ended, close prints its verdict.
+settle() { "$FW" attach testbox "$1" --interval 1 >/dev/null 2>&1; "$FW" close testbox "$1" >/dev/null 2>&1; }
 # need_worker <name>: a finished worker and its worktree, as the launch section leaves behind for
 # the sections that read one. A no-op once that section has run.
 need_worker() {
   [ -d "$ISSUE_WAVE_STATE/workers/$1" ] && return 0
   need_lease
   "$FW" launch testbox "$1" --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch "claude/$1" >/dev/null &&
-    "$FW" attach testbox "$1" --interval 1 >/dev/null ||
+    settle "$1" && [ -f "$ISSUE_WAVE_STATE/workers/$1/exit" ] ||
     ko "could not prepare worker $1 (setup, not the launcher)"
 }
 
@@ -638,7 +684,7 @@ grep -q -- '--wait=301 ' "$BASE_CALL_LOG" && ko "the hand-spelled 301 ceiling is
 original_base=$(git -C "$proj" rev-parse origin/master)
 later_base=$(git -C "$proj" commit-tree 'HEAD^{tree}' -p HEAD -m later)
 expect "new worktree uses confirmed SHA despite later ref movement" 0 "LAUNCHED testbox/pinned-base" -- env SHIM_MOVE_REF_AFTER_CONFIRM="$later_base" "$FW" launch testbox pinned-base --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/pinned-base
-"$FW" attach testbox pinned-base --interval 1 >/dev/null
+settle pinned-base
 [ "$(git -C "$proj-worktrees/pinned-base" rev-parse HEAD)" = "$original_base" ] && ok "worktree starts from pinned SHA" || ko "worktree followed moving ref"
 git -C "$proj" update-ref refs/remotes/origin/master "$original_base"
 expect "target movement refuses new worktree" 1 "differs from fetched base" -- env SHIM_BASE_TIP=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$FW" launch testbox moved-base --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/moved-base
@@ -1011,7 +1057,7 @@ expect "launch without a lease refuses" 1 "LAUNCH REFUSED testbox/w1: no coordin
 "$FW" claim >/dev/null
 expect "launch says on stderr which sibling did not answer, and still launches" 0 "preflight note for testbox/w-cross: (cross-box unreachable, asleep or off the network: otherbox)" -- \
   env FLEET_BOXES="testbox otherbox" SHIM_SSH_DOWN=otherbox "$FW" launch testbox w-cross --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
-"$FW" attach testbox w-cross --interval 1 >/dev/null
+settle w-cross
 echo x >> "$repo/ship-pr/SKILL.md"
 expect "launch runs the preflight on the box and refuses a dirty served tree" 1 "LAUNCH REFUSED testbox/w1: PREFLIGHT REFUSED testbox: 1 local change(s) in the served tree" -- \
   "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
@@ -1029,12 +1075,23 @@ expect "launch creates the worktree and reports the session" 0 "LAUNCHED testbox
   "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 -- --model opus
 [ -d "$proj-worktrees/w1" ] && [ "$(git -C "$proj-worktrees/w1" rev-parse --abbrev-ref HEAD)" = claude/w1 ] && ok "worktree on the requested branch" || ko "worktree missing or wrong branch"
 grep -q -- "--model opus" "$ISSUE_WAVE_STATE/workers/w1/run.sh" && ok "extra CLI args reach the command line" || ko "extra args lost"
-expect "attach returns the verdict" 0 "DONE testbox/w1 exit=0 success is_error=false" -- "$FW" attach testbox w1 --interval 1
+# ludics-lite#259: a claude worker is one stream-json process fed from input.jsonl, the brief first.
+grep -q -- "tail -n +1 -f .*input.jsonl" "$ISSUE_WAVE_STATE/workers/w1/run.sh" && grep -q -- "claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages " "$ISSUE_WAVE_STATE/workers/w1/run.sh" &&
+  ok "a claude worker runs one stream-json process fed from its input channel" || ko "claude command: $(cat "$ISSUE_WAVE_STATE/workers/w1/run.sh")"
+[ "$(jq -j '.message.content' "$ISSUE_WAVE_STATE/workers/w1/input.jsonl")" = "$(cat "$brief")" ] && [ "$(grep -c '' "$ISSUE_WAVE_STATE/workers/w1/input.jsonl")" -eq 1 ] &&
+  ok "the brief is the channel's first line, byte for byte" || ko "input.jsonl: $(cat "$ISSUE_WAVE_STATE/workers/w1/input.jsonl")"
+expect "attach returns IDLE when the turn ends: the process stays up for the next message" 0 "IDLE testbox/w1 success is_error=false .* | awaiting input" -- "$FW" attach testbox w1 --interval 1
+expect "...ls reads it as IDLE" 0 "testbox/w1 IDLE kind=claude" -- "$FW" ls testbox
+expect "...status names the turn state and no unread input" 0 "IDLE testbox/w1 kind=claude .* | turn=ended background_tasks=0 unread=0 | " -- "$FW" status testbox w1
+expect "...and attach re-armed on an IDLE worker answers at once" 0 "IDLE testbox/w1 " -- "$FW" attach testbox w1 --interval 30
+expect "close ends an IDLE worker and prints the final verdict" 0 "DONE testbox/w1 exit=0 success is_error=false" -- "$FW" close testbox w1
+[ ! -e "$ISSUE_WAVE_STATE/workers/w1/feeder.pid" ] && [ ! -e "$ISSUE_WAVE_STATE/workers/w1/stdin.fifo" ] && ok "the process's end removes its feeder pid and FIFO" || ko "feeder or FIFO left behind"
+expect "close of an ended worker prints its verdict as it stands" 0 "DONE testbox/w1 exit=0" -- "$FW" close testbox w1
 git -C "$proj" branch -q -f alt-base master && echo b > "$proj/b" && git -C "$proj" add b && git -C "$proj" commit -q -m b && git -C "$proj" push -q origin master alt-base
 expect "FLEET_BASE_REF sets the worktree's start point when --base is not given" 0 "LAUNCHED testbox/wb " -- \
   env FLEET_BASE_REF=origin/alt-base "$FW" launch testbox wb --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/wb
 [ "$(git -C "$proj-worktrees/wb" rev-parse HEAD)" = "$(git -C "$proj" rev-parse origin/alt-base)" ] && ok "worktree started from FLEET_BASE_REF" || ko "worktree did not start from FLEET_BASE_REF"
-"$FW" attach testbox wb --interval 1 >/dev/null
+settle wb
 [ "$(cat "$ISSUE_WAVE_STATE/workers/w1/brief.md")" = "$(cat "$brief")" ] && ok "brief crossed byte-for-byte" || ko "brief mangled"
 expect "status after exit names head and branch" 0 "EXITED(0) testbox/w1 kind=claude .*branch=claude/w1" -- "$FW" status testbox w1
 expect "log prints the assistant text" 0 "did: Fix issue #1" -- "$FW" log testbox w1
@@ -1055,7 +1112,7 @@ expect "a foreign repository at the derived path is refused even on the right br
 rm -rf "$foreign"
 expect "a reused worktree on the requested branch is accepted" 0 "reusing existing worktree .* (on claude/w1)" -- \
   "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 --replace
-"$FW" attach testbox w1 --interval 1 >/dev/null
+settle w1
 bash -c 'sleep 30; :' claude "$ISSUE_WAVE_STATE/workers/w1/" >/dev/null 2>&1 & orphan=$!
 expect "--replace refuses while a process still carries the old worker's path" 1 "a CLI from the previous launch is still running" -- \
   "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj-worktrees/w1" --replace
@@ -1071,7 +1128,7 @@ expect "--replace archives the previous record and starts a fresh one" 0 "LAUNCH
 arch=$(printf '%s' "$out" | sed -n 's/.* replaced=//p')
 [ -n "$arch" ] && [ "$(cat "$arch/stream.jsonl")" = "$oldstream" ] && [ -f "$arch/exit" ] && ok "the archived record keeps the old stream and exit" || ko "archive missing or incomplete: $arch"
 [ "$(cat "$ISSUE_WAVE_STATE/workers/w1/brief.md")" = "$(cat "$brief")" ] && ok "the fresh record has the new brief" || ko "fresh record brief wrong"
-"$FW" attach testbox w1 --interval 1 >/dev/null
+settle w1
 expect "ls lists local workers with state" 0 "testbox/w1 EXITED(0) kind=claude" -- "$FW" ls testbox
 out=$(FLEET_BOXES="testbox" "$FW" ls 2>&1)
 [ "$(printf '%s\n' "$out" | grep -c '/w1 ')" -eq 1 ] && grep -q '^local/w1 ' <<<"$out" && ok "default ls sweeps the fleet minus the local box, once" || ko "default ls: $out"
@@ -1081,7 +1138,8 @@ section "failure verdicts" && {
 need_lease   # this section and every one below launch workers; see the shared setup above
 printf 'FAIL on purpose\n' > "$TMP/fail.md"
 "$FW" launch testbox wf --target-repo example/project --kind claude --brief "$TMP/fail.md" --cwd "$proj" >/dev/null
-expect "an erroring worker attaches as FAILED, exit 1" 1 "FAILED testbox/wf exit=1 error_during_execution is_error=true" -- "$FW" attach testbox wf --interval 1
+expect "an erroring turn attaches as FAILED idle, exit 1: the process awaits input" 1 "FAILED testbox/wf idle error_during_execution is_error=true .* | awaiting input" -- "$FW" attach testbox wf --interval 1
+expect "...and its close reports the failed last turn" 1 "FAILED testbox/wf exit=0 error_during_execution is_error=true" -- "$FW" close testbox wf
 printf 'SILENT\n' > "$TMP/silent.md"
 "$FW" launch testbox wsil --target-repo example/project --kind claude --brief "$TMP/silent.md" --cwd "$proj" >/dev/null
 expect "exit 0 with no terminal event is FAILED, not DONE" 1 "FAILED testbox/wsil exit=0 no terminal event" -- "$FW" attach testbox wsil --interval 1
@@ -1100,54 +1158,100 @@ expect "attach waits for the orphan to exit and then reports VANISHED" 3 "VANISH
 # ludics-lite#361: a DONE turn that ended announcing a pending wait is marked, not failed.
 printf 'The watch is ARMED; it will wake me\n' > "$TMP/strand.md"
 "$FW" launch testbox wst --target-repo example/project --kind claude --brief "$TMP/strand.md" --cwd "$proj" >/dev/null
-expect "a final message announcing a pending wait marks DONE as a PROBABLE STRAND, exit still 0" 0 \
-  'DONE testbox/wst exit=0 .* | PROBABLE STRAND: the final message says "will wake me"' -- "$FW" attach testbox wst --interval 1
+expect "a final message announcing a pending wait marks IDLE as a PROBABLE STRAND when no background task is listed, exit still 0" 0 \
+  'IDLE testbox/wst .* | PROBABLE STRAND: the final message says "will wake me"; no background task of the worker is pending' -- "$FW" attach testbox wst --interval 1
+expect "...and so does the DONE its close prints" 0 \
+  'DONE testbox/wst exit=0 .* | PROBABLE STRAND: the final message says "will wake me"' -- "$FW" close testbox wst
 printf 'The watch returned rc=0 and it merged\n' > "$TMP/nostrand.md"
 "$FW" launch testbox wns --target-repo example/project --kind claude --brief "$TMP/nostrand.md" --cwd "$proj" >/dev/null
 out=$("$FW" attach testbox wns --interval 1 2>&1)
-grep -q '^DONE testbox/wns ' <<<"$out" && ! grep -q 'PROBABLE STRAND' <<<"$out" && ok "a final message with no listed phrase is a plain DONE" || ko "unlisted final message: $out"
+grep -q '^IDLE testbox/wns ' <<<"$out" && ! grep -q 'PROBABLE STRAND' <<<"$out" && ok "a final message with no listed phrase is a plain IDLE" || ko "unlisted final message: $out"
+settle wns
+# A turn that ends with a background task listed is not the worker idle: the task's completion
+# starts a turn of its own (Claude Code 2.1.282), so attach waits it out.
+printf 'BG 5 then report\n' > "$TMP/bg.md"
+"$FW" launch testbox wbg --target-repo example/project --kind claude --brief "$TMP/bg.md" --cwd "$proj" >/dev/null
+for i in $(seq 1 20); do grep -q '"background_tasks_changed","tasks":\[{' "$ISSUE_WAVE_STATE/workers/wbg/stream.jsonl" 2>/dev/null && break; sleep 0.25; done
+expect "a turn ended with a background task listed reads as RUNNING, not IDLE" 0 "RUNNING testbox/wbg .* turn=ended background_tasks=1 " -- "$FW" status testbox wbg
+expect "...attach waits for the turn the task's completion starts" 0 "IDLE testbox/wbg .*background task done" -- "$FW" attach testbox wbg --interval 1
+settle wbg
 }
 
 section "unstick" && {
 need_lease
 need_worker w1   # its own worktree, for the sibling-session case below
-printf 'SLEEP 60 then report\n' > "$TMP/slow.md"
+# ludics-lite#259: a live claude worker takes the message by append -- mid-turn it reaches the
+# model at the next tool boundary, idle it starts the next turn -- with no kill and no resume.
+wsd="$ISSUE_WAVE_STATE/workers/ws"
+printf 'SLEEP 6 then report\n' > "$TMP/slow.md"
 "$FW" launch testbox ws --target-repo example/project --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1
-expect "unstick refuses while the exec is alive" 1 "still running.*pass --kill" -- "$FW" unstick testbox ws --message "$TMP/msg.md"
-expect "unstick --kill stops it and resumes the same session" 0 "RESUMED testbox/ws kind=claude session=[0-9a-f-]\{36\} resume=1" -- \
+pid_before=$(cat "$wsd/feeder.pid")
+expect "unstick of a live worker mid-turn appends the message and proves delivery from its echo" 0 \
+  "APPENDED testbox/ws kind=claude session=[0-9a-f-]\{36\} to=RUNNING .* delivered (echoed by the CLI)" -- "$FW" unstick testbox ws --message "$TMP/msg.md"
+expect "...the turn in flight answers it: attach waits for that reply" 0 "IDLE testbox/ws success .*did: SLEEP 6 then report +msg: Stop and answer now" -- "$FW" attach testbox ws --interval 1
+[ "$(cat "$wsd/feeder.pid")" = "$pid_before" ] && ! grep -q '"resumed":true' "$wsd/stream.jsonl" && grep -q '^resumes=0$' "$wsd/meta" &&
+  ok "...the same process took it: no restart, no resume" || ko "the append restarted the worker: $(cat "$wsd/meta")"
+[ "$(grep -c '' "$wsd/input.jsonl")" -eq 2 ] && [ "$(sed -n 2p "$wsd/input.jsonl" | jq -j '.message.content')" = "$(cat "$TMP/msg.md")" ] &&
+  ok "...and input.jsonl logs the message after the brief" || ko "input.jsonl: $(cat "$wsd/input.jsonl")"
+printf 'Now the next step.\n' > "$TMP/msg2.md"
+expect "an append to an IDLE worker starts its next turn" 0 "APPENDED testbox/ws .* to=IDLE .* delivered" -- "$FW" unstick testbox ws --message "$TMP/msg2.md"
+expect "...whose reply attach returns" 0 "IDLE testbox/ws success .*did: Now the next step" -- "$FW" attach testbox ws --interval 1
+cp "$wsd/feeder.pid" "$TMP/feeder.saved"; echo $$ > "$wsd/feeder.pid"
+expect "a live session whose input feeder is gone refuses the append and names --kill" 1 "UNSTICK REFUSED testbox/ws: the CLI's session is up but its input channel is not" -- "$FW" unstick testbox ws --message "$TMP/msg.md"
+cp "$TMP/feeder.saved" "$wsd/feeder.pid"
+jq -cn '{type: "user", uuid: "x-1", message: {role: "user", content: "SLEEP 4"}}' >> "$wsd/input.jsonl"; sleep 2
+expect "close refuses a worker whose turn is in progress" 1 "CLOSE REFUSED testbox/ws: not idle (turn=working" -- "$FW" close testbox ws
+# A record from before the channel, still running its one-shot turn: no input to append to.
+sleep 3; sed -i.bak '/^channel=/d' "$wsd/meta" && rm -f "$wsd/meta.bak"
+expect "a live one-shot claude worker still refuses without --kill" 1 "still running.*pass --kill" -- "$FW" unstick testbox ws --message "$TMP/msg.md"
+echo "channel=stream-json" >> "$wsd/meta"
+expect "unstick --kill stops a live worker and resumes the same session" 0 "RESUMED testbox/ws kind=claude session=[0-9a-f-]\{36\} resume=1 .*(kill-and-resume: --kill stopped the live CLI)" -- \
   "$FW" unstick testbox ws --message "$TMP/msg.md" --kill
-sid=$(sed -n 's/^session=//p' "$ISSUE_WAVE_STATE/workers/ws/meta")
-grep -q -- "--resume $sid" "$ISSUE_WAVE_STATE/workers/ws/run.sh" && ok "resume addresses the recorded session" || ko "resume command wrong: $(cat "$ISSUE_WAVE_STATE/workers/ws/run.sh")"
-expect "the resumed turn completes with the message's result" 0 "DONE testbox/ws exit=0 .*did: Stop and answer now" -- "$FW" attach testbox ws --interval 1
-grep -q '"resumed":true' "$ISSUE_WAVE_STATE/workers/ws/stream.jsonl" && ok "stream appended, not truncated, across the resume" || ko "stream lost the resume"
-grep -q '^resumes=1$' "$ISSUE_WAVE_STATE/workers/ws/meta" && ok "meta counts the resume" || ko "meta resumes not bumped"
+sid=$(sed -n 's/^session=//p' "$wsd/meta")
+grep -q -- "--resume $sid" "$wsd/run.sh" && grep -q -- "tail -n +5 -f " "$wsd/run.sh" && ok "the resume addresses the recorded session and feeds from the message's own line" || ko "resume command wrong: $(cat "$wsd/run.sh")"
+expect "the resumed process answers the message and idles" 0 "IDLE testbox/ws .*did: Stop and answer now" -- "$FW" attach testbox ws --interval 1
+grep -q '"resumed":true' "$wsd/stream.jsonl" && ok "stream appended, not truncated, across the resume" || ko "stream lost the resume"
+[ "$(tail -n +"$(( $(sed -n 's/^proc_offset=//p' "$wsd/meta") + 1 ))" "$wsd/stream.jsonl" | grep -c '"isReplay":true')" -eq 1 ] && ok "the resumed process read no line an earlier one had" || ko "the resume replayed old input"
+grep -q '^resumes=1$' "$wsd/meta" && ok "meta counts the resume" || ko "meta resumes not bumped"
+expect "close ends it with the resumed turn's verdict" 0 "DONE testbox/ws exit=0 .*did: Stop and answer now" -- "$FW" close testbox ws
+# Delivery is proven by the echo, not assumed: a CLI that has not read the line yet (here inside a
+# turn that reads nothing) leaves it queued and unread, and attach waits for its reply.
+printf 'BG 6\n' > "$TMP/bg4.md"
+"$FW" launch testbox wq --target-repo example/project --kind claude --brief "$TMP/bg4.md" --cwd "$proj" >/dev/null
+for i in $(seq 1 20); do grep -q '"background_tasks_changed","tasks":\[{' "$ISSUE_WAVE_STATE/workers/wq/stream.jsonl" 2>/dev/null && break; sleep 0.25; done
+expect "a message the CLI has not read is reported queued, not delivered" 0 "APPENDED testbox/wq .* queued: not echoed within 1s" -- env FLEET_DELIVERY_WAIT=1 "$FW" unstick testbox wq --message "$TMP/msg.md"
+expect "...status counts it unread" 0 "turn=.* unread=1 " -- "$FW" status testbox wq
+expect "...and attach returns the reply to it, not the turn that ended before it was read" 0 "IDLE testbox/wq .*did: Stop and answer now" -- "$FW" attach testbox wq --interval 1
+expect "...after which it is read" 0 "unread=0 " -- "$FW" status testbox wq
+settle wq
 
 printf 'SLEEP 60\n' > "$TMP/slow.md"
 "$FW" launch testbox a.b --target-repo example/project --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1
 expect "a dotted name is killed by a literal match, not a regex" 0 "RESUMED testbox/a.b" -- "$FW" unstick testbox a.b --message "$TMP/msg.md" --kill
-"$FW" attach testbox a.b --interval 1 >/dev/null
+settle a.b
 mkdir -p "$TMP/nouuid"; printf '#!/bin/sh\nexit 1\n' > "$TMP/nouuid/uuidgen"; chmod +x "$TMP/nouuid/uuidgen"
 expect "no uuidgen: a fallback still yields a session id" 0 "LAUNCHED testbox/nu kind=claude session=[0-9a-f-]\{36\}" -- \
   env PATH="$TMP/nouuid:$PATH" "$FW" launch testbox nu --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
-"$FW" attach testbox nu --interval 1 >/dev/null
+settle nu
 
-"$FW" launch testbox wo --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox wo --interval 1 >/dev/null
+"$FW" launch testbox wo --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" >/dev/null; settle wo
 bash -c 'sleep 30; :' claude "$ISSUE_WAVE_STATE/workers/wo/" >/dev/null 2>&1 & orphan=$!; disown; sleep 0.5
 expect "an orphaned CLI (tmux gone) refuses a plain unstick" 1 "tmux is gone but a CLI still runs" -- "$FW" unstick testbox wo --message "$TMP/msg.md"
 kill -0 "$orphan" 2>/dev/null && ok "the orphan was not killed by the refused unstick" || ko "plain unstick killed the orphan"
 expect "unstick --kill terminates the orphan and resumes" 0 "RESUMED testbox/wo" -- "$FW" unstick testbox wo --message "$TMP/msg.md" --kill
 kill -0 "$orphan" 2>/dev/null && ko "orphan survived --kill" || ok "--kill terminated the orphan"
-"$FW" attach testbox wo --interval 1 >/dev/null
+settle wo
 mv "$ISSUE_WAVE_STATE/workers/wo/run.sh" "$TMP/run.saved"; mkdir "$ISSUE_WAVE_STATE/workers/wo/run.sh"
 expect "unstick refuses when the resume script cannot be written" 1 "UNSTICK REFUSED testbox/wo: cannot write .*run.sh" -- "$FW" unstick testbox wo --message "$TMP/msg.md"
 [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "a refused unstick keeps the previous exit record" || ko "refused unstick destroyed the exit record"
 rmdir "$ISSUE_WAVE_STATE/workers/wo/run.sh"; mv "$TMP/run.saved" "$ISSUE_WAVE_STATE/workers/wo/run.sh"
 bash -c 'sleep 3; :' tail -f "$ISSUE_WAVE_STATE/workers/wo/stream.jsonl" >/dev/null 2>&1 & disown; sleep 0.5
 expect "a diagnostic process on the record does not block a plain unstick" 0 "RESUMED testbox/wo" -- "$FW" unstick testbox wo --message "$TMP/msg.md"
-"$FW" attach testbox wo --interval 1 >/dev/null
-cp "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before"
+settle wo
+cp "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before"; cp "$ISSUE_WAVE_STATE/workers/wo/input.jsonl" "$TMP/input.before"
 expect "a tmux failure during unstick restores exit and meta" 1 "tmux failed (previous exit record and meta kept)" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" unstick testbox wo --message "$TMP/msg.md"
 cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "meta and exit are as before the failed resume" || ko "meta or exit changed by a failed resume"
+cmp -s "$ISSUE_WAVE_STATE/workers/wo/input.jsonl" "$TMP/input.before" && ok "...and the input channel takes the undelivered message back" || ko "input.jsonl changed by a failed resume: $(cat "$ISSUE_WAVE_STATE/workers/wo/input.jsonl")"
 # A resume creates a tmux session with no preflight in front of it, so it runs the stale-server
 # check itself (ludics-lite#327), before it touches the record.
 printf 'PATH=%s\nROCM_PATH=/usr\n' "$PATH" > "$TMP/genv-stale"
@@ -1174,31 +1278,33 @@ launched=$(cat "$TMP/dup-a.out" "$TMP/dup-b.out" | grep -c '^LAUNCHED testbox/du
 # the worktree ownership check. Each is a refusal; which one fires is timing.
 grep -q 'another launch of this name is in progress\|already running\|already owned by live worker' "$TMP/dup-a.out" "$TMP/dup-b.out" && ok "the other was refused by the lock, the liveness guard or ownership" || ko "no refusal for the overlapping launch -- $(cat "$TMP/dup-a.out" "$TMP/dup-b.out")"
 [ -d "$ISSUE_WAVE_STATE/locks/dup" ] && ko "launch lock left behind" || ok "launch lock released"
-"$FW" attach testbox dup --interval 1 >/dev/null   # dup shares $proj; a live owner would refuse q
+settle dup   # dup shares $proj; a live owner would refuse q
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo 999999 > "$ISSUE_WAVE_STATE/locks/q/pid"
 expect "a lock left by a dead holder is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
-"$FW" attach testbox q --interval 1 >/dev/null
+settle q
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"
 expect "a fresh ownerless lock (registration in progress) still refuses" 1 "another launch or unstick of this name is in progress" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
 touch -t 202001010000 "$ISSUE_WAVE_STATE/locks/q"
 expect "an old ownerless lock (shell died before the pid write) is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
-"$FW" attach testbox q --interval 1 >/dev/null
+settle q
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo $$ > "$ISSUE_WAVE_STATE/locks/q/pid"; echo "bogus start" > "$ISSUE_WAVE_STATE/locks/q/start"
 expect "a lock whose pid is live but whose start time differs (pid reuse) is reclaimed" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
-"$FW" attach testbox q --interval 1 >/dev/null
+settle q
 mkdir -p "$ISSUE_WAVE_STATE/locks/q"; echo $$ > "$ISSUE_WAVE_STATE/locks/q/pid"; ps -o lstart= -p $$ | tr -s ' ' > "$ISSUE_WAVE_STATE/locks/q/start"
 expect "a lock held by a live process still refuses" 1 "another launch or unstick of this name is in progress" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
 rm -rf "$ISSUE_WAVE_STATE/locks/q"
-"$FW" launch testbox q.mutating --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox q.mutating --interval 1 >/dev/null
+"$FW" launch testbox q.mutating --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" >/dev/null; settle q.mutating
 expect "a worker named like a lock suffix does not block its sibling" 0 "LAUNCHED testbox/q" -- "$FW" launch testbox q --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
-"$FW" attach testbox q --interval 1 >/dev/null
-"$FW" attach testbox dup --interval 1 >/dev/null
+settle q
+settle dup
 "$FW" unstick testbox dup --message "$TMP/msg.md" >"$TMP/un-a.out" 2>&1 & ua=$!
 "$FW" unstick testbox dup --message "$TMP/msg.md" >"$TMP/un-b.out" 2>&1 & ub=$!
 wait "$ua" "$ub"
 resumed=$(cat "$TMP/un-a.out" "$TMP/un-b.out" | grep -c '^RESUMED testbox/dup')
-[ "$resumed" -eq 1 ] && ok "two overlapping unsticks of one worker: exactly one RESUMED" || ko "overlapping unsticks: $resumed RESUMED -- $(cat "$TMP/un-a.out" "$TMP/un-b.out")"
-"$FW" attach testbox dup --interval 1 >/dev/null
+# The other one either met the name lock, or came after the resume and appended to its process.
+other=$(cat "$TMP/un-a.out" "$TMP/un-b.out" | grep -c '^APPENDED testbox/dup\|another launch or unstick of this name is in progress')
+[ "$resumed" -eq 1 ] && [ "$other" -eq 1 ] && ok "two overlapping unsticks of one ended worker: exactly one RESUMED, the other locked out or appended" || ko "overlapping unsticks: $resumed RESUMED -- $(cat "$TMP/un-a.out" "$TMP/un-b.out")"
+settle dup
 bash -c 'sleep 3; :' tail -f "$ISSUE_WAVE_STATE/workers/dup/stream.jsonl" >/dev/null 2>&1 & disown; sleep 0.5
 expect "a diagnostic process on a record file is not the worker" 0 "EXITED(0) testbox/dup" -- "$FW" status testbox dup
 rm -rf "$ISSUE_WAVE_STATE/incoming"; : > "$ISSUE_WAVE_STATE/incoming"
@@ -1211,9 +1317,9 @@ rm -f "$ISSUE_WAVE_STATE/workers/blocked"
 printf 'SLEEP 20\n' > "$TMP/slow20.md"
 "$FW" launch testbox own-a --target-repo example/project --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
 expect "a second worker on a worktree a live worker owns is refused" 1 "already owned by live worker own-a" -- "$FW" launch testbox own-b --target-repo example/project --kind claude --brief "$brief" --cwd "$proj/"
-"$FW" unstick testbox own-a --message "$TMP/msg.md" --kill >/dev/null; "$FW" attach testbox own-a --interval 1 >/dev/null
+"$FW" unstick testbox own-a --message "$TMP/msg.md" --kill >/dev/null; settle own-a
 expect "...and allowed once that worker has finished" 0 "LAUNCHED testbox/own-b" -- "$FW" launch testbox own-b --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
-"$FW" attach testbox own-b --interval 1 >/dev/null
+settle own-b
 "$FW" launch testbox race-x --target-repo example/project --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/rx.out" 2>&1 & rx=$!
 "$FW" launch testbox race-y --target-repo example/project --kind claude --brief "$TMP/slow5.md" --cwd "$proj" >"$TMP/ry.out" 2>&1 & ry=$!
 wait "$rx" "$ry"
@@ -1221,21 +1327,21 @@ n=$(cat "$TMP/rx.out" "$TMP/ry.out" | grep -c '^LAUNCHED ')
 [ "$n" -eq 1 ] && ok "two concurrent launches under different names on one worktree: exactly one LAUNCHED" || ko "worktree race: $n LAUNCHED -- $(cat "$TMP/rx.out" "$TMP/ry.out")"
 grep -q 'already owned by live worker' "$TMP/rx.out" "$TMP/ry.out" && ok "the other was refused by ownership" || ko "no ownership refusal: $(cat "$TMP/rx.out" "$TMP/ry.out")"
 [ -d "$ISSUE_WAVE_STATE/launch.lock" ] && ko "box-wide launch lock left behind" || ok "box-wide launch lock released"
-for w in race-x race-y; do "$FW" unstick testbox $w --message "$TMP/msg.md" --kill >/dev/null 2>&1; "$FW" attach testbox $w --interval 1 >/dev/null 2>&1; done
+for w in race-x race-y; do "$FW" unstick testbox $w --message "$TMP/msg.md" --kill >/dev/null 2>&1; settle $w; done
 "$FW" launch testbox hold --target-repo example/project --kind claude --brief "$TMP/slow20.md" --cwd "$proj" >/dev/null; sleep 1
 expect "unstick refuses to resume into a worktree another live worker now owns" 1 "UNSTICK REFUSED testbox/own-b: worktree .* is now owned by live worker hold" -- "$FW" unstick testbox own-b --message "$TMP/msg.md"
-"$FW" unstick testbox hold --message "$TMP/msg.md" --kill >/dev/null; "$FW" attach testbox hold --interval 1 >/dev/null
-"$FW" launch testbox p-1 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" >/dev/null; "$FW" attach testbox p-1 --interval 1 >/dev/null
+"$FW" unstick testbox hold --message "$TMP/msg.md" --kill >/dev/null; settle hold
+"$FW" launch testbox p-1 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" >/dev/null; settle p-1
 "$FW" launch testbox p-12 --target-repo example/project --kind claude --brief "$TMP/slow20.md" --cwd "$proj-worktrees/w1" >/dev/null; sleep 1   # its own worktree: ownership is not what this case tests
 expect "a finished worker is not read as running through a prefix-matching sibling session" 0 "EXITED(0) testbox/p-1 " -- "$FW" status testbox p-1
 expect "unstick --kill of the finished worker leaves the sibling session alone" 0 "RESUMED testbox/p-1" -- "$FW" unstick testbox p-1 --message "$TMP/msg.md" --kill
 expect "...the sibling is still running" 0 "RUNNING testbox/p-12" -- "$FW" status testbox p-12
-"$FW" attach testbox p-1 --interval 1 >/dev/null
-"$FW" unstick testbox p-12 --message "$TMP/msg.md" --kill >/dev/null; "$FW" attach testbox p-12 --interval 1 >/dev/null
+settle p-1
+"$FW" unstick testbox p-12 --message "$TMP/msg.md" --kill >/dev/null; settle p-12
 expect "a first launch whose tmux fails leaves no record behind" 1 "LAUNCH REFUSED testbox/tf: tmux failed" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" launch testbox tf --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 [ -d "$ISSUE_WAVE_STATE/workers/tf" ] && ko "failed first launch left a record" || ok "no record left by the failed first launch"
 expect "...so the name launches normally afterwards" 0 "LAUNCHED testbox/tf" -- "$FW" launch testbox tf --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
-"$FW" attach testbox tf --interval 1 >/dev/null
+settle tf
 expect "a --replace whose tmux fails restores the previous record" 1 "tmux failed (previous record restored)" -- env SHIM_TMUX_FAIL_NEW=1 "$FW" launch testbox tf --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace
 expect "...and the previous worker still reads as done" 0 "EXITED(0) testbox/tf" -- "$FW" status testbox tf
 expect "a stalling project fetch is bounded and refused before any record is touched" 1 "git fetch in .* timed out after 2s" -- \
@@ -1258,7 +1364,7 @@ expect "status recovers the thread id from the stream when meta lacks it" 0 "ses
 expect "codex unstick resumes by thread id (from the stream) with --yolo" 0 "RESUMED testbox/c1 kind=codex session=0199-shim-" -- "$FW" unstick testbox c1 --message "$TMP/msg.md"
 tid=$(sed -n '/^session=/ { s/^session=//; p; q; }' "$ISSUE_WAVE_STATE/workers/c1/meta")
 grep -q -- "codex exec resume $tid --yolo --json -" "$ISSUE_WAVE_STATE/workers/c1/run.sh" && ok "codex resume command shape" || ko "codex resume: $(cat "$ISSUE_WAVE_STATE/workers/c1/run.sh")"
-"$FW" attach testbox c1 --interval 1 >/dev/null
+settle c1
 expect "a resumed turn that emits nothing is FAILED even though the first turn succeeded" 1 "FAILED testbox/c1 exit=0 no terminal event" -- \
   env SHIM_CODEX_SILENT_RESUME=1 bash -c '"$0" unstick testbox c1 --message "$1" && "$0" attach testbox c1 --interval 1' "$FW" "$TMP/msg.md"
 "$FW" unstick testbox c1 --message "$TMP/msg.md" >/dev/null
@@ -1285,10 +1391,10 @@ expect "native triage gate allows the holder during halt" 0 "" -- "$FW" gate --t
 expect "native triage gate still refuses a non-holder" 1 "coordinator lease held" -- "${B[@]}" gate --target-repo example/project --force
 expect "launch refuses while halted" 1 "LAUNCH REFUSED testbox/h1: launches halted -- .*master red" -- "$FW" launch testbox h1 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 expect "--force launches anyway (the triage worker)" 0 "LAUNCHED testbox/h1" -- "$FW" launch testbox h1 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --force
-"$FW" attach testbox h1 --interval 1 >/dev/null
+settle h1
 expect "resume-launches clears it" 0 "RESUMED launches" -- "$FW" resume-launches
 expect "launch works again" 0 "LAUNCHED testbox/h2" -- "$FW" launch testbox h2 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
-"$FW" attach testbox h2 --interval 1 >/dev/null
+settle h2
 "$FW" halt "adopted mid-halt" >/dev/null
 "${B[@]}" claim --take >/dev/null
 expect "a coordinator adopting the lease inherits the halt" 1 "LAUNCH REFUSED testbox/h3: launches halted -- .*adopted mid-halt" -- \
@@ -1855,6 +1961,9 @@ expect "dot names refuse" 2 "name must be" -- "$FW" launch testbox .. --target-r
 expect "a dot-prefixed name refuses (ls could not see it)" 2 "not start with a dot" -- "$FW" launch testbox .triage --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 expect "unstick validates the name before writing anything" 2 "unstick: name must be" -- "$FW" unstick testbox ../escape --message "$TMP/msg.md"
 expect "status validates the name" 2 "status: name must be" -- "$FW" status testbox "a b"
+expect "close validates the name" 2 "close: name must be" -- "$FW" close testbox ../escape
+expect "close takes no options" 2 "close: unknown option" -- "$FW" close testbox w1 --kill
+expect "close is fenced by the lease" 1 "CLOSE REFUSED testbox/w1: coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" close testbox w1
 expect "without FLEET_LOCAL_BOX an unrecognized host is local only to 'local'" 0 "EXITED(0) local/w1" -- env -u FLEET_LOCAL_BOX "$FW" status local w1
 out=$(env -u FLEET_LOCAL_BOX "$FW" status testbox w1 2>&1); rc=$?
 [ "$rc" -eq 4 ] && grep -q "UNREACHABLE testbox" <<<"$out" && ok "...and a named box that is not this host goes over ssh (unreachable here)" || ko "named box without local mapping: rc=$rc $out"
@@ -1867,7 +1976,7 @@ expect "hostname-map tokens do not expand as filenames in the launcher's cwd" 0 
 expect "attach rejects a zero interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval 0
 expect "attach rejects a non-numeric interval" 2 "positive number of seconds" -- "$FW" attach testbox w1 --interval fast
 expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --target-repo example/project --kind claude --brief "$TMP/none.md" --cwd "$proj"
-( cd "$TMP" && "$FW" launch testbox rel --target-repo example/project --kind claude --brief "$brief" --cwd "pro j" >/dev/null ) && "$FW" attach testbox rel --interval 1 >/dev/null
+( cd "$TMP" && "$FW" launch testbox rel --target-repo example/project --kind claude --brief "$brief" --cwd "pro j" >/dev/null ) && settle rel
 grep -q "^cwd=$proj\$" "$ISSUE_WAVE_STATE/workers/rel/meta" && ok "a relative --cwd is recorded as its absolute path" || ko "relative cwd recorded: $(grep '^cwd=' "$ISSUE_WAVE_STATE/workers/rel/meta")"
 expect "a path with a newline refuses" 2 "must not contain newlines" -- "$FW" launch testbox nl --target-repo example/project --kind claude --brief "$brief" --cwd "$(printf '%s\nx' "$proj")"
 }
