@@ -2604,11 +2604,15 @@ watch_act() { # <pr> <state line>
 # threshold deferral it had to retract, because only `rounds` showed the count. Read here, off
 # the PR, so the caller never has to count. The count is taken twice — as it stood at the
 # watermark this window started from, and with the window's items — and the difference is what
-# the line may claim: one round opened is "round N"; none (an initialization failure, a verdict,
-# the tail of a round the last window already ended on) claims no round number; several (a
-# first watch, or a stale watermark, over a backlog) names the span rather than pinning the named
-# item to the last of them (review of #434, round 1). No state token is consulted, since an
-# unattributed failure reads `expected` and would otherwise be numbered as a round.
+# the line claims: the rounds the WINDOW opened (none, one, or a span), never the round of the
+# item it names. That item is only the first one rendered, and the rendering groups by feed, not
+# by round, so in a batch holding an old round's tail and a new round it can be the tail (review
+# of #434, rounds 1 and 2). No state token is consulted, since an unattributed failure reads
+# `expected` and would otherwise be numbered as a round.
+#
+# Both counts cost no request inside a watch round: the feeds come from the round's snapshot, and
+# substantive_reviews's per-review reads from review_comments's per-round cache, which the
+# round's own poll and state read have already filled.
 watch_round_note() { # <pr>
   local now before n b detail of past=""
   now=$(review_rounds "$1")
@@ -2629,11 +2633,11 @@ watch_round_note() { # <pr>
     ;;
   esac
   if [ "$n" -le "$b" ]; then
-    printf ' — no new round; rounds with findings: %s%s' "$n" "$of"
+    printf ' — this window opened no round; rounds with findings: %s%s' "$n" "$of"
   elif [ "$n" -eq $((b + 1)) ]; then
-    printf ' — round %s%s%s' "$n" "$of" "$past"
+    printf ' — this window opened round %s%s%s' "$n" "$of" "$past"
   else
-    printf ' — this window holds rounds %s–%s%s%s' "$((b + 1))" "$n" "$of" "$past"
+    printf ' — this window opened rounds %s–%s%s%s' "$((b + 1))" "$n" "$of" "$past"
   fi
 }
 

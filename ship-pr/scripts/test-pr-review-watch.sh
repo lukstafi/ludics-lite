@@ -431,18 +431,18 @@ test_the_ending_line_names_the_round() (
   run_watch 0,0,500
   assert_eq "$WATCH_RC" 0 "the round ends the wait"
   assert_contains "$WATCH_ERR" \
-    "ending the wait on review id=600 state=COMMENTED commit=${H2:0:7} by ${REVIEWER}[bot] — round 3 of 12" \
+    "ending the wait on review id=600 state=COMMENTED commit=${H2:0:7} by ${REVIEWER}[bot] — this window opened round 3 of 12" \
     "the exit line carries the round as \`rounds\` counts it, against the threshold"
   assert_contains "$(rounds_line "$(review_rounds 7)")" "review rounds with findings: 3 of 12" \
     "the same count \`rounds\` reports"
   # Past the threshold the line says what that means, where the caller is about to act on it.
   ROUND_THRESHOLD=2
   run_watch 0,0,500
-  assert_contains "$WATCH_ERR" "— round 3 of 2, PAST the threshold: blocking-only from here" \
+  assert_contains "$WATCH_ERR" "— this window opened round 3 of 2, PAST the threshold: blocking-only from here" \
     "a round past the threshold says so on the exit line"
   ROUND_THRESHOLD=off
   run_watch 0,0,500
-  assert_contains "$WATCH_ERR" "— round 3 (no threshold set)" "and with none set, the count alone"
+  assert_contains "$WATCH_ERR" "— this window opened round 3 (no threshold set)" "and with none set, the count alone"
 )
 
 # The line claims only what the window's own items opened (review of #434, round 1). A first watch
@@ -453,12 +453,40 @@ test_the_ending_line_claims_only_the_rounds_the_window_opened() (
   schedule reviews 1 "[$(review 400 "$H1" 2026-09-01T00:00:00Z),$(review 500 "$H2" 2026-09-01T01:00:00Z),$(
     review 600 "$H2" 2026-09-01T01:30:00Z),$(review 601 "$H2" 2026-09-01T01:30:05Z)]"
   run_watch 0,0,0
-  assert_contains "$WATCH_ERR" "— this window holds rounds 1–3 of 12" \
+  assert_contains "$WATCH_ERR" "— this window opened rounds 1–3 of 12" \
     "a backlog names the span, not the last round against the first item"
   run_watch 0,0,600
   assert_contains "$WATCH_ERR" "ending the wait on review id=601" "the burst's tail still ends the wait"
-  assert_contains "$WATCH_ERR" "— no new round; rounds with findings: 3 of 12" \
+  assert_contains "$WATCH_ERR" "— this window opened no round; rounds with findings: 3 of 12" \
     "the tail of round 3 is not round 4, nor round 3 claimed again as new"
+  # The tail of round 3 AND a new round 4 in one window (review of #434, round 2): the named item
+  # is the tail, so the line speaks of what the window opened, not of the item's round.
+  schedule reviews 1 "[$(review 400 "$H1" 2026-09-01T00:00:00Z),$(review 500 "$H2" 2026-09-01T01:00:00Z),$(
+    review 600 "$H2" 2026-09-01T01:30:00Z),$(review 601 "$H2" 2026-09-01T01:30:05Z),$(
+    review 700 "$H2" 2026-09-01T02:30:00Z)]"
+  run_watch 0,0,600
+  assert_contains "$WATCH_ERR" \
+    "ending the wait on review id=601 state=COMMENTED commit=${H2:0:7} by ${REVIEWER}[bot] (+1 more about this head) — this window opened round 4 of 12" \
+    "the window opened round 4; review 601 is not claimed to be it"
+)
+
+# The label reads no feed of its own inside a round (review of #434, round 2): both counts take the
+# round's snapshot, and an empty-bodied review's own comments — which substantive_reviews asks for
+# on every count — come from the per-round cache the poll and the state read already filled.
+test_the_round_label_costs_no_request() (
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T01:00:00Z ' '),$(review 600 "$H2" 2026-09-01T01:30:00Z ' ')]"
+  schedule review_comments 1 "[$(inline_comment 900 "$H2" "$H2")]"
+  run_watch 0,0,500
+  assert_contains "$WATCH_ERR" "— this window opened round 2 of 12" "the empty-bodied reviews are rounds"
+  # ONE read of review 500's comments, and the watch cannot do without it: the round's state read
+  # (the poll reads only NEW reviews' own comments, 600's, and the opening state saw an empty feed —
+  # the schedule starts at round 1). The label's two counts add none: nothing re-reads it after.
+  # (The bodies are a space because the fixture's `review` defaults an empty body to "findings".)
+  assert_eq "$(grep -c -F -x "repos/$REPO/pulls/7/reviews/500/comments?per_page=100" "$REQUEST_LOG" || true)" 1 \
+    "the round label adds no read of a review's comments"
+  assert_eq "$(grep -c -F -x "repos/$REPO/pulls/7/reviews?per_page=100" "$REQUEST_LOG" || true)" 2 \
+    "nor of the reviews feed: the opening state and the round's poll"
 )
 
 # The missing-environment answer (ludics-lite#421), as #420 saw it: the connector's first word on
@@ -478,7 +506,7 @@ test_the_missing_environment_ends_the_wait_with_the_nudge() {
     "the state beside it is the failure, not a round"
   assert_contains "$WATCH_ERR" "nudge it once with a '@codex review' comment" "and it names the nudge"
   assert_contains "$WATCH_ERR" \
-    "ending the wait on summary id=100 commit=- by ${REVIEWER}[bot] — no new round; rounds with findings: 0 of 12" \
+    "ending the wait on summary id=100 commit=- by ${REVIEWER}[bot] — this window opened no round; rounds with findings: 0 of 12" \
     "the exit line must not number the failure as a round"
   run_watch 0,100,0
   assert_eq "$WATCH_RC" 0 "the failure is a verdict to act on, as a stall is"
@@ -495,7 +523,7 @@ test_the_missing_environment_ends_the_wait_with_the_nudge() {
     'To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).')]"
   run_watch 0,0,0
   assert_contains "$WATCH_ERR" "status: review EXPECTED" "unattributed, the state is the ordinary one"
-  assert_contains "$WATCH_ERR" "— no new round; rounds with findings: 0 of 12" \
+  assert_contains "$WATCH_ERR" "— this window opened no round; rounds with findings: 0 of 12" \
     "and the count, not the state, decides that no round was opened"
   assert_not_contains "$WATCH_ERR" "— round 0" "never an impossible round zero"
 }
@@ -1703,6 +1731,7 @@ tests=(
   test_nudges_wait_past_old_failed_and_stalled_states
   test_the_ending_line_names_the_round
   test_the_ending_line_claims_only_the_rounds_the_window_opened
+  test_the_round_label_costs_no_request
   test_the_missing_environment_ends_the_wait_with_the_nudge
   test_an_extension_holds_through_unknown_status
   test_a_nudge_buys_exactly_one_window

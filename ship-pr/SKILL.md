@@ -375,8 +375,9 @@ is not closing it, though: a scrolled-past finding whose thread is still open ke
 from reading clean (`unresolved`, below) and keeps `merge` refusing.
 
 So read the line each exit ends on, which now says what it ended *on*: the item's own descriptor
-(`ending the wait on review id=… state=… commit=… by … — round 3 of 12`, the count `rounds`
-reports, so cite that number rather than one you kept) when a round ended it, and the head the
+(`ending the wait on review id=… state=… commit=… by … — this window opened round 3 of 12`,
+by the count `rounds` reports, so cite that number rather than one you kept) when a round ended
+it, and the head the
 silence was about plus how much scrolled past (`no reviewer activity about head abc1234 in 900s;
 2 item(s) about another commit scrolled past …`) when nothing did. "The reviewer answered this
 head" and "an old review went by" are different windows and read differently.
