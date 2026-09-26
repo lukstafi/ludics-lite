@@ -2445,7 +2445,6 @@ item_about_head() { # <stamp> <head sha>
 # subshell; every one is reset here, so nothing leaks from the round before.
 #   POLLED_OUT / POLLED_RC  poll's own stdout and exit code, verbatim
 #   POLLED_MARK             the watermark to resume from (the caller's, when the poll failed)
-#   POLLED_FROM             the watermark the round started from (the caller's, always)
 #   POLLED_HEAD             the head the round was judged against ("" when the PR read failed)
 #   POLLED_ON  / _ON_N      the items about that head: the first one's descriptor, and how many
 #   POLLED_PAST / _PAST_N   the items about some other commit, likewise
@@ -2467,7 +2466,6 @@ watch_round() { # <pr> <watermark>
   POLLED_OUT=$(cmd_poll "$1" "$2")
   POLLED_RC=$?
   POLLED_MARK="$2"
-  POLLED_FROM="$2"
   POLLED_HEAD=""
   POLLED_ON=""
   POLLED_ON_N=0
@@ -2608,7 +2606,10 @@ watch_act() { # <pr> <state line>
 # item it names. That item is only the first one rendered, and the rendering groups by feed, not
 # by round, so in a batch holding an old round's tail and a new round it can be the tail (review
 # of #434, rounds 1 and 2). No state token is consulted, since an unattributed failure reads
-# `expected` and would otherwise be numbered as a round.
+# `expected` and would otherwise be numbered as a round. The window is the whole watch: the count
+# is taken at the watermark the watch was STARTED with (watch_from, in watch_loop's scope), not at
+# the last poll's, which an earlier poll advances past another head's round (review of #434,
+# round 3) — so a backlog arriving over several polls reads the same span as one seen at once.
 #
 # Both counts cost no request inside a watch round: the feeds come from the round's snapshot, and
 # substantive_reviews's per-review reads from review_comments's per-round cache, which the
@@ -2616,7 +2617,7 @@ watch_act() { # <pr> <state line>
 watch_round_note() { # <pr>
   local now before n b detail of past=""
   now=$(review_rounds "$1")
-  before=$(review_rounds "$1" "$(mark_of "$POLLED_FROM" 2)" "$(mark_of "$POLLED_FROM" 3)")
+  before=$(review_rounds "$1" "$(mark_of "$watch_from" 2)" "$(mark_of "$watch_from" 3)")
   n="${now%%|*}"
   b="${before%%|*}"
   if [ "$n" = unknown ] || [ "$b" = unknown ]; then
@@ -2805,7 +2806,7 @@ cmd_watch() {
 }
 
 watch_loop() {
-  local pr="${1:?usage: watch <pr> [watermark]}" mark="${2:-}"
+  local pr="${1:?usage: watch <pr> [watermark]}" mark="${2:-}" watch_from="${2:-}"
   pr_arg "$pr"
   pr="$PR_NUM"
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"

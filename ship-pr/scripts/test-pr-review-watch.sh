@@ -470,6 +470,21 @@ test_the_ending_line_claims_only_the_rounds_the_window_opened() (
     "the window opened round 4; review 601 is not claimed to be it"
 )
 
+# The window is the whole watch, not the last poll (review of #434, round 3): the first poll sees
+# only a round about H1, scrolls past it and advances the watermark; the round about H2 lands on
+# the second. The watch opened both, as it would have read them in a single poll.
+test_the_round_span_is_the_whole_watch() (
+  sleep() { SECONDS=$((SECONDS + $1)); }
+  reset_fixture
+  schedule reviews 1 "[$(review 400 "$H1" 2026-09-01T00:00:00Z)]"
+  schedule reviews 2 "[$(review 400 "$H1" 2026-09-01T00:00:00Z),$(review 500 "$H2" 2026-09-01T01:00:00Z)]"
+  run_watch 0,0,0 1 10
+  assert_eq "$(poll_rounds)" 2 "the round about the head lands on the second poll"
+  assert_contains "$WATCH_ERR" "ending the wait on review id=500" "and ends the wait"
+  assert_contains "$WATCH_ERR" "— this window opened rounds 1–2 of 12" \
+    "the span is counted from the watermark the watch started with"
+)
+
 # The label reads no feed of its own inside a round (review of #434, round 2): both counts take the
 # round's snapshot, and an empty-bodied review's own comments — which substantive_reviews asks for
 # on every count — come from the per-round cache the poll and the state read already filled.
@@ -1732,6 +1747,7 @@ tests=(
   test_the_ending_line_names_the_round
   test_the_ending_line_claims_only_the_rounds_the_window_opened
   test_the_round_label_costs_no_request
+  test_the_round_span_is_the_whole_watch
   test_the_missing_environment_ends_the_wait_with_the_nudge
   test_an_extension_holds_through_unknown_status
   test_a_nudge_buys_exactly_one_window
