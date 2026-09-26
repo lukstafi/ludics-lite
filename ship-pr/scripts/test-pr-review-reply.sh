@@ -54,10 +54,12 @@ CWD_REPO=""
 FAIL_ID=0
 FAIL_MSG=""
 # The threads the PR has, as "<comment id>:<resolved>" pairs; a comment id absent from this list
-# is a thread that does not exist, which is `resolve`'s one exit-1 answer.
+# is a thread that does not exist, which is `resolve`'s one exit-1 answer. How the connection pages
+# them, and a totalCount other than the rows it serves, are the library's THREADS_FIXTURE_PAGE and
+# THREADS_FIXTURE_TOTAL (review_threads_answer).
 THREADS="900:false 901:false 902:false 903:true"
-# The totalCount the connection states, when a case needs one other than the rows it serves.
-THREADS_TOTAL=""
+THREADS_FIXTURE_PAGE=""
+THREADS_FIXTURE_TOTAL=""
 
 reset_fixture() {
   : >"$REQUEST_LOG"
@@ -69,23 +71,23 @@ reset_fixture() {
   CWD_REPO=""
   REPO="$TARGET_REPO"
   THREADS="900:false 901:false 902:false 903:true"
-  THREADS_TOTAL=""
+  THREADS_FIXTURE_PAGE=""
+  THREADS_FIXTURE_TOTAL=""
 }
 
-# One page, served as GitHub serves the connection: the id `fullDatabaseId` names first as a
-# BigInt string, `databaseId` beside it as the 32-bit Int it is typed as — absent past 2^31, which
-# review comment ids already run beyond — and a totalCount the lookup checks its read against.
-threads_json() {
-  local pair nodes=""
+# THREADS as review_thread rows. `databaseId` is a 32-bit Int, so past 2^31 — where review comment
+# ids already run — GitHub serves it null and only `fullDatabaseId` names the comment.
+thread_rows() {
+  local pair id nodes=""
   for pair in $THREADS; do
-    nodes="$nodes,$(jq -cn --arg id "${pair%%:*}" --argjson res "${pair##*:}" \
-      '{id:("T" + $id), isResolved:$res,
-        comments:{nodes:[{fullDatabaseId:$id,
-          databaseId:(($id | tonumber) as $n | if $n < 2147483648 then $n else null end)}]}}')"
+    id="${pair%%:*}"
+    if [ "$id" -lt 2147483648 ]; then
+      nodes="$nodes,$(review_thread "$id" "${pair##*:}")"
+    else
+      nodes="$nodes,$(review_thread "$id" "${pair##*:}" | jq -c '.comments.nodes[0].databaseId = null')"
+    fi
   done
-  jq -cn --argjson nodes "[${nodes#,}]" --argjson total "${THREADS_TOTAL:-null}" \
-    '{data:{repository:{pullRequest:{reviewThreads:
-      {totalCount:($total // ($nodes | length)), pageInfo:{hasNextPage:false, endCursor:null}, nodes:$nodes}}}}}'
+  printf '[%s]\n' "${nodes#,}"
 }
 
 # The body of a write is read off the raw arguments rather than out of the shared parser: the
@@ -127,7 +129,7 @@ gh() {
       printf '%s\n' "$query" >>"$BODIES/mutations"
       gh_fixture_answer '{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}'
       ;;
-    *) gh_fixture_answer "$(threads_json)" ;;
+    *) gh_fixture_answer "$(review_threads_answer "$(thread_rows)" "$@")" ;;
     esac
     ;;
   *)
@@ -462,16 +464,33 @@ test_resolve_finds_a_thread_by_its_full_width_id() {
 # totalCount it states is a retry, not an answer — the thread could be in the part never served.
 test_a_short_read_is_a_retry_not_a_missing_thread() {
   reset_fixture
-  THREADS_TOTAL=9
+  THREADS_FIXTURE_TOTAL=9
   run_cmd cmd_resolve 999
   assert_eq "$RC" 3 "an incomplete lookup is transport"
   assert_contains "$ERR" "ended at 4 thread(s) while the PR states 9" "and says how it was short"
   assert_not_contains "$ERR" "no review thread starts" "never a missing thread"
   # The control: a thread that IS on the part served is found all the same.
   reset_fixture
-  THREADS_TOTAL=9
+  THREADS_FIXTURE_TOTAL=9
   run_cmd cmd_resolve 900
   assert_eq "$RC" 0 "a hit needs no count"
+}
+
+# The lookup walks the WHOLE connection, page by page through the `after=` cursor, since it reads
+# through the same threads_walk as the open-thread gate: a thread the gate names from page 2 is one
+# `resolve` must find there, not one it reports missing after reading page 1.
+test_resolve_finds_a_thread_on_a_later_page() {
+  reset_fixture
+  THREADS_FIXTURE_PAGE=2
+  run_cmd cmd_resolve 902
+  assert_eq "$RC" 0 "a thread on page 2 is found"
+  assert_contains "$(cat "$BODIES/mutations")" '"T902"' "and it is that thread that is closed"
+  # The control: an id on no page is still missing, after every page was read.
+  reset_fixture
+  THREADS_FIXTURE_PAGE=2
+  run_cmd cmd_resolve 999
+  assert_eq "$RC" 1 "an id on no page is a missing thread"
+  assert_contains "$ERR" "no review thread starts at comment 999" "named as itself"
 }
 
 # --- the repo a write lands on is NAMED, never inferred from the cwd (ludics-lite#92) -----------
@@ -605,6 +624,7 @@ tests=(
   test_a_missing_thread_names_where_the_batch_stopped
   test_resolve_finds_a_thread_by_its_full_width_id
   test_a_short_read_is_a_retry_not_a_missing_thread
+  test_resolve_finds_a_thread_on_a_later_page
   test_a_reply_never_takes_its_repo_from_the_cwd
   test_the_refusal_holds_when_the_cwd_repo_has_that_pr_number
   test_a_resolve_never_takes_its_repo_from_the_cwd
