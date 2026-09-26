@@ -1922,7 +1922,8 @@ EXECUTION_COMMAND
 # that refuses its own map refuses the reservation: a map that is there and wrong is a defect to fix.
 endpoint_map() {
   local wake out
-  wake="$(cd "$(dirname "$0")/../.." && pwd -P)/scripts/wake-lab.sh"
+  # cd -P: `..` must leave the skill symlink's TARGET, not collapse the symlink's own path.
+  wake="$(cd -P "$(dirname "$0")/../.." && pwd -P)/scripts/wake-lab.sh"
   if [ ! -f "$wake" ]; then
     printf '%s\n' "EXECUTION WARNING: no endpoint map ($wake is missing): FLEET_BOXES is not checked for two aliases of one box" >&2
     return 0

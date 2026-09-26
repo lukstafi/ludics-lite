@@ -330,11 +330,11 @@ def one_entry_per_box():
             assert result.returncode == expected, (args, result.returncode, result.stdout, result.stderr)
             return result.stdout, result.stderr
 
-        def change(action, data, expected=0, **extra):
+        def change(action, data, expected=0, script=SCRIPT, **extra):
             with tempfile.NamedTemporaryFile(mode='w', dir=root, suffix='.input') as stream:
                 json.dump(data, stream)
                 stream.flush()
-                return run('execution', action, stream.name, expected=expected, **extra)
+                return run('execution', action, stream.name, expected=expected, script=script, **extra)
 
         def request(identity, host, kind='measurement'):
             return dict(request_id=identity, wave='wave', worker=identity, transport='subagent',
@@ -377,6 +377,14 @@ def one_entry_per_box():
         change('conclude', dict(request_id='measure-rog', verdict='not-launched', log='/logs/rog',
                                 evidence='fixture never dispatched'), FLEET_BOXES=split)
         assert records()['measure-rog']['state'] == 'concluded'
+        # Reached through a skills symlink, as installed (~/.claude/skills/issue-wave -> the
+        # checkout's issue-wave), the map is still found: `..` must leave the symlink's target.
+        skills = root / 'skills'
+        skills.mkdir()
+        (skills / 'issue-wave').symlink_to(SCRIPT.resolve().parent.parent)
+        out, err = change('reserve', request('linked-split', 'rog-nv-wsl'), expected=1, FLEET_BOXES=split,
+                          script=skills / 'issue-wave' / 'scripts' / 'fleet-worker.sh')
+        assert want in err and 'WARNING' not in err, err
         # A checkout with no wake-lab.sh degrades loudly: one warning, and the roster check keeps to
         # exact entries up to case, so the split roster is admitted as it was before #395.
         bare = root / 'bare'
