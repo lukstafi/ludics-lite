@@ -261,6 +261,30 @@ not call finished. The run directory is read on the reservation's execution host
 the registry when `--box` is omitted; the conclusion names the box it read, and the registry
 refuses evidence read on any box but the reserved one.
 
+When the run blocked under `bg-run.sh` instead (a `tools/machine-verify.sh` leg, a measurement
+script: eleven hand-written conclusions in the 2026-09-25 wave, ludics-lite#405),
+`fleet-worker.sh execution conclude --from-bg-run <run-dir> --request <id> --sha <sha> [--box
+<box>] [--checkout <text>] [--evidence <text>]` composes the payload from the directory. The
+verdict comes from bg-run.sh's own `wait <dir> --within 0`, so `refused` is read before `rc` as
+its header requires, plus the runner's `exit:` sentinel when the log has one (a whole line `exit:
+N` or `<name>: exit: N`, the last one winning; OCANNL's `test-run.sh` and `machine-verify.sh`
+print one): the code is the sentinel when that is nonzero, else `rc`, so a pass needs both. Then
+0 is pass, 124 or 142 timeout, a signal code (129, 130, 137, 143) cancelled, anything else fail.
+A `DIED` task (killed before the command returned, nothing left alive) is cancelled; `RUNNING`,
+`STARTING` and `REFUSED` are refused. The directory is read on `--box`, by default the reservation's
+execution host. Name the box that drove the run when the leg went over ssh (a machine-verify trip
+started on the agent host leaves its directory there). Because that box is legitimately not the
+reserved one, this form carries no execution-host binding; the conclusion's `log` and `handle`
+name the box read (`<box>:<path>`), and its evidence says which box drove the run. bg-run keeps no
+checkout: `--checkout` names one, one already on the record is kept, and otherwise the field says
+it was not recorded.
+
+A run that died before it fetched any source (a self-ssh refusal, a trip whose far side never
+started) ran no revision. It is not a verdict about one, so there is no `fail` without
+`observed_sha`: conclude it `not-launched` with evidence naming the failure and its log. To retry
+under the same request instead, `reconcile` it to `reserved` (the evidence establishing that
+nothing ran and nothing runs) and dispatch again.
+
 The actual verdict must be `pass`, `fail`, `timeout` or `cancelled`. A timeout/cancellation needs
 runner evidence that its processes stopped. SHA, checkout and handle may already be in the record;
 evidence and log are required in the conclusion. If reconciliation proves nothing launched, use

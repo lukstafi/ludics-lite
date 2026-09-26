@@ -45,6 +45,8 @@ SECTIONS=(
   "codex workers"
   "halt"
   "execution run and conclude --from-run"
+  "execution conclude --from-bg-run"
+  "prs (the supervision read)"
   "refresh (execution-only boxes)"
   "execution slot"
   "usage"
@@ -153,11 +155,32 @@ trap cleanup EXIT
 mkdir -p "$TMP/dispatcher/issue-wave/scripts" "$TMP/dispatcher/ship-pr/scripts"
 cp "$FW" "$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
 cp "$HERE/fleet-execution.py" "$TMP/dispatcher/issue-wave/scripts/fleet-execution.py"
+cp "$HERE/bg-run.sh" "$TMP/dispatcher/issue-wave/scripts/bg-run.sh"
 FW="$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
 export BASE_CALL_LOG="$TMP/base-calls"
 cat > "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$* grace=${SHIP_PR_BASE_ABSENT_GRACE:-unset} interval=${SHIP_PR_CHECKS_INTERVAL:-unset}" >> "$BASE_CALL_LOG"
+# `prs` reads (SHIM_PRS names a fixture directory): the open-PR list, `rounds`, `checks` and the
+# head commit's date, each answered from a file there, or 3 (the API never answered) without one.
+if [ -n "${SHIM_PRS:-}" ]; then
+  printf '%s\n' "$* threshold=${SHIP_PR_ROUND_THRESHOLD:-unset}" >> "$SHIM_PRS/calls"
+  case "$1 $3" in
+    "retry pr") [ -f "$SHIM_PRS/list.json" ] || exit 3; cat "$SHIM_PRS/list.json"; exit 0 ;;
+    "retry api") [ -f "$SHIM_PRS/date-${4##*/}" ] || exit 3; cat "$SHIM_PRS/date-${4##*/}"; exit 0 ;;
+  esac
+  case "$1" in
+    rounds)
+      [ "${SHIP_PR_ROUND_THRESHOLD:-}" = off ] || exit 2
+      [ -f "$SHIM_PRS/rounds-${2##*#}" ] || { echo "review rounds: UNKNOWN — fixture; this is NOT 'no rounds yet', retry"; exit 3; }
+      echo "review rounds with findings: $(cat "$SHIM_PRS/rounds-${2##*#}") (fixture); no threshold set"; exit 0 ;;
+    checks)
+      [ -f "$SHIM_PRS/checks-${2##*#}" ] || exit 3
+      { read -r crc; read -r line; } < "$SHIM_PRS/checks-${2##*#}"
+      printf 'build signal %s @abcdef12: %s\n  a check line\n' "$2" "$line"; exit "$crc" ;;
+  esac
+  exit 2
+fi
 if [ "$3" = retry ]; then
   [ -z "${SHIM_BASE_TIP_FAIL:-}" ] || exit 3
   ref="${6##*/}"
@@ -1332,6 +1355,108 @@ grep -Fq "\"observed_sha\": \"$ran\"" <<<"$out" && ok "...with the reported revi
 jq -n '{request_id:"run-other", verdict:"not-launched", log:"/dev/null", evidence:"fixture never invoked a runner on other"}' > "$TMP/run-other-done.json"
 "${FWX[@]}" execution conclude "$TMP/run-other-done.json" >/dev/null || ko "could not conclude the off-box fixture (setup)"
 expect "a run of a request outside the roster is refused" 1 "canonical FLEET_BOXES" -- "$FW" execution run "$(reqjson run-e)"
+}
+
+section "execution conclude --from-bg-run" && {
+need_lease
+# ludics-lite#405: runs that are not test-run.sh records -- a machine-verify trip, a measurement
+# script -- block under bg-run.sh, whose directory (`rc`, `log`, `refused`, `pid`/`cpid`) is read
+# here through bg-run.sh's own `wait --within 0`. Each directory below is a real bg-run.sh run
+# (`start` returns when the command does), except the ones whose state has to be staged: a live
+# task, a killed one, one never started.
+BG="$TMP/dispatcher/issue-wave/scripts/bg-run.sh"
+bgdir() { # <name> <command...>: a finished bg-run.sh directory, its path on stdout
+  local d="$TMP/bg runs/$1"; shift
+  bash "$BG" start "$d" -- "$@" >/dev/null 2>&1
+  printf '%s' "$d"
+}
+bgreq() { # <id> -> a dispatched reservation on testbox
+  jq -n --arg id "$1" '{request_id:$id, wave:"w", worker:$id, transport:"subagent", issue:"o/r#405", purpose:"bg-run fixture",
+    agent_host:"testbox", execution_host:"testbox", repository:"o/r", requested_revision:"origin/main", kind:"correctness"}' > "$TMP/$1.json"
+  "${FWB[@]}" execution run "$TMP/$1.json" >/dev/null || ko "could not dispatch $1 (setup)"
+}
+FWB=(env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other "$FW")
+sha=$(printf 'b%.0s' $(seq 40))
+bgc() { # <id> <dir> [flags...]: dispatch <id>, then conclude it from <dir>
+  local id="$1" dir="$2"; shift 2
+  bgreq "$id" && "${FWB[@]}" execution conclude --from-bg-run "$dir" --request "$id" --sha "$sha" "$@"
+}
+ok_dir=$(bgdir pass sh -c 'echo building; echo "exit: 1 (a test named exit)"; echo "x: ssh exit: 5"')
+expect "a bg-run that returned 0 concludes as pass" 0 '"verdict": "pass"' -- bgc bg-pass "$ok_dir"
+for want in "\"observed_sha\": \"$sha\"" "\"handle\": \"bg-run:testbox:$ok_dir\"" "\"log\": \"testbox:$ok_dir/log\"" \
+  "rc=0; the command returned; revision $sha as reported by the worker" "\"remote_checkout\": \"not recorded (bg-run keeps no checkout"; do
+  grep -Fq -- "$want" <<<"$out" && ok "...recorded $want" || ko "missing $want in $out"
+done
+grep -q "runner sentinel" <<<"$out" && ko "a line outside the sentinel grammar was read as one: $out" || ok "...reading neither a sentinel with trailing text nor a transport line as the runner's"
+expect "the runner's nonzero sentinel wins over a 0 rc: fail" 0 "runner sentinel 'runner: exit: 1'" -- bgc bg-sent1 "$(bgdir sent1 sh -c 'echo "runner: exit: 1"; echo tail output')"
+grep -q '"verdict": "fail"' <<<"$out" && ok "...as fail" || ko "a failing sentinel under rc 0 did not read as fail: $out"
+expect "a zero sentinel does not rescue a nonzero rc: fail" 0 '"verdict": "fail"' -- bgc bg-sent0 "$(bgdir sent0 sh -c 'echo "exit: 0"; exit 1')"
+expect "the LAST sentinel is the runner's: a cap is timeout" 0 '"verdict": "timeout"' -- bgc bg-cap "$(bgdir cap sh -c 'echo "exit: 1"; echo "machine-verify: exit: 142"; echo "machine-verify: ssh exit: 142"; exit 142')"
+expect "rc 124 (timeout(1)) concludes as timeout" 0 '"verdict": "timeout"' -- bgc bg-124 "$(bgdir t124 sh -c 'exit 124')"
+expect "a signal death concludes as cancelled" 0 '"verdict": "cancelled"' -- bgc bg-term "$(bgdir term sh -c 'kill -TERM $$')"
+expect "any other status concludes as fail, with the given evidence and checkout" 0 '"evidence": "sweep red"' -- \
+  bgc bg-fail "$(bgdir fail sh -c 'exit 3')" --evidence "sweep red" --checkout "testbox:/w/verify (removed)"
+grep -q '"verdict": "fail"' <<<"$out" && grep -Fq '"remote_checkout": "testbox:/w/verify (removed)"' <<<"$out" && ok "...as fail, naming the checkout given" || ko "exit 3 or --checkout misread: $out"
+# The box that drove the run over ssh holds the directory; the conclusion names it.
+expect "a directory read on the box that drove the run concludes, naming that box" 0 "read on other, which drove the run on testbox" -- bgc bg-drove "$ok_dir" --box other
+grep -Fq "\"log\": \"other:$ok_dir/log\"" <<<"$out" && ok "...in the log it cites" || ko "the driving box is missing from the log: $out"
+# Staged states: bg-run.sh's own verdicts, never re-derived here.
+d="$TMP/bg runs/died"; mkdir -p "$d"; sh -c 'exit 0' & gone=$!; wait "$gone"; printf '%s\n\n' "$gone" > "$d/pid"; : > "$d/log"
+expect "a task killed before the command returned (DIED) concludes as cancelled" 0 '"verdict": "cancelled"' -- bgc bg-died "$d"
+grep -q "DIED" <<<"$out" && ok "...saying DIED" || ko "the DIED evidence is missing: $out"
+d="$TMP/bg runs/live"; mkdir -p "$d"; printf '%s\n\n' "$$" > "$d/pid"
+expect "a live task (RUNNING) is refused" 1 "FROM-BG-RUN REFUSED: bg-run.sh wait: RUNNING" -- bgc bg-live "$d"
+d="$TMP/bg runs/never"; mkdir -p "$d"
+expect "a directory no task claimed (STARTING) is refused" 1 "FROM-BG-RUN REFUSED: bg-run.sh wait: STARTING" -- "${FWB[@]}" execution conclude --from-bg-run "$d" --request bg-live --sha "$sha"
+d=$(bgdir reused true); bash "$BG" start "$d" -- false >/dev/null 2>&1
+expect "a directory a second start refused is refused, its rc unread" 1 "an rc there may be an earlier run's" -- "${FWB[@]}" execution conclude --from-bg-run "$d" --request bg-live --sha "$sha"
+expect "a missing directory is refused" 1 "FROM-BG-RUN REFUSED: no run directory" -- "${FWB[@]}" execution conclude --from-bg-run "$TMP/bg runs/nope" --request bg-live --sha "$sha"
+expect "an unknown request is refused before any box is read" 1 "unknown request_id bg-zz" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-zz --sha "$sha"
+expect "--from-bg-run needs an absolute directory" 2 "must be absolute" -- "${FWB[@]}" execution conclude --from-bg-run bg/x --request bg-live --sha "$sha"
+expect "--from-bg-run needs the request id" 2 "--request <id> required" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --sha "$sha"
+expect "--from-bg-run needs the revision that ran" 2 "--sha <full commit SHA> required" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live
+expect "--from-bg-run refuses a stray flag" 2 "conclude --from-bg-run <run-dir>" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live --sha "$sha" --oops
+"$FW" execution list | jq -e '[.[] | select(.request_id == "bg-live") | .state] == ["launching"]' >/dev/null && ok "every refusal left the assignment dispatched" || ko "a refusal changed bg-live"
+}
+
+section "prs (the supervision read)" && {
+# ludics-lite#405: one line per open PR, from ship-pr's pr-review.sh (stubbed: SHIM_PRS).
+P="$TMP/prs"; mkdir -p "$P"; export SHIM_PRS="$P"
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+jq -n --arg now "$now" '[
+  {number: 12, title: "second\tPR", headRefName: "claude/issue-12", headRefOid: "c12", createdAt: "2026-09-01T00:00:00Z", isDraft: true,
+   closingIssuesReferences: [{number: 12, repository: {name: "r", owner: {login: "o"}}}]},
+  {number: 7, title: "first PR", headRefName: "claude/issue-7", headRefOid: "c7", createdAt: $now, isDraft: false,
+   closingIssuesReferences: [{number: 7, repository: {name: "other", owner: {login: "o"}}}]},
+  {number: 9, title: "", headRefName: "claude/issue-9", headRefOid: "c9", createdAt: $now, isDraft: false, closingIssuesReferences: []}]' > "$P/list.json"
+echo 6 > "$P/rounds-12"; echo 2 > "$P/rounds-7"
+printf '0\ngreen — 3 build checks passed\n' > "$P/checks-12"; printf '4\nNO VERDICT YET — still running\n' > "$P/checks-7"
+printf '0\nABSENT — no build check ran on this commit: x\n' > "$P/checks-9"
+echo "2026-09-02T00:00:00Z" > "$P/date-c12"; echo "$now" > "$P/date-c7"
+expect "prs flags a PR at five or more rounds, exit 1" 1 "o/r#12 rounds=6 ci=green head=[0-9]*d[0-9]*h draft claude/issue-12: second.tPR -- CONVERGE: 6 review rounds with findings (flag at 5)" -- "$FW" prs o/r
+grep -q "^o/r#7 rounds=2 ci=pending head=[01]m claude/issue-7: first PR$" <<<"$out" && ok "...a PR under the flag gets its line, no note, age from the newer of commit and creation" || ko "PR 7's line: $out"
+grep -q "^o/r#9 rounds=? ci=absent head=[01]m claude/issue-9: -$" <<<"$out" && ok "...an unread count reads as ?, never as 0, and an unread commit date leaves the age to the creation time" || ko "PR 9's line: $out"
+[ "$(grep -o '^o/r#[0-9]*' <<<"$out" | tr '\n' ' ')" = "o/r#7 o/r#9 o/r#12 " ] && ok "...in PR order" || ko "order: $out"
+grep -q "rounds o/r#12 threshold=off" "$P/calls" && grep -q "^retry --read pr list --repo o/r --state open" "$P/calls" && ok "...through pr-review.sh, the repo spelled out in every read" || ko "calls: $(cat "$P/calls")"
+expect "--flag-at raises the flag; an unread count alone exits 4" 4 "o/r#9 rounds=?" -- "$FW" prs o/r --flag-at 7
+grep -q CONVERGE <<<"$out" && ko "a PR under --flag-at was flagged: $out" || ok "...and nothing is flagged under it"
+rm "$P/list.json"
+expect "an open-PR list that never answered is UNREACHABLE, exit 4" 4 "PRS UNREACHABLE: the open PRs of o/r did not answer" -- "$FW" prs o/r
+expect "prs needs an owner/repo" 2 "prs: <owner/repo> required" -- "$FW" prs
+expect "prs refuses a zero --flag-at" 2 "positive number of rounds" -- "$FW" prs o/r --flag-at 0
+# --wave: the wave's issues are the ones its execution records name.
+need_lease
+jq -n --arg now "$now" '[{number: 7, title: "first PR", headRefName: "claude/issue-7", headRefOid: "c7", createdAt: $now, isDraft: false,
+  closingIssuesReferences: [{number: 7, repository: {name: "other", owner: {login: "o"}}}]},
+  {number: 12, title: "second", headRefName: "claude/issue-12", headRefOid: "c12", createdAt: $now, isDraft: false,
+  closingIssuesReferences: [{number: 12, repository: {name: "r", owner: {login: "o"}}}]}]' > "$P/list.json"
+jq -n '{request_id:"prs-7", wave:"wv", worker:"prs-7", transport:"subagent", issue:"o/other#7", purpose:"prs fixture",
+  agent_host:"testbox", execution_host:"testbox", repository:"o/r", requested_revision:"origin/main", kind:"correctness", standing:true}' > "$TMP/prs-7.json"
+env FLEET_BOXES="testbox other" "$FW" execution reserve "$TMP/prs-7.json" >/dev/null 2>&1 || ko "could not reserve prs-7 (setup)"
+expect "--wave keeps the PRs closing an issue its records name" 0 "^o/r#7 rounds=2" -- "$FW" prs o/r --wave wv
+grep -q "o/r#12" <<<"$out" && ko "a PR of no wave issue was listed: $out" || ok "...and drops the rest"
+expect "--wave with no records is refused, not read as an empty wave" 1 "no execution record names wave nowave" -- "$FW" prs o/r --wave nowave
+unset SHIM_PRS
 }
 
 section "refresh (execution-only boxes)" && {

@@ -523,7 +523,9 @@ controlled through the tools in your coordinator's file, never through those com
   SAME worker is resumed with the assignment - by session for CLI, by agent ID for native;
   never a second writer. On a result, `execution conclude --from-run <run-dir> --request <id>
   --sha <sha>` reads verdict, log and checkout off the record on the reserved box and refuses an
-  unfinished run; then resume implementation or review. Formats and the per-transport sides:
+  unfinished run (`--from-bg-run <dir>` for a run blocked under `bg-run.sh`, see
+  [executions.md](references/executions.md#reserve-launch-observe-conclude)); then resume
+  implementation or review. Formats and the per-transport sides:
   [native Claude](references/native-claude.md#worker-channel),
   [native Codex](references/native-codex.md#worker-channel),
   [CLI](references/executions.md#cli-reservation-handoff).
@@ -551,7 +553,9 @@ controlled through the tools in your coordinator's file, never through those com
   exemption for the same red conflicted at the next integration run).
 - **Converge long reviews.** An automated reviewer keeps finding members of any open-ended
   artifact (a scanner, a property table) indefinitely (2026-08-22: two workers went 9 and 13
-  rounds; 2026-08-27: three went 11-18). After ~5 rounds send the policy, whose axis is
+  rounds; 2026-08-27: three went 11-18). At 5 rounds send the policy - `fleet-worker.sh prs
+  <owner/repo> [--wave <id>]` lists each open PR's round count, CI and head age and flags the
+  ones there (ludics-lite#405; one reached 10 unnoticed) - whose axis is
   **silent vs loud**: a silent defect (a claim that cannot fail, a sweep that deletes what it
   shouldn't, an oracle a scheduler accident satisfies) is must-fix through round twelve, while a
   loud one (a false refusal or error on valid-but-absent shapes) defers to ONE follow-up
