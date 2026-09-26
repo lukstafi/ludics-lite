@@ -417,7 +417,7 @@ first_unread() {
 feeder_of() {
   local d="$WORKERS/$1" p c; p=$(cat "$d/feeder.pid" 2>/dev/null)
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
-  c=$(ps -o command= -p "$p" 2>/dev/null)
+  c=$(ps -ww -o command= -p "$p" 2>/dev/null)   # -ww: never width-truncated (macOS)
   case "$c" in *tail*"$d/input.jsonl"*) printf '%s' "$p" ;; *) return 1 ;; esac
 }
 # user_line <file> <uuid>: one stream-json user message carrying the file's bytes, built by jq,
@@ -445,7 +445,7 @@ stream_run() {
   printf '  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s %q ] && break; sleep 1; done\n' "$d/feeder.pid"
   # Killed only while it is still this record's tail: `close` may have ended it already, and its
   # pid could be anyone's by now.
-  printf '  p=$(cat %q 2>/dev/null); case "$(ps -o command= -p "$p" 2>/dev/null)" in *tail*%q*) kill "$p" 2>/dev/null ;; esac; exit "$rc"\n}\n' "$d/feeder.pid" "$d/input.jsonl"
+  printf '  p=$(cat %q 2>/dev/null); case "$(ps -ww -o command= -p "$p" 2>/dev/null)" in *tail*%q*) kill "$p" 2>/dev/null ;; esac; exit "$rc"\n}\n' "$d/feeder.pid" "$d/input.jsonl"
   printf 'rc=$?; rm -f %q; echo "$rc" > %q\n' "$d/feeder.pid" "$d/exit"
 }
 state_of() {
@@ -1560,7 +1560,7 @@ d="$WORKERS/$name"; staged="$STATE/incoming/$name-$stamp.md"
 # Same critical section as launch: liveness checks through tmux creation, one at a time.
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
 msg=$(take_lock "$wlock" 0 "lock") || { rm -f "$staged"; echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress ($msg)"; exit 1; }
-started=0; blaunch=""; backed=0; ilines=""
+started=0; blaunch=""; backed=0; ilines=""; appending=0
 # A resume that never started takes its line back off the input channel: the file had $ilines.
 input_restore() {
   [ -n "$ilines" ] || return 0
@@ -1581,6 +1581,9 @@ on_exit() {
       rm -f "$d/exit.prev" "$d/meta.prev"
     fi
   fi
+  # An append interrupted between its meta update and its line: meta must not name a message
+  # the input never got, or attach and close would wait on it forever.
+  if [ "$appending" = 1 ] && [ -e "$d/meta.prev" ]; then mv -f "$d/meta.prev" "$d/meta" 2>/dev/null; fi
   release_lock "$wlock"; [ -n "$blaunch" ] && release_lock "$blaunch"
 }
 trap on_exit EXIT; trap 'exit 143' TERM HUP INT
@@ -1603,13 +1606,14 @@ if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name
   # attach waits for the reply to THIS message: meta names it before the line lands, so a reply
   # that beats the next command is still read as its reply.
   off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
+  appending=1
   cp -p "$d/meta" "$d/meta.prev" 2>/dev/null && meta_set "$d" turn_offset "$off" && meta_set "$d" awaiting "$mid" ||
     { [ -e "$d/meta.prev" ] && mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
   if ! printf '%s\n' "$line" >> "$d/input.jsonl" 2>/dev/null; then
     mv -f "$d/meta.prev" "$d/meta"
     echo "UNSTICK REFUSED $BOX/$name: cannot append to $d/input.jsonl"; exit 1
   fi
-  rm -f "$d/meta.prev"
+  appending=2; rm -f "$d/meta.prev"
   waited=0
   while :; do
     echoed=$(tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null | jq -Rrn --arg u "$mid" 'first(inputs | fromjson? | select(.type=="user" and .uuid==$u) | .uuid) // empty' 2>/dev/null)
@@ -1747,8 +1751,9 @@ state=$(state_of "$name")
 if ! alive "$name" || ! is_stream "$name"; then
   echo "CLOSE REFUSED $BOX/$name: $state, not a stream-json worker with its session up (a one-shot or orphaned CLI ends with its turn) -- wait for it, or \`unstick --kill\`"; exit 1
 fi
+# The tuple read here decides, never the earlier state: a turn can start in between.
 read -r t bg res <<< "$(turn_state "$name")"
-[ "$state" = IDLE ] || { echo "CLOSE REFUSED $BOX/$name: not idle (turn=$t, background_tasks=$bg) -- wait for attach's IDLE, or \`unstick --kill\` to interrupt"; exit 1; }
+[ "$t $bg" = "ended 0" ] || { echo "CLOSE REFUSED $BOX/$name: not idle (turn=$t, background_tasks=$bg) -- wait for attach's IDLE, or \`unstick --kill\` to interrupt"; exit 1; }
 # attach's own condition: the latest message sent has had its reply. An appended line not yet
 # read would be dropped by closing the input under it.
 [ "$res" = 1 ] || { echo "CLOSE REFUSED $BOX/$name: idle, but the latest message sent has no reply yet (unread, or not yet answered) -- wait for attach's IDLE"; exit 1; }
