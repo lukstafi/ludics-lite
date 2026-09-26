@@ -366,7 +366,9 @@ requirements for every transport with transport-specific setup and identity, and
   coordinator took at launch - name its request id, the bounded aliases and `-j` width it
   covers, and that every batch goes through the project runner, wrapped in `fleet-worker.sh
   execution slot -- <batch>`, and is reported by run directory. Every other run - a
-  measurement, a cross-box leg, a full suite - needs a request first, in the transport's shape:
+  measurement (for a [timing-grade claim only](references/executions.md#exclusivity-and-the-run-time-slots),
+  a rule the brief carries), a cross-box leg, a full suite - needs a request first, in the
+  transport's shape:
   the [Claude Code worker channel](references/native-claude.md#worker-channel), the
   [Codex worker channel](references/native-codex.md#worker-channel), or the
   [CLI reservation handoff](references/executions.md#cli-reservation-handoff). A resumed worker
@@ -588,16 +590,19 @@ controlled through the tools in your coordinator's file, never through those com
   The merge gate is one green full-matrix run for the PR's *last commit*. A clean merge does
   not restart verification, and only a merge that needed a conflict-RESOLVING commit waits for
   green CI on that commit. `pr-review.sh merge` warns loudly on a stale base but no longer
-  refuses. The complement is the coordinator's **integration loop**, a fleet-placement
-  decision the coordinator makes with the whole board in view: as each merge lands, pick the
-  box with the least work (`fleet-worker.sh load` - CPU/GPU five-minute averages, dune count,
-  agent sessions per box; a box already running this wave's GPU measurement is NOT least
-  loaded whatever its CPU says), take an execution reservation there, and run the MERGED
+  refuses. The complement is the coordinator's **integration loop**, whose value is a verdict
+  for every merge: a master CI that cancels superseded runs leaves most merges without one
+  (2026-09-25: 9 of 16 master pushes cancelled, no master tip with a verdict for 2.5 h). As
+  each merge lands, pick a quiet, strong box with the whole board in view (`fleet-worker.sh
+  load` - CPU/GPU five-minute averages, dune count, agent sessions per box; a box already
+  running this wave's GPU measurement is NOT quiet whatever its CPU says; the maintainer chose
+  minix-amd-linux over tuf-amd-linux), take an execution reservation there, and run the MERGED
   repository's own full integration suite to completion in a checkout that owes the same proof
   as the launch preflight - clean porcelain, expected branch, HEAD equal to the remote master
   just merged - because a suite run atop local edits or the wrong branch verifies nothing. For
-  OCANNL that is the `@runtest @train` aliases (the remote CI's coverage), as an unpiped ssh
-  command with its own exit sentinel per the OCANNL agent-notes; for a repo whose CI already is
+  OCANNL that is the `@runtest @train` aliases, as an unpiped ssh command with its own exit
+  sentinel per the OCANNL agent-notes, and on a GPU box it also runs that box's backend, which
+  GitHub CI never covers (a bonus, not the reason for the pick); for a repo whose CI already is
   its fullest suite (ludics, flotilla, this one), the merged tip's CI run is the verdict,
   awaited with `pr-review.sh base owner/repo --wait` rather than re-run locally. Pick up each
   merge as it lands; one run covering several merges is incidental batching, never deliberate
@@ -645,11 +650,13 @@ controlled through the tools in your coordinator's file, never through those com
   (*Execution ownership* below). Timing experiments also inspect external activity and wait
   when it compromises the measurement. When repeated hardware iteration argues for an agent on
   that box, the placement options are in [native-workers.md](references/native-workers.md).
-- **Experiment-only items** (the user says "measurement only, don't recommend"): the brief
-  forbids implementing or recommending a fix direction, the deliverable is an issue comment
-  that a later session can act on, and the issue stays open. Expect the review of the
-  harness PR to find real instrument defects (#444: a device readback inside the timed region,
-  worth up to 1.7x) - that review is worth its rounds; cap it with the convergence policy
+- **Experiment-only items** (the user says "measurement only, don't recommend") get a brief
+  variant (2026-09-25: ahrefs/ocannl#719's was hand-edited into it): no fix direction,
+  implemented or recommended; no standing reservation, which would refuse the item's own
+  exclusive measurement on its box; no ship-pr landing - the deliverable is an issue comment a
+  later session can act on, and the issue stays open. A harness PR, if the item needs one, lands
+  through ship-pr, and its review finds real instrument defects (#444: a device readback inside
+  the timed region, worth up to 1.7x) - worth its rounds; cap it with the convergence policy
   after, not before.
 - **Gate later waves** on the merges and out-of-scope closures they wait for, and rebrief
   each next-wave worker with what its predecessors landed (new helpers, reshaped goldens,
