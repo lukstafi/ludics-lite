@@ -1626,7 +1626,9 @@ if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name
     { [ -e "$d/meta.prev" ] && mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
   if ! printf '%s\n' "$line" >> "$d/input.jsonl" 2>/dev/null; then
     mv -f "$d/meta.prev" "$d/meta"
-    echo "UNSTICK REFUSED $BOX/$name: cannot append to $d/input.jsonl"; exit 1
+    # No truncation: the live feeder may already have forwarded a partial write, and a file
+    # truncated under `tail -f` is re-read or skipped by platform. Said, not repaired.
+    echo "UNSTICK REFUSED $BOX/$name: cannot append to $d/input.jsonl (disk full?); it may now end in a partial line the CLI has already read -- free space, then \`close\` or \`unstick --kill\` it rather than appending again"; exit 1
   fi
   rm -f "$d/meta.prev"; trap 'exit 143' TERM HUP INT
   waited=0
