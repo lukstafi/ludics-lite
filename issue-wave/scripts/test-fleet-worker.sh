@@ -2028,6 +2028,41 @@ o1=$!
 held "$TMP/slot-old.log" "slot 1 of 1 held" &&
   expect "a batch holding slot 1 under the old count is a GPU token to the new one" 1 "all 1 GPU tokens" -- "${FWT[@]}" execution slot --wait 0 -- echo after-switch
 kill -9 "$o1" 2>/dev/null; wait "$o1" 2>/dev/null
+# THE NESTED SLOT (ahrefs/ocannl#1004): a held slot exports its marker, and an `execution slot`
+# inside it runs under that slot instead of taking another -- a runner that takes its own slot
+# inside a worker's wrapper must not hold two, or deadlock a full box.
+expect "a held slot exports its marker to the command" 0 "^testbox 1 1 gpu$" -- \
+  "${FWS[@]}" execution slot --wait 0 -- sh -c 'echo "$FLEET_SLOT_HELD"'
+expect "a slot taken --cpu past the tokens is marked cpu" 0 "^testbox 3 3 cpu$" -- \
+  "${FWT[@]}" execution slot --wait 0 --cpu -- sh -c 'echo "$FLEET_SLOT_HELD"'
+expect "a nested execution slot on a one-slot box runs inside the held slot (no deadlock, no refusal)" 0 "inside slot 1 of 1, held by an enclosing batch, for: echo nested-ran" -- \
+  "${FWS[@]}" execution slot --wait 0 -- "$FW" execution slot --wait 0 -- echo nested-ran
+grep -q "^nested-ran$" <<<"$out" && ok "...and the inner command ran" || ko "the nested command did not run -- $out"
+expect "...and returns the inner command's own status (3 is not read as a verdict)" 3 "inside slot 1 of 1" -- \
+  "${FWS[@]}" execution slot --wait 0 -- "$FW" execution slot --wait 0 -- sh -c 'exit 3'
+expect "a nested --cpu batch runs inside an enclosing GPU token" 0 "inside slot 1 of 3" -- \
+  "${FWT[@]}" execution slot --wait 0 -- "$FW" execution slot --wait 0 --cpu -- echo cpu-in-token
+expect "a nested GPU batch inside a slot taken --cpu is refused" 1 "EXECUTION SLOT REFUSED testbox: this batch runs inside slot 3 of 3, which an enclosing batch took as --cpu" -- \
+  "${FWT[@]}" execution slot --wait 0 --cpu -- "$FW" execution slot --wait 0 -- echo gpu-in-cpu
+expect "a marker naming a slot nobody holds is ignored, and a slot is taken" 0 "slot 1 of 1 held for: echo stale" -- \
+  env FLEET_SLOT_HELD="testbox 1 1 gpu" "${FWS[@]}" execution slot --wait 0 -- echo stale
+grep -q "does not cover this batch (slot 1 is not held)" <<<"$out" && ok "...saying why" || ko "the stale marker was not reported -- $out"
+expect "a marker naming another box is ignored" 0 "slot 1 of 1 held for: echo other-box" -- \
+  env FLEET_SLOT_HELD="other 1 1 gpu" "${FWS[@]}" execution slot --wait 0 -- echo other-box
+expect "a malformed marker is ignored" 0 "slot 1 of 1 held for: echo malformed" -- \
+  env FLEET_SLOT_HELD="garbage" "${FWS[@]}" execution slot --wait 0 -- echo malformed
+# A marker for a HELD slot, exported by hand beside a real holder: the marker is judged by the
+# lock, so it runs inside -- the holder's slot is the box's bound either way, and the batch adds
+# to its load only as much as the holder's own children would.
+"${FWS[@]}" execution slot -- sleep 30 > "$TMP/slot-n1.log" 2>&1 &
+n1=$!
+if held "$TMP/slot-n1.log" "slot 1 of 1 held"; then
+  expect "a hand-exported marker for a held slot runs inside it" 0 "inside slot 1 of 1" -- \
+    env FLEET_SLOT_HELD="testbox 1 1 gpu" "${FWS[@]}" execution slot --wait 0 -- echo beside-holder
+  expect "...while a batch with no marker is still refused" 1 "all 1 run-time correctness slots busy" -- \
+    "${FWS[@]}" execution slot --wait 0 -- echo no-marker
+fi
+kill -9 "$n1" 2>/dev/null; wait "$n1" 2>/dev/null
 expect "--cpu and --gpu together are a usage error" 2 "exclusive" -- "${FWT[@]}" execution slot --cpu --gpu -- true
 expect "a token count below one is refused, as a slot count is" 1 "FLEET_BOX_GPU_TOKENS entry must be <box>=<positive n>: testbox=0" -- \
   env FLEET_BOXES="testbox other" FLEET_BOX_GPU_TOKENS="testbox=0" "$FW" execution slot -- true

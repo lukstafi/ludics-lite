@@ -76,6 +76,18 @@ is each coordinator's own directory, and slots kept there would let two workers 
 coordinators each take slot 1 on one machine. The command after `--` is exec'd, not
 interpreted, so a pipeline or a shell builtin goes as `sh -c '...'`.
 
+**Nested slots.** A held slot exports `FLEET_SLOT_HELD` (`<box> <slot> <slots> <gpu|cpu>`) to
+its command, and an `execution slot` that finds it runs its command under the enclosing slot
+instead of taking a second one (ahrefs/ocannl#1004). That lets a project runner take the slot
+itself: OCANNL's `tools/test-run.sh` does, declaring `--cpu` when the backend it resolves is a
+CPU one. A worker's wrapper around such a runner is harmless, because the runner runs inside
+it. Without this, two slots per batch would fill a box at half its count, and a full box would
+deadlock until the deadline. The marker is checked, not trusted: it has to name this box and a
+slot that is held now, or it is reported and ignored. The GPU check reads the current token
+spec rather than the marker, so a GPU batch inside a slot that an enclosing batch took as
+`--cpu` is refused. A wrapper around a runner that may hold the GPU must therefore not declare
+`--cpu`, and the runner's own declaration is the better one to rely on.
+
 ## The OS-level sleep guard
 
 On native Linux the lab locks are advisory: they bind sessions that go through `wake-lab.sh`,
