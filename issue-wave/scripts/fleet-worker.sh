@@ -372,7 +372,9 @@ meta_set() {
 }
 # turn_state <name>: "<turn> <bg> <res>", read from the stream past the current process's start
 # (proc_offset). turn: `ended` when the last turn event is a `result`, `working` when it is a
-# system init, a user or an assistant event, `none` before the first; bg: how many background
+# system init, a user or an assistant event, or a task_notification (a finished background task
+# starts a turn with no user event, and its init can trail the notification), `none` before the
+# first; bg: how many background
 # tasks the last background_tasks_changed event listed; res: 1 when the latest message sent has
 # had its reply -- a `result` after the CLI's echo of that message (meta `awaiting`, its uuid), or,
 # for a record that names none, a `result` past turn_offset. An echo is the proof the CLI read
@@ -387,7 +389,7 @@ turn_state() {
       | if ($e | type) != "object" then .
         elif $e.type == "result" then .t = "ended" | (if .seen and .n > $rel then .res = 1 else . end)
         elif $u != "" and $e.type == "user" and $e.uuid == $u then .t = "working" | .seen = true
-        elif $e.type == "assistant" or $e.type == "user" or ($e.type == "system" and $e.subtype == "init") then .t = "working"
+        elif $e.type == "assistant" or $e.type == "user" or ($e.type == "system" and ($e.subtype == "init" or $e.subtype == "task_notification")) then .t = "working"
         elif $e.type == "system" and $e.subtype == "background_tasks_changed" then .bg = (($e.tasks // []) | length)
         else . end)
     | "\(.t) \(.bg) \(.res)"' 2>/dev/null)
@@ -1551,10 +1553,13 @@ mkdir -p "$d/messages" && mv -f "$staged" "$d/messages/$stamp.md" 2>/dev/null &&
   { echo "UNSTICK REFUSED $BOX/$name: cannot place the message under $d/messages"; exit 1; }
 kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd); sid=$(session_of "$d")
 [ -n "$sid" ] || { echo "UNSTICK REFUSED $BOX/$name: no session id in meta or stream"; exit 1; }
+[ -d "$cwd" ] || { echo "UNSTICK REFUSED $BOX/$name: recorded working directory $cwd is gone (worktree removed or renamed); nothing was changed"; exit 1; }
 # The append path (see the header): a live claude worker whose input channel is up takes the
 # message as one more input line -- the same process, so no second writer, no resume and no
 # transcript replay, whether it is IDLE or mid-turn. --kill skips it for kill-and-resume.
 if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name"; then
+  # A running process takes no new flags: extra CLI args are a restart, which is --kill.
+  [ "$#" -eq 0 ] || { echo "UNSTICK REFUSED $BOX/$name: extra CLI arguments ($*) cannot reach a live process -- pass --kill to resume the session with them, or drop them to append"; exit 1; }
   feeder_of "$name" >/dev/null || { echo "UNSTICK REFUSED $BOX/$name: the CLI's session is up but its input channel is not (no live feeder on $d/input.jsonl) -- pass --kill to resume the session instead"; exit 1; }
   line=$(user_line "$d/messages/$stamp.md" "$mid") && [ -n "$line" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot encode the message as an input line"; exit 1; }
   was=$(state_of "$name")
@@ -1581,7 +1586,6 @@ if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name
   fi
   echo "APPENDED $BOX/$name kind=claude session=$sid to=$was message=$d/messages/$stamp.md uuid=$mid $how"; exit 0
 fi
-[ -d "$cwd" ] || { echo "UNSTICK REFUSED $BOX/$name: recorded working directory $cwd is gone (worktree removed or renamed); nothing was changed"; exit 1; }
 # The same one-live-worker-per-worktree rule as launch, under the same box-wide lock: a
 # resume must not start beside another worker that took this worktree meanwhile.
 msg=$(take_lock "$STATE/launch.lock" 120 "launch lock") || { echo "UNSTICK REFUSED $BOX/$name: another launch on this box is publishing its record ($msg)"; exit 1; }
@@ -1682,7 +1686,8 @@ EOF
 # close: the end of a claude worker's life. Its process outlives every turn, so "finished" is the
 # hand-back turn ended (IDLE) AND the input closed: killing the feeder closes the CLI's stdin, the
 # CLI exits, run.sh records `exit`, and the verdict of the last turn is printed as attach would
-# (DONE/FAILED, exit 0/1). A worker mid-turn, or with background tasks listed, is refused: close
+# (DONE/FAILED, exit 0/1). A worker mid-turn, with background tasks listed, or whose latest message
+# has no reply yet (attach's own condition) is refused: close
 # is never an interrupt (that is `unstick --kill`). A worker already ended prints its verdict as it
 # stands, so a close-out can run close over every worker it finished.
 cmd_close() {
@@ -1703,7 +1708,11 @@ state=$(state_of "$name")
 if ! alive "$name" || ! is_stream "$name"; then
   echo "CLOSE REFUSED $BOX/$name: $state, not a stream-json worker with its session up (a one-shot or orphaned CLI ends with its turn) -- wait for it, or \`unstick --kill\`"; exit 1
 fi
-[ "$state" = IDLE ] || { read -r t bg _ <<< "$(turn_state "$name")"; echo "CLOSE REFUSED $BOX/$name: not idle (turn=$t, background_tasks=$bg) -- wait for attach's IDLE, or \`unstick --kill\` to interrupt"; exit 1; }
+read -r t bg res <<< "$(turn_state "$name")"
+[ "$state" = IDLE ] || { echo "CLOSE REFUSED $BOX/$name: not idle (turn=$t, background_tasks=$bg) -- wait for attach's IDLE, or \`unstick --kill\` to interrupt"; exit 1; }
+# attach's own condition: the latest message sent has had its reply. An appended line not yet
+# read would be dropped by closing the input under it.
+[ "$res" = 1 ] || { echo "CLOSE REFUSED $BOX/$name: idle, but the latest message sent has no reply yet (unread, or not yet answered) -- wait for attach's IDLE"; exit 1; }
 fpid=$(feeder_of "$name") || { echo "CLOSE REFUSED $BOX/$name: no live feeder on $d/input.jsonl, so its input is closed already or was never fed -- \`attach\` waits for the CLI, \`unstick --kill\` ends it"; exit 1; }
 kill "$fpid" 2>/dev/null
 # The session ends only after run.sh has written `exit`, so the verdict never reads it half-written.

@@ -277,8 +277,10 @@ if [ "$infmt" = stream-json ]; then
     if [ -n "$bg" ]; then
       echo '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash"}]}'
       result "$text"; sleep "$bg"
+      # As the real CLI: the task list clears and the notification lands before the new turn's init.
       echo '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
-      init; text="background task done"; say "$text"
+      echo '{"type":"system","subtype":"task_notification","task_id":"b1","status":"completed"}'
+      sleep 2; init; text="background task done"; say "$text"
     fi
     result "$text"
   done
@@ -1173,6 +1175,8 @@ printf 'BG 5 then report\n' > "$TMP/bg.md"
 "$FW" launch testbox wbg --target-repo example/project --kind claude --brief "$TMP/bg.md" --cwd "$proj" >/dev/null
 for i in $(seq 1 20); do grep -q '"background_tasks_changed","tasks":\[{' "$ISSUE_WAVE_STATE/workers/wbg/stream.jsonl" 2>/dev/null && break; sleep 0.25; done
 expect "a turn ended with a background task listed reads as RUNNING, not IDLE" 0 "RUNNING testbox/wbg .* turn=ended background_tasks=1 " -- "$FW" status testbox wbg
+for i in $(seq 1 40); do grep -q '"task_notification"' "$ISSUE_WAVE_STATE/workers/wbg/stream.jsonl" 2>/dev/null && break; sleep 0.25; done
+expect "...and the task's notification starts a turn before its init does: RUNNING, turn=working" 0 "RUNNING testbox/wbg .* turn=working background_tasks=0 " -- "$FW" status testbox wbg
 expect "...attach waits for the turn the task's completion starts" 0 "IDLE testbox/wbg .*background task done" -- "$FW" attach testbox wbg --interval 1
 settle wbg
 }
@@ -1196,6 +1200,15 @@ expect "...the turn in flight answers it: attach waits for that reply" 0 "IDLE t
 printf 'Now the next step.\n' > "$TMP/msg2.md"
 expect "an append to an IDLE worker starts its next turn" 0 "APPENDED testbox/ws .* to=IDLE .* delivered" -- "$FW" unstick testbox ws --message "$TMP/msg2.md"
 expect "...whose reply attach returns" 0 "IDLE testbox/ws success .*did: Now the next step" -- "$FW" attach testbox ws --interval 1
+expect "a live worker refuses extra CLI args on the append path: they need a new process" 1 "UNSTICK REFUSED testbox/ws: extra CLI arguments (--model opus) cannot reach a live process" -- "$FW" unstick testbox ws --message "$TMP/msg.md" -- --model opus
+mv "$proj" "$proj.moved"
+expect "a live worker whose worktree is gone refuses the append too" 1 "UNSTICK REFUSED testbox/ws: recorded working directory .* is gone" -- "$FW" unstick testbox ws --message "$TMP/msg.md"
+mv "$proj.moved" "$proj"
+[ "$(grep -c '' "$wsd/input.jsonl")" -eq 3 ] && ok "...neither refusal touched the input channel" || ko "a refused append wrote input: $(cat "$wsd/input.jsonl")"
+# An appended line the CLI has not answered: close would drop it by closing the input under it.
+cp "$wsd/meta" "$TMP/ws.meta"; sed -i.bak 's/^awaiting=.*/awaiting=never-sent/' "$wsd/meta" && rm -f "$wsd/meta.bak"
+expect "close refuses an IDLE worker whose latest message has no reply yet" 1 "CLOSE REFUSED testbox/ws: idle, but the latest message sent has no reply yet" -- "$FW" close testbox ws
+cp "$TMP/ws.meta" "$wsd/meta"
 cp "$wsd/feeder.pid" "$TMP/feeder.saved"; echo $$ > "$wsd/feeder.pid"
 expect "a live session whose input feeder is gone refuses the append and names --kill" 1 "UNSTICK REFUSED testbox/ws: the CLI's session is up but its input channel is not" -- "$FW" unstick testbox ws --message "$TMP/msg.md"
 cp "$TMP/feeder.saved" "$wsd/feeder.pid"

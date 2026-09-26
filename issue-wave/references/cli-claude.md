@@ -125,8 +125,8 @@ with the wait to run in the foreground.
 
 A Claude worker's process ends only when its input closes: once its hand-back turn is read,
 `fleet-worker.sh close <box> <name>` closes the input, waits for the exit and prints the final
-`DONE`/`FAILED` verdict (it refuses a worker mid-turn; on an ended worker it prints the verdict as
-it stands). `fleet-worker.sh ls` must show no `RUNNING`, no `IDLE` and no `ORPHANED` CLI worker on
+`DONE`/`FAILED` verdict (it refuses a worker mid-turn or with its latest message unanswered; on
+an ended worker it prints the verdict as it stands). `fleet-worker.sh ls` must show no `RUNNING`, no `IDLE` and no `ORPHANED` CLI worker on
 any box before the wave closes: an orphan is a CLI still writing after its tmux session died -
 wait for it, or `unstick --kill` it, never close out over it. Then, and only then, remove CLI
 workers' worktrees on their boxes (`ssh <box> 'git -C <checkout> worktree remove <path>'`), once
