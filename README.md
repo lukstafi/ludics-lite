@@ -136,7 +136,8 @@ batch declared `execution slot --cpu` takes a slot alone), four on minix-amd-lin
 tuf-amd-linux (ludics-lite#316, #344, #391). The
 usual coordinator shape is two calls per execution: `execution run <reserve.json>` (reserve and
 dispatch) and `execution conclude --from-run <run-dir> --request <id> --sha <sha>` (verdict, log and
-checkout read off a `test-run.sh` record on the reserved box). The reservation helper requires Python 3 on the anchor, and `execution slot` requires it on every
+checkout read off a `test-run.sh` record on the reserved box; `--from-bg-run <dir>` reads a
+`bg-run.sh` directory instead). The reservation helper requires Python 3 on the anchor, and `execution slot` requires it on every
 box that runs batches (the per-box preflight checks it).
 
 ## Routines

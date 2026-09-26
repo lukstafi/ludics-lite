@@ -1417,6 +1417,11 @@ expect "--from-bg-run needs the request id" 2 "--request <id> required" -- "${FW
 expect "--from-bg-run needs the revision that ran" 2 "--sha <full commit SHA> required" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live
 expect "--from-bg-run refuses a stray flag" 2 "conclude --from-bg-run <run-dir>" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live --sha "$sha" --oops
 "$FW" execution list | jq -e '[.[] | select(.request_id == "bg-live") | .state] == ["launching"]' >/dev/null && ok "every refusal left the assignment dispatched" || ko "a refusal changed bg-live"
+bgdone() { # <id>: conclude it, so the sections below find testbox free
+  jq -n --arg id "$1" '{request_id:$id, verdict:"not-launched", log:"/dev/null", evidence:"bg-run fixture: nothing ran"}' > "$TMP/$1-done.json"
+  "${FWB[@]}" execution conclude "$TMP/$1-done.json" >/dev/null || ko "could not conclude $1 (setup)"
+}
+bgdone bg-live
 }
 
 section "prs (the supervision read)" && {
@@ -1456,6 +1461,8 @@ env FLEET_BOXES="testbox other" "$FW" execution reserve "$TMP/prs-7.json" >/dev/
 expect "--wave keeps the PRs closing an issue its records name" 0 "^o/r#7 rounds=2" -- "$FW" prs o/r --wave wv
 grep -q "o/r#12" <<<"$out" && ko "a PR of no wave issue was listed: $out" || ok "...and drops the rest"
 expect "--wave with no records is refused, not read as an empty wave" 1 "no execution record names wave nowave" -- "$FW" prs o/r --wave nowave
+jq -n '{request_id:"prs-7", verdict:"not-launched", log:"/dev/null", evidence:"prs fixture: nothing ran"}' > "$TMP/prs-7-done.json"
+"$FW" execution conclude "$TMP/prs-7-done.json" >/dev/null || ko "could not conclude prs-7 (setup)"
 unset SHIM_PRS
 }
 
