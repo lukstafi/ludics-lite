@@ -6473,12 +6473,11 @@ BASE_INTEGRATION_ROWS=""
 # tip_named_source <branch> <tip sha> <workflow id>:<name>...: the tip's verdict for those
 # workflows from the named sources, (b) then (a).
 # Sets SRC_VERDICT (green | red | pending | none), SRC_WHY, SRC_NAME (the source in a few words,
-# for the verdict line) and SRC_KIND (b or a, which source answered); exit 3 on UNKNOWN. Nothing is remembered between rounds: a PR head's runs
+# for the verdict line); exit 3 on UNKNOWN. Nothing is remembered between rounds: a PR head's runs
 # can be re-run, and a green read in round one can be a red by round three (review round 2).
 SRC_VERDICT=""
 SRC_WHY=""
 SRC_NAME=""
-SRC_KIND=""
 tip_named_source() {
   local branch="$1" sha="$2" row rsha verdict rid when
   # The newest record at the tip, by its conclusion time (ISO 8601 from one clock, so it sorts
@@ -6490,14 +6489,12 @@ tip_named_source() {
     if [ "$verdict" = pass ]; then SRC_VERDICT=green; else SRC_VERDICT=red; fi
     SRC_WHY="source (b): integration record $rid ran the tip ${rsha:0:8} and concluded $verdict ($when)"
     SRC_NAME="integration record $rid"
-    SRC_KIND=b
     return 0
   fi
   shift 2
   tip_pr_head_verdict "$branch" "$sha" "$@" || return 3
   SRC_VERDICT="$TIP_PR_VERDICT"
   SRC_NAME="PR #$TIP_PR_NUM's head run (roll-forward rule)"
-  SRC_KIND=a
   if [ "$SRC_VERDICT" = none ]; then
     SRC_WHY="no integration record ran the tip ${sha:0:8}, and $TIP_PR_WHY"
   else
@@ -6517,7 +6514,7 @@ cmd_base() {
   local records="" rsha rverdict rid rwhen pushless="" pushless_ids=() src_pending=0 src_none=0
   local trig_note interim="" fly tipfly=0 tipfly_ids=() tipfly_names="" uncov_nofly=0 pend_fly=0
   local interim_green="" interim_name="" interim_why="" pushless_name="" norun_ids=() rerounds=0
-  local hold_why moved want rid rstatus
+  local hold_why moved want rid rstatus pushless_wids older_fly
   while [ $# -gt 0 ]; do
     case "$1" in
     # Opt in to an INTERIM verdict for a tip whose own push run is still in flight (ludics-lite
@@ -6599,7 +6596,7 @@ cmd_base() {
   grace_from=$started
   while :; do
     red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0 norun=0
-    tip_unjudged=0 unrun_rows="" pushless="" pushless_ids=() src_pending=0 src_none=0
+    tip_unjudged=0 unrun_rows="" pushless="" pushless_ids=() src_pending=0 src_none=0 pushless_wids=" "
     tipfly=0 tipfly_ids=() tipfly_names="" uncov_nofly=0 pend_fly=0 interim_green="" norun_ids=()
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
@@ -6730,6 +6727,7 @@ cmd_base() {
           if [ "$BASE_TRIGGER" = pushless ]; then
             pushless="${pushless:+$pushless, }$name"
             pushless_ids+=("$wfid:$name")
+            pushless_wids="$pushless_wids$wfid "
             out="${out}  retired  $name — no push trigger at the tip, so its newest judged push run ($vconcl at ${vsha:0:8}) is history, not the tip's verdict"$'\n'
             continue
           fi
@@ -6860,11 +6858,19 @@ cmd_base() {
     # the head run of the PR whose clean GitHub merge the tip is, under the roll-forward rule),
     # for exactly the workflows in flight — each must have built green on that head. A green is an
     # interim verdict, exit 0, and the verdict line names its source and the run still in flight,
-    # so a reader of the report cannot take it for the tip's own run. A FAILED integration record
-    # at the tip is the tip's red, as it is everywhere else in this command: that run judged the
-    # tip's own tree (review round 1). Anything else from the source (a direct push, a squash, a
-    # PR head red or not built) adds a line saying why and leaves the tip pending: a PR head's red
-    # is not the tip's while the tip's own run is going.
+    # so a reader of the report cannot take it for the tip's own run. Anything else from the
+    # source (a direct push, a squash, a PR head red or not built) adds a line saying why and
+    # leaves the tip pending: a PR head's red is not the tip's while the tip's own run is going.
+    #
+    # A FAILED integration record at the tip is the tip's red, as it is everywhere else in this
+    # command: that run judged the tip's own tree (review round 1). It is read first, from the
+    # records in hand (no API call), whenever the tip's own run is in flight — before any of the
+    # shape's guards, which hold back only a green (round 5). A tip whose own run is not in
+    # flight is outside #308, and a record there is read only for a retired workflow, as before.
+    #
+    # "No other run in flight" is counted over EVERY row read, not the fold's newest per
+    # workflow: a workflow without cancel-in-progress can run an older commit beside the tip's
+    # run, and that older run judges base changes the PR head may never have met (round 5).
     #
     # Two checks stand between a green source and the interim (review round 1), and they hold
     # back only that green: the source is asked first, so a failed record at the tip is RED
@@ -6886,15 +6892,23 @@ cmd_base() {
     # interim; a --wait asks every round, since a round in this shape would otherwise keep
     # waiting. A read that fails leaves the tip pending with a note — never UNKNOWN, since the
     # pending answer it falls back to is true.
+    if [ -n "$interim" ] && [ "$tipfly" -gt 0 ] &&
+      awk -F'\t' -v s="$tip" '$1 == s { found = 1 } END { exit !found }' <<<"$BASE_INTEGRATION_ROWS" &&
+      tip_named_source "$branch" "$tip" "${tipfly_ids[@]}" && [ "$SRC_VERDICT" = red ]; then
+      red=$((red + 1))
+      red_at_tip=$((red_at_tip + 1))
+      out="${out}  RED      $tipfly_names — its push run is still in flight, but $SRC_WHY"$'\n'
+    fi
+    older_fly=0
+    if [ "$tipfly" -gt 0 ]; then
+      older_fly=$(awk -F'\t' -v t="$tip" -v skip="$pushless_wids" \
+        '$1 != "" && $3 != "completed" && $5 != t && index(skip, " " $1 " ") == 0 { n++ } END { print n + 0 }' <<<"$allruns")
+    fi
     if [ -n "$interim" ] && [ "$red" -eq 0 ] && [ "$src_pending" -eq 0 ] && [ "$src_none" -eq 0 ] &&
       [ "$tipfly" -gt 0 ] && [ "$inflight" -eq "$tipfly" ] && [ "$uncov_nofly" -eq 0 ] &&
-      { [ "$wait_for" -gt 0 ] || [ "$pend" -gt 0 ]; }; then
+      [ "$older_fly" -eq 0 ] && { [ "$wait_for" -gt 0 ] || [ "$pend" -gt 0 ]; }; then
       if ! tip_named_source "$branch" "$tip" "${tipfly_ids[@]}"; then
         out="${out}           (no interim verdict for $tipfly_names: a verdict source could not be read ($(gh_err_line)))"$'\n'
-      elif [ "$SRC_VERDICT" = red ] && [ "$SRC_KIND" = b ]; then
-        red=$((red + 1))
-        red_at_tip=$((red_at_tip + 1))
-        out="${out}  RED      $tipfly_names — its push run is still in flight, but $SRC_WHY"$'\n'
       elif [ "$SRC_VERDICT" != green ]; then
         out="${out}           (no interim verdict for $tipfly_names: $SRC_WHY)"$'\n'
       else
@@ -6947,6 +6961,12 @@ cmd_base() {
           interim_green=1
         elif [ -n "$moved" ] && [ "$rerounds" -lt 2 ]; then
           rerounds=$((rerounds + 1))
+          # The tip this round observed is recorded first, as the round's own end would: a move
+          # found next round then restamps the absence grace (round 5).
+          if [ "$tip" != "$last_tip" ]; then
+            [ -z "$last_tip" ] || grace_from=$(date +%s)
+            last_tip="$tip"
+          fi
           continue
         else
           out="${out}           (no interim verdict for $tipfly_names: $hold_why)"$'\n'

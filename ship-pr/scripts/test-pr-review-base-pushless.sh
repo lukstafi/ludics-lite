@@ -539,6 +539,16 @@ test_interim_is_not_asked_outside_its_shape() {
   assert_eq "$BASE_RC" 4 "a run in flight at an older commit is pending"
   assert_contains "$BASE_OUTPUT" "NO VERDICT YET (tip ${SHA_C:0:8}) — pending" "and reads so"
   assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "but the tip's own run is not what is coming"
+  # And an older run of the SAME workflow still going beside the tip's own (no cancel-in-progress):
+  # the fold keeps only the newest row, but every row read counts (review round 5). That older run
+  # judges base changes the PR head may never have met.
+  burst_fixture '[{"status":"in_progress","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7372},
+                  {"status":"in_progress","conclusion":null,"head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7371},
+                  {"conclusion":"cancelled","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","id":7370}]'
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "an older run in flight beside the tip's own holds the interim"
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "no green over a run still judging"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "and no source is asked"
 }
 
 # The interim re-confirms the tip before it is taken, as the covered break does: a merge landing
@@ -629,6 +639,15 @@ test_interim_takes_a_record_at_the_tip() {
   run_base --interim --integration-records "$file"
   assert_eq "$BASE_RC" 0 "a passed record at the tip is an interim green"
   assert_contains "$BASE_OUTPUT" "judged meanwhile by integration record w-integration-8" "naming it"
+  # Read before the shape's guards, which hold back only a green (round 5): an older red under the
+  # tip's run, where the interim itself is never asked, does not hide the record's red at the tip.
+  burst_fixture '[{"status":"in_progress","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7361},
+                  {"conclusion":"failure","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7360}]'
+  file=$(records "$SHA_C	fail	w-integration-9	2026-09-26T09:00:00+00:00")
+  run_base --interim --wait=4 --integration-records "$file"
+  assert_eq "$BASE_RC" 1 "a failed record at the tip is its red beside an older red too"
+  assert_contains "$BASE_OUTPUT" "integration record w-integration-9 ran the tip ${SHA_C:0:8} and concluded fail" "naming it"
+  assert_eq "$(rounds_polled)" 1 "and it ends the wait on the round that read it"
   # Without --interim the record is not read for a push workflow at all, as before.
   burst_fixture "$BURST_RUNS"
   file=$(records "$SHA_C	fail	w-integration-9	2026-09-26T09:00:00+00:00")
