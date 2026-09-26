@@ -35,8 +35,8 @@ FW="$HERE/fleet-worker.sh"
 # selected run still runs the sections in file order: each reads what the ones above it left.
 SECTIONS=(
   "the real checkout under the README's install loops"
-  "coordinator lease"
   "base gate"
+  "coordinator lease"
   "preflight"
   "load"
   "launch / attach / status / log with a project repo and --repo/--branch"
