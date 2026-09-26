@@ -57,6 +57,10 @@ responsibility to the skill/coordinator rather than starting another monitor.
 A PR counts when its head branch has the local branch's name or, for work pushed
 under another name (`git push origin HEAD:<name>`), when it contains the local
 HEAD commit. Local commits beyond such a PR's head are in no PR and still nudge.
+The lookup asks origin's repository by its URL, and also gh's default repository
+when the checkout has other remotes and origin is not `gh repo set-default`'s
+choice: gh prefers a remote named `upstream`, so a staging checkout would
+otherwise ask the parent and miss the PR that merged on origin.
 
 A nudge is claimed at most once per session, worktree, branch, HEAD and porcelain
 status. File contents are deliberately not hashed: editing the same dirty files
@@ -64,10 +68,15 @@ again does not nag the user at every turn. A new commit or changed set/status of
 paths can permit another nudge. The `stop_hook_active` guard prevents an immediate
 continuation loop. Claims live in `${TMPDIR:-/tmp}/ship-pr-nudge` and are temporary.
 
-GitHub failures, missing dependencies, and unreadable Git state are unknown and
-stay quiet without claiming the state. A successful empty `gh pr list --state all`
-answer to every lookup is required before saying there is no PR. There is no fetch; the local
-`origin/HEAD` determines the base, falling back to `master` when absent.
+GitHub failures, timeouts, missing dependencies, and unreadable Git state are
+unknown and stay quiet without claiming the state. A successful empty
+`gh pr list --state all` answer to every lookup is required before saying there is
+no PR. The local `origin/HEAD` determines the base, falling back to `master` when
+absent. Only then, with commits ahead, the hook fetches that base branch from
+origin (`gh pr merge` does not update the local ref) and counts again: a branch
+whose commits already landed stays quiet. A failed fetch still nudges, noting that
+the count is against a possibly stale local ref. Each network call is bounded to
+5 seconds and all of them together to 15, inside the 20-second hook timeout above.
 
 Claude's recent unfinished task files defer the reminder without stamping. Codex
 payloads have `turn_id` and skip that Claude-only probe; this hook does **not**

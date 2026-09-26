@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 HOOK = Path(__file__).with_name("ship-pr-nudge.sh").resolve()
@@ -21,17 +22,20 @@ class NudgeTests(unittest.TestCase):
         self.bin.mkdir()
         # A controlled PATH also exercises the Python fallback without uninstalling jq.
         for name in ("git", "python3", "cat", "shasum", "cut", "mkdir", "pwd",
-                     "grep", "tail", "find"):
+                     "grep", "tail", "find", "sleep"):
             path = shutil.which(name)
             if path:
                 (self.bin / name).symlink_to(path)
         gh = self.bin / "gh"
-        # N_PR answers the lookup by branch name, N_SHA the lookup by commit.
+        # N_PR answers the lookup by branch name, N_SHA the lookup by commit. N_ORIGIN, when set,
+        # answers a branch lookup naming a --repo, which the hook uses only for origin's.
         gh.write_text('#!/bin/bash\n'
                       'echo "$*" >> "$TMPDIR/gh-calls"\n'
                       '[ "$1 $2" = "pr list" ] || exit 9\n'
                       'answer=$N_PR\n'
+                      'case " $* " in *" --repo "*) answer=${N_ORIGIN:-$N_PR} ;; esac\n'
                       'case " $* " in *" --search "*) answer=$N_SHA ;; esac\n'
+                      '[ "$answer" = hang ] && exec sleep 30\n'
                       '[ "$answer" = error ] && exit 1\n'
                       'printf "%s\\n" "$answer"\n')
         gh.chmod(0o755)
@@ -49,6 +53,14 @@ class NudgeTests(unittest.TestCase):
         self.git("switch", "-qc", "topic")
         self.file.write_text("exploring\n")
         self.payload = dict(cwd=str(self.repo), session_id="session", stop_hook_active=False)
+
+    def add_origin(self):
+        """A real origin whose main is the fixture's base, so the hook's fetch has a remote."""
+        origin = self.root / "origin.git"
+        self.git("init", "-q", "--bare", str(origin))
+        self.git("remote", "add", "origin", str(origin))
+        self.git("push", "-q", "origin", "main")
+        return origin
 
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.repo, env=self.env, check=True,
@@ -105,6 +117,60 @@ class NudgeTests(unittest.TestCase):
                       (self.root / "gh-calls").read_text())
         self.env["N_SHA"] = "0"
         self.run_hook(0)  # The same repository state remains stamped.
+
+    def test_pr_on_origin_found_when_gh_default_is_another_remote(self):
+        # #404: a staging checkout with an `upstream` remote and no `gh repo set-default`, where
+        # gh's default resolves to upstream, which has no PR for the branch; origin has it.
+        self.git("commit", "-qam", "work")
+        origin = self.add_origin()
+        self.git("remote", "add", "upstream", "https://github.com/example/parent.git")
+        self.env["N_ORIGIN"] = "1"
+        self.run_hook(0)
+        self.assertIn(f"--repo {origin} --head topic", (self.root / "gh-calls").read_text())
+
+    def test_origin_only_checkout_asks_origin_alone(self):
+        self.git("commit", "-qam", "work")
+        origin = self.add_origin()
+        self.run_hook(2)
+        calls = (self.root / "gh-calls").read_text().splitlines()
+        self.assertTrue(calls and all(f"--repo {origin} " in call for call in calls), calls)
+
+    def test_branch_landed_behind_stale_base_reads_as_landed(self):
+        # The branch landed with no PR to find (here a direct push), and the local origin/main
+        # predates it: the hook refreshes the base before calling the branch unlanded.
+        self.git("commit", "-qam", "work")
+        self.add_origin()
+        stale = self.git("rev-parse", "main")
+        self.git("push", "-q", "origin", "HEAD:main")
+        self.git("update-ref", "refs/remotes/origin/main", stale)
+        self.run_hook(0)
+        self.assertEqual(self.git("rev-parse", "origin/main"), self.git("rev-parse", "HEAD"))
+        self.assertFalse((self.root / "ship-pr-nudge").exists() and
+                         any((self.root / "ship-pr-nudge").iterdir()))
+        self.file.write_text("new work on the landed branch\n")
+        result = self.run_hook(2)
+        self.assertNotIn("ahead", result.stderr)
+
+    def test_unlanded_branch_behind_fresh_base_still_nudges(self):
+        self.git("commit", "-qam", "work")
+        self.add_origin()
+        result = self.run_hook(2)
+        self.assertIn("1 commit(s) ahead of origin/main, no PR.", result.stderr)
+        self.assertNotIn("could not refresh", result.stderr)
+
+    def test_unrefreshable_base_nudges_with_a_note(self):
+        # The fixture's origin/main has no remote behind it, so the fetch fails.
+        self.git("commit", "-qam", "work")
+        result = self.run_hook(2)
+        self.assertIn("could not refresh origin/main", result.stderr)
+
+    def test_hanging_gh_is_bounded_and_does_not_stamp(self):
+        self.env["N_PR"] = "hang"
+        started = time.monotonic()
+        self.run_hook(0)
+        self.assertLess(time.monotonic() - started, 12)
+        self.env["N_PR"] = "0"
+        self.run_hook(2)
 
     def test_commit_lookup_failure_does_not_claim_absence_or_stamp(self):
         self.git("commit", "-qam", "work")
