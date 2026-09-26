@@ -26,8 +26,10 @@
 #   wake-lab.sh boot-linux --as=ID box    ...and back: reboot it (or wake it) into Ubuntu; both are
 #                                         reboots, so a desktop session's open apps close with them
 #   wake-lab.sh --list                    dump the router's host table
-# Every verb but `status` needs a box (or `all`): with none, wake-lab.sh prints this and exits 2,
-# sending nothing. A bare invocation is what you type to see the usage, so it must never wake,
+#   wake-lab.sh endpoint-map              print each box's row of the endpoint map as data, the box
+#                                         and then its ssh aliases; needs no site table, takes no box
+# Every verb but `status` and `endpoint-map` needs a box (or `all`): with none, wake-lab.sh prints
+# this and exits 2, sending nothing. A bare invocation is what you type to see the usage, so it must never wake,
 # sleep or restart anything.
 # WSL and Windows hardware notes live with the adapter in scripts/wake-lab-wsl.sh.
 #
@@ -206,7 +208,7 @@ check_map() {
       ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_-]*) bad="$bad the box name $(printf %q "$name") is not a plain name;"; continue ;;
     esac
     case "$name" in
-      status|sleep|hibernate|down|kick-wsl|restart-wsl|unhold|lock-path|boot-windows|boot-linux|all)
+      status|sleep|hibernate|down|kick-wsl|restart-wsl|unhold|lock-path|boot-windows|boot-linux|endpoint-map|all)
         bad="$bad the box name $name is a command word;"; continue ;;
     esac
     case "$boxes" in *" $name "*) bad="$bad $name has two rows;"; continue ;; esac
@@ -1374,7 +1376,33 @@ case "${1:-}" in
   status|sleep|hibernate|down|kick-wsl|unhold) VERB=$1; shift ;;
   restart-wsl) VERB=kick-wsl; FRESH_WSL=fresh; shift ;;
   lock-path|boot-windows|boot-linux) VERB=$1; shift ;;
+  endpoint-map) VERB=$1; shift ;;
 esac
+
+# `endpoint-map` (ludics-lite#395): the map as data, one line per row -- the box name, then every
+# ssh alias of that row -- for fleet-worker.sh, whose registry refuses a FLEET_BOXES roster that
+# lists two aliases of one box (a measurement on one would not exclude a run on the other). The map
+# stays the one source: the registry asks here rather than restating the rows. Before the argument
+# loop and load_hosts, like lock-path: it takes no box and no option, and it answers from a checkout
+# that holds no site table. It answers only for a map every rule passes -- check_map whole, then
+# check_endpoints on each row with no kind to require -- so a reader never gets a row this script
+# itself would refuse to act on.
+if [ "$VERB" = endpoint-map ]; then
+  if [ "$#" -ne 0 ]; then
+    printf '%s\n' "wake-lab.sh: endpoint-map takes no arguments; nothing was sent." >&2
+    exit 2
+  fi
+  check_map || exit 1
+  while IFS= read -r t; do check_endpoints "$t" "" || exit 1; done < <(lab_boxes)
+  for r in "${ENDPOINT_MAP[@]}"; do
+    read -r t rest <<<"$r"
+    read -r -a ws <<<"$rest"
+    line=$t
+    for w in "${ws[@]}"; do line="$line ${w#*=}"; done
+    printf '%s\n' "$line"
+  done
+  exit 0
+fi
 
 for arg in "$@"; do
   case "$arg" in

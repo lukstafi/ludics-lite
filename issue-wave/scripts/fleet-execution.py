@@ -3,7 +3,7 @@
 This records cooperative ownership; it neither launches nor supervises processes.
 
 Argv: <state root> <action> <coordinator> <lease token> <json payload> <FLEET_BOXES>
-      [<FLEET_BOX_CORRECTNESS_SLOTS>]
+      [<FLEET_BOX_CORRECTNESS_SLOTS> [<endpoint map>]]
 
 Ownership per execution host (ludics-lite#157): a `measurement` assignment is exclusive -- it
 refuses while anything else is outstanding on the box, and everything refuses while it is. A
@@ -15,6 +15,21 @@ record is the ownership/evidence record of a worker's whole life, taken at launc
 at hand-back, so it consumes no slot -- the slots are taken at run time by
 `fleet-worker.sh execution slot`, around each batch. It is still outstanding for every other
 purpose, so a measurement keeps the box to itself.
+
+One roster entry per physical box (ludics-lite#395). Ownership is keyed by the exact
+FLEET_BOXES entry, so a roster naming two aliases of one box (`rog-nv-linux` and `rog-nv-wsl`)
+would admit a measurement on one beside a run on the other, and the exclusivity above -- which
+`wake-lab.sh boot-windows --as=<request_id>` relies on -- would split silently. So reserve, run and
+dispatch refuse such a roster, naming both entries and the box they share; reads and
+evidence/conclusion stay available, as for a noncanonical outstanding host. What is one box is read
+from the endpoint map argument, `wake-lab.sh endpoint-map` as fleet-worker passes it: one line per
+box, the box name and then its ssh aliases. The boundary, fail-closed within it: two roster
+entries are one box when the map puts both on one row (the box name counts as one of its row's
+aliases), or when they differ only by case, as ssh lowercases a host name before matching its
+config; a map naming one alias on two rows is refused whole. It deliberately does not read
+~/.ssh/config: two `Host` stanzas pointing at one HostName outside the map are not detected. An
+empty or absent map argument keeps today's behaviour (each entry is its own box, up to case);
+fleet-worker passes one only when its checkout has no wake-lab.sh, and says so on stderr.
 """
 import json
 import os
@@ -118,6 +133,30 @@ def correctness_slots(spec, canonical_hosts):
     return slots
 
 
+def endpoint_boxes(spec):
+    """The endpoint map as {casefolded alias: box}; each row is `<box> <alias>...`."""
+    boxes = {}
+    for row in spec.splitlines():
+        words = row.split()
+        for alias in words:
+            owner = boxes.setdefault(alias.casefold(), words[0])
+            if owner != words[0]:
+                refuse(f"the endpoint map puts {alias} on both {owner} and {words[0]}; fix ENDPOINT_MAP in wake-lab.sh")
+    return boxes
+
+
+def check_one_entry_per_box(roster, map_spec):
+    """Refuse a roster naming two aliases of one physical box (see the header)."""
+    boxes = endpoint_boxes(map_spec)
+    seen = {}
+    for entry in roster:
+        box = boxes.get(entry.casefold(), entry.casefold())
+        other = seen.setdefault(box, entry)
+        if other != entry:
+            refuse(f"FLEET_BOXES lists {other} and {entry}, two aliases of the one box {box}: a measurement "
+                   f"on one would not exclude a run on the other; keep one entry per physical box")
+
+
 def check_capacity(data, records, canonical_hosts, slots_spec):
     """Refuse when the requested host cannot take this assignment beside the outstanding ones."""
     host, kind = data["execution_host"], data["kind"]
@@ -146,6 +185,7 @@ def check_capacity(data, records, canonical_hosts, slots_spec):
 def main():
     root, action, coordinator, token, raw, boxes = sys.argv[1:7]
     slots_spec = sys.argv[7] if len(sys.argv) > 7 else ""
+    map_spec = sys.argv[8] if len(sys.argv) > 8 else ""
     directory = Path(root) / "executions"
     # A corrupt record blocks dispatch instead of silently making its box available.
     records = {}
@@ -187,9 +227,11 @@ def main():
     record = records.get(identity)
     events = []   # (action, data) pairs appended to the history, in order
     if action in {"reserve", "run", "dispatch"}:
-        canonical_hosts = set(boxes.split())
+        roster = list(dict.fromkeys(boxes.split()))   # a repeated entry is the same entry
+        canonical_hosts = set(roster)
         if not canonical_hosts:
             refuse("FLEET_BOXES must name the canonical fleet hosts")
+        check_one_entry_per_box(roster, map_spec)
         # A changed roster cannot silently erase ownership recorded under an old alias.
         # Keep reads and evidence/conclusion available to reconcile those records.
         for existing in records.values():

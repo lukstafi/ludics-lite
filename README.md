@@ -241,14 +241,18 @@ counts, so a green run says what it did not check. The staging side has no match
 `WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the common lab
 lore in `wake-lab.sh` and the Windows/WSL lessons in `wake-lab-wsl.sh`, the router endpoints, the
 ssh aliases and all of the logic. `wake-lab.sh --help` prints the common header, and
-`--help` and `--list` are the two commands that work before the host table exists. The box names
+`--help`, `--list`, `lock-path` and `endpoint-map` are the commands that work before the host
+table exists. The box names
 (`rog`, `minix`, `tuf`) and the ssh aliases are the author's and are edited in place. The aliases
 live in one endpoint map, `ENDPOINT_MAP` in `wake-lab.sh`: one row per box, listing each OS it can
 boot (`linux`, `win`, `wsl`, and a `lan` route to Windows). Validation, `status`, the waits and the
 WSL adapter all read that row, and a row that is incomplete (a Windows endpoint with no guest, a
 half-renamed alias, a misspelt key) is refused before anything is sent (ludics-lite#314). `all`
 and a bare `status` expand to the map's rows, so adding or renaming a box is one row there plus
-its entries in the site file. `status` is the only verb with a no-box default: every other verb,
+its entries in the site file. `wake-lab.sh endpoint-map` prints the map as data, one line per box
+(the box, then its aliases), and only for a map every rule passes; `fleet-worker.sh execution`
+reads it to refuse a `FLEET_BOXES` roster naming two aliases of one box (ludics-lite#395).
+`status` is the only verb with a no-box default, and `endpoint-map` takes none: every other verb,
 wake included, prints the usage and exits 2 when no box is named, so a bare `wake-lab.sh` never
 wakes anything; name the boxes, or `all`.
 
@@ -619,7 +623,8 @@ worker to read, takes it itself, so every section also passes when it is the onl
 adapter absent, including the lab-lock columns (a held lock, a free one with a stale line, and no
 file at all, with status leaving every file and holder as it found them) and the reservation count
 from a stub registry reader, and the endpoint map: a fixture box added to a copy of the script is
-probed from its row alone, and each incomplete shape of that row is refused with nothing sent. It
+probed from its row alone, and each incomplete shape of that row is refused with nothing sent, and
+`endpoint-map` prints the rows with no site table and nothing for a map or row it refuses. It
 also drives `boot-windows` and `boot-linux` against a stub box whose booted OS the stub's reboot
 rewrites: the single BootNext selection read from the listing (never BootOrder or GRUB), both lab
 locks held at the moment of the reboot, the refusal on a held lane or hold lock and none on a stale
