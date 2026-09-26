@@ -3588,8 +3588,9 @@ summarize_checks() {
 #
 # Prints "<red count><TAB><waived runs><TAB><reason>" — a count, because gate_checks reports through
 # CHECK_RED and a command substitution cannot hand it back a variable; and the red runs an
-# override's waiver took out of that count (see is_waived), one "<run id> <name>" per line and empty
-# outside an override, because the recording read has to add them to WAIVED in gate_checks' own shell — and
+# override's waiver took out of that count (see is_waived), one "<run id> <run|job> <name>" per
+# line (`job`: red through a waived check; `run`: a checkless red waived as itself), empty outside
+# an override, because the recording read has to add them to WAIVED in gate_checks' own shell — and
 # returns
 #   1  RED at the run level: a non-advisory run for this head concluded red with no check behind
 #      it. A red is a verdict, so it ends a --wait like any other.
@@ -3632,8 +3633,13 @@ run_reason() {
 # and none of the non-advisory ones is red, i.e. its red is entirely explained by jobs the gate
 # ignores. A run with NO jobs (the `startup_failure` case this red branch exists for) is not
 # explained, and neither is a jobs read that failed — a red this cannot disprove stands.
+# Returns 0 when advisory jobs alone explain the red, 2 when it is explained but a job an override
+# waived is part of the explanation, 1 when it is not explained. 2 is not 0 because a red waived is
+# still a red: dropping it like an advisory one let a poll whose check list momentarily lacked the
+# waived row read the head as GREEN, with no OVERRIDE record, and past --require-green (review
+# round 5). The caller reports it as a waived red instead.
 run_red_is_advisory_only() {
-  local id="$1" suite="${2:--}" raw rc jname jconcl jobs=0 hard=0 names=""
+  local id="$1" suite="${2:--}" raw rc jname jconcl jobs=0 hard=0 waived=0 names=""
   raw=$(gh_retry read api --paginate "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
     --jq '.jobs[] | [(.name // "-"), (.conclusion // "pending")] | @tsv')
   rc=$?
@@ -3650,10 +3656,15 @@ run_red_is_advisory_only() {
     [ "$(conclusion_class "$jconcl")" = red ] || continue
     # A job an override waived as its check explains its run's red the same way (ludics-lite#392,
     # see is_waived). Outside an override WAIVED is empty and this never holds.
-    one_line_is "$names" "$jname" && is_waived "check:$suite/$jname" && continue
+    if one_line_is "$names" "$jname" && is_waived "check:$suite/$jname"; then
+      waived=$((waived + 1))
+      continue
+    fi
     hard=$((hard + 1))
   done <<<"$raw"
-  [ "$jobs" -gt 0 ] && [ "$hard" -eq 0 ]
+  [ "$jobs" -gt 0 ] && [ "$hard" -eq 0 ] || return 1
+  [ "$waived" -eq 0 ] || return 2
+  return 0
 }
 
 run_signal() {
@@ -3730,11 +3741,20 @@ run_signal() {
   if [ -n "$red_rows" ]; then
     while IFS=$'\t' read -r rid rname rconcl rsuite; do
       [ -n "$rid" ] || continue
-      run_red_is_advisory_only "$rid" "$rsuite" && continue
+      run_red_is_advisory_only "$rid" "$rsuite"
+      case "$?" in
+      0) continue ;;
+      # Red through a check the override waived: a waived red, handed back as one (kind `job`).
+      2)
+        waived_runs="${waived_runs}${rid} job ${rname}"$'\n'
+        continue
+        ;;
+      esac
       # Under an override, a run-level red it waives (or, on the recording read, every one there
-      # is) is handed back to gate_checks as "<run id> <name>" and not counted (ludics-lite#392).
+      # is) is handed back to gate_checks as "<run id> run <name>" and not counted
+      # (ludics-lite#392).
       if [ "$GATE_WAIVE" = record ] || { [ "$GATE_WAIVE" = apply ] && is_waived "run:$rid"; }; then
-        waived_runs="${waived_runs}${rid} ${rname}"$'\n'
+        waived_runs="${waived_runs}${rid} run ${rname}"$'\n'
         continue
       fi
       red=$((red + 1))
@@ -3839,7 +3859,7 @@ run_signal() {
 # other; a red that is not in the set is VERDICT red or runred, as it would be without one.
 gate_checks() {
   local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining
-  local run_why="" run_info note pr_at="" base_sha="" head_ref="" current_sha waived_runs rname
+  local run_why="" run_info note pr_at="" base_sha="" head_ref="" current_sha waived_runs rname rid
   WAIVED=$'\n'
   RUN_WAIVED=0
   CHECK_WAIVED=0
@@ -3914,9 +3934,18 @@ gate_checks() {
       # recording read, and reported either way, since they are reds the merge goes over.
       while IFS= read -r rname; do
         [ -n "$rname" ] || continue
-        [ "$GATE_WAIVE" != record ] || WAIVED="${WAIVED}run:${rname%% *}"$'\n'
         RUN_WAIVED=$((RUN_WAIVED + 1))
-        CHECK_LINES="${CHECK_LINES}  RED      workflow run ${rname#* } (no build check behind it — WAIVED: red when --override was given)"$'\n'
+        rid="${rname%% *}"
+        rname="${rname#* }"
+        case "${rname%% *}" in
+        job) CHECK_LINES="${CHECK_LINES}  RED      workflow run ${rname#* } (red through a check above that is WAIVED)"$'\n' ;;
+        *)
+          # Only a checkless red is waived by its run id; one red through a waived check is
+          # covered by that check's key, and recording its id would waive the run's later reds.
+          [ "$GATE_WAIVE" != record ] || WAIVED="${WAIVED}run:${rid}"$'\n'
+          CHECK_LINES="${CHECK_LINES}  RED      workflow run ${rname#* } (no build check behind it — WAIVED: red when --override was given)"$'\n'
+          ;;
+        esac
       done <<<"$waived_runs"
       case "$rc" in
       1)

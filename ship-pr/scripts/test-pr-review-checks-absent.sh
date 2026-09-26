@@ -1312,6 +1312,21 @@ test_a_waived_leg_does_not_redden_its_run() {
       assert_contains "$GATE_OUTPUT" "concluded red with no build check" "another suite's job name explains nothing"
     fi
   done
+  # A poll whose check list momentarily lacks the waived row still reads the run's red: it is a
+  # waived red, never a green (review round 5) — --require-green and the OVERRIDE record rest on it.
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u","check_suite":{"id":11}},
+                                        {"name":"macos","conclusion":null,"html_url":"m","check_suite":{"id":11}}]')"
+    "$(check_runs_json '[{"name":"macos","conclusion":"success","html_url":"m","check_suite":{"id":11}}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"in_progress","check_suite_id":11}]')"
+    "$(runs_json '[{"name":"ci","status":"completed","conclusion":"failure","check_suite_id":11}]')")
+  JOBS_JSON=$(jobs_json '[{"name":"ubuntu","conclusion":"failure"},
+                          {"name":"macos","conclusion":"success"}]')
+  run_gate 30 waive
+  assert_eq "$GATE_RC" 1 "the run is still red"
+  assert_contains "$GATE_OUTPUT" ": RED, WAIVED" "a waived red, not a green"
+  assert_contains "$GATE_OUTPUT" "workflow run ci (red through a check above that is WAIVED)" "naming the run"
+  assert_not_contains "$GATE_OUTPUT" ": green" "never a green"
   reset_fixture
   CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u"},
                                         {"name":"macos","conclusion":null,"html_url":"m"}]')")
