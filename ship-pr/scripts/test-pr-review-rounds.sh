@@ -266,6 +266,22 @@ test_the_missing_environment_is_not_a_round() {
   run_rounds
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
     "a finding that quotes the sentence is still a finding"
+  # The phrase is bounded (review of #434, round 1): a finding that CONTINUES it is a finding,
+  # while the sentence unlinked, alone on its line, is still the connector's.
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
+    'To use Codex here, create an environment for this repository before running the tests.')"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" "'repository' is not 'repo'"
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
+    'To use Codex here, create an environment for this repo. The tests assume one.')"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "a sentence that goes on past the full stop is a finding"
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
+    'To use Codex here, create an environment for this repo.')"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 0 of 12" \
+    "the sentence unlinked, and nothing after it, is the connector's"
 }
 
 # The other side of that filter: a comment-only round whose finding QUOTES the ref error is a

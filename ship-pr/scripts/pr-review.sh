@@ -1257,10 +1257,13 @@ esac
 # as its first word on a round (ludics-lite#421: PR #420, 2026-09-26, while a sibling PR was
 # reviewed normally; one '@codex review' got a round). It names no ref, which is why status_state
 # attributes it by the clock rather than by the ref (see the `failed` branch there). Anchored and
-# taken through "this repo" for the reason above; the link is optional, since only its text is
-# the reviewer's sentence. INIT_FAILURE_RE is the union, so `rounds` drops both shapes.
+# taken through "this repo" for the reason above, and then BOUNDED: the link's `](`, or an
+# optional full stop and the end of the line — a finding opening "To use Codex here, create an
+# environment for this repository before …" is a finding (review of #434, round 1). The link is
+# otherwise optional, since only its text is the reviewer's sentence. INIT_FAILURE_RE is the
+# union, so `rounds` drops both shapes.
 INIT_FAILURE_GIT_RE='\A[ \t]*Codex Review:[ \t]*Something went wrong\.[ \t]*Try again later by commenting[^\n]{0,4}@codex review'
-INIT_FAILURE_ENV_RE='\A[ \t]*To use Codex here,[ \t]*\[?create an environment for this repo'
+INIT_FAILURE_ENV_RE='\A[ \t]*To use Codex here,[ \t]*\[?create an environment for this repo(?:\]\(|\.?[ \t]*(?:\n|\z))'
 INIT_FAILURE_RE="(?:$INIT_FAILURE_GIT_RE)|(?:$INIT_FAILURE_ENV_RE)"
 # The ref the failure names — the head the reviewer could not fetch. GitHub serves lowercase hex,
 # as does the message. A failure that names none is not attributed to any head: see the branch in
@@ -2070,8 +2073,11 @@ status_line() {
 # land in the same feed as COMMENTED reviews, hence the login filter; PENDING reviews have no
 # submitted_at and are not a round. Prints ONE line, "<count>|<detail>", and always exits 0:
 # a count of "unknown" carries the failure, and is NOT "no rounds yet".
-review_rounds() {
-  local pr="$1" raw comments line count heads
+#
+# The optional caps count only the comments and reviews at or below those ids — the count as it
+# stood at a watermark, which is how `watch` tells which rounds a window's items opened.
+review_rounds() { # <pr> [<issue comment id cap> <review id cap>]
+  local pr="$1" icap="${2:-null}" rcap="${3:-null}" raw comments line count heads
   # Through the round snapshot when a watch round holds one (the same feeds the round was judged
   # on, and no second read), and a read of its own otherwise — as status_state reads them.
   raw=$(state_reviews "$pr") || {
@@ -2102,13 +2108,16 @@ review_rounds() {
   # Both feeds go in on stdin (slurped: reviews first, comments second), never as arguments —
   # a long PR's comment history outgrows the argument list (128 KB per argument on Linux).
   line=$(printf '%s\n%s\n' "$raw" "$comments" | jq -r -s --arg rev "$REVIEWER" \
-    --argjson gap "$ROUND_GAP" --arg fail "$INIT_FAILURE_RE" --arg rc "$REVIEWED_COMMIT_RE" '
+    --argjson gap "$ROUND_GAP" --arg fail "$INIT_FAILURE_RE" --arg rc "$REVIEWED_COMMIT_RE" \
+    --argjson icap "$icap" --argjson rcap "$rcap" '
       .[1] as $comments | .[0]
       | ([.[] | select((.user.login // "") | startswith($rev))
+           | select($rcap == null or (.id // 0) <= $rcap)
            | select(.submitted_at != null)
            | select(.state == "COMMENTED" or .state == "CHANGES_REQUESTED")
            | {sha: (.commit_id // ""), t: (.submitted_at | fromdateiso8601)}]
        + [$comments[] | select((.user.login // "") | startswith($rev))
+           | select($icap == null or (.id // 0) <= $icap)
            | select((.body // "") | test("codex-pull-request-review-summary") | not)
            | select((.body // "") | test("[Dd]idn.t find any major issues") | not)
            | select((.body // "") | test($fail) | not)
@@ -2436,6 +2445,7 @@ item_about_head() { # <stamp> <head sha>
 # subshell; every one is reset here, so nothing leaks from the round before.
 #   POLLED_OUT / POLLED_RC  poll's own stdout and exit code, verbatim
 #   POLLED_MARK             the watermark to resume from (the caller's, when the poll failed)
+#   POLLED_FROM             the watermark the round started from (the caller's, always)
 #   POLLED_HEAD             the head the round was judged against ("" when the PR read failed)
 #   POLLED_ON  / _ON_N      the items about that head: the first one's descriptor, and how many
 #   POLLED_PAST / _PAST_N   the items about some other commit, likewise
@@ -2457,6 +2467,7 @@ watch_round() { # <pr> <watermark>
   POLLED_OUT=$(cmd_poll "$1" "$2")
   POLLED_RC=$?
   POLLED_MARK="$2"
+  POLLED_FROM="$2"
   POLLED_HEAD=""
   POLLED_ON=""
   POLLED_ON_N=0
@@ -2584,21 +2595,29 @@ watch_act() { # <pr> <state line>
   fi
   echo "status: $(status_line "$2")" >&2
   watch_drift_note "$1"
-  warn "PR $REPO#$1: ending the wait on ${POLLED_ON:-reviewer activity}$extra$(watch_round_note "$1" "$2")"
+  warn "PR $REPO#$1: ending the wait on ${POLLED_ON:-reviewer activity}$extra$(watch_round_note "$1")"
   echo "$POLLED_OUT"
 }
 
 # Which round the wait ended on, by the count `rounds` reports and against its threshold
 # (ludics-lite#423, part 2): #259's worker numbered its round 12 as 13 from memory and posted a
 # threshold deferral it had to retract, because only `rounds` showed the count. Read here, off
-# the PR, so the caller never has to count. Only an item the count leaves out is said otherwise:
-# the initialization failure (not a round) and an approval (whose verdict is not a finding).
-watch_round_note() { # <pr> <state line>
-  local line count detail of past=""
-  line=$(review_rounds "$1")
-  count="${line%%|*}"
-  detail="${line#*|}"
-  if [ "$count" = unknown ]; then
+# the PR, so the caller never has to count. The count is taken twice — as it stood at the
+# watermark this window started from, and with the window's items — and the difference is what
+# the line may claim: one round opened is "round N"; none (an initialization failure, a verdict,
+# the tail of a round the last window already ended on) claims no round number; several (a
+# first watch, or a stale watermark, over a backlog) names the span rather than pinning the named
+# item to the last of them (review of #434, round 1). No state token is consulted, since an
+# unattributed failure reads `expected` and would otherwise be numbered as a round.
+watch_round_note() { # <pr>
+  local now before n b detail of past=""
+  now=$(review_rounds "$1")
+  before=$(review_rounds "$1" "$(mark_of "$POLLED_FROM" 2)" "$(mark_of "$POLLED_FROM" 3)")
+  n="${now%%|*}"
+  b="${before%%|*}"
+  if [ "$n" = unknown ] || [ "$b" = unknown ]; then
+    detail="${now#*|}"
+    [ "$n" != unknown ] && detail="${before#*|}"
     printf ' — round UNKNOWN (%s); read `rounds` before citing a round number' "$detail"
     return 0
   fi
@@ -2606,14 +2625,16 @@ watch_round_note() { # <pr> <state line>
   '' | off | *[!0-9]*) of=" (no threshold set)" ;;
   *)
     of=" of $ROUND_THRESHOLD"
-    [ "$count" -le "$ROUND_THRESHOLD" ] || past=", PAST the threshold: blocking-only from here"
+    [ "$n" -le "$ROUND_THRESHOLD" ] || past=", PAST the threshold: blocking-only from here"
     ;;
   esac
-  case "$(state_tok "$2")" in
-  failed) printf ' — not a round; rounds with findings stay at %s%s' "$count" "$of" ;;
-  approved | unresolved) printf ' — rounds with findings: %s%s' "$count" "$of" ;;
-  *) printf ' — round %s%s%s' "$count" "$of" "$past" ;;
-  esac
+  if [ "$n" -le "$b" ]; then
+    printf ' — no new round; rounds with findings: %s%s' "$n" "$of"
+  elif [ "$n" -eq $((b + 1)) ]; then
+    printf ' — round %s%s%s' "$n" "$of" "$past"
+  else
+    printf ' — this window holds rounds %s–%s%s%s' "$((b + 1))" "$n" "$of" "$past"
+  fi
 }
 
 # One last poll before any verdict that says no round came (ludics-lite#72; the race is the one

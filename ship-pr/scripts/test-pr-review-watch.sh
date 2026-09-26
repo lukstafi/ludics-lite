@@ -445,6 +445,22 @@ test_the_ending_line_names_the_round() (
   assert_contains "$WATCH_ERR" "— round 3 (no threshold set)" "and with none set, the count alone"
 )
 
+# The line claims only what the window's own items opened (review of #434, round 1). A first watch
+# over a backlog holds several rounds, and naming the last one against the first item would
+# mislabel it; the tail of a round the previous window already ended on opens none.
+test_the_ending_line_claims_only_the_rounds_the_window_opened() (
+  reset_fixture
+  schedule reviews 1 "[$(review 400 "$H1" 2026-09-01T00:00:00Z),$(review 500 "$H2" 2026-09-01T01:00:00Z),$(
+    review 600 "$H2" 2026-09-01T01:30:00Z),$(review 601 "$H2" 2026-09-01T01:30:05Z)]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_ERR" "— this window holds rounds 1–3 of 12" \
+    "a backlog names the span, not the last round against the first item"
+  run_watch 0,0,600
+  assert_contains "$WATCH_ERR" "ending the wait on review id=601" "the burst's tail still ends the wait"
+  assert_contains "$WATCH_ERR" "— no new round; rounds with findings: 3 of 12" \
+    "the tail of round 3 is not round 4, nor round 3 claimed again as new"
+)
+
 # The missing-environment answer (ludics-lite#421), as #420 saw it: the connector's first word on
 # the head. The first window ends on the comment — it is new activity — but with the state beside
 # it saying what it is, and the round count saying it is not one; the next window, already past
@@ -462,7 +478,7 @@ test_the_missing_environment_ends_the_wait_with_the_nudge() {
     "the state beside it is the failure, not a round"
   assert_contains "$WATCH_ERR" "nudge it once with a '@codex review' comment" "and it names the nudge"
   assert_contains "$WATCH_ERR" \
-    "ending the wait on summary id=100 commit=- by ${REVIEWER}[bot] — not a round; rounds with findings stay at 0 of 12" \
+    "ending the wait on summary id=100 commit=- by ${REVIEWER}[bot] — no new round; rounds with findings: 0 of 12" \
     "the exit line must not number the failure as a round"
   run_watch 0,100,0
   assert_eq "$WATCH_RC" 0 "the failure is a verdict to act on, as a stall is"
@@ -471,6 +487,17 @@ test_the_missing_environment_ends_the_wait_with_the_nudge() {
   assert_contains "$WATCH_OUT" "the environment is the maintainer's to set up" \
     "with the remedy for this failure, not the git-ref one"
   assert_not_contains "$WATCH_OUT" "no review materialized" "and without waiting out the grace"
+  # Unattributed — a head commit dated in the future attributes nothing, so the state is
+  # `expected` — the comment still ends the first window, and still is not numbered as a round.
+  reset_fixture
+  HEAD_AT=2099-01-01T00:00:00Z
+  schedule comments 1 "[$(summary_comment 100 "$now" \
+    'To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).')]"
+  run_watch 0,0,0
+  assert_contains "$WATCH_ERR" "status: review EXPECTED" "unattributed, the state is the ordinary one"
+  assert_contains "$WATCH_ERR" "— no new round; rounds with findings: 0 of 12" \
+    "and the count, not the state, decides that no round was opened"
+  assert_not_contains "$WATCH_ERR" "— round 0" "never an impossible round zero"
 }
 
 # The two silences a log could not tell apart: a window in which the reviewer said nothing about
@@ -1675,6 +1702,7 @@ tests=(
   test_an_unknown_boundary_uses_the_last_live_deadline
   test_nudges_wait_past_old_failed_and_stalled_states
   test_the_ending_line_names_the_round
+  test_the_ending_line_claims_only_the_rounds_the_window_opened
   test_the_missing_environment_ends_the_wait_with_the_nudge
   test_an_extension_holds_through_unknown_status
   test_a_nudge_buys_exactly_one_window

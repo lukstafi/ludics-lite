@@ -951,6 +951,11 @@ test_a_quoted_missing_environment_is_not_a_failure() {
     "$ENV_FAILURE_BODY")")]"
   run_status
   assert_eq "$(state_tok "$STATE")" expected "a quotation of the sentence is not the reviewer failing"
+  # Nor a finding that opens with the words and carries on (review of #434, round 1).
+  COMMENTS_JSON="[$(plain_comment 101 "$ENV_FAILED_AT" \
+    'To use Codex here, create an environment for this repository before running the tests.')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "'repository' is not the connector's 'repo'"
 }
 
 # The merge gate against a failure, both ways round — the deliberate part of the ranking. A round
