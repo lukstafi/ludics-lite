@@ -952,7 +952,12 @@ base_gate() {
   # round 3). It is the anchor the lease read just came from, so this costs nothing but outages.
   args=(--repo "$target" base)
   [ -z "$branch" ] || args+=("$branch")
-  args+=("--wait=$BASE_WAIT")
+  # --interim (ludics-lite#308): a tip whose own push run is still in flight, as every tip of a
+  # merge burst is, is green meanwhile when it is GitHub's clean merge of a PR whose head built
+  # green, and the checker names that source. A launch is not waiting for the tip's own run -- the
+  # integration loop is, and it reads `base --wait` without the flag -- and without it the gate
+  # refused every launch at its ceiling for as long as a burst lasted.
+  args+=("--wait=$BASE_WAIT" --interim)
   if rows=$(integration_records "$target"); then
     if [ -n "$rows" ]; then
       # Staged whole or not at all: an empty or cut file is valid input to the checker, and a

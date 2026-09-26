@@ -317,7 +317,7 @@ tested once per round, so a ceiling less than a whole round past it gets exactly
 settle - the round the ceiling cap schedules - and loses it to a tip that moves, which restamps
 the grace. That is what the hand-spelled `--wait=301` was, and the checker now says so in a loud
 line (ludics-lite#175). A covered green exits at once, a pending base
-blocks at the ceiling, and a tip with no run of its own settles for the older verdict - at once
+blocks at the ceiling (unless the interim below answers), and a tip with no run of its own settles for the older verdict - at once
 when the checker recognizes the tip's diff as entirely within the workflow's `paths-ignore`,
 otherwise once that absence outlives the grace (ludics-lite#156). A run in flight or stopped at
 the tip keeps the refusal. A workflow that no longer runs on push (its file at the tip names no
@@ -327,7 +327,16 @@ reads the execution registry's integration records for the target - concluded re
 which takes the tip's verdict from a record at the tip first, else from the PR the tip is
 GitHub's clean merge of, when that workflow ran green on its head (roll-forward), and names the
 source it used. A tip with neither reads `NO VERDICT` at once, and dispatch waits; an unreadable
-registry refuses too, since a failed record there would outrank the PR head (ludics-lite#401). This is a bounded pre-dispatch check, not another observer, and it is
+registry refuses too, since a failed record there would outrank the PR head (ludics-lite#401).
+Through a merge burst each tip's push run is cancelled by the next merge's, so the tip's own run
+is always in flight and the wait used to reach its ceiling and refuse every launch (20-40 min per
+launch on 09-24 and 09-25). The gate now passes `--interim` (ludics-lite#308): a tip whose own
+push run is in flight, with nothing red and nothing else in flight, is green meanwhile when it is
+GitHub's clean merge of a PR whose head built that workflow green, and the verdict line reads
+`green, interim (...; judged meanwhile by PR #N's head run ...)`. A tip that is not such a
+merge stays pending and refused. So a wave launches through a burst, and the integration loop,
+which reads `base --wait` WITHOUT `--interim`, still waits for the tip's own run: an interim is
+never its verdict. This is a bounded pre-dispatch check, not another observer, and it is
 point-in-time: not atomic with the spawn or launch that follows, so an adoption reconciles
 pending dispatches before replacing anything.
 

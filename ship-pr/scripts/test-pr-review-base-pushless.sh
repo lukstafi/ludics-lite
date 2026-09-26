@@ -14,6 +14,12 @@
 # push, or whose file cannot be read for its triggers, reads exactly as before, and a covered tip
 # does not so much as read its workflow file.
 #
+# And the same source (a) for a push repository's tip whose own run is still in flight
+# (ludics-lite#308): a merge burst cancels each tip's push run with the next merge's, so the window
+# can hold no judged run at all while the tip's run is going. That reads PENDING, not "never
+# judged", and under `--interim` (the gate's and the base watch's opt-in, never the default) the
+# merged PR's green head is an INTERIM verdict the verdict line names.
+#
 # The fixture transport is test-pr-review-base-lib.sh, shared with the other base suites.
 
 set -euo pipefail
@@ -411,6 +417,142 @@ test_a_push_workflow_green_at_the_tip_does_not_speak_for_a_retired_one() {
     "naming the source for the workflow that needed one"
 }
 
+# --- a push repository's tip whose own run is in flight (ludics-lite#308) ----------------------
+# burst_fixture <runs as JSON, newest first>: `ci` STILL runs on push, and the tip SHA_C is
+# GitHub's clean merge of PR #7, whose head is green, exactly as pushless_fixture has it. The runs
+# are what a merge burst leaves: each tip's push run cancelled by the next merge's.
+burst_fixture() {
+  pushless_fixture
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  RUNS_1=$(runs_json 1 "$1")
+}
+
+# The window a burst leaves: the tip's run in flight over runs each cancelled by the next merge.
+BURST_RUNS='[{"status":"in_progress","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7301},
+             {"conclusion":"cancelled","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7300},
+             {"conclusion":"cancelled","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","id":7299}]'
+
+# Every episode #308 recorded: no finished run in the window judged the branch, and the tip's own
+# run is in flight. That is pending — the run that will judge it exists — and the headline says so
+# rather than "never judged". Exit 4 is unchanged: it is still no verdict. And with nothing in
+# flight the old reading stands, since then nothing is coming.
+test_a_window_of_cancelled_runs_under_a_run_in_flight_is_pending() {
+  burst_fixture "$BURST_RUNS"
+  run_base
+  assert_eq "$BASE_RC" 4 "a pending tip is still no verdict"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: NO VERDICT YET (tip ${SHA_C:0:8}) — pending: a run is in flight, and no finished run in the window judged the branch" \
+    "the headline says pending, not never judged"
+  assert_contains "$BASE_OUTPUT" "pending  ci — cancelled at ${SHA_B:0:8} (stopped, not judged; no earlier judged run in the window), and a later run is in flight" \
+    "the workflow's line says a run is in flight"
+  assert_contains "$BASE_OUTPUT" "(ci is running now at ${SHA_C:0:8})" "naming the commit it is running at"
+  assert_not_contains "$BASE_OUTPUT" "never judged" "the old wording is gone for this shape"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "no source is asked without --interim"
+  burst_fixture '[{"status":"queued","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7311}]'
+  run_base
+  assert_eq "$BASE_RC" 4 "a first run still going is no verdict"
+  assert_contains "$BASE_OUTPUT" "pending  ci — no run of it has finished on $BRANCH yet, and one is in flight" \
+    "and pending too"
+  burst_fixture '[{"conclusion":"cancelled","head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7321}]'
+  run_base
+  assert_eq "$BASE_RC" 4 "a stopped run with nothing behind it is no verdict"
+  assert_contains "$BASE_OUTPUT" "some workflow was never judged here" "and reads as it did: nothing is coming"
+}
+
+# Under --interim, that pending tip is green by a NAMED source meanwhile: GitHub's clean merge of
+# PR #7, whose head built `ci` green. The verdict line names the source AND the run still in flight,
+# so it cannot be read as the tip's own verdict. Plain and under --wait alike; the wait takes it on
+# the round that read it, which is what stops the gate starving through a burst.
+test_interim_a_clean_merge_of_a_green_head_is_green_meanwhile() {
+  local wait
+  for wait in "" --wait=4; do
+    burst_fixture "$BURST_RUNS"
+    run_base --interim ${wait:+"$wait"}
+    assert_eq "$BASE_RC" 0 "an interim green is a green ($wait)"
+    assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green, interim (tip ${SHA_C:0:8}; ci still running at the tip, judged meanwhile by PR #7's head run (roll-forward rule))" \
+      "the verdict line names the source and the run still in flight"
+    assert_contains "$BASE_OUTPUT" "interim  ci — the tip's own run is in flight; source (a): PR #7's head ${SHA_H:0:8}, which GitHub merged cleanly as the tip ${SHA_C:0:8}" \
+      "and a line says what the source established"
+  done
+  assert_eq "$(rounds_polled)" 1 "the wait takes the interim on the round that read it"
+  # An older green standing under the tip's run in flight: a --wait holds for the tip's own run
+  # to its ceiling without --interim, and says the tip is pending; with it, the interim answers.
+  burst_fixture '[{"status":"in_progress","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7331},
+                  {"conclusion":"success","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7330}]'
+  run_base --wait=2
+  assert_eq "$BASE_RC" 4 "without --interim the wait is for the tip's own run"
+  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8} — pending: its own run of ci is still in flight" \
+    "and at the ceiling it says the tip is pending"
+  run_base --wait=2 --interim
+  assert_eq "$BASE_RC" 0 "with --interim the merged head's green answers meanwhile"
+  assert_contains "$BASE_OUTPUT" "green, interim (tip ${SHA_C:0:8};" "named as interim"
+}
+
+# The integration loop reads `base --wait` for the merged tip's OWN verdict, so the interim is
+# never the default: without the flag no PR is so much as looked up.
+test_interim_is_never_the_default() {
+  local wait
+  for wait in "" --wait=2; do
+    burst_fixture "$BURST_RUNS"
+    run_base ${wait:+"$wait"}
+    assert_eq "$BASE_RC" 4 "no interim without --interim ($wait)"
+    assert_not_contains "$BASE_OUTPUT" "interim" "and the report does not mention one"
+    assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "no PR is read"
+  done
+}
+
+# The interim only ever supplies a green. A tip no PR head speaks for (a direct push), a red head
+# and a head that never built `ci` all leave the tip PENDING — its own run is coming — with a line
+# saying why there is no interim: a red head is not the tip's red while the tip's run is going.
+test_interim_without_a_green_source_stays_pending() {
+  burst_fixture "$BURST_RUNS"
+  COMMIT_META=$(jq -cn --arg b "$SHA_B" '{parents: [{sha: $b}]}')
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "a tip that is no merge has no interim"
+  assert_contains "$BASE_OUTPUT" "NO VERDICT YET (tip ${SHA_C:0:8}) — pending" "it stays pending"
+  assert_contains "$BASE_OUTPUT" "(no interim verdict for ci: no integration record ran the tip ${SHA_C:0:8}, and the tip ${SHA_C:0:8} is not a merge commit (1 parent(s)), so no PR head" \
+    "and says why there is no interim"
+  burst_fixture "$BURST_RUNS"
+  head_signal '"failure"'
+  run_base --interim --wait=2
+  assert_eq "$BASE_RC" 4 "a red head leaves the tip pending, not red"
+  assert_not_contains "$BASE_OUTPUT" "is RED" "the head's red is not the tip's while its run is going"
+  assert_contains "$BASE_OUTPUT" "(no interim verdict for ci: source (a): PR #7's head" "and names the source"
+  burst_fixture "$BURST_RUNS"
+  HEAD_RUNS='{"workflow_runs":[{"created_at":"2026-09-26T07:41:00Z","id":8002,"workflow_id":2,"event":"pull_request","name":"lint","status":"completed","conclusion":"success"}]}'
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "a green head that never built ci has no interim for it"
+  assert_contains "$BASE_OUTPUT" "has no successful run of ci (no run)" "and says so"
+}
+
+# Outside the shape, the source is not asked at all: an older red standing under the tip's run (a
+# fix in progress; the wait holds for the tip's own run, as it always has), and a run in flight at
+# an OLDER commit, where the tip's own run is not what is coming.
+test_interim_is_not_asked_outside_its_shape() {
+  burst_fixture '[{"status":"in_progress","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7341},
+                  {"conclusion":"failure","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7340}]'
+  run_base --interim --wait=2
+  assert_eq "$BASE_RC" 4 "an older red under the tip's run is still waited on"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "and no source is asked over a red"
+  burst_fixture '[{"status":"in_progress","conclusion":null,"head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7351},
+                  {"conclusion":"cancelled","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","id":7350}]'
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "a run in flight at an older commit is pending"
+  assert_contains "$BASE_OUTPUT" "NO VERDICT YET (tip ${SHA_C:0:8}) — pending" "and reads so"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "but the tip's own run is not what is coming"
+}
+
+# The interim re-confirms the tip before it is taken, as the covered break does: a merge landing
+# inside the round makes the green one for a tip the branch has left.
+test_interim_reconfirms_the_tip() {
+  burst_fixture "$BURST_RUNS"
+  at_round 1 "$SHA_B"
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "a tip that moved under the round gets no interim"
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "no green for the tip the branch left"
+  assert_contains "$(cat "$REQUEST_LOG")" "/pulls" "though the source was asked, and answered green"
+  assert_not_contains "$BASE_OUTPUT" "no interim verdict" "so it is the re-confirm that refused it"
+}
+
 tests=(
   test_a_clean_merge_of_a_green_head_is_green_by_the_named_source
   test_a_tip_no_source_covers_is_no_verdict_never_the_old_green
@@ -429,6 +571,12 @@ tests=(
   test_a_file_read_that_fails_is_unknown
   test_a_file_confirmed_absent_at_the_tip_reads_as_before
   test_a_push_workflow_green_at_the_tip_does_not_speak_for_a_retired_one
+  test_a_window_of_cancelled_runs_under_a_run_in_flight_is_pending
+  test_interim_a_clean_merge_of_a_green_head_is_green_meanwhile
+  test_interim_is_never_the_default
+  test_interim_without_a_green_source_stays_pending
+  test_interim_is_not_asked_outside_its_shape
+  test_interim_reconfirms_the_tip
 )
 
 run_tests "${tests[@]}"

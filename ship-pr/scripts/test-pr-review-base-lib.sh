@@ -20,7 +20,9 @@
 #                                   each break re-confirms, where the absence clock starts
 #                                   (ludics-lite#93)
 #   test-pr-review-base-pushless.sh a workflow that no longer runs on push: the tip judged by a
-#                                   NAMED source or not at all (ludics-lite#401)
+#                                   NAMED source or not at all (ludics-lite#401), and a push
+#                                   tip whose own run is in flight: pending, or an interim
+#                                   green by the same source under --interim (#308)
 #
 # What this file provides: the canned answers keyed the way `base` reads them (TIP, WORKFLOWS_JSON,
 # RUNS_<id>, JOBS_<run id>, FILES_<sha initial>, the compare and the workflow file), the fixture

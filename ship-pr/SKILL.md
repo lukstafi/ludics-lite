@@ -168,6 +168,14 @@ counts as "no longer runs on push" is narrow on purpose: its file at the tip was
 `push` trigger. A workflow that still declares `push`, or whose file the reader refuses, reads as
 it always did.
 
+A tip whose own run is **in flight** over a window with no judged run (a merge burst: each merge's
+push run cancelled by the next) reads **pending** — `NO VERDICT YET`, exit 4 — not "never judged":
+the run that will judge it is running (ludics-lite#308). With `--interim` such a tip is green
+meanwhile when it is GitHub's clean merge of a PR whose head built that workflow green, and the
+verdict line says `green, interim` and names the PR. That is the wave gate's opt-in and the base
+watch's; it is never the tip's own verdict, so a read that needs that (`base --wait` after a merge)
+does not pass it.
+
 ## Open
 
 Look at the working tree first: commit what belongs to this goal, and say explicitly what you did

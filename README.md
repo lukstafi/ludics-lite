@@ -949,7 +949,12 @@ records file), the red and still-running heads, the verdict line naming its sour
 direction: a workflow that still runs on push, whose file the trigger reader refuses, or whose file
 the directory at the tip confirms absent reads exactly as before, and a covered tip never reads its
 workflow file. A read of the file the API refuses (401, 403, an unconfirmed 404) is UNKNOWN, and
-so is a plain read whose tip read failed while a workflow is retired.
+so is a plain read whose tip read failed while a workflow is retired. The same suite covers a push
+repository's tip whose own run is in flight over a window of cancelled runs (ludics-lite#308): it
+reads pending, not "never judged"; under the opt-in `--interim` the merged PR's green head is an
+interim green the verdict line names, plain and under `--wait`, re-confirmed against the tip; and
+it is never the default, never asked over a red or a run in flight at an older commit, and never
+more than a green (a direct push, a red head, a head that never built the workflow stay pending).
 
 Each workflow's page of runs is sorted on `(created_at desc, id desc)` before the fold
 (ludics-lite#90), as `run_signal`'s feed has been since #83: two pushes to the branch inside one

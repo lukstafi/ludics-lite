@@ -186,7 +186,7 @@
 #                                          # --wait and refused with 4 without it, and a check
 #                                          # that turns red during the wait was never waived, so
 #                                          # it refuses with 1 (ludics-lite#392)
-#   pr-review.sh base [owner/name] [branch] [--wait[=seconds]]
+#   pr-review.sh base [owner/name] [branch] [--wait[=seconds]] [--interim]
 #                                          # is the branch you are about to work off CI-green?
 #                                          # --wait holds until the CURRENT tip has its verdict —
 #                                          # the post-merge integration read (see cmd_base).
@@ -199,6 +199,10 @@
 #                                          # the tip by a NAMED source or not at all (ludics-lite
 #                                          # #401): the merged PR's head run, or a coordinator's
 #                                          # [--integration-records <file>] (fleet-worker gate)
+#                                          # --interim: a tip whose own push run is in flight is
+#                                          # green by a NAMED source meanwhile (the merged PR's
+#                                          # head run), never the tip's own verdict; opt-in, for
+#                                          # the gate and the base watch (ludics-lite#308)
 #   pr-review.sh reply <pr> <comment-id>[+<comment-id>...] <body>
 #                                          # the id token poll rendered. A FOLDED entry names
 #                                          # several: the body goes to the first thread and each
@@ -6508,9 +6512,17 @@ cmd_base() {
   local tip_unjudged=0 unrun_rows="" settle_why
   local started now beat waited_note="" no_tip_verdict=""
   local records="" rsha rverdict rid rwhen pushless="" pushless_ids=() src_pending=0 src_none=0
-  local trig_note
+  local trig_note interim="" fly tipfly=0 tipfly_ids=() tipfly_names="" uncov_nofly=0 pend_fly=0
+  local interim_green="" interim_name="" interim_why="" pushless_name=""
   while [ $# -gt 0 ]; do
     case "$1" in
+    # Opt in to an INTERIM verdict for a tip whose own push run is still in flight (ludics-lite
+    # #308): see the block in the wait loop below. Opt-in, never the default, because exit 0 is
+    # what every caller reads, and the coordinator's integration loop reads `base --wait` for the
+    # merged tip's OWN verdict: a PR head's green handed to it as exit 0 would end that wait on
+    # evidence about another commit. The callers that pass it are a launch decision
+    # (`fleet-worker.sh gate`) and the base watch, neither of which is waiting for the tip's run.
+    --interim) interim=1 ;;
     # The integration records `fleet-worker.sh gate` hands in (source (b) above). Matched before
     # the slashed-argument case below, since its value is an absolute path.
     --integration-records)
@@ -6584,6 +6596,7 @@ cmd_base() {
   while :; do
     red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0 norun=0
     tip_unjudged=0 unrun_rows="" pushless="" pushless_ids=() src_pending=0 src_none=0
+    tipfly=0 tipfly_ids=() tipfly_names="" uncov_nofly=0 pend_fly=0 interim_green=""
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
     tip=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || tip=""
@@ -6721,10 +6734,21 @@ cmd_base() {
           esac
         fi
         [ "$status" = completed ] || inflight=$((inflight + 1))
+        # The tip's OWN run in flight: this workflow's newest run is at the tip and has not
+        # finished. It is what a merge burst leaves on every tip (each merge's push run cancels the
+        # one before under cancel-in-progress), and what the interim verdict below speaks for.
+        fly=""
+        if [ "$status" != completed ] && [ -n "$tip" ] && [ "$sha" = "$tip" ]; then
+          fly=1
+          tipfly=$((tipfly + 1))
+          tipfly_ids+=("$wfid:$name")
+          tipfly_names="${tipfly_names:+$tipfly_names, }$name"
+        fi
         if [ -n "$tip" ] && [ "$vsha" = "$tip" ]; then
           : # this workflow's newest judged run is about the tip: covered
         else
           uncovered=$((uncovered + 1))
+          [ -n "$fly" ] || uncov_nofly=$((uncov_nofly + 1))
           # WHICH absence, per workflow, because only one of the two can ever be explained. A run
           # for the tip EXISTS and has not judged it (queued, running, or stopped) — nothing but
           # that run can answer, so the wait keeps waiting. Or no run for the tip exists at all,
@@ -6763,13 +6787,27 @@ cmd_base() {
           out="${out}${BASE_RED_DETAIL}"
           ;;
         green) out="${out}  green    $name — $concl at ${csha:0:8}"$'\n' ;;
+        # With a run of it in flight, a workflow no finished run in the window judged is PENDING,
+        # not "never judged" (ludics-lite#308): the run that will judge it exists and is running.
+        # A merge burst reads exactly so, the tip's run in flight over a window of runs each
+        # cancelled by the next merge, and every one of the four episodes #308 recorded was it.
         pending)
           pend=$((pend + 1))
-          out="${out}  no verdict  $name — has never completed on $branch"$'\n'
+          if [ "$status" != completed ]; then
+            pend_fly=$((pend_fly + 1))
+            out="${out}  pending  $name — no run of it has finished on $branch yet, and one is in flight"$'\n'
+          else
+            out="${out}  no verdict  $name — has never completed on $branch"$'\n'
+          fi
           ;;
         *)
           pend=$((pend + 1))
-          out="${out}  no verdict  $name — $concl at ${csha:0:8} (stopped, not judged; no earlier judged run in the window)  $curl"$'\n'
+          if [ "$status" != completed ]; then
+            pend_fly=$((pend_fly + 1))
+            out="${out}  pending  $name — $concl at ${csha:0:8} (stopped, not judged; no earlier judged run in the window), and a later run is in flight  $curl"$'\n'
+          else
+            out="${out}  no verdict  $name — $concl at ${csha:0:8} (stopped, not judged; no earlier judged run in the window)  $curl"$'\n'
+          fi
           ;;
         esac
         out="${out}${stopped_note}${trig_note}"
@@ -6807,8 +6845,49 @@ cmd_base() {
           out="${out}  no verdict  $pushless — no named source judges the tip: $SRC_WHY"$'\n'
           ;;
         esac
+        pushless_name="$SRC_NAME"
       fi
     fi
+    # The INTERIM verdict (ludics-lite#308), under --interim only. The shape: nothing is red, every
+    # workflow still owed a verdict at the tip has the tip's OWN run in flight, and no other run is
+    # in flight anywhere on the branch. Then the tip's run is the only thing left to come, and the
+    # tip is asked of the named sources (tip_named_source: an integration record at the tip, else
+    # the head run of the PR whose clean GitHub merge the tip is, under the roll-forward rule),
+    # for exactly the workflows in flight — each must have built green on that head. A green is an
+    # interim verdict, exit 0, and the verdict line names its source and the run still in flight,
+    # so a reader of the report cannot take it for the tip's own run. Anything else from the
+    # source (a direct push, a squash, a head not green) adds a line saying why and leaves the
+    # tip pending: the interim only ever supplies a green, it never takes one away.
+    #
+    # Boundary, what it deliberately does not read: a workflow with no push run on the branch at
+    # all (norun) is not in the fold, and the interim does not speak for it, as the PR head's
+    # aggregate build signal — the one `merge` gated on — already covered what ran on the head. A
+    # workflow still owed a verdict with no run at the tip (paths-ignore, not created yet) keeps
+    # the settle rules below, and so does a run in flight at an older commit: neither is this
+    # shape. A plain read asks only when it would otherwise report no verdict (pend), since an
+    # older green it already settles for needs no interim; a --wait asks every round, since a
+    # round in this shape would otherwise keep waiting. A read of a source that fails leaves the
+    # tip pending with a note — never UNKNOWN, since the pending answer it falls back to is true.
+    if [ -n "$interim" ] && [ "$red" -eq 0 ] && [ "$src_pending" -eq 0 ] && [ "$src_none" -eq 0 ] &&
+      [ "$tipfly" -gt 0 ] && [ "$inflight" -eq "$tipfly" ] && [ "$uncov_nofly" -eq 0 ] &&
+      { [ "$wait_for" -gt 0 ] || [ "$pend" -gt 0 ]; }; then
+      if tip_named_source "$branch" "$tip" "${tipfly_ids[@]}"; then
+        if [ "$SRC_VERDICT" = green ]; then
+          # The TOCTOU the covered break answers: a merge landing between the round's tip read
+          # and here makes this a green for a tip the branch has left. On a moved or unreadable
+          # tip there is no interim; a --wait polls again, a plain read reports what it has.
+          confirm=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || confirm=""
+          if [ "$confirm" = "$tip" ]; then
+            interim_green=1 interim_name="$SRC_NAME" interim_why="$SRC_WHY"
+          fi
+        else
+          out="${out}           (no interim verdict for $tipfly_names: $SRC_WHY)"$'\n'
+        fi
+      else
+        out="${out}           (no interim verdict for $tipfly_names: a verdict source could not be read ($(gh_err_line)))"$'\n'
+      fi
+    fi
+    [ -n "$interim_green" ] && break
     [ "$wait_for" -gt 0 ] || break
     # Only a red AT THE TIP ends the wait early — it is the tip's own verdict. An older tip's red
     # while the current tip's run is still in flight is precisely the fix-in-progress shape:
@@ -6940,9 +7019,21 @@ cmd_base() {
   # red AT the tip broke the wait before this flag could be set, so it still reports as red; the
   # older red stays visible in the per-workflow lines under the honest headline.
   if [ -n "$no_tip_verdict" ]; then
-    echo "$REPO $branch: NO VERDICT for the tip${tip:+ ${tip:0:8}} — not green, not red (see above)"
+    if [ "$tipfly" -gt 0 ]; then
+      echo "$REPO $branch: NO VERDICT for the tip ${tip:0:8} — pending: its own run of $tipfly_names is still in flight; not green, not red (see above)"
+    else
+      echo "$REPO $branch: NO VERDICT for the tip${tip:+ ${tip:0:8}} — not green, not red (see above)"
+    fi
     printf '%s' "$out"
     return 4
+  fi
+  # An interim green (ludics-lite#308): the tip's own run is still in flight, and the headline says
+  # so beside the source that judged the tip meanwhile, so it cannot be read as that run's verdict.
+  if [ -n "$interim_green" ]; then
+    echo "$REPO $branch: green, interim (tip ${tip:0:8}; $tipfly_names still running at the tip, judged meanwhile by $interim_name${pushless:+; $pushless judged by $pushless_name})"
+    out="${out}  interim  $tipfly_names — the tip's own run is in flight; $interim_why"$'\n'
+    printf '%s' "$out"
+    return 0
   fi
   if [ "$red" -gt 0 ]; then
     echo "!!! $REPO $branch is RED — $red workflow(s) failed on the tip you are about to branch from"
@@ -6961,6 +7052,11 @@ cmd_base() {
     printf '%s' "$out"
     return 4
   fi
+  if [ "$pend" -gt 0 ] && [ "$pend_fly" -eq "$pend" ]; then
+    echo "$REPO $branch: NO VERDICT YET${tip:+ (tip ${tip:0:8})} — pending: a run is in flight, and no finished run in the window judged the branch; not green, not red"
+    printf '%s' "$out"
+    return 4
+  fi
   if [ "$pend" -gt 0 ]; then
     echo "$REPO $branch: NO VERDICT${tip:+ (tip ${tip:0:8})} — some workflow was never judged here; not green, not red"
     printf '%s' "$out"
@@ -6969,7 +7065,7 @@ cmd_base() {
   # The source rides on the verdict line itself when one was used: "green" over a tip no push run
   # judged is only as good as what judged it instead (ludics-lite#401).
   if [ -n "$pushless" ]; then
-    echo "$REPO $branch: green (tip ${tip:0:8}; $pushless judged by $SRC_NAME)"
+    echo "$REPO $branch: green (tip ${tip:0:8}; $pushless judged by $pushless_name)"
   else
     echo "$REPO $branch: green${tip:+ (tip ${tip:0:8})}"
   fi
@@ -7000,7 +7096,10 @@ main() {
   pr-review.sh comment <pr> <body>           # a plain PR comment (a summary round, a review nudge)
   pr-review.sh base [owner/name] [branch] [--wait]  # is the base branch's CI green? (start of
                                              # work; --wait = post-merge integration read;
-                                             # --integration-records <file>: fleet-worker gate's)
+                                             # --integration-records <file>: fleet-worker gate's;
+                                             # --interim: a named green while the tip's run is in
+                                             # flight — the gate's and the base watch's, never
+                                             # the integration loop's)
   pr-review.sh retry [--read] <gh args...>   # any other gh call, same retry policy
   pr-review.sh retry run watch owner/name#<run-id>  # quiet await of ONE run (never forwarded
                                              # to gh); for a PR prefer: checks <pr> --wait
