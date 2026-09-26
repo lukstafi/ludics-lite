@@ -225,7 +225,20 @@ test_a_head_still_running_holds_the_wait() {
   assert_eq "$BASE_RC" 4 "a head still running is no verdict yet"
   assert_contains "$BASE_OUTPUT" "no verdict  ci — not yet: source (a): PR #7's head ${SHA_H:0:8}" \
     "the line names the source it is waiting on"
-  # Held to the CEILING, which is what the note says — a count of rounds would be on the clock,
+  # A re-run of the retired workflow that started after the head's build signal was read is the
+# answer now, and it is still judging: the older completed success beneath it is not taken (review
+# round 5). Here the check list is already green; only the run list shows the re-run.
+test_a_rerun_behind_a_green_head_is_pending() {
+  pushless_fixture
+  HEAD_RUNS_LATER='{"workflow_runs":[
+    {"created_at":"2026-09-26T09:00:00Z","id":8009,"workflow_id":1,"event":"pull_request","name":"ci","status":"in_progress","conclusion":null},
+    {"created_at":"2026-09-26T07:41:00Z","id":8001,"workflow_id":1,"event":"pull_request","name":"ci","status":"completed","conclusion":"success"}]}'
+  run_base
+  assert_eq "$BASE_RC" 4 "a re-run in flight is no verdict yet"
+  assert_contains "$BASE_OUTPUT" "is being re-run by ci" "and the line says which workflow"
+}
+
+# Held to the CEILING, which is what the note says — a count of rounds would be on the clock,
   # and a loaded runner spends a two-second ceiling inside the first round (review round 2). A
   # wait the pending source did not hold ends on the round that read it, with no ceiling note.
   pushless_fixture
@@ -406,6 +419,7 @@ tests=(
   test_a_red_head_is_a_red_tip
   test_a_green_head_without_a_run_of_the_retired_workflow_is_no_source
   test_a_head_still_running_holds_the_wait
+  test_a_rerun_behind_a_green_head_is_pending
   test_an_unreadable_tip_with_a_retired_workflow_is_unknown
   test_an_integration_record_at_the_tip_is_the_first_source
   test_a_record_at_another_commit_is_not_the_tips

@@ -117,6 +117,9 @@ TIP_PULLS=""
 HEAD_PR=""
 HEAD_CHECKS=""
 HEAD_RUNS=""
+# What the head's run list answers from its SECOND read on, when a case sets it: a re-run that
+# started between the build signal's read and the one after it.
+HEAD_RUNS_LATER=""
 # The delay the wall-clock cases spend their grace with, in seconds; set through `spend_grace`
 # below, which is where the idiom is written down. DELAY_LOG records each delay actually taken,
 # so "once" is a fact the controls can read rather than a property of a marker file's existence.
@@ -217,6 +220,8 @@ reset_fixture() {
   HEAD_PR='{}'
   HEAD_CHECKS='{"check_runs":[]}'
   HEAD_RUNS='{"workflow_runs":[]}'
+  HEAD_RUNS_LATER=""
+  fixture_call_reset headruns
   FIRST_READ_DELAY=""
   for v in $(set | LC_ALL=C sed -n 's/^\(FILES_[0-9a-z]\)=.*/\1/p'); do unset "$v"; done
   : >"$DELAY_LOG"
@@ -231,7 +236,7 @@ reset_fixture() {
 }
 
 gh() {
-  local response="" rid wid sha base
+  local response="" rid wid sha base reads
   # The delay, once — on the FIRST read of the run, which is the round's tip read.
   if [ -n "$FIRST_READ_DELAY" ] && [ ! -s "$DELAY_LOG" ]; then
     printf 'x\n' >>"$DELAY_LOG"
@@ -300,7 +305,14 @@ gh() {
   "repos/$REPO/commits/"*"/pulls?per_page=100") response="$TIP_PULLS" ;;
   "repos/$REPO/commits/"*"/check-runs?"*) response="$HEAD_CHECKS" ;;
   "repos/$REPO/pulls/"*) response="$HEAD_PR" ;;
-  "repos/$REPO/actions/runs?head_sha="*) response="$HEAD_RUNS" ;;
+  "repos/$REPO/actions/runs?head_sha="*)
+    response="$HEAD_RUNS"
+    if [ -n "$HEAD_RUNS_LATER" ]; then
+      # `|| return 1`, as the round counter's: this runs in a substitution without errexit.
+      reads=$(fixture_call_count headruns) || return 1
+      [ "$reads" -le 1 ] || response="$HEAD_RUNS_LATER"
+    fi
+    ;;
   "repos/$REPO/commits/"*)
     sha=${FIXTURE_ENDPOINT#*/commits/}
     sha=${sha%%\?*}

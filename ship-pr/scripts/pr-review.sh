@@ -6154,7 +6154,7 @@ TIP_PR_NUM=""
 TIP_PR_HEAD=""
 tip_pr_head_verdict() {
   local branch="$1" sha="$2" c rc n p1 email verified prs num head bref res line v runs want
-  local wid wname concl unbuilt="" row rid jobs jname jconcl built
+  local wid wname concl unbuilt="" rerun="" row rid jobs jname jconcl built
   shift 2
   TIP_PR_VERDICT=none TIP_PR_WHY="" TIP_PR_NUM="" TIP_PR_HEAD=""
   case "$sha" in '' | *[!0-9a-f]*)
@@ -6219,11 +6219,17 @@ tip_pr_head_verdict() {
   for want in "$@"; do
     wid="${want%%:*}"
     wname="${want#*:}"
-    # The newest COMPLETED run of that workflow at the head: the green above already says nothing
-    # is in flight there.
-    row=$(awk -F'\t' -v w="$wid" '$3 == w && $4 == "completed" { print $2 "\t" $5; exit }' <<<"$runs")
+    # The NEWEST run of that workflow at the head, finished or not: a re-run that started after
+    # the build signal was read is the answer now, and it is still judging (review round 5).
+    row=$(awk -F'\t' -v w="$wid" '$3 == w { print $2 "\t" $4 "\t" $5; exit }' <<<"$runs")
     rid="${row%%$'\t'*}"
+    row="${row#*$'\t'}"
+    if [ -n "$rid" ] && [ "${row%%$'\t'*}" != completed ]; then
+      rerun="${rerun:+$rerun, }$wname"
+      continue
+    fi
     concl="${row#*$'\t'}"
+    [ -n "$rid" ] || concl=""
     if [ "$concl" != success ]; then
       unbuilt="${unbuilt:+$unbuilt, }$wname (${concl:-no run})"
       continue
@@ -6245,6 +6251,9 @@ tip_pr_head_verdict() {
   if [ -n "$unbuilt" ]; then
     TIP_PR_VERDICT=none
     TIP_PR_WHY="PR #$num's head ${head:0:8}, which GitHub merged cleanly as the tip ${sha:0:8}, has no successful run of $unbuilt: its green is about other workflows"
+  elif [ -n "$rerun" ]; then
+    TIP_PR_VERDICT=pending
+    TIP_PR_WHY="PR #$num's head ${head:0:8}, which GitHub merged cleanly as the tip ${sha:0:8}, is being re-run by $rerun"
   fi
 }
 
