@@ -36,8 +36,9 @@
 # A start refused over an earlier run that has ENDED (finished, or died) writes `refused` into
 # that directory, so a wait there says REFUSED instead of reading the earlier status as this
 # run's. A directory from `new` never gets one unless the caller hands it to a second `start`;
-# the marker stays for the caller that names its own directory and reuses a name. A start refused over a run that is still live, or still being claimed, marks nothing:
-# that is the run a wait there should report, since the likeliest way to reach it is a duplicated
+# the marker stays for the caller that names its own directory and reuses a name. A start
+# refused over a run that is still live, or still being claimed, marks nothing: that is the run
+# a wait there should report, since the likeliest way to reach it is a duplicated
 # or retried `start` of the same command -- marking it would send the caller off to run it again.
 # A duplicate that arrives only after its twin has ENDED cannot be told from the reuse of an old
 # directory, and is refused the same way: that costs a second run, loudly, where the other
@@ -59,7 +60,9 @@
 #                 backgrounded `merge --wait`). It says nothing about what the command saw:
 #                 re-arm it in a new directory.
 #   REFUSED    6  `start` refused this directory (the reason follows): start again in a NEW one.
-# Usage errors exit 2, from either subcommand.
+# `new` exits 0 having printed the directory, and 2 when it cannot create one (a parent that is a
+# file, or one it cannot write in: an error, never a search through ever higher N). Usage errors
+# exit 2, from any subcommand.
 #
 # The races this closes, each pinned by test-bg-run.sh:
 #   1. a killed task never writes rc: `wait` reads the dead pid as DIED instead of polling forever;
@@ -81,8 +84,8 @@
 # The directory layout is a contract a reader may rely on without going through `wait`
 # (ludics-lite#405's `execution conclude --from-bg-run` reads it): `rc` holds one line, the decimal
 # exit status, and appears only once complete (rename); `log` is the command's whole output;
-# `refused`, when present, says `start` refused the directory, and an `rc` beside it belongs to an
-# EARLIER run, never to the one the caller meant. So a reader checks `refused` first, then `rc`,
+# `refused`, when present, says `start` refused the directory, and an `rc` beside it may be an
+# earlier run's, so it is never read as the caller's. So a reader checks `refused` first, then `rc`,
 # in `wait`'s own order; `pid` and `cpid` are the liveness evidence behind RUNNING and DIED.
 # Dot-files are in-flight temporaries, never a reader's. `wait <dir> --within 0` gives the same
 # verdict in one call.
@@ -131,7 +134,9 @@ cmd_new() {
   parent=$1
   need_absolute "$parent"
   # Trailing slashes off, so the path printed has one spelling (and / stays /).
-  while :; do case $parent in */) [ "$parent" = / ] && break; parent=${parent%/} ;; *) break ;; esac; done
+  while [ "$parent" != / ]; do
+    case $parent in */) parent=${parent%/} ;; *) break ;; esac
+  done
   mkdir -p -- "$parent" 2>/dev/null && [ -d "$parent" ] \
     || { say "cannot create $(printf '%q' "$parent")"; exit 2; }
   base=${parent%/}
