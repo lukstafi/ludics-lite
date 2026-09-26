@@ -365,10 +365,15 @@ running() { alive "$1" || orphaned "$1"; }
 # every codex worker, runs one process per turn.
 is_stream() { [ "$(meta_get "$WORKERS/$1" channel)" = stream-json ]; }
 meta_num() { local v; v=$(meta_get "$1" "$2"); case "$v" in ''|*[!0-9]*) echo "${3:-0}" ;; *) echo "$v" ;; esac; }
-# meta_set <dir> <key> <value>: replace or add one meta line, verified by reading it back.
+# meta_set <dir> <key> <value> [<key> <value> ...]: replace or add meta lines in ONE rename, so
+# meta holds all of the new values or none of them; verified by reading them back.
 meta_set() {
-  { grep -v "^$2=" "$1/meta"; printf '%s=%s\n' "$2" "$3"; } > "$1/meta.new" 2>/dev/null &&
-    mv -f "$1/meta.new" "$1/meta" 2>/dev/null && [ "$(meta_get "$1" "$2")" = "$3" ]
+  local d="$1" keys="" k; shift
+  local -a kv=("$@")
+  for ((k = 0; k < ${#kv[@]}; k += 2)); do keys="$keys|${kv[k]}"; done
+  { grep -Ev "^(${keys#|})=" "$d/meta"; for ((k = 0; k < ${#kv[@]}; k += 2)); do printf '%s=%s\n' "${kv[k]}" "${kv[k + 1]}"; done; } > "$d/meta.new" 2>/dev/null &&
+    mv -f "$d/meta.new" "$d/meta" 2>/dev/null || return 1
+  for ((k = 0; k < ${#kv[@]}; k += 2)); do [ "$(meta_get "$d" "${kv[k]}")" = "${kv[k + 1]}" ] || return 1; done
 }
 # turn_state <name>: "<turn> <bg> <res>", read from the stream past the current process's start
 # (proc_offset). turn: `ended` when the last turn event is a `result`, `working` when it is a
@@ -1625,18 +1630,18 @@ if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name
   # Meta and the input line change together: signals wait until both have (milliseconds), so an
   # interruption never leaves meta naming a message the input never got, nor half a line.
   trap '' TERM HUP INT
-  # Only a backup whose copy completed is ever restored: a failed cp can leave a truncated one.
-  cp -p "$d/meta" "$d/meta.prev" 2>/dev/null ||
-    { rm -f "$d/meta.prev"; echo "UNSTICK REFUSED $BOX/$name: cannot back up $d/meta (disk full?); nothing was changed"; exit 1; }
-  meta_set "$d" turn_offset "$off" && meta_set "$d" awaiting "$mid" ||
-    { mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
+  # Both keys in one rename (meta_set), the previous values kept in the shell: no backup file.
+  prev_off=$(meta_get "$d" turn_offset); prev_awaiting=$(meta_get "$d" awaiting)
+  meta_set "$d" turn_offset "$off" awaiting "$mid" ||
+    { echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta (disk full?); nothing was changed"; exit 1; }
   if ! printf '%s\n' "$line" >> "$d/input.jsonl" 2>/dev/null; then
-    mv -f "$d/meta.prev" "$d/meta"
+    meta_set "$d" turn_offset "$prev_off" awaiting "$prev_awaiting" ||
+      echo "UNSTICK: could not put back $d/meta's turn_offset=$prev_off awaiting=$prev_awaiting; attach waits on a message the input lacks until they are" >&2
     # No truncation: the live feeder may already have forwarded a partial write, and a file
     # truncated under `tail -f` is re-read or skipped by platform. Said, not repaired.
     echo "UNSTICK REFUSED $BOX/$name: cannot append to $d/input.jsonl (disk full?); it may now end in a partial line the CLI has already read -- free space, then \`unstick --kill\` it (the resume drops a partial line) rather than appending again"; exit 1
   fi
-  rm -f "$d/meta.prev"; trap 'exit 143' TERM HUP INT
+  trap 'exit 143' TERM HUP INT
   waited=0
   while :; do
     echoed=$(tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null | jq -Rrn --arg u "$mid" 'first(inputs | fromjson? | select(.type=="user" and .uuid==$u) | .uuid) // empty' 2>/dev/null)
@@ -1728,7 +1733,7 @@ backed=1
 off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
 grep -q '^turn_offset=' "$d/meta" || echo "turn_offset=0" >> "$d/meta"
 sed -i.bak "s/^resumes=.*/resumes=$n/; s/^turn_offset=.*/turn_offset=$off/" "$d/meta" 2>/dev/null && rm -f "$d/meta.bak" && grep -q "^resumes=$n\$" "$d/meta" && grep -q "^turn_offset=$off\$" "$d/meta" &&
-  { [ "$kind" != claude ] || { meta_set "$d" channel stream-json && meta_set "$d" proc_offset "$off" && meta_set "$d" input_from "$from" && meta_set "$d" awaiting "$mid"; }; } ||
+  { [ "$kind" != claude ] || { meta_set "$d" channel stream-json proc_offset "$off" input_from "$from" awaiting "$mid"; }; } ||
   { mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
 # The previous terminal state is evidence until the resume has really started: set it aside,
 # and put it back (with the previous meta) if tmux refuses.
