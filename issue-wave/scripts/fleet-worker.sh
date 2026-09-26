@@ -179,6 +179,9 @@
 #     Past it the message is reported queued, not lost: a worker inside a long tool call reads it
 #     when the call returns.
 #   FLEET_CLOSE_WAIT: seconds `close` waits for the CLI to exit after its input closes; 60.
+#   FLEET_FEEDER_WAIT: seconds a claude worker's run.sh waits for its input feeder to record its
+#     pid before refusing to start the CLI (exit 95); 10. Fixed into run.sh when `launch` or
+#     `unstick` writes it, so it is the coordinator's value on every box.
 
 set -uo pipefail
 
@@ -241,6 +244,7 @@ ANCHOR_STATE="${FLEET_ANCHOR_STATE:-$STATE}"
 TMUX_SOCKET="${FLEET_TMUX_SOCKET:-}"
 FLOTILLA="${FLEET_FLOTILLA:-http://mac-studio:7799}"
 PRS_LIMIT="${FLEET_PRS_LIMIT:-1000}"
+FEEDER_WAIT="${FLEET_FEEDER_WAIT:-10}"
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
 # The skills checkout this script belongs to, by its physical path: the script is reached through
 # the ~/.claude/skills/issue-wave symlink, and a plain `cd ..` collapses the symlink's own path
@@ -249,6 +253,10 @@ SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o Ser
 CHECKOUT=$(CDPATH='' cd -P "$(dirname "$0")/../.." 2>/dev/null && pwd -P)
 
 die() { echo "fleet-worker.sh: $*" >&2; exit 2; }
+
+# The run.sh feeder bound, checked by the commands that write one: a whole number of seconds, above
+# zero (a zero bound would refuse every CLI whose feeder took one poll to record its pid).
+feeder_wait_ok() { case "$FEEDER_WAIT" in ''|*[!0-9]*|0*) return 1 ;; esac; }
 
 is_local() { [ "$1" = local ] || { [ -n "$LOCAL_BOX" ] && [ "$1" = "$LOCAL_BOX" ]; }; }
 
@@ -270,7 +278,7 @@ emit_var() {
 # coordinator never typed. Single-quoted heredoc: nothing expands locally.
 prelude() {
   emit_var STATE "$STATE"; emit_var SKILLS_REPO "$SKILLS_REPO"; emit_var ANCHOR_STATE "$ANCHOR_STATE"
-  printf 'TMUX_SOCKET=%q\nBOX=%q\n' "$TMUX_SOCKET" "$1"
+  printf 'TMUX_SOCKET=%q\nBOX=%q\nFEEDER_WAIT=%q\n' "$TMUX_SOCKET" "$1" "$FEEDER_WAIT"
   # Whether run_on runs this as a local child: `local` and the anchor's own name alike (is_local).
   if is_local "$1"; then printf 'BOX_IS_LOCAL=1\n'; else printf 'BOX_IS_LOCAL=0\n'; fi
   cat <<'EOF'
@@ -456,11 +464,12 @@ stream_run() {
   printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
   printf 'rm -f %q\n' "$d/feeder.pid"
   # Without its pid on record the feeder could never be closed or ended, so the CLI starts only
-  # once feeder.pid names this record's live tail (else exit 95, the CLI never started); a failed
-  # pid write ends the feeder it would have named, so the pipeline still finishes.
+  # once feeder.pid names this record's live tail (else exit 95, the CLI never started, after
+  # FEEDER_WAIT seconds of 0.2 s polls); a failed pid write ends the feeder it would have named, so
+  # the pipeline still finishes.
   printf '{ tail -n +%d -f %q & echo $! > %q || { kill $!; exit 95; }; wait; } | {\n' "$from" "$d/input.jsonl" "$d/feeder.pid"
   feeder=$(printf 'case "$(ps -ww -o command= -p "$p" 2>/dev/null)" in *tail*%q*)' "$d/input.jsonl")
-  printf '  n=0; while p=$(cat %q 2>/dev/null); ! %s true ;; *) false ;; esac; do n=$((n + 1)); [ "$n" -lt 50 ] || { case "$p" in *[!0-9]*|"") ;; *) kill "$p" 2>/dev/null ;; esac; exit 95; }; sleep 0.2; done\n' "$d/feeder.pid" "$feeder"
+  printf '  n=0; while p=$(cat %q 2>/dev/null); ! %s true ;; *) false ;; esac; do n=$((n + 1)); [ "$n" -lt %d ] || { case "$p" in *[!0-9]*|"") ;; *) kill "$p" 2>/dev/null ;; esac; exit 95; }; sleep 0.2; done\n' "$d/feeder.pid" "$feeder" "$((FEEDER_WAIT * 5))"
   printf '  claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --dangerously-skip-permissions %s %q' "$flag" "$sid"
   for a in "$@"; do printf ' %q' "$a"; done
   printf ' >> %q 2>> %q; rc=$?\n' "$d/stream.jsonl" "$d/stderr.log"
@@ -1217,6 +1226,7 @@ cmd_launch() {
     shift
   done
   case "$kind" in claude|codex) ;; *) die "launch: --kind claude|codex" ;; esac
+  feeder_wait_ok || die "launch: FLEET_FEEDER_WAIT must be a positive number of seconds"
   case "$cwd$repo$branch$base" in *$'\n'*) die "launch: paths and refs must not contain newlines (the record is line-oriented)" ;; esac
   [ -n "$brief" ] && [ -r "$brief" ] || die "launch: --brief <readable file>"
   if [ -z "$cwd" ]; then
@@ -1648,6 +1658,7 @@ cmd_unstick() {
   [ -n "$msg" ] && [ -r "$msg" ] || die "unstick: --message <readable file>"
   local dwait="${FLEET_DELIVERY_WAIT:-20}"
   case "$dwait" in ''|*[!0-9]*) die "unstick: FLEET_DELIVERY_WAIT must be a number of seconds" ;; esac
+  feeder_wait_ok || die "unstick: FLEET_FEEDER_WAIT must be a positive number of seconds"
   # The uuid the message's input line carries: its replay in the stream proves delivery.
   local mid; mid=$(gen_uuid) || { echo "UNSTICK REFUSED $box/$name: cannot generate a message id here (no uuidgen, /proc uuid, or python3)"; exit 1; }
   anchor_gate UNSTICK "$box/$name" 1 || exit $?

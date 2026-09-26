@@ -1333,8 +1333,10 @@ expect "...unstick --kill resumes" 0 "RESUMED testbox/wp " -- "$FW" unstick test
 expect "...and the message is answered" 0 "IDLE testbox/wp .*did: Stop and answer now" -- "$FW" attach testbox wp --interval 1
 settle wp
 # A feeder whose pid cannot be recorded could never be closed: the worker stops before its CLI.
+# FLEET_FEEDER_WAIT=1: a second of polling for the pid, not the default ten.
 mkdir "$ISSUE_WAVE_STATE/workers/wr/feeder.pid"
-"$FW" unstick testbox wr --message "$TMP/msg.md" >/dev/null
+FLEET_FEEDER_WAIT=1 "$FW" unstick testbox wr --message "$TMP/msg.md" >/dev/null
+grep -q -- '-lt 5 ]' "$ISSUE_WAVE_STATE/workers/wr/run.sh" && ok "...FLEET_FEEDER_WAIT=1 bounds run.sh's feeder wait at five polls" || ko "run.sh ignored FLEET_FEEDER_WAIT: $(cat "$ISSUE_WAVE_STATE/workers/wr/run.sh")"
 expect "an unwritable feeder pid file stops the worker before the CLI starts" 1 "FAILED testbox/wr exit=95" -- "$FW" attach testbox wr --interval 1
 rmdir "$ISSUE_WAVE_STATE/workers/wr/feeder.pid"
 
@@ -2125,6 +2127,8 @@ expect "unstick validates the name before writing anything" 2 "unstick: name mus
 expect "status validates the name" 2 "status: name must be" -- "$FW" status testbox "a b"
 expect "close validates the name" 2 "close: name must be" -- "$FW" close testbox ../escape
 expect "close takes no options" 2 "close: unknown option" -- "$FW" close testbox w1 --kill
+expect "launch refuses a feeder wait that is not a positive number" 2 "launch: FLEET_FEEDER_WAIT must be a positive number" -- env FLEET_FEEDER_WAIT=0 "$FW" launch testbox fw0 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
+expect "...and so does unstick" 2 "unstick: FLEET_FEEDER_WAIT must be a positive number" -- env FLEET_FEEDER_WAIT=1s "$FW" unstick testbox w1 --message "$TMP/msg.md"
 expect "close is fenced by the lease" 1 "CLOSE REFUSED testbox/w1: coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" close testbox w1
 expect "without FLEET_LOCAL_BOX an unrecognized host is local only to 'local'" 0 "EXITED(0) local/w1" -- env -u FLEET_LOCAL_BOX "$FW" status local w1
 out=$(env -u FLEET_LOCAL_BOX "$FW" status testbox w1 2>&1); rc=$?
