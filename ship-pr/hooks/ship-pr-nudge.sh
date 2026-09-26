@@ -56,8 +56,8 @@ upstream="origin/$default_branch"
 git rev-parse --verify --quiet "$upstream" >/dev/null || exit 0
 
 # 4. What is unlanded: uncommitted changes, and commits this branch has that the default branch
-# does not. Both are read locally -- no fetch, so a merged-but-unfetched branch can still look
-# ahead; the PR check below is what catches that case.
+# does not. Both are read locally here, so a merged-but-unfetched branch can still look ahead;
+# the PR lookup and the base refresh below are what catch that case.
 dirty=$(git status --porcelain 2>/dev/null) || exit 0
 ahead=$(git rev-list --count "$upstream..HEAD" 2>/dev/null) || exit 0
 [ -z "$dirty" ] && [ "$ahead" = "0" ] && exit 0
@@ -101,18 +101,48 @@ stamp="$stamp_dir/$state"
 [ -e "$stamp" ] && exit 0
 
 # 8. A branch that already has a PR has been shipped; monitoring it is the session's own business.
-# The only network call, and only once the local checks say something is pending.
+# Network calls happen only once the local checks say something is pending, and each is bounded:
+# a GitHub or remote that does not answer in time counts as a failed call, never a held stop.
 # Keep ALL PR states exempt: closed PRs may be deliberately abandoned experiments.
-# A successful empty list proves absence; auth/network errors and missing gh do not.
+# A successful empty list proves absence; auth/network errors, timeouts and missing gh do not.
 command -v gh >/dev/null 2>&1 || exit 0
+net_deadline=$((SECONDS + 15))
+bounded() {
+  local left=$((net_deadline - SECONDS)) pid rc
+  [ "$left" -gt 5 ] && left=5
+  [ "$left" -gt 0 ] || return 124
+  "$@" </dev/null 2>/dev/null &
+  pid=$!
+  # The watchdog must not hold the caller's stdout: $(...) waits for every writer to close it.
+  # It kills only after a nap that ran out: a missing or failed sleep kills nothing.
+  ( sleep "$left" & nap=$!; trap 'kill "$nap"; exit' TERM; wait "$nap" && kill "$pid" ) >/dev/null 2>&1 &
+  local dog=$!
+  wait "$pid" 2>/dev/null; rc=$?
+  kill "$dog" 2>/dev/null
+  return "$rc"
+}
+# Where to look. gh's default resolution prefers a remote named `upstream`, so a fork-shaped
+# checkout (origin = a staging repo, upstream = its parent) without `gh repo set-default` asks the
+# parent and reads a merged origin PR as "no PR" (#404). Ask origin's repository explicitly --
+# the branch is judged against origin's base, so that is where its PR lives -- and gh's default
+# too whenever it may differ: PRs from a fork to its parent live there. An empty entry is gh's
+# default.
+repos=()
+origin_url=$(git remote get-url origin 2>/dev/null) && repos+=("$origin_url")
+if [ "$(git remote 2>/dev/null)" != origin ] && [ "$(git config remote.origin.gh-resolved 2>/dev/null)" != base ]; then
+  repos+=("")
+fi
 pr_exempt() {
-  local pr_count
-  pr_count=$(gh pr list "$@" --state all --limit 1 --json number --jq length 2>/dev/null) || exit 0
-  case "$pr_count" in
-    0) return 1 ;;
-    1) mkdir "$stamp" 2>/dev/null; exit 0 ;;
-    *) exit 0 ;;
-  esac
+  local pr_count repo
+  for repo in "${repos[@]}"; do
+    pr_count=$(bounded gh pr list ${repo:+--repo "$repo"} "$@" --state all --limit 1 --json number --jq length) || exit 0
+    case "$pr_count" in
+      0) ;;
+      1) mkdir "$stamp" 2>/dev/null; exit 0 ;;
+      *) exit 0 ;;
+    esac
+  done
+  return 1
 }
 pr_exempt --head "$branch"
 # The work may have been pushed under another name (`git push origin HEAD:<name>`), so also look
@@ -122,10 +152,24 @@ pr_exempt --head "$branch"
 # With nothing ahead, HEAD is already on the default branch and would match the PR that landed it.
 [ "$ahead" != "0" ] && pr_exempt --search "$(git rev-parse HEAD)"
 
+# 9. No PR anywhere. Commits can still have landed without one (a direct push from another
+# checkout), and `ahead` was counted against a local ref nothing here refreshes: `gh pr merge`
+# does not update it. Refresh the base before blaming the branch; if that fails, say so.
+stale_note=
+if [ "$ahead" != "0" ]; then
+  if GIT_TERMINAL_PROMPT=0 bounded git fetch --quiet --no-tags origin \
+       "+refs/heads/$default_branch:refs/remotes/$upstream"; then
+    ahead=$(git rev-list --count "$upstream..HEAD" 2>/dev/null) || exit 0
+    [ -z "$dirty" ] && [ "$ahead" = "0" ] && exit 0
+  else
+    stale_note=" (could not refresh $upstream: counted against the local ref, which may be stale)"
+  fi
+fi
+
 mkdir "$stamp" 2>/dev/null || exit 0
 {
   printf 'Unlanded work: branch %s' "$branch"
-  [ "$ahead" != "0" ] && printf ', %s commit(s) ahead of %s' "$ahead" "$upstream"
+  [ "$ahead" != "0" ] && printf ', %s commit(s) ahead of %s%s' "$ahead" "$upstream" "$stale_note"
   [ -n "$dirty" ] && printf ', uncommitted changes'
   printf ', no PR.\n'
   printf 'If the goal is finished, invoke the ship-pr skill to land it. If it is not -- work still\n'
