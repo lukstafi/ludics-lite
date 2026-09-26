@@ -420,6 +420,59 @@ test_the_acting_exit_names_the_item() {
     "a review's state is part of what the exit names"
 }
 
+# Which round the wait ended on, by the count `rounds` reports (ludics-lite#423, part 2): #259's
+# worker numbered its round 12 as 13 from memory and posted a threshold deferral it had to
+# retract. The fixture is that shape in small: a round on H1, one on H2, and a re-requested round
+# on H2 with no push — so counting heads (or pushes) says 2, and the line must say 3.
+test_the_ending_line_names_the_round() (
+  reset_fixture
+  schedule reviews 1 "[$(review 400 "$H1" 2026-09-01T00:00:00Z),$(review 500 "$H2" 2026-09-01T01:00:00Z),$(
+    review 600 "$H2" 2026-09-01T01:30:00Z)]"
+  run_watch 0,0,500
+  assert_eq "$WATCH_RC" 0 "the round ends the wait"
+  assert_contains "$WATCH_ERR" \
+    "ending the wait on review id=600 state=COMMENTED commit=${H2:0:7} by ${REVIEWER}[bot] — round 3 of 12" \
+    "the exit line carries the round as \`rounds\` counts it, against the threshold"
+  assert_contains "$(rounds_line "$(review_rounds 7)")" "review rounds with findings: 3 of 12" \
+    "the same count \`rounds\` reports"
+  # Past the threshold the line says what that means, where the caller is about to act on it.
+  ROUND_THRESHOLD=2
+  run_watch 0,0,500
+  assert_contains "$WATCH_ERR" "— round 3 of 2, PAST the threshold: blocking-only from here" \
+    "a round past the threshold says so on the exit line"
+  ROUND_THRESHOLD=off
+  run_watch 0,0,500
+  assert_contains "$WATCH_ERR" "— round 3 (no threshold set)" "and with none set, the count alone"
+)
+
+# The missing-environment answer (ludics-lite#421), as #420 saw it: the connector's first word on
+# the head. The first window ends on the comment — it is new activity — but with the state beside
+# it saying what it is, and the round count saying it is not one; the next window, already past
+# it, exits on the nudge remedy at once instead of holding the grace.
+test_the_missing_environment_ends_the_wait_with_the_nudge() {
+  local now
+  reset_fixture
+  now=$(jq -rn 'now | todate')
+  schedule comments 1 "[$(summary_comment 100 "$now" \
+    'To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).')]"
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 0 "a new comment is something to act on"
+  assert_contains "$WATCH_OUT" "--- summary id=100 commit=-" "the comment is what poll saw"
+  assert_contains "$WATCH_ERR" "status: reviewer FAILED at initialization on head ${H2:0:7}" \
+    "the state beside it is the failure, not a round"
+  assert_contains "$WATCH_ERR" "nudge it once with a '@codex review' comment" "and it names the nudge"
+  assert_contains "$WATCH_ERR" \
+    "ending the wait on summary id=100 commit=- by ${REVIEWER}[bot] — not a round; rounds with findings stay at 0 of 12" \
+    "the exit line must not number the failure as a round"
+  run_watch 0,100,0
+  assert_eq "$WATCH_RC" 0 "the failure is a verdict to act on, as a stall is"
+  assert_contains "$WATCH_OUT" "reviewer FAILED at initialization on head ${H2:0:7}" \
+    "the verdict is on stdout, where the caller reads it"
+  assert_contains "$WATCH_OUT" "the environment is the maintainer's to set up" \
+    "with the remedy for this failure, not the git-ref one"
+  assert_not_contains "$WATCH_OUT" "no review materialized" "and without waiting out the grace"
+}
+
 # The two silences a log could not tell apart: a window in which the reviewer said nothing about
 # anything, and one in which it spoke three times about a head that is no longer the head.
 test_the_quiet_exit_names_the_head_and_what_scrolled_past() {
@@ -1621,6 +1674,8 @@ tests=(
   test_a_late_review_gets_its_own_grace_after_the_nudge
   test_an_unknown_boundary_uses_the_last_live_deadline
   test_nudges_wait_past_old_failed_and_stalled_states
+  test_the_ending_line_names_the_round
+  test_the_missing_environment_ends_the_wait_with_the_nudge
   test_an_extension_holds_through_unknown_status
   test_a_nudge_buys_exactly_one_window
   test_an_ordinary_reply_or_old_nudge_does_not_reset_grace

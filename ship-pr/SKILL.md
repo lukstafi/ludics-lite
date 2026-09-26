@@ -375,7 +375,8 @@ is not closing it, though: a scrolled-past finding whose thread is still open ke
 from reading clean (`unresolved`, below) and keeps `merge` refusing.
 
 So read the line each exit ends on, which now says what it ended *on*: the item's own descriptor
-(`ending the wait on review id=… state=… commit=… by …`) when a round ended it, and the head the
+(`ending the wait on review id=… state=… commit=… by … — round 3 of 12`, the count `rounds`
+reports, so cite that number rather than one you kept) when a round ended it, and the head the
 silence was about plus how much scrolled past (`no reviewer activity about head abc1234 in 900s;
 2 item(s) about another commit scrolled past …`) when nothing did. "The reviewer answered this
 head" and "an old review went by" are different windows and read differently.
@@ -565,7 +566,7 @@ head SHA, and answers with one of eight:
 | `unresolved` | that same 👍, over review threads still open — whatever head they cite | answer each thread and `resolve` it; `merge` refuses until none is open |
 | `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
 | `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
-| `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) |
+| `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head, or "To use Codex here, create an environment for this repo" newer than the head's commit: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) — or, for the environment one, hand it to the maintainer, since no push reaches it |
 | `expected` | no live 👀, and no review of the head SHA: a round is due and has not started — including a 👍 left from before a push, until the app takes it down | wait out the grace, then `@codex review` |
 | `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push — or, at one of the loop's exits (below), close out and merge |
 | `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
