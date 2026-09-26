@@ -372,9 +372,11 @@ meta_set() {
 }
 # turn_state <name>: "<turn> <bg> <res>", read from the stream past the current process's start
 # (proc_offset). turn: `ended` when the last turn event is a `result`, `working` when it is a
-# system init, a user or an assistant event, or a task_notification (a finished background task
-# starts a turn with no user event, and its init can trail the notification), `none` before the
-# first; bg: how many background
+# system init, a user or an assistant event, a task_notification, or a background task list
+# going from nonempty to empty (a finished background task starts a turn with no user event: the
+# CLI clears the list, then notifies, then inits the turn, in separate writes), `none` before the
+# first. Its boundary: a task that leaves the list WITHOUT starting a turn would leave the worker
+# `working` until its next event; every finished task observed (2.1.282) started one; bg: how many background
 # tasks the last background_tasks_changed event listed; res: 1 when the latest message sent has
 # had its reply -- a `result` after the CLI's echo of that message (meta `awaiting`, its uuid), or,
 # for a record that names none, a `result` past turn_offset. An echo is the proof the CLI read
@@ -390,10 +392,25 @@ turn_state() {
         elif $e.type == "result" then .t = "ended" | (if .seen and .n > $rel then .res = 1 else . end)
         elif $u != "" and $e.type == "user" and $e.uuid == $u then .t = "working" | .seen = true
         elif $e.type == "assistant" or $e.type == "user" or ($e.type == "system" and ($e.subtype == "init" or $e.subtype == "task_notification")) then .t = "working"
-        elif $e.type == "system" and $e.subtype == "background_tasks_changed" then .bg = (($e.tasks // []) | length)
+        elif $e.type == "system" and $e.subtype == "background_tasks_changed" then
+          (($e.tasks // []) | length) as $nb | (if .bg > 0 and $nb == 0 then .t = "working" else . end) | .bg = $nb
         else . end)
     | "\(.t) \(.bg) \(.res)"' 2>/dev/null)
   printf '%s' "${out:-none 0 0}"
+}
+# first_unread <name> <lines>: the first line of input.jsonl, among the current process's
+# (input_from on) up to <lines>, whose message that process never echoed -- so a resume feeds a
+# queued message the dead process never read instead of skipping it; <lines>+1 when none is.
+first_unread() {
+  local d="$WORKERS/$1" seen n u
+  seen=$(tail -n +"$(( $(meta_num "$d" proc_offset) + 1 ))" "$d/stream.jsonl" 2>/dev/null | jq -Rr 'fromjson? | select(.type=="user" and .isReplay==true) | .uuid // empty' 2>/dev/null)
+  n=$(meta_num "$d" input_from 1)
+  while [ "$n" -le "$2" ]; do
+    u=$(sed -n "${n}p" "$d/input.jsonl" 2>/dev/null | jq -r '.uuid // empty' 2>/dev/null)
+    [ -n "$u" ] && ! grep -qxF -- "$u" <<< "$seen" && break
+    n=$((n + 1))
+  done
+  printf '%s' "$n"
 }
 # The pid of a stream worker's live feeder, or nothing (status 1): a pid file alone could name a
 # reused pid, so the process must still be a tail on this record's input.jsonl.
@@ -1236,6 +1253,9 @@ for om in "$WORKERS"/*/meta; do
 done
 mkdir -p "$d" 2>/dev/null || refuse "cannot create the worker record at $d (a file in the way, or unwritable)"
 if [ -f "$d/meta" ]; then
+  # A feeder that outlived its CLI (no tmux, no CLI: both refused above) would follow the archived
+  # file forever, out of feeder_of's reach once the record moves: end it first.
+  if fpid=$(feeder_of "$name"); then kill "$fpid" 2>/dev/null; fi
   # --replace keeps the previous record whole under $STATE/replaced/ (evidence), and a refusal
   # below puts it back; nothing of it is truncated in place.
   mkdir -p "$STATE/replaced" 2>/dev/null; archive="$STATE/replaced/$name-$stamp"
@@ -1348,6 +1368,14 @@ verdict() {
   # reads past the turn_offset the launch/unstick recorded; a turn with no terminal event of
   # its own is not a success whatever the exit code said.
   local off; off=$(meta_get "$d" turn_offset); off=${off:-0}
+  # A claude record that names the latest message (meta `awaiting`) counts only what follows the
+  # CLI's echo of it, as attach does: a result between the append and the read answers something
+  # else, and a message never echoed has had no turn at all.
+  if [ "$kind" = claude ] && [ -n "$(meta_get "$d" awaiting)" ]; then
+    local at; at=$(tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null | jq -Rrn --arg u "$(meta_get "$d" awaiting)" \
+      'first(foreach inputs as $l (0; . + 1; . as $n | ($l | fromjson? // null) | select(type == "object" and .type == "user" and .uuid == $u) | $n)) // empty' 2>/dev/null)
+    if [ -n "$at" ]; then off=$((off + at)); else off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}; fi
+  fi
   turn() { tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null; }
   case "$kind" in
     claude) summary=$(turn | jq -Rr 'fromjson? | select(.type=="result") | "\(.subtype) is_error=\(.is_error) turns=\(.num_turns) " + ((.result // "")|tostring|.[0:200]|gsub("\n";" "))' 2>/dev/null | tail -n1)
@@ -1632,11 +1660,13 @@ fi
 # A resume creates a session too, with no preflight in front of it.
 msg=$(tmux_env_check) || { echo "UNSTICK REFUSED $BOX/$name: $msg"; exit 1; }
 # A claude session resumes onto the stream-json channel whatever it ran before (a record from
-# before it has no input.jsonl): the new process reads input.jsonl from the message's own line.
+# before it has no input.jsonl): the new process reads input.jsonl from the first line the old one
+# never echoed -- a message still queued when it died -- or else from the message's own line.
 if [ "$kind" = claude ]; then
   line=$(user_line "$d/messages/$stamp.md" "$mid") && [ -n "$line" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot encode the message as an input line"; exit 1; }
   il=$(grep -c '' "$d/input.jsonl" 2>/dev/null); il=${il:-0}
-  stream_run "$d" "$cwd" "$((il + 1))" --resume "$sid" "$@" > "$d/run.sh" 2>/dev/null
+  if is_stream "$name"; then from=$(first_unread "$name" "$il"); else from=$((il + 1)); fi
+  stream_run "$d" "$cwd" "$from" --resume "$sid" "$@" > "$d/run.sh" 2>/dev/null
 else
   {
     printf 'cd %q || { echo 97 > %q; exit 97; }\n' "$cwd" "$d/exit"
@@ -1656,7 +1686,7 @@ backed=1
 off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
 grep -q '^turn_offset=' "$d/meta" || echo "turn_offset=0" >> "$d/meta"
 sed -i.bak "s/^resumes=.*/resumes=$n/; s/^turn_offset=.*/turn_offset=$off/" "$d/meta" 2>/dev/null && rm -f "$d/meta.bak" && grep -q "^resumes=$n\$" "$d/meta" && grep -q "^turn_offset=$off\$" "$d/meta" &&
-  { [ "$kind" != claude ] || { meta_set "$d" channel stream-json && meta_set "$d" proc_offset "$off" && meta_set "$d" input_from "$((il + 1))" && meta_set "$d" awaiting "$mid"; }; } ||
+  { [ "$kind" != claude ] || { meta_set "$d" channel stream-json && meta_set "$d" proc_offset "$off" && meta_set "$d" input_from "$from" && meta_set "$d" awaiting "$mid"; }; } ||
   { mv -f "$d/meta.prev" "$d/meta"; echo "UNSTICK REFUSED $BOX/$name: cannot update $d/meta"; exit 1; }
 # The previous terminal state is evidence until the resume has really started: set it aside,
 # and put it back (with the previous meta) if tmux refuses.

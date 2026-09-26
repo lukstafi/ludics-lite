@@ -277,9 +277,10 @@ if [ "$infmt" = stream-json ]; then
     if [ -n "$bg" ]; then
       echo '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash"}]}'
       result "$text"; sleep "$bg"
-      # As the real CLI: the task list clears and the notification lands before the new turn's init.
+      # As the real CLI: the task list clears, then the notification lands, then the new turn's
+      # init, in separate writes (gaps widened so a reader can land between them).
       echo '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
-      echo '{"type":"system","subtype":"task_notification","task_id":"b1","status":"completed"}'
+      sleep 2; echo '{"type":"system","subtype":"task_notification","task_id":"b1","status":"completed"}'
       sleep 2; init; text="background task done"; say "$text"
     fi
     result "$text"
@@ -1175,10 +1176,24 @@ printf 'BG 5 then report\n' > "$TMP/bg.md"
 "$FW" launch testbox wbg --target-repo example/project --kind claude --brief "$TMP/bg.md" --cwd "$proj" >/dev/null
 for i in $(seq 1 20); do grep -q '"background_tasks_changed","tasks":\[{' "$ISSUE_WAVE_STATE/workers/wbg/stream.jsonl" 2>/dev/null && break; sleep 0.25; done
 expect "a turn ended with a background task listed reads as RUNNING, not IDLE" 0 "RUNNING testbox/wbg .* turn=ended background_tasks=1 " -- "$FW" status testbox wbg
+for i in $(seq 1 40); do grep -q '"tasks":\[\]' "$ISSUE_WAVE_STATE/workers/wbg/stream.jsonl" 2>/dev/null && break; sleep 0.25; done
+expect "...and the task list clearing starts the task's turn before its notification or init: RUNNING, turn=working" 0 "RUNNING testbox/wbg .* turn=working background_tasks=0 " -- "$FW" status testbox wbg
 for i in $(seq 1 40); do grep -q '"task_notification"' "$ISSUE_WAVE_STATE/workers/wbg/stream.jsonl" 2>/dev/null && break; sleep 0.25; done
-expect "...and the task's notification starts a turn before its init does: RUNNING, turn=working" 0 "RUNNING testbox/wbg .* turn=working background_tasks=0 " -- "$FW" status testbox wbg
+expect "...as does the notification before the init" 0 "RUNNING testbox/wbg .* turn=working background_tasks=0 " -- "$FW" status testbox wbg
 expect "...attach waits for the turn the task's completion starts" 0 "IDLE testbox/wbg .*background task done" -- "$FW" attach testbox wbg --interval 1
 settle wbg
+# A feeder that outlived its CLI must not follow the archived record forever after a --replace.
+tail -n +1 -f "$ISSUE_WAVE_STATE/workers/wbg/input.jsonl" >/dev/null 2>&1 & stale=$!; echo "$stale" > "$ISSUE_WAVE_STATE/workers/wbg/feeder.pid"
+"$FW" launch testbox wbg --target-repo example/project --kind claude --brief "$brief" --cwd "$proj" --replace >/dev/null
+sleep 0.5; kill -0 "$stale" 2>/dev/null && { ko "--replace left the old record's feeder running"; kill "$stale"; } || ok "--replace ends a feeder the old record left behind"
+wait "$stale" 2>/dev/null; settle wbg
+# The verdict of an ended process reads only what follows the echo of the latest message: a
+# message echoed and never answered is no DONE, even with an earlier turn's result after the append.
+printf 'BG 4\n' > "$TMP/bg4b.md"; printf 'SILENT\n' > "$TMP/silent-msg.md"
+"$FW" launch testbox wqs --target-repo example/project --kind claude --brief "$TMP/bg4b.md" --cwd "$proj" >/dev/null
+for i in $(seq 1 20); do grep -q '"background_tasks_changed","tasks":\[{' "$ISSUE_WAVE_STATE/workers/wqs/stream.jsonl" 2>/dev/null && break; sleep 0.25; done
+FLEET_DELIVERY_WAIT=0 "$FW" unstick testbox wqs --message "$TMP/silent-msg.md" >/dev/null
+expect "a message echoed but never answered before the CLI exited is FAILED, not the earlier turn's DONE" 1 "FAILED testbox/wqs exit=0 no terminal event" -- "$FW" attach testbox wqs --interval 1
 }
 
 section "unstick" && {
@@ -1237,6 +1252,15 @@ expect "...status counts it unread" 0 "turn=.* unread=1 " -- "$FW" status testbo
 expect "...and attach returns the reply to it, not the turn that ended before it was read" 0 "IDLE testbox/wq .*did: Stop and answer now" -- "$FW" attach testbox wq --interval 1
 expect "...after which it is read" 0 "unread=0 " -- "$FW" status testbox wq
 settle wq
+# A message still queued when the process is killed is fed to the resumed one, before the new one.
+"$FW" launch testbox wr --target-repo example/project --kind claude --brief "$TMP/bg4.md" --cwd "$proj" >/dev/null
+for i in $(seq 1 20); do grep -q '"background_tasks_changed","tasks":\[{' "$ISSUE_WAVE_STATE/workers/wr/stream.jsonl" 2>/dev/null && break; sleep 0.25; done
+FLEET_DELIVERY_WAIT=0 "$FW" unstick testbox wr --message "$TMP/msg.md" >/dev/null
+expect "a kill-and-resume over a queued message" 0 "RESUMED testbox/wr " -- "$FW" unstick testbox wr --message "$TMP/msg2.md" --kill
+grep -q -- "tail -n +2 -f " "$ISSUE_WAVE_STATE/workers/wr/run.sh" && ok "...resumes from the first line the dead process never echoed" || ko "resume skipped the queued message: $(cat "$ISSUE_WAVE_STATE/workers/wr/run.sh")"
+expect "...and the resumed process answers both, the new one last" 0 "IDLE testbox/wr .*did: Now the next step" -- "$FW" attach testbox wr --interval 1
+grep -q '"text":"did: Stop and answer now' "$ISSUE_WAVE_STATE/workers/wr/stream.jsonl" && ok "...the queued message had its own turn" || ko "queued message lost across the resume"
+settle wr
 
 printf 'SLEEP 60\n' > "$TMP/slow.md"
 "$FW" launch testbox a.b --target-repo example/project --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1
