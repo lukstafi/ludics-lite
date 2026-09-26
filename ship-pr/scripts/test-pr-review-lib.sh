@@ -70,6 +70,8 @@
 #   run_tests <case>...                 the guard below, then each case with a PASS line — and,
 #                                       after each case, the refusal of a BREAK_JQ left standing,
 #                                       which would break a jq program for every case after it.
+#                                       A case that is not a defined function when run_tests is
+#                                       reached is refused before any case runs.
 #                                       SHIP_PR_TEST_CASES="<case> <case>" runs only those, and
 #                                       says so on a closing `SUBSET: n of m cases` line
 #
@@ -860,10 +862,23 @@ check_shadows() {
 # nothing and report green; so is any subset under GITHUB_ACTIONS=true, so CI never runs part of
 # a suite. The variable is read once and unset before the first case: a case that runs a
 # throwaway suite of its own must not hand it a list naming the outer suite's cases.
+#
+# Every case named must already be a function when run_tests is reached, and the run is refused
+# before the first case otherwise. PR #415 defined a case inside another case's body: the full run
+# was green, since the outer case defined the inner one before its turn came, but a subset naming
+# the inner case alone had nothing to call — and only the reviewer noticed. A name the register
+# carries and no function answers is a defect of the suite, whichever cases a run selects.
 run_tests() {
-  local test_name wanted=() selected=() missing=""
+  local test_name wanted=() selected=() missing="" undefined=""
   check_shadows
   [ $# -gt 0 ] || bail "run_tests: no cases named"
+  for test_name in "$@"; do
+    declare -F "$test_name" >/dev/null || undefined="$undefined $test_name"
+  done
+  [ -z "$undefined" ] || {
+    echo "$LIB_BASENAME: REFUSING to run: run_tests names cases that are not defined functions:$undefined — define every case at the top level of the suite, where it exists before the first case runs (a case defined inside another case's body cannot be selected alone)" >&2
+    exit 2
+  }
   read -r -d '' -a wanted <<<"${SHIP_PR_TEST_CASES:-}" || true
   unset SHIP_PR_TEST_CASES
   if [ "${#wanted[@]}" -eq 0 ]; then
@@ -1655,6 +1670,40 @@ test_a_subset_naming_a_case_the_suite_lacks_is_refused() {
   assert_contains "$CONTROL_ERR" "does not run: test_tow —" "the unknown name should be named, alone"
 }
 
+# The PR #415 shape: a case defined inside another case's body. The full run used to pass — the
+# outer case defined the inner one before its turn — while a subset naming the inner case alone
+# could not select it. Both are refused now, before any case runs.
+# two_case_suite <definition>...: a throwaway suite running test_outer and test_inner, with the
+# given definitions above its `run_tests`, written to CONTROL_FILE.
+two_case_suite() {
+  CONTROL_FILE="$CONTROL_ROOT/two-cases-$((CONTROL_N += 1)).sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    printf 'source %s\n' "\"$TEST_LIB_FILE\""
+    printf '%s\n' "$@"
+    echo 'unset GITHUB_ACTIONS'
+    echo 'run_tests test_outer test_inner'
+  } >"$CONTROL_FILE"
+}
+
+test_a_case_that_is_not_a_function_is_refused() {
+  local list
+  two_case_suite 'test_outer() { test_inner() { :; }; }'
+  for list in '' test_inner; do
+    SHIP_PR_TEST_CASES=$list control_run "$CONTROL_FILE"
+    assert_refused "a nested case (SHIP_PR_TEST_CASES='$list')"
+    assert_contains "$CONTROL_ERR" "not defined functions: test_inner —" \
+      "the undefined case should be named, alone ($list)"
+  done
+  # The control: the same two cases, both at the top level, run whole.
+  two_case_suite 'test_outer() { :; }' 'test_inner() { :; }'
+  control_run "$CONTROL_FILE"
+  assert_eq "$CONTROL_RC" 0 "top-level cases run ($CONTROL_ERR)"
+  assert_eq "$CONTROL_OUT" "PASS: test_outer
+PASS: test_inner" "both cases run once the inner one is defined at the top level"
+}
+
 test_a_subset_under_ci_is_refused() {
   subset_suite 'GITHUB_ACTIONS=true' 'SHIP_PR_TEST_CASES=test_one'
   assert_refused "a subset in CI"
@@ -2166,6 +2215,7 @@ tests=(
   test_a_subset_runs_the_cases_it_names_and_says_so
   test_a_subset_naming_a_case_the_suite_lacks_is_refused
   test_a_subset_under_ci_is_refused
+  test_a_case_that_is_not_a_function_is_refused
   test_a_second_library_is_protected_once_it_says_so
   test_protect_library_refuses_a_file_that_defines_nothing
   test_retune_moves_a_constant

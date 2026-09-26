@@ -319,7 +319,9 @@ To iterate on a few cases of a `ship-pr/scripts/test-pr-review-*.sh` suite, name
 `SHIP_PR_TEST_CASES="test_a test_b" ship-pr/scripts/test-pr-review-watch.sh` runs only those, in
 the suite's order, and closes with `SUBSET: 2 of <m> cases` — a line a full run never prints. A
 name the suite does not run is refused, and so is any subset under `GITHUB_ACTIONS=true`, so CI
-always runs the whole suite; the full run before a push still stands.
+always runs the whole suite; the full run before a push still stands. Every case `run_tests` is
+given must already be a defined function, or the run is refused before any case: PR #415 defined a
+case inside another case's body, which a full run reached but a subset could never select.
 
 The scripts carry their own test suites (Python fixtures use `python3`; PowerShell fixtures run on Windows):
 
