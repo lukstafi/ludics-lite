@@ -278,6 +278,11 @@ test_the_missing_environment_is_not_a_round() {
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
     "a sentence that goes on past the full stop is a finding"
   set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
+    'To use Codex here, [create an environment for this repo](https://example.test/env) — the suite needs one.')"
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "a finding that carries on past the link is a finding (review of #434, round 4)"
+  set_comments "$(comment "$REVIEWER" 2026-09-26T12:44:03Z \
     'To use Codex here, create an environment for this repo.')"
   run_rounds
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 0 of 12" \

@@ -459,6 +459,14 @@ test_the_ending_line_claims_only_the_rounds_the_window_opened() (
   assert_contains "$WATCH_ERR" "ending the wait on review id=601" "the burst's tail still ends the wait"
   assert_contains "$WATCH_ERR" "— this window opened no round; rounds with findings: 3 of 12" \
     "the tail of round 3 is not round 4, nor round 3 claimed again as new"
+  # A tail past the threshold is still past it: its findings are blocking-only too (review of
+  # #434, round 4).
+  ROUND_THRESHOLD=2
+  run_watch 0,0,600
+  assert_contains "$WATCH_ERR" \
+    "— this window opened no round; rounds with findings: 3 of 2, PAST the threshold: blocking-only from here" \
+    "the tail of an over-threshold round keeps the warning"
+  ROUND_THRESHOLD=12
   # The tail of round 3 AND a new round 4 in one window (review of #434, round 2): the named item
   # is the tail, so the line speaks of what the window opened, not of the item's round.
   schedule reviews 1 "[$(review 400 "$H1" 2026-09-01T00:00:00Z),$(review 500 "$H2" 2026-09-01T01:00:00Z),$(
