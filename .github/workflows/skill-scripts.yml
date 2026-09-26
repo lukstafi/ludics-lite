@@ -235,6 +235,8 @@ jobs:
         run: ship-pr/scripts/test-pr-review-base-settle.sh
       - name: Exercise what the base wait loop decides
         run: ship-pr/scripts/test-pr-review-base-verdict.sh
+      - name: Exercise the named verdict sources of a tip no push run judges
+        run: ship-pr/scripts/test-pr-review-base-pushless.sh
       - name: Exercise the build gate's absent-vs-not-yet split
         run: ship-pr/scripts/test-pr-review-checks-absent.sh
       - name: Repeat the four suites a CRLF jq turned red, over a stub jq.exe
@@ -414,6 +416,9 @@ jobs:
       - name: pr-review fixtures, what the base wait loop decides
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-base-verdict.sh || { echo '::error title=macOS suite failed::test-pr-review-base-verdict.sh'; exit 1; }
+      - name: pr-review fixtures, the named sources of a tip no push run judges
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-base-pushless.sh || { echo '::error title=macOS suite failed::test-pr-review-base-pushless.sh'; exit 1; }
       - name: pr-review fixtures, absent vs not yet
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-checks-absent.sh || { echo '::error title=macOS suite failed::test-pr-review-checks-absent.sh'; exit 1; }

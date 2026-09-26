@@ -604,6 +604,15 @@ if [ -n "$STALE_BASE_PR" ]; then
     # every merge strategy has.
     if [ "$(jq '.parents | length' <<<"$merge_commit")" -ge 2 ]; then
       pin "the merge commit's second parent is the PR's head" '.parents[1].sha == $head' "$merge_commit" --arg head "$head_sha"
+      # What tip_pr_head_verdict reads to call a tip a CLEAN merge of a PR head (ludics-lite#401):
+      # GitHub's own merge commits are committed as noreply@github.com with a signature GitHub
+      # verified. If either moved, every pushless tip would quietly read "no verdict".
+      pin "GitHub's merge commit is committed by noreply@github.com with a verified signature (tip_pr_head_verdict's clean-merge test)" \
+        '.commit.committer.email == "noreply@github.com" and .commit.verification.verified == true' "$merge_commit"
+      tip_pulls=$(api "repos/$REPO/commits/$merge_sha/pulls?per_page=100")
+      pin "commits/<merge sha>/pulls lists the PR it merged, with merged_at, that merge_commit_sha, its head.sha and base.ref (tip_pr_head_verdict's lookup)" \
+        'any(.[]; .number == $n and .merged_at != null and .merge_commit_sha == $m and .head.sha == $h and (.base.ref | type == "string"))' \
+        "$tip_pulls" --argjson n "$STALE_BASE_PR" --arg m "$merge_sha" --arg h "$head_sha"
     else
       skip "the merge commit's second parent is the PR's head" "#$STALE_BASE_PR was squash- or rebase-merged: its merge_commit_sha has one parent and does not carry the head as a parent at all; a merge-commit anchor pins this claim"
     fi
