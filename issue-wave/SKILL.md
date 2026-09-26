@@ -382,7 +382,9 @@ requirements for every transport with transport-specific setup and identity, and
   the [standing reservation](references/executions.md#standing-iteration-reservation) the
   coordinator took at launch - name its request id, the bounded aliases and `-j` width it
   covers, and that every batch goes through the project runner, wrapped in `fleet-worker.sh
-  execution slot -- <batch>` (`execution slot --cpu -- <batch>` for one that holds no GPU), and
+  execution slot -- <batch>` (`execution slot --cpu -- <batch>` for one that holds no GPU; a
+  runner that takes the slot itself runs inside the wrapper, [nested
+  slots](references/executions.md#exclusivity-and-the-run-time-slots)), and
   is reported by run directory. Every other run - a
   measurement (only for a timing-grade claim or a run that needs the box to itself, a
   [rule](references/executions.md#exclusivity-and-the-run-time-slots) the brief carries), a

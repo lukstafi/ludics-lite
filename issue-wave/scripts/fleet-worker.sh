@@ -88,7 +88,10 @@
 #   fleet-worker.sh execution list [--active] [--compact]
 #   fleet-worker.sh execution slot [--wait <seconds>] [--cpu|--gpu] -- <command...>   # hold one
 #                          # of THIS box's run-time correctness slots around a suite or batch
-#                          # (no lease needed), plus a GPU token unless it declares --cpu
+#                          # (no lease needed), plus a GPU token unless it declares --cpu; inside
+#                          # a slot already held (FLEET_SLOT_HELD) it runs under that one
+#   fleet-worker.sh execution slot --probe             # `EXECUTION SLOT PROBE <box> <slots> <gpu
+#                          # tokens>` for this box, taking nothing (exit 2: not a fleet host)
 #   fleet-worker.sh execution hold [--why <text>] -- <command...>   # run under THIS box's OS-level
 #                          # sleep guard alone (a systemd-inhibit block lock; bare where none):
 #                          # the wrapper for an exclusive measurement, and what `slot` runs inside
@@ -162,6 +165,8 @@
 #     ~/.local/state/fleet-execution-slots. Deliberately NOT under ISSUE_WAVE_STATE, which is
 #     per-coordinator: the cap is the box's, so every agent on the box must resolve this to the
 #     same directory (as every coordinator must resolve FLEET_ANCHOR_STATE to the same one).
+#   FLEET_SLOT_HELD: set BY `execution slot` in its command's environment, never by hand:
+#     `<box> <slot> <slots> <gpu|cpu>`, the slot the batch holds (THE NESTED SLOT, below).
 #   FLEET_SYSTEMD_INHIBIT: the systemd-inhibit that `execution hold` (and so `execution slot`)
 #     wraps a run in; systemd-inhibit on PATH. A name that resolves to no executable runs the
 #     command bare, as on macOS; the suites pin it to a stub or to nothing, never to the runner's.
@@ -2295,6 +2300,21 @@ box_spec_count() {
 # box has as many tokens as slots nothing binds, and every batch takes the first free slot as
 # before, so every box but the one the token spec narrows is unchanged.
 #
+# THE NESTED SLOT (ahrefs/ocannl#1004). A project runner may take the slot itself (OCANNL's
+# tools/test-run.sh does, declaring --cpu from the backend it resolves), so no brief has to name
+# the wrapper and no worker can forget it -- but a worker that still wraps the runner would then
+# hold two slots for one batch, and four such workers on a four-slot box would each hold one and
+# wait for another until the deadline refused them all. So a held slot exports FLEET_SLOT_HELD
+# (`<box> <slot> <slots> <gpu|cpu>`, the last saying whether that slot may hold the GPU) to the
+# command, and an `execution slot` that finds it runs its command under the enclosing slot rather
+# than taking a second one: no flock, no registry read (the enclosing take made it), no second
+# sleep guard. The marker is judged, never trusted: it must name this box and a slot this spec
+# has, and that slot must be held NOW (a non-blocking flock on it must fail), so a marker exported
+# by hand, or outliving its batch, is said so and ignored and a slot is taken as usual. Whether
+# the slot may hold the GPU is judged from the current token spec, not from the marker's own word,
+# and a GPU batch inside a slot an enclosing batch took as --cpu is refused: the enclosing
+# declaration was wrong, and running would put a GPU batch past the tokens.
+#
 # The measurement check is a point-in-time gate read from the anchor's registry, exactly as
 # `execution dispatch` is: it refuses to start a batch beside an outstanding measurement, and
 # a measurement reserved afterwards is the registry's exclusivity to enforce, not this lock's.
@@ -2360,6 +2380,19 @@ if mode == "slot":
     directory, cap, tokens, cpu = sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == "cpu"
     wait, inhibitor = int(sys.argv[7]), sys.argv[8]
     why, command = "", sys.argv[9:]
+    prefix = "EXECUTION SLOT"
+elif mode == "nested":
+    # Judge an enclosing `execution slot`'s marker (THE NESTED SLOT, above) and print the verdict
+    # as one word on stdout: `inside` (run the command under it) or `take` (take a slot of one's
+    # own); a refusal prints its line and exits 1. It never runs the command, so no status the
+    # command could return is ever read as a verdict.
+    directory, cap, tokens, cpu = sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == "cpu"
+    marker, inhibitor, why, command = sys.argv[7], "", "", sys.argv[8:]
+    prefix = "EXECUTION SLOT"
+elif mode == "bare":
+    # The command alone, as `slot` runs it once the slot is held: the enclosing batch holds both
+    # the slot and the sleep guard.
+    inhibitor, why, command = "", "", sys.argv[3:]
     prefix = "EXECUTION SLOT"
 else:
     inhibitor, why, command = sys.argv[3], sys.argv[4], sys.argv[5:]
@@ -2447,6 +2480,51 @@ def run(why):
 if mode == "hold":
     run(why)
 
+if mode == "nested":
+    def not_here(reason):
+        sys.stderr.write("EXECUTION SLOT %s: FLEET_SLOT_HELD=%r does not cover this batch (%s); taking a slot\n"
+                         % (box, marker, reason))
+        print("take")
+        sys.exit(0)
+    fields = marker.split()
+    if len(fields) != 4 or not fields[1].isdigit():
+        not_here("malformed")
+    if fields[0] != box:
+        not_here("another box's")
+    index = int(fields[1])
+    if not 1 <= index <= cap:
+        not_here("no slot %d among this box's %d" % (index, cap))
+    # The slot must be held NOW: a marker copied into a shell by hand, or left behind in an
+    # environment that outlived its batch, names a slot nobody holds, and running under it would
+    # be running without one. A held flock refuses a second, non-blocking one on a new descriptor
+    # even from a descendant of its holder, so this cannot mistake a free slot for a held one.
+    try:
+        descriptor = os.open(os.path.join(directory, "slot.%d" % index), os.O_RDWR)
+    except OSError:
+        not_here("slot %d has no lock file" % index)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        pass  # held, as the marker says
+    else:
+        os.close(descriptor)
+        not_here("slot %d is not held" % index)
+    os.close(descriptor)
+    # Whether that slot may hold the GPU is judged from THIS spec, never from the marker's own
+    # word: the tokens are the first <tokens> slot files (THE GPU TOKENS, above).
+    if tokens and index > tokens and not cpu:
+        print("EXECUTION SLOT REFUSED %s: this batch runs inside slot %d of %d, which an enclosing batch"
+              " took as --cpu and is not a GPU token; a batch that holds the GPU must not run there"
+              " (the enclosing `execution slot` must not declare --cpu)" % (box, index, cap))
+        sys.exit(1)
+    sys.stderr.write("EXECUTION SLOT %s: inside slot %d of %d, held by an enclosing batch, for: %s\n"
+                     % (box, index, cap, " ".join(command)))
+    print("inside")
+    sys.exit(0)
+
+if mode == "bare":
+    run("")
+
 # The candidate slots, in the order this batch tries them. Where the box has fewer GPU tokens
 # than slots, the tokens ARE the first <tokens> slot files: a GPU batch may take only those, and a
 # CPU batch takes the highest free slot, so it leaves the GPU ones for last (THE GPU TOKENS, above).
@@ -2472,6 +2550,10 @@ while True:
         if tokens and index <= tokens:
             held += ", GPU token %d of %d" % (index, tokens)
         sys.stderr.write("EXECUTION SLOT %s: %s held for: %s\n" % (box, held, " ".join(command)))
+        # The marker a nested `execution slot` (and a runner that takes its own slot) reads:
+        # <box> <slot> <slots> <gpu|cpu>, the last saying whether this slot may hold the GPU.
+        os.environ["FLEET_SLOT_HELD"] = "%s %d %d %s" % (
+            box, index, cap, "gpu" if not tokens or index <= tokens else "cpu")
         run("%s %s: %s" % (box, held, " ".join(command)))
     if time.monotonic() >= deadline:
         if tokens and not cpu:
@@ -2489,9 +2571,10 @@ RUN_PY
 inhibitor_path() { type -P -- "$INHIBIT" 2>/dev/null || true; }
 
 cmd_execution_slot() {
-  local wait=600 kind="" box cap tokens listing rc measuring dir helper
+  local wait=600 kind="" box cap tokens listing rc measuring dir helper probe=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --probe) probe=1 ;;
       --wait)
         [ "$#" -ge 2 ] || die "execution slot: expected value for --wait"
         case "$2" in ''|*[!0-9]*) die "execution slot: --wait takes a whole number of seconds" ;; esac
@@ -2500,11 +2583,11 @@ cmd_execution_slot() {
         [ -z "$kind" ] || [ "$kind" = "$1" ] || die "execution slot: --cpu and --gpu are exclusive"
         kind="$1" ;;
       --) shift; break ;;
-      *) die "execution slot [--wait <seconds>] [--cpu|--gpu] -- <command> [args...]" ;;
+      *) die "execution slot [--wait <seconds>] [--cpu|--gpu] -- <command> [args...] | execution slot --probe" ;;
     esac
     shift
   done
-  [ "$#" -ge 1 ] || die "execution slot: a command to hold the slot around is required, after --"
+  [ -n "$probe" ] || [ "$#" -ge 1 ] || die "execution slot: a command to hold the slot around is required, after --"
   box="$LOCAL_BOX"
   [ -n "$box" ] || die "execution slot: this host has no fleet name; set FLEET_LOCAL_BOX (the slot is this box's own)"
   # An alias or a typo would lock under a name of its own and read measurements under another,
@@ -2515,6 +2598,32 @@ cmd_execution_slot() {
   tokens=$(box_gpu_tokens "$box") || { echo "EXECUTION SLOT REFUSED $box: $tokens"; exit 1; }
   # Where there are as many tokens as slots the tokens cannot bind, and every batch takes any slot.
   [ "$tokens" -lt "$cap" ] || tokens=0
+  # THE PROBE: what a slot here would be, without taking one -- no lock, no registry read. A
+  # project runner that takes the slot itself asks this first (ahrefs/ocannl#1004): an answer
+  # means this is a fleet box, and that this fleet-worker.sh runs a nested slot inside an
+  # enclosing one, so a worker's own wrapper around the runner cannot cost two slots. Anything
+  # else -- a host with no fleet name (exit 2), a box outside the roster (1), a version without
+  # the probe (2, usage) -- tells the runner to run as it would without a fleet.
+  if [ -n "$probe" ]; then
+    echo "EXECUTION SLOT PROBE $box $cap $([ "$tokens" -eq 0 ] && echo "$cap" || echo "$tokens")"
+    exit 0
+  fi
+  dir="$(local_path "$SLOT_STATE")/$box"
+  # THE NESTED SLOT: inside a batch that already holds one of this box's slots, a second take
+  # would hold two for one batch, and N enclosing batches could deadlock waiting on each other.
+  # The enclosing slot's marker, once judged, is the slot: no second flock and no registry read
+  # (it was read when the enclosing slot was taken). A marker that does not cover this batch is
+  # said so and ignored.
+  if [ -n "${FLEET_SLOT_HELD:-}" ]; then
+    local verdict
+    verdict=$(python3 -c "$(run_py)" nested "$box" "$dir" "$cap" "$tokens" "${kind#--}" "$FLEET_SLOT_HELD" "$@") || {
+      printf '%s\n' "$verdict"; exit 1; }
+    case $verdict in
+      inside) exec python3 -c "$(run_py)" bare "$box" "$@" ;;
+      take) unset FLEET_SLOT_HELD ;;
+      *) echo "EXECUTION SLOT REFUSED $box: the nested-slot check answered '$verdict'"; exit 1 ;;
+    esac
+  fi
   helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
   listing=$(execution_listing "$helper"); rc=$?
@@ -2525,7 +2634,6 @@ cmd_execution_slot() {
        | .request_id] | join(", ")' <<<"$listing") ||
     { echo "EXECUTION SLOT REFUSED $box: the anchor's registry did not parse"; exit 1; }
   [ -z "$measuring" ] || { echo "EXECUTION SLOT REFUSED $box: a measurement holds the box exclusively ($measuring)"; exit 1; }
-  dir="$(local_path "$SLOT_STATE")/$box"
   mkdir -p "$dir" || die "execution slot: cannot create the slot directory $dir"
   exec python3 -c "$(run_py)" slot "$box" "$dir" "$cap" "$tokens" "${kind#--}" "$wait" "$(inhibitor_path)" "$@"
 }
