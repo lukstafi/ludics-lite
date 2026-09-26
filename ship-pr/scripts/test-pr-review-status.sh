@@ -1147,10 +1147,12 @@ test_a_broken_jq_program_is_unknown_on_the_thread_read() {
 test_a_thread_is_named_by_its_full_width_id() {
   # databaseId is a 32-bit Int in the schema and review comment ids already run past 2^31, so the
   # BigInt string is the id the line names, and databaseId is only its fallback (review of #370).
+  # The first row is past 2^31, so review_thread serves its databaseId null, as GitHub does; the
+  # second drops fullDatabaseId, and so stays below 2^31, where databaseId still carries the id.
   approved_fixture
-  THREADS_JSON="[$(review_thread 4095735704 false | jq -c '.comments.nodes[0].databaseId = null'),$(review_thread 4095735696 false | jq -c 'del(.comments.nodes[0].fullDatabaseId)')]"
+  THREADS_JSON="[$(review_thread 4095735704 false),$(review_thread 2095735696 false | jq -c 'del(.comments.nodes[0].fullDatabaseId)')]"
   run_cmd_status
-  assert_contains "$CMD_OUT" "4095735704 by codex[bot] on a.sh, 4095735696 by codex[bot] on a.sh" \
+  assert_contains "$CMD_OUT" "4095735704 by codex[bot] on a.sh, 2095735696 by codex[bot] on a.sh" \
     "the full-width id first, and the Int one where it is all the row carries"
 }
 
