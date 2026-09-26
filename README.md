@@ -319,7 +319,9 @@ To iterate on a few cases of a `ship-pr/scripts/test-pr-review-*.sh` suite, name
 `SHIP_PR_TEST_CASES="test_a test_b" ship-pr/scripts/test-pr-review-watch.sh` runs only those, in
 the suite's order, and closes with `SUBSET: 2 of <m> cases` — a line a full run never prints. A
 name the suite does not run is refused, and so is any subset under `GITHUB_ACTIONS=true`, so CI
-always runs the whole suite; the full run before a push still stands.
+always runs the whole suite; the full run before a push still stands. Every case `run_tests` is
+given must already be a defined function, or the run is refused before any case: PR #415 defined a
+case inside another case's body, which a full run reached but a subset could never select.
 
 The scripts carry their own test suites (Python fixtures use `python3`; PowerShell fixtures run on Windows):
 
@@ -867,7 +869,11 @@ writing from that same wrong cwd.
 
 Four suites cover the other `base` — the one that answers "is the branch I am about to work off
 green" — over one shared fixture transport, `test-pr-review-base-lib.sh`. The first three were one
-900-line, 33-case file until ludics-lite#179, where "which suite failed" said only "base".
+900-line, 33-case file until ludics-lite#179, where "which suite failed" said only "base". Its
+`reset_fixture` clears the per-key answers by name pattern (`FIXTURE_KEYS`) and refuses a pattern
+that matches a name in scope before any case ran: in PR #419 the prefix `WORKFLOW_YAML_` matched
+`pr-review.sh`'s own `WORKFLOW_YAML_FILTER`, and the settle suite went red for a reason it does not
+test.
 
 `test-pr-review-base-red.sh` is the red REPORT: what the command says once the answer is no
 (ludics-lite#73). A red names the
