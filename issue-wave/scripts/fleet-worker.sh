@@ -908,8 +908,9 @@ base_gate() {
   # The ceiling is BASE_WAIT, derived from the grace and the poll interval pinned above.
   # The registry's integration records ride along only when there are any: they are a verdict
   # source for a tip no push run judges, and a repository that still runs on push never asks.
-  # An unread registry withholds the source, never the gate: without it such a tip reads as no
-  # verdict, which refuses dispatch on its own.
+  # An UNREAD registry refuses, though: a record there outranks the PR head's run, so reading
+  # none could hand a green head's verdict to a tip whose own integration run failed (review
+  # round 3). It is the anchor the lease read just came from, so this costs nothing but outages.
   args=(--repo "$target" base)
   [ -z "$branch" ] || args+=("$branch")
   args+=("--wait=$BASE_WAIT")
@@ -920,7 +921,8 @@ base_gate() {
       args+=(--integration-records "$records")
     fi
   else
-    echo "BASE NOTE: the execution registry could not be read, so no integration record is offered as a verdict source" >&2
+    echo "BASE REFUSED: $target ${branch:-default branch}: the execution registry could not be read, so whether an integration record judges its tip is unknown; dispatch blocked" >&2
+    return 1
   fi
   base_checker "$helper" "${args[@]}" >&2
   rc=$?

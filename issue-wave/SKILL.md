@@ -322,7 +322,7 @@ otherwise once that absence outlives the grace (ludics-lite#156). A run in fligh
 the tip keeps the refusal. A workflow that no longer runs on push (its file at the tip names no
 `push`; OCANNL's `ci` after ahrefs/ocannl#1057) never settles for its old push verdict: the gate
 reads the execution registry's integration records for the target - concluded records marked
-`"integration": true`, with a pass or fail at an exact SHA - and hands them to the
+`"integration": true`, with a pass or fail at an exact SHA; an unreadable registry refuses - and hands them to the
 checker, which takes the tip's verdict from a record at the tip first, else from the PR the tip
 is GitHub's clean merge of, when that workflow ran green on its head (roll-forward), and names
 the source it used.

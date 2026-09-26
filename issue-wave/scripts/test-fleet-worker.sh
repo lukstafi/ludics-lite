@@ -1347,6 +1347,13 @@ grep -Fq -- '--repo example/project base --wait=360 --integration-records ' "$BA
 [ "$(grep -c '^records: ' "$BASE_CALL_LOG")" = 1 ] && grep -q "^records: $ran	pass	int-a	" "$BASE_CALL_LOG" && ok "...only the marked integration pass/fail for that repository" || ko "wrong records offered: $(cat "$BASE_CALL_LOG")"
 # (With no record for the target, the call carries no flag at all: the "base gate" section's
 # exact call lines above pin that, since its gates ran before any record existed.)
+# An unreadable registry refuses the gate rather than withholding the source: a failed record
+# there would outrank a green PR head (review round 3 of #401).
+printf 'not json\n' > "$ISSUE_WAVE_STATE/executions/zz-broken.json"
+: > "$BASE_CALL_LOG"
+expect "an unreadable registry refuses the gate" 1 "the execution registry could not be read" -- "$FW" gate --target-repo example/project
+[ -s "$BASE_CALL_LOG" ] && ko "the checker ran over an unread registry: $(cat "$BASE_CALL_LOG")" || ok "...before the checker is asked anything"
+rm -f "$ISSUE_WAVE_STATE/executions/zz-broken.json"
 }
 
 section "refresh (execution-only boxes)" && {
