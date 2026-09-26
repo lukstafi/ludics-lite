@@ -6514,7 +6514,7 @@ cmd_base() {
   local records="" rsha rverdict rid rwhen pushless="" pushless_ids=() src_pending=0 src_none=0
   local trig_note interim="" fly tipfly=0 tipfly_ids=() tipfly_names="" uncov_nofly=0 pend_fly=0
   local interim_green="" interim_name="" interim_why="" pushless_name="" norun_ids=() rerounds=0
-  local hold_why moved want rid rstatus pushless_wids older_fly
+  local hold_why moved want rid rstatus pushless_wids older_fly snap_at
   while [ $# -gt 0 ]; do
     case "$1" in
     # Opt in to an INTERIM verdict for a tip whose own push run is still in flight (ludics-lite
@@ -6624,6 +6624,12 @@ cmd_base() {
         "the base's health is UNKNOWN, which is NOT 'green'."
     fi
     raw=""
+    # The clock the runs below are read against, taken BEFORE the first of them: the interim's
+    # newcomer hold ages the tip at this moment, never at a later one, so the API calls the round
+    # makes after its reads (the source's among them) cannot age a workflow out of its creation
+    # window on a snapshot that predates them (review round 6). Earlier than every read, so an age
+    # measured on it can only come out short, which holds longer, never less.
+    snap_at=$(date +%s)
     while IFS=$'\t' read -r wid wname; do
       [ -n "$wid" ] || continue
       is_advisory "$wname" && continue
@@ -6878,7 +6884,8 @@ cmd_base() {
     # is outside the fold, so the tip may have just ADDED it and its first run be on its way: each
     # must be shown unable to run on push (its file at the tip names no push trigger,
     # base_push_trigger), or the tip must have outlived that workflow's creation window
-    # (SHIP_PR_BASE_ABSENT_GRACE, from the tip's own run's creation, the covered break's clock).
+    # (SHIP_PR_BASE_ABSENT_GRACE, from the tip's own run's creation to when this round's runs were
+    # read — snap_at, not the moment the check runs).
     # And the tip's runs are read again AFTER the source, each by its id: one that finished
     # meanwhile is the tip's own verdict, and the interim is refused for it. The round is then
     # taken again AT ONCE, plain read and --wait alike, so the fold reads what finished before any
@@ -6920,7 +6927,8 @@ cmd_base() {
           fi
           [ "$BASE_TRIGGER" != pushless ] || continue
           tip_seen_at=$(awk -F'\t' -v t="$tip" '$5 == t && $6 > best { best=$6 } END { print best }' <<<"$allruns")
-          tip_age=$(age_of "$tip_seen_at")
+          tip_age=$(jq -rn --arg t "$tip_seen_at" --argjson at "$snap_at" \
+            'try (($at - ($t | fromdateiso8601)) | floor | if . < 0 then 0 else . end | tostring) catch "-"' 2>/dev/null)
           case "$tip_age" in
           '' | *[!0-9]*)
             hold_why="${want#*:} may run on push and has no run on $branch, and the tip's age could not be read"
