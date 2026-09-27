@@ -93,17 +93,29 @@ thread_rows() {
 
 # The body of a write is read off the raw arguments rather than out of the shared parser: the
 # parser consumes an option's value on purpose (a `-f body=…` must not become the endpoint), and
-# what these cases are about is exactly WHICH body reached WHICH thread.
+# what these cases are about is exactly WHICH body reached WHICH thread. The method is the one gh
+# would send, in every spelling it takes, and with none named it is gh's default: POST when a field
+# was added, GET otherwise (`gh api --help`) — so a case pins the request, not how it was typed.
 gh() {
-  local arg body="" query="" id method="" prev=""
+  local arg body="" query="" id method="" prev="" fields=""
   for arg in "$@"; do
     case "$arg" in
     body=*) body="${arg#body=}" ;;
     query=*) query="${arg#query=}" ;;
     esac
-    [ "$prev" != -X ] || method="$arg"
+    case "$prev" in
+    -X | --method) method="$arg" ;;
+    -f | -F | --field | --raw-field) fields=1 ;;
+    esac
+    case "$arg" in
+    --method=*) method="${arg#--method=}" ;;
+    -X?*) method="${arg#-X}" ;;
+    --field=* | --raw-field=* | -f?* | -F?*) fields=1 ;;
+    esac
     prev="$arg"
   done
+  [ -n "$method" ] || { [ -n "$fields" ] && method=POST; } || method=GET
+  method=$(printf '%s' "$method" | tr '[:lower:]' '[:upper:]')
   # `repo view` is not an `api` call, so it is answered before gh_fixture_parse, which refuses
   # everything else. It is answered at all because `repo_from_cwd` asks it first and the cwd cases
   # below need the inference armed; with CWD_REPO empty it fails the way gh does when GraphQL is
@@ -306,6 +318,7 @@ test_the_invocation_shape_is_a_usage_error() {
   run_cmd cmd_reply 900
   assert_eq "$RC" 2 "a reply with no body is an invocation error"
   assert_contains "$ERR" "got 2 argument(s)" "and the refusal counts what it got"
+  assert_eq "$(wc -l <"$REQUEST_LOG" | tr -d " ")" 0 "with nothing posted"
   reset_fixture
   run_cmd cmd_reply 900 "Fixed in round 3" "and the rest of the sentence"
   assert_eq "$RC" 2 "an unquoted body is caught rather than posted in part"
@@ -314,9 +327,11 @@ test_the_invocation_shape_is_a_usage_error() {
   run_cmd cmd_reply 900 "   "
   assert_eq "$RC" 2 "a blank body is nothing to post"
   assert_contains "$ERR" "the body is empty" "and says so"
+  assert_eq "$(wc -l <"$REQUEST_LOG" | tr -d " ")" 0 "with nothing posted"
   reset_fixture
   run_cmd cmd_resolve
   assert_eq "$RC" 2 "resolve wants its comment id too"
+  assert_eq "$(wc -l <"$REQUEST_LOG" | tr -d " ")" 0 "with nothing read or written"
   # The control: the shape they do want posts, so the refusals above are about the shape.
   reset_fixture
   run_cmd cmd_reply 900 "Fixed in round 3 (abc1234)."
@@ -720,21 +735,24 @@ test_body_invocation_errors_send_nothing() {
   run_cmd cmd_body "$TEST_ROOT/no-such-file"
   assert_eq "$RC" 2 "a missing file ($ERR)"
   assert_contains "$ERR" "is not a readable file" "is named as such"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
   reset_fixture
   run_cmd cmd_body -
   assert_eq "$RC" 2 "stdin ($ERR)"
   assert_contains "$ERR" "stdin" "is refused by name"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
   reset_fixture
   body_file $' \n\t\n'
   run_cmd cmd_body "$BODY_FILE"
   assert_eq "$RC" 2 "a blank file ($ERR)"
   assert_contains "$ERR" "is empty" "is nothing to set"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
   reset_fixture
   body_file "The body."
   run_cmd cmd_body "$BODY_FILE" "and more"
   assert_eq "$RC" 2 "a stray argument ($ERR)"
   assert_contains "$ERR" "got 3 argument(s)" "is counted"
-  assert_eq "$(cat "$REQUEST_LOG")" "" "none of them sent a request"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
   reset_fixture
   scratch_checkout "$TARGET_REPO"
   CWD_REPO="$TARGET_REPO"
@@ -764,10 +782,9 @@ test_comment_posts_to_the_issues_endpoint() {
   assert_eq "$(cat "$REQUEST_LOG")" "repos/$TARGET_REPO/issues/7/comments" \
     "one call, to the issues endpoint and not pulls/7/comments"
   assert_eq "$(cat "$BODIES/comment-methods")" POST "as a POST"
-  assert_contains "$(cat "$BODIES/comment")" $'- `guard` now fires — "quoted", $dollars.' \
-    "with the body as given"
-  assert_contains "$(cat "$BODIES/comment")" "Addressed by an automated coding agent" \
-    "and the marker every reply from this script carries"
+  assert_eq "$(cat "$BODIES/comment")" \
+    $'Addressed the summary:\n\n- `guard` now fires — "quoted", $dollars.\n\n_🤖 Addressed by an automated coding agent_' \
+    "the body exactly as given, then the marker every reply from this script carries"
   assert_eq "$OUT" "https://github.com/example/repo/pull/7#issuecomment-4242" \
     "its url is the whole of stdout"
 }
@@ -829,16 +846,18 @@ test_comment_invocation_errors_send_nothing() {
   run_cmd cmd_comment
   assert_eq "$RC" 2 "a comment with no body ($ERR)"
   assert_contains "$ERR" "got 1 argument(s)" "is counted"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
   reset_fixture
   run_cmd cmd_comment "Fixed in round 3" "and the rest of the sentence"
   assert_eq "$RC" 2 "an unquoted body is caught rather than posted in part ($ERR)"
   assert_contains "$ERR" "got 3 argument(s)" "is counted"
   assert_contains "$ERR" "The body is ONE argument" "and the refusal says how to fix it"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
   reset_fixture
   run_cmd cmd_comment $' \n\t '
   assert_eq "$RC" 2 "a blank body ($ERR)"
   assert_contains "$ERR" "the body is empty" "is nothing to post"
-  assert_eq "$(cat "$REQUEST_LOG")" "" "none of them sent a request"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
   reset_fixture
   scratch_checkout "$TARGET_REPO"
   CWD_REPO="$TARGET_REPO"
