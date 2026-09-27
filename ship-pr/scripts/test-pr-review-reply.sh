@@ -97,8 +97,16 @@ thread_rows() {
 # method are read in every spelling gh takes — a flag and its value as two arguments or one
 # (`-f k=v`, `-fk=v`, `--raw-field=k=v`; `-X M`, `-XM`, `--method=M`) — and with no method named it
 # is gh's default: POST when a field was added, GET otherwise (`gh api --help`). So a case pins the
-# request, not how it was typed. A payload sent some other way (`--input`) reads as no body at all,
-# which fails the case that looks for one rather than passing it.
+# request, not how it was typed.
+#
+# The boundary is spelling, not ENCODING, and it fails closed. How a body is carried is part of what
+# a command is responsible for, not a detail of how it was typed: `-f` sends a string as written,
+# `-F` converts types, expands placeholders and reads `@file`, and `--input` sends a raw JSON
+# document. `body` sends a file on purpose, and refuses stdin because a retry would find it spent.
+# So each branch decodes only the form its command uses: the PR PATCH reads `@file` and refuses an
+# inline body, and a comment's `@file` or `--input` payload is recorded as it arrives, which fails
+# the exact-body case. A change of encoding is a change these cases are meant to notice, never one
+# they pass in silence.
 gh() {
   local arg body="" query="" id method="" prev="" field fields=""
   for arg in "$@"; do
