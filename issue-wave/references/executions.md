@@ -160,7 +160,13 @@ checkouts. Record the checkout actually used; this does not introduce persistent
 worktrees, sync, scheduling or remote agent launch.
 
 `load` observes activity; reservations provide cooperative ownership. They do not stop
-unrelated users, applications or scheduled sweeps. Before timing experiments inspect external
+unrelated users or applications. The one scheduled sweep that reads them is OCANNL's daily
+`tools/sweep.sh`, which skips a unit whose box an outstanding `measurement` names (on any of the
+box's endpoints in `wake-lab.sh endpoint-map`) and defers to nothing else; it holds no reservation
+and takes no slot itself (ahrefs/ocannl#1097). That is a read before each unit, so it protects a
+measurement already reserved when a unit starts, not one reserved while a unit runs: nothing refuses
+that yet (#445), and the box's held lab lane lock in `wake-lab.sh status` is what shows a sweep
+there. Before timing experiments inspect external
 activity and wait when it compromises the measurement. Existing project runners continue to
 own process locks, time limits, cancellation and logs. This interface never starts or stops a
 process.

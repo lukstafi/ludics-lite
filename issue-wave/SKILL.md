@@ -728,4 +728,5 @@ execution - `execution run <reserve.json>` then `execution conclude --from-run <
 --request <id> --sha <sha>` - plus one standing reservation per worker for its own iteration
 batches, taken at launch and concluded at hand-back, with `execution slot` around each batch
 bounding the box's load. `load` is an observation, not ownership, and neither it nor these
-cooperative reservations stops unrelated processes or scheduled sweeps from using a machine.
+cooperative reservations stops unrelated processes from using a machine; OCANNL's daily sweep
+defers to an outstanding `measurement` reservation, and to nothing else (executions.md).
