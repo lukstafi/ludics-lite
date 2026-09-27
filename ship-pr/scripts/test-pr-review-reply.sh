@@ -104,26 +104,31 @@ thread_rows() {
 # a command is responsible for, not a detail of how it was typed: `-f` sends a string as written,
 # `-F` converts types, expands placeholders and reads `@file`, and `--input` sends a raw JSON
 # document. `body` sends a file on purpose, and refuses stdin because a retry would find it spent.
-# So each branch decodes only the form its command uses: the PR PATCH reads `@file` and refuses an
-# inline body, and a comment's `@file` or `--input` payload is recorded as it arrives, which fails
-# the exact-body case. A change of encoding is a change these cases are meant to notice, never one
-# they pass in silence.
+# So each branch decodes only the form its command uses, and refuses the other field kind: a reply
+# and a comment go out verbatim, so their body must be a RAW field (`-f`/`--raw-field`) — a typed
+# `-F body=…` would send `true`, `42` or `@notes.md` as something else — while the PR PATCH reads
+# `@file`, which only a typed field does (`-f body=@file` sends the literal string). A comment's
+# `--input` payload reads as no body, which fails the exact-body case. A change of encoding is a
+# change these cases are meant to notice, never one they pass in silence.
 gh() {
-  local arg body="" query="" id method="" prev="" field fields=""
+  local arg body="" body_kind="" query="" id method="" prev="" field kind fields=""
   for arg in "$@"; do
     field=""
     case "$prev" in
     -X | --method) method="$arg" ;;
-    -f | -F | --field | --raw-field) field="$arg" ;;
+    -f | --raw-field) field="$arg" kind=raw ;;
+    -F | --field) field="$arg" kind=typed ;;
     esac
     case "$arg" in
     --method=*) method="${arg#--method=}" ;;
     -X?*) method="${arg#-X}" method="${method#=}" ;;
-    --field=* | --raw-field=*) field="${arg#*=}" ;;
-    -f?* | -F?*) field="${arg#-?}" field="${field#=}" ;;
+    --raw-field=*) field="${arg#*=}" kind=raw ;;
+    --field=*) field="${arg#*=}" kind=typed ;;
+    -f?*) field="${arg#-f}" field="${field#=}" kind=raw ;;
+    -F?*) field="${arg#-F}" field="${field#=}" kind=typed ;;
     esac
     case "$field" in
-    body=*) body="${field#body=}" ;;
+    body=*) body="${field#body=}" body_kind="$kind" ;;
     query=*) query="${field#query=}" ;;
     esac
     [ -z "$field" ] || fields=1
@@ -145,6 +150,10 @@ gh() {
   "repos/$TARGET_REPO/pulls/7/comments/"*"/replies")
     id="${FIXTURE_ENDPOINT#repos/$TARGET_REPO/pulls/7/comments/}"
     id="${id%/replies}"
+    [ "$body_kind" = raw ] || {
+      printf 'a reply body sent as a %s field, not a raw one\n' "${body_kind:-missing}" >>"$UNEXPECTED"
+      return 1
+    }
     printf '%s' "$body" >>"$BODIES/$id"
     if [ "$FAIL_ID" != 0 ] && [ "$id" = "$FAIL_ID" ]; then
       echo "gh: $FAIL_MSG" >&2
@@ -158,6 +167,10 @@ gh() {
   # same endpoint read with GET would be a different call answering 200 without changing a thing.
   "repos/$TARGET_REPO/pulls/7")
     printf '%s\n' "$method" >>"$BODIES/pr-methods"
+    [ "$body_kind" = typed ] || {
+      printf 'the PR body sent as a %s field, which does not read @file\n' "${body_kind:-missing}" >>"$UNEXPECTED"
+      return 1
+    }
     case "$body" in
     @*) cat "${body#@}" >"$BODIES/pr-body" 2>/dev/null || return 1 ;;
     *) printf 'the body was not sent as a file: %s\n' "$body" >>"$UNEXPECTED" && return 1 ;;
@@ -175,6 +188,10 @@ gh() {
   # Attempts are counted off a log for the same reason as the PATCH above.
   "repos/$TARGET_REPO/issues/7/comments")
     printf '%s\n' "$method" >>"$BODIES/comment-methods"
+    [ "$body_kind" = raw ] || {
+      printf 'a comment body sent as a %s field, not a raw one\n' "${body_kind:-missing}" >>"$UNEXPECTED"
+      return 1
+    }
     printf '%s' "$body" >"$BODIES/comment"
     if [ "$(wc -l <"$BODIES/comment-methods")" -le "$COMMENT_FAILS" ]; then
       echo "gh: $FAIL_MSG" >&2
