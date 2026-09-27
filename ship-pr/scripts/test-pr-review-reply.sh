@@ -158,7 +158,10 @@ gh() {
   # `comment`: a plain PR comment, which on GitHub is an ISSUE comment. The pulls/7/comments
   # endpoint (inline review comments) is deliberately absent, so a call there lands in UNEXPECTED.
   # Attempts are counted off a log for the same reason as the PATCH above.
-  "repos/$TARGET_REPO/issues/7/comments")
+  # Any PR number, echoed into the url, so a case can tell which PR the comment reached.
+  "repos/$TARGET_REPO/issues/"*"/comments")
+    id="${FIXTURE_ENDPOINT#repos/$TARGET_REPO/issues/}"
+    id="${id%/comments}"
     printf '%s\n' "$method" >>"$BODIES/comment-methods"
     [ "$FIXTURE_BODY_KIND" = raw ] || {
       printf 'a comment body sent as a %s field, not a raw one\n' "${FIXTURE_BODY_KIND:-missing}" >>"$UNEXPECTED"
@@ -169,7 +172,8 @@ gh() {
       echo "gh: $FAIL_MSG" >&2
       return 1
     fi
-    gh_fixture_answer '{"html_url":"https://github.com/example/repo/pull/7#issuecomment-4242","body":"ignored"}'
+    gh_fixture_answer "$(jq -cn --arg n "$id" \
+      '{html_url:("https://github.com/example/repo/pull/" + $n + "#issuecomment-4242"),body:"ignored"}')"
     ;;
   graphql)
     case "$query" in
@@ -791,6 +795,16 @@ test_comment_posts_to_the_issues_endpoint() {
     "the body exactly as given, then the marker every reply from this script carries"
   assert_eq "$OUT" "https://github.com/example/repo/pull/7#issuecomment-4242" \
     "its url is the whole of stdout"
+  # The PR number is the one parsed from the argument, not the fixture's usual 7.
+  reset_fixture
+  set +e
+  (cmd_comment "$TARGET_REPO#8" "On PR 8.") >"$TEST_ROOT/out" 2>"$TEST_ROOT/err"
+  RC=$?
+  set -e
+  assert_eq "$RC" 0 "a comment on another PR posts ($(cat "$TEST_ROOT/err"))"
+  assert_eq "$(cat "$REQUEST_LOG")" "repos/$TARGET_REPO/issues/8/comments" "to that PR's endpoint"
+  assert_eq "$(cat "$TEST_ROOT/out")" "https://github.com/example/repo/pull/8#issuecomment-4242" \
+    "and prints that comment's url"
 }
 
 # A gateway refusal is a request no backend ran, so it is repeated; one that outlives the attempts

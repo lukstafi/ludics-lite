@@ -337,22 +337,47 @@ FIXTURE_BODY_KIND=""
 FIXTURE_QUERY=""
 FIXTURE_INPUT=""
 __fixture_field_keys=" "
+__fixture_field_leaves=" "
+__fixture_field_nodes=" "
 
-# gh_fixture_field <raw|typed> <key=value>: one -f/-F field. gh refuses a field with no `=`, and a
-# key given twice ("unexpected override existing field"), except an array key (`k[]=`), which
-# appends -- so the fixture refuses both too, rather than answering a request gh never sends.
+# gh_fixture_field <raw|typed> <key=value>: one -f/-F field, placed in the nested parameter map gh
+# builds from `k`, `k[a]` and `k[]` keys. gh refuses a key with no `=`, a value set twice at one
+# path ("unexpected override existing field"), and a path used as two shapes -- a scalar and then a
+# map or array under it, or the reverse, or a map where an array stands ("expected map type") --
+# and it appends for every `k[]`. So the fixture refuses the same, rather than answering a request
+# gh never sends (probed against gh 2.101.0). An array of maps (`k[][a]`) is a shape pr-review.sh
+# never sends and this model does not carry, so it is refused as unmodeled, not guessed at.
 gh_fixture_field() {
-  local key
-  case "$2" in *=*) ;; *) bail "fixture received field '$2' with no '=' in: gh $call -- gh refuses it and makes no request" ;; esac
+  local key rest path part shape
+  case "$2" in *=*) ;; *) bail "fixture received field '$2' with no '=' in: gh $call -- gh refuses it ('invalid key') and makes no request" ;; esac
   key="${2%%=*}"
-  case "$key" in
-  *"[]") ;;
-  *)
-    case "$__fixture_field_keys" in
-    *" $key "*) bail "fixture received field '$key' twice in: gh $call -- gh refuses the override and makes no request" ;;
+  case "$key" in *" "* | "" | "["*) bail "fixture cannot model the field key '$key' in: gh $call" ;; esac
+  case "$key" in *"[]"?*) bail "fixture does not model an array of maps ('$key') in: gh $call" ;; esac
+  path="${key%%\[*}"
+  rest="${key#"$path"}"
+  while [ -n "$rest" ]; do
+    part="${rest#\[}"
+    part="${part%%\]*}"
+    rest="${rest#\["$part"\]}"
+    if [ -z "$part" ]; then shape=array; else shape=map; fi
+    # `$path` must be a container of that shape: not a scalar, not the other kind of container.
+    case "$__fixture_field_leaves" in *" $path "*)
+      bail "fixture received field '$key' under the scalar '$path' in: gh $call -- gh refuses it ('expected $shape type') and makes no request" ;;
     esac
-    ;;
-  esac
+    case "$__fixture_field_nodes" in
+    *" $path:$shape "*) ;;
+    *" $path:"*) bail "fixture received field '$key' reshaping '$path' in: gh $call -- gh refuses it and makes no request" ;;
+    *) __fixture_field_nodes="$__fixture_field_nodes$path:$shape " ;;
+    esac
+    [ "$shape" = array ] && path="" && break
+    path="$path.$part"
+  done
+  if [ -n "$path" ]; then
+    case "$__fixture_field_leaves$__fixture_field_nodes" in *" $path "* | *" $path:"*)
+      bail "fixture received field '$key' over one already set in: gh $call -- gh refuses the override and makes no request" ;;
+    esac
+    __fixture_field_leaves="$__fixture_field_leaves$path "
+  fi
   __fixture_field_keys="$__fixture_field_keys$key "
   case "$key" in
   body) FIXTURE_BODY="${2#body=}" FIXTURE_BODY_KIND="$1" ;;
@@ -395,6 +420,9 @@ gh_fixture_parse() {
   FIXTURE_QUERY=""
   FIXTURE_INPUT=""
   __fixture_field_keys=" "
+  __fixture_field_leaves=" "
+  __fixture_field_nodes=" "
+  local method_named="" slurp="" outputs=" "
   [ "${1:-}" = api ] || bail "fixture received non-api gh call: $*"
   shift
   while [ $# -gt 0 ]; do
@@ -446,7 +474,8 @@ gh_fixture_parse() {
       positionals=$((positionals + 1))
       [ "$positionals" -eq 1 ] ||
         bail "fixture received $positionals positional arguments in: gh $call — gh api takes exactly one, the endpoint; the real CLI answers 'accepts 1 arg(s), received $positionals' and makes no request"
-      FIXTURE_ENDPOINT="$arg"
+      # gh sends `/repos/...` and `repos/...` as one request, so the leading slash is spelling.
+      FIXTURE_ENDPOINT="${arg#/}"
       continue
     fi
     # `--help` is a terminal ACTION, not part of a request: gh prints the help, exits 0 and calls
@@ -461,7 +490,11 @@ gh_fixture_parse() {
       # the table can express neither. Refuse it rather than pick a reading.
       [ -z "$inline" ] ||
         bail "fixture cannot parse '$arg' in: gh $call — $name takes no value, so this is either a boolean written as '$name=$value' or short options bundled as one word; write them apart"
-      [ "$name" != --paginate ] || FIXTURE_PAGINATE=1
+      case "$name" in
+      --paginate) FIXTURE_PAGINATE=1 ;;
+      --slurp) slurp=1 ;;
+      --silent | --verbose) outputs="$outputs$name " ;;
+      esac
       continue
       ;;
     esac
@@ -470,17 +503,39 @@ gh_fixture_parse() {
     *) bail "fixture does not know the gh api option $name in: gh $call — add it to FIXTURE_GH_BOOLS or FIXTURE_GH_VALUED, whichever it is; guessing is what put an option's value in the endpoint slot twice (ludics-lite#86, #102)" ;;
     esac
     if [ -z "$inline" ]; then
-      value="${1:-}"
+      [ $# -gt 0 ] ||
+        bail "fixture received $name with no value in: gh $call -- gh refuses it ('flag needs an argument') and makes no request"
+      value="$1"
       shift || true
     fi
     case "$name" in
-    --jq | -q) FIXTURE_FILTER="$value" ;;
-    -X | --method) FIXTURE_METHOD="$value" ;;
+    --jq | -q) FIXTURE_FILTER="$value" outputs="$outputs--jq " ;;
+    --template | -t) outputs="$outputs--template " ;;
+    -X | --method) FIXTURE_METHOD="$value" method_named=1 ;;
     -f | --raw-field) gh_fixture_field raw "$value" ;;
     -F | --field) gh_fixture_field typed "$value" ;;
     --input) FIXTURE_INPUT="$value" ;;
     esac
   done
+  # The combinations gh refuses before it sends anything (probed against gh 2.101.0). The output
+  # modes count once each, so a repeated --jq is gh's last-one-wins, not a conflict.
+  local mode modes=""
+  for mode in --jq --template --silent --verbose; do
+    case "$outputs" in *" $mode "*) modes="$modes $mode" ;; esac
+  done
+  case "$modes" in " "*" "*) bail "fixture received$modes together in: gh $call -- gh allows only one of them and makes no request" ;; esac
+  [ -z "$slurp" ] || [ -n "$FIXTURE_PAGINATE" ] ||
+    bail "fixture received --slurp without --paginate in: gh $call -- gh refuses it and makes no request"
+  [ -z "$slurp" ] || case "$modes" in *--jq* | *--template*)
+    bail "fixture received --slurp with$modes in: gh $call -- gh refuses it and makes no request" ;;
+  esac
+  [ -z "$FIXTURE_PAGINATE" ] || [ -z "$FIXTURE_INPUT" ] ||
+    bail "fixture received --paginate with --input in: gh $call -- gh refuses it and makes no request"
+  if [ -n "$FIXTURE_PAGINATE" ] && [ -n "$method_named" ] && [ "$FIXTURE_ENDPOINT" != graphql ]; then
+    case "$FIXTURE_METHOD" in [Gg][Ee][Tt]) ;; *)
+      bail "fixture received --paginate with -X $FIXTURE_METHOD in: gh $call -- gh refuses it for a non-GET request" ;;
+    esac
+  fi
   [ -z "$FIXTURE_INPUT" ] || FIXTURE_BODY_KIND=input
   if [ -z "$FIXTURE_METHOD" ]; then
     if [ "$__fixture_field_keys" != " " ] || [ -n "$FIXTURE_INPUT" ]; then FIXTURE_METHOD=POST; else FIXTURE_METHOD=GET; fi
