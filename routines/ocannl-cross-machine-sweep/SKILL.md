@@ -66,18 +66,36 @@ Carry on with the sweep either way — a drifted prompt still runs a useful swee
 Read the site file's `kind_of` for each GPU box, then wake each kind through its own path:
 
     . ~/.config/wake-lab/hosts.sh
+    # Outstanding measurement hosts, one per line; "?" when the registry could not be read.
+    # Read first and parsed second: a failed read piped into jq would parse as an empty registry.
+    if registry=$(~/ludics-lite/issue-wave/scripts/fleet-worker.sh execution list --active --compact) &&
+       measured=$(jq -r '.[] | select(.request.kind == "measurement") | .request.execution_host' \
+         <<<"$registry"); then :; else measured='?'; fi
+    under_measurement() { # box -- does an outstanding measurement name any of its endpoints?
+      ~/bin/wake-lab.sh endpoint-map | awk -v b="$1" -v m=" $(printf '%s' "$measured" | tr '\n' ' ') " \
+        '$1 == b { for (i = 2; i <= NF; i++) if (index(m, " " $i " ")) f = 1 } END { exit !f }'
+    }
     linux_boxes=(); wsl_boxes=()
     for box in rog minix; do
       case "$(kind_of "$box")" in
         linux) linux_boxes+=("$box") ;;
-        wsl) wsl_boxes+=("$box") ;;
+        wsl)
+          if [ "$measured" != '?' ] && under_measurement "$box"; then
+            echo "not restarting $box: an exclusive measurement holds it (the sweep will skip its units)"
+          else
+            wsl_boxes+=("$box")
+          fi
+          ;;
         *) echo "unknown kind for $box" >&2; exit 1 ;;
       esac
     done
+    # A registry that could not be read cannot clear any VM for destruction: start WSL, never restart.
+    restart=--restart-wsl
+    [ "$measured" != '?' ] || { restart=--wsl; echo "registry unread: WSL started, not restarted"; }
     [ ${#linux_boxes[@]} -eq 0 ] || ~/bin/wake-lab.sh --wait "${linux_boxes[@]}"
     held_file=$(mktemp "${TMPDIR:-/tmp}/ocannl-held-wsl.XXXXXX")
     if [ ${#wsl_boxes[@]} -gt 0 ]; then
-      wsl_out=$(~/bin/wake-lab.sh --wait --restart-wsl --hold "${wsl_boxes[@]}" 2>&1)
+      wsl_out=$(~/bin/wake-lab.sh --wait "$restart" --hold "${wsl_boxes[@]}" 2>&1)
       printf '%s\n' "$wsl_out"
       for box in "${wsl_boxes[@]}"; do
         grep -Fq "wsl holder observed on $box (" <<<"$wsl_out" && printf '%s\n' "$box" >>"$held_file"
@@ -85,6 +103,13 @@ Read the site file's `kind_of` for each GPU box, then wake each kind through its
     fi
     printf 'holder list: %s\n' "$held_file"
     ~/bin/wake-lab.sh status rog minix tuf
+
+`--restart-wsl` destroys the guest host-globally, and an exclusive `measurement` reservation holds
+no lab lock, so the registry is read first: a WSL box an outstanding measurement names (on any of
+its endpoints) is not restarted, since that would kill the measured VM before the sweep's own
+per-unit check could skip it. A registry that cannot be read clears nothing, so every WSL box is
+then only started (`--wsl`), never restarted: report `registry unread` as a finding. The fleet-side
+interlock that would make `restart-wsl` refuse such a box on its own is ludics-lite#445.
 
 tuf appears in `status` only, never in the wake commands: it is Wi-Fi only (a wake sent to it is
 refused as `no wired NIC`), and it is woken by its own RTC timer or by hand. Read its `os=`/`linux=`
