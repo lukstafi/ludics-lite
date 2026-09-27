@@ -337,47 +337,20 @@ FIXTURE_BODY_KIND=""
 FIXTURE_QUERY=""
 FIXTURE_INPUT=""
 __fixture_field_keys=" "
-__fixture_field_leaves=" "
-__fixture_field_nodes=" "
 
-# gh_fixture_field <raw|typed> <key=value>: one -f/-F field, placed in the nested parameter map gh
-# builds from `k`, `k[a]` and `k[]` keys. gh refuses a key with no `=`, a value set twice at one
-# path ("unexpected override existing field"), and a path used as two shapes -- a scalar and then a
-# map or array under it, or the reverse, or a map where an array stands ("expected map type") --
-# and it appends for every `k[]`. So the fixture refuses the same, rather than answering a request
-# gh never sends (probed against gh 2.101.0). An array of maps (`k[][a]`) is a shape pr-review.sh
-# never sends and this model does not carry, so it is refused as unmodeled, not guessed at.
+# gh_fixture_field <raw|typed> <key=value>: one -f/-F field. gh refuses a key with no `=` ("invalid
+# key") and one given twice ("unexpected override existing field"), so the fixture refuses both
+# rather than answering a request gh never sends. A bracketed key (`k[]`, `k[a]`, and the valueless
+# `k[]` gh reads as an empty array) builds gh's nested parameter map, which pr-review.sh never
+# sends and this parser does not model: it is refused as unmodeled -- the same answer as an option
+# missing from the table below, and taught the same way, when a call first needs one.
 gh_fixture_field() {
-  local key rest path part shape
+  local key="${2%%=*}"
+  case "$key" in *"["*) bail "fixture does not model the bracketed field key '$key' in: gh $call -- pr-review.sh sends none; teach gh_fixture_field gh's nested map when a call needs one" ;; esac
   case "$2" in *=*) ;; *) bail "fixture received field '$2' with no '=' in: gh $call -- gh refuses it ('invalid key') and makes no request" ;; esac
-  key="${2%%=*}"
-  case "$key" in *" "* | "" | "["*) bail "fixture cannot model the field key '$key' in: gh $call" ;; esac
-  case "$key" in *"[]"?*) bail "fixture does not model an array of maps ('$key') in: gh $call" ;; esac
-  path="${key%%\[*}"
-  rest="${key#"$path"}"
-  while [ -n "$rest" ]; do
-    part="${rest#\[}"
-    part="${part%%\]*}"
-    rest="${rest#\["$part"\]}"
-    if [ -z "$part" ]; then shape=array; else shape=map; fi
-    # `$path` must be a container of that shape: not a scalar, not the other kind of container.
-    case "$__fixture_field_leaves" in *" $path "*)
-      bail "fixture received field '$key' under the scalar '$path' in: gh $call -- gh refuses it ('expected $shape type') and makes no request" ;;
-    esac
-    case "$__fixture_field_nodes" in
-    *" $path:$shape "*) ;;
-    *" $path:"*) bail "fixture received field '$key' reshaping '$path' in: gh $call -- gh refuses it and makes no request" ;;
-    *) __fixture_field_nodes="$__fixture_field_nodes$path:$shape " ;;
-    esac
-    [ "$shape" = array ] && path="" && break
-    path="$path.$part"
-  done
-  if [ -n "$path" ]; then
-    case "$__fixture_field_leaves$__fixture_field_nodes" in *" $path "* | *" $path:"*)
-      bail "fixture received field '$key' over one already set in: gh $call -- gh refuses the override and makes no request" ;;
-    esac
-    __fixture_field_leaves="$__fixture_field_leaves$path "
-  fi
+  case "$__fixture_field_keys" in *" $key "*)
+    bail "fixture received field '$key' twice in: gh $call -- gh refuses the override and makes no request" ;;
+  esac
   __fixture_field_keys="$__fixture_field_keys$key "
   case "$key" in
   body) FIXTURE_BODY="${2#body=}" FIXTURE_BODY_KIND="$1" ;;
@@ -420,8 +393,6 @@ gh_fixture_parse() {
   FIXTURE_QUERY=""
   FIXTURE_INPUT=""
   __fixture_field_keys=" "
-  __fixture_field_leaves=" "
-  __fixture_field_nodes=" "
   local method_named="" slurp="" outputs=" "
   [ "${1:-}" = api ] || bail "fixture received non-api gh call: $*"
   shift
@@ -1539,9 +1510,12 @@ test_gh_fixture_parse_knows_gh_s_option_table() {
   gh_fixture_parse api --cache 5m --hostname github.com -t '{{.x}}' -p nebula repos/o/n/thing
   assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "nor a duration, a host, a template or a preview"
   # The booleans, which must not consume what follows them — in either position.
-  gh_fixture_parse api -i --silent --slurp --verbose --allow-escape-sequences repos/o/n/thing
+  # (Two calls, as gh allows one output mode per call and --slurp only under --paginate.)
+  gh_fixture_parse api -i --silent --allow-escape-sequences repos/o/n/thing
   assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "a boolean does not consume the endpoint"
-  gh_fixture_parse api repos/o/n/thing --silent --jq .a
+  gh_fixture_parse api --paginate --slurp --verbose repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "nor do --paginate, --slurp and --verbose"
+  gh_fixture_parse api repos/o/n/thing --include --jq .a
   assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "nor when it stands after the endpoint"
   assert_eq "$FIXTURE_FILTER" .a "and it does not swallow the option after it (#102 round 2)"
   # The filter in every spelling gh accepts: separated long and short, and each attached form.
@@ -1564,6 +1538,44 @@ test_gh_fixture_parse_knows_gh_s_option_table() {
   gh_fixture_parse api --jq .a -- repos/o/n/thing
   assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "options before -- still parse"
   assert_eq "$FIXTURE_FILTER" .a "and their values are still read"
+}
+
+# What a request carries, for a fixture asserting on a write: the method gh sends (its default
+# when none is named), the body and query fields, and the kind of field the body came as.
+test_gh_fixture_parse_records_the_request() {
+  gh_fixture_parse api repos/o/n/thing
+  assert_eq "$FIXTURE_METHOD" GET "no field and no method is gh's GET"
+  gh_fixture_parse api repos/o/n/thing -f body=hi
+  assert_eq "$FIXTURE_METHOD" POST "a field makes gh's default a POST"
+  assert_eq "$FIXTURE_BODY $FIXTURE_BODY_KIND" "hi raw" "-f is a raw field"
+  gh_fixture_parse api -Xpatch /repos/o/n/thing --field=body=@f.md -F query=q
+  assert_eq "$FIXTURE_METHOD" PATCH "a named method, uppercased as gh sends it"
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "and a leading slash is the same endpoint"
+  assert_eq "$FIXTURE_BODY $FIXTURE_BODY_KIND $FIXTURE_QUERY" "@f.md typed q" "-F is a typed field"
+  gh_fixture_parse api repos/o/n/thing --input b.json -f body=hi
+  assert_eq "$FIXTURE_BODY_KIND" input "--input replaces the body, whatever the fields say"
+  gh_fixture_parse api graphql --paginate -X POST -f query=q
+  assert_eq "$FIXTURE_METHOD" POST "graphql paginates over POST, as gh allows"
+  gh_fixture_parse api repos/o/n/thing --jq .a -q .b
+  assert_eq "$FIXTURE_FILTER" .b "a repeated filter is gh's last-one-wins, not a conflict"
+}
+
+# The calls gh itself refuses before sending anything (each probed against gh 2.101.0). Answering
+# one would be answering a request production cannot make.
+test_gh_fixture_parse_refuses_what_gh_refuses() {
+  local call out
+  for call in "repos/o/n/thing -X" "repos/o/n/thing --jq .a --silent" "repos/o/n/thing -t x --verbose" \
+    "repos/o/n/thing --slurp" "repos/o/n/thing --paginate --slurp --jq .a" \
+    "repos/o/n/thing --paginate --input b.json" "repos/o/n/thing --paginate -X POST" \
+    "repos/o/n/thing -f body=a -f body=b" "repos/o/n/thing -f nobody" \
+    "repos/o/n/thing -f body[]=a" "repos/o/n/thing -f items[]"; do
+    set +e
+    # shellcheck disable=SC2086 # one call, split into its words
+    out=$(gh_fixture_parse api $call 2>&1)
+    assert_eq "$?" 1 "'gh api $call' is refused"
+    set -e
+    assert_contains "$out" "gh api $call" "and the refusal quotes the call"
+  done
 }
 
 # What the table refuses. Every one of these was parsed, wrongly and in silence, by one of the
@@ -2315,6 +2327,8 @@ tests=(
   test_a_trap_that_stops_reaching_pr_review_sh_s_is_refused
   test_gh_fixture_parse
   test_gh_fixture_parse_knows_gh_s_option_table
+  test_gh_fixture_parse_records_the_request
+  test_gh_fixture_parse_refuses_what_gh_refuses
   test_gh_fixture_parse_refuses_what_it_cannot_parse
   test_the_jq_shim_breaks_the_program_it_is_pointed_at
   test_the_jq_shim_leaves_every_other_program_alone
