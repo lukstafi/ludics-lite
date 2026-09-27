@@ -95,7 +95,8 @@ thread_rows() {
 # parser consumes an option's value on purpose (a `-f body=…` must not become the endpoint), and
 # what these cases are about is exactly WHICH body reached WHICH thread. Both the fields and the
 # method are read in every spelling gh takes — a flag and its value as two arguments or one
-# (`-f k=v`, `-fk=v`, `--raw-field=k=v`; `-X M`, `-XM`, `--method=M`) — and with no method named it
+# (`-f k=v`, `-fk=v`, `-f=k=v`, `--raw-field=k=v`; `-X M`, `-XM`, `-X=M`, `--method=M`; pflag
+# takes a short option's attached value with or without an `=`) — and with no method named it
 # is gh's default: POST when a field was added, GET otherwise (`gh api --help`). So a case pins the
 # request, not how it was typed.
 #
@@ -117,9 +118,9 @@ gh() {
     esac
     case "$arg" in
     --method=*) method="${arg#--method=}" ;;
-    -X?*) method="${arg#-X}" ;;
+    -X?*) method="${arg#-X}" method="${method#=}" ;;
     --field=* | --raw-field=*) field="${arg#*=}" ;;
-    -f?* | -F?*) field="${arg#-?}" ;;
+    -f?* | -F?*) field="${arg#-?}" field="${field#=}" ;;
     esac
     case "$field" in
     body=*) body="${field#body=}" ;;
