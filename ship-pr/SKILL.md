@@ -79,7 +79,7 @@ It reads the build signal and never the 👍 (where a go-ahead is needed, CI run
 waits). It keeps the build gate the direct push skips; the push stays the lighter act where the user names that instead.
 
 The `gh` recipes below are packaged as `~/.claude/skills/ship-pr/scripts/pr-review.sh` (`poll`,
-`watch`, `status`, `checks`, `merge`, `base`, `reply`, `resolve`, `comment`, `retry`), which
+`watch`, `status`, `checks`, `merge`, `base`, `reply`, `resolve`, `comment`, `body`, `retry`), which
 encodes the traps in code — including the pagination that a PR running to many rounds walks into —
 so prefer it to hand-rolled API calls. The commands below spell that path out in full because they
 are run from a repo checkout, not from the skill directory.
@@ -533,6 +533,17 @@ prints the comment's URL), 1 the API rejected it, 2 your invocation is wrong —
 **one** argument, so quote it — and 3 nothing was posted, or nothing is known, so re-read the PR
 before repeating it.
 
+**Edit the PR body with `body`, not `gh pr edit`.** Rewriting the description — the review-record
+paragraph of a close-out, a closing sentence `merge` warned about — goes through REST from a file:
+
+```bash
+~/.claude/skills/ship-pr/scripts/pr-review.sh body <owner>/<repo>#<pr> <file>
+```
+
+`gh pr edit --body-file` rides GraphQL and fails on `lukstafi/ocannl-staging` with the classic
+Projects deprecation error whatever is edited. `body` replaces the description whole, under the
+same write policy and exits as `comment`, except that an ambiguous exit 3 is safe to repeat as is.
+
 If a finding changes what a measurement *means* (not just how it is run), redo the affected
 measurement rather than editing the prose around it; and if a result rests on a premise the
 review invalidated, say so in the artifact instead of quietly dropping it.
@@ -731,8 +742,8 @@ the reviewer never 👍'd defensible:
   merge the reviewer never 👍'd does not get the path-filter allowance the ordinary gate gives;
 - every thread is answered with its disposition — fixed / removed / deferred / rebutted — and
   resolved;
-- the PR body carries a review-record paragraph: how many rounds, each rebuttal in one line, and
-  — when anything was deferred — the follow-up issue's number;
+- the PR body carries a review-record paragraph (edited in with `body`, above): how many rounds,
+  each rebuttal in one line, and — when anything was deferred — the follow-up issue's number;
 - the residuals, when there are any, are filed as one issue before the merge rather than after
   it. A round rebutted in full leaves none, and no empty issue is filed to say so.
 
