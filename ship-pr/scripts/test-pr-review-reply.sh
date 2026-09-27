@@ -93,25 +93,31 @@ thread_rows() {
 
 # The body of a write is read off the raw arguments rather than out of the shared parser: the
 # parser consumes an option's value on purpose (a `-f body=…` must not become the endpoint), and
-# what these cases are about is exactly WHICH body reached WHICH thread. The method is the one gh
-# would send, in every spelling it takes, and with none named it is gh's default: POST when a field
-# was added, GET otherwise (`gh api --help`) — so a case pins the request, not how it was typed.
+# what these cases are about is exactly WHICH body reached WHICH thread. Both the fields and the
+# method are read in every spelling gh takes — a flag and its value as two arguments or one
+# (`-f k=v`, `-fk=v`, `--raw-field=k=v`; `-X M`, `-XM`, `--method=M`) — and with no method named it
+# is gh's default: POST when a field was added, GET otherwise (`gh api --help`). So a case pins the
+# request, not how it was typed. A payload sent some other way (`--input`) reads as no body at all,
+# which fails the case that looks for one rather than passing it.
 gh() {
-  local arg body="" query="" id method="" prev="" fields=""
+  local arg body="" query="" id method="" prev="" field fields=""
   for arg in "$@"; do
-    case "$arg" in
-    body=*) body="${arg#body=}" ;;
-    query=*) query="${arg#query=}" ;;
-    esac
+    field=""
     case "$prev" in
     -X | --method) method="$arg" ;;
-    -f | -F | --field | --raw-field) fields=1 ;;
+    -f | -F | --field | --raw-field) field="$arg" ;;
     esac
     case "$arg" in
     --method=*) method="${arg#--method=}" ;;
     -X?*) method="${arg#-X}" ;;
-    --field=* | --raw-field=* | -f?* | -F?*) fields=1 ;;
+    --field=* | --raw-field=*) field="${arg#*=}" ;;
+    -f?* | -F?*) field="${arg#-?}" ;;
     esac
+    case "$field" in
+    body=*) body="${field#body=}" ;;
+    query=*) query="${field#query=}" ;;
+    esac
+    [ -z "$field" ] || fields=1
     prev="$arg"
   done
   [ -n "$method" ] || { [ -n "$fields" ] && method=POST; } || method=GET
