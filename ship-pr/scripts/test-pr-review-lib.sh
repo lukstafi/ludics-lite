@@ -323,6 +323,42 @@ test_tmpdir() {
 FIXTURE_ENDPOINT=""
 FIXTURE_FILTER=""
 FIXTURE_PAGINATE=""
+# What the request CARRIES, as gh would build it, for a fixture that asserts on a write: the
+# effective method (gh's default when none is named: POST once a field or --input is added, GET
+# otherwise), and the `body` and `query` fields with the kind of field each came as -- `raw` for
+# -f/--raw-field, sent as written; `typed` for -F/--field, which converts values and reads `@file`
+# -- or `input` when --input replaces the body with a file and moves the fields to the query
+# string. Read off the parse below, never off a second scan of the arguments: a second scan
+# re-reads an option's consumed VALUE as an option of its own (`-X --method=POST` is a method of
+# "--method=POST" to gh, which refuses it, and POST to a naive scan).
+FIXTURE_METHOD=""
+FIXTURE_BODY=""
+FIXTURE_BODY_KIND=""
+FIXTURE_QUERY=""
+FIXTURE_INPUT=""
+__fixture_field_keys=" "
+
+# gh_fixture_field <raw|typed> <key=value>: one -f/-F field. gh refuses a field with no `=`, and a
+# key given twice ("unexpected override existing field"), except an array key (`k[]=`), which
+# appends -- so the fixture refuses both too, rather than answering a request gh never sends.
+gh_fixture_field() {
+  local key
+  case "$2" in *=*) ;; *) bail "fixture received field '$2' with no '=' in: gh $call -- gh refuses it and makes no request" ;; esac
+  key="${2%%=*}"
+  case "$key" in
+  *"[]") ;;
+  *)
+    case "$__fixture_field_keys" in
+    *" $key "*) bail "fixture received field '$key' twice in: gh $call -- gh refuses the override and makes no request" ;;
+    esac
+    ;;
+  esac
+  __fixture_field_keys="$__fixture_field_keys$key "
+  case "$key" in
+  body) FIXTURE_BODY="${2#body=}" FIXTURE_BODY_KIND="$1" ;;
+  query) FIXTURE_QUERY="${2#query=}" ;;
+  esac
+}
 
 # gh api's OPTION TABLE, as of gh 2.99.0: every option the command accepts AS PART OF A REQUEST,
 # split by whether it carries a value, each spelling its own entry and surrounded by spaces so a
@@ -353,6 +389,12 @@ gh_fixture_parse() {
   FIXTURE_ENDPOINT=""
   FIXTURE_FILTER=""
   FIXTURE_PAGINATE=""
+  FIXTURE_METHOD=""
+  FIXTURE_BODY=""
+  FIXTURE_BODY_KIND=""
+  FIXTURE_QUERY=""
+  FIXTURE_INPUT=""
+  __fixture_field_keys=" "
   [ "${1:-}" = api ] || bail "fixture received non-api gh call: $*"
   shift
   while [ $# -gt 0 ]; do
@@ -433,8 +475,17 @@ gh_fixture_parse() {
     fi
     case "$name" in
     --jq | -q) FIXTURE_FILTER="$value" ;;
+    -X | --method) FIXTURE_METHOD="$value" ;;
+    -f | --raw-field) gh_fixture_field raw "$value" ;;
+    -F | --field) gh_fixture_field typed "$value" ;;
+    --input) FIXTURE_INPUT="$value" ;;
     esac
   done
+  [ -z "$FIXTURE_INPUT" ] || FIXTURE_BODY_KIND=input
+  if [ -z "$FIXTURE_METHOD" ]; then
+    if [ "$__fixture_field_keys" != " " ] || [ -n "$FIXTURE_INPUT" ]; then FIXTURE_METHOD=POST; else FIXTURE_METHOD=GET; fi
+  fi
+  FIXTURE_METHOD=$(printf '%s' "$FIXTURE_METHOD" | tr '[:lower:]' '[:upper:]')
   # The endpoint's SHAPE, the last thing between a mis-parse and a fixture dispatching on it.
   # Every endpoint pr-review.sh addresses is `graphql` or a REST path, so anything else is a word
   # the caller never wrote as one — a `POST` the table failed to consume, or no endpoint at all —

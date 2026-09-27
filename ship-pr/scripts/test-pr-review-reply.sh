@@ -91,51 +91,22 @@ thread_rows() {
   printf '[%s]\n' "${nodes#,}"
 }
 
-# The body of a write is read off the raw arguments rather than out of the shared parser: the
-# parser consumes an option's value on purpose (a `-f body=…` must not become the endpoint), and
-# what these cases are about is exactly WHICH body reached WHICH thread. Both the fields and the
-# method are read in every spelling gh takes — a flag and its value as two arguments or one
-# (`-f k=v`, `-fk=v`, `-f=k=v`, `--raw-field=k=v`; `-X M`, `-XM`, `-X=M`, `--method=M`; pflag
-# takes a short option's attached value with or without an `=`) — and with no method named it
-# is gh's default: POST when a field was added, GET otherwise (`gh api --help`). So a case pins the
-# request, not how it was typed.
+# What a write sent is read off the shared parser (FIXTURE_METHOD, FIXTURE_BODY and its kind):
+# it takes every spelling pflag does and consumes each option's value, so a case pins the request,
+# not how it was typed, and a call gh itself refuses -- a repeated field, a field with no `=` --
+# is refused there rather than answered.
 #
 # The boundary is spelling, not ENCODING, and it fails closed. How a body is carried is part of what
 # a command is responsible for, not a detail of how it was typed: `-f` sends a string as written,
-# `-F` converts types, expands placeholders and reads `@file`, and `--input` sends a raw JSON
-# document. `body` sends a file on purpose, and refuses stdin because a retry would find it spent.
-# So each branch decodes only the form its command uses, and refuses the other field kind: a reply
-# and a comment go out verbatim, so their body must be a RAW field (`-f`/`--raw-field`) — a typed
-# `-F body=…` would send `true`, `42` or `@notes.md` as something else — while the PR PATCH reads
-# `@file`, which only a typed field does (`-f body=@file` sends the literal string). A comment's
-# `--input` payload reads as no body, which fails the exact-body case. A change of encoding is a
-# change these cases are meant to notice, never one they pass in silence.
+# `-F` converts types, expands placeholders and reads `@file`, and `--input` replaces the body with
+# a file. `body` sends a file on purpose, and refuses stdin because a retry would find it spent.
+# So each branch requires the kind its command's encoding needs and refuses the others: a reply
+# and a comment go out verbatim, so their body must be a RAW field -- a typed `-F body=…` would send
+# `true`, `42` or `@notes.md` as something else -- while the PR PATCH reads `@file`, which only a
+# typed field does (`-f body=@file` sends the literal string). A change of encoding is a change
+# these cases are meant to notice, never one they pass in silence.
 gh() {
-  local arg body="" body_kind="" query="" id method="" prev="" field kind fields=""
-  for arg in "$@"; do
-    field=""
-    case "$prev" in
-    -X | --method) method="$arg" ;;
-    -f | --raw-field) field="$arg" kind=raw ;;
-    -F | --field) field="$arg" kind=typed ;;
-    esac
-    case "$arg" in
-    --method=*) method="${arg#--method=}" ;;
-    -X?*) method="${arg#-X}" method="${method#=}" ;;
-    --raw-field=*) field="${arg#*=}" kind=raw ;;
-    --field=*) field="${arg#*=}" kind=typed ;;
-    -f?*) field="${arg#-f}" field="${field#=}" kind=raw ;;
-    -F?*) field="${arg#-F}" field="${field#=}" kind=typed ;;
-    esac
-    case "$field" in
-    body=*) body="${field#body=}" body_kind="$kind" ;;
-    query=*) query="${field#query=}" ;;
-    esac
-    [ -z "$field" ] || fields=1
-    prev="$arg"
-  done
-  [ -n "$method" ] || { [ -n "$fields" ] && method=POST; } || method=GET
-  method=$(printf '%s' "$method" | tr '[:lower:]' '[:upper:]')
+  local body query id method
   # `repo view` is not an `api` call, so it is answered before gh_fixture_parse, which refuses
   # everything else. It is answered at all because `repo_from_cwd` asks it first and the cwd cases
   # below need the inference armed; with CWD_REPO empty it fails the way gh does when GraphQL is
@@ -146,12 +117,13 @@ gh() {
     return 0
   fi
   gh_fixture_parse "$@"
+  body="$FIXTURE_BODY" query="$FIXTURE_QUERY" method="$FIXTURE_METHOD"
   case "$FIXTURE_ENDPOINT" in
   "repos/$TARGET_REPO/pulls/7/comments/"*"/replies")
     id="${FIXTURE_ENDPOINT#repos/$TARGET_REPO/pulls/7/comments/}"
     id="${id%/replies}"
-    [ "$body_kind" = raw ] || {
-      printf 'a reply body sent as a %s field, not a raw one\n' "${body_kind:-missing}" >>"$UNEXPECTED"
+    [ "$FIXTURE_BODY_KIND" = raw ] || {
+      printf 'a reply body sent as a %s field, not a raw one\n' "${FIXTURE_BODY_KIND:-missing}" >>"$UNEXPECTED"
       return 1
     }
     printf '%s' "$body" >>"$BODIES/$id"
@@ -167,8 +139,8 @@ gh() {
   # same endpoint read with GET would be a different call answering 200 without changing a thing.
   "repos/$TARGET_REPO/pulls/7")
     printf '%s\n' "$method" >>"$BODIES/pr-methods"
-    [ "$body_kind" = typed ] || {
-      printf 'the PR body sent as a %s field, which does not read @file\n' "${body_kind:-missing}" >>"$UNEXPECTED"
+    [ "$FIXTURE_BODY_KIND" = typed ] || {
+      printf 'the PR body sent as a %s field, which does not read @file\n' "${FIXTURE_BODY_KIND:-missing}" >>"$UNEXPECTED"
       return 1
     }
     case "$body" in
@@ -188,8 +160,8 @@ gh() {
   # Attempts are counted off a log for the same reason as the PATCH above.
   "repos/$TARGET_REPO/issues/7/comments")
     printf '%s\n' "$method" >>"$BODIES/comment-methods"
-    [ "$body_kind" = raw ] || {
-      printf 'a comment body sent as a %s field, not a raw one\n' "${body_kind:-missing}" >>"$UNEXPECTED"
+    [ "$FIXTURE_BODY_KIND" = raw ] || {
+      printf 'a comment body sent as a %s field, not a raw one\n' "${FIXTURE_BODY_KIND:-missing}" >>"$UNEXPECTED"
       return 1
     }
     printf '%s' "$body" >"$BODIES/comment"
