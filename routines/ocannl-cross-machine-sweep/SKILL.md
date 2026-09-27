@@ -256,7 +256,18 @@ refuses to destroy a box either of whose locks is held, so the 2026-09-16 collis
 silently. Two consequences to know. A unit recorded as `skip (box <box> reserved by ...)` is a box
 ANOTHER run's lane held for longer than the sweep was willing to wait: nothing was tested and
 nothing failed, so report it the way `skip (unreachable)` is reported, naming the holder. (A
-holder line reading `wake-lab --hold` there is the regression above, not another run.) And a dxg
+holder line reading `wake-lab --hold` there is the regression above, not another run.) A unit
+recorded as `skip (box <box> under an exclusive measurement: <request_id> (<state> on <host>))` is
+a box the fleet's execution registry has under an outstanding `measurement` reservation: before
+each unit the lane asks `fleet-worker.sh execution list --active --compact`, and it defers rather
+than contaminate someone's timings (ahrefs/ocannl#1097). Report it like the lock skip, naming the
+request id, and do not wake, kick or rerun for it: the box is busy on purpose. Correctness
+reservations never cause it. The header's `reservations:` line says whether the registry was
+consulted; `NOT CONSULTED` on this Mac means no fleet-worker.sh answered its probe, which is a
+setup finding for step 5, and a unit line `WARNING -- the fleet's execution registry could not be
+read` means that unit ran without the check. The header's `lab locks:` line is the startup check
+that the sweep and `wake-lab.sh` still agree on the lane-lock contract (ahrefs/ocannl#1025):
+`agree with ...` needs nothing; `NOT CHECKED` is a finding. And a dxg
 window whose verdict is
 `vm-replaced` means the guest was destroyed and recreated while that unit ran — the unit's result
 says nothing about the code, it gets the serial rerun automatically, and the thing to investigate
@@ -369,7 +380,10 @@ unusable (a `sweep: ...` line on stderr says why) and stopped BEFORE testing any
 machine. A startup exit 2 is therefore a whole day of non-coverage for all five backends, not a test result:
 read the `sweep:` line first, and relaunch only if it names something this routine can correct
 from the instructions above (a missing box ID, a stale or incomplete extraction, "another sweep is
-running"). Do not retry the same command hoping for a different answer — the 2026-09-05 run burned
+running"). `sweep: the lab lock contract with <wake-lab.sh> is broken: ...` is NOT one of those:
+the sweep's `lab_box_of`/`lab_dest_of` and wake-lab's `ENDPOINT_MAP` or lock directory disagree,
+so lanes would reserve locks no destroyer checks. It is a code fix on whichever side moved (the
+line names what), and it is notify-worthy. Do not retry the same command hoping for a different answer — the 2026-09-05 run burned
 a second attempt on that before recognizing the failure. Whatever the outcome of the single
 corrected relaunch, a startup exit 2 is reported in step 5 as non-coverage and notified in step 6.
 
