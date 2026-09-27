@@ -483,6 +483,9 @@ main() {
     if ! git -C "$HOME/ocannl-staging" remote get-url upstream >/dev/null 2>&1; then
       git -C "$HOME/ocannl-staging" remote add upstream https://github.com/ahrefs/ocannl.git
     fi
+    # The aarch64 -march columns of OCANNL's test/operations/cc_march_census compile emitted C with
+    # an aarch64 cross gcc found on PATH; without one they skip on every box (ahrefs/ocannl#621).
+    sudo apt-get install -y gcc-aarch64-linux-gnu
     opam init --bare --no-setup -y
     if ! opam switch list --short | grep -Fxq fleet-5.5.1; then
       opam switch create fleet-5.5.1 ocaml-base-compiler.5.5.1 -y

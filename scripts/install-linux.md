@@ -74,6 +74,13 @@ does not tell us the target Unix username.
 - Optional `~/ocannl-staging`, upstream `ahrefs/ocannl`, a named OCaml **5.5.1**
   switch, test/dev dependencies from the project opam files, and a build.
   The switch becomes the opam default; existing switches are retained.
+  The stage also installs `gcc-aarch64-linux-gnu`: the cross compiler behind the aarch64 columns
+  of OCANNL's `cc_march_census`, the only check of gcc's aarch64 fp16 builtin typing
+  (ahrefs/ocannl#621). Without it those columns skip on every box. Check with
+  `aarch64-linux-gnu-gcc --version`. rog and minix got a rootless copy instead:
+  `apt-get download` + `dpkg-deb -x` into `~/.local/opt/aarch64-linux-gnu-gcc-15`, reached by a
+  wrapper at `~/.local/bin/aarch64-linux-gnu-gcc` that puts the extracted binutils' private
+  libraries on `LD_LIBRARY_PATH`, since they carry no RPATH.
 - Optional NVIDIA or AMD GPU setup below, and `cudajit` / `hipjit` bindings.
 
 Existing repositories are checked for the expected origin and left untouched.
