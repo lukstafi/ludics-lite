@@ -323,6 +323,40 @@ test_tmpdir() {
 FIXTURE_ENDPOINT=""
 FIXTURE_FILTER=""
 FIXTURE_PAGINATE=""
+# What the request CARRIES, as gh would build it, for a fixture that asserts on a write: the
+# effective method (gh's default when none is named: POST once a field or --input is added, GET
+# otherwise), and the `body` and `query` fields with the kind of field each came as -- `raw` for
+# -f/--raw-field, sent as written; `typed` for -F/--field, which converts values and reads `@file`
+# -- or `input` when --input replaces the body with a file and moves the fields to the query
+# string. Read off the parse below, never off a second scan of the arguments: a second scan
+# re-reads an option's consumed VALUE as an option of its own (`-X --method=POST` is a method of
+# "--method=POST" to gh, which refuses it, and POST to a naive scan).
+FIXTURE_METHOD=""
+FIXTURE_BODY=""
+FIXTURE_BODY_KIND=""
+FIXTURE_QUERY=""
+FIXTURE_INPUT=""
+__fixture_field_keys=" "
+
+# gh_fixture_field <raw|typed> <key=value>: one -f/-F field. gh refuses a key with no `=` ("invalid
+# key") and one given twice ("unexpected override existing field"), so the fixture refuses both
+# rather than answering a request gh never sends. A bracketed key (`k[]`, `k[a]`, and the valueless
+# `k[]` gh reads as an empty array) builds gh's nested parameter map, which pr-review.sh never
+# sends and this parser does not model: it is refused as unmodeled -- the same answer as an option
+# missing from the table below, and taught the same way, when a call first needs one.
+gh_fixture_field() {
+  local key="${2%%=*}"
+  case "$key" in *"["*) bail "fixture does not model the bracketed field key '$key' in: gh $call -- pr-review.sh sends none; teach gh_fixture_field gh's nested map when a call needs one" ;; esac
+  case "$2" in *=*) ;; *) bail "fixture received field '$2' with no '=' in: gh $call -- gh refuses it ('invalid key') and makes no request" ;; esac
+  case "$__fixture_field_keys" in *" $key "*)
+    bail "fixture received field '$key' twice in: gh $call -- gh refuses the override and makes no request" ;;
+  esac
+  __fixture_field_keys="$__fixture_field_keys$key "
+  case "$key" in
+  body) FIXTURE_BODY="${2#body=}" FIXTURE_BODY_KIND="$1" ;;
+  query) FIXTURE_QUERY="${2#query=}" ;;
+  esac
+}
 
 # gh api's OPTION TABLE, as of gh 2.99.0: every option the command accepts AS PART OF A REQUEST,
 # split by whether it carries a value, each spelling its own entry and surrounded by spaces so a
@@ -353,6 +387,13 @@ gh_fixture_parse() {
   FIXTURE_ENDPOINT=""
   FIXTURE_FILTER=""
   FIXTURE_PAGINATE=""
+  FIXTURE_METHOD=""
+  FIXTURE_BODY=""
+  FIXTURE_BODY_KIND=""
+  FIXTURE_QUERY=""
+  FIXTURE_INPUT=""
+  __fixture_field_keys=" "
+  local method_named="" slurp="" outputs=" "
   [ "${1:-}" = api ] || bail "fixture received non-api gh call: $*"
   shift
   while [ $# -gt 0 ]; do
@@ -404,7 +445,8 @@ gh_fixture_parse() {
       positionals=$((positionals + 1))
       [ "$positionals" -eq 1 ] ||
         bail "fixture received $positionals positional arguments in: gh $call — gh api takes exactly one, the endpoint; the real CLI answers 'accepts 1 arg(s), received $positionals' and makes no request"
-      FIXTURE_ENDPOINT="$arg"
+      # gh sends `/repos/...` and `repos/...` as one request, so the leading slash is spelling.
+      FIXTURE_ENDPOINT="${arg#/}"
       continue
     fi
     # `--help` is a terminal ACTION, not part of a request: gh prints the help, exits 0 and calls
@@ -419,7 +461,11 @@ gh_fixture_parse() {
       # the table can express neither. Refuse it rather than pick a reading.
       [ -z "$inline" ] ||
         bail "fixture cannot parse '$arg' in: gh $call — $name takes no value, so this is either a boolean written as '$name=$value' or short options bundled as one word; write them apart"
-      [ "$name" != --paginate ] || FIXTURE_PAGINATE=1
+      case "$name" in
+      --paginate) FIXTURE_PAGINATE=1 ;;
+      --slurp) slurp=1 ;;
+      --silent | --verbose) outputs="$outputs$name " ;;
+      esac
       continue
       ;;
     esac
@@ -428,13 +474,44 @@ gh_fixture_parse() {
     *) bail "fixture does not know the gh api option $name in: gh $call — add it to FIXTURE_GH_BOOLS or FIXTURE_GH_VALUED, whichever it is; guessing is what put an option's value in the endpoint slot twice (ludics-lite#86, #102)" ;;
     esac
     if [ -z "$inline" ]; then
-      value="${1:-}"
+      [ $# -gt 0 ] ||
+        bail "fixture received $name with no value in: gh $call -- gh refuses it ('flag needs an argument') and makes no request"
+      value="$1"
       shift || true
     fi
     case "$name" in
-    --jq | -q) FIXTURE_FILTER="$value" ;;
+    --jq | -q) FIXTURE_FILTER="$value" outputs="$outputs--jq " ;;
+    --template | -t) outputs="$outputs--template " ;;
+    -X | --method) FIXTURE_METHOD="$value" method_named=1 ;;
+    -f | --raw-field) gh_fixture_field raw "$value" ;;
+    -F | --field) gh_fixture_field typed "$value" ;;
+    --input) FIXTURE_INPUT="$value" ;;
     esac
   done
+  # The combinations gh refuses before it sends anything (probed against gh 2.101.0). The output
+  # modes count once each, so a repeated --jq is gh's last-one-wins, not a conflict.
+  local mode modes=""
+  for mode in --jq --template --silent --verbose; do
+    case "$outputs" in *" $mode "*) modes="$modes $mode" ;; esac
+  done
+  case "$modes" in " "*" "*) bail "fixture received$modes together in: gh $call -- gh allows only one of them and makes no request" ;; esac
+  [ -z "$slurp" ] || [ -n "$FIXTURE_PAGINATE" ] ||
+    bail "fixture received --slurp without --paginate in: gh $call -- gh refuses it and makes no request"
+  [ -z "$slurp" ] || case "$modes" in *--jq* | *--template*)
+    bail "fixture received --slurp with$modes in: gh $call -- gh refuses it and makes no request" ;;
+  esac
+  [ -z "$FIXTURE_PAGINATE" ] || [ -z "$FIXTURE_INPUT" ] ||
+    bail "fixture received --paginate with --input in: gh $call -- gh refuses it and makes no request"
+  if [ -n "$FIXTURE_PAGINATE" ] && [ -n "$method_named" ] && [ "$FIXTURE_ENDPOINT" != graphql ]; then
+    case "$FIXTURE_METHOD" in [Gg][Ee][Tt]) ;; *)
+      bail "fixture received --paginate with -X $FIXTURE_METHOD in: gh $call -- gh refuses it for a non-GET request" ;;
+    esac
+  fi
+  [ -z "$FIXTURE_INPUT" ] || FIXTURE_BODY_KIND=input
+  if [ -z "$FIXTURE_METHOD" ]; then
+    if [ "$__fixture_field_keys" != " " ] || [ -n "$FIXTURE_INPUT" ]; then FIXTURE_METHOD=POST; else FIXTURE_METHOD=GET; fi
+  fi
+  FIXTURE_METHOD=$(printf '%s' "$FIXTURE_METHOD" | tr '[:lower:]' '[:upper:]')
   # The endpoint's SHAPE, the last thing between a mis-parse and a fixture dispatching on it.
   # Every endpoint pr-review.sh addresses is `graphql` or a REST path, so anything else is a word
   # the caller never wrote as one — a `POST` the table failed to consume, or no endpoint at all —
@@ -1433,9 +1510,12 @@ test_gh_fixture_parse_knows_gh_s_option_table() {
   gh_fixture_parse api --cache 5m --hostname github.com -t '{{.x}}' -p nebula repos/o/n/thing
   assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "nor a duration, a host, a template or a preview"
   # The booleans, which must not consume what follows them — in either position.
-  gh_fixture_parse api -i --silent --slurp --verbose --allow-escape-sequences repos/o/n/thing
+  # (Two calls, as gh allows one output mode per call and --slurp only under --paginate.)
+  gh_fixture_parse api -i --silent --allow-escape-sequences repos/o/n/thing
   assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "a boolean does not consume the endpoint"
-  gh_fixture_parse api repos/o/n/thing --silent --jq .a
+  gh_fixture_parse api --paginate --slurp --verbose repos/o/n/thing
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "nor do --paginate, --slurp and --verbose"
+  gh_fixture_parse api repos/o/n/thing --include --jq .a
   assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "nor when it stands after the endpoint"
   assert_eq "$FIXTURE_FILTER" .a "and it does not swallow the option after it (#102 round 2)"
   # The filter in every spelling gh accepts: separated long and short, and each attached form.
@@ -1458,6 +1538,44 @@ test_gh_fixture_parse_knows_gh_s_option_table() {
   gh_fixture_parse api --jq .a -- repos/o/n/thing
   assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "options before -- still parse"
   assert_eq "$FIXTURE_FILTER" .a "and their values are still read"
+}
+
+# What a request carries, for a fixture asserting on a write: the method gh sends (its default
+# when none is named), the body and query fields, and the kind of field the body came as.
+test_gh_fixture_parse_records_the_request() {
+  gh_fixture_parse api repos/o/n/thing
+  assert_eq "$FIXTURE_METHOD" GET "no field and no method is gh's GET"
+  gh_fixture_parse api repos/o/n/thing -f body=hi
+  assert_eq "$FIXTURE_METHOD" POST "a field makes gh's default a POST"
+  assert_eq "$FIXTURE_BODY $FIXTURE_BODY_KIND" "hi raw" "-f is a raw field"
+  gh_fixture_parse api -Xpatch /repos/o/n/thing --field=body=@f.md -F query=q
+  assert_eq "$FIXTURE_METHOD" PATCH "a named method, uppercased as gh sends it"
+  assert_eq "$FIXTURE_ENDPOINT" repos/o/n/thing "and a leading slash is the same endpoint"
+  assert_eq "$FIXTURE_BODY $FIXTURE_BODY_KIND $FIXTURE_QUERY" "@f.md typed q" "-F is a typed field"
+  gh_fixture_parse api repos/o/n/thing --input b.json -f body=hi
+  assert_eq "$FIXTURE_BODY_KIND" input "--input replaces the body, whatever the fields say"
+  gh_fixture_parse api graphql --paginate -X POST -f query=q
+  assert_eq "$FIXTURE_METHOD" POST "graphql paginates over POST, as gh allows"
+  gh_fixture_parse api repos/o/n/thing --jq .a -q .b
+  assert_eq "$FIXTURE_FILTER" .b "a repeated filter is gh's last-one-wins, not a conflict"
+}
+
+# The calls gh itself refuses before sending anything (each probed against gh 2.101.0). Answering
+# one would be answering a request production cannot make.
+test_gh_fixture_parse_refuses_what_gh_refuses() {
+  local call out
+  for call in "repos/o/n/thing -X" "repos/o/n/thing --jq .a --silent" "repos/o/n/thing -t x --verbose" \
+    "repos/o/n/thing --slurp" "repos/o/n/thing --paginate --slurp --jq .a" \
+    "repos/o/n/thing --paginate --input b.json" "repos/o/n/thing --paginate -X POST" \
+    "repos/o/n/thing -f body=a -f body=b" "repos/o/n/thing -f nobody" \
+    "repos/o/n/thing -f body[]=a" "repos/o/n/thing -f items[]"; do
+    set +e
+    # shellcheck disable=SC2086 # one call, split into its words
+    out=$(gh_fixture_parse api $call 2>&1)
+    assert_eq "$?" 1 "'gh api $call' is refused"
+    set -e
+    assert_contains "$out" "gh api $call" "and the refusal quotes the call"
+  done
 }
 
 # What the table refuses. Every one of these was parsed, wrongly and in silence, by one of the
@@ -2209,6 +2327,8 @@ tests=(
   test_a_trap_that_stops_reaching_pr_review_sh_s_is_refused
   test_gh_fixture_parse
   test_gh_fixture_parse_knows_gh_s_option_table
+  test_gh_fixture_parse_records_the_request
+  test_gh_fixture_parse_refuses_what_gh_refuses
   test_gh_fixture_parse_refuses_what_it_cannot_parse
   test_the_jq_shim_breaks_the_program_it_is_pointed_at
   test_the_jq_shim_leaves_every_other_program_alone

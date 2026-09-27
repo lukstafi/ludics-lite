@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fixture tests for the WRITING commands, `reply` and `resolve`, the folded id token they take
-# (ludics-lite#76), and `body`, which replaces a PR's description over REST. Until this suite they had no fixture coverage at all: every other
+# (ludics-lite#76), `body`, which replaces a PR's description over REST, and `comment`, which posts
+# a plain PR comment. Until this suite they had no fixture coverage at all: every other
 # suite drives a read path, and the writes were exercised only against the live API, where a
 # double-posted reply is not something a test may risk.
 #
@@ -62,6 +63,8 @@ THREADS_FIXTURE_PAGE=""
 THREADS_FIXTURE_TOTAL=""
 # How many PATCHes of the PR body fail (with FAIL_MSG) before one succeeds.
 BODY_FAILS=0
+# How many POSTs of a plain PR comment fail (with FAIL_MSG) before one succeeds.
+COMMENT_FAILS=0
 
 reset_fixture() {
   : >"$REQUEST_LOG"
@@ -76,6 +79,7 @@ reset_fixture() {
   THREADS_FIXTURE_PAGE=""
   THREADS_FIXTURE_TOTAL=""
   BODY_FAILS=0
+  COMMENT_FAILS=0
 }
 
 # THREADS as review_thread rows (which serve `databaseId` null past 2^31, as GitHub does).
@@ -87,19 +91,22 @@ thread_rows() {
   printf '[%s]\n' "${nodes#,}"
 }
 
-# The body of a write is read off the raw arguments rather than out of the shared parser: the
-# parser consumes an option's value on purpose (a `-f body=…` must not become the endpoint), and
-# what these cases are about is exactly WHICH body reached WHICH thread.
+# What a write sent is read off the shared parser (FIXTURE_METHOD, FIXTURE_BODY and its kind):
+# it takes every spelling pflag does and consumes each option's value, so a case pins the request,
+# not how it was typed, and a call gh itself refuses -- a repeated field, a field with no `=` --
+# is refused there rather than answered.
+#
+# The boundary is spelling, not ENCODING, and it fails closed. How a body is carried is part of what
+# a command is responsible for, not a detail of how it was typed: `-f` sends a string as written,
+# `-F` converts types, expands placeholders and reads `@file`, and `--input` replaces the body with
+# a file. `body` sends a file on purpose, and refuses stdin because a retry would find it spent.
+# So each branch requires the kind its command's encoding needs and refuses the others: a reply
+# and a comment go out verbatim, so their body must be a RAW field -- a typed `-F body=…` would send
+# `true`, `42` or `@notes.md` as something else -- while the PR PATCH reads `@file`, which only a
+# typed field does (`-f body=@file` sends the literal string). A change of encoding is a change
+# these cases are meant to notice, never one they pass in silence.
 gh() {
-  local arg body="" query="" id method="" prev=""
-  for arg in "$@"; do
-    case "$arg" in
-    body=*) body="${arg#body=}" ;;
-    query=*) query="${arg#query=}" ;;
-    esac
-    [ "$prev" != -X ] || method="$arg"
-    prev="$arg"
-  done
+  local body query id method
   # `repo view` is not an `api` call, so it is answered before gh_fixture_parse, which refuses
   # everything else. It is answered at all because `repo_from_cwd` asks it first and the cwd cases
   # below need the inference armed; with CWD_REPO empty it fails the way gh does when GraphQL is
@@ -110,10 +117,15 @@ gh() {
     return 0
   fi
   gh_fixture_parse "$@"
+  body="$FIXTURE_BODY" query="$FIXTURE_QUERY" method="$FIXTURE_METHOD"
   case "$FIXTURE_ENDPOINT" in
   "repos/$TARGET_REPO/pulls/7/comments/"*"/replies")
     id="${FIXTURE_ENDPOINT#repos/$TARGET_REPO/pulls/7/comments/}"
     id="${id%/replies}"
+    [ "$FIXTURE_BODY_KIND" = raw ] || {
+      printf 'a reply body sent as a %s field, not a raw one\n' "${FIXTURE_BODY_KIND:-missing}" >>"$UNEXPECTED"
+      return 1
+    }
     printf '%s' "$body" >>"$BODIES/$id"
     if [ "$FAIL_ID" != 0 ] && [ "$id" = "$FAIL_ID" ]; then
       echo "gh: $FAIL_MSG" >&2
@@ -127,6 +139,10 @@ gh() {
   # same endpoint read with GET would be a different call answering 200 without changing a thing.
   "repos/$TARGET_REPO/pulls/7")
     printf '%s\n' "$method" >>"$BODIES/pr-methods"
+    [ "$FIXTURE_BODY_KIND" = typed ] || {
+      printf 'the PR body sent as a %s field, which does not read @file\n' "${FIXTURE_BODY_KIND:-missing}" >>"$UNEXPECTED"
+      return 1
+    }
     case "$body" in
     @*) cat "${body#@}" >"$BODIES/pr-body" 2>/dev/null || return 1 ;;
     *) printf 'the body was not sent as a file: %s\n' "$body" >>"$UNEXPECTED" && return 1 ;;
@@ -138,6 +154,27 @@ gh() {
       return 1
     fi
     gh_fixture_answer '{"html_url":"https://github.com/example/repo/pull/7","body":"ignored"}'
+    ;;
+  # `comment`: a plain PR comment, which on GitHub is an ISSUE comment. The pulls/7/comments
+  # endpoint (inline review comments) is deliberately absent, so a call there lands in UNEXPECTED.
+  # Attempts are counted off a log for the same reason as the PATCH above.
+  # Any repository and PR number, echoed into the url, so a case can tell which PR the comment
+  # reached.
+  repos/*/*/issues/*/comments)
+    id="${FIXTURE_ENDPOINT#repos/}"
+    id="${id%/comments}"
+    printf '%s\n' "$method" >>"$BODIES/comment-methods"
+    [ "$FIXTURE_BODY_KIND" = raw ] || {
+      printf 'a comment body sent as a %s field, not a raw one\n' "${FIXTURE_BODY_KIND:-missing}" >>"$UNEXPECTED"
+      return 1
+    }
+    printf '%s' "$body" >"$BODIES/comment"
+    if [ "$(wc -l <"$BODIES/comment-methods")" -le "$COMMENT_FAILS" ]; then
+      echo "gh: $FAIL_MSG" >&2
+      return 1
+    fi
+    gh_fixture_answer "$(jq -cn --arg p "${id%/issues/*}/pull/${id##*/}" \
+      '{html_url:("https://github.com/" + $p + "#issuecomment-4242"),body:"ignored"}')"
     ;;
   graphql)
     case "$query" in
@@ -290,6 +327,7 @@ test_the_invocation_shape_is_a_usage_error() {
   run_cmd cmd_reply 900
   assert_eq "$RC" 2 "a reply with no body is an invocation error"
   assert_contains "$ERR" "got 2 argument(s)" "and the refusal counts what it got"
+  assert_eq "$(wc -l <"$REQUEST_LOG" | tr -d " ")" 0 "with nothing posted"
   reset_fixture
   run_cmd cmd_reply 900 "Fixed in round 3" "and the rest of the sentence"
   assert_eq "$RC" 2 "an unquoted body is caught rather than posted in part"
@@ -298,9 +336,11 @@ test_the_invocation_shape_is_a_usage_error() {
   run_cmd cmd_reply 900 "   "
   assert_eq "$RC" 2 "a blank body is nothing to post"
   assert_contains "$ERR" "the body is empty" "and says so"
+  assert_eq "$(wc -l <"$REQUEST_LOG" | tr -d " ")" 0 "with nothing posted"
   reset_fixture
   run_cmd cmd_resolve
   assert_eq "$RC" 2 "resolve wants its comment id too"
+  assert_eq "$(wc -l <"$REQUEST_LOG" | tr -d " ")" 0 "with nothing read or written"
   # The control: the shape they do want posts, so the refusals above are about the shape.
   reset_fixture
   run_cmd cmd_reply 900 "Fixed in round 3 (abc1234)."
@@ -704,21 +744,24 @@ test_body_invocation_errors_send_nothing() {
   run_cmd cmd_body "$TEST_ROOT/no-such-file"
   assert_eq "$RC" 2 "a missing file ($ERR)"
   assert_contains "$ERR" "is not a readable file" "is named as such"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
   reset_fixture
   run_cmd cmd_body -
   assert_eq "$RC" 2 "stdin ($ERR)"
   assert_contains "$ERR" "stdin" "is refused by name"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
   reset_fixture
   body_file $' \n\t\n'
   run_cmd cmd_body "$BODY_FILE"
   assert_eq "$RC" 2 "a blank file ($ERR)"
   assert_contains "$ERR" "is empty" "is nothing to set"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
   reset_fixture
   body_file "The body."
   run_cmd cmd_body "$BODY_FILE" "and more"
   assert_eq "$RC" 2 "a stray argument ($ERR)"
   assert_contains "$ERR" "got 3 argument(s)" "is counted"
-  assert_eq "$(cat "$REQUEST_LOG")" "" "none of them sent a request"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
   reset_fixture
   scratch_checkout "$TARGET_REPO"
   CWD_REPO="$TARGET_REPO"
@@ -730,6 +773,125 @@ test_body_invocation_errors_send_nothing() {
   run_cmd_from_cwd cmd_body "$TARGET_REPO#7" "$BODY_FILE"
   assert_eq "$RC" 0 "a named repo is enough from anywhere ($ERR)"
   assert_eq "$(cat "$BODIES/pr-body")" "The body." "and the body lands"
+}
+
+# --- `comment`: a plain PR comment, over REST -----------------------------------------------------
+
+# A review's summary body has no thread to answer in, so its answer is a PR comment — posted to the
+# ISSUES endpoint, since pulls/<n>/comments takes inline review comments, which need a commit and a
+# path. It carries the same marker as `reply`.
+comment_attempts() {
+  wc -l <"$BODIES/comment-methods" 2>/dev/null | tr -d ' ' || echo 0
+}
+
+test_comment_posts_to_the_issues_endpoint() {
+  reset_fixture
+  run_cmd cmd_comment $'Addressed the summary:\n\n- `guard` now fires — "quoted", $dollars.'
+  assert_eq "$RC" 0 "the comment is posted ($ERR)"
+  assert_eq "$(cat "$REQUEST_LOG")" "repos/$TARGET_REPO/issues/7/comments" \
+    "one call, to the issues endpoint and not pulls/7/comments"
+  assert_eq "$(cat "$BODIES/comment-methods")" POST "as a POST"
+  assert_eq "$(cat "$BODIES/comment")" \
+    $'Addressed the summary:\n\n- `guard` now fires — "quoted", $dollars.\n\n_🤖 Addressed by an automated coding agent_' \
+    "the body exactly as given, then the marker every reply from this script carries"
+  assert_eq "$OUT" "https://github.com/example/repo/pull/7#issuecomment-4242" \
+    "its url is the whole of stdout"
+  # The repository and PR number are the ones parsed from the argument, not the fixture's usual
+  # example/repo#7.
+  reset_fixture
+  set +e
+  (cmd_comment "other-owner/other-name#8" "On PR 8.") >"$TEST_ROOT/out" 2>"$TEST_ROOT/err"
+  RC=$?
+  set -e
+  assert_eq "$RC" 0 "a comment on another repo's PR posts ($(cat "$TEST_ROOT/err"))"
+  assert_eq "$(cat "$REQUEST_LOG")" "repos/other-owner/other-name/issues/8/comments" \
+    "to that repo's endpoint for that PR"
+  assert_eq "$(cat "$TEST_ROOT/out")" "https://github.com/other-owner/other-name/pull/8#issuecomment-4242" \
+    "and prints that comment's url"
+}
+
+# A gateway refusal is a request no backend ran, so it is repeated; one that outlives the attempts
+# is transport, and the refusal may say nothing was posted.
+test_comment_retries_a_gateway_refusal() {
+  reset_fixture
+  retune API_ATTEMPTS=3
+  COMMENT_FAILS=2
+  FAIL_MSG="503 No server is currently available to service your request"
+  run_cmd cmd_comment "The comment."
+  assert_eq "$RC" 0 "the third attempt lands ($ERR)"
+  assert_eq "$(comment_attempts)" 3 "after two refused ones"
+  assert_contains "$ERR" "retrying" "each retry is announced on stderr"
+  assert_eq "$OUT" "https://github.com/example/repo/pull/7#issuecomment-4242" \
+    "and the url of the one that landed is printed"
+  reset_fixture
+  retune API_ATTEMPTS=2
+  COMMENT_FAILS=5
+  FAIL_MSG="503 No server is currently available to service your request"
+  run_cmd cmd_comment "The comment."
+  assert_eq "$RC" 3 "a gateway refusal that outlives the attempts is transport"
+  assert_contains "$ERR" "on all 2 attempts" "the refusal counts the attempts"
+  assert_contains "$ERR" "Nothing was posted, so retry" "and nothing was posted"
+  assert_eq "$(comment_attempts)" 2 "after every attempt was spent"
+}
+
+# The other two exits, kept apart as on every write: a 4xx is the API answering (1, not retried),
+# anything else ambiguous (3, not retried under the write policy). Unlike `body`, an ambiguous
+# comment is NOT safe to repeat — a POST adds a comment — so the message sends the caller to read
+# the PR first, and never says nothing was posted.
+test_comment_exits_stay_apart() {
+  reset_fixture
+  retune API_ATTEMPTS=3
+  COMMENT_FAILS=1
+  FAIL_MSG="Not Found (HTTP 404)"
+  run_cmd cmd_comment "The comment."
+  assert_eq "$RC" 1 "a 404 is the API answering about that PR"
+  assert_contains "$ERR" "was REJECTED, not dropped" "and the message says so"
+  assert_eq "$(comment_attempts)" 1 "a rejection is not retried"
+  reset_fixture
+  retune API_ATTEMPTS=3
+  COMMENT_FAILS=1
+  FAIL_MSG="Internal Server Error (HTTP 500)"
+  run_cmd cmd_comment "The comment."
+  assert_eq "$RC" 3 "an ambiguous write is transport, not a verdict"
+  assert_contains "$ERR" "failed AMBIGUOUSLY" "and is reported as ambiguous, never as rejected"
+  assert_contains "$ERR" "will not post it twice" "it says it will not post twice"
+  assert_not_contains "$ERR" "Nothing was posted" "a claim a 500 does not support"
+  assert_eq "$(comment_attempts)" 1 "and the write policy does not repeat it itself"
+}
+
+# Every shape that is not `comment <pr> <body>` is an invocation error, before any request: a
+# missing body, an unquoted one (which would otherwise post its first word), a blank one, and a
+# PR with no repo named.
+test_comment_invocation_errors_send_nothing() {
+  reset_fixture
+  run_cmd cmd_comment
+  assert_eq "$RC" 2 "a comment with no body ($ERR)"
+  assert_contains "$ERR" "got 1 argument(s)" "is counted"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
+  reset_fixture
+  run_cmd cmd_comment "Fixed in round 3" "and the rest of the sentence"
+  assert_eq "$RC" 2 "an unquoted body is caught rather than posted in part ($ERR)"
+  assert_contains "$ERR" "got 3 argument(s)" "is counted"
+  assert_contains "$ERR" "The body is ONE argument" "and the refusal says how to fix it"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
+  reset_fixture
+  run_cmd cmd_comment $' \n\t '
+  assert_eq "$RC" 2 "a blank body ($ERR)"
+  assert_contains "$ERR" "the body is empty" "is nothing to post"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and sends no request"
+  reset_fixture
+  scratch_checkout "$TARGET_REPO"
+  CWD_REPO="$TARGET_REPO"
+  run_cmd_from_cwd cmd_comment 7 "The comment."
+  assert_eq "$RC" 2 "a bare PR number is refused here too, even from a checkout of the repo ($ERR)"
+  assert_contains "$ERR" "owner/name#7" "the refusal spells the form that names the repo"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and nothing is posted on the strength of the cwd"
+  # The control: the same comment, with the repo named, goes through from that same checkout.
+  reset_fixture
+  run_cmd_from_cwd cmd_comment "$TARGET_REPO#7" "The comment."
+  assert_eq "$RC" 0 "a named repo is enough from anywhere ($ERR)"
+  assert_contains "$(cat "$BODIES/comment")" "The comment." "and the comment lands"
+  assert_eq "$(cat "$REQUEST_LOG")" "repos/$TARGET_REPO/issues/7/comments" "on the PR it names"
 }
 
 tests=(
@@ -758,6 +920,10 @@ tests=(
   test_body_retries_a_gateway_refusal
   test_body_exits_stay_apart
   test_body_invocation_errors_send_nothing
+  test_comment_posts_to_the_issues_endpoint
+  test_comment_retries_a_gateway_refusal
+  test_comment_exits_stay_apart
+  test_comment_invocation_errors_send_nothing
 )
 
 run_tests "${tests[@]}"
