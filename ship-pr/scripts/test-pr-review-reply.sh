@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Fixture tests for the two WRITING commands, `reply` and `resolve`, and for the folded id token
-# they take (ludics-lite#76). Until this suite they had no fixture coverage at all: every other
+# Fixture tests for the WRITING commands, `reply` and `resolve`, the folded id token they take
+# (ludics-lite#76), and `body`, which replaces a PR's description over REST. Until this suite they had no fixture coverage at all: every other
 # suite drives a read path, and the writes were exercised only against the live API, where a
 # double-posted reply is not something a test may risk.
 #
@@ -60,6 +60,8 @@ FAIL_MSG=""
 THREADS="900:false 901:false 902:false 903:true"
 THREADS_FIXTURE_PAGE=""
 THREADS_FIXTURE_TOTAL=""
+# How many PATCHes of the PR body fail (with FAIL_MSG) before one succeeds.
+BODY_FAILS=0
 
 reset_fixture() {
   : >"$REQUEST_LOG"
@@ -73,6 +75,7 @@ reset_fixture() {
   THREADS="900:false 901:false 902:false 903:true"
   THREADS_FIXTURE_PAGE=""
   THREADS_FIXTURE_TOTAL=""
+  BODY_FAILS=0
 }
 
 # THREADS as review_thread rows (which serve `databaseId` null past 2^31, as GitHub does).
@@ -88,12 +91,14 @@ thread_rows() {
 # parser consumes an option's value on purpose (a `-f body=…` must not become the endpoint), and
 # what these cases are about is exactly WHICH body reached WHICH thread.
 gh() {
-  local arg body="" query="" id
+  local arg body="" query="" id method="" prev=""
   for arg in "$@"; do
     case "$arg" in
     body=*) body="${arg#body=}" ;;
     query=*) query="${arg#query=}" ;;
     esac
+    [ "$prev" != -X ] || method="$arg"
+    prev="$arg"
   done
   # `repo view` is not an `api` call, so it is answered before gh_fixture_parse, which refuses
   # everything else. It is answered at all because `repo_from_cwd` asks it first and the cwd cases
@@ -116,6 +121,23 @@ gh() {
     fi
     gh_fixture_answer "$(jq -cn --arg id "$id" \
       '{html_url:("https://github.com/example/repo/pull/7#discussion_r" + $id)}')"
+    ;;
+  # `body`: the PR itself, PATCHed with a field gh reads from a file (`-F body=@<path>`). What the
+  # fixture keeps is what gh would have SENT — the file's content — and the method, since the
+  # same endpoint read with GET would be a different call answering 200 without changing a thing.
+  "repos/$TARGET_REPO/pulls/7")
+    printf '%s\n' "$method" >>"$BODIES/pr-methods"
+    case "$body" in
+    @*) cat "${body#@}" >"$BODIES/pr-body" 2>/dev/null || return 1 ;;
+    *) printf 'the body was not sent as a file: %s\n' "$body" >>"$UNEXPECTED" && return 1 ;;
+    esac
+    # Counted off the log, not by decrementing BODY_FAILS: gh_retry calls gh in a command
+    # substitution, a subshell whose assignments never reach the next attempt.
+    if [ "$(wc -l <"$BODIES/pr-methods")" -le "$BODY_FAILS" ]; then
+      echo "gh: $FAIL_MSG" >&2
+      return 1
+    fi
+    gh_fixture_answer '{"html_url":"https://github.com/example/repo/pull/7","body":"ignored"}'
     ;;
   graphql)
     case "$query" in
@@ -602,6 +624,114 @@ test_a_bare_number_is_refused_even_after_a_named_call() {
   assert_eq "$(cat "$REQUEST_LOG")" "" "and nothing is read to try to make one stand up"
 }
 
+# --- `body`: the PR's description, over REST ------------------------------------------------------
+
+# `gh pr edit --body-file` rides GraphQL and fails on lukstafi/ocannl-staging with the classic
+# Projects deprecation error, so `body` PATCHes the pulls endpoint instead. The body is sent as the
+# file gh reads (`-F body=@<file>`), byte for byte, backticks and all, and with no agent marker: it
+# is the PR's own text, not a reply.
+BODY_FILE=""
+body_file() { # <content>
+  BODY_FILE="$TEST_ROOT/new-body.md"
+  printf '%s' "$1" >"$BODY_FILE"
+}
+
+test_body_patches_the_pr_from_the_file() {
+  reset_fixture
+  body_file $'## Summary\n\nUses `pr-review.sh body` — "quotes", $dollars and `ticks`.\n\nCloses #7\n'
+  run_cmd cmd_body "$BODY_FILE"
+  assert_eq "$RC" 0 "the body is replaced ($ERR)"
+  assert_eq "$(cat "$BODIES/pr-methods")" PATCH "as a PATCH of the PR, the REST edit"
+  assert_eq "$(cat "$BODIES/pr-body")" "$(cat "$BODY_FILE")" "with the file's content, exactly"
+  assert_not_contains "$(cat "$BODIES/pr-body")" "Addressed by an automated coding agent" \
+    "and no reply marker: the body is the PR's own text"
+  assert_eq "$OUT" "https://github.com/example/repo/pull/7" "its url is the whole of stdout"
+  assert_eq "$(cat "$REQUEST_LOG")" "repos/$TARGET_REPO/pulls/7" "one call, to the PR it names"
+}
+
+# The retry the other writes have: a gateway refusal is a request no backend ran, so it is
+# repeated, and the edit that finally goes through is reported as done.
+test_body_retries_a_gateway_refusal() {
+  reset_fixture
+  retune API_ATTEMPTS=3
+  BODY_FAILS=2
+  FAIL_MSG="503 No server is currently available to service your request"
+  body_file "The body."
+  run_cmd cmd_body "$BODY_FILE"
+  assert_eq "$RC" 0 "the third attempt lands ($ERR)"
+  assert_eq "$(wc -l <"$BODIES/pr-methods" | tr -d ' ')" 3 "after two refused ones"
+  assert_contains "$ERR" "retrying" "each retry is announced on stderr"
+  # Every attempt refused: transport, and the refusal may say nothing changed.
+  reset_fixture
+  retune API_ATTEMPTS=2
+  BODY_FAILS=5
+  FAIL_MSG="503 No server is currently available to service your request"
+  run_cmd cmd_body "$BODY_FILE"
+  assert_eq "$RC" 3 "a gateway refusal that outlives the attempts is transport"
+  assert_contains "$ERR" "Nothing was changed, so retry" "and nothing was changed"
+  assert_eq "$(wc -l <"$BODIES/pr-methods" | tr -d ' ')" 2 "after every attempt was spent"
+}
+
+# The other two exits, kept apart as on every write: a 4xx is the API answering (1, not retried —
+# a retry answers the same), anything else ambiguous (3, not retried under the write policy).
+# Unlike a reply, an ambiguous edit is safe to REPEAT, since the PATCH sets the body whole, and
+# the message says so rather than sending the caller to read the PR first.
+test_body_exits_stay_apart() {
+  reset_fixture
+  retune API_ATTEMPTS=3
+  BODY_FAILS=1
+  FAIL_MSG="Not Found (HTTP 404)"
+  body_file "The body."
+  run_cmd cmd_body "$BODY_FILE"
+  assert_eq "$RC" 1 "a 404 is the API answering about that PR"
+  assert_contains "$ERR" "was REJECTED, not dropped" "and the message says so"
+  assert_eq "$(wc -l <"$BODIES/pr-methods" | tr -d ' ')" 1 "a rejection is not retried"
+  reset_fixture
+  retune API_ATTEMPTS=3
+  BODY_FAILS=1
+  FAIL_MSG="Internal Server Error (HTTP 500)"
+  run_cmd cmd_body "$BODY_FILE"
+  assert_eq "$RC" 3 "an ambiguous write is transport, not a verdict"
+  assert_contains "$ERR" "repeating the same command is safe" "and a whole-body edit may be repeated"
+  assert_eq "$(wc -l <"$BODIES/pr-methods" | tr -d ' ')" 1 "though the write policy does not repeat it itself"
+}
+
+# Every shape that is not `body <pr> <file>` is an invocation error, before any request: a missing
+# file, stdin (gh reads `@-` once, so a retry would send its empty remainder as the body), an empty
+# file (which would clear the description), a body passed inline, and a PR with no repo named.
+test_body_invocation_errors_send_nothing() {
+  reset_fixture
+  run_cmd cmd_body "$TEST_ROOT/no-such-file"
+  assert_eq "$RC" 2 "a missing file ($ERR)"
+  assert_contains "$ERR" "is not a readable file" "is named as such"
+  reset_fixture
+  run_cmd cmd_body -
+  assert_eq "$RC" 2 "stdin ($ERR)"
+  assert_contains "$ERR" "stdin" "is refused by name"
+  reset_fixture
+  body_file $' \n\t\n'
+  run_cmd cmd_body "$BODY_FILE"
+  assert_eq "$RC" 2 "a blank file ($ERR)"
+  assert_contains "$ERR" "is empty" "is nothing to set"
+  reset_fixture
+  body_file "The body."
+  run_cmd cmd_body "$BODY_FILE" "and more"
+  assert_eq "$RC" 2 "a stray argument ($ERR)"
+  assert_contains "$ERR" "got 3 argument(s)" "is counted"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "none of them sent a request"
+  reset_fixture
+  scratch_checkout "$TARGET_REPO"
+  CWD_REPO="$TARGET_REPO"
+  run_cmd_from_cwd cmd_body 7 "$BODY_FILE"
+  assert_eq "$RC" 2 "a bare PR number is refused here too, even from a checkout of the repo ($ERR)"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and nothing is written on the strength of the cwd"
+  # The control: the same file, with the repo named, goes through from that same checkout.
+  reset_fixture
+  run_cmd_from_cwd cmd_body "$TARGET_REPO#7" "$BODY_FILE"
+  assert_eq "$RC" 0 "a named repo is enough from anywhere ($ERR)"
+  assert_eq "$(cat "$BODIES/pr-body")" "The body." "and the body lands"
+}
+
 tests=(
   test_a_folded_entry_is_answered_by_one_invocation
   test_a_single_thread_reply_is_unchanged
@@ -624,6 +754,10 @@ tests=(
   test_a_resolve_never_takes_its_repo_from_the_cwd
   test_a_named_repo_writes_from_any_cwd
   test_a_bare_number_is_refused_even_after_a_named_call
+  test_body_patches_the_pr_from_the_file
+  test_body_retries_a_gateway_refusal
+  test_body_exits_stay_apart
+  test_body_invocation_errors_send_nothing
 )
 
 run_tests "${tests[@]}"

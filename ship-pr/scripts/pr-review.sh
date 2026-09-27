@@ -217,6 +217,10 @@
 #                                          # the same token; every thread it names is closed
 #   pr-review.sh comment <pr> <body>       # a plain PR comment, for what has no thread to reply in:
 #                                          # a review SUMMARY's findings, or a '@codex review' nudge
+#   pr-review.sh body <pr> <file>          # replace the PR's description with the file's content,
+#                                          # over REST: `gh pr edit --body-file` rides GraphQL and
+#                                          # fails on a repo whose PRs trip the classic-Projects
+#                                          # deprecation (see cmd_body). Prints the PR's URL
 #   pr-review.sh retry [--read] <gh args...>
 #                                          # any other gh call (pr merge, api) with the same retry
 #                                          # policy, instead of a hand-rolled loop
@@ -3240,6 +3244,43 @@ _🤖 Addressed by an automated coding agent_" --jq .html_url
     fail 3 "comment on PR $REPO#$pr failed AMBIGUOUSLY: $(gh_err_line)." \
       "That is not a gateway refusal, so the comment may or may not have landed and this script" \
       "will not post it twice — read the PR, then retry only if it is not there."
+    ;;
+  esac
+}
+
+# The PR's description, replaced whole from a file. `gh pr edit --body-file` is the obvious tool
+# and it rides GraphQL, where on lukstafi/ocannl-staging it fails outright with the classic
+# Projects deprecation error whatever is being edited (2026-09: an issue-wave worker's PR bodies
+# went through a hand-typed `gh api -X PATCH repos/{o}/{r}/pulls/{n} -F body=@file` instead). The REST
+# endpoint touches nothing but the fields sent, so it is immune, and it takes the pieces this
+# script already resolves. A file and not an argument, because a body is multi-paragraph Markdown
+# full of backticks; and not stdin, because gh reads `@-` once, so a gateway retry would send the
+# empty remainder as the new body. No agent marker: the body is the PR's own text, not a reply.
+#
+# The write policy is the same as every other write's, but an ambiguous failure reads differently:
+# a PATCH SETS the body rather than adding to anything, so repeating it cannot post anything twice.
+cmd_body() {
+  [ $# -eq 2 ] || die "usage: body <pr> <file> — got $# argument(s). The new body is read from" \
+    "the file, whole; write it there first."
+  local pr="$1" file="$2"
+  [ "$file" != - ] || die "body: '-' (stdin) is refused — a retry after a gateway refusal would" \
+    "read stdin again and find it spent. Write the body to a file."
+  [ -f "$file" ] && [ -r "$file" ] || die "body: '$file' is not a readable file"
+  grep -q '[^[:space:]]' "$file" 2>/dev/null ||
+    die "body: '$file' is empty; a PR body is not cleared through this command"
+  pr_arg "$pr"
+  pr="$PR_NUM"
+  gh_retry write api -X PATCH "repos/$REPO/pulls/$pr" -F "body=@$file" --jq .html_url
+  case "$?" in
+  0) return 0 ;;
+  3) fail 3 "body of PR $REPO#$pr was not updated — the API refused it at the gateway on all" \
+    "$API_ATTEMPTS attempts ($(gh_err_line)). Nothing was changed, so retry." ;;
+  *)
+    api_rejection "$(gh_err_line)" &&
+      fail 1 "body of PR $REPO#$pr was REJECTED, not dropped: $(gh_err_line)." \
+        "Retrying prints the same thing — check the PR number, the repo and the token's access."
+    fail 3 "body of PR $REPO#$pr failed AMBIGUOUSLY: $(gh_err_line). The edit may or may not" \
+      "have landed; it sets the body whole, so repeating the same command is safe."
     ;;
   esac
 }
@@ -7382,9 +7423,11 @@ main() {
   reply) shift && cmd_reply "$@" ;;
   resolve) shift && cmd_resolve "$@" ;;
   comment) shift && cmd_comment "$@" ;;
+  body) shift && cmd_body "$@" ;;
   retry) shift && cmd_retry "$@" ;;
   *) die "usage: pr-review.sh [--repo owner/name] {poll|watch|status|rounds|checks|merge|reply|resolve} <pr> ...
   pr-review.sh comment <pr> <body>           # a plain PR comment (a summary round, a review nudge)
+  pr-review.sh body <pr> <file>              # replace the PR's description from a file, over REST
   pr-review.sh base [owner/name] [branch] [--wait]  # is the base branch's CI green? (start of
                                              # work; --wait = post-merge integration read;
                                              # --integration-records <file>: fleet-worker gate's;
