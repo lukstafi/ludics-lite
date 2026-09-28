@@ -333,14 +333,18 @@ test_a_fixed_graphql_answer_is_a_rejection() {
     assert_not_contains "$RETRY_OUT" "never answered" "the API did answer ($body)"
     assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "and it is not re-sent ($body)"
   done
-  # The write policy never retried it; it now says rejected rather than ambiguous, since a query
-  # GraphQL refused to validate ran nothing.
-  reset_fixture
-  GQL_ERROR="${bodies[4]}"
-  run_retry api graphql -f query=q
-  assert_eq "$RETRY_RC" 1 "a write whose query was refused is exit 1 ($RETRY_OUT)"
-  assert_contains "$RETRY_OUT" "was rejected" "and is reported as rejected"
-  assert_not_contains "$RETRY_OUT" "AMBIGUOUSLY" "not as a write that may have landed"
+  # The write policy too, on every body: rejected rather than ambiguous, since a query GraphQL
+  # refused to validate ran nothing, and not re-sent even where the body quotes a gateway marker,
+  # which the write policy's own gateway scan would otherwise retry (review round 2).
+  for body in "${bodies[@]}"; do
+    reset_fixture
+    GQL_ERROR="$body"
+    run_retry api graphql -f query=q
+    assert_eq "$RETRY_RC" 1 "a write whose query was refused is exit 1 ($body: $RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "was rejected: $body" "and is reported as rejected"
+    assert_not_contains "$RETRY_OUT" "AMBIGUOUSLY" "not as a write that may have landed ($body)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "nor re-sent ($body)"
+  done
 }
 
 # The control: a gateway failure and GraphQL's execution failure are transport and still retry to

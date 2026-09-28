@@ -484,12 +484,7 @@ graphql_fixed_answer() {
   return 1
 }
 
-# transient_failure <gh stderr and stdout> <gh stderr's first line>
 transient_failure() {
-  # A fixed GraphQL answer is read FIRST: its whole first line is GraphQL's own message, which no
-  # gateway prints, while the substring scan below would match a marker the message only quotes
-  # (`Expected NAME, actual: STRING ("Bad gateway")`) and retry a query that cannot change.
-  graphql_fixed_answer "$2" && return 1
   gateway_failure "$1" && return 0
   case "$1" in
   *"HTTP 4"[0-9][0-9]*) return 1 ;; # the API answered; a retry answers the same, slower
@@ -524,12 +519,19 @@ gh_retry() {
       return 0
     fi
     printf '%s' "${GH_ERR%%$'\n'*}" >"$GH_ERR_FILE" 2>/dev/null
-    if [ "$mode" = write ]; then
+    # A fixed GraphQL answer is read FIRST, under both policies: its whole first line is GraphQL's
+    # own message, which no gateway prints, while the substring scans below would match a marker the
+    # message only quotes (`Expected NAME, actual: STRING ("Bad gateway")`) and retry a query that
+    # cannot change. A query GraphQL refused to validate ran nothing, so a write has nothing to land.
+    if graphql_fixed_answer "${GH_ERR%%$'\n'*}"; then
+      retryable=1
+    elif [ "$mode" = write ]; then
       gateway_failure "$GH_ERR $out"
+      retryable=$?
     else
-      transient_failure "$GH_ERR $out" "${GH_ERR%%$'\n'*}"
+      transient_failure "$GH_ERR $out"
+      retryable=$?
     fi
-    retryable=$?
     if [ "$retryable" -ne 0 ] || [ "$attempt" -ge "$API_ATTEMPTS" ]; then
       [ "$tmp" = /dev/null ] || { rm -f "$tmp"; GH_TMP_FILE=""; }
       [ "$retryable" -eq 0 ] && return 3
