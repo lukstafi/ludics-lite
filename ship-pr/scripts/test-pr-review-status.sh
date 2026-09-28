@@ -1075,7 +1075,7 @@ test_a_broken_jq_program_is_unknown_on_the_current_head_evidence() {
 }
 
 # The other half of ludics-lite#89: a `capture` that never errors, it just stops producing. The
-# table test admits a Code Review Running row and the stamp pattern beside it re-matches the same
+# table test admits a Code Review Running row and SUMMARY_ROW_STAMP_RE re-matches the same
 # row; unbracketed, a row the second pattern misses is deleted from the stream — with every row
 # after it — and the older 👍 then stands unopposed. Bracketed, the miss is a null that is
 # counted, and a table this script can only half read is not an approval.
