@@ -158,17 +158,22 @@ live() {
   *) case $(ps -o stat= -p "$1" 2>/dev/null) in '' | Z*) return 1 ;; esac ;;
   esac
 }
-# gone PID|-PGID: true once it is no longer live, polling for at most $GRACE seconds -- no wait
-# here is unbounded, since a process that ignores TERM or an orphan holding the fifo would
-# otherwise hold the helper, and the worktree, forever.
+# gone PID|-PGID [SECONDS]: true once it is no longer live, polling for at most SECONDS (default
+# $GRACE) -- no wait here is unbounded, since a process that ignores TERM or an orphan holding the
+# fifo would otherwise hold the helper, and the worktree, forever.
 gone() {
-  local i=0
+  local i=0 limit=${2:-$GRACE}
   while live "$1"; do
-    [ "$i" -ge $((GRACE * 10)) ] && return 1
+    [ "$i" -ge $((limit * 10)) ] && return 1
     sleep 0.1
     i=$((i + 1))
   done
 }
+# TEE_DRAIN: how long tee gets to see EOF once the suite's group is stopped. Not the suite's
+# grace, which may be 0 or 1: a tee that needs a moment on a loaded box is not a failed capture
+# (a macOS CI runner took over a second), and past this only a process that escaped the group can
+# still be holding the fifo.
+TEE_DRAIN=30
 # stop_group: the suite runs as the leader of its own process group, so this reaches whatever it
 # left behind in that group as well -- a background child that outlived it, one that ignores
 # TERM -- and none of it keeps running in (or writing to) a worktree about to be removed. The
@@ -187,7 +192,7 @@ cleanup() {
   trap '' INT TERM HUP
   [ -n "$SCRATCH" ] || return 0
   [ -n "$child" ] && stop_group
-  if [ -n "$teepid" ] && ! gone "$teepid"; then kill "$teepid" 2>/dev/null; fi
+  if [ -n "$teepid" ] && ! gone "$teepid" "$TEE_DRAIN"; then kill "$teepid" 2>/dev/null; fi
   if [ -d "$WT" ]; then
     # --force twice: once for the copied suite (the checkout is dirty), again for a worktree the
     # suite locked, which a single --force refuses.
@@ -290,7 +295,7 @@ child=
 # tee is reaped and judged too: a capture that failed, or that something outside the group still
 # held open past the grace, would make the result line (and a SIGPIPE'd suite's status) a claim
 # about output nobody read.
-if gone "$teepid"; then
+if gone "$teepid" "$TEE_DRAIN"; then
   wait "$teepid"
   tee_rc=$?
 else

@@ -485,6 +485,15 @@ fi
 out=$(cd "$R/scripts" && TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=09 "$RAB" test-toy.sh 2>&1)
 rc=$?
 if [ "$rc" -eq 1 ]; then ok "a zero-padded grace (09) is read as decimal"; else ko "grace 09: rc=$rc -- $out"; fi
+# The suite's grace is not tee's: with it at 0, a tee that has not yet seen EOF the instant the
+# suite exits is still draining, not a failed capture (a macOS CI runner once took over a second).
+out=$(cd "$R/scripts" && TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=0 "$RAB" test-toy.sh 2>&1)
+rc=$?
+if [ "$rc" -eq 1 ] && grep -qF 'exit 1 on origin/main: 1 passed, 1 failed' <<<"$out"; then
+  ok "a zero grace still reads the suite's output and status"
+else
+  ko "grace 0: rc=$rc -- $out"
+fi
 run_rab test-toy.sh --rc125
 if [ "$rc" -eq 1 ] && grep -qF 'exit 125 on origin/main' <<<"$out"; then
   ok "a suite's own 125 is reported, and exits 1"
