@@ -1284,6 +1284,15 @@ INIT_FAILURE_REF_RE='Provided git ref[^0-9a-f]*(?<s>[0-9a-f]{7,40})'
 # is why cmd_poll, defined above, reads a constant assigned here: every command runs after the
 # whole file has been read) — so they share one expression.
 REVIEWED_COMMIT_RE='Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})'
+# The summary comment's Code Review row once a round is DONE (#439), the one row shape status_state
+# reads as a verdict when no 👍 came. A fail-closed allowlist, cell by cell, of the row the app
+# writes (ocannl-staging#828, ludics-lite#427 and #444, 2026-09-27):
+#   | <a cell naming Code Review> | ✅ **Completed** <relative-time datetime="<ISO>"><text></relative-time> | `<7-40 hex>` | ...
+# The status cell must be exactly that: U+2705 with no variation selector, the bold word, one
+# relative-time element and nothing else; the commit cell a backquoted lowercase hex SHA. Any other
+# status (Running, a failure or cancellation word, a new emoji, a reworded or re-marked Completed)
+# is not a verdict, and what it leaves is the reading status gave before this row was read.
+SUMMARY_COMPLETED_ROW_RE='^\|[^|]*Code Review[^|]*\| *✅ \*\*Completed\*\* <relative-time datetime="(?<at>[^"]+)">[^<|]*</relative-time> *\| *`(?<sha>[0-9a-f]{7,40})` *\|'
 
 # ISO 8601 UTC timestamps sort correctly as plain strings, which is why every comparison below is a
 # string comparison: no date(1) is involved, whose parsing flags differ between BSD and GNU.
@@ -1446,6 +1455,7 @@ status_state() {
   local running_at evidence evidence_kind evidence_at running_unread vline verd_at verd_sha mstate="-" head_err="" pr_created=""
   local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref fail_kind fail_head rev_head_at nudge_at="" nudge_age nudge_id="" nudge_line comments_loaded=false
   local reviews_loaded=false head_loaded=false head_at_read=false row_sha stale_plus_at="" stale_note=""
+  local done_line done_at done_sha
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -1636,6 +1646,24 @@ status_state() {
     stale_plus_at="$plus_at"
   fi
 
+  # The comments BEFORE the reviews, as the 👍 path above and cmd_poll read them: the summary's
+  # Completed row is read below as a verdict when nothing was posted since the 👀 (#439), and the
+  # app submits a round's findings review 2-4 s BEFORE it flips that row to Completed (nine of nine
+  # findings rounds sampled on 2026-09-28, e.g. ludics-lite#427's review at 20:04:21Z under the row's
+  # 20:04:24Z). Read in that order, a Completed row in the comments read means its review, if the
+  # round had one, is already in the reviews read after it; read the other way round, the few
+  # seconds between the reads would be a window in which a findings round reads as clean. So a
+  # comments read that the 👍 path could not make, and makes here after that path's reviews
+  # read, costs the reviews a second read rather than the order.
+  if [ "$comments_loaded" != true ]; then
+    comments_raw=$(state_comments "$pr") || {
+      echo "unknown|-|$mstate|the comments API did not answer ($(gh_err_line))"
+      return 0
+    }
+    comments_loaded=true
+    reviews_loaded=false
+  fi
+
   if [ "$reviews_loaded" = true ]; then
     # The stale-👍 path's read, already through substantive_reviews.
     raw="$reviews_raw"
@@ -1673,15 +1701,7 @@ status_state() {
   # two polls, and one that never did times out at the shorter grace while the round is still
   # running (review of self-improve#13). It is an announcement, not the reviewer speaking; the
   # verdict scan below still reads it, in case a verdict is ever delivered by editing it in place.
-  if [ "$comments_loaded" = true ]; then
-    raw="$comments_raw"
-  else
-    raw=$(state_comments "$pr") || {
-      echo "unknown|-|$mstate|the comments API did not answer ($(gh_err_line))"
-      return 0
-    }
-    comments_raw="$raw"
-  fi
+  raw="$comments_raw"
   com_at=$(jq -r --arg rev "$REVIEWER" '
       [.[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | test("codex-pull-request-review-summary") | not)
@@ -1718,6 +1738,36 @@ status_state() {
   }
   verd_at="${vline%%|*}"
   verd_sha="${vline#*|}"
+  # The round the summary table says is done (#439): its newest Code Review row, when that row is
+  # the Completed shape SUMMARY_COMPLETED_ROW_RE allows. Read like the 👍 path's fourth field: the
+  # rows of the NEWEST summary comment only, and none at all when any Code Review row there is one
+  # the stamp pattern cannot date — no row can then be called the newest, and an older summary is
+  # never consulted in its place. The newest row is found by the same stamp the 👍 path reads, and
+  # must then ALSO match the allowlist, the two patterns applied to the same line: one that dates a
+  # row the allowlist refuses is not a verdict, so the patterns disagreeing costs the verdict and
+  # nothing else (the Running rows' disagreement is `unknown` instead, because there it would
+  # otherwise leave a 👍 standing; here the fallback approves nothing). Whether it is a verdict for
+  # the head, and for this round, is decided below, once the head is known.
+  done_line=$(jq -r --arg rev "$REVIEWER" --arg done "$SUMMARY_COMPLETED_ROW_RE" '
+      [.[] | select((.user.login // "") | startswith($rev))
+           | select((.body // "") | contains("codex-pull-request-review-summary"))]
+      | max_by(.updated_at // .created_at)
+      | if . == null then "|"
+        else [(.body // "") | split("\n")[]
+              | select(test("^\\|[^|]*Code Review[^|]*\\|"))
+              | . as $row
+              | [capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")] | first
+              | if . == null then null else {at, row: $row} end]
+          | if length == 0 or any(.[]; . == null) then "|"
+            else max_by(.at) | [.row | capture($done)] | first
+              | if . == null then "|" else "\(.at | sub("\\.[0-9]+Z$"; "Z"))|\(.sha)" end
+            end
+        end' <<<"$raw" 2>/dev/null) || {
+    echo "unknown|-|$mstate|the summary comments feed did not parse"
+    return 0
+  }
+  done_at="${done_line%%|*}"
+  done_sha="${done_line#*|}"
   # The initialization failure (INIT_FAILURE_RE above). Only the NEWEST non-placeholder comment is
   # tested, never all of them: any later word supersedes the failure — a findings summary, a
   # no-findings verdict, a second failure naming a different head — and the state it leaves is
@@ -1780,6 +1830,35 @@ status_state() {
     case "$head_sha" in
     "$verd_sha"*)
       echo "approved|-|$mstate|$REVIEWER posted a no-findings verdict for head ${head_sha:0:7} at $verd_at"
+      return 0
+      ;;
+    esac
+  fi
+
+  # A round the summary table marks Completed on the CURRENT head, with nothing posted since its 👀,
+  # is a clean round the app forgot to 👍 (#439: ocannl-staging#828, the row "✅ Completed" on
+  # fc6ff6a at 01:10:51Z under a 👀 of 01:06:53Z, no review and no 👍 after it, and `status` read
+  # STALLED 56 minutes on and recommended the nudge that clears approvals). The app's own contract,
+  # in every summary it posts, is "comments if it has suggestions, and reacts with 👍 once all
+  # reviews finish with no findings", so a finished round that said nothing is the no-findings one.
+  # This is an approval, and passes through the open-thread gate like any other; `merge` reads the
+  # build and the threads and never the 👍, so it gains nothing to skip. What makes it safe to call
+  # one is what it requires, each fail-closed:
+  #   - the row is the allowlisted Completed shape, newest in the newest summary, naming the head;
+  #   - a 👀 bounds the round: the row is newer than it, and so is not a previous round's (a
+  #     re-request raises a fresh 👀 over a row whose SHA still matches). No 👀 — taken down, or
+  #     older than a pending request — leaves no round to bound, and the reading stays as it was;
+  #   - the reviewer's last word (a substantive review, a comment other than the summary, a stale 👍)
+  #     is OLDER than that 👀. "Nothing after the row" would be the wrong test: a findings round
+  #     submits its review 2-4 s BEFORE the row flips (see the read order above), so it would call
+  #     every findings round clean. Anything the reviewer said inside the round disqualifies it,
+  #     which leaves such a round to the arms below (`idle` on a review of this head).
+  if [ -n "$done_sha" ] && [ -n "$head_sha" ] && [ -n "$eyes_at" ] && [[ "$done_at" > "$eyes_at" ]] &&
+    { [ -z "$last_spoke" ] || [[ "$last_spoke" < "$eyes_at" ]]; }; then
+    case "$head_sha" in
+    "$done_sha"*)
+      echo "approved|-|$mstate|$REVIEWER's summary marks head ${head_sha:0:7}'s Code Review Completed at" \
+        "$done_at, with nothing posted since its 👀 at $eyes_at (no 👍 was given)"
       return 0
       ;;
     esac

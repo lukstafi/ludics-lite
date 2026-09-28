@@ -1345,6 +1345,137 @@ test_a_stale_thumbs_up_leaves_the_ordinary_states() {
   assert_contains "$WATCH_OUT$WATCH_ERR" "review EXPECTED but not started" "it reads the due round"
 }
 
+# --- a round the summary marks Completed with no 👍 (ludics-lite#439) ---------------------------
+# ocannl-staging#828, 2026-09-27: a findings review on the previous head b67e463 at 01:03:11Z, the
+# push of fc6ff6a, the 👀 for it at 01:06:53Z, and the summary's Code Review row flipped to
+# "✅ Completed" on fc6ff6a at 01:10:51Z. No review, no 👍, the 👀 left up — and `status` read
+# STALLED 56 minutes later and recommended the nudge that clears approvals.
+COMPLETED_HEAD=fc6ff6ae371000202d46683c50e62cdc1f125357
+
+completed_fixture() {
+  reset_fixture
+  HEAD_SHA="$COMPLETED_HEAD"
+  HEAD_AT=2026-09-27T01:06:05Z
+  REVIEWS_JSON="[$(review 5 b67e463000000000000000000000000000000000 2026-09-27T01:03:11Z)]"
+  REACTIONS_JSON="[$(reaction eyes 2026-09-27T01:06:53Z)]"
+  COMMENTS_JSON="[$(summary_row 1 Completed fc6ff6a 2026-09-27T01:10:51Z)]"
+}
+
+# The summary as it stands while that round runs: the same row, Running.
+running_row() { # <id> <short sha> <datetime>
+  plain_comment "$1" "$3" "<!-- codex-pull-request-review-summary -->
+| Review | Status | Commit | Review trigger |
+| --- | --- | --- | --- |
+| 📝 **Code Review** | 🔄 **Running** <relative-time datetime=\"${3%Z}.484070Z\">$3</relative-time> | \`$2\` | New commits |"
+}
+
+test_a_completed_row_on_the_head_is_a_verdict() {
+  completed_fixture
+  COMMENTS_JSON="[$(running_row 1 fc6ff6a 2026-09-27T01:07:02Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" stalled "control: the same round while its row reads Running"
+  completed_fixture
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "a round the summary marks Completed on the head, silent since its 👀"
+  assert_contains "$LINE" "summary marks head fc6ff6a's Code Review Completed at 2026-09-27T01:10:51Z" \
+    "the approval names the row it rests on"
+  assert_contains "$LINE" "since its 👀 at 2026-09-27T01:06:53Z (no 👍 was given)" \
+    "and the 👀 that bounds the round"
+  # The comments are read BEFORE the reviews, so a findings review the app submits seconds before
+  # it flips the row is in the reviews read whenever the flipped row is in the comments read.
+  assert_eq "$(grep -F -x -e "repos/$REPO/issues/7/comments?per_page=100" \
+    -e "repos/$REPO/pulls/7/reviews?per_page=100" "$REQUEST_LOG" | head -1)" \
+    "repos/$REPO/issues/7/comments?per_page=100" "the comments are read before the reviews"
+  assert_eq "$(endpoint_reads "issues/7/comments?per_page=100")" 1 "one comments read"
+  assert_eq "$(endpoint_reads "pulls/7/reviews?per_page=100")" 1 "one reviews read"
+  # A `watch` ends its wait on it, where it used to sit out the 👀 until the stall.
+  run_watch 0,0,0
+  assert_contains "$WATCH_OUT$WATCH_ERR" "approved" "watch ends on the Completed round"
+}
+
+test_a_completed_row_for_another_head_is_not_this_head_s_verdict() {
+  completed_fixture
+  COMMENTS_JSON="[$(summary_row 1 Completed b67e463 2026-09-27T01:10:51Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" stalled "a Completed row naming an older head approves nothing here"
+}
+
+test_a_completed_row_after_a_findings_review_is_not_clean() {
+  completed_fixture
+  # #427's order: the findings review three seconds before the row flips.
+  REVIEWS_JSON="[$(review 6 "$COMPLETED_HEAD" 2026-09-27T01:10:48Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "a round that posted findings before its row flipped is not clean"
+  # Or after it: anything the reviewer says inside the round disqualifies the row.
+  REVIEWS_JSON="[$(review 6 "$COMPLETED_HEAD" 2026-09-27T01:11:30Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "nor one that posted findings after it"
+  # An empty COMMENTED envelope is not a finding (#88), and leaves the verdict standing.
+  REVIEWS_JSON="[$(review 6 "$COMPLETED_HEAD" 2026-09-27T01:10:48Z | jq -c '.body=""')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "an empty envelope inside the round is not a finding"
+}
+
+test_a_completed_row_needs_a_round_to_bound_it() {
+  completed_fixture
+  # A re-request on the same head: its fresh 👀 over a row that is still the last round's.
+  REACTIONS_JSON="[$(reaction eyes 2026-09-27T01:20:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" stalled "a row older than the 👀 is the previous round's"
+  # No 👀 at all: no round to bound, so the reading is what it was before the row was read.
+  REACTIONS_JSON='[]'
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "with no 👀 the row is not read as a verdict"
+  # A 👀 older than a pending request inside a watch is spent, and so is the row under it.
+  completed_fixture
+  COMMENTS_JSON="[$(summary_row 1 Completed fc6ff6a 2026-09-27T01:10:51Z),$(jq -cn \
+    '{id:2, user:{login:"me"}, created_at:"2026-09-27T01:30:00Z", updated_at:"2026-09-27T01:30:00Z",
+      body:"@codex review"}')]"
+  local watch_nudge_after=1
+  run_status
+  assert_eq "$(state_tok "$STATE")" nudged "a Completed row from before a pending request does not answer it"
+}
+
+test_a_completed_row_outside_the_allowlist_is_not_a_verdict() {
+  completed_fixture
+  # The stamp dates it; the allowlist refuses the status cell.
+  COMMENTS_JSON="[$(summary_row 1 'Completed with errors' fc6ff6a 2026-09-27T01:10:51Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" stalled "a reworded Completed cell is not a verdict"
+  # A Completed row that is not the newest Code Review row of the summary.
+  COMMENTS_JSON="[$(plain_comment 1 2026-09-27T01:12:00Z "<!-- codex-pull-request-review-summary -->
+| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-09-27T01:10:51.1Z\">x</relative-time> | \`fc6ff6a\` | New commits |
+| 📝 **Code Review** | 🔄 **Running** <relative-time datetime=\"2026-09-27T01:11:40.1Z\">x</relative-time> | \`fc6ff6a\` | Comment |")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" stalled "a Completed row under a newer Running row is not the round's end"
+  # A Code Review row the stamp cannot date beside it: no row can be called the newest.
+  COMMENTS_JSON="[$(plain_comment 1 2026-09-27T01:12:00Z "<!-- codex-pull-request-review-summary -->
+| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-09-27T01:10:51.1Z\">x</relative-time> | \`fc6ff6a\` | New commits |
+| 📝 **Code Review** | 🔄 **Running** just now | \`fc6ff6a\` | Comment |")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" stalled "an undatable row beside it leaves no newest row"
+  # Only the NEWEST summary comment is read: an older one's Completed row is history.
+  COMMENTS_JSON="[$(summary_row 1 Completed fc6ff6a 2026-09-27T01:10:51Z),$(running_row 2 fc6ff6a 2026-09-27T01:11:40Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" stalled "an older summary's Completed row is not read past the newest one"
+}
+
+test_a_completed_row_approval_passes_the_thread_gate() {
+  completed_fixture
+  THREADS_JSON="[$(review_thread 4053098120 false)]"
+  run_cmd_status
+  assert_contains "$CMD_OUT" "BUT 1 review thread(s) still UNRESOLVED" \
+    "an open thread under the Completed row's approval is unresolved, as under a 👍"
+}
+
+test_a_broken_jq_program_is_unknown_on_the_completed_row_read() {
+  completed_fixture
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "control: this fixture reaches the Completed-row read"
+  assert_unknown_when_broken 'capture($done)' \
+    "the summary comments feed did not parse" "the Completed-row read"
+}
+
 tests=(
   test_empty_reviews_need_their_own_findings
   test_idle_clean_says_next_move_is_yours
@@ -1403,6 +1534,13 @@ tests=(
   test_a_thumbs_up_older_than_the_head_commit_is_not_an_approval
   test_a_stale_thumbs_up_leaves_the_ordinary_states
   test_a_thumbs_up_is_judged_only_on_evidence_that_can_prove_it_stale
+  test_a_completed_row_on_the_head_is_a_verdict
+  test_a_completed_row_for_another_head_is_not_this_head_s_verdict
+  test_a_completed_row_after_a_findings_review_is_not_clean
+  test_a_completed_row_needs_a_round_to_bound_it
+  test_a_completed_row_outside_the_allowlist_is_not_a_verdict
+  test_a_completed_row_approval_passes_the_thread_gate
+  test_a_broken_jq_program_is_unknown_on_the_completed_row_read
 )
 
 run_tests "${tests[@]}"
