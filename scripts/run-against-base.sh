@@ -89,9 +89,10 @@ GRACE=${RUN_AGAINST_BASE_GRACE:-5}
 case "$GRACE" in '' | *[!0-9]*) die "RUN_AGAINST_BASE_GRACE must be whole seconds: $GRACE" ;; esac
 GRACE=$((10#$GRACE))
 
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/run-against-base.$$.XXXXXX") || die "mktemp failed"
-SCRATCH=$(CDPATH= cd "$SCRATCH" && pwd -P) || die "cannot resolve $SCRATCH"
-WT="$SCRATCH/base"
+# The cleanup is armed before the scratch directory exists, so no signal can land between the
+# allocation and the trap; until SCRATCH is set it has nothing to do.
+SCRATCH=
+WT=
 child=
 teepid=
 # live PID | live -PGID: whether that process, or any member of that process group, is still
@@ -130,6 +131,7 @@ cleanup() {
   # A second INT/TERM/HUP while this runs must not cut it short: the trap's `exit` would leave
   # the EXIT trap before the worktree is removed.
   trap '' INT TERM HUP
+  [ -n "$SCRATCH" ] || return 0
   [ -n "$child" ] && stop_group
   if [ -n "$teepid" ] && ! gone "$teepid"; then kill "$teepid" 2>/dev/null; fi
   if [ -d "$WT" ]; then
@@ -156,6 +158,10 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
+
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/run-against-base.$$.XXXXXX") || die "mktemp failed"
+SCRATCH=$(CDPATH= cd "$SCRATCH" && pwd -P) || die "cannot enter the scratch directory it just made"
+WT="$SCRATCH/base"
 
 git -C "$TOP" worktree add --quiet --detach "$WT" "$sha" >/dev/null 2>&1 \
   || die "git worktree add failed for $base ($sha)"
