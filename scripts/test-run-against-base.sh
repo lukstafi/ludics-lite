@@ -407,6 +407,17 @@ else
   ko "git env: rc=$rc TOPLEVEL=$top -- $out"
 fi
 worktrees_clean "after a caller with git's local variables"
+# A suite in a nested repository (as a submodule's would be) is refused from the outer one: the
+# outer base holds none of its neighbours.
+g init -q "$R/sub"
+cp -p "$R/scripts/test-link.sh" "$R/sub/test-sub.sh"
+run_rab ../sub/test-sub.sh
+if [ "$rc" -eq 125 ] && grep -qF 'nested repository' <<<"$out"; then
+  ok "a suite inside a nested repository is refused from the outer checkout"
+else
+  ko "nested repo: rc=$rc -- $out"
+fi
+rm -rf "$R/sub"
 # A suite under .git is not a working-tree file.
 run_rab "$R/.git/hooks/test-meta"
 if [ "$rc" -eq 125 ] && grep -qF 'inside a .git directory' <<<"$out"; then

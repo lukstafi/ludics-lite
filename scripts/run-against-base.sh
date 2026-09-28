@@ -72,6 +72,14 @@ suite_dir=$(CDPATH= cd "${suite_arg%/*}/" && pwd -P && printf x) || die "cannot 
 suite_dir=${suite_dir%x}
 suite_dir=${suite_dir%$'\n'}
 suite_abs="$suite_dir/${suite_arg##*/}"
+# A suite inside a nested repository (a submodule, say) belongs to that repository: the base
+# worktree of this one would hold an empty directory there, and the suite would fail on the base
+# for want of its neighbours -- a negative control that proves nothing. Run it from inside.
+suite_top=$(git -C "$suite_dir" rev-parse --show-toplevel 2>/dev/null) \
+  && suite_top=$(CDPATH= cd "$suite_top" && pwd -P) || suite_top=
+if [ -n "$suite_top" ] && [ "$suite_top" != "$TOP" ]; then
+  die "$suite_arg is inside the nested repository $suite_top (a submodule?); run the helper from inside it"
+fi
 case "$suite_abs" in
 "$TOP"/*) rel=${suite_abs#"$TOP"/} ;;
 *) die "$suite_arg is not inside this checkout ($TOP)" ;;
