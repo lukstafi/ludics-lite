@@ -65,8 +65,13 @@ case "$suite_arg" in /*) ;; *) suite_arg="./$suite_arg" ;; esac
 [ -L "$suite_arg" ] && die "$suite_arg is a symlink; name the file it points at"
 TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git checkout: $PWD"
 TOP=$(CDPATH= cd "$TOP" && pwd -P) || die "cannot resolve the checkout root: $TOP"
-suite_dir=$(CDPATH= cd "$(dirname "$suite_arg")" && pwd -P) || die "cannot resolve: $suite_arg"
-suite_abs="$suite_dir/$(basename "$suite_arg")"
+# Split with parameter expansion, and read the resolved directory back through a trailing `x`: a
+# command substitution strips trailing newlines, which a git filename may end in, and would then
+# name a different file than the one checked above.
+suite_dir=$(CDPATH= cd "${suite_arg%/*}/" && pwd -P && printf x) || die "cannot resolve: $suite_arg"
+suite_dir=${suite_dir%x}
+suite_dir=${suite_dir%$'\n'}
+suite_abs="$suite_dir/${suite_arg##*/}"
 case "$suite_abs" in
 "$TOP"/*) rel=${suite_abs#"$TOP"/} ;;
 *) die "$suite_arg is not inside this checkout ($TOP)" ;;
@@ -81,6 +86,23 @@ case "$rel" in
   runner=
   ;;
 esac
+# An interpreter that is missing means the suite never runs, and its 126/127 must not read as a
+# base result. A missing first program is caught at the exec (execfail, below); what the exec
+# cannot see is `#!/usr/bin/env <prog>` whose <prog> is not on PATH, since env itself starts
+# fine -- so that one is looked up here. (`env -S`/option forms are left to the exec.)
+interp=$runner
+if [ -z "$interp" ]; then
+  IFS= read -r shebang <"$suite_abs" || true
+  case "$shebang" in
+  '#!'*)
+    read -r sb_prog sb_arg _ <<<"${shebang#\#!}"
+    case "${sb_prog##*/}:${sb_arg-}" in env:[!-]*) interp=$sb_arg ;; esac
+    ;;
+  esac
+fi
+if [ -n "$interp" ] && ! command -v "$interp" >/dev/null 2>&1; then
+  die "$rel needs $interp, which is not on PATH here; it would never run"
+fi
 sha=$(git -C "$TOP" rev-parse --verify --quiet "$base^{commit}") || die "no such commit: $base"
 
 # Whole seconds, checked before anything is allocated: the cleanup does integer arithmetic on it,
@@ -159,8 +181,11 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/run-against-base.$$.XXXXXX") || die "mktemp failed"
-SCRATCH=$(CDPATH= cd "$SCRATCH" && pwd -P) || die "cannot enter the scratch directory it just made"
+# The root is resolved first and the scratch directory made under it, so SCRATCH is physical
+# from its first assignment (a child of a physical path is physical) and no later line can
+# overwrite it with an empty value the cleanup would then not know to remove.
+TMP_ROOT=$(CDPATH= cd "${TMPDIR:-/tmp}" && pwd -P) || die "cannot resolve ${TMPDIR:-/tmp}"
+SCRATCH=$(mktemp -d "$TMP_ROOT/run-against-base.$$.XXXXXX") || die "mktemp failed"
 WT="$SCRATCH/base"
 
 git -C "$TOP" worktree add --quiet --detach "$WT" "$sha" >/dev/null 2>&1 \

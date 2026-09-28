@@ -18,10 +18,11 @@
 #   - whatever the base keeps on the suite's path -- a symlink out of the checkout at the leaf or
 #     at a parent, a directory where the suite now is -- is replaced, never followed or written
 #     through, and nothing is created outside the worktree;
-#   - a suite named with a leading dash runs, a `--` directory on the suite's path installs,
-#     and a working-tree suite that is a symlink is refused rather than followed;
-#   - a path inside .git is refused, and a suite that cannot be started (a missing interpreter)
-#     exits 125 rather than its exec error's 126/127;
+#   - a suite named with a leading dash, or ending in a newline, runs that very file; a `--`
+#     directory on the suite's path installs; a working-tree suite that is a symlink is refused
+#     rather than followed;
+#   - a path inside .git is refused, and a suite that cannot be started (a missing interpreter,
+#     directly or behind `#!/usr/bin/env`) exits 125 rather than its exec error's 126/127;
 #   - an unreadable directory the suite leaves behind does not leak the scratch;
 #   - git's repository-local variables exported by the caller (GIT_DIR, GIT_WORK_TREE) do not
 #     reach the suite;
@@ -141,6 +142,12 @@ echo "1 passed, 0 failed"
 EOF
 chmod +x "$R/scripts/test-link.sh"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/-check.sh"
+# A name ending in a newline, beside the same name without it (which must not be the one run).
+cp -p "$R/scripts/test-link.sh" "$R/scripts/test-nl.sh"$'\n'
+printf '#!/usr/bin/env bash\necho "WRONG FILE"\nexit 3\n' >"$R/scripts/test-nl.sh"
+chmod +x "$R/scripts/test-nl.sh"
+printf '#!/usr/bin/env run-against-base-no-such-interpreter\nexit 1\n' >"$R/scripts/test-envmiss.sh"
+chmod +x "$R/scripts/test-envmiss.sh"
 mkdir -p "$R/scripts/--"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/--/test-dash.sh"
 # An executable suite outside git, so only the symlink refusal can stop it running.
@@ -362,6 +369,13 @@ worktrees_clean "after replacing base paths"
 # A suite name that starts with a dash is a file, not an option.
 run_rab -check.sh
 if [ "$rc" -eq 0 ]; then ok "a suite named -check.sh runs"; else ko "leading dash: rc=$rc -- $out"; fi
+# A trailing newline is part of the name: the suite named so runs, not its newline-free twin.
+run_rab "test-nl.sh"$'\n'
+if [ "$rc" -eq 0 ] && ! grep -qF 'WRONG FILE' <<<"$out"; then
+  ok "a suite name ending in a newline runs that file"
+else
+  ko "trailing newline: rc=$rc -- $out"
+fi
 # A directory literally named `--` is a path component like any other.
 run_rab ./--/test-dash.sh
 if [ "$rc" -eq 0 ]; then ok "a \`--\` directory on the suite's path installs"; else ko "-- component: rc=$rc -- $out"; fi
@@ -389,6 +403,14 @@ if [ "$rc" -eq 125 ] && grep -qF 'inside a .git directory' <<<"$out"; then
   ok "a path inside .git is refused"
 else
   ko ".git path: rc=$rc -- $out"
+fi
+# ...and so did one whose `#!/usr/bin/env <prog>` names a program that is not on PATH, which the
+# exec cannot see (env itself starts).
+run_rab test-envmiss.sh
+if [ "$rc" -eq 125 ] && grep -qF 'not on PATH' <<<"$out"; then
+  ok "an env shebang naming a missing interpreter exits 125, not env's 127"
+else
+  ko "env interpreter: rc=$rc -- $out"
 fi
 # A suite whose interpreter is missing never ran: that is the helper's 125, not a base failure.
 run_rab test-noexec.sh
