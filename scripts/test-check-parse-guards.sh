@@ -8,6 +8,8 @@
 # group hands its caller back alive, and one that falls through to the foot's `exit` takes the
 # caller down with it. Both are deterministic -- the running script does the appending itself, so
 # there is no window to race -- and the second is the property the twelve pr-review suites rest on.
+# Every script in the guard's ALSO_GUARDED list is also rewritten in place under a running copy of
+# it, with the group stripped as the control (ludics-lite#437).
 # It ends by running the guard on this checkout, which is the verdict CI's lint job reads, and on
 # test-fleet-worker.sh as it stood before ludics-lite#247, where the guard must find what that PR
 # fixed: a rule nobody has ever seen fire is a rule nobody can trust.
@@ -272,6 +274,94 @@ if grep -qF BODY_RAN <<<"$out" && ! grep -qF APPENDED_RAN <<<"$out"; then
 else
   ko "a line appended past the closing brace ran -- $out"
 fi
+
+# --- the long-running scripts, rewritten in place under a running copy ---------------------------
+# ALSO_GUARDED names the non-test scripts that run for minutes to hours from the checkout serving
+# them (ludics-lite#437). What corrupts such a run is a writer that rewrites the file IN PLACE,
+# through its inode -- `cp` over it, a `>` redirection, `rsync --inplace`, an editor that saves in
+# place -- and that is the writer used here: `cat <new> ><file>`. A git fast-forward is NOT such a
+# writer: checkout unlinks the old file and creates a new one, and a running shell keeps reading
+# the old inode, so a case built on one would pass with or without the group (measured for #437).
+#
+# Each listed script is copied and held just inside its `{` until the rewrite has landed; the
+# rewrite puts three marker lines at exactly the offset where the hold line ends, which is where a
+# shell that comes back to the file resumes (bash discards its read buffer at every fork). The copy
+# is run with --help, which every one of them answers quickly and without side effects, under a
+# scratch HOME. The guarded copy must answer exactly as the same copy does unrewritten; the copy
+# with the wrapper stripped, rewritten the same way, must land on the marker -- the control that
+# makes the first half a test of the group rather than of where the rewrite happened to fall.
+MIDRUN="$TMP/midrun"
+mkdir -p "$MIDRUN/home"
+MARK='echo "REWRITE_RESUMED at line $LINENO" >&2; exit 99'
+
+# midrun_run <copy> <hold-line>: run the held copy, rewrite it in place once it holds, let it go.
+# Leaves its output in <copy>.out and prints its exit status.
+midrun_run() {
+  local copy="$1" hold="$2" pid rc tries=0
+  rm -f "$copy.started" "$copy.go"
+  (cd "$MIDRUN" && HOME="$MIDRUN/home" exec bash "$copy" --help) >"$copy.out" 2>&1 </dev/null &
+  pid=$!
+  while [ ! -e "$copy.started" ] && [ "$tries" -lt 300 ]; do
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  # A copy that never reached its hold would be rewritten before it ran, not under it: say so
+  # rather than report an exit status that a rewrite-free run could equally have produced.
+  [ -e "$copy.started" ] || { touch "$copy.go"; wait "$pid"; printf '%s' "never-held"; return; }
+  { head -n "$hold" "$copy"; printf '%s\n' "$MARK" "$MARK" "$MARK"; tail -n +"$((hold + 1))" "$copy"; } >"$copy.new"
+  cat "$copy.new" >"$copy"
+  touch "$copy.go"
+  if wait "$pid"; then rc=0; else rc=$?; fi
+  printf '%s' "$rc"
+}
+
+# midrun_hold <file> <line>: insert the hold after <line> of <file>, in place.
+midrun_hold() {
+  local held
+  held=$(awk -v at="$2" -v hold="touch '$1.started'; while [ ! -e '$1.go' ]; do sleep 0.1; done" \
+    '{ print } NR == at { print hold }' "$1")
+  printf '%s\n' "$held" >"$1"
+}
+
+listed=0
+while IFS= read -r rel; do
+  listed=$((listed + 1))
+  name=$(basename "$rel" .sh)
+  src="$ROOT/$rel"
+  open=$(grep -n -m1 '^{$' "$src" | cut -d: -f1)
+  if [ -z "$open" ]; then
+    ko "$rel has no line that is exactly \`{\`, so there is no group to hold it inside"
+    continue
+  fi
+
+  # The baseline: the pristine copy's answer, from the same path the held copy will run at.
+  copy="$MIDRUN/$name.sh"
+  cp "$src" "$copy"
+  want=$(cd "$MIDRUN" && HOME="$MIDRUN/home" bash "$copy" --help 2>&1 </dev/null)
+  want_rc=$?
+
+  midrun_hold "$copy" "$open"
+  rc=$(midrun_run "$copy" "$((open + 1))")
+  got=$(cat "$copy.out")
+  if [ "$rc" = "$want_rc" ] && [ "$got" = "$want" ] && ! grep -qF REWRITE_RESUMED <<<"$got"; then
+    ok "$rel, rewritten in place under a running copy, answers exactly as it does unrewritten (exit $rc)"
+  else
+    ko "$rel, rewritten in place mid-run, exited $rc (want $want_rc) -- $got"
+  fi
+
+  # The control: the same copy with the two wrapper lines stripped, held where the `{` stood.
+  plain="$MIDRUN/$name-plain.sh"
+  sed -e "${open}d" -e '$d' "$src" | sed '$d' >"$plain"
+  midrun_hold "$plain" "$((open - 1))"
+  rc=$(midrun_run "$plain" "$open")
+  if [ "$rc" = 99 ] && grep -qF REWRITE_RESUMED "$plain.out"; then
+    ok "$rel without the group resumes at the rewritten offset, which is what the case above is guarded against"
+  else
+    ko "negative control: $rel without the group did not resume at the marker (exit $rc), so the case above proves nothing -- $(cat "$plain.out")"
+  fi
+done < <("$CP" --also-guarded)
+[ "$listed" -gt 0 ] || ko "check-parse-guards.sh --also-guarded listed nothing, so no script was rewritten under a run"
+
 # --- the dual-mode libraries -------------------------------------------------------------------
 # test-pr-review-lib.sh and test-pr-review-base-lib.sh are sourced by the suites over them AND run
 # on their own. Inside the group, their `[ "${BASH_SOURCE[0]}" = "$0" ] || return 0` dispatch ends
@@ -381,15 +471,18 @@ fi
 
 # scratch_tree <name>: a scratch checkout with the guard installed where it lives here, so that
 # running it with no arguments exercises the real default sweep over a tree we control. It comes
-# with one good suite (so the sweep is never empty for the wrong reason) and a good
-# post-merge-cleanup.sh (which ALSO_GUARDED requires to exist).
+# with one good suite (so the sweep is never empty for the wrong reason) and a good file at every
+# path ALSO_GUARDED names (which it requires to exist).
 scratch_tree() {
-  local d="$TMP/$1"
-  mkdir -p "$d/scripts" "$d/ship-pr/scripts"
+  local d="$TMP/$1" x
+  mkdir -p "$d/scripts"
   cp "$CP" "$d/scripts/check-parse-guards.sh"
   chmod +x "$d/scripts/check-parse-guards.sh"
   cp "$TMP/good.sh" "$d/scripts/test-good.sh"
-  cp "$TMP/good.sh" "$d/ship-pr/scripts/post-merge-cleanup.sh"
+  while IFS= read -r x; do
+    mkdir -p "$d/$(dirname "$x")"
+    cp "$TMP/good.sh" "$d/$x"
+  done < <("$CP" --also-guarded)
   printf '%s' "$d/scripts/check-parse-guards.sh"
 }
 

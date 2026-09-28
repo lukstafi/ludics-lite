@@ -73,6 +73,7 @@
 # reads a script, and python and pwsh read theirs whole.
 #
 # Usage: check-parse-guards.sh [file...]   (default: the sweep above)
+#        check-parse-guards.sh --also-guarded   (print the ALSO_GUARDED list, one path per line)
 # Exit 0 when every file is one brace group, 1 when one is not, 2 on a usage error.
 
 set -euo pipefail
@@ -88,11 +89,24 @@ esac
 
 # A non-test script required to carry the shape, named one path at a time. post-merge-cleanup.sh is
 # here because ludics-lite#10 armored it: the suite runs it once per case while a review round can
-# be editing it. The list is explicit rather than a glob because the shape is not free — a script
-# that runs and exits in a second has no window to be edited in — so each entry is a decision.
+# be editing it. The other four run for minutes to hours from the checkout that serves them -- a
+# `fleet-worker.sh attach` or lock wait, a `bg-run.sh start` supervising a `pr-review.sh watch`, a
+# `wake-lab.sh --wait`, a `wait-for.sh` -- while a deploy can land a merged change in that
+# checkout (ludics-lite#437). The list is explicit rather than a glob because the shape is not
+# free -- a script that runs and exits in a second has no window to be edited in -- so each entry
+# is a decision. `--also-guarded` prints it, one repo-relative path per line, for the fixture
+# suite, which rewrites every entry in place under a running copy.
 ALSO_GUARDED=(
   ship-pr/scripts/post-merge-cleanup.sh
+  issue-wave/scripts/fleet-worker.sh
+  issue-wave/scripts/bg-run.sh
+  scripts/wake-lab.sh
+  wait-and-proceed/scripts/wait-for.sh
 )
+if [ "${1:-}" = --also-guarded ]; then
+  printf '%s\n' "${ALSO_GUARDED[@]}"
+  exit 0
+fi
 
 # The wrapper-removal probe of rule 3 needs somewhere to write the body it parses.
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/check-parse-guards.XXXXXX") || exit 2
