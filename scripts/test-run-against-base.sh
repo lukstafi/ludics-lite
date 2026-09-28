@@ -99,7 +99,9 @@ ln -s "$TMP/victim.sh" "$R/scripts/test-link.sh"
 mkdir -p "$TMP/outdir" "$R/scripts/test-dir"
 ln -s "$TMP/outdir" "$R/scripts/lnk"
 printf 'x\n' >"$R/scripts/test-dir/x"
+# ...and a directory that is a submodule (a gitlink) in the base and an ordinary one now.
 g -C "$R" add -A
+g -C "$R" update-index --add --cacheinfo "160000,$BASE_SHA,scripts/subdir"
 g -C "$R" commit -qm link
 g -C "$R" checkout -q main
 
@@ -142,6 +144,8 @@ echo "1 passed, 0 failed"
 EOF
 chmod +x "$R/scripts/test-link.sh"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/-check.sh"
+mkdir -p "$R/scripts/subdir"
+cp -p "$R/scripts/test-link.sh" "$R/scripts/subdir/test-insub.sh"
 # A name ending in a newline, beside the same name without it (which must not be the one run).
 cp -p "$R/scripts/test-link.sh" "$R/scripts/test-nl.sh"$'\n'
 printf '#!/usr/bin/env bash\necho "WRONG FILE"\nexit 3\n' >"$R/scripts/test-nl.sh"
@@ -407,6 +411,14 @@ else
   ko "git env: rc=$rc TOPLEVEL=$top -- $out"
 fi
 worktrees_clean "after a caller with git's local variables"
+# A parent that is a submodule in the base: its content is not checked out there, so the run is
+# refused rather than reported as a base failure.
+run_rab subdir/test-insub.sh --base linked
+if [ "$rc" -eq 125 ] && grep -qF 'is a submodule in linked' <<<"$out"; then
+  ok "a path through a submodule of the base is refused"
+else
+  ko "base gitlink: rc=$rc -- $out"
+fi
 # A suite in a nested repository (as a submodule's would be) is refused from the outer one: the
 # outer base holds none of its neighbours.
 g init -q "$R/sub"

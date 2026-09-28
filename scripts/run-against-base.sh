@@ -237,6 +237,11 @@ rest=$rel
 while case "$rest" in */*) true ;; *) false ;; esac do
   dest="$dest/${rest%%/*}"
   rest=${rest#*/}
+  # A submodule in the base is checked out as an empty directory: the suite would fail there for
+  # want of neighbours the base does have, which is a false result, not a negative control.
+  case "$(git -C "$TOP" ls-tree "$sha" -- "${dest#"$WT"/}" 2>/dev/null)" in
+  160000\ *) die "${dest#"$WT"/} is a submodule in $base; run the helper inside that repository" ;;
+  esac
   if [ -L "$dest" ] || { [ -e "$dest" ] && [ ! -d "$dest" ]; }; then
     rm -f "$dest" || die "cannot replace ${dest#"$WT"/} in the base worktree"
   fi
