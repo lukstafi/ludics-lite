@@ -54,6 +54,18 @@
 # Requires bash 3.2 (stock macOS): no associative arrays, no ${var,,}.
 set -u
 
+# Bash reads a script by OFFSET while it runs, so a writer that rewrites this file IN PLACE, through
+# its own inode (`cp` over it, a shell `>` redirection, `rsync --inplace`, an editor that saves in
+# place), resumes a running shell mid-command in whatever text now sits at the offset it left off
+# at. `--wait` and a lock wait live for minutes, from the checkout its ~/bin symlink resolves into.
+# A git fast-forward is not such a writer: checkout unlinks the old file and creates a new one, and
+# a running shell keeps reading the old inode (measured for ludics-lite#437). Everything below is
+# one brace group, parsed whole before its first command runs, and the closing exit means the shell
+# never comes back to the file; the body keeps its own indentation, so the guard is these lines and
+# two at the foot. scripts/check-parse-guards.sh holds the shape (ALSO_GUARDED), and
+# scripts/test-check-parse-guards.sh rewrites the file in place under a running copy.
+{
+
 ROUTER=192.168.178.1
 BCAST=192.168.178.255
 HOSTS_CTL=/upnp/control/hosts
@@ -1566,3 +1578,5 @@ case "$VERB" in
     fi
     ;;
 esac
+exit "$?"
+}
