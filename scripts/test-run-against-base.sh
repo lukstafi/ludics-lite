@@ -15,7 +15,10 @@
 #   - nothing the suite does holds the helper: a suite that ignores TERM is killed after the grace,
 #     an orphan that inherited its output is stopped with it, and a worktree it locked still goes;
 #     a left-behind child with a TERM cleanup of its own gets the whole grace to finish it;
-#   - a base that keeps the suite's path as a symlink out of the checkout is not written through.
+#   - whatever the base keeps on the suite's path -- a symlink out of the checkout at the leaf or
+#     at a parent, a directory where the suite now is -- is replaced, never followed or written
+#     through, and nothing is created outside the worktree;
+#   - RUN_AGAINST_BASE_GRACE is validated up front, and a suite's own 125 exits 1.
 #
 # Usage: test-run-against-base.sh   (exit 0 all pass, 1 otherwise)
 
@@ -82,6 +85,11 @@ g -C "$R" checkout -q main
 printf '%s\n' 'VICTIM' >"$TMP/victim.sh"
 g -C "$R" checkout -qb linked
 ln -s "$TMP/victim.sh" "$R/scripts/test-link.sh"
+# ...a parent directory kept as a symlink out of the checkout, and a directory where the working
+# tree has a suite file.
+mkdir -p "$TMP/outdir" "$R/scripts/test-dir"
+ln -s "$TMP/outdir" "$R/scripts/lnk"
+printf 'x\n' >"$R/scripts/test-dir/x"
 g -C "$R" add -A
 g -C "$R" commit -qm link
 g -C "$R" checkout -q main
@@ -103,6 +111,7 @@ case "${1-}" in
 --stubborn) trap '' TERM; echo "$$" >"$2"; while :; do sleep 1; done ;;
 --orphan) sleep 60 & echo "$!" >"$2" ;;
 --graceful) ( trap 'sleep 1; echo done >"$2"; exit 0' TERM; sleep 60 & wait ) >/dev/null 2>&1 & ;;
+--rc125) exit 125 ;;
 --lock) git -C "$HERE" worktree lock "$(git -C "$HERE" rev-parse --show-toplevel)" ;;
 esac
 echo "$pass passed, $fail failed"
@@ -118,6 +127,9 @@ cat >"$R/scripts/test-link.sh" <<'EOF'
 echo "1 passed, 0 failed"
 EOF
 chmod +x "$R/scripts/test-link.sh"
+mkdir -p "$R/scripts/lnk/deep"
+cp -p "$R/scripts/test-link.sh" "$R/scripts/lnk/deep/test-deep.sh"
+cp -p "$R/scripts/test-link.sh" "$R/scripts/test-dir"
 status_before=$(git -C "$R" status --porcelain)
 
 # worktrees_clean LABEL: nothing but the checkout itself registered, and no helper scratch left.
@@ -308,6 +320,37 @@ else
   ko "symlink: rc=$rc, victim now: $(cat "$TMP/victim.sh") -- $out"
 fi
 worktrees_clean "after a symlinked base path"
+
+# A parent component the base keeps as a symlink is replaced, not followed -- not even by mkdir.
+run_rab lnk/deep/test-deep.sh --base linked
+if [ "$rc" -eq 0 ] && [ -z "$(ls -A "$TMP/outdir")" ]; then
+  ok "a symlinked parent in the base is replaced: nothing created outside the worktree"
+else
+  ko "parent symlink: rc=$rc, outdir holds [$(ls -A "$TMP/outdir")] -- $out"
+fi
+# A directory in the base where the working tree has the suite file: a path-type change.
+run_rab test-dir --base linked
+if [ "$rc" -eq 0 ]; then ok "a base directory at the suite's path is replaced"; else ko "dir at suite path: rc=$rc -- $out"; fi
+worktrees_clean "after replacing base paths"
+
+# The grace is validated before anything is allocated; a suite's own 125 is not the helper's.
+out=$(cd "$R/scripts" && TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=0.5 "$RAB" test-toy.sh 2>&1)
+rc=$?
+if [ "$rc" -eq 125 ] && grep -qF 'must be whole seconds' <<<"$out"; then
+  ok "a fractional grace is refused up front"
+else
+  ko "grace 0.5: rc=$rc -- $out"
+fi
+out=$(cd "$R/scripts" && TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=09 "$RAB" test-toy.sh 2>&1)
+rc=$?
+if [ "$rc" -eq 1 ]; then ok "a zero-padded grace (09) is read as decimal"; else ko "grace 09: rc=$rc -- $out"; fi
+run_rab test-toy.sh --rc125
+if [ "$rc" -eq 1 ] && grep -qF 'exit 125 on origin/main' <<<"$out"; then
+  ok "a suite's own 125 is reported, and exits 1"
+else
+  ko "suite 125: rc=$rc -- $out"
+fi
+worktrees_clean "after grace and 125 cases"
 
 # A suite that locks its own worktree: a single --force refuses a locked one.
 run_rab test-toy.sh --lock

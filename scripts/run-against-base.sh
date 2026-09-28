@@ -24,8 +24,9 @@
 #                 suite path, and every argument after it goes to the suite
 # Exit: the suite's own exit status; 125 when the helper could not run it at all, or could not
 # unregister the worktree afterwards (the `git bisect run` convention for "cannot test"), so a
-# refusal is never read as the suite's failure. Whatever the suite left running is stopped with
-# it: its process group gets TERM, then KILL after RUN_AGAINST_BASE_GRACE seconds (default 5).
+# refusal is never read as the suite's failure -- and a suite's own 125 is reported as 1.
+# Whatever the suite left running is stopped with it: its process group gets TERM, then KILL
+# after RUN_AGAINST_BASE_GRACE whole seconds (default 5).
 
 set -uo pipefail
 
@@ -72,12 +73,17 @@ case "$rel" in
 esac
 sha=$(git -C "$TOP" rev-parse --verify --quiet "$base^{commit}") || die "no such commit: $base"
 
+# Whole seconds, checked before anything is allocated: the cleanup does integer arithmetic on it,
+# and an expansion error inside the EXIT trap would leave the suite and its worktree behind.
+GRACE=${RUN_AGAINST_BASE_GRACE:-5}
+case "$GRACE" in '' | *[!0-9]*) die "RUN_AGAINST_BASE_GRACE must be whole seconds: $GRACE" ;; esac
+GRACE=$((10#$GRACE))
+
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/run-against-base.$$.XXXXXX") || die "mktemp failed"
 SCRATCH=$(CDPATH= cd "$SCRATCH" && pwd -P) || die "cannot resolve $SCRATCH"
 WT="$SCRATCH/base"
 child=
 teepid=
-GRACE=${RUN_AGAINST_BASE_GRACE:-5}
 # live PID | live -PGID: whether that process, or any member of that process group, is still
 # running. An exited child of this shell stays a zombie until it is waited for, and kill -0
 # still reaches a zombie, so the state is read instead.
@@ -132,17 +138,30 @@ trap 'exit 143' TERM HUP
 
 git -C "$TOP" worktree add --quiet --detach "$WT" "$sha" >/dev/null 2>&1 \
   || die "git worktree add failed for $base ($sha)"
-# The base decides what stands at the suite's path, and a symlink there (or at a parent) would
-# have the copy write through it, outside the worktree: the parent must resolve inside it, and a
-# link at the leaf is removed rather than followed.
-mkdir -p "$(dirname "$WT/$rel")" || die "cannot create $(dirname "$WT/$rel")"
-dest_dir=$(CDPATH= cd "$(dirname "$WT/$rel")" && pwd -P) || die "cannot resolve $(dirname "$rel") in the base"
-case "$dest_dir/" in
-"$WT"/*) ;;
-*) die "$(dirname "$rel") resolves outside the base worktree (a symlink in $base): $dest_dir" ;;
-esac
-dest="$dest_dir/$(basename "$rel")"
-if [ -L "$dest" ] || [ -e "$dest" ]; then rm -f "$dest" || die "cannot replace $rel in the base worktree"; fi
+# The suite's path is installed one component at a time, and at each one whatever the base has
+# there -- a symlink, a file, a directory where the suite now is -- is replaced, never followed:
+# the working tree's shape wins, so nothing is created or written outside the worktree. (`rel`
+# came from a `pwd -P`, so every component above the suite is a real directory in the working
+# tree too.)
+dest=$WT
+old_ifs=$IFS
+IFS=/
+set -f
+# shellcheck disable=SC2086 # the split on / is the point
+set -- $rel -- "$@"
+set +f
+IFS=$old_ifs
+while [ "$2" != -- ]; do
+  dest="$dest/$1"
+  if [ -L "$dest" ] || { [ -e "$dest" ] && [ ! -d "$dest" ]; }; then
+    rm -f "$dest" || die "cannot replace ${dest#"$WT"/} in the base worktree"
+  fi
+  [ -d "$dest" ] || mkdir "$dest" || die "cannot create ${dest#"$WT"/} in the base worktree"
+  shift
+done
+dest="$dest/$1"
+shift 2
+if [ -L "$dest" ] || [ -e "$dest" ]; then rm -rf "$dest" || die "cannot replace $rel in the base worktree"; fi
 cp -p "$suite_abs" "$dest" || die "cannot copy $rel into the base worktree"
 
 say "$rel (working tree) against $base ($(git -C "$TOP" rev-parse --short "$sha"))"
@@ -171,6 +190,8 @@ teepid=
 tally=$(grep -E '[0-9]+ passed, [0-9]+ failed' "$LOG" | tail -n 1)
 [ -n "$tally" ] || tally=$(grep -v '^[[:space:]]*$' "$LOG" | tail -n 1)
 say "exit $rc on $base: ${tally:-(no output)}"
+# 125 is this helper's own "could not run it"; a suite that returns it failed, and says so as 1.
+[ "$rc" -eq 125 ] && rc=1
 exit "$rc"
 exit "$?"
 }
