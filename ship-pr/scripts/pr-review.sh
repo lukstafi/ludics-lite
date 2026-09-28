@@ -1627,7 +1627,7 @@ status_state() {
     0) ;;
     *)
       echo "unknown|-|$mstate|a $REVIEWER Code Review row matched the Running test but not the" \
-        "stamp pattern beside it, so the running round could not be read"
+        "SUMMARY_ROW_STAMP_RE, so the running round could not be read"
       return 0
       ;;
     esac
