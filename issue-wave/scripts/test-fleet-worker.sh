@@ -1596,15 +1596,42 @@ for want in "\"observed_sha\": \"$ran\"" "\"remote_checkout\": \"$wt\"" "\"handl
   grep -Fq -- "$want" <<<"$out" && ok "...recorded $want" || ko "missing $want in $out"
 done
 jq -e '.history[-1].data | has("execution_host") | not' <<<"$out" >/dev/null && ok "...and the box check left no field behind" || ko "the box bound to the evidence leaked into the record: $out"
+grep -Fq "the record has no head or dirty" <<<"$out" && ok "...and says the record named no revision of its own" || ko "a record without head/dirty concluded silently: $out"
 run_conclude() { local id="$1" dir="$2"; shift 2; "${FWX[@]}" execution run "$(reqjson "$id")" >/dev/null && "${FWX[@]}" execution conclude --from-run "$dir" --request "$id" --sha "$ran" "$@"; }
 expect "a capped run concludes as timeout" 0 '"verdict": "timeout"' -- run_conclude run-b "$runs/20260915T201414Z-3"
-expect "a red run concludes as fail, with the given evidence" 0 '"evidence": "sweep red on scans"' -- run_conclude run-c "$runs/20260915T201414Z-4" --evidence "sweep red on scans"
+expect "a red run concludes as fail, with the given evidence" 0 '"evidence": "sweep red on scans; the record has no head or dirty' -- run_conclude run-c "$runs/20260915T201414Z-4" --evidence "sweep red on scans"
 grep -q '"verdict": "fail"' <<<"$out" && ok "...as fail" || ko "exit 1 did not read as fail: $out"
 expect "conclude --from-run on an unknown request is refused before any box is read" 1 "unknown request_id run-zz" -- "${FWX[@]}" execution conclude --from-run "$run1" --request run-zz --sha "$ran"
 # A checkout that moved on after the run still concludes on the reported revision, and says so.
 git -C "$wt" commit -q --allow-empty -m moved   # a guaranteed new head, whatever the clone holds
-expect "a moved checkout concludes on the reported revision and records the drift" 0 "checkout head is now $(git -C "$wt" rev-parse HEAD), revision $ran as reported" -- run_conclude run-d "$runs/20260915T201414Z-5"
+expect "a moved checkout concludes on the reported revision and records the drift" 0 "revision is $ran as reported by the worker; checkout head is now $(git -C "$wt" rev-parse HEAD)" -- run_conclude run-d "$runs/20260915T201414Z-5"
 grep -Fq "\"observed_sha\": \"$ran\"" <<<"$out" && ok "...with the reported revision as observed_sha" || ko "wrong observed_sha: $out"
+# The launch-time source record (ludics-lite#438; OCANNL's test-run.sh since ocannl-staging#808):
+# `head` and `dirty`, both or neither. The records above carry neither, the fallback. Each case
+# below is its own record under its own reservation, so on a checker that reads neither file each
+# one fails on its own, not behind an earlier case's conclusion.
+moved=$(git -C "$wt" rev-parse HEAD)
+mksrc() { # <name> <head or -> <dirty lines or -> -> a finished passed record with that source record
+  mkrun "$1" 0; [ "$2" = - ] || printf '%s\n' "$2" > "$runs/$1/head"
+  [ "$3" = - ] || printf '%s' "$3" > "$runs/$1/dirty"
+}
+mksrc src-clean "$ran" ""; mksrc src-other "$moved" ""; mksrc src-dirty "$ran" $' M lib/a.ml\n?? test/new_test.ml\n'
+mksrc src-head-only "$ran" -; mksrc src-dirty-only - ""; mksrc src-bad-head "not-a-sha" ""
+# src_refused <label> <record> <want>: a refusal that leaves its reservation dispatched.
+src_refused() {
+  "${FWX[@]}" execution run "$(reqjson "run-$2")" >/dev/null || ko "could not reserve run-$2 (setup)"
+  expect "$1" 1 "$3" -- "${FWX[@]}" execution conclude --from-run "$runs/$2" --request "run-$2" --sha "$ran"
+  "$FW" execution list | jq -e --arg id "run-$2" '[.[] | select(.request_id == $id) | .state] == ["launching"]' >/dev/null &&
+    ok "...and left the assignment dispatched" || ko "the refusal of $2 changed its record"
+  fixture_done "run-$2"
+}
+src_refused "a record launched at another revision is refused, naming both" src-other "FROM-RUN REFUSED: .*/head records $moved as the revision launched, but the reported revision is $ran"
+src_refused "a record launched over uncommitted edits is refused, with their count" src-dirty "FROM-RUN REFUSED: .*/dirty lists 2 uncommitted path"
+src_refused "a head without a dirty is a malformed record" src-head-only "FROM-RUN REFUSED: .*has a head but no dirty"
+src_refused "a dirty without a head is a malformed record" src-dirty-only "FROM-RUN REFUSED: .*has a dirty but no head"
+src_refused "a head that is not a commit ID is a malformed record" src-bad-head "FROM-RUN REFUSED: .*/head holds 'not-a-sha'"
+expect "a record launched clean at the reported revision concludes, and says so" 0 "launched at $ran on a clean tree" -- run_conclude run-src-clean "$runs/src-clean"
+grep -Fq "\"observed_sha\": \"$ran\"" <<<"$out" && grep -Fq '"verdict": "pass"' <<<"$out" && ok "...as a pass at the recorded revision" || ko "clean record: $out"
 fixture_done run-other
 expect "a run of a request outside the roster is refused" 1 "canonical FLEET_BOXES" -- "$FW" execution run "$(reqjson run-e)"
 # The base gate offers the checker the registry's INTEGRATION RECORDS for its target (ludics-lite
