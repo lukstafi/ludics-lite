@@ -102,6 +102,7 @@ ALSO_GUARDED=(
   issue-wave/scripts/bg-run.sh
   scripts/wake-lab.sh
   wait-and-proceed/scripts/wait-for.sh
+  scripts/run-against-base.sh
 )
 if [ "${1:-}" = --also-guarded ]; then
   printf '%s\n' "${ALSO_GUARDED[@]}"

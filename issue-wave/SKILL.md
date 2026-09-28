@@ -365,7 +365,8 @@ requirements for every transport with transport-specific setup and identity, and
   ONLY the comments and never the body, so on a comment-less issue it emits zero bytes and
   exits 0 - the worker then holds nothing of its task and reconstructs it from the brief's
   summary (ludics-lite#70 and #76, 2026-09-10).
-- Verification expectations: scoped test runs, negative controls where the work is a checker,
+- Verification expectations: scoped test runs, negative controls where the work is a checker
+  (new fixtures shown to FAIL on base: `~/ludics-lite/scripts/run-against-base.sh <suite>`, slot-wrapped),
   and the box's known environmental traps. **On mac-studio**: Gatekeeper/XProtect stalls
   fresh executables for minutes - sample the pid before assuming a hang; never start a second
   dune against a running _build; and **targeted test aliases only** (`dune build

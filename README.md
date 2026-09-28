@@ -328,6 +328,16 @@ always runs the whole suite; the full run before a push still stands. Every case
 given must already be a defined function, or the run is refused before any case: PR #415 defined a
 case inside another case's body, which a full run reached but a subset could never select.
 
+To show that new fixtures FAIL on the base code — the negative control every issue-wave brief
+asks for — run `scripts/run-against-base.sh <suite-path> [--base <ref>] [suite args...]`. It makes a
+detached worktree of `origin/main` (or `<ref>`) under `$TMPDIR`, copies the working tree's version
+of that one suite over the base's, runs it from the base worktree, and reports its exit status and
+pass/fail line (its own refusals exit 125, never the suite's status); the worktree is removed and
+pruned on every exit path, INT and TERM included, and whatever the suite left running is stopped
+with it (its process group: TERM, then KILL after a grace). It is a suite run, so wrap it in
+`~/.claude/skills/issue-wave/scripts/fleet-worker.sh execution slot -- …` like any other.
+`scripts/test-run-against-base.sh` pins it against a scratch repo.
+
 The scripts carry their own test suites (Python fixtures use `python3`; PowerShell fixtures run on Windows):
 
 ```sh
@@ -364,6 +374,7 @@ scripts/test-check-scratch-dirs.sh
 scripts/test-check-parse-guards.sh
 scripts/test-preflight.sh
 scripts/test-sync-routines.sh
+scripts/test-run-against-base.sh
 ```
 
 Four conventions travel with that list. Each is held by a scanner that reads line shapes — a
@@ -409,7 +420,8 @@ by a sibling takes the same shape: the `[ "${BASH_SOURCE[0]}" = "$0" ] || return
 `test-pr-review-lib.sh` and `test-pr-review-base-lib.sh` ends the sourcing inside the group, before
 the foot is reached, so the caller survives with the definitions it came for. The long-running
 non-test scripts in `ALSO_GUARDED` (`fleet-worker.sh`, `bg-run.sh`, `wake-lab.sh`, `wait-for.sh`)
-take the shape too, because they run for hours from the checkout a deploy updates (ludics-lite#437).
+take the shape too, because they run for hours from the checkout a deploy updates (ludics-lite#437),
+and so does `run-against-base.sh`, which runs a suite for as long as the suite takes.
 What corrupts such a run is a writer that rewrites the file in place, through its inode (`cp` over
 it, a `>` redirection, `rsync --inplace`); a git fast-forward does not, since checkout replaces the
 file and a running shell keeps reading the old inode. `test-check-parse-guards.sh` rewrites each
