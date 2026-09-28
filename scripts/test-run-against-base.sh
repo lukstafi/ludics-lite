@@ -18,8 +18,8 @@
 #   - whatever the base keeps on the suite's path -- a symlink out of the checkout at the leaf or
 #     at a parent, a directory where the suite now is -- is replaced, never followed or written
 #     through, and nothing is created outside the worktree;
-#   - a `--` directory on the suite's path installs, and a working-tree suite that is a symlink
-#     is refused rather than followed;
+#   - a suite named with a leading dash runs, a `--` directory on the suite's path installs,
+#     and a working-tree suite that is a symlink is refused rather than followed;
 #   - a path inside .git is refused, and a suite that cannot be started (a missing interpreter)
 #     exits 125 rather than its exec error's 126/127;
 #   - an unreadable directory the suite leaves behind does not leak the scratch;
@@ -140,6 +140,7 @@ cat >"$R/scripts/test-link.sh" <<'EOF'
 echo "1 passed, 0 failed"
 EOF
 chmod +x "$R/scripts/test-link.sh"
+cp -p "$R/scripts/test-link.sh" "$R/scripts/-check.sh"
 mkdir -p "$R/scripts/--"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/--/test-dash.sh"
 # An executable suite outside git, so only the symlink refusal can stop it running.
@@ -358,6 +359,9 @@ run_rab test-dir --base linked
 if [ "$rc" -eq 0 ]; then ok "a base directory at the suite's path is replaced"; else ko "dir at suite path: rc=$rc -- $out"; fi
 worktrees_clean "after replacing base paths"
 
+# A suite name that starts with a dash is a file, not an option.
+run_rab -check.sh
+if [ "$rc" -eq 0 ]; then ok "a suite named -check.sh runs"; else ko "leading dash: rc=$rc -- $out"; fi
 # A directory literally named `--` is a path component like any other.
 run_rab ./--/test-dash.sh
 if [ "$rc" -eq 0 ]; then ok "a \`--\` directory on the suite's path installs"; else ko "-- component: rc=$rc -- $out"; fi

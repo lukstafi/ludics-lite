@@ -56,6 +56,9 @@ if [ "${1-}" = --base ]; then
   shift 2
 fi
 
+# A relative path gets a `./`, so a name like `-check.sh` is never read as an option by dirname,
+# basename or cd.
+case "$suite_arg" in /*) ;; *) suite_arg="./$suite_arg" ;; esac
 [ -f "$suite_arg" ] || die "no such file in the working tree: $suite_arg"
 # A symlink is refused rather than resolved: what it points at may be outside git, and the negative
 # control must be the working tree's committed-or-edited file, not something it reaches.
@@ -181,17 +184,17 @@ say "$rel (working tree) against $base ($(git -C "$TOP" rev-parse --short "$sha"
 # returns; its output goes through a fifo to tee, which both shows it live and keeps it for the
 # pass/fail line (a `| tee` would hide the suite's exit status behind tee's under `wait`).
 LOG="$SCRATCH/out"
+# Signals are deferred from the launches until `teepid` and `child` are recorded: a trap taken in between would
+# run the cleanup without knowing what it has to stop, and leave tee or the suite running.
+pending=
+trap 'pending=130' INT
+trap 'pending=143' TERM HUP
 mkfifo "$SCRATCH/fifo" || die "mkfifo failed"
 tee "$LOG" <"$SCRATCH/fifo" &
 teepid=$!
 # `set -m` puts the suite in a process group of its own (its pid is the group id), which
 # stop_group signals whole; it also keeps INT at its default there rather than ignored, as a
 # non-interactive shell would start a background job.
-# Signals are deferred from the launch until `child` is recorded: a trap taken in between would
-# run the cleanup without knowing the process group it owns, and leave the suite running.
-pending=
-trap 'pending=130' INT
-trap 'pending=143' TERM HUP
 set -m
 # execfail: a suite that cannot be started at all (a missing interpreter, no python3) never ran,
 # so it must not read as the suite's 126/127 failure on the base; the marker tells the two apart.
@@ -221,8 +224,19 @@ fi
 # Anything the suite left running still holds the fifo open; stop it so tee sees EOF.
 stop_group
 child=
-if ! gone "$teepid"; then kill "$teepid" 2>/dev/null; fi
+# tee is reaped and judged too: a capture that failed, or that something outside the group still
+# held open past the grace, would make the result line (and a SIGPIPE'd suite's status) a claim
+# about output nobody read.
+if gone "$teepid"; then
+  wait "$teepid"
+  tee_rc=$?
+else
+  kill "$teepid" 2>/dev/null
+  wait "$teepid" 2>/dev/null
+  tee_rc=timeout
+fi
 teepid=
+[ "$tee_rc" = 0 ] || die "capturing the suite's output failed (tee: $tee_rc); its exit $rc is not a result"
 
 tally=$(grep -E '[0-9]+ passed, [0-9]+ failed' "$LOG" | tail -n 1)
 [ -n "$tally" ] || tally=$(grep -v '^[[:space:]]*$' "$LOG" | tail -n 1)
