@@ -333,7 +333,8 @@ asks for — run `scripts/run-against-base.sh <suite-path> [--base <ref>] [suite
 detached worktree of `origin/main` (or `<ref>`) under `$TMPDIR`, copies the working tree's version
 of that one suite over the base's, runs it from the base worktree, and reports its exit status and
 pass/fail line (its own refusals exit 125, never the suite's status); the worktree is removed and
-pruned on every exit path, INT and TERM included. It is a suite run, so wrap it in
+pruned on every exit path, INT and TERM included, and whatever the suite left running is stopped
+with it (its process group: TERM, then KILL after a grace). It is a suite run, so wrap it in
 `~/.claude/skills/issue-wave/scripts/fleet-worker.sh execution slot -- …` like any other.
 `scripts/test-run-against-base.sh` pins it against a scratch repo.
 

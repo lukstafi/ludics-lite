@@ -11,7 +11,9 @@
 #   - --base <ref> picks another base, and a fixed one passes;
 #   - a refusal (unknown ref, a suite outside the checkout) exits 125, never the suite's status;
 #   - every exit path, TERM and INT during the run included, leaves no worktree registered, no
-#     scratch directory under $TMPDIR, the suite process gone, and the checkout's status as it was.
+#     scratch directory under $TMPDIR, the suite process gone, and the checkout's status as it was;
+#   - nothing the suite does holds the helper: a suite that ignores TERM is killed after the grace,
+#     an orphan that inherited its output is stopped with it, and a worktree it locked still goes.
 #
 # Usage: test-run-against-base.sh   (exit 0 all pass, 1 otherwise)
 
@@ -86,7 +88,12 @@ pass=0; fail=0
 top=$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null) || top=NONE
 echo "TOPLEVEL=$(cd "$top" 2>/dev/null && pwd -P || echo NONE) HERE=$HERE"
 echo "ARGS=[$*]"
-if [ "${1-}" = --slow ]; then echo "$$" >"$2"; exec sleep 60; fi
+case "${1-}" in
+--slow) echo "$$" >"$2"; exec sleep 60 ;;
+--stubborn) trap '' TERM; echo "$$" >"$2"; while :; do sleep 1; done ;;
+--orphan) sleep 60 & echo "$!" >"$2" ;;
+--lock) git -C "$HERE" worktree lock "$(git -C "$HERE" rev-parse --show-toplevel)" ;;
+esac
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
 EOF
@@ -111,7 +118,7 @@ worktrees_clean() {
 
 # run_rab ARGS...: the helper from inside the scratch checkout; sets $out and $rc.
 run_rab() {
-  out=$(cd "$R/scripts" && TMPDIR="$HTMP" "$RAB" "$@" 2>&1)
+  out=$(cd "$R/scripts" && TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=1 "$RAB" "$@" 2>&1)
   rc=$?
 }
 
@@ -192,17 +199,17 @@ if [ "$rc" -eq 125 ]; then ok "a missing suite refused with 125"; else ko "missi
 worktrees_clean "after refusals"
 
 # ---- a signal mid-run: the worktree still goes, and so does the suite ------------------------
-# signal_case SIG WANT_RC: `set -m` gives the helper its own process group with default signal
+# signal_case SIG WANT_RC [MODE]: `set -m` gives the helper its own process group with default signal
 # dispositions -- a non-interactive shell starts background jobs with INT ignored, and a signal
 # ignored on entry cannot be trapped.
 signal_case() {
-  local sig=$1 want=$2 pidf="$TMP/suite.pid.$1" hpid spid i rc_s
+  local sig=$1 want=$2 mode=${3:---slow} pidf="$TMP/suite.pid.$1${3-}" hpid spid i rc_s
   rm -f "$pidf"
   set -m
-  (cd "$R/scripts" && TMPDIR="$HTMP" exec "$RAB" test-toy.sh --slow "$pidf") >"$TMP/sig.$sig.out" 2>&1 &
+  (cd "$R/scripts" && TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=1 exec "$RAB" test-toy.sh "$mode" "$pidf") >"$TMP/sig.$sig.out" 2>&1 &
   hpid=$!
   set +m
-  for i in $(seq 1 100); do
+  for i in $(seq 1 300); do
     [ -s "$pidf" ] && break
     sleep 0.1
   done
@@ -213,6 +220,17 @@ signal_case() {
     return
   fi
   kill -"$sig" "$hpid"
+  # Bounded: a helper that waits forever on a suite ignoring TERM is the regression this case is
+  # for, and it must fail here rather than hang the run. An exited helper is a zombie until
+  # waited for, and kill -0 reaches a zombie, so the state is read instead.
+  for i in $(seq 1 300); do
+    case $(ps -o stat= -p "$hpid" 2>/dev/null) in '' | Z*) break ;; esac
+    sleep 0.1
+  done
+  if case $(ps -o stat= -p "$hpid" 2>/dev/null) in '' | Z*) false ;; *) true ;; esac then
+    ko "$sig: the helper was still running 30s after $sig"
+    kill -KILL -- "-$hpid" "-$spid" 2>/dev/null
+  fi
   wait "$hpid"
   rc_s=$?
   if [ "$rc_s" -eq "$want" ]; then ok "$sig: helper exits $want"; else ko "$sig: helper rc=$rc_s want $want"; fi
@@ -230,6 +248,33 @@ signal_case() {
 }
 signal_case TERM 143
 signal_case INT 130
+# A suite that ignores TERM: the helper's own wait is bounded, and KILL follows the grace.
+signal_case TERM 143 --stubborn
+
+# ---- what the suite leaves behind is not the helper's to wait on ------------------------------
+# An orphan that inherited the suite's stdout holds the output pipe open after the suite exits;
+# the helper must still report and clean up promptly, and the orphan must not outlive it.
+SECONDS=0
+run_rab test-toy.sh --orphan "$TMP/orphan.pid"
+took=$SECONDS
+opid=$(cat "$TMP/orphan.pid" 2>/dev/null)
+if [ "$rc" -eq 1 ] && [ "$took" -lt 20 ] && grep -qF 'exit 1 on origin/main: 1 passed, 1 failed' <<<"$out"; then
+  ok "an orphan holding the output does not hold the helper (${took}s)"
+else
+  ko "orphan: rc=$rc after ${took}s -- $out"
+fi
+if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then
+  ok "the orphan is stopped with the suite"
+else
+  ko "the orphan ($opid) outlived the helper"
+  [ -n "$opid" ] && kill -KILL "$opid" 2>/dev/null
+fi
+worktrees_clean "after an orphaned child"
+
+# A suite that locks its own worktree: a single --force refuses a locked one.
+run_rab test-toy.sh --lock
+if [ "$rc" -eq 1 ]; then ok "a locked worktree: the suite's status is still reported"; else ko "lock: rc=$rc -- $out"; fi
+worktrees_clean "after the suite locked its worktree"
 
 printf '\n%s\n' "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

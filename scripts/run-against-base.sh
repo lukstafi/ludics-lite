@@ -22,9 +22,10 @@
 #   <suite-path>  a file in the current checkout's working tree (relative to the cwd, or absolute)
 #   --base <ref>  the base to run against (default origin/main); it must come right after the
 #                 suite path, and every argument after it goes to the suite
-# Exit: the suite's own exit status; 125 when the helper could not run it at all (the
-# `git bisect run` convention for "cannot test"), so a refusal is never read as the suite's
-# failure.
+# Exit: the suite's own exit status; 125 when the helper could not run it at all, or could not
+# unregister the worktree afterwards (the `git bisect run` convention for "cannot test"), so a
+# refusal is never read as the suite's failure. Whatever the suite left running is stopped with
+# it: its process group gets TERM, then KILL after RUN_AGAINST_BASE_GRACE seconds (default 5).
 
 set -uo pipefail
 
@@ -76,15 +77,46 @@ SCRATCH=$(CDPATH= cd "$SCRATCH" && pwd -P) || die "cannot resolve $SCRATCH"
 WT="$SCRATCH/base"
 child=
 teepid=
+GRACE=${RUN_AGAINST_BASE_GRACE:-5}
+# gone PID: true once PID has exited, polling for at most $GRACE seconds -- no wait here is
+# unbounded, since a process that ignores TERM or an orphan holding the fifo would otherwise hold
+# the helper, and the worktree, forever.
+gone() {
+  local i=0
+  # An exited child of this shell stays a zombie until it is waited for, and kill -0 still
+  # reaches a zombie, so the state is read instead.
+  while case $(ps -o stat= -p "$1" 2>/dev/null) in '' | Z*) false ;; *) true ;; esac do
+    [ "$i" -ge $((GRACE * 10)) ] && return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+}
+# stop_group: the suite runs as the leader of its own process group, so this reaches whatever it
+# left behind as well -- a background child that outlived it, one that ignores TERM -- and none of
+# it keeps running in (or writing to) a worktree about to be removed.
+stop_group() {
+  kill -TERM -- "-$child" 2>/dev/null || return 0
+  gone "$child" || true
+  sleep 0.2
+  kill -KILL -- "-$child" 2>/dev/null
+  wait "$child" 2>/dev/null
+  return 0
+}
 cleanup() {
-  [ -n "$child" ] && kill -TERM "$child" 2>/dev/null && wait "$child" 2>/dev/null
-  [ -n "$teepid" ] && kill "$teepid" 2>/dev/null
+  [ -n "$child" ] && stop_group
+  if [ -n "$teepid" ] && ! gone "$teepid"; then kill "$teepid" 2>/dev/null; fi
   if [ -d "$WT" ]; then
-    git -C "$TOP" worktree remove --force "$WT" >/dev/null 2>&1 \
-      || printf '%s\n' "run-against-base: could not remove the worktree $WT" >&2
+    # --force twice: once for the copied suite (the checkout is dirty), again for a worktree the
+    # suite locked, which a single --force refuses.
+    git -C "$TOP" worktree remove --force --force "$WT" >/dev/null 2>&1
   fi
   git -C "$TOP" worktree prune >/dev/null 2>&1
   rm -rf "$SCRATCH"
+  git -C "$TOP" worktree prune >/dev/null 2>&1
+  if git -C "$TOP" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $WT"; then
+    printf '%s\n' "run-against-base: the worktree $WT is still registered; remove it by hand" >&2
+    exit 125
+  fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -103,12 +135,19 @@ LOG="$SCRATCH/out"
 mkfifo "$SCRATCH/fifo" || die "mkfifo failed"
 tee "$LOG" <"$SCRATCH/fifo" &
 teepid=$!
+# `set -m` puts the suite in a process group of its own (its pid is the group id), which
+# stop_group signals whole; it also keeps INT at its default there rather than ignored, as a
+# non-interactive shell would start a background job.
+set -m
 (cd "$WT" && exec $runner "./$rel" "$@") >"$SCRATCH/fifo" 2>&1 </dev/null &
 child=$!
+set +m
 wait "$child"
 rc=$?
+# Anything the suite left running still holds the fifo open; stop it so tee sees EOF.
+stop_group
 child=
-wait "$teepid"
+if ! gone "$teepid"; then kill "$teepid" 2>/dev/null; fi
 teepid=
 
 tally=$(grep -E '[0-9]+ passed, [0-9]+ failed' "$LOG" | tail -n 1)
