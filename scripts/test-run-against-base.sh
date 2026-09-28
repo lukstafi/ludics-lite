@@ -13,7 +13,9 @@
 #   - every exit path, TERM and INT during the run included, leaves no worktree registered, no
 #     scratch directory under $TMPDIR, the suite process gone, and the checkout's status as it was;
 #   - nothing the suite does holds the helper: a suite that ignores TERM is killed after the grace,
-#     an orphan that inherited its output is stopped with it, and a worktree it locked still goes.
+#     an orphan that inherited its output is stopped with it, and a worktree it locked still goes;
+#     a left-behind child with a TERM cleanup of its own gets the whole grace to finish it;
+#   - a base that keeps the suite's path as a symlink out of the checkout is not written through.
 #
 # Usage: test-run-against-base.sh   (exit 0 all pass, 1 otherwise)
 
@@ -76,6 +78,14 @@ printf '%s\n' 'add() { echo $(($1 + $2)); }' >"$R/scripts/lib.sh"
 g -C "$R" commit -qam fix
 g -C "$R" checkout -q main
 
+# A base that keeps a suite path as a symlink to a file outside the checkout.
+printf '%s\n' 'VICTIM' >"$TMP/victim.sh"
+g -C "$R" checkout -qb linked
+ln -s "$TMP/victim.sh" "$R/scripts/test-link.sh"
+g -C "$R" add -A
+g -C "$R" commit -qm link
+g -C "$R" checkout -q main
+
 # The working tree: the fix, plus a case the base fails, a git probe, and an argument echo.
 printf '%s\n' 'add() { echo $(($1 + $2)); }' >"$R/scripts/lib.sh"
 cat >"$R/scripts/test-toy.sh" <<'EOF'
@@ -92,6 +102,7 @@ case "${1-}" in
 --slow) echo "$$" >"$2"; exec sleep 60 ;;
 --stubborn) trap '' TERM; echo "$$" >"$2"; while :; do sleep 1; done ;;
 --orphan) sleep 60 & echo "$!" >"$2" ;;
+--graceful) ( trap 'sleep 1; echo done >"$2"; exit 0' TERM; sleep 60 & wait ) >/dev/null 2>&1 & ;;
 --lock) git -C "$HERE" worktree lock "$(git -C "$HERE" rev-parse --show-toplevel)" ;;
 esac
 echo "$pass passed, $fail failed"
@@ -102,6 +113,11 @@ cat >"$R/scripts/test-new.sh" <<'EOF'
 echo "1 passed, 0 failed"
 EOF
 chmod +x "$R/scripts/test-new.sh"
+cat >"$R/scripts/test-link.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "1 passed, 0 failed"
+EOF
+chmod +x "$R/scripts/test-link.sh"
 status_before=$(git -C "$R" status --porcelain)
 
 # worktrees_clean LABEL: nothing but the checkout itself registered, and no helper scratch left.
@@ -263,13 +279,35 @@ if [ "$rc" -eq 1 ] && [ "$took" -lt 20 ] && grep -qF 'exit 1 on origin/main: 1 p
 else
   ko "orphan: rc=$rc after ${took}s -- $out"
 fi
-if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then
+# A killed orphan can sit as a zombie until init reaps it, and kill -0 reaches a zombie.
+if [ -n "$opid" ] && case $(ps -o stat= -p "$opid" 2>/dev/null) in '' | Z*) true ;; *) false ;; esac then
   ok "the orphan is stopped with the suite"
 else
   ko "the orphan ($opid) outlived the helper"
   [ -n "$opid" ] && kill -KILL "$opid" 2>/dev/null
 fi
 worktrees_clean "after an orphaned child"
+
+# A background child with a TERM cleanup of its own gets the grace, not a fixed moment: the group
+# is what is waited for, not the leader that has already exited.
+rm -f "$TMP/graceful.done"
+out=$(cd "$R/scripts" && TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=4 "$RAB" test-toy.sh --graceful "$TMP/graceful.done" 2>&1)
+rc=$?
+if [ "$rc" -eq 1 ] && [ -s "$TMP/graceful.done" ]; then
+  ok "a left-behind child's TERM cleanup completes within the grace"
+else
+  ko "graceful: rc=$rc, marker $( [ -s "$TMP/graceful.done" ] && echo present || echo absent) -- $out"
+fi
+worktrees_clean "after a graceful child"
+
+# A base whose suite path is a symlink out of the checkout: removed, never written through.
+run_rab test-link.sh --base linked
+if [ "$rc" -eq 0 ] && [ "$(cat "$TMP/victim.sh")" = VICTIM ]; then
+  ok "a symlinked suite path in the base is replaced, not written through"
+else
+  ko "symlink: rc=$rc, victim now: $(cat "$TMP/victim.sh") -- $out"
+fi
+worktrees_clean "after a symlinked base path"
 
 # A suite that locks its own worktree: a single --force refuses a locked one.
 run_rab test-toy.sh --lock

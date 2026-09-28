@@ -78,27 +78,35 @@ WT="$SCRATCH/base"
 child=
 teepid=
 GRACE=${RUN_AGAINST_BASE_GRACE:-5}
-# gone PID: true once PID has exited, polling for at most $GRACE seconds -- no wait here is
-# unbounded, since a process that ignores TERM or an orphan holding the fifo would otherwise hold
-# the helper, and the worktree, forever.
+# live PID | live -PGID: whether that process, or any member of that process group, is still
+# running. An exited child of this shell stays a zombie until it is waited for, and kill -0
+# still reaches a zombie, so the state is read instead.
+live() {
+  case "$1" in
+  -*) ps -eo pgid=,stat= 2>/dev/null | awk -v g="${1#-}" '$1 == g && $2 !~ /^Z/ { f = 1 } END { exit !f }' ;;
+  *) case $(ps -o stat= -p "$1" 2>/dev/null) in '' | Z*) return 1 ;; esac ;;
+  esac
+}
+# gone PID|-PGID: true once it is no longer live, polling for at most $GRACE seconds -- no wait
+# here is unbounded, since a process that ignores TERM or an orphan holding the fifo would
+# otherwise hold the helper, and the worktree, forever.
 gone() {
   local i=0
-  # An exited child of this shell stays a zombie until it is waited for, and kill -0 still
-  # reaches a zombie, so the state is read instead.
-  while case $(ps -o stat= -p "$1" 2>/dev/null) in '' | Z*) false ;; *) true ;; esac do
+  while live "$1"; do
     [ "$i" -ge $((GRACE * 10)) ] && return 1
     sleep 0.1
     i=$((i + 1))
   done
 }
 # stop_group: the suite runs as the leader of its own process group, so this reaches whatever it
-# left behind as well -- a background child that outlived it, one that ignores TERM -- and none of
-# it keeps running in (or writing to) a worktree about to be removed.
+# left behind in that group as well -- a background child that outlived it, one that ignores
+# TERM -- and none of it keeps running in (or writing to) a worktree about to be removed. The
+# grace is the GROUP's, not the leader's: a leader that has already exited must not cut short a
+# background child's own TERM cleanup. A descendant that leaves the group (`setsid`, its own
+# `set -m` job) has left what this helper owns; the suite that starts one stops it.
 stop_group() {
-  kill -TERM -- "-$child" 2>/dev/null || return 0
-  gone "$child" || true
-  sleep 0.2
-  kill -KILL -- "-$child" 2>/dev/null
+  kill -TERM -- "-$child" 2>/dev/null
+  gone "-$child" || kill -KILL -- "-$child" 2>/dev/null
   wait "$child" 2>/dev/null
   return 0
 }
@@ -124,8 +132,18 @@ trap 'exit 143' TERM HUP
 
 git -C "$TOP" worktree add --quiet --detach "$WT" "$sha" >/dev/null 2>&1 \
   || die "git worktree add failed for $base ($sha)"
+# The base decides what stands at the suite's path, and a symlink there (or at a parent) would
+# have the copy write through it, outside the worktree: the parent must resolve inside it, and a
+# link at the leaf is removed rather than followed.
 mkdir -p "$(dirname "$WT/$rel")" || die "cannot create $(dirname "$WT/$rel")"
-cp -p "$suite_abs" "$WT/$rel" || die "cannot copy $rel into the base worktree"
+dest_dir=$(CDPATH= cd "$(dirname "$WT/$rel")" && pwd -P) || die "cannot resolve $(dirname "$rel") in the base"
+case "$dest_dir/" in
+"$WT"/*) ;;
+*) die "$(dirname "$rel") resolves outside the base worktree (a symlink in $base): $dest_dir" ;;
+esac
+dest="$dest_dir/$(basename "$rel")"
+if [ -L "$dest" ] || [ -e "$dest" ]; then rm -f "$dest" || die "cannot replace $rel in the base worktree"; fi
+cp -p "$suite_abs" "$dest" || die "cannot copy $rel into the base worktree"
 
 say "$rel (working tree) against $base ($(git -C "$TOP" rev-parse --short "$sha"))"
 # The suite runs in the background so the INT/TERM traps fire at once rather than after it
