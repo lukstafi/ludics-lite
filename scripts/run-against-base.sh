@@ -154,6 +154,7 @@ GRACE=$((10#$GRACE))
 # allocation and the trap; until SCRATCH is set it has nothing to do.
 SCRATCH=
 WT=
+ADMIN=
 child=
 teepid=
 # live PID | live -PGID: whether that process, or any member of that process group, is still
@@ -205,11 +206,16 @@ cleanup() {
     # suite locked, which a single --force refuses.
     git -C "$TOP" worktree remove --force --force "$WT" >/dev/null 2>&1
   fi
-  git -C "$TOP" worktree prune >/dev/null 2>&1
   # A suite can leave a directory it made unreadable; give the tree back its owner's permissions
   # and try again rather than leak it.
   rm -rf "$SCRATCH" 2>/dev/null || { chmod -R u+rwx "$SCRATCH" 2>/dev/null; rm -rf "$SCRATCH"; }
-  git -C "$TOP" worktree prune >/dev/null 2>&1
+  # No `git worktree prune`: it has no path argument, and would also drop the registration of any
+  # other worktree of this repository whose directory is missing just now. When `worktree remove`
+  # did not take this one, its own administrative directory is removed, and nothing else.
+  if [ -n "$ADMIN" ] && [ -d "$ADMIN" ] \
+    && git -C "$TOP" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $WT"; then
+    rm -rf "$ADMIN"
+  fi
   local leaked=
   if git -C "$TOP" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $WT"; then
     printf '%s\n' "run-against-base: the worktree $WT is still registered; remove it by hand" >&2
@@ -234,6 +240,22 @@ WT="$SCRATCH/base"
 
 git -C "$TOP" worktree add --quiet --detach "$WT" "$sha" >/dev/null 2>&1 \
   || die "git worktree add failed for $base ($sha)"
+ADMIN=$(git -C "$WT" rev-parse --absolute-git-dir 2>/dev/null) || ADMIN=
+case "$ADMIN" in "$(git -C "$TOP" rev-parse --path-format=absolute --git-common-dir)"/worktrees/?*) ;; *) ADMIN= ;; esac
+# A sparse checkout is copied into the new worktree, and files outside its patterns would be
+# missing from the base -- a suite failing on one of them is not a base failure. The skip-worktree
+# bits are cleared in this worktree's own index and every file written; no config is touched, so
+# the source checkout stays as sparse as it was.
+if [ "$(git -C "$WT" config --bool core.sparseCheckout 2>/dev/null)" = true ]; then
+  git -C "$WT" -c index.sparse=false ls-files -z -t \
+    | while IFS= read -r -d '' entry; do case "$entry" in 'S '*) printf '%s\0' "${entry#S }" ;; esac; done \
+    | git -C "$WT" -c core.sparseCheckout=false update-index --no-skip-worktree -z --stdin \
+    && git -C "$WT" -c core.sparseCheckout=false checkout-index -a -f \
+    || die "could not fill in the sparse checkout of the base worktree"
+fi
+# Submodules are not checked out in the base worktree. One on the suite's own path is refused
+# below; one elsewhere cannot be judged from here, so the result line names them instead.
+uninit_subs=$(git -C "$WT" ls-files -s 2>/dev/null | awk '$1 == "160000" { n++ } END { print n + 0 }')
 # The suite's path is installed one component at a time, and at each one whatever the base has
 # there -- a symlink, a file, a directory where the suite now is -- is replaced, never followed:
 # the working tree's shape wins, so nothing is created or written outside the worktree. (`rel`
@@ -316,6 +338,8 @@ teepid=
 tally=$(grep -E '[0-9]+ passed, [0-9]+ failed' "$LOG" | tail -n 1)
 [ -n "$tally" ] || tally=$(grep -v '^[[:space:]]*$' "$LOG" | tail -n 1)
 say "exit $rc on $base: ${tally:-(no output)}"
+[ "$uninit_subs" -eq 0 ] \
+  || say "note: $base has $uninit_subs submodule(s), not checked out here; a failure that reaches into one is not the base's"
 # 125 is this helper's own "could not run it"; a suite that returns it failed, and says so as 1.
 [ "$rc" -eq 125 ] && rc=1
 exit "$rc"

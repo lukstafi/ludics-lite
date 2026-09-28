@@ -26,6 +26,8 @@
 #   - an unreadable directory the suite leaves behind does not leak the scratch;
 #   - git's repository-local variables exported by the caller (GIT_DIR, GIT_WORK_TREE,
 #     GIT_INDEX_FILE) reach neither the suite nor the helper's own git commands;
+#   - a sparse source checkout still gets a complete base (and stays sparse itself), another
+#     worktree's registration is never pruned, and a base's submodules are named on the result;
 #   - a second signal during the cleanup does not cut the teardown short;
 #   - RUN_AGAINST_BASE_GRACE is validated up front, and a suite's own 125 exits 1.
 #
@@ -532,6 +534,53 @@ worktrees_clean "after grace and 125 cases"
 run_rab test-toy.sh --lockout
 if [ "$rc" -eq 1 ]; then ok "an unreadable leftover: the suite's status is reported"; else ko "lockout: rc=$rc -- $out"; fi
 worktrees_clean "after an unreadable leftover"
+
+# A sparse source checkout: its patterns are copied into the base worktree, and a suite reading a
+# file outside them would fail there for want of it. The base is filled in; the source stays
+# sparse.
+SP="$TMP/sparse"
+g init -q "$SP"
+mkdir -p "$SP/a" "$SP/b"
+printf 'data\n' >"$SP/b/data"
+printf '#!/usr/bin/env bash\nHERE=$(cd "$(dirname "$0")" && pwd -P)\n[ -f "$HERE/../b/data" ] && echo "1 passed, 0 failed"\n' >"$SP/a/test-sp.sh"
+chmod +x "$SP/a/test-sp.sh"
+g -C "$SP" add -A
+g -C "$SP" commit -qm base
+g -C "$SP" sparse-checkout set a >/dev/null 2>&1
+printf '# edited\n' >>"$SP/a/test-sp.sh"
+out=$(cd "$SP/a" && TMPDIR="$HTMP" "$RAB" test-sp.sh --base HEAD 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$SP/b/data" ]; then
+  ok "a sparse source: the base worktree is complete, the source stays sparse"
+else
+  ko "sparse: rc=$rc, source b/data $( [ -e "$SP/b/data" ] && echo present || echo absent) -- $out"
+fi
+if [ -z "$(ls -A "$HTMP")" ] && [ "$(git -C "$SP" worktree list --porcelain | grep -c '^worktree ')" -eq 1 ]; then
+  ok "after a sparse source: no worktree registered, no scratch left"
+else
+  ko "after a sparse source: $(git -C "$SP" worktree list)"
+fi
+
+# Another worktree of the repository whose directory is gone is not the helper's to forget:
+# `git worktree prune` would drop its registration along with any of the helper's own.
+g -C "$R" worktree add -q --detach "$TMP/stale-wt" HEAD
+rm -rf "$TMP/stale-wt"
+run_rab test-toy.sh
+if git -C "$R" worktree list --porcelain | grep -qxF "worktree $TMP/stale-wt"; then
+  ok "an unrelated missing worktree stays registered"
+else
+  ko "the unrelated worktree's registration was pruned -- $out"
+fi
+g -C "$R" worktree prune
+worktrees_clean "after an unrelated missing worktree"
+
+# Submodules of the base elsewhere than the suite's path are not checked out; the result says so.
+run_rab test-link.sh --base linked
+if grep -qF 'note: linked has 1 submodule(s), not checked out here' <<<"$out"; then
+  ok "a base's submodules are named on the result"
+else
+  ko "submodule note missing -- $out"
+fi
 
 # A suite that locks its own worktree: a single --force refuses a locked one.
 run_rab test-toy.sh --lock
