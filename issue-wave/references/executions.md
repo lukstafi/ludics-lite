@@ -274,9 +274,14 @@ When the run went through OCANNL's `tools/test-run.sh` (or any runner leaving `e
 --request <id> --sha <sha> [--box <execution host>] [--evidence <text>]` composes that payload
 itself: the verdict from `exit` (0 pass, 142 timeout, a signal code cancelled, anything else
 fail), `log` and the checkout from the record, the handle `test-run:<run>`, and `--sha` as the
-observed SHA - the record carries none, so the revision that ran is the coordinator's to name
-from the worker's result line, and the checkout must at least contain it; a checkout whose head
-has moved on is concluded on the named revision with the drift noted in the evidence. It
+observed SHA, which the checkout must contain. A record from `test-run.sh` since
+ocannl-staging#808 names its own source at launch, `head` and `dirty` (`git status --porcelain`,
+empty when clean), both or neither: a `head` other than `--sha` is refused with both SHAs named,
+and a nonempty `dirty` is refused with its path count, since a run over uncommitted edits is
+evidence for no commit (conclude one deliberately with a JSON payload whose evidence says so).
+A record with neither (an older run, or no checkout) concludes on `--sha` from the worker's
+result line and says so in the evidence; one file without the other is malformed and refused.
+A checkout whose head has moved on since is noted in the evidence. It
 refuses a record without a verdict and a run the checkout's own `tools/test-run.sh status` does
 not call finished. The run directory is read on the reservation's execution host, resolved from
 the registry when `--box` is omitted; the conclusion names the box it read, and the registry

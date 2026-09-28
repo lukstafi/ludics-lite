@@ -2064,7 +2064,16 @@ EOF
 # Far side of `conclude --from-run`, on the execution box: read a finished test-run.sh record
 # (OCANNL's `tools/test-run.sh`: `exit`, `log`, `wt` and `cmd` under the run directory) and
 # the checkout's head, and refuse anything short of a published verdict with no process left.
-# Args: run-dir, reported sha. Prints `exit=`, `wt=`, `head=` lines, or one FROM-RUN REFUSED line.
+# Since ocannl-staging#808 the record also names the source it ran, as launch-time facts: `head`
+# (the checkout's HEAD commit) and `dirty` (its `git status --porcelain=v1
+# --untracked-files=normal`, empty when clean), `dirty` written first, so the writer leaves both
+# or neither (ludics-lite#438). Both present: `head` must be the reported sha (a record of another
+# revision is refused, naming both) and `dirty` empty (a run over uncommitted edits is evidence
+# for no commit, so it is refused with their count). Neither: an older record or a run outside a
+# checkout, concluded on the reported sha alone, as before, and said so (`record=none`). One
+# without the other, or a `head` that is not one hex object ID, is malformed and refused.
+# Args: run-dir, reported sha. Prints `exit=`, `wt=`, `head=`, `record=` lines, or one FROM-RUN
+# REFUSED line.
 from_run_script() {
   cat <<'EOF'
 dir="$1" sha="$2"
@@ -2083,12 +2092,29 @@ if [ -x "$wt/tools/test-run.sh" ]; then
 elif [ -s "$dir/pid" ] && kill -0 "$(head -n1 "$dir/pid")" 2>/dev/null; then
   refuse "supervisor pid $(head -n1 "$dir/pid") of $dir is still alive"
 fi
+if [ -e "$dir/head" ] && [ -e "$dir/dirty" ]; then
+  [ -f "$dir/head" ] && [ -f "$dir/dirty" ] || refuse "$dir/head or $dir/dirty is not a regular file: a malformed record"
+  rhead=$(cat "$dir/head")
+  case "$rhead" in ''|*[!0-9a-f]*) refuse "$dir/head holds '$rhead', not one commit ID: a malformed record" ;; esac
+  [ "$rhead" = "$sha" ] || refuse "$dir/head records $rhead as the revision launched, but the reported revision is $sha: this run is evidence for $rhead, not $sha"
+  if [ -s "$dir/dirty" ]; then
+    n=$(grep -c '' "$dir/dirty")
+    refuse "$dir/dirty lists $n uncommitted path(s) at launch: the run tested $sha plus those edits, so it is not evidence for $sha; conclude it with a JSON payload whose evidence says so"
+  fi
+  record=launch
+elif [ -e "$dir/head" ]; then
+  refuse "$dir has a head but no dirty: a malformed record (test-run.sh writes dirty first, so both or neither)"
+elif [ -e "$dir/dirty" ]; then
+  refuse "$dir has a dirty but no head: a malformed record (test-run.sh writes head after dirty, so both or neither)"
+else
+  record=none
+fi
 head=$(git -C "$wt" rev-parse --verify HEAD^{commit} 2>/dev/null) || refuse "cannot read HEAD of $wt"
-# The record carries no SHA, so the revision that ran is the coordinator's to name (--sha, from
-# the worker's result line); the checkout only has to KNOW that commit, and its head is reported
-# so a conclusion over a moved checkout says so in its evidence.
+# With no launch record the revision that ran is the coordinator's to name (--sha, from the
+# worker's result line). Either way the checkout has to KNOW that commit, and its head now is
+# reported so a conclusion over a moved checkout says so in its evidence.
 git -C "$wt" cat-file -e "$sha^{commit}" 2>/dev/null || refuse "$wt does not contain the reported revision $sha"
-printf 'exit=%s\nwt=%s\nhead=%s\n' "$code" "$wt" "$head"
+printf 'exit=%s\nwt=%s\nhead=%s\nrecord=%s\n' "$code" "$wt" "$head" "$record"
 EOF
 }
 
@@ -2116,17 +2142,24 @@ execution_host_of() {
 # The box is the reservation's execution host: the payload names it and the registry checks it,
 # so a record read on the wrong machine cannot conclude another box's assignment.
 conclude_from_run() {
-  local dir="$1" request="$2" box="$3" sha="$4" evidence="$5" facts rc code wt head verdict
+  local dir="$1" request="$2" box="$3" sha="$4" evidence="$5" facts rc code wt head record verdict
   facts=$({ prelude "$box"; from_run_script; } | run_on "$box" "$dir" "$sha"); rc=$?
   if unreachable "$rc"; then echo "FROM-RUN UNREACHABLE $box: nothing concluded"; return 4; fi
   [ "$rc" -eq 0 ] || { printf '%s\n' "$facts"; return 1; }
   code=$(sed -n 's/^exit=//p' <<<"$facts"); wt=$(sed -n 's/^wt=//p' <<<"$facts"); head=$(sed -n 's/^head=//p' <<<"$facts")
-  [[ "$head" =~ ^[0-9a-f]{40}$ ]] && [ -n "$code" ] && [ -n "$wt" ] || { echo "FROM-RUN REFUSED: unreadable record facts from $box: $facts"; return 1; }
+  record=$(sed -n 's/^record=//p' <<<"$facts")
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] && [ -n "$code" ] && [ -n "$wt" ] && { [ "$record" = launch ] || [ "$record" = none ]; } ||
+    { echo "FROM-RUN REFUSED: unreadable record facts from $box: $facts"; return 1; }
   # test-run.sh's exit vocabulary: 142 the cap, 129/130/137/143 a signal; every other nonzero
   # (dune's own 1, a refused invocation, 126/127 toolchain) is a failed run.
   case "$code" in 0) verdict=pass ;; 142) verdict=timeout ;; 129|130|137|143) verdict=cancelled ;; *) verdict=fail ;; esac
   [ -n "$evidence" ] || evidence="test-run.sh record $dir on $box: exit $code published, no process remains"
-  [ "$head" = "$sha" ] || evidence="$evidence; checkout head is now $head, revision $sha as reported by the worker"
+  if [ "$record" = launch ]; then
+    evidence="$evidence; launched at $sha on a clean tree (the record's head and dirty)"
+  else
+    evidence="$evidence; the record has no head or dirty (a run before test-run.sh recorded them, or outside a checkout), so the revision is $sha as reported by the worker"
+  fi
+  [ "$head" = "$sha" ] || evidence="$evidence; checkout head is now $head"
   jq -cn --arg id "$request" --arg ev "$evidence" --arg sha "$sha" --arg wt "$wt" --arg host "$box" \
     --arg handle "test-run:$(basename "$dir")" --arg log "$dir/log" --arg verdict "$verdict" \
     '{request_id: $id, evidence: $ev, observed_sha: $sha, remote_checkout: $wt, handle: $handle, log: $log, verdict: $verdict, execution_host: $host}'
@@ -2700,7 +2733,7 @@ cmd_execution() {
           shift
         done
         [ -n "$request" ] || die "execution conclude --from-run: --request <id> required"
-        [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "execution conclude --from-run: --sha <full commit SHA> required (the record carries none; the worker's result line names it)"
+        [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "execution conclude --from-run: --sha <full commit SHA> required (the worker's result line names it; a record's own head is cross-checked against it)"
         check_identity
         if [ -z "$box" ]; then
           box=$(execution_host_of "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py" "$request") || { echo "EXECUTION UNREACHABLE $ANCHOR: cannot resolve the request's execution host"; exit 4; }
