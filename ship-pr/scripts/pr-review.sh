@@ -486,11 +486,14 @@ graphql_fixed_answer() {
 
 # transient_failure <gh stderr and stdout> <gh stderr's first line>
 transient_failure() {
+  # A fixed GraphQL answer is read FIRST: its whole first line is GraphQL's own message, which no
+  # gateway prints, while the substring scan below would match a marker the message only quotes
+  # (`Expected NAME, actual: STRING ("Bad gateway")`) and retry a query that cannot change.
+  graphql_fixed_answer "$2" && return 1
   gateway_failure "$1" && return 0
   case "$1" in
   *"HTTP 4"[0-9][0-9]*) return 1 ;; # the API answered; a retry answers the same, slower
   esac
-  graphql_fixed_answer "$2" && return 1 # so did GraphQL, with an answer no retry changes
   # Everything else — a 500, a GraphQL "Something went wrong while executing your query", a reset
   # connection, an HTML error page jq could not parse — is retried, because a read has nothing to
   # duplicate and the alternative is presenting the failure as an empty feed.

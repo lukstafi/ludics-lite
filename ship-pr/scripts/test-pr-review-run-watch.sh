@@ -318,6 +318,9 @@ test_a_fixed_graphql_answer_is_a_rejection() {
     "gh: Field 'nosuchfield' doesn't exist on type 'User'"
     'gh: Expected NAME, actual: (none) ("") at [1, 12]'
     'gh: Expected one of SCHEMA, SCALAR, TYPE, ENUM, INPUT, UNION, INTERFACE, actual: RCURLY ("}") at [1, 22]'
+    # A gateway marker the message only QUOTES, from `{ viewer { login "Bad gateway" } }`: the
+    # gateway scan reads substrings, so the allowlist has to be read before it (review round 1).
+    'gh: Expected NAME, actual: STRING ("Bad gateway") at [1, 18]'
   )
   retune API_ATTEMPTS=3
   for body in "${bodies[@]}"; do
