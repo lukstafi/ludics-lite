@@ -451,6 +451,43 @@ api_rejection() {
   return 1
 }
 
+# Did GraphQL answer with an error whose answer is FIXED, one that re-sending the same query can
+# never change (ludics-lite#422)? GraphQL validates a query before it runs any of it, so such a
+# query did nothing. Retried as transport, a query-cost rejection spent four attempts and ~35s and
+# then reported "the API never answered" — which it had.
+#
+# The boundary. This reads ONE line, the first line of gh's stderr, where gh prints a GraphQL
+# error's message after `gh: ` (`gh api graphql`) or `GraphQL: ` (every other gh command). It is a
+# fail-closed ALLOWLIST of whole-line shapes, each copied from a real failing call:
+#   the node limit    By the time this query traverses to the <c> connection, it is requesting up
+#                     to <n> possible nodes which exceeds the maximum limit of <n>.
+#   the page limit    Requesting <n> records on the `<c>` connection exceeds the `first|last`
+#                     limit of <n> records.
+#   an unknown field  Field '<f>' doesn't exist on type '<T>'
+#   a parse error     Expected <tokens>, actual: <TOKEN> ("<text>") at [<line>, <column>]
+# It deliberately does not read stdout (a read's data can quote any of these sentences), the lines
+# after the first, a message carrying gh's ` (<path>)` suffix, several errors gh joined onto one
+# line, gh's own client-side refusals (`Unknown JSON field`), or any other GraphQL message. Those
+# keep the classification they had, and that direction is the point: a fixed shape this misses
+# costs only the retries it always cost, while a transient failure read as fixed would turn an
+# unanswered read into a false fact (exit 1).
+graphql_fixed_answer() {
+  local msg re
+  case "$1" in
+  "gh: "*) msg="${1#gh: }" ;;
+  "GraphQL: "*) msg="${1#GraphQL: }" ;;
+  *) return 1 ;;
+  esac
+  for re in \
+    '^By the time this query traverses to the [A-Za-z0-9_]+ connection, it is requesting up to [0-9,]+ possible nodes which exceeds the maximum limit of [0-9,]+\.$' \
+    '^Requesting [0-9,]+ records on the `[A-Za-z0-9_]+` connection exceeds the `(first|last)` limit of [0-9,]+ records\.$' \
+    "^Field '[A-Za-z0-9_]+' doesn't exist on type '[A-Za-z0-9_]+'$" \
+    '^Expected [A-Za-z_ ,]+, actual: ([A-Z_]+|\(none\)) \(".*"\) at \[[0-9]+, [0-9]+\]$'; do
+    [[ "$msg" =~ $re ]] && return 0
+  done
+  return 1
+}
+
 transient_failure() {
   gateway_failure "$1" && return 0
   case "$1" in
@@ -486,12 +523,19 @@ gh_retry() {
       return 0
     fi
     printf '%s' "${GH_ERR%%$'\n'*}" >"$GH_ERR_FILE" 2>/dev/null
-    if [ "$mode" = write ]; then
+    # A fixed GraphQL answer is read FIRST, under both policies: its whole first line is GraphQL's
+    # own message, which no gateway prints, while the substring scans below would match a marker the
+    # message only quotes (`Expected NAME, actual: STRING ("Bad gateway")`) and retry a query that
+    # cannot change. A query GraphQL refused to validate ran nothing, so a write has nothing to land.
+    if graphql_fixed_answer "${GH_ERR%%$'\n'*}"; then
+      retryable=1
+    elif [ "$mode" = write ]; then
       gateway_failure "$GH_ERR $out"
+      retryable=$?
     else
       transient_failure "$GH_ERR $out"
+      retryable=$?
     fi
-    retryable=$?
     if [ "$retryable" -ne 0 ] || [ "$attempt" -ge "$API_ATTEMPTS" ]; then
       [ "$tmp" = /dev/null ] || { rm -f "$tmp"; GH_TMP_FILE=""; }
       [ "$retryable" -eq 0 ] && return 3
@@ -3663,7 +3707,8 @@ cmd_retry() {
     "the API never answered, so the outcome is UNKNOWN — confirm the state before retrying a" \
     "write, and never report the command as having failed to do its job." ;;
   *)
-    api_rejection "$(gh_err_line)" && fail 1 "gh $1 was rejected: $(gh_err_line)"
+    { api_rejection "$(gh_err_line)" || graphql_fixed_answer "$(gh_err_line)"; } &&
+      fail 1 "gh $1 was rejected: $(gh_err_line)"
     fail 3 "gh $1 failed AMBIGUOUSLY: $(gh_err_line). Not a gateway refusal, so a write may have" \
       "landed and this did not repeat it — confirm the state (over REST) before retrying."
     ;;

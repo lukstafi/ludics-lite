@@ -763,7 +763,11 @@ checkout whose `origin` names a third repository with the fixture answering `gh 
 both halves of the removed inference armed, and nothing read. The suite pins the other exits
 against that refusal: a 4xx on the pair is an invocation error (exit 2) and a run that concluded
 `failure` is still the verdict (exit 1), with an unanswered read exit 3 and a run still going at
-the deadline exit 4.
+the deadline exit 4. It pins the plain `retry`'s line between a GraphQL answer and transport too
+(ludics-lite#422): a query-cost rejection used to be retried four times and reported as "the API
+never answered". Each GraphQL body on the fixed-answer allowlist, verbatim from a real `gh` call,
+exits 1 on its first attempt; a gateway failure, GraphQL's execution failure and the near-misses
+(another prefix, gh's path suffix, a second line, stdout) still retry to exit 3.
 
 `test-pr-review-status.sh` drives `status` and `watch` against canned reactions, reviews,
 comments and PR reads, and pins the mergeability that rides on every state line: a PR whose merge

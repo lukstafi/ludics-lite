@@ -9,6 +9,11 @@
 # subcommand's argument, and the cases below pin BOTH halves: the refusals that replaced the
 # guess, and the exits 0/1/3/4 that must survive them (a refusal policy that swallowed the real
 # verdicts would be worse than the inference it replaced).
+#
+# It also pins the plain `retry`'s line between a GraphQL answer and transport (ludics-lite#422): a
+# query-cost rejection was retried four times and reported as "the API never answered". The
+# fixed-answer bodies below are verbatim from real `gh` 2.101.0 calls; each must exit 1 on its first
+# attempt, while a gateway failure and the near-misses outside the allowlist still retry to exit 3.
 
 set -euo pipefail
 
@@ -37,6 +42,10 @@ RUN_ERROR="" # gh's stderr when the read must fail, e.g. "gh: Not Found (HTTP 40
 # What `repo_from_cwd` would answer if anything asked it. The point of every refusal case below is
 # that nothing does: this value must never reach a run read.
 CWD_REPO=cwd-inferred/repo
+# What a failing `gh api graphql` prints: GQL_ERROR on stderr (a case always sets it) and GQL_OUT on
+# stdout, where `gh api graphql` puts the error document itself.
+GQL_ERROR=""
+GQL_OUT=""
 
 # The fixture gh. Not gh_fixture_parse: that one refuses everything but `gh api`, and this await
 # reads `gh run view`. `repo view` is answered rather than refused ON PURPOSE — it is the first
@@ -51,6 +60,12 @@ gh() {
     return 0
     ;;
   "run view") ;;
+  "api graphql")
+    [ -n "$GQL_ERROR" ] || bail "fixture api graphql was called with no GQL_ERROR set: $*"
+    printf '%s' "$GQL_OUT"
+    printf '%s\n' "$GQL_ERROR" >&2
+    return 1
+    ;;
   *)
     echo "gh: unsupported fixture call: $*" >&2
     return 1
@@ -88,6 +103,8 @@ reset_fixture() {
   RUN_STATUS=completed
   RUN_CONCLUSION=success
   RUN_ERROR=""
+  GQL_ERROR=""
+  GQL_OUT=""
   REPO=""
   AWAIT_WAIT=""
   : >"$CALL_LOG"
@@ -108,6 +125,17 @@ run_await() {
 }
 
 gh_calls() { cat "$CALL_LOG"; }
+
+# cmd_retry in a command substitution, for the same reason: its verdicts call `exit`.
+run_retry() {
+  local rc
+  : >"$CALL_LOG"
+  set +e
+  RETRY_OUT=$(cmd_retry "$@" 2>&1)
+  rc=$?
+  set -e
+  RETRY_RC="$rc"
+}
 
 # A scratch checkout whose origin is a third repository, so the git half of the removed inference
 # is armed too: `repo_from_cwd` falls back to `git remote get-url origin` when gh does not answer.
@@ -274,6 +302,93 @@ test_no_verdict_is_exit_4() {
   assert_contains "$AWAIT_OUT" "in_progress" "and report the status it read"
 }
 
+# --- a GraphQL answer is not transport (ludics-lite#422) ------------------------------------
+
+# Every allowlisted shape, verbatim, under both prefixes gh prints: `gh: ` from `gh api graphql`
+# (whose stdout then carries the error document) and `GraphQL: ` from every other command (the
+# cost body is the one `gh pr list --json commits --limit 1000` printed). Each is the API's
+# answer, so the read stops on its first attempt and says it was rejected.
+test_a_fixed_graphql_answer_is_a_rejection() {
+  local body
+  local -a bodies=(
+    'GraphQL: By the time this query traverses to the authors connection, it is requesting up to 1,000,000 possible nodes which exceeds the maximum limit of 500,000.'
+    'gh: By the time this query traverses to the comments connection, it is requesting up to 1,000,000 possible nodes which exceeds the maximum limit of 500,000.'
+    'gh: Requesting 101 records on the `repositories` connection exceeds the `first` limit of 100 records.'
+    'gh: Requesting 101 records on the `repositories` connection exceeds the `last` limit of 100 records.'
+    "gh: Field 'nosuchfield' doesn't exist on type 'User'"
+    'gh: Expected NAME, actual: (none) ("") at [1, 12]'
+    'gh: Expected one of SCHEMA, SCALAR, TYPE, ENUM, INPUT, UNION, INTERFACE, actual: RCURLY ("}") at [1, 22]'
+    # A gateway marker the message only QUOTES, from `{ viewer { login "Bad gateway" } }`: the
+    # gateway scan reads substrings, so the allowlist has to be read before it (review round 1).
+    'gh: Expected NAME, actual: STRING ("Bad gateway") at [1, 18]'
+  )
+  retune API_ATTEMPTS=3
+  for body in "${bodies[@]}"; do
+    reset_fixture
+    GQL_ERROR="$body"
+    GQL_OUT='{"errors":[{"message":"(the error document gh api graphql prints)"}]}'
+    run_retry --read api graphql -f query=q
+    assert_eq "$RETRY_RC" 1 "a fixed answer is exit 1 ($body: $RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "was rejected: $body" "the message is the API's answer, quoted"
+    assert_not_contains "$RETRY_OUT" "never answered" "the API did answer ($body)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "and it is not re-sent ($body)"
+  done
+  # The write policy too, on every body: rejected rather than ambiguous, since a query GraphQL
+  # refused to validate ran nothing, and not re-sent even where the body quotes a gateway marker,
+  # which the write policy's own gateway scan would otherwise retry (review round 2).
+  for body in "${bodies[@]}"; do
+    reset_fixture
+    GQL_ERROR="$body"
+    run_retry api graphql -f query=q
+    assert_eq "$RETRY_RC" 1 "a write whose query was refused is exit 1 ($body: $RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "was rejected: $body" "and is reported as rejected"
+    assert_not_contains "$RETRY_OUT" "AMBIGUOUSLY" "not as a write that may have landed ($body)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "nor re-sent ($body)"
+  done
+}
+
+# The control: a gateway failure and GraphQL's execution failure are transport and still retry to
+# exit 3, so the case above cannot pass by never retrying anything.
+test_a_graphql_outage_still_retries() {
+  local body
+  retune API_ATTEMPTS=3
+  for body in 'gh: HTTP 502: Bad gateway (https://api.github.com/graphql)' \
+    'gh: Something went wrong while executing your query. This may be the result of a timeout, or it could be a GitHub bug. Please include `0D8E:1234:5678:9ABC:66F0A1B2` when reporting this issue.'; do
+    reset_fixture
+    GQL_ERROR="$body"
+    run_retry --read api graphql -f query=q
+    assert_eq "$RETRY_RC" 3 "an outage is transport ($body: $RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "never answered" "and is reported as unknown"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "after every attempt ($body)"
+  done
+}
+
+# The near-misses: an allowlisted sentence anywhere but as the whole first stderr line after one of
+# gh's two prefixes keeps the retry. Behind another prefix; with gh's ` (<path>)` suffix; on the
+# second line; and in stdout only, where a read's data can quote it.
+test_a_near_miss_still_retries() {
+  local body
+  local -a bodies=(
+    'gh: proxy: By the time this query traverses to the comments connection, it is requesting up to 1,000,000 possible nodes which exceeds the maximum limit of 500,000.'
+    "GraphQL: Field 'nosuchfield' doesn't exist on type 'User' (query.viewer.nosuchfield)"
+    $'gh: Something went wrong (HTTP 500)\ngh: Field \'nosuchfield\' doesn\'t exist on type \'User\''
+  )
+  retune API_ATTEMPTS=3
+  for body in "${bodies[@]}"; do
+    reset_fixture
+    GQL_ERROR="$body"
+    run_retry --read api graphql -f query=q
+    assert_eq "$RETRY_RC" 3 "outside the allowlist keeps the retry ($body: $RETRY_OUT)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "every attempt was spent ($body)"
+  done
+  reset_fixture
+  GQL_ERROR='gh: Something went wrong (HTTP 500)'
+  GQL_OUT="{\"body\":\"gh: Field 'nosuchfield' doesn't exist on type 'User'\"}"
+  run_retry --read api graphql -f query=q
+  assert_eq "$RETRY_RC" 3 "a sentence in stdout is not read ($RETRY_OUT)"
+  assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "so the read is retried"
+}
+
 # --- the shared parse -------------------------------------------------------------------------
 
 # parse_ref is what both this command and pr_arg read their argument with; pinning it directly
@@ -314,6 +429,9 @@ tests=(
   test_a_failed_run_is_still_exit_1
   test_transport_failure_is_unknown
   test_no_verdict_is_exit_4
+  test_a_fixed_graphql_answer_is_a_rejection
+  test_a_graphql_outage_still_retries
+  test_a_near_miss_still_retries
   test_parse_ref
 )
 
