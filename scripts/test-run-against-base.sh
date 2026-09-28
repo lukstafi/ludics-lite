@@ -18,6 +18,9 @@
 #   - whatever the base keeps on the suite's path -- a symlink out of the checkout at the leaf or
 #     at a parent, a directory where the suite now is -- is replaced, never followed or written
 #     through, and nothing is created outside the worktree;
+#   - a `--` directory on the suite's path installs, and a working-tree suite that is a symlink
+#     is refused rather than followed;
+#   - a second signal during the cleanup does not cut the teardown short;
 #   - RUN_AGAINST_BASE_GRACE is validated up front, and a suite's own 125 exits 1.
 #
 # Usage: test-run-against-base.sh   (exit 0 all pass, 1 otherwise)
@@ -110,7 +113,11 @@ case "${1-}" in
 --slow) echo "$$" >"$2"; exec sleep 60 ;;
 --stubborn) trap '' TERM; echo "$$" >"$2"; while :; do sleep 1; done ;;
 --orphan) sleep 60 & echo "$!" >"$2" ;;
---graceful) ( trap 'sleep 1; echo done >"$2"; exit 0' TERM; sleep 60 & wait ) >/dev/null 2>&1 & ;;
+--graceful)
+  # The ready file is the handshake: the suite exits only once the child's TERM trap is armed,
+  # or the helper's TERM can land before it and the default action skips the cleanup.
+  ( trap 'sleep 1; echo done >"$2"; exit 0' TERM; : >"$2.ready"; sleep 60 & wait ) >/dev/null 2>&1 &
+  for i in $(seq 1 300); do [ -e "$2.ready" ] && break; sleep 0.1; done ;;
 --rc125) exit 125 ;;
 --lock) git -C "$HERE" worktree lock "$(git -C "$HERE" rev-parse --show-toplevel)" ;;
 esac
@@ -127,6 +134,11 @@ cat >"$R/scripts/test-link.sh" <<'EOF'
 echo "1 passed, 0 failed"
 EOF
 chmod +x "$R/scripts/test-link.sh"
+mkdir -p "$R/scripts/--"
+cp -p "$R/scripts/test-link.sh" "$R/scripts/--/test-dash.sh"
+# An executable suite outside git, so only the symlink refusal can stop it running.
+cp -p "$R/scripts/test-link.sh" "$TMP/outside-suite.sh"
+ln -s "$TMP/outside-suite.sh" "$R/scripts/test-symleaf.sh"
 mkdir -p "$R/scripts/lnk/deep"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/lnk/deep/test-deep.sh"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/test-dir"
@@ -227,11 +239,11 @@ if [ "$rc" -eq 125 ]; then ok "a missing suite refused with 125"; else ko "missi
 worktrees_clean "after refusals"
 
 # ---- a signal mid-run: the worktree still goes, and so does the suite ------------------------
-# signal_case SIG WANT_RC [MODE]: `set -m` gives the helper its own process group with default signal
+# signal_case SIG WANT_RC [MODE [twice]]: `set -m` gives the helper its own process group with default signal
 # dispositions -- a non-interactive shell starts background jobs with INT ignored, and a signal
 # ignored on entry cannot be trapped.
 signal_case() {
-  local sig=$1 want=$2 mode=${3:---slow} pidf="$TMP/suite.pid.$1${3-}" hpid spid i rc_s
+  local sig=$1 want=$2 mode=${3:---slow} pidf="$TMP/suite.pid.$1${3-}${4-}" hpid spid i rc_s
   rm -f "$pidf"
   set -m
   (cd "$R/scripts" && TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=1 exec "$RAB" test-toy.sh "$mode" "$pidf") >"$TMP/sig.$sig.out" 2>&1 &
@@ -248,6 +260,8 @@ signal_case() {
     return
   fi
   kill -"$sig" "$hpid"
+  # A second signal inside the cleanup's grace must not cut the teardown short.
+  [ "${4-}" = twice ] && sleep 0.5 && kill -"$sig" "$hpid" 2>/dev/null
   # Bounded: a helper that waits forever on a suite ignoring TERM is the regression this case is
   # for, and it must fail here rather than hang the run. An exited helper is a zombie until
   # waited for, and kill -0 reaches a zombie, so the state is read instead.
@@ -278,6 +292,7 @@ signal_case TERM 143
 signal_case INT 130
 # A suite that ignores TERM: the helper's own wait is bounded, and KILL follows the grace.
 signal_case TERM 143 --stubborn
+signal_case TERM 143 --stubborn twice
 
 # ---- what the suite leaves behind is not the helper's to wait on ------------------------------
 # An orphan that inherited the suite's stdout holds the output pipe open after the suite exits;
@@ -302,7 +317,7 @@ worktrees_clean "after an orphaned child"
 
 # A background child with a TERM cleanup of its own gets the grace, not a fixed moment: the group
 # is what is waited for, not the leader that has already exited.
-rm -f "$TMP/graceful.done"
+rm -f "$TMP/graceful.done" "$TMP/graceful.done.ready"
 out=$(cd "$R/scripts" && TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=4 "$RAB" test-toy.sh --graceful "$TMP/graceful.done" 2>&1)
 rc=$?
 if [ "$rc" -eq 1 ] && [ -s "$TMP/graceful.done" ]; then
@@ -332,6 +347,18 @@ fi
 run_rab test-dir --base linked
 if [ "$rc" -eq 0 ]; then ok "a base directory at the suite's path is replaced"; else ko "dir at suite path: rc=$rc -- $out"; fi
 worktrees_clean "after replacing base paths"
+
+# A directory literally named `--` is a path component like any other.
+run_rab ./--/test-dash.sh
+if [ "$rc" -eq 0 ]; then ok "a \`--\` directory on the suite's path installs"; else ko "-- component: rc=$rc -- $out"; fi
+# A suite path that is itself a symlink (here, out of the checkout) is refused, not followed.
+run_rab test-symleaf.sh
+if [ "$rc" -eq 125 ] && grep -qF 'is a symlink' <<<"$out"; then
+  ok "a symlinked suite in the working tree is refused"
+else
+  ko "symlink leaf: rc=$rc -- $out"
+fi
+worktrees_clean "after path-shape cases"
 
 # The grace is validated before anything is allocated; a suite's own 125 is not the helper's.
 out=$(cd "$R/scripts" && TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=0.5 "$RAB" test-toy.sh 2>&1)

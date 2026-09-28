@@ -56,6 +56,9 @@ if [ "${1-}" = --base ]; then
 fi
 
 [ -f "$suite_arg" ] || die "no such file in the working tree: $suite_arg"
+# A symlink is refused rather than resolved: what it points at may be outside git, and the negative
+# control must be the working tree's committed-or-edited file, not something it reaches.
+[ -L "$suite_arg" ] && die "$suite_arg is a symlink; name the file it points at"
 TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git checkout: $PWD"
 TOP=$(CDPATH= cd "$TOP" && pwd -P) || die "cannot resolve the checkout root: $TOP"
 suite_dir=$(CDPATH= cd "$(dirname "$suite_arg")" && pwd -P) || die "cannot resolve: $suite_arg"
@@ -117,6 +120,9 @@ stop_group() {
   return 0
 }
 cleanup() {
+  # A second INT/TERM/HUP while this runs must not cut it short: the trap's `exit` would leave
+  # the EXIT trap before the worktree is removed.
+  trap '' INT TERM HUP
   [ -n "$child" ] && stop_group
   if [ -n "$teepid" ] && ! gone "$teepid"; then kill "$teepid" 2>/dev/null; fi
   if [ -d "$WT" ]; then
@@ -144,23 +150,16 @@ git -C "$TOP" worktree add --quiet --detach "$WT" "$sha" >/dev/null 2>&1 \
 # came from a `pwd -P`, so every component above the suite is a real directory in the working
 # tree too.)
 dest=$WT
-old_ifs=$IFS
-IFS=/
-set -f
-# shellcheck disable=SC2086 # the split on / is the point
-set -- $rel -- "$@"
-set +f
-IFS=$old_ifs
-while [ "$2" != -- ]; do
-  dest="$dest/$1"
+rest=$rel
+while case "$rest" in */*) true ;; *) false ;; esac do
+  dest="$dest/${rest%%/*}"
+  rest=${rest#*/}
   if [ -L "$dest" ] || { [ -e "$dest" ] && [ ! -d "$dest" ]; }; then
     rm -f "$dest" || die "cannot replace ${dest#"$WT"/} in the base worktree"
   fi
   [ -d "$dest" ] || mkdir "$dest" || die "cannot create ${dest#"$WT"/} in the base worktree"
-  shift
 done
-dest="$dest/$1"
-shift 2
+dest="$dest/$rest"
 if [ -L "$dest" ] || [ -e "$dest" ]; then rm -rf "$dest" || die "cannot replace $rel in the base worktree"; fi
 cp -p "$suite_abs" "$dest" || die "cannot copy $rel into the base worktree"
 
