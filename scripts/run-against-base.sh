@@ -175,6 +175,7 @@ dest="$dest/$rest"
 if [ -L "$dest" ] || [ -e "$dest" ]; then rm -rf "$dest" || die "cannot replace $rel in the base worktree"; fi
 cp -p "$suite_abs" "$dest" || die "cannot copy $rel into the base worktree"
 
+git_local_env=$(git rev-parse --local-env-vars | tr '\n' ' ')
 say "$rel (working tree) against $base ($(git -C "$TOP" rev-parse --short "$sha"))"
 # The suite runs in the background so the INT/TERM traps fire at once rather than after it
 # returns; its output goes through a fifo to tee, which both shows it live and keeps it for the
@@ -186,18 +187,30 @@ teepid=$!
 # `set -m` puts the suite in a process group of its own (its pid is the group id), which
 # stop_group signals whole; it also keeps INT at its default there rather than ignored, as a
 # non-interactive shell would start a background job.
+# Signals are deferred from the launch until `child` is recorded: a trap taken in between would
+# run the cleanup without knowing the process group it owns, and leave the suite running.
+pending=
+trap 'pending=130' INT
+trap 'pending=143' TERM HUP
 set -m
 # execfail: a suite that cannot be started at all (a missing interpreter, no python3) never ran,
 # so it must not read as the suite's 126/127 failure on the base; the marker tells the two apart.
 # A top-level `bash -c` and not a `( ... )` subshell, because bash 3.2 exits a subshell on a
 # failed exec whatever execfail says. Its $0 is the marker path; the exec keeps the pid, so the
 # suite is still the group leader.
+# Git's repository-local variables (GIT_DIR, GIT_WORK_TREE, ... as `git rev-parse
+# --local-env-vars` lists them; a git hook exports them) are unset for the suite, or its git
+# commands would inspect the caller's checkout instead of the base worktree.
 # shellcheck disable=SC2016 # expanded by the inner bash
-bash -c 'cd "$1" && shift && shopt -s execfail && exec "$@"
+RUN_AGAINST_BASE_UNSET=$git_local_env bash -c 'unset $RUN_AGAINST_BASE_UNSET RUN_AGAINST_BASE_UNSET
+  cd "$1" && shift && shopt -s execfail && exec "$@"
   : >"$0"
   exit 125' "$SCRATCH/execfail" "$WT" $runner "./$rel" "$@" >"$SCRATCH/fifo" 2>&1 </dev/null &
 child=$!
 set +m
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+[ -z "$pending" ] || exit "$pending"
 wait "$child"
 rc=$?
 if [ -e "$SCRATCH/execfail" ]; then

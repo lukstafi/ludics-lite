@@ -23,6 +23,8 @@
 #   - a path inside .git is refused, and a suite that cannot be started (a missing interpreter)
 #     exits 125 rather than its exec error's 126/127;
 #   - an unreadable directory the suite leaves behind does not leak the scratch;
+#   - git's repository-local variables exported by the caller (GIT_DIR, GIT_WORK_TREE) do not
+#     reach the suite;
 #   - a second signal during the cleanup does not cut the teardown short;
 #   - RUN_AGAINST_BASE_GRACE is validated up front, and a suite's own 125 exits 1.
 #
@@ -366,6 +368,17 @@ if [ "$rc" -eq 125 ] && grep -qF 'is a symlink' <<<"$out"; then
 else
   ko "symlink leaf: rc=$rc -- $out"
 fi
+# A caller exporting git's repository-local variables (as a git hook does): the suite's git must
+# still see the base worktree, not the caller's checkout.
+out=$(cd "$R/scripts" && GIT_DIR="$R/.git" GIT_WORK_TREE="$R" TMPDIR="$HTMP" "$RAB" test-toy.sh 2>&1)
+rc=$?
+top=$(sed -n 's/^TOPLEVEL=\([^ ]*\) HERE=.*$/\1/p' <<<"$out")
+if [ "$rc" -eq 1 ] && case "$top" in "$HTMP"/*) true ;; *) false ;; esac; then
+  ok "GIT_DIR/GIT_WORK_TREE from the caller do not reach the suite"
+else
+  ko "git env: rc=$rc TOPLEVEL=$top -- $out"
+fi
+worktrees_clean "after a caller with git's local variables"
 # A suite under .git is not a working-tree file.
 run_rab "$R/.git/hooks/test-meta"
 if [ "$rc" -eq 125 ] && grep -qF 'inside a .git directory' <<<"$out"; then
