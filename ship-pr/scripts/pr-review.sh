@@ -158,7 +158,9 @@
 #   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands ON THE HEAD being
 #                                          # watched; 0 = act, 1 = quiet. Reviewer activity about
 #                                          # another commit is printed on stderr for the record and
-#                                          # the wait continues; every exit names what it ends on
+#                                          # the wait continues; every exit names what it ends on,
+#                                          # and one on reviewer activity carries a `watch-rounds:`
+#                                          # line above the watermark (see count_token)
 #   pr-review.sh status <pr>               # merge gate + who owes what: approved / unresolved
 #                                          # (approved over open review threads) / reviewing /
 #                                          # stalled / failed / expected / idle / unknown — and
@@ -168,9 +170,11 @@
 #                                          # and a push gets no run at all, until the base is in)
 #   pr-review.sh rounds <pr>               # how many review rounds carried findings, read off the
 #                                          # PR (heads the reviewer left comments on), against
-#                                          # SHIP_PR_ROUND_THRESHOLD; exit 1 past it
+#                                          # SHIP_PR_ROUND_THRESHOLD; exit 1 past it; ends with a
+#                                          # `rounds: n=… threshold=…` trailer (see count_token)
 #   pr-review.sh checks <pr> [--wait]      # the BUILD signal on the head commit: green / red /
-#                                          # no verdict yet / absent
+#                                          # no verdict yet / absent; ends with a
+#                                          # `checks: verdict=…` trailer (see count_token)
 #   pr-review.sh merge <pr> [--override "<why this red is unrelated>"] [--wait]
 #                           [--allow-no-verdict] [--require-green]
 #                                          # checks, then merge; refuses on an open review thread
@@ -2204,9 +2208,28 @@ rounds_line() {
   return 0
 }
 
+# The machine-readable trailers (ludics-lite#423, part 1). The prose above them is for a reader and
+# has been reworded often (#434 changed `watch`'s round clause four times in one PR); a program
+# reads these instead, the way `watch` reads poll's `items:` line. Each is the LAST line of its
+# command's stdout — `watch`'s goes just above its watermark, which stays last — and each field is
+# a token from a closed set: a count or `unknown`, a threshold number or `off`, and for `checks`
+# the VERDICT vocabulary gate_checks sets (anything else prints as `unknown`). A consumer takes
+# the fields from the trailer alone and reads a missing or malformed one as unknown.
+count_token() { # <review_rounds result>
+  case "${1%%|*}" in
+  '' | *[!0-9]*) printf 'unknown' ;;
+  *) printf '%s' "${1%%|*}" ;;
+  esac
+}
+
 cmd_rounds() {
+  local r rc
   pr_arg "${1:?usage: rounds <pr>}"
-  rounds_line "$(review_rounds "$PR_NUM")"
+  r=$(review_rounds "$PR_NUM")
+  rounds_line "$r"
+  rc=$?
+  echo "rounds: n=$(count_token "$r") threshold=$ROUND_THRESHOLD"
+  return "$rc"
 }
 
 # --- open review threads under an approval (ludics-lite#289) ----------------------------------
@@ -2601,7 +2624,15 @@ watch_act() { # <pr> <state line>
   fi
   echo "status: $(status_line "$2")" >&2
   watch_drift_note "$1"
-  warn "PR $REPO#$1: ending the wait on ${POLLED_ON:-reviewer activity}$extra$(watch_round_note "$1")"
+  watch_round_counts "$1"
+  warn "PR $REPO#$1: ending the wait on ${POLLED_ON:-reviewer activity}$extra$(watch_round_note)"
+  # The trailer goes just above the watermark, which stays the last line.
+  case "$(tail -n 1 <<<"$POLLED_OUT")" in
+  'watermark: '*)
+    POLLED_OUT="$(sed '$d' <<<"$POLLED_OUT")"$'\n'"$(watch_rounds_trailer)"$'\n'"$(tail -n 1 <<<"$POLLED_OUT")"
+    ;;
+  *) POLLED_OUT="$POLLED_OUT"$'\n'"$(watch_rounds_trailer)" ;;
+  esac
   echo "$POLLED_OUT"
 }
 
@@ -2622,12 +2653,25 @@ watch_act() { # <pr> <state line>
 # Both counts cost no request inside a watch round: the feeds come from the round's snapshot, and
 # substantive_reviews's per-review reads from review_comments's per-round cache, which the
 # round's own poll and state read have already filled.
-watch_round_note() { # <pr>
-  local now before n b detail of past=""
-  now=$(review_rounds "$1")
-  before=$(review_rounds "$1" "$(mark_of "$watch_from" 2)" "$(mark_of "$watch_from" 3)")
-  n="${now%%|*}"
-  b="${before%%|*}"
+# The two counts are taken once, into WATCH_ROUNDS_NOW and WATCH_ROUNDS_BEFORE (review_rounds's
+# "count|detail"), and read by both the prose clause and the `watch-rounds:` trailer, so the two
+# can never disagree about the window.
+watch_round_counts() { # <pr>
+  WATCH_ROUNDS_NOW=$(review_rounds "$1")
+  WATCH_ROUNDS_BEFORE=$(review_rounds "$1" "$(mark_of "$watch_from" 2)" "$(mark_of "$watch_from" 3)")
+}
+
+# The trailer for the same window: from=<b> (the count at the watermark the watch started with)
+# to=<n> (the count now), so the window opened rounds from+1..to, or none when to <= from.
+watch_rounds_trailer() {
+  printf 'watch-rounds: from=%s to=%s threshold=%s' "$(count_token "$WATCH_ROUNDS_BEFORE")" \
+    "$(count_token "$WATCH_ROUNDS_NOW")" "$ROUND_THRESHOLD"
+}
+
+watch_round_note() {
+  local now="$WATCH_ROUNDS_NOW" before="$WATCH_ROUNDS_BEFORE" n b detail of past=""
+  n=$(count_token "$now")
+  b=$(count_token "$before")
   if [ "$n" = unknown ] || [ "$b" = unknown ]; then
     detail="${now#*|}"
     [ "$n" != unknown ] && detail="${before#*|}"
@@ -4286,7 +4330,7 @@ gate_checks() {
 }
 
 cmd_checks() {
-  local pr="${1:?usage: checks <pr> [--wait[=seconds]]}" wait_for=0
+  local pr="${1:?usage: checks <pr> [--wait[=seconds]]}" wait_for=0 rc
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -4297,7 +4341,16 @@ cmd_checks() {
     shift
   done
   pr_arg "$pr"
+  VERDICT=""
   gate_checks "$PR_NUM" "$wait_for"
+  rc=$?
+  # The trailer (see count_token): gate_checks's VERDICT, from its closed vocabulary, or unknown.
+  case "$VERDICT" in
+  green | absent | red | runred | waived | pending | mixed | unjudged | superseded | unknown) ;;
+  *) VERDICT=unknown ;;
+  esac
+  echo "checks: verdict=$VERDICT"
+  return "$rc"
 }
 
 # GitHub recomputes a PR's mergeability asynchronously after every push, and until that finishes

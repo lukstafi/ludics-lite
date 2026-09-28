@@ -399,6 +399,41 @@ test_empty_reviews_need_their_own_findings() {
   INLINE_JSON='[]'
 }
 
+# `rounds` ends with its machine-readable trailer (ludics-lite#423), the line `fleet-worker.sh prs`
+# reads instead of the prose: the count or `unknown`, and the threshold or `off`, on the LAST line.
+test_rounds_ends_with_its_trailer() {
+  local out rc
+  set_reviews \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)" \
+    "$(review "$REVIEWER" COMMENTED bbbb 2026-09-01T11:00:00Z)"
+  ROUND_THRESHOLD=12
+  set +e
+  out=$(cmd_rounds 7 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 0 "under the threshold"
+  assert_contains "$out" "review rounds with findings: 2 of 12" "the prose line stays"
+  assert_eq "$(tail -n 1 <<<"$out")" "rounds: n=2 threshold=12" "and the trailer is the last line"
+  ROUND_THRESHOLD=1
+  set +e
+  out=$(cmd_rounds 7 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 1 "past the threshold, the exit is unchanged"
+  assert_eq "$(tail -n 1 <<<"$out")" "rounds: n=2 threshold=1" "and the trailer still follows"
+  ROUND_THRESHOLD=off
+  out=$(cmd_rounds 7 2>&1)
+  assert_eq "$(tail -n 1 <<<"$out")" "rounds: n=2 threshold=off" "no threshold reads as off"
+  FAIL_READ=1
+  ROUND_THRESHOLD=12
+  set +e
+  out=$(cmd_rounds 7 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 3 "an unread feed exits 3"
+  assert_eq "$(tail -n 1 <<<"$out")" "rounds: n=unknown threshold=12" "and its trailer says unknown, not 0"
+}
+
 # --- a jq program that ERRORS must not render as a count (ludics-lite#89) -----------------------
 # The shim is the preamble's (`with_broken_jq`, ludics-lite#179), and so is the control that it
 # breaks only the program it is pointed at. The count's own arm already refuses; the head tally
@@ -446,6 +481,7 @@ tests=(
   test_threshold_off
   test_api_failure_is_unknown
   test_a_broken_jq_program_is_not_a_round_count
+  test_rounds_ends_with_its_trailer
 )
 
 run_tests "${tests[@]}"

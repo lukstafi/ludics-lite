@@ -1955,8 +1955,13 @@ cmd_load() {
 # per open PR -- `pr-review.sh rounds` (review rounds with findings), `pr-review.sh checks` (the
 # build signal on the head, never waited for) and the head's age -- and a CONVERGE note on a PR at
 # --flag-at rounds or more. Every read goes through ship-pr's pr-review.sh, for its retry and its
-# exit codes; its text is read only as far as the count on the `rounds` line and the ABSENT word
-# on the `checks` line. Read-only: no lease, nothing posted.
+# exit codes. Of its text, only the machine-readable trailer each command ends with is read
+# (ludics-lite#423), never the prose above it: the last stdout line of `rounds` must be exactly
+# `rounds: n=<digits> threshold=off`, and of `checks` exactly `checks: verdict=<word>`, where the
+# verdict must also be one that `checks`'s exit status can carry (an allowlist of pairs below). A
+# missing, malformed or disagreeing trailer reads as `rounds=?` / `ci=unknown` and exit 4 -- never
+# as a count or as green, which is what the old scrape of the prose made of a reworded ABSENT
+# line. Read-only: no lease, nothing posted.
 # The head's age runs from the newer of the head commit's committer date and the PR's creation,
 # the floor pr-review.sh itself uses, since the push time is not an API field.
 # --wave keeps the PRs that close an issue some execution record of that wave names (every worker
@@ -1965,7 +1970,7 @@ cmd_load() {
 # Exit: 0 read | 1 a PR is at the flag, or refused | 4 some read did not answer (a flag wins).
 cmd_prs() {
   local repo="" wave="" flag=5 helper list rc issues=null rows n sha created draft branch title
-  local rounds_out rounds checks_out ci date age worst=0 shown=0 note
+  local rounds_out rounds checks_out checks_rc verdict ci date age worst=0 shown=0 note
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --wave|--flag-at)
@@ -2014,14 +2019,17 @@ cmd_prs() {
     [ -n "$n" ] || continue
     shown=$((shown + 1))
     rounds_out=$(SHIP_PR_ROUND_THRESHOLD=off "$helper" rounds "$repo#$n" 2>/dev/null)
-    rounds=$(sed -n 's/^review rounds with findings: \([0-9][0-9]*\) .*/\1/p' <<<"$rounds_out" | head -n 1)
+    rounds=$(tail -n 1 <<<"$rounds_out" | sed -n 's/^rounds: n=\([0-9][0-9]*\) threshold=off$/\1/p')
     [ -n "$rounds" ] || { rounds="?"; [ "$worst" -eq 1 ] || worst=4; }
     checks_out=$("$helper" checks "$repo#$n" 2>/dev/null)
-    case "$?" in
-      0) case "$(head -n 1 <<<"$checks_out")" in *": ABSENT"*) ci=absent ;; *) ci=green ;; esac ;;
-      1) ci=red ;;
-      4) ci=pending ;;
-      5) ci=moved ;;
+    checks_rc=$?
+    verdict=$(tail -n 1 <<<"$checks_out" | sed -n 's/^checks: verdict=\([a-z][a-z]*\)$/\1/p')
+    case "$checks_rc:$verdict" in
+      0:green) ci=green ;;
+      0:absent) ci=absent ;;
+      1:red|1:runred|1:waived) ci=red ;;
+      4:pending|4:mixed|4:unjudged) ci=pending ;;
+      5:superseded) ci=moved ;;
       *) ci=unknown; [ "$worst" -eq 1 ] || worst=4 ;;
     esac
     date=$("$helper" retry --read api "repos/$repo/commits/$sha" --jq .commit.committer.date 2>/dev/null) || date=""

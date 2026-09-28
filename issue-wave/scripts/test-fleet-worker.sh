@@ -167,6 +167,9 @@ cat > "$TMP/dispatcher/ship-pr/scripts/pr-review.sh" <<'EOF'
 printf '%s\n' "$* grace=${SHIP_PR_BASE_ABSENT_GRACE:-unset} interval=${SHIP_PR_CHECKS_INTERVAL:-unset}" >> "$BASE_CALL_LOG"
 # `prs` reads (SHIM_PRS names a fixture directory): the open-PR list, `rounds`, `checks` and the
 # head commit's date, each answered from a file there, or 3 (the API never answered) without one.
+# `rounds-N` holds the count, then optionally the trailer line to print instead of the real shape
+# (`-` prints none); `checks-N` holds the exit status, the verdict's prose, and the trailer line
+# as printed (empty: none), then any lines to print after it.
 if [ -n "${SHIM_PRS:-}" ]; then
   printf '%s\n' "$* threshold=${SHIP_PR_ROUND_THRESHOLD:-unset}" >> "$SHIM_PRS/calls"
   case "$1 $3" in
@@ -176,12 +179,16 @@ if [ -n "${SHIM_PRS:-}" ]; then
   case "$1" in
     rounds)
       [ "${SHIP_PR_ROUND_THRESHOLD:-}" = off ] || exit 2
-      [ -f "$SHIM_PRS/rounds-${2##*#}" ] || { echo "review rounds: UNKNOWN — fixture; this is NOT 'no rounds yet', retry"; exit 3; }
-      echo "review rounds with findings: $(cat "$SHIM_PRS/rounds-${2##*#}") (fixture); no threshold set"; exit 0 ;;
+      [ -f "$SHIM_PRS/rounds-${2##*#}" ] || { echo "review rounds: UNKNOWN — fixture; this is NOT 'no rounds yet', retry"; echo "rounds: n=unknown threshold=off"; exit 3; }
+      { read -r cnt; read -r trailer || trailer="rounds: n=$cnt threshold=off"; } < "$SHIM_PRS/rounds-${2##*#}"
+      echo "review rounds with findings: $cnt (fixture); no threshold set"
+      [ "$trailer" = - ] || printf '%s\n' "$trailer"; exit 0 ;;
     checks)
       [ -f "$SHIM_PRS/checks-${2##*#}" ] || exit 3
-      { read -r crc; read -r line; } < "$SHIM_PRS/checks-${2##*#}"
-      printf 'build signal %s @abcdef12: %s\n  a check line\n' "$2" "$line"; exit "$crc" ;;
+      { read -r crc; read -r line; read -r trailer; } < "$SHIM_PRS/checks-${2##*#}"
+      printf 'build signal %s @abcdef12: %s\n  a check line\n' "$2" "$line"
+      [ -z "$trailer" ] || printf '%s\n' "$trailer"
+      tail -n +4 "$SHIM_PRS/checks-${2##*#}"; exit "$crc" ;;
   esac
   exit 2
 fi
@@ -1732,8 +1739,9 @@ jq -n --arg now "$now" '[
    closingIssuesReferences: [{number: 7, repository: {name: "other", owner: {login: "o"}}}]},
   {number: 9, title: "", headRefName: "claude/issue-9", headRefOid: "c9", createdAt: $now, isDraft: false, closingIssuesReferences: []}]' > "$P/list.json"
 echo 6 > "$P/rounds-12"; echo 2 > "$P/rounds-7"
-printf '0\ngreen — 3 build checks passed\n' > "$P/checks-12"; printf '4\nNO VERDICT YET — still running\n' > "$P/checks-7"
-printf '0\nABSENT — no build check ran on this commit: x\n' > "$P/checks-9"
+printf '0\ngreen — 3 build checks passed\nchecks: verdict=green\n' > "$P/checks-12"
+printf '4\nNO VERDICT YET — still running\nchecks: verdict=pending\n' > "$P/checks-7"
+printf '0\nABSENT — no build check ran on this commit: x\nchecks: verdict=absent\n' > "$P/checks-9"
 echo "2026-09-02T00:00:00Z" > "$P/date-c12"; echo "$now" > "$P/date-c7"
 expect "prs flags a PR at five or more rounds, exit 1" 1 "o/r#12 rounds=6 ci=green head=[0-9]*d[0-9]*h draft claude/issue-12: second.tPR -- CONVERGE: 6 review rounds with findings (flag at 5)" -- "$FW" prs o/r
 grep -q "^o/r#7 rounds=2 ci=pending head=[01]m claude/issue-7: first PR$" <<<"$out" && ok "...a PR under the flag gets its line, no note, age from the newer of commit and creation" || ko "PR 7's line: $out"
@@ -1744,7 +1752,32 @@ expect "--flag-at raises the flag; an unread count alone exits 4" 4 "o/r#9 round
 grep -q CONVERGE <<<"$out" && ko "a PR under --flag-at was flagged: $out" || ok "...and nothing is flagged under it"
 expect "a list that reaches its cap says PRs past it are not shown, exit 4" 4 "PRS INCOMPLETE o/r: the list reached its cap of 3 open PRs" -- env FLEET_PRS_LIMIT=3 "$FW" prs o/r --flag-at 7
 grep -q "^o/r#12 rounds=6" <<<"$out" && ok "...and still lists what it read" || ko "a capped list dropped its rows: $out"
-rm "$P/list.json"
+# Only the trailers are read (ludics-lite#423): the prose may be reworded, and a trailer that is
+# missing, malformed or at odds with the exit status reads as unknown -- never as green. The old
+# scrape read a reworded ABSENT line under exit 0 as ci=green.
+cp "$P/list.json" "$P/list-full.json"
+jq '[.[] | select(.number == 9)]' "$P/list-full.json" > "$P/list.json"
+probe() { # <rounds file> <checks file>: PR 9's line from those fixtures
+  printf '%b' "$1" > "$P/rounds-9"; printf '%b' "$2" > "$P/checks-9"
+  out=$("$FW" prs o/r 2>&1); rc=$?
+}
+probe '3\n' '0\nnothing ran on this commit -- x\n'
+[ "$rc" -eq 4 ] && grep -q "^o/r#9 rounds=3 ci=unknown " <<<"$out" && ok "a reworded ABSENT line with no trailer is ci=unknown, exit 4, never green" || ko "no checks trailer (exit $rc): $out"
+probe '3\n' '0\nnothing ran on this commit -- x\nchecks: verdict=absent\n'
+[ "$rc" -eq 0 ] && grep -q "^o/r#9 rounds=3 ci=absent " <<<"$out" && ok "...and with its trailer it is ci=absent, whatever the prose says" || ko "reworded prose, absent trailer (exit $rc): $out"
+probe '3\n' '0\ngreen -- 3 passed\nchecks: verdict=red\n'
+[ "$rc" -eq 4 ] && grep -q "^o/r#9 rounds=3 ci=unknown " <<<"$out" && ok "a verdict its exit status cannot carry is ci=unknown" || ko "0:red (exit $rc): $out"
+probe '3\n' '0\ngreen -- 3 passed\nchecks: verdict=green extra\n'
+[ "$rc" -eq 4 ] && grep -q " ci=unknown " <<<"$out" && ok "a malformed checks trailer is ci=unknown" || ko "malformed checks trailer (exit $rc): $out"
+probe '3\n' '0\ngreen -- 3 passed\nchecks: verdict=green\n  a line after it\n'
+[ "$rc" -eq 4 ] && grep -q " ci=unknown " <<<"$out" && ok "a checks trailer that is not the last line is not read" || ko "trailer not last (exit $rc): $out"
+probe '3\n-\n' '0\ngreen -- 3 passed\nchecks: verdict=green\n'
+[ "$rc" -eq 4 ] && grep -q "^o/r#9 rounds=? ci=green " <<<"$out" && ok "a count with no rounds trailer is rounds=?, even under readable prose" || ko "no rounds trailer (exit $rc): $out"
+probe '3\nrounds: n=6 threshold=off\n' '0\ngreen -- 3 passed\nchecks: verdict=green\n'
+[ "$rc" -eq 1 ] && grep -q "^o/r#9 rounds=6 ci=green .*CONVERGE" <<<"$out" && ok "...and the count is the trailer's, not the prose's" || ko "trailer count (exit $rc): $out"
+probe '3\nrounds: n=6 threshold=12\n' '0\ngreen -- 3 passed\nchecks: verdict=green\n'
+[ "$rc" -eq 4 ] && grep -q "^o/r#9 rounds=? " <<<"$out" && ok "a rounds trailer under a threshold prs did not ask for is not read" || ko "threshold mismatch (exit $rc): $out"
+rm "$P/list.json" "$P/list-full.json"
 expect "an open-PR list that never answered is UNREACHABLE, exit 4" 4 "PRS UNREACHABLE: the open PRs of o/r did not answer" -- "$FW" prs o/r
 expect "prs needs an owner/repo" 2 "prs: <owner/repo> required" -- "$FW" prs
 expect "prs refuses a zero --flag-at" 2 "positive number of rounds" -- "$FW" prs o/r --flag-at 0

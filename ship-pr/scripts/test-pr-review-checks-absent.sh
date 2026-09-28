@@ -1430,7 +1430,59 @@ test_head_reread_unknown() {
   done
 }
 
+# `checks` ends with its machine-readable trailer (ludics-lite#423): `fleet-worker.sh prs` reads
+# the verdict from it, never from the prose, whose ABSENT wording it once scraped — a reworded line
+# there read as green. One fixture per exit status, the trailer the LAST line of stdout, and the
+# prose left as it was.
+check_trailer() { # <expected rc> <expected verdict> <prose> [checks args]
+  local want_rc="$1" want="$2" prose="$3" out rc
+  shift 3
+  set +e
+  out=$(cmd_checks 7 "$@" 2>/dev/null)
+  rc=$?
+  set -e
+  assert_eq "$rc" "$want_rc" "$want: the exit status is unchanged"
+  assert_contains "$out" "$prose" "$want: the prose line stays"
+  assert_eq "$(tail -n 1 <<<"$out")" "checks: verdict=$want" "$want: the trailer is the last line"
+}
+
+test_checks_ends_with_its_verdict_trailer() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ci","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
+  check_trailer 0 green "green — 1 build checks passed"
+  reset_fixture
+  COMMIT_AGE=1800
+  check_trailer 0 absent ": ABSENT"
+  reset_fixture
+  COMMIT_AGE=20
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"in_progress"}]')")
+  check_trailer 4 unjudged "NO VERDICT YET"
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ci","status":"in_progress"}]')")
+  check_trailer 4 pending "NO VERDICT YET — still running"
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ci","conclusion":"failure","html_url":"u"}]')")
+  check_trailer 1 red ": RED"
+  reset_fixture
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"startup_failure"}]')")
+  check_trailer 1 runred ": RED"
+  reset_fixture
+  COMMIT_AGE=1800
+  FAIL_ENDPOINT="*actions/runs*"
+  check_trailer 3 unknown ""
+  reset_fixture
+  HEAD_SEQ=("$HEAD_SHA" "$HEAD_SHA" feedbeeffeedbeeffeedbeeffeedbeeffeedbeef)
+  CHECK_RUNS_SEQ=(
+    "$(check_runs_json '[{"name":"ci","status":"in_progress"}]')"
+    "$(check_runs_json '[{"name":"ci","conclusion":"success"}]')"
+  )
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
+  check_trailer 5 superseded "SUPERSEDED" --wait=30
+}
+
 tests=(
+  test_checks_ends_with_its_verdict_trailer
   test_wait_superseded_head
   test_wait_unchanged_head_turns_green
   test_head_reread_unknown
