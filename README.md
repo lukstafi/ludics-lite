@@ -402,7 +402,13 @@ and the shape was chosen over a `main() { … }` with `main "$@"` at the foot pr
 one hands the shell back to the file after the minutes the run took. A suite that is also SOURCED
 by a sibling takes the same shape: the `[ "${BASH_SOURCE[0]}" = "$0" ] || return 0` dispatch in
 `test-pr-review-lib.sh` and `test-pr-review-base-lib.sh` ends the sourcing inside the group, before
-the foot is reached, so the caller survives with the definitions it came for.
+the foot is reached, so the caller survives with the definitions it came for. The long-running
+non-test scripts in `ALSO_GUARDED` (`fleet-worker.sh`, `bg-run.sh`, `wake-lab.sh`, `wait-for.sh`)
+take the shape too, because they run for hours from the checkout a deploy updates (ludics-lite#437).
+What corrupts such a run is a writer that rewrites the file in place, through its inode (`cp` over
+it, a `>` redirection, `rsync --inplace`); a git fast-forward does not, since checkout replaces the
+file and a running shell keeps reading the old inode. `test-check-parse-guards.sh` rewrites each
+listed script in place under a running copy.
 
 A suite that SOURCES a sibling library does it in a preamble ABOVE the `{`, and that is the one
 thing about the shape that is not free. Bash binds the location `declare -F` reports for a function

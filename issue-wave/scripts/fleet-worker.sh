@@ -190,6 +190,19 @@
 
 set -uo pipefail
 
+# Bash reads a script by OFFSET while it runs, so a writer that rewrites this file IN PLACE, through
+# its own inode (`cp` over it, a shell `>` redirection, `rsync --inplace`, an editor that saves in
+# place), resumes a running shell mid-command in whatever text now sits at the offset it left off
+# at. `attach`, `watch`, a `launch` waiting on a lock and an `execution` run live for minutes to hours,
+# from the checkout that `refresh` and a hub fast-forward update.
+# A git fast-forward is not such a writer: checkout unlinks the old file and creates a new one, and
+# a running shell keeps reading the old inode (measured for ludics-lite#437). Everything below is
+# one brace group, parsed whole before its first command runs, and the closing exit means the shell
+# never comes back to the file; the body keeps its own indentation, so the guard is these lines and
+# two at the foot. scripts/check-parse-guards.sh holds the shape (ALSO_GUARDED), and
+# scripts/test-check-parse-guards.sh rewrites the file in place under a running copy.
+{
+
 # Which fleet box this is, from the hostname unless FLEET_LOCAL_BOX says so; an unrecognized
 # host is local to nothing but the literal `local`, so every named box is reached over ssh.
 # FLEET_HOSTNAME_MAP is the lookup: `<glob>=<box>` pairs, first match wins, patterns are shell
@@ -3003,3 +3016,5 @@ case "$cmd" in
   coordinator) cmd_coordinator "$@" ;;
   *) sed -n '/^# Usage:/,/^# Exit:/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
+exit "$?"
+}
