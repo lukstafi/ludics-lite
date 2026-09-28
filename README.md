@@ -218,7 +218,11 @@ now, with the holder's line and its age under the box, or `free`, with any lefto
 stale text. The probe is a non-blocking shared take on a descriptor of its own, gone as it exits,
 so it creates and writes nothing and is safe beside a running sweep. `reservations=` counts the
 active `fleet-worker.sh execution list` records naming the box and lists them; it reads `?`, never
-0, when that registry could not be read. The OCANNL cross-machine sweep reserves each box's
+0, when that registry could not be read. Holding both locks, `restart-wsl`, `--restart-wsl` and the
+power verbs read that registry too and refuse a box an outstanding `measurement` reservation names
+(ludics-lite#445): an exclusive timing run holds no lab lock. `--as=<request_id>` spares the
+caller's own, an unreadable registry refuses, and `--force` skips the check with the locks. The
+other direction is the registry's: a measurement is refused on a box whose lane lock is held. The OCANNL cross-machine sweep reserves each box's
 lane lock for the length of its lane — on 2026-09-16, before any of this existed, a restart issued
 mid-sweep destroyed both GPU boxes' VMs and cost that run both GPU units. The split into two locks
 came later, on 2026-09-18: while one lock said both things, the sweep routine's own `--hold` in
@@ -253,7 +257,8 @@ half-renamed alias, a misspelt key) is refused before anything is sent (ludics-l
 and a bare `status` expand to the map's rows, so adding or renaming a box is one row there plus
 its entries in the site file. `wake-lab.sh endpoint-map` prints the map as data, one line per box
 (the box, then its aliases), and only for a map every rule passes; `fleet-worker.sh execution`
-reads it to refuse a `FLEET_BOXES` roster naming two aliases of one box (ludics-lite#395).
+reads it to refuse a `FLEET_BOXES` roster naming two aliases of one box (ludics-lite#395), and to
+find the lab box whose lane lock a `measurement` reads (ludics-lite#445).
 `status` is the only verb with a no-box default, and `endpoint-map` takes none: every other verb,
 wake included, prints the usage and exits 2 when no box is named, so a bare `wake-lab.sh` never
 wakes anything; name the boxes, or `all`.

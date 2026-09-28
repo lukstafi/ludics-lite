@@ -69,8 +69,9 @@ endpoints (its row of `~/bin/wake-lab.sh endpoint-map`), is someone's exclusive 
 it out of this step entirely — drop it from the `for box in rog minix` loop, and from the checkout
 refresh below, so it is neither woken, restarted, held nor fetched on —
 and report it as measured. The sweep's own per-unit check then skips its units. `--restart-wsl` in
-particular destroys a guest host-globally, and a measurement holds no lab lock, so nothing else
-stops it yet (ludics-lite#445). If the registry or the map cannot be read, say so in the report and
+particular destroys a guest host-globally, and a measurement holds no lab lock; wake-lab.sh now
+refuses a measured box itself (ludics-lite#445), but that refusal would read as a failed wake, so
+leave the box out rather than lean on it. If the registry or the map cannot be read, say so in the report and
 treat a WSL box as measured unless you can tell otherwise (a skipped box costs a day's coverage; a
 restarted one costs the measurement). A WSL box left out here is not held, so if its measurement
 concludes before the sweep reaches its units they run in an unheld guest and may end `skip

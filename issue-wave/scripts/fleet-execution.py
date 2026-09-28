@@ -36,7 +36,26 @@ the repository's full integration suite at a merged tip, and once concluded pass
 exact `observed_sha` it is the verdict source `fleet-worker.sh gate` offers `pr-review.sh base`
 for a default branch without push CI. The field is what tells it from a targeted batch, which is
 a correctness run too; the gate reads no record without it.
+
+A measurement refuses a box a sweep lane holds (ludics-lite#445). OCANNL's daily sweep owns no
+record here; what says a lane is running on a lab box is that box's LANE lock, the flock
+`<lock dir>/<box>.lock` it takes for the length of the lane (`wake-lab.sh`'s lab lock lore). So a
+`measurement` reserve, run or dispatch takes that lock SHARED and non-blocking, refuses naming the
+holder's first line (e.g. `ocannl sweep <stamp> (pid ..., since ...)`) when it is held, and keeps
+it until this process exits, after the record is written. The lane takes it EXCLUSIVE and reads
+this registry before each unit only once it holds it, and every destroyer in wake-lab.sh takes it
+EXCLUSIVE before it reads this registry too, so neither can slip between this check and the record
+it guards. What it reads, and nothing else: the box is the endpoint map row naming the execution
+host (the map argument above; a host on no row, or no map at all, is not a lab box and has no lane
+lock), and the lock directory is THIS process's -- WAKE_LAB_LOCK_DIR, else
+~/.local/state/wake-lab, the default wake-lab.sh and the sweep share -- so it is the lab's only
+because the anchor is the machine that runs wake-lab.sh and the sweep (mac-studio). The box's HOLD
+lock is not read: a hold keeps a VM alive and says nothing about who works there. A lock file that
+cannot be created or opened is free, as wake-lab.sh treats it (no lane can hold what it cannot open:
+the sweep fails such a lane rather than running it); one that opens but cannot be probed refuses.
+Correctness reservations never read the lock.
 """
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -169,6 +188,40 @@ def check_one_entry_per_box(roster, map_spec):
                    f"on one would not exclude a run on the other; keep one entry per physical box")
 
 
+LANE_LOCKS = []   # lane-lock descriptors held SHARED until this process exits (see the header)
+
+
+def check_lane_lock(host, map_spec):
+    """Refuse a measurement on a box whose lab LANE lock is held; hold it shared if free."""
+    box = endpoint_boxes(map_spec).get(host.casefold())
+    if box is None:
+        return
+    directory = Path(os.environ.get("WAKE_LAB_LOCK_DIR") or Path.home() / ".local/state/wake-lab")
+    path = directory / (box + ".lock")
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_RDONLY | os.O_CREAT, 0o644)
+    except OSError:
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            with open(descriptor, errors="replace", closefd=False) as stream:
+                line = stream.readline()
+        except OSError:
+            line = ""
+        os.close(descriptor)
+        holder = re.sub(r"[\x00-\x1f\x7f]", "", line)[:200] or "an unnamed holder"
+        refuse(f"{host} is lab box {box}, whose lane lock is held by {holder} ({path}): a measurement "
+               f"needs the box to itself; wait for that lane to end (`wake-lab.sh status {box}`)")
+    except OSError as exc:
+        os.close(descriptor)
+        refuse(f"{host} is lab box {box}, whose lane lock {path} could not be probed ({exc}), so a sweep "
+               f"lane there cannot be ruled out")
+    LANE_LOCKS.append(descriptor)
+
+
 def check_capacity(data, records, canonical_hosts, slots_spec):
     """Refuse when the requested host cannot take this assignment beside the outstanding ones."""
     host, kind = data["execution_host"], data["kind"]
@@ -277,11 +330,16 @@ def main():
                 refuse(f"assignment already dispatched (state {record['state']}); reconcile, never run twice")
             if record["lease_token"] != token:
                 refuse("adopted assignment must be reconciled before dispatch")
+            # The dispatch step, rechecked: a reservation can wait hours for its launch.
+            if record["request"]["kind"] == "measurement":
+                check_lane_lock(record["request"]["execution_host"], map_spec)
         else:
             halted = halt_identity is not None
             if "triage_reason" in request and not halted:
                 refuse("triage reservations require an active halt")
             check_capacity(request, records, canonical_hosts, slots_spec)
+            if request["kind"] == "measurement":
+                check_lane_lock(request["execution_host"], map_spec)
             if halted:
                 if "triage_reason" not in request:
                     refuse("fleet halted; ordinary reservations refused (only the named triage_reason reservation is admitted)")
@@ -337,6 +395,10 @@ def main():
                 refuse("triage assignment belongs to a different or ended halt")
             if halt_identity is not None and not triage:
                 refuse("fleet halted; ordinary dispatch refused")
+            # Rechecked at dispatch, the moment the timed work starts: a reservation can wait hours
+            # for its launch, and a lane harness that reads no registry can take the box meanwhile.
+            if record["request"]["kind"] == "measurement":
+                check_lane_lock(record["request"]["execution_host"], map_spec)
             state = "launching"
         elif action == "record":
             if record["state"] not in {"launching", "running", "uncertain"}:

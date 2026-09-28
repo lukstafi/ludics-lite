@@ -14,6 +14,8 @@
 #                                         is really held, and the box's execution reservations
 #                                         (default: every box)
 #   wake-lab.sh sleep|hibernate|down box  suspend / hibernate / full shutdown
+#                                         (a destroyer's --as=ID spares only the caller's own
+#                                         measurement reservation; see the next paragraph)
 #   wake-lab.sh kick-wsl box              start the WSL VM (it never autostarts at boot)
 #   wake-lab.sh restart-wsl box           shut the WSL VM down and start it again
 #   wake-lab.sh kick-wsl --hold box       ...and leave a Windows-side holder keeping the VM alive
@@ -41,6 +43,10 @@
 # -- the lane lock and the hold lock, which say two different things and are held by two different
 # kinds of user -- and `--force` overrides both. The lab lock lore below says which is which, why
 # there are two, when `--force` is the right call, and what each cost the day it was not there.
+# Holding them, every one of these also refuses a box an outstanding `measurement` reservation in
+# the fleet's execution registry names (ludics-lite#445): an exclusive timing run holds no lab
+# lock. `--as=<request_id>` spares the caller's own measurement, an unreadable registry refuses,
+# and `--force` skips this check with the locks (measured_box_clear, below the lock lore).
 #
 # Tracked in the ludics-lite repository as scripts/wake-lab.sh and meant to be reached through a
 # ~/bin/wake-lab.sh symlink, so an edit made mid-run lands as a normal `git status`. One part is
@@ -561,6 +567,10 @@ DOWN_WAIT_SECONDS=${WAKE_LAB_DOWN_WAIT_SECONDS:-120}
 #   `--hold`       the HOLD lock, carried by the holder for exactly as long as the holder lives
 #   a DESTROYER    (`restart-wsl`, `--restart-wsl`, `sleep`, `hibernate`, `down`) takes BOTH and is
 #                  refused if EITHER is held -- each one alone means somebody loses work
+#   the registry   the LANE lock, SHARED and non-blocking, for the instant a `measurement`
+#                  reservation is written or dispatched (fleet-worker.sh, ludics-lite#445): refused
+#                  while a lane or a destroyer holds it, so a measurement is never reserved under a
+#                  running lane; a lane waits that instant out, a destroyer is refused by it
 #
 # That keeps the 2026-09-16 property whole: another session's `restart-wsl` is refused while a lane
 # is using the box, and refused just the same in the gap between a hold and the lane it was taken
@@ -649,9 +659,11 @@ lock_holder() { # lock_holder <path>
 # lock files named holders and none of the four pids was alive. The flock can say it, so this asks
 # the flock: a non-blocking SHARED take on a read-only descriptor of the probe's own, dropped as the
 # probe exits. Every taker here and in the sweep takes these locks EXCLUSIVE, so a refused shared
-# take is exactly "a destroyer would be refused right now". The probe creates no file, writes no
-# line and holds nothing past its own instant; the one effect it can have is that a destroyer's
-# non-blocking take landing in that instant is refused, which fails closed.
+# take is exactly "a destroyer would be refused right now". (The registry's shared take for a
+# measurement's write, ludics-lite#445, lasts an instant and reads as free here.) The probe
+# creates no file, writes no line and holds nothing past its own instant; the one effect it can
+# have is that a destroyer's non-blocking take landing in that instant is refused, which fails
+# closed.
 # What it reads, and nothing else: whether the file exists, its flock, its mtime (when a holder last
 # wrote the line, which is when it took the lock), and its first line. The line is SHOWN, stripped of
 # control characters, and never parsed: no pid in it is looked up and no state is taken from it.
@@ -720,8 +732,10 @@ reservations_read() {
   if [ -n "${WAKE_LAB_FLEET_WORKER:-}" ]; then fw=$WAKE_LAB_FLEET_WORKER
   else dir=$(script_dir) || return 0; fw=$dir/../issue-wave/scripts/fleet-worker.sh; fi
   [ -x "$fw" ] || return 0
-  RESERVATIONS=$(capped_tree "$PROBE_CAP" "$fw" execution list --active --compact 2>/dev/null </dev/null) \
-    || RESERVATIONS=""
+  # A destroyer reads this while it holds its boxes' lab locks, on descriptors LOCK_FD_BASE (4)
+  # through 9, so the reader is given none of them: a straggler of its tree must not carry a lock.
+  RESERVATIONS=$(capped_tree "$PROBE_CAP" "$fw" execution list --active --compact 2>/dev/null </dev/null \
+    4>&- 5>&- 6>&- 7>&- 8>&- 9>&-) || RESERVATIONS=""
 }
 
 # `capped` for a command that is a process TREE writing into a command substitution. `capped`
@@ -744,20 +758,22 @@ capped_tree() { # capped_tree <seconds> <cmd...>
     alarm 0; kill "KILL", -$pid;
     exit(($st & 127) ? 128 + ($st & 127) : $st >> 8);' "$1" "$CAP_EXPIRED" "${@:2}"
 }
-# box_reservations <box> [except-id] [only-id] -- "<id> (<state>)" per active reservation naming the
-# box on any endpoint of its row, less the one whose request_id is <except-id>; with <only-id>, just
-# that one, and only if it is a `measurement` (exclusive) reservation. 1 when the registry was unread.
+# box_reservations <box> [except-id] [only-id] [kind] -- "<id> (<state>)" per active reservation
+# naming the box on any endpoint of its row, less the one whose request_id is <except-id>; with
+# <only-id>, just that one, and only if it is a `measurement` (exclusive) reservation; with <kind>,
+# only reservations of that kind. 1 when the registry was unread.
 box_reservations() {
   local os e names=""
   for os in linux wsl win lan; do
     e=$(endpoint_of "$1" "$os") && names="$names$e"$'\n'
   done
   [ -n "$RESERVATIONS" ] && [ -n "$names" ] || return 1
-  jq -r --arg names "$names" --arg except "${2:-}" --arg only "${3:-}" \
+  jq -r --arg names "$names" --arg except "${2:-}" --arg only "${3:-}" --arg kind "${4:-}" \
      '($names | split("\n") | map(select(. != ""))) as $ns
       | if type == "array" then .[] | .request.execution_host as $h
         | select($ns | index([$h])) | select(($except == "") or (.request_id != $except))
         | select(($only == "") or (.request_id == $only and .request.kind == "measurement"))
+        | select(($kind == "") or (.request.kind == $kind))
         | "\(.request_id) (\(.state))" else error("not a list") end' <<<"$RESERVATIONS" 2>/dev/null
 }
 reservations_fields() { # reservations_fields <box>
@@ -805,6 +821,34 @@ lab_reserve() { # lab_reserve <box> <what> <fd> — the lane lock on <fd>, the h
   return 0
 }
 
+# A destroyer's second check, made while it HOLDS the box's lab locks (ludics-lite#445). An
+# exclusive `measurement` reservation in the fleet's execution registry is someone's timing run on
+# the box, and it holds no lab lock, so the locks alone let `restart-wsl` or `sleep` take the box
+# from under it. So every destroyer, once reserved, reads the registry and refuses a box that an
+# outstanding measurement names on any endpoint of its row -- except the caller's own, named with
+# `--as=<request_id>` (a measurement's owner restarting its guest, or sleeping the box it is done
+# timing on). Correctness reservations are not read: a slot batch holds a logind sleep inhibitor,
+# which refuses a native sleep from the OS side, and the registry keeps a standing record on nearly
+# every box. A registry that cannot be read refuses, as boot_reservations_clear does: "nothing
+# measured" and "could not look" call for opposite conclusions, and the cost of the refusal is a
+# box left awake or a guest not restarted, where the cost of guessing wrong is the measurement.
+# Holding the locks first is what closes the race: a measurement reserve takes the box's LANE lock
+# shared while it writes its record (fleet-execution.py), so it is refused for as long as this
+# destroyer holds that lock, and one written before it is in the registry this reads.
+# Its caller has run reservations_read after taking the locks; prints the refusal and returns 1.
+measured_box_clear() { # measured_box_clear <verb> <box>
+  local held
+  if ! held=$(box_reservations "$2" "$BOOT_AS" "" measurement); then
+    printf '%s\n' "  $1 REFUSED on $2: the fleet's execution registry could not be read, so an exclusive measurement there cannot be ruled out"
+    return 1
+  fi
+  [ -z "$held" ] && return 0
+  printf '%s\n' "$held" | sed 's/^/  measurement: /'
+  printf '%s\n' "  $1 REFUSED on $2: an exclusive measurement reservation names it"
+  return 1
+}
+MEASURED_HINT="an exclusive measurement holds the box, or the registry could not be read; wait for it to conclude, pass --as=<request_id> if it is your own, or --force to take the box anyway"
+
 # The whole power phase, with every box it acts on RESERVED from before its command is sent until
 # that box is confirmed down.
 #
@@ -832,7 +876,7 @@ lab_reserve() { # lab_reserve <box> <what> <fd> — the lane lock on <fd>, the h
 # deadline, where confirming box by box would multiply the worst-case wait by the number of boxes.
 power_phase() { # power_phase <verb> <box...> — nonzero if any box was refused or never went down
   local verb=$1; shift
-  local box fd=$LOCK_FD_BASE rc=0 acted=() confirming=() refused=()
+  local box fd=$LOCK_FD_BASE rc=0 i acted=() fds=() kept=() confirming=() refused=() measured=()
   for box in "$@"; do
     if [ "$FORCE" = 1 ]; then acted+=("$box"); continue; fi
     # Out of descriptors below bash 3.2's save slot: refuse rather than act on a box this shell
@@ -843,12 +887,26 @@ power_phase() { # power_phase <verb> <box...> — nonzero if any box was refused
       refused+=("$box"); continue
     fi
     if lab_reserve "$box" "$verb" "$fd"; then
-      acted+=("$box"); fd=$((fd + 2))
+      acted+=("$box"); fds+=("$fd"); fd=$((fd + 2))
     else
       echo "  $verb REFUSED on $box: $RESERVE_REFUSED_BY"
       refused+=("$box")
     fi
   done
+  # With every lock held, the registry (measured_box_clear): a measured box's two locks are let go
+  # again at once, since this command will not act on it.
+  if [ "$FORCE" != 1 ] && [ ${#acted[@]} -gt 0 ]; then
+    reservations_read
+    i=0
+    for box in "${acted[@]}"; do
+      if measured_box_clear "$verb" "$box"; then kept+=("$box")
+      else
+        measured+=("$box"); eval "exec ${fds[$i]}>&- $((fds[i] + 1))>&-"
+      fi
+      i=$((i + 1))
+    done
+    acted=(${kept[@]+"${kept[@]}"})
+  fi
   # Only the boxes actually acted on are confirmed: polling a refused box for the DOWN signal
   # would report the holder's live machine as a failure to go down.
   if [ ${#acted[@]} -gt 0 ]; then
@@ -865,6 +923,10 @@ power_phase() { # power_phase <verb> <box...> — nonzero if any box was refused
   fi
   if [ ${#refused[@]} -gt 0 ]; then
     echo "$verb REFUSED on: ${refused[*]} (a lab lock is held; wait for the holder, or --force to take the box anyway)"
+    rc=1
+  fi
+  if [ ${#measured[@]} -gt 0 ]; then
+    echo "$verb REFUSED on: ${measured[*]} ($MEASURED_HINT)"
     rc=1
   fi
   return $rc
@@ -1376,7 +1438,8 @@ WAIT=0
 WANT_WSL=0
 HOLD=0
 FRESH_WSL=""   # "fresh" makes kick_wsl shut the VM down first; --wsl alone never kills a live VM
-BOOT_AS=""     # --as=<request_id>: the caller's own execution reservation, which a boot verb does not refuse
+BOOT_AS=""     # --as=<request_id>: the caller's own measurement reservation, which a boot verb requires
+               # and no destroyer refuses (boot_reservations_clear, measured_box_clear)
 FORCE=0        # --force: destroy the VM even while a lab lock is held (see the lab lock lore)
 HOLD_LOCKED=0  # set in a box's subshell once its reservation holds that box's HOLD lock on HOLD_FD
 VERB=wake

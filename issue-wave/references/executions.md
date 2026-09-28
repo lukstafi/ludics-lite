@@ -163,13 +163,17 @@ worktrees, sync, scheduling or remote agent launch.
 unrelated users or applications. The one scheduled sweep that reads them is OCANNL's daily
 `tools/sweep.sh`, which skips a unit whose box an outstanding `measurement` names (on any of the
 box's endpoints in `wake-lab.sh endpoint-map`) and defers to nothing else; it holds no reservation
-and takes no slot itself (ahrefs/ocannl#1097). That is a read before each unit, so it protects a
-measurement already reserved when a unit starts, not one reserved while a unit runs: nothing refuses
-that yet (#445), and the box's held lab lane lock in `wake-lab.sh status` is what shows a sweep
-there. Before timing experiments inspect external
-activity and wait when it compromises the measurement. Existing project runners continue to
-own process locks, time limits, cancellation and logs. This interface never starts or stops a
-process.
+and takes no slot itself (ahrefs/ocannl#1097). The other direction is the registry's (#445): a
+`measurement` reserve, run or dispatch refuses a lab box whose lane lock a sweep lane holds, naming
+the holder (`ocannl sweep <stamp> ...`), and holds that lock shared while it writes, so a lane that
+starts after it reads the new record before its first unit. The lock is the anchor's, which is the
+machine that runs `wake-lab.sh` and the sweep. The destroyers (`wake-lab.sh restart-wsl`,
+`--restart-wsl`, `sleep`, `hibernate`, `down`) likewise refuse a box an outstanding `measurement`
+names, unless `--as=<request_id>` names it as the caller's own; an unreadable registry refuses them,
+and `--force` skips the check. Correctness reservations take part in neither. Before timing
+experiments inspect external activity and wait when it compromises the measurement. Existing
+project runners continue to own process locks, time limits, cancellation and logs. This interface
+never starts or stops a process.
 
 ## Reserve, launch, observe, conclude
 

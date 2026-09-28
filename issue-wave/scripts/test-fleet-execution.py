@@ -8,6 +8,11 @@ import subprocess
 import tempfile
 
 SCRIPT = Path(__file__).with_name('fleet-worker.sh')
+# A measurement on a lab box probes that box's lane lock (ludics-lite#445), and the real endpoint
+# map makes `rog` and `rog-nv-linux` lab boxes, so no case may reach the real lab's lock directory:
+# every subprocess below inherits this one.
+LAB_LOCKS = tempfile.TemporaryDirectory(prefix='fleet-lab-locks-')
+os.environ['WAKE_LAB_LOCK_DIR'] = LAB_LOCKS.name
 with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     root = Path(temporary)
     env = {**os.environ, 'FLEET_ANCHOR': 'local', 'FLEET_LOCAL_BOX': 'fixture',
@@ -427,6 +432,101 @@ def one_entry_per_box():
 
 one_entry_per_box()
 
+# ludics-lite#445: a measurement refuses a box whose lab LANE lock is held -- what a running sweep
+# lane looks like, since the sweep owns no record -- at reserve, run and dispatch alike, naming the
+# holder's line; and it holds that lock shared while it writes, so a lane cannot start between the
+# check and the record the lane then reads.
+import fcntl
+
+
+def lane_lock_interlock():
+    with tempfile.TemporaryDirectory(prefix='fleet-lane-lock-') as temporary:
+        root = Path(temporary)
+        locks = root / 'locks'
+        env = {**os.environ, 'FLEET_ANCHOR': 'local', 'FLEET_LOCAL_BOX': 'fixture',
+               'ISSUE_WAVE_STATE': str(root), 'FLEET_ANCHOR_STATE': str(root),
+               'FLEET_COORDINATOR': 'first', 'FLEET_LOCK_WAIT': '10', 'WAKE_LAB_LOCK_DIR': str(locks),
+               'FLEET_BOXES': 'mac-studio rog-nv-linux minix-amd-linux'}
+        env.pop('FLEET_BOX_CORRECTNESS_SLOTS', None)
+
+        def change(action, data, expected=0, **extra):
+            with tempfile.NamedTemporaryFile(mode='w', dir=root, suffix='.input') as stream:
+                json.dump(data, stream)
+                stream.flush()
+                result = subprocess.run(['bash', str(SCRIPT), 'execution', action, stream.name],
+                                        env={**env, **extra}, text=True, capture_output=True, timeout=20)
+            assert result.returncode == expected, (action, data, result.returncode, result.stdout, result.stderr)
+            return result.stderr
+
+        def request(identity, host, kind='measurement'):
+            return dict(request_id=identity, wave='wave', worker=identity, transport='subagent',
+                        issue='repo#445', purpose='fixture', agent_host='mac', execution_host=host,
+                        repository='owner/repo', requested_revision='origin/main', kind=kind)
+
+        def records():
+            out = subprocess.run(['bash', str(SCRIPT), 'execution', 'list'], env=env, text=True,
+                                 capture_output=True, timeout=20, check=True).stdout
+            return {r['request_id']: r for r in json.loads(out)}
+
+        def lane_free(box):
+            with open(locks / (box + '.lock'), 'a') as probe:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return False
+                return True
+
+        holder = 'ocannl sweep 20260928T050000Z (pid 4242, since 20260928T050001Z)'
+        want = f'rog-nv-linux is lab box rog, whose lane lock is held by {holder}'
+
+        def hold_lane():
+            locks.mkdir(exist_ok=True)
+            lane = open(locks / 'rog.lock', 'a')
+            fcntl.flock(lane, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lane.truncate(0)
+            lane.write(holder + '\n')
+            lane.flush()
+            return lane
+
+        subprocess.run(['bash', str(SCRIPT), 'claim'], env=env, capture_output=True, timeout=20, check=True)
+        lane = hold_lane()
+        for action in ['reserve', 'run']:
+            err = change(action, request('lane-' + action, 'rog-nv-linux'), expected=1)
+            assert want in err, err
+        # Any endpoint of the box is the box.
+        err = change('reserve', request('lane-win', 'rog-nv-win'), expected=1,
+                     FLEET_BOXES='mac-studio rog-nv-win minix-amd-linux')
+        assert 'rog-nv-win is lab box rog, whose lane lock is held by ' + holder in err, err
+        assert not [identity for identity in records() if identity.startswith('lane-')], records()
+        # Only a measurement reads it: a correctness run shares the box with a lane as before, and
+        # another box's measurement, or one on a host that is no lab box, is not refused.
+        change('reserve', request('lane-check', 'rog-nv-linux', 'correctness'))
+        change('reserve', request('measure-minix', 'minix-amd-linux'))
+        change('reserve', request('measure-mac', 'mac-studio'))
+        assert not (locks / 'mac-studio.lock').exists()
+        lane.close()
+        change('conclude', dict(request_id='lane-check', verdict='not-launched', log='/logs/check',
+                                evidence='fixture never dispatched'))
+        # Released, the same measurement is admitted, and the helper leaves the lock free behind it.
+        change('reserve', request('lane-reserve', 'rog-nv-linux'))
+        assert records()['lane-reserve']['state'] == 'reserved'
+        assert lane_free('rog')
+        # Dispatch rechecks, and so does the dispatch step of `run` on a reserved record.
+        lane = hold_lane()
+        err = change('dispatch', dict(request_id='lane-reserve', evidence='fixture dispatch'), expected=1)
+        assert want in err, err
+        err = change('run', request('lane-reserve', 'rog-nv-linux'), expected=1)
+        assert want in err, err
+        assert records()['lane-reserve']['state'] == 'reserved'
+        lane.close()
+        change('dispatch', dict(request_id='lane-reserve', evidence='fixture dispatch'))
+        assert records()['lane-reserve']['state'] == 'launching'
+    print('PASS: a measurement refuses a box whose lab lane lock is held, at reserve, run and dispatch')
+
+
+lane_lock_interlock()
+
+
 # Exercise real fsync calls and their publication order, including first directory creation.
 import runpy
 import stat
@@ -463,3 +563,32 @@ with tempfile.TemporaryDirectory(prefix='fleet-durable-') as temporary:
         runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
     assert events == ['directory', 'directory'], events
     print('PASS: parent and record directory synced around atomic publication')
+
+# ludics-lite#445, continued: a measurement holds its box's lane lock across the record's
+# publication, so a lane taking it EXCLUSIVE at the moment of the atomic replace is refused.
+with tempfile.TemporaryDirectory(prefix='fleet-lane-held-') as temporary:
+    locks = Path(temporary) / 'locks'
+    payload = dict(request_id='held', wave='wave', worker='held', transport='subagent',
+                   issue='repo#445', purpose='fixture', agent_host='mac', execution_host='rog-nv-linux',
+                   repository='owner/repo', requested_revision='origin/main', kind='measurement')
+    seen = []
+    real_replace = os.replace
+
+    def replace(source, target):
+        with open(locks / 'rog.lock', 'a') as lane:
+            try:
+                fcntl.flock(lane, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                seen.append('free')
+            except BlockingIOError:
+                seen.append('held')
+        return real_replace(source, target)
+
+    with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload),
+                            'rog-nv-linux', '', 'rog rog-nv-linux rog-nv-wsl']), \
+            patch.dict(os.environ, {'WAKE_LAB_LOCK_DIR': str(locks)}), \
+            patch('os.replace', side_effect=replace), redirect_stdout(io.StringIO()):
+        helper = runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
+    for descriptor in helper['LANE_LOCKS']:
+        os.close(descriptor)
+    assert seen == ['held'], seen
+    print('PASS: the measurement holds the lane lock while its record is published')

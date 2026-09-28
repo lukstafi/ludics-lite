@@ -729,4 +729,6 @@ execution - `execution run <reserve.json>` then `execution conclude --from-run <
 batches, taken at launch and concluded at hand-back, with `execution slot` around each batch
 bounding the box's load. `load` is an observation, not ownership, and neither it nor these
 cooperative reservations stops unrelated processes from using a machine; OCANNL's daily sweep
-defers to an outstanding `measurement` reservation, and to nothing else (executions.md).
+defers to an outstanding `measurement` reservation, and to nothing else, while a `measurement`
+refuses a box a sweep lane holds and `wake-lab.sh`'s destroyers refuse a measured box
+(executions.md).

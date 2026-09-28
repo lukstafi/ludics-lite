@@ -56,9 +56,30 @@ printf 'python3 %s\n' "$*" >>"$SSH_LOG"
 exit 0
 PYTHON
 chmod +x "$tmp/bin"/*
-# WAKE_LAB_FLEET_WORKER: status reads the execution registry, and this suite must not read the real one.
+# A stub registry reader, printing FW_LISTING (by default an empty registry) with status FW_RC.
+# FW_HANG=leader wedges the reader itself; FW_HANG=orphan leaves a descendant holding its stdout
+# after it exits, the shape of an ssh stuck inside the real reader's pipeline. Either way the
+# descendant's pid goes to FW_PIDFILE so the case can see that status reaped it. FW_LOCKCHECK=<box>
+# logs whether that box's lane lock was held at the moment the registry was read (#445).
+cat >"$tmp/fleet-worker.sh" <<'FW'
+#!/usr/bin/env bash
+[ "$*" = "execution list --active --compact" ] || exit 9
+if [ -n "${FW_LOCKCHECK:-}" ]; then
+  if perl -e 'use Fcntl ":flock"; open(my $f, ">>", $ARGV[0]) or exit 0; exit(flock($f, LOCK_EX | LOCK_NB) ? 1 : 0)' \
+       "$WAKE_LAB_LOCK_DIR/$FW_LOCKCHECK.lock"; then st=held; else st=free; fi
+  printf 'registry read with lane=%s\n' "$st" >>"$SSH_LOG"
+fi
+case "${FW_HANG:-}" in
+  leader) sleep 60 & echo $! >"$FW_PIDFILE"; wait ;;
+  orphan) sleep 60 & echo $! >"$FW_PIDFILE" ;;
+esac
+printf '%s' "${FW_LISTING-[]}"; exit "${FW_RC:-0}"
+FW
+chmod +x "$tmp/fleet-worker.sh"
+# WAKE_LAB_FLEET_WORKER: status and every destroyer read the execution registry (#445), and this
+# suite must not read the real one; the stub's default is an empty registry.
 export PATH="$tmp/bin:$PATH" SSH_LOG="$tmp/ssh.log" WAKE_LAB_HOSTS="$tmp/hosts.sh" WAKE_LAB_LOCK_DIR="$tmp/locks" \
-  WAKE_LAB_FLEET_WORKER="$tmp/absent-fleet-worker.sh"
+  WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh"
 mkdir -p "$WAKE_LAB_LOCK_DIR"
 fail=0
 check() { if eval "$2"; then echo "PASS: $1"; else echo "FAIL: $1"; fail=$((fail+1)); fi; }
@@ -100,20 +121,7 @@ rm -f "$sl/tuf.lock" "$sl/tuf.hold.lock"
 out=$(WAKE_LAB_LOCK_DIR="$sl" SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
 check 'with no lock files both locks read free, with no detail line' '[ "$rc" = 0 ] && [[ "$out" == *"lane-lock=free  hold-lock=free"* ]] && [[ "$out" != *" lock: "* ]]'
 check '...and status created no lock file' '[ -z "$(ls -A "$sl")" ]'
-# The reservations column, from a stub registry reader; `?` whenever the registry was not read.
-# FW_HANG=leader wedges the reader itself; FW_HANG=orphan leaves a descendant holding its stdout
-# after it exits, the shape of an ssh stuck inside the real reader's pipeline. Either way the
-# descendant's pid goes to FW_PIDFILE so the case can see that status reaped it.
-cat >"$tmp/fleet-worker.sh" <<'FW'
-#!/usr/bin/env bash
-[ "$*" = "execution list --active --compact" ] || exit 9
-case "${FW_HANG:-}" in
-  leader) sleep 60 & echo $! >"$FW_PIDFILE"; wait ;;
-  orphan) sleep 60 & echo $! >"$FW_PIDFILE" ;;
-esac
-printf '%s' "${FW_LISTING-}"; exit "${FW_RC:-0}"
-FW
-chmod +x "$tmp/fleet-worker.sh"
+# The reservations column, from the stub registry reader above; `?` whenever the registry was not read.
 listing='[{"request_id":"w-359-tuf-1","request":{"execution_host":"tuf-amd-linux"},"state":"launching"},
 {"request_id":"w-359-mac","request":{"execution_host":"mac-studio"},"state":"running"},
 {"request_id":"w-360-tuf-2","request":{"execution_host":"tuf-amd-linux"},"state":"dispatched"}]'
@@ -125,7 +133,7 @@ out=$(WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING='[]' FW_RC=4 SSH_U
 check 'an unreachable registry is unknown, not zero' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=?"* ]]'
 out=$(WAKE_LAB_FLEET_WORKER="$tmp/fleet-worker.sh" FW_LISTING='EXECUTION REFUSED' SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
 check 'a registry listing that is not a JSON list is unknown, not zero' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=?"* ]]'
-out=$(SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
+out=$(WAKE_LAB_FLEET_WORKER="$tmp/absent-fleet-worker.sh" SSH_UP=1 "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
 check 'a missing registry reader is unknown, not zero' '[ "$rc" = 0 ] && [[ "$out" == *"reservations=?"* ]]'
 # A wedged leader is cut short, so its registry is unread (`?`); a leader that finished gave its
 # answer ('[]', so 0) and only its straggler is reaped.
@@ -207,6 +215,43 @@ out=$(SSH_NO_MARKER=1 SSH_UP=1 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" s
 check 'SSH disconnect before the command marker is a failure' '[ "$rc" = 1 ] && [[ "$out" == *"before the remote power command started"* ]] && [[ "$out" != *"confirming..."* ]]'
 out=$(WAKE_LAB_HOSTS="$tmp/rog-hosts.sh" SSH_NO_MARKER=1 SSH_UP=rog-nv-win WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" sleep rog 2>&1); rc=$?
 check 'a Linux-configured box booted into Windows cannot report successful sleep' '[ "$rc" = 1 ] && [[ "$out" == *"before the remote power command started"* ]]'
+# ludics-lite#445: a destroyer refuses a box an outstanding exclusive measurement names, on any
+# endpoint of its row, and reads the registry only once it holds the box's lab locks. The caller's
+# own measurement (--as) and --force pass; a correctness reservation is not read; an unreadable
+# registry refuses. A refused box's locks are let go again, and nothing is sent to it.
+measured='[{"request_id":"m-445","request":{"execution_host":"tuf-amd-linux","kind":"measurement"},"state":"running"}]'
+: >"$SSH_LOG"
+out=$(FW_LISTING="$measured" FW_LOCKCHECK=tuf SSH_UP=1 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" sleep tuf 2>&1); rc=$?
+check 'sleep refuses a box an exclusive measurement names, naming the reservation' '[ "$rc" = 1 ] && [[ "$out" == *"measurement: m-445 (running)"* ]] && [[ "$out" == *"sleep REFUSED on tuf: an exclusive measurement reservation names it"* ]] && [[ "$out" == *"sleep REFUSED on: tuf (an exclusive measurement holds the box"*"--as=<request_id>"* ]] && [[ "$out" != *"confirming..."* ]]'
+check '...sends nothing to it, and let its lab locks go again' '! grep -q systemctl "$SSH_LOG" && lock_free "$WAKE_LAB_LOCK_DIR/tuf.lock" && lock_free "$WAKE_LAB_LOCK_DIR/tuf.hold.lock"'
+check '...having read the registry while it held the box'"'"'s lane lock' 'grep -qx "registry read with lane=held" "$SSH_LOG"'
+for verb in hibernate down; do
+  : >"$SSH_LOG"
+  out=$(FW_LISTING="$measured" SSH_UP=1 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" "$verb" tuf 2>&1); rc=$?
+  check "$verb refuses a measured box too" '[ "$rc" = 1 ] && [[ "$out" == *"$verb REFUSED on tuf: an exclusive measurement reservation names it"* ]] && ! grep -q systemctl "$SSH_LOG"'
+done
+: >"$SSH_LOG"
+out=$(FW_LISTING='[{"request_id":"m-445-win","request":{"execution_host":"tuf-amd-win","kind":"measurement"},"state":"reserved"}]' \
+  SSH_UP=1 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" sleep tuf 2>&1); rc=$?
+check '...on any endpoint of the box'"'"'s row' '[ "$rc" = 1 ] && [[ "$out" == *"measurement: m-445-win (reserved)"* ]] && ! grep -q systemctl "$SSH_LOG"'
+: >"$SSH_LOG"
+out=$(FW_LISTING='[{"request_id":"c-445","request":{"execution_host":"tuf-amd-linux","kind":"correctness"},"state":"running"}]' \
+  SSH_UP=0 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" sleep tuf 2>&1); rc=$?
+check 'a correctness reservation does not refuse a destroyer' '[ "$rc" = 0 ] && grep -q -- "--check-inhibitors=yes suspend" "$SSH_LOG"'
+: >"$SSH_LOG"
+out=$(FW_LISTING="$measured" SSH_UP=0 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" sleep --as=m-445 tuf 2>&1); rc=$?
+check '--as=<its request_id> lets the measurement'"'"'s own owner put the box to sleep' '[ "$rc" = 0 ] && grep -q -- "--check-inhibitors=yes suspend" "$SSH_LOG"'
+: >"$SSH_LOG"
+out=$(FW_LISTING="$measured" SSH_UP=0 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" sleep --as=m-other tuf 2>&1); rc=$?
+check '...and --as naming another reservation spares nothing' '[ "$rc" = 1 ] && [[ "$out" == *"measurement: m-445 (running)"* ]] && ! grep -q systemctl "$SSH_LOG"'
+for fw in "FW_RC=4" "WAKE_LAB_FLEET_WORKER=$tmp/absent-fleet-worker.sh" "FW_LISTING=EXECUTION REFUSED"; do
+  : >"$SSH_LOG"
+  out=$(env "$fw" SSH_UP=1 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" sleep tuf 2>&1); rc=$?
+  check "a registry that cannot be read refuses the destroyer (${fw##*/})" '[ "$rc" = 1 ] && [[ "$out" == *"sleep REFUSED on tuf: the fleet'"'"'s execution registry could not be read"* ]] && ! grep -q systemctl "$SSH_LOG"'
+done
+: >"$SSH_LOG"
+out=$(FW_LISTING="$measured" SSH_UP=0 WAKE_LAB_DOWN_WAIT_SECONDS=0 "$tmp/wake-lab.sh" sleep --force tuf 2>&1); rc=$?
+check '--force takes a measured box anyway' '[ "$rc" = 0 ] && grep -q -- "--check-inhibitors=yes suspend" "$SSH_LOG"'
 cp "$here/wake-lab-wsl.sh" "$tmp/wake-lab-wsl.sh"
 sed 's/echo linux/echo wsl/' "$tmp/hosts.sh" >"$tmp/tuf-wsl.sh"
 out=$(WAKE_LAB_HOSTS="$tmp/tuf-wsl.sh" SSH_UP=tuf-amd-win "$tmp/wake-lab.sh" status tuf 2>&1); rc=$?
