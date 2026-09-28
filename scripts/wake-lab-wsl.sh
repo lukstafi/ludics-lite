@@ -1380,7 +1380,7 @@ wsl_power_action() { # power_action <verb> <box>
 WSL_FAILED=""
 start_wsl() {
   local n i dir krc kphase kheld what=kick started=() unshut=() unstarted=() up=() down=() rc=0 line
-  local unheld_down=() unheld_up=() held=()
+  local unheld_down=() unheld_up=() held=() measured=()
   [ "$FRESH_WSL" = fresh ] && what=restart
   # One box at a time meant one wedged box could cost its neighbours their restart entirely: on
   # 2026-09-16 rog's start probe hung and minix, second in the loop, never got a restart at all —
@@ -1412,9 +1412,14 @@ start_wsl() {
     # restart. The HOLD step runs in this same subshell, for the same reason the kick does: a box
     # whose holder cannot be established must not cost its neighbour the settle — and because the
     # hold lock this subshell already holds is the one the holder must inherit.
+    # The registry is read in the same subshell, once the locks are held (measured_box_clear): a
+    # measured box is `measured`, a phase of its own, since its remedy is the measurement's end.
     { if [ "$FRESH_WSL" = fresh ] && [ "$FORCE" != 1 ] && ! lab_reserve "$n" "$what" "$LANE_FD"; then
         echo "  wsl $what REFUSED on $n: $RESERVE_REFUSED_BY" >"$dir/$i.out" 2>&1
         printf '1 locked na\n' >"$dir/$i.rc"
+      elif [ "$FRESH_WSL" = fresh ] && [ "$FORCE" != 1 ] &&
+           ! { reservations_read; measured_box_clear "wsl $what" "$n"; } >"$dir/$i.out" 2>&1; then
+        printf '1 measured na\n' >"$dir/$i.rc"
       else
         [ "$FRESH_WSL" = fresh ] && [ "$FORCE" != 1 ] && HOLD_LOCKED=1
         kick_wsl "$n" "$FRESH_WSL" >"$dir/$i.out" 2>&1
@@ -1452,6 +1457,7 @@ start_wsl() {
         *)        started+=("$n") ;;
       esac
     elif [ "$kphase" = locked ]; then held+=("$n")
+    elif [ "$kphase" = measured ]; then measured+=("$n")
     elif [ "$kphase" = shutdown ]; then unshut+=("$n")
     else unstarted+=("$n"); fi
   done
@@ -1488,6 +1494,10 @@ start_wsl() {
   # destroying the lane's units or unholding the VM under them.
   if [ ${#held[@]} -gt 0 ]; then
     line="wsl $what REFUSED on: ${held[*]} (a lab lock is held; wait for the holder, or --force to take the box anyway)"
+    echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
+  fi
+  if [ ${#measured[@]} -gt 0 ]; then
+    line="wsl $what REFUSED on: ${measured[*]} ($MEASURED_HINT)"
     echo "$line"; WSL_FAILED="${WSL_FAILED:+$WSL_FAILED; }$line"; rc=1
   fi
   # Two shapes, and they are different findings: a VM that is gone costs the lane its coverage,

@@ -40,9 +40,22 @@ trap 'declare -F kill_stub_holders >/dev/null 2>&1 && kill_stub_holders; rm -rf 
 # `env`.
 LOCKS="$TMP/locks"; mkdir -p "$LOCKS"
 WAKE_LAB_LOCK_DIR="$LOCKS"; export WAKE_LAB_LOCK_DIR
-# ...and the execution registry `status` counts reservations from (ludics-lite#359): a reader that
-# is not there, so no status case reads the real registry or asks the anchor box over ssh.
-WAKE_LAB_FLEET_WORKER="$TMP/absent-fleet-worker.sh"; export WAKE_LAB_FLEET_WORKER
+# ...and the execution registry `status` counts reservations from (ludics-lite#359) and every
+# destroyer reads before it acts (#445): a stub reader, so no case reads the real registry or asks
+# the anchor box over ssh. It prints FW_LISTING, by default an empty registry, with status FW_RC;
+# FW_LOCKCHECK=<box> logs to FW_LOG whether that box's lane lock was held when it was read.
+cat >"$TMP/fleet-worker.sh" <<'FW'
+#!/usr/bin/env bash
+[ "$*" = "execution list --active --compact" ] || exit 9
+if [ -n "${FW_LOCKCHECK:-}" ]; then
+  if perl -e 'use Fcntl ":flock"; open(my $f, ">>", $ARGV[0]) or exit 0; exit(flock($f, LOCK_EX | LOCK_NB) ? 1 : 0)' \
+       "$WAKE_LAB_LOCK_DIR/$FW_LOCKCHECK.lock"; then st=held; else st=free; fi
+  printf 'registry read with lane=%s\n' "$st" >>"$FW_LOG"
+fi
+printf '%s' "${FW_LISTING-[]}"; exit "${FW_RC:-0}"
+FW
+chmod +x "$TMP/fleet-worker.sh"
+WAKE_LAB_FLEET_WORKER="$TMP/fleet-worker.sh"; export WAKE_LAB_FLEET_WORKER
 
 # ...and the control that the export above is really doing it. The redirection is one variable
 # deep: a case that builds its own environment with `env -i`, or an explicit `env` list that drops
@@ -597,6 +610,62 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog
 [ "$rc" -ne 0 ] && grep -q '^wsl up on: rog$' <<<"$out" && grep -q 'wsl still down after 0 min on: minix$' <<<"${out##*$'\n'}" \
   && ok "one late guest is reported alone, and its neighbour as up (rc=$rc)" \
   || ko "the poll's aggregate failure was pinned on every started box (rc=$rc) -- $out"
+# ludics-lite#445: the restart is a destroyer, so it refuses a box an outstanding exclusive
+# measurement names (on any endpoint of its row), reading the registry only once it holds the box's
+# lab locks; `--as` spares the caller's own, `--force` skips the check, and an unreadable registry
+# refuses. The refusal is a phase of its own, and nothing reaches the measured box's Windows host.
+measured='[{"request_id":"m-445","request":{"execution_host":"rog-nv-wsl","kind":"measurement"},"state":"running"}]'
+FW_LOG="$TMP/fw.log"; export FW_LOG
+: > "$SSH_LOG"; : > "$FW_LOG"
+out=$(env FW_LISTING="$measured" FW_LOCKCHECK=rog WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+  SSH_UP="rog-lan minix-lan rog-nv-wsl minix-amd-wsl" "$WL" restart-wsl rog minix 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q 'measurement: m-445 (running)' <<<"$out" \
+  && grep -q 'wsl restart REFUSED on rog: an exclusive measurement reservation names it' <<<"$out" \
+  && grep -q '^wsl restart REFUSED on: rog (an exclusive measurement holds the box' <<<"$out" \
+  && grep -q '^wsl up on: minix$' <<<"$out" \
+  && ok "restart-wsl refuses the measured box and restarts its unmeasured neighbour (rc=$rc)" \
+  || ko "restart-wsl took a measured box, or its neighbour with it (rc=$rc) -- $out"
+grep -q '^rog-' "$SSH_LOG" && ko "a command reached the measured box: $(grep '^rog-' "$SSH_LOG")" \
+  || ok "...and nothing reaches the measured box"
+grep -q '^minix-lan :: wsl.exe --shutdown$' "$SSH_LOG" && ok "...while its neighbour's VM is restarted" \
+  || ko "the neighbour was not restarted: $(cat "$SSH_LOG")"
+grep -qx 'registry read with lane=held' "$FW_LOG" && ! grep -q 'lane=free' "$FW_LOG" \
+  && ok "...having read the registry while it held the box's lane lock" \
+  || ko "the registry was read with rog's lane lock free: $(cat "$FW_LOG")"
+for f in rog.lock rog.hold.lock; do
+  perl -e 'use Fcntl ":flock"; exit(flock(STDIN, LOCK_EX | LOCK_NB) ? 0 : 1)' <"$WAKE_LAB_LOCK_DIR/$f" \
+    && ok "...and the measured box's $f is free again" || ko "a refused restart kept rog's $f"
+done
+: > "$SSH_LOG"
+out=$(env FW_LISTING="$measured" WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WAIT_SECONDS=1 WAKE_LAB_WSL_WAIT_SECONDS=1 \
+  SSH_UP="rog-lan rog-nv-wsl" "$WL" --wait --restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q '^NOT all up: wsl restart REFUSED on: rog (an exclusive measurement' <<<"${out##*$'\n'}" \
+  && ! grep -q -- '--shutdown' "$SSH_LOG" \
+  && ok "--wait --restart-wsl refuses it as well, its last line saying so (rc=$rc)" \
+  || ko "--wait --restart-wsl over a measured box (rc=$rc) -- $out; $(cat "$SSH_LOG")"
+: > "$SSH_LOG"
+out=$(env FW_LISTING="$measured" WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+  SSH_UP="rog-lan rog-nv-wsl" "$WL" restart-wsl --as=m-445 rog 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q '^rog-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ok "--as=<its request_id> lets the measurement's owner restart its guest (rc=$rc)" \
+  || ko "--as did not spare the caller's own measurement (rc=$rc) -- $out"
+: > "$SSH_LOG"
+out=$(env FW_LISTING='[{"request_id":"c-445","request":{"execution_host":"rog-nv-linux","kind":"correctness"},"state":"running"}]' \
+  WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-wsl" "$WL" restart-wsl rog 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q '^rog-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ok "a correctness reservation does not refuse the restart (rc=$rc)" \
+  || ko "a correctness reservation refused the restart (rc=$rc) -- $out"
+: > "$SSH_LOG"
+out=$(env FW_RC=4 WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 SSH_UP="rog-lan rog-nv-wsl" "$WL" restart-wsl rog 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q "wsl restart REFUSED on rog: the fleet's execution registry could not be read" <<<"$out" \
+  && ! grep -q -- '--shutdown' "$SSH_LOG" \
+  && ok "an unreadable registry refuses the restart (rc=$rc)" \
+  || ko "the restart went ahead over an unreadable registry (rc=$rc) -- $out"
+: > "$SSH_LOG"
+out=$(env FW_LISTING="$measured" WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_WSL_WAIT_SECONDS=1 \
+  SSH_UP="rog-lan rog-nv-wsl" "$WL" restart-wsl --force rog 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -q '^rog-lan :: wsl.exe --shutdown$' "$SSH_LOG" \
+  && ok "--force restarts a measured box anyway (rc=$rc)" || ko "--force was refused (rc=$rc) -- $out"
 # The kick path holds the same line: a kick no Windows endpoint carried is a failed kick, whatever
 # the guest answers, so `wsl up` there is the kick's own success and not the poll's.
 out=$(kick "rog-nv-wsl" 2>&1); rc=$?
@@ -2296,6 +2365,31 @@ if lock_free rog && lock_free minix; then
 else
   ko "a box stayed reserved after the command was killed (rog free=$(lock_free rog && echo yes || echo no), minix free=$(lock_free minix && echo yes || echo no))"
 fi
+
+# ludics-lite#445: a power phase reads the registry once it holds every box, and a measured box
+# among them is let go at once -- both of its locks, while the phase goes on acting on the others.
+: > "$SSH_LOG"
+env FW_LISTING='[{"request_id":"m-445","request":{"execution_host":"rog-nv-win","kind":"measurement"},"state":"running"}]' \
+    WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_LOCK_DIR="$LOCKS" WAKE_LAB_DOWN_WAIT_SECONDS=60 \
+    SSH_UP="rog-lan rog-nv-win minix-lan minix-amd-win" \
+    "$WL" hibernate rog minix >"$TMP/phase.out" 2>&1 8>&- &
+phase_pid=$!
+phase_deadline=$((SECONDS + 20))
+while lock_free minix || ! grep -q 'hibernate REFUSED on rog' "$TMP/phase.out"; do
+  [ "$SECONDS" -ge "$phase_deadline" ] && break
+  sleep 1
+done
+if ! lock_free minix && lock_free rog; then
+  ok "a power phase lets a measured box go at once while it still acts on its neighbour"
+else
+  ko "measured rog or acting minix held wrongly mid-phase (rog free=$(lock_free rog && echo yes || echo no), minix free=$(lock_free minix && echo yes || echo no)) -- $(cat "$TMP/phase.out")"
+fi
+grep -q '^rog-' "$SSH_LOG" && ko "the phase sent a command to the measured box: $(grep '^rog-' "$SSH_LOG")" \
+  || ok "...and sends nothing to the measured box"
+kill "$phase_pid" 2>/dev/null
+wait "$phase_pid" 2>/dev/null
+kill_deadline=$((SECONDS + 20))
+while ! lock_free minix; do [ "$SECONDS" -ge "$kill_deadline" ] && break; sleep 1; done
 
 # Half a reservation is worse than none. A destroyer takes the lane lock first and the hold lock
 # second, and if the second is refused -- a `--hold` holder is on that box -- it must give the

@@ -2779,8 +2779,9 @@ EXECUTION_COMMAND
 }
 
 # endpoint_map: the lab's endpoint map as `wake-lab.sh endpoint-map` prints it, one `<box> <alias>...`
-# line per box, for the registry's one-entry-per-box roster check (ludics-lite#395; the grammar and
-# its boundary are fleet-execution.py's header). Read from THIS checkout's wake-lab.sh, found by the
+# line per box, for the registry's one-entry-per-box roster check (ludics-lite#395) and for the lab
+# box whose lane lock a measurement reads (ludics-lite#445; the grammar and both boundaries are
+# fleet-execution.py's header). Read from THIS checkout's wake-lab.sh, found by the
 # physical path (the skill is reached through a ~/.claude/skills symlink), so the map is never
 # restated here. No wake-lab.sh in the checkout degrades loudly: one EXECUTION WARNING on stderr and
 # an empty map, which keeps the roster check to exact entries up to case, as before. A wake-lab.sh
@@ -2789,7 +2790,7 @@ endpoint_map() {
   local wake out
   wake="$CHECKOUT/scripts/wake-lab.sh"
   if [ ! -f "$wake" ]; then
-    printf '%s\n' "EXECUTION WARNING: no endpoint map ($wake is missing): FLEET_BOXES is not checked for two aliases of one box" >&2
+    printf '%s\n' "EXECUTION WARNING: no endpoint map ($wake is missing): FLEET_BOXES is not checked for two aliases of one box, and a measurement is not checked against its box's lab lane lock" >&2
     return 0
   fi
   out=$(bash "$wake" endpoint-map) || {
