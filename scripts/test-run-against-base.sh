@@ -148,6 +148,10 @@ printf '#!/usr/bin/env bash\necho "WRONG FILE"\nexit 3\n' >"$R/scripts/test-nl.s
 chmod +x "$R/scripts/test-nl.sh"
 printf '#!/usr/bin/env run-against-base-no-such-interpreter\nexit 1\n' >"$R/scripts/test-envmiss.sh"
 chmod +x "$R/scripts/test-envmiss.sh"
+printf '#!/usr/bin/env -S run-against-base-no-such-interpreter --flag\nexit 1\n' >"$R/scripts/test-envS.sh"
+chmod +x "$R/scripts/test-envS.sh"
+printf '#!/usr/bin/env -S bash -e\necho "ARGS=[$*]"\necho "1 passed, 0 failed"\n' >"$R/scripts/test-envSok.sh"
+chmod +x "$R/scripts/test-envSok.sh"
 mkdir -p "$R/scripts/--"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/--/test-dash.sh"
 # An executable suite outside git, so only the symlink refusal can stop it running.
@@ -411,6 +415,22 @@ if [ "$rc" -eq 125 ] && grep -qF 'not on PATH' <<<"$out"; then
   ok "an env shebang naming a missing interpreter exits 125, not env's 127"
 else
   ko "env interpreter: rc=$rc -- $out"
+fi
+# The `-S` form, as common as the plain one: a missing program behind it is caught the same way,
+# and a present one runs with the suite's arguments intact.
+run_rab test-envS.sh
+if [ "$rc" -eq 125 ] && grep -qF 'not on PATH' <<<"$out"; then
+  ok "an env -S shebang naming a missing interpreter exits 125"
+else
+  ko "env -S missing: rc=$rc -- $out"
+fi
+if [ "$(uname)" = Darwin ] || env -S true 2>/dev/null; then
+  run_rab test-envSok.sh -- a
+  if [ "$rc" -eq 0 ] && grep -qF 'ARGS=[-- a]' <<<"$out"; then
+    ok "an env -S shebang with its program present runs, arguments intact"
+  else
+    ko "env -S present: rc=$rc -- $out"
+  fi
 fi
 # A suite whose interpreter is missing never ran: that is the helper's 125, not a base failure.
 run_rab test-noexec.sh

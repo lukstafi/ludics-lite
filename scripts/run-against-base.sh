@@ -88,15 +88,31 @@ case "$rel" in
 esac
 # An interpreter that is missing means the suite never runs, and its 126/127 must not read as a
 # base result. A missing first program is caught at the exec (execfail, below); what the exec
-# cannot see is `#!/usr/bin/env <prog>` whose <prog> is not on PATH, since env itself starts
-# fine -- so that one is looked up here. (`env -S`/option forms are left to the exec.)
+# cannot see is an env shebang whose program is not on PATH, since env itself starts fine -- so
+# env's arguments are walked the way env reads them (options, `-u NAME`, `-S`'s split string,
+# NAME=value assignments) to the first program word, and that is looked up here.
 interp=$runner
 if [ -z "$interp" ]; then
   IFS= read -r shebang <"$suite_abs" || true
   case "$shebang" in
   '#!'*)
-    read -r sb_prog sb_arg _ <<<"${shebang#\#!}"
-    case "${sb_prog##*/}:${sb_arg-}" in env:[!-]*) interp=$sb_arg ;; esac
+    # An array, not the positional parameters: those are the suite's arguments.
+    set -f
+    read -r -a sb <<<"${shebang#??}"
+    set +f
+    if [ "${#sb[@]}" -gt 0 ] && [ "${sb[0]##*/}" = env ]; then
+      i=1
+      while [ "$i" -lt "${#sb[@]}" ]; do
+        w=${sb[$i]}
+        case "$w" in
+        -u | --unset) i=$((i + 1)) ;;
+        -S?*) w=${w#-S}; interp=$w; break ;;
+        -* | *=*) ;;
+        *) interp=$w; break ;;
+        esac
+        i=$((i + 1))
+      done
+    fi
     ;;
   esac
 fi
