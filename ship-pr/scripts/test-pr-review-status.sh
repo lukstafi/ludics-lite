@@ -1472,7 +1472,7 @@ test_a_broken_jq_program_is_unknown_on_the_completed_row_read() {
   completed_fixture
   run_status
   assert_eq "$(state_tok "$STATE")" approved "control: this fixture reaches the Completed-row read"
-  assert_unknown_when_broken 'capture($done)' \
+  assert_unknown_when_broken 'max_by(.at) | [.row' \
     "the summary comments feed did not parse" "the Completed-row read"
 }
 

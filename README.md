@@ -791,7 +791,13 @@ paging at the cap, a row that did not parse and a GraphQL outage are each `unkno
 never a clean approval. A 👍 from before the head arrived is not an approval of it (ludics-lite#418):
 one the reviewer's summary row gives another commit, or, with no row read, one older than the head
 commit's date, reads `expected` (or a live 👀's `reviewing`) with no feed read twice, and `watch`
-does not end on it. `test-pr-review-watch.sh` runs PR #277's two-head shape through a watch
+does not end on it. A clean round the app left without a 👍 is one (ludics-lite#439): the summary's
+Code Review row Completed on the head, newer than the 👀, with nothing posted since the 👀, reads
+`approved` where ocannl-staging#828 read `stalled` — and its controls read as before: the row
+naming an older head, a findings review inside the round (before the row flips, as the app posts
+them, or after), a row older than the 👀 or no 👀 at all, a spent 👀 under a pending request, and
+a status cell or table outside the allowlisted shape; the comments are read before the reviews,
+and an open thread under it is `unresolved`. `test-pr-review-watch.sh` runs PR #277's two-head shape through a watch
 (findings on the previous head scrolled past as NOT about head, the 👍 on the head above it), and
 `test-pr-review-merge.sh` pins `merge` refusing on an open thread (exit 1, no flag bypassing it)
 and on an unread connection (exit 3), with one read per merge attempt, so a thread opened
