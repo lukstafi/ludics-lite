@@ -1341,6 +1341,12 @@ REVIEWED_COMMIT_RE='Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})'
 # status (Running, a failure or cancellation word, a new emoji, a reworded or re-marked Completed)
 # is not a verdict, and what it leaves is the reading status gave before this row was read.
 SUMMARY_COMPLETED_ROW_RE='^\|[^|]*Code Review[^|]*\| *✅ \*\*Completed\*\* <relative-time datetime="(?<at>[^"]+)">[^<|]*</relative-time> *\| *`(?<sha>[0-9a-f]{7,40})` *\|'
+# The stamp of any summary-table row, whatever its status: the relative-time's datetime and the
+# commit cell after it. status_state reads it three times — the Running rows, the newest summary's
+# Code Review rows for the 👍 path's fourth field, and the same rows again to find the one
+# SUMMARY_COMPLETED_ROW_RE is tried on — and the three must date a row identically, or the newest
+# row one reader finds is not the one another does.
+SUMMARY_ROW_STAMP_RE='datetime="(?<at>[^"]+)"[^|]*\| *`(?<sha>[0-9a-f]{7,40})` *\|'
 
 # ISO 8601 UTC timestamps sort correctly as plain strings, which is why every comparison below is a
 # string comparison: no date(1) is involved, whose parsing flags differ between BSD and GNU.
@@ -1563,13 +1569,14 @@ status_state() {
     }
     state_head_read "$pr"
     head_loaded=true
-    evidence=$(jq -rs --arg rev "$REVIEWER" --arg head "$head_sha" --arg rc "$REVIEWED_COMMIT_RE" '
+    evidence=$(jq -rs --arg rev "$REVIEWER" --arg head "$head_sha" --arg rc "$REVIEWED_COMMIT_RE" \
+      --arg stamp "$SUMMARY_ROW_STAMP_RE" '
       .[0] as $comments | .[1] as $reviews |
       def reviewer: select((.user.login // "") | startswith($rev));
       def current: select(.sha != "" and $head != "")
         | select(.sha as $sha | $head | startswith($sha));
       # One entry per Running row the table test admits, each re-matched by the stamp pattern
-      # beside it: `[capture(...)] | first` yields null where they disagree instead of yielding
+      # (SUMMARY_ROW_STAMP_RE): `[capture(...)] | first` yields null where they disagree instead of yielding
       # NOTHING, which unbracketed here would delete not just that row but every later row of
       # the same stream. The two patterns have to keep agreeing on every Running row, and the
       # count of nulls is the third field below — how the caller hears that they stopped
@@ -1578,7 +1585,7 @@ status_state() {
          | select((.body // "") | contains("codex-pull-request-review-summary"))
          | (.body // "") | split("\n")[]
          | select(test("^\\|[^|]*Code Review[^|]*\\|[^|]*Running"))
-         | ([capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")] | first)]
+         | ([capture($stamp)] | first)]
         as $running |
       # The Code Review rows of the NEWEST summary comment (the app edits one in place, so that
       # is its latest activity), whatever their status: the newest row names the commit the
@@ -1592,7 +1599,7 @@ status_state() {
        | if . == null then []
          else [(.body // "") | split("\n")[]
                | select(test("^\\|[^|]*Code Review[^|]*\\|"))
-               | [capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")] | first]
+               | [capture($stamp)] | first]
          end) as $rows |
       (if ($rows | length) == 0 or any($rows[]; . == null) then ""
        else $rows | max_by(.at) | .sha end) as $row_sha |
@@ -1796,7 +1803,8 @@ status_state() {
   # nothing else (the Running rows' disagreement is `unknown` instead, because there it would
   # otherwise leave a 👍 standing; here the fallback approves nothing). Whether it is a verdict for
   # the head, and for this round, is decided below, once the head is known.
-  done_line=$(jq -r --arg rev "$REVIEWER" --arg done "$SUMMARY_COMPLETED_ROW_RE" '
+  done_line=$(jq -r --arg rev "$REVIEWER" --arg done "$SUMMARY_COMPLETED_ROW_RE" \
+      --arg stamp "$SUMMARY_ROW_STAMP_RE" '
       [.[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | contains("codex-pull-request-review-summary"))]
       | max_by(.updated_at // .created_at)
@@ -1804,7 +1812,7 @@ status_state() {
         else [(.body // "") | split("\n")[]
               | select(test("^\\|[^|]*Code Review[^|]*\\|"))
               | . as $row
-              | [capture("datetime=\"(?<at>[^\"]+)\"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|")] | first
+              | [capture($stamp)] | first
               | if . == null then null else {at, row: $row} end]
           | if length == 0 or any(.[]; . == null) then "|"
             else max_by(.at) | [.row | capture($done)] | first
