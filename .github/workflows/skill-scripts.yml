@@ -326,6 +326,17 @@ jobs:
       - name: Exercise the hygiene checks against defective scratch trees
         run: scripts/test-check-prompts.sh
 
+  run-against-base:
+    name: base negative-control helper (ubuntu)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise run-against-base.sh against a scratch repo
+        run: scripts/test-run-against-base.sh
+
   fleet-worker:
     name: fleet launcher (ubuntu)
     needs: changes
@@ -520,6 +531,9 @@ jobs:
         # these macs far more often than in CI.
         if: ${{ !cancelled() }}
         run: scripts/test-preflight.sh || { echo '::error title=macOS suite failed::test-preflight.sh'; exit 1; }
+      - name: base negative-control helper
+        if: ${{ !cancelled() }}
+        run: scripts/test-run-against-base.sh || { echo '::error title=macOS suite failed::test-run-against-base.sh'; exit 1; }
       - name: execution reservations
         if: ${{ !cancelled() }}
         run: python3 issue-wave/scripts/test-fleet-execution.py || { echo '::error title=macOS suite failed::test-fleet-execution.py'; exit 1; }

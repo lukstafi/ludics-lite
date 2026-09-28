@@ -328,6 +328,15 @@ always runs the whole suite; the full run before a push still stands. Every case
 given must already be a defined function, or the run is refused before any case: PR #415 defined a
 case inside another case's body, which a full run reached but a subset could never select.
 
+To show that new fixtures FAIL on the base code — the negative control every issue-wave brief
+asks for — run `scripts/run-against-base.sh <suite-path> [--base <ref>] [suite args...]`. It makes a
+detached worktree of `origin/main` (or `<ref>`) under `$TMPDIR`, copies the working tree's version
+of that one suite over the base's, runs it from the base worktree, and reports its exit status and
+pass/fail line (its own refusals exit 125, never the suite's status); the worktree is removed and
+pruned on every exit path, INT and TERM included. It is a suite run, so wrap it in
+`~/.claude/skills/issue-wave/scripts/fleet-worker.sh execution slot -- …` like any other.
+`scripts/test-run-against-base.sh` pins it against a scratch repo.
+
 The scripts carry their own test suites (Python fixtures use `python3`; PowerShell fixtures run on Windows):
 
 ```sh
@@ -364,6 +373,7 @@ scripts/test-check-scratch-dirs.sh
 scripts/test-check-parse-guards.sh
 scripts/test-preflight.sh
 scripts/test-sync-routines.sh
+scripts/test-run-against-base.sh
 ```
 
 Four conventions travel with that list. Each is held by a scanner that reads line shapes — a
