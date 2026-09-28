@@ -24,8 +24,8 @@
 #   - a path inside .git is refused, and a suite that cannot be started (a missing interpreter,
 #     directly or behind `#!/usr/bin/env`) exits 125 rather than its exec error's 126/127;
 #   - an unreadable directory the suite leaves behind does not leak the scratch;
-#   - git's repository-local variables exported by the caller (GIT_DIR, GIT_WORK_TREE) do not
-#     reach the suite;
+#   - git's repository-local variables exported by the caller (GIT_DIR, GIT_WORK_TREE,
+#     GIT_INDEX_FILE) reach neither the suite nor the helper's own git commands;
 #   - a second signal during the cleanup does not cut the teardown short;
 #   - RUN_AGAINST_BASE_GRACE is validated up front, and a suite's own 125 exits 1.
 #
@@ -409,6 +409,19 @@ if [ "$rc" -eq 1 ] && case "$top" in "$HTMP"/*) true ;; *) false ;; esac; then
   ok "GIT_DIR/GIT_WORK_TREE from the caller do not reach the suite"
 else
   ko "git env: rc=$rc TOPLEVEL=$top -- $out"
+fi
+# ...and an exported GIT_INDEX_FILE (staged-file tooling) is not the helper's to write: the base
+# worktree's checkout must not overwrite it.
+g -C "$R" add scripts/test-new.sh
+cp "$R/.git/index" "$TMP/alt-index"
+before=$(cksum <"$TMP/alt-index")
+g -C "$R" reset -q scripts/test-new.sh
+out=$(cd "$R/scripts" && GIT_INDEX_FILE="$TMP/alt-index" TMPDIR="$HTMP" "$RAB" test-toy.sh 2>&1)
+rc=$?
+if [ "$rc" -eq 1 ] && [ "$(cksum <"$TMP/alt-index")" = "$before" ]; then
+  ok "an exported GIT_INDEX_FILE is left as it was"
+else
+  ko "GIT_INDEX_FILE: rc=$rc, index $( [ "$(cksum <"$TMP/alt-index")" = "$before" ] && echo same || echo REWRITTEN) -- $out"
 fi
 worktrees_clean "after a caller with git's local variables"
 # A parent that is a submodule in the base: its content is not checked out there, so the run is
