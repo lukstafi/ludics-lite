@@ -158,7 +158,9 @@
 #   pr-review.sh watch <pr> [watermark]    # poll on a timer until a round lands ON THE HEAD being
 #                                          # watched; 0 = act, 1 = quiet. Reviewer activity about
 #                                          # another commit is printed on stderr for the record and
-#                                          # the wait continues; every exit names what it ends on
+#                                          # the wait continues; every exit names what it ends on,
+#                                          # and one on reviewer activity carries a `watch-rounds:`
+#                                          # line above the watermark (see count_token)
 #   pr-review.sh status <pr>               # merge gate + who owes what: approved / unresolved
 #                                          # (approved over open review threads) / reviewing /
 #                                          # stalled / failed / expected / idle / unknown — and
@@ -168,9 +170,11 @@
 #                                          # and a push gets no run at all, until the base is in)
 #   pr-review.sh rounds <pr>               # how many review rounds carried findings, read off the
 #                                          # PR (heads the reviewer left comments on), against
-#                                          # SHIP_PR_ROUND_THRESHOLD; exit 1 past it
+#                                          # SHIP_PR_ROUND_THRESHOLD; exit 1 past it; ends with a
+#                                          # `rounds: n=… threshold=…` trailer (see count_token)
 #   pr-review.sh checks <pr> [--wait]      # the BUILD signal on the head commit: green / red /
-#                                          # no verdict yet / absent
+#                                          # no verdict yet / absent; ends with a
+#                                          # `checks: verdict=…` trailer (see count_token)
 #   pr-review.sh merge <pr> [--override "<why this red is unrelated>"] [--wait]
 #                           [--allow-no-verdict] [--require-green]
 #                                          # checks, then merge; refuses on an open review thread

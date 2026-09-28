@@ -435,6 +435,11 @@ test_the_ending_line_names_the_round() (
     "the exit line carries the round as \`rounds\` counts it, against the threshold"
   assert_contains "$(rounds_line "$(review_rounds 7)")" "review rounds with findings: 3 of 12" \
     "the same count \`rounds\` reports"
+  # The same window as a machine-readable trailer on stdout (ludics-lite#423, part 1), just above
+  # the watermark, which stays the last line.
+  assert_eq "$(tail -n 2 <<<"$WATCH_OUT" | head -n 1)" "watch-rounds: from=2 to=3 threshold=12" \
+    "the trailer carries the window's counts and the threshold"
+  assert_contains "$(tail -n 1 <<<"$WATCH_OUT")" "watermark: " "and the watermark is still last"
   # Past the threshold the line says what that means, where the caller is about to act on it.
   ROUND_THRESHOLD=2
   run_watch 0,0,500
@@ -443,6 +448,7 @@ test_the_ending_line_names_the_round() (
   ROUND_THRESHOLD=off
   run_watch 0,0,500
   assert_contains "$WATCH_ERR" "— this window opened round 3 (no threshold set)" "and with none set, the count alone"
+  assert_contains "$WATCH_OUT" "watch-rounds: from=2 to=3 threshold=off" "the trailer says off"
   # A span that crosses the threshold says where blocking-only starts, not that all of it is past
   # (review of #434, round 5): rounds 1–3 against a threshold of 2 keep rounds 1–2 in full.
   ROUND_THRESHOLD=2
@@ -466,10 +472,12 @@ test_the_ending_line_claims_only_the_rounds_the_window_opened() (
   run_watch 0,0,0
   assert_contains "$WATCH_ERR" "— this window opened rounds 1–3 of 12" \
     "a backlog names the span, not the last round against the first item"
+  assert_contains "$WATCH_OUT" "watch-rounds: from=0 to=3 threshold=12" "and the trailer the same span"
   run_watch 0,0,600
   assert_contains "$WATCH_ERR" "ending the wait on review id=601" "the burst's tail still ends the wait"
   assert_contains "$WATCH_ERR" "— this window opened no round; rounds with findings: 3 of 12" \
     "the tail of round 3 is not round 4, nor round 3 claimed again as new"
+  assert_contains "$WATCH_OUT" "watch-rounds: from=3 to=3 threshold=12" "a window that opened none: from = to"
   # A tail past the threshold is still past it: its findings are blocking-only too (review of
   # #434, round 4).
   ROUND_THRESHOLD=2
@@ -502,6 +510,7 @@ test_the_round_span_is_the_whole_watch() (
   assert_contains "$WATCH_ERR" "ending the wait on review id=500" "and ends the wait"
   assert_contains "$WATCH_ERR" "— this window opened rounds 1–2 of 12" \
     "the span is counted from the watermark the watch started with"
+  assert_contains "$WATCH_OUT" "watch-rounds: from=0 to=2 threshold=12" "and so is the trailer's"
 )
 
 # The label reads no feed of its own inside a round (review of #434, round 2): both counts take the
