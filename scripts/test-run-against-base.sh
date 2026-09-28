@@ -20,6 +20,9 @@
 #     through, and nothing is created outside the worktree;
 #   - a `--` directory on the suite's path installs, and a working-tree suite that is a symlink
 #     is refused rather than followed;
+#   - a path inside .git is refused, and a suite that cannot be started (a missing interpreter)
+#     exits 125 rather than its exec error's 126/127;
+#   - an unreadable directory the suite leaves behind does not leak the scratch;
 #   - a second signal during the cleanup does not cut the teardown short;
 #   - RUN_AGAINST_BASE_GRACE is validated up front, and a suite's own 125 exits 1.
 #
@@ -119,6 +122,7 @@ case "${1-}" in
   ( trap 'sleep 1; echo done >"$2"; exit 0' TERM; : >"$2.ready"; sleep 60 & wait ) >/dev/null 2>&1 &
   for i in $(seq 1 300); do [ -e "$2.ready" ] && break; sleep 0.1; done ;;
 --rc125) exit 125 ;;
+--lockout) mkdir -p "$HERE/sealed/d" && : >"$HERE/sealed/d/f" && chmod 000 "$HERE/sealed/d" ;;
 --lock) git -C "$HERE" worktree lock "$(git -C "$HERE" rev-parse --show-toplevel)" ;;
 esac
 echo "$pass passed, $fail failed"
@@ -139,6 +143,10 @@ cp -p "$R/scripts/test-link.sh" "$R/scripts/--/test-dash.sh"
 # An executable suite outside git, so only the symlink refusal can stop it running.
 cp -p "$R/scripts/test-link.sh" "$TMP/outside-suite.sh"
 ln -s "$TMP/outside-suite.sh" "$R/scripts/test-symleaf.sh"
+printf '#!/nonexistent/interpreter\necho "1 passed, 1 failed"\nexit 1\n' >"$R/scripts/test-noexec.sh"
+chmod +x "$R/scripts/test-noexec.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$R/.git/hooks/test-meta"
+chmod +x "$R/.git/hooks/test-meta"
 mkdir -p "$R/scripts/lnk/deep"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/lnk/deep/test-deep.sh"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/test-dir"
@@ -358,6 +366,20 @@ if [ "$rc" -eq 125 ] && grep -qF 'is a symlink' <<<"$out"; then
 else
   ko "symlink leaf: rc=$rc -- $out"
 fi
+# A suite under .git is not a working-tree file.
+run_rab "$R/.git/hooks/test-meta"
+if [ "$rc" -eq 125 ] && grep -qF 'inside a .git directory' <<<"$out"; then
+  ok "a path inside .git is refused"
+else
+  ko ".git path: rc=$rc -- $out"
+fi
+# A suite whose interpreter is missing never ran: that is the helper's 125, not a base failure.
+run_rab test-noexec.sh
+if [ "$rc" -eq 125 ] && grep -qF 'it never ran' <<<"$out"; then
+  ok "a suite that cannot be started exits 125, not 126/127"
+else
+  ko "exec failure: rc=$rc -- $out"
+fi
 worktrees_clean "after path-shape cases"
 
 # The grace is validated before anything is allocated; a suite's own 125 is not the helper's.
@@ -378,6 +400,12 @@ else
   ko "suite 125: rc=$rc -- $out"
 fi
 worktrees_clean "after grace and 125 cases"
+
+# A suite that leaves an unreadable directory behind: the scratch still goes (as root the
+# permissions never bite, so this passes trivially there).
+run_rab test-toy.sh --lockout
+if [ "$rc" -eq 1 ]; then ok "an unreadable leftover: the suite's status is reported"; else ko "lockout: rc=$rc -- $out"; fi
+worktrees_clean "after an unreadable leftover"
 
 # A suite that locks its own worktree: a single --force refuses a locked one.
 run_rab test-toy.sh --lock

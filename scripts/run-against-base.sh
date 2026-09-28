@@ -22,9 +22,10 @@
 #   <suite-path>  a file in the current checkout's working tree (relative to the cwd, or absolute)
 #   --base <ref>  the base to run against (default origin/main); it must come right after the
 #                 suite path, and every argument after it goes to the suite
-# Exit: the suite's own exit status; 125 when the helper could not run it at all, or could not
-# unregister the worktree afterwards (the `git bisect run` convention for "cannot test"), so a
-# refusal is never read as the suite's failure -- and a suite's own 125 is reported as 1.
+# Exit: the suite's own exit status; 125 when the helper could not run it at all, could not
+# start it (exec failed: it never ran), or could not clean up after it (the `git bisect run`
+# convention for "cannot test"), so a refusal is never read as the suite's failure -- and a
+# suite's own 125 is reported as 1.
 # Whatever the suite left running is stopped with it: its process group gets TERM, then KILL
 # after RUN_AGAINST_BASE_GRACE whole seconds (default 5).
 
@@ -67,6 +68,9 @@ case "$suite_abs" in
 "$TOP"/*) rel=${suite_abs#"$TOP"/} ;;
 *) die "$suite_arg is not inside this checkout ($TOP)" ;;
 esac
+# Git's own directory is not the working tree: installing a path through `.git` would replace the
+# base worktree's `.git` file and leave a checkout git no longer recognizes.
+case "/$rel/" in */.git/*) die "$rel is inside a .git directory, not the working tree" ;; esac
 case "$rel" in
 *.py) runner=python3 ;;
 *)
@@ -131,12 +135,20 @@ cleanup() {
     git -C "$TOP" worktree remove --force --force "$WT" >/dev/null 2>&1
   fi
   git -C "$TOP" worktree prune >/dev/null 2>&1
-  rm -rf "$SCRATCH"
+  # A suite can leave a directory it made unreadable; give the tree back its owner's permissions
+  # and try again rather than leak it.
+  rm -rf "$SCRATCH" 2>/dev/null || { chmod -R u+rwx "$SCRATCH" 2>/dev/null; rm -rf "$SCRATCH"; }
   git -C "$TOP" worktree prune >/dev/null 2>&1
+  local leaked=
   if git -C "$TOP" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $WT"; then
     printf '%s\n' "run-against-base: the worktree $WT is still registered; remove it by hand" >&2
-    exit 125
+    leaked=1
   fi
+  if [ -e "$SCRATCH" ]; then
+    printf '%s\n' "run-against-base: could not remove $SCRATCH; remove it by hand" >&2
+    leaked=1
+  fi
+  [ -z "$leaked" ] || exit 125
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -175,11 +187,24 @@ teepid=$!
 # stop_group signals whole; it also keeps INT at its default there rather than ignored, as a
 # non-interactive shell would start a background job.
 set -m
-(cd "$WT" && exec $runner "./$rel" "$@") >"$SCRATCH/fifo" 2>&1 </dev/null &
+# execfail: a suite that cannot be started at all (a missing interpreter, no python3) never ran,
+# so it must not read as the suite's 126/127 failure on the base; the marker tells the two apart.
+# A top-level `bash -c` and not a `( ... )` subshell, because bash 3.2 exits a subshell on a
+# failed exec whatever execfail says. Its $0 is the marker path; the exec keeps the pid, so the
+# suite is still the group leader.
+# shellcheck disable=SC2016 # expanded by the inner bash
+bash -c 'cd "$1" && shift && shopt -s execfail && exec "$@"
+  : >"$0"
+  exit 125' "$SCRATCH/execfail" "$WT" $runner "./$rel" "$@" >"$SCRATCH/fifo" 2>&1 </dev/null &
 child=$!
 set +m
 wait "$child"
 rc=$?
+if [ -e "$SCRATCH/execfail" ]; then
+  stop_group
+  child=
+  die "could not start $rel on $base (exec failed, see above); it never ran"
+fi
 # Anything the suite left running still holds the fifo open; stop it so tee sees EOF.
 stop_group
 child=
