@@ -420,7 +420,8 @@ by a sibling takes the same shape: the `[ "${BASH_SOURCE[0]}" = "$0" ] || return
 `test-pr-review-lib.sh` and `test-pr-review-base-lib.sh` ends the sourcing inside the group, before
 the foot is reached, so the caller survives with the definitions it came for. The long-running
 non-test scripts in `ALSO_GUARDED` (`fleet-worker.sh`, `bg-run.sh`, `wake-lab.sh`, `wait-for.sh`)
-take the shape too, because they run for hours from the checkout a deploy updates (ludics-lite#437).
+take the shape too, because they run for hours from the checkout a deploy updates (ludics-lite#437),
+and so does `run-against-base.sh`, which runs a suite for as long as the suite takes.
 What corrupts such a run is a writer that rewrites the file in place, through its inode (`cp` over
 it, a `>` redirection, `rsync --inplace`); a git fast-forward does not, since checkout replaces the
 file and a running shell keeps reading the old inode. `test-check-parse-guards.sh` rewrites each
