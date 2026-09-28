@@ -152,6 +152,12 @@ printf '#!/usr/bin/env -S run-against-base-no-such-interpreter --flag\nexit 1\n'
 chmod +x "$R/scripts/test-envS.sh"
 printf '#!/usr/bin/env -S bash -e\necho "ARGS=[$*]"\necho "1 passed, 0 failed"\n' >"$R/scripts/test-envSok.sh"
 chmod +x "$R/scripts/test-envSok.sh"
+mkdir -p "$TMP/interp-bin"
+printf '#!/bin/sh\nexec bash "$@"\n' >"$TMP/interp-bin/rab-private-interp"
+chmod +x "$TMP/interp-bin/rab-private-interp"
+printf '#!/usr/bin/env -S PATH=/definitely/no/such/path bash\nexit 0\n' >"$R/scripts/test-envPATHbad.sh"
+printf '#!/usr/bin/env -S PATH=%s:/usr/bin:/bin rab-private-interp\necho "1 passed, 0 failed"\n' "$TMP/interp-bin" >"$R/scripts/test-envPATHok.sh"
+chmod +x "$R/scripts/test-envPATHbad.sh" "$R/scripts/test-envPATHok.sh"
 mkdir -p "$R/scripts/--"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/--/test-dash.sh"
 # An executable suite outside git, so only the symlink refusal can stop it running.
@@ -430,6 +436,22 @@ if [ "$(uname)" = Darwin ] || env -S true 2>/dev/null; then
     ok "an env -S shebang with its program present runs, arguments intact"
   else
     ko "env -S present: rc=$rc -- $out"
+  fi
+fi
+# A PATH= in the shebang is the PATH env searches: bash is on ours and not on that one, and a
+# private interpreter is on that one and not on ours.
+if [ "$(uname)" = Darwin ] || env -S true 2>/dev/null; then
+  run_rab test-envPATHbad.sh
+  if [ "$rc" -eq 125 ] && grep -qF 'not on the PATH its shebang sets' <<<"$out"; then
+    ok "a program missing from the shebang's own PATH= exits 125"
+  else
+    ko "env PATH= bad: rc=$rc -- $out"
+  fi
+  run_rab test-envPATHok.sh
+  if [ "$rc" -eq 0 ]; then
+    ok "a program found only on the shebang's own PATH= runs"
+  else
+    ko "env PATH= ok: rc=$rc -- $out"
   fi
 fi
 # A suite whose interpreter is missing never ran: that is the helper's 125, not a base failure.

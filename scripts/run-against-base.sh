@@ -106,7 +106,9 @@ if [ -z "$interp" ]; then
         w=${sb[$i]}
         case "$w" in
         -u | --unset) i=$((i + 1)) ;;
+        -i | --ignore-environment | -) sb_clear=1 ;;
         -S?*) w=${w#-S}; interp=$w; break ;;
+        PATH=*) sb_path=${w#PATH=} ;;
         -* | *=*) ;;
         *) interp=$w; break ;;
         esac
@@ -116,8 +118,14 @@ if [ -z "$interp" ]; then
     ;;
   esac
 fi
-if [ -n "$interp" ] && ! command -v "$interp" >/dev/null 2>&1; then
-  die "$rel needs $interp, which is not on PATH here; it would never run"
+# The lookup uses the PATH env will use: the shebang's own PATH= when it sets one; with the
+# environment cleared (-i) and no PATH= the search path is env's built-in default, which is not
+# ours to guess, so that one is left to the exec.
+if [ -n "$interp" ] && [ -z "${sb_clear-}${sb_path+set}" ]; then
+  command -v "$interp" >/dev/null 2>&1 || die "$rel needs $interp, which is not on PATH here; it would never run"
+elif [ -n "$interp" ] && [ -n "${sb_path+set}" ]; then
+  PATH=$sb_path command -v "$interp" >/dev/null 2>&1 \
+    || die "$rel needs $interp, which is not on the PATH its shebang sets ($sb_path); it would never run"
 fi
 sha=$(git -C "$TOP" rev-parse --verify --quiet "$base^{commit}") || die "no such commit: $base"
 
