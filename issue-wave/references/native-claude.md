@@ -19,17 +19,17 @@ woken. What holds a turn is a foreground Bash call, capped at 600 s. So:
   on exit 124 until the run's own status comes back;
 - anything that can outlast the cap, ship-pr's `pr-review.sh watch` and `merge --wait` included
   (never run in the foreground: a live 👀 can stretch a watch to its 20-minute grace), runs under
-  [`scripts/bg-run.sh`](../scripts/bg-run.sh), in a fresh directory of its own per run, which
-  `new` allocates: give it one absolute parent for all your runs (under the scratchpad with the
-  issue prefix) and it creates and prints `<parent>/run-<N>`, a directory no run has used. Then
-  two calls, each spelling that printed `<dir>` out, since a Bash call's variables do not reach
-  the next one:
+  [`scripts/bg-run.sh`](../scripts/bg-run.sh) in two calls. `spawn` takes one absolute parent
+  for all your runs (under the scratchpad with the issue prefix), allocates a fresh
+  `<parent>/run-<N>` no run has used, starts the command there detached, and prints that `<dir>`;
+  a slot-held batch is `fleet-worker.sh execution slot --bg <parent>`, which does the same around
+  the slot (inside an enclosing slot too). Spell the printed `<dir>` out in the wait, since a Bash
+  call's variables do not reach the next one:
 
   ```bash
-  # foreground; prints <dir>
-  ~/.claude/skills/issue-wave/scripts/bg-run.sh new <parent>
-  # Bash run_in_background: true
-  ~/.claude/skills/issue-wave/scripts/bg-run.sh start <dir> -- <cmd> [arg...]
+  # foreground; each prints <dir> at once
+  ~/.claude/skills/issue-wave/scripts/bg-run.sh spawn <parent> -- <cmd> [arg...]
+  ~/.claude/skills/issue-wave/scripts/fleet-worker.sh execution slot --bg <parent> -- <batch>
   # foreground, re-issued until it prints rc=
   ~/.claude/skills/issue-wave/scripts/bg-run.sh wait <dir>
   ```
@@ -37,18 +37,17 @@ woken. What holds a turn is a foreground Bash call, capped at 600 s. So:
   `wait` ends before the cap by itself (`--within`, default 540 s) and prints one verdict; its
   exit code says the same. `rc=<n>` (exit 0): the command finished with status `<n>`, and its
   output is `<dir>/log`. The status is a file of its own, so a review body quoting `rc=` cannot
-  end the wait. `RUNNING` (3): re-issue it. `STARTING` (4): no pid within a minute of the wait,
-  which a task that has only just launched is, not dead: re-issue it once, and a second one means the launch itself
-  failed, so start again. `DIED` (5): the harness killed the task before the command returned
-  (observed at ~40 min for a backgrounded `merge --wait`), which says nothing about what the
-  command was reading: re-arm it, and for `merge --wait` first re-read the merge state as
-  ship-pr's *The approval is one gate* says. `REFUSED` (6): `start` found the directory holding a
-  run that had ended, whose status would otherwise have been read as this one's; a directory from
-  `new` reaches it only when handed to a second `start`. Every re-arm and restart takes a new
-  directory from `new`. `start` still accepts a directory you name yourself, which it creates,
-  and then a new name every time is yours to keep. The script's header is the full contract,
-  the run directory's layout included, and `test-bg-run.sh` beside it pins the races each verdict
-  closes (ludics-lite#357, #388).
+  end the wait. `RUNNING` (3): re-issue it. `STARTING` (4): no pid within a minute of the wait:
+  re-issue it once, and a second one means the launch itself failed, so spawn again. `DIED` (5):
+  the run was killed before the command returned, which says nothing about what the command was
+  reading: re-arm it, and for `merge --wait` first re-read the merge state as ship-pr's *The
+  approval is one gate* says. `REFUSED` (6): the directory held a run that had ended; a directory
+  `spawn` allocated never does. Every re-arm takes a new `spawn`. A spawned run is no background
+  task of the harness's, so a task-stop does not reach it: stop it with `kill` on the pid in
+  `<dir>/cpid`. The older form, `new` and then `start` as a Bash `run_in_background: true` task,
+  still works; the harness killed such a task at ~40 min into a `merge --wait`, which is `DIED`.
+  The script's header is the full contract, the run directory's layout included, and
+  `test-bg-run.sh` beside it pins the races each verdict closes (ludics-lite#357, #388).
 
 ## Worker channel
 

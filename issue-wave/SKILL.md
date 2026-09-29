@@ -386,7 +386,9 @@ requirements for every transport with transport-specific setup and identity, and
   execution slot -- <batch>` (`execution slot --cpu -- <batch>` for one that holds no GPU; a
   runner that takes the slot itself runs inside the wrapper, [nested
   slots](references/executions.md#exclusivity-and-the-run-time-slots)), and
-  is reported by run directory. Every other run - a
+  is reported by run directory; a batch that can outlast the 600 s tool cap is one call, `execution
+  slot --bg <parent> -- <batch>`, which prints a run directory to block on with `bg-run.sh wait`
+  ([Blocking on a run](references/native-claude.md#blocking-on-a-run)). Every other run - a
   measurement (only for a timing-grade claim or a run that needs the box to itself, a
   [rule](references/executions.md#exclusivity-and-the-run-time-slots) the brief carries), a
   cross-box leg, a full suite - needs a request first, in the transport's shape:

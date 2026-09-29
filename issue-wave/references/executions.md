@@ -74,7 +74,11 @@ cannot be read. Its lock files live under `FLEET_SLOT_STATE`
 (`~/.local/state/fleet-execution-slots/<box>`), which is box-wide on purpose: `ISSUE_WAVE_STATE`
 is each coordinator's own directory, and slots kept there would let two workers under different
 coordinators each take slot 1 on one machine. The command after `--` is exec'd, not
-interpreted, so a pipeline or a shell builtin goes as `sh -c '...'`.
+interpreted, so a pipeline or a shell builtin goes as `sh -c '...'`. A batch that can outlast
+the 600 s tool cap takes `--bg <parent>` (ludics-lite#181): the same slot-held batch, detached
+under `bg-run.sh spawn`, whose one foreground call prints the run directory at once; a Claude
+worker blocks on it with `bg-run.sh wait` ([Blocking on a
+run](native-claude.md#blocking-on-a-run)), and `execution conclude --from-bg-run` reads it.
 
 **Nested slots.** A held slot exports `FLEET_SLOT_HELD` (`<box> <slot> <slots> <gpu|cpu>`) to
 its command, and an `execution slot` that finds it runs its command under the enclosing slot
