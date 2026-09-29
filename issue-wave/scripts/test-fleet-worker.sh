@@ -455,8 +455,8 @@ SHIMEOF
 # on stdout with no newline, then the error on stderr, exit 1; rog-nv-linux, 2026-09-24),
 # `noauth` a box never logged in (exit 4), `down` a network that cannot reach api.github.com,
 # `5xx` a GitHub outage, `hang` a call that never returns. Unset, it answers a login.
-# It is also git's credential helper for https://github.com, configured in the scratch HOME the
-# way `gh auth setup-git` writes it (the list reset first, so no system helper answers): the
+# It is also git's credential helper for https://github.com, configured in the suite's global git
+# config the way `gh auth setup-git` writes it (the list reset first, so no system helper answers): the
 # preflight's `git credential fill` (ludics-lite#374) gets a credential from it unless
 # SHIM_GH_CRED=none (no credential, as gh with no login answers) or `hang`.
 cat > "$TMP/bin/gh" <<'SHIMEOF'
@@ -477,6 +477,8 @@ esac
 echo shim-user
 SHIMEOF
 chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux" "$TMP/bin/ssh" "$TMP/bin/gh"
+# Through GIT_CONFIG_GLOBAL, not ~/.gitconfig: some sections preflight under a HOME of their own.
+export GIT_CONFIG_GLOBAL="$TMP/gitconfig"
 git config --global --add credential.https://github.com.helper ""
 git config --global --add credential.https://github.com.helper "!gh auth git-credential"
 
