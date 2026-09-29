@@ -1690,7 +1690,7 @@ test_a_broken_jq_program_is_unknown_on_the_request_read() {
 
 test_watch_re_requests_a_failed_run_once() {
   # A grace short enough that the request's pickup window ends inside the case.
-  retune GRACE=4
+  retune GRACE=2
   failed_run_fixture
   run_watch 0,1,0 1 3
   assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 1 \
@@ -1716,7 +1716,7 @@ _🤖 Addressed by an automated coding agent_" "the plain request the pending-nu
 # request's grace — the deadline is set by the post, not by the round's `failed` read, which has
 # none — so the watch goes on to read the request back instead of ending on it.
 test_watch_waits_out_a_re_request_posted_on_its_last_poll() {
-  retune GRACE=4
+  retune GRACE=2
   failed_run_fixture
   # An interval past the timeout: one regular round, then the boundary.
   run_watch 0,1,0 5 3

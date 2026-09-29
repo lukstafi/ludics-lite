@@ -216,8 +216,10 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: ubuntu-latest
-    # Two complete fixture passes; allow slower runners time to finish both.
-    timeout-minutes: 15
+    # Two complete fixture passes; allow slower runners time to finish both. 20, not 15: by
+    # 2026-09-29 a green run took 12-14 minutes, and runs on several PRs were cancelled at the
+    # 15-minute mark inside the second (hostile-locale) pass, a stop no fixture had caused.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Exercise the suites' shared preamble and its shadow guard
