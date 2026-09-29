@@ -272,8 +272,11 @@ up=1
 for u in ${SSH_UP:-}; do [ "$u" = "$dest" ] && up=0; done
 if [ "$up" = 0 ]; then
   case "$cmd" in
+    # cmd.exe's echo prints everything up to the `&` verbatim, a blank before it included, so the
+    # marker line is that text; $SSH_POWER_MARKER replaces it to hand the script another line.
     *WAKE_LAB_POWER_STARTED*)
-      printf 'WAKE_LAB_POWER_STARTED\r\n'
+      marker=${cmd#*echo }; marker=${marker%%&*}
+      printf '%s\r\n' "${SSH_POWER_MARKER-$marker}"
       [ "${SSH_POWER_FAIL:-0}" = 1 ] && { echo 'Power request denied' >&2; exit 2; }
       [ "${SSH_POWER_DROP_AFTER_MARKER:-0}" = 1 ] && exit 255 ;;
   esac
@@ -2293,6 +2296,28 @@ out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
   && grep -q 'confirming' <<<"$out" \
   && ok "a dropped Windows power connection is provisional only after its start marker" \
   || ko "a started Windows sleep was lost on SSH disconnect (rc=$rc) -- $out"
+# cmd.exe keeps a blank before `&` in what `echo` prints (#394): the command has none, and the
+# marker line is read with its trailing blanks and `\r` stripped, so `MARKER \r\n` still counts...
+grep -q 'echo WAKE_LAB_POWER_STARTED& ' "$SSH_LOG" && ! grep -q 'echo WAKE_LAB_POWER_STARTED &' "$SSH_LOG" \
+  && ok "the Windows power command puts no blank between its start marker and \`&\`" \
+  || ko "the Windows power command's marker carries a blank before \`&\` -- $(cat "$SSH_LOG")"
+rm -f "$TMP/power-down.list"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="rog-nv-win" SSH_POWER_DROP_AFTER_MARKER=1 SSH_POWER_MARKER='WAKE_LAB_POWER_STARTED ' \
+    SSH_DOWN_LIST="$TMP/power-down.list" SSH_DOWN_AFTER='WAKE_LAB_POWER_STARTED|rog-nv-win' \
+    "$WL" sleep rog 2>&1 8>&-); rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'did not start' <<<"$out" && grep -q 'confirming' <<<"$out" \
+  && ok "a start marker returned with a trailing blank still counts as started (rc=$rc)" \
+  || ko "a started Windows sleep was refused over the marker's trailing blank (rc=$rc) -- $out"
+# ...and the match is still exact: a line that merely contains the marker is not it.
+rm -f "$TMP/power-down.list"
+out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
+    SSH_UP="rog-nv-win" SSH_POWER_DROP_AFTER_MARKER=1 SSH_POWER_MARKER='WAKE_LAB_POWER_STARTED & shutdown /h' \
+    SSH_DOWN_LIST="$TMP/power-down.list" SSH_DOWN_AFTER='WAKE_LAB_POWER_STARTED|rog-nv-win' \
+    "$WL" hibernate rog 2>&1 8>&-); rc=$?
+[ "$rc" -eq 1 ] && grep -q 'Windows power command did not start' <<<"$out" && ! grep -q 'confirming' <<<"$out" \
+  && ok "...while a line that only contains the marker is still not the marker" \
+  || ko "the marker match accepted a line that is not the marker (rc=$rc) -- $out"
 out=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" WAKE_LAB_DOWN_WAIT_SECONDS=0 \
     SSH_UP="rog-lan rog-nv-win" SSH_POWER_FAIL=1 "$WL" hibernate rog 2>&1 8>&-); rc=$?
 [ "$rc" -eq 1 ] && grep -q 'hibernate FAILED on rog (command exited 2)' <<<"$out" \

@@ -1345,12 +1345,15 @@ wsl_power_action() { # power_action <verb> <box>
     down)      cmd='shutdown /s /f /t 0' ;;
     *) echo "unknown power verb: $verb" >&2; return 1 ;;
   esac
-  cmd='cmd.exe /d /s /c "echo WAKE_LAB_POWER_STARTED & '"$cmd"'"'
+  # No space before `&`: cmd.exe's echo keeps it, so `echo X & ...` comes back as `X ` (boot-linux
+  # on rog, 2026-09-24). Trailing blanks and `\r` are stripped before the exact-line match as well,
+  # so the marker is read the same whichever way it comes.
+  cmd='cmd.exe /d /s /c "echo WAKE_LAB_POWER_STARTED& '"$cmd"'"'
   echo "$name: $verb"
   output=$(capped 30 ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
       "$ts" "$cmd" 2>&1); action_rc=$?
   [ -z "$output" ] || printf '  %s\n' "$(printf '%s\n' "$output" | tail -1)"
-  if ! tr -d '\r' <<<"$output" | grep -Fxq 'WAKE_LAB_POWER_STARTED'; then
+  if ! tr -d '\r' <<<"$output" | sed 's/[[:space:]]*$//' | grep -Fxq 'WAKE_LAB_POWER_STARTED'; then
     echo "  $verb FAILED on $name (Windows power command did not start)"
     return 1
   fi
