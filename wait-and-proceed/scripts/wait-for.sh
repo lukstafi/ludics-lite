@@ -29,13 +29,21 @@
 #     cannot be told from one that is still waiting.
 #
 # Usage:
-#   wait-for.sh branch <branch> [--base <ref>] [--repo <dir>]
+#   wait-for.sh branch <branch> [--base <ref>] [--repo <checkout-dir>]
 #   wait-for.sh cmd '<shell command>'        # any predicate; its exit 0 means clear
 #   both accept: [--timeout <sec>] [--interval <sec>] [--label <text>]
 #
 # Exit: 0 clear, proceed | 3 timed out | 4 cannot evaluate | 5 will never clear | 2 usage.
 #
 # Env: none. Defaults: --base origin/master, --timeout 14400 (4h), --interval 60, --repo $PWD.
+#
+# --repo is the path of a local checkout, never a GitHub owner/name, although every other fleet
+# tool's --repo takes owner/name: the git witness above fetches and runs merge-base in a clone, and
+# an owner/name names no clone -- a box has several of one repository (the primary, worktrees, a
+# shared staging checkout), so picking one would be a guess, and dropping to the PR witness alone
+# would lose the direct-push and no-PR-yet cases the git witness exists for. So a value shaped
+# like owner/name that is not a path here is refused as a usage error (exit 2) that names the
+# confusion, before any wait starts.
 
 set -uo pipefail
 
@@ -58,7 +66,7 @@ INTERVAL=60
 LABEL=""
 
 die() {
-  echo "wait-for.sh: $*" >&2
+  printf 'wait-for.sh: %s\n' "$*" >&2
   exit 2
 }
 
@@ -88,6 +96,11 @@ done
 case "$TIMEOUT$INTERVAL" in
   *[!0-9]*) die "--timeout and --interval take seconds" ;;
 esac
+
+# An existing path is a path, whatever its shape; only a missing one is read as owner/name.
+if [ ! -e "$REPO_DIR" ] && [[ $REPO_DIR =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$ ]]; then
+  die "--repo takes the path of a local checkout, not a GitHub owner/name like $(printf '%q' "$REPO_DIR"); pass a clone whose origin is that repository (it is fetched and merge-base runs there)"
+fi
 
 # A caller who says origin/foo means the branch foo; the ref is rebuilt below either way.
 TARGET="${TARGET#origin/}"
@@ -138,7 +151,7 @@ deadline=$((started + TIMEOUT))
 case "$MODE" in
   branch)
     git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 ||
-      finish 4 "ERROR" "not a git repository: $REPO_DIR"
+      finish 4 "ERROR" "not a git repository: $(printf '%q' "$REPO_DIR") (--repo takes the path of a local checkout)"
     printf 'waiting: %s into %s (timeout %ss, polling %ss)%s\n' \
       "$TARGET" "$BASE" "$TIMEOUT" "$INTERVAL" "${LABEL:+ [$LABEL]}"
     ;;

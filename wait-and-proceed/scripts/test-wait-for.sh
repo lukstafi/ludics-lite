@@ -9,6 +9,11 @@
 # merge on origin that git cannot see (ludics-lite#404 was the same bug in the ship-pr Stop hook).
 # A checkout whose origin has no URL falls back to gh's default.
 #
+# And what --repo takes: a checkout path. A GitHub owner/name that is not a path here is refused
+# with exit 2, a message naming the confusion, and no gh call; a relative path of the same shape
+# that IS a checkout is still a path; a directory that is not a checkout is exit 4, saying --repo
+# wants a checkout.
+#
 # Usage: test-wait-for.sh   (exit 0 all pass, 1 otherwise)
 
 set -uo pipefail
@@ -117,8 +122,47 @@ test_no_origin_falls_back_to_gh_default() {
   esac
 }
 
+# The staging#889 call: --repo lukstafi/ocannl-staging, as every other fleet tool spells it.
+test_owner_name_is_refused() {
+  local out rc
+  GH_LOG="$TMP/owner-name.gh-log"
+  : >"$GH_LOG"
+  export GH_LOG
+  out=$(CDPATH= cd "$TMP" && "$WAIT_FOR" branch topic --repo lukstafi/ocannl-staging --timeout 0 --interval 1 2>&1)
+  rc=$?
+  check "$rc" 2 "owner/name: refused as a usage error"
+  check_contains "$out" "--repo takes the path of a local checkout, not a GitHub owner/name like lukstafi/ocannl-staging" \
+    "owner/name: the refusal names the confusion"
+  check "$(cat "$GH_LOG")" "" "owner/name: refused before gh was asked anything"
+}
+
+# The shape alone does not decide: a relative path that exists is a path.
+test_relative_checkout_of_owner_name_shape() {
+  mkdir -p "$TMP/rel/owner"
+  make_checkout "$TMP/rel/owner/name" yes
+  GH_LOG="$TMP/rel.gh-log"
+  : >"$GH_LOG"
+  export GH_LOG
+  OUT=$(CDPATH= cd "$TMP/rel" && FAKE_GH_REPO="$TMP/rel/owner/name.origin.git" \
+    "$WAIT_FOR" branch topic --base origin/main --repo owner/name --timeout 0 --interval 1 2>&1)
+  RC=$?
+  check "$RC" 0 "relative checkout path shaped like owner/name: watched as a checkout"
+  check_contains "$OUT" "CLEAR: topic merged (1234abcd)" "relative checkout path: the PR reported the landing"
+}
+
+test_non_checkout_dir_is_error() {
+  mkdir -p "$TMP/plain"
+  OUT=$("$WAIT_FOR" branch topic --repo "$TMP/plain" --timeout 0 --interval 1 2>&1)
+  RC=$?
+  check "$RC" 4 "a directory that is not a checkout: exit 4"
+  check_contains "$OUT" "(--repo takes the path of a local checkout)" "a directory that is not a checkout: the error says what --repo wants"
+}
+
 test_fork_checkout_asks_origin
 test_no_origin_falls_back_to_gh_default
+test_owner_name_is_refused
+test_relative_checkout_of_owner_name_shape
+test_non_checkout_dir_is_error
 
 printf '%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

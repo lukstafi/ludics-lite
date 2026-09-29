@@ -279,9 +279,11 @@ request id, and do not wake, kick or rerun for it: the box is busy on purpose. C
 reservations never cause it. The header's `reservations:` line says whether the registry was
 consulted; `NOT CONSULTED` on this Mac means no fleet-worker.sh answered its probe, which is a
 setup finding for step 5, and a unit line `WARNING -- the fleet's execution registry could not be
-read` means that unit ran without the check. The header's `lab locks:` line is the startup check
-that the sweep and `wake-lab.sh` still agree on the lane-lock contract (ahrefs/ocannl#1025):
-`agree with ...` needs nothing; `NOT CHECKED` is a finding. And a dxg
+read` means that unit ran without the check. The header's `lab locks:` line, present whenever a
+remote unit is selected, is the startup check that the sweep and `wake-lab.sh` still agree on the
+lane-lock contract (ahrefs/ocannl#1025): `agree with ...` is its only verdict and needs nothing.
+There is no unchecked state (staging#888): a contract or endpoint map the sweep cannot read refuses
+the run at startup with exit 2 and a `sweep:` line, which step 2 says how to read. And a dxg
 window whose verdict is
 `vm-replaced` means the guest was destroyed and recreated while that unit ran — the unit's result
 says nothing about the code, it gets the serial rerun automatically, and the thing to investigate
@@ -395,9 +397,13 @@ machine. A startup exit 2 is therefore a whole day of non-coverage for all five 
 read the `sweep:` line first, and relaunch only if it names something this routine can correct
 from the instructions above (a missing box ID, a stale or incomplete extraction, "another sweep is
 running"). `sweep: the lab lock contract with <wake-lab.sh> is broken: ...` is NOT one of those:
-the sweep's `lab_box_of`/`lab_dest_of` and wake-lab's `ENDPOINT_MAP` or lock directory disagree,
-so lanes would reserve locks no destroyer checks. It is a code fix on whichever side moved (the
-line names what), and it is notify-worthy. Do not retry the same command hoping for a different answer — the 2026-09-05 run burned
+`wake-lab.sh lock-path <box>` names a different file from the one a lane locks, so lanes would
+reserve locks no destroyer checks. It is a code fix on whichever side moved (the line names what),
+and it is notify-worthy. Nor are the endpoint-map refusals, since the sweep takes every remote
+unit's ssh alias from `wake-lab.sh endpoint-map` (staging#888): `endpoint-map gave no map`, `has no
+row for <box>`, `lists no -<kind> alias for <box>` are a finding about the installed wake-lab.sh or
+its site map, notify-worthy. Only `sweep: no wake-lab.sh at <path>` is an incomplete extraction
+(the wrapper above is missing). Do not retry the same command hoping for a different answer — the 2026-09-05 run burned
 a second attempt on that before recognizing the failure. Whatever the outcome of the single
 corrected relaunch, a startup exit 2 is reported in step 5 as non-coverage and notified in step 6.
 
