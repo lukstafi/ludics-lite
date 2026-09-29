@@ -1764,7 +1764,11 @@ test_watch_does_not_post_over_an_approval_that_landed_since_the_round() {
 test_watch_surfaces_a_re_request_that_did_not_post() {
   failed_run_fixture
   FAIL_POST=1
+  # Four attempts is gh_retry's write default: the request must be sent once whatever it is.
+  retune API_ATTEMPTS=4
   run_watch 0,1,0 1 3
+  assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 1 \
+    "a gateway refusal is not re-sent: it may have landed (review of #465, round 4)"
   assert_eq "$WATCH_RC" 0 "the caller has a move to make"
   assert_contains "$WATCH_OUT" "re-request for the failed run on head 1e14b13 did not go through" \
     "the watch says the request is not known to be on the PR"

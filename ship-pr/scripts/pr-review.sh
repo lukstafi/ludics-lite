@@ -2075,7 +2075,12 @@ status_state() {
   # arrival is the newest of the head commit's date and the PR's creation (the review clock's
   # bounds), inclusive, since a request in the arrival's own second is on this head as likely as
   # not; with neither readable every request on the PR counts, so an unreadable clock can only
-  # suppress a re-request, never add one. Requests are matched loosely, any non-reviewer
+  # suppress a re-request, never add one. The committer date is commit metadata, not the push
+  # (which is no API field, #72), and its two misses are priced, not closed (review of #465, round
+  # 4): a reset to an OLDER commit dates the head before requests made for its predecessor, so a
+  # first failure reads `run-again` and is surfaced to the caller, loudly; a commit dated AFTER a
+  # request it was pushed before (an explicit GIT_COMMITTER_DATE) can cost one duplicate request
+  # on a run with no approval, never a cleared 👍. Requests are matched loosely, any non-reviewer
   # comment carrying "@codex review", for the same reason: a looser match only surfaces sooner.
   if [ "$done_kind" = failed ] && [ -n "$done_sha" ] && [ -n "$head_sha" ] && [ "$plus" != true ] &&
     [ "$(age_of "$done_at")" != - ] &&
@@ -3223,6 +3228,19 @@ watch_grace_deadline() {
 # the one that runs on a box routinely, so the start of one is the natural place to notice what a
 # SIGKILLed run — a watch, a gh call, a fixture suite — left in TMPDIR. It sweeps every family,
 # not just the snapshot's (ludics-lite#219); see tmp_sweep_stale for why that is safe.
+# The watch's one write, ATTEMPTED ONCE. gh_retry's write policy re-sends on a gateway refusal
+# (502/503/504), on the premise that such a refusal did not land; a caller running `comment` by
+# hand reads the outcome and decides, but an automatic request re-sent after a refusal that did
+# land is a second review run nobody asked for (review of #465, round 4). So any failure is
+# reported back as one that may have landed, and the caller reads the PR before posting by hand.
+watch_post_request() { # <pr>
+  local API_ATTEMPTS=1
+  gh_retry write api -X POST "repos/$REPO/issues/$1/comments" \
+    -f body="@codex review
+
+_🤖 Addressed by an automated coding agent_" --jq .html_url >/dev/null
+}
+
 cmd_watch() {
   local rc=0
   tmp_sweep_stale
@@ -3342,10 +3360,7 @@ watch_loop() {
       fkind="${fkind%%|*}"
       if [ "$fkind" = run ] && [ "$rerequested" != "$fsha" ]; then
         # This state is the fresh one read above, right after the round's.
-        if gh_retry write api -X POST "repos/$REPO/issues/$pr/comments" \
-          -f body="@codex review
-
-_🤖 Addressed by an automated coding agent_" --jq .html_url >/dev/null; then
+        if watch_post_request "$pr"; then
           rerequested="$fsha"
           # The request's grace is this watch's to wait out, from now: the deadline the round
           # computed was the `failed` state's, which has none, and a failure first seen on the
