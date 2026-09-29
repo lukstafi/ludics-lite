@@ -243,11 +243,13 @@ refuses a token that call rejects (ludics-lite#360: on 2026-09-23 a dead keyring
 an hour into a worker's task, and on 2026-09-24 minix's token answered HTTP 401 over ssh while
 `gh auth status` at its desktop console was green - the console and the status read prove
 nothing about the worker's session). It also asks git for github.com's HTTPS credential as a
-push does (`git credential fill`, output discarded) and refuses when none comes back, with
-`gh auth setup-git` as the repair; and for a CLI worker, when the box's tmux server is running,
-it repeats both calls in a throwaway session of that server, whose environment the worker
-inherits, refusing a server that hands out a credential this session's calls did not prove
-(repair: restart that server once its workers finish; ludics-lite#374). A GitHub that does not
+push does (`git credential fill`) and tries what comes back against GitHub, never printing it,
+refusing when none comes back or GitHub refuses it, with `gh auth setup-git` as the repair; and
+for a CLI worker, when the box's tmux server is running, it repeats the probe in a throwaway
+session of that server, whose environment the worker inherits, refusing a server that hands out
+a credential that does not work (repair: restart that server once its workers finish;
+ludics-lite#374). `launch` and `unstick` repeat that server probe just before they create the
+worker's session. A GitHub that does not
 answer (no reply within `FLEET_GH_TIMEOUT`, 30 s per call; a connection error; an HTTP 5xx) is
 noted on the OK line, not refused, as a sleeping sibling is. A refusal names its reason; surface it rather than launching
 stale, and never reset a dirty checkout silently - a divergent local edit may be a fix worth

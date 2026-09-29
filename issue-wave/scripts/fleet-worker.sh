@@ -751,11 +751,120 @@ skills_freshness() {
 EOF
 }
 
+# The GitHub probe (ludics-lite#360, #374), shared by the preflight, which runs it in its own
+# session and in a running tmux server, and by the far sides that create a worker session (launch,
+# unstick), which run it in the server just before new-session, as they repeat tmux_env_check.
+# Far side, after the prelude; gh_bound is each call's wall-clock bound (FLEET_GH_TIMEOUT).
+ghprobe_fn() {
+  printf 'gh_bound=%q\n' "${FLEET_GH_TIMEOUT:-30}"
+  cat <<'EOF'
+# gh_probe_write <file>: the probe, one file run wherever it is made, `bash <file> <dir> <bound>
+# [tmux]`. It writes gh.rc and gh.out (`gh api user`; rc 127 is no gh on PATH), then git.rc and
+# git.out, then done. The git half asks for github.com's HTTPS credential as a push does, with
+# prompts and askpass off, and once the API call passed, tries the credential git returned against
+# GitHub: a helper can hold a stale password beside a live GH_TOKEN, and retrieving one proves
+# nothing about it. The credential lives in a variable and in that one call's GH_TOKEN, never in
+# a file: git.out holds git's stderr and gh's error alone. Its exits: 0 accepted (or retrieved,
+# when there was nothing to try it against), 1 no credential, 2 GitHub refused it, 3 no password.
+# With `tmux` it ends by killing its own session, so `remain-on-exit` or an interrupted preflight
+# leaves none behind; the caller never passes it outside a probe session (a shell in the user's own
+# pane has TMUX_PANE too).
+gh_probe_write() {
+  { printf '%s\n' 'set -u'; declare -f bounded; cat <<'PROBE'
+d="$1" t="$2"
+cd / || exit 1
+if command -v gh >/dev/null 2>&1; then
+  GH_PROMPT_DISABLED=1 bounded "$t" gh api --hostname github.com user -q .login > "$d/gh.out"; echo "$?" > "$d/gh.rc"
+else echo 127 > "$d/gh.rc"; fi
+# bounded runs it in a subshell that records its status after it: return, never exit.
+git_cred() {
+  local cred pw out
+  cred=$(git credential fill) || return 1
+  [ "$1" = 0 ] || return 0
+  pw=$(printf '%s\n' "$cred" | sed -n 's/^password=//p' | head -n 1)
+  [ -n "$pw" ] || { echo "git's answer carries no password"; return 3; }
+  out=$(GH_TOKEN=$pw GH_PROMPT_DISABLED=1 gh api --hostname github.com user -q .login 2>&1) && [ -n "$out" ] && return 0
+  printf '%s\n' "$out"; return 2
+}
+printf 'protocol=https\nhost=github.com\n\n' > "$d/cred.in"
+GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=false GCM_INTERACTIVE=never \
+  bounded --stdin "$d/cred.in" "$t" git_cred "$(cat "$d/gh.rc")" > "$d/git.out"; echo "$?" > "$d/git.rc"
+: > "$d/done"
+[ "${3:-}" != tmux ] || [ -z "${TMUX_PANE:-}" ] || tmux kill-session -t "$TMUX_PANE" 2>/dev/null
+PROBE
+  } > "$1"
+}
+# gh_read <dir>: ghst is ok, nogh, down, refused or none (no result at all), ghlast what gh said;
+# gitst ok, down, rejected, or none/nocred (no credential), gitwhy what git or GitHub said. A
+# GitHub that did not answer is gh's "error connecting to" or an HTTP 5xx; any other failure refuses.
+gh_read() {
+  local ghrc gitrc ghout gitout
+  ghrc=$(cat "$1/gh.rc" 2>/dev/null); gitrc=$(cat "$1/git.rc" 2>/dev/null)
+  ghout=$(cat "$1/gh.out" 2>/dev/null); gitout=$(cat "$1/git.out" 2>/dev/null)
+  ghlast=$(printf '%s\n' "$ghout" | sed '/^[[:space:]]*$/d' | tail -n1 | sed 's/^.*}gh: /gh: /' | cut -c1-120)
+  case "$ghrc" in
+    '') ghst=none; ghlast="no result" ;;
+    0) if [ -n "$ghlast" ]; then ghst=ok; else ghst=refused; ghlast="exit 0, no output"; fi ;;
+    127) ghst=nogh ;;
+    124) ghst=down; ghlast="no answer from gh api user in ${gh_bound}s" ;;
+    *) case "$ghout" in *"error connecting to "*|*"(HTTP 5"[0-9][0-9]")"*) ghst=down; ghlast="gh api user: $ghlast" ;; *) ghst=refused; ghlast=${ghlast:-exit $ghrc, no output} ;; esac ;;
+  esac
+  gitwhy=$(printf '%s\n' "$gitout" | sed '/^[[:space:]]*$/d' | tail -n1 | sed 's/^.*}gh: /gh: /' | cut -c1-120)
+  case "$gitrc" in
+    '') gitst=none; gitwhy="no result" ;;
+    0) gitst=ok; gitwhy="" ;;
+    124) gitst=nocred; gitwhy="no answer in ${gh_bound}s" ;;
+    2) case "$gitout" in *"error connecting to "*|*"(HTTP 5"[0-9][0-9]")"*) gitst=down ;; *) gitst=rejected ;; esac; gitwhy=${gitwhy:-no output} ;;
+    *) gitst=nocred; gitwhy=${gitwhy:-exit $gitrc, no output} ;;
+  esac
+}
+# tmux_gh_check: the probe as the command of a throwaway session of the RUNNING tmux server, the
+# shape `launch` starts a CLI worker in (`bash <file>` via new-session, so update-environment and
+# the default shell apply as they do for the worker; `run-shell` is not that shape: it runs /bin/sh
+# in the most recent session's environment). A new session takes the server's environment, not
+# this shell's, and a server started before gh-token.sh existed or rotated hands out a stale token
+# or none. No comparison of variables stands in for this (#367 built one over three review rounds
+# and removed it). No server running passes: the next session starts one from this shell. Returns
+# 1 with tmux_gh_msg set when the server's session fails either half; tmux_gh_down says GitHub did
+# not answer there. The session is not iw-*, so no `ls` reads it as a worker.
+tmux_gh_check() {
+  local pf pd ps perr waited srv=""
+  tmux_gh_msg=""; tmux_gh_down=""
+  tm show-environment -g >/dev/null 2>&1 || return 0
+  pf=$(mktemp "${TMPDIR:-/tmp}/fw-ghprobe.XXXXXX"); pd=$(mktemp -d "${TMPDIR:-/tmp}/fw-ghprobe.XXXXXX"); ps="fw-ghprobe-$$"
+  gh_probe_write "$pf"
+  if perr=$(tm new-session -d -s "$ps" "bash $(printf '%q' "$pf") $(printf '%q' "$pd") $(printf '%q' "$gh_bound") tmux" 2>&1); then
+    # Two bounded calls and a margin, in tenths; a session gone without `done` has no more to say.
+    waited=0
+    while [ ! -e "$pd/done" ] && [ "$waited" -lt $((gh_bound * 20 + 100)) ] && tm has-session -t "=$ps" 2>/dev/null; do
+      sleep 0.1; waited=$((waited + 1))
+    done
+    tm kill-session -t "=$ps" 2>/dev/null   # a probe past its bound; a finished one has gone itself
+    gh_read "$pd"
+    case "$ghst" in ok) ;; down) tmux_gh_down=$ghlast ;; nogh) srv="no gh on PATH" ;; *) srv="gh api user: $ghlast" ;; esac
+    case "$ghst:$gitst" in
+      *:ok|nogh:*|refused:*|none:*) ;;
+      *:down) tmux_gh_down="${tmux_gh_down:+$tmux_gh_down; }checking git's credential: $gitwhy" ;;
+      *:rejected) srv="${srv:+$srv; }git's credential: $gitwhy" ;;
+      *) srv="${srv:+$srv; }git credential fill: $gitwhy" ;;
+    esac
+  else
+    srv="new-session refused: $(printf '%s' "$perr" | tail -n1 | cut -c1-120)"
+  fi
+  rm -rf "$pd" "$pf"
+  [ -n "$srv" ] || return 0
+  tmux_gh_msg="the running tmux server on $BOX gives a new session a GitHub credential that does not work ($srv): a CLI worker started now would inherit it; $(tmux_restart_advice "$(tm list-sessions -F '#{session_name}' 2>/dev/null)")"
+  return 1
+}
+EOF
+}
+
 # Far-side skill-freshness preflight (ludics-lite#3). Args: codex probe. Exit 0 with a
 # PREFLIGHT OK line, 1 with the refusal. `launch` runs it on the box before every worker, so
 # the per-launch refusal the skill promises is enforced here rather than remembered.
 preflight_script() {
   freshness_fn
+  ghprobe_fn
   cat <<'EOF'
 codex="$1" probe="$2" probe_timeout="$3" fetch_timeout="$4" cross="$5" cross_timeout="$6" gh_timeout="$7"
 refuse=""
@@ -879,24 +988,14 @@ done
 # GitHub did not answer, which is noted on the OK line like a sleeping sibling (git fetch above
 # already refuses a box that cannot reach GitHub at all); everything else - a 401, gh's "gh auth
 # login" hint, any output this list does not name - refuses with the user-side repair.
-# The push path too (ludics-lite#374): an exported token passes `gh api user` whether or not git
-# has a credential helper, so the probe also asks git for github.com's HTTPS credential the way a
-# push does, `git credential fill` with prompts and askpass off; exit 0 passes, anything else
-# refuses with `gh auth setup-git`. The credential itself goes to /dev/null, never to a file.
-# And where a CLI worker runs (ludics-lite#374): a new session of a RUNNING tmux server takes the
-# server's environment, not this session's, and a server started before gh-token.sh existed or
-# rotated hands the worker a stale token or none. No comparison of variables stands in for the
-# worker there (#367 built one over three review rounds and removed it: gh resolves a token and a
-# config directory from several variables and every copy of those rules had a gap). So the same
-# probe runs as the command of a throwaway session of that server - the shape `launch` starts a
-# worker in, `bash <file>` via new-session, with update-environment and the default shell
-# applied as they are for the worker (`run-shell` is not that shape: it runs /bin/sh in the most
-# recent session's environment) - only when the probe here passed, so a failure there is the
-# server's to repair.
-# Boundary: it proves what `gh api --hostname github.com user` and `git credential fill` for
-# https://github.com (outside any repository) answer in this session, the session a native worker,
-# a leg and a NEW tmux server get, and in a new session of the running tmux server a CLI worker
-# would start in. It does not read what a worker's own tool shell re-sources on top of that, a
+# The push path and the tmux server too (ludics-lite#374; ghprobe_fn above): git's credential for
+# github.com is asked for as a push asks and tried against GitHub, and for a CLI worker the probe
+# runs again in the running tmux server the worker would inherit from - only once it passed here,
+# so a failure there is the server's to repair.
+# Boundary: it proves what `gh api --hostname github.com user` answers, and that git gets a
+# credential for https://github.com (outside any repository) that GitHub accepts, in this session,
+# the session a native worker, a leg and a NEW tmux server get, and in a new session of the running
+# tmux server a CLI worker would start in. It does not read what a worker's own tool shell re-sources on top of that, a
 # repository's own credential config, a remote over ssh (a box pushing only over ssh is refused
 # for a missing helper it does not need), or a token /user does not accept (an app installation
 # token; the fleet pushes as the user).
@@ -940,45 +1039,12 @@ if [ -e "$tokf" ] || [ -L "$tokf" ]; then
     fi
   fi
 fi
-# The probe, one file run in both places: `bash <file> <dir> <bound>` writes gh.rc and gh.out (the
-# API call; rc 127 is no gh on PATH), then git.rc and git.out (git's stderr alone), then done.
-ghprobe=$(mktemp "${TMPDIR:-/tmp}/fw-ghprobe.XXXXXX")
-{ printf '%s\n' 'set -u'; declare -f bounded; cat <<'PROBE'
-d="$1" t="$2"
-cd / || exit 1
-if command -v gh >/dev/null 2>&1; then
-  GH_PROMPT_DISABLED=1 bounded "$t" gh api --hostname github.com user -q .login > "$d/gh.out"; echo "$?" > "$d/gh.rc"
-else echo 127 > "$d/gh.rc"; fi
-printf 'protocol=https\nhost=github.com\n\n' > "$d/cred.in"
-GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=false GCM_INTERACTIVE=never \
-  bounded --stdin "$d/cred.in" "$t" bash -c 'git credential fill 2>&1 >/dev/null' > "$d/git.out"; echo "$?" > "$d/git.rc"
-: > "$d/done"
-PROBE
-} > "$ghprobe"
-# Reads a probe's directory: ghst is ok, nogh, down, refused or none (no result at all), and
-# ghlast its last line; gitst ok, refused or none, and gitwhy what git said.
-gh_read() {
-  local ghrc gitrc ghout
-  ghrc=$(cat "$1/gh.rc" 2>/dev/null); gitrc=$(cat "$1/git.rc" 2>/dev/null); ghout=$(cat "$1/gh.out" 2>/dev/null)
-  ghlast=$(printf '%s\n' "$ghout" | sed '/^[[:space:]]*$/d' | tail -n1 | sed 's/^.*}gh: /gh: /' | cut -c1-120)
-  case "$ghrc" in
-    '') ghst=none ;;
-    0) if [ -n "$ghlast" ]; then ghst=ok; else ghst=refused; ghlast="exit 0, no output"; fi ;;
-    127) ghst=nogh ;;
-    124) ghst=down; ghlast="no answer from gh api user in ${gh_timeout}s" ;;
-    *) case "$ghout" in *"error connecting to "*|*"(HTTP 5"[0-9][0-9]")"*) ghst=down; ghlast="gh api user: $ghlast" ;; *) ghst=refused; ghlast=${ghlast:-exit $ghrc, no output} ;; esac ;;
-  esac
-  case "$gitrc" in
-    '') gitst=none; gitwhy="no result" ;;
-    0) gitst=ok; gitwhy="" ;;
-    124) gitst=refused; gitwhy="no answer in ${gh_timeout}s" ;;
-    *) gitst=refused; gitwhy=$(sed '/^[[:space:]]*$/d' "$1/git.out" 2>/dev/null | tail -n1 | cut -c1-120); gitwhy=${gitwhy:-exit $gitrc, no output} ;;
-  esac
-}
+gh_bound=$gh_timeout
 case "$BOX_IS_LOCAL" in 1) setupgit="in a terminal on this box: gh auth setup-git" ;; *) setupgit="ssh $qbox 'gh auth setup-git'" ;; esac
-gpd=$(mktemp -d "${TMPDIR:-/tmp}/fw-ghprobe.XXXXXX")
-bash "$ghprobe" "$gpd" "$gh_timeout" < /dev/null > /dev/null 2>&1
-gh_read "$gpd"; rm -rf "$gpd"
+gpf=$(mktemp "${TMPDIR:-/tmp}/fw-ghprobe.XXXXXX"); gpd=$(mktemp -d "${TMPDIR:-/tmp}/fw-ghprobe.XXXXXX")
+gh_probe_write "$gpf"
+bash "$gpf" "$gpd" "$gh_bound" < /dev/null > /dev/null 2>&1
+gh_read "$gpd"; rm -rf "$gpd" "$gpf"
 case "$ghst" in
   nogh) note "no gh on PATH in a non-interactive session on $BOX (a worker here cannot open its PR)" ;;
   down) gh_down=$ghlast ;;
@@ -993,33 +1059,20 @@ case "$ghst" in
         *) repair="ssh -t $qbox 'gh auth login -h github.com -p https -w && gh auth setup-git'" ;; esac
       [ -z "$envtok" ] || repair="remove the $envtok this session exports (it outranks gh's stored login and blocks gh auth login) from $BOX's shell startup, then restart any tmux server that inherited it; for the stored login: $repair"
     fi
-    note "GitHub credential refused in a non-interactive session on $BOX (gh api user: ${ghlast:-no result}); a green \`gh auth status\` at the box's desktop console does not prove the token a worker's ssh session reads -- repair: $repair" ;;
+    note "GitHub credential refused in a non-interactive session on $BOX (gh api user: $ghlast); a green \`gh auth status\` at the box's desktop console does not prove the token a worker's ssh session reads -- repair: $repair" ;;
 esac
-case "$ghst" in ok|down)
-  [ "$gitst" = ok ] || note "git gets no GitHub credential in a non-interactive session on $BOX (git credential fill for https://github.com: $gitwhy), so a worker's push would fail -- repair: $setupgit" ;;
+case "$ghst:$gitst" in
+  ok:ok|down:ok|nogh:*|refused:*|none:*) ;;
+  *:down) gh_down="${gh_down:+$gh_down; }checking git's credential: $gitwhy" ;;
+  *:rejected) note "GitHub rejects the credential git returns for https://github.com in a non-interactive session on $BOX ($gitwhy) though gh's own token passes, so a worker's push would fail -- repair: $setupgit (it makes gh git's helper for github.com)" ;;
+  *) note "git gets no GitHub credential in a non-interactive session on $BOX (git credential fill for https://github.com: $gitwhy), so a worker's push would fail -- repair: $setupgit" ;;
 esac
 # The running tmux server, only once this session's probe proved both halves: a failure there is
-# then the server's environment. Its session is not iw-*, so no `ls` reads it as a worker.
+# then the server's environment.
 if [ -n "$tmux_live" ] && [ "$ghst" = ok ] && [ "$gitst" = ok ]; then
-  gpd=$(mktemp -d "${TMPDIR:-/tmp}/fw-ghprobe.XXXXXX"); gps="fw-ghprobe-$$"
-  if gperr=$(tm new-session -d -s "$gps" "bash $(printf '%q' "$ghprobe") $(printf '%q' "$gpd") $(printf '%q' "$gh_timeout")" 2>&1); then
-    # Two bounded calls and a margin, in tenths; a session gone without `done` has no more to say.
-    waited=0
-    while [ ! -e "$gpd/done" ] && [ "$waited" -lt $((gh_timeout * 20 + 100)) ] && tm has-session -t "=$gps" 2>/dev/null; do
-      sleep 0.1; waited=$((waited + 1))
-    done
-    tm kill-session -t "=$gps" 2>/dev/null   # remain-on-exit would keep it; a hung probe is ended
-    gh_read "$gpd"
-    srv=""
-    case "$ghst" in ok) ;; down) gh_down="in the running tmux server: $ghlast" ;; nogh) srv="no gh on PATH" ;; *) srv="gh api user: ${ghlast:-no result}" ;; esac
-    [ "$gitst" = ok ] || srv="${srv:+$srv; }git credential fill: $gitwhy"
-    [ -z "$srv" ] || note "the running tmux server on $BOX gives a new session a GitHub credential this session's probe did not prove ($srv): a CLI worker started now would inherit it; $(tmux_restart_advice "$(tm list-sessions -F '#{session_name}' 2>/dev/null)")"
-  else
-    note "the running tmux server on $BOX refused a probe session ($(printf '%s' "$gperr" | tail -n1 | cut -c1-120)), so it would refuse a CLI worker too"
-  fi
-  rm -rf "$gpd"
+  tmux_gh_check || note "$tmux_gh_msg"
+  [ -z "$tmux_gh_down" ] || gh_down="${gh_down:+$gh_down; }in the running tmux server: $tmux_gh_down"
 fi
-rm -f "$ghprobe"
 if [ -n "$refuse" ]; then
   echo "PREFLIGHT REFUSED $BOX: ${refuse#; }${other:+ (changes outside the served tree, ignored: $other)}"
   exit 1
@@ -1399,7 +1452,7 @@ EOF
   local prc2=$?
   if unreachable "$prc2"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
   [ "$prc2" -eq 0 ] || { echo "LAUNCH REFUSED $box/$name: cannot stage the brief under the worker state dir on $box (unwritable, or a file in the way)"; exit 1; }
-  { prelude "$box"; cat <<'EOF'
+  { prelude "$box"; ghprobe_fn; cat <<'EOF'
 name="$1" kind="$2" cwd="$3" repo="$4" branch="$5" base="$6" sid="$7" coord="$8" replace="$9" stamp="${10}" fetch_timeout="${11}" bid="${12}"; shift 12
 d="$WORKERS/$name"; incoming="$STATE/incoming/$name-$stamp.md"
 # Until the lock is held nothing here is ours but the staged brief; `fresh` (this launch
@@ -1516,6 +1569,7 @@ fi
   if [ "$kind" = claude ]; then echo "channel=stream-json"; echo "proc_offset=0"; echo "input_from=1"; echo "awaiting=$bid"; fi
 } > "$d/meta" || refuse "cannot write $d/meta"
 msg=$(tmux_env_check) || refuse "$msg"   # the preflight's read may be minutes old
+tmux_gh_check || refuse "$tmux_gh_msg"   # and so may its GitHub probe of the server
 tm new-session -d -s "$(sess "$name")" "bash $(printf '%q' "$d/run.sh")" || refuse "tmux failed"
 started=1
 # Ownership is now visible as a live session; the box-wide lock can go.
@@ -1801,7 +1855,7 @@ cmd_unstick() {
   # Re-read the lease after the upload, right before the worker is touched: an adoption that
   # completed meanwhile fences this intervention (residual window: one ssh round trip).
   anchor_gate UNSTICK "$box/$name" 1 || exit $?
-  { prelude "$box"; cat <<'EOF'
+  { prelude "$box"; ghprobe_fn; cat <<'EOF'
 name="$1" kill="$2" stamp="$3" mid="$4" dwait="$5" rid="$6"; shift 6
 # An empty stamp: a bare --interrupt, with no message staged or to place.
 d="$WORKERS/$name"; staged=""; [ -z "$stamp" ] || staged="$STATE/incoming/$name-$stamp.md"
@@ -1970,6 +2024,7 @@ if pgrep -f -- "$pat" >/dev/null 2>&1; then
 fi
 # A resume creates a session too, with no preflight in front of it.
 msg=$(tmux_env_check) || { echo "UNSTICK REFUSED $BOX/$name: $msg"; exit 1; }
+tmux_gh_check || { echo "UNSTICK REFUSED $BOX/$name: $tmux_gh_msg"; exit 1; }
 # A claude session resumes onto the stream-json channel whatever it ran before (a record from
 # before it has no input.jsonl): the new process reads input.jsonl from the first line the old one
 # never echoed -- a message still queued when it died -- or else from the message's own line.
