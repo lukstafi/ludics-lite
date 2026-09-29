@@ -497,37 +497,57 @@ graphql_fixed_answer() {
 # answered", which tells an obedient caller to re-arm forever.
 #
 # The boundary. This reads ONE line, the first line of gh's stderr, where gh prints the refusal
-# with no prefix. It is a fail-closed ALLOWLIST of whole-line shapes, each copied from a real call
-# to gh 2.101.0 that sent no request:
-#   Unknown JSON field: "<field>"                           --json with a field gh does not know
+# with no prefix, and only for a call gh_builtin_command (below) says gh parses itself. It is a
+# fail-closed ALLOWLIST of whole-line shapes, each copied from a real call to gh 2.101.0 that sent
+# no request:
+#   Unknown JSON field: "<field>"                              --json with a field gh lacks
 #   Specify one or more comma-separated fields for `--json`:   --json with no value
-#   unknown flag: --<name>                                  a long flag the command does not take
-#   unknown shorthand flag: '<c>' in -<cs>                  a short one
-#   flag needs an argument: --<name>  /  '<c>' in -<c>      a flag missing its value
+#   unknown flag: --<name>                                     a long flag the command lacks
+#   unknown shorthand flag: '<c>' in -<cs>                     a short one
+#   flag needs an argument: --<name>  /  '<c>' in -<c>         a flag missing its value
 #   invalid argument "<v>" for "[-<c>, ]--<name>" flag: <why>  a value the flag cannot take
-#   accepts [at most ]<n> arg(s), received <m>              the wrong number of arguments
-#   unknown command "<x>" for "gh[ <cmd>...]"               a subcommand gh does not have
-# It deliberately does not read stdout, the lines after the first, a line behind a prefix (`gh: `,
-# `GraphQL: `: those are the API's words, which can quote any of these), or any other client-side
-# message: a jq expression gh could not parse can be reported AFTER the request was sent (`gh pr
-# view 1 --jq '.['` answers with the API's own error first), a write's included, and the rest (`flags required when not running interactively`, `cannot use --web with
-# --json`, ...) are not on the list. Those keep the classification they had. And only a caller's
-# arguments are read this way: cmd_retry opts in, while this script's own calls keep today's
-# classification, since a refusal there means the installed gh no longer takes an argument the
-# script sends, and their callers do not report it as that.
+#   accepts [at most ]<n> arg(s), received <m>                 the wrong number of arguments
+#   unknown command "<x>" for "gh <cmd>..."                    a subcommand gh does not have
+# A mistyped flag's name is whatever the caller typed up to an `=`, punctuation included
+# (`--foo_bar`, `--foo.bar`, `-_`); one holding whitespace is not read. The line deliberately does
+# not read stdout, the lines after the first, a line behind a prefix (`gh: `, `GraphQL: `: those
+# are the API's words, which can quote any of these), or any other client-side message. A jq
+# expression gh could not parse can be reported AFTER the request was sent (`gh pr view 1 --jq
+# '.['` answers with the API's own error first), a write's included, and the rest (`flags required
+# when not running interactively`, `cannot use --web with --json`, ...) are not on the list. Those
+# keep the classification they had. And only a caller's arguments are read this way: cmd_retry
+# opts in, while this script's own calls keep today's classification, since a refusal there means
+# the installed gh no longer takes an argument the script sends, and their callers do not report it
+# as that.
 gh_client_refusal() {
   local re
   for re in \
     '^Unknown JSON field: "[^"]+"$' \
     '^Specify one or more comma-separated fields for `--json`:$' \
-    '^unknown flag: --[A-Za-z0-9][A-Za-z0-9-]*$' \
-    "^unknown shorthand flag: '[A-Za-z0-9]' in -[A-Za-z0-9]+\$" \
+    '^unknown flag: --[^[:space:]=]+$' \
+    "^unknown shorthand flag: '[^'[:space:]]' in -[^[:space:]]+\$" \
     "^flag needs an argument: (--[A-Za-z0-9][A-Za-z0-9-]*|'[A-Za-z0-9]' in -[A-Za-z0-9])\$" \
     '^invalid argument ".*" for "(-[A-Za-z0-9], )?--[A-Za-z0-9][A-Za-z0-9-]*" flag: .+$' \
     '^accepts (at most )?[0-9]+ arg\(s\), received [0-9]+$' \
-    '^unknown command "[^"]+" for "gh( [a-z][a-z-]*)*"$'; do
+    '^unknown command "[^"]+" for "gh( [a-z][a-z-]*)+"$'; do
     [[ "$1" =~ $re ]] && return 0
   done
+  return 1
+}
+
+# Is the call's command one gh parses and runs itself, so that its stderr is gh's own? A command
+# gh does not have is an alias or an extension, and gh hands an extension every argument: its
+# stderr is arbitrary code's, which can write to GitHub and then print a gh-shaped `unknown flag:`
+# line. So this is a fail-closed ALLOWLIST of gh's built-in commands that run no delegated code
+# (not `extension`, whose `exec` runs one, `copilot`, `codespace`, `alias` or `preview`). A
+# built-in's name cannot be taken over: gh 2.101.0 refuses the alias (`Could not create alias pr:
+# already a gh command or extension`), and `gh help extension` states that an extension cannot
+# override a core command (one that clashes runs only through `gh extension exec`, not listed).
+gh_builtin_command() {
+  case "${1:-}" in
+  api | pr | issue | run | workflow | repo | release | label | search | cache | ruleset | gist | \
+    secret | variable) return 0 ;;
+  esac
   return 1
 }
 
@@ -3760,7 +3780,9 @@ cmd_retry() {
     cmd_run_watch "$@"
     return
   fi
-  GH_RETRY_CALLER_ARGS=1 gh_retry "$mode" "$@"
+  local caller_args=""
+  gh_builtin_command "$1" && caller_args=1
+  GH_RETRY_CALLER_ARGS="$caller_args" gh_retry "$mode" "$@"
   case "$?" in
   0) return 0 ;;
   2) die "gh $1 refused its own arguments and sent nothing: $(gh_err_line). That is a usage" \

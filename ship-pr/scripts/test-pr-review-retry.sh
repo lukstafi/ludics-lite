@@ -418,6 +418,12 @@ test_a_client_refusal_is_a_usage_error() {
     $'Specify one or more comma-separated fields for `--json`:\n  additions'
     # gh pr view 1 --repo lukstafi/ludics-lite --nosuchflag
     $'unknown flag: --nosuchflag\n\nDisplay the title, body, and other information about a pull request.'
+    # gh pr list --repo lukstafi/ludics-lite --foo_bar (review round 1: punctuation in the name)
+    'unknown flag: --foo_bar'
+    # gh pr list --repo lukstafi/ludics-lite --foo.bar
+    'unknown flag: --foo.bar'
+    # gh pr list --repo lukstafi/ludics-lite -_
+    "unknown shorthand flag: '_' in -_"
     # gh pr view 1 --repo lukstafi/ludics-lite -z
     $'unknown shorthand flag: \'z\' in -z\n\nDisplay the title, body, and other information about a pull request.'
     # gh pr view 1 --repo lukstafi/ludics-lite --jq
@@ -453,7 +459,7 @@ test_a_client_refusal_is_a_usage_error() {
 
 # The controls: a refusal line anywhere but as the whole first stderr line, and gh's client-side
 # messages outside the list, keep the retry. Behind the prefix the API's words carry; with a
-# suffix; on the second line; unquoted; a jq expression gh parses after the request was sent; and a
+# suffix; on the second line; unquoted; a flag name holding whitespace; a jq expression gh parses after the request was sent; and a
 # refusal that depends on whether a terminal is attached.
 test_a_client_refusal_near_miss_still_retries() {
   local body
@@ -462,6 +468,7 @@ test_a_client_refusal_near_miss_still_retries() {
     'unknown flag: --nosuchflag (HTTP 502)'
     $'gh: Something went wrong (HTTP 500)\nUnknown JSON field: "nosuchfield"'
     'Unknown JSON field: nosuchfield'
+    'unknown flag: --foo bar'
     $'failed to parse jq expression (line 1, column 3)\n    .[\n      ^  unexpected EOF'
     $'flags required when not running interactively\n'
   )
@@ -472,6 +479,27 @@ test_a_client_refusal_near_miss_still_retries() {
     run_retry --read pr view 1 --repo example/repo --json number
     assert_eq "$RETRY_RC" 3 "outside the allowlist keeps the retry ($body: $RETRY_OUT)"
     assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "every attempt was spent ($body)"
+  done
+}
+
+# The other half of the scope (review round 1): a command gh does not have is an alias or an
+# extension, which gh hands every argument, so its stderr is arbitrary code's and can follow a write
+# that landed. The same refusal line keeps the retry on a read and stays ambiguous on a write.
+test_an_extension_refusal_is_not_read() {
+  local cmd
+  retune API_ATTEMPTS=3
+  for cmd in myext co; do
+    reset_fixture
+    CLIENT_ERROR='unknown flag: --later'
+    run_retry --read "$cmd" --later
+    assert_eq "$RETRY_RC" 3 "a non-built-in's refusal-shaped line keeps the retry ($cmd: $RETRY_OUT)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "every attempt was spent ($cmd)"
+    reset_fixture
+    CLIENT_ERROR='unknown flag: --later'
+    run_retry "$cmd" --later
+    assert_eq "$RETRY_RC" 3 "and a write through it stays ambiguous ($cmd: $RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "AMBIGUOUSLY" "it may have landed ($cmd)"
+    assert_not_contains "$RETRY_OUT" "sent nothing" "nothing is claimed about what was sent ($cmd)"
   done
 }
 
@@ -536,6 +564,7 @@ tests=(
   test_a_near_miss_still_retries
   test_a_client_refusal_is_a_usage_error
   test_a_client_refusal_near_miss_still_retries
+  test_an_extension_refusal_is_not_read
   test_the_scripts_own_calls_keep_their_classification
   test_parse_ref
 )
