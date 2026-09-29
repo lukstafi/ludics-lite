@@ -1438,12 +1438,33 @@ REVIEWED_COMMIT_RE='Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})'
 # status (Running, a failure or cancellation word, a new emoji, a reworded or re-marked Completed)
 # is not a verdict, and what it leaves is the reading status gave before this row was read.
 SUMMARY_COMPLETED_ROW_RE='^\|[^|]*Code Review[^|]*\| *✅ \*\*Completed\*\* <relative-time datetime="(?<at>[^"]+)">[^<|]*</relative-time> *\| *`(?<sha>[0-9a-f]{7,40})` *\|'
+# The same row when the reviewer's RUN failed (#453), the one failure status the app has been seen
+# to write — once in the 621 Code Review rows of every summary comment on both repositories since
+# the table appeared (2026-08-29 to 2026-09-29), on lukstafi/ocannl-staging#633
+# (issuecomment-5541857882); then twice on 2026-09-29: ludics-lite#462's opening round (read back
+# from the comment's GraphQL userContentEdits, since the app rewrites the row in place — the row's
+# datetime 17:40:02Z, the edit 17:40:56Z, and one '@codex review' got the round), and ludics-lite#465,
+# the PR that added this reading, with a "Manual request" trigger one second after a "Something
+# went wrong" comment:
+#   | 📝 **Code Review** | ⚠️ **Failed** <relative-time datetime="2026-09-04T22:47:25.387018Z">...</relative-time> | `1e14b13` | New commits |
+# A fail-closed allowlist of that row, cell by cell as the Completed one is: U+26A0 WITH its
+# variation selector U+FE0F (the bytes that row carries), the bold word, one relative-time element,
+# a backquoted lowercase hex SHA. Any other failure word, emoji or spelling is not this row, and
+# keeps the reading status gave before #453 (a spent 👀's `expected`, a live one's `stalled`).
+SUMMARY_FAILED_ROW_RE='^\|[^|]*Code Review[^|]*\| *⚠️ \*\*Failed\*\* <relative-time datetime="(?<at>[^"]+)">[^<|]*</relative-time> *\| *`(?<sha>[0-9a-f]{7,40})` *\|'
 # The stamp of any summary-table row, whatever its status: the relative-time's datetime and the
 # commit cell after it. status_state reads it three times — the Running rows, the newest summary's
 # Code Review rows for the 👍 path's fourth field, and the same rows again to find the one
 # SUMMARY_COMPLETED_ROW_RE is tried on — and the three must date a row identically, or the newest
 # row one reader finds is not the one another does.
 SUMMARY_ROW_STAMP_RE='datetime="(?<at>[^"]+)"[^|]*\| *`(?<sha>[0-9a-f]{7,40})` *\|'
+# How the two readers that pick the NEWEST row (the 👍 path's fourth field and the Completed/Failed
+# read) order the stamps: as instants, not as the strings the app writes. The app writes six
+# fractional digits, but a whole-second "...:25Z" sorts AFTER "...:25.123Z" as a string, so a row
+# written without a fraction would be taken for newer than one written later in the same second
+# (review of #465, round 3). Padded to nine fractional digits, the string order is the time order;
+# both readers use this one definition, so they cannot disagree about which row is the newest.
+SUMMARY_ROW_INSTANT_DEF='def instant: sub("Z$"; "") | (if test("\\.") then . else . + "." end) + "000000000" | .[0:29];'
 
 # ISO 8601 UTC timestamps sort correctly as plain strings, which is why every comparison below is a
 # string comparison: no date(1) is involved, whose parsing flags differ between BSD and GNU.
@@ -1502,7 +1523,8 @@ fmt_age() {
 #   approved  👍 is on the PR and is not older than the head (#418, below): the merge gate is open.
 #   reviewing 👀 is newer than the reviewer's last word, so a round really is in flight.
 #   stalled   ... and it has been in flight longer than any round takes; nothing is coming.
-#   failed    the reviewer's newest word is the INITIALIZATION failure above: the round never ran.
+#   failed    the reviewer's newest word is the INITIALIZATION failure above: the round never ran —
+#             or its summary marks the head's run Failed with no review and no 👍 (#453, below).
 #   expected  no live 👀 and no review of the head SHA: a round is due and has not started. A 👍
 #             left from before the head arrived is such a head's state too, not an approval.
 #   idle      the reviewer has reviewed this exact head and left no 👍, so the next move is yours.
@@ -1606,7 +1628,7 @@ status_state() {
   local running_at evidence evidence_kind evidence_at running_unread vline verd_at verd_sha mstate="-" head_err="" pr_created=""
   local reviews_raw="[]" comments_raw="[]" fline fail_at fail_ref fail_kind fail_head rev_head_at nudge_at="" nudge_age nudge_id="" nudge_line comments_loaded=false
   local reviews_loaded=false head_loaded=false head_at_read=false row_sha stale_plus_at="" stale_note=""
-  local done_line done_at done_sha
+  local done_line done_kind done_at done_sha req_line req_after req_before floor
 
   raw=$(api_list "issues/$pr/reactions?per_page=100") || {
     echo "unknown|-|-|the reactions API did not answer ($(gh_err_line))"
@@ -1667,7 +1689,7 @@ status_state() {
     state_head_read "$pr"
     head_loaded=true
     evidence=$(jq -rs --arg rev "$REVIEWER" --arg head "$head_sha" --arg rc "$REVIEWED_COMMIT_RE" \
-      --arg stamp "$SUMMARY_ROW_STAMP_RE" '
+      --arg stamp "$SUMMARY_ROW_STAMP_RE" "$SUMMARY_ROW_INSTANT_DEF"'
       .[0] as $comments | .[1] as $reviews |
       def reviewer: select((.user.login // "") | startswith($rev));
       def current: select(.sha != "" and $head != "")
@@ -1699,7 +1721,7 @@ status_state() {
                | [capture($stamp)] | first]
          end) as $rows |
       (if ($rows | length) == 0 or any($rows[]; . == null) then ""
-       else $rows | max_by(.at) | .sha end) as $row_sha |
+       else $rows | max_by(.at | instant) | .sha end) as $row_sha |
       [($running[] | select(. != null) | . + {kind:"running"}),
        ($reviews[] | reviewer | select(.submitted_at != null)
          | {sha:(.commit_id // ""), at:.submitted_at, kind:"findings"}),
@@ -1891,8 +1913,10 @@ status_state() {
   verd_at="${vline%%|*}"
   verd_sha="${vline#*|}"
   # The round the summary table says is done (#439): its newest Code Review row, when that row is
-  # the Completed shape SUMMARY_COMPLETED_ROW_RE allows. Read like the 👍 path's fourth field: the
-  # rows of the NEWEST summary comment only, and none at all when any Code Review row there is one
+  # the Completed shape SUMMARY_COMPLETED_ROW_RE allows — or the run it says FAILED (#453), when it
+  # is the SUMMARY_FAILED_ROW_RE shape instead; the first field says which. Read like the 👍
+  # path's fourth field: the rows of the NEWEST summary comment only, and none at all when any
+  # Code Review row there is one
   # the stamp pattern cannot date — no row can then be called the newest, and an older summary is
   # never consulted in its place. The newest row is found by the same stamp the 👍 path reads, and
   # must then ALSO match the allowlist, the two patterns applied to the same line: one that dates a
@@ -1901,24 +1925,29 @@ status_state() {
   # otherwise leave a 👍 standing; here the fallback approves nothing). Whether it is a verdict for
   # the head, and for this round, is decided below, once the head is known.
   done_line=$(jq -r --arg rev "$REVIEWER" --arg done "$SUMMARY_COMPLETED_ROW_RE" \
-      --arg stamp "$SUMMARY_ROW_STAMP_RE" '
+      --arg failed "$SUMMARY_FAILED_ROW_RE" --arg stamp "$SUMMARY_ROW_STAMP_RE" "$SUMMARY_ROW_INSTANT_DEF"'
       [.[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | contains("codex-pull-request-review-summary"))]
       | max_by(.updated_at // .created_at)
-      | if . == null then "|"
+      | if . == null then "||"
         else [(.body // "") | split("\n")[]
               | select(test("^\\|[^|]*Code Review[^|]*\\|"))
               | . as $row
               | [capture($stamp)] | first
               | if . == null then null else {at, row: $row} end]
-          | if length == 0 or any(.[]; . == null) then "|"
-            else max_by(.at) | [.row | capture($done)] | first
-              | if . == null then "|" else "\(.at | sub("\\.[0-9]+Z$"; "Z"))|\(.sha)" end
+          | if length == 0 or any(.[]; . == null) then "||"
+            else max_by(.at | instant) | ([.row | capture($done)] | first) as $c
+              | ([.row | capture($failed)] | first) as $f
+              | if $c != null then "completed|\($c.at | sub("\\.[0-9]+Z$"; "Z"))|\($c.sha)"
+                elif $f != null then "failed|\($f.at | sub("\\.[0-9]+Z$"; "Z"))|\($f.sha)"
+                else "||" end
             end
         end' <<<"$raw" 2>/dev/null) || {
     echo "unknown|-|$mstate|the summary comments feed did not parse"
     return 0
   }
+  done_kind="${done_line%%|*}"
+  done_line="${done_line#*|}"
   done_at="${done_line%%|*}"
   done_sha="${done_line#*|}"
   # The initialization failure (INIT_FAILURE_RE above). Only the NEWEST non-placeholder comment is
@@ -2006,7 +2035,7 @@ status_state() {
   #     submits its review 2-4 s BEFORE the row flips (see the read order above), so it would call
   #     every findings round clean. Anything the reviewer said inside the round disqualifies it,
   #     which leaves such a round to the arms below (`idle` on a review of this head).
-  if [ -n "$done_sha" ] && [ -n "$head_sha" ] && [ -n "$eyes_at" ] && [[ "$done_at" > "$eyes_at" ]] &&
+  if [ "$done_kind" = completed ] && [ -n "$done_sha" ] && [ -n "$head_sha" ] && [ -n "$eyes_at" ] && [[ "$done_at" > "$eyes_at" ]] &&
     { [ -z "$last_spoke" ] || [[ "$last_spoke" < "$eyes_at" ]]; }; then
     case "$head_sha" in
     "$done_sha"*)
@@ -2015,6 +2044,100 @@ status_state() {
       return 0
       ;;
     esac
+  fi
+
+  # A reviewer RUN the summary table marks Failed on the CURRENT head (#453): the app took the
+  # head up and its run ended without a round — no review, no 👍 — so nothing is coming, and a
+  # '@codex review' re-request is the move. That request is safe to make exactly when there is no
+  # approval for it to clear (the danger the never-re-request-as-stall-recovery rule is about), so
+  # the reading requires that, each fail-closed; anything else keeps the reading status gave
+  # before this row was read (the observed case, ocannl-staging#633, read `expected` there):
+  #   - the row is the allowlisted Failed shape, newest in the newest summary, naming the head,
+  #     and its datetime is one age_of reads, not in the future: the comparisons below are string
+  #     orderings, and a malformed or future stamp would order an old failure above a newer 👀;
+  #   - no 👍 on the PR at all, standing or stale;
+  #   - the row is newer than a pending request (a watch's nudge) and than any 👀 — a 👀 above it
+  #     is a round started after the failure, which the in-flight arm below waits out — and no
+  #     '@codex review' has been posted since the row: a request after it has answered it. The
+  #     row's stamp is cut to whole seconds, as the comments' are served, so a request in the
+  #     row's own second counts as after it — pending, never a second failure's cause;
+  #   - the reviewer said nothing inside the run: with a 👀 up, nothing since that 👀 (a findings
+  #     round submits its review seconds BEFORE its row flips, see the read order above, so
+  #     "nothing after the row" would be the wrong test); with the 👀 taken down — the app takes
+  #     it down when a run ends, and #633 had none — no review of this head at all, and nothing
+  #     newer than the row. An initialization-failure comment posted with the row (#465: one second
+  #     BEFORE it) is the same failed run, not a word against it: the row, being newer, is read,
+  #     and the init-failure arm below keeps the failures that come with no row.
+  # The kind says whether this head has had a request before: `run` when no '@codex review' was
+  # posted between the head's arrival and the row, `run-again` when one was, so the failure is
+  # the answer to a request already made. `watch` re-requests on `run` and surfaces `run-again`,
+  # which is what makes its re-request once per head across watches, not per process. The
+  # arrival is the newest of the head commit's date and the PR's creation (the review clock's
+  # bounds), inclusive, since a request in the arrival's own second is on this head as likely as
+  # not; with neither readable every request on the PR counts, so an unreadable clock can only
+  # suppress a re-request, never add one. The committer date is commit metadata, not the push
+  # (which is no API field, #72), and its two misses are priced, not closed (review of #465, round
+  # 4): a reset to an OLDER commit dates the head before requests made for its predecessor, so a
+  # first failure reads `run-again` and is surfaced to the caller, loudly; a commit dated AFTER a
+  # request it was pushed before (an explicit GIT_COMMITTER_DATE) can cost one duplicate request
+  # on a run with no approval, never a cleared 👍. Requests are matched loosely, any non-reviewer
+  # comment carrying "@codex review", for the same reason: a looser match only surfaces sooner.
+  if [ "$done_kind" = failed ] && [ -n "$done_sha" ] && [ -n "$head_sha" ] && [ "$plus" != true ] &&
+    [ "$(age_of "$done_at")" != - ] &&
+    review_after_nudge "$done_at" "$nudge_at" && { [ -z "$eyes_at" ] || [[ "$eyes_at" < "$done_at" ]]; }; then
+    case "$head_sha" in
+    "$done_sha"*)
+      if [ -n "$eyes_at" ]; then
+        { [ -z "$last_spoke" ] || [[ "$last_spoke" < "$eyes_at" ]]; } || done_kind=""
+      else
+        { [ -z "$last_spoke" ] || [[ "$last_spoke" < "$done_at" ]]; } || done_kind=""
+        rev_head_at=$(jq -r --arg rev "$REVIEWER" --arg sha "$head_sha" '
+            [.[] | select((.user.login // "") | startswith($rev))
+                 | select(.submitted_at != null) | select((.commit_id // "") == $sha)
+                 | .submitted_at] | max // ""' <<<"$reviews_raw" 2>/dev/null) || {
+          echo "unknown|-|$mstate|the reviews feed did not parse for the failed run's head"
+          return 0
+        }
+        [ -z "$rev_head_at" ] || done_kind=""
+      fi
+      ;;
+    *) done_kind="" ;;
+    esac
+  else
+    done_kind=""
+  fi
+  if [ "$done_kind" = failed ]; then
+    if [ "$head_at_read" != true ]; then
+      head_at=$(gh_retry read api "repos/$REPO/commits/$head_sha" --jq .commit.committer.date) ||
+        head_at=""
+      head_at_read=true
+    fi
+    floor=""
+    [ "$(age_of "$head_at")" = - ] || floor="$head_at"
+    [ -z "$pr_created" ] || [ "$(age_of "$pr_created")" = - ] || floor=$(newest "$floor" "$pr_created")
+    req_line=$(jq -r --arg rev "$REVIEWER" --arg row "$done_at" --arg floor "$floor" '
+        [.[] | select((.user.login // "") | startswith($rev) | not)
+             | select((.body // "") | test("@codex[[:space:]]+review"; "i"))
+             | .created_at // ""]
+        | "\(any(.[]; . >= $row))|\([.[] | select(. >= $floor and . < $row)] | max // "")"' \
+      <<<"$comments_raw" 2>/dev/null) || {
+      echo "unknown|-|$mstate|the review-request comments feed did not parse"
+      return 0
+    }
+    req_after="${req_line%%|*}"
+    req_before="${req_line#*|}"
+    if [ "$req_after" != true ]; then
+      if [ -n "$req_before" ]; then
+        echo "failed|$(age_of "$done_at")|$mstate|${head_sha:0:7}|run-again|$REVIEWER's summary marks" \
+          "head ${head_sha:0:7}'s Code Review Failed at $done_at, after the '@codex review' request" \
+          "at $req_before on this head, with no review of it and no 👍"
+      else
+        echo "failed|$(age_of "$done_at")|$mstate|${head_sha:0:7}|run|$REVIEWER's summary marks" \
+          "head ${head_sha:0:7}'s Code Review Failed at $done_at, with no review of it, no 👍, and" \
+          "no '@codex review' on it since it arrived"
+      fi
+      return 0
+    fi
   fi
 
   # In flight only while the 👀 is newer than everything the reviewer has said. An empty last_spoke
@@ -2262,6 +2385,24 @@ status_line() {
     fkind="${frest%%|*}"
     frest="${frest#*|}"
     case "$fkind" in
+    # A run the summary marks Failed (#453). The re-request is the move, and it is safe here as it
+    # is nowhere else: the state requires no 👍 on the PR and nothing from the reviewer about the
+    # run, so the request has no approval to clear. `watch` makes it itself, once per head;
+    # `run-again` is that request answered by a second failure, and is the caller's.
+    run)
+      echo "reviewer's run FAILED on head $fsha — no review and no 👍, so a '@codex review'" \
+        "re-request clears nothing: \`watch\` posts it itself, once per head, and keeps" \
+        "watching; outside a watch, post it (pr-review.sh comment $REPO#${PR_NUM:-<pr>}" \
+        "'@codex review'). This is not a round — $frest, standing for" \
+        "$(fmt_age "$age")${conflict:+; $conflict}"
+      ;;
+    run-again)
+      echo "reviewer's run FAILED AGAIN on head $fsha after a '@codex review' request on it — not" \
+        "re-requested a second time: read the PR feed (retry --read pr view <pr> --comments) for" \
+        "anything the reviewer said, then push a new head (an amend suffices: git commit --amend" \
+        "--no-edit && git push --force-with-lease) or hand it to the maintainer. This is not a" \
+        "round — $frest, standing for $(fmt_age "$age")${conflict:+; $conflict}"
+      ;;
     env)
       echo "reviewer FAILED at initialization on head $fsha — nudge it once with a '@codex review'" \
         "comment (pr-review.sh comment $REPO#${PR_NUM:-<pr>} '@codex review'); the connector" \
@@ -3087,6 +3228,19 @@ watch_grace_deadline() {
 # the one that runs on a box routinely, so the start of one is the natural place to notice what a
 # SIGKILLed run — a watch, a gh call, a fixture suite — left in TMPDIR. It sweeps every family,
 # not just the snapshot's (ludics-lite#219); see tmp_sweep_stale for why that is safe.
+# The watch's one write, ATTEMPTED ONCE. gh_retry's write policy re-sends on a gateway refusal
+# (502/503/504), on the premise that such a refusal did not land; a caller running `comment` by
+# hand reads the outcome and decides, but an automatic request re-sent after a refusal that did
+# land is a second review run nobody asked for (review of #465, round 4). So any failure is
+# reported back as one that may have landed, and the caller reads the PR before posting by hand.
+watch_post_request() { # <pr>
+  local API_ATTEMPTS=1
+  gh_retry write api -X POST "repos/$REPO/issues/$1/comments" \
+    -f body="@codex review
+
+_🤖 Addressed by an automated coding agent_" --jq .html_url >/dev/null
+}
+
 cmd_watch() {
   local rc=0
   tmp_sweep_stale
@@ -3102,6 +3256,7 @@ watch_loop() {
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"
   local start=$SECONDS was state tok age quiet=0 saw=0 blind=0 past_seen=0 past_last=""
   local watch_nudge_after extension_end="" candidate_end candidate_kind extension_kind="" extension_mark="" remaining pause elapsed final_state last_healthy_mark="$mark"
+  local fkind fsha rerequested="" rerequest_end=""
   watch_nudge_after=$(mark_of "$mark" 2)
 
   state=$(status_state "$pr")
@@ -3125,6 +3280,23 @@ watch_loop() {
     # reporting it (ludics-lite#289) — the read is made on the round that ends, never on the rest.
     state=$(gated_state "$pr")
     tok=$(state_tok "$state")
+    # A failed run this watch is about to re-request (the `failed` arm below) is read again, fresh:
+    # the round's state came from its snapshot, and a push or a 👍 landing since would make the
+    # post request the wrong head or clear the approval (review of #465). The fresh read REPLACES
+    # the round's state, so whatever it says — an approval, a new head's due round, an unreadable
+    # state — goes through this round's ordinary handling and deadlines, and the arm posts only
+    # on a state read after the round. The seconds between this read and the POST remain: GitHub
+    # has no conditional comment write, and the next round reads whatever landed in them.
+    if [ "$tok" = failed ]; then
+      fkind=$(state_detail "$state" | cut -d'|' -f1-2)
+      if [ "${fkind#*|}" = run ] && [ "$rerequested" != "${fkind%%|*}" ]; then
+        snapshot_drop
+        state=$(gated_state "$pr")
+        tok=$(state_tok "$state")
+        [ "$(state_detail "$state" | cut -d'|' -f1-2)" = "$fkind" ] ||
+          warn "PR $REPO#$pr: not re-requesting the failed run on ${fkind%%|*} — a fresh read says: $(status_line "$state")"
+      fi
+    fi
     age=$(state_age "$state")
     if [ "$tok" != unknown ]; then
       # The first negative read still holds the live round: only the second
@@ -3171,12 +3343,61 @@ watch_loop() {
       return $?
       ;;
     failed)
-      # Nothing is running and nothing will start on its own: the reviewer said it could not fetch
-      # the head. Exiting here rather than falling into the `expected` arm below is the whole
-      # point of the state — that arm would hold the window and then hold the grace out (three
-      # times over, on ocannl-staging#677) before recommending the nudge this prints now.
-      watch_end "$pr" "$tok" ""
-      return $?
+      # A run the summary marks Failed, on a head nobody has re-requested since it arrived (#453):
+      # the one state this loop answers itself, because the request has no approval to clear (see
+      # status_state). One post per head per process — a comments feed that has not caught up with
+      # the post yet reads `run` again, and is polled, not re-posted — and across processes the
+      # request itself is the record: once it is on the PR, a second failure reads `run-again`,
+      # which falls through to the exit below. The request is then this watch's pending nudge
+      # (its id is past the incoming watermark), so the next rounds read `nudged` and its grace.
+      # Two watches on one PR at the same moment can each post one: the record is only as fresh
+      # as the reads, and GitHub has no conditional comment write (review of #465, round 3,
+      # rebutted). That costs a duplicate request on a run with no approval — one extra run,
+      # never a cleared 👍 — and ship-pr runs one watch per PR.
+      fkind=$(state_detail "$state")
+      fsha="${fkind%%|*}"
+      fkind="${fkind#*|}"
+      fkind="${fkind%%|*}"
+      if [ "$fkind" = run ] && [ "$rerequested" != "$fsha" ]; then
+        # This state is the fresh one read above, right after the round's.
+        if watch_post_request "$pr"; then
+          rerequested="$fsha"
+          # The request's grace is this watch's to wait out, from now: the deadline the round
+          # computed was the `failed` state's, which has none, and a failure first seen on the
+          # window's last poll would otherwise end it before the request is ever read back.
+          rerequest_end=$((SECONDS + GRACE))
+          candidate_end="$rerequest_end"
+          candidate_kind=nudged
+          warn "PR $REPO#$pr: re-requested the review with '@codex review' — the run on head" \
+            "$fsha failed with no review and no 👍 to clear; watching for the new round"
+        else
+          # Not posted, or not known to be: the caller decides, with the error in hand.
+          watch_drift_note "$pr"
+          echo "the '@codex review' re-request for the failed run on head $fsha did not go" \
+            "through ($(gh_err_line)) — read the PR's comments before posting it by hand," \
+            "since a request that failed ambiguously may have landed"
+          echo "status: $(status_line "$state")"
+          echo "watermark: $mark"
+          return 0
+        fi
+        was="$tok"
+        quiet=0
+      elif [ "$fkind" = run ]; then
+        # Posted already, and the feed has not caught up with it yet: poll, do not post again —
+        # and keep the request's deadline, which this round's `failed` read has just cleared.
+        candidate_end="$rerequest_end"
+        candidate_kind=nudged
+        was="$tok"
+        quiet=0
+      else
+        # Nothing is running and nothing will start on its own: the reviewer said it could not
+        # fetch the head, or its run failed again after a request. Exiting here rather than
+        # falling into the `expected` arm below is the whole point of the state — that arm would
+        # hold the window and then hold the grace out (three times over, on ocannl-staging#677)
+        # before recommending the nudge this prints now.
+        watch_end "$pr" "$tok" ""
+        return $?
+      fi
       ;;
     *)
       # A 👀 that stops being in flight without a review of the head is a round that ended with

@@ -836,7 +836,13 @@ Code Review row Completed on the head, newer than the 👀, with nothing posted 
 naming an older head, a findings review inside the round (before the row flips, as the app posts
 them, or after), a row older than the 👀 or no 👀 at all, a spent 👀 under a pending request, and
 a status cell or table outside the allowlisted shape; the comments are read before the reviews,
-and an open thread under it is `unresolved`. `test-pr-review-watch.sh` runs PR #277's two-head shape through a watch
+and an open thread under it is `unresolved`. A run the summary marks Failed is one to re-request
+(ludics-lite#453): ocannl-staging#633's verbatim row on the head, with no review, no 👍 and nothing
+said inside the run, reads `failed` (kind `run`) where it read `expected`, and `watch` posts one
+`@codex review` and waits out its grace; a `@codex review` already on the head makes it
+`run-again`, which `watch` surfaces unposted, as it does a request that did not post. Its controls
+keep the old reading: another head's row, any 👍, a review of the head or one inside the 👀, a 👀
+above the row, a request after it, and a row outside the observed shape. `test-pr-review-watch.sh` runs PR #277's two-head shape through a watch
 (findings on the previous head scrolled past as NOT about head, the 👍 on the head above it), and
 `test-pr-review-merge.sh` pins `merge` refusing on an open thread (exit 1, no flag bypassing it)
 and on an unread connection (exit 3), with one read per merge attempt, so a thread opened
@@ -1073,7 +1079,10 @@ arbitrary ones); the status,
 conclusion, mergeable-state and review-state vocabularies; that a merged PR's `.base.sha` is a
 snapshot standing behind the merge's first parent (anchored on #53); and the reviewer feeds' shapes
 (the `[bot]` suffix, the `+1` approval, `COMMENTED` rounds, the summary tag, 30-per-page
-pagination) anchored on #39. `.github/workflows/api-contract.yml` runs it daily, on demand, and on a pull request that
+pagination) anchored on #39; and, over the newest 60 merged PRs, that every summary Code Review row
+is a shape `status_state` reads (Completed, Failed, Running) and that a findings review is
+submitted before its row flips to Completed, the order the #439 reading rests on (#453).
+`.github/workflows/api-contract.yml` runs it daily, on demand, and on a pull request that
 changes the contract itself; a scheduled failure opens (or comments on) one issue rather than
 failing silently, from a second job that checks nothing out, so the job that runs a pull request's
 version of the script holds a read-only token. A belief that needs a state this repository does not

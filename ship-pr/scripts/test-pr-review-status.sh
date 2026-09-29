@@ -53,6 +53,13 @@ THREADS_JSON='[]'
 THREADS_FIXTURE_PAGE=""
 THREADS_FIXTURE_TOTAL=""
 FAIL_GRAPHQL=""
+# A comment POST refusing (a watch's re-request of a failed run, #453). What does post is kept in
+# $TEST_ROOT/posted, one comment per line, and served back by the comments read after it.
+FAIL_POST=""
+# A 👍 landing mid-watch: from this reactions read on (counted from the case's reset), the feed
+# answers REACTIONS_JSON plus a 👍 — how a case puts one between a round's read and the write
+# that round decided on.
+THUMBS_ON_REACTIONS_READ=""
 # The base's tip, and the head PUSH_ON_REVIEWS_READ swaps in. With HEAD_SHA these are the only
 # SHAs the transport below spells out, so a case that needs a new head just sets HEAD_SHA.
 BASE_SHA=base-sha
@@ -81,7 +88,9 @@ reset_fixture() {
   THREADS_FIXTURE_PAGE=""
   THREADS_FIXTURE_TOTAL=""
   FAIL_GRAPHQL=""
-  rm -f "$TEST_ROOT/pushed" "$TEST_ROOT"/nth.*
+  FAIL_POST=""
+  THUMBS_ON_REACTIONS_READ=""
+  rm -f "$TEST_ROOT/pushed" "$TEST_ROOT/posted" "$TEST_ROOT"/nth.*
   : >"$REQUEST_LOG"
 }
 
@@ -153,10 +162,15 @@ fixture_head() { # <sha>
 # here: the PR read asks gh to format its head/mergeability snapshot. --paginate is ignored (one
 # page is the whole feed).
 gh() {
-  local response="" spec left right
+  local response="" spec left right posted
   gh_fixture_parse "$@"
   case "$FIXTURE_ENDPOINT" in
-  "repos/$REPO/issues/7/reactions?per_page=100") response="$REACTIONS_JSON" ;;
+  "repos/$REPO/issues/7/reactions?per_page=100")
+    fixture_nth reactions
+    response="$REACTIONS_JSON"
+    [ -z "$THUMBS_ON_REACTIONS_READ" ] || [ "$FIXTURE_NTH" -lt "$THUMBS_ON_REACTIONS_READ" ] ||
+      response=$(jq -c --argjson r "$(reaction +1 "$(jq -rn 'now | todate')")" '. + [$r]' <<<"$response")
+    ;;
   "repos/$REPO/pulls/7/reviews?per_page=100")
     # The simulated push: gh runs in a subshell, so the "new head" travels through a file that
     # the PR read below consults.
@@ -164,7 +178,25 @@ gh() {
     [ "$PUSH_ON_REVIEWS_READ" != "$FIXTURE_NTH" ] || : >"$TEST_ROOT/pushed"
     response="$REVIEWS_JSON"
     ;;
-  "repos/$REPO/issues/7/comments?per_page=100") response="$COMMENTS_JSON" ;;
+  "repos/$REPO/issues/7/comments?per_page=100")
+    response="$COMMENTS_JSON"
+    [ ! -s "$TEST_ROOT/posted" ] ||
+      response=$(jq -c --slurpfile p "$TEST_ROOT/posted" '. + $p' <<<"$response")
+    ;;
+  "repos/$REPO/issues/7/comments")
+    [ "$FIXTURE_METHOD" = POST ] || bail "unexpected ${FIXTURE_METHOD:-GET} on $FIXTURE_ENDPOINT"
+    if [ -n "$FAIL_POST" ]; then
+      echo "gh: HTTP 502: Bad Gateway" >&2
+      return 1
+    fi
+    # Ids above every fixture comment's, dated now, as GitHub numbers and dates a new comment.
+    posted=0
+    [ ! -e "$TEST_ROOT/posted" ] || posted=$(($(wc -l <"$TEST_ROOT/posted")))
+    jq -cn --argjson id "$((900 + posted))" \
+      --arg b "$FIXTURE_BODY" --arg at "$(jq -rn 'now | todate')" \
+      '{id:$id, user:{login:"me"}, created_at:$at, updated_at:$at, body:$b}' >>"$TEST_ROOT/posted"
+    response='{"html_url":"https://github.com/example/repo/pull/7#issuecomment-900"}'
+    ;;
   "repos/$REPO/pulls/7/comments?per_page=100")
     if [ -n "$FAIL_INLINE_FEED" ]; then
       echo "gh: 503 No server is currently available to service your request" >&2
@@ -1472,8 +1504,275 @@ test_a_broken_jq_program_is_unknown_on_the_completed_row_read() {
   completed_fixture
   run_status
   assert_eq "$(state_tok "$STATE")" approved "control: this fixture reaches the Completed-row read"
-  assert_unknown_when_broken 'max_by(.at) | [.row' \
+  assert_unknown_when_broken 'max_by(.at | instant) | ([.row' \
     "the summary comments feed did not parse" "the Completed-row read"
+}
+
+# --- a reviewer run the summary marks Failed (ludics-lite#453) ----------------------------------
+# lukstafi/ocannl-staging#633, 2026-09-04: the last findings review on 8c090d3 at 22:24:34Z, head
+# 1e14b13 committed at 22:46:29Z, and the summary's Code Review row "⚠️ Failed" on it at
+# 22:47:25Z — no review of it, no 👍, no 👀 left up. The row below is that comment's, verbatim.
+FAILED_RUN_HEAD=1e14b1368a51d19726b17bb6d2a6e557680d0b4b
+FAILED_RUN_ROW='| 📝 **Code Review** | ⚠️ **Failed** <relative-time datetime="2026-09-04T22:47:25.387018Z">2026-09-04T22:47:25.387018Z</relative-time> | `1e14b13` | New commits |'
+
+failed_run_summary() { # <id> <row>
+  plain_comment "$1" 2026-09-04T22:47:26Z "<!-- codex-pull-request-review-summary -->
+
+## Codex Review Summary
+
+This comment shows the latest Codex review activity on this pull request.
+
+| Review | Status | Commit | Review trigger |
+| --- | --- | --- | --- |
+$2"
+}
+
+failed_run_fixture() {
+  reset_fixture
+  HEAD_SHA="$FAILED_RUN_HEAD"
+  HEAD_AT=2026-09-04T22:46:29Z
+  REVIEWS_JSON="[$(review 5 8c090d3000000000000000000000000000000000 2026-09-04T22:24:34Z)]"
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW")]"
+}
+
+# A request comment from the caller, as `comment` posts one.
+request_comment() { # <id> <created_at>
+  jq -cn --argjson id "$1" --arg at "$2" \
+    '{id:$id, user:{login:"me"}, created_at:$at, updated_at:$at,
+      body:"@codex review\n\n_🤖 Addressed by an automated coding agent_"}'
+}
+
+test_a_failed_run_on_the_head_is_a_failed_state() {
+  failed_run_fixture
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "a run the summary marks Failed on the head is not a round that is due"
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run "and nobody has re-requested it on this head"
+  assert_contains "$LINE" "reviewer's run FAILED on head 1e14b13 — no review and no 👍" \
+    "the line names the state, the head, and why a re-request is safe"
+  assert_contains "$LINE" "\`watch\` posts it itself, once per head" "and who makes it"
+  assert_contains "$LINE" "Failed at 2026-09-04T22:47:25Z" "the row it rests on"
+  assert_not_contains "$LINE" "review EXPECTED" "the reading #633 had before"
+  run_cmd_status
+  assert_eq "$CMD_RC" 0 "a state that was READ is exit 0"
+  assert_contains "$CMD_OUT" "review rounds with findings: 1 of 12" "the failed run is not a round"
+  # ludics-lite#462's row, 2026-09-29, read back from the summary's edit history (the app has since
+  # rewritten it): the same shape, on a PR's opening round.
+  COMMENTS_JSON="[$(failed_run_summary 1 '| 📝 **Code Review** | ⚠️ **Failed** <relative-time datetime="2026-09-29T17:40:02.163602Z">2026-09-29T17:40:02.163602Z</relative-time> | `1e14b13` | PR opened |')]"
+  run_status
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run "#462's row reads as the same failed run"
+  failed_run_fixture
+  # A 👀 left up under the row, with nothing said since it, is the same failed run.
+  REACTIONS_JSON="[$(reaction eyes 2026-09-04T22:46:40Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "a 👀 older than the row, silent since, bounds the same run"
+}
+
+# Each control keeps the reading status gave before the row was read.
+test_a_failed_run_needs_the_head_and_no_approval() {
+  failed_run_fixture
+  COMMENTS_JSON="[$(failed_run_summary 1 "${FAILED_RUN_ROW//1e14b13/8c090d3}")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a Failed row naming another head is not this head's run"
+  failed_run_fixture
+  REACTIONS_JSON="[$(reaction +1 2026-09-04T22:30:00Z)]"
+  run_status
+  assert_not_contains "$(state_tok "$STATE")" failed "with a 👍 on the PR the re-request could clear it"
+  # And a 👍 a pending request has superseded is still a 👍 on the PR.
+  local watch_nudge_after=1
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(request_comment 2 2026-09-04T22:40:00Z)]"
+  run_status
+  assert_not_contains "$(state_tok "$STATE")" failed "nor a 👍 older than a pending request"
+}
+
+test_a_failed_run_needs_a_silent_reviewer() {
+  failed_run_fixture
+  REVIEWS_JSON="[$(review 6 "$FAILED_RUN_HEAD" 2026-09-04T22:47:22Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "a review of the head, with no 👀 to bound the run, is not a silent run"
+  # With a 👀 up: a review inside the run, before the row flips as a findings round's does.
+  REACTIONS_JSON="[$(reaction eyes 2026-09-04T22:46:40Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "a review between the 👀 and the row is the reviewer speaking"
+  # A 👀 newer than the row is a round started after the failure.
+  failed_run_fixture
+  REACTIONS_JSON="[$(reaction eyes "$(jq -rn '(now - 60) | todate')")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" reviewing "a 👀 above the row is a round to wait out"
+  # A reviewer comment after the row is its newer word.
+  failed_run_fixture
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(failure_comment 2 "$FAILED_RUN_HEAD" 2026-09-04T22:50:00Z)]"
+  run_status
+  assert_contains "$LINE" "reviewer FAILED at initialization" "the newer word is the one read"
+}
+
+test_a_failed_run_counts_the_requests_on_its_head() {
+  failed_run_fixture
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(request_comment 2 2026-09-04T22:47:00Z)]"
+  run_status
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run-again "a failure answering a request on this head"
+  assert_contains "$LINE" "reviewer's run FAILED AGAIN on head 1e14b13" "is surfaced, not re-requested"
+  assert_contains "$LINE" "request at 2026-09-04T22:47:00Z" "naming the request it answers"
+  # A request in the head commit's own second counts as on it: the clock cannot say otherwise.
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(request_comment 2 "$HEAD_AT")]"
+  run_status
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run-again "a request at the arrival's own second"
+  # A request from before the head's commit was about an earlier head.
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(request_comment 2 2026-09-04T22:40:00Z)]"
+  run_status
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run "a request before the head arrived is not on it"
+  # With no readable arrival, every request counts: the clock can only suppress a re-request.
+  HEAD_AT=""
+  run_status
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run-again "an unread commit date counts every request"
+  HEAD_AT=2099-01-01T00:00:00Z
+  run_status
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run-again "and so does one in the future"
+  # A request in the row's own second is after it (the row's stamp is cut to whole seconds, and
+  # the comment's is served that way): pending, not the cause of a second failure.
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(request_comment 2 2026-09-04T22:47:25Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a request in the row's second is not read as answered by it"
+  # A request after the row has answered it: the round it asked for is due.
+  failed_run_fixture
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(request_comment 2 2026-09-04T22:50:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a failure already re-requested is not re-requested again"
+  local watch_nudge_after=1
+  run_status
+  assert_eq "$(state_tok "$STATE")" nudged "and inside a watch it is that request's grace"
+}
+
+# ludics-lite#465, this reading's own PR, 2026-09-29: head d208deb committed 17:53:20Z, the
+# connector's missing-environment answer at 18:08:06Z, a '@codex review' at 18:08:34Z, then a
+# "Something went wrong" naming d208deb at 18:09:10Z and the row flipping to Failed ("Manual
+# request") one second later. The comment posted with the row is the same failed run.
+test_a_failed_run_posted_with_an_initialization_failure() {
+  reset_fixture
+  HEAD_SHA=d208debe08508c6ffe2c5c6f2a12466225832581
+  HEAD_AT=2026-09-29T17:53:20Z
+  local row='| 📝 **Code Review** | ⚠️ **Failed** <relative-time datetime="2026-09-29T18:09:11.056100Z">2026-09-29T18:09:11.056100Z</relative-time> | `d208deb` | Manual request |'
+  COMMENTS_JSON="[$(plain_comment 1 2026-09-29T18:08:06Z "$ENV_FAILURE_BODY"),$(request_comment 2 2026-09-29T18:08:34Z),$(
+    failed_run_summary 3 "$row"),$(failure_comment 4 "$HEAD_SHA" 2026-09-29T18:09:10Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "the run failed"
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run-again "after the request made on this head"
+  # The same row and comment on a head nobody re-requested: the run, to re-request.
+  COMMENTS_JSON="[$(failed_run_summary 3 "$row"),$(failure_comment 4 "$HEAD_SHA" 2026-09-29T18:09:10Z)]"
+  run_status
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run "the comment posted with the row does not disqualify it"
+  # A failure comment AFTER the row is the reviewer's newer word, and its own arm reads it.
+  COMMENTS_JSON="[$(failed_run_summary 3 "$row"),$(failure_comment 4 "$HEAD_SHA" 2026-09-29T18:09:30Z)]"
+  run_status
+  assert_contains "$LINE" "reviewer FAILED at initialization" "a later comment is read by its own arm"
+}
+
+test_a_failed_row_outside_the_allowlist_is_not_read() {
+  local row
+  for row in "${FAILED_RUN_ROW/⚠️/⚠}" "${FAILED_RUN_ROW/⚠️/❌}" "${FAILED_RUN_ROW/Failed/Error}" \
+    "${FAILED_RUN_ROW/\*\*Failed\*\*/Failed}"; do
+    failed_run_fixture
+    COMMENTS_JSON="[$(failed_run_summary 1 "$row")]"
+    run_status
+    assert_eq "$(state_tok "$STATE")" expected "a failure row outside the observed shape keeps the old reading: $row"
+  done
+  # Review of #465, round 3: the newest row is found by instant, not by string. A whole-second
+  # Failed stamp sorts after a later fractional one in the same second as a string, and would be
+  # taken for the newest over a Running row that superseded it.
+  failed_run_fixture
+  COMMENTS_JSON="[$(failed_run_summary 1 "${FAILED_RUN_ROW//2026-09-04T22:47:25.387018Z/2026-09-04T22:47:25Z}
+| 📝 **Code Review** | 🔄 **Running** since <relative-time datetime=\"2026-09-04T22:47:25.5Z\">x</relative-time> | \`1e14b13\` | Manual request |")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a Running row later in the same second is the newest, and no failure is read"
+  # The shape with a datetime the comparisons cannot order: malformed, or in the future.
+  for row in "${FAILED_RUN_ROW//2026-09-04T22:47:25.387018Z/garbage}" \
+    "${FAILED_RUN_ROW//2026-09-04T22:47:25.387018Z/2099-01-01T00:00:00.1Z}"; do
+    failed_run_fixture
+    COMMENTS_JSON="[$(failed_run_summary 1 "$row")]"
+    run_status
+    assert_eq "$(state_tok "$STATE")" expected "a Failed row whose datetime cannot be ordered is not read: $row"
+  done
+}
+
+test_a_broken_jq_program_is_unknown_on_the_request_read() {
+  failed_run_fixture
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "control: this fixture reaches the request read"
+  assert_unknown_when_broken '@codex[[:space:]]+review' \
+    "the review-request comments feed did not parse" "the request read"
+}
+
+test_watch_re_requests_a_failed_run_once() {
+  # A grace short enough that the request's pickup window ends inside the case.
+  retune GRACE=2
+  failed_run_fixture
+  run_watch 0,1,0 1 3
+  assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 1 \
+    "one re-request posted for the failed run"
+  assert_eq "$(jq -r .body "$TEST_ROOT/posted")" "@codex review
+
+_🤖 Addressed by an automated coding agent_" "the plain request the pending-nudge reader recognizes"
+  assert_contains "$WATCH_ERR" "re-requested the review with '@codex review'" "the watch says it did"
+  assert_contains "$WATCH_ERR" "fresh review nudge; waiting for pickup" "and then waits out the request's grace"
+  assert_not_contains "$WATCH_OUT" "FAILED" "the failure it answered is not the verdict"
+  # The same run failing again after that request: surfaced, not re-requested.
+  mv "$TEST_ROOT/posted" "$TEST_ROOT/posted.keep"
+  failed_run_fixture
+  COMMENTS_JSON="[$(failed_run_summary 1 "${FAILED_RUN_ROW//2026-09-04T22:47:25.387018Z/2026-09-04T23:05:00.1Z}"),$(request_comment 2 2026-09-04T22:50:00Z)]"
+  run_watch 0,2,0 1 3
+  assert_eq "$WATCH_RC" 0 "a second failure is something to act on"
+  assert_contains "$WATCH_OUT" "reviewer's run FAILED AGAIN on head 1e14b13" "the verdict is on stdout"
+  assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 0 "and nothing is posted"
+  rm -f "$TEST_ROOT/posted.keep"
+}
+
+# Review of #465, round 1: a failure first seen on the window's LAST regular poll still gets the
+# request's grace — the deadline is set by the post, not by the round's `failed` read, which has
+# none — so the watch goes on to read the request back instead of ending on it.
+test_watch_waits_out_a_re_request_posted_on_its_last_poll() {
+  retune GRACE=2
+  failed_run_fixture
+  # An interval past the timeout: one regular round, then the boundary.
+  run_watch 0,1,0 5 3
+  assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 1 "the request is posted"
+  assert_contains "$WATCH_ERR" "extending watch for the live review or fresh nudge" \
+    "and the window extends for its grace"
+  assert_contains "$WATCH_ERR" "fresh review nudge; waiting for pickup" "reading the request back"
+  assert_eq "$WATCH_RC" 0 "the window ends on the request's grace, not as a quiet window (exit 1)"
+  assert_contains "$WATCH_OUT" "no review materialized" "the grace verdict is the request's own"
+}
+
+# Review of #465, rounds 1 and 2: the round decided on its snapshot, and a 👍 landing before the
+# write would be cleared by it. The state is read fresh before the round is dispatched, the post is
+# made only on that read, and whatever the read says instead is handled by the same round — here
+# on the window's LAST regular poll, where a state only logged would have ended the window quiet
+# on the stale failure.
+test_watch_does_not_post_over_an_approval_that_landed_since_the_round() {
+  failed_run_fixture
+  # Reactions reads: the opening status (1), the round's state (2), the fresh read before the
+  # write (3) — the 👍 lands between the round and the write.
+  THUMBS_ON_REACTIONS_READ=3
+  # An interval past the timeout: this round is the last regular one.
+  run_watch 0,1,0 5 3
+  assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 0 "nothing is posted"
+  assert_contains "$WATCH_ERR" "not re-requesting the failed run on 1e14b13 — a fresh read says: approved" \
+    "and the watch says why"
+  assert_eq "$WATCH_RC" 0 "the approval ends the wait"
+  assert_contains "$WATCH_OUT" "approved (👍 from" "and is what the watch reports, not the stale failure"
+  assert_not_contains "$WATCH_OUT" "FAILED" "the failure the round read is not reported"
+}
+
+test_watch_surfaces_a_re_request_that_did_not_post() {
+  failed_run_fixture
+  FAIL_POST=1
+  # Four attempts is gh_retry's write default: the request must be sent once whatever it is.
+  retune API_ATTEMPTS=4
+  run_watch 0,1,0 1 3
+  assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 1 \
+    "a gateway refusal is not re-sent: it may have landed (review of #465, round 4)"
+  assert_eq "$WATCH_RC" 0 "the caller has a move to make"
+  assert_contains "$WATCH_OUT" "re-request for the failed run on head 1e14b13 did not go through" \
+    "the watch says the request is not known to be on the PR"
+  assert_contains "$WATCH_OUT" "watermark: " "and ends on a watermark"
 }
 
 tests=(
@@ -1541,6 +1840,17 @@ tests=(
   test_a_completed_row_outside_the_allowlist_is_not_a_verdict
   test_a_completed_row_approval_passes_the_thread_gate
   test_a_broken_jq_program_is_unknown_on_the_completed_row_read
+  test_a_failed_run_on_the_head_is_a_failed_state
+  test_a_failed_run_needs_the_head_and_no_approval
+  test_a_failed_run_needs_a_silent_reviewer
+  test_a_failed_run_counts_the_requests_on_its_head
+  test_a_failed_run_posted_with_an_initialization_failure
+  test_a_failed_row_outside_the_allowlist_is_not_read
+  test_a_broken_jq_program_is_unknown_on_the_request_read
+  test_watch_re_requests_a_failed_run_once
+  test_watch_surfaces_a_re_request_that_did_not_post
+  test_watch_waits_out_a_re_request_posted_on_its_last_poll
+  test_watch_does_not_post_over_an_approval_that_landed_since_the_round
 )
 
 run_tests "${tests[@]}"

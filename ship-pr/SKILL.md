@@ -408,7 +408,8 @@ round has been paid for.
 An exit 0 is not always a round: `watch` also returns when it can tell that **nothing is coming** —
 the 👀 went spent without a review of the head, or never landed, or a push has been sitting
 unreviewed past the grace (20 min, `SHIP_PR_REVIEW_GRACE`), or the reviewer said outright that it
-could not start (`failed`, below, which exits at once rather than holding the grace). Its line says
+could not start (`failed`, below, which exits at once rather than holding the grace — except on a
+first Failed summary row, which `watch` re-requests itself and waits on). Its line says
 so and names the remedy: post a plain `@codex review` comment on the PR — `pr-review.sh comment
 <owner>/<repo>#<pr> '@codex review'` — which starts a round within one window. Do that rather than
 re-arming a fourth identical wait; see the state table below for why waiting cannot distinguish
@@ -587,7 +588,7 @@ head SHA, and answers with one of eight:
 | `unresolved` | that same 👍, over review threads still open — whatever head they cite | answer each thread and `resolve` it; `merge` refuses until none is open |
 | `reviewing` | the 👀 is newer than the reviewer's last word — a round really is in flight | wait it out |
 | `stalled` | that 👀 has been up longer than a round takes and nothing was posted | `@codex review` |
-| `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head, or "To use Codex here, create an environment for this repo" newer than the head's commit: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) — or, for the environment one, hand it to the maintainer, since no push reaches it |
+| `failed` | the reviewer's newest word is an initialization failure — "Something went wrong", over "Provided git ref `<sha>` does not exist" — naming this head, or "To use Codex here, create an environment for this repo" newer than the head's commit — or the summary's Code Review row marks this head's run "⚠️ Failed" with no review, no 👍 and nothing said inside the run: the round never ran | `@codex review` once; if the same head fails again, push a new head (an amend is enough) — or, for the environment one, hand it to the maintainer, since no push reaches it. On the Failed row `watch` posts that one request itself |
 | `expected` | no live 👀, and no review of the head SHA: a round is due and has not started — including a 👍 left from before a push, until the app takes it down | wait out the grace, then `@codex review` |
 | `idle` | the reviewer has reviewed this exact head and left no 👍 | the next move is yours: address the round and push — or, at one of the loop's exits (below), close out and merge |
 | `unknown` (exit 3) | a read failed | retry — this is *not* "not approved yet" |
@@ -619,6 +620,19 @@ ref: it is attributed to the head by the clock — newer than both the head's co
 PR's creation, neither unread nor in the future, else `expected` — and its second move is the
 maintainer's, since no push reaches it. The failed attempt is not a round, so it does not count
 against the convergence threshold.
+
+The third shape is a run the app started and could not finish (ludics-lite#453): the summary's
+Code Review row reads "⚠️ **Failed**" on the head (once in 621 rows, ocannl-staging#633), with no
+review and no 👍. That is the one case where a re-request cannot cost an approval, so `watch`
+makes it — it posts `@codex review` and keeps watching the request's grace — and the rule against
+re-requesting as stall recovery stands everywhere else. The reading is fail-closed: only the
+observed row shape, only on the head, with no 👍 on the PR, nothing from the reviewer inside the
+run (since its 👀, or about this head at all once the 👀 is down), and no request since the row.
+It fires once per head (two watches on one PR at the same moment could each post one, which is a
+duplicate request and never a cleared 👍): the request is its own record, so a second Failed row
+on a head that already had a `@codex review` reads `reviewer's run FAILED AGAIN`, and `watch` exits on it for
+you — read the feed, then push a new head or hand it over. `status` states the same move and
+posts nothing.
 
 An empty `COMMENTED` review counts as no completed review unless its own inline-comments
 endpoint contains findings. This also excludes it from the convergence count; comments on another
