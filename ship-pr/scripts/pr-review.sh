@@ -497,7 +497,7 @@ graphql_fixed_answer() {
 # answered", which tells an obedient caller to re-arm forever.
 #
 # The boundary. This reads ONE line, the first line of gh's stderr, where gh prints the refusal
-# with no prefix, and only for a call gh_builtin_command (below) says gh parses itself. It is a
+# with no prefix, and only for a call gh_api_only_command (below) lets it read. It is a
 # fail-closed ALLOWLIST of whole-line shapes, each copied from a real call to gh 2.101.0 that sent
 # no request:
 #   Unknown JSON field: "<field>"                              --json with a field gh lacks
@@ -535,18 +535,43 @@ gh_client_refusal() {
   return 1
 }
 
-# Is the call's command one gh parses and runs itself, so that its stderr is gh's own? A command
-# gh does not have is an alias or an extension, and gh hands an extension every argument: its
-# stderr is arbitrary code's, which can write to GitHub and then print a gh-shaped `unknown flag:`
-# line. So this is a fail-closed ALLOWLIST of gh's built-in commands that run no delegated code
-# (not `extension`, whose `exec` runs one, `copilot`, `codespace`, `alias` or `preview`). A
-# built-in's name cannot be taken over: gh 2.101.0 refuses the alias (`Could not create alias pr:
-# already a gh command or extension`), and `gh help extension` states that an extension cannot
-# override a core command (one that clashes runs only through `gh extension exec`, not listed).
-gh_builtin_command() {
+# Is the call's command one whose whole run is gh's own parse and API calls, so that its stderr
+# is gh's own? A command gh does not have is an alias or an extension, which gh hands every
+# argument: its stderr is arbitrary code's, which can write to GitHub and then print a gh-shaped
+# `unknown flag:` line. And some built-ins run another program after a write (`repo fork --clone`
+# runs git once the fork exists, `pr merge --delete-branch` once the merge landed). So this is a
+# fail-closed ALLOWLIST of command paths, read off gh 2.101.0's own command lists: whole commands
+# with no subcommand that runs another program, and, of the rest, the subcommands that run none.
+# Left off, and so keeping today's classification: `pr checkout|create|merge|close|diff|revert`,
+# `issue develop`, `run download` (`run watch` is the await above), `repo clone|create|fork|
+# rename|set-default|sync`, `release create|download`, `gist clone|edit|rename`, and `extension`,
+# `alias`, `copilot`, `codespace`, `preview`, `browse` and every other command not named. A
+# built-in cannot be taken over: gh 2.101.0 refuses the alias (`Could not create alias pr: already
+# a gh command or extension`), and `gh help extension` states that an extension cannot override a
+# core command (one that clashes runs only through `gh extension exec`). What this does not read:
+# a flag that starts a program inside a listed subcommand (`--editor`, `--web`), which runs it
+# before the call writes anything, in a mode a scripted retry does not use; and a subcommand named
+# after a flag the parent takes (`gh pr -R o/r view`), which reads as unlisted.
+gh_api_only_command() {
   case "${1:-}" in
-  api | pr | issue | run | workflow | repo | release | label | search | cache | ruleset | gist | \
-    secret | variable) return 0 ;;
+  api | status | search | org | project | label | cache | ruleset | secret | variable | ssh-key | \
+    gpg-key) return 0 ;;
+  esac
+  case "${1:-} ${2:-}" in
+  "pr list" | "pr status" | "pr checks" | "pr comment" | "pr edit" | "pr lock" | "pr ready" | \
+    "pr reopen" | "pr review" | "pr unlock" | "pr update-branch" | "pr view") return 0 ;;
+  "issue create" | "issue list" | "issue status" | "issue close" | "issue comment" | \
+    "issue delete" | "issue edit" | "issue lock" | "issue pin" | "issue reopen" | \
+    "issue transfer" | "issue unlock" | "issue unpin" | "issue view") return 0 ;;
+  "run cancel" | "run delete" | "run list" | "run rerun" | "run view") return 0 ;;
+  "workflow disable" | "workflow enable" | "workflow list" | "workflow run" | \
+    "workflow view") return 0 ;;
+  "repo list" | "repo archive" | "repo autolink" | "repo delete" | "repo deploy-key" | \
+    "repo edit" | "repo gitignore" | "repo license" | "repo read-dir" | "repo read-file" | \
+    "repo unarchive" | "repo view") return 0 ;;
+  "release list" | "release delete" | "release delete-asset" | "release edit" | "release upload" | \
+    "release verify" | "release verify-asset" | "release view") return 0 ;;
+  "gist create" | "gist delete" | "gist list" | "gist view") return 0 ;;
   esac
   return 1
 }
@@ -3781,7 +3806,7 @@ cmd_retry() {
     return
   fi
   local caller_args=""
-  gh_builtin_command "$1" && caller_args=1
+  gh_api_only_command "$@" && caller_args=1
   GH_RETRY_CALLER_ARGS="$caller_args" gh_retry "$mode" "$@"
   case "$?" in
   0) return 0 ;;

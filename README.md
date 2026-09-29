@@ -796,8 +796,9 @@ caller's own arguments (ludics-lite#452: `gh pr view 1 --json nosuchfield` sends
 retried four times to exit 3): each refusal on that allowlist, verbatim from a real call that sent
 no request, exits 2 on its first attempt under both policies; its near-misses (a prefix, a suffix,
 a second line, an unquoted field, a jq parse error, a terminal-dependent refusal) still retry to
-exit 3. So does the same line from an alias or an extension, which gh hands every argument, and
-the script's own calls keep the classification they had.
+exit 3. So does the same line from any command path off the API-only allowlist: an alias or an
+extension, which gh hands every argument, or a built-in subcommand that runs git after a write
+(`repo fork --clone`, `pr merge`). The script's own calls keep the classification they had.
 
 `test-pr-review-status.sh` drives `status` and `watch` against canned reactions, reviews,
 comments and PR reads, and pins the mergeability that rides on every state line: a PR whose merge

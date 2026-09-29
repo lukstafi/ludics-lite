@@ -440,6 +440,8 @@ test_a_client_refusal_is_a_usage_error() {
     'accepts at most 1 arg(s), received 2'
     # gh pr nosuchcmd
     $'unknown command "nosuchcmd" for "gh pr"\n\nUsage:  gh pr <command> [flags]'
+    # gh label nosuchcmd
+    'unknown command "nosuchcmd" for "gh label"'
   )
   retune API_ATTEMPTS=3
   for mode in --read --write; do
@@ -482,24 +484,38 @@ test_a_client_refusal_near_miss_still_retries() {
   done
 }
 
-# The other half of the scope (review round 1): a command gh does not have is an alias or an
-# extension, which gh hands every argument, so its stderr is arbitrary code's and can follow a write
-# that landed. The same refusal line keeps the retry on a read and stays ambiguous on a write.
-test_an_extension_refusal_is_not_read() {
-  local cmd
+# The other half of the scope (review rounds 1 and 2): the line is read only for a command path
+# that runs no program but gh. An alias or an extension is handed every argument, and some built-in
+# subcommands run git after a write (`repo fork --clone`, `pr merge --delete-branch`), so on those
+# the same line keeps the retry on a read and stays ambiguous on a write. A listed path whose
+# parent takes any subcommand (`project list`, `label nosuchcmd`) is read, the positive control.
+test_a_delegating_command_refusal_is_not_read() {
+  local -a cmd
+  local spec
   retune API_ATTEMPTS=3
-  for cmd in myext co; do
+  for spec in 'myext --later' 'co --later' 'repo fork o/r --clone --later' 'pr merge 1 --later' \
+    'pr checkout 1 --later' 'pr -R o/r view 1 --later'; do
+    read -r -a cmd <<<"$spec"
     reset_fixture
     CLIENT_ERROR='unknown flag: --later'
-    run_retry --read "$cmd" --later
-    assert_eq "$RETRY_RC" 3 "a non-built-in's refusal-shaped line keeps the retry ($cmd: $RETRY_OUT)"
-    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "every attempt was spent ($cmd)"
+    run_retry --read "${cmd[@]}"
+    assert_eq "$RETRY_RC" 3 "an unlisted path's refusal-shaped line keeps the retry ($spec: $RETRY_OUT)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "every attempt was spent ($spec)"
     reset_fixture
     CLIENT_ERROR='unknown flag: --later'
-    run_retry "$cmd" --later
-    assert_eq "$RETRY_RC" 3 "and a write through it stays ambiguous ($cmd: $RETRY_OUT)"
-    assert_contains "$RETRY_OUT" "AMBIGUOUSLY" "it may have landed ($cmd)"
-    assert_not_contains "$RETRY_OUT" "sent nothing" "nothing is claimed about what was sent ($cmd)"
+    run_retry "${cmd[@]}"
+    assert_eq "$RETRY_RC" 3 "and a write through it stays ambiguous ($spec: $RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "AMBIGUOUSLY" "it may have landed ($spec)"
+    assert_not_contains "$RETRY_OUT" "sent nothing" "nothing is claimed about what was sent ($spec)"
+  done
+  for spec in 'project list --owner o --foo_bar' 'label nosuchcmd' 'api repos/o/r --later' \
+    'issue comment 1 --later'; do
+    read -r -a cmd <<<"$spec"
+    reset_fixture
+    CLIENT_ERROR='unknown flag: --later'
+    run_retry "${cmd[@]}"
+    assert_eq "$RETRY_RC" 2 "a listed path is read ($spec: $RETRY_OUT)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "and not re-sent ($spec)"
   done
 }
 
@@ -564,7 +580,7 @@ tests=(
   test_a_near_miss_still_retries
   test_a_client_refusal_is_a_usage_error
   test_a_client_refusal_near_miss_still_retries
-  test_an_extension_refusal_is_not_read
+  test_a_delegating_command_refusal_is_not_read
   test_the_scripts_own_calls_keep_their_classification
   test_parse_ref
 )
