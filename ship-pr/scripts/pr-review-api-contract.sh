@@ -891,7 +891,7 @@ for n in $(jq -r --argjson k "$SUMMARY_SAMPLE" '[.[] | select(.merged_at != null
   jq -cn --argjson pr "$n" --arg rev "$REVIEWER" --arg done "$SUMMARY_COMPLETED_ROW_RE" \
     --arg failed "$SUMMARY_FAILED_ROW_RE" --arg stamp "$SUMMARY_ROW_STAMP_RE" \
     --slurpfile comments "$SCRATCH/s_comments.json" --slurpfile reviews "$SCRATCH/s_reviews.json" "
-    def app: $APP;"'
+    def app: $APP; $SUMMARY_ROW_INSTANT_DEF"'
     def kind: if test($done) then "completed" elif test($failed) then "failed"
               elif test("^\\|[^|]*Code Review[^|]*\\|[^|]*Running") then "running" else "other" end;
     def rows: (.body // "") | split("\n")[] | select(test("^\\|[^|]*Code Review[^|]*\\|"));
@@ -905,8 +905,9 @@ for n in $(jq -r --argjson k "$SUMMARY_SAMPLE" '[.[] | select(.merged_at != null
     | ($sums | max_by(.updated_at // .created_at)
        | if . == null then null
          else [rows | . as $row | [capture($stamp)] | first
-               | if . == null then null else {at: (.at | sub("\\.[0-9]+Z$"; "Z")), sha, kind: ($row | kind)} end]
-           | if length == 0 or any(.[]; . == null) then null else max_by(.at) end
+               | if . == null then null
+                 else {at: (.at | sub("\\.[0-9]+Z$"; "Z")), key: (.at | instant), sha, kind: ($row | kind)} end]
+           | if length == 0 or any(.[]; . == null) then null else max_by(.key) end
          end) as $newest
     | ([$reviews[0][] | select(app) | select(.submitted_at != null)] | max_by(.submitted_at)) as $last
     | {pr: $pr, rows: [$sums[] | rows | {kind: kind, dated: dated, row: .}], newest: $newest,

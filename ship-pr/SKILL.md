@@ -628,8 +628,9 @@ makes it — it posts `@codex review` and keeps watching the request's grace —
 re-requesting as stall recovery stands everywhere else. The reading is fail-closed: only the
 observed row shape, only on the head, with no 👍 on the PR, nothing from the reviewer inside the
 run (since its 👀, or about this head at all once the 👀 is down), and no request since the row.
-It fires once per head: the request is its own record, so a second Failed row on a head that
-already had a `@codex review` reads `reviewer's run FAILED AGAIN`, and `watch` exits on it for
+It fires once per head (two watches on one PR at the same moment could each post one, which is a
+duplicate request and never a cleared 👍): the request is its own record, so a second Failed row
+on a head that already had a `@codex review` reads `reviewer's run FAILED AGAIN`, and `watch` exits on it for
 you — read the feed, then push a new head or hand it over. `status` states the same move and
 posts nothing.
 

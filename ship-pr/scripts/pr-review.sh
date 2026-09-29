@@ -1458,6 +1458,13 @@ SUMMARY_FAILED_ROW_RE='^\|[^|]*Code Review[^|]*\| *⚠️ \*\*Failed\*\* <relati
 # SUMMARY_COMPLETED_ROW_RE is tried on — and the three must date a row identically, or the newest
 # row one reader finds is not the one another does.
 SUMMARY_ROW_STAMP_RE='datetime="(?<at>[^"]+)"[^|]*\| *`(?<sha>[0-9a-f]{7,40})` *\|'
+# How the two readers that pick the NEWEST row (the 👍 path's fourth field and the Completed/Failed
+# read) order the stamps: as instants, not as the strings the app writes. The app writes six
+# fractional digits, but a whole-second "...:25Z" sorts AFTER "...:25.123Z" as a string, so a row
+# written without a fraction would be taken for newer than one written later in the same second
+# (review of #465, round 3). Padded to nine fractional digits, the string order is the time order;
+# both readers use this one definition, so they cannot disagree about which row is the newest.
+SUMMARY_ROW_INSTANT_DEF='def instant: sub("Z$"; "") | (if test("\\.") then . else . + "." end) + "000000000" | .[0:29];'
 
 # ISO 8601 UTC timestamps sort correctly as plain strings, which is why every comparison below is a
 # string comparison: no date(1) is involved, whose parsing flags differ between BSD and GNU.
@@ -1682,7 +1689,7 @@ status_state() {
     state_head_read "$pr"
     head_loaded=true
     evidence=$(jq -rs --arg rev "$REVIEWER" --arg head "$head_sha" --arg rc "$REVIEWED_COMMIT_RE" \
-      --arg stamp "$SUMMARY_ROW_STAMP_RE" '
+      --arg stamp "$SUMMARY_ROW_STAMP_RE" "$SUMMARY_ROW_INSTANT_DEF"'
       .[0] as $comments | .[1] as $reviews |
       def reviewer: select((.user.login // "") | startswith($rev));
       def current: select(.sha != "" and $head != "")
@@ -1714,7 +1721,7 @@ status_state() {
                | [capture($stamp)] | first]
          end) as $rows |
       (if ($rows | length) == 0 or any($rows[]; . == null) then ""
-       else $rows | max_by(.at) | .sha end) as $row_sha |
+       else $rows | max_by(.at | instant) | .sha end) as $row_sha |
       [($running[] | select(. != null) | . + {kind:"running"}),
        ($reviews[] | reviewer | select(.submitted_at != null)
          | {sha:(.commit_id // ""), at:.submitted_at, kind:"findings"}),
@@ -1918,7 +1925,7 @@ status_state() {
   # otherwise leave a 👍 standing; here the fallback approves nothing). Whether it is a verdict for
   # the head, and for this round, is decided below, once the head is known.
   done_line=$(jq -r --arg rev "$REVIEWER" --arg done "$SUMMARY_COMPLETED_ROW_RE" \
-      --arg failed "$SUMMARY_FAILED_ROW_RE" --arg stamp "$SUMMARY_ROW_STAMP_RE" '
+      --arg failed "$SUMMARY_FAILED_ROW_RE" --arg stamp "$SUMMARY_ROW_STAMP_RE" "$SUMMARY_ROW_INSTANT_DEF"'
       [.[] | select((.user.login // "") | startswith($rev))
            | select((.body // "") | contains("codex-pull-request-review-summary"))]
       | max_by(.updated_at // .created_at)
@@ -1929,7 +1936,7 @@ status_state() {
               | [capture($stamp)] | first
               | if . == null then null else {at, row: $row} end]
           | if length == 0 or any(.[]; . == null) then "||"
-            else max_by(.at) | ([.row | capture($done)] | first) as $c
+            else max_by(.at | instant) | ([.row | capture($done)] | first) as $c
               | ([.row | capture($failed)] | first) as $f
               | if $c != null then "completed|\($c.at | sub("\\.[0-9]+Z$"; "Z"))|\($c.sha)"
                 elif $f != null then "failed|\($f.at | sub("\\.[0-9]+Z$"; "Z"))|\($f.sha)"
@@ -2051,7 +2058,9 @@ status_state() {
   #   - no 👍 on the PR at all, standing or stale;
   #   - the row is newer than a pending request (a watch's nudge) and than any 👀 — a 👀 above it
   #     is a round started after the failure, which the in-flight arm below waits out — and no
-  #     '@codex review' has been posted since the row: a request after it has answered it;
+  #     '@codex review' has been posted since the row: a request after it has answered it. The
+  #     row's stamp is cut to whole seconds, as the comments' are served, so a request in the
+  #     row's own second counts as after it — pending, never a second failure's cause;
   #   - the reviewer said nothing inside the run: with a 👀 up, nothing since that 👀 (a findings
   #     round submits its review seconds BEFORE its row flips, see the read order above, so
   #     "nothing after the row" would be the wrong test); with the 👀 taken down — the app takes
@@ -2105,7 +2114,7 @@ status_state() {
         [.[] | select((.user.login // "") | startswith($rev) | not)
              | select((.body // "") | test("@codex[[:space:]]+review"; "i"))
              | .created_at // ""]
-        | "\(any(.[]; . > $row))|\([.[] | select(. >= $floor and . <= $row)] | max // "")"' \
+        | "\(any(.[]; . >= $row))|\([.[] | select(. >= $floor and . < $row)] | max // "")"' \
       <<<"$comments_raw" 2>/dev/null) || {
       echo "unknown|-|$mstate|the review-request comments feed did not parse"
       return 0
@@ -3323,6 +3332,10 @@ watch_loop() {
       # request itself is the record: once it is on the PR, a second failure reads `run-again`,
       # which falls through to the exit below. The request is then this watch's pending nudge
       # (its id is past the incoming watermark), so the next rounds read `nudged` and its grace.
+      # Two watches on one PR at the same moment can each post one: the record is only as fresh
+      # as the reads, and GitHub has no conditional comment write (review of #465, round 3,
+      # rebutted). That costs a duplicate request on a run with no approval — one extra run,
+      # never a cleared 👍 — and ship-pr runs one watch per PR.
       fkind=$(state_detail "$state")
       fsha="${fkind%%|*}"
       fkind="${fkind#*|}"

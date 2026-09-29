@@ -1504,7 +1504,7 @@ test_a_broken_jq_program_is_unknown_on_the_completed_row_read() {
   completed_fixture
   run_status
   assert_eq "$(state_tok "$STATE")" approved "control: this fixture reaches the Completed-row read"
-  assert_unknown_when_broken 'max_by(.at) | ([.row' \
+  assert_unknown_when_broken 'max_by(.at | instant) | ([.row' \
     "the summary comments feed did not parse" "the Completed-row read"
 }
 
@@ -1627,6 +1627,11 @@ test_a_failed_run_counts_the_requests_on_its_head() {
   HEAD_AT=2099-01-01T00:00:00Z
   run_status
   assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run-again "and so does one in the future"
+  # A request in the row's own second is after it (the row's stamp is cut to whole seconds, and
+  # the comment's is served that way): pending, not the cause of a second failure.
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(request_comment 2 2026-09-04T22:47:25Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a request in the row's second is not read as answered by it"
   # A request after the row has answered it: the round it asked for is due.
   failed_run_fixture
   COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(request_comment 2 2026-09-04T22:50:00Z)]"
@@ -1670,6 +1675,14 @@ test_a_failed_row_outside_the_allowlist_is_not_read() {
     run_status
     assert_eq "$(state_tok "$STATE")" expected "a failure row outside the observed shape keeps the old reading: $row"
   done
+  # Review of #465, round 3: the newest row is found by instant, not by string. A whole-second
+  # Failed stamp sorts after a later fractional one in the same second as a string, and would be
+  # taken for the newest over a Running row that superseded it.
+  failed_run_fixture
+  COMMENTS_JSON="[$(failed_run_summary 1 "${FAILED_RUN_ROW//2026-09-04T22:47:25.387018Z/2026-09-04T22:47:25Z}
+| 📝 **Code Review** | 🔄 **Running** since <relative-time datetime=\"2026-09-04T22:47:25.5Z\">x</relative-time> | \`1e14b13\` | Manual request |")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a Running row later in the same second is the newest, and no failure is read"
   # The shape with a datetime the comparisons cannot order: malformed, or in the future.
   for row in "${FAILED_RUN_ROW//2026-09-04T22:47:25.387018Z/garbage}" \
     "${FAILED_RUN_ROW//2026-09-04T22:47:25.387018Z/2099-01-01T00:00:00.1Z}"; do
