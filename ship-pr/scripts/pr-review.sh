@@ -227,7 +227,9 @@
 #                                          # deprecation (see cmd_body). Prints the PR's URL
 #   pr-review.sh retry [--read] <gh args...>
 #                                          # any other gh call (pr merge, api) with the same retry
-#                                          # policy, instead of a hand-rolled loop
+#                                          # policy, instead of a hand-rolled loop. gh refusing
+#                                          # the arguments itself (an unknown flag or --json
+#                                          # field) sent nothing: exit 2, never retried
 #   pr-review.sh retry [--read] run watch owner/name#<run-id>
 #                                          # NOT forwarded to gh: executed as a QUIET await of that
 #                                          # run — one verdict line instead of a stream of redraws,
@@ -488,6 +490,47 @@ graphql_fixed_answer() {
   return 1
 }
 
+# Did gh refuse the ARGUMENTS itself, before it sent anything (ludics-lite#452)? gh validates its
+# flags, its argument count and its `--json` field names before it makes a request, so such a
+# refusal is a caller error: re-sending prints it again, and the API never saw the call. Retried as
+# transport, `gh pr view 1 --json nosuchfield` spent four attempts and then reported "the API never
+# answered", which tells an obedient caller to re-arm forever.
+#
+# The boundary. This reads ONE line, the first line of gh's stderr, where gh prints the refusal
+# with no prefix. It is a fail-closed ALLOWLIST of whole-line shapes, each copied from a real call
+# to gh 2.101.0 that sent no request:
+#   Unknown JSON field: "<field>"                           --json with a field gh does not know
+#   Specify one or more comma-separated fields for `--json`:   --json with no value
+#   unknown flag: --<name>                                  a long flag the command does not take
+#   unknown shorthand flag: '<c>' in -<cs>                  a short one
+#   flag needs an argument: --<name>  /  '<c>' in -<c>      a flag missing its value
+#   invalid argument "<v>" for "[-<c>, ]--<name>" flag: <why>  a value the flag cannot take
+#   accepts [at most ]<n> arg(s), received <m>              the wrong number of arguments
+#   unknown command "<x>" for "gh[ <cmd>...]"               a subcommand gh does not have
+# It deliberately does not read stdout, the lines after the first, a line behind a prefix (`gh: `,
+# `GraphQL: `: those are the API's words, which can quote any of these), or any other client-side
+# message: a jq expression gh could not parse can be reported AFTER the request was sent (`gh pr
+# view 1 --jq '.['` answers with the API's own error first), a write's included, and the rest (`flags required when not running interactively`, `cannot use --web with
+# --json`, ...) are not on the list. Those keep the classification they had. And only a caller's
+# arguments are read this way: cmd_retry opts in, while this script's own calls keep today's
+# classification, since a refusal there means the installed gh no longer takes an argument the
+# script sends, and their callers do not report it as that.
+gh_client_refusal() {
+  local re
+  for re in \
+    '^Unknown JSON field: "[^"]+"$' \
+    '^Specify one or more comma-separated fields for `--json`:$' \
+    '^unknown flag: --[A-Za-z0-9][A-Za-z0-9-]*$' \
+    "^unknown shorthand flag: '[A-Za-z0-9]' in -[A-Za-z0-9]+\$" \
+    "^flag needs an argument: (--[A-Za-z0-9][A-Za-z0-9-]*|'[A-Za-z0-9]' in -[A-Za-z0-9])\$" \
+    '^invalid argument ".*" for "(-[A-Za-z0-9], )?--[A-Za-z0-9][A-Za-z0-9-]*" flag: .+$' \
+    '^accepts (at most )?[0-9]+ arg\(s\), received [0-9]+$' \
+    '^unknown command "[^"]+" for "gh( [a-z][a-z-]*)*"$'; do
+    [[ "$1" =~ $re ]] && return 0
+  done
+  return 1
+}
+
 transient_failure() {
   gateway_failure "$1" && return 0
   case "$1" in
@@ -501,6 +544,9 @@ transient_failure() {
 
 # gh_retry <read|write> <gh args...>: runs gh, prints its stdout, and returns 0 on success,
 # 3 when a retryable failure outlived the attempts, 1 when the failure was the API's answer.
+# With GH_RETRY_CALLER_ARGS=1 (cmd_retry's, set for a caller's own gh arguments) it also returns 2,
+# on its first attempt, when gh refused those arguments without sending anything.
+GH_RETRY_CALLER_ARGS=""
 gh_retry() {
   local mode="$1"
   shift
@@ -523,6 +569,12 @@ gh_retry() {
       return 0
     fi
     printf '%s' "${GH_ERR%%$'\n'*}" >"$GH_ERR_FILE" 2>/dev/null
+    # A refusal of the caller's arguments sent nothing, so under either policy there is nothing to
+    # retry and, for a write, nothing that could have landed.
+    if [ "$GH_RETRY_CALLER_ARGS" = 1 ] && gh_client_refusal "${GH_ERR%%$'\n'*}"; then
+      [ "$tmp" = /dev/null ] || { rm -f "$tmp"; GH_TMP_FILE=""; }
+      return 2
+    fi
     # A fixed GraphQL answer is read FIRST, under both policies: its whole first line is GraphQL's
     # own message, which no gateway prints, while the substring scans below would match a marker the
     # message only quotes (`Expected NAME, actual: STRING ("Bad gateway")`) and retry a query that
@@ -3708,9 +3760,12 @@ cmd_retry() {
     cmd_run_watch "$@"
     return
   fi
-  gh_retry "$mode" "$@"
+  GH_RETRY_CALLER_ARGS=1 gh_retry "$mode" "$@"
   case "$?" in
   0) return 0 ;;
+  2) die "gh $1 refused its own arguments and sent nothing: $(gh_err_line). That is a usage" \
+    "error in the command, not an API answer and not transport — re-sending it prints the same" \
+    "refusal, and nothing reached GitHub, so fix the arguments and run it again." ;;
   3) fail 3 "gh $1 did not go through after $API_ATTEMPTS attempts ($(gh_err_line));" \
     "the API never answered, so the outcome is UNKNOWN — confirm the state before retrying a" \
     "write, and never report the command as having failed to do its job." ;;
