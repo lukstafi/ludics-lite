@@ -1438,6 +1438,16 @@ REVIEWED_COMMIT_RE='Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})'
 # status (Running, a failure or cancellation word, a new emoji, a reworded or re-marked Completed)
 # is not a verdict, and what it leaves is the reading status gave before this row was read.
 SUMMARY_COMPLETED_ROW_RE='^\|[^|]*Code Review[^|]*\| *✅ \*\*Completed\*\* <relative-time datetime="(?<at>[^"]+)">[^<|]*</relative-time> *\| *`(?<sha>[0-9a-f]{7,40})` *\|'
+# The same row when the reviewer's RUN failed (#453), the one failure status the app has been seen
+# to write — once, on lukstafi/ocannl-staging#633 (2026-09-04, issuecomment-5541857882), in
+# the Code Review rows of every summary comment on both repositories since the table appeared
+# (2026-08-29 to 2026-09-29), 1 of 621:
+#   | 📝 **Code Review** | ⚠️ **Failed** <relative-time datetime="2026-09-04T22:47:25.387018Z">...</relative-time> | `1e14b13` | New commits |
+# A fail-closed allowlist of that row, cell by cell as the Completed one is: U+26A0 WITH its
+# variation selector U+FE0F (the bytes that row carries), the bold word, one relative-time element,
+# a backquoted lowercase hex SHA. Any other failure word, emoji or spelling is not this row, and
+# keeps the reading status gave before #453 (a spent 👀's `expected`, a live one's `stalled`).
+SUMMARY_FAILED_ROW_RE='^\|[^|]*Code Review[^|]*\| *⚠️ \*\*Failed\*\* <relative-time datetime="(?<at>[^"]+)">[^<|]*</relative-time> *\| *`(?<sha>[0-9a-f]{7,40})` *\|'
 # The stamp of any summary-table row, whatever its status: the relative-time's datetime and the
 # commit cell after it. status_state reads it three times — the Running rows, the newest summary's
 # Code Review rows for the 👍 path's fourth field, and the same rows again to find the one

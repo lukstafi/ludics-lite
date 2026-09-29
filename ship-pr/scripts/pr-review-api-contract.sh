@@ -28,6 +28,8 @@
 #   CONTRACT_OWN_HEAD        under Actions: the head this job's own run is attached to
 #                            (github.event.pull_request.head.sha, else github.sha); with
 #                            GITHUB_RUN_ID it pins the job's own row as the newest for that head
+#   CONTRACT_SUMMARY_SAMPLE  how many of the newest merged PRs the summary-row beliefs read
+#                            (default 60; two paginated reads each)
 #   REVIEWER                 the review app's login without its [bot] suffix (pr-review.sh's)
 #
 # Exit 0: every checkable belief holds. 1: at least one MOVED (listed, all of them — the script
@@ -849,6 +851,80 @@ if [ -n "$REVIEWED_PR" ]; then
 else
   skip "the reviewer feeds' shapes" "set CONTRACT_REVIEWED_PR to a PR the review app reviewed and approved"
 fi
+
+# --- the summary row on recent merged PRs ---------------------------------------------------------
+# status_state reads the summary comment's newest Code Review row as a verdict: Completed on the
+# head, with nothing posted since the 👀, is a clean round (#439); Failed on the head, with no
+# review and no 👍, is a run to re-request (#453). Two beliefs carry those readings and no anchor
+# PR can: they are about what the app writes NOW, so they are asked of the newest merged PRs.
+#   - The vocabulary: every Code Review row is one of the three shapes status_state reads —
+#     SUMMARY_COMPLETED_ROW_RE, SUMMARY_FAILED_ROW_RE, or a Running row (the test the 👍 path's
+#     Running read makes). A row outside them keeps the pre-#439 reading, which is safe but
+#     silent: a new failure word would read as a stall rather than as a failed run.
+#   - The ORDER the Completed reading rests on (#453): the app submits a round's findings review
+#     BEFORE it flips the row to Completed (9 of 9 findings rounds sampled on 2026-09-28, 2-4 s
+#     apart), which is why "nothing since the 👀" is the test and "nothing after the row" would
+#     call every findings round clean. Asked of every sampled PR whose last app review names the
+#     commit its newest Completed row names: that review's submitted_at is not after the row's
+#     datetime (fractional seconds dropped, as status_state drops them). If the app ever reverses
+#     the order, this goes red before a findings round is read as approved.
+# The sample is the newest merged PRs (CONTRACT_SUMMARY_SAMPLE, default 60) of the closed-PR list
+# the pulls section read (the 100 most recently updated), since the summary comment is edited in
+# place and a merged PR's is the last state it reached — so only a PR merged on a findings round
+# (its last review naming the head its Completed row names) carries the order at all: 8 of the 60
+# on this repository when the belief was written (2026-09-29), every one holding by 2-4 s. A
+# sample with no such PR says so as a skip.
+section "the Codex summary row on recent merged PRs — status_state's Completed and Failed readings"
+SUMMARY_SAMPLE="${CONTRACT_SUMMARY_SAMPLE:-60}"
+is_num "$SUMMARY_SAMPLE" || { echo "pr-review-api-contract.sh: CONTRACT_SUMMARY_SAMPLE must be a number, got '$SUMMARY_SAMPLE'" >&2; exit 2; }
+: >"$SCRATCH/summary_rows.jsonl"
+for n in $(jq -r --argjson k "$SUMMARY_SAMPLE" '[.[] | select(.merged_at != null) | .number | select(type == "number")] | .[:$k] | .[]' <<<"$closed"); do
+  # Through files, not the argument vector: a long-reviewed PR's feed is over Linux's
+  # per-argument limit (the rounds suite's known trap).
+  api --paginate "repos/$REPO/issues/$n/comments?per_page=100" | jq -s 'add // []' >"$SCRATCH/s_comments.json"
+  api --paginate "repos/$REPO/pulls/$n/reviews?per_page=100" | jq -s 'add // []' >"$SCRATCH/s_reviews.json"
+  # One line per PR: every Code Review row of its summaries classified, and the newest row of the
+  # newest summary — none when a row there is one the stamp cannot date, as status_state reads
+  # it — beside the app's last submitted review. The Running test is the 👍 path's.
+  jq -cn --argjson pr "$n" --arg rev "$REVIEWER" --arg done "$SUMMARY_COMPLETED_ROW_RE" \
+    --arg failed "$SUMMARY_FAILED_ROW_RE" --arg stamp "$SUMMARY_ROW_STAMP_RE" \
+    --slurpfile comments "$SCRATCH/s_comments.json" --slurpfile reviews "$SCRATCH/s_reviews.json" "
+    def app: $APP;"'
+    def kind: if test($done) then "completed" elif test($failed) then "failed"
+              elif test("^\\|[^|]*Code Review[^|]*\\|[^|]*Running") then "running" else "other" end;
+    def rows: (.body // "") | split("\n")[] | select(test("^\\|[^|]*Code Review[^|]*\\|"));
+    [$comments[0][] | select(app) | select((.body // "") | contains("codex-pull-request-review-summary"))] as $sums
+    | ($sums | max_by(.updated_at // .created_at)
+       | if . == null then null
+         else [rows | . as $row | [capture($stamp)] | first
+               | if . == null then null else {at: (.at | sub("\\.[0-9]+Z$"; "Z")), sha, kind: ($row | kind)} end]
+           | if length == 0 or any(.[]; . == null) then null else max_by(.at) end
+         end) as $newest
+    | ([$reviews[0][] | select(app) | select(.submitted_at != null)] | max_by(.submitted_at)) as $last
+    | {pr: $pr, rows: [$sums[] | rows | {kind: kind, row: .}], newest: $newest,
+       review: (if $last == null then null else {at: $last.submitted_at, sha: ($last.commit_id // "")} end)}' \
+    >>"$SCRATCH/summary_rows.jsonl"
+done
+summary_rows=$(jq -s . "$SCRATCH/summary_rows.jsonl")
+n_rows=$(jq '[.[].rows[]] | length' <<<"$summary_rows")
+if [ "$n_rows" -eq 0 ]; then
+  skip "every Code Review row is a shape status_state reads" "the $(jq length <<<"$summary_rows") sampled merged PRs carry no Code Review row"
+else
+  # Failing rows first, so the MOVED line's 400 characters show them.
+  pin "every Code Review row of the sampled PRs' summaries is Completed or Failed in the allowlisted shape, or Running ($n_rows rows on $(jq length <<<"$summary_rows") PRs; $(jq '[.[].rows[] | select(.kind == "failed")] | length' <<<"$summary_rows") Failed)" \
+    'all(.[]; .kind != "other")' "$(jq -c '[.[] | .pr as $pr | .rows[] | {pr: $pr} + .] | sort_by(.kind != "other")' <<<"$summary_rows")"
+fi
+ordered=$(jq -c '[.[] | select(.newest != null and .newest.kind == "completed" and .review != null)
+                 | select(.newest.sha as $s | $s != "" and (.review.sha | startswith($s)))
+                 | {pr, review_at: .review.at, row_at: .newest.at, sha: .newest.sha}]
+                | sort_by(.review_at <= .row_at)' <<<"$summary_rows")
+if [ "$(jq length <<<"$ordered")" -eq 0 ]; then
+  skip "a findings review is submitted before its row flips to Completed" "no sampled merged PR's last app review names the commit of its newest Completed row (every one ended on a clean round); a larger CONTRACT_SUMMARY_SAMPLE finds one"
+else
+  pin "a findings review is submitted before its row flips to Completed: the app's last review naming the newest Completed row's commit is not after that row, on $(jq length <<<"$ordered") sampled PRs (status_state's 'nothing since the 👀' rests on it, #453)" \
+    'all(.[]; .review_at <= .row_at)' "$ordered"
+fi
+
 skip "reviewThreads (GraphQL) pagination at 100" "the resolve path is the one GraphQL read, and it is not exercised here"
 skip "compare's 300-file cap" "no compare of that size exists in this repository"
 
