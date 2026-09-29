@@ -22,7 +22,8 @@
 #     turns; `unstick` appends a line, which the CLI picks up at its next tool
 #     or turn boundary (a message sent mid-turn reaches the model mid-turn: Claude Code 2.1.282,
 #     probed 2026-09-26), and `close` kills the feeder, the CLI reads EOF and exits, and run.sh
-#     writes `exit`. input.jsonl is the durable log of every message the coordinator sent.
+#     writes `exit`. input.jsonl is the durable log of every message (and interrupt) the
+#     coordinator sent.
 #     `--replay-user-messages` echoes each message into the stream under the uuid it was sent
 #     with, which is how `unstick` and `status` prove delivery.
 #   A claude worker's states, from its stream past the current process's start (proc_offset):
@@ -40,6 +41,16 @@
 #   in `awaiting` alone, so there is one key to write and nothing to reconcile if it is cut off.
 #   One thing IDLE cannot see: a ScheduleWakeup the worker armed is not in the stream, so an IDLE
 #   worker can start a turn on its own; the next `attach` or `status` reads it.
+#   `unstick --interrupt` (ludics-lite#424) stops the turn in flight, tool call included, through
+#   the same channel: it appends the CLI's own control request,
+#   {"type":"control_request","request_id":<uuid>,"request":{"subtype":"interrupt"}}, and waits
+#   for the `control_response` naming that request_id (the receipt: the CLI read and honoured it;
+#   probed on Claude Code 2.1.284, 2026-09-29). The aborted turn ends in a `result` of its own
+#   (`error_during_execution`, terminal_reason `aborted_tools`); a message given with it is appended
+#   only after the receipt, so it starts the next turn instead of joining the one being aborted. A
+#   plain interrupt, not `cancel_queued`: a message queued before it survives (the receipt lists it
+#   under `still_queued`) and runs next. Control lines carry no uuid, so every reader of input.jsonl
+#   that counts messages by uuid skips them; a resume drops those a new process would read.
 #
 # Why the shape is what it is, kept in code rather than skill prose:
 #   - the worker's process tree hangs off tmux on ITS box, never off the coordinator's ssh or
@@ -81,6 +92,9 @@
 #   fleet-worker.sh log <box> <name> [-n <lines>]
 #   fleet-worker.sh unstick <box> <name> --message <file> [--kill] [-- <extra CLI args>]
 #                          # a live claude worker: append (APPENDED); else kill-and-resume (RESUMED)
+#   fleet-worker.sh unstick <box> <name> --interrupt [--message <file>]
+#                          # a live claude worker: stop its turn and tool call (INTERRUPTED), then
+#                          # append the message, if any, as its next turn; no restart
 #   fleet-worker.sh close <box> <name>     # end an IDLE claude worker (close its input), then
 #                          # print its final verdict; an ended worker's verdict as it stands
 #   fleet-worker.sh ls [<box> ...]
@@ -182,7 +196,7 @@
 #     after a cross-box `execution run`/`dispatch`); 30.
 #   FLEET_DELIVERY_WAIT: seconds an appending `unstick` waits for the CLI to echo the message; 20.
 #     Past it the message is reported queued, not lost: a worker inside a long tool call reads it
-#     when the call returns.
+#     when the call returns. `--interrupt` waits as long for the CLI's receipt of the interrupt.
 #   FLEET_CLOSE_WAIT: seconds `close` waits for the CLI to exit after its input closes; 60.
 #   FLEET_FEEDER_WAIT: seconds a claude worker's run.sh waits for its input feeder to record its
 #     pid before refusing to start the CLI (exit 95); 10. Fixed into run.sh when `launch` or
@@ -1663,38 +1677,53 @@ cmd_unstick() {
   local box="${1:-}" name="${2:-}"; [ -n "$box" ] && [ -n "$name" ] || die "unstick: <box> <name> required"
   valid_name "$name" || die "unstick: name must be [A-Za-z0-9._-]+"
   shift 2
-  local msg="" kill=0
+  local msg="" kill=0 interrupt=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --message) msg="${2:-}"; shift ;;
       --kill) kill=1 ;;
+      --interrupt) interrupt=1 ;;
       --) shift; break ;;
       *) die "unstick: unknown option $1" ;;
     esac
     shift
   done
-  [ -n "$msg" ] && [ -r "$msg" ] || die "unstick: --message <readable file>"
+  if [ "$interrupt" = 1 ]; then
+    [ "$kill" = 0 ] || die "unstick: --interrupt stops the turn and keeps the process, --kill replaces the process; pass one"
+    [ $# -eq 0 ] || die "unstick: --interrupt reaches a live process, which takes no CLI arguments (they need --kill)"
+    [ -z "$msg" ] || [ -r "$msg" ] || die "unstick: --message <readable file>"
+  else
+    [ -n "$msg" ] && [ -r "$msg" ] || die "unstick: --message <readable file> (or --interrupt)"
+  fi
   local dwait="${FLEET_DELIVERY_WAIT:-20}"
   case "$dwait" in ''|*[!0-9]*) die "unstick: FLEET_DELIVERY_WAIT must be a number of seconds" ;; esac
   feeder_wait_ok || die "unstick: FLEET_FEEDER_WAIT must be a positive number of seconds"
-  # The uuid the message's input line carries: its replay in the stream proves delivery.
-  local mid; mid=$(gen_uuid) || { echo "UNSTICK REFUSED $box/$name: cannot generate a message id here (no uuidgen, /proc uuid, or python3)"; exit 1; }
+  # The uuid the message's input line carries: its replay in the stream proves delivery. An
+  # interrupt's request_id plays the same part for the CLI's receipt of it.
+  local mid rid=""; mid=$(gen_uuid) && { [ "$interrupt" = 0 ] || rid=$(gen_uuid); } ||
+    { echo "UNSTICK REFUSED $box/$name: cannot generate a message id here (no uuidgen, /proc uuid, or python3)"; exit 1; }
   anchor_gate UNSTICK "$box/$name" 1 || exit $?
-  local stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  put_file "$box" "$msg" "$STATE/incoming/$name-$stamp.md"
-  local prc2=$?
-  if unreachable "$prc2"; then echo "UNSTICK UNREACHABLE $box"; exit 4; fi
-  [ "$prc2" -eq 0 ] || { echo "UNSTICK REFUSED $box/$name: cannot stage the message under the worker state dir on $box (unwritable, or a file in the way)"; exit 1; }
+  # No message (a bare --interrupt): nothing to stage, and an empty stamp tells the far side so.
+  local stamp=""
+  if [ -n "$msg" ]; then
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    put_file "$box" "$msg" "$STATE/incoming/$name-$stamp.md"
+    local prc2=$?
+    if unreachable "$prc2"; then echo "UNSTICK UNREACHABLE $box"; exit 4; fi
+    [ "$prc2" -eq 0 ] || { echo "UNSTICK REFUSED $box/$name: cannot stage the message under the worker state dir on $box (unwritable, or a file in the way)"; exit 1; }
+  fi
   # Re-read the lease after the upload, right before the worker is touched: an adoption that
   # completed meanwhile fences this intervention (residual window: one ssh round trip).
   anchor_gate UNSTICK "$box/$name" 1 || exit $?
   { prelude "$box"; cat <<'EOF'
-name="$1" kill="$2" stamp="$3" mid="$4" dwait="$5"; shift 5
-d="$WORKERS/$name"; staged="$STATE/incoming/$name-$stamp.md"
-[ -f "$d/meta" ] || { rm -f "$staged"; echo "UNSTICK REFUSED $BOX/$name: never launched here"; exit 1; }
+name="$1" kill="$2" stamp="$3" mid="$4" dwait="$5" rid="$6"; shift 6
+# An empty stamp: a bare --interrupt, with no message staged or to place.
+d="$WORKERS/$name"; staged=""; [ -z "$stamp" ] || staged="$STATE/incoming/$name-$stamp.md"
+unstage() { [ -z "$staged" ] || rm -f "$staged"; }
+[ -f "$d/meta" ] || { unstage; echo "UNSTICK REFUSED $BOX/$name: never launched here"; exit 1; }
 # Same critical section as launch: liveness checks through tmux creation, one at a time.
 mkdir -p "$STATE/locks"; wlock="$STATE/locks/$name"
-msg=$(take_lock "$wlock" 0 "lock") || { rm -f "$staged"; echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress ($msg)"; exit 1; }
+msg=$(take_lock "$wlock" 0 "lock") || { unstage; echo "UNSTICK REFUSED $BOX/$name: another launch or unstick of this name is in progress ($msg)"; exit 1; }
 started=0; blaunch=""; backed=0; ilines=""
 # A resume that never started takes its line back off the input channel: the file had $ilines.
 input_restore() {
@@ -1711,7 +1740,7 @@ on_exit() {
       [ -e "$d/exit.prev" ] && mv -f "$d/exit.prev" "$d/exit" 2>/dev/null
       [ -e "$d/meta.prev" ] && mv -f "$d/meta.prev" "$d/meta" 2>/dev/null
       input_restore
-      rm -f "$staged"
+      unstage
     else
       rm -f "$d/exit.prev" "$d/meta.prev"
     fi
@@ -1721,7 +1750,7 @@ on_exit() {
 trap on_exit EXIT; trap 'exit 143' TERM HUP INT
 # The message moves into the record only now, under the lock: a --replace that archived the
 # record before we held it cannot have taken it along.
-mkdir -p "$d/messages" && mv -f "$staged" "$d/messages/$stamp.md" 2>/dev/null && [ -f "$d/messages/$stamp.md" ] ||
+[ -z "$stamp" ] || { mkdir -p "$d/messages" && mv -f "$staged" "$d/messages/$stamp.md" 2>/dev/null && [ -f "$d/messages/$stamp.md" ]; } ||
   { echo "UNSTICK REFUSED $BOX/$name: cannot place the message under $d/messages"; exit 1; }
 kind=$(meta_get "$d" kind); cwd=$(meta_get "$d" cwd); sid=$(session_of "$d")
 [ -n "$sid" ] || { echo "UNSTICK REFUSED $BOX/$name: no session id in meta or stream"; exit 1; }
@@ -1733,11 +1762,50 @@ if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name
   # A running process takes no new flags: extra CLI args are a restart, which is --kill.
   [ "$#" -eq 0 ] || { echo "UNSTICK REFUSED $BOX/$name: extra CLI arguments ($*) cannot reach a live process -- pass --kill to resume the session with them, or drop them to append"; exit 1; }
   feeder_of "$name" >/dev/null || { echo "UNSTICK REFUSED $BOX/$name: the CLI's session is up but its input channel is not (no live feeder on $d/input.jsonl) -- pass --kill to resume the session instead"; exit 1; }
-  line=$(user_line "$d/messages/$stamp.md" "$mid") && [ -n "$line" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot encode the message as an input line"; exit 1; }
+  if [ -n "$stamp" ]; then
+    line=$(user_line "$d/messages/$stamp.md" "$mid") && [ -n "$line" ] || { echo "UNSTICK REFUSED $BOX/$name: cannot encode the message as an input line"; exit 1; }
+  fi
   # A line appended onto a partial one (a failed earlier append) would reach the CLI as garbage.
   [ ! -s "$d/input.jsonl" ] || [ -z "$(tail -c 1 "$d/input.jsonl")" ] ||
     { echo "UNSTICK REFUSED $BOX/$name: $d/input.jsonl ends in a partial line (an append that failed) -- \`unstick --kill\` resumes the session and drops it"; exit 1; }
   was=$(state_of "$name")
+  # --interrupt (see the header): the control request first, and the message only once the CLI's
+  # receipt says the interrupt was honoured -- a message ahead of it could join the aborted turn.
+  # No receipt, no message: the request stays on the input and acts whenever the CLI reads it.
+  if [ -n "$rid" ]; then
+    cline=$(jq -cn --arg r "$rid" '{type: "control_request", request_id: $r, request: {subtype: "interrupt"}}' 2>/dev/null) && [ -n "$cline" ] ||
+      { echo "UNSTICK REFUSED $BOX/$name: cannot encode the interrupt as an input line"; exit 1; }
+    off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
+    trap '' TERM HUP INT
+    if ! printf '%s\n' "$cline" >> "$d/input.jsonl" 2>/dev/null; then
+      echo "UNSTICK REFUSED $BOX/$name: cannot append the interrupt to $d/input.jsonl (disk full?); it may now end in a partial line -- free space, then \`unstick --kill\` it (the resume drops a partial line)"; exit 1
+    fi
+    trap 'exit 143' TERM HUP INT
+    nomsg=""; [ -z "$stamp" ] || nomsg="; the message was NOT sent (it stays at $d/messages/$stamp.md)"
+    waited=0
+    while :; do
+      receipt=$(tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null | jq -Rrn --arg r "$rid" '
+        first(inputs | fromjson? | select(type == "object" and .type == "control_response" and .response.request_id == $r) | .response
+          | if .subtype == "success" then "ok \(.response.still_queued // null | if type == "array" then length else "?" end)"
+            else "error \(.error // "no reason given" | tostring | .[0:200] | gsub("\n"; " "))" end) // empty' 2>/dev/null)
+      [ -z "$receipt" ] && [ "$waited" -lt "$dwait" ] && alive "$name" || break
+      sleep 1; waited=$((waited + 1))
+    done
+    case "$receipt" in
+      "ok "*) ;;
+      "error "*) echo "INTERRUPT FAILED $BOX/$name request=$rid: the CLI answered it with an error: ${receipt#error }$nomsg"; exit 1 ;;
+      *) if alive "$name"; then
+           echo "INTERRUPT UNCONFIRMED $BOX/$name request=$rid: on the input channel, but the CLI sent no receipt within ${dwait}s (a wedged CLI acts on it only if it reads it)$nomsg -- \`unstick --kill\` stops it"
+         else
+           echo "INTERRUPT UNCONFIRMED $BOX/$name request=$rid: the process ended before answering it$nomsg -- \`attach\` for its verdict, then unstick again to resume"
+         fi; exit 1 ;;
+    esac
+    # still_queued: messages the CLI had read but not yet started (e.g. one appended mid-tool):
+    # they survive a plain interrupt and run next, ahead of any message sent now.
+    echo "INTERRUPTED $BOX/$name kind=claude session=$sid from=$was request=$rid receipt: still_queued=${receipt#ok }"
+    [ -n "$stamp" ] || exit 0
+    was=$(state_of "$name")
+  fi
   # attach waits for the reply to THIS message: meta names it before the line lands, so a reply
   # that beats the next command is still read as its reply.
   off=$(grep -c '' "$d/stream.jsonl" 2>/dev/null); off=${off:-0}
@@ -1769,6 +1837,8 @@ if [ "$kind" = claude ] && [ "$kill" != 1 ] && alive "$name" && is_stream "$name
   fi
   echo "APPENDED $BOX/$name kind=claude session=$sid to=$was message=$d/messages/$stamp.md uuid=$mid $how"; exit 0
 fi
+# An interrupt has no other path: it never falls back to a kill or a resume.
+[ -z "$rid" ] || { echo "UNSTICK REFUSED $BOX/$name: --interrupt reaches only a live claude worker on the stream-json channel, and this is kind=$kind, $(state_of "$name")$(is_stream "$name" || echo ', one process per turn') -- nothing was sent; \`unstick --message\` resumes an ended worker, \`--kill\` stops a live one"; exit 1; }
 # The same one-live-worker-per-worktree rule as launch, under the same box-wide lock: a
 # resume must not start beside another worker that took this worktree meanwhile.
 msg=$(take_lock "$STATE/launch.lock" 120 "launch lock") || { echo "UNSTICK REFUSED $BOX/$name: another launch on this box is publishing its record ($msg)"; exit 1; }
@@ -1827,6 +1897,16 @@ if [ "$kind" = claude ]; then
   fi
   il=$(grep -c '' "$d/input.jsonl" 2>/dev/null); il=${il:-0}
   if is_stream "$name"; then from=$(first_unread "$name" "$il"); else from=$((il + 1)); fi
+  # An interrupt at or past $from was meant for the process that is gone (one the CLI never
+  # answered, behind a queued message): the new one would abort the turn it resumes into. Dropped
+  # like the partial line; the lines before $from, which no process reads again, stay as the log.
+  # Matched by the line's opening, which is the exact shape the interrupt path writes (jq -c keeps
+  # key order) and no user line (`{"type":"user"`) can start with.
+  if awk -v f="$from" 'NR >= f && /^\{"type":"control_request"/ { x = 1 } END { exit !x }' "$d/input.jsonl" 2>/dev/null; then
+    awk -v f="$from" 'NR < f || !/^\{"type":"control_request"/' "$d/input.jsonl" > "$d/input.jsonl.new" 2>/dev/null && mv -f "$d/input.jsonl.new" "$d/input.jsonl" ||
+      { rm -f "$d/input.jsonl.new"; echo "UNSTICK REFUSED $BOX/$name: cannot drop the unanswered interrupt from $d/input.jsonl (disk full?)"; exit 1; }
+    il=$(grep -c '' "$d/input.jsonl" 2>/dev/null); il=${il:-0}
+  fi
   stream_run "$d" "$cwd" "$from" --resume "$sid" "$@" > "$d/run.sh" 2>/dev/null
 else
   {
@@ -1867,7 +1947,7 @@ release_lock "$blaunch"; blaunch=""
 rm -f "$d/exit.prev" "$d/meta.prev"
 echo "RESUMED $BOX/$name kind=$kind session=$sid resume=$n message=$d/messages/$stamp.md ($why)"
 EOF
-  } | run_on "$box" "$name" "$kill" "$stamp" "$mid" "$dwait" "$@"
+  } | run_on "$box" "$name" "$kill" "$stamp" "$mid" "$dwait" "$rid" "$@"
   local rc=$?
   if unreachable "$rc"; then echo "UNSTICK UNREACHABLE $box/$name"; exit 4; fi
   exit "$rc"

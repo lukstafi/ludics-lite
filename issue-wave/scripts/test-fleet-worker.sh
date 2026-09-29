@@ -281,6 +281,10 @@ section_left() {
 # as Claude Code 2.1.282 takes one at its next tool boundary, and its text joins the reply; `BG
 # <n>` ends the turn with a background task listed that finishes <n> s later and starts a turn
 # of its own; `SILENT` exits 0 with no events; `FAIL` answers with an error result and stays up.
+# A control request line (`unstick --interrupt`, ludics-lite#424) is answered as Claude Code 2.1.284
+# answers it: a `control_response` receipt under its request_id, and, during a SLEEP, the turn
+# ends at once in an aborted `result` (error_during_execution, terminal_reason aborted_tools);
+# idle, the receipt alone. `NOINT` in a turn's message answers an interrupt with an error instead.
 cat > "$TMP/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 sid=""; fmt=text; resume=""; infmt=text; replay=0; probe=0
@@ -304,9 +308,17 @@ if [ "$infmt" = stream-json ]; then
   fi
   echo_line() { [ "$replay" = 0 ] || jq -c '. + {isReplay: true}' <<<"$1"; }
   say() { jq -cn --arg t "$1" '{type: "assistant", message: {content: [{type: "text", text: $t}]}}'; }
-  result() { jq -cn --arg t "$1" --arg s "$sid" --argjson e "${2:-false}" '{type: "result", subtype: (if $e then "error_during_execution" else "success" end), is_error: $e, num_turns: 1, result: $t, session_id: $s}'; }
+  result() { jq -cn --arg t "$1" --arg s "$sid" --argjson e "${2:-false}" --arg tr "${3:-}" '{type: "result", subtype: (if $e then "error_during_execution" else "success" end), is_error: $e, num_turns: 1, result: $t, session_id: $s} + (if $tr == "" then {} else {terminal_reason: $tr} end)'; }
+  is_control() { [ "$(jq -r '.type // empty' <<<"$1" 2>/dev/null)" = control_request ]; }
+  # control <line> [refuse]: the receipt of an interrupt, or with `refuse` an error answer.
+  control() {
+    local r; r=$(jq -r '.request_id // empty' <<<"$1")
+    if [ -n "${2:-}" ]; then jq -cn --arg r "$r" '{type: "control_response", response: {subtype: "error", request_id: $r, error: "shim: not now"}}'; return 1; fi
+    jq -cn --arg r "$r" '{type: "control_response", response: {subtype: "success", request_id: $r, response: {still_queued: []}}}'
+  }
   init() { printf '{"type":"system","subtype":"init","session_id":"%s","resumed":%s}\n' "$sid" "$([ -n "$resume" ] && echo true || echo false)"; }
   while IFS= read -r line; do
+    if is_control "$line"; then control "$line"; continue; fi
     msg=$(jq -r '.message.content // empty' <<<"$line" 2>/dev/null)
     init; echo_line "$line"
     grep -q '^SILENT' <<<"$msg" && exit 0
@@ -314,15 +326,20 @@ if [ "$infmt" = stream-json ]; then
     if grep -q '^HALFTURN' <<<"$msg"; then say "half"; result "half"; init; exit 0; fi
     extra=""
     n=$(sed -n '/^SLEEP [0-9]/ { s/^SLEEP \([0-9]*\).*/\1/; p; q; }' <<<"$msg")
-    i=0
+    i=0; aborted=0; noint=""; grep -q 'NOINT' <<<"$msg" && noint=1
     while [ -n "$n" ] && [ "$i" -lt "$n" ]; do
       if IFS= read -r -t 1 more; then
-        echo_line "$more"; extra="$extra +msg: $(jq -r '.message.content // empty' <<<"$more" | tr '\n' ' ' | cut -c1-30)"
+        if is_control "$more"; then control "$more" "$noint" && { aborted=1; break; }
+        else echo_line "$more"; extra="$extra +msg: $(jq -r '.message.content // empty' <<<"$more" | tr '\n' ' ' | cut -c1-30)"; fi
       else
         rs=$?; [ "$rs" -gt 128 ] || sleep 1   # >128 is the timeout, which already waited
       fi
       i=$((i + 1))
     done
+    if [ "$aborted" = 1 ]; then
+      echo '{"type":"system","subtype":"task_notification","task_id":"t1","status":"stopped"}'
+      result "" true aborted_tools; continue
+    fi
     text="did: $(printf '%s' "$msg" | tr '\n' ' ' | cut -c1-40)$extra"
     say "$text"
     if grep -q '^FAIL' <<<"$msg"; then result "boom: $text" true; continue; fi
@@ -1369,6 +1386,61 @@ FLEET_FEEDER_WAIT=1 "$FW" unstick testbox wr --message "$TMP/msg.md" >/dev/null
 grep -q -- '-lt 5 ]' "$ISSUE_WAVE_STATE/workers/wr/run.sh" && ok "...FLEET_FEEDER_WAIT=1 bounds run.sh's feeder wait at five polls" || ko "run.sh ignored FLEET_FEEDER_WAIT: $(cat "$ISSUE_WAVE_STATE/workers/wr/run.sh")"
 expect "an unwritable feeder pid file stops the worker before the CLI starts" 1 "FAILED testbox/wr exit=95" -- "$FW" attach testbox wr --interval 1
 rmdir "$ISSUE_WAVE_STATE/workers/wr/feeder.pid"
+
+# ludics-lite#424: --interrupt stops the turn in flight, tool call included, through the same
+# channel; a message given with it goes in only after the CLI's receipt, as the next turn.
+wid="$ISSUE_WAVE_STATE/workers/wi"
+printf 'SLEEP 60 then report\n' > "$TMP/slow60.md"
+"$FW" launch testbox wi --target-repo example/project --kind claude --brief "$TMP/slow60.md" --cwd "$proj" >/dev/null; sleep 1
+pid_before=$(cat "$wid/feeder.pid"); t0=$(date +%s)
+expect "unstick --interrupt --message stops a turn mid-tool, proven by the CLI's receipt" 0 \
+  "^INTERRUPTED testbox/wi kind=claude session=[0-9a-f-]\{36\} from=RUNNING request=[0-9a-f-]\{36\} receipt: still_queued=0$" -- "$FW" unstick testbox wi --interrupt --message "$TMP/msg.md"
+rid=$(sed -n 's/^INTERRUPTED .* request=\([0-9a-f-]*\) .*/\1/p' <<<"$out")
+grep -q "^APPENDED testbox/wi .* delivered (echoed by the CLI)$" <<<"$out" && ok "...then appends the message, which the CLI echoes" || ko "no delivered append after the interrupt: $out"
+expect "...the message is its own turn, answered at once" 0 "IDLE testbox/wi success .*did: Stop and answer now" -- "$FW" attach testbox wi --interval 1
+[ $(( $(date +%s) - t0 )) -lt 30 ] && ! grep -q '+msg: Stop' "$wid/stream.jsonl" && ok "...not after the 60 s call, and not folded into the aborted turn" || ko "the interrupt did not stop the turn: $(tail -n 5 "$wid/stream.jsonl")"
+[ "$(cat "$wid/feeder.pid")" = "$pid_before" ] && ! grep -q '"resumed":true' "$wid/stream.jsonl" && grep -q '^resumes=0$' "$wid/meta" &&
+  ok "...the same process: no restart, no resume" || ko "the interrupt restarted the worker: $(cat "$wid/meta")"
+[ "$(jq -c 'select(.type == "result") | [.is_error, .terminal_reason]' "$wid/stream.jsonl" | tr '\n' ' ')" = '[true,"aborted_tools"] [false,null] ' ] &&
+  ok "...the aborted turn ends in its own error result, before the message's" || ko "results: $(jq -c 'select(.type == "result")' "$wid/stream.jsonl")"
+[ "$(sed -n 2p "$wid/input.jsonl" | jq -c .)" = "{\"type\":\"control_request\",\"request_id\":\"$rid\",\"request\":{\"subtype\":\"interrupt\"}}" ] &&
+  [ "$(sed -n 3p "$wid/input.jsonl" | jq -j '.message.content')" = "$(cat "$TMP/msg.md")" ] &&
+  ok "...and input.jsonl logs the request, then the message" || ko "input.jsonl: $(cat "$wid/input.jsonl")"
+expect "status counts no unread message: a control line is not a message" 0 "turn=ended background_tasks=0 unread=0" -- "$FW" status testbox wi
+expect "a bare --interrupt to an IDLE worker: a receipt, nothing to stop" 0 "^INTERRUPTED testbox/wi .* from=IDLE .* still_queued=0$" -- "$FW" unstick testbox wi --interrupt
+expect "...which leaves its last reply standing" 0 "IDLE testbox/wi success .*did: Stop and answer now" -- "$FW" attach testbox wi --interval 1
+jq -cn '{type: "user", uuid: "x-2", message: {role: "user", content: "SLEEP 60"}}' >> "$wid/input.jsonl"; sleep 2
+expect "a bare --interrupt mid-turn stops it" 0 "^INTERRUPTED testbox/wi .* from=RUNNING " -- "$FW" unstick testbox wi --interrupt
+expect "...and attach reads the aborted turn as FAILED idle, awaiting input" 1 "FAILED testbox/wi idle error_during_execution is_error=true .*awaiting input" -- "$FW" attach testbox wi --interval 1
+jq -cn '{type: "user", uuid: "x-3", message: {role: "user", content: "SLEEP 60 NOINT"}}' >> "$wid/input.jsonl"; sleep 2
+n_in=$(grep -c '' "$wid/input.jsonl")
+expect "a CLI that answers the interrupt with an error: FAILED, and the message is not sent" 1 \
+  "^INTERRUPT FAILED testbox/wi request=[0-9a-f-]\{36\}: the CLI answered it with an error: shim: not now; the message was NOT sent (it stays at .*/messages/" -- "$FW" unstick testbox wi --interrupt --message "$TMP/msg2.md"
+[ "$(grep -c '' "$wid/input.jsonl")" -eq $((n_in + 1)) ] && ok "...only the request went in" || ko "input after a failed interrupt: $(cat "$wid/input.jsonl")"
+expect "--interrupt and --kill are refused together" 2 "unstick: --interrupt stops the turn and keeps the process" -- "$FW" unstick testbox wi --interrupt --kill
+expect "--interrupt takes no CLI arguments" 2 "unstick: --interrupt reaches a live process, which takes no CLI arguments" -- "$FW" unstick testbox wi --interrupt -- --model opus
+expect "a non-holder cannot interrupt" 1 "UNSTICK REFUSED testbox/wi: coordinator lease held by" -- env FLEET_COORDINATOR=other-session "$FW" unstick testbox wi --interrupt
+"$FW" unstick testbox wi --message "$TMP/msg.md" --kill >/dev/null; settle wi
+expect "an ended worker refuses --interrupt: it never falls back to a resume" 1 "UNSTICK REFUSED testbox/wi: --interrupt reaches only a live claude worker .* EXITED(0) .* nothing was sent" -- "$FW" unstick testbox wi --interrupt --message "$TMP/msg.md"
+grep -q '^resumes=1$' "$wid/meta" && [ -f "$wid/exit" ] && ok "...and did not resume it" || ko "a refused interrupt resumed: $(cat "$wid/meta")"
+# A CLI that never reads the request (here: inside a turn that reads nothing) sends no receipt:
+# the message stays out, and a kill-and-resume behind a queued message does not feed the new
+# process that request, which would abort the turn it resumes into.
+printf 'BG 30\n' > "$TMP/bg30.md"   # reads nothing for 30 s; the --kill below ends it sooner
+"$FW" launch testbox wu --target-repo example/project --kind claude --brief "$TMP/bg30.md" --cwd "$proj" >/dev/null
+wud="$ISSUE_WAVE_STATE/workers/wu"
+for i in $(seq 1 20); do grep -q '"background_tasks_changed","tasks":\[{' "$wud/stream.jsonl" 2>/dev/null && break; sleep 0.25; done
+FLEET_DELIVERY_WAIT=0 "$FW" unstick testbox wu --message "$TMP/msg.md" >/dev/null
+expect "an interrupt the CLI never answers is UNCONFIRMED, and the message is not sent" 1 \
+  "^INTERRUPT UNCONFIRMED testbox/wu request=[0-9a-f-]\{36\}: on the input channel, but the CLI sent no receipt within 1s .*the message was NOT sent .*unstick --kill" -- \
+  env FLEET_DELIVERY_WAIT=1 "$FW" unstick testbox wu --interrupt --message "$TMP/msg2.md"
+[ "$(grep -c '' "$wud/input.jsonl")" -eq 3 ] && grep -q '^{"type":"control_request"' <<<"$(sed -n 3p "$wud/input.jsonl")" && ok "...the request is the input's last line" || ko "input: $(cat "$wud/input.jsonl")"
+expect "a kill-and-resume behind a queued message and an unanswered interrupt" 0 "RESUMED testbox/wu " -- "$FW" unstick testbox wu --message "$TMP/msg2.md" --kill
+grep -q -- "tail -n +2 -f " "$wud/run.sh" && [ "$(grep -c '' "$wud/input.jsonl")" -eq 3 ] && ! grep -q control_request "$wud/input.jsonl" &&
+  ok "...feeds the queued message and drops the stale request" || ko "resume input: $(cat "$wud/run.sh") -- $(cat "$wud/input.jsonl")"
+expect "...and the resumed process answers both, the new one last" 0 "IDLE testbox/wu success .*did: Now the next step" -- "$FW" attach testbox wu --interval 1
+grep -q '"text":"did: Stop and answer now' <<<"$(tail -n +"$(( $(sed -n 's/^proc_offset=//p' "$wud/meta") + 1 ))" "$wud/stream.jsonl")" && ok "...the queued message had its own turn" || ko "queued message lost across the resume"
+settle wu
 
 printf 'SLEEP 60\n' > "$TMP/slow.md"
 "$FW" launch testbox a.b --target-repo example/project --kind claude --brief "$TMP/slow.md" --cwd "$proj" >/dev/null; sleep 1
