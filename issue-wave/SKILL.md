@@ -242,9 +242,17 @@ session kind a worker or leg uses, a non-interactive ssh (a local shell on the a
 refuses a token that call rejects (ludics-lite#360: on 2026-09-23 a dead keyring token surfaced
 an hour into a worker's task, and on 2026-09-24 minix's token answered HTTP 401 over ssh while
 `gh auth status` at its desktop console was green - the console and the status read prove
-nothing about the worker's session). A GitHub that does not answer (no reply within
-`FLEET_GH_TIMEOUT`, 30 s; a connection error; an HTTP 5xx) is noted on the OK line, not refused,
-as a sleeping sibling is. A refusal names its reason; surface it rather than launching
+nothing about the worker's session). It also asks git for github.com's HTTPS credential as a
+push does (`git credential fill`) and tries what comes back against GitHub, never printing it,
+refusing when none comes back, GitHub refuses it, or it is another account's than gh's, with
+`gh auth setup-git` as the repair; and
+for a CLI worker it repeats the probe in a throwaway tmux session, of the running server (whose
+environment the worker inherits) or of one started from its own shell as the worker's would be,
+refusing a session whose credential does not work or answers as another account (repair: restart
+that server once its workers finish, or fix the default shell's startup; ludics-lite#374).
+`launch` and `unstick` repeat that probe just before they create the worker's session. A GitHub that does not
+answer (no reply within `FLEET_GH_TIMEOUT`, 30 s per call; a connection error; an HTTP 5xx) is
+noted on the OK line, not refused, as a sleeping sibling is. A refusal names its reason; surface it rather than launching
 stale, and never reset a dirty checkout silently - a divergent local edit may be a fix worth
 keeping. Every launch, not just the first: upstream main advancing mid-wave is normal,
 after-merge's push-side fast-forward is best-effort, and the deployed skills are symlinks into
