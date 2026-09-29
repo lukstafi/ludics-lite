@@ -52,6 +52,9 @@ check passing:
 Options: `--base` (default `origin/master`), `--timeout` seconds (default 14400, i.e. 4h), `--interval` seconds (default 60),
 `--repo`, `--label`. The script does not detect the base branch: on a repository whose base is
 `main`, pass `--base origin/main`, or a branch merged there reads as unlanded until the timeout.
+`--repo` (default: the current directory) is the path of a local checkout whose `origin` holds the
+branch, NOT the `owner/name` other tools take: git fetches and runs merge-base in that checkout, and
+`owner/name` names none. A missing path shaped like `owner/name` is refused with exit 2.
 
 ## Read the outcome, do not assume it
 
@@ -61,7 +64,7 @@ Every exit prints one line. Four of the five are not "go":
 |---|---|---|
 | 0 | `CLEAR:` | Proceed — "On wake" below. |
 | 3 | `TIMEOUT:` | Nothing landed in the window. Report to the user; do not start on a guess. |
-| 4 | `ERROR:` | Predicate unevaluable (wrong repo path). Fix and re-arm. |
+| 4 | `ERROR:` | Predicate unevaluable (`--repo` is not a git checkout). Fix and re-arm. |
 | 5 | `ABANDONED:` | The PR was closed unmerged — this will never clear. Tell the user; the plan needs rethinking, not a longer wait. |
 | 2 | usage | Fix the invocation. |
 
