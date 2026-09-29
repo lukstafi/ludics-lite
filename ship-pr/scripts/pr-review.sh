@@ -1441,8 +1441,11 @@ SUMMARY_COMPLETED_ROW_RE='^\|[^|]*Code Review[^|]*\| *✅ \*\*Completed\*\* <rel
 # The same row when the reviewer's RUN failed (#453), the one failure status the app has been seen
 # to write — once in the 621 Code Review rows of every summary comment on both repositories since
 # the table appeared (2026-08-29 to 2026-09-29), on lukstafi/ocannl-staging#633
-# (issuecomment-5541857882), and again on ludics-lite#465, the PR that added this reading, with a
-# "Manual request" trigger one second after a "Something went wrong" comment:
+# (issuecomment-5541857882); then twice on 2026-09-29: ludics-lite#462's opening round (read back
+# from the comment's GraphQL userContentEdits, since the app rewrites the row in place — the row's
+# datetime 17:40:02Z, the edit 17:40:56Z, and one '@codex review' got the round), and ludics-lite#465,
+# the PR that added this reading, with a "Manual request" trigger one second after a "Something
+# went wrong" comment:
 #   | 📝 **Code Review** | ⚠️ **Failed** <relative-time datetime="2026-09-04T22:47:25.387018Z">...</relative-time> | `1e14b13` | New commits |
 # A fail-closed allowlist of that row, cell by cell as the Completed one is: U+26A0 WITH its
 # variation selector U+FE0F (the bytes that row carries), the bold word, one relative-time element,
@@ -3226,7 +3229,7 @@ watch_loop() {
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"
   local start=$SECONDS was state tok age quiet=0 saw=0 blind=0 past_seen=0 past_last=""
   local watch_nudge_after extension_end="" candidate_end candidate_kind extension_kind="" extension_mark="" remaining pause elapsed final_state last_healthy_mark="$mark"
-  local fkind fsha fresh rerequested="" rerequest_end=""
+  local fkind fsha rerequested="" rerequest_end=""
   watch_nudge_after=$(mark_of "$mark" 2)
 
   state=$(status_state "$pr")
@@ -3250,6 +3253,23 @@ watch_loop() {
     # reporting it (ludics-lite#289) — the read is made on the round that ends, never on the rest.
     state=$(gated_state "$pr")
     tok=$(state_tok "$state")
+    # A failed run this watch is about to re-request (the `failed` arm below) is read again, fresh:
+    # the round's state came from its snapshot, and a push or a 👍 landing since would make the
+    # post request the wrong head or clear the approval (review of #465). The fresh read REPLACES
+    # the round's state, so whatever it says — an approval, a new head's due round, an unreadable
+    # state — goes through this round's ordinary handling and deadlines, and the arm posts only
+    # on a state read after the round. The seconds between this read and the POST remain: GitHub
+    # has no conditional comment write, and the next round reads whatever landed in them.
+    if [ "$tok" = failed ]; then
+      fkind=$(state_detail "$state" | cut -d'|' -f1-2)
+      if [ "${fkind#*|}" = run ] && [ "$rerequested" != "${fkind%%|*}" ]; then
+        snapshot_drop
+        state=$(gated_state "$pr")
+        tok=$(state_tok "$state")
+        [ "$(state_detail "$state" | cut -d'|' -f1-2)" = "$fkind" ] ||
+          warn "PR $REPO#$pr: not re-requesting the failed run on ${fkind%%|*} — a fresh read says: $(status_line "$state")"
+      fi
+    fi
     age=$(state_age "$state")
     if [ "$tok" != unknown ]; then
       # The first negative read still holds the live round: only the second
@@ -3308,42 +3328,29 @@ watch_loop() {
       fkind="${fkind#*|}"
       fkind="${fkind%%|*}"
       if [ "$fkind" = run ] && [ "$rerequested" != "$fsha" ]; then
-        # The round's state is the round's snapshot, read seconds ago: a push or a 👍 landing since
-        # would make this post request the wrong head or clear the approval. So the state is read
-        # again, fresh, right before the write, and the post is made only if it is still this
-        # head's first failed run. What is left is the seconds between that read and the POST,
-        # which no comment write can close (GitHub has no conditional comment); the next round
-        # reads whatever landed in them.
-        snapshot_drop
-        fresh=$(status_state "$pr")
-        if [ "$(state_tok "$fresh")" = failed ] &&
-          [ "$(state_detail "$fresh" | cut -d'|' -f1-2)" = "$fsha|run" ]; then
-          if gh_retry write api -X POST "repos/$REPO/issues/$pr/comments" \
-            -f body="@codex review
+        # This state is the fresh one read above, right after the round's.
+        if gh_retry write api -X POST "repos/$REPO/issues/$pr/comments" \
+          -f body="@codex review
 
 _🤖 Addressed by an automated coding agent_" --jq .html_url >/dev/null; then
-            rerequested="$fsha"
-            # The request's grace is this watch's to wait out, from now: the deadline the round
-            # computed was the `failed` state's, which has none, and a failure first seen on the
-            # window's last poll would otherwise end it before the request is ever read back.
-            rerequest_end=$((SECONDS + GRACE))
-            candidate_end="$rerequest_end"
-            candidate_kind=nudged
-            warn "PR $REPO#$pr: re-requested the review with '@codex review' — the run on head" \
-              "$fsha failed with no review and no 👍 to clear; watching for the new round"
-          else
-            # Not posted, or not known to be: the caller decides, with the error in hand.
-            watch_drift_note "$pr"
-            echo "the '@codex review' re-request for the failed run on head $fsha did not go" \
-              "through ($(gh_err_line)) — read the PR's comments before posting it by hand," \
-              "since a request that failed ambiguously may have landed"
-            echo "status: $(status_line "$state")"
-            echo "watermark: $mark"
-            return 0
-          fi
+          rerequested="$fsha"
+          # The request's grace is this watch's to wait out, from now: the deadline the round
+          # computed was the `failed` state's, which has none, and a failure first seen on the
+          # window's last poll would otherwise end it before the request is ever read back.
+          rerequest_end=$((SECONDS + GRACE))
+          candidate_end="$rerequest_end"
+          candidate_kind=nudged
+          warn "PR $REPO#$pr: re-requested the review with '@codex review' — the run on head" \
+            "$fsha failed with no review and no 👍 to clear; watching for the new round"
         else
-          warn "PR $REPO#$pr: not re-requesting — the state moved since the round was read:" \
-            "$(status_line "$fresh")"
+          # Not posted, or not known to be: the caller decides, with the error in hand.
+          watch_drift_note "$pr"
+          echo "the '@codex review' re-request for the failed run on head $fsha did not go" \
+            "through ($(gh_err_line)) — read the PR's comments before posting it by hand," \
+            "since a request that failed ambiguously may have landed"
+          echo "status: $(status_line "$state")"
+          echo "watermark: $mark"
+          return 0
         fi
         was="$tok"
         quiet=0

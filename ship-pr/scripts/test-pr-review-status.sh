@@ -1555,6 +1555,12 @@ test_a_failed_run_on_the_head_is_a_failed_state() {
   run_cmd_status
   assert_eq "$CMD_RC" 0 "a state that was READ is exit 0"
   assert_contains "$CMD_OUT" "review rounds with findings: 1 of 12" "the failed run is not a round"
+  # ludics-lite#462's row, 2026-09-29, read back from the summary's edit history (the app has since
+  # rewritten it): the same shape, on a PR's opening round.
+  COMMENTS_JSON="[$(failed_run_summary 1 '| 📝 **Code Review** | ⚠️ **Failed** <relative-time datetime="2026-09-29T17:40:02.163602Z">2026-09-29T17:40:02.163602Z</relative-time> | `1e14b13` | PR opened |')]"
+  run_status
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run "#462's row reads as the same failed run"
+  failed_run_fixture
   # A 👀 left up under the row, with nothing said since it, is the same failed run.
   REACTIONS_JSON="[$(reaction eyes 2026-09-04T22:46:40Z)]"
   run_status
@@ -1722,18 +1728,24 @@ test_watch_waits_out_a_re_request_posted_on_its_last_poll() {
   assert_contains "$WATCH_OUT" "no review materialized" "the grace verdict is the request's own"
 }
 
-# Review of #465, round 1: the round decided on its snapshot, and a 👍 landing before the write
-# would be cleared by it. The state is read fresh right before the POST, and the post is skipped
-# when it is no longer this head's first failed run.
+# Review of #465, rounds 1 and 2: the round decided on its snapshot, and a 👍 landing before the
+# write would be cleared by it. The state is read fresh before the round is dispatched, the post is
+# made only on that read, and whatever the read says instead is handled by the same round — here
+# on the window's LAST regular poll, where a state only logged would have ended the window quiet
+# on the stale failure.
 test_watch_does_not_post_over_an_approval_that_landed_since_the_round() {
   failed_run_fixture
   # Reactions reads: the opening status (1), the round's state (2), the fresh read before the
   # write (3) — the 👍 lands between the round and the write.
   THUMBS_ON_REACTIONS_READ=3
-  run_watch 0,1,0 1 3
+  # An interval past the timeout: this round is the last regular one.
+  run_watch 0,1,0 5 3
   assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 0 "nothing is posted"
-  assert_contains "$WATCH_ERR" "not re-requesting — the state moved since the round was read" "and the watch says why"
-  assert_contains "$WATCH_OUT" "approved" "the approval is what the watch ends on"
+  assert_contains "$WATCH_ERR" "not re-requesting the failed run on 1e14b13 — a fresh read says: approved" \
+    "and the watch says why"
+  assert_eq "$WATCH_RC" 0 "the approval ends the wait"
+  assert_contains "$WATCH_OUT" "approved (👍 from" "and is what the watch reports, not the stale failure"
+  assert_not_contains "$WATCH_OUT" "FAILED" "the failure the round read is not reported"
 }
 
 test_watch_surfaces_a_re_request_that_did_not_post() {
