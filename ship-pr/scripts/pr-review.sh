@@ -1439,9 +1439,10 @@ REVIEWED_COMMIT_RE='Reviewed commit[^0-9a-fA-F]*(?<s>[0-9a-f]{7,40})'
 # is not a verdict, and what it leaves is the reading status gave before this row was read.
 SUMMARY_COMPLETED_ROW_RE='^\|[^|]*Code Review[^|]*\| *✅ \*\*Completed\*\* <relative-time datetime="(?<at>[^"]+)">[^<|]*</relative-time> *\| *`(?<sha>[0-9a-f]{7,40})` *\|'
 # The same row when the reviewer's RUN failed (#453), the one failure status the app has been seen
-# to write — once, on lukstafi/ocannl-staging#633 (2026-09-04, issuecomment-5541857882), in
-# the Code Review rows of every summary comment on both repositories since the table appeared
-# (2026-08-29 to 2026-09-29), 1 of 621:
+# to write — once in the 621 Code Review rows of every summary comment on both repositories since
+# the table appeared (2026-08-29 to 2026-09-29), on lukstafi/ocannl-staging#633
+# (issuecomment-5541857882), and again on ludics-lite#465, the PR that added this reading, with a
+# "Manual request" trigger one second after a "Something went wrong" comment:
 #   | 📝 **Code Review** | ⚠️ **Failed** <relative-time datetime="2026-09-04T22:47:25.387018Z">...</relative-time> | `1e14b13` | New commits |
 # A fail-closed allowlist of that row, cell by cell as the Completed one is: U+26A0 WITH its
 # variation selector U+FE0F (the bytes that row carries), the bold word, one relative-time element,
@@ -2050,7 +2051,9 @@ status_state() {
   #     round submits its review seconds BEFORE its row flips, see the read order above, so
   #     "nothing after the row" would be the wrong test); with the 👀 taken down — the app takes
   #     it down when a run ends, and #633 had none — no review of this head at all, and nothing
-  #     newer than the row.
+  #     newer than the row. An initialization-failure comment posted with the row (#465: one second
+  #     BEFORE it) is the same failed run, not a word against it: the row, being newer, is read,
+  #     and the init-failure arm below keeps the failures that come with no row.
   # The kind says whether this head has had a request before: `run` when no '@codex review' was
   # posted between the head's arrival and the row, `run-again` when one was, so the failure is
   # the answer to a request already made. `watch` re-requests on `run` and surfaces `run-again`,

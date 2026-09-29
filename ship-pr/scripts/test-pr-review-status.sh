@@ -1617,6 +1617,30 @@ test_a_failed_run_counts_the_requests_on_its_head() {
   assert_eq "$(state_tok "$STATE")" nudged "and inside a watch it is that request's grace"
 }
 
+# ludics-lite#465, this reading's own PR, 2026-09-29: head d208deb committed 17:53:20Z, the
+# connector's missing-environment answer at 18:08:06Z, a '@codex review' at 18:08:34Z, then a
+# "Something went wrong" naming d208deb at 18:09:10Z and the row flipping to Failed ("Manual
+# request") one second later. The comment posted with the row is the same failed run.
+test_a_failed_run_posted_with_an_initialization_failure() {
+  reset_fixture
+  HEAD_SHA=d208debe08508c6ffe2c5c6f2a12466225832581
+  HEAD_AT=2026-09-29T17:53:20Z
+  local row='| 📝 **Code Review** | ⚠️ **Failed** <relative-time datetime="2026-09-29T18:09:11.056100Z">2026-09-29T18:09:11.056100Z</relative-time> | `d208deb` | Manual request |'
+  COMMENTS_JSON="[$(plain_comment 1 2026-09-29T18:08:06Z "$ENV_FAILURE_BODY"),$(request_comment 2 2026-09-29T18:08:34Z),$(
+    failed_run_summary 3 "$row"),$(failure_comment 4 "$HEAD_SHA" 2026-09-29T18:09:10Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" failed "the run failed"
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run-again "after the request made on this head"
+  # The same row and comment on a head nobody re-requested: the run, to re-request.
+  COMMENTS_JSON="[$(failed_run_summary 3 "$row"),$(failure_comment 4 "$HEAD_SHA" 2026-09-29T18:09:10Z)]"
+  run_status
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run "the comment posted with the row does not disqualify it"
+  # A failure comment AFTER the row is the reviewer's newer word, and its own arm reads it.
+  COMMENTS_JSON="[$(failed_run_summary 3 "$row"),$(failure_comment 4 "$HEAD_SHA" 2026-09-29T18:09:30Z)]"
+  run_status
+  assert_contains "$LINE" "reviewer FAILED at initialization" "a later comment is read by its own arm"
+}
+
 test_a_failed_row_outside_the_allowlist_is_not_read() {
   local row
   for row in "${FAILED_RUN_ROW/⚠️/⚠}" "${FAILED_RUN_ROW/⚠️/❌}" "${FAILED_RUN_ROW/Failed/Error}" \
@@ -1739,6 +1763,7 @@ tests=(
   test_a_failed_run_needs_the_head_and_no_approval
   test_a_failed_run_needs_a_silent_reviewer
   test_a_failed_run_counts_the_requests_on_its_head
+  test_a_failed_run_posted_with_an_initialization_failure
   test_a_failed_row_outside_the_allowlist_is_not_read
   test_a_broken_jq_program_is_unknown_on_the_request_read
   test_watch_re_requests_a_failed_run_once
