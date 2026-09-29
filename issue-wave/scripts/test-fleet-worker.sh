@@ -410,7 +410,8 @@ chmod +x "$TMP/bin/git"
 REAL_TMUX=$(command -v tmux)
 cat > "$TMP/bin/tmux" <<EOF
 #!/usr/bin/env bash
-if [ -n "\${SHIM_TMUX_FAIL_NEW:-}" ]; then case " \$* " in *" new-session "*) echo "shim: tmux refuses new-session" >&2; exit 1 ;; esac; fi
+# A worker's session only (iw-*): the GitHub probe's own session (ludics-lite#374) goes through.
+if [ -n "\${SHIM_TMUX_FAIL_NEW:-}" ]; then case " \$* " in *" new-session "*" -s iw-"*) echo "shim: tmux refuses new-session" >&2; exit 1 ;; esac; fi
 # The server the preflight's environment check reads (ludics-lite#327): SHIM_TMUX_GENV names a
 # file holding \`show-environment -g\` output, or \`none\` for no server running; SHIM_TMUX_SESSIONS
 # lists its session names and SHIM_TMUX_UPDATE_ENV its update-environment option; with
@@ -460,20 +461,22 @@ SHIMEOF
 # preflight's `git credential fill` (ludics-lite#374) gets a credential from it unless
 # SHIM_GH_CRED=none (no credential, as gh with no login answers) or `hang`; `dead` returns one
 # the API call then refuses, as GitHub refuses a stale password (the API call reads the token it
-# was given, GH_TOKEN, as gh does), and `other` one that answers as another account.
-# SHIM_GH_SLOW=<s> delays every API answer.
+# was given, GH_TOKEN, as gh does), `other` one that answers as another account, and `slowcheck`
+# one GitHub never answers for.
+# SHIM_GH_SLOW=<s> delays every API answer; SHIM_GH_LOGIN=<login> answers as that account.
 cat > "$TMP/bin/gh" <<'SHIMEOF'
 #!/usr/bin/env bash
 if [ "$*" = "auth git-credential get" ]; then
   cat > /dev/null
   case "${SHIM_GH_CRED:-}" in none) exit 1 ;; hang) sleep 30 ;; esac
-  case "${SHIM_GH_CRED:-}" in dead) tok=dead-token ;; other) tok=other-token ;; *) tok=shim-token ;; esac
+  case "${SHIM_GH_CRED:-}" in dead) tok=dead-token ;; other) tok=other-token ;; slowcheck) tok=slow-token ;; *) tok=shim-token ;; esac
   printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n' "$tok"; exit 0
 fi
 [ "$*" = "api --hostname github.com user -q .login" ] || { echo "gh shim: unexpected call: $*" >&2; exit 2; }
 [ -z "${SHIM_GH_SLOW:-}" ] || sleep "$SHIM_GH_SLOW"
 [ "${GH_TOKEN:-}" != dead-token ] || { echo "gh: Bad credentials (HTTP 401)" >&2; exit 1; }
 [ "${GH_TOKEN:-}" != other-token ] || { echo other-user; exit 0; }
+[ "${GH_TOKEN:-}" != slow-token ] || sleep 30
 [ -z "${SHIM_GH_DEAD_WHEN:-}" ] || [ ! -e "$SHIM_GH_DEAD_WHEN" ] || { echo "gh: Bad credentials (HTTP 401)" >&2; exit 1; }
 case "${SHIM_GH:-}" in
   401) printf '{\n  "message": "Bad credentials",\n  "status": "401"\n}'; echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
@@ -482,7 +485,7 @@ case "${SHIM_GH:-}" in
   5xx) echo "gh: Server Error (HTTP 502)" >&2; exit 1 ;;
   hang) sleep 30 ;;
 esac
-echo shim-user
+echo "${SHIM_GH_LOGIN:-shim-user}"
 SHIMEOF
 chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux" "$TMP/bin/ssh" "$TMP/bin/gh"
 # Through GIT_CONFIG_GLOBAL, not ~/.gitconfig: some sections preflight under a HOME of their own.
@@ -1016,11 +1019,13 @@ expect "a gh call that never returns is bounded and noted" 0 "PREFLIGHT OK.*GitH
 expect "no git credential for github.com refuses with gh auth setup-git" 1 "PREFLIGHT REFUSED other: git gets no GitHub credential in a non-interactive session on other (git credential fill for https://github.com: fatal: could not read Username for 'https://github.com': terminal prompts disabled), so a worker's push would fail -- repair: ssh other 'gh auth setup-git'$" -- \
   env SHIM_GH_CRED=none "${FWO[@]}" preflight other --native-claude --no-cross
 expect "...on the anchor, in a terminal there" 1 "repair: in a terminal on this box: gh auth setup-git$" -- env SHIM_GH_CRED=none "$FW" preflight testbox --no-probe --no-cross
-expect "...and a helper that never answers is bounded and refused" 1 "git credential fill for https://github.com: no answer in 2s" -- env SHIM_GH_CRED=hang FLEET_GH_TIMEOUT=2 "$FW" preflight testbox --no-probe --no-cross
+expect "...and a helper that never answers is bounded and refused" 1 "git credential fill for https://github.com: no answer from git's credential helper in 9s" -- env SHIM_GH_CRED=hang FLEET_GH_TIMEOUT=2 "$FW" preflight testbox --no-probe --no-cross
 expect "...and the git probe still runs when GitHub's API did not answer" 1 "PREFLIGHT REFUSED testbox: git gets no GitHub credential" -- env SHIM_GH=down SHIM_GH_CRED=none "$FW" preflight testbox --no-probe --no-cross
 expect "a git credential GitHub refuses is refused, though gh's own token passes" 1 "PREFLIGHT REFUSED other: GitHub rejects the credential git returns for https://github.com in a non-interactive session on other (gh: Bad credentials (HTTP 401)) though gh's own token passes, so a worker's push would fail -- repair: ssh other 'gh auth setup-git' (it makes gh git's helper for github.com)$" -- \
   env SHIM_GH_CRED=dead "${FWO[@]}" preflight other --native-claude --no-cross
 grep -q 'dead-token' <<<"$out" && ko "the refused git credential reached the output -- $out" || ok "...and the credential it refused is not printed"
+expect "GitHub not answering the try of git's credential is noted, not read as a helper timeout" 0 "PREFLIGHT OK testbox .*(GitHub unreachable from testbox: checking git's credential: no answer from gh api user in 2s)$" -- \
+  env SHIM_GH_CRED=slowcheck FLEET_GH_TIMEOUT=2 "$FW" preflight testbox --native-claude --no-cross
 expect "a git credential for another account than gh's is refused" 1 "PREFLIGHT REFUSED testbox: git's credential for https://github.com is another account's than gh's in a non-interactive session on testbox (git's credential is other-user's, gh's token is shim-user's), so a worker would push as one account and open its PR as the other -- repair: in a terminal on this box: gh auth setup-git" -- \
   env SHIM_GH_CRED=other "$FW" preflight testbox --native-claude --no-cross
 out=$(env SHIM_GH=down SHIM_GH_CRED=none "$FW" preflight testbox --no-probe --no-cross 2>&1)
@@ -1175,6 +1180,25 @@ expect "a real server whose git gets no credential refuses, and names kill-serve
   "server on testbox gives a new session a GitHub credential that does not work (git credential fill: fatal: could not read Username .*no worker session is live on it, so restart it with \`tmux -L $envsock kill-server\` (kill-server also ends its non-worker session(s): notes) and try again" -- \
   "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe --no-cross
 "$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
+# The server must answer as the account this session proved, not merely with a live token: here it
+# holds another account's, for gh and git alike.
+"${fresh[@]}" SHIM_GH_LOGIN=other-user "$REAL_TMUX" -L "$envsock" new-session -d -s iw-real 'sleep 60'
+expect "a real server whose credential is another account's refuses" 1 "the running tmux server on testbox gives a new session a GitHub credential that does not work (gh api user answers as other-user, not as shim-user)" -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe --no-cross
+"$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
+# No server running: the worker's session starts one from this shell, run by tmux's default shell,
+# whose startup can change the credential (zsh's ~/.zshenv sources env.sh on the anchor). A default
+# shell that exports a dead one is refused though this shell's passes, and the probe's server exits
+# with its session.
+printf '#!/usr/bin/env bash\nexport SHIM_GH=401\nexec bash "$@"\n' > "$TMP/badshell"; chmod +x "$TMP/badshell"
+nosock="fwtest-none-$$"
+expect "with no server, a default shell whose startup sets a dead credential refuses" 1 "PREFLIGHT REFUSED testbox: a tmux server started from this session on testbox gives a new session a GitHub credential that does not work (gh api user: gh: Bad credentials (HTTP 401)), though this session's own passes: its default shell's startup files change it" -- \
+  "${fresh[@]}" SHELL="$TMP/badshell" FLEET_TMUX_SOCKET="$nosock" "$FW" preflight testbox --no-probe --no-cross
+for _ in $(seq 1 30); do "$REAL_TMUX" -L "$nosock" list-sessions >/dev/null 2>&1 || break; sleep 0.1; done
+"$REAL_TMUX" -L "$nosock" list-sessions >/dev/null 2>&1 && ko "the probe left a tmux server running on $nosock" || ok "...and the server the probe started exits with it"
+expect "...while a default shell that leaves it alone passes" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- \
+  "${fresh[@]}" SHELL="$(command -v bash)" FLEET_TMUX_SOCKET="$nosock" "$FW" preflight testbox --no-probe --no-cross
+"$REAL_TMUX" -L "$nosock" kill-server 2>/dev/null
 # A preflight killed outright (no trap runs) while its probe session is live: the probe ends that
 # session itself, so a remain-on-exit server keeps no dead fw-ghprobe-* session.
 "${fresh[@]}" SHIM_GH_SLOW=3 "$REAL_TMUX" -L "$envsock" new-session -d -s iw-real 'sleep 60'
@@ -1195,7 +1219,7 @@ if [ "$seen" = 1 ] && [ "$left" = iw-real ]; then ok "a probe session outlives n
 else ko "probe session seen=$seen; sessions after the killed preflight: $left"; fi
 "$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
 "${fresh[@]}" SHIM_GH=hang "$REAL_TMUX" -L "$envsock" new-session -d -s iw-real 'sleep 60'
-expect "a gh call that hangs only in the server is bounded and noted" 0 "PREFLIGHT OK .*(GitHub unreachable from testbox: in the running tmux server: no answer from gh api user in 1s)" -- \
+expect "a gh call that hangs only in the server is bounded and noted" 0 "PREFLIGHT OK .*(GitHub unreachable from testbox: in a tmux session: no answer from gh api user in 1s)" -- \
   "${fresh[@]}" FLEET_GH_TIMEOUT=1 FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe --no-cross
 "$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
 }
@@ -1251,10 +1275,10 @@ expect "a tmux server whose GitHub credential dies after the preflight still ref
 [ -e "$ISSUE_WAVE_STATE/workers/wg" ] && ko "a GitHub refusal at launch left a record behind" || ok "...and leaves no record"
 "$REAL_TMUX" -L "$FLEET_TMUX_SOCKET" set-environment -gu SHIM_GH_DEAD_WHEN; rm -f "$TMP/gh-dead-now"
 "$REAL_TMUX" -L "$FLEET_TMUX_SOCKET" kill-session -t =holder374
-# With no server running, the worker's session starts one from the launch's own far-side shell, so
-# that is what the late probe tries: here its credential dies during the base gate.
+# The late probe first re-proves the launch's own far-side shell, the one a new server would start
+# from: here its credential dies during the base gate, with no server running.
 nosock="fwtest-none-$$"
-expect "with no tmux server, a credential that dies after the preflight still refuses the launch" 1 "LAUNCH REFUSED testbox/wn: a tmux server started from this session on testbox would give a CLI worker a GitHub credential that does not work (gh api user: gh: Bad credentials (HTTP 401))" -- \
+expect "with no tmux server, a credential that dies after the preflight still refuses the launch" 1 "LAUNCH REFUSED testbox/wn: GitHub credential refused in a non-interactive session on testbox (gh api user: gh: Bad credentials (HTTP 401)) -- \`fleet-worker.sh preflight testbox\` names the repair" -- \
   env FLEET_TMUX_SOCKET="$nosock" SHIM_GH_DEAD_WHEN="$TMP/gh-dead-now" SHIM_BASE_TOUCH="$TMP/gh-dead-now" "$FW" launch testbox wn --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 "$REAL_TMUX" -L "$nosock" list-sessions >/dev/null 2>&1 && ko "the refused launch started a tmux server on $nosock" || ok "...and starts no server"
 [ -e "$ISSUE_WAVE_STATE/workers/wn" ] && ko "a no-server GitHub refusal left a record behind" || ok "...and leaves no record"
@@ -1587,7 +1611,7 @@ expect "a resume refuses against a tmux server whose GitHub credential is dead" 
 "$REAL_TMUX" -L "$FLEET_TMUX_SOCKET" set-environment -gu SHIM_GH
 "$REAL_TMUX" -L "$FLEET_TMUX_SOCKET" kill-session -t =holder374
 cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "...leaving meta and exit as they were" || ko "meta or exit changed by a GitHub refusal"
-expect "...and with no server running, against the credential of the shell that would start one" 1 "UNSTICK REFUSED testbox/wo: a tmux server started from this session on testbox would give a CLI worker a GitHub credential that does not work (gh api user: gh: Bad credentials (HTTP 401))" -- \
+expect "...and with no server running, against the credential of the shell that would start one" 1 "UNSTICK REFUSED testbox/wo: GitHub credential refused in a non-interactive session on testbox (gh api user: gh: Bad credentials (HTTP 401))" -- \
   env SHIM_GH=401 FLEET_TMUX_SOCKET="fwtest-none-$$" "$FW" unstick testbox wo --message "$TMP/msg.md"
 cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "...leaving meta and exit as they were too" || ko "meta or exit changed by a no-server GitHub refusal"
 echo 99 > "$ISSUE_WAVE_STATE/workers/wo/exit.prev"; echo "kind=stale" > "$ISSUE_WAVE_STATE/workers/wo/meta.prev"; cp "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/wo.meta"

@@ -115,8 +115,8 @@ the box's file from the anchor's, `ssh <box> 'f=~/.config/fleet/gh-token.sh; uma
 ~/.config/fleet/gh-token.sh` (a fresh 0600 file, swapped in), and restart any tmux server that inherited the old value.
 It also asks git for github.com's HTTPS credential the way a push does (`git credential fill`)
 and tries it against GitHub, refusing with `gh auth setup-git` when none comes back or GitHub
-refuses it, and for a CLI worker it runs the probe again inside the box's running tmux server,
-whose environment the worker inherits.
+refuses it, and for a CLI worker it runs the probe again as a tmux session of the server the
+worker would start in, whose environment the worker inherits.
 Provider/model, launch transport and execution placement are separate choices. Both Codex and
 Claude Code support their own native subagents in coordinator-created external worktrees, or
 CLI workers launched with `--kind codex` or `--kind claude`. Only the CLI route provides

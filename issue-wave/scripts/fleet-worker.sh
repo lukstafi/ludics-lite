@@ -195,8 +195,9 @@
 #   FLEET_PROBE_TIMEOUT: wall-clock bound on the live headless preflight turn; 120.
 #   FLEET_CROSS_TIMEOUT: wall-clock bound on each cross-box ssh reach probe of the preflight; 20.
 #   FLEET_FETCH_TIMEOUT: wall-clock bound on skills-checkout and project fetches; 300.
-#   FLEET_GH_TIMEOUT: wall-clock bound on each of the preflight's GitHub credential calls, `gh api
-#     user` and `git credential fill`, in its own session and in a running tmux server's; 30.
+#   FLEET_GH_TIMEOUT: wall-clock bound on each of the GitHub probe's API calls, `gh api user` and
+#     the try of the credential git returns (git's helper gets twice that plus 5 s, the try
+#     inside it included), in the preflight's session and in a tmux session; 30.
 #   FLEET_REFRESH_TIMEOUT: wall-clock bound on `refresh`'s skills fetch (and so on the refresh
 #     after a cross-box `execution run`/`dispatch`); 30.
 #   FLEET_DELIVERY_WAIT: seconds an appending `unstick` waits for the CLI to echo the message; 20.
@@ -767,7 +768,8 @@ ghprobe_fn() {
 # a file: git.out holds git's stderr and gh's error alone. The account must be the one gh's own
 # token answered as, since that is who opens the PR (the fleet pushes as one user). Its exits: 0
 # accepted (or retrieved, when there was nothing to try it against), 1 no credential, 2 GitHub
-# refused it, 3 no password, 4 another account's.
+# refused it, 3 no password, 4 another account's, 5 GitHub did not answer the try; 124 is then the
+# helper's own silence, since the try is bounded inside.
 # With `tmux` it ends by killing its own session, so `remain-on-exit` or an interrupted preflight
 # leaves none behind; the caller never passes it outside a probe session (a shell in the user's own
 # pane has TMUX_PANE too).
@@ -779,18 +781,22 @@ if command -v gh >/dev/null 2>&1; then
   GH_PROMPT_DISABLED=1 bounded "$t" gh api --hostname github.com user -q .login > "$d/gh.out"; echo "$?" > "$d/gh.rc"
 else echo 127 > "$d/gh.rc"; fi
 # bounded runs it in a subshell that records its status after it: return, never exit.
+# The API call has its own bound inside the helper's: its silence is GitHub's (5), not the helper's.
 git_cred() {
-  local cred pw out
+  local cred pw out orc
   cred=$(git credential fill) || return 1
   [ "$1" = 0 ] || return 0
   pw=$(printf '%s\n' "$cred" | sed -n 's/^password=//p' | head -n 1)
   [ -n "$pw" ] || { echo "git's answer carries no password"; return 3; }
-  out=$(GH_TOKEN=$pw GH_PROMPT_DISABLED=1 gh api --hostname github.com user -q .login 2>&1) && [ -n "$out" ] || { printf '%s\n' "$out"; return 2; }
+  out=$(GH_TOKEN=$pw GH_PROMPT_DISABLED=1 bounded "$3" gh api --hostname github.com user -q .login); orc=$?
+  [ "$orc" -ne 124 ] || { echo "no answer from gh api user in ${3}s"; return 5; }
+  out=$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | tail -n 1)
+  [ "$orc" -eq 0 ] && [ -n "$out" ] || { printf '%s\n' "${out:-exit $orc, no output}"; return 2; }
   [ "$out" = "$2" ] || { printf '%s\n' "git's credential is $out's, gh's token is $2's"; return 4; }
 }
 printf 'protocol=https\nhost=github.com\n\n' > "$d/cred.in"
 GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=false GCM_INTERACTIVE=never \
-  bounded --stdin "$d/cred.in" "$t" git_cred "$(cat "$d/gh.rc")" "$(tail -n 1 "$d/gh.out" 2>/dev/null)" > "$d/git.out"; echo "$?" > "$d/git.rc"
+  bounded --stdin "$d/cred.in" "$((2 * t + 5))" git_cred "$(cat "$d/gh.rc")" "$(tail -n 1 "$d/gh.out" 2>/dev/null)" "$t" > "$d/git.out"; echo "$?" > "$d/git.rc"
 : > "$d/done"
 [ "${3:-}" != tmux ] || [ -z "${TMUX_PANE:-}" ] || tmux kill-session -t "$TMUX_PANE" 2>/dev/null
 PROBE
@@ -816,22 +822,13 @@ gh_read() {
   case "$gitrc" in
     '') gitst=none; gitwhy="no result" ;;
     0) gitst=ok; gitwhy="" ;;
-    124) gitst=nocred; gitwhy="no answer in ${gh_bound}s" ;;
+    124) gitst=nocred; gitwhy="no answer from git's credential helper in $((2 * gh_bound + 5))s" ;;
+    5) gitst=down ;;
     2) case "$gitout" in *"error connecting to "*|*"(HTTP 5"[0-9][0-9]")"*) gitst=down ;; *) gitst=rejected ;; esac; gitwhy=${gitwhy:-no output} ;;
     4) gitst=other ;;
     *) gitst=nocred; gitwhy=${gitwhy:-exit $gitrc, no output} ;;
   esac
 }
-# tmux_gh_check: the probe as the command of a throwaway session of the RUNNING tmux server, the
-# shape `launch` starts a CLI worker in (`bash <file>` via new-session, so update-environment and
-# the default shell apply as they do for the worker; `run-shell` is not that shape: it runs /bin/sh
-# in the most recent session's environment). A new session takes the server's environment, not
-# this shell's, and a server started before gh-token.sh existed or rotated hands out a stale token
-# or none. No comparison of variables stands in for this (#367 built one over three review rounds
-# and removed it). With no server running the next session starts one from this shell, which is
-# then what the probe runs in (a resume has no preflight in front of it, and a launch's preflight
-# ran minutes earlier in another shell). Returns 1 with tmux_gh_msg set when either half fails;
-# tmux_gh_down says GitHub did not answer. The session is not iw-*, so no `ls` reads it as a worker.
 # gh_verdict: gh_read's result as one reason (srv) and a GitHub-did-not-answer note; 1 on a reason.
 gh_verdict() {
   srv=""
@@ -844,31 +841,54 @@ gh_verdict() {
   esac
   [ -z "$srv" ]
 }
+# tmux_gh_check [login]: the probe as the command of a throwaway session of the tmux server a CLI
+# worker would start in, in the shape `launch` starts one (`bash <file>` via new-session, so
+# update-environment and the default shell, and its startup files, apply as they do for the worker;
+# `run-shell` is not that shape: it runs /bin/sh in the most recent session's environment). A new
+# session takes a RUNNING server's environment, not this shell's, and a server started before
+# gh-token.sh existed or rotated hands out a stale token or none; with no server running, the
+# session starts one from this shell, as the worker's would. No comparison of variables stands in
+# for this (#367 built one over three review rounds and removed it). The session must also answer
+# as the account this shell's probe proved: <login>, or with none given this shell is probed first
+# (a resume has no preflight in front of it, and a launch's preflight ran minutes earlier in another
+# shell). Returns 1 with tmux_gh_msg set on a failure; tmux_gh_down says GitHub did not answer.
+# The session is not iw-*, so no `ls` reads it as a worker.
 tmux_gh_check() {
-  local pf pd ps perr waited srv=""
+  local want="${1:-}" pf pd ps perr waited srv="" had=1
   tmux_gh_msg=""; tmux_gh_down=""
   pf=$(mktemp "${TMPDIR:-/tmp}/fw-ghprobe.XXXXXX"); pd=$(mktemp -d "${TMPDIR:-/tmp}/fw-ghprobe.XXXXXX"); ps="fw-ghprobe-$$"
   gh_probe_write "$pf"
-  if ! tm show-environment -g >/dev/null 2>&1; then
-    bash "$pf" "$pd" "$gh_bound" < /dev/null > /dev/null 2>&1; gh_read "$pd"; rm -rf "$pd" "$pf"
-    gh_verdict && return 0
-    tmux_gh_msg="a tmux server started from this session on $BOX would give a CLI worker a GitHub credential that does not work ($srv) -- \`fleet-worker.sh preflight $BOX\` names the repair"
-    return 1
+  if [ -z "$want" ]; then
+    bash "$pf" "$pd" "$gh_bound" < /dev/null > /dev/null 2>&1; gh_read "$pd"; rm -rf "$pd"; mkdir -p "$pd"
+    if ! gh_verdict; then
+      rm -rf "$pd" "$pf"
+      tmux_gh_msg="GitHub credential refused in a non-interactive session on $BOX ($srv) -- \`fleet-worker.sh preflight $BOX\` names the repair"
+      return 1
+    fi
+    [ "$ghst" != ok ] || want=$ghlast   # GitHub silent: no login to hold the server to
   fi
+  tm show-environment -g >/dev/null 2>&1 || had=0
   if perr=$(tm new-session -d -s "$ps" "bash $(printf '%q' "$pf") $(printf '%q' "$pd") $(printf '%q' "$gh_bound") tmux" 2>&1); then
-    # Two bounded calls and a margin, in tenths; a session gone without `done` has no more to say.
+    # Both calls' bounds and a margin, in tenths; a session gone without `done` has no more to say.
     waited=0
-    while [ ! -e "$pd/done" ] && [ "$waited" -lt $((gh_bound * 20 + 100)) ] && tm has-session -t "=$ps" 2>/dev/null; do
+    while [ ! -e "$pd/done" ] && [ "$waited" -lt $((gh_bound * 30 + 150)) ] && tm has-session -t "=$ps" 2>/dev/null; do
       sleep 0.1; waited=$((waited + 1))
     done
     tm kill-session -t "=$ps" 2>/dev/null   # a probe past its bound; a finished one has gone itself
-    gh_read "$pd"; gh_verdict
+    gh_read "$pd"
+    gh_verdict && [ "$ghst" = ok ] && [ -n "$want" ] && [ "$ghlast" != "$want" ] && srv="gh api user answers as $ghlast, not as $want"
   else
-    srv="new-session refused: $(printf '%s' "$perr" | tail -n1 | cut -c1-120)"
+    rm -rf "$pd" "$pf"
+    tmux_gh_msg="tmux on $BOX refused a probe session ($(printf '%s' "$perr" | tail -n1 | cut -c1-120)), so it would refuse a CLI worker's too"
+    return 1
   fi
   rm -rf "$pd" "$pf"
   [ -n "$srv" ] || return 0
-  tmux_gh_msg="the running tmux server on $BOX gives a new session a GitHub credential that does not work ($srv): a CLI worker started now would inherit it; $(tmux_restart_advice "$(tm list-sessions -F '#{session_name}' 2>/dev/null)")"
+  if [ "$had" = 1 ]; then
+    tmux_gh_msg="the running tmux server on $BOX gives a new session a GitHub credential that does not work ($srv): a CLI worker started now would inherit it; $(tmux_restart_advice "$(tm list-sessions -F '#{session_name}' 2>/dev/null)")"
+  else
+    tmux_gh_msg="a tmux server started from this session on $BOX gives a new session a GitHub credential that does not work ($srv), though this session's own passes: its default shell's startup files change it (grep -Hnos GH_TOKEN ~/.zshenv ~/.bashrc ~/.config/fleet/env.sh lists the lines without their values)"
+  fi
   return 1
 }
 EOF
@@ -890,7 +910,7 @@ note() { refuse="$refuse; $*"; }
 # The wait covers everything a holder may legitimately spend: the fetch, the live probe, and one
 # cross-box timeout per sibling, since the reach probes run serially under this lock.
 nsib=0; for _s in $cross; do nsib=$((nsib + 1)); done
-checkout_lock $((fetch_timeout + probe_timeout + 4 * gh_timeout + 70 + cross_timeout * nsib)) "PREFLIGHT REFUSED $BOX"; lrc=$?
+checkout_lock $((fetch_timeout + probe_timeout + 6 * gh_timeout + 90 + cross_timeout * nsib)) "PREFLIGHT REFUSED $BOX"; lrc=$?
 if [ "$lrc" -eq 2 ]; then echo "PREFLIGHT REFUSED $BOX: no skills checkout at $repo"; exit 1; fi
 [ "$lrc" -eq 0 ] || exit 1
 skills_freshness "$fetch_timeout"
@@ -945,14 +965,14 @@ elif [ "$codex" = 0 ]; then
     fi
   fi
 fi
-# tmux_live: a CLI worker launched now would start in a server that is already running, and whose
-# build variables match (the GitHub probe below then runs inside it too).
-tmux_live=""
+# tmux_ok: a CLI worker launched now would start under tmux in a server whose build variables are
+# right (the GitHub probe below then runs as a session of that server too).
+tmux_ok=""
 case "$codex" in
   native|native-claude) ;;
   *) if ! command -v tmux >/dev/null 2>&1; then note "no tmux"
      elif ! msg=$(tmux_env_check); then note "$msg"
-     elif tm show-environment -g >/dev/null 2>&1; then tmux_live=1; fi ;;
+     else tmux_ok=1; fi ;;
 esac
 command -v jq >/dev/null 2>&1 || note "no jq"
 # Every correctness batch on this box now runs under `execution slot`, whose N-holder lock is a
@@ -1005,8 +1025,8 @@ done
 # login" hint, any output this list does not name - refuses with the user-side repair.
 # The push path and the tmux server too (ludics-lite#374; ghprobe_fn above): git's credential for
 # github.com is asked for as a push asks and tried against GitHub, and for a CLI worker the probe
-# runs again in the running tmux server the worker would inherit from - only once it passed here,
-# so a failure there is the server's to repair.
+# runs again as a session of the tmux server the worker would start in (the running one, or one
+# started from this shell) - only once it passed here, so a failure there is tmux's to repair.
 # Boundary: it proves what `gh api --hostname github.com user` answers, and that git gets a
 # credential for https://github.com (outside any repository) that GitHub accepts, in this session,
 # the session a native worker, a leg and a NEW tmux server get, and in a new session of the running
@@ -1083,11 +1103,11 @@ case "$ghst:$gitst" in
   *:other) note "git's credential for https://github.com is another account's than gh's in a non-interactive session on $BOX ($gitwhy), so a worker would push as one account and open its PR as the other -- repair: $setupgit (it makes gh git's helper for github.com)" ;;
   *) note "git gets no GitHub credential in a non-interactive session on $BOX (git credential fill for https://github.com: $gitwhy), so a worker's push would fail -- repair: $setupgit" ;;
 esac
-# The running tmux server, only once this session's probe proved both halves: a failure there is
-# then the server's environment.
-if [ -n "$tmux_live" ] && [ "$ghst" = ok ] && [ "$gitst" = ok ]; then
-  tmux_gh_check || note "$tmux_gh_msg"
-  [ -z "$tmux_gh_down" ] || gh_down="${gh_down:+$gh_down; }in the running tmux server: $tmux_gh_down"
+# The tmux server, only once this session's probe proved both halves: a failure there is then the
+# server's environment, or its default shell's startup.
+if [ -n "$tmux_ok" ] && [ "$ghst" = ok ] && [ "$gitst" = ok ]; then
+  tmux_gh_check "$ghlast" || note "$tmux_gh_msg"
+  [ -z "$tmux_gh_down" ] || gh_down="${gh_down:+$gh_down; }in a tmux session: $tmux_gh_down"
 fi
 if [ -n "$refuse" ]; then
   echo "PREFLIGHT REFUSED $BOX: ${refuse#; }${other:+ (changes outside the served tree, ignored: $other)}"
