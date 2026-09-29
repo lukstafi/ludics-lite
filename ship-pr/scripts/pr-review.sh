@@ -1903,8 +1903,9 @@ status_state() {
   verd_sha="${vline#*|}"
   # The round the summary table says is done (#439): its newest Code Review row, when that row is
   # the Completed shape SUMMARY_COMPLETED_ROW_RE allows — or the run it says FAILED (#453), when it
-  # is the SUMMARY_FAILED_ROW_RE shape instead; the first field says which. Read like the 👍 path's fourth field: the
-  # rows of the NEWEST summary comment only, and none at all when any Code Review row there is one
+  # is the SUMMARY_FAILED_ROW_RE shape instead; the first field says which. Read like the 👍
+  # path's fourth field: the rows of the NEWEST summary comment only, and none at all when any
+  # Code Review row there is one
   # the stamp pattern cannot date — no row can then be called the newest, and an older summary is
   # never consulted in its place. The newest row is found by the same stamp the 👍 path reads, and
   # must then ALSO match the allowlist, the two patterns applied to the same line: one that dates a

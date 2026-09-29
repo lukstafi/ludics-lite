@@ -461,7 +461,9 @@ requirements for every transport with transport-specific setup and identity, and
   the existing 👍 - a worker that re-requests before reading the feed destroys the approval
   it failed to see. `pr-review.sh status` recognizes the comment-shaped verdict since
   ludics-lite 254facf; the brief still says: read the full feed first, re-request only
-  when it truly holds nothing for the current head.
+  when it truly holds nothing for the current head. The one re-request that is automatic is
+  `pr-review.sh watch`'s, once per head, on a summary row marking the run Failed with no review
+  and no 👍 (ludics-lite#453): with no approval standing, there is nothing for it to clear.
 - **A scan boundary, for an issue whose natural implementation reads free text.** When the task
   is a rule over a PR body, a commit message, a workflow file or Markdown, the brief says which
   reading the issue's requirement actually needs. Where a best-effort reading satisfies it (a
