@@ -57,9 +57,9 @@ brief of every CLI worker tells it to block inside the turn on every watch, wait
 the command returns - bounded calls re-issued, never an `until`/`sleep` loop:
 
 - a Claude worker runs anything that can outlast the 600 s foreground cap under `bg-run.sh`, as
-  [native-claude.md, *Blocking on a run*](native-claude.md#blocking-on-a-run) says: `new` for the
-  run directory, `start` as a background task, then foreground `wait` calls re-issued in the SAME
-  turn until one prints `rc=`;
+  [native-claude.md, *Blocking on a run*](native-claude.md#blocking-on-a-run) says: `spawn`
+  (`fleet-worker.sh execution slot --bg` for a slot-held batch) prints the run directory, then
+  foreground `wait` calls re-issued in the SAME turn until one prints `rc=`;
 - a Codex worker keeps the command in the foreground of its turn, as
   [native-codex.md](native-codex.md#what-a-returned-turn-means) says.
 

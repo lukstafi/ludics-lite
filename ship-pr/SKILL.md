@@ -281,7 +281,7 @@ re-runs both `status` and watermark-aware `poll` (or a bounded `watch`). A backg
 nobody is polling is not an observer. A Claude Code session that the notification does not wake
 (a native issue-wave worker, whose turn must stay open, or a one-shot headless `claude -p` one,
 whose turn's end kills its background tasks) runs `watch` and `merge --wait` under issue-wave's
-`bg-run.sh start` and blocks on `bg-run.sh wait` in the same turn, as
+`bg-run.sh spawn` and blocks on `bg-run.sh wait` in the same turn, as
 [Blocking on a run](../issue-wave/references/native-claude.md#blocking-on-a-run) says.
 
 `watch` *is* the polling loop — don't hand-roll a sleep loop around `poll`, which is what a long

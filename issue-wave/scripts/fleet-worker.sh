@@ -90,6 +90,10 @@
 #                          # of THIS box's run-time correctness slots around a suite or batch
 #                          # (no lease needed), plus a GPU token unless it declares --cpu; inside
 #                          # a slot already held (FLEET_SLOT_HELD) it runs under that one
+#   fleet-worker.sh execution slot --bg <parent> [--wait <seconds>] [--cpu|--gpu] -- <command...>
+#                          # the same batch detached, for one that can outlast a 600 s tool
+#                          # call: prints a bg-run.sh run directory under <parent> at once;
+#                          # block on `bg-run.sh wait <dir>`
 #   fleet-worker.sh execution slot --probe             # `EXECUTION SLOT PROBE <box> <slots> <gpu
 #                          # tokens>` for this box, taking nothing (exit 2: not a fleet host)
 #   fleet-worker.sh execution hold [--why <text>] -- <command...>   # run under THIS box's OS-level
@@ -2625,10 +2629,13 @@ RUN_PY
 inhibitor_path() { type -P -- "$INHIBIT" 2>/dev/null || true; }
 
 cmd_execution_slot() {
-  local wait=600 kind="" box cap tokens listing rc measuring dir helper probe=""
+  local wait=600 kind="" box cap tokens listing rc measuring dir helper probe="" bg="" here
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --probe) probe=1 ;;
+      --bg)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die "execution slot: expected a parent directory for --bg"
+        bg="$2"; shift ;;
       --wait)
         [ "$#" -ge 2 ] || die "execution slot: expected value for --wait"
         case "$2" in ''|*[!0-9]*) die "execution slot: --wait takes a whole number of seconds" ;; esac
@@ -2637,10 +2644,11 @@ cmd_execution_slot() {
         [ -z "$kind" ] || [ "$kind" = "$1" ] || die "execution slot: --cpu and --gpu are exclusive"
         kind="$1" ;;
       --) shift; break ;;
-      *) die "execution slot [--wait <seconds>] [--cpu|--gpu] -- <command> [args...] | execution slot --probe" ;;
+      *) die "execution slot [--bg <parent>] [--wait <seconds>] [--cpu|--gpu] -- <command> [args...] | execution slot --probe" ;;
     esac
     shift
   done
+  [ -z "$probe" ] || [ -z "$bg" ] || die "execution slot: --probe takes no --bg; it runs nothing"
   [ -n "$probe" ] || [ "$#" -ge 1 ] || die "execution slot: a command to hold the slot around is required, after --"
   box="$LOCAL_BOX"
   [ -n "$box" ] || die "execution slot: this host has no fleet name; set FLEET_LOCAL_BOX (the slot is this box's own)"
@@ -2661,6 +2669,22 @@ cmd_execution_slot() {
   if [ -n "$probe" ]; then
     echo "EXECUTION SLOT PROBE $box $cap $([ "$tokens" -eq 0 ] && echo "$cap" || echo "$tokens")"
     exit 0
+  fi
+  # THE DETACHED BATCH (ludics-lite#181): a batch that can outlast a 600 s tool call used to take
+  # three calls from a native worker (`bg-run.sh new`, a backgrounded `bg-run.sh start` around this
+  # command, `bg-run.sh wait`). `--bg <parent>` is the first two in one foreground call: bg-run.sh
+  # `spawn` allocates <parent>/run-<N>, runs this same `execution slot` there detached, and prints
+  # the directory, so the caller's one wait is `bg-run.sh wait <dir>` and its verdicts, and the
+  # directory is what `execution conclude --from-bg-run` reads. The run directory contract stays
+  # bg-run.sh's alone. What can be refused here is refused in the foreground (usage, a host with no
+  # fleet name, a box outside the roster, a malformed spec); the registry read and the wait for a
+  # slot happen in the run, whose log holds any refusal and whose rc is its status. The detached
+  # run inherits this environment, FLEET_SLOT_HELD and an enclosing slot's flock included, so a
+  # --bg batch inside an enclosing slot runs under that slot (THE NESTED SLOT, below) and keeps it
+  # held for as long as the batch runs, past the enclosing command's own end.
+  if [ -n "$bg" ]; then
+    here=$(cd "$(dirname "$0")" && pwd)
+    exec "$here/bg-run.sh" spawn "$bg" -- "$here/$(basename "$0")" execution slot --wait "$wait" ${kind:+"$kind"} -- "$@"
   fi
   dir="$(local_path "$SLOT_STATE")/$box"
   # THE NESTED SLOT: inside a batch that already holds one of this box's slots, a second take
