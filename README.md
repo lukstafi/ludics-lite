@@ -365,7 +365,7 @@ ship-pr/scripts/test-pr-review-merge.sh
 ship-pr/scripts/test-pr-review-status.sh
 ship-pr/scripts/test-pr-review-watch.sh
 ship-pr/scripts/test-pr-review-reply.sh
-ship-pr/scripts/test-pr-review-run-watch.sh
+ship-pr/scripts/test-pr-review-retry.sh
 scripts/test-wake-lab.sh
 scripts/test-wake-lab-linux.sh
 scripts/test-check-prompts.sh
@@ -777,7 +777,8 @@ separately and a queued invocation is never hidden behind a finished twin; and a
 explained entirely by advisory jobs is not a red build signal, since those checks were dropped on
 purpose.
 
-`test-pr-review-run-watch.sh` drives `retry run watch`, which addresses its run as
+`test-pr-review-retry.sh` drives `retry`: the plain retry's classification, and `retry run
+watch`, which addresses its run as
 `owner/name#<run-id>` like every other subcommand and no longer resolves the repository from the
 cwd (ludics-lite#74): a background shell that had started in another project's worktree awaited a
 run id from this one, the read 404'd against the repo the cwd named, and the await answered about
@@ -790,7 +791,14 @@ the deadline exit 4. It pins the plain `retry`'s line between a GraphQL answer a
 (ludics-lite#422): a query-cost rejection used to be retried four times and reported as "the API
 never answered". Each GraphQL body on the fixed-answer allowlist, verbatim from a real `gh` call,
 exits 1 on its first attempt; a gateway failure, GraphQL's execution failure and the near-misses
-(another prefix, gh's path suffix, a second line, stdout) still retry to exit 3.
+(another prefix, gh's path suffix, a second line, stdout) still retry to exit 3. And gh refusing a
+caller's own arguments (ludics-lite#452: `gh pr view 1 --json nosuchfield` sends nothing, yet was
+retried four times to exit 3): each refusal on that allowlist, verbatim from a real call that sent
+no request, exits 2 on its first attempt under both policies; its near-misses (a prefix, a suffix,
+a second line, an unquoted field, a jq parse error, a terminal-dependent refusal) still retry to
+exit 3. So does the same line from any command path off the API-only allowlist: an alias or an
+extension, which gh hands every argument, or a built-in subcommand that runs git after a write
+(`repo fork --clone`, `pr merge`). The script's own calls keep the classification they had.
 
 `test-pr-review-status.sh` drives `status` and `watch` against canned reactions, reviews,
 comments and PR reads, and pins the mergeability that rides on every state line: a PR whose merge

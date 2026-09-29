@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Focused fixture tests for pr-review.sh's `retry run watch`: how the run is addressed, and the
-# line between an invocation error and a verdict about the run (ludics-lite#74).
+# Focused fixture tests for pr-review.sh's `retry`: the plain retry's line between an answer, a
+# caller error and transport, and `retry run watch`'s — how the run is addressed, and the line
+# between an invocation error and a verdict about the run (ludics-lite#74).
 #
 # The await used to resolve the repository from the cwd when no -R/REPO named one. A worker whose
 # background shell had started in another project's worktree awaited a run id from this one: the
@@ -14,6 +15,9 @@
 # query-cost rejection was retried four times and reported as "the API never answered". The
 # fixed-answer bodies below are verbatim from real `gh` 2.101.0 calls; each must exit 1 on its first
 # attempt, while a gateway failure and the near-misses outside the allowlist still retry to exit 3.
+# And gh's own refusal of a caller's arguments (ludics-lite#452): `gh pr view 1 --json nosuchfield`
+# sends nothing, yet was retried four times and reported as exit 3. Those bodies are verbatim too,
+# and each must exit 2 on its first attempt, while their near-misses still retry to exit 3.
 
 set -euo pipefail
 
@@ -31,7 +35,7 @@ source "$SCRIPT_DIR/test-pr-review-lib.sh"
 # declared stub and accepting an undeclared shadow in silence. scripts/check-parse-guards.sh
 # checks the shape, and says what may stand above the `{`.
 {
-test_tmpdir TEST_ROOT run-watch-test
+test_tmpdir TEST_ROOT retry-test
 
 CALL_LOG="$TEST_ROOT/gh-calls"
 : >"$CALL_LOG"
@@ -46,6 +50,9 @@ CWD_REPO=cwd-inferred/repo
 # stdout, where `gh api graphql` puts the error document itself.
 GQL_ERROR=""
 GQL_OUT=""
+# What gh prints on stderr when it refuses its arguments before sending anything: any call made
+# while it is set fails with it, whatever the command, since the refusal is gh's and not the API's.
+CLIENT_ERROR=""
 
 # The fixture gh. Not gh_fixture_parse: that one refuses everything but `gh api`, and this await
 # reads `gh run view`. `repo view` is answered rather than refused ON PURPOSE — it is the first
@@ -54,6 +61,10 @@ GQL_OUT=""
 gh() {
   local filter="" repo="" run_id="" json=""
   printf '%s\n' "$*" >>"$CALL_LOG"
+  if [ -n "$CLIENT_ERROR" ]; then
+    printf '%s\n' "$CLIENT_ERROR" >&2
+    return 1
+  fi
   case "$1 ${2:-}" in
   "repo view")
     printf '%s\n' "$CWD_REPO"
@@ -105,6 +116,7 @@ reset_fixture() {
   RUN_ERROR=""
   GQL_ERROR=""
   GQL_OUT=""
+  CLIENT_ERROR=""
   REPO=""
   AWAIT_WAIT=""
   : >"$CALL_LOG"
@@ -389,6 +401,140 @@ test_a_near_miss_still_retries() {
   assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "so the read is retried"
 }
 
+# --- gh refusing the caller's arguments (ludics-lite#452) -------------------------------------
+
+# Every allowlisted shape, verbatim from gh 2.101.0 with the lines gh prints after it, each from a
+# call that sent nothing (the command is beside it). A refusal is the caller's error, so it stops on
+# its first attempt and exits 2 under both policies: re-sending prints the same refusal, and a write
+# whose arguments gh refused cannot have landed.
+test_a_client_refusal_is_a_usage_error() {
+  local body mode
+  local -a bodies=(
+    # gh pr view 1 --repo lukstafi/ludics-lite --json nosuchfield
+    $'Unknown JSON field: "nosuchfield"\nAvailable fields:\n  additions'
+    # gh pr view 1 --repo lukstafi/ludics-lite --json 'a b'
+    $'Unknown JSON field: "a b"\nAvailable fields:\n  additions'
+    # gh pr list --repo lukstafi/ludics-lite --json
+    $'Specify one or more comma-separated fields for `--json`:\n  additions'
+    # gh pr view 1 --repo lukstafi/ludics-lite --nosuchflag
+    $'unknown flag: --nosuchflag\n\nDisplay the title, body, and other information about a pull request.'
+    # gh pr list --repo lukstafi/ludics-lite --foo_bar (review round 1: punctuation in the name)
+    'unknown flag: --foo_bar'
+    # gh pr list --repo lukstafi/ludics-lite --foo.bar
+    'unknown flag: --foo.bar'
+    # gh pr list --repo lukstafi/ludics-lite -_
+    "unknown shorthand flag: '_' in -_"
+    # gh pr view 1 --repo lukstafi/ludics-lite -z
+    $'unknown shorthand flag: \'z\' in -z\n\nDisplay the title, body, and other information about a pull request.'
+    # gh pr view 1 --repo lukstafi/ludics-lite --jq
+    $'flag needs an argument: --jq\n'
+    # gh api -X
+    $'flag needs an argument: \'X\' in -X\n\nMakes an authenticated HTTP request to the GitHub API and prints the response.'
+    # gh pr list --repo lukstafi/ludics-lite -L abc
+    $'invalid argument "abc" for "-L, --limit" flag: strconv.ParseInt: parsing "abc": invalid syntax\n'
+    # gh pr list --repo lukstafi/ludics-lite --state bogus
+    $'invalid argument "bogus" for "-s, --state" flag: valid values are {open|closed|merged|all}\n'
+    # gh issue close
+    'accepts 1 arg(s), received 0'
+    # gh pr view 1 2 --repo lukstafi/ludics-lite
+    'accepts at most 1 arg(s), received 2'
+    # gh pr nosuchcmd
+    $'unknown command "nosuchcmd" for "gh pr"\n\nUsage:  gh pr <command> [flags]'
+    # gh label nosuchcmd
+    'unknown command "nosuchcmd" for "gh label"'
+  )
+  retune API_ATTEMPTS=3
+  for mode in --read --write; do
+    for body in "${bodies[@]}"; do
+      reset_fixture
+      CLIENT_ERROR="$body"
+      run_retry "$mode" pr view 1 --repo example/repo --json nosuchfield
+      assert_eq "$RETRY_RC" 2 "a refused argument is a usage error ($mode, $body: $RETRY_OUT)"
+      assert_contains "$RETRY_OUT" "refused its own arguments and sent nothing: ${body%%$'\n'*}." \
+        "the message quotes gh's refusal, its first line ($mode)"
+      assert_not_contains "$RETRY_OUT" "never answered" "no API was asked ($mode, $body)"
+      assert_not_contains "$RETRY_OUT" "AMBIGUOUSLY" "and no write can have landed ($mode, $body)"
+      assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "and it is not re-sent ($mode, $body)"
+    done
+  done
+}
+
+# The controls: a refusal line anywhere but as the whole first stderr line, and gh's client-side
+# messages outside the list, keep the retry. Behind the prefix the API's words carry; with a
+# suffix; on the second line; unquoted; a flag name holding whitespace; a jq expression gh parses after the request was sent; and a
+# refusal that depends on whether a terminal is attached.
+test_a_client_refusal_near_miss_still_retries() {
+  local body
+  local -a bodies=(
+    'gh: unknown flag: --nosuchflag'
+    'unknown flag: --nosuchflag (HTTP 502)'
+    $'gh: Something went wrong (HTTP 500)\nUnknown JSON field: "nosuchfield"'
+    'Unknown JSON field: nosuchfield'
+    'unknown flag: --foo bar'
+    $'failed to parse jq expression (line 1, column 3)\n    .[\n      ^  unexpected EOF'
+    $'flags required when not running interactively\n'
+  )
+  retune API_ATTEMPTS=3
+  for body in "${bodies[@]}"; do
+    reset_fixture
+    CLIENT_ERROR="$body"
+    run_retry --read pr view 1 --repo example/repo --json number
+    assert_eq "$RETRY_RC" 3 "outside the allowlist keeps the retry ($body: $RETRY_OUT)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "every attempt was spent ($body)"
+  done
+}
+
+# The other half of the scope (review rounds 1 and 2): the line is read only for a command path
+# that runs no program but gh. An alias or an extension is handed every argument, and some built-in
+# subcommands run git after a write (`repo fork --clone`, `pr merge --delete-branch`), so on those
+# the same line keeps the retry on a read and stays ambiguous on a write. A listed path whose
+# parent takes any subcommand (`project list`, `label nosuchcmd`) is read, the positive control.
+test_a_delegating_command_refusal_is_not_read() {
+  local -a cmd
+  local spec
+  retune API_ATTEMPTS=3
+  for spec in 'myext --later' 'co --later' 'repo fork o/r --clone --later' 'pr merge 1 --later' \
+    'pr checkout 1 --later' 'pr -R o/r view 1 --later'; do
+    read -r -a cmd <<<"$spec"
+    reset_fixture
+    CLIENT_ERROR='unknown flag: --later'
+    run_retry --read "${cmd[@]}"
+    assert_eq "$RETRY_RC" 3 "an unlisted path's refusal-shaped line keeps the retry ($spec: $RETRY_OUT)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "every attempt was spent ($spec)"
+    reset_fixture
+    CLIENT_ERROR='unknown flag: --later'
+    run_retry "${cmd[@]}"
+    assert_eq "$RETRY_RC" 3 "and a write through it stays ambiguous ($spec: $RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "AMBIGUOUSLY" "it may have landed ($spec)"
+    assert_not_contains "$RETRY_OUT" "sent nothing" "nothing is claimed about what was sent ($spec)"
+  done
+  for spec in 'project list --owner o --foo_bar' 'label nosuchcmd' 'api repos/o/r --later' \
+    'issue comment 1 --later'; do
+    read -r -a cmd <<<"$spec"
+    reset_fixture
+    CLIENT_ERROR='unknown flag: --later'
+    run_retry "${cmd[@]}"
+    assert_eq "$RETRY_RC" 2 "a listed path is read ($spec: $RETRY_OUT)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "and not re-sent ($spec)"
+  done
+}
+
+# The scope: only `retry` reads a caller's arguments this way. The script's own calls keep the
+# classification they had, so a refusal there is still retried to exit 3 — the one this suite can
+# pin without asserting what those callers should say instead.
+test_the_scripts_own_calls_keep_their_classification() {
+  local rc
+  reset_fixture
+  retune API_ATTEMPTS=3
+  CLIENT_ERROR=$'Unknown JSON field: "nosuchfield"\nAvailable fields:\n  additions'
+  set +e
+  (gh_retry read pr view 1 --repo example/repo --json nosuchfield) >/dev/null 2>&1
+  rc=$?
+  set -e
+  assert_eq "$rc" 3 "an internal read is retried as before"
+  assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "on every attempt"
+}
+
 # --- the shared parse -------------------------------------------------------------------------
 
 # parse_ref is what both this command and pr_arg read their argument with; pinning it directly
@@ -432,6 +578,10 @@ tests=(
   test_a_fixed_graphql_answer_is_a_rejection
   test_a_graphql_outage_still_retries
   test_a_near_miss_still_retries
+  test_a_client_refusal_is_a_usage_error
+  test_a_client_refusal_near_miss_still_retries
+  test_a_delegating_command_refusal_is_not_read
+  test_the_scripts_own_calls_keep_their_classification
   test_parse_ref
 )
 
