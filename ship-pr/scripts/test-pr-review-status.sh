@@ -56,6 +56,10 @@ FAIL_GRAPHQL=""
 # A comment POST refusing (a watch's re-request of a failed run, #453). What does post is kept in
 # $TEST_ROOT/posted, one comment per line, and served back by the comments read after it.
 FAIL_POST=""
+# A 👍 landing mid-watch: from this reactions read on (counted from the case's reset), the feed
+# answers REACTIONS_JSON plus a 👍 — how a case puts one between a round's read and the write
+# that round decided on.
+THUMBS_ON_REACTIONS_READ=""
 # The base's tip, and the head PUSH_ON_REVIEWS_READ swaps in. With HEAD_SHA these are the only
 # SHAs the transport below spells out, so a case that needs a new head just sets HEAD_SHA.
 BASE_SHA=base-sha
@@ -85,6 +89,7 @@ reset_fixture() {
   THREADS_FIXTURE_TOTAL=""
   FAIL_GRAPHQL=""
   FAIL_POST=""
+  THUMBS_ON_REACTIONS_READ=""
   rm -f "$TEST_ROOT/pushed" "$TEST_ROOT/posted" "$TEST_ROOT"/nth.*
   : >"$REQUEST_LOG"
 }
@@ -160,7 +165,12 @@ gh() {
   local response="" spec left right posted
   gh_fixture_parse "$@"
   case "$FIXTURE_ENDPOINT" in
-  "repos/$REPO/issues/7/reactions?per_page=100") response="$REACTIONS_JSON" ;;
+  "repos/$REPO/issues/7/reactions?per_page=100")
+    fixture_nth reactions
+    response="$REACTIONS_JSON"
+    [ -z "$THUMBS_ON_REACTIONS_READ" ] || [ "$FIXTURE_NTH" -lt "$THUMBS_ON_REACTIONS_READ" ] ||
+      response=$(jq -c --argjson r "$(reaction +1 "$(jq -rn 'now | todate')")" '. + [$r]' <<<"$response")
+    ;;
   "repos/$REPO/pulls/7/reviews?per_page=100")
     # The simulated push: gh runs in a subshell, so the "new head" travels through a file that
     # the PR read below consults.
@@ -1596,6 +1606,10 @@ test_a_failed_run_counts_the_requests_on_its_head() {
   assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run-again "a failure answering a request on this head"
   assert_contains "$LINE" "reviewer's run FAILED AGAIN on head 1e14b13" "is surfaced, not re-requested"
   assert_contains "$LINE" "request at 2026-09-04T22:47:00Z" "naming the request it answers"
+  # A request in the head commit's own second counts as on it: the clock cannot say otherwise.
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(request_comment 2 "$HEAD_AT")]"
+  run_status
+  assert_eq "$(state_detail "$STATE" | cut -d'|' -f2)" run-again "a request at the arrival's own second"
   # A request from before the head's commit was about an earlier head.
   COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(request_comment 2 2026-09-04T22:40:00Z)]"
   run_status
@@ -1650,6 +1664,14 @@ test_a_failed_row_outside_the_allowlist_is_not_read() {
     run_status
     assert_eq "$(state_tok "$STATE")" expected "a failure row outside the observed shape keeps the old reading: $row"
   done
+  # The shape with a datetime the comparisons cannot order: malformed, or in the future.
+  for row in "${FAILED_RUN_ROW//2026-09-04T22:47:25.387018Z/garbage}" \
+    "${FAILED_RUN_ROW//2026-09-04T22:47:25.387018Z/2099-01-01T00:00:00.1Z}"; do
+    failed_run_fixture
+    COMMENTS_JSON="[$(failed_run_summary 1 "$row")]"
+    run_status
+    assert_eq "$(state_tok "$STATE")" expected "a Failed row whose datetime cannot be ordered is not read: $row"
+  done
 }
 
 test_a_broken_jq_program_is_unknown_on_the_request_read() {
@@ -1682,6 +1704,36 @@ _🤖 Addressed by an automated coding agent_" "the plain request the pending-nu
   assert_contains "$WATCH_OUT" "reviewer's run FAILED AGAIN on head 1e14b13" "the verdict is on stdout"
   assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 0 "and nothing is posted"
   rm -f "$TEST_ROOT/posted.keep"
+}
+
+# Review of #465, round 1: a failure first seen on the window's LAST regular poll still gets the
+# request's grace — the deadline is set by the post, not by the round's `failed` read, which has
+# none — so the watch goes on to read the request back instead of ending on it.
+test_watch_waits_out_a_re_request_posted_on_its_last_poll() {
+  retune GRACE=4
+  failed_run_fixture
+  # An interval past the timeout: one regular round, then the boundary.
+  run_watch 0,1,0 5 3
+  assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 1 "the request is posted"
+  assert_contains "$WATCH_ERR" "extending watch for the live review or fresh nudge" \
+    "and the window extends for its grace"
+  assert_contains "$WATCH_ERR" "fresh review nudge; waiting for pickup" "reading the request back"
+  assert_eq "$WATCH_RC" 0 "the window ends on the request's grace, not as a quiet window (exit 1)"
+  assert_contains "$WATCH_OUT" "no review materialized" "the grace verdict is the request's own"
+}
+
+# Review of #465, round 1: the round decided on its snapshot, and a 👍 landing before the write
+# would be cleared by it. The state is read fresh right before the POST, and the post is skipped
+# when it is no longer this head's first failed run.
+test_watch_does_not_post_over_an_approval_that_landed_since_the_round() {
+  failed_run_fixture
+  # Reactions reads: the opening status (1), the round's state (2), the fresh read before the
+  # write (3) — the 👍 lands between the round and the write.
+  THUMBS_ON_REACTIONS_READ=3
+  run_watch 0,1,0 1 3
+  assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 0 "nothing is posted"
+  assert_contains "$WATCH_ERR" "not re-requesting — the state moved since the round was read" "and the watch says why"
+  assert_contains "$WATCH_OUT" "approved" "the approval is what the watch ends on"
 }
 
 test_watch_surfaces_a_re_request_that_did_not_post() {
@@ -1768,6 +1820,8 @@ tests=(
   test_a_broken_jq_program_is_unknown_on_the_request_read
   test_watch_re_requests_a_failed_run_once
   test_watch_surfaces_a_re_request_that_did_not_post
+  test_watch_waits_out_a_re_request_posted_on_its_last_poll
+  test_watch_does_not_post_over_an_approval_that_landed_since_the_round
 )
 
 run_tests "${tests[@]}"

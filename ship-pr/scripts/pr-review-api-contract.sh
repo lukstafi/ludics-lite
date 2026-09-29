@@ -859,8 +859,10 @@ fi
 # PR can: they are about what the app writes NOW, so they are asked of the newest merged PRs.
 #   - The vocabulary: every Code Review row is one of the three shapes status_state reads —
 #     SUMMARY_COMPLETED_ROW_RE, SUMMARY_FAILED_ROW_RE, or a Running row (the test the 👍 path's
-#     Running read makes). A row outside them keeps the pre-#439 reading, which is safe but
-#     silent: a new failure word would read as a stall rather than as a failed run.
+#     Running read makes) — each dated by a well-formed UTC datetime not in the future, since
+#     status_state orders these stamps as strings. A row outside them keeps the pre-#439
+#     reading, which is safe but silent: a new failure word would read as a stall rather than as
+#     a failed run.
 #   - The ORDER the Completed reading rests on (#453): the app submits a round's findings review
 #     BEFORE it flips the row to Completed (9 of 9 findings rounds sampled on 2026-09-28, 2-4 s
 #     apart), which is why "nothing since the 👀" is the test and "nothing after the row" would
@@ -893,6 +895,12 @@ for n in $(jq -r --argjson k "$SUMMARY_SAMPLE" '[.[] | select(.merged_at != null
     def kind: if test($done) then "completed" elif test($failed) then "failed"
               elif test("^\\|[^|]*Code Review[^|]*\\|[^|]*Running") then "running" else "other" end;
     def rows: (.body // "") | split("\n")[] | select(test("^\\|[^|]*Code Review[^|]*\\|"));
+    def dated: [capture($stamp)] | first
+      | if . == null then false
+        else (.at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"))
+          and ((try (.at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null) as $t
+               | $t != null and $t <= now)
+        end;
     [$comments[0][] | select(app) | select((.body // "") | contains("codex-pull-request-review-summary"))] as $sums
     | ($sums | max_by(.updated_at // .created_at)
        | if . == null then null
@@ -901,7 +909,7 @@ for n in $(jq -r --argjson k "$SUMMARY_SAMPLE" '[.[] | select(.merged_at != null
            | if length == 0 or any(.[]; . == null) then null else max_by(.at) end
          end) as $newest
     | ([$reviews[0][] | select(app) | select(.submitted_at != null)] | max_by(.submitted_at)) as $last
-    | {pr: $pr, rows: [$sums[] | rows | {kind: kind, row: .}], newest: $newest,
+    | {pr: $pr, rows: [$sums[] | rows | {kind: kind, dated: dated, row: .}], newest: $newest,
        review: (if $last == null then null else {at: $last.submitted_at, sha: ($last.commit_id // "")} end)}' \
     >>"$SCRATCH/summary_rows.jsonl"
 done
@@ -911,8 +919,8 @@ if [ "$n_rows" -eq 0 ]; then
   skip "every Code Review row is a shape status_state reads" "the $(jq length <<<"$summary_rows") sampled merged PRs carry no Code Review row"
 else
   # Failing rows first, so the MOVED line's 400 characters show them.
-  pin "every Code Review row of the sampled PRs' summaries is Completed or Failed in the allowlisted shape, or Running ($n_rows rows on $(jq length <<<"$summary_rows") PRs; $(jq '[.[].rows[] | select(.kind == "failed")] | length' <<<"$summary_rows") Failed)" \
-    'all(.[]; .kind != "other")' "$(jq -c '[.[] | .pr as $pr | .rows[] | {pr: $pr} + .] | sort_by(.kind != "other")' <<<"$summary_rows")"
+  pin "every Code Review row of the sampled PRs' summaries is Completed or Failed in the allowlisted shape, or Running, dated by an ISO 8601 UTC datetime not in the future ($n_rows rows on $(jq length <<<"$summary_rows") PRs; $(jq '[.[].rows[] | select(.kind == "failed")] | length' <<<"$summary_rows") Failed)" \
+    'all(.[]; .kind != "other" and .dated)' "$(jq -c '[.[] | .pr as $pr | .rows[] | {pr: $pr} + .] | sort_by(.kind != "other" and .dated)' <<<"$summary_rows")"
 fi
 ordered=$(jq -c '[.[] | select(.newest != null and .newest.kind == "completed" and .review != null)
                  | select(.newest.sha as $s | $s != "" and (.review.sha | startswith($s)))
