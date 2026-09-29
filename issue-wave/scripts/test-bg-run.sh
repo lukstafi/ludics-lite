@@ -36,6 +36,10 @@
 #   - the finish-between-reads order: a dead pid beside an rc reads rc, not DIED;
 #   - the usage errors (relative directory, missing `--`, a --within that is not a number), and
 #     that a zero-padded number is read as decimal;
+#   - `spawn` returns while its command runs, with the pid already published, printing the
+#     directory `new` would have and nothing else; a wait there reads RUNNING, then the command's
+#     status, its arguments intact in the log, the directory in start's layout; its usage errors
+#     create nothing;
 #   - when zsh is installed, a start issued through `zsh -c` the way the Bash tool issues it,
 #     with its arguments passed through intact.
 #
@@ -398,6 +402,32 @@ d="$TMP/dead-no-rc"; mkdir -p "$d"
 printf '99999999\n' > "$d/pid"
 expect "control: a dead pid with no rc reads DIED" 5 DIED -- "$BG" wait "$d" --within 0
 
+# --- spawn: new plus a detached start, in one call that returns ------------------------------------
+p="$TMP/spawned"
+# The command waits on a gate file, so the spawn is shown returning while it still runs.
+expect "spawn returns while its command runs, printing the run directory new allocates" 0 "$p/run-1" -- \
+  "$BG" spawn "$p" -- sh -c 'while [ ! -e "$0" ]; do sleep 0.1; done; printf "%s\n" "$@"; exit 5' "$TMP/spawn-gate" 'a b' '$HOME'
+[ "$out" = "$p/run-1" ] && ok "...and prints that path and nothing else" || ko "spawn printed: $out"
+d="$p/run-1"
+for f in pid cpid; do [ -s "$d/$f" ] && BGPIDS="$BGPIDS $(head -n 1 "$d/$f")"; done
+[ -s "$d/pid" ] && ok "...having waited for the start to publish its pid" || ko "spawn returned before the claim: $(ls -A "$d")"
+expect "a wait on a spawned run that is still going reads RUNNING" 3 RUNNING -- "$BG" wait "$d" --within 0
+: > "$TMP/spawn-gate"
+expect "...and its status once it finishes (rc=5)" 0 'rc=5' -- "$BG" wait "$d" --within 20
+[ "$(cat "$d/log")" = "$(printf '%s\n' 'a b' '$HOME')" ] && ok "...with its arguments passed through intact, in its log" \
+  || ko "the spawned run logged: $(cat "$d/log")"
+[ "$(ls -A "$d" | tr '\n' ' ')" = "cpid log pid rc " ] && ok "...in the directory layout start writes, and nothing else" \
+  || ko "the spawned directory holds: $(ls -A "$d" | tr '\n' ' ')"
+expect "a second spawn takes the next directory" 0 "$p/run-2" -- "$BG" spawn "$p" -- true
+expect "...and reads its own status" 0 'rc=0' -- "$BG" wait "$p/run-2" --within 20
+expect "usage: spawn refuses a relative parent" 2 'absolute' -- "$BG" spawn rel/parent -- true
+[ ! -e rel ] && ok "...and creates nothing" || ko "a relative spawn created ./rel"
+expect "usage: spawn without -- is refused" 2 'usage:' -- "$BG" spawn "$TMP/u5" true
+expect "usage: spawn with no command is refused" 2 'usage:' -- "$BG" spawn "$TMP/u5" --
+[ ! -e "$TMP/u5" ] && ok "...and creates nothing" || ko "a refused spawn created its parent"
+: > "$TMP/spawn-file"
+expect "spawn under a parent that is a file is an error, and starts nothing" 2 'cannot create' -- "$BG" spawn "$TMP/spawn-file" -- true
+
 # --- usage -------------------------------------------------------------------------------------------
 expect "usage: start refuses a relative directory" 2 'absolute' -- "$BG" start rel/dir -- true
 [ ! -e rel ] && ok "...and creates nothing" || ko "a relative start created ./rel"
@@ -413,6 +443,7 @@ expect "...and so are zero-padded BG_RUN_POLL and BG_RUN_START_GRACE" 4 STARTING
 expect "usage: no subcommand is refused" 2 'usage:' -- "$BG"
 expect "usage: --help prints the synopsis" 0 'bg-run.sh start <dir> --' -- "$BG" --help
 expect "...and names new" 0 'bg-run.sh new   <parent>' -- "$BG" --help
+expect "...and spawn" 0 'bg-run.sh spawn <parent> -- <cmd>' -- "$BG" --help
 expect "usage: new refuses a relative parent" 2 'absolute' -- "$BG" new rel/parent
 [ ! -e rel ] && ok "...and creates nothing" || ko "a relative new created ./rel"
 expect "usage: new with no parent is refused" 2 'usage:' -- "$BG" new

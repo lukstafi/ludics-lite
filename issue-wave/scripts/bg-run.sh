@@ -8,9 +8,26 @@
 # (issue-wave/references/native-claude.md, *Blocking on a run*). This replaces the two lines of
 # hand-copied shell that took three review rounds of races (ludics-lite#354, #357):
 #
+#   bg-run.sh spawn <parent> -- <cmd> [arg...] # foreground; `new` + a detached `start`, prints <dir>
+#   bg-run.sh wait  <dir> [--within <s>]       # run it in the foreground; default 540
+#
+# or, with the start as the harness's own background task:
+#
 #   bg-run.sh new   <parent>                   # foreground; prints <dir>, a fresh directory
 #   bg-run.sh start <dir> -- <cmd> [arg...]    # run it with Bash run_in_background: true
-#   bg-run.sh wait  <dir> [--within <s>]       # run it in the foreground; default 540
+#   bg-run.sh wait  <dir> [--within <s>]
+#
+# `spawn` is the two-call form (ludics-lite#181): it allocates <dir> as `new` does, runs `start`
+# there DETACHED -- its stdio on /dev/null and SIGHUP ignored, so the foreground call that ran
+# `spawn` returns while the command runs on -- waits up to 10 s for that start to publish its pid
+# (the claim, below), and prints <dir> and nothing else; `wait` on it is the one wait. The run is
+# the same `start` on the same directory, so every verdict below reads it as it reads any other.
+# What differs is who can kill it: a detached run is no background task of the harness's, so the
+# harness's own kill of a long task (the DIED case below) does not reach it, and neither does a
+# task-stop; `kill` on the pid in <dir>/cpid (the command) or <dir>/pid (its wrapper) does. A start
+# that has not published its pid by the time `spawn` returns is said so on stderr, and `wait` then
+# reads it as STARTING, as for any start. `fleet-worker.sh execution slot --bg <parent>` is this
+# around a slot-held batch.
 #
 # `new` allocates the run directory, so no caller has to keep a fresh name by hand: it creates
 # <parent> if need be (absolute), then <parent>/run-<N> with one exclusive `mkdir`, N one past the
@@ -108,7 +125,8 @@ set -u
 {
 
 usage() {
-  printf '%s\n' 'usage: bg-run.sh new <parent>' \
+  printf '%s\n' 'usage: bg-run.sh spawn <parent> -- <cmd> [arg...]' \
+    '       bg-run.sh new <parent>' \
     '       bg-run.sh start <dir> -- <cmd> [arg...]' \
     '       bg-run.sh wait <dir> [--within <seconds>]' >&2
   exit 2
@@ -227,6 +245,23 @@ cmd_start() {
   exit "$rc"
 }
 
+# spawn <parent> -- <cmd>: `new`, then `start` on the directory it printed, detached (header). The
+# start is a fresh bash on this file rather than a subshell, because a subshell's $$ is still this
+# process's pid, which `start` publishes as the run's and which is gone the moment `spawn` returns.
+cmd_spawn() {
+  [ $# -ge 3 ] || usage
+  parent=$1; shift
+  [ "$1" = -- ] || usage
+  shift
+  dir=$(cmd_new "$parent") || exit 2
+  ( trap '' HUP; exec "${BASH:-bash}" "$0" start "$dir" -- "$@" ) < /dev/null > /dev/null 2>&1 &
+  tries=0
+  while [ ! -s "$dir/pid" ] && [ "$tries" -lt 50 ]; do sleep 0.2; tries=$((tries + 1)); done
+  [ -s "$dir/pid" ] || say "the start in $(printf '%q' "$dir") has not published its pid after 10 s; a wait there reads STARTING until it does"
+  printf '%s\n' "$dir"
+  exit 0
+}
+
 # started <pid>: the process's start time, blanks removed, in one fixed locale and zone so the
 # start and the wait spell it alike; empty where ps cannot say. (The inner sh in cmd_start spells
 # the same pipeline out, since it cannot call this function.)
@@ -307,6 +342,7 @@ cmd_wait() {
 [ $# -ge 1 ] || usage
 sub=$1; shift
 case $sub in
+  spawn) cmd_spawn "$@" ;;
   new) cmd_new "$@" ;;
   start) cmd_start "$@" ;;
   wait) cmd_wait "$@" ;;

@@ -2137,6 +2137,49 @@ if held "$TMP/slot-n1.log" "slot 1 of 1 held"; then
     "${FWS[@]}" execution slot --wait 0 -- echo no-marker
 fi
 kill -9 "$n1" 2>/dev/null; wait "$n1" 2>/dev/null
+# THE DETACHED BATCH (ludics-lite#181): `--bg <parent>` runs the same slot-held batch under
+# bg-run.sh's `spawn`, returning the run directory at once; bg-run.sh's `wait` is its one wait. The
+# commands wait on a gate file, so each is seen holding its slot after the call that started it
+# returned.
+BGR="$HERE/bg-run.sh"
+# shellcheck disable=SC2016 # the batch's own sh expands these
+GATED='while [ ! -e "$0" ]; do sleep 0.1; done; echo gated-done; exit "$1"'
+bgkill() { local f; for f in pid cpid; do [ -s "$1/$f" ] && kill -9 "$(head -n 1 "$1/$f")" 2>/dev/null; done; }
+bgcmd=(sh -c "$GATED" "$TMP/slot-bg-gate1" 3)
+expect "execution slot --bg returns at once with a bg-run.sh run directory" 0 "^$TMP/slot-bg/run-1$" -- \
+  "${FWS[@]}" execution slot --bg "$TMP/slot-bg" -- "${bgcmd[@]}"
+bgd="$TMP/slot-bg/run-1"
+if [ "$out" = "$bgd" ] && held "$bgd/log" "slot 1 of 1 held for: sh -c"; then
+  ok "...whose detached batch takes the slot"
+  expect "...and holds it after the call returned: a foreground batch is refused" 1 "all 1 run-time correctness slots busy" -- \
+    "${FWS[@]}" execution slot --wait 0 -- echo beside-bg
+  expect "...and bg-run.sh wait reads it RUNNING" 3 RUNNING -- "$BGR" wait "$bgd" --within 0
+  : > "$TMP/slot-bg-gate1"
+  expect "...then the batch's own status (rc=3)" 0 "rc=3" -- "$BGR" wait "$bgd" --within 30
+  grep -q "^gated-done$" "$bgd/log" && ok "...with its output in the run's log" || ko "the --bg batch's log: $(cat "$bgd/log")"
+  expect "...and the slot is free once it ends" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo after-bg
+else ko "the --bg batch printed $out and never took the slot: $(cat "$bgd/log" 2>/dev/null)"; fi
+bgkill "$bgd"
+# Inside an enclosing slot the detached batch runs under it, and keeps it held past the end of
+# the enclosing command that spawned it: the flock is inherited, like FLEET_SLOT_HELD.
+bgcmd=(sh -c "$GATED" "$TMP/slot-bg-gate2" 0)
+expect "a --bg batch inside an enclosing slot returns its directory from within it" 0 "$TMP/slot-bg/run-2" -- \
+  "${FWS[@]}" execution slot --wait 0 -- "$FW" execution slot --wait 0 --bg "$TMP/slot-bg" -- "${bgcmd[@]}"
+bgd="$TMP/slot-bg/run-2"
+if held "$bgd/log" "inside slot 1 of 1, held by an enclosing batch"; then
+  ok "...and runs inside that slot rather than waiting for a second one"
+  expect "...which stays held after the enclosing command ended" 1 "all 1 run-time correctness slots busy" -- \
+    "${FWS[@]}" execution slot --wait 0 -- echo beside-nested-bg
+  : > "$TMP/slot-bg-gate2"
+  expect "...until the batch ends (rc=0)" 0 "rc=0" -- "$BGR" wait "$bgd" --within 30
+  expect "...and then it is free" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 -- echo after-nested-bg
+else ko "the nested --bg batch did not run inside the enclosing slot: $(cat "$bgd/log" 2>/dev/null)"; fi
+bgkill "$bgd"
+expect "--bg on a host with no fleet name is refused in the foreground" 2 "no fleet name" -- \
+  env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=testbox" "$FW" execution slot --bg "$TMP/slot-bg-none" -- echo x
+[ ! -e "$TMP/slot-bg-none" ] && ok "...and allocates no run directory" || ko "a refused --bg allocated $TMP/slot-bg-none"
+expect "--bg takes an absolute parent, as bg-run.sh does" 2 "absolute" -- "${FWS[@]}" execution slot --bg rel/runs -- echo x
+expect "--bg with --probe is a usage error" 2 "--probe takes no --bg" -- "${FWS[@]}" execution slot --probe --bg "$TMP/slot-bg"
 expect "--cpu and --gpu together are a usage error" 2 "exclusive" -- "${FWT[@]}" execution slot --cpu --gpu -- true
 expect "a token count below one is refused, as a slot count is" 1 "FLEET_BOX_GPU_TOKENS entry must be <box>=<positive n>: testbox=0" -- \
   env FLEET_BOXES="testbox other" FLEET_BOX_GPU_TOKENS="testbox=0" "$FW" execution slot -- true
@@ -2227,7 +2270,7 @@ expect "execution hold needs a command after --" 2 "a command to hold the box ar
 expect "execution hold takes no slot options" 2 "execution hold .--why <text>. -- <command>" -- "${FWS[@]}" execution hold --wait 5 -- true
 expect "execution slot needs a command after --" 2 "a command to hold the slot around is required" -- "${FWS[@]}" execution slot --
 expect "execution slot refuses a non-numeric --wait" 2 "whole number of seconds" -- "${FWS[@]}" execution slot --wait soon -- echo x
-expect "execution slot takes no --box: the slot is this box's own" 2 "execution slot .--wait <seconds>. .--cpu|--gpu. -- <command>" -- "${FWS[@]}" execution slot --box other -- echo x
+expect "execution slot takes no --box: the slot is this box's own" 2 "execution slot .--bg <parent>. .--wait <seconds>. .--cpu|--gpu. -- <command>" -- "${FWS[@]}" execution slot --box other -- echo x
 expect "a malformed slots spec refuses before anything is locked" 1 "<box>=<positive n>" -- \
   env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=x" "$FW" execution slot -- echo x
 expect "a host with no fleet name has no slot to take" 2 "no fleet name" -- \
