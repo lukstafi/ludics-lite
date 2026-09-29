@@ -460,18 +460,20 @@ SHIMEOF
 # preflight's `git credential fill` (ludics-lite#374) gets a credential from it unless
 # SHIM_GH_CRED=none (no credential, as gh with no login answers) or `hang`; `dead` returns one
 # the API call then refuses, as GitHub refuses a stale password (the API call reads the token it
-# was given, GH_TOKEN, as gh does). SHIM_GH_SLOW=<s> delays every API answer.
+# was given, GH_TOKEN, as gh does), and `other` one that answers as another account.
+# SHIM_GH_SLOW=<s> delays every API answer.
 cat > "$TMP/bin/gh" <<'SHIMEOF'
 #!/usr/bin/env bash
 if [ "$*" = "auth git-credential get" ]; then
   cat > /dev/null
   case "${SHIM_GH_CRED:-}" in none) exit 1 ;; hang) sleep 30 ;; esac
-  tok=shim-token; [ "${SHIM_GH_CRED:-}" != dead ] || tok=dead-token
+  case "${SHIM_GH_CRED:-}" in dead) tok=dead-token ;; other) tok=other-token ;; *) tok=shim-token ;; esac
   printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n' "$tok"; exit 0
 fi
 [ "$*" = "api --hostname github.com user -q .login" ] || { echo "gh shim: unexpected call: $*" >&2; exit 2; }
 [ -z "${SHIM_GH_SLOW:-}" ] || sleep "$SHIM_GH_SLOW"
 [ "${GH_TOKEN:-}" != dead-token ] || { echo "gh: Bad credentials (HTTP 401)" >&2; exit 1; }
+[ "${GH_TOKEN:-}" != other-token ] || { echo other-user; exit 0; }
 [ -z "${SHIM_GH_DEAD_WHEN:-}" ] || [ ! -e "$SHIM_GH_DEAD_WHEN" ] || { echo "gh: Bad credentials (HTTP 401)" >&2; exit 1; }
 case "${SHIM_GH:-}" in
   401) printf '{\n  "message": "Bad credentials",\n  "status": "401"\n}'; echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
@@ -1019,6 +1021,8 @@ expect "...and the git probe still runs when GitHub's API did not answer" 1 "PRE
 expect "a git credential GitHub refuses is refused, though gh's own token passes" 1 "PREFLIGHT REFUSED other: GitHub rejects the credential git returns for https://github.com in a non-interactive session on other (gh: Bad credentials (HTTP 401)) though gh's own token passes, so a worker's push would fail -- repair: ssh other 'gh auth setup-git' (it makes gh git's helper for github.com)$" -- \
   env SHIM_GH_CRED=dead "${FWO[@]}" preflight other --native-claude --no-cross
 grep -q 'dead-token' <<<"$out" && ko "the refused git credential reached the output -- $out" || ok "...and the credential it refused is not printed"
+expect "a git credential for another account than gh's is refused" 1 "PREFLIGHT REFUSED testbox: git's credential for https://github.com is another account's than gh's in a non-interactive session on testbox (git's credential is other-user's, gh's token is shim-user's), so a worker would push as one account and open its PR as the other -- repair: in a terminal on this box: gh auth setup-git" -- \
+  env SHIM_GH_CRED=other "$FW" preflight testbox --native-claude --no-cross
 out=$(env SHIM_GH=down SHIM_GH_CRED=none "$FW" preflight testbox --no-probe --no-cross 2>&1)
 grep -q 'shim-token' <<<"$out" && ko "the git credential reached the preflight's output -- $out" || ok "the git credential never reaches the output"
 out=$(env GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross 2>&1)
@@ -1247,6 +1251,14 @@ expect "a tmux server whose GitHub credential dies after the preflight still ref
 [ -e "$ISSUE_WAVE_STATE/workers/wg" ] && ko "a GitHub refusal at launch left a record behind" || ok "...and leaves no record"
 "$REAL_TMUX" -L "$FLEET_TMUX_SOCKET" set-environment -gu SHIM_GH_DEAD_WHEN; rm -f "$TMP/gh-dead-now"
 "$REAL_TMUX" -L "$FLEET_TMUX_SOCKET" kill-session -t =holder374
+# With no server running, the worker's session starts one from the launch's own far-side shell, so
+# that is what the late probe tries: here its credential dies during the base gate.
+nosock="fwtest-none-$$"
+expect "with no tmux server, a credential that dies after the preflight still refuses the launch" 1 "LAUNCH REFUSED testbox/wn: a tmux server started from this session on testbox would give a CLI worker a GitHub credential that does not work (gh api user: gh: Bad credentials (HTTP 401))" -- \
+  env FLEET_TMUX_SOCKET="$nosock" SHIM_GH_DEAD_WHEN="$TMP/gh-dead-now" SHIM_BASE_TOUCH="$TMP/gh-dead-now" "$FW" launch testbox wn --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
+"$REAL_TMUX" -L "$nosock" list-sessions >/dev/null 2>&1 && ko "the refused launch started a tmux server on $nosock" || ok "...and starts no server"
+[ -e "$ISSUE_WAVE_STATE/workers/wn" ] && ko "a no-server GitHub refusal left a record behind" || ok "...and leaves no record"
+rm -f "$TMP/gh-dead-now"
 expect "launch creates the worktree and reports the session" 0 "LAUNCHED testbox/w1 kind=claude session=[0-9a-f-]\{36\} cwd=$proj-worktrees/w1" -- \
   "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1 -- --model opus
 [ -d "$proj-worktrees/w1" ] && [ "$(git -C "$proj-worktrees/w1" rev-parse --abbrev-ref HEAD)" = claude/w1 ] && ok "worktree on the requested branch" || ko "worktree missing or wrong branch"
@@ -1575,6 +1587,9 @@ expect "a resume refuses against a tmux server whose GitHub credential is dead" 
 "$REAL_TMUX" -L "$FLEET_TMUX_SOCKET" set-environment -gu SHIM_GH
 "$REAL_TMUX" -L "$FLEET_TMUX_SOCKET" kill-session -t =holder374
 cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "...leaving meta and exit as they were" || ko "meta or exit changed by a GitHub refusal"
+expect "...and with no server running, against the credential of the shell that would start one" 1 "UNSTICK REFUSED testbox/wo: a tmux server started from this session on testbox would give a CLI worker a GitHub credential that does not work (gh api user: gh: Bad credentials (HTTP 401))" -- \
+  env SHIM_GH=401 FLEET_TMUX_SOCKET="fwtest-none-$$" "$FW" unstick testbox wo --message "$TMP/msg.md"
+cmp -s "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/meta.before" && [ -f "$ISSUE_WAVE_STATE/workers/wo/exit" ] && ok "...leaving meta and exit as they were too" || ko "meta or exit changed by a no-server GitHub refusal"
 echo 99 > "$ISSUE_WAVE_STATE/workers/wo/exit.prev"; echo "kind=stale" > "$ISSUE_WAVE_STATE/workers/wo/meta.prev"; cp "$ISSUE_WAVE_STATE/workers/wo/meta" "$TMP/wo.meta"
 mv "$proj" "$proj.moved"
 expect "unstick refuses when the recorded worktree is gone, before touching the record" 1 "recorded working directory .* is gone" -- "$FW" unstick testbox wo --message "$TMP/msg.md"
