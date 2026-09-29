@@ -113,6 +113,9 @@ opens the PR with it): every box exports one fleet PAT as `GH_TOKEN` from
 calls `gh api user` from that session kind and refuses a rejected token with the repair: replace
 the box's file from the anchor's, `ssh <box> 'f=~/.config/fleet/gh-token.sh; umask 077; cat > "$f.new" && chmod 600 "$f.new" && mv "$f.new" "$f"' <
 ~/.config/fleet/gh-token.sh` (a fresh 0600 file, swapped in), and restart any tmux server that inherited the old value.
+It also asks git for github.com's HTTPS credential the way a push does (`git credential fill`),
+refusing with `gh auth setup-git` when none comes back, and for a CLI worker it runs both calls
+again inside the box's running tmux server, whose environment the worker inherits.
 Provider/model, launch transport and execution placement are separate choices. Both Codex and
 Claude Code support their own native subagents in coordinator-created external worktrees, or
 CLI workers launched with `--kind codex` or `--kind claude`. Only the CLI route provides

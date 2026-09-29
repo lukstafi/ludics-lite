@@ -455,8 +455,17 @@ SHIMEOF
 # on stdout with no newline, then the error on stderr, exit 1; rog-nv-linux, 2026-09-24),
 # `noauth` a box never logged in (exit 4), `down` a network that cannot reach api.github.com,
 # `5xx` a GitHub outage, `hang` a call that never returns. Unset, it answers a login.
+# It is also git's credential helper for https://github.com, configured in the scratch HOME the
+# way `gh auth setup-git` writes it (the list reset first, so no system helper answers): the
+# preflight's `git credential fill` (ludics-lite#374) gets a credential from it unless
+# SHIM_GH_CRED=none (no credential, as gh with no login answers) or `hang`.
 cat > "$TMP/bin/gh" <<'SHIMEOF'
 #!/usr/bin/env bash
+if [ "$*" = "auth git-credential get" ]; then
+  cat > /dev/null
+  case "${SHIM_GH_CRED:-}" in none) exit 1 ;; hang) sleep 30 ;; esac
+  printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=shim-token\n'; exit 0
+fi
 [ "$*" = "api --hostname github.com user -q .login" ] || { echo "gh shim: unexpected call: $*" >&2; exit 2; }
 case "${SHIM_GH:-}" in
   401) printf '{\n  "message": "Bad credentials",\n  "status": "401"\n}'; echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
@@ -468,6 +477,8 @@ esac
 echo shim-user
 SHIMEOF
 chmod +x "$TMP/bin/claude" "$TMP/bin/codex" "$TMP/bin/tmux" "$TMP/bin/ssh" "$TMP/bin/gh"
+git config --global --add credential.https://github.com.helper ""
+git config --global --add credential.https://github.com.helper "!gh auth git-credential"
 
 # --- the real checkout, installed by the README's own loops, must pass the preflight ---------
 # The scratch checkout further down is built to the layout the preflight expects, so the two
@@ -990,6 +1001,16 @@ expect "a box never logged in to gh refuses (an unnamed failure fails closed)" 1
 expect "a GitHub that cannot be reached is noted on the OK line" 0 "PREFLIGHT OK testbox .*(GitHub unreachable from testbox: gh api user: check your internet connection" -- env SHIM_GH=down "$FW" preflight testbox --no-probe --no-cross
 expect "a GitHub outage (HTTP 5xx) is noted, not refused" 0 "PREFLIGHT OK.*GitHub unreachable from testbox: gh api user: gh: Server Error (HTTP 502)" -- env SHIM_GH=5xx "$FW" preflight testbox --no-probe --no-cross
 expect "a gh call that never returns is bounded and noted" 0 "PREFLIGHT OK.*GitHub unreachable from testbox: no answer from gh api user in 2s" -- env SHIM_GH=hang FLEET_GH_TIMEOUT=2 "$FW" preflight testbox --no-probe --no-cross
+# The push half (ludics-lite#374): a live API token with no git credential for https://github.com
+# is refused, since a worker's push asks git, not gh; the credential itself is never printed.
+expect "no git credential for github.com refuses with gh auth setup-git" 1 "PREFLIGHT REFUSED other: git gets no GitHub credential in a non-interactive session on other (git credential fill for https://github.com: fatal: could not read Username for 'https://github.com': terminal prompts disabled), so a worker's push would fail -- repair: ssh other 'gh auth setup-git'$" -- \
+  env SHIM_GH_CRED=none "${FWO[@]}" preflight other --native-claude --no-cross
+expect "...on the anchor, in a terminal there" 1 "repair: in a terminal on this box: gh auth setup-git$" -- env SHIM_GH_CRED=none "$FW" preflight testbox --no-probe --no-cross
+expect "...and a helper that never answers is bounded and refused" 1 "git credential fill for https://github.com: no answer in 2s" -- env SHIM_GH_CRED=hang FLEET_GH_TIMEOUT=2 "$FW" preflight testbox --no-probe --no-cross
+expect "...and the git probe still runs when GitHub's API did not answer" 1 "PREFLIGHT REFUSED testbox: git gets no GitHub credential" -- env SHIM_GH=down SHIM_GH_CRED=none "$FW" preflight testbox --no-probe --no-cross
+grep -q 'shim-token' <<<"$out" && ko "the git credential reached the preflight's output -- $out" || ok "the git credential never reaches the output"
+out=$(env GH_TOKEN=ghp_dead "$FW" preflight testbox --native-claude --no-cross 2>&1)
+grep -q 'shim-token' <<<"$out" && ko "the git credential reached a passing preflight's output -- $out" || ok "...nor a passing one's"
 expect "a hanging live probe is bounded and refused" 1 "claude headless probe timed out after 2s" -- env SHIM_CLAUDE_HANG=1 FLEET_PROBE_TIMEOUT=2 "$FW" preflight testbox
 expect "the live probe runs the worker's own stream-json mode: a CLI without it is refused" 1 "claude cannot run headless: error: unknown option '--input-format'" -- env SHIM_CLAUDE_OLD=1 "$FW" preflight testbox
 expect "native preflight needs neither CLI login nor a model probe" 0 "PREFLIGHT OK" -- env SHIM_CODEX_LOGIN_DOWN=1 SHIM_CODEX_DOWN=1 SHIM_CLAUDE_DOWN=1 "$FW" preflight testbox --native-codex
@@ -1111,8 +1132,36 @@ expect "a real server left with no session (exit-empty off) is still checked" 1 
   "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe
 "$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
 "${fresh[@]}" "$REAL_TMUX" -L "$envsock" new-session -d -s iw-real 'sleep 60'
-expect "...and a real server started from the same environment passes" 0 "PREFLIGHT OK" -- \
-  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe
+# The GitHub probe runs inside that server too (ludics-lite#374), as a throwaway session, and
+# remain-on-exit must not leave it behind.
+"$REAL_TMUX" -L "$envsock" set-option -g remain-on-exit on
+expect "...and a real server started from the same environment passes" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe --no-cross
+left=$("$REAL_TMUX" -L "$envsock" list-sessions -F '#{session_name}' 2>&1)
+[ "$left" = iw-real ] && ok "...leaving no probe session behind" || ko "sessions after the probe: $left"
+"$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
+# A server whose environment hands gh a dead credential (the shim reads SHIM_GH from the
+# environment it runs in, as gh reads GH_TOKEN): this session's probe passes, the server's refuses.
+"${fresh[@]}" SHIM_GH=401 "$REAL_TMUX" -L "$envsock" new-session -d -s iw-real 'sleep 60'
+expect "a real server whose environment has a dead GitHub credential refuses a CLI launch" 1 \
+  "PREFLIGHT REFUSED testbox: the running tmux server on testbox gives a new session a GitHub credential this session's probe did not prove (gh api user: gh: Bad credentials (HTTP 401)): a CLI worker started now would inherit it; wait for its live worker session(s) (iw-real; " -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe --no-cross
+expect "...but not a native one, which never runs under tmux" 0 "PREFLIGHT OK" -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --native-claude --no-cross
+# update-environment copies the variable from the launching client into each new session, so the
+# worker gets this session's value whatever the global one is: the probe session does too.
+"$REAL_TMUX" -L "$envsock" set-option -ga update-environment SHIM_GH
+expect "...and passes once the server refreshes that variable from the client" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe --no-cross
+"$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
+"${fresh[@]}" SHIM_GH_CRED=none "$REAL_TMUX" -L "$envsock" new-session -d -s notes 'sleep 60'
+expect "a real server whose git gets no credential refuses, and names kill-server" 1 \
+  "server on testbox gives a new session a GitHub credential this session's probe did not prove (git credential fill: fatal: could not read Username .*no worker session is live on it, so restart it with \`tmux -L $envsock kill-server\` (kill-server also ends its non-worker session(s): notes) and try again" -- \
+  "${fresh[@]}" FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe --no-cross
+"$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
+"${fresh[@]}" SHIM_GH=hang "$REAL_TMUX" -L "$envsock" new-session -d -s iw-real 'sleep 60'
+expect "a gh call that hangs only in the server is bounded and noted" 0 "PREFLIGHT OK .*(GitHub unreachable from testbox: in the running tmux server: no answer from gh api user in 1s)" -- \
+  "${fresh[@]}" FLEET_GH_TIMEOUT=1 FLEET_TMUX_SOCKET="$envsock" "$FW" preflight testbox --no-probe --no-cross
 "$REAL_TMUX" -L "$envsock" kill-server 2>/dev/null
 }
 
