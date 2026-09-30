@@ -101,8 +101,9 @@ with the wait to run in the foreground.
   own interrupt request on the same channel and prints `INTERRUPTED ... from=RUNNING|IDLE` once
   the CLI's receipt is in the stream. Only then does it append the message, which runs as the
   next turn of the same process. Without a message, the aborted turn stands as the latest reply,
-  and `attach` reads it as `FAILED ... idle error_during_execution`. A message the CLI had
-  already queued survives the interrupt (the receipt's `still_queued` counts it) and runs next.
+  and `attach` reads it as `FAILED ... idle error_during_execution ... terminal_reason=aborted_tools`,
+  which a crash does not name. A message the CLI had already queued survives the interrupt (the
+  receipt's `still_queued` counts it) and runs next.
   With no receipt within `FLEET_DELIVERY_WAIT`, the line reads `INTERRUPT UNCONFIRMED` and the
   message is NOT sent. That is a wedged CLI: use `--kill`. `--interrupt` never falls back to a
   kill or a resume. For a wedged Claude worker, or a live Codex exec (which has no
