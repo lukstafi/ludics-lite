@@ -150,7 +150,16 @@ export FLEET_SYSTEMD_INHIBIT="fleet-test-no-systemd-inhibit"
 # A scratch git identity, so worktree/commit steps work on a bare runner.
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
-cleanup() { tmux -L "$FLEET_TMUX_SOCKET" kill-server 2>/dev/null; rm -rf "$TMP"; }
+# kill-server leaves the socket file behind, so each run's own are removed by name: never a
+# prefix glob, since peer sessions run this suite concurrently on the same box.
+cleanup() {
+  local s
+  for s in "$FLEET_TMUX_SOCKET" "fwtest-env-$$" "fwtest-none-$$"; do
+    tmux -L "$s" kill-server 2>/dev/null
+    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$s"
+  done
+  rm -rf "$TMP"
+}
 trap cleanup EXIT
 
 # Copy the dispatcher beside a canned base helper: no live GitHub reads, and no
