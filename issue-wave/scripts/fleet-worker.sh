@@ -1690,7 +1690,11 @@ verdict() {
   fi
   turn() { tail -n +"$((off + 1))" "$d/stream.jsonl" 2>/dev/null; }
   case "$kind" in
-    claude) summary=$(turn | jq -Rr 'fromjson? | select(.type=="result") | "\(.subtype) is_error=\(.is_error) turns=\(.num_turns) " + ((.result // "")|tostring|.[0:200]|gsub("\n";" "))' 2>/dev/null | tail -n1)
+    # A terminal_reason other than `completed` goes among the fields, ahead of the free text: it
+    # tells an interrupted turn (`aborted_tools`, unstick --interrupt) from a crash.
+    claude) summary=$(turn | jq -Rr 'fromjson? | select(.type=="result") | "\(.subtype) is_error=\(.is_error) turns=\(.num_turns) "
+              + (if (.terminal_reason // "completed") != "completed" then "terminal_reason=\(.terminal_reason) " else "" end)
+              + ((.result // "")|tostring|.[0:200]|gsub("\n";" "))' 2>/dev/null | tail -n1)
             # From the last result's own field: the summary carries the result text, which can
             # say anything, `is_error=false` included.
             ok_event=$(turn | jq -Rrn '[inputs | fromjson? | select(.type=="result")] | last | if . != null and .is_error == false then 1 else 0 end' 2>/dev/null) ;;

@@ -1536,6 +1536,7 @@ expect "a bare --interrupt to an IDLE worker: a receipt, nothing to stop" 0 "^IN
 expect "...which leaves its last reply standing" 0 "IDLE testbox/wi success .*did: Stop and answer now" -- "$FW" attach testbox wi --interval 1
 jq -cn '{type: "user", uuid: "x-2", message: {role: "user", content: "SLEEP 60"}}' >> "$wid/input.jsonl"; sleep 2
 expect "a bare --interrupt mid-turn stops it" 0 "^INTERRUPTED testbox/wi .* from=RUNNING " -- "$FW" unstick testbox wi --interrupt
+expect "...and attach names the aborted turn's terminal_reason, which a crash does not" 1 "FAILED testbox/wi idle error_during_execution is_error=true turns=[0-9]* terminal_reason=aborted_tools " -- "$FW" attach testbox wi --interval 1
 expect "...and attach reads the aborted turn as FAILED idle, awaiting input" 1 "FAILED testbox/wi idle error_during_execution is_error=true .*awaiting input" -- "$FW" attach testbox wi --interval 1
 jq -cn '{type: "user", uuid: "x-3", message: {role: "user", content: "SLEEP 60 NOINT"}}' >> "$wid/input.jsonl"; sleep 2
 n_in=$(grep -c '' "$wid/input.jsonl")
