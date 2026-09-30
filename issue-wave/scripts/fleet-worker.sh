@@ -84,7 +84,7 @@
 #                          # on the execution host
 #   fleet-worker.sh gate --target-repo <owner/repo> [--base-branch <branch>] [--force --allow-red-base <reason>] # lease + halt read before native dispatch (not a reservation)
 #   fleet-worker.sh launch <box> <name> --target-repo <owner/repo> --kind claude|codex --brief <file>
-#                          (--cwd <dir> | --repo <dir> --branch <branch> [--base <ref>])
+#                          (--cwd <dir> | --repo <checkout-dir> --branch <branch> [--base <ref>])
 #                          [--base-branch <branch>] [--force --allow-red-base <reason>]
 #                          [--replace] [-- <extra CLI args>]
 #   fleet-worker.sh attach <box> <name> [--interval <sec>]
@@ -1438,6 +1438,14 @@ cmd_launch() {
   [ -n "$brief" ] && [ -r "$brief" ] || die "launch: --brief <readable file>"
   if [ -z "$cwd" ]; then
     [ -n "$repo" ] && [ -n "$branch" ] || die "launch: --cwd <dir>, or --repo <dir> --branch <branch>"
+    # --repo is a checkout path on the box while --target-repo is owner/repo, and the two are
+    # easily swapped. An existing path is a path whatever its shape (asked of the box, where it
+    # resolves); only a missing one shaped like owner/name is refused, before the lease is read.
+    if [[ $repo =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$ ]]; then
+      { prelude "$box"; echo '[ -e "$(expand_tilde "$1")" ]'; } | run_on "$box" "$repo"; local src=$?
+      if unreachable "$src"; then echo "LAUNCH UNREACHABLE $box"; exit 4; fi
+      [ "$src" -eq 0 ] || die "launch: --repo takes the path of a checkout on $box, not a GitHub owner/name like $(printf '%q' "$repo"); the GitHub repository goes in --target-repo"
+    fi
   fi
   anchor_gate LAUNCH "$box/$name" "$force" || exit $?
   # Worktree creation names its base already. An explicit CI branch is needed for

@@ -1250,6 +1250,14 @@ section "launch / attach / status / log with a project repo and --repo/--branch"
 expect "launch without a lease refuses" 1 "LAUNCH REFUSED testbox/w1: no coordinator lease" -- \
   "$FW" launch testbox w1 --target-repo example/project --kind claude --brief "$brief" --repo "$proj" --branch claude/w1
 "$FW" claim >/dev/null
+# --repo is a checkout path on the box; --target-repo is owner/repo. A missing --repo shaped like
+# owner/name is the two swapped, refused as usage; an existing relative path of that shape is
+# still a path (here a plain directory, so the launch goes on and fails at its fetch).
+expect "launch refuses an owner/name --repo that is no path on the box" 2 "launch: --repo takes the path of a checkout on testbox, not a GitHub owner/name like example/project; the GitHub repository goes in --target-repo" -- \
+  "$FW" launch testbox w-swap --target-repo example/project --kind claude --brief "$brief" --repo example/project --branch claude/w-swap
+mkdir -p "$TMP/relrepo/example/project"
+expect "an existing relative --repo shaped like owner/name is still a path" 1 "fetch failed in example/project" -- \
+  bash -c 'cd "$1" && shift && "$@"' _ "$TMP/relrepo" "$FW" launch testbox w-rel --target-repo example/project --kind claude --brief "$brief" --repo example/project --branch claude/w-rel
 expect "launch says on stderr which sibling did not answer, and still launches" 0 "preflight note for testbox/w-cross: (cross-box unreachable, asleep or off the network: otherbox)" -- \
   env FLEET_BOXES="testbox otherbox" SHIM_SSH_DOWN=otherbox "$FW" launch testbox w-cross --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 settle w-cross
