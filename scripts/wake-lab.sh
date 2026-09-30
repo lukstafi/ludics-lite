@@ -1085,6 +1085,13 @@ win_alias() { # win_alias <box> -- the first of the box's Windows routes that an
   return 1
 }
 
+# Windows' cmd.exe ends its lines with `\r` and its echo keeps a blank before `&`, so the start
+# marker is matched as a whole line only after both are stripped. Here, not in the WSL adapter:
+# boot_linux needs it on a dual-boot box whose kind is linux, and the adapter is not loaded then.
+saw_power_start_marker() { # saw_power_start_marker <output> -- 0 when a line of it is the marker
+  tr -d '\r' <<<"$1" | sed 's/[[:space:]]*$//' | grep -Fxq WAKE_LAB_POWER_STARTED
+}
+
 boot_ssh() { # boot_ssh <alias> <remote command> -- one capped, non-interactive remote command
   capped "$BOOT_CAP" ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 \
     -o ServerAliveCountMax=2 "$1" "$2"
@@ -1324,8 +1331,7 @@ boot_linux() { # boot_linux <box>
       echo "$box: restart from Windows ($a)"
       # /f as the adapter's `down` has it: nobody is at the keyboard to answer an app that asks. No
       # space before `&`: cmd.exe's echo keeps it, and on rog (2026-09-24) `echo X & ...` came back
-      # as `X ` and failed an exact match over a restart that had in fact started. Trailing blanks
-      # are stripped before the match as well, so the marker is read the same whichever way it comes.
+      # as `X ` and failed an exact match over a restart that had in fact started.
       out=$(boot_ssh "$a" 'cmd.exe /d /s /c "echo WAKE_LAB_POWER_STARTED& shutdown /r /f /t 0"' 2>&1); rc=$?
       # Error 1190, ERROR_SHUTDOWN_IS_SCHEDULED: a restart was already pending, and it will still
       # happen. That is an accepted restart as far as the locks are concerned, so it is waited out
@@ -1334,7 +1340,7 @@ boot_linux() { # boot_linux <box>
         echo "  $box: a shutdown was already scheduled there (1190); waiting on that one"
         rc=0
       fi
-      if ! tr -d '\r' <<<"$out" | sed 's/[[:space:]]*$//' | grep -Fxq WAKE_LAB_POWER_STARTED ||
+      if ! saw_power_start_marker "$out" ||
          { [ "$rc" != 0 ] && [ "$rc" != 255 ] && [ "$rc" != 124 ]; }; then
         printf '  %s\n' "$(printf '%s\n' "$out" | tr -d '\r' | tail -1)"
         echo "boot-linux FAILED on $box: the Windows restart command did not start (exit $rc)"; return 1
