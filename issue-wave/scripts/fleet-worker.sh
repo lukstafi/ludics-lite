@@ -114,10 +114,13 @@
 #   fleet-worker.sh execution hold [--why <text>] [--request <id>] -- <command...>   # run under
 #                          # THIS box's OS-level sleep guard alone (a systemd-inhibit block lock;
 #                          # bare where none): the wrapper for an exclusive measurement, and what
-#                          # `slot` runs inside; with --request <id> (the measurement's), an
-#                          # `execution slot` inside it runs under the hold instead of refusing
+#                          # `slot` runs inside; with --request <id> (the measurement's), it
+#                          # first takes every slot of the box (waiting for running batches), and
+#                          # an `execution slot` inside it runs under the hold instead of refusing
 #   fleet-worker.sh execution reserve|dispatch|record|reconcile|conclude <json-file>
 #   fleet-worker.sh execution run <json-file>          # reserve + dispatch in one step
+#   fleet-worker.sh execution window <box> <json-file> # `run` for a measurement that suspends the
+#                          # box's standing reservations, restored when it concludes
 #   fleet-worker.sh execution conclude --from-run <run-dir> --request <id> --sha <sha>
 #                          [--box <box>] [--evidence <text>]   # verdict, log and checkout read from a
 #                                                     # test-run.sh record on the reserved box
@@ -2740,8 +2743,9 @@ elif mode == "bare":
     inhibitor, why, command = "", "", sys.argv[3:]
     prefix = "EXECUTION SLOT"
 else:
-    # hold: <inhibitor> <why> <measurement lock or ""> <marker or ""> <command...>
-    inhibitor, why, hold_lock, hold_marker, command = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7:]
+    # hold: <inhibitor> <why> <measurement lock or ""> <marker or ""> <slot count> <command...>
+    inhibitor, why, hold_lock, hold_marker = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+    hold_cap, command = int(sys.argv[7]), sys.argv[8:]
     prefix = "EXECUTION HOLD"
 HOLD_WAIT = 30  # seconds for systemd-inhibit to answer HELD or refuse; it answers at once
 
@@ -2825,6 +2829,45 @@ def run(why):
 
 if mode == "hold":
     if hold_lock:
+        # THE DRAIN (ludics-lite#481, at `execution hold`): every slot of the box, before the
+        # runner starts and for as long as its tree runs, so a batch that was running or waiting
+        # for a slot when the measurement was reserved ends before the measurement begins and
+        # none starts beside it. Before the marker's lock, so a nested slot of such a batch is
+        # still judged as it was until the batch ends. Fail-open and loud, as the marker is.
+        directory = os.path.dirname(hold_lock)
+        indices = set(range(1, hold_cap + 1))
+        try:
+            indices.update(int(name[5:]) for name in os.listdir(directory)
+                           if name.startswith("slot.") and name[5:].isdigit())
+        except OSError:
+            pass
+        # A hold nested in a live hold of this same measurement finds the slots held by its
+        # enclosing one, and waiting for them would wait for itself.
+        if os.environ.get("FLEET_MEASUREMENT_HELD") == hold_marker:
+            try:
+                descriptor = os.open(hold_lock, os.O_RDWR)
+            except OSError:
+                pass
+            else:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    indices = set()
+                os.close(descriptor)
+        for index in sorted(indices):
+            try:
+                descriptor = os.open(os.path.join(directory, "slot.%d" % index), os.O_CREAT | os.O_RDWR, 0o644)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    sys.stderr.write("EXECUTION HOLD %s: measurement %s waits for the batch in slot %d to end\n"
+                                     % (box, hold_marker.split()[1], index))
+                    sys.stderr.flush()
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                os.set_inheritable(descriptor, True)
+            except OSError as exc:
+                sys.stderr.write("EXECUTION HOLD %s: WARNING: slot %d is not held for the measurement, so a batch"
+                                 " may run beside it -- %s\n" % (box, index, exc))
         # The measurement's marker and the lock that proves it live (THE MEASUREMENT'S OWN RUN,
         # at `execution hold`): shared, so a second hold of the same measurement is not refused,
         # and held on a descriptor every process of the command's tree inherits, so the kernel
@@ -2851,11 +2894,17 @@ if mode == "measured":
             return None, "malformed"
         if fields[0] != box:
             return None, "another box's"
+        note = ""
         if measuring != "-":
             outstanding = [i for i in measuring.split(", ") if i]
-            if fields[1] not in outstanding:
+            if not outstanding:
+                # Its measurement is concluded (or never was) while its runner still runs. The live
+                # hold holds every slot of the box (THE DRAIN), so a slot of its own would wait for
+                # that very hold; under it the batch has the box, which is all a slot would give it.
+                note = "the registry has no outstanding measurement %s on %s" % (fields[1], box)
+            elif fields[1] not in outstanding:
                 return None, "the registry has no outstanding measurement %s on %s" % (fields[1], box)
-            if outstanding != [fields[1]]:
+            elif outstanding != [fields[1]]:
                 return None, "other measurements are outstanding on %s too: %s" % (box, measuring)
         # The hold must be live NOW, as an enclosing slot must be: a marker copied into a shell by
         # hand, or left behind by a process that outlived its hold, is not running inside it.
@@ -2867,7 +2916,7 @@ if mode == "measured":
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             os.close(descriptor)
-            return fields[1], ""
+            return fields[1], note
         os.close(descriptor)
         return None, "no `execution hold --request` is live on %s" % box
     request, reason = judged()
@@ -2879,8 +2928,12 @@ if mode == "measured":
                          % (box, marker, reason))
         print("take")
         sys.exit(0)
-    sys.stderr.write("EXECUTION SLOT %s: inside measurement %s, held by an enclosing `execution hold`;"
-                     " no slot taken, for: %s\n" % (box, request, " ".join(command)))
+    if reason:
+        sys.stderr.write("EXECUTION SLOT %s: inside the enclosing `execution hold --request %s`, which holds"
+                         " this box's slots (%s); no slot taken, for: %s\n" % (box, request, reason, " ".join(command)))
+    else:
+        sys.stderr.write("EXECUTION SLOT %s: inside measurement %s, held by an enclosing `execution hold`;"
+                         " no slot taken, for: %s\n" % (box, request, " ".join(command)))
     print("inside")
     sys.exit(0)
 
@@ -2914,6 +2967,20 @@ if mode == "nested":
         os.close(descriptor)
         not_here("slot %d is not held" % index)
     os.close(descriptor)
+    # A live `execution hold --request` holds every slot (THE DRAIN, at `execution hold`), and no
+    # batch inside it carries this marker -- the measurement's own runs are judged by theirs -- so
+    # the slot above being held proves nothing while one is live.
+    try:
+        descriptor = os.open(os.path.join(directory, "measurement.lock"), os.O_RDWR)
+    except OSError:
+        pass
+    else:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(descriptor)
+            not_here("a measurement's `execution hold --request` holds this box's slots")
+        os.close(descriptor)
     # Whether that slot may hold the GPU is judged from THIS spec, never from the marker's own
     # word: the tokens are the first <tokens> slot files (THE GPU TOKENS, above).
     if tokens and index > tokens and not cpu:
@@ -2975,7 +3042,7 @@ RUN_PY
 inhibitor_path() { type -P -- "$INHIBIT" 2>/dev/null || true; }
 
 cmd_execution_slot() {
-  local wait=600 kind="" box cap tokens listing rc measuring dir helper probe="" bg="" here
+  local wait=600 kind="" box cap tokens listing rc measuring window dir helper probe="" bg="" here
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --probe) probe=1 ;;
@@ -3061,7 +3128,10 @@ cmd_execution_slot() {
   [ "$rc" -eq 0 ] || { printf '%s\n' "$listing"; echo "EXECUTION SLOT REFUSED $box: the anchor's registry could not be read"; exit 1; }
   measuring=$(jq -r --arg box "$box" \
     '[.[] | select(.state != "concluded" and .request.execution_host == $box and .request.kind == "measurement")
-       | .request_id] | join(", ")' <<<"$listing") ||
+       | .request_id] | join(", ")' <<<"$listing") &&
+  window=$(jq -r --arg box "$box" \
+    '[.[] | select(.state != "concluded" and .request.execution_host == $box and .request.kind == "measurement"
+                   and .window == true) | .request_id] | join(", ")' <<<"$listing") ||
     { echo "EXECUTION SLOT REFUSED $box: the anchor's registry did not parse"; exit 1; }
   # THE MEASUREMENT'S OWN RUN (at `execution hold`): inside the hold of the one measurement
   # outstanding here, the batch is that measurement's, so it runs under the hold -- no slot, no
@@ -3077,6 +3147,9 @@ cmd_execution_slot() {
       *) echo "EXECUTION SLOT REFUSED $box: the measurement check answered '$judged'"; exit 1 ;;
     esac
   fi
+  # THE MEASUREMENT WINDOW (ludics-lite#481): the refusal names it, so a worker whose standing
+  # reservation it suspended knows to retry once it closes rather than to debug or to request.
+  [ -z "$window" ] || { echo "EXECUTION SLOT REFUSED $box: measurement window $window is open on $box, and holds the box exclusively; standing reservations here are suspended until it concludes, so retry this batch then (no request needed); only a batch inside its own \`execution hold --request <id>\` runs there"; exit 1; }
   [ -z "$measuring" ] || { echo "EXECUTION SLOT REFUSED $box: a measurement holds the box exclusively ($measuring); only a batch inside its own \`execution hold --request <id>\` runs there"; exit 1; }
   mkdir -p "$dir" || die "execution slot: cannot create the slot directory $dir"
   exec python3 -c "$(run_py)" slot "$box" "$dir" "$cap" "$tokens" "${kind#--}" "$wait" "$(inhibitor_path)" "$@"
@@ -3108,9 +3181,16 @@ cmd_execution_slot() {
 # an independent correctness batch on the measured box among them. The hold itself reads no
 # registry, so it never refuses a measurement over the anchor; a mistyped id is caught by the
 # first `slot` inside it, which is refused.
+#
+# THE DRAIN (ludics-lite#481): with --request the hold also takes every slot of the box before the
+# command starts, waiting for a batch that holds one, and the command's tree inherits them, so no
+# batch runs beside a measurement: not one running when it was reserved (a measurement window
+# reserves one on a box whose workers are iterating), nor one that was waiting for a slot then.
+# The slot check reads the registry once, at the batch's start, and cannot see either. A nested
+# hold of the same live measurement takes none, since its enclosing hold holds them.
 # Exit: the command's own status; 127 with `EXECUTION HOLD REFUSED` when it cannot be run; 2 usage.
 cmd_execution_hold() {
-  local why="" request="" box dir="" marker=""
+  local why="" request="" box dir="" marker="" cap=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --why)
@@ -3133,9 +3213,12 @@ cmd_execution_hold() {
     dir="$(local_path "$SLOT_STATE")/$box"
     mkdir -p "$dir" || die "execution hold: cannot create the slot directory $dir"
     dir="$dir/measurement.lock" marker="$box $request"
+    # THE DRAIN takes every slot file there and slots 1..<count>; a spec it cannot read costs
+    # only the second half, never the measurement.
+    cap=$(box_correctness_slots "$box" 2>/dev/null) || cap=0
   fi
   [ -n "$why" ] || why="$box ${request:+measurement $request }hold: $*"
-  exec python3 -c "$(run_py)" hold "$box" "$(inhibitor_path)" "$why" "$dir" "$marker" "$@"
+  exec python3 -c "$(run_py)" hold "$box" "$(inhibitor_path)" "$why" "$dir" "$marker" "${cap:-0}" "$@"
 }
 
 cmd_execution() {
@@ -3224,11 +3307,18 @@ cmd_execution() {
       [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
       payload=$(cat "$2") || die "execution: cannot read payload"
       check_identity ;;
-    *) die "execution: list, slot -- <command>, hold -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run|--from-bg-run <run-dir> --request <id>" ;;
+    # THE MEASUREMENT WINDOW (ludics-lite#481; the registry rules are fleet-execution.py's header):
+    # the box is named apart from the payload so the call says which box's standing reservations
+    # it suspends, and the registry refuses a payload measuring on any other.
+    window)
+      [ "$#" -eq 3 ] && [ -n "$2" ] && [ -r "$3" ] || die "execution window <box> <measurement reserve.json>: a box and a readable JSON file required"
+      payload=$(jq -c --arg box "$2" '{box: $box, request: .}' "$3") || die "execution window: $3 is not a JSON reservation"
+      check_identity ;;
+    *) die "execution: list, slot -- <command>, hold -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, window <box> <json-file>, or conclude --from-run|--from-bg-run <run-dir> --request <id>" ;;
   esac
   local helper out rc map=""; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
-  case "$action" in reserve|run|dispatch) map=$(endpoint_map) || exit 1 ;; esac
+  case "$action" in reserve|run|dispatch|window) map=$(endpoint_map) || exit 1 ;; esac
   out=$({
     prelude "$ANCHOR"
     if [ "$action" != list ]; then lease_mutation_prelude; else printf 'shift 3\n'; fi
@@ -3241,7 +3331,7 @@ EXECUTION_COMMAND
     "$(fleet_name "$ANCHOR")" "$(fleet_name "$LAB_HOST")"); rc=$?
   [ -z "$out" ] || printf '%s\n' "$out"
   if unreachable "$rc"; then echo "EXECUTION UNREACHABLE $ANCHOR: outcome unknown; reconcile before retrying dispatch"; exit 4; fi
-  if [ "$rc" -eq 0 ]; then case "$action" in run|dispatch) execution_refresh "$out" >&2 ;; esac; fi
+  if [ "$rc" -eq 0 ]; then case "$action" in run|dispatch|window) execution_refresh "$out" >&2 ;; esac; fi
   exit "$rc"
 }
 
@@ -3275,12 +3365,21 @@ endpoint_map() {
 # launch preflight need have run on the box the coordinator itself runs from (PR #379 review). On
 # stderr, so stdout stays the record; the dispatch's exit status stands whatever the refresh
 # reports, and a record it cannot read is said so rather than skipped silently.
+#
+# A standing reservation queued behind a measurement window (ludics-lite#481) is not refreshed: the
+# box is measuring, and a fetch there is activity beside the timed run. Its worker's batches are
+# refused until the window concludes, so the line names the refresh to run then.
 execution_refresh() {
-  local host
+  local host window
   host=$(jq -r '.request.execution_host // empty' <<<"$1" 2>&1) && [ -n "$host" ] || {
     printf '%s\n' "REFRESH FAILED: cannot read the execution host from the dispatched record (${host:-empty}); run fleet-worker.sh refresh <host> by hand"
     return 1
   }
+  window=$(jq -r 'select(.state == "suspended") | .suspended_by' <<<"$1" 2>/dev/null)
+  if [ -n "$window" ]; then
+    printf '%s\n' "REFRESH DEFERRED $host: measurement window $window is measuring there; run fleet-worker.sh refresh $host once it concludes"
+    return 0
+  fi
   refresh_box "$host"
 }
 

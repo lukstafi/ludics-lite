@@ -2528,9 +2528,55 @@ expect "a marker naming a concluded measurement is not confirmed beside an outst
   "${FWS[@]}" execution hold --request hold-measure -- "$FW" execution slot -- echo concluded
 grep -q "a measurement holds the box exclusively (hold-measure-2)" <<<"$out" && ok "...and the batch is refused by that one" || ko "the concluded request's marker was not refused: $out"
 fixture_done hold-measure-2
-expect "...and with nothing outstanding the batch takes a slot as usual" 0 "slot 1 of 1 held for: echo after-measurements" -- \
+# With nothing outstanding the hold still holds every slot of the box (THE DRAIN, ludics-lite#481),
+# so a slot of the batch's own would wait for the very hold it runs in: it runs under the hold.
+expect "...and with nothing outstanding the batch runs under the hold, which holds the box's slots" 0 "inside the enclosing .execution hold --request hold-measure., which holds this box's slots (the registry has no outstanding measurement hold-measure on testbox); no slot taken, for: echo after-measurements" -- \
   "${FWS[@]}" execution hold --request hold-measure -- "$FW" execution slot --wait 0 -- echo after-measurements
-grep -q "does not cover this batch (the registry has no outstanding measurement hold-measure" <<<"$out" && ok "...saying the marker does not cover it" || ko "the ignored marker was not reported: $out"
+grep -q "^after-measurements$" <<<"$out" && ok "...and runs" || ko "the batch under a hold with nothing outstanding did not run: $out"
+# THE MEASUREMENT WINDOW (ludics-lite#481): a measurement on a box whose workers hold standing
+# reservations suspends them; a batch there is refused naming the window, the measurement's own
+# run is still admitted inside its hold (#480), and the conclusion restores the standing ones.
+"${FWS[@]}" execution run "$(slotreq win-iterate correctness true)" >/dev/null || ko "could not take the standing reservation (setup)"
+expect "a plain measurement is refused beside a standing reservation, pointing at the window" 1 "every one is standing, which .fleet-worker.sh execution window. suspends" -- \
+  "${FWS[@]}" execution run "$(slotreq win-plain measurement)"
+"${FWS[@]}" execution slot -- sleep 30 > "$TMP/win-b0.log" 2>&1 &
+b0=$!
+held "$TMP/win-b0.log" "slot 1 of 1 held"
+expect "execution window opens a measurement over the box's standing reservations" 0 "EXECUTION WINDOW testbox: win-measure open; suspended win-iterate" -- \
+  "${FWS[@]}" execution window testbox "$(slotreq win-measure measurement)"
+grep -q '"window": true' <<<"$out" && grep -q '"state": "launching"' <<<"$out" && ok "...dispatched, and marked a window" || ko "the window's record: $out"
+listing=$("${FWS[@]}" execution list --active --compact 2>&1)
+[ "$(jq -r '.[] | select(.request_id == "win-iterate") | "\(.state) \(.suspended_by)"' <<<"$listing")" = "suspended win-measure" ] &&
+  ok "...and execution list --active --compact shows the standing reservation suspended by it" || ko "the suspended reservation is not shown as such: $listing"
+# THE DRAIN: a batch already running when the window opened ends before the measurement starts,
+# and while the measurement's hold holds the box's slots no batch starts beside it, a stale slot
+# marker included.
+"${FWS[@]}" execution hold --request win-measure -- sh -c 'echo measuring; sleep 30' > "$TMP/win-m.log" 2>&1 &
+m0=$!
+if held "$TMP/win-m.log" "measurement win-measure waits for the batch in slot 1 to end"; then
+  grep -q "^measuring$" "$TMP/win-m.log" && ko "the measurement started beside a running batch: $(cat "$TMP/win-m.log")" ||
+    ok "the measurement's hold waits for a batch running when the window opened"
+  kill -9 "$b0" 2>/dev/null; wait "$b0" 2>/dev/null
+  held "$TMP/win-m.log" "^measuring$" && ok "...and starts once it ends"
+  expect "...after which a slot marker is not trusted, since the hold is what holds that slot" 1 "does not cover this batch (a measurement's .execution hold --request. holds this box's slots)" -- \
+    env FLEET_SLOT_HELD="testbox 1 1 gpu" "${FWS[@]}" execution slot -- echo stale-marker
+  grep -q "^stale-marker$" <<<"$out" && ko "a stale slot marker ran beside the measurement: $out" || ok "...and the batch is refused"
+fi
+kill -9 "$b0" "$m0" 2>/dev/null; wait "$b0" 2>/dev/null; wait "$m0" 2>/dev/null
+expect "a hold nested in a hold of the same measurement does not wait for its own slots" 0 "^nested-hold$" -- \
+  "${FWS[@]}" execution hold --request win-measure -- "$FW" execution hold --request win-measure -- echo nested-hold
+expect "a batch during the window is refused, naming it" 1 "measurement window win-measure is open on testbox, and holds the box exclusively; standing reservations here are suspended until it concludes, so retry this batch then (no request needed)" -- \
+  "${FWS[@]}" execution slot -- echo during-window
+expect "...while the measurement's own run is admitted inside its hold" 0 "inside measurement win-measure, held by an enclosing .execution hold.; no slot taken, for: echo window-own-run" -- \
+  "${FWS[@]}" execution hold --request win-measure -- "$FW" execution slot -- echo window-own-run
+grep -q "^window-own-run$" <<<"$out" && ok "...and runs" || ko "the window's own run did not run: $out"
+expect "a second window on the box is refused while one is open" 1 "measurement window win-measure is already open on testbox" -- \
+  "${FWS[@]}" execution window testbox "$(slotreq win-second measurement)"
+expect "execution window takes a box and a reservation" 2 "execution window <box> <measurement reserve.json>" -- "${FWS[@]}" execution window testbox
+expect "concluding the measurement restores the standing reservation" 0 "EXECUTION WINDOW testbox: win-measure concluded; restored win-iterate (launching)" -- \
+  "${FWS[@]}" execution conclude "$(jq -n '{request_id:"win-measure", verdict:"not-launched", log:"/dev/null", evidence:"fixture: nothing ran"}' > "$TMP/win-done.json"; printf '%s' "$TMP/win-done.json")"
+expect "...and a batch is admitted again" 0 "slot 1 of 1 held for: echo after-window" -- "${FWS[@]}" execution slot --wait 0 -- echo after-window
+fixture_done win-iterate
 expect "execution hold --request needs a request id" 2 "--request takes the measurement's request id" -- "${FWS[@]}" execution hold --request "../x" -- true
 expect "...and this host's fleet name, which the marker names" 2 "--request needs this host's fleet name" -- \
   env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=testbox" "$FW" execution hold --request hold-measure -- true

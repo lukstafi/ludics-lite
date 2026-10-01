@@ -20,7 +20,8 @@ behaviour check that happens to print timings is `correctness`, and its timings 
 shared-box (2026-09-25: a warm-cache A/B whose claim was which arms replay asked for an exclusive
 mac-studio measurement, impossible while a wave shares the box, and was reclassified). A
 measurement is exclusive: it is refused while anything is outstanding on its host, and
-everything is refused while it is outstanding. A `correctness` reservation shares its
+everything is refused while it is outstanding (standing reservations are suspended for it by a
+[measurement window](#exclusivity-and-the-run-time-slots), not refused). A `correctness` reservation shares its
 host with other correctness reservations up to the box's slots - `FLEET_BOX_CORRECTNESS_SLOTS`,
 `<box>=<n>` pairs, `mac-studio=6 rog-nv-linux=4 minix-amd-linux=4 tuf-amd-linux=3` with the
 default roster and one slot for any box it does not name. The default roster is the default set of boxes, whether
@@ -108,6 +109,66 @@ on this box must be exactly that request, and some `hold --request` on the box m
 now. A marker naming another box, an unknown or concluded request, or no live hold is reported
 and ignored, so the batch is refused as any other is while a measurement is outstanding - and so
 is every batch with no marker, an independent correctness batch on the measured box included.
+
+**The measurement window** (ludics-lite#481). Every native worker holds a standing reservation on
+its agent host for its whole life, so a measurement there was never admitted: the 2026-09-30 wave's
+first Metal measurement on mac-studio waited about five hours, and the coordinator then opened each
+"Metal window" by hand - concluding every standing reservation `cancelled` (a conclusion describing
+no run), messaging the workers, measuring, and taking fresh reservations under invented ids. Now a
+measurement on a box where standing reservations are outstanding is reserved with
+`fleet-worker.sh execution window <box> <reserve.json>` in place of `execution run`. Under one
+registry lock it refuses unless everything outstanding on the box is standing (an assigned
+correctness run or another measurement still refuses it, naming the owners; an open window by
+name), reserves and dispatches the measurement as `run` does (its record carries `"window": true`),
+and moves each standing reservation there to state `suspended`, naming the measurement in
+`suspended_by` and the state it left in `suspended_from`. It prints the measurement's record, and
+on stderr `EXECUTION WINDOW <box>: <id> open; suspended <ids>`. Concluding the measurement, whatever
+the verdict, restores every reservation it suspended to its former state, with the same request ids
+(`EXECUTION WINDOW <box>: <id> concluded; restored <id> (<state>), ...` on stderr). While the window is open:
+
+- `execution slot` on the box refuses a batch with `EXECUTION SLOT REFUSED <box>: measurement window
+  <id> is open on <box> ...`, so a worker knows to retry after it closes rather than to debug or to
+  request; the measurement's own run is admitted inside its `hold --request`, as
+  [above](#exclusivity-and-the-run-time-slots).
+- a standing reservation taken on the box is queued into the window - admitted straight into
+  `suspended` and restored with the others - so a worker's launch never waits for a window;
+- a suspended reservation takes no dispatch, record or reconcile (the window owns its state), but
+  may be concluded: a worker handing back mid-window ends its reservation as usual;
+- a second `execution window` on the box is refused naming the open one. One measurement per window
+  keeps the registry at one outstanding measurement per box, which the in-hold admission above
+  relies on, and gives each request its own record, assignment and conclusion.
+
+`execution list --active --compact` shows a suspended reservation by its state and its
+`suspended_by`. A retried `window` with the same payload never dispatches twice: it suspends any
+standing reservation still outstanding there and prints the record. A standing reservation queued
+into a window is not followed by the usual [refresh](#reserve-launch-observe-conclude) of the box,
+which is measuring: `REFRESH DEFERRED <box>` names the refresh to run once the window concludes.
+
+The refusal above is a registry read at the batch's start, so it cannot stop a batch that was
+already running, or already waiting for a slot, when the window opened. **The drain** closes that:
+`execution hold --request <id>` takes every slot of the box (`slot.1` up to the box's count, and
+any other slot file there) before its runner starts, waiting for a running batch to end with
+`EXECUTION HOLD <box>: measurement <id> waits for the batch in slot <n> to end`, and holds them
+for as long as the runner's tree runs. So no batch runs beside the measurement however it was
+admitted: a batch waiting for a slot either ends before the measurement starts or starts after it
+ends. While such a hold is live a `FLEET_SLOT_HELD` marker is not trusted, since the slot it names
+is held by the hold, not by an enclosing batch; the measurement's own runs carry its marker
+instead. A hold nested in a live hold of the same measurement takes no slots (they are its
+enclosing hold's), and a second, concurrent hold of it waits for the first to end. A batch under a
+hold whose measurement is no longer outstanding runs under that hold, which holds the box's
+slots, rather than waiting for one of them. The drain applies to every measurement, though only a
+window's ever had batches to wait for. A slot file the hold cannot lock is a loud `WARNING`, never
+a refused measurement, as with the marker.
+
+**Batching measurements into windows.** When a measurement request arrives for a box where workers
+hold standing reservations, gather every pending measurement request for that box first (the
+requests already queued, and any a worker has said is about to follow) and run them back to back
+in arrival order: open a window with the first, and when its result line comes in, conclude it and
+open the next one's window in the same turn. The conclusion restores the standing reservations and
+the next window suspends them again, two registry calls with no message to the workers, whose
+batches are refused naming whichever window is open. A request arriving while a window is open
+joins the queue. The last conclusion leaves the standing reservations restored, and the workers'
+batches are admitted again.
 
 ## The OS-level sleep guard
 
@@ -385,6 +446,12 @@ repository whose runner is a plain script go through it the same way, one batch 
 (2026-09-15: the coordinator ended up granting this by message after sixteen
 request/assign/report round-trips parked three workers idle between review rounds).
 
+A measurement on the worker's agent host suspends this reservation for as long as it runs: the
+coordinator opens it as a [measurement window](#exclusivity-and-the-run-time-slots), the record's
+state is `suspended` meanwhile, and every batch on the box is refused naming the window. The worker
+retries the batch once the window closes, with no request. A standing reservation taken while a
+window is open is admitted suspended, and restored with the others.
+
 ## Native handoffs
 
 A Claude Code native worker cannot wait for a message mid-turn, so its handoff is turn-shaped:
@@ -429,6 +496,11 @@ requires request ID, evidence and state `reserved`, `running` or `uncertain`. On
 when evidence proves no execution began or can still begin; it acknowledges the new lease for a
 later dispatch. Otherwise preserve uncertainty or conclude with verified terminal evidence.
 Recording and concluding existing executions remain available during a halt for reconciliation.
+An open [measurement window](#exclusivity-and-the-run-time-slots) and its suspended reservations
+survive adoption as they stand: the adopter reconciles the window's measurement like any other
+record, and its conclusion restores the suspended reservations, during a halt too. A suspended
+reservation itself is not reconciled - the window owns its state until then - though it may be
+concluded.
 
 A halt refuses ordinary reservations and dispatch. The one named regression-triage reservation
 may include a nonempty `triage_reason` only while a halt is active; its dispatch is allowed

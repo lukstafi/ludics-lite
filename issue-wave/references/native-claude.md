@@ -71,6 +71,9 @@ and a release through five PRs on 2026-09-15 with no stranded worker.
    with two GPU tokens that a batch declared `--cpu` does not take, four on minix-amd-linux,
    three on tuf-amd-linux, one on a box the spec does not name) and
    refuses while a measurement is outstanding there; a measurement still needs the box to itself through the registry.
+   A refusal naming a *measurement window* means the coordinator is measuring on the box and has
+   suspended the worker's standing reservation until it concludes: the worker keeps working
+   without the batch and retries it once the window closes, with no request.
 2. **Request, for everything else.** A measurement, a cross-box leg, a full suite: the worker
    ends its turn with its final message carrying one block and nothing after it:
 
@@ -85,7 +88,10 @@ and a release through five PRs on 2026-09-15 with no stranded worker.
    The task notification that follows is this handoff, not completion.
 3. **Assign.** The coordinator completes the reservation (wave, worker, `transport:
    "subagent"`, agent host, repository, issue, purpose - the request supplies the rest), runs
-   `execution run <reserve.json>`, and on exit 0 resumes the worker by its agent ID (the
+   `execution run <reserve.json>` - or, for a measurement on a box where workers hold standing
+   reservations, `execution window <box> <reserve.json>`, batching the box's pending
+   measurements as [executions.md](executions.md#exclusivity-and-the-run-time-slots) says - and
+   on exit 0 resumes the worker by its agent ID (the
    runtime's continue-an-agent form: SendMessage to the agent's name or ID, never a fresh
    Agent call) with one line, `EXECUTION_ASSIGNED <request_id>`, followed by the exact
    command, revision, checkout and log to use. On a refusal, hold the worker - idle, it keeps
@@ -96,7 +102,8 @@ and a release through five PRs on 2026-09-15 with no stranded worker.
    without `execution slot`, as [executions.md](executions.md#reserve-launch-observe-conclude)
    specifies: under `fleet-worker.sh execution hold --request <request_id> -- <command>`, the
    OS-level sleep guard alone, inside which a runner's own `execution slot` runs instead of
-   being refused. The worker blocks on either kind to completion within the turn ([Blocking on a
+   being refused. The hold first waits for any batch still running on the box (`waits for the
+   batch in slot <n> to end`) and keeps the box's slots until the command's tree ends. The worker blocks on either kind to completion within the turn ([Blocking on a
    run](#blocking-on-a-run)), and ends that turn with one fixed line,
    so the coordinator concludes without grepping run ids out of prose:
 

@@ -13,7 +13,9 @@ fleet correctness or measurement run beyond its
 [standing reservation](executions.md#standing-iteration-reservation), the worker messages the
 coordinator with revision, execution host, workload kind, the bounded command, checkout and
 intended log path, then waits for dispatch. The coordinator completes the reservation, runs
-`fleet-worker.sh execution run <reserve.json>`, and answers the same agent with the
+`fleet-worker.sh execution run <reserve.json>` (`execution window <box> <reserve.json>` for a
+measurement on a box where workers hold standing reservations, [executions.md](executions.md#exclusivity-and-the-run-time-slots)),
+and answers the same agent with the
 assignment; the worker runs only that, blocks on it to completion, and reports the run
 directory, observed SHA and exit in its reply, which `execution conclude --from-run <run>
 --request <id> --sha <sha>` consumes. A Codex worker may also use the fixed `EXECUTION_REQUEST`
