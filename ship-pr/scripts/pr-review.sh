@@ -6679,13 +6679,18 @@ PATHS_IGNORE_WHY=""
 
 # commit_files <sha>: the paths ONE commit changed, one per line, or nothing (exit 1) when the
 # answer is not evidence — an empty list (a commit whose files the API omitted, an empty
-# first-parent diff) and a list at the endpoint's 300-file cap both say nothing about the whole
-# commit. A merge commit answers with its FIRST-PARENT diff, which is the change the merge brought
-# to the branch. Renames carry both names, since both are changed paths.
+# first-parent diff) and a list of 300 or more both say nothing about the whole commit. A merge
+# commit answers with its FIRST-PARENT diff, which is the change the merge brought to the branch.
+# Renames carry both names, since both are changed paths.
 #
-# PAGINATED, because a commit's files are: the endpoint serves 30 a page by default and 300 in
-# all, so an unpaginated read of a 45-file commit answers with 30 ignored paths and hides the
-# source file behind them — a page taken for a diff (ludics-lite#163 review, round 2). One row per
+# PAGINATED, because a commit's files are: an unpaginated read answers one default page of 300
+# files with a rel=next link past it, so a wide commit's single read hides every file after the
+# first page — a page taken for a diff (ludics-lite#163 review, round 2). The paginated read is
+# whole well past 300 (GitHub documents 3000 as the most it serves; pr-review-api-contract.sh pins
+# the default page, per_page, and a 353-file read joining whole — ludics-lite#177, which found the
+# "30 a page, 300 in all" this comment once said to be wrong on both counts). So the refusal at 300
+# is conservative, not a cap the endpoint imposes: it costs a docs push that wide the grace, and it
+# is the backstop that refuses an unpaginated read, whose wide answer is exactly 300. One row per
 # file, both of a rename's names on it, so the count below counts FILES and not paths.
 commit_files() {
   local sha="$1" raw count
