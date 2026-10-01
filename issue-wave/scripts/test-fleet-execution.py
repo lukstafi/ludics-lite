@@ -842,3 +842,73 @@ with tempfile.TemporaryDirectory(prefix='fleet-lane-held-') as temporary:
         os.close(descriptor)
     assert seen == ['held'], seen
     print('PASS: the measurement holds the lane lock while its record is published')
+
+# ludics-lite#481, continued: the window's publication order. A crash between its records may leave
+# the window open with some standing records not yet suspended, or some restored early -- never a
+# record suspended by a measurement that is not outstanding -- and a retry finishes the rest.
+with tempfile.TemporaryDirectory(prefix='fleet-window-order-') as temporary:
+    executions = Path(temporary) / 'executions'
+    real_replace = os.replace
+
+    def helper(action, data, crash_after=None):
+        """Run the helper in process; with `crash_after`, the os.replace after that many raises."""
+        published = []
+
+        def replace(source, target):
+            if crash_after is not None and len(published) == crash_after:
+                raise OSError('fixture crash between records')
+            published.append(Path(target).stem)
+            return real_replace(source, target)
+
+        try:
+            with patch('sys.argv', ['helper', temporary, action, 'owner', 'token', json.dumps(data), 'mac']), \
+                    patch('os.replace', side_effect=replace), redirect_stdout(io.StringIO()):
+                runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
+            assert crash_after is None, published
+        except SystemExit as exit:
+            assert crash_after is not None and exit.code == 1 and len(published) == crash_after, (exit, published)
+        return published
+
+    def request(identity, kind='correctness', standing=True):
+        data = dict(request_id=identity, wave='wave', worker=identity, transport='subagent',
+                    issue='repo#481', purpose='fixture', agent_host='mac', execution_host='mac',
+                    repository='owner/repo', requested_revision='origin/main', kind=kind)
+        return {**data, 'standing': True} if standing else data
+
+    def records():
+        return {path.stem: json.loads(path.read_text()) for path in executions.glob('*.json')}
+
+    def invariant():
+        """No record is suspended by a measurement that is not outstanding."""
+        now = records()
+        for r in now.values():
+            if r['state'] == 'suspended':
+                window = now.get(r['suspended_by'])
+                assert window and window['state'] != 'concluded', (r['request_id'], window)
+
+    helper('run', request('iterate-a'))
+    helper('reserve', request('iterate-b'))
+    measurement = {'box': 'mac', 'request': request('measure', 'measurement', standing=False)}
+    # The window crashes right after its first record is published: the measurement, outstanding.
+    assert helper('window', measurement, crash_after=1) == ['measure'], records()
+    invariant()
+    assert records()['measure']['state'] == 'launching'
+    assert [records()[n]['state'] for n in ['iterate-a', 'iterate-b']] == ['launching', 'reserved']
+    # A retried window finishes the suspensions without a second dispatch.
+    assert helper('window', measurement) == ['iterate-a', 'iterate-b']
+    invariant()
+    assert [e['action'] for e in records()['measure']['history']] == ['reserve', 'dispatch']
+    assert all(records()[n]['state'] == 'suspended' for n in ['iterate-a', 'iterate-b'])
+    # The conclusion crashes right after its first record is published: one restoration, while
+    # the measurement is still outstanding and the other record still suspended by it.
+    conclusion = dict(request_id='measure', verdict='not-launched', evidence='fixture', log='/logs/measure')
+    assert helper('conclude', conclusion, crash_after=1) == ['iterate-a'], records()
+    invariant()
+    assert records()['measure']['state'] == 'launching'
+    assert [records()[n]['state'] for n in ['iterate-a', 'iterate-b']] == ['launching', 'suspended']
+    # A retried conclusion restores the rest and concludes.
+    assert helper('conclude', conclusion) == ['iterate-b', 'measure']
+    invariant()
+    assert [records()[n]['state'] for n in ['measure', 'iterate-a', 'iterate-b']] == ['concluded', 'launching', 'reserved']
+    assert records()['iterate-b']['history'][-1]['action'] == 'restore'
+    print('PASS: a crash between window records leaves nothing suspended by an absent measurement; a retry finishes')
