@@ -441,6 +441,6 @@ tests=(
   test_base_ref_is_encoded
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

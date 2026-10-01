@@ -792,7 +792,7 @@ test_a_suite_that_shadows_the_transport_is_refused() {
     printf 'source %s\n' "\"$BASE_LIB_DIR/$BASE_LIB_BASENAME\""
     echo 'reset_fixture() { :; }'
     echo 'test_a_case() { assert_eq 1 1 "one is one"; }'
-    echo 'run_tests test_a_case'
+    echo 'run_tests test_a_case -- "$@"'
   } >"$dir/shadow.sh"
   set +e
   out=$(bash "$dir/shadow.sh" 2>&1)
@@ -844,6 +844,6 @@ tests=(
   test_reset_fixture_refuses_to_unset_a_name_it_did_not_create
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

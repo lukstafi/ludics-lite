@@ -1557,6 +1557,6 @@ tests=(
   test_wait_ceiling_with_a_queued_run_is_no_verdict
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

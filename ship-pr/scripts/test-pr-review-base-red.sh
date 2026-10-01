@@ -256,6 +256,6 @@ tests=(
   test_a_wait_that_runs_out_over_an_older_red_has_no_verdict
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

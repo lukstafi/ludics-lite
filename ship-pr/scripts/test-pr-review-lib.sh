@@ -71,13 +71,15 @@
 #   protect_library <file>              extends the guard over a second library sourced after
 #                                       this one (test-pr-review-base-lib.sh), whose functions
 #                                       the snapshot below could not see
-#   run_tests <case>...                 the guard below, then each case with a PASS line — and,
+#   run_tests <case>... -- "$@"         the guard below, then each case with a PASS line — and,
 #                                       after each case, the refusal of a BREAK_JQ left standing,
 #                                       which would break a jq program for every case after it.
 #                                       A case that is not a defined function when run_tests is
-#                                       reached is refused before any case runs.
-#                                       SHIP_PR_TEST_CASES="<case> <case>" runs only those, and
-#                                       says so on a closing `SUBSET: n of m cases` line
+#                                       reached is refused before any case runs. Case names on
+#                                       the suite's command line, or SHIP_PR_TEST_CASES="<case>
+#                                       <case>", run only those, and say so on a closing
+#                                       `SUBSET: n of m cases` line; a call without the `--`
+#                                       forward is refused
 #
 # The guard is why the file exists. pr-review.sh defines some sixty top-level functions, every
 # one in scope in every suite the moment it is sourced, and a suite helper that happens to share
@@ -963,8 +965,9 @@ check_shadows() {
   }
 }
 
-# run_tests <case>...: the guard, then the cases in order, each announced on stdout. A case's
-# retuned constants are put back before the next one starts, whether or not it restored them.
+# run_tests <case>... -- "$@": the guard, then the cases in order, each announced on stdout. A
+# case's retuned constants are put back before the next one starts, whether or not it restored
+# them.
 #
 # A marker left standing is the other leak between cases, and the one nothing can put back: the
 # constants have a value as sourced to restore to, but a broken jq program is a claim about the
@@ -984,40 +987,66 @@ check_shadows() {
 # a suite. The variable is read once and unset before the first case: a case that runs a
 # throwaway suite of its own must not hand it a list naming the outer suite's cases.
 #
+# The suite's own arguments, after `--`, select the same way, so `bash <suite> <case>...` is the
+# list spelled on the command line; naming cases both ways is refused rather than merged. The
+# `--` is required, not optional: a suite that never forwarded its arguments ran the whole suite
+# for `bash test-pr-review-base-verdict.sh <case>` and said nothing, and a forward that may be
+# left out would let the next suite drop them the same way.
+#
 # Every case named must already be a function when run_tests is reached, and the run is refused
 # before the first case otherwise. PR #415 defined a case inside another case's body: the full run
 # was green, since the outer case defined the inner one before its turn came, but a subset naming
 # the inner case alone had nothing to call — and only the reviewer noticed. A name the register
 # carries and no function answers is a defect of the suite, whichever cases a run selects.
 run_tests() {
-  local test_name wanted=() selected=() missing="" undefined=""
+  local test_name cases=() listed=() wanted=() selected=() missing="" undefined="" from
   check_shadows
-  [ $# -gt 0 ] || bail "run_tests: no cases named"
-  for test_name in "$@"; do
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do
+    cases+=("$1")
+    shift
+  done
+  [ $# -gt 0 ] || {
+    echo "$LIB_BASENAME: REFUSING to run: run_tests was not handed the suite's arguments — end the call with \`-- \"\$@\"\`, or a case named on the suite's command line is ignored and the whole suite runs in its place" >&2
+    exit 2
+  }
+  shift
+  [ "${#cases[@]}" -gt 0 ] || bail "run_tests: no cases named"
+  for test_name in "${cases[@]}"; do
     declare -F "$test_name" >/dev/null || undefined="$undefined $test_name"
   done
   [ -z "$undefined" ] || {
     echo "$LIB_BASENAME: REFUSING to run: run_tests names cases that are not defined functions:$undefined — define every case at the top level of the suite, where it exists before the first case runs (a case defined inside another case's body cannot be selected alone)" >&2
     exit 2
   }
-  read -r -d '' -a wanted <<<"${SHIP_PR_TEST_CASES:-}" || true
+  read -r -d '' -a listed <<<"${SHIP_PR_TEST_CASES:-}" || true
   unset SHIP_PR_TEST_CASES
+  if [ $# -gt 0 ]; then
+    [ "${#listed[@]}" -eq 0 ] || {
+      echo "$LIB_BASENAME: REFUSING to run: cases are named both on the command line ($*) and in SHIP_PR_TEST_CASES (${listed[*]}) — name them one way" >&2
+      exit 2
+    }
+    wanted=("$@")
+    from="the command line"
+  elif [ "${#listed[@]}" -gt 0 ]; then
+    wanted=("${listed[@]}")
+    from=SHIP_PR_TEST_CASES
+  fi
   if [ "${#wanted[@]}" -eq 0 ]; then
-    selected=("$@")
+    selected=("${cases[@]}")
   else
     [ "${GITHUB_ACTIONS:-}" != true ] || {
-      echo "$LIB_BASENAME: REFUSING to run: SHIP_PR_TEST_CASES asks for a subset (${wanted[*]}) under GITHUB_ACTIONS=true — CI runs every case of a suite, never a part of one" >&2
+      echo "$LIB_BASENAME: REFUSING to run: $from asks for a subset (${wanted[*]}) under GITHUB_ACTIONS=true — CI runs every case of a suite, never a part of one" >&2
       exit 2
     }
     for test_name in "${wanted[@]}"; do
-      case " $* " in *" $test_name "*) ;; *) missing="$missing $test_name" ;; esac
+      lib_is_one_of "$test_name" "${cases[@]}" || missing="$missing $(printf '%q' "$test_name")"
     done
     [ -z "$missing" ] || {
-      echo "$LIB_BASENAME: REFUSING to run: SHIP_PR_TEST_CASES names what this suite does not run:$missing — a name that selects nothing would run nothing and report green" >&2
+      echo "$LIB_BASENAME: REFUSING to run: $from names what this suite does not run:$missing — a name that selects nothing would run nothing and report green" >&2
       exit 2
     }
-    for test_name in "$@"; do
-      case " ${wanted[*]} " in *" $test_name "*) selected+=("$test_name") ;; esac
+    for test_name in "${cases[@]}"; do
+      if lib_is_one_of "$test_name" "${wanted[@]}"; then selected+=("$test_name"); fi
     done
   fi
   for test_name in "${selected[@]}"; do
@@ -1026,7 +1055,18 @@ run_tests() {
     restore_tuning
     echo "PASS: $test_name"
   done
-  [ "${#wanted[@]}" -eq 0 ] || echo "SUBSET: ${#selected[@]} of $# cases"
+  [ "${#wanted[@]}" -eq 0 ] || echo "SUBSET: ${#selected[@]} of ${#cases[@]} cases"
+}
+
+# lib_is_one_of <word> <word>...: whether the first word is one of the rest, compared whole — a
+# command-line argument may carry a space, and a space-joined match would take `"a b"` for both.
+lib_is_one_of() {
+  local word="$1" each
+  shift
+  for each in "$@"; do
+    [ "$each" != "$word" ] || return 0
+  done
+  return 1
 }
 
 # protect_library <file>: extend the guard over a SECOND library, sourced after this one — the
@@ -1148,8 +1188,9 @@ set -euo pipefail
 # not copy itself a third time, and the marker that stops it is an ARGUMENT rather than an
 # exported variable on purpose: an argument cannot arrive from an ambient environment, so no stray
 # `export` in a caller's shell can delete the control from an ordinary run and leave the file
-# reporting a PASS for a case that did nothing. Anything else on the command line is a typo, and
-# a typo that ran the whole suite anyway would look like the flag had been honoured.
+# reporting a PASS for a case that did nothing. Any other option is a typo, and a typo that ran
+# the whole suite anyway would look like the flag had been honoured. Words that are not options
+# are case names, handed to run_tests like any suite's, which refuses one this file does not run.
 #
 # The COUNT is part of the match, not just the first word. Reading `$1` alone accepted
 # `--inner-copy typo`: the trailing word was ignored, the copy control skipped itself, and the run
@@ -1157,10 +1198,12 @@ set -euo pipefail
 # silently missing, which is the failure this parser exists to prevent.
 LIB_INNER_RUN=""
 case "$#:${1:-}" in
-"0:") ;;
-"1:--inner-copy") LIB_INNER_RUN=1 ;;
-*)
-  echo "$LIB_BASENAME: REFUSING to run: expected no arguments, or exactly \`--inner-copy\` (which this file passes to a copy of itself); got $# argument(s): $*" >&2
+"1:--inner-copy")
+  LIB_INNER_RUN=1
+  shift
+  ;;
+*:-*)
+  echo "$LIB_BASENAME: REFUSING to run: expected case names, or exactly \`--inner-copy\` alone (which this file passes to a copy of itself); got $# argument(s): $*" >&2
   exit 2
   ;;
 esac
@@ -1203,21 +1246,21 @@ control_in() {
     printf 'source %s\n' "\"$lib\""
     printf '%s\n' "$@"
     echo 'test_a_case() { assert_eq 1 1 "one is one"; }'
-    echo 'run_tests test_a_case'
+    echo 'run_tests test_a_case -- "$@"'
   } >"$file"
   CONTROL_FILE="$file"
   control_run "$file"
 }
 
-# control_run <script>: run <script> and land its exit code, stdout and stderr in CONTROL_RC /
-# _OUT / _ERR. For the controls that cannot be a plain body — a wrapper that exports a function
-# in before exec'ing a suite, a suite that defines one above the source — which need the capture
-# and nothing else. The two capture files stay in $CONTROL_ROOT wherever <script> is, so a
+# control_run <script> [<arg>...]: run <script> with <arg>s and land its exit code, stdout and
+# stderr in CONTROL_RC / _OUT / _ERR. For the controls that cannot be a plain body — a wrapper
+# that exports a function in before exec'ing a suite, a suite that defines one above the source,
+# a suite given case names — which need the capture and nothing else. The two capture files stay in $CONTROL_ROOT wherever <script> is, so a
 # control with a directory of its own has in it only what it was given.
 control_run() {
   local rc
   set +e
-  bash "$1" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
+  bash "$@" >"$CONTROL_ROOT/out" 2>"$CONTROL_ROOT/err"
   rc=$?
   set -e
   CONTROL_RC="$rc"
@@ -1255,7 +1298,7 @@ PERL
 
 # mutant <case> <old> <new> <failure>: prove the unmodified case passes first, then
 # require its assertion failure, not a syntax/load failure or an unrelated earlier case. The
-# copy runs <case> alone through SHIP_PR_TEST_CASES, with GITHUB_ACTIONS emptied for that one
+# copy runs <case> alone, named on its command line, with GITHUB_ACTIONS emptied for that one
 # call: CI runs this file with it set to true, and run_tests refuses any subset under it. An
 # assignment prefix can empty it but not unset it, and run_tests reads empty as not-CI; a prefix
 # is what keeps the outer suite's own value intact for the cases after this one.
@@ -1268,13 +1311,13 @@ mutant() {
   copy="$root/$LIB_BASENAME"
   cp "$HELPER" "$root/"
   mutation_copy "$copy" "$2" "$2"
-  GITHUB_ACTIONS='' SHIP_PR_TEST_CASES="$1" TMPDIR="$root" control_run "$copy"
+  GITHUB_ACTIONS='' TMPDIR="$root" control_run "$copy" "$1"
   assert_eq "$CONTROL_RC" 0 "mutation baseline for $1 ($CONTROL_ERR)"
   assert_eq "$CONTROL_OUT" "PASS: $1
 SUBSET: 1 of ${#tests[@]} cases" "the selected baseline case must run, alone"
   assert_eq "$CONTROL_ERR" "" "the baseline must be clean"
   mutation_copy "$copy" "$2" "$3"
-  GITHUB_ACTIONS='' SHIP_PR_TEST_CASES="$1" TMPDIR="$root" control_run "$copy"
+  GITHUB_ACTIONS='' TMPDIR="$root" control_run "$copy" "$1"
   assert_eq "$CONTROL_RC" 1 "mutant must fail the assertion in $1 ($CONTROL_ERR)"
   assert_eq "$CONTROL_OUT" "" "the mutated case must not report a pass"
   assert_contains "$CONTROL_ERR" "FAIL: $4" "the named case must fail for the intended reason"
@@ -1375,7 +1418,7 @@ test_definitions_before_sourcing_are_refused() {
     echo 'set -euo pipefail'
     echo 'early() { :; }'
     printf 'source %s\n' "\"$TEST_LIB_FILE\""
-    echo 'run_tests early'
+    echo 'run_tests early -- "$@"'
   } >"$file"
   control_run "$file"
   assert_refused "a function defined before the source"
@@ -1777,7 +1820,7 @@ test_a_leaked_marker_fails_the_case_that_leaked_it() {
     echo 'test_that_clears() { with_broken_jq zzz-no-program-carries-this true; }'
     echo 'test_that_leaks() { BREAK_JQ=".[] | select(.marked)"; }'
     echo 'test_after_the_leak() { :; }'
-    echo 'run_tests test_that_clears test_that_leaks test_after_the_leak'
+    echo 'run_tests test_that_clears test_that_leaks test_after_the_leak -- "$@"'
   } >"$file"
   control_run "$file"
   assert_eq "$CONTROL_RC" 1 "a leaked marker is the reporter's exit 1 ($CONTROL_ERR)"
@@ -1794,9 +1837,10 @@ test_a_leaked_marker_fails_the_case_that_leaked_it() {
 
 # --- SHIP_PR_TEST_CASES: a subset, and only ever a visible one -------------------------------
 # subset_suite <line>...: a throwaway suite of three cases, with the given lines above its
-# `run_tests`, run through control_run. Each case asserts the variable is gone by the time it
-# runs, which is what keeps a case's own throwaway suites from inheriting the outer list. The
-# lines unset GITHUB_ACTIONS themselves where they need to: CI runs this file with it set.
+# `run_tests`, written to CONTROL_FILE and run through control_run with no arguments. Each case
+# asserts the variable is gone by the time it runs, which is what keeps a case's own throwaway
+# suites from inheriting the outer list. The lines unset GITHUB_ACTIONS themselves where they need
+# to: CI runs this file with it set.
 subset_suite() {
   local file="$CONTROL_ROOT/subset-$((CONTROL_N += 1)).sh" name
   {
@@ -1807,8 +1851,9 @@ subset_suite() {
       echo "$name() { assert_eq \"\${SHIP_PR_TEST_CASES-unset}\" unset 'the list is consumed before a case runs'; }"
     done
     printf '%s\n' "$@"
-    echo 'run_tests test_one test_two test_three'
+    echo 'run_tests test_one test_two test_three -- "$@"'
   } >"$file"
+  CONTROL_FILE="$file"
   control_run "$file"
 }
 
@@ -1844,7 +1889,7 @@ two_case_suite() {
     printf 'source %s\n' "\"$TEST_LIB_FILE\""
     printf '%s\n' "$@"
     echo 'unset GITHUB_ACTIONS'
-    echo 'run_tests test_outer test_inner'
+    echo 'run_tests test_outer test_inner -- "$@"'
   } >"$CONTROL_FILE"
 }
 
@@ -1874,6 +1919,56 @@ test_a_subset_under_ci_is_refused() {
   assert_eq "$CONTROL_OUT" "PASS: test_one
 PASS: test_two
 PASS: test_three" "a full run in CI runs every case ($CONTROL_ERR)"
+}
+
+# --- cases named on the command line --------------------------------------------------------
+# `bash test-pr-review-base-verdict.sh <case>` used to run the whole suite: run_tests saw only the
+# suite's own register, and the argument was dropped without a word. Each suite now hands
+# run_tests its arguments after `--`, and a name there selects exactly as SHIP_PR_TEST_CASES does.
+test_cases_named_on_the_command_line_select_like_the_list() {
+  subset_suite 'unset GITHUB_ACTIONS'
+  control_run "$CONTROL_FILE" test_three test_one
+  assert_eq "$CONTROL_RC" 0 "a subset named on the command line runs ($CONTROL_ERR)"
+  assert_eq "$CONTROL_OUT" "PASS: test_one
+PASS: test_three
+SUBSET: 2 of 3 cases" "only the named cases run, in the suite's order, and the run says it was partial"
+  control_run "$CONTROL_FILE" test_one test_tow
+  assert_refused "a misspelt case on the command line"
+  assert_contains "$CONTROL_ERR" "the command line names what this suite does not run: test_tow —" \
+    "the unknown name should be named, alone, with where it came from"
+  # An argument is one name, compared whole: a space-joined match would take it for two.
+  control_run "$CONTROL_FILE" "test_one test_two"
+  assert_refused "two names in one argument"
+  assert_contains "$CONTROL_ERR" 'does not run: test_one\ test_two —' "the argument should be named as given"
+  SHIP_PR_TEST_CASES=test_two control_run "$CONTROL_FILE" test_one
+  assert_refused "a name in each place"
+  assert_contains "$CONTROL_ERR" "(test_one) and in SHIP_PR_TEST_CASES (test_two) — name them one way" \
+    "both lists should be named"
+  subset_suite 'GITHUB_ACTIONS=true'
+  control_run "$CONTROL_FILE" test_one
+  assert_refused "a subset named on the command line in CI"
+  assert_contains "$CONTROL_ERR" "the command line asks for a subset (test_one) under GITHUB_ACTIONS=true" \
+    "the refusal should say why"
+}
+
+# The forward is not left to discipline: a suite that calls run_tests without `--` is refused
+# whether or not it was given arguments, so the next suite cannot drop them the old way.
+test_a_suite_that_does_not_forward_its_arguments_is_refused() {
+  local file="$CONTROL_ROOT/no-forward.sh" args
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    printf 'source %s\n' "\"$TEST_LIB_FILE\""
+    echo 'test_one() { :; }'
+    echo 'run_tests test_one'
+  } >"$file"
+  for args in '' test_one; do
+    # shellcheck disable=SC2086 # no argument at all, then one
+    control_run "$file" $args
+    assert_refused "a run_tests call without -- (arguments: '$args')"
+    assert_contains "$CONTROL_ERR" "run_tests was not handed the suite's arguments — end the call with \`-- \"\$@\"\`" \
+      "the refusal should name the remedy ($args)"
+  done
 }
 
 # --- a jq that writes CRLF (ludics-lite#335) ---------------------------------------------------
@@ -2155,19 +2250,19 @@ test_fixture_call_count_survives_a_command_substitution() {
     '  fixture_call_reset' \
     '  n=$(fixture_call_count other); assert_eq "$n" 1 "reset with no name zeroes them all"' \
     '}' \
-    'run_tests test_counts'
+    'run_tests test_counts -- "$@"'
   assert_eq "$CONTROL_RC" 0 "the counter should survive the substitution ($CONTROL_ERR)"
   assert_contains "$CONTROL_OUT" "PASS: test_counts" "the throwaway case should run"
-  control 'TEST_ROOT=' 'test_no_root() { fixture_call_count body; }' 'run_tests test_no_root'
+  control 'TEST_ROOT=' 'test_no_root() { fixture_call_count body; }' 'run_tests test_no_root -- "$@"'
   assert_eq "$CONTROL_RC" 1 "with no TEST_ROOT the count is refused, not written somewhere ($CONTROL_ERR)"
   assert_contains "$CONTROL_ERR" "TEST_ROOT is unset" "the refusal should say what is missing"
-  control 'TEST_ROOT=' 'test_no_root() { fixture_call_total body; }' 'run_tests test_no_root'
+  control 'TEST_ROOT=' 'test_no_root() { fixture_call_total body; }' 'run_tests test_no_root -- "$@"'
   assert_eq "$CONTROL_RC" 1 "with no TEST_ROOT a total is refused too, not answered 0 ($CONTROL_ERR)"
   assert_contains "$CONTROL_ERR" "TEST_ROOT is unset" "with the same refusal"
-  control 'test_two_names() { fixture_call_count a b; }' 'run_tests test_two_names'
+  control 'test_two_names() { fixture_call_count a b; }' 'run_tests test_two_names -- "$@"'
   assert_eq "$CONTROL_RC" 1 "two names is a call that meant something else ($CONTROL_ERR)"
   assert_contains "$CONTROL_ERR" "one counter name expected" "and the refusal says so"
-  control 'test_two_names() { fixture_call_total a b; }' 'run_tests test_two_names'
+  control 'test_two_names() { fixture_call_total a b; }' 'run_tests test_two_names -- "$@"'
   assert_eq "$CONTROL_RC" 1 "two names to a total meant something else as well ($CONTROL_ERR)"
   assert_contains "$CONTROL_ERR" "one counter name expected" "with the same refusal"
   # A name that is not one plain path component is refused BEFORE it is joined to the directory,
@@ -2176,22 +2271,22 @@ test_fixture_call_count_survives_a_command_substitution() {
   local bad
   for bad in '../victim' 'a/b' '.' '..' '' '-rf' 'a\\b'; do
     control "TEST_ROOT=$(printf '%q' "$root")" \
-      "test_bad_name() { fixture_call_count $(printf '%q' "$bad"); }" 'run_tests test_bad_name'
+      "test_bad_name() { fixture_call_count $(printf '%q' "$bad"); }" 'run_tests test_bad_name -- "$@"'
     assert_eq "$CONTROL_RC" 1 "counting under '$bad' must be refused ($CONTROL_ERR)"
     assert_contains "$CONTROL_ERR" "one plain path component" "and the refusal says what a name is ('$bad')"
     control "TEST_ROOT=$(printf '%q' "$root")" \
-      "test_bad_name() { fixture_call_reset $(printf '%q' "$bad"); }" 'run_tests test_bad_name'
+      "test_bad_name() { fixture_call_reset $(printf '%q' "$bad"); }" 'run_tests test_bad_name -- "$@"'
     assert_eq "$CONTROL_RC" 1 "resetting '$bad' must be refused too ($CONTROL_ERR)"
     assert_contains "$CONTROL_ERR" "one plain path component" "with the same refusal ('$bad')"
     control "TEST_ROOT=$(printf '%q' "$root")" \
-      "test_bad_name() { fixture_call_total $(printf '%q' "$bad"); }" 'run_tests test_bad_name'
+      "test_bad_name() { fixture_call_total $(printf '%q' "$bad"); }" 'run_tests test_bad_name -- "$@"'
     assert_eq "$CONTROL_RC" 1 "a total under '$bad' must be refused too ($CONTROL_ERR)"
     assert_contains "$CONTROL_ERR" "one plain path component" "with the same refusal ('$bad')"
   done
   : >"$root/victim"
   mkdir -p "$root/fixture-calls"
   control "TEST_ROOT=$(printf '%q' "$root/fixture-calls")" \
-    'test_traversal() { fixture_call_reset ../victim; }' 'run_tests test_traversal'
+    'test_traversal() { fixture_call_reset ../victim; }' 'run_tests test_traversal -- "$@"'
   assert_eq "$CONTROL_RC" 1 "a traversal reset is refused ($CONTROL_ERR)"
   [ -f "$root/victim" ] || bail "the refusal came after the removal: the planted file is gone"
   # A step that fails is a failed CALL, never a stale total (round 2): an unwritable counter file
@@ -2204,7 +2299,7 @@ test_fixture_call_count_survives_a_command_substitution() {
     chmod 0444 "$root/ro/fixture-calls/body"
     control "TEST_ROOT=$(printf '%q' "$root/ro")" \
       'test_ro() { local n; n=$(fixture_call_count body) || return 1; bail "stale total $n under a clean status"; }' \
-      'run_tests test_ro'
+      'run_tests test_ro -- "$@"'
     assert_eq "$CONTROL_RC" 1 "an append that fails is a failed count ($CONTROL_ERR)"
     assert_contains "$CONTROL_ERR" "cannot append" "and says so"
     assert_not_contains "$CONTROL_ERR" "stale total" "the caller's \`|| return 1\` must see the failure"
@@ -2217,7 +2312,7 @@ test_fixture_call_count_survives_a_command_substitution() {
     if ! [ -r "$root/ro/fixture-calls/body" ]; then
       control "TEST_ROOT=$(printf '%q' "$root/ro")" \
         'test_ro_total() { local n; n=$(fixture_call_total body) || return 1; bail "stale total $n under a clean status"; }' \
-        'run_tests test_ro_total'
+        'run_tests test_ro_total -- "$@"'
       assert_eq "$CONTROL_RC" 1 "a counter that exists but cannot be read is a failed total, not 0 ($CONTROL_ERR)"
       assert_contains "$CONTROL_ERR" "cannot read" "and says so"
       assert_not_contains "$CONTROL_ERR" "stale total" "through the substitution the caller reads it in"
@@ -2227,7 +2322,7 @@ test_fixture_call_count_survives_a_command_substitution() {
     if (: >"$root/ro/fixture-calls/.probe") 2>/dev/null; then
       rm -f "$root/ro/fixture-calls/.probe"
     else
-      control "TEST_ROOT=$(printf '%q' "$root/ro")" 'test_reset() { fixture_call_reset; }' 'run_tests test_reset'
+      control "TEST_ROOT=$(printf '%q' "$root/ro")" 'test_reset() { fixture_call_reset; }' 'run_tests test_reset -- "$@"'
       assert_eq "$CONTROL_RC" 1 "a reset that cannot remove the counters refuses ($CONTROL_ERR)"
       assert_contains "$CONTROL_ERR" "cannot remove" "and says so"
     fi
@@ -2345,7 +2440,7 @@ test_the_self_test_runs_from_a_renamed_copy() {
     set -e
     err=$(cat "$root/err")
     assert_eq "$rc" 2 "\`$bad\` must be refused, not honoured ($err)"
-    assert_contains "$err" "lib-reverted.sh: REFUSING to run: expected no arguments" \
+    assert_contains "$err" "lib-reverted.sh: REFUSING to run: expected case names" \
       "the refusal should carry the COPY's name, which is the prefix a renamed run renders"
     assert_eq "$out" "" "no case may run under a refused command line"
   done
@@ -2378,6 +2473,8 @@ tests=(
   test_a_subset_runs_the_cases_it_names_and_says_so
   test_a_subset_naming_a_case_the_suite_lacks_is_refused
   test_a_subset_under_ci_is_refused
+  test_cases_named_on_the_command_line_select_like_the_list
+  test_a_suite_that_does_not_forward_its_arguments_is_refused
   test_a_case_that_is_not_a_function_is_refused
   test_a_second_library_is_protected_once_it_says_so
   test_protect_library_refuses_a_file_that_defines_nothing
@@ -2395,6 +2492,6 @@ tests=(
   test_probe_diagnostics_mutation_is_caught
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

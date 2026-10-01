@@ -758,6 +758,6 @@ tests=(
   test_interim_takes_a_record_at_the_tip
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

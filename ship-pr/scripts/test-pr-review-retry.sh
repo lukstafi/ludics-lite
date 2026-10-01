@@ -687,6 +687,6 @@ tests=(
   test_parse_ref
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

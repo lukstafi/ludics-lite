@@ -527,6 +527,6 @@ tests=(
   test_rounds_ends_with_its_trailer
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }
