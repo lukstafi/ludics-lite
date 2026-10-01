@@ -39,6 +39,7 @@ MERGE_STATE="merged=true state=MERGED" # what REST says after the merge call
 MERGE_QUEUE=""                         # nonempty = the base has a merge queue
 MERGE_NOT_MERGEABLE=""                 # nonempty = the FIRST pr merge call fails as not mergeable
 MERGE_BASE_MODIFIED=""                 # nonempty = the FIRST pr merge call loses a race to the base
+MERGE_REFUSAL=""                       # nonempty = every pr merge call is refused by gh with it
 HEAD_AFTER_MERGE=""                    # nonempty = what the head re-read after a refusal answers
 PR_BASE=main                           # the branch this PR targets
 BASE_LATER=""                          # nonempty = the base read answers with this from the 2nd on
@@ -182,6 +183,10 @@ gh() {
     ;;
   "pr merge")
     printf 'CALL %s\n' "$*" >>"$CALLS_FILE"
+    if [ -n "$MERGE_REFUSAL" ]; then
+      printf '%s\n' "$MERGE_REFUSAL" >&2
+      return 1
+    fi
     # The stale pre-recompute verdict: the first attempt fails as not mergeable, await_mergeable
     # then reads mergeable=true and cmd_merge retries. One failure only, so the retry lands.
     if [ -n "$MERGE_NOT_MERGEABLE" ] && [ ! -f "$TEST_ROOT/merge-failed-once" ]; then
@@ -248,6 +253,8 @@ reset() {
   MERGE_QUEUE=""
   MERGE_NOT_MERGEABLE=""
   MERGE_BASE_MODIFIED=""
+  MERGE_REFUSAL=""
+  rm -f "$GH_REFUSED_FILE"
   HEAD_AFTER_MERGE=""
   PR_BASE=main
   BASE_LATER=""
@@ -881,6 +888,26 @@ test_a_base_moved_during_the_call_is_not_a_head_move() {
   assert_contains "$MERGE_OUTPUT" "ABSENT verdict was recognized against the old base" \
     "the refusal names the base as the reason"
   assert_eq "$(grep -c 'pr merge' <<<"$MERGE_CALLS")" 1 "and is not retried"
+}
+
+# ludics-lite#471: gh refusing the merge call's own flags is a gh/script version mismatch, exit 2
+# on the one call. With the caller's flags forwarded after `--`, the call is the caller's (review
+# of #490): a refusal there may be the caller's typo, and a forwarded `--delete-branch` runs git
+# after the merge, so it keeps the write policy's ambiguous exit 3.
+test_a_refused_merge_call_is_the_scripts_only_without_forwarded_flags() {
+  reset
+  MERGE_REFUSAL='unknown flag: --match-head-commit'
+  run_merge
+  assert_eq "$MERGE_RC" 2 "the script's own merge call refused is exit 2 ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDERR" "refused this script's own call, which sent nothing: gh pr merge 7" \
+    "naming the call"
+  assert_eq "$(grep -c 'pr merge' <<<"$MERGE_CALLS")" 1 "on its first attempt"
+  reset
+  MERGE_REFUSAL='unknown flag: --nosuchflag'
+  run_merge -- --squash --nosuchflag
+  assert_eq "$MERGE_RC" 3 "with forwarded flags it stays ambiguous ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "AMBIGUOUSLY" "as a write that may have landed"
+  assert_not_contains "$MERGE_OUTPUT" "refused this script's own call" "not the script's mismatch"
 }
 
 # Review round 6, P2. A body keyword binds only on a merge into the repository DEFAULT branch. On a
@@ -1806,6 +1833,7 @@ test_an_unread_or_partial_series_says_the_scan_did_not_run() {
 }
 
 tests=(
+  test_a_refused_merge_call_is_the_scripts_only_without_forwarded_flags
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
   test_forwarded_head_binding_is_refused

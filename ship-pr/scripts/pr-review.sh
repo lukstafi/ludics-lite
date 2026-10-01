@@ -572,7 +572,8 @@ gh_client_refusal() {
 # arbitrary code there can write and then print an allowlisted line (review of #490).
 # This list gates a CALLER's arguments only. The script's own calls are not read through it: they
 # are written in this file, as `api`, `run view` and `pr merge` with no `--delete-branch`, none of
-# which runs another program.
+# which runs another program. A `merge` that forwards the caller's own `gh pr merge` flags (after
+# `--`) makes that call a caller's, and it is read as unlisted (review of #490).
 gh_api_only_command() {
   case "${1:-}" in
   api | status | search | org | project | label | cache | ruleset | secret | variable | ssh-key | \
@@ -628,10 +629,19 @@ transient_failure() {
 # refusal prints its message itself, and the caller's `fail` turns into the exit 2.
 GH_REFUSAL_PID=""
 gh_refused_own() { # <gh args...>, of the refused call
-  local call="" arg
-  for arg in "$@"; do call+=" $(printf '%q' "$arg")"; done
-  # A GraphQL call carries its whole query as one argument: enough of the call to find it in this
-  # file, not the query text.
+  local call="" arg prev=""
+  # A field's VALUE is payload, not the call's shape: a reply's or a comment's text, a body file's
+  # path, a GraphQL query. Logged, it would copy text that was never posted into a worker's or CI's
+  # log (review of #490), and the field's name is enough to find the call in this file. This file
+  # passes every field as a separate `-f`/`-F` argument, which is the one form read here.
+  for arg in "$@"; do
+    case "$prev" in
+    -f | -F | --field | --raw-field) call+=" $(printf '%q' "${arg%%=*}")=..." ;;
+    *) call+=" $(printf '%q' "$arg")" ;;
+    esac
+    prev="$arg"
+  done
+  # A long --jq filter: enough of the call to find it, not the whole filter.
   [ "${#call}" -le 240 ] || call="${call:0:240}..."
   printf '%s\n' "pr-review.sh: the installed gh refused this script's own call, which sent \
 nothing: gh${call} -> $(gh_err_line). That is a version mismatch between pr-review.sh and the \
@@ -5962,7 +5972,10 @@ cmd_merge() {
     *) die "merge: unknown option '$1' (extra \`gh pr merge\` flags go after --)" ;;
     esac
   done
-  [ ${#gh_args[@]} -gt 0 ] || gh_args=(--merge) # the repo convention: preserve the commit series
+  # Whose arguments the merge call carries, for gh_retry: the script's alone, or with the caller's
+  # forwarded flags, which can name a refused flag or `--delete-branch` (see gh_api_only_command).
+  local merge_args=unlisted
+  [ ${#gh_args[@]} -gt 0 ] || { gh_args=(--merge) && merge_args=""; } # the repo convention: preserve the commit series
   # The head binding is the script's, not the caller's: a forwarded --match-head-commit would
   # follow the script's on the command line and could name a head the gate never read.
   for arg in "${gh_args[@]}"; do
@@ -6123,8 +6136,8 @@ cmd_merge() {
     # loop, so the ordinary path still makes exactly one queue read -- only a retry adds another,
     # which is a retry that has already waited for a mergeability recompute.
     [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
-    out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" --match-head-commit "$CHECK_SHA" \
-      "${gh_args[@]}")
+    out=$(GH_RETRY_CALLER_ARGS="$merge_args" gh_retry write pr merge "$PR_NUM" --repo "$REPO" \
+      --match-head-commit "$CHECK_SHA" "${gh_args[@]}")
     rc=$?
     [ -n "$out" ] && printf '%s\n' "$out"
     [ "$rc" -eq 0 ] && break

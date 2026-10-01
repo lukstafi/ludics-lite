@@ -567,6 +567,19 @@ test_the_scripts_own_refused_call_is_exit_2() {
   assert_eq "$rc" 2 "a refused merge call is exit 2 ($out)"
   assert_contains "$out" "gh pr merge 7 --repo example/repo --merge" "naming the call"
   assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "and it is not re-sent"
+  # A field's value is payload, and is not copied into the message (review of #490): a refused
+  # reply names its endpoint and its field, never the text that was not posted.
+  reset_fixture
+  CLIENT_ERROR="unknown flag: --raw-field"
+  set +e
+  out=$(gh_retry write api -X POST repos/example/repo/pulls/7/comments/9/replies \
+    -f 'body=a private draft' -F "body=@/private/path" --jq .html_url 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 2 "a refused reply is exit 2 ($out)"
+  assert_contains "$out" "repos/example/repo/pulls/7/comments/9/replies -f body=... -F body=... --jq" \
+    "the call keeps its endpoint and field names"
+  assert_not_contains "$out" "private" "and loses the field values"
   # After a refusal, the same process calls gh no more, and a verdict composed afterwards exits 2
   # in silence instead of claiming transport.
   reset_fixture
