@@ -2594,7 +2594,8 @@ while IFS= read -r v; do SWEEP_SHELL_VARS+=("$v"); done \
 # `refused <construct>` for what would blind the run. The forms, as a closed list: `${name-w}` and
 # `${name:-w}`, the same with `=`, `+` and `?`, on a name or an array element; a whole-array
 # `${name[@]}` or `${name[*]}` (`#` or not), which bash 4.4 and later expand to nothing when unset
-# even under `set -u`; every `-v name` set test, wherever it sits in the test; and any mention of a
+# even under `set -u`; every `-v name` set test, wherever it sits in the test (after whitespace,
+# `(`, `!`, `&&` or `||`, spaced or not); and any mention of a
 # bash variable, as a whole word, since bash defines it even under `env -i`. Each would quietly
 # take a value or a branch where the sweep had another, which is ludics-lite#469's shape again
 # with the error swallowed. SECONDS is bound by the callers, being bash's own clock in any
@@ -2608,7 +2609,9 @@ while IFS= read -r v; do SWEEP_SHELL_VARS+=("$v"); done \
 # bounds: anything else that asks whether a name is set (`declare -p`, `compgen -v`); a nounset
 # failure the fragment itself silences and recovers from (`( ... ) 2>/dev/null || fallback`); and
 # the process the fragment runs in, as opposed to its variables -- `$0`, `$$`, `$?` on entry, the
-# working directory, umask and open descriptors are this suite's, not the sweep's.
+# working directory, umask and open descriptors are this suite's, not the sweep's; and a command
+# word assembled from quoted pieces (`s''et +u`). This is a tripwire for a copied function that
+# quietly gains an input, the drift ludics-lite#469 met, not a sandbox for code written to evade it.
 fragment_defaulted() {
   perl -e '
     my ($file, @rest) = @ARGV;
@@ -2633,7 +2636,7 @@ fragment_defaulted() {
       push @refused, "." if /(?:^|[;&|{(]|\b(?:then|do|else))[ \t]*\.[ \t]/;
       my @names = (/\$\{($id)(?:\[[^\]]*\])?:?[-=+?]/g, /\$\{#?($id)\[[@*]\]/g);
       push @names, /(?<!\w)($shell)(?!\w)/g if $shell ne "";
-      for my $v (/(?:^|[\s(!])-v[ \t]+([^\s\]]+)/g) {
+      for my $v (/(?:^|[\s(!&|])-v[ \t]+([^\s\]]+)/g) {
         next if $v =~ /^$id=/;
         if ($v =~ /^$id$/) { push @names, $v } else { push @refused, "-v $v" }
       }
@@ -2695,6 +2698,13 @@ if out=$(fragment_defaulted "$TMP/planted-fragment.sh" "${SWEEP_ENV[@]%%=*}" SEC
 else
   ko "the text check did not run on the planted fragment -- $out"
 fi
+# ...and a `-v` behind an unspaced `||`, which bash 3.2 cannot even parse inside `[[ ]]`, so it is
+# planted as text the check reads but nothing sources.
+printf '%s\n' '[[ -z x||-v PLANTED_UNSPACED ]]' >"$TMP/planted-text.sh"
+out=$(fragment_defaulted "$TMP/planted-text.sh" "${SWEEP_ENV[@]%%=*}")
+[ "$out" = PLANTED_UNSPACED ] \
+  && ok "...including a -v set test behind an unspaced ||" \
+  || ko "the text check missed a -v set test behind an unspaced || -- got [$out]"
 # With <ready> and <keep>, the lock is HELD until <keep> is removed, and the waiting happens inside
 # the very shell that took it: take_lab_lock's flock belongs to the open file description behind
 # its fd 8, so it dies with that shell. A wait wrapped AROUND this function holds nothing -- which
