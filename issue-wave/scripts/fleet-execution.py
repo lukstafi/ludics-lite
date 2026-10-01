@@ -59,7 +59,10 @@ else ~/.config/wake-lab/hosts.sh, what wake-lab.sh refuses to drive the lab with
 readable file here, which catches a declaration naming a machine that cannot drive the lab. It
 resolves no alias, reads none of the file's contents, and cannot see a sweep moved to another
 box that has a site file of its own but was never declared: the declaration is that fact's only
-source. Absent identity arguments refuse. The box's HOLD
+source. Absent identity arguments refuse. WAKE_LAB_LOCK_DIR and WAKE_LAB_HOSTS are read from THIS
+process's environment -- the anchor's, as its own wake-lab.sh and sweep would see them -- and never
+forwarded from the coordinator's: a coordinator's path names a file on the coordinator's machine. A
+custom path is set where the anchor's non-interactive ssh shell reads it. The box's HOLD
 lock is not read: a hold keeps a VM alive and says nothing about who works there. A lock file that
 cannot be created or opened is free, as wake-lab.sh treats it (no lane can hold what it cannot open:
 the sweep fails such a lane rather than running it); one that opens but cannot be probed refuses.
