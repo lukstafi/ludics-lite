@@ -976,9 +976,15 @@ inside the first round's own reads (`spend_grace`), the fixture's event lands on
 ceiling is kept clear of both. Counting ROUNDS against a clock was the trap: a round launches a
 fixture and several jq subprocesses, so under load four happened where five were counted on and a
 tip move landed on the wrong side of the grace (ludics-lite#169). A case that wants to know how
-far a wait got reads `rounds_polled` rather than elapsed time. Executed rather than sourced, the
-transport runs its own controls over those three devices — read a `gh` call at a time, with no
-`base` run around them, since a control driven through the wait loop would be on the clock itself.
+far a wait got reads `rounds_polled` rather than elapsed time. A case that needs a run of a given
+AGE has the fixture stamp it as the feed is read (`aged_at_read`) rather than compute it from its
+own clock before the run, since the gap between the two is load; and `delay_after_runs_read` puts
+wall clock between round one's runs read and everything the round checks after it, which tells a
+clock taken before the reads from one taken after. A runs feed can also change between rounds
+(`runs_from_round`, ludics-lite#426), so a run that finishes, or a moved tip's own run, is pinned
+by what the next round makes of it. Executed rather than sourced, the transport runs its own
+controls over those devices — read a `gh` call at a time, with no `base` run around them, since a
+control driven through the wait loop would be on the clock itself.
 
 `test-pr-review-base-verdict.sh` pins what the wait loop DECIDES (ludics-lite#93). A red at the tip is the
 tip's own verdict and ends the wait on the round that saw it; a red behind an unjudged tip is the
@@ -1016,6 +1022,11 @@ reads pending, not "never judged"; under the opt-in `--interim` the merged PR's 
 interim green the verdict line names, plain and under `--wait`, re-confirmed against the tip; and
 it is never the default, never asked over a red or a run in flight at an older commit, and never
 more than a green (a direct push, a red head, a head that never built the workflow stay pending).
+A tip's run that finished while the source was read, or a tip that moved, takes the round again
+at once, and the next round's feed decides: the tip's own verdict, or the new tip's (#426); at
+most twice per call, so a lagging feed stops on three rounds with its note. The hold for a
+workflow the tip may have just added ages the tip on the round's snapshot clock, taken before its
+runs were read, never at the later moment the hold is checked.
 
 Each workflow's page of runs is sorted on `(created_at desc, id desc)` before the fold
 (ludics-lite#90), as `run_signal`'s feed has been since #83: two pushes to the branch inside one
