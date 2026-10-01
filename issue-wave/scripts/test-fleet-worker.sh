@@ -2531,6 +2531,30 @@ fixture_done hold-measure-2
 expect "...and with nothing outstanding the batch takes a slot as usual" 0 "slot 1 of 1 held for: echo after-measurements" -- \
   "${FWS[@]}" execution hold --request hold-measure -- "$FW" execution slot --wait 0 -- echo after-measurements
 grep -q "does not cover this batch (the registry has no outstanding measurement hold-measure" <<<"$out" && ok "...saying the marker does not cover it" || ko "the ignored marker was not reported: $out"
+# THE MEASUREMENT WINDOW (ludics-lite#481): a measurement on a box whose workers hold standing
+# reservations suspends them; a batch there is refused naming the window, the measurement's own
+# run is still admitted inside its hold (#480), and the conclusion restores the standing ones.
+"${FWS[@]}" execution run "$(slotreq win-iterate correctness true)" >/dev/null || ko "could not take the standing reservation (setup)"
+expect "a plain measurement is refused beside a standing reservation, pointing at the window" 1 "every one is standing, which .fleet-worker.sh execution window. suspends" -- \
+  "${FWS[@]}" execution run "$(slotreq win-plain measurement)"
+expect "execution window opens a measurement over the box's standing reservations" 0 "EXECUTION WINDOW testbox: win-measure open; suspended win-iterate" -- \
+  "${FWS[@]}" execution window testbox "$(slotreq win-measure measurement)"
+grep -q '"window": true' <<<"$out" && grep -q '"state": "launching"' <<<"$out" && ok "...dispatched, and marked a window" || ko "the window's record: $out"
+listing=$("${FWS[@]}" execution list --active --compact 2>&1)
+[ "$(jq -r '.[] | select(.request_id == "win-iterate") | "\(.state) \(.suspended_by)"' <<<"$listing")" = "suspended win-measure" ] &&
+  ok "...and execution list --active --compact shows the standing reservation suspended by it" || ko "the suspended reservation is not shown as such: $listing"
+expect "a batch during the window is refused, naming it" 1 "measurement window win-measure is open on testbox, and holds the box exclusively; standing reservations here are suspended until it concludes, so retry this batch then (no request needed)" -- \
+  "${FWS[@]}" execution slot -- echo during-window
+expect "...while the measurement's own run is admitted inside its hold" 0 "inside measurement win-measure, held by an enclosing .execution hold.; no slot taken, for: echo window-own-run" -- \
+  "${FWS[@]}" execution hold --request win-measure -- "$FW" execution slot -- echo window-own-run
+grep -q "^window-own-run$" <<<"$out" && ok "...and runs" || ko "the window's own run did not run: $out"
+expect "a second window on the box is refused while one is open" 1 "measurement window win-measure is already open on testbox" -- \
+  "${FWS[@]}" execution window testbox "$(slotreq win-second measurement)"
+expect "execution window takes a box and a reservation" 2 "execution window <box> <measurement reserve.json>" -- "${FWS[@]}" execution window testbox
+expect "concluding the measurement restores the standing reservation" 0 "EXECUTION WINDOW testbox: win-measure concluded; restored win-iterate (launching)" -- \
+  "${FWS[@]}" execution conclude "$(jq -n '{request_id:"win-measure", verdict:"not-launched", log:"/dev/null", evidence:"fixture: nothing ran"}' > "$TMP/win-done.json"; printf '%s' "$TMP/win-done.json")"
+expect "...and a batch is admitted again" 0 "slot 1 of 1 held for: echo after-window" -- "${FWS[@]}" execution slot --wait 0 -- echo after-window
+fixture_done win-iterate
 expect "execution hold --request needs a request id" 2 "--request takes the measurement's request id" -- "${FWS[@]}" execution hold --request "../x" -- true
 expect "...and this host's fleet name, which the marker names" 2 "--request needs this host's fleet name" -- \
   env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=testbox" "$FW" execution hold --request hold-measure -- true

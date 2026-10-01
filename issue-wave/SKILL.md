@@ -393,7 +393,8 @@ requirements for every transport with transport-specific setup and identity, and
   covers, and that every batch goes through the project runner, wrapped in `fleet-worker.sh
   execution slot -- <batch>` (`execution slot --cpu -- <batch>` for one that holds no GPU; a
   runner that takes the slot itself runs inside the wrapper, [nested
-  slots](references/executions.md#exclusivity-and-the-run-time-slots)), and
+  slots](references/executions.md#exclusivity-and-the-run-time-slots); a refusal naming a
+  measurement window is retried once the window closes, with no request), and
   is reported by run directory; a batch that can outlast the 600 s tool cap is one call, `execution
   slot --bg <parent> -- <batch>`, which prints a run directory to block on with `bg-run.sh wait`
   ([Blocking on a run](references/native-claude.md#blocking-on-a-run)). Every other run - a
@@ -740,7 +741,10 @@ integration run, whatever the provider or transport. The usual shape is two call
 execution - `execution run <reserve.json>` then `execution conclude --from-run <run-dir>
 --request <id> --sha <sha>` - plus one standing reservation per worker for its own iteration
 batches, taken at launch and concluded at hand-back, with `execution slot` around each batch
-bounding the box's load. `load` is an observation, not ownership, and neither it nor these
+bounding the box's load. A measurement on a box where those are outstanding opens with
+`execution window <box> <reserve.json>` in place of `run`, which suspends them until it concludes
+(executions.md, *The measurement window*, which also says how to batch a box's pending
+measurements). `load` is an observation, not ownership, and neither it nor these
 cooperative reservations stops unrelated processes from using a machine; OCANNL's daily sweep
 defers to an outstanding `measurement` reservation, and to nothing else, while a `measurement`
 refuses a box a sweep lane holds and `wake-lab.sh`'s destroyers refuse a measured box
