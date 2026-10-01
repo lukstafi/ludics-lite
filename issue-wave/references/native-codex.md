@@ -23,7 +23,8 @@ differs is only that it may wait instead of yielding.
 Name the workload kind in that assignment and use the wrapper specified in
 [executions.md](executions.md#reserve-launch-observe-conclude): correctness takes a run-time
 slot; an exclusively reserved measurement runs the bounded project runner directly, under
-`fleet-worker.sh execution hold -- <command>` (the OS-level sleep guard alone).
+`fleet-worker.sh execution hold --request <request_id> -- <command>` (the OS-level sleep guard
+alone, inside which a runner's own `execution slot` runs instead of being refused).
 
 ## Coordinator supervision
 

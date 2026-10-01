@@ -64,7 +64,7 @@ mac-studio's slots were reading their briefs; six slots, not three, for the same
 cap bounds concurrent load, never how many agents may be in flight).
 
 `execution slot` runs on the worker's own box around one suite or batch: it refuses while a
-measurement is outstanding on that box, holds one of the box's N slots (a GPU token one, unless
+measurement is outstanding on that box (except the measurement's own run, below), holds one of the box's N slots (a GPU token one, unless
 `--cpu`) as a real flock for exactly as long as the command runs (the kernel drops it even when the batch is killed), and
 returns the command's own status. It needs no coordinator lease, takes no `--box` (the slot is
 the local box's), and refuses with a line beginning `EXECUTION SLOT REFUSED` - exit 1 for no
@@ -95,6 +95,20 @@ spec rather than the marker, so a GPU batch inside a slot that an enclosing batc
 `--cpu` is refused. A wrapper around a runner that may hold the GPU must therefore not declare
 `--cpu`, and the runner's own declaration is the better one to rely on.
 
+**The measurement's own run** (ludics-lite#480). A runner that takes the slot itself also does so
+inside a measurement, where every slot is refused - so OCANNL's `tools/test-run.sh` was refused by
+its own measurement (exit 75, `SLOT REFUSED`) five times in the 2026-09-30 wave, until briefs
+carried `OCANNL_TOOL_FLEET_WORKER=none`. So a measurement runs under `fleet-worker.sh execution
+hold --request <request_id> -- <runner command>`, which exports `FLEET_MEASUREMENT_HELD` (`<box>
+<request_id>`) and holds a shared lock for as long as the runner's process tree runs; an
+`execution slot` inside it runs its command under the hold, taking no slot and no second sleep
+guard, and logs `inside measurement <id>`. `execution slot --probe` there appends `measurement
+<id>` to its line. The marker is checked, not trusted: the registry's outstanding measurements
+on this box must be exactly that request, and some `hold --request` on the box must hold its lock
+now. A marker naming another box, an unknown or concluded request, or no live hold is reported
+and ignored, so the batch is refused as any other is while a measurement is outstanding - and so
+is every batch with no marker, an independent correctness batch on the measured box included.
+
 ## The OS-level sleep guard
 
 On native Linux the lab locks are advisory: they bind sessions that go through `wake-lab.sh`,
@@ -103,7 +117,9 @@ from taking a box out from under a running worker (under WSL the Windows-side ho
 So every run on a box carries a logind **block** inhibitor on `sleep:idle` for exactly as long
 as it runs (ludics-lite#317): `execution slot` runs its command inside
 `fleet-worker.sh execution hold [--why <text>] -- <command>`, and an exclusive measurement,
-which cannot take a slot, is invoked as `fleet-worker.sh execution hold -- <runner command>`.
+which takes no slot of its own, is invoked as `fleet-worker.sh execution hold --request
+<request_id> -- <runner command>` (a slot its runner takes inside runs under that one guard:
+[the measurement's own run](#exclusivity-and-the-run-time-slots)).
 `hold` takes nothing else - no slot, no registry read, no lease - and where there is no
 `systemd-inhibit` (macOS, a Linux host without systemd) it runs the command bare and silently.
 The inhibitor is held by a helper BESIDE the command, not by systemd-inhibit wrapped around it:
@@ -233,12 +249,14 @@ possible execution.
 
 `execution run` already performs dispatch; do not dispatch that reservation again. The assignment
 must name its workload kind and command: **correctness** wraps the bounded project runner in
-`execution slot`; an exclusively reserved **measurement** invokes the runner directly, without
-that wrapper (ludics-lite#309), under `fleet-worker.sh execution hold -- <runner command>` alone,
-the OS-level sleep guard `slot` also runs inside (ludics-lite#317, [below](#the-os-level-sleep-guard)).
-The slot intentionally refuses every outstanding measurement,
-including the assigned measurement itself. Keep that refusal: it protects the measurement from
-concurrent correctness batches. Direct invocation still uses the project's time limits, logs and
+`execution slot`; an exclusively reserved **measurement** invokes the runner without that
+wrapper (ludics-lite#309), under `fleet-worker.sh execution hold --request <request_id> --
+<runner command>` alone, the OS-level sleep guard `slot` also runs inside (ludics-lite#317,
+[below](#the-os-level-sleep-guard)). The slot refuses every batch beside an outstanding
+measurement, which protects the measurement from concurrent correctness batches; the one it
+admits is a batch inside that measurement's own `hold --request` (ludics-lite#480), so a runner
+that takes the slot itself needs no opt-out there. The assignment names the request id in that
+command. Direct invocation still uses the project's time limits, logs and
 process ownership; it does not skip the reservation, dispatch or external-activity check.
 
 **The execution host's skills checkout** (ludics-lite#362). Only `launch` and `preflight` ever

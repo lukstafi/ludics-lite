@@ -133,7 +133,8 @@ exclusive per box; correctness runs share a box up to its `FLEET_BOX_CORRECTNESS
 mac-studio), a run-time count a worker takes around each batch with `execution slot -- <batch>`,
 so a standing iteration record gates no agent's start (ludics-lite#160). Every run on a native
 Linux box also holds a logind block inhibitor on sleep for as long as it runs - `execution hold --
-<command>`, which `execution slot` runs inside and an exclusive measurement uses alone - so another
+<command>`, which `execution slot` runs inside and an exclusive measurement uses alone, as `execution
+hold --request <id>`, inside which its runner's own slot runs (ludics-lite#480) - so another
 session's `wake-lab.sh sleep` is refused by the OS (ludics-lite#317). The native GPU boxes take
 measured counts: four on rog-nv-linux, of which two may hold its GPU (`FLEET_BOX_GPU_TOKENS`; a
 batch declared `execution slot --cpu` takes a slot alone), four on minix-amd-linux, three on
