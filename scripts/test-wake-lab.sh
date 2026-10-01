@@ -2560,7 +2560,8 @@ created() { # created <dir> -- every regular file under it, relative and shell-q
 #   LAB_MAP                  lab_box_of's table, which the sweep's lab_map fills from
 #                            `wake-lab.sh endpoint-map`; SWEEP_MAP is this checkout's answer to it
 #   stamp                    the run stamp take_lab_lock writes into its advisory holder line
-# And it runs under `set -u`, as the sweep itself does (its `set -uo pipefail`), so a read of
+# And it runs under `set -uo pipefail`, the sweep's own options (an anchor below holds the sweep
+# to that line), so a read of
 # anything else on a path a case executes is `<name>: unbound variable` on the holder's stderr,
 # which sweep_hold_stop reports by name -- whether it is read plainly, behind a branch that did
 # not run, through an arithmetic value, in a subshell or in a command substitution, since bash
@@ -2598,12 +2599,15 @@ while IFS= read -r v; do SWEEP_SHELL_VARS+=("$v"); done \
 # take a value or a branch where the sweep had another, which is ludics-lite#469's shape again
 # with the error swallowed. SECONDS is bound by the callers, being bash's own clock in any
 # environment. Refused outright: `${!`, whose target no reader of the text can name; a `-v` whose
-# operand is neither a bare name nor an awk-style `name=value` (quoted, or computed); and anything
-# that turns `set -u` off (`set +u`, or any mention of `nounset`). It reads the whole fragment text, comments and quoted spans included, so an
-# occurrence is over-reported, never missed -- a whole-array read of the fragment's own `local`
-# array included, which is loud. Out of bounds: anything else that asks whether a name is set
-# (`declare -p`, `compgen -v`), and a nounset failure the fragment itself silences and recovers
-# from (`( ... ) 2>/dev/null || fallback`), which the sweep's own `set -u` would not see either.
+# operand is neither a bare name nor an awk-style `name=value` (quoted, or computed); anything that
+# could turn `set -u` off -- a `set` given a `+` option or a computed argument, or any mention of
+# `nounset`; and code the text does not show, `eval`, `source` and a `.` command. It reads the
+# whole fragment text, comments and quoted spans included, so an occurrence is over-reported, never
+# missed -- a whole-array read of the fragment's own `local` array included, which is loud. Out of
+# bounds: anything else that asks whether a name is set (`declare -p`, `compgen -v`); a nounset
+# failure the fragment itself silences and recovers from (`( ... ) 2>/dev/null || fallback`); and
+# the process the fragment runs in, as opposed to its variables -- `$0`, `$$`, `$?` on entry, the
+# working directory, umask and open descriptors are this suite's, not the sweep's.
 fragment_defaulted() {
   perl -e '
     my ($file, @rest) = @ARGV;
@@ -2618,7 +2622,10 @@ fragment_defaulted() {
     while (<$fh>) {
       my @refused;
       push @refused, "\${!" if /\$\{!/;
-      push @refused, "set +u" if /\bset[ \t]+(?:[-+][A-Za-z]*[ \t]+)*\+[A-Za-z]*u|\bnounset\b/;
+      push @refused, $1 while /\b(set[ \t][^\n;|&]*?[+\$][^\n;|&]*?)[ \t]*(?=$|[;|&}])/g;
+      push @refused, "nounset" if /\bnounset\b/;
+      push @refused, $1 while /(?<![\w.-])(eval|source)(?![\w-])/g;
+      push @refused, "." if /(?:^|[;&|{(]|\b(?:then|do|else))[ \t]*\.[ \t]/;
       my @names = (/\$\{($id)(?:\[[^\]]*\])?:?[-=+?]/g, /\$\{#?($id)\[[@*]\]/g);
       push @names, /(?<!\w)($shell)(?!\w)/g if $shell ne "";
       for my $v (/(?:^|[\s(!])-v[ \t]+([^\s\]]+)/g) {
@@ -2651,17 +2658,19 @@ planted_computed() { [ -v "$PLANTED_NAME" ] && printf '%s\n' set; }
 planted_compound() { [ -n "$LAB_MAP" -a -v PLANTED_COMPOUND ] && printf '%s\n' set; }
 planted_shell() { [ "$SHELL" = /bin/zsh ] && printf '%s\n' zsh; }
 planted_status() { [ "${PIPESTATUS[0]}" = 1 ] && printf '%s\n' failed; }
+planted_optset() { local o=u; set +$o; }
+planted_eval() { eval "$PLANTED_CODE"; }
 EOF
 sweep_env "$LOCKS" "$TMP/sweep-home-planted"
 for planted in plain branch arith subst; do
   name=PLANTED_$(printf '%s' "$planted" | tr '[:lower:]' '[:upper:]')
-  out=$(env -i "${SWEEP_ENV[@]}" bash -uc '. "$1"; "$2"' _ "$TMP/planted-fragment.sh" \
+  out=$(env -i "${SWEEP_ENV[@]}" bash -uo pipefail -c '. "$1"; "$2"' _ "$TMP/planted-fragment.sh" \
     "planted_$planted" 2>&1)
   grep -q "$name: unbound variable" <<<"$out" \
     && ok "a planted fragment reading $name (planted_$planted) is reported by name" \
     || ko "a planted fragment's unbound read in planted_$planted went unreported -- $out"
 done
-out=$(env -i "${SWEEP_ENV[@]}" bash -uc '. "$1"; planted_bound rog' _ "$TMP/planted-fragment.sh" 2>&1)
+out=$(env -i "${SWEEP_ENV[@]}" bash -uo pipefail -c '. "$1"; planted_bound rog' _ "$TMP/planted-fragment.sh" 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] && ! grep -q 'unbound variable' <<<"$out" \
   && ok "...while one reading only what sweep_env binds runs clean (rc=$rc)" \
@@ -2670,7 +2679,8 @@ sweep_env "$LOCKS" "$HOME"
 if out=$(fragment_defaulted "$TMP/planted-fragment.sh" "${SWEEP_ENV[@]%%=*}" SECONDS -- \
            ${SWEEP_SHELL_VARS[@]+"${SWEEP_SHELL_VARS[@]}"}); then
   want=$(printf '%s\n' PLANTED_DEFAULTED 'refused ${!' PLANTED_TESTED PLANTED_ARRAY \
-    'refused set +u' 'refused -v "$PLANTED_NAME"' PLANTED_COMPOUND SHELL PIPESTATUS)
+    'refused set +u' 'refused -v "$PLANTED_NAME"' PLANTED_COMPOUND SHELL PIPESTATUS \
+    'refused set +$o' 'refused eval')
   [ "$out" = "$want" ] \
     && ok "the text check reports exactly the planted reads set -u lets through unset" \
     || ko "the text check is off on the planted fragment -- want [$want], got [$out]"
@@ -2699,7 +2709,7 @@ sweep_lock() { # sweep_lock <lock-dir|-> <home> <ssh-alias> [<ready> <keep>]
                   open my $fh, ">", $ARGV[0] or die $!; print $fh "$$\n"; close $fh;
                   shift @ARGV; exec @ARGV or die $!' \
       "$TMP/sweep-pgid" \
-      bash -uc '. "$1" || exit 2
+      bash -uo pipefail -c '. "$1" || exit 2
                 take_lab_lock "$(lab_box_of "$2")" || exit 1
                 [ -n "$3" ] || exit 0
                 : > "$3"
@@ -2764,12 +2774,12 @@ else
   for anchor in '^LAB_LOCK_DIR=' '^lab_box_of() {' '^take_lab_lock() {' \
                 '^[[:space:]]*lab_box=\$(lab_box_of ' '^[[:space:]]*take_lab_lock "\$lab_box"' \
                 '^lab_map() {' '^[[:space:]]*ask_capped LAB_MAP [0-9][0-9]* "\$WAKE_LAB" endpoint-map' \
-                '[[:space:]{;]lab_map[;[:space:]]'; do
+                '[[:space:]{;]lab_map[;[:space:]]' '^set -uo pipefail$'; do
     n=$(grep -c -- "$anchor" "$SWEEP")
     [ "$n" -eq 1 ] || { anchors=0
       ko "origin/master's sweep has $n lines matching /$anchor/, not 1 -- the lane no longer takes \
-its lock (or fills the map it reads) the way the cases below assume, so they would stop being \
-about the live sweep"; }
+its lock, fills the map it reads or sets its shell options the way the cases below assume, so \
+they would stop being about the live sweep"; }
   done
   if [ "$anchors" -eq 1 ]; then
     { grep '^LAB_LOCK_DIR=' "$SWEEP"
