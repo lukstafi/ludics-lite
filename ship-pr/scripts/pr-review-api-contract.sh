@@ -30,6 +30,17 @@
 #                            GITHUB_RUN_ID it pins the job's own row as the newest for that head
 #   CONTRACT_SUMMARY_SAMPLE  how many of the newest merged PRs the summary-row beliefs read
 #                            (default 60; two paginated reads each)
+#   CONTRACT_THREADS_PR      a PR with at least three review threads whose first comments' ids
+#                            run past 2^31 (ludics-lite#389) — the reviewThreads beliefs of the
+#                            open-thread gate and `resolve`; the not-clamped claim skips on an
+#                            anchor whose ids are all below 2^31
+#   CONTRACT_WIDE_COMMIT     <owner/name>@<sha> of a commit whose first-parent diff has more files
+#                            than the endpoint's default page (300), and CONTRACT_WIDE_COMMIT_FILES
+#                            that diff's file count, counted with git (`git diff --name-only
+#                            <sha>^1 <sha> | wc -l`; a fact of an immutable commit) — the
+#                            commit-files paging commit_files rests on (ludics-lite#177). Another
+#                            repository's commit, by default: this one has none that wide, and
+#                            the endpoint's paging is GitHub's, not a repository's
 #   REVIEWER                 the review app's login without its [bot] suffix (pr-review.sh's)
 #
 # Exit 0: every checkable belief holds. 1: at least one MOVED (listed, all of them — the script
@@ -61,9 +72,19 @@ REVIEWER="${REVIEWER:-chatgpt-codex-connector}"
 BOT="${REVIEWER}[bot]" # how an app's login reads in every feed: matched by prefix in pr-review.sh
 STALE_BASE_PR="${CONTRACT_STALE_BASE_PR:-}"
 REVIEWED_PR="${CONTRACT_REVIEWED_PR:-}"
+THREADS_PR="${CONTRACT_THREADS_PR:-}"
+WIDE_COMMIT="${CONTRACT_WIDE_COMMIT:-}"
+WIDE_COMMIT_FILES="${CONTRACT_WIDE_COMMIT_FILES:-}"
 if [ "$REPO" = lukstafi/ludics-lite ]; then
   : "${STALE_BASE_PR:=53}"
   : "${REVIEWED_PR:=39}"
+  # #370: five threads, their first comments 4095735684 and up, all past 2^31.
+  : "${THREADS_PR:=370}"
+  # The merge of origin/master into a branch, 353 files against its first parent, one a rename.
+  if [ -z "$WIDE_COMMIT" ]; then
+    WIDE_COMMIT=lukstafi/ocannl@eaa6313d983cbb2c698e23507a7094dde99e79bb
+    WIDE_COMMIT_FILES=353
+  fi
 fi
 
 # The vocabularies the projections classify. conclusion_class in pr-review.sh maps failure,
@@ -88,6 +109,11 @@ HEX40='^[0-9a-f]{40}$'
 CLAIMS=0
 MOVED=0
 SKIPPED=0
+# The one part of CLAIMS that varies with nothing drifting: cmd_base's section claims the runs
+# wrapper once per workflow it asks before one has push runs on the base, so the total moves with
+# the workflow list's order and history (52, 64, 66 and 67 over four runs of #169). The verdict
+# names it, so two runs' totals compare (ludics-lite#177).
+WRAPPER_CLAIMS=0
 
 # api <gh api args...>: one read, of the raw body — never with --jq. A projection that fails
 # inside gh exits nonzero with no HTTP status, indistinguishable from transport, so every
@@ -98,8 +124,12 @@ SKIPPED=0
 # 403 otherwise are the token or the workflow's permissions refusing the read — exit 5, not
 # drift either, but reported. Any other 4xx is the API answering "no such thing" about an input
 # this script validated before asking: a retired or renamed endpoint, or a wrong anchor — exit
-# 4, drift, no retry. Each ends the run from inside a command substitution too: the caller's
-# assignment fails, and the script runs under errexit.
+# 4, drift, no retry. GraphQL answers a query it rejects — a field it no longer has, or a PR
+# number that resolves to nothing — inside an HTTP 200, as an `errors` list with no status line,
+# so that shape is the same exit 4 rather than three retries ending as transport (exit 3, which
+# the workflow does not report); its own timeout message is retried like a 5xx. Each ends the run
+# from inside a command substitution too: the caller's assignment fails, and the script runs
+# under errexit.
 api() {
   local attempt out
   case " $* " in
@@ -122,6 +152,11 @@ api() {
       ;;
     *"HTTP 4"[0-9][0-9]*)
       echo "pr-review-api-contract.sh: an endpoint the contract addresses answered 4xx (retired, renamed, or a wrong anchor): gh api $* -> ${out##*$'\n'}" >&2
+      exit 4
+      ;;
+    *"HTTP 5"[0-9][0-9]* | *"Something went wrong while executing your query"*) ;; # retried
+    *'"errors":['*)
+      echo "pr-review-api-contract.sh: GraphQL rejected the query (a field it asks for is gone or renamed, or a wrong anchor): gh api ${1:-} -> ${out##*$'\n'}" >&2
       exit 4
       ;;
     esac
@@ -383,6 +418,7 @@ for wf_id in $(jq -r '.[].id // empty' <<<"$wflist"); do
   # (#169, round 1). An empty list is not that: a workflow with no push run on this branch is the
   # `norun` shape the wait loop has its own grace for, a valid answer and not drift.
   pin "workflow $wf_id's branch-and-event feed is workflow_runs[]" 'type == "array"' "$bruns"
+  WRAPPER_CLAIMS=$((WRAPPER_CLAIMS + 1))
   is_list "$bruns" || { bruns='[]'; continue; }
   if [ "$(jq length <<<"$bruns")" -gt 0 ]; then
     banchor="$wf_id"
@@ -934,10 +970,149 @@ else
     'all(.[]; .review_at <= .row_at)' "$ordered"
 fi
 
-skip "reviewThreads (GraphQL) pagination at 100" "the resolve path is the one GraphQL read, and it is not exercised here"
+# --- reviewThreads (GraphQL) ------------------------------------------------------------------------
+# The one GraphQL read: the open-thread gate (unresolved_threads) and `resolve` (find_thread) both
+# page reviewThreads through threads_walk with the library's own THREADS_QUERY, sent here verbatim,
+# so a field the query asks for that GraphQL stopped serving is this script's exit 4 rather than a
+# restatement that kept passing. What the fixtures invent and nothing pinned (ludics-lite#389):
+#   - totalCount on EVERY page — threads_walk takes the read as whole only when the rows reach the
+#     count the LAST page states, so a count served on the first page alone would refuse every
+#     multi-page PR, and one that stopped agreeing across pages would judge a prefix;
+#   - the node `id`, which `resolve` hands to resolveReviewThread as threadId (the fixtures make it
+#     up as "T<comment id>");
+#   - `isResolved` a boolean — the gate counts a thread closed only when it is literally true, so
+#     a string "true" would hold every approval as unresolved, and a dropped field the same;
+#   - the first comment's `fullDatabaseId` a decimal string, which THREAD_ID_JQ names a thread by
+#     ahead of `databaseId` — the schema types databaseId as a 32-bit Int while review-comment ids
+#     run past 2^31, and the reply fixture assumes it null there. What GitHub serves past 2^31 is
+#     printed, and the claim is the one the fallback needs: null or the same number, never clamped.
+# Reads: one verbatim page of 100, then the same query on a page small enough to make the anchor
+# span several pages, since one page shows nothing about "every page".
+section "reviewThreads on #${THREADS_PR:-?} (GraphQL) — the open-thread gate's and resolve's read"
+if [ -z "$THREADS_PR" ]; then
+  skip "the reviewThreads connection's shape" "set CONTRACT_THREADS_PR to a PR with review threads whose first comments' ids run past 2^31"
+else
+  is_num "$THREADS_PR" || { echo "pr-review-api-contract.sh: CONTRACT_THREADS_PR must be a PR number, got '$THREADS_PR'" >&2; exit 2; }
+  threads_conn() { # stdin: a GraphQL answer -> its reviewThreads connection, or null
+    jq -c 'try .data.repository.pullRequest.reviewThreads catch null'
+  }
+  tconn=$(api graphql -f query="$THREADS_QUERY" -F owner="${REPO%%/*}" -F name="${REPO##*/}" -F pr="$THREADS_PR" | threads_conn)
+  pin "the gate's own THREADS_QUERY, sent verbatim, answers #$THREADS_PR's reviewThreads as a connection: nodes[], a numeric totalCount and a boolean pageInfo.hasNextPage" \
+    '(.nodes | type == "array") and (.totalCount | type == "number") and (.pageInfo.hasNextPage | type == "boolean")' "$tconn"
+  tnodes=$(jq -c '.nodes? // null' <<<"$tconn")
+  ttotal=$(jq -r '.totalCount? // empty' <<<"$tconn")
+  if ! is_list "$tnodes" || ! is_num "$ttotal"; then
+    skip "the row-level and paging claims on #$THREADS_PR's review threads" "$UNUSABLE"
+  elif [ "$(jq length <<<"$tnodes")" -eq 0 ]; then
+    skip "the row-level and paging claims on #$THREADS_PR's review threads" "#$THREADS_PR has no review thread; an anchor with three or more shows them"
+  else
+    pin "every thread carries a non-empty node id (resolve's threadId) and isResolved as a boolean (closed only when literally true)" \
+      'all(.[]; (.id | type == "string" and length > 0) and (.isResolved | type == "boolean"))' "$tnodes"
+    pin "every thread's first comment carries fullDatabaseId as a decimal string (the BigInt THREAD_ID_JQ names a thread by, ahead of databaseId)" \
+      'all(.[]; .comments.nodes[0].fullDatabaseId | type == "string" and test("^[1-9][0-9]*$"))' "$tnodes"
+    # Past 2^31 is selected on the decimal string, so the claim is about exactly the threads whose
+    # 32-bit databaseId the schema cannot hold; jq's numbers are doubles, exact far past these ids.
+    BIG='.comments.nodes[0] | select((.fullDatabaseId | type == "string" and test("^[1-9][0-9]*$")) and (.fullDatabaseId | tonumber) > 2147483647)'
+    n_big=$(jq "[.[] | $BIG] | length" <<<"$tnodes")
+    if [ "$n_big" -ge 1 ]; then
+      pin "databaseId is not clamped past 2^31: on #$THREADS_PR's $n_big thread(s) whose first comment id is past it, databaseId is null or the very number fullDatabaseId spells (THREAD_ID_JQ's fallback)" \
+        "all(.[] | $BIG; .databaseId == null or ((.databaseId | type == \"number\") and (.databaseId | tostring) == .fullDatabaseId))" "$tnodes"
+      echo "      databaseId past 2^31 on #$THREADS_PR: $(jq -r "[.[] | $BIG | if .databaseId == null then \"null\" elif (.databaseId | tostring) == .fullDatabaseId then \"whole\" else \"other\" end] | group_by(.) | map(\"\(.[0]) on \(length)\") | join(\", \")" <<<"$tnodes")"
+    else
+      skip "databaseId is not clamped past 2^31" "#$THREADS_PR's thread ids are all below 2^31; an anchor past it pins this"
+    fi
+    if [ "$ttotal" -lt 3 ]; then
+      skip "totalCount on every page of reviewThreads" "#$THREADS_PR has $ttotal thread(s): too few to span two pages of two; an anchor with three or more shows it"
+    else
+      # The verbatim query at a smaller page — the one edit, made on the library's text so every
+      # field stays the gate's. A query that no longer reads `reviewThreads(first:100,` is a change
+      # this read must follow, and it stops rather than walking some other query.
+      tsize=$(((ttotal + 2) / 3))
+      [ "$tsize" -ge 2 ] || tsize=2
+      [ "$tsize" -le 100 ] || tsize=100
+      tfrom='reviewThreads(first:100,'
+      tto="reviewThreads(first:$tsize,"
+      tquery=${THREADS_QUERY/"$tfrom"/$tto}
+      [ "$tquery" != "$THREADS_QUERY" ] || { echo "pr-review-api-contract.sh: THREADS_QUERY no longer asks for reviewThreads(first:100, ...); the paged read derives from it and must be updated with it" >&2; exit 2; }
+      : >"$SCRATCH/thread_pages"
+      tcursor=""
+      for ((tpage = 1; tpage <= 10; tpage++)); do
+        tafter=()
+        [ -z "$tcursor" ] || tafter=(-f "after=$tcursor")
+        api graphql -f query="$tquery" -F owner="${REPO%%/*}" -F name="${REPO##*/}" -F pr="$THREADS_PR" ${tafter[@]+"${tafter[@]}"} | threads_conn |
+          jq -c 'if type == "object" then {has_total: has("totalCount"), total: .totalCount,
+                   n: (.nodes | if type == "array" then length else null end),
+                   next: .pageInfo.hasNextPage, cursor: .pageInfo.endCursor} else {has_total: false} end' >>"$SCRATCH/thread_pages"
+        # The cursor rides the next request only when it is a usable one; otherwise the walk ends
+        # here and the claims below report the page that broke it.
+        [ "$(tail -n 1 "$SCRATCH/thread_pages" | jq -r '.next')" = true ] || break
+        tcursor=$(tail -n 1 "$SCRATCH/thread_pages" | jq -r '.cursor | if type == "string" then . else empty end')
+        [ -n "$tcursor" ] || break
+      done
+      tpages=$(jq -cs . "$SCRATCH/thread_pages")
+      pin "on a walk of #$THREADS_PR at $tsize a page ($(jq length <<<"$tpages") pages), EVERY page states a numeric totalCount, nodes[] and a boolean hasNextPage, with a non-empty endCursor whenever there is a next page (threads_walk reads the last page's count)" \
+        'length >= 2 and all(.[]; .has_total and (.total | type == "number") and (.n | type == "number") and (.next | type == "boolean")
+                              and (.next == false or (.cursor | type == "string" and length > 0)))' "$tpages"
+      pin "... and the pages add up: each states the verbatim read's totalCount ($ttotal), their rows reach it, and the last says hasNextPage false (threads_walk's whole-read test)" \
+        'all(.[]; .total == $t) and ((map(.n // 0) | add) == $t) and (.[-1].next == false)' "$tpages" --argjson t "$ttotal"
+    fi
+  fi
+fi
+skip "reviewThreads paged past 100 threads" "no PR here has more than one page of 100 threads; the paging itself is pinned above on a smaller page of the same query"
+
+# --- commits/<sha> files ------------------------------------------------------------------------------
+# What commit_files reads for the paths-ignore recognition (ludics-lite#163, #177): one commit's
+# files, its first-parent diff, through `--paginate` at per_page=100, refusing a list of 300 or
+# more as possibly truncated. The fixtures can record only that --paginate was passed; what makes
+# it necessary, and what makes the joined pages the whole diff, is the endpoint's paging, asked
+# here of a commit wider than one default page. Live (2026-10-01), against the belief #163's
+# review wrote into the comments (30 a page, 300 in all): the default page is 300 files, with a
+# rel=next Link past it; per_page is honoured; and the paginated read is NOT capped at 300 — it
+# joins to the whole diff (GitHub documents 3000 as the most it serves). So commit_files' refusal
+# at 300 is conservative rather than a cap it must respect, and it is the backstop that refuses an
+# unpaginated read, whose wide answer is exactly one default page of 300.
+section "commits/<sha> files on ${WIDE_COMMIT:-?} — commit_files's feed (the paths-ignore walk)"
+if [ -z "$WIDE_COMMIT" ] || [ -z "$WIDE_COMMIT_FILES" ]; then
+  skip "the commit-files paging commit_files rests on" "set CONTRACT_WIDE_COMMIT (<owner/name>@<sha>, wider than 300 files) and CONTRACT_WIDE_COMMIT_FILES (its file count)"
+else
+  wrepo=${WIDE_COMMIT%@*}
+  wsha=${WIDE_COMMIT##*@}
+  case "$wrepo" in
+  */*/* | /* | */ | *[!A-Za-z0-9._/-]*) wrepo="" ;;
+  */*) ;;
+  *) wrepo="" ;;
+  esac
+  if [ -z "$wrepo" ] || ! is_sha "$wsha" || ! is_num "$WIDE_COMMIT_FILES"; then
+    echo "pr-review-api-contract.sh: CONTRACT_WIDE_COMMIT must be <owner/name>@<40-hex sha> and CONTRACT_WIDE_COMMIT_FILES a count, got '$WIDE_COMMIT' and '$WIDE_COMMIT_FILES'" >&2
+    exit 2
+  fi
+  if [ "$WIDE_COMMIT_FILES" -le 300 ]; then
+    skip "the commit-files paging commit_files rests on" "the anchor has $WIDE_COMMIT_FILES files: no wider than the default page, it shows no paging"
+  else
+    # Projected to the fields commit_files reads as each page arrives: the rows carry patches, and
+    # a wide commit's pages run to megabytes.
+    PAGE_ROWS='if type == "object" then {files: (.files | if type == "array" then map(if type == "object" then {filename, status, previous_filename} else . end) else . end)} else . end'
+    wone=$(api "repos/$wrepo/commits/$wsha" | jq -c "$PAGE_ROWS")
+    pin "an unpaginated commits/<sha> read answers ONE default page: 300 of $wsha's $WIDE_COMMIT_FILES files (a single read is a truncated diff, which is why commit_files pages, and a list of exactly 300 is what its refusal at 300 catches)" \
+      '.files | type == "array" and length == 300' "$wone"
+    wpages=$(api --paginate "repos/$wrepo/commits/$wsha?per_page=100" | jq -cs "map($PAGE_ROWS)")
+    pin "commits/<sha>?per_page=100 under --paginate is one commit object per page with files[], each page 100 rows but the last, which has 1 to 100 (the page size commit_files asks for is honoured)" \
+      'length >= 2 and all(.[]; .files | type == "array") and all(.[:-1][]; .files | length == 100)
+       and (.[-1].files | length >= 1 and length <= 100)' "$wpages"
+    pin "... and the joined pages are the WHOLE first-parent diff, past 300: $WIDE_COMMIT_FILES rows with distinct, non-empty string filenames (the read commit_files takes as the commit's changed paths is not capped at the default page)" \
+      '[.[].files[]?] | length == $n and all(.[]; .filename | type == "string" and length > 0) and ([.[].filename] | unique | length) == $n' \
+      "$wpages" --argjson n "$WIDE_COMMIT_FILES"
+    if jq -e 'any(.[].files[]?; .status == "renamed")' <<<"$wpages" >/dev/null; then
+      pin "a renamed row carries a non-empty previous_filename (commit_files lists both names as changed paths)" \
+        'all(.[].files[]? | select(.status == "renamed"); .previous_filename | type == "string" and length > 0)' "$wpages"
+    else
+      skip "a renamed commit-files row carries previous_filename" "no rename in the anchor commit"
+    fi
+  fi
+fi
 skip "compare's 300-file cap" "no compare of that size exists in this repository"
 
 # --- the verdict --------------------------------------------------------------------------------------
 section "verdict"
-echo "$CLAIMS beliefs checked, $MOVED moved, $SKIPPED unpinned here"
+echo "$CLAIMS beliefs checked ($((CLAIMS - WRAPPER_CLAIMS)) + $WRAPPER_CLAIMS per-workflow wrapper claim(s), one per workflow the base-runs search asked), $MOVED moved, $SKIPPED unpinned here"
 [ "$MOVED" -eq 0 ] || { echo "pr-review-api-contract.sh: $MOVED belief(s) the fixtures encode no longer hold on $REPO — see MOVED above" >&2; exit 1; }
