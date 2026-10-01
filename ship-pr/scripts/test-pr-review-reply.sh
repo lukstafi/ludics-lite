@@ -16,7 +16,9 @@
 #   - a failure MID-batch never reports "nothing was posted": a reply is the one write here that
 #     cannot be repeated safely, so the refusal names what landed and what to retry with. That is
 #     the case with a negative control on either side — the first id failing DOES say nothing was
-#     posted — because a progress note that is always the same says nothing at all.
+#     posted — because a progress note that is always the same says nothing at all;
+#   - a body mentioning '@codex' refuses before any write, `comment`'s bare nudge aside, since any
+#     mention is an instruction to the connector (ludics-lite#472).
 #
 # `reply` and `resolve` refuse by calling `fail`, which EXITS; every case therefore runs the
 # command in a subshell, with errexit off so the refusal's own exit code survives to be read.
@@ -894,6 +896,82 @@ test_comment_invocation_errors_send_nothing() {
   assert_eq "$(cat "$REQUEST_LOG")" "repos/$TARGET_REPO/issues/7/comments" "on the PR it names"
 }
 
+# --- an '@codex' mention in a body (ludics-lite#472) ---------------------------------------------
+
+# The body #465 posted, in small: a rebuttal QUOTING the nudge to explain the re-request rule. The
+# connector read the quote as a request and answered in the thread, and the answer was counted as
+# a round. Every spelling of the handle refuses before any request, wherever it stands; the flag
+# lets a meant mention through; the same sentence rephrased without the at-sign is the control.
+test_a_mention_is_refused_before_anything_is_posted() {
+  local body
+  for body in \
+    "A request carries no SHA, since the connector's request syntax is the bare '@codex review'." \
+    'Rebutted: see the `@codex review` rule.' \
+    $'Rebutted.\n\n```\n@codex review\n```' \
+    'Ask @Codex to look again.' \
+    'Mail ops@codex.example.' \
+    'cc @codex-bot'; do
+    reset_fixture
+    run_cmd cmd_reply 900+901 "$body"
+    assert_eq "$RC" 2 "a reply mentioning the handle is refused: $body ($ERR)"
+    assert_contains "$ERR" "any mention is an instruction to the connector" "and says why: $body"
+    assert_contains "$ERR" "--allow-mention" "and names the flag for a meant mention"
+    assert_eq "$(cat "$REQUEST_LOG")" "" "and posts nothing, to no thread: $body"
+    reset_fixture
+    run_cmd cmd_comment "$body"
+    assert_eq "$RC" 2 "a comment mentioning the handle is refused too: $body ($ERR)"
+    assert_eq "$(cat "$REQUEST_LOG")" "" "and posts nothing: $body"
+  done
+  # The nudge has no thread to go to: in a reply it refuses, and the refusal says where it goes.
+  reset_fixture
+  run_cmd cmd_reply 900 '@codex review'
+  assert_eq "$RC" 2 "the bare nudge as a thread reply is refused ($ERR)"
+  assert_contains "$ERR" "a nudge goes through \`comment <pr> '@codex review'\`" "and sent to \`comment\`"
+  assert_eq "$(cat "$REQUEST_LOG")" "" "and posts nothing"
+  # The control: the same rebuttal without the at-sign is an ordinary reply.
+  reset_fixture
+  run_cmd cmd_reply 900 "A request carries no SHA, since the codex review nudge is bare."
+  assert_eq "$RC" 0 "a body that names the nudge without the handle posts ($ERR)"
+  assert_contains "$(posted_to 900)" "the codex review nudge is bare" "as written"
+}
+
+test_allow_mention_posts_a_meant_mention() {
+  reset_fixture
+  run_cmd cmd_reply --allow-mention 900+901 "Over to @codex for the retry path."
+  assert_eq "$RC" 0 "the flag lets the reply through, before the token ($ERR)"
+  assert_contains "$(posted_to 900)" "Over to @codex for the retry path." "the body as written"
+  assert_contains "$(posted_to 901)" "#discussion_r900" "and the duplicate gets its pointer"
+  reset_fixture
+  run_cmd cmd_reply 900 "Over to @codex." --allow-mention
+  assert_eq "$RC" 0 "and after the body ($ERR)"
+  reset_fixture
+  run_cmd cmd_comment --allow-mention "Quoting the rule: '@codex review' re-requests."
+  assert_eq "$RC" 0 "the flag lets a comment through ($ERR)"
+  assert_eq "$(cat "$BODIES/comment")" \
+    $'Quoting the rule: \'@codex review\' re-requests.\n\n_🤖 Addressed by an automated coding agent_' \
+    "the body exactly as given, the flag no part of it"
+}
+
+# The one allowlisted body: `comment`'s bare nudge, exactly, trailing whitespace allowed — the shape
+# status_state reads as a request. Anything else around the handle is a mention.
+test_the_bare_nudge_is_the_one_comment_that_passes() {
+  local body
+  for body in '@codex review' $'@codex review\n'; do
+    reset_fixture
+    run_cmd cmd_comment "$body"
+    assert_eq "$RC" 0 "the bare nudge posts without the flag ($ERR)"
+    assert_eq "$(cat "$REQUEST_LOG")" "repos/$TARGET_REPO/issues/7/comments" "as a PR comment"
+  done
+  for body in '@codex review please' '@Codex review' ' @codex review' '@codex  review' \
+    $'@codex review\n\nRound 3 answered in the threads.'; do
+    reset_fixture
+    run_cmd cmd_comment "$body"
+    assert_eq "$RC" 2 "not the bare nudge, so a mention: '$body' ($ERR)"
+    assert_contains "$ERR" "the bare nudge is the one body that may mention it" "and says which body passes"
+    assert_eq "$(cat "$REQUEST_LOG")" "" "and posts nothing: '$body'"
+  done
+}
+
 tests=(
   test_a_folded_entry_is_answered_by_one_invocation
   test_a_single_thread_reply_is_unchanged
@@ -924,6 +1002,9 @@ tests=(
   test_comment_retries_a_gateway_refusal
   test_comment_exits_stay_apart
   test_comment_invocation_errors_send_nothing
+  test_a_mention_is_refused_before_anything_is_posted
+  test_allow_mention_posts_a_meant_mention
+  test_the_bare_nudge_is_the_one_comment_that_passes
 )
 
 run_tests "${tests[@]}"
