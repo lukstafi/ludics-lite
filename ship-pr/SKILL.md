@@ -645,7 +645,10 @@ An empty `COMMENTED` review counts as no completed review unless its own inline-
 endpoint contains findings. This also excludes it from the convergence count; comments on another
 review cannot make it substantive, and an unread endpoint yields `unknown`. Existing reactions,
 verdicts and genuine findings still decide status; otherwise the ordinary `expected`/grace path
-applies. This structural check does not classify plain, unstamped setup messages by their prose.
+applies. This structural check does not classify plain, unstamped setup messages by their prose,
+with one verbatim exception: the connector's fixed reply posted INTO a review thread ("To use Codex
+here, create an environment for this repo", which a mention of its handle draws there,
+ludics-lite#472) is not a finding, so an envelope holding only that reply is no review and no round.
 
 Every one of those lines also says **`CONFLICTS with the base (mergeable_state=dirty)`** when
 GitHub cannot build the PR's merge commit, and on `idle` that replaces "the next move is yours".
