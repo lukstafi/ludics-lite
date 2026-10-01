@@ -681,6 +681,6 @@ tests=(
   test_an_unanswered_api_exits_3_and_leaves_nothing_behind
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

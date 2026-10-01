@@ -1919,6 +1919,6 @@ tests=(
   test_a_deferred_merge_says_the_series_is_unbound
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

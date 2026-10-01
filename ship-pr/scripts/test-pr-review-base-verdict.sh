@@ -283,6 +283,6 @@ tests=(
   test_a_same_second_tie_goes_to_the_higher_run_id
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

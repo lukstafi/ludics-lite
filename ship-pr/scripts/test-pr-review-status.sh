@@ -1859,6 +1859,6 @@ tests=(
   test_watch_does_not_post_over_an_approval_that_landed_since_the_round
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

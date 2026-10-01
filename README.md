@@ -330,10 +330,13 @@ instead of on the push (PR #275). The workflow calls this script for those steps
 cannot drift, and `scripts/test-preflight.sh` pins that they have not.
 
 To iterate on a few cases of a `ship-pr/scripts/test-pr-review-*.sh` suite, name them:
-`SHIP_PR_TEST_CASES="test_a test_b" ship-pr/scripts/test-pr-review-watch.sh` runs only those, in
-the suite's order, and closes with `SUBSET: 2 of <m> cases` — a line a full run never prints. A
-name the suite does not run is refused, and so is any subset under `GITHUB_ACTIONS=true`, so CI
-always runs the whole suite; the full run before a push still stands. Every case `run_tests` is
+`ship-pr/scripts/test-pr-review-watch.sh test_a test_b` (or
+`SHIP_PR_TEST_CASES="test_a test_b" ship-pr/scripts/test-pr-review-watch.sh`; naming cases both
+ways is refused) runs only those, in the suite's order, and closes with `SUBSET: 2 of <m> cases` —
+a line a full run never prints. A name the suite does not run is refused, and so is any subset
+under `GITHUB_ACTIONS=true`, so CI always runs the whole suite; the full run before a push still
+stands. A suite hands its arguments to `run_tests "${tests[@]}" -- "$@"`, and a call without the
+`--` is refused, so a new suite cannot silently run whole when given case names. Every case `run_tests` is
 given must already be a defined function, or the run is refused before any case: PR #415 defined a
 case inside another case's body, which a full run reached but a subset could never select.
 

@@ -1821,6 +1821,6 @@ tests=(
   test_an_approval_beside_a_final_poll_round_is_checked_too
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

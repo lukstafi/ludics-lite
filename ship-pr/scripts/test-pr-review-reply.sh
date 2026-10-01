@@ -1007,6 +1007,6 @@ tests=(
   test_the_bare_nudge_is_the_one_comment_that_passes
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }

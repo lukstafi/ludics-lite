@@ -448,6 +448,6 @@ tests=(
   test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict
 )
 
-run_tests "${tests[@]}"
+run_tests "${tests[@]}" -- "$@"
 exit "$?"
 }
