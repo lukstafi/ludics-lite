@@ -603,7 +603,9 @@ test_a_doctored_response_moves_its_pin_and_only_it() {
     "$R/pulls/9/comments?per_page=100^.[1] |= del(.original_line)^MOVED inline comments carry numeric id" \
     "$R/pulls/9/reviews/31/comments?per_page=100^.[1] |= del(.original_position)^MOVED the per-review rows carry what poll renders" \
     "graphql?pr=9&first=100&after=-^.data.repository.pullRequest.reviewThreads.nodes[0].isResolved = \"true\"^MOVED every thread carries a non-empty node id (resolve's threadId) and isResolved as a boolean" \
-    "graphql?pr=9&first=2&after=c2^.data.repository.pullRequest.reviewThreads.totalCount = 4^MOVED ... and the pages add up: each states the verbatim read's totalCount (3)"; do
+    "graphql?pr=9&first=2&after=c2^.data.repository.pullRequest.reviewThreads.totalCount = 4^MOVED ... and the pages add up: each states the verbatim read's totalCount (3)" \
+    "graphql?pr=9&first=100&after=-^.data.repository.pullRequest.reviewThreads.nodes[0].comments.nodes[0].databaseId = 2147483647^MOVED databaseId is not clamped past 2^31" \
+    "repos/$WIDE_REPO/commits/$WIDE^.files |= .[:30]^MOVED an unpaginated commits/<sha> read answers ONE default page"; do
     IFS='^' read -r endpoint filter belief <<<"$row"
     world_healthy
     doctor "$endpoint" "$filter"
