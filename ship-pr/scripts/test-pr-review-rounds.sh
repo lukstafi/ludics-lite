@@ -300,6 +300,48 @@ test_the_missing_environment_is_not_a_round() {
     "the sentence unlinked, and nothing after it, is the connector's"
 }
 
+# The connector's environment reply posted INTO a review thread (ludics-lite#472): a mention of
+# '@codex' in a thread reply on #465 drew inline comment 4138519259, which GitHub filed as an
+# empty-bodied COMMENTED review on the head, and the count took it for round 5. Verbatim from that
+# comment. The envelope holding only that body is no round; the controls are that same envelope
+# with a real finding beside it, and a finding that QUOTES the reply.
+test_the_connector_thread_reply_is_not_a_round() {
+  local findings
+  findings=$(review "$REVIEWER" COMMENTED aaaa 2026-09-29T21:24:38Z)
+  set_reviews "$findings" \
+    "$(review "$REVIEWER" COMMENTED bbbb 2026-09-29T21:29:15Z | jq -c '. + {id:5358720309,body:""}')"
+  ROUND_THRESHOLD=12
+  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" \
+    '[{id:4138519259, in_reply_to_id:4138480284, pull_request_review_id:5358720309, body:$b}]')
+  run_rounds
+  assert_eq "$ROUNDS_RC" 0 "a count that was read is exit 0"
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "the connector's thread reply opens no round"
+  assert_contains "$ROUNDS_OUTPUT" "over 1 head(s)" "and adds no head"
+  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" '[{id:1, in_reply_to_id:9, body:($b + "\n\n")}]')
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
+    "trailing whitespace is still the verbatim body"
+  # Only as a THREAD reply (review of #488, round 1): a top-level comment with that text is a finding.
+  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" '[{id:1, body:$b}]')
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
+    "the text as a top-level comment, replying to nothing, is a round"
+  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" '[{id:1, in_reply_to_id:9, body:$b}, {id:2, body:"a real finding"}]')
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
+    "an envelope holding a finding beside the reply is a round"
+  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" '[{id:1, in_reply_to_id:9, body:("The connector answered\n\n> " + $b)}]')
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
+    "a finding that quotes the reply is a finding"
+  INLINE_JSON=$(jq -cn '[{id:1, in_reply_to_id:9, body:"To use Codex here, create an environment for this repo."}]')
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
+    "a wording the allowlist does not hold verbatim is still a round, loudly"
+  INLINE_JSON='[]'
+}
+
 # The other side of that filter: a comment-only round whose finding QUOTES the ref error is a
 # round. This function has no head to check a quoted ref against, so it drops a comment only when
 # the body OPENS with the failure sentence itself — under the shape `status` uses, a round about
@@ -475,6 +517,7 @@ tests=(
   test_large_comment_feed_still_counts
   test_initialization_failures_are_not_rounds
   test_the_missing_environment_is_not_a_round
+  test_the_connector_thread_reply_is_not_a_round
   test_a_round_quoting_the_ref_error_still_counts
   test_no_rounds_yet
   test_threshold

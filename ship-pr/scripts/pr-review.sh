@@ -208,19 +208,23 @@
 #                                          # green by a NAMED source meanwhile (the merged PR's
 #                                          # head run), never the tip's own verdict; opt-in, for
 #                                          # the gate and the base watch (ludics-lite#308)
-#   pr-review.sh reply <pr> <comment-id>[+<comment-id>...] <body>
+#   pr-review.sh reply <pr> <comment-id>[+<comment-id>...] <body> [--allow-mention]
 #                                          # the id token poll rendered. A FOLDED entry names
 #                                          # several: the body goes to the first thread and each
 #                                          # duplicate gets a one-line pointer to that reply, from
-#                                          # this one invocation
+#                                          # this one invocation. A body mentioning '@codex' is
+#                                          # refused unless --allow-mention (see mention_refusal)
 #   pr-review.sh reply <pr> <comment-id>[+...] --anchor <comment-id>
 #                                          # no body: the answer already stands in <comment-id>'s
 #                                          # thread, and every id in the token is pointed at it.
 #                                          # What a batch that failed part-way is retried with
 #   pr-review.sh resolve <pr> <comment-id>[+<comment-id>...]
 #                                          # the same token; every thread it names is closed
-#   pr-review.sh comment <pr> <body>       # a plain PR comment, for what has no thread to reply in:
+#   pr-review.sh comment <pr> <body> [--allow-mention]
+#                                          # a plain PR comment, for what has no thread to reply in:
 #                                          # a review SUMMARY's findings, or a '@codex review' nudge
+#                                          # (the one body that may mention '@codex' without the
+#                                          # flag; see mention_refusal)
 #   pr-review.sh body <pr> <file>          # replace the PR's description with the file's content,
 #                                          # over REST: `gh pr edit --body-file` rides GraphQL and
 #                                          # fails on a repo whose PRs trip the classic-Projects
@@ -1680,6 +1684,25 @@ review_after_nudge() { # <event timestamp> <eligible nudge timestamp, or empty>
 # A submitted COMMENTED envelope alone proves no findings (#88). Read its OWN
 # comments: the flat PR feed can lag behind that endpoint. A failed read is not
 # an empty review. Keep all other review states and nonempty summaries untouched.
+#
+# Nor does an envelope whose comments are all the connector's FIXED replies (ludics-lite#472). A
+# mention of '@codex' in a review thread draws the connector's answer INTO that thread, and GitHub
+# files a thread reply as an empty-bodied COMMENTED review on the head, so the envelope test above
+# passed it as findings: on PR #465 one quoted '@codex review' drew inline comment 4138519259, and
+# `watch` reported "opened round 5 of 12" over a round that never ran. Both the count and the
+# state read through here, so for both it is not a review of that head.
+#
+# Boundary, as a fail-closed allowlist: CONNECTOR_FIXED_REPLIES holds the verbatim bodies of the
+# replies seen, and a comment matches only when it IS a thread reply (a numeric `in_reply_to_id`,
+# which the review's own comments endpoint serves) and its body, trailing whitespace aside, EQUALS
+# one of them. A top-level comment carrying that text is a finding, not this reply (review of #488,
+# round 1). One body today, taken from comment 4138519259 and the same answer the connector gave six
+# times in threads of PR #82 (every connector thread reply on this repository and
+# ocannl-staging, read 2026-10-01). Not read: the comment's author (a review's comments are its
+# author's), any other wording, a body that quotes or extends one of these, and an envelope
+# mixing one with anything else, all of which stay findings. A new fixed reply counts as a round
+# until its body is added here, loudly; a finding swallowed by a looser match would not be seen.
+CONNECTOR_FIXED_REPLIES='["To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments)."]'
 substantive_reviews() { # <pr>; reviews JSON on stdin
   local pr="$1" raw ids id inline
   raw=$(cat)
@@ -1691,7 +1714,11 @@ substantive_reviews() { # <pr>; reviews JSON on stdin
     [ -n "$id" ] || continue
     case "$id" in null | *[!0-9]*) return 1 ;; esac
     inline=$(review_comments "$pr" "$id") || return 1
-    if jq -e 'type == "array" and length == 0' <<<"$inline" >/dev/null; then
+    if jq -e --argjson fixed "$CONNECTOR_FIXED_REPLIES" '
+        def fixed_reply: (.in_reply_to_id | type) == "number" and (.body | type) == "string"
+          and (.body | sub("[[:space:]]+\\z"; "") | IN($fixed[]));
+        type == "array" and all(.[]; fixed_reply)' \
+      <<<"$inline" >/dev/null; then
       raw=$(jq --argjson id "$id" 'map(select(.id != $id))' <<<"$raw") || return 1
     else
       jq -e 'type == "array"' <<<"$inline" >/dev/null || return 1
@@ -3700,6 +3727,37 @@ reply_failed() { # <pr> <comment-id> <rc> <ids answered> <ids not answered, firs
     "${after:-there is nothing else outstanding if it is}"
 }
 
+# --- an '@codex' mention in a written body (ludics-lite#472) -------------------------------------
+# Any mention of the connector is an instruction to it, wherever it stands in the body. On PR #465
+# a thread reply rebutting a finding QUOTED the nudge ('@codex review') to explain the re-request
+# rule; the connector took the quote as a request and answered in that thread "To use Codex here,
+# create an environment for this repo" (inline comment 4138519259), and `watch` numbered the
+# answer as round 5. A request can also clear an approval, and nothing about it is undoable once
+# posted. So `reply` and `comment` REFUSE a body that mentions it, before any request, unless the
+# caller passes --allow-mention to say the mention is meant: a refusal costs a rephrase ("the
+# codex review nudge"), where a missed mention costs a round.
+#
+# Boundary, as a fail-closed allowlist: the ONE body that passes with a mention in it is
+# `comment`'s bare nudge, exactly '@codex review' with trailing whitespace allowed (the shape
+# status_state reads as a request). Every other body holding the characters '@codex', in any
+# letter case, refuses: inside a code span or a fence, quoted, inside an email-like word, or as
+# the prefix of a longer handle (`@codex-bot`). Not read: Markdown structure, whether GitHub
+# renders the mention as a link, or whether the connector would act on it, none of which this
+# script can know. `reply` has no allowlisted body: the nudge goes to the PR conversation through
+# `comment`, and a thread is where the connector answered a mention with its environment reply.
+mention_refusal() { # <reply|comment> <body>; exit 2 on a mention the allowlist does not name
+  local cmd="$1" body="$2" trimmed
+  case "$body" in *@[Cc][Oo][Dd][Ee][Xx]*) ;; *) return 0 ;; esac
+  trimmed="${body%"${body##*[![:space:]]}"}"
+  [ "$cmd" != comment ] || [ "$trimmed" != "@codex review" ] || return 0
+  local nudge="the bare nudge is the one body that may mention it"
+  [ "$cmd" = comment ] || nudge="a nudge goes through \`comment <pr> '@codex review'\`, never a thread"
+  die "$cmd: the body mentions '@codex', and any mention is an instruction to the connector —" \
+    "a quoted '@codex review' summoned it on PR #465 and drew a reply counted as a round. Rephrase" \
+    "without the at-sign (\"the codex review nudge\"), or pass --allow-mention if the mention is" \
+    "meant; $nudge. Nothing was posted."
+}
+
 # One invocation answers a whole folded entry: the body goes to the ANCHOR (the first id), and
 # each duplicate gets a one-line pointer to the anchor's reply. That is what makes a duplicate
 # cheap — one composed answer instead of one per thread (ludics-lite#76).
@@ -3712,9 +3770,13 @@ reply_failed() { # <pr> <comment-id> <rc> <ids answered> <ids not answered, firs
 # Every reply's html_url is printed, one per line, in the order they were posted, so the caller
 # can see which threads it actually reached.
 cmd_reply() {
-  local anchor="" args=() arg
+  local anchor="" args=() arg allow_mention=""
   while [ $# -gt 0 ]; do
     case "$1" in
+    --allow-mention)
+      allow_mention=1
+      shift
+      ;;
     --anchor)
       anchor="${2:-}"
       shift 2 || die "reply: --anchor takes the comment id of the thread the answer is already in"
@@ -3742,10 +3804,11 @@ cmd_reply() {
       "so no body is taken: every id in the token is pointed at it."
     case "$anchor" in '' | *[!0-9]*) die "reply: --anchor takes one comment id, got '$anchor'" ;; esac
   else
-    [ $# -eq 3 ] || die "usage: reply <pr> <comment-id>[+<comment-id>...] <body> — got $# argument(s)." \
+    [ $# -eq 3 ] || die "usage: reply <pr> <comment-id>[+<comment-id>...] <body> [--allow-mention] — got $# argument(s)." \
       "The body is ONE argument: quote it, including a multi-line one."
     body="$3"
     [ -n "${body//[[:space:]]/}" ] || die "reply: the body is empty; there is nothing to post"
+    [ -n "$allow_mention" ] || mention_refusal reply "$body"
   fi
   local pr="$1" ids="$2"
   pr_arg "$pr"
@@ -3791,10 +3854,20 @@ cmd_comment() {
   # Exactly two, and checked rather than left to ${1:?...} — which exits 1, the code that means "the
   # fact does not hold". A body is a sentence, so an unquoted one arrives as several arguments and
   # would otherwise post its first word and drop the rest; that reads as a posted comment.
-  [ $# -eq 2 ] || die "usage: comment <pr> <body> — got $# argument(s)." \
+  local args=() allow_mention=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --allow-mention) allow_mention=1 ;;
+    *) args+=("$1") ;;
+    esac
+    shift
+  done
+  set -- ${args[@]+"${args[@]}"}
+  [ $# -eq 2 ] || die "usage: comment <pr> <body> [--allow-mention] — got $# argument(s)." \
     "The body is ONE argument: quote it, including a multi-line one."
   local pr="$1" body="$2"
   [ -n "${body//[[:space:]]/}" ] || die "comment: the body is empty; there is nothing to post"
+  [ -n "$allow_mention" ] || mention_refusal comment "$body"
   pr_arg "$pr"
   pr="$PR_NUM"
   # issues/<n>/comments, not pulls/<n>/comments: on GitHub a PR *is* an issue, and the pulls

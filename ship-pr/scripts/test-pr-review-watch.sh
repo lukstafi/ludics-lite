@@ -553,6 +553,31 @@ test_the_missing_environment_ends_the_wait_with_the_nudge() {
   assert_not_contains "$WATCH_ERR" "— round 0" "never an impossible round zero"
 }
 
+# The same reply posted INTO a review thread (ludics-lite#472), as #465 saw it: a thread reply that
+# quoted the nudge summoned the connector, which answered in the thread (inline comment 4138519259,
+# an empty-bodied COMMENTED review on the head). The window still ends on it, since it is new
+# activity about the head, but its line must not number it: #465's said "opened round 5 of 12".
+# The control is the same envelope carrying a finding, which does open the next round.
+test_the_connector_thread_reply_opens_no_round() {
+  local env_body='To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).'
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H1" 2026-09-01T00:00:00Z),$(review 600 "$H2" 2026-09-01T01:00:00Z ' ')]"
+  schedule inline 1 "[$(inline_comment 4138519259 "$H2" "$H2" "$env_body" a.sh 3 '{"in_reply_to_id":900}')]"
+  schedule review_comments 1 "[$(inline_comment 4138519259 "$H2" "$H2" "$env_body" a.sh 3 '{"in_reply_to_id":900}')]"
+  run_watch 0,0,500
+  assert_eq "$WATCH_RC" 0 "the reply is new activity about the head"
+  assert_contains "$WATCH_ERR" "— this window opened no round; rounds with findings: 1 of 12" \
+    "the connector's thread reply is not numbered as a round"
+  assert_contains "$WATCH_OUT" "watch-rounds: from=1 to=1 threshold=12" "nor counted in the trailer"
+  reset_fixture
+  schedule reviews 1 "[$(review 500 "$H1" 2026-09-01T00:00:00Z),$(review 600 "$H2" 2026-09-01T01:00:00Z ' ')]"
+  schedule inline 1 "[$(inline_comment 901 "$H2" "$H2" 'a finding')]"
+  schedule review_comments 1 "[$(inline_comment 901 "$H2" "$H2" 'a finding')]"
+  run_watch 0,0,500
+  assert_contains "$WATCH_ERR" "— this window opened round 2 of 12" "a finding in the envelope is a round"
+  assert_contains "$WATCH_OUT" "watch-rounds: from=1 to=2 threshold=12" "and the trailer counts it"
+}
+
 # The two silences a log could not tell apart: a window in which the reviewer said nothing about
 # anything, and one in which it spoke three times about a head that is no longer the head.
 test_the_quiet_exit_names_the_head_and_what_scrolled_past() {
@@ -1759,6 +1784,7 @@ tests=(
   test_the_round_label_costs_no_request
   test_the_round_span_is_the_whole_watch
   test_the_missing_environment_ends_the_wait_with_the_nudge
+  test_the_connector_thread_reply_opens_no_round
   test_an_extension_holds_through_unknown_status
   test_a_nudge_buys_exactly_one_window
   test_an_ordinary_reply_or_old_nudge_does_not_reset_grace

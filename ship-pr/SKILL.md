@@ -538,6 +538,13 @@ prints the comment's URL), 1 the API rejected it, 2 your invocation is wrong —
 **one** argument, so quote it — and 3 nothing was posted, or nothing is known, so re-read the PR
 before repeating it.
 
+**Never write the connector's handle in a `reply` or `comment` body.** Any `@codex` in a body is an
+instruction to the connector, quoted or not: a rebuttal on ludics-lite#465 that quoted the nudge
+summoned it into the thread, where it answered with its environment reply. Both commands refuse
+such a body with exit 2 and post nothing. The bare `comment <pr> '@codex review'` nudge is the one
+body that passes. Rephrase the rest ("the codex review nudge"). `--allow-mention` is for a mention
+you really mean.
+
 **Edit the PR body with `body`, not `gh pr edit`.** Rewriting the description — the review-record
 paragraph of a close-out, a closing sentence `merge` warned about — goes through REST from a file:
 
@@ -640,7 +647,10 @@ An empty `COMMENTED` review counts as no completed review unless its own inline-
 endpoint contains findings. This also excludes it from the convergence count; comments on another
 review cannot make it substantive, and an unread endpoint yields `unknown`. Existing reactions,
 verdicts and genuine findings still decide status; otherwise the ordinary `expected`/grace path
-applies. This structural check does not classify plain, unstamped setup messages by their prose.
+applies. This structural check does not classify plain, unstamped setup messages by their prose,
+with one verbatim exception: the connector's fixed reply posted INTO a review thread ("To use Codex
+here, create an environment for this repo", which a mention of its handle draws there,
+ludics-lite#472) is not a finding, so an envelope holding only that reply is no review and no round.
 
 Every one of those lines also says **`CONFLICTS with the base (mergeable_state=dirty)`** when
 GitHub cannot build the PR's merge commit, and on `idle` that replaces "the next move is yours".
