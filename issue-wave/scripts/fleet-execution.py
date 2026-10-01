@@ -67,6 +67,24 @@ lock is not read: a hold keeps a VM alive and says nothing about who works there
 cannot be created or opened is free, as wake-lab.sh treats it (no lane can hold what it cannot open:
 the sweep fails such a lane rather than running it); one that opens but cannot be probed refuses.
 Correctness reservations never read the lock.
+
+The measurement window (ludics-lite#481). Every native worker holds a standing correctness record on
+its agent host for its whole life, and a measurement is refused while anything is outstanding on its
+box, so a measurement on a wave's agent host was never admitted until the coordinator concluded every
+standing record there `cancelled` (a conclusion describing no run), measured, and took fresh ones
+under invented ids. `window` (payload `{"box": <box>, "request": <measurement reserve.json>}`) does
+it under this one lock: it refuses unless everything outstanding on the box is standing, writes the
+measurement as `run` does (reserved and dispatched, `"window": true` on the record), then moves each
+standing record there to state `suspended`, naming the measurement in `suspended_by` and its former
+state in `suspended_from`. Concluding that measurement, whatever the verdict, first restores every
+record it suspended to its former state and then writes the conclusion, so no record is ever left
+suspended by a concluded measurement. A standing reservation taken while a window is open is admitted
+straight into `suspended` by it (queued, not refused: the worker's launch does not wait for the
+window). A suspended record takes no dispatch, record or reconcile -- the window owns its state --
+but may be concluded, which is how a worker handing back mid-window ends it. A retried `window` with
+the same request never dispatches twice: it suspends any standing record not yet suspended and prints
+the record. There is one measurement per window, so the registry still never holds two outstanding
+measurements on a box (`execution slot`'s in-hold admission, ludics-lite#480, relies on that).
 """
 import fcntl
 import json
@@ -90,7 +108,8 @@ def nonempty(obj, keys):
 
 REQUEST_FIELDS = {"request_id", "wave", "worker", "transport", "issue", "purpose",
                   "agent_host", "execution_host", "repository", "requested_revision", "kind"}
-STATES = {"reserved", "launching", "running", "uncertain", "concluded"}
+STATES = {"reserved", "launching", "running", "uncertain", "suspended", "concluded"}
+SUSPENDABLE = STATES - {"suspended", "concluded"}   # what `suspended_from` may name
 
 
 def validate_request(data):
@@ -139,6 +158,15 @@ def validate_record(record, path):
             nonempty(record, [key])
     if "observed_sha" in record and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", record["observed_sha"]):
         refuse(f"invalid observed SHA: {path}")
+    # A suspension is exactly the state and its two fields, on a standing record (see the header).
+    if record["state"] == "suspended":
+        nonempty(record, ["suspended_by", "suspended_from"])
+        if record["suspended_from"] not in SUSPENDABLE or not record["request"].get("standing"):
+            refuse(f"invalid suspension: {path}")
+    elif {"suspended_by", "suspended_from"} & set(record):
+        refuse(f"suspension fields on a record that is not suspended: {path}")
+    if "window" in record and (record["window"] is not True or record["request"]["kind"] != "measurement"):
+        refuse(f"invalid measurement window: {path}")
     if record["state"] == "concluded":
         nonempty(record, ["verdict", "log"])
         if record["verdict"] not in {"pass", "fail", "timeout", "cancelled", "not-launched"}:
@@ -253,29 +281,76 @@ def check_lane_lock(host, map_spec, anchor, lab):
     LANE_LOCKS.append(descriptor)
 
 
-def check_capacity(data, records, canonical_hosts, slots_spec):
-    """Refuse when the requested host cannot take this assignment beside the outstanding ones."""
+def check_capacity(data, records, canonical_hosts, slots_spec, window=False):
+    """Refuse when the requested host cannot take this assignment beside the outstanding ones.
+
+    Returns the open measurement window a standing request is queued behind, if any."""
     host, kind = data["execution_host"], data["kind"]
     slots = correctness_slots(slots_spec, canonical_hosts)
     outstanding = [r for r in records.values()
                    if r["state"] != "concluded" and r["request"]["execution_host"] == host]
+    if window:
+        # A window suspends the standing records and nothing else (see the header).
+        outstanding = [r for r in outstanding if not r["request"].get("standing")]
     if not outstanding:
-        return
+        return None
     owners = ", ".join(f"{r['request']['worker']} request={r['request_id']} coordinator={r['coordinator']}"
                        for r in outstanding)
     measuring = [r for r in outstanding if r["request"]["kind"] == "measurement"]
+    if window:
+        opened = [r["request_id"] for r in measuring if r.get("window")]
+        if opened:
+            refuse(f"measurement window {opened[0]} is already open on {host}; open the next one when it concludes")
+        refuse(f"box owned by {owners} (a measurement window suspends only standing reservations, "
+               f"and needs {host} otherwise to itself)")
     if kind == "measurement":
-        refuse(f"box owned by {owners} (measurement needs {host} to itself)")
+        hint = ("; every one is standing, which `fleet-worker.sh execution window` suspends for the measurement"
+                if all(r["request"].get("standing") for r in outstanding) else "")
+        refuse(f"box owned by {owners} (measurement needs {host} to itself{hint})")
     if measuring:
+        windows = [r["request_id"] for r in measuring if r.get("window")]
+        if windows and data.get("standing"):
+            return windows[0]
         refuse(f"box owned by {owners} (a measurement holds {host} exclusively)")
     # Standing iteration records hold nothing at run time, so they neither fill a slot nor can
     # be refused for want of one; they remain outstanding for measurement exclusivity above.
     if data.get("standing"):
-        return
+        return None
     counted = [r for r in outstanding if not r["request"].get("standing")]
     cap = slots.get(host, 1)
     if len(counted) >= cap:
         refuse(f"box owned by {owners} (correctness slots {len(counted)}/{cap} on {host} taken)")
+    return None
+
+
+def suspend(record, window, now, coordinator):
+    """Move a standing record into the window's suspension (see the header)."""
+    if record["state"] != "suspended":
+        record["suspended_from"] = record["state"]
+    record["state"] = "suspended"
+    record["suspended_by"] = window
+    record["updated_at"] = now
+    record["history"].append({"at": now, "coordinator": coordinator, "action": "suspend", "data": {
+        "request_id": record["request_id"], "evidence": f"suspended by measurement window {window}"}})
+
+
+def publish(directory, record):
+    """Write one record atomically and durably."""
+    directory.mkdir(exist_ok=True)
+    # Sync even on retry: an earlier failed sync may have left the new directory visible.
+    sync_directory(directory.parent)
+    fd, temporary = tempfile.mkstemp(prefix=".execution-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(record, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, directory / (record["request_id"] + ".json"))
+        sync_directory(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def main():
@@ -306,6 +381,12 @@ def main():
         print(json.dumps(selected, indent=None if options.get("compact") else 2))
         return
     data = json.loads(raw)
+    window_box = None
+    if action == "window":
+        if not isinstance(data, dict) or set(data) != {"box", "request"}:
+            refuse("window payload must be {box, request}")
+        nonempty(data, ["box"])
+        window_box, data = data["box"], data["request"]
     if not isinstance(data, dict):
         refuse("request must be a JSON object")
     nonempty(data, ["request_id"])
@@ -323,7 +404,9 @@ def main():
         refuse("invalid empty halt record")
     record = records.get(identity)
     events = []   # (action, data) pairs appended to the history, in order
-    if action in {"reserve", "run", "dispatch"}:
+    before = []   # other records to publish BEFORE this one (a window's restorations)
+    after = []    # other records to publish AFTER this one (a window's suspensions)
+    if action in {"reserve", "run", "dispatch", "window"}:
         roster = list(dict.fromkeys(boxes.split()))   # a repeated entry is the same entry
         canonical_hosts = set(roster)
         if not canonical_hosts:
@@ -334,13 +417,15 @@ def main():
         for existing in records.values():
             if existing["state"] != "concluded" and existing["request"]["execution_host"] not in canonical_hosts:
                 refuse(f"reconcile noncanonical execution host on request {existing['request_id']} before dispatch")
-    if action in {"reserve", "run"}:
+    if action in {"reserve", "run", "window"}:
         # `run` is reserve + dispatch under one lock: the payload is the reservation, plus an
         # optional `evidence` for the dispatch step (ludics-lite: four calls per execution
-        # were a third of a coordinator's tool calls on 2026-09-15).
+        # were a third of a coordinator's tool calls on 2026-09-15). `window` is `run` for a
+        # measurement that suspends its box's standing records (see the header).
         request = data
-        dispatch_evidence = "reserved and dispatched in one step (execution run)"
-        if action == "run":
+        dispatch_evidence = ("measurement window opened: reserved and dispatched in one step (execution window)"
+                             if action == "window" else "reserved and dispatched in one step (execution run)")
+        if action in {"run", "window"}:
             request = {k: v for k, v in data.items() if k != "evidence"}
             if "evidence" in data:
                 nonempty(data, ["evidence"])
@@ -348,6 +433,13 @@ def main():
         validate_request(request)
         if request["execution_host"] not in canonical_hosts:
             refuse("execution_host must exactly match a canonical FLEET_BOXES entry")
+        if action == "window":
+            if request["kind"] != "measurement":
+                refuse("a window opens for a measurement: kind must be measurement")
+            if request["execution_host"] != window_box:
+                refuse(f"the window is for {window_box}, but the measurement names {request['execution_host']}")
+        queued = None      # the open window a standing request is admitted suspended by
+        dispatch = action in {"run", "window"}
         if record:
             if record["request"] != request:
                 refuse("request_id already names a different assignment")
@@ -356,20 +448,31 @@ def main():
                 sync_directory(directory)
                 print(json.dumps(record, indent=2))
                 return
-            # A repeated `run` never repeats a launch: the connection that dropped after the
-            # first one may have started the runner. Only a still-reserved own record proceeds.
-            if record["state"] != "reserved":
-                refuse(f"assignment already dispatched (state {record['state']}); reconcile, never run twice")
-            if record["lease_token"] != token:
-                refuse("adopted assignment must be reconciled before dispatch")
-            # The dispatch step, rechecked: a reservation can wait hours for its launch.
-            if record["request"]["kind"] == "measurement":
-                check_lane_lock(record["request"]["execution_host"], map_spec, anchor, lab)
+            if action == "window":
+                # A retried window never dispatches again: it finishes the suspensions below.
+                if not record.get("window"):
+                    refuse("request_id already names a measurement that opened no window")
+                if record["state"] == "concluded":
+                    sync_directory(directory.parent)
+                    sync_directory(directory)
+                    print(json.dumps(record, indent=2))
+                    return
+                dispatch = False
+            else:
+                # A repeated `run` never repeats a launch: the connection that dropped after the
+                # first one may have started the runner. Only a still-reserved own record proceeds.
+                if record["state"] != "reserved":
+                    refuse(f"assignment already dispatched (state {record['state']}); reconcile, never run twice")
+                if record["lease_token"] != token:
+                    refuse("adopted assignment must be reconciled before dispatch")
+                # The dispatch step, rechecked: a reservation can wait hours for its launch.
+                if record["request"]["kind"] == "measurement":
+                    check_lane_lock(record["request"]["execution_host"], map_spec, anchor, lab)
         else:
             halted = halt_identity is not None
             if "triage_reason" in request and not halted:
                 refuse("triage reservations require an active halt")
-            check_capacity(request, records, canonical_hosts, slots_spec)
+            queued = check_capacity(request, records, canonical_hosts, slots_spec, window=action == "window")
             if request["kind"] == "measurement":
                 check_lane_lock(request["execution_host"], map_spec, anchor, lab)
             if halted:
@@ -383,8 +486,10 @@ def main():
                       "lease_token": token, "state": "reserved", "created_at": now, "history": []}
             if "triage_reason" in request:
                 record["halt_identity"] = halt_identity
+            if action == "window":
+                record["window"] = True
             events.append(("reserve", request))
-        if action == "run":
+        if dispatch:
             triage = record["request"].get("triage_reason")
             if triage and (halt_identity is None or halt_generation(record.get("halt_identity")) != halt_identity):
                 refuse("triage assignment belongs to a different or ended halt")
@@ -392,6 +497,22 @@ def main():
                 refuse("fleet halted; ordinary dispatch refused")
             record["state"] = "launching"
             events.append(("dispatch", {"request_id": identity, "evidence": dispatch_evidence}))
+        if queued:
+            # Queued behind the open window rather than refused: restored when it concludes.
+            record["suspended_from"] = record["state"]
+            record["state"] = "suspended"
+            record["suspended_by"] = queued
+            events.append(("suspend", {"request_id": identity, "evidence": f"queued behind measurement window {queued}"}))
+        if action == "window":
+            # The measurement is published first: a crash before the suspensions leaves standing
+            # records outstanding beside it (refused at run time all the same), which a retried
+            # window finishes, never a record suspended by a measurement that does not exist.
+            host = request["execution_host"]
+            for other in records.values():
+                if (other["request_id"] != identity and other["state"] not in {"concluded", "suspended"}
+                        and other["request"]["execution_host"] == host and other["request"].get("standing")):
+                    suspend(other, identity, now, coordinator)
+                    after.append(other)
     else:
         if record is None:
             refuse("unknown request_id")
@@ -417,6 +538,9 @@ def main():
                 print(json.dumps(record, indent=2))
                 return
             refuse("assignment already concluded")
+        if record["state"] == "suspended" and action != "conclude":
+            refuse(f"{identity} is suspended by measurement window {record['suspended_by']}, which restores it "
+                   f"when it concludes; conclude it only once its worker has handed back")
         if action == "dispatch":
             if record["state"] != "reserved":
                 refuse("dispatch requires reserved state; reconcile an uncertain launch")
@@ -451,6 +575,21 @@ def main():
             if data["verdict"] != "not-launched":
                 nonempty({**record, **data}, ["observed_sha", "remote_checkout", "handle"])
             state = "concluded"
+            record.pop("suspended_by", None)
+            record.pop("suspended_from", None)
+            # A window's conclusion, whatever its verdict, restores what it suspended, and those
+            # records are published first: a crash between leaves the window open with some
+            # records restored early (refused at run time all the same), never a record suspended
+            # by a concluded measurement.
+            for other in records.values():
+                if other["state"] == "suspended" and other.get("suspended_by") == identity:
+                    other["state"] = other.pop("suspended_from")
+                    del other["suspended_by"]
+                    other["updated_at"] = now
+                    other["history"].append({"at": now, "coordinator": coordinator, "action": "restore", "data": {
+                        "request_id": other["request_id"],
+                        "evidence": f"measurement window {identity} concluded {data['verdict']}"}})
+                    before.append(other)
         else:
             refuse("unknown operation")
         if "observed_sha" in data and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", data["observed_sha"]):
@@ -461,24 +600,28 @@ def main():
                 record[key] = data[key]
         record["state"] = state
         events.append((action, data))
-    record["updated_at"] = now
-    for event_action, event_data in events:
-        record["history"].append({"at": now, "coordinator": coordinator, "action": event_action, "data": event_data})
-    directory.mkdir(exist_ok=True)
-    # Sync even on retry: an earlier failed sync may have left the new directory visible.
-    sync_directory(directory.parent)
-    fd, temporary = tempfile.mkstemp(prefix=".execution-", dir=directory)
-    try:
-        with os.fdopen(fd, "w") as stream:
-            json.dump(record, stream, indent=2)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, directory / (identity + ".json"))
+    for other in before:
+        publish(directory, other)
+    if events:
+        record["updated_at"] = now
+        for event_action, event_data in events:
+            record["history"].append({"at": now, "coordinator": coordinator, "action": event_action, "data": event_data})
+        publish(directory, record)
+    else:
+        # A retried window: its record stands as it was written.
+        sync_directory(directory.parent)
         sync_directory(directory)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    for other in after:
+        publish(directory, other)
+    host = record["request"]["execution_host"]
+    if before:
+        print(f"EXECUTION WINDOW {host}: {identity} concluded; restored "
+              + ", ".join(f"{r['request_id']} ({r['state']})" for r in before), file=sys.stderr)
+    if action == "window":
+        suspended = sorted(r["request_id"] for r in records.values()
+                           if r.get("suspended_by") == identity and r["state"] == "suspended")
+        print(f"EXECUTION WINDOW {host}: {identity} open; suspended "
+              + (", ".join(suspended) or "nothing (no standing reservation on the box)"), file=sys.stderr)
     print(json.dumps(record, indent=2))
 
 

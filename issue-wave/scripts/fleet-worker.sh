@@ -118,6 +118,8 @@
 #                          # `execution slot` inside it runs under the hold instead of refusing
 #   fleet-worker.sh execution reserve|dispatch|record|reconcile|conclude <json-file>
 #   fleet-worker.sh execution run <json-file>          # reserve + dispatch in one step
+#   fleet-worker.sh execution window <box> <json-file> # `run` for a measurement that suspends the
+#                          # box's standing reservations, restored when it concludes
 #   fleet-worker.sh execution conclude --from-run <run-dir> --request <id> --sha <sha>
 #                          [--box <box>] [--evidence <text>]   # verdict, log and checkout read from a
 #                                                     # test-run.sh record on the reserved box
@@ -2975,7 +2977,7 @@ RUN_PY
 inhibitor_path() { type -P -- "$INHIBIT" 2>/dev/null || true; }
 
 cmd_execution_slot() {
-  local wait=600 kind="" box cap tokens listing rc measuring dir helper probe="" bg="" here
+  local wait=600 kind="" box cap tokens listing rc measuring window dir helper probe="" bg="" here
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --probe) probe=1 ;;
@@ -3061,7 +3063,10 @@ cmd_execution_slot() {
   [ "$rc" -eq 0 ] || { printf '%s\n' "$listing"; echo "EXECUTION SLOT REFUSED $box: the anchor's registry could not be read"; exit 1; }
   measuring=$(jq -r --arg box "$box" \
     '[.[] | select(.state != "concluded" and .request.execution_host == $box and .request.kind == "measurement")
-       | .request_id] | join(", ")' <<<"$listing") ||
+       | .request_id] | join(", ")' <<<"$listing") &&
+  window=$(jq -r --arg box "$box" \
+    '[.[] | select(.state != "concluded" and .request.execution_host == $box and .request.kind == "measurement"
+                   and .window == true) | .request_id] | join(", ")' <<<"$listing") ||
     { echo "EXECUTION SLOT REFUSED $box: the anchor's registry did not parse"; exit 1; }
   # THE MEASUREMENT'S OWN RUN (at `execution hold`): inside the hold of the one measurement
   # outstanding here, the batch is that measurement's, so it runs under the hold -- no slot, no
@@ -3077,6 +3082,9 @@ cmd_execution_slot() {
       *) echo "EXECUTION SLOT REFUSED $box: the measurement check answered '$judged'"; exit 1 ;;
     esac
   fi
+  # THE MEASUREMENT WINDOW (ludics-lite#481): the refusal names it, so a worker whose standing
+  # reservation it suspended knows to retry once it closes rather than to debug or to request.
+  [ -z "$window" ] || { echo "EXECUTION SLOT REFUSED $box: measurement window $window is open on $box, and holds the box exclusively; standing reservations here are suspended until it concludes, so retry this batch then (no request needed); only a batch inside its own \`execution hold --request <id>\` runs there"; exit 1; }
   [ -z "$measuring" ] || { echo "EXECUTION SLOT REFUSED $box: a measurement holds the box exclusively ($measuring); only a batch inside its own \`execution hold --request <id>\` runs there"; exit 1; }
   mkdir -p "$dir" || die "execution slot: cannot create the slot directory $dir"
   exec python3 -c "$(run_py)" slot "$box" "$dir" "$cap" "$tokens" "${kind#--}" "$wait" "$(inhibitor_path)" "$@"
@@ -3224,11 +3232,18 @@ cmd_execution() {
       [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
       payload=$(cat "$2") || die "execution: cannot read payload"
       check_identity ;;
-    *) die "execution: list, slot -- <command>, hold -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, or conclude --from-run|--from-bg-run <run-dir> --request <id>" ;;
+    # THE MEASUREMENT WINDOW (ludics-lite#481; the registry rules are fleet-execution.py's header):
+    # the box is named apart from the payload so the call says which box's standing reservations
+    # it suspends, and the registry refuses a payload measuring on any other.
+    window)
+      [ "$#" -eq 3 ] && [ -n "$2" ] && [ -r "$3" ] || die "execution window <box> <measurement reserve.json>: a box and a readable JSON file required"
+      payload=$(jq -c --arg box "$2" '{box: $box, request: .}' "$3") || die "execution window: $3 is not a JSON reservation"
+      check_identity ;;
+    *) die "execution: list, slot -- <command>, hold -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, window <box> <json-file>, or conclude --from-run|--from-bg-run <run-dir> --request <id>" ;;
   esac
   local helper out rc map=""; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
   [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
-  case "$action" in reserve|run|dispatch) map=$(endpoint_map) || exit 1 ;; esac
+  case "$action" in reserve|run|dispatch|window) map=$(endpoint_map) || exit 1 ;; esac
   out=$({
     prelude "$ANCHOR"
     if [ "$action" != list ]; then lease_mutation_prelude; else printf 'shift 3\n'; fi
@@ -3241,7 +3256,7 @@ EXECUTION_COMMAND
     "$(fleet_name "$ANCHOR")" "$(fleet_name "$LAB_HOST")"); rc=$?
   [ -z "$out" ] || printf '%s\n' "$out"
   if unreachable "$rc"; then echo "EXECUTION UNREACHABLE $ANCHOR: outcome unknown; reconcile before retrying dispatch"; exit 4; fi
-  if [ "$rc" -eq 0 ]; then case "$action" in run|dispatch) execution_refresh "$out" >&2 ;; esac; fi
+  if [ "$rc" -eq 0 ]; then case "$action" in run|dispatch|window) execution_refresh "$out" >&2 ;; esac; fi
   exit "$rc"
 }
 

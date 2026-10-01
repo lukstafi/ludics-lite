@@ -610,6 +610,171 @@ def lab_host_identity():
 lab_host_identity()
 
 
+# ludics-lite#481: the measurement window. `execution window <box>` reserves and dispatches a
+# measurement on a box whose outstanding records are all standing, suspends those (a state of their
+# own, naming the window), and the measurement's conclusion restores them whatever its verdict.
+def measurement_window():
+    with tempfile.TemporaryDirectory(prefix='fleet-window-') as temporary:
+        root = Path(temporary)
+        env = {**os.environ, 'FLEET_ANCHOR': 'local', 'FLEET_LOCAL_BOX': 'fixture',
+               'ISSUE_WAVE_STATE': str(root), 'FLEET_ANCHOR_STATE': str(root),
+               'FLEET_COORDINATOR': 'first', 'FLEET_LOCK_WAIT': '10', 'FLEET_BOXES': 'mac rog'}
+        env.pop('FLEET_BOX_CORRECTNESS_SLOTS', None)
+
+        def run(*args, expected=0, owner='first'):
+            result = subprocess.run(['bash', str(SCRIPT), *args], env={**env, 'FLEET_COORDINATOR': owner},
+                                    text=True, capture_output=True, timeout=20)
+            assert result.returncode == expected, (args, result.returncode, result.stdout, result.stderr)
+            return result.stdout, result.stderr
+
+        def payload(data):
+            stream = tempfile.NamedTemporaryFile(mode='w', dir=root, suffix='.input', delete=False)
+            json.dump(data, stream)
+            stream.close()
+            return stream.name
+
+        def change(action, data, expected=0, owner='first'):
+            return run('execution', action, payload(data), expected=expected, owner=owner)
+
+        def window(data, box='mac', expected=0, owner='first'):
+            return run('execution', 'window', box, payload(data), expected=expected, owner=owner)
+
+        def request(identity, host='mac', kind='correctness', standing=False):
+            data = dict(request_id=identity, wave='wave', worker=identity, transport='subagent',
+                        issue='repo#481', purpose='fixture', agent_host='mac', execution_host=host,
+                        repository='owner/repo', requested_revision='origin/main', kind=kind)
+            return {**data, 'standing': True} if standing else data
+
+        def records():
+            return {r['request_id']: r for r in json.loads(run('execution', 'list')[0])}
+
+        def done(identity, verdict='pass', owner='first'):
+            result = dict(request_id=identity, verdict=verdict, evidence='runner terminal record; process stopped',
+                          log='/logs/' + identity)
+            if verdict != 'not-launched':
+                result.update(observed_sha='c' * 40, remote_checkout='/work/' + identity, handle='runner-' + identity)
+            return change('conclude', result, owner=owner)
+
+        run('claim')
+        change('run', request('iterate-a', standing=True))           # launching
+        change('reserve', request('iterate-b', standing=True))       # reserved
+        change('run', request('iterate-rog', 'rog', standing=True))  # another box: never suspended
+        # A plain measurement is still refused beside standing records, and says what opens the box.
+        out, err = change('run', request('plain', kind='measurement'), expected=1)
+        assert 'measurement needs mac to itself; every one is standing' in err and 'execution window' in err, err
+        # The window is for a measurement, on the box it names, beside nothing but standing records.
+        out, err = window(request('not-measure'), expected=1)
+        assert 'kind must be measurement' in err, err
+        out, err = window(request('elsewhere', 'rog', kind='measurement'), expected=1)
+        assert 'the window is for mac, but the measurement names rog' in err, err
+        out, err = run('execution', 'window', 'mac', expected=2)
+        assert 'execution window <box> <measurement reserve.json>' in err, err
+        change('run', request('assigned'))
+        out, err = window(request('blocked', kind='measurement'), expected=1)
+        assert 'request=assigned' in err and 'suspends only standing reservations' in err, err
+        assert {'not-measure', 'elsewhere', 'blocked'}.isdisjoint(records())
+        done('assigned')
+        before = records()
+
+        def open_window(identity, owner='first'):
+            out, err = window({**request(identity, kind='measurement'), 'evidence': 'invoking the runner'}, owner=owner)
+            record = json.loads(out)
+            assert record['request_id'] == identity and record['window'] is True, record
+            assert record['state'] == 'launching', record
+            assert [e['action'] for e in record['history']] == ['reserve', 'dispatch'], record['history']
+            return err
+
+        err = open_window('window-1')
+        assert 'EXECUTION WINDOW mac: window-1 open; suspended iterate-a, iterate-b' in err, err
+        now = records()
+        for name, former in [('iterate-a', 'launching'), ('iterate-b', 'reserved')]:
+            r = now[name]
+            assert (r['state'], r['suspended_by'], r['suspended_from']) == ('suspended', 'window-1', former), r
+            assert r['history'][-1]['action'] == 'suspend' and r['lease_token'] == before[name]['lease_token'], r
+        assert now['iterate-rog'] == before['iterate-rog']
+        # Routine supervision tells a suspended reservation apart, and names its window.
+        compact = {r['request_id']: r for r in json.loads(run('execution', 'list', '--active', '--compact')[0])}
+        assert compact['iterate-a']['state'] == 'suspended' and compact['iterate-a']['suspended_by'] == 'window-1'
+        assert compact['iterate-rog']['state'] == 'launching' and 'suspended_by' not in compact['iterate-rog']
+        assert compact['window-1']['window'] is True and 'history' not in compact['window-1']
+        # One window at a time: a second is refused naming the open one, and nothing else gets in.
+        out, err = window(request('window-x', kind='measurement'), expected=1)
+        assert 'measurement window window-1 is already open on mac' in err, err
+        out, err = change('run', request('during'), expected=1)
+        assert 'a measurement holds mac exclusively' in err, err
+        # A standing reservation taken during the window is queued into it, not refused.
+        out, err = change('run', request('iterate-c', standing=True))
+        queued = json.loads(out)
+        assert (queued['state'], queued['suspended_by'], queued['suspended_from']) == ('suspended', 'window-1', 'launching'), queued
+        assert [e['action'] for e in queued['history']] == ['reserve', 'dispatch', 'suspend'], queued['history']
+        # The window owns a suspended record's state: no dispatch, record or reconcile.
+        for action, extra in [('dispatch', {}), ('record', {'state': 'running'}), ('reconcile', {'state': 'reserved'})]:
+            out, err = change(action, dict(request_id='iterate-b', evidence='fixture', **extra), expected=1)
+            assert 'iterate-b is suspended by measurement window window-1' in err, (action, err)
+        # A retried window never dispatches again, and finishes a suspension a crash left undone.
+        partial = json.loads((root / 'executions' / 'iterate-b.json').read_text())
+        (root / 'executions' / 'iterate-b.json').write_text(json.dumps(before['iterate-b']))
+        out, err = window({**request('window-1', kind='measurement'), 'evidence': 'invoking the runner'})
+        assert json.loads(out) == records()['window-1'] and 'suspended iterate-a, iterate-b, iterate-c' in err, err
+        assert records()['iterate-b']['state'] == 'suspended'
+        assert [e['action'] for e in records()['window-1']['history']] == ['reserve', 'dispatch']
+        assert partial['suspended_from'] == records()['iterate-b']['suspended_from']
+        # A worker handing back mid-window concludes its suspended reservation, which then stays so.
+        done('iterate-c', 'not-launched')
+        assert 'suspended_by' not in records()['iterate-c']
+        # Adoption: the window and its suspensions survive `claim --take`, and the new coordinator's
+        # conclusion of the measurement restores them.
+        run('claim', '--take', owner='second')
+        survived = records()
+        assert survived['window-1']['state'] == 'launching'
+        assert all(survived[n]['state'] == 'suspended' for n in ['iterate-a', 'iterate-b'])
+        out, err = done('window-1', 'pass', owner='second')
+        assert 'EXECUTION WINDOW mac: window-1 concluded; restored iterate-a (launching), iterate-b (reserved)' in err, err
+        after = records()
+        assert after['iterate-c']['state'] == 'concluded'
+        for name, former in [('iterate-a', 'launching'), ('iterate-b', 'reserved')]:
+            r = after[name]
+            assert r['state'] == former and 'suspended_by' not in r and 'suspended_from' not in r, r
+            assert r['history'][-1]['action'] == 'restore', r['history']
+            assert r['history'][-1]['data']['evidence'] == 'measurement window window-1 concluded pass', r['history']
+        # No new request ids: the same records, restored. And a restored record works again.
+        assert set(after) - set(before) == {'window-1', 'iterate-c'}, set(after)
+        change('reconcile', dict(request_id='iterate-b', state='reserved', evidence='adopted; nothing ran'), owner='second')
+        change('dispatch', dict(request_id='iterate-b', evidence='fixture dispatch'), owner='second')
+        run('claim', '--take')
+        change('reconcile', dict(request_id='iterate-b', state='running', evidence='adopted back'))
+        # Suspend and restore across every other conclusion.
+        for verdict in ['fail', 'timeout', 'cancelled', 'not-launched']:
+            open_window('window-' + verdict)
+            assert all(records()[n]['state'] == 'suspended' for n in ['iterate-a', 'iterate-b'])
+            out, err = done('window-' + verdict, verdict)
+            assert f'window-{verdict} concluded; restored iterate-a (launching), iterate-b (running)' in err, err
+            assert records()['iterate-b']['history'][-1]['data']['evidence'].endswith('concluded ' + verdict)
+        # Each box's window is its own; a box with no standing record left opens one suspending nothing.
+        out, err = window(request('window-rog', 'rog', kind='measurement'), box='rog')
+        assert 'EXECUTION WINDOW rog: window-rog open; suspended iterate-rog' in err, err
+        assert records()['iterate-a']['state'] == 'launching'
+        done('iterate-rog', 'not-launched')
+        out, err = done('window-rog')
+        assert 'restored' not in err, err
+        out, err = window(request('window-rog-2', 'rog', kind='measurement'), box='rog')
+        assert 'suspended nothing (no standing reservation on the box)' in err, err
+        done('window-rog-2', 'not-launched')
+        # The registry refuses a malformed suspension rather than read past it.
+        path = root / 'executions' / 'iterate-a.json'
+        good = path.read_bytes()
+        for fields in [dict(state='suspended', suspended_by='window-1'),
+                       dict(suspended_by='window-1', suspended_from='launching')]:
+            path.write_text(json.dumps({**json.loads(good), **fields}))
+            out, err = run('execution', 'list', '--active', '--compact', expected=1)
+            assert 'suspended_from must be a nonempty string' in err or 'suspension fields on a record' in err, err
+        path.write_bytes(good)
+    print('PASS: measurement window: suspend, restore on every verdict, queue, adoption, one at a time')
+
+
+measurement_window()
+
+
 # Exercise real fsync calls and their publication order, including first directory creation.
 import runpy
 import stat
