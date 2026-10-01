@@ -56,6 +56,10 @@
 # so; the workflow reports every exit but 0 and 3, naming which. A belief this repository
 # cannot check prints as `skip`, with the reason, so the unpinned set is visible in every run
 # rather than assumed away.
+#
+# This script's own logic — which claims pin and which skip, the read guards, how a failed read is
+# sorted, the cleanup on exit — is pinned by test-pr-review-api-contract.sh against a fixture world
+# (ludics-lite#91): a belief added or reworded here changes that suite's expected verdict list too.
 
 set -euo pipefail
 
@@ -232,6 +236,14 @@ skip() { # <belief> <why>
 }
 
 section() { printf '\n== %s\n' "$*"; }
+
+# The fixture suite (test-pr-review-api-contract.sh) loads everything above — the helpers, the
+# scratch directory and the EXIT trap that removes it — without the reads below: sourced with
+# CONTRACT_TEST_SOURCE_ONLY=1, this file ends here (ludics-lite#91). pr-review.sh's own
+# SHIP_PR_TEST_SOURCE_ONLY cannot serve, since this file exports it itself to source the library.
+if [ "${CONTRACT_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0 2>/dev/null || { echo "pr-review-api-contract.sh: CONTRACT_TEST_SOURCE_ONLY=1 is for sourcing this file, not running it" >&2; exit 2; }
+fi
 
 # --- the anchors ------------------------------------------------------------------------------
 section "anchors on $REPO"
