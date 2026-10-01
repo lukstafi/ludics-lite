@@ -2483,7 +2483,57 @@ expect "execution hold runs a measurement's runner under the inhibitor while the
   "${FWI[@]}" execution hold -- echo measured
 grep -Fxq -- "--what=sleep:idle --mode=block --who=fleet-worker --why=testbox hold: echo measured $HELPER_ARGV" "$INHIBIT_LOG" && ok "...the same block inhibitor the slot takes" || ko "hold did not take the block inhibitor: $(cat "$INHIBIT_LOG")"
 expect "...beside a slot that is refused for that very measurement" 1 "a measurement holds the box exclusively (hold-measure)" -- "${FWI[@]}" execution slot -- echo during
+# THE MEASUREMENT'S OWN RUN (ludics-lite#480): a runner that takes the slot itself (OCANNL's
+# tools/test-run.sh) inside its own measurement's `hold --request` runs under that hold, with no
+# slot taken; every batch the registry and the hold's lock do not confirm is still refused.
+: > "$INHIBIT_LOG"
+expect "a slot inside its own measurement's hold runs under that hold instead of being refused" 0 "inside measurement hold-measure, held by an enclosing .execution hold.; no slot taken, for: echo own-run" -- \
+  "${FWI[@]}" execution hold --request hold-measure -- "$FW" execution slot -- echo own-run
+grep -q "^own-run$" <<<"$out" && ok "...and its command ran" || ko "the measurement's own batch did not run: $out"
+grep -Eq "slot [0-9]+ of [0-9]+ held|REFUSED" <<<"$out" && ko "the measurement's own batch took a slot or was refused: $out" || ok "...taking no slot"
+[ "$(grep -c -- "--what=sleep:idle" "$INHIBIT_LOG")" -eq 1 ] && grep -Fq -- "--why=testbox measurement hold-measure hold: " "$INHIBIT_LOG" &&
+  ok "...under the hold's one sleep guard, which names the measurement" || ko "the measurement's own batch took a second guard, or the hold's names no measurement: $(cat "$INHIBIT_LOG")"
+expect "...and the probe inside that hold reports it" 0 "^EXECUTION SLOT PROBE testbox 1 1 measurement hold-measure$" -- \
+  "${FWS[@]}" execution hold --request hold-measure -- "$FW" execution slot --probe
+expect "...as does a slot nested a level deeper, through a shell" 0 "^deeper$" -- \
+  "${FWS[@]}" execution hold --request hold-measure -- sh -c '"$1" execution slot -- "$1" execution slot -- echo deeper' _ "$FW"
+"${FWS[@]}" execution hold --request hold-measure -- sleep 30 > "$TMP/hold-m0.log" 2>&1 &
+m0=$!
+if held "$TMP/hold-m0.log" "measurement hold-measure held"; then
+  expect "an independent batch beside the live hold, with no marker, is still refused" 1 "a measurement holds the box exclusively (hold-measure); only a batch inside its own" -- \
+    "${FWS[@]}" execution slot -- echo independent
+  expect "...and its probe reports no measurement" 0 "^EXECUTION SLOT PROBE testbox 1 1$" -- "${FWS[@]}" execution slot --probe
+fi
+kill -9 "$m0" 2>/dev/null; wait "$m0" 2>/dev/null
+expect "a marker naming another box is not confirmed, and the batch is refused" 1 "FLEET_MEASUREMENT_HELD='other hold-measure' does not cover this batch (another box's)" -- \
+  "${FWS[@]}" execution hold --request hold-measure -- env FLEET_MEASUREMENT_HELD="other hold-measure" "$FW" execution slot -- echo other-box
+grep -q "a measurement holds the box exclusively (hold-measure)" <<<"$out" && ok "...by the measurement" || ko "the other box's marker was not refused by the measurement: $out"
+expect "a marker naming an unknown request is not confirmed, and the batch is refused" 1 "the registry has no outstanding measurement no-such-request on testbox" -- \
+  "${FWS[@]}" execution hold --request no-such-request -- "$FW" execution slot -- echo unknown
+grep -q "a measurement holds the box exclusively (hold-measure)" <<<"$out" && ok "...by the measurement" || ko "the unknown request's marker was not refused by the measurement: $out"
+expect "a marker no live hold backs (copied by hand, or outliving its hold) is not confirmed" 1 "no .execution hold --request. is live on testbox" -- \
+  env FLEET_MEASUREMENT_HELD="testbox hold-measure" "${FWS[@]}" execution slot -- echo stale
+expect "...nor a malformed one" 1 "FLEET_MEASUREMENT_HELD='testbox' does not cover this batch (malformed)" -- \
+  "${FWS[@]}" execution hold --request hold-measure -- env FLEET_MEASUREMENT_HELD="testbox" "$FW" execution slot -- echo malformed
+expect "...and the probe reports neither" 0 "^EXECUTION SLOT PROBE testbox 1 1$" -- env FLEET_MEASUREMENT_HELD="testbox hold-measure" "${FWS[@]}" execution slot --probe
+mkdir -p "$TMP/slot-nolock/testbox/measurement.lock"
+expect "a hold whose lock cannot be taken still runs the measurement, saying so" 0 "WARNING: no measurement marker" -- \
+  env FLEET_SLOT_STATE="$TMP/slot-nolock" "${FWS[@]}" execution hold --request hold-measure -- echo measured-unlocked
+grep -q "^measured-unlocked$" <<<"$out" && ok "...and the runner ran" || ko "the unlocked hold did not run its command: $out"
+expect "...while a slot inside it, with no marker, is refused" 1 "a measurement holds the box exclusively (hold-measure)" -- \
+  env FLEET_SLOT_STATE="$TMP/slot-nolock" "${FWS[@]}" execution hold --request hold-measure -- "$FW" execution slot -- echo x
 fixture_done hold-measure
+"${FWS[@]}" execution run "$(slotreq hold-measure-2 measurement)" >/dev/null || ko "could not reserve the second measurement (setup)"
+expect "a marker naming a concluded measurement is not confirmed beside an outstanding one" 1 "the registry has no outstanding measurement hold-measure on testbox" -- \
+  "${FWS[@]}" execution hold --request hold-measure -- "$FW" execution slot -- echo concluded
+grep -q "a measurement holds the box exclusively (hold-measure-2)" <<<"$out" && ok "...and the batch is refused by that one" || ko "the concluded request's marker was not refused: $out"
+fixture_done hold-measure-2
+expect "...and with nothing outstanding the batch takes a slot as usual" 0 "slot 1 of 1 held for: echo after-measurements" -- \
+  "${FWS[@]}" execution hold --request hold-measure -- "$FW" execution slot --wait 0 -- echo after-measurements
+grep -q "does not cover this batch (the registry has no outstanding measurement hold-measure" <<<"$out" && ok "...saying the marker does not cover it" || ko "the ignored marker was not reported: $out"
+expect "execution hold --request needs a request id" 2 "--request takes the measurement's request id" -- "${FWS[@]}" execution hold --request "../x" -- true
+expect "...and this host's fleet name, which the marker names" 2 "--request needs this host's fleet name" -- \
+  env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=testbox" "$FW" execution hold --request hold-measure -- true
 expect "execution hold --why names the holder in the inhibitor" 0 "held for: rog run 7" -- "${FWI[@]}" execution hold --why "rog run 7" -- true
 expect "execution hold passes the command's own status through" 5 "held for" -- "${FWI[@]}" execution hold -- sh -c 'exit 5'
 expect "...a signal death's too, which a systemd-inhibit wrapper would have turned into 1" 143 "held for" -- "${FWI[@]}" execution hold -- sh -c 'kill -TERM $$'
@@ -2493,7 +2543,7 @@ expect "...and so does the slot" 127 "EXECUTION SLOT REFUSED testbox: cannot run
 expect "execution hold runs bare where there is no systemd-inhibit" 0 "^bare-hold$" -- "${FWS[@]}" execution hold -- echo bare-hold
 expect "execution hold refuses a command that cannot be run" 127 "EXECUTION HOLD REFUSED testbox: cannot run /nonexistent/runner" -- "${FWS[@]}" execution hold -- /nonexistent/runner
 expect "execution hold needs a command after --" 2 "a command to hold the box around is required" -- "${FWS[@]}" execution hold --
-expect "execution hold takes no slot options" 2 "execution hold .--why <text>. -- <command>" -- "${FWS[@]}" execution hold --wait 5 -- true
+expect "execution hold takes no slot options" 2 "execution hold .--why <text>. .--request <id>. -- <command>" -- "${FWS[@]}" execution hold --wait 5 -- true
 expect "execution slot needs a command after --" 2 "a command to hold the slot around is required" -- "${FWS[@]}" execution slot --
 expect "execution slot refuses a non-numeric --wait" 2 "whole number of seconds" -- "${FWS[@]}" execution slot --wait soon -- echo x
 expect "execution slot takes no --box: the slot is this box's own" 2 "execution slot .--bg <parent>. .--wait <seconds>. .--cpu|--gpu. -- <command>" -- "${FWS[@]}" execution slot --box other -- echo x

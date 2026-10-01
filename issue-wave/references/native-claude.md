@@ -94,8 +94,9 @@ and a release through five PRs on 2026-09-15 with no stranded worker.
    `fleet-worker.sh execution slot -- <command>`, which is what bounds the box's
    concurrent load. An exclusively reserved measurement runs the bounded project runner directly,
    without `execution slot`, as [executions.md](executions.md#reserve-launch-observe-conclude)
-   specifies: under `fleet-worker.sh execution hold -- <command>`, the OS-level sleep guard
-   alone. The worker blocks on either kind to completion within the turn ([Blocking on a
+   specifies: under `fleet-worker.sh execution hold --request <request_id> -- <command>`, the
+   OS-level sleep guard alone, inside which a runner's own `execution slot` runs instead of
+   being refused. The worker blocks on either kind to completion within the turn ([Blocking on a
    run](#blocking-on-a-run)), and ends that turn with one fixed line,
    so the coordinator concludes without grepping run ids out of prose:
 
