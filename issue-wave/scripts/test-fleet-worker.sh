@@ -2516,6 +2516,12 @@ expect "a marker no live hold backs (copied by hand, or outliving its hold) is n
 expect "...nor a malformed one" 1 "FLEET_MEASUREMENT_HELD='testbox' does not cover this batch (malformed)" -- \
   "${FWS[@]}" execution hold --request hold-measure -- env FLEET_MEASUREMENT_HELD="testbox" "$FW" execution slot -- echo malformed
 expect "...and the probe reports neither" 0 "^EXECUTION SLOT PROBE testbox 1 1$" -- env FLEET_MEASUREMENT_HELD="testbox hold-measure" "${FWS[@]}" execution slot --probe
+mkdir -p "$TMP/slot-nolock/testbox/measurement.lock"
+expect "a hold whose lock cannot be taken still runs the measurement, saying so" 0 "WARNING: no measurement marker" -- \
+  env FLEET_SLOT_STATE="$TMP/slot-nolock" "${FWS[@]}" execution hold --request hold-measure -- echo measured-unlocked
+grep -q "^measured-unlocked$" <<<"$out" && ok "...and the runner ran" || ko "the unlocked hold did not run its command: $out"
+expect "...while a slot inside it, with no marker, is refused" 1 "a measurement holds the box exclusively (hold-measure)" -- \
+  env FLEET_SLOT_STATE="$TMP/slot-nolock" "${FWS[@]}" execution hold --request hold-measure -- "$FW" execution slot -- echo x
 fixture_done hold-measure
 "${FWS[@]}" execution run "$(slotreq hold-measure-2 measurement)" >/dev/null || ko "could not reserve the second measurement (setup)"
 expect "a marker naming a concluded measurement is not confirmed beside an outstanding one" 1 "the registry has no outstanding measurement hold-measure on testbox" -- \
