@@ -89,9 +89,11 @@ roughly every other call returning `503 No server is currently available`) a sin
 coin flip, so the script retries every call — 4 tries, 5s doubling to 20s, on 5xx and that body,
 never on a 4xx, on a GraphQL error no retry can change (a node or page limit, an unknown field, a
 parse error), or on gh refusing a `retry` call's own arguments (an unknown flag or `--json` field:
-exit 2, since nothing was sent). Two rules follow, and they are worth holding even when you step outside the script.
-Read its **exit codes**: `0` did it, `1` the fact does not hold, `2` your invocation is wrong, `3`
-the API never answered. And never restate a `3` as a finding — "no such thread", "no new activity",
+exit 2, since nothing was sent). gh refusing an argument the script itself sends (a field or flag
+a gh upgrade renamed) stops the command with exit 2 too: re-running cannot change it, so do not
+re-arm; update gh or the script. Two rules follow, and they are worth holding even when you step outside the script.
+Read its **exit codes**: `0` did it, `1` the fact does not hold, `2` your invocation is wrong (or
+the installed gh refused the script's own), `3` the API never answered. And never restate a `3` as a finding — "no such thread", "no new activity",
 "not approved" are claims about the PR, and an unanswered call supports none of them. That
 conflation is not hypothetical: the pre-retry script reported `no review thread starts at comment
 N` for three threads that existed, because its paginated GraphQL lookup had 503'd.

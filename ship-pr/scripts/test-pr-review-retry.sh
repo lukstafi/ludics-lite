@@ -17,7 +17,10 @@
 # attempt, while a gateway failure and the near-misses outside the allowlist still retry to exit 3.
 # And gh's own refusal of a caller's arguments (ludics-lite#452): `gh pr view 1 --json nosuchfield`
 # sends nothing, yet was retried four times and reported as exit 3. Those bodies are verbatim too,
-# and each must exit 2 on its first attempt, while their near-misses still retry to exit 3.
+# and each must exit 2 on its first attempt, while their near-misses still retry to exit 3 (Cobra's
+# flag-syntax and minimum-count refusals and the `discussion` path joined in ludics-lite#468). And
+# gh refusing an argument the SCRIPT sends (ludics-lite#471: a gh upgrade renaming a field) stops the
+# whole command with exit 2, where it used to retry to exit 3 and leave `watch` re-arming forever.
 
 set -euo pipefail
 
@@ -120,6 +123,9 @@ reset_fixture() {
   REPO=""
   AWAIT_WAIT=""
   : >"$CALL_LOG"
+  # A case's refusal of the script's own call stops every later call in this process, which is
+  # the point of it (ludics-lite#471), so the next case starts without one.
+  rm -f "$GH_REFUSED_FILE"
 }
 
 # cmd_run_watch in a command substitution: its refusals call `exit`, and a subshell is what keeps
@@ -442,6 +448,14 @@ test_a_client_refusal_is_a_usage_error() {
     $'unknown command "nosuchcmd" for "gh pr"\n\nUsage:  gh pr <command> [flags]'
     # gh label nosuchcmd
     'unknown command "nosuchcmd" for "gh label"'
+    # gh pr list --repo lukstafi/ludics-lite --=x (ludics-lite#468: Cobra's flag-syntax refusal)
+    $'bad flag syntax: --=x\n\nList pull requests in a GitHub repository. By default, this only lists open PRs.'
+    # gh pr list --repo lukstafi/ludics-lite ---x
+    'bad flag syntax: ---x'
+    # gh release upload --repo lukstafi/ludics-lite (Cobra's minimum-count refusal)
+    'requires at least 2 arg(s), only received 0'
+    # gh release upload v0 --repo lukstafi/ludics-lite
+    'requires at least 2 arg(s), only received 1'
   )
   retune API_ATTEMPTS=3
   for mode in --read --write; do
@@ -473,6 +487,8 @@ test_a_client_refusal_near_miss_still_retries() {
     'unknown flag: --foo bar'
     $'failed to parse jq expression (line 1, column 3)\n    .[\n      ^  unexpected EOF'
     $'flags required when not running interactively\n'
+    'gh: bad flag syntax: --=x'
+    'requires at least 2 arg(s), only received 0 (HTTP 502)'
   )
   retune API_ATTEMPTS=3
   for body in "${bodies[@]}"; do
@@ -509,7 +525,7 @@ test_a_delegating_command_refusal_is_not_read() {
     assert_not_contains "$RETRY_OUT" "sent nothing" "nothing is claimed about what was sent ($spec)"
   done
   for spec in 'project list --owner o --foo_bar' 'label nosuchcmd' 'api repos/o/r --later' \
-    'issue comment 1 --later'; do
+    'issue comment 1 --later' 'discussion list --repo o/r --later'; do
     read -r -a cmd <<<"$spec"
     reset_fixture
     CLIENT_ERROR='unknown flag: --later'
@@ -519,20 +535,88 @@ test_a_delegating_command_refusal_is_not_read() {
   done
 }
 
-# The scope: only `retry` reads a caller's arguments this way. The script's own calls keep the
-# classification they had, so a refusal there is still retried to exit 3 — the one this suite can
-# pin without asserting what those callers should say instead.
-test_the_scripts_own_calls_keep_their_classification() {
-  local rc
-  reset_fixture
+# --- gh refusing this script's own arguments (ludics-lite#471) -------------------------------
+
+# Inside the process: a refusal of an argument the script itself sends is a gh/script version
+# mismatch, so the call is not retried, the caller's verdict is not printed over it, and nothing
+# after it calls gh. Sourced, there is no main to signal, so the caller's `fail` is the exit 2.
+OWN_REFUSAL='Unknown JSON field: "status"'
+test_the_scripts_own_refused_call_is_exit_2() {
+  local rc out
   retune API_ATTEMPTS=3
-  CLIENT_ERROR=$'Unknown JSON field: "nosuchfield"\nAvailable fields:\n  additions'
+  # The issue's fixture: the run await's own read, fed an unknown JSON field.
+  reset_fixture
+  CLIENT_ERROR=$'Unknown JSON field: "status"\nAvailable fields:\n  attempt'
+  run_await example/repo#4242
+  assert_eq "$AWAIT_RC" 2 "the await's refused read is exit 2 ($AWAIT_OUT)"
+  assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "on its first attempt"
+  assert_contains "$AWAIT_OUT" "refused this script's own call, which sent nothing: gh run view 4242" \
+    "the message names the refused invocation"
+  assert_contains "$AWAIT_OUT" "-> $OWN_REFUSAL. That is a version mismatch" "and quotes gh's refusal"
+  assert_not_contains "$AWAIT_OUT" "UNKNOWN" "it is not transport"
+  assert_not_contains "$AWAIT_OUT" "attempts" "and no retry count is reported"
+  # The merge write, under the write policy: refused, not ambiguous, and not re-sent.
+  reset_fixture
+  CLIENT_ERROR="$OWN_REFUSAL"
   set +e
-  (gh_retry read pr view 1 --repo example/repo --json nosuchfield) >/dev/null 2>&1
+  out=$(gh_retry write pr merge 7 --repo example/repo --merge --match-head-commit abc 2>&1)
   rc=$?
   set -e
-  assert_eq "$rc" 3 "an internal read is retried as before"
-  assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "on every attempt"
+  assert_eq "$rc" 2 "a refused merge call is exit 2 ($out)"
+  assert_contains "$out" "gh pr merge 7 --repo example/repo --merge" "naming the call"
+  assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "and it is not re-sent"
+  # After a refusal, the same process calls gh no more, and a verdict composed afterwards exits 2
+  # in silence instead of claiming transport.
+  reset_fixture
+  CLIENT_ERROR="$OWN_REFUSAL"
+  set +e
+  out=$( (gh_retry read api repos/example/repo/pulls/7) 2>/dev/null
+    CLIENT_ERROR=""
+    x=$(gh_retry read api repos/example/repo/pulls/8) || fail 3 "the API never answered"
+    echo "not reached: $x")
+  rc=$?
+  set -e
+  assert_eq "$rc" 2 "the caller's exit 3 becomes the refusal's 2 ($out)"
+  assert_eq "$out" "" "and prints nothing over it"
+  assert_eq "$(gh_calls)" "api repos/example/repo/pulls/7" "the second call never reached gh"
+  reset_fixture
+}
+
+# Whole commands, as a caller runs them: main traps the refusal from inside a command
+# substitution and stops the process there. `watch` is the one that re-armed forever: its reads
+# failing held the window blind and returned exit 3, so a short window here turns a regression
+# into a fast exit 3 rather than a hang. The gh on PATH is a stub, and refuses every call.
+test_a_refused_own_call_stops_the_command() {
+  local stub tmp rc out spec
+  local -a cmd
+  test_tmpdir stub own-refusal-gh
+  test_tmpdir tmp own-refusal-tmp
+  cat >"$stub/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-} ${2:-}" >>"$STUB_LOG" # one line per call: a --jq argument can hold several
+printf '%s\n' 'Unknown JSON field: "status"' 'Available fields:' '  attempt' >&2
+exit 1
+STUB
+  chmod +x "$stub/gh"
+  for spec in 'watch example/repo#7' 'merge example/repo#7' 'retry run watch example/repo#4242' \
+    'checks example/repo#7 --wait'; do
+    read -r -a cmd <<<"$spec"
+    : >"$CALL_LOG"
+    set +e
+    out=$(STUB_LOG="$CALL_LOG" PATH="$stub:$PATH" TMPDIR="$tmp" SHIP_PR_TEST_SOURCE_ONLY='' \
+      SHIP_PR_API_ATTEMPTS=3 WATCH_TIMEOUT=4 WATCH_INTERVAL=1 SHIP_PR_CHECKS_WAIT=4 \
+      bash "$HELPER" "${cmd[@]}" 2>&1)
+    rc=$?
+    set -e
+    assert_eq "$rc" 2 "$spec stops on the refusal ($out)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "$spec makes no call after it"
+    assert_contains "$out" "refused this script's own call" "$spec says what happened"
+    assert_eq "$(grep -c 'refused this script' <<<"$out")" 1 "$spec says it once"
+    assert_not_contains "$out" "re-arm the watch" "$spec does not ask to be re-armed"
+    assert_not_contains "$out" "UNKNOWN" "$spec does not report transport"
+    assert_eq "$(find "$tmp" -name 'pr-review-refused.*' | wc -l | tr -d ' ')" 0 \
+      "$spec leaves no refusal file behind"
+  done
 }
 
 # --- the shared parse -------------------------------------------------------------------------
@@ -581,7 +665,8 @@ tests=(
   test_a_client_refusal_is_a_usage_error
   test_a_client_refusal_near_miss_still_retries
   test_a_delegating_command_refusal_is_not_read
-  test_the_scripts_own_calls_keep_their_classification
+  test_the_scripts_own_refused_call_is_exit_2
+  test_a_refused_own_call_stops_the_command
   test_parse_ref
 )
 
