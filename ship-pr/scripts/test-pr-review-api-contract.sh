@@ -60,6 +60,8 @@ M7=$(sha40 e)   # its merge commit
 C7=$(sha40 f)   # its first commit
 H9=$(sha40 1)   # the reviewed anchor #9's head
 H12=$(sha40 2)  # the open PR #12's head
+WIDE=$(sha40 3)  # the wide commit, past one default page of files
+WIDE_REPO=example/wide
 BOT="${REVIEWER}[bot]"
 
 # --- the fixture gh and sleep -------------------------------------------------------------------
@@ -71,16 +73,30 @@ fixture_key() { printf '%s' "$1" | tr '/?&=' ',@+~'; }
 cat >"$BIN/gh" <<'EOF'
 #!/usr/bin/env bash
 # The contract suite's fixture gh: `gh api [--paginate] [-H <the raw media type>] <endpoint>`
-# answered from $CONTRACT_FIXTURE_WORLD, one file per endpoint, and nothing else.
+# answered from $CONTRACT_FIXTURE_WORLD, one file per endpoint, and `gh api graphql` with the
+# reviewThreads query's fields, answered from the file of the virtual endpoint
+# `graphql?pr=<pr>&first=<page size>&after=<cursor, or ->`; nothing else.
 set -u
 printf '%s\n' "$*" >>"$CONTRACT_FIXTURE_CALLS"
 refuse() { printf 'gh: %s\n' "$1" >&2; exit 1; }
 [ "${1:-}" = api ] || refuse "the fixture answers gh api only (HTTP 400): $*"
 shift
-endpoint="" paginate="" raw=""
+endpoint="" paginate="" raw="" query="" owner="" name="" pr="" after="" fields=""
 while [ $# -gt 0 ]; do
   case "$1" in
   --paginate) paginate=1 ;;
+  -f | -F)
+    fields=1
+    case "${2:-}" in
+    query=*) query="${2#query=}" ;;
+    owner=*) owner="${2#owner=}" ;;
+    name=*) name="${2#name=}" ;;
+    pr=*) pr="${2#pr=}" ;;
+    after=*) after="${2#after=}" ;;
+    *) refuse "a field the fixture does not model (HTTP 400): ${2:-}" ;;
+    esac
+    shift
+    ;;
   -H)
     [ "${2:-}" = "Accept: application/vnd.github.raw" ] || refuse "a header the fixture does not model (HTTP 400): ${2:-}"
     raw=.raw
@@ -95,6 +111,19 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -z "${CONTRACT_FIXTURE_FAIL:-}" ] || refuse "the fixture refuses every read ($CONTRACT_FIXTURE_FAIL)"
+if [ "$endpoint" = graphql ]; then
+  # The library's THREADS_QUERY, verbatim but for the page size, on this repository: anything
+  # else is a query the world does not model.
+  first=${query#*reviewThreads(first:}
+  first=${first%%,*}
+  case "$first" in '' | *[!0123456789]*) refuse "a GraphQL query without a reviewThreads page size (HTTP 400)" ;; esac
+  [ "${query/"reviewThreads(first:$first,"/reviewThreads(first:100,}" = "$CONTRACT_FIXTURE_THREADS_QUERY" ] ||
+    refuse "a GraphQL query that is not the library's THREADS_QUERY (HTTP 400)"
+  [ "$owner/$name" = "$CONTRACT_FIXTURE_REPO" ] || refuse "a GraphQL read of another repository (HTTP 400): $owner/$name"
+  endpoint="graphql?pr=$pr&first=$first&after=${after:--}"
+elif [ -n "$fields" ]; then
+  refuse "a field on a REST read (HTTP 400): $endpoint"
+fi
 case "$endpoint" in
 '' | *[!A-Za-z0-9/?\&=._%-]*) refuse "an endpoint outside the fixture's alphabet (HTTP 400): $endpoint" ;;
 esac
@@ -137,6 +166,12 @@ run_row() { # <id> <workflow id> <check suite id> <event> <status> <conclusion|n
     '{id:$id, workflow_id:$w, check_suite_id:$s, event:$e, name:"CI", status:$st, conclusion:$c,
       created_at:$at, head_sha:$h, head_branch:"main", html_url:"https://example/runs/\($id)"}'
 }
+wide_files() { # <from> <count>: one page of the wide commit's files, the 301st a rename
+  jq -cn --argjson from "$1" --argjson n "$2" --arg sha "$WIDE" \
+    '{sha:$sha, files:[range($from; $from + $n)
+       | if . == 300 then {filename:"f300", status:"renamed", previous_filename:"old-f300"}
+         else {filename:"f\(.)", status:"modified"} end]}'
+}
 check_run() { # <id> <name> <check suite id> <conclusion>
   jq -cn --argjson id "$1" --arg n "$2" --argjson s "$3" --arg c "$4" \
     '{id:$id, name:$n, status:"completed", conclusion:$c, html_url:"https://example/checks/\($id)",
@@ -149,7 +184,7 @@ check_run() { # <id> <name> <check suite id> <conclusion>
 # re-run on the tip, a renamed file in the anchor compare, a reply to an inline finding, a migrated
 # anchor on each inline feed, and a merged PR whose findings review precedes its Completed row.
 world_healthy() {
-  local R="repos/$REPO" tip_runs inline
+  local R="repos/$REPO" tip_runs inline threads
   rm -rf "$WORLD"
   mkdir -p "$WORLD"
   answer "$R" '{"default_branch":"main"}'
@@ -208,6 +243,19 @@ world_healthy() {
   answer "$R/pulls/9/reviews/31/comments?per_page=100" \
     "[$(positional_comment 900 "$H9" 'P2: a finding' 3 3 '{"pull_request_review_id":31}'),$(positional_comment 901 "$H9" 'P2: another' 7 4 '{"pull_request_review_id":31}')]"
 
+  # The reviewThreads anchor is #9 too: three threads, the lib's review_thread rows, their first
+  # comments past 2^31 (databaseId null, as the builder serves it), read verbatim and then walked
+  # at the contract's derived page of two.
+  threads="[$(review_thread 4095735684 false),$(review_thread 4095735690 true a.sh),$(review_thread 4095735700 false b.sh)]"
+  answer "graphql?pr=9&first=100&after=-" "$(review_threads_answer "$threads")"
+  answer "graphql?pr=9&first=2&after=-" "$(THREADS_FIXTURE_PAGE=2 review_threads_answer "$threads")"
+  answer "graphql?pr=9&first=2&after=c2" "$(THREADS_FIXTURE_PAGE=2 review_threads_answer "$threads" after=c2)"
+
+  # The wide commit, in a repository of its own: 301 files, one default page of 300 unpaginated,
+  # four pages of at most 100 paginated, the last row a rename.
+  answer "repos/$WIDE_REPO/commits/$WIDE" "$(wide_files 0 300)"
+  answer "repos/$WIDE_REPO/commits/$WIDE?per_page=100" "$(wide_files 0 100)" "$(wide_files 100 100)" "$(wide_files 200 100)" "$(wide_files 300 1)"
+
   # The summary-row sample: #7, the one merged PR, ended on a findings round.
   answer "$R/issues/7/comments?per_page=100" "$(jq -cn --arg bot "$BOT" --arg s "${H7:0:7}" \
     '[{id:71, user:{login:$bot}, created_at:"2026-09-20T09:00:00Z", updated_at:"2026-09-20T09:10:10Z",
@@ -244,7 +292,9 @@ run_contract() { # [VAR=value...]: extra environment for this run
     exec env -u GITHUB_RUN_ID -u CONTRACT_OWN_HEAD -u CONTRACT_BASE -u GITHUB_REPOSITORY -u GITHUB_EVENT_NAME \
       -u CONTRACT_SUMMARY_SAMPLE -u CONTRACT_TEST_SOURCE_ONLY -u CONTRACT_FIXTURE_FAIL \
       PATH="$BIN:$PATH" TMPDIR="$tmp" REVIEWER="$REVIEWER" \
-      CONTRACT_STALE_BASE_PR=7 CONTRACT_REVIEWED_PR=9 \
+      CONTRACT_STALE_BASE_PR=7 CONTRACT_REVIEWED_PR=9 CONTRACT_THREADS_PR=9 \
+      CONTRACT_WIDE_COMMIT="$WIDE_REPO@$WIDE" CONTRACT_WIDE_COMMIT_FILES=301 \
+      CONTRACT_FIXTURE_REPO="$REPO" CONTRACT_FIXTURE_THREADS_QUERY="$THREADS_QUERY" \
       CONTRACT_FIXTURE_WORLD="$WORLD" CONTRACT_FIXTURE_CALLS="$TEST_ROOT/calls" \
       CONTRACT_FIXTURE_ASKED="$TEST_ROOT/asked" CONTRACT_FIXTURE_SLEEPS="$TEST_ROOT/sleeps" "$@" \
       bash "$CONTRACT" "$REPO"
@@ -278,6 +328,7 @@ sourced() { # <script> [VAR=value...]
   SOURCED_OUT=$(
     unexport_functions
     exec env -u CONTRACT_FIXTURE_FAIL PATH="$BIN:$PATH" TMPDIR="$tmp" CONTRACT_TEST_SOURCE_ONLY=1 \
+      CONTRACT_FIXTURE_REPO="$REPO" CONTRACT_FIXTURE_THREADS_QUERY="$THREADS_QUERY" \
       CONTRACT_FIXTURE_WORLD="$WORLD" CONTRACT_FIXTURE_CALLS="$TEST_ROOT/calls" \
       CONTRACT_FIXTURE_ASKED="$TEST_ROOT/asked" CONTRACT_FIXTURE_SLEEPS="$TEST_ROOT/sleeps" "$@" \
       bash -c 'source "$1" '"$REPO"'; eval "$2"' _ "$CONTRACT" "$script" 2>"$TEST_ROOT/err"
@@ -362,7 +413,9 @@ test_api_sorts_a_failed_read_by_its_status() {
     "HTTP 401|5|1|" \
     "HTTP 403|5|1|" \
     "HTTP 404|4|1|" \
-    "HTTP 422|4|1|"; do
+    "HTTP 422|4|1|" \
+    "Something went wrong while executing your query|3|3|5 10" \
+    '{"errors":[{"type":"NOT_FOUND"}]}|4|1|'; do
     IFS='|' read -r fail want_rc want_calls want_sleeps <<<"$row"
     sourced 'api "repos/'"$REPO"'"' CONTRACT_FIXTURE_FAIL="$fail"
     assert_eq "$SOURCED_RC" "$want_rc" "a read failing with '$fail' should exit $want_rc ($SOURCED_ERR)"
@@ -402,8 +455,8 @@ test_the_exit_trap_cleans_up_and_names_an_unchosen_exit() {
 # --- whole runs ----------------------------------------------------------------------------------
 # What the healthy world pins and what it skips, line by line. The skips are the claims the
 # contract never makes off Actions or at all (its own run, a push under observation, the push
-# clock, the GraphQL read, a 300-file compare) and one that waits on an anchor the world does not
-# carry (more than a page of inline comments). A belief the contract adds or rewords lands here in
+# clock, more than 100 review threads, a 300-file compare) and one that waits on an anchor the
+# world does not carry (more than a page of inline comments). A belief the contract adds or rewords lands here in
 # the same PR, and the world grows the fields it pins.
 IFS= read -r -d '' HEALTHY_VERDICTS <<'EOF' || :
 ok    repos/<owner/name> carries default_branch (the drift anchor's ref when none is given)
@@ -486,7 +539,17 @@ ok    a review's own comments endpoint answers with exactly the flat listing's r
 ok    the per-review rows carry what poll renders and folds from this feed alone while the flat listing lags: numeric id and pull_request_review_id, commit_id, the original_commit_id the head stamp needs, the position pair the fold keys on, user.login, a non-empty path, body
 ok    every Code Review row of the sampled PRs' summaries is Completed or Failed in the allowlisted shape, or Running, dated by an ISO 8601 UTC datetime not in the future (1 rows on 1 PRs; 0 Failed)
 ok    a findings review is submitted before its row flips to Completed: the app's last review naming the newest Completed row's commit is not after that row, on 1 sampled PRs (status_state's 'nothing since the 👀' rests on it, #453)
-skip  reviewThreads (GraphQL) pagination at 100 — the resolve path is the one GraphQL read, and it is not exercised here
+ok    the gate's own THREADS_QUERY, sent verbatim, answers #9's reviewThreads as a connection: nodes[], a numeric totalCount and a boolean pageInfo.hasNextPage
+ok    every thread carries a non-empty node id (resolve's threadId) and isResolved as a boolean (closed only when literally true)
+ok    every thread's first comment carries fullDatabaseId as a decimal string (the BigInt THREAD_ID_JQ names a thread by, ahead of databaseId)
+ok    databaseId is not clamped past 2^31: on #9's 3 thread(s) whose first comment id is past it, databaseId is null or the very number fullDatabaseId spells (THREAD_ID_JQ's fallback)
+ok    on a walk of #9 at 2 a page (2 pages), EVERY page states a numeric totalCount, nodes[] and a boolean hasNextPage, with a non-empty endCursor whenever there is a next page (threads_walk reads the last page's count)
+ok    ... and the pages add up: each states the verbatim read's totalCount (3), their rows reach it, and the last says hasNextPage false (threads_walk's whole-read test)
+skip  reviewThreads paged past 100 threads — no PR here has more than one page of 100 threads; the paging itself is pinned above on a smaller page of the same query
+ok    an unpaginated commits/<sha> read answers ONE default page: 300 of 3333333333333333333333333333333333333333's 301 files (a single read is a truncated diff, which is why commit_files pages, and a list of exactly 300 is what its refusal at 300 catches)
+ok    commits/<sha>?per_page=100 under --paginate is one commit object per page with files[], each page 100 rows but the last, which has 1 to 100 (the page size commit_files asks for is honoured)
+ok    ... and the joined pages are the WHOLE first-parent diff, past 300: 301 rows with distinct, non-empty string filenames (the read commit_files takes as the commit's changed paths is not capped at the default page)
+ok    a renamed row carries a non-empty previous_filename (commit_files lists both names as changed paths)
 skip  compare's 300-file cap — no compare of that size exists in this repository
 EOF
 HEALTHY_VERDICTS=${HEALTHY_VERDICTS%$'\n'}
@@ -497,7 +560,7 @@ test_a_healthy_world_pins_what_it_can_and_skips_the_rest() {
   run_contract
   assert_eq "$CONTRACT_RC" 0 "the contract should hold on the healthy world ($CONTRACT_ERR)"
   assert_eq "$(verdicts)" "$HEALTHY_VERDICTS" "the healthy world's verdict lines"
-  assert_contains "$CONTRACT_OUT" "beliefs checked, 0 moved" "the verdict should count no moved belief"
+  assert_contains "$CONTRACT_OUT" ", 0 moved," "the verdict should count no moved belief"
   assert_nothing_left "a healthy run"
   # Both directions of the request set: everything asked was answered (or the run would have
   # ended 4), and everything answered was asked — a read the contract stopped making is a dead
@@ -529,24 +592,26 @@ test_a_squash_merged_anchor_skips_the_second_parent_claims() {
 test_a_doctored_response_moves_its_pin_and_only_it() {
   local row endpoint filter belief R="repos/$REPO"
   for row in \
-    "$R/actions/runs?head_sha=$TIP&per_page=100#.workflow_runs[1] |= del(.created_at)#MOVED every row carries the fields the fold indexes" \
-    "$R/actions/runs?head_sha=$TIP&per_page=100#.workflow_runs[0] |= (.status = \"surprise\" | .conclusion = null)#MOVED status strings are in the known vocabulary" \
-    "$R/actions/runs?head_sha=$TIP&per_page=100#.workflow_runs[0] |= del(.conclusion)#MOVED every row carries conclusion (present, null until completed) and it is in the vocabulary" \
-    "$R/actions/workflows?per_page=100#.workflows[0].state = \"paused\"#MOVED every workflow carries a state drawn from the vocabulary" \
-    "$R/commits/$TIP/check-runs?filter=latest&per_page=100#.check_runs[0].conclusion = \"surprise\"#MOVED check-run conclusions are in the vocabulary" \
-    "$R/commits/$M7#.commit.verification.verified = false#MOVED GitHub's merge commit is committed by noreply@github.com" \
-    "$R/pulls/12#.mergeable_state = \"surprise\"#MOVED ... and a mergeable_state in the vocabulary" \
-    "$R/pulls/9/reviews?per_page=100#.[2].state = \"surprise\"#MOVED the app's review states are in the vocabulary" \
-    "$R/pulls/9/comments?per_page=100#.[1] |= del(.original_line)#MOVED inline comments carry numeric id" \
-    "$R/pulls/9/reviews/31/comments?per_page=100#.[1] |= del(.original_position)#MOVED the per-review rows carry what poll renders"; do
-    IFS='#' read -r endpoint filter belief <<<"$row"
+    "$R/actions/runs?head_sha=$TIP&per_page=100^.workflow_runs[1] |= del(.created_at)^MOVED every row carries the fields the fold indexes" \
+    "$R/actions/runs?head_sha=$TIP&per_page=100^.workflow_runs[0] |= (.status = \"surprise\" | .conclusion = null)^MOVED status strings are in the known vocabulary" \
+    "$R/actions/runs?head_sha=$TIP&per_page=100^.workflow_runs[0] |= del(.conclusion)^MOVED every row carries conclusion (present, null until completed) and it is in the vocabulary" \
+    "$R/actions/workflows?per_page=100^.workflows[0].state = \"paused\"^MOVED every workflow carries a state drawn from the vocabulary" \
+    "$R/commits/$TIP/check-runs?filter=latest&per_page=100^.check_runs[0].conclusion = \"surprise\"^MOVED check-run conclusions are in the vocabulary" \
+    "$R/commits/$M7^.commit.verification.verified = false^MOVED GitHub's merge commit is committed by noreply@github.com" \
+    "$R/pulls/12^.mergeable_state = \"surprise\"^MOVED ... and a mergeable_state in the vocabulary" \
+    "$R/pulls/9/reviews?per_page=100^.[2].state = \"surprise\"^MOVED the app's review states are in the vocabulary" \
+    "$R/pulls/9/comments?per_page=100^.[1] |= del(.original_line)^MOVED inline comments carry numeric id" \
+    "$R/pulls/9/reviews/31/comments?per_page=100^.[1] |= del(.original_position)^MOVED the per-review rows carry what poll renders" \
+    "graphql?pr=9&first=100&after=-^.data.repository.pullRequest.reviewThreads.nodes[0].isResolved = \"true\"^MOVED every thread carries a non-empty node id (resolve's threadId) and isResolved as a boolean" \
+    "graphql?pr=9&first=2&after=c2^.data.repository.pullRequest.reviewThreads.totalCount = 4^MOVED ... and the pages add up: each states the verbatim read's totalCount (3)"; do
+    IFS='^' read -r endpoint filter belief <<<"$row"
     world_healthy
     doctor "$endpoint" "$filter"
     run_contract
     assert_eq "$CONTRACT_RC" 1 "doctoring $endpoint with '$filter' should end the run 1 ($CONTRACT_ERR)"
     assert_contains "$(verdicts)" "$belief" "doctoring $endpoint with '$filter' should move its pin"
     assert_eq "$(verdicts | grep -c '^MOVED ' || true)" 1 "doctoring $endpoint with '$filter' should move that pin alone"
-    assert_contains "$CONTRACT_OUT" "1 moved" "the verdict should count the one moved belief"
+    assert_contains "$CONTRACT_OUT" ", 1 moved," "the verdict should count the one moved belief"
     assert_nothing_left "a run that moved"
   done
 }
