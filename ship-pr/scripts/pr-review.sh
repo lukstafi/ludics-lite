@@ -566,16 +566,17 @@ gh_client_refusal() {
 # core command (one that clashes runs only through `gh extension exec`). What this does not read:
 # a flag that starts a program inside a listed subcommand (`--editor`, `--web`), which runs it
 # before the call writes anything, in a mode a scripted retry does not use; and a subcommand named
-# after a flag the parent takes (`gh pr -R o/r view`), which reads as unlisted. `discussion`, a
-# preview core command, is whole: its create, list, comment, edit and view are gh's parse and
-# GraphQL calls, `--web` the one program they start (ludics-lite#468, from each one's `--help`).
+# after a flag the parent takes (`gh pr -R o/r view`), which reads as unlisted. `discussion` stays
+# off although gh 2.101.0's preview command runs no other program (ludics-lite#468): it is new
+# enough that an older gh hands `gh discussion` to an installed `gh-discussion` extension, and
+# arbitrary code there can write and then print an allowlisted line (review of #490).
 # This list gates a CALLER's arguments only. The script's own calls are not read through it: they
 # are written in this file, as `api`, `run view` and `pr merge` with no `--delete-branch`, none of
 # which runs another program.
 gh_api_only_command() {
   case "${1:-}" in
   api | status | search | org | project | label | cache | ruleset | secret | variable | ssh-key | \
-    gpg-key | discussion) return 0 ;;
+    gpg-key) return 0 ;;
   esac
   case "${1:-} ${2:-}" in
   "pr list" | "pr status" | "pr checks" | "pr comment" | "pr edit" | "pr lock" | "pr ready" | \

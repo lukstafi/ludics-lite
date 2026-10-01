@@ -18,7 +18,7 @@
 # And gh's own refusal of a caller's arguments (ludics-lite#452): `gh pr view 1 --json nosuchfield`
 # sends nothing, yet was retried four times and reported as exit 3. Those bodies are verbatim too,
 # and each must exit 2 on its first attempt, while their near-misses still retry to exit 3 (Cobra's
-# flag-syntax and minimum-count refusals and the `discussion` path joined in ludics-lite#468). And
+# flag-syntax and minimum-count refusals joined in ludics-lite#468; the `discussion` path did not). And
 # gh refusing an argument the SCRIPT sends (ludics-lite#471: a gh upgrade renaming a field) stops the
 # whole command with exit 2, where it used to retry to exit 3 and leave `watch` re-arming forever.
 
@@ -509,8 +509,10 @@ test_a_delegating_command_refusal_is_not_read() {
   local -a cmd
   local spec
   retune API_ATTEMPTS=3
+  # `discussion` is gh 2.101.0's own preview command, but an older gh hands it to a `gh-discussion`
+  # extension, so it is read as one (review of #490).
   for spec in 'myext --later' 'co --later' 'repo fork o/r --clone --later' 'pr merge 1 --later' \
-    'pr checkout 1 --later' 'pr -R o/r view 1 --later'; do
+    'pr checkout 1 --later' 'pr -R o/r view 1 --later' 'discussion list --repo o/r --later'; do
     read -r -a cmd <<<"$spec"
     reset_fixture
     CLIENT_ERROR='unknown flag: --later'
@@ -525,7 +527,7 @@ test_a_delegating_command_refusal_is_not_read() {
     assert_not_contains "$RETRY_OUT" "sent nothing" "nothing is claimed about what was sent ($spec)"
   done
   for spec in 'project list --owner o --foo_bar' 'label nosuchcmd' 'api repos/o/r --later' \
-    'issue comment 1 --later' 'discussion list --repo o/r --later'; do
+    'issue comment 1 --later'; do
     read -r -a cmd <<<"$spec"
     reset_fixture
     CLIENT_ERROR='unknown flag: --later'
