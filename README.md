@@ -1108,9 +1108,12 @@ and that another repository calls the same way from its own triggers, running lu
 `test-post-merge-cleanup.sh` runs its cases concurrently, each in its own process group with a
 deadline (`SHIP_PR_TEST_CASE_TIMEOUT`, five minutes by default): a stalled case is killed and
 reported instead of holding the job until CI's own timeout. `SHIP_PR_TEST_LOG_DIR` keeps the
-per-case logs where CI can collect them. The runner also tests itself, from patched scratch copies:
-refused arguments, `--help` with an inherited pid list, the deadline, and an in-place rewrite of
-both scripts mid-run (with a negative control that strips the parse guard).
+per-case logs where CI can collect them. Each case runs Git under its own scratch global config
+and no system or environment config (ludics-lite#386), so a user's `core.hooksPath` cannot send
+Git past a case's `.git/hooks` race fixture. The runner also tests itself, from patched scratch
+copies: refused arguments, `--help` with an inherited pid list, the deadline, an in-place rewrite
+of both scripts mid-run (with a negative control that strips the parse guard), and a
+`core.hooksPath` planted through each config channel (with one that strips the isolation).
 
 ## Why symlinks, not copies
 
