@@ -1637,7 +1637,7 @@ substantive_reviews() { # <pr>; reviews JSON on stdin
     inline=$(review_comments "$pr" "$id") || return 1
     if jq -e --argjson fixed "$CONNECTOR_FIXED_REPLIES" '
         def fixed_reply: (.body | type) == "string"
-          and (.body | sub("[[:space:]]+\\z"; "")) as $b | any($fixed[]; . == $b);
+          and (.body | sub("[[:space:]]+\\z"; "") | IN($fixed[]));
         type == "array" and all(.[]; fixed_reply)' \
       <<<"$inline" >/dev/null; then
       raw=$(jq --argjson id "$id" 'map(select(.id != $id))' <<<"$raw") || return 1
