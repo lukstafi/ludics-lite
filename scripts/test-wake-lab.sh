@@ -2557,10 +2557,12 @@ created() { # created <dir> -- every regular file under it, relative and shell-q
 #   LAB_MAP                  lab_box_of's table, which the sweep's lab_map fills from
 #                            `wake-lab.sh endpoint-map`; this suite fills it the same way
 #   stamp                    the run stamp take_lab_lock writes into its advisory holder line
-# SWEEP_FOREIGN names, per function, a `$name` that belongs to a program the function hands to
-# another interpreter, which fragment_unbound reads as shell: awk's field loop in lab_box_of.
+# SWEEP_FOREIGN counts, per function, the reads of a name that belong to a program the function
+# hands to another interpreter, which fragment_unbound reads as shell: `lab_box_of:i:1` is the one
+# `$i` of awk's field loop in lab_box_of. It exempts that many reads and no more, so a shell `$i`
+# added beside it is still reported.
 SWEEP_BOUND=(HOME WAKE_LAB_LOCK_DIR LAB_LOCK_WAIT LAB_MAP stamp SECONDS)
-SWEEP_FOREIGN=(lab_box_of:i)
+SWEEP_FOREIGN=(lab_box_of:i:1)
 # fragment_unbound <fragment> -- every variable the fragment reads that neither it nor SWEEP_BOUND
 # binds, as `<function>: <name>`, and `<function>: refused <construct>` for text it will not read;
 # empty output means every read is bound. The copy step refuses the import on any line, rather
@@ -2569,19 +2571,24 @@ SWEEP_FOREIGN=(lab_box_of:i)
 # the two repositories disagreeing (ludics-lite#469). The single-anchor checks could not see it.
 #
 # Its grammar, as a fail-closed allowlist. Each function is read as bash itself prints it
-# (`declare -f` in a clean shell, so comments are gone), and the fragment's top-level lines as written: those
-# outside the `name() {` ... `}` ranges the copy step cuts. A READ is any `$name`, `${name` or
-# `${#name`, quoted or not, and every name inside a `((...))` or inside the `[...]` of a subscript
-# (`${a[i]}`, `a[i]=`), which bash evaluates arithmetically. A name is BOUND by SWEEP_BOUND, by an
-# assignment on the fragment's top level, and, within one function, by its `local` list or an
-# assignment anywhere in its body -- an assignment that is a statement of its own, since one
-# prefixed to a command (`FOO=x cmd`) is gone when that command ends. A name bound only by `for`,
-# `read` or `printf -v` is reported unbound, which is loud, not silent. Reads inside single quotes are checked too, so an awk or perl
-# `$name` is over-reported (hence SWEEP_FOREIGN), never missed. Text through which a variable can
-# be read any other way -- `[[`, `let`, `eval`, `declare`, `typeset`, `source`, a `.` command,
-# `${!`, or a `local` given an option (`-n`, `-i`) -- is refused, not scanned. Out of bounds: a
-# function the fragment CALLS without copying it (take_lab_lock's `say`, reached only after a
-# wait), and whether an assignment in a body comes before the read it binds.
+# (`declare -f` in a clean shell: comments gone, one statement per line, the body's own level
+# indented four spaces), and the fragment's top-level lines as written, those outside the
+# `name() {` ... `}` ranges the copy step cuts.
+# - A READ is any `$name`, `${name` or `${#name`, quoted or not, and every name inside a `((...))`
+#   or inside the `[...]` of a subscript (`${a[i]}`, `a[i]=`), which bash evaluates
+#   arithmetically. Reads inside single quotes count too, so an awk or perl `$name` is
+#   over-reported, never missed; SWEEP_FOREIGN exempts a counted number of them.
+# - A name is BOUND by SWEEP_BOUND; by a top-level assignment that is a statement of its own (one
+#   prefixed to a command, `FOO=x cmd`, or in a pipeline is gone when that command ends); and,
+#   within one function, ONLY by a `local` at the body's own level. An assignment in the body binds
+#   nothing: whether it persists depends on the subshell, pipeline or branch around it, so a global
+#   a copied function sets and reads is reported, which is loud, not silent. So is a name bound by
+#   `for`, `read` or `printf -v`.
+# - Refused, not scanned: text through which a variable can be read or a `local` can be scoped
+#   some other way -- `[[`, `let`, `eval`, `declare`, `typeset`, `source`, a `.` command, `${!`, a
+#   `(` subshell, a `local` given an option (`-n`, `-i`), or one in a pipeline.
+# Out of bounds: a function the fragment CALLS without copying it (take_lab_lock's `say`, reached
+# only after a wait), and whether a `local` comes before the read it binds.
 fragment_unbound() {
   local fns
   fns=$(env -i PATH="$PATH" bash --noprofile --norc -c '. "$1" >/dev/null 2>&1 </dev/null || exit 1
@@ -2595,7 +2602,9 @@ fragment_unbound() {
   } | perl -e '
     use strict; use warnings;
     my (%bound, %foreign);
-    for (@ARGV) { if (/:/) { $foreign{$_} = 1 } else { $bound{$_} = 1 } }
+    for (@ARGV) {
+      if (/^(\w+:\w+):(\d+)$/) { $foreign{$1} = $2 } else { $bound{$_} = 1 }
+    }
     my $id = qr/[A-Za-z_][A-Za-z0-9_]*/;
     local $/ = "\f";
     while (my $unit = <STDIN>) {
@@ -2603,61 +2612,76 @@ fragment_unbound() {
       next if $unit eq "";
       my ($where, $text) = split /\n/, $unit, 2;
       $text = "" unless defined $text;
+      my $top = $where eq "(top level)";
       my (@refused, %mine, %reads);
       push @refused, $1
         while $text =~ /(\[\[|\$\{!|(?<![\w.-])(?:let|eval|declare|typeset|source)(?![\w-]))/g;
-      push @refused, "." if $text =~ /(?:^|[;&|(])[ \t]*\.[ \t]/m;
-      while ($text =~ /^[ \t]*local[ \t]+([^\n]*)/mg) {
-        (my $list = $1) =~ s/\$\(\(.*?\)\)|\$\([^()]*\)|"[^"]*"|\x27[^\x27]*\x27//g;
-        for my $w (split " ", $list) {
-          $w =~ s/;$//;
-          if ($w =~ /^-/) { push @refused, "local $w"; next }
-          $mine{$1} = 1 if $w =~ /^($id)(?:=|$)/;
+      # The same text with arithmetic, command substitutions and quoted spans flattened, for the
+      # questions about statement structure.
+      (my $flat = $text) =~ s/\$\(\(.*?\)\)|\$\([^()]*\)|"[^"]*"|\x27[^\x27]*\x27/X/g;
+      my $start = qr/(?:^|;|&&|\|\||\{|\b(?:then|do|else))[ \t]*/m;
+      push @refused, "." if $flat =~ /$start\.[ \t]/;
+      push @refused, "(" if $flat =~ /(?:$start|[|&][ \t]*)\((?!\()/;
+      if ($top) {
+        while ($flat =~ /$start((?:$id\+?=[^\s;&|()]*[ \t]+)*$id\+?=[^\s;&|()]*)[ \t]*(?=$|;|&&|\|\|)/mg) {
+          my $run = $1;
+          $mine{$1} = 1 while $run =~ /(?:^|[ \t])($id)\+?=/g;
+        }
+      } else {
+        while ($flat =~ /^    local[ \t]+([^\n]*)/mg) {
+          my $list = $1;
+          if ($list =~ /[|&]/) { push @refused, "local in a pipeline"; next }
+          for my $w (split " ", $list) {
+            $w =~ s/;$//;
+            if ($w =~ /^-/) { push @refused, "local $w"; next }
+            $mine{$1} = 1 if $w =~ /^($id)(?:=|$)/;
+          }
         }
       }
-      # Assignments that are whole statements; one prefixed to a command binds nothing after it.
-      (my $flat = $text) =~ s/\$\(\(.*?\)\)|\$\([^()]*\)|"[^"]*"|\x27[^\x27]*\x27/X/g;
-      while ($flat =~ /(?:^|[;&|({]|\b(?:then|do|else))[ \t]*((?:$id\+?=[^\s;&|()]*[ \t]+)*$id\+?=[^\s;&|()]*)[ \t]*(?=$|[;&|)])/mg) {
-        my $run = $1;
-        $mine{$1} = 1 while $run =~ /(?:^|[ \t])($id)\+?=/g;
-      }
-      $reads{$1} = 1 while $text =~ /\$\{?#?($id)/g;
+      $reads{$1}++ while $text =~ /\$\{?#?($id)/g;
       for my $arith ($text =~ /\(\((.*?)\)\)/sg, $text =~ /\w\[([^\]\n]*)\]/g) {
         (my $expr = $arith) =~ s/\$\([^()]*\)//g;
-        $reads{$1} = 1 while $expr =~ /(?<![\w#])($id)/g;
+        $reads{$1}++ while $expr =~ /(?<![\w#])($id)/g;
       }
       print "$where: refused $_\n" for @refused;
       for (sort keys %reads) {
-        print "$where: $_\n" unless $bound{$_} || $mine{$_} || $foreign{"$where:$_"};
+        next if $bound{$_} || $mine{$_} || $reads{$_} <= ($foreign{"$where:$_"} // 0);
+        print "$where: $_\n";
       }
-      if ($where eq "(top level)") { $bound{$_} = 1 for keys %mine }
+      if ($top) { $bound{$_} = 1 for keys %mine }
     }' "${SWEEP_BOUND[@]}" "${SWEEP_FOREIGN[@]}"
 }
 # The negative control, which needs no staging checkout and so runs in CI too: a checker that
-# cannot fail proves nothing. A planted fragment in the real one's shape, with one unbound read of
-# each kind the grammar names, one read of each kind that IS bound, a comment that must not count,
-# awk's foreign `$i`, and one refused construct.
+# cannot fail proves nothing. A planted fragment in the real one's shape: an unbound read of each
+# kind the grammar names, a bound read of each kind, reads bound only by an assignment (in the body,
+# prefixed to a command, in a subshell), a comment that must not count, awk's foreign `$i` beside a
+# shell one, and refused constructs.
 cat >"$TMP/planted-fragment.sh" <<'EOF'
 LAB_LOCK_DIR=${WAKE_LAB_LOCK_DIR:-$HOME/.local/state/wake-lab}
 lab_box_of() { # ssh-alias -- the $COMMENTED_OUT table
   awk -v a="$1" '{ for (i = 2; i <= NF; i++) if ($i == a) print $1 }' <<<"$PLANTED_MAP"
+  printf '%s\n' "$i"
 }
 take_lab_lock() {
-  local box=$1 deadline=$((SECONDS + PLANTED_WAIT)) waits=(1 2)
+  local box=$1 path deadline=$((SECONDS + PLANTED_WAIT)) waits=(1 2)
   path=$LAB_LOCK_DIR/$box.lock
   PLANTED_PREFIX=temporary true
+  PLANTED_GLOBAL=set-here
   printf '%s\n' "$path $deadline ${#LAB_MAP} $stamp ${waits[PLANTED_INDEX]} ${waits[deadline]}"
-  printf '%s\n' "$PLANTED_PREFIX"
+  printf '%s\n' "$PLANTED_PREFIX $PLANTED_GLOBAL"
 }
-planted_let() {
+planted_refused() {
   let n=PLANTED_LET+1
+  ( local scoped=1 )
 }
 EOF
 out=$(fragment_unbound "$TMP/planted-fragment.sh")
-want=$(printf '%s\n' 'lab_box_of: PLANTED_MAP' 'planted_let: refused let' \
-  'take_lab_lock: PLANTED_INDEX' 'take_lab_lock: PLANTED_PREFIX' 'take_lab_lock: PLANTED_WAIT')
+want=$(printf '%s\n' 'lab_box_of: PLANTED_MAP' 'lab_box_of: i' \
+  'planted_refused: refused let' 'planted_refused: refused (' \
+  'take_lab_lock: PLANTED_GLOBAL' 'take_lab_lock: PLANTED_INDEX' 'take_lab_lock: PLANTED_PREFIX' \
+  'take_lab_lock: PLANTED_WAIT')
 [ "$out" = "$want" ] \
-  && ok "the copy step's unbound-variable check flags exactly the planted reads and the refused let" \
+  && ok "the copy step's unbound-variable check flags exactly the planted reads and refusals" \
   || ko "the copy step's unbound-variable check is off on a planted fragment -- want [$want], got [$out]"
 # take_lab_lock's own wait is LAB_LOCK_WAIT, which is not among the lines extracted below; give it
 # a small explicit value rather than letting it be unset, so a contended case fails in seconds and
