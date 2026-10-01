@@ -312,6 +312,9 @@ API_BACKOFF="${SHIP_PR_API_BACKOFF:-5}"
 fail() {
   local rc="$1"
   shift
+  # After gh refused one of this script's own calls, that refusal is the command's one outcome
+  # (gh_refused_own): a verdict composed from the call it stopped would be about nothing.
+  [ ! -s "${GH_REFUSED_FILE:-}" ] || exit 2
   echo "pr-review.sh: $*" >&2
   exit "$rc"
 }
@@ -401,6 +404,9 @@ jq_eol_probe
 # blank.
 GH_ERR=""
 GH_ERR_FILE="${TMPDIR:-/tmp}/pr-review-err.$$"
+# gh_refused_own's message, when gh refused one of this script's own calls (see there).
+GH_REFUSED_FILE="${TMPDIR:-/tmp}/pr-review-refused.$$"
+rm -f "$GH_REFUSED_FILE"
 # gh_retry's per-attempt stderr capture, tracked here so the EXIT trap removes one a call died
 # holding. It is only ever the CURRENT shell's: every feed read happens inside a command
 # substitution, and that subshell does not run this trap — which is the same fact gh_err_line
@@ -429,7 +435,7 @@ SNAP=""
 # script calls this function from its own trap instead, so there is no copy to drift; the suites'
 # preamble refuses to run if its trap no longer reaches whatever this one installs.
 pr_review_cleanup() {
-  rm -f "$GH_ERR_FILE"
+  rm -f "$GH_ERR_FILE" "$GH_REFUSED_FILE"
   [ -z "$GH_TMP_FILE" ] || rm -f "$GH_TMP_FILE"
   [ -z "$SNAP_DIR" ] || rm -rf "$SNAP_DIR"
 }
@@ -507,6 +513,8 @@ graphql_fixed_answer() {
 #   flag needs an argument: --<name>  /  '<c>' in -<c>         a flag missing its value
 #   invalid argument "<v>" for "[-<c>, ]--<name>" flag: <why>  a value the flag cannot take
 #   accepts [at most ]<n> arg(s), received <m>                 the wrong number of arguments
+#   requires at least <n> arg(s), only received <m>            too few, on a minimum-count command
+#   bad flag syntax: --=<x>  /  ---<x>                         a long flag with no name
 #   unknown command "<x>" for "gh <cmd>..."                    a subcommand gh does not have
 # A mistyped flag's name is whatever the caller typed up to an `=`, punctuation included
 # (`--foo_bar`, `--foo.bar`, `-_`); one holding whitespace is not read. The line deliberately does
@@ -515,10 +523,15 @@ graphql_fixed_answer() {
 # expression gh could not parse can be reported AFTER the request was sent (`gh pr view 1 --jq
 # '.['` answers with the API's own error first), a write's included, and the rest (`flags required
 # when not running interactively`, `cannot use --web with --json`, ...) are not on the list. Those
-# keep the classification they had. And only a caller's arguments are read this way: cmd_retry
-# opts in, while this script's own calls keep today's classification, since a refusal there means
-# the installed gh no longer takes an argument the script sends, and their callers do not report it
-# as that.
+# keep the classification they had. Cobra's other count refusals (`accepts between <n> and <m>
+# arg(s)`, ...) are not on the list until a real call shows one verbatim.
+#
+# Two kinds of argument are read this way. A caller's, through cmd_retry, where the refusal is the
+# caller's usage error (exit 2, said by cmd_retry). And this script's own (ludics-lite#471), where
+# it means the installed gh no longer takes an argument the script sends, a field or a flag a gh
+# upgrade renamed: retried as transport, `watch`, `merge` and the run await each reported "the API
+# never answered", and a caller obeying exit 3 re-armed forever. That refusal stops the whole
+# command at once with exit 2 (gh_refused_own, below).
 gh_client_refusal() {
   local re
   for re in \
@@ -529,6 +542,8 @@ gh_client_refusal() {
     "^flag needs an argument: (--[A-Za-z0-9][A-Za-z0-9-]*|'[A-Za-z0-9]' in -[A-Za-z0-9])\$" \
     '^invalid argument ".*" for "(-[A-Za-z0-9], )?--[A-Za-z0-9][A-Za-z0-9-]*" flag: .+$' \
     '^accepts (at most )?[0-9]+ arg\(s\), received [0-9]+$' \
+    '^requires at least [0-9]+ arg\(s\), only received [0-9]+$' \
+    '^bad flag syntax: --[-=][^[:space:]]*$' \
     '^unknown command "[^"]+" for "gh( [a-z][a-z-]*)+"$'; do
     [[ "$1" =~ $re ]] && return 0
   done
@@ -551,7 +566,14 @@ gh_client_refusal() {
 # core command (one that clashes runs only through `gh extension exec`). What this does not read:
 # a flag that starts a program inside a listed subcommand (`--editor`, `--web`), which runs it
 # before the call writes anything, in a mode a scripted retry does not use; and a subcommand named
-# after a flag the parent takes (`gh pr -R o/r view`), which reads as unlisted.
+# after a flag the parent takes (`gh pr -R o/r view`), which reads as unlisted. `discussion` stays
+# off although gh 2.101.0's preview command runs no other program (ludics-lite#468): it is new
+# enough that an older gh hands `gh discussion` to an installed `gh-discussion` extension, and
+# arbitrary code there can write and then print an allowlisted line (review of #490).
+# This list gates a CALLER's arguments only. The script's own calls are not read through it: they
+# are written in this file, as `api`, `run view` and `pr merge` with no `--delete-branch`, none of
+# which runs another program. A `merge` that forwards the caller's own `gh pr merge` flags (after
+# `--`) makes that call a caller's, and it is read as unlisted (review of #490).
 gh_api_only_command() {
   case "${1:-}" in
   api | status | search | org | project | label | cache | ruleset | secret | variable | ssh-key | \
@@ -587,15 +609,69 @@ transient_failure() {
   return 0
 }
 
+# gh's refusal of an argument THIS SCRIPT sends (ludics-lite#471). It is not the caller's error,
+# not transport and not GitHub's answer: the installed gh no longer takes something this file
+# wrote, and every later run hits the same refusal. So it ends the whole command, exit 2, rather
+# than the call: most calls run inside a command substitution, whose caller would read a failed
+# call as an unanswered one, and a `watch` would hold its window blind and report exit 3, the code
+# that says re-arm. The pieces:
+#   GH_REFUSED_FILE  holds the message, so a subshell's refusal is visible to its parents (the
+#                    same subshell reason as GH_ERR_FILE). Cleared at source time, since a pid a
+#                    killed run left one under would otherwise stop a later run before its first
+#                    call; removed by the EXIT trap.
+#   GH_REFUSAL_PID   main's pid, set by main with the USR2 trap that prints the message and exits
+#                    2. A refusal in any subshell signals it, so main stops when the substitution it
+#                    is waiting on returns, without running its next command.
+#   gh_retry         makes no call once the file holds a refusal, so a subshell that outlives one
+#                    sends nothing more; and `fail` exits 2 in silence then, so no verdict about
+#                    the PR (exit 1, 3 or 4) is printed over it.
+# Sourced without main (the suites, pr-review-api-contract.sh), there is no pid to signal: the
+# refusal prints its message itself, and the caller's `fail` turns into the exit 2.
+GH_REFUSAL_PID=""
+gh_refused_own() { # <gh args...>, of the refused call
+  local call="" arg prev=""
+  # A field's VALUE is payload, not the call's shape: a reply's or a comment's text, a body file's
+  # path, a GraphQL query. Logged, it would copy text that was never posted into a worker's or CI's
+  # log (review of #490), and the field's name is enough to find the call in this file. This file
+  # passes every field as a separate `-f`/`-F` argument, which is the one form read here.
+  for arg in "$@"; do
+    case "$prev" in
+    -f | -F | --field | --raw-field) call+=" $(printf '%q' "${arg%%=*}")=..." ;;
+    *) call+=" $(printf '%q' "$arg")" ;;
+    esac
+    prev="$arg"
+  done
+  # A long --jq filter: enough of the call to find it, not the whole filter.
+  [ "${#call}" -le 240 ] || call="${call:0:240}..."
+  printf '%s\n' "pr-review.sh: the installed gh refused this script's own call, which sent \
+nothing: gh${call} -> $(gh_err_line). That is a version mismatch between pr-review.sh and the \
+installed gh (\`gh --version\`), not transport and not GitHub's answer: re-running prints the same \
+refusal, so do not re-arm or retry; update gh or this script. The command stopped at this call, \
+and anything it did before the call stands." >"$GH_REFUSED_FILE"
+  if [ -n "$GH_REFUSAL_PID" ]; then
+    kill -USR2 "$GH_REFUSAL_PID" 2>/dev/null
+  else
+    cat "$GH_REFUSED_FILE" >&2
+  fi
+  exit 2
+}
+gh_refused_exit() {
+  cat "$GH_REFUSED_FILE" >&2 2>/dev/null
+  exit 2
+}
+
 # gh_retry <read|write> <gh args...>: runs gh, prints its stdout, and returns 0 on success,
 # 3 when a retryable failure outlived the attempts, 1 when the failure was the API's answer.
-# With GH_RETRY_CALLER_ARGS=1 (cmd_retry's, set for a caller's own gh arguments) it also returns 2,
-# on its first attempt, when gh refused those arguments without sending anything.
+# GH_RETRY_CALLER_ARGS says whose arguments these are. Empty (every call but cmd_retry's) is this
+# script's own, and gh refusing one ends the command (gh_refused_own). `listed` is a caller's, on a
+# path gh_api_only_command reads: gh refusing it returns 2 on the first attempt, sent nothing.
+# `unlisted` is a caller's on any other path, whose stderr is not read as gh's.
 GH_RETRY_CALLER_ARGS=""
 gh_retry() {
   local mode="$1"
   shift
   local attempt=1 rc out tmp retryable delay="$API_BACKOFF"
+  [ ! -s "$GH_REFUSED_FILE" ] || exit 2
   # Keyed by the owning pid, like every other temporary path this script makes. The template was
   # `pr-review.XXXXXX`, and mktemp's suffix alone names no owner: a capture a killed call left
   # behind could not be told from a live sibling's by any later run, so nothing could ever collect
@@ -614,11 +690,12 @@ gh_retry() {
       return 0
     fi
     printf '%s' "${GH_ERR%%$'\n'*}" >"$GH_ERR_FILE" 2>/dev/null
-    # A refusal of the caller's arguments sent nothing, so under either policy there is nothing to
-    # retry and, for a write, nothing that could have landed.
-    if [ "$GH_RETRY_CALLER_ARGS" = 1 ] && gh_client_refusal "${GH_ERR%%$'\n'*}"; then
+    # A refusal of the arguments sent nothing, so under either policy there is nothing to retry
+    # and, for a write, nothing that could have landed.
+    if [ "$GH_RETRY_CALLER_ARGS" != unlisted ] && gh_client_refusal "${GH_ERR%%$'\n'*}"; then
       [ "$tmp" = /dev/null ] || { rm -f "$tmp"; GH_TMP_FILE=""; }
-      return 2
+      [ "$GH_RETRY_CALLER_ARGS" = listed ] && return 2
+      gh_refused_own "$@"
     fi
     # A fixed GraphQL answer is read FIRST, under both policies: its whole first line is GraphQL's
     # own message, which no gateway prints, while the substring scans below would match a marker the
@@ -4026,8 +4103,8 @@ cmd_retry() {
     cmd_run_watch "$@"
     return
   fi
-  local caller_args=""
-  gh_api_only_command "$@" && caller_args=1
+  local caller_args=unlisted
+  gh_api_only_command "$@" && caller_args=listed
   GH_RETRY_CALLER_ARGS="$caller_args" gh_retry "$mode" "$@"
   case "$?" in
   0) return 0 ;;
@@ -5895,7 +5972,10 @@ cmd_merge() {
     *) die "merge: unknown option '$1' (extra \`gh pr merge\` flags go after --)" ;;
     esac
   done
-  [ ${#gh_args[@]} -gt 0 ] || gh_args=(--merge) # the repo convention: preserve the commit series
+  # Whose arguments the merge call carries, for gh_retry: the script's alone, or with the caller's
+  # forwarded flags, which can name a refused flag or `--delete-branch` (see gh_api_only_command).
+  local merge_args=unlisted
+  [ ${#gh_args[@]} -gt 0 ] || { gh_args=(--merge) && merge_args=""; } # the repo convention: preserve the commit series
   # The head binding is the script's, not the caller's: a forwarded --match-head-commit would
   # follow the script's on the command line and could name a head the gate never read.
   for arg in "${gh_args[@]}"; do
@@ -6056,8 +6136,8 @@ cmd_merge() {
     # loop, so the ordinary path still makes exactly one queue read -- only a retry adds another,
     # which is a retry that has already waited for a mergeability recompute.
     [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
-    out=$(gh_retry write pr merge "$PR_NUM" --repo "$REPO" --match-head-commit "$CHECK_SHA" \
-      "${gh_args[@]}")
+    out=$(GH_RETRY_CALLER_ARGS="$merge_args" gh_retry write pr merge "$PR_NUM" --repo "$REPO" \
+      --match-head-commit "$CHECK_SHA" "${gh_args[@]}")
     rc=$?
     [ -n "$out" ] && printf '%s\n' "$out"
     [ "$rc" -eq 0 ] && break
@@ -7920,6 +8000,8 @@ cmd_base() {
 
 # --repo mirrors gh's own flag, so reaching for it out of gh habit works instead of hitting usage.
 main() {
+  GH_REFUSAL_PID=$$
+  trap gh_refused_exit USR2
   case "${1:-}" in
   --repo) REPO="${2:?--repo owner/name}" && shift 2 ;;
   --repo=*) REPO="${1#--repo=}" && shift ;;

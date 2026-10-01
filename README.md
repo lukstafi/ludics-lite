@@ -807,7 +807,16 @@ no request, exits 2 on its first attempt under both policies; its near-misses (a
 a second line, an unquoted field, a jq parse error, a terminal-dependent refusal) still retry to
 exit 3. So does the same line from any command path off the API-only allowlist: an alias or an
 extension, which gh hands every argument, or a built-in subcommand that runs git after a write
-(`repo fork --clone`, `pr merge`). The script's own calls keep the classification they had.
+(`repo fork --clone`, `pr merge`), or `discussion`, which an older gh hands to an extension.
+Cobra's `bad flag syntax` and `requires at least <n> arg(s)` joined the list from real calls
+(ludics-lite#468). And gh
+refusing an argument the script itself sends (ludics-lite#471: a gh upgrade renaming a field)
+stops the whole command with exit 2 and one message naming the refused call, its field values
+left out: the run await, a merge write, a reply, and `watch`, `merge`, `checks --wait` and `retry
+run watch` run as processes against a gh stub that refuses every call, each exiting 2 after that
+one call. `watch` used to hold its window blind and exit 3, the code that says re-arm.
+`test-pr-review-merge.sh` holds the merge call's half: the script's own flags refused is exit 2,
+and with the caller's flags forwarded after `--` the same refusal stays the ambiguous exit 3.
 
 `test-pr-review-status.sh` drives `status` and `watch` against canned reactions, reviews,
 comments and PR reads, and pins the mergeability that rides on every state line: a PR whose merge
