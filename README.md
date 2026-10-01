@@ -983,23 +983,26 @@ no run history whose filter nobody read — each costing the grace rather than a
 re-confirm, since a settle for an older verdict must not be handed to a tip that moved under the
 round.
 
-Five cases across those suites are on the CLOCK — a retuned grace, a `--wait` ceiling, a delay
-inside the fixture — and they went red on a loaded machine twice before settling into one shape,
-which the shared transport now writes down and provides: the grace is spent by an explicit delay
-inside the first round's own reads (`spend_grace`), the fixture's event lands on round one
-(`at_round`, counted on the runs-feed read, which is one per round by construction), and the
-ceiling is kept clear of both. Counting ROUNDS against a clock was the trap: a round launches a
-fixture and several jq subprocesses, so under load four happened where five were counted on and a
-tip move landed on the wrong side of the grace (ludics-lite#169). A case that wants to know how
-far a wait got reads `rounds_polled` rather than elapsed time. A case that needs a run of a given
-AGE has the fixture stamp it as the feed is read (`aged_at_read`) rather than compute it from its
-own clock before the run, since the gap between the two is load; and `delay_after_runs_read` puts
-wall clock between round one's runs read and everything the round checks after it, which tells a
-clock taken before the reads from one taken after. A runs feed can also change between rounds
-(`runs_from_round`, ludics-lite#426), so a run that finishes, or a moved tip's own run, is pinned
-by what the next round makes of it. Executed rather than sourced, the transport runs its own
-controls over those devices — read a `gh` call at a time, with no `base` run around them, since a
-control driven through the wait loop would be on the clock itself.
+Some cases across those suites are on the CLOCK — a retuned grace, a `--wait` ceiling, a delay
+inside the fixture — and they went red on a loaded machine twice and on the Git Bash runner once
+before settling into one shape, which the shared transport now writes down and provides: the grace
+is spent by an explicit delay inside the first round's own reads (`spend_grace`), the fixture's
+events land on counted rounds (`at_round` moves the tip and `runs_from_round`, ludics-lite#426,
+changes a workflow's runs, both counted on the runs-feed read, which is one per round by
+construction), and a case that has to reach a round ENDS its wait on an event there, with a
+ceiling (`EVENT_CEILING`) that only a broken case reaches. Counting ROUNDS against a clock was the
+trap, twice: a round launches a fixture and several jq subprocesses, so under load four happened
+where five were counted on and a tip move landed on the wrong side of the grace (ludics-lite#169),
+and on the Git Bash runner one round outran the `--wait=2` that was counted on to hold two
+(ludics-lite#375). A case that wants to know how far a wait got reads `rounds_polled` rather than
+elapsed time, and a case whose subject is the ceiling asserts only what holds however few rounds
+fit under it. A case that needs a run of a given AGE has the fixture stamp it as the feed is read
+(`aged_at_read`) rather than compute it from its own clock before the run, since the gap between
+the two is load; and `delay_after_runs_read` puts wall clock between round one's runs read and
+everything the round checks after it, which tells a clock taken before the reads from one taken
+after. Executed rather than sourced, the transport runs its own controls over those devices — read
+a `gh` call at a time, with no `base` run around them, since a control driven through the wait
+loop would be on the clock itself.
 
 `test-pr-review-base-verdict.sh` pins what the wait loop DECIDES (ludics-lite#93). A red at the tip is the
 tip's own verdict and ends the wait on the round that saw it; a red behind an unjudged tip is the

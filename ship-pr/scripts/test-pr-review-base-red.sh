@@ -16,7 +16,8 @@
 # suite's fixtures are sized against that, not against a repository's whole history.
 #
 # The fixture transport is test-pr-review-base-lib.sh, shared with the settle and verdict suites
-# (ludics-lite#179); what this file holds is the red report's own cases.
+# (ludics-lite#179); what this file holds is the red report's own cases. The one that crosses
+# rounds counts them, under the wall-clock idiom that file's header writes down.
 
 set -euo pipefail
 
@@ -186,8 +187,14 @@ test_two_workflows_sharing_a_name_keep_their_streaks_apart() {
 # workflow unless it is remembered. It was not, for one round of review: the caller took the
 # detail through a command substitution, and every cache record the function wrote died with that
 # subshell — a cache that could never hit, which is invisible except in the call count.
+#
+# The rounds are COUNTED, not timed (ludics-lite#375): the red stands for two rounds, and on the
+# third a second workflow's run at the tip concludes red, which is what ends the wait. A `--wait=2`
+# that was counted on to hold two rounds held one on the Git Bash runner, where a round outruns two
+# seconds.
 test_a_standing_red_is_read_once_across_wait_rounds() {
   reset_fixture
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"lint"}]')
   # The shape that keeps a wait going: the tip is still being judged, and the red standing behind
   # it belongs to an older commit, so nothing breaks the loop early.
   RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" --arg a "$SHA_A" \
@@ -195,26 +202,46 @@ test_a_standing_red_is_read_once_across_wait_rounds() {
       {conclusion:"failure", head_sha:$b, id:3040},
       {conclusion:"success", head_sha:$a, id:3039}]')")
   JOBS_3040=$(jobs_json '[{"name":"fixtures (macos)","conclusion":"failure"}]')
+  RUNS_2=$(runs_json 2 "$(jq -cn --arg c "$SHA_C" \
+    '[{status:"in_progress", conclusion:null, head_sha:$c, id:4041, name:"lint"}]')")
+  runs_from_round 3 2 "$(jq -cn --arg c "$SHA_C" \
+    '[{conclusion:"failure", head_sha:$c, id:4041, name:"lint"}]')"
+  JOBS_4041=$(jobs_json '[{"name":"shellcheck","conclusion":"failure"}]')
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 1 "the red at the tip on round three ends the wait ($BASE_OUTPUT)"
+  # Three reads of the runs feed, every one of them over the standing red, are what make the
+  # single jobs read below evidence of anything.
+  assert_eq "$(rounds_polled)" 3 "the wait runs two rounds over the standing red, and ends on the third"
+  assert_eq "$(grep -c "actions/runs/3040/jobs" "$REQUEST_LOG")" 1 \
+    "the standing red's jobs should be read once, not once per round"
+  assert_contains "$BASE_OUTPUT" "failed job(s): fixtures (macos) (failure)" \
+    "the remembered line should still be printed on the rounds that did not read"
+  assert_contains "$BASE_OUTPUT" "failed job(s): shellcheck (failure)" \
+    "and the red that ended the wait is reported beside it"
+}
+
+# ... and when the wait runs out with that red still standing, it says NO VERDICT INSTEAD of the
+# red, not under it: at the ceiling with an older tip's red standing, the red headline would claim
+# "failed on the tip you are about to branch from" about a commit that has no verdict yet, and send
+# the caller fixing a fix already in flight. This case is about the ceiling, and asserts only what
+# holds however few rounds fit under it.
+test_a_wait_that_runs_out_over_an_older_red_has_no_verdict() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" --arg a "$SHA_A" \
+    '[{status:"in_progress", conclusion:null, head_sha:$c, id:3041},
+      {conclusion:"failure", head_sha:$b, id:3040},
+      {conclusion:"success", head_sha:$a, id:3039}]')")
+  JOBS_3040=$(jobs_json '[{"name":"fixtures (macos)","conclusion":"failure"}]')
   run_base --wait=2
   assert_eq "$BASE_RC" 4 "a wait that ends with the tip unjudged is no verdict"
-  # ... and it says so INSTEAD of the red, not under it: at the ceiling with an older tip's red
-  # standing, the red headline would claim "failed on the tip you are about to branch from" about
-  # a commit that has no verdict yet, and send the caller fixing a fix already in flight.
   assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_C:0:8}" \
     "the honest headline is about the tip, which nothing here has judged"
   assert_not_contains "$BASE_OUTPUT" "is RED" \
     "an older tip's red must not headline as the tip's own verdict"
   assert_contains "$BASE_OUTPUT" "RED      ci" \
     "and the older red stays visible in the per-workflow lines under that headline"
-  # Two reads of the runs feed prove the loop really went round more than once, which is what
-  # makes the single jobs read below evidence of anything.
-  local rounds
-  rounds=$(rounds_polled)
-  [ "$rounds" -ge 2 ] || bail "the wait should have polled more than once (got $rounds rounds)"
-  assert_eq "$(grep -c "actions/runs/3040/jobs" "$REQUEST_LOG")" 1 \
-    "the standing red's jobs should be read once, not once per round"
   assert_contains "$BASE_OUTPUT" "failed job(s): fixtures (macos) (failure)" \
-    "the remembered line should still be printed on the rounds that did not read"
+    "with the job that failed in it"
 }
 
 tests=(
@@ -226,6 +253,7 @@ tests=(
   test_a_green_base_asks_for_no_jobs
   test_two_workflows_sharing_a_name_keep_their_streaks_apart
   test_a_standing_red_is_read_once_across_wait_rounds
+  test_a_wait_that_runs_out_over_an_older_red_has_no_verdict
 )
 
 run_tests "${tests[@]}"

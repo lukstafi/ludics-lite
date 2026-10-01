@@ -308,7 +308,7 @@ reset_fixture() {
 }
 
 gh() {
-  local response="" rid wid sha base reads round=""
+  local response="" rid wid sha base head reads round=""
   # The delay, once — on the FIRST read of the run, which is the round's tip read.
   if [ -n "$FIRST_READ_DELAY" ] && ! grep -qx 'first read' "$DELAY_LOG"; then
     printf 'first read\n' >>"$DELAY_LOG"
@@ -401,12 +401,17 @@ gh() {
   "repos/$REPO/contents/"*) response="$WORKFLOW_YAML" ;;
   "repos/$REPO/compare/"*)
     # Oldest first, so each commit's first parent is the one before it and the first commit's is
-    # the compare's base — the judged commit, which the endpoint names in the path.
+    # the compare's base — the judged commit, which the endpoint names in the path. A list that
+    # holds the endpoint's HEAD ends there, as the API's answer does: a case whose tip moves names
+    # both tips in one chain, and each round's compare reaches its own (#375).
     base=${FIXTURE_ENDPOINT#*/compare/}
+    head=${base#*...}
+    head=${head%%\?*}
     base=${base%%...*}
-    response=$(jq -cn --argjson c "$COMPARE_COMMITS" --arg t "$COMPARE_TOTAL" \
+    response=$(jq -cn --argjson c "$COMPARE_COMMITS" --arg t "$COMPARE_TOTAL" --arg h "$head" \
       --arg b "$base" --arg behind "$COMPARE_BEHIND" --argjson p "${COMPARE_PARENTS:-null}" \
-      '{total_commits: (if $t == "" then ($c | length) else ($t | tonumber) end),
+      '($c | index($h)) as $at | (if $at == null then $c else $c[0:$at + 1] end) as $c |
+       {total_commits: (if $t == "" then ($c | length) else ($t | tonumber) end),
         behind_by: (if $behind == "" then 0 else ($behind | tonumber) end),
         commits: [$c | to_entries[] |
           {sha: .value,
@@ -449,31 +454,32 @@ all_red_runs() {
   jq -cn --argjson n "$1" '[range($n) | {conclusion: "failure"}]'
 }
 
-# --- the wall-clock idiom (ludics-lite#169, #179) ---------------------------------------------
-# Five cases here depend on SECONDS: a retuned grace, a `--wait` ceiling, and a delay inside the
+# --- the wall-clock idiom (ludics-lite#169, #179, #375) ----------------------------------------
+# Some cases here depend on SECONDS: a retuned grace, a `--wait` ceiling, and a delay inside the
 # fixture. They are the only cases in this repository whose fixture and whose subject are both on
-# the clock, and they went red on a loaded machine twice before settling into one shape. It is
-# three rules, and each of them is a thing that failed (a fourth, below them, keeps a case that
-# needs an AGE off the clock altogether):
+# the clock, and they went red on a loaded machine twice, then on the Git Bash runner, before
+# settling into one shape. It is three rules, and each of them is a thing that failed (a fourth,
+# below them, keeps a case that needs an AGE off the clock altogether):
 #
 #   Put the clock in an explicit DELAY. The grace is spent by `spend_grace <seconds>`, which
 #   holds up the round's FIRST read by that much, and never by "however long N rounds take".
 #   `CHECKS_INTERVAL=1` makes a round about a second on an idle box and rather more on a busy
 #   one, so a case counting rounds against a grace is a case that passes when the box is quiet.
 #
-#   Put the fixture's EVENT on round one. `at_round <n> <sha>` moves the branch on the runs-feed
-#   read count, which is one per round by construction — but the `n` every case here passes is 1.
-#   A tip that moved "five rounds in" was counted in tip READS, of which a round takes one or
-#   two depending on which break re-confirms, and where a round launches a fixture and several
-#   jq subprocesses: under load four rounds happened where five were counted on, and the move
-#   landed on the wrong side of the clock (#169, round 2).
+#   Put the fixture's EVENTS on ROUNDS, counted. `at_round <n> <sha>` moves the branch and
+#   `runs_from_round <n> <id> <runs>` changes a workflow's runs, both on the runs-feed read count,
+#   which is one per round by construction. A tip that moved "five rounds in" was once counted in
+#   tip READS, of which a round takes one or two, and under load four rounds happened where five
+#   were counted on (#169, round 2).
 #
-#   Keep the CEILING clear of both. `--wait=<n>` must not be able to arrive during the delay or
-#   within a round of the grace it is sized against, in either direction; a ceiling that can
-#   overtake the event is a case that reports the wrong reason for the right exit code.
-#
-# What is NOT on the clock stays off it: a case that wants an ordinary round asks for `--wait=2`
-# and reads `rounds_polled`, not elapsed time.
+#   END a wait that has to reach a round on an EVENT, never on its ceiling. A round on the Git
+#   Bash runner — a fixture and several jq.exe spawns — outran the two seconds `--wait=2` was
+#   counted on to hold two of them, and a six-second ceiling sized to land after round one landed
+#   inside it (#375). So a case that needs round <n> makes round <n> end the wait: a run that
+#   completes from then on, a tip that moves, a grace that runs out. Its ceiling is
+#   `--wait=$EVENT_CEILING`, a safety net that only a broken case reaches, and its claim about how
+#   far the wait got is `rounds_polled`. A case whose ceiling IS its subject (the headline a wait
+#   prints when it runs out) asserts only what holds however few rounds fit under it.
 #
 #   Stamp an AGE at the READ. A case that needs a run of a given age when `base` reads it —
 #   just inside a window, just past it — has it stamped by the fixture as it serves the feed
@@ -482,6 +488,10 @@ all_red_runs() {
 #   at the read, an age the script measures at its own snapshot (taken before the read) can only
 #   come out at or under the stamp, and one measured after a `delay_after_runs_read` of <d>
 #   seconds at or over the stamp plus <d> — whatever the box's load.
+
+# The ceiling of a case that ends its wait on an event: an order of magnitude past the longest
+# such case's rounds on the slowest runner, so reaching it says the case is broken, not slow.
+EVENT_CEILING=60
 
 # spend_grace <seconds>: hold up the fixture's FIRST read by <seconds>, once. An API round takes
 # time, and the grace is measured from when the tip was first READ, so a case that needs the grace
@@ -554,7 +564,7 @@ protect_library "${BASH_SOURCE[0]}"
 
 # --- executed: this file's own controls --------------------------------------------------------
 # What is controlled here is the TRANSPORT, read directly — a `gh` call at a time, with no `base`
-# run around it. The three wall-clock devices above are the whole reason: a control that drove
+# run around it. The wall-clock devices above are the whole reason: a control that drove
 # them through `cmd_base` would be on the clock itself, which is the property that made the cases
 # they exist for flaky in the first place.
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0
@@ -656,6 +666,21 @@ test_a_runs_feed_changes_on_the_round_it_names() {
   assert_eq "$(runs_feed 1)" "" "a per-round feed is cleared with the rest of the fixture"
   runs_read 1
   assert_eq "$(runs_feed 1)" "" "on every round"
+}
+
+# A compare ends at the head it names, as the API's does, so one chain serves a case whose tip
+# moves: each round's walk reaches its own tip. A head the list does not hold gets the whole list,
+# which is how a case says the range never reaches the tip.
+test_a_compare_ends_at_its_head() {
+  local q='[.total_commits, (.commits[] | .sha[0:1] + "<" + .parents[0].sha[0:1])] | join(" ")'
+  reset_fixture
+  COMPARE_COMMITS=$(jq -cn --arg b "$SHA_B" --arg c "$SHA_C" '[$c, $b]')
+  assert_eq "$(fixture_gh "compare/$SHA_A...$SHA_C?per_page=20" --jq "$q")" "1 c<a" \
+    "the range to the first tip stops there"
+  assert_eq "$(fixture_gh "compare/$SHA_A...$SHA_B?per_page=20" --jq "$q")" "2 c<a b<c" \
+    "and the successor's runs through it"
+  assert_eq "$(fixture_gh "compare/$SHA_A...$SHA_0?per_page=20" --jq "$q")" "2 c<a b<c" \
+    "a head outside the list gets all of it"
 }
 
 # The delay after the runs read is round one's, and it happens once, AFTER that read is answered
@@ -812,6 +837,7 @@ tests=(
   test_a_runs_feed_changes_on_the_round_it_names
   test_the_runs_read_delay_is_round_ones_and_once
   test_an_aged_run_is_stamped_at_the_read
+  test_a_compare_ends_at_its_head
   test_the_fixture_setters_refuse_what_they_cannot_mean
   test_a_suite_that_skips_the_preamble_is_refused
   test_a_suite_that_shadows_the_transport_is_refused
