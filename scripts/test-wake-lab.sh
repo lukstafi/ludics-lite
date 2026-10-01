@@ -2598,7 +2598,8 @@ while IFS= read -r v; do SWEEP_SHELL_VARS+=("$v"); done \
 # bash variable, as a whole word, since bash defines it even under `env -i`. Each would quietly
 # take a value or a branch where the sweep had another, which is ludics-lite#469's shape again
 # with the error swallowed. SECONDS is bound by the callers, being bash's own clock in any
-# environment. Refused outright: `${!`, whose target no reader of the text can name; a `-v` whose
+# environment. It reads logical lines, a backslash-newline joined first, as bash parses them.
+# Refused outright: `${!`, whose target no reader of the text can name; a `-v` whose
 # operand is neither a bare name nor an awk-style `name=value` (quoted, or computed); anything that
 # could turn `set -u` off -- a `set` given a `+` option or a computed argument, or any mention of
 # `nounset`; and code the text does not show, `eval`, `source` and a `.` command. It reads the
@@ -2619,7 +2620,11 @@ fragment_defaulted() {
     my %seen;
     my $id = qr/[A-Za-z_][A-Za-z0-9_]*/;
     open my $fh, "<", $file or die "$file: $!\n";
-    while (<$fh>) {
+    my $text = do { local $/; <$fh> };
+    close $fh or die "$file: $!\n";
+    # Logical lines, as bash reads them: a backslash-newline is removed before parsing.
+    $text =~ s/\\\n//g;
+    for (split /\n/, $text) {
       my @refused;
       push @refused, "\${!" if /\$\{!/;
       push @refused, $1 while /\b(set[ \t][^\n;|&]*?[+\$][^\n;|&]*?)[ \t]*(?=$|[;|&}])/g;
@@ -2634,8 +2639,7 @@ fragment_defaulted() {
       }
       for (@refused) { print "refused $_\n" unless $seen{"refused $_"}++ }
       for my $n (@names) { print "$n\n" unless $ok{$n} || $seen{$n}++ }
-    }
-    close $fh or die "$file: $!\n";' "$@"
+    }' "$@"
 }
 # The negative control, which needs no staging checkout and so runs in CI too: a check that cannot
 # fail proves nothing. Each planted_* reads one name nothing binds, in a way the copy step's old
@@ -2660,6 +2664,10 @@ planted_shell() { [ "$SHELL" = /bin/zsh ] && printf '%s\n' zsh; }
 planted_status() { [ "${PIPESTATUS[0]}" = 1 ] && printf '%s\n' failed; }
 planted_optset() { local o=u; set +$o; }
 planted_eval() { eval "$PLANTED_CODE"; }
+planted_continued() {
+  set \
+-o pipefail +u
+}
 EOF
 sweep_env "$LOCKS" "$TMP/sweep-home-planted"
 for planted in plain branch arith subst; do
@@ -2680,7 +2688,7 @@ if out=$(fragment_defaulted "$TMP/planted-fragment.sh" "${SWEEP_ENV[@]%%=*}" SEC
            ${SWEEP_SHELL_VARS[@]+"${SWEEP_SHELL_VARS[@]}"}); then
   want=$(printf '%s\n' PLANTED_DEFAULTED 'refused ${!' PLANTED_TESTED PLANTED_ARRAY \
     'refused set +u' 'refused -v "$PLANTED_NAME"' PLANTED_COMPOUND SHELL PIPESTATUS \
-    'refused set +$o' 'refused eval')
+    'refused set +$o' 'refused eval' 'refused set -o pipefail +u')
   [ "$out" = "$want" ] \
     && ok "the text check reports exactly the planted reads set -u lets through unset" \
     || ko "the text check is off on the planted fragment -- want [$want], got [$out]"
