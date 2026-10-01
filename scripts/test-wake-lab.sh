@@ -2574,10 +2574,12 @@ SWEEP_FOREIGN=(lab_box_of:i:1)
 # (`declare -f` in a clean shell: comments gone, one statement per line, the body's own level
 # indented four spaces), and the fragment's top-level lines as written, those outside the
 # `name() {` ... `}` ranges the copy step cuts.
-# - A READ is any `$name`, `${name` or `${#name`, quoted or not, and every name inside a `((...))`
-#   or inside the `[...]` of a subscript (`${a[i]}`, `a[i]=`), which bash evaluates
-#   arithmetically. Reads inside single quotes count too, so an awk or perl `$name` is
-#   over-reported, never missed; SWEEP_FOREIGN exempts a counted number of them.
+# - A READ is any `$name`, `${name` or `${#name`, quoted or not, and every name in each place bash
+#   evaluates arithmetically: `((...))` and `$((...))`, `$[...]`, an array subscript (`${a[i]}`,
+#   `a[i]=`, `a=([i]=v)`), and a substring's offset and length (`${s:o:l}`, but not the word of
+#   `${s:-w}`, `${s:=w}`, `${s:?w}` or `${s:+w}`, which is text). The other arithmetic contexts
+#   (`let`, `[[ ]]`, `local -i`) are refused below. Reads inside single quotes count too, so an
+#   awk or perl `$name` is over-reported, never missed; SWEEP_FOREIGN exempts a counted number.
 # - A name is BOUND by SWEEP_BOUND; by a top-level assignment that is a statement of its own (one
 #   prefixed to a command, `FOO=x cmd`, or in a pipeline is gone when that command ends); and,
 #   within one function, ONLY by a `local` at the body's own level. An assignment in the body binds
@@ -2639,7 +2641,9 @@ fragment_unbound() {
         }
       }
       $reads{$1}++ while $text =~ /\$\{?#?($id)/g;
-      for my $arith ($text =~ /\(\((.*?)\)\)/sg, $text =~ /\w\[([^\]\n]*)\]/g) {
+      for my $arith ($text =~ /\(\((.*?)\)\)/sg, $text =~ /\$\[([^\]]*)\]/g,
+                     $text =~ /\w\[([^\]\n]*)\]/g, $text =~ /[(\s]\[([^\]\n]*)\]\+?=/g,
+                     $text =~ /\$\{$id:(?![-=?+])([^}]*)\}/g) {
         (my $expr = $arith) =~ s/\$\([^()]*\)//g;
         $reads{$1}++ while $expr =~ /(?<![\w#])($id)/g;
       }
@@ -2669,6 +2673,8 @@ take_lab_lock() {
   PLANTED_GLOBAL=set-here
   printf '%s\n' "$path $deadline ${#LAB_MAP} $stamp ${waits[PLANTED_INDEX]} ${waits[deadline]}"
   printf '%s\n' "$PLANTED_PREFIX $PLANTED_GLOBAL"
+  waits=([PLANTED_SLOT]=3)
+  printf '%s\n' "${box:PLANTED_OFFSET:2} ${box:-PLANTED_DEFAULT_WORD} $[PLANTED_OLD + 1]"
 }
 planted_refused() {
   let n=PLANTED_LET+1
@@ -2678,7 +2684,8 @@ EOF
 out=$(fragment_unbound "$TMP/planted-fragment.sh")
 want=$(printf '%s\n' 'lab_box_of: PLANTED_MAP' 'lab_box_of: i' \
   'planted_refused: refused let' 'planted_refused: refused (' \
-  'take_lab_lock: PLANTED_GLOBAL' 'take_lab_lock: PLANTED_INDEX' 'take_lab_lock: PLANTED_PREFIX' \
+  'take_lab_lock: PLANTED_GLOBAL' 'take_lab_lock: PLANTED_INDEX' 'take_lab_lock: PLANTED_OFFSET' \
+  'take_lab_lock: PLANTED_OLD' 'take_lab_lock: PLANTED_PREFIX' 'take_lab_lock: PLANTED_SLOT' \
   'take_lab_lock: PLANTED_WAIT')
 [ "$out" = "$want" ] \
   && ok "the copy step's unbound-variable check flags exactly the planted reads and refusals" \
