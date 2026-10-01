@@ -69,8 +69,8 @@ test_tmpdir TEST_ROOT base-fixture
 REPO=example/repo
 BRANCH=main
 REQUEST_LOG="$TEST_ROOT/requests"
-# What the fixture `gh` records as PAGINATED: a commit's files are served 30 to a page, so the
-# read that walks them has to ask for every one.
+# What the fixture `gh` records as PAGINATED: a commit's files are served 300 to a default page,
+# so the read that walks them has to ask for every one.
 PAGINATE_LOG="$TEST_ROOT/paginated"
 
 # Four commits, oldest last, in the order the fixtures list their runs.

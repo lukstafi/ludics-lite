@@ -959,10 +959,10 @@ its first parent, so a merge reached through its second parent would hide, behin
 first-parent diff, everything the push carried — and after a force-push the judged commit is not an
 ancestor at all, which `behind_by` says. The one filter read has to be the one that applied, too —
 so no commit on the path may touch the workflow file, and each commit's files are read across every
-page, since that endpoint serves thirty at a time. The cases pin both directions
+page, since that endpoint serves 300 at a time by default. The cases pin both directions
 — a source file in the range, a source change reverted inside it, a workflow file changed inside
 it, a judged commit that is not an ancestor, a merge reached through its second parent, a range
-past the commit cap or only partly in hand, a file list at the endpoint's own cap, a
+past the commit cap or only partly in hand, a file list of 300 (one default page), a
 filter pattern the translation does not carry, a workflow file naming no filter, a workflow with
 no run history whose filter nobody read — each costing the grace rather than a settle, and the tip
 re-confirm, since a settle for an older verdict must not be handed to a tip that moved under the
