@@ -603,17 +603,32 @@ test_git_windows_drive_path_is_absolute() {
   echo "PASS: a Git for Windows drive-rooted path is not joined to the checkout"
 }
 
+# The runner clears the environment's Git configuration for every case (isolate_git_config), so
+# the helper's own clearing of it -- `git rev-parse --local-env-vars` lists GIT_CONFIG_COUNT and
+# GIT_CONFIG_PARAMETERS -- is exercised here alone, set on the helper's call. Each names an
+# `origin` upload-pack program that does not exist (a single-valued key: an extra
+# `remote.origin.url` would only append to the repository's own), and each is first shown to break
+# the case's `ls-remote` when honoured.
 test_git_local_environment_is_cleared() {
-  local foreign_index
+  local foreign_index nowhere
   setup_case git-local-environment merge main-off
   foreign_index="$TEST_ROOT/foreign-index"
+  nowhere=ship-pr-test-no-such-upload-pack
   cp "$(git -C "$CASE_MAIN" rev-parse --absolute-git-dir)/index" "$foreign_index"
+  ! GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.uploadpack GIT_CONFIG_VALUE_0="$nowhere" \
+    git -C "$CASE_MAIN" ls-remote origin >/dev/null 2>&1 ||
+    fail "the fixture's GIT_CONFIG_COUNT pair did not break origin, so its clearing is untested"
+  ! GIT_CONFIG_PARAMETERS="'remote.origin.uploadpack'='$nowhere'" \
+    git -C "$CASE_MAIN" ls-remote origin >/dev/null 2>&1 ||
+    fail "the fixture's GIT_CONFIG_PARAMETERS did not break origin, so its clearing is untested"
 
   GIT_DIR="$TEST_ROOT/not-a-repository" GIT_INDEX_FILE="$foreign_index" \
     GIT_WORK_TREE="$TEST_ROOT/not-a-worktree" \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.uploadpack GIT_CONFIG_VALUE_0="$nowhere" \
+    GIT_CONFIG_PARAMETERS="'remote.origin.uploadpack'='$nowhere'" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
   assert_cleaned
-  echo "PASS: repository-selection environment is cleared before path validation"
+  echo "PASS: repository-selection and configuration environment is cleared before path validation"
 }
 
 test_non_files_ref_backend_refusal() {
@@ -5163,6 +5178,60 @@ test_runner_counts_a_stated_boundary() {
   echo "PASS: a stated boundary is printed under its case and counted in the summary, verbose or failing"
 }
 
+# ludics-lite#386: a `core.hooksPath` in the configuration the suite is run under sends Git past
+# the race-injection hook a case writes to `.git/hooks`. It is planted here through each channel
+# isolate_git_config closes -- the user's global file found through HOME, a GIT_CONFIG_GLOBAL file,
+# a GIT_CONFIG_SYSTEM file, a GIT_CONFIG_COUNT pair, GIT_CONFIG_PARAMETERS -- and each is first
+# shown to reach Git from where the suite is started. A copy of the runner then runs a race case
+# under it, and the race must still fire: test_remote_master_lease's pre-push hook rewrites the
+# remote base, and the case fails if the helper never saw it. The negative control strips the
+# isolation from a copy: the same case under the HOME leg must then go red on the race it no
+# longer ran, which is what makes the passing legs a test of the isolation and not of the case.
+test_runner_isolates_ambient_git_config() {
+  local tag="gc$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" home="$TEST_ROOT/home"
+  local hooks="$TEST_ROOT/ambient-hooks" planted="$TEST_ROOT/ambient.gitconfig" leg leg_env patched rc
+  local race=test_remote_master_lease
+  mkdir -p "$home" "$hooks"
+  git config --file "$planted" core.hooksPath "$hooks"
+  cp "$planted" "$home/.gitconfig"
+  copy_runner "$copy" "$tag"
+  for leg in home global system count parameters; do
+    # The outer runner's own isolation is removed first, so the leg is what the copy inherits.
+    leg_env=(env -u GIT_CONFIG_NOSYSTEM -u GIT_CONFIG_GLOBAL -u XDG_CONFIG_HOME)
+    case "$leg" in
+    home) leg_env+=(HOME="$home") ;;
+    global) leg_env+=(GIT_CONFIG_GLOBAL="$planted") ;;
+    system) leg_env+=(GIT_CONFIG_SYSTEM="$planted") ;;
+    count) leg_env+=(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$hooks") ;;
+    parameters) leg_env+=(GIT_CONFIG_PARAMETERS="'core.hookspath'='$hooks'") ;;
+    esac
+    [ -n "$(cd "$TEST_ROOT" && "${leg_env[@]}" git config --get core.hooksPath)" ] ||
+      fail "the planted core.hooksPath does not reach Git through the $leg leg, so the leg tests nothing"
+    if run_copy "${leg_env[@]}" "$copy/test-post-merge-cleanup.sh" -j 1 "$race" >"$out" 2>&1 </dev/null; then
+      rc=0
+    else
+      rc=$?
+    fi
+    [ "$rc" -eq 0 ] || fail "a core.hooksPath planted through the $leg leg reached the race case (exit $rc): $(cat "$out")"
+  done
+  assert_copy_root_gone "$tag"
+
+  rm -rf "$copy"
+  copy_runner "$copy" "$tag-open"
+  patched=$(sed 's/^  isolate_git_config$/  :/' "$copy/test-post-merge-cleanup.sh")
+  printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
+  ! grep -q '^  isolate_git_config$' "$copy/test-post-merge-cleanup.sh" ||
+    fail "could not strip the isolation from the copy"
+  if run_copy env -u GIT_CONFIG_NOSYSTEM -u GIT_CONFIG_GLOBAL -u XDG_CONFIG_HOME HOME="$home" \
+    "$copy/test-post-merge-cleanup.sh" -j 1 "$race" >"$out" 2>&1 </dev/null; then
+    fail "negative control: without the isolation the race case passed under a global core.hooksPath, so the isolation is not what this case tests: $(cat "$out")"
+  fi
+  grep -qxF 'FAIL: topic deletion ignored a concurrent remote master rewrite' "$out" ||
+    fail "negative control: the copy without the isolation failed, but not on the race it skipped: $(cat "$out")"
+  assert_copy_root_gone "$tag-open"
+  echo "PASS: a core.hooksPath planted through the global, system or environment configuration leaves a race fixture firing; without the isolation it does not"
+}
+
 TESTS=(
   test_unchecked_out_master
   test_master_owned_by_main
@@ -5318,6 +5387,7 @@ TESTS=(
   test_runner_refuses_bad_arguments
   test_runner_help_ignores_inherited_pids
   test_runner_counts_a_stated_boundary
+  test_runner_isolates_ambient_git_config
 )
 
 usage() {
@@ -5508,7 +5578,36 @@ run_case() {
   TEST_ROOT="$TEST_ROOT/$2"
   CASE_NAME="$name" # skip_boundary names its line with it
   mkdir -p "$TEST_ROOT" || exit 1
+  isolate_git_config
   "$name"
+}
+
+# isolate_git_config: the case's Git -- its fixtures, its hooks, and the helper, which inherits
+# this -- reads the case's repositories' own configuration and one scratch global file, nothing
+# else (ludics-lite#386). A user's global `core.hooksPath` sent Git past every race-injection hook
+# a case writes to `.git/hooks`, so the case's verdict was the user's configuration's, not the
+# helper's; a global `init.templateDir`, `user.*`, `init.defaultBranch` and the rest reached every
+# fixture the same way. Cleared: the system file (GIT_CONFIG_NOSYSTEM, which also outranks a
+# GIT_CONFIG_SYSTEM), the global and XDG files (GIT_CONFIG_GLOBAL names the scratch one instead;
+# Git >= 2.32), and the configuration the environment carries (GIT_CONFIG_COUNT with its
+# GIT_CONFIG_KEY_n/VALUE_n pairs, GIT_CONFIG_PARAMETERS, the legacy GIT_CONFIG). The scratch file
+# pins `init.defaultBranch` to Git's built-in default, which also silences the hint every
+# `git init --bare` printed. Not cleared: Git's other environment (GIT_EDITOR, GIT_TRACE, GIT_SSH
+# ...), which no case's verdict has been seen to depend on. The helper clearing the environment
+# configuration itself is test_git_local_environment_is_cleared's to pin, which sets it on the
+# helper's call alone. Fail-closed: a Git that ignores any of this (GIT_CONFIG_GLOBAL before 2.32)
+# lists more than the scratch file outside a repository, and the case fails before it runs.
+# test_runner_isolates_ambient_git_config plants a hooksPath through each channel.
+isolate_git_config() {
+  local listed
+  unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_SYSTEM
+  export GIT_CONFIG_NOSYSTEM=1
+  export GIT_CONFIG_GLOBAL="$TEST_ROOT/.ship-pr-test-gitconfig"
+  printf '%s\n' '[init]' '	defaultBranch = master' >"$GIT_CONFIG_GLOBAL" ||
+    fail "could not write the case's scratch global Git configuration"
+  listed=$(CDPATH= cd "$TEST_ROOT" && git config --list 2>&1) || listed="(git config --list failed: $listed)"
+  [ "$listed" = init.defaultbranch=master ] ||
+    fail "Git still reads configuration from outside the case ($(git --version)); outside a repository it lists: $listed"
 }
 
 SPAWNED=0 # the next case's index in the RUNNING_* arrays, which unset leaves sparse
