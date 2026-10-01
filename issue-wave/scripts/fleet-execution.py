@@ -325,8 +325,7 @@ def check_capacity(data, records, canonical_hosts, slots_spec, window=False):
 
 def suspend(record, window, now, coordinator):
     """Move a standing record into the window's suspension (see the header)."""
-    if record["state"] != "suspended":
-        record["suspended_from"] = record["state"]
+    record["suspended_from"] = record["state"]
     record["state"] = "suspended"
     record["suspended_by"] = window
     record["updated_at"] = now
