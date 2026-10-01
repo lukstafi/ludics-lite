@@ -605,7 +605,9 @@ STUB
     read -r -a cmd <<<"$spec"
     : >"$CALL_LOG"
     set +e
-    out=$(STUB_LOG="$CALL_LOG" PATH="$stub:$PATH" TMPDIR="$tmp" SHIP_PR_TEST_SOURCE_ONLY='' \
+    # `env -i`, as the lib's constants probe does: an exported `gh` function (this suite's own,
+    # under the hostile runner's inherited names) outranks the stub on PATH in the child.
+    out=$(env -i "PATH=$stub:$PATH" "HOME=${HOME:-}" "TMPDIR=$tmp" "STUB_LOG=$CALL_LOG" \
       SHIP_PR_API_ATTEMPTS=3 WATCH_TIMEOUT=4 WATCH_INTERVAL=1 SHIP_PR_CHECKS_WAIT=4 \
       bash "$HELPER" "${cmd[@]}" 2>&1)
     rc=$?
