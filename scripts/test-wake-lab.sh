@@ -2574,7 +2574,9 @@ SWEEP_FOREIGN=(lab_box_of:i)
 # `${#name`, quoted or not, and every name inside a `((...))` or inside the `[...]` of a subscript
 # (`${a[i]}`, `a[i]=`), which bash evaluates arithmetically. A name is BOUND by SWEEP_BOUND, by an
 # assignment on the fragment's top level, and, within one function, by its `local` list or an
-# assignment anywhere in its body. Reads inside single quotes are checked too, so an awk or perl
+# assignment anywhere in its body -- an assignment that is a statement of its own, since one
+# prefixed to a command (`FOO=x cmd`) is gone when that command ends. A name bound only by `for`,
+# `read` or `printf -v` is reported unbound, which is loud, not silent. Reads inside single quotes are checked too, so an awk or perl
 # `$name` is over-reported (hence SWEEP_FOREIGN), never missed. Text through which a variable can
 # be read any other way -- `[[`, `let`, `eval`, `declare`, `typeset`, `source`, a `.` command,
 # `${!`, or a `local` given an option (`-n`, `-i`) -- is refused, not scanned. Out of bounds: a
@@ -2613,7 +2615,12 @@ fragment_unbound() {
           $mine{$1} = 1 if $w =~ /^($id)(?:=|$)/;
         }
       }
-      $mine{$1} = 1 while $text =~ /(?:^|[\s;&|(])($id)\+?=(?!=)/mg;
+      # Assignments that are whole statements; one prefixed to a command binds nothing after it.
+      (my $flat = $text) =~ s/\$\(\(.*?\)\)|\$\([^()]*\)|"[^"]*"|\x27[^\x27]*\x27/X/g;
+      while ($flat =~ /(?:^|[;&|({]|\b(?:then|do|else))[ \t]*((?:$id\+?=[^\s;&|()]*[ \t]+)*$id\+?=[^\s;&|()]*)[ \t]*(?=$|[;&|)])/mg) {
+        my $run = $1;
+        $mine{$1} = 1 while $run =~ /(?:^|[ \t])($id)\+?=/g;
+      }
       $reads{$1} = 1 while $text =~ /\$\{?#?($id)/g;
       for my $arith ($text =~ /\(\((.*?)\)\)/sg, $text =~ /\w\[([^\]\n]*)\]/g) {
         (my $expr = $arith) =~ s/\$\([^()]*\)//g;
@@ -2638,7 +2645,9 @@ lab_box_of() { # ssh-alias -- the $COMMENTED_OUT table
 take_lab_lock() {
   local box=$1 deadline=$((SECONDS + PLANTED_WAIT)) waits=(1 2)
   path=$LAB_LOCK_DIR/$box.lock
+  PLANTED_PREFIX=temporary true
   printf '%s\n' "$path $deadline ${#LAB_MAP} $stamp ${waits[PLANTED_INDEX]} ${waits[deadline]}"
+  printf '%s\n' "$PLANTED_PREFIX"
 }
 planted_let() {
   let n=PLANTED_LET+1
@@ -2646,7 +2655,7 @@ planted_let() {
 EOF
 out=$(fragment_unbound "$TMP/planted-fragment.sh")
 want=$(printf '%s\n' 'lab_box_of: PLANTED_MAP' 'planted_let: refused let' \
-  'take_lab_lock: PLANTED_INDEX' 'take_lab_lock: PLANTED_WAIT')
+  'take_lab_lock: PLANTED_INDEX' 'take_lab_lock: PLANTED_PREFIX' 'take_lab_lock: PLANTED_WAIT')
 [ "$out" = "$want" ] \
   && ok "the copy step's unbound-variable check flags exactly the planted reads and the refused let" \
   || ko "the copy step's unbound-variable check is off on a planted fragment -- want [$want], got [$out]"
@@ -2754,11 +2763,16 @@ about the live sweep"; }
       sed -n '/^lab_box_of() {/,/^}/p' "$SWEEP"
       sed -n '/^take_lab_lock() {/,/^}/p' "$SWEEP"
     } >"$TMP/sweep-lock.sh"
-    unbound=$(fragment_unbound "$TMP/sweep-lock.sh")
     # The map the sweep's lab_map would read, asked of this checkout's wake-lab over this suite's
     # hosts table. Empty is a refusal too: every lab_box_of would then answer nothing.
     SWEEP_MAP=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" "$WL" endpoint-map 2>&1); map_rc=$?
-    if [ -n "$unbound" ]; then
+    # The scanner's own status first: one that died before printing would otherwise read as a
+    # fragment with nothing unbound.
+    if ! unbound=$(fragment_unbound "$TMP/sweep-lock.sh"); then
+      anchors=0
+      ko "the unbound-variable check over the fragment copied out of origin/master's sweep did not \
+run to completion, so nothing says what that fragment reads -- ${unbound//$'\n'/; }"
+    elif [ -n "$unbound" ]; then
       anchors=0
       ko "the fragment copied out of origin/master's sweep reads what neither it nor this suite \
 binds, so the cases below would run it on an input nobody set and report whatever that yields as \
