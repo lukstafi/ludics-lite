@@ -247,7 +247,9 @@ lock and checks the other side's real behaviour, since a lock file without a liv
 nothing: a restart is refused while the sweep's own `take_lab_lock` holds the box, and the sweep
 still takes its lane lock while that box's hold lock is held. The checkout is read strictly
 read-only. Where it is absent, as in CI, the case prints a named `SKIP:` line that the summary
-counts, so a green run says what it did not check. The staging side has no matching check.
+counts, so a green run says what it did not check. The sweep checks the same contract from its
+side at startup: `lab_contract_check` in ocannl-staging's `tools/sweep.sh` asks
+`wake-lab.sh lock-path` for each lane box and refuses the run on a mismatch.
 
 `WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the common lab
 lore in `wake-lab.sh` and the Windows/WSL lessons in `wake-lab-wsl.sh`, the router endpoints, the
